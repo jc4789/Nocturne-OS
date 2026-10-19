@@ -27,7 +27,7 @@ static void rgba_tile(size_t tile, void *context) {
 }
 
 static image_t *image_new(int w, int h) {
-    if (w <= 0 || h <= 0 || (long)w * h > IMAGE_MAX_PIXELS) return NULL;
+    if (w <= 0 || h <= 0 || (long long)w * h > IMAGE_MAX_PIXELS) return NULL;
     image_t *img = malloc(sizeof *img);
     if (!img) return NULL;
     img->w = w;
@@ -251,7 +251,7 @@ image_t *image_decode(const void *data, size_t n) {
     if (!memcmp(d, "\0\0\1\0", 4)) return decode_icon(d, n);
     if (n >= 12 && !memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WEBP", 4)) {
         jebp_image_t ji;
-        if (jebp_decode_size(&ji, n, data) != JEBP_OK || (long)ji.width * ji.height > IMAGE_MAX_PIXELS) return NULL;
+        if (jebp_decode_size(&ji, n, data) != JEBP_OK || (long long)ji.width * ji.height > IMAGE_MAX_PIXELS) return NULL;
         if (jebp_decode(&ji, n, data) != JEBP_OK) return NULL;
         image_t *img = from_rgba((const uint8_t *)ji.pixels, ji.width, ji.height);
         jebp_free_image(&ji);
@@ -260,7 +260,7 @@ image_t *image_decode(const void *data, size_t n) {
     int w, h, comp;
     image_codec_acquire();
     if (stbi_info_from_memory(d, (int)n, &w, &h, &comp)) {
-        if ((long)w * h > IMAGE_MAX_PIXELS) { image_codec_release(); return NULL; }
+        if ((long long)w * h > IMAGE_MAX_PIXELS) { image_codec_release(); return NULL; }
         uint8_t *rgba = stbi_load_from_memory(d, (int)n, &w, &h, &comp, 4);
         image_codec_release();
         if (!rgba) return NULL;

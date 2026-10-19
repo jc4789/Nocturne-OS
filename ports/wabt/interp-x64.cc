@@ -1312,10 +1312,27 @@ JitCode* JitCompiler::Compile() {
     return nullptr;
   }
   jit->size = a_.b.size();
-  jit->map.resize(code_.size());
-  for (size_t i = 0; i < code_.size(); ++i) {
-    jit->map[i] = static_cast<u64>(code_[i].pc) << 32 | labels_[i];
+  // Compiled code is entered at the body's start and at branch targets
+  // (calls, loops asking, branches the interpreter stepped); any other offset
+  // keeps interpreting until one of those, so only they are kept.
+  std::vector<u32> entries;
+  entries.reserve(fixes_.size() + 1);
+  entries.push_back(code_.front().pc);
+  for (const Fix& fix : fixes_) entries.push_back(fix.target);
+  for (const Table& table : tables_) {
+    for (u32 i = 0; i < table.count; ++i) {
+      entries.push_back(table.first + i * Istream::kBrTableEntrySize);
+    }
   }
+  std::sort(entries.begin(), entries.end());
+  entries.erase(std::unique(entries.begin(), entries.end()), entries.end());
+  for (u32 pc : entries) {
+    size_t target;
+    if (pc != end_ && Lookup(pc, &target)) {
+      jit->map.push_back(static_cast<u64>(pc) << 32 | target);
+    }
+  }
+  jit->map.shrink_to_fit();
   return jit;
 }
 

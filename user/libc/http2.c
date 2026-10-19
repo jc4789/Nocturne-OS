@@ -684,7 +684,8 @@ next_stream:
             c->frame_header_at+=(size_t)n;bytes+=(size_t)n;if(c->frame_header_at<9)continue;
             c->frame_len=(size_t)c->frame_header[0]<<16|(size_t)c->frame_header[1]<<8|c->frame_header[2];
             if(c->frame_len>16384){fail(c,EPROTO,"HTTP/2 frame exceeds advertised maximum");return;}
-            if(c->frame_len&&!c->frame){c->frame=malloc(16384);if(!c->frame){fail(c,ENOMEM,"HTTP/2 frame allocation failed");return;}}
+            /* Zero-length frames (empty HEADERS/DATA) still get a base pointer: dispatch does pointer arithmetic on it. */
+            if(!c->frame){c->frame=malloc(16384);if(!c->frame){fail(c,ENOMEM,"HTTP/2 frame allocation failed");return;}}
         }
         if(c->frame_at<c->frame_len) {
             long n=ns_try_read(c->wire,c->frame+c->frame_at,c->frame_len-c->frame_at);

@@ -839,7 +839,7 @@ static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t
     if (!owner->is_user || owner->exiting || owner->killed) return -N_ERR_STOPPED;
     unsigned count = 0;
     for (struct task *p = task_list; p; p = p->all_next)
-        if (p->is_thread && p->process == owner) count++;
+        if (p->is_thread && p->process == owner && p->state != TASK_ZOMBIE) count++; /* exited, not yet joined: no longer a running thread */
     if (count >= 128) return -N_ERR_NOT_READY;
     struct task *t = task_alloc(owner->name);
     if (!t) return -N_ERR_NO_MEMORY;
@@ -854,7 +854,7 @@ static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t
         return -N_ERR_NO_MEMORY;
     }
     t->user_stack = reserved + PAGE_SIZE;
-    if (vmm_user_alloc(t->pml4, t->user_stack, t->user_stack_size, VM_W) < 0) {
+    if (vmm_user_reserve(t->pml4, t->user_stack, t->user_stack_size, VM_W) < 0) { /* pages on first touch */
         free_task(t); /* frees the partial stack and returns its reservation */
         return -N_ERR_NO_MEMORY;
     }
@@ -943,6 +943,7 @@ int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsi
     if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
     struct task *t = current_task;
     uint64_t phys = vmm_translate(t->pml4, (uint64_t)address);
+    if (!phys && vmm_demand_fault(t->pml4, (uint64_t)address, false) > 0) phys = vmm_translate(t->pml4, (uint64_t)address);
     if (!phys) { irq_restore(flags); return -N_ERR_BAD_ADDRESS; }
     uint32_t *bucket = address_bucket(phys);
     __atomic_add_fetch(bucket, 1, __ATOMIC_SEQ_CST);
@@ -1110,6 +1111,8 @@ int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t 
     if (!w) return -N_ERR_NO_MEMORY;
     uint64_t flags = irq_save();
     uint64_t phys = vmm_translate(current_task->pml4, (uint64_t)address);
+    if (!phys && vmm_demand_fault(current_task->pml4, (uint64_t)address, false) > 0)
+        phys = vmm_translate(current_task->pml4, (uint64_t)address);
     if (!phys) { irq_restore(flags); kfree(w); return -N_ERR_BAD_ADDRESS; }
     /* Counted before the value check, as task_wait_address; unlink uncounts. */
     __atomic_add_fetch(address_bucket(phys), 1, __ATOMIC_SEQ_CST);
@@ -1179,6 +1182,16 @@ NORETURN void task_exit(int code) {
     t->exit_code = code;
     net_task_exit(t);
     if (t->is_thread) {
+        /* The thread never returns to ring 3, so its user stack is dead now. An
+           unjoined (or detached) zombie keeps only its kernel stack and task record
+           instead of 256 KiB of address space and the pages it touched. */
+        struct task *owner = t->process;
+        if (t->user_stack && owner && !owner->exiting && owner->pml4 == t->pml4 && t->pml4 != kernel_pml4) {
+            uint64_t stack = t->user_stack, size = t->user_stack_size;
+            t->user_stack = t->user_stack_size = 0;
+            vmm_user_free(t->pml4, stack, size);
+            mmap_hole_add(owner, stack - PAGE_SIZE, size + 2 * PAGE_SIZE);
+        }
         /* Do not close shared descriptors, orphan process children or destroy VM. */
         cli();
         t->state = TASK_ZOMBIE;

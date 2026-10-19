@@ -7,3 +7,4 @@ void kfree(void *p);
 void *krealloc(void *p, size_t size);
 uint64_t heap_used_bytes(void);
 uint64_t heap_size_bytes(void);
+void heap_trim_start(void); /* the task that returns large free blocks' pages */

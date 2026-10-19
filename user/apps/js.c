@@ -21,6 +21,7 @@
 #include <string.h>
 #include "../libc/web/js_encoding.h"
 #include "../libc/web/js_crypto.h"
+#include "../libc/web/js_memory.h"
 
 #pragma clang diagnostic ignored "-Wc23-extensions"
 
@@ -1368,7 +1369,7 @@ int main(int argc, char **argv) {
     if (mode == REPL && !n_terminal(0)) mode = INPUT;
 
     if (mtx_init(&fetch_lock, mtx_plain) != thrd_success) return 70;
-    rt = JS_NewRuntime();
+    rt = web_js_new_runtime(NULL);
     if (!rt) return 70;
     JS_SetMaxStackSize(rt, 4u << 20); /* the main thread has 8 MiB */
     ctx = JS_NewContext(rt);

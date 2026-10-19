@@ -248,6 +248,9 @@ type reader struct {
 func (r *reader) take(n int) []byte {
 	if r.bad || len(r.b) < n {
 		r.bad = true
+		if n > 8 { // a length read from a bad message must not become an allocation
+			return nil
+		}
 		return make([]byte, n)
 	}
 	p := r.b[:n]

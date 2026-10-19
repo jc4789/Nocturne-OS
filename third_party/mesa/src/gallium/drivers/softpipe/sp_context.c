@@ -190,7 +190,7 @@ softpipe_create_context(struct pipe_screen *screen,
 {
    struct softpipe_screen *sp_screen = softpipe_screen(screen);
    struct softpipe_context *softpipe = CALLOC_STRUCT(softpipe_context);
-   uint i, sh;
+   uint i;
 
    util_init_math();
 
@@ -244,14 +244,9 @@ softpipe_create_context(struct pipe_screen *screen,
       softpipe->cbuf_cache[i] = sp_create_tile_cache( &softpipe->pipe );
    softpipe->zsbuf_cache = sp_create_tile_cache( &softpipe->pipe );
 
-   /* Allocate texture caches */
-   for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
-      for (i = 0; i < ARRAY_SIZE(softpipe->tex_cache[0]); i++) {
-         softpipe->tex_cache[sh][i] = sp_create_tex_tile_cache(&softpipe->pipe);
-         if (!softpipe->tex_cache[sh][i])
-            goto fail;
-      }
-   }
+   /* Texture caches (256 KiB each) are created when a view is first bound
+    * to their slot: allocating every stage's 128 slots up front cost about
+    * 200 MB per context. */
 
    softpipe->fs_machine = tgsi_exec_machine_create(MESA_SHADER_FRAGMENT);
 

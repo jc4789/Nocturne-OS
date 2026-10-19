@@ -220,8 +220,14 @@ static struct json *pvalue(struct parser *ps) {
         memcpy(tmp, ps->p, n);
         tmp[n] = 0;
         ps->p += n;
+        char *stop = NULL;
+        double value = strtod(tmp, &stop);
+        if (n == 0 || stop != tmp + n) {
+            ps->err = "malformed number";
+            return NULL;
+        }
         struct json *j = node(J_NUM);
-        if (j) j->num = strtod(tmp, NULL);
+        if (j) j->num = value;
         return j;
     }
     static const struct {
@@ -408,7 +414,9 @@ void json_write(struct jbuf *b, const struct json *j) {
     case J_NULL: jb_puts(b, "null"); break;
     case J_BOOL: jb_puts(b, j->b ? "true" : "false"); break;
     case J_NUM:
-        if (j->num == (double)(long long)j->num && j->num > -1e15 && j->num < 1e15) jb_printf(b, "%lld", (long long)j->num);
+        /* NaN/Infinity have no JSON form; the range test must precede the integer cast (UB out of range). */
+        if (!(j->num - j->num == 0)) jb_puts(b, "null");
+        else if (j->num > -1e15 && j->num < 1e15 && j->num == (double)(long long)j->num) jb_printf(b, "%lld", (long long)j->num);
         else jb_printf(b, "%.17g", j->num);
         break;
     case J_STR: jb_strn(b, j->str, j->len); break;

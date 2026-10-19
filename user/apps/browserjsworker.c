@@ -12,6 +12,7 @@
 #include "../libc/web/js_wasm.h"
 #include "../libc/web/js_webgl.h"
 #include "../libc/web/js_atomics.h"
+#include "../libc/web/js_memory.h"
 #include "../libc/web/js_opfs.h"
 #include "../libc/web/js_worker_transfer.h"
 #include "../libc/web/js_worker_port_lifetime.h"
@@ -605,7 +606,7 @@ static void policy_task(struct worker *w){
     JSValue r=hook(w,"safetyViolation",1,&v->init);if(JS_IsException(r))exception(w);JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,v->init);js_free(w->ctx,v);
 }
 int main(int argc,char**argv){
-    struct worker w={0};w.probe=-1;w.queue=web_atomics_queue();if(w.queue<0)return 1;w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=JS_NewRuntime();if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,true);web_atomics_runtime_init(w.rt);JS_SetInterruptHandler(w.rt,interrupt,&w);JS_SetHostPromiseRejectionTracker(w.rt,rejection_track,NULL);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=n_clock_uptime_ms()+10000;
+    struct worker w={0};w.probe=-1;w.queue=web_atomics_queue();if(w.queue<0)return 1;w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=web_js_new_runtime(NULL);if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,true);web_atomics_runtime_init(w.rt);JS_SetInterruptHandler(w.rt,interrupt,&w);JS_SetHostPromiseRejectionTracker(w.rt,rejection_track,NULL);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=n_clock_uptime_ms()+10000;
     if(trusted_native_init(w.ctx)<0)goto shutdown;
     if(web_js_wasm_init(w.ctx,wasm_poll,wasm_can_compile)<0)goto shutdown;
     JSValue global=JS_GetGlobalObject(w.ctx),host=JS_NewObject(w.ctx);

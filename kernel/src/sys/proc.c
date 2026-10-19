@@ -183,7 +183,8 @@ int proc_launch(const char *path, const struct proc_launch *l) {
             if (ph[i].vaddr + ph[i].memsz > top) top = ph[i].vaddr + ph[i].memsz;
             continue;
         }
-        if (vmm_user_alloc(t->pml4, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
+        /* The file's bytes are copied now; the zero tail (.bss) gets frames on first touch. */
+        if (vmm_user_reserve(t->pml4, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
         if (vmm_copy_to_space(t->pml4, ph[i].vaddr, img + ph[i].offset, ph[i].filesz) < 0) goto fail;
         if (ph[i].vaddr + ph[i].memsz > top) top = ph[i].vaddr + ph[i].memsz;
     }

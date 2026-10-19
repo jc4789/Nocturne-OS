@@ -191,6 +191,8 @@ bool url_parse(const char *s, struct url *u) {
         if (p <= 0 || p > 65535) return false;
         u->port = (uint16_t)p;
     }
+    /* "host:80abc" must not yield the relative request target "abc". */
+    if (*s && *s != '/' && *s != '?') return false;
     int n = *s == '?' ? snprintf(u->path, sizeof u->path, "/%s", s)
                       : snprintf(u->path, sizeof u->path, "%s", *s ? s : "/");
     /* A prefix would request a different resource, not the original URL. */

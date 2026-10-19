@@ -16,6 +16,7 @@
 #include "sys/sched.h"
 #include "sys/prof.h"
 #include "mm/pmm.h"
+#include "mm/heap.h"
 
 extern volatile struct limine_module_request module_req;
 extern const char *kernel_cmdline;
@@ -58,9 +59,47 @@ bool cmdline_has(const char *word) {
     return false;
 }
 
+/* Removes a RAM-root folder and everything below it. */
+static void remove_tree(char *path, size_t room) {
+    struct vnode *v = vfs_lookup(path);
+    if (!v) return;
+    if (v->type == VT_DIR) {
+        struct dirent *e = kmalloc(sizeof *e);
+        size_t len = strlen(path);
+        /* Always list from the start: each pass removes what it returned. */
+        while (e && vfs_folder_list(path, 0, e, 1) == 1) {
+            size_t name = strlen(e->name);
+            if (len + 1 + name + 1 > room) break;
+            path[len] = '/'; memcpy(path + len + 1, e->name, name + 1);
+            remove_tree(path, room);
+            bool gone = !vfs_lookup(path);
+            path[len] = 0;
+            if (!gone) break;
+        }
+        kfree(e);
+    }
+    vfs_unlink(path);
+}
+
+/* GPU firmware is large and only the driver of a present GPU reads it: the
+   RAM root keeps it only when such a display controller is on the bus. */
+static void drop_absent_firmware(void) {
+    for (int i = 0; i < pci_count(); i++) {
+        struct pci_device *d = pci_at(i);
+        if (d && d->vendor == 0x10DE && d->cls == 0x03) return;
+    }
+    char path[PATH_MAX_LEN] = "/usr/share/firmware/nvidia";
+    if (!vfs_lookup(path)) return;
+    uint64_t before = heap_used_bytes();
+    remove_tree(path, sizeof path);
+    kprintf("initrd: no NVIDIA display controller, firmware dropped (%lu MiB)\n",
+            (unsigned long)((before - heap_used_bytes()) / 1048576));
+}
+
 void kmain_late(void) {
     entropy_init();
     prof_init();
+    heap_trim_start();
     vfs_init();
     vfs_mkdir("/home");
     vfs_mkdir("/tmp");
@@ -84,6 +123,7 @@ void kmain_late(void) {
         hvsock_init();
     }
     pci_init();
+    drop_absent_firmware();
     usb_init();
     net_init();
     audio_init();

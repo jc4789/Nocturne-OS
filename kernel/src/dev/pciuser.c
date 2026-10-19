@@ -25,6 +25,9 @@ struct pci_claim {
     volatile uint32_t pending; /* message n arrived; cleared by take */
     struct wait_queue wq;
     unsigned vector_base, vectors;
+    /* BAR sizes, probed once at claim: the probe switches memory decoding off for a moment, which
+       would make a running function's registers read as all-ones (a GPU gone from the bus). */
+    uint64_t bar_size[6];
 };
 static struct pci_claim *claim_of_vector[256];
 
@@ -107,6 +110,10 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     v->unlinked = true; /* the claim ends when its last handle closes */
     c->d = d;
     c->v = v;
+    for (unsigned i = 0; i < 6; i++) {
+        c->bar_size[i] = pci_bar_size(d, i);
+        if (c->bar_size[i] && !(d->bar[i] & 1) && ((d->bar[i] >> 1) & 3) == 2) i++; /* 64-bit: the upper half is no BAR */
+    }
     struct file *f = vfs_open_vnode(v, O_RDWR);
     if (!f) { kfree(c); kfree(v); return -N_ERR_NO_MEMORY; }
     d->claimed = true;
@@ -140,7 +147,7 @@ int64_t pci_user_info(struct file *f, struct n_pci_function *out) {
     for (unsigned i = 0; i < 6; i++) {
         uint32_t raw = d->bar[i];
         if (raw & 1) { out->bar[i] = (struct n_pci_bar){.address = raw & ~3u, .flags = N_PCI_BAR_IO}; continue; }
-        uint64_t address = pci_bar_address(d, i), size = pci_bar_size(d, i);
+        uint64_t address = pci_bar_address(d, i), size = c->bar_size[i];
         if (!address || !size) continue;
         uint32_t flags = N_PCI_BAR_MEMORY | (raw & 8 ? N_PCI_BAR_PREFETCH : 0);
         bool wide = ((raw >> 1) & 3) == 2;
@@ -221,7 +228,7 @@ int64_t pci_user_bar(struct file *f, uint32_t bar, uint64_t *address, uint64_t *
     if (!c) return -N_ERR_WRONG_KIND;
     if (bar > 5) return -N_ERR_INVALID;
     if (c->d->bar[bar] & 1) return -N_ERR_UNSUPPORTED; /* I/O ports */
-    uint64_t a = pci_bar_address(c->d, bar), s = pci_bar_size(c->d, bar);
+    uint64_t a = pci_bar_address(c->d, bar), s = c->bar_size[bar];
     if (!a || !s) return -N_ERR_NOT_FOUND;
     /* A smaller BAR shares its page with whatever lies beside it. */
     if ((a | s) & (PAGE_SIZE - 1)) return -N_ERR_UNSUPPORTED;

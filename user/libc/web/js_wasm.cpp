@@ -167,7 +167,7 @@ Binding::~Binding() {
 // A compiled module's immutable storage in native shared pages, so a Module
 // cloned to a dedicated Worker (another process) maps the same compiled code
 // instead of compiling its bytes again:
-//   [ImageHeader][binary][interpreter code][data segments][descriptor record]
+//   [ImageHeader][binary][interpreter code][data segments][descriptor record, 8-aligned]
 // A module with a shared memory is made to run in several agents at once, so
 // its own descriptor moves into an image when it is compiled; any other module
 // gets an image the first time it is cloned.
@@ -175,7 +175,7 @@ struct ImageHeader {
   uint64_t magic, binary_size, code_offset, code_size, data_offset, data_size,
            record_offset, record_size;
 };
-constexpr uint64_t kImageMagic = 0x32474d494d534157ull; // "WASMIMG2"
+constexpr uint64_t kImageMagic = 0x33474d494d534157ull; // "WASMIMG3"
 struct ModuleImage {
   const uint8_t *base = nullptr;
   size_t size = 0;
@@ -710,14 +710,30 @@ struct NativeInstance : std::enable_shared_from_this<NativeInstance> {
   State *state;
   wi::Ref instance_ref;
   std::shared_ptr<NativeModule> module;
+  // What native code reads at every access (wasm_host_instance::memories).
   std::vector<wasm_rt_memory_t> memory_views;
+  // The instance's memories, which it keeps alive as long as this binding
+  // (its host info).
+  std::vector<wi::Memory *> memories;
   wasm_host_instance host = {};
   std::string last_trap;
   NativeInstance(State *s, wi::Instance::Ptr instance, std::shared_ptr<NativeModule> m)
       : state(s), instance_ref(instance.ref()), module(std::move(m)), memory_views(instance->memories().size()) {
+    for (size_t i = 0; i < memory_views.size(); ++i) {
+      auto *mem = static_cast<wi::Memory *>(s->store.UnsafeObject(instance->memories()[i]));
+      memories.push_back(mem);
+      auto &view = memory_views[i];
+      const auto &limits = mem->type().limits;
+      view.page_size = mem->type().page_size;
+      view.max_pages = limits.has_max ? limits.max :
+          (limits.is_64 ? UINT64_MAX / view.page_size : (uint64_t(UINT32_MAX) + 1) / view.page_size);
+      view.is64 = limits.is_64;
+    }
+    refresh_memories();
     host.opaque = this; host.root_head = &s->native_roots;
     host.owner_ref = instance.ref().index;
-    host.memory = memory; host.memory_grow = memory_grow; host.memory_init = memory_init;
+    host.memories = memory_views.data();
+    host.memory_grow = memory_grow; host.memory_init = memory_init;
     host.data_drop = data_drop; host.global = global; host.table = table;
     host.call = call; host.indirect = indirect; host.func_ref = func_ref;
   }
@@ -727,23 +743,29 @@ struct NativeInstance : std::enable_shared_from_this<NativeInstance> {
     State *s = self(p)->state;
     return s->interrupted();
   }
-  static wasm_rt_memory_t *memory(void *p, uint32_t index) {
-    auto *n = self(p); auto inst = n->instance();
-    auto mem = n->state->store.UnsafeGet<wi::Memory>(inst->memories()[index]);
-    auto& view = n->memory_views[index];
-    view.data = mem->UnsafeData(); view.size = mem->ByteSize();
-    view.data_end = view.data ? view.data + view.size : nullptr;
-    view.page_size = mem->type().page_size; view.pages = mem->PageSize();
-    view.max_pages = mem->type().limits.has_max ? mem->type().limits.max :
-        (mem->type().limits.is_64 ? UINT64_MAX / view.page_size : (uint64_t(UINT32_MAX) + 1) / view.page_size);
-    view.is64 = mem->type().limits.is_64;
-    return &view;
+  // Only the extent changes, by a grow in this agent: native code (never over
+  // a shared memory) runs again only through invoke() or the return of a
+  // host call, which refresh the views first.
+  void refresh_memories() {
+    for (size_t i = 0; i < memories.size(); ++i) {
+      wi::Memory *mem = memories[i];
+      auto &view = memory_views[i];
+      view.data = mem->UnsafeData(); view.size = mem->ByteSize();
+      view.data_end = view.data ? view.data + view.size : nullptr;
+      view.pages = mem->PageSize();
+    }
   }
   static uint64_t memory_grow(void *p, uint32_t index, uint64_t pages) {
-    auto *n = self(p); NativeRoots roots(n->state); auto inst = n->instance();
-    auto mem = n->state->store.UnsafeGet<wi::Memory>(inst->memories()[index]);
-    uint64_t old = mem->PageSize();
-    return wabt::Succeeded(mem->Grow(pages)) ? old : UINT64_MAX;
+    auto *n = self(p);
+    uint64_t result;
+    {
+      NativeRoots roots(n->state); auto inst = n->instance();
+      auto mem = n->state->store.UnsafeGet<wi::Memory>(inst->memories()[index]);
+      uint64_t old = mem->PageSize();
+      result = wabt::Succeeded(mem->Grow(pages)) ? old : UINT64_MAX;
+    }
+    n->refresh_memories();
+    return result;
   }
   static int memory_init(void *p, uint32_t index, uint32_t segment, uint64_t d, uint64_t s, uint64_t count) {
     auto *n = self(p); auto inst = n->instance();
@@ -752,7 +774,21 @@ struct NativeInstance : std::enable_shared_from_this<NativeInstance> {
   }
   static void data_drop(void *p, uint32_t segment) { self(p)->instance()->datas()[segment].Drop(); }
   static int global(void *p, uint32_t index, int set, wasm_host_value *value) {
-    auto *n = self(p); NativeRoots roots(n->state); auto inst = n->instance();
+    auto *n = self(p);
+    {
+      // A number makes and reaches no JS value: no roots to refresh. Native
+      // code reads its stack pointer global in nearly every function.
+      auto &store = n->state->store;
+      auto *inst = static_cast<wi::Instance *>(store.UnsafeObject(n->instance_ref));
+      auto *object = static_cast<wi::Global *>(store.UnsafeObject(inst->globals()[index]));
+      Type type = object->type().type;
+      if (!type.IsRef()) {
+        if (set) object->UnsafeSet(store_value(type, *value));
+        else *value = host_value(type, object->Get());
+        return 0;
+      }
+    }
+    NativeRoots roots(n->state); auto inst = n->instance();
     auto object = n->state->store.UnsafeGet<wi::Global>(inst->globals()[index]);
     Type type = object->type().type;
     if (set) {
@@ -806,7 +842,10 @@ struct NativeInstance : std::enable_shared_from_this<NativeInstance> {
     return 0;
   }
   static int call(void *p, uint32_t index, const wasm_host_value *params, wasm_host_value *results) {
-    auto *n = self(p); return n->call_ref(n->instance()->funcs()[index], params, results);
+    auto *n = self(p);
+    int status = n->call_ref(n->instance()->funcs()[index], params, results);
+    n->refresh_memories();
+    return status;
   }
   static int indirect(void *p, uint32_t type, uint32_t table_index, uint64_t index,
                       const wasm_host_value *params, wasm_host_value *results) {
@@ -817,7 +856,9 @@ struct NativeInstance : std::enable_shared_from_this<NativeInstance> {
     auto func = n->state->store.UnsafeGet<wi::Func>(ref);
     auto mod = n->state->store.UnsafeGet<wi::Module>(inst->module());
     if (wabt::Failed(Match(func->type(), mod->desc().func_types[type], nullptr))) return WASM_RT_TRAP_CALL_INDIRECT;
-    return n->call_ref(ref, params, results);
+    int status = n->call_ref(ref, params, results);
+    n->refresh_memories();
+    return status;
   }
   Result invoke(uint32_t index, const wi::Values& params, wi::Values& results, wi::Trap::Ptr *trap) {
     auto inst = instance(); auto function = state->store.UnsafeGet<wi::Func>(inst->funcs()[index]);
@@ -836,6 +877,7 @@ struct NativeInstance : std::enable_shared_from_this<NativeInstance> {
     }
     auto *saved_roots = state->native_roots;
     last_trap.clear(); ++state->stats.native_calls;
+    refresh_memories();
     int status = wasm_rt_run(entry, &invocation);
     state->native_roots = saved_roots;
     // The callee's C root frame has gone, but its reference results have not
@@ -1246,21 +1288,22 @@ struct RecordWriter {
       }
     }
   }
-  const wi::ModuleDesc *desc = nullptr;
-  // A function's type is a func_types index; an initializer's is its result.
-  void func(const wi::FuncDesc &f) {
-    const wi::FuncType *types = desc->func_types.data();
-    bool defined = std::less_equal<const wi::FuncType *>()(types, f.type) &&
-                   std::less<const wi::FuncType *>()(f.type, types + desc->func_types.size());
-    pod(uint8_t(defined));
-    if (defined) pod(uint32_t(f.type - types)); else pod(f.type->results[0]);
-    pod(f.code_offset); pod(f.locals); pod(f.local_count); pod(f.handlers); pod(f.handler_count);
+  // A module's largest tables are stored as their entries, 8-aligned in the
+  // image, so every agent views the same pages (DescArray::View).
+  template <typename T> void table(const wi::DescArray<T> &values) {
+    static_assert(std::is_trivially_copyable_v<T> && alignof(T) <= 8);
+    pod(uint64_t(values.size()));
+    out.resize((out.size() + 7) & ~size_t(7));
+    raw(values.data(), values.size() * sizeof(T));
   }
+  void func(const wi::FuncDesc &f) { pod(f); }
   void module(const wi::ModuleDesc &d) {
-    desc = &d;
+    // Before any FuncDesc: they refer to these by index.
+    pod(uint64_t(d.init_types.size()));
+    for (const auto &t : d.init_types) pod(t->results[0]);
     pod(uint64_t(d.func_types.size()));
     for (const auto &t : d.func_types) func_type(t);
-    pods(d.locals);
+    table(d.locals);
     pod(uint64_t(d.handlers.size()));
     for (const auto &h : d.handlers) {
       pod(h.kind); pod(h.try_start_offset); pod(h.try_end_offset); pods(h.catches);
@@ -1268,8 +1311,7 @@ struct RecordWriter {
     }
     pod(uint64_t(d.imports.size()));
     for (const auto &i : d.imports) { text(i.type.module); text(i.type.name); extern_type(*i.type.type); }
-    pod(uint64_t(d.funcs.size()));
-    for (const auto &f : d.funcs) func(f);
+    table(d.funcs);
     pod(uint64_t(d.tables.size()));
     for (const auto &t : d.tables) { extern_type(t.type); func(t.init_func); }
     pod(uint64_t(d.memories.size()));
@@ -1284,8 +1326,7 @@ struct RecordWriter {
     for (const auto &start : d.starts) pod(start.func_index);
     pod(uint64_t(d.elems.size()));
     for (const auto &e : d.elems) {
-      pod(uint64_t(e.elements.size()));
-      for (const auto &f : e.elements) func(f);
+      table(e.elements);
       pod(e.type); pod(e.mode); pod(e.table_index); func(e.init_func);
     }
     pod(uint64_t(d.datas.size()));
@@ -1365,34 +1406,44 @@ struct RecordReader {
     return ok ? std::move(type) : nullptr;
   }
   wi::ModuleDesc *desc = nullptr;
-  // At least the type reference and the offset and ranges below.
-  static constexpr size_t kFuncRecord = 1 + sizeof(uint32_t) + 5 * sizeof(uint32_t);
   // [first, first + count) of a pool of `size` entries.
   static bool range(uint32_t first, uint32_t count, size_t size) {
     return first <= size && count <= size - first;
   }
+  bool valid(const wi::FuncDesc &f) const {
+    uint32_t index = f.type & ~wi::FuncDesc::kInitType;
+    size_t types = f.type & wi::FuncDesc::kInitType ? desc->init_types.size() : desc->func_types.size();
+    return index < types && range(f.locals, f.local_count, desc->locals.size()) &&
+           range(f.handlers, f.handler_count, desc->handlers.size());
+  }
   wi::FuncDesc func() {
-    const wi::FuncType *type = nullptr;
-    if (pod<uint8_t>()) {
-      auto index = pod<uint32_t>();
-      if (ok && index < desc->func_types.size()) type = &desc->func_types[index]; else ok = false;
-    } else {
-      auto result = pod<wi::ValueType>();
-      if (ok) type = desc->InitType(result);
-    }
-    wi::FuncDesc f{type};
-    f.code_offset = pod<uint32_t>();
-    f.locals = pod<uint32_t>(); f.local_count = pod<uint32_t>();
-    f.handlers = pod<uint32_t>(); f.handler_count = pod<uint32_t>();
-    if (ok && (!range(f.locals, f.local_count, desc->locals.size()) ||
-               !range(f.handlers, f.handler_count, desc->handlers.size()))) ok = false;
+    auto f = pod<wi::FuncDesc>();
+    if (ok && !valid(f)) ok = false;
     return f;
+  }
+  // A table viewed in place in the image (see RecordWriter::table).
+  template <typename T> void table(wi::DescArray<T> &values) {
+    size_t n = count(sizeof(T));
+    size_t skip = (0 - reinterpret_cast<uintptr_t>(p)) & 7;
+    if (ok && (size_t(end - p) < skip || n > (size_t(end - p) - skip) / sizeof(T))) ok = false;
+    if (!ok) return;
+    p += skip;
+    values.View(reinterpret_cast<const T *>(p), n);
+    p += n * sizeof(T);
+  }
+  void funcs(wi::DescArray<wi::FuncDesc> &values) {
+    table(values);
+    for (const auto &f : values) if (ok && !valid(f)) ok = false;
   }
   // Data segments view the image's data bytes [data, data + data_size).
   void module(wi::ModuleDesc *d, const uint8_t *data, size_t data_size) {
     desc = d;
+    for (size_t i = 0, n = count(sizeof(wi::ValueType)); ok && i < n; ++i) {
+      auto result = pod<wi::ValueType>();
+      if (ok && d->InitType(result) != (wi::FuncDesc::kInitType | i)) ok = false;
+    }
     for (size_t i = 0, n = reserve(d->func_types, 16); ok && i < n; ++i) d->func_types.push_back(func_type());
-    d->locals = pods<wi::LocalDesc>();
+    table(d->locals);
     d->handlers.resize(count(4 * sizeof(uint32_t)));
     for (auto &h : d->handlers) {
       h.kind = pod<wi::HandlerKind>();
@@ -1406,7 +1457,7 @@ struct RecordReader {
       auto module = text(); auto name = text(); auto type = extern_type();
       if (ok) d->imports.push_back(wi::ImportDesc{wi::ImportType(std::move(module), std::move(name), std::move(type))});
     }
-    for (size_t i = 0, n = reserve(d->funcs, kFuncRecord); ok && i < n; ++i) d->funcs.push_back(func());
+    funcs(d->funcs);
     for (size_t i = 0, n = count(1); ok && i < n; ++i) {
       auto type = slot<wi::TableType>(); auto init = func();
       if (ok) d->tables.push_back(wi::TableDesc{*wabt::cast<wi::TableType>(type.get()), std::move(init)});
@@ -1430,8 +1481,8 @@ struct RecordReader {
     for (size_t i = 0, n = count(sizeof(wi::Index)); ok && i < n; ++i)
       d->starts.push_back(wi::StartDesc{pod<wi::Index>()});
     for (size_t i = 0, n = count(1); ok && i < n; ++i) {
-      std::vector<wi::FuncDesc> elements;
-      for (size_t j = 0, m = reserve(elements, kFuncRecord); ok && j < m; ++j) elements.push_back(func());
+      wi::DescArray<wi::FuncDesc> elements;
+      funcs(elements);
       auto type = pod<wi::ValueType>(); auto mode = pod<wi::SegmentMode>();
       auto table = pod<wi::Index>(); auto init = func();
       if (ok) d->elems.push_back(wi::ElemDesc{std::move(elements), type, mode, table, std::move(init)});
@@ -1458,7 +1509,7 @@ static std::shared_ptr<const ModuleImage> make_image(const wi::ModuleDesc &desc,
   h.code_size = desc.istream.end();
   h.data_offset = h.code_offset + h.code_size;
   for (const auto &segment : desc.datas) h.data_size += segment.size();
-  h.record_offset = h.data_offset + h.data_size;
+  h.record_offset = (h.data_offset + h.data_size + 7) & ~uint64_t(7);
   h.record_size = record.out.size();
   size_t size = h.record_offset + h.record_size;
   uint8_t *base = web_atomics_image_reserve(size);
@@ -1476,18 +1527,17 @@ static std::shared_ptr<const ModuleImage> make_image(const wi::ModuleDesc &desc,
   memcpy(base + h.record_offset, record.out.data(), h.record_size);
   return image;
 }
-// Moves a descriptor's code stream and data segment bytes to its image.
-static void adopt_image(wi::ModuleDesc *desc, std::shared_ptr<const ModuleImage> image) {
+// The descriptor of an image, over the image's code stream, data segment
+// bytes and tables: what every agent of the module runs, the compiling one
+// included.
+static bool desc_from_image(std::shared_ptr<const ModuleImage> image, wi::ModuleDesc *desc) {
   const ImageHeader &h = image->header;
+  RecordReader reader{image->base + h.record_offset, image->base + h.record_offset + h.record_size};
+  reader.module(desc, image->base + h.data_offset, h.data_size);
+  if (!reader.ok) return false;
   desc->istream.Adopt(image->base + h.code_offset, wi::Istream::Offset(h.code_size));
-  const uint8_t *data = image->base + h.data_offset;
-  for (auto &segment : desc->datas) {
-    size_t size = segment.size();
-    wi::Buffer().swap(segment.data);
-    segment.view = data; segment.view_size = size;
-    data += size;
-  }
   desc->storage = std::move(image);
+  return true;
 }
 static std::shared_ptr<const ModuleImage> import_image(JSContext *ctx, JSValueConst record) {
   size_t length = 0;
@@ -1501,7 +1551,8 @@ static std::shared_ptr<const ModuleImage> import_image(JSContext *ctx, JSValueCo
             h.binary_size <= length - sizeof h && h.code_offset == sizeof h + h.binary_size &&
             h.code_size <= length - h.code_offset && h.code_size <= UINT32_MAX &&
             h.data_offset == h.code_offset + h.code_size && h.data_size <= length - h.data_offset &&
-            h.record_offset == h.data_offset + h.data_size && h.record_size <= length - h.record_offset;
+            h.record_offset == ((h.data_offset + h.data_size + 7) & ~uint64_t(7)) &&
+            h.record_offset <= length && h.record_size <= length - h.record_offset;
   if (!ok) { JS_ThrowTypeError(ctx, "Invalid WebAssembly module image"); return nullptr; }
   return image;
 }
@@ -1527,14 +1578,10 @@ static JSValue module_value(JSContext *ctx, State *s, wi::ModuleDesc desc,
 // the same agent is given.
 static JSValue module_from_image(JSContext *ctx, State *s, std::shared_ptr<const ModuleImage> image,
                                  std::shared_ptr<NativeModule> native, bool compile_natively) {
-  const ImageHeader &h = image->header;
   uint64_t started = uptime_ms();
   wi::ModuleDesc desc;
-  RecordReader reader{image->base + h.record_offset, image->base + h.record_offset + h.record_size};
-  reader.module(&desc, image->base + h.data_offset, h.data_size);
-  if (!reader.ok) return wasm_error(ctx, s, CompileError, "Invalid WebAssembly module image");
-  desc.istream.Adopt(image->base + h.code_offset, wi::Istream::Offset(h.code_size));
-  desc.storage = image;
+  bool decoded = desc_from_image(image, &desc);
+  if (!decoded) return wasm_error(ctx, s, CompileError, "Invalid WebAssembly module image");
   s->stats.image_ms += uptime_ms() - started;
   s->stats.image_bytes += image->size;
   if (compile_natively) {
@@ -1557,10 +1604,15 @@ static JSValue compiled_module(JSContext *ctx, State *s, std::vector<uint8_t> bi
   std::shared_ptr<const ModuleImage> image;
   uint64_t started = uptime_ms();
   if (uses_shared_memory(desc) && (image = make_image(desc, binary))) {
-    adopt_image(&desc, image);
-    std::vector<uint8_t>().swap(binary);
-    s->stats.image_ms += uptime_ms() - started;
-    s->stats.image_bytes += image->size;
+    wi::ModuleDesc shared;
+    if (desc_from_image(image, &shared)) {
+      desc = std::move(shared);
+      std::vector<uint8_t>().swap(binary);
+      s->stats.image_ms += uptime_ms() - started;
+      s->stats.image_bytes += image->size;
+    } else {
+      image.reset();
+    }
   }
   return module_value(ctx, s, std::move(desc), std::move(native), std::move(binary),
                       std::move(image), new_target);
@@ -2070,9 +2122,10 @@ static void table_references(State *s, size_t ref, uint64_t start, uint64_t coun
   anchors.entries.resize(table->size(), 0);
   for (uint64_t j = start; j < start + count; ++j) {
     wi::Ref element = table->UnsafeGet(j);
-    size_t next = element == wi::Ref::Null ? 0 :
-        s->store.Is<wi::DefinedFunc>(element) ?
-        s->store.UnsafeGet<wi::DefinedFunc>(element)->instance().index : element.index;
+    // A table holds most of a module's functions: find their instance without
+    // building each function's object.
+    wi::Ref owner_ref = element == wi::Ref::Null ? wi::Ref::Null : s->store.DefinedFuncInstance(element);
+    size_t next = element == wi::Ref::Null ? 0 : owner_ref != wi::Ref::Null ? owner_ref.index : element.index;
     size_t old = anchors.entries[j];
     if (next == old) continue;
     if (next) {

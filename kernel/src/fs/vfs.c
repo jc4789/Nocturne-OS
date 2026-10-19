@@ -84,7 +84,8 @@ int vfs_normalize(const char *cwd, const char *path, char *out) {
     if (path[0] == '/') {
         if (strlcpy(tmp, path, sizeof tmp) >= sizeof tmp) return -N_ERR_NAME_TOO_LONG;
     } else {
-        ksnprintf(tmp, sizeof tmp, "%s/%s", cwd ? cwd : "/", path);
+        /* a truncated join would silently name a different file */
+        if (ksnprintf(tmp, sizeof tmp, "%s/%s", cwd ? cwd : "/", path) >= (int)sizeof tmp) return -N_ERR_NAME_TOO_LONG;
     }
     /* split into components, resolving . and .. */
     char *comps[64];

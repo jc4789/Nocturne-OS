@@ -182,7 +182,7 @@ uint64_t pci_bar_size(const struct pci_device *d, unsigned bar) {
     if (!pci_bar_address(d, bar)) return 0;
     bool wide = (d->bar[bar] & 6) == 4;
     uint8_t off = 0x10 + bar * 4;
-    uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 4);
+    uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 4) & 0xFFFF; /* not the write-1-to-clear status half */
     uint64_t f = irq_save();
     pci_write32(d->bus, d->dev, d->func, 4, cmd & ~2u);
     pci_write32(d->bus, d->dev, d->func, off, 0xFFFFFFFFu);

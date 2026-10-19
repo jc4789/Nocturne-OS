@@ -86,8 +86,8 @@ function utf8Decode(b) {
         else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
         else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
         else { cp = c & 0x07; n = 4; }
-        for (let k = 1; k < n; k++) cp = cp << 6 | (b[i + k] & 0x3F);
-        s += String.fromCodePoint(cp);
+        for (let k = 1; k < n; k++) cp = cp << 6 | ((b[i + k] ?? 0) & 0x3F);
+        s += String.fromCodePoint(cp > 0x10FFFF ? 0xFFFD : cp); /* a clipboard's stray bytes must not throw */
         i += n;
     }
     return s;

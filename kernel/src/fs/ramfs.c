@@ -6,7 +6,7 @@
 
 static int64_t ram_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
     if (off >= v->size) return 0;
-    if (off + n > v->size) n = v->size - off;
+    if (n > v->size - off) n = v->size - off;
     memcpy(buf, v->data + off, n);
     return n;
 }
@@ -25,6 +25,8 @@ static int ensure_cap(struct vnode *v, uint64_t need) {
 }
 
 static int64_t ram_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
+    if (!n) return 0; /* an empty file has no backing storage to offset into */
+    if (off + n < off) return -N_ERR_NO_SPACE;
     if (ensure_cap(v, off + n) < 0) return -N_ERR_NO_SPACE;
     if (off > v->size) memset(v->data + v->size, 0, off - v->size);
     memcpy(v->data + off, buf, n);

@@ -28,6 +28,7 @@ extern char cpu_brand[64];
 void power_off(void);
 void power_reboot(void);
 int pci_list(struct n_pciinfo *out, int max);
+void vmm_user_pages_split(uint64_t pml4, uint64_t out[6]);
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
 static int copy_to_user(void *udst, const void *src, size_t n);
 
@@ -144,6 +145,21 @@ static void report_memory_exhaustion(struct task *t, int64_t inc) {
             t->pid, t->name, (long)inc, (unsigned long)pmm_free_pages());
     for (int i = 0; i < n; i++) kprintf(" %d/%s %luK", top[i].pid, top[i].name, (unsigned long)top[i].kb);
     kprintf("\n");
+    /* Where the private pages sit, for every process: many middling ones can
+       outweigh the largest. */
+    flags = irq_save();
+    for (struct task *p = task_list; p; p = p->all_next) {
+        if (!p->is_user || p->is_thread) continue;
+        uint64_t s[6];
+        unsigned threads = 0;
+        vmm_user_pages_split(p->pml4, s);
+        for (struct task *q = task_list; q; q = q->all_next)
+            if (q->is_thread && q->process == p && q->state != TASK_ZOMBIE) threads++;
+        kprintf("[memory]  %d/%s image %luK low %luK reserved %luK stack %luK shared %luK tables %luK threads %u\n",
+                p->pid, p->name, (unsigned long)s[0] * 4, (unsigned long)s[1] * 4, (unsigned long)s[2] * 4,
+                (unsigned long)s[3] * 4, (unsigned long)s[4] * 4, (unsigned long)s[5] * 4, threads);
+    }
+    irq_restore(flags);
 }
 
 /* Snapshot the explicit native key length once; never rescan mutable user
@@ -420,9 +436,15 @@ static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache) 
     else if(device?cache==N_CACHE_WRITE_BACK:!root->dma && cache!=src->cache){vfs_close(f);return -N_ERR_DENIED;}
     struct vnode *v;struct shared_pages *p=shared_new(bytes,SHARED_VIEW,0,&v);
     if(!p){vfs_close(f);return -N_ERR_NO_MEMORY;}
+    int access=f->flags&O_ACCMODE;
     p->count=bytes/PAGE_SIZE;p->first=offset/PAGE_SIZE;p->cache=(uint8_t)cache;p->parent=f; /* the view keeps our reference */
+    if(src->kind==SHARED_VIEW){
+        /* A view of a view points at the root object, so a chain of views (which any app can
+           build, closing each parent) never grows the recursion in shared_frame and release. */
+        p->parent=vfs_dup(src->parent);p->first+=src->first;vfs_close(f);
+    }
     struct file *view=NULL;
-    return new_handle(shared_open(v,f->flags&O_ACCMODE,&view),view);
+    return new_handle(shared_open(v,access,&view),view);
 }
 /* Read-only ELF segments: every task running the same program bytes maps one
  * set of frames, so concurrent instances (a worker pool) hold one copy of their
@@ -498,6 +520,14 @@ int shared_program_segment(struct task *t,const char *path,uint64_t va,const uin
 bool shared_demand_fault(uint64_t addr,bool write) {
     struct task *owner=task_process();
     if(!owner)return false;
+    int reserved=vmm_demand_fault(owner->pml4,addr,write); /* a private reserved page */
+    if(reserved>0)return true;
+    if(reserved<0){
+        kprintf("[memory] pid %d (%s): no frame for reserved page %p, %lu pages free\n",
+                owner->pid,owner->name,(void *)ALIGN_DOWN(addr,PAGE_SIZE),(unsigned long)pmm_free_pages());
+        report_memory_exhaustion(owner,PAGE_SIZE);
+        return false;
+    }
     uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE),irq=irq_save();bool ok=false,starved=false;
     for(struct shared_mapping *m=owner->shared_mappings;m;m=m->next){
         if(page<m->va || page-m->va>=m->bytes)continue;
@@ -510,8 +540,11 @@ bool shared_demand_fault(uint64_t addr,bool write) {
         break;
     }
     irq_restore(irq);
-    if(starved)kprintf("[shared] pid %d (%s): no frame for page %p, %lu pages free\n",
-                       owner->pid,owner->name,(void *)page,(unsigned long)pmm_free_pages());
+    if(starved){
+        kprintf("[shared] pid %d (%s): no frame for page %p, %lu pages free\n",
+                owner->pid,owner->name,(void *)page,(unsigned long)pmm_free_pages());
+        report_memory_exhaustion(owner,PAGE_SIZE);
+    }
     return ok;
 }
 /* Maps a shared object the caller holds a handle to (its own, or one received
@@ -636,20 +669,26 @@ static int access_flags(int access) {
     }
 }
 
-/* Committed, zeroed pages in the reservation region above the program (window
-   buffers and shared mappings live there too), or below 2 GiB with N_MEMORY_LOW.
-   These finite BSP helpers do not sleep. Kernel-mode timer IRQs request a
-   reschedule but cannot switch their continuation (idt.c). Keep IRQ delivery
-   enabled for large allocations; each PTE publication has its own short guard. */
+/* Zeroed pages in the reservation region above the program (window buffers
+   and shared mappings live there too), or below 2 GiB with N_MEMORY_LOW.
+   Beyond a few pages they receive frames on first touch, so a process pays
+   only for what it uses; a reservation larger than all free memory still
+   fails here. These finite BSP helpers do not sleep. Kernel-mode timer IRQs
+   request a reschedule but cannot switch their continuation (idt.c). Keep IRQ
+   delivery enabled for large allocations; each PTE publication has its own
+   short guard. */
+#define RESERVE_EAGER (64 * 1024)
 static int64_t sys_memory_reserve(size_t len, int access) {
     struct task *t = task_process();
     int vp = access_flags(access & ~N_MEMORY_LOW);
     if (len == 0 || len > (1ULL << 32) || vp < 0) return -N_ERR_INVALID;
     len = ALIGN_UP(len, PAGE_SIZE);
+    if (len / PAGE_SIZE > pmm_free_pages()) { report_memory_exhaustion(t, len); return -N_ERR_NO_MEMORY; }
     uint64_t va = access & N_MEMORY_LOW ? region_reserve(&t->low_holes, &t->low_next, USER_LOW_TOP, len)
                                         : mmap_reserve(t, len);
     if (!va) return -N_ERR_NO_MEMORY;
-    if (vmm_user_alloc(t->pml4, va, len, vp) < 0) {
+    int r = len <= RESERVE_EAGER ? vmm_user_alloc(t->pml4, va, len, vp) : vmm_user_reserve(t->pml4, va, len, vp);
+    if (r < 0) {
         vmm_user_free(t->pml4, va, len);
         mmap_hole_add(t, va, len + PAGE_SIZE);
         report_memory_exhaustion(t, len);
@@ -678,7 +717,7 @@ static int64_t sys_memory_release(uint64_t va, size_t len) {
     vmm_user_free(t->pml4, va, len);
     /* The unmapped page right after the range is the reservation's guard. */
     uint64_t end = va + len;
-    bool guard = end < frontier && !(vmm_get_pte(t->pml4, end) & PTE_P);
+    bool guard = end < frontier && !(vmm_get_leaf(t->pml4, end) & (PTE_P | PTE_DEMAND)); /* not an untouched reserved page */
     for (struct shared_mapping *m = t->shared_mappings; guard && m; m = m->next)
         if (end >= m->va && end < m->va + m->bytes) guard = false; /* an untouched demand page */
     mmap_hole_add(t, va, guard ? len + PAGE_SIZE : len);

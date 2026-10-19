@@ -8,6 +8,7 @@
 #include "form_value.h"
 #include "nocturne.h"
 #include "quickjs.h"
+#include "js_memory.h"
 #include "libregexp.h"
 #include "js_form_url.inc"
 #include <limits.h>
@@ -149,7 +150,7 @@ static struct validation_state *validation_state(web_doc *d) {
     struct validation_state *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->url_check = JS_UNDEFINED;
-    s->rt = JS_NewRuntime();
+    s->rt = web_js_new_runtime(NULL);
     if (!s->rt) { free(s); return NULL; }
     JS_SetMemoryLimit(s->rt, SIZE_MAX);
     JS_SetMaxStackSize(s->rt, 256u << 10);

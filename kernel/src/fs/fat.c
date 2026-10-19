@@ -168,8 +168,12 @@ static uint32_t node_first(struct vnode *v) { return ((struct fat_node *)v->priv
 
 /* read a whole directory into memory; *len gets its size in bytes */
 static uint8_t *dir_load(struct fat_fs *fs, uint32_t first, uint32_t *len) {
+    /* A FAT directory holds at most 65536 entries (2 MiB). The bound also stops a damaged, circular
+       chain from asking for gigabytes, and keeps n * cbytes inside 32 bits. */
+    uint32_t max_clusters = (uint32_t)((2u << 20) / fs->cbytes);
+    if (!max_clusters) max_clusters = 1;
     uint32_t n = 0;
-    for (uint32_t c = first; clus_valid(fs, c) && n < 65536; c = fat_get(fs, c)) n++;
+    for (uint32_t c = first; clus_valid(fs, c) && n < max_clusters; c = fat_get(fs, c)) n++;
     uint8_t *buf = kmalloc((size_t)MAX(n, 1u) * fs->cbytes);
     if (!buf) return NULL;
     uint32_t i = 0;
@@ -383,7 +387,7 @@ static int64_t fat_read(struct vnode *v, struct file *f, void *buf, uint64_t off
     struct fat_node *n = v->priv;
     struct fat_fs *fs = n->fs;
     if (off >= v->size) return 0;
-    if (off + len > v->size) len = v->size - off;
+    if (len > v->size - off) len = v->size - off; /* off + len could wrap */
     uint8_t *tmp = kmalloc(fs->cbytes);
     if (!tmp) return -N_ERR_NO_MEMORY;
     uint32_t c = chain_nth(fs, n->first, off / fs->cbytes);
@@ -416,7 +420,8 @@ static int64_t fat_store(struct vnode *v, const void *buf, uint64_t off, uint64_
     /* grow the chain to cover the write */
     uint64_t have = 0;
     uint32_t last = 0;
-    for (uint32_t c = n->first; clus_valid(fs, c); c = fat_get(fs, c)) {
+    /* Count only as far as this write needs: a damaged, circular chain must not hang the count. */
+    for (uint32_t c = n->first; clus_valid(fs, c) && have < need; c = fat_get(fs, c)) {
         have++;
         last = c;
     }
@@ -965,8 +970,19 @@ static struct fat_fs *try_volume(struct blkdev *disk, uint64_t lba, char *label)
     uint16_t root_entries = *(uint16_t *)(bs + 17);
     uint32_t total = *(uint16_t *)(bs + 19) ? *(uint16_t *)(bs + 19) : *(uint32_t *)(bs + 32);
     uint32_t fat_sectors = *(uint32_t *)(bs + 36);
-    if (bps != SECTOR || !spc || (spc & (spc - 1)) || !nfats || root_entries || !fat_sectors) return NULL;
+    if (bps != SECTOR || !spc || (spc & (spc - 1)) || !nfats || root_entries || !fat_sectors || spc > 128 || !reserved)
+        return NULL;
+    /* The geometry comes from an untrusted disk. The metadata must fit inside the volume (and the
+       volume inside the disk), or the cluster count below underflows and every allocation scan
+       walks billions of unreadable clusters. */
+    uint64_t data_start = reserved + (uint64_t)nfats * fat_sectors;
+    if (disk->sectors) {
+        if (lba >= disk->sectors) return NULL;
+        if (total > disk->sectors - lba) total = (uint32_t)(disk->sectors - lba);
+    }
+    if (data_start >= total || (total - data_start) / spc < 1) return NULL;
     struct fat_fs *fs = kzalloc(sizeof *fs);
+    if (!fs) return NULL;
     fs->disk = disk;
     fs->lba0 = lba;
     fs->spc = spc;
@@ -977,6 +993,16 @@ static struct fat_fs *try_volume(struct blkdev *disk, uint64_t lba, char *label)
     fs->root_clus = *(uint32_t *)(bs + 44);
     fs->data_lba = reserved + (uint64_t)nfats * fat_sectors;
     fs->nclus = (uint32_t)((total - fs->data_lba) / spc);
+    /* Entries 0..nclus+1 must exist in one FAT copy, or the FAT accessors reach into the data area
+       (and fat_set would overwrite it). A cluster number is also limited to 28 bits. */
+    uint64_t fat_entries = (uint64_t)fat_sectors * (SECTOR / 4);
+    if (fs->nclus > fat_entries - 2) fs->nclus = (uint32_t)(fat_entries - 2);
+    if (fs->nclus > 0x0FFFFFF0u) fs->nclus = 0x0FFFFFF0u;
+    if (!clus_valid(fs, fs->root_clus)) {
+        kprintf("fat: %s: root cluster %u outside the volume\n", disk->name, fs->root_clus);
+        kfree(fs);
+        return NULL;
+    }
     fs->free_hint = 2;
     fs->fsinfo = *(uint16_t *)(bs + 48);
     volume_label(fs, bs, label);

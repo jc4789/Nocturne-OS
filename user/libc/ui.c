@@ -1943,7 +1943,10 @@ static void render(struct uiwin *w) {
     w->dirty = false;
     w->hold = false;
     w->animating = false;
-    if (win_begin_frame(w->win) < 0 || !c->px) return; /* a double-buffered window waits for a free buffer */
+    if (win_begin_frame(w->win) < 0 || !c->px) { /* a double-buffered window waits for a free buffer: ask again soon, the picture is not lost */
+        w->redraw_at = w->now + 8;
+        return;
+    }
     if (w->n) layout(w);
     w->deep = win_deep(w->win);
     /* a new canvas, a deep plane come or gone and the other buffer of a double-buffered window
@@ -2100,7 +2103,9 @@ static void set_surface(struct ui_session *s, uint32_t id, uint32_t width, uint3
     struct surface *sf = surface_of(s, id);
     n_result result = 0;
     bool deep = flags & UI_SURFACE_DEEP;
-    if (!width || !height || width > 16384 || height > 16384 || (flags & ~UI_SURFACE_DEEP)) result = -N_ERR_INVALID;
+    /* the request may come from another process (uihost): no surface of more than 2^27 pixels (512 MiB) */
+    if (!width || !height || width > 16384 || height > 16384 || (uint64_t)width * height > (1u << 27) ||
+        (flags & ~UI_SURFACE_DEEP)) result = -N_ERR_INVALID;
     else if (!sf || sf->c.w != (int)width || sf->c.h != (int)height || sf->deep != deep) {
         struct surface *fresh = calloc(1, sizeof *fresh);
         size_t bytes = ((size_t)width * height * (deep ? 5 : 4) + 4095) & ~(size_t)4095;

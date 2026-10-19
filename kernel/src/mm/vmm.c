@@ -324,6 +324,12 @@ uint64_t vmm_get_pte(uint64_t pml4, uint64_t va) {
     return *p;
 }
 
+uint64_t vmm_get_leaf(uint64_t pml4, uint64_t va) {
+    bool huge = false;
+    uint64_t *p = walk(pml4, va, &huge);
+    return p ? *p : 0;
+}
+
 uint64_t vmm_translate(uint64_t pml4, uint64_t va) {
     bool huge = false;
     uint64_t *p = walk(pml4, va, &huge);
@@ -342,7 +348,8 @@ static void unmap_range(uint64_t pml4, uint64_t va, uint64_t pages, uint64_t *ol
         bool huge = false;
         uint64_t *p = walk(pml4, va + i * PAGE_SIZE, &huge);
         old[i] = 0;
-        if (!p || !(*p & PTE_P) || huge) continue;
+        if (!p || huge) continue;
+        if (!(*p & PTE_P)) { *p = 0; continue; } /* drops a reservation marker; never cached */
         if (!any) revoke_begin(pml4);
         any = true;
         old[i] = *p;
@@ -497,6 +504,38 @@ uint64_t vmm_user_pages(uint64_t pml4) {
     return n;
 }
 
+/* Diagnostic split of an address space's private pages: [0] program image and
+ * sbrk heap, [1] low reservations, [2] the reservation region, [3] main stack,
+ * [4] shared leaves mapped, [5] page-table frames. A full walk: only for the
+ * rare out-of-memory report. */
+void vmm_user_pages_split(uint64_t pml4, uint64_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = 0;
+    if (!pml4 || pml4 == kernel_pml4) return;
+    uint64_t *l4 = tbl(pml4);
+    for (int a = 0; a < 256; a++) {
+        if (!(l4[a] & PTE_P)) continue;
+        uint64_t *l3 = phys_to_virt(l4[a] & PTE_ADDR);
+        out[5]++;
+        for (int b = 0; b < 512; b++) {
+            if (!(l3[b] & PTE_P)) continue;
+            uint64_t *l2 = phys_to_virt(l3[b] & PTE_ADDR);
+            out[5]++;
+            for (int c = 0; c < 512; c++) {
+                if (!(l2[c] & PTE_P)) continue;
+                uint64_t *l1 = phys_to_virt(l2[c] & PTE_ADDR);
+                uint64_t va = ((uint64_t)a << 39) | ((uint64_t)b << 30) | ((uint64_t)c << 21);
+                int region = va < USER_LOW_BASE ? 0 : va < USER_MMAP_BASE ? 1
+                           : va < USER_STACK_TOP - USER_STACK_MAX ? 2 : 3;
+                out[5]++;
+                for (int d = 0; d < 512; d++) {
+                    if (!(l1[d] & PTE_P)) continue;
+                    out[l1[d] & PTE_SHARED ? 4 : region]++;
+                }
+            }
+        }
+    }
+}
+
 static uint64_t prot_flags(int prot) {
     return PTE_U | (prot & VM_W ? PTE_W : 0) | (prot & VM_X ? 0 : pte_nx);
 }
@@ -544,6 +583,84 @@ int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
     return result;
 }
 
+/* Reserve pages that receive a zeroed frame only when first touched: a
+   non-present leaf holds PTE_DEMAND and the page's protection. Present pages
+   keep their contents and gain the permissions, as with vmm_user_alloc. Only
+   the page tables are allocated here. */
+int vmm_user_reserve(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
+    uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
+    uint64_t lo = end, hi = start, marker = prot_flags(prot) | PTE_DEMAND;
+    int result = 0;
+    for (uint64_t a = start; a < end; a += PAGE_SIZE) {
+        uint64_t f = irq_save();
+        bool stale = false;
+        uint64_t *l4 = tbl(pml4);
+        uint64_t *l3 = next_level(l4, (a >> 39) & 511, true, true, 4, &stale);
+        uint64_t *l2 = l3 ? next_level(l3, (a >> 30) & 511, true, true, 3, &stale) : NULL;
+        uint64_t *l1 = l2 ? next_level(l2, (a >> 21) & 511, true, true, 2, &stale) : NULL;
+        if (stale) tlb_shootdown(pml4, a, 1);
+        if (!l1) { irq_restore(f); result = -N_ERR_NO_MEMORY; break; }
+        uint64_t *leaf = &l1[(a >> 12) & 511], now = *leaf;
+        if (now & PTE_P) {
+            if ((now & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) result = -N_ERR_DENIED;
+            else {
+                if (prot & VM_W) now |= PTE_W;
+                if (prot & VM_X) now &= ~PTE_NX;
+                if (now != *leaf) { *leaf = now; lo = MIN(lo, a); hi = MAX(hi, a + PAGE_SIZE); }
+            }
+        } else if (now & PTE_DEMAND) {
+            if (prot & VM_W) now |= PTE_W;
+            if (prot & VM_X) now &= ~PTE_NX;
+            *leaf = now;
+        } else {
+            *leaf = marker;
+        }
+        irq_restore(f);
+        if (result) break;
+    }
+    if (lo < hi) {
+        uint64_t f = irq_save();
+        tlb_shootdown(pml4, lo, (hi - lo) / PAGE_SIZE);
+        irq_restore(f);
+    }
+    return result;
+}
+
+/* Reserved pages filled together with a touched one: the following leaves of
+   the same table, so ascending first touches fault once per 64 KiB. */
+#define DEMAND_AROUND 16
+
+int vmm_demand_fault(uint64_t pml4, uint64_t va, bool write) {
+    if (va >= USER_TOP || !pml4 || pml4 == kernel_pml4) return 0;
+    uint64_t page = ALIGN_DOWN(va, PAGE_SIZE), f = irq_save();
+    bool huge = false;
+    int result = 0;
+    uint64_t *pte = walk(pml4, page, &huge);
+    if (pte && !huge) {
+        uint64_t e = *pte;
+        if (e & PTE_P) result = 1; /* a sibling filled it first */
+        else if ((e & PTE_DEMAND) && (!write || (e & PTE_W))) {
+            uint64_t p = pmm_alloc_zeroed();
+            result = p ? 1 : -N_ERR_NO_MEMORY;
+            if (p) {
+                *pte = p | (e & ~PTE_DEMAND) | PTE_P;
+                user_page_count_change(pml4, page, e, *pte);
+                uint64_t *l1 = pte - ((page >> 12) & 511);
+                for (unsigned idx = ((page >> 12) & 511) + 1, n = 1; idx < 512 && n < DEMAND_AROUND; idx++, n++) {
+                    uint64_t next = l1[idx];
+                    if ((next & (PTE_P | PTE_DEMAND)) != PTE_DEMAND || pmm_free_pages() < 4096) break;
+                    uint64_t q = pmm_alloc_zeroed();
+                    if (!q) break;
+                    l1[idx] = q | (next & ~PTE_DEMAND) | PTE_P;
+                    user_page_count_change(pml4, page + n * PAGE_SIZE, next, l1[idx]);
+                }
+            }
+        }
+    }
+    irq_restore(f);
+    return result;
+}
+
 /* mprotect: set exactly these permissions on already-mapped user pages */
 int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
@@ -551,7 +668,7 @@ int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
-        if (!pte || !(*pte & PTE_P) || huge || !(*pte & PTE_U)) { irq_restore(f); return -N_ERR_NO_MEMORY; }
+        if (!pte || !(*pte & (PTE_P | PTE_DEMAND)) || huge || !(*pte & PTE_U)) { irq_restore(f); return -N_ERR_NO_MEMORY; }
         if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) { irq_restore(f); return -N_ERR_DENIED; }
     }
     if (start < end) revoke_begin(pml4);
@@ -581,7 +698,12 @@ int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n) {
     const uint8_t *s = src;
     while (n) {
         uint64_t pa = vmm_translate(pml4, va);
-        if (!pa) return -N_ERR_BAD_ADDRESS;
+        if (!pa) {
+            int d = vmm_demand_fault(pml4, va, false); /* the loader also fills read-only pages */
+            if (d <= 0) return d < 0 ? d : -N_ERR_BAD_ADDRESS;
+            pa = vmm_translate(pml4, va);
+            if (!pa) return -N_ERR_BAD_ADDRESS;
+        }
         size_t chunk = MIN(n, PAGE_SIZE - (va & 0xFFF));
         if (s) memcpy(phys_to_virt(pa), s, chunk);
         else memset(phys_to_virt(pa), 0, chunk);

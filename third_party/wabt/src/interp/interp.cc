@@ -302,10 +302,11 @@ bool CanGrow(const Limits& limits, T old_size, T delta, T* new_size) {
 //// FuncDesc ////
 
 ValueType ModuleDesc::GetLocalType(const FuncDesc& func, Index index) const {
-  if (index < func.type->params.size()) {
-    return func.type->params[index];
+  const FuncType& type = Type(func);
+  if (index < type.params.size()) {
+    return type.params[index];
   }
-  index -= func.type->params.size();
+  index -= type.params.size();
 
   const LocalDesc* begin = locals.data() + func.locals;
   const LocalDesc* end = begin + func.local_count;
@@ -336,7 +337,7 @@ bool Store::HasValueType(Ref ref, ValueType type) const {
     return true;
   }
 
-  Object* obj = objects_.Get(ref.index);
+  Object* obj = Resolve(ref.index);
   switch (type) {
     case ValueType::FuncRef:
     case ValueType::Ref:
@@ -396,7 +397,7 @@ void Store::Collect() {
     assert(gc_context_.call_depth == 0);
 
     gc_context_.untraced_objects.pop_back();
-    objects_.Get(index)->Mark(*this);
+    Trace(index);
   }
 
   assert(gc_context_.call_depth == 0);
@@ -423,7 +424,7 @@ void Store::Mark(Ref ref) {
   }
 
   gc_context_.call_depth++;
-  objects_.Get(index)->Mark(*this);
+  Trace(index);
   gc_context_.call_depth--;
 }
 
@@ -431,6 +432,38 @@ void Store::Mark(const RefVec& refs) {
   for (auto&& ref : refs) {
     Mark(ref);
   }
+}
+
+// A reserved function is not built to be marked: like a built one, it keeps
+// its instance alive.
+void Store::Trace(size_t index) {
+  uintptr_t entry = reinterpret_cast<uintptr_t>(objects_.Get(index));
+  if (entry & ObjectList::ptrReservedBit) {
+    Mark(reserved_funcs_[entry >> 32].instance);
+  } else {
+    reinterpret_cast<Object*>(entry)->Mark(*this);
+  }
+}
+
+void Store::ReserveFuncs(Ref instance, const ModuleDesc& module, RefVec* out) {
+  size_t count = module.funcs.size();
+  assert(count < (size_t(1) << 30) && reserved_funcs_.size() < (size_t(1) << 32));
+  uintptr_t group = reserved_funcs_.size();
+  reserved_funcs_.push_back({instance, &module});
+  for (size_t i = 0; i < count; ++i) {
+    uintptr_t entry = (group << 32) | (uintptr_t(i) << 2) | ObjectList::ptrReservedBit;
+    out->push_back(Ref{objects_.New(reinterpret_cast<Object*>(entry))});
+  }
+}
+
+Object* Store::Build(size_t index) {
+  uintptr_t entry = reinterpret_cast<uintptr_t>(objects_.Get(index));
+  const ReservedFuncs& group = reserved_funcs_[entry >> 32];
+  auto* func = new DefinedFunc(*this, group.instance, *group.module,
+                               group.module->funcs[(entry >> 2) & ((1u << 30) - 1)]);
+  func->self_ = Ref(index);
+  objects_.Get(index) = func;
+  return func;
 }
 
 //// Object ////
@@ -522,8 +555,11 @@ Result Func::Call(Thread& thread,
 }
 
 //// DefinedFunc ////
-DefinedFunc::DefinedFunc(Store& store, Ref instance, const FuncDesc& desc)
-    : Func(skind, desc.type), instance_(instance), desc_(&desc) {}
+DefinedFunc::DefinedFunc(Store& store,
+                         Ref instance,
+                         const ModuleDesc& module,
+                         const FuncDesc& desc)
+    : Func(skind, &module.Type(desc)), instance_(instance), desc_(&desc) {}
 
 void DefinedFunc::Mark(Store& store) {
   store.Mark(instance_);
@@ -910,7 +946,8 @@ ElemSegment::ElemSegment(Store& store,
     : desc_(desc) {
   Trap::Ptr out_trap;
   elements_.reserve(desc->elements.size());
-  const Istream& code = store.UnsafeGet<Module>(inst->module())->desc().istream;
+  const ModuleDesc& module = store.UnsafeGet<Module>(inst->module())->desc();
+  const Istream& code = module.istream;
   for (auto&& elem_expr : desc->elements) {
     // `ref.func i` and `ref.null` are nearly all of a large module's elements:
     // take their value without a function object and a thread per element.
@@ -923,7 +960,7 @@ ElemSegment::ElemSegment(Store& store,
       continue;
     }
     Value value;
-    Ref func_ref = DefinedFunc::New(store, inst.ref(), elem_expr).ref();
+    Ref func_ref = DefinedFunc::New(store, inst.ref(), module, elem_expr).ref();
     if (Failed(inst->CallInitFunc(store, func_ref, &value, &out_trap))) {
       WABT_UNREACHABLE;  // valid const expression cannot trap
     }
@@ -946,14 +983,14 @@ bool DataSegment::IsValidRange(u64 offset, u64 size) const {
 }
 
 //// ModuleDesc ////
-const FuncType* ModuleDesc::InitType(ValueType result) {
-  for (auto& type : init_types) {
-    if (type->results[0] == result) {
-      return type.get();
+u32 ModuleDesc::InitType(ValueType result) {
+  for (size_t i = 0; i < init_types.size(); ++i) {
+    if (init_types[i]->results[0] == result) {
+      return FuncDesc::kInitType | static_cast<u32>(i);
     }
   }
   init_types.push_back(std::make_unique<FuncType>(ValueTypes{}, ValueTypes{result}));
-  return init_types.back().get();
+  return FuncDesc::kInitType | static_cast<u32>(init_types.size() - 1);
 }
 
 //// Module ////
@@ -1039,15 +1076,13 @@ Instance::Ptr Instance::Instantiate(Store& store,
   }
 
   // Funcs.
-  for (auto&& desc : mod->desc().funcs) {
-    inst->funcs_.push_back(DefinedFunc::New(store, inst.ref(), desc).ref());
-  }
+  store.ReserveFuncs(inst.ref(), mod->desc(), &inst->funcs_);
 
   // Tables.
   for (auto&& desc : mod->desc().tables) {
     Ref ref = Ref::Null;
     if (desc.init_func.code_offset != Istream::kInvalidOffset) {
-      Ref func_ref = DefinedFunc::New(store, inst.ref(), desc.init_func).ref();
+      Ref func_ref = DefinedFunc::New(store, inst.ref(), mod->desc(), desc.init_func).ref();
       Value value;
       if (Failed(inst->CallInitFunc(store, func_ref, &value, out_trap))) {
         return {};
@@ -1075,7 +1110,7 @@ Instance::Ptr Instance::Instantiate(Store& store,
   // Globals.
   for (auto&& desc : mod->desc().globals) {
     Value value;
-    Ref func_ref = DefinedFunc::New(store, inst.ref(), desc.init_func).ref();
+    Ref func_ref = DefinedFunc::New(store, inst.ref(), mod->desc(), desc.init_func).ref();
     if (Failed(inst->CallInitFunc(store, func_ref, &value, out_trap))) {
       return {};
     }
@@ -1126,7 +1161,7 @@ Instance::Ptr Instance::Instantiate(Store& store,
         Table::Ptr table{store, inst->tables_[desc.table_index]};
         Value value;
         Ref func_ref =
-            DefinedFunc::New(store, inst.ref(), desc.init_func).ref();
+            DefinedFunc::New(store, inst.ref(), mod->desc(), desc.init_func).ref();
         if (Failed(inst->CallInitFunc(store, func_ref, &value, out_trap))) {
           return {};
         }
@@ -1170,7 +1205,7 @@ Instance::Ptr Instance::Instantiate(Store& store,
         Memory::Ptr memory{store, inst->memories_[desc.memory_index]};
         Value offset_op;
         Ref func_ref =
-            DefinedFunc::New(store, inst.ref(), desc.init_func).ref();
+            DefinedFunc::New(store, inst.ref(), mod->desc(), desc.init_func).ref();
         if (Failed(inst->CallInitFunc(store, func_ref, &offset_op, out_trap))) {
           return {};
         }

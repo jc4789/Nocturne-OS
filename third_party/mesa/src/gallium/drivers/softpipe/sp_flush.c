@@ -62,7 +62,8 @@ softpipe_flush( struct pipe_context *pipe,
 
       for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
          for (i = 0; i < softpipe->num_sampler_views[sh]; i++) {
-            sp_flush_tex_tile_cache(softpipe->tex_cache[sh][i]);
+            if (softpipe->tex_cache[sh][i])
+               sp_flush_tex_tile_cache(softpipe->tex_cache[sh][i]);
          }
       }
    }
@@ -191,7 +192,8 @@ void softpipe_texture_barrier(struct pipe_context *pipe, unsigned flags)
 #endif
    for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
       for (i = 0; i < softpipe->num_sampler_views[sh]; i++) {
-         sp_flush_tex_tile_cache(softpipe->tex_cache[sh][i]);
+         if (softpipe->tex_cache[sh][i])
+            sp_flush_tex_tile_cache(softpipe->tex_cache[sh][i]);
       }
    }
 

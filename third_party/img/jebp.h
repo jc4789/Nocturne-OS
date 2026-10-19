@@ -2591,6 +2591,9 @@ static jebp_error_t jebp__alloc_huffman(jebp__huffman_t **huffmans,
     jebp__huffman_t primary[JEBP__NB_PRIMARY_HUFFMANS];
     for (jebp_int i = 0; i < JEBP__NB_PRIMARY_HUFFMANS; i += 1) {
         primary[i].symbol = JEBP__NO_HUFFMAN_SYMBOL;
+        // An incomplete code leaves entries no symbol claims; their length is
+        // read below, so it must not be uninitialized stack.
+        primary[i].length = 0;
     }
 
     // Fill in the 8-bit codes in the primary table

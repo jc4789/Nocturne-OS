@@ -654,7 +654,7 @@ Result BinaryReaderInterp::OnFunction(Index index, Index sig_index) {
   CHECK_RESULT(
       validator_.OnFunction(GetLocation(), Var(sig_index, GetLocation())));
   FuncType& func_type = module_.func_types[sig_index];
-  module_.funcs.push_back(FuncDesc{&func_type});
+  module_.funcs.push_back(FuncDesc{sig_index});
   func_types_.push_back(func_type);
   return Result::Ok;
 }
@@ -738,7 +738,7 @@ Result BinaryReaderInterp::BeginInitExpr(FuncDesc* func) {
   label_stack_.clear();
   func_ = func;
   func_->code_offset = istream_.end();
-  Type type = func->type->results[0];
+  Type type = module_.Type(*func).results[0];
   CHECK_RESULT(validator_.BeginInitExpr(GetLocation(), type));
   // Push implicit init func label (equivalent to return).
   PushLabel(LabelKind::Try, Istream::kInvalidOffset, Istream::kInvalidOffset);
@@ -959,7 +959,7 @@ Result BinaryReaderInterp::EndLocalDecls() {
   if (local_count_ != 0) {
     istream_.Emit(Opcode::InterpAlloca, local_count_);
     for (Index i = 0; i < local_count_; i++) {
-      if (module_.GetLocalType(*func_, func_->type->params.size() + i).IsRef()) {
+      if (module_.GetLocalType(*func_, module_.Type(*func_).params.size() + i).IsRef()) {
         istream_.Emit(Opcode::InterpMarkRef, local_count_ - i);
       }
     }

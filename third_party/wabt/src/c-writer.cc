@@ -1215,8 +1215,8 @@ void CWriter::Write(const TagSymbol& name) {
 
 void CWriter::Write(const ExternalInstancePtr& name) {
   if (options_.host_resources && name.type == ModuleFieldType::Memory) {
-    Write("instance->memory(instance->opaque, ",
-          module_->GetMemoryIndex(Var(name.name, {})), ")");
+    Write("(&instance->memories[",
+          module_->GetMemoryIndex(Var(name.name, {})), "])");
     return;
   }
   if (!IsImport(name.name)) {

@@ -184,7 +184,7 @@ bool FreeList<T>::IsUsed(Index index) const {
 template <typename T>
 FreeList<T>::~FreeList() {
   for (auto object : list_) {
-    if ((reinterpret_cast<uintptr_t>(object) & ptrFreeBit) == 0) {
+    if ((reinterpret_cast<uintptr_t>(object) & (ptrFreeBit | ptrReservedBit)) == 0) {
       delete object;
     }
   }
@@ -213,7 +213,9 @@ template <typename T>
 void FreeList<T>::Delete(Index index) {
   assert(IsUsed(index));
 
-  delete list_[index];
+  if ((reinterpret_cast<uintptr_t>(list_[index]) & ptrReservedBit) == 0) {
+    delete list_[index];
+  }
   list_[index] = reinterpret_cast<T>((free_head_ << ptrFreeShift) | ptrFreeBit);
   free_head_ = index + 1;
   free_items_++;
@@ -253,7 +255,7 @@ RefPtr<T>::RefPtr(Store& store, Ref ref) {
     if (ref == Ref::Null) {
       ref_kind = ObjectKind::Null;
     } else {
-      ref_kind = store.objects_.Get(ref.index)->kind();
+      ref_kind = store.Resolve(ref.index)->kind();
     }
     fprintf(stderr, "Invalid conversion from Ref (%s) to RefPtr<%s>!\n",
             GetName(ref_kind), T::GetTypeName());
@@ -261,7 +263,7 @@ RefPtr<T>::RefPtr(Store& store, Ref ref) {
   }
 #endif
   root_index_ = store.NewRoot(ref);
-  obj_ = static_cast<T*>(store.objects_.Get(ref.index));
+  obj_ = static_cast<T*>(store.Resolve(ref.index));
   store_ = &store;
 }
 
@@ -481,13 +483,42 @@ template <> inline void WABT_VECTORCALL Value::Set<v128>(v128 val) { v128_ = val
 template <> inline void WABT_VECTORCALL Value::Set<Ref>(Ref val) { ref_ = val; SetType(ValueType::ExternRef); }
 
 //// Store ////
+inline Object* Store::Resolve(size_t index) const {
+  Object* obj = objects_.Get(index);
+  if (WABT_UNLIKELY(reinterpret_cast<uintptr_t>(obj) & ObjectList::ptrReservedBit)) {
+    obj = const_cast<Store*>(this)->Build(index);
+  }
+  return obj;
+}
+
+inline Ref Store::DefinedFuncInstance(Ref ref) const {
+  if (!objects_.IsUsed(ref.index)) return Ref::Null;
+  uintptr_t entry = reinterpret_cast<uintptr_t>(objects_.Get(ref.index));
+  if (entry & ObjectList::ptrReservedBit) return reserved_funcs_[entry >> 32].instance;
+  auto* obj = reinterpret_cast<Object*>(entry);
+  return obj && isa<DefinedFunc>(obj) ? static_cast<DefinedFunc*>(obj)->instance() : Ref::Null;
+}
+
+// A reserved function is a DefinedFunc that is not built yet: asking whether
+// it is valid, or of a kind, does not build it.
+inline const Object& Store::ReservedFuncKind() {
+  static const Object kind(ObjectKind::DefinedFunc);
+  return kind;
+}
+
 inline bool Store::IsValid(Ref ref) const {
-  return objects_.IsUsed(ref.index) && objects_.Get(ref.index);
+  if (!objects_.IsUsed(ref.index)) return false;
+  Object* obj = objects_.Get(ref.index);
+  return (reinterpret_cast<uintptr_t>(obj) & ObjectList::ptrReservedBit) || obj;
 }
 
 template <typename T>
 bool Store::Is(Ref ref) const {
-  return objects_.IsUsed(ref.index) && isa<T>(objects_.Get(ref.index));
+  if (!objects_.IsUsed(ref.index)) return false;
+  Object* obj = objects_.Get(ref.index);
+  if (WABT_UNLIKELY(reinterpret_cast<uintptr_t>(obj) & ObjectList::ptrReservedBit))
+    return isa<T>(&ReservedFuncKind());
+  return isa<T>(obj);
 }
 
 template <typename T>
@@ -654,8 +685,9 @@ inline bool DefinedFunc::classof(const Object* obj) {
 // static
 inline DefinedFunc::Ptr DefinedFunc::New(Store& store,
                                          Ref instance,
+                                         const ModuleDesc& module,
                                          const FuncDesc& desc) {
-  return store.Alloc<DefinedFunc>(store, instance, desc);
+  return store.Alloc<DefinedFunc>(store, instance, module, desc);
 }
 
 inline Ref DefinedFunc::instance() const {
@@ -915,7 +947,9 @@ inline const TagType& Tag::type() const {
 
 //// ElemSegment ////
 inline void ElemSegment::Drop() {
-  elements_.clear();
+  // Released, not only emptied: a large module's segment holds a word per
+  // table entry for the life of the instance.
+  RefVec().swap(elements_);
 }
 
 inline const ElemDesc& ElemSegment::desc() const {

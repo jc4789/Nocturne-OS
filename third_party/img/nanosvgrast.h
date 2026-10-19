@@ -332,6 +332,8 @@ static float nsvg__normalize(float *x, float* y)
 
 static float nsvg__absf(float x) { return x < 0 ? -x : x; }
 static float nsvg__roundf(float x) { return (x >= 0) ? floorf(x + 0.5) : ceilf(x - 0.5); }
+// Float to int that never leaves the range (NaN -> lowest bound).
+static int nsvg__ftoi_sat(float v) { return !(v > -1e9f) ? -1000000000 : v > 1e9f ? 1000000000 : (int)v; }
 
 static void nsvg__flattenCubicBez(NSVGrasterizer* r,
 								  float x1, float y1, float x2, float y2,
@@ -602,7 +604,10 @@ static void nsvg__straightJoin(NSVGrasterizer* r, NSVGpoint* left, NSVGpoint* ri
 static int nsvg__curveDivs(float r, float arc, float tol)
 {
 	float da = acosf(r / (r + tol)) * 2.0f;
-	int divs = (int)ceilf(arc / da);
+	// da underflows to 0 for huge radii; ceilf(inf) -> int is undefined, and an
+	// unbounded division count would make joins/caps effectively endless.
+	float want = ceilf(arc / da);
+	int divs = want < 4096.0f ? (int)want : 4096;
 	if (divs < 2) divs = 2;
 	return divs;
 }
@@ -873,12 +878,13 @@ static NSVGactiveEdge* nsvg__addActive(NSVGrasterizer* r, NSVGedge* e, float sta
 
 	float dxdy = (e->x1 - e->x0) / (e->y1 - e->y0);
 //	STBTT_assert(e->y0 <= start_point);
-	// round dx down to avoid going too far
+	// round dx down to avoid going too far. Hostile coordinates can leave the
+	// int range; saturate instead of an undefined float-to-int conversion.
 	if (dxdy < 0)
-		z->dx = (int)(-nsvg__roundf(NSVG__FIX * -dxdy));
+		z->dx = nsvg__ftoi_sat(-nsvg__roundf(NSVG__FIX * -dxdy));
 	else
-		z->dx = (int)nsvg__roundf(NSVG__FIX * dxdy);
-	z->x = (int)nsvg__roundf(NSVG__FIX * (e->x0 + dxdy * (startPoint - e->y0)));
+		z->dx = nsvg__ftoi_sat(nsvg__roundf(NSVG__FIX * dxdy));
+	z->x = nsvg__ftoi_sat(nsvg__roundf(NSVG__FIX * (e->x0 + dxdy * (startPoint - e->y0))));
 //	z->x -= off_x * FIX;
 	z->ey = e->y1;
 	z->next = 0;

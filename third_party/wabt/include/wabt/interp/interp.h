@@ -435,16 +435,53 @@ struct HandlerDesc {
 // a function's local declarations and exception handlers are ranges of its
 // module's pools (ModuleDesc::locals and ::handlers) rather than containers of
 // their own; a function's ranges are contiguous because bodies are read one at
-// a time.
+// a time. It holds no address, so agents can share one table of them.
 struct FuncDesc {
-  // Owned by the module: a defined function's entry of func_types, or an
-  // initializer's ModuleDesc::InitType. A module has few distinct types.
-  const FuncType* type;
+  // A func_types index, or kInitType | an init_types index (ModuleDesc::Type).
+  static constexpr u32 kInitType = 0x80000000u;
+  u32 type;
   u32 code_offset = Istream::kInvalidOffset;
   u32 locals = 0;  // First entry of ModuleDesc::locals.
   u32 local_count = 0;
   u32 handlers = 0;  // First entry of ModuleDesc::handlers.
   u32 handler_count = 0;
+};
+
+// A descriptor table built here, or a view of the same entries in storage
+// that ModuleDesc::storage keeps alive: a module image that every agent maps
+// instead of keeping a private copy of its largest tables.
+template <typename T>
+class DescArray {
+ public:
+  void reserve(size_t count) { owned_.reserve(count); }
+  void push_back(const T& value) {
+    assert(!view_);
+    owned_.push_back(value);
+  }
+  T& operator[](size_t index) {
+    assert(!view_);
+    return owned_[index];
+  }
+  T& back() {
+    assert(!view_);
+    return owned_.back();
+  }
+  const T& operator[](size_t index) const { return data()[index]; }
+  const T* data() const { return view_ ? view_ : owned_.data(); }
+  size_t size() const { return view_ ? view_size_ : owned_.size(); }
+  bool empty() const { return size() == 0; }
+  const T* begin() const { return data(); }
+  const T* end() const { return data() + size(); }
+  void View(const T* entries, size_t count) {
+    std::vector<T>().swap(owned_);
+    view_ = count ? entries : nullptr;
+    view_size_ = count;
+  }
+
+ private:
+  std::vector<T> owned_;
+  const T* view_ = nullptr;
+  size_t view_size_ = 0;
 };
 
 struct TableDesc {
@@ -489,7 +526,7 @@ struct DataDesc {
 };
 
 struct ElemDesc {
-  std::vector<FuncDesc> elements;
+  DescArray<FuncDesc> elements;
   ValueType type;
   SegmentMode mode;
   Index table_index;
@@ -498,14 +535,20 @@ struct ElemDesc {
 
 struct ModuleDesc {
   ModuleDesc() = default;
-  // FuncDesc::type points into this descriptor; it moves but is not copied.
+  // Functions borrow its types and entries; it moves but is not copied.
   ModuleDesc(ModuleDesc&&) = default;
   ModuleDesc& operator=(ModuleDesc&&) = default;
   ModuleDesc(const ModuleDesc&) = delete;
   ModuleDesc& operator=(const ModuleDesc&) = delete;
 
-  // The type `[] -> [result]` of a constant initializer expression.
-  const FuncType* InitType(ValueType result);
+  // The type `[] -> [result]` of a constant initializer expression, as a
+  // FuncDesc::type.
+  u32 InitType(ValueType result);
+  const FuncType& Type(const FuncDesc& func) const {
+    return func.type & FuncDesc::kInitType
+               ? *init_types[func.type & ~FuncDesc::kInitType]
+               : func_types[func.type];
+  }
 
   // A function's local (including params) and its handler ranges.
   ValueType GetLocalType(const FuncDesc&, Index) const;
@@ -517,7 +560,7 @@ struct ModuleDesc {
   std::vector<FuncType> func_types;
   std::vector<std::unique_ptr<FuncType>> init_types;
   std::vector<ImportDesc> imports;
-  std::vector<FuncDesc> funcs;
+  DescArray<FuncDesc> funcs;
   std::vector<TableDesc> tables;
   std::vector<MemoryDesc> memories;
   std::vector<GlobalDesc> globals;
@@ -526,11 +569,12 @@ struct ModuleDesc {
   std::vector<StartDesc> starts;
   std::vector<ElemDesc> elems;
   std::vector<DataDesc> datas;
-  std::vector<LocalDesc> locals;
+  DescArray<LocalDesc> locals;
   std::vector<HandlerDesc> handlers;
   Istream istream;
-  // Keeps external istream and data segment storage alive (Istream::Adopt,
-  // DataDesc::view) for as long as the module exists.
+  // Keeps external istream, data segment and table storage alive
+  // (Istream::Adopt, DataDesc::view, DescArray::View) for as long as the
+  // module exists.
   std::shared_ptr<const void> storage;
 };
 
@@ -575,6 +619,11 @@ class FreeList {
   Index size() const;   // 1 greater than the maximum index.
   Index count() const;  // The number of used elements.
 
+  // An Object entry with this bit (and not the free bit) is reserved for an
+  // object built when it is first reached (Store::Resolve): there is nothing
+  // to delete.
+  static const uintptr_t ptrReservedBit = 2;
+
  private:
   // As for Refs, the free bit is 0x80..0. This bit is never
   // set for valid Refs, since it would mean more objects
@@ -618,7 +667,17 @@ class Store {
   RefPtr<T> UnsafeGet(Ref);
   // Borrowed, without a root, for a caller that already keeps |ref| alive
   // (a function in an active frame).
-  Object* UnsafeObject(Ref ref) { return objects_.Get(ref.index); }
+  Object* UnsafeObject(Ref ref) { return Resolve(ref.index); }
+
+  // Refs to the functions an instance defines, described by |module| (its
+  // module's descriptor). A module has hundreds of thousands of functions and
+  // an agent reaches few of them, so each function's object is built when it
+  // is first reached; until then its entry costs one word.
+  void ReserveFuncs(Ref instance, const ModuleDesc& module, RefVec* out);
+  // The instance that defines function |ref|, whether or not its object has
+  // been built; Ref::Null when |ref| is not a defined function. Walking a
+  // table this way does not build every function the table holds.
+  Ref DefinedFuncInstance(Ref ref) const;
 
   RootList::Index NewRoot(Ref);
   RootList::Index CopyRoot(RootList::Index);
@@ -672,6 +731,21 @@ class Store {
   };
 
   static const int max_call_depth = 10;
+
+  // The object at |index|, built if it is reserved.
+  Object* Resolve(size_t index) const;
+  Object* Build(size_t index);
+  void Trace(size_t index);
+  // Stands for a reserved function in kind checks.
+  static const Object& ReservedFuncKind();
+
+  // An instance's reserved functions: an entry holds
+  // (group << 32) | (function << 2) | ptrReservedBit.
+  struct ReservedFuncs {
+    Ref instance;
+    const ModuleDesc* module;
+  };
+  std::vector<ReservedFuncs> reserved_funcs_;
 
   Features features_;
   std::function<bool()> interrupt_callback_;
@@ -942,7 +1016,8 @@ class DefinedFunc : public Func {
 
   // The descriptor is borrowed from the instance's module, which the function
   // keeps alive through its instance.
-  static DefinedFunc::Ptr New(Store&, Ref instance, const FuncDesc&);
+  static DefinedFunc::Ptr New(Store&, Ref instance, const ModuleDesc&,
+                              const FuncDesc&);
 
   Result Match(Store&, const ImportType&, Trap::Ptr* out_trap) override;
 
@@ -964,7 +1039,8 @@ class DefinedFunc : public Func {
  private:
   friend Store;
   friend Thread;
-  explicit DefinedFunc(Store&, Ref instance, const FuncDesc&);
+  explicit DefinedFunc(Store&, Ref instance, const ModuleDesc&,
+                       const FuncDesc&);
   void Mark(Store&) override;
 
   Ref instance_;

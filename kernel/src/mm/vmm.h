@@ -13,6 +13,7 @@
 #define PTE_G      (1ULL << 8)
 #define PTE_SHARED (1ULL << 9) /* not owned by this address space: don't free */
 #define PTE_SHARED_RO (1ULL << 10) /* read-only shared ABI page: never grant W/X */
+#define PTE_DEMAND (1ULL << 11) /* in a non-present user leaf: a reserved page, zero-filled on first touch */
 #define PTE_PAT2M  (1ULL << 12)
 #define PTE_ADDR   0x000FFFFFFFFFF000ULL
 #define PTE_NX     (1ULL << 63)
@@ -44,11 +45,16 @@ bool vmm_map_page(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags);
 uint64_t vmm_unmap_page(uint64_t pml4, uint64_t va);
 uint64_t vmm_translate(uint64_t pml4, uint64_t va); /* returns phys or 0 */
 uint64_t vmm_get_pte(uint64_t pml4, uint64_t va);
+uint64_t vmm_get_leaf(uint64_t pml4, uint64_t va); /* the raw 4 KiB leaf, present or not; 0 when none */
 void *vmm_map_mmio(uint64_t phys, uint64_t size);
 uint64_t vmm_new_space(void);
 void vmm_free_space(uint64_t pml4);
 uint64_t vmm_user_pages(uint64_t pml4); /* present, non-shared lower-half 4K leaves */
 int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot);
+int vmm_user_reserve(uint64_t pml4, uint64_t va, uint64_t size, int prot); /* zeroed on first touch */
+/* First touch of a reserved page: 1 when mapped (or already present), 0 when
+   va is no reserved page, -N_ERR_NO_MEMORY when no frame is left. */
+int vmm_demand_fault(uint64_t pml4, uint64_t va, bool write);
 int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot);
 void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size);
 int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n);

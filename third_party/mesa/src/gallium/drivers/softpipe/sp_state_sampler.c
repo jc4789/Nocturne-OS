@@ -118,10 +118,16 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
       struct sp_sampler_view *sp_sviewdst =
          &softpipe->tgsi.sampler[shader]->sp_sview[start + i];
       struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
+      struct softpipe_tex_tile_cache **cache = &softpipe->tex_cache[shader][start + i];
+      struct pipe_sampler_view *view = views[i];
 
-      pipe_sampler_view_reference(pview, views[i]);
-      sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
-                                         views[i]);
+      if (view && !*cache)
+         *cache = sp_create_tex_tile_cache(pipe);
+      if (!*cache)
+         view = NULL; /* no memory for the slot's cache: leave it unbound */
+      pipe_sampler_view_reference(pview, view);
+      if (*cache)
+         sp_tex_tile_cache_set_sampler_view(*cache, view);
       /*
        * We don't really have variants, however some bits are different per shader,
        * so just copy?
@@ -140,8 +146,9 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
    for (; i < num + unbind_num_trailing_slots; i++) {
       struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
       pipe_sampler_view_reference(pview, NULL);
-      sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
-                                         NULL);
+      if (softpipe->tex_cache[shader][start + i])
+         sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
+                                            NULL);
    }
 
 

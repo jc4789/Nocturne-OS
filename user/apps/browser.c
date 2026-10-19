@@ -255,7 +255,7 @@ enum { CMD_BACK = 1, CMD_FORWARD, CMD_RELOAD, CMD_HOME, CMD_HISTORY, CMD_GO, CMD
 static uint32_t views; /* views sent: an event names the one it refers to */
 static struct chrome {
     uint32_t view, back, forward, reload, home, history, address, find, console, page;
-} chrome[4];
+} chrome[32]; /* the recent views: an event names the view it came from, and a handler may send many before it is read */
 static uint8_t *chrome_sent; /* the last view as it went, not sent again */
 static size_t chrome_sent_n;
 
@@ -365,7 +365,7 @@ static void show_chrome(void) {
     free(chrome_sent);
     chrome_sent = copy;
     chrome_sent_n = copy ? n : 0;
-    chrome[++views % 4] = c;
+    chrome[++views % 32] = c;
 }
 
 static void draw_page(void) {
@@ -1391,7 +1391,7 @@ static void take_engine_events(void) {
         if (ok) { memcpy(text, e.text, e.text_n); text[e.text_n] = 0; }
         ui_session_pop(ui);
         if (!ok) continue;
-        const struct chrome *c = &chrome[e.view % 4];
+        const struct chrome *c = &chrome[e.view % 32];
         bool known = c->view == e.view && e.node != 0xFFFFFFFFu;
         int which = !known ? F_PAGE : e.node == c->address ? F_ADDR : e.node == c->find ? F_FIND
                     : e.node == c->console ? F_CONSOLE : F_PAGE;

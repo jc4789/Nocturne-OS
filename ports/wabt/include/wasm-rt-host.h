@@ -34,7 +34,10 @@ typedef struct wasm_host_instance {
   void *opaque;
   wasm_host_roots **root_head;
   wasm_host_ref owner_ref;
-  wasm_rt_memory_t *(*memory)(void *, uint32_t);
+  /* One view per memory, read in place by every access. The host brings them
+   * up to date before generated code runs again after anything that may have
+   * grown a memory: entry, and the return of memory_grow, call and indirect. */
+  wasm_rt_memory_t *memories;
   uint64_t (*memory_grow)(void *, uint32_t, uint64_t);
   int (*memory_init)(void *, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t);
   void (*data_drop)(void *, uint32_t);
