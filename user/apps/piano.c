@@ -1,22 +1,29 @@
 /* Piano: play two octaves with the mouse or the keyboard (Z S X D C ... for the lower one,
-   Q 2 W 3 E ... for the upper one), in three voices. The sound is synthesised here and kept
-   about 30 ms ahead of the speaker, by asking how much its sound stream has queued. */
+   Q 2 W 3 E ... for the upper one), in three voices. The voices and the octave are widgets
+   of the interface engine (libc/ui.c); the keyboard and the oscilloscope are surfaces this
+   app draws itself. The sound is synthesised here and kept about 30 ms ahead of the
+   speaker, by asking how much its sound stream has queued. */
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 #include "nocturne.h"
+#include "ui.h"
 
 #define PI 3.14159265358979323846
 #define W 720
-#define TOP 92
 #define KEYS_H 200
-#define H (TOP + KEYS_H)
+#define SCOPE_W 236
+#define SCOPE_H 64
+#define H 330
 #define NWHITE 15 /* C to C, two octaves */
 #define KW (W / NWHITE)
 #define NNOTES 25
 #define NVOICES 10
 #define AHEAD 1440 /* frames to keep queued: 30 ms */
 #define CHUNK 240  /* frames made at a time: 5 ms */
+#define WINDOW 1
+#define S_KEYS 1
+#define S_SCOPE 2
 
 static const char *voice_names[] = {"Piano", "Organ", "Chip"};
 static const char lower_keys[] = "zsxdcvgbhnjm,";  /* C .. C, white and black in turn */
@@ -32,13 +39,67 @@ static int sound = 0, octave = 4, mouse_note = -1;
 static n_handle stream = -1;
 static bool down[NNOTES];
 static int16_t scope[CHUNK * 2];
+static canvas_t *keys_c, *scope_c;
+static uint32_t voice_seg, octave_down, octave_up; /* their places in the view */
+static int dirty_x0 = W, dirty_y0 = KEYS_H, dirty_x1, dirty_y1; /* keys changed since they were drawn */
 
 static double note_hz(int n) { return 440.0 * pow(2.0, ((octave + 1) * 12 + n - 69) / 12.0); }
 static bool is_black(int n) { return (0x54A >> (n % 12)) & 1; } /* C# D# F# G# A# */
 
+/* ---- keys on the screen ---- */
+
+/* which white key a note is on, or (for a black key) just right of */
+static int white_index(int n) {
+    static const int in_octave[12] = {0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6};
+    return n / 12 * 7 + in_octave[n % 12];
+}
+
+static void key_rect(int n, int *x, int *y, int *w, int *h) {
+    if (is_black(n)) {
+        *x = (white_index(n) + 1) * KW - 15;
+        *w = 30;
+        *h = KEYS_H * 6 / 10;
+    } else {
+        *x = white_index(n) * KW;
+        *w = KW;
+        *h = KEYS_H;
+    }
+    *y = 0;
+}
+
+static void mark_rect(int x, int y, int w, int h) {
+    if (x < dirty_x0) dirty_x0 = x;
+    if (y < dirty_y0) dirty_y0 = y;
+    if (x + w > dirty_x1) dirty_x1 = x + w;
+    if (y + h > dirty_y1) dirty_y1 = y + h;
+}
+
+static void mark_note(int n) {
+    int x, y, w, h;
+    key_rect(n, &x, &y, &w, &h);
+    mark_rect(x, y, w, h);
+}
+
+static int key_at(int px, int py) {
+    if (py < 0 || py >= KEYS_H) return -1;
+    for (int pass = 0; pass < 2; pass++) /* black keys lie on top */
+        for (int n = 0; n < NNOTES; n++) {
+            if (is_black(n) != (pass == 0)) continue;
+            int x, y, w, h;
+            key_rect(n, &x, &y, &w, &h);
+            if (px >= x && px < x + w && py >= y && py < y + h) return n;
+        }
+    return -1;
+}
+
+static char key_label(int n) { return n < 12 ? lower_keys[n] : upper_keys[n - 12]; }
+
+/* ---- the notes ---- */
+
 static void note_on(int n) {
     if (n < 0 || n >= NNOTES) return;
     down[n] = true;
+    mark_note(n);
     struct voice *v = NULL;
     for (int i = 0; i < NVOICES && !v; i++)
         if (voices[i].note == n) v = &voices[i];
@@ -59,6 +120,7 @@ static void note_on(int n) {
 static void note_off(int n) {
     if (n < 0 || n >= NNOTES) return;
     down[n] = false;
+    mark_note(n);
     for (int i = 0; i < NVOICES; i++)
         if (voices[i].note == n) voices[i].held = false;
 }
@@ -113,60 +175,26 @@ static void pump(void) {
 
 /* ---- drawing ---- */
 
-/* which white key a note is on, or (for a black key) just right of */
-static int white_index(int n) {
-    static const int in_octave[12] = {0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6};
-    return n / 12 * 7 + in_octave[n % 12];
-}
-
-static void key_rect(int n, int *x, int *y, int *w, int *h) {
-    if (is_black(n)) {
-        *x = (white_index(n) + 1) * KW - 15;
-        *w = 30;
-        *h = KEYS_H * 6 / 10;
-    } else {
-        *x = white_index(n) * KW;
-        *w = KW;
-        *h = KEYS_H;
-    }
-    *y = TOP;
-}
-
-static int key_at(int px, int py) {
-    if (py < TOP) return -1;
-    for (int pass = 0; pass < 2; pass++) /* black keys lie on top */
-        for (int n = 0; n < NNOTES; n++) {
-            if (is_black(n) != (pass == 0)) continue;
-            int x, y, w, h;
-            key_rect(n, &x, &y, &w, &h);
-            if (ui_hit(px, py, x, y, w, h)) return n;
-        }
-    return -1;
-}
-
-static char key_label(int n) { return n < 12 ? lower_keys[n] : upper_keys[n - 12]; }
-
 static void draw_scope(canvas_t *c) {
-    int sx = W - 250, sy = 14, sw = 236, sh = 64;
-    gfx_fill_round(c, sx, sy, sw, sh, 6, RGB(16, 14, 30));
-    int prev = 0;
-    for (int i = 0; i < sw - 8; i++) {
-        int f = i * CHUNK / (sw - 8), y = sy + sh / 2 - scope[2 * f] * (sh / 2 - 4) / 32768;
-        if (i) gfx_line(c, sx + 3 + i, prev, sx + 4 + i, y, RGB(120, 230, 170));
-        prev = y;
+    const struct ui_theme *t = &ui_theme;
+    gfx_fill(c, 0, 0, SCOPE_W, SCOPE_H, t->background);
+    ui_round_fill(c, 0, 0, SCOPE_W, SCOPE_H, t->radius, t->surface);
+    ui_round_stroke(c, 0, 0, SCOPE_W, SCOPE_H, t->radius, 1, t->border);
+    ui_line(c, 8, SCOPE_H / 2, SCOPE_W - 8, SCOPE_H / 2, 1, t->divider);
+    int span = SCOPE_W - 16;
+    float px = 0, py = 0;
+    for (int i = 0; i <= span; i += 2) {
+        int f = MIN(CHUNK - 1, i * CHUNK / span);
+        float x = 8.0f + (float)i, y = SCOPE_H / 2.0f - (float)scope[2 * f] * (SCOPE_H / 2 - 6) / 32768.0f;
+        if (i) ui_line(c, px, py, x, y, 1.6f, t->success);
+        px = x;
+        py = y;
     }
 }
 
-static void draw(window_t *win) {
-    canvas_t *c = &win->c;
-    gfx_fill(c, 0, 0, W, TOP, UI_BG);
-    for (int i = 0; i < 3; i++) ui_button(c, 14 + i * 92, 14, 84, 28, voice_names[i], false, sound == i);
-    char buf[80];
-    snprintf(buf, sizeof buf, "octave %d   (Left/Right)", octave);
-    gfx_text(c, 16, 54, buf, UI_DIM, TRANSPARENT, FONT_SMALL);
-    gfx_text(c, 16, 70, stream < 0 ? "no sound: every sound stream is taken" : "Tab: next sound", stream < 0 ? UI_ACCENT2 : UI_DIM,
-             TRANSPARENT, FONT_SMALL);
-    draw_scope(c);
+static void draw_keys(canvas_t *c) {
+    const struct ui_theme *t = &ui_theme;
+    gfx_fill(c, 0, 0, W, KEYS_H, t->background);
     for (int pass = 0; pass < 2; pass++)
         for (int n = 0; n < NNOTES; n++) {
             if (is_black(n) != (pass == 1)) continue;
@@ -174,23 +202,77 @@ static void draw(window_t *win) {
             key_rect(n, &x, &y, &w, &h);
             char lab[2] = {key_label(n), 0};
             if (lab[0] >= 'a' && lab[0] <= 'z') lab[0] -= 32;
+            /* keys reach above the surface so only their lower corners are round */
             if (is_black(n)) {
-                gfx_fill_round(c, x, y - 4, w, h + 4, 4, down[n] ? UI_ACCENT : RGB(24, 22, 36));
-                ui_text_center(c, x, y + h - 22, w, lab, RGB(170, 170, 200), FONT_SMALL);
+                ui_round_gradient(c, (float)x, -10, (float)w, (float)h + 10, 5, down[n] ? t->accentHover : RGB(52, 50, 70),
+                                  down[n] ? t->accent : RGB(22, 21, 30));
+                float lw = ui_text_width(lab, 1, 12, 1);
+                ui_text(c, (float)x + ((float)w - lw) / 2, (float)(y + h) - 24, lab, 1, 12, 1, RGB(170, 170, 200));
             } else {
-                gfx_fill(c, x, y, w - 1, h, down[n] ? RGB(200, 190, 255) : RGB(246, 244, 236));
-                gfx_fill(c, x + w - 1, y, 1, h, RGB(120, 118, 140));
-                ui_text_center(c, x, y + h - 24, w, lab, RGB(120, 118, 140), FONT_SMALL);
+                ui_round_gradient(c, (float)x + 1, -10, (float)w - 2, (float)h + 10, 7,
+                                  down[n] ? t->accentHover : RGB(250, 249, 252), down[n] ? t->accent : RGB(226, 224, 236));
+                float lw = ui_text_width(lab, 1, 12, 1);
+                ui_text(c, (float)x + ((float)w - lw) / 2, (float)(y + h) - 26, lab, 1, 12, 1, down[n] ? t->accentText : RGB(120, 118, 140));
                 if (n % 12 == 0) {
-                    snprintf(buf, sizeof buf, "C%d", octave + n / 12);
-                    ui_text_center(c, x, y + h - 44, w, buf, RGB(160, 150, 200), FONT_SMALL);
+                    char buf[8];
+                    int len = snprintf(buf, sizeof buf, "C%d", octave + n / 12);
+                    float cw = ui_text_width(buf, (size_t)len, 12, 0);
+                    ui_text(c, (float)x + ((float)w - cw) / 2, (float)(y + h) - 48, buf, (size_t)len, 12, 0,
+                            down[n] ? t->accentText : RGB(130, 120, 190));
                 }
             }
         }
-    win_update(win);
+}
+
+/* Draw the keys, telling the engine only about the part that changed. */
+static void flush_keys(struct ui_session *s, bool whole) {
+    if (whole) mark_rect(0, 0, W, KEYS_H);
+    if (dirty_x1 <= dirty_x0 || dirty_y1 <= dirty_y0) return;
+    draw_keys(keys_c);
+    ui_surface_changed_rect(s, S_KEYS, dirty_x0, dirty_y0, dirty_x1 - dirty_x0, dirty_y1 - dirty_y0);
+    dirty_x0 = W;
+    dirty_y0 = KEYS_H;
+    dirty_x1 = dirty_y1 = 0;
+}
+
+/* The window's widgets: the voices, the octave and a hint. */
+static void show(struct ui_session *s) {
+    char label[24];
+    snprintf(label, sizeof label, "Octave %d", octave);
+    const double pad[2] = {14, 16};
+    struct ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m, "column");
+        ui_node(&m, "row"); ui_nums(&m, "padding", pad, 2); ui_num(&m, "gap", 16); ui_num(&m, "grow", 1);
+            ui_node(&m, "column"); ui_num(&m, "gap", 10); ui_num(&m, "grow", 1); ui_str(&m, "align", "start");
+                voice_seg = ui_node(&m, "segmented");
+                ui_strs(&m, "options", voice_names, 3); ui_num(&m, "selected", sound); ui_end(&m);
+                ui_node(&m, "row"); ui_num(&m, "gap", 8);
+                    octave_down = ui_node(&m, "button");
+                    ui_str(&m, "icon", "minus"); ui_num(&m, "compact", 1); ui_num(&m, "disabled", octave <= 2); ui_end(&m);
+                    ui_node(&m, "text"); ui_str(&m, "text", label); ui_num(&m, "weight", 1); ui_num(&m, "width", 84);
+                    ui_str(&m, "textAlign", "center"); ui_end(&m);
+                    octave_up = ui_node(&m, "button");
+                    ui_str(&m, "icon", "plus"); ui_num(&m, "compact", 1); ui_num(&m, "disabled", octave >= 6); ui_end(&m);
+                ui_end(&m);
+                ui_node(&m, "text");
+                ui_str(&m, "text", stream < 0 ? "No sound: every sound stream is taken"
+                                              : "Tab: next sound   Left / Right: octave");
+                ui_str(&m, "style", "caption");
+                if (stream < 0) ui_num(&m, "colour", ui_theme.warning);
+                ui_end(&m);
+            ui_end(&m);
+            ui_node(&m, "surface"); ui_num(&m, "surface", S_SCOPE);
+            ui_num(&m, "width", SCOPE_W); ui_num(&m, "height", SCOPE_H); ui_end(&m);
+        ui_end(&m);
+        ui_node(&m, "surface"); ui_num(&m, "surface", S_KEYS); ui_num(&m, "pointer", 1);
+        ui_num(&m, "width", W); ui_num(&m, "height", KEYS_H); ui_end(&m);
+    ui_end(&m);
+    ui_send(s, &m);
 }
 
 static int note_for_key(int k) {
+    if (k <= 0 || k > 0x7F) return -1; /* named keys have codes of their own */
     if (k >= 'A' && k <= 'Z') k += 32;
     if (k == '<') k = ',';
     const char *p = strchr(lower_keys, k);
@@ -202,61 +284,85 @@ static int note_for_key(int k) {
 
 int main(void) {
     for (int i = 0; i < NVOICES; i++) voices[i].note = -1;
-    window_t *win = win_open(W, H, "Piano", WIN_CENTER);
-    if (!win) return 1;
+    struct ui_session *s = ui_session_new();
+    if (!s || ui_window(s, WINDOW, W, H, WIN_CENTER, "Piano", NULL, NULL) < 0) return 1;
+    keys_c = ui_surface(s, S_KEYS, W, KEYS_H, 0);
+    scope_c = ui_surface(s, S_SCOPE, SCOPE_W, SCOPE_H, 0);
+    if (!keys_c || !scope_c) return 1;
     stream = n_audio_open();
-    draw(win);
+    flush_keys(s, true);
+    draw_scope(scope_c);
+    ui_surface_changed(s, S_SCOPE);
+    show(s);
     uint64_t last_scope = 0;
     bool was_active = false;
-    for (;;) {
-        struct gui_event e;
-        int r = win_event(win, &e, any_voice() ? 4 : -1);
-        if (r < 0) break;
-        bool redraw = false;
-        if (r > 0) {
-            if (e.type == EV_CLOSE) break;
-            if (e.type == EV_KEY) {
-                int n = note_for_key((int)e.key);
+    for (bool running = true; running;) {
+        ui_session_wait(s, any_voice() ? 4 : -1);
+        bool view = false, labels = false;
+        struct ui_event e;
+        char text[16];
+        while (ui_next_event(s, &e, text, sizeof text)) {
+            switch (e.type) {
+            case UI_EVENT_CLOSE:
+                running = false;
+                break;
+            case UI_EVENT_KEY: {
+                bool up = e.flags & UI_UP;
+                int n = note_for_key((int)e.a);
                 if (n >= 0) {
-                    if (e.pressed && !down[n]) note_on(n), redraw = true;
-                    else if (!e.pressed) note_off(n), redraw = true;
-                } else if (e.pressed) {
-                    if (e.key == NKEY_ESC) break;
-                    if (e.key == NKEY_TAB) sound = (sound + 1) % 3, redraw = true;
-                    if (e.key == NKEY_LEFT && octave > 2) octave--, redraw = true;
-                    if (e.key == NKEY_RIGHT && octave < 6) octave++, redraw = true;
+                    if (!up && !down[n]) note_on(n);
+                    else if (up) note_off(n);
+                } else if (!up) {
+                    if (!strcmp(e.text, "Escape")) running = false;
+                    else if (!strcmp(e.text, "Tab")) sound = (sound + 1) % 3, view = true;
+                    else if (!strcmp(e.text, "ArrowLeft") && octave > 2) octave--, view = labels = true;
+                    else if (!strcmp(e.text, "ArrowRight") && octave < 6) octave++, view = labels = true;
                 }
-            } else if (e.type == EV_MOUSE_DOWN && (e.buttons & 1)) {
-                for (int i = 0; i < 3; i++)
-                    if (ui_hit(e.x, e.y, 14 + i * 92, 14, 84, 28)) sound = i;
-                mouse_note = key_at(e.x, e.y);
-                note_on(mouse_note);
-                redraw = true;
-            } else if (e.type == EV_MOUSE_MOVE && mouse_note >= 0) { /* a glissando */
-                int n = key_at(e.x, e.y);
-                if (n != mouse_note) {
-                    note_off(mouse_note);
-                    note_on(mouse_note = n);
-                    redraw = true;
+                break;
+            }
+            case UI_EVENT_CHOOSE:
+                if (e.node == voice_seg) sound = (int)e.a, view = true;
+                break;
+            case UI_EVENT_CLICK:
+                if (e.node == octave_down && octave > 2) octave--, view = labels = true;
+                else if (e.node == octave_up && octave < 6) octave++, view = labels = true;
+                break;
+            case UI_EVENT_POINTER: {
+                int x = (int)floor(e.a), y = (int)floor(e.b);
+                if (e.flags & UI_DOWN) {
+                    if (UI_BUTTONS(e.flags) & 1) {
+                        mouse_note = key_at(x, y);
+                        note_on(mouse_note);
+                    }
+                } else if (e.flags & UI_UP) {
+                    if (mouse_note >= 0) {
+                        note_off(mouse_note);
+                        mouse_note = -1;
+                    }
+                } else if (mouse_note >= 0) { /* a glissando */
+                    int n = key_at(x, y);
+                    if (n != mouse_note) {
+                        note_off(mouse_note);
+                        note_on(mouse_note = n);
+                    }
                 }
-            } else if (e.type == EV_MOUSE_UP && mouse_note >= 0) {
-                note_off(mouse_note);
-                mouse_note = -1;
-                redraw = true;
+                break;
+            }
             }
         }
+        if (!running || !ui_session_open(s)) break;
         pump();
+        flush_keys(s, labels);
+        if (view) show(s);
         bool active = any_voice();
-        if (redraw) {
-            draw(win);
-        } else if (n_clock_uptime_ms() - last_scope >= 33 || active != was_active) {
+        if ((active && n_clock_uptime_ms() - last_scope >= 33) || active != was_active) {
             last_scope = n_clock_uptime_ms();
             if (!active) memset(scope, 0, sizeof scope);
-            draw_scope(&win->c);
-            win_update_rect(win, W - 250, 14, 236, 64);
+            draw_scope(scope_c);
+            ui_surface_changed(s, S_SCOPE);
         }
         was_active = active;
     }
-    win_close(win);
+    ui_session_free(s);
     return 0;
 }

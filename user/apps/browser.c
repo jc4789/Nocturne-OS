@@ -5,21 +5,27 @@
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
+#include <math.h>
 #include "nocturne.h"
+#include "ui.h"
 #include "http.h"
 #include "web.h"
 #include "webnet.h"
 #include "webstorage.h"
 #include <parallel.h>
 
-#define TB (browser_fullscreen?0:40)   /* native fullscreen has no chrome */
-#define SB (browser_fullscreen?0:24)
-#define SCRW (browser_fullscreen?0:10)
+#define SCRW (browser_fullscreen?0:10) /* native fullscreen has no chrome */
 #define LINE 48
 #define HOME "about:home"
 #define SEARCH "https://lite.duckduckgo.com/lite/?q="
 
-static window_t *w;
+/* The window is the interface engine's (libc/ui.c): the toolbar, the status line, the find bar
+   and the console's input are its widgets, and the page, its scroll bar and DevTools are drawn
+   into one surface between them, in the surface's coordinates. */
+enum { WINDOW = 1, VIEW = 1 };
+static struct ui_session *ui;
+static window_t *w;   /* behind the engine's window: its state, fullscreen and handle */
+static canvas_t view; /* the surface */
 static bool browser_fullscreen;
 static web_doc *fullscreen_doc,*pip_doc;
 static web_node *pip_node;
@@ -82,8 +88,6 @@ static unsigned long console_sequence;
 static bool console_open, console_dirty;
 static char *console_input, *console_startup;
 static size_t console_input_capacity, console_startup_length;
-static size_t console_cursor;
-static bool console_selected;
 static uint64_t console_due, console_startup_generation;
 static bool console_each_document;
 /* An explicit native debug file is not a page-injected script. Preserve the
@@ -93,7 +97,7 @@ static bool console_startup_pending(void) {
 }
 
 static int console_h(void);
-static int console_visible(void) { return MAX(1, (console_h() - 72) / 16); } /* below the DevTools tab bar */
+static int console_visible(void) { return MAX(1, (console_h() - 50) / 16); } /* below the DevTools tab bar (24) and the heading (26) */
 static void console_scroll(int delta) {
     int64_t desired = (int64_t)console_skip + delta;
     console_skip = (int)MAX(0, MIN(desired, MAX(console_n - console_visible(), 0)));
@@ -128,15 +132,21 @@ static struct browser_history_task { struct browser_history_task *next; int delt
     *history_queue, *history_queue_tail;
 static unsigned history_queue_count;
 
-enum { F_PAGE, F_ADDR, F_FIND, F_CONSOLE };
-static int focus = F_PAGE;
-static size_t acur;
-static bool addr_all;
+/* Where keys go. The engine keeps the fields' own focus and acts on a field's "focus" only
+   when it changes, so each field keeps its own value (focus_asked) and only a move the
+   browser makes changes them: focus_shown is where the view last put the keyboard, and
+   focus_renew asks again for the field that has it (select all of it). What the engine does
+   with the keyboard comes back in order with the other input (CMD_FOCUS) and moves
+   focus_shown with it, so the views never ask for what the engine did on its own. */
+enum { F_PAGE, F_ADDR, F_FIND, F_CONSOLE, F_COUNT };
+static int focus = F_PAGE, focus_shown = F_PAGE, focus_serial, focus_asked[F_COUNT];
+static bool focus_renew;
+static int field_focus = F_PAGE; /* the field the engine has given the keyboard to, as it said so */
 
 static bool find_open;
 static struct url_text find_text;
 #define find_buf (find_text.p ? find_text.p : "")
-static bool find_all, find_error;
+static bool find_error;
 static int find_y = -1;
 
 static web_node *sel_node;
@@ -154,7 +164,6 @@ static uint64_t refresh_at;
 static bool refresh_seen, initial_scroll_pending, initial_scroll_anchor;
 static int initial_scroll_x, initial_scroll_y;
 
-static int hot_btn = -1;
 static bool drag_sb;
 static int drag_off;
 
@@ -175,14 +184,14 @@ static bool native_wait_snapshot;
 static bool native_scroll_active;
 #include "browser_events.h"
 
-static int page_w(void) { return MAX(w->w - SCRW, 50); }
+static int page_w(void) { return MAX(view.w - SCRW, 50); }
 static int devtools_height; /* DevTools panel, dragged by its top edge; 0: default share */
 static int console_h(void) {
     if (!console_open || browser_fullscreen) return 0;
-    int room = w->h - TB - SB, h = devtools_height ? devtools_height : room * 2 / 5;
+    int room = view.h, h = devtools_height ? devtools_height : room * 2 / 5;
     return MAX(MIN(h, room - 60), MIN(120, room / 2));
 }
-static int page_h(void) { return MAX(w->h - TB - SB - console_h(), 20); }
+static int page_h(void) { return MAX(view.h - console_h(), 20); }
 static int max_scroll(void) { return MAX(doc_h - page_h(), 0); }
 static int max_scroll_x(void) { return MAX(doc_w - page_w(), 0); }
 static int document_x(int client_x) { return client_x + scroll_x; }
@@ -218,14 +227,6 @@ static void sb_esc(struct sb *s, const char *p, size_t n) {
 }
 
 static bool has_prefix(const char *s, const char *p) { return !strncasecmp(s, p, strlen(p)); }
-static bool url_text_reserve(struct url_text *text, size_t needed) {
-    if (needed <= text->capacity) return true;
-    size_t capacity = text->capacity ? text->capacity : 64;
-    while (capacity < needed) capacity = capacity > SIZE_MAX / 2 ? needed : capacity * 2;
-    char *grown = realloc(text->p, capacity);
-    if (!grown) return false;
-    text->p = grown; text->capacity = capacity; return true;
-}
 static bool url_text_set(struct url_text *text, const char *source) {
     char *copy = strdup(source ? source : "");
     if (!copy) return false;
@@ -240,113 +241,150 @@ static void url_pair_commit(char *current, char *address) {
     free(current_text.p); free(address_text.p);
     current_text = (struct url_text){current, strlen(current) + 1};
     address_text = (struct url_text){address, strlen(address) + 1};
-    acur = strlen(address);
-}
-static int address_width(const char *text, size_t bytes) {
-    int width = 0;
-    while (*text && bytes) {
-        uint32_t cp; int n = gfx_utf8_decode(text, &cp);
-        if (n <= 0 || (size_t)n > bytes) break;
-        int add = MAX(gfx_codepoint_width(cp, FONT_SMALL), 0);
-        if (add > INT_MAX - width) return INT_MAX;
-        width += add; text += n; bytes -= (size_t)n;
-    }
-    return width;
 }
 
 /* ---------------------------------------------------------------- drawing */
-static void field(canvas_t *c, int x, int y, int fw, int h, const char *text, bool foc, size_t caret, bool all) {
-    gfx_fill_round(c, x, y, fw, h, 5, foc ? UI_ACCENT : RGB(70, 66, 110));
-    gfx_fill_round(c, x + 1, y + 1, fw - 2, h - 2, 4, RGB(18, 16, 32));
-    canvas_t cl = *c;
-    gfx_clip(&cl, x + 4, y, fw - 8, h);
-    int ty = y + (h - 16) / 2;
-    int cpx = foc ? address_width(text, caret) : 0;
-    int shift = foc && cpx > fw - 20 ? cpx - (fw - 20) : 0;
-    int tx = x + 7 - shift;
-    if (foc && all && *text) gfx_fill(&cl, tx - 1, ty, MIN(address_width(text, strlen(text)), INT_MAX - 2) + 2, 16, RGB(70, 60, 140));
-    gfx_text(&cl, tx, ty, text, foc ? UI_FG : RGB(200, 200, 225), TRANSPARENT, FONT_SMALL);
-    if (foc && !all) gfx_fill(&cl, tx + cpx, ty, 2, 16, UI_ACCENT2);
-}
-
-enum { BTN_BACK, BTN_FWD, BTN_RELOAD, BTN_HOME, BTN_HISTORY, NBTN };
-static int btn_x(int i) { return 6 + i * 32; }
-#define ADDR_X (btn_x(NBTN) + 6)
-
-static void draw_toolbar(void) {
-    if(browser_fullscreen)return;
-    canvas_t *c = &w->c;
-    int W = w->w;
-    gfx_gradient_v(c, 0, 0, W, TB, RGB(46, 42, 80), RGB(36, 32, 64));
-    for (int i = 0; i < NBTN; i++) {
-        int x = btn_x(i), y = 6;
-        bool on = i == BTN_BACK ? hpos > 0 : i == BTN_FWD ? hpos < nhist - 1 : true;
-        ui_button(c, x, y, 28, 28, "", on && hot_btn == i, false);
-        uint32_t col = on ? UI_FG : RGB(100, 98, 140);
-        int cx = x + 14, cy = y + 14;
-        if (i == BTN_BACK) gfx_triangle(c, cx - 6, cy, cx + 4, cy - 6, cx + 4, cy + 6, col);
-        else if (i == BTN_FWD) gfx_triangle(c, cx + 6, cy, cx - 4, cy - 6, cx - 4, cy + 6, col);
-        else if (i == BTN_RELOAD) {
-            if (loading) {
-                gfx_line(c, cx - 5, cy - 5, cx + 5, cy + 5, col);
-                gfx_line(c, cx - 5, cy + 5, cx + 5, cy - 5, col);
-            } else {
-                gfx_circle(c, cx, cy, 7, col);
-                gfx_circle(c, cx, cy, 6, col);
-                gfx_fill(c, cx + 1, cy - 8, 8, 8, UI_BTN);
-                gfx_triangle(c, cx + 1, cy - 11, cx + 1, cy - 1, cx + 7, cy - 6, col);
-            }
-        } else if (i == BTN_HOME) {
-            gfx_triangle(c, cx - 8, cy - 1, cx, cy - 8, cx + 8, cy - 1, col);
-            gfx_fill(c, cx - 5, cy - 1, 10, 8, col);
-            gfx_fill(c, cx - 1, cy + 3, 3, 4, UI_BTN);
-        } else {
-            gfx_text(c, cx - 4, cy - 7, "H", col, TRANSPARENT, FONT_SMALL);
-        }
-    }
-    int room = W - ADDR_X - 8;
-    field(c, ADDR_X, 8, room, 24, focus == F_ADDR ? addr : cur_url, focus == F_ADDR,
-                focus == F_ADDR ? acur : 0, addr_all);
-}
-
-static void draw_status(void) {
-    if(browser_fullscreen)return;
-    canvas_t *c = &w->c;
-    int W = w->w, y = w->h - SB;
-    gfx_fill(c, 0, y, W, SB, RGB(28, 26, 46));
-    gfx_hline(c, 0, y, W, RGB(60, 56, 100));
-    if (find_open) {
-        gfx_text(c, 8, y + 4, "Find:", UI_ACCENT2, TRANSPARENT, FONT_SMALL);
-        field(c, 56, y + 2, 240, 20, find_buf, focus == F_FIND, strlen(find_buf), find_all);
-        const char *msg = find_error ? "allocation failed" : !find_buf[0] ? "Enter: next   Esc: close" : find_y < 0 ? "not found" : "Enter: next match";
-        gfx_text(c, 306, y + 4, msg, find_error || (find_y < 0 && find_buf[0]) ? RGB(240, 120, 120) : UI_DIM, TRANSPARENT, FONT_SMALL);
-        return;
-    }
-    const char *s = hover[0] ? hover : status;
-    canvas_t cl = *c;
-    gfx_clip(&cl, 0, y, W - 8, SB);
-    gfx_text(&cl, 8, y + 4, s, hover[0] ? RGB(160, 200, 255) : UI_DIM, TRANSPARENT, FONT_SMALL);
-}
-
+static void show_chrome(void);
 #include "browser_devtools.h"
 
+/* The widgets around the surface. Their events are browser commands that wait their turn
+   with the rest of the input (EV_COMMAND), except a field's text, which only the field uses. */
+enum { CMD_BACK = 1, CMD_FORWARD, CMD_RELOAD, CMD_HOME, CMD_HISTORY, CMD_GO, CMD_FIND, CMD_FIND_NEXT,
+       CMD_EVAL, CMD_FOCUS };
+#define EV_COMMAND 0x100u /* key = CMD_*; CMD_FOCUS: x = F_*, y = got (1) or lost (0) */
+static uint32_t views; /* views sent: an event names the one it refers to */
+static struct chrome {
+    uint32_t view, back, forward, reload, home, history, address, find, console, page;
+} chrome[4];
+static uint8_t *chrome_sent; /* the last view as it went, not sent again */
+static size_t chrome_sent_n;
+
+static uint32_t tool(struct ui_msg *m, const char *icon, bool enabled) {
+    uint32_t place = ui_node(m, "button");
+    ui_str(m, "icon", icon); ui_str(m, "variant", "ghost"); ui_num(m, "compact", 1);
+    if (!enabled) ui_num(m, "disabled", 1);
+    ui_end(m);
+    return place;
+}
+
+static void field_focus_prop(struct ui_msg *m, int which) {
+    ui_num(m, "focus", focus_asked[which]);
+}
+
+static void show_chrome(void) {
+    if (!ui) return;
+    if (focus != focus_shown || focus_renew) {
+        if (focus_shown != F_PAGE) focus_asked[focus_shown] = -++focus_serial;
+        if (focus != F_PAGE) focus_asked[focus] = ++focus_serial;
+        focus_shown = focus;
+        focus_renew = false;
+    }
+    const struct ui_theme *t = &ui_theme;
+    struct chrome c = {.view = views + 1};
+    struct ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m, "column");
+    if (!browser_fullscreen) {
+        ui_node(&m, "row"); ui_str(&m, "key", "toolbar"); ui_nums(&m, "padding", (double[]){5, 8}, 2); ui_num(&m, "gap", 2);
+        ui_str(&m, "align", "center"); ui_num(&m, "background", t->sidebar);
+            c.back = tool(&m, "chevron-left", hpos > 0);
+            c.forward = tool(&m, "chevron-right", hpos < nhist - 1);
+            c.reload = tool(&m, loading ? "close" : "refresh", loading || cur_url[0]);
+            c.home = tool(&m, "home", true);
+            c.history = tool(&m, "clock", true);
+            ui_node(&m, "spacer"); ui_num(&m, "size", 4); ui_end(&m);
+            c.address = ui_node(&m, "field");
+            ui_str(&m, "value", field_focus == F_ADDR ? addr : cur_url);
+            ui_str(&m, "placeholder", "Search or enter an address");
+            ui_str(&m, "width", "fill"); ui_num(&m, "height", 30); ui_num(&m, "selectOnFocus", 1);
+            field_focus_prop(&m, F_ADDR);
+            ui_end(&m);
+        ui_end(&m);
+        ui_node(&m, "divider"); ui_end(&m);
+    }
+    c.page = ui_node(&m, "surface"); ui_str(&m, "key", "page"); ui_num(&m, "surface", VIEW); ui_num(&m, "pointer", 1);
+    ui_str(&m, "width", "fill"); ui_str(&m, "height", "fill"); ui_end(&m);
+    if (!browser_fullscreen && console_open && dt_tab == DT_CONSOLE) {
+        ui_node(&m, "row"); ui_str(&m, "key", "console"); ui_nums(&m, "padding", (double[]){3, 8}, 2); ui_num(&m, "gap", 6);
+        ui_str(&m, "align", "center"); ui_num(&m, "background", DT_BG);
+            ui_node(&m, "text"); ui_str(&m, "text", ">"); ui_num(&m, "mono", 1); ui_num(&m, "colour", t->accent);
+            ui_end(&m);
+            c.console = ui_node(&m, "field");
+            ui_str(&m, "value", console_input); ui_str(&m, "placeholder", "JavaScript");
+            ui_num(&m, "mono", 1); ui_str(&m, "width", "fill"); ui_num(&m, "height", 28);
+            field_focus_prop(&m, F_CONSOLE);
+            ui_end(&m);
+        ui_end(&m);
+    }
+    if (!browser_fullscreen) {
+        ui_node(&m, "divider"); ui_end(&m);
+        ui_node(&m, "row"); ui_str(&m, "key", "status"); ui_nums(&m, "padding", (double[]){0, 10}, 2); ui_num(&m, "height", 30);
+        ui_num(&m, "gap", 8); ui_str(&m, "align", "center"); ui_num(&m, "background", t->sidebar);
+        if (find_open) {
+            ui_node(&m, "icon"); ui_str(&m, "icon", "search"); ui_num(&m, "size", 16); ui_num(&m, "colour", t->textDim);
+            ui_end(&m);
+            c.find = ui_node(&m, "field");
+            ui_str(&m, "value", find_buf); ui_str(&m, "placeholder", "Find in page");
+            ui_num(&m, "length", 240); ui_num(&m, "height", 24);
+            field_focus_prop(&m, F_FIND);
+            ui_end(&m);
+            bool bad = find_error || (find_y < 0 && find_buf[0]);
+            ui_node(&m, "text");
+            ui_str(&m, "text", find_error ? "allocation failed" : !find_buf[0] ? "Enter: next   Esc: close"
+                               : find_y < 0 ? "not found" : "Enter: next match");
+            ui_str(&m, "style", "caption"); ui_num(&m, "ellipsis", 1); ui_num(&m, "grow", 1);
+            if (bad) ui_num(&m, "colour", t->danger);
+            ui_end(&m);
+        } else {
+            ui_node(&m, "text"); ui_str(&m, "text", hover[0] ? hover : status); ui_str(&m, "style", "caption");
+            ui_num(&m, "ellipsis", 1); ui_num(&m, "grow", 1);
+            if (hover[0]) ui_num(&m, "colour", t->accentHover);
+            ui_end(&m);
+        }
+        ui_end(&m);
+    }
+    ui_end(&m);
+    /* a field left out of the view gives the keyboard up without an event and comes back new:
+       one that still has the browser's keys (the console's, behind another DevTools tab) is
+       asked for again when it is back */
+    const bool shown[F_COUNT] = {[F_ADDR] = c.address, [F_FIND] = c.find, [F_CONSOLE] = c.console};
+    for (int f = F_ADDR; f < F_COUNT; f++) {
+        if (shown[f]) continue;
+        focus_asked[f] = 0;
+        if (field_focus == f) field_focus = F_PAGE;
+        if (focus_shown == f) focus_shown = F_PAGE;
+    }
+    if (m.b.bad || (chrome_sent && m.b.n == chrome_sent_n && !memcmp(m.b.p, chrome_sent, m.b.n))) {
+        free(m.b.p); free(m.open);
+        return;
+    }
+    uint8_t *copy = malloc(m.b.n ? m.b.n : 1);
+    if (copy) memcpy(copy, m.b.p, m.b.n);
+    size_t n = m.b.n;
+    if (ui_send(ui, &m) < 0) { free(copy); return; }
+    free(chrome_sent);
+    chrome_sent = copy;
+    chrome_sent_n = copy ? n : 0;
+    chrome[++views % 4] = c;
+}
+
 static void draw_page(void) {
-    canvas_t *c = &w->c;
+    canvas_t *c = &view;
     int pw = page_w(), ph = page_h();
-    if (doc) web_paint(doc, c, 0, TB, pw, ph, scroll_x, scroll_y);
-    else gfx_fill(c, 0, TB, pw, ph, RGB(255, 255, 255));
+    if (doc) web_paint(doc, c, 0, 0, pw, ph, scroll_x, scroll_y);
+    else gfx_fill(c, 0, 0, pw, ph, RGB(255, 255, 255));
     devtools_draw_overlay(c);
     /* scrollbar */
-    int x = w->w - SCRW;
-    gfx_fill(c, x, TB, SCRW, ph, RGB(36, 34, 60));
+    int x = view.w - SCRW;
+    gfx_fill(c, x, 0, SCRW, ph, ui_theme.sidebar);
     if (doc_h > ph) {
         int th = MAX(24, (int)((long)ph * ph / doc_h));
-        int ty = TB + (int)((long)scroll_y * (ph - th) / max_scroll());
-        gfx_fill_round(c, x + 2, ty + 1, SCRW - 4, th - 2, 3, drag_sb ? UI_ACCENT : RGB(100, 96, 150));
+        int ty = (int)((long)scroll_y * (ph - th) / max_scroll());
+        gfx_fill_round(c, x + 2, ty + 1, SCRW - 4, th - 2, 3, drag_sb ? ui_theme.accent : ui_theme.textFaint);
     }
     /* <select> popup */
     if (sel_node) {
-        int vis = MIN(sel_n - sel_top, (w->h - SB - sel_y) / SEL_H);
+        int vis = MIN(sel_n - sel_top, (view.h - sel_y) / SEL_H);
         gfx_fill(c, sel_x - 1, sel_y - 1, sel_w + 2, vis * SEL_H + 2, RGB(90, 90, 120));
         for (int i = 0; i < vis; i++) {
             int k = sel_top + i, y = sel_y + i * SEL_H;
@@ -359,43 +397,35 @@ static void draw_page(void) {
     }
 }
 
+/* The DevTools panel under the page, inside the surface. The console's input
+   line is an engine field below the surface (show_chrome). */
 static void draw_console(void) {
-    if(browser_fullscreen)return;
+    if (browser_fullscreen) return;
     if (console_open) {
-        canvas_t *c = &w->c;
-        int top = TB + page_h(), h = console_h();
+        canvas_t *c = &view;
+        int top = page_h(), h = console_h();
         devtools_draw(c, top, h);
         console_dirty = false;
         if (dt_tab != DT_CONSOLE) return;
         top += DT_TABH; h -= DT_TABH;
-        gfx_fill(c, 0, top, w->w, h, RGB(18, 16, 30));
-        gfx_hline(c, 0, top, w->w, UI_ACCENT);
+        gfx_fill(c, 0, top, view.w, h, DT_BG);
         char heading[192];
         snprintf(heading, sizeof heading, "JavaScript console  [PgUp/PgDn: history] [Ctrl+Shift+C: copy log] [Ctrl+K: clear]  %d/%d%s",
                  console_n - console_skip, console_n, console_skip ? " (paused)" : "");
-        gfx_text(c, 8, top + 4, heading, UI_ACCENT2, TRANSPARENT, FONT_SMALL);
+        gfx_text(c, 8, top + 4, heading, ui_theme.textDim, TRANSPARENT, FONT_SMALL);
         canvas_t clip = *c;
-        gfx_clip(&clip, 4, top + 24, w->w - 8, h - 46);
+        gfx_clip(&clip, 4, top + 24, view.w - 8, h - 24);
         console_skip = MIN(console_skip, MAX(console_n - console_visible(), 0));
-        int visible = MAX(0, (h - 48) / 16), count = MIN(visible, console_n - console_skip);
+        int count = MIN(console_visible(), console_n - console_skip);
         for (int i = 0; i < count; i++) {
             int n = console_n - console_skip - count + i;
-            gfx_text(&clip, 8, top + 25 + i * 16, console_lines[n], UI_FG, TRANSPARENT, FONT_SMALL);
+            gfx_text(&clip, 8, top + 25 + i * 16, console_lines[n], ui_theme.text, TRANSPARENT, FONT_SMALL);
         }
-        gfx_hline(c, 4, top+h-23, w->w-8, UI_DIM);
-        canvas_t input=*c;gfx_clip(&input,8,top+h-20,w->w-16,20);
-        gfx_text(&input,8,top+h-19,focus==F_CONSOLE?"> ":"  ",UI_ACCENT2,TRANSPARENT,FONT_SMALL);
-        size_t first=console_cursor>(size_t)MAX((w->w-48)/8,1)?console_cursor-(size_t)MAX((w->w-48)/8,1):0;
-        while(first&&((unsigned char)console_input[first]&0xc0)==0x80)first++;
-        gfx_text(&input,24,top+h-19,console_input+first,UI_FG,TRANSPARENT,FONT_SMALL);
-        if(focus==F_CONSOLE){char saved=console_input[console_cursor];console_input[console_cursor]=0;
-            int x=24+gfx_text_width(console_input+first,FONT_SMALL);console_input[console_cursor]=saved;
-            gfx_vline(&input,x,top+h-19,15,UI_ACCENT2);}
     }
     console_dirty = false;
 }
 static void draw(void) {
-    draw_toolbar(); draw_page(); draw_status(); draw_console();
+    draw_page(); draw_console();
 }
 
 /* --log-console keeps the console in the system log (the serial port), so a
@@ -423,7 +453,7 @@ static void console_add(const char *level, const char *message) {
     uint64_t now = n_clock_uptime_ms();
     unsigned long sequence = ++console_sequence;
     int glyph = w ? MAX(gfx_text_width("M", FONT_SMALL), 1) : 8;
-    size_t wrap = (size_t)MAX(16, MIN(CONSOLE_LINE - 64, (w ? w->w : 1024) / glyph - 48));
+    size_t wrap = (size_t)MAX(16, MIN(CONSOLE_LINE - 64, (view.px ? view.w : 1024) / glyph - 48));
     do {
         size_t n = strcspn(p, "\r\n");
         size_t offset = 0;
@@ -456,10 +486,12 @@ static void console_add(const char *level, const char *message) {
 
 static void redraw(void) {
     if(doc){int x,y,width,height;(void)web_take_paint_damage(doc,&x,&y,&width,&height);}
+    if (!view.px) { need_paint = false; show_chrome(); return; }
     uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
     draw();
     uint64_t drawn = debug_js ? n_clock_uptime_ms() : 0;
-    win_update(w);
+    ui_surface_changed(ui, VIEW);
+    show_chrome();
     if (debug_js) {
         loop_profile.draw_ms += drawn - start;
         loop_profile.update_ms += n_clock_uptime_ms() - drawn;
@@ -469,33 +501,28 @@ static void redraw(void) {
 }
 static void redraw_damage(void){
     int x,y,width,height;
-    if(!doc||need_paint||sel_node||devtools_overlay_visible()||!web_take_paint_damage(doc,&x,&y,&width,&height)){redraw();return;}
+    if(!doc||!view.px||need_paint||sel_node||devtools_overlay_visible()||!web_take_paint_damage(doc,&x,&y,&width,&height)){redraw();return;}
     if(width<=0||height<=0)return;
     uint64_t start=debug_js?n_clock_uptime_ms():0;
-    canvas_t original=w->c;
-    gfx_clip(&w->c,x,TB+y,width,height);
-    draw_page();w->c=original;
+    canvas_t original=view;
+    gfx_clip(&view,x,y,width,height);
+    draw_page();view=original;
     uint64_t drawn=debug_js?n_clock_uptime_ms():0;
-    win_update_rect(w,x,TB+y,width,height);
+    ui_surface_changed_rect(ui,VIEW,x,y,width,height);
     if(debug_js){loop_profile.partial_draws++;loop_profile.partial_ms+=drawn-start;
         loop_profile.partial_update_ms+=n_clock_uptime_ms()-drawn;}
 }
 
-static void redraw_status(void) {
-    draw_status();
-    win_update_rect(w, 0, w->h - SB, w->w, SB);
-}
-
-/* Log/input changes do not invalidate author content. In particular the
+/* Log changes do not invalidate author content. In particular the
    profiling console must not make its own next sample rasterize the page.
    Opening/closing or resizing it still follows the layout/full-paint path. */
 static void redraw_console(void) {
-    if (!w || !console_dirty || !console_open || browser_fullscreen) return;
+    if (!view.px || !console_dirty || !console_open || browser_fullscreen) return;
     uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
-    int top = TB + page_h(), height = console_h();
+    int top = page_h(), height = console_h();
     draw_console();
     uint64_t drawn = debug_js ? n_clock_uptime_ms() : 0;
-    win_update_rect(w, 0, top, w->w, height);
+    ui_surface_changed_rect(ui, VIEW, 0, top, view.w, height);
     if (debug_js) {
         loop_profile.console_draws++;
         loop_profile.console_ms += drawn - start;
@@ -505,7 +532,7 @@ static void redraw_console(void) {
 
 static void set_status(const char *s) {
     strlcpy(status, s, sizeof status);
-    if (!hover[0] && !find_open) redraw_status();
+    show_chrome(); /* the same view is not sent again */
 }
 
 /* ---------------------------------------------------------------- scrolling */
@@ -562,8 +589,8 @@ static bool scroll_key(const struct gui_event *e) {
 static bool try_scroll_event(const struct gui_event *e,struct web_input_target *target_out) {
     if (e->type == EV_WHEEL) {
         if (!doc || sel_node || need_layout || e->x<0 || e->x>=page_w() ||
-            e->y<TB || e->y>=TB+page_h() || !web_native_input_ready(doc,native_wait&&native_wait_snapshot)) return false;
-        web_node *target=web_node_at(doc,document_x(e->x),e->y-TB+scroll_y);
+            e->y<0 || e->y>=page_h() || !web_native_input_ready(doc,native_wait&&native_wait_snapshot)) return false;
+        web_node *target=web_node_at(doc,document_x(e->x),e->y+scroll_y);
         /* Hit-index construction can run a cancellation checkpoint. Chrome
            may have resized the viewport or queued navigation in that call. */
         if(quit || pending_navigation || need_layout)return false;
@@ -848,10 +875,13 @@ static void relayout(void) {
 }
 
 static void set_title(void) {
+    static char shown[256];
     char t[256];
     const char *s = doc ? web_title(doc) : "";
     snprintf(t, sizeof t, "%s - Web", *s ? s : cur_url);
-    win_set_title(w, t);
+    if (!ui || !strcmp(t, shown)) return;
+    strcpy(shown, t);
+    ui_window_title(ui, WINDOW, t);
 }
 
 /* A finished JS task may have retired stylesheet/SVG arenas. No native hit-test,
@@ -1278,23 +1308,23 @@ static bool host_video_present(void *opaque, web_doc *document, const struct web
        mutable layout boxes. Keep it moving until real paint replaces it;
        document, canvas, viewport, scroll and native-overlay checks below
        reject an obsolete surface without re-entering DOM or layout here. */
-    if (!w || !patch || document != doc || quit || native_wait || pending_navigation ||
+    if (!view.px || !patch || document != doc || quit || native_wait || pending_navigation ||
         sel_node || devtools_overlay_visible() || !patch->pixels || patch->w <= 0 || patch->h <= 0 ||
         patch->pitch < patch->w ||
-        patch->canvas.px != w->c.px || patch->canvas.w != w->c.w ||
-        patch->canvas.h != w->c.h || patch->canvas.pitch != w->c.pitch ||
+        patch->canvas.px != view.px || patch->canvas.w != view.w ||
+        patch->canvas.h != view.h || patch->canvas.pitch != view.pitch ||
         patch->scroll_x != scroll_x || patch->scroll_y != scroll_y ||
-        patch->x < 0 || patch->y < TB || patch->x > page_w() || patch->y > TB + page_h() ||
-        patch->w > page_w() - patch->x || patch->h > TB + page_h() - patch->y ||
-        w->c.pitch < w->c.w || w->c.h <= 0 ||
+        patch->x < 0 || patch->y < 0 || patch->x > page_w() || patch->y > page_h() ||
+        patch->w > page_w() - patch->x || patch->h > page_h() - patch->y ||
+        view.pitch < view.w || view.h <= 0 ||
         (size_t)patch->pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)patch->h ||
-        (size_t)w->c.pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)w->c.h) return false;
+        (size_t)view.pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)view.h) return false;
     uint64_t start=debug_js?n_clock_uptime_ms():0;
     for (int row = 0; row < patch->h; row++)
-        memcpy(w->c.px + (size_t)(patch->y + row) * w->c.pitch + patch->x,
+        memcpy(view.px + (size_t)(patch->y + row) * view.pitch + patch->x,
                patch->pixels + (size_t)row * patch->pitch, (size_t)patch->w * sizeof(uint32_t));
     __sync_synchronize();
-    win_update_rect(w,patch->x,patch->y,patch->w,patch->h);
+    ui_surface_changed_rect(ui,VIEW,patch->x,patch->y,patch->w,patch->h);
     if(debug_js){loop_profile.video_patches++;loop_profile.video_present_ms+=n_clock_uptime_ms()-start;}
     return true;
 }
@@ -1309,30 +1339,161 @@ static void native_active_event(const struct gui_event *event) {
        ((event->type==EV_MOUSE_UP || event->type==EV_MOUSE_MOVE) && !(event->buttons&1))))
         web_active_release(doc);
 }
+/* The engine's events become the browser's input, in the order they came. A field's
+   text goes straight into what it edits (nothing else reads it); everything else waits
+   in the inbox, then in evq while a page task runs, like the window's own input did. */
+static struct gui_event *inbox;
+static size_t inbox_first, inbox_n, inbox_capacity;
+static int pointer_x = -1, pointer_y = -1; /* the last place the pointer was reported on the surface */
+static void inbox_put(struct gui_event e) {
+    if (inbox_first + inbox_n == inbox_capacity) {
+        if (inbox_first) {
+            memmove(inbox, inbox + inbox_first, inbox_n * sizeof *inbox);
+            inbox_first = 0;
+        } else {
+            size_t capacity = inbox_capacity ? inbox_capacity * 2 : 64;
+            void *grown = capacity <= SIZE_MAX / sizeof *inbox ? realloc(inbox, capacity * sizeof *inbox) : NULL;
+            if (!grown) {
+                if (!evq_failure_logged) { console_add("error", "Native event storage allocation failed"); evq_failure_logged = true; }
+                return;
+            }
+            inbox = grown; inbox_capacity = capacity;
+        }
+    }
+    inbox[inbox_first + inbox_n++] = e;
+}
+static void inbox_command(uint32_t command, int x, int y, uint32_t pressed) {
+    inbox_put((struct gui_event){.type = EV_COMMAND, .key = command, .x = x, .y = y, .pressed = pressed});
+}
+static bool console_set(const char *text, size_t n) {
+    if (n >= console_input_capacity) {
+        char *grown = n < SIZE_MAX ? realloc(console_input, n + 1) : NULL;
+        if (!grown) { console_add("error", "Console input allocation failed"); return false; }
+        console_input = grown; console_input_capacity = n + 1;
+    }
+    memcpy(console_input, text, n); console_input[n] = 0;
+    return true;
+}
+static void take_engine_events(void) {
+    static char *text;
+    static size_t text_capacity;
+    size_t n;
+    const void *p;
+    bool echo = false;
+    while ((p = ui_session_peek(ui, &n))) {
+        struct ui_event e;
+        bool ok = ui_event_read(p, n, &e) && e.window == WINDOW;
+        if (ok && e.text_n >= text_capacity) {
+            char *grown = e.text_n < SIZE_MAX ? realloc(text, e.text_n + 1) : NULL;
+            if (grown) { text = grown; text_capacity = e.text_n + 1; }
+            else ok = false;
+        }
+        if (ok) { memcpy(text, e.text, e.text_n); text[e.text_n] = 0; }
+        ui_session_pop(ui);
+        if (!ok) continue;
+        const struct chrome *c = &chrome[e.view % 4];
+        bool known = c->view == e.view && e.node != 0xFFFFFFFFu;
+        int which = !known ? F_PAGE : e.node == c->address ? F_ADDR : e.node == c->find ? F_FIND
+                    : e.node == c->console ? F_CONSOLE : F_PAGE;
+        switch (e.type) {
+        case UI_EVENT_CLICK:
+            if (!known) break;
+            if (e.node == c->back) inbox_command(CMD_BACK, 0, 0, 0);
+            else if (e.node == c->forward) inbox_command(CMD_FORWARD, 0, 0, 0);
+            else if (e.node == c->reload) inbox_command(CMD_RELOAD, 0, 0, 0);
+            else if (e.node == c->home) inbox_command(CMD_HOME, 0, 0, 0);
+            else if (e.node == c->history) inbox_command(CMD_HISTORY, 0, 0, 0);
+            break;
+        case UI_EVENT_TEXT:
+        case UI_EVENT_SUBMIT:
+            echo = true;
+            if (which == F_ADDR) {
+                if (!url_text_set(&address_text, text)) console_add("error", "Address allocation failed");
+                else if (e.type == UI_EVENT_SUBMIT) inbox_command(CMD_GO, 0, 0, 0);
+            } else if (which == F_FIND) {
+                if (!url_text_set(&find_text, text)) { find_error = true; console_add("error", "Search input allocation failed"); }
+                else inbox_command(e.type == UI_EVENT_SUBMIT ? CMD_FIND_NEXT : CMD_FIND, 0, 0, 0);
+            } else if (which == F_CONSOLE) {
+                if (console_set(text, e.text_n) && e.type == UI_EVENT_SUBMIT) inbox_command(CMD_EVAL, 0, 0, 0);
+            }
+            break;
+        case UI_EVENT_FOCUS:
+            if (e.node == 0xFFFFFFFFu) { inbox_put((struct gui_event){.type = e.a ? EV_FOCUS : EV_UNFOCUS}); break; }
+            if (which == F_PAGE) break;
+            if (e.a) {
+                if (which == F_ADDR && !url_text_set(&address_text, cur_url)) console_add("error", "Address allocation failed");
+                field_focus = which;
+            } else if (field_focus == which) field_focus = F_PAGE;
+            inbox_command(CMD_FOCUS, which, e.a ? 1 : 0, e.flags & UI_CANCEL);
+            break;
+        case UI_EVENT_KEY:
+            inbox_put((struct gui_event){.type = EV_KEY, .key = (uint32_t)e.a, .mods = e.mods,
+                                         .pressed = !(e.flags & UI_UP), .x = pointer_x, .y = pointer_y});
+            break;
+        case UI_EVENT_CLOSE:
+            if (e.flags & UI_GONE) w = NULL;
+            inbox_put((struct gui_event){.type = EV_CLOSE});
+            break;
+        case UI_EVENT_CANVAS: {
+            canvas_t *surface = ui_surface(ui, VIEW, (int)e.a, (int)e.b, 0);
+            if (!surface) { console_add("error", "Page surface allocation failed"); break; }
+            view = *surface;
+            need_paint = true;
+            inbox_put((struct gui_event){.type = EV_RESIZE, .x = view.w, .y = view.h});
+            break;
+        }
+        case UI_EVENT_POINTER: {
+            pointer_x = (int)floor(e.a); pointer_y = (int)floor(e.b);
+            uint32_t type = e.flags & UI_DOWN ? EV_MOUSE_DOWN : e.flags & UI_UP ? EV_MOUSE_UP : EV_MOUSE_MOVE;
+            inbox_put((struct gui_event){.type = type, .x = pointer_x, .y = pointer_y,
+                                         .buttons = UI_BUTTONS(e.flags), .mods = e.mods});
+            break;
+        }
+        case UI_EVENT_WHEEL:
+            inbox_put((struct gui_event){.type = EV_WHEEL, .x = pointer_x, .y = pointer_y,
+                                         .wheel = (int32_t)e.a, .mods = e.mods});
+            break;
+        default: break; /* the window's own size: the surface's comes as UI_EVENT_CANVAS */
+        }
+    }
+    /* A field's new value goes back in the next view: the engine takes a value it sent and
+       the app only returned as no change, so a value the browser sets later (a cleared
+       console line) is never mistaken for an old one of its own. */
+    if (echo) show_chrome();
+}
 static int browser_event(struct gui_event *event, int timeout) {
-    int result=win_event(w,event,0);
-    if(!result && timeout!=0){
+    if (!ui) return -1;
+    ui_session_pump(ui);
+    take_engine_events();
+    if (!inbox_n && timeout != 0 && w) {
         /* One wait for the window, transports and Atomics.waitAsync waiters. */
         static bool window_watched;
         n_handle queue=web_wait_queue();
         if(queue<0)return -1;
         if(!window_watched)window_watched=n_events_watch(queue,w->handle,N_EVENT_RECEIVABLE,UINT64_C(0x42)<<56)>=0;
+        int wait=window_watched||(timeout>=0&&timeout<10)?timeout:10;
+        int engine=ui_session_timeout(ui); /* the caret, animations, a picture to finish */
+        if(engine>=0&&(wait<0||engine<wait))wait=engine;
         struct n_event events[64];
-        int ready=webnet_wait(network,queue,window_watched||(timeout>=0&&timeout<10)?timeout:10,events,64);
+        int ready=webnet_wait(network,queue,wait,events,64);
         if(ready<0)return -1;
         web_wait_events(events,(size_t)ready);
-        result=win_event(w,event,0);
+        ui_session_pump(ui);
+        take_engine_events();
     }
+    if (!inbox_n) return w ? 0 : -1;
+    *event = inbox[inbox_first++];
+    if (!--inbox_n) inbox_first = 0;
     /* Release/capture cancellation is native state, even while author JS is
        running. Never hit-test, dispatch, or lay out mutable DOM at dequeue. */
-    if(result>0){native_active_event(event);browser_hover_boundary(&evq_hover_tail_valid,event);}
-    if(result>0 && debug_js && (event->type==EV_MOUSE_MOVE ||
+    native_active_event(event);browser_hover_boundary(&evq_hover_tail_valid,event);
+    if(debug_js && (event->type==EV_MOUSE_MOVE ||
        event->type==EV_MOUSE_DOWN || event->type==EV_MOUSE_UP)) {
         static uint64_t sequence;
         fprintf(stderr,"[web-input] NATIVE_POINTER %lu %d %d\n",
-                (unsigned long)++sequence,event->x,event->y-TB);
+                (unsigned long)++sequence,event->x,event->y);
     }
-    return result;
+    return 1;
 }
 /* Only browser-owned navigation commands cancel a running page task. Keep
    the event in FIFO so the ordinary handler acts after QuickJS unwinds. */
@@ -1346,12 +1507,13 @@ static bool native_navigation_command(const struct gui_event *event) {
             if(key==NKEY_RIGHT && hpos<nhist-1)return true;
         }
     }
-    if(event->type==EV_MOUSE_DOWN && (event->buttons&1) &&
-       event->y<TB && !sel_node) {
-        for(int i=BTN_BACK;i<=BTN_HOME;i++)
-            if(ui_hit(event->x,event->y,btn_x(i),6,28,28))
-                return i==BTN_BACK?hpos>0:i==BTN_FWD?hpos<nhist-1:
-                       i==BTN_RELOAD?cur_url[0]!=0:true;
+    if(event->type==EV_COMMAND && !sel_node) {
+        switch(event->key) {
+        case CMD_BACK: return hpos>0;
+        case CMD_FORWARD: return hpos<nhist-1;
+        case CMD_RELOAD: return cur_url[0]!=0;
+        case CMD_HOME: case CMD_GO: return true;
+        }
     }
     return false;
 }
@@ -1373,7 +1535,7 @@ static bool host_script_checkpoint(void *opaque) {
         if(event<0){quit=true;return false;}
         if(!event)break;
         if(e.type==EV_CLOSE){quit=true;return false;}
-        if(e.type==EV_WHEEL && console_open && e.y>=TB+page_h() && e.y<w->h-SB) {
+        if(e.type==EV_WHEEL && console_open && e.y>=page_h() && e.y<view.h) {
             devtools_wheel(e.x,e.y,e.wheel);redraw_console();continue;
         }
         /* Escape in native chrome/fullscreen is an ordinary UI command, not
@@ -1382,15 +1544,18 @@ static bool host_script_checkpoint(void *opaque) {
         if(e.type==EV_KEY && e.pressed && e.key==NKEY_ESC && !browser_fullscreen &&
            focus==F_PAGE && !sel_node && !find_open)return false;
         if(e.type==EV_KEY && e.pressed && e.key==NKEY_F12) {
-            int old_top=TB+page_h(),old_height=console_h();
+            int old_top=page_h(),old_height=console_h();
             console_open=!console_open;
             if(console_open)focus=F_CONSOLE;else if(focus==F_CONSOLE)focus=F_PAGE;
             need_layout=need_paint=true;
             /* Chrome only: never read the document's half-built layout here.
                The exposed page area is restored after the task unwinds. */
-            if(console_open)draw_console();
-            else gfx_fill(&w->c,0,old_top,w->w,old_height,UI_BG);
-            win_update(w);
+            if(view.px){
+                if(console_open)draw_console();
+                else gfx_fill(&view,0,old_top,view.w,old_height,ui_theme.background);
+                ui_surface_changed(ui,VIEW);
+            }
+            show_chrome();
             continue;
         }
         if(!defer_native_event(&e))return false;
@@ -1759,7 +1924,7 @@ static void navigate_inner(const char *url, const void *post, size_t length, con
     navigation_mode = mode;
     loading = true;
     char what[256]; snprintf(what, sizeof what, "Loading %.240s", url); set_status(what);
-    draw_toolbar(); win_update_rect(w, 0, 0, w->w, TB);
+    show_chrome();
     if (has_prefix(url, "about:") || has_prefix(url, "file://")) {
         navigation_timing.fetch_start_ms = n_clock_uptime_ms();
         navigation_timing.fetch_valid = true;
@@ -1972,7 +2137,7 @@ static bool dispatch_native_mode(const char *type, web_node *target, const struc
     char key_text[8];
     struct web_event event = {
         .type = type, .bubbles = true, .cancelable = cancelable,
-        .x = e ? e->x : 0, .y = e ? e->y - TB : 0,
+        .x = e ? e->x : 0, .y = e ? e->y : 0,
         .button = e && (e->buttons & 2) ? 2 : 0,
         .buttons = e ? e->buttons : 0,
         .delta_y = e && !strcmp(type,"wheel") ? e->wheel * LINE : 0,
@@ -1990,7 +2155,7 @@ static bool dispatch_native(const char *type, web_node *target, const struct gui
 }
 static web_node *native_capture_target(const struct gui_event *e) {
     if(!doc || native_wait || !e)return NULL;
-    struct web_event event={.x=e->x,.y=e->y-TB,.button=e->type==EV_MOUSE_MOVE?-1:0,.buttons=e->buttons,
+    struct web_event event={.x=e->x,.y=e->y,.button=e->type==EV_MOUSE_MOVE?-1:0,.buttons=e->buttons,
         .ctrl=(e->mods&NMOD_CTRL)!=0,.shift=(e->mods&NMOD_SHIFT)!=0,.alt=(e->mods&NMOD_ALT)!=0};
     return web_pointer_capture_target(doc,&event);
 }
@@ -2050,13 +2215,13 @@ static void open_select(web_node *n) {
     sel_w = ww;
     for (int i = 0; i < sel_n; i++) sel_w = MAX(sel_w, gfx_text_width(sel_labels[i], FONT_SMALL) + 16);
     sel_x = MAX(0, MIN(sel_x, page_w() - sel_w));
-    sel_y = TB + y + h - scroll_y;
-    int room = (w->h - SB - sel_y) / SEL_H;
+    sel_y = y + h - scroll_y;
+    int room = (view.h - sel_y) / SEL_H;
     if (room < MIN(sel_n, 6)) { /* not enough room below: open upwards */
-        int up = MIN(sel_n, (TB + y - scroll_y - TB) / SEL_H);
-        if (up > room) sel_y = TB + y - scroll_y - up * SEL_H;
+        int up = MIN(sel_n, (y - scroll_y) / SEL_H);
+        if (up > room) sel_y = y - scroll_y - up * SEL_H;
     }
-    room = (w->h - SB - sel_y) / SEL_H;
+    room = (view.h - sel_y) / SEL_H;
     sel_top = sel_cur >= room ? sel_cur - room + 1 : 0;
 }
 
@@ -2072,77 +2237,11 @@ static void choose_select(int i) {
     relayout();
 }
 
+/* The fields edit themselves in the engine; these give them the keyboard and act on what they hold. */
 static void addr_focus(void) {
     if (!url_text_set(&address_text, cur_url)) { console_add("error", "Address allocation failed"); return; }
     focus = F_ADDR;
-    acur = strlen(addr);
-    addr_all = true;
-}
-
-static void addr_insert(const char *s) {
-    size_t n = strlen(s), len = addr_all ? 0 : strlen(addr);
-    if (len == SIZE_MAX || n > SIZE_MAX - len - 1 || !url_text_reserve(&address_text, len + n + 1)) {
-        console_add("error", "Address allocation failed"); return;
-    }
-    if (!len) addr[0] = 0;
-    if (addr_all) { addr[0] = 0; acur = 0; addr_all = false; }
-    memmove(addr + acur + n, addr + acur, len - (size_t)acur + 1);
-    memcpy(addr + acur, s, n); acur += n;
-}
-
-static void addr_key(const struct gui_event *e) {
-    if (!address_text.p && !url_text_set(&address_text, "")) { console_add("error", "Address allocation failed"); return; }
-    size_t len = strlen(addr);
-    bool ctrl = e->mods & NMOD_CTRL;
-    if (e->key == NKEY_ENTER) {
-        focus = F_PAGE;
-        go_addr(addr);
-        return;
-    }
-    if (e->key == NKEY_ESC) {
-        focus = F_PAGE;
-        return;
-    }
-    if (ctrl && (e->key == 'a' || e->key == 'A')) addr_all = true;
-    else if (ctrl && (e->key == 'c' || e->key == 'C')) clipboard_set(addr, strlen(addr));
-    else if (ctrl && (e->key == 'v' || e->key == 'V')) {
-        int needed = clipboard_get(NULL, 0);
-        if (needed < 0 || needed == INT_MAX) { console_add("error", "Clipboard address length is not representable"); return; }
-        char *clip = malloc((size_t)needed + 1);
-        if (!clip) { console_add("error", "Address allocation failed"); return; }
-        int n = clipboard_get(clip, needed + 1);
-        if (n >= 0 && n <= needed) {
-            clip[n] = 0;
-            for (char *p = clip; *p; p++) if (*p == '\n' || *p == '\r' || *p == '\t') *p = ' ';
-            addr_insert(clip);
-        } else console_add("error", "Clipboard changed while copying address");
-        free(clip);
-    } else if (e->key == NKEY_BACKSPACE || e->key == NKEY_DELETE) {
-        if (addr_all) {
-            addr[0] = 0;
-            acur = 0;
-            addr_all = false;
-        } else {
-            size_t start = acur, end = acur;
-            if (e->key == NKEY_BACKSPACE && start > 0) {
-                start--; while (start > 0 && ((unsigned char)addr[start] & 0xc0) == 0x80) start--;
-            } else if (e->key == NKEY_DELETE && end < len) {
-                end++; while (end < len && ((unsigned char)addr[end] & 0xc0) == 0x80) end++;
-            }
-            memmove(addr + start, addr + end, (size_t)(len - end + 1)); acur = start;
-        }
-    } else if (e->key == NKEY_LEFT || e->key == NKEY_HOME) {
-        acur = addr_all || e->key == NKEY_HOME ? 0 : acur ? acur - 1 : 0;
-        while (acur > 0 && ((unsigned char)addr[acur] & 0xc0) == 0x80) acur--;
-        addr_all = false;
-    } else if (e->key == NKEY_RIGHT || e->key == NKEY_END) {
-        acur = addr_all || e->key == NKEY_END ? len : acur < len ? acur + 1 : len;
-        while (acur < len && ((unsigned char)addr[acur] & 0xc0) == 0x80) acur++;
-        addr_all = false;
-    } else if (e->key >= 32 && e->key < 127 && !ctrl) {
-        char s[2] = {(char)e->key, 0};
-        addr_insert(s);
-    }
+    focus_renew = true; /* again, even when it has the keyboard already: select all of it */
 }
 
 static void find_next(int from) {
@@ -2154,79 +2253,18 @@ static void find_next(int from) {
     if (find_y >= 0 && (find_y < scroll_y || find_y > scroll_y + page_h() - 40)) scroll_to(find_y - page_h() / 3);
 }
 
-static bool find_insert(const char *text) {
-    size_t n = strlen(text), len = find_all ? 0 : strlen(find_buf);
-    if (len == SIZE_MAX || n > SIZE_MAX - len - 1 || !url_text_reserve(&find_text, len + n + 1)) {
-        find_error = true; console_add("error", "Search input allocation failed"); return false;
-    }
-    memcpy(find_text.p + len, text, n + 1);
-    find_all = false; return true;
+static void find_close(void) {
+    find_open = false;
+    if (focus == F_FIND) focus = F_PAGE;
+    if (doc) web_find(doc, "", 0);
 }
 
-static void find_key(const struct gui_event *e) {
-    size_t len = strlen(find_buf);
-    bool ctrl = e->mods & NMOD_CTRL;
-    if (e->key == NKEY_ESC) {
-        find_open = false;
-        focus = F_PAGE;
-        if (doc) web_find(doc, "", 0);
-        return;
-    }
-    if (e->key == NKEY_ENTER) {
-        if (find_buf[0]) find_next(find_y >= 0 ? find_y + 1 : scroll_y);
-        return;
-    }
-    if (ctrl && (e->key == 'a' || e->key == 'A')) { find_all = true; return; }
-    if (ctrl && (e->key == 'c' || e->key == 'C' || e->key == 'x' || e->key == 'X')) {
-        if (clipboard_set(find_buf, len) < 0) { console_add("error", "Search clipboard copy failed"); return; }
-        if (e->key == 'c' || e->key == 'C') return;
-        if (find_text.p) find_text.p[0] = 0;
-        find_all = false;
-    } else if (ctrl && (e->key == 'v' || e->key == 'V')) {
-        int needed = clipboard_get(NULL, 0);
-        if (needed < 0 || needed == INT_MAX) { console_add("error", "Search clipboard length is not representable"); return; }
-        char *clip = malloc((size_t)needed + 1);
-        if (!clip) { find_error = true; console_add("error", "Search clipboard allocation failed"); return; }
-        int n = clipboard_get(clip, needed + 1);
-        if (n < 0 || n > needed) { console_add("error", "Clipboard changed while copying search text"); free(clip); return; }
-        clip[n] = 0;
-        bool inserted = find_insert(clip); free(clip);
-        if (!inserted) return;
-    } else if (e->key == NKEY_BACKSPACE || (e->key == NKEY_DELETE && find_all)) {
-        if (len && find_text.p) {
-            size_t start = find_all ? 0 : len - 1;
-            while (start && ((unsigned char)find_text.p[start] & 0xc0) == 0x80) start--;
-            find_text.p[start] = 0;
-        }
-        find_all = false;
-    } else if (e->key >= 32 && e->key < 127 && !ctrl) {
-        char text[2] = {(char)e->key, 0};
-        if (!find_insert(text)) return;
-    } else return;
-    find_next(find_y >= 0 ? find_y : scroll_y);
-}
-
-static void console_insert(const char *text) {
-    size_t n=strlen(text),length=console_selected?0:strlen(console_input);
-    if(n>SIZE_MAX-length-1)return;
-    size_t needed=length+n+1;
-    if (needed > console_input_capacity) {
-        size_t capacity=console_input_capacity > 64 ? console_input_capacity : 64;
-        while(capacity<needed){if(capacity>SIZE_MAX/2){capacity=needed;break;}capacity*=2;}
-        char *grown=realloc(console_input,capacity);
-        if(!grown){console_add("error","Console input allocation failed");return;}
-        console_input=grown;console_input_capacity=capacity;
-    }
-    if(console_selected){console_input[0]=0;console_cursor=0;console_selected=false;}
-    memmove(console_input+console_cursor+n,console_input+console_cursor,length-console_cursor+1);
-    memcpy(console_input+console_cursor,text,n);console_cursor+=n;console_dirty=true;
-}
+/* Keys for the DevTools panel while the console has the keyboard; the line itself is the field's. */
 static void console_key(const struct gui_event *e) {
     if(dt_tab!=DT_CONSOLE){devtools_key(e);return;}
     uint32_t k=e->key;bool ctrl=e->mods&NMOD_CTRL;
     if(ctrl&&k>='A'&&k<='Z')k+=32;
     if(ctrl&&(k=='['||k==']')){devtools_set_tab(k==']'?DT_NETWORK:DT_ELEMENTS);return;}
-    size_t length=strlen(console_input);
     if(k==NKEY_PGUP){console_scroll(console_visible());return;}
     if(k==NKEY_PGDN){console_scroll(-console_visible());return;}
     if(ctrl&&k==NKEY_HOME){console_scroll(INT_MAX);return;}
@@ -2235,39 +2273,16 @@ static void console_key(const struct gui_event *e) {
         bool copied=console_copy_log();console_skip=0;
         console_add(copied?"log":"error",copied?"Retained console log copied to Nocturne clipboard.":"Console log copy failed.");return;
     }
-    if(k==NKEY_ENTER){if(length){
-        console_skip=0;
-        console_add("input",console_input);
-        if(!web_console_eval(doc,console_input,length))console_add("error","Console execution failed or the page runtime is unavailable.");
-        console_input[0]=0;console_cursor=0;console_selected=false;
-        need_layout=true;
-    }}else if(k==NKEY_ESC){focus=F_PAGE;}
-    else if(ctrl&&k=='a')console_selected=true;
-    else if(ctrl&&k=='c')clipboard_set(console_input,length);
-    else if(ctrl&&k=='v'){
-        char dummy; int needed=clipboard_get(&dummy,0);
-        char *text=needed>0?malloc((size_t)needed+1):NULL;
-        if(text){int n=clipboard_get(text,(size_t)needed+1);
-            if(n>0&&n<=needed){text[n]=0;for(char *p=text;*p;p++)if(*p=='\r'||*p=='\n')*p=' ';console_insert(text);}
-            free(text);
-        }
-    }
-    else if(k==NKEY_LEFT||k==NKEY_HOME){
-        if(k==NKEY_HOME||console_selected)console_cursor=0;
-        else if(console_cursor){console_cursor--;while(console_cursor&&((unsigned char)console_input[console_cursor]&0xc0)==0x80)console_cursor--;}
-        console_selected=false;
-    }else if(k==NKEY_RIGHT||k==NKEY_END){
-        if(k==NKEY_END||console_selected)console_cursor=length;
-        else if(console_cursor<length){console_cursor++;while(console_cursor<length&&((unsigned char)console_input[console_cursor]&0xc0)==0x80)console_cursor++;}
-        console_selected=false;
-    }else if(k==NKEY_BACKSPACE||k==NKEY_DELETE){
-        if(console_selected){console_input[0]=0;console_cursor=0;console_selected=false;}
-        else {size_t start=console_cursor,end=console_cursor;
-            if(k==NKEY_BACKSPACE&&start){start--;while(start&&((unsigned char)console_input[start]&0xc0)==0x80)start--;}
-            if(k==NKEY_DELETE&&end<length){end++;while(end<length&&((unsigned char)console_input[end]&0xc0)==0x80)end++;}
-            memmove(console_input+start,console_input+end,length-end+1);console_cursor=start;}
-    }else if(!ctrl&&!(e->mods&NMOD_ALT)&&!(k>=NKEY_F1&&k<=NKEY_F12)){char text[8];const char *p=event_key(k,text);if(p==text&&*p)console_insert(p);}
-    console_dirty=true;
+}
+
+static void console_eval(void) {
+    size_t length=strlen(console_input);
+    if(!length)return;
+    console_skip=0;
+    console_add("input",console_input);
+    if(!web_console_eval(doc,console_input,length))console_add("error","Console execution failed or the page runtime is unavailable.");
+    console_input[0]=0;
+    need_layout=true;
 }
 
 /* These are native user commands. Page scripts receive the ordinary editing
@@ -2343,6 +2358,7 @@ static void key(const struct gui_event *e) {
     if (ctrl && k == 'f') {
         find_open = true;
         focus = F_FIND;
+        focus_renew = true; /* again, when it has the keyboard already */
         sel_node = NULL;
         return;
     }
@@ -2354,7 +2370,7 @@ static void key(const struct gui_event *e) {
     if (alt && k == NKEY_RIGHT) return go_history(1);
     if(console_open&&focus==F_CONSOLE)return console_key(e);
     if (sel_node) {
-        int room = MAX((w->h - SB - sel_y) / SEL_H, 1);
+        int room = MAX((view.h - sel_y) / SEL_H, 1);
         if (k == NKEY_ESC) sel_node = NULL;
         else if (k == NKEY_ENTER || k == ' ') choose_select(sel_cur);
         else if (k == NKEY_UP || k == NKEY_DOWN) {
@@ -2364,8 +2380,7 @@ static void key(const struct gui_event *e) {
         }
         return;
     }
-    if (focus == F_ADDR) return addr_key(e);
-    if (focus == F_FIND) return find_key(e);
+    if (focus == F_ADDR || focus == F_FIND) return; /* a key the field had no use for */
     web_node *target = doc ? web_focused(doc) : NULL;
     if (!dispatch_native("keydown", target, e, true)) return;
     if (!(e->mods & (NMOD_CTRL | NMOD_ALT)) &&
@@ -2393,8 +2408,7 @@ static void key(const struct gui_event *e) {
     }
     if (k == NKEY_BACKSPACE && !ctrl) return go_history(-1);
     if (k == NKEY_ESC && find_open) {
-        find_open = false;
-        if (doc) web_find(doc, "", 0);
+        find_close();
         return;
     }
     scroll_key(e);
@@ -2424,7 +2438,7 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
     } else if (!web_node_action(doc,target,&hit) || hit.kind==WEB_HIT_LINK) return;
     if (!keyboard && hit.kind==WEB_HIT_DETAILS) {
         struct web_hit pointer={0};
-        if (!web_hit_test(doc,document_x(x),y-TB+scroll_y,&pointer) || pointer.kind!=WEB_HIT_DETAILS || pointer.node!=hit.node) return;
+        if (!web_hit_test(doc,document_x(x),y+scroll_y,&pointer) || pointer.kind!=WEB_HIT_DETAILS || pointer.node!=hit.node) return;
     }
     switch (hit.kind) {
     case WEB_HIT_LINK:
@@ -2468,7 +2482,7 @@ static void scrollbar_drag(int my) {
     int th = MAX(24, (int)((long)ph * ph / doc_h));
     int range = ph - th;
     if (range <= 0) return;
-    scroll_to((int)((long)(my - TB - drag_off) * max_scroll() / range));
+    scroll_to((int)((long)(my - drag_off) * max_scroll() / range));
 }
 
 static void mouse_down(const struct gui_event *e) {
@@ -2478,54 +2492,16 @@ static void mouse_down(const struct gui_event *e) {
     int x = e->x, y = e->y;
     if (devtools_pointer_down(x, y)) return;
     if (sel_node) {
-        int vis = MIN(sel_n - sel_top, (w->h - SB - sel_y) / SEL_H);
-        if (ui_hit(x, y, sel_x, sel_y, sel_w, vis * SEL_H)) choose_select(sel_top + (y - sel_y) / SEL_H);
+        int vis = MIN(sel_n - sel_top, (view.h - sel_y) / SEL_H);
+        if (x >= sel_x && x < sel_x + sel_w && y >= sel_y && y < sel_y + vis * SEL_H) choose_select(sel_top + (y - sel_y) / SEL_H);
         else sel_node = NULL;
         return;
     }
-    if (y < TB) {
-        if (x >= ADDR_X) {
-            if (focus != F_ADDR) {
-                addr_focus();
-            }
-            else { /* place the caret */
-                addr_all = false;
-                size_t len = strlen(addr), best = len;
-                int width = 0, shift = address_width(addr, acur);
-                shift = shift > w->w - ADDR_X - 28 ? shift - (w->w - ADDR_X - 28) : 0;
-                for (size_t i = 0; i < len;) {
-                    if ((int64_t)ADDR_X + 7 + width - shift >= x) { best = i; break; }
-                    uint32_t cp; int bytes = gfx_utf8_decode(addr + i, &cp);
-                    if (bytes <= 0 || (size_t)bytes > len - i) break;
-                    int add = MAX(gfx_codepoint_width(cp, FONT_SMALL), 0);
-                    width = add > INT_MAX - width ? INT_MAX : width + add; i += bytes;
-                }
-                acur = best;
-            }
-            return;
-        }
-        focus = F_PAGE;
-        for (int i = 0; i < NBTN; i++)
-            if (ui_hit(x, y, btn_x(i), 6, 28, 28)) {
-                if (i == BTN_BACK) go_history(-1);
-                else if (i == BTN_FWD) go_history(1);
-                else if (i == BTN_RELOAD && loading && !native_wait) stop_navigation();
-                else if (i == BTN_RELOAD && cur_url[0]) navigate(cur_url, NULL, NAV_RELOAD);
-                else if (i == BTN_HOME) navigate(HOME, NULL, NAV_PUSH);
-                else if (i == BTN_HISTORY) { sel_node = NULL; web_autocomplete_settings(); need_paint = true; }
-                return;
-            }
-        return;
-    }
-    if (y >= w->h - SB) {
-        if (find_open) focus = F_FIND;
-        return;
-    }
-    if (x >= w->w - SCRW) {
+    if (x >= view.w - SCRW) {
         int ph = page_h();
         if (doc_h <= ph) return;
         int th = MAX(24, (int)((long)ph * ph / doc_h));
-        int ty = TB + (int)((long)scroll_y * (ph - th) / max_scroll());
+        int ty = (int)((long)scroll_y * (ph - th) / max_scroll());
         if (y < ty) scroll_to(scroll_y - (ph - LINE));
         else if (y >= ty + th) scroll_to(scroll_y + (ph - LINE));
         else {
@@ -2536,7 +2512,7 @@ static void mouse_down(const struct gui_event *e) {
     }
     focus = F_PAGE;
     if (doc) {
-        pressed_node = web_node_at(doc, document_x(x), y - TB + scroll_y);
+        pressed_node = web_node_at(doc, document_x(x), y + scroll_y);
         web_active_press(doc,pressed_node);
         web_frame_address_select(doc, pressed_node); need_paint = true;
         /* Dispatch may cancel the compatibility mouse event, remove the
@@ -2556,27 +2532,18 @@ static void mouse_move(const struct gui_event *e) {
         redraw();
         return;
     }
-    int hb = -1;
-    if (e->y < TB)
-        for (int i = 0; i < NBTN; i++)
-            if (ui_hit(e->x, e->y, btn_x(i), 6, 28, 28)) hb = i;
-    if (hb != hot_btn) {
-        hot_btn = hb;
-        draw_toolbar();
-        win_update_rect(w, 0, 0, w->w, TB);
-    }
     char h[sizeof hover] = "";
     web_node *node = NULL;
-    if (doc && !sel_node && e->y >= TB && e->y < TB + page_h() && e->x >= 0 && e->x < page_w()) {
+    if (doc && !sel_node && e->y >= 0 && e->y < page_h() && e->x >= 0 && e->x < page_w()) {
         struct web_hit hit;
-        if (web_hit_test(doc, document_x(e->x), e->y - TB + scroll_y, &hit) && hit.href) strlcpy(h, hit.href, sizeof h);
-        node = web_node_at(doc, document_x(e->x), e->y - TB + scroll_y);
+        if (web_hit_test(doc, document_x(e->x), e->y + scroll_y, &hit) && hit.href) strlcpy(h, hit.href, sizeof h);
+        node = web_node_at(doc, document_x(e->x), e->y + scroll_y);
     }
     if (doc && !native_wait && !web_script_running(doc)) {
         web_node *captured=native_capture_target(e);
         if(captured)node=captured;
         struct web_event event = {
-            .x=e->x, .y=e->y-TB, .buttons=e->buttons,
+            .x=e->x, .y=e->y, .buttons=e->buttons,
             .ctrl=(e->mods & NMOD_CTRL)!=0, .shift=(e->mods & NMOD_SHIFT)!=0,
             .alt=(e->mods & NMOD_ALT)!=0
         };
@@ -2586,16 +2553,46 @@ static void mouse_move(const struct gui_event *e) {
     }
     if (strcmp(h, hover)) {
         strlcpy(hover, h, sizeof hover);
-        redraw_status();
+        show_chrome();
+    }
+}
+
+/* What the widgets around the page asked for, in its turn with the rest of the input. */
+static void command(const struct gui_event *e) {
+    switch (e->key) {
+    case CMD_BACK: go_history(-1); break;
+    case CMD_FORWARD: go_history(1); break;
+    case CMD_RELOAD:
+        if (loading && !native_wait) stop_navigation();
+        else if (cur_url[0]) navigate(cur_url, NULL, NAV_RELOAD);
+        break;
+    case CMD_HOME: navigate(HOME, NULL, NAV_PUSH); break;
+    case CMD_HISTORY: sel_node = NULL; web_autocomplete_settings(); need_paint = true; break;
+    case CMD_GO: focus = F_PAGE; sel_node = NULL; go_addr(addr); break;
+    case CMD_FIND: find_next(find_y >= 0 ? find_y : scroll_y); break;
+    case CMD_FIND_NEXT: if (find_buf[0]) find_next(find_y >= 0 ? find_y + 1 : scroll_y); break;
+    case CMD_EVAL: console_eval(); break;
+    case CMD_FOCUS: /* x: the field; y: it got the keyboard (1) or lost it; pressed: Escape gave it up */
+        if (e->y) { focus = focus_shown = e->x; sel_node = NULL; }
+        else if (focus == e->x) {
+            focus = focus_shown = F_PAGE;
+            if (e->x == F_FIND && e->pressed) find_close();
+        }
+        break;
     }
 }
 
 static void handle(const struct gui_event *e) {
     bool console_only=console_open && !dt_resizing &&
         ((e->type==EV_KEY && focus==F_CONSOLE) ||
-         (e->type==EV_WHEEL && e->y>=TB+page_h() && e->y<w->h-SB));
+         (e->type==EV_WHEEL && e->y>=page_h() && e->y<view.h));
     switch (e->type) {
     case EV_CLOSE: quit = true; return;
+    case EV_COMMAND:
+        command(e);
+        /* the keyboard moving between fields changes only the widgets */
+        if (e->key == CMD_FOCUS && !(e->x == F_FIND && e->pressed) && !need_layout && !need_paint) { show_chrome(); return; }
+        break;
     case EV_UNFOCUS: web_pointer_cancel(doc);web_active_release(doc);pressed_node=NULL;break;
     case EV_KEY:
         if (!e->pressed) {
@@ -2616,8 +2613,8 @@ static void handle(const struct gui_event *e) {
         if (dt_resizing || dt_swallow_up) { dt_resizing = dt_swallow_up = false; pressed_node = NULL; break; }
         if (doc) {
             web_node *capture=native_capture_target(e);
-            bool inside=e->y>=TB && e->y<TB+page_h() && e->x>=0 && e->x<page_w();
-            web_node *target=capture?capture:inside?web_node_at(doc,document_x(e->x),e->y-TB+scroll_y):NULL;
+            bool inside=e->y >= 0 && e->y<page_h() && e->x>=0 && e->x<page_w();
+            web_node *target=capture?capture:inside?web_node_at(doc,document_x(e->x),e->y+scroll_y):NULL;
             web_node *down = pressed_node;
             dispatch_native("mouseup", target, e, false);
             web_node *captured_click=web_pointer_capture_click_target(doc,target);
@@ -2636,14 +2633,14 @@ static void handle(const struct gui_event *e) {
         else if (!quit) redraw_console();
         return;
     case EV_WHEEL:
-        if (console_open && e->y >= TB + page_h() && e->y < w->h - SB) {
+        if (console_open && e->y >= page_h() && e->y < view.h) {
             devtools_wheel(e->x, e->y, e->wheel);
         } else if (sel_node) {
-            int room = MAX((w->h - SB - sel_y) / SEL_H, 1);
+            int room = MAX((view.h - sel_y) / SEL_H, 1);
             sel_top = MAX(0, MIN(sel_n - room, sel_top + e->wheel));
         } else {
-            web_node *target = doc && e->y >= TB && e->y < TB + page_h() ?
-                               web_node_at(doc, document_x(e->x), e->y - TB + scroll_y) : NULL;
+            web_node *target = doc && e->y >= 0 && e->y < page_h() ?
+                               web_node_at(doc, document_x(e->x), e->y + scroll_y) : NULL;
             if (dispatch_native("wheel", target, e, true)) {
                 if (e->mods & NMOD_SHIFT) scroll_input(target,e->wheel*LINE,0,0);
                 else scroll_input(target,0,e->wheel*LINE,0);
@@ -2684,11 +2681,11 @@ static void handle_native_wait(const struct gui_event *e) {
             if (console_open) focus = F_CONSOLE; else if (focus == F_CONSOLE) focus = F_PAGE;
             prepare_native_snapshot(true);native_wait_snapshot=web_native_input_ready(doc,true);
             if(native_wait_snapshot)redraw();
-            else if(console_open){draw_console();win_update_rect(w,0,TB+page_h(),w->w,console_h());}
+            else if(console_open&&view.px){draw_console();ui_surface_changed_rect(ui,VIEW,0,page_h(),view.w,console_h());}
+            show_chrome();
             return;
         }
-        if ((e->mods & NMOD_CTRL) && k == 'l') { addr_focus(); redraw(); return; }
-        if (focus == F_ADDR) { addr_key(e); redraw(); return; }
+        if ((e->mods & NMOD_CTRL) && k == 'l') { addr_focus(); show_chrome(); return; }
         if (e->key == NKEY_F5 || ((e->mods & NMOD_CTRL) && k == 'r')) {
             queue_navigation(cur_url, NULL, NAV_RELOAD); return;
         }
@@ -2697,12 +2694,17 @@ static void handle_native_wait(const struct gui_event *e) {
             if (e->key == NKEY_RIGHT) { go_history(1); return; }
         }
     }
-    if (e->type == EV_MOUSE_DOWN && (e->y < TB || e->x >= w->w - SCRW)) {
+    /* The toolbar's commands act now; what needs the document (find, the console) waits. */
+    if (e->type == EV_COMMAND && e->key != CMD_FIND && e->key != CMD_FIND_NEXT && e->key != CMD_EVAL &&
+        !(e->key == CMD_FOCUS && e->x == F_FIND && e->pressed)) {
+        command(e); show_chrome(); return;
+    }
+    if (e->type == EV_MOUSE_DOWN && e->x >= view.w - SCRW) {
         mouse_down(e); redraw(); return;
     }
     if (e->type == EV_MOUSE_MOVE && drag_sb) { scrollbar_drag(e->y); redraw(); return; }
     if (e->type == EV_MOUSE_UP && drag_sb) { drag_sb = false; redraw(); return; }
-    if(e->type==EV_WHEEL && console_open && e->y>=TB+page_h() && e->y<w->h-SB) {
+    if(e->type==EV_WHEEL && console_open && e->y>=page_h() && e->y<view.h) {
         devtools_wheel(e->x,e->y,e->wheel);redraw_console();return;
     }
     if(!defer_native_event(e)){sync_stopped=true;return;}
@@ -2878,13 +2880,20 @@ int main(int argc, char **argv) {
     web_avmedia_debug(debug_js);
     web_paint_debug(debug_js);
     parallel_profile_enable(debug_js);
-    w = win_open(MIN(1100, sw - 40), MIN(800, sh - 70), "Web",
-                 WIN_RESIZABLE | (start_maximized ? WIN_START_MAXIMIZED : 0));
-    if (!w) return 1;
+    /* The window is the UI engine's: the toolbar, the address and find fields and the status
+       line are its widgets; the page, its scrollbar and DevTools are one surface between them. */
+    ui = ui_session_new();
+    if (!ui) return 1;
+    if (ui_window(ui, WINDOW, MIN(1100, sw - 40), MIN(800, sh - 70),
+                  WIN_RESIZABLE | (start_maximized ? WIN_START_MAXIMIZED : 0), "Web", NULL, NULL) < 0 ||
+        !(w = ui_session_window(ui, WINDOW))) { ui_session_free(ui); return 1; }
     network = webnet_create();
     webnet_debug(network, debug_js);
-    if (!network) { win_close(w); return 1; }
+    if (!network) { ui_session_free(ui); return 1; }
     storage = webstorage_create(); /* lazily touches local disk only on storage access */
+    show_chrome();
+    ui_session_pump(ui); /* the surface gets its size */
+    take_engine_events();
     redraw();
     if (argc > 1) {
         if (argv[1][0] == '/') {
@@ -2993,6 +3002,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nhist; i++) hist_discard(i);
     free(hist); free(console_lines); free(sel_labels); free(evq); free(console_input); free(console_startup);
     while (history_queue) { struct browser_history_task *next=history_queue->next; free(history_queue); history_queue=next; }
-    win_close(w);
+    ui_session_free(ui); free(chrome_sent); free(inbox);
     return 0;
 }

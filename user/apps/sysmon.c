@@ -1,22 +1,27 @@
-/* System monitor */
+/* System monitor: the readouts and the process list are widgets of the interface engine
+   (libc/ui.c); the two history graphs are surfaces drawn here. It samples once a second. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "ui.h"
 
-#define W 620
-#define H 520
+#define GW 295 /* a graph, inside a card of padding 14 */
+#define GH 84
+#define W (2 * (GW + 28) + 10 + 24)
+#define H 700
 #define HIST 120
-#define ROW 20
-#define LIST_Y 200
+#define MAXPROC 128
+#define WINDOW 1
+#define S_CPU 1
+#define S_MEM 2
 
-static window_t *w;
-static struct n_procinfo procs[128], prev[128];
-static int nproc, nprev, sel_pid = -1, scroll;
-static float cpu_hist[HIST], mem_hist[HIST], proc_cpu[128];
+static struct n_procinfo procs[MAXPROC], prev[MAXPROC];
+static int nproc, nprev, sel_pid = -1;
+static float cpu_hist[HIST], mem_hist[HIST], proc_cpu[MAXPROC];
 static uint64_t last_t;
-static bool hot_kill;
 static char status[96];
+static uint32_t row_node[MAXPROC], kill_node; /* places in the view that events name */
 
 static uint64_t prev_cpu(int pid) {
     for (int i = 0; i < nprev; i++)
@@ -27,7 +32,7 @@ static uint64_t prev_cpu(int pid) {
 static void sample(void) {
     memcpy(prev, procs, sizeof procs);
     nprev = nproc;
-    nproc = proclist(procs, 128);
+    nproc = proclist(procs, MAXPROC);
     uint64_t now = n_clock_uptime_ms(), dt = now - last_t;
     if (!last_t || !dt) dt = 1000;
     last_t = now;
@@ -53,131 +58,201 @@ static void sample(void) {
     mem_hist[HIST - 1] = mem;
 }
 
-static void graph(canvas_t *c, int x, int y, int gw, int gh, float *hist, uint32_t col, const char *label) {
-    gfx_fill_round(c, x, y, gw, gh, 8, RGB(18, 16, 32));
-    for (int i = 1; i < 4; i++) gfx_hline(c, x + 4, y + gh * i / 4, gw - 8, RGB(34, 32, 56));
-    int prevx = -1, prevy = 0;
-    for (int i = 0; i < HIST; i++) {
-        int px = x + 4 + i * (gw - 8) / (HIST - 1);
-        int py = y + gh - 4 - (int)(hist[i] * (gh - 8) / 100);
-        for (int yy = py; yy < y + gh - 4; yy++) gfx_blend_pixel(c, px, yy, (col & 0xFFFFFF) | 0x30000000);
-        if (prevx >= 0) {
-            gfx_line(c, prevx, prevy, px, py, col);
-            gfx_line(c, prevx, prevy - 1, px, py - 1, col);
-        }
-        prevx = px;
-        prevy = py;
+/* ---- the graphs ---- */
+
+static void graph(canvas_t *c, const float *hist, uint32_t col) {
+    const struct ui_theme *t = &ui_theme;
+    const float pad = 6, step = (GW - 2 * pad) / (HIST - 1);
+    gfx_fill(c, 0, 0, GW, GH, t->surface);
+    ui_round_fill(c, 0, 0, GW, GH, 8, t->background);
+    for (int i = 1; i < 4; i++) ui_line(c, pad, (float)(GH * i / 4), GW - pad, (float)(GH * i / 4), 1, t->divider);
+    float y[HIST];
+    for (int i = 0; i < HIST; i++) y[i] = GH - pad - hist[i] * (GH - 2 * pad) / 100;
+    /* the area under the curve, a column of pixels at a time */
+    for (int x = (int)pad; x <= GW - (int)pad; x++) {
+        int i = MIN(HIST - 2, (int)(((float)x - pad) / step));
+        float f = ((float)x - pad) / step - (float)i, top = y[i] + (y[i + 1] - y[i]) * f;
+        if (top < GH - pad) gfx_fill_blend(c, x, (int)top, 1, GH - (int)pad - (int)top, (col & 0xFFFFFF) | 0x30000000);
     }
-    char b[48];
-    snprintf(b, sizeof b, "%s %.0f%%", label, hist[HIST - 1]);
-    gfx_text(c, x + 10, y + 6, b, UI_FG, TRANSPARENT, FONT_SMALL);
+    for (int i = 1; i < HIST; i++) ui_line(c, pad + step * (float)(i - 1), y[i - 1], pad + step * (float)i, y[i], 2.2f, col);
 }
+
+static void draw_graphs(struct ui_session *s, canvas_t *cpu, canvas_t *mem) {
+    graph(cpu, cpu_hist, ui_theme.accent);
+    graph(mem, mem_hist, ui_theme.warning);
+    ui_surface_changed(s, S_CPU);
+    ui_surface_changed(s, S_MEM);
+}
+
+/* ---- the window ---- */
 
 static const char *state_name(int s) {
     static const char *n[] = {"ready", "running", "sleeping", "zombie"};
     return s >= 0 && s < 4 ? n[s] : "?";
 }
 
-static int list_rows(void) { return (H - LIST_Y - 24 - 50) / ROW; }
+/* One cell of the list: a fixed-width piece of text (width 0: takes what is left). */
+static void cell(struct ui_msg *m, const char *text, int width, bool caption, bool has_colour, uint32_t colour) {
+    ui_node(m, "text");
+    ui_str(m, "text", text);
+    if (width) ui_num(m, "width", width);
+    else ui_num(m, "grow", 1);
+    ui_num(m, "size", 13);
+    if (caption) ui_str(m, "style", "caption");
+    if (has_colour) ui_num(m, "colour", colour);
+    ui_end(m);
+}
 
-static void draw(void) {
-    canvas_t *c = &w->c;
-    gfx_fill(c, 0, 0, W, H, RGB(26, 24, 44));
-    /* AP計算workerをtask実行CPUの使用率と混同しない。 */
-    graph(c, 12, 12, (W - 36) / 2, 140, cpu_hist, RGB(130, 200, 255), "Task CPUs");
-    graph(c, 24 + (W - 36) / 2, 12, (W - 36) / 2, 140, mem_hist, RGB(250, 170, 110), "Memory");
+static const int colw[] = {56, 200, 96, 64, 112, 0};
+
+/* A card with a heading and the current value on top of a graph and a meter. */
+static void meter(struct ui_msg *m, const char *name, float percent, uint32_t surface, const char *info) {
+    char value[16];
+    snprintf(value, sizeof value, "%.0f%%", percent);
+    ui_node(m, "card"); ui_num(m, "padding", 14); ui_num(m, "gap", 8); ui_num(m, "width", GW + 28);
+        ui_node(m, "row");
+            ui_node(m, "text"); ui_str(m, "text", name); ui_str(m, "style", "heading"); ui_end(m);
+            ui_node(m, "spacer"); ui_end(m);
+            ui_node(m, "text"); ui_str(m, "text", value); ui_num(m, "size", 18); ui_num(m, "weight", 1); ui_end(m);
+        ui_end(m);
+        ui_node(m, "surface"); ui_num(m, "surface", surface); ui_num(m, "width", GW); ui_num(m, "height", GH); ui_end(m);
+        ui_node(m, "progress"); ui_num(m, "value", percent); ui_num(m, "max", 100); ui_end(m);
+        ui_node(m, "text"); ui_str(m, "text", info); ui_str(m, "style", "caption"); ui_num(m, "wrap", 1); ui_end(m);
+    ui_end(m);
+}
+
+static void show(struct ui_session *s) {
+    const struct ui_theme *t = &ui_theme;
+    char b[128], cpu_info_text[96] = "", up_text[32];
     struct n_sysinfo si;
     sysinfo(&si);
-    char b[128];
-    unsigned long up = si.uptime_ms / 1000;
-    snprintf(b, sizeof b, "%d tasks   %lu / %lu MiB used   kernel heap %lu KiB   up %lu:%02lu:%02lu", nproc,
-             (unsigned long)((si.total_mem - si.free_mem) >> 20), (unsigned long)(si.total_mem >> 20),
-             (unsigned long)(si.heap_used >> 10), up / 3600, up / 60 % 60, up % 60);
-    gfx_text(c, 14, 164, b, UI_DIM, TRANSPARENT, FONT_SMALL);
+    snprintf(b, sizeof b, "%lu / %lu MiB used   kernel heap %lu KiB", (unsigned long)((si.total_mem - si.free_mem) >> 20),
+             (unsigned long)(si.total_mem >> 20), (unsigned long)(si.heap_used >> 10));
     struct n_cpuinfo ci;
-    if (cpu_info(&ci) == 0) {
-        snprintf(b, sizeof b, "CPU %u / %u   task CPU %u   AP workers %u   jobs %lu", ci.online_cpus,
+    /* AP計算workerをtask実行CPUの使用率と混同しない。 */
+    if (cpu_info(&ci) == 0)
+        snprintf(cpu_info_text, sizeof cpu_info_text, "CPU %u / %u   task CPU %u   AP workers %u   jobs %lu", ci.online_cpus,
                  ci.detected_cpus, ci.scheduler_cpus, ci.worker_cpus, (unsigned long)ci.parallel_jobs);
-        gfx_text(c, 14, 181, b, UI_DIM, TRANSPARENT, FONT_SMALL);
-    }
-    int y = LIST_Y;
-    gfx_fill(c, 0, y, W, 22, RGB(36, 34, 60));
-    const char *hdr[] = {"PID", "Name", "State", "CPU", "Memory", "Kind"};
-    int colx[] = {14, 64, 240, 340, 410, 510};
-    for (int i = 0; i < 6; i++) gfx_text(c, colx[i], y + 3, hdr[i], UI_DIM, TRANSPARENT, FONT_SMALL);
-    y += 24;
-    int rows = list_rows();
-    for (int r = 0; r < rows && scroll + r < nproc; r++) {
-        int i = scroll + r;
-        struct n_procinfo *p = &procs[i];
-        int ry = y + r * ROW;
-        if (p->pid == sel_pid) gfx_fill_round(c, 4, ry, W - 8, ROW, 4, RGB(84, 70, 170));
-        else if (r & 1) gfx_fill(c, 0, ry, W, ROW, RGB(30, 28, 50));
-        uint32_t fgc = p->is_user ? UI_FG : RGB(160, 160, 200);
-        snprintf(b, sizeof b, "%d", p->pid);
-        gfx_text(c, colx[0], ry + 2, b, fgc, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, colx[1], ry + 2, p->name, fgc, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, colx[2], ry + 2, state_name(p->state), UI_DIM, TRANSPARENT, FONT_SMALL);
-        snprintf(b, sizeof b, "%.0f%%", proc_cpu[i]);
-        gfx_text(c, colx[3], ry + 2, b, proc_cpu[i] > 20 ? UI_ACCENT2 : fgc, TRANSPARENT, FONT_SMALL);
-        if (p->is_user) {
-            snprintf(b, sizeof b, "%lu KiB", (unsigned long)p->mem_kb);
-            gfx_text(c, colx[4], ry + 2, b, fgc, TRANSPARENT, FONT_SMALL);
+    unsigned long up = si.uptime_ms / 1000;
+    snprintf(up_text, sizeof up_text, "up %lu:%02lu:%02lu", up / 3600, up / 60 % 60, up % 60);
+    char tasks[24];
+    snprintf(tasks, sizeof tasks, "%d tasks", nproc);
+
+    struct ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m, "column"); ui_num(&m, "padding", 12); ui_num(&m, "gap", 10);
+        ui_node(&m, "row"); ui_num(&m, "gap", 10); ui_str(&m, "align", "stretch");
+            meter(&m, "Task CPUs", cpu_hist[HIST - 1], S_CPU, cpu_info_text);
+            meter(&m, "Memory", mem_hist[HIST - 1], S_MEM, b);
+        ui_end(&m);
+        ui_node(&m, "card"); ui_num(&m, "grow", 1); ui_num(&m, "padding", 14); ui_num(&m, "gap", 8);
+            ui_node(&m, "row"); ui_num(&m, "gap", 12);
+                ui_node(&m, "text"); ui_str(&m, "text", "Processes"); ui_str(&m, "style", "heading"); ui_end(&m);
+                ui_node(&m, "text"); ui_str(&m, "text", tasks); ui_str(&m, "style", "caption"); ui_end(&m);
+                ui_node(&m, "spacer"); ui_end(&m);
+                ui_node(&m, "text"); ui_str(&m, "text", up_text); ui_str(&m, "style", "caption"); ui_end(&m);
+            ui_end(&m);
+            static const char *const hdr[] = {"PID", "Name", "State", "CPU", "Memory", "Kind"};
+            ui_node(&m, "row"); ui_nums(&m, "padding", (const double[]){0, 10}, 2);
+                for (int i = 0; i < 6; i++) cell(&m, hdr[i], colw[i], true, false, 0);
+            ui_end(&m);
+            ui_node(&m, "divider"); ui_end(&m);
+            ui_node(&m, "scroll"); ui_num(&m, "grow", 1); ui_num(&m, "gap", 2); ui_num(&m, "key", 1);
+                for (int i = 0; i < nproc; i++) {
+                    const struct n_procinfo *p = &procs[i];
+                    bool picked = p->pid == sel_pid;
+                    uint32_t fg = p->is_user ? t->text : t->textDim;
+                    row_node[i] = ui_node(&m, "row");
+                    ui_num(&m, "key", p->pid); ui_num(&m, "clickable", 1); ui_num(&m, "radius", 6); ui_num(&m, "gap", 0);
+                    ui_nums(&m, "padding", (const double[]){5, 10}, 2);
+                    if (picked) { ui_num(&m, "background", t->surfaceActive); ui_num(&m, "border", t->accent); }
+                    snprintf(b, sizeof b, "%d", p->pid);
+                    cell(&m, b, colw[0], false, true, fg);
+                    cell(&m, p->name, colw[1], false, true, fg);
+                    cell(&m, state_name(p->state), colw[2], false, true, t->textDim);
+                    snprintf(b, sizeof b, "%.0f%%", proc_cpu[i]);
+                    cell(&m, b, colw[3], false, true, proc_cpu[i] > 20 ? t->warning : fg);
+                    if (p->is_user) snprintf(b, sizeof b, "%lu KiB", (unsigned long)p->mem_kb);
+                    else b[0] = 0;
+                    cell(&m, b, colw[4], false, true, fg);
+                    cell(&m, p->is_user ? "user" : "kernel", colw[5], false, true, t->textDim);
+                    ui_end(&m);
+                }
+            ui_end(&m);
+        ui_end(&m);
+        ui_node(&m, "row"); ui_num(&m, "gap", 12);
+            ui_node(&m, "text"); ui_str(&m, "text", status); ui_str(&m, "style", "caption"); ui_num(&m, "grow", 1); ui_end(&m);
+            kill_node = ui_node(&m, "button");
+            ui_str(&m, "text", "End process"); ui_str(&m, "icon", "close"); ui_num(&m, "disabled", sel_pid <= 0); ui_end(&m);
+        ui_end(&m);
+    ui_end(&m);
+    ui_send(s, &m);
+}
+
+/* End the selected process (and what it started), if it is a user process. */
+static void end_selected(void) {
+    int pid = sel_pid;
+    n_result res = -N_ERR_NO_APP;
+    for (int i = 0; i < nproc; i++)
+        if (procs[i].pid == pid && procs[i].is_user) {
+            n_handle app = n_app_open(pid);
+            res = app < 0 ? app : n_app_stop(app, N_APP_STOP_TREE);
+            if (app >= 0) n_handle_close(app);
         }
-        gfx_text(c, colx[5], ry + 2, p->is_user ? "user" : "kernel", UI_DIM, TRANSPARENT, FONT_SMALL);
-    }
-    gfx_fill(c, 0, H - 46, W, 46, RGB(34, 30, 60));
-    ui_button(c, W - 130, H - 38, 116, 30, "End process", hot_kill, false);
-    gfx_text(c, 14, H - 30, status, UI_DIM, TRANSPARENT, FONT_SMALL);
+    if (res >= 0) snprintf(status, sizeof status, "ended process %d", pid);
+    else snprintf(status, sizeof status, "cannot end process %d", pid);
+    sel_pid = -1;
+    sample();
 }
 
 int main(void) {
-    w = win_open(W, H, "System Monitor", 0);
-    if (!w) return 1;
+    struct ui_session *s = ui_session_new();
+    if (!s || ui_window(s, WINDOW, W, H, 0, "System Monitor", NULL, NULL) < 0) return 1;
+    canvas_t *cpu_c = ui_surface(s, S_CPU, GW, GH, 0), *mem_c = ui_surface(s, S_MEM, GW, GH, 0);
+    if (!cpu_c || !mem_c) return 1;
     sample();
-    snprintf(status, sizeof status, "select a process to end it");
+    snprintf(status, sizeof status, "Select a process to end it");
     uint64_t next = n_clock_uptime_ms() + 1000;
-    draw();
-    win_update(w);
-    for (;;) {
+    draw_graphs(s, cpu_c, mem_c);
+    show(s);
+    for (bool running = true; running;) {
         int64_t wait = (int64_t)(next - n_clock_uptime_ms());
-        struct gui_event e;
-        int r = win_event(w, &e, wait > 0 ? (int)wait : 0);
-        if (r < 0) break;
-        if (r == 0) {
+        ui_session_wait(s, wait > 0 ? (int)wait : 0);
+        bool changed = false, resample = false;
+        struct ui_event e;
+        char text[16];
+        while (ui_next_event(s, &e, text, sizeof text)) {
+            switch (e.type) {
+            case UI_EVENT_CLOSE:
+                running = false;
+                break;
+            case UI_EVENT_KEY:
+                if (!(e.flags & UI_UP) && !strcmp(e.text, "Escape")) running = false;
+                break;
+            case UI_EVENT_CLICK:
+                if (e.node == kill_node) {
+                    if (sel_pid > 0) end_selected();
+                    resample = changed = true;
+                    break;
+                }
+                for (int i = 0; i < nproc; i++)
+                    if (e.node == row_node[i]) {
+                        sel_pid = procs[i].pid;
+                        changed = true;
+                        break;
+                    }
+                break;
+            }
+        }
+        if (!running || !ui_session_open(s)) break;
+        if (n_clock_uptime_ms() >= next) {
             sample();
             next = n_clock_uptime_ms() + 1000;
-        } else if (e.type == EV_CLOSE) break;
-        else if (e.type == EV_MOUSE_MOVE) {
-            bool h = ui_hit(e.x, e.y, W - 130, H - 38, 116, 30);
-            if (h == hot_kill) continue;
-            hot_kill = h;
-        } else if (e.type == EV_MOUSE_DOWN) {
-            int idx = scroll + (e.y - LIST_Y - 24) / ROW;
-            if (e.y >= LIST_Y + 24 && idx < nproc && e.y < H - 46) sel_pid = procs[idx].pid;
-        } else if (e.type == EV_MOUSE_UP) {
-            if (ui_hit(e.x, e.y, W - 130, H - 38, 116, 30) && sel_pid > 0) {
-                int pid = sel_pid;
-                n_result res = -N_ERR_NO_APP;
-                for (int i = 0; i < nproc; i++)
-                    if (procs[i].pid == pid && procs[i].is_user) {
-                        n_handle app = n_app_open(pid);
-                        res = app < 0 ? app : n_app_stop(app, N_APP_STOP_TREE);
-                        if (app >= 0) n_handle_close(app);
-                    }
-                if (res >= 0) snprintf(status, sizeof status, "ended process %d", pid);
-                else snprintf(status, sizeof status, "cannot end process %d", pid);
-                sel_pid = -1;
-                sample();
-            }
-        } else if (e.type == EV_WHEEL) {
-            scroll = MAX(0, MIN(nproc - list_rows(), scroll + e.wheel * 2));
-            if (scroll < 0) scroll = 0;
-        } else if (e.type == EV_KEY && e.pressed && e.key == NKEY_ESC) break;
-        else continue;
-        draw();
-        win_update(w);
+            resample = changed = true;
+        }
+        if (resample) draw_graphs(s, cpu_c, mem_c);
+        if (changed) show(s);
     }
-    win_close(w);
+    ui_session_free(s);
     return 0;
 }

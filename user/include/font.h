@@ -19,10 +19,10 @@ font_t *font_open(const char *path); /* NULL if the file is missing or not a Tru
 font_t *font_open_memory(const void *data, size_t length);
 void font_close(font_t *font); /* only caller-owned faces, never bundled caches */
 font_t *font_ui(int style);          /* Maple Mono; loaded once. NULL if the files are missing */
-/* Inter / Noto Serif Living Regular / Maple Mono。統合 Noto は四ファイルだけで
-   各 Regular face を共有し、実 bold/italic は持たない。Sans は Inter の指定
-   style/Regular、欠落時は Sans Living。未知 family は Sans、全欠落は NULL。
-   同梱統合 Noto の行箱は Inter Regular の metrics（欠落時は既定値）を使う。
+/* Noto Sans Living / Noto Serif Living / Maple Mono。統合 Noto は四ファイルだけで
+   各 Regular face を共有し、bold は同じ outline を 1/24 em 太らせて合成する
+   （欠字を補う CJK 等の face も同様）。italic は正体のまま。未知 family は Sans、
+   全欠落は NULL。同梱統合 Noto の行箱は固定比率（ascent 0.969 em、descent 0.242 em）。
    欠落 CJK は本文 family 用の日本語 Regular OTF、CN、Plangothic の順。
    UI/Mono はその OTF を使わず、Maple の主書体/CN 優先順を保つ。
    font_open は単一 face のまま。この API は Web font / shaping を追加しない。 */

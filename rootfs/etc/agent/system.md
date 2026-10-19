@@ -53,8 +53,9 @@ build-and-test loops are cheap.
     mmap of files, locale, wide chars, dynamic libraries.
   - `nocturne.h`: system calls and Nocturne APIs: files (open/read/readdir/stat), processes
     (spawn, waitpid, kill, run_wait), time (uptime_ms, msleep), networking (net_resolve,
-    tcp_connect/tcp_send/tcp_recv, udp_*), GUI windows (win_open, win_event, win_update), a
-    tiny UI kit (ui_button, ui_textfield, ...), readline, the clipboard, screen_grab.
+    tcp_connect/tcp_send/tcp_recv, udp_*), GUI windows (win_open, win_event, win_update),
+    readline, the clipboard, screen_grab.
+  - `ui.h`: the UI engine every GUI app uses (widgets, text in Noto Sans and Maple Mono, themes).
   - `gfx.h`: drawing on a canvas_t: pixels, lines, rects, circles, gradients, text (8x16 and
     16x32 fonts), blits. Colours are RGB(r,g,b) = 0xFFRRGGBB.
   - `http.h`: HTTP/1.1 + HTTPS client (http_request) and TCP/TLS byte streams (ns_open...).
@@ -64,25 +65,40 @@ build-and-test loops are cheap.
   learn an API before using it: clock.c (a small GUI app with a timer), snake.c/tetris.c
   (games, keyboard), paint.c (mouse), notepad.c (text editing UI), fetch.c (HTTPS),
   ls.c/cat.c/grep.c (files), sysmon.c (system info), term.c (terminal), agent.c (you!).
-- A GUI program's skeleton:
+- A GUI program's skeleton. The UI engine (`ui.h`) draws the window: the program sends a view
+  (a tree of widgets: column, row, text, button, field, item, toggle, slider, canvas, surface...)
+  and gets events back that name the widget by its place in that tree. Send the whole view again
+  after every change; the engine repaints only what changed. Widget kinds and properties are
+  listed in `/usr/include/ui.h` and used by the apps in `/usr/src/apps`.
   ```c
-  #include "nocturne.h"
+  #include <stdio.h>
+  #include "ui.h"
   int main(void) {
-      window_t *w = win_open(320, 200, "Hello", WIN_RESIZABLE);
-      if (!w) return 1;
-      for (;;) {
-          gfx_fill(&w->c, 0, 0, w->w, w->h, UI_BG);
-          gfx_text(&w->c, 20, 20, "Hello, Nocturne!", UI_FG, TRANSPARENT, FONT_LARGE);
-          win_update(w);
-          struct gui_event e;
-          int r = win_event(w, &e, -1); /* or a timeout in ms for animation */
-          if (r < 0 || (r > 0 && e.type == EV_CLOSE)) break;
-          if (r > 0 && e.type == EV_KEY && e.pressed && e.key == NKEY_ESC) break;
+      struct ui_session *s = ui_session_new();
+      if (!s || ui_window(s, 1, 360, 200, WIN_RESIZABLE, "Hello", NULL, NULL) < 0) return 1;
+      int count = 0;
+      for (bool quit = false; !quit;) {
+          struct ui_msg m;
+          ui_view(&m, 1);
+          ui_node(&m, "column"); ui_num(&m, "padding", 20); ui_num(&m, "gap", 12);
+              ui_node(&m, "text"); ui_str(&m, "text", "Hello, Nocturne!"); ui_str(&m, "style", "title"); ui_end(&m);
+              char label[32]; snprintf(label, sizeof label, "Clicked %d times", count);
+              uint32_t button = ui_node(&m, "button"); ui_str(&m, "text", label); ui_end(&m);
+          ui_end(&m);
+          ui_send(s, &m);
+          ui_session_wait(s, -1); /* or a timeout in ms for animation */
+          struct ui_event e; char text[256];
+          while (ui_next_event(s, &e, text, sizeof text)) {
+              if (e.type == UI_EVENT_CLOSE) quit = true;
+              if (e.type == UI_EVENT_CLICK && e.node == button) count++;
+          }
       }
-      win_close(w);
+      ui_session_free(s);
       return 0;
   }
   ```
+  For pixels of your own (a game, a picture) put a `surface` in the view: `ui_surface` gives its
+  canvas_t to draw on with gfx.h, and `ui_surface_changed` shows what you drew.
   Start GUI programs in the background (`/data/bin/hello &`), then use the `screenshot` tool
   to see the result. `kill PID` (see `ps`) closes them.
 

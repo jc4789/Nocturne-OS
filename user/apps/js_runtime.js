@@ -221,6 +221,14 @@ define(nocturne, 'default', nocturne);
 Object.freeze(nocturne);
 internal.nocturne = nocturne;
 
+/* Built-in modules: "nocturne", and "nocturne/ui" (windows and widgets, js_ui.js) loaded on first import. */
+const builtin = path => {
+    if (path === 'nocturne') return nocturne;
+    if (!internal.ui) host.loadChunk('ui');
+    return internal.ui;
+};
+const isBuiltin = path => path === 'nocturne' || path === 'nocturne/ui';
+
 /* ---- module resolution: relative and absolute paths, node_modules packages ---- */
 const extensions = ['.js', '.mjs', '.cjs', '.json'];
 const kindOf = path => { try { return host.info(path)?.kind ?? 0; } catch { return 0; } };
@@ -318,6 +326,7 @@ function tsSource(path) {
 }
 function resolve(base, spec, conditions) {
     if (spec === 'nocturne' || spec === 'nocturne:') return 'nocturne';
+    if (spec === 'nocturne/ui' || spec === 'nocturne:ui') return 'nocturne/ui';
     if (spec.startsWith('file://')) spec = decodeURIComponent(spec.slice(7));
     let found;
     if (spec.startsWith('/')) found = asFile(normalize(spec));
@@ -389,7 +398,7 @@ class Module {
 }
 function requireFrom(parent, spec) {
     const path = resolve(parent.filename, spec, requireConditions);
-    return path === 'nocturne' ? nocturne : load(path, parent);
+    return isBuiltin(path) ? builtin(path) : load(path, parent);
 }
 function load(path, parent, main) {
     const cached = cache[path];
@@ -437,9 +446,9 @@ function exportNames(path, seen = new Set()) {
     for (const m of reexports) {
         try {
             const target = resolve(path, m[1], requireConditions);
-            if (target !== 'nocturne' && internal.moduleFormat(target) === 'commonjs')
+            if (!isBuiltin(target) && internal.moduleFormat(target) === 'commonjs')
                 for (const name of exportNames(target, seen)) names.add(name);
-            else if (target === 'nocturne') for (const name of Object.keys(nocturne)) names.add(name);
+            else if (isBuiltin(target)) for (const name of Object.keys(builtin(target))) names.add(name);
         } catch {}
     }
     names.delete('default');
@@ -447,9 +456,9 @@ function exportNames(path, seen = new Set()) {
     return [...names];
 }
 internal.exportNames = (path, format) =>
-    path === 'nocturne' ? Object.keys(nocturne) : format === 'json' ? [] : exportNames(path);
+    isBuiltin(path) ? Object.keys(builtin(path)) : format === 'json' ? [] : exportNames(path);
 internal.namespace = (path, format) => {
-    if (path === 'nocturne') return nocturne;
+    if (isBuiltin(path)) return builtin(path);
     const value = format === 'json' ? JSON.parse(source(path)) : load(path, null);
     const ns = {default: value};
     if (format !== 'json' && value !== null && (typeof value === 'object' || typeof value === 'function'))
@@ -464,7 +473,7 @@ internal.fillMeta = (meta, path, main) => {
     meta.main = main;
     meta.resolve = spec => {
         const found = resolve(path, String(spec), importConditions);
-        return found === 'nocturne' ? 'nocturne:' : 'file://' + encodeURI(found);
+        return isBuiltin(found) ? found.replace('/', ':').replace(/^nocturne$/, 'nocturne:') : 'file://' + encodeURI(found);
     };
 };
 

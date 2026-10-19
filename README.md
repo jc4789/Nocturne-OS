@@ -118,6 +118,13 @@ POSIX のヘッダー（`unistd.h`、`fcntl.h`、`sys/*.h`）は意図して用�
   - 描画（`gfx.h`）、TrueType（`font.h`）、画像の読込み（`image.h`）、FFmpeg による音声・動画の復号（`media.h`）、
     並列処理（`parallel.h`）。
   - Web エンジン（`user/libc/web/`、C で約 54,000 行と JavaScript で約 42,000 行）。[Web ブラウザー](#web-ブラウザー)を参照。
+- **UI エンジン**（`user/libc/ui.c`、`ui.h`）：アプリの画面（ボタン、入力欄、一覧など）を作る一つのエンジンです
+  （端末やマンデルブロ集合のように画素だけを描くアプリは、窓へ直接描きます）。
+  アプリは部品の木（ビュー：列、行、文字、ボタン、入力欄、一覧、スイッチ、スライダー、キャンバス、サーフェス）を
+  メッセージで送り、部品の場所を名指すイベントを受けます。配置、描画、ポインターとキーボード、フォーカス、
+  スクロール、アニメーションはエンジンが受け持ち、前の絵から変わった部品だけを描き直します。
+  C はそのまま呼び、JavaScript・TypeScript（`nocturne/ui`）と Go（`ports/go/ui`）は `/bin/uihost` を通して
+  同じ形式で使います。言語ごとの部品の実装はありません。文字は Noto Sans（CJK を含む）、等幅は Maple Mono です。
 - **シェル**（`sh`）
   - パイプ（チャンネル）、リダイレクト（`< > >> 2>`）、`&`、`;`、`&&`、`||`、引用符、`*` と `?` の展開、`~`、`#` の注釈。
   - `$?` とスクリプトの引数（`$0`〜`$9`、`$#`、`$@`）。変数、`if`、繰返しはありません。
@@ -267,7 +274,8 @@ python -X utf8 scripts/build.py -j 8 cxx                    # Makefile の任意
 - `data.img`：QEMU 用の `/data` ディスク（512 MB）。最初のビルドで作り、二度と上書きしません。
 - `data-blank.vhdx`：Hyper-V 用の空のデータディスク（2 GB）。
 
-**追加の部品**（無くても OS はビルドできます）：
+**追加の部品**（無くても OS はビルドできます。ただし電卓は Go、設定と「Nocturne について」は TypeScript で
+書かれているので、揃ったデスクトップには両方が要ります。`tools/go` と `tools/typescript-go` に置けば自動で使います）：
 - **Go**（[ports/go](ports/go/README.md)）：Go 1.27.2 に `ports/go/nocturne.patch` を当ててビルドし、
   `make GO=<Go のソース>/bin/go.exe` とすると `ports/go/apps/*` が `/bin` に入ります。
 - **TypeScript-Go**（[ports/tsgo](ports/tsgo/README.md)）：さらに `TSGO=<TypeScript-Go のソース>` を付けると
@@ -422,7 +430,7 @@ fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
 - 画像は PNG、JPEG、GIF、WebP、SVG、ICO、BMP。
 - フォーム（文字入力、チェックボックス、ラジオボタン、選択、日時・数値の入力、検証、ファイルの選択）、
   ページ内検索、Shadow DOM、カスタム要素。
-- 文字：既定の serif は Noto Serif、sans-serif は Inter、monospace と UI は Maple Mono NF です。
+- 文字：既定の serif は Noto Serif、sans-serif は Noto Sans、monospace と端末は Maple Mono NF です（太字は合成）。
   日本語は Noto Sans／Serif CJK JP と Plangothic で補い、絵文字は Noto Color Emoji（COLRv1、ZWJ の連結や国旗）で描きます。
   Web フォント（`@font-face`）は FreeType で TrueType、OpenType CFF、WOFF、WOFF2、非圧縮 EOT を読みます。
 
@@ -435,6 +443,9 @@ fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
   インタープリター、JSPI、共有メモリーと Atomics、スレッドがあります。
 - `<video>`・`<audio>`（FFmpeg 9.0.2 の一部の復号器）、MSE、HLS・DASH、WebVTT 字幕、全画面、ピクチャーインピクチャー。
 - Web Crypto（ハッシュと AES）、Intl（英語と日本語）、Trusted Types、CSP。
+- 窓は UI エンジンのものです。ツールバー（戻る、進む、再読込み、ホーム、履歴の設定）、アドレス欄、ページ内検索、
+  コンソールの入力欄、ステータス行はエンジンの部品で、ページ・スクロールバー・開発者ツールはその間の一つのサーフェスです。
+  入力欄はエンジンが編集するので、ページの重いスクリプトが走っている間もアドレス欄に打てます。
 
 **開発者ツール**：F12（または Ctrl+Shift+I）で、要素（DOM の木、スタイル、計算値、ボックスモデル、ページ上で選ぶ）、
 コンソール、ネットワークのパネルを開きます。`browser --log-console`、`--net-log`、`--debug-js` で
@@ -446,7 +457,7 @@ fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
 | Ctrl+F | ページ内検索（Enter で次へ） |
 | Alt+← / Backspace、Alt+→ | 戻る、進む |
 | F5 または Ctrl+R | 再読込み |
-| Esc | 読込みを止める（全画面を抜ける） |
+| Esc | 読込みを止める（全画面を抜ける。入力欄ではそこから抜け、検索は閉じる） |
 | F12、Ctrl+Shift+I / J / C | 開発者ツール（要素／コンソール／要素の選択） |
 | Space、PgUp/PgDn、矢印、ホイール | スクロール |
 
@@ -476,7 +487,8 @@ tcc -o /data/bin/hello hello.c            # プログラムを作る。以後 he
 ```
 
 プログラムは Nocturne の libc と静的にリンクします。使えるヘッダー：
-- `nocturne.h`：ネイティブ API、窓、小さな UI 部品。
+- `nocturne.h`：ネイティブ API と窓。
+- `ui.h`：UI エンジン（部品のビューとイベント。[ユーザーランド](#ユーザーランドuser)を参照）。
 - `gfx.h`（描画）、`font.h`（TrueType）、`image.h`（画像）、`media.h`（音声・動画）、`gpu.h`。
 - `threads.h`、`parallel.h`。
 - `http.h`（HTTP と HTTPS）、`json.h`、`png.h`、BearSSL。
@@ -650,7 +662,6 @@ hyperv.ps1    Hyper-V の VM の作成
   原本・許諾・変換内容は `third_party/unifont/`、起動イメージ内の許諾は `/usr/share/licenses/unifont/`。
   `python -X utf8 scripts/build.py bitmap-fonts` で作り直せます。
 - Maple Mono NF（未改変の TTF。各ファイルの SHA-256 は `MapleMono-manifest.json`）。
-- [Inter](https://rsms.me/inter/)（Rasmus Andersson）。
 - [Noto](https://fonts.google.com/noto) の Sans／Serif、Sans／Serif CJK JP、Color Emoji。
 - Plangothic（Fitzgerald P. Köeingsegg）。
 

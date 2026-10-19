@@ -66,7 +66,7 @@ int main(void) {
         if (!style) regular = latin;
         else if (style == 1) bold = latin;
         else if (style == 2) italic = latin;
-        if (!style) check(latin == raster(raw,"Maple ABC ijk",24), "default is Maple not former Inter");
+        if (!style) check(latin == raster(raw,"Maple ABC ijk",24), "default UI face is Maple");
     }
     check(regular != bold && regular != italic && bold != italic, "real style outlines differ");
     check(raster(cn,"日",24) != raster(cn,"本",24), "distinct CJK glyphs, not a shared tofu box");
@@ -98,15 +98,19 @@ int main(void) {
         family_hash[family] = outline[0];
         if (family < 2 && cjk[family])
             check(raster(font_family(family,0),"日本語",24) == raster(cjk[family],"日本語",24), "CJK generic uses its actual Sans/Serif CFF face");
-        if (family == FONT_FAMILY_SERIF)
-            check(outline[0] == outline[1] && outline[0] == outline[2] && outline[0] == outline[3], "merged Serif provides only real Regular");
-        else check(outline[0] != outline[1] && outline[0] != outline[2] && outline[2] != outline[3], "Sans/Mono styles have real outlines");
+        if (family != FONT_FAMILY_MONO) {
+            check(outline[0] != outline[1] && outline[0] == outline[2] && outline[1] == outline[3],
+                  "merged Sans/Serif: synthetic bold, upright italic");
+            check(raster(font_family(family,FONT_BOLD),"日本語",24) != raster(font_family(family,0),"日本語",24) &&
+                  font_advance(font_family(family,FONT_BOLD),24,0x65e5) > font_advance(font_family(family,0),24,0x65e5),
+                  "bold CJK fallback is emboldened too");
+        } else check(outline[0] != outline[1] && outline[0] != outline[2] && outline[2] != outline[3], "Mono styles have real outlines");
     }
     check(family_hash[0] != family_hash[1] && family_hash[0] != family_hash[2] && family_hash[1] != family_hash[2], "generic families have distinct rasters");
     check(font_family(FONT_FAMILY_MONO,FONT_REGULAR) == font_ui(FONT_REGULAR), "mono preserves UI face identity");
-    font_t *latin = font_open("/usr/share/fonts/Inter-Regular.ttf");
-    font_t *web = memory_face("/usr/share/fonts/Inter-Regular.ttf");
-    check(latin && web, "validated Latin-only web face opens from bytes");
+    font_t *latin = font_open("/usr/share/fonts/NotoSansLiving-Regular.ttf");
+    font_t *web = memory_face("/usr/share/fonts/NotoSansLiving-Regular.ttf");
+    check(latin && web, "validated non-CJK web face opens from bytes");
     if (latin && web) {
         check(!font_has(latin,0x65e5) && font_has(web,0x65e5) && font_has(web,0x20bb7),
               "web missing BMP and supplementary CJK use bundled glyphs");

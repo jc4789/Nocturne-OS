@@ -235,3 +235,139 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   列挙外、または書込みと実行の同時指定は `N_ERR_INVALID`。
 - `SYS_SHARED_MAP`（共有ハンドル、バイト数、`access`）：自分のハンドルだけ。
 - `SYS_DMESG` は `SYS_SYSTEM_LOG`（同じ33番）。
+
+## 11. インターフェースエンジン（`ui.h`）
+
+GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc の `user/libc/ui.c` にある一つの
+エンジンが配置・描画・入力処理を行う。アプリは窓を「部品の木」として記述して送り、
+「ボタン3が押された」のようなイベントを受け取る。ホバー、押下、フォーカス、カーソル、
+スクロール、動き、配色はエンジン側が持つ。言語ごとに部品を作り直さない：
+
+- C と `/bin/js`（TypeScript／JavaScript）は同じプロセス内で `ui_session_send`／
+  `ui_session_peek` を呼ぶ。
+- C を呼べないプログラム（Go 等）は、メッセージチャンネルの一端をハンドル3として
+  `/bin/uihost` を起動し、同じバイト列をチャンネルの一メッセージずつ送受信する。
+  `uihost` は自分の端が閉じられると終わる。
+
+数値はすべてリトルエンディアン。f64 は IEEE の倍精度、str は u32 の長さ＋UTF-8。
+色は 0xAARRGGBB（上位バイトが不透明度）。
+
+### アプリからエンジンへ
+
+| 型 | 内容 | 意味 |
+|---|---|---|
+| `'O'` | u32 窓、u32 幅、u32 高さ、u32 flags、u32 背景（0＝配色の既定）、str 題名 | 窓を開く |
+| `'V'` | u32 窓、ノード | この木を表示する |
+| `'T'` | u32 窓、str 題名 | 題名を変える |
+| `'C'` | u32 窓 | 閉じる |
+| `'M'` | u32 要求番号、f64 大きさ、u32 書体（ビット 1 太字、2 等幅）、str 文字列 | 文字列の寸法を測る |
+| `'Q'` | なし | 配色と寸法を問い合わせる |
+| `'S'` | u32 サーフェス、u32 幅、u32 高さ、［u32 flags］ | サーフェスを作る／大きさを変える |
+| `'P'` | u32 サーフェス、［u32 x、y、幅、高さ］ | その画素（矩形を付ければその部分だけ）が変わった |
+| `'D'` | u32 サーフェス | 捨てる |
+
+窓の flags は `UI_WINDOW_FLAGS` の範囲だけ：`WIN_RESIZABLE`、`WIN_CENTER`、
+`WIN_START_MAXIMIZED`、`WIN_ALWAYS_ON_TOP`、`WIN_DOUBLE_BUFFER`（各画面は空きバッファーを
+待ち、全体を描く。表示に合わせて間隔が決まる）、`WIN_DEEP_COLOR`。サーフェスの flags は
+`UI_SURFACE_DEEP`（1）だけで、画素の後ろに1画素1バイトの深い面（`win_deep` と同じ並び）を
+持つ。10bpc の画面で `WIN_DEEP_COLOR` の窓に置くと、深い面も画面へ写る。範囲外のビットは
+不正なメッセージ。
+
+`'P'` に矩形を付けると、エンジンは木を描き直さず、その部分だけを窓へ写して画面へ出す
+（動画、カーソル、動く駒など）。サーフェスが配置された大きさと違う、スクロールバーと
+重なる、二重バッファーの窓などで直接写せない時は、次の絵でその部分を描き直す。
+
+エンジンは各ノードの見た目（プロパティ、位置、ポインターとキーボードの状態、アニメーション）を
+覚えておき、次の絵では変わったノードの箱だけを描き直して画面へ出す（周りはその範囲で描き直すので、
+全体を描き直した時と同じ絵になる）。窓の大きさが変わった時と二重バッファーの窓は全体を描く。
+
+### ノード
+
+ノードは：u8 種類名の長さ、種類名、u16 プロパティ数、u16 子の数、プロパティ、子。
+プロパティは：u8 名前の長さ、名前、u8 型、値。型は 1＝f64、2＝str、3＝u32 n＋n 個の f64、
+4＝u32 n＋n 個の str、5＝u32 n＋n バイト。知らない種類は何も描かず、知らないプロパティは
+無視する（新しいエンジンが古いアプリを動かせるように）。ノードの「場所」は、その木を
+前順で数えた番号（0から）で、イベントはこの番号で部品を指す。
+
+種類：`column` `row` `scroll` `card` `text` `button` `toggle` `checkbox` `slider`
+`progress` `segmented` `field` `item` `icon` `divider` `spacer` `canvas` `surface`。
+
+プロパティ：
+
+- 配置：`width`／`height`（数値、または文字列 `"fill"`）、`minWidth`、`minHeight`、
+  `maxHeight`、`grow`、`padding`（数値、または2個［縦、横］か4個［上、右、下、左］）、
+  `gap`、`align`／`self`（`"start"` `"center"` `"end"` `"stretch"`）、`justify`
+  （それに `"between"`）、`radius`、`key`（数値か文字列。木を送り直してもスクロール位置等を
+  保つ同一性）。
+- 色：`background`、`border`、`colour`、`hoverBackground`、`pressedBackground`、
+  `shadow`（0/1）。
+- 文字：`text`、`size`、`weight`（0 通常、1 太字）、`style`（`"heading"` `"title"`
+  `"caption"`）、`textAlign`、`lineHeight`、`wrap`、`ellipsis`、`mono`。書体は Noto Sans、`mono` では Maple Mono（どちらも CJK を含む）。
+- ボタン：`text`、`icon`、`variant`（`"primary"` `"secondary"` `"ghost"`）、`compact`、
+  `disabled`。どの箱も `clickable` で押せる。
+- `toggle`／`checkbox`：`on`、`text`。`slider`／`progress`：`value`、`min`、`max`、
+  `step`、`wheelStep`、`length`。`segmented`：`options`（型4）、`selected`。
+- `field`：`value`（文字列）、`placeholder`、`secret`。`item`：`text`、`icon`、`selected`。
+- `icon`：`display` `mouse` `sound` `info` `check` `plus` `minus` `close`
+  `chevron-right` `chevron-left` `settings` `folder` `clock` `refresh` `backspace` `home` `search`。
+- `canvas`：`draw`（型5の描画命令）、`drawn`（型3の［幅、高さ］：命令を作った大きさ）。
+- `surface`：`surface`（サーフェスの番号）、`pointer`（1：ポインターとホイールをアプリへ）。
+  `canvas` にも `pointer` を付けられる。
+
+描画命令（`draw`）は u8 命令、その f64 引数、文字列を取る命令は続けて str：
+
+| 番号 | 引数 | 描くもの |
+|---|---|---|
+| 1 | x、y、幅、高さ、色 | 矩形 |
+| 2 | x、y、幅、高さ、半径、上の色、下の色 | 角丸の縦グラデーション |
+| 3 | x、y、幅、高さ、半径、線幅、色 | 角丸の枠 |
+| 4 | x、y、幅、高さ、半径、ぼかし、色 | 角丸の影 |
+| 5 | x0、y0、x1、y1、線幅、色 | 端が丸い線 |
+| 6 | x、y、大きさ、書体（`'M'` と同じビット）、色、str | 文字列 |
+| 7 | x、y、大きさ、色、str | アイコン |
+
+### エンジンからアプリへ
+
+返信（`'o'` `'m'` `'q'` `'s'`）は要求の順に、待っているイベントより先に届く。
+
+| 型 | 内容 |
+|---|---|
+| `'o'` | u32 窓、i32 結果（0 か -N_ERR_*）、u32 幅、u32 高さ |
+| `'e'` | u32 窓、u32 木（何番目の `'V'` か、1から）、u32 イベント、u32 場所（窓なら 0xFFFFFFFF）、u32 mods（NMOD_*）、u32 flags、f64 a、f64 b、str 文字列 |
+| `'m'` | u32 要求番号、f64 幅、f64 行の高さ、f64 ベースライン |
+| `'q'` | u32 個数、個数×（u8 名前の長さ、名前、f64 値） |
+| `'s'` | u32 サーフェス、i32 結果、u32 幅、u32 高さ。`uihost` 経由では共有ページを添付する（`n_shared_map` で写す） |
+| `'x'` | `uihost` だけ：i32 結果、u8 拒否したメッセージの型 |
+
+イベント：
+
+| 番号 | 名前 | 内容 |
+|---|---|---|
+| 1 | CLICK | ボタン、一覧の項目、`clickable` の箱 |
+| 2 | TOGGLE | a＝新しい状態（0/1） |
+| 3 | SLIDE | a＝値。ドラッグが終わると flags に `UI_DONE`（1） |
+| 4 | CHOOSE | a＝選んだ項目の番号 |
+| 5 | TEXT | 文字列＝入力欄が今持つべき値（次の木で `value` として送り返す） |
+| 6 | SUBMIT | 入力欄で Enter。文字列＝その値 |
+| 7 | KEY | 部品が使わなかったキー。文字列＝`"Escape"` `"Enter"` `"ArrowUp"` … `"F12"` か文字、a＝NKEY_ の番号か文字、離した時は flags に `UI_UP`（8） |
+| 8 | CLOSE | 閉じるボタン（`UI_GONE`（2）：窓は既に無い） |
+| 9 | CANVAS | `canvas`／`surface` が作った大きさと違う大きさに配置された。a、b＝その大きさ |
+| 10 | RESIZE | a、b＝窓の新しい大きさ |
+| 11 | POINTER | `pointer` 付きの上で：a、b＝その中の位置。flags に `UI_DOWN`（4）か `UI_UP`（8）（どちらも無ければ移動）、押しているボタンは `(flags >> 8) & 0xFF`（1 左、2 右、4 中）。押した後は全部離すまでその部品が受け取り、外へ出ると外の位置で移動を一つ送る |
+| 12 | WHEEL | `pointer` 付きの上で：a＝刻み数（手前が正） |
+| 13 | FOCUS | 入力欄がキーボードを得た（a＝1）／失った（a＝0。Escape で手放した時は flags に `UI_CANCEL`（16））。場所が窓（0xFFFFFFFF）なら窓のこと |
+
+入力欄はカーソルと選択範囲をエンジン側で持つ（←→、Home／End、Shift で選択、Ctrl で単語
+単位、Ctrl+A／C／X／V、クリックとドラッグ）。入力欄が使わないキーは KEY としてアプリへ
+届き、その離鍵も届く。アプリがまだ送り返していない値の上に次のキーを積むので、速い入力が
+取りこぼされない。
+
+値が前の木から変わった時だけ働くプロパティがある（もう一度頼む時は数を増やす）：
+
+- `focus`（入力欄）：正の数ならキーボードを取る（カーソルは末尾）。0以下なら手放す。
+- `reveal`（どの部品にも）：入っているスクロール箱を、それが見える位置までスクロールする。
+
+`selectOnFocus`（入力欄）は、クリックや `focus` でキーボードを得た時に全選択する。`ellipsis`（文字列）は
+一行に収め、入らない部分を「…」で切る。`mono`（文字列、入力欄）は等幅の Maple Mono で描く。
+フォーカスのある入力欄が木から消えると、
+フォーカスも消える。

@@ -126,6 +126,13 @@ An ISO C library (`stdio`, `stdlib`, `string`, `math`, `time`, `threads` and so 
   - Drawing (`gfx.h`), TrueType (`font.h`), image loading (`image.h`), audio and video decoding through FFmpeg
     (`media.h`) and parallel work (`parallel.h`).
   - The web engine (`user/libc/web/`, about 54,000 lines of C and 42,000 of JavaScript). See [The web browser](#the-web-browser).
+- **The UI engine** (`user/libc/ui.c`, `ui.h`): the one engine that builds app interfaces (buttons, fields, lists and
+  so on; apps that only draw pixels, like the terminal and the Mandelbrot viewer, draw into their windows directly).
+  An app sends a tree of widgets (a view: columns, rows, text, buttons, fields, items, toggles, sliders, canvases,
+  surfaces) as a message and gets back events that name a widget by its place. The engine does layout, painting,
+  pointer and keyboard, focus, scrolling and animation, and repaints only the widgets that changed since the last
+  picture. C calls it directly; JavaScript/TypeScript (`nocturne/ui`) and Go (`ports/go/ui`) use the same format through
+  `/bin/uihost`. No language has its own widget implementation. Text is Noto Sans (CJK included), monospace is Maple Mono.
 - **Shell** (`sh`)
   - Pipes (channels), redirection (`< > >> 2>`), `&`, `;`, `&&`, `||`, quoting, `*` and `?` globbing, `~` and `#` comments.
   - `$?` and script arguments (`$0` to `$9`, `$#`, `$@`). There are no variables, `if` or loops.
@@ -277,7 +284,8 @@ Outputs in `build\`:
 - `data.img`: the `/data` disk for QEMU (512 MB). Created on the first build and never overwritten.
 - `data-blank.vhdx`: an empty data disk for Hyper-V (2 GB).
 
-**Optional components** (the OS builds without them):
+**Optional components** (the OS builds without them, but the calculator is written in Go and Settings and About in
+TypeScript, so a complete desktop needs both; toolchains in `tools/go` and `tools/typescript-go` are used automatically):
 - **Go** ([ports/go](ports/go/README.md)): build Go 1.27.2 with `ports/go/nocturne.patch` applied, then
   `make GO=<Go source>/bin/go.exe` puts `ports/go/apps/*` into `/bin`.
 - **TypeScript-Go** ([ports/tsgo](ports/tsgo/README.md)): add `TSGO=<TypeScript-Go source>` to get `/bin/tsgo`.
@@ -436,7 +444,7 @@ there are no tabs, you open more windows instead (`window.open` also makes a new
 - PNG, JPEG, GIF, WebP, SVG, ICO and BMP images.
 - Forms (text fields, checkboxes, radio buttons, selects, date/time and number inputs, validation, file picking),
   find in page, Shadow DOM and custom elements.
-- Text: the default serif is Noto Serif, sans-serif is Inter, and monospace and the UI use Maple Mono NF. Japanese
+- Text: the default serif is Noto Serif, sans-serif is Noto Sans (bold is synthesized), and monospace and the terminal use Maple Mono NF. Japanese
   falls back to Noto Sans/Serif CJK JP and Plangothic, and emoji are drawn with Noto Color Emoji (COLRv1, with ZWJ
   sequences and flags). Web fonts (`@font-face`) are read by FreeType: TrueType, OpenType CFF, WOFF, WOFF2 and
   uncompressed EOT.
@@ -451,6 +459,10 @@ there are no tabs, you open more windows instead (`window.open` also makes a new
 - `<video>` and `<audio>` (a subset of FFmpeg 9.0.2's decoders), MSE, HLS and DASH, WebVTT captions, full screen
   and picture-in-picture.
 - Web Crypto (hashes and AES), Intl (English and Japanese), Trusted Types and CSP.
+- The window belongs to the UI engine. The toolbar (back, forward, reload, home, history settings), the address field,
+  find in page, the console input and the status line are its widgets; the page, its scrollbar and the developer tools
+  are one surface between them. The engine edits the fields, so the address field takes typing even while a heavy
+  page script runs.
 
 **Developer tools**: F12 (or Ctrl+Shift+I) opens the Elements (DOM tree, styles, computed values, box model, picking
 on the page), Console and Network panels. `browser --log-console`, `--net-log` and `--debug-js` send the console
@@ -462,7 +474,7 @@ and network log to the system log (serial).
 | Ctrl+F | Find in page (Enter for the next match) |
 | Alt+Left / Backspace, Alt+Right | Back, forward |
 | F5 or Ctrl+R | Reload |
-| Esc | Stop loading (and leave full screen) |
+| Esc | Stop loading (and leave full screen; in a field, leave it, and close find) |
 | F12, Ctrl+Shift+I / J / C | Developer tools (Elements / Console / pick an element) |
 | Space, PgUp/PgDn, arrows, wheel | Scroll |
 
@@ -491,7 +503,8 @@ tcc -o /data/bin/hello hello.c            # build a program; it now runs as `hel
 ```
 
 Programs are linked statically against Nocturne's libc. They can use:
-- `nocturne.h`: the native API, windows and a tiny UI kit.
+- `nocturne.h`: the native API and windows.
+- `ui.h`: the UI engine (views of widgets and their events; see [Userland](#userland-user)).
 - `gfx.h` (drawing), `font.h` (TrueType), `image.h` (images), `media.h` (audio and video), `gpu.h`.
 - `threads.h`, `parallel.h`.
 - `http.h` (HTTP and HTTPS), `json.h`, `png.h` and BearSSL.
@@ -668,7 +681,6 @@ parts of them out of date.
   the license and the conversion are in `third_party/unifont/`, and the license inside the boot image is in
   `/usr/share/licenses/unifont/`. Regenerate with `python -X utf8 scripts/build.py bitmap-fonts`.
 - Maple Mono NF (unmodified TTFs; each file's SHA-256 is in `MapleMono-manifest.json`).
-- [Inter](https://rsms.me/inter/) by Rasmus Andersson.
 - [Noto](https://fonts.google.com/noto) Sans/Serif, Sans/Serif CJK JP and Color Emoji.
 - Plangothic (Fitzgerald P. Köeingsegg).
 

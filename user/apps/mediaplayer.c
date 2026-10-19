@@ -1,8 +1,11 @@
 /* Native GUI audio/video player. Decoding is in-process; IO, audio queues and
- * windows are Nocturne's, never an external player or a POSIX runtime. */
+ * windows are Nocturne's, never an external player or a POSIX runtime.
+ * The controls are widgets of the interface engine (libc/ui.c); the video is a
+ * deep-colour surface that this program draws each new picture into. */
 #include "nocturne.h"
 #include "media.h"
 #include "display.h"
+#include "ui.h"
 #include "media_video_private.h"
 #include "media_alloc_private.h"
 #include <stdio.h>
@@ -10,7 +13,13 @@
 #include <string.h>
 #define WIDTH 768
 #define HEIGHT 584
-static window_t *win;
+#define PAD 12
+#define VIDEO_W (WIDTH - 2 * PAD)
+#define VIDEO_H 408
+#define SEEK_PX 500 /* the slider moves on screen in about this many steps */
+#define WINDOW 1
+#define VIDEO 1
+static struct ui_session *ui;
 static nmedia *media;
 static const struct nmedia_info *info;
 static struct nmedia_output pending;
@@ -26,7 +35,15 @@ static size_t picture_capacity;
 static int picture_w, picture_h;
 static bool has_deep;
 static char error[160], path[2048];
-static bool input_focus;
+static bool picture_new; /* a picture arrived that the surface does not show yet */
+/* the seek slider while it is dragged, the field's "focus" (counted up: positive takes the keyboard, negative
+   gives it up), the places of the widgets in the last view and what that view showed of the time */
+static bool scrubbing;
+static int64_t scrub_ms, shown_ms = -1;
+static int shown_px = -1;
+static int field_focus;
+static uint32_t n_play, n_seek, n_field, n_open;
+static void focus_field(bool on) { field_focus = (abs(field_focus) + 1) * (on ? 1 : -1); }
 static int64_t position(void) { return base_ms + (playing ? (int64_t)(n_clock_uptime_ms() - started) : 0); }
 static void clear_audio(void) { if (audio >= 0) { n_audio_flush(audio);n_handle_close(audio); } audio = -1; }
 /* frames the stream still holds; -1 if it failed */
@@ -44,7 +61,7 @@ static bool present_picture(void) {
         if(count>picture_deep_capacity){uint8_t *p=nmedia_ff_realloc(picture_deep,count);if(!p){strlcpy(error,"Video presentation allocation failed.",sizeof error);return false;}picture_deep=p;picture_deep_capacity=count;}
         memcpy(picture_deep,pending.deep,count);
     }
-    has_deep=pending.deep!=NULL;return true;
+    has_deep=pending.deep!=NULL;picture_new=true;return true;
 }
 static bool seek_to(int64_t ms) {
     if (!media || !nmedia_seek(media, ms)) { strlcpy(error,"This input cannot seek to that position.",sizeof error); return false; }
@@ -68,31 +85,63 @@ static void clock_text(char *s, int64_t ms) {
     if (ms < 0) { strlcpy(s,"--:--",16); return; }
     snprintf(s,16,"%u:%02u",(unsigned)(ms/60000),(unsigned)(ms/1000%60));
 }
-static void draw(void) {
-    if (win_begin_frame(win) < 0) return;
-    canvas_t *c = &win->c;
-    gfx_fill(c,0,0,WIDTH,HEIGHT,UI_BG);
-    gfx_fill(c,12,12,WIDTH-24,408,RGB(0,0,0));
-    uint8_t *deep = win_deep(win); /* this surface's; UI drawing is 8-bit content */
-    if (deep) memset(deep,0,(size_t)win->w*win->h);
-    if (picture) nmedia_draw_deep(c,deep,picture,has_deep?picture_deep:NULL,picture_w,picture_h,12,12,WIDTH-24,408);
-    else gfx_text(c,24,196,media ? "Audio playback" : "Open a file or HTTP(S) URL below.",UI_FG,TRANSPARENT,FONT_LARGE);
-    char t1[16],t2[16],line[256]; clock_text(t1,position());clock_text(t2,info?info->duration_ms:-1);
-    snprintf(line,sizeof line,"%s  /  %s    %s%s%s",t1,t2,info?info->audio_codec:"",info&&info->audio&&info->video?" + ":"",info?info->video_codec:"");
-    gfx_text(c,16,430,line,UI_FG,TRANSPARENT,FONT_SMALL);
-    if (info && info->duration_ms > 0) {
-        int f = (int)(MIN(position(),info->duration_ms)*(WIDTH-32)/info->duration_ms);
-        gfx_fill(c,16,456,WIDTH-32,6,UI_PANEL); if (f>0) gfx_fill(c,16,456,f,6,UI_ACCENT);
+/* The video surface: black, the picture fitted into it, and its 10-bit plane where the desktop keeps one (the
+   plane is cleared to 0 where nothing deep is drawn; on an 8 bpc desktop the picture is dithered to 8 bits). */
+static void draw_video(void) {
+    canvas_t *c = ui_session_surface(ui, VIDEO);
+    if (!c) return;
+    gfx_fill(c,0,0,VIDEO_W,VIDEO_H,RGB(0,0,0));
+    uint8_t *deep = ui_session_surface_deep(ui, VIDEO);
+    if (deep) memset(deep,0,(size_t)VIDEO_W*VIDEO_H);
+    if (picture) nmedia_draw_deep(c,deep,picture,has_deep?picture_deep:NULL,picture_w,picture_h,0,0,VIDEO_W,VIDEO_H);
+    else {
+        const char *msg = media ? "Audio playback" : "Open a file or HTTP(S) URL below.";
+        float size = 22, tw = ui_text_width(msg,strlen(msg),size,1), lh = ui_line_height(size,1,NULL);
+        ui_text(c,(VIDEO_W-tw)/2,(VIDEO_H-lh)/2,msg,strlen(msg),size,1,ui_theme.text);
     }
-    gfx_fill_round(c,16,476,130,32,6,UI_BTN);
-    gfx_text(c,30,484,playing?"Pause":"Play",UI_FG,TRANSPARENT,FONT_SMALL);
-    gfx_text(c,164,484,"Space: pause   Left/Right: seek 5 seconds",UI_DIM,TRANSPARENT,FONT_SMALL);
-    ui_textfield(c,16,516,WIDTH-136,path,input_focus);
-    ui_button(c,WIDTH-108,516,92,24,"Open",false,false);
-    if (error[0]) gfx_text(c,16,558,error,UI_ACCENT2,TRANSPARENT,FONT_SMALL);
-    else if (playing && info && info->audio && audio < 0) gfx_text(c,16,558,"Audio unavailable; video continues silently.",UI_ACCENT2,TRANSPARENT,FONT_SMALL);
-    else gfx_text(c,16,558,"Ctrl+O: input   HTTP refills wait synchronously; no cookies or login.",UI_DIM,TRANSPARENT,FONT_SMALL);
-    win_update(win);
+    ui_surface_changed(ui, VIDEO);
+}
+/* The controls. Sent when a word of them changes, not for every picture. */
+static void show(void) {
+    const struct ui_theme *t = &ui_theme;
+    int64_t at = scrubbing ? scrub_ms : position(), duration = info ? info->duration_ms : -1;
+    char t1[16],t2[16],codecs[96];
+    clock_text(t1,at);clock_text(t2,duration);
+    snprintf(codecs,sizeof codecs,"%s%s%s",info?info->audio_codec:"",info&&info->audio&&info->video?" + ":"",info?info->video_codec:"");
+    const char *status = "Ctrl+O: input   HTTP refills wait synchronously; no cookies or login.";
+    uint32_t status_colour = t->textDim;
+    if (error[0]) { status = error; status_colour = t->danger; }
+    else if (playing && info && info->audio && audio < 0) { status = "Audio unavailable; video continues silently."; status_colour = t->danger; }
+    bool seekable = info && duration > 0;
+    shown_ms = at;
+    shown_px = seekable ? (int)(MIN(MAX(at,0),duration)*SEEK_PX/duration) : 0;
+    char time[48];
+    snprintf(time,sizeof time,"%s  /  %s",t1,t2);
+
+    struct ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m,"column"); ui_num(&m,"padding",PAD); ui_num(&m,"gap",10);
+        ui_node(&m,"surface"); ui_num(&m,"surface",VIDEO); ui_num(&m,"width",VIDEO_W); ui_num(&m,"height",VIDEO_H); ui_end(&m);
+        ui_node(&m,"row"); ui_num(&m,"gap",12);
+            ui_node(&m,"text"); ui_str(&m,"text",time); ui_num(&m,"minWidth",110); ui_end(&m);
+            n_seek = ui_node(&m,"slider"); ui_str(&m,"width","fill");
+            ui_num(&m,"value",seekable?(double)MIN(MAX(at,0),duration):0); ui_num(&m,"max",seekable?(double)duration:1);
+            ui_num(&m,"wheelStep",5000); ui_num(&m,"disabled",!seekable); ui_end(&m);
+            ui_node(&m,"text"); ui_str(&m,"text",codecs); ui_str(&m,"style","caption"); ui_end(&m);
+        ui_end(&m);
+        ui_node(&m,"row"); ui_num(&m,"gap",12);
+            n_play = ui_node(&m,"button"); ui_str(&m,"text",playing?"Pause":"Play"); ui_str(&m,"variant","primary");
+            ui_num(&m,"minWidth",110); ui_end(&m);
+            ui_node(&m,"text"); ui_str(&m,"text","Space: pause   Left/Right: seek 5 seconds"); ui_str(&m,"style","caption"); ui_end(&m);
+        ui_end(&m);
+        ui_node(&m,"row"); ui_num(&m,"gap",12);
+            n_field = ui_node(&m,"field"); ui_num(&m,"focus",field_focus); ui_str(&m,"width","fill"); ui_str(&m,"value",path);
+            ui_str(&m,"placeholder","File path or http(s) URL"); ui_end(&m);
+            n_open = ui_node(&m,"button"); ui_str(&m,"text","Open"); ui_end(&m);
+        ui_end(&m);
+        ui_node(&m,"text"); ui_str(&m,"text",status); ui_str(&m,"style","caption"); ui_num(&m,"colour",status_colour); ui_end(&m);
+    ui_end(&m);
+    ui_send(ui, &m);
 }
 static void release_media(void) {
     clear_audio(); nmedia_close(media);media=NULL;info=NULL;
@@ -101,9 +150,12 @@ static void release_media(void) {
     memset(&pending,0,sizeof pending);audio_at=0;playing=finished=false;base_ms=0;
 }
 static void open_media(void) {
-    release_media();error[0]=0;input_focus=false;
+    release_media();error[0]=0;scrubbing=false;
+    focus_field(false); /* the Enter that opened this does not leave the field taking Space and the arrows */
+    draw_video();
     if (!path[0]) { strlcpy(error,"Enter a file path or anonymous HTTP(S) URL.",sizeof error);return; }
-    strlcpy(error,"Opening media (network reads are synchronous)...",sizeof error);draw();
+    strlcpy(error,"Opening media (network reads are synchronous)...",sizeof error);
+    show();ui_session_pump(ui); /* the blocking open below must not leave the window blank */
     bool url = !strncmp(path,"http://",7)||!strncmp(path,"https://",8);
     media=url?nmedia_open_url(path,error,sizeof error):nmedia_open(path,error,sizeof error);
     /* 10-bit frames either way: scaled in 10 bits, then kept by a 10 bpc
@@ -148,32 +200,61 @@ static bool pump(void) {
     return changed;
 }
 int main(int argc,char **argv) {
-    win=win_open(WIDTH,HEIGHT,"Media Player",WIN_DOUBLE_BUFFER|WIN_DEEP_COLOR);
-    if (!win) return 1;
+    ui=ui_session_new();
+    /* the engine paces each picture with win_begin_frame and paints it whole */
+    if (!ui || ui_window(ui,WINDOW,WIDTH,HEIGHT,WIN_DOUBLE_BUFFER|WIN_DEEP_COLOR,"Media Player",NULL,NULL)<0) return 1;
+    if (!ui_surface(ui,VIDEO,VIDEO_W,VIDEO_H,UI_SURFACE_DEEP)) return 1;
     if (argc>1) {
         if(strlen(argv[1])>=sizeof path)strlcpy(error,"Media path/URL is too long; nothing was opened.",sizeof error);
         else {memcpy(path,argv[1],strlen(argv[1])+1);open_media();}
-    } else input_focus=true;
-    draw();uint64_t last=0;
-    for (;;) {
-        struct gui_event e;int r=win_event(win,&e,playing?10:-1);bool redraw=false;
-        if (r<0 || (r>0&&e.type==EV_CLOSE)) break;
-        if (r>0&&e.type==EV_KEY&&e.pressed) {
-            if((e.mods&NMOD_CTRL)&&(e.key=='o'||e.key=='O'))input_focus=true;
-            else if(input_focus){int edited=ui_edit_key(path,sizeof path,&e);if(edited==1)open_media();else if(edited<0)input_focus=false;}
-            else if(e.key==' ')toggle();
-            else if(e.key==NKEY_LEFT)seek_to(MAX(0,position()-5000));
-            else if(e.key==NKEY_RIGHT)seek_to(info&&info->duration_ms>=0?MIN(info->duration_ms,position()+5000):position()+5000);
-            redraw=true;
-        } else if(r>0&&e.type==EV_MOUSE_DOWN&&(e.buttons&1)) {
-            input_focus=ui_hit(e.x,e.y,16,516,WIDTH-136,24);
-            if(ui_hit(e.x,e.y,WIDTH-108,516,92,24))open_media();
-            if(ui_hit(e.x,e.y,16,476,130,32))toggle();
-            if(info&&info->duration_ms>0&&ui_hit(e.x,e.y,16,448,WIDTH-32,24))seek_to((int64_t)(e.x-16)*info->duration_ms/(WIDTH-32));
-            redraw=true;
+    } else focus_field(true);
+    draw_video();show();
+    char text[sizeof path];
+    for (bool running=true;running;) {
+        ui_session_wait(ui,playing?10:-1);
+        bool redraw=false;struct ui_event e;
+        while (ui_next_event(ui,&e,text,sizeof text)) {
+            switch (e.type) {
+            case UI_EVENT_CLOSE: running=false; break;
+            case UI_EVENT_KEY: { /* only when no field has the keyboard */
+                if (e.flags&UI_UP) break;
+                uint32_t key=(uint32_t)e.a;
+                if((e.mods&NMOD_CTRL)&&(key=='o'||key=='O'))focus_field(true);
+                else if(key==' ')toggle();
+                else if(key==NKEY_LEFT)seek_to(MAX(0,position()-5000));
+                else if(key==NKEY_RIGHT)seek_to(info&&info->duration_ms>=0?MIN(info->duration_ms,position()+5000):position()+5000);
+                redraw=true;
+                break;
+            }
+            case UI_EVENT_TEXT:
+                if (e.node==n_field) strlcpy(path,text,sizeof path);
+                break;
+            case UI_EVENT_SUBMIT:
+                if (e.node==n_field) { strlcpy(path,text,sizeof path);open_media();redraw=true; }
+                break;
+            case UI_EVENT_CLICK:
+                if(e.node==n_open)open_media();
+                else if(e.node==n_play)toggle();
+                redraw=true;
+                break;
+            case UI_EVENT_SLIDE:
+                if (e.node!=n_seek||!info||info->duration_ms<=0) break;
+                if (e.flags&UI_DONE) { scrubbing=false;seek_to((int64_t)e.a); }
+                else { scrubbing=true;scrub_ms=(int64_t)e.a; }
+                redraw=true;
+                break;
+            }
         }
-        redraw|=pump();
-        if(redraw||(playing&&n_clock_uptime_ms()-last>=100)){draw();last=n_clock_uptime_ms();}
+        if (!running||!ui_session_open(ui)) break;
+        if (pump()) redraw=true;
+        bool fresh=picture_new;
+        if (fresh) { picture_new=false;draw_video(); }
+        if (!redraw&&playing&&!scrubbing) { /* the controls change when the clock ticks over or the slider moves a step */
+            int64_t at=position(),duration=info?info->duration_ms:-1;
+            if(at/1000!=shown_ms/1000||(duration>0&&(int)(MIN(MAX(at,0),duration)*SEEK_PX/duration)!=shown_px))redraw=true;
+        }
+        if (redraw) show();
+        if (fresh||redraw) ui_session_pump(ui); /* show the new picture now */
     }
-    release_media();win_close(win);return 0;
+    release_media();ui_session_free(ui);return 0;
 }

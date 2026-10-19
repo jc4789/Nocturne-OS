@@ -589,6 +589,7 @@ struct app {
     const char *name;
     const char *path;
     int icon;
+    const char *arg; /* the one argument, or NULL: apps written in TypeScript run as /bin/js FILE.js */
 };
 
 static const struct app apps[] = {
@@ -608,8 +609,8 @@ static const struct app apps[] = {
     {"Mandelbrot", "/bin/mandel", ICON_FRACTAL},
     {"3D Cube", "/bin/cube", ICON_CUBE},
     {"Game of Life", "/bin/life", ICON_LIFE},
-    {"Settings", "/bin/settings", ICON_SETTINGS},
-    {"About Nocturne", "/bin/about", ICON_ABOUT},
+    {"Settings", "/bin/js", ICON_SETTINGS, "/bin/settings.js"},
+    {"About Nocturne", "/bin/js", ICON_ABOUT, "/bin/about.js"},
     {"Restart", "@reboot", ICON_REBOOT},
     {"Shut Down", "@poweroff", ICON_POWER},
 };
@@ -1811,7 +1812,7 @@ static void handle_key(const struct key_event *k) {
             } else if (k->key == KEY_ENTER && menu_sel >= 0) {
                 int s = menu_sel;
                 set_menu(false);
-                launch(apps[s].path, NULL);
+                launch(apps[s].path, apps[s].arg);
             }
             return;
         }
@@ -1825,7 +1826,7 @@ static void handle_key(const struct key_event *k) {
         e.pressed = k->pressed;
         push_event(f, &e);
     } else if (k->pressed && sel_icon >= 0 && k->key == KEY_ENTER) {
-        launch(apps[desktop_apps[sel_icon]].path, NULL);
+        launch(apps[desktop_apps[sel_icon]].path, apps[desktop_apps[sel_icon]].arg);
     }
 }
 
@@ -1876,7 +1877,7 @@ static void left_press(void) {
             int i = menu_item_at(mx, my);
             if (i >= 0) {
                 set_menu(false);
-                launch(apps[i].path, NULL);
+                launch(apps[i].path, apps[i].arg);
             }
             return;
         }
@@ -1958,7 +1959,7 @@ static void left_press(void) {
             damage_rect(x, y, ICON_CELL_W, ICON_CELL_H);
         }
     }
-    if (ic >= 0 && dbl) launch(apps[desktop_apps[ic]].path, NULL);
+    if (ic >= 0 && dbl) launch(apps[desktop_apps[ic]].path, apps[desktop_apps[ic]].arg);
 }
 
 static void left_release(void) {

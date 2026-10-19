@@ -52,7 +52,7 @@ cp third_party/unifont/OFL-1.1.txt third_party/unifont/NOTICE.txt third_party/un
 cp $T/include/*.h "$S/usr/lib/tcc/include/"
 # the sources of the programs in /bin, as examples of the APIs
 mkdir -p "$S/usr/src/apps"
-cp user/apps/*.c user/apps/*.h user/apps/*.js "$S/usr/src/apps/"
+cp user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts "$S/usr/src/apps/"
 
 strip_obj() { objcopy --strip-debug -R .eh_frame -R .llvm_addrsig -R .comment "$1" "$2"; }
 

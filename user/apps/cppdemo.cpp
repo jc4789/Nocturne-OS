@@ -1,4 +1,4 @@
-/* A host-built C++20 application using the real libc++ and native C GUI ABI. */
+/* A host-built C++20 application using the real libc++ and the interface engine (libc/ui.c). */
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <nocturne.h>
+#include <ui.h>
 
 extern "C" int __cxa_atexit(void (*)(void *), void *, void *);
 extern "C" void __cxa_finalize(void *);
@@ -110,39 +111,62 @@ int runtime_check() {
     return failures ? 1 : 0;
 }
 
-struct WindowCloser { void operator()(window_t *w) const { if (w) win_close(w); } };
-void draw(window_t *w, const std::vector<int> &values) {
-    gfx_fill(&w->c, 0, 0, w->w, w->h, UI_BG);
-    gfx_text(&w->c, 24, 24, global.title.c_str(), UI_FG, TRANSPARENT, FONT_LARGE);
-    gfx_text(&w->c, 24, 66, "ホストclangで構築したC++20アプリ", UI_DIM, TRANSPARENT, FONT_SMALL);
+constexpr uint32_t WINDOW = 1;
+uint32_t add_button; /* the button's place in the view */
+
+struct SessionCloser { void operator()(ui_session *s) const { if (s) ui_session_free(s); } };
+
+/* The window as widgets of the interface engine (libc/ui.c). */
+void show(ui_session *s, const std::vector<int> &values) {
     char buffer[100];
     snprintf(buffer, sizeof buffer, "追加した数：%zu    合計：%d", values.size(), std::accumulate(values.begin(), values.end(), 0));
     std::string line(buffer);
-    gfx_text(&w->c, 24, 108, line.c_str(), UI_FG, TRANSPARENT, FONT_SMALL);
-    gfx_text(&w->c, 24, 148, "Enterかボタンで追加、Escで終了", UI_DIM, TRANSPARENT, FONT_SMALL);
-    ui_button(&w->c, 24, 196, 220, 44, "数を追加", false, false);
-    win_update(w);
+    ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m, "column"); ui_num(&m, "padding", 24); ui_num(&m, "gap", 12);
+        ui_node(&m, "text"); ui_str(&m, "text", global.title.c_str()); ui_str(&m, "style", "title"); ui_end(&m);
+        ui_node(&m, "text"); ui_str(&m, "text", "ホストclangで構築したC++20アプリ"); ui_str(&m, "style", "caption"); ui_end(&m);
+        ui_node(&m, "card"); ui_num(&m, "padding", 16);
+            ui_node(&m, "text"); ui_str(&m, "text", line.c_str()); ui_end(&m);
+        ui_end(&m);
+        ui_node(&m, "text"); ui_str(&m, "text", "Enterかボタンで追加、Escで終了"); ui_str(&m, "style", "caption"); ui_end(&m);
+        ui_node(&m, "row");
+            add_button = ui_node(&m, "button");
+            ui_str(&m, "text", "数を追加"); ui_str(&m, "variant", "primary"); ui_str(&m, "icon", "plus");
+            ui_num(&m, "width", 220); ui_num(&m, "height", 44);
+            ui_end(&m);
+        ui_end(&m);
+    ui_end(&m);
+    ui_send(s, &m);
 }
 }
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--self-test")) return runtime_check();
-    std::unique_ptr<window_t, WindowCloser> window(win_open(680, 280, "Nocturne C++", 0));
-    if (!window) return 1;
+    std::unique_ptr<ui_session, SessionCloser> session(ui_session_new());
+    if (!session || ui_window(session.get(), WINDOW, 680, 280, 0, "Nocturne C++", nullptr, nullptr) < 0) return 1;
     std::vector<int> values{1, 2, 3};
-    draw(window.get(), values);
+    show(session.get(), values);
     puts("CPP_GUI_READY");
-    for (;;) {
-        gui_event event{};
-        if (win_event(window.get(), &event, -1) < 0 || event.type == EV_CLOSE) break;
-        if (event.type == EV_KEY && event.pressed && event.key == NKEY_ESC) break;
-        bool add = (event.type == EV_KEY && event.pressed && event.key == NKEY_ENTER)
-                   || (event.type == EV_MOUSE_UP && ui_hit(event.x, event.y, 24, 196, 220, 44));
-        if (add) {
-            values.push_back(static_cast<int>(values.size()) + 1);
-            printf("CPP_GUI_ADD count=%zu sum=%d\n", values.size(), std::accumulate(values.begin(), values.end(), 0));
+    for (bool running = true; running && ui_session_open(session.get());) {
+        ui_session_wait(session.get(), -1);
+        ui_event event{};
+        char text[16];
+        while (ui_next_event(session.get(), &event, text, sizeof text)) {
+            bool add = false;
+            if (event.type == UI_EVENT_CLOSE) running = false;
+            else if (event.type == UI_EVENT_KEY && !(event.flags & UI_UP)) {
+                if (!strcmp(event.text, "Escape")) running = false;
+                else if (!strcmp(event.text, "Enter")) add = true;
+            } else if (event.type == UI_EVENT_CLICK && event.node == add_button) {
+                add = true;
+            }
+            if (add) {
+                values.push_back(static_cast<int>(values.size()) + 1);
+                printf("CPP_GUI_ADD count=%zu sum=%d\n", values.size(), std::accumulate(values.begin(), values.end(), 0));
+                show(session.get(), values);
+            }
         }
-        if (add || event.type == EV_RESIZE) draw(window.get(), values);
     }
     puts("CPP_GUI_CLOSED");
     return 0;

@@ -277,12 +277,19 @@ $(BUILD)/root/bin/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LI
 	@$(LD) $(patsubst user/user.ld,user/cxx.ld,$(ULDFLAGS)) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 # Go programs (ports/go/README.md), built when GO names a Go toolchain with the
-# Nocturne port: make GO=/path/to/go/bin/go.exe
+# Nocturne port: make GO=/path/to/go/bin/go.exe. Without GO, a toolchain in
+# tools/go (a copy or a link) is used; likewise TSGO and tools/typescript-go.
+# Desktop apps are written in Go and TypeScript, so a full system needs both.
+GO ?= $(if $(wildcard tools/go/bin/go.exe),$(CURDIR)/tools/go/bin/go.exe)
+TSGO ?= $(if $(wildcard tools/typescript-go/go.mod),$(CURDIR)/tools/typescript-go)
 ifneq ($(GO),)
+# the MSYS2 shell may not have the Windows folders Go keeps its cache in
+GOCACHE ?= $(CURDIR)/$(BUILD)/go-cache
+export GOCACHE
 GO_APPS  := $(notdir $(wildcard ports/go/apps/*))
 GO_BINS  := $(addprefix $(BUILD)/root/bin/,$(GO_APPS))
 GO_FILES := $(GO_BINS) $(BUILD)/root/usr/share/licenses/go/LICENSE $(BUILD)/root/usr/share/ca/ca-bundle.crt
-$(GO_BINS): $(BUILD)/root/bin/%: ports/go/apps/%/main.go
+$(GO_BINS): $(BUILD)/root/bin/%: ports/go/apps/%/main.go $(wildcard ports/go/ui/*.go) ports/go/go.mod
 	@mkdir -p $(dir $@)
 	@echo "  GO   $@"
 	@cd ports/go/apps/$* && GOOS=nocturne GOARCH=amd64 CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" main.go
@@ -303,6 +310,24 @@ $(BUILD)/root/bin/tsgo: ports/tsgo/nocturne.patch
 $(BUILD)/root/usr/share/licenses/typescript-go/LICENSE:
 	@mkdir -p $(dir $@)
 	@cp "$(TSGO)/LICENSE" "$(TSGO)/NOTICE.txt" $(dir $@)
+# The desktop apps written in TypeScript (user/apps/*.ts, the toolkit in
+# "nocturne/ui") are type-checked and compiled on the build host, so starting
+# one does not wait for tsgo: user/apps/settings.ts -> /bin/settings.js, run as
+# "js /bin/settings.js".
+TS_APPS := $(notdir $(basename $(wildcard user/apps/*.ts)))
+TS_BINS := $(addprefix $(BUILD)/root/bin/,$(addsuffix .js,$(TS_APPS)))
+GO_FILES += $(TS_BINS)
+$(BUILD)/host/tsgo.exe: ports/tsgo/nocturne.patch
+	@mkdir -p $(dir $@)
+	@echo "  GO   $@"
+	@cd "$(TSGO)" && GOOS= GOARCH= CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" ./cmd/tsgo
+$(BUILD)/apps-ts.stamp: $(BUILD)/host/tsgo.exe user/apps/tsconfig.json $(wildcard user/apps/*.ts) $(wildcard rootfs/node_modules/@types/nocturne/*.d.ts)
+	@echo "  TSGO user/apps"
+	@$(BUILD)/host/tsgo.exe -p user/apps/tsconfig.json --pretty false
+	@touch $@
+$(TS_BINS): $(BUILD)/root/bin/%.js: $(BUILD)/apps-ts.stamp
+	@mkdir -p $(dir $@)
+	@cp $(BUILD)/apps-ts/$*.js $@
 endif
 endif
 

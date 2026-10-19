@@ -1,15 +1,26 @@
-/* Tetris-style falling blocks */
+/* Tetris-style falling blocks: the score panel (next piece, score, lines, level, best
+   and the keys) is made of widgets of the interface engine (libc/ui.c); the well and
+   the next piece are surfaces the game draws itself. Arrows move, Up or X rotates,
+   space drops, P pauses, Enter starts again after the game is over, Escape closes. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "ui.h"
 
 #define BW 10
 #define BH 20
 #define CS 26
 #define SIDE 170
-#define W (BW * CS + SIDE)
+#define W (BW * CS)
 #define H (BH * CS)
+#define PAD 12
+#define NCS 22 /* the size of a block in the next-piece preview */
+#define NW (4 * NCS)
+#define NH (2 * NCS)
+#define WINDOW 1
+#define WELL 1
+#define PREVIEW 2
 
 static const uint32_t colors[8] = {0, RGB(100, 220, 240), RGB(250, 210, 80), RGB(190, 120, 250), RGB(110, 220, 120),
                                    RGB(240, 90, 110), RGB(100, 140, 250), RGB(250, 160, 80)};
@@ -94,72 +105,128 @@ static void lock_piece(void) {
     spawn_piece();
 }
 
-static void block(canvas_t *c, int x, int y, uint32_t col) {
-    gfx_fill(c, x, y, CS - 1, CS - 1, col);
-    gfx_hline(c, x, y, CS - 1, gfx_mix(col, RGB(255, 255, 255), 110));
-    gfx_vline(c, x, y, CS - 1, gfx_mix(col, RGB(255, 255, 255), 70));
-    gfx_hline(c, x, y + CS - 2, CS - 1, gfx_mix(col, RGB(0, 0, 0), 90));
+/* One block of size cs at x, y: a rounded tile that is lighter at the top. */
+static void block(canvas_t *c, float x, float y, float cs, uint32_t col) {
+    ui_round_gradient(c, x + 0.5f, y + 0.5f, cs - 2, cs - 2, 4, gfx_mix(col, RGB(255, 255, 255), 70),
+                      gfx_mix(col, RGB(0, 0, 0), 70));
 }
 
-static void draw(window_t *w) {
-    canvas_t *c = &w->c;
-    gfx_fill(c, 0, 0, BW * CS, H, RGB(14, 12, 26));
-    for (int x = 1; x < BW; x++) gfx_vline(c, x * CS - 1, 0, H, RGB(22, 20, 38));
+static void draw_well(canvas_t *c) {
+    const struct ui_theme *t = &ui_theme;
+    gfx_fill(c, 0, 0, W, H, t->sidebar);
+    for (int x = 1; x < BW; x++) gfx_vline(c, x * CS - 1, 0, H, t->surface);
     for (int y = 0; y < BH; y++)
         for (int x = 0; x < BW; x++)
-            if (board[y][x]) block(c, x * CS, y * CS, colors[board[y][x]]);
+            if (board[y][x]) block(c, (float)(x * CS), (float)(y * CS), CS, colors[board[y][x]]);
     if (!over) {
         int gy = py;
         while (fits(cur, rot, px, gy + 1)) gy++;
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++)
                 if (cell(cur, rot, x, y)) {
-                    if (gy + y >= 0) gfx_rect(c, (px + x) * CS, (gy + y) * CS, CS - 1, CS - 1, RGB(90, 86, 130));
-                    if (py + y >= 0) block(c, (px + x) * CS, (py + y) * CS, colors[cur + 1]);
+                    if (gy + y >= 0)
+                        ui_round_stroke(c, (float)((px + x) * CS) + 1, (float)((gy + y) * CS) + 1, CS - 3, CS - 3, 4, 1.5f,
+                                        gfx_mix(t->sidebar, colors[cur + 1], 110));
+                    if (py + y >= 0) block(c, (float)((px + x) * CS), (float)((py + y) * CS), CS, colors[cur + 1]);
                 }
     }
-    int sx = BW * CS;
-    gfx_gradient_v(c, sx, 0, SIDE, H, RGB(34, 30, 62), RGB(24, 20, 44));
-    gfx_text(c, sx + 16, 16, "NEXT", UI_DIM, TRANSPARENT, FONT_SMALL);
+    if (over || paused) {
+        gfx_fill_blend(c, 0, 0, W, H, ARGB(160, 8, 6, 16));
+        const char *big = over ? "GAME OVER" : "PAUSED";
+        const char *small = over ? "Enter: new game" : "P: resume";
+        float bs = 28, ss = 14, bw = ui_text_width(big, strlen(big), bs, 1), sw = ui_text_width(small, strlen(small), ss, 0);
+        float bl = ui_line_height(bs, 1, NULL), sl = ui_line_height(ss, 0, NULL);
+        float top = ((float)H - bl - 8 - sl) / 2;
+        ui_text(c, ((float)W - bw) / 2, top, big, strlen(big), bs, 1, t->text);
+        ui_text(c, ((float)W - sw) / 2, top + bl + 8, small, strlen(small), ss, 0, t->textDim);
+    }
+}
+
+/* The next piece, centred in its small surface (which lies on a card). */
+static void draw_next(canvas_t *c) {
+    gfx_fill(c, 0, 0, NW, NH, ui_theme.surface);
+    int x0 = 4, x1 = -1, y0 = 4, y1 = -1;
     for (int y = 0; y < 4; y++)
         for (int x = 0; x < 4; x++)
-            if (cell(nextp, 0, x, y)) block(c, sx + 30 + x * CS, 44 + y * CS, colors[nextp + 1]);
+            if (cell(nextp, 0, x, y)) {
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+    float ox = ((float)NW - (float)((x1 - x0 + 1) * NCS)) / 2, oy = ((float)NH - (float)((y1 - y0 + 1) * NCS)) / 2;
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++)
+            if (cell(nextp, 0, x, y)) block(c, ox + (float)((x - x0) * NCS), oy + (float)((y - y0) * NCS), NCS, colors[nextp + 1]);
+}
+
+static void caption(struct ui_msg *m, const char *text) {
+    ui_node(m, "text"); ui_str(m, "text", text); ui_str(m, "style", "caption"); ui_end(m);
+}
+
+static void stat(struct ui_msg *m, const char *label, int value) {
     char buf[32];
-    const char *lab[] = {"SCORE", "LINES", "LEVEL", "BEST"};
-    int val[] = {score, lines, level, best};
-    for (int i = 0; i < 4; i++) {
-        gfx_text(c, sx + 16, 160 + i * 56, lab[i], UI_DIM, TRANSPARENT, FONT_SMALL);
-        snprintf(buf, sizeof buf, "%d", val[i]);
-        gfx_text(c, sx + 16, 178 + i * 56, buf, UI_FG, TRANSPARENT, FONT_SMALL);
-    }
-    gfx_text(c, sx + 12, H - 70, "arrows move", UI_DIM, TRANSPARENT, FONT_SMALL);
-    gfx_text(c, sx + 12, H - 52, "up rotates", UI_DIM, TRANSPARENT, FONT_SMALL);
-    gfx_text(c, sx + 12, H - 34, "space drops", UI_DIM, TRANSPARENT, FONT_SMALL);
-    if (over || paused) {
-        gfx_fill_blend(c, 0, 0, BW * CS, H, ARGB(160, 8, 6, 16));
-        ui_text_center(c, 0, H / 2 - 30, BW * CS, over ? "GAME OVER" : "PAUSED", RGB(255, 255, 255), FONT_LARGE);
-        ui_text_center(c, 0, H / 2 + 10, BW * CS, over ? "Enter: new game" : "P: resume", UI_DIM, FONT_SMALL);
-    }
+    snprintf(buf, sizeof buf, "%d", value);
+    ui_node(m, "column"); ui_num(m, "gap", 2);
+        caption(m, label);
+        ui_node(m, "text"); ui_str(m, "text", buf); ui_num(m, "size", 22); ui_num(m, "weight", 1); ui_end(m);
+    ui_end(m);
+}
+
+static void show(struct ui_session *s) {
+    struct ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m, "row"); ui_num(&m, "padding", PAD); ui_num(&m, "gap", PAD); ui_str(&m, "align", "stretch");
+        ui_node(&m, "surface"); ui_num(&m, "surface", WELL); ui_num(&m, "width", W); ui_num(&m, "height", H); ui_end(&m);
+        ui_node(&m, "card"); ui_num(&m, "width", SIDE); ui_num(&m, "gap", 12);
+            caption(&m, "NEXT");
+            ui_node(&m, "surface"); ui_num(&m, "surface", PREVIEW); ui_num(&m, "width", NW); ui_num(&m, "height", NH); ui_end(&m);
+            ui_node(&m, "divider"); ui_end(&m);
+            stat(&m, "SCORE", score);
+            stat(&m, "LINES", lines);
+            stat(&m, "LEVEL", level);
+            stat(&m, "BEST", best);
+            ui_node(&m, "spacer"); ui_end(&m);
+            caption(&m, "Arrows: move");
+            caption(&m, "Up or X: rotate");
+            caption(&m, "Space: drop");
+            caption(&m, "P: pause");
+        ui_end(&m);
+    ui_end(&m);
+    ui_send(s, &m);
 }
 
 int main(void) {
     srand((unsigned)n_clock_uptime_ms());
-    window_t *w = win_open(W, H, "Tetris", 0);
-    if (!w) return 1;
+    struct ui_session *s = ui_session_new();
+    if (!s || ui_window(s, WINDOW, W + SIDE + 3 * PAD, H + 2 * PAD, 0, "Tetris", NULL, NULL) < 0) return 1;
+    canvas_t *well = ui_surface(s, WELL, W, H, 0), *preview = ui_surface(s, PREVIEW, NW, NH, 0);
+    if (!well || !preview) return 1;
     reset();
+    draw_well(well);
+    draw_next(preview);
+    show(s);
+    int shown_score = score, shown_lines = lines, shown_level = level, shown_best = best, shown_next = nextp;
     uint64_t next = n_clock_uptime_ms() + 800;
-    for (;;) {
+    for (bool running = true; running;) {
         int delay = 800 - (level - 1) * 70;
         if (delay < 90) delay = 90;
         int64_t wait = (int64_t)(next - n_clock_uptime_ms());
-        struct gui_event e;
-        int r = win_event(w, &e, wait > 0 ? (int)wait : 0);
-        if (r < 0) break;
-        if (r > 0) {
-            if (e.type == EV_CLOSE) break;
-            if (e.type != EV_KEY || !e.pressed) continue;
-            int k = e.key;
-            if (k == NKEY_ESC) break;
+        ui_session_wait(s, wait > 0 ? (int)wait : 0);
+        bool redraw = false;
+        struct ui_event e;
+        char text[16];
+        while (ui_next_event(s, &e, text, sizeof text)) {
+            if (e.type == UI_EVENT_CLOSE) {
+                running = false;
+                continue;
+            }
+            if (e.type != UI_EVENT_KEY || (e.flags & UI_UP)) continue;
+            int k = (int)e.a;
+            if (k == NKEY_ESC) {
+                running = false;
+                break;
+            }
             if (over) {
                 if (k == NKEY_ENTER) reset();
             } else if (k == 'p' || k == 'P') {
@@ -192,18 +259,34 @@ int main(void) {
                     next = n_clock_uptime_ms() + delay;
                 }
             }
-            draw(w);
-            win_update(w);
-            continue;
+            redraw = true;
         }
-        next = n_clock_uptime_ms() + delay;
-        if (!over && !paused) {
-            if (fits(cur, rot, px, py + 1)) py++;
-            else lock_piece();
+        if (!running || !ui_session_open(s)) break;
+        if ((int64_t)(next - n_clock_uptime_ms()) <= 0) {
+            next = n_clock_uptime_ms() + delay;
+            if (!over && !paused) {
+                if (fits(cur, rot, px, py + 1)) py++;
+                else lock_piece();
+            }
+            redraw = true;
         }
-        draw(w);
-        win_update(w);
+        if (redraw) {
+            draw_well(well);
+            ui_surface_changed(s, WELL);
+        }
+        if (nextp != shown_next) { /* the next piece changed */
+            shown_next = nextp;
+            draw_next(preview);
+            ui_surface_changed(s, PREVIEW);
+        }
+        if (score != shown_score || lines != shown_lines || level != shown_level || best != shown_best) {
+            shown_score = score;
+            shown_lines = lines;
+            shown_level = level;
+            shown_best = best;
+            show(s); /* the numbers in the panel */
+        }
     }
-    win_close(w);
+    ui_session_free(s);
     return 0;
 }

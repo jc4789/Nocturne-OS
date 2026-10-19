@@ -1,14 +1,21 @@
 /* Native Nocturne window picker. No author-supplied local path or UNIX layer.
-   Called only from the browser's trusted input dispatch, not DOM .click(). */
+   Called only from the browser's trusted input dispatch, not DOM .click().
+   It is a window of the UI engine (ui.h), modal while the browser waits for it. */
 #include <stdio.h>
 #include "nocturne.h"
+#include "ui.h"
 #include "form_file.h"
 #include "form_value.h"
 #include "form_validation.h"
-#define NATIVE_PICKER_FILE_COUNT 64 /* trusted picker selection storage, not script FileList quota */
 
 struct picker_entry { char name[256]; uint32_t kind; bool selected; };
-struct picker_state { struct picker_entry entries[512]; char path[1024], message[160]; int count, cursor, top; };
+struct picker_state {
+    struct picker_entry *entries;
+    int count, capacity, cursor;
+    uint32_t folder;  /* counts folders shown: the list's key, so a new folder starts at its top */
+    uint32_t reveal;  /* counts keyboard moves: the cursor's row is scrolled into view */
+    char path[1024], message[160];
+};
 static int picker_compare(const void *a, const void *b) {
     const struct picker_entry *x = a, *y = b;
     if ((x->kind == N_KIND_FOLDER) != (y->kind == N_KIND_FOLDER)) return x->kind == N_KIND_FOLDER ? -1 : 1;
@@ -19,40 +26,69 @@ static bool picker_join(char *out, size_t capacity, const char *path, const char
     return length > 0 && (size_t)length < capacity;
 }
 static void picker_load(struct picker_state *picker) {
-    picker->count = 0; picker->top = 0; picker->cursor = -1;
+    picker->count = 0; picker->cursor = -1; picker->folder++;
     struct n_entry *entries;
     n_result count = n_folder_entries(picker->path, &entries);
     if (count < 0) { strcpy(picker->message, "Cannot open this folder"); return; }
-    for (n_result index = 0; picker->count < 512 && index < count; index++) {
+    for (n_result index = 0; index < count; index++) {
         if (entries[index].kind != N_KIND_DOCUMENT && entries[index].kind != N_KIND_FOLDER) continue;
+        if (picker->count == picker->capacity) {
+            int capacity = picker->capacity ? picker->capacity * 2 : 64;
+            void *grown = capacity > picker->capacity && (size_t)capacity <= SIZE_MAX / sizeof *picker->entries ?
+                realloc(picker->entries, (size_t)capacity * sizeof *picker->entries) : NULL;
+            if (!grown) { strcpy(picker->message, "Not enough memory to list this whole folder"); break; }
+            picker->entries = grown; picker->capacity = capacity;
+        }
         struct picker_entry *dest = &picker->entries[picker->count++];
         strlcpy(dest->name, entries[index].name, sizeof dest->name); dest->kind = entries[index].kind; dest->selected = false;
     }
-    free(entries); qsort(picker->entries, picker->count, sizeof *picker->entries, picker_compare);
-    snprintf(picker->message, sizeof picker->message, "%d entries; select up to %u files", picker->count, NATIVE_PICKER_FILE_COUNT);
+    free(entries);
+    if (picker->count) qsort(picker->entries, picker->count, sizeof *picker->entries, picker_compare);
+    snprintf(picker->message, sizeof picker->message, "%d entries", picker->count);
 }
 static void picker_up(struct picker_state *picker) {
     char *slash = strrchr(picker->path, '/');
     if (slash) { if (slash == picker->path) slash[1] = 0; else *slash = 0; picker_load(picker); }
 }
-static void picker_draw(window_t *window, struct picker_state *picker, bool directory) {
-    canvas_t *canvas = &window->c;
-    gfx_fill(canvas, 0, 0, window->w, window->h, RGB(26, 24, 44));
-    ui_button(canvas, 8, 8, 64, 28, "Up", false, false);
-    ui_button(canvas, window->w - 212, 8, 112, 28, directory ? "Choose folder" : "Choose files", false, false);
-    ui_button(canvas, window->w - 92, 8, 84, 28, "Cancel", false, false);
-    canvas_t clip = *canvas; gfx_clip(&clip, 8, 44, window->w - 16, 20);
-    gfx_text(&clip, 8, 44, picker->path, RGB(220, 220, 230), TRANSPARENT, FONT_SMALL);
-    int rows = MAX(1, (window->h - 100) / 24);
-    for (int row = 0; row < rows && picker->top + row < picker->count; row++) {
-        int index = picker->top + row, y = 70 + row * 24; struct picker_entry *entry = &picker->entries[index];
-        if (index == picker->cursor) gfx_fill(canvas, 4, y, window->w - 8, 24, RGB(84, 70, 170));
-        gfx_text(canvas, 10, y + 4, entry->kind == N_KIND_FOLDER ? "[dir]" : entry->selected ? "[x]" : "[ ]", RGB(180, 180, 220), TRANSPARENT, FONT_SMALL);
-        clip = *canvas; gfx_clip(&clip, 58, y, window->w - 66, 24);
-        gfx_text(&clip, 58, y + 4, entry->name, RGB(238, 238, 244), TRANSPARENT, FONT_SMALL);
-    }
-    gfx_text(canvas, 8, window->h - 22, picker->message, RGB(190, 190, 210), TRANSPARENT, FONT_SMALL);
-    win_update(window);
+/* The places of the view's buttons and rows, for the events that name them. */
+struct picker_places { uint32_t up, cancel, choose, first; };
+static struct picker_places picker_show(struct ui_session *s, struct picker_state *picker, bool directory) {
+    const struct ui_theme *t = &ui_theme;
+    struct picker_places p = {0};
+    struct ui_msg m;
+    ui_view(&m, 1);
+    ui_node(&m, "column");
+        ui_node(&m, "row"); ui_nums(&m, "padding", (double[]){10, 12}, 2); ui_num(&m, "gap", 8);
+        ui_str(&m, "align", "center"); ui_num(&m, "background", t->sidebar);
+            p.up = ui_node(&m, "button"); ui_str(&m, "icon", "chevron-left"); ui_str(&m, "variant", "ghost");
+            ui_num(&m, "compact", 1); if (!strcmp(picker->path, "/")) ui_num(&m, "disabled", 1); ui_end(&m);
+            ui_node(&m, "icon"); ui_str(&m, "icon", "folder"); ui_num(&m, "size", 16); ui_num(&m, "colour", t->textDim); ui_end(&m);
+            ui_node(&m, "text"); ui_str(&m, "text", picker->path); ui_num(&m, "ellipsis", 1); ui_num(&m, "grow", 1); ui_end(&m);
+            p.cancel = ui_node(&m, "button"); ui_str(&m, "text", "Cancel"); ui_str(&m, "variant", "secondary"); ui_end(&m);
+            p.choose = ui_node(&m, "button"); ui_str(&m, "text", directory ? "Choose folder" : "Choose files");
+            ui_str(&m, "variant", "primary"); ui_end(&m);
+        ui_end(&m);
+        ui_node(&m, "divider"); ui_end(&m);
+        ui_node(&m, "scroll"); ui_num(&m, "key", picker->folder); ui_num(&m, "grow", 1);
+            ui_node(&m, "column"); ui_nums(&m, "padding", (double[]){6, 8}, 2); ui_num(&m, "gap", 2);
+            for (int i = 0; i < picker->count; i++) {
+                const struct picker_entry *entry = &picker->entries[i];
+                uint32_t place = ui_node(&m, "item");
+                if (!i) p.first = place;
+                ui_str(&m, "text", entry->name);
+                if (entry->kind == N_KIND_FOLDER || entry->selected) ui_str(&m, "icon", entry->kind == N_KIND_FOLDER ? "folder" : "check");
+                if (entry->selected || i == picker->cursor) ui_num(&m, "selected", 1);
+                if (i == picker->cursor) ui_num(&m, "reveal", picker->reveal);
+                ui_end(&m);
+            }
+            ui_end(&m);
+        ui_end(&m);
+        ui_node(&m, "divider"); ui_end(&m);
+        ui_node(&m, "text"); ui_str(&m, "text", picker->message); ui_str(&m, "style", "caption");
+        ui_nums(&m, "padding", (double[]){8, 14}, 2); ui_num(&m, "ellipsis", 1); ui_end(&m);
+    ui_end(&m);
+    ui_send(s, &m);
+    return p;
 }
 static bool picker_commit(web_doc *d, node_t *input, struct picker_state *picker, bool directory) {
     if (directory) {
@@ -60,58 +96,78 @@ static bool picker_commit(web_doc *d, node_t *input, struct picker_state *picker
         if (picker->cursor >= 0 && picker->entries[picker->cursor].kind == N_KIND_FOLDER && !picker_join(path, sizeof path, picker->path, picker->entries[picker->cursor].name)) return false;
         const char *paths[] = {path}; return web_input_file_paths(d, input, paths, 1, true);
     }
-    char (*storage)[1024] = malloc(NATIVE_PICKER_FILE_COUNT * 1024); if (!storage) return false;
-    const char *paths[NATIVE_PICKER_FILE_COUNT]; unsigned count = 0; bool ok = true;
-    for (int index = 0; index < picker->count; index++) {
+    unsigned count = 0;
+    for (int index = 0; index < picker->count; index++)
+        if (picker->entries[index].selected && picker->entries[index].kind == N_KIND_DOCUMENT) count++;
+    if (!count) return false;
+    char (*storage)[1024] = malloc((size_t)count * 1024);
+    const char **paths = malloc((size_t)count * sizeof *paths);
+    bool ok = storage && paths;
+    unsigned used = 0;
+    for (int index = 0; ok && index < picker->count; index++) {
         struct picker_entry *entry = &picker->entries[index]; if (!entry->selected || entry->kind != N_KIND_DOCUMENT) continue;
-        if (count >= NATIVE_PICKER_FILE_COUNT || !picker_join(storage[count], 1024, picker->path, entry->name)) { ok = false; break; }
-        paths[count] = storage[count]; count++;
+        if (!picker_join(storage[used], 1024, picker->path, entry->name)) { ok = false; break; }
+        paths[used] = storage[used]; used++;
     }
-    ok = ok && count && web_input_file_paths(d, input, paths, count, false); free(storage); return ok;
+    ok = ok && web_input_file_paths(d, input, paths, used, false);
+    free(storage); free(paths); return ok;
 }
 bool web_input_choose_files(web_doc *d, web_node *input) {
     if (!d || !web_input_is_file(input) || input->owner != d || web_control_disabled(input)) return false;
     bool directory = node_attr(input, "webkitdirectory") != NULL, multiple = node_attr(input, "multiple") != NULL;
     struct picker_state *picker = calloc(1, sizeof *picker); if (!picker) return false;
     strcpy(picker->path, "/home"); picker_load(picker);
-    window_t *window = win_open(620, 440, directory ? "Select upload folder" : "Select upload files", WIN_RESIZABLE);
-    if (!window) { free(picker); return false; }
-    bool chosen = false; uint64_t last_click = 0; int last_index = -1;
-    for (;;) {
-        picker_draw(window, picker, directory); struct gui_event event;
-        if (win_event(window, &event, -1) < 0 || event.type == EV_CLOSE || (event.type == EV_KEY && event.pressed && event.key == NKEY_ESC)) break;
-        bool commit = false, enter = false;
-        if (event.type == EV_MOUSE_UP && event.y < 40) {
-            if (event.x < 80) picker_up(picker);
-            else if (event.x >= window->w - 92) break;
-            else if (event.x >= window->w - 212) commit = true;
-        } else if (event.type == EV_MOUSE_DOWN && event.y >= 70 && event.y < window->h - 30) {
-            int index = picker->top + (event.y - 70) / 24;
-            if (index < picker->count) {
-                if (!multiple || !(event.mods & NMOD_CTRL)) for (int i = 0; i < picker->count; i++) picker->entries[i].selected = false;
-                picker->cursor = index; picker->entries[index].selected = !picker->entries[index].selected;
-                uint64_t now = uptime_ms(); enter = index == last_index && now - last_click < 450;
-                last_click = now; last_index = index;
-            }
-        } else if (event.type == EV_KEY && event.pressed) {
-            if (event.key == NKEY_BACKSPACE) picker_up(picker);
-            else if (event.key == NKEY_UP) picker->cursor = MAX(0, picker->cursor - 1);
-            else if (event.key == NKEY_DOWN) picker->cursor = MIN(picker->count - 1, picker->cursor + 1);
-            else if (event.key == NKEY_ENTER) enter = true;
-            else if (event.key == ' ' && picker->cursor >= 0) {
-                if (!multiple) for (int i = 0; i < picker->count; i++) if (i != picker->cursor) picker->entries[i].selected = false;
-                picker->entries[picker->cursor].selected = !picker->entries[picker->cursor].selected;
-            }
-        } else if (event.type == EV_WHEEL) picker->top = MAX(0, picker->top + event.wheel * 3);
-        if (enter && picker->cursor >= 0 && picker->cursor < picker->count) {
-            struct picker_entry *entry = &picker->entries[picker->cursor];
-            if (entry->kind == N_KIND_FOLDER) { char path[1024]; if (picker_join(path, sizeof path, picker->path, entry->name)) { strcpy(picker->path, path); picker_load(picker); } }
-            else if (!directory) { entry->selected = true; commit = true; }
-        }
-        if (commit) { if (picker_commit(d, input, picker, directory)) { chosen = true; break; } strcpy(picker->message, "Selection failed: regular files, picker metadata and available memory required"); }
-        int rows = MAX(1, (window->h - 100) / 24);
-        picker->top = MAX(0, MIN(picker->top, picker->count - rows));
-        if (picker->cursor >= 0) { if (picker->cursor < picker->top) picker->top = picker->cursor; else if (picker->cursor >= picker->top + rows) picker->top = picker->cursor - rows + 1; }
+    struct ui_session *s = ui_session_new();
+    if (!s || ui_window(s, 1, 640, 460, WIN_RESIZABLE | WIN_CENTER, directory ? "Select upload folder" : "Select upload files", NULL, NULL) < 0) {
+        ui_session_free(s); free(picker->entries); free(picker); return false;
     }
-    win_close(window); free(picker); return chosen;
+    bool chosen = false, done = false; uint64_t last_click = 0; int last_index = -1;
+    uint32_t views = 0, folder_view = 0, shown_folder = 0; /* a row named by a view of an older folder is not a row of this one */
+    while (!done) {
+        struct picker_places places = picker_show(s, picker, directory);
+        views++;
+        if (picker->folder != shown_folder) { shown_folder = picker->folder; folder_view = views; }
+        if (!ui_session_wait(s, -1)) continue;
+        struct ui_event event;
+        char text[16];
+        while (!done && ui_next_event(s, &event, text, sizeof text)) {
+            bool commit = false, enter = false;
+            if (event.type == UI_EVENT_CLOSE) { done = true; break; }
+            if (event.type == UI_EVENT_CLICK) {
+                if (event.node == places.up) picker_up(picker);
+                else if (event.node == places.cancel) { done = true; break; }
+                else if (event.node == places.choose) commit = true;
+                else if (places.first && event.view >= folder_view && event.node >= places.first && event.node < places.first + (uint32_t)picker->count) {
+                    int index = (int)(event.node - places.first);
+                    if (!multiple || !(event.mods & NMOD_CTRL)) for (int i = 0; i < picker->count; i++) if (i != index) picker->entries[i].selected = false;
+                    picker->cursor = index; picker->entries[index].selected = !picker->entries[index].selected;
+                    uint64_t now = uptime_ms(); enter = index == last_index && now - last_click < 450;
+                    last_click = now; last_index = index;
+                }
+            } else if (event.type == UI_EVENT_KEY && !(event.flags & UI_UP)) {
+                uint32_t key = (uint32_t)event.a;
+                if (key == NKEY_ESC) { done = true; break; }
+                if (key == NKEY_BACKSPACE) picker_up(picker);
+                else if (key == NKEY_UP && picker->count) { picker->cursor = MAX(0, picker->cursor - 1); picker->reveal++; }
+                else if (key == NKEY_DOWN && picker->count) { picker->cursor = MIN(picker->count - 1, picker->cursor + 1); picker->reveal++; }
+                else if (key == NKEY_ENTER) enter = true;
+                else if (key == ' ' && picker->cursor >= 0) {
+                    if (!multiple) for (int i = 0; i < picker->count; i++) if (i != picker->cursor) picker->entries[i].selected = false;
+                    picker->entries[picker->cursor].selected = !picker->entries[picker->cursor].selected;
+                }
+            }
+            if (enter && picker->cursor >= 0 && picker->cursor < picker->count) {
+                struct picker_entry *entry = &picker->entries[picker->cursor];
+                if (entry->kind == N_KIND_FOLDER) {
+                    char path[1024];
+                    if (picker_join(path, sizeof path, picker->path, entry->name)) { strcpy(picker->path, path); picker_load(picker); last_index = -1; }
+                } else if (!directory) { entry->selected = true; commit = true; }
+            }
+            if (commit) {
+                if (picker_commit(d, input, picker, directory)) { chosen = true; done = true; break; }
+                strcpy(picker->message, "Selection failed: regular files, picker metadata and available memory required");
+            }
+        }
+    }
+    ui_session_free(s); free(picker->entries); free(picker); return chosen;
 }

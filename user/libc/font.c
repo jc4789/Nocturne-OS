@@ -47,6 +47,7 @@ struct font {
     uint16_t lo_glyph[0x250];      /* glyph index for code points below 0x250, 0xFFFF = not looked up */
     uint8_t fallback;             /* font_open は単一 face、family/Web face は欠字を補完する */
     bool merged_metrics;         /* 統合版の巨大な全字形 hhea を通常本文の行箱に使わない */
+    int bold_units;              /* synthetic bold: extra advance and stroke, font units (0 = none) */
     bool web_face;               /* validated TTF; explicit-stack composite renderer */
     FT_Face outline;             /* bounded OpenType CFF/CFF2 fallback only */
     bool colr;                   /* COLRv1 paint graph rendered as RGBA glyphs */
@@ -238,7 +239,7 @@ font_t *font_ui(int style) {
 }
 
 /* 指定された実験的統合版の Regular 四ファイルだけ。style ごとの再読込や
-   合成 bold/italic はしない。Historical も必要な字形に出会うまで開かない。 */
+   合成 italic はしない（bold は noto_bold が同じ face から合成する）。Historical も必要な字形に出会うまで開かない。 */
 static font_t *noto_face(int which) {
     static font_t *cache[4];
     static bool tried[4];
@@ -258,27 +259,39 @@ static font_t *noto_face(int which) {
     return cache[which];
 }
 
-/* Sans の主書体と、欠落ファイル時の既存 backup。 */
-static font_t *inter_backup(int style) {
-    static font_t *cache[4];
-    static bool tried[4];
-    static const char *names[4] = {"Inter-Regular.ttf", "Inter-Bold.ttf", "Inter-Italic.ttf", "Inter-BoldItalic.ttf"};
-    style &= 3;
-    if (!tried[style]) {
-        if(font_probe_depth){font_probe_failed=true;return NULL;}
-        tried[style] = true;
-        cache[style] = open_bundled(names[style]);
-        if (cache[style]) cache[style]->fallback = FALLBACK_SANS;
-        else if (style) cache[style] = inter_backup(FONT_REGULAR);
-    }
-    return cache[style];
+/* The bundled families have one Regular file each. Bold is the same outlines
+   made heavier by a 24th of an em (strokes and advances), as a face of its
+   own so that the glyph and face caches keep the two apart. Italic stays
+   upright. */
+/* The bold face of a bundled face (also used for the CJK and other faces that
+   fill in missing glyphs of bold text). Colour emoji keep their own paint. */
+static font_t *bold_of(font_t *base) {
+    static struct { font_t *base, *bold; } made[16];
+    static int count;
+    if (!base || base->colr || base->bold_units || base->web_face) return base;
+    for (int i = 0; i < count; i++)
+        if (made[i].base == base) return made[i].bold;
+    if(font_probe_depth){font_probe_failed=true;return base;}
+    if (count == 16 || !next_font_id) return base;
+    font_t *f = malloc(sizeof *f);
+    if (!f) return base;
+    *f = *base; /* shares the bytes, outlines and advance table; never freed */
+    f->id = next_font_id++;
+    f->bold_units = (int)(1.0f / (24.0f * base->unit_scale) + 0.5f);
+    if (!f->bold_units) f->bold_units = 1;
+    if (font_metrics_epoch) font_metrics_epoch++;
+    made[count].base = base;
+    made[count++].bold = f;
+    return f;
 }
+
+static font_t *noto_bold(int which) { return bold_of(noto_face(which)); }
 
 font_t *font_family(int family, int style) {
     if (family == FONT_FAMILY_MONO) return font_ui(style);
-    if (family != FONT_FAMILY_SERIF) family = FONT_FAMILY_SANS;
-    font_t *f = family == FONT_FAMILY_SERIF ? noto_face(2) : inter_backup(style);
-    if (!f) f = family == FONT_FAMILY_SERIF ? inter_backup(style) : noto_face(0);
+    int which = family == FONT_FAMILY_SERIF ? 2 : 0;
+    font_t *f = style & FONT_BOLD ? noto_bold(which) : noto_face(which);
+    if (!f) f = style & FONT_BOLD ? noto_bold(2 - which) : noto_face(2 - which);
     return f ? f : font_ui(style);
 }
 
@@ -364,7 +377,7 @@ static bool private_codepoint(uint32_t cp) {
 
 /* 収録判定・測定・描画は必ず同じ実 face を選ぶ。候補は有限で、必要時だけ
    読み込み、候補の glyph_face へ再帰しない。既存 UI/CN の優先順は維持する。 */
-static font_t *glyph_face_uncached(font_t *f, uint32_t cp, int *glyph) {
+static font_t *fallback_face(font_t *f, uint32_t cp, int *glyph) {
     *glyph = glyph_of(f, cp);
     /* CSS Fonts character handling forbids installed/generic fallback for PUA:
      * a web icon's private mapping must not become an unrelated bundled symbol. */
@@ -392,6 +405,12 @@ static font_t *glyph_face_uncached(font_t *f, uint32_t cp, int *glyph) {
         if (!emoji_first && (face = try_glyph(emoji_face(), cp, glyph))) return face;
     }
     return f;
+}
+
+/* Bold text stays bold in the faces that fill in its missing glyphs (CJK). */
+static font_t *glyph_face_uncached(font_t *f, uint32_t cp, int *glyph) {
+    font_t *face = fallback_face(f, cp, glyph);
+    return f->bold_units && face != f ? bold_of(face) : face;
 }
 
 /* 同じ文字の測定・収録判定・描画で高 Unicode の cmap と fallback 群を
@@ -437,22 +456,18 @@ static int glyph_adv(font_t *f, int g) {
         } else stbtt_GetGlyphHMetrics(&f->info, g, &a, &lsb);
         f->adv[g] = a;
     }
-    return f->adv[g];
+    return f->adv[g] + f->bold_units;
 }
 
 void font_metrics(font_t *f, float px, float *ascent, float *descent, float *line_gap) {
-    /* 統合版の約 2.7 em hhea で通常行高を広げない。行箱だけを既存 Inter
-       Regular に合わせ、glyph の em scale / advance / raster と原版 bytes は保つ。
+    /* 統合版の約 2.7 em hhea で通常行高を広げない。行箱は従来どおりの
+       固定比率（ascent 0.969 em、descent 0.242 em）にし、glyph の em scale / advance / raster と原版 bytes は保つ。
        特殊な tall glyph の縦 extent を完全に行箱へ統合する shaping ではない。 */
     if (f->merged_metrics) {
-        font_t *base = inter_backup(FONT_REGULAR);
-        if (base) f = base;
-        else {
-            if (ascent) *ascent = px * 0.95f;
-            if (descent) *descent = px * 0.25f;
-            if (line_gap) *line_gap = 0;
-            return;
-        }
+        if (ascent) *ascent = px * 0.969f;
+        if (descent) *descent = px * 0.242f;
+        if (line_gap) *line_gap = 0;
+        return;
     }
     float s = f->unit_scale * px;
     if (ascent) *ascent = f->ascent * s;
@@ -1124,6 +1139,31 @@ static bool colr_bitmap(font_t *f, int glyph, unsigned size4, int phase, struct 
     return true;
 }
 
+/* Synthetic bold: each row spread to the right by s pixels (whole pixels at
+   full coverage, the fraction at partial), matching the wider advance. */
+static void embolden(struct gent *e, float s) {
+    int k = (int)s, w = e->w + k + 1;
+    float frac = s - k;
+    if (w > UINT16_MAX) return;
+    uint8_t *out = calloc((size_t)w, e->h);
+    if (!out) return;
+    for (int y = 0; y < e->h; y++) {
+        const uint8_t *in = e->bmp + (size_t)y * e->w;
+        uint8_t *o = out + (size_t)y * w;
+        for (int x = 0; x < w; x++) {
+            int v = 0;
+            for (int j = 0; j <= k; j++)
+                if (x - j >= 0 && x - j < e->w && in[x - j] > v) v = in[x - j];
+            int x2 = x - k - 1;
+            if (x2 >= 0 && x2 < e->w) { int p = (int)(in[x2] * frac + 0.5f); if (p > v) v = p; }
+            o[x] = (uint8_t)v;
+        }
+    }
+    free(e->bmp);
+    e->bmp = out;
+    e->w = (uint16_t)w;
+}
+
 static struct gent *gc_get(font_t *f, int g, float px, int phase) {
     if (!gc) {
         if(font_probe_depth){font_probe_failed=true;return NULL;}
@@ -1146,6 +1186,7 @@ static struct gent *gc_get(font_t *f, int g, float px, int phase) {
                 if(!(f->colr && colr_bitmap(f,g,size4,phase,e)) && !outline_bitmap(f,g,size4,phase,e)) {
                     free(e->bmp);memset(e,0,sizeof *e);return NULL;
                 }
+                if(f->bold_units && !e->color && e->bmp)embolden(e,f->bold_units*f->unit_scale*size4/4.0f);
                 e->font=f->id;e->glyph=g;e->size4=size4;e->phase=(uint8_t)phase;e->used=1;
                 gc_count++;return e;
             }
@@ -1170,6 +1211,7 @@ static struct gent *gc_get(font_t *f, int g, float px, int phase) {
                     stbtt_Rasterize(&bitmap,0.35f,vertices,count,scale,scale,shift,0,x0,y0,1,f->info.userdata);
                     free(vertices);
                 } else stbtt_MakeGlyphBitmapSubpixel(&f->info, e->bmp, e->w, e->h, e->w, scale, scale, shift, 0, g);
+                if (f->bold_units) embolden(e, f->bold_units * scale);
             }
             gc_count++;
             return e;

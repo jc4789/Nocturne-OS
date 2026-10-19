@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "target": "esnext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmitOnError": true,
+    "types": [],
+    "paths": {
+      "nocturne": ["../../rootfs/node_modules/@types/nocturne/index.d.ts"],
+      "nocturne/*": ["../../rootfs/node_modules/@types/nocturne/*.d.ts"]
+    },
+    "rootDir": ".",
+    "outDir": "../../build/apps-ts"
+  },
+  "include": ["*.ts"]
+}

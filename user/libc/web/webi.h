@@ -803,7 +803,7 @@ void doc_paint_full(web_doc *d); /* unclassified visual change, including frame 
 bool box_element_scrollable(const box_t *b);
 void box_scroll_clamp(box_t *b);
 
-/* Inter / Noto Serif / Maple Mono, with family-aware missing-glyph fallback. */
+/* Noto Sans / Noto Serif / Maple Mono, with family-aware missing-glyph fallback. */
 typedef struct wfont {
     font_t *ttf; /* NULL: monospace bitmap */
     float px;

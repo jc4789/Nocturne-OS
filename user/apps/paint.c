@@ -1,19 +1,26 @@
-/* Paint */
+/* Paint: the tools, the brush size and the buttons are widgets of the interface engine
+   (libc/ui.c); the picture and the colour palette are surfaces this app draws itself.
+   Left button paints with the colour, right button with the background colour. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
 #include "nocturne.h"
+#include "ui.h"
 
-#define W 900
-#define H 640
-#define TOOLW 76
-#define PALH 56
-#define CX TOOLW
-#define CY 0
-#define CWID (W - TOOLW)
-#define CHGT (H - PALH)
+#define CWID 824 /* the picture */
+#define CHGT 584
+#define SIDEW 172
+#define BARH 92
+#define W (SIDEW + CWID + 24)
+#define H (CHGT + 24 + BARH)
+#define SWATCH 32 /* a cell of the palette, and its columns and rows */
+#define PCOLS 10
+#define PROWS 2
+#define WINDOW 1
+#define S_CANVAS 1
+#define S_PALETTE 2
 
 enum { T_PENCIL, T_BRUSH, T_ERASER, T_LINE, T_RECT, T_FRECT, T_ELLIPSE, T_FILL, T_PICK, T_SPRAY, NTOOL };
 static const char *tool_name[NTOOL] = {"Pencil", "Brush", "Eraser", "Line", "Rect", "Filled", "Ellipse", "Fill",
@@ -27,8 +34,8 @@ static const uint32_t palette[] = {
 };
 #define NPAL (int)(sizeof palette / sizeof palette[0])
 
-static window_t *win;
 static canvas_t img, snap_c;
+static canvas_t *canvas_c, *palette_c; /* the surfaces */
 static uint32_t *pix, *snap, *undo;
 static int tool = T_BRUSH, size = 4;
 static uint32_t fg = RGB(30, 110, 230), bg = RGB(255, 255, 255);
@@ -36,12 +43,50 @@ static bool drawing;
 static int sx0, sy0, lx, ly;
 static uint32_t dcol;
 static char status[160];
+static int hot_swatch = -1;
+/* places in the view that events name */
+static uint32_t tool_node[NTOOL], size_node, undo_node, clear_node, save_node, canvas_node, palette_node;
+/* the part of the picture that changed since the surface was updated, and where the shape being dragged lies */
+static int dirty_x0 = CWID, dirty_y0 = CHGT, dirty_x1, dirty_y1;
+static int box[4];
+static bool box_valid;
 
 static void push_undo(void) { memcpy(undo, pix, CWID * CHGT * 4); }
+
+/* ---- what changed ---- */
+
+static bool clamp_box(int *x0, int *y0, int *x1, int *y1) {
+    *x0 = MAX(0, *x0);
+    *y0 = MAX(0, *y0);
+    *x1 = MIN(CWID, *x1);
+    *y1 = MIN(CHGT, *y1);
+    return *x1 > *x0 && *y1 > *y0;
+}
+
+static void touch(int x0, int y0, int x1, int y1) {
+    if (!clamp_box(&x0, &y0, &x1, &y1)) return;
+    dirty_x0 = MIN(dirty_x0, x0);
+    dirty_y0 = MIN(dirty_y0, y0);
+    dirty_x1 = MAX(dirty_x1, x1);
+    dirty_y1 = MAX(dirty_y1, y1);
+}
+
+/* Copy what changed to the surface and tell the engine about only that part. */
+static void flush(struct ui_session *s) {
+    if (dirty_x1 <= dirty_x0 || dirty_y1 <= dirty_y0) return;
+    gfx_blit(canvas_c, dirty_x0, dirty_y0, &img, dirty_x0, dirty_y0, dirty_x1 - dirty_x0, dirty_y1 - dirty_y0);
+    ui_surface_changed_rect(s, S_CANVAS, dirty_x0, dirty_y0, dirty_x1 - dirty_x0, dirty_y1 - dirty_y0);
+    dirty_x0 = CWID;
+    dirty_y0 = CHGT;
+    dirty_x1 = dirty_y1 = 0;
+}
+
+/* ---- painting ---- */
 
 static void stamp(int x, int y, int r, uint32_t col) {
     if (r <= 1) gfx_pixel(&img, x, y, col);
     else gfx_fill_circle(&img, x, y, r / 2, col);
+    touch(x - r / 2 - 1, y - r / 2 - 1, x + r / 2 + 2, y + r / 2 + 2);
 }
 
 static void stroke(int x0, int y0, int x1, int y1, int r, uint32_t col) {
@@ -77,6 +122,7 @@ static void flood(int x, int y, uint32_t col) {
     if (target == col) return;
     int cap = 65536, n = 0;
     int *st = malloc(cap * sizeof(int) * 2);
+    if (!st) return;
     st[n++] = x;
     st[n++] = y;
     while (n) {
@@ -94,8 +140,13 @@ static void flood(int x, int y, uint32_t col) {
             for (int i = l; i <= r; i++)
                 if (nr[i] == target && (i == l || nr[i - 1] != target)) {
                     if (n + 2 > cap) {
+                        int *bigger = realloc(st, cap * 2 * sizeof(int) * 2);
+                        if (!bigger) {
+                            free(st);
+                            return;
+                        }
+                        st = bigger;
                         cap *= 2;
-                        st = realloc(st, cap * sizeof(int) * 2);
                     }
                     st[n++] = i;
                     st[n++] = ny;
@@ -114,85 +165,53 @@ static void shape(int x0, int y0, int x1, int y1) {
         stroke(x1, y1, x0, y1, size, dcol);
         stroke(x0, y1, x0, y0, size, dcol);
         break;
-    case T_FRECT: gfx_fill(&img, MIN(x0, x1), MIN(y0, y1), abs(x1 - x0) + 1, abs(y1 - y0) + 1, dcol); break;
+    case T_FRECT:
+        gfx_fill(&img, MIN(x0, x1), MIN(y0, y1), abs(x1 - x0) + 1, abs(y1 - y0) + 1, dcol);
+        touch(MIN(x0, x1), MIN(y0, y1), MAX(x0, x1) + 1, MAX(y0, y1) + 1);
+        break;
     case T_ELLIPSE: ellipse(x0, y0, x1, y1, dcol, size); break;
     }
 }
 
-static void tool_icon(canvas_t *c, int x, int y, int t) {
-    uint32_t k = RGB(230, 230, 245);
-    switch (t) {
-    case T_PENCIL:
-        gfx_line(c, x + 4, y + 18, x + 18, y + 4, k);
-        gfx_line(c, x + 5, y + 18, x + 19, y + 4, k);
-        gfx_fill(c, x + 3, y + 18, 3, 3, RGB(250, 200, 110));
+/* The pointer went to (x, y) with a button down: carry on with the tool. */
+static void paint_move(int x, int y) {
+    switch (tool) {
+    case T_PENCIL: stroke(sx0, sy0, x, y, 1, dcol); break;
+    case T_BRUSH: stroke(sx0, sy0, x, y, size + 2, dcol); break;
+    case T_ERASER: stroke(sx0, sy0, x, y, size * 2 + 6, bg); break;
+    case T_SPRAY: {
+        int rad = size * 2 + 6;
+        for (int i = 0; i < 12 + size * 2; i++) {
+            int dx = rand() % (2 * rad + 1) - rad, dy = rand() % (2 * rad + 1) - rad;
+            if (dx * dx + dy * dy <= rad * rad) gfx_pixel(&img, x + dx, y + dy, dcol);
+        }
+        touch(x - rad, y - rad, x + rad + 1, y + rad + 1);
         break;
-    case T_BRUSH:
-        gfx_line(c, x + 18, y + 3, x + 9, y + 12, RGB(170, 120, 70));
-        gfx_line(c, x + 19, y + 4, x + 10, y + 13, RGB(170, 120, 70));
-        gfx_fill_circle(c, x + 7, y + 16, 4, RGB(120, 160, 250));
+    }
+    case T_LINE: case T_RECT: case T_FRECT: case T_ELLIPSE: {
+        /* put back what the shape covered before, then draw it again: only in the boxes involved */
+        int pad = size + 2, b[4] = {MIN(sx0, x) - pad, MIN(sy0, y) - pad, MAX(sx0, x) + pad + 1, MAX(sy0, y) + pad + 1};
+        if (box_valid) {
+            int r[4] = {box[0], box[1], box[2], box[3]};
+            if (clamp_box(&r[0], &r[1], &r[2], &r[3]))
+                for (int row = r[1]; row < r[3]; row++)
+                    memcpy(pix + row * CWID + r[0], snap + row * CWID + r[0], (size_t)(r[2] - r[0]) * 4);
+            touch(box[0], box[1], box[2], box[3]);
+        }
+        shape(sx0, sy0, x, y);
+        touch(b[0], b[1], b[2], b[3]);
+        memcpy(box, b, sizeof box);
+        box_valid = true;
         break;
-    case T_ERASER:
-        gfx_fill_round(c, x + 4, y + 7, 16, 10, 2, RGB(250, 150, 170));
-        gfx_fill(c, x + 4, y + 13, 16, 4, RGB(230, 230, 240));
-        break;
-    case T_LINE: gfx_line(c, x + 3, y + 19, x + 20, y + 3, k); break;
-    case T_RECT: gfx_rect(c, x + 3, y + 5, 18, 14, k); break;
-    case T_FRECT: gfx_fill(c, x + 3, y + 5, 18, 14, k); break;
-    case T_ELLIPSE: gfx_circle(c, x + 12, y + 12, 8, k); break;
-    case T_FILL:
-        gfx_triangle(c, x + 4, y + 10, x + 12, y + 3, x + 18, y + 12, k);
-        gfx_fill_circle(c, x + 19, y + 18, 3, RGB(120, 160, 250));
-        break;
-    case T_PICK:
-        gfx_line(c, x + 5, y + 19, x + 15, y + 9, k);
-        gfx_fill_circle(c, x + 17, y + 7, 4, k);
-        break;
-    case T_SPRAY:
-        gfx_fill_round(c, x + 6, y + 9, 9, 12, 2, k);
-        for (int i = 0; i < 6; i++) gfx_pixel(c, x + 16 + (i * 7) % 6, y + 2 + (i * 5) % 7, k);
-        break;
+    }
+    }
+    if (tool <= T_ERASER) {
+        sx0 = x;
+        sy0 = y;
     }
 }
 
-static void draw(void) {
-    canvas_t *c = &win->c;
-    gfx_fill(c, 0, 0, TOOLW, H, RGB(34, 30, 60));
-    for (int i = 0; i < NTOOL; i++) {
-        int x = 8 + (i % 2) * 32, y = 8 + (i / 2) * 32;
-        gfx_fill_round(c, x, y, 28, 28, 5, i == tool ? UI_ACCENT : RGB(52, 48, 90));
-        tool_icon(c, x + 2, y + 2, i);
-    }
-    int y = 8 + ((NTOOL + 1) / 2) * 32 + 8;
-    gfx_text(c, 8, y, "Size", UI_DIM, TRANSPARENT, FONT_SMALL);
-    y += 20;
-    static const int sizes[] = {1, 4, 8, 16};
-    for (int i = 0; i < 4; i++) {
-        int by = y + i * 30;
-        gfx_fill_round(c, 8, by, 60, 26, 5, sizes[i] == size ? UI_ACCENT : RGB(52, 48, 90));
-        gfx_fill_circle(c, 38, by + 13, MAX(1, sizes[i] / 2), RGB(230, 230, 245));
-    }
-    y += 4 * 30 + 10;
-    ui_button(c, 8, y, 60, 26, "Undo", false, false);
-    ui_button(c, 8, y + 32, 60, 26, "Clear", false, false);
-    ui_button(c, 8, y + 64, 60, 26, "Save", false, false);
-    /* canvas */
-    gfx_blit(c, CX, CY, &img, 0, 0, CWID, CHGT);
-    /* palette */
-    gfx_fill(c, 0, H - PALH, W, PALH, RGB(34, 30, 60));
-    gfx_fill(c, 18, H - PALH + 12, 30, 30, bg);
-    gfx_rect(c, 18, H - PALH + 12, 30, 30, RGB(0, 0, 0));
-    gfx_fill(c, 8, H - PALH + 6, 28, 28, fg);
-    gfx_rect(c, 8, H - PALH + 6, 28, 28, RGB(255, 255, 255));
-    for (int i = 0; i < NPAL; i++) {
-        int px = CX + 10 + (i % 10) * 26, py = H - PALH + 4 + (i / 10) * 25;
-        gfx_fill_round(c, px, py, 23, 22, 4, palette[i]);
-    }
-    gfx_text(c, CX + 290, H - PALH + 10, status, UI_DIM, TRANSPARENT, FONT_SMALL);
-    char hint[96];
-    snprintf(hint, sizeof hint, "%s, size %d   right click: background", tool_name[tool], size);
-    gfx_text(c, CX + 290, H - PALH + 30, hint, RGB(110, 108, 150), TRANSPARENT, FONT_SMALL);
-}
+/* ---- files ---- */
 
 static void save(const char *path) {
     char hdr[64];
@@ -254,34 +273,162 @@ static void load(const char *path) {
     snprintf(status, sizeof status, "opened %s", path);
 }
 
-static void click_tools(int x, int y) {
-    for (int i = 0; i < NTOOL; i++)
-        if (ui_hit(x, y, 8 + (i % 2) * 32, 8 + (i / 2) * 32, 28, 28)) tool = i;
-    int by = 8 + ((NTOOL + 1) / 2) * 32 + 28;
-    static const int sizes[] = {1, 4, 8, 16};
-    for (int i = 0; i < 4; i++)
-        if (ui_hit(x, y, 8, by + i * 30, 60, 26)) size = sizes[i];
-    by += 4 * 30 + 10;
-    if (ui_hit(x, y, 8, by, 60, 26)) {
-        uint32_t *t = malloc(CWID * CHGT * 4);
-        memcpy(t, pix, CWID * CHGT * 4);
-        memcpy(pix, undo, CWID * CHGT * 4);
-        memcpy(undo, t, CWID * CHGT * 4);
-        free(t);
+/* Undo swaps the picture with the one before the last change, so a second undo redoes. */
+static void do_undo(void) {
+    uint32_t *t = malloc(CWID * CHGT * 4);
+    if (!t) return;
+    memcpy(t, pix, CWID * CHGT * 4);
+    memcpy(pix, undo, CWID * CHGT * 4);
+    memcpy(undo, t, CWID * CHGT * 4);
+    free(t);
+    touch(0, 0, CWID, CHGT);
+}
+
+static void do_clear(void) {
+    push_undo();
+    gfx_fill(&img, 0, 0, CWID, CHGT, bg);
+    touch(0, 0, CWID, CHGT);
+}
+
+/* ---- the palette ---- */
+
+static void draw_palette(canvas_t *c) {
+    const struct ui_theme *t = &ui_theme;
+    gfx_fill(c, 0, 0, SWATCH * PCOLS, SWATCH * PROWS, t->sidebar);
+    for (int i = 0; i < NPAL; i++) {
+        float px = (float)(i % PCOLS * SWATCH), py = (float)(i / PCOLS * SWATCH);
+        if (i == hot_swatch) ui_round_fill(c, px + 1, py + 1, SWATCH - 2, SWATCH - 2, 9, t->surfaceHover);
+        ui_round_fill(c, px + 4, py + 4, SWATCH - 8, SWATCH - 8, 7, palette[i]);
+        ui_round_stroke(c, px + 4, py + 4, SWATCH - 8, SWATCH - 8, 7, 1, ARGB(90, 128, 128, 140));
+        if (palette[i] == bg) ui_round_stroke(c, px + 1.5f, py + 1.5f, SWATCH - 3, SWATCH - 3, 9, 1.5f, t->textDim);
+        if (palette[i] == fg) ui_round_stroke(c, px + 1.5f, py + 1.5f, SWATCH - 3, SWATCH - 3, 9, 2, t->accent);
     }
-    if (ui_hit(x, y, 8, by + 32, 60, 26)) {
-        push_undo();
-        gfx_fill(&img, 0, 0, CWID, CHGT, bg);
+}
+
+static int swatch_at(double a, double b) {
+    if (a < 0 || b < 0) return -1;
+    int col = (int)a / SWATCH, row = (int)b / SWATCH;
+    int i = row * PCOLS + col;
+    return col < PCOLS && row < PROWS && i < NPAL ? i : -1;
+}
+
+/* ---- the window ---- */
+
+static void colour_box(struct ui_msg *m, const char *name, uint32_t col) {
+    ui_node(m, "column"); ui_num(m, "gap", 4); ui_str(m, "align", "center");
+        ui_node(m, "row"); ui_num(m, "width", 38); ui_num(m, "height", 38); ui_num(m, "radius", 9);
+        ui_num(m, "background", col); ui_num(m, "border", ui_theme.textFaint); ui_end(m);
+        ui_node(m, "text"); ui_str(m, "text", name); ui_str(m, "style", "caption"); ui_end(m);
+    ui_end(m);
+}
+
+static void show(struct ui_session *s) {
+    const struct ui_theme *t = &ui_theme;
+    char px[16], hint[96];
+    snprintf(px, sizeof px, "%d px", size);
+    snprintf(hint, sizeof hint, "%s, size %d   right click: background", tool_name[tool], size);
+    struct ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m, "column"); ui_num(&m, "gap", 0);
+        ui_node(&m, "row"); ui_num(&m, "grow", 1); ui_num(&m, "gap", 0); ui_str(&m, "align", "stretch");
+            ui_node(&m, "column"); ui_num(&m, "width", SIDEW); ui_num(&m, "padding", 12); ui_num(&m, "gap", 8);
+            ui_num(&m, "background", t->sidebar);
+                ui_node(&m, "text"); ui_str(&m, "text", "Tools"); ui_str(&m, "style", "heading"); ui_end(&m);
+                ui_node(&m, "column"); ui_num(&m, "gap", 4);
+                    for (int i = 0; i < NTOOL; i += 2) {
+                        ui_node(&m, "row"); ui_num(&m, "gap", 4);
+                        for (int j = i; j < i + 2 && j < NTOOL; j++) {
+                            tool_node[j] = ui_node(&m, "button");
+                            ui_str(&m, "text", tool_name[j]); ui_num(&m, "compact", 1); ui_num(&m, "width", 72);
+                            ui_str(&m, "variant", j == tool ? "primary" : "secondary"); ui_end(&m);
+                        }
+                        ui_end(&m);
+                    }
+                ui_end(&m);
+                ui_node(&m, "row");
+                    ui_node(&m, "text"); ui_str(&m, "text", "Size"); ui_str(&m, "style", "heading"); ui_end(&m);
+                    ui_node(&m, "spacer"); ui_end(&m);
+                    ui_node(&m, "text"); ui_str(&m, "text", px); ui_num(&m, "weight", 1); ui_end(&m);
+                ui_end(&m);
+                size_node = ui_node(&m, "slider");
+                ui_num(&m, "value", size); ui_num(&m, "min", 1); ui_num(&m, "max", 32); ui_num(&m, "step", 1);
+                ui_num(&m, "wheelStep", 1); ui_end(&m);
+                ui_node(&m, "divider"); ui_end(&m);
+                undo_node = ui_node(&m, "button"); ui_str(&m, "text", "Undo"); ui_str(&m, "icon", "chevron-left"); ui_end(&m);
+                clear_node = ui_node(&m, "button"); ui_str(&m, "text", "Clear"); ui_str(&m, "icon", "close"); ui_end(&m);
+                save_node = ui_node(&m, "button"); ui_str(&m, "text", "Save"); ui_str(&m, "variant", "primary");
+                ui_str(&m, "icon", "folder"); ui_end(&m);
+            ui_end(&m);
+            ui_node(&m, "column"); ui_num(&m, "padding", 12);
+                canvas_node = ui_node(&m, "surface"); ui_num(&m, "surface", S_CANVAS); ui_num(&m, "pointer", 1);
+                ui_num(&m, "width", CWID); ui_num(&m, "height", CHGT); ui_end(&m);
+            ui_end(&m);
+        ui_end(&m);
+        ui_node(&m, "row"); ui_nums(&m, "padding", (const double[]){0, 16}, 2); ui_num(&m, "gap", 18);
+        ui_num(&m, "height", BARH); ui_num(&m, "background", t->sidebar);
+            ui_node(&m, "row"); ui_num(&m, "gap", 12); ui_str(&m, "align", "start");
+                colour_box(&m, "Colour", fg);
+                colour_box(&m, "Back", bg);
+            ui_end(&m);
+            palette_node = ui_node(&m, "surface"); ui_num(&m, "surface", S_PALETTE); ui_num(&m, "pointer", 1);
+            ui_num(&m, "width", SWATCH * PCOLS); ui_num(&m, "height", SWATCH * PROWS); ui_end(&m);
+            ui_node(&m, "column"); ui_num(&m, "grow", 1); ui_num(&m, "gap", 4);
+                ui_node(&m, "text"); ui_str(&m, "text", status); ui_num(&m, "wrap", 1); ui_end(&m);
+                ui_node(&m, "text"); ui_str(&m, "text", hint); ui_str(&m, "style", "caption"); ui_num(&m, "wrap", 1); ui_end(&m);
+            ui_end(&m);
+        ui_end(&m);
+    ui_end(&m);
+    ui_send(s, &m);
+}
+
+/* The pointer on the picture. Returns whether the colours changed. */
+static bool canvas_pointer(const struct ui_event *e, bool *moved) {
+    int x = (int)floor(e->a), y = (int)floor(e->b);
+    uint32_t buttons = UI_BUTTONS(e->flags);
+    if (e->flags & UI_DOWN) {
+        if (drawing) return false;
+        dcol = (buttons & 2) ? bg : fg;
+        if (tool == T_PICK) {
+            if (x >= 0 && y >= 0 && x < CWID && y < CHGT) {
+                if (buttons & 2) bg = pix[y * CWID + x];
+                else fg = pix[y * CWID + x];
+                return true;
+            }
+        } else if (tool == T_FILL) {
+            push_undo();
+            flood(x, y, dcol);
+            touch(0, 0, CWID, CHGT);
+        } else {
+            push_undo();
+            memcpy(snap, pix, CWID * CHGT * 4);
+            drawing = true;
+            box_valid = false;
+            sx0 = lx = x;
+            sy0 = ly = y;
+            if (tool == T_PENCIL) stamp(x, y, 1, dcol);
+            else if (tool == T_BRUSH) stamp(x, y, size + 2, dcol);
+            else if (tool == T_ERASER) stamp(x, y, size * 2 + 6, bg);
+        }
+    } else if (e->flags & UI_UP) {
+        if (drawing && !(buttons & 3)) drawing = false;
+    } else if (drawing) {
+        lx = x;
+        ly = y;
+        paint_move(x, y);
+        *moved = true;
     }
-    if (ui_hit(x, y, 8, by + 64, 60, 26)) save("/home/painting.ppm");
+    return false;
 }
 
 int main(int argc, char **argv) {
-    win = win_open(W, H, "Paint", 0);
-    if (!win) return 1;
+    struct ui_session *s = ui_session_new();
+    if (!s || ui_window(s, WINDOW, W, H, 0, "Paint", NULL, NULL) < 0) return 1;
+    canvas_c = ui_surface(s, S_CANVAS, CWID, CHGT, 0);
+    palette_c = ui_surface(s, S_PALETTE, SWATCH * PCOLS, SWATCH * PROWS, 0);
     pix = malloc(CWID * CHGT * 4);
     snap = malloc(CWID * CHGT * 4);
     undo = malloc(CWID * CHGT * 4);
+    if (!canvas_c || !palette_c || !pix || !snap || !undo) return 1;
     gfx_init(&img, pix, CWID, CHGT, CWID);
     gfx_init(&snap_c, snap, CWID, CHGT, CWID);
     gfx_fill(&img, 0, 0, CWID, CHGT, bg);
@@ -290,86 +437,70 @@ int main(int argc, char **argv) {
     if (argc > 1 && n_path_complete(argv[1], named, sizeof named) > 0) load(named);
     push_undo();
     srand((unsigned)n_clock_uptime_ms());
-    draw();
-    win_update(win);
-    for (;;) {
-        struct gui_event e;
-        int r = win_event(win, &e, drawing && tool == T_SPRAY ? 30 : -1);
-        if (r < 0 || (r > 0 && e.type == EV_CLOSE)) break;
-        int x = r > 0 ? e.x - CX : lx, y = r > 0 ? e.y - CY : ly;
-        if (r == 0 || e.type == EV_MOUSE_MOVE) {
-            if (!drawing) continue;
-            if (r > 0) {
-                lx = x;
-                ly = y;
-            }
-            switch (tool) {
-            case T_PENCIL: stroke(sx0, sy0, x, y, 1, dcol); break;
-            case T_BRUSH: stroke(sx0, sy0, x, y, size + 2, dcol); break;
-            case T_ERASER: stroke(sx0, sy0, x, y, size * 2 + 6, bg); break;
-            case T_SPRAY:
-                for (int i = 0; i < 12 + size * 2; i++) {
-                    int rad = size * 2 + 6;
-                    int dx = rand() % (2 * rad + 1) - rad, dy = rand() % (2 * rad + 1) - rad;
-                    if (dx * dx + dy * dy <= rad * rad) gfx_pixel(&img, x + dx, y + dy, dcol);
+    touch(0, 0, CWID, CHGT);
+    flush(s);
+    draw_palette(palette_c);
+    ui_surface_changed(s, S_PALETTE);
+    show(s);
+    for (bool running = true; running;) {
+        ui_session_wait(s, drawing && tool == T_SPRAY ? 30 : -1);
+        bool view = false, colours = false, moved = false;
+        struct ui_event e;
+        char text[16];
+        while (ui_next_event(s, &e, text, sizeof text)) {
+            switch (e.type) {
+            case UI_EVENT_CLOSE:
+                running = false;
+                break;
+            case UI_EVENT_CLICK:
+                for (int i = 0; i < NTOOL; i++)
+                    if (e.node == tool_node[i]) tool = i, view = true;
+                if (e.node == undo_node) do_undo();
+                else if (e.node == clear_node) do_clear();
+                else if (e.node == save_node) save("/home/painting.ppm"), view = true;
+                break;
+            case UI_EVENT_SLIDE:
+                if (e.node == size_node) size = MAX(1, MIN(32, (int)lround(e.a))), view = true;
+                break;
+            case UI_EVENT_POINTER:
+                if (e.node == canvas_node) {
+                    if (canvas_pointer(&e, &moved)) view = colours = true;
+                } else if (e.node == palette_node) {
+                    int i = swatch_at(e.a, e.b);
+                    if (e.flags & UI_DOWN) {
+                        if (i >= 0) {
+                            if (UI_BUTTONS(e.flags) & 2) bg = palette[i];
+                            else fg = palette[i];
+                            view = colours = true;
+                        }
+                    } else if (!(e.flags & UI_UP) && i != hot_swatch) {
+                        hot_swatch = i;
+                        colours = true;
+                    }
                 }
                 break;
-            case T_LINE: case T_RECT: case T_FRECT: case T_ELLIPSE:
-                memcpy(pix, snap, CWID * CHGT * 4);
-                shape(sx0, sy0, x, y);
+            case UI_EVENT_KEY: {
+                if (e.flags & UI_UP) break;
+                int k = (int)e.a;
+                if ((e.mods & NMOD_CTRL) && (k == 'z' || k == 'Z')) do_undo();
+                else if ((e.mods & NMOD_CTRL) && (k == 's' || k == 'S')) save("/home/painting.ppm"), view = true;
+                else if (k == '[') size = MAX(1, size - 1), view = true;
+                else if (k == ']') size = MIN(32, size + 1), view = true;
+                else if (k >= '1' && k <= '9' && k - '1' < NTOOL) tool = k - '1', view = true;
+                else if (k == '0') tool = T_SPRAY, view = true;
                 break;
             }
-            if (tool <= T_ERASER) {
-                sx0 = x;
-                sy0 = y;
             }
-        } else if (e.type == EV_MOUSE_DOWN) {
-            if (e.x < TOOLW) {
-                click_tools(e.x, e.y);
-            } else if (e.y >= H - PALH) {
-                for (int i = 0; i < NPAL; i++)
-                    if (ui_hit(e.x, e.y, CX + 10 + (i % 10) * 26, H - PALH + 4 + (i / 10) * 25, 23, 22)) {
-                        if (e.buttons & 2) bg = palette[i];
-                        else fg = palette[i];
-                    }
-            } else if (!drawing) {
-                dcol = (e.buttons & 2) ? bg : fg;
-                if (tool == T_PICK) {
-                    if (x >= 0 && y >= 0 && x < CWID && y < CHGT) {
-                        if (e.buttons & 2) bg = pix[y * CWID + x];
-                        else fg = pix[y * CWID + x];
-                    }
-                } else if (tool == T_FILL) {
-                    push_undo();
-                    flood(x, y, dcol);
-                } else {
-                    push_undo();
-                    memcpy(snap, pix, CWID * CHGT * 4);
-                    drawing = true;
-                    sx0 = x;
-                    sy0 = y;
-                    lx = x;
-                    ly = y;
-                    if (tool == T_PENCIL) stamp(x, y, 1, dcol);
-                    else if (tool == T_BRUSH) stamp(x, y, size + 2, dcol);
-                    else if (tool == T_ERASER) stamp(x, y, size * 2 + 6, bg);
-                }
-            }
-        } else if (e.type == EV_MOUSE_UP) {
-            if (drawing && !(e.buttons & 3)) drawing = false;
-        } else if (e.type == EV_KEY && e.pressed) {
-            int k = e.key;
-            if ((e.mods & NMOD_CTRL) && (k == 'z' || k == 'Z')) click_tools(8, 8 + ((NTOOL + 1) / 2) * 32 + 28 + 130);
-            else if ((e.mods & NMOD_CTRL) && (k == 's' || k == 'S')) save("/home/painting.ppm");
-            else if (k == '[') size = MAX(1, size - 1);
-            else if (k == ']') size = MIN(32, size + 1);
-            else if (k >= '1' && k <= '9' && k - '1' < NTOOL) tool = k - '1';
-            else if (k == '0') tool = T_SPRAY;
-            else continue;
-        } else continue;
-        draw();
-        win_update(win);
+        }
+        if (!running || !ui_session_open(s)) break;
+        if (drawing && tool == T_SPRAY && !moved) paint_move(lx, ly); /* the spray keeps going while held still */
+        flush(s);
+        if (colours) {
+            draw_palette(palette_c);
+            ui_surface_changed(s, S_PALETTE);
+        }
+        if (view) show(s);
     }
-    win_close(win);
+    ui_session_free(s);
     return 0;
 }

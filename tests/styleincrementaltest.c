@@ -515,7 +515,7 @@ static void font_completion(void) {
     check(d->root_box==root && stable->box==kept && sn->box->parent==shaped &&
         shaped->layout_mem.head==arena && shaped->runs==runs,
         "decode failure retains layout and shaping");
-    FILE *fp=fopen("/usr/share/fonts/Inter-Regular.ttf","rb");
+    FILE *fp=fopen("/usr/share/fonts/NotoSansLiving-Regular.ttf","rb");
     long length=0;void *bytes=NULL;
     if(fp && !fseek(fp,0,SEEK_END)) { length=ftell(fp);if(length>0 && !fseek(fp,0,SEEK_SET))bytes=malloc((size_t)length); }
     bool read_ok=bytes && fread(bytes,1,(size_t)length,fp)==(size_t)length;

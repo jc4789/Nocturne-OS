@@ -10,6 +10,9 @@
  * system through a private host object and runs the event loop: microtasks,
  * timers and fetches answered by worker threads. */
 #include <nocturne.h>
+#include <display.h>
+#include <ui.h>
+#include <math.h>
 #include <quickjs.h>
 #include <http.h>
 #include <threads.h>
@@ -35,6 +38,9 @@ static const char src_console[] = {
 };
 static const char src_web[] = {
 #embed "js_web.js"
+};
+static const char src_ui[] = {
+#embed "js_ui.js"
 };
 static const char src_url[] = {
 #embed "../libc/web/js_url.js"
@@ -676,6 +682,7 @@ static JSValue h_load_chunk(JSContext *c, JSValueConst this, int argc, JSValueCo
     if (!name) return JS_EXCEPTION;
     bool ok = !strcmp(name, "url") ? run_chunk("url", src_url, sizeof src_url, "")
             : !strcmp(name, "crypto") ? run_chunk("crypto", src_crypto, sizeof src_crypto, "")
+            : !strcmp(name, "ui") ? run_chunk("ui", src_ui, sizeof src_ui, "")
             : (JS_ThrowTypeError(ctx, "no chunk '%s'", name), false);
     JS_FreeCString(ctx, name);
     return ok ? JS_UNDEFINED : JS_EXCEPTION;
@@ -820,6 +827,138 @@ static void deliver_fetches(void) {
     }
 }
 
+/* ---------------------------------------------------------------- windows (nocturne/ui) */
+
+/* The program's windows are one session of the interface engine (libc/ui.c):
+   js_ui.js sends it views and requests as bytes, and the event loop hands its
+   events back to internal.uiEvent. */
+static struct ui_session *ui;
+
+static struct ui_session *ui_get(void) {
+    if (!ui) ui = ui_session_new();
+    return ui;
+}
+
+static JSValue ui_bytes(const void *p, size_t n) { return JS_NewArrayBufferCopy(ctx, p, n); }
+
+/* (message): 0 or a negative N_ERR_ */
+static JSValue h_ui_send(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    size_t n;
+    uint8_t *p = JS_GetArrayBuffer(ctx, &n, argv[0]);
+    if (!p) return JS_EXCEPTION;
+    struct ui_session *s = ui_get();
+    return JS_NewInt32(ctx, s ? (int32_t)ui_session_send(s, p, n) : -N_ERR_NO_MEMORY);
+}
+
+/* (request): its reply, or null */
+static JSValue h_ui_request(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    size_t n;
+    uint8_t *p = JS_GetArrayBuffer(ctx, &n, argv[0]);
+    if (!p) return JS_EXCEPTION;
+    struct ui_session *s = ui_get();
+    if (!s || !n || ui_session_send(s, p, n) != 0) return JS_NULL;
+    size_t rn;
+    const uint8_t *r = ui_session_peek(s, &rn);
+    if (!r || r[0] != (uint8_t)(p[0] | 0x20)) return JS_NULL;
+    JSValue reply = ui_bytes(r, rn);
+    ui_session_pop(s);
+    return reply;
+}
+
+static JSValue h_ui_launch(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_EXCEPTION;
+    const char *arg = argc > 1 && !JS_IsUndefined(argv[1]) ? JS_ToCString(ctx, argv[1]) : NULL;
+    int r = gui_launch(path, arg);
+    JS_FreeCString(ctx, path);
+    if (arg) JS_FreeCString(ctx, arg);
+    return JS_NewBool(ctx, r >= 0);
+}
+
+/* The desktop: screen size and depth, the compositor's settings, the volume. */
+static JSValue h_desktop(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    struct desktop_settings s;
+    if (__syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_GET, 0, 0) != 0) return JS_NULL;
+    JSValue o = JS_NewObject(ctx);
+    int sw = 0, sh = 0;
+    struct n_sysinfo si;
+    if (sysinfo(&si) == 0) sw = (int)si.fb_w, sh = (int)si.fb_h;
+    else screen_size(&sw, &sh);
+    n_result vol = n_audio_volume();
+    JS_SetPropertyStr(ctx, o, "screenWidth", JS_NewInt32(ctx, sw));
+    JS_SetPropertyStr(ctx, o, "screenHeight", JS_NewInt32(ctx, sh));
+    JS_SetPropertyStr(ctx, o, "bitsPerChannel", JS_NewInt32(ctx, display_bits_per_channel()));
+    JS_SetPropertyStr(ctx, o, "nativeBitsPerChannel", JS_NewInt32(ctx, s.native_bits_per_channel));
+    JS_SetPropertyStr(ctx, o, "refreshRate", JS_NewInt32(ctx, (int32_t)s.refresh_hz));
+    JS_SetPropertyStr(ctx, o, "pointerSpeed", JS_NewInt32(ctx, s.pointer_speed));
+    JS_SetPropertyStr(ctx, o, "pointerY", JS_NewInt32(ctx, s.pointer_y));
+    JS_SetPropertyStr(ctx, o, "pointerYDetected", JS_NewBool(ctx, s.pointer_y_detected));
+    JS_SetPropertyStr(ctx, o, "deepColour", JS_NewBool(ctx, s.deep_simulation));
+    JS_SetPropertyStr(ctx, o, "deepColourAvailable", JS_NewBool(ctx, s.deep_simulation_available));
+    JS_SetPropertyStr(ctx, o, "volume", vol < 0 ? JS_NULL : JS_NewInt32(ctx, (int32_t)vol));
+    return o;
+}
+
+/* (refresh, pointer speed, pointer y, deep colour): whether the desktop took them */
+static JSValue h_desktop_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    struct desktop_settings s;
+    if (__syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_GET, 0, 0) != 0) return JS_FALSE;
+    int32_t refresh = 0, speed = 0, y = 0;
+    JS_ToInt32(ctx, &refresh, argv[0]);
+    JS_ToInt32(ctx, &speed, argv[1]);
+    JS_ToInt32(ctx, &y, argv[2]);
+    s.refresh_hz = (uint32_t)(refresh < 0 ? 0 : refresh);
+    s.pointer_speed = (int8_t)speed;
+    s.pointer_y = (uint8_t)y;
+    s.deep_simulation = (uint8_t)JS_ToBool(ctx, argv[3]);
+    return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_SET, 0, 0) == 0);
+}
+
+/* The computer: processor, memory, uptime, running tasks. */
+static JSValue h_system_info(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    struct n_sysinfo si;
+    if (sysinfo(&si) != 0) return JS_NULL;
+    struct n_cpuinfo ci = {.version = 1};
+    int cpus = cpu_info(&ci) == 0 ? (int)ci.online_cpus : 1;
+    si.cpu[sizeof si.cpu - 1] = 0;
+    si.os[sizeof si.os - 1] = 0;
+    JSValue o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "processor", JS_NewString(ctx, si.cpu));
+    JS_SetPropertyStr(ctx, o, "processors", JS_NewInt32(ctx, cpus > 0 ? cpus : 1));
+    JS_SetPropertyStr(ctx, o, "system", JS_NewString(ctx, si.os));
+    JS_SetPropertyStr(ctx, o, "totalMemory", JS_NewFloat64(ctx, (double)si.total_mem));
+    JS_SetPropertyStr(ctx, o, "freeMemory", JS_NewFloat64(ctx, (double)si.free_mem));
+    JS_SetPropertyStr(ctx, o, "uptimeMs", JS_NewFloat64(ctx, (double)si.uptime_ms));
+    JS_SetPropertyStr(ctx, o, "tasks", JS_NewInt32(ctx, si.ntasks));
+    JS_SetPropertyStr(ctx, o, "screenWidth", JS_NewInt32(ctx, (int32_t)si.fb_w));
+    JS_SetPropertyStr(ctx, o, "screenHeight", JS_NewInt32(ctx, (int32_t)si.fb_h));
+    JS_SetPropertyStr(ctx, o, "bitsPerChannel", JS_NewInt32(ctx, display_bits_per_channel()));
+    return o;
+}
+
+static JSValue h_set_volume(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    int32_t v = 0;
+    JS_ToInt32(ctx, &v, argv[0]);
+    n_result r = n_audio_set_volume(v < 0 ? 0 : v > 100 ? 100 : v);
+    return r < 0 ? JS_NULL : JS_NewInt32(ctx, (int32_t)r);
+}
+
+/* Hands the engine's events to js_ui.js, one at a time. */
+static void ui_deliver(void) {
+    size_t n;
+    const void *p;
+    while (ui && (p = ui_session_peek(ui, &n))) {
+        JSValue e = ui_bytes(p, n);
+        ui_session_pop(ui);
+        JSValue r = internal_call("uiEvent", 1, (JSValue[]){e});
+        if (JS_IsException(r)) report_exception();
+        JS_FreeValue(ctx, r);
+        drain();
+    }
+}
+
+static bool ui_open(void) { return ui && ui_session_open(ui); }
+
 /* ---------------------------------------------------------------- event loop */
 
 /* Runs tasks until nothing is left to wait for, or until the promise until
@@ -830,6 +969,7 @@ static void run_loop(JSValueConst until) {
         uint32_t seen = __atomic_load_n(&fetch_signal, __ATOMIC_ACQUIRE);
         drain();
         deliver_fetches();
+        if (ui) { ui_session_pump(ui); ui_deliver(); }
         for (;;) {
             JSValue now = JS_NewFloat64(ctx, (double)n_clock_uptime_ms());
             JSValue fired = internal_call("fireTimer", 1, (JSValue[]){now});
@@ -846,13 +986,14 @@ static void run_loop(JSValueConst until) {
         JS_ToFloat64(ctx, &at, next);
         JS_FreeValue(ctx, next);
         if (JS_IsJobPending(rt)) continue;
-        if (at < 0 && fetch_pending <= 0) return;
+        if (at < 0 && fetch_pending <= 0 && !ui_open()) return;
         uint64_t ms = 1000, t = n_clock_uptime_ms();
         if (at >= 0) ms = at <= (double)t ? 0 : (uint64_t)(at - (double)t + 0.999);
         if (ms > 1000) ms = 1000;
         if (!ms) continue;
         fflush(stdout);
-        if (fetch_pending > 0) wait_on_address(&fetch_signal, seen, (unsigned)ms);
+        if (ui_open()) { ui_session_wait(ui, fetch_pending > 0 && ms > 10 ? 10 : (int)ms); ui_deliver(); } /* window events end the wait */
+        else if (fetch_pending > 0) wait_on_address(&fetch_signal, seen, (unsigned)ms);
         else n_sleep_ms(ms);
     }
 }
@@ -912,7 +1053,7 @@ static JSValue compile_module(const char *path) {
 static JSModuleDef *module_load(JSContext *c, const char *path, void *opaque, JSValueConst attributes) {
     const char *format;
     JSValue fv = JS_UNDEFINED;
-    if (!strcmp(path, "nocturne")) format = "nocturne";
+    if (!strcmp(path, "nocturne") || !strcmp(path, "nocturne/ui")) format = "nocturne";
     else {
         fv = internal_call("moduleFormat", 1, (JSValue[]){JS_NewString(ctx, path)});
         if (JS_IsException(fv)) return NULL;
@@ -1175,6 +1316,13 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("securityURL", 0, h_security_url),
     JS_CFUNC_DEF("fetch", 5, h_fetch),
     JS_CFUNC_DEF("fetchCancel", 1, h_fetch_cancel),
+    JS_CFUNC_DEF("uiSend", 1, h_ui_send),
+    JS_CFUNC_DEF("uiRequest", 1, h_ui_request),
+    JS_CFUNC_DEF("uiLaunch", 2, h_ui_launch),
+    JS_CFUNC_DEF("desktop", 0, h_desktop),
+    JS_CFUNC_DEF("desktopSet", 4, h_desktop_set),
+    JS_CFUNC_DEF("setVolume", 1, h_set_volume),
+    JS_CFUNC_DEF("systemInfo", 0, h_system_info),
 };
 
 static void usage(FILE *f) {

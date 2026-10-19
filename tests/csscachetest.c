@@ -76,7 +76,7 @@ static int font_sources_integration(void) {
     doc_font_loaded(d,first,NULL,0);web_layout(d,800,600);
     check(first->done&&first->failed&&second->wanted&&!second->done,"failed unhinted candidate advances next source without losing font user");
     check(quiet&&root==d->root_box&&revision==d->layout_revision,"failed candidate does not remeasure unchanged font metrics");
-    FILE *file=fopen("/usr/share/fonts/Inter-Regular.ttf","rb");
+    FILE *file=fopen("/usr/share/fonts/NotoSansLiving-Regular.ttf","rb");
     void *bytes=NULL;long length=0;
     if(file){fseek(file,0,SEEK_END);length=ftell(file);fseek(file,0,SEEK_SET);if(length>0)bytes=malloc((size_t)length);}
     bool loaded=bytes&&file&&fread(bytes,1,(size_t)length,file)==(size_t)length;

@@ -3,6 +3,7 @@
    it. This is not a password manager or personal/contact/payment autofill. */
 #include <stdio.h>
 #include <nocturne.h>
+#include <ui.h>
 #include <bearssl_hash.h>
 #include "form_autocomplete.h"
 #include "form_value.h"
@@ -335,46 +336,64 @@ bool web_autocomplete_choose(web_doc *d, web_node *input, int index) {
     if (ok) { uint32_t end = doc_utf16_length(input->value); doc_control_selection(d, input, end, end, 0); }
     popup_reset(); return ok;
 }
+/* A window of the UI engine (ui.h), modal while the browser waits for it. */
 void web_autocomplete_settings(void) {
-    window_t *window = win_open(600, 244, "Search history privacy", 0); if (!window) return;
+    struct ui_session *s = ui_session_new();
+    if (!s || ui_window(s, 1, 560, 290, WIN_CENTER, "Search history privacy", NULL, NULL) < 0) { ui_session_free(s); return; }
+    const struct ui_theme *t = &ui_theme;
     char message[120] = "Default is off. Enable only for non-secret searches.";
-    int pressed = -1;
-    for (;;) {
-        bool enabled = history_enabled(); canvas_t *c = &window->c;
-        gfx_fill(c, 0, 0, window->w, window->h, UI_BG);
-        gfx_text(c, 16, 14, "Native search completion", UI_FG, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, 16, 40, enabled ? "Search history: ENABLED" : "Search history: OFF", UI_ACCENT, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, 16, 66, "Stores typed search fields, separated by site and field name.", UI_DIM, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, 16, 88, "Stored only in /data/browser; Clear removes every entry.", UI_DIM, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, 16, 110, "On a search field: Down opens suggestions; Enter chooses.", UI_DIM, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, 16, 132, "Never type secrets in a search. Clear also disables history.", UI_DIM, TRANSPARENT, FONT_SMALL);
-        ui_button(c, 16, 164, 170, 30, enabled ? "Disable (D)" : "Enable (E)", false, false);
-        ui_button(c, 200, 164, 170, 30, "Clear and disable (C)", false, false);
-        ui_button(c, 384, 164, 170, 30, "Close (Esc)", false, false);
-        gfx_text(c, 16, 212, message, UI_FG, TRANSPARENT, FONT_SMALL); win_update(window);
-        struct gui_event event;
-        if (win_event(window, &event, -1) < 0 || event.type == EV_CLOSE) break;
-        int action = -1;
-        if (event.type == EV_MOUSE_DOWN && (event.buttons & 1)) {
-            pressed = ui_hit(event.x, event.y, 16, 164, 170, 30) ? 0 :
-                ui_hit(event.x, event.y, 200, 164, 170, 30) ? 1 :
-                ui_hit(event.x, event.y, 384, 164, 170, 30) ? 2 : -1;
-        } else if (event.type == EV_MOUSE_UP) {
-            if (pressed == 0 && ui_hit(event.x, event.y, 16, 164, 170, 30)) action = enabled ? 1 : 0;
-            else if (pressed == 1 && ui_hit(event.x, event.y, 200, 164, 170, 30)) action = 2;
-            else if (pressed == 2 && ui_hit(event.x, event.y, 384, 164, 170, 30)) break;
-            pressed = -1;
-        } else if (event.type == EV_KEY && event.pressed) {
-            if (event.key == NKEY_ESC) break;
-            unsigned key = lower(event.key);
-            if (key == 'e') action = 0; else if (key == 'd') action = 1; else if (key == 'c') action = 2;
-        }
-        if (action >= 0) {
-            bool ok = action == 2 ? history_clear() : history_enable(action == 0);
-            strlcpy(message, !ok ? "Storage operation failed; verify the persistent /data volume." : action == 2 ?
-                "History removed and completion disabled." : action == 0 ? "Enabled. Past values are offered only on explicit selection." :
-                "Disabled. Stored history is kept until Clear is selected.", sizeof message);
+    for (bool done = false; !done;) {
+        bool enabled = history_enabled();
+        struct ui_msg m;
+        ui_view(&m, 1);
+        ui_node(&m, "column"); ui_num(&m, "padding", 22); ui_num(&m, "gap", 8);
+            ui_node(&m, "text"); ui_str(&m, "text", "Native search completion"); ui_str(&m, "style", "heading"); ui_end(&m);
+            ui_node(&m, "text"); ui_str(&m, "text", enabled ? "Search history is on" : "Search history is off");
+            ui_num(&m, "colour", enabled ? t->success : t->textDim); ui_num(&m, "weight", 1); ui_end(&m);
+            static const char *const lines[] = {
+                "Stores typed search fields, separated by site and field name.",
+                "Stored only in /data/browser; Clear removes every entry.",
+                "On a search field: Down opens suggestions; Enter chooses.",
+                "Never type secrets in a search. Clear also disables history.",
+            };
+            for (size_t i = 0; i < sizeof lines / sizeof *lines; i++) {
+                ui_node(&m, "text"); ui_str(&m, "text", lines[i]); ui_num(&m, "wrap", 1); ui_num(&m, "colour", t->textDim); ui_end(&m);
+            }
+            ui_node(&m, "spacer"); ui_num(&m, "size", 6); ui_end(&m);
+            ui_node(&m, "row"); ui_num(&m, "gap", 8);
+                uint32_t toggle = ui_node(&m, "button"); ui_str(&m, "text", enabled ? "Disable" : "Enable");
+                ui_str(&m, "variant", "primary"); ui_end(&m);
+                uint32_t clear = ui_node(&m, "button"); ui_str(&m, "text", "Clear and disable");
+                ui_str(&m, "variant", "secondary"); ui_end(&m);
+                ui_node(&m, "spacer"); ui_num(&m, "grow", 1); ui_end(&m);
+                uint32_t close = ui_node(&m, "button"); ui_str(&m, "text", "Close"); ui_str(&m, "variant", "ghost"); ui_end(&m);
+            ui_end(&m);
+            ui_node(&m, "text"); ui_str(&m, "text", message); ui_str(&m, "style", "caption"); ui_num(&m, "wrap", 1); ui_end(&m);
+        ui_end(&m);
+        ui_send(s, &m);
+        if (!ui_session_wait(s, -1)) continue;
+        struct ui_event event;
+        char text[16];
+        while (!done && ui_next_event(s, &event, text, sizeof text)) {
+            int action = -1; /* 0 enable, 1 disable, 2 clear */
+            if (event.type == UI_EVENT_CLOSE) done = true;
+            else if (event.type == UI_EVENT_CLICK) {
+                if (event.node == toggle) action = enabled ? 1 : 0;
+                else if (event.node == clear) action = 2;
+                else if (event.node == close) done = true;
+            } else if (event.type == UI_EVENT_KEY && !(event.flags & UI_UP)) {
+                if ((uint32_t)event.a == NKEY_ESC) done = true;
+                unsigned key = lower((unsigned)event.a);
+                if (key == 'e') action = 0; else if (key == 'd') action = 1; else if (key == 'c') action = 2;
+            }
+            if (action >= 0) {
+                bool ok = action == 2 ? history_clear() : history_enable(action == 0);
+                strlcpy(message, !ok ? "Storage operation failed; verify the persistent /data volume." : action == 2 ?
+                    "History removed and completion disabled." : action == 0 ? "Enabled. Past values are offered only on explicit selection." :
+                    "Disabled. Stored history is kept until Clear is selected.", sizeof message);
+                break; /* the buttons say what it is now */
+            }
         }
     }
-    win_close(window);
+    ui_session_free(s);
 }

@@ -537,12 +537,12 @@ static void dt_detail_headers(const char *title, const char *headers, int width)
         while (*p == '\r' || *p == '\n') p++;
     }
 }
-static int dt_net_list_w(void) { return dt_net_selected >= 0 ? w->w * 9 / 20 : w->w; }
+static int dt_net_list_w(void) { return dt_net_selected >= 0 ? view.w * 9 / 20 : view.w; }
 static void dt_net_detail_build(void) {
     dt_lines_clear(&dt_detail);
     if (dt_net_selected < 0 || dt_net_selected >= dt_net_n) return;
     const struct dt_request *r = &dt_net[dt_net_selected];
-    int width = w->w - dt_net_list_w();
+    int width = view.w - dt_net_list_w();
     char text[64];
     struct sb s = {0};
     dt_puts(&s, C_ACCENT, "General");
@@ -584,7 +584,7 @@ static int dt_sub_x(int split, int sub) {
     for (int i = 0; i < sub; i++) x += gfx_text_width(dt_sub_names[i], FONT_SMALL) + 24;
     return x;
 }
-static int dt_split(void) { return w->w * 3 / 5; }
+static int dt_split(void) { return view.w * 3 / 5; }
 
 static void dt_draw_lines(canvas_t *c, struct dt_lines *l, int x, int y, int width, int height, bool tree) {
     int rows = dt_rows_in(height);
@@ -617,9 +617,9 @@ static void dt_draw_lines(canvas_t *c, struct dt_lines *l, int x, int y, int wid
     }
 }
 static void dt_draw_tabs(canvas_t *c, int top) {
-    gfx_fill(c, 0, top, w->w, DT_TABH, DT_BAR);
-    gfx_hline(c, 0, top, w->w, DT_RULE);
-    gfx_hline(c, 0, top + DT_TABH - 1, w->w, DT_RULE);
+    gfx_fill(c, 0, top, view.w, DT_TABH, DT_BAR);
+    gfx_hline(c, 0, top, view.w, DT_RULE);
+    gfx_hline(c, 0, top + DT_TABH - 1, view.w, DT_RULE);
     /* element picker: a box with a pointer */
     uint32_t picker = dt_picking ? DT_BLUE : dt_palette[C_DIM];
     gfx_rect(c, 9, top + 6, 11, 11, picker);
@@ -637,7 +637,7 @@ static void dt_draw_tabs(canvas_t *c, int top) {
         char size[32]; dt_format_size(size, sizeof size, total);
         snprintf(hint, sizeof hint, "%d requests   %s transferred   Ctrl+K: clear", dt_net_n, size);
     } else snprintf(hint, sizeof hint, "%d messages", console_n);
-    int hw = gfx_text_width(hint, FONT_SMALL), hx = w->w - hw - 12;
+    int hw = gfx_text_width(hint, FONT_SMALL), hx = view.w - hw - 12;
     if (hx > dt_tab_x(DT_NTABS)) gfx_text(c, hx, top + 4, hint, dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
 }
 static void dt_box_numbers(canvas_t *c, int x, int y, int width, int height, const float v[4]) {
@@ -690,15 +690,15 @@ static void dt_draw_elements(canvas_t *c, int top, int h) {
     if (!dt_tree.n) gfx_text(c, 12, top + 6, doc ? "Waiting for the document layout..." : "No document.", dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
     else dt_draw_lines(c, &dt_tree, 0, top, split, h, true);
     gfx_vline(c, split, top, h, DT_RULE);
-    gfx_fill(c, split + 1, top, w->w - split - 1, DT_SUBH, DT_BAR);
-    gfx_hline(c, split + 1, top + DT_SUBH - 1, w->w - split - 1, DT_RULE);
+    gfx_fill(c, split + 1, top, view.w - split - 1, DT_SUBH, DT_BAR);
+    gfx_hline(c, split + 1, top + DT_SUBH - 1, view.w - split - 1, DT_RULE);
     for (int i = 0; i < DT_NSUB; i++) {
         int x = dt_sub_x(split, i), tw = gfx_text_width(dt_sub_names[i], FONT_SMALL);
         gfx_text(c, x, top + 3, dt_sub_names[i], i == dt_sub ? RGB(232, 234, 237) : dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
         if (i == dt_sub) gfx_fill(c, x - 4, top + DT_SUBH - 3, tw + 8, 2, DT_BLUE);
     }
-    if (dt_sub == DT_LAYOUT) dt_draw_box_model(c, split + 1, top + DT_SUBH, w->w - split - 1, h - DT_SUBH);
-    else dt_draw_lines(c, &dt_side, split + 1, top + DT_SUBH + 2, w->w - split - 1, h - DT_SUBH - 2, false);
+    if (dt_sub == DT_LAYOUT) dt_draw_box_model(c, split + 1, top + DT_SUBH, view.w - split - 1, h - DT_SUBH);
+    else dt_draw_lines(c, &dt_side, split + 1, top + DT_SUBH + 2, view.w - split - 1, h - DT_SUBH - 2, false);
 }
 static uint32_t dt_type_color(const char *type) {
     if (!strcmp(type, "document")) return RGB(138, 180, 248);
@@ -766,7 +766,7 @@ static void dt_draw_network(canvas_t *c, int top, int h) {
         gfx_fill(c, bx, ry + 4, MIN(bw, wx + ww - bx), 8, dt_type_color(type));
     }
     if (compact) {
-        int dx = list_w + 1, dw = w->w - dx;
+        int dx = list_w + 1, dw = view.w - dx;
         gfx_vline(c, list_w, top, h, DT_RULE);
         gfx_fill(c, dx, top, dw, DT_NET_HEAD, DT_BAR);
         gfx_hline(c, dx, top + DT_NET_HEAD - 1, dw, DT_RULE);
@@ -779,8 +779,8 @@ static void dt_draw_network(canvas_t *c, int top, int h) {
 static void devtools_draw(canvas_t *c, int top, int h) {
     dt_draw_tabs(c, top);
     canvas_t body = *c;
-    gfx_clip(&body, 0, top + DT_TABH, w->w, h - DT_TABH);
-    gfx_fill(&body, 0, top + DT_TABH, w->w, h - DT_TABH, DT_BG);
+    gfx_clip(&body, 0, top + DT_TABH, view.w, h - DT_TABH);
+    gfx_fill(&body, 0, top + DT_TABH, view.w, h - DT_TABH, DT_BG);
     if (dt_tab == DT_ELEMENTS) dt_draw_elements(&body, top + DT_TABH, h - DT_TABH);
     else if (dt_tab == DT_NETWORK) dt_draw_network(&body, top + DT_TABH, h - DT_TABH);
 }
@@ -797,9 +797,9 @@ static int dt_px(float v) { return v > 0 ? (int)(v + 0.5f) : 0; }
 static void devtools_draw_overlay(canvas_t *page) {
     if (!devtools_overlay_visible()) return;
     canvas_t c = *page;
-    gfx_clip(&c, 0, TB, page_w(), page_h());
+    gfx_clip(&c, 0, 0, page_w(), page_h());
     const struct web_inspect_box *b = &dt_overlay;
-    int bx = b->x - scroll_x, by = TB + b->y - scroll_y;
+    int bx = b->x - scroll_x, by = b->y - scroll_y;
     int mt = dt_px(b->margin[0]), mr = dt_px(b->margin[1]), mb = dt_px(b->margin[2]), ml = dt_px(b->margin[3]);
     int bt = dt_px(b->border[0]), br = dt_px(b->border[1]), bb = dt_px(b->border[2]), bl = dt_px(b->border[3]);
     int pt = dt_px(b->padding[0]), pr = dt_px(b->padding[1]), pb = dt_px(b->padding[2]), pl = dt_px(b->padding[3]);
@@ -817,8 +817,8 @@ static void devtools_draw_overlay(canvas_t *page) {
         tw += MAX(gfx_codepoint_width(cp, FONT_SMALL), 0); p += k;
     }
     int tx = MAX(4, MIN(bx, page_w() - tw - 20)), ty = by + b->h + mb + 6;
-    if (ty + 22 > TB + page_h()) ty = by - mt - 28;
-    ty = MAX(TB + 2, ty);
+    if (ty + 22 > page_h()) ty = by - mt - 28;
+    ty = MAX(2, ty);
     gfx_fill_round(&c, tx, ty, tw + 16, 22, 4, RGB(48, 50, 54));
     dt_draw_text(&c, tx + 8, ty + 3, dt_overlay_label, dt_palette[C_TEXT]);
 }
@@ -840,6 +840,7 @@ static void devtools_set_tab(int tab) {
     focus = F_CONSOLE;
     devtools_refresh(true);
     console_dirty = true;
+    show_chrome(); /* the console's line is a field of the window, only under its own tab */
 }
 /* Global DevTools shortcuts: Ctrl+Shift+I toggles, J opens the console,
    C opens Elements with the picker. */
@@ -914,16 +915,16 @@ static void devtools_wheel(int x, int y, int wheel) {
     else dt_detail.top = MAX(0, dt_detail.top - wheel * 3);
     console_dirty = true;
 }
-static bool dt_in_page(int x, int y) { return y >= TB && y < TB + page_h() && x >= 0 && x < page_w(); }
+static bool dt_in_page(int x, int y) { return y >= 0 && y < page_h() && x >= 0 && x < page_w(); }
 /* Primary press: the resize edge, a picked page element, or the panel.
    Returns true when DevTools consumed the press. */
 static bool devtools_pointer_down(int x, int y) {
     if (!console_open || browser_fullscreen) return false;
-    int top = TB + page_h();
+    int top = page_h();
     dt_sync_doc();
-    if (y >= top - 3 && y < top + 3 && y < w->h - SB) { dt_resizing = true; return true; }
+    if (y >= top - 3 && y < top + 3 && y < view.h) { dt_resizing = true; return true; }
     if (dt_picking && doc && dt_in_page(x, y)) {
-        web_node *n = web_node_at(doc, document_x(x), y - TB + scroll_y);
+        web_node *n = web_node_at(doc, document_x(x), y + scroll_y);
         dt_picking = false;
         dt_swallow_up = true;
         dt_tab = DT_ELEMENTS; focus = F_CONSOLE;
@@ -932,7 +933,7 @@ static bool devtools_pointer_down(int x, int y) {
         need_paint = true;
         return true;
     }
-    if (y < top || y >= w->h - SB) return false;
+    if (y < top || y >= view.h) return false;
     focus = F_CONSOLE;
     console_dirty = true;
     if (y < top + DT_TABH) {
@@ -976,15 +977,15 @@ static bool devtools_pointer_down(int x, int y) {
 static bool devtools_pointer_move(int x, int y) {
     if (!console_open || browser_fullscreen) return false;
     if (dt_resizing) {
-        int room = w->h - TB - SB;
-        devtools_height = MAX(MIN(w->h - SB - y, room - 60), MIN(120, room / 2));
+        int room = view.h;
+        devtools_height = MAX(MIN(view.h - y, room - 60), MIN(120, room / 2));
         need_layout = need_paint = true;
         return true;
     }
     dt_sync_doc();
-    int top = TB + page_h();
-    if (dt_picking && doc && dt_in_page(x, y)) { dt_set_hover(web_node_at(doc, document_x(x), y - TB + scroll_y)); return false; }
-    if (dt_tab == DT_ELEMENTS && y >= top + DT_TABH && y < w->h - SB && x < dt_split()) {
+    int top = page_h();
+    if (dt_picking && doc && dt_in_page(x, y)) { dt_set_hover(web_node_at(doc, document_x(x), y + scroll_y)); return false; }
+    if (dt_tab == DT_ELEMENTS && y >= top + DT_TABH && y < view.h && x < dt_split()) {
         int row = dt_tree.top + (y - top - DT_TABH) / DT_ROWH;
         dt_set_hover(row >= 0 && row < dt_tree.n ? dt_tree.v[row].node : NULL);
         return false;

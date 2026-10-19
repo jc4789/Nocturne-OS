@@ -250,23 +250,6 @@ int gui_launch(const char *path, const char *arg);
    the size. 0 or -1 (E2BIG: buffer too small) */
 int screen_grab(uint32_t *buf, size_t bytes, int *w, int *h);
 
-/* ---- tiny UI kit (ui.c) ---- */
-#define UI_BG      RGB(30, 28, 52)
-#define UI_PANEL   RGB(40, 38, 70)
-#define UI_FG      RGB(232, 232, 245)
-#define UI_DIM     RGB(150, 150, 185)
-#define UI_ACCENT  RGB(130, 110, 240)
-#define UI_ACCENT2 RGB(246, 200, 110)
-#define UI_BTN     RGB(56, 52, 98)
-#define UI_BTN_HI  RGB(84, 74, 150)
-void ui_button(canvas_t *c, int x, int y, int w, int h, const char *label, bool hot, bool pressed);
-void ui_text_center(canvas_t *c, int x, int y, int w, const char *s, uint32_t col, int font);
-bool ui_hit(int px, int py, int x, int y, int w, int h);
-/* draws a single-line text field; returns nothing. */
-void ui_textfield(canvas_t *c, int x, int y, int w, const char *text, bool focus);
-/* edit a line buffer with a key event; returns 1 on Enter, -1 on Escape, 0 otherwise */
-int ui_edit_key(char *buf, size_t cap, const struct gui_event *e);
-
 /* ---- sound (sound.c) ----
    Streams come from n_audio_open (above; up to 8 play at once) and hold about 170 ms
    (SOUND_QUEUE frames). */

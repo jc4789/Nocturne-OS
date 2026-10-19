@@ -4,18 +4,23 @@
 #include <string.h>
 #include "nocturne.h"
 
-/* Launch path with the given input, output and log, in this app's folder.
-   Settings beyond FOLDER (such as TERMINAL) are passed in extra. */
-static n_handle start(const char *path, const char *name, const char *arg, int32_t in, int32_t out, const char *extra) {
+/* Launch path with up to two arguments and the given input, output and log, in
+   this app's folder. Settings beyond FOLDER (such as TERMINAL) are passed in extra. */
+static n_handle start2(const char *path, const char *name, const char *arg, const char *arg2, int32_t in, int32_t out,
+                       const char *extra) {
     const char *f = getenv("FOLDER");
     char folder[300];
     snprintf(folder, sizeof folder, "FOLDER=%s", f && f[0] == '/' ? f : "/home");
     const char *settings[2] = {folder, extra};
-    const char *args[2] = {name, arg};
+    const char *args[3] = {name, arg, arg2};
     int32_t handles[3] = {in, out, out};
-    struct n_launch l = {.arguments = args, .settings = settings, .handles = handles, .argument_count = arg ? 2 : 1,
-                         .setting_count = extra ? 2 : 1, .handle_count = 3};
+    struct n_launch l = {.arguments = args, .settings = settings, .handles = handles,
+                         .argument_count = arg ? (arg2 ? 3 : 2) : 1, .setting_count = extra ? 2 : 1, .handle_count = 3};
     return n_app_launch(path, &l);
+}
+
+static n_handle start(const char *path, const char *name, const char *arg, int32_t in, int32_t out, const char *extra) {
+    return start2(path, name, arg, NULL, in, out, extra);
 }
 
 /* Test disks (scripts/test.py) carry /data/tests/autorun.sh: run it with its output in the system
@@ -36,7 +41,7 @@ int main(void) {
     if (gui_available()) {
         /* desktop session: put the saved Settings back; the desktop is the user's
            from here, opened apps come from its icons and menu */
-        n_handle settings = start("/bin/settings", "settings", "--apply", -1, -1, NULL);
+        n_handle settings = start2("/bin/js", "js", "/bin/settings.js", "--apply", -1, -1, NULL);
         if (settings >= 0) {
             n_app_result(settings, 5000, NULL);
             n_handle_close(settings);

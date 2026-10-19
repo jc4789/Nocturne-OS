@@ -1,8 +1,21 @@
-/* Spinning shaded solids. Space switches shape, mouse drag spins. */
+/* Spinning shaded solids. Space (or the button) switches shape, mouse drag spins. The
+   header and the hint are widgets of the interface engine (libc/ui.c); the solid is
+   drawn in a surface that fills the resizable window. Escape closes. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include "nocturne.h"
+#include "ui.h"
+
+#define WINDOW 1
+#define VIEW 1
+#define PAD 12
+#define GAP 8
+#define HEADER 36 /* the height of the header row */
+#define HINT 18   /* the height of the hint below the view */
+
+static uint32_t next_shape; /* the button's place in the view */
 
 typedef struct {
     double x, y, z;
@@ -89,20 +102,50 @@ static int cmpf(const void *a, const void *b) {
     return d < 0 ? 1 : d > 0 ? -1 : 0;
 }
 
+/* The header (the shape's name, the frame rate and the button for the next shape) and the
+   hint are widgets; the solid is drawn in the surface between them. */
+static void show(struct ui_session *s, int fps) {
+    char rate[24];
+    snprintf(rate, sizeof rate, "%d fps", fps);
+    struct ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m, "column"); ui_num(&m, "padding", PAD); ui_num(&m, "gap", GAP);
+        ui_node(&m, "row"); ui_num(&m, "gap", 10);
+            ui_node(&m, "text"); ui_str(&m, "text", shape_name[shape]); ui_str(&m, "style", "heading"); ui_end(&m);
+            ui_node(&m, "text"); ui_str(&m, "text", rate); ui_str(&m, "style", "caption"); ui_end(&m);
+            ui_node(&m, "spacer"); ui_end(&m);
+            next_shape = ui_node(&m, "button");
+            ui_str(&m, "text", "Next shape"); ui_str(&m, "icon", "chevron-right"); ui_str(&m, "variant", "secondary");
+            ui_num(&m, "compact", 1); ui_end(&m);
+        ui_end(&m);
+        ui_node(&m, "surface"); ui_num(&m, "surface", VIEW); ui_num(&m, "pointer", 1);
+        ui_str(&m, "width", "fill"); ui_str(&m, "height", "fill"); ui_end(&m);
+        ui_node(&m, "text"); ui_str(&m, "text", "Space: next shape    Drag: spin    Esc: close");
+        ui_str(&m, "style", "caption"); ui_end(&m);
+    ui_end(&m);
+    ui_send(s, &m);
+}
+
 int main(void) {
-    window_t *w = win_open(480, 420, "3D Shapes", WIN_RESIZABLE);
-    if (!w) return 1;
+    struct ui_session *s = ui_session_new();
+    int ww, wh;
+    if (!s || ui_window(s, WINDOW, 480, 440, WIN_RESIZABLE, "3D Shapes", &ww, &wh) < 0) return 1;
+    /* a first guess; the engine reports the real size with UI_EVENT_CANVAS */
+    int W = MAX(1, ww - 2 * PAD), H = MAX(1, wh - 2 * PAD - 2 * GAP - HEADER - HINT);
+    canvas_t *c = ui_surface(s, VIEW, W, H, 0);
+    if (!c) return 1;
     build();
     double ax = 0.5, ay = 0.3, vx = 0.011, vy = 0.017;
     bool drag = false;
     int lmx = 0, lmy = 0;
     uint64_t frames = 0, t0 = n_clock_uptime_ms();
     int fps = 0;
+    show(s, fps);
     for (;;) {
         uint64_t frame_start = n_clock_uptime_ms();
-        canvas_t *c = &w->c;
-        int W = w->w, H = w->h;
-        gfx_gradient_v(c, 0, 0, W, H, RGB(16, 14, 34), RGB(44, 30, 70));
+        const struct ui_theme *th = &ui_theme;
+        gfx_fill(c, 0, 0, W, H, th->background);
+        ui_round_gradient(c, 0, 0, W, H, th->radius, th->sidebar, th->surfaceActive);
         double sc = MIN(W, H) * 0.27;
         vec3 tv[64];
         int px[64], py[64];
@@ -113,8 +156,10 @@ int main(void) {
             py[i] = H / 2 - (int)(tv[i].y * sc * 4 / z);
         }
         /* shadow */
-        for (int r = 0; r < 12; r++)
-            gfx_fill_blend(c, W / 2 - (int)sc + r * 4, H - 50 + r, 2 * (int)sc - r * 8, 6, ARGB(14, 0, 0, 0));
+        for (int r = 0; r < 6; r++) {
+            float sw = 2 * (float)sc - r * 12, sh = 14 - r * 2;
+            ui_round_fill(c, (float)W / 2 - sw / 2, (float)H - 30 + r, sw, sh, sh / 2, ARGB(26, 0, 0, 0));
+        }
         struct drawface df[64];
         for (int f = 0; f < nface; f++) {
             double z = 0;
@@ -144,19 +189,17 @@ int main(void) {
             uint32_t edge = gfx_mix(col, RGB(255, 255, 255), 90);
             for (int k = 0; k < face_n[f]; k++) {
                 int p0 = faces[f][k], p1 = faces[f][(k + 1) % face_n[f]];
-                gfx_line(c, px[p0], py[p0], px[p1], py[p1], edge);
+                ui_line(c, (float)px[p0], (float)py[p0], (float)px[p1], (float)py[p1], 1.2f, edge);
             }
         }
-        char b[64];
-        snprintf(b, sizeof b, "%s  %d fps", shape_name[shape], fps);
-        gfx_text(c, 10, 8, b, UI_DIM, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, 10, H - 24, "space: next shape   drag: spin", RGB(110, 100, 150), TRANSPARENT, FONT_SMALL);
-        win_update(w);
+        ui_surface_changed(s, VIEW);
         frames++;
         if (n_clock_uptime_ms() - t0 >= 1000) {
+            bool same = (int)frames == fps;
             fps = (int)frames;
             frames = 0;
             t0 = n_clock_uptime_ms();
+            if (!same) show(s, fps); /* the frame rate is a widget; send it only when it changed */
         }
         if (!drag) {
             ax += vx;
@@ -168,37 +211,60 @@ int main(void) {
         bool quit = false;
         for (;;) {
             int64_t left = (int64_t)(until - n_clock_uptime_ms());
-            struct gui_event e;
-            int r = win_event(w, &e, left > 0 ? (int)left : 0);
-            if (r < 0) {
+            ui_session_wait(s, left > 0 ? (int)left : 0);
+            struct ui_event e;
+            char text[16];
+            while (ui_next_event(s, &e, text, sizeof text)) {
+                bool next = false;
+                switch (e.type) {
+                case UI_EVENT_CLOSE:
+                    quit = true;
+                    break;
+                case UI_EVENT_KEY:
+                    if (e.flags & UI_UP) break;
+                    if (!strcmp(e.text, "Escape")) quit = true;
+                    else if (e.a == ' ') next = true;
+                    break;
+                case UI_EVENT_CLICK:
+                    if (e.node == next_shape) next = true;
+                    break;
+                case UI_EVENT_CANVAS:
+                    W = MAX(1, (int)e.a);
+                    H = MAX(1, (int)e.b);
+                    c = ui_surface(s, VIEW, W, H, 0);
+                    if (!c) quit = true;
+                    break;
+                case UI_EVENT_POINTER:
+                    if (e.flags & UI_DOWN) {
+                        drag = true;
+                        lmx = (int)e.a;
+                        lmy = (int)e.b;
+                    } else if (e.flags & UI_UP) {
+                        drag = false;
+                    } else if (drag) {
+                        vy = ((int)e.a - lmx) * 0.01;
+                        vx = ((int)e.b - lmy) * -0.01;
+                        ay += vy;
+                        ax += vx;
+                        lmx = (int)e.a;
+                        lmy = (int)e.b;
+                    }
+                    break;
+                }
+                if (next) {
+                    shape = (shape + 1) % 4;
+                    build();
+                    show(s, fps); /* the name of the shape */
+                }
+            }
+            if (quit || !ui_session_open(s)) {
                 quit = true;
                 break;
             }
-            if (r == 0) break;
-            if (e.type == EV_CLOSE || (e.type == EV_KEY && e.pressed && e.key == NKEY_ESC)) {
-                quit = true;
-                break;
-            }
-            if (e.type == EV_KEY && e.pressed && e.key == ' ') {
-                shape = (shape + 1) % 4;
-                build();
-            } else if (e.type == EV_MOUSE_DOWN) {
-                drag = true;
-                lmx = e.x;
-                lmy = e.y;
-            } else if (e.type == EV_MOUSE_UP) {
-                drag = false;
-            } else if (e.type == EV_MOUSE_MOVE && drag) {
-                vy = (e.x - lmx) * 0.01;
-                vx = (e.y - lmy) * -0.01;
-                ay += vy;
-                ax += vx;
-                lmx = e.x;
-                lmy = e.y;
-            }
+            if (n_clock_uptime_ms() >= until) break;
         }
         if (quit) break;
     }
-    win_close(w);
+    ui_session_free(s);
     return 0;
 }

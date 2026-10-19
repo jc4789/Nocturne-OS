@@ -1,21 +1,27 @@
-/* Minesweeper */
+/* Minesweeper: the counters and New game are widgets of the interface engine
+   (libc/ui.c); the board is a surface the game draws itself. Left click opens a
+   cell, right click flags it; N or F2 starts again, Escape closes. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "ui.h"
 
 #define GW 16
 #define GH 16
 #define MINES 40
 #define CS 24
-#define TOP 48
-#define W (GW * CS)
-#define H (GH * CS + TOP)
+#define BW (GW * CS)
+#define BH (GH * CS)
+#define PAD 12
+#define WINDOW 1
+#define BOARD 1
 
 static bool mine[GH][GW], open_[GH][GW], flag[GH][GW];
-static int nflags, nopen;
+static int nflags, nopen, hot_x = -1, hot_y = -1;
 static bool lost, won, started;
 static uint64_t t0, t_end;
+static uint32_t new_game; /* the button's place in the view */
 
 static int count(int x, int y) {
     int n = 0;
@@ -69,111 +75,141 @@ static void reveal(int x, int y) {
     }
 }
 
-static void draw(window_t *w) {
-    canvas_t *c = &w->c;
-    gfx_gradient_v(c, 0, 0, W, TOP, RGB(40, 34, 76), RGB(28, 24, 54));
-    char buf[32];
-    snprintf(buf, sizeof buf, "%03d", MINES - nflags);
-    gfx_fill_round(c, 10, 10, 64, 28, 6, RGB(10, 8, 20));
-    gfx_text(c, 18, 16, buf, RGB(250, 90, 100), TRANSPARENT, FONT_SMALL);
-    int secs = started ? (int)(((lost || won) ? t_end : n_clock_uptime_ms()) - t0) / 1000 : 0;
-    snprintf(buf, sizeof buf, "%03d", secs > 999 ? 999 : secs);
-    gfx_fill_round(c, W - 74, 10, 64, 28, 6, RGB(10, 8, 20));
-    gfx_text(c, W - 66, 16, buf, RGB(250, 90, 100), TRANSPARENT, FONT_SMALL);
-    /* face button */
-    int fx = W / 2;
-    gfx_fill_circle(c, fx, 24, 15, RGB(250, 210, 80));
-    gfx_circle(c, fx, 24, 15, RGB(120, 90, 20));
-    if (lost) {
-        gfx_line(c, fx - 8, 17, fx - 4, 21, RGB(40, 30, 10));
-        gfx_line(c, fx - 8, 21, fx - 4, 17, RGB(40, 30, 10));
-        gfx_line(c, fx + 4, 17, fx + 8, 21, RGB(40, 30, 10));
-        gfx_line(c, fx + 4, 21, fx + 8, 17, RGB(40, 30, 10));
-        gfx_hline(c, fx - 5, 31, 10, RGB(40, 30, 10));
-    } else {
-        gfx_fill(c, fx - 6, 18, 3, 3, RGB(40, 30, 10));
-        gfx_fill(c, fx + 4, 18, 3, 3, RGB(40, 30, 10));
-        if (won) gfx_fill(c, fx - 9, 17, 18, 4, RGB(20, 20, 30));
-        for (int i = -6; i <= 6; i++) gfx_pixel(c, fx + i, 31 - (i * i) / 12, RGB(40, 30, 10));
-    }
-    static const uint32_t numc[9] = {0, RGB(90, 150, 255), RGB(90, 200, 110), RGB(240, 90, 100), RGB(150, 110, 250),
-                                     RGB(220, 120, 60), RGB(70, 200, 210), RGB(230, 230, 230), RGB(150, 150, 150)};
+static int seconds(void) {
+    int secs = started ? (int)((((lost || won) ? t_end : n_clock_uptime_ms()) - t0) / 1000) : 0;
+    return secs > 999 ? 999 : secs;
+}
+
+static void draw_board(canvas_t *c) {
+    const struct ui_theme *t = &ui_theme;
+    static const uint32_t numc[9] = {0, RGB(110, 160, 255), RGB(111, 214, 160), RGB(240, 122, 122), RGB(170, 140, 250),
+                                     RGB(242, 160, 90), RGB(90, 210, 220), RGB(230, 230, 240), RGB(160, 160, 175)};
+    gfx_fill(c, 0, 0, BW, BH, t->background);
     for (int y = 0; y < GH; y++)
         for (int x = 0; x < GW; x++) {
-            int px = x * CS, py = TOP + y * CS;
+            float px = (float)(x * CS) + 1, py = (float)(y * CS) + 1, s = CS - 2;
             if (open_[y][x] || (lost && mine[y][x])) {
-                gfx_fill(c, px, py, CS, CS, RGB(36, 34, 54));
-                gfx_rect(c, px, py, CS, CS, RGB(28, 26, 42));
+                ui_round_fill(c, px, py, s, s, 4, mine[y][x] && open_[y][x] ? RGB(150, 52, 70) : t->surface);
                 if (mine[y][x]) {
-                    if (open_[y][x]) gfx_fill(c, px + 1, py + 1, CS - 2, CS - 2, RGB(170, 40, 60));
-                    gfx_fill_circle(c, px + CS / 2, py + CS / 2, 6, RGB(15, 15, 20));
-                    gfx_pixel(c, px + CS / 2 - 2, py + CS / 2 - 2, RGB(255, 255, 255));
+                    ui_round_fill(c, px + 6, py + 6, s - 12, s - 12, (s - 12) / 2, RGB(20, 18, 28));
+                    ui_round_fill(c, px + 8, py + 8, 3, 3, 1.5f, RGB(230, 230, 240));
                 } else {
                     int n = count(x, y);
                     if (n) {
-                        snprintf(buf, sizeof buf, "%d", n);
-                        gfx_text(c, px + 8, py + 4, buf, numc[n], TRANSPARENT, FONT_SMALL);
+                        char d = (char)('0' + n);
+                        float tw = ui_text_width(&d, 1, 14, 1), lh = ui_line_height(14, 1, NULL);
+                        ui_text(c, px + (s - tw) / 2, py + (s - lh) / 2, &d, 1, 14, 1, numc[n]);
                     }
                 }
             } else {
-                gfx_fill(c, px, py, CS, CS, RGB(84, 80, 130));
-                gfx_hline(c, px, py, CS, RGB(130, 126, 180));
-                gfx_vline(c, px, py, CS, RGB(130, 126, 180));
-                gfx_hline(c, px, py + CS - 1, CS, RGB(50, 46, 80));
-                gfx_vline(c, px + CS - 1, py, CS, RGB(50, 46, 80));
+                bool hot = x == hot_x && y == hot_y && !lost && !won;
+                ui_round_gradient(c, px, py, s, s, 4, hot ? t->controlHover : RGB(60, 56, 84), hot ? t->control : RGB(48, 45, 68));
                 if (flag[y][x]) {
-                    gfx_vline(c, px + 9, py + 5, 14, RGB(30, 30, 30));
-                    gfx_triangle(c, px + 10, py + 5, px + 10, py + 13, px + 18, py + 9, RGB(240, 70, 90));
-                    gfx_hline(c, px + 6, py + 19, 8, RGB(30, 30, 30));
+                    ui_line(c, px + 8, py + 5, px + 8, py + s - 5, 2, t->textDim);
+                    gfx_triangle(c, (int)px + 9, (int)py + 5, (int)px + 9, (int)py + 13, (int)px + 17, (int)py + 9, t->danger);
                 }
             }
         }
-    if (won) {
-        gfx_fill_blend(c, 0, TOP + H / 2 - 50, W, 60, ARGB(170, 10, 10, 30));
-        ui_text_center(c, 0, TOP + H / 2 - 44, W, "You win!", RGB(255, 230, 120), FONT_LARGE);
+    if (won || lost) {
+        const char *msg = won ? "You win!" : "Boom! Press New game";
+        float size = 22, lh = ui_line_height(size, 1, NULL), tw = ui_text_width(msg, strlen(msg), size, 1);
+        ui_round_fill(c, (BW - tw) / 2 - 20, (BH - lh) / 2 - 12, tw + 40, lh + 24, 12, ARGB(210, 22, 21, 29));
+        ui_text(c, (BW - tw) / 2, (BH - lh) / 2, msg, strlen(msg), size, 1, won ? t->warning : t->text);
+    }
+}
+
+static void counter(struct ui_msg *m, const char *icon, const char *text) {
+    ui_node(m, "row");
+    ui_num(m, "gap", 6);
+    ui_node(m, "icon"); ui_str(m, "icon", icon); ui_end(m);
+    ui_node(m, "text"); ui_str(m, "text", text); ui_num(m, "size", 18); ui_num(m, "weight", 1); ui_end(m);
+    ui_end(m);
+}
+
+static void show(struct ui_session *s) {
+    char mines_left[16], time[16];
+    snprintf(mines_left, sizeof mines_left, "%d", MINES - nflags);
+    snprintf(time, sizeof time, "%03d", seconds());
+    struct ui_msg m;
+    ui_view(&m, WINDOW);
+    ui_node(&m, "column"); ui_num(&m, "padding", PAD); ui_num(&m, "gap", PAD);
+        ui_node(&m, "row");
+            counter(&m, "info", mines_left);
+            ui_node(&m, "spacer"); ui_end(&m);
+            new_game = ui_node(&m, "button");
+            ui_str(&m, "text", "New game"); ui_str(&m, "icon", "refresh"); ui_end(&m);
+            ui_node(&m, "spacer"); ui_end(&m);
+            counter(&m, "clock", time);
+        ui_end(&m);
+        ui_node(&m, "surface"); ui_num(&m, "surface", BOARD); ui_num(&m, "pointer", 1);
+        ui_num(&m, "width", BW); ui_num(&m, "height", BH); ui_end(&m);
+    ui_end(&m);
+    ui_send(s, &m);
+}
+
+static void press(int x, int y, uint32_t buttons) {
+    if (lost || won || x < 0 || x >= GW || y < 0 || y >= GH) return;
+    if (buttons & 2) {
+        if (!open_[y][x]) {
+            flag[y][x] = !flag[y][x];
+            nflags += flag[y][x] ? 1 : -1;
+            sound_effect(flag[y][x] ? 900 : 600, flag[y][x] ? 1200 : 450, 25, SND_TRIANGLE);
+        }
+    } else if (buttons & 1) {
+        if (!started) plant(x, y);
+        bool was_open = open_[y][x] || flag[y][x];
+        reveal(x, y);
+        if (!was_open && !lost && !won) sound_effect(1800, 1400, 12, SND_TRIANGLE); /* a click */
     }
 }
 
 int main(void) {
     srand((unsigned)n_clock_uptime_ms());
-    window_t *w = win_open(W, H, "Minesweeper", 0);
-    if (!w) return 1;
+    struct ui_session *s = ui_session_new();
+    if (!s || ui_window(s, WINDOW, BW + 2 * PAD, BH + 3 * PAD + 40, 0, "Minesweeper", NULL, NULL) < 0) return 1;
+    canvas_t *board = ui_surface(s, BOARD, BW, BH, 0);
+    if (!board) return 1;
     reset();
-    draw(w);
-    win_update(w);
-    for (;;) {
-        struct gui_event e;
-        int r = win_event(w, &e, started && !lost && !won ? 1000 : -1);
-        if (r < 0) break;
-        if (r > 0) {
-            if (e.type == EV_CLOSE) break;
-            if (e.type == EV_KEY && e.pressed && e.key == NKEY_ESC) break;
-            if (e.type == EV_KEY && e.pressed && (e.key == 'n' || e.key == NKEY_F2)) reset();
-            if (e.type == EV_MOUSE_DOWN) {
-                if (e.y < TOP) {
-                    if (abs(e.x - W / 2) < 16) reset();
-                } else if (!lost && !won) {
-                    int x = e.x / CS, y = (e.y - TOP) / CS;
-                    if (x >= 0 && x < GW && y >= 0 && y < GH) {
-                        if (e.buttons & 2) {
-                            if (!open_[y][x]) {
-                                flag[y][x] = !flag[y][x];
-                                nflags += flag[y][x] ? 1 : -1;
-                                sound_effect(flag[y][x] ? 900 : 600, flag[y][x] ? 1200 : 450, 25, SND_TRIANGLE);
-                            }
-                        } else if (e.buttons & 1) {
-                            if (!started) plant(x, y);
-                            bool was_open = open_[y][x] || flag[y][x];
-                            reveal(x, y);
-                            if (!was_open && !lost && !won) sound_effect(1800, 1400, 12, SND_TRIANGLE); /* a click */
-                        }
-                    }
-                }
+    draw_board(board);
+    show(s);
+    int shown = -1;
+    for (bool running = true; running;) {
+        ui_session_wait(s, started && !lost && !won ? 250 : -1);
+        bool changed = false;
+        struct ui_event e;
+        char text[16];
+        while (ui_next_event(s, &e, text, sizeof text)) {
+            switch (e.type) {
+            case UI_EVENT_CLICK:
+                if (e.node == new_game) { reset(); changed = true; }
+                break;
+            case UI_EVENT_POINTER: {
+                int x = (int)e.a / CS, y = (int)e.b / CS;
+                if (e.a < 0 || e.b < 0) x = y = -1;
+                if (e.flags & UI_DOWN) { press(x, y, UI_BUTTONS(e.flags)); changed = true; }
+                if (x != hot_x || y != hot_y) { hot_x = x; hot_y = y; changed = true; }
+                break;
+            }
+            case UI_EVENT_KEY:
+                if (e.flags & UI_UP) break;
+                if (!strcmp(e.text, "Escape")) running = false;
+                else if (!strcmp(e.text, "n") || !strcmp(e.text, "F2")) { reset(); changed = true; }
+                break;
+            case UI_EVENT_CLOSE:
+                running = false;
+                break;
             }
         }
-        draw(w);
-        win_update(w);
+        if (!running || !ui_session_open(s)) break;
+        if (changed) {
+            draw_board(board);
+            ui_surface_changed(s, BOARD);
+        }
+        if (changed || seconds() != shown) {
+            shown = seconds();
+            show(s);
+        }
     }
-    win_close(w);
+    ui_session_free(s);
     return 0;
 }
