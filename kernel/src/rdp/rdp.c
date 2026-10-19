@@ -779,6 +779,19 @@ static void key(bool extended, bool extended1, bool release, uint8_t code) {
 
 static void mouse(struct rdp *c, uint16_t flags, int x, int y, bool extended) {
     struct mouse_event e = {0};
+    if (!extended && (flags & (PTRFLAGS_WHEEL | PTRFLAGS_HWHEEL))) {
+        /* a wheel event's xPos/yPos are not a position (clients send 0,0): the pointer stays where
+           it is, so the wheel goes to what is under it */
+        if (flags & PTRFLAGS_WHEEL) {
+            int rot = flags & 0xFF;
+            if (flags & PTRFLAGS_WHEEL_NEGATIVE) rot -= 256;
+            e.wheel = rot > 0 ? -MAX(1, rot / 120) : rot < 0 ? MAX(1, -rot / 120) : 0;
+        }
+        if (!e.wheel) return;
+        e.buttons = (uint8_t)c->mouse_buttons;
+        input_mouse(&e);
+        return;
+    }
     e.absolute = true;
     int sw = MAX(c->width - 1, 1), sh = MAX(c->height - 1, 1);
     x = MAX(0, MIN(x, sw));
@@ -786,16 +799,10 @@ static void mouse(struct rdp *c, uint16_t flags, int x, int y, bool extended) {
     e.x = (x * MOUSE_ABS_MAX + sw - 1) / sw; /* round up so the compositor maps it back to x */
     e.y = (y * MOUSE_ABS_MAX + sh - 1) / sh;
     if (!extended) {
-        if (flags & PTRFLAGS_WHEEL) {
-            int rot = flags & 0xFF;
-            if (flags & PTRFLAGS_WHEEL_NEGATIVE) rot -= 256;
-            e.wheel = rot > 0 ? -MAX(1, rot / 120) : rot < 0 ? MAX(1, -rot / 120) : 0;
-        } else if (!(flags & PTRFLAGS_HWHEEL)) {
-            int bit = (flags & PTRFLAGS_BUTTON1) ? 1 : (flags & PTRFLAGS_BUTTON2) ? 2 : (flags & PTRFLAGS_BUTTON3) ? 4 : 0;
-            if (bit) {
-                if (flags & PTRFLAGS_DOWN) c->mouse_buttons |= bit;
-                else c->mouse_buttons &= ~bit;
-            }
+        int bit = (flags & PTRFLAGS_BUTTON1) ? 1 : (flags & PTRFLAGS_BUTTON2) ? 2 : (flags & PTRFLAGS_BUTTON3) ? 4 : 0;
+        if (bit) {
+            if (flags & PTRFLAGS_DOWN) c->mouse_buttons |= bit;
+            else c->mouse_buttons &= ~bit;
         }
     }
     e.buttons = (uint8_t)c->mouse_buttons;
