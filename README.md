@@ -1,264 +1,373 @@
 # Nocturne OS
 
-*A small operating system for quiet nights.*
+*静かな夜のための、小さなオペレーティングシステム。*
 
-Nocturne is a hobby x86-64 operating system written from scratch: the kernel, a compositing window
-manager, a TCP/IP stack, a C library, a web browser engine, a shell, a terminal emulator and about 50 programs. It was
-written with an AI coding assistant (Claude Code) over several long sessions, and is meant for
-virtual machines (QEMU and Hyper-V); it has not been tried on real hardware. It is a toy, not a
-general-purpose OS: see [Limits](#limits). A few borrowed pieces of code are included:
-- Limine loads the kernel and the initial ramdisk.
-- BearSSL provides TLS.
-- Lexbor が HTML の字句解析・木構築を、QuickJS が JavaScript 言語の実行を担当します。ブラウザー API と描画は Nocturne 側の実装です。
-- WebAssembly は WABT の検証器と Store を基盤に、wasm2c の生成 C を Nocturne 内の TCC でコンパイルし、Window／Worker のブラウザー内でネイティブ実行します。変換未対応の命令は理由を記録してインタープリターへ戻します。Module／Instance／Memory／Table／Global、Promise／buffered streaming API、本物の JSPI（Suspending／promising の中断・再開・取消）を接続し、`/bin/wasm2c` と C ランタイムも同梱しています。Core 3.0 全体への適合、共有メモリ／Atomics、Module の Worker 転送、GC／文字列組込みの全面対応は意味しません。Puter の Firefox Wasm は Launch 実クリックまで確認しましたが、Atomics.waitAsync 不足で Firefox 本体の起動は未達です。
-- TinyCC is the C compiler that runs inside the OS.
-- 限定したFFmpeg 9.0.2のC decoderを、Nocturne固有のIO・音声・動画表示に移植しています。
-- stb_truetype, stb_image, JebP and NanoSVG read fonts and images for the web browser, which draws text in Inter.
+[English](README_EN.md)
 
-Nocturne also has an **AI agent**. `agent` connects to an LLM over HTTPS, and the model can then run
-commands, write C, compile it with `tcc`, start it and look at the screen to check the result.
-Everything it writes is kept on a persistent disk.
+Nocturne は、ゼロから書いた x86-64 の趣味の OS です。カーネル、合成ウィンドウマネージャー、
+TCP/IP、C ライブラリー、Web ブラウザーのエンジン、シェル、端末、約 55 本のアプリが入っています。
+AI のコーディング支援（Claude Code など）と長い対話を重ねて書きました。
 
-Nocturne has its own **web browser**. HTML and CSS (block, inline, float, table, flexbox and grid
-layout) are parsed, laid out and painted by an engine written for Nocturne.
-QuickJS の実験的な統合がありますが、ブラウザー API は未完成です。
-**現時点で YouTube、DeepMind、通常版 DuckDuckGo、ChatGPT の正常動作は確認できていません。**
-実サイトの QEMU 検証結果と残課題は [検証記録](docs/browser-validation-2026-10-06.md) を参照してください。
-その後の JavaScript・Shift_JIS 修正と実サイト再検証は [追補](docs/browser-js-progress-2026-10-06.md) に記録しています。指定4サイトの全面動作は未達成です。
-実サイトで判明した microtask 再帰と Nocturne のメモリ不足時処理の修正は [続報](docs/browser-native-progress-2026-10-06.md) に記録しています。
-Google・GitHub・HTML5test・百度百科を加えた実機検証と、XHR・独立Document・SVGの修正は [互換性の拡大検証](docs/browser-web-compatibility-2026-10-06.md) を参照してください。表示の部分成功と、サイト操作の未達を区別しています。
-HTML tokenizer／tree builder は Lexbor へ移行しました。Nocturne の DOM・描画・OS API を維持した統合範囲と、実サイトで残る失敗は [Lexbor 統合記録](docs/browser-lexbor-2026-10-06.md) に記載しています。ブラウザー全体の互換性が完成したわけではありません。
-その後の属性ノード・DOMTokenList・HTML要素・Fetch/Abortとnative通信の一括拡張は [API拡張記録](docs/browser-api-batch-2026-10-06.md) を参照してください。未実装のstream/CSSOM等を対応済みとはしていません。
-Shadow DOM・Intl.Collator・TCP接続枠の拡張と2 GiB QEMUでの検証は [次の拡張記録](docs/browser-shadow-intl-network-2026-10-06.md) に記載します。実装範囲と未達項目を区別しています。
-HTML要素・日時/数値入力・フォーム検証・複数選択・detailsの追加は [要素とフォームの拡張記録](docs/browser-elements-forms-2026-10-07.md) に記載します。HTML5testの検出結果と、実際のGUI・サイト動作は別に確認します。
-CPU/AP worker、実Canvas、限定virgl、FFmpegとGUI/browser再生の追加は [CPU・描画・メディア統合記録](docs/platform-progress-2026-10-07.md) を参照してください。全面SMP・WebGL・配信サイト全般・日常利用OSの完成とは区別しています。
+**Nocturne は UNIX でも POSIX でもありません。** GUI を第一にした独自の OS で、プログラムは
+Nocturne 独自のネイティブ API（文書・フォルダー・チャンネル・アプリ・イベントのハンドル）で
+システムを使います。`fork`、ファイル記述子、シグナル、`unistd.h` はありません。
+他の OS のプログラムは、Nocturne を合わせるのではなく、プログラムの側をネイティブ API へ移植します。
 
-![Desktop and start menu](docs/desktop-menu.png)
+主に仮想マシン（QEMU と Hyper-V）で動かしていますが、実機でも USB メモリーから起動し、
+デスクトップ、ブラウザー、USB キーボード・マウス、有線 LAN が動くところまで来ています。
+おもちゃの OS であり、日常に使える汎用 OS ではありません（[制約](#制約)）。
+
+![デスクトップとスタートメニュー](docs/desktop-menu.png)
 
 | | |
 |---|---|
-| ![Terminal](docs/terminal.png) | ![Text editor](docs/editor.png) |
-| ![Paint](docs/paint.png) | ![System monitor](docs/sysmon.png) |
-| ![Mandelbrot](docs/mandelbrot.png) | ![3D shapes](docs/shapes.png) |
+| ![端末](docs/terminal.png) | ![テキストエディター](docs/editor.png) |
+| ![ペイント](docs/paint.png) | ![システムモニター](docs/sysmon.png) |
+| ![マンデルブロ集合](docs/mandelbrot.png) | ![3D 図形](docs/shapes.png) |
 
-## What's inside
+## 特徴
 
-**Kernel** (`kernel/`, about 13,500 lines of C)
-- Boots through Limine (BIOS or UEFI) into a higher-half x86-64 kernel.
-- Memory: physical page allocator, 4-level paging, kernel heap, and a separate address space for every process.
-  - W^X: no page is both writable and executable. ELF segments are mapped with their own permissions, the stack and heap are no-execute (NX), and the kernel's own code, read-only data and data are mapped separately. Write protection also applies in ring 0.
-  - `mmap`, `munmap` and `mprotect` are real, which is how `tcc -run` gets executable memory for the code it just compiled.
-- Processes: ring-3 user processes with ELF loading, preemptive scheduling (1 kHz local APIC timer, or the PIT), `int 0x80` system calls, `spawn` and `waitpid`, process trees, and `kill`.
-- Files: a VFS with a RAM filesystem (populated from a tar initrd), `/dev` (console, null, zero, random, audio, volume), pipes, and `poll`.
-- Persistent storage: ATA PIO and Hyper-V SCSI disk drivers and a FAT32 filesystem (read and write), which is mounted at `/data`.
-- Drivers: PS/2 keyboard and wheel mouse, framebuffer, serial, CMOS clock, PCI enumeration, and ACPI power-off and reboot.
-- Sound: every open of `/dev/audio` is a stream of 48 kHz stereo samples. The kernel mixes the streams, applies the master volume (`/dev/volume`) and plays them on an Intel AC'97 card (QEMU, VirtualBox), or sends them to the Enhanced Session's client. See [Sound](#sound).
-- Hyper-V: VMBus and its synthetic devices, so Nocturne runs in a Generation 2 VM. See [Running it in Hyper-V](#running-it-in-hyper-v).
-  - Keyboard, absolute mouse, SCSI disks and network adapter.
-  - Heartbeat, graceful shutdown and restart from Hyper-V Manager, the host's clock (time sync), and the key-value exchange, so Hyper-V Manager shows the VM's IP address and OS.
-  - Hyper-V sockets, and an RDP server on them for VMConnect's **Enhanced Session**: the desktop takes the size of the VMConnect window, text copied on either side pastes on the other, and sound plays on the host.
-- Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware), the DEC 21140 "tulip" (Hyper-V's legacy network adapter) and Hyper-V's synthetic adapter, and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client.
-  - TCP keeps out-of-order segments and reassembles them, and does NewReno congestion control (slow start, fast retransmit and fast recovery) with a retransmission timeout taken from the measured round-trip time.
-- Graphics: a compositing window manager. It runs in the kernel, which keeps it simple and fast, but a bug in it can bring the whole system down.
-  - Window buffers are shared memory and redraws are damage-tracked.
-  - Windows have drop shadows and can be dragged, resized, maximized and minimized.
-  - The desktop has a taskbar, start menu, desktop icons, toast notifications and a clipboard.
-  - The night-sky wallpaper is generated procedurally.
+- **カーネル**：Limine で BIOS・UEFI から起動。複数 CPU で動くユーザースレッド、公平スケジューラー「継」、
+  W^X を守るメモリー管理、ネイティブのシステムコール ABI。
+- **デスクトップ**：カーネル内の合成ウィンドウマネージャー。影、二重バッファー、タスクバー、スタートメニュー、
+  通知、クリップボード、夜空の壁紙。既定の解像度は 1920×1080。
+- **Web ブラウザー**：HTML の木構築に Lexbor、JavaScript に QuickJS を使い、DOM・CSS・レイアウト・描画・
+  Web API は Nocturne で実装しています。Worker、IndexedDB、WebSocket、WebGL（Mesa のソフトウェア描画）、
+  WebAssembly、動画（FFmpeg、MSE）、開発者ツールがあります。
+- **ネットワーク**：自前の TCP/IP（TCP の接続と待受け、ウィンドウスケーリング、ループバック）、DHCP、DNS、
+  HTTP/1.1・HTTP/2、BearSSL による TLS 1.2。
+- **開発**：OS の中で C をコンパイルする TinyCC、JavaScript・TypeScript の実行環境 `js`、
+  TypeScript 7 のコンパイラー `tsgo`、Go の移植（`GOOS=nocturne`）、ホストからの C++20。
+- **AI エージェント**：`agent` が HTTPS で LLM につながり、コマンドの実行、C の作成とコンパイル、
+  画面の確認までを OS の中で行います。
+- **Hyper-V**：第 2 世代 VM の合成デバイス、統合サービス、拡張セッション（RDP サーバー）。
 
-**Userland** (`user/`)
-- libc: stdio, `printf` with correctly rounded floating point, `malloc`, string, math and time functions, `qsort`, `strtod`, `setjmp`, and more. It is a subset of C99/POSIX, not a complete one.
-  - It also includes an HTTP/1.1 client with HTTPS, a JSON parser and builder, and a PNG encoder.
-  - The web engine (`user/libc/web/`, about 11,000 lines): an HTML parser, CSS cascade and layout, and painting with anti-aliased TrueType text, images and gradients. See [The web browser](#the-web-browser).
-- Shell (`sh`):
-  - Pipes, redirection (`< > >> 2>`), `&`, `;`, `&&` and `||`, quoting, globbing, `$?` and script arguments (`$1`, `$#`, `$@`). There are no variables, `if` or loops.
-  - History, tab completion and scripts.
-- Terminal: ANSI colours, UTF-8, scrollback, copy and paste, and resizing.
-- Command-line tools: `ls cat cp mv rm mkdir touch tree grep wc head hexdump echo ps kill free uptime date uname dmesg lspci sleep clear reboot poweroff neofetch fortune moonsay`
-- Sound: `beep` (tones and melodies), `play` (WAV files) and `volume`, for scripts; everything they do can be done from the desktop.
-- Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP and HTTPS client).
-- Development: the `tcc` C compiler, with headers and a static libc in `/usr`. The source of every program in `/bin` is in `/usr/src/apps`.
-  - `js` runs JavaScript and TypeScript, and `tsgo` is the TypeScript 7 compiler. See [JavaScript と TypeScript](#javascript-と-typescript).
-- `agent`: the AI agent (see below). `screenshot` saves the screen as a PNG.
-- Desktop apps: Web Browser, Files, Text Editor, Paint, Calculator, Clock, System Monitor, Piano and Sound Player. The taskbar's speaker sets the volume.
-- Games and toys: Snake, Tetris, Minesweeper (all three with sound effects), Mandelbrot, 3D Shapes and Game of Life.
+## 中身
 
-## Running it in Hyper-V
+### カーネル（`kernel/`、C とアセンブリーで約 29,000 行）
 
-You need Windows with Hyper-V enabled. Run this once from an **elevated** (administrator) PowerShell in this folder:
+- **起動**：Limine（BIOS・UEFI）から上位半分の 64 ビットカーネルへ。起動メニューには既定の
+  1920×1080、1024×768、文字コンソールだけ（`nogui`）の 3 項目があります。
+- **CPU**：最大 16 CPU。CPU 0（BSP）がカーネル、割り込み、ドライバー、GUI、ネットワークを持ち、
+  ほかの CPU（AP）はそれぞれ自分の実行キューでアプリのスレッドを動かします。
+  - スケジューラー「継」（`sys/kei.c`、`sys/sched.c`）：重み付きの仮想時間による公平な選択、
+    AP ごとのキュー、空いた AP によるスレッドの取得、切替えの費用を考えた保持。
+  - IPI による TLB の撃ち落とし、PCID、XSAVE による AVX 状態の保存、
+    実機での CPPC・HWP による最高性能の設定、サンプリングによるプロファイラー（`prof`）。
+  - 時計は 1 kHz のローカル APIC タイマー（無ければ PIT）。刻みは TSC か Hyper-V の参照時計から求めます。
+- **メモリー**：4 段のページング、アプリごとのアドレス空間、カーネルヒープ。
+  - W^X：書込み可能かつ実行可能なページは作りません。生成したコードは書いてから実行可能へ切り替えます。
+  - ネイティブのメモリー API（`n_memory_reserve`・`protect`・`release`）と共有ページ。
+    共有ページはチャンネルのメッセージに添付してだけ他のアプリへ渡せます。
+  - initrd は RAM のルートへ展開したあと、元の書庫のページを解放します。
+- **ファイル**：ルートは RAM（initrd から作成、再起動で消えます）。`/data` は `NOCTDATA` という
+  名前の FAT32 で、再起動しても残ります。MBR・GPT・パーティションなしのどれでも見つけます。
+- **ドライバー**
+  - 記憶装置：ATA（PIO）、NVMe、USB 大容量記憶装置（BOT＋SCSI）、Hyper-V の SCSI。
+  - USB：xHCI、USB 2.0 と SuperSpeed のハブ、HID のキーボード・マウス。
+  - 入力：PS/2 のキーボードとホイールマウス、Hyper-V の合成キーボードと絶対座標マウス、USB HID。
+  - ネットワーク：Intel e1000、DEC 21140／21143（tulip）、Hyper-V の合成アダプター、
+    Realtek RTL8125B（2.5GbE）、USB Ethernet（CDC ECM／NCM）。
+  - 画面：Limine が渡すフレームバッファー。virtio-gpu（virgl）は試験的で、既定では使いません（`gpu-enable`）。
+  - 音：Intel AC'97 と、拡張セッションへの音声送信。
+  - そのほか：ACPI の表（電源断と再起動）、PCI と PCIe ECAM、MSI／MSI-X、PAT、CMOS 時計、シリアル、乱数。
+- **GUI**：ウィンドウマネージャーはカーネルのスレッドで動きます。単純で速い反面、その不具合はシステム全体を止めます。
+  - 窓の画素はアプリと共有するメモリーで、変わった部分だけを描き直します。合成と画面への転送は AP にも分けます。
+  - 二重バッファーの窓と描画完了のイベント（`EV_FRAME`）、合成の周期（`wmrefresh`、既定 120 Hz）。
+  - 影、角の丸いタイトルバー、移動・大きさの変更・最大化・最小化・全画面。
+  - タスクバー（スタートボタン、窓のボタン、音量、日付と時刻）、スタートメニュー、通知、1 MiB までのクリップボード。
+  - カーネルの文字は GNU Unifont Japanese 18.0.01 のビットマップ（57,086 字形、半角 8×16・全角 16×16）です。
+- **Hyper-V**：VMBus と合成デバイス、ハートビート、Hyper-V マネージャーからの終了と再起動、時刻の同期、
+  KVP（VM の IP アドレスと OS を表示）、Hyper-V ソケット、その上の拡張セッション用 RDP サーバー。
+
+### ネイティブ API
+
+プログラムから見た Nocturne です（`user/include/nocturne.h`、`common/abi.h`、
+設計は [docs/nocturne-native-abi.md](docs/nocturne-native-abi.md)）。
+
+- **ハンドル**：資源はすべて種類付きのハンドルです（文書、フォルダー、チャンネル、窓、共有ページ、アプリ、
+  イベント、装置、接続）。失敗は負の `N_ERR_*` で返り、`n_result_text` で説明を得られます。
+- **文書とフォルダー**：いつも `/` で始まる完全なパスで扱います。カーネルには作業フォルダーも読み書き位置もありません。
+  シェルの現在のフォルダーは設定 `FOLDER=` でアプリへ渡ります。文書全体の読込み・原子的な保存・追記、
+  位置を指定した読み書き、排他の取得があります。
+- **チャンネル**：双方向のメッセージ通信で、パイプの代わりです。文書や共有ページのハンドルを添付できます。
+  名前を付けて待ち受け、接続することもできます。
+- **アプリ**：`n_app_launch` で引数・設定・渡すハンドルを指定して起動し、`n_app_result` で結果を受け、
+  `n_app_stop` で止めます。シグナルはありません。端末は設定 `TERMINAL=0 1 2`、Ctrl+C は `INTERRUPTS=3` の
+  チャンネルに届くメッセージです。
+- **イベント**：レベル型のイベントキューで、受信可能・送信可能・終了・アプリ終了・タイマー・アドレスを待ちます。
+- **スレッド**：`thread_create` などのネイティブスレッドと、アプリをまたいで使える `wait_on_address`。
+  C11 の `<threads.h>` もあります。
+- **そのほか**：音声ストリーム（`n_audio_*`）、窓（`win_open` など）、時計、乱数、システム情報、
+  TCP・UDP・DNS（下の[ネットワーク](#ネットワーク)）。
+
+その上に ISO C のライブラリー（`stdio`、`stdlib`、`string`、`math`、`time`、`threads` など）があります。
+POSIX のヘッダー（`unistd.h`、`fcntl.h`、`sys/*.h`）は意図して用意していません。
+
+### ユーザーランド（`user/`）
+
+- **libc**：ネイティブ API と ISO C11 の一部（正しく丸める浮動小数点の `printf`、`strtod`、`qsort`、`setjmp` など）。
+  - HTTP/1.1・HTTP/2 と HTTPS のクライアント、JSON の解析と組立て、PNG の書出し。
+  - 描画（`gfx.h`）、TrueType（`font.h`）、画像の読込み（`image.h`）、FFmpeg による音声・動画の復号（`media.h`）、
+    並列処理（`parallel.h`）。
+  - Web エンジン（`user/libc/web/`、C で約 54,000 行と JavaScript で約 42,000 行）。[Web ブラウザー](#web-ブラウザー)を参照。
+- **シェル**（`sh`）
+  - パイプ（チャンネル）、リダイレクト（`< > >> 2>`）、`&`、`;`、`&&`、`||`、引用符、`*` と `?` の展開、`~`、`#` の注釈。
+  - `$?` とスクリプトの引数（`$0`〜`$9`、`$#`、`$@`）。変数、`if`、繰返しはありません。
+  - 履歴、Tab 補完、`cd`・`pwd`・`history`・`help`。
+- **端末**：16 色の ANSI、UTF-8、1000 行のスクロールバック、画面のコピーと貼付け、大きさの変更。
+  全角文字は 1 マスで表示され、2 マス幅の処理はまだありません。
+- **コマンド**：`ls cat cp mv rm mkdir rmdir touch tree grep wc head hexdump echo sleep date uptime uname
+  ps kill free dmesg lspci clear true false reboot poweroff neofetch fortune moonsay screenshot`
+- **ネットワーク**：`ifconfig`、`ping`、`host`（DNS）、`fetch`（HTTP・HTTPS）。
+- **音**：`beep`（音と旋律）、`play`（WAV）、`volume`。どれもデスクトップからもできることで、スクリプト用です。
+- **開発**：`tcc`、`js`、`tsgo`、`wasm2c`、`cppdemo`。`/bin` のすべてのアプリのソースは `/usr/src/apps` にあります。
+- **AI**：`agent`（[AI エージェント](#ai-エージェント)）。
+- **デスクトップのアプリ**：端末、ファイル、Web ブラウザー、テキストエディター、ペイント、電卓、時計、
+  システムモニター、ピアノ、サウンドプレーヤー、メディアプレーヤー、Nocturne について。
+- **ゲームとおもちゃ**：スネーク、テトリス、マインスイーパー（3 つとも効果音付き）、マンデルブロ集合、3D 図形、ライフゲーム。
+
+## 動かす
+
+### QEMU
+
+[ビルド](#ビルド)のあと、次のどちらかで QEMU を起動します。
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File hyperv.ps1
+powershell -ExecutionPolicy Bypass -File build.ps1 run
 ```
 
-This creates a **Generation 2** VM called `Nocturne` with the following settings:
-- 512 MB of static memory and 1 CPU.
-- Secure Boot off (the boot loader is not signed).
-- The boot disk (`hyperv\Nocturne-boot.vhdx`) on SCSI 0:0 and the [data disk](#persistent-storage-data) on SCSI 0:1.
-- A network adapter on the **Default Switch**, so the VM gets an address by DHCP and can reach the internet.
-- The Enhanced Session over Hyper-V sockets. If the host has Enhanced Session Mode turned off, the script turns it on.
-- No checkpoints.
-- COM1 connected to `\\.\pipe\nocturne-com1`.
+`build.ps1 run`（`make run`）は既定で 2048 MiB、4 CPU、TCG（エミュレーション）です。
+`make run QEMU_ACCEL=whpx QEMU_MEMORY=4096M` のように変数で変えられます。
+音は AC'97、ネットワークは QEMU 既定の e1000 とユーザーモードの NAT です。
 
-The script then starts the VM and opens a VMConnect window.
+WHPX では起動ディスクを IDE につなぐと、Limine が約 450 MB の initrd を IDE の PIO で読むため、
+カーネルが始まるまで約 3 分かかります。起動ディスクを AHCI につなぐと約 8 秒です。開発で使っている構成は次のとおりです。
 
-**Enhanced Session.** VMConnect asks for a display size once Nocturne is up. That is the Enhanced
-Session: VMConnect connects to the RDP server inside Nocturne, and the desktop takes the size you
-pick. When a client resizes its window it sends the new size over the display control channel,
-and the desktop follows it. Keyboard and mouse go through the same connection, with no mouse capture, and so does the
-clipboard: text copied in Windows pastes in Nocturne (Ctrl+V in the Text Editor and the browser's
-address bar, Ctrl+Shift+V in the terminal), and text copied in Nocturne (Ctrl+C, or Ctrl+Shift+C
-for the terminal's screen) pastes in Windows. Sound plays through the host's speakers (VMConnect's
-**Local Resources > Remote audio** setting must be "Play on this computer", its default). Choose
-**View > Enhanced Session** to switch back to the basic console, which shows the desktop at the
-framebuffer's size. Nocturne returns to that size when the Enhanced Session ends.
+```powershell
+& "C:\Program Files\qemu\qemu-system-x86_64.exe" -M pc -accel whpx -smp 4 -m 4096M -vga std `
+  -device ahci,id=ahci `
+  -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on `
+  -device ide-hd,drive=boot,bus=ahci.0,bootindex=0 `
+  -drive file=build/data.img,format=raw,if=ide,index=1 `
+  -audiodev dsound,id=snd -device AC97,audiodev=snd -serial stdio
+```
 
-Other options:
+カーネルには AHCI のドライバーがないので、`/data` のディスク（`data.img`）は IDE のままにします。
 
-| Command | What it does |
+### Hyper-V
+
+Hyper-V を有効にした Windows で、このフォルダーから**管理者の** PowerShell で一度だけ実行します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File hyperv.ps1 -MemoryMB 4096
+```
+
+`Nocturne` という名前の**第 2 世代** VM を作り、起動して VMConnect を開きます。設定は次のとおりです。
+- 静的メモリー（既定は 512 MB）と 1 CPU。起動イメージは約 450 MB の initrd を RAM に展開するので、
+  `-MemoryMB` で増やしてください（開発の試験は 4096 MiB で行っています）。CPU 数は Hyper-V マネージャーで増やせ、
+  カーネルは増やした CPU を使います。
+- セキュアブートは無効（ブートローダーは署名されていません）。チェックポイントなし。
+- 起動ディスク（`hyperv\<名前>-boot.vhdx`）は SCSI 0:0、[データディスク](#永続ストレージdata)
+  （`hyperv\<名前>-data.vhdx`、2 GB の可変長）は SCSI 0:1。
+- ネットワークアダプターは **Default Switch** につなぐので、DHCP でアドレスを得てインターネットへ出られます。
+- 拡張セッションは Hyper-V ソケットで使います。ホストで拡張セッションモードが切れていれば、スクリプトが有効にします。
+- COM1 は `\\.\pipe\<名前の小文字>-com1` につながります。
+
+**拡張セッション**：Nocturne が起動すると、VMConnect が画面の大きさを尋ねます。VMConnect は Nocturne の中の
+RDP サーバーにつながり、デスクトップは選んだ大きさになります。窓の大きさを変えると、デスクトップもそれに合わせます。
+キーボードとマウス（マウスのキャプチャーなし）、クリップボードの文字（Windows でコピーしたものを Nocturne の
+エディターやアドレス欄で Ctrl+V、端末では Ctrl+Shift+V。逆方向は Ctrl+C、端末の画面は Ctrl+Shift+C）、
+音（VMConnect の**ローカル リソース > リモート オーディオ**が既定の「このコンピューターで再生する」のとき）も
+同じ接続で届きます。**表示 > 拡張セッション**で基本のコンソールに戻すと、フレームバッファーの大きさで表示します。
+
+そのほかの使い方：
+
+| コマンド | 内容 |
 |---|---|
-| `hyperv.ps1 -Update` | Copy a freshly built disk into the existing VM and restart it. The VM keeps its generation. |
-| `hyperv.ps1 -Generation 1` | Create a Generation 1 VM instead (see below). |
-| `hyperv.ps1 -Iso` | Boot from `build\nocturne.iso` on the DVD drive instead of the disk. |
-| `hyperv.ps1 -Remove` | Delete the VM. |
-| `hyperv.ps1 -NoNetwork` | Create the VM without a network adapter. |
-| `hyperv.ps1 -Switch "Name"` | Connect the network adapter to a different virtual switch. |
-| `hyperv.ps1 -Name Foo -MemoryMB 1024` | Use a different VM name and memory size. |
+| `hyperv.ps1 -Update` | 新しくビルドした起動ディスクを既存の VM へコピーして再起動します。データディスクは残します。ビルド成果物が kernel.elf や initrd.tar より古ければ拒否します。 |
+| `hyperv.ps1 -Generation 1` | 第 1 世代の VM を作ります（下記）。 |
+| `hyperv.ps1 -Iso` | ディスクの代わりに `build\nocturne.iso` を DVD ドライブから起動します。 |
+| `hyperv.ps1 -Remove` | VM を削除します。データディスクは `-DeleteData` を付けたときだけ消します。 |
+| `hyperv.ps1 -NoStart` | VM を作るだけで起動しません。 |
+| `hyperv.ps1 -NoNetwork` | ネットワークアダプターなしで作ります。 |
+| `hyperv.ps1 -Switch "名前"` | 別の仮想スイッチにつなぎます。 |
+| `hyperv.ps1 -Name Foo -MemoryMB 4096` | VM の名前とメモリーを変えます。 |
+| `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | AI エージェントの API キーをデータディスクへ書きます（`-Endpoint`、`-Model` も指定可）。 |
 
-To create a Gen 2 VM by hand instead, turn Secure Boot off and attach `build\nocturne.vhdx` as a SCSI
-disk. Set `Set-VM -EnhancedSessionTransportType HvSocket` for the Enhanced Session.
+手で第 2 世代の VM を作るなら、セキュアブートを切って `build\nocturne.vhdx` を SCSI ディスクとしてつなぎ、
+拡張セッションには `Set-VM -EnhancedSessionTransportType HvSocket` を設定します。
 
-**Generation 1** emulates a legacy PC. Nocturne drives it too: `build\nocturne.vhd` on IDE, the data
-disk on IDE 0:1 and a *legacy* network adapter (an emulated DEC 21140). VMConnect shows the basic
-console only.
+**第 1 世代**は旧来の PC を模倣します。`build\nocturne.vhd` を IDE に、データディスクを IDE 0:1 に、
+*レガシー*ネットワークアダプター（DEC 21140 の模倣）をつなぎます。VMConnect は基本のコンソールだけです。
 
-**Tips for VMConnect**
-- In the basic console, click inside the window to capture the mouse. **Ctrl+Alt+Left Arrow** releases it.
-- The Windows key only reaches the VM in full-screen mode. Use **Ctrl+Esc** to open the start menu instead.
-- The boot menu has a **1024x768** entry and a **text console only** entry, in case the default 1920x1080 mode isn't available (Limine also falls back to a mode the firmware offers).
-- Kernel log: connect any named-pipe client, such as PuTTY (Serial, `\\.\pipe\nocturne-com1`), to COM1. `scripts\hv-serial.ps1` copies it to a file.
-- **Mouse moving up when you move down?** On Gen 1, Hyper-V on Windows 11 hosts reports the emulated PS/2 mouse's vertical axis backwards. Nocturne detects Hyper-V (and the host build) and flips the axis itself. If it guesses wrong on your host, press **E** on the boot menu entry and add `cmdline: mouse_y=normal` (or `mouse_y=invert`).
+**VMConnect のこつ**
+- 基本のコンソールでは、窓の中をクリックするとマウスを捕まえます。**Ctrl+Alt+←** で離します。
+- Windows キーは全画面のときしか VM へ届きません。スタートメニューは **Ctrl+Esc** で開けます。
+- 1920×1080 が使えない環境のために、起動メニューに 1024×768 と文字コンソールだけの項目があります。
+  1920×1080 が無いときは Limine がファームウェアのモードを選びます。
+- カーネルのログは COM1 です。PuTTY などの名前付きパイプのクライアント（Serial、`\\.\pipe\nocturne-com1`）で
+  見られます。`scripts\hv-serial.ps1` はファイルへ書き写します。
+- **下へ動かすとマウスが上へ動く場合**：第 1 世代では、Windows 11 ホストの Hyper-V が模倣 PS/2 マウスの縦軸を
+  逆に報告します。Nocturne は Hyper-V（とホストのビルド）を見分けて自分で軸を反転します。合わないときは
+  起動メニューの項目で **E** を押し、`cmdline` に `mouse_y=normal`（または `mouse_y=invert`）を足してください。
 
-**Development scripts** (`scripts\`, elevated):
+**開発用のスクリプト**（`scripts\`、管理者で実行）：
 
-| Script | What it does |
+| スクリプト | 内容 |
 |---|---|
-| `hv-boot.ps1 -Name VM -Build` | Build, refresh the VM's boot media, boot, record COM1 and take a console screenshot. |
-| `hv-esm.ps1 -Name VM` | Open an Enhanced Session in VMConnect and save a picture of the window. |
-| `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | Test the Enhanced Session without VMConnect: a small RDP client types and clicks, and saves the desktop it receives as a PNG. `clip:TEXT` and `chord:1d,2a,2f` test the clipboard, `resize:1600x900` a window resize. The sound the server sends is saved as a WAV next to the PNG, with the tones in it listed. |
-| `hv-shot.ps1 -Name VM` | Screenshot the VM's console without VMConnect. |
-| `hv-sock.ps1 -Name VM -Port N` | Connect to a Hyper-V socket service in the guest from the host. |
-| `hv-serial.ps1 -Pipe P -Log F` | Copy a COM port pipe to a log file. |
+| `hv-boot.ps1 -Name VM -Build` | ビルドし、VM の起動媒体を更新して起動し、COM1 を記録してコンソールを撮ります。 |
+| `hv-esm.ps1 -Name VM` | VMConnect で拡張セッションを開き、窓の画像を保存します。 |
+| `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | VMConnect なしで拡張セッションを試します。小さな RDP クライアントが打鍵・クリックし、受け取った画面を PNG に保存します。`clip:TEXT` と `chord:1d,2a,2f` はクリップボード、`resize:1600x900` は窓の大きさの変更を試します。受け取った音は PNG の隣に WAV で保存し、含まれる音の高さを一覧にします。 |
+| `hv-input.ps1 -Name VM -Steps "text:...","click:1"` | 基本のコンソールへキーボードとマウスの入力を送ります。 |
+| `hv-shot.ps1 -Name VM` | VMConnect なしで VM のコンソールを撮ります。 |
+| `hv-sock.ps1 -Name VM -Port N` | ホストからゲストの Hyper-V ソケットのサービスへつなぎます。 |
+| `hv-serial.ps1 -Pipe P -Log F` | COM ポートのパイプをログファイルへ書き写します。 |
 
-## Building
+### 実機
 
-Everything needed is in `tools/`:
-- A portable MSYS2 with clang, lld, nasm, mtools, xorriso, qemu and python.
-- Limine.
+`build\nocturne.img`（MBR の FAT32、BIOS・UEFI の両方で起動）を USB メモリーへ書き込み、
+セキュアブートを切って起動します。12 スレッドの AMD 機（USB 起動、RTL8125B の有線 LAN、USB の
+キーボード・マウス）で、デスクトップとブラウザーでの動画ページの表示まで確認しました。まだ初期段階です。
+- 手順書や対応機種の一覧はありません。
+- 音は出ません（HD Audio は未対応）。GPU のドライバーはなく、ファームウェアの画面モードを使います。
+- `/data` を残すには、どれかのディスク（USB メモリー、NVMe など）に `NOCTDATA` という名前の
+  FAT32 ボリュームが必要です。無ければ `/data` は RAM になり、再起動で消えます。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1          # build everything into .\build
-powershell -ExecutionPolicy Bypass -File build.ps1 run      # build and boot in QEMU
-powershell -ExecutionPolicy Bypass -File build.ps1 clean
-```
+## ビルド
 
-Outputs in `build\`:
-- `nocturne.img`: raw MBR disk, used by QEMU.
-- `data.img`: the persistent `/data` disk for QEMU.
-- `nocturne.vhd`: fixed VHD for Hyper-V Generation 1.
-- `nocturne.vhdx`: dynamic VHDX for Hyper-V Generation 2.
-- `nocturne.iso`: hybrid BIOS/UEFI ISO.
-
-QEMU の通常起動・試験用 RAM は既定 2 GiB です。通常起動は `make run QEMU_MEMORY=2048M`、
-試験は `python scripts/test.py --memory 2048` で明示指定できます。Hyper-V の既存 VM 設定は変更しません。
-
-## Tests
+ホストは Windows です。ツール一式は `tools/` に置きます（リポジトリーには含まれず、`.gitignore` されています）。
+- `tools/msys64`：MSYS2（UCRT64）。clang 22、lld、nasm、mtools、xorriso、Python、make、QEMU。
+- `tools/limine`：Limine のバイナリー。
+- `tools/mesa-tools`：Mesa の解析器を作り直すときの bison・flex・m4。
+- ホストの LLVM 18.1.8（`C:\Program Files\LLVM\bin`、`NOCTURNE_LLVM_BIN` で変更可）：C++ のアプリと
+  WebAssembly の部分に使います。libc++ は llvm-project の `llvmorg-18.1.8` から取り出し
+  （`NOCTURNE_LLVM_SOURCE`）、`build/cxx` に保存して使い回します。
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1 test        # 全体試験（所要時間は環境による）
-powershell -ExecutionPolicy Bypass -File build.ps1 test-quick  # skips compiling every app
-powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # adds tcc rebuilding itself inside the OS
+powershell -ExecutionPolicy Bypass -File build.ps1          # すべてを .\build へビルド
+powershell -ExecutionPolicy Bypass -File build.ps1 run      # ビルドして QEMU で起動
+powershell -ExecutionPolicy Bypass -File build.ps1 clean    # build を消す（data.img は残す）
+python -X utf8 scripts/build.py -j 8 cxx                    # Makefile の任意の目標（cxx、bitmap-fonts など）
 ```
 
-`scripts/test.py` boots the image headless in QEMU with a scratch data disk holding `tests/`. Your own
-`data.img` is not touched. At boot, `init` runs the suite. The suite compiles its own runner with the
-in-OS `tcc` and runs the test cases, checking each one's exit status and output. Results come back over the
-serial port, and afterwards the host checks the FAT32 volume the OS wrote to with `fatcheck.py`. The
-tests cover:
-- Shell and tools, and `malloc` stress.
-- W^X: writing code or read-only data and running the stack or heap must crash, and `mprotect` must work.
-- FAT32 and the RAM filesystem: many sizes, long names, 150-file directories, rename and nested directories.
-- `tcc`: printf and math, compiling every app, and self-hosting.
-- The GUI: a window appears in a screen grab and is gone after it closes.
-- Sound: streams, blocking and non-blocking writes, eight streams at once, the volume, `beep`, `play` with 8-, 16-, 24-bit and float WAV files at several rates, and the Sound Player started the way Files starts it. QEMU records the AC'97 card's output to `build/test-audio.wav`, and the host checks that each tone came out with the right pitch on each channel and the right length.
-- The web engine, offline: about 80 checks of element positions (blocks, floats, flexbox, grid, tables, `@media`), painted pixels (borders, alpha, gradients, images), links, form submission, charsets and URL resolution. Deeply nested and malformed pages must not crash it.
-- Network: DHCP, ping, DNS, HTTP, HTTPS, and a rejected bad certificate.
-- TCP: 14 MiB to and from a host-side server, clean and with simulated loss and reordering, checking every byte.
-- The agent, offline: it never needs an API key.
+`build\` にできるもの：
+- `kernel.elf`、`initrd.tar`：カーネルと RAM のルートの中身。
+- `nocturne.img`：MBR の起動ディスク（QEMU、USB メモリー）。
+- `nocturne.vhd`：Hyper-V 第 1 世代用の固定長 VHD。
+- `nocturne.vhdx`：Hyper-V 第 2 世代用の可変長 VHDX。
+- `nocturne.iso`：BIOS・UEFI 両用の ISO。
+- `data.img`：QEMU 用の `/data` ディスク（512 MB）。最初のビルドで作り、二度と上書きしません。
+- `data-blank.vhdx`：Hyper-V 用の空のデータディスク（2 GB）。
 
-The network tests need internet access from the host. Use `python scripts/test.py --no-net` without it.
+**追加の部品**（無くても OS はビルドできます）：
+- **Go**（[ports/go](ports/go/README.md)）：Go 1.27.2 に `ports/go/nocturne.patch` を当ててビルドし、
+  `make GO=<Go のソース>/bin/go.exe` とすると `ports/go/apps/*` が `/bin` に入ります。
+- **TypeScript-Go**（[ports/tsgo](ports/tsgo/README.md)）：さらに `TSGO=<TypeScript-Go のソース>` を付けると
+  `/bin/tsgo` が入ります。`js file.ts` は tsgo を使います。
+- **virgl**（[ports/virgl](ports/virgl/README.md)）：ホストの QEMU で virtio-gpu を試すときだけ使います（`QEMU_GPU=virgl`）。
 
-`scripts/qtest.py` drives a running image by hand: keystrokes, mouse moves and screenshots.
+## 試験
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1 test        # 全体の試験（時間がかかります）
+powershell -ExecutionPolicy Bypass -File build.ps1 test-quick  # 全アプリのコンパイルと tcc の自己ビルドを省く
+powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # OS の中で tcc が自分をビルドし直す試験も行う
+```
+
+`scripts/test.py` はイメージを画面なしの QEMU で起動し、`tests/` を入れた使い捨てのデータディスクをつなぎます。
+自分の `data.img` には触れません。OS の中の `tcc` が試験の実行役（`tests/runtests.c`）をコンパイルし、
+約 100 の群・約 220 の試験を走らせ、終了状態と出力を確かめます。結果はシリアルで返り、最後にホストが
+`fatcheck.py` で OS が書いた FAT32 を検査します。主な対象は次のとおりです。
+- シェルとコマンド、`malloc`、ネイティブ ABI、スレッドと並列処理。
+- W^X：コードや読込み専用データへの書込み、スタックやヒープの実行がアプリを止めること。
+- FAT32 と RAM のファイル：さまざまな大きさ、長い名前、150 個の項目、名前の変更、入れ子のフォルダー。
+- `tcc`：printf と数学関数、全アプリのコンパイル、自己ビルド。C++。
+- GUI：窓が画面に現れ、閉じると消えること。
+- 音：ストリーム、待つ書込みと待たない書込み、8 本同時、音量、`beep`、各種 WAV の `play`。QEMU が AC'97 の出力を
+  `build/test-audio.wav` に録り、ホストが各音の高さ・左右・長さを確かめます。媒体の復号も試します。
+- Web エンジン：要素の位置、描いた画素、CSS、フォーム、文字コード、URL、Worker、IndexedDB、WebAssembly、
+  WPT と html5lib の一部。壊れた・深く入れ子のページで落ちないこと。
+- ネットワーク：DHCP、ping、DNS、HTTP、HTTPS、不正な証明書の拒否、HTTP/2、TLS の再開。
+- TCP：ホストのサーバーとの 14 MiB の送受信（損失と順序の入替えの模擬あり）、全バイトの照合。
+- エージェント：オフラインで、API キーは要りません。
+
+ネットワークの試験はホストからインターネットへ出られる必要があります。出られないときは
+`python scripts/test.py --no-net` を使います。`--accel whpx`、`--cpus`、`--memory`、群の名前
+（`python scripts/test.py web tcp`）も指定できます。
+
+`scripts/qtest.py` は起動中のイメージを打鍵・マウス・画面の撮影で操作します。
 
 ```
 python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dclick shot:files
 ```
 
-## Using it
+## 使い方
 
-| Keys | Action |
+| キー | 動作 |
 |---|---|
-| Super or Ctrl+Esc | Open the start menu (arrow keys and Enter work in it) |
-| Ctrl+Alt+T | New terminal |
-| Alt+Tab | Switch windows |
-| Alt+F4 | Close window |
-| Double-click a title bar | Maximize or restore |
-| Drag the bottom-right corner | Resize (Terminal, Files, Text Editor, Clock, Mandelbrot, 3D Shapes) |
-| Ctrl+Shift+C / Ctrl+Shift+V | Copy screen / paste in the terminal |
-| Shift+PgUp / PgDn, mouse wheel | Terminal scrollback |
-| Ctrl+C | Interrupt the running command |
+| Super または Ctrl+Esc | スタートメニュー（矢印キーと Enter で選べます） |
+| Ctrl+Alt+T | 新しい端末 |
+| Alt+Tab | 前面の窓を一番後ろへ回す |
+| Alt+F4 | 窓を閉じる |
+| タイトルバーをダブルクリック | 最大化と元に戻す |
+| 右下の角をドラッグ | 大きさの変更（端末、ファイル、テキストエディター、時計、マンデルブロ集合、3D 図形、Web ブラウザー） |
+| Ctrl+Shift+C / Ctrl+Shift+V | 端末の画面のコピー／貼付け |
+| Shift+PgUp / PgDn、ホイール | 端末のスクロールバック |
+| Ctrl+C | 実行中のコマンドを止める |
 
-The root filesystem lives in RAM, so files you create there are lost when you reboot. Save anything you want to keep under `/data`. `/home` starts with a few sample files; try `sh hello.sh`.
+ルートのファイルは RAM にあり、再起動で消えます。残したいものは `/data` に保存してください。
+`/home` には見本のファイルがあります。`sh hello.sh` を試してみてください。`/home/JavaScript` には `js` の見本があります。
 
-## Sound
+### 永続ストレージ：/data
 
-- **Volume:** click the speaker on the taskbar, next to the clock. Drag the slider to change it
-  (a short tick plays at the new level), or click the speaker inside the panel to mute. Scrolling over the taskbar's
-  speaker changes the volume without opening anything. The panel also says where the sound goes
-  (the sound card, or Remote desktop in an Enhanced Session).
-- **Sound Player:** double-click a `.wav` file in Files, or open Sound Player from the desktop or
-  the start menu. It lists the other sounds in the same folder and plays on through them. It has
-  play/pause, stop, previous and next, and a bar you can click or drag to jump. Keys: Space plays
-  or pauses, Left and Right jump 5 seconds, Up and Down change sound. It reads PCM WAV of any rate
-  (8/16/24/32-bit or float, mono to multichannel).
-- **Music:** `/home/Music` has three short pieces made for Nocturne (synthesised at build time by
-  `scripts/mksounds.py`).
-- **Piano** plays two octaves from the mouse or the keyboard (Z S X D C V G B H N J M for the
-  lower octave, Q 2 W 3 E R 5 T 6 Y 7 U I for the upper), in three sounds (Tab), with Left and
-  Right to change octave.
-- Snake, Tetris and Minesweeper have sound effects.
+`/data` 以外はすべて RAM にあり、起動のたびに戻ります。`/data` は `NOCTDATA` という名前の FAT32 で、
+保存したファイルは再起動やビルドのし直しでも残ります。
+- **QEMU**：`build\data.img`（512 MB）。最初のビルドで作り、上書きしません。`build.ps1 clean` も消しません。
+  まっさらにしたいときは手で消してください。
+- **Hyper-V**：`hyperv.ps1` が `hyperv\<名前>-data.vhdx`（2 GB、可変長）を 2 台目のディスクとしてつなぎます。
+  `-Update` は起動ディスクだけを置き換えます。
+- **実機**：どれかのディスクの `NOCTDATA` という FAT32 ボリューム。
 
-Sound comes out of an Intel AC'97 card: `build.ps1 run` gives QEMU one, played through Windows'
-speakers, and VirtualBox emulates one (ICH AC97). In Hyper-V the Enhanced Session carries it to
-VMConnect; Hyper-V has no sound card, so outside an Enhanced Session sound plays into nothing (at
-the speed it would play, so programs still take as long as their sound does).
+アプリは `/bin` の次に `/data/bin` から探すので、そこへ入れたプログラムは名前だけで動きます。
 
-For programs: a program plays sound by writing 16-bit little-endian stereo frames at 48 kHz to `/dev/audio`;
-writes block while about 170 ms are queued, and `close` waits for the rest to finish. Reading the
-stream (opened `O_RDWR`) returns a `uint32_t`: how many frames are queued, for keeping a picture
-in step with the sound. Up to eight programs can play at once. For games, libc's
-`sound_effect(hz, hz2, ms, wave)` plays a short tone or noise without ever waiting, and
-`wav_open`/`wav_read`/`wav_seek` read any WAV file as 48 kHz stereo (`nocturne.h`). Scripts can use
-`beep`, `play` and `volume`.
+## 音
 
-## Networking
+- **音量**：タスクバーの時計の隣のスピーカーをクリックします。つまみをドラッグすると変わり（新しい音量で短く鳴ります）、
+  パネルの中のスピーカーで消音します。タスクバーのスピーカーの上でホイールを回しても変わります。
+  パネルには音の出先（サウンドカード、または拡張セッションのリモートデスクトップ）も表示します。
+- **サウンドプレーヤー**：ファイルで `.wav` をダブルクリックするか、デスクトップやスタートメニューから開きます。
+  同じフォルダーの他の音も一覧にして続けて再生します。再生・一時停止、停止、前、次、クリックやドラッグで移動できる
+  バーがあります。Space で再生・一時停止、←→ で 5 秒移動、↑↓ で曲を変えます。PCM の WAV（8/16/24/32 ビット、
+  浮動小数点、モノラルから多チャンネル、任意の標本化周波数）を読みます。
+- **メディアプレーヤー**：MP3、FLAC、AAC、Ogg（Vorbis、Opus）の音声と、MP4・WebM・AVI・MOV の動画
+  （H.264、HEVC、VP8、VP9 など）を FFmpeg で再生します。ファイルで音声・動画をダブルクリックすると開きます。
+  Space で再生・一時停止、←→ で 5 秒移動、Ctrl+O でファイルや URL を開きます。
+- **音楽**：`/home/Music` に Nocturne 用の短い曲が 3 つあります（ビルド時に `scripts/mksounds.py` が合成）。
+- **ピアノ**：マウスかキーボードで 2 オクターブを弾けます（下のオクターブは Z S X D C V G B H N J M、
+  上は Q 2 W 3 E R 5 T 6 Y 7 U I）。Tab で 3 種類の音色、←→ でオクターブを変えます。
+- スネーク、テトリス、マインスイーパーには効果音があります。
 
-![Network tools](docs/network.png)
+音は Intel AC'97 から出ます。`build.ps1 run` は QEMU に AC'97 を付けて Windows のスピーカーで鳴らします。
+Hyper-V にはサウンドカードがないので、拡張セッションが VMConnect へ運びます。拡張セッションの外では、
+音は再生されるのと同じ速さで捨てられます（プログラムの所要時間は音の長さどおりです）。
 
-The network comes up by itself: a DHCP client runs in the kernel at boot, so `ifconfig` normally
-shows an address a second or two after the desktop appears.
+**プログラムから**：`n_audio_open` でストリームを開き、`n_audio_submit` で 48 kHz・ステレオ・16 ビットの
+フレームを送ります。約 170 ms 分がたまると待ち（`N_AUDIO_WAIT`）、`n_audio_status` で再生済みの量を知って
+画面と音を合わせられます。8 本まで同時に鳴らせます。ゲーム向けには、待たずに短い音や雑音を鳴らす
+`sound_effect(hz, hz2, ms, wave)` と、どんな WAV も 48 kHz ステレオで読む `wav_open`・`wav_read`・`wav_seek`
+があります（`nocturne.h`）。スクリプトでは `beep`、`play`、`volume` を使えます。
 
-- **QEMU**: the default e1000 card with user-mode networking works as-is (`build.ps1 run`). `-nic user,model=tulip` exercises the Hyper-V driver.
-- **Hyper-V**: `hyperv.ps1` adds a network adapter on the Default Switch: the synthetic (VMBus) adapter on Gen 2, a legacy one on Gen 1.
+## ネットワーク
+
+![ネットワークのコマンド](docs/network.png)
+
+ネットワークはひとりでに立ち上がります。カーネルの DHCP クライアントが起動時に動くので、`ifconfig` は
+ふつうデスクトップが出て 1、2 秒でアドレスを表示します。
+
+- **QEMU**：既定の e1000 とユーザーモードの NAT がそのまま使えます。`-nic user,model=tulip` で tulip
+  （Hyper-V 第 1 世代のレガシーアダプター）のドライバーを試せます。
+- **Hyper-V**：第 2 世代は合成アダプター（VMBus）、第 1 世代はレガシーアダプターを使います。
 
 ```
 ping -c 3 example.com
@@ -267,96 +376,120 @@ fetch -i http://example.com
 fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
 ```
 
-`fetch https://...` uses TLS 1.2 through BearSSL. Certificates are checked against the Mozilla root store, which
-is compiled into libc. The CMOS clock supplies the time for the validity check.
+- **TCP/IP**（`kernel/src/net/`）：Ethernet、ARP、IPv4、ICMP、UDP、DHCP、DNS、TCP。
+  - TCP は接続と待受け（RFC 9293）、ウィンドウスケーリング（RFC 7323、既定で送受信 1 MiB）、NewReno の輻輳制御、
+    往復時間から求める再送時間、順序の乱れたセグメントの組立て。
+  - `127.0.0.1` と自分のアドレスへのループバック。
+  - DNS はキャッシュ付きで、応答が切れていれば TCP で問い直し、複数のアドレスを返します。
+- **プログラムから**：ソケットではなく Nocturne の API です。`tcp_connect`・`tcp_send`・`tcp_recv`、
+  サーバーは `tcp_listen`・`tcp_accept`、UDP は `udp_socket` など、名前解決は `net_resolve_all`（`nocturne.h`）。
+  上位には TCP・TLS のストリームと HTTP のクライアント（`http.h`）があります。
+- **HTTP**：HTTP/1.1（持続接続、チャンク、gzip）と HTTP/2（ALPN、HPACK、接続の共有）。接続は使い回します。
+- **TLS**：BearSSL による TLS 1.2。証明書は libc に組み込んだ Mozilla のルート証明書で検証し、
+  有効期限には CMOS の時計を使います。セッションを再開できます。Go のプログラムは Go 自身の TLS（1.3 まで）を使います。
 
-Network limits: TCP is client-side only (no listening sockets), with no window scaling or SACK, so a connection has at most 64 KiB in flight. There is no IP fragmentation and no IPv6.
+制約：IPv6、IP の断片化、TCP の SACK とタイムスタンプはありません。使えるネットワークアダプターは 1 枚です。
 
-## The web browser
+## Web ブラウザー
 
-![The web browser showing Wikipedia](docs/browser.png)
+![Wikipedia を表示している Web ブラウザー](docs/browser.png)
 
-Open **Web Browser** from the desktop or the start menu, or run `browser URL` (or `browser /path/file.html`).
-Files opens `.html` files in it. It starts on a page of links and a search box.
+デスクトップかスタートメニューの **Web ブラウザー**、または `browser URL`（`browser /パス/file.html`）で開きます。
+ファイルは `.html` をブラウザーで開きます。最初のページは検索欄とリンク集です。窓ごとに 1 つの処理で、
+タブの代わりに窓を増やします（`window.open` も新しい窓になります）。
 
-The engine is a library in libc (`web.h`). It parses HTML (with entities, implied tags and legacy
-charsets), runs the CSS cascade (combinators, attribute selectors, `:nth-child()`, `:is()`, `:not()`,
-`:has()`, `@media`, `@supports`, `@layer`, custom properties, `calc()`), and lays out block, inline, float, table, flexbox and grid
-boxes, including positioned elements and `::before`/`::after`. Painting covers backgrounds, linear
-and radial gradients, borders with rounded corners, PNG/JPEG/GIF/WebP/SVG images and CSS masks.
-本文と `monospace` の標準フォントは Maple Mono NF です。通常・太字・斜体・太字斜体を同梱し、
-欠けた文字は共通の Maple Mono NF CN Regular で補います。ひらがな・カタカナ・多くの漢字に対応しますが、
-この提供版にハングル音節はありません。アプリの共通UI描画もMaple Monoを使用します。
-起動コンソールとカーネルのウィンドウ装飾は Unifont Japanese 18.0.01 由来のビットマップを使用します。
-提供BDFの全57,086字形を収録し、半角8×16・全角16×16を無変形で描画します。
-大フォントは2倍拡大、カーネルのコンソールとウィンドウタイトルもUnicode・全角幅を扱います。
-提供BDFに含まれない文字（BMP外を含む）は置換文字になります。
-端末の全角セル処理やエディターのUnicode編集は別の未対応部分です。
-Links, forms (text fields, checkboxes,
-radio buttons, selects, GET and POST) and find in page work.
+**しくみ**
+- HTML の字句解析と木構築は Lexbor 3.1.0、JavaScript は QuickJS（2026-06-04）。DOM は Nocturne のネイティブ DOM が
+  一つだけで、CSS のカスケード、ボックスの生成とレイアウト、描画、当たり判定、Web API は Nocturne の実装です。
+- 通信は別の処理 `webfetch` が持ちます（DNS、TCP、TLS、HTTP/1.1・HTTP/2、Cookie、CORS、WebSocket、キャッシュ）。
+  Worker、動画の復号、MSE、IndexedDB の入出力もそれぞれ別の処理で動きます。
+- スタイル、レイアウトの部分木、ラスターのタイルは複数の CPU で処理します。
 
-The browser loads the page and its stylesheets first, shows it, then fetches images one at a time
-while you read, laying the page out again as they arrive. Redirects, `<meta http-equiv=refresh>`,
-`file://` (with folder listings) and plain-text and image URLs work.
+**HTML と CSS**
+- block、inline、inline-block、float、table、flexbox、grid、`display: contents`、相対・絶対・固定の配置、
+  `::before`・`::after`。
+- セレクター（`:has()`、`:is()`、`:not()`、`:nth-child()` など）、`@media`、`@supports`、`@layer`、
+  カスタムプロパティ、`calc()`、CSSOM、構築可能なスタイルシート。
+- 背景、線形・放射グラデーション、角丸の枠、影、`outline`、CSS マスク、2D の変形（`transform`、
+  `rotate`・`scale`・`translate`）、`@keyframes` とトランジション（変形と不透明度）。
+- 画像は PNG、JPEG、GIF、WebP、SVG、ICO、BMP。
+- フォーム（文字入力、チェックボックス、ラジオボタン、選択、日時・数値の入力、検証、ファイルの選択）、
+  ページ内検索、Shadow DOM、カスタム要素。
+- 文字：既定の serif は Noto Serif、sans-serif は Inter、monospace と UI は Maple Mono NF です。
+  日本語は Noto Sans／Serif CJK JP と Plangothic で補い、絵文字は Noto Color Emoji（COLRv1、ZWJ の連結や国旗）で描きます。
+  Web フォント（`@font-face`）は FreeType で TrueType、OpenType CFF、WOFF、WOFF2、非圧縮 EOT を読みます。
 
-| Keys | Action |
+**JavaScript と Web API**
+- DOM、イベント、各種 Observer、Range・Selection、履歴、URL、Blob、FormData、Fetch・XHR、Streams、WebSocket。
+- 専用 Worker と SharedWorker（窓をまたいで共有）、MessageChannel、BroadcastChannel。
+- Cookie（SameSite、公開サフィックス一覧）、localStorage・sessionStorage、IndexedDB、OPFS。
+- Canvas 2D、OffscreenCanvas、WebGL・WebGL2（Mesa の GLSL コンパイラーと softpipe によるソフトウェア描画）。
+- WebAssembly：WABT で検証し、wasm2c が出した C を OS の中の TCC でネイティブコードにします。x86-64 の JIT、
+  インタープリター、JSPI、共有メモリーと Atomics、スレッドがあります。
+- `<video>`・`<audio>`（FFmpeg 9.0.2 の一部の復号器）、MSE、HLS・DASH、WebVTT 字幕、全画面、ピクチャーインピクチャー。
+- Web Crypto（ハッシュと AES）、Intl（英語と日本語）、Trusted Types、CSP。
+
+**開発者ツール**：F12（または Ctrl+Shift+I）で、要素（DOM の木、スタイル、計算値、ボックスモデル、ページ上で選ぶ）、
+コンソール、ネットワークのパネルを開きます。`browser --log-console`、`--net-log`、`--debug-js` で
+コンソールと通信の記録をシステムログ（シリアル）へ出せます。
+
+| キー | 動作 |
 |---|---|
-| Ctrl+L | Address bar (words without a dot search DuckDuckGo Lite) |
-| Ctrl+F | Find in page (Enter for the next match) |
-| Alt+Left / Backspace, Alt+Right | Back, forward |
-| F5 or Ctrl+R | Reload |
-| Esc | Stop loading |
-| Space, PgUp/PgDn, arrows, wheel | Scroll |
+| Ctrl+L | アドレス欄（点を含まない言葉は DuckDuckGo Lite で検索） |
+| Ctrl+F | ページ内検索（Enter で次へ） |
+| Alt+← / Backspace、Alt+→ | 戻る、進む |
+| F5 または Ctrl+R | 再読込み |
+| Esc | 読込みを止める（全画面を抜ける） |
+| F12、Ctrl+Shift+I / J / C | 開発者ツール（要素／コンソール／要素の選択） |
+| Space、PgUp/PgDn、矢印、ホイール | スクロール |
 
-ブラウザーの制約: QuickJS の JavaScript 実行と、現代のサイトが要求する Web API・描画の対応は別です。
-未実装 API による例外で実サイトの初期化が停止します。単体試験の成功は実サイトの動作保証ではありません。
-Cookie jarは実装されていますが、実サイトへのログイン動作は検証済みではありません。
-Webフォントは `@font-face` の取得・順序付きsrcフォールバックと、TrueType／OpenType CFF／WOFF／WOFF2の復号・描画に対応します。
-非圧縮EOTも復号しますが、MicroType圧縮EOTとSVG fontは未対応です。未対応のformat／tech指定は取得前に除外します。
-OpenTypeの完全な合字・複雑文字shapingやvariation軸の選択は別の未対応部分です。同梱UI／カーネルフォントは変更しません。
-検索結果のICO画像は、内部PNGおよびDIBの色深度・透過を処理します。HTTP404を復号成功にはしません。
-classic SharedWorkerは文書・別ブラウザー窓からネイティブ共有taskへ接続し、MessagePortで通信します。
-共有taskはNocturne固有の名前付き双方向channelを使い、最後のclient終了で回収します。module／nested workerは未対応です。
-専用Workerも独立taskを維持し、timer deadlineはheap、WorkerLocationはURL属性を公開します。
-Flexbox and grid cover the common cases, not every corner of the
-specs, and there are no transforms, animations or `position: sticky`.
+**実サイト**：QEMU（WHPX、4 CPU、4096 MiB、1920×1080）で確かめた例です。それぞれその日の記録であり、
+動作の保証ではありません。
+- 2026-10-13：DuckDuckGo の検索と結果のリンク、Reddit の検索、GitHub のメニュー、百度百科の表示。
+- 2026-10-14：百度百科の本文・画像・検索・戻る進む。YouTube は再生、一時停止、シーク、スクロールまで動きましたが、
+  途中の停止や字幕の重なりが残りました。CNN はトップページが表示され、動画ページは黒いままでした
+  （[記録](docs/browser-wasm-delivery-20261014.md)）。
+- 2026-10-16：Puter の Firefox（WebAssembly）が既定の GPU 描画で起動しました。
 
-## Persistent storage: /data
+**まだできないこと**：TLS 1.3、Service Worker、WebRTC、Web Audio、WebGPU、モジュール Worker、
+`position: sticky`、3D の変形、`clip-path` などの多くのプロパティ、OpenType の完全な文字整形と可変フォント、
+AV1 と HDR、RSA・楕円曲線の署名、ダウンロードとブックマークの UI。重いページではレイアウトに数秒かかることがあります。
+対応の空白は [docs/browser-missing-20261012.md](docs/browser-missing-20261012.md) にまとめています
+（その後に対応したものも含みます）。
 
-Everything outside `/data` lives in RAM and is reset on every boot. `/data` is a FAT32 partition
-labelled `NOCTDATA` on a second disk, so files saved there survive reboots and rebuilds.
-- **QEMU**: `build\data.img` (512 MB) is created on the first build and is never overwritten.
-  `build.ps1 clean` leaves it alone. Delete it by hand to start fresh.
-- **Hyper-V**: `hyperv.ps1` attaches `hyperv\<Name>-data.vhdx` (2 GB, dynamic) as the second disk (SCSI on Gen 2, IDE on Gen 1).
-  `-Update` replaces only the boot disk and keeps the data disk.
+## 開発
 
-`/data/bin` is on `PATH`, so programs installed there run by name.
+### OS の中で C を書く
 
-## Writing C inside Nocturne
-
-`tcc` is TinyCC 0.9.28, built for Nocturne:
+`tcc` は Nocturne 向けにビルドした TinyCC 0.9.28rc です。
 
 ```
-tcc -run /usr/src/apps/mandel.c           # compile in memory and run
-tcc -o /data/bin/hello hello.c            # build a program; it now runs as `hello`
+tcc -run /usr/src/apps/mandel.c           # メモリー上でコンパイルして実行
+tcc -o /data/bin/hello hello.c            # プログラムを作る。以後 hello で動く
 ```
 
-Programs are linked statically against Nocturne's libc. They can use:
-- `nocturne.h`: system calls, windows and widgets.
-- `gfx.h`: drawing.
-- `http.h`: HTTP and HTTPS.
-- `json.h` and `png.h`.
-- BearSSL.
+プログラムは Nocturne の libc と静的にリンクします。使えるヘッダー：
+- `nocturne.h`：ネイティブ API、窓、小さな UI 部品。
+- `gfx.h`（描画）、`font.h`（TrueType）、`image.h`（画像）、`media.h`（音声・動画）、`gpu.h`。
+- `threads.h`、`parallel.h`。
+- `http.h`（HTTP と HTTPS）、`json.h`、`png.h`、BearSSL。
 
-tcc can also compile itself: its own source rebuilds inside the OS into a working compiler.
+tcc は自分自身もコンパイルでき、そのソースから OS の中で使えるコンパイラーを作り直せます（`build.ps1 test-full`）。
 
-## C++とCの併用
+### C++
 
-ホストclangでNocturne向けのC++20アプリをクロスコンパイルできます。`user/apps/*.cpp`を追加し、`python -X utf8 scripts/build.py cxx`でビルドします。既存C APIをそのまま呼び出せます。OS内で`cppdemo`を起動すると、libc++の文字列・コンテナーとCのGUI APIを使う実例が動きます。
+ホストの clang で Nocturne 向けの C++20 アプリをクロスコンパイルできます。`user/apps/*.cpp` を置き、
+`python -X utf8 scripts/build.py cxx` でビルドします。C の API はそのまま呼べます。OS の中で `cppdemo` を起動すると、
+libc++ の文字列・コンテナーと C の GUI API を使う例が動きます。例外、RTTI、iostream、スレッドなどは使えません。
+詳しくは [docs/cpp-support.md](docs/cpp-support.md) を参照してください。
 
-初期構成は例外・RTTIなしで、標準ライブラリーの対応範囲には制限があります。ツールの場所、全媒体の生成、対応範囲と実行確認は[利用手順](docs/cpp-support.md)を参照してください。
+### Go
 
-## JavaScript と TypeScript
+[ports/go](ports/go/README.md) は Go を `GOOS=nocturne GOARCH=amd64` へ移植したもので、UNIX 系としてではなく
+Nocturne の API の上で動きます。ゴルーチンは複数の CPU で動き、`os`、`os/exec`、`net`（TCP・UDP・DNS、
+`net.Listen`）、`crypto/tls` を使えます。ホストでクロスコンパイルし、`ports/go/apps/<名前>` が `/bin/<名前>` になります。
+
+### JavaScript と TypeScript
 
 `js` は端末で JavaScript と TypeScript を動かす実行環境（QuickJS）、`tsgo` は TypeScript 7 の
 公式コンパイラーです（[ports/tsgo](ports/tsgo/README.md)）。
@@ -383,90 +516,135 @@ js -e 'console.log(1 + 2)'  # -p は結果を表示、js - は入力から、js 
   ブラウザーと同じ実装です。`fetch` はアプリ内のスレッドで通信し、待つ間も他の処理が進みます。
 - **型**：`nocturne` の型定義は `/node_modules/@types/nocturne` にあり、どのフォルダーの
   プロジェクトからも見つかります。`js file.ts` は `--strict` で検査し、型の誤りがあれば実行しません
-  （出力は `/tmp/js-ts`、パッケージは元の場所から探します）。
+  （出力は `/tmp/js-ts`、パッケージは元の場所から探します）。TypeScript には `tsgo` を入れたビルドが必要です。
 - **終了**：捕まえられなかった例外と処理されなかった Promise の拒否はスタックを表示して状態 1、
   終わらないトップレベルの `await` は状態 13。対話プロンプトでは表示だけして続けます。
 
 実行環境の本体は `user/apps/js.c`（システムとの接続、モジュールの読み込み、イベントループ）と
 `user/apps/js_runtime.js`・`js_console.js`・`js_web.js` です。
 
-## The AI agent
+### WebAssembly
+
+`wasm2c` は WABT の変換器です。出力した C は、`/usr/include` と `/usr/src/wasm2c` のランタイムと一緒に
+OS の中の `tcc` でコンパイルできます。
+
+## AI エージェント
 
 ![agent](docs/agent.png)
 
-`agent` is a coding agent that runs inside the OS. It streams replies from any OpenAI-compatible
-chat completions endpoint (over HTTPS, from Nocturne's own TLS stack) and gives the model these tools:
-- `run_command`: runs a command in the shell.
-- `read_file`, `write_file`, `edit_file` and `list_dir`.
-- `fetch_url`.
-- `screenshot`: the model sees the desktop as an image, so it can check the GUI programs it writes.
+`agent` は OS の中で動くコーディングエージェントです。OpenAI 互換の chat completions のエンドポイントから
+（Nocturne 自身の TLS で HTTPS を通して）返答を逐次受け取り、モデルに次の道具を渡します。
+- `run_command`：シェルでコマンドを実行します。
+- `read_file`、`write_file`、`edit_file`、`list_dir`。
+- `fetch_url`。
+- `screenshot`：モデルがデスクトップを画像として見るので、自分の書いた GUI のアプリを確かめられます。
 
-It writes C, compiles it with `tcc`, runs it and fixes what breaks.
+C を書いて `tcc` でコンパイルし、実行し、壊れたところを直します。
 
 ```
-agent                                   # interactive session (type /help)
+agent                                   # 対話（/help で命令の一覧）
 agent write a tetris clone in /data/projects/tetris and install it as /data/bin/tet
-agent -r                                # resume the previous session
+agent -r                                # 前回の続き
 ```
 
-The model's instructions are in `/etc/agent/system.md`. Sessions and the agent's notes are kept in
-`/data/agent`. Settings are in `/data/etc/agent.conf`:
-- `endpoint` and `model`.
-- `max_tokens` and `context_limit`.
-- `reasoning`, `show_thinking` and `vision`. Set `vision=0` for models that cannot take images.
+モデルへの指示は `/etc/agent/system.md`、会話とエージェントのメモは `/data/agent`、設定は `/data/etc/agent.conf` です。
+- `endpoint` と `model`。
+- `max_tokens` と `context_limit`。
+- `reasoning`、`show_thinking`、`vision`。画像を受け取れないモデルでは `vision=0` にします。
 
-**API key.** The key is stored only on the data disk, never in the repository or the boot image:
-- QEMU: `python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]`
-- Hyper-V: `hyperv.ps1 -Update -ApiKeyFile KEYFILE`
-- Or start `agent` and paste the key when it asks.
+**API キー**：キーはデータディスクにだけ保存し、リポジトリーや起動イメージには入れません。
+- QEMU：`python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]`
+- Hyper-V：`hyperv.ps1 -Update -ApiKeyFile KEYFILE`
+- または `agent` を起動し、尋ねられたときに貼り付けます（`/key` で入れ直せます）。
 
-`KEYFILE` holds just the key, or contains a line like `api key: ...`. The defaults are
-`https://hyper.charm.land/v1` and `glm-5.3-flash`. Keep key files outside this folder.
+`KEYFILE` はキーだけか、`api key: ...` という行を含むファイルです。既定は `https://hyper.charm.land/v1` と
+`glm-5.3-flash` です。キーのファイルはこのフォルダーの外に置いてください。
 
-## Limits
+## 制約
 
-What Nocturne does not have, so nobody is surprised:
-- **CPUの並列化は限定的です。** APは同期型の純計算workerとして実仕事を行いますが、通常のtask scheduler・IRQ・QuickJS・FFmpegはBSP専用です。一般プロセスSMPやAVXは未対応です。
-- **No users or permissions.** Every process is isolated in its own address space, but all of them can read and write every file.
-- **No `fork`/`exec`.** Processes are started with `spawn`. There are no signals beyond kill, no threads, no dynamic linking and no swap.
-- **The window manager runs in the kernel.**
-- **Slow, simple disks.** The ATA driver uses PIO with polling (no DMA). FAT32 has no journal, so power loss during a write can leave the volume inconsistent. Names may be up to 255 characters.
-- **The networking limits are listed above.**
-- **A plain Enhanced Session.** It carries the picture, keyboard, mouse, sound and text on the clipboard: no images or files on the clipboard, no microphone, drive or printer sharing. If VMConnect doesn't send a new size when you resize its window, reconnect to change the size. The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
-- **Sound out only, on one kind of card.** AC'97 or the Enhanced Session: no Intel HD Audio, no recording, and uncompressed sound only (no MP3 or Ogg).
-- **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
-- **実験的な JavaScript 統合で、ブラウザー API と Cookie は未完成。** [制約](#the-web-browser)と[実サイト検証](docs/browser-validation-2026-10-06.md)を参照。
-- **Only checked in virtual machines.** It has been tested in QEMU and Hyper-V, never on real hardware.
+驚かないように、Nocturne に無いもの：
+- **ユーザーと権限がありません。** アプリはそれぞれ自分のアドレス空間に隔離されますが、どのアプリもすべてのファイルを読み書きできます。
+- **カーネルの仕事は CPU 0 が持ちます。** アプリのスレッドは全 CPU で動きますが、システムコール、割り込み、
+  ドライバー、GUI、ネットワークのほとんどは CPU 0 で処理します。
+- **ウィンドウマネージャーはカーネルの中で動きます。**
+- **動的リンクとスワップはありません。** プログラムはすべて静的リンクです。
+- **ディスクは単純です。** ATA は PIO、NVMe は一度に 1 命令です。カーネルに AHCI のドライバーはありません。
+  FAT32 にはジャーナルがないので、書込み中の電源断でボリュームが不整合になることがあります。名前は 255 文字までです。
+- **ネットワークの制約**は[上](#ネットワーク)のとおりです（IPv4 だけ、TLS 1.2 まで）。
+- **拡張セッションは素朴です。** 画面、キーボード、マウス、音、クリップボードの文字を運びます。画像やファイルのクリップボード、
+  マイク、ドライブやプリンターの共有はありません。RDP サーバーは暗号化しませんが、ホストの Hyper-V ソケットからしか
+  届かず、ネットワークには出ません。
+- **音は出力だけで、AC'97 か拡張セッションだけです。** HD Audio、USB オーディオ、録音はありません。
+- **GPU のドライバーはありません。** 描画は CPU です（WebGL もソフトウェア描画）。
+- **AI エージェントはモデルのコマンドを尋ねずに実行します。** VM の外には出ませんが、`/data` のファイルを消すことはあります。
+- **ブラウザーは発展途上です。** 多くのサイトは表示できますが、動かない機能や遅いページがあります（[上](#web-ブラウザー)）。
+- **実機はまだ試し始めた段階です。** 確かめた機械は少なく、手順書もありません。
 
-## Layout
+## フォルダー構成
 
 ```
-boot/        limine.conf
-common/      ABI shared by kernel and userland, 2D graphics library, fonts
-kernel/src/  arch/ (GDT, IDT, APIC), mm/, sys/ (processes, scheduler, syscalls), fs/, dev/, gui/, net/,
-             hv/ (VMBus and Hyper-V devices), rdp/ (the Enhanced Session's RDP server)
-user/        libc/ (web/ is the browser engine), include/, apps/ (one .c file per program)
-rootfs/      files copied into the initrd (/etc, /home, /usr/share/fonts)
-ports/tcc/   TinyCC configuration and runtime glue for Nocturne
-third_party/ BearSSL, TinyCC, img/ (stb_truetype, stb_image, JebP, NanoSVG)
-scripts/     image builder, initrd packer, sysroot builder, test.py, qtest.py, setkey.py, fatcheck.py,
-             hv-*.ps1 (Hyper-V development loop)
-tests/       the in-OS test suite (runtests.c and the C programs it compiles)
-hyperv.ps1   Hyper-V VM setup
+boot/         limine.conf
+common/       カーネルとユーザーランドが共有する ABI（abi.h、gpu_abi.h）、2D 描画、Unifont のビットマップ
+kernel/src/   arch/（GDT、IDT、APIC、SMP、FPU、PAT、P ステート、Hyper-V の検出）、mm/、
+              sys/（アプリ、スケジューラー「継」、システムコール、イベント、プロファイラー）、
+              fs/（VFS、RAM、FAT32、initrd、チャンネル）、dev/（ATA、NVMe、xHCI と USB、PCI、ACPI、音、画面、入力）、
+              gui/（ウィンドウマネージャー、デスクトップ）、net/（TCP/IP、e1000、tulip、RTL8125B）、
+              hv/（VMBus と Hyper-V の装置）、rdp/（拡張セッションの RDP サーバー）
+user/         libc/（web/ はブラウザーのエンジン）、include/、apps/（アプリ、ブラウザーの補助処理、js の .js）
+rootfs/       initrd へ入れるファイル（/etc、/home、/node_modules、/usr/share/fonts など）
+ports/        Nocturne への移植の設定と差分（tcc、go、tsgo、lexbor、freetype、ffmpeg、mesa、wabt、virgl）
+third_party/  取り込んだソース（下のクレジット）
+scripts/      イメージ・initrd・sysroot の作成、test.py、qtest.py、setkey.py、fatcheck.py、hv-*.ps1
+tests/        OS の中の試験（runtests.c とそれがコンパイルするプログラム）、ホストの検査、試験用の素材
+docs/         README の画像、設計の文書、作業の記録
+build.ps1     ビルドの入口
+hyperv.ps1    Hyper-V の VM の作成
 ```
 
-## Credits
+`docs/` には日付付きの作業記録がたくさんあります。その時点の記録で、後の変更で古くなった記述も含みます。
 
-- [Limine](https://github.com/limine-bootloader/limine) bootloader (BSD-2-Clause)
-- [GNU Unifont Japanese](https://unifoundry.com/unifont/index.html) のカーネル用ビットマップ（18.0.01、SIL Open Font License 1.1）。提供BDF原本・許諾・変換内容は `third_party/unifont/`、起動イメージ内の許諾は `/usr/share/licenses/unifont/`。`python -X utf8 scripts/build.py bitmap-fonts` で再生成できます。
-- [BearSSL](https://bearssl.org/) TLS library (MIT)
-- [TinyCC](https://bellard.org/tcc/) C compiler (LGPL-2.1, source in `third_party/tinycc`)
-- [FreeType](https://freetype.org/) 2.14.3はFreeType Project License（FTL）を選択。Nocturneの一部はFreeTypeチームの成果に基づきます。代替GPLv2ではなくFTLを使用し、原文・著作権表示・変更記録を保持します。
-- QuickJS JavaScript エンジン（MIT、ソースとライセンスは `third_party/quickjs`）
-- [Inter](https://rsms.me/inter/) typeface by Rasmus Andersson (SIL Open Font License 1.1, see `rootfs/usr/share/fonts/Inter-LICENSE.txt`)
-- Maple Mono（ユーザー提供の未改変TTF、SIL Open Font License 1.1）。ライセンス・各ファイルのSHA-256・収録文字の確認結果は `rootfs/usr/share/fonts/MapleMono-LICENSE.txt` と `MapleMono-manifest.json` に同梱。
-- [stb_truetype and stb_image](https://github.com/nothings/stb) by Sean Barrett (public domain)
-- [JebP](https://github.com/matanui159/jebp) WebP decoder (MIT No Attribution)
-- [NanoSVG](https://github.com/memononen/nanosvg) by Mikko Mononen (zlib license; one local change: the default `preserveAspectRatio`)
-- Mozilla's CA certificate bundle, via [curl](https://curl.se/docs/caextract.html) (MPL-2.0)
-- Everything else was written for Nocturne.
+## クレジット
+
+**起動と基盤**
+- [Limine](https://github.com/limine-bootloader/limine) ブートローダー（BSD-2-Clause）。
+- [BearSSL](https://bearssl.org/) TLS（MIT）。
+- [TinyCC](https://bellard.org/tcc/) 0.9.28rc C コンパイラー（LGPL-2.1、ソースは `third_party/tinycc`）。
+- Mozilla の CA 証明書（[curl](https://curl.se/docs/caextract.html) 経由、MPL-2.0）。
+- スケジューラー「継」の選択核 kei_sched（MIT、`kernel/src/sys/kei.c`）。
+- RTL8125B ドライバー（`kernel/src/net/rtl8125.c`）のレジスターと初期化の手順は Realtek の FreeBSD 用ドライバー
+  rtl_bsd_drv_v1102.01 に従っています。This product includes software developed by Bill Paul.
+  （4 条項 BSD、全文はファイルの先頭）
+
+**ブラウザーと JavaScript**
+- [QuickJS](https://bellard.org/quickjs/) 2026-06-04（MIT、`third_party/quickjs`）。
+- [Lexbor](https://lexbor.com/) 3.1.0（Apache-2.0）。
+- [FreeType](https://freetype.org/) 2.14.3。FreeType Project License（FTL）を選び、代替の GPLv2 は使いません。
+  Nocturne の一部は FreeType チームの成果に基づきます。
+- [Brotli](https://github.com/google/brotli) 1.2.0（MIT、WOFF2 用）。
+- [FFmpeg](https://ffmpeg.org/) 9.0.2 の一部の復号器（LGPL-2.1 以降、GPL の部分は無効）。
+- [Mesa](https://mesa3d.org/) 26.3.0-devel の GLSL・NIR・softpipe（MIT ほか、`third_party/mesa/licenses`）。
+- [WABT](https://github.com/WebAssembly/wabt) 1.0.42（Apache-2.0）。
+- [FormatJS](https://formatjs.github.io/)（MIT）、Unicode CLDR と Unicode のデータ（Unicode License V3）、
+  ICU 由来の照合表、IANA のタイムゾーンデータベース。
+- [web-streams-polyfill](https://github.com/MattiasBuelens/web-streams-polyfill) 4.2.0（MIT）。
+- [Public Suffix List](https://publicsuffix.org/)（MPL-2.0）、WHATWG Encoding の JIS0208 表（CC BY 4.0）。
+- [stb_truetype と stb_image](https://github.com/nothings/stb)（Sean Barrett、パブリックドメイン）、
+  [JebP](https://github.com/matanui159/jebp) WebP 復号器（MIT No Attribution）、
+  [NanoSVG](https://github.com/memononen/nanosvg)（Mikko Mononen、zlib、既定の `preserveAspectRatio` を一か所変更）。
+
+**開発**
+- libc++ 18.1.8（Apache-2.0 with LLVM Exceptions、ビルド時に llvm-project から取り出します）。
+- [Go](https://go.dev/) 1.27.2（BSD-3-Clause、`GO=` を指定したときだけ）。
+- [TypeScript-Go](https://github.com/microsoft/typescript-go) 7.0.2（Apache-2.0、`TSGO=` を指定したときだけ）。
+- ビルド時だけ使う Python のモジュール Mako、MarkupSafe、PyYAML（`third_party/python-build`、イメージには入りません）。
+
+**フォント**（どれも SIL Open Font License 1.1。ライセンスは `rootfs/usr/share/fonts`）
+- [GNU Unifont Japanese](https://unifoundry.com/unifont/index.html) 18.0.01 のカーネル用ビットマップ。
+  原本・許諾・変換内容は `third_party/unifont/`、起動イメージ内の許諾は `/usr/share/licenses/unifont/`。
+  `python -X utf8 scripts/build.py bitmap-fonts` で作り直せます。
+- Maple Mono NF（未改変の TTF。各ファイルの SHA-256 は `MapleMono-manifest.json`）。
+- [Inter](https://rsms.me/inter/)（Rasmus Andersson）。
+- [Noto](https://fonts.google.com/noto) の Sans／Serif、Sans／Serif CJK JP、Color Emoji。
+- Plangothic（Fitzgerald P. Köeingsegg）。
+
+それ以外はすべて Nocturne のために書いたものです。
