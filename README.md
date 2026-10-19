@@ -133,7 +133,7 @@ console only.
 **Tips for VMConnect**
 - In the basic console, click inside the window to capture the mouse. **Ctrl+Alt+Left Arrow** releases it.
 - The Windows key only reaches the VM in full-screen mode. Use **Ctrl+Esc** to open the start menu instead.
-- The boot menu has a **1024x768** entry and a **text console only** entry, in case the default 1280x800 mode isn't available.
+- The boot menu has a **1024x768** entry and a **text console only** entry, in case the default 1920x1080 mode isn't available (Limine also falls back to a mode the firmware offers).
 - Kernel log: connect any named-pipe client, such as PuTTY (Serial, `\\.\pipe\nocturne-com1`), to COM1. `scripts\hv-serial.ps1` copies it to a file.
 - **Mouse moving up when you move down?** On Gen 1, Hyper-V on Windows 11 hosts reports the emulated PS/2 mouse's vertical axis backwards. Nocturne detects Hyper-V (and the host build) and flips the axis itself. If it guesses wrong on your host, press **E** on the boot menu entry and add `cmdline: mouse_y=normal` (or `mouse_y=invert`).
 
