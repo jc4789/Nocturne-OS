@@ -41,6 +41,7 @@
 #include "../arch/cpu.h"
 #include "../dev/pci.h"
 #include "../dev/entropy.h"
+#include "../dev/pm.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
 
@@ -264,6 +265,19 @@ static void mac_reset(void) {
     wr8(CMD, CMD_RESET);
     if (!wait8(CMD, CMD_RESET, 0, 1000, 10)) kprintf("rtl8125: reset did not complete\n");
 }
+
+/* Power change (dev/pm.h): interrupts off, then the reset ends every DMA. Polled waits only. */
+static void rtl_quiesce(void *arg) {
+    (void)arg;
+    wr32(IMR_CLEAR, 0xFFFFFFFF);
+    wr32(RXCFG, rd32(RXCFG) & ~0x3Fu);
+    wr8(CMD, rd8(CMD) & ~(CMD_TX_EN | CMD_RX_EN));
+    udelay(100);
+    wr8(CMD, CMD_RESET);
+    wait8(CMD, CMD_RESET, 0, 1000, 10);
+}
+
+static struct pm_device rtl_pm = {.name = "rtl8125", .stage = PM_STAGE_IO, .quiesce = rtl_quiesce};
 
 static void aspm_clkreq_off(void) {
     wr8(0xF1, rd8(0xF1) & ~0x80);
@@ -564,6 +578,7 @@ bool rtl8125_probe(void) {
         pic_unmask(d->irq);
     }
     net_register(&nif);
+    pm_register(&rtl_pm);
     wr32(ISR, 0xFFFFFFFF);
     wr32(IMR_SET, INT_MASK);
     start_autoneg();

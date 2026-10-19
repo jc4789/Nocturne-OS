@@ -3,6 +3,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "dev/pci.h"
+#include "dev/pm.h"
 #include "dev/usb.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
@@ -1421,6 +1422,20 @@ static void usb_thread(void *arg) {
     }
 }
 
+/* Power change (dev/pm.h): halt every controller, which ends its DMA (xHCI 4.24: within 16 ms).
+   The disks behind it were flushed before. Interrupts are off: polled. */
+static void xhci_quiesce(void *arg) {
+    (void)arg;
+    for (int i = 0; i < ncontrollers; i++) {
+        struct usb_hc *hc = &controllers[i];
+        if (!hc->op) continue;
+        wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
+        for (int t = 0; t < 20000 && !(rd32(hc->op, USBSTS) & STS_HCH); t++) io_wait(); /* ~1 us each */
+    }
+}
+
+static struct pm_device xhci_pm = {.name = "xhci", .stage = PM_STAGE_BUS, .quiesce = xhci_quiesce};
+
 void usb_init(void) {
     for (int i = 0; i < pci_count() && ncontrollers < MAX_HC; i++) {
         struct pci_device *d = pci_at(i);
@@ -1430,5 +1445,7 @@ void usb_init(void) {
             ncontrollers++;
         }
     }
-    if (ncontrollers) usb_task = kthread_create("usb", usb_thread, NULL);
+    if (!ncontrollers) return;
+    usb_task = kthread_create("usb", usb_thread, NULL);
+    pm_register(&xhci_pm);
 }

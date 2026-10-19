@@ -7,6 +7,7 @@
 #include "arch/cpu.h"
 #include "dev/blk.h"
 #include "dev/pci.h"
+#include "dev/pm.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -435,6 +436,22 @@ static void start(struct nvme *c) {
     for (unsigned i = 0; i < found; i++) add_namespace(c, nsids[i], model);
 }
 
+/* Normal shutdown notification before power goes away (section 7.6.2): the controller writes its
+   cache back and the drive does not count an unsafe shutdown. Interrupts are already off. */
+static void nvme_shutdown(void *arg) {
+    (void)arg;
+    for (int i = 0; i < nctrls; i++) {
+        struct nvme *c = &ctrls[i];
+        if (!c->live) continue;
+        wr32(c, CC, (rd32(c, CC) & ~0xC000u) | 0x4000u);
+        uint64_t us = c->rtd3e < 1000000 ? 1000000 : c->rtd3e > 10000000 ? 10000000 : c->rtd3e;
+        for (uint64_t t = 0; t < us && (rd32(c, CSTS) >> 2 & 3) != 2; t++) io_wait(); /* ~1 us each */
+        c->live = false;
+    }
+}
+
+static struct pm_device nvme_pm = {.name = "nvme", .stage = PM_STAGE_STORAGE, .quiesce = nvme_shutdown};
+
 void nvme_init(void) {
     for (int i = 0; i < pci_count() && nctrls < MAX_CTRL; i++) {
         struct pci_device *p = pci_at(i);
@@ -444,17 +461,5 @@ void nvme_init(void) {
         c->pci = p;
         start(c);
     }
-}
-
-/* Normal shutdown notification before power goes away (section 7.6.2): the controller writes its
-   cache back and the drive does not count an unsafe shutdown. Interrupts are already off. */
-void nvme_shutdown(void) {
-    for (int i = 0; i < nctrls; i++) {
-        struct nvme *c = &ctrls[i];
-        if (!c->live) continue;
-        wr32(c, CC, (rd32(c, CC) & ~0xC000u) | 0x4000u);
-        uint64_t us = c->rtd3e < 1000000 ? 1000000 : c->rtd3e > 10000000 ? 10000000 : c->rtd3e;
-        for (uint64_t t = 0; t < us && (rd32(c, CSTS) >> 2 & 3) != 2; t++) io_wait(); /* ~1 us each */
-        c->live = false;
-    }
+    if (nctrls) pm_register(&nvme_pm);
 }

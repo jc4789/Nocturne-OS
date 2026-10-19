@@ -114,8 +114,12 @@ void kmain(void) {
     kmain_late();
     /* become the idle task */
     for (;;) {
+        cli();
+        if (!need_resched) {
+            timer_idle();
+            __asm__ volatile("sti; hlt" : : : "memory"); /* a wake between the check and hlt ends the hlt */
+        }
         sti();
-        hlt();
         schedule();
     }
 }

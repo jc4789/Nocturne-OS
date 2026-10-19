@@ -94,6 +94,8 @@ void sched_make_ready(struct task *t);
 void schedule(void);
 void sched_yield(void);
 void sched_tick(void);
+bool sched_bsp_quiet(void);      /* tickless idle (dev/timer.c): nothing to run, no app on an AP */
+uint64_t sched_next_wake(void);  /* the earliest timeout (uptime_ms), UINT64_MAX: none */
 void sched_user_return(struct regs *r);
 void sched_post_switch(void); /* context_switch: 旧taskstackを離れた後だけpublication */
 NORETURN void sched_ap_loop(void);
@@ -120,6 +122,7 @@ NORETURN void task_exit(int code);
 NORETURN void task_exit_app(int code); /* SYS_EXIT or a fatal user exception: the whole app ends, from any of its threads */
 struct task *task_find(int pid);
 int task_kill(int pid);
+int task_stop_apps(void); /* power change: kill every app task; returns how many have not ended yet */
 int task_wait(int pid, int *status, bool nohang);
 void task_printf_stderr(struct task *t, const char *fmt, ...);
 /* Descriptor representation helpers; caller holds a BSP IRQ guard. File

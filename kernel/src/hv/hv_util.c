@@ -6,13 +6,11 @@
    framework and message versions. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "dev/pm.h"
 #include "dev/timer.h"
 #include "hv/vmbus.h"
 #include "net/net.h"
 #include "sys/sched.h"
-
-void power_off(void);
-void power_reboot(void);
 
 enum { IC_NEGOTIATE = 0, IC_HEARTBEAT = 1, IC_KVP = 2, IC_SHUTDOWN = 3, IC_TIMESYNC = 4 };
 #define IC_FLAG_TRANSACTION 1
@@ -65,10 +63,10 @@ static void util_thread(void *arg) {
         irq_restore(f);
         int a = pending_action;
         if (a == ACT_NONE) continue;
+        pending_action = ACT_NONE;
         kprintf("hv-util: the host asked us to %s\n", a == ACT_REBOOT ? "restart" : "shut down");
         sleep_ms(100); /* let our reply reach the host */
-        if (a == ACT_REBOOT) power_reboot();
-        else power_off();
+        pm_request(a == ACT_REBOOT ? PM_REBOOT : PM_POWER_OFF, false);
     }
 }
 

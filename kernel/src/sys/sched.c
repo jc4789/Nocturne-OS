@@ -7,6 +7,7 @@
 #include "arch/smp.h"
 #include "sys/sched.h"
 #include "sys/prof.h"
+#include "dev/timer.h"
 #include "arch/pstate.h"
 #include "sys/syscall.h"
 #include "mm/heap.h"
@@ -31,6 +32,7 @@ extern void kthread_trampoline(void);
 
 #define BSP_USER_SLICE_US 2000    /* BSPが借りたring3の最長連続 */
 #define BALANCE_MS 4              /* 過負荷のAPから軽いAPへの移送の間隔 */
+#define AP_IDLE_TICKS 2           /* tickless：APがtaskなしでこのms続いたら刻みを止める */
 #define KEI_SWITCH_COST_NS 10000  /* AP内の切替（XSAVE、CR3、キャッシュの回復）の見積り */
 #define KEI_OVERHEAD_PPM 10000    /* 切替損失の目標1%：継続幅はおよそ99倍 */
 static uint64_t bsp_stamp, bsp_run_us, balance_ms, kei_retention_v;
@@ -388,6 +390,10 @@ NORETURN void sched_ap_loop(void) {
     unsigned cpu = cpu_current_index();
     struct cpu_queue *q = &cpuq[cpu];
     cpu_runner_started();
+    /* Tickless idle: after AP_IDLE_TICKS ms without a task the tick stops (a syscall's round
+       trip through the BSP is shorter and keeps it), and starts again with the next task. */
+    uint64_t idle_since = 0;
+    bool tick_off = false;
     for (;;) {
         cli();
         if (cpu_worker_poll()) continue;
@@ -401,8 +407,21 @@ NORETURN void sched_ap_loop(void) {
             /* IF=0の検査からsti;hltまでに来た起床IPIは保留され、hltを抜ける。 */
             unsigned src = busiest_queue(cpu);
             if (src && move_waiting(src, cpu)) { STAT(steals); continue; }
+            if (!tick_off && tsc_hz >= 1000000 && timer_tickless()) {
+                uint64_t now = rdtsc();
+                if (!idle_since) idle_since = now;
+                else if (now - idle_since >= tsc_hz / 1000 * AP_IDLE_TICKS) {
+                    lapic_tick_stop();
+                    tick_off = true;
+                }
+            }
             __asm__ volatile("sti; hlt" : : : "memory");
             continue;
+        }
+        idle_since = 0;
+        if (tick_off) {
+            lapic_tick_resume();
+            tick_off = false;
         }
         /* kernel mappingの変更はtlb_shootdownがこのCPUにも届けるので全消去は不要。
            user spaceの古いtagはvmm_switchがgen比較で破棄する。 */
@@ -742,6 +761,24 @@ void sched_tick(void) {
         }
     }
     bsp_preempt_check();
+}
+
+/* BSP idle, interrupts off: sched_tick has nothing to do until a timeout. Nothing is ready, and
+   no AP runs or holds an app task (their uptime_ms reads need the tick, and so does ap_balance). */
+bool sched_bsp_quiet(void) {
+    if (current_task != idle_task || need_resched || kq.head ||
+        __atomic_load_n(&runner_return_pending, __ATOMIC_ACQUIRE))
+        return false;
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++)
+        if (q_resident(cpu) || __atomic_load_n(&cpuq[cpu].returned, __ATOMIC_RELAXED)) return false;
+    return true;
+}
+
+uint64_t sched_next_wake(void) {
+    uint64_t next = UINT64_MAX;
+    for (struct task *t = task_list; t; t = t->all_next)
+        if (t->state == TASK_BLOCKED && t->wake_at && t->wake_at < next) next = t->wake_at;
+    return next;
 }
 
 void sched_user_return(struct regs *r) {
@@ -1268,11 +1305,8 @@ NORETURN void task_exit(int code) {
     panic("zombie task %d was scheduled", t->pid);
 }
 
-int task_kill(int pid) {
-    uint64_t f = irq_save();
-    struct task *t = task_find(pid);
-    if (!t || t == idle_task) { irq_restore(f); return -N_ERR_NO_APP; }
-    if (!t->is_user) { irq_restore(f); return -N_ERR_DENIED; }
+/* BSP IRQ guard held. */
+static void kill_locked(struct task *t) {
     sched_quiesce_space(t->pml4);
     if (!t->killed) t->kill_code = 130;
     t->killed = true;
@@ -1286,8 +1320,28 @@ int task_kill(int pid) {
         t->wake_at = 0;
         sched_make_ready(t);
     }
+}
+
+int task_kill(int pid) {
+    uint64_t f = irq_save();
+    struct task *t = task_find(pid);
+    if (!t || t == idle_task) { irq_restore(f); return -N_ERR_NO_APP; }
+    if (!t->is_user) { irq_restore(f); return -N_ERR_DENIED; }
+    kill_locked(t);
     irq_restore(f);
     return 0;
+}
+
+int task_stop_apps(void) {
+    int alive = 0;
+    uint64_t f = irq_save();
+    for (struct task *t = task_list; t; t = t->all_next) {
+        if (!t->is_user || t->state == TASK_ZOMBIE) continue;
+        alive++;
+        if (!t->killed) kill_locked(t);
+    }
+    irq_restore(f);
+    return alive;
 }
 
 int task_wait(int pid, int *status, bool nohang) {

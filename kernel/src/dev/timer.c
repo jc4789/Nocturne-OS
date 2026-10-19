@@ -14,12 +14,12 @@ static uint64_t tsc_base, tsc_per_ms;
 static uint64_t reference_base;
 static bool reference_clock;
 
-/* The tick counts milliseconds. An emulator may drop timer interrupts when it falls behind (QEMU
-   without acceleration loses a quarter of them), so with a measured TSC the count is set from it
-   instead: a late tick catches up the time it missed. */
-static void timer_irq(struct regs *r) {
-    prof_tick(r, current_task->pid == 0);
-    if (pstate_sampling()) pstate_tick();
+/* Tickless idle: with a clock to catch up from, an idle machine stops the 1 kHz tick. */
+static bool tickless;
+volatile bool tick_stopped;
+
+/* Set the count from the clock; false without one (then each tick adds one). */
+static bool catch_up(void) {
     uint64_t reference;
     if (reference_clock && hv_reference_time(&reference)) {
         uint64_t ms = (reference - reference_base) / 10000;
@@ -28,10 +28,40 @@ static void timer_irq(struct regs *r) {
         uint64_t ms = (rdtsc() - tsc_base) / tsc_per_ms;
         if (ms > timer_ticks) timer_ticks = ms;
     } else {
-        timer_ticks++;
+        return false;
     }
+    return true;
+}
+
+/* The tick counts milliseconds. An emulator may drop timer interrupts when it falls behind (QEMU
+   without acceleration loses a quarter of them), so with a measured TSC the count is set from it
+   instead: a late tick catches up the time it missed. */
+static void timer_irq(struct regs *r) {
+    prof_tick(r, current_task->pid == 0);
+    if (pstate_sampling()) pstate_tick();
+    if (!catch_up()) timer_ticks++;
     audio_tick();
     sched_tick();
+}
+
+bool timer_tickless(void) { return tickless && !prof_enabled() && !pstate_sampling(); }
+
+/* BSP idle task, interrupts off. When nothing runs anywhere and no sound plays, the tick waits
+   for the earliest timeout instead (at most a second). Any interrupt starts it again
+   (timer_wake), so handlers always see the current uptime_ms. */
+void timer_idle(void) {
+    if (tick_stopped || !timer_tickless() || audio_needs_tick() || !sched_bsp_quiet()) return;
+    catch_up();
+    uint64_t now = timer_ticks, next = sched_next_wake();
+    if (next <= now + 1) return; /* due by the next tick anyway */
+    lapic_tick_once(next - now > 1000 ? 1000 : (unsigned)(next - now));
+    tick_stopped = true;
+}
+
+void timer_wake(void) {
+    tick_stopped = false;
+    lapic_tick_resume();
+    catch_up();
 }
 
 static uint8_t cmos(uint8_t reg) {
@@ -85,6 +115,8 @@ void timer_init(void) {
             tsc_per_ms = tsc_hz / 1000;
             tsc_base = rdtsc() - timer_ticks * tsc_per_ms;
         }
+        tickless = (tsc_per_ms || reference_clock) && !cmdline_has("notickless");
+        kprintf("timer: tickless idle %s\n", tickless ? "on (notickless turns it off)" : "off");
     } else {
         uint16_t div = 1193182 / 1000;
         outb(0x43, 0x36);

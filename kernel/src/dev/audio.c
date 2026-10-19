@@ -201,6 +201,9 @@ bool audio_pending(void) {
     return false;
 }
 
+/* audio_tick has work: frames wait, or the card has not yet played all it was given. */
+bool audio_needs_tick(void) { return audio_pending() || card_consumed != card_submitted; }
+
 void audio_tick(void) {
     static uint64_t last;
     uint64_t now = uptime_ms();

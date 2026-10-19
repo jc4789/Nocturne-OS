@@ -34,6 +34,7 @@ bool audio_mix(int16_t *out, int frames);
 bool audio_card_mix(int16_t *out, int frames);
 void audio_card_played(uint64_t ordinal);
 bool audio_pending(void); /* some stream has frames waiting */
+bool audio_needs_tick(void); /* tickless idle: the timer must keep calling audio_tick */
 
 /* A sound card: fill() tops up its buffers with audio_mix(); it is called from audio_tick().
    While audio_remote() it may only drain already-issued buffers, not mix new PCM.

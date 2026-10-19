@@ -24,10 +24,8 @@
 #include "sys/sched.h"
 #include "sys/proc.h"
 #include "sys/syscall.h"
+#include "dev/pm.h"
 #include "abi.h"
-
-void power_off(void);
-void power_reboot(void);
 
 #define TITLE_H   28
 #define TITLE_RADIUS 8 /* existing rounded title geometry; shared by shadow culling */
@@ -730,18 +728,11 @@ static void set_deep_simulation(bool on) {
 }
 
 static int launch(const char *path, const char *arg) {
-    if (!strcmp(path, "@reboot")) {
-        wm_notify("Restarting", "See you in a moment...");
-        composite();
-        sleep_ms(600);
-        power_reboot();
+    if (!strcmp(path, "@reboot") || !strcmp(path, "@poweroff")) {
+        pm_request(path[1] == 'r' ? PM_REBOOT : PM_POWER_OFF, true);
+        return 0;
     }
-    if (!strcmp(path, "@poweroff")) {
-        wm_notify("Shutting down", "Good night!");
-        composite();
-        sleep_ms(600);
-        power_off();
-    }
+    if (pm_stopping()) return -N_ERR_STOPPED;
     int pid = proc_spawn_simple(path, arg, NULL);
     if (pid < 0) {
         char msg[128];
@@ -2423,6 +2414,26 @@ void wm_process_exit(int pid) {
         if (i >= nwin) continue;
         if (zorder[i]->pid == pid) win_destroy(zorder[i]);
     }
+    wm_unlock();
+}
+
+int wm_window_count(char *top_title, size_t n) {
+    if (!running) return 0;
+    int count = 0;
+    wm_lock();
+    for (int i = nwin - 1; i >= 0; i--) {
+        if (zorder[i]->dead) continue;
+        if (!count++ && top_title) strlcpy(top_title, zorder[i]->title, n);
+    }
+    wm_unlock();
+    return count;
+}
+
+void wm_close_windows(void) {
+    if (!running) return;
+    wm_lock();
+    for (int i = 0; i < nwin; i++)
+        if (!zorder[i]->dead) send_simple(zorder[i], EV_CLOSE);
     wm_unlock();
 }
 

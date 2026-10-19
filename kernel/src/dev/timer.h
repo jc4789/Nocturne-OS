@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 struct tm_parts {
     int year, mon, mday, hour, min, sec, wday;
@@ -9,3 +10,8 @@ int64_t time_now(void);
 void time_set(int64_t unix_time); /* set the wall clock */
 void time_to_parts(int64_t t, struct tm_parts *p);
 int64_t time_from_parts(const struct tm_parts *p);
+/* Tickless idle (dev/timer.c). */
+extern volatile bool tick_stopped;
+bool timer_tickless(void); /* runner APs may stop their tick when idle */
+void timer_idle(void);     /* BSP idle task, interrupts off: maybe stop the tick */
+void timer_wake(void);     /* BSP, any interrupt while tick_stopped: tick again */

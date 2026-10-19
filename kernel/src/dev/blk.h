@@ -10,6 +10,9 @@ struct blkdev {
     uint64_t sectors;
     int (*read)(struct blkdev *d, uint64_t lba, uint32_t count, void *buf);
     int (*write)(struct blkdev *d, uint64_t lba, uint32_t count, const void *buf);
+    /* Write the device's cache back (power changes). NULL: every write already reaches the
+       medium (ATA, NVMe and Hyper-V disks flush after each write). */
+    int (*flush)(struct blkdev *d);
     void *priv;
 };
 

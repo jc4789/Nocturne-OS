@@ -4,6 +4,7 @@
 #include "net.h"
 #include "../arch/cpu.h"
 #include "../dev/pci.h"
+#include "../dev/pm.h"
 #include "../mm/pmm.h"
 
 #define NRX   32
@@ -87,6 +88,15 @@ static int tulip_send(const void *frame, size_t len) {
     csr_wr(1, 0); /* transmit poll demand */
     return 0;
 }
+
+/* Power change (dev/pm.h): interrupts off, receive and transmit stopped (CSR7, CSR6). */
+static void tulip_quiesce(void *arg) {
+    (void)arg;
+    csr_wr(7, 0);
+    csr_wr(6, 0);
+}
+
+static struct pm_device tulip_pm = {.name = "tulip", .stage = PM_STAGE_IO, .quiesce = tulip_quiesce};
 
 bool tulip_probe(void) {
     struct pci_device *d = pci_find(0x1011, 0x0009); /* 21140: Hyper-V legacy adapter */
@@ -177,5 +187,6 @@ bool tulip_probe(void) {
     kprintf("net: tulip (%04x) irq %d mac %02x:%02x:%02x:%02x:%02x:%02x\n", d->device, d->irq, nif.mac[0],
             nif.mac[1], nif.mac[2], nif.mac[3], nif.mac[4], nif.mac[5]);
     net_register(&nif);
+    pm_register(&tulip_pm);
     return true;
 }

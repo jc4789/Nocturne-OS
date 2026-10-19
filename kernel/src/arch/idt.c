@@ -5,6 +5,7 @@
 #include "sys/syscall.h"
 #include "mm/vmm.h"
 #include "dev/entropy.h"
+#include "dev/timer.h"
 #include "arch/irq.h"
 
 struct idt_entry {
@@ -186,6 +187,7 @@ void isr_dispatch(struct regs *r) {
         if (v != 0xFF) lapic_eoi();
         return;
     }
+    if (tick_stopped) timer_wake(); /* the BSP was idle without its tick: uptime_ms catches up first */
     if (v < 32) {
         exception(r, r->vector == 14 ? read_cr2() : 0, 0);
     } else if (v < 48) {

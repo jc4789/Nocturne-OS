@@ -7,6 +7,7 @@
 #include "dev/audio.h"
 #include "arch/cpu.h"
 #include "dev/pci.h"
+#include "dev/pm.h"
 #include "mm/pmm.h"
 
 /* mixer registers (NAM, BAR0) */
@@ -118,6 +119,15 @@ static void ac97_fill(void) {
     if (audio_trace_active) audio_trace_ac97(before, inw(nabm + PO_SR), filled, restarted);
 }
 
+/* Power change (dev/pm.h): the PCM-out engine stops reading descriptors and buffers. */
+static void ac97_quiesce(void *arg) {
+    (void)arg;
+    outb(nabm + PO_CR, 0);
+    dma_live = false;
+}
+
+static struct pm_device ac97_pm = {.name = "ac97", .stage = PM_STAGE_IO, .quiesce = ac97_quiesce};
+
 void ac97_init(void) {
     static const uint16_t ids[] = {0x2415, 0x2425, 0x2445, 0x2485, 0x24C5, 0x24D5, 0x266E, 0x27DE, 0x7195};
     struct pci_device *d = NULL;
@@ -160,5 +170,6 @@ void ac97_init(void) {
     lvi = NBUF - 1; /* no descriptor has been issued; reset PIV will start at 0 */
     dma_live = false; /* do not start a perpetual silence DMA stream at boot */
     audio_set_card("AC'97", ac97_fill);
+    pm_register(&ac97_pm);
     kprintf("audio: AC'97 (%04x) at ports %#x/%#x, 48 kHz stereo\n", d->device, nam, nabm);
 }

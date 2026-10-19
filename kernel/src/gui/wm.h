@@ -15,6 +15,10 @@ char *wm_clipboard_snapshot(size_t *len);
 void wm_process_exit(int pid);
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
 void wm_notify(const char *title, const char *text); /* desktop toast */
+/* Power changes (dev/pm.c): how many app windows are open (the top one's
+   title in top_title), and ask every one of them to close. */
+int wm_window_count(char *top_title, size_t n);
+void wm_close_windows(void);
 
 /* Remote display: rectangle copies hold WM ownership only for the copy, never
    while encoding or sending a network packet. */

@@ -246,6 +246,24 @@ static int msc_write(struct blkdev *b, uint64_t lba, uint32_t count, const void 
     return io.result;
 }
 
+/* SYNCHRONIZE CACHE(10) over the whole unit (SBC). A unit without a write cache may refuse it
+   (ILLEGAL REQUEST): then nothing was waiting. */
+static void do_flush(void *arg) {
+    struct io *io = arg;
+    static const uint8_t cdb[10] = {0x35};
+    struct msc *m = io->l->m;
+    io->result = -1;
+    if (!m->dev) return;
+    int r = scsi(m, io->l->lun, cdb, 10, NULL, 0, false);
+    io->result = r >= 0 || (r == BOT_FAILED && m->sense_key == 5) ? 0 : -1;
+}
+
+static int msc_flush(struct blkdev *b) {
+    struct io io = {b->priv, false, 0, 0, NULL, -1};
+    usb_run(do_flush, &io);
+    return io.result;
+}
+
 static void probe_lun(struct msc *m, unsigned lun) {
     uint8_t inq[36] = {0}, cdb[6] = {0x12, 0, 0, 0, sizeof inq, 0};
     int r = scsi(m, lun, cdb, 6, inq, sizeof inq, true);
@@ -292,6 +310,7 @@ static void probe_lun(struct msc *m, unsigned lun) {
     l->blk.sectors = blocks * (block / 512);
     l->blk.read = msc_read;
     l->blk.write = msc_write;
+    l->blk.flush = msc_flush;
     l->blk.priv = l;
     blk_register(&l->blk);
 }

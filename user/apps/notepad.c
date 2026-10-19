@@ -38,6 +38,11 @@ static uint32_t btn_node[NBTN]; /* where the buttons are in the last view */
 static int prompt_kind;         /* B_OPEN or B_SAVEAS */
 static int prompt_focus;        /* the field's "focus": counts up each time the prompt opens */
 static uint32_t prompt_field;   /* its place in the last view */
+/* Closing with unsaved changes (the close button, or the system shutting down) asks first. */
+enum { A_SAVE, A_DISCARD, A_CANCEL, NASK };
+static const char *ask_label[NASK] = {"Save", "Don't save", "Cancel"};
+static uint32_t ask_node[NASK];
+static bool closing;
 
 /* the look of the text area */
 static float fs, small_size, space_w;
@@ -341,7 +346,17 @@ static void show(void) {
                 ui_num(&m, "compact", 1);
                 ui_end(&m);
             }
-            if (prompt_open) {
+            if (closing && !prompt_open) {
+                ui_node(&m, "text"); ui_str(&m, "text", "Save changes?");
+                ui_num(&m, "colour", ui_theme.accent); ui_num(&m, "weight", 1); ui_num(&m, "ellipsis", 1);
+                ui_num(&m, "grow", 1); ui_nums(&m, "padding", (double[]){0, 8}, 2); ui_end(&m);
+                for (int i = 0; i < NASK; i++) {
+                    ask_node[i] = ui_node(&m, "button");
+                    ui_str(&m, "text", ask_label[i]);
+                    ui_num(&m, "compact", 1);
+                    ui_end(&m);
+                }
+            } else if (prompt_open) {
                 ui_node(&m, "text"); ui_str(&m, "text", prompt_kind == B_OPEN ? "Open:" : "Save as:");
                 ui_num(&m, "colour", ui_theme.accent); ui_num(&m, "weight", 1); ui_nums(&m, "padding", (double[]){0, 4}, 2);
                 ui_end(&m);
@@ -529,11 +544,18 @@ int main(int argc, char **argv) {
                 strlcpy(prompt_buf, e.text, sizeof prompt_buf);
                 prompt_open = false;
                 if (prompt_kind == B_OPEN) load_file(prompt_buf);
-                else save_file(prompt_buf);
+                else if (save_file(prompt_buf) && closing) running = false;
                 redraw = follow = true;
                 break;
             case UI_EVENT_CLICK:
-                if (e.node == btn_node[B_NEW]) new_text();
+                if (closing && e.node == ask_node[A_SAVE]) {
+                    if (!path[0]) open_prompt(B_SAVEAS);
+                    else if (save_file(path)) running = false;
+                } else if (closing && e.node == ask_node[A_DISCARD]) {
+                    running = false;
+                } else if (closing && e.node == ask_node[A_CANCEL]) {
+                    closing = false;
+                } else if (e.node == btn_node[B_NEW]) new_text();
                 else if (e.node == btn_node[B_OPEN]) open_prompt(B_OPEN);
                 else if (e.node == btn_node[B_SAVE]) save();
                 else if (e.node == btn_node[B_SAVEAS]) open_prompt(B_SAVEAS);
@@ -573,7 +595,8 @@ int main(int argc, char **argv) {
                 win_h = (int)e.b;
                 break;
             case UI_EVENT_CLOSE:
-                running = false;
+                if (!modified) running = false;
+                closing = true;
                 break;
             }
         }
@@ -584,8 +607,8 @@ int main(int argc, char **argv) {
         char now[1024];
         char right[96];
         right_status(right, sizeof right);
-        snprintf(now, sizeof now, "%d|%d|%d|%d|%d|%s|%s|%s|%s", win_w, win_h, prompt_open, prompt_kind, prompt_focus,
-                 prompt_buf, path, status, right);
+        snprintf(now, sizeof now, "%d|%d|%d|%d|%d|%d|%s|%s|%s|%s", win_w, win_h, closing, prompt_open, prompt_kind,
+                 prompt_focus, prompt_buf, path, status, right);
         if (strcmp(now, shown)) {
             strlcpy(shown, now, sizeof shown);
             show();

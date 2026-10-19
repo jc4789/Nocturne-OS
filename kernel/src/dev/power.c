@@ -1,10 +1,9 @@
-/* ACPI-based power off and reboot (with emulator fallbacks). */
+/* ACPI-based power off and reboot (with emulator fallbacks): the last step of a power change
+   (dev/pm.c), after the apps have ended and the devices have stopped. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "dev/acpi.h"
 #include "mm/vmm.h"
-
-void nvme_shutdown(void);
 
 struct gas {
     uint8_t space, bit_width, bit_offset, access;
@@ -98,7 +97,6 @@ void acpi_init(void) {
 void power_off(void) {
     cli();
     kprintf("power: shutting down\n");
-    nvme_shutdown();
     if (fadt && s5_ok && fadt_has(268) && fadt->sleep_control.address) {
         /* hardware-reduced ACPI: SLP_TYPx in bits 2-4, SLP_EN is bit 5 */
         gas_write(&fadt->sleep_control, ((slp_typa & 7) << 2) | (1 << 5));
@@ -122,7 +120,6 @@ void power_off(void) {
 void power_reboot(void) {
     cli();
     kprintf("power: rebooting\n");
-    nvme_shutdown();
     if (fadt_has(129) && (fadt->flags & FADT_RESET_REG_SUP) && fadt->reset_reg.address) {
         gas_write(&fadt->reset_reg, fadt->reset_value);
         for (int i = 0; i < 100000; i++) io_wait();

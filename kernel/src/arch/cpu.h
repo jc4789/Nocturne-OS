@@ -97,6 +97,11 @@ bool lapic_send_ipi(uint32_t apic_id, uint8_t vector);
 void lapic_eoi(void);
 bool lapic_timer_start(unsigned hz, int vector);
 bool lapic_runner_timer_start(void); /* BSPで較正済みのperiodic tickだけをAPで再使用 */
+/* Tickless idle, after lapic_timer_start: stop this CPU's tick, fire it once after ms, or go
+   back to the periodic tick. */
+void lapic_tick_stop(void);
+void lapic_tick_once(unsigned ms);
+void lapic_tick_resume(void);
 void isr_dispatch_remote(struct regs *r, uint64_t cr2);
 extern uint64_t tsc_hz; /* measured by lapic_timer_start(); 0 if unknown */
 #define VEC_TIMER 0x30

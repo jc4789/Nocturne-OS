@@ -6,6 +6,7 @@
 #include "dev/input.h"
 #include "dev/fbcon.h"
 #include "dev/pci.h"
+#include "dev/pm.h"
 #include "arch/ioapic.h"
 #include "dev/ata.h"
 #include "dev/audio.h"
@@ -116,6 +117,7 @@ void kmain_late(void) {
         kprintf("initrd: none found!\n");
     }
     acpi_init();
+    pm_init(); /* the power thread: every shutdown and restart goes through it */
     ioapic_init(); /* maps and masks the pins; nothing routes through it yet (devices stay on the PIC / MSI) */
     if (vmbus_init()) {
         hv_input_init();

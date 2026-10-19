@@ -19,14 +19,13 @@
 #include "dev/pciuser.h"
 #include "arch/pat.h"
 #include "gui/wm.h"
+#include "dev/pm.h"
 #include "abi.h"
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
 
 extern char cpu_brand[64];
-void power_off(void);
-void power_reboot(void);
 int pci_list(struct n_pciinfo *out, int max);
 void vmm_user_pages_split(uint64_t pml4, uint64_t out[6]);
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
@@ -1471,9 +1470,10 @@ void syscall_dispatch(struct regs *r) {
     }
     case SYS_YIELD: schedule(); ret = 0; break;
     case SYS_POWER:
-        if (a == POWER_REBOOT) power_reboot();
-        else power_off();
-        ret = -N_ERR_IO;
+        /* the power thread ends this app with the others */
+        pm_request(a == POWER_REBOOT ? PM_REBOOT : PM_POWER_OFF, false);
+        while (!current_task->killed) sleep_ms(1000);
+        ret = -N_ERR_STOPPED;
         break;
     case SYS_SYSTEM_LOG: ret = sys_system_log((char *)a, b); break;
     case SYS_PCILIST:

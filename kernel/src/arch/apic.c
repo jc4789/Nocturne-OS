@@ -191,3 +191,18 @@ bool lapic_runner_timer_start(void) {
     lapic_write(LAPIC_TIMER_INIT, timer_reload);
     return true;
 }
+
+/* Tickless idle. An initial count of 0 stops the timer in either mode; one-shot mode counts
+   down once and stops. The CPU's own LAPIC only, with interrupts off. */
+void lapic_tick_stop(void) { lapic_write(LAPIC_TIMER_INIT, 0); }
+
+void lapic_tick_once(unsigned ms) {
+    if (ms > UINT32_MAX / timer_reload) ms = UINT32_MAX / timer_reload;
+    lapic_write(LAPIC_LVT_TIMER, (uint32_t)timer_vector);
+    lapic_write(LAPIC_TIMER_INIT, ms * timer_reload);
+}
+
+void lapic_tick_resume(void) {
+    lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)timer_vector);
+    lapic_write(LAPIC_TIMER_INIT, timer_reload);
+}

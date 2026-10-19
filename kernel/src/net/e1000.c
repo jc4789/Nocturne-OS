@@ -3,6 +3,7 @@
 #include "net.h"
 #include "../arch/cpu.h"
 #include "../dev/pci.h"
+#include "../dev/pm.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
 
@@ -188,6 +189,16 @@ static uint32_t e1000_itr_ticks(void) {
     return ticks;
 }
 
+/* Power change (dev/pm.h): no more interrupts, receive or transmit DMA. */
+static void e1000_quiesce(void *arg) {
+    (void)arg;
+    wr(REG_IMC, 0xFFFFFFFF);
+    wr(REG_RCTL, 0);
+    wr(REG_TCTL, 0);
+}
+
+static struct pm_device e1000_pm = {.name = "e1000", .stage = PM_STAGE_IO, .quiesce = e1000_quiesce};
+
 static void e1000_free_dma(uint64_t rx_ring, uint64_t tx_ring) {
     for (size_t i = 0; i < NRX; i += BUFS_PER_PAGE)
         if (rxbuf[i]) pmm_free(hhdm_virt_to_phys(rxbuf[i]));
@@ -292,6 +303,7 @@ bool e1000_probe(void) {
     nif.rx_pending = e1000_rx_pending;
     nif.poll_rx = e1000_poll_rx;
     net_register(&nif);
+    pm_register(&e1000_pm);
     irq_register(d->irq, e1000_irq);
     pic_unmask(d->irq);
     rd(REG_ICR);
