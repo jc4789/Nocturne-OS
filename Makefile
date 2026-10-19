@@ -331,6 +331,21 @@ $(TS_BINS): $(BUILD)/root/bin/%.js: $(BUILD)/apps-ts.stamp
 endif
 endif
 
+include ports/rust/rust.mk
+
+# /bin/nvrm: NVIDIA's RM as a driver app (ports/nvidia/README.md). init starts it only when an
+# NVIDIA display function is present, so other machines just carry the file.
+include ports/nvidia/nvrm.mk
+NVRM_FILES := $(BUILD)/root/bin/nvrm $(BUILD)/root/usr/share/licenses/nvidia-open/COPYING \
+    $(BUILD)/root/usr/share/licenses/nvidia-open/NOTICES
+$(BUILD)/root/usr/share/licenses/nvidia-open/%: third_party/nvidia-open/%
+	@mkdir -p $(dir $@)
+	@cp $< $@
+$(BUILD)/root/bin/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+	@mkdir -p $(dir $@)
+	@echo "  LD   $@"
+	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
+
 $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
 	@mkdir -p $(dir $@)
 	@cp $(BUILD)/cxx/LICENSE.libc++.txt $@
@@ -406,11 +421,29 @@ $(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(
 all: image
 
 kernel: $(BUILD)/kernel.elf
-user: $(APP_BINS) $(BUILD)/root/bin/tcc
+user: $(APP_BINS) $(NVRM_FILES) $(BUILD)/root/bin/tcc
 cxx: $(CPP_BINS) $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT
 lexbor: $(LXB_OBJ)
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(GO_FILES) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
+# NVIDIA GSP firmware for /bin/nvrm (docs/nvidia/LEDGER.md D9). It is never in git and never
+# distributed: a copy unpacked into local/ (ignored) goes into images built on this machine, and
+# images get none without it. NVIDIA_FIRMWARE= leaves it out explicitly.
+NVIDIA_FIRMWARE ?= local/firmware/nvidia/615.78.08
+NVIDIA_FW_ROOT := $(BUILD)/root/usr/share/firmware/nvidia/615.78.08
+# RM (osinit.c) needs both images of the GPU family: Ampere and Ada (the RTX 4070) use ga10x.
+NVIDIA_FW_FILES := $(if $(and $(NVIDIA_FIRMWARE),$(wildcard $(NVIDIA_FIRMWARE)/firmware/gsp_ga10x.bin)),\
+    $(NVIDIA_FW_ROOT)/gsp_ga10x.bin $(NVIDIA_FW_ROOT)/ucodes_ga10x.bin $(NVIDIA_FW_ROOT)/LICENSE)
+$(NVIDIA_FW_ROOT)/%.bin: $(NVIDIA_FIRMWARE)/firmware/%.bin
+	@mkdir -p $(dir $@)
+	@cp $< $@
+$(NVIDIA_FW_ROOT)/LICENSE: $(NVIDIA_FIRMWARE)/LICENSE
+	@mkdir -p $(dir $@)
+	@cp $< $@
+ifeq ($(NVIDIA_FW_FILES),)
+$(shell rm -rf $(BUILD)/root/usr/share/firmware/nvidia)
+endif
+
+$(BUILD)/initrd.tar: $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(NVRM_FILES) $(NVIDIA_FW_FILES) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"
 	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
 

@@ -3,7 +3,7 @@
 #include "sys/sched.h"
 
 enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_WINDOW = 5, VT_CHANNEL = 6, VT_SHARED = 7, VT_ADDRESS_WATCH = 8,
-       VT_APP = 9, VT_EVENTS = 10 };
+       VT_APP = 9, VT_EVENTS = 10, VT_PCI = 11 };
 
 #define O_RDONLY    0x0
 #define O_WRONLY    0x1

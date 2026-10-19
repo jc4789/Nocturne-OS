@@ -142,6 +142,7 @@ struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls) {
 }
 
 void pci_enable_busmaster(struct pci_device *d) {
+    d->kernel_owned = true;
     uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 4);
     cmd |= 0x7; /* I/O, memory, bus master */
     pci_write32(d->bus, d->dev, d->func, 4, cmd);

@@ -96,6 +96,11 @@ enum {
     /* (bytes, access): N_MEMORY_* access, N_MEMORY_LOW added for pages below 2 GiB */
     SYS_MEMORY_RESERVE, SYS_MEMORY_RELEASE, SYS_MEMORY_PROTECT,
     SYS_SHARED_MAP, /* (shared handle, bytes, N_MEMORY_READ or N_MEMORY_READ_WRITE) */
+    /* Drivers in apps (docs/nocturne-native-abi.md §9): the right to a PCI function, its
+       memory as shared objects and its interrupts. */
+    SYS_PCI_CLAIM, SYS_PCI_INFO, SYS_PCI_CONFIG_READ, SYS_PCI_CONFIG_WRITE, SYS_PCI_BAR,
+    SYS_PCI_INTERRUPTS, SYS_PCI_INTERRUPT_TAKE,
+    SYS_DMA_CREATE, SYS_DMA_ADDRESSES, SYS_SHARED_VIEW,
     SYS_MAX = 192
 };
 
@@ -109,6 +114,7 @@ enum {
 #define N_KIND_EVENTS 7
 #define N_KIND_DEVICE 8
 #define N_KIND_CONNECTION 9
+#define N_KIND_PCI 10       /* the right to drive one PCI function */
 
 /* n_document_open access: one of these, not a bit set. */
 #define N_DOCUMENT_READ 1     /* read an existing document */
@@ -211,6 +217,43 @@ struct n_pciinfo {
     uint8_t bus, dev, func, cls, subcls, progif;
     uint16_t vendor, device;
 };
+
+/* A claimed PCI function (n_pci_info). Addresses are bus addresses, which are physical
+   addresses (Nocturne programs no IOMMU). */
+#define N_PCI_BAR_MEMORY 1u
+#define N_PCI_BAR_64BIT 2u
+#define N_PCI_BAR_PREFETCH 4u
+#define N_PCI_BAR_IO 8u
+#define N_PCI_NONE 0xFFFFFFFFu  /* no such function, BAR or framebuffer */
+#define N_PCI_SELF 0xFFFFFFFFu  /* n_pci_config_read: the claimed function itself */
+#define N_PCI_TARGET(bus, dev, func) ((uint32_t)(bus) << 8 | (uint32_t)(dev) << 3 | (uint32_t)(func))
+struct n_pci_bar {
+    uint64_t address, size;
+    uint32_t flags, reserved;
+};
+struct n_pci_function {
+    uint8_t bus, dev, func, revision;
+    uint16_t vendor, device, subsystem_vendor, subsystem_id;
+    uint8_t cls, subcls, progif, interrupt_pin;
+    uint32_t msi_vectors, msix_vectors; /* what the function offers, 0 without */
+    uint32_t upstream;                  /* N_PCI_TARGET of the bridge above it, or N_PCI_NONE */
+    uint32_t reserved;
+    struct n_pci_bar bar[6];
+    /* The screen the firmware set up, when its pixels lie in one of this function's BARs
+       (framebuffer_bar, else N_PCI_NONE): drivers must keep that memory as it is. */
+    uint64_t framebuffer_address, framebuffer_size;
+    uint32_t framebuffer_bar, framebuffer_width, framebuffer_height, framebuffer_pitch;
+    uint32_t framebuffer_bpp, reserved2;
+};
+/* n_dma_create flags */
+#define N_DMA_CONTIGUOUS 1u  /* one physically contiguous run */
+#define N_DMA_32BIT 2u       /* every page below 4 GiB */
+/* n_shared_view caching. RAM may be viewed in any of them, device memory only uncached or
+   write-combining, other shared pages only as they are. */
+#define N_CACHE_DEFAULT 0u   /* the object's own: write-back for RAM, uncached for device memory */
+#define N_CACHE_WRITE_BACK 1u
+#define N_CACHE_WRITE_COMBINE 2u
+#define N_CACHE_UNCACHED 3u
 
 /* power */
 #define POWER_OFF 0

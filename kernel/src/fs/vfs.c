@@ -424,6 +424,7 @@ int vfs_kind(struct vnode *v) {
     case VT_WINDOW: return N_KIND_WINDOW;
     case VT_SHARED: return N_KIND_SHARED;
     case VT_APP: return N_KIND_APP;
+    case VT_PCI: return N_KIND_PCI;
     case VT_EVENTS: case VT_ADDRESS_WATCH: return N_KIND_EVENTS;
     default: return N_KIND_DEVICE;
     }

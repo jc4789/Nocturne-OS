@@ -16,6 +16,8 @@
 #include "dev/gpu.h"
 #include "dev/audio.h"
 #include "dev/entropy.h"
+#include "dev/pciuser.h"
+#include "arch/pat.h"
 #include "gui/wm.h"
 #include "abi.h"
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
@@ -27,6 +29,7 @@ void power_off(void);
 void power_reboot(void);
 int pci_list(struct n_pciinfo *out, int max);
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
+static int copy_to_user(void *udst, const void *src, size_t n);
 
 /* ---- user memory access ---- */
 
@@ -245,15 +248,30 @@ static int64_t stop_tree(int pid, int include_self) {
  * address space (a growable buffer's or shared wasm memory's maximum): a
  * two-level table of leaf frames receives zeroed pages at the first touch by
  * any mapping process, and every later mapper sees the same frame. */
+/* Drivers in apps (dev/pciuser.c) add objects over memory that is not handed out page by page:
+ * a range is a run of physical pages, a device's BAR or a contiguous DMA run it allocated whole;
+ * a view maps part of another object, which it holds open, with its own caching. DMA objects
+ * are RAM (or an owned range) whose bus addresses n_dma_addresses reports. */
 #define SHARED_LEAF (PAGE_SIZE/sizeof(uint64_t))
-struct shared_pages {size_t count;bool demand;uint64_t pages[];};
+enum {SHARED_RAM,SHARED_DEMAND,SHARED_RANGE,SHARED_VIEW};
+struct shared_pages {
+    size_t count;uint8_t kind,cache;bool dma,owned;
+    uint64_t base;struct file *parent;size_t first; /* a range's first frame; a view's object and first page */
+    uint64_t pages[];
+};
 struct shared_mapping {struct shared_mapping *next;struct file *file;uint64_t va,flags;size_t bytes;};
 static size_t shared_slots(const struct shared_pages *p) {
-    return p->demand?(p->count+SHARED_LEAF-1)/SHARED_LEAF:p->count;
+    return p->kind==SHARED_DEMAND?(p->count+SHARED_LEAF-1)/SHARED_LEAF:p->kind==SHARED_RAM?p->count:0;
+}
+static struct shared_pages *shared_root(struct shared_pages *p) {
+    while(p->kind==SHARED_VIEW)p=p->parent->vn->priv;
+    return p;
 }
 /* BSP-owned, called with interrupts disabled or from the fault handler. */
 static uint64_t shared_frame(struct shared_pages *p,size_t index,bool create) {
-    if(!p->demand)return p->pages[index];
+    if(p->kind==SHARED_RAM)return p->pages[index];
+    if(p->kind==SHARED_RANGE)return p->base+index*PAGE_SIZE;
+    if(p->kind==SHARED_VIEW)return shared_frame(p->parent->vn->priv,p->first+index,create);
     uint64_t *leaf=&p->pages[index/SHARED_LEAF];
     if(!*leaf){if(!create || !(*leaf=pmm_alloc_zeroed()))return 0;}
     uint64_t *slot=(uint64_t *)phys_to_virt(*leaf)+index%SHARED_LEAF;
@@ -265,40 +283,146 @@ static void shared_release(struct vnode *v) {
     if(p){
         for(size_t i=0;i<shared_slots(p);i++){
             if(!p->pages[i])continue;
-            if(p->demand){uint64_t *leaf=phys_to_virt(p->pages[i]);
+            if(p->kind==SHARED_DEMAND){uint64_t *leaf=phys_to_virt(p->pages[i]);
                 for(size_t j=0;j<SHARED_LEAF;j++)if(leaf[j])pmm_free(leaf[j]);}
             pmm_free(p->pages[i]);
         }
+        if(p->kind==SHARED_RANGE && p->owned)for(size_t i=0;i<p->count;i++)pmm_free(p->base+i*PAGE_SIZE);
+        if(p->parent)vfs_close(p->parent);
         kfree(p);
     }
     kfree(v);
 }
 static struct vnode_ops shared_ops={.release=shared_release};
+/* An empty object record of `bytes` with `slots` page slots, write-back until told otherwise. */
+static struct shared_pages *shared_new(size_t bytes,uint8_t kind,size_t slots,struct vnode **out) {
+    if(slots>(SIZE_MAX-sizeof(struct shared_pages))/sizeof(uint64_t))return NULL;
+    struct vnode *v=kzalloc(sizeof *v);if(!v)return NULL;
+    struct shared_pages *p=kzalloc(sizeof *p+slots*sizeof(uint64_t));
+    if(!p){kfree(v);return NULL;}
+    p->kind=kind;p->cache=N_CACHE_WRITE_BACK;
+    v->type=VT_SHARED;v->size=bytes;v->unlinked=true;v->ops=&shared_ops;v->priv=p;
+    *out=v;return p;
+}
+static int64_t shared_open(struct vnode *v,int flags,struct file **out) {
+    struct file *f=vfs_open_vnode(v,flags);
+    if(!f){shared_release(v);return -N_ERR_NO_MEMORY;}
+    *out=f;return 0;
+}
 /* A file over a new shared object of `bytes` (page aligned). */
 static int64_t shared_object(size_t bytes,bool demand,int flags,struct file **out) {
     if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1))return -N_ERR_INVALID;
     bytes=ALIGN_UP(bytes,PAGE_SIZE);size_t count=bytes/PAGE_SIZE;
     size_t slots=demand?(count+SHARED_LEAF-1)/SHARED_LEAF:count;
-    if(slots>(SIZE_MAX-sizeof(struct shared_pages))/sizeof(uint64_t))return -N_ERR_INVALID;
     if(!demand && count>pmm_free_pages())return -N_ERR_NO_MEMORY;
-    struct vnode *v=kzalloc(sizeof *v);if(!v)return -N_ERR_NO_MEMORY;
-    struct shared_pages *p=kzalloc(sizeof *p+slots*sizeof(uint64_t));
-    if(!p){kfree(v);return -N_ERR_NO_MEMORY;}
-    p->demand=demand;
-    v->type=VT_SHARED;v->size=bytes;v->unlinked=true;v->ops=&shared_ops;v->priv=p;
+    struct vnode *v;struct shared_pages *p=shared_new(bytes,demand?SHARED_DEMAND:SHARED_RAM,slots,&v);
+    if(!p)return -N_ERR_NO_MEMORY;
     if(demand)p->count=count;
     else for(;p->count<count;p->count++){
         p->pages[p->count]=pmm_alloc_zeroed();
         if(!p->pages[p->count]){shared_release(v);return -N_ERR_NO_MEMORY;}
     }
-    struct file *f=vfs_open_vnode(v,flags);
-    if(!f){shared_release(v);return -N_ERR_NO_MEMORY;}
-    *out=f;return 0;
+    return shared_open(v,flags,out);
 }
-static int64_t sys_shared_create(size_t bytes,bool demand) {
-    struct file *f=NULL;int64_t r=shared_object(bytes,demand,O_RDWR,&f);
+static int64_t new_handle(int64_t r,struct file *f) {
     if(r<0)return r;
     int fd=allocfd(f);if(fd<0)vfs_close(f);return fd;
+}
+static int64_t sys_shared_create(size_t bytes,bool demand) {
+    struct file *f=NULL;
+    return new_handle(shared_object(bytes,demand,O_RDWR,&f),f);
+}
+static uint64_t cache_pte(unsigned cache) {
+    if(cache==N_CACHE_WRITE_COMBINE && pat_supported())return PTE_PWT|PTE_PAT4K; /* PAT index 5 */
+    if(cache==N_CACHE_WRITE_COMBINE || cache==N_CACHE_UNCACHED)return PTE_PCD|PTE_PWT; /* index 3 */
+    return 0;
+}
+
+/* A claimed function's memory BAR: device memory, uncached unless a view says otherwise. */
+static int64_t sys_pci_bar(int h,uint32_t bar) {
+    struct file *pci=getfd_ref(h);
+    if(!pci)return -N_ERR_NO_HANDLE;
+    uint64_t address=0,size=0;int64_t r=pci_user_bar(pci,bar,&address,&size);
+    vfs_close(pci);
+    if(r<0)return r;
+    if(size>SIZE_MAX)return -N_ERR_TOO_LARGE;
+    struct vnode *v;struct shared_pages *p=shared_new(size,SHARED_RANGE,0,&v);
+    if(!p)return -N_ERR_NO_MEMORY;
+    p->base=address;p->count=size/PAGE_SIZE;p->cache=N_CACHE_UNCACHED;
+    struct file *f=NULL;
+    return new_handle(shared_open(v,O_RDWR,&f),f);
+}
+/* Zeroed RAM a claimed function may reach by DMA. A contiguous run is allocated whole; pages
+   below 4 GiB come from the low end of memory, where the allocator's run search begins. */
+static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
+    struct file *pci=getfd_ref(h);
+    if(!pci)return -N_ERR_NO_HANDLE;
+    bool claim=pci_user_is_claim(pci);vfs_close(pci);
+    if(!claim)return -N_ERR_WRONG_KIND;
+    if(flags&~(N_DMA_CONTIGUOUS|N_DMA_32BIT) || !bytes || bytes>SIZE_MAX-(PAGE_SIZE-1))return -N_ERR_INVALID;
+    bytes=ALIGN_UP(bytes,PAGE_SIZE);size_t count=bytes/PAGE_SIZE;
+    if(count>pmm_free_pages())return -N_ERR_NO_MEMORY;
+    uint64_t limit=flags&N_DMA_32BIT?0x100000000ull:UINT64_MAX;
+    struct vnode *v;struct shared_pages *p;
+    if(flags&N_DMA_CONTIGUOUS){
+        uint64_t base=pmm_alloc_contig(count);
+        if(!base)return -N_ERR_NO_MEMORY;
+        if(base+bytes>limit || !(p=shared_new(bytes,SHARED_RANGE,0,&v))){
+            for(size_t i=0;i<count;i++)pmm_free(base+i*PAGE_SIZE);
+            return -N_ERR_NO_MEMORY;
+        }
+        memset(phys_to_virt(base),0,bytes);
+        p->base=base;p->count=count;p->owned=true;
+    }else{
+        if(!(p=shared_new(bytes,SHARED_RAM,count,&v)))return -N_ERR_NO_MEMORY;
+        for(;p->count<count;p->count++){
+            uint64_t frame=limit==UINT64_MAX?pmm_alloc():pmm_alloc_contig(1);
+            if(frame && frame+PAGE_SIZE>limit){pmm_free(frame);frame=0;}
+            if(!frame){shared_release(v);return -N_ERR_NO_MEMORY;}
+            memset(phys_to_virt(frame),0,PAGE_SIZE);
+            p->pages[p->count]=frame;
+        }
+    }
+    p->dma=true;
+    struct file *f=NULL;
+    return new_handle(shared_open(v,O_RDWR,&f),f);
+}
+/* Bus addresses of a DMA object's (or a device range's) pages, also through views. */
+static int64_t sys_dma_addresses(int h,size_t first,uint64_t *uout,size_t count) {
+    struct file *f=getfd_ref(h);
+    if(!f)return -N_ERR_NO_HANDLE;
+    int64_t r=0;struct shared_pages *p=f->vn->priv;
+    if(f->vn->type!=VT_SHARED || (!shared_root(p)->dma && shared_root(p)->kind!=SHARED_RANGE))r=-N_ERR_WRONG_KIND;
+    else if(first>=p->count)r=-N_ERR_INVALID;
+    for(size_t done=0,n=r<0?0:MIN(count,p->count-first);done<n;){
+        uint64_t piece[64];size_t k=MIN(n-done,ARRAY_SIZE(piece));
+        uint64_t irq=irq_save();
+        for(size_t i=0;i<k;i++)piece[i]=shared_frame(p,first+done+i,false);
+        irq_restore(irq);
+        if(copy_to_user(uout+done,piece,k*sizeof *piece)<0){r=-N_ERR_BAD_ADDRESS;break;}
+        done+=k;r=(int64_t)done;
+    }
+    vfs_close(f);return r;
+}
+/* Part of a shared object as a new one with its own caching. RAM given to devices may be seen
+   any way; device memory only uncached or write-combining; other objects only as they are. */
+static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache) {
+    struct file *f=getfd_ref(h);
+    if(!f)return -N_ERR_NO_HANDLE;
+    int64_t r=0;
+    if(f->vn->type!=VT_SHARED)r=-N_ERR_WRONG_KIND;
+    else if(!bytes || (offset|bytes)&(PAGE_SIZE-1) || offset>f->vn->size || bytes>f->vn->size-offset ||
+            cache>N_CACHE_UNCACHED)r=-N_ERR_INVALID;
+    if(r<0){vfs_close(f);return r;}
+    struct shared_pages *src=f->vn->priv,*root=shared_root(src);
+    bool device=root->kind==SHARED_RANGE && !root->owned;
+    if(cache==N_CACHE_DEFAULT)cache=src->cache;
+    else if(device?cache==N_CACHE_WRITE_BACK:!root->dma && cache!=src->cache){vfs_close(f);return -N_ERR_DENIED;}
+    struct vnode *v;struct shared_pages *p=shared_new(bytes,SHARED_VIEW,0,&v);
+    if(!p){vfs_close(f);return -N_ERR_NO_MEMORY;}
+    p->count=bytes/PAGE_SIZE;p->first=offset/PAGE_SIZE;p->cache=(uint8_t)cache;p->parent=f; /* the view keeps our reference */
+    struct file *view=NULL;
+    return new_handle(shared_open(v,f->flags&O_ACCMODE,&view),view);
 }
 /* Read-only ELF segments: every task running the same program bytes maps one
  * set of frames, so concurrent instances (a worker pool) hold one copy of their
@@ -378,7 +502,7 @@ bool shared_demand_fault(uint64_t addr,bool write) {
     for(struct shared_mapping *m=owner->shared_mappings;m;m=m->next){
         if(page<m->va || page-m->va>=m->bytes)continue;
         struct shared_pages *p=m->file->vn->priv;
-        if(!p->demand || (write && !(m->flags&PTE_W)))break;
+        if(shared_root(p)->kind!=SHARED_DEMAND || (write && !(m->flags&PTE_W)))break;
         if(vmm_get_pte(owner->pml4,page)&PTE_P){ok=true;break;}
         uint64_t frame=shared_frame(p,(page-m->va)/PAGE_SIZE,true);
         starved=!frame;
@@ -407,7 +531,7 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
     uint64_t va=mmap_reserve(owner,bytes);
     if(!va){vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
     struct shared_pages *p=f->vn->priv;size_t mapped=0;
-    uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO);
+    uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO)|cache_pte(p->cache);
     /* Demand pages not yet touched by any peer stay unmapped until a fault. */
     for(;mapped<p->count;mapped++){
         irq=irq_save();uint64_t frame=shared_frame(p,mapped,false);irq_restore(irq);
@@ -1133,6 +1257,30 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SHARED_CREATE: ret = sys_shared_create(a,false); break;
     case SYS_SHARED_RESERVE: ret = sys_shared_create(a,true); break;
     case SYS_SHARED_MAP: ret = sys_shared_map((int)a,b,(int)c); break;
+    case SYS_SHARED_VIEW: ret = sys_shared_view((int)a,b,c,(uint32_t)d); break;
+    case SYS_PCI_CLAIM: {
+        struct file *f = NULL;
+        ret = new_handle(pci_user_claim((uint8_t)a,(uint8_t)b,(uint8_t)c,&f),f);
+        break;
+    }
+    case SYS_PCI_BAR: ret = sys_pci_bar((int)a,(uint32_t)b); break;
+    case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
+    case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
+    case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:
+    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: {
+        struct file *f = getfd_ref((int)a);
+        if (!f) { ret = -N_ERR_NO_HANDLE; break; }
+        if (r->rax == SYS_PCI_INFO) {
+            struct n_pci_function info;
+            ret = pci_user_info(f, &info);
+            if (!ret) ret = copy_to_user((void *)b, &info, sizeof info);
+        } else if (r->rax == SYS_PCI_CONFIG_READ) ret = pci_user_config_read(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
+        else if (r->rax == SYS_PCI_CONFIG_WRITE) ret = pci_user_config_write(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
+        else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
+        else ret = pci_user_interrupt_take(f,(int64_t)b);
+        vfs_close(f);
+        break;
+    }
     case SYS_MEMORY_RESERVE: ret = sys_memory_reserve(a, (int)b); break;
     case SYS_MEMORY_RELEASE: ret = sys_memory_release(a, b); break;
     case SYS_MEMORY_PROTECT: ret = sys_memory_protect(a, b, (int)c); break;

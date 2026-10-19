@@ -88,6 +88,33 @@ n_handle n_app_open(int64_t id); /* a running app by the identifier the app list
 n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its length */
 n_handle n_system_log_open(void); /* a handle whose messages are added to the system log */
 n_result n_app_id(n_handle app); /* its identifier; 0 once it has ended */
+/* Drivers in apps (docs/nocturne-native-abi.md §9). Only init may claim a PCI function; it
+   hands the N_KIND_PCI handle to the driver app it launches. A claim is exclusive until its
+   last handle closes, which also turns the function's interrupts off. */
+n_handle n_pci_claim(uint8_t bus, uint8_t dev, uint8_t func);
+n_result n_pci_info(n_handle pci, struct n_pci_function *out);
+/* Config space: width 1, 2 or 4 at an offset below 4096 aligned to it. Reads may name another
+   function (N_PCI_TARGET, e.g. the upstream bridge) or N_PCI_SELF; writes only reach the
+   claimed function. A read returns the value (non-negative). */
+n_result n_pci_config_read(n_handle pci, uint32_t target, uint32_t offset, uint32_t width);
+n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value);
+/* A memory BAR as a shared object over its device memory (uncached; n_shared_view makes
+   write-combining parts or smaller windows to map or to send to another app). */
+n_handle n_pci_bar(n_handle pci, uint32_t bar);
+/* Turn on `count` message-signalled interrupts (MSI-X if offered, else MSI; count is rounded
+   down to what the function and the system give) and return how many. Each one that arrives
+   sets its bit until n_pci_interrupt_take returns it; the handle is N_EVENT_RECEIVABLE while a
+   bit is set. take waits up to timeout_ms (-1 always, 0 not at all; N_ERR_TIMEOUT). */
+n_result n_pci_interrupts(n_handle pci, uint32_t count);
+n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms);
+/* Zeroed RAM that a claimed function may read and write by DMA: a shared object (N_DMA_*
+   flags), held while any handle or mapping holds it. n_dma_addresses gives the bus address of
+   each page from first_page (count of them; returns how many it wrote). */
+n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags);
+n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size_t count);
+/* A new shared object over part of another (page-aligned offset and bytes) with the given
+   caching (N_CACHE_*): mapping it maps the same pages. */
+n_handle n_shared_view(n_handle shared, size_t offset, size_t bytes, uint32_t cache);
 /* Sound: each n_audio_open is a stream of N_AUDIO_RATE stereo frames (two int16_t, left first)
    of its own, mixed with the others and scaled by the master volume. A stream holds about
    170 ms; n_audio_submit takes what fits and returns the frames taken (with N_AUDIO_WAIT it

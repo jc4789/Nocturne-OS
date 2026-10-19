@@ -34,6 +34,8 @@ static void kpush(struct task *t, uint64_t v) {
     *(uint64_t *)t->ksp = v;
 }
 
+int init_pid;
+
 /* ---- app handles: an app's end is an event on its handle ---- */
 
 struct app_record {

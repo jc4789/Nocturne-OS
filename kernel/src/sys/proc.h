@@ -17,6 +17,7 @@ struct proc_launch {
     struct vnode *app;
 };
 int proc_launch(const char *path, const struct proc_launch *launch);
+extern int init_pid; /* /bin/init: the only app that may claim a PCI function */
 int proc_spawn_simple(const char *path, const char *arg1, struct task *parent);
 uint64_t proc_user_pages(struct task *t);
 

@@ -10,6 +10,8 @@ struct pci_device {
     uint8_t pcie_type; /* device/port type field of the PCIe capability (valid when pcie_cap != 0) */
     uint16_t msix_entries;      /* set by pci_msix_init() */
     volatile uint32_t *msix_table; /* mapped MSI-X table, 16 bytes per entry */
+    bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster): no app may claim it */
+    bool claimed;      /* an app drives it (dev/pciuser.c) */
 };
 void pci_init(void);
 /* Config space access. offsets are 0..4095: below 256 CF8/CFC or ECAM, 256 and up ECAM only (an

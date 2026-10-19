@@ -1,0 +1,2027 @@
+diff --git a/library/std/build.rs b/library/std/build.rs
+index 98856b5..c8dc8bf 100644
+--- a/library/std/build.rs
++++ b/library/std/build.rs
+@@ -34,6 +34,7 @@ fn main() {
+         || target_os == "fuchsia"
+         || (target_vendor == "fortanix" && target_env == "sgx")
+         || target_os == "motor"
++        || target_os == "nocturne"
+         || target_os == "hermit"
+         || target_os == "trusty"
+         || target_os == "l4re"
+diff --git a/library/std/src/sys/alloc/mod.rs b/library/std/src/sys/alloc/mod.rs
+index f2f1d1c..c2be461 100644
+--- a/library/std/src/sys/alloc/mod.rs
++++ b/library/std/src/sys/alloc/mod.rs
+@@ -86,6 +86,9 @@ cfg_select! {
+     target_os = "motor" => {
+         mod motor;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+     }
+diff --git a/library/std/src/sys/alloc/nocturne.rs b/library/std/src/sys/alloc/nocturne.rs
+new file mode 100644
+index 0000000..4fe9170
+--- /dev/null
++++ b/library/std/src/sys/alloc/nocturne.rs
+@@ -0,0 +1,73 @@
++//! The system allocator on Nocturne: the C library's `malloc` family.
++//!
++//! The C library's heap hands out blocks that are 16-byte aligned (a 16-byte
++//! block header, 16-byte size classes, page-aligned regions), which is the
++//! `MIN_ALIGN` of x86-64. The C library has no aligned allocator, so a larger
++//! alignment over-allocates and keeps the pointer `malloc` returned in the
++//! word just before the aligned block.
++
++use super::{MIN_ALIGN, realloc_fallback};
++use crate::alloc::{GlobalAlloc, Layout, System};
++use crate::ptr;
++use crate::sys::abi;
++
++#[stable(feature = "alloc_system_type", since = "1.28.0")]
++unsafe impl GlobalAlloc for System {
++    #[inline]
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        if layout.align() <= MIN_ALIGN {
++            unsafe { abi::malloc(layout.size()) as *mut u8 }
++        } else {
++            unsafe { aligned_malloc(&layout) }
++        }
++    }
++
++    #[inline]
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        if layout.align() <= MIN_ALIGN {
++            unsafe { abi::calloc(layout.size(), 1) as *mut u8 }
++        } else {
++            let ptr = unsafe { self.alloc(layout) };
++            if !ptr.is_null() {
++                unsafe { ptr::write_bytes(ptr, 0, layout.size()) };
++            }
++            ptr
++        }
++    }
++
++    #[inline]
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        if layout.align() <= MIN_ALIGN {
++            unsafe { abi::free(ptr as *mut _) }
++        } else {
++            // The block `malloc` returned is recorded just before ours.
++            unsafe { abi::free(ptr.cast::<*mut u8>().sub(1).read().cast()) }
++        }
++    }
++
++    #[inline]
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        if layout.align() <= MIN_ALIGN {
++            unsafe { abi::realloc(ptr as *mut _, new_size) as *mut u8 }
++        } else {
++            unsafe { realloc_fallback(self, ptr, layout, new_size) }
++        }
++    }
++}
++
++#[inline]
++unsafe fn aligned_malloc(layout: &Layout) -> *mut u8 {
++    let align = layout.align();
++    // Room for the alignment slack and for the word that remembers the block.
++    let Some(total) = layout.size().checked_add(align + size_of::<*mut u8>()) else {
++        return ptr::null_mut();
++    };
++    let raw = unsafe { abi::malloc(total) } as *mut u8;
++    if raw.is_null() {
++        return raw;
++    }
++    let start = raw.addr() + size_of::<*mut u8>();
++    let aligned = raw.with_addr((start + align - 1) & !(align - 1));
++    unsafe { aligned.cast::<*mut u8>().sub(1).write(raw) };
++    aligned
++}
+diff --git a/library/std/src/sys/args/mod.rs b/library/std/src/sys/args/mod.rs
+index 2659750..06d7ead 100644
+--- a/library/std/src/sys/args/mod.rs
++++ b/library/std/src/sys/args/mod.rs
+@@ -7,6 +7,7 @@
+     target_family = "windows",
+     target_os = "hermit",
+     target_os = "motor",
++    target_os = "nocturne",
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
+@@ -33,6 +34,10 @@ cfg_select! {
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        pub use nocturne::*;
++    }
+     target_os = "uefi" => {
+         mod uefi;
+         pub use uefi::*;
+diff --git a/library/std/src/sys/args/nocturne.rs b/library/std/src/sys/args/nocturne.rs
+new file mode 100644
+index 0000000..9a23e24
+--- /dev/null
++++ b/library/std/src/sys/args/nocturne.rs
+@@ -0,0 +1,41 @@
++//! Command line arguments on Nocturne: the C library passes the program's
++//! `argc`/`argv` (the launcher's argument list) to `main`.
++
++#![allow(dead_code)] // runtime init functions not used during testing
++
++pub use super::common::Args;
++use crate::ffi::{CStr, OsString};
++use crate::ptr;
++use crate::sync::atomic::{Atomic, AtomicIsize, AtomicPtr, Ordering};
++
++static ARGC: Atomic<isize> = AtomicIsize::new(0);
++static ARGV: Atomic<*mut *const u8> = AtomicPtr::new(ptr::null_mut());
++
++/// One-time global initialization.
++pub unsafe fn init(argc: isize, argv: *const *const u8) {
++    // Only the unmodified system-provided argv/argc are stored, so these
++    // need no ordering with other stores.
++    ARGC.store(argc, Ordering::Relaxed);
++    ARGV.store(argv as *mut _, Ordering::Relaxed);
++}
++
++/// Returns the command line arguments
++pub fn args() -> Args {
++    let argv = ARGV.load(Ordering::Relaxed);
++    let argc = if argv.is_null() { 0 } else { ARGC.load(Ordering::Relaxed) };
++
++    let mut vec = Vec::with_capacity(argc as usize);
++    for i in 0..argc {
++        // SAFETY: `argv` is non-null if `argc` is positive, and it is
++        // guaranteed to be at least as long as `argc`.
++        let ptr = unsafe { argv.offset(i).read() };
++        if ptr.is_null() {
++            break;
++        }
++        // SAFETY: arguments are NUL-terminated C strings.
++        let cstr = unsafe { CStr::from_ptr(ptr.cast()) };
++        // SAFETY: Nocturne arguments are plain bytes, like the encoded bytes of an OsString.
++        vec.push(unsafe { OsString::from_encoded_bytes_unchecked(cstr.to_bytes().to_vec()) });
++    }
++    Args::new(vec)
++}
+diff --git a/library/std/src/sys/env/mod.rs b/library/std/src/sys/env/mod.rs
+index 8985651..9ae4507 100644
+--- a/library/std/src/sys/env/mod.rs
++++ b/library/std/src/sys/env/mod.rs
+@@ -6,6 +6,7 @@
+     target_family = "unix",
+     target_os = "hermit",
+     target_os = "motor",
++    target_os = "nocturne",
+     all(target_vendor = "fortanix", target_env = "sgx"),
+     target_os = "solid_asp3",
+     target_os = "uefi",
+@@ -31,6 +32,10 @@ cfg_select! {
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        pub use nocturne::*;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::*;
+diff --git a/library/std/src/sys/env/nocturne.rs b/library/std/src/sys/env/nocturne.rs
+new file mode 100644
+index 0000000..3f449a3
+--- /dev/null
++++ b/library/std/src/sys/env/nocturne.rs
+@@ -0,0 +1,105 @@
++//! Environment variables on Nocturne.
++//!
++//! There is no `environ`: a program's environment is the launcher's list of
++//! settings (`"NAME=value"`, `n_settings`), which the C library's `getenv`
++//! reads. std keeps its own copy, filled from `n_settings` on first use, so
++//! that `std::env::vars()` can enumerate it. `set_var`/`remove_var` change
++//! std's copy and are mirrored into the C library's table, so C code in the
++//! same program (and apps launched later) see them; changes made only by C
++//! code afterwards are not seen by std.
++
++use core::slice::memchr;
++
++pub use super::common::Env;
++use crate::ffi::{CStr, OsStr, OsString, c_char};
++use crate::io;
++use crate::sync::Mutex;
++use crate::sys::abi;
++use crate::sys::cvt;
++use crate::sys::helpers::run_with_cstr;
++
++static ENV: Mutex<Option<Vec<(OsString, OsString)>>> = Mutex::new(None);
++
++fn parse(input: &[u8]) -> Option<(OsString, OsString)> {
++    // Variable name and value are separated by an ASCII equals sign '='. A
++    // variable name must not be empty, so a leading '=' belongs to the name.
++    if input.is_empty() {
++        return None;
++    }
++    let pos = memchr::memchr(b'=', &input[1..]).map(|p| p + 1)?;
++    // SAFETY: Nocturne settings are plain bytes, like the encoded bytes of an OsString.
++    unsafe {
++        Some((
++            OsString::from_encoded_bytes_unchecked(input[..pos].to_vec()),
++            OsString::from_encoded_bytes_unchecked(input[pos + 1..].to_vec()),
++        ))
++    }
++}
++
++fn load() -> Vec<(OsString, OsString)> {
++    let mut vars = Vec::new();
++    // SAFETY: `n_settings` is a NULL-terminated array of C strings set up by
++    // the C library's start-up code and never freed.
++    unsafe {
++        let mut p: *const *mut c_char = abi::n_settings;
++        if !p.is_null() {
++            while !(*p).is_null() {
++                if let Some(kv) = parse(CStr::from_ptr(*p).to_bytes()) {
++                    vars.push(kv);
++                }
++                p = p.add(1);
++            }
++        }
++    }
++    vars
++}
++
++fn with_env<T>(f: impl FnOnce(&mut Vec<(OsString, OsString)>) -> T) -> T {
++    let mut guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
++    f(guard.get_or_insert_with(load))
++}
++
++/// Reads the launch settings now rather than at the first access.
++pub fn init() {
++    with_env(|_| ());
++}
++
++/// All the environment variables of the current process.
++pub fn env() -> Env {
++    Env::new(with_env(|vars| vars.clone()))
++}
++
++pub fn getenv(k: &OsStr) -> Option<OsString> {
++    with_env(|vars| vars.iter().find(|(name, _)| name == k).map(|(_, v)| v.clone()))
++}
++
++pub unsafe fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
++    run_with_cstr(k.as_encoded_bytes(), &|kc| {
++        run_with_cstr(v.as_encoded_bytes(), &|vc| {
++            with_env(|vars| {
++                // Keep the C library's table (what `getenv` and the apps this
++                // program launches read) in step.
++                cvt(if unsafe { abi::setenv(kc.as_ptr(), vc.as_ptr(), 1) } < 0 {
++                    -(abi::N_ERR_NO_MEMORY as i64)
++                } else {
++                    0
++                })?;
++                match vars.iter_mut().find(|(name, _)| name == k) {
++                    Some((_, value)) => *value = v.to_os_string(),
++                    None => vars.push((k.to_os_string(), v.to_os_string())),
++                }
++                Ok(())
++            })
++        })
++    })
++}
++
++pub unsafe fn unsetenv(k: &OsStr) -> io::Result<()> {
++    run_with_cstr(k.as_encoded_bytes(), &|kc| {
++        with_env(|vars| {
++            unsafe { abi::unsetenv(kc.as_ptr()) };
++            vars.retain(|(name, _)| name != k);
++            Ok(())
++        })
++    })
++}
+diff --git a/library/std/src/sys/env_consts.rs b/library/std/src/sys/env_consts.rs
+index b14160c..cab264f 100644
+--- a/library/std/src/sys/env_consts.rs
++++ b/library/std/src/sys/env_consts.rs
+@@ -213,6 +213,17 @@ pub mod os {
+     pub const EXE_EXTENSION: &str = "";
+ }
+ 
++#[cfg(target_os = "nocturne")]
++pub mod os {
++    pub const FAMILY: &str = "";
++    pub const OS: &str = "nocturne";
++    pub const DLL_PREFIX: &str = "";
++    pub const DLL_SUFFIX: &str = "";
++    pub const DLL_EXTENSION: &str = "";
++    pub const EXE_SUFFIX: &str = "";
++    pub const EXE_EXTENSION: &str = "";
++}
++
+ #[cfg(target_os = "nto")]
+ pub mod os {
+     pub const FAMILY: &str = "unix";
+diff --git a/library/std/src/sys/exit.rs b/library/std/src/sys/exit.rs
+index 53fb92b..6520561 100644
+--- a/library/std/src/sys/exit.rs
++++ b/library/std/src/sys/exit.rs
+@@ -82,6 +82,9 @@ pub fn exit(code: i32) -> ! {
+         target_os = "motor" => {
+             moto_rt::process::exit(code)
+         }
++        target_os = "nocturne" => {
++            unsafe { crate::sys::pal::abi::exit(code as crate::ffi::c_int) }
++        }
+         all(target_vendor = "fortanix", target_env = "sgx") => {
+             crate::sys::pal::abi::exit_with_code(code as _)
+         }
+diff --git a/library/std/src/sys/fs/mod.rs b/library/std/src/sys/fs/mod.rs
+index 0c297c5..2f9abd0 100644
+--- a/library/std/src/sys/fs/mod.rs
++++ b/library/std/src/sys/fs/mod.rs
+@@ -33,6 +33,10 @@ cfg_select! {
+         mod motor;
+         use motor as imp;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        use nocturne as imp;
++    }
+     target_os = "solid_asp3" => {
+         mod solid;
+         use solid as imp;
+diff --git a/library/std/src/sys/fs/nocturne.rs b/library/std/src/sys/fs/nocturne.rs
+new file mode 100644
+index 0000000..6a7fd85
+--- /dev/null
++++ b/library/std/src/sys/fs/nocturne.rs
+@@ -0,0 +1,558 @@
++//! Documents and folders on Nocturne.
++//!
++//! A file is a document handle (`n_document_open`). The kernel has no shared
++//! cursor, so `File` keeps its own position; append-style files claim the
++//! document and write at its end each time. Paths are completed against the
++//! app's `FOLDER` setting before they reach the kernel. There are no
++//! permissions, symbolic links or hard links: permissions are always writable
++//! and links are unsupported; timestamps are whole wall seconds.
++
++use crate::ffi::{CStr, OsString, c_char};
++use crate::fmt;
++use crate::fs::TryLockError;
++use crate::hash::Hash;
++use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
++use crate::path::{Path, PathBuf};
++use crate::sync::atomic::{AtomicU64, Ordering};
++pub use crate::sys::fs::common::{Dir, copy, exists, remove_dir_all};
++use crate::sys::pal::abi::{self, n_entry};
++use crate::sys::pal::{cvt, unsupported, with_complete_path};
++use crate::sys::time::SystemTime;
++
++/// Entries asked of `n_folder_list` at a time.
++const LIST_PAGE: usize = 64;
++
++pub struct File {
++    handle: abi::n_handle,
++    pos: AtomicU64,
++    writable: bool,
++    append: bool,
++    /// The complete path with a trailing NUL: for `file_attr` and `duplicate`.
++    path: Vec<u8>,
++}
++
++#[derive(Clone)]
++pub struct FileAttr {
++    size: u64,
++    kind: u32,
++    modified: i64,
++}
++
++pub struct ReadDir {
++    root: PathBuf,
++    entries: crate::vec::IntoIter<DirEntry>,
++}
++
++pub struct DirEntry {
++    root: PathBuf,
++    name: OsString,
++    attr: FileAttr,
++}
++
++#[derive(Clone, Debug)]
++pub struct OpenOptions {
++    read: bool,
++    write: bool,
++    append: bool,
++    truncate: bool,
++    create: bool,
++    create_new: bool,
++}
++
++#[derive(Copy, Clone, Debug, Default)]
++pub struct FileTimes {}
++
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct FilePermissions {
++    readonly: bool,
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
++pub struct FileType {
++    kind: u32,
++}
++
++#[derive(Debug)]
++pub struct DirBuilder {}
++
++fn invalid(msg: &'static str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidInput, msg)
++}
++
++fn info(path: *const c_char) -> io::Result<FileAttr> {
++    let mut e = n_entry::zeroed();
++    cvt(unsafe { abi::n_entry_info(path, &mut e) })?;
++    Ok(FileAttr::from_entry(&e))
++}
++
++impl FileAttr {
++    fn from_entry(e: &n_entry) -> FileAttr {
++        FileAttr { size: e.size, kind: e.kind, modified: e.modified }
++    }
++
++    pub fn size(&self) -> u64 {
++        self.size
++    }
++
++    pub fn perm(&self) -> FilePermissions {
++        FilePermissions { readonly: false }
++    }
++
++    pub fn file_type(&self) -> FileType {
++        FileType { kind: self.kind }
++    }
++
++    pub fn modified(&self) -> io::Result<SystemTime> {
++        SystemTime::new(self.modified.max(0), 0)
++    }
++
++    pub fn accessed(&self) -> io::Result<SystemTime> {
++        self.modified()
++    }
++
++    pub fn created(&self) -> io::Result<SystemTime> {
++        Err(io::const_error!(io::ErrorKind::Unsupported, "creation time is not available"))
++    }
++}
++
++impl FilePermissions {
++    pub fn readonly(&self) -> bool {
++        self.readonly
++    }
++
++    pub fn set_readonly(&mut self, readonly: bool) {
++        self.readonly = readonly;
++    }
++}
++
++impl FileTimes {
++    pub fn set_accessed(&mut self, _t: SystemTime) {}
++    pub fn set_modified(&mut self, _t: SystemTime) {}
++}
++
++impl FileType {
++    pub fn is_dir(&self) -> bool {
++        self.kind == abi::N_KIND_FOLDER
++    }
++
++    pub fn is_file(&self) -> bool {
++        self.kind == abi::N_KIND_DOCUMENT
++    }
++
++    pub fn is_symlink(&self) -> bool {
++        false
++    }
++}
++
++impl fmt::Debug for ReadDir {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_tuple("ReadDir").field(&self.root).finish()
++    }
++}
++
++impl Iterator for ReadDir {
++    type Item = io::Result<DirEntry>;
++
++    fn next(&mut self) -> Option<io::Result<DirEntry>> {
++        self.entries.next().map(Ok)
++    }
++}
++
++impl DirEntry {
++    pub fn path(&self) -> PathBuf {
++        self.root.join(&self.name)
++    }
++
++    pub fn file_name(&self) -> OsString {
++        self.name.clone()
++    }
++
++    pub fn metadata(&self) -> io::Result<FileAttr> {
++        Ok(self.attr.clone())
++    }
++
++    pub fn file_type(&self) -> io::Result<FileType> {
++        Ok(self.attr.file_type())
++    }
++}
++
++impl OpenOptions {
++    pub fn new() -> OpenOptions {
++        OpenOptions {
++            read: false,
++            write: false,
++            append: false,
++            truncate: false,
++            create: false,
++            create_new: false,
++        }
++    }
++
++    pub fn read(&mut self, read: bool) {
++        self.read = read;
++    }
++    pub fn write(&mut self, write: bool) {
++        self.write = write;
++    }
++    pub fn append(&mut self, append: bool) {
++        self.append = append;
++    }
++    pub fn truncate(&mut self, truncate: bool) {
++        self.truncate = truncate;
++    }
++    pub fn create(&mut self, create: bool) {
++        self.create = create;
++    }
++    pub fn create_new(&mut self, create_new: bool) {
++        self.create_new = create_new;
++    }
++
++    fn writes(&self) -> bool {
++        self.write || self.append
++    }
++
++    fn check(&self) -> io::Result<()> {
++        if !self.read && !self.writes() {
++            return Err(invalid("must specify at least one of read, write, or append access"));
++        }
++        if !self.writes() && (self.truncate || self.create || self.create_new) {
++            return Err(invalid("creating or truncating a file requires write or append access"));
++        }
++        if self.append && self.truncate && !self.create_new {
++            return Err(invalid("creating or truncating a file requires write access"));
++        }
++        Ok(())
++    }
++}
++
++fn open_handle(full: *const c_char, access: crate::ffi::c_int) -> io::Result<abi::n_handle> {
++    let h = unsafe { abi::n_document_open(full, access) };
++    cvt(h as i64).map(|h| h as abi::n_handle)
++}
++
++impl File {
++    pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
++        opts.check()?;
++        with_complete_path(path, &|full| {
++            let handle = if opts.create_new {
++                open_handle(full, abi::N_DOCUMENT_CREATE)?
++            } else if opts.writes() {
++                let h = match open_handle(full, abi::N_DOCUMENT_EDIT) {
++                    Err(e) if opts.create && e.raw_os_error() == Some(abi::N_ERR_NOT_FOUND) => {
++                        match open_handle(full, abi::N_DOCUMENT_CREATE) {
++                            // Somebody else created it in the meantime.
++                            Err(e) if e.raw_os_error() == Some(abi::N_ERR_EXISTS) => {
++                                open_handle(full, abi::N_DOCUMENT_EDIT)?
++                            }
++                            other => other?,
++                        }
++                    }
++                    other => other?,
++                };
++                if opts.truncate {
++                    if let Err(e) = cvt(unsafe { abi::n_document_set_size(h, 0) }) {
++                        unsafe { abi::n_handle_close(h) };
++                        return Err(e);
++                    }
++                }
++                h
++            } else {
++                open_handle(full, abi::N_DOCUMENT_READ)?
++            };
++            let stored = unsafe { CStr::from_ptr(full) }.to_bytes_with_nul().to_vec();
++            Ok(File {
++                handle,
++                pos: AtomicU64::new(0),
++                writable: opts.writes(),
++                append: opts.append,
++                path: stored,
++            })
++        })
++    }
++
++    pub fn file_attr(&self) -> io::Result<FileAttr> {
++        let mut attr = info(self.path.as_ptr().cast())?;
++        // The handle knows the current size.
++        if let Ok(size) = cvt(unsafe { abi::n_document_size(self.handle) }) {
++            attr.size = size as u64;
++        }
++        Ok(attr)
++    }
++
++    pub fn fsync(&self) -> io::Result<()> {
++        Ok(())
++    }
++
++    pub fn datasync(&self) -> io::Result<()> {
++        Ok(())
++    }
++
++    pub fn lock(&self) -> io::Result<()> {
++        cvt(unsafe { abi::n_document_claim(self.handle, true) }).map(|_| ())
++    }
++
++    pub fn lock_shared(&self) -> io::Result<()> {
++        self.lock()
++    }
++
++    pub fn try_lock(&self) -> Result<(), TryLockError> {
++        let r = unsafe { abi::n_document_claim(self.handle, false) };
++        if r == -(abi::N_ERR_NOT_READY as i64) {
++            Err(TryLockError::WouldBlock)
++        } else {
++            cvt(r).map(|_| ()).map_err(TryLockError::Error)
++        }
++    }
++
++    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
++        self.try_lock()
++    }
++
++    pub fn unlock(&self) -> io::Result<()> {
++        cvt(unsafe { abi::n_document_release(self.handle) }).map(|_| ())
++    }
++
++    pub fn truncate(&self, size: u64) -> io::Result<()> {
++        cvt(unsafe { abi::n_document_set_size(self.handle, size) }).map(|_| ())
++    }
++
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        let pos = self.pos.load(Ordering::Relaxed);
++        let n = cvt(unsafe {
++            abi::n_document_read_at(self.handle, pos, buf.as_mut_ptr().cast(), buf.len())
++        })? as usize;
++        self.pos.store(pos + n as u64, Ordering::Relaxed);
++        Ok(n)
++    }
++
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        io::default_read_vectored(|b| self.read(b), bufs)
++    }
++
++    #[inline]
++    pub fn is_read_vectored(&self) -> bool {
++        false
++    }
++
++    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
++        io::default_read_buf(|b| self.read(b), cursor)
++    }
++
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        if !self.writable {
++            return Err(io::Error::from_raw_os_error(abi::N_ERR_DENIED));
++        }
++        if buf.is_empty() {
++            return Ok(0);
++        }
++        if self.append {
++            // The claim keeps other appenders from writing at the same end.
++            let claimed = unsafe { abi::n_document_claim(self.handle, true) } >= 0;
++            let result = (|| {
++                let end = cvt(unsafe { abi::n_document_size(self.handle) })? as u64;
++                let n = cvt(unsafe {
++                    abi::n_document_write_at(self.handle, end, buf.as_ptr().cast(), buf.len())
++                })? as usize;
++                self.pos.store(end + n as u64, Ordering::Relaxed);
++                Ok(n)
++            })();
++            if claimed {
++                unsafe { abi::n_document_release(self.handle) };
++            }
++            result
++        } else {
++            let pos = self.pos.load(Ordering::Relaxed);
++            let n = cvt(unsafe {
++                abi::n_document_write_at(self.handle, pos, buf.as_ptr().cast(), buf.len())
++            })? as usize;
++            self.pos.store(pos + n as u64, Ordering::Relaxed);
++            Ok(n)
++        }
++    }
++
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        io::default_write_vectored(|b| self.write(b), bufs)
++    }
++
++    #[inline]
++    pub fn is_write_vectored(&self) -> bool {
++        false
++    }
++
++    pub fn flush(&self) -> io::Result<()> {
++        Ok(())
++    }
++
++    pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
++        let target = match pos {
++            SeekFrom::Start(n) => Some(n),
++            SeekFrom::Current(d) => self.pos.load(Ordering::Relaxed).checked_add_signed(d),
++            SeekFrom::End(d) => {
++                let end = cvt(unsafe { abi::n_document_size(self.handle) })? as u64;
++                end.checked_add_signed(d)
++            }
++        };
++        let target =
++            target.ok_or_else(|| invalid("invalid seek to a negative or overflowing position"))?;
++        self.pos.store(target, Ordering::Relaxed);
++        Ok(target)
++    }
++
++    pub fn size(&self) -> Option<io::Result<u64>> {
++        Some(cvt(unsafe { abi::n_document_size(self.handle) }).map(|n| n as u64))
++    }
++
++    pub fn tell(&self) -> io::Result<u64> {
++        Ok(self.pos.load(Ordering::Relaxed))
++    }
++
++    pub fn duplicate(&self) -> io::Result<File> {
++        // There is no handle duplication: open the same document again.
++        let handle = open_handle(
++            self.path.as_ptr().cast(),
++            if self.writable { abi::N_DOCUMENT_EDIT } else { abi::N_DOCUMENT_READ },
++        )?;
++        Ok(File {
++            handle,
++            pos: AtomicU64::new(self.pos.load(Ordering::Relaxed)),
++            writable: self.writable,
++            append: self.append,
++            path: self.path.clone(),
++        })
++    }
++
++    pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
++        // No permission bits exist; accepting this lets `fs::copy` finish.
++        Ok(())
++    }
++
++    pub fn set_times(&self, _times: FileTimes) -> io::Result<()> {
++        unsupported()
++    }
++}
++
++impl Drop for File {
++    fn drop(&mut self) {
++        unsafe { abi::n_handle_close(self.handle) };
++    }
++}
++
++impl fmt::Debug for File {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let path = String::from_utf8_lossy(&self.path[..self.path.len() - 1]);
++        f.debug_struct("File").field("path", &path).field("handle", &self.handle).finish()
++    }
++}
++
++impl DirBuilder {
++    pub fn new() -> DirBuilder {
++        DirBuilder {}
++    }
++
++    pub fn mkdir(&self, p: &Path) -> io::Result<()> {
++        with_complete_path(p, &|full| cvt(unsafe { abi::n_folder_create(full) }).map(|_| ()))
++    }
++}
++
++pub fn readdir(p: &Path) -> io::Result<ReadDir> {
++    with_complete_path(p, &|full| {
++        let mut entries = Vec::new();
++        let mut page: Vec<n_entry> = (0..LIST_PAGE).map(|_| n_entry::zeroed()).collect();
++        let mut start = 0u64;
++        loop {
++            let count =
++                cvt(unsafe { abi::n_folder_list(full, page.as_mut_ptr(), page.len(), start) })?
++                    as usize;
++            for e in &page[..count.min(page.len())] {
++                let name = unsafe { CStr::from_ptr(e.name.as_ptr()) }.to_bytes();
++                if name == b"." || name == b".." {
++                    continue;
++                }
++                entries.push(DirEntry {
++                    root: p.to_path_buf(),
++                    // SAFETY: names are plain bytes.
++                    name: unsafe { OsString::from_encoded_bytes_unchecked(name.to_vec()) },
++                    attr: FileAttr::from_entry(e),
++                });
++            }
++            start += count as u64;
++            if count < page.len() {
++                break;
++            }
++        }
++        Ok(ReadDir { root: p.to_path_buf(), entries: entries.into_iter() })
++    })
++}
++
++pub fn unlink(p: &Path) -> io::Result<()> {
++    with_complete_path(p, &|full| {
++        if info(full)?.kind == abi::N_KIND_FOLDER {
++            return Err(io::Error::from_raw_os_error(abi::N_ERR_IS_FOLDER));
++        }
++        cvt(unsafe { abi::n_entry_remove(full) }).map(|_| ())
++    })
++}
++
++pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
++    // The C library's `rename` replaces an existing document atomically;
++    // `n_entry_move` alone never replaces.
++    with_complete_path(old, &|old| {
++        with_complete_path(new, &|new| {
++            if unsafe { abi::rename(old, new) } == 0 {
++                Ok(())
++            } else {
++                Err(io::Error::last_os_error())
++            }
++        })
++    })
++}
++
++pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
++    Ok(())
++}
++
++pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
++    unsupported()
++}
++
++pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
++    unsupported()
++}
++
++pub fn rmdir(p: &Path) -> io::Result<()> {
++    with_complete_path(p, &|full| {
++        if info(full)?.kind != abi::N_KIND_FOLDER {
++            return Err(io::Error::from_raw_os_error(abi::N_ERR_NOT_FOLDER));
++        }
++        cvt(unsafe { abi::n_entry_remove(full) }).map(|_| ())
++    })
++}
++
++pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
++    unsupported()
++}
++
++pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> {
++    unsupported()
++}
++
++pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
++    unsupported()
++}
++
++pub fn stat(p: &Path) -> io::Result<FileAttr> {
++    with_complete_path(p, &|full| info(full))
++}
++
++pub fn lstat(p: &Path) -> io::Result<FileAttr> {
++    stat(p)
++}
++
++pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
++    with_complete_path(p, &|full| {
++        info(full)?;
++        let bytes = unsafe { CStr::from_ptr(full) }.to_bytes().to_vec();
++        // SAFETY: path bytes.
++        Ok(PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(bytes) }))
++    })
++}
+diff --git a/library/std/src/sys/io/error/mod.rs b/library/std/src/sys/io/error/mod.rs
+index cc8cda9..66d651c 100644
+--- a/library/std/src/sys/io/error/mod.rs
++++ b/library/std/src/sys/io/error/mod.rs
+@@ -7,6 +7,10 @@ cfg_select! {
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        pub use nocturne::*;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::*;
+diff --git a/library/std/src/sys/io/error/nocturne.rs b/library/std/src/sys/io/error/nocturne.rs
+new file mode 100644
+index 0000000..daeb4f5
+--- /dev/null
++++ b/library/std/src/sys/io/error/nocturne.rs
+@@ -0,0 +1,54 @@
++//! OS error codes on Nocturne: the positive `N_ERR_*` numbers of the native ABI.
++
++use crate::io::ErrorKind;
++use crate::sys::pal::abi::*;
++
++pub fn errno() -> i32 {
++    // SAFETY: the C library keeps `errno` per thread.
++    unsafe { *__errno_location() }
++}
++
++pub fn is_interrupted(code: i32) -> bool {
++    code == N_ERR_CANCELLED || code == N_ERR_STOPPED
++}
++
++pub fn decode_error_kind(code: i32) -> ErrorKind {
++    match code {
++        N_ERR_NOT_FOUND | N_ERR_NO_APP => ErrorKind::NotFound,
++        N_ERR_EXISTS => ErrorKind::AlreadyExists,
++        N_ERR_DENIED | N_ERR_READ_ONLY => ErrorKind::PermissionDenied,
++        N_ERR_NO_MEMORY => ErrorKind::OutOfMemory,
++        N_ERR_INVALID | N_ERR_BAD_ADDRESS | N_ERR_WRONG_KIND | N_ERR_NOT_PROGRAM
++        | N_ERR_PROTOCOL => ErrorKind::InvalidInput,
++        N_ERR_BUSY | N_ERR_NOT_READY => ErrorKind::WouldBlock,
++        N_ERR_CLOSED => ErrorKind::BrokenPipe,
++        N_ERR_TIMEOUT => ErrorKind::TimedOut,
++        N_ERR_CANCELLED | N_ERR_STOPPED => ErrorKind::Interrupted,
++        N_ERR_TOO_LARGE | N_ERR_NAME_TOO_LONG | N_ERR_TOO_MANY_ARGUMENTS => {
++            ErrorKind::InvalidFilename
++        }
++        N_ERR_NOT_EMPTY => ErrorKind::DirectoryNotEmpty,
++        N_ERR_UNSUPPORTED => ErrorKind::Unsupported,
++        N_ERR_NOT_FOLDER => ErrorKind::NotADirectory,
++        N_ERR_IS_FOLDER => ErrorKind::IsADirectory,
++        N_ERR_NO_SPACE => ErrorKind::StorageFull,
++        N_ERR_CONNECTION_RESET => ErrorKind::ConnectionReset,
++        N_ERR_CONNECTION_REFUSED => ErrorKind::ConnectionRefused,
++        N_ERR_ADDRESS_IN_USE => ErrorKind::AddrInUse,
++        N_ERR_NETWORK_DOWN => ErrorKind::NetworkDown,
++        N_ERR_NOT_CONNECTED => ErrorKind::NotConnected,
++        N_ERR_UNREACHABLE => ErrorKind::HostUnreachable,
++        _ => ErrorKind::Uncategorized,
++    }
++}
++
++pub fn error_string(code: i32) -> String {
++    // SAFETY: `n_result_text` returns a static string for any code.
++    unsafe {
++        let p = n_result_text(-(code as i64));
++        if p.is_null() {
++            return format!("error {code}");
++        }
++        crate::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
++    }
++}
+diff --git a/library/std/src/sys/pal/mod.rs b/library/std/src/sys/pal/mod.rs
+index 88d9d42..1a6fa99 100644
+--- a/library/std/src/sys/pal/mod.rs
++++ b/library/std/src/sys/pal/mod.rs
+@@ -40,6 +40,10 @@ cfg_select! {
+         mod wasm;
+         pub use self::wasm::*;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        pub use self::nocturne::*;
++    }
+     target_os = "xous" => {
+         mod xous;
+         pub use self::xous::*;
+diff --git a/library/std/src/sys/pal/nocturne/abi.rs b/library/std/src/sys/pal/nocturne/abi.rs
+new file mode 100644
+index 0000000..710dc4c
+--- /dev/null
++++ b/library/std/src/sys/pal/nocturne/abi.rs
+@@ -0,0 +1,174 @@
++//! Declarations of the Nocturne native ABI as the C library exports it
++//! (`user/include/nocturne.h`, `common/abi.h`, `docs/nocturne-native-abi.md`).
++//!
++//! Nocturne is not UNIX or POSIX, so this deliberately does not use the `libc`
++//! crate: there are no file descriptors, no `errno` names and no signals here.
++//! Results are negative `n_result` values (`-N_ERR_*`); the C library keeps the
++//! positive `N_ERR_*` number in `errno` for the ISO C functions.
++
++#![allow(non_camel_case_types, dead_code)]
++
++use crate::ffi::{c_char, c_int, c_long, c_uint, c_void};
++
++pub type n_handle = i32;
++pub type n_result = i64;
++
++// ---- results (common/abi.h) ----
++pub const N_ERR_NOT_FOUND: i32 = 1;
++pub const N_ERR_EXISTS: i32 = 2;
++pub const N_ERR_DENIED: i32 = 3;
++pub const N_ERR_NO_MEMORY: i32 = 4;
++pub const N_ERR_INVALID: i32 = 5;
++pub const N_ERR_WRONG_KIND: i32 = 6;
++pub const N_ERR_NO_HANDLE: i32 = 7;
++pub const N_ERR_BUSY: i32 = 8;
++pub const N_ERR_NOT_READY: i32 = 9;
++pub const N_ERR_CLOSED: i32 = 10;
++pub const N_ERR_TIMEOUT: i32 = 11;
++pub const N_ERR_CANCELLED: i32 = 12;
++pub const N_ERR_TOO_LARGE: i32 = 13;
++pub const N_ERR_NOT_EMPTY: i32 = 14;
++pub const N_ERR_IO: i32 = 15;
++pub const N_ERR_UNSUPPORTED: i32 = 16;
++pub const N_ERR_BAD_ADDRESS: i32 = 17;
++pub const N_ERR_STOPPED: i32 = 18;
++pub const N_ERR_NOT_FOLDER: i32 = 19;
++pub const N_ERR_IS_FOLDER: i32 = 20;
++pub const N_ERR_READ_ONLY: i32 = 21;
++pub const N_ERR_NO_SPACE: i32 = 22;
++pub const N_ERR_NOT_PROGRAM: i32 = 23;
++pub const N_ERR_NAME_TOO_LONG: i32 = 24;
++pub const N_ERR_NO_APP: i32 = 25;
++pub const N_ERR_TOO_MANY_ARGUMENTS: i32 = 26;
++pub const N_ERR_CONNECTION_RESET: i32 = 27;
++pub const N_ERR_CONNECTION_REFUSED: i32 = 28;
++pub const N_ERR_ADDRESS_IN_USE: i32 = 29;
++pub const N_ERR_NETWORK_DOWN: i32 = 30;
++pub const N_ERR_NOT_CONNECTED: i32 = 31;
++pub const N_ERR_UNREACHABLE: i32 = 32;
++pub const N_ERR_PROTOCOL: i32 = 33;
++
++// ---- handle kinds ----
++pub const N_KIND_DOCUMENT: u32 = 1;
++pub const N_KIND_FOLDER: u32 = 2;
++pub const N_KIND_CHANNEL: u32 = 3;
++pub const N_KIND_DEVICE: u32 = 8;
++
++// ---- n_document_open access (an enumeration, not a bit set) ----
++pub const N_DOCUMENT_READ: c_int = 1;
++pub const N_DOCUMENT_EDIT: c_int = 2;
++pub const N_DOCUMENT_CREATE: c_int = 3;
++pub const N_DOCUMENT_REPLACE: c_int = 4;
++
++// ---- n_channel_receive flags ----
++pub const N_CHANNEL_WAIT: c_int = 1;
++pub const N_CHANNEL_PEEK: c_int = 2;
++
++pub const NAME_MAX: usize = 255;
++
++/// `struct n_entry`
++#[repr(C)]
++pub struct n_entry {
++    pub name: [c_char; 256],
++    pub kind: u32,
++    pub reserved: u32,
++    pub size: u64,
++    pub modified: i64,
++}
++
++impl n_entry {
++    pub const fn zeroed() -> n_entry {
++        n_entry { name: [0; 256], kind: 0, reserved: 0, size: 0, modified: 0 }
++    }
++}
++
++/// `struct n_cpuinfo`
++#[repr(C)]
++pub struct n_cpuinfo {
++    pub version: u32,
++    pub detected_cpus: u32,
++    pub online_cpus: u32,
++    pub worker_cpus: u32,
++    pub scheduler_cpus: u32,
++    pub flags: u32,
++    pub parallel_jobs: u64,
++    pub worker_chunks: u64,
++}
++
++/// ISO C `struct timespec` of the Nocturne C library (`time_t` is 64 bits).
++#[repr(C)]
++pub struct timespec {
++    pub tv_sec: i64,
++    pub tv_nsec: c_long,
++}
++
++/// ISO C `timespec_get` bases.
++pub const TIME_UTC: c_int = 1;
++pub const TIME_MONOTONIC: c_int = 2;
++
++unsafe extern "C" {
++    // ---- ISO C ----
++    pub fn malloc(size: usize) -> *mut c_void;
++    pub fn calloc(count: usize, size: usize) -> *mut c_void;
++    pub fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
++    pub fn free(ptr: *mut c_void);
++    pub fn rename(from: *const c_char, to: *const c_char) -> c_int;
++    pub fn abort() -> !;
++    pub fn exit(code: c_int) -> !;
++    pub fn getenv(name: *const c_char) -> *mut c_char;
++    pub fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
++    pub fn unsetenv(name: *const c_char) -> c_int;
++    pub fn fwrite(buf: *const c_void, size: usize, count: usize, file: *mut c_void) -> usize;
++    pub fn fflush(file: *mut c_void) -> c_int;
++    pub fn timespec_get(ts: *mut timespec, base: c_int) -> c_int;
++    pub fn __errno_location() -> *mut c_int;
++    pub static mut stdout: *mut c_void;
++    pub static mut stderr: *mut c_void;
++
++    // ---- Nocturne native ABI ----
++    pub fn n_result_text(r: n_result) -> *const c_char;
++    pub fn n_handle_close(h: n_handle) -> n_result;
++    pub fn n_handle_kind(h: n_handle) -> n_result;
++    pub fn n_document_open(path: *const c_char, access: c_int) -> n_handle;
++    pub fn n_document_read_at(h: n_handle, offset: u64, buf: *mut c_void, n: usize) -> n_result;
++    pub fn n_document_write_at(h: n_handle, offset: u64, buf: *const c_void, n: usize) -> n_result;
++    pub fn n_document_size(h: n_handle) -> n_result;
++    pub fn n_document_set_size(h: n_handle, size: u64) -> n_result;
++    pub fn n_document_claim(h: n_handle, wait: bool) -> n_result;
++    pub fn n_document_release(h: n_handle) -> n_result;
++    pub fn n_document_save(path: *const c_char, data: *const c_void, size: usize) -> n_result;
++    pub fn n_entry_info(path: *const c_char, out: *mut n_entry) -> n_result;
++    pub fn n_entry_remove(path: *const c_char) -> n_result;
++    pub fn n_entry_move(from: *const c_char, to: *const c_char) -> n_result;
++    pub fn n_folder_create(path: *const c_char) -> n_result;
++    pub fn n_folder_list(path: *const c_char, out: *mut n_entry, max: usize, start: u64) -> n_result;
++    pub fn n_channel_receive(
++        h: n_handle,
++        buf: *mut c_void,
++        cap: usize,
++        flags: c_int,
++        attached: *mut n_handle,
++    ) -> n_result;
++    pub fn n_path_complete(name: *const c_char, out: *mut c_char, cap: usize) -> n_result;
++    pub fn n_folder_set(name: *const c_char) -> n_result;
++    pub fn n_random(buf: *mut c_void, n: usize) -> n_result;
++    pub fn n_app_self() -> n_result;
++    pub fn n_terminal(h: n_handle) -> bool;
++    pub static n_settings: *const *mut c_char;
++
++    pub fn msleep(ms: c_uint) -> c_int;
++    #[link_name = "yield"]
++    pub fn yield_now() -> ();
++    pub fn thread_create(f: extern "C" fn(*mut c_void), arg: *mut c_void) -> c_int;
++    pub fn thread_join(tid: c_int) -> c_int;
++    pub fn thread_id() -> c_int;
++    pub fn cpu_info(info: *mut n_cpuinfo) -> c_int;
++    pub fn wait_on_address(address: *const u32, expected: u32, timeout_ms: c_uint) -> n_result;
++    pub fn wake_address(address: *const u32, count: c_uint) -> n_result;
++}
++
++/// The positive `N_ERR_*` code a negative `n_result` stands for.
++#[inline]
++pub fn code(r: n_result) -> i32 {
++    (-r).clamp(1, i32::MAX as i64) as i32
++}
+diff --git a/library/std/src/sys/pal/nocturne/futex.rs b/library/std/src/sys/pal/nocturne/futex.rs
+new file mode 100644
+index 0000000..f4b3799
+--- /dev/null
++++ b/library/std/src/sys/pal/nocturne/futex.rs
+@@ -0,0 +1,65 @@
++//! Futex-style waits on Nocturne's address waits (`wait_on_address` /
++//! `wake_address`, docs/nocturne-native-abi.md §7), which std's futex-based
++//! `Mutex`, `Condvar`, `RwLock`, `Once` and thread parker are built on.
++
++use super::abi;
++use crate::sync::atomic::Atomic;
++use crate::time::Duration;
++
++/// An atomic for use as a futex that is at least 32-bits but may be larger
++pub type Futex = Atomic<Primitive>;
++/// Must be the underlying type of Futex
++pub type Primitive = u32;
++
++/// An atomic for use as a futex that is at least 8-bits but may be larger.
++pub type SmallFutex = Atomic<SmallPrimitive>;
++/// Must be the underlying type of SmallFutex
++pub type SmallPrimitive = u32;
++
++/// Waits for a `futex_wake` operation to wake us.
++///
++/// Returns directly if the futex doesn't hold the expected value.
++///
++/// Returns false on timeout, and true in all other cases (a woken wait, a
++/// value that no longer matches, or a spurious return).
++pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
++    // The kernel counts whole milliseconds in a u32; u32::MAX waits forever.
++    // A longer timeout waits as long as one call can, then returns early like
++    // a spurious wake-up (every caller re-checks its condition and clock).
++    let ms: u32 = match timeout {
++        None => u32::MAX,
++        Some(dur) => {
++            let ms = dur.as_millis() + u128::from(dur.subsec_nanos() % 1_000_000 != 0);
++            if ms >= (u32::MAX - 1) as u128 { u32::MAX - 1 } else { ms as u32 }
++        }
++    };
++    let r = unsafe { abi::wait_on_address(futex.as_ptr(), expected, ms) };
++    if r == -(abi::N_ERR_TIMEOUT as i64) {
++        // Only a real timeout counts as one; the clamped wait above is spurious.
++        return match timeout {
++            Some(d) => d.as_millis() >= (u32::MAX - 1) as u128,
++            None => true,
++        };
++    }
++    if r == -(abi::N_ERR_STOPPED as i64) {
++        // The app is being stopped; do not spin the CPU until it ends.
++        unsafe { abi::yield_now() };
++    }
++    true
++}
++
++/// Wakes up one thread that's blocked on `futex_wait` on this futex.
++///
++/// Returns true if this actually woke up a thread, false if no thread was
++/// waiting on this futex.
++#[inline]
++pub fn futex_wake(futex: &Atomic<u32>) -> bool {
++    unsafe { abi::wake_address(futex.as_ptr(), 1) > 0 }
++}
++
++/// Wakes up all threads that are waiting on `futex_wait` on this futex.
++#[inline]
++pub fn futex_wake_all(futex: &Atomic<u32>) {
++    // A count of zero wakes everybody.
++    unsafe { abi::wake_address(futex.as_ptr(), 0) };
++}
+diff --git a/library/std/src/sys/pal/nocturne/mod.rs b/library/std/src/sys/pal/nocturne/mod.rs
+new file mode 100644
+index 0000000..71caaf0
+--- /dev/null
++++ b/library/std/src/sys/pal/nocturne/mod.rs
+@@ -0,0 +1,65 @@
++//! System bindings for Nocturne OS.
++//!
++//! Nocturne is its own operating system, not UNIX and not POSIX. This target
++//! therefore does not set `target_family = "unix"` and std does not use the
++//! `libc` crate here: it calls the Nocturne C library's ISO C functions
++//! (allocation, `exit`, `getenv`, `timespec_get`, stdio) and the native ABI
++//! (`n_*`: documents, folders, handles, `wait_on_address`, threads) through
++//! the declarations in [`abi`].
++
++#![deny(unsafe_op_in_unsafe_fn)]
++#![allow(missing_docs, nonstandard_style)]
++
++use crate::io as std_io;
++
++pub mod abi;
++pub mod futex;
++
++// SAFETY: must be called only once during runtime initialization.
++// NOTE: this is not guaranteed to run, for example when Rust code is called externally.
++pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
++    // The C library's start-up (`__libc_start`) already set up the main
++    // thread's TLS block, stdio and the launch settings before `main`.
++    unsafe {
++        crate::sys::args::init(argc, argv);
++        crate::sys::env::init();
++    }
++}
++
++// SAFETY: must be called only once during runtime cleanup.
++// NOTE: this is not guaranteed to run, for example when the program aborts.
++pub unsafe fn cleanup() {}
++
++pub fn unsupported<T>() -> std_io::Result<T> {
++    Err(unsupported_err())
++}
++
++pub fn unsupported_err() -> std_io::Error {
++    std_io::Error::from_raw_os_error(abi::N_ERR_UNSUPPORTED)
++}
++
++pub fn abort_internal() -> ! {
++    unsafe { abi::abort() }
++}
++
++/// Turns a native result (negative `-N_ERR_*`, otherwise a value) into an
++/// `io::Result`. The error is the positive `N_ERR_*` code as an OS error.
++#[inline]
++pub fn cvt(r: abi::n_result) -> std_io::Result<abi::n_result> {
++    if r < 0 { Err(std_io::Error::from_raw_os_error(abi::code(r))) } else { Ok(r) }
++}
++
++/// Runs `f` with the complete, normalised form of `path` (`n_path_complete`:
++/// relative names are taken inside the `FOLDER` setting, `.` and `..` are
++/// resolved by name). Every call that names a document or folder goes through
++/// here because the kernel only accepts complete paths.
++pub fn with_complete_path<T>(
++    path: &crate::path::Path,
++    f: &dyn Fn(*const crate::ffi::c_char) -> std_io::Result<T>,
++) -> std_io::Result<T> {
++    crate::sys::helpers::run_path_with_cstr(path, &|name| {
++        let mut full = [0 as crate::ffi::c_char; 4096];
++        cvt(unsafe { abi::n_path_complete(name.as_ptr(), full.as_mut_ptr(), full.len()) })?;
++        f(full.as_ptr())
++    })
++}
+diff --git a/library/std/src/sys/paths/mod.rs b/library/std/src/sys/paths/mod.rs
+index 8880a83..97b25e6 100644
+--- a/library/std/src/sys/paths/mod.rs
++++ b/library/std/src/sys/paths/mod.rs
+@@ -26,6 +26,10 @@ cfg_select! {
+             pub use super::unsupported::{getcwd, SplitPaths, split_paths, JoinPathsError, join_paths, current_exe, temp_dir, home_dir};
+         }
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        use nocturne as imp;
++    }
+     target_os = "uefi" => {
+         mod uefi;
+         use uefi as imp;
+diff --git a/library/std/src/sys/paths/nocturne.rs b/library/std/src/sys/paths/nocturne.rs
+new file mode 100644
+index 0000000..4a2dc8d
+--- /dev/null
++++ b/library/std/src/sys/paths/nocturne.rs
+@@ -0,0 +1,108 @@
++//! Folders and paths on Nocturne.
++//!
++//! There is no kernel working directory: an app's "current folder" is its
++//! `FOLDER` setting, which `n_path_complete` uses to complete relative names
++//! and which is passed on to the apps it launches. Paths use `/` and the
++//! search-path separator is `:`.
++
++use crate::ffi::{CStr, OsStr, OsString};
++use crate::io;
++use crate::marker::PhantomData;
++use crate::path::{self, PathBuf};
++use crate::sys::pal::abi;
++use crate::{fmt, vec};
++
++pub fn getcwd() -> io::Result<PathBuf> {
++    // SAFETY: `getenv` returns a NUL-terminated string or NULL.
++    unsafe {
++        let p = abi::getenv(c"FOLDER".as_ptr());
++        if !p.is_null() {
++            let bytes = CStr::from_ptr(p).to_bytes();
++            if bytes.first() == Some(&b'/') {
++                return Ok(PathBuf::from(OsString::from_encoded_bytes_unchecked(bytes.to_vec())));
++            }
++        }
++    }
++    Ok(PathBuf::from("/"))
++}
++
++pub fn chdir(p: &path::Path) -> io::Result<()> {
++    crate::sys::with_complete_path(p, &|_| Ok(()))?;
++    crate::sys::helpers::run_path_with_cstr(p, &|name| {
++        crate::sys::cvt(unsafe { abi::n_folder_set(name.as_ptr()) })?;
++        Ok(())
++    })?;
++    // `n_folder_set` changed the C library's table; bring std's copy along.
++    let cwd = getcwd()?;
++    unsafe { crate::sys::env::setenv(OsStr::new("FOLDER"), cwd.as_os_str()) }
++}
++
++pub struct SplitPaths<'a> {
++    iter: vec::IntoIter<PathBuf>,
++    _marker: PhantomData<&'a OsStr>,
++}
++
++pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
++    let parts: Vec<PathBuf> = unparsed
++        .as_encoded_bytes()
++        .split(|&b| b == b':')
++        .map(|part| {
++            // SAFETY: a piece between ASCII separators of an encoded OsStr.
++            PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(part) })
++        })
++        .collect();
++    SplitPaths { iter: parts.into_iter(), _marker: PhantomData }
++}
++
++impl<'a> Iterator for SplitPaths<'a> {
++    type Item = PathBuf;
++    fn next(&mut self) -> Option<PathBuf> {
++        self.iter.next()
++    }
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        self.iter.size_hint()
++    }
++}
++
++#[derive(Debug)]
++pub struct JoinPathsError;
++
++pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
++where
++    I: Iterator<Item = T>,
++    T: AsRef<OsStr>,
++{
++    let mut joined = Vec::new();
++    for (i, path) in paths.enumerate() {
++        let path = path.as_ref().as_encoded_bytes();
++        if i > 0 {
++            joined.push(b':')
++        }
++        if path.contains(&b':') {
++            return Err(JoinPathsError);
++        }
++        joined.extend_from_slice(path);
++    }
++    // SAFETY: made of encoded bytes of OsStrs and ASCII separators.
++    Ok(unsafe { OsString::from_encoded_bytes_unchecked(joined) })
++}
++
++impl fmt::Display for JoinPathsError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        "path segment contains separator `:`".fmt(f)
++    }
++}
++
++impl crate::error::Error for JoinPathsError {}
++
++pub fn current_exe() -> io::Result<PathBuf> {
++    crate::sys::unsupported()
++}
++
++pub fn temp_dir() -> PathBuf {
++    PathBuf::from("/tmp")
++}
++
++pub fn home_dir() -> Option<PathBuf> {
++    crate::env::var_os("HOME").map(PathBuf::from).or_else(|| Some(PathBuf::from("/home")))
++}
+diff --git a/library/std/src/sys/process/mod.rs b/library/std/src/sys/process/mod.rs
+index ee61175..091629d 100644
+--- a/library/std/src/sys/process/mod.rs
++++ b/library/std/src/sys/process/mod.rs
+@@ -15,6 +15,11 @@ cfg_select! {
+         mod motor;
+         use motor as imp;
+     }
++    target_os = "nocturne" => {
++        mod unsupported;
++        mod nocturne;
++        use nocturne as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;
+diff --git a/library/std/src/sys/process/nocturne.rs b/library/std/src/sys/process/nocturne.rs
+new file mode 100644
+index 0000000..3e2c3b0
+--- /dev/null
++++ b/library/std/src/sys/process/nocturne.rs
+@@ -0,0 +1,13 @@
++//! Processes on Nocturne.
++//!
++//! Apps are started with `n_app_launch` and not with `fork`/`exec`, and there
++//! are no pipes between them (channels are message based), so `Command` is not
++//! supported yet; only the app's own id is available.
++
++pub use super::unsupported::*;
++
++pub fn getpid() -> u32 {
++    // SAFETY: plain system call.
++    let id = unsafe { crate::sys::pal::abi::n_app_self() };
++    if id > 0 { id as u32 } else { 0 }
++}
+diff --git a/library/std/src/sys/random/mod.rs b/library/std/src/sys/random/mod.rs
+index e5a66dc..02882f7 100644
+--- a/library/std/src/sys/random/mod.rs
++++ b/library/std/src/sys/random/mod.rs
+@@ -67,6 +67,10 @@ cfg_select! {
+         mod motor;
+         pub use motor::fill_bytes;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        pub use nocturne::fill_bytes;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::fill_bytes;
+diff --git a/library/std/src/sys/random/nocturne.rs b/library/std/src/sys/random/nocturne.rs
+new file mode 100644
+index 0000000..4bbc037
+--- /dev/null
++++ b/library/std/src/sys/random/nocturne.rs
+@@ -0,0 +1,9 @@
++use crate::sys::pal::abi;
++
++pub fn fill_bytes(mut bytes: &mut [u8]) {
++    while !bytes.is_empty() {
++        let n = unsafe { abi::n_random(bytes.as_mut_ptr().cast(), bytes.len()) };
++        assert!(n > 0, "failed to generate random data");
++        bytes = &mut bytes[n as usize..];
++    }
++}
+diff --git a/library/std/src/sys/stdio/mod.rs b/library/std/src/sys/stdio/mod.rs
+index 86d0f3f..f8ab6a9 100644
+--- a/library/std/src/sys/stdio/mod.rs
++++ b/library/std/src/sys/stdio/mod.rs
+@@ -17,6 +17,10 @@ cfg_select! {
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        pub use nocturne::*;
++    }
+     target_os = "solid_asp3" => {
+         mod solid;
+         pub use solid::*;
+diff --git a/library/std/src/sys/stdio/nocturne.rs b/library/std/src/sys/stdio/nocturne.rs
+new file mode 100644
+index 0000000..e53295a
+--- /dev/null
++++ b/library/std/src/sys/stdio/nocturne.rs
+@@ -0,0 +1,193 @@
++//! Standard streams on Nocturne.
++//!
++//! Output goes through the C library's `stdout`/`stderr` streams, which know
++//! whether the launcher gave a channel (a terminal or pipe: one message per
++//! write) or a document (appended to). Input reads handle 0 directly: a
++//! message channel is read a message at a time, with the rest of a message
++//! larger than the caller's buffer kept for the next read; a document is read
++//! from a position std keeps itself (there is no shared cursor).
++
++use crate::io::{self, IoSlice};
++use crate::sync::Mutex;
++use crate::sys::pal::abi;
++
++pub struct Stdin;
++pub struct Stdout;
++pub struct Stderr;
++
++struct StdinState {
++    /// 0: not asked yet, otherwise `N_KIND_*` of handle 0 (u32::MAX: no handle).
++    kind: u32,
++    pos: u64,
++    /// The unread part of a message that did not fit the reader's buffer.
++    carry: Vec<u8>,
++    carry_pos: usize,
++}
++
++static STDIN: Mutex<StdinState> =
++    Mutex::new(StdinState { kind: 0, pos: 0, carry: Vec::new(), carry_pos: 0 });
++
++impl Stdin {
++    pub const fn new() -> Stdin {
++        Stdin
++    }
++}
++
++impl io::Read for Stdin {
++    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++        if buf.is_empty() {
++            return Ok(0);
++        }
++        // Whatever was written to the terminal should be visible before waiting for input.
++        unsafe { abi::fflush(abi::stdout) };
++        let mut st = STDIN.lock().unwrap_or_else(|e| e.into_inner());
++        if st.carry_pos < st.carry.len() {
++            let n = buf.len().min(st.carry.len() - st.carry_pos);
++            buf[..n].copy_from_slice(&st.carry[st.carry_pos..st.carry_pos + n]);
++            st.carry_pos += n;
++            if st.carry_pos == st.carry.len() {
++                st.carry.clear();
++                st.carry_pos = 0;
++            }
++            return Ok(n);
++        }
++        if st.kind == 0 {
++            let k = unsafe { abi::n_handle_kind(0) };
++            st.kind = if k < 0 { u32::MAX } else { k as u32 };
++        }
++        match st.kind {
++            abi::N_KIND_DOCUMENT => {
++                let r = unsafe {
++                    abi::n_document_read_at(0, st.pos, buf.as_mut_ptr().cast(), buf.len())
++                };
++                let n = crate::sys::cvt(r)? as usize;
++                st.pos += n as u64;
++                Ok(n)
++            }
++            u32::MAX => Ok(0),
++            _ => loop {
++                let r = unsafe {
++                    abi::n_channel_receive(
++                        0,
++                        buf.as_mut_ptr().cast(),
++                        buf.len(),
++                        abi::N_CHANNEL_WAIT,
++                        crate::ptr::null_mut(),
++                    )
++                };
++                if r == -(abi::N_ERR_CLOSED as i64) {
++                    return Ok(0);
++                }
++                if r == -(abi::N_ERR_TOO_LARGE as i64) {
++                    // Take the whole message and hand it out in pieces.
++                    let size = crate::sys::cvt(unsafe {
++                        abi::n_channel_receive(
++                            0,
++                            crate::ptr::null_mut(),
++                            0,
++                            abi::N_CHANNEL_WAIT | abi::N_CHANNEL_PEEK,
++                            crate::ptr::null_mut(),
++                        )
++                    })? as usize;
++                    let mut whole = vec![0u8; size];
++                    let got = crate::sys::cvt(unsafe {
++                        abi::n_channel_receive(
++                            0,
++                            whole.as_mut_ptr().cast(),
++                            size,
++                            abi::N_CHANNEL_WAIT,
++                            crate::ptr::null_mut(),
++                        )
++                    })? as usize;
++                    whole.truncate(got);
++                    let n = buf.len().min(whole.len());
++                    buf[..n].copy_from_slice(&whole[..n]);
++                    st.carry = whole;
++                    st.carry_pos = n;
++                    return Ok(n);
++                }
++                let n = crate::sys::cvt(r)? as usize;
++                // An empty message carries no bytes: wait for the next one.
++                if n != 0 {
++                    return Ok(n);
++                }
++            },
++        }
++    }
++
++}
++
++impl Stdout {
++    pub const fn new() -> Stdout {
++        Stdout
++    }
++}
++
++fn write_stream(stream: *mut crate::ffi::c_void, buf: &[u8]) -> io::Result<usize> {
++    if buf.is_empty() {
++        return Ok(0);
++    }
++    // SAFETY: `stream` is the C library's stdout/stderr and `buf` is valid.
++    let n = unsafe { abi::fwrite(buf.as_ptr().cast(), 1, buf.len(), stream) };
++    if n == 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(n)
++    }
++}
++
++impl io::Write for Stdout {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        write_stream(unsafe { abi::stdout }, buf)
++    }
++
++    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        io::default_write_vectored(|b| self.write(b), bufs)
++    }
++
++    #[inline]
++    fn is_write_vectored(&self) -> bool {
++        false
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        unsafe { abi::fflush(abi::stdout) };
++        Ok(())
++    }
++}
++
++impl Stderr {
++    pub const fn new() -> Stderr {
++        Stderr
++    }
++}
++
++impl io::Write for Stderr {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        write_stream(unsafe { abi::stderr }, buf)
++    }
++
++    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        io::default_write_vectored(|b| self.write(b), bufs)
++    }
++
++    #[inline]
++    fn is_write_vectored(&self) -> bool {
++        false
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        unsafe { abi::fflush(abi::stderr) };
++        Ok(())
++    }
++}
++
++pub const STDIN_BUF_SIZE: usize = crate::sys::io::DEFAULT_BUF_SIZE;
++
++pub fn is_ebadf(err: &io::Error) -> bool {
++    err.raw_os_error() == Some(abi::N_ERR_NO_HANDLE)
++}
++
++pub fn panic_output() -> Option<impl io::Write> {
++    Some(Stderr::new())
++}
+diff --git a/library/std/src/sys/sync/condvar/mod.rs b/library/std/src/sys/sync/condvar/mod.rs
+index 83cf0ae..cefa4d6 100644
+--- a/library/std/src/sys/sync/condvar/mod.rs
++++ b/library/std/src/sys/sync/condvar/mod.rs
+@@ -7,6 +7,7 @@ cfg_select! {
+         target_os = "openbsd",
+         target_os = "dragonfly",
+         target_os = "motor",
++        target_os = "nocturne",
+         target_os = "fuchsia",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
+diff --git a/library/std/src/sys/sync/mutex/mod.rs b/library/std/src/sys/sync/mutex/mod.rs
+index e3d6ad1..4ee54cc 100644
+--- a/library/std/src/sys/sync/mutex/mod.rs
++++ b/library/std/src/sys/sync/mutex/mod.rs
+@@ -6,6 +6,7 @@ cfg_select! {
+         target_os = "freebsd",
+         target_os = "openbsd",
+         target_os = "motor",
++        target_os = "nocturne",
+         target_os = "dragonfly",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
+diff --git a/library/std/src/sys/sync/once/mod.rs b/library/std/src/sys/sync/once/mod.rs
+index 5796c6d..5be4019 100644
+--- a/library/std/src/sys/sync/once/mod.rs
++++ b/library/std/src/sys/sync/once/mod.rs
+@@ -15,6 +15,7 @@ cfg_select! {
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "freebsd",
+         target_os = "motor",
++        target_os = "nocturne",
+         target_os = "openbsd",
+         target_os = "dragonfly",
+         target_os = "fuchsia",
+diff --git a/library/std/src/sys/sync/rwlock/mod.rs b/library/std/src/sys/sync/rwlock/mod.rs
+index 8603fca..96350fa 100644
+--- a/library/std/src/sys/sync/rwlock/mod.rs
++++ b/library/std/src/sys/sync/rwlock/mod.rs
+@@ -10,6 +10,7 @@ cfg_select! {
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
+        target_os = "motor",
++       target_os = "nocturne",
+     ) => {
+         mod futex;
+         pub use futex::RwLock;
+diff --git a/library/std/src/sys/sync/thread_parking/mod.rs b/library/std/src/sys/sync/thread_parking/mod.rs
+index 9d5a0a9..443c8a2 100644
+--- a/library/std/src/sys/sync/thread_parking/mod.rs
++++ b/library/std/src/sys/sync/thread_parking/mod.rs
+@@ -9,6 +9,7 @@ cfg_select! {
+         target_os = "dragonfly",
+         target_os = "fuchsia",
+         target_os = "motor",
++        target_os = "nocturne",
+         target_os = "hermit",
+     ) => {
+         mod futex;
+diff --git a/library/std/src/sys/thread/mod.rs b/library/std/src/sys/thread/mod.rs
+index 9816981..f62e689 100644
+--- a/library/std/src/sys/thread/mod.rs
++++ b/library/std/src/sys/thread/mod.rs
+@@ -10,6 +10,10 @@ cfg_select! {
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        pub use nocturne::{Thread, available_parallelism, current_os_id, set_name, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::{Thread, current_os_id, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
+diff --git a/library/std/src/sys/thread/nocturne.rs b/library/std/src/sys/thread/nocturne.rs
+new file mode 100644
+index 0000000..11a858f
+--- /dev/null
++++ b/library/std/src/sys/thread/nocturne.rs
+@@ -0,0 +1,96 @@
++//! Threads on Nocturne: the native `thread_create` / `thread_join`.
++//!
++//! The kernel gives every thread a fixed-size stack (256 KiB) and a process at
++//! most 128 threads, so the stack size asked for in `thread::Builder` is not
++//! honoured. The C library sets up the new thread's TLS block (`#[thread_local]`
++//! statics) before the entry function runs.
++
++use crate::ffi::{CStr, c_void};
++use crate::num::NonZero;
++use crate::sys::pal::abi;
++use crate::thread::ThreadInit;
++use crate::time::Duration;
++use crate::io;
++
++pub const DEFAULT_MIN_STACK_SIZE: usize = 256 * 1024;
++
++pub struct Thread {
++    tid: i32,
++}
++
++unsafe impl Send for Thread {}
++unsafe impl Sync for Thread {}
++
++impl Thread {
++    // unsafe: see thread::Builder::spawn_unchecked for safety requirements
++    pub unsafe fn new(_stack: usize, init: Box<ThreadInit>) -> io::Result<Thread> {
++        extern "C" fn thread_start(data: *mut c_void) {
++            // SAFETY: recreates the box leaked below.
++            let init = unsafe { Box::from_raw(data.cast::<ThreadInit>()) };
++            let rust_start = init.init();
++            rust_start();
++
++            // Run the thread-local destructors, then leave.
++            unsafe { crate::sys::thread_local::destructors::run() };
++            crate::rt::thread_cleanup();
++        }
++
++        let data = Box::into_raw(init);
++        let tid = unsafe { abi::thread_create(thread_start, data.cast()) };
++        if tid < 0 {
++            // The thread never started, so the init was not consumed.
++            drop(unsafe { Box::from_raw(data) });
++            let err = unsafe { *abi::__errno_location() };
++            return Err(io::Error::from_raw_os_error(if err > 0 {
++                err
++            } else {
++                abi::N_ERR_NO_MEMORY
++            }));
++        }
++        Ok(Thread { tid })
++    }
++
++    pub fn join(self) {
++        unsafe { abi::thread_join(self.tid) };
++    }
++}
++
++pub fn available_parallelism() -> io::Result<NonZero<usize>> {
++    let mut info = abi::n_cpuinfo {
++        version: 0,
++        detected_cpus: 0,
++        online_cpus: 0,
++        worker_cpus: 0,
++        scheduler_cpus: 0,
++        flags: 0,
++        parallel_jobs: 0,
++        worker_chunks: 0,
++    };
++    // SAFETY: `info` is a valid out structure.
++    let r = unsafe { abi::cpu_info(&mut info) };
++    let n = if r < 0 { 0 } else { info.online_cpus.max(info.scheduler_cpus) as usize };
++    NonZero::new(n).ok_or(io::Error::UNKNOWN_THREAD_COUNT)
++}
++
++pub fn current_os_id() -> Option<u64> {
++    let id = unsafe { abi::thread_id() };
++    if id >= 0 { Some(id as u64) } else { None }
++}
++
++pub fn yield_now() {
++    unsafe { abi::yield_now() }
++}
++
++pub fn set_name(_name: &CStr) {
++    // The kernel keeps no thread names.
++}
++
++pub fn sleep(dur: Duration) {
++    // Whole milliseconds, rounded up so it never returns early.
++    let mut ms = dur.as_millis() + u128::from(dur.subsec_nanos() % 1_000_000 != 0);
++    while ms > 0 {
++        let step = ms.min(u32::MAX as u128 - 1) as u32;
++        unsafe { abi::msleep(step) };
++        ms -= step as u128;
++    }
++}
+diff --git a/library/std/src/sys/thread_local/mod.rs b/library/std/src/sys/thread_local/mod.rs
+index d48bb1c..b7f631d 100644
+--- a/library/std/src/sys/thread_local/mod.rs
++++ b/library/std/src/sys/thread_local/mod.rs
+@@ -118,6 +118,7 @@ pub(crate) mod guard {
+         any(
+             target_os = "hermit",
+             target_os = "xous",
++            target_os = "nocturne",
+         ) => {
+             // `std` is the only runtime, so it just calls the destructor functions
+             // itself when the time comes.
+diff --git a/library/std/src/sys/time/mod.rs b/library/std/src/sys/time/mod.rs
+index 6cd1850..4eb7d01 100644
+--- a/library/std/src/sys/time/mod.rs
++++ b/library/std/src/sys/time/mod.rs
+@@ -6,6 +6,10 @@ cfg_select! {
+     target_os = "motor" => {
+         use moto_rt::time as imp;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        use nocturne as imp;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         use sgx as imp;
+diff --git a/library/std/src/sys/time/nocturne.rs b/library/std/src/sys/time/nocturne.rs
+new file mode 100644
+index 0000000..0b7d8d1
+--- /dev/null
++++ b/library/std/src/sys/time/nocturne.rs
+@@ -0,0 +1,73 @@
++//! Clocks on Nocturne.
++//!
++//! Both clocks come from the C library's `timespec_get`: `TIME_MONOTONIC` is
++//! the uptime counter and `TIME_UTC` the wall clock. The C library's
++//! resolution is one millisecond.
++
++use crate::io;
++use crate::sys::pal::abi;
++use crate::time::Duration;
++
++fn now(base: crate::ffi::c_int) -> Duration {
++    let mut ts = abi::timespec { tv_sec: 0, tv_nsec: 0 };
++    // SAFETY: `ts` is a valid out pointer.
++    if unsafe { abi::timespec_get(&mut ts, base) } == 0 {
++        return Duration::ZERO;
++    }
++    Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32)
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
++pub struct Instant(Duration);
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
++pub struct SystemTime(Duration);
++
++pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
++
++impl Instant {
++    pub fn now() -> Instant {
++        Instant(now(abi::TIME_MONOTONIC))
++    }
++
++    pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
++        self.0.checked_sub(other.0)
++    }
++
++    pub fn checked_add_duration(&self, other: &Duration) -> Option<Instant> {
++        Some(Instant(self.0.checked_add(*other)?))
++    }
++
++    pub fn checked_sub_duration(&self, other: &Duration) -> Option<Instant> {
++        Some(Instant(self.0.checked_sub(*other)?))
++    }
++}
++
++impl SystemTime {
++    pub const MAX: SystemTime = SystemTime(Duration::MAX);
++
++    pub const MIN: SystemTime = SystemTime(Duration::ZERO);
++
++    pub fn new(tv_sec: i64, tv_nsec: i64) -> Result<SystemTime, io::Error> {
++        if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
++            return Err(io::const_error!(io::ErrorKind::InvalidData, "invalid time"));
++        }
++        Ok(SystemTime(Duration::new(tv_sec as u64, tv_nsec as u32)))
++    }
++
++    pub fn now() -> SystemTime {
++        SystemTime(now(abi::TIME_UTC))
++    }
++
++    pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {
++        self.0.checked_sub(other.0).ok_or_else(|| other.0 - self.0)
++    }
++
++    pub fn checked_add_duration(&self, other: &Duration) -> Option<SystemTime> {
++        Some(SystemTime(self.0.checked_add(*other)?))
++    }
++
++    pub fn checked_sub_duration(&self, other: &Duration) -> Option<SystemTime> {
++        Some(SystemTime(self.0.checked_sub(*other)?))
++    }
++}

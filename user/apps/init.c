@@ -35,9 +35,40 @@ static void autorun(void) {
     poweroff();
 }
 
+/* Drivers in apps (docs/nocturne-native-abi.md §9): an NVIDIA display function goes to /bin/nvrm,
+   which gets the claim as its handle 3 and logs to the system log. init keeps no copy, so the
+   claim (and the device's DMA) ends with the driver. Media without the driver skip this. */
+static void start_drivers(void) {
+    struct n_entry e;
+    if (n_entry_info("/bin/nvrm", &e) < 0) return;
+    struct n_pciinfo list[128];
+    int n = pcilist(list, 128);
+    for (int i = 0; i < n; i++) {
+        if (list[i].vendor != 0x10de || list[i].cls != 0x03) continue;
+        char where[16];
+        snprintf(where, sizeof where, "%02x:%02x.%u", list[i].bus, list[i].dev, list[i].func);
+        n_handle pci = n_pci_claim(list[i].bus, list[i].dev, list[i].func);
+        if (pci < 0) {
+            printf("init: cannot claim %s for nvrm (%s)\n", where, n_result_text(pci));
+            continue;
+        }
+        n_handle log = n_system_log_open();
+        const char *args[2] = {"nvrm", where};
+        int32_t handles[4] = {-1, log, log, pci};
+        struct n_launch l = {.arguments = args, .handles = handles, .argument_count = 2, .handle_count = 4};
+        n_handle app = n_app_launch("/bin/nvrm", &l);
+        if (app < 0) printf("init: cannot start /bin/nvrm (%s)\n", n_result_text(app));
+        else n_handle_close(app);
+        if (log >= 0) n_handle_close(log);
+        n_handle_close(pci);
+    }
+    fflush(stdout);
+}
+
 int main(void) {
     printf("\n\x1b[1;35m*\x1b[0m Welcome to \x1b[1mNocturne " "\x1b[0m- a small operating system for quiet nights.\n");
     fflush(stdout);
+    start_drivers();
     if (gui_available()) {
         /* desktop session: put the saved Settings back; the desktop is the user's
            from here, opened apps come from its icons and menu */

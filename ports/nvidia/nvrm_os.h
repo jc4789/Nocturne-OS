@@ -1,0 +1,146 @@
+/* Nocturne OS layer for NVIDIA RM (/bin/nvrm): shared declarations.
+ *
+ * RM itself (third_party/nvidia-open) is OS neutral and calls the os_* / nv_* functions
+ * implemented in os.c, os_pci.c, os_stubs.c, nvlink_os.c and spdm_stubs.c. This header holds
+ * what those files share, and the few entry points the request server (nvrm_serve) needs.
+ *
+ * Nothing here is POSIX; the implementation uses Nocturne's native ABI and ISO C
+ * (malloc, <threads.h>, wait_on_address, timespec_get).
+ */
+#ifndef NVRM_OS_H
+#define NVRM_OS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <threads.h>
+
+#include "nocturne.h"
+#include "nvrm_serve.h"
+
+#include <nvtypes.h>
+#include <nvstatus.h>
+#include <nv.h>
+
+#define NVRM_FIRMWARE_VERSION "615.78.08"
+
+/* Handle numbers of an app launched by init: 0 input, 1 output, 2 log, 3 the PCI right. */
+#define NVRM_PCI_HANDLE 3
+
+/* ------------------------------------------------------------------------------------------
+ * The device (one GPU per nvrm process)
+ * ---------------------------------------------------------------------------------------- */
+
+struct nvrm_device {
+    n_handle pci;                    /* N_KIND_PCI right; never duplicated */
+    struct n_pci_function info;      /* as n_pci_info returned it */
+    nv_state_t nv;                   /* what RM sees */
+    nvidia_stack_t *sp;              /* RM's (dummy) altstack; no __use_altstack__ here */
+    bool adapter_ready;              /* rm_init_adapter succeeded */
+    char name[128];                  /* rm_get_device_name text */
+};
+
+extern struct nvrm_device nvrm_dev;
+
+/* The control "device" RM expects for clients without a GPU (nv_get_ctl_state). */
+extern nv_state_t nvrm_ctl_state;
+
+/* ------------------------------------------------------------------------------------------
+ * Logging (os.c): system log (n_system_log_open) and /data/logs/nvrm.log when /data exists
+ * ---------------------------------------------------------------------------------------- */
+
+void nvrm_log_init(void);
+void nvrm_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void nvrm_log_raw(const char *text, size_t length);
+
+/* ------------------------------------------------------------------------------------------
+ * Per-thread context
+ * ---------------------------------------------------------------------------------------- */
+
+/* Set by the interrupt thread: os_is_isr() is true while it runs RM. */
+extern thread_local bool nvrm_in_isr;
+
+/* The request server sets this per thread for a client that must not get RM's administrator
+ * rights (os_is_administrator, os_check_access). Threads of the process itself are
+ * administrators; the default is true. */
+extern thread_local bool nvrm_thread_admin;
+
+/* ------------------------------------------------------------------------------------------
+ * The request server (nvrm_serve.c, nvrm_serve.h) calls the nvrm_rm_* functions of rm_api.c
+ * and provides nvrm_user_translate, which os_memcpy_from_user / os_memcpy_to_user use.
+ * ---------------------------------------------------------------------------------------- */
+
+/* RM posted an event (nv_post_event). The weak default in os.c does nothing; events are
+ * not carried to clients yet (docs/nvidia/LEDGER.md). */
+void nvrm_event_post(nv_event_t *event, NvHandle object, NvU32 index, NvU32 info32,
+                     NvU16 info16, NvBool data_valid);
+
+/* ------------------------------------------------------------------------------------------
+ * Client mappings (os_pci.c)
+ *
+ * RM calls nv_add_mapping_context_to_file while the server handles a "map this memory to the
+ * client" request (rm_create_mmap_context). The context is parked in a per-thread slot; the
+ * rm_api.c (nvrm_rm_mapping_object) takes it with nvrm_take_mapping and turns it into a
+ * shared object with nvrm_alloc_view (system memory) or nvrm_bar_view (a range of a BAR),
+ * which it sends to the client as a channel attachment.
+ * ---------------------------------------------------------------------------------------- */
+
+#define NVRM_MAPPING_MAX_RANGES 16
+
+struct nvrm_alloc; /* a system-memory allocation made by nv_alloc_pages; opaque */
+
+struct nvrm_range {
+    uint64_t start, size;            /* physical addresses inside a BAR */
+};
+
+struct nvrm_mapping {
+    bool is_alloc;
+    uint32_t prot;                   /* NV_PROTECT_* */
+    uint32_t caching;                /* NV_MEMORY_* (nvuap->caching) */
+    /* is_alloc: system memory */
+    struct nvrm_alloc *alloc;
+    uint64_t page_index;             /* first 4 KiB page of the allocation */
+    uint64_t size;                   /* nvuap->size, bytes */
+    /* !is_alloc: BAR memory */
+    uint64_t access_start, access_size;
+    uint32_t range_count;
+    struct nvrm_range ranges[NVRM_MAPPING_MAX_RANGES];
+};
+
+/* Moves the parked context of this thread into *out; false when there is none. */
+bool nvrm_take_mapping(struct nvrm_mapping *out);
+/* Forgets a parked context nobody took (a failed request). */
+void nvrm_drop_mapping(void);
+
+/* A new shared handle over pages of a system-memory allocation (caller closes it or sends
+ * it). caching is NV_MEMORY_*. N_CACHE_* is chosen from it. Returns a negative n_result on
+ * failure. */
+n_handle nvrm_alloc_view(struct nvrm_alloc *alloc, uint64_t page_index, uint64_t bytes,
+                         uint32_t nv_caching);
+/* Bytes the allocation holds (page rounded). */
+uint64_t nvrm_alloc_size(const struct nvrm_alloc *alloc);
+
+/* A new shared handle over [phys, phys + bytes) of a BAR of the device. phys and bytes are
+ * rounded out to pages; *view_offset gets the byte offset of phys inside the view. */
+n_handle nvrm_bar_view(uint64_t phys, uint64_t bytes, uint32_t nv_caching, uint64_t *view_offset);
+
+/* ------------------------------------------------------------------------------------------
+ * Pieces shared between the OS layer files
+ * ---------------------------------------------------------------------------------------- */
+
+/* os_pci.c */
+NV_STATUS nvrm_pci_attach(void);     /* n_pci_info + nv_state_t fields + BAR0 mapping */
+void nvrm_pci_detach(void);
+uint32_t nvrm_interrupt_count(void); /* vectors enabled (0 before nvrm_irq_enable) */
+int nvrm_irq_enable(void);           /* n_pci_interrupts; returns the number of vectors */
+
+/* os.c */
+uint64_t nvrm_now_ns(void);          /* monotonic, TSC based when the system offers it */
+void nvrm_timers_init(void);
+void nvrm_work_init(void);
+struct os_work_queue *nvrm_work_queue(void);
+
+/* The interrupt thread (nvrm.c). */
+int nvrm_irq_thread_start(void);
+
+#endif

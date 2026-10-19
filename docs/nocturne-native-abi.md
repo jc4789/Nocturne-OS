@@ -209,6 +209,28 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - 主音量：`n_audio_volume()`、`n_audio_set_volume(0〜100)`（消音も解く）。
 - システムログ：`n_system_log(buf, cap)` で読み、`n_system_log_open()` の
   ハンドルへ `n_channel_send` で書く。
+- アプリの中の装置ドライバー（例：NVIDIA の資源管理 `/bin/nvrm`、`docs/nvidia/LEDGER.md`）：
+  - `n_pci_claim(bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。呼べるのは
+    init だけで、init は起動するドライバーアプリへハンドルを渡す。カーネルのドライバーが使う
+    機能と、既に権利のある機能は `N_ERR_BUSY`。起動オプション `noappdrivers` で全部断る。最後のハンドルが閉じると、カーネルが割り込みと
+    バスマスターを止める（アプリ終了時はハンドルがマッピングより先に閉じるので、DMA 用の
+    メモリが解放される前に装置が止まる）。
+  - `n_pci_info` は ID、BAR、MSI／MSI-X の数、上流のブリッジ、起動時の画面がその機能の BAR に
+    あるならその位置（ドライバーはそこを壊さない）を返す。
+  - 構成空間：読みは自分、同じ装置の他の機能、上流のブリッジだけ。書きは自分だけで、BAR、
+    拡張 ROM、MSI／MSI-X の機能はカーネルだけが書く（`N_ERR_DENIED`）。
+  - `n_pci_bar(pci, i)` はメモリ BAR を装置メモリの共有オブジェクト（既定は非キャッシュ）にする。
+    1 ページ未満や境界の合わない BAR、I/O ポートは扱わない。
+  - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を最大 32 本つなぎ、本数を返す。
+    INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットがある間ハンドルは
+    `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, timeout_ms)` がビットを取り出して消す。
+  - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
+    オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
+    `n_dma_addresses` が各ページのバスアドレスを返す（IOMMU は使わないので物理アドレス）。
+  - `n_shared_view(shared, offset, bytes, cache)` は共有オブジェクトの一部を、別のキャッシュ
+    属性（`N_CACHE_*`）で見る新しい共有オブジェクト。DMA 用の RAM はどの属性でも、装置
+    メモリは非キャッシュか write-combining だけ、それ以外の共有オブジェクトは元の属性だけ。
+    view も共有オブジェクトなので、`n_shared_map` で写し、チャネルの添付で他のアプリへ渡せる。
 
 ## 10. 移行の段階
 

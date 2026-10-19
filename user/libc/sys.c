@@ -345,6 +345,24 @@ n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_SYSTEM_LOG, buf, c
 n_handle n_system_log_open(void) { return (n_handle)NC5(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0); }
 n_handle n_app_open(int64_t id) { return (n_handle)NC5(SYS_APP_OPEN, id, 0, 0, 0, 0); }
 n_result n_app_id(n_handle app) { return NC5(SYS_APP_ID, app, 0, 0, 0, 0); }
+n_handle n_pci_claim(uint8_t bus, uint8_t dev, uint8_t func) { return (n_handle)NC5(SYS_PCI_CLAIM, bus, dev, func, 0, 0); }
+n_result n_pci_info(n_handle pci, struct n_pci_function *out) { return NC5(SYS_PCI_INFO, pci, out, 0, 0, 0); }
+n_result n_pci_config_read(n_handle pci, uint32_t target, uint32_t offset, uint32_t width) {
+    return NC5(SYS_PCI_CONFIG_READ, pci, target, offset, width, 0);
+}
+n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value) {
+    return NC5(SYS_PCI_CONFIG_WRITE, pci, offset, width, value, 0);
+}
+n_handle n_pci_bar(n_handle pci, uint32_t bar) { return (n_handle)NC5(SYS_PCI_BAR, pci, bar, 0, 0, 0); }
+n_result n_pci_interrupts(n_handle pci, uint32_t count) { return NC5(SYS_PCI_INTERRUPTS, pci, count, 0, 0, 0); }
+n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms) { return NC5(SYS_PCI_INTERRUPT_TAKE, pci, timeout_ms, 0, 0, 0); }
+n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags) { return (n_handle)NC5(SYS_DMA_CREATE, pci, bytes, flags, 0, 0); }
+n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size_t count) {
+    return NC5(SYS_DMA_ADDRESSES, shared, first_page, out, count, 0);
+}
+n_handle n_shared_view(n_handle shared, size_t offset, size_t bytes, uint32_t cache) {
+    return (n_handle)NC5(SYS_SHARED_VIEW, shared, offset, bytes, cache, 0);
+}
 n_handle n_audio_open(void) { return (n_handle)NC5(SYS_AUDIO_OPEN, 0, 0, 0, 0, 0); }
 n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags) {
     return NC5(SYS_AUDIO_SUBMIT, a, frames, count, flags, 0);
