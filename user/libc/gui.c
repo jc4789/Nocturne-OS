@@ -25,12 +25,9 @@ int screen_format(struct screen_format *out) {
 }
 
 int display_bits_per_channel(void) {
-    static int known; /* the display's format is fixed for the whole boot */
-    if (!known) {
-        struct screen_format f;
-        known = screen_format(&f) == 0 && f.bits_per_channel ? f.bits_per_channel : 8;
-    }
-    return known;
+    /* not cached: Settings can switch the desktop between 8 and 10 bpc */
+    struct screen_format f;
+    return screen_format(&f) == 0 && f.bits_per_channel ? f.bits_per_channel : 8;
 }
 
 uint8_t *win_deep(window_t *win) {

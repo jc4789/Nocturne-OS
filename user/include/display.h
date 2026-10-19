@@ -10,6 +10,7 @@ int screen_format(struct screen_format *out);
 int display_bits_per_channel(void);
 /* The deep plane of the window's current canvas (one byte per pixel, pitch
    win->w), or NULL when the window was opened without WIN_DEEP_COLOR or the
-   display has 8 bits per channel. Like win->c.px it changes with each
+   desktop has 8 bits per channel (which Settings can change at any time).
+   Like win->c.px it changes with each
    win_begin_frame and resize, so ask again after either. */
 uint8_t *win_deep(window_t *win);

@@ -19,9 +19,28 @@ struct screen_format {
     uint8_t bits_per_channel;   /* smallest of the three: 8 or 10 (or more) */
 };
 
-/* Window flag. When the display has 10 or more bits per channel, the window
-   buffer carries a deep plane of w*h bytes directly after its w*h pixels.
-   On an 8 bpc display the flag is accepted and no plane exists. */
+/* Desktop settings, read and changed by the Settings app: SYS_SCREEN_INFO with
+   its third argument SCREEN_SETTINGS_GET or SCREEN_SETTINGS_SET and its second
+   argument sizeof(struct desktop_settings). Changes apply at once; keeping
+   them across restarts is the Settings app's job (its saved file). */
+#define SCREEN_SETTINGS_GET 1
+#define SCREEN_SETTINGS_SET 2
+enum { POINTER_Y_AUTO, POINTER_Y_NORMAL, POINTER_Y_INVERT };
+struct desktop_settings {
+    uint32_t refresh_hz;     /* compositor frame cadence; 0 draws as soon as anything changes */
+    int8_t pointer_speed;    /* -2 (slowest) .. 2 (fastest), 0 as delivered */
+    uint8_t pointer_y;       /* POINTER_Y_* for a PS/2 mouse */
+    uint8_t deep_simulation; /* run the 10 bpc pipeline, dithered, on an 8 bpc display */
+    /* read only: what the system found */
+    uint8_t pointer_y_detected;        /* POINTER_Y_AUTO inverts the Y axis (Hyper-V on Windows 11) */
+    uint8_t deep_simulation_available; /* the display is 8 bpc 32-bit xRGB */
+    uint8_t native_bits_per_channel;   /* the display's own depth */
+    uint8_t reserved[6];
+};
+
+/* Window flag. The window buffer carries a deep plane of w*h bytes directly
+   after its w*h pixels. The compositor reads it only while the desktop has 10
+   or more bits per channel, which can change at run time (Settings). */
 #define WIN_DEEP_COLOR 64
 
 /* Deep byte: bit 7 says the low bits are valid, bits 5:4 R, 3:2 G, 1:0 B.

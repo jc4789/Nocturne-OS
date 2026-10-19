@@ -42,3 +42,7 @@ void input_scancode(uint8_t sc); /* one byte of scancode set 1, including 0xE0 p
 void input_unicode(uint16_t c, bool pressed); /* a typed character, independent of layout */
 void input_mouse(const struct mouse_event *e);
 void input_mouse_attach(void);
+/* Y axis of the PS/2 mouse: 0 automatic, 1 normal, 2 inverted (display_abi.h POINTER_Y_*) */
+void input_set_pointer_y(int mode);
+int input_pointer_y(void);
+bool input_pointer_y_detected(void); /* automatic inverts */

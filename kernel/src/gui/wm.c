@@ -60,7 +60,7 @@ struct window {
     struct gui_event frame_event; /* durable mailbox, not a droppable input event */
     int flags;
     bool shown, minimized, maximized, dead,fullscreen;
-    bool deep; /* WIN_DEEP_COLOR on a deep display: each surface ends with its deep plane */
+    bool deep; /* WIN_DEEP_COLOR: each surface ends with its deep plane (read while back_deep exists) */
     struct rect restore;
     struct rect fullscreen_restore;
     char title[64];
@@ -79,6 +79,12 @@ static uint8_t *back_deep, *wall_deep;
 static struct wait_queue wm_wq;
 static unsigned pending_frames;
 static uint64_t frame_period_ms, frame_started_ms;
+/* Settings (struct desktop_settings): cadence, pointer speed with its
+   leftover quarter steps, and the deep-colour mode the compositor applies
+   between frames. */
+static uint32_t refresh_hz;
+static int pointer_speed, pointer_rest_x, pointer_rest_y;
+static bool deep_wanted;
 static bool presenting_back;
 static struct wait_queue present_wait;
 
@@ -464,7 +470,7 @@ static struct vnode_ops win_ops = {
     .can_read = win_can_read, .close = win_close, .release = win_release};
 
 static bool alloc_buffer(struct window *w, int cw, int ch) {
-    w->deep = (w->flags & WIN_DEEP_COLOR) && back_deep;
+    w->deep = (w->flags & WIN_DEEP_COLOR) != 0; /* kept on 8 bpc: the depth can change */
     size_t pixels = (size_t)cw * ch;
     size_t pages = ALIGN_UP((uint64_t)pixels * (w->deep ? 5 : 4), PAGE_SIZE) / PAGE_SIZE;
     uint32_t *buf = vmalloc(pages);
@@ -602,13 +608,14 @@ static const struct app apps[] = {
     {"Mandelbrot", "/bin/mandel", ICON_FRACTAL},
     {"3D Cube", "/bin/cube", ICON_CUBE},
     {"Game of Life", "/bin/life", ICON_LIFE},
+    {"Settings", "/bin/settings", ICON_SETTINGS},
     {"About Nocturne", "/bin/about", ICON_ABOUT},
     {"Restart", "@reboot", ICON_REBOOT},
     {"Shut Down", "@poweroff", ICON_POWER},
 };
 #define NAPPS ((int)ARRAY_SIZE(apps))
 
-static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 10, 13, 14, 16};
+static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 10, 13, 14, 16, 17};
 #define NDESK ((int)ARRAY_SIZE(desktop_apps))
 #define ICON_CELL_W 88
 #define ICON_CELL_H 82
@@ -704,6 +711,21 @@ static void free_deep(int w, int h) {
     if (back_deep) vfree(back_deep, pages);
     if (wall_deep) vfree(wall_deep, pages);
     back_deep = wall_deep = NULL;
+}
+
+/* Settings switched the 10 bpc simulation. Only from the compositor thread
+   between frames; windows keep their own planes, so only the desktop's change. */
+static void set_deep_simulation(bool on) {
+    if (!fb_set_simulated(on)) { deep_wanted = fb.simulated; return; }
+    free_deep(sw, sh);
+    if (!alloc_deep(sw, sh, &back_deep, &wall_deep)) {
+        kprintf("wm: no memory for deep colour, using 8 bpc\n");
+        fb_set_simulated(false);
+        deep_wanted = false;
+    }
+    kprintf("wm: %u bpc desktop%s\n", fb.bpc, fb.simulated ? ", dithered to the 8 bpc display" : "");
+    draw_wall();
+    damage_all();
 }
 
 static int launch(const char *path, const char *arg) {
@@ -1979,6 +2001,17 @@ static void handle_mouse(const struct mouse_event *m) {
         /* mild acceleration */
         if (ABS(dx) > 5) dx *= 2;
         if (ABS(dy) > 5) dy *= 2;
+        /* pointer speed in quarters: x0.5, x0.75, x1, x1.5, x2; slow moves keep their remainder */
+        static const int quarters[5] = {2, 3, 4, 6, 8};
+        int q = quarters[pointer_speed + 2];
+        if (q != 4) {
+            pointer_rest_x += dx * q;
+            pointer_rest_y += dy * q;
+            dx = pointer_rest_x / 4;
+            dy = pointer_rest_y / 4;
+            pointer_rest_x -= dx * 4;
+            pointer_rest_y -= dy * 4;
+        }
     }
     int ox = mx, oy = my;
     if (dx || dy) {
@@ -2094,6 +2127,9 @@ static void wm_thread(void *arg) {
             if (ev.is_key) handle_key(&ev.k);
             else handle_mouse(&ev.m);
         }
+
+        /* Nothing is presenting between frames: the planes can be replaced. */
+        if (deep_wanted != fb.simulated) set_deep_simulation(deep_wanted);
 
         struct tm_parts tp;
         time_to_parts(time_now(), &tp);
@@ -2297,6 +2333,9 @@ bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h) {
 
 int wm_cursor_shape(void) { return cursor_shape; }
 
+/* Frame period for a cadence, rounded UP to the scheduler's millisecond. */
+static uint64_t refresh_period(uint32_t hz) { return hz ? 1000 / hz + (1000 % hz != 0) : 0; }
+
 void wm_init(void) {
     /* PCI has been enumerated. Optional offscreen GPU never changes the display
        or the RAM frame used by Enhanced Session/RDP. */
@@ -2319,8 +2358,10 @@ void wm_init(void) {
             if (hz > (UINT64_MAX - digit) / 10) valid = false;
             if (valid) hz = hz * 10 + digit;
         }
-        if (valid && (!*q || *q == ' ')) frame_period_ms = hz ? 1000 / hz + (1000 % hz != 0) : 0;
+        if (valid && (!*q || *q == ' ')) refresh_hz = hz > 1000 ? 1000 : (uint32_t)hz;
     }
+    frame_period_ms = refresh_period(refresh_hz);
+    deep_wanted = fb.simulated;
     kprintf("wm: configured frame period %lu ms (0=unpaced, no vblank signal)\n", frame_period_ms);
     size_t pages = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
@@ -2560,6 +2601,34 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return 0;
     }
     case SYS_SCREEN_INFO: {
+        if (c == SCREEN_SETTINGS_GET || c == SCREEN_SETTINGS_SET) {
+            if (b != sizeof(struct desktop_settings)) return -N_ERR_INVALID;
+            struct desktop_settings *ds = (struct desktop_settings *)a;
+            if (c == SCREEN_SETTINGS_SET) {
+                if (!user_ok(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
+                struct desktop_settings n = *ds;
+                if (n.refresh_hz > 1000 || n.pointer_speed < -2 || n.pointer_speed > 2 ||
+                    n.pointer_y > POINTER_Y_INVERT || (n.deep_simulation && !fb.native))
+                    return -N_ERR_INVALID;
+                refresh_hz = n.refresh_hz;
+                frame_period_ms = refresh_period(refresh_hz);
+                if (n.pointer_speed != pointer_speed) pointer_rest_x = pointer_rest_y = 0;
+                pointer_speed = n.pointer_speed;
+                input_set_pointer_y(n.pointer_y);
+                deep_wanted = n.deep_simulation != 0;
+                wake_compositor();
+            }
+            if (!user_ok_w(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
+            memset(ds, 0, sizeof *ds);
+            ds->refresh_hz = refresh_hz;
+            ds->pointer_speed = (int8_t)pointer_speed;
+            ds->pointer_y = (uint8_t)input_pointer_y();
+            ds->deep_simulation = deep_wanted;
+            ds->pointer_y_detected = input_pointer_y_detected();
+            ds->deep_simulation_available = fb.native;
+            ds->native_bits_per_channel = fb.native_bpc;
+            return 0;
+        }
         /* b == 0: the original struct screen_info; b == sizeof(struct
            screen_format): the colour format as well (display_abi.h). */
         if (b && b != sizeof(struct screen_format)) return -N_ERR_INVALID;

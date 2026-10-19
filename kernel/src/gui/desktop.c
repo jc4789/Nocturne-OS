@@ -279,6 +279,14 @@ void desktop_draw_icon(canvas_t *c, int x, int y, int icon) {
         gfx_line(c, x + 28, y + 6, x + 18, y + 24, RGB(240, 150, 60));
         gfx_line(c, x + 29, y + 7, x + 19, y + 25, RGB(240, 150, 60));
         break;
+    case ICON_SETTINGS: { /* a gear: eight teeth round a wheel with a hole */
+        static const int8_t teeth[8][2] = {{0, -12}, {8, -8}, {12, 0}, {8, 8}, {0, 12}, {-8, 8}, {-12, 0}, {-8, -8}};
+        for (int i = 0; i < 8; i++) gfx_fill_round(c, x + 13 + teeth[i][0], y + 13 + teeth[i][1], 7, 7, 2, RGB(180, 188, 220));
+        gfx_fill_circle(c, x + 16, y + 16, 10, RGB(180, 188, 220));
+        gfx_fill_circle(c, x + 16, y + 16, 7, RGB(120, 128, 170));
+        gfx_fill_circle(c, x + 16, y + 16, 4, RGB(40, 34, 70));
+        break;
+    }
     case ICON_ABOUT:
         gfx_fill_circle(c, x + 16, y + 16, 13, RGB(246, 236, 196));
         gfx_fill_circle(c, x + 22, y + 12, 12, RGB(40, 30, 80));

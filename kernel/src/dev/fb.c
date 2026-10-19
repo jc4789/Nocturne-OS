@@ -39,11 +39,19 @@ void fb_init(struct limine_framebuffer *f) {
     fb.bpc = MIN(fb.rsize, MIN(fb.gsize, fb.bsize));
     fb.native = fb.bpp == 32 && fb.rshift == 16 && fb.gshift == 8 && fb.bshift == 0 &&
                 fb.rsize == 8 && fb.gsize == 8 && fb.bsize == 8;
-    /* Diagnostic: run the whole 10 bpc pipeline on an 8 bpc display (every
-       QEMU/Hyper-V firmware mode is 8 bpc) and dither it at scanout. */
-    fb.simulated = fb.native && cmdline_has("fbsim10");
-    if (fb.simulated) fb.bpc = 10;
+    fb.native_bpc = fb.bpc;
+    fb_set_simulated(cmdline_has("fbsim10"));
+}
+
+/* Run the whole 10 bpc pipeline on an 8 bpc display (every QEMU/Hyper-V
+   firmware mode is 8 bpc) and dither it at scanout. Only the window manager
+   calls this after boot, between frames, and then reallocates its planes. */
+bool fb_set_simulated(bool on) {
+    if (on && !fb.native) return false;
+    fb.simulated = on;
+    fb.bpc = on ? 10 : fb.native_bpc;
     fb.deep = fb.bpc >= 10;
+    return true;
 }
 
 static inline unsigned channel10(uint32_t c, unsigned shift, uint8_t deep, unsigned deep_shift) {

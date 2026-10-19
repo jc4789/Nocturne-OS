@@ -34,9 +34,13 @@ int main(void) {
     printf("\n\x1b[1;35m*\x1b[0m Welcome to \x1b[1mNocturne " "\x1b[0m- a small operating system for quiet nights.\n");
     fflush(stdout);
     if (gui_available()) {
-        /* desktop session: open a terminal and idle */
-        n_handle term = start("/bin/term", "term", NULL, -1, -1, NULL);
-        if (term >= 0) n_handle_close(term);
+        /* desktop session: put the saved Settings back; the desktop is the user's
+           from here, opened apps come from its icons and menu */
+        n_handle settings = start("/bin/settings", "settings", "--apply", -1, -1, NULL);
+        if (settings >= 0) {
+            n_app_result(settings, 5000, NULL);
+            n_handle_close(settings);
+        }
         autorun();
         for (;;) n_sleep_ms(60000);
     }
