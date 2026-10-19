@@ -77,6 +77,7 @@ CPU/AP worker、実Canvas、限定virgl、FFmpegとGUI/browser再生の追加は
 - Sound: `beep` (tones and melodies), `play` (WAV files) and `volume`, for scripts; everything they do can be done from the desktop.
 - Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP and HTTPS client).
 - Development: the `tcc` C compiler, with headers and a static libc in `/usr`. The source of every program in `/bin` is in `/usr/src/apps`.
+  - `js` runs JavaScript and TypeScript, and `tsgo` is the TypeScript 7 compiler. See [JavaScript と TypeScript](#javascript-と-typescript).
 - `agent`: the AI agent (see below). `screenshot` saves the screen as a PNG.
 - Desktop apps: Web Browser, Files, Text Editor, Paint, Calculator, Clock, System Monitor, Piano and Sound Player. The taskbar's speaker sets the volume.
 - Games and toys: Snake, Tetris, Minesweeper (all three with sound effects), Mandelbrot, 3D Shapes and Game of Life.
@@ -354,6 +355,40 @@ tcc can also compile itself: its own source rebuilds inside the OS into a workin
 ホストclangでNocturne向けのC++20アプリをクロスコンパイルできます。`user/apps/*.cpp`を追加し、`python -X utf8 scripts/build.py cxx`でビルドします。既存C APIをそのまま呼び出せます。OS内で`cppdemo`を起動すると、libc++の文字列・コンテナーとCのGUI APIを使う実例が動きます。
 
 初期構成は例外・RTTIなしで、標準ライブラリーの対応範囲には制限があります。ツールの場所、全媒体の生成、対応範囲と実行確認は[利用手順](docs/cpp-support.md)を参照してください。
+
+## JavaScript と TypeScript
+
+`js` は端末で JavaScript と TypeScript を動かす実行環境（QuickJS）、`tsgo` は TypeScript 7 の
+公式コンパイラーです（[ports/tsgo](ports/tsgo/README.md)）。
+
+```
+js hello.js                 # ES モジュール、CommonJS、JSON
+js app.ts one two           # tsgo で型検査とコンパイルをしてから実行（引数は nocturne.args）
+js --init myapp             # package.json、tsconfig.json、src/main.ts を作る
+cd myapp && tsgo && js dist/main.js
+js -e 'console.log(1 + 2)'  # -p は結果を表示、js - は入力から、js だけで対話プロンプト
+```
+
+- **モジュール**：`import`・`export`、トップレベルの `await`、`require`（ES モジュールも読める）、
+  `import ... with { type: "json" }`。`.mjs`・`.cjs` は拡張子で、`.js` は最寄りの `package.json` の
+  `"type"` で、無ければ構文で判断します。パッケージは上のフォルダーの `node_modules` から探し、
+  `package.json` の `exports`（条件 `nocturne`・`import`・`require`・`default`）と `main` を使います。
+- **システム**：`import { readText, writeText, list, run, args } from "nocturne"` で文書・フォルダー・
+  設定・端末の入出力・アプリの起動を使えます。失敗は `code`（`"NOT_FOUND"` 等）を持つ Error です。
+  Node.js の `fs` や `process` はありません（移植するのはプログラムで、Nocturne を Node に合わせません）。
+- **Web の API**：`console`、`setTimeout` 等、`queueMicrotask`、`performance`、`fetch`
+  （HTTP・HTTPS・data:、転送の追跡、`AbortController`）、`Headers`・`Request`・`Response`、
+  `URL`、`TextEncoder`・`TextDecoder`、`crypto`（`getRandomValues`、`subtle`）、`structuredClone`、
+  `atob`・`btoa`、`EventTarget`、`DOMException`。DOMException・Encoding・URL・Web Crypto は
+  ブラウザーと同じ実装です。`fetch` はアプリ内のスレッドで通信し、待つ間も他の処理が進みます。
+- **型**：`nocturne` の型定義は `/node_modules/@types/nocturne` にあり、どのフォルダーの
+  プロジェクトからも見つかります。`js file.ts` は `--strict` で検査し、型の誤りがあれば実行しません
+  （出力は `/tmp/js-ts`、パッケージは元の場所から探します）。
+- **終了**：捕まえられなかった例外と処理されなかった Promise の拒否はスタックを表示して状態 1、
+  終わらないトップレベルの `await` は状態 13。対話プロンプトでは表示だけして続けます。
+
+実行環境の本体は `user/apps/js.c`（システムとの接続、モジュールの読み込み、イベントループ）と
+`user/apps/js_runtime.js`・`js_console.js`・`js_web.js` です。
 
 ## The AI agent
 

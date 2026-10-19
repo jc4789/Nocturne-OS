@@ -370,7 +370,7 @@ $(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(
 		third_party/lexbor/LICENSE third_party/lexbor/NOTICE third_party/lexbor/UPSTREAM.json \
 		third_party/ffmpeg/LICENSE.md third_party/ffmpeg/COPYING.LGPLv2.1 third_party/ffmpeg/manifest.json third_party/ffmpeg/README.nocturne.md \
 		third_party/unifont/OFL-1.1.txt third_party/unifont/NOTICE.txt third_party/unifont/manifest.json \
-		common/abi.h common/gfx.h common/gpu_abi.h $(wildcard user/apps/*.c)
+		common/abi.h common/gfx.h common/gpu_abi.h $(wildcard user/apps/*.c user/apps/*.js)
 	@echo "  SYSROOT"
 	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
 	@touch $@

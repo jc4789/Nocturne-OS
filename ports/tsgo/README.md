@@ -29,4 +29,6 @@ Go の移植（`os`、`net`、`os/exec` 等）の上でそのまま動きます�
 - プロジェクト：`tsgo --init` で `tsconfig.json` を作り、`tsgo` がフォルダーを走査して
   `.js`・`.d.ts`・`.map` を出力。
 
-出力した JavaScript を端末で実行する JS 実行環境は、まだ `/bin` にありません。
+出力した JavaScript は `js` で実行します。`js file.ts` は tsgo で検査・コンパイルしてから実行し、
+`js --init` は tsgo と js 用のプロジェクトを作ります（README の「JavaScript と TypeScript」）。
+`js --init` のプロジェクトで `tsgo` → `js dist/main.js` が動くことを QEMU で確認しました。
