@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "nocturne.h"
+#include "display.h"
 
 static const char *art[] = {
     "\033[1;33m        _..._      ",
@@ -34,7 +35,8 @@ int main(void) {
     snprintf(lines[n++], 128, "\033[1;35mKernel\033[0m: %s", si.os[0] ? si.os : "nocturne");
     snprintf(lines[n++], 128, "\033[1;35mUptime\033[0m: %luh %lum %lus", up / 3600, up / 60 % 60, up % 60);
     snprintf(lines[n++], 128, "\033[1;35mShell\033[0m: nsh");
-    if (si.fb_w) snprintf(lines[n++], 128, "\033[1;35mResolution\033[0m: %ux%u", si.fb_w, si.fb_h);
+    if (si.fb_w) snprintf(lines[n++], 128, "\033[1;35mResolution\033[0m: %ux%u, %d bpc", si.fb_w, si.fb_h,
+                          display_bits_per_channel());
     snprintf(lines[n++], 128, "\033[1;35mWM\033[0m: Nocturne compositor");
     snprintf(lines[n++], 128, "\033[1;35mCPU\033[0m: %s", si.cpu);
     snprintf(lines[n++], 128, "\033[1;35mMemory\033[0m: %luMiB / %luMiB",

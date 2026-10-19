@@ -3,6 +3,7 @@
 #include <string.h>
 #include <errno.h>
 #include "nocturne.h"
+#include "display.h"
 
 bool gui_available(void) {
     struct screen_info si;
@@ -15,6 +16,26 @@ int screen_size(int *w, int *h) {
     if (w) *w = si.width;
     if (h) *h = si.height;
     return (int)r;
+}
+
+int screen_format(struct screen_format *out) {
+    long r = __syscall(SYS_SCREEN_INFO, (long)out, sizeof *out, 0, 0, 0);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+
+int display_bits_per_channel(void) {
+    static int known; /* the display's format is fixed for the whole boot */
+    if (!known) {
+        struct screen_format f;
+        known = screen_format(&f) == 0 && f.bits_per_channel ? f.bits_per_channel : 8;
+    }
+    return known;
+}
+
+uint8_t *win_deep(window_t *win) {
+    if (!win || !win->c.px || !(win->flags & WIN_DEEP_COLOR) || display_bits_per_channel() < 10) return NULL;
+    return (uint8_t *)(win->c.px + (size_t)win->w * win->h);
 }
 
 window_t *win_open(int w, int h, const char *title, int flags) {

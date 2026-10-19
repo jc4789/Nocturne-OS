@@ -2,6 +2,7 @@
  * windows are Nocturne's, never an external player or a POSIX runtime. */
 #include "nocturne.h"
 #include "media.h"
+#include "display.h"
 #include "media_video_private.h"
 #include "media_alloc_private.h"
 #include <stdio.h>
@@ -19,8 +20,11 @@ static bool playing, finished;
 static int64_t base_ms;
 static uint64_t started;
 static uint32_t *picture;
+static uint8_t *picture_deep; /* low bits of a 10-bit frame (display_abi.h) */
+static size_t picture_deep_capacity;
 static size_t picture_capacity;
 static int picture_w, picture_h;
+static bool has_deep;
 static char error[160], path[2048];
 static bool input_focus;
 static int64_t position(void) { return base_ms + (playing ? (int64_t)(n_clock_uptime_ms() - started) : 0); }
@@ -35,7 +39,12 @@ static bool present_picture(void) {
     size_t count,bytes;
     if(!pending.pixels||!nmedia_video_size(pending.width,pending.height,&count,&bytes)){strlcpy(error,"Invalid video frame.",sizeof error);return false;}
     if(count>picture_capacity){uint32_t *p=nmedia_ff_realloc(picture,bytes);if(!p){strlcpy(error,"Video presentation allocation failed.",sizeof error);return false;}picture=p;picture_capacity=count;}
-    memcpy(picture,pending.pixels,bytes);picture_w=pending.width;picture_h=pending.height;return true;
+    memcpy(picture,pending.pixels,bytes);picture_w=pending.width;picture_h=pending.height;
+    if(pending.deep){
+        if(count>picture_deep_capacity){uint8_t *p=nmedia_ff_realloc(picture_deep,count);if(!p){strlcpy(error,"Video presentation allocation failed.",sizeof error);return false;}picture_deep=p;picture_deep_capacity=count;}
+        memcpy(picture_deep,pending.deep,count);
+    }
+    has_deep=pending.deep!=NULL;return true;
 }
 static bool seek_to(int64_t ms) {
     if (!media || !nmedia_seek(media, ms)) { strlcpy(error,"This input cannot seek to that position.",sizeof error); return false; }
@@ -64,7 +73,9 @@ static void draw(void) {
     canvas_t *c = &win->c;
     gfx_fill(c,0,0,WIDTH,HEIGHT,UI_BG);
     gfx_fill(c,12,12,WIDTH-24,408,RGB(0,0,0));
-    if (picture) nmedia_draw(c,picture,picture_w,picture_h,12,12,WIDTH-24,408);
+    uint8_t *deep = win_deep(win); /* this surface's; UI drawing is 8-bit content */
+    if (deep) memset(deep,0,(size_t)win->w*win->h);
+    if (picture) nmedia_draw_deep(c,deep,picture,has_deep?picture_deep:NULL,picture_w,picture_h,12,12,WIDTH-24,408);
     else gfx_text(c,24,196,media ? "Audio playback" : "Open a file or HTTP(S) URL below.",UI_FG,TRANSPARENT,FONT_LARGE);
     char t1[16],t2[16],line[256]; clock_text(t1,position());clock_text(t2,info?info->duration_ms:-1);
     snprintf(line,sizeof line,"%s  /  %s    %s%s%s",t1,t2,info?info->audio_codec:"",info&&info->audio&&info->video?" + ":"",info?info->video_codec:"");
@@ -86,6 +97,7 @@ static void draw(void) {
 static void release_media(void) {
     clear_audio(); nmedia_close(media);media=NULL;info=NULL;
     nmedia_ff_free(picture);picture=NULL;picture_capacity=0;picture_w=picture_h=0;
+    nmedia_ff_free(picture_deep);picture_deep=NULL;picture_deep_capacity=0;has_deep=false;
     memset(&pending,0,sizeof pending);audio_at=0;playing=finished=false;base_ms=0;
 }
 static void open_media(void) {
@@ -94,7 +106,9 @@ static void open_media(void) {
     strlcpy(error,"Opening media (network reads are synchronous)...",sizeof error);draw();
     bool url = !strncmp(path,"http://",7)||!strncmp(path,"https://",8);
     media=url?nmedia_open_url(path,error,sizeof error):nmedia_open(path,error,sizeof error);
-    if(media){info=nmedia_get_info(media);toggle();}
+    /* 10-bit frames either way: scaled in 10 bits, then kept by a 10 bpc
+       display or dithered where they land on an 8 bpc one. */
+    if(media){info=nmedia_get_info(media);nmedia_set_deep(media,true);toggle();}
 }
 static bool pump(void) {
     if (!playing || !media || finished) return false;
@@ -134,7 +148,7 @@ static bool pump(void) {
     return changed;
 }
 int main(int argc,char **argv) {
-    win=win_open(WIDTH,HEIGHT,"Media Player",WIN_DOUBLE_BUFFER);
+    win=win_open(WIDTH,HEIGHT,"Media Player",WIN_DOUBLE_BUFFER|WIN_DEEP_COLOR);
     if (!win) return 1;
     if (argc>1) {
         if(strlen(argv[1])>=sizeof path)strlcpy(error,"Media path/URL is too long; nothing was opened.",sizeof error);

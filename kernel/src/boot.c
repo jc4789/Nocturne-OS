@@ -90,7 +90,9 @@ void kmain(void) {
     }
     kprintf("cpu: %s\n", cpu_brand);
     hv_detect();
-    kprintf("video: %ux%u, %u bpp, pitch %u\n", fb.width, fb.height, fb.bpp, fb.pitch);
+    kprintf("video: %ux%u, %u bpp, %u bpc (R%u@%u G%u@%u B%u@%u)%s, pitch %u\n", fb.width, fb.height,
+            fb.bpp, fb.bpc, fb.rsize, fb.rshift, fb.gsize, fb.gshift, fb.bsize, fb.bshift,
+            fb.simulated ? " simulated by fbsim10" : "", fb.pitch);
     for (uint64_t i = 0; i < mm->entry_count; i++) {
         struct limine_memmap_entry *e = mm->entries[i];
         serial_write("", 0);

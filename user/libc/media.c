@@ -21,6 +21,7 @@
 #include "libavutil/dict.h"
 #include "libswresample/swresample.h"
 #include <emmintrin.h>
+#include "display_abi.h"
 
 struct nmedia {
     AVFormatContext *format;
@@ -38,6 +39,9 @@ struct nmedia {
     char error[160];
     uint32_t *pixels;
     size_t pixel_capacity;
+    bool deep;            /* nmedia_set_deep: 10-bit frames, dithered by the drawer */
+    uint8_t *deep_pixels; /* their low bits, pixel_capacity-independent */
+    size_t deep_capacity;
     bool video_borrowed;
     int64_t video_loan_pts;
     int64_t video_present_ms;bool video_present_set;
@@ -412,7 +416,8 @@ static __m128i video_mul4(__m128i value,int coefficient,bool high){
     __m128i zero=_mm_setzero_si128();
     return _mm_madd_epi16(high?_mm_unpackhi_epi16(value,zero):_mm_unpacklo_epi16(value,zero),_mm_set1_epi32(coefficient));
 }
-static __m128i video_channel(__m128i y,__m128i u,__m128i v,int yc,int uc,int vc,int depth){
+/* Signed 16-bit lanes of (sum + rounding) >> shift. */
+static __m128i video_channel(__m128i y,__m128i u,__m128i v,int yc,int uc,int vc,int depth,__m128i rounding,int shift){
     __m128i lo=_mm_add_epi32(video_mul4(y,yc,false),_mm_add_epi32(video_mul4(u,uc,false),video_mul4(v,vc,false)));
     __m128i hi=_mm_add_epi32(video_mul4(y,yc,true),_mm_add_epi32(video_mul4(u,uc,true),video_mul4(v,vc,true)));
     if(depth==16){
@@ -422,21 +427,34 @@ static __m128i video_channel(__m128i y,__m128i u,__m128i v,int yc,int uc,int vc,
         lo=_mm_add_epi32(lo,_mm_and_si128(_mm_unpacklo_epi16(high,high),bias));
         hi=_mm_add_epi32(hi,_mm_and_si128(_mm_unpackhi_epi16(high,high),bias));
     }
-    __m128i rounding=_mm_set1_epi32(1<<(depth-1)),shift=_mm_cvtsi32_si128(depth);
-    lo=_mm_sra_epi32(_mm_add_epi32(lo,rounding),shift);
-    hi=_mm_sra_epi32(_mm_add_epi32(hi,rounding),shift);
-    return _mm_packus_epi16(_mm_packs_epi32(lo,hi),_mm_setzero_si128());
+    __m128i count=_mm_cvtsi32_si128(shift);
+    lo=_mm_sra_epi32(_mm_add_epi32(lo,rounding),count);
+    hi=_mm_sra_epi32(_mm_add_epi32(hi,rounding),count);
+    return _mm_packs_epi32(lo,hi);
+}
+/* The rounding added before dropping `depth` fraction bits for pixel x of a
+   row. 8-bit sources round to nearest exactly as always; deeper sources are
+   ordered-dithered, so their extra precision survives as fine texture on an
+   8 bpc display instead of becoming bands. */
+static int video_rounding(int depth,int x,int row){
+    return depth==8?1<<7:(int)(dither_threshold((unsigned)x,(unsigned)row)<<(depth-4))+(1<<(depth-5));
 }
 /* Baseline x86-64 SSE2, not AVX or an external thread backend. Loads touch
    only complete eight-pixel groups; the existing scalar tail handles width
    and chroma oddities. Signed row strides and all existing color coefficients
-   are preserved exactly. */
-static int video_yuv_row(AVFrame *f,int row,int w,int sx,int sy,int depth,bool full,const struct video_matrix *matrix,uint32_t *out){
+   are preserved exactly. deep != NULL (sources above 8 bits only): 10-bit
+   results, the top 8 bits to out and the low bits to deep (display_abi.h). */
+static int video_yuv_row(AVFrame *f,int row,int w,int sx,int sy,int depth,bool full,const struct video_matrix *matrix,uint32_t *out,uint8_t *deep){
     const uint8_t *yp=f->data[0]+(ptrdiff_t)row*f->linesize[0];
     const uint8_t *up=f->data[1]+(ptrdiff_t)(row>>sy)*f->linesize[1];
     const uint8_t *vp=f->data[2]+(ptrdiff_t)(row>>sy)*f->linesize[2];
     __m128i zero=_mm_setzero_si128(),center=_mm_set1_epi16(1<<(depth-1)),alpha=_mm_set1_epi8(-1);
     int yc=matrix->yc,rv=matrix->rv,gu=matrix->gu,gv=matrix->gv,bu=matrix->bu,x=0;
+    /* Groups start at multiples of 8, so lanes 0..3 and 4..7 share x & 3. */
+    int shift=deep?depth-2:depth;
+    __m128i rounding=deep?_mm_set1_epi32(1<<(depth-3)):
+        _mm_set_epi32(video_rounding(depth,3,row),video_rounding(depth,2,row),video_rounding(depth,1,row),video_rounding(depth,0,row));
+    __m128i max10=_mm_set1_epi16(1020),low2=_mm_set1_epi16(3),valid=_mm_set1_epi16(DEEP_VALID);
     for(;w-x>=8;x+=8){
         __m128i y,u,v;
         if(depth>8){
@@ -455,7 +473,18 @@ static int video_yuv_row(AVFrame *f,int row,int w,int sx,int sy,int depth,bool f
         }
         u=_mm_sub_epi16(u,center);v=_mm_sub_epi16(v,center);
         if(!full)y=_mm_subs_epu16(y,_mm_set1_epi16(16<<(depth-8)));
-        __m128i r=video_channel(y,u,v,yc,0,rv,depth),g=video_channel(y,u,v,yc,-gu,-gv,depth),b=video_channel(y,u,v,yc,bu,0,depth);
+        __m128i r=video_channel(y,u,v,yc,0,rv,depth,rounding,shift),g=video_channel(y,u,v,yc,-gu,-gv,depth,rounding,shift),
+                b=video_channel(y,u,v,yc,bu,0,depth,rounding,shift);
+        if(deep){
+            /* 4x the 8-bit scale (0..1020), widened like deep_widen so white is 1023 */
+            r=_mm_min_epi16(_mm_max_epi16(r,zero),max10);g=_mm_min_epi16(_mm_max_epi16(g,zero),max10);b=_mm_min_epi16(_mm_max_epi16(b,zero),max10);
+            r=_mm_add_epi16(r,_mm_srli_epi16(r,8));g=_mm_add_epi16(g,_mm_srli_epi16(g,8));b=_mm_add_epi16(b,_mm_srli_epi16(b,8));
+            __m128i low=_mm_or_si128(_mm_or_si128(valid,_mm_slli_epi16(_mm_and_si128(r,low2),4)),
+                                     _mm_or_si128(_mm_slli_epi16(_mm_and_si128(g,low2),2),_mm_and_si128(b,low2)));
+            _mm_storel_epi64((__m128i *)(deep+x),_mm_packus_epi16(low,zero));
+            r=_mm_srli_epi16(r,2);g=_mm_srli_epi16(g,2);b=_mm_srli_epi16(b,2);
+        }
+        r=_mm_packus_epi16(r,zero);g=_mm_packus_epi16(g,zero);b=_mm_packus_epi16(b,zero);
         __m128i bg=_mm_unpacklo_epi8(b,g),ra=_mm_unpacklo_epi8(r,alpha);
         _mm_storeu_si128((__m128i *)(out+x),_mm_unpacklo_epi16(bg,ra));
         _mm_storeu_si128((__m128i *)(out+x+4),_mm_unpackhi_epi16(bg,ra));
@@ -464,9 +493,14 @@ static int video_yuv_row(AVFrame *f,int row,int w,int sx,int sy,int depth,bool f
         int yy,u,v;
         if(depth>8){uint16_t a,b,c;memcpy(&a,yp+2*(ptrdiff_t)x,2);memcpy(&b,up+2*(ptrdiff_t)(x>>sx),2);memcpy(&c,vp+2*(ptrdiff_t)(x>>sx),2);yy=a;u=(int)b-(1<<(depth-1));v=(int)c-(1<<(depth-1));}
         else {yy=yp[x];u=(int)up[x>>sx]-128;v=(int)vp[x>>sx]-128;}
-        int c=yc*(full?yy:MAX(yy-(16<<(depth-8)),0)),rounding=1<<(depth-1);
-        int r=(c+rv*v+rounding)>>depth,g=(c-gu*u-gv*v+rounding)>>depth,b=(c+bu*u+rounding)>>depth;
-        out[x]=0xff000000u|clamp8(r)<<16|clamp8(g)<<8|clamp8(b);
+        int64_t c=(int64_t)yc*(full?yy:MAX(yy-(16<<(depth-8)),0));
+        int64_t round=deep?1<<(depth-3):video_rounding(depth,x,row);
+        int r=(int)((c+rv*v+round)>>shift),g=(int)((c-gu*u-gv*v+round)>>shift),b=(int)((c+bu*u+round)>>shift);
+        if(deep){
+            r=MAX(0,MIN(1020,r));g=MAX(0,MIN(1020,g));b=MAX(0,MIN(1020,b));
+            r+=r>>8;g+=g>>8;b+=b>>8;
+            out[x]=deep_pixel((unsigned)r,(unsigned)g,(unsigned)b);deep[x]=deep_pack((unsigned)r,(unsigned)g,(unsigned)b);
+        }else out[x]=0xff000000u|clamp8(r)<<16|clamp8(g)<<8|clamp8(b);
     }
     return x;
 }
@@ -515,6 +549,11 @@ static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o
         if (!p) return fail(m, "video output allocation", AVERROR(ENOMEM));
         m->pixels = p; m->pixel_capacity = count;
     }
+    uint8_t *deep=NULL;
+    if(yuv&&depth>8&&m->deep){
+        if(count>m->deep_capacity){uint8_t *p=nmedia_ff_realloc(m->deep_pixels,count);if(!p)return fail(m,"deep video output allocation",AVERROR(ENOMEM));m->deep_pixels=p;m->deep_capacity=count;}
+        deep=m->deep_pixels;
+    }
     bool full = f->color_range == AVCOL_RANGE_JPEG || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUVJ444P;
     struct video_matrix matrix;
     if(yuv&&!video_matrix(f->colorspace,full,&matrix))return fail(m,"unsupported YUV color matrix",AVERROR(ENOSYS));
@@ -528,7 +567,7 @@ static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o
     }else {unsigned packed=format==AV_PIX_FMT_GRAY8?1:format==AV_PIX_FMT_RGB24||format==AV_PIX_FMT_BGR24?3:4;
         if(!video_plane_valid(f,0,h,(size_t)w*packed))return fail(m,"invalid decoded packed plane ownership/stride",AVERROR(EINVAL));}
     for (int y = 0; y < h; y++) {
-      int x=yuv?video_yuv_row(f,y,w,sx,sy,depth,full,&matrix,m->pixels+(size_t)y*w):0;
+      int x=yuv?video_yuv_row(f,y,w,sx,sy,depth,full,&matrix,m->pixels+(size_t)y*w,deep?deep+(size_t)y*w:NULL):0;
       for (; x < w; x++) {
         int r, g, b;
         if (format == AV_PIX_FMT_GRAY8) r = g = b = f->data[0][(ptrdiff_t)y * f->linesize[0] + x];
@@ -542,7 +581,7 @@ static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o
       }
     }
     m->info.width = w; m->info.height = h;
-    o->kind = NMEDIA_VIDEO; o->pixels = m->pixels; o->width = w; o->height = h;
+    o->kind = NMEDIA_VIDEO; o->pixels = m->pixels; o->width = w; o->height = h; o->deep = deep;
     o->pts_ms=pts;
     AVStream *stream=m->format->streams[m->video_index];
     o->duration_ms=f->duration>0?av_rescale_q(f->duration,stream->time_base,(AVRational){1,1000}):0;
@@ -773,5 +812,6 @@ void nmedia_close(nmedia *m) {
     if (m->packet_release) m->packet_release(m->packet_owner);
     if (m->document >= 0) n_handle_close(m->document);
     nmedia_http_close(m->http);
-    nmedia_ff_free(m->bytes); nmedia_ff_free(m->pixels); nmedia_ff_free(m);
+    nmedia_ff_free(m->bytes); nmedia_ff_free(m->pixels); nmedia_ff_free(m->deep_pixels); nmedia_ff_free(m);
 }
+void nmedia_set_deep(nmedia *m, bool deep) { if (m) m->deep = deep; }

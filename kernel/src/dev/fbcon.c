@@ -32,7 +32,7 @@ static void mark(int y0, int y1) {
 
 static void flush(void) {
     if (!enabled || dirty_y1 < 0) return;
-    fb_present(cv.px, cv.pitch, 0, dirty_y0, cv.w, dirty_y1 - dirty_y0);
+    fb_present(cv.px, cv.pitch, NULL, 0, 0, dirty_y0, cv.w, dirty_y1 - dirty_y0);
     dirty_y0 = 1 << 30;
     dirty_y1 = -1;
 }
@@ -314,7 +314,7 @@ static void panic_draw(const char *msg, struct regs *r) {
     pr_y += 10;
     pline(&c, "Please restart the virtual machine. Sweet dreams.", 0xFF8E9AC8);
     enabled = true;
-    fb_present(c.px, c.pitch, 0, 0, c.w, c.h);
+    fb_present(c.px, c.pitch, NULL, 0, 0, 0, c.w, c.h);
 }
 
 void panic_screen(const char *msg) { panic_draw(msg, NULL); }

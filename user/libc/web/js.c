@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <nocturne.h>
+#include <display.h>
 #include <http.h>
 #include <webnet.h>
 #include <parallel.h>
@@ -3942,9 +3943,10 @@ static JSValue native_screen(JSContext *ctx, JSValueConst this_val, int argc, JS
     if (screen_size(&available_w, &available_h) < 0) { available_w = (int)info.fb_w; available_h = (int)info.fb_h; }
     JSValue result = JS_NewArray(ctx);
     if (JS_IsException(result)) return result;
+    /* CSSOM View: colorDepth/pixelDepth count colour bits without alpha. */
     uint32_t dimensions[] = {info.fb_w, info.fb_h, available_w > 0 ? (uint32_t)available_w : 0,
-                             available_h > 0 ? (uint32_t)available_h : 0};
-    for (uint32_t i = 0; i < 4; i++) if (JS_SetPropertyUint32(ctx, result, i, JS_NewUint32(ctx, dimensions[i])) < 0) {
+                             available_h > 0 ? (uint32_t)available_h : 0, (uint32_t)display_bits_per_channel() * 3};
+    for (uint32_t i = 0; i < 5; i++) if (JS_SetPropertyUint32(ctx, result, i, JS_NewUint32(ctx, dimensions[i])) < 0) {
         JS_FreeValue(ctx, result); return JS_EXCEPTION;
     }
     return result;

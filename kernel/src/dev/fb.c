@@ -6,6 +6,19 @@
 
 struct fb_info fb;
 
+/* Any Limine/GOP bit-mask format: a 10-bit channel value -> that channel's
+ * bits at their position, rounded to the channel's own depth (1..16 bits).
+ * 8-bit content enters widened by bit replication, so 8 bpc XRGB8888 maps
+ * every value to itself and 10 bpc 2:10:10:10 shows 255 as 1023. */
+static uint32_t lut_r[1024], lut_g[1024], lut_b[1024];
+
+static void build_lut(uint32_t *lut, uint8_t *size, uint8_t shift, uint32_t bpp) {
+    if (*size > 16) *size = 16;
+    if (shift >= bpp || shift + *size > bpp) *size = 0; /* a mask outside the pixel shows nothing */
+    uint32_t max = (1u << *size) - 1;
+    for (unsigned v = 0; v < 1024; v++) lut[v] = (v * max + 511) / 1023 << shift;
+}
+
 void fb_init(struct limine_framebuffer *f) {
     fb.addr = f->address;
     fb.phys = (uint64_t)f->address - hhdm_offset;
@@ -19,16 +32,37 @@ void fb_init(struct limine_framebuffer *f) {
     fb.rsize = f->red_mask_size;
     fb.gsize = f->green_mask_size;
     fb.bsize = f->blue_mask_size;
-    fb.native = fb.bpp == 32 && fb.rshift == 16 && fb.gshift == 8 && fb.bshift == 0;
+    if (fb.bpp != 16 && fb.bpp != 24 && fb.bpp != 32) fb.rsize = fb.gsize = fb.bsize = 0;
+    build_lut(lut_r, &fb.rsize, fb.rshift, fb.bpp);
+    build_lut(lut_g, &fb.gsize, fb.gshift, fb.bpp);
+    build_lut(lut_b, &fb.bsize, fb.bshift, fb.bpp);
+    fb.bpc = MIN(fb.rsize, MIN(fb.gsize, fb.bsize));
+    fb.native = fb.bpp == 32 && fb.rshift == 16 && fb.gshift == 8 && fb.bshift == 0 &&
+                fb.rsize == 8 && fb.gsize == 8 && fb.bsize == 8;
+    /* Diagnostic: run the whole 10 bpc pipeline on an 8 bpc display (every
+       QEMU/Hyper-V firmware mode is 8 bpc) and dither it at scanout. */
+    fb.simulated = fb.native && cmdline_has("fbsim10");
+    if (fb.simulated) fb.bpc = 10;
+    fb.deep = fb.bpc >= 10;
 }
 
-static inline uint32_t convert(uint32_t c) {
-    uint32_t r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-    return ((r >> (8 - fb.rsize)) << fb.rshift) | ((g >> (8 - fb.gsize)) << fb.gshift) |
-           ((b >> (8 - fb.bsize)) << fb.bshift);
+static inline unsigned channel10(uint32_t c, unsigned shift, uint8_t deep, unsigned deep_shift) {
+    unsigned v = (c >> shift) & 0xFF;
+    return deep & DEEP_VALID ? v << 2 | ((deep >> deep_shift) & 3) : deep_widen(v);
 }
 
-struct present_job { const uint32_t *src; int pitch, x, y, w, h; };
+static inline uint32_t convert(uint32_t c, uint8_t deep) {
+    return lut_r[channel10(c, 16, deep, 4)] | lut_g[channel10(c, 8, deep, 2)] |
+           lut_b[channel10(c, 0, deep, 0)];
+}
+
+/* 10 -> 8 bits with the 4x4 ordered dither: +1 with probability frac/4. */
+static inline unsigned dither8(unsigned v10, unsigned threshold) {
+    unsigned v = (v10 * 4 + threshold) >> 4;
+    return v > 255 ? 255 : v;
+}
+
+struct present_job { const uint32_t *src; const uint8_t *deep; int pitch, deep_pitch, x, y, w, h; };
 
 /* Disjoint row tiles only. No allocation, scheduling, device commands or FPU.
  * The framebuffer writes remain scalar: WHPX does not emulate SIMD MMIO. */
@@ -37,34 +71,46 @@ static void present_rows(size_t tile, void *context) {
     int first=(int)tile*16, end=MIN(first+16,p->h);
     for (int j = first; j < end; j++) {
         const uint32_t *s = &p->src[(size_t)(p->y + j) * p->pitch + p->x];
+        const uint8_t *e = p->deep ? p->deep + (size_t)(p->y + j) * p->deep_pitch + p->x : NULL;
         uint8_t *d = fb.addr + (uint64_t)(p->y + j) * fb.pitch;
-        if (fb.native) {
+        if (fb.native && !e) {
             memcpy(d + p->x * 4, s, (size_t)p->w * 4);
+        } else if (fb.simulated) {
+            uint32_t *d32 = (uint32_t *)d + p->x;
+            for (int i = 0; i < p->w; i++) {
+                if (!(e[i] & DEEP_VALID)) { d32[i] = s[i]; continue; }
+                unsigned t = dither_threshold((unsigned)(p->x + i), (unsigned)(p->y + j));
+                d32[i] = dither8(channel10(s[i], 16, e[i], 4), t) << 16 |
+                         dither8(channel10(s[i], 8, e[i], 2), t) << 8 | dither8(channel10(s[i], 0, e[i], 0), t);
+            }
         } else if (fb.bpp == 32) {
             uint32_t *d32 = (uint32_t *)d + p->x;
-            for (int i = 0; i < p->w; i++) d32[i] = convert(s[i]);
+            if (e) for (int i = 0; i < p->w; i++) d32[i] = convert(s[i], e[i]);
+            else for (int i = 0; i < p->w; i++) d32[i] = convert(s[i], 0);
         } else if (fb.bpp == 24) {
             uint8_t *d8 = d + p->x * 3;
             for (int i = 0; i < p->w; i++) {
-                uint32_t v = convert(s[i]);
+                uint32_t v = convert(s[i], e ? e[i] : 0);
                 d8[i * 3] = v & 0xFF;
                 d8[i * 3 + 1] = (v >> 8) & 0xFF;
                 d8[i * 3 + 2] = (v >> 16) & 0xFF;
             }
         } else if (fb.bpp == 16) {
             uint16_t *d16 = (uint16_t *)d + p->x;
-            for (int i = 0; i < p->w; i++) d16[i] = (uint16_t)convert(s[i]);
+            for (int i = 0; i < p->w; i++) d16[i] = (uint16_t)convert(s[i], e ? e[i] : 0);
         }
     }
 }
 
-void fb_present(const uint32_t *src, int src_pitch, int x, int y, int w, int h) {
+void fb_present(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
+                int x, int y, int w, int h) {
     if (!src || !fb.addr || src_pitch<=0 || w<=0 || h<=0) return;
     int64_t right=(int64_t)x+w, bottom=(int64_t)y+h;
     if (x<0) x=0;
     if (y<0) y=0;
     if (right>(int64_t)fb.width) right=fb.width;
     if (right>src_pitch) right=src_pitch;
+    if (deep && right>deep_pitch) right=deep_pitch;
     if (bottom>(int64_t)fb.height) bottom=fb.height;
     if (right<=x || bottom<=y) return;
     w=(int)(right-x); h=(int)(bottom-y);
@@ -79,11 +125,11 @@ void fb_present(const uint32_t *src, int src_pitch, int x, int y, int w, int h) 
         /* A join holds BSP interrupts disabled. Bound each join to 128 rows,
            restoring interrupts between batches for timer/audio delivery. */
         for (int first=0;first<h;first+=128) {
-            struct present_job job={src,src_pitch,x,y+first,w,MIN(h-first,128)};
+            struct present_job job={src,deep,src_pitch,deep_pitch,x,y+first,w,MIN(h-first,128)};
             cpu_parallel_for(((size_t)job.h+15)/16,present_rows,&job);
         }
     } else {
-        struct present_job job={src,src_pitch,x,y,w,h};
+        struct present_job job={src,deep,src_pitch,deep_pitch,x,y,w,h};
         for (size_t tile=0;tile<((size_t)h+15)/16;tile++) present_rows(tile,&job);
     }
 }
@@ -95,12 +141,12 @@ static uint64_t measured_tick(void) {
 }
 void fb_benchmark(const uint32_t *src,int src_pitch) {
     if (!cmdline_has("fbbench") || !src || !fb.native || src_pitch<(int)fb.width) return;
-    struct present_job job={src,src_pitch,0,0,(int)fb.width,(int)fb.height};
+    struct present_job job={src,NULL,src_pitch,0,0,0,(int)fb.width,(int)fb.height};
     uint64_t start=measured_tick();
     for (unsigned n=0;n<3;n++) for (size_t tile=0;tile<(fb.height+15)/16;tile++) present_rows(tile,&job);
     uint64_t serial=measured_tick()-start,jobs=cpu_parallel_jobs();
     start=measured_tick();
-    for (unsigned n=0;n<3;n++) fb_present(src,src_pitch,0,0,fb.width,fb.height);
+    for (unsigned n=0;n<3;n++) fb_present(src,src_pitch,NULL,0,0,0,fb.width,fb.height);
     uint64_t parallel=measured_tick()-start;
     bool same=true;
     for (unsigned y=0;y<fb.height;y++) {

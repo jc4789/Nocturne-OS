@@ -34,6 +34,8 @@ void power_reboot(void);
 #define BORDER    1
 #define TASKBAR_H 40
 #define SHADOW    10
+#define CURSOR_BOX_W 26 /* every pointer shape fits this box at (mx-8, my-8) */
+#define CURSOR_BOX_H 30
 #define MAX_WIN   64
 #define EVQ       128
 #define MIN_CW    120
@@ -58,6 +60,7 @@ struct window {
     struct gui_event frame_event; /* durable mailbox, not a droppable input event */
     int flags;
     bool shown, minimized, maximized, dead,fullscreen;
+    bool deep; /* WIN_DEEP_COLOR on a deep display: each surface ends with its deep plane */
     struct rect restore;
     struct rect fullscreen_restore;
     char title[64];
@@ -71,6 +74,8 @@ struct window {
 static bool running;
 static int sw, sh;
 static canvas_t back, wall;
+/* Deep planes (display_abi.h) of back and wall, pitch sw; NULL on an 8 bpc display. */
+static uint8_t *back_deep, *wall_deep;
 static struct wait_queue wm_wq;
 static unsigned pending_frames;
 static uint64_t frame_period_ms, frame_started_ms;
@@ -459,11 +464,17 @@ static struct vnode_ops win_ops = {
     .can_read = win_can_read, .close = win_close, .release = win_release};
 
 static bool alloc_buffer(struct window *w, int cw, int ch) {
-    size_t pages = ALIGN_UP((uint64_t)cw * ch * 4, PAGE_SIZE) / PAGE_SIZE;
+    w->deep = (w->flags & WIN_DEEP_COLOR) && back_deep;
+    size_t pixels = (size_t)cw * ch;
+    size_t pages = ALIGN_UP((uint64_t)pixels * (w->deep ? 5 : 4), PAGE_SIZE) / PAGE_SIZE;
     uint32_t *buf = vmalloc(pages);
     if (!buf) return false;
     uint32_t *producer = vmalloc(pages);
     if (!producer) { vfree(buf, pages); return false; }
+    if (w->deep) { /* nothing written yet is 8-bit content */
+        memset(buf + pixels, 0, pixels);
+        memset(producer + pixels, 0, pixels);
+    }
     w->buf = buf;
     w->user_buf = producer;
     w->pages = pages;
@@ -618,11 +629,41 @@ static int icon_at(int x, int y) {
     return -1;
 }
 
-static void draw_desktop_icons(canvas_t *c) {
+/* 8-bit art drawn over a possibly deep picture: remember the pixels of its
+   box (inside the canvas clip) before drawing, then mark only the pixels it
+   changed as 8-bit content, so the picture around and beneath it keeps its
+   low bits. The box must fit the caller's buffer of stride pixels per row. */
+struct deep_mark { int x, y, w, h, stride; uint32_t *saved; };
+static bool deep_mark_begin(struct deep_mark *m, const canvas_t *c, int x, int y, int w, int h,
+                            uint32_t *saved, int stride) {
+    int x0 = MAX(x, MAX(c->cx0, 0)), y0 = MAX(y, MAX(c->cy0, 0));
+    int x1 = MIN(x + w, MIN(c->cx1, c->w)), y1 = MIN(y + h, MIN(c->cy1, c->h));
+    *m = (struct deep_mark){x0, y0, x1 - x0, y1 - y0, stride, saved};
+    if (m->w <= 0 || m->h <= 0) return false;
+    for (int row = 0; row < m->h; row++)
+        memcpy(saved + row * stride, c->px + (size_t)(y0 + row) * c->pitch + x0, (size_t)m->w * 4);
+    return true;
+}
+static void deep_mark_end(const struct deep_mark *m, const canvas_t *c, uint8_t *deep) {
+    for (int row = 0; row < m->h; row++) {
+        const uint32_t *now = c->px + (size_t)(m->y + row) * c->pitch + m->x, *was = m->saved + row * m->stride;
+        uint8_t *d = deep + (size_t)(m->y + row) * c->pitch + m->x;
+        for (int col = 0; col < m->w; col++) if (now[col] != was[col]) d[col] = 0;
+    }
+}
+
+/* Icons are 8-bit art over a possibly deep wallpaper. */
+#define ICON_AREA_PAD 16
+static void draw_desktop_icons(canvas_t *c, uint8_t *deep) {
+    static uint32_t saved[(ICON_CELL_W + 2 * ICON_AREA_PAD) * ICON_CELL_H];
+    const int stride = ICON_CELL_W + 2 * ICON_AREA_PAD;
     for (int i = 0; i < NDESK; i++) {
         const struct app *a = &apps[desktop_apps[i]];
         int x, y;
         icon_cell(i, &x, &y);
+        struct deep_mark mark;
+        bool track = deep && deep_mark_begin(&mark, c, x - ICON_AREA_PAD, y, ICON_CELL_W + 2 * ICON_AREA_PAD,
+                                             ICON_CELL_H, saved, stride);
         int cw = ICON_CELL_W - 8;
         desktop_draw_icon(c, x + (cw - 32) / 2, y + 8, a->icon);
         const char *label = a->name;
@@ -631,7 +672,38 @@ static void draw_desktop_icons(canvas_t *c) {
         int tx = x + (cw - tw) / 2;
         gfx_text(c, tx + 1, y + 49, label, RGB(0, 0, 0), TRANSPARENT, FONT_SMALL);
         gfx_text(c, tx, y + 48, label, RGB(235, 235, 250), TRANSPARENT, FONT_SMALL);
+        if (track) deep_mark_end(&mark, c, deep);
     }
+}
+
+/* The desktop's own art, at the display's depth. */
+static void draw_wall(void) {
+    desktop_draw_wallpaper(&wall, wall_deep);
+    draw_desktop_icons(&wall, wall_deep);
+}
+
+/* Deep planes exist only for a display with 10 or more bits per channel. */
+static bool alloc_deep(int w, int h, uint8_t **bd, uint8_t **wd) {
+    *bd = *wd = NULL;
+    if (!fb.deep) return true;
+    size_t pages = ALIGN_UP((uint64_t)w * h, PAGE_SIZE) / PAGE_SIZE;
+    *bd = vmalloc(pages);
+    *wd = vmalloc(pages);
+    if (*bd && *wd) {
+        memset(*bd, 0, (size_t)w * h);
+        memset(*wd, 0, (size_t)w * h);
+        return true;
+    }
+    if (*bd) vfree(*bd, pages);
+    if (*wd) vfree(*wd, pages);
+    *bd = *wd = NULL;
+    return false;
+}
+static void free_deep(int w, int h) {
+    size_t pages = ALIGN_UP((uint64_t)w * h, PAGE_SIZE) / PAGE_SIZE;
+    if (back_deep) vfree(back_deep, pages);
+    if (wall_deep) vfree(wall_deep, pages);
+    back_deep = wall_deep = NULL;
 }
 
 static int launch(const char *path, const char *arg) {
@@ -932,6 +1004,7 @@ struct draw_layer {
     bool focus, maximized;
     bool client_raw_overwrite; /* renderer契約。snapshot中は不変。 */
     const uint32_t *pixels;
+    const uint8_t *deep; /* the client's deep plane, or NULL */
     char title[64];
     struct rect bounds;
 };
@@ -951,6 +1024,7 @@ static bool capture_layer(struct draw_layer *l, struct window *w, bool focus) {
                 (w->pending_index >= 0 ? w->pending_index : w->front_index) == 1 ? w->user_buf : w->buf,
         .client_raw_overwrite=true,
         .bounds={MAX(0,x0),MAX(0,y0),MIN(sw,x1)-MAX(0,x0),MIN(sh,y1)-MAX(0,y0)}};
+    if (w->deep && back_deep) l->deep = (const uint8_t *)(l->pixels + (size_t)w->cw * w->ch);
     memcpy(l->title, w->title, sizeof l->title);
     l->title[sizeof l->title - 1] = 0;
     return true;
@@ -1077,11 +1151,31 @@ static struct rect toast_rect(void) { return (struct rect){sw - 336 - SHADOW, 0,
 /* ---- compositing ---- */
 struct draw_scene {
     canvas_t dst, wallpaper;
+    uint8_t *dst_deep;            /* deep planes of dst/wallpaper (pitch = dst pitch), or NULL */
+    const uint8_t *wallpaper_deep;
     struct draw_layer layers[MAX_WIN];
     unsigned count;
     struct rect selection;
     bool selected, fault_test, shadow_strip, occlusion;
 };
+
+/* Deep-plane bookkeeping inside the canvas clip. 8-bit drawing marks its
+   area as 8-bit content; a deep source copies its low bits along with its
+   pixels. Shadows and other blends over deep pixels are 8-bit results. */
+static void deep_clear(uint8_t *deep, const canvas_t *c, int64_t x, int64_t y, int64_t w, int64_t h) {
+    int64_t x0 = MAX(x, (int64_t)c->cx0), y0 = MAX(y, (int64_t)c->cy0);
+    int64_t x1 = MIN(x + w, (int64_t)c->cx1), y1 = MIN(y + h, (int64_t)c->cy1);
+    if (x1 <= x0) return;
+    for (int64_t row = y0; row < y1; row++) memset(deep + row * c->pitch + x0, 0, (size_t)(x1 - x0));
+}
+static void deep_copy(uint8_t *deep, const canvas_t *c, int64_t x, int64_t y,
+                      const uint8_t *src, int src_pitch, int w, int h) {
+    int64_t x0 = MAX(x, (int64_t)c->cx0), y0 = MAX(y, (int64_t)c->cy0);
+    int64_t x1 = MIN(x + w, (int64_t)c->cx1), y1 = MIN(y + h, (int64_t)c->cy1);
+    if (x1 <= x0) return;
+    for (int64_t row = y0; row < y1; row++)
+        memcpy(deep + row * c->pitch + x0, src + (row - y) * src_pitch + (x0 - x), (size_t)(x1 - x0));
+}
 
 struct scene_job {
     const struct draw_scene *scene;
@@ -1151,6 +1245,8 @@ static void capture_scene(struct draw_scene *s, canvas_t dst) {
     cpu_require_bsp();
     s->dst = dst;
     s->wallpaper = wall;
+    s->dst_deep = back_deep;
+    s->wallpaper_deep = wall_deep;
     s->count = 0;
     s->selected = sel_icon >= 0;
     s->fault_test = false;
@@ -1184,13 +1280,24 @@ static void scene_tile(size_t index, void *arg) {
     gfx_clip(&c, r.x, r.y, r.w, r.h);
     bool covered=false;
     unsigned first=scene_first_layer(s,r,&covered);
-    if (!covered) gfx_blit(&c, r.x, r.y, &s->wallpaper, r.x, r.y, r.w, r.h);
+    uint8_t *deep = s->dst_deep;
+    if (!covered) {
+        gfx_blit(&c, r.x, r.y, &s->wallpaper, r.x, r.y, r.w, r.h);
+        if (deep) deep_copy(deep, &c, r.x, r.y, s->wallpaper_deep + (size_t)r.y * c.pitch + r.x, c.pitch, r.w, r.h);
+    }
     if (s->selected && !covered) {
         struct rect a = s->selection;
         gfx_fill_blend(&c, a.x, a.y, a.w, a.h, ARGB(70,150,140,255));
+        if (deep) deep_clear(deep, &c, a.x, a.y, a.w, a.h);
     }
-    for (unsigned i = first; i < s->count; i++)
-        if (rect_overlap(&s->layers[i].bounds, &r)) draw_layer(&c, &s->layers[i], s->shadow_strip);
+    for (unsigned i = first; i < s->count; i++) {
+        const struct draw_layer *l = &s->layers[i];
+        if (!rect_overlap(&l->bounds, &r)) continue;
+        draw_layer(&c, l, s->shadow_strip);
+        if (!deep) continue;
+        deep_clear(deep, &c, l->bounds.x, l->bounds.y, l->bounds.w, l->bounds.h);
+        if (l->deep) deep_copy(deep, &c, l->cx, l->cy, l->deep, l->cw, l->cw, l->ch);
+    }
     job->cpu[index] = cpu_current_index();
 }
 
@@ -1234,6 +1341,8 @@ static void render_scene_original(struct draw_scene *s, struct rect r) {
 static void measure_reference(struct draw_scene *s,struct rect r,unsigned rows,
                               uint64_t *direct,uint64_t *serial) {
     canvas_t original=s->dst;
+    uint8_t *original_deep=s->dst_deep;
+    s->dst_deep=NULL; /* the oracle compares pixels only */
     bool saved=s->shadow_strip, saved_occlusion=s->occlusion;
     s->shadow_strip=false;
     s->occlusion=false;
@@ -1243,6 +1352,7 @@ static void measure_reference(struct draw_scene *s,struct rect r,unsigned rows,
     *direct=scene_tick()-start;
     *serial=render_scene(s,r,false,rows,NULL,NULL);
     s->dst=original;
+    s->dst_deep=original_deep;
     s->shadow_strip=saved;
     s->occlusion=saved_occlusion;
 }
@@ -1258,6 +1368,7 @@ static void scene_benchmark(void) {
     }
     struct draw_scene s;
     capture_scene(&s,back);
+    s.dst_deep=NULL; /* pixel comparison buffers only */
     struct window fixture={.cw=16,.ch=16,.buf=wall.px};
     int extrema[]={INT32_MIN,INT32_MAX};
     for (unsigned i=0;i<ARRAY_SIZE(extrema);i++) {
@@ -1371,6 +1482,7 @@ static void composite_ram(struct rect r) {
         render_scene_direct(&scene,r);
         if (verify && scene.count) {
             scene.dst=verify_back;
+            scene.dst_deep=NULL;
             render_scene_original(&scene,r);
             for (int y=r.y;y<r.y+r.h;y++)
                 if (memcmp(back.px+(size_t)y*back.pitch+r.x,
@@ -1417,12 +1529,36 @@ static void composite_rect(struct rect r) {
         gfx_rect(c, o.x, o.y, o.w, o.h, RGB(180, 160, 255));
         gfx_rect(c, o.x + 1, o.y + 1, o.w - 2, o.h - 2, RGB(90, 70, 200));
     }
-    if (r.y + r.h > sh - TASKBAR_H&&(!focused()||!focused()->fullscreen||menu_open||vol_open)) draw_taskbar(c);
+    bool taskbar = r.y + r.h > sh - TASKBAR_H&&(!focused()||!focused()->fullscreen||menu_open||vol_open);
+    if (taskbar) draw_taskbar(c);
     if (menu_open) draw_menu(c);
     if (vol_open) draw_volume_panel(c);
     if (toast_until) draw_toast(c);
     /* a remote viewer draws the pointer itself; keep it out of the picture it is sent */
-    if (!remote_users) desktop_draw_cursor(c, mx, my, cursor_shape);
+    if (!remote_users) {
+        static uint32_t under[CURSOR_BOX_W * CURSOR_BOX_H];
+        struct deep_mark mark;
+        bool track = back_deep && deep_mark_begin(&mark, c, mx - 8, my - 8, CURSOR_BOX_W, CURSOR_BOX_H,
+                                                  under, CURSOR_BOX_W);
+        desktop_draw_cursor(c, mx, my, cursor_shape);
+        if (track) deep_mark_end(&mark, c, back_deep);
+    }
+    if (back_deep) { /* the shell's own drawing above is 8-bit content */
+        if (resize_visible) deep_clear(back_deep, c, resize_rect.x, resize_rect.y, resize_rect.w, resize_rect.h);
+        if (taskbar) deep_clear(back_deep, c, 0, sh - TASKBAR_H, sw, TASKBAR_H);
+        if (menu_open) {
+            struct rect m = menu_rect();
+            deep_clear(back_deep, c, m.x - SHADOW, m.y - SHADOW, m.w + 2 * SHADOW, m.h + 2 * SHADOW);
+        }
+        if (vol_open) {
+            struct rect v = vol_rect();
+            deep_clear(back_deep, c, v.x - SHADOW, v.y - SHADOW, v.w + 2 * SHADOW, v.h + 2 * SHADOW);
+        }
+        if (toast_until) {
+            struct rect t = toast_rect();
+            deep_clear(back_deep, c, t.x, t.y, t.w, t.h);
+        }
+    }
     if (remote_users) {
         if (nrdamage == MAX_RDAMAGE) {
             for (int i = 1; i < nrdamage; i++) rdamage[0] = rect_union(rdamage[0], rdamage[i]);
@@ -1463,14 +1599,14 @@ static void composite(void) {
         presenting_back = true;
         wm_unlock();
         for (int i = 0; i < n; i++)
-            fb_present(frame.px, frame.pitch, list[i].x, list[i].y, list[i].w, list[i].h);
+            fb_present(frame.px, frame.pitch, back_deep, frame.pitch, list[i].x, list[i].y, list[i].w, list[i].h);
         wm_lock();
         presenting_back = false;
         wq_wake_all(&present_wait);
     }
 }
 
-static void damage_cursor(void) { damage_rect(mx - 8, my - 8, 26, 30); }
+static void damage_cursor(void) { damage_rect(mx - 8, my - 8, CURSOR_BOX_W, CURSOR_BOX_H); }
 
 /* ---- input handling (compositor thread) ---- */
 #define INQ 256
@@ -2052,22 +2188,31 @@ static bool set_screen_size(int w, int h) {
     size_t old = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
     uint32_t *reference = wm_verify ? vmalloc(pages) : NULL;
-    if (!bb || !wp || (wm_verify && !reference)) {
+    uint8_t *bd, *wd;
+    bool deep = alloc_deep(w, h, &bd, &wd);
+    if (!bb || !wp || (wm_verify && !reference) || !deep) {
         if (bb) vfree(bb, pages);
         if (wp) vfree(wp, pages);
         if (reference) vfree(reference,pages);
+        if (deep && bd) {
+            size_t deep_pages = ALIGN_UP((uint64_t)w * h, PAGE_SIZE) / PAGE_SIZE;
+            vfree(bd, deep_pages);
+            vfree(wd, deep_pages);
+        }
         return false;
     }
     vfree(back.px, old);
     vfree(wall.px, old);
+    free_deep(sw, sh);
     if (wm_verify) vfree(verify_back.px,old);
     sw = w;
     sh = h;
     gfx_init(&back, bb, sw, sh, sw);
     gfx_init(&wall, wp, sw, sh, sw);
+    back_deep = bd;
+    wall_deep = wd;
     if (wm_verify) gfx_init(&verify_back,reference,sw,sh,sw);
-    desktop_draw_wallpaper(&wall);
-    draw_desktop_icons(&wall);
+    draw_wall();
     mx = MIN(mx, sw - 1);
     my = MIN(my, sh - 1);
     drag_mode = DRAG_NONE;
@@ -2185,8 +2330,10 @@ void wm_init(void) {
     }
     gfx_init(&back, bb, sw, sh, sw);
     gfx_init(&wall, wp, sw, sh, sw);
-    desktop_draw_wallpaper(&wall);
-    draw_desktop_icons(&wall);
+    if (!alloc_deep(sw, sh, &back_deep, &wall_deep)) kprintf("wm: no memory for deep colour, using 8 bpc\n");
+    kprintf("wm: %u bpc display, %s\n", fb.bpc,
+            back_deep ? "10-bit deep planes" : "8-bit content, dithered gradients");
+    draw_wall();
     fb_benchmark(wall.px,wall.pitch);
     /* Experimental RAM work is independent of the opt-in VRAM copy path. */
     wm_verify=cmdline_has("wmverify");
@@ -2413,10 +2560,21 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return 0;
     }
     case SYS_SCREEN_INFO: {
-        struct screen_info *si = (struct screen_info *)a;
-        if (!user_ok_w(si, sizeof *si)) return -N_ERR_BAD_ADDRESS;
+        /* b == 0: the original struct screen_info; b == sizeof(struct
+           screen_format): the colour format as well (display_abi.h). */
+        if (b && b != sizeof(struct screen_format)) return -N_ERR_INVALID;
+        struct screen_format *si = (struct screen_format *)a;
+        if (!user_ok_w(si, b ? sizeof *si : sizeof(struct screen_info))) return -N_ERR_BAD_ADDRESS;
         si->width = running ? sw : fb.width;
         si->height = running ? sh - TASKBAR_H : fb.height;
+        if (b) {
+            si->bits_per_pixel = fb.bpp;
+            si->red_bits = fb.simulated ? 10 : fb.rsize;
+            si->green_bits = fb.simulated ? 10 : fb.gsize;
+            si->blue_bits = fb.simulated ? 10 : fb.bsize;
+            /* Without deep planes the desktop delivers 8 bits per channel. */
+            si->bits_per_channel = back_deep ? fb.bpc : MIN(fb.bpc, 8);
+        }
         return running ? 0 : -N_ERR_UNSUPPORTED;
     }
     case SYS_WIN_MOVE: {

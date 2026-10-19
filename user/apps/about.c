@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "nocturne.h"
+#include "display.h"
 
 #define W 460
 #define H 330
@@ -43,7 +44,8 @@ static void draw(window_t *w, bool hot) {
     snprintf(vals[1], 96, "%.40s", si.cpu);
     snprintf(vals[2], 96, "%lu MiB free of %lu MiB", (unsigned long)(si.free_mem >> 20),
              (unsigned long)(si.total_mem >> 20));
-    snprintf(vals[3], 96, "%ux%u, 32-bit colour", si.fb_w, si.fb_h);
+    int bpc = display_bits_per_channel();
+    snprintf(vals[3], 96, "%ux%u, %d bpc (%d-bit colour)", si.fb_w, si.fb_h, bpc, bpc * 3);
     snprintf(vals[4], 96, "%lu:%02lu:%02lu", up / 3600, up / 60 % 60, up % 60);
     snprintf(vals[5], 96, "%d running", si.ntasks);
     for (int i = 0; i < 6; i++) {

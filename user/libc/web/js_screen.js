@@ -7,9 +7,9 @@
         get width(){return value(this,0);}get height(){return value(this,1);}
         get availWidth(){return value(this,2);}get availHeight(){return value(this,3);}
         get availLeft(){value(this,0);return 0;}get availTop(){value(this,0);return 0;}
-        // Nocturne's canvas is 8-bit RGB in an ARGB32 buffer. Alpha is not
-        // counted in the CSSOM screen color/pixel depth.
-        get colorDepth(){value(this,0);return 24;}get pixelDepth(){value(this,0);return 24;}
+        // The desktop's bits per channel times three: 24 on an 8 bpc display,
+        // 30 on a 10 bpc one. Alpha is not counted (CSSOM View).
+        get colorDepth(){return value(this,4);}get pixelDepth(){return value(this,4);}
     }
     const screen=Object.create(Screen.prototype);screens.add(screen);
     Object.defineProperty(globalThis,'screen',{configurable:true,enumerable:true,get(){return screen;}});

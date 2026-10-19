@@ -1,6 +1,8 @@
 /* Procedural desktop art: night-sky wallpaper, app icons and the mouse cursor. */
 #include "kernel.h"
 #include "gui/wm.h"
+#include "display_abi.h"
+#include "mm/heap.h"
 
 static uint32_t seed = 0x5EED1234;
 static uint32_t rnd(void) {
@@ -54,29 +56,85 @@ static void ridge(int *hgt, int w, int base, int amp, uint32_t s) {
     }
 }
 
-void desktop_draw_wallpaper(canvas_t *c) {
-    int w = c->w, h = c->h;
-    for (int y = 0; y < h; y++) gfx_hline(c, 0, y, w, sky_at(y, h));
+/* The smooth parts of the wallpaper (sky, moon glow, far mountains) are
+ * computed in 8.8 fixed point per channel, then delivered at the display's
+ * depth: 10 bits with a deep plane, or ordered-dithered to 8 bits. Either way
+ * the long dark gradients show no bands. Crisp details stay 8-bit content. */
+struct hue { int32_t r, g, b; }; /* 8.8: 0 .. 255 << 8 */
 
-    /* moon glow + crescent */
+static struct hue hue_of(uint32_t c) {
+    return (struct hue){(int32_t)((c >> 16) & 0xFF) << 8, (int32_t)((c >> 8) & 0xFF) << 8, (int32_t)(c & 0xFF) << 8};
+}
+/* a + (b - a) * num / den, with 0 <= num <= den */
+static struct hue hue_mix(struct hue a, struct hue b, int64_t num, int64_t den) {
+    return (struct hue){a.r + (int32_t)((b.r - a.r) * num / den), a.g + (int32_t)((b.g - a.g) * num / den),
+                        a.b + (int32_t)((b.b - a.b) * num / den)};
+}
+static struct hue sky_hue(int y, int h) {
+    struct hue navy = hue_of(RGB(6, 8, 26)), indigo = hue_of(RGB(24, 20, 64));
+    struct hue violet = hue_of(RGB(84, 44, 108)), glow = hue_of(RGB(140, 70, 120));
+    int64_t p = (int64_t)y * 100;
+    if (p < 55LL * h) return hue_mix(navy, indigo, p, 55LL * h);
+    if (p < 85LL * h) return hue_mix(indigo, violet, p - 55LL * h, 30LL * h);
+    return hue_mix(violet, glow, p - 85LL * h, 15LL * h);
+}
+static unsigned to10(int32_t v) { return (unsigned)(((uint32_t)v * 1023u + 32640u) / 65280u); }
+static unsigned to8(int32_t v, unsigned threshold) {
+    unsigned q = ((unsigned)v + threshold * 16u + 8u) >> 8;
+    return q > 255 ? 255 : q;
+}
+static void put_hue(canvas_t *c, uint8_t *deep, int x, int y, struct hue v) {
+    size_t at = (size_t)y * c->pitch + x;
+    if (deep) {
+        unsigned r = to10(v.r), g = to10(v.g), b = to10(v.b);
+        c->px[at] = deep_pixel(r, g, b);
+        deep[at] = deep_pack(r, g, b);
+    } else {
+        unsigned t = dither_threshold((unsigned)x, (unsigned)y);
+        c->px[at] = RGB(to8(v.r, t), to8(v.g, t), to8(v.b, t));
+    }
+}
+/* An 8-bit write over the field: that pixel is no longer deep. */
+static void put_crisp(canvas_t *c, uint8_t *deep, int x, int y, uint32_t col) {
+    if (x < 0 || y < 0 || x >= c->w || y >= c->h) return;
+    size_t at = (size_t)y * c->pitch + x;
+    c->px[at] = col;
+    if (deep) deep[at] = 0;
+}
+
+void desktop_draw_wallpaper(canvas_t *c, uint8_t *deep) {
+    int w = c->w, h = c->h;
     int mx = w * 78 / 100, my = h * 22 / 100, mr = h / 14;
     int gr = mr * 4;
-    for (int y = my - gr; y < my + gr; y++) {
-        if (y < 0 || y >= h) continue;
-        for (int x = mx - gr; x < mx + gr; x++) {
-            if (x < 0 || x >= w) continue;
-            int dx = x - mx, dy = y - my;
-            uint32_t d = isqrt(dx * dx + dy * dy);
-            if (d < (uint32_t)gr) {
-                int t = (int)(gr - d) * 255 / gr;
-                t = t * t / 255 * 70 / 255;
-                uint32_t *p = &c->px[y * c->pitch + x];
-                *p = gfx_mix(*p, RGB(200, 190, 255), t);
+    int *hgt = kmalloc(sizeof(int) * w * 2);
+    if (!hgt) return;
+    int *front = hgt + w;
+    ridge(hgt, w, h * 76 / 100, h * 16 / 100, 0x1234567);
+    ridge(front, w, h * 87 / 100, h * 10 / 100, 0x7654321);
+
+    /* sky, the moon's glow (radius in 1/16 pixel) and the far mountains */
+    struct hue moon = hue_of(RGB(200, 190, 255)), far_top = hue_of(RGB(38, 26, 70)), far_bottom = hue_of(RGB(22, 16, 46));
+    int64_t gr16 = (int64_t)gr * 16;
+    for (int y = 0; y < h; y++) {
+        struct hue sky = sky_hue(y, h);
+        bool glow_row = gr > 0 && y >= my - gr && y < my + gr;
+        for (int x = 0; x < w; x++) {
+            struct hue v = sky;
+            if (y >= hgt[x]) {
+                v = hue_mix(far_top, far_bottom, y - hgt[x], h - hgt[x] + 1);
+            } else if (glow_row && x >= mx - gr && x < mx + gr) {
+                int dx = x - mx, dy = y - my;
+                int64_t d16 = isqrt((uint32_t)(dx * dx + dy * dy) * 256u);
+                if (d16 < gr16) {
+                    int64_t t = (gr16 - d16) * 65536 / gr16; /* 0..1 in 16.16 */
+                    v = hue_mix(v, moon, t * t / 65536 * 70 / 255, 65536);
+                }
             }
+            put_hue(c, deep, x, y, v);
         }
     }
 
-    /* stars */
+    /* stars, behind the far mountains */
     seed = 0xC0DEF00D;
     int nstars = w * h / 2200;
     for (int i = 0; i < nstars; i++) {
@@ -86,14 +144,14 @@ void desktop_draw_wallpaper(canvas_t *c) {
         int b = 70 + rnd() % 186;
         uint32_t tint = rnd() % 3;
         uint32_t col = tint == 0 ? RGB(b, b, b) : tint == 1 ? RGB(b * 9 / 10, b * 9 / 10, b) : RGB(b, b * 95 / 100, b * 8 / 10);
-        uint32_t *p = &c->px[y * c->pitch + x];
-        *p = gfx_mix(*p, col, 230);
+        if (y < hgt[x]) put_crisp(c, deep, x, y, gfx_mix(c->px[y * c->pitch + x], col, 230));
         if (b > 240 && rnd() % 3 == 0) {
             uint32_t dim = gfx_mix(sky_at(y, h), col, 110);
-            gfx_pixel(c, x - 1, y, dim);
-            gfx_pixel(c, x + 1, y, dim);
-            gfx_pixel(c, x, y - 1, dim);
-            gfx_pixel(c, x, y + 1, dim);
+            static const int8_t arm[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+            for (int k = 0; k < 4; k++) {
+                int px = x + arm[k][0], py = y + arm[k][1];
+                if (px >= 0 && px < w && py >= 0 && py < hgt[px]) put_crisp(c, deep, px, py, dim);
+            }
         }
     }
 
@@ -101,7 +159,7 @@ void desktop_draw_wallpaper(canvas_t *c) {
     int ox = mr * 45 / 100, oy = -mr * 20 / 100;
     for (int y = my - mr - 1; y <= my + mr + 1; y++) {
         for (int x = mx - mr - 1; x <= mx + mr + 1; x++) {
-            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            if (x < 0 || y < 0 || x >= w || y >= h || y >= hgt[x]) continue;
             int dx = x - mx, dy = y - my;
             int d2 = dx * dx + dy * dy;
             int ex = x - (mx + ox), ey = y - (my + oy);
@@ -116,32 +174,28 @@ void desktop_draw_wallpaper(canvas_t *c) {
                 int a2 = outer * 255 / (mr * 2 + 1);
                 if (a2 < a) a = a2;
                 if (a > 255) a = 255;
-                uint32_t *p = &c->px[y * c->pitch + x];
-                *p = gfx_mix(*p, RGB(246, 236, 196), a);
+                put_crisp(c, deep, x, y, gfx_mix(c->px[y * c->pitch + x], RGB(246, 236, 196), a));
             }
         }
     }
 
-    /* mountains: two layers */
-    int *hgt = __builtin_alloca(sizeof(int) * w);
-    ridge(hgt, w, h * 76 / 100, h * 16 / 100, 0x1234567);
+    /* the near ridge is one flat colour */
     for (int x = 0; x < w; x++)
-        for (int y = hgt[x]; y < h; y++) {
-            uint32_t *p = &c->px[y * c->pitch + x];
-            *p = gfx_mix(RGB(38, 26, 70), RGB(22, 16, 46), (y - hgt[x]) * 255 / (h - hgt[x] + 1));
-        }
-    ridge(hgt, w, h * 87 / 100, h * 10 / 100, 0x7654321);
-    for (int x = 0; x < w; x++)
-        for (int y = hgt[x]; y < h; y++) c->px[y * c->pitch + x] = RGB(12, 10, 26);
+        for (int y = MAX(front[x], 0); y < h; y++) put_crisp(c, deep, x, y, RGB(12, 10, 26));
 
     /* a few pine trees on the front ridge */
     seed = 0xBADA55;
     for (int i = 0; i < w / 40; i++) {
         int x = rnd() % w;
         int th = 10 + rnd() % 18;
-        int base = hgt[x] + 2;
+        int base = front[x] + 2;
         gfx_triangle(c, x, base - th, x - th / 3, base, x + th / 3, base, RGB(10, 8, 20));
+        if (!deep) continue;
+        for (int y = MAX(base - th, 0); y <= MIN(base, h - 1); y++)
+            for (int tx = MAX(x - th / 3, 0); tx <= MIN(x + th / 3, w - 1); tx++)
+                if (c->px[(size_t)y * c->pitch + tx] == RGB(10, 8, 20)) deep[(size_t)y * c->pitch + tx] = 0;
     }
+    kfree(hgt);
 }
 
 /* ---- icons (32x32) ---- */

@@ -31,7 +31,7 @@ bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h);
 int wm_cursor_shape(void);
 
 /* desktop.c */
-void desktop_draw_wallpaper(canvas_t *c);
+void desktop_draw_wallpaper(canvas_t *c, uint8_t *deep); /* deep plane (display_abi.h) or NULL */
 void desktop_draw_icon(canvas_t *c, int x, int y, int icon);
 void desktop_draw_cursor(canvas_t *c, int x, int y, int shape);
 enum { ICON_TERMINAL, ICON_FILES, ICON_PAINT, ICON_CLOCK, ICON_SNAKE, ICON_FRACTAL, ICON_CUBE,

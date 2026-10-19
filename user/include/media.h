@@ -44,6 +44,11 @@ struct nmedia_output {
     uint64_t video_measurement_id;
     struct nmedia_video_configuration video_configuration;
     struct nmedia_audio_observation audio_observation;
+    /* With nmedia_set_deep and a source of more than 8 bits per sample: the
+       low bits of each pixel (display_abi.h deep plane, pitch width), pixels
+       holding the top 8 bits. Otherwise NULL, and such sources are ordered-
+       dithered to 8 bits; 8-bit sources are converted exactly as before. */
+    const uint8_t *deep;
 };
 nmedia *nmedia_open(const char *path, char *error, size_t error_size);
 /* Anonymous HTTP(S), bounded synchronous Range cache. Large resources require
@@ -66,6 +71,11 @@ int nmedia_step(nmedia *media, struct nmedia_output *output);
 bool nmedia_seek(nmedia *media, int64_t ms);
 const char *nmedia_error(const nmedia *media);
 void nmedia_close(nmedia *media);
+/* Deliver high-bit-depth video as 10-bit deep frames instead of dithering it
+   to 8 bits at decode (the default). For a drawer that scales: it keeps 10
+   bits through nmedia_draw_deep and dithers where the pixel lands on an 8 bpc
+   display, or keeps them on a 10 bpc one. */
+void nmedia_set_deep(nmedia *media, bool deep);
 bool nmedia_audio_extension(const char *name);
 /* Returns "maybe", "probably", or ""; never claims an unbuilt codec/MSE/DRM. */
 const char *nmedia_can_play_type(const char *type);
@@ -75,5 +85,11 @@ bool nmedia_performance_codec(const char *type,struct nmedia_video_configuration
 bool nmedia_performance_audio(const char *type,uint32_t *codec,uint32_t *profile);
 /* Aspect-fit bilinear sampling. Destination clip and physical canvas bounds are
  * both enforced, including extreme/offscreen destination rectangles. */
+/* nmedia_draw interpolating a deep frame's 10-bit channels: into the canvas's
+ * deep plane (canvas_deep, pitch canvas->pitch) when it has one, otherwise
+ * ordered-dithered to 8 bits after scaling. Without a frame deep plane it is
+ * exactly nmedia_draw. */
+void nmedia_draw_deep(canvas_t *canvas, uint8_t *canvas_deep, const uint32_t *pixels, const uint8_t *deep,
+                      int source_width, int source_height, int x, int y, int width, int height);
 void nmedia_draw(canvas_t *canvas, const uint32_t *pixels, int source_width, int source_height,
                  int x, int y, int width, int height);

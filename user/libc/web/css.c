@@ -6,6 +6,7 @@
 #include <math.h>
 #include <limits.h>
 #include <nocturne.h>
+#include <display.h>
 #include <parallel.h>
 #include "webi.h"
 #include "web_dialog.h"
@@ -2339,7 +2340,7 @@ static int mq_numeric(const char *s,size_t n,const struct mq *m,double *v) {
     if(m->container)return 0;
     if(strn_ieq(s,"resolution",n)){*v=1;return MQ_RESOLUTION;}
     if(strn_ieq(s,"-webkit-device-pixel-ratio",n)||strn_ieq(s,"device-pixel-ratio",n)){*v=1;return MQ_NUMBER;}
-    if(strn_ieq(s,"color",n)){*v=8;return MQ_INTEGER;}
+    if(strn_ieq(s,"color",n)){*v=display_bits_per_channel();return MQ_INTEGER;} /* bits per component */
     if(strn_ieq(s,"monochrome",n)||strn_ieq(s,"color-index",n)){*v=0;return MQ_INTEGER;}
     return 0;
 }

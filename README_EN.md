@@ -78,6 +78,10 @@ general-purpose OS for daily use (see [Limits](#limits)).
     to the screen are also split across the APs.
   - Double-buffered windows with a frame-completion event (`EV_FRAME`), and a configurable compositing period
     (`wmrefresh`, 120 Hz by default).
+  - 8 bpc and 10 bpc colour: when the firmware's display is 10 bpc (2:10:10:10), the compositor keeps a 10-bit deep
+    plane and windows can draw 10-bit pixels with `WIN_DEEP_COLOR`. On an 8 bpc display the wallpaper and 10-bit
+    video are ordered-dithered to 8 bits, so gradients do not band. Adding `fbsim10` to `cmdline` exercises the
+    10 bpc path on an 8 bpc display.
   - Shadows, rounded title bars, move, resize, maximize, minimize and full screen.
   - A taskbar (start button, window buttons, volume, date and time), a start menu, notifications and a clipboard
     of up to 1 MiB.
