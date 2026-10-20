@@ -20,3 +20,4 @@ uint32_t ioapic_isa_to_gsi(unsigned isa_irq, bool *level, bool *active_low);
 /* Sleep (dev/pm.c), interrupts off: save every entry before S3, write them back after it. */
 void ioapic_suspend(void);
 void ioapic_resume(void);
+void ioapic_mask_all(void); /* a hibernation restore: nothing more comes in before the image takes over */

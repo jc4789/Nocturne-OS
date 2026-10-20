@@ -137,6 +137,12 @@ void ioapic_suspend(void) {
     }
 }
 
+void ioapic_mask_all(void) {
+    for (unsigned i = 0; i < nios; i++)
+        for (uint32_t pin = 0; pin < ios[i].pins && pin < 256; pin++)
+            wr(&ios[i], REG_RTE(pin), rd(&ios[i], REG_RTE(pin)) | RTE_MASK);
+}
+
 void ioapic_resume(void) {
     for (unsigned i = 0; i < nios; i++) {
         wr(&ios[i], REG_ID, saved_id[i]);

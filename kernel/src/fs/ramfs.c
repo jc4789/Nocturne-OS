@@ -11,7 +11,27 @@ static int64_t ram_read(struct vnode *v, struct file *f, void *buf, uint64_t off
     return n;
 }
 
+static bool borrowed(struct vnode *v) { return v->data && !v->cap; }
+
+/* A file read in place from the initrd gets its own copy before its first change. */
+static int own(struct vnode *v, uint64_t need) {
+    uint64_t nc = MAX(MAX(need, v->size), 1);
+    uint8_t *nd = kmalloc(nc);
+    if (!nd) return -N_ERR_NO_MEMORY;
+    memcpy(nd, v->data, v->size);
+    initrd_unborrow(v->data, v->size);
+    v->data = nd;
+    v->cap = nc;
+    return 0;
+}
+
+static void drop_data(uint8_t *data, uint64_t cap, uint64_t size) {
+    if (data && !cap) initrd_unborrow(data, size);
+    else kfree(data);
+}
+
 static int ensure_cap(struct vnode *v, uint64_t need) {
+    if (borrowed(v)) return own(v, need);
     if (need <= v->cap) return 0;
     /* The first write sizes the file exactly (the initrd unpacks each file in
        one write, as do most whole-file saves); later growth doubles. */
@@ -35,6 +55,7 @@ static int64_t ram_write(struct vnode *v, struct file *f, const void *buf, uint6
 }
 
 static int ram_truncate(struct vnode *v, uint64_t size) {
+    if (borrowed(v) && own(v, size) < 0) return -N_ERR_NO_SPACE;
     if (size > v->size) {
         if (ensure_cap(v, size) < 0) return -N_ERR_NO_SPACE;
         memset(v->data + v->size, 0, size - v->size);
@@ -90,7 +111,7 @@ static int ram_create(struct vnode *dir, const char *name, int type, struct vnod
 }
 
 static void ram_release(struct vnode *v) {
-    kfree(v->data);
+    drop_data(v->data, v->cap, v->size);
     kfree(v);
 }
 
@@ -110,12 +131,22 @@ static int ram_unlink(struct vnode *dir, const char *name) {
 static int ram_replace(struct vnode *v, uint8_t *data, uint64_t size) {
     uint64_t flags = irq_save();
     uint8_t *old = v->data;
+    uint64_t old_cap = v->cap, old_size = v->size;
     v->data = data;
-    v->size = v->cap = data ? size : 0;
+    v->size = data ? size : 0;
+    v->cap = data ? MAX(size, 1) : 0; /* owned: never 0, which means borrowed */
     v->mtime = time_now();
     irq_restore(flags);
-    kfree(old);
+    drop_data(old, old_cap, old_size);
     return 0;
+}
+
+void ramfs_borrow(struct vnode *v, const uint8_t *data, uint64_t size) {
+    if (v->ops != &ramfs_ops || !size) return;
+    drop_data(v->data, v->cap, v->size);
+    v->data = (uint8_t *)data;
+    v->size = size;
+    v->cap = 0;
 }
 
 static int ram_move(struct vnode *from_dir, const char *from, struct vnode *to_dir, const char *to) {

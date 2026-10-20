@@ -147,13 +147,43 @@ static uint32_t clus_alloc(struct fat_fs *fs, uint32_t prev, bool zero) {
     return 0;
 }
 
+/* Long runs of FAT changes (freeing or reserving a big file): each FAT sector is written once per
+   run of entries in it instead of once per entry. The pending sector is the one used last, so the
+   cache cannot drop it before fat_put_end writes it. */
+static int fat_put(struct fat_fs *fs, uint32_t c, uint32_t v, uint64_t *pending) {
+    uint64_t off = (uint64_t)c * 4, lba = fs->reserved + off / SECTOR;
+    if (*pending && *pending != lba) {
+        uint8_t *s = fat_sector(fs, *pending);
+        for (uint32_t f = 0; s && f < fs->nfats; f++)
+            if (disk_write(fs, *pending + (uint64_t)f * fs->fat_sectors, 1, s) < 0) return -N_ERR_IO;
+        if (!s) return -N_ERR_IO;
+    }
+    uint8_t *s = fat_sector(fs, lba);
+    if (!s) return -N_ERR_IO;
+    uint32_t *p = (uint32_t *)(s + off % SECTOR);
+    *p = (*p & 0xF0000000) | (v & 0x0FFFFFFF);
+    *pending = lba;
+    return 0;
+}
+
+static int fat_put_end(struct fat_fs *fs, uint64_t *pending) {
+    if (!*pending) return 0;
+    uint8_t *s = fat_sector(fs, *pending);
+    for (uint32_t f = 0; s && f < fs->nfats; f++)
+        if (disk_write(fs, *pending + (uint64_t)f * fs->fat_sectors, 1, s) < 0) return -N_ERR_IO;
+    *pending = 0;
+    return s ? 0 : -N_ERR_IO;
+}
+
 static void chain_free(struct fat_fs *fs, uint32_t c) {
+    uint64_t pending = 0;
     while (clus_valid(fs, c)) {
         uint32_t next = fat_get(fs, c);
-        fat_set(fs, c, 0);
+        if (fat_put(fs, c, 0, &pending) < 0) break;
         if (c < fs->free_hint) fs->free_hint = c;
         c = next;
     }
+    fat_put_end(fs, &pending);
 }
 
 /* the n-th cluster of a chain (0 if the chain is shorter) */
@@ -912,6 +942,65 @@ static int fat_unlink(struct vnode *dir, const char *name) {
         chain_free(fs, clus);
     }
     return 0;
+}
+
+bool fat_is(struct vnode *v) { return v && v->ops == &fat_ops; }
+
+/* An empty file grows to size bytes of clusters nobody wrote: a hibernation image is written
+   into them directly (fat_extents), with no change to the volume's tables afterwards. */
+int fat_reserve(struct vnode *v, uint64_t size) {
+    if (!fat_is(v) || v->type != VT_FILE) return -N_ERR_INVALID;
+    struct fat_node *n = v->priv;
+    struct fat_fs *fs = n->fs;
+    if (n->first || size > 0xFFFFFFFFull) return -N_ERR_INVALID;
+    uint64_t need = (size + fs->cbytes - 1) / fs->cbytes, have = 0, pending = 0;
+    uint32_t prev = 0, start = clus_valid(fs, fs->free_hint) ? fs->free_hint : 2, c = start;
+    int err = 0;
+    while (have < need && !err) {
+        if (fat_get(fs, c) == 0) {
+            if (prev) err = fat_put(fs, prev, c, &pending);
+            else n->first = c;
+            if (!err) err = fat_put(fs, c, 0x0FFFFFFF, &pending);
+            prev = c;
+            have++;
+        }
+        if (++c >= fs->nclus + 2) c = 2;
+        if (c == start && have < need) err = -N_ERR_NO_SPACE;
+    }
+    if (!err) err = fat_put_end(fs, &pending);
+    else fat_put_end(fs, &pending);
+    if (err) {
+        chain_free(fs, n->first);
+        n->first = 0;
+        return err;
+    }
+    fs->free_hint = c;
+    v->size = size;
+    v->mtime = time_now();
+    return node_sync(v);
+}
+
+/* The file's clusters as runs of whole-disk sectors, in file order. */
+int fat_extents(struct vnode *v, int (*run)(void *ctx, struct blkdev *d, uint64_t lba, uint64_t sectors), void *ctx) {
+    if (!fat_is(v)) return -N_ERR_INVALID;
+    struct fat_node *n = v->priv;
+    struct fat_fs *fs = n->fs;
+    uint64_t left = (v->size + fs->cbytes - 1) / fs->cbytes, lba = 0, count = 0;
+    for (uint32_t c = n->first; clus_valid(fs, c) && left; c = fat_get(fs, c), left--) {
+        uint64_t at = fs->lba0 + clus_lba(fs, c);
+        if (count && at == lba + count) {
+            count += fs->spc;
+            continue;
+        }
+        if (count) {
+            int r = run(ctx, fs->disk, lba, count);
+            if (r < 0) return r;
+        }
+        lba = at;
+        count = fs->spc;
+    }
+    if (left) return -N_ERR_IO; /* the chain ends before the file does */
+    return count ? run(ctx, fs->disk, lba, count) : 0;
 }
 
 static void fat_release(struct vnode *v) {

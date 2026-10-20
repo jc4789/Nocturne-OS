@@ -615,12 +615,20 @@ static uacpi_iteration_decision found_link(void *user, uacpi_namespace_node *nod
     return UACPI_ITERATION_DECISION_CONTINUE;
 }
 
+void acpi_links_save(void) {
+    if (!aml_ready) return;
+    acpi_links_forget();
+    uacpi_find_devices("PNP0C0F", found_link, NULL);
+}
+
+void acpi_links_forget(void) {
+    for (unsigned i = 0; i < nlinks; i++) uacpi_free_resources(links[i].res);
+    nlinks = 0;
+}
+
 bool acpi_sleep_prepare(unsigned state) {
     if (!aml_ready) return false;
-    if (state == 3) {
-        nlinks = 0;
-        uacpi_find_devices("PNP0C0F", found_link, NULL);
-    }
+    if (state == 3) acpi_links_save();
     uacpi_status st = uacpi_prepare_for_sleep_state((uacpi_sleep_state)state);
     if (st != UACPI_STATUS_OK) kprintf("acpi: preparing S%u failed: %s\n", state, uacpi_status_to_string(st));
     return st == UACPI_STATUS_OK;
@@ -649,14 +657,12 @@ void acpi_wake_prepare(unsigned state) {
 void acpi_wake(unsigned state) {
     if (!aml_ready) return;
     unsigned routed = 0;
-    for (unsigned i = 0; i < nlinks; i++) {
+    for (unsigned i = 0; i < nlinks; i++)
         if (uacpi_set_resources(links[i].node, links[i].res) == UACPI_STATUS_OK) routed++;
-        uacpi_free_resources(links[i].res);
-    }
     uacpi_status st = uacpi_wake_from_sleep_state((uacpi_sleep_state)state);
     if (st != UACPI_STATUS_OK) kprintf("acpi: waking from S%u: %s\n", state, uacpi_status_to_string(st));
     if (nlinks) kprintf("acpi: %u of %u PCI interrupt links set again\n", routed, nlinks);
-    nlinks = 0;
+    acpi_links_forget();
 }
 
 bool acpi_reset(void) { return aml_ready && uacpi_reboot() == UACPI_STATUS_OK; }

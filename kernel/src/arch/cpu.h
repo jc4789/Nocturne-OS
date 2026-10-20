@@ -100,6 +100,7 @@ bool lapic_timer_start(unsigned hz, int vector);
 bool lapic_runner_timer_start(void); /* BSPで較正済みのperiodic tickだけをAPで再使用 */
 void lapic_resume(void); /* BSP after S3: registers and the calibrated tick again */
 bool lapic_start_ap(uint32_t apic_id, uint64_t page); /* INIT-SIPI-SIPI into real mode at page */
+bool lapic_send_init(uint32_t apic_id); /* INIT only: the AP waits for a STARTUP, running nothing */
 /* Tickless idle, after lapic_timer_start: stop this CPU's tick, fire it once after ms, or go
    back to the periodic tick. */
 void lapic_tick_stop(void);

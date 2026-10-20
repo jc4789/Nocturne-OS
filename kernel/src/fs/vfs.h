@@ -74,7 +74,8 @@ struct vnode {
     void *priv;
     struct vnode *mounted;  /* fs root mounted on top of this dir */
     struct vnode *parent;
-    /* ramfs storage */
+    /* ramfs storage. cap 0 with data set: the bytes are the initrd archive's, read in place; the
+       first change copies them out (fs/initrd.c gets the pages back once nothing reads them). */
     struct vnode *children, *sibling;
     uint8_t *data;
     uint64_t cap;
@@ -147,6 +148,7 @@ extern struct vnode_ops ramfs_ops;
 struct vnode *ramfs_replace_new(const char *abspath); /* staging for N_DOCUMENT_REPLACE */
 bool ramfs_is_replace(struct vnode *v);
 int ramfs_replace_commit(struct vnode *v);
+void ramfs_borrow(struct vnode *v, const uint8_t *data, uint64_t size); /* initrd bytes, in place */
 
 /* event queues (sys/events.c) */
 struct event_watch;
@@ -168,5 +170,18 @@ int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct
 int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek, bool discard,
                                 struct file **attached);
 
-/* initrd */
+/* FAT (fs/fat.c) */
+struct blkdev;
+void fat_mount_data(void);
+bool fat_is(struct vnode *v);
+int fat_reserve(struct vnode *v, uint64_t size); /* empty file -> size bytes, nothing written */
+int fat_extents(struct vnode *v, int (*run)(void *ctx, struct blkdev *d, uint64_t lba, uint64_t sectors),
+                void *ctx);
+
+/* initrd: the archive stays where the bootloader put it and its files are read from it */
 void initrd_load(void *data, uint64_t size);
+void initrd_unborrow(const uint8_t *data, uint64_t size); /* nothing reads these bytes any more */
+/* Hibernation: the archive's pages that still hold what the bootloader loaded (the next boot
+   loads them again, so an image need not carry them). */
+bool initrd_range(uint64_t *phys, uint64_t *pages);
+bool initrd_page_pristine(uint64_t pfn);

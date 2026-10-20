@@ -19,5 +19,11 @@ struct blkdev {
 void blk_register(struct blkdev *d);
 int blk_count(void);
 struct blkdev *blk_get(int i);
-static inline int blk_read(struct blkdev *d, uint64_t lba, uint32_t n, void *buf) { return d->read(d, lba, n, buf); }
-static inline int blk_write(struct blkdev *d, uint64_t lba, uint32_t n, const void *buf) { return d->write(d, lba, n, buf); }
+int blk_read(struct blkdev *d, uint64_t lba, uint32_t n, void *buf);
+int blk_write(struct blkdev *d, uint64_t lba, uint32_t n, const void *buf);
+/* Power changes: blk_hold waits for every transfer under way to end, and from then on only the
+   calling thread reaches the disks; everyone else waits in blk_read/blk_write until blk_release.
+   Across a sleep no request is lost with the controller's state, and between a hibernation
+   snapshot and the power going off nothing changes on disk that the snapshot does not know. */
+void blk_hold(void);
+void blk_release(void);

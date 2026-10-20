@@ -25,6 +25,9 @@ extern uint32_t hv_vp_index;
 
 /* Set up the hypercall page and the SynIC; SINT2 interrupts go to `isr`. False if unavailable. */
 bool hv_core_init(void (*isr)(void));
+/* Hypercall page and SynIC overlays off (before a restored image is copied), and on again. */
+void hv_core_suspend(void);
+void hv_core_resume(void);
 /* HvPostMessage: send a message to the host on a connection. Returns an HV status. */
 uint16_t hv_post_message(uint32_t connection_id, uint32_t type, const void *data, uint32_t len);
 /* HvSignalEvent: signal the host on an event connection. */

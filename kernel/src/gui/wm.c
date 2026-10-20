@@ -610,15 +610,29 @@ static const struct app apps[] = {
     {"Settings", "/bin/js", ICON_SETTINGS, "/bin/settings.js"},
     {"About Nocturne", "/bin/js", ICON_ABOUT, "/bin/about.js"},
     {"Sleep", "@sleep", ICON_SLEEP},
+    {"Hibernate", "@hibernate", ICON_HIBERNATE},
     {"Restart", "@reboot", ICON_REBOOT},
     {"Shut Down", "@poweroff", ICON_POWER},
 };
 #define NAPPS ((int)ARRAY_SIZE(apps))
-#define APP_SLEEP (NAPPS - 3) /* the power items close the menu: Sleep, Restart, Shut Down */
+#define APP_SLEEP (NAPPS - 4) /* the power items close the menu: Sleep, Hibernate, Restart, Shut Down */
 
-/* the start menu leaves Sleep out on machines that cannot sleep (dev/pm.c says which) */
-static int menu_count(void) { return pm_can_sleep() ? NAPPS : NAPPS - 1; }
-static const struct app *menu_app(int i) { return &apps[i >= APP_SLEEP && !pm_can_sleep() ? i + 1 : i]; }
+/* the start menu leaves Sleep and Hibernate out on machines that cannot do them (dev/pm.c says which) */
+static bool menu_has(int i) {
+    if (!strcmp(apps[i].path, "@sleep")) return pm_can_sleep();
+    if (!strcmp(apps[i].path, "@hibernate")) return pm_can_hibernate();
+    return true;
+}
+static int menu_count(void) {
+    int n = 0;
+    for (int i = 0; i < NAPPS; i++) n += menu_has(i);
+    return n;
+}
+static const struct app *menu_app(int i) {
+    for (int k = 0; k < NAPPS; k++)
+        if (menu_has(k) && i-- == 0) return &apps[k];
+    return &apps[NAPPS - 1];
+}
 
 static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 10, 13, 14, 16, 17};
 #define NDESK ((int)ARRAY_SIZE(desktop_apps))
@@ -734,8 +748,8 @@ static void set_deep_simulation(bool on) {
 }
 
 static int launch(const char *path, const char *arg) {
-    if (!strcmp(path, "@reboot") || !strcmp(path, "@poweroff") || !strcmp(path, "@sleep")) {
-        pm_request(path[1] == 'r' ? PM_REBOOT : path[1] == 's' ? PM_SLEEP : PM_POWER_OFF, true);
+    if (!strcmp(path, "@reboot") || !strcmp(path, "@poweroff") || !strcmp(path, "@sleep") || !strcmp(path, "@hibernate")) {
+        pm_request(path[1] == 'r' ? PM_REBOOT : path[1] == 's' ? PM_SLEEP : path[1] == 'h' ? PM_HIBERNATE : PM_POWER_OFF, true);
         return 0;
     }
     if (pm_stopping()) return -N_ERR_STOPPED;

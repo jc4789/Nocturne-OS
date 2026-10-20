@@ -313,6 +313,16 @@ void desktop_draw_icon(canvas_t *c, int x, int y, int icon) {
         gfx_line(c, x + 27, y + 4, x + 21, y + 9, RGB(200, 190, 250));
         gfx_hline(c, x + 21, y + 10, 7, RGB(200, 190, 250));
         break;
+    case ICON_HIBERNATE: /* the sleep crescent over a disk: the memory goes to the disk */
+        for (int j = -8; j <= 8; j++)
+            for (int i = -8; i <= 8; i++)
+                if (i * i + j * j <= 64 && (i - 4) * (i - 4) + (j + 3) * (j + 3) > 49)
+                    gfx_pixel(c, x + 12 + i, y + 9 + j, RGB(200, 190, 250));
+        gfx_fill_round(c, x + 3, y + 19, 26, 11, 3, RGB(110, 100, 170));
+        gfx_hline(c, x + 6, y + 22, 14, RGB(70, 62, 120));
+        gfx_hline(c, x + 6, y + 26, 14, RGB(70, 62, 120));
+        gfx_fill(c, x + 23, y + 23, 3, 3, RGB(120, 230, 150));
+        break;
     case ICON_REBOOT:
         gfx_circle(c, x + 16, y + 16, 11, RGB(120, 200, 250));
         gfx_circle(c, x + 16, y + 16, 10, RGB(120, 200, 250));

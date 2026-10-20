@@ -51,7 +51,7 @@ static const uint32_t frame_versions[] = {0x30000, 0x10000};
 
 /* ---- deferred work: power actions must not run in interrupt context ---- */
 
-enum { ACT_NONE, ACT_SHUTDOWN, ACT_REBOOT };
+enum { ACT_NONE, ACT_SHUTDOWN, ACT_REBOOT, ACT_HIBERNATE };
 static volatile int pending_action;
 static struct wait_queue util_wq;
 
@@ -64,9 +64,10 @@ static void util_thread(void *arg) {
         int a = pending_action;
         if (a == ACT_NONE) continue;
         pending_action = ACT_NONE;
-        kprintf("hv-util: the host asked us to %s\n", a == ACT_REBOOT ? "restart" : "shut down");
+        kprintf("hv-util: the host asked us to %s\n",
+                a == ACT_REBOOT ? "restart" : a == ACT_HIBERNATE ? "hibernate" : "shut down");
         sleep_ms(100); /* let our reply reach the host */
-        pm_request(a == ACT_REBOOT ? PM_REBOOT : PM_POWER_OFF, false);
+        pm_request(a == ACT_REBOOT ? PM_REBOOT : a == ACT_HIBERNATE ? PM_HIBERNATE : PM_POWER_OFF, false);
     }
 }
 
@@ -84,7 +85,8 @@ static void shutdown(struct service *s, struct ic_header *h, uint8_t *body, uint
     uint32_t flags = ((uint32_t *)body)[2];
     if (flags <= 1) pending_action = ACT_SHUTDOWN;
     else if (flags <= 3) pending_action = ACT_REBOOT;
-    else h->status = IC_E_FAIL; /* hibernate: not supported */
+    else if (pm_can_hibernate()) pending_action = ACT_HIBERNATE;
+    else h->status = IC_E_FAIL; /* no hibernation on this machine */
 }
 
 /* The RTC on Hyper-V holds the host's local time and Nocturne has no time zones, so the clock

@@ -17,3 +17,11 @@ void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg);
    is back as it was; false when enter() returned instead (the machine did not sleep). The interrupt
    controllers, the timer and the devices are the caller's. */
 bool wake_sleep(void (*enter)(void));
+
+/* Hibernation restore (dev/hibernate.c). The spare page follows the wake pages below 1 MiB, never
+   used otherwise (0 when low memory has no room for it). wake_hibernate_jump runs from it on pml4,
+   a page table mapping all RAM one to one (its kernel half is filled in here): it copies every
+   pair of the list (arch/wake.asm) and enters the image through its wake page, where wake_sleep
+   returns true. Interrupts off, every other CPU in INIT, every device stopped. */
+uint64_t wake_spare_page(void);
+__attribute__((noreturn)) void wake_hibernate_jump(uint64_t pml4, uint64_t list, uint64_t image_wake_page);

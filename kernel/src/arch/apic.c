@@ -121,6 +121,20 @@ bool lapic_start_ap(uint32_t apic_id, uint64_t page) {
     return true;
 }
 
+bool lapic_send_init(uint32_t apic_id) {
+    if (!available || tsc_hz < 1000000) return false;
+    if (x2_mode) {
+        wrmsr(X2APIC_ICR, ((uint64_t)apic_id << 32) | 0x4500);
+    } else {
+        if (!xapic_ipi_ready()) return false;
+        lapic[0x310 / 4] = apic_id << 24;
+        lapic[0x300 / 4] = 0x4500;
+        if (!xapic_ipi_ready()) return false;
+    }
+    spin_us(10000);
+    return true;
+}
+
 bool lapic_worker_init(void) {
     if (!available) return false;
     uint32_t a, b, c, d;

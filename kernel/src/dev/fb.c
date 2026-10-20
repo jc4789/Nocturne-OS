@@ -206,7 +206,8 @@ static void vbe_resume(void *arg) {
     outb(0x3C0, 0x20); /* palette address source: the picture is shown again */
 }
 
-static struct pm_device display_pm = {.name = "display", .stage = PM_STAGE_IO};
+/* the firmware sets the same mode again on the next boot (a hibernation image checks it does) */
+static struct pm_device display_pm = {.name = "display", .stage = PM_STAGE_IO, .cold_ok = true};
 
 void fb_pm_init(void) {
     if (!fb.addr) return;

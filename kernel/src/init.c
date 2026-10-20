@@ -8,6 +8,7 @@
 #include "dev/fb.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "dev/hibernate.h"
 #include "arch/ioapic.h"
 #include "dev/ata.h"
 #include "dev/audio.h"
@@ -24,7 +25,6 @@ extern volatile struct limine_module_request module_req;
 extern const char *kernel_cmdline;
 void acpi_init(void);
 void net_init(void);
-void fat_mount_data(void);
 void nvme_init(void);
 void rdp_init(void);
 
@@ -92,10 +92,11 @@ static void drop_absent_firmware(void) {
     }
     char path[PATH_MAX_LEN] = "/usr/share/firmware/nvidia";
     if (!vfs_lookup(path)) return;
-    uint64_t before = heap_used_bytes();
+    uint64_t heap = heap_used_bytes(), free = pmm_free_pages();
     remove_tree(path, sizeof path);
-    kprintf("initrd: no NVIDIA display controller, firmware dropped (%lu MiB)\n",
-            (unsigned long)((before - heap_used_bytes()) / 1048576));
+    /* files copied into the heap shrink it, files read in place give archive pages back */
+    int64_t gone = (int64_t)(heap - heap_used_bytes()) + (int64_t)((pmm_free_pages() - free) * PAGE_SIZE);
+    kprintf("initrd: no NVIDIA display controller, firmware dropped (%ld MiB)\n", (long)(gone / 1048576));
 }
 
 void kmain_late(void) {
@@ -110,10 +111,14 @@ void kmain_late(void) {
         struct limine_file *m = module_req.response->modules[0];
         initrd_load(m->address, m->size);
         kprintf("initrd: %lu KiB loaded from %s\n", m->size / 1024, m->path);
-        /* Every file was copied into ramfs; the archive itself is dead weight. */
-        uint64_t before = pmm_free_pages();
-        pmm_release_range(hhdm_virt_to_phys(m->address), m->size);
-        kprintf("initrd: archive released, %lu MiB returned\n", (unsigned long)((pmm_free_pages() - before) * PAGE_SIZE / 1048576));
+        uint64_t phys, pages;
+        if (initrd_range(&phys, &pages)) {
+            kprintf("initrd: files read in place from the archive\n");
+        } else { /* every file was copied into ramfs; the archive itself is dead weight */
+            uint64_t before = pmm_free_pages();
+            pmm_release_range(hhdm_virt_to_phys(m->address), m->size);
+            kprintf("initrd: archive released, %lu MiB returned\n", (unsigned long)((pmm_free_pages() - before) * PAGE_SIZE / 1048576));
+        }
     } else {
         kprintf("initrd: none found!\n");
     }
@@ -136,6 +141,7 @@ void kmain_late(void) {
     nvme_init();
     usb_wait_settled(8000); /* USB disks present at boot can hold /data */
     fat_mount_data();
+    hibernate_restore(); /* returns only when there is no image to go back to */
 
     bool gui = !cmdline_has("nogui");
     if (gui) wm_init();

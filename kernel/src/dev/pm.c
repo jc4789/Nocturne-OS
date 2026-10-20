@@ -6,6 +6,7 @@
 #include "dev/pm.h"
 #include "dev/acpi.h"
 #include "dev/blk.h"
+#include "dev/hibernate.h"
 #include "gui/wm.h"
 #include "sys/sched.h"
 #include "arch/ioapic.h"
@@ -14,6 +15,8 @@
 #include "dev/pci.h"
 #include "dev/timer.h"
 #include "dev/serial.h"
+#include "arch/hyperv.h"
+#include "hv/hv.h"
 
 void power_off(void);
 void power_reboot(void);
@@ -41,7 +44,8 @@ void pm_register(struct pm_device *d) {
 void pm_request(enum pm_action action, bool interactive) {
     uint64_t f = irq_save();
     /* sleep is never forced and never replaces a shutdown that is already waiting */
-    if (!stopping && !(action == PM_SLEEP && (busy || requested))) {
+    bool nap = action == PM_SLEEP || action == PM_HIBERNATE;
+    if (!stopping && !(nap && (busy || requested))) {
         wanted = action;
         /* asking again while apps are closing, or soon after a cancel, means "close them anyway" */
         if (!interactive || busy || uptime_ms() < force_until) forced = true;
@@ -91,49 +95,94 @@ static void stop_apps(void) {
     if (left) kprintf("pm: %d app tasks did not end\n", left);
 }
 
-static NORETURN void finish(enum pm_action action) {
+static void flush_disks(void) {
     for (int i = 0; i < blk_count(); i++) {
         struct blkdev *d = blk_get(i);
         if (d->flush && d->flush(d) < 0) kprintf("pm: %s: cache flush failed\n", d->name);
     }
-    if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
-    cli();
+}
+
+void pm_quiesce_devices(void) {
     for (int s = 0; s < PM_STAGES; s++)
         for (struct pm_device *d = stages[s]; d; d = d->next)
-            if (d->quiesce) {
-                kprintf("pm: stopping %s\n", d->name);
-                d->quiesce(d->ctx);
-            }
+            if (d->quiesce) d->quiesce(d->ctx);
+}
+
+static NORETURN void finish(enum pm_action action) {
+    flush_disks();
+    if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
+    cli();
+    kprintf("pm: stopping the devices\n");
+    pm_quiesce_devices();
     if (action == PM_REBOOT) power_reboot();
     power_off();
     for (;;) hlt();
 }
 
-/* ---- sleep (S3) ---- */
-static const char *sleep_blocker(void) {
-    if (!acpi_sleep_supported(3)) return "the firmware has no S3";
+/* ---- sleep (S3) and hibernation ---- */
+static const char *sleep_blocker(bool hibernate) {
+    const char *why = hibernate ? hibernate_blocker() : !acpi_sleep_supported(3) ? "the firmware has no S3" : NULL;
+    if (why) return why;
     if (!wake_available()) return "no wake page below 1 MiB";
     for (int s = 0; s < PM_STAGES; s++)
         for (struct pm_device *d = stages[s]; d; d = d->next)
-            if (!d->resume) return d->name;
+            if (!d->resume && !(hibernate && d->cold_ok)) return d->name;
     return NULL;
 }
 
-static bool can_sleep; /* decided once by pm_sleep_check: the start menu asks on every redraw */
+/* decided once by pm_sleep_check: the start menu asks on every redraw */
+static bool can_sleep, can_hibernate;
 
 bool pm_can_sleep(void) { return can_sleep; }
+bool pm_can_hibernate(void) { return can_hibernate; }
 
 void pm_sleep_check(void) {
-    const char *why = sleep_blocker();
+    const char *why = sleep_blocker(false);
     can_sleep = !why;
     if (why) kprintf("pm: sleep unavailable (%s)\n", why);
     else kprintf("pm: sleep (S3) available\n");
+    why = sleep_blocker(true);
+    can_hibernate = !why;
+    if (why) kprintf("pm: hibernation unavailable (%s)\n", why);
+    else kprintf("pm: hibernation available\n");
 }
 
 static void enter_s3(void) { acpi_sleep_enter(3); }
 
-static void sleep_now(void) {
-    const char *why = sleep_blocker();
+/* Devices, interrupt controllers and the CPU down, enter(), and all of it back. True after a real
+   sleep (S3 woke up, or a hibernation image was restored), false when enter() returned. */
+static bool machine_sleep(void (*enter)(void), unsigned state) {
+    pci_suspend();
+    uint64_t f = irq_save();
+    pm_quiesce_devices();
+    uint32_t pic = pic_state();
+    ioapic_suspend();
+    timer_suspend();
+    bool slept = wake_sleep(enter);
+    /* awake (or never asleep): the CPU is back; now what it talks to */
+    lapic_resume();
+    pic_restore(pic);
+    serial_init(); /* the log port, reset with the rest */
+    ioapic_resume();
+    hv_reference_resume(); /* the hypervisor's overlay pages: reset, or the restoring kernel's */
+    hv_core_resume();
+    int64_t secs = timer_resume();
+    sched_clock_resume();
+    acpi_wake_prepare(state);
+    pci_resume();
+    irq_restore(f);
+    /* a hibernation's snapshot is no sleep: the firmware heard of none */
+    if (state == 3 || slept) acpi_wake(state);
+    else acpi_links_forget();
+    for (int s = PM_STAGES - 1; s >= 0; s--)
+        for (struct pm_device *d = stages[s]; d; d = d->next)
+            if (d->resume) d->resume(d->ctx);
+    if (slept) kprintf("pm: awake after %ld s\n", (long)secs);
+    return slept;
+}
+
+static void sleep_now(bool hibernate) {
+    const char *why = sleep_blocker(hibernate);
     /* a driver in an app (dev/pciuser.c) is not told about sleep yet: its device would come back
        reset under it */
     for (int i = 0; i < pci_count() && !why; i++)
@@ -141,47 +190,43 @@ static void sleep_now(void) {
     for (int s = 0; s < PM_STAGES && !why; s++)
         for (struct pm_device *d = stages[s]; d && !why; d = d->next)
             if (d->refuse) why = d->refuse(d->ctx);
-    if (why) kprintf("pm: not sleeping: %s\n", why);
+    if (!why && hibernate) hibernate_prepare(&why);
     if (why) {
-        wm_notify("Cannot sleep", why);
+        kprintf("pm: not %s: %s\n", hibernate ? "hibernating" : "sleeping", why);
+        wm_notify(hibernate ? "Cannot hibernate" : "Cannot sleep", why);
         return;
     }
-    kprintf("pm: going to sleep\n");
-    for (int i = 0; i < blk_count(); i++) {
-        struct blkdev *d = blk_get(i);
-        if (d->flush && d->flush(d) < 0) kprintf("pm: %s: cache flush failed\n", d->name);
-    }
-    bool aps = smp_suspend();
-    bool slept = false;
-    if (aps && acpi_sleep_prepare(3)) {
-        pci_suspend();
-        uint64_t f = irq_save();
-        for (int s = 0; s < PM_STAGES; s++)
-            for (struct pm_device *d = stages[s]; d; d = d->next)
-                if (d->quiesce) d->quiesce(d->ctx);
-        uint32_t pic = pic_state();
-        ioapic_suspend();
-        timer_suspend();
-        slept = wake_sleep(enter_s3);
-        /* awake (or never asleep): the CPU is back; now what it talks to */
-        lapic_resume();
-        pic_restore(pic);
-        serial_init(); /* the log port, reset with the rest */
-        ioapic_resume();
-        int64_t secs = timer_resume();
-        sched_clock_resume();
-        acpi_wake_prepare(3);
-        pci_resume();
-        irq_restore(f);
-        acpi_wake(3);
-        for (int s = PM_STAGES - 1; s >= 0; s--)
-            for (struct pm_device *d = stages[s]; d; d = d->next) d->resume(d->ctx);
-        if (slept) kprintf("pm: awake after %ld s\n", (long)secs);
+    kprintf("pm: going to %s\n", hibernate ? "hibernate" : "sleep");
+    /* no transfer is cut off by the controllers losing their state, and after a snapshot nothing
+       but the image reaches the disks */
+    blk_hold();
+    flush_disks();
+    bool aps = smp_suspend(), slept = false;
+    if (!aps) {
+        why = "A processor did not stop";
+    } else if (hibernate) {
+        acpi_links_save();
+        slept = machine_sleep(hibernate_snapshot, 4);
+        if (!slept) {
+            /* the snapshot: the machine as it is from here on never comes back */
+            wm_notify("Hibernating", "Saving the memory to /data");
+            if (!(why = hibernate_write())) {
+                stopping = true;
+                kprintf("pm: hibernated, power off\n");
+                finish(PM_POWER_OFF);
+            }
+        }
+    } else if (!acpi_sleep_prepare(3) || !(slept = machine_sleep(enter_s3, 3))) {
+        why = "The firmware did not sleep";
     }
     smp_resume();
-    if (!slept) kprintf("pm: sleep failed%s\n", aps ? "" : " (a CPU did not stop)");
+    blk_release();
+    if (hibernate) hibernate_cleanup(slept);
     wm_repaint();
-    if (!slept) wm_notify("Sleep failed", aps ? "The firmware did not sleep" : "A processor did not stop");
+    if (!slept) {
+        kprintf("pm: %s failed: %s\n", hibernate ? "hibernation" : "sleep", why);
+        wm_notify(hibernate ? "Hibernation failed" : "Sleep failed", why);
+    }
 }
 
 static void pm_thread(void *arg) {
@@ -193,14 +238,15 @@ static void pm_thread(void *arg) {
         busy = true;
         irq_restore(f);
         enum pm_action action = wanted;
-        if (action == PM_SLEEP) {
-            kprintf("pm: sleep requested\n");
-            sleep_now(); /* apps keep running: they are only told the time moved */
+        bool nap = action == PM_SLEEP || action == PM_HIBERNATE;
+        if (nap) {
+            kprintf("pm: %s requested\n", action == PM_SLEEP ? "sleep" : "hibernation");
+            sleep_now(action == PM_HIBERNATE); /* apps keep running: they are only told the time moved */
         } else {
             kprintf("pm: %s requested%s\n", action == PM_REBOOT ? "restart" : "shutdown",
                     forced ? "" : " (apps may keep their windows)");
         }
-        if (action != PM_SLEEP && close_windows()) {
+        if (!nap && close_windows()) {
             f = irq_save();
             stopping = true;
             action = wanted;
@@ -213,7 +259,7 @@ static void pm_thread(void *arg) {
         f = irq_save();
         busy = false;
         /* a shutdown asked for while asleep (the power button wakes the machine) still happens */
-        if (action != PM_SLEEP || wanted == PM_SLEEP) forced = requested = false;
+        if (!nap || wanted == PM_SLEEP || wanted == PM_HIBERNATE) forced = requested = false;
         irq_restore(f);
     }
 }

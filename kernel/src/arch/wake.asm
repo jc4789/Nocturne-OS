@@ -112,3 +112,54 @@ wake_out:
     pop rbp
     pop rbx
     ret
+
+; ---- the last step of restoring a hibernation image ----
+; Copied to a page below 1 MiB that neither the restoring kernel nor the image uses, and entered on
+; a page table that maps all RAM one to one (arch/wake.c, wake_hibernate_jump), interrupts off:
+;   rdi = the first page of the copy list: { next page, count, count x { dst, src } }, physical;
+;         src 0 means a page of zeros
+;   rsi = the image's wake page, which the image prepared for wake_resume64 before its snapshot
+; Every pair is copied, then the image's own wake page table (the first 2 MiB one to one and the
+; image's kernel half) is loaded and the image comes back through tramp_lm64, as from S3.
+bits 64
+section .text
+global hib_copy_start, hib_copy_end
+hib_copy_start:
+    mov r12, rdi
+    mov r15, rsi
+    cld
+.page:
+    test r12, r12
+    jz .done
+    mov r13, [r12 + 8]
+    lea r14, [r12 + 16]
+.pair:
+    test r13, r13
+    jz .next
+    mov rdi, [r14]
+    mov rsi, [r14 + 8]
+    mov ecx, 512
+    test rsi, rsi
+    jz .zero
+    rep movsq
+    jmp .advance
+.zero:
+    xor eax, eax
+    rep stosq
+.advance:
+    add r14, 16
+    dec r13
+    jmp .pair
+.next:
+    mov r12, [r12]
+    jmp .page
+.done:
+    mov rax, cr4                ; global TLB entries of the restoring kernel's half must go
+    and rax, ~(1 << 7)
+    mov cr4, rax
+    lea rax, [r15 + 0x1000]
+    mov cr3, rax
+    mov ebx, r15d
+    lea rax, [rbx + (tramp_lm64 - tramp_start)]
+    jmp rax
+hib_copy_end:

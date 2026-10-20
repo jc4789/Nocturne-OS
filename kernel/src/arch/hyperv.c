@@ -53,6 +53,15 @@ uint64_t hv_reference_tsc_page(void) {
     return page;
 }
 
+/* An overlay too: off before a restored image is copied over its frame, on again after. */
+void hv_reference_suspend(void) {
+    if (reference_page) wrmsr(HV_MSR_REFERENCE_TSC, rdmsr(HV_MSR_REFERENCE_TSC) & ~1ULL);
+}
+
+void hv_reference_resume(void) {
+    if (reference_page) wrmsr(HV_MSR_REFERENCE_TSC, reference_page | (rdmsr(HV_MSR_REFERENCE_TSC) & 0xFFE) | 1);
+}
+
 bool hv_reference_time(uint64_t *units_100ns) {
     if (!hv.present || !(hv.features & HV_ACCESS_TIME_REF_COUNT)) return false;
     if (reference_page) {

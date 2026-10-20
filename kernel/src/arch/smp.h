@@ -72,3 +72,4 @@ void cpu_worker_fault(struct regs *regs) __attribute__((noreturn));
 bool smp_suspend(void);
 void smp_resume(void);
 void cpu_park_check(void);
+void smp_hold_in_init(void); /* after smp_suspend, for a hibernation restore: every AP to INIT */

@@ -74,4 +74,9 @@ bool acpi_sleep_enter(unsigned state);
    wake with interrupts on before the drivers resume (PCI interrupt links via _SRS, then _WAK). */
 void acpi_wake_prepare(unsigned state);
 void acpi_wake(unsigned state);
+/* The PCI interrupt links' settings, kept for acpi_wake (prepare keeps them for S3). Hibernation
+   keeps them itself: after a restore the booting kernel's routing is not necessarily the image's.
+   forget drops them (a hibernation that did not happen). */
+void acpi_links_save(void);
+void acpi_links_forget(void);
 bool acpi_reset(void);

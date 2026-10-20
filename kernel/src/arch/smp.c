@@ -122,6 +122,8 @@ bool cpu_tlb_ipi(unsigned i) {
     /* A failed AP halts with IRQs off and never touches memory again. */
     if (!i || i >= slots || !__atomic_load_n(&workers[i].ready, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&workers[i].failed, __ATOMIC_ACQUIRE)) return false;
+    /* Parked for a sleep: halted with IRQs off until INIT, which also empties its TLB. */
+    if (workers[i].asleep && __atomic_load_n(&workers[i].parked, __ATOMIC_ACQUIRE)) return false;
     if (!lapic_send_ipi(workers[i].apic_id, VEC_TLB_SHOOTDOWN))
         panic("smp: TLB shootdown IPI failed; context retained");
     return true;
@@ -263,6 +265,11 @@ bool smp_suspend(void) {
     online = 1;
     irq_restore(flags);
     return ok;
+}
+
+void smp_hold_in_init(void) {
+    for (unsigned i = 1; i < slots; i++)
+        if (workers[i].asleep) lapic_send_init(workers[i].apic_id);
 }
 
 void smp_resume(void) {

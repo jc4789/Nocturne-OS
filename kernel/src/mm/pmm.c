@@ -18,7 +18,49 @@ static inline bool is_used(uint64_t p) { return bitmap[p / 64] & (1ULL << (p % 6
 
 uint64_t pmm_highest_usable;
 
+/* RAM as the bootloader described it (usable, its own and the kernel's): what a hibernation image
+   saves and restores. The signature also covers the firmware's ACPI memory, which must not move
+   between the boot that saved an image and the boot that restores it. */
+#define RAM_RANGES 64
+static struct pmm_range ram[RAM_RANGES];
+static unsigned nram;
+static uint64_t map_sig = 0xcbf29ce484222325ULL;
+
+static void sig_add(uint64_t v) {
+    for (int i = 0; i < 8; i++) map_sig = (map_sig ^ ((v >> (i * 8)) & 0xFF)) * 0x100000001b3ULL;
+}
+
+static void note_ranges(struct limine_memmap_response *mm) {
+    for (uint64_t i = 0; i < mm->entry_count; i++) {
+        struct limine_memmap_entry *e = mm->entries[i];
+        if (e->type == LIMINE_MEMMAP_ACPI_RECLAIMABLE || e->type == LIMINE_MEMMAP_ACPI_NVS) {
+            sig_add(e->base);
+            sig_add(e->length);
+            sig_add(e->type);
+        }
+        if (e->type != LIMINE_MEMMAP_USABLE && e->type != LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE &&
+            e->type != LIMINE_MEMMAP_EXECUTABLE_AND_MODULES)
+            continue;
+        uint64_t b = ALIGN_UP(e->base, PAGE_SIZE), end = ALIGN_DOWN(e->base + e->length, PAGE_SIZE);
+        if (end <= b) continue;
+        if (nram && ram[nram - 1].end == b) ram[nram - 1].end = end; /* the map is sorted */
+        else if (nram < RAM_RANGES) ram[nram++] = (struct pmm_range){b, end};
+    }
+    for (unsigned i = 0; i < nram; i++) {
+        sig_add(ram[i].base);
+        sig_add(ram[i].end);
+    }
+}
+
+unsigned pmm_ram_ranges(const struct pmm_range **out) {
+    *out = ram;
+    return nram;
+}
+
+uint64_t pmm_map_signature(void) { return map_sig; }
+
 void pmm_init(struct limine_memmap_response *mm) {
+    note_ranges(mm);
     uint64_t top = 0;
     for (uint64_t i = 0; i < mm->entry_count; i++) {
         struct limine_memmap_entry *e = mm->entries[i];
@@ -140,6 +182,21 @@ void pmm_free(uint64_t phys) {
 }
 
 uint64_t pmm_free_pages(void) { return free_pages; }
+uint64_t pmm_page_count(void) { return total_pages; }
+bool pmm_page_used(uint64_t pfn) { return pfn >= total_pages || is_used(pfn); }
+
+bool pmm_claim(uint64_t pfn) {
+    cpu_require_bsp();
+    if (pfn >= total_pages) return false;
+    uint64_t f = irq_save();
+    bool was_free = !is_used(pfn);
+    if (was_free) {
+        set_used(pfn);
+        free_pages--;
+    }
+    irq_restore(f);
+    return was_free;
+}
 uint64_t pmm_total_pages(void) { return usable_pages; }
 
 /* Hand frames the bootloader gave us (a module that has been consumed) to the

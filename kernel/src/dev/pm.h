@@ -17,6 +17,11 @@
         PM_STAGE_BUS first, then the APs. Sleep is offered only when every
         registered device can resume.
 
+   Hibernate (dev/hibernate.h): as sleep, but the firmware is not asked; RAM is
+   written to /data and the power goes off. A device that cannot resume may
+   still take part when it comes back by itself after a cold boot (cold_ok:
+   the firmware's display).
+
    Quiesce callbacks run on the BSP with interrupts off: they may only poll
    (io_wait, the TSC), never sleep or wait for uptime_ms, which stands still.
    Resume callbacks run on the BSP with interrupts on, before any other thread:
@@ -39,10 +44,11 @@ struct pm_device {
     void (*resume)(void *ctx);  /* NULL: cannot come back from sleep (no sleep while it is there) */
     const char *(*refuse)(void *ctx); /* NULL, or why it cannot sleep right now (asked at each sleep) */
     void *ctx;
+    bool cold_ok; /* without resume: as it was after the next boot (hibernation) */
     struct pm_device *next;
 };
 
-enum pm_action { PM_POWER_OFF, PM_REBOOT, PM_SLEEP };
+enum pm_action { PM_POWER_OFF, PM_REBOOT, PM_SLEEP, PM_HIBERNATE };
 
 void pm_init(void);
 void pm_register(struct pm_device *d); /* d stays owned by the driver for good */
@@ -55,4 +61,6 @@ bool pm_stopping(void); /* a power change has passed the point of no return */
 /* Whether sleep can be offered: the firmware has S3, there is a wake page, every registered
    device can resume. pm_sleep_check logs it once all the drivers have registered. */
 bool pm_can_sleep(void);
+bool pm_can_hibernate(void); /* /data on a disk, room below 1 MiB, every device back after it */
 void pm_sleep_check(void);
+void pm_quiesce_devices(void); /* interrupts off: every registered device stops, stage by stage */

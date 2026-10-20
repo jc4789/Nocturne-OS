@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 struct limine_memmap_response;
 void pmm_init(struct limine_memmap_response *mm);
@@ -12,3 +13,11 @@ uint64_t pmm_free_pages(void);
 uint64_t pmm_low_range(uint64_t *pages);
 uint64_t pmm_total_pages(void);
 extern uint64_t pmm_highest_usable;
+
+/* Hibernation (dev/hibernate.c) */
+struct pmm_range { uint64_t base, end; }; /* physical, page aligned, end exclusive */
+unsigned pmm_ram_ranges(const struct pmm_range **out); /* the bootloader's RAM, merged and sorted */
+uint64_t pmm_map_signature(void);  /* the same on every boot of the same machine and memory */
+uint64_t pmm_page_count(void);     /* frames the bitmap covers */
+bool pmm_page_used(uint64_t pfn);
+bool pmm_claim(uint64_t pfn);      /* a free frame becomes used: true; false when it was in use */

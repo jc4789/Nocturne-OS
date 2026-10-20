@@ -23,6 +23,7 @@
 
 uint32_t hv_vp_index;
 static void *hypercall_page;
+static uint64_t hc_pa, simp_pa, siefp_pa; /* the overlays, for hv_core_resume */
 static uint8_t *post_buf; /* HvPostMessage input: must not cross a page */
 static uint64_t post_buf_pa;
 static struct hv_message *msg_page;
@@ -49,7 +50,7 @@ bool hv_core_init(void (*isr)(void)) {
     if (!hv.present || (hv.features & need) != need) return false;
 
     wrmsr(HV_MSR_GUEST_OS_ID, NOCTURNE_GUEST_ID);
-    uint64_t hc_pa = pmm_alloc_zeroed();
+    hc_pa = pmm_alloc_zeroed();
     wrmsr(HV_MSR_HYPERCALL, (rdmsr(HV_MSR_HYPERCALL) & 0xFFE) | hc_pa | 1);
     if (!(rdmsr(HV_MSR_HYPERCALL) & 1)) {
         kprintf("hyperv: the hypercall page could not be enabled\n");
@@ -60,11 +61,12 @@ bool hv_core_init(void (*isr)(void)) {
     post_buf = phys_to_virt(post_buf_pa);
     hv_vp_index = (uint32_t)rdmsr(HV_MSR_VP_INDEX);
 
-    uint64_t simp = pmm_alloc_zeroed(), siefp = pmm_alloc_zeroed();
-    msg_page = phys_to_virt(simp);
-    event_page = phys_to_virt(siefp);
-    wrmsr(HV_MSR_SIMP, simp | 1);
-    wrmsr(HV_MSR_SIEFP, siefp | 1);
+    simp_pa = pmm_alloc_zeroed();
+    siefp_pa = pmm_alloc_zeroed();
+    msg_page = phys_to_virt(simp_pa);
+    event_page = phys_to_virt(siefp_pa);
+    wrmsr(HV_MSR_SIMP, simp_pa | 1);
+    wrmsr(HV_MSR_SIEFP, siefp_pa | 1);
     sint_isr = isr;
     vector_register(VEC_VMBUS, vmbus_vector);
     wrmsr(HV_MSR_SINT0 + VMBUS_MESSAGE_SINT, VEC_VMBUS); /* unmasked, no auto-EOI */
@@ -99,4 +101,25 @@ void hv_message_done(struct hv_message *m) {
     m->type = 0;
     hv_mb();
     if (m->flags & 1) wrmsr(HV_MSR_EOM, 0); /* the hypervisor has another message queued */
+}
+
+/* The hypervisor lays the hypercall, message and event pages over guest frames; while enabled,
+   writes to those frames do not reach RAM. Off before a restored image is copied over them. */
+void hv_core_suspend(void) {
+    if (!hypercall_page) return;
+    wrmsr(HV_MSR_SCONTROL, rdmsr(HV_MSR_SCONTROL) & ~1ULL);
+    wrmsr(HV_MSR_SIMP, rdmsr(HV_MSR_SIMP) & ~1ULL);
+    wrmsr(HV_MSR_SIEFP, rdmsr(HV_MSR_SIEFP) & ~1ULL);
+    wrmsr(HV_MSR_HYPERCALL, rdmsr(HV_MSR_HYPERCALL) & ~1ULL);
+}
+
+/* After a sleep (the MSRs were reset) or a restored image (another kernel's values): ours again. */
+void hv_core_resume(void) {
+    if (!hypercall_page) return;
+    wrmsr(HV_MSR_GUEST_OS_ID, NOCTURNE_GUEST_ID);
+    wrmsr(HV_MSR_HYPERCALL, (rdmsr(HV_MSR_HYPERCALL) & 0xFFE) | hc_pa | 1);
+    wrmsr(HV_MSR_SIMP, simp_pa | 1);
+    wrmsr(HV_MSR_SIEFP, siefp_pa | 1);
+    wrmsr(HV_MSR_SINT0 + VMBUS_MESSAGE_SINT, VEC_VMBUS);
+    wrmsr(HV_MSR_SCONTROL, rdmsr(HV_MSR_SCONTROL) | 1);
 }

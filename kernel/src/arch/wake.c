@@ -48,7 +48,10 @@ extern struct { uint16_t limit; uint64_t base; } PACKED wake_gdtr;
 extern uint64_t wake_suspend(void (*enter)(void));
 extern void wake_resume64(void);
 
+extern const uint8_t hib_copy_start[], hib_copy_end[];
+
 static uint64_t page; /* physical; 0 without one */
+static uint64_t spare; /* the page after them when there is one: a hibernation restore's last copy */
 static uint8_t resume_stack[4096] __attribute__((aligned(16))); /* wake_resume64's few pushes */
 
 void wake_init(void) {
@@ -64,9 +67,23 @@ void wake_init(void) {
     pml4[0] = (page + 0x2000) | PTE_P | PTE_W;
     pdpt[0] = (page + 0x3000) | PTE_P | PTE_W;
     pd[0] = PTE_P | PTE_W | PTE_PS; /* 0 - 2 MiB, the wake page included */
+    if (n > WAKE_PAGES && (size_t)(hib_copy_end - hib_copy_start) <= PAGE_SIZE) spare = page + WAKE_PAGES * PAGE_SIZE;
 }
 
 bool wake_available(void) { return page != 0; }
+uint64_t wake_spare_page(void) { return spare; }
+
+NORETURN void wake_hibernate_jump(uint64_t pml4, uint64_t list, uint64_t image_wake_page) {
+    memcpy(phys_to_virt(spare), hib_copy_start, (size_t)(hib_copy_end - hib_copy_start));
+    /* the kernel half stays mapped until the jump into the spare page */
+    uint64_t *p = phys_to_virt(pml4), *k = phys_to_virt(kernel_pml4 & PTE_ADDR);
+    for (unsigned i = 256; i < 512; i++) p[i] = k[i];
+    cli();
+    write_cr4(read_cr4() & ~(1ULL << 7)); /* PGE off: every TLB entry goes, global ones too */
+    write_cr3(pml4);
+    ((void (*)(uint64_t, uint64_t))spare)(list, image_wake_page);
+    for (;;) hlt();
+}
 uint64_t wake_page(void) { return page; }
 
 void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg) {

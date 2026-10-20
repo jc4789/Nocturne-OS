@@ -1,5 +1,35 @@
-/* Unpack a USTAR archive (the Limine module) into the root ramfs. */
+/* Unpack a USTAR archive (the Limine module) into the root ramfs. The files' bytes stay in the
+   archive and are read there (ramfs_borrow); a page of it goes back to the allocator once no file
+   reads it any more (one was changed, removed or replaced). */
 #include "fs/vfs.h"
+#include "mm/heap.h"
+#include "mm/pmm.h"
+
+static uint64_t base, npages; /* physical, page aligned */
+static uint64_t *given_back;   /* 1 bit per archive page: handed to the allocator */
+
+void initrd_unborrow(const uint8_t *data, uint64_t size) {
+    if (!given_back || !size) return;
+    uint64_t start = ALIGN_UP(hhdm_virt_to_phys(data), PAGE_SIZE);
+    uint64_t end = ALIGN_DOWN(hhdm_virt_to_phys(data) + size, PAGE_SIZE);
+    for (uint64_t p = start; p < end; p += PAGE_SIZE) {
+        uint64_t i = (p - base) / PAGE_SIZE;
+        if (p < base || i >= npages || given_back[i / 64] & (1ULL << (i % 64))) continue;
+        given_back[i / 64] |= 1ULL << (i % 64);
+        pmm_release_range(p, PAGE_SIZE);
+    }
+}
+
+bool initrd_range(uint64_t *phys, uint64_t *pages) {
+    *phys = base;
+    *pages = npages;
+    return given_back != NULL;
+}
+
+bool initrd_page_pristine(uint64_t pfn) {
+    uint64_t i = pfn - base / PAGE_SIZE;
+    return given_back && pfn >= base / PAGE_SIZE && i < npages && !(given_back[i / 64] & (1ULL << (i % 64)));
+}
 
 static uint64_t octal(const char *s, int n) {
     uint64_t v = 0;
@@ -10,6 +40,10 @@ static uint64_t octal(const char *s, int n) {
 void initrd_load(void *data, uint64_t size) {
     uint8_t *p = data, *end = p + size;
     int files = 0, dirs = 0;
+    /* Limine loads modules page aligned; the archive's pages stay the allocator's "used" ones */
+    base = ALIGN_DOWN(hhdm_virt_to_phys(data), PAGE_SIZE);
+    npages = (ALIGN_UP(hhdm_virt_to_phys(data) + size, PAGE_SIZE) - base) / PAGE_SIZE;
+    given_back = kzalloc((npages + 63) / 64 * 8);
     while (p + 512 <= end) {
         char *h = (char *)p;
         if (!h[0]) break;
@@ -41,8 +75,10 @@ void initrd_load(void *data, uint64_t size) {
             if (!v) {
                 struct file *f;
                 if (vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC, &f) == 0) {
-                    vfs_write(f, p + 512, fsize);
                     vfs_close(f);
+                    struct vnode *n = vfs_lookup(path);
+                    if (n && given_back) ramfs_borrow(n, p + 512, fsize);
+                    else if (n) vfs_write_whole(path, p + 512, fsize); /* no room to track pages */
                     files++;
                 }
             }
