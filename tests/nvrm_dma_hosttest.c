@@ -8,6 +8,7 @@
 static int failures, creates, closes, maps, views, live;
 static uint64_t first_address, replacement_address, scattered[3];
 static size_t allocated_bytes;
+static uint32_t allocation_flags, view_cache;
 static bool fail_addresses, fail_view;
 static uint8_t mapped[3 * NV_RM_PAGE_SIZE];
 
@@ -23,8 +24,9 @@ void call_once(once_flag *flag, void (*init)(void)) { (void)flag; init(); }
 
 void nvrm_log(const char *fmt, ...) { (void)fmt; }
 n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags) {
-    (void)pci; (void)flags;
+    (void)pci;
     allocated_bytes = bytes;
+    allocation_flags = flags;
     creates++; live++;
     return creates;
 }
@@ -39,7 +41,8 @@ n_result n_dma_addresses(n_handle h, size_t first, uint64_t *out, size_t count) 
     return 3;
 }
 n_handle n_shared_view(n_handle h, size_t offset, size_t bytes, uint32_t cache) {
-    (void)h; (void)cache;
+    (void)h;
+    view_cache = cache;
     views++;
     CHECK(offset <= allocated_bytes && bytes <= allocated_bytes - offset);
     if (fail_view) return -N_ERR_NO_MEMORY;
@@ -58,6 +61,7 @@ n_result n_handle_close(n_handle h) { CHECK(h >= 0); live--; closes++; return 0;
 static void reset_fixture(void) {
     CHECK(live == 0 && maps == 0);
     creates = closes = views = 0;
+    allocation_flags = view_cache = 0;
     fail_addresses = fail_view = false;
     first_address = replacement_address = PAGE;
 }
@@ -74,6 +78,16 @@ static void allocation_cases(void) {
     CHECK(nv_alloc_pages(&nv, 3, PAGE, NV_FALSE, NV_MEMORY_CACHED,
                         NV_TRUE, NV_FALSE, 0, ptes, &priv) != NV_OK);
     CHECK(priv == NULL && live == 0 && closes == 1 && ptes[0] == 0);
+    CHECK(allocation_flags == N_DMA_32BIT);
+
+    reset_fixture();
+    /* The last byte at the inclusive DMA mask is valid. */
+    first_address = (uint64_t)UINT32_MAX + 1 - PAGE;
+    CHECK(nv_alloc_pages(&nv, 1, PAGE, NV_TRUE, NV_MEMORY_CACHED,
+                        NV_TRUE, NV_FALSE, 0, ptes, &priv) == NV_OK);
+    CHECK(ptes[0] == first_address);
+    CHECK(nv_free_pages(&nv, 1, NV_TRUE, NV_MEMORY_CACHED, priv) == NV_OK);
+    priv = NULL;
 
     reset_fixture();
     nv.dma_mask = UINT64_MAX;
@@ -87,6 +101,7 @@ static void allocation_cases(void) {
     CHECK(nv_alloc_pages(&nv, 1, PAGE, NV_TRUE, NV_MEMORY_CACHED,
                         NV_TRUE, NV_FALSE, 0, ptes, &priv) != NV_OK);
     CHECK(priv == NULL && live == 0);
+    CHECK(allocation_flags == N_DMA_CONTIGUOUS);
 
     reset_fixture();
     CHECK(nv_alloc_pages(&nv, 1, 3 * PAGE, NV_TRUE, NV_MEMORY_CACHED,
@@ -131,6 +146,7 @@ static void allocation_cases(void) {
     CHECK(nv_alloc_pages(&nv, 1, PAGE, NV_TRUE, NV_MEMORY_CACHED,
                         NV_TRUE, NV_FALSE, 0, ptes, &priv) != NV_OK);
     CHECK(priv == NULL && live == 0);
+    CHECK(allocation_flags == (N_DMA_CONTIGUOUS | N_DMA_32BIT));
 }
 
 static void mapping_cases(void) {
@@ -156,6 +172,21 @@ static void mapping_cases(void) {
     nv_free_kernel_mapping(&nv, priv, address, mapping);
     CHECK(nv_free_pages(&nv, 2, NV_TRUE, NV_MEMORY_CACHED, priv) == NV_OK);
     CHECK(live == 0 && maps == 0);
+
+    reset_fixture();
+    priv = mapping = NULL;
+    /* The scrubber's allocation uses contiguous, uncached system memory.
+       Verify the actual OS callback's view/mapping ownership for that path;
+       this does not exercise Falcon, cache hardware or PCI DMA. */
+    CHECK(nv_alloc_pages(&nv, 2, PAGE, NV_TRUE, NV_MEMORY_UNCACHED,
+                        NV_TRUE, NV_FALSE, 0, &pte, &priv) == NV_OK);
+    address = nv_alloc_kernel_mapping(&nv, priv, 0, 0, 2 * PAGE, &mapping);
+    CHECK(address == mapped && mapping != NULL);
+    CHECK(view_cache == N_CACHE_UNCACHED && views == 1 && maps == 1 && live == 1);
+    nv_free_kernel_mapping(&nv, priv, address, mapping);
+    CHECK(maps == 0 && live == 1);
+    CHECK(nv_free_pages(&nv, 2, NV_TRUE, NV_MEMORY_UNCACHED, priv) == NV_OK);
+    CHECK(live == 0);
 }
 
 int main(void) {
