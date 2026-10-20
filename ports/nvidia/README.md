@@ -122,6 +122,6 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 - `nv->bars[2]`（インスタンスメモリ）を設定空間の BAR 3 としたのは推測。
 - `os_is_efi_enabled` は常に真。`os_disable_console_access` は何もしない（表示の乗っ取りは GSP 初期化の間にありうる。D8）。
 - `nv_revoke_gpu_mappings` はクライアントの view を取り上げられない。
-- `cnd_timedwait` は `TIME_UTC` で待つ（単調時計との差の影響は未確認）。
+- `cnd_timedwait` は `TIME_UTC` の期限で待つ。Nocturne の `TIME_UTC` は戻らない（libc の `time.c`）ので、壁時計が進められても待ちが早く終わるだけで、タイマーの線は単調時計で測り直す。
 - RM の呼出しの深さに対し、スレッドのスタックが 256 KiB で足りるかは未確認。
 - 実機でのファームウェア起動・割り込み・ブートの結果は未確認。

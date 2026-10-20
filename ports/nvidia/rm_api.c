@@ -169,9 +169,10 @@ n_handle nvrm_rm_mapping_object(uint64_t *offset, uint64_t *bytes) {
             nvrm_log("NVRM: a mapping of %u separate ranges is not supported", (unsigned)m.range_count);
             return -1;
         }
-        uint64_t view_offset = 0;
-        length = m.ranges[0].size;
-        h = nvrm_bar_view(m.ranges[0].start, length, m.caching, &view_offset);
+        uint64_t view_offset = 0, size = m.ranges[0].size;
+        h = nvrm_bar_view(m.ranges[0].start, size, m.caching, &view_offset);
+        /* The view is whole pages; the client maps all of it, as for system memory. */
+        length = (view_offset + size + PAGE - 1) & ~(PAGE - 1);
         in_page += view_offset;
     }
     if (h < 0) {

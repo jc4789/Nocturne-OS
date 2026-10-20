@@ -457,8 +457,11 @@ void *NV_API_CALL os_alloc_semaphore(NvU32 initial) {
     return s;
 }
 void NV_API_CALL os_free_semaphore(void *semaphore) {
-    if (!semaphore) return;
-    free(semaphore);
+    struct nvrm_semaphore *s = semaphore;
+    if (!s) return;
+    cnd_destroy(&s->cv);
+    mtx_destroy(&s->lock);
+    free(s);
 }
 NV_STATUS NV_API_CALL os_acquire_semaphore(void *semaphore) {
     struct nvrm_semaphore *s = semaphore;
@@ -817,6 +820,9 @@ static int timer_thread(void *arg) {
                 for (int i = 0; i < 32; i++) __builtin_ia32_pause();
                 mtx_lock(&timer_lock);
             } else {
+                /* cnd_timedwait takes a TIME_UTC deadline. Nocturne's TIME_UTC never runs
+                   backwards (libc time.c), so a wall clock set forward can only end the wait
+                   early, and the loop measures again on the monotonic clock. */
                 struct timespec ts;
                 timespec_get(&ts, TIME_UTC);
                 uint64_t ms = left_ns / 1000000ull;

@@ -255,12 +255,21 @@ static bool kernel_register(const struct pci_device *d, uint32_t offset, uint32_
     return false;
 }
 
+/* A reset (the GPU fell off the bus and came back, or left a power state) clears the BARs, and
+   the driver puts back the addresses it saw at boot one dword at a time. That write is let
+   through when it is exactly the address the kernel found there (d->bar): a BAR can be put back,
+   never moved. Half way through a 64-bit BAR it decodes at a mixed address, but only requests
+   inside the bridge window above it reach it, so that touches no other device. */
+static bool bar_restore(const struct pci_device *d, uint32_t offset, uint32_t width, uint32_t value) {
+    return width == 4 && offset >= 0x10 && offset < 0x28 && value == d->bar[(offset - 0x10) / 4];
+}
+
 int64_t pci_user_config_write(struct file *f, uint32_t offset, uint32_t width, uint32_t value) {
     struct pci_claim *c = claim_of(f);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!config_access_ok(offset, width)) return -N_ERR_INVALID;
     struct pci_device *d = c->d;
-    if (kernel_register(d, offset, width)) return -N_ERR_DENIED;
+    if (kernel_register(d, offset, width) && !bar_restore(d, offset, width, value)) return -N_ERR_DENIED;
     if (width == 4) pci_write32(d->bus, d->dev, d->func, offset, value);
     else if (width == 2) pci_write16(d->bus, d->dev, d->func, offset, value);
     else pci_write8(d->bus, d->dev, d->func, offset, value);

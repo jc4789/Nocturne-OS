@@ -12,6 +12,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 
 #include <os-interface.h>
 
@@ -43,33 +44,60 @@ NvU32 NV_API_CALL nv_get_dev_minor(nv_state_t *nv) { (void)nv; return 0; }
 struct pci_token {
     uint32_t target;   /* N_PCI_SELF or N_PCI_TARGET(...) */
     bool self;
+    struct pci_token *next;
 };
 
 static struct pci_token self_token = { .target = N_PCI_SELF, .self = true };
+
+/* The tokens of other functions. RM never hands one back (os_pci_remove_supported is false) and
+   asks for the same bridges again and again, so each function gets one token for the life of
+   nvrm. */
+static struct pci_token *other_tokens;
+static mtx_t token_lock;
+static once_flag token_once = ONCE_FLAG_INIT;
+static void token_setup(void) { mtx_init(&token_lock, mtx_plain); }
 
 static n_result pci_read(struct pci_token *t, uint32_t offset, uint32_t width) {
     if (!t || nvrm_dev.pci < 0) return -N_ERR_NO_HANDLE;
     return n_pci_config_read(nvrm_dev.pci, t->target, offset, width);
 }
 
+static bool function_present(n_result id) { return id >= 0 && (id & 0xFFFF) != 0xFFFF && (id & 0xFFFF) != 0; }
+
+/* Only a function that answers gets a token, so probing empty slots keeps nothing. */
+static struct pci_token *other_token(uint32_t target, n_result *id) {
+    call_once(&token_once, token_setup);
+    mtx_lock(&token_lock);
+    struct pci_token *t = other_tokens;
+    while (t && t->target != target) t = t->next;
+    if (t) {
+        mtx_unlock(&token_lock);
+        *id = pci_read(t, 0, 4);
+        return t;
+    }
+    struct pci_token probe = { .target = target };
+    *id = pci_read(&probe, 0, 4);
+    if (function_present(*id) && (t = malloc(sizeof *t))) {
+        *t = (struct pci_token){ .target = target, .next = other_tokens };
+        other_tokens = t;
+    }
+    mtx_unlock(&token_lock);
+    return t;
+}
+
 void *NV_API_CALL os_pci_init_handle(NvU32 domain, NvU8 bus, NvU8 slot, NvU8 function, NvU16 *vendor,
                                      NvU16 *device) {
     if (domain != 0 || slot > 31 || function > 7 || nvrm_dev.pci < 0) return NULL;
     struct pci_token *t;
+    n_result id;
     const struct n_pci_function *g = &nvrm_dev.info;
     if (bus == g->bus && slot == g->dev && function == g->func) {
         t = &self_token;
+        id = pci_read(t, 0, 4);
     } else {
-        t = malloc(sizeof *t);
-        if (!t) return NULL;
-        t->target = N_PCI_TARGET(bus, slot, function);
-        t->self = false;
+        t = other_token(N_PCI_TARGET(bus, slot, function), &id);
     }
-    n_result id = pci_read(t, 0, 4);
-    if (id < 0 || (id & 0xFFFF) == 0xFFFF || (id & 0xFFFF) == 0) {
-        if (t != &self_token) free(t);
-        return NULL;
-    }
+    if (!t || !function_present(id)) return NULL;
     if (vendor) *vendor = (NvU16)(id & 0xFFFF);
     if (device) *device = (NvU16)((id >> 16) & 0xFFFF);
     return t;
