@@ -1,6 +1,6 @@
 /* Drivers in apps (docs/nocturne-native-abi.md §9). Only init claims a PCI function; the claim
    is a vnode whose handles init passes to the driver app it launches. The app reads config space
-   (its function, the functions beside it and the bridges above it), writes its own, maps BARs as
+   (its device, the bridges above it with their devices, the host bridges), writes its own, maps BARs as
    shared objects (syscall.c) and waits for its message-signalled interrupts on the handle.
    The kernel keeps what decides where memory and interrupts go: BAR registers and the MSI and
    MSI-X capabilities are written here only. The last handle's close stops the function: every
@@ -219,13 +219,20 @@ int64_t pci_user_info(struct file *f, struct n_pci_function *out) {
 static bool config_access_ok(uint32_t offset, uint32_t width) {
     return (width == 1 || width == 2 || width == 4) && offset < 4096 && !(offset & (width - 1));
 }
-/* Reads reach the claimed function, the other functions of its device (an audio function on a
-   graphics card) and the bridges above it, but no unrelated device. */
+/* Reads reach the path from the host to the claimed function, but no unrelated device:
+   - the function and the other functions of its device (an audio function on a graphics card);
+   - each bridge above it with the other functions of that bridge's device. A driver scans a bus
+     device by device and gives up on a device whose function 0 does not answer, and a root port
+     is often function 1 or later beside a host-bridge function 0;
+   - the host bridges, which tell the driver what chipset the path starts at. */
+static bool is_host_bridge(const struct pci_device *d) {
+    return ((pci_read32(d->bus, d->dev, d->func, 0x08) >> 16) & 0xFFFF) == 0x0600;
+}
 static bool may_read(const struct pci_device *d, const struct pci_device *target) {
     if (target->bus == d->bus && target->dev == d->dev) return true;
     for (const struct pci_device *b = upstream_of(d); b; b = upstream_of(b))
-        if (b == target) return true;
-    return false;
+        if (target->bus == b->bus && target->dev == b->dev) return true;
+    return is_host_bridge(target);
 }
 
 int64_t pci_user_config_read(struct file *f, uint32_t target, uint32_t offset, uint32_t width) {

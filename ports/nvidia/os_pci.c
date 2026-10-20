@@ -335,13 +335,13 @@ NV_STATUS nvrm_pci_attach(void) {
         nvrm_log("NVRM: n_pci_bar(0) failed: %s", n_result_text(h0));
         return NV_ERR_GENERIC;
     }
+    /* nvrm keeps one mapping of the whole BAR0; os_map_kernel_space hands out pieces of it.
+       nv->regs->map stays NULL: RM sets it itself (RmSetupRegisters) and asserts it was unset. */
     bars[0].map = n_shared_map(h0, (size_t)b0->size, N_MEMORY_READ_WRITE);
     if (!bars[0].map) {
         nvrm_log("NVRM: mapping BAR0 (%llu bytes) failed", (unsigned long long)b0->size);
         return NV_ERR_GENERIC;
     }
-    nv->bars[0].map = (NvU32 *)bars[0].map;
-    nv->bars[0].map_u = (nv_phwreg_t)bars[0].map;
 
     d->sp = stack_ptr;
     return NV_OK;

@@ -33,7 +33,10 @@ static bool irq_thread_running;
 static bool irq_stop;         /* atomic */
 static bool irq_polling;      /* no usable vector: the same thread runs rm_isr on a timer */
 
+static uint64_t irq_runs;     /* atomic: times rm_isr ran, for the bring-up progress lines */
+
 static void irq_run_rm(void) {
+    __atomic_add_fetch(&irq_runs, 1, __ATOMIC_RELAXED);
     NvU32 need_bottom_half = 0;
     nvrm_in_isr = true;
     NvBool handled = rm_isr(nvrm_dev.sp, &nvrm_dev.nv, &need_bottom_half);
@@ -107,6 +110,52 @@ static const char *status_text(NV_STATUS s) {
 
 static bool events_ready;   /* rm_init_event_locks ran on the control device */
 
+/* While rm_init_adapter runs (GSP boot prints nothing when it goes well), a line every
+   PROGRESS_MS tells a stuck start from a slow one, and says whether interrupts arrive. */
+#define PROGRESS_MS 10000
+static mtx_t progress_lock;
+static cnd_t progress_wake;
+static bool progress_done;
+
+static int progress_thread(void *start_ns) {
+    uint64_t start = *(const uint64_t *)start_ns;
+    mtx_lock(&progress_lock);
+    while (!progress_done) {
+        struct timespec until;
+        timespec_get(&until, TIME_UTC);
+        until.tv_sec += PROGRESS_MS / 1000;
+        if (cnd_timedwait(&progress_wake, &progress_lock, &until) != thrd_timedout || progress_done) continue;
+        nvrm_log("NVRM: still initialising the GPU after %llu s (%llu interrupts handled%s)",
+                 (unsigned long long)((nvrm_now_ns() - start) / 1000000000ull),
+                 (unsigned long long)__atomic_load_n(&irq_runs, __ATOMIC_RELAXED),
+                 irq_polling ? ", polling" : "");
+    }
+    mtx_unlock(&progress_lock);
+    return 0;
+}
+
+static bool init_adapter(nvidia_stack_t *sp, nv_state_t *nv) {
+    uint64_t start = nvrm_now_ns();
+    thrd_t watch;
+    progress_done = false;
+    bool watching = mtx_init(&progress_lock, mtx_plain) == thrd_success &&
+                    cnd_init(&progress_wake) == thrd_success &&
+                    thrd_create(&watch, progress_thread, &start) == thrd_success;
+    bool ok = rm_init_adapter(sp, nv);
+    if (watching) {
+        mtx_lock(&progress_lock);
+        progress_done = true;
+        cnd_signal(&progress_wake);
+        mtx_unlock(&progress_lock);
+        thrd_join(watch, NULL);
+        cnd_destroy(&progress_wake);
+        mtx_destroy(&progress_lock);
+    }
+    nvrm_log("NVRM: rm_init_adapter %s after %llu ms", ok ? "finished" : "failed",
+             (unsigned long long)((nvrm_now_ns() - start) / 1000000ull));
+    return ok;
+}
+
 static bool bring_up(void) {
     struct nvrm_device *d = &nvrm_dev;
     nvidia_stack_t *sp;
@@ -164,8 +213,8 @@ static bool bring_up(void) {
     if (!nvrm_irq_thread_start()) return false;
 
     nvrm_log("NVRM: initialising the GPU (GSP firmware %s)...", NVRM_FIRMWARE_VERSION);
-    if (!rm_init_adapter(sp, nv)) {
-        nvrm_log("NVRM: rm_init_adapter failed; the GPU did not start");
+    if (!init_adapter(sp, nv)) {
+        nvrm_log("NVRM: the GPU did not start");
         return true; /* RM's client API (without a working GPU) is still served for diagnosis */
     }
     d->adapter_ready = true;

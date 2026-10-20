@@ -60,7 +60,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。修理済み、2 回目は未実施 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み、3 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -103,6 +103,9 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C33 | RM が BAR を構成空間へ書き戻す必要は無い | 却下 → 修理済み | RM はリセット後（`kbifRestoreBarsAndCommand`、GC6 からの復帰の `kbifRestoreBar0`）に起動時の BAR の値を 32 ビットで書き戻す。カーネルは、起動時に見た値と同じ書込みだけを通す（戻せるが動かせない）。GC6 の経路は BAR0 だけ戻してデコードを入れるので、デコードには条件を付けない。MSI／MSI-X がリセットで消えたときの再設定は実機で未確認 |
 | C34 | 他機能のトークン、BAR 写像の長さ、セマフォの破棄は問題ない | 却下 → 修理済み | 他の機能のトークンは機能ごとに一つを使い回す（応答する機能だけ）。BAR 写像の長さはページに丸めたビューの長さを返す。`os_free_semaphore` は `cnd`／`mtx` を破棄する。`TIME_UTC` の期限は、Nocturne の `TIME_UTC` が戻らないので、壁時計が進んでも早く起きて単調時計で測り直すだけ |
 | C35 | RM の中にユーザーモードで実行できない命令は無い | 却下 → 修理済み | 実機で `nv_rdcr.c` の `osNv_rdcr4`（`mov %cr4`）が GPF（rip 0x46ec34、`RmInitCpuInfo` から）。nvrm.mk で同ファイルを外し、`os.c` が OSFXSR（常に有効）と CPUID.1:ECX 27（CR4.OSXSAVE の写し）から同じ値を返す。記号付きで再リンクした nvrm の逆アセンブル全体で、CR・DR・MSR・in／out・cli／sti・hlt・invlpg・wbinvd は他に 0 |
+| C36 | nvrm が BAR0 の写像を `nv->regs->map` に置いてよい | 却下 → 修理済み | RM の `RmSetupRegisters` は自分で写像し、`aperture->map == NULL` を表明する（実機で osinit.c:168）。nvrm は BAR0 全体の写像を自分だけで持ち、`os_map_kernel_space` がその一部を返す。`nv->regs->map` は RM が設定する |
+| C37 | 構成空間は自分の装置と上流のブリッジだけ読めればよい | 却下 → 修理済み | RM の `clStoreBusTopologyCache` は装置ごとに機能 0 が答えなければ他の機能を飛ばす。AMD ではルートポートが 00:01.1 で、00:01.0 はホストブリッジ。読めないと上流ポートも FHB（ホストブリッジ、チップセットの識別）も見つからない（実機で chipset.c:463／558 の表明と「Unable to get PCI port handles」）。カーネルは、上流の各ブリッジの装置の全機能とホストブリッジ（06/00）の読みも許す。無関係な装置は今まで通り `N_ERR_DENIED` |
+| C38 | rm_init_adapter が止まっても分かる | 却下 → 修理済み | GSP の起動はうまくいくと何も出さないので、固まったのか遅いのかが見分けられない。nvrm は rm_init_adapter の間 10 秒ごとに経過と処理した割り込みの数を、終わると所要時間と成否をログへ出す |
 
 ## 5. 担当と受け渡し
 
@@ -121,6 +124,12 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-20：実機 2 回目（ユーザー）。C35 の修理で rm_init_rm を越え、rm_init_adapter の中まで進んだ。
+  BAR0 16 MiB at 0xfb000000、BAR1（ReBAR）16 GiB at 0xf800000000、ファームウェア 2 本を読込み。
+  osinit.c:168 の表明（C36）、FHB が無い（chipset.c:463／558）、「Unable to get PCI port handles」（C37、
+  RM はこれを無視して続ける）の後、nvrm のログは止まり、WebGL は softpipe のまま。止まった場所は
+  ログから分からないので、経過の行（C38）を足した。
 
 - 2026-10-20：実機 1 回目（ユーザー）。RTX 4070（AD104、10de:2786、副 19da:2714、PCIe 4.0 x16、
   Above 4G・ReBAR 有効、画面は GPU に接続、BIOS 95.04.3E.C0.82）、AMD の iGPU 1002:164e も有り。

@@ -96,6 +96,23 @@ int main(void) {
             CHECK(r == -N_ERR_DENIED, "unrelated config read: %lld", (long long)r);
             break;
         }
+    /* behind a root port (QEMU -M q35 with edu on a pcie-root-port at function 1 of a
+       multifunction slot): the port and function 0 of its device are readable */
+    if (info.upstream != N_PCI_NONE) {
+        uint32_t up = info.upstream;
+        n_result r = n_pci_config_read(pci, up, 0x18, 4);
+        CHECK(r >= 0 && ((r >> 8) & 0xFF) == e->bus, "upstream bridge read: %lld", (long long)r);
+        r = n_pci_config_read(pci, up & ~7u, 0, 4);
+        CHECK(r >= 0 && (r & 0xFFFF) != 0xFFFF, "function 0 beside the upstream bridge: %lld", (long long)r);
+    }
+    /* a host bridge names the chipset: readable */
+    for (int i = 0; i < n; i++)
+        if (list[i].cls == 0x06 && list[i].subcls == 0x00) {
+            n_result r = n_pci_config_read(pci, N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func), 0, 4);
+            CHECK(r == (n_result)((uint32_t)list[i].device << 16 | list[i].vendor), "host bridge config read: %lld",
+                  (long long)r);
+            break;
+        }
 
     n_handle bar = n_pci_bar(pci, 0);
     CHECK(bar >= 0 && n_handle_kind(bar) == N_KIND_SHARED, "bar: %s", n_result_text(bar));
