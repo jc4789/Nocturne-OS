@@ -1,9 +1,21 @@
 /* ACPI table registry (RSDP/XSDT/RSDT), MADT and MCFG parsing. Hardware specs only: ACPI 6.x
-   chapter 5 (table formats) and the PCI Firmware specification (MCFG). No AML. */
+   chapter 5 (table formats) and the PCI Firmware specification (MCFG). The AML is uACPI's: the
+   second half of this file gives it the kernel services it asks for (uacpi/kernel_api.h). */
 #include "kernel.h"
 #include "limine.h"
+#include "arch/cpu.h"
 #include "dev/acpi.h"
+#include "dev/pci.h"
+#include "dev/pm.h"
 #include "mm/vmm.h"
+#include "mm/heap.h"
+#include "sys/sched.h"
+#include <uacpi/kernel_api.h>
+#include <uacpi/uacpi.h>
+#include <uacpi/event.h>
+#include <uacpi/notify.h>
+#include <uacpi/sleep.h>
+#include <uacpi/utilities.h>
 
 extern volatile struct limine_rsdp_request rsdp_req;
 
@@ -257,3 +269,335 @@ const struct acpi_ioapic *acpi_ioapics(unsigned *count) { *count = nioapics; ret
 const struct acpi_iso *acpi_isos(unsigned *count) { *count = nisos; return isos; }
 const struct acpi_nmi *acpi_nmis(unsigned *count) { *count = nnmis; return nmis; }
 const struct acpi_ecam *acpi_ecams(unsigned *count) { *count = necams; return ecams; }
+
+/* ---- AML: uACPI (third_party/uacpi) on Nocturne's own kernel services ----
+   Everything here runs on the BSP, like every other kernel thread. uACPI's locks and events are
+   counting semaphores on wait queues; its deferred work (GPE methods, Notify) runs in the "acpi"
+   kernel thread; the SCI is an ISA interrupt through the 8259 like the other legacy lines. */
+static bool aml_ready;
+
+/* The boot task becomes the idle task: it may not block, so it spins (letting other threads run)
+   where a thread would sleep. */
+static bool may_block(void) { return current_task->pid != 0; }
+
+static uint64_t ns_now(void) {
+    if (!tsc_hz) return uptime_ms() * 1000000;
+    uint64_t t = rdtsc();
+    return t / tsc_hz * 1000000000 + t % tsc_hz * 1000000000 / tsc_hz;
+}
+
+static void spin_ns(uint64_t ns) {
+    if (!tsc_hz) {
+        for (uint64_t i = 0; i < ns / 1000 + 1; i++) io_wait(); /* about a microsecond each */
+        return;
+    }
+    uint64_t end = ns_now() + ns;
+    while (ns_now() < end) pause();
+}
+
+uacpi_status uacpi_kernel_get_rsdp(uacpi_phys_addr *out) {
+    if (!rsdp_req.response) return UACPI_STATUS_NOT_FOUND;
+    uint64_t a = (uint64_t)rsdp_req.response->address;
+    *out = a >= hhdm_offset ? a - hhdm_offset : a;
+    return UACPI_STATUS_OK;
+}
+
+void *uacpi_kernel_map(uacpi_phys_addr addr, uacpi_size len) { return vmm_map_phys(addr, len ? len : 1); }
+void uacpi_kernel_unmap(void *addr, uacpi_size len) {} /* the direct map stays */
+
+void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *msg) {
+    kprintf("acpi: %s%s", level == UACPI_LOG_ERROR ? "error: " : level == UACPI_LOG_WARN ? "warning: " : "", msg);
+}
+
+struct pci_handle { uint8_t bus, dev, fn; };
+
+uacpi_status uacpi_kernel_pci_device_open(uacpi_pci_address a, uacpi_handle *out) {
+    if (a.segment) return UACPI_STATUS_UNIMPLEMENTED; /* segment 0 only, like dev/pci.c */
+    struct pci_handle *h = kmalloc(sizeof *h);
+    if (!h) return UACPI_STATUS_OUT_OF_MEMORY;
+    *h = (struct pci_handle){a.bus, a.device, a.function};
+    *out = h;
+    return UACPI_STATUS_OK;
+}
+void uacpi_kernel_pci_device_close(uacpi_handle h) { kfree(h); }
+
+static uint32_t cfg_read(struct pci_handle *h, uacpi_size off) { return pci_read32(h->bus, h->dev, h->fn, off & ~3u); }
+
+/* A narrow write is a read-modify-write of its dword; in the command/status dword the status half
+   is written as 0, since its bits clear when written with 1. */
+static void cfg_write(struct pci_handle *h, uacpi_size off, uint32_t v, unsigned bytes) {
+    unsigned shift = (off & 3) * 8;
+    uint32_t mask = bytes == 4 ? 0xFFFFFFFFu : ((1u << bytes * 8) - 1) << shift;
+    uint32_t old = bytes == 4 ? 0 : cfg_read(h, off);
+    if ((off & ~3u) == 4) old &= 0xFFFF;
+    pci_write32(h->bus, h->dev, h->fn, off & ~3u, (old & ~mask) | (v << shift & mask));
+}
+
+uacpi_status uacpi_kernel_pci_read8(uacpi_handle h, uacpi_size off, uacpi_u8 *v) {
+    *v = cfg_read(h, off) >> (off & 3) * 8;
+    return UACPI_STATUS_OK;
+}
+uacpi_status uacpi_kernel_pci_read16(uacpi_handle h, uacpi_size off, uacpi_u16 *v) {
+    *v = cfg_read(h, off) >> (off & 2) * 8;
+    return UACPI_STATUS_OK;
+}
+uacpi_status uacpi_kernel_pci_read32(uacpi_handle h, uacpi_size off, uacpi_u32 *v) {
+    *v = cfg_read(h, off);
+    return UACPI_STATUS_OK;
+}
+uacpi_status uacpi_kernel_pci_write8(uacpi_handle h, uacpi_size off, uacpi_u8 v) {
+    cfg_write(h, off, v, 1);
+    return UACPI_STATUS_OK;
+}
+uacpi_status uacpi_kernel_pci_write16(uacpi_handle h, uacpi_size off, uacpi_u16 v) {
+    cfg_write(h, off, v, 2);
+    return UACPI_STATUS_OK;
+}
+uacpi_status uacpi_kernel_pci_write32(uacpi_handle h, uacpi_size off, uacpi_u32 v) {
+    cfg_write(h, off, v, 4);
+    return UACPI_STATUS_OK;
+}
+
+/* An I/O range handle is its base port plus one (port 0 is a valid range, a NULL handle is not). */
+uacpi_status uacpi_kernel_io_map(uacpi_io_addr base, uacpi_size len, uacpi_handle *out) {
+    if (base > 0xFFFF || len > 0x10000 - base) return UACPI_STATUS_INVALID_ARGUMENT;
+    *out = (uacpi_handle)(uintptr_t)(base + 1);
+    return UACPI_STATUS_OK;
+}
+void uacpi_kernel_io_unmap(uacpi_handle h) {}
+#define PORT(h, off) ((uint16_t)((uintptr_t)(h) - 1 + (off)))
+uacpi_status uacpi_kernel_io_read8(uacpi_handle h, uacpi_size off, uacpi_u8 *v) { *v = inb(PORT(h, off)); return UACPI_STATUS_OK; }
+uacpi_status uacpi_kernel_io_read16(uacpi_handle h, uacpi_size off, uacpi_u16 *v) { *v = inw(PORT(h, off)); return UACPI_STATUS_OK; }
+uacpi_status uacpi_kernel_io_read32(uacpi_handle h, uacpi_size off, uacpi_u32 *v) { *v = inl(PORT(h, off)); return UACPI_STATUS_OK; }
+uacpi_status uacpi_kernel_io_write8(uacpi_handle h, uacpi_size off, uacpi_u8 v) { outb(PORT(h, off), v); return UACPI_STATUS_OK; }
+uacpi_status uacpi_kernel_io_write16(uacpi_handle h, uacpi_size off, uacpi_u16 v) { outw(PORT(h, off), v); return UACPI_STATUS_OK; }
+uacpi_status uacpi_kernel_io_write32(uacpi_handle h, uacpi_size off, uacpi_u32 v) { outl(PORT(h, off), v); return UACPI_STATUS_OK; }
+
+void *uacpi_kernel_alloc(uacpi_size size) { return kmalloc(size); }
+void uacpi_kernel_free(void *p) { kfree(p); }
+
+uacpi_u64 uacpi_kernel_get_nanoseconds_since_boot(void) { return ns_now(); }
+void uacpi_kernel_stall(uacpi_u8 us) { spin_ns(us * 1000ull); }
+void uacpi_kernel_sleep(uacpi_u64 ms) {
+    if (may_block()) sleep_ms(ms);
+    else spin_ns(ms * 1000000);
+}
+
+struct sem {
+    uint32_t units;
+    struct wait_queue wq;
+};
+
+uacpi_handle uacpi_kernel_create_semaphore(uacpi_u32 units) {
+    struct sem *s = kzalloc(sizeof *s);
+    if (s) s->units = units;
+    return s;
+}
+void uacpi_kernel_free_semaphore(uacpi_handle s) { kfree(s); }
+
+uacpi_status uacpi_kernel_wait_for_semaphore(uacpi_handle h, uacpi_u16 timeout) {
+    struct sem *s = h;
+    uint64_t end = uptime_ms() + timeout;
+    uint64_t f = irq_save();
+    while (!s->units) {
+        uint64_t now = uptime_ms();
+        if (timeout != 0xFFFF && now >= end) {
+            irq_restore(f);
+            return UACPI_STATUS_TIMEOUT;
+        }
+        if (may_block()) {
+            if (timeout == 0xFFFF) wq_wait(&s->wq);
+            else wq_wait_timeout(&s->wq, end - now);
+        } else {
+            sti(); /* the boot task: let interrupts and other threads give the unit */
+            schedule();
+            cli();
+        }
+    }
+    s->units--;
+    irq_restore(f);
+    return UACPI_STATUS_OK;
+}
+
+void uacpi_kernel_signal_semaphore(uacpi_handle h) {
+    struct sem *s = h;
+    uint64_t f = irq_save();
+    s->units++;
+    wq_wake_all(&s->wq);
+    irq_restore(f);
+}
+
+uacpi_thread_id uacpi_kernel_get_thread_id(void) { return current_task; }
+uacpi_interrupt_state uacpi_kernel_disable_interrupts(void) { return irq_save(); }
+void uacpi_kernel_restore_interrupts(uacpi_interrupt_state s) { irq_restore(s); }
+
+uacpi_status uacpi_kernel_handle_firmware_request(uacpi_firmware_request *r) {
+    if (r->type == UACPI_FIRMWARE_REQUEST_TYPE_FATAL)
+        kprintf("acpi: firmware reports a fatal error: type %u code %x arg %lx\n", r->fatal.type, r->fatal.code,
+                r->fatal.arg);
+    return UACPI_STATUS_OK;
+}
+
+/* The SCI is the only interrupt uACPI installs. */
+static uacpi_interrupt_handler sci_handler;
+static uacpi_handle sci_ctx;
+static int sci_irq = -1;
+
+static void sci_entry(struct regs *r) {
+    if (sci_handler) sci_handler(sci_ctx);
+}
+
+uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interrupt_handler h, uacpi_handle ctx,
+                                                    uacpi_handle *out) {
+    if (irq >= 16 || sci_handler) return UACPI_STATUS_UNIMPLEMENTED;
+    sci_handler = h;
+    sci_ctx = ctx;
+    sci_irq = (int)irq;
+    irq_register(sci_irq, sci_entry);
+    pic_unmask(sci_irq);
+    *out = &sci_irq;
+    return UACPI_STATUS_OK;
+}
+
+uacpi_status uacpi_kernel_uninstall_interrupt_handler(uacpi_interrupt_handler h, uacpi_handle irq) {
+    if (h != sci_handler) return UACPI_STATUS_INVALID_ARGUMENT;
+    irq_unregister(sci_irq, sci_entry);
+    sci_handler = NULL;
+    return UACPI_STATUS_OK;
+}
+
+struct spin { volatile uint32_t held; };
+uacpi_handle uacpi_kernel_create_spinlock(void) { return kzalloc(sizeof(struct spin)); }
+void uacpi_kernel_free_spinlock(uacpi_handle h) { kfree(h); }
+uacpi_cpu_flags uacpi_kernel_lock_spinlock(uacpi_handle h) {
+    struct spin *l = h;
+    uint64_t f = irq_save();
+    while (__atomic_exchange_n(&l->held, 1, __ATOMIC_ACQUIRE)) pause();
+    return f;
+}
+void uacpi_kernel_unlock_spinlock(uacpi_handle h, uacpi_cpu_flags f) {
+    struct spin *l = h;
+    __atomic_store_n(&l->held, 0, __ATOMIC_RELEASE);
+    irq_restore(f);
+}
+
+/* Deferred work: one FIFO, run in order by the "acpi" thread (on the BSP, CPU0, as GPE methods
+   should be). `unfinished` counts queued plus running work for wait_for_work_completion. */
+struct work {
+    uacpi_work_handler fn;
+    uacpi_handle ctx;
+    struct work *next;
+};
+static struct work *work_head, *work_tail;
+static unsigned unfinished;
+static struct wait_queue work_wq, done_wq;
+
+uacpi_handle uacpi_kernel_create_work_item(void) { return kzalloc(sizeof(struct work)); }
+void uacpi_kernel_free_work_item(uacpi_handle w) { kfree(w); }
+
+void uacpi_kernel_schedule_work(uacpi_work_type type, uacpi_handle item, uacpi_work_handler fn, uacpi_handle ctx) {
+    struct work *w = item;
+    uint64_t f = irq_save();
+    w->fn = fn;
+    w->ctx = ctx;
+    w->next = NULL;
+    if (work_tail) work_tail->next = w;
+    else work_head = w;
+    work_tail = w;
+    unfinished++;
+    wq_wake_all(&work_wq);
+    irq_restore(f);
+}
+
+uacpi_status uacpi_kernel_wait_for_work_completion(void) {
+    /* interrupt handlers run to completion with interrupts off on this CPU: none is in flight here */
+    uint64_t f = irq_save();
+    while (unfinished) {
+        if (may_block()) wq_wait(&done_wq);
+        else { sti(); schedule(); cli(); }
+    }
+    irq_restore(f);
+    return UACPI_STATUS_OK;
+}
+
+static void acpi_worker(void *arg) {
+    for (;;) {
+        uint64_t f = irq_save();
+        while (!work_head) wq_wait(&work_wq);
+        struct work *w = work_head;
+        work_head = w->next;
+        if (!work_head) work_tail = NULL;
+        uacpi_work_handler fn = w->fn; /* the item may be reused or freed by the handler */
+        uacpi_handle ctx = w->ctx;
+        irq_restore(f);
+        fn(ctx);
+        f = irq_save();
+        if (!--unfinished) wq_wake_all(&done_wq);
+        irq_restore(f);
+    }
+}
+
+/* ---- events and sleep ---- */
+
+/* The power button asks like the menu does: apps may ask to save; a second press within a minute
+   of a cancelled request forces it. Interrupt context (fixed event) or the acpi thread (Notify). */
+static uacpi_interrupt_ret power_button(uacpi_handle ctx) {
+    pm_request(PM_POWER_OFF, true);
+    return UACPI_INTERRUPT_HANDLED;
+}
+
+static uacpi_status button_notify(uacpi_handle ctx, uacpi_namespace_node *node, uacpi_u64 value) {
+    if (value == 0x80) pm_request(PM_POWER_OFF, true); /* control-method power button: pressed */
+    return UACPI_STATUS_OK;
+}
+
+static uacpi_iteration_decision found_button(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
+    if (uacpi_install_notify_handler(node, button_notify, NULL) == UACPI_STATUS_OK) (*(unsigned *)user)++;
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+static bool aml_ok(uacpi_status st, const char *what) {
+    if (st == UACPI_STATUS_OK) return true;
+    kprintf("acpi: %s failed: %s; AML is off, power off uses the FADT alone\n", what, uacpi_status_to_string(st));
+    return false;
+}
+
+void acpi_aml_init(void) {
+    if (cmdline_has("noaml")) {
+        kprintf("acpi: AML off (noaml)\n");
+        return;
+    }
+    kthread_create("acpi", acpi_worker, NULL);
+    uint64_t t0 = ns_now();
+    if (!aml_ok(uacpi_initialize(0), "uACPI initialisation")) return;
+    if (!aml_ok(uacpi_namespace_load(), "loading the namespace")) return;
+    if (!aml_ok(uacpi_namespace_initialize(), "initialising devices")) return;
+    uacpi_bool hw_reduced = false;
+    uacpi_is_platform_reduced_hardware(&hw_reduced);
+    bool fixed = !hw_reduced &&
+                 uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_POWER_BUTTON, power_button, NULL) == UACPI_STATUS_OK;
+    unsigned buttons = 0;
+    uacpi_find_devices("PNP0C0C", found_button, &buttons);
+    if (!hw_reduced) aml_ok(uacpi_finalize_gpe_initialization(), "enabling GPEs");
+    aml_ready = true;
+    kprintf("acpi: AML ready in %lu ms, SCI IRQ %d, power button: %s%s%u in the namespace\n",
+            (ns_now() - t0) / 1000000, sci_irq, fixed ? "fixed" : "", fixed ? " + " : "", buttons);
+}
+
+bool acpi_aml_ready(void) { return aml_ready; }
+
+bool acpi_sleep_prepare(unsigned state) {
+    if (!aml_ready) return false;
+    uacpi_status st = uacpi_prepare_for_sleep_state((uacpi_sleep_state)state);
+    if (st != UACPI_STATUS_OK) kprintf("acpi: preparing S%u failed: %s\n", state, uacpi_status_to_string(st));
+    return st == UACPI_STATUS_OK;
+}
+
+bool acpi_sleep_enter(unsigned state) {
+    if (!aml_ready) return false;
+    uacpi_status st = uacpi_enter_sleep_state((uacpi_sleep_state)state);
+    if (st != UACPI_STATUS_OK) kprintf("acpi: entering S%u failed: %s\n", state, uacpi_status_to_string(st));
+    return st == UACPI_STATUS_OK;
+}
+
+bool acpi_reset(void) { return aml_ready && uacpi_reboot() == UACPI_STATUS_OK; }

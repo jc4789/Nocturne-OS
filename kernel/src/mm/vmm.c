@@ -11,6 +11,12 @@
 uint64_t kernel_pml4;
 uint64_t pte_nx;
 
+/* memory map regions that are RAM (usable, ACPI tables and NVS, bootloader, kernel): the direct
+   map already reaches them write-back, so vmm_map_phys leaves them as they are */
+struct ram_range { uint64_t base, end; };
+static struct ram_range ram[64];
+static unsigned nram;
+
 extern char __kernel_start[], __kernel_end[], __text_start[], __rodata_start[], __data_start[];
 
 /* Fixed storage, shared by pml4 rather than copied into each task. The BSP
@@ -414,6 +420,7 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
         } else if (e->type == LIMINE_MEMMAP_BAD_MEMORY) {
             continue;
         } else {
+            if (e->type != LIMINE_MEMMAP_RESERVED && nram < ARRAY_SIZE(ram)) ram[nram++] = (struct ram_range){base, end};
             map_range(hhdm_offset + base, base, end - base, PTE_W | pte_nx, PTE_W | pte_nx);
         }
     }
@@ -442,6 +449,12 @@ void *vmm_map_mmio(uint64_t phys, uint64_t size) {
         vmm_map_page(kernel_pml4, hhdm_offset + p, p, PTE_W | PTE_PCD | PTE_PWT | pte_nx);
     }
     return phys_to_virt(phys);
+}
+
+void *vmm_map_phys(uint64_t phys, uint64_t size) {
+    for (unsigned i = 0; i < nram; i++)
+        if (phys >= ram[i].base && phys + size <= ram[i].end) return phys_to_virt(phys);
+    return vmm_map_mmio(phys, size);
 }
 
 /* ---- user address spaces ---- */

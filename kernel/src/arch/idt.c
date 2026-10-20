@@ -20,7 +20,8 @@ struct idt_entry {
 
 static struct idt_entry idt[256];
 extern uint64_t isr_stub_table[256];
-static irq_handler_t irq_handlers[16];
+#define IRQ_SHARED 4 /* level-triggered PCI lines and the ACPI SCI can share an ISA IRQ */
+static irq_handler_t irq_handlers[16][IRQ_SHARED];
 static irq_handler_t vec_handlers[256]; /* LAPIC-delivered vectors (0x30 and up) */
 
 static void idt_set(int vec, uint64_t handler, uint8_t type, uint8_t ist) {
@@ -48,7 +49,24 @@ void idt_load(void) {
     __asm__ volatile("lidt %0" : : "m"(idtr));
 }
 
-void irq_register(int irq, irq_handler_t h) { irq_handlers[irq] = h; }
+void irq_register(int irq, irq_handler_t h) {
+    uint64_t f = irq_save();
+    unsigned i = 0;
+    while (i < IRQ_SHARED && irq_handlers[irq][i] && irq_handlers[irq][i] != h) i++;
+    if (i == IRQ_SHARED) panic("idt: more than %d handlers on IRQ %d", IRQ_SHARED, irq);
+    irq_handlers[irq][i] = h;
+    irq_restore(f);
+}
+
+void irq_unregister(int irq, irq_handler_t h) {
+    uint64_t f = irq_save();
+    for (unsigned i = 0; i < IRQ_SHARED; i++)
+        if (irq_handlers[irq][i] == h) {
+            for (; i + 1 < IRQ_SHARED; i++) irq_handlers[irq][i] = irq_handlers[irq][i + 1];
+            irq_handlers[irq][IRQ_SHARED - 1] = NULL;
+        }
+    irq_restore(f);
+}
 
 /* ---- vector ownership ----
    A vector is owned once it has been allocated or registered. Fixed driver vectors are reserved by
@@ -199,7 +217,7 @@ void isr_dispatch(struct regs *r) {
         }
         entropy_add(rdtsc() ^ (uint64_t)irq << 56);
         pic_eoi(irq);
-        if (irq_handlers[irq]) irq_handlers[irq](r);
+        for (unsigned i = 0; i < IRQ_SHARED && irq_handlers[irq][i]; i++) irq_handlers[irq][i](r);
     } else if (v == 0x80) {
         syscall_dispatch(r);
     } else if (v < 0xFF) {

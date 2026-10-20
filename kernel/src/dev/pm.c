@@ -3,6 +3,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "dev/pm.h"
+#include "dev/acpi.h"
 #include "dev/blk.h"
 #include "gui/wm.h"
 #include "sys/sched.h"
@@ -87,6 +88,7 @@ static NORETURN void finish(enum pm_action action) {
         struct blkdev *d = blk_get(i);
         if (d->flush && d->flush(d) < 0) kprintf("pm: %s: cache flush failed\n", d->name);
     }
+    if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
     cli();
     for (int s = 0; s < PM_STAGES; s++)
         for (struct pm_device *d = stages[s]; d; d = d->next) {
@@ -107,7 +109,7 @@ static void pm_thread(void *arg) {
         busy = true;
         irq_restore(f);
         enum pm_action action = wanted;
-        kprintf("pm: %s requested%s\n", action == PM_REBOOT ? "restart" : "shutdown", forced ? "" : " from the menu");
+        kprintf("pm: %s requested%s\n", action == PM_REBOOT ? "restart" : "shutdown", forced ? "" : " (apps may keep their windows)");
         if (close_windows()) {
             f = irq_save();
             stopping = true;

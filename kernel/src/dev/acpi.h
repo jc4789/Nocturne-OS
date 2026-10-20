@@ -1,6 +1,6 @@
 #pragma once
 /* ACPI table registry: RSDP -> XSDT/RSDT walk with checksum validation, plus the MADT and MCFG
-   parsers. Tables are looked up by signature; no AML is interpreted. */
+   parsers. Tables are looked up by signature. The AML interpreter (uACPI) is at the end. */
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -58,3 +58,15 @@ const struct acpi_ecam *acpi_ecams(unsigned *count);
 
 /* Registry + MADT + MCFG, with a one-line log summary of each. Called once from acpi_init(). */
 void acpi_tables_init(void);
+
+/* ---- AML (uACPI) ----
+   acpi_aml_init: load the namespace, run the devices' _INI, take the SCI, the power button
+   (fixed and control-method) and the GPEs. "noaml" on the command line skips it. */
+void acpi_aml_init(void);
+bool acpi_aml_ready(void);
+/* Sleep states are ACPI's S numbers (3 = suspend to RAM, 5 = soft off). prepare runs _PTS with
+   interrupts on; enter writes SLP_TYP with interrupts off and returns only on failure (S5) or
+   after waking (S3). acpi_reset is the FADT reset register through uACPI (any address space). */
+bool acpi_sleep_prepare(unsigned state);
+bool acpi_sleep_enter(unsigned state);
+bool acpi_reset(void);

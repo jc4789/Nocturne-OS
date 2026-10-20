@@ -24,12 +24,20 @@ KLDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 -T kernel/li
 
 KSRC_C   := $(shell find kernel/src -name '*.c') common/gfx.c
 KSRC_ASM := $(shell find kernel/src -name '*.asm') common/unifont.asm
-KOBJ     := $(patsubst %.c,$(BUILD)/k/%.o,$(KSRC_C)) $(patsubst %.asm,$(BUILD)/k/%.asm.o,$(KSRC_ASM))
+# uACPI runs the firmware's AML inside the kernel (third_party/uacpi/README.nocturne.md)
+UACPI_C  := $(wildcard third_party/uacpi/source/*.c)
+KCFLAGS  += -Ithird_party/uacpi/include
+KOBJ     := $(patsubst %.c,$(BUILD)/k/%.o,$(KSRC_C) $(UACPI_C)) $(patsubst %.asm,$(BUILD)/k/%.asm.o,$(KSRC_ASM))
 
 $(BUILD)/k/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "  CC   $<"
 	@$(CC) $(KCFLAGS) -c $< -o $@
+
+$(BUILD)/k/third_party/uacpi/%.o: third_party/uacpi/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   $<"
+	@$(CC) $(filter-out -W%,$(KCFLAGS)) -w -c $< -o $@
 
 $(BUILD)/k/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
@@ -353,6 +361,10 @@ $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
 	@mkdir -p $(dir $@)
 	@cp $(BUILD)/cxx/LICENSE.libc++.txt $@
 
+$(BUILD)/root/usr/share/licenses/uacpi/LICENSE: third_party/uacpi/LICENSE
+	@mkdir -p $(dir $@)
+	@cp $< $@
+
 $(BUILD)/root/usr/share/licenses/wabt/LICENSE: third_party/wabt/LICENSE third_party/wabt/UPSTREAM.json
 	@mkdir -p $(dir $@)
 	@cp third_party/wabt/LICENSE third_party/wabt/UPSTREAM.json $(dir $@)
@@ -446,7 +458,7 @@ ifeq ($(NVIDIA_FW_FILES),)
 $(shell rm -rf $(BUILD)/root/usr/share/firmware/nvidia)
 endif
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(NVRM_FILES) $(NVIDIA_FW_FILES) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
+$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/usr/share/licenses/uacpi/LICENSE $(GO_FILES) $(RUST_FILES) $(NVRM_FILES) $(NVIDIA_FW_FILES) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"
 	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
 

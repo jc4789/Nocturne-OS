@@ -1,5 +1,6 @@
 /* ACPI-based power off and reboot (with emulator fallbacks): the last step of a power change
-   (dev/pm.c), after the apps have ended and the devices have stopped. */
+   (dev/pm.c), after the apps have ended and the devices have stopped. uACPI goes first; the FADT
+   registers with the _S5_ bytes found in the DSDT remain for when the AML could not be loaded. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "dev/acpi.h"
@@ -92,11 +93,13 @@ void acpi_init(void) {
     if (fadt_has(268))
         kprintf("acpi: sleep control %u:%lx, reset %u:%lx=%x\n", fadt->sleep_control.space,
                 fadt->sleep_control.address, fadt->reset_reg.space, fadt->reset_reg.address, fadt->reset_value);
+    acpi_aml_init();
 }
 
 void power_off(void) {
     cli();
     kprintf("power: shutting down\n");
+    acpi_sleep_enter(5); /* uACPI: SLP_TYP from \_S5 with the firmware's own layout; returns only on failure */
     if (fadt && s5_ok && fadt_has(268) && fadt->sleep_control.address) {
         /* hardware-reduced ACPI: SLP_TYPx in bits 2-4, SLP_EN is bit 5 */
         gas_write(&fadt->sleep_control, ((slp_typa & 7) << 2) | (1 << 5));
@@ -120,6 +123,7 @@ void power_off(void) {
 void power_reboot(void) {
     cli();
     kprintf("power: rebooting\n");
+    if (acpi_reset()) for (int i = 0; i < 100000; i++) io_wait(); /* the reset register, any address space */
     if (fadt_has(129) && (fadt->flags & FADT_RESET_REG_SUP) && fadt->reset_reg.address) {
         gas_write(&fadt->reset_reg, fadt->reset_value);
         for (int i = 0; i < 100000; i++) io_wait();

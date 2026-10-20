@@ -87,7 +87,8 @@ void tss_set_rsp0(uint64_t rsp0);
 void idt_init(void);
 void idt_load(void);
 typedef void (*irq_handler_t)(struct regs *r);
-void irq_register(int irq, irq_handler_t h);
+void irq_register(int irq, irq_handler_t h); /* a line may have a few handlers; each checks its device */
+void irq_unregister(int irq, irq_handler_t h);
 void vector_register(int vec, irq_handler_t h);
 bool lapic_present(void);
 bool lapic_x2apic(void); /* Limineが選んだBSP/AP共通mode。起動後の切替は禁止。 */
