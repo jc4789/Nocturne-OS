@@ -119,6 +119,7 @@ void usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total);
 void usbhub_detach(struct usb_device *d);
 void usbhid_detach(struct usb_device *d);
 void usbmsc_detach(struct usb_device *d);
+bool usbmsc_attached(void); /* a USB disk is plugged in */
 void usbnet_detach(struct usb_device *d);
 
 void usb_init(void);

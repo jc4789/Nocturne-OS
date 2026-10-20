@@ -156,3 +156,21 @@ void time_to_parts(int64_t t, struct tm_parts *p) {
 int64_t time_from_parts(const struct tm_parts *p) {
     return days_from_civil(p->year, p->mon, p->mday) * 86400 + p->hour * 3600 + p->min * 60 + p->sec;
 }
+
+static int64_t rtc_before;
+
+void timer_suspend(void) {
+    catch_up();
+    rtc_before = rtc_read_unix();
+}
+
+int64_t timer_resume(void) {
+    uint64_t reference;
+    if (reference_clock && hv_reference_time(&reference)) reference_base = reference - timer_ticks * 10000;
+    if (tsc_per_ms) tsc_base = rdtsc() - timer_ticks * tsc_per_ms;
+    tick_stopped = false;
+    int64_t slept = rtc_read_unix() - rtc_before;
+    if (slept < 0) slept = 0;
+    boot_unix_time += slept;
+    return slept;
+}

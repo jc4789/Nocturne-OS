@@ -163,6 +163,7 @@ struct usb_hc {
     uint8_t cmd_cc, cmd_slot;
     uint8_t vector; /* 0: polled */
     bool running, recover, irq_seen, failed;
+    volatile bool woke; /* back from a sleep, which reset it: start over on the usb thread */
     volatile uint32_t interrupts;
     uint32_t events;
     struct xdev *slots[256];
@@ -1282,8 +1283,9 @@ static bool hc_start(struct usb_hc *hc) {
 
 /* A Host System Error or Host Controller Error stops the controller for good (4.24.1, 5.4.2) and
  * every device with it: reset it so it lets go of memory, have the drivers drop their devices,
- * then bring it up again and enumerate from scratch. A controller that keeps failing is left off. */
-static void hc_restart(struct usb_hc *hc) {
+ * then bring it up again and enumerate from scratch. A controller that keeps failing is left off.
+ * After a sleep the same happens, without counting as a failure: the devices lost their addresses. */
+static void hc_restart(struct usb_hc *hc, bool after_sleep) {
     hc->running = false;
     wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
     wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50);
@@ -1298,6 +1300,11 @@ static void hc_restart(struct usb_hc *hc) {
     for (unsigned s = 1; s <= hc->max_slots; s++)
         if (hc->slots[s]) usb_remove(&hc->slots[s]->dev);
     hc->recover = false;
+    if (after_sleep) {
+        kprintf("usb: controller %d starting again after sleep\n", hc->index);
+        if (hc_start(hc)) hc->failed = false;
+        return;
+    }
     if (++hc->restarts > 3) {
         kprintf("usb: controller %d keeps failing, left off\n", hc->index);
         return;
@@ -1394,12 +1401,16 @@ static void usb_thread(void *arg) {
                 wr32(hc->rt, IMAN, 1);
                 hc->vector = 0;
             }
+            if (hc->woke) {
+                hc->woke = false;
+                hc_restart(hc, true);
+            }
             uint32_t sts = hc->running ? rd32(hc->op, USBSTS) : 0;
             if ((sts & (STS_HSE | STS_HCE)) && sts != 0xFFFFFFFFu && !hc->failed) { /* all ones: gone from the bus */
                 hc->failed = true;
                 kprintf("usb: controller %d stopped on a %s error (status %08x)\n", hc->index,
                         sts & STS_HCE ? "controller" : "host system", sts);
-                hc_restart(hc);
+                hc_restart(hc, false);
             }
             hc_work(hc);
         }
@@ -1434,7 +1445,29 @@ static void xhci_quiesce(void *arg) {
     }
 }
 
-static struct pm_device xhci_pm = {.name = "xhci", .stage = PM_STAGE_BUS, .quiesce = xhci_quiesce};
+/* After a sleep: every controller is reset and enumerated again by the usb thread (resume must
+   not wait, and the class drivers run there). Keyboards and mice come back; a USB disk would come
+   back as a new device under a mounted filesystem, so there is no sleep while one is plugged in. */
+static void xhci_resume(void *arg) {
+    (void)arg;
+    uint64_t f = irq_save();
+    for (int i = 0; i < ncontrollers; i++)
+        if (controllers[i].op) {
+            controllers[i].running = false;
+            controllers[i].woke = true;
+        }
+    usb_more = usb_kick = true;
+    wq_wake_all(&usb_wq);
+    irq_restore(f);
+}
+
+static const char *xhci_refuse(void *arg) {
+    (void)arg;
+    return usbmsc_attached() ? "A USB disk is plugged in" : NULL;
+}
+
+static struct pm_device xhci_pm = {.name = "xhci", .stage = PM_STAGE_BUS, .quiesce = xhci_quiesce,
+                                   .resume = xhci_resume, .refuse = xhci_refuse};
 
 void usb_init(void) {
     for (int i = 0; i < pci_count() && ncontrollers < MAX_HC; i++) {

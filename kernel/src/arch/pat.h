@@ -11,3 +11,7 @@ bool pat_supported(void);
    before the kernel page tables are built and on every AP before it uses them. Returns the MSR value
    read back, or 0 when the CPU has no PAT. */
 uint64_t pat_init_cpu(void);
+/* MTRRs across a sleep: the BSP saves its set before it sleeps; mtrr_sync() on any CPU afterwards
+   (the BSP when it wakes, each AP the kernel starts) writes that set back if it differs. */
+void mtrr_save(void);
+void mtrr_sync(void);

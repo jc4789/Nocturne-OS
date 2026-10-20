@@ -71,14 +71,63 @@ uint32_t lapic_current_id(void) {
     return x2_mode ? id : id >> 24;
 }
 
+/* A CPU after INIT or S3 has its APIC enabled in xAPIC mode: take it back to the mode in use.
+   x2APIC is entered from enabled xAPIC; the other way round would need a disable first. */
+static bool lapic_mode_restore(void) {
+    uint64_t base = rdmsr(IA32_APIC_BASE);
+    if (!(base & APIC_BASE_ENABLE)) wrmsr(IA32_APIC_BASE, base |= APIC_BASE_ENABLE);
+    if (x2_mode && !(base & APIC_BASE_X2)) wrmsr(IA32_APIC_BASE, base |= APIC_BASE_X2);
+    return ((rdmsr(IA32_APIC_BASE) & APIC_BASE_X2) != 0) == x2_mode;
+}
+
+/* The BSP after S3: the same registers as apic_init, and the tick with its calibration. */
+void lapic_resume(void) {
+    if (!available) return;
+    if (!lapic_mode_restore()) panic("apic: cannot return to %s mode after sleep", x2_mode ? "x2APIC" : "xAPIC");
+    lapic_write(0x80, 0);
+    lapic_write(0xF0, (lapic_read(0xF0) & ~0xFFu) | 0x1FF);
+    lapic_write(0x350, 0x700);
+    lapic_write(0x360, 0x400);
+    lapic_write(0x370, 0x10000 | 0xFE);
+    if (timer_reload) {
+        lapic_write(LAPIC_TIMER_DIV, 0xB);
+        lapic_tick_resume();
+    }
+}
+
+static bool xapic_ipi_ready(void);
+
+static void spin_us(unsigned us) {
+    uint64_t t0 = rdtsc(), n = tsc_hz / 1000000 * us;
+    while (rdtsc() - t0 < n) pause();
+}
+
+/* INIT, then STARTUP twice (the second is ignored by a CPU that already runs): the AP starts in
+   real mode at the physical page `page` (4 KiB aligned, below 1 MiB). */
+bool lapic_start_ap(uint32_t apic_id, uint64_t page) {
+    if (!available || page & 0xFFF || page >= 0x100000 || tsc_hz < 1000000) return false;
+    uint32_t cmd[3] = {0x4500, 0x4600 | (uint32_t)(page >> 12), 0x4600 | (uint32_t)(page >> 12)};
+    for (unsigned i = 0; i < 3; i++) {
+        if (x2_mode) {
+            wrmsr(X2APIC_ICR, ((uint64_t)apic_id << 32) | cmd[i]);
+        } else {
+            if (!xapic_ipi_ready()) return false;
+            lapic[0x310 / 4] = apic_id << 24;
+            lapic[0x300 / 4] = cmd[i];
+            if (!xapic_ipi_ready()) return false;
+        }
+        spin_us(i ? 200 : 10000);
+    }
+    return true;
+}
+
 bool lapic_worker_init(void) {
     if (!available) return false;
     uint32_t a, b, c, d;
     cpuid(1, 0, &a, &b, &c, &d);
     if (!(d & (1u << 9)) || (x2_mode && !(c & (1u << 21)))) return false;
-    uint64_t base = rdmsr(IA32_APIC_BASE);
-    /* Limineの全CPU modeを採用する。APだけを切り替えてBSPと混在させない。 */
-    if (!(base & APIC_BASE_ENABLE) || ((base & APIC_BASE_X2) != 0) != x2_mode) return false;
+    /* BSPのmode（Limineが選んだもの）に揃える。INIT後のAPはxAPICへ戻っている。 */
+    if (!lapic_mode_restore()) return false;
     lapic_write(0x80, 0);
     lapic_write(0xF0, (lapic_read(0xF0) & ~0xFFu) | 0x1FF);
     lapic_write(LAPIC_LVT_TIMER, 0x10000);

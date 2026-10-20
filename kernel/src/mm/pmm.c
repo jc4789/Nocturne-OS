@@ -10,6 +10,7 @@ static uint64_t total_pages; /* pages covered by the bitmap */
 static uint64_t free_pages;
 static uint64_t usable_pages;
 static uint64_t search_hint;
+static uint64_t low_base, low_pages; /* usable below 1 MiB; never allocated */
 
 static inline void set_used(uint64_t p) { bitmap[p / 64] |= (1ULL << (p % 64)); }
 static inline void set_free(uint64_t p) { bitmap[p / 64] &= ~(1ULL << (p % 64)); }
@@ -61,6 +62,22 @@ void pmm_init(struct limine_memmap_response *mm) {
         if (!is_used(p)) { set_used(p); free_pages--; }
     }
     search_hint = 256;
+    /* the longest usable run in the first megabyte (page 0 aside): real-mode entry (arch/wake.c) */
+    for (uint64_t i = 0; i < mm->entry_count; i++) {
+        struct limine_memmap_entry *e = mm->entries[i];
+        if (e->type != LIMINE_MEMMAP_USABLE || e->base >= 0x100000) continue;
+        uint64_t start = MAX(ALIGN_UP(e->base, PAGE_SIZE), PAGE_SIZE);
+        uint64_t end = ALIGN_DOWN(MIN(e->base + e->length, 0x100000ULL), PAGE_SIZE);
+        if (end > start && (end - start) / PAGE_SIZE > low_pages) {
+            low_base = start;
+            low_pages = (end - start) / PAGE_SIZE;
+        }
+    }
+}
+
+uint64_t pmm_low_range(uint64_t *pages) {
+    *pages = low_pages;
+    return low_base;
 }
 
 uint64_t pmm_alloc(void) {

@@ -65,6 +65,7 @@ struct nvme {
     volatile bool kick;
     struct wait_queue wq;
     bool busy, live, vwc;
+    bool woke; /* back from a sleep: enable again before the next command (under the lock) */
     struct wait_queue idle;
     uint16_t cid;
     uint8_t *data;
@@ -316,6 +317,11 @@ static int rw(struct ns *s, bool write, uint64_t lba, uint32_t count, uint8_t *p
     struct nvme *c = s->c;
     if (lba + count > s->blk.sectors) return -N_ERR_IO;
     lock(c);
+    if (c->woke) {
+        c->woke = false;
+        if (enable(c)) kprintf("nvme%d: ready again after sleep\n", c->index);
+        else kprintf("nvme%d: did not come back after sleep\n", c->index);
+    }
     int result = -N_ERR_IO;
     unsigned per = s->block / 512, most = c->max_xfer / s->block;
     while (count) {
@@ -450,7 +456,17 @@ static void nvme_shutdown(void *arg) {
     }
 }
 
-static struct pm_device nvme_pm = {.name = "nvme", .stage = PM_STAGE_STORAGE, .quiesce = nvme_shutdown};
+/* After a sleep (the shutdown notification above went first): the next read or write resets the
+   controller and sets the queues up again, the way it recovers from a timeout. Resume must not
+   wait for the controller; the I/O path may. */
+static void nvme_resume(void *arg) {
+    (void)arg;
+    for (int i = 0; i < nctrls; i++)
+        if (ctrls[i].regs && ctrls[i].data) ctrls[i].woke = true;
+}
+
+static struct pm_device nvme_pm = {.name = "nvme", .stage = PM_STAGE_STORAGE, .quiesce = nvme_shutdown,
+                                   .resume = nvme_resume};
 
 void nvme_init(void) {
     for (int i = 0; i < pci_count() && nctrls < MAX_CTRL; i++) {

@@ -124,3 +124,27 @@ uint32_t ioapic_isa_to_gsi(unsigned isa_irq, bool *level, bool *active_low) {
     if (active_low) *active_low = low;
     return gsi;
 }
+
+/* Sleep: every redirection entry and the id, written back after S3 (the chip comes back reset). */
+static uint64_t saved_rte[IOAPIC_MAX][256];
+static uint32_t saved_id[IOAPIC_MAX];
+
+void ioapic_suspend(void) {
+    for (unsigned i = 0; i < nios; i++) {
+        saved_id[i] = rd(&ios[i], REG_ID);
+        for (uint32_t pin = 0; pin < ios[i].pins && pin < 256; pin++)
+            saved_rte[i][pin] = rd(&ios[i], REG_RTE(pin)) | (uint64_t)rd(&ios[i], REG_RTE(pin) + 1) << 32;
+    }
+}
+
+void ioapic_resume(void) {
+    for (unsigned i = 0; i < nios; i++) {
+        wr(&ios[i], REG_ID, saved_id[i]);
+        for (uint32_t pin = 0; pin < ios[i].pins && pin < 256; pin++) {
+            uint64_t v = saved_rte[i][pin];
+            wr(&ios[i], REG_RTE(pin), (uint32_t)v | RTE_MASK); /* masked while the destination goes in */
+            wr(&ios[i], REG_RTE(pin) + 1, (uint32_t)(v >> 32));
+            wr(&ios[i], REG_RTE(pin), (uint32_t)v);
+        }
+    }
+}

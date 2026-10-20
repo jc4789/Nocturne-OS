@@ -197,7 +197,68 @@ static void e1000_quiesce(void *arg) {
     wr(REG_TCTL, 0);
 }
 
-static struct pm_device e1000_pm = {.name = "e1000", .stage = PM_STAGE_IO, .quiesce = e1000_quiesce};
+static uint64_t rx_ring_phys, tx_ring_phys;
+static uint32_t itr_ticks; /* 0: the 82544GC/EI, which has no ITR */
+
+static void hw_reset(void) {
+    wr(REG_IMC, 0xFFFFFFFF);
+    wr(REG_CTRL, rd(REG_CTRL) | (1u << 26)); /* device reset */
+    net_delay_ms(10);
+    for (int i = 0; i < 1000 && (rd(REG_CTRL) & (1u << 26)); i++) net_delay_ms(1);
+    wr(REG_IMC, 0xFFFFFFFF);
+    uint32_t ctrl = rd(REG_CTRL);
+    ctrl |= (1u << 6) | (1u << 5);                  /* SLU, ASDE */
+    ctrl &= ~((1u << 3) | (1u << 31) | (1u << 7)); /* LRST, PHY_RST, ILOS */
+    wr(REG_CTRL, ctrl);
+}
+
+/* After the reset: the address, both rings from their first descriptor, the interrupt rate and
+   the interrupts. At probe and after a sleep, which lost every register. */
+static void hw_start(void) {
+    wr(REG_RAL, nif.mac[0] | nif.mac[1] << 8 | nif.mac[2] << 16 | (uint32_t)nif.mac[3] << 24);
+    wr(REG_RAH, nif.mac[4] | nif.mac[5] << 8 | 0x80000000u);
+    for (int i = 0; i < 128; i++) wr(REG_MTA + i * 4, 0);
+    for (size_t i = 0; i < NRX; i++) rx[i].status = 0;
+    for (size_t i = 0; i < NTX; i++) {
+        tx[i].status = 1; /* DD: free */
+        tx[i].cmd = 0;
+    }
+    rx_cur = tx_cur = tx_clean = 0;
+    rx_irq_pending = false;
+    wr(REG_RDBAL, (uint32_t)rx_ring_phys);
+    wr(REG_RDBAH, (uint32_t)(rx_ring_phys >> 32));
+    wr(REG_RDLEN, NRX * sizeof *rx);
+    wr(REG_RDH, 0);
+    wr(REG_RDT, NRX - 1);
+    wr(REG_RCTL, (1u << 1) | (1u << 15) | (1u << 26)); /* EN, BAM, SECRC; 2048-byte buffers */
+    wr(REG_TDBAL, (uint32_t)tx_ring_phys);
+    wr(REG_TDBAH, (uint32_t)(tx_ring_phys >> 32));
+    wr(REG_TDLEN, NTX * sizeof *tx);
+    wr(REG_TDH, 0);
+    wr(REG_TDT, 0);
+    wr(REG_TCTL, (1u << 1) | (1u << 3) | (15u << 4) | (64u << 12)); /* EN, PSP, CT, COLD */
+    wr(REG_TIPG, 10 | (8 << 10) | (6 << 20));
+
+    /* Intel explicitly recommends ITR instead of RDTR/RADV (receive-delay
+       errata). ITR is not implemented by the 82544GC/EI, device 0x100C. */
+    wr(REG_RDTR, 0);
+    if (itr_ticks) {
+        wr(REG_RADV, 0);
+        wr(REG_ITR, itr_ticks);
+    }
+    rd(REG_ICR);
+    wr(REG_IMS, ICR_TXDW | ICR_LSC | RX_IRQS);
+}
+
+static void e1000_resume(void *arg) {
+    (void)arg;
+    hw_reset();
+    hw_start();
+    net_rx_notify(); /* whatever the net thread was waiting for is gone: let it look again */
+}
+
+static struct pm_device e1000_pm = {.name = "e1000", .stage = PM_STAGE_IO, .quiesce = e1000_quiesce,
+                                    .resume = e1000_resume};
 
 static void e1000_free_dma(uint64_t rx_ring, uint64_t tx_ring) {
     for (size_t i = 0; i < NRX; i += BUFS_PER_PAGE)
@@ -224,16 +285,7 @@ bool e1000_probe(void) {
     uint64_t phys = d->bar[0] & ~0xFULL;
     if ((d->bar[0] & 6) == 4) phys |= (uint64_t)d->bar[1] << 32;
     mmio = vmm_map_mmio(phys, 0x20000);
-
-    wr(REG_IMC, 0xFFFFFFFF);
-    wr(REG_CTRL, rd(REG_CTRL) | (1u << 26)); /* device reset */
-    net_delay_ms(10);
-    for (int i = 0; i < 1000 && (rd(REG_CTRL) & (1u << 26)); i++) net_delay_ms(1);
-    wr(REG_IMC, 0xFFFFFFFF);
-    uint32_t ctrl = rd(REG_CTRL);
-    ctrl |= (1u << 6) | (1u << 5);                  /* SLU, ASDE */
-    ctrl &= ~((1u << 3) | (1u << 31) | (1u << 7)); /* LRST, PHY_RST, ILOS */
-    wr(REG_CTRL, ctrl);
+    hw_reset();
 
     uint32_t ral = rd(REG_RAL), rah = rd(REG_RAH);
     if ((rah & 0x80000000u) && (ral || (rah & 0xFFFF))) {
@@ -246,10 +298,7 @@ bool e1000_probe(void) {
             nif.mac[i * 2] = (uint8_t)w;
             nif.mac[i * 2 + 1] = (uint8_t)(w >> 8);
         }
-        wr(REG_RAL, nif.mac[0] | nif.mac[1] << 8 | nif.mac[2] << 16 | (uint32_t)nif.mac[3] << 24);
-        wr(REG_RAH, nif.mac[4] | nif.mac[5] << 8 | 0x80000000u);
     }
-    for (int i = 0; i < 128; i++) wr(REG_MTA + i * 4, 0);
 
     /* descriptor rings and buffers */
     uint64_t rx_ring = pmm_alloc_zeroed(), tx_ring = pmm_alloc_zeroed();
@@ -262,7 +311,6 @@ bool e1000_probe(void) {
         for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
             rxbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
             rx[i + k].addr = p + k * BUFSZ;
-            rx[i + k].status = 0;
         }
     }
     for (size_t i = 0; i < NTX; i += BUFS_PER_PAGE) {
@@ -271,32 +319,13 @@ bool e1000_probe(void) {
         for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
             txbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
             tx[i + k].addr = p + k * BUFSZ;
-            tx[i + k].status = 1; /* DD: free */
-            tx[i + k].cmd = 0;
         }
     }
-    wr(REG_RDBAL, (uint32_t)rx_ring);
-    wr(REG_RDBAH, (uint32_t)(rx_ring >> 32));
-    wr(REG_RDLEN, NRX * sizeof *rx);
-    wr(REG_RDH, 0);
-    wr(REG_RDT, NRX - 1);
-    wr(REG_RCTL, (1u << 1) | (1u << 15) | (1u << 26)); /* EN, BAM, SECRC; 2048-byte buffers */
-    wr(REG_TDBAL, (uint32_t)tx_ring);
-    wr(REG_TDBAH, (uint32_t)(tx_ring >> 32));
-    wr(REG_TDLEN, NTX * sizeof *tx);
-    wr(REG_TDH, 0);
-    wr(REG_TDT, 0);
-    wr(REG_TCTL, (1u << 1) | (1u << 3) | (15u << 4) | (64u << 12)); /* EN, PSP, CT, COLD */
-    wr(REG_TIPG, 10 | (8 << 10) | (6 << 20));
-
-    /* Intel explicitly recommends ITR instead of RDTR/RADV (receive-delay
-       errata). ITR is not implemented by the 82544GC/EI, device 0x100C. */
-    wr(REG_RDTR, 0);
+    rx_ring_phys = rx_ring;
+    tx_ring_phys = tx_ring;
     if (d->device != 0x100C) {
-        wr(REG_RADV, 0);
-        uint32_t itr = e1000_itr_ticks();
-        wr(REG_ITR, itr);
-        kprintf("net: e1000 ITR %u x %u ns (e1000-itr-us=0 disables)\n", itr, ITR_TICK_NS);
+        itr_ticks = e1000_itr_ticks();
+        kprintf("net: e1000 ITR %u x %u ns (e1000-itr-us=0 disables)\n", itr_ticks, ITR_TICK_NS);
     }
 
     nif.send = e1000_send;
@@ -306,8 +335,7 @@ bool e1000_probe(void) {
     pm_register(&e1000_pm);
     irq_register(d->irq, e1000_irq);
     pic_unmask(d->irq);
-    rd(REG_ICR);
-    wr(REG_IMS, ICR_TXDW | ICR_LSC | RX_IRQS);
+    hw_start();
     kprintf("net: e1000 (%04x) irq %d mac %02x:%02x:%02x:%02x:%02x:%02x\n", d->device, d->irq, nif.mac[0],
             nif.mac[1], nif.mac[2], nif.mac[3], nif.mac[4], nif.mac[5]);
     return true;

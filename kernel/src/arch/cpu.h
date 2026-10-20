@@ -98,6 +98,8 @@ bool lapic_send_ipi(uint32_t apic_id, uint8_t vector);
 void lapic_eoi(void);
 bool lapic_timer_start(unsigned hz, int vector);
 bool lapic_runner_timer_start(void); /* BSPで較正済みのperiodic tickだけをAPで再使用 */
+void lapic_resume(void); /* BSP after S3: registers and the calibrated tick again */
+bool lapic_start_ap(uint32_t apic_id, uint64_t page); /* INIT-SIPI-SIPI into real mode at page */
 /* Tickless idle, after lapic_timer_start: stop this CPU's tick, fire it once after ms, or go
    back to the periodic tick. */
 void lapic_tick_stop(void);
@@ -110,5 +112,7 @@ void pic_init(void);
 void pic_unmask(int irq);
 void pic_mask(int irq);
 void pic_eoi(int irq);
+uint32_t pic_state(void);           /* masks (bit n: IRQ n masked) and, above them, the ELCR */
+void pic_restore(uint32_t state);   /* after S3: pic_init, then that state again */
 void fpu_init(void);
 void cpu_get_brand(char *out);

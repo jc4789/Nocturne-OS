@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "dev/input.h"
+#include "dev/pm.h"
 #include "limine.h"
 
 extern volatile struct limine_rsdp_request rsdp_req;
@@ -191,11 +192,10 @@ static void flush(void) {
     for (int i = 0; i < 64 && (inb(0x64) & 1); i++) inb(0x60);
 }
 
-void input_init(void) {
-    if (inb(0x64) == 0xFF) { /* nothing decodes the port: no i8042 (Hyper-V Generation 2) */
-        kprintf("input: no PS/2 controller\n");
-        return;
-    }
+/* The controller's configuration, keyboard scanning, and the mouse in wheel mode if it has one:
+   at boot, and after a sleep, which reset the controller and both devices. Returns whether a
+   mouse answered. The IRQ handlers must not take the replies: their lines are masked. */
+static bool ps2_setup(void) {
     ctl_cmd(0xAD); /* disable keyboard port */
     ctl_cmd(0xA7); /* disable aux port */
     flush();
@@ -219,6 +219,7 @@ void input_init(void) {
 
     /* mouse (some emulated controllers need a moment after the port is enabled) */
     int ack = -1;
+    bool found = false;
     for (int tries = 0; tries < 4 && ack != 0xFA; tries++) {
         ack = mouse_cmd(0xF6);
         if (ack != 0xFA) flush();
@@ -234,9 +235,34 @@ void input_init(void) {
             mouse_wheel = (id == 3 || id == 4);
         }
         mouse_cmd(0xF3); mouse_cmd(60);
-        if (mouse_cmd(0xF4) == 0xFA) mouse_ok = true;
+        found = mouse_cmd(0xF4) == 0xFA;
     }
     flush();
+    pidx = 0;
+    e0 = false;
+    return found;
+}
+
+static void ps2_resume(void *arg) {
+    (void)arg;
+    pic_mask(1);
+    pic_mask(12);
+    mods = 0; /* keys held when it went to sleep were let go long ago */
+    if (ps2_setup()) mouse_ok = true;
+    else kprintf("input: the PS/2 mouse did not answer after sleep\n");
+    pic_unmask(1);
+    pic_unmask(12);
+}
+
+static struct pm_device ps2_pm = {.name = "ps2", .stage = PM_STAGE_IO, .resume = ps2_resume};
+
+void input_init(void) {
+    if (inb(0x64) == 0xFF) { /* nothing decodes the port: no i8042 (Hyper-V Generation 2) */
+        kprintf("input: no PS/2 controller\n");
+        return;
+    }
+    if (ps2_setup()) mouse_ok = true;
+    pm_register(&ps2_pm);
     flip_detected = mouse_ok && detect_flip_y();
     flip_y = flip_detected;
     irq_register(1, kbd_irq);

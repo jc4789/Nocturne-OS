@@ -15,3 +15,8 @@ extern volatile bool tick_stopped;
 bool timer_tickless(void); /* runner APs may stop their tick when idle */
 void timer_idle(void);     /* BSP idle task, interrupts off: maybe stop the tick */
 void timer_wake(void);     /* BSP, any interrupt while tick_stopped: tick again */
+/* Sleep: uptime_ms leaves the time asleep out, the wall clock takes it from the RTC. suspend before
+   S3, resume after it with interrupts off (the TSC may have started again from 0). resume returns
+   the seconds slept. */
+void timer_suspend(void);
+int64_t timer_resume(void);

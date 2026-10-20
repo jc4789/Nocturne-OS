@@ -3,6 +3,8 @@
 #include "limine.h"
 #include "arch/smp.h"
 #include "arch/cpu.h"
+#include "dev/pci.h"
+#include "dev/pm.h"
 
 struct fb_info fb;
 
@@ -166,4 +168,54 @@ void fb_benchmark(const uint32_t *src,int src_pitch) {
     kprintf("fbbench: %ux%u rounds=3 CPUs=%u serial_ticks=%lu parallel_ticks=%lu jobs=%lu max_job_us=%lu pixels=%s\n",
         fb.width,fb.height,cpu_online_count(),serial,parallel,cpu_parallel_jobs()-jobs,cpu_max_job_us(),same?"PASS":"FAIL");
     if (!same) panic("fbbench: display pixels differ after SMP presentation");
+}
+
+/* ---- sleep ----
+   The firmware set the display mode at boot; after a sleep nothing sets it again. Only a display
+   with the Bochs VBE interface (QEMU's standard VGA, VirtualBox's VGA) can be put back here, by
+   its index/data ports; on any other one the screen would stay dark, so the display has no
+   resume there and sleep is not offered. */
+#define VBE_INDEX  0x1CE
+#define VBE_DATA   0x1CF
+#define VBE_REGS   10 /* id, xres, yres, bpp, enable, bank, virt width/height, x/y offset */
+#define VBE_ENABLE 4
+static uint16_t vbe_saved[VBE_REGS];
+
+static uint16_t vbe_read(uint16_t reg) {
+    outw(VBE_INDEX, reg);
+    return inw(VBE_DATA);
+}
+
+static void vbe_write(uint16_t reg, uint16_t value) {
+    outw(VBE_INDEX, reg);
+    outw(VBE_DATA, value);
+}
+
+static void vbe_quiesce(void *arg) {
+    (void)arg;
+    for (uint16_t r = 1; r < VBE_REGS; r++) vbe_saved[r] = vbe_read(r);
+}
+
+static void vbe_resume(void *arg) {
+    (void)arg;
+    vbe_write(VBE_ENABLE, 0);
+    for (uint16_t r = 1; r < VBE_REGS; r++)
+        if (r != VBE_ENABLE) vbe_write(r, vbe_saved[r]);
+    vbe_write(VBE_ENABLE, vbe_saved[VBE_ENABLE] | 0x80); /* back on, without clearing the memory */
+    inb(0x3DA);       /* the attribute controller's flip-flop to "index" */
+    outb(0x3C0, 0x20); /* palette address source: the picture is shown again */
+}
+
+static struct pm_device display_pm = {.name = "display", .stage = PM_STAGE_IO};
+
+void fb_pm_init(void) {
+    if (!fb.addr) return;
+    struct pci_device *d = pci_find(0x1234, 0x1111);
+    if (!d) d = pci_find(0x80EE, 0xBEEF);
+    uint16_t id = d && d->cls == 0x03 && d->subcls == 0x00 ? vbe_read(0) : 0;
+    if (id >= 0xB0C0 && id <= 0xB0CF && (vbe_read(VBE_ENABLE) & 0x41) == 0x41) {
+        display_pm.quiesce = vbe_quiesce;
+        display_pm.resume = vbe_resume;
+    }
+    pm_register(&display_pm);
 }

@@ -609,10 +609,16 @@ static const struct app apps[] = {
     {"Game of Life", "/bin/life", ICON_LIFE},
     {"Settings", "/bin/js", ICON_SETTINGS, "/bin/settings.js"},
     {"About Nocturne", "/bin/js", ICON_ABOUT, "/bin/about.js"},
+    {"Sleep", "@sleep", ICON_SLEEP},
     {"Restart", "@reboot", ICON_REBOOT},
     {"Shut Down", "@poweroff", ICON_POWER},
 };
 #define NAPPS ((int)ARRAY_SIZE(apps))
+#define APP_SLEEP (NAPPS - 3) /* the power items close the menu: Sleep, Restart, Shut Down */
+
+/* the start menu leaves Sleep out on machines that cannot sleep (dev/pm.c says which) */
+static int menu_count(void) { return pm_can_sleep() ? NAPPS : NAPPS - 1; }
+static const struct app *menu_app(int i) { return &apps[i >= APP_SLEEP && !pm_can_sleep() ? i + 1 : i]; }
 
 static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 10, 13, 14, 16, 17};
 #define NDESK ((int)ARRAY_SIZE(desktop_apps))
@@ -728,8 +734,8 @@ static void set_deep_simulation(bool on) {
 }
 
 static int launch(const char *path, const char *arg) {
-    if (!strcmp(path, "@reboot") || !strcmp(path, "@poweroff")) {
-        pm_request(path[1] == 'r' ? PM_REBOOT : PM_POWER_OFF, true);
+    if (!strcmp(path, "@reboot") || !strcmp(path, "@poweroff") || !strcmp(path, "@sleep")) {
+        pm_request(path[1] == 'r' ? PM_REBOOT : path[1] == 's' ? PM_SLEEP : PM_POWER_OFF, true);
         return 0;
     }
     if (pm_stopping()) return -N_ERR_STOPPED;
@@ -750,12 +756,12 @@ static int launch(const char *path, const char *arg) {
 /* items run down a column, and on into a second one when the screen is too short for one */
 static int menu_rows(void) {
     int fit = (sh - TASKBAR_H - 8 - MENU_HEAD - 10) / MENU_ITEM_H;
-    int cols = fit < 1 ? NAPPS : (NAPPS + fit - 1) / fit;
-    return (NAPPS + cols - 1) / cols;
+    int cols = fit < 1 ? menu_count() : (menu_count() + fit - 1) / fit;
+    return (menu_count() + cols - 1) / cols;
 }
 
 static struct rect menu_rect(void) {
-    int rows = menu_rows(), cols = (NAPPS + rows - 1) / rows;
+    int rows = menu_rows(), cols = (menu_count() + rows - 1) / rows;
     int h = MENU_HEAD + rows * MENU_ITEM_H + 10;
     return (struct rect){4, MAX(0, sh - TASKBAR_H - h - 4), MENU_W * cols, h};
 }
@@ -771,7 +777,7 @@ static int menu_item_at(int x, int y) {
     int rows = menu_rows();
     if (!in_rect(x, y, m.x, m.y + MENU_HEAD, m.w, rows * MENU_ITEM_H)) return -1;
     int i = (x - m.x) / MENU_W * rows + (y - m.y - MENU_HEAD) / MENU_ITEM_H;
-    return i < NAPPS ? i : -1;
+    return i < menu_count() ? i : -1;
 }
 
 static void set_menu(bool open) {
@@ -807,15 +813,15 @@ static void draw_menu(canvas_t *c) {
         draw_crescent(c, m.x + 30, m.y + 26, 13, RGB(246, 236, 196));
         gfx_text(c, m.x + 54, m.y + 10, OS_NAME, RGB(255, 255, 255), TRANSPARENT, FONT_LARGE);
     }
-    for (int i = 0; i < NAPPS; i++) {
+    for (int i = 0, n = menu_count(); i < n; i++) {
         int ix, iy;
         menu_item_pos(i, &ix, &iy);
         /* Include the separator row above this item. */
         if (!canvas_hits(c, ix, iy-1, MENU_W, MENU_ITEM_H+1)) continue;
-        if (i == NAPPS - 2 && iy > m.y + MENU_HEAD) gfx_hline(c, ix + 12, iy - 1, MENU_W - 24, RGB(60, 56, 100));
+        if (i == APP_SLEEP && iy > m.y + MENU_HEAD) gfx_hline(c, ix + 12, iy - 1, MENU_W - 24, RGB(60, 56, 100));
         if (i == menu_sel) gfx_fill_round(c, ix + 6, iy + 1, MENU_W - 12, MENU_ITEM_H - 2, 6, RGB(76, 64, 150));
-        desktop_draw_icon(c, ix + 12, iy + 2, apps[i].icon);
-        gfx_text(c, ix + 54, iy + 10, apps[i].name, RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
+        desktop_draw_icon(c, ix + 12, iy + 2, menu_app(i)->icon);
+        gfx_text(c, ix + 54, iy + 10, menu_app(i)->name, RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
     }
 }
 
@@ -1797,13 +1803,14 @@ static void handle_key(const struct key_event *k) {
             if (k->key == KEY_ESC) set_menu(false);
             else if (k->key == KEY_UP || k->key == KEY_DOWN) {
                 int d = k->key == KEY_UP ? -1 : 1;
-                menu_sel = menu_sel < 0 ? (d > 0 ? 0 : NAPPS - 1) : (menu_sel + d + NAPPS) % NAPPS;
+                int n = menu_count();
+                menu_sel = menu_sel < 0 ? (d > 0 ? 0 : n - 1) : (menu_sel + d + n) % n;
                 struct rect m = menu_rect();
                 damage_rect(m.x, m.y, m.w, m.h);
             } else if (k->key == KEY_ENTER && menu_sel >= 0) {
                 int s = menu_sel;
                 set_menu(false);
-                launch(apps[s].path, apps[s].arg);
+                launch(menu_app(s)->path, menu_app(s)->arg);
             }
             return;
         }
@@ -1868,7 +1875,7 @@ static void left_press(void) {
             int i = menu_item_at(mx, my);
             if (i >= 0) {
                 set_menu(false);
-                launch(apps[i].path, apps[i].arg);
+                launch(menu_app(i)->path, menu_app(i)->arg);
             }
             return;
         }
@@ -2291,6 +2298,14 @@ bool wm_remote_attach(int *w, int *h) {
     wake_compositor();
     wm_unlock();
     return true;
+}
+
+void wm_repaint(void) {
+    if (!running) return;
+    wm_lock();
+    damage_all();
+    wake_compositor();
+    wm_unlock();
 }
 
 void wm_remote_detach(void) {

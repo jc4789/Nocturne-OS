@@ -4,6 +4,7 @@
 #include "dev/pci.h"
 #include "dev/acpi.h"
 #include "abi.h"
+#include "mm/heap.h"
 #include "mm/vmm.h"
 
 /* ---- ECAM (MCFG) ----
@@ -329,4 +330,74 @@ bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
     pci_msix_mask(d, 0, false);
     pci_msix_function_mask(d, false);
     return true;
+}
+
+/* ---- sleep ----
+   After S3 a function comes back reset: no BARs, no command bits, no MSI. The header, the MSI and
+   MSI-X state (the MSI-X table lives in a BAR) and the PCIe control registers are saved before
+   and written back before any driver touches its device again. Device-specific registers past
+   the capabilities are the driver's. */
+static struct pci_saved {
+    uint32_t id, hdr[16];
+    uint8_t msi, msix, msi_dwords;
+    uint32_t msi_regs[5];
+    uint32_t msix_ctl, *msix_table;
+    uint16_t pcie_ctl[4];
+} saved[ARRAY_SIZE(devices)];
+static const uint8_t pcie_ctl_off[4] = {0x08, 0x10, 0x28, 0x30}; /* device, link, device 2, link 2 */
+
+void pci_suspend(void) {
+    for (int i = 0; i < ndevices; i++) {
+        struct pci_device *d = &devices[i];
+        struct pci_saved *s = &saved[i];
+        for (unsigned k = 0; k < 16; k++) s->hdr[k] = pci_read32(d->bus, d->dev, d->func, k * 4);
+        s->id = s->hdr[0];
+        s->msi = pci_find_cap(d, 0x05);
+        if (s->msi) {
+            uint16_t ctl = pci_read32(d->bus, d->dev, d->func, s->msi) >> 16;
+            /* control, address (+ high half), data, and the mask bits when there are any */
+            s->msi_dwords = 3 + !!(ctl & 0x80) + !!(ctl & 0x100);
+            for (unsigned j = 0; j < s->msi_dwords; j++)
+                s->msi_regs[j] = pci_read32(d->bus, d->dev, d->func, s->msi + 4 * j);
+        }
+        s->msix = pci_find_cap(d, 0x11);
+        if (s->msix) {
+            s->msix_ctl = pci_read32(d->bus, d->dev, d->func, s->msix);
+            if (d->msix_table && !s->msix_table) s->msix_table = kmalloc(d->msix_entries * 16);
+            if (d->msix_table && s->msix_table)
+                for (unsigned j = 0; j < d->msix_entries * 4u; j++) s->msix_table[j] = d->msix_table[j];
+        }
+        if (d->pcie_cap)
+            for (unsigned j = 0; j < 4; j++) s->pcie_ctl[j] = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j]);
+    }
+}
+
+void pci_resume(void) {
+    for (int i = 0; i < ndevices; i++) {
+        struct pci_device *d = &devices[i];
+        struct pci_saved *s = &saved[i];
+        if (pci_read32(d->bus, d->dev, d->func, 0) != s->id) {
+            kprintf("pci: %02x:%02x.%x is not there after sleep\n", d->bus, d->dev, d->func);
+            continue;
+        }
+        /* cache line and latency, not BIST (a write there starts a self test); then BARs and the
+           rest of the header (bus numbers and windows for a bridge); command last */
+        pci_write16(d->bus, d->dev, d->func, 0x0C, s->hdr[3] & 0xFFFF);
+        for (unsigned k = 4; k < 16; k++) pci_write32(d->bus, d->dev, d->func, k * 4, s->hdr[k]);
+        if (d->pcie_cap)
+            for (unsigned j = 0; j < 4; j++) pci_write16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
+        pci_write16(d->bus, d->dev, d->func, 4, s->hdr[1] & 0xFFFF);
+        if (s->msix) {
+            /* the table is memory space, which the command register has just opened */
+            pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl | 0xC0000000u);
+            if (d->msix_table && s->msix_table)
+                for (unsigned j = 0; j < d->msix_entries * 4u; j++) d->msix_table[j] = s->msix_table[j];
+            pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl);
+        }
+        if (s->msi) {
+            for (unsigned j = 1; j < s->msi_dwords; j++)
+                pci_write32(d->bus, d->dev, d->func, s->msi + 4 * j, s->msi_regs[j]);
+            pci_write32(d->bus, d->dev, d->func, s->msi, s->msi_regs[0]);
+        }
+    }
 }

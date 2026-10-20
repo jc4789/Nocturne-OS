@@ -5,6 +5,7 @@
 #include "fs/vfs.h"
 #include "dev/input.h"
 #include "dev/fbcon.h"
+#include "dev/fb.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
 #include "arch/ioapic.h"
@@ -125,6 +126,7 @@ void kmain_late(void) {
         hvsock_init();
     }
     pci_init();
+    fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
     drop_absent_firmware();
     usb_init();
     net_init();
@@ -139,6 +141,7 @@ void kmain_late(void) {
     if (gui) wm_init();
     rdp_init();
     if (!gui || !wm_running()) input_set_sinks(console_key_sink, NULL);
+    pm_sleep_check(); /* every driver has registered: whether the start menu offers Sleep */
 
     struct file *con = NULL;
     vfs_open("/dev/console", O_RDWR, &con);

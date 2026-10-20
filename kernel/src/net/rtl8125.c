@@ -277,8 +277,6 @@ static void rtl_quiesce(void *arg) {
     wait8(CMD, CMD_RESET, 0, 1000, 10);
 }
 
-static struct pm_device rtl_pm = {.name = "rtl8125", .stage = PM_STAGE_IO, .quiesce = rtl_quiesce};
-
 static void aspm_clkreq_off(void) {
     wr8(0xF1, rd8(0xF1) & ~0x80);
     wr8(CFG5, rd8(CFG5) & ~0x01);
@@ -375,6 +373,49 @@ static void start_autoneg(void) {
                             ANAR_PAUSE | ANAR_ASYM);
     mii_write(MII_BMCR, BMCR_RESET | BMCR_AUTONEG | BMCR_RESTART);
 }
+
+/* Both rings from their first descriptor, handed to the MAC, then receive and transmit on: at
+   probe and after a sleep, which reset the MAC (the buffers stay where they were). */
+static uint64_t rx_ring_phys, tx_ring_phys;
+
+static void rings_start(void) {
+    for (size_t i = 0; i < NRX; i++) {
+        rx[i].opts2 = 0;
+        rx[i].opts1 = D_OWN | (i == NRX - 1 ? D_EOR : 0) | BUFSZ;
+    }
+    for (size_t i = 0; i < NTX; i++) tx[i].opts1 = i == NTX - 1 ? D_EOR : 0;
+    rx_cur = tx_cur = tx_clean = 0;
+    rx_irq_pending = false;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    wr32(TX_RING, (uint32_t)tx_ring_phys);
+    wr32(TX_RING + 4, (uint32_t)(tx_ring_phys >> 32));
+    wr32(RX_RING, (uint32_t)rx_ring_phys);
+    wr32(RX_RING + 4, (uint32_t)(rx_ring_phys >> 32));
+    wr16(RX_MAX_SIZE, FRAME_MAX);
+    wr16(EEE_TXIDLE, 1500 + 14 + 0x20);
+    wr32(MAR0, 0xFFFFFFFF);
+    wr32(MAR4, 0xFFFFFFFF);
+    wr32(RXCFG, 0x40C00C00 | RX_ACCEPT);
+    wr8(CMD, CMD_TX_EN | CMD_RX_EN);
+}
+
+static void rtl_resume(void *arg) {
+    (void)arg;
+    hw_init();
+    cfg_unlock();
+    wr32(IDR0, nif.mac[0] | nif.mac[1] << 8 | nif.mac[2] << 16 | (uint32_t)nif.mac[3] << 24);
+    wr16(IDR0 + 4, (uint16_t)(nif.mac[4] | nif.mac[5] << 8));
+    cfg_lock();
+    rings_start();
+    link = false; /* check_link reports it again once autonegotiation is done */
+    wr32(ISR, 0xFFFFFFFF);
+    wr32(IMR_SET, INT_MASK);
+    start_autoneg();
+    net_rx_notify();
+}
+
+static struct pm_device rtl_pm = {.name = "rtl8125", .stage = PM_STAGE_IO, .quiesce = rtl_quiesce,
+                                  .resume = rtl_resume};
 
 static void check_link(void) {
     uint32_t s = rd32(PHY_STATUS);
@@ -543,8 +584,6 @@ bool rtl8125_probe(void) {
         for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
             rxbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
             rx[i + k].addr = p + k * BUFSZ;
-            rx[i + k].opts2 = 0;
-            rx[i + k].opts1 = D_OWN | (i + k == NRX - 1 ? D_EOR : 0) | BUFSZ;
         }
     }
     for (size_t i = 0; i < NTX; i += BUFS_PER_PAGE) {
@@ -553,20 +592,11 @@ bool rtl8125_probe(void) {
         for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
             txbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
             tx[i + k].addr = p + k * BUFSZ;
-            tx[i + k].opts1 = i + k == NTX - 1 ? D_EOR : 0;
         }
     }
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    wr32(TX_RING, (uint32_t)tx_ring);
-    wr32(TX_RING + 4, (uint32_t)(tx_ring >> 32));
-    wr32(RX_RING, (uint32_t)rx_ring);
-    wr32(RX_RING + 4, (uint32_t)(rx_ring >> 32));
-    wr16(RX_MAX_SIZE, FRAME_MAX);
-    wr16(EEE_TXIDLE, 1500 + 14 + 0x20);
-    wr32(MAR0, 0xFFFFFFFF);
-    wr32(MAR4, 0xFFFFFFFF);
-    wr32(RXCFG, 0x40C00C00 | RX_ACCEPT);
-    wr8(CMD, CMD_TX_EN | CMD_RX_EN);
+    rx_ring_phys = rx_ring;
+    tx_ring_phys = tx_ring;
+    rings_start();
 
     nif.send = rtl_send;
     nif.rx_pending = rtl_rx_pending;

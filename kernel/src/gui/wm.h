@@ -19,6 +19,7 @@ void wm_notify(const char *title, const char *text); /* desktop toast */
    title in top_title), and ask every one of them to close. */
 int wm_window_count(char *top_title, size_t n);
 void wm_close_windows(void);
+void wm_repaint(void); /* the screen lost what was on it (after sleep): draw all of it again */
 
 /* Remote display: rectangle copies hold WM ownership only for the copy, never
    while encoding or sending a network packet. */
@@ -40,5 +41,5 @@ void desktop_draw_icon(canvas_t *c, int x, int y, int icon);
 void desktop_draw_cursor(canvas_t *c, int x, int y, int shape);
 enum { ICON_TERMINAL, ICON_FILES, ICON_PAINT, ICON_CLOCK, ICON_SNAKE, ICON_FRACTAL, ICON_CUBE,
        ICON_LIFE, ICON_MONITOR, ICON_EDITOR, ICON_ABOUT, ICON_CALC, ICON_POWER, ICON_REBOOT,
-       ICON_TETRIS, ICON_MINES, ICON_NET, ICON_PIANO, ICON_SOUND, ICON_SETTINGS, ICON_GENERIC, ICON_COUNT };
+       ICON_TETRIS, ICON_MINES, ICON_NET, ICON_PIANO, ICON_SOUND, ICON_SETTINGS, ICON_SLEEP, ICON_GENERIC, ICON_COUNT };
 enum { CURSOR_ARROW, CURSOR_RESIZE, CURSOR_MOVE };

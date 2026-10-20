@@ -16,6 +16,8 @@
 #include <uacpi/notify.h>
 #include <uacpi/sleep.h>
 #include <uacpi/utilities.h>
+#include <uacpi/resources.h>
+#include "arch/wake.h"
 
 extern volatile struct limine_rsdp_request rsdp_req;
 
@@ -586,8 +588,39 @@ void acpi_aml_init(void) {
 
 bool acpi_aml_ready(void) { return aml_ready; }
 
+bool acpi_sleep_supported(unsigned state) {
+    if (!aml_ready || state > 5) return false;
+    char path[] = "\\_S0_";
+    path[3] = (char)('0' + state);
+    uacpi_namespace_node *node;
+    return uacpi_namespace_node_find(UACPI_NULL, path, &node) == UACPI_STATUS_OK;
+}
+
+/* PCI interrupt links (PNP0C0F): the chipset's routing of INTx to IRQs comes back cleared from
+   S3, so each link's current setting (_CRS) is kept and given back to it (_SRS) on waking. */
+#define LINKS_MAX 32
+static struct link {
+    uacpi_namespace_node *node;
+    uacpi_resources *res;
+} links[LINKS_MAX];
+static unsigned nlinks;
+
+static uacpi_iteration_decision found_link(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
+    (void)user;
+    (void)depth;
+    uacpi_namespace_node *srs;
+    if (nlinks == LINKS_MAX || uacpi_namespace_node_find(node, "_SRS", &srs) != UACPI_STATUS_OK)
+        return UACPI_ITERATION_DECISION_CONTINUE;
+    if (uacpi_get_current_resources(node, &links[nlinks].res) == UACPI_STATUS_OK) links[nlinks++].node = node;
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
 bool acpi_sleep_prepare(unsigned state) {
     if (!aml_ready) return false;
+    if (state == 3) {
+        nlinks = 0;
+        uacpi_find_devices("PNP0C0F", found_link, NULL);
+    }
     uacpi_status st = uacpi_prepare_for_sleep_state((uacpi_sleep_state)state);
     if (st != UACPI_STATUS_OK) kprintf("acpi: preparing S%u failed: %s\n", state, uacpi_status_to_string(st));
     return st == UACPI_STATUS_OK;
@@ -595,9 +628,35 @@ bool acpi_sleep_prepare(unsigned state) {
 
 bool acpi_sleep_enter(unsigned state) {
     if (!aml_ready) return false;
+    if (state == 3) {
+        /* where the firmware jumps on waking: the wake page, in real mode */
+        uacpi_status st = uacpi_set_waking_vector(wake_page(), 0);
+        if (st != UACPI_STATUS_OK || !wake_available()) {
+            kprintf("acpi: no waking vector: %s\n", uacpi_status_to_string(st));
+            return false;
+        }
+        __asm__ volatile("wbinvd" : : : "memory"); /* the caches lose their contents in S3 */
+    }
     uacpi_status st = uacpi_enter_sleep_state((uacpi_sleep_state)state);
     if (st != UACPI_STATUS_OK) kprintf("acpi: entering S%u failed: %s\n", state, uacpi_status_to_string(st));
     return st == UACPI_STATUS_OK;
+}
+
+void acpi_wake_prepare(unsigned state) {
+    if (aml_ready) uacpi_prepare_for_wake_from_sleep_state((uacpi_sleep_state)state);
+}
+
+void acpi_wake(unsigned state) {
+    if (!aml_ready) return;
+    unsigned routed = 0;
+    for (unsigned i = 0; i < nlinks; i++) {
+        if (uacpi_set_resources(links[i].node, links[i].res) == UACPI_STATUS_OK) routed++;
+        uacpi_free_resources(links[i].res);
+    }
+    uacpi_status st = uacpi_wake_from_sleep_state((uacpi_sleep_state)state);
+    if (st != UACPI_STATUS_OK) kprintf("acpi: waking from S%u: %s\n", state, uacpi_status_to_string(st));
+    if (nlinks) kprintf("acpi: %u of %u PCI interrupt links set again\n", routed, nlinks);
+    nlinks = 0;
 }
 
 bool acpi_reset(void) { return aml_ready && uacpi_reboot() == UACPI_STATUS_OK; }

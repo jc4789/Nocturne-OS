@@ -6,6 +6,7 @@
 #include "kernel.h"
 #include "dev/gpu.h"
 #include "dev/pci.h"
+#include "dev/pm.h"
 #include "arch/cpu.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -467,6 +468,9 @@ void gpu_init(void) {
         kprintf("gpu: virgl transport unavailable; boot framebuffer unchanged\n");
         return;
     }
+    /* its queues and resources would be gone after a sleep: no sleep while it is in use */
+    static struct pm_device gpu_pm = {.name = "virtio-gpu", .stage = PM_STAGE_IO};
+    pm_register(&gpu_pm);
     /* Read only the fixed prefix of growable capset2, not host pointers or
      * arbitrary resources. virgl_caps_v1 is 77 dwords, then capability_bits
      * is v2 word 98 (byte392). All formats/limits needed by this finite

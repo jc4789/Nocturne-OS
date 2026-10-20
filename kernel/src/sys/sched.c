@@ -396,6 +396,7 @@ NORETURN void sched_ap_loop(void) {
     bool tick_off = false;
     for (;;) {
         cli();
+        if (!q_resident(cpu)) cpu_park_check(); /* a sleep: nothing of ours is left here */
         if (cpu_worker_poll()) continue;
         bool returned = false;
         q_lock(q);
@@ -772,6 +773,12 @@ bool sched_bsp_quiet(void) {
     for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++)
         if (q_resident(cpu) || __atomic_load_n(&cpuq[cpu].returned, __ATOMIC_RELAXED)) return false;
     return true;
+}
+
+/* After S3 the TSC may have started again from 0: the BSP's running stamp starts over. */
+void sched_clock_resume(void) {
+    bsp_stamp = run_stamp();
+    bsp_stamp_tsc = tsc_hz >= 1000000;
 }
 
 uint64_t sched_next_wake(void) {

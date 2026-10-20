@@ -96,6 +96,7 @@ void sched_yield(void);
 void sched_tick(void);
 bool sched_bsp_quiet(void);      /* tickless idle (dev/timer.c): nothing to run, no app on an AP */
 uint64_t sched_next_wake(void);  /* the earliest timeout (uptime_ms), UINT64_MAX: none */
+void sched_clock_resume(void); /* after S3 (the TSC may have restarted), interrupts off */
 void sched_user_return(struct regs *r);
 void sched_post_switch(void); /* context_switch: 旧taskstackを離れた後だけpublication */
 NORETURN void sched_ap_loop(void);

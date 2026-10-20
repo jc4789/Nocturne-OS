@@ -66,3 +66,9 @@ void cpu_runner_check(void); /* BSP: failed APはcontextを保持してpanic */
 bool cpu_jobs_active(void);
 void cpu_require_bsp(void);
 void cpu_worker_fault(struct regs *regs) __attribute__((noreturn));
+/* Sleep: smp_suspend (BSP) takes every user thread back and halts each AP, false when one did not
+   stop; smp_resume starts them again with INIT-SIPI, after S3 or after a sleep that failed.
+   cpu_park_check is the APs' side, at the top of their idle loops with interrupts off. */
+bool smp_suspend(void);
+void smp_resume(void);
+void cpu_park_check(void);

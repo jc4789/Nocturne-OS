@@ -32,6 +32,7 @@ struct lun {
 };
 
 static unsigned disks;
+static unsigned attached; /* storage devices plugged in now (they do not survive a sleep) */
 
 static void put32(uint8_t *p, uint32_t v) {
     for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
@@ -342,6 +343,7 @@ void usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
     m->in = eps[0].address;
     m->out = eps[1].address;
     d->msc = m;
+    attached++;
     /* BOT 3.2: Get Max LUN; a device with one unit may stall it */
     uint8_t max = 0;
     if (usb_control(d, 0xA1, 0xFE, 0, m->intf, &max, 1) < 1) max = 0;
@@ -357,4 +359,7 @@ void usbmsc_detach(struct usb_device *d) {
     if (!m) return;
     m->dev = NULL;
     d->msc = NULL;
+    attached--;
 }
+
+bool usbmsc_attached(void) { return attached > 0; }

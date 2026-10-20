@@ -17,3 +17,6 @@ bool ioapic_mask(uint32_t gsi);
 /* ISA IRQ -> GSI honoring MADT interrupt source overrides. level/active_low (may be NULL) receive the
    trigger mode and polarity to use for that source (ISA default: edge, active high). */
 uint32_t ioapic_isa_to_gsi(unsigned isa_irq, bool *level, bool *active_low);
+/* Sleep (dev/pm.c), interrupts off: save every entry before S3, write them back after it. */
+void ioapic_suspend(void);
+void ioapic_resume(void);

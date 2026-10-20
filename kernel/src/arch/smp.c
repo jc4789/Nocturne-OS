@@ -9,6 +9,7 @@
 #include "sys/sched.h"
 #include "arch/pstate.h"
 #include "arch/pat.h"
+#include "arch/wake.h"
 
 #define AP_STACK_SIZE (32 * 1024)
 #define START_TIMEOUT_MS 2000
@@ -18,7 +19,8 @@ struct cpu_worker {
     uint32_t apic_id;
     unsigned index;
     bool enabled;
-    unsigned ready, failed, runner_ready;
+    unsigned ready, failed, runner_ready, parked;
+    bool asleep; /* parked for a sleep: smp_resume starts it again */
     uint64_t epoch, done, seen;
     cpu_job_fn fn;
     void *context;
@@ -189,6 +191,7 @@ static NORETURN void worker_main(void *argument) {
     pstate_init_ap();
     if (pte_nx) wrmsr(0xC0000080, rdmsr(0xC0000080) | (1ULL << 11));
     write_cr0(read_cr0() | (1ULL << 16)); /* kernel write protection */
+    mtrr_sync(); /* after a sleep the firmware's memory types may be gone: the BSP's again */
     if (have_pat) pat_init_cpu(); /* same PAT as the BSP before any MMIO/WC mapping is touched */
     if (have_pat && rdmsr(0x277) != bsp_pat) {
         __atomic_store_n(&w->failed, 1, __ATOMIC_RELEASE);
@@ -203,6 +206,7 @@ static NORETURN void worker_main(void *argument) {
     __atomic_store_n(&w->ready, 1, __ATOMIC_RELEASE);
     for (;;) {
         cli();
+        cpu_park_check();
         if (cpu_is_runner()) {
             if (!lapic_runner_timer_start()) {
                 __atomic_store_n(&w->failed, 1, __ATOMIC_RELEASE);
@@ -216,6 +220,88 @@ static NORETURN void worker_main(void *argument) {
             continue;
         }
     }
+}
+
+/* ---- sleep ----
+   Before S3 every AP gives its user threads back to the BSP and halts with interrupts off; after
+   it (or after a sleep that failed) each one is started again with INIT-SIPI through the wake
+   page and comes back through worker_main as at boot. */
+static volatile bool parking;
+
+void cpu_park_check(void) {
+    if (!__atomic_load_n(&parking, __ATOMIC_ACQUIRE)) return;
+    struct cpu_worker *w = &workers[cpu_current_index()];
+    cli();
+    lapic_tick_stop();
+    __atomic_store_n(&w->parked, 1, __ATOMIC_RELEASE);
+    for (;;) hlt(); /* only INIT gets it out */
+}
+
+bool smp_suspend(void) {
+    cpu_require_bsp();
+    if (slots == 1) return true;
+    if (!wake_available()) return false;
+    uint64_t flags = irq_save();
+    sched_quiesce_space(0); /* every user thread back to the BSP's queue */
+    __atomic_store_n(&runner_mask, 0, __ATOMIC_RELEASE); /* and none handed out again */
+    __atomic_store_n(&parking, true, __ATOMIC_RELEASE);
+    bool ok = true;
+    for (unsigned i = 1; i < slots; i++) {
+        struct cpu_worker *w = &workers[i];
+        w->asleep = w->enabled;
+        w->enabled = false;
+        if (!w->asleep) continue;
+        __atomic_store_n(&w->parked, 0, __ATOMIC_RELEASE);
+        lapic_send_ipi(w->apic_id, VEC_SMP_WAKE);
+        uint64_t since = rdtsc(), spins = 0;
+        while (!__atomic_load_n(&w->parked, __ATOMIC_ACQUIRE) && !deadline(since, START_TIMEOUT_MS, ++spins)) pause();
+        if (!__atomic_load_n(&w->parked, __ATOMIC_ACQUIRE)) {
+            kprintf("smp: cpu%u did not stop for sleep\n", i);
+            ok = false;
+        }
+    }
+    online = 1;
+    irq_restore(flags);
+    return ok;
+}
+
+void smp_resume(void) {
+    cpu_require_bsp();
+    if (slots == 1) return;
+    __atomic_store_n(&parking, false, __ATOMIC_RELEASE);
+    for (unsigned i = 1; i < slots; i++) {
+        struct cpu_worker *w = &workers[i];
+        if (!w->asleep) continue;
+        w->asleep = false;
+        __atomic_store_n(&w->ready, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&w->failed, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&w->runner_ready, 0, __ATOMIC_RELEASE);
+        /* worker_main as if called: the return address slot below an aligned top */
+        wake_prepare((uint64_t)worker_main, (uint64_t)w->stack + sizeof w->stack - 8, (uint64_t)w);
+        bool sent = lapic_start_ap(w->apic_id, wake_page());
+        uint64_t since = rdtsc(), spins = 0;
+        while (sent && !__atomic_load_n(&w->ready, __ATOMIC_ACQUIRE) && !__atomic_load_n(&w->failed, __ATOMIC_ACQUIRE) &&
+               !deadline(since, START_TIMEOUT_MS, ++spins)) pause();
+        if (!__atomic_load_n(&w->ready, __ATOMIC_ACQUIRE)) {
+            kprintf("smp: cpu%u did not start again after sleep; excluded\n", i);
+            continue;
+        }
+        w->enabled = true;
+        online++;
+        if (cmdline_has("nousermp")) continue;
+        __atomic_fetch_or(&runner_mask, 1u << i, __ATOMIC_RELEASE);
+        cpu_runner_wake_at(i);
+        since = rdtsc(), spins = 0;
+        while (!cpu_runner_ready_at(i) && !__atomic_load_n(&w->failed, __ATOMIC_ACQUIRE) &&
+               !deadline(since, START_TIMEOUT_MS, ++spins)) pause();
+        if (!cpu_runner_ready_at(i)) {
+            __atomic_fetch_and(&runner_mask, ~(1u << i), __ATOMIC_RELEASE);
+            w->enabled = false;
+            online--;
+            kprintf("smp: cpu%u user runner did not start again after sleep\n", i);
+        }
+    }
+    kprintf("smp: %u/%u CPUs online after sleep\n", online, slots);
 }
 
 static NORETURN void ap_entry(struct limine_mp_info *info) {

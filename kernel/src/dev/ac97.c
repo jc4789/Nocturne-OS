@@ -47,6 +47,8 @@ static uint16_t nam, nabm;
 static int16_t *bufs;
 static int lvi;
 static bool dma_live; /* RUN set; issued descriptors may still belong to the device */
+static volatile bool hw_ready; /* the codec and the PCM-out box are set up (not during sleep) */
+static uint32_t bdl_phys;
 static uint64_t submitted_frames;
 
 static void spin_ms(uint64_t ms) { /* early in boot: no sleeping yet */
@@ -58,6 +60,7 @@ static void ac97_fill(void) {
     bool remote = audio_remote();
     bool pending = !remote && audio_pending();
     if (!dma_live && !pending) return; /* no DMA owner, no wake: zero VM exits */
+    if (!hw_ready) return;             /* asleep, or the codec is being set up again */
 
     /* ICH7 PRM 2.2.2-4 permits this aligned read; QEMU nabm_readl also returns
        CIV | LVI<<8 | SR<<16. One snapshot replaces separate CIV/SR reads. */
@@ -122,21 +125,14 @@ static void ac97_fill(void) {
 /* Power change (dev/pm.h): the PCM-out engine stops reading descriptors and buffers. */
 static void ac97_quiesce(void *arg) {
     (void)arg;
+    hw_ready = false;
     outb(nabm + PO_CR, 0);
     dma_live = false;
 }
 
-static struct pm_device ac97_pm = {.name = "ac97", .stage = PM_STAGE_IO, .quiesce = ac97_quiesce};
-
-void ac97_init(void) {
-    static const uint16_t ids[] = {0x2415, 0x2425, 0x2445, 0x2485, 0x24C5, 0x24D5, 0x266E, 0x27DE, 0x7195};
-    struct pci_device *d = NULL;
-    for (size_t i = 0; i < ARRAY_SIZE(ids) && !d; i++) d = pci_find(0x8086, ids[i]);
-    if (!d || !(d->bar[0] & 1) || !(d->bar[1] & 1)) return;
-    nam = (uint16_t)(d->bar[0] & ~3u);
-    nabm = (uint16_t)(d->bar[1] & ~3u);
-    pci_enable_busmaster(d);
-
+/* The codec out of cold reset at 0 dB and 48 kHz, the PCM-out box reset, then the ring (once it
+   exists): at boot and after a sleep, which powered the codec off. */
+static void hw_init(void) {
     outl(nabm + GLOB_CNT, 0x2); /* out of cold reset, interrupts off */
     for (int i = 0; i < 100 && !(inl(nabm + GLOB_STA) & 0x100); i++) spin_ms(1); /* codec ready */
     outw(nam + NAM_RESET, 1);
@@ -149,26 +145,52 @@ void ac97_init(void) {
 
     outb(nabm + PO_CR, CR_RESET);
     for (int i = 0; i < 100 && (inb(nabm + PO_CR) & CR_RESET); i++) spin_ms(1);
+    if (!bdl_phys) return;
+    outl(nabm + PO_BDBAR, bdl_phys);
+    lvi = NBUF - 1; /* no descriptor has been issued; reset PIV will start at 0 */
+    dma_live = false; /* do not start a perpetual silence DMA stream */
+    hw_ready = true;
+}
+
+static void ac97_resume(void *arg) {
+    (void)arg;
+    hw_init();
+}
+
+static struct pm_device ac97_pm = {.name = "ac97", .stage = PM_STAGE_IO, .quiesce = ac97_quiesce,
+                                   .resume = ac97_resume};
+
+void ac97_init(void) {
+    static const uint16_t ids[] = {0x2415, 0x2425, 0x2445, 0x2485, 0x24C5, 0x24D5, 0x266E, 0x27DE, 0x7195};
+    struct pci_device *d = NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(ids) && !d; i++) d = pci_find(0x8086, ids[i]);
+    if (!d || !(d->bar[0] & 1) || !(d->bar[1] & 1)) return;
+    nam = (uint16_t)(d->bar[0] & ~3u);
+    nabm = (uint16_t)(d->bar[1] & ~3u);
+    pci_enable_busmaster(d);
+    hw_init();
 
     /* descriptors and buffers, below 4 GiB for the 32-bit addresses */
-    uint64_t bdl_phys = pmm_alloc_zeroed();
+    uint64_t bdl = pmm_alloc_zeroed();
     uint64_t pages = ALIGN_UP(NBUF * BUF_FRAMES * AUDIO_FRAME, PAGE_SIZE) / PAGE_SIZE;
     uint64_t buf_phys = pmm_alloc_contig(pages);
-    if (!bdl_phys || !buf_phys || buf_phys + pages * PAGE_SIZE > 0x100000000ULL || bdl_phys >= 0x100000000ULL) {
+    if (!bdl || !buf_phys || buf_phys + pages * PAGE_SIZE > 0x100000000ULL || bdl >= 0x100000000ULL) {
         kprintf("audio: AC'97 found, but no memory for its buffers\n");
         return;
     }
-    volatile struct bd *bdl = phys_to_virt(bdl_phys);
+    volatile struct bd *bdl_ring = phys_to_virt(bdl);
     bufs = phys_to_virt(buf_phys);
     memset(bufs, 0, pages * PAGE_SIZE);
     for (int i = 0; i < NBUF; i++) {
-        bdl[i].addr = (uint32_t)(buf_phys + (uint64_t)i * BUF_FRAMES * AUDIO_FRAME);
-        bdl[i].samples = BUF_FRAMES * 2;
-        bdl[i].flags = 0;
+        bdl_ring[i].addr = (uint32_t)(buf_phys + (uint64_t)i * BUF_FRAMES * AUDIO_FRAME);
+        bdl_ring[i].samples = BUF_FRAMES * 2;
+        bdl_ring[i].flags = 0;
     }
-    outl(nabm + PO_BDBAR, (uint32_t)bdl_phys);
+    bdl_phys = (uint32_t)bdl;
+    outl(nabm + PO_BDBAR, bdl_phys);
     lvi = NBUF - 1; /* no descriptor has been issued; reset PIV will start at 0 */
     dma_live = false; /* do not start a perpetual silence DMA stream at boot */
+    hw_ready = true;
     audio_set_card("AC'97", ac97_fill);
     pm_register(&ac97_pm);
     kprintf("audio: AC'97 (%04x) at ports %#x/%#x, 48 kHz stereo\n", d->device, nam, nabm);

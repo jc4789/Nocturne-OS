@@ -126,6 +126,22 @@ void pic_init(void) {
     outb(0xA1, 0xFF);
 }
 
+/* The ELCR (ports 0x4D0/0x4D1) says which lines are level-triggered (PCI INTx, the SCI); the
+   firmware sets it at power on, and a machine woken from S3 may come back with it cleared. */
+uint32_t pic_state(void) {
+    return inb(0x21) | (uint32_t)inb(0xA1) << 8 | (uint32_t)inb(0x4D0) << 16 | (uint32_t)inb(0x4D1) << 24;
+}
+
+void pic_restore(uint32_t state) {
+    pic_init();
+    if ((state >> 16) != 0xFFFF) { /* 0xFFFF: nothing answers there */
+        outb(0x4D0, (uint8_t)(state >> 16));
+        outb(0x4D1, (uint8_t)(state >> 24));
+    }
+    outb(0x21, (uint8_t)state);
+    outb(0xA1, (uint8_t)(state >> 8));
+}
+
 void pic_unmask(int irq) {
     uint16_t port = irq < 8 ? 0x21 : 0xA1;
     outb(port, inb(port) & ~(1 << (irq & 7)));

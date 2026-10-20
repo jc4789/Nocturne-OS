@@ -15,6 +15,7 @@
 #include "mm/heap.h"
 #include "sys/sched.h"
 #include "arch/pstate.h"
+#include "arch/wake.h"
 
 __attribute__((used, section(".limine_requests_start")))
 static volatile uint64_t requests_start[] = LIMINE_REQUESTS_START_MARKER;
@@ -83,6 +84,7 @@ void kmain(void) {
     struct limine_memmap_response *mm = mm_req.response;
     pmm_init(mm);
     vmm_init(mm, ka_req.response);
+    wake_init(); /* the real-mode page for waking from sleep and restarting the APs */
 
     if (fb_req.response && fb_req.response->framebuffer_count > 0) {
         fb_init(fb_req.response->framebuffers[0]);

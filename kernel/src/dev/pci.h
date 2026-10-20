@@ -50,3 +50,7 @@ bool pci_msix_route(struct pci_device *d, unsigned entry, uint8_t vector, uint32
 void pci_msix_mask(struct pci_device *d, unsigned entry, bool masked);
 void pci_msix_function_mask(struct pci_device *d, bool masked);
 void pci_msi_disable(struct pci_device *d); /* turns off both MSI and MSI-X */
+/* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (BSP,
+   before the drivers resume). pci_suspend allocates and so runs with interrupts on. */
+void pci_suspend(void);
+void pci_resume(void);
