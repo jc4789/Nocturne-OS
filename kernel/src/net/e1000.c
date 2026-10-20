@@ -195,8 +195,10 @@ static bool e1000_quiesce(void *arg) {
     wr(REG_IMC, 0xFFFFFFFF);
     wr(REG_RCTL, 0);
     wr(REG_TCTL, 0);
-    /* the enables read back clear: neither engine fetches another descriptor */
-    return !(rd(REG_RCTL) & (1u << 1)) && !(rd(REG_TCTL) & (1u << 1));
+    /* The 8254x has no bit that says its DMA went idle (EN reads back what was written): neither
+       engine fetches another descriptor, and the one in flight lands within this wait. */
+    for (int i = 0; i < 100; i++) io_wait(); /* ~1 us each */
+    return true;
 }
 
 static uint64_t rx_ring_phys, tx_ring_phys;

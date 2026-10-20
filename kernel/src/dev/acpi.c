@@ -416,7 +416,9 @@ uacpi_status uacpi_kernel_wait_for_semaphore(uacpi_handle h, uacpi_u16 timeout) 
             if (timeout == 0xFFFF) wq_wait(&s->wq);
             else wq_wait_timeout(&s->wq, end - now);
         } else if (frozen && (timeout != 0xFFFF || now - start < FROZEN_WAIT_MS)) {
-            sti(); /* only an interrupt can give the unit now */
+            /* only an interrupt can give the unit now, and only where the caller allows them: with
+               the devices stopped (machine_sleep's interrupts-off part) none is let in */
+            if (f & (1u << 9)) sti();
             pause();
             cli();
         } else {

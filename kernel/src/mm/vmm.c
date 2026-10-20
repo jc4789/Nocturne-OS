@@ -21,7 +21,11 @@ static unsigned nram;
 static void ram_add(uint64_t base, uint64_t end) {
     if (nram && ram[nram - 1].end == base) ram[nram - 1].end = end;
     else if (nram < ARRAY_SIZE(ram)) ram[nram++] = (struct ram_range){base, end};
-    else kprintf("vmm: more than %u RAM ranges, [%p, %p) not kept\n", (unsigned)ARRAY_SIZE(ram), (void *)base, (void *)end);
+    else {
+        static bool told; /* one line, not one per range left out */
+        if (!told) kprintf("vmm: more than %u RAM ranges, from %p on not kept\n", (unsigned)ARRAY_SIZE(ram), (void *)base);
+        told = true;
+    }
 }
 
 static bool is_ram(uint64_t page) {

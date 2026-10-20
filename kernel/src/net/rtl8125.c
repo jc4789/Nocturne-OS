@@ -402,13 +402,13 @@ static void rings_start(void) {
 static bool rtl_resume(void *arg) {
     (void)arg;
     hw_init();
-    uint8_t cmd = rd8(CMD); /* out of reset, both engines on (hw_init's last write) */
-    bool back = !(cmd & CMD_RESET) && (cmd & (CMD_TX_EN | CMD_RX_EN)) == (CMD_TX_EN | CMD_RX_EN);
     cfg_unlock();
     wr32(IDR0, nif.mac[0] | nif.mac[1] << 8 | nif.mac[2] << 16 | (uint32_t)nif.mac[3] << 24);
     wr16(IDR0 + 4, (uint16_t)(nif.mac[4] | nif.mac[5] << 8));
     cfg_lock();
     rings_start();
+    uint8_t cmd = rd8(CMD); /* out of reset, both engines on (rings_start's last write) */
+    bool back = !(cmd & CMD_RESET) && (cmd & (CMD_TX_EN | CMD_RX_EN)) == (CMD_TX_EN | CMD_RX_EN);
     link = false; /* check_link reports it again once autonegotiation is done */
     wr32(ISR, 0xFFFFFFFF);
     wr32(IMR_SET, INT_MASK);
