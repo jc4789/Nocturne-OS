@@ -3,8 +3,13 @@
    (its function, the functions beside it and the bridges above it), writes its own, maps BARs as
    shared objects (syscall.c) and waits for its message-signalled interrupts on the handle.
    The kernel keeps what decides where memory and interrupts go: BAR registers and the MSI and
-   MSI-X capabilities are written here only. The last handle's close stops the function: no
-   interrupts, no bus mastering, before the app's DMA memory can be freed with its mappings. */
+   MSI-X capabilities are written here only. The last handle's close stops the function: every
+   mapping of its BARs, in any process, loses the device pages; then no interrupts and no bus
+   mastering, and the kernel waits until the function has no request in flight before the app's
+   DMA memory can return to the allocator. A function that does not report its requests done in
+   time keeps its DMA pages out of use for good (syscall.c asks pci_user_claim_dma_reusable).
+   BAR and DMA objects hold the claim record, so a later claim of the same function is a new
+   record and the old objects stay dead. */
 #include "kernel.h"
 #include "abi.h"
 #include "arch/cpu.h"
@@ -16,6 +21,7 @@
 #include "mm/heap.h"
 #include "sys/proc.h"
 #include "sys/sched.h"
+#include "sys/syscall.h"
 
 #define CLAIM_VECTORS 32 /* one pending bit each */
 
@@ -28,8 +34,16 @@ struct pci_claim {
     /* BAR sizes, probed once at claim: the probe switches memory decoding off for a moment, which
        would make a running function's registers read as all-ones (a GPU gone from the bus). */
     uint64_t bar_size[6];
+    unsigned refs;   /* the vnode and every BAR or DMA object made through it */
+    bool released;   /* the last handle closed: BAR objects are revoked, the function stopped */
+    bool dma_unsafe; /* stopping it was not confirmed: its DMA pages are never reused */
 };
 static struct pci_claim *claim_of_vector[256];
+
+static void claim_drop(struct pci_claim *c) {
+    ASSERT(c->refs);
+    if (--c->refs == 0) kfree(c);
+}
 
 static void claim_isr(struct regs *r) {
     struct pci_claim *c = claim_of_vector[r->vector & 0xFF];
@@ -54,21 +68,54 @@ static bool claim_can_read(struct vnode *v, struct file *f) {
     (void)f;
     return ((struct pci_claim *)v->priv)->pending != 0;
 }
+/* After bus mastering is off the function starts no request, but some may still be in flight.
+   A PCI Express function says so in Device Status (Transactions Pending), and the config read
+   that sees it clear also follows any write it posted before (a completion does not pass a
+   posted write). Conventional PCI has no such bit: the read and a short pause stand for it.
+   Busy waiting with interrupts possibly off, so by the TSC, bounded: this runs once, when a
+   driver ends. */
+#define QUIESCE_MS 200
+static bool function_quiet(struct pci_device *d) {
+    uint64_t since = rdtsc(), spins = 0;
+    for (;;) {
+        if ((pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) == 0xFFFF) return true; /* gone from the bus */
+        if (!d->pcie_cap) {
+            if (tsc_hz ? rdtsc() - since >= tsc_hz / 1000 : ++spins >= 100000) return true;
+        } else if (!(pci_read16(d->bus, d->dev, d->func, d->pcie_cap + 0x0A) & 0x20)) return true;
+        if (tsc_hz ? rdtsc() - since > tsc_hz / 1000 * QUIESCE_MS : ++spins > 20000000) return false;
+        pause();
+    }
+}
+
 static void claim_release(struct vnode *v) {
     struct pci_claim *c = v->priv;
-    interrupts_off(c);
     struct pci_device *d = c->d;
-    uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 4);
-    pci_write32(d->bus, d->dev, d->func, 4, (cmd & 0xFFFF) & ~0x4u); /* bus mastering off */
+    c->released = true;
+    shared_revoke_claim(c); /* no process reaches the registers any more */
+    interrupts_off(c);
+    pci_write16(d->bus, d->dev, d->func, 4, pci_read16(d->bus, d->dev, d->func, 4) & ~0x4u); /* bus mastering off */
+    c->dma_unsafe = !function_quiet(d);
+    if (c->dma_unsafe)
+        kprintf("pci: %02x:%02x.%u still has requests in flight; its DMA memory stays out of use\n",
+                d->bus, d->dev, d->func);
     d->claimed = false;
     kprintf("pci: %02x:%02x.%u released\n", d->bus, d->dev, d->func);
-    kfree(c);
     kfree(v);
+    claim_drop(c);
 }
 static struct vnode_ops claim_ops = {.can_read = claim_can_read, .release = claim_release};
 
 bool pci_user_is_claim(struct file *f) { return f && f->vn->ops == &claim_ops; }
 static struct pci_claim *claim_of(struct file *f) { return pci_user_is_claim(f) ? f->vn->priv : NULL; }
+
+struct pci_claim *pci_user_hold(struct file *f) {
+    struct pci_claim *c = claim_of(f);
+    if (c) c->refs++;
+    return c;
+}
+void pci_user_drop(struct pci_claim *c) { if (c) claim_drop(c); }
+bool pci_user_revoked(const struct pci_claim *c) { return c && c->released; }
+bool pci_user_dma_reusable(const struct pci_claim *c) { return !c || !c->dma_unsafe; }
 
 static struct pci_device *find_function(uint8_t bus, uint8_t dev, uint8_t func) {
     for (int i = 0; i < pci_count(); i++) {
@@ -110,6 +157,7 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     v->unlinked = true; /* the claim ends when its last handle closes */
     c->d = d;
     c->v = v;
+    c->refs = 1;
     for (unsigned i = 0; i < 6; i++) {
         c->bar_size[i] = pci_bar_size(d, i);
         if (c->bar_size[i] && !(d->bar[i] & 1) && ((d->bar[i] >> 1) & 3) == 2) i++; /* 64-bit: the upper half is no BAR */
@@ -215,11 +263,7 @@ int64_t pci_user_config_write(struct file *f, uint32_t offset, uint32_t width, u
     if (kernel_register(d, offset, width)) return -N_ERR_DENIED;
     if (width == 4) pci_write32(d->bus, d->dev, d->func, offset, value);
     else if (width == 2) pci_write16(d->bus, d->dev, d->func, offset, value);
-    else {
-        uint32_t at = offset & ~1u, shift = (offset & 1) * 8;
-        uint16_t old = pci_read16(d->bus, d->dev, d->func, at);
-        pci_write16(d->bus, d->dev, d->func, at, (old & ~(0xFFu << shift)) | (value & 0xFF) << shift);
-    }
+    else pci_write8(d->bus, d->dev, d->func, offset, value);
     return 0;
 }
 

@@ -49,6 +49,9 @@ uint64_t vmm_get_leaf(uint64_t pml4, uint64_t va); /* the raw 4 KiB leaf, presen
 void *vmm_map_mmio(uint64_t phys, uint64_t size);
 /* Any physical range: RAM through the write-back direct map, everything else as vmm_map_mmio. */
 void *vmm_map_phys(uint64_t phys, uint64_t size);
+/* The direct map's memory type of RAM pages (frames, or base on when frames is NULL): the leaf's
+   PWT/PCD/PAT bits, 0 for write-back. False when splitting large pages found no memory. */
+bool vmm_direct_type(const uint64_t *frames, uint64_t base, size_t pages, uint64_t type);
 uint64_t vmm_new_space(void);
 void vmm_free_space(uint64_t pml4);
 uint64_t vmm_user_pages(uint64_t pml4); /* present, non-shared lower-half 4K leaves */

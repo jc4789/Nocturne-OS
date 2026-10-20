@@ -125,7 +125,7 @@ void nnrm_chan_destroy(struct nnrm_chan *chan);
  * space.  The caller serialises calls on one channel. */
 uint32_t nnrm_chan_submit(struct nnrm_chan *chan, const struct nnrm_gp *gps, uint32_t count);
 
-/* true once the channel has hit an error (RM reset it) */
+/* true once the channel has hit an error (RM reset it) or /bin/nvrm has gone */
 bool nnrm_chan_has_error(struct nnrm_chan *chan);
 
 /* ---- results ---- */

@@ -144,6 +144,9 @@ struct nnrm {
    mtx_t usermode_lock;
    uint32_t usermode_object;
    volatile uint8_t *usermode_map;
+
+   /* /bin/nvrm has gone: nothing the GPU was doing can be waited for any more */
+   atomic_bool daemon_lost;
 };
 
 #define OS32_ATTR(field, value) DRF_DEF(OS32, _ATTR, field, value)
@@ -241,14 +244,18 @@ popcount32(uint32_t v)
    return (uint32_t)__builtin_popcount(v);
 }
 
-static void
+/* The shader configuration NVK sizes its shader memory from: it has to be
+ * complete, a partial count would under-size it. */
+static uint32_t
 query_gr(struct nnrm *n)
 {
    NV2080_CTRL_GR_GET_GPC_MASK_PARAMS gpc = {0};
-   if (rm_control(n, n->subdevice, NV2080_CTRL_CMD_GR_GET_GPC_MASK, &gpc, sizeof(gpc)) != NV_OK)
-      return;
-
-   n->info.gpc_count = (uint8_t)popcount32(gpc.gpcMask);
+   uint32_t st = rm_control(n, n->subdevice, NV2080_CTRL_CMD_GR_GET_GPC_MASK,
+                            &gpc, sizeof(gpc));
+   if (st != NV_OK)
+      return st;
+   if (gpc.gpcMask == 0)
+      return NV_ERR_INVALID_STATE;
 
    uint32_t tpcs = 0;
    for (uint32_t id = 0; id < 32; id++) {
@@ -256,11 +263,18 @@ query_gr(struct nnrm *n)
          continue;
       NV2080_CTRL_GR_GET_TPC_MASK_PARAMS tpc = {0};
       tpc.gpcId = id;
-      if (rm_control(n, n->subdevice, NV2080_CTRL_CMD_GR_GET_TPC_MASK,
-                     &tpc, sizeof(tpc)) == NV_OK)
-         tpcs += popcount32(tpc.tpcMask);
+      st = rm_control(n, n->subdevice, NV2080_CTRL_CMD_GR_GET_TPC_MASK,
+                      &tpc, sizeof(tpc));
+      if (st != NV_OK)
+         return st;
+      tpcs += popcount32(tpc.tpcMask);
    }
+   if (tpcs == 0)
+      return NV_ERR_INVALID_STATE;
+
+   n->info.gpc_count = (uint8_t)popcount32(gpc.gpcMask);
    n->info.tpc_count = (uint16_t)tpcs;
+   return NV_OK;
 }
 
 static void
@@ -422,7 +436,9 @@ query_gpu(struct nnrm *n, uint32_t gpu_index)
                   &partner, sizeof(partner)) == NV_OK && partner.numPartners > 0)
       n->grce_engine_type = partner.partnerList[0];
 
-   query_gr(n);
+   st = query_gr(n);
+   if (st != NV_OK)
+      return st;
    query_fb(n);
    return NV_OK;
 }
@@ -622,6 +638,9 @@ struct nnrm_virt {
    uint64_t addr, size_B;
    bool sparse;
 
+   /* Guards pieces/count/cap and makes "look up, change, tell RM" one step:
+    * queues sharing a sparse buffer bind and unbind through here at once. */
+   mtx_t lock;
    struct virt_piece *pieces; /* sorted by off, disjoint */
    uint32_t count, cap;
 };
@@ -667,6 +686,7 @@ nnrm_virt_reserve(struct nnrm *n, uint64_t addr, uint64_t size_B,
    v->addr = addr;
    v->size_B = size_B;
    v->sparse = sparse;
+   mtx_init(&v->lock, mtx_plain);
    *out = v;
    return NV_OK;
 }
@@ -678,26 +698,38 @@ nnrm_virt_release(struct nnrm_virt *v)
       return NV_OK;
    /* RM unmaps what is still mapped when the virtual object goes */
    rm_free(v->rm, v->rm->device, v->handle);
+   mtx_destroy(&v->lock);
    free(v->pieces);
    free(v);
    return NV_OK;
 }
 
+/* Make room for `extra` more pieces.  Done before RM is told anything, so a
+ * mapping that RM accepted can always be recorded. */
 static uint32_t
+piece_reserve(struct nnrm_virt *v, uint32_t extra)
+{
+   if (v->count + extra <= v->cap)
+      return NV_OK;
+
+   uint32_t cap = v->cap ? v->cap : 8;
+   while (cap < v->count + extra)
+      cap *= 2;
+   struct virt_piece *grown = realloc(v->pieces, cap * sizeof(*grown));
+   if (grown == NULL)
+      return NV_ERR_NO_MEMORY;
+   v->pieces = grown;
+   v->cap = cap;
+   return NV_OK;
+}
+
+/* Cannot fail: piece_reserve() has made the room */
+static void
 piece_insert(struct nnrm_virt *v, uint32_t at, struct virt_piece piece)
 {
-   if (v->count == v->cap) {
-      uint32_t cap = v->cap ? v->cap * 2 : 8;
-      struct virt_piece *grown = realloc(v->pieces, cap * sizeof(*grown));
-      if (grown == NULL)
-         return NV_ERR_NO_MEMORY;
-      v->pieces = grown;
-      v->cap = cap;
-   }
    memmove(&v->pieces[at + 1], &v->pieces[at], (v->count - at) * sizeof(*v->pieces));
    v->pieces[at] = piece;
    v->count++;
-   return NV_OK;
 }
 
 static uint32_t
@@ -718,11 +750,14 @@ rm_unmap_dma(struct nnrm_virt *v, uint64_t off, uint64_t len, uint32_t mem_handl
    return st == NV_OK ? p.status : st;
 }
 
-uint32_t
-nnrm_virt_unmap(struct nnrm_virt *v, uint64_t off, uint64_t len)
+/* v->lock held.  One contiguous cut splits at most one piece in two. */
+static uint32_t
+virt_unmap_locked(struct nnrm_virt *v, uint64_t off, uint64_t len)
 {
    const uint64_t end = off + len;
-   uint32_t result = NV_OK;
+   uint32_t result = piece_reserve(v, 1);
+   if (result != NV_OK)
+      return result; /* nothing was unmapped */
 
    for (uint32_t i = 0; i < v->count;) {
       struct virt_piece piece = v->pieces[i];
@@ -755,8 +790,7 @@ nnrm_virt_unmap(struct nnrm_virt *v, uint64_t off, uint64_t len)
       if (keep_lo && keep_hi) {
          v->pieces[i].len = cut_lo - piece.off;
          struct virt_piece hi = {cut_hi, piece_end - cut_hi, piece.mem_handle};
-         if (piece_insert(v, i + 1, hi) != NV_OK)
-            result = NV_ERR_NO_MEMORY; /* the right part stays mapped but untracked */
+         piece_insert(v, i + 1, hi);
          i += 2;
       } else if (keep_lo) {
          v->pieces[i].len = cut_lo - piece.off;
@@ -775,13 +809,28 @@ nnrm_virt_unmap(struct nnrm_virt *v, uint64_t off, uint64_t len)
    return result;
 }
 
+uint32_t
+nnrm_virt_unmap(struct nnrm_virt *v, uint64_t off, uint64_t len)
+{
+   mtx_lock(&v->lock);
+   uint32_t st = virt_unmap_locked(v, off, len);
+   mtx_unlock(&v->lock);
+   return st;
+}
+
 static uint32_t
-virt_map(struct nnrm_virt *v, uint64_t va_off, struct nnrm_mem *mem,
-         uint64_t mem_off, uint64_t range, uint8_t pte_kind, uint32_t extra_flags)
+virt_map_locked(struct nnrm_virt *v, uint64_t va_off, struct nnrm_mem *mem,
+                uint64_t mem_off, uint64_t range, uint8_t pte_kind, uint32_t extra_flags)
 {
    struct nnrm *n = v->rm;
 
-   uint32_t st = nnrm_virt_unmap(v, va_off, range);
+   /* The unmap may split a piece and the new mapping adds one: room for both
+    * up front, so no record can fail after RM has acted. */
+   uint32_t st = piece_reserve(v, 2);
+   if (st != NV_OK)
+      return st;
+
+   st = virt_unmap_locked(v, va_off, range);
    if (st != NV_OK)
       return st;
 
@@ -812,7 +861,18 @@ virt_map(struct nnrm_virt *v, uint64_t va_off, struct nnrm_mem *mem,
    while (at < v->count && v->pieces[at].off < va_off)
       at++;
    struct virt_piece piece = {va_off, range, mem->handle};
-   return piece_insert(v, at, piece);
+   piece_insert(v, at, piece);
+   return NV_OK;
+}
+
+static uint32_t
+virt_map(struct nnrm_virt *v, uint64_t va_off, struct nnrm_mem *mem,
+         uint64_t mem_off, uint64_t range, uint8_t pte_kind, uint32_t extra_flags)
+{
+   mtx_lock(&v->lock);
+   uint32_t st = virt_map_locked(v, va_off, mem, mem_off, range, pte_kind, extra_flags);
+   mtx_unlock(&v->lock);
+   return st;
 }
 
 uint32_t
@@ -1140,5 +1200,17 @@ nnrm_chan_has_error(struct nnrm_chan *c)
    const volatile NvNotification *note =
       (const volatile NvNotification *)c->notifier.map;
    const volatile NvNotification *err = &note[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR];
-   return err->status != 0 || err->info32 != 0;
+   if (err->status != 0 || err->info32 != 0)
+      return true;
+
+   /* The daemon dying takes the RM client, and with it every channel, but
+    * leaves no notifier entry behind: ask the connection too. */
+   struct nnrm *n = c->rm;
+   if (atomic_load(&n->daemon_lost))
+      return true;
+   if (!nvrm_alive(n->rm)) {
+      atomic_store(&n->daemon_lost, true);
+      return true;
+   }
+   return false;
 }

@@ -56,6 +56,16 @@ static void reply(struct client *c, struct nvrm_message *head, const void *args,
     n_channel_send(c->channel, &out, sizeof out.head + out.head.size, attach);
 }
 
+/* Whether RM treats the client's requests as an administrator's. A channel carries no identity
+   of its peer, so no connection has a basis for it: every client is unprivileged, like an
+   ordinary user of RM's control device, which is all graphics clients (NVK) need. nvrm's own
+   threads (interrupts, work, timers) are the only administrators. A connection that can prove
+   where it comes from would be granted here, per connection. */
+static bool client_is_admin(const struct client *c) {
+    (void)c;
+    return false;
+}
+
 /* The client's first message: its arena, mapped here too. */
 static n_result hello(struct client *c, const struct nvrm_message *head, n_handle arena) {
     if (c->file) return -N_ERR_INVALID;
@@ -66,7 +76,7 @@ static n_result hello(struct client *c, const struct nvrm_message *head, n_handl
     c->arena_handle = arena;
     c->arena_address = head->arena_address;
     c->arena_bytes = (size_t)head->arena_bytes;
-    c->file = nvrm_rm_file_open();
+    c->file = nvrm_rm_file_open(client_is_admin(c));
     return c->file ? 0 : -N_ERR_NO_MEMORY;
 }
 
@@ -124,10 +134,11 @@ n_result nvrm_serve(void) {
     n_events_watch(events, listener, N_EVENT_RECEIVABLE, LISTENER_TOKEN);
     printf("nvrm: serving clients on \"%s\"\n", NVRM_CHANNEL);
     fflush(stdout);
+    n_result ended = 0;
     for (;;) {
         struct n_event ev[16];
         n_result n = n_events_wait(events, ev, 16, -1);
-        if (n < 0) return n;
+        if (n < 0) { ended = n; break; }
         for (n_result i = 0; i < n; i++) {
             if (ev[i].token == LISTENER_TOKEN) {
                 n_handle ch;
@@ -150,4 +161,9 @@ n_result nvrm_serve(void) {
             else if (ev[i].events & N_EVENT_CLOSED) client_end(events, c);
         }
     }
+    /* RM is about to shut down: every client frees what it still holds in RM first. */
+    while (clients) client_end(events, clients);
+    n_handle_close(events);
+    n_handle_close(listener);
+    return ended;
 }

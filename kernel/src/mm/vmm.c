@@ -468,6 +468,45 @@ void *vmm_map_mmio(uint64_t phys, uint64_t size) {
     return phys_to_virt(phys);
 }
 
+/* RAM a device reaches uncached or write-combining: x86 wants every mapping of a page to agree
+   on its memory type, so the direct map takes the type the user mappings get. type: the leaf's
+   PWT/PCD/PAT bits, 0 for write-back. The pages are frames[i], or base + i pages when frames is
+   NULL. The 2 MiB pages around them are split (false, and nothing changed, when there is no
+   memory for that); the run is shot down once; then lines cached while it was write-back are
+   flushed out of every cache (clflush works whatever the type of the page). BSP. */
+bool vmm_direct_type(const uint64_t *frames, uint64_t base, size_t pages, uint64_t type) {
+    uint64_t f = irq_save(), splits = 0, last = ~0ull;
+    for (size_t i = 0; i < pages; i++) {
+        uint64_t va = hhdm_offset + (frames ? frames[i] : base + i * PAGE_SIZE);
+        bool huge = false;
+        if (walk(kernel_pml4, va, &huge) && huge && ALIGN_DOWN(va, 1ULL << 21) != last) {
+            splits++;
+            last = ALIGN_DOWN(va, 1ULL << 21);
+        }
+    }
+    if (splits && pmm_free_pages() < splits + 16) { irq_restore(f); return false; }
+    for (size_t i = 0; i < pages; i++) {
+        uint64_t va = hhdm_offset + (frames ? frames[i] : base + i * PAGE_SIZE);
+        bool stale = false;
+        uint64_t *l3 = next_level(tbl(kernel_pml4), (va >> 39) & 511, false, false, 4, &stale);
+        uint64_t *l2 = l3 ? next_level(l3, (va >> 30) & 511, false, false, 3, &stale) : NULL;
+        uint64_t *l1 = l2 ? next_level(l2, (va >> 21) & 511, false, false, 2, &stale) : NULL;
+        if (!l1 || !(l1[(va >> 12) & 511] & PTE_P)) continue;
+        uint64_t *leaf = &l1[(va >> 12) & 511];
+        *leaf = (*leaf & ~(PTE_PWT | PTE_PCD | PTE_PAT4K)) | type;
+    }
+    /* scattered frames: a whole flush (a range above TLB_RANGE_MAX) */
+    if (pages) tlb_shootdown(kernel_pml4, hhdm_offset + (frames ? 0 : base), frames ? TLB_RANGE_MAX + 1 : pages);
+    if (type)
+        for (size_t i = 0; i < pages; i++) {
+            uint8_t *p = phys_to_virt(frames ? frames[i] : base + i * PAGE_SIZE);
+            for (size_t at = 0; at < PAGE_SIZE; at += 64) __asm__ volatile("clflush (%0)" ::"r"(p + at) : "memory");
+        }
+    __asm__ volatile("mfence" ::: "memory");
+    irq_restore(f);
+    return true;
+}
+
 /* Page by page: a request may run across several ranges, and only what lies in none of them
    (device memory) becomes uncached. RAM stays write-back for everyone else who uses it. */
 void *vmm_map_phys(uint64_t phys, uint64_t size) {

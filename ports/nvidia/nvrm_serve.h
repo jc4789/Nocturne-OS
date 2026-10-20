@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "nocturne.h"
@@ -7,7 +8,7 @@
 
 /* From the OS layer. A file is one client's RM state (RM's per-open-file private data); every
    request runs on RM's control device, as RM expects of an API client. */
-void *nvrm_rm_file_open(void);
+void *nvrm_rm_file_open(bool admin); /* admin: RM treats the client's requests as an administrator's */
 void nvrm_rm_file_close(void *file); /* frees everything the client still holds in RM */
 uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size); /* NV_STATUS */
 /* After a successful NV_ESC_RM_MAP_MEMORY: what RM recorded for the mapping, as a new shared

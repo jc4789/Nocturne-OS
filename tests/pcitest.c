@@ -151,10 +151,24 @@ int main(void) {
             CHECK(!memcmp(ram, ram + 4096, 4096), "the copy came back intact");
         }
     }
+    /* One memory type per page: the write-back mapping above fixes this object's type while it
+       stays, and once it is gone an uncached view sets the type for the whole object. */
+    CHECK(mem < 0 || n_shared_view(mem, 4096, 4096, N_CACHE_UNCACHED) == -N_ERR_DENIED,
+          "a mapped write-back dma object keeps its type");
+    if (ram) n_memory_release(ram, 8192);
+    ram = NULL;
     n_handle low = mem >= 0 ? n_shared_view(mem, 4096, 4096, N_CACHE_UNCACHED) : -1;
     CHECK(low >= 0, "uncached view of dma memory: %s", n_result_text(low));
+    CHECK(mem < 0 || n_shared_view(mem, 0, 4096, N_CACHE_WRITE_BACK) == -N_ERR_DENIED,
+          "no write-back view of uncached dma memory");
     uint64_t through = 0;
     CHECK(low >= 0 && n_dma_addresses(low, 0, &through, 1) == 1 && through == pages[1], "addresses through a view");
+    volatile uint8_t *uc = low >= 0 ? n_shared_map(low, 4096, N_MEMORY_READ_WRITE) : NULL;
+    CHECK(uc != NULL, "map the uncached view");
+    if (uc) {
+        CHECK(uc[0] == (uint8_t)3 || !regs || vectors < 1, "the uncached view sees the copy: %u", uc[0]);
+        n_memory_release((void *)uc, 4096);
+    }
     n_handle plain = n_shared_create(4096);
     CHECK(n_shared_view(plain, 0, 4096, N_CACHE_UNCACHED) == -N_ERR_DENIED, "ordinary memory keeps its caching");
     CHECK(n_dma_addresses(plain, 0, &through, 1) == -N_ERR_WRONG_KIND, "no addresses of ordinary memory");
@@ -163,9 +177,14 @@ int main(void) {
     if (ram) n_memory_release(ram, 8192);
     if (mem >= 0) n_handle_close(mem);
 
-    if (regs) n_memory_release((void *)regs, 1 << 20);
+    /* The BAR mapping outlives the claim: when the last handle goes, the device pages leave and the
+       range reads all-ones, as a function gone from the bus. */
     if (bar >= 0) n_handle_close(bar);
     n_handle_close(pci);
+    if (regs) {
+        CHECK(rd32(EDU_IDENT) == 0xFFFFFFFFu, "the BAR mapping is revoked with the claim: %08x", rd32(EDU_IDENT));
+        n_memory_release((void *)regs, 1 << 20);
+    }
     n_handle back = n_pci_claim(e->bus, e->dev, e->func);
     CHECK(back >= 0, "claim after release: %s", n_result_text(back));
     if (back >= 0) {

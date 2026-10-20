@@ -77,14 +77,14 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C7 | gallium nvc0 は chipset 0x190（Ada）を受け付ける | 受理（一覧に有る）／未確定（実際に描けるか） | nvc0_screen.c の chipset の switch |
 | C8 | Nocturne カーネルは ECAM、64 ビット BAR、MSI／MSI-X、連続ページ、WC の PAT を持つ | 受理 | pci.h、pmm.h、pat.h |
 | C9 | ユーザー空間の RM でも性能上の問題は小さい | 未確定 | 投入はクライアント直、RM は確保と制御だけ、という設計上の推論。実機で測る |
-| C10 | RAM を WB の直接写像と WC／UC の写しで二重に持っても実害は小さい | 未確定 | x86 は型の混在を避けるよう求める。RM が非キャッシュを求めるメモリだけに限る。問題が出たら直接写像の属性も変える |
+| C10 | RAM を WB の直接写像と WC／UC の写しで二重に持っても実害は小さい | 却下 → 修理済み | x86 は一つのページに二つの型を許さない。DMA の RAM は型を一つだけ持つ：最初の UC／WC のビューで直接写像（`vmm_direct_type`、2 MiB ページは分割、TLB 撃墜と clflush）も同じ型へ変え、別の型のビューと、写像が残る間の型変更は拒む。解放時に WB へ戻す |
 | C11 | RM の `arch/nvalloc/unix` は NVIDIA 自身の OS 中立層（MIT）で、使っても UNIX 互換を Nocturne に足すことにはならない | 受理 | Nocturne 側へ POSIX の API を足さず、RM の OS 層を Nocturne の API で実装する |
 | C12 | RTX 4070 は ReBAR 有効なら BAR1 が 16GB になり得る。BAR 全体を 4K で一度に写さない | 受理 | 16GB÷4K＝400 万 PTE。view で必要な部分だけ写す |
-| C13 | アプリ終了時は fd をすべて閉じてから共有マッピングを外すので、PCI の権利（fd 3）が DMA メモリの解放より先に終わり、バスマスターが先に止まる | 受理（順序）／未確定（nvrm が権利のハンドルを複製した場合） | sched.c の終了処理（fd を昇順に閉じた後 `sys_shared_cleanup`）。nvrm は権利を複製しない規約にする |
+| C13 | アプリ終了時は fd をすべて閉じてから共有マッピングを外すので、PCI の権利（fd 3）が DMA メモリの解放より先に終わり、バスマスターが先に止まる | 却下（順序だけでは足りない） → 修理済み | バスマスターを消しても発行済みの DMA は残る。クレームの解放は BAR の写像を全プロセスから失効 → 割り込み停止 → BME 消去 → Device Status の Transactions Pending が消えるまで待つ（上限 200 ms）。DMA オブジェクトはクレームを参照で持ち、静止を確かめられなかったクレームの RAM は解放せず隔離する。終了処理は PCI クレームを他の fd より先に閉じる。複製されたハンドルも参照数で同じ扱い |
 | C14 | MSI-X の表は BAR の中にあるので、BAR を写したドライバーは表を書き換えられる | 受理（危険として） | ドライバーアプリは init が起動する信頼済みのもの。IOMMU も無いので DMA でも同じ。権限分離の目標外と明記 |
 | C15 | RM は割り込みを MSI-X でも MSI でも受けられ、INTx は不要 | 未確定（実機待ち） | OS 層は `n_pci_interrupts(1)` の後に `NV_FLAG_USES_MSIX`／`NV_FLAG_USES_MSI` を立てる。担当 B の調べでは RM はこの印を読まない。実際に割り込みが来るかは実機で |
 | C18 | RM の OS 層が RM の「spinlock」を mutex にしても正しい（割り込み処理もスレッドなので） | 受理 | `rm_isr` は普通のスレッドで動き、`os_is_isr` は `nvrm_in_isr` で真になる。眠ってはならない区間で眠る危険は、割り込み文脈が本物の割り込みでない以上ない |
-| C19 | 全クライアントが RM には同じ管理者権限のプロセスに見える | 受理（制約として） | `nvrm_thread_admin` は既定で真。クライアントごとの隔離は無い。グラフィックスを使うアプリはすべて信頼する前提。後で接続ごとに権限を分けられる |
+| C19 | 全クライアントが RM には同じ管理者権限のプロセスに見える | 修理済み | 接続ごとの権限（`nvrm_file.admin`）。チャネルは相手の素性を持たないので全クライアントが非特権（通常ユーザー相当）。管理者は nvrm 自身のスレッドだけ。根拠のある接続を `client_is_admin` で足せる |
 | C17 | Zink は Vulkan を `util_dl_open(VK_LIBNAME)` と `vkGetInstanceProcAddr` だけで得るので、Nocturne の util の dl 層に静的な表（"vkGetInstanceProcAddr"→NVK の `vk_icdGetInstanceProcAddr`、`vkGetDeviceProcAddr`）を置けば、zink 本体を変えずに静的リンクの NVK を使える | 未確定 | zink_screen.c 3481〜3492 行。ローダー無しで ICD の入口がローダーの代わりになるか（インスタンス拡張の列挙等）は P8 で確かめる |
 | C20 | GPU で描いた WebGL を毎フレーム CPU へ読み戻しても、softpipe より速い | 未確定（実機待ち） | 画面は起動時のフレームバッファー（D8）で、合成は CPU。読み戻しは Zink の staging コピーと待ち。遅ければ、読み戻しを非同期にするか表示側を GPU へ寄せる |
 | C21 | GSP 下でも USERD とエラー通知を sysmem（CPU から見えるだけのページ）に置いてよい | 未確定（実機待ち） | `NV_CHANNEL_ALLOC_PARAMS` の `hUserdMemory[0]` と `hObjectError` に物理メモリ（sysmem）を渡す。NVIDIA の SDK の型と RM の受付けまで。RM が拒めば `nnrm_chan_create` が失敗を返す |
@@ -96,7 +96,10 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C27 | チャンネル内部用 VA（3<<37〜1<<39、1 MiB ずつ、再利用しない）は使い切らない | 受理（上限として） | 131072 個。超えれば `VK_ERROR_OUT_OF_DEVICE_MEMORY` 相当で失敗し、黙って壊れない |
 | C28 | VRAM の CPU 写像は BAR1 経由で RM の MAP_MEMORY が返す共有オブジェクトで得られる | 未確定（実機待ち） | libnvrm の `nvrm_map`。ReBAR 無しでは BAR1 が 256 MiB で、写せる量が限られる |
 | C29 | QEMU（NVIDIA 無し）では `nvrm_connect` がすぐ失敗し、Zink は 1 行のログで softpipe へ後退する | 未確定 → P9 の QEMU で確かめる | `n_channel_connect` が相手無しで即失敗する前提 |
-| C16 | 1 バイトの構成空間書き込みを 16 ビットの読み書きで行うと、隣の状態レジスターの RW1C ビットを消すことがある | 受理（影響なし） | RM の `osPciWriteByte` には呼び元が無い（rg で 0 件）。1 バイト書き込みは起きない |
+| C16 | 1 バイトの構成空間書き込みを 16 ビットの読み書きで行うと、隣の状態レジスターの RW1C ビットを消すことがある | 修理済み | RM に呼び元が無くても、カーネルの `pci_write16` 自体が 32 ビットの読み書きで Status を消していた（BME の操作、uACPI、ドライバーの 1／2 バイト書込み）。`pci_write16`／新しい `pci_write8` は本当の 16／8 ビット幅で書く（ECAM、CF8 とも） |
+| C30 | 古い BAR の写像は、クレームの所有者が替わった後も使える | 却下 → 修理済み | クレームの最後のハンドルが閉じると、そのクレームの BAR オブジェクトの写像を全プロセスで外し、触れると全 1 の読取り専用ページ（バスから消えた装置と同じ）を見せる。新しいビュー・写像・DMA アドレスの照会は `N_ERR_CLOSED` |
+| C31 | `n_shared_map` は読取り専用のハンドルからも書込みの写像を作れる | 却下 → 修理済み | 書込みの写像は書込みで開いたハンドルにだけ許す |
+| C32 | イベント（`nv_post_event`／`nv_get_event`）は不要 | 却下 → 修理済み | 接続ごとの `nvrm_file` に上限つきの待ち行列。GOP の画面は `nv_get_screen_info` で RM へ渡し、RM がその範囲を保つ。nvrm の死亡は NVK がチャネルの照会で `DEVICE_LOST` にする（`nvrm_alive`） |
 
 ## 5. 担当と受け渡し
 
@@ -115,6 +118,20 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-20：Codex の静的監査（97b7d802）の指摘を修理。カーネル：クレームの参照数と静止（BME 消去後に
+  Transactions Pending を待つ、確かめられなければ DMA の RAM を隔離）、BAR 写像の失効（C30）、DMA RAM の
+  型を一つに（C10）、読取り専用ハンドルの写像（C31）、本当の 8／16 ビットの構成空間書込み（C16）、
+  `n_memory_release` の VA 再利用、終了時に PCI クレームを先に閉じる（C13）。RM の OS 層：大ページの
+  散布への後退をやめる、割り込み・タイマー・ワーカーの生成失敗を失敗として返し停止を join、イベント
+  （C32）、接続ごとの権限（C19）、終了時に全クライアントを終える。NVK：sparse の pieces を mtx と事前確保
+  で守る、query_gr の失敗を失敗に、nvkmd_mem_map の参照数、host copy の失敗処理、nvrm の死亡で
+  DEVICE_LOST。WebGL：bufferData(size)・texStorage・copyTexImage2D の外側・renderbuffer を 0 で初期化、
+  描画バッファーを作った時に色 0・深度 1・ステンシル 0 で初期化。差分ビルド（img・vhd・vhdx・iso）。
+  QEMU 一台（WHPX、4 コア、4096 MiB、1920×1080、AHCI、snapshot）：edu で `pcitest: 0 failed`（型の固定、
+  UC ビューで DMA の写しが見える、クレーム終了後の BAR は全 1 を新たに確認）。通常の媒体で机上、3D Cube
+  （63 fps）、ブラウザー（about:home、get.webgl.org の立方体が softpipe で回る、Alt+Left で戻る、ホイールで
+  下端と先頭）を実マウスで操作して画面を見た。回帰なし。NVIDIA 実機の経路（RM・NVK・Zink）は未実行。
 
 - 2026-10-19：P7・P8 をビルドとリンクまで。主担当が NVK 側を引き取り、`nvkmd/nocturne/` の 7 ファイル
   （rm・pdev・dev・mem・va・ctx・sync）を書いた。直した誤り：rm.c が Mesa の `nvtypes.h` を拾う（RM の

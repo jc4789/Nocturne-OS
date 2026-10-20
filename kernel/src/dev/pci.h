@@ -20,6 +20,7 @@ uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off);
 void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v);
 uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off);
 void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t v);
+void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v);
 struct pci_device *pci_find(uint16_t vendor, uint16_t device);
 struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls);
 void pci_enable_busmaster(struct pci_device *d);

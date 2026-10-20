@@ -222,3 +222,10 @@ uint32_t nvrm_escape(struct nvrm *rm, uint32_t escape, void *args, uint32_t size
     nvrm_unlock(rm);
     return r;
 }
+
+/* A message already queued from nvrm (a reply some thread is about to take) counts as alive; only
+   a gone peer with nothing queued reports N_ERR_CLOSED. Takes no lock and takes no message. */
+bool nvrm_alive(struct nvrm *rm) {
+    n_result r = n_channel_receive(rm->channel, NULL, 0, N_CHANNEL_PEEK, NULL);
+    return r != -N_ERR_CLOSED && r != -N_ERR_NO_HANDLE;
+}

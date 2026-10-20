@@ -442,13 +442,10 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     if (nv && (nv->force_dma32_alloc || nv->dma_mask <= 0xFFFFFFFFull)) flags |= N_DMA_32BIT;
 
     uint64_t bytes = (uint64_t)page_count * PAGE;
+    /* No scattered retry for big pages: page_size is the GPU's page granularity, and RM promises
+       its callers whole aligned chunks of it. When the run cannot be had, the failure goes back
+       to RM, which retries the allocation with 4 KiB pages itself (memdescAlloc). */
     n_handle dma = n_dma_create(nvrm_dev.pci, (size_t)bytes, flags);
-    if (dma < 0 && want_contig && !contiguous) {
-        /* a run was only a convenience for big pages */
-        want_contig = false;
-        flags &= ~N_DMA_CONTIGUOUS;
-        dma = n_dma_create(nvrm_dev.pci, (size_t)bytes, flags);
-    }
     if (dma < 0) {
         free(a);
         return NV_ERR_NO_MEMORY;

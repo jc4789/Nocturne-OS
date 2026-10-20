@@ -13,6 +13,7 @@
 #include "mm/heap.h"
 #include "mm/vmm.h"
 #include "fs/vfs.h"
+#include "dev/pciuser.h"
 #include "sys/proc.h"
 #include "gui/wm.h"
 #include "net/net.h"
@@ -1248,12 +1249,15 @@ NORETURN void task_exit(int code) {
         else wq_wait(&t->child_wait);
     }
     sti();
-    for (size_t i = 0; i < t->fd_capacity; i++) {
-        if (t->fds[i]) {
-            vfs_close(t->fds[i]);
-            t->fds[i] = NULL;
+    /* PCI claims first, whatever their handle numbers: a driver's device is stopped (and seen
+       to have no DMA in flight) before the DMA objects among its other handles can free RAM. */
+    for (int claims = 1; claims >= 0; claims--)
+        for (size_t i = 0; i < t->fd_capacity; i++) {
+            if (t->fds[i] && (!claims || pci_user_is_claim(t->fds[i]))) {
+                vfs_close(t->fds[i]);
+                t->fds[i] = NULL;
+            }
         }
-    }
     wm_process_exit(t->pid);
     net_process_exit(t->pid);
     cli();

@@ -61,9 +61,33 @@ uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
     return (uint16_t)(pci_read32(bus, dev, func, off) >> ((off & 2) * 8));
 }
 
+/* Narrow writes are narrow on the bus too: a read-modify-write of the whole dword would write
+   back the register beside this one, and Status (beside Command) clears its error bits on a
+   written 1. */
+static void cf8_select(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
+    outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (off & 0xFC));
+}
+
 void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t v) {
-    uint32_t shift = (off & 2) * 8, w = pci_read32(bus, dev, func, off);
-    pci_write32(bus, dev, func, off, (w & ~(0xFFFFu << shift)) | (uint32_t)v << shift);
+    volatile uint32_t *r = ecam_regs(bus, dev, func, off >= 256);
+    if (r) {
+        *(volatile uint16_t *)((volatile uint8_t *)r + (off & 0xFFE)) = v;
+        return;
+    }
+    if (off >= 256) return;
+    cf8_select(bus, dev, func, off);
+    outw(0xCFC + (off & 2), v);
+}
+
+void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v) {
+    volatile uint32_t *r = ecam_regs(bus, dev, func, off >= 256);
+    if (r) {
+        *((volatile uint8_t *)r + (off & 0xFFF)) = v;
+        return;
+    }
+    if (off >= 256) return;
+    cf8_select(bus, dev, func, off);
+    outb(0xCFC + (off & 3), v);
 }
 
 /* Switch a found function to ECAM, checking that ECAM really reaches it (a wrong MCFG base turns it off). */
@@ -144,9 +168,9 @@ struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls) {
 
 void pci_enable_busmaster(struct pci_device *d) {
     d->kernel_owned = true;
-    uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 4);
+    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, 4);
     cmd |= 0x7; /* I/O, memory, bus master */
-    pci_write32(d->bus, d->dev, d->func, 4, cmd);
+    pci_write16(d->bus, d->dev, d->func, 4, cmd);
 }
 
 int pci_list(struct n_pciinfo *out, int max) {
@@ -229,8 +253,8 @@ uint16_t pci_find_ext_cap(const struct pci_device *d, uint16_t id) {
 static uint32_t msi_address(uint32_t dest_apic_id) { return 0xFEE00000u | dest_apic_id << 12; }
 
 static void intx_disable(struct pci_device *d) {
-    uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 4);
-    pci_write32(d->bus, d->dev, d->func, 4, cmd | 0x400);
+    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, 4);
+    pci_write16(d->bus, d->dev, d->func, 4, cmd | 0x400);
 }
 
 unsigned pci_msi_max_vectors(const struct pci_device *d) {

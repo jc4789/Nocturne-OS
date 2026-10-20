@@ -85,7 +85,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `nv_start_rc_timer`／`nv_stop_rc_timer`、`nv_create_nano_timer` ほか | 1 本のタイマースレッド（1 Hz の RC、nano タイマー） |
 | `nv_get_firmware`／`nv_put_firmware` | `n_document_load`（上のフォルダー順。ログの追記は `n_document_append`） |
 | `os_get_cpu_count`／`os_get_cpu_number`／`os_get_cpu_frequency` | `cpu_info`／`cpu_index` |
-| `os_get_current_process`／`_name`／`os_get_current_thread`、`os_get_euid`、`os_is_administrator`、`os_check_access` | nvrm のプロセスは一つ。スレッド局所の `nvrm_thread_admin`（既定は管理者）。クライアントごとの隔離は無い |
+| `os_get_current_process`／`_name`／`os_get_current_thread`、`os_get_euid`、`os_is_administrator`、`os_check_access` | nvrm のプロセスは一つ。スレッド局所の `nvrm_thread_admin` は要求の間だけ接続の権限（`nvrm_serve.c` の `client_is_admin`、現状すべて非特権）になり、nvrm 自身のスレッド（割り込み・作業・タイマー）は管理者 |
 | `os_pci_init_handle`、`os_pci_read_*`／`write_*` | `n_pci_config_read／write`。自分の機能だけ書ける。他の機能（上流ブリッジ）は読むだけ |
 | `os_map_kernel_space`／`os_unmap_kernel_space` | BAR は `n_pci_bar`＋`n_shared_view`（UC／WC）＋`n_shared_map`。BAR0 は全体を一度だけ写す |
 | `nv_alloc_pages`／`nv_free_pages` | `n_dma_create`（`N_DMA_CONTIGUOUS`、`N_DMA_32BIT`）＋`n_dma_addresses`。ページ 4 KiB より大きいときは余分に取って view で整列 |
@@ -109,7 +109,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 - **NUMA・ページ・IOMMU・dma-buf・scatter-gather の取り込み・ユーザーページの固定・P2P**：Nocturne にその概念が無い。クライアントのメモリは「共有オブジェクト」で渡す。
 - **仮想化**（vGPU、GRID、VFIO）、**cgroup**、**IMEX チャンネル**、**能力ファイル**（`nvidia_caps_root` は NULL）。
 - **電源管理**（ランタイムサスペンド、S0ix、動的電源）：最初は扱わない。
-- **イベント**：`nv_post_event` は `nvrm_event_post`（弱い既定は何もしない）へ。`nv_get_event`／`nv_get_file_private` はクライアントへ届けない。
+- **イベント**：`nv_post_event` はクライアント（`struct nvrm_file`）ごとのキューに積み、`nv_get_event`（`NV_ESC_RM_GET_EVENT_DATA`）で取り出す。プロトコルは要求・応答なのでクライアントがポーリングし、プッシュ通知は無い。`nv_get_file_private` は無し（記述子が無い）。
 - **ファイル**（`os_allocate_temporary_file` など）：ページアウト用。無い。
 
 ## 既知のリスク・不確かなこと

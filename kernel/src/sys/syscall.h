@@ -16,3 +16,8 @@ uint64_t mmap_reserve(struct task *owner, uint64_t len);
 int shared_program_segment(struct task *t, const char *path, uint64_t va, const uint8_t *bytes,
                            uint64_t filesz, uint64_t memsz, bool exec);
 bool shared_demand_fault(uint64_t addr, bool write); /* first touch of a reserved shared page */
+/* A PCI claim's last handle closed (dev/pciuser.c): every process loses the device pages of its
+   BAR objects' mappings. The address ranges stay reserved; a touch there reads all-ones, as a
+   function gone from the bus does, and writes go nowhere. */
+struct pci_claim;
+void shared_revoke_claim(const struct pci_claim *c);

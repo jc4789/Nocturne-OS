@@ -327,14 +327,12 @@ void uacpi_kernel_pci_device_close(uacpi_handle h) { kfree(h); }
 
 static uint32_t cfg_read(struct pci_handle *h, uacpi_size off) { return pci_read32(h->bus, h->dev, h->fn, off & ~3u); }
 
-/* A narrow write is a read-modify-write of its dword; in the command/status dword the status half
-   is written as 0, since its bits clear when written with 1. */
+/* Writes as wide as asked: a read-modify-write of the dword would write back the registers beside
+   it, and status registers clear their bits when written with 1. */
 static void cfg_write(struct pci_handle *h, uacpi_size off, uint32_t v, unsigned bytes) {
-    unsigned shift = (off & 3) * 8;
-    uint32_t mask = bytes == 4 ? 0xFFFFFFFFu : ((1u << bytes * 8) - 1) << shift;
-    uint32_t old = bytes == 4 ? 0 : cfg_read(h, off);
-    if ((off & ~3u) == 4) old &= 0xFFFF;
-    pci_write32(h->bus, h->dev, h->fn, off & ~3u, (old & ~mask) | (v << shift & mask));
+    if (bytes == 1) pci_write8(h->bus, h->dev, h->fn, off, (uint8_t)v);
+    else if (bytes == 2) pci_write16(h->bus, h->dev, h->fn, off, (uint16_t)v);
+    else pci_write32(h->bus, h->dev, h->fn, off & ~3u, v);
 }
 
 uacpi_status uacpi_kernel_pci_read8(uacpi_handle h, uacpi_size off, uacpi_u8 *v) {

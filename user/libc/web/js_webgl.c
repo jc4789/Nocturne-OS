@@ -1739,6 +1739,29 @@ FN(m_bind_transform_feedback) {
 
 /* ---- buffers ---- */
 
+/* A data-less bufferData must give a zero-filled buffer (WebGL "resource
+ * restrictions"). GL leaves a NULL upload undefined, and the driver may keep the
+ * old storage when the size is unchanged, so the zeros are written explicitly. A
+ * small buffer takes them in the allocation call; a larger one is allocated
+ * first and then cleared from one shared zero page in pieces, with no
+ * allocation of its own. */
+#define ZERO_CHUNK 262144
+static uint8_t zero_chunk[ZERO_CHUNK];
+static void buffer_data_zeroed(GLenum target, int64_t size, GLenum usage) {
+    if (size <= ZERO_CHUNK) {
+        glBufferData(target, (GLsizeiptr)size, zero_chunk, usage);
+        return;
+    }
+    glBufferData(target, (GLsizeiptr)size, NULL, usage);
+    GLint got = 0;
+    glGetBufferParameteriv(target, GL_BUFFER_SIZE, &got);
+    if ((int64_t)got != size) return; /* the allocation failed: its error is already recorded */
+    for (int64_t off = 0; off < size; off += ZERO_CHUNK) {
+        int64_t n = size - off < ZERO_CHUNK ? size - off : ZERO_CHUNK;
+        glBufferSubData(target, (GLintptr)off, (GLsizeiptr)n, zero_chunk);
+    }
+}
+
 FN(m_buffer_data) {
     GLint target, usage;
     if (toi(ctx, argv[0], &target) || toi(ctx, argv[2], &usage)) return JS_EXCEPTION;
@@ -1774,7 +1797,7 @@ FN(m_buffer_data) {
             synth(gl, GL_INVALID_VALUE);
             return JS_UNDEFINED;
         }
-        glBufferData((GLenum)target, (GLsizeiptr)size, NULL, (GLenum)usage);
+        buffer_data_zeroed((GLenum)target, size, (GLenum)usage);
     }
     return JS_UNDEFINED;
 }
@@ -2906,15 +2929,186 @@ FN(m_tex_sub_image_3d) {
 /* No compressed texture format extension is offered, so every compressed
  * format is unknown to this context. */
 FN(m_compressed_tex) { UNUSED_ARGS; CUR(JS_UNDEFINED); synth(gl, GL_INVALID_ENUM); return JS_UNDEFINED; }
+/* The client format/type that carries zeros into a texture of this internal
+ * format; false for a format with no such pair (compressed ones). */
+static bool zero_format_of(GLenum f, GLenum *format, GLenum *type) {
+    *type = GL_UNSIGNED_BYTE;
+    switch (f) {
+    case GL_ALPHA: case GL_LUMINANCE: case GL_LUMINANCE_ALPHA: case GL_RGB: case GL_RGBA:
+        *format = f; return true;
+    case GL_R8: case GL_R8_SNORM: *format = GL_RED; *type = f == GL_R8 ? GL_UNSIGNED_BYTE : GL_BYTE; return true;
+    case GL_RG8: case GL_RG8_SNORM: *format = GL_RG; *type = f == GL_RG8 ? GL_UNSIGNED_BYTE : GL_BYTE; return true;
+    case GL_RGB8: case GL_SRGB8: case GL_RGB8_SNORM: *format = GL_RGB; *type = f == GL_RGB8_SNORM ? GL_BYTE : GL_UNSIGNED_BYTE; return true;
+    case GL_RGBA8: case GL_SRGB8_ALPHA8: case GL_RGBA8_SNORM: *format = GL_RGBA; *type = f == GL_RGBA8_SNORM ? GL_BYTE : GL_UNSIGNED_BYTE; return true;
+    case GL_RGB565: *format = GL_RGB; *type = GL_UNSIGNED_SHORT_5_6_5; return true;
+    case GL_RGBA4: *format = GL_RGBA; *type = GL_UNSIGNED_SHORT_4_4_4_4; return true;
+    case GL_RGB5_A1: *format = GL_RGBA; *type = GL_UNSIGNED_SHORT_5_5_5_1; return true;
+    case GL_RGB10_A2: *format = GL_RGBA; *type = GL_UNSIGNED_INT_2_10_10_10_REV; return true;
+    case GL_R11F_G11F_B10F: *format = GL_RGB; *type = GL_UNSIGNED_INT_10F_11F_11F_REV; return true;
+    case GL_RGB9_E5: *format = GL_RGB; *type = GL_UNSIGNED_INT_5_9_9_9_REV; return true;
+    case GL_R16F: case GL_R32F: *format = GL_RED; *type = GL_FLOAT; return true;
+    case GL_RG16F: case GL_RG32F: *format = GL_RG; *type = GL_FLOAT; return true;
+    case GL_RGB16F: case GL_RGB32F: *format = GL_RGB; *type = GL_FLOAT; return true;
+    case GL_RGBA16F: case GL_RGBA32F: *format = GL_RGBA; *type = GL_FLOAT; return true;
+    case GL_R8UI: *format = GL_RED_INTEGER; return true;
+    case GL_R8I: *format = GL_RED_INTEGER; *type = GL_BYTE; return true;
+    case GL_R16UI: *format = GL_RED_INTEGER; *type = GL_UNSIGNED_SHORT; return true;
+    case GL_R16I: *format = GL_RED_INTEGER; *type = GL_SHORT; return true;
+    case GL_R32UI: *format = GL_RED_INTEGER; *type = GL_UNSIGNED_INT; return true;
+    case GL_R32I: *format = GL_RED_INTEGER; *type = GL_INT; return true;
+    case GL_RG8UI: *format = GL_RG_INTEGER; return true;
+    case GL_RG8I: *format = GL_RG_INTEGER; *type = GL_BYTE; return true;
+    case GL_RG16UI: *format = GL_RG_INTEGER; *type = GL_UNSIGNED_SHORT; return true;
+    case GL_RG16I: *format = GL_RG_INTEGER; *type = GL_SHORT; return true;
+    case GL_RG32UI: *format = GL_RG_INTEGER; *type = GL_UNSIGNED_INT; return true;
+    case GL_RG32I: *format = GL_RG_INTEGER; *type = GL_INT; return true;
+    case GL_RGB8UI: *format = GL_RGB_INTEGER; return true;
+    case GL_RGB8I: *format = GL_RGB_INTEGER; *type = GL_BYTE; return true;
+    case GL_RGB16UI: *format = GL_RGB_INTEGER; *type = GL_UNSIGNED_SHORT; return true;
+    case GL_RGB16I: *format = GL_RGB_INTEGER; *type = GL_SHORT; return true;
+    case GL_RGB32UI: *format = GL_RGB_INTEGER; *type = GL_UNSIGNED_INT; return true;
+    case GL_RGB32I: *format = GL_RGB_INTEGER; *type = GL_INT; return true;
+    case GL_RGBA8UI: *format = GL_RGBA_INTEGER; return true;
+    case GL_RGBA8I: *format = GL_RGBA_INTEGER; *type = GL_BYTE; return true;
+    case GL_RGBA16UI: *format = GL_RGBA_INTEGER; *type = GL_UNSIGNED_SHORT; return true;
+    case GL_RGBA16I: *format = GL_RGBA_INTEGER; *type = GL_SHORT; return true;
+    case GL_RGBA32UI: *format = GL_RGBA_INTEGER; *type = GL_UNSIGNED_INT; return true;
+    case GL_RGBA32I: *format = GL_RGBA_INTEGER; *type = GL_INT; return true;
+    case GL_RGB10_A2UI: *format = GL_RGBA_INTEGER; *type = GL_UNSIGNED_INT_2_10_10_10_REV; return true;
+    case GL_DEPTH_COMPONENT16: *format = GL_DEPTH_COMPONENT; *type = GL_UNSIGNED_SHORT; return true;
+    case GL_DEPTH_COMPONENT24: *format = GL_DEPTH_COMPONENT; *type = GL_UNSIGNED_INT; return true;
+    case GL_DEPTH_COMPONENT32F: *format = GL_DEPTH_COMPONENT; *type = GL_FLOAT; return true;
+    case GL_DEPTH24_STENCIL8: *format = GL_DEPTH_STENCIL; *type = GL_UNSIGNED_INT_24_8; return true;
+    case GL_DEPTH32F_STENCIL8: *format = GL_DEPTH_STENCIL; *type = GL_FLOAT_32_UNSIGNED_INT_24_8_REV; return true;
+    default: return false;
+    }
+}
+
+/* texStorage makes immutable storage whose contents WebGL defines as zero; the
+ * driver only has to give undefined data. Writes the zeros through one
+ * slice-sized buffer (the largest image slice is level 0's) so the cost is a
+ * single allocation and one upload per slice and level. A PIXEL_UNPACK_BUFFER
+ * would turn the pointers into offsets, so it is unbound meanwhile. */
+static void zero_storage(struct webgl *gl, GLenum target, GLsizei levels, GLenum internal, GLsizei w, GLsizei h,
+                         GLsizei d, bool three) {
+    GLenum format, type;
+    if (!zero_format_of(internal, &format, &type) || w <= 0 || h <= 0 || d <= 0) return;
+    unsigned bpp = pixel_bytes(format, type);
+    if (!bpp) return;
+    uint64_t bytes = (uint64_t)w * (uint64_t)h * bpp;
+    void *zeros = bytes <= ((uint64_t)1 << 30) ? calloc(1, (size_t)bytes) : NULL;
+    if (!zeros) {
+        synth(gl, GL_OUT_OF_MEMORY);
+        return;
+    }
+    GLint unpack = 0;
+    if (gl->version == 2) {
+        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+        if (unpack) glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    }
+    unpack_tight(gl, 0, 0, false);
+    unsigned faces = target == GL_TEXTURE_CUBE_MAP ? 6 : 1;
+    GLsizei lw = w, lh = h, ld = d;
+    for (GLsizei level = 0; level < levels && level < 32; level++) {
+        for (unsigned face = 0; face < faces; face++) {
+            if (three) {
+                for (GLsizei z = 0; z < ld; z++)
+                    glTexSubImage3D(target, level, 0, 0, z, lw, lh, 1, format, type, zeros);
+            } else {
+                glTexSubImage2D(faces == 6 ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + face : target, level, 0, 0, lw, lh,
+                                format, type, zeros);
+            }
+        }
+        lw = lw > 1 ? lw >> 1 : 1;
+        lh = lh > 1 ? lh >> 1 : 1;
+        if (target == GL_TEXTURE_3D) ld = ld > 1 ? ld >> 1 : 1;
+    }
+    unpack_restore(gl);
+    if (unpack) glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+    free(zeros);
+}
+static bool storage_is_immutable(GLenum target) {
+    GLint immutable = 0;
+    glGetTexParameteriv(target, GL_TEXTURE_IMMUTABLE_FORMAT, &immutable);
+    return immutable != 0;
+}
 FN(m_tex_storage_2d) {
     GLint v[5]; if (ints(ctx, argc, argv, 0, 5, v)) return JS_EXCEPTION; CUR(JS_UNDEFINED);
+    bool was = storage_is_immutable((GLenum)v[0]);
     glTexStorage2D((GLenum)v[0], v[1], (GLenum)v[2], v[3], v[4]);
+    if (!was && storage_is_immutable((GLenum)v[0]))
+        zero_storage(gl, (GLenum)v[0], v[1], (GLenum)v[2], v[3], v[4], 1, false);
     return JS_UNDEFINED;
 }
 FN(m_tex_storage_3d) {
     GLint v[6]; if (ints(ctx, argc, argv, 0, 6, v)) return JS_EXCEPTION; CUR(JS_UNDEFINED);
+    bool was = storage_is_immutable((GLenum)v[0]);
     glTexStorage3D((GLenum)v[0], v[1], (GLenum)v[2], v[3], v[4], v[5]);
+    if (!was && storage_is_immutable((GLenum)v[0]))
+        zero_storage(gl, (GLenum)v[0], v[1], (GLenum)v[2], v[3], v[4], v[5], true);
     return JS_UNDEFINED;
+}
+
+/* The size of the framebuffer copyTexImage2D reads from; false when it cannot be
+ * told cheaply (a texture attachment: ES 3.0 has no level size query). */
+static bool read_buffer_size(struct webgl *gl, GLint *w, GLint *h) {
+    GLint fb = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &fb);
+    if (!fb) {
+        unsigned uw, uh;
+        ngl_get_size(gl->ngl, &uw, &uh);
+        *w = (GLint)uw;
+        *h = (GLint)uh;
+        return true;
+    }
+    GLint attach = GL_COLOR_ATTACHMENT0, type = 0, name = 0, previous = 0;
+    if (gl->version == 2) glGetIntegerv(GL_READ_BUFFER, &attach);
+    glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, (GLenum)attach, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if (type != GL_RENDERBUFFER) return false;
+    glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, (GLenum)attach, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &previous);
+    glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)name);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, w);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, h);
+    glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)previous);
+    return true;
+}
+/* copyTexImage2D whose rectangle reaches outside the framebuffer: WebGL wants the
+ * outside to be zero, GL leaves it undefined. The image is defined as zeros and
+ * the part inside is copied over it. Returns false when the plain call applies. */
+static bool copy_tex_image_zero_outside(struct webgl *gl, const GLint v[8]) {
+    GLint x = v[3], y = v[4], w = v[5], h = v[6];
+    GLenum format, type;
+    if (v[7] != 0 || w <= 0 || h <= 0 || !zero_format_of((GLenum)v[2], &format, &type)) return false;
+    /* Depth formats are not valid for a copy: the plain call reports that. */
+    if (format == GL_DEPTH_COMPONENT || format == GL_DEPTH_STENCIL) return false;
+    GLint fb = 0, rw = 0, rh = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &fb);
+    if (fb && glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    bool known = read_buffer_size(gl, &rw, &rh);
+    if (known && x >= 0 && y >= 0 && (int64_t)x + w <= rw && (int64_t)y + h <= rh) return false;
+    unsigned bpp = pixel_bytes(format, type);
+    uint64_t bytes = (uint64_t)w * (uint64_t)h * bpp;
+    void *zeros = bpp && bytes <= ((uint64_t)1 << 30) ? calloc(1, (size_t)bytes) : NULL;
+    if (!zeros) {
+        if (bpp) synth(gl, GL_OUT_OF_MEMORY);
+        return bpp != 0;
+    }
+    GLint unpack = 0;
+    if (gl->version == 2) {
+        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+        if (unpack) glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    }
+    unpack_tight(gl, 0, 0, false);
+    glTexImage2D((GLenum)v[0], v[1], v[2], w, h, 0, format, type, zeros);
+    unpack_restore(gl);
+    if (unpack) glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+    free(zeros);
+    GLint x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    GLint x1 = known && (int64_t)x + w > rw ? rw : x + w, y1 = known && (int64_t)y + h > rh ? rh : y + h;
+    if (x1 > x0 && y1 > y0)
+        glCopyTexSubImage2D((GLenum)v[0], v[1], x0 - x, y0 - y, x0, y0, x1 - x0, y1 - y0);
+    return true;
 }
 FN(m_copy_tex_image_2d) {
     GLint v[8]; if (ints(ctx, argc, argv, 0, 8, v)) return JS_EXCEPTION; CUR(JS_UNDEFINED);
@@ -2925,6 +3119,7 @@ FN(m_copy_tex_image_2d) {
             return JS_UNDEFINED;
         }
     }
+    if (copy_tex_image_zero_outside(gl, v)) return JS_UNDEFINED;
     glCopyTexImage2D((GLenum)v[0], v[1], (GLenum)v[2], v[3], v[4], v[5], v[6], v[7]);
     return JS_UNDEFINED;
 }
@@ -3011,6 +3206,84 @@ static GLenum renderbuffer_format(struct webgl *gl, GLenum f) {
     default: return 0;
     }
 }
+/* A new renderbuffer image must read as zero (WebGL "resource restrictions"). It
+ * is cleared through a scratch framebuffer; every piece of state the clear
+ * depends on is saved and put back, so the page cannot see it. */
+static void clear_renderbuffer(struct webgl *gl, GLenum f, GLsizei w, GLsizei h) {
+    if (w <= 0 || h <= 0) return;
+    GLint rb = 0, rw = 0, rh = 0;
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &rb);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &rw);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &rh);
+    if (!rb || rw != w || rh != h) return; /* the storage call failed */
+    bool depth = false, stencil = false, uint = false, sint = false;
+    switch (f) {
+    case GL_DEPTH_COMPONENT16: case GL_DEPTH_COMPONENT24: case GL_DEPTH_COMPONENT32F: depth = true; break;
+    case GL_STENCIL_INDEX8: stencil = true; break;
+    case GL_DEPTH24_STENCIL8: case GL_DEPTH32F_STENCIL8: depth = stencil = true; break;
+    case GL_R8UI: case GL_R16UI: case GL_R32UI: case GL_RG8UI: case GL_RG16UI: case GL_RG32UI:
+    case GL_RGBA8UI: case GL_RGBA16UI: case GL_RGBA32UI: case GL_RGB10_A2UI:
+        uint = true; break;
+    case GL_R8I: case GL_R16I: case GL_R32I: case GL_RG8I: case GL_RG16I: case GL_RG32I:
+    case GL_RGBA8I: case GL_RGBA16I: case GL_RGBA32I:
+        sint = true; break;
+    default: break;
+    }
+    GLint draw_fb = 0, read_fb = 0;
+    GLint stencil_front = 0, stencil_back = 0, stencil_clear = 0;
+    GLboolean color_mask[4], depth_mask = GL_TRUE;
+    GLfloat color_clear[4], depth_clear = 1;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fb);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fb);
+    glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+    glGetIntegerv(GL_STENCIL_WRITEMASK, &stencil_front);
+    glGetIntegerv(GL_STENCIL_BACK_WRITEMASK, &stencil_back);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, color_clear);
+    glGetFloatv(GL_DEPTH_CLEAR_VALUE, &depth_clear);
+    glGetIntegerv(GL_STENCIL_CLEAR_VALUE, &stencil_clear);
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean discard = gl->version == 2 ? glIsEnabled(GL_RASTERIZER_DISCARD) : GL_FALSE;
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    if (depth) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, (GLuint)rb);
+    if (stencil) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, (GLuint)rb);
+    if (!depth && !stencil) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, (GLuint)rb);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        glDisable(GL_SCISSOR_TEST);
+        if (gl->version == 2) glDisable(GL_RASTERIZER_DISCARD);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_TRUE);
+        glStencilMask(0xffffffffu);
+        if (uint) {
+            static const GLuint zero[4];
+            glClearBufferuiv(GL_COLOR, 0, zero);
+        } else if (sint) {
+            static const GLint zero[4];
+            glClearBufferiv(GL_COLOR, 0, zero);
+        } else {
+            GLbitfield mask = 0;
+            if (depth) { glClearDepthf(0); mask |= GL_DEPTH_BUFFER_BIT; }
+            if (stencil) { glClearStencil(0); mask |= GL_STENCIL_BUFFER_BIT; }
+            if (!depth && !stencil) { glClearColor(0, 0, 0, 0); mask |= GL_COLOR_BUFFER_BIT; }
+            glClear(mask);
+        }
+    }
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_fb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_fb);
+    glDeleteFramebuffers(1, &fbo);
+    glColorMask(color_mask[0], color_mask[1], color_mask[2], color_mask[3]);
+    glDepthMask(depth_mask);
+    glStencilMaskSeparate(GL_FRONT, (GLuint)stencil_front);
+    glStencilMaskSeparate(GL_BACK, (GLuint)stencil_back);
+    glClearColor(color_clear[0], color_clear[1], color_clear[2], color_clear[3]);
+    glClearDepthf(depth_clear);
+    glClearStencil(stencil_clear);
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+    if (discard) glEnable(GL_RASTERIZER_DISCARD);
+}
 FN(m_renderbuffer_storage) {
     GLint v[4]; if (ints(ctx, argc, argv, 0, 4, v)) return JS_EXCEPTION; CUR(JS_UNDEFINED);
     GLenum f = renderbuffer_format(gl, (GLenum)v[1]);
@@ -3019,6 +3292,7 @@ FN(m_renderbuffer_storage) {
         return JS_UNDEFINED;
     }
     glRenderbufferStorage(GL_RENDERBUFFER, f, v[2], v[3]);
+    clear_renderbuffer(gl, f, v[2], v[3]);
     return JS_UNDEFINED;
 }
 FN(m_renderbuffer_storage_multisample) {
@@ -3029,6 +3303,7 @@ FN(m_renderbuffer_storage_multisample) {
         return JS_UNDEFINED;
     }
     glRenderbufferStorageMultisample(GL_RENDERBUFFER, v[1], f, v[3], v[4]);
+    clear_renderbuffer(gl, f, v[3], v[4]);
     return JS_UNDEFINED;
 }
 FN(m_get_renderbuffer_parameter) {

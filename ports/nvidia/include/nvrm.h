@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 /* libnvrm: an app's connection to /bin/nvrm, the NVIDIA resource manager (nvrm_protocol.h).
@@ -29,6 +30,10 @@ uint32_t nvrm_unmap(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t 
 /* Any other escape whose argument struct holds no pointers (NVOS46 map DMA, NVOS47, ...). Returns
    NV_OK once nvrm ran it; RM's own status is the struct's status field. */
 uint32_t nvrm_escape(struct nvrm *rm, uint32_t escape, void *args, uint32_t size);
+
+/* false once /bin/nvrm has gone (its end of the connection is closed); polling waits use it to
+   give up. Safe to call from any thread, locked or not. */
+bool nvrm_alive(struct nvrm *rm);
 
 void nvrm_lock(struct nvrm *rm);
 void nvrm_unlock(struct nvrm *rm);

@@ -37,6 +37,7 @@ struct nvrm_device {
     nv_state_t nv;                   /* what RM sees */
     nvidia_stack_t *sp;              /* RM's (dummy) altstack; no __use_altstack__ here */
     bool adapter_ready;              /* rm_init_adapter succeeded */
+    bool mappings_revoked;           /* RM revoked the GPU mappings: no new client mappings (atomic) */
     char name[128];                  /* rm_get_device_name text */
 };
 
@@ -60,20 +61,17 @@ void nvrm_log_raw(const char *text, size_t length);
 /* Set by the interrupt thread: os_is_isr() is true while it runs RM. */
 extern thread_local bool nvrm_in_isr;
 
-/* The request server sets this per thread for a client that must not get RM's administrator
- * rights (os_is_administrator, os_check_access). Threads of the process itself are
- * administrators; the default is true. */
+/* Whether RM sees the running request as an administrator's (os_is_administrator,
+ * os_check_access). nvrm_rm_ioctl sets it to the client's own right for the length of one request
+ * and back to true after; threads of the process itself (interrupts, work, timers) are
+ * administrators. */
 extern thread_local bool nvrm_thread_admin;
 
 /* ------------------------------------------------------------------------------------------
  * The request server (nvrm_serve.c, nvrm_serve.h) calls the nvrm_rm_* functions of rm_api.c
  * and provides nvrm_user_translate, which os_memcpy_from_user / os_memcpy_to_user use.
+ * rm_api.c also holds the clients' RM event queues (nv_post_event, nv_get_event).
  * ---------------------------------------------------------------------------------------- */
-
-/* RM posted an event (nv_post_event). The weak default in os.c does nothing; events are
- * not carried to clients yet (docs/nvidia/LEDGER.md). */
-void nvrm_event_post(nv_event_t *event, NvHandle object, NvU32 index, NvU32 info32,
-                     NvU16 info16, NvBool data_valid);
 
 /* ------------------------------------------------------------------------------------------
  * Client mappings (os_pci.c)
@@ -137,10 +135,15 @@ int nvrm_irq_enable(void);           /* n_pci_interrupts; returns the number of 
 /* os.c */
 uint64_t nvrm_now_ns(void);          /* monotonic, TSC based when the system offers it */
 void nvrm_timers_init(void);
+bool nvrm_timers_start(void);        /* the timer thread runs; false when it cannot be started */
+void nvrm_timers_stop(void);         /* stops and joins it; armed timers never fire after */
 void nvrm_work_init(void);
+void nvrm_work_stop(void);           /* runs what is queued, stops and waits for the workers */
 struct os_work_queue *nvrm_work_queue(void);
 
-/* The interrupt thread (nvrm.c). */
-int nvrm_irq_thread_start(void);
+/* The interrupt thread (nvrm.c): MSI/MSI-X delivery, or a polling loop when the system gives no
+ * vector. start returns false when no thread runs; stop joins it. */
+bool nvrm_irq_thread_start(void);
+void nvrm_irq_thread_stop(void);
 
 #endif

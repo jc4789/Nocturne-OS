@@ -414,8 +414,6 @@ nvkmd_mem_map(struct nvkmd_mem *mem, struct vk_object_base *log_obj,
       simple_mtx_lock(&mem->map_mutex);
 
       assert((mem->map_cnt == 0) == (mem->map == NULL));
-      mem->map_cnt++;
-
       VkResult result = VK_SUCCESS;
       if (mem->map == NULL) {
          /* We always map read/write for internal maps since they're reference
@@ -423,10 +421,13 @@ nvkmd_mem_map(struct nvkmd_mem *mem, struct vk_object_base *log_obj,
           * after the fact.
           */
          result = mem->ops->map(mem, log_obj, NVKMD_MEM_MAP_RDWR, NULL, &map);
-         if (result == VK_SUCCESS)
+         if (result == VK_SUCCESS) {
             mem->map = map;
+            mem->map_cnt++;
+         }
       } else {
          map = mem->map;
+         mem->map_cnt++;
       }
 
       simple_mtx_unlock(&mem->map_mutex);

@@ -212,11 +212,6 @@ NV_STATUS NV_API_CALL os_memcpy_to_user(void *to, const void *from, NvU32 n) {
     return NV_OK;
 }
 
-__attribute__((weak)) void nvrm_event_post(nv_event_t *event, NvHandle object, NvU32 index, NvU32 info32,
-                                           NvU16 info16, NvBool data_valid) {
-    (void)event; (void)object; (void)index; (void)info32; (void)info16; (void)data_valid;
-}
-
 /* ------------------------------------------------------------------------------------------
  * Strings
  * ---------------------------------------------------------------------------------------- */
@@ -617,8 +612,9 @@ struct os_work_queue {
     struct work_item *head, *tail;
     int pending;      /* queued + running */
     int idle_workers;
-    int workers;
+    int workers;      /* threads started and not yet ended */
     int flushing;
+    bool stopping;    /* nvrm_work_stop: no new items, workers end when the queue is empty */
 };
 
 static struct os_work_queue work_queue;
@@ -640,6 +636,12 @@ static int work_thread(void *arg) {
     mtx_lock(&q->lock);
     for (;;) {
         while (!q->head) {
+            if (q->stopping) {
+                q->workers--;
+                cnd_broadcast(&q->idle_cv);
+                mtx_unlock(&q->lock);
+                return 0;
+            }
             q->idle_workers++;
             cnd_wait(&q->work_cv, &q->lock);
             q->idle_workers--;
@@ -666,26 +668,58 @@ NV_STATUS NV_API_CALL os_queue_work_item(struct os_work_queue *queue, void *data
     item->data = data;
     bool spawn = false;
     mtx_lock(&q->lock);
-    if (q->tail) q->tail->next = item; else q->head = item;
-    q->tail = item;
-    q->pending++;
+    if (q->stopping) {
+        mtx_unlock(&q->lock);
+        free(item);
+        return NV_ERR_INVALID_STATE;
+    }
     if (q->idle_workers == 0 && q->workers < WORK_THREADS_MAX) {
         q->workers++;
         spawn = true;
     }
     mtx_unlock(&q->lock);
-    cnd_signal(&q->work_cv);
+    /* A worker is started before the item is accepted: with none running and none startable, the
+       item would wait forever, so the request fails and RM decides what to do. */
     if (spawn) {
         thrd_t t;
         if (thrd_create(&t, work_thread, q) == thrd_success) {
             thrd_detach(t);
         } else {
             mtx_lock(&q->lock);
-            q->workers--;
+            bool none = --q->workers == 0;
             mtx_unlock(&q->lock);
+            if (none) {
+                free(item);
+                nvrm_log("NVRM: cannot start a work thread");
+                return NV_ERR_INSUFFICIENT_RESOURCES;
+            }
+            /* other workers exist: one of them takes the item when it is free */
         }
     }
+    mtx_lock(&q->lock);
+    if (q->stopping) {
+        mtx_unlock(&q->lock);
+        free(item);
+        return NV_ERR_INVALID_STATE;
+    }
+    if (q->tail) q->tail->next = item; else q->head = item;
+    q->tail = item;
+    q->pending++;
+    mtx_unlock(&q->lock);
+    cnd_signal(&q->work_cv);
     return NV_OK;
+}
+
+/* Called once nothing new can arrive (clients gone, interrupts stopped): the items already
+   queued run, then every worker ends. */
+void nvrm_work_stop(void) {
+    nvrm_work_init();
+    struct os_work_queue *q = &work_queue;
+    mtx_lock(&q->lock);
+    q->stopping = true;
+    cnd_broadcast(&q->work_cv);
+    while (q->workers) cnd_wait(&q->idle_cv, &q->lock);
+    mtx_unlock(&q->lock);
 }
 
 NV_STATUS NV_API_CALL os_flush_work_queue(struct os_work_queue *queue, NvBool do_work) {
@@ -727,14 +761,18 @@ static cnd_t timer_cv;
 static cnd_t timer_done_cv;
 static once_flag timer_once = ONCE_FLAG_INIT;
 static struct nv_nano_timer *timers;
-static bool timer_thread_started;
+static thrd_t timer_thread_id;
+static bool timer_thread_started;   /* the thread runs and accepts timers */
+static bool timer_stop;
 static nv_state_t *rc_nv;
 static uint64_t rc_deadline_ns;
+static bool rc_running;             /* the RC callback is running */
+static int rc_runner;
 
 static int timer_thread(void *arg) {
     (void)arg;
     mtx_lock(&timer_lock);
-    for (;;) {
+    while (!timer_stop) {
         uint64_t now = nvrm_now_ns();
         struct nv_nano_timer *due = NULL;
         uint64_t next = UINT64_MAX;
@@ -758,9 +796,13 @@ static int timer_thread(void *arg) {
             if (rc_deadline_ns <= now) {
                 nv_state_t *nv = rc_nv;
                 rc_deadline_ns = now + 1000000000ull;
+                rc_running = true;
+                rc_runner = thread_id();
                 mtx_unlock(&timer_lock);
                 rm_run_rc_callback(nvrm_dev.sp, nv);
                 mtx_lock(&timer_lock);
+                rc_running = false;
+                cnd_broadcast(&timer_done_cv);
                 continue;
             }
             if (rc_deadline_ns < next) next = rc_deadline_ns;
@@ -785,6 +827,7 @@ static int timer_thread(void *arg) {
             }
         }
     }
+    mtx_unlock(&timer_lock);
     return 0;
 }
 
@@ -795,23 +838,49 @@ static void timers_setup(void) {
 }
 
 static bool timer_thread_ensure_locked(void) {
+    if (timer_stop) return false;
     if (timer_thread_started) return true;
-    thrd_t t;
-    if (thrd_create(&t, timer_thread, NULL) != thrd_success) return false;
-    thrd_detach(t);
+    if (thrd_create(&timer_thread_id, timer_thread, NULL) != thrd_success) return false;
     timer_thread_started = true;
     return true;
 }
 
 void nvrm_timers_init(void) { call_once(&timer_once, timers_setup); }
 
+/* RM's timers all run on this thread. It is started during bring-up, so a failure there ends the
+   start of the GPU instead of leaving timers that are accepted and never fire. */
+bool nvrm_timers_start(void) {
+    nvrm_timers_init();
+    mtx_lock(&timer_lock);
+    bool ok = timer_thread_ensure_locked();
+    mtx_unlock(&timer_lock);
+    return ok;
+}
+
+void nvrm_timers_stop(void) {
+    nvrm_timers_init();
+    mtx_lock(&timer_lock);
+    bool join = timer_thread_started;
+    timer_stop = true;
+    for (struct nv_nano_timer *t = timers; t; t = t->next) t->armed = false;
+    rc_nv = NULL;
+    mtx_unlock(&timer_lock);
+    cnd_broadcast(&timer_cv);
+    if (join) thrd_join(timer_thread_id, NULL);
+    mtx_lock(&timer_lock);
+    timer_thread_started = false;
+    mtx_unlock(&timer_lock);
+}
+
 NvS32 NV_API_CALL nv_start_rc_timer(nv_state_t *nv) {
     nvrm_timers_init();
     mtx_lock(&timer_lock);
-    nv->rc_timer_enabled = 1;
-    rc_nv = nv;
-    rc_deadline_ns = nvrm_now_ns() + 1000000000ull;
     bool ok = timer_thread_ensure_locked();
+    if (ok) {
+        nv->rc_timer_enabled = 1;
+        rc_nv = nv;
+        rc_deadline_ns = nvrm_now_ns() + 1000000000ull;
+    }
     mtx_unlock(&timer_lock);
     cnd_signal(&timer_cv);
     return ok ? 0 : -1;
@@ -822,21 +891,27 @@ NvS32 NV_API_CALL nv_stop_rc_timer(nv_state_t *nv) {
     mtx_lock(&timer_lock);
     nv->rc_timer_enabled = 0;
     if (rc_nv == nv) rc_nv = NULL;
+    /* RC recovery uses RM's state: it must not still run once the timer is stopped (it may stop
+       itself from inside the callback). */
+    while (rc_running && rc_runner != thread_id()) cnd_wait(&timer_done_cv, &timer_lock);
     mtx_unlock(&timer_lock);
     return 0;
 }
 
 void NV_API_CALL nv_create_nano_timer(nv_state_t *nv, void *event, nv_nano_timer_t **timer) {
     nvrm_timers_init();
-    struct nv_nano_timer *t = calloc(1, sizeof *t);
+    struct nv_nano_timer *t = NULL;
+    mtx_lock(&timer_lock);
+    /* A timer is only handed out while the thread that runs it exists. */
+    if (timer_thread_ensure_locked()) t = calloc(1, sizeof *t);
     if (t) {
         t->nv = nv;
         t->event = event;
-        mtx_lock(&timer_lock);
         t->next = timers;
         timers = t;
-        mtx_unlock(&timer_lock);
     }
+    mtx_unlock(&timer_lock);
+    if (!t) nvrm_log("NVRM: cannot create a nano timer");
     *timer = t;
 }
 
@@ -844,9 +919,14 @@ void NV_API_CALL nv_start_nano_timer(nv_state_t *nv, nv_nano_timer_t *timer, NvU
     (void)nv;
     if (!timer) return;
     mtx_lock(&timer_lock);
+    if (!timer_thread_ensure_locked()) {
+        /* Not armed: nothing would run it. (RM's start has no way to report this.) */
+        mtx_unlock(&timer_lock);
+        nvrm_log("NVRM: nano timer not started: the timer thread is not running");
+        return;
+    }
     timer->deadline_ns = nvrm_now_ns() + time_ns;
     timer->armed = true;
-    timer_thread_ensure_locked();
     mtx_unlock(&timer_lock);
     cnd_signal(&timer_cv);
 }

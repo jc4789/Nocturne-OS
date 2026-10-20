@@ -179,10 +179,12 @@ static void drop_textures(struct ngl_context *c) {
     for (unsigned i = 0; i < ST_ATTACHMENT_COUNT; i++) pipe_resource_reference(&c->textures[i], NULL);
 }
 
+static void init_texture(struct pipe_context *pipe, struct pipe_resource *texture, uint32_t value);
+
 static bool drawable_validate(struct st_context *st, struct pipe_frontend_drawable *drawable,
                               const enum st_attachment_type *statts, unsigned count,
                               struct pipe_resource **out, struct pipe_resource **resolve) {
-    (void)st; (void)resolve;
+    (void)resolve;
     struct ngl_context *c = (struct ngl_context *)drawable;
     struct pipe_screen *screen = drawable->fscreen->screen;
     if (c->tex_width != c->width || c->tex_height != c->height) {
@@ -210,6 +212,9 @@ static bool drawable_validate(struct st_context *st, struct pipe_frontend_drawab
             if (templ.format == PIPE_FORMAT_NONE) return false;
             c->textures[a] = screen->resource_create(screen, &templ);
             if (!c->textures[a]) return false;
+            /* A new buffer is defined before anything can see it: the driver gives no content, and
+               softpipe's zeros are wrong for depth. Color (0,0,0,0), depth 1, stencil 0. */
+            init_texture(st->pipe, c->textures[a], a == ST_ATTACHMENT_DEPTH_STENCIL ? 0x00ffffff : 0);
         }
         pipe_resource_reference(&out[i], c->textures[a]);
     }
@@ -321,7 +326,7 @@ bool ngl_resize(struct ngl_context *c, unsigned width, unsigned height) {
     if (width > limit || height > limit) return false;
     c->width = width;
     c->height = height;
-    /* The textures are rebuilt (zero-filled) at the next validation. */
+    /* The textures are rebuilt, and initialized (init_texture), at the next validation. */
     drop_textures(c);
     c->tex_width = c->tex_height = 0;
     p_atomic_inc(&c->base.stamp);
@@ -391,6 +396,14 @@ static void clear_texture(struct pipe_context *pipe, struct pipe_resource *textu
     struct pipe_box box;
     u_box_2d(0, 0, texture->width0, texture->height0, &box);
     pipe->clear_texture(pipe, texture, 0, &box, &value);
+}
+
+/* The initial content of a drawing buffer made by drawable_validate: queued on the GPU, written
+   directly by the CPU for softpipe. Nothing is pending on a resource that was just created, so
+   neither waits. */
+static void init_texture(struct pipe_context *pipe, struct pipe_resource *texture, uint32_t value) {
+    if (screen_on_gpu) clear_texture(pipe, texture, value);
+    else fill_texture(pipe, texture, value);
 }
 
 void ngl_clear_drawing_buffer(struct ngl_context *c) {

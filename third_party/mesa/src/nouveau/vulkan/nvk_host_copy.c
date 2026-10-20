@@ -407,8 +407,10 @@ nvk_copy_image_to_image(struct nvk_device *dev,
 
    void *dst_ptr;
    result = nvk_image_plane_map(dst_img_plane, NVKMD_MEM_MAP_WR, &dst_ptr);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      nvk_image_plane_unmap(src_img_plane);
       return result;
+   }
 
    /* Take into account the miplevel and array layer */
    dst_ptr += dst_level->offset_B;
@@ -482,6 +484,11 @@ nvk_copy_image_to_image(struct nvk_device *dev,
          src_extent_B.depth * src_extent_B.array_len * tmp_layer_stride_B;
       void *tmp_mem = vk_alloc(&dev->vk.alloc, tmp_size_B, 8,
                                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      if (tmp_mem == NULL) {
+         nvk_image_plane_unmap(src_img_plane);
+         nvk_image_plane_unmap(dst_img_plane);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
 
       const struct nil_Extent4D_Pixels src_level_extent_px =
          nil_image_level_extent_px(&src_img_plane->nil, src_miplevel);
