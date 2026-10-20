@@ -60,7 +60,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 未着手 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。修理済み、2 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -102,6 +102,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C32 | イベント（`nv_post_event`／`nv_get_event`）は不要 | 却下 → 修理済み | 接続ごとの `nvrm_file` に上限つきの待ち行列。GOP の画面は `nv_get_screen_info` で RM へ渡し、RM がその範囲を保つ。nvrm の死亡は NVK がチャネルの照会で `DEVICE_LOST` にする（`nvrm_alive`） |
 | C33 | RM が BAR を構成空間へ書き戻す必要は無い | 却下 → 修理済み | RM はリセット後（`kbifRestoreBarsAndCommand`、GC6 からの復帰の `kbifRestoreBar0`）に起動時の BAR の値を 32 ビットで書き戻す。カーネルは、起動時に見た値と同じ書込みだけを通す（戻せるが動かせない）。GC6 の経路は BAR0 だけ戻してデコードを入れるので、デコードには条件を付けない。MSI／MSI-X がリセットで消えたときの再設定は実機で未確認 |
 | C34 | 他機能のトークン、BAR 写像の長さ、セマフォの破棄は問題ない | 却下 → 修理済み | 他の機能のトークンは機能ごとに一つを使い回す（応答する機能だけ）。BAR 写像の長さはページに丸めたビューの長さを返す。`os_free_semaphore` は `cnd`／`mtx` を破棄する。`TIME_UTC` の期限は、Nocturne の `TIME_UTC` が戻らないので、壁時計が進んでも早く起きて単調時計で測り直すだけ |
+| C35 | RM の中にユーザーモードで実行できない命令は無い | 却下 → 修理済み | 実機で `nv_rdcr.c` の `osNv_rdcr4`（`mov %cr4`）が GPF（rip 0x46ec34、`RmInitCpuInfo` から）。nvrm.mk で同ファイルを外し、`os.c` が OSFXSR（常に有効）と CPUID.1:ECX 27（CR4.OSXSAVE の写し）から同じ値を返す。記号付きで再リンクした nvrm の逆アセンブル全体で、CR・DR・MSR・in／out・cli／sti・hlt・invlpg・wbinvd は他に 0 |
 
 ## 5. 担当と受け渡し
 
@@ -120,6 +121,14 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-20：実機 1 回目（ユーザー）。RTX 4070（AD104、10de:2786、副 19da:2714、PCIe 4.0 x16、
+  Above 4G・ReBAR 有効、画面は GPU に接続、BIOS 95.04.3E.C0.82）、AMD の iGPU 1002:164e も有り。
+  nvrm.log は「GPU 10de:2786 at 01:00.0, BAR0 16 MiB at 0xfb000000」と `_sysCreateOs` の 0x56
+  （無害、RM は続行）の後、nvrm が GPF（C35）。WebGL は softpipe（9 fps）。NOCTDATA が無く /data は RAM。
+  修理後、新しい `tests/nvrmtest.c`（edu 装置で nvrm を起動し、rm_init_rm を通って RM が装置を断り
+  状態 1 で終わるか）を QEMU で：修理前は状態 141 で 2 failed、修理後は `nvrmtest: 0 failed`、
+  `pcitest: 0 failed`。nvrm のシステムログの行に改行が無く、画面で繋がっていたのも修理。
 
 - 2026-10-20：GLM の静的監査の指摘を修理。BAR の書き戻し（C33）、他機能のトークンの使い回し、
   BAR 写像の長さ、セマフォの破棄（C34）。pcitest に「BAR へ自分の値を書き戻せる」「BAR を動かせない」を

@@ -91,10 +91,15 @@ static void log_emit(const char *text, size_t length, bool urgent) {
     while (length && (text[length - 1] == '\n' || text[length - 1] == '\r')) length--;
     mtx_lock(&log_lock);
     if (log_handle >= 0) {
-        for (size_t at = 0; at < length;) {
+        /* The system log keeps what it is sent as is: each line ends with its own newline. */
+        char piece[NVRM_LOG_CHUNK + 1];
+        for (size_t at = 0; at < length || !length;) {
             size_t part = length - at < NVRM_LOG_CHUNK ? length - at : NVRM_LOG_CHUNK;
-            n_channel_send(log_handle, text + at, part, -1);
+            memcpy(piece, text + at, part);
             at += part;
+            if (at == length) piece[part++] = '\n';
+            n_channel_send(log_handle, piece, part, -1);
+            if (!length) break;
         }
     }
     if (log_file_enabled) {
@@ -354,6 +359,17 @@ NvU32 NV_API_CALL os_get_cpu_count(void) {
 }
 
 NvU32 NV_API_CALL os_get_cpu_number(void) { return cpu_index(); }
+
+/* RM's cpu.c reads CR4 to learn whether the OS saves SSE and AVX state (OSFXSR, bit 9, and
+   OSXSAVE, bit 18). Its own nv_rdcr.c does that with "mov %cr4", which a program cannot run
+   (nvrm.mk leaves the file out). The same two answers are visible from here: every Nocturne
+   program runs SSE code, so OSFXSR is on, and CPUID.1:ECX bit 27 mirrors CR4.OSXSAVE. */
+NvU32 osNv_rdcr4(void);
+NvU32 osNv_rdcr4(void) {
+    uint32_t a = 1, b, c = 0, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    return 1u << 9 | (c & 1u << 27 ? 1u << 18 : 0);
+}
 
 NvU64 NV_API_CALL os_get_max_user_va(void) { return (1ull << 47) - 4096; }
 

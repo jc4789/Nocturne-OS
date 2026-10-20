@@ -27,7 +27,8 @@ NVRM_VERSION := 615.78.08
 SRCS :=
 SRCS_CXX :=
 include $(NVRM_DIR)/srcs.mk
-NVRM_SRCS := $(SRCS)
+# nv_rdcr.c reads CR4 with a privileged instruction; os.c answers osNv_rdcr4 instead.
+NVRM_SRCS := $(filter-out arch/nvalloc/unix/src/asm/x86/nv_rdcr.c,$(SRCS))
 NVRM_SRCS_CXX := $(SRCS_CXX)
 SRCS :=
 SRCS_CXX :=
@@ -140,7 +141,7 @@ nvrm-objs: nvrm-rm nvrm-os
 
 # Partial link of all RM objects: one nv-kernel.o like NVIDIA's Makefile makes. memcpy/memset
 # defined by RM's gcc_helper.c are made local so they cannot clash with libc's.
-$(NVRM_OUT)/nv-kernel.o: $(NVRM_OBJ)
+$(NVRM_OUT)/nv-kernel.o: $(NVRM_OBJ) ports/nvidia/nvrm.mk
 	@echo "  LD   $@"
 	@$(file >$@.rsp,$(NVRM_OBJ))
 	@$(LD) -m elf_x86_64 -r @$@.rsp -o $@
