@@ -3,9 +3,8 @@
    BAR 0 and runs rm_init_rm (RM's CPU, registry and OS objects, all before the GPU is touched),
    then RM must refuse the device and nvrm end with status 1. A crash there (status 128 + the
    CPU exception, e.g. 141 for "mov %cr4" in user mode) is what real hardware hit first.
-   Booted with appdrivers=any so this app may claim; compiled inside Nocturne with tcc. Run it
-   once without and once with displaydriver: the display that carries the screen is refused,
-   then claimed and held. Prints "nvrmtest: N failed". */
+   Booted with appdrivers=any so this app may claim; compiled inside Nocturne with tcc. Prints
+   "nvrmtest: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,56 +67,7 @@ int main(void) {
     /* the claim ends with nvrm: the device can be claimed again */
     n_handle again = n_pci_claim(e->bus, e->dev, e->func);
     CHECK(again >= 0, "claim after nvrm ended: %s", n_result_text(again));
-    if (again >= 0) {
-        n_result r = n_pci_hold_screen(again, true);
-        CHECK(r == -N_ERR_NOT_FOUND, "holding the screen through a function it is not in: %s", n_result_text(r));
-        n_handle_close(again);
-    }
-
-    /* The display that carries the screen is refused unless the system booted with displaydriver.
-       With it, RM's os_disable_console_access/os_enable_console_access: holds nest, an extra
-       release is refused, and a claim that ends while it holds gives the screen back (the
-       desktop must be drawn again afterwards). Run once with and once without the option. */
-    n_handle screen = -1;
-    bool refused = false;
-    for (int i = 0; i < n && screen < 0; i++) {
-        if (list[i].cls != 0x03) continue;
-        n_handle h = n_pci_claim(list[i].bus, list[i].dev, list[i].func);
-        struct n_pci_function info;
-        if (h == -N_ERR_DENIED) refused = true;
-        else if (h >= 0 && n_pci_info(h, &info) >= 0 && info.framebuffer_bar != N_PCI_NONE) screen = h;
-        else if (h >= 0) n_handle_close(h);
-    }
-    got = text ? n_system_log(text, 65535) : -1;
-    if (got >= 0) text[got] = 0;
-    if (refused) {
-        printf("nvrmtest: the display that shows the desktop stays with the system (no displaydriver)\n");
-        CHECK(got >= 0 && strstr(text, "carries the screen; it stays with the system"), "the refusal is logged");
-    }
-    CHECK(screen >= 0 || refused, "claim the display that carries the boot screen");
-    if (screen >= 0) {
-        n_result r1 = n_pci_hold_screen(screen, true), r2 = n_pci_hold_screen(screen, true);
-        n_result r3 = n_pci_hold_screen(screen, false), r4 = n_pci_hold_screen(screen, false);
-        n_result r5 = n_pci_hold_screen(screen, false);
-        CHECK(r1 == 0 && r2 == 0 && r3 == 0 && r4 == 0, "nested hold/release: %s %s %s %s", n_result_text(r1),
-              n_result_text(r2), n_result_text(r3), n_result_text(r4));
-        CHECK(r5 == -N_ERR_INVALID, "a release without a hold: %s", n_result_text(r5));
-        r1 = n_pci_hold_screen(screen, true);
-        CHECK(r1 == 0, "hold before the claim ends: %s", n_result_text(r1));
-        n_handle_close(screen);
-        /* the claim's BAR sizing pauses and resumes once, then the two holds above */
-        got = text ? n_system_log(text, 65535) : -1;
-        if (got >= 0) text[got] = 0;
-        const char *p = got >= 0 ? text : NULL;
-        int pauses = 0;
-        while (p && (p = strstr(p, "fb: drawing paused"))) {
-            const char *r = strstr(p, "fb: drawing resumed");
-            if (!r) break;
-            pauses++;
-            p = r + 1;
-        }
-        CHECK(pauses >= 3, "drawing paused and resumed %d times (sizing, nested holds, the claim ending: 3)", pauses);
-    }
+    if (again >= 0) n_handle_close(again);
 
     printf("nvrmtest: %d failed\n", failed);
     return failed != 0;

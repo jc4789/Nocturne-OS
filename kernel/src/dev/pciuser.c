@@ -37,7 +37,6 @@ struct pci_claim {
     unsigned refs;   /* the vnode and every BAR or DMA object made through it */
     bool released;   /* the last handle closed: BAR objects are revoked, the function stopped */
     bool dma_unsafe; /* stopping it was not confirmed: its DMA pages are never reused */
-    unsigned screen_holds; /* n_pci_hold_screen nesting; given back when the claim ends */
 };
 static struct pci_claim *claim_of_vector[256];
 
@@ -96,9 +95,6 @@ static void claim_release(struct vnode *v) {
     interrupts_off(c);
     pci_write16(d->bus, d->dev, d->func, 4, pci_read16(d->bus, d->dev, d->func, 4) & ~0x4u); /* bus mastering off */
     c->dma_unsafe = !function_quiet(d);
-    /* A driver that ended in the middle of rebuilding the way to the screen leaves it however
-       it is; drawing again is the only way the desktop can come back. */
-    for (; c->screen_holds; c->screen_holds--) fb_release();
     if (c->dma_unsafe)
         kprintf("pci: %02x:%02x.%u still has requests in flight; its DMA memory stays out of use\n",
                 d->bus, d->dev, d->func);
@@ -141,53 +137,6 @@ static struct pci_device *upstream_of(const struct pci_device *d) {
     return NULL;
 }
 
-/* The boot screen is drawn through this function's BAR (what n_pci_info reports). */
-static bool screen_in_bars(const struct pci_claim *c) {
-    if (!fb.phys) return false;
-    for (unsigned i = 0; i < 6; i++) {
-        uint32_t raw = c->d->bar[i];
-        if (raw & 1) continue;
-        uint64_t address = pci_bar_address(c->d, i), size = c->bar_size[i];
-        if (address && size && fb.phys >= address && fb.phys - address < size) return true;
-        if (((raw >> 1) & 3) == 2) i++;
-    }
-    return false;
-}
-
-/* The same question before anything is written to the function (sizing a BAR writes it). A BAR
-   is aligned to its size, so the screen can lie in it only within the alignment of its base, and
-   BARs do not overlap, so no other memory BAR may start between that base and the screen. */
-static uint64_t highest_bar_below_screen(void) {
-    uint64_t best = 0;
-    for (int n = 0; n < pci_count(); n++) {
-        const struct pci_device *d = pci_at(n);
-        /* a bridge has two BARs, the rest of its header is bus numbers and windows (a CardBus
-           bridge's header holds none to compare) */
-        uint32_t type = (pci_read32(d->bus, d->dev, d->func, 0x0C) >> 16) & 0x7F;
-        unsigned bars = type == 0 ? 6 : type == 1 ? 2 : 0;
-        for (unsigned i = 0; i < bars; i++) {
-            uint32_t raw = d->bar[i];
-            if (raw & 1) continue;
-            uint64_t address = pci_bar_address(d, i);
-            if (address && address <= fb.phys && address > best) best = address;
-            if (((raw >> 1) & 3) == 2) i++;
-        }
-    }
-    return best;
-}
-static bool screen_may_be_in(const struct pci_device *d) {
-    if (!fb.phys) return false;
-    uint64_t nearest = highest_bar_below_screen();
-    for (unsigned i = 0; i < 6; i++) {
-        uint32_t raw = d->bar[i];
-        if (raw & 1) continue;
-        uint64_t address = pci_bar_address(d, i);
-        if (address && address == nearest && fb.phys - address < (address & -address)) return true;
-        if (((raw >> 1) & 3) == 2) i++;
-    }
-    return false;
-}
-
 int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out) {
     struct task *t = task_process();
     /* Boot options: noappdrivers keeps every function with the kernel; appdrivers=any lets any
@@ -198,16 +147,6 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     struct pci_device *d = find_function(bus, dev, func);
     if (!d) return -N_ERR_NOT_FOUND;
     if (d->kernel_owned || d->claimed) return -N_ERR_BUSY;
-    /* The desktop is shown through this function. A driver that starts the device rebuilds the
-       way to that memory (NVIDIA's RM: BAR1 into virtual mode, with the screen held still for the
-       whole start, which can take minutes when it goes wrong), and the picture can stay dark after
-       it. Until a driver shows the desktop itself, only the boot option displaydriver hands such a
-       function to an app; without it the function is not touched at all (not even sized). */
-    if (screen_may_be_in(d) && !cmdline_has("displaydriver")) {
-        kprintf("pci: %02x:%02x.%u (%04x:%04x) carries the screen; it stays with the system (boot option "
-                "displaydriver lets an app drive it)\n", bus, dev, func, d->vendor, d->device);
-        return -N_ERR_DENIED;
-    }
     struct vnode *v = kzalloc(sizeof *v);
     struct pci_claim *c = kzalloc(sizeof *c);
     if (!v || !c) { kfree(v); kfree(c); return -N_ERR_NO_MEMORY; }
@@ -219,15 +158,10 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     c->d = d;
     c->v = v;
     c->refs = 1;
-    /* Sizing a BAR moves it and turns memory decoding off for a moment: nothing may be drawn
-       into a display's BARs meanwhile. */
-    bool display = d->cls == 0x03 && fb.addr;
-    if (display) fb_hold();
     for (unsigned i = 0; i < 6; i++) {
         c->bar_size[i] = pci_bar_size(d, i);
         if (c->bar_size[i] && !(d->bar[i] & 1) && ((d->bar[i] >> 1) & 3) == 2) i++; /* 64-bit: the upper half is no BAR */
     }
-    if (display) fb_release();
     struct file *f = vfs_open_vnode(v, O_RDWR);
     if (!f) { kfree(c); kfree(v); return -N_ERR_NO_MEMORY; }
     d->claimed = true;
@@ -404,21 +338,6 @@ int64_t pci_user_interrupts(struct file *f, uint32_t count) {
     }
     if (!ok) { interrupts_off(c); return -N_ERR_UNSUPPORTED; }
     return n;
-}
-
-int64_t pci_user_hold_screen(struct file *f, bool hold) {
-    struct pci_claim *c = claim_of(f);
-    if (!c) return -N_ERR_WRONG_KIND;
-    if (!screen_in_bars(c)) return -N_ERR_NOT_FOUND;
-    if (hold) {
-        c->screen_holds++;
-        fb_hold();
-        return 0;
-    }
-    if (!c->screen_holds) return -N_ERR_INVALID;
-    c->screen_holds--;
-    fb_release();
-    return 0;
 }
 
 int64_t pci_user_interrupt_take(struct file *f, int64_t timeout_ms) {

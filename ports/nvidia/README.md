@@ -23,11 +23,6 @@ libc 側の `n_pci_*`／`n_dma_*`／`n_shared_view` だけ（ソースには有�
 | `nvrm.c` | `main`、割り込みスレッド、起動手順 |
 | `nvrm_serve.c／.h`、`libnvrm.c`、`include/` | リクエストサーバー、クライアント側ライブラリー、通信規約（主担当の所有。ここでは変更しない） |
 
-実機で動かすには起動メニューの「Nocturne OS (NVIDIA driver test)」（起動オプション `displaydriver`）を選ぶ。
-GPU が画面を出しているとき、カーネルはこのオプション無しでは init に GPU を渡さない（既定の起動では nvrm は
-動かず、GPU には何も書かない）。RM は `rm_init_adapter` の全体を `os_disable_console_access` で挟むので、
-その間は画面とカーソルが止まる。経過は `/data/logs/nvrm.log`（保持の始めと終わり、画面が BAR1 の先頭か）。
-
 起動手順（`nvrm.c`）：init が `N_KIND_PCI` をハンドル 3 で渡す → `n_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
 `NVRM_REGISTRY_DWORDS`（環境変数、任意）を `rm_parse_option_string` へ → `rm_init_rm` → `rm_is_supported_device`
 → `rm_init_private_state` → `rm_init_event_locks` → `rm_set_rm_firmware_requested` → 割り込みスレッド

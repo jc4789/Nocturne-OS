@@ -24,4 +24,3 @@ int64_t pci_user_config_write(struct file *f, uint32_t offset, uint32_t width, u
 int64_t pci_user_bar(struct file *f, uint32_t bar, uint64_t *address, uint64_t *size);
 int64_t pci_user_interrupts(struct file *f, uint32_t count);
 int64_t pci_user_interrupt_take(struct file *f, int64_t timeout_ms);
-int64_t pci_user_hold_screen(struct file *f, bool hold);

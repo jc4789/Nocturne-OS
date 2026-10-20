@@ -48,11 +48,6 @@ static void start_drivers(void) {
         char where[16];
         snprintf(where, sizeof where, "%02x:%02x.%u", list[i].bus, list[i].dev, list[i].func);
         n_handle pci = n_pci_claim(list[i].bus, list[i].dev, list[i].func);
-        if (pci == -N_ERR_DENIED) {
-            printf("init: %s stays with the system (the screen is drawn through it, or app drivers are off); "
-                   "boot \"Nocturne OS (NVIDIA driver test)\" to start nvrm on it\n", where);
-            continue;
-        }
         if (pci < 0) {
             printf("init: cannot claim %s for nvrm (%s)\n", where, n_result_text(pci));
             continue;

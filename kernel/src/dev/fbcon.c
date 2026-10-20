@@ -262,12 +262,6 @@ void fbcon_set_enabled(bool on) {
 
 bool fbcon_enabled(void) { return ready && enabled; }
 
-void fbcon_repaint(void) {
-    if (!ready || !enabled) return;
-    mark(0, cv.h);
-    flush();
-}
-
 /* ---- the panic screen ---- */
 #include "arch/cpu.h"
 

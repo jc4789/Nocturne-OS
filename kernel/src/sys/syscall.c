@@ -1374,7 +1374,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
     case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
     case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:
-    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: case SYS_PCI_HOLD_SCREEN: {
+    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: {
         struct file *f = getfd_ref((int)a);
         if (!f) { ret = -N_ERR_NO_HANDLE; break; }
         if (r->rax == SYS_PCI_INFO) {
@@ -1384,7 +1384,6 @@ void syscall_dispatch(struct regs *r) {
         } else if (r->rax == SYS_PCI_CONFIG_READ) ret = pci_user_config_read(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
         else if (r->rax == SYS_PCI_CONFIG_WRITE) ret = pci_user_config_write(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
         else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
-        else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);
         else ret = pci_user_interrupt_take(f,(int64_t)b);
         vfs_close(f);
         break;

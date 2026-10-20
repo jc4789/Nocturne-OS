@@ -212,10 +212,7 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - アプリの中の装置ドライバー（例：NVIDIA の資源管理 `/bin/nvrm`、`docs/nvidia/LEDGER.md`）：
   - `n_pci_claim(bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。呼べるのは
     init だけで、init は起動するドライバーアプリへハンドルを渡す。カーネルのドライバーが使う
-    機能と、既に権利のある機能は `N_ERR_BUSY`。起動オプション `noappdrivers` で全部断る。
-    起動時の画面（デスクトップ）がその機能の BAR にあるときも、起動オプション `displaydriver` が
-    無ければ `N_ERR_DENIED`（装置には何も書かない。ドライバーが画面を自分で出せるまで、装置を
-    起動するドライバーは画面を止めたり消したりし得るため）。最後のハンドルが閉じると、カーネルは
+    機能と、既に権利のある機能は `N_ERR_BUSY`。起動オプション `noappdrivers` で全部断る。最後のハンドルが閉じると、カーネルは
     (1) その権利の BAR オブジェクトの写像を全アプリから外し（その範囲は予約のまま、触れると
     全 1 が読める読取り専用のページ。バスから消えた装置と同じ）、(2) 割り込みとバスマスターを
     止め、(3) 発行済みの DMA が終わるまで待つ（PCIe の Transactions Pending、上限 200 ms）。
@@ -235,12 +232,6 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を最大 32 本つなぎ、本数を返す。
     INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットがある間ハンドルは
     `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, timeout_ms)` がビットを取り出して消す。
-  - `n_pci_hold_screen(pci, hold)`：起動時の画面がその機能の BAR にあるとき、ドライバーが
-    CPU から画面への経路を作り直す間（NVIDIA の RM は GSP が BAR1 を仮想モードにする間）、
-    システムは画面へ書かない。`true` は書込み中のものが終わってから戻り、入れ子にできる。最後の
-    `false`（または権利の終わり）で画面全体を描き直す。画面が別の所なら `N_ERR_NOT_FOUND`。
-    時間の上限は無く、その間はカーソルも描かれない（カーネルも表示機能の BAR の大きさを調べる
-    間だけ同じように止める）。
   - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
     オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
     `n_dma_addresses` が各ページのバスアドレスを返す（IOMMU は使わないので物理アドレス）。
