@@ -7,6 +7,7 @@
     // native policy start removes the constructor outside isolation.
     /* @include js_dom_exception.js */
     const DOMException=domExceptionBridge.DOMException;
+    /* @include js_atob.js */
     const eventStates=new WeakMap(),listeners=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set;
     const eventDefine=Object.defineProperty,eventCreate=Object.create,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventSlice=Array.prototype.slice;
     const EventMap=Map,EventString=String,eventIndexOf=Array.prototype.indexOf,eventSplice=Array.prototype.splice;
