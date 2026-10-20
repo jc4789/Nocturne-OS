@@ -118,17 +118,17 @@ static void present_rows(size_t tile, void *context) {
 }
 
 /* ---- holding the screen ----
-   A driver that rebuilds the way the CPU reaches the framebuffer (NVIDIA's RM puts the BAR the
-   boot screen lies in into virtual mode) asks that nothing is written there meanwhile: a write
-   in that window can stall on the bus, and the BSP with it, which serves every interrupt. While
-   any hold lasts, fb_present draws nothing; when the last one ends, the screen is drawn again
-   whole. Both sides run in BSP task context; a present preempted half way is waited for. */
+   Whoever moves the way the CPU reaches the framebuffer (sizing the BAR it lies in; NVIDIA's RM
+   setting up that BAR, which it asks to happen with no writes to the screen) must have nothing
+   written there meanwhile. While any hold lasts, fb_present draws nothing, the cursor included;
+   when the last one ends, the screen is drawn again whole. Both sides run in task context; a
+   present preempted half way is waited for. */
 static unsigned hold_count;          /* atomic */
 static unsigned presenting;          /* atomic: fb_present calls between their check and return */
 
 void fb_hold(void) {
     if (__atomic_fetch_add(&hold_count, 1, __ATOMIC_ACQ_REL) == 0)
-        kprintf("fb: screen held by a display driver\n");
+        kprintf("fb: drawing paused\n");
     while (__atomic_load_n(&presenting, __ATOMIC_ACQUIRE)) sleep_ms(1);
     __asm__ volatile("sfence" ::: "memory"); /* the write-combined pixels already sent leave now */
 }
@@ -139,7 +139,7 @@ void fb_release(void) {
                                                   __ATOMIC_ACQUIRE)) {
     }
     if (before != 1) return;
-    kprintf("fb: screen released, drawing it again\n");
+    kprintf("fb: drawing resumed\n");
     fbcon_repaint();
     wm_repaint();
 }

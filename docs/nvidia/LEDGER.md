@@ -52,7 +52,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 |---|---|---|---|
 | P0 | 調査（RM の OS 層、カーネル、Mesa、Rust） | 主担当 | 済（下の主張表） |
 | P1 | GSP ファームウェアの入手（.run を実行せずに抽出） | 主担当 | 済（`local/firmware/nvidia/615.78.08/`、sha256 を §7 に記録、`git check-ignore` で除外を確認） |
-| P2 | カーネル ABI（D2・D3）と init の起動 | 主担当 | 済：QEMU（edu 装置、`appdrivers=any`）で `pcitest: 0 failed`。NVIDIA の無い機械では init は nvrm を起動しない |
+| P2 | カーネル ABI（D2・D3）と init の起動 | 主担当 | 済：QEMU（edu 装置、`appdrivers=any`）で `pcitest: 0 failed`。NVIDIA の無い機械では init は nvrm を起動しない。GPU が画面を出している機械でも、起動項目「Nocturne OS (NVIDIA driver test)」（`displaydriver`）以外では起動しない（C40） |
 | P3 | RM の取り込みとビルド（静的ライブラリー）、未定義の OS 関数の洗い出し | サブ B | 済：`third_party/nvidia-open`（無変更、`diff -rq` で一致と担当報告）、`ports/nvidia/nvrm.mk`。1100 オブジェクトがエラー 0。主担当が `NV_BSD` の影響（版名の文字列だけ）とファームウェア名の形を確認 |
 | P4 | Nocturne の OS 層と /bin/nvrm（GSP 起動まで） | 主担当＋サブ B | 書いた：`os.c`・`os_pci.c`・`rm_api.c`・`os_stubs.c`・`nvlink_os.c`・`spdm_stubs.c`・`nvrm.c`。RM が要る 397 シンボルすべてに定義あり。主担当の修正 2 件（割り込みの時間切れの符号、`ucodes_ga10x.bin` の同梱漏れ）。全体ビルドで `/bin/nvrm`（13 MB）がリンク。実機の GSP 起動は未確認（P10） |
 | P5 | Rust std の Nocturne 移植 | サブ A | ホストで済：std（rust-src 1.98.1 へのパッチ `ports/rust/nocturne.patch`）がビルドでき、`rusttest` が静的 ELF にリンクできる（未定義シンボル 0）。主担当がパッチ対象・ターゲット定義・C 構造体との一致を確認し、`rust.mk` を Makefile へ接続。QEMU の Nocturne 上で `rusttest: ok (38 checks)` |
@@ -107,7 +107,8 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C37 | 構成空間は自分の装置と上流のブリッジだけ読めればよい | 却下 → 修理済み | RM の `clStoreBusTopologyCache` は装置ごとに機能 0 が答えなければ他の機能を飛ばす。AMD ではルートポートが 00:01.1 で、00:01.0 はホストブリッジ。読めないと上流ポートも FHB（ホストブリッジ、チップセットの識別）も見つからない（実機で chipset.c:463／558 の表明と「Unable to get PCI port handles」）。カーネルは、上流の各ブリッジの装置の全機能とホストブリッジ（06/00）の読みも許す。無関係な装置は今まで通り `N_ERR_DENIED` |
 | C38 | rm_init_adapter が止まっても分かる | 却下 → 修理済み | GSP の起動はうまくいくと何も出さないので、固まったのか遅いのかが見分けられない。nvrm は rm_init_adapter の間 10 秒ごとに経過と処理した割り込みの数を、終わると所要時間と成否をログへ出す |
 | C39 | 装置のバスマスターは誰かが入れている | 却下 → 修理済み | RM はコマンドレジスターのメモリデコードとバスマスターを、リセット後の構成空間の復元でしか入れない（普段は OS 側のドライバーが装置を取るときに入れる前提）。カーネルの権利は入れず、終わるときに切るだけ。実機 3 回目で `s_dmaPoll_GA102: Error while waiting for Falcon DMA`（スクラバーの IMEM 読込み、4 秒で時間切れ）が約 60 秒ごとに繰り返した。nvrm が attach で 0x6 を立てる。C38 の行の間隔が 20 秒になっていたのも、早く起きた待ちが 10 秒を数え直していたためで、単調時計の決まった時刻で出すように直した |
-| C40 | RM の「コンソールを止めて」（`os_disable_console_access`）は無視してよい | 却下 → 修理済み | RM は GPU が起動画面を持つとき rm_init_adapter（と停止の経路）全体をこれで挟み、BAR1 経由の画面への書込みが physical RM の BAR1 の設定を邪魔しないようにする。C39 の修理でスクラバーを越えて GSP が BAR1 を作り直すようになり、実機 4 回目でマウスと画面が起動直後に止まった（カーネル内の WM の合成は BSP で `fb_present` が BAR1 へ書き、BSP は全割り込みを受ける）。カーネルに `n_pci_hold_screen`（`fb_present` を止め、最後の解除か権利の終わりで全体を描き直す）を足し、nvrm がこの二つをそれにつなぐ。RM が BAR1 の仮想モードで画面を写し続けるのは画面が BAR1 の先頭にあるときだけなので、nvrm が attach でその判定をログへ出す |
+| C40 | RM の「コンソールを止めて」（`os_disable_console_access`）は無視してよい | 却下 → 修理済み | RM は GPU が起動画面を持つとき rm_init_adapter（と停止の経路）全体をこれで挟み、BAR1 経由の画面への書込みが physical RM の BAR1 の設定を邪魔しないようにする。C39 の修理でスクラバーを越えて GSP が BAR1 を作り直すようになり、実機 4 回目でマウスか画面が起動から約 250 ms で止まった。カーネルに `n_pci_hold_screen`（`fb_present` を止め、最後の解除か権利の終わりで全体を描き直す）を足し、nvrm がこの二つをそれにつないだ。RM が BAR1 の仮想モードで画面を写し続けるのは画面が BAR1 の先頭にあるときだけなので、nvrm が attach でその判定を、保持の始めと終わり（経過 ms）を nvrm.log へ出す。**ただし保持は rm_init_adapter の全体（失敗すれば数十秒〜数分、戻らなければ永久）に及び、実機 5 回目は画面とカーソルが最初から動かなかった。** RM が画面を自分で出せるまで、画面を出している GPU は起動オプション `displaydriver`（起動項目「Nocturne OS (NVIDIA driver test)」）が無ければ claim を断り（装置には何も書かない）、既定の起動ではデスクトップを守る |
+| C41 | `nv_state_t` は 0 で埋めれば足りる | 却下 → 修理済み | `iovaspace_id` が 0 のままだと、RM は ID 0 の I/O VA 空間を作り、システムメモリの割当てをすべて `osIovaMap` → `nv_dma_map_alloc`（Nocturne には無い、`NV_ERR_NOT_SUPPORTED`）へ回す（`gpumgrGetGpuFromId(0)` も見つからない）。IOMMU が無いので `NV_IOVA_DOMAIN_NONE`（`~0u`）にする |
 
 ## 5. 担当と受け渡し
 
@@ -127,8 +128,19 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
-- 2026-10-20：実機 4 回目（ユーザー）。起動後すぐマウスと画面が止まった。C39 の修理で RM が GSP の起動へ
-  進み、RM が止めるよう求めた画面への書込み（C40）が BAR1 の作り直しと重なった。修理した。
+- 2026-10-20：ユーザーから「24c752ff で実機が固まる」。上の修理（既定の起動では画面を出している GPU を
+  nvrm へ渡さない）は 07:35 のビルドより後にも編集されていたので、仕上げて媒体を作り直した。カーネルの
+  判定は、画面より下で一番近い BAR がその機能のものかも見るようにした（別の GPU を画面の GPU と取り違え
+  ないため。ブリッジは BAR 2 本だけ読む）。あわせて C41（`iovaspace_id` が 0 のまま）を修理。
+  QEMU は実機のこの症状を再現しないため実行していない。実機は未確認。
+- 2026-10-20：実機 5 回目（ユーザー）。b9000ad5 の画面保持でマウス（画面）が最初から一度も動かない。
+  保持は rm_init_adapter の全体に及ぶ（RM の仕様、osapi.c）。画面を出している GPU は起動項目
+  「Nocturne OS (NVIDIA driver test)」でだけ nvrm へ渡すようにした。既定の起動では 4070 に何も
+  書かない。QEMU（edu＋標準 VGA）で両方の起動の nvrmtest が 0 件失敗、既定の起動でマウスと Files を
+  確認。実機は未確認。試験項目で起動したら、通常の起動に戻して `/data/logs/nvrm.log` を送ってもらう。
+- 2026-10-20：実機 4 回目（ユーザー）。起動から約 250 ms でマウスか画面が止まった。C39 の修理で RM が
+  GSP の起動へ進み、RM が止めるよう求めた画面への書込み（C40）が BAR1 の作り直しと重なったと見て
+  保持を足した（BSP が止まったのか画面だけが止まったのかは未確認のまま）。
 
 - 2026-10-20：実機 3 回目（ユーザー）。FHB と上流ポートの失敗は消えた。rm_init_adapter の中で、スクラバーの
   ucode を Falcon の IMEM へ DMA で読む `s_dmaTransfer_GA102`（kernel_gsp_falcon_ga102.c:242）が
@@ -225,7 +237,8 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
   単独コンパイル済み。サーバー側は担当 B の nvrm.c の形を見てから。
 - 2026-10-19：init が NVIDIA の表示機能を claim して `/bin/nvrm bb:dd.f` を起動（handle 3、
   ログはシステムログ、init は複製を閉じる）。`/bin/nvrm` が無い媒体では何もしない。
-  起動オプション `noappdrivers` でカーネルが claim を断る。
+  起動オプション `noappdrivers` でカーネルが claim を断る。画面を出している機能は `displaydriver`
+  が無ければ断る（2026-10-20、C40）。
 
 - 2026-10-19：カーネル側の ABI を実装。`kernel/src/dev/pciuser.c`（権利、構成空間、MSI／MSI-X、
   解放でバスマスター停止）、`syscall.c` の共有オブジェクトに範囲・view・キャッシュ属性・DMA を

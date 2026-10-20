@@ -305,6 +305,10 @@ NV_STATUS nvrm_pci_attach(void) {
     nv->handle = &self_token;
     nv->queue = nvrm_work_queue();
     nv->dma_mask = ~0ull;
+    /* No IOMMU: the GPU uses physical addresses (nv_requires_dma_remap). Any other value makes RM
+       create an I/O VA space under that id and send every system memory allocation through
+       nv_dma_map_alloc, which this platform does not have (RM's NV_IOVA_DOMAIN_NONE). */
+    nv->iovaspace_id = ~(NvU32)0;
     nv->primary_vga = g->cls == 0x03 && g->subcls == 0x00 && g->framebuffer_bar != N_PCI_NONE;
     nv->console_device = g->framebuffer_bar != N_PCI_NONE;
 
@@ -412,18 +416,27 @@ void NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *base, NvU32 *width, N
     *size = g->framebuffer_size;
 }
 
-/* RM brackets the start and the end of the adapter with these when the GPU carries the boot
-   screen: GSP (physical RM) puts BAR1 into virtual mode under it, and a CPU write to the screen
-   meanwhile can stall on the bus, and the processor that serves the desktop and its input with
-   it. The system stops drawing there until the matching enable; RM keeps the screen's place in
-   BAR1 mapped (nv_get_screen_info), so drawing then goes on where it was. */
+/* RM brackets the whole start and the end of the adapter with these when the GPU carries the
+   boot screen, so that no console write through BAR1 meets physical RM setting BAR1 up. The
+   system stops drawing there until the matching enable (the desktop stands still, the cursor
+   too); RM keeps the screen mapped at BAR1's start when it lies there (nvrm_pci_attach logs
+   which), so drawing then goes on where it was. The log file says how long the screen stood. */
+static unsigned held;        /* atomic: holds nest */
+static uint64_t held_since;  /* when the outermost one began */
 void NV_API_CALL os_disable_console_access(void) {
     n_result r = n_pci_hold_screen(nvrm_dev.pci, true);
     if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot hold the boot screen: %s", n_result_text(r));
+    if (r == 0 && __atomic_fetch_add(&held, 1, __ATOMIC_ACQ_REL) == 0) {
+        __atomic_store_n(&held_since, nvrm_now_ns(), __ATOMIC_RELEASE);
+        nvrm_log("NVRM: the screen stands still while RM sets up BAR1");
+    }
 }
 void NV_API_CALL os_enable_console_access(void) {
     n_result r = n_pci_hold_screen(nvrm_dev.pci, false);
     if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot release the boot screen: %s", n_result_text(r));
+    if (r == 0 && __atomic_sub_fetch(&held, 1, __ATOMIC_ACQ_REL) == 0)
+        nvrm_log("NVRM: the screen is drawn again after %llu ms",
+                 (unsigned long long)((nvrm_now_ns() - __atomic_load_n(&held_since, __ATOMIC_ACQUIRE)) / 1000000ull));
 }
 
 void NV_API_CALL nv_set_dma_address_size(nv_state_t *nv, NvU32 bits) {

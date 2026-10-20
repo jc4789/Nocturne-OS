@@ -23,7 +23,8 @@ bool fb_set_simulated(bool on); /* false: the scanout is not 8 bpc xRGB */
    that buffer's deep plane (display_abi.h) or NULL for 8-bit content. */
 void fb_present(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
                 int x, int y, int w, int h);
-/* A display driver rebuilding how the CPU reaches the framebuffer: fb_hold returns once nothing
+/* Moving how the CPU reaches the framebuffer (a BAR being sized, a display driver setting up the
+   BAR): fb_hold returns once nothing
    is being written there, and fb_present draws nothing until every hold is released; the last
    release draws the whole screen again. Task context (fb_hold sleeps). */
 void fb_hold(void);
