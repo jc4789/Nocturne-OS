@@ -31,6 +31,9 @@ struct ngl_context *ngl_get_current(void);
 /* The attributes actually provided (depth/stencil may differ from the
  * request when only one of them was asked for). */
 void ngl_get_attribs(const struct ngl_context *context, struct ngl_attribs *out);
+/* The selected backend's known caveat (currently CPU rasterization); not a
+ * claim about measured GPU speed or a context's requested power preference. */
+bool ngl_has_major_performance_caveat(const struct ngl_context *context);
 
 /* Reallocates the drawing buffer; its contents become transparent black. */
 bool ngl_resize(struct ngl_context *context, unsigned width, unsigned height);

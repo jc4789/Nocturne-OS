@@ -29,6 +29,7 @@ struct nnrm_chan;  /* a GPFIFO channel with its engine objects and doorbell */
 
 /* What the GPU is, from NV01_ROOT/NV01_DEVICE_0/NV20_SUBDEVICE_0 controls */
 struct nnrm_gpu_info {
+   uint32_t pci_target; /* native N_PCI_TARGET: stable across daemon readiness */
    uint16_t device_id;
    uint16_t subsystem_id;
    uint16_t subsystem_vendor_id;
@@ -52,12 +53,14 @@ struct nnrm_gpu_info {
    uint16_t cls_gpfifo, cls_vdec;
 };
 
-/* Number of GPUs RM has probed (0 when /bin/nvrm cannot be reached) */
+/* Number of NVIDIA display functions; an unready daemon is skipped on open. */
 uint32_t nnrm_gpu_count(void);
 
 /* Open GPU `gpu_index`: a new RM client, the device and subdevice, the
  * default GPU address space.  `info` may be NULL. */
 uint32_t nnrm_open(uint32_t gpu_index, struct nnrm **out, struct nnrm_gpu_info *info);
+/* Reopen the exact PCI function retained by a physical device. */
+uint32_t nnrm_open_device(uint32_t pci_target, struct nnrm **out, struct nnrm_gpu_info *info);
 void nnrm_close(struct nnrm *rm);
 
 /* VRAM in use (bytes), 0 when RM does not say */

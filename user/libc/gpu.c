@@ -16,6 +16,9 @@ int gpu_render(const struct n_gpu_render *r, uint32_t *pixels, size_t bytes) {
 int gpu_render_batch(const struct n_gpu_batch *r, uint32_t *pixels, size_t bytes) {
     return result(__syscall(SYS_GPU_RENDER_BATCH,(long)r,(long)pixels,(long)bytes,0,0));
 }
+int gpu_render_list(const struct n_gpu_scene *r,const struct n_gpu_vertex *v,uint32_t *pixels,size_t bytes) {
+    return result(__syscall(SYS_GPU_RENDER_LIST,(long)r,(long)v,(long)pixels,(long)bytes,0));
+}
 int gpu_blit(const struct n_gpu_blit *r,const uint32_t *source,size_t source_bytes,
              uint32_t *pixels,size_t bytes) {
     return result(__syscall(SYS_GPU_BLIT,(long)r,(long)source,(long)source_bytes,(long)pixels,(long)bytes));
@@ -59,35 +62,40 @@ static void raster(canvas_t *dst,const struct vertex *a,const struct vertex *b,c
         dst->px[(size_t)yy*dst->pitch+xx]=(col[3]<<24)|(col[0]<<16)|(col[1]<<8)|col[2];
     }
 }
-static bool valid_vertices(const struct n_gpu_vertex *v,unsigned count) {
-    for (unsigned i=0;i<count;i++) {
-        if (v[i].w<256 || v[i].w>16*65536 || v[i].x<-16*65536 || v[i].x>16*65536 ||
-            v[i].y<-16*65536 || v[i].y>16*65536 || v[i].z<-16*65536 || v[i].z>16*65536) return false;
+static bool valid_vertices(const struct n_gpu_vertex *v,size_t count) {
+    for (size_t i=0;i<count;i++) {
+        if (!v[i].w) return false;
     }
     return true;
 }
 static bool valid(const struct n_gpu_render *r) {
-    if (!r || !r->width || !r->height || r->width>N_GPU_MAX_SIDE || r->height>N_GPU_MAX_SIDE ||
+    if (!r || !n_gpu_frame_bytes(r->width,r->height) ||
         (r->operation!=N_GPU_CLEAR && r->operation!=N_GPU_TRIANGLE)) return false;
     return r->operation!=N_GPU_TRIANGLE || valid_vertices(r->vertex,3);
 }
 static void draw_triangle(canvas_t *dst,const struct n_gpu_vertex *source,unsigned width,unsigned height) {
-    struct vertex v[16], next[16]; unsigned n=3;
+    /* Clipping a convex triangle by six planes adds at most one vertex per
+       plane: 3+6 storage is a geometric bound, not an author input ceiling. */
+    enum {CLIP_PLANES=6,CLIP_VERTICES=3+CLIP_PLANES};
+    struct vertex v[CLIP_VERTICES], next[CLIP_VERTICES]; unsigned n=3;
     for (unsigned i=0;i<3;i++) {
         const struct n_gpu_vertex *a=&source[i];
         v[i].p[0]=a->x/65536.0; v[i].p[1]=a->y/65536.0; v[i].p[2]=a->z/65536.0; v[i].p[3]=a->w/65536.0;
         v[i].c[0]=(a->argb>>16)&255; v[i].c[1]=(a->argb>>8)&255; v[i].c[2]=a->argb&255; v[i].c[3]=a->argb>>24;
     }
     /* Homogeneous six-plane clipping before the perspective division. */
-    for (unsigned p=0;p<6 && n;p++) {
+    for (unsigned p=0;p<CLIP_PLANES && n;p++) {
         unsigned count=0;
         for (unsigned i=0;i<n;i++) {
             const struct vertex *a=&v[i],*b=&v[(i+1)%n]; double da=plane(a,p),db=plane(b,p);
-            if (da>=0 && count<16) next[count++]=*a;
-            if ((da<0)!=(db<0) && count<16) next[count++]=interpolate(a,b,da/(da-db));
+            if (da>=0) next[count++]=*a;
+            if ((da<0)!=(db<0)) next[count++]=interpolate(a,b,da/(da-db));
         }
         n=count; memcpy(v,next,n*sizeof *v);
     }
+    unsigned visible=0;
+    for(unsigned i=0;i<n;i++)if(v[i].p[3]>0)v[visible++]=v[i];
+    n=visible; /* the homogeneous origin has no perspective projection */
     for (unsigned i=1;i+1<n;i++) raster(dst,&v[0],&v[i],&v[i+1],width,height);
 }
 static canvas_t clipped(canvas_t *dst) {
@@ -117,7 +125,7 @@ int gfx_render3d_batch(canvas_t *dst,const struct n_gpu_batch *request) {
     if (!request) { errno=EINVAL; return -1; }
     /* Keep input stable even when its storage aliases the output canvas. */
     struct n_gpu_batch r=*request;
-    if (!dst || !dst->px || !r.width || !r.height || r.width>N_GPU_MAX_SIDE || r.height>N_GPU_MAX_SIDE ||
+    if (!dst || !dst->px || !n_gpu_frame_bytes(r.width,r.height) ||
         r.triangle_count>N_GPU_MAX_TRIANGLES || !valid_vertices(r.vertex,r.triangle_count*3) ||
         dst->w<(int)r.width || dst->h<(int)r.height || dst->pitch<dst->w) {
         errno=EINVAL; return -1;
@@ -140,4 +148,29 @@ int gfx_render3d_batch(canvas_t *dst,const struct n_gpu_batch *request) {
     gfx_fill(dst,0,0,r.width,r.height,r.clear_argb);
     for (unsigned i=0;i<r.triangle_count;i++) draw_triangle(dst,&r.vertex[i*3],r.width,r.height);
     return N_GPU_BACKEND_CPU;
+}
+int gfx_render3d_list(canvas_t *dst,const struct n_gpu_scene *request,const struct n_gpu_vertex *v) {
+    if(!request){errno=EINVAL;return -1;}
+    struct n_gpu_scene r=*request;
+    size_t bytes=n_gpu_frame_bytes(r.width,r.height),count=(size_t)r.triangle_count*3;
+    if(!dst || !dst->px || !bytes || (count && !v) ||
+       dst->w<(int)r.width || dst->h<(int)r.height || dst->pitch<dst->w){errno=EINVAL;return -1;}
+    size_t vertex_bytes=count*sizeof *v;
+    if(vertex_bytes/sizeof *v!=count){errno=EINVAL;return -1;}
+    struct n_gpu_vertex *snapshot=count?malloc(vertex_bytes):NULL;
+    if(count && !snapshot){errno=ENOMEM;return -1;}
+    if(count)memcpy(snapshot,v,vertex_bytes);
+    if(!valid_vertices(snapshot,count)){free(snapshot);errno=EINVAL;return -1;}
+    canvas_t safe=clipped(dst);dst=&safe;
+    bool direct=dst->w==(int)r.width && dst->h==(int)r.height && dst->pitch==(int)r.width &&
+        dst->cx0==0 && dst->cy0==0 && dst->cx1==(int)r.width && dst->cy1==(int)r.height;
+    uint32_t *pixels=direct?dst->px:malloc(bytes);
+    if(pixels && gpu_render_list(&r,snapshot,pixels,bytes)==0){
+        if(!direct){canvas_t src;gfx_init(&src,pixels,r.width,r.height,r.width);gfx_blit(dst,0,0,&src,0,0,r.width,r.height);free(pixels);}
+        free(snapshot);return N_GPU_BACKEND_VIRGL;
+    }
+    if(!direct)free(pixels);
+    gfx_fill(dst,0,0,r.width,r.height,r.clear_argb);
+    for(size_t i=0;i<r.triangle_count;i++)draw_triangle(dst,&snapshot[i*3],r.width,r.height);
+    free(snapshot);return N_GPU_BACKEND_CPU;
 }

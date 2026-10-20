@@ -49,6 +49,7 @@ nv_cap_t *nvidia_caps_root = NULL;
 
 thread_local bool nvrm_in_isr = false;
 thread_local bool nvrm_thread_admin = true;
+thread_local uint32_t nvrm_thread_process;
 
 /* ------------------------------------------------------------------------------------------
  * Logging
@@ -334,8 +335,9 @@ NV_STATUS NV_API_CALL os_schedule(void) {
  * Process, thread and CPU identity
  * ---------------------------------------------------------------------------------------- */
 NvU32 NV_API_CALL os_get_current_process(void) {
+    if (nvrm_thread_process) return nvrm_thread_process;
     n_result id = n_app_self();
-    return id > 0 ? (NvU32)id : 1;
+    return id > 0 && (uint64_t)id <= UINT32_MAX ? (NvU32)id : 0;
 }
 
 void NV_API_CALL os_get_current_process_name(char *name, NvU32 length) {
@@ -579,7 +581,8 @@ void NV_API_CALL os_release_rwlock_write(void *rwlock) {
     mtx_unlock(&l->lock);
 }
 
-/* A wait queue is a latch: wake_up before wait is not lost, and one wait consumes it. */
+/* RM's queue is a one-shot completion: waking releases every present and future
+   waiter. There is no reset operation in this OS interface. */
 struct os_wait_queue {
     mtx_t lock;
     cnd_t cv;
@@ -587,18 +590,23 @@ struct os_wait_queue {
 };
 
 NV_STATUS NV_API_CALL os_alloc_wait_queue(os_wait_queue **queue) {
+    if (!queue) return NV_ERR_INVALID_ARGUMENT;
     os_wait_queue *q = calloc(1, sizeof *q);
     if (!q) return NV_ERR_NO_MEMORY;
-    mtx_init(&q->lock, mtx_plain);
-    cnd_init(&q->cv);
+    if (mtx_init(&q->lock, mtx_plain) != thrd_success) { free(q); return NV_ERR_NO_MEMORY; }
+    if (cnd_init(&q->cv) != thrd_success) { mtx_destroy(&q->lock); free(q); return NV_ERR_NO_MEMORY; }
     *queue = q;
     return NV_OK;
 }
-void NV_API_CALL os_free_wait_queue(os_wait_queue *queue) { free(queue); }
+void NV_API_CALL os_free_wait_queue(os_wait_queue *queue) {
+    if (!queue) return;
+    cnd_destroy(&queue->cv);
+    mtx_destroy(&queue->lock);
+    free(queue);
+}
 static void wait_queue_wait(os_wait_queue *q) {
     mtx_lock(&q->lock);
     while (!q->signaled) cnd_wait(&q->cv, &q->lock);
-    q->signaled = false;
     mtx_unlock(&q->lock);
 }
 void NV_API_CALL os_wait_uninterruptible(os_wait_queue *queue) { wait_queue_wait(queue); }
@@ -606,8 +614,8 @@ void NV_API_CALL os_wait_interruptible(os_wait_queue *queue) { wait_queue_wait(q
 void NV_API_CALL os_wake_up(os_wait_queue *queue) {
     mtx_lock(&queue->lock);
     queue->signaled = true;
-    mtx_unlock(&queue->lock);
     cnd_broadcast(&queue->cv);
+    mtx_unlock(&queue->lock);
 }
 
 /* ------------------------------------------------------------------------------------------

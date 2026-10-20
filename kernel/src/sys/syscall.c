@@ -275,8 +275,13 @@ static int64_t stop_tree(int pid, int include_self) {
  * it, then that type for good (x86 forbids one page with two types). */
 #define SHARED_LEAF (PAGE_SIZE/sizeof(uint64_t))
 enum {SHARED_RAM,SHARED_DEMAND,SHARED_RANGE,SHARED_VIEW};
+/* Physical views remain flattened. Revocation ancestry is independent of the
+   backing, so creating a child never escapes an issuer's cancellation scope.
+   References are released iteratively, not through an unbounded C call stack. */
+struct shared_scope {struct shared_scope *parent;size_t refs;int issuer;bool revoked;};
 struct shared_pages {
-    size_t count;uint8_t kind,cache;bool dma,owned;
+    size_t count;uint8_t kind,cache;bool dma,owned,wc_allowed;
+    struct shared_scope *scope;
     uint32_t maps;            /* a DMA root: mappings of it or its views, in any process */
     struct pci_claim *claim;  /* a BAR or DMA root: the claim it was made through */
     uint64_t base;struct file *parent;size_t first; /* a range's first frame; a view's object and first page */
@@ -289,6 +294,17 @@ static size_t shared_slots(const struct shared_pages *p) {
 static struct shared_pages *shared_root(struct shared_pages *p) {
     while(p->kind==SHARED_VIEW)p=p->parent->vn->priv;
     return p;
+}
+static bool scope_revoked(const struct shared_scope *s) {
+    for(;s;s=s->parent)if(s->revoked)return true;
+    return false;
+}
+static bool scope_within(const struct shared_scope *s,const struct shared_scope *ancestor) {
+    for(;s;s=s->parent)if(s==ancestor)return true;
+    return false;
+}
+static void scope_drop(struct shared_scope *s) {
+    while(s && !--s->refs){struct shared_scope *parent=s->parent;kfree(s);s=parent;}
 }
 /* BSP-owned, called with interrupts disabled or from the fault handler. */
 static uint64_t shared_frame(struct shared_pages *p,size_t index,bool create) {
@@ -316,6 +332,7 @@ static void shared_release(struct vnode *v) {
         }
         if(p->kind==SHARED_RANGE && p->owned && !keep)for(size_t i=0;i<p->count;i++)pmm_free(p->base+i*PAGE_SIZE);
         if(p->parent)vfs_close(p->parent);
+        scope_drop(p->scope);
         pci_user_drop(p->claim);
         kfree(p);
     }
@@ -358,7 +375,8 @@ static int64_t new_handle(int64_t r,struct file *f) {
 }
 static int64_t sys_shared_create(size_t bytes,bool demand) {
     struct file *f=NULL;
-    return new_handle(shared_object(bytes,demand,O_RDWR,&f),f);
+    int64_t r=shared_object(bytes,demand,O_RDWR,&f);
+    return new_handle(r,f);
 }
 static uint64_t cache_pte(unsigned cache) {
     if(cache==N_CACHE_WRITE_COMBINE && pat_supported())return PTE_PWT|PTE_PAT4K; /* PAT index 5 */
@@ -371,15 +389,17 @@ static int64_t sys_pci_bar(int h,uint32_t bar) {
     struct file *pci=getfd_ref(h);
     if(!pci)return -N_ERR_NO_HANDLE;
     uint64_t address=0,size=0;int64_t r=pci_user_bar(pci,bar,&address,&size);
+    bool wc_allowed=pci_user_bar_prefetchable(pci,bar);
     if(r>=0 && size>SIZE_MAX)r=-N_ERR_TOO_LARGE;
     struct vnode *v;struct shared_pages *p=r<0?NULL:shared_new(size,SHARED_RANGE,0,&v);
     if(p)p->claim=pci_user_hold(pci);
     vfs_close(pci);
     if(r<0)return r;
     if(!p)return -N_ERR_NO_MEMORY;
-    p->base=address;p->count=size/PAGE_SIZE;p->cache=N_CACHE_UNCACHED;
+    p->base=address;p->count=size/PAGE_SIZE;p->cache=N_CACHE_UNCACHED;p->wc_allowed=wc_allowed;
     struct file *f=NULL;
-    return new_handle(shared_open(v,O_RDWR,&f),f);
+    r=shared_open(v,O_RDWR,&f);
+    return new_handle(r,f);
 }
 /* Zeroed RAM a claimed function may reach by DMA. A contiguous run is allocated whole; pages
    below 4 GiB come from the low end of memory, where the allocator's run search begins. */
@@ -418,7 +438,8 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
     }
     p->dma=true;
     struct file *f=NULL;
-    return new_handle(shared_open(v,O_RDWR,&f),f);
+    r=shared_open(v,O_RDWR,&f);
+    return new_handle(r,f);
 }
 /* Bus addresses of a DMA object's (or a device range's) pages, also through views. */
 static int64_t sys_dma_addresses(int h,size_t first,uint64_t *uout,size_t count) {
@@ -426,7 +447,7 @@ static int64_t sys_dma_addresses(int h,size_t first,uint64_t *uout,size_t count)
     if(!f)return -N_ERR_NO_HANDLE;
     int64_t r=0;struct shared_pages *p=f->vn->priv;
     if(f->vn->type!=VT_SHARED || (!shared_root(p)->dma && shared_root(p)->kind!=SHARED_RANGE))r=-N_ERR_WRONG_KIND;
-    else if(!shared_root(p)->dma && pci_user_revoked(shared_root(p)->claim))r=-N_ERR_CLOSED;
+    else if(scope_revoked(p->scope) || (!shared_root(p)->dma && pci_user_revoked(shared_root(p)->claim)))r=-N_ERR_CLOSED;
     else if(first>=p->count)r=-N_ERR_INVALID;
     for(size_t done=0,n=r<0?0:MIN(count,p->count-first);done<n;){
         uint64_t piece[64];size_t k=MIN(n-done,ARRAY_SIZE(piece));
@@ -441,15 +462,19 @@ static int64_t sys_dma_addresses(int h,size_t first,uint64_t *uout,size_t count)
 /* Part of a shared object as a new one with its own caching. Device memory only uncached or
    write-combining, and not after its claim ended; DMA RAM in its one type (the first other
    type asked while nothing maps it becomes that type); other objects only as they are. */
-static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache) {
+static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache,uint32_t maximum) {
     struct file *f=getfd_ref(h);
     if(!f)return -N_ERR_NO_HANDLE;
     int64_t r=0;
     if(f->vn->type!=VT_SHARED)r=-N_ERR_WRONG_KIND;
     else if(!bytes || (offset|bytes)&(PAGE_SIZE-1) || offset>f->vn->size || bytes>f->vn->size-offset ||
-            cache>N_CACHE_UNCACHED)r=-N_ERR_INVALID;
+            cache>N_CACHE_UNCACHED || (maximum && maximum!=N_MEMORY_READ && maximum!=N_MEMORY_READ_WRITE))r=-N_ERR_INVALID;
     if(r<0){vfs_close(f);return r;}
     struct shared_pages *src=f->vn->priv,*root=shared_root(src);
+    if(scope_revoked(src->scope)){vfs_close(f);return -N_ERR_CLOSED;}
+    int access=f->flags&O_ACCMODE;
+    if(maximum==N_MEMORY_READ_WRITE && access==O_RDONLY){vfs_close(f);return -N_ERR_DENIED;}
+    if(maximum==N_MEMORY_READ)access=O_RDONLY;
     bool device=root->kind==SHARED_RANGE && !root->owned;
     if(device && pci_user_revoked(root->claim)){vfs_close(f);return -N_ERR_CLOSED;}
     if(root->dma){
@@ -462,10 +487,14 @@ static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache) 
             root->cache=(uint8_t)cache;
         }
     }else if(cache==N_CACHE_DEFAULT)cache=src->cache;
-    else if(device?cache==N_CACHE_WRITE_BACK:cache!=src->cache){vfs_close(f);return -N_ERR_DENIED;}
+    else if(device?(cache==N_CACHE_WRITE_BACK || (cache==N_CACHE_WRITE_COMBINE && !root->wc_allowed)):cache!=src->cache){vfs_close(f);return -N_ERR_DENIED;}
+    struct shared_scope *scope=kzalloc(sizeof *scope);
+    if(!scope){vfs_close(f);return -N_ERR_NO_MEMORY;}
+    scope->refs=1;scope->issuer=task_process()->pid;scope->parent=src->scope;
+    if(scope->parent)scope->parent->refs++;
     struct vnode *v;struct shared_pages *p=shared_new(bytes,SHARED_VIEW,0,&v);
-    if(!p){vfs_close(f);return -N_ERR_NO_MEMORY;}
-    int access=f->flags&O_ACCMODE;
+    if(!p){scope_drop(scope);vfs_close(f);return -N_ERR_NO_MEMORY;}
+    p->scope=scope;
     p->count=bytes/PAGE_SIZE;p->first=offset/PAGE_SIZE;p->cache=(uint8_t)cache;p->parent=f; /* the view keeps our reference */
     if(src->kind==SHARED_VIEW){
         /* A view of a view points at the root object, so a chain of views (which any app can
@@ -473,7 +502,25 @@ static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache) 
         p->parent=vfs_dup(src->parent);p->first+=src->first;vfs_close(f);
     }
     struct file *view=NULL;
-    return new_handle(shared_open(v,access,&view),view);
+    r=shared_open(v,access,&view);
+    return new_handle(r,view);
+}
+static int64_t sys_shared_revoke(int h) {
+    struct file *f=getfd_ref(h);
+    if(!f)return -N_ERR_NO_HANDLE;
+    if(f->vn->type!=VT_SHARED){vfs_close(f);return -N_ERR_WRONG_KIND;}
+    struct shared_scope *scope=((struct shared_pages *)f->vn->priv)->scope;
+    if(!scope || scope->issuer!=task_process()->pid){vfs_close(f);return -N_ERR_DENIED;}
+    /* Revoked is published before any PTE removal, including SMP shootdown.
+       A concurrent fault cannot restore a page while cancellation runs. */
+    scope->revoked=true;
+    for(struct task *t=task_list;t;t=t->all_next){
+        if(t->is_thread || !t->pml4 || t->pml4==kernel_pml4)continue;
+        for(struct shared_mapping *m=t->shared_mappings;m;m=m->next)
+            if(scope_within(((struct shared_pages *)m->file->vn->priv)->scope,scope))
+                vmm_user_free(t->pml4,m->va,m->bytes);
+    }
+    vfs_close(f);return 0;
 }
 /* Read-only ELF segments: every task running the same program bytes maps one
  * set of frames, so concurrent instances (a worker pool) hold one copy of their
@@ -571,6 +618,7 @@ bool shared_demand_fault(uint64_t addr,bool write) {
     for(struct shared_mapping *m=owner->shared_mappings;m;m=m->next){
         if(page<m->va || page-m->va>=m->bytes)continue;
         struct shared_pages *p=m->file->vn->priv,*root=shared_root(p);
+        if(scope_revoked(p->scope))break;
         if(root->kind==SHARED_RANGE && !root->owned && pci_user_revoked(root->claim)){
             /* The device's driver ended. One kernel page, all-ones at first, stands in for every
                register and aperture page: reads see a function gone from the bus, writes (a
@@ -607,6 +655,7 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
     /* the handle's own rights bound the mapping's: a read-only handle maps read-only */
     if(access==N_MEMORY_READ_WRITE && (f->flags&O_ACCMODE)==O_RDONLY){vfs_close(f);return -N_ERR_DENIED;}
     struct shared_pages *root=shared_root(f->vn->priv);
+    if(scope_revoked(((struct shared_pages *)f->vn->priv)->scope)){vfs_close(f);return -N_ERR_CLOSED;}
     if(root->kind==SHARED_RANGE && !root->owned && pci_user_revoked(root->claim)){vfs_close(f);return -N_ERR_CLOSED;}
     uint64_t irq;
     bytes=ALIGN_UP(bytes,PAGE_SIZE);
@@ -804,6 +853,23 @@ static int64_t sys_system_log(char *buf, size_t n) {
     return klog_read(buf, n);
 }
 
+/* GPU requests can now sleep, and their images no longer have a small fixed
+   extent. Page-sized user operations revalidate after every possible switch.
+   Keep this local to GPU IO: other APIs retain their established atomicity. */
+static int gpu_user_span(void *pointer,size_t bytes,bool write) {
+    uint64_t base=(uint64_t)pointer;
+    if(base>=USER_TOP || bytes>USER_TOP-base)return -N_ERR_BAD_ADDRESS;
+    for(size_t at=0;at<bytes;){
+        size_t piece=MIN(bytes-at,(size_t)PAGE_SIZE);
+        bool valid=write?user_ok_w((uint8_t *)pointer+at,piece):user_ok((uint8_t *)pointer+at,piece);
+        if(!valid)return -N_ERR_BAD_ADDRESS;
+        at+=piece;
+        if(need_resched)schedule();
+        if(current_task->killed)return -N_ERR_STOPPED;
+    }
+    return 0;
+}
+
 /* ---- native ABI (docs/nocturne-native-abi.md) ---- */
 
 /* Paths are complete: there is no working directory to resolve against. */
@@ -843,6 +909,18 @@ static int copy_to_user(void *udst, const void *src, size_t n) {
     if (ok) memcpy(udst, src, n);
     irq_restore(flags);
     return ok ? 0 : -N_ERR_BAD_ADDRESS;
+}
+static int gpu_user_copy(void *destination,const void *source,size_t bytes,bool output) {
+    for(size_t at=0;at<bytes;){
+        size_t piece=MIN(bytes-at,(size_t)PAGE_SIZE);
+        int r=output?copy_to_user((uint8_t *)destination+at,(const uint8_t *)source+at,piece):
+                     copy_from_user((uint8_t *)destination+at,(const uint8_t *)source+at,piece);
+        if(r<0)return r;
+        at+=piece;
+        if(need_resched)schedule();
+        if(current_task->killed)return -N_ERR_STOPPED;
+    }
+    return 0;
 }
 
 static int64_t sys_handle_close(int h) {
@@ -1364,10 +1442,12 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SHARED_CREATE: ret = sys_shared_create(a,false); break;
     case SYS_SHARED_RESERVE: ret = sys_shared_create(a,true); break;
     case SYS_SHARED_MAP: ret = sys_shared_map((int)a,b,(int)c); break;
-    case SYS_SHARED_VIEW: ret = sys_shared_view((int)a,b,c,(uint32_t)d); break;
+    case SYS_SHARED_VIEW: ret = sys_shared_view((int)a,b,c,(uint32_t)d,(uint32_t)e); break;
+    case SYS_SHARED_REVOKE: ret = sys_shared_revoke((int)a); break;
     case SYS_PCI_CLAIM: {
         struct file *f = NULL;
-        ret = new_handle(pci_user_claim((uint8_t)a,(uint8_t)b,(uint8_t)c,&f),f);
+        ret = pci_user_claim((uint8_t)a,(uint8_t)b,(uint8_t)c,&f);
+        ret = new_handle(ret,f);
         break;
     }
     case SYS_PCI_BAR: ret = sys_pci_bar((int)a,(uint32_t)b); break;
@@ -1484,13 +1564,17 @@ void syscall_dispatch(struct regs *r) {
         struct n_gpu_render request;
         if (!user_ok((void *)a, sizeof request)) { ret = -N_ERR_BAD_ADDRESS; break; }
         memcpy(&request, (void *)a, sizeof request);
-        if (!request.width || !request.height || request.width > N_GPU_MAX_SIDE || request.height > N_GPU_MAX_SIDE) {
+        if (!n_gpu_frame_bytes(request.width,request.height)) {
             ret = -N_ERR_INVALID; break;
         }
-        size_t bytes = (size_t)request.width * request.height * sizeof(uint32_t);
+        size_t bytes = n_gpu_frame_bytes(request.width,request.height);
         if (c < bytes) { ret = -N_ERR_INVALID; break; }
-        if (!user_ok_w((void *)b, bytes)) { ret = -N_ERR_BAD_ADDRESS; break; }
-        ret = gpu_render(&request, (uint32_t *)b, bytes);
+        ret=gpu_user_span((void *)b,bytes,true);if(ret<0)break;
+        uint32_t *pixels=kmalloc(bytes);
+        if(!pixels){ret=-N_ERR_NO_MEMORY;break;}
+        ret=gpu_render(&request,pixels,bytes);
+        if(!ret)ret=gpu_user_copy((void *)b,pixels,bytes,true);
+        kfree(pixels);
         break;
     }
     case SYS_GPU_RENDER_BATCH: {
@@ -1500,14 +1584,36 @@ void syscall_dispatch(struct regs *r) {
         if (!user_ok((void *)a, sizeof request)) { ret = -N_ERR_BAD_ADDRESS; break; }
         memcpy(&request, (void *)a, sizeof request);
         if (!request.width || !request.height ||
-            request.width > N_GPU_MAX_SIDE || request.height > N_GPU_MAX_SIDE ||
+            !n_gpu_frame_bytes(request.width,request.height) ||
             request.triangle_count > N_GPU_MAX_TRIANGLES) {
             ret = -N_ERR_INVALID; break;
         }
-        size_t bytes = (size_t)request.width * request.height * sizeof(uint32_t);
+        size_t bytes = n_gpu_frame_bytes(request.width,request.height);
         if (c < bytes) { ret = -N_ERR_INVALID; break; }
-        if (!user_ok_w((void *)b, bytes)) { ret = -N_ERR_BAD_ADDRESS; break; }
-        ret = gpu_render_batch(&request, (uint32_t *)b, bytes);
+        ret=gpu_user_span((void *)b,bytes,true);if(ret<0)break;
+        uint32_t *pixels=kmalloc(bytes);
+        if(!pixels){ret=-N_ERR_NO_MEMORY;break;}
+        ret=gpu_render_batch(&request,pixels,bytes);
+        if(!ret)ret=gpu_user_copy((void *)b,pixels,bytes,true);
+        kfree(pixels);
+        break;
+    }
+    case SYS_GPU_RENDER_LIST: {
+        struct n_gpu_scene request;
+        if(copy_from_user(&request,(const void *)a,sizeof request)<0){ret=-N_ERR_BAD_ADDRESS;break;}
+        size_t bytes=n_gpu_frame_bytes(request.width,request.height);
+        size_t vertices=(size_t)request.triangle_count*3,vertex_bytes=vertices*sizeof(struct n_gpu_vertex);
+        if(!bytes || d<bytes || vertex_bytes/sizeof(struct n_gpu_vertex)!=vertices){ret=-N_ERR_INVALID;break;}
+        ret=vertex_bytes?gpu_user_span((void *)b,vertex_bytes,false):0;
+        if(!ret)ret=gpu_user_span((void *)c,bytes,true);
+        if(ret<0)break;
+        struct n_gpu_vertex *snapshot=vertex_bytes?kmalloc(vertex_bytes):NULL;
+        uint32_t *pixels=kmalloc(bytes);
+        if((vertex_bytes && !snapshot) || !pixels){kfree(snapshot);kfree(pixels);ret=-N_ERR_NO_MEMORY;break;}
+        ret=vertex_bytes?gpu_user_copy(snapshot,(const void *)b,vertex_bytes,false):0;
+        if(!ret)ret=gpu_render_list(&request,snapshot,pixels,bytes);
+        if(!ret)ret=gpu_user_copy((void *)c,pixels,bytes,true);
+        kfree(snapshot);kfree(pixels);
         break;
     }
     case SYS_GPU_BLIT: {
@@ -1516,25 +1622,29 @@ void syscall_dispatch(struct regs *r) {
         memcpy(&request, (void *)a, sizeof request);
         if (!request.width || !request.height ||
             !request.source_width || !request.source_height ||
-            request.width > N_GPU_MAX_SIDE || request.height > N_GPU_MAX_SIDE ||
-            request.source_width > N_GPU_MAX_SIDE || request.source_height > N_GPU_MAX_SIDE ||
+            !n_gpu_frame_bytes(request.width,request.height) ||
+            !n_gpu_frame_bytes(request.source_width,request.source_height) ||
             !request.source_w || !request.source_h ||
             request.source_x > request.source_width || request.source_y > request.source_height ||
             request.source_w > request.source_width - request.source_x ||
             request.source_h > request.source_height - request.source_y) {
             ret = -N_ERR_INVALID; break;
         }
-        size_t source_bytes = (size_t)request.source_width * request.source_height * sizeof(uint32_t);
-        size_t output_bytes = (size_t)request.width * request.height * sizeof(uint32_t);
+        size_t source_bytes = n_gpu_frame_bytes(request.source_width,request.source_height);
+        size_t output_bytes = n_gpu_frame_bytes(request.width,request.height);
         if (c < source_bytes || e < output_bytes) { ret = -N_ERR_INVALID; break; }
-        if (!user_ok((void *)b, source_bytes) || !user_ok_w((void *)d, output_bytes)) {
-            ret = -N_ERR_BAD_ADDRESS; break;
-        }
-        /* The BSP-owned driver snapshots all source pixels before using the
-           device or touching output. No extra megabyte allocation per call;
-           input/output/request aliases are safe after the copies complete. */
-        ret = gpu_blit(&request, (const uint32_t *)b, source_bytes,
-                       (uint32_t *)d, output_bytes);
+        ret=gpu_user_span((void *)b,source_bytes,false);
+        if(!ret)ret=gpu_user_span((void *)d,output_bytes,true);
+        if(ret<0)break;
+        /* Snapshot input before any blocking resource/fence operation. Private
+           output is copied only after completion and user-span revalidation:
+           a sibling may unmap the caller's memory while this thread sleeps. */
+        uint32_t *source=kmalloc(source_bytes),*pixels=kmalloc(output_bytes);
+        if(!source || !pixels){kfree(source);kfree(pixels);ret=-N_ERR_NO_MEMORY;break;}
+        ret=gpu_user_copy(source,(const void *)b,source_bytes,false);
+        if(!ret)ret=gpu_blit(&request,source,source_bytes,pixels,output_bytes);
+        if(!ret)ret=gpu_user_copy((void *)d,pixels,output_bytes,true);
+        kfree(source);kfree(pixels);
         break;
     }
     case SYS_YIELD: schedule(); ret = 0; break;

@@ -363,6 +363,10 @@ n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size
 n_handle n_shared_view(n_handle shared, size_t offset, size_t bytes, uint32_t cache) {
     return (n_handle)NC5(SYS_SHARED_VIEW, shared, offset, bytes, cache, 0);
 }
+n_handle n_shared_view_access(n_handle shared, size_t offset, size_t bytes, uint32_t cache, uint32_t access) {
+    return (n_handle)NC5(SYS_SHARED_VIEW, shared, offset, bytes, cache, access);
+}
+n_result n_shared_revoke(n_handle view) { return NC5(SYS_SHARED_REVOKE, view, 0, 0, 0, 0); }
 n_handle n_audio_open(void) { return (n_handle)NC5(SYS_AUDIO_OPEN, 0, 0, 0, 0, 0); }
 n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags) {
     return NC5(SYS_AUDIO_SUBMIT, a, frames, count, flags, 0);

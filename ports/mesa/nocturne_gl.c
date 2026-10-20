@@ -1,7 +1,6 @@
 /* Nocturne's OpenGL ES frontend: Mesa's state tracker on Zink over the Vulkan
  * driver linked into the program (NVK) when it finds a GPU, otherwise on the
- * softpipe rasterizer, with drawing buffers kept in ordinary heap memory. One
- * screen serves every context of the process; each context owns a drawable
+ * softpipe rasterizer. Screens live for the process; each context owns a drawable
  * whose color and depth/stencil textures it allocates on demand. */
 #include "nocturne_gl.h"
 
@@ -13,6 +12,7 @@
 #include "softpipe/sp_public.h"
 #ifdef GALLIUM_ZINK
 #include "zink/zink_public.h"
+#include "nvrm.h"
 
 /* Zink opens "vulkan" through util/u_dl.c, which only refers weakly to the Vulkan driver's entry
  * point; this reference is what links the driver (NVK) into a program that draws with OpenGL. */
@@ -131,29 +131,36 @@ static struct sw_winsys mem_winsys = {
 /* ---- the process-wide screen ---- */
 
 static simple_mtx_t screen_lock = SIMPLE_MTX_INITIALIZER;
-static struct pipe_frontend_screen *fscreen;
-static bool screen_on_gpu; /* Zink: the drawing buffers live in GPU memory */
+static struct pipe_frontend_screen *gpu_fscreen, *cpu_fscreen;
+
+static struct pipe_frontend_screen *frontend_screen(struct pipe_screen *screen) {
+    if (!screen) return NULL;
+    struct pipe_frontend_screen *fs = CALLOC_STRUCT(pipe_frontend_screen);
+    if (fs) fs->screen = screen;
+    else screen->destroy(screen);
+    return fs;
+}
 
 static struct pipe_frontend_screen *get_screen(void) {
     simple_mtx_lock(&screen_lock);
-    if (!fscreen) {
-        struct pipe_screen *screen = NULL;
 #ifdef GALLIUM_ZINK
-        /* Fails (with one log line) when the Vulkan driver finds no GPU. */
-        screen = zink_create_screen(&mem_winsys, NULL);
-        screen_on_gpu = screen != NULL;
-#endif
-        if (!screen) screen = softpipe_create_screen(&mem_winsys);
-        struct pipe_frontend_screen *fs = screen ? CALLOC_STRUCT(pipe_frontend_screen) : NULL;
-        if (fs) {
-            fs->screen = screen;
-            fscreen = fs;
-        } else if (screen) {
-            screen->destroy(screen);
+    if (!gpu_fscreen) {
+        /* The daemon publishes only after initialization.  Probe its native
+         * endpoint before constructing Vulkan/Zink again; no-GPU and early
+         * WebGL calls still take the immediate software path.  A later
+         * context can promote without invalidating any existing CPU context. */
+        struct nvrm *ready = nvrm_connect();
+        if (ready) {
+            nvrm_disconnect(ready);
+            gpu_fscreen = frontend_screen(zink_create_screen(&mem_winsys, NULL));
         }
     }
+#endif
+    if (!gpu_fscreen && !cpu_fscreen)
+        cpu_fscreen = frontend_screen(softpipe_create_screen(&mem_winsys));
+    struct pipe_frontend_screen *fs = gpu_fscreen ? gpu_fscreen : cpu_fscreen;
     simple_mtx_unlock(&screen_lock);
-    return fscreen;
+    return fs;
 }
 
 /* ---- contexts and their drawables ---- */
@@ -163,6 +170,7 @@ struct ngl_context {
     struct st_visual visual;
     struct ngl_attribs attribs;
     struct st_context *st;
+    bool on_gpu; /* immutable backend of this context, not the newest screen */
     struct pipe_resource *textures[ST_ATTACHMENT_COUNT];
     unsigned width, height;           /* requested drawing buffer size */
     unsigned tex_width, tex_height;   /* size the textures were made at */
@@ -179,7 +187,7 @@ static void drop_textures(struct ngl_context *c) {
     for (unsigned i = 0; i < ST_ATTACHMENT_COUNT; i++) pipe_resource_reference(&c->textures[i], NULL);
 }
 
-static void init_texture(struct pipe_context *pipe, struct pipe_resource *texture, uint32_t value);
+static void init_texture(struct pipe_context *pipe, struct pipe_resource *texture, uint32_t value, bool on_gpu);
 
 static bool drawable_validate(struct st_context *st, struct pipe_frontend_drawable *drawable,
                               const enum st_attachment_type *statts, unsigned count,
@@ -214,7 +222,7 @@ static bool drawable_validate(struct st_context *st, struct pipe_frontend_drawab
             if (!c->textures[a]) return false;
             /* A new buffer is defined before anything can see it: the driver gives no content, and
                softpipe's zeros are wrong for depth. Color (0,0,0,0), depth 1, stencil 0. */
-            init_texture(st->pipe, c->textures[a], a == ST_ATTACHMENT_DEPTH_STENCIL ? 0x00ffffff : 0);
+            init_texture(st->pipe, c->textures[a], a == ST_ATTACHMENT_DEPTH_STENCIL ? 0x00ffffff : 0, c->on_gpu);
         }
         pipe_resource_reference(&out[i], c->textures[a]);
     }
@@ -248,6 +256,7 @@ struct ngl_context *ngl_context_create(int es_major, const struct ngl_attribs *a
         return NULL;
     }
     c->attribs = *attribs;
+    c->on_gpu = fs == gpu_fscreen;
     c->attribs.antialias = false; /* a hint; the drawing buffer is single-sampled */
     c->visual.color_format = attribs->alpha ? PIPE_FORMAT_R8G8B8A8_UNORM : PIPE_FORMAT_R8G8B8X8_UNORM;
     if (attribs->stencil) {
@@ -319,6 +328,12 @@ bool ngl_make_current(struct ngl_context *c) {
 struct ngl_context *ngl_get_current(void) { return current_get(); }
 
 void ngl_get_attribs(const struct ngl_context *c, struct ngl_attribs *out) { *out = c->attribs; }
+
+bool ngl_has_major_performance_caveat(const struct ngl_context *c) {
+    /* Product policy: CPU rasterization is a known caveat.  Accelerated
+     * rendering is not a promise that transfer/readback is faster. */
+    return !c->base.fscreen->screen->caps.accelerated;
+}
 
 bool ngl_resize(struct ngl_context *c, unsigned width, unsigned height) {
     struct pipe_screen *screen = c->base.fscreen->screen;
@@ -401,8 +416,8 @@ static void clear_texture(struct pipe_context *pipe, struct pipe_resource *textu
 /* The initial content of a drawing buffer made by drawable_validate: queued on the GPU, written
    directly by the CPU for softpipe. Nothing is pending on a resource that was just created, so
    neither waits. */
-static void init_texture(struct pipe_context *pipe, struct pipe_resource *texture, uint32_t value) {
-    if (screen_on_gpu) clear_texture(pipe, texture, value);
+static void init_texture(struct pipe_context *pipe, struct pipe_resource *texture, uint32_t value, bool on_gpu) {
+    if (on_gpu) clear_texture(pipe, texture, value);
     else fill_texture(pipe, texture, value);
 }
 
@@ -413,7 +428,7 @@ void ngl_clear_drawing_buffer(struct ngl_context *c) {
     /* The values are in the textures' own formats. Z24 in the low bits: depth 1.0 is 0xffffff,
        stencil 0 above it. */
     void (*fill)(struct pipe_context *, struct pipe_resource *, uint32_t) = clear_texture;
-    if (!screen_on_gpu) {
+    if (!c->on_gpu) {
         st_context_flush(c->st, ST_FLUSH_WAIT, NULL, NULL, NULL);
         fill = fill_texture;
     }

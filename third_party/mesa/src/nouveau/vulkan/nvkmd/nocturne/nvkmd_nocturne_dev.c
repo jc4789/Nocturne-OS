@@ -18,7 +18,7 @@ nvkmd_nocturne_create_dev(struct nvkmd_pdev *_pdev,
       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    /* A device has an RM client (and so a GPU address space) of its own */
-   uint32_t st = nnrm_open(pdev->gpu_index, &dev->rm, NULL);
+   uint32_t st = nnrm_open_device(pdev->pci_target, &dev->rm, NULL);
    if (st != 0) {
       FREE(dev);
       return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,

@@ -22,6 +22,11 @@
  */
 
 #include <nv.h>                     // NV device driver interface
+#ifdef NVRM_NOCTURNE
+/* Native user mappings are revocable capabilities with an RM-owned lifetime. */
+extern void *nvrm_user_mapping_new(void);
+extern void nvrm_user_mapping_free(void *);
+#endif
 #include <nv-priv.h>
 #include <nv-caps.h>
 #include <os/os.h>
@@ -1191,6 +1196,10 @@ NV_STATUS osMapPciMemoryAreaUser
     NvU64 origSize;
     NvU64 diffStart;
 
+#ifdef NVRM_NOCTURNE
+    if (pPriv == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+#endif
     if (memArea.numRanges == 0)
     {
         *pVirtualAddress = (NvP64) NULL;
@@ -1236,6 +1245,15 @@ NV_STATUS osMapPciMemoryAreaUser
 
         portMemCopy((*ppNvuap)->memArea.pRanges, totalRangeSize, memArea.pRanges, totalRangeSize);
 
+#ifdef NVRM_NOCTURNE
+        *pPriv = NV_PTR_TO_NvP64(nvrm_user_mapping_new());
+        if (NvP64_VALUE(*pPriv) == NULL)
+        {
+            status = NV_ERR_NO_MEMORY;
+            os_free_mem((*ppNvuap)->memArea.pRanges);
+            goto free_nvuap;
+        }
+#endif
         *pVirtualAddress = (NvP64) (memArea.pRanges[0].start + diffStart);
         goto unalign_and_return;
 
@@ -1280,6 +1298,9 @@ void osUnmapPciMemoryUser(
     NvP64        pPriv
 )
 {
+#ifdef NVRM_NOCTURNE
+    nvrm_user_mapping_free(NvP64_VALUE(pPriv));
+#endif
 }
 
 NV_STATUS osMapPciMemoryKernelOld

@@ -14,10 +14,10 @@ uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size); 
 /* After a successful NV_ESC_RM_MAP_MEMORY: what RM recorded for the mapping, as a new shared
    object handle (a view of a BAR or of DMA memory) with the mapping's offset and length in it;
    -1 when RM recorded none. */
-n_handle nvrm_rm_mapping_object(uint64_t *offset, uint64_t *bytes);
+n_handle nvrm_rm_mapping_object(void *file, uint64_t *offset, uint64_t *bytes, uint32_t *access);
 
 /* From the server, for os_memcpy_from_user / os_memcpy_to_user: nvrm's address of n bytes of the
    current client's arena at the client's address `user`, or NULL outside it. */
 void *nvrm_user_translate(const void *user, size_t n);
 /* Serve clients until the channel cannot be listened on; returns the reason. */
-n_result nvrm_serve(void);
+n_result nvrm_serve(uint32_t pci_target);

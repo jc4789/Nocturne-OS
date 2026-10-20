@@ -107,7 +107,7 @@ VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
     defined(VK_USE_PLATFORM_XCB_KHR) || \
     defined(VK_USE_PLATFORM_XLIB_KHR) || \
-    defined(VK_USE_PLATFORM_DISPLAY_KHR)
+    defined(VK_USE_PLATFORM_DISPLAY_KHR) || DETECT_OS_NOCTURNE
 #define NVK_USE_WSI_PLATFORM
 #endif
 

@@ -66,6 +66,8 @@ extern thread_local bool nvrm_in_isr;
  * and back to true after; threads of the process itself (interrupts, work, timers) are
  * administrators. */
 extern thread_local bool nvrm_thread_admin;
+/* Nonzero, non-reused connection principal during a request; zero for daemon work. */
+extern thread_local uint32_t nvrm_thread_process;
 
 /* ------------------------------------------------------------------------------------------
  * The request server (nvrm_serve.c, nvrm_serve.h) calls the nvrm_rm_* functions of rm_api.c
@@ -83,8 +85,6 @@ extern thread_local bool nvrm_thread_admin;
  * which it sends to the client as a channel attachment.
  * ---------------------------------------------------------------------------------------- */
 
-#define NVRM_MAPPING_MAX_RANGES 16
-
 struct nvrm_alloc; /* a system-memory allocation made by nv_alloc_pages; opaque */
 
 struct nvrm_range {
@@ -92,6 +92,7 @@ struct nvrm_range {
 };
 
 struct nvrm_mapping {
+    void *owner;                    /* RM's per-user-map private lifetime token */
     bool is_alloc;
     uint32_t prot;                   /* NV_PROTECT_* */
     uint32_t caching;                /* NV_MEMORY_* (nvuap->caching) */
@@ -101,26 +102,30 @@ struct nvrm_mapping {
     uint64_t size;                   /* nvuap->size, bytes */
     /* !is_alloc: BAR memory */
     uint64_t access_start, access_size;
-    uint32_t range_count;
-    struct nvrm_range ranges[NVRM_MAPPING_MAX_RANGES];
+    struct nvrm_range range;        /* contiguous physical run, coalesced from RM's ranges */
 };
 
 /* Moves the parked context of this thread into *out; false when there is none. */
 bool nvrm_take_mapping(struct nvrm_mapping *out);
 /* Forgets a parked context nobody took (a failed request). */
 void nvrm_drop_mapping(void);
+/* Private tokens are kept by RM until explicit or implicit user unmap. */
+void *nvrm_user_mapping_new(void);
+void *nvrm_user_mapping_current(void);
+void nvrm_user_mapping_free(void *owner);
 
 /* A new shared handle over pages of a system-memory allocation (caller closes it or sends
  * it). caching is NV_MEMORY_*. N_CACHE_* is chosen from it. Returns a negative n_result on
  * failure. */
 n_handle nvrm_alloc_view(struct nvrm_alloc *alloc, uint64_t page_index, uint64_t bytes,
-                         uint32_t nv_caching);
+                         uint32_t nv_caching, uint32_t access);
 /* Bytes the allocation holds (page rounded). */
 uint64_t nvrm_alloc_size(const struct nvrm_alloc *alloc);
 
 /* A new shared handle over [phys, phys + bytes) of a BAR of the device. phys and bytes are
  * rounded out to pages; *view_offset gets the byte offset of phys inside the view. */
-n_handle nvrm_bar_view(uint64_t phys, uint64_t bytes, uint32_t nv_caching, uint64_t *view_offset);
+n_handle nvrm_bar_view(uint64_t phys, uint64_t bytes, uint32_t nv_caching, uint32_t access,
+                       uint64_t *view_offset);
 
 /* ------------------------------------------------------------------------------------------
  * Pieces shared between the OS layer files

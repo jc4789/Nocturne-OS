@@ -88,6 +88,10 @@ NVRM_CFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protec
 $(NVRM_SPDM_OBJ): NVRM_EXTRA := $(addprefix -I$(NVRM_DIR)/,$(NVRM_SPDM_INCLUDES)) \
     $(addprefix -D,$(NVRM_SPDM_DEFINES))
 
+# Only this existing OS-boundary translation unit needs the Nocturne lifetime
+# hook. Do not change flags/timestamps of every RM source for one callback.
+$(call nvrm_obj,arch/nvalloc/unix/src/os.c): NVRM_EXTRA += -DNVRM_NOCTURNE
+
 $(NVRM_OUT)/rm/%.o: $(NVRM_DIR)/%.c
 	@mkdir -p $(dir $@)
 	@echo "  RM   $<"

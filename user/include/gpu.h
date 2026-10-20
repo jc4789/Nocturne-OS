@@ -7,6 +7,8 @@ int gpu_info(struct n_gpu_info *out);
 /* Strict device path, -1/errno on failure. No implicit fallback. */
 int gpu_render(const struct n_gpu_render *request, uint32_t *pixels, size_t bytes);
 int gpu_render_batch(const struct n_gpu_batch *request, uint32_t *pixels, size_t bytes);
+int gpu_render_list(const struct n_gpu_scene *request,const struct n_gpu_vertex *vertices,uint32_t *pixels,size_t bytes);
+int gfx_render3d_list(canvas_t *dst,const struct n_gpu_scene *request,const struct n_gpu_vertex *vertices);
 /* Strict bounded texture crop/scale, ARGB replace (not source-over).
  * Packed source and output; alias is safe. No implicit CPU fallback. */
 int gpu_blit(const struct n_gpu_blit *request, const uint32_t *source, size_t source_bytes,

@@ -150,7 +150,7 @@ void NV_API_CALL os_io_write_dword(NvU32 address, NvU32 value) { (void)address; 
 /* ------------------------------------------------------------------------------------------
  * BARs
  * ---------------------------------------------------------------------------------------- */
-#define BAR_COUNT 6
+#define BAR_COUNT (sizeof nvrm_dev.info.bar / sizeof nvrm_dev.info.bar[0])
 
 struct bar {
     n_handle handle;   /* n_pci_bar, opened on first use; -1 before */
@@ -160,6 +160,26 @@ struct bar {
 static struct bar bars[BAR_COUNT] = {
     { -1, NULL }, { -1, NULL }, { -1, NULL }, { -1, NULL }, { -1, NULL }, { -1, NULL },
 };
+/* RM aperture order differs from PCI configuration indices after a 64-bit BAR. */
+static unsigned aperture_bar[NV_GPU_NUM_BARS];
+static void pci_apertures(const struct n_pci_function *g, nv_state_t *nv) {
+    for (unsigned a = 0; a < NV_GPU_NUM_BARS; a++) {
+        aperture_bar[a] = N_PCI_NONE;
+        nv->bars[a].cpu_address = nv->bars[a].size = 0;
+    }
+    unsigned aperture = 0;
+    for (unsigned i = 0; i < BAR_COUNT && aperture < NV_GPU_NUM_BARS; i++) {
+        const struct n_pci_bar *b = &g->bar[i];
+        if ((b->flags & N_PCI_BAR_MEMORY) && b->size) {
+            aperture_bar[aperture] = i;
+            nv->bars[aperture].cpu_address = b->address;
+            nv->bars[aperture].size = b->size;
+            aperture++;
+        }
+        /* The upper DWORD of a 64-bit BAR never denotes a second aperture. */
+        if (b->flags & N_PCI_BAR_64BIT) i++;
+    }
+}
 static mtx_t bar_lock;
 static once_flag bar_once = ONCE_FLAG_INIT;
 static void bar_setup(void) { mtx_init(&bar_lock, mtx_plain); }
@@ -192,16 +212,28 @@ static uint32_t n_cache_for(uint32_t nv_caching, bool device) {
     }
 }
 
-n_handle nvrm_bar_view(uint64_t phys, uint64_t bytes, uint32_t nv_caching, uint64_t *view_offset) {
-    int i = bar_of(phys, bytes ? bytes : 1);
+static uint32_t bar_cache(unsigned index, uint32_t nv_caching) {
+    /* Only the framebuffer aperture contains normal VRAM. Registers, user
+       doorbells and instance-memory control windows require UC even if a caller
+       requests WC or the PCI BAR happens to be prefetchable. */
+    if (index != aperture_bar[NV_GPU_BAR_INDEX_FB] ||
+        !(nvrm_dev.info.bar[index].flags & N_PCI_BAR_PREFETCH)) return N_CACHE_UNCACHED;
+    return n_cache_for(nv_caching, true);
+}
+
+n_handle nvrm_bar_view(uint64_t phys, uint64_t bytes, uint32_t nv_caching, uint32_t access,
+                       uint64_t *view_offset) {
+    if (!bytes) return -N_ERR_INVALID;
+    int i = bar_of(phys, bytes);
     if (i < 0) return -N_ERR_INVALID;
     n_handle bar = bar_handle((unsigned)i);
     if (bar < 0) return bar;
     uint64_t off = phys - nvrm_dev.info.bar[i].address;
+    if (off > SIZE_MAX - bytes || off + bytes > SIZE_MAX - (PAGE - 1)) return -N_ERR_TOO_LARGE;
     uint64_t start = ALIGN_DOWN(off, PAGE);
     uint64_t end = ALIGN_UP(off + bytes, PAGE);
     if (view_offset) *view_offset = off - start;
-    return n_shared_view(bar, (size_t)start, (size_t)(end - start), n_cache_for(nv_caching, true));
+    return n_shared_view_access(bar, (size_t)start, (size_t)(end - start), bar_cache((unsigned)i, nv_caching), access);
 }
 
 /* Kernel mappings of BAR ranges (os_map_kernel_space). BAR0 registers come out of the whole
@@ -222,14 +254,15 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode) {
         return NULL;
     }
     uint64_t off = start - nvrm_dev.info.bar[i].address;
-    if (i == 0 && bars[0].map && (mode == NV_MEMORY_UNCACHED || mode == NV_MEMORY_UNCACHED_WEAK))
-        return bars[0].map + off;
+    unsigned registers = aperture_bar[NV_GPU_BAR_INDEX_REGS];
+    if ((unsigned)i == registers && bars[i].map) return bars[i].map + off;
 
     n_handle bar = bar_handle((unsigned)i);
     if (bar < 0) return NULL;
+    if (!size || off > SIZE_MAX - size || off + size > SIZE_MAX - (PAGE - 1)) return NULL;
     uint64_t astart = ALIGN_DOWN(off, PAGE);
     uint64_t length = ALIGN_UP(off + size, PAGE) - astart;
-    n_handle view = n_shared_view(bar, (size_t)astart, (size_t)length, n_cache_for(mode, true));
+    n_handle view = n_shared_view(bar, (size_t)astart, (size_t)length, bar_cache((unsigned)i, mode));
     if (view < 0) return NULL;
     uint8_t *base = n_shared_map(view, (size_t)length, N_MEMORY_READ_WRITE);
     n_handle_close(view);
@@ -237,7 +270,12 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode) {
     call_once(&bar_once, bar_setup);
     mtx_lock(&bar_lock);
     if (kmap_count == kmap_cap) {
-        size_t cap = kmap_cap ? kmap_cap * 2 : 16;
+        if (kmap_cap > SIZE_MAX / 2 / sizeof *kmaps) {
+            mtx_unlock(&bar_lock);
+            n_memory_release(base, (size_t)length);
+            return NULL;
+        }
+        size_t cap = kmap_cap ? kmap_cap * 2 : 1;
         struct kmap *grown = realloc(kmaps, cap * sizeof *grown);
         if (!grown) {
             mtx_unlock(&bar_lock);
@@ -255,8 +293,10 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode) {
 void NV_API_CALL os_unmap_kernel_space(void *address, NvU64 size) {
     (void)size;
     if (!address) return;
-    uint8_t *p = address;
-    if (bars[0].map && p >= bars[0].map && p < bars[0].map + nvrm_dev.info.bar[0].size) return;
+    uintptr_t p = (uintptr_t)address;
+    unsigned registers = aperture_bar[NV_GPU_BAR_INDEX_REGS];
+    if (registers < BAR_COUNT && bars[registers].map && p >= (uintptr_t)bars[registers].map &&
+        p - (uintptr_t)bars[registers].map < nvrm_dev.info.bar[registers].size) return;
     call_once(&bar_once, bar_setup);
     mtx_lock(&bar_lock);
     for (size_t k = 0; k < kmap_count; k++) {
@@ -308,15 +348,7 @@ NV_STATUS nvrm_pci_attach(void) {
     nv->primary_vga = g->cls == 0x03 && g->subcls == 0x00 && g->framebuffer_bar != N_PCI_NONE;
     nv->console_device = g->framebuffer_bar != N_PCI_NONE;
 
-    /* RM's three apertures: registers (config BAR 0), framebuffer (BAR 1, 64 bit) and the
-       instance-memory BAR (config BAR 3). */
-    static const unsigned index[NV_GPU_NUM_BARS] = { 0, 1, 3 };
-    for (int a = 0; a < NV_GPU_NUM_BARS; a++) {
-        const struct n_pci_bar *b = &g->bar[index[a]];
-        if (!(b->flags & N_PCI_BAR_MEMORY)) continue;
-        nv->bars[a].cpu_address = b->address;
-        nv->bars[a].size = b->size;
-    }
+    pci_apertures(g, nv);
     nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
     nv->fb = &nv->bars[NV_GPU_BAR_INDEX_FB];
 
@@ -336,20 +368,22 @@ NV_STATUS nvrm_pci_attach(void) {
         nv->pci_cfg_space[dw] = v < 0 ? 0xFFFFFFFFu : (NvU32)v;
     }
 
-    const struct n_pci_bar *b0 = &g->bar[0];
-    if (!(b0->flags & N_PCI_BAR_MEMORY) || !b0->size) {
-        nvrm_log("NVRM: BAR0 is not a memory BAR");
+    unsigned registers = aperture_bar[NV_GPU_BAR_INDEX_REGS];
+    if (registers >= BAR_COUNT) {
+        nvrm_log("NVRM: no register memory BAR");
         return NV_ERR_INVALID_STATE;
     }
-    n_handle h0 = bar_handle(0);
+    const struct n_pci_bar *b0 = &g->bar[registers];
+    if (b0->size > SIZE_MAX) return NV_ERR_INVALID_ARGUMENT;
+    n_handle h0 = bar_handle(registers);
     if (h0 < 0) {
-        nvrm_log("NVRM: n_pci_bar(0) failed: %s", n_result_text(h0));
+        nvrm_log("NVRM: n_pci_bar(%u) failed: %s", registers, n_result_text(h0));
         return NV_ERR_GENERIC;
     }
     /* nvrm keeps one mapping of the whole BAR0; os_map_kernel_space hands out pieces of it.
        nv->regs->map stays NULL: RM sets it itself (RmSetupRegisters) and asserts it was unset. */
-    bars[0].map = n_shared_map(h0, (size_t)b0->size, N_MEMORY_READ_WRITE);
-    if (!bars[0].map) {
+    bars[registers].map = n_shared_map(h0, (size_t)b0->size, N_MEMORY_READ_WRITE);
+    if (!bars[registers].map) {
         nvrm_log("NVRM: mapping BAR0 (%llu bytes) failed", (unsigned long long)b0->size);
         return NV_ERR_GENERIC;
     }
@@ -359,8 +393,14 @@ NV_STATUS nvrm_pci_attach(void) {
 }
 
 void nvrm_pci_detach(void) {
-    if (bars[0].map) n_memory_release(bars[0].map, (size_t)nvrm_dev.info.bar[0].size);
-    bars[0].map = NULL;
+    for (size_t k = 0; k < kmap_count; k++) n_memory_release(kmaps[k].base, kmaps[k].length);
+    free(kmaps); kmaps = NULL; kmap_count = kmap_cap = 0;
+    for (unsigned i = 0; i < BAR_COUNT; i++) {
+        if (bars[i].map) n_memory_release(bars[i].map, (size_t)nvrm_dev.info.bar[i].size);
+        bars[i].map = NULL;
+        if (bars[i].handle >= 0) n_handle_close(bars[i].handle);
+        bars[i].handle = -1;
+    }
 }
 
 /* MSI or MSI-X: the system picks (MSI-X when the function offers it) and reports one vector
@@ -673,11 +713,15 @@ NV_STATUS NV_API_CALL nv_alloc_user_mapping(nv_state_t *nv, void *priv, NvU64 pa
     struct nvrm_alloc *a = priv;
     if (!user_address || !alloc_range_valid(a, page_index, page_offset, size)) return NV_ERR_INVALID_ARGUMENT;
     *user_address = alloc_page_address(a, page_index) + page_offset;
-    if (priv_data) *priv_data = NULL;
+    if (priv_data) {
+        *priv_data = nvrm_user_mapping_new();
+        if (!*priv_data) return NV_ERR_NO_MEMORY;
+    }
     return NV_OK;
 }
 void NV_API_CALL nv_free_user_mapping(nv_state_t *nv, void *priv, NvU64 address, void *priv_data) {
-    (void)nv; (void)priv; (void)address; (void)priv_data;
+    (void)nv; (void)priv; (void)address;
+    nvrm_user_mapping_free(priv_data);
 }
 
 NV_STATUS NV_API_CALL os_match_mmap_offset(void *priv, NvU64 offset, NvU64 *page_index) {
@@ -697,11 +741,12 @@ NV_STATUS NV_API_CALL os_match_mmap_offset(void *priv, NvU64 offset, NvU64 *page
     return NV_ERR_OBJECT_NOT_FOUND;
 }
 
-n_handle nvrm_alloc_view(struct nvrm_alloc *a, uint64_t page_index, uint64_t bytes, uint32_t nv_caching) {
+n_handle nvrm_alloc_view(struct nvrm_alloc *a, uint64_t page_index, uint64_t bytes, uint32_t nv_caching,
+                         uint32_t access) {
     if (!alloc_range_valid(a, page_index, 0, bytes)) return -N_ERR_INVALID;
     uint64_t span = ALIGN_UP(bytes, PAGE);
     uint32_t cache = nv_caching == NV_MEMORY_DEFAULT ? n_cache_for(a->cache, false) : n_cache_for(nv_caching, false);
-    return n_shared_view(a->root, (size_t)(page_index * PAGE), (size_t)span, cache);
+    return n_shared_view_access(a->root, (size_t)(page_index * PAGE), (size_t)span, cache, access);
 }
 
 /* ---- the mapping RM parked for the request being served ---- */
@@ -711,8 +756,10 @@ static thread_local bool parked_valid;
 NV_STATUS NV_API_CALL nv_add_mapping_context_to_file(nv_state_t *nv, nv_usermap_access_params_t *nvuap, NvU32 prot,
                                                      void *alloc_priv, NvU64 page_index, NvU32 fd) {
     (void)nv; (void)fd;
+    parked_valid = false;
     struct nvrm_mapping *m = &parked;
     memset(m, 0, sizeof *m);
+    m->owner = nvrm_user_mapping_current();
     m->prot = prot;
     m->caching = nvuap->caching;
     if (alloc_priv) {
@@ -724,12 +771,18 @@ NV_STATUS NV_API_CALL nv_add_mapping_context_to_file(nv_state_t *nv, nv_usermap_
         m->access_start = nvuap->access_start;
         m->access_size = nvuap->access_size;
         uint32_t n = nvuap->memArea.numRanges;
-        if (n > NVRM_MAPPING_MAX_RANGES) return NV_ERR_NOT_SUPPORTED;
+        if (!n || !nvuap->memArea.pRanges) return NV_ERR_INVALID_ARGUMENT;
+        /* A native shared view covers one contiguous run. Coalesce any number
+           of adjacent RM ranges; reject only genuinely disjoint backing. */
         for (uint32_t i = 0; i < n; i++) {
-            m->ranges[i].start = nvuap->memArea.pRanges[i].start;
-            m->ranges[i].size = nvuap->memArea.pRanges[i].size;
+            uint64_t start = nvuap->memArea.pRanges[i].start;
+            uint64_t size = nvuap->memArea.pRanges[i].size;
+            if (!size || start > UINT64_MAX - size) return NV_ERR_INVALID_ARGUMENT;
+            if (!i) m->range.start = start;
+            else if (m->range.start + m->range.size != start) return NV_ERR_NOT_SUPPORTED;
+            if (m->range.size > UINT64_MAX - size) return NV_ERR_INVALID_ARGUMENT;
+            m->range.size += size;
         }
-        m->range_count = n;
     }
     parked_valid = true;
     return NV_OK;

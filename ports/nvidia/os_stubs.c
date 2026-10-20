@@ -30,24 +30,7 @@ nv_file_private_t *NV_API_CALL nv_get_file_private(NvS32 fd, NvBool ctl, void **
 void NV_API_CALL nv_put_file_private(void *priv) { (void)priv; }
 
 /* ---------------------------------------------------------------- mmap bookkeeping */
-void NV_API_CALL nv_acquire_mmap_lock(nv_state_t *nv) { (void)nv; }
-void NV_API_CALL nv_release_mmap_lock(nv_state_t *nv) { (void)nv; }
-/* Mappings a client already holds are shared objects it mapped itself; nvrm cannot take them
-   back one by one (the system revokes all of them when nvrm ends). What it can do is stop handing
-   out new ones: nvrm_rm_ioctl refuses NV_ESC_RM_MAP_MEMORY while the mappings are revoked. */
-NV_STATUS NV_API_CALL nv_revoke_gpu_mappings(nv_state_t *nv) {
-    (void)nv;
-    __atomic_store_n(&nvrm_dev.mappings_revoked, true, __ATOMIC_RELEASE);
-    return NV_OK;
-}
-NvBool NV_API_CALL nv_get_all_mappings_revoked_locked(nv_state_t *nv) {
-    (void)nv;
-    return __atomic_load_n(&nvrm_dev.mappings_revoked, __ATOMIC_ACQUIRE) ? NV_TRUE : NV_FALSE;
-}
-void NV_API_CALL nv_set_safe_to_mmap_locked(nv_state_t *nv, NvBool safe) {
-    (void)nv;
-    __atomic_store_n(&nvrm_dev.mappings_revoked, !safe, __ATOMIC_RELEASE);
-}
+/* Live mapping publication/revocation and mmap locking belong to rm_api.c. */
 NvBool NV_API_CALL nv_is_gpu_accessible(nv_state_t *nv) { (void)nv; return NV_TRUE; }
 NvBool NV_API_CALL nv_match_gpu_os_info(nv_state_t *nv, void *os_info) { (void)nv; (void)os_info; return NV_FALSE; }
 void NV_API_CALL nv_flush_coherent_cpu_cache_range(nv_state_t *nv, NvU64 address, NvU64 size) {

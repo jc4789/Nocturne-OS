@@ -1,7 +1,10 @@
-/* Nocturne's bounded native GPU interface. This is not an OpenGL/WebGL ABI. */
+/* Nocturne's native GPU interface. This is not an OpenGL/WebGL ABI. */
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
+/* Source compatibility only: neither value bounds the scalable interface.
+ * The old batch's inline array length must retain its binary layout. */
 #define N_GPU_MAX_SIDE 512u
 #define N_GPU_MAX_TRIANGLES 32u
 #define N_GPU_CLEAR 1u
@@ -31,9 +34,16 @@ struct n_gpu_batch {
     uint32_t width, height, clear_argb, triangle_count;
     struct n_gpu_vertex vertex[N_GPU_MAX_TRIANGLES * 3];
 };
+/* Variable triangle-list frame. Vertex storage is supplied separately and
+ * snapshotted before execution. Zero triangles means a clear-only frame. */
+struct n_gpu_scene {uint32_t width,height,clear_argb,triangle_count;};
+static inline size_t n_gpu_frame_bytes(uint32_t w,uint32_t h) {
+    if(!w || !h || w>INT32_MAX || h>INT32_MAX || (size_t)w>SIZE_MAX/sizeof(uint32_t)/h)return 0;
+    return (size_t)w*h*sizeof(uint32_t);
+}
 /* Packed ARGB replacement, integer crop and nearest-neighbour scaling.
  * No compositing, rotation, author shaders, or WebGL capability is implied.
- * Source and output are bounded to 512 squared. The complete source is copied
+ * The complete source is copied
  * into private device storage before submission or any output write, so alias
  * is supported. Exactly eight uint32_t fields; user pointers are syscall args. */
 struct n_gpu_blit {

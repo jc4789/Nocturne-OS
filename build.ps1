@@ -5,6 +5,8 @@
 param([string]$Target = "all")
 $env:MSYSTEM = "UCRT64"
 $env:CHERE_INVOKING = "1"
+# ログインシェルでもホストのRustなどを見つける。同梱UCRT64のツールは引き続き優先する。
+$env:MSYS2_PATH_TYPE = "inherit"
 # Keep paths and the requested target out of shell syntax. The caller's working
 # directory must not decide which project gets built: bash starts in this
 # script's folder (CHERE_INVOKING keeps it there). The command line carries no

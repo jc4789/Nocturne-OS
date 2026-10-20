@@ -15,7 +15,10 @@ def main():
         parser.error('並列数は1以上を指定してください')
     root = Path(__file__).resolve().parents[1]
     bash = root / 'tools/msys64/usr/bin/bash.exe'
-    env = dict(os.environ, MSYSTEM='UCRT64', CHERE_INVOKING='1', NOCTURNE_BUILD_ROOT=root.as_posix())
+    # ログイン時の既定PATHはWindows側のRustなどを落とす。
+    # 継承してもMSYS2はUCRT64と/usr/binを先頭に置くため、同梱ツールを優先できる。
+    env = dict(os.environ, MSYSTEM='UCRT64', CHERE_INVOKING='1',
+               MSYS2_PATH_TYPE='inherit', NOCTURNE_BUILD_ROOT=root.as_posix())
     # Targets remain individual argv entries, never shell-source interpolation.
     command = [str(bash), '-lc', 'cd "$NOCTURNE_BUILD_ROOT" && exec make "$@"',
                'nocturne-build', '-j'+str(args.jobs), *(args.targets or ['all'])]

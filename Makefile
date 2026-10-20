@@ -255,7 +255,9 @@ $(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $
 # C++ is an additional host cross-build path; C/TinyCC keep their own flags.
 $(BUILD)/u/tests/media_cenc_test.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 $(BUILD)/u/tests/media_cenc_test.o: user/libc/media_mse.c
-$(BUILD)/tests/media_cenc_test: $(BUILD)/u/tests/media_cenc_test.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+$(BUILD)/u/tests/nvk_contracttest.o: UCFLAGS += -Ithird_party/mesa/include
+$(BUILD)/tests/nvk_contracttest: private ULDFLAGS += --gc-sections
+$(BUILD)/tests/media_cenc_test $(BUILD)/tests/nvk_contracttest: $(BUILD)/tests/%: $(BUILD)/u/tests/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
@@ -444,23 +446,20 @@ lexbor: $(LXB_OBJ)
 # distributed: a copy unpacked into local/ (ignored) goes into images built on this machine, and
 # images get none without it. NVIDIA_FIRMWARE= leaves it out explicitly.
 NVIDIA_FIRMWARE ?= local/firmware/nvidia/615.78.08
-NVIDIA_FW_ROOT := $(BUILD)/root/usr/share/firmware/nvidia/615.78.08
+NVIDIA_FW_PREFIX := usr/share/firmware/nvidia/615.78.08
+NVIDIA_FW_STATE := $(BUILD)/nvidia-firmware.json
 # RM (osinit.c) needs both images of the GPU family: Ampere and Ada (the RTX 4070) use ga10x.
-NVIDIA_FW_FILES := $(if $(and $(NVIDIA_FIRMWARE),$(wildcard $(NVIDIA_FIRMWARE)/firmware/gsp_ga10x.bin)),\
-    $(NVIDIA_FW_ROOT)/gsp_ga10x.bin $(NVIDIA_FW_ROOT)/ucodes_ga10x.bin $(NVIDIA_FW_ROOT)/LICENSE)
-$(NVIDIA_FW_ROOT)/%.bin: $(NVIDIA_FIRMWARE)/firmware/%.bin
-	@mkdir -p $(dir $@)
-	@cp $< $@
-$(NVIDIA_FW_ROOT)/LICENSE: $(NVIDIA_FIRMWARE)/LICENSE
-	@mkdir -p $(dir $@)
-	@cp $< $@
-ifeq ($(NVIDIA_FW_FILES),)
-$(shell rm -rf $(BUILD)/root/usr/share/firmware/nvidia)
-endif
+# Content/selection changes update the stamp; an unchanged selection leaves its mtime alone.
+# Do not delete staging files while parsing make (including make -n). The packer excludes
+# old staged NVIDIA firmware and adds only this manifest's inputs, even when disabled.
+.PHONY: nvidia-firmware-check
+nvidia-firmware-check:
+$(NVIDIA_FW_STATE): nvidia-firmware-check scripts/mkinitrd.py
+	@$(PY) scripts/mkinitrd.py --firmware-state "$@" --firmware-source "$(NVIDIA_FIRMWARE)" --firmware-prefix "$(NVIDIA_FW_PREFIX)"
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/usr/share/licenses/uacpi/LICENSE $(GO_FILES) $(RUST_FILES) $(NVRM_FILES) $(NVIDIA_FW_FILES) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
+$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/usr/share/licenses/uacpi/LICENSE $(GO_FILES) $(RUST_FILES) $(NVRM_FILES) $(NVIDIA_FW_STATE) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"
-	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
+	@$(PY) scripts/mkinitrd.py --firmware-manifest "$(NVIDIA_FW_STATE)" $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
 
 # the music in /home/Music, made by a script
 $(BUILD)/sounds.stamp: scripts/mksounds.py

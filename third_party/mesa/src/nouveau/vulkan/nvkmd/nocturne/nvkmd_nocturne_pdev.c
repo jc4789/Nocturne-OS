@@ -130,7 +130,7 @@ nvkmd_nocturne_try_create_pdev(uint32_t gpu_index,
    /* Every allocation and mapping is in 4 KiB pages for now */
    pdev->base.bind_align_B = NNRM_PAGE_SIZE;
 
-   pdev->gpu_index = gpu_index;
+   pdev->pci_target = gpu.pci_target;
    pdev->rm = rm;
 
    pdev->sync_types[0] = &nvkmd_nocturne_sync_type;

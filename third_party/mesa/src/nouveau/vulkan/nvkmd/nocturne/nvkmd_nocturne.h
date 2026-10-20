@@ -89,7 +89,7 @@ VkResult nvkmd_nocturne_sync_add_gpu_signal(struct vk_sync *sync, uint64_t value
 struct nvkmd_nocturne_pdev {
    struct nvkmd_pdev base;
 
-   uint32_t gpu_index;
+   uint32_t pci_target;
    /* An RM session for get_vram_used() */
    struct nnrm *rm;
 

@@ -127,16 +127,22 @@ update_locked(struct nvkmd_nocturne_sync *s)
    struct nvkmd_nocturne_sync_point *points =
       util_dynarray_begin(&s->points);
 
+   /* Resolve all completed values first: an earlier in-flight point may
+    * already be superseded by a completed signal on another channel. */
+   for (unsigned i = 0; i < count; i++) {
+      if (fence_passed(points[i].fence, points[i].seqno))
+         s->value = MAX2(s->value, points[i].value);
+   }
    unsigned kept = 0;
    for (unsigned i = 0; i < count; i++) {
-      if (fence_passed(points[i].fence, points[i].seqno)) {
-         s->value = MAX2(s->value, points[i].value);
+      if (points[i].value <= s->value) {
          nvkmd_nocturne_fence_unref(points[i].fence);
       } else {
          points[kept++] = points[i];
       }
    }
-   util_dynarray_resize(&s->points, struct nvkmd_nocturne_sync_point, kept);
+   /* Shrinking needs no allocation and cannot overflow the old byte size. */
+   s->points.size = kept * sizeof(*points);
 }
 
 static uint64_t
@@ -194,6 +200,7 @@ nvkmd_nocturne_sync_signal(struct vk_device *device,
    if (sync->flags & VK_SYNC_IS_TIMELINE) {
       update_locked(s);
       s->value = MAX2(s->value, value);
+      update_locked(s);
    } else {
       clear_points_locked(s);
       s->value = 1;
@@ -340,19 +347,40 @@ nvkmd_nocturne_sync_add_gpu_signal(struct vk_sync *sync, uint64_t value,
                                    uint64_t seqno)
 {
    struct nvkmd_nocturne_sync *s = to_sync(sync);
-   const struct nvkmd_nocturne_sync_point point = {
-      .fence = nvkmd_nocturne_fence_ref(fence),
-      .seqno = seqno,
-      .value = normalize_value(sync, value),
-   };
+   value = normalize_value(sync, value);
 
    simple_mtx_lock(&sync_lock);
-   if (!(sync->flags & VK_SYNC_IS_TIMELINE)) {
+   if (sync->flags & VK_SYNC_IS_TIMELINE) {
+      /* Queries of a different fence or queue idle must not leave this
+       * long-lived timeline accumulating already completed references. */
+      update_locked(s);
+      if (value <= s->value)
+         goto done;
+      util_dynarray_foreach(&s->points, struct nvkmd_nocturne_sync_point, p) {
+         /* Only identical completion points can be merged without delaying
+          * a wait for an earlier value (and potentially making a cycle). */
+         if (p->fence == fence && p->seqno == seqno) {
+            p->value = MAX2(p->value, value);
+            goto done;
+         }
+      }
+   } else {
       /* A new binary payload replaces the old one */
       clear_points_locked(s);
       s->value = 0;
    }
-   util_dynarray_append(&s->points, point);
+   struct nvkmd_nocturne_sync_point *point =
+      util_dynarray_grow(&s->points, struct nvkmd_nocturne_sync_point, 1);
+   if (point == NULL) {
+      simple_mtx_unlock(&sync_lock);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   *point = (struct nvkmd_nocturne_sync_point) {
+      .fence = nvkmd_nocturne_fence_ref(fence),
+      .seqno = seqno,
+      .value = value,
+   };
+done:
    simple_mtx_unlock(&sync_lock);
    return VK_SUCCESS;
 }

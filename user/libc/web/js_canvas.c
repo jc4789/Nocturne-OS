@@ -397,12 +397,13 @@ static bool image_gpu_blit(struct web_canvas *c,web_doc *allocation,const uint32
      * only when every sampled source texel is opaque. The existing RAM path
      * handles alpha, smoothing, rotation, reflection, fractional and clipped
      * draws; GPU failure must never corrupt that authoritative bitmap. */
-    if (c->clip || w>N_GPU_MAX_SIDE || h>N_GPU_MAX_SIDE || dw<1 || dh<1 || dw>N_GPU_MAX_SIDE || dh>N_GPU_MAX_SIDE ||
+    if (c->clip || dw<1 || dh<1 || !n_gpu_frame_bytes(w,h) || dw>INT32_MAX || dh>INT32_MAX ||
         ox<0 || oy<0 || ox+dw>c->w || oy+dh>c->h ||
         sx!=floor(sx) || sy!=floor(sy) || sw!=floor(sw) || sh!=floor(sh) ||
         ox!=floor(ox) || oy!=floor(oy) || dw!=floor(dw) || dh!=floor(dh)) return false;
     struct n_gpu_info info;
     if (gpu_info(&info)<0 || !(info.capabilities&N_GPU_CAP_BLIT)) return false;
+    if(w>info.max_width || h>info.max_height || dw>info.max_width || dh>info.max_height)return false;
     unsigned x0=(unsigned)sx,y0=(unsigned)sy,cw=(unsigned)sw,ch=(unsigned)sh;
     for (unsigned y=y0;y<y0+ch;y++) for (unsigned x=x0;x<x0+cw;x++)
         if (pixels[(size_t)y*w+x]>>24!=255) return false;
@@ -670,7 +671,7 @@ static void rectangle(struct web_canvas *c,double *v,uint32_t color,bool clear,c
     int w=x1-x0,h=y1-y0;
     /* Real native virgl clear only for opaque, integer-aligned sizable fills.
        Other Canvas work remains explicitly software; no WebGL is advertised. */
-    if ((!paint || !paint->kind) && !c->clip && !clear && color>>24==255 && w>=64 && h>=64 && w<=512 && h<=512 &&
+    if ((!paint || !paint->kind) && !c->clip && !clear && color>>24==255 && w>=64 && h>=64 &&
         ax==x0 && ay==y0 && bx==x1 && by==y1) {
         size_t bytes=(size_t)w*h*4; uint32_t *pixels=malloc(bytes);
         struct n_gpu_render r={.width=(unsigned)w,.height=(unsigned)h,.operation=N_GPU_CLEAR,.clear_argb=color};

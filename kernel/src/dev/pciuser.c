@@ -62,6 +62,10 @@ static void interrupts_off(struct pci_claim *c) {
     irq_restore(irq);
     irq_vector_free(c->vector_base, c->vectors);
     c->vectors = 0;
+    /* A waiter must observe NOT_READY instead of sleeping forever after the
+       driver disables its last interrupt (including an infinite take). */
+    wq_wake_all(&c->wq);
+    vfs_poll_notify(c->v);
 }
 
 static bool claim_can_read(struct vnode *v, struct file *f) {
@@ -71,18 +75,17 @@ static bool claim_can_read(struct vnode *v, struct file *f) {
 /* After bus mastering is off the function starts no request, but some may still be in flight.
    A PCI Express function says so in Device Status (Transactions Pending), and the config read
    that sees it clear also follows any write it posted before (a completion does not pass a
-   posted write). Conventional PCI has no such bit: the read and a short pause stand for it.
+   posted write). Conventional PCI provides no such completion proof: retain its DMA pages.
    Busy waiting with interrupts possibly off, so by the TSC, bounded: this runs once, when a
    driver ends. */
 #define QUIESCE_MS 200
 static bool function_quiet(struct pci_device *d) {
-    uint64_t since = rdtsc(), spins = 0;
+    if (!d->pcie_cap || !tsc_hz) return false;
+    uint64_t since = rdtsc();
     for (;;) {
-        if ((pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) == 0xFFFF) return true; /* gone from the bus */
-        if (!d->pcie_cap) {
-            if (tsc_hz ? rdtsc() - since >= tsc_hz / 1000 : ++spins >= 100000) return true;
-        } else if (!(pci_read16(d->bus, d->dev, d->func, d->pcie_cap + 0x0A) & 0x20)) return true;
-        if (tsc_hz ? rdtsc() - since > tsc_hz / 1000 * QUIESCE_MS : ++spins > 20000000) return false;
+        if ((pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) == 0xFFFF) return false;
+        if (!(pci_read16(d->bus, d->dev, d->func, d->pcie_cap + 0x0A) & 0x20)) return true;
+        if (rdtsc() - since > tsc_hz / 1000 * QUIESCE_MS) return false;
         pause();
     }
 }
@@ -94,7 +97,9 @@ static void claim_release(struct vnode *v) {
     shared_revoke_claim(c); /* no process reaches the registers any more */
     interrupts_off(c);
     pci_write16(d->bus, d->dev, d->func, 4, pci_read16(d->bus, d->dev, d->func, 4) & ~0x4u); /* bus mastering off */
-    c->dma_unsafe = !function_quiet(d);
+    bool stopped = (pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) != 0xFFFF &&
+                   !(pci_read16(d->bus, d->dev, d->func, 4) & 4);
+    c->dma_unsafe = !stopped || !function_quiet(d);
     if (c->dma_unsafe)
         kprintf("pci: %02x:%02x.%u still has requests in flight; its DMA memory stays out of use\n",
                 d->bus, d->dev, d->func);
@@ -295,6 +300,10 @@ int64_t pci_user_bar(struct file *f, uint32_t bar, uint64_t *address, uint64_t *
     *address = a;
     *size = s;
     return 0;
+}
+bool pci_user_bar_prefetchable(struct file *f, uint32_t bar) {
+    struct pci_claim *c=claim_of(f);
+    return c && bar<6 && !(c->d->bar[bar]&1) && (c->d->bar[bar]&8);
 }
 
 static unsigned floor_pow2(unsigned n) {

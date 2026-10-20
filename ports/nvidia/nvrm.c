@@ -256,7 +256,7 @@ int main(int argc, char **argv) {
         tear_down();
         return 1;
     }
-    n_result r = nvrm_serve();
+    n_result r = nvrm_serve(N_PCI_TARGET(nvrm_dev.info.bus, nvrm_dev.info.dev, nvrm_dev.info.func));
     nvrm_log("NVRM: request server ended: %s", n_result_text(r));
     tear_down();
     return 0;

@@ -22,5 +22,6 @@ int64_t pci_user_config_read(struct file *f, uint32_t target, uint32_t offset, u
 int64_t pci_user_config_write(struct file *f, uint32_t offset, uint32_t width, uint32_t value);
 /* A memory BAR's bus address and size (page aligned, at least a page). */
 int64_t pci_user_bar(struct file *f, uint32_t bar, uint64_t *address, uint64_t *size);
+bool pci_user_bar_prefetchable(struct file *f, uint32_t bar);
 int64_t pci_user_interrupts(struct file *f, uint32_t count);
 int64_t pci_user_interrupt_take(struct file *f, int64_t timeout_ms);

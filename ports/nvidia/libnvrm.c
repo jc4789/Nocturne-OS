@@ -1,5 +1,7 @@
 /* libnvrm: an app's connection to /bin/nvrm (include/nvrm.h, include/nvrm_protocol.h). */
 #include <stdlib.h>
+#include <stdio.h>
+#include <limits.h>
 #include <string.h>
 #include <threads.h>
 #include "nocturne.h"
@@ -32,10 +34,13 @@ struct nvrm {
     struct mapping *mappings;
 };
 
-struct nvrm *nvrm_connect(void) {
+struct nvrm *nvrm_connect_device(uint32_t pci_target) {
+    if (pci_target > UINT16_MAX) return NULL;
+    char channel[NVRM_CHANNEL_NAME_BYTES];
+    snprintf(channel, sizeof channel, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
     struct nvrm *rm = calloc(1, sizeof *rm);
     if (!rm) return NULL;
-    rm->channel = n_channel_connect(NVRM_CHANNEL);
+    rm->channel = n_channel_connect(channel);
     rm->arena_handle = rm->channel >= 0 ? n_shared_reserve(ARENA_BYTES) : -1;
     rm->arena = rm->arena_handle >= 0 ? n_shared_map(rm->arena_handle, ARENA_BYTES, N_MEMORY_READ_WRITE) : NULL;
     if (!rm->arena || mtx_init(&rm->lock, mtx_recursive) != thrd_success) goto fail;
@@ -44,7 +49,7 @@ struct nvrm *nvrm_connect(void) {
     struct nvrm_message reply;
     if (n_channel_send(rm->channel, &hello, sizeof hello, rm->arena_handle) < 0 ||
         n_channel_receive(rm->channel, &reply, sizeof reply, N_CHANNEL_WAIT, NULL) != (n_result)sizeof reply ||
-        reply.status < 0) {
+        reply.protocol != NVRM_PROTOCOL || reply.escape != NVRM_HELLO || reply.size || reply.status < 0) {
         mtx_destroy(&rm->lock);
         goto fail;
     }
@@ -55,6 +60,32 @@ fail:
     if (rm->channel >= 0) n_handle_close(rm->channel);
     free(rm);
     return NULL;
+}
+
+struct nvrm *nvrm_connect(void) {
+    /* pcilist fills the supplied capacity. Grow until the complete snapshot fits,
+       rather than truncating the set of GPUs to a driver-specific constant. */
+    struct n_pciinfo *list = NULL;
+    size_t capacity = 1;
+    int count;
+    for (;;) {
+        if (capacity > INT_MAX || capacity > SIZE_MAX / sizeof *list) { free(list); return NULL; }
+        struct n_pciinfo *grown = realloc(list, capacity * sizeof *list);
+        if (!grown) { free(list); return NULL; }
+        list = grown;
+        count = pcilist(list, (int)capacity);
+        if (count < 0) { free(list); return NULL; }
+        if ((size_t)count < capacity) break;
+        if (capacity > INT_MAX / 2) { free(list); return NULL; }
+        capacity *= 2;
+    }
+    struct nvrm *rm = NULL;
+    for (int i = 0; i < count && !rm; i++) {
+        if (list[i].vendor != 0x10de || list[i].cls != 0x03) continue;
+        rm = nvrm_connect_device(N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func));
+    }
+    free(list);
+    return rm;
 }
 
 void nvrm_disconnect(struct nvrm *rm) {
@@ -92,24 +123,34 @@ void *nvrm_scratch(struct nvrm *rm, size_t bytes) {
 /* One request and its reply; the reply's arguments overwrite args. Called locked. */
 static uint32_t request(struct nvrm *rm, uint32_t escape, void *args, uint32_t size, n_handle *attached,
                         struct nvrm_message *head) {
-    struct {
-        struct nvrm_message head;
-        uint8_t args[NVRM_ARGS_MAX];
-    } msg;
-    if (size > NVRM_ARGS_MAX) return NV_ERR_INVALID_ARGUMENT;
-    msg.head = (struct nvrm_message){.protocol = NVRM_PROTOCOL, .escape = escape, .size = size};
-    memcpy(msg.args, args, size);
+    size_t bytes = sizeof(struct nvrm_message) + size;
+    if (bytes < size) return NV_ERR_INVALID_ARGUMENT;
+    struct nvrm_message *msg = malloc(bytes);
+    if (!msg) return NV_ERR_NO_MEMORY;
+    *msg = (struct nvrm_message){.protocol = NVRM_PROTOCOL, .escape = escape, .size = size};
+    if (size) memcpy(msg + 1, args, size);
     if (attached) *attached = -1;
-    if (n_channel_send(rm->channel, &msg, sizeof msg.head + size, -1) < 0) return NV_ERR_OPERATING_SYSTEM;
-    n_result got = n_channel_receive(rm->channel, &msg, sizeof msg, N_CHANNEL_WAIT, attached);
-    if (got < (n_result)sizeof msg.head || msg.head.status < 0 || msg.head.size != size ||
-        (size_t)got != sizeof msg.head + size) {
-        if (attached && *attached >= 0) n_handle_close(*attached);
-        return NV_ERR_OPERATING_SYSTEM;
+    uint32_t result = NV_ERR_OPERATING_SYSTEM;
+    if (n_channel_send(rm->channel, msg, bytes, -1) < 0) goto done;
+    n_result got = n_channel_receive(rm->channel, msg, bytes, N_CHANNEL_WAIT, attached);
+    if (got < (n_result)sizeof *msg || msg->protocol != NVRM_PROTOCOL || msg->escape != escape) goto invalid;
+    if (msg->status < 0) {
+        /* Protocol1 peers used these slots only for hello. A new server carries
+           RM's exact error here; old peers still see a generic transport error. */
+        if (msg->rm_status && msg->rm_status <= UINT32_MAX && !msg->size && (size_t)got == sizeof *msg)
+            result = (uint32_t)msg->rm_status;
+        goto invalid;
     }
-    memcpy(args, msg.args, size);
-    if (head) *head = msg.head;
-    return NV_OK;
+    if (msg->rm_status > UINT32_MAX || msg->size != size || (size_t)got != bytes) goto invalid;
+    if (size) memcpy(args, msg + 1, size);
+    if (head) *head = *msg;
+    result = (uint32_t)msg->rm_status;
+    goto done;
+invalid:
+    if (attached && *attached >= 0) { n_handle_close(*attached); *attached = -1; }
+done:
+    free(msg);
+    return result;
 }
 
 /* params copied into the arena around a request whose argument struct points at them. */
@@ -172,10 +213,13 @@ uint32_t nvrm_map(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t me
     nvrm_lock(rm);
     uint32_t r = request(rm, NV_ESC_RM_MAP_MEMORY, &a, sizeof a, &shared, &head);
     if (r == NV_OK) r = a.params.status;
-    if (r == NV_OK && (shared < 0 || head.offset > head.bytes)) r = NV_ERR_OPERATING_SYSTEM;
+    if (r == NV_OK && (shared < 0 || !head.bytes || head.bytes > SIZE_MAX || head.offset >= head.bytes ||
+                      length > head.bytes - head.offset ||
+                      (head.access != N_MEMORY_READ && head.access != N_MEMORY_READ_WRITE)))
+        r = NV_ERR_OPERATING_SYSTEM;
     if (r == NV_OK) {
         m->bytes = (size_t)head.bytes;
-        m->base = n_shared_map(shared, m->bytes, N_MEMORY_READ_WRITE);
+        m->base = n_shared_map(shared, m->bytes, head.access);
         if (!m->base) r = NV_ERR_NO_MEMORY;
     }
     if (shared >= 0) n_handle_close(shared); /* the mapping keeps the object */

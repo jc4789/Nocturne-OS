@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <threads.h>
+#include <stdatomic.h>
+#include <errno.h>
 #include "nocturne.h"
 
 static int failed;
@@ -33,6 +36,13 @@ static int failed;
 #define EDU_DMA_MASK 0xFFFFFFFFull
 
 static volatile uint8_t *regs;
+static atomic_int waiter_started;
+static n_result waiter_result;
+static int interrupt_waiter(void *arg) {
+    atomic_store(&waiter_started,1);
+    waiter_result=n_pci_interrupt_take((n_handle)(intptr_t)arg,-1);
+    return 0;
+}
 static uint32_t rd32(uint32_t at) { return *(volatile uint32_t *)(regs + at); }
 static void wr32(uint32_t at, uint32_t v) { *(volatile uint32_t *)(regs + at) = v; }
 static void wr64(uint32_t at, uint64_t v) { *(volatile uint64_t *)(regs + at) = v; }
@@ -49,7 +59,20 @@ static int dma(n_handle pci, uint64_t ram, uint32_t count, int to_ram) {
     return got > 0 && (why & 0x100);
 }
 
-int main(void) {
+static int revoked_reader(void) {
+    n_handle view=-1;char signal=0;
+    if(n_channel_receive(3,&signal,1,N_CHANNEL_WAIT,&view)!=1 || view<0)return 10;
+    const volatile uint32_t *p=n_shared_map(view,4096,N_MEMORY_READ);
+    if(!p || p[0]!=0x12345678)return 11;
+    /* Receiving a view must not confer the issuer's cancellation authority. */
+    if(n_shared_revoke(view)!=-N_ERR_DENIED)return 12;
+    if(n_channel_send(3,"r",1,-1)!=1)return 13;
+    if(n_channel_receive(3,&signal,1,N_CHANNEL_WAIT,NULL)!=1)return 14;
+    volatile uint32_t value=p[0]; /* expected access fault after parent revoke */
+    return value==0x12345678?15:16;
+}
+int main(int argc,char **argv) {
+    if(argc>1 && !strcmp(argv[1],"revoked-reader"))return revoked_reader();
     struct n_pciinfo list[128];
     int n = pcilist(list, 128), at = -1;
     for (int i = 0; i < n; i++)
@@ -124,7 +147,7 @@ int main(void) {
         CHECK(rd32(EDU_LIVENESS) == ~0x12345678u, "liveness %08x", rd32(EDU_LIVENESS));
     }
     n_handle wc = n_shared_view(bar, 0, 4096, N_CACHE_WRITE_COMBINE);
-    CHECK(wc >= 0, "write-combining view: %s", n_result_text(wc));
+    CHECK(wc == -N_ERR_DENIED, "non-prefetchable register BAR refuses write-combining: %s", n_result_text(wc));
     n_handle wb = n_shared_view(bar, 0, 4096, N_CACHE_WRITE_BACK);
     CHECK(wb == -N_ERR_DENIED, "write-back view of device memory: %s", n_result_text(wb));
     CHECK(n_shared_view(bar, 100, 4096, N_CACHE_UNCACHED) == -N_ERR_INVALID, "unaligned view");
@@ -150,6 +173,20 @@ int main(void) {
         CHECK(got == 1, "interrupt bits %lld", (long long)got);
         CHECK(rd32(EDU_IRQ_STATUS) == 0x5, "irq status %x", rd32(EDU_IRQ_STATUS));
         wr32(EDU_IRQ_ACK, 0x5);
+    }
+    if(vectors>=1){
+        thrd_t waiter;
+        int created=thrd_create(&waiter,interrupt_waiter,(void *)(intptr_t)pci);
+        CHECK(created==thrd_success,"interrupt waiter thread");
+        if(created==thrd_success){
+            while(!atomic_load(&waiter_started))thrd_yield();
+            n_sleep_ms(1); /* let the native take enter its blocking continuation */
+            CHECK(n_pci_interrupts(pci,0)==0,"disable interrupts while take waits");
+            thrd_join(waiter,NULL);
+            CHECK(waiter_result==-N_ERR_NOT_READY,"disabled IRQ wakes infinite take: %s",n_result_text(waiter_result));
+            vectors=n_pci_interrupts(pci,4);
+            CHECK(vectors>=1,"interrupt re-enable");
+        }
     }
 
     n_handle mem = n_dma_create(pci, 8192, N_DMA_CONTIGUOUS | N_DMA_32BIT);
@@ -190,6 +227,54 @@ int main(void) {
         n_memory_release((void *)uc, 4096);
     }
     n_handle plain = n_shared_create(4096);
+    uint32_t *plain_map=n_shared_map(plain,4096,N_MEMORY_READ_WRITE);
+    if(plain_map)plain_map[0]=0x12345678;
+    n_handle ro=n_shared_view_access(plain,0,4096,N_CACHE_DEFAULT,N_MEMORY_READ);
+    CHECK(ro>=0,"read-only maximum view");
+    CHECK(!n_shared_map(ro,4096,N_MEMORY_READ_WRITE),"read-only view refuses writable map");
+    const uint32_t *ro_map=n_shared_map(ro,4096,N_MEMORY_READ);
+    CHECK(ro_map && ro_map[0]==0x12345678,"read-only view maps original bytes");
+    /* n_memory_protect is the -1/errno convenience API, not n_result. The
+       original check incorrectly compared it with the raw native error. */
+    CHECK(!ro_map || (n_memory_protect((void *)ro_map,4096,N_MEMORY_READ_WRITE)==-1 && errno==N_ERR_DENIED),"read-only page cannot be upgraded");
+    CHECK(!ro_map || __syscall(SYS_MEMORY_PROTECT,(long)ro_map,4096,N_MEMORY_READ_WRITE,0,0)==-N_ERR_DENIED,"raw native protect preserves maximum access");
+    CHECK(n_shared_view_access(ro,0,4096,N_CACHE_DEFAULT,N_MEMORY_READ_WRITE)==-N_ERR_DENIED,"derived view cannot enlarge maximum access");
+    n_handle child=n_shared_view(ro,0,4096,N_CACHE_DEFAULT);
+    const uint32_t *child_map=n_shared_map(child,4096,N_MEMORY_READ);
+    CHECK(child>=0 && child_map && child_map[0]==0x12345678,"derived read-only view");
+    n_handle channel[2]={-1,-1},reader=-1;
+    if(n_channel_pair(channel)==0){
+        const char *args[]={argv[0],"revoked-reader"};
+        int32_t handles[]={0,1,2,channel[1]};
+        struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=4};
+        reader=n_app_launch(argv[0],&launch);
+        CHECK(reader>=0,"launch independent mapping reader");
+        n_handle_close(channel[1]);channel[1]=-1;
+        if(reader>=0){
+            char ready=0;
+            CHECK(n_channel_send(channel[0],"m",1,child)==1,"send descendant view to child app");
+            CHECK(n_channel_receive(channel[0],&ready,1,N_CHANNEL_WAIT,NULL)==1 && ready=='r',"child mapped and read before revoke");
+        }
+    }else CHECK(0,"mapping reader channel");
+    CHECK(n_shared_revoke(ro)==0,"issuer revokes exported view");
+    if(reader>=0){
+        int status=0;
+        CHECK(n_channel_send(channel[0],"x",1,-1)==1,"release child to read revoked mapping");
+        n_result result=n_app_result(reader,2000,&status);
+        CHECK(result==0 && status==128+14,"revoked existing mapping faults in child: result=%lld status=%d",(long long)result,status);
+        if(result<0)n_app_stop(reader,0);
+        n_handle_close(reader);
+    }
+    if(channel[0]>=0)n_handle_close(channel[0]);
+    CHECK(!n_shared_map(child,4096,N_MEMORY_READ),"revoked child cannot remap");
+    CHECK(n_shared_view(child,0,4096,N_CACHE_DEFAULT)==-N_ERR_CLOSED,"revoked descendant cannot escape through view");
+    CHECK(!child_map || n_memory_protect((void *)child_map,4096,N_MEMORY_READ)<0,"existing descendant mapping lost its PTE");
+    CHECK(plain_map && plain_map[0]==0x12345678,"independent owner mapping survives view revoke");
+    if(ro_map)n_memory_release((void *)ro_map,4096);
+    if(child_map)n_memory_release((void *)child_map,4096);
+    if(plain_map)n_memory_release(plain_map,4096);
+    if(child>=0)n_handle_close(child);
+    if(ro>=0)n_handle_close(ro);
     CHECK(n_shared_view(plain, 0, 4096, N_CACHE_UNCACHED) == -N_ERR_DENIED, "ordinary memory keeps its caching");
     CHECK(n_dma_addresses(plain, 0, &through, 1) == -N_ERR_WRONG_KIND, "no addresses of ordinary memory");
     n_handle_close(plain);

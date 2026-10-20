@@ -115,6 +115,12 @@ n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size
 /* A new shared object over part of another (page-aligned offset and bytes) with the given
    caching (N_CACHE_*): mapping it maps the same pages. */
 n_handle n_shared_view(n_handle shared, size_t offset, size_t bytes, uint32_t cache);
+/* A view with an immutable maximum access (N_MEMORY_READ or READ_WRITE).
+   Derived views and transferred handles cannot enlarge this access. */
+n_handle n_shared_view_access(n_handle shared, size_t offset, size_t bytes, uint32_t cache, uint32_t access);
+/* Only the app which issued a view may revoke it. Existing mappings and all
+   derived views lose access; the underlying object and independent views remain alive. */
+n_result n_shared_revoke(n_handle view);
 /* Sound: each n_audio_open is a stream of N_AUDIO_RATE stereo frames (two int16_t, left first)
    of its own, mixed with the others and scaled by the master volume. A stream holds about
    170 ms; n_audio_submit takes what fits and returns the frames taken (with N_AUDIO_WAIT it

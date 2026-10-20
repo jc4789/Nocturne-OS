@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "nocturne.h"
 
 /* Launch path with up to two arguments and the given input, output and log, in
@@ -41,8 +42,26 @@ static void autorun(void) {
 static void start_drivers(void) {
     struct n_entry e;
     if (n_entry_info("/bin/nvrm", &e) < 0) return;
-    struct n_pciinfo list[128];
-    int n = pcilist(list, 128);
+    struct n_pciinfo *list = NULL;
+    size_t capacity = 1;
+    int n;
+    for (;;) {
+        if (capacity > INT_MAX || capacity > SIZE_MAX / sizeof *list) {
+            free(list);
+            return;
+        }
+        struct n_pciinfo *grown = realloc(list, capacity * sizeof *list);
+        if (!grown) {
+            free(list);
+            return;
+        }
+        list = grown;
+        n = pcilist(list, (int)capacity);
+        if (n < 0) { free(list); return; }
+        if ((size_t)n < capacity) break;
+        if (capacity > INT_MAX / 2) { free(list); return; }
+        capacity *= 2;
+    }
     for (int i = 0; i < n; i++) {
         if (list[i].vendor != 0x10de || list[i].cls != 0x03) continue;
         char where[16];
@@ -62,6 +81,7 @@ static void start_drivers(void) {
         if (log >= 0) n_handle_close(log);
         n_handle_close(pci);
     }
+    free(list);
     fflush(stdout);
 }
 

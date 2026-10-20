@@ -3,10 +3,12 @@
 RTX 4070（AD104、Ada）を、NVIDIA の open-gpu-kernel-modules 615.78.08 の RM（`third_party/nvidia-open`）で
 動かすための層。台帳は `docs/nvidia/LEDGER.md`。**Nocturne は Unix でも POSIX でもない。** この層は
 Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`、`timespec_get`）だけで書いてあり、
-`fork`・`ioctl`・`mmap` などの互換層は無い。RM のソースは変更しない（変更が要るなら OS 層側で合わせる）。
+`fork`・`ioctl`・`mmap` などの互換層は無い。修理は OS 層へ統合し、RM 本体の変更は既存の MIT
+`arch/nvalloc/unix/src/os.c` の Nocturne 条件付き user-map 寿命コールバックに限定する。
 
-状態：RM 全体（1100 個）と OS 層がコンパイルでき、`/bin/nvrm` のリンクで未解決なのは、まだ再ビルドしていない
-libc 側の `n_pci_*`／`n_dma_*`／`n_shared_view` だけ（ソースには有る）。**実機（GSP の起動）では未確認。**
+状態：RM、OS 層、クライアントと NVK の接続がある。2026-10-20 の修理は
+`docs/nvidia/repair-rm-first.md` と第二検討報告へ記録する。ホスト試験は native サービスを mock にするため、
+その成功から PCI、GPU DMA、キャッシュ、GSP 起動の成功を推論しない。**NVIDIA 実機は未確認。**
 
 ## 構成
 
@@ -21,13 +23,21 @@ libc 側の `n_pci_*`／`n_dma_*`／`n_shared_view` だけ（ソースには有�
 | `nvlink_os.c` | NVLink／NVSwitch ライブラリーが求める OS 関数（メモリ・文字列・時刻・識別） |
 | `spdm_stubs.c` | libspdm の暗号バックエンド（71 個、すべて 0 を返す） |
 | `nvrm.c` | `main`、割り込みスレッド、起動手順 |
-| `nvrm_serve.c／.h`、`libnvrm.c`、`include/` | リクエストサーバー、クライアント側ライブラリー、通信規約（主担当の所有。ここでは変更しない） |
+| `nvrm_serve.c／.h`、`libnvrm.c`、`include/` | リクエストサーバー、クライアント側ライブラリー、通信規約 |
 
 起動手順（`nvrm.c`）：init が `N_KIND_PCI` をハンドル 3 で渡す → `n_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
 `NVRM_REGISTRY_DWORDS`（環境変数、任意）を `rm_parse_option_string` へ → `rm_init_rm` → `rm_is_supported_device`
 → `rm_init_private_state` → `rm_init_event_locks` → `rm_set_rm_firmware_requested` → 割り込みスレッド
 → `rm_init_adapter`（ここで GSP が起動する）→ `rm_get_device_name` をログへ → `nvrm_serve()`。
 `rm_init_adapter` が失敗しても、診断のためにサーバーは動かし続ける（ログに失敗を残す）。
+
+装置ごとに `nocturne.nvidia.rm.<N_PCI_TARGETの4桁16進数>` を公開する。
+`nvrm_connect_device()` は指定装置へ、従来の `nvrm_connect()` は動的 PCI 列挙から最初に接続可能な装置へつなぐ。
+従来名 `nocturne.nvidia.rm` は一つの daemon だけが既存アプリ用 alias として公開する。
+Protocol1 の48byte header と field offset は維持し、通常応答で未使用だった hello 用領域へ
+RM 戻り値と map access を格納する。旧バイナリーにも RM 関数失敗を負の status で通知する。
+RO view を RW map しようとする旧クライアントは拒否される。RO 対応には新しい libnvrm との再リンクが必要で、
+互換性のために写像権利を緩めない。
 
 ファームウェア：`/usr/share/firmware/nvidia/615.78.08/`、無ければ `/data/firmware/nvidia/615.78.08/`
 （`nv_get_firmware`）。git には入れない（台帳 D9）。
@@ -85,7 +95,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `nv_start_rc_timer`／`nv_stop_rc_timer`、`nv_create_nano_timer` ほか | 1 本のタイマースレッド（1 Hz の RC、nano タイマー） |
 | `nv_get_firmware`／`nv_put_firmware` | `n_document_load`（上のフォルダー順。ログの追記は `n_document_append`） |
 | `os_get_cpu_count`／`os_get_cpu_number`／`os_get_cpu_frequency` | `cpu_info`／`cpu_index` |
-| `os_get_current_process`／`_name`／`os_get_current_thread`、`os_get_euid`、`os_is_administrator`、`os_check_access` | nvrm のプロセスは一つ。スレッド局所の `nvrm_thread_admin` は要求の間だけ接続の権限（`nvrm_serve.c` の `client_is_admin`、現状すべて非特権）になり、nvrm 自身のスレッド（割り込み・作業・タイマー）は管理者 |
+| `os_get_current_process`／`_name`／`os_get_current_thread`、`os_get_euid`、`os_is_administrator`、`os_check_access` | 要求／cleanup は再利用しない接続固有の RM 主体と非特権 TLS で実行。daemon 自身のスレッドは daemon の PID と管理者権限。認証済み peer PID API が無いため、同一アプリの別接続も暗黙に同一主体とはしない |
 | `os_pci_init_handle`、`os_pci_read_*`／`write_*` | `n_pci_config_read／write`。自分の機能だけ書ける。他の機能（上流ブリッジ）は読むだけ |
 | `os_map_kernel_space`／`os_unmap_kernel_space` | BAR は `n_pci_bar`＋`n_shared_view`（UC／WC）＋`n_shared_map`。BAR0 は全体を一度だけ写す |
 | `nv_alloc_pages`／`nv_free_pages` | `n_dma_create`（`N_DMA_CONTIGUOUS`、`N_DMA_32BIT`）＋`n_dma_addresses`。ページ 4 KiB より大きいときは余分に取って view で整列 |
@@ -117,11 +127,11 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 - 4 KiB を超えるページサイズの連続確保は、余分に取って整列する。非連続の大きなページも連続を強いるので、大きな確保は失敗しうる。
 - `nv_alloc_user_mapping` の符号化は bus 番地が一意であることに頼る（IOMMU が無いので成り立つ）。
 - 再配置可能な BAR（Resizable BAR）で BAR1／BAR2 が 16 GiB のとき、カーネル側の写しが失敗しうる。
-- BAR を複数の範囲に分けたマッピングは未対応（`nvrm_rm_mapping_object` が -1 を返す）。
-- 全クライアントが RM の目には一つのプロセス（`n_app_self`）。クライアントごとの隔離・権限は無い。
-- `nv->bars[2]`（インスタンスメモリ）を設定空間の BAR 3 としたのは推測。
+- 隣接 BAR range は個数制限なしで結合するが、真に非連続の BAR mapping は native shared view の能力外。
 - `os_is_efi_enabled` は常に真。`os_disable_console_access` は何もしない（表示の乗っ取りは GSP 初期化の間にありうる。D8）。
-- `nv_revoke_gpu_mappings` はクライアントの view を取り上げられない。
+- memory BAR の有効索引と64bit幅から RM aperture を割当てる。通常 VRAM 以外は UC に固定する。
+- user-map ごとの RM private token を保持し、明示／暗黙 unmap と close で当該 view と派生写像を失効する。
+  `nv_revoke_gpu_mappings` は既存全 view を失効し、失効に失敗した場合は成功と報告しない。
 - `cnd_timedwait` は `TIME_UTC` の期限で待つ。Nocturne の `TIME_UTC` は戻らない（libc の `time.c`）ので、壁時計が進められても待ちが早く終わるだけで、タイマーの線は単調時計で測り直す。
 - RM の呼出しの深さに対し、スレッドのスタックが 256 KiB で足りるかは未確認。
 - 実機でのファームウェア起動・割り込み・ブートの結果は未確認。

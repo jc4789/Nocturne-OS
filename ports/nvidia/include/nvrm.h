@@ -13,6 +13,8 @@
 struct nvrm;
 
 struct nvrm *nvrm_connect(void); /* NULL when no driver runs */
+/* Select a domain-zero PCI function, encoded by N_PCI_TARGET(bus, dev, func). */
+struct nvrm *nvrm_connect_device(uint32_t pci_target);
 void nvrm_disconnect(struct nvrm *rm);
 
 /* NV_ESC_RM_ALLOC: *object 0 asks RM for a handle (as for a new client: root 0, parent 0). */
@@ -28,7 +30,7 @@ uint32_t nvrm_map(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t me
 uint32_t nvrm_unmap(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t memory, void *address,
                     uint32_t flags);
 /* Any other escape whose argument struct holds no pointers (NVOS46 map DMA, NVOS47, ...). Returns
-   NV_OK once nvrm ran it; RM's own status is the struct's status field. */
+   rm_ioctl's NV_STATUS; the individual API's status is the struct's status field. */
 uint32_t nvrm_escape(struct nvrm *rm, uint32_t escape, void *args, uint32_t size);
 
 /* false once /bin/nvrm has gone (its end of the connection is closed); polling waits use it to

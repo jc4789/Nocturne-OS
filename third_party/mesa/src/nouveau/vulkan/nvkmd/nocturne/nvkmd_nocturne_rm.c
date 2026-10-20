@@ -17,6 +17,7 @@
  *   *_CHANNEL_GPFIFO_A (in a group of its own) -> engine objects  one nnrm_chan
  *   VOLTA_USERMODE_A                                        the doorbell page
  */
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,6 +29,7 @@
 #include "nvkmd_nocturne_rm.h"
 
 #include "nvrm.h"
+#include "nocturne.h"
 
 /* nvstatus.h brings RM's own nvtypes.h; Mesa's nouveau headers have a file of
  * that name too, so it is never included by name here */
@@ -87,40 +89,41 @@
 
 /* ------------------------------------------------------------------ session */
 
-static once_flag g_once = ONCE_FLAG_INIT;
-static mtx_t g_lock;
-static struct nvrm *g_rm;
-static unsigned g_refs;
-
-static void
-global_init(void)
+/* Enumerate native PCI identities, not one daemon's local probed-ID indices.
+ * A daemon owns exactly the function handed to it by init.  Start with room
+ * for one function and grow until pcilist says the complete list fitted. */
+static uint32_t
+pci_gpus(uint32_t wanted, uint32_t *target)
 {
-   mtx_init(&g_lock, mtx_plain);
-}
-
-static struct nvrm *
-rm_acquire(void)
-{
-   call_once(&g_once, global_init);
-   mtx_lock(&g_lock);
-   if (g_rm == NULL)
-      g_rm = nvrm_connect();
-   if (g_rm != NULL)
-      g_refs++;
-   struct nvrm *rm = g_rm;
-   mtx_unlock(&g_lock);
-   return rm;
-}
-
-static void
-rm_release(void)
-{
-   mtx_lock(&g_lock);
-   if (g_refs > 0 && --g_refs == 0) {
-      nvrm_disconnect(g_rm);
-      g_rm = NULL;
+   struct n_pciinfo *list = NULL;
+   size_t capacity = 1;
+   uint32_t count = 0;
+   for (;;) {
+      if (capacity > INT_MAX || capacity > SIZE_MAX / sizeof(*list))
+         break;
+      struct n_pciinfo *next = realloc(list, capacity * sizeof(*list));
+      if (next == NULL)
+         break;
+      list = next;
+      int len = pcilist(list, (int)capacity);
+      if (len < 0)
+         break;
+      if ((size_t)len < capacity) {
+         for (int i = 0; i < len; i++) {
+            if (list[i].vendor != 0x10de || list[i].cls != 0x03)
+               continue;
+            if (target != NULL && count == wanted)
+               *target = N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func);
+            count++;
+         }
+         break;
+      }
+      if (capacity > SIZE_MAX / 2)
+         break;
+      capacity *= 2;
    }
-   mtx_unlock(&g_lock);
+   free(list);
+   return count;
 }
 
 struct nnrm {
@@ -446,53 +449,48 @@ query_gpu(struct nnrm *n, uint32_t gpu_index)
 uint32_t
 nnrm_gpu_count(void)
 {
-   struct nvrm *rm = rm_acquire();
-   if (rm == NULL)
-      return 0;
-
-   uint32_t client = 0;
-   uint32_t count = 0;
-   if (nvrm_alloc(rm, 0, 0, &client, NV01_ROOT_CLIENT, NULL, 0) == NV_OK) {
-      NV0000_CTRL_GPU_GET_PROBED_IDS_PARAMS probed;
-      memset(&probed, 0, sizeof(probed));
-      if (nvrm_control(rm, client, client, NV0000_CTRL_CMD_GPU_GET_PROBED_IDS,
-                       &probed, sizeof(probed)) == NV_OK) {
-         while (count < NV0000_CTRL_GPU_MAX_PROBED_GPUS &&
-                probed.gpuIds[count] != NV0000_CTRL_GPU_INVALID_ID)
-            count++;
-      }
-      nvrm_free(rm, client, client, client);
-   }
-
-   rm_release();
-   return count;
+   return pci_gpus(0, NULL);
 }
 
 uint32_t
 nnrm_open(uint32_t gpu_index, struct nnrm **out, struct nnrm_gpu_info *info)
 {
-   struct nvrm *rm = rm_acquire();
+   uint32_t target = N_PCI_NONE;
+   if (gpu_index >= pci_gpus(gpu_index, &target))
+      return NV_ERR_INVALID_ARGUMENT;
+   return nnrm_open_device(target, out, info);
+}
+
+uint32_t
+nnrm_open_device(uint32_t target, struct nnrm **out, struct nnrm_gpu_info *info)
+{
+   struct nvrm *rm = nvrm_connect_device(target);
    if (rm == NULL)
       return NV_ERR_OPERATING_SYSTEM;
 
    struct nnrm *n = calloc(1, sizeof(*n));
    if (n == NULL) {
-      rm_release();
+      nvrm_disconnect(rm);
       return NV_ERR_NO_MEMORY;
    }
    n->rm = rm;
    atomic_init(&n->internal_va, NNRM_INTERNAL_VA);
+   atomic_init(&n->daemon_lost, false);
    mtx_init(&n->usermode_lock, mtx_plain);
 
    uint32_t st = nvrm_alloc(rm, 0, 0, &n->client, NV01_ROOT_CLIENT, NULL, 0);
    if (st == NV_OK)
-      st = query_gpu(n, gpu_index);
+      st = query_gpu(n, 0);
 
    if (st != NV_OK) {
       nnrm_close(n);
       return st;
    }
 
+   n->info.pci_target = target;
+   n->info.pci_bus = target >> 8;
+   n->info.pci_dev = (target >> 3) & 0x1f;
+   n->info.pci_func = target & 0x7;
    if (info != NULL)
       *info = n->info;
    *out = n;
@@ -513,8 +511,8 @@ nnrm_close(struct nnrm *n)
       nvrm_free(n->rm, n->client, n->client, n->client);
 
    mtx_destroy(&n->usermode_lock);
+   nvrm_disconnect(n->rm);
    free(n);
-   rm_release();
 }
 
 uint64_t
@@ -900,6 +898,11 @@ struct nnrm_chan {
    /* GP FIFO ring (GPU-visible), error notifier and USERD (RM and CPU only) */
    struct chan_buffer gpfifo, notifier, userd;
 
+   /* A channel-owned, readable BAR1 allocation.  Reading it drains this
+    * device's PCI posted writes before sysmem USERD makes work visible. */
+   struct nnrm_mem *posted_mem;
+   void *posted_map;
+
    uint32_t entries; /* GP FIFO entries, a power of two */
    uint32_t put;     /* next entry to write, wraps at entries */
    uint32_t token;   /* work submit token, written to the doorbell */
@@ -1014,6 +1017,13 @@ chan_setup(struct nnrm *n, struct nnrm_chan *c, uint32_t engines, bool gr,
            uint32_t engine_type)
 {
    uint32_t st = usermode_map(n);
+   if (st != NV_OK)
+      return st;
+
+   st = nnrm_mem_alloc(n, NNRM_MEM_VRAM, NNRM_PAGE_SIZE, NNRM_PAGE_SIZE,
+                       &c->posted_mem);
+   if (st == NV_OK)
+      st = nnrm_mem_map(c->posted_mem, &c->posted_map);
    if (st != NV_OK)
       return st;
 
@@ -1132,6 +1142,10 @@ nnrm_chan_destroy(struct nnrm_chan *c)
    if (c->channel != 0)
       rm_free(c->rm, c->rm->device, c->channel);
 
+   if (c->posted_map != NULL)
+      nnrm_mem_unmap(c->posted_mem, c->posted_map);
+   nnrm_mem_free(c->posted_mem);
+
    buffer_destroy(&c->gpfifo);
    buffer_destroy(&c->notifier);
    buffer_destroy(&c->userd);
@@ -1184,7 +1198,11 @@ nnrm_chan_submit(struct nnrm_chan *c, const struct nnrm_gp *gps, uint32_t count)
          c->put = (c->put + 1) & mask;
       }
 
-      /* The ring entries before GPPut, GPPut before the doorbell */
+      /* CPU ordering alone does not drain WC/UC PCI posted writes.  Order
+       * the caller's VRAM stores, complete a read from this device's live
+       * BAR1 allocation, then publish sysmem GPPut and ring the doorbell. */
+      atomic_thread_fence(memory_order_seq_cst);
+      (void)*(const volatile uint32_t *)c->posted_map;
       atomic_thread_fence(memory_order_seq_cst);
       userd->GPPut = c->put;
       atomic_thread_fence(memory_order_seq_cst);

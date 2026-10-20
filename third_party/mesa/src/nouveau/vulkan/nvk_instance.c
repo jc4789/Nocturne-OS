@@ -54,7 +54,7 @@ static const struct vk_instance_extension_table instance_extensions = {
    .EXT_display_surface_counter = true,
    .EXT_acquire_drm_display = true,
 #endif
-#ifndef VK_USE_PLATFORM_WIN32_KHR
+#if defined(NVK_USE_WSI_PLATFORM) && !defined(VK_USE_PLATFORM_WIN32_KHR)
    .EXT_headless_surface = true,
 #endif
    .KHR_device_group_creation = true,

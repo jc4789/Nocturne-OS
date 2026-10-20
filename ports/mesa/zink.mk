@@ -14,6 +14,6 @@ ZINK_FLAGS := -DGALLIUM_ZINK -I$(ZINK) -I$(ZINK_GEN) -I$(MESA)/src/vulkan/util -
 $(ZINK_OBJ): MESA_CFLAGS += $(ZINK_FLAGS)
 $(ZINK_OBJ): MESA_CXXFLAGS += $(ZINK_FLAGS)
 # the GL frontend tries Zink before softpipe
-$(BUILD)/mesa/o/ports/mesa/nocturne_gl.c.o: MESA_CFLAGS += -DGALLIUM_ZINK
+$(BUILD)/mesa/o/ports/mesa/nocturne_gl.c.o: MESA_CFLAGS += -DGALLIUM_ZINK -Iports/nvidia/include
 $(filter $(MESA_GEN)/%,$(ZINK_SRC)): $(MESA_GEN_STAMP)
 	@:

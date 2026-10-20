@@ -562,6 +562,11 @@ static bool context_setup(struct webgl *gl) {
     struct ngl_attribs attribs = {gl->attrs.alpha, gl->attrs.depth, gl->attrs.stencil, gl->attrs.antialias};
     gl->ngl = ngl_context_create(gl->version == 2 ? 3 : 2, &attribs, gl->width, gl->height, error, sizeof error);
     if (!gl->ngl) return false;
+    if (gl->attrs.fail_caveat && ngl_has_major_performance_caveat(gl->ngl)) {
+        ngl_context_destroy(gl->ngl);
+        gl->ngl = NULL;
+        return false;
+    }
     if (!ngl_make_current(gl->ngl)) {
         ngl_context_destroy(gl->ngl);
         gl->ngl = NULL;
@@ -646,9 +651,6 @@ JSValue web_webgl_create(JSContext *ctx, JSValueConst canvas, int version, JSVal
     } else {
         probe.attrs.alpha = probe.attrs.antialias = probe.attrs.depth = probe.attrs.premultiplied = true;
     }
-    /* Software rasterization is the major performance caveat the page
-       asked to avoid; it then falls back to its own path. */
-    if (probe.attrs.fail_caveat) return JS_NULL;
     struct webgl *gl = calloc(1, sizeof *gl);
     if (!gl) return JS_ThrowOutOfMemory(ctx);
     gl->attrs = probe.attrs;
