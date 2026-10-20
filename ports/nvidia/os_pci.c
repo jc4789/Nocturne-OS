@@ -4,8 +4,8 @@
  *   config space      n_pci_config_read / n_pci_config_write
  *   register BAR      n_pci_bar + n_shared_map (BAR0, mapped whole at start)
  *   other BAR ranges  n_pci_bar + n_shared_view (uncached or write-combining) + n_shared_map
- *   system memory     n_dma_create / n_dma_addresses (the bus address is the physical address;
- *                     Nocturne programs no IOMMU, so RM's "DMA remap" is never needed)
+ *   system memory     n_dma_create / n_dma_addresses (Nocturne currently returns physical
+ *                     addresses; it does not establish an IOMMU translation domain)
  *   interrupts        n_pci_interrupts / n_pci_interrupt_take
  */
 #include "nvrm_os.h"
@@ -320,6 +320,17 @@ NV_STATUS nvrm_pci_attach(void) {
     nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
     nv->fb = &nv->bars[NV_GPU_BAR_INDEX_FB];
 
+    /* PCI Local Bus, type-0 header: Command is a 16-bit register at 04h.
+       MSE (bit 1) admits CPU memory accesses; BME (bit 2) admits the function's
+       memory requests, including DMA and MSI. Read the actual value, not the
+       saved configuration image. In particular, do not silently reintroduce
+       the early BME write that froze the reported bare-metal machine. */
+    enum { PCI_COMMAND = 0x04, PCI_COMMAND_MEMORY = 1u << 1, PCI_COMMAND_MASTER = 1u << 2 };
+    n_result command = n_pci_config_read(d->pci, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
+    if (command < 0) return NV_ERR_OPERATING_SYSTEM;
+    nvrm_log("NVRM: PCI Command=0x%04x (memory=%u, bus-master=%u); DMA addresses are physical, IOMMU state unverified",
+             (unsigned)command, !!(command & PCI_COMMAND_MEMORY), !!(command & PCI_COMMAND_MASTER));
+
     for (unsigned dw = 0; dw < NVRM_PCICFG_NUM_DWORDS; dw++) {
         n_result v = n_pci_config_read(d->pci, N_PCI_SELF, dw * 4, 4);
         nv->pci_cfg_space[dw] = v < 0 ? 0xFFFFFFFFu : (NvU32)v;
@@ -427,6 +438,16 @@ static uint64_t alloc_page_address(const struct nvrm_alloc *a, uint64_t index) {
     return a->contiguous ? a->base + index * PAGE : a->addr[index];
 }
 
+/* One owner for the backing allocation, its optional aligned view and address
+   table. Every failed construction follows the same unwind as a normal free. */
+static void alloc_destroy(struct nvrm_alloc *a) {
+    if (a->kmap) n_memory_release(a->kmap, (size_t)(a->pages * PAGE));
+    if (a->root != a->dma && a->root >= 0) n_handle_close(a->root);
+    if (a->dma >= 0) n_handle_close(a->dma);
+    free(a->addr);
+    free(a);
+}
+
 static NV_STATUS alloc_fetch_addresses(struct nvrm_alloc *a, n_handle object) {
     if (a->contiguous) {
         uint64_t first;
@@ -438,12 +459,30 @@ static NV_STATUS alloc_fetch_addresses(struct nvrm_alloc *a, n_handle object) {
     if (!a->addr) return NV_ERR_NO_MEMORY;
     for (uint64_t done = 0; done < a->pages;) {
         n_result n = n_dma_addresses(object, (size_t)done, a->addr + done, (size_t)(a->pages - done));
-        if (n <= 0) {
+        if (n <= 0 || (uint64_t)n > a->pages - done) {
             free(a->addr);
             a->addr = NULL;
             return NV_ERR_GENERIC;
         }
         done += (uint64_t)n;
+    }
+    return NV_OK;
+}
+
+static NV_STATUS alloc_check_addresses(const struct nvrm_alloc *a, uint64_t mask) {
+    /* Scattered frames are not ordered by bus address. Checking only the last
+       entry can publish an unreachable earlier frame to RM. Use subtraction
+       so an overflowing physical end address cannot pass the mask check. */
+    uint64_t count = a->contiguous ? 1 : a->pages;
+    uint64_t span = a->contiguous ? a->pages * PAGE : PAGE;
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t address = alloc_page_address(a, i);
+        if ((address & (PAGE - 1)) || mask < span - 1 || address > mask - (span - 1)) {
+            nvrm_log("NVRM: DMA range base=0x%llx bytes=0x%llx cannot use mask=0x%llx (page %llu)",
+                     (unsigned long long)address, (unsigned long long)span, (unsigned long long)mask,
+                     (unsigned long long)i);
+            return NV_ERR_INVALID_ADDRESS;
+        }
     }
     return NV_OK;
 }
@@ -454,7 +493,14 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     (void)zeroed; (void)unencrypted; (void)node_id; /* n_dma_create returns zeroed RAM */
     call_once(&alloc_once, alloc_setup);
     if (!page_count || !pte_array || !priv_data) return NV_ERR_INVALID_ARGUMENT;
+    *priv_data = NULL;
     if (page_size < PAGE) page_size = PAGE;
+    uint64_t bytes = (uint64_t)page_count * PAGE;
+    /* page_count is in OS pages (osGetPagesInfo/osAllocPagesInternal), not in
+       page_size units. Alignment must be a power of two and any over-allocation
+       must fit the native size_t; neither is an arbitrary allocation ceiling. */
+    if ((page_size & (page_size - 1)) || page_size - PAGE > SIZE_MAX - bytes)
+        return NV_ERR_INVALID_ARGUMENT;
 
     struct nvrm_alloc *a = calloc(1, sizeof *a);
     if (!a) return NV_ERR_NO_MEMORY;
@@ -469,7 +515,6 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     if (want_contig) flags |= N_DMA_CONTIGUOUS;
     if (nv && (nv->force_dma32_alloc || nv->dma_mask <= 0xFFFFFFFFull)) flags |= N_DMA_32BIT;
 
-    uint64_t bytes = (uint64_t)page_count * PAGE;
     /* No scattered retry for big pages: page_size is the GPU's page granularity, and RM promises
        its callers whole aligned chunks of it. When the run cannot be had, the failure goes back
        to RM, which retries the allocation with 4 KiB pages itself (memdescAlloc). */
@@ -488,43 +533,30 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
         a->dma = a->root = -1;
         n_handle big = n_dma_create(nvrm_dev.pci, (size_t)(bytes + page_size - PAGE), flags);
         if (big < 0) {
-            free(a);
+            alloc_destroy(a);
             return NV_ERR_NO_MEMORY;
         }
+        a->dma = a->root = big;
         uint64_t first;
         if (n_dma_addresses(big, 0, &first, 1) != 1) status = NV_ERR_GENERIC;
+        else if ((first & (PAGE - 1)) || first > UINT64_MAX - (page_size - 1))
+            status = NV_ERR_INVALID_ADDRESS;
         else {
             uint64_t skip = ALIGN_UP(first, page_size) - first;
             n_handle view = n_shared_view(big, (size_t)skip, (size_t)bytes, N_CACHE_DEFAULT);
             if (view < 0) status = NV_ERR_NO_MEMORY;
             else {
-                a->dma = big;
                 a->root = view;
                 a->base = first + skip;
             }
         }
-        if (status != NV_OK) n_handle_close(big);
     }
+    uint64_t mask = nv ? nv->dma_mask : UINT64_MAX;
+    if ((flags & N_DMA_32BIT) && mask > UINT32_MAX) mask = UINT32_MAX;
+    if (status == NV_OK) status = alloc_check_addresses(a, mask);
     if (status != NV_OK) {
-        if (a->dma >= 0) n_handle_close(a->dma);
-        free(a->addr);
-        free(a);
+        alloc_destroy(a);
         return status;
-    }
-    if (a->dma >= 0 && a->root != a->dma && a->root < 0) a->root = a->dma;
-
-    /* x86 DMA reaches every address the mask allows; check the mask RM set. */
-    if (nv && nv->dma_mask != ~0ull) {
-        uint64_t last = alloc_page_address(a, a->pages - 1) + PAGE - 1;
-        if (last > nv->dma_mask) {
-            nvrm_log("NVRM: allocation reaches 0x%llx, above the GPU's DMA mask 0x%llx", (unsigned long long)last,
-                     (unsigned long long)nv->dma_mask);
-            if (a->root != a->dma) n_handle_close(a->root);
-            n_handle_close(a->dma);
-            free(a->addr);
-            free(a);
-            return NV_ERR_NO_MEMORY;
-        }
     }
 
     if (a->contiguous) {
@@ -542,11 +574,7 @@ NV_STATUS NV_API_CALL nv_free_pages(nv_state_t *nv, NvU32 page_count, NvBool con
     (void)nv; (void)page_count; (void)contiguous; (void)cache_type;
     struct nvrm_alloc *a = priv_data;
     if (!a) return NV_ERR_INVALID_ARGUMENT;
-    if (a->kmap) n_memory_release(a->kmap, (size_t)(a->pages * PAGE));
-    if (a->root != a->dma && a->root >= 0) n_handle_close(a->root);
-    if (a->dma >= 0) n_handle_close(a->dma);
-    free(a->addr);
-    free(a);
+    alloc_destroy(a);
     return NV_OK;
 }
 
@@ -575,14 +603,21 @@ struct kern_mapping {
     size_t length;
 };
 
+static bool alloc_range_valid(const struct nvrm_alloc *a, uint64_t page_index, uint64_t page_offset,
+                               uint64_t size) {
+    if (!a || page_index >= a->pages || page_offset >= PAGE || !size) return false;
+    return size <= (a->pages - page_index) * PAGE - page_offset;
+}
+
 void *NV_API_CALL nv_alloc_kernel_mapping(nv_state_t *nv, void *priv, NvU64 page_index, NvU32 page_offset,
                                           NvU64 size, void **priv_data) {
     (void)nv;
     struct nvrm_alloc *a = priv;
     call_once(&alloc_once, alloc_setup);
-    if (!a || page_index >= a->pages) return NULL;
+    if (!priv_data) return NULL;
+    *priv_data = NULL;
+    if (!alloc_range_valid(a, page_index, page_offset, size)) return NULL;
     uint64_t span = ALIGN_UP((uint64_t)page_offset + size, PAGE);
-    if (page_index + span / PAGE > a->pages) return NULL;
     uint32_t cache = n_cache_for(a->cache, false);
     if (cache == N_CACHE_WRITE_BACK) {
         mtx_lock(&alloc_lock);
@@ -634,9 +669,9 @@ void NV_API_CALL nv_free_kernel_mapping(nv_state_t *nv, void *priv, void *addres
  * in rm_create_mmap_context, and os_match_mmap_offset turns it into a page index again. */
 NV_STATUS NV_API_CALL nv_alloc_user_mapping(nv_state_t *nv, void *priv, NvU64 page_index, NvU32 page_offset,
                                             NvU64 size, NvU32 protect, NvU64 *user_address, void **priv_data) {
-    (void)nv; (void)size; (void)protect;
+    (void)nv; (void)protect;
     struct nvrm_alloc *a = priv;
-    if (!a || page_index >= a->pages || !user_address) return NV_ERR_INVALID_ARGUMENT;
+    if (!user_address || !alloc_range_valid(a, page_index, page_offset, size)) return NV_ERR_INVALID_ARGUMENT;
     *user_address = alloc_page_address(a, page_index) + page_offset;
     if (priv_data) *priv_data = NULL;
     return NV_OK;
@@ -649,7 +684,7 @@ NV_STATUS NV_API_CALL os_match_mmap_offset(void *priv, NvU64 offset, NvU64 *page
     struct nvrm_alloc *a = priv;
     if (!a || !page_index) return NV_ERR_INVALID_ARGUMENT;
     if (a->contiguous) {
-        if (offset < a->base || offset >= a->base + a->pages * PAGE) return NV_ERR_OBJECT_NOT_FOUND;
+        if (offset < a->base || offset - a->base >= a->pages * PAGE) return NV_ERR_OBJECT_NOT_FOUND;
         *page_index = (offset - a->base) / PAGE;
         return NV_OK;
     }
@@ -663,9 +698,8 @@ NV_STATUS NV_API_CALL os_match_mmap_offset(void *priv, NvU64 offset, NvU64 *page
 }
 
 n_handle nvrm_alloc_view(struct nvrm_alloc *a, uint64_t page_index, uint64_t bytes, uint32_t nv_caching) {
-    if (!a || page_index >= a->pages || !bytes) return -N_ERR_INVALID;
+    if (!alloc_range_valid(a, page_index, 0, bytes)) return -N_ERR_INVALID;
     uint64_t span = ALIGN_UP(bytes, PAGE);
-    if (page_index + span / PAGE > a->pages) return -N_ERR_INVALID;
     uint32_t cache = nv_caching == NV_MEMORY_DEFAULT ? n_cache_for(a->cache, false) : n_cache_for(nv_caching, false);
     return n_shared_view(a->root, (size_t)(page_index * PAGE), (size_t)span, cache);
 }
