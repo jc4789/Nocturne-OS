@@ -444,25 +444,29 @@ static void start(struct nvme *c) {
 
 /* Normal shutdown notification before power goes away (section 7.6.2): the controller writes its
    cache back and the drive does not count an unsafe shutdown. Interrupts are already off. */
-static void nvme_shutdown(void *arg) {
+static bool nvme_shutdown(void *arg) {
     (void)arg;
+    bool all = true;
     for (int i = 0; i < nctrls; i++) {
         struct nvme *c = &ctrls[i];
         if (!c->live) continue;
         wr32(c, CC, (rd32(c, CC) & ~0xC000u) | 0x4000u);
         uint64_t us = c->rtd3e < 1000000 ? 1000000 : c->rtd3e > 10000000 ? 10000000 : c->rtd3e;
         for (uint64_t t = 0; t < us && (rd32(c, CSTS) >> 2 & 3) != 2; t++) io_wait(); /* ~1 us each */
+        if ((rd32(c, CSTS) >> 2 & 3) != 2) all = false; /* its cache may not be on the flash */
         c->live = false;
     }
+    return all;
 }
 
 /* After a sleep (the shutdown notification above went first): the next read or write resets the
    controller and sets the queues up again, the way it recovers from a timeout. Resume must not
-   wait for the controller; the I/O path may. */
-static void nvme_resume(void *arg) {
+   wait for the controller; the I/O path may (it reports a controller that does not come back). */
+static bool nvme_resume(void *arg) {
     (void)arg;
     for (int i = 0; i < nctrls; i++)
         if (ctrls[i].regs && ctrls[i].data) ctrls[i].woke = true;
+    return true;
 }
 
 static struct pm_device nvme_pm = {.name = "nvme", .stage = PM_STAGE_STORAGE, .quiesce = nvme_shutdown,

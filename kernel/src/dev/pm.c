@@ -95,25 +95,37 @@ static void stop_apps(void) {
     if (left) kprintf("pm: %d app tasks did not end\n", left);
 }
 
-static void flush_disks(void) {
+static bool flush_disks(void) {
+    bool ok = true;
     for (int i = 0; i < blk_count(); i++) {
         struct blkdev *d = blk_get(i);
-        if (d->flush && d->flush(d) < 0) kprintf("pm: %s: cache flush failed\n", d->name);
+        if (d->flush && d->flush(d) < 0) {
+            kprintf("pm: %s: cache flush failed\n", d->name);
+            ok = false;
+        }
     }
+    return ok;
 }
 
-void pm_quiesce_devices(void) {
+const char *pm_quiesce_devices(bool stop_at_failure) {
+    const char *stuck = NULL;
     for (int s = 0; s < PM_STAGES; s++)
-        for (struct pm_device *d = stages[s]; d; d = d->next)
-            if (d->quiesce) d->quiesce(d->ctx);
+        for (struct pm_device *d = stages[s]; d; d = d->next) {
+            d->down = true; /* reached: resumed after a sleep, also one called off from here */
+            if (!d->quiesce || d->quiesce(d->ctx)) continue;
+            kprintf("pm: %s did not stop\n", d->name);
+            if (!stuck) stuck = d->name;
+            if (stop_at_failure) return stuck;
+        }
+    return stuck;
 }
 
 static NORETURN void finish(enum pm_action action) {
-    flush_disks();
+    flush_disks(); /* a disk that fails is logged: the power goes off all the same */
     if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
     cli();
     kprintf("pm: stopping the devices\n");
-    pm_quiesce_devices();
+    pm_quiesce_devices(false);
     if (action == PM_REBOOT) power_reboot();
     power_off();
     for (;;) hlt();
@@ -150,15 +162,19 @@ void pm_sleep_check(void) {
 static void enter_s3(void) { acpi_sleep_enter(3); }
 
 /* Devices, interrupt controllers and the CPU down, enter(), and all of it back. True after a real
-   sleep (S3 woke up, or a hibernation image was restored), false when enter() returned. */
-static bool machine_sleep(void (*enter)(void), unsigned state) {
+   sleep (S3 woke up, or a hibernation image was restored), false when enter() returned or a device
+   did not stop (*why says which; enter() is then not called). From the freeze to the thaw no other
+   thread runs: the devices are down or not back yet. */
+static bool machine_sleep(void (*enter)(void), unsigned state, const char **why) {
+    acpi_freeze(true);
     pci_suspend();
     uint64_t f = irq_save();
-    pm_quiesce_devices();
+    const char *stuck = pm_quiesce_devices(true);
     uint32_t pic = pic_state();
     ioapic_suspend();
     timer_suspend();
-    bool slept = wake_sleep(enter);
+    /* called off, the way back is the one after an enter() that returned */
+    bool slept = !stuck && wake_sleep(enter);
     /* awake (or never asleep): the CPU is back; now what it talks to */
     lapic_resume();
     pic_restore(pic);
@@ -174,10 +190,23 @@ static bool machine_sleep(void (*enter)(void), unsigned state) {
     /* a hibernation's snapshot is no sleep: the firmware heard of none */
     if (state == 3 || slept) acpi_wake(state);
     else acpi_links_forget();
+    const char *lost = NULL;
     for (int s = PM_STAGES - 1; s >= 0; s--)
-        for (struct pm_device *d = stages[s]; d; d = d->next)
-            if (d->resume) d->resume(d->ctx);
+        for (struct pm_device *d = stages[s]; d; d = d->next) {
+            if (!d->down) continue; /* after a device that did not stop: it never stopped */
+            d->down = false;
+            if (!d->resume || d->resume(d->ctx)) continue;
+            kprintf("pm: %s did not come back\n", d->name);
+            if (!lost) lost = d->name;
+        }
+    acpi_freeze(false);
+    if (lost) wm_notify(slept ? "A device did not wake up" : "A device did not restart", lost);
     if (slept) kprintf("pm: awake after %ld s\n", (long)secs);
+    if (stuck) {
+        static char msg[64];
+        ksnprintf(msg, sizeof msg, "%s did not stop", stuck);
+        *why = msg;
+    }
     return slept;
 }
 
@@ -200,14 +229,17 @@ static void sleep_now(bool hibernate) {
     /* no transfer is cut off by the controllers losing their state, and after a snapshot nothing
        but the image reaches the disks */
     blk_hold();
-    flush_disks();
-    bool aps = smp_suspend(), slept = false;
-    if (!aps) {
-        why = "A processor did not stop";
+    bool parked = false, slept = false;
+    if (!flush_disks()) why = "A disk did not write its cache back"; /* asleep or in an image, it could be lost */
+    if (!why) {
+        parked = true;
+        if (!smp_suspend()) why = "A processor did not stop";
+    }
+    if (why) {
     } else if (hibernate) {
         acpi_links_save();
-        slept = machine_sleep(hibernate_snapshot, 4);
-        if (!slept) {
+        slept = machine_sleep(hibernate_snapshot, 4, &why);
+        if (!slept && !why) {
             /* the snapshot: the machine as it is from here on never comes back */
             wm_notify("Hibernating", "Saving the memory to /data");
             if (!(why = hibernate_write())) {
@@ -216,10 +248,10 @@ static void sleep_now(bool hibernate) {
                 finish(PM_POWER_OFF);
             }
         }
-    } else if (!acpi_sleep_prepare(3) || !(slept = machine_sleep(enter_s3, 3))) {
-        why = "The firmware did not sleep";
+    } else if (!acpi_sleep_prepare(3) || !(slept = machine_sleep(enter_s3, 3, &why))) {
+        if (!why) why = "The firmware did not sleep";
     }
-    smp_resume();
+    if (parked) smp_resume();
     blk_release();
     if (hibernate) hibernate_cleanup(slept);
     wm_repaint();

@@ -12,10 +12,23 @@ uint64_t kernel_pml4;
 uint64_t pte_nx;
 
 /* memory map regions that are RAM (usable, ACPI tables and NVS, bootloader, kernel): the direct
-   map already reaches them write-back, so vmm_map_phys leaves them as they are */
+   map already reaches them write-back, so vmm_map_phys leaves them as they are. Neighbours are
+   joined: the map is sorted, and a UEFI one has many small entries. */
 struct ram_range { uint64_t base, end; };
-static struct ram_range ram[64];
+static struct ram_range ram[256];
 static unsigned nram;
+
+static void ram_add(uint64_t base, uint64_t end) {
+    if (nram && ram[nram - 1].end == base) ram[nram - 1].end = end;
+    else if (nram < ARRAY_SIZE(ram)) ram[nram++] = (struct ram_range){base, end};
+    else kprintf("vmm: more than %u RAM ranges, [%p, %p) not kept\n", (unsigned)ARRAY_SIZE(ram), (void *)base, (void *)end);
+}
+
+static bool is_ram(uint64_t page) {
+    for (unsigned i = 0; i < nram; i++)
+        if (page >= ram[i].base && page < ram[i].end) return true;
+    return false;
+}
 
 extern char __kernel_start[], __kernel_end[], __text_start[], __rodata_start[], __data_start[];
 
@@ -420,7 +433,7 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
         } else if (e->type == LIMINE_MEMMAP_BAD_MEMORY) {
             continue;
         } else {
-            if (e->type != LIMINE_MEMMAP_RESERVED && nram < ARRAY_SIZE(ram)) ram[nram++] = (struct ram_range){base, end};
+            if (e->type != LIMINE_MEMMAP_RESERVED) ram_add(base, end);
             map_range(hhdm_offset + base, base, end - base, PTE_W | pte_nx, PTE_W | pte_nx);
         }
     }
@@ -451,10 +464,13 @@ void *vmm_map_mmio(uint64_t phys, uint64_t size) {
     return phys_to_virt(phys);
 }
 
+/* Page by page: a request may run across several ranges, and only what lies in none of them
+   (device memory) becomes uncached. RAM stays write-back for everyone else who uses it. */
 void *vmm_map_phys(uint64_t phys, uint64_t size) {
-    for (unsigned i = 0; i < nram; i++)
-        if (phys >= ram[i].base && phys + size <= ram[i].end) return phys_to_virt(phys);
-    return vmm_map_mmio(phys, size);
+    uint64_t end = ALIGN_UP(phys + size, PAGE_SIZE);
+    for (uint64_t p = ALIGN_DOWN(phys, PAGE_SIZE); p < end; p += PAGE_SIZE)
+        if (!is_ram(p)) vmm_map_mmio(p, PAGE_SIZE);
+    return phys_to_virt(phys);
 }
 
 /* ---- user address spaces ---- */

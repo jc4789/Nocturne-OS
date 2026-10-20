@@ -89,11 +89,17 @@ static int tulip_send(const void *frame, size_t len) {
     return 0;
 }
 
-/* Power change (dev/pm.h): interrupts off, receive and transmit stopped (CSR7, CSR6). */
-static void tulip_quiesce(void *arg) {
+/* Power change (dev/pm.h): interrupts off, receive and transmit stopped (CSR7, CSR6), until both
+   processes report "stopped" in CSR5 (bits 17-19 and 20-22). */
+static bool tulip_quiesce(void *arg) {
     (void)arg;
     csr_wr(7, 0);
     csr_wr(6, 0);
+    for (int i = 0; i < 10000; i++) {
+        if (!(csr_rd(5) & (0x3Fu << 17))) return true;
+        io_wait(); /* ~1 us each */
+    }
+    return false;
 }
 
 static struct pm_device tulip_pm = {.name = "tulip", .stage = PM_STAGE_IO, .quiesce = tulip_quiesce};

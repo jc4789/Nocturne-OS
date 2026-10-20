@@ -21,9 +21,10 @@ uint64_t pmm_highest_usable;
 /* RAM as the bootloader described it (usable, its own and the kernel's): what a hibernation image
    saves and restores. The signature also covers the firmware's ACPI memory, which must not move
    between the boot that saved an image and the boot that restores it. */
-#define RAM_RANGES 64
+#define RAM_RANGES 256
 static struct pmm_range ram[RAM_RANGES];
 static unsigned nram;
+static bool ram_lost; /* more ranges than RAM_RANGES: an image would leave RAM out, so none is made */
 static uint64_t map_sig = 0xcbf29ce484222325ULL;
 
 static void sig_add(uint64_t v) {
@@ -45,6 +46,10 @@ static void note_ranges(struct limine_memmap_response *mm) {
         if (end <= b) continue;
         if (nram && ram[nram - 1].end == b) ram[nram - 1].end = end; /* the map is sorted */
         else if (nram < RAM_RANGES) ram[nram++] = (struct pmm_range){b, end};
+        else {
+            if (!ram_lost) kprintf("pmm: more than %u RAM ranges, hibernation is off\n", RAM_RANGES);
+            ram_lost = true;
+        }
     }
     for (unsigned i = 0; i < nram; i++) {
         sig_add(ram[i].base);
@@ -56,6 +61,8 @@ unsigned pmm_ram_ranges(const struct pmm_range **out) {
     *out = ram;
     return nram;
 }
+
+bool pmm_ram_complete(void) { return !ram_lost; }
 
 uint64_t pmm_map_signature(void) { return map_sig; }
 

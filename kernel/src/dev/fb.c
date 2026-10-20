@@ -191,12 +191,13 @@ static void vbe_write(uint16_t reg, uint16_t value) {
     outw(VBE_DATA, value);
 }
 
-static void vbe_quiesce(void *arg) {
+static bool vbe_quiesce(void *arg) {
     (void)arg;
     for (uint16_t r = 1; r < VBE_REGS; r++) vbe_saved[r] = vbe_read(r);
+    return true; /* scanout only: no DMA to stop */
 }
 
-static void vbe_resume(void *arg) {
+static bool vbe_resume(void *arg) {
     (void)arg;
     vbe_write(VBE_ENABLE, 0);
     for (uint16_t r = 1; r < VBE_REGS; r++)
@@ -204,6 +205,7 @@ static void vbe_resume(void *arg) {
     vbe_write(VBE_ENABLE, vbe_saved[VBE_ENABLE] | 0x80); /* back on, without clearing the memory */
     inb(0x3DA);       /* the attribute controller's flip-flop to "index" */
     outb(0x3C0, 0x20); /* palette address source: the picture is shown again */
+    return (vbe_read(VBE_ENABLE) & 0x41) == 0x41 && vbe_read(1) == vbe_saved[1] && vbe_read(2) == vbe_saved[2];
 }
 
 /* the firmware sets the same mode again on the next boot (a hibernation image checks it does) */

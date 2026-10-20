@@ -74,6 +74,10 @@ bool acpi_sleep_enter(unsigned state);
    wake with interrupts on before the drivers resume (PCI interrupt links via _SRS, then _WAK). */
 void acpi_wake_prepare(unsigned state);
 void acpi_wake(unsigned state);
+/* Around a sleep, from before the devices stop until they are all back: AML that waits (Sleep,
+   Acquire, Wait in _WAK) spins instead of letting another thread at a device not back yet. on
+   first lets queued GPE and Notify work finish, so no method holds a lock across the sleep. */
+void acpi_freeze(bool on);
 /* The PCI interrupt links' settings, kept for acpi_wake (prepare keeps them for S3). Hibernation
    keeps them itself: after a restore the booting kernel's routing is not necessarily the image's.
    forget drops them (a hibernation that did not happen). */

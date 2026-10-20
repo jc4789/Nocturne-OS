@@ -1303,6 +1303,7 @@ static void hc_restart(struct usb_hc *hc, bool after_sleep) {
     if (after_sleep) {
         kprintf("usb: controller %d starting again after sleep\n", hc->index);
         if (hc_start(hc)) hc->failed = false;
+        else kprintf("usb: controller %d did not come back after sleep\n", hc->index);
         return;
     }
     if (++hc->restarts > 3) {
@@ -1435,20 +1436,23 @@ static void usb_thread(void *arg) {
 
 /* Power change (dev/pm.h): halt every controller, which ends its DMA (xHCI 4.24: within 16 ms).
    The disks behind it were flushed before. Interrupts are off: polled. */
-static void xhci_quiesce(void *arg) {
+static bool xhci_quiesce(void *arg) {
     (void)arg;
+    bool all = true;
     for (int i = 0; i < ncontrollers; i++) {
         struct usb_hc *hc = &controllers[i];
         if (!hc->op) continue;
         wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
         for (int t = 0; t < 20000 && !(rd32(hc->op, USBSTS) & STS_HCH); t++) io_wait(); /* ~1 us each */
+        if (!(rd32(hc->op, USBSTS) & STS_HCH)) all = false;
     }
+    return all;
 }
 
 /* After a sleep: every controller is reset and enumerated again by the usb thread (resume must
    not wait, and the class drivers run there). Keyboards and mice come back; a USB disk would come
    back as a new device under a mounted filesystem, so there is no sleep while one is plugged in. */
-static void xhci_resume(void *arg) {
+static bool xhci_resume(void *arg) {
     (void)arg;
     uint64_t f = irq_save();
     for (int i = 0; i < ncontrollers; i++)
@@ -1459,6 +1463,7 @@ static void xhci_resume(void *arg) {
     usb_more = usb_kick = true;
     wq_wake_all(&usb_wq);
     irq_restore(f);
+    return true; /* the usb thread logs a controller that does not come back (hc_restart) */
 }
 
 static const char *xhci_refuse(void *arg) {

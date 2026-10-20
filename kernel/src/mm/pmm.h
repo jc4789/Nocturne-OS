@@ -17,6 +17,7 @@ extern uint64_t pmm_highest_usable;
 /* Hibernation (dev/hibernate.c) */
 struct pmm_range { uint64_t base, end; }; /* physical, page aligned, end exclusive */
 unsigned pmm_ram_ranges(const struct pmm_range **out); /* the bootloader's RAM, merged and sorted */
+bool pmm_ram_complete(void);       /* false: the map had more ranges than are kept */
 uint64_t pmm_map_signature(void);  /* the same on every boot of the same machine and memory */
 uint64_t pmm_page_count(void);     /* frames the bitmap covers */
 bool pmm_page_used(uint64_t pfn);

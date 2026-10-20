@@ -122,19 +122,26 @@ static void ac97_fill(void) {
     if (audio_trace_active) audio_trace_ac97(before, inw(nabm + PO_SR), filled, restarted);
 }
 
-/* Power change (dev/pm.h): the PCM-out engine stops reading descriptors and buffers. */
-static void ac97_quiesce(void *arg) {
+/* Power change (dev/pm.h): the PCM-out engine stops reading descriptors and buffers, and says so
+   (DMA controller halted). */
+static bool ac97_quiesce(void *arg) {
     (void)arg;
     hw_ready = false;
     outb(nabm + PO_CR, 0);
     dma_live = false;
+    for (int i = 0; i < 1000; i++) {
+        if (inw(nabm + PO_SR) & SR_HALTED) return true;
+        io_wait();
+    }
+    return false;
 }
 
 /* The codec out of cold reset at 0 dB and 48 kHz, the PCM-out box reset, then the ring (once it
    exists): at boot and after a sleep, which powered the codec off. */
-static void hw_init(void) {
+static bool hw_init(void) {
     outl(nabm + GLOB_CNT, 0x2); /* out of cold reset, interrupts off */
     for (int i = 0; i < 100 && !(inl(nabm + GLOB_STA) & 0x100); i++) spin_ms(1); /* codec ready */
+    bool codec = inl(nabm + GLOB_STA) & 0x100;
     outw(nam + NAM_RESET, 1);
     outw(nam + NAM_MASTER, 0x0000);  /* 0 dB, not muted */
     outw(nam + NAM_PCM_OUT, 0x0808); /* 0 dB */
@@ -145,16 +152,18 @@ static void hw_init(void) {
 
     outb(nabm + PO_CR, CR_RESET);
     for (int i = 0; i < 100 && (inb(nabm + PO_CR) & CR_RESET); i++) spin_ms(1);
-    if (!bdl_phys) return;
+    bool reset = !(inb(nabm + PO_CR) & CR_RESET);
+    if (!bdl_phys) return codec && reset;
     outl(nabm + PO_BDBAR, bdl_phys);
     lvi = NBUF - 1; /* no descriptor has been issued; reset PIV will start at 0 */
     dma_live = false; /* do not start a perpetual silence DMA stream */
     hw_ready = true;
+    return codec && reset;
 }
 
-static void ac97_resume(void *arg) {
+static bool ac97_resume(void *arg) {
     (void)arg;
-    hw_init();
+    return hw_init();
 }
 
 static struct pm_device ac97_pm = {.name = "ac97", .stage = PM_STAGE_IO, .quiesce = ac97_quiesce,

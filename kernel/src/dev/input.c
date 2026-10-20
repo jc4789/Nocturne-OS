@@ -243,15 +243,17 @@ static bool ps2_setup(void) {
     return found;
 }
 
-static void ps2_resume(void *arg) {
+static bool ps2_resume(void *arg) {
     (void)arg;
     pic_mask(1);
     pic_mask(12);
     mods = 0; /* keys held when it went to sleep were let go long ago */
-    if (ps2_setup()) mouse_ok = true;
-    else kprintf("input: the PS/2 mouse did not answer after sleep\n");
+    bool had = mouse_ok, found = ps2_setup();
+    if (found) mouse_ok = true;
+    else if (had) kprintf("input: the PS/2 mouse did not answer after sleep\n");
     pic_unmask(1);
     pic_unmask(12);
+    return found || !had; /* a mouse that was never there is not missing */
 }
 
 static struct pm_device ps2_pm = {.name = "ps2", .stage = PM_STAGE_IO, .resume = ps2_resume};

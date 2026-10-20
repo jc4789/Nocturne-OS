@@ -267,14 +267,14 @@ static void mac_reset(void) {
 }
 
 /* Power change (dev/pm.h): interrupts off, then the reset ends every DMA. Polled waits only. */
-static void rtl_quiesce(void *arg) {
+static bool rtl_quiesce(void *arg) {
     (void)arg;
     wr32(IMR_CLEAR, 0xFFFFFFFF);
     wr32(RXCFG, rd32(RXCFG) & ~0x3Fu);
     wr8(CMD, rd8(CMD) & ~(CMD_TX_EN | CMD_RX_EN));
     udelay(100);
     wr8(CMD, CMD_RESET);
-    wait8(CMD, CMD_RESET, 0, 1000, 10);
+    return wait8(CMD, CMD_RESET, 0, 1000, 10);
 }
 
 static void aspm_clkreq_off(void) {
@@ -399,9 +399,11 @@ static void rings_start(void) {
     wr8(CMD, CMD_TX_EN | CMD_RX_EN);
 }
 
-static void rtl_resume(void *arg) {
+static bool rtl_resume(void *arg) {
     (void)arg;
     hw_init();
+    uint8_t cmd = rd8(CMD); /* out of reset, both engines on (hw_init's last write) */
+    bool back = !(cmd & CMD_RESET) && (cmd & (CMD_TX_EN | CMD_RX_EN)) == (CMD_TX_EN | CMD_RX_EN);
     cfg_unlock();
     wr32(IDR0, nif.mac[0] | nif.mac[1] << 8 | nif.mac[2] << 16 | (uint32_t)nif.mac[3] << 24);
     wr16(IDR0 + 4, (uint16_t)(nif.mac[4] | nif.mac[5] << 8));
@@ -412,6 +414,7 @@ static void rtl_resume(void *arg) {
     wr32(IMR_SET, INT_MASK);
     start_autoneg();
     net_rx_notify();
+    return back;
 }
 
 static struct pm_device rtl_pm = {.name = "rtl8125", .stage = PM_STAGE_IO, .quiesce = rtl_quiesce,

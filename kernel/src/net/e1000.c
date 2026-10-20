@@ -190,11 +190,13 @@ static uint32_t e1000_itr_ticks(void) {
 }
 
 /* Power change (dev/pm.h): no more interrupts, receive or transmit DMA. */
-static void e1000_quiesce(void *arg) {
+static bool e1000_quiesce(void *arg) {
     (void)arg;
     wr(REG_IMC, 0xFFFFFFFF);
     wr(REG_RCTL, 0);
     wr(REG_TCTL, 0);
+    /* the enables read back clear: neither engine fetches another descriptor */
+    return !(rd(REG_RCTL) & (1u << 1)) && !(rd(REG_TCTL) & (1u << 1));
 }
 
 static uint64_t rx_ring_phys, tx_ring_phys;
@@ -250,11 +252,13 @@ static void hw_start(void) {
     wr(REG_IMS, ICR_TXDW | ICR_LSC | RX_IRQS);
 }
 
-static void e1000_resume(void *arg) {
+static bool e1000_resume(void *arg) {
     (void)arg;
     hw_reset();
+    bool reset = !(rd(REG_CTRL) & (1u << 26));
     hw_start();
     net_rx_notify(); /* whatever the net thread was waiting for is gone: let it look again */
+    return reset && (rd(REG_RCTL) & (1u << 1)) && (rd(REG_TCTL) & (1u << 1));
 }
 
 static struct pm_device e1000_pm = {.name = "e1000", .stage = PM_STAGE_IO, .quiesce = e1000_quiesce,

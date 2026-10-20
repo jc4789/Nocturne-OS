@@ -31,6 +31,8 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 
+void power_reboot(void); /* dev/power.c */
+
 #define DIR_PATH    "/data/.hibernate"
 #define IMAGE_PATH  "/data/.hibernate/image"
 #define VERSION     1
@@ -158,6 +160,7 @@ static void describe(struct header *hd) {
 const char *hibernate_blocker(void) {
     if (!wake_available() || !wake_spare_page()) return "no room below 1 MiB";
     if (vmbus_ready()) return "Hyper-V devices cannot come back from it yet";
+    if (!pmm_ram_complete()) return "the memory map has more ranges than can be saved";
     if (!fat_is(vfs_lookup("/data"))) return "no disk holds /data";
     return NULL;
 }
@@ -608,6 +611,8 @@ void hibernate_restore(void) {
         goto drop;
     memcpy(&hd, h.stage, sizeof hd);
     if ((why = check(&hd))) goto drop;
+    why = "the memory map has more ranges than can be restored";
+    if (!pmm_ram_complete()) goto drop;
     why = "the image is damaged";
     if (hd.data_off + hd.data_bytes > v->size) goto drop;
 
@@ -702,7 +707,12 @@ void hibernate_restore(void) {
     smp_suspend();
     smp_hold_in_init(); /* out of every page the copy overwrites */
     cli();
-    pm_quiesce_devices();
+    if (pm_quiesce_devices(false)) {
+        /* its DMA could write over the restored pages; the image is used up, so the next boot is
+           a normal one */
+        kprintf("hibernate: a device did not stop, restarting instead of restoring\n");
+        power_reboot();
+    }
     for (int irq = 0; irq < 16; irq++) pic_mask(irq);
     ioapic_mask_all();
     lapic_tick_stop();

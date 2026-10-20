@@ -24,9 +24,14 @@
 
    Quiesce callbacks run on the BSP with interrupts off: they may only poll
    (io_wait, the TSC), never sleep or wait for uptime_ms, which stands still.
-   Resume callbacks run on the BSP with interrupts on, before any other thread:
-   they may poll uptime_ms but must not sleep. The device lost its state; its
-   PCI configuration space is already back (dev/pci.c). */
+   They return false when the device did not confirm it stopped (its DMA may
+   still run): a sleep or hibernation is then called off and the devices
+   stopped so far are resumed; a shut down goes on.
+   Resume callbacks run on the BSP with interrupts on, before any other thread
+   (the AML of _WAK is frozen too, dev/acpi.h): they may poll uptime_ms but
+   must not sleep. The device lost its state, or was only quiesced (a sleep
+   called off); its PCI configuration space is already back (dev/pci.c). They
+   return false when the device did not come back, which the user is told. */
 #pragma once
 #include <stdbool.h>
 
@@ -40,11 +45,12 @@ enum pm_stage {
 struct pm_device {
     const char *name;
     enum pm_stage stage;
-    void (*quiesce)(void *ctx); /* NULL: nothing to stop */
-    void (*resume)(void *ctx);  /* NULL: cannot come back from sleep (no sleep while it is there) */
+    bool (*quiesce)(void *ctx); /* NULL: nothing to stop */
+    bool (*resume)(void *ctx);  /* NULL: cannot come back from sleep (no sleep while it is there) */
     const char *(*refuse)(void *ctx); /* NULL, or why it cannot sleep right now (asked at each sleep) */
     void *ctx;
     bool cold_ok; /* without resume: as it was after the next boot (hibernation) */
+    bool down;    /* pm.c: quiesced, not yet resumed */
     struct pm_device *next;
 };
 
@@ -63,4 +69,6 @@ bool pm_stopping(void); /* a power change has passed the point of no return */
 bool pm_can_sleep(void);
 bool pm_can_hibernate(void); /* /data on a disk, room below 1 MiB, every device back after it */
 void pm_sleep_check(void);
-void pm_quiesce_devices(void); /* interrupts off: every registered device stops, stage by stage */
+/* Interrupts off: every registered device stops, stage by stage. NULL, or the first device that
+   did not stop (with stop_at_failure, the ones after it are left running). */
+const char *pm_quiesce_devices(bool stop_at_failure);

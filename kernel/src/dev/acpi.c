@@ -279,8 +279,10 @@ const struct acpi_ecam *acpi_ecams(unsigned *count) { *count = necams; return ec
 static bool aml_ready;
 
 /* The boot task becomes the idle task: it may not block, so it spins (letting other threads run)
-   where a thread would sleep. */
-static bool may_block(void) { return current_task->pid != 0; }
+   where a thread would sleep. While frozen (acpi_freeze) nothing blocks and nothing else runs:
+   the devices are down or not yet back. */
+static volatile bool frozen;
+static bool may_block(void) { return !frozen && current_task->pid != 0; }
 
 static uint64_t ns_now(void) {
     if (!tsc_hz) return uptime_ms() * 1000000;
@@ -385,6 +387,9 @@ void uacpi_kernel_sleep(uacpi_u64 ms) {
     else spin_ns(ms * 1000000);
 }
 
+/* Frozen, a lock or event nobody gives would hang the machine: after this long its owner may run. */
+#define FROZEN_WAIT_MS 2000
+
 struct sem {
     uint32_t units;
     struct wait_queue wq;
@@ -399,7 +404,7 @@ void uacpi_kernel_free_semaphore(uacpi_handle s) { kfree(s); }
 
 uacpi_status uacpi_kernel_wait_for_semaphore(uacpi_handle h, uacpi_u16 timeout) {
     struct sem *s = h;
-    uint64_t end = uptime_ms() + timeout;
+    uint64_t start = uptime_ms(), end = start + timeout;
     uint64_t f = irq_save();
     while (!s->units) {
         uint64_t now = uptime_ms();
@@ -410,7 +415,16 @@ uacpi_status uacpi_kernel_wait_for_semaphore(uacpi_handle h, uacpi_u16 timeout) 
         if (may_block()) {
             if (timeout == 0xFFFF) wq_wait(&s->wq);
             else wq_wait_timeout(&s->wq, end - now);
+        } else if (frozen && (timeout != 0xFFFF || now - start < FROZEN_WAIT_MS)) {
+            sti(); /* only an interrupt can give the unit now */
+            pause();
+            cli();
         } else {
+            static bool told;
+            if (frozen && !told) {
+                told = true;
+                kprintf("acpi: a lock is held across sleep, other threads run until it is given\n");
+            }
             sti(); /* the boot task: let interrupts and other threads give the unit */
             schedule();
             cli();
@@ -512,7 +526,10 @@ void uacpi_kernel_schedule_work(uacpi_work_type type, uacpi_handle item, uacpi_w
 }
 
 uacpi_status uacpi_kernel_wait_for_work_completion(void) {
-    /* interrupt handlers run to completion with interrupts off on this CPU: none is in flight here */
+    /* interrupt handlers run to completion with interrupts off on this CPU: none is in flight here.
+       Frozen, the worker was idle when the freeze began (acpi_freeze) and cannot run: what is queued
+       since waits for the thaw. */
+    if (frozen) return UACPI_STATUS_OK;
     uint64_t f = irq_save();
     while (unfinished) {
         if (may_block()) wq_wait(&done_wq);
@@ -648,6 +665,11 @@ bool acpi_sleep_enter(unsigned state) {
     uacpi_status st = uacpi_enter_sleep_state((uacpi_sleep_state)state);
     if (st != UACPI_STATUS_OK) kprintf("acpi: entering S%u failed: %s\n", state, uacpi_status_to_string(st));
     return st == UACPI_STATUS_OK;
+}
+
+void acpi_freeze(bool on) {
+    if (on && !frozen) uacpi_kernel_wait_for_work_completion(); /* no method is halfway, holding a lock */
+    frozen = on;
 }
 
 void acpi_wake_prepare(unsigned state) {

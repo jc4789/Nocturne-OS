@@ -32,7 +32,6 @@ extern void kthread_trampoline(void);
 
 #define BSP_USER_SLICE_US 2000    /* BSPが借りたring3の最長連続 */
 #define BALANCE_MS 4              /* 過負荷のAPから軽いAPへの移送の間隔 */
-#define AP_IDLE_TICKS 2           /* tickless：APがtaskなしでこのms続いたら刻みを止める */
 #define KEI_SWITCH_COST_NS 10000  /* AP内の切替（XSAVE、CR3、キャッシュの回復）の見積り */
 #define KEI_OVERHEAD_PPM 10000    /* 切替損失の目標1%：継続幅はおよそ99倍 */
 static uint64_t bsp_stamp, bsp_run_us, balance_ms, kei_retention_v;
@@ -390,10 +389,8 @@ NORETURN void sched_ap_loop(void) {
     unsigned cpu = cpu_current_index();
     struct cpu_queue *q = &cpuq[cpu];
     cpu_runner_started();
-    /* Tickless idle: after AP_IDLE_TICKS ms without a task the tick stops (a syscall's round
-       trip through the BSP is shorter and keeps it), and starts again with the next task. */
-    uint64_t idle_since = 0;
-    bool tick_off = false;
+    /* An idle AP keeps its tick: each one wakes it to steal from a busy queue (busiest_queue),
+       and nothing else would tell it that work is waiting there. */
     for (;;) {
         cli();
         if (!q_resident(cpu)) cpu_park_check(); /* a sleep: nothing of ours is left here */
@@ -408,21 +405,8 @@ NORETURN void sched_ap_loop(void) {
             /* IF=0の検査からsti;hltまでに来た起床IPIは保留され、hltを抜ける。 */
             unsigned src = busiest_queue(cpu);
             if (src && move_waiting(src, cpu)) { STAT(steals); continue; }
-            if (!tick_off && tsc_hz >= 1000000 && timer_tickless()) {
-                uint64_t now = rdtsc();
-                if (!idle_since) idle_since = now;
-                else if (now - idle_since >= tsc_hz / 1000 * AP_IDLE_TICKS) {
-                    lapic_tick_stop();
-                    tick_off = true;
-                }
-            }
             __asm__ volatile("sti; hlt" : : : "memory");
             continue;
-        }
-        idle_since = 0;
-        if (tick_off) {
-            lapic_tick_resume();
-            tick_off = false;
         }
         /* kernel mappingの変更はtlb_shootdownがこのCPUにも届けるので全消去は不要。
            user spaceの古いtagはvmm_switchがgen比較で破棄する。 */

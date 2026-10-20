@@ -44,7 +44,9 @@ static void timer_irq(struct regs *r) {
     sched_tick();
 }
 
-bool timer_tickless(void) { return tickless && !prof_enabled() && !pstate_sampling(); }
+/* The frequency samples (arch/pstate.c) are ratios over TSC time: a stopped tick only makes the
+   BSP's window longer while it idles, so they do not keep the tick running. */
+bool timer_tickless(void) { return tickless && !prof_enabled(); }
 
 /* BSP idle task, interrupts off. When nothing runs anywhere and no sound plays, the tick waits
    for the earliest timeout instead (at most a second). Any interrupt starts it again

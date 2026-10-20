@@ -12,7 +12,7 @@ void time_to_parts(int64_t t, struct tm_parts *p);
 int64_t time_from_parts(const struct tm_parts *p);
 /* Tickless idle (dev/timer.c). */
 extern volatile bool tick_stopped;
-bool timer_tickless(void); /* runner APs may stop their tick when idle */
+bool timer_tickless(void); /* the BSP may stop its tick when idle (APs keep theirs) */
 void timer_idle(void);     /* BSP idle task, interrupts off: maybe stop the tick */
 void timer_wake(void);     /* BSP, any interrupt while tick_stopped: tick again */
 /* Sleep: uptime_ms leaves the time asleep out, the wall clock takes it from the RTC. suspend before

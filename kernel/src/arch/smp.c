@@ -246,14 +246,19 @@ bool smp_suspend(void) {
     uint64_t flags = irq_save();
     sched_quiesce_space(0); /* every user thread back to the BSP's queue */
     __atomic_store_n(&runner_mask, 0, __ATOMIC_RELEASE); /* and none handed out again */
-    __atomic_store_n(&parking, true, __ATOMIC_RELEASE);
-    bool ok = true;
+    /* parked is cleared before parking is seen: an AP that its tick brings to cpu_park_check
+       first says so once, and nothing clears it after (its hlt with interrupts off ignores the IPI) */
     for (unsigned i = 1; i < slots; i++) {
         struct cpu_worker *w = &workers[i];
         w->asleep = w->enabled;
         w->enabled = false;
+        if (w->asleep) __atomic_store_n(&w->parked, 0, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&parking, true, __ATOMIC_RELEASE);
+    bool ok = true;
+    for (unsigned i = 1; i < slots; i++) {
+        struct cpu_worker *w = &workers[i];
         if (!w->asleep) continue;
-        __atomic_store_n(&w->parked, 0, __ATOMIC_RELEASE);
         lapic_send_ipi(w->apic_id, VEC_SMP_WAKE);
         uint64_t since = rdtsc(), spins = 0;
         while (!__atomic_load_n(&w->parked, __ATOMIC_ACQUIRE) && !deadline(since, START_TIMEOUT_MS, ++spins)) pause();
