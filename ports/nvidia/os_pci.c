@@ -320,6 +320,17 @@ NV_STATUS nvrm_pci_attach(void) {
     nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
     nv->fb = &nv->bars[NV_GPU_BAR_INDEX_FB];
 
+    /* Memory decode and bus mastering are the driver's to turn on when it takes the device (RM
+       sets them itself only when it restores config space after a reset). Without bus mastering
+       the GPU's engines cannot reach system memory: the first Falcon DMA, loading the scrubber,
+       times out. The system turns bus mastering off again when the claim ends. */
+    n_result command = n_pci_config_read(d->pci, N_PCI_SELF, 0x04, 2);
+    if (command < 0 || n_pci_config_write(d->pci, 0x04, 2, (uint32_t)command | 0x6u) < 0) {
+        nvrm_log("NVRM: cannot enable memory decode and bus mastering: %s",
+                 n_result_text(command < 0 ? command : -N_ERR_DENIED));
+        return NV_ERR_GENERIC;
+    }
+
     for (unsigned dw = 0; dw < NVRM_PCICFG_NUM_DWORDS; dw++) {
         n_result v = n_pci_config_read(d->pci, N_PCI_SELF, dw * 4, 4);
         nv->pci_cfg_space[dw] = v < 0 ? 0xFFFFFFFFu : (NvU32)v;

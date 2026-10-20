@@ -117,18 +117,32 @@ static mtx_t progress_lock;
 static cnd_t progress_wake;
 static bool progress_done;
 
+/* The lines are due at fixed points (start + k * PROGRESS_MS) measured on the monotonic clock;
+   a wait that ends early (a wake-up without a signal) only waits again for the same point. */
 static int progress_thread(void *start_ns) {
-    uint64_t start = *(const uint64_t *)start_ns;
+    const uint64_t start = *(const uint64_t *)start_ns, step = PROGRESS_MS * 1000000ull;
+    uint64_t due = start + step;
     mtx_lock(&progress_lock);
     while (!progress_done) {
-        struct timespec until;
-        timespec_get(&until, TIME_UTC);
-        until.tv_sec += PROGRESS_MS / 1000;
-        if (cnd_timedwait(&progress_wake, &progress_lock, &until) != thrd_timedout || progress_done) continue;
+        uint64_t now = nvrm_now_ns();
+        if (now < due) {
+            uint64_t left = due - now;
+            struct timespec until;
+            timespec_get(&until, TIME_UTC);
+            until.tv_sec += (time_t)(left / 1000000000ull);
+            until.tv_nsec += (long)(left % 1000000000ull);
+            if (until.tv_nsec >= 1000000000L) {
+                until.tv_sec++;
+                until.tv_nsec -= 1000000000L;
+            }
+            cnd_timedwait(&progress_wake, &progress_lock, &until);
+            continue;
+        }
         nvrm_log("NVRM: still initialising the GPU after %llu s (%llu interrupts handled%s)",
-                 (unsigned long long)((nvrm_now_ns() - start) / 1000000000ull),
+                 (unsigned long long)((now - start) / 1000000000ull),
                  (unsigned long long)__atomic_load_n(&irq_runs, __ATOMIC_RELAXED),
                  irq_polling ? ", polling" : "");
+        while (due <= now) due += step;
     }
     mtx_unlock(&progress_lock);
     return 0;

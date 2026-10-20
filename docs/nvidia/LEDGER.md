@@ -60,7 +60,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み、3 回目は未実施 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目はチップセットの失敗が消え、GSP 起動前のスクラバーの Falcon DMA が時間切れ（C39）。修理済み、4 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -106,6 +106,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C36 | nvrm が BAR0 の写像を `nv->regs->map` に置いてよい | 却下 → 修理済み | RM の `RmSetupRegisters` は自分で写像し、`aperture->map == NULL` を表明する（実機で osinit.c:168）。nvrm は BAR0 全体の写像を自分だけで持ち、`os_map_kernel_space` がその一部を返す。`nv->regs->map` は RM が設定する |
 | C37 | 構成空間は自分の装置と上流のブリッジだけ読めればよい | 却下 → 修理済み | RM の `clStoreBusTopologyCache` は装置ごとに機能 0 が答えなければ他の機能を飛ばす。AMD ではルートポートが 00:01.1 で、00:01.0 はホストブリッジ。読めないと上流ポートも FHB（ホストブリッジ、チップセットの識別）も見つからない（実機で chipset.c:463／558 の表明と「Unable to get PCI port handles」）。カーネルは、上流の各ブリッジの装置の全機能とホストブリッジ（06/00）の読みも許す。無関係な装置は今まで通り `N_ERR_DENIED` |
 | C38 | rm_init_adapter が止まっても分かる | 却下 → 修理済み | GSP の起動はうまくいくと何も出さないので、固まったのか遅いのかが見分けられない。nvrm は rm_init_adapter の間 10 秒ごとに経過と処理した割り込みの数を、終わると所要時間と成否をログへ出す |
+| C39 | 装置のバスマスターは誰かが入れている | 却下 → 修理済み | RM はコマンドレジスターのメモリデコードとバスマスターを、リセット後の構成空間の復元でしか入れない（普段は OS 側のドライバーが装置を取るときに入れる前提）。カーネルの権利は入れず、終わるときに切るだけ。実機 3 回目で `s_dmaPoll_GA102: Error while waiting for Falcon DMA`（スクラバーの IMEM 読込み、4 秒で時間切れ）が約 60 秒ごとに繰り返した。nvrm が attach で 0x6 を立てる。C38 の行の間隔が 20 秒になっていたのも、早く起きた待ちが 10 秒を数え直していたためで、単調時計の決まった時刻で出すように直した |
 
 ## 5. 担当と受け渡し
 
@@ -124,6 +125,11 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-20：実機 3 回目（ユーザー）。FHB と上流ポートの失敗は消えた。rm_init_adapter の中で、スクラバーの
+  ucode を Falcon の IMEM へ DMA で読む `s_dmaTransfer_GA102`（kernel_gsp_falcon_ga102.c:242）が
+  NV_ERR_TIMEOUT、`kgspExecuteScrubberIfNeeded_AD102` 失敗（kernel_gsp_tu102.c:406）が 180 秒の間に
+  3 回。割り込みは 0。原因はバスマスターが切れたまま（C39）。修理後、QEMU で `nvrmtest: 0 failed`、`pcitest: 0 failed`。
 
 - 2026-10-20：実機 2 回目（ユーザー）。C35 の修理で rm_init_rm を越え、rm_init_adapter の中まで進んだ。
   BAR0 16 MiB at 0xfb000000、BAR1（ReBAR）16 GiB at 0xf800000000、ファームウェア 2 本を読込み。
