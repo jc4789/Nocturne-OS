@@ -5,6 +5,9 @@
 #include "arch/cpu.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "dev/fbcon.h"
+#include "gui/wm.h"
+#include "sys/sched.h"
 
 struct fb_info fb;
 
@@ -73,6 +76,8 @@ static inline unsigned dither8(unsigned v10, unsigned threshold) {
 }
 
 struct present_job { const uint32_t *src; const uint8_t *deep; int pitch, deep_pitch, x, y, w, h; };
+static void present_area(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
+                         int x, int y, int w, int h);
 
 /* Disjoint row tiles only. No allocation, scheduling, device commands or FPU.
  * The framebuffer writes remain scalar: WHPX does not emulate SIMD MMIO. */
@@ -112,9 +117,47 @@ static void present_rows(size_t tile, void *context) {
     }
 }
 
+/* ---- holding the screen ----
+   A driver that rebuilds the way the CPU reaches the framebuffer (NVIDIA's RM puts the BAR the
+   boot screen lies in into virtual mode) asks that nothing is written there meanwhile: a write
+   in that window can stall on the bus, and the BSP with it, which serves every interrupt. While
+   any hold lasts, fb_present draws nothing; when the last one ends, the screen is drawn again
+   whole. Both sides run in BSP task context; a present preempted half way is waited for. */
+static unsigned hold_count;          /* atomic */
+static unsigned presenting;          /* atomic: fb_present calls between their check and return */
+
+void fb_hold(void) {
+    if (__atomic_fetch_add(&hold_count, 1, __ATOMIC_ACQ_REL) == 0)
+        kprintf("fb: screen held by a display driver\n");
+    while (__atomic_load_n(&presenting, __ATOMIC_ACQUIRE)) sleep_ms(1);
+    __asm__ volatile("sfence" ::: "memory"); /* the write-combined pixels already sent leave now */
+}
+
+void fb_release(void) {
+    unsigned before = __atomic_load_n(&hold_count, __ATOMIC_ACQUIRE);
+    while (before && !__atomic_compare_exchange_n(&hold_count, &before, before - 1, false, __ATOMIC_ACQ_REL,
+                                                  __ATOMIC_ACQUIRE)) {
+    }
+    if (before != 1) return;
+    kprintf("fb: screen released, drawing it again\n");
+    fbcon_repaint();
+    wm_repaint();
+}
+
 void fb_present(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
                 int x, int y, int w, int h) {
     if (!src || !fb.addr || src_pitch<=0 || w<=0 || h<=0) return;
+    __atomic_add_fetch(&presenting, 1, __ATOMIC_ACQ_REL);
+    if (__atomic_load_n(&hold_count, __ATOMIC_ACQUIRE)) {
+        __atomic_sub_fetch(&presenting, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    present_area(src, src_pitch, deep, deep_pitch, x, y, w, h);
+    __atomic_sub_fetch(&presenting, 1, __ATOMIC_RELEASE);
+}
+
+static void present_area(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
+                         int x, int y, int w, int h) {
     int64_t right=(int64_t)x+w, bottom=(int64_t)y+h;
     if (x<0) x=0;
     if (y<0) y=0;

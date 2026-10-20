@@ -37,6 +37,7 @@ struct pci_claim {
     unsigned refs;   /* the vnode and every BAR or DMA object made through it */
     bool released;   /* the last handle closed: BAR objects are revoked, the function stopped */
     bool dma_unsafe; /* stopping it was not confirmed: its DMA pages are never reused */
+    unsigned screen_holds; /* n_pci_hold_screen nesting; given back when the claim ends */
 };
 static struct pci_claim *claim_of_vector[256];
 
@@ -95,6 +96,9 @@ static void claim_release(struct vnode *v) {
     interrupts_off(c);
     pci_write16(d->bus, d->dev, d->func, 4, pci_read16(d->bus, d->dev, d->func, 4) & ~0x4u); /* bus mastering off */
     c->dma_unsafe = !function_quiet(d);
+    /* A driver that ended in the middle of rebuilding the way to the screen leaves it however
+       it is; drawing again is the only way the desktop can come back. */
+    for (; c->screen_holds; c->screen_holds--) fb_release();
     if (c->dma_unsafe)
         kprintf("pci: %02x:%02x.%u still has requests in flight; its DMA memory stays out of use\n",
                 d->bus, d->dev, d->func);
@@ -338,6 +342,34 @@ int64_t pci_user_interrupts(struct file *f, uint32_t count) {
     }
     if (!ok) { interrupts_off(c); return -N_ERR_UNSUPPORTED; }
     return n;
+}
+
+/* The boot screen is drawn through this function's BAR (what n_pci_info reports). */
+static bool screen_in_bars(const struct pci_claim *c) {
+    if (!fb.phys) return false;
+    for (unsigned i = 0; i < 6; i++) {
+        uint32_t raw = c->d->bar[i];
+        if (raw & 1) continue;
+        uint64_t address = pci_bar_address(c->d, i), size = c->bar_size[i];
+        if (address && size && fb.phys >= address && fb.phys - address < size) return true;
+        if (((raw >> 1) & 3) == 2) i++;
+    }
+    return false;
+}
+
+int64_t pci_user_hold_screen(struct file *f, bool hold) {
+    struct pci_claim *c = claim_of(f);
+    if (!c) return -N_ERR_WRONG_KIND;
+    if (!screen_in_bars(c)) return -N_ERR_NOT_FOUND;
+    if (hold) {
+        c->screen_holds++;
+        fb_hold();
+        return 0;
+    }
+    if (!c->screen_holds) return -N_ERR_INVALID;
+    c->screen_holds--;
+    fb_release();
+    return 0;
 }
 
 int64_t pci_user_interrupt_take(struct file *f, int64_t timeout_ms) {

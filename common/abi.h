@@ -101,6 +101,7 @@ enum {
     SYS_PCI_CLAIM, SYS_PCI_INFO, SYS_PCI_CONFIG_READ, SYS_PCI_CONFIG_WRITE, SYS_PCI_BAR,
     SYS_PCI_INTERRUPTS, SYS_PCI_INTERRUPT_TAKE,
     SYS_DMA_CREATE, SYS_DMA_ADDRESSES, SYS_SHARED_VIEW,
+    SYS_PCI_HOLD_SCREEN, /* (pci, hold): the system stops/resumes drawing to the boot screen in its BAR */
     SYS_MAX = 192
 };
 

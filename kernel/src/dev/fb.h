@@ -23,6 +23,11 @@ bool fb_set_simulated(bool on); /* false: the scanout is not 8 bpc xRGB */
    that buffer's deep plane (display_abi.h) or NULL for 8-bit content. */
 void fb_present(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
                 int x, int y, int w, int h);
+/* A display driver rebuilding how the CPU reaches the framebuffer: fb_hold returns once nothing
+   is being written there, and fb_present draws nothing until every hold is released; the last
+   release draws the whole screen again. Task context (fb_hold sleeps). */
+void fb_hold(void);
+void fb_release(void);
 /* Optional boot-time real-framebuffer test; only runs with the fbbench flag. */
 void fb_benchmark(const uint32_t *src, int src_pitch);
 /* Sleep (dev/pm.h): the display registers once PCI is known; it resumes only where the mode can

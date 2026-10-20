@@ -207,10 +207,6 @@ NV_STATUS NV_API_CALL os_get_smbios_header(NvU64 *address) { (void)address; retu
 NV_STATUS NV_API_CALL os_get_acpi_rsdp_from_uefi(NvU32 *address) { (void)address; return NOT_SUPPORTED; }
 void NV_API_CALL os_add_record_for_crashLog(void *record, NvU32 size) { (void)record; (void)size; }
 void NV_API_CALL os_delete_record_for_crashLog(void *record) { (void)record; }
-/* The firmware console's framebuffer lives in the GPU's BAR: nvrm cannot make other apps stop
-   drawing to it, so RM's request to keep the console quiet is acknowledged and ignored. */
-void NV_API_CALL os_disable_console_access(void) {}
-void NV_API_CALL os_enable_console_access(void) {}
 NvBool NV_API_CALL nv_is_chassis_notebook(void) { return NV_FALSE; }
 NvBool NV_API_CALL os_supports_kernel_suspend_notifiers(void) { return NV_FALSE; }
 

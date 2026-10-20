@@ -6,4 +6,5 @@ void fbcon_write(const char *s, size_t n);         /* user-visible console outpu
 void fbcon_write_kernel(const char *s, size_t n);  /* kernel log (suppressed once GUI runs) */
 void fbcon_set_enabled(bool on);
 bool fbcon_enabled(void);
+void fbcon_repaint(void); /* the screen lost what was on it: draw the console again */
 void fbcon_clear(void);

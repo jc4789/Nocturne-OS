@@ -232,6 +232,10 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を最大 32 本つなぎ、本数を返す。
     INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットがある間ハンドルは
     `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, timeout_ms)` がビットを取り出して消す。
+  - `n_pci_hold_screen(pci, hold)`：起動時の画面がその機能の BAR にあるとき、ドライバーが
+    CPU から画面への経路を作り直す間（NVIDIA の RM は GSP が BAR1 を仮想モードにする間）、
+    システムは画面へ書かない。`true` は書込み中のものが終わってから戻り、入れ子にできる。最後の
+    `false`（または権利の終わり）で画面全体を描き直す。画面が別の所なら `N_ERR_NOT_FOUND`。
   - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
     オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
     `n_dma_addresses` が各ページのバスアドレスを返す（IOMMU は使わないので物理アドレス）。

@@ -107,6 +107,11 @@ n_handle n_pci_bar(n_handle pci, uint32_t bar);
    bit is set. take waits up to timeout_ms (-1 always, 0 not at all; N_ERR_TIMEOUT). */
 n_result n_pci_interrupts(n_handle pci, uint32_t count);
 n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms);
+/* While the driver changes how the CPU reaches the boot screen in the function's BAR (as
+   n_pci_info reports it), the system must not write there. hold true returns once nothing is
+   being written and keeps the screen untouched; holds nest, and the last false (or the end of
+   the claim) draws the whole screen again. N_ERR_NOT_FOUND: the boot screen is elsewhere. */
+n_result n_pci_hold_screen(n_handle pci, bool hold);
 /* Zeroed RAM that a claimed function may read and write by DMA: a shared object (N_DMA_*
    flags), held while any handle or mapping holds it. n_dma_addresses gives the bus address of
    each page from first_page (count of them; returns how many it wrote). */

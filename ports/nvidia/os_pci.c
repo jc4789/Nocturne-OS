@@ -319,6 +319,13 @@ NV_STATUS nvrm_pci_attach(void) {
     }
     nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
     nv->fb = &nv->bars[NV_GPU_BAR_INDEX_FB];
+    /* RM keeps the boot screen mapped through BAR1's virtual mode only when it starts BAR1. */
+    if (g->framebuffer_bar != N_PCI_NONE)
+        nvrm_log("NVRM: boot screen %ux%u at 0x%llx (%llu KiB), BAR1 at 0x%llx: %s", (unsigned)g->framebuffer_width,
+                 (unsigned)g->framebuffer_height, (unsigned long long)g->framebuffer_address,
+                 (unsigned long long)(g->framebuffer_size >> 10), (unsigned long long)nv->fb->cpu_address,
+                 g->framebuffer_address == nv->fb->cpu_address ? "RM keeps it mapped"
+                                                               : "not at BAR1's start, RM will not keep it mapped");
 
     /* Memory decode and bus mastering are the driver's to turn on when it takes the device (RM
        sets them itself only when it restores config space after a reset). Without bus mastering
@@ -403,6 +410,20 @@ void NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *base, NvU32 *width, N
     *depth = g->framebuffer_bpp;
     *pitch = g->framebuffer_pitch;
     *size = g->framebuffer_size;
+}
+
+/* RM brackets the start and the end of the adapter with these when the GPU carries the boot
+   screen: GSP (physical RM) puts BAR1 into virtual mode under it, and a CPU write to the screen
+   meanwhile can stall on the bus, and the processor that serves the desktop and its input with
+   it. The system stops drawing there until the matching enable; RM keeps the screen's place in
+   BAR1 mapped (nv_get_screen_info), so drawing then goes on where it was. */
+void NV_API_CALL os_disable_console_access(void) {
+    n_result r = n_pci_hold_screen(nvrm_dev.pci, true);
+    if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot hold the boot screen: %s", n_result_text(r));
+}
+void NV_API_CALL os_enable_console_access(void) {
+    n_result r = n_pci_hold_screen(nvrm_dev.pci, false);
+    if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot release the boot screen: %s", n_result_text(r));
 }
 
 void NV_API_CALL nv_set_dma_address_size(nv_state_t *nv, NvU32 bits) {
