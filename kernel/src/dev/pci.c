@@ -101,8 +101,27 @@ static void ecam_activate(uint8_t bus, uint8_t dev, uint8_t func, uint32_t id) {
     }
 }
 
-static struct pci_device devices[256]; /* desktop chipsets expose well over 64 functions */
+/* Every function enumeration found. The array grows while pci_init runs only: drivers keep
+   pointers into it from then on. */
+static struct pci_device *devices;
 static int ndevices;
+static size_t devices_room;
+static bool devices_lost;
+
+static struct pci_device *device_new(void) {
+    struct pci_device *grown = kgrow(devices, (size_t)ndevices, &devices_room, sizeof *grown);
+    if (!grown) {
+        if (!devices_lost) kprintf("pci: no memory to keep more functions; the rest are not used\n");
+        devices_lost = true;
+        return NULL;
+    }
+    devices = grown;
+    struct pci_device *d = &devices[ndevices++];
+    memset(d, 0, sizeof *d);
+    return d;
+}
+
+bool pci_all_known(void) { return !devices_lost; }
 
 static const char *class_name(uint8_t c, uint8_t s) {
     switch (c) {
@@ -141,8 +160,8 @@ void pci_init(void) {
                 }
                 uint32_t cls = pci_read32(bus, dev, func, 8);
                 ecam_activate(bus, dev, func, id);
-                if (ndevices < (int)ARRAY_SIZE(devices)) {
-                    struct pci_device *d = &devices[ndevices++];
+                struct pci_device *d = device_new();
+                if (d) {
                     d->bus = bus;
                     d->dev = dev;
                     d->func = func;
@@ -160,6 +179,12 @@ void pci_init(void) {
                     }
                     d->pcie_cap = pci_find_cap(d, 0x10);
                     if (d->pcie_cap) d->pcie_type = (pci_read16(bus, dev, func, d->pcie_cap + 2) >> 4) & 0xF;
+                    d->bridge = ((pci_read32(bus, dev, func, 0x0C) >> 16) & 0x7F) == 1;
+                    if (d->bridge) {
+                        uint32_t buses = pci_read32(bus, dev, func, 0x18);
+                        d->secondary = buses >> 8 & 0xFF;
+                        d->subordinate = buses >> 16 & 0xFF;
+                    }
                     kprintf("pci: %02x:%02x.%x %04x:%04x %s\n", bus, dev, func, d->vendor, d->device,
                             class_name(d->cls, d->subcls));
                 }
@@ -167,6 +192,11 @@ void pci_init(void) {
             }
         }
     }
+    /* Bus numbers stay as the firmware gave them (sleep writes them back), so the tree is found once. */
+    for (int i = 0; i < ndevices; i++)
+        for (int k = 0; k < ndevices && !devices[i].upstream; k++)
+            if (k != i && devices[k].bridge && devices[k].secondary == devices[i].bus)
+                devices[i].upstream = &devices[k];
 }
 
 struct pci_device *pci_find(uint16_t vendor, uint16_t device) {
@@ -213,17 +243,16 @@ struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func) {
     return NULL;
 }
 
-static bool is_bridge(const struct pci_device *d) {
-    return ((pci_read32(d->bus, d->dev, d->func, 0x0C) >> 16) & 0x7F) == 1;
+struct pci_device *pci_upstream(const struct pci_device *d) { return d->upstream; }
+
+bool pci_below(const struct pci_device *b, const struct pci_device *o) {
+    return b->bridge && o != b && o->bus >= b->secondary && o->bus <= b->subordinate;
 }
 
-struct pci_device *pci_upstream(const struct pci_device *d) {
-    for (int i = 0; i < ndevices; i++) {
-        struct pci_device *b = &devices[i];
-        if (b != d && is_bridge(b) && ((pci_read32(b->bus, b->dev, b->func, 0x18) >> 8) & 0xFF) == d->bus)
-            return b;
-    }
-    return NULL;
+bool pci_same_device(const struct pci_device *a, const struct pci_device *b) {
+    if (a->bus != b->bus) return false;
+    const struct pci_device *up = a->upstream;
+    return a->dev == b->dev || (up && up->pcie_cap && (up->pcie_type == 4 || up->pcie_type == 6));
 }
 
 uint64_t pci_bar_address(const struct pci_device *d, unsigned bar) {
@@ -381,12 +410,12 @@ void pci_msix_function_mask(struct pci_device *d, bool masked) {
     pci_write32(d->bus, d->dev, d->func, cap, masked ? h | 0x40000000u : h & ~0x40000000u);
 }
 
-void pci_msi_disable(struct pci_device *d) {
+bool pci_msi_disable(struct pci_device *d) {
     uint8_t cap = pci_find_cap(d, 0x05), msix = pci_find_cap(d, 0x11);
     if (cap) pci_write32(d->bus, d->dev, d->func, cap, pci_read32(d->bus, d->dev, d->func, cap) & ~0x00010000u);
     if (msix) pci_write32(d->bus, d->dev, d->func, msix,
                           pci_read32(d->bus, d->dev, d->func, msix) & ~0x80000000u);
-    iommu_msi_clear(d);
+    return iommu_msi_clear(d);
 }
 
 bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
@@ -403,7 +432,8 @@ bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
 
 /* ---- sleep ----
    After S3 a function comes back reset: no BARs, no command bits, no MSI. The header, the MSI and
-   MSI-X state (the MSI-X table lives in a BAR) and the PCIe control registers are saved before
+   MSI-X state (the MSI-X table lives in a BAR), the PCIe control registers and ACS control (what
+   keeps a claimed function's requests on their way to the IOMMU, dev/iommu.c) are saved before
    and written back before any driver touches its device again. Device-specific registers past
    the capabilities are the driver's. */
 static struct pci_saved {
@@ -412,10 +442,15 @@ static struct pci_saved {
     uint32_t msi_regs[5];
     uint32_t msix_ctl, *msix_table;
     uint16_t pcie_ctl[4];
-} saved[ARRAY_SIZE(devices)];
+    uint16_t acs, acs_ctl; /* the ACS capability's offset and its control register */
+} *saved;
+static bool saved_valid;
 static const uint8_t pcie_ctl_off[4] = {0x08, 0x10, 0x28, 0x30}; /* device, link, device 2, link 2 */
 
-void pci_suspend(void) {
+const char *pci_suspend(void) {
+    saved_valid = false;
+    if (!saved) saved = kzalloc((size_t)ndevices * sizeof *saved);
+    if (!saved) return "PCI (no memory to save it)";
     for (int i = 0; i < ndevices; i++) {
         struct pci_device *d = &devices[i];
         struct pci_saved *s = &saved[i];
@@ -433,15 +468,21 @@ void pci_suspend(void) {
         if (s->msix) {
             s->msix_ctl = pci_read32(d->bus, d->dev, d->func, s->msix);
             if (d->msix_table && !s->msix_table) s->msix_table = kmalloc(d->msix_entries * 16);
-            if (d->msix_table && s->msix_table)
+            if (d->msix_table && !s->msix_table) return "PCI (no memory to save it)";
+            if (d->msix_table)
                 for (unsigned j = 0; j < d->msix_entries * 4u; j++) s->msix_table[j] = d->msix_table[j];
         }
         if (d->pcie_cap)
             for (unsigned j = 0; j < 4; j++) s->pcie_ctl[j] = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j]);
+        s->acs = pci_find_ext_cap(d, 0x0D);
+        if (s->acs) s->acs_ctl = pci_read16(d->bus, d->dev, d->func, s->acs + 6);
     }
+    saved_valid = true;
+    return NULL;
 }
 
 void pci_resume(void) {
+    if (!saved_valid) return; /* the sleep was called off before anything went down */
     for (int i = 0; i < ndevices; i++) {
         struct pci_device *d = &devices[i];
         struct pci_saved *s = &saved[i];
@@ -455,6 +496,7 @@ void pci_resume(void) {
         for (unsigned k = 4; k < 16; k++) pci_write32(d->bus, d->dev, d->func, k * 4, s->hdr[k]);
         if (d->pcie_cap)
             for (unsigned j = 0; j < 4; j++) pci_write16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
+        if (s->acs) pci_write16(d->bus, d->dev, d->func, s->acs + 6, s->acs_ctl); /* before bus mastering */
         pci_write16(d->bus, d->dev, d->func, 4, s->hdr[1] & 0xFFFF);
         if (s->msix) {
             /* the table is memory space, which the command register has just opened */

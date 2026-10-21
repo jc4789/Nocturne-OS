@@ -74,12 +74,14 @@ static void claim_isr(struct regs *r) {
 
 static void interrupts_off(struct pci_claim *c) {
     if (!c->vectors) return;
-    pci_msi_disable(c->d);
+    bool cleared = pci_msi_disable(c->d);
     uint64_t irq = irq_save();
     for (unsigned i = 0; i < c->vectors; i++) claim_of_vector[c->vector_base + i] = NULL;
     c->pending = 0;
     irq_restore(irq);
-    irq_vector_free(c->vector_base, c->vectors);
+    /* a remapping entry the units may still hold could reach them: they stay taken, unhandled */
+    if (cleared) irq_vector_free(c->vector_base, c->vectors);
+    else kprintf("pci: %02x:%02x.%u: its interrupt vectors stay out of use\n", c->d->bus, c->d->dev, c->d->func);
     c->vectors = 0;
     /* A waiter must observe NOT_READY instead of sleeping forever after the
        driver disables its last interrupt (including an infinite take). */

@@ -9,6 +9,9 @@ struct pci_device {
     uint64_t bar_size[6]; /* memory BARs, measured once during enumeration; 0 for I/O, unused, upper halves */
     uint8_t pcie_cap;  /* PCI Express capability offset, 0 for conventional PCI */
     uint8_t pcie_type; /* device/port type field of the PCIe capability (valid when pcie_cap != 0) */
+    bool bridge;                  /* a PCI-to-PCI bridge (header type 1) */
+    uint8_t secondary, subordinate; /* a bridge's buses: those below it, as enumeration found them */
+    struct pci_device *upstream;  /* the bridge whose secondary bus this function is on, or NULL */
     uint16_t msix_entries;      /* set by pci_msix_init() */
     volatile uint32_t *msix_table; /* mapped MSI-X table, 16 bytes per entry */
     bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster): no app may claim it */
@@ -30,6 +33,13 @@ struct pci_device *pci_at(int index);
 struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func);
 /* The PCI-to-PCI bridge whose secondary bus is the function's bus, or NULL on the root buses. */
 struct pci_device *pci_upstream(const struct pci_device *d);
+/* Whether o is below bridge b (on one of its buses), and whether a and b are functions of one
+   device: the same device number, or any two on the link below a PCI Express port, which leads to
+   one device only (an ARI device's functions use the device number bits too). */
+bool pci_below(const struct pci_device *b, const struct pci_device *o);
+/* False when enumeration ran out of memory: some functions are unknown (and so unusable). */
+bool pci_all_known(void);
+bool pci_same_device(const struct pci_device *a, const struct pci_device *b);
 /* Memory BAR base (64-bit BARs combined); 0 for I/O, unassigned or out-of-range BARs. */
 uint64_t pci_bar_address(const struct pci_device *d, unsigned bar);
 /* How many BAR dwords the function's header type has (6, 2 for a bridge, 1 for CardBus). */
@@ -58,8 +68,11 @@ unsigned pci_msix_init(struct pci_device *d);
 bool pci_msix_route(struct pci_device *d, unsigned entry, uint8_t vector, uint32_t dest_apic_id);
 void pci_msix_mask(struct pci_device *d, unsigned entry, bool masked);
 void pci_msix_function_mask(struct pci_device *d, bool masked);
-void pci_msi_disable(struct pci_device *d); /* turns off both MSI and MSI-X */
+/* Turns off both MSI and MSI-X: false when interrupt remapping did not confirm the function's
+   messages lead nowhere, so that its vectors must not be given to anything else. */
+bool pci_msi_disable(struct pci_device *d);
 /* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (BSP,
-   before the drivers resume). pci_suspend allocates and so runs with interrupts on. */
-void pci_suspend(void);
+   before the drivers resume). pci_suspend allocates and so runs with interrupts on; it returns
+   NULL, or what could not be saved (the sleep is then called off and pci_resume writes nothing). */
+const char *pci_suspend(void);
 void pci_resume(void);

@@ -193,7 +193,7 @@ static bool transport_init(struct pci_device *d) {
                 completion_irq=true;avail->flags=0;
             }
         }
-        if(!completion_irq){pci_msi_disable(d);irq_vector_free((unsigned)vector,1);}
+        if(!completion_irq && pci_msi_disable(d))irq_vector_free((unsigned)vector,1); /* else it stays taken */
     }
     common->queue_enable = 1;
     common->device_status = 1 | 2 | 8 | 4;

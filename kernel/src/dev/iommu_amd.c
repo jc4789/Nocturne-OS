@@ -3,21 +3,22 @@
    IVRS table that describes the units.
    One device table (64K entries of 32 bytes) serves every unit; each unit reads only the
    entries of the functions behind it, and commands go to all of them. An entry left zero lets
-   a function through: DMA untranslated, interrupts as sent. A claimed function's entries point
-   at its domain's page tables and at an interrupt remapping table of its own whose entries are
-   the claim's vectors; once blocked they let nothing through. The IOAPICs, the HPET and the
-   kernel's devices keep zero entries, so their interrupts never depend on the units. */
+   a function through: DMA untranslated, interrupts as sent. A claimed function's group has
+   entries pointing at its domain's page tables and at an interrupt remapping table of the
+   claim's own whose entries are the claim's vectors; once blocked they let nothing through. The
+   IOAPICs, the HPET and the kernel's devices keep zero entries, so their interrupts never depend
+   on the units. The units cannot block system management interrupts by device table entry (only
+   their SMI filter can, which the firmware's own SMIs may need): a claimed device that sends an
+   SMI message reaches the firmware's handler as on a machine without an IOMMU. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "dev/acpi.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
+#include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
-
-#define MAX_UNITS   8
-#define MAX_ALIASES 64
 
 /* MMIO registers */
 #define R_DEVTAB    0x0000
@@ -59,13 +60,18 @@
 #define DTE_IV       (1ull << 0)
 #define DTE_IRT_LEN(n) ((uint64_t)(n) << 1)
 #define DTE_INT_REMAP (2ull << 60) /* IntCtl: fixed and arbitrated interrupts remapped; 00 aborts */
-/* I/O page table entry */
+/* I/O page table entry: what a request may do is what every entry on its way allows */
 #define PTE_PR (1ull << 0)
 #define PTE_IR (1ull << 61)
 #define PTE_IW (1ull << 62)
 
 enum { CMD_COMPLETION_WAIT = 1, CMD_INV_DEVTAB = 2, CMD_INV_PAGES = 3, CMD_INV_IRT = 5, CMD_INV_ALL = 8 };
 enum { EVENT_ILLEGAL_DTE = 1, EVENT_PAGE_FAULT = 2 };
+
+/* IVRS: device IDs first..last */
+struct span {
+    uint16_t first, last;
+};
 
 struct unit {
     uint64_t base;
@@ -76,11 +82,15 @@ struct unit {
     uint64_t efr;
     uint64_t cmd, events;  /* rings */
     uint32_t cmd_tail;
+    bool lost;             /* a command since the last sync was not done: that sync fails */
+    struct span *listed;   /* the IDs its IVHD names: those it may have cached entries of */
+    size_t nlisted, listed_room;
 };
-static struct unit units[MAX_UNITS];
-static unsigned nunits;
+static struct unit *units;
+static size_t nunits, units_room;
 static bool np_cache; /* a unit caches not-present entries */
 static uint64_t devtab, sems; /* device table; one completion word a unit */
+static size_t sem_pages;
 static uint64_t token;
 static int event_vector = -1;
 
@@ -88,8 +98,9 @@ static int event_vector = -1;
 struct alias {
     uint16_t first, last, as;
 };
-static struct alias aliases[MAX_ALIASES];
-static unsigned naliases;
+static struct alias *aliases;
+static size_t naliases, aliases_room;
+static bool parse_lost; /* no memory kept part of the IVRS: the units are not used */
 
 static struct iommu_hw amd;
 
@@ -100,40 +111,87 @@ static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 
 /* ---- IVRS ---- */
 static void alias_add(uint16_t first, uint16_t last, uint16_t as) {
-    if (naliases < MAX_ALIASES && first <= last) aliases[naliases++] = (struct alias){first, last, as};
+    if (first > last) return;
+    struct alias *grown = kgrow(aliases, naliases, &aliases_room, sizeof *grown);
+    if (!grown) {
+        parse_lost = true;
+        return;
+    }
+    aliases = grown;
+    aliases[naliases++] = (struct alias){first, last, as};
 }
 
-/* Device entries: 4 bytes below type 40h, 8 below 80h, ACPI HID entries (F0h) 22 plus their
-   UID. Only aliases matter here: zero entries already let every function through. */
-static void parse_devices(const uint8_t *b, uint32_t at, uint32_t end) {
+/* IDs the unit sees requests with: covered (a claim may isolate them), and named, so that what
+   it cached of them is invalidated where it cannot invalidate everything at once */
+static void listed_add(struct unit *u, uint16_t first, uint16_t last, bool cover) {
+    if (first > last) return;
+    if (cover) iommu_cover(first, last);
+    struct span *grown = kgrow(u->listed, u->nlisted, &u->listed_room, sizeof *grown);
+    if (!grown) {
+        parse_lost = true;
+        return;
+    }
+    u->listed = grown;
+    u->listed[u->nlisted++] = (struct span){first, last};
+}
+
+/* Device entries (Table 95 on): 4 bytes below type 40h, 8 below 80h, ACPI HID entries (F0h) 22
+   plus their UID. Select (02h, 42h, 46h), all (01h), and ranges from a start (03h, 43h, 47h) to
+   an end (04h); 42h and 43h add the ID the requests arrive as. Special devices (48h) are the
+   IOAPICs and HPETs, the platform's. Their DTE settings (byte 3: the LINT, NMI, INIT and ExtInt
+   passes) are for the entries the firmware writes; a claim's entries pass none. */
+static void parse_devices(struct unit *u, const uint8_t *b, uint32_t at, uint32_t end) {
     uint16_t first = 0, as = 0;
-    bool alias_range = false;
+    bool range = false, alias_range = false;
     while (at + 4 <= end) {
         uint8_t type = b[at];
         uint32_t len = type < 0x40 ? 4 : type < 0x80 ? 8 : type == 0xF0 && at + 22 <= end ? 22u + b[at + 21] : 0;
         if (!len || at + len > end) break;
         uint16_t id = u16(b + at + 1);
-        if (type == 0x42) alias_add(id, id, u16(b + at + 5));
-        else if (type == 0x43) first = id, as = u16(b + at + 5), alias_range = true;
-        else if (type == 0x03 || type == 0x47) alias_range = false;
-        else if (type == 0x04 && alias_range) alias_add(first, id, as), alias_range = false;
+        switch (type) {
+        case 0x01: listed_add(u, 0, 0xFFFF, true); break;
+        case 0x02: case 0x46: listed_add(u, id, id, true); break;
+        case 0x03: case 0x47: first = id, range = true, alias_range = false; break;
+        case 0x42:
+            listed_add(u, id, id, true);
+            listed_add(u, u16(b + at + 5), u16(b + at + 5), false);
+            alias_add(id, id, u16(b + at + 5));
+            break;
+        case 0x43: first = id, as = u16(b + at + 5), range = alias_range = true; break;
+        case 0x04:
+            if (range) listed_add(u, first, id, true);
+            if (range && alias_range) {
+                listed_add(u, as, as, false);
+                alias_add(first, id, as);
+            }
+            range = alias_range = false;
+            break;
+        case 0x48:
+            iommu_kernel_id(u16(b + at + 5));
+            listed_add(u, u16(b + at + 5), u16(b + at + 5), false);
+            break;
+        case 0xF0: listed_add(u, id, id, false); break;
+        }
         at += len;
     }
 }
 
-/* IVMD: memory a function reaches by DMA from the firmware's start (unity mapped, or excluded
-   from translation): a claimed function's domain maps it as it is. */
+/* IVMD: memory a function reaches by DMA from the firmware's start: unity mapped with the
+   access its IR and IW flags give (none: not mapped), or excluded from translation (then
+   reached as it is, the flags ignored). A claimed function's domain maps it as it is. */
 static void parse_memory(const uint8_t *b) {
-    if (!(b[1] & (1u << 0 | 1u << 3))) return;
+    unsigned flags = b[1], access = flags & 8 ? IOMMU_READ | IOMMU_WRITE
+                                  : flags & 1 ? (flags & 2 ? IOMMU_READ : 0) | (flags & 4 ? IOMMU_WRITE : 0) : 0;
+    if (!access) return;
     uint64_t start, length;
     memcpy(&start, b + 16, 8);
     memcpy(&length, b + 24, 8);
     uint16_t first = b[0] == 0x20 ? 0 : u16(b + 4), last = b[0] == 0x20 ? 0xFFFF : b[0] == 0x22 ? u16(b + 6) : first;
-    if (length) iommu_reserved(first, last, ALIGN_DOWN(start, PAGE_SIZE), ALIGN_UP(start + length, PAGE_SIZE));
+    if (length) iommu_reserved(first, last, ALIGN_DOWN(start, PAGE_SIZE), ALIGN_UP(start + length, PAGE_SIZE), access);
 }
 
 static struct unit *unit_at(uint64_t base) {
-    for (unsigned i = 0; i < nunits; i++)
+    for (size_t i = 0; i < nunits; i++)
         if (units[i].base == base) return &units[i];
     return NULL;
 }
@@ -156,18 +214,27 @@ static bool parse_ivrs(void) {
                 if (pass == 0 && u16(b + off + 16) != 0) {
                     kprintf("iommu: AMD-Vi unit at %lx is on PCI segment %u, which Nocturne does not reach\n",
                             base, u16(b + off + 16));
-                } else if (pass == 0 && base && !u && nunits < MAX_UNITS) {
-                    u = &units[nunits++];
-                    u->base = base;
-                    u->type = type;
-                } else if (pass == 0 && u && type > u->type) {
+                } else if (pass == 0 && !base) {
+                    kprintf("iommu: the IVRS describes an AMD-Vi unit without an address; not used\n");
+                } else if (pass == 0 && !u) {
+                    struct unit *grown = kgrow(units, nunits, &units_room, sizeof *grown);
+                    if (!grown) {
+                        parse_lost = true;
+                    } else {
+                        units = grown;
+                        u = &units[nunits++];
+                        memset(u, 0, sizeof *u);
+                        u->base = base;
+                        u->type = type;
+                    }
+                } else if (pass == 0 && type > u->type) {
                     u->type = type;
                 } else if (pass == 1 && u && u->type == type) {
                     uint16_t id = u16(b + off + 4);
                     u->flags = b[off + 1];
                     u->cap = u16(b + off + 6);
                     u->fn = pci_find_function(id >> 8, (id >> 3) & 31, id & 7);
-                    parse_devices(b, off + (type == 0x10 ? 24 : 40), off + len);
+                    parse_devices(u, b, off + (type == 0x10 ? 24 : 40), off + len);
                 }
             } else if (pass == 1 && type >= 0x20 && type <= 0x22 && len >= 32) {
                 parse_memory(b + off);
@@ -179,23 +246,43 @@ static bool parse_ivrs(void) {
 }
 
 /* ---- commands and events ---- */
-static bool command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    uint32_t next = (u->cmd_tail + 16) % RING_BYTES;
-    for (uint64_t t = iommu_deadline(100); (rd(u, R_CMD_HEAD) & 0x7FFF0) == next; pause())
-        if (iommu_expired(t)) return false;
+/* A unit stops fetching commands after an illegal or failed one (events 5 and 6, CmdBufRun
+   clear): its buffer starts again, empty. What it had not done is lost, and the next sync says so. */
+static void commands_restart(struct unit *u) {
+    kprintf("iommu: unit at %lx stopped taking commands; started again\n", u->base);
+    uint64_t ctl = rd(u, R_CONTROL);
+    wr(u, R_CONTROL, ctl & ~CTL_CMDBUF_EN);
+    wr(u, R_CMD_HEAD, 0);
+    wr(u, R_CMD_TAIL, 0);
+    u->cmd_tail = 0;
+    u->lost = true;
+    wr(u, R_CONTROL, ctl | CTL_CMDBUF_EN);
+}
+
+/* A command for one unit: one it has no room for in time is lost (u->lost). */
+static void command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    for (uint64_t t = iommu_deadline(100); (rd(u, R_CMD_HEAD) & 0x7FFF0) == (u->cmd_tail + 16) % RING_BYTES; pause()) {
+        if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) {
+            commands_restart(u);
+            break;
+        }
+        if (iommu_expired(t)) {
+            u->lost = true;
+            return;
+        }
+    }
     volatile uint32_t *slot = (volatile uint32_t *)((uint8_t *)phys_to_virt(u->cmd) + u->cmd_tail);
     slot[0] = a;
     slot[1] = b | (uint32_t)op << 28;
     slot[2] = c;
     slot[3] = d;
     if (!amd.coherent) iommu_cache_flush(slot, 16);
-    u->cmd_tail = next;
-    wr(u, R_CMD_TAIL, next);
-    return true;
+    u->cmd_tail = (u->cmd_tail + 16) % RING_BYTES;
+    wr(u, R_CMD_TAIL, u->cmd_tail);
 }
 
 static void send(unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    for (unsigned i = 0; i < nunits; i++) command(&units[i], op, a, b, c, d);
+    for (size_t i = 0; i < nunits; i++) command(&units[i], op, a, b, c, d);
 }
 
 /* Every page of a domain, the page directory caches with them. */
@@ -217,47 +304,65 @@ static void event_show(const struct unit *u, const volatile uint32_t *e) {
     }
 }
 
+static bool stopped(const struct unit *u, uint64_t run) {
+    for (uint64_t t = iommu_deadline(10); rd(u, R_STATUS) & run; pause())
+        if (iommu_expired(t)) return false;
+    return true;
+}
+
 static void events_drain(struct unit *u) {
     uint32_t status = (uint32_t)rd(u, R_STATUS);
-    wr(u, R_STATUS, status & (ST_EVENT_INT | ST_EVENT_OVERFLOW));
+    wr(u, R_STATUS, status & ST_EVENT_INT);
     uint32_t head = rd(u, R_EVT_HEAD) & 0x7FFF0, tail = rd(u, R_EVT_TAIL) & 0x7FFF0;
     for (; head != tail; head = (head + 16) % RING_BYTES)
         event_show(u, (const volatile uint32_t *)((uint8_t *)phys_to_virt(u->events) + head));
     wr(u, R_EVT_HEAD, head);
-    if (status & ST_EVENT_OVERFLOW) { /* the log stopped: start it again, empty */
+    if (status & ST_EVENT_OVERFLOW) { /* the log stopped: started again, empty (2.5.1) */
+        if (!stopped(u, ST_EVENTLOG_RUN))
+            kprintf("iommu: unit at %lx: its event log overflowed and does not stop\n", u->base);
         uint64_t ctl = rd(u, R_CONTROL);
         wr(u, R_CONTROL, ctl & ~CTL_EVENTLOG_EN);
         wr(u, R_EVT_HEAD, 0);
         wr(u, R_EVT_TAIL, 0);
-        wr(u, R_CONTROL, ctl);
+        wr(u, R_STATUS, ST_EVENT_OVERFLOW);
+        wr(u, R_CONTROL, ctl | CTL_EVENTLOG_EN);
         kprintf("iommu: unit at %lx: its event log overflowed\n", u->base);
     }
 }
 
 static void event_isr(struct regs *r) {
     (void)r;
-    for (unsigned i = 0; i < nunits; i++) events_drain(&units[i]);
+    for (size_t i = 0; i < nunits; i++) events_drain(&units[i]);
 }
 
-/* Waits until every unit has done every command sent before. */
+/* Waits until every unit has done every command sent since the last sync: false when one was
+   lost or a unit did not finish them in time. */
 static bool sync(void) {
     volatile uint64_t *word = phys_to_virt(sems);
     token++;
-    bool ok = true;
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         uint64_t at = sems + i * 8;
         word[i] = 0;
-        ok &= command(&units[i], CMD_COMPLETION_WAIT, (uint32_t)at | 1, (uint32_t)(at >> 32) & 0xFFFFF,
-                      (uint32_t)token, (uint32_t)(token >> 32));
+        command(&units[i], CMD_COMPLETION_WAIT, (uint32_t)at | 1, (uint32_t)(at >> 32) & 0xFFFFF, (uint32_t)token,
+                (uint32_t)(token >> 32));
     }
-    for (unsigned i = 0; ok && i < nunits; i++)
-        for (uint64_t t = iommu_deadline(100); word[i] != token; pause())
-            if (iommu_expired(t)) {
-                kprintf("iommu: unit at %lx did not finish its commands\n", units[i].base);
-                ok = false;
-                break;
+    for (size_t i = 0; i < nunits; i++) {
+        struct unit *u = &units[i];
+        for (uint64_t t = iommu_deadline(100); !u->lost && word[i] != token; pause()) {
+            if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) {
+                commands_restart(u);
+            } else if (iommu_expired(t)) {
+                kprintf("iommu: unit at %lx did not finish its commands\n", u->base);
+                u->lost = true;
             }
-    for (unsigned i = 0; i < nunits; i++) events_drain(&units[i]);
+        }
+    }
+    bool ok = true;
+    for (size_t i = 0; i < nunits; i++) {
+        events_drain(&units[i]);
+        ok &= !units[i].lost;
+        units[i].lost = false;
+    }
     return ok;
 }
 
@@ -271,6 +376,7 @@ static void dte_write(uint16_t id, uint64_t q0, uint64_t q1, uint64_t q2) {
     if (!amd.coherent) iommu_cache_flush(e, 32);
 }
 
+/* The device table and interrupt remapping caches keep the IDs' entries (2.3.2): both go. */
 static void send_entry_flush(const struct iommu_domain *dom) {
     for (unsigned i = 0; i < dom->nids; i++) {
         send(CMD_INV_DEVTAB, dom->ids[i], 0, 0, 0);
@@ -279,18 +385,24 @@ static void send_entry_flush(const struct iommu_domain *dom) {
 }
 
 static bool amd_attach(struct iommu_domain *dom) {
-    if (!(dom->irt = pmm_alloc_zeroed())) return false;
+    if (!(dom->irt = pmm_alloc_zeroed())) {
+        kprintf("iommu: no memory for an interrupt remapping table\n");
+        return false;
+    }
     if (!amd.coherent) iommu_cache_flush(phys_to_virt(dom->irt), PAGE_SIZE);
     uint64_t f = irq_save();
     send_domain_flush(dom->id); /* nothing the firmware cached under this id is used */
-    sync();
-    for (unsigned i = 0; i < dom->nids; i++)
-        dte_write(dom->ids[i], DTE_V | DTE_TV | DTE_MODE(dom->levels) | dom->root | DTE_IR | DTE_IW, dom->id,
-                  DTE_IV | DTE_IRT_LEN(IRT_LOG2) | dom->irt | DTE_INT_REMAP);
-    send_entry_flush(dom);
-    sync();
+    bool ok = sync();
+    if (ok) {
+        dom->written = true;
+        for (unsigned i = 0; i < dom->nids; i++)
+            dte_write(dom->ids[i], DTE_V | DTE_TV | DTE_MODE(dom->levels) | dom->root | DTE_IR | DTE_IW, dom->id,
+                      DTE_IV | DTE_IRT_LEN(IRT_LOG2) | dom->irt | DTE_INT_REMAP);
+        send_entry_flush(dom);
+        ok = sync();
+    }
     irq_restore(f);
-    return true;
+    return ok;
 }
 
 /* Valid, translation on, mode 0 (no page tables) with neither read nor write allowed: every DMA
@@ -317,20 +429,21 @@ static bool amd_flush(struct iommu_domain *dom, bool unmapped) {
 static uint64_t amd_table(uint64_t phys, unsigned level) {
     return phys | (uint64_t)(level - 1) << 9 | PTE_IR | PTE_IW | PTE_PR; /* NextLevel: the table's */
 }
-static uint64_t amd_leaf(uint64_t phys, unsigned level) {
+static uint64_t amd_leaf(uint64_t phys, unsigned level, unsigned access) {
     (void)level; /* 4 KiB pages only: NextLevel 0 */
-    return phys | PTE_IR | PTE_IW | PTE_PR;
+    return phys | (access & IOMMU_READ ? PTE_IR : 0) | (access & IOMMU_WRITE ? PTE_IW : 0) | PTE_PR;
 }
 
 static uint16_t amd_alias(uint16_t id) {
-    for (unsigned i = 0; i < naliases; i++)
+    for (size_t i = 0; i < naliases; i++)
         if (id >= aliases[i].first && id <= aliases[i].last) return aliases[i].as;
     return id;
 }
 
 /* ---- interrupts ----
    A claimed function's message carries its remapping table index in data bits 10:0: entry n
-   is message n, fixed delivery to a physical APIC id (the 32-bit entry format). */
+   is message n, fixed delivery to a physical APIC id (the 32-bit entry format). The table is
+   cached: every change is invalidated (2.3.2). */
 static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, uint8_t vector, uint32_t dest,
                       bool on) {
     volatile uint32_t *irt = phys_to_virt(dom->irt);
@@ -354,21 +467,23 @@ static bool amd_msi(struct pci_device *d, unsigned index, unsigned count, uint8_
     return index + count <= 1u << IRT_LOG2 && irt_write(dom, index, count, vector, dest, true);
 }
 
-static void amd_msi_clear(struct pci_device *d) {
+static bool amd_msi_clear(struct pci_device *d) {
     struct iommu_domain *dom = iommu_domain_of(d);
-    if (dom) irt_write(dom, 0, 1u << IRT_LOG2, 0, 0, false);
+    return !dom || irt_write(dom, 0, 1u << IRT_LOG2, 0, 0, false);
 }
 
-static uint64_t amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t rte) {
-    (void)ioapic_id, (void)gsi;
-    return rte;
+static bool amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
+    (void)ioapic_id, (void)gsi, (void)rte;
+    return true;
 }
 
 /* ---- the units ---- */
-static void program(struct unit *u) {
+static bool program(struct unit *u) {
     wr(u, R_CONTROL, 0); /* off, also when the firmware left it on */
-    for (uint64_t t = iommu_deadline(10); rd(u, R_STATUS) & (ST_EVENTLOG_RUN | ST_CMDBUF_RUN) && !iommu_expired(t);)
-        pause();
+    if (!stopped(u, ST_EVENTLOG_RUN | ST_CMDBUF_RUN)) {
+        kprintf("iommu: unit at %lx does not stop its command buffer and event log\n", u->base);
+        return false;
+    }
     wr(u, R_DEVTAB, devtab | (DT_BYTES / PAGE_SIZE - 1));
     wr(u, R_CMDBUF, u->cmd | RING_LEN);
     wr(u, R_EVENTLOG, u->events | RING_LEN);
@@ -377,6 +492,7 @@ static void program(struct unit *u) {
     wr(u, R_EVT_HEAD, 0);
     wr(u, R_EVT_TAIL, 0);
     u->cmd_tail = 0;
+    u->lost = false;
     wr(u, R_STATUS, ST_EVENT_OVERFLOW | ST_EVENT_INT | ST_COMWAIT_INT);
     /* the IVHD flags HtTunEn, PassPW, ResPassPW, Isoc and Coherent are the firmware's settings
        for control bits 1, 8, 9, 11 and 10 */
@@ -388,65 +504,98 @@ static void program(struct unit *u) {
     if (u->flags & 32) ctl |= 1ull << 10;
     if (event_vector >= 0 && u->fn) ctl |= CTL_EVENTINT_EN;
     wr(u, R_CONTROL, ctl);
+    return true;
 }
 
-/* What a unit may have cached before it was ours, or before a sleep. */
+/* What a unit may have cached before it was ours, or before a sleep: everything at once where
+   it can be told so, else the entries of every ID its IVHD names (a domain's pages are
+   invalidated before the domain is first used). */
 static void send_everything_flush(void) {
-    bool all = true;
-    for (unsigned i = 0; i < nunits; i++) all &= (units[i].efr & EFR_IA) != 0;
-    if (all) {
-        send(CMD_INV_ALL, 0, 0, 0, 0);
-        return;
-    }
-    for (uint32_t id = 0; id < 65536; id++) {
-        send(CMD_INV_DEVTAB, id, 0, 0, 0);
-        send(CMD_INV_IRT, id, 0, 0, 0);
+    for (size_t i = 0; i < nunits; i++) {
+        struct unit *u = &units[i];
+        if (u->efr & EFR_IA) {
+            command(u, CMD_INV_ALL, 0, 0, 0, 0);
+            continue;
+        }
+        for (size_t s = 0; s < u->nlisted; s++)
+            for (uint32_t id = u->listed[s].first; id <= u->listed[s].last; id++) {
+                command(u, CMD_INV_DEVTAB, id, 0, 0, 0);
+                command(u, CMD_INV_IRT, id, 0, 0, 0);
+            }
     }
 }
 
-static void amd_shutdown(void) {
-    for (unsigned i = 0; i < nunits; i++) wr(&units[i], R_CONTROL, 0);
+/* Every unit off; false when one did not stop reading its buffers. */
+static bool units_off(void) {
+    bool ok = true;
+    for (size_t i = 0; i < nunits; i++) {
+        wr(&units[i], R_CONTROL, 0);
+        if (!stopped(&units[i], ST_EVENTLOG_RUN | ST_CMDBUF_RUN)) {
+            kprintf("iommu: unit at %lx does not stop\n", units[i].base);
+            ok = false;
+        }
+    }
+    return ok;
 }
+
+static void amd_shutdown(void) { units_off(); }
 
 static void amd_resume(void) {
-    for (unsigned i = 0; i < nunits; i++) program(&units[i]);
-    send_everything_flush();
-    sync();
+    bool ok = true;
+    for (size_t i = 0; i < nunits; i++) ok &= program(&units[i]);
+    if (ok) {
+        send_everything_flush();
+        ok = sync();
+    }
+    if (!ok) kprintf("iommu: AMD-Vi did not come back after sleep\n");
+}
+
+static void tables_free(void) {
+    for (uint64_t at = 0; devtab && at < DT_BYTES; at += PAGE_SIZE) pmm_free(devtab + at);
+    for (size_t p = 0; sems && p < sem_pages; p++) pmm_free(sems + p * PAGE_SIZE);
+    for (size_t i = 0; i < nunits; i++) {
+        if (units[i].cmd) pmm_free(units[i].cmd);
+        if (units[i].events) pmm_free(units[i].events);
+        units[i].cmd = units[i].events = 0;
+    }
+    devtab = sems = 0;
 }
 
 static bool amd_start(void) {
+    sem_pages = ALIGN_UP(nunits * 8, PAGE_SIZE) / PAGE_SIZE;
     devtab = pmm_alloc_contig(DT_BYTES / PAGE_SIZE);
-    sems = pmm_alloc_zeroed();
+    sems = pmm_alloc_contig(sem_pages);
     bool ok = devtab && sems;
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         units[i].cmd = pmm_alloc_zeroed();
         units[i].events = pmm_alloc_zeroed();
         ok &= units[i].cmd && units[i].events;
     }
     if (!ok) {
         kprintf("iommu: no memory for the AMD-Vi tables\n");
-        for (uint64_t at = 0; devtab && at < DT_BYTES; at += PAGE_SIZE) pmm_free(devtab + at);
-        if (sems) pmm_free(sems);
-        for (unsigned i = 0; i < nunits; i++) {
-            if (units[i].cmd) pmm_free(units[i].cmd);
-            if (units[i].events) pmm_free(units[i].events);
-        }
+        tables_free();
         return false;
     }
     memset(phys_to_virt(devtab), 0, DT_BYTES);
+    memset(phys_to_virt(sems), 0, sem_pages * PAGE_SIZE);
     if (!amd.coherent) iommu_cache_flush(phys_to_virt(devtab), DT_BYTES);
     event_vector = irq_vector_alloc(1, 1);
     if (event_vector >= 0) vector_register(event_vector, event_isr);
     uint64_t f = irq_save();
-    for (unsigned i = 0; i < nunits; i++) program(&units[i]);
-    send_everything_flush();
-    ok = sync();
+    for (size_t i = 0; ok && i < nunits; i++) ok = program(&units[i]);
+    if (ok) {
+        send_everything_flush();
+        ok = sync();
+    }
+    bool off = ok || units_off();
     irq_restore(f);
     if (!ok) {
-        amd_shutdown();
+        if (event_vector >= 0) irq_vector_free((unsigned)event_vector, 1);
+        event_vector = -1;
+        if (off) tables_free(); /* else a unit may still read them: they stay */
         return false;
     }
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         struct pci_device *fn = units[i].fn;
         if (!fn) continue;
         pci_enable_busmaster(fn); /* the kernel's: no app may claim the unit */
@@ -454,9 +603,9 @@ static bool amd_start(void) {
             kprintf("iommu: unit at %lx has no event interrupt: blocked requests show after commands only\n",
                     units[i].base);
     }
-    kprintf("iommu: AMD-Vi on, %u unit%s; %u alias%s, %u reserved range%s: every function passes through "
-            "until an app claims it\n", nunits, nunits == 1 ? "" : "s", naliases, naliases == 1 ? "" : "es",
-            iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s");
+    kprintf("iommu: AMD-Vi on, %lu unit%s; %lu alias%s, %u reserved range%s: every function passes through "
+            "until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s", (unsigned long)naliases,
+            naliases == 1 ? "" : "es", iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s");
     return true;
 }
 
@@ -480,10 +629,17 @@ static struct iommu_hw amd = {
 
 const struct iommu_hw *iommu_amd_probe(void) {
     if (!parse_ivrs()) return NULL;
+    if (parse_lost) {
+        kprintf("iommu: no memory to keep the IVRS: AMD-Vi not used\n");
+        return NULL;
+    }
     amd.coherent = true;
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
-        u->regs = vmm_map_mmio(u->base, MMIO_BYTES);
+        if (!(u->regs = vmm_map_mmio(u->base, MMIO_BYTES))) {
+            kprintf("iommu: the registers of the AMD-Vi unit at %lx cannot be mapped: AMD-Vi not used\n", u->base);
+            return NULL;
+        }
         /* without its function the capability header is unknown: assume the cautious answers */
         uint32_t header = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap) : CAP_NP_CACHE;
         u->efr = header & CAP_EFR ? rd(u, R_EFR) : 0;

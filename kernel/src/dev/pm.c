@@ -168,9 +168,9 @@ static void enter_s3(void) { acpi_sleep_enter(3); }
    thread runs: the devices are down or not back yet. */
 static bool machine_sleep(void (*enter)(void), unsigned state, const char **why) {
     acpi_freeze(true);
-    pci_suspend();
+    const char *stuck = pci_suspend();
     uint64_t f = irq_save();
-    const char *stuck = pm_quiesce_devices(true);
+    if (!stuck) stuck = pm_quiesce_devices(true);
     uint32_t pic = pic_state();
     ioapic_suspend();
     timer_suspend();

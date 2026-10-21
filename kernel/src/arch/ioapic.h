@@ -13,11 +13,13 @@
 void ioapic_init(void); /* after acpi_init(); maps and masks every IOAPIC found in the MADT */
 unsigned ioapic_count(void);
 /* Redirect GSI `gsi` to `vector` on the CPU with physical APIC id `dest_apic_id` (fixed delivery),
-   unmasked. level/active_low describe the source. False if no IOAPIC owns the GSI or an argument is bad. */
+   unmasked. level/active_low describe the source. False if no IOAPIC owns the GSI, an argument is
+   bad, or interrupt remapping cannot deliver it (the pin then stays masked). The IOAPIC ids passed
+   to dev/iommu.h are the MADT's, which the DMAR's device scopes name. */
 bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool level, bool active_low);
 bool ioapic_mask(uint32_t gsi);
 /* Interrupt remapping came on (dev/iommu_intel.c): the unmasked entries (the firmware's ExtINT
-   pin) are written again, remappable. */
+   pin) are written again, remappable; one whose remapping entry the units did not confirm is masked. */
 void ioapic_remap(void);
 /* ISA IRQ -> GSI honoring MADT interrupt source overrides. level/active_low (may be NULL) receive the
    trigger mode and polarity to use for that source (ISA default: edge, active high). */

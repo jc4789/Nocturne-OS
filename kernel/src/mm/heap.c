@@ -229,5 +229,14 @@ void *krealloc(void *p, size_t size) {
     return n;
 }
 
+void *kgrow(void *array, size_t count, size_t *room, size_t size) {
+    if (count < *room) return array;
+    size_t more = *room ? *room * 2 : 8;
+    if (more < *room || more > SIZE_MAX / size) return NULL;
+    void *grown = krealloc(array, more * size);
+    if (grown) *room = more;
+    return grown;
+}
+
 uint64_t heap_used_bytes(void) { return heap_used; }
 uint64_t heap_size_bytes(void) { return heap_end - KHEAP_BASE; }

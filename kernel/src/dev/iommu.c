@@ -1,9 +1,11 @@
 /* IOMMU, the part AMD-Vi and VT-d share: domains and their page tables (512 entries a level, 9
-   bits of the address each, in both formats), the requester IDs a function's requests carry,
-   ACS on the ports above a claimed function, and the calls the rest of the kernel makes, passed
-   to the back end that found its units. The address and ID rules are the PCI Express Base
-   specification's (requester IDs, ACS) and the bridge specifications'. */
+   bits of the address each, in both formats), the requester IDs a function's requests carry, the
+   group of functions a claim isolates together (ACS on the way, PCI Express Base specification
+   6.12 and 7.7.7), the firmware's descriptions the back ends found, and the calls the rest of
+   the kernel makes, passed to the back end that found its units. The address and ID rules are
+   the PCI Express Base specification's (requester IDs, ACS) and the bridge specifications'. */
 #include "kernel.h"
+#include "abi.h"
 #include "arch/cpu.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
@@ -13,18 +15,104 @@
 #define PTE_ADDR 0x000FFFFFFFFFF000ull
 
 static const struct iommu_hw *hw;
-static struct iommu_domain *attached;
+/* attached: the claims' domains; held: blocked without the units' confirmation (iommu_block) */
+static struct iommu_domain *attached, *held;
 static uint8_t domain_used[65536 / 8];
+
+/* ---- what the back ends found in the firmware's tables ---- */
+static struct reserved {
+    uint16_t first, last;
+    uint64_t start, end;
+    unsigned access;
+} *reserved;
+static size_t nreserved, reserved_room;
+static struct span {
+    uint16_t first, last;
+} *covered;
+static size_t ncovered, covered_room;
+static uint16_t *kernel_ids;
+static size_t nkernel_ids, kernel_ids_room;
+static bool described_lost; /* no memory kept one of them: the units are not used */
+
+static void lost(const char *what) {
+    if (!described_lost) kprintf("iommu: no memory to keep the firmware's %s\n", what);
+    described_lost = true;
+}
+
+void iommu_reserved(uint16_t first, uint16_t last, uint64_t start, uint64_t end, unsigned access) {
+    access &= IOMMU_READ | IOMMU_WRITE;
+    if (first > last || start >= end || !access) return;
+    for (size_t i = 0; i < nreserved; i++) /* firmware repeats them (one per IVHD type, or scope) */
+        if (reserved[i].first == first && reserved[i].last == last && reserved[i].start == start &&
+            reserved[i].end == end) {
+            reserved[i].access |= access;
+            return;
+        }
+    struct reserved *grown = kgrow(reserved, nreserved, &reserved_room, sizeof *grown);
+    if (!grown) {
+        lost("reserved memory ranges");
+        return;
+    }
+    reserved = grown;
+    reserved[nreserved++] = (struct reserved){first, last, start, end, access};
+}
+
+unsigned iommu_reserved_count(void) { return (unsigned)nreserved; }
+
+void iommu_cover(uint16_t first, uint16_t last) {
+    if (first > last) return;
+    struct span *grown = kgrow(covered, ncovered, &covered_room, sizeof *grown);
+    if (!grown) {
+        lost("device scopes");
+        return;
+    }
+    covered = grown;
+    covered[ncovered++] = (struct span){first, last};
+}
+
+static bool is_covered(uint16_t id) {
+    for (size_t i = 0; i < ncovered; i++)
+        if (id >= covered[i].first && id <= covered[i].last) return true;
+    return false;
+}
+
+void iommu_kernel_id(uint16_t id) {
+    for (size_t i = 0; i < nkernel_ids; i++)
+        if (kernel_ids[i] == id) return;
+    uint16_t *grown = kgrow(kernel_ids, nkernel_ids, &kernel_ids_room, sizeof *grown);
+    if (!grown) {
+        lost("IOAPIC and HPET IDs");
+        return;
+    }
+    kernel_ids = grown;
+    kernel_ids[nkernel_ids++] = id;
+}
+
+static bool is_kernel_id(uint16_t id) {
+    for (size_t i = 0; i < nkernel_ids; i++)
+        if (kernel_ids[i] == id) return true;
+    return false;
+}
 
 void iommu_init(void) {
     if (cmdline_has("noiommu")) {
         kprintf("iommu: off (noiommu): a device given to an app reaches all of memory\n");
         return;
     }
+    /* every wait on a unit is bounded by the TSC */
+    if (!tsc_hz) {
+        kprintf("iommu: the TSC rate is unknown, so waits on the units cannot be bounded: not used; a device "
+                "given to an app reaches all of memory\n");
+        return;
+    }
     const struct iommu_hw *found = iommu_amd_probe();
     if (!found) found = iommu_intel_probe();
     if (!found) {
         kprintf("iommu: none described (no IVRS or DMAR): a device given to an app reaches all of memory\n");
+        return;
+    }
+    if (described_lost) {
+        kprintf("iommu: not used: a device given to an app reaches all of memory\n");
         return;
     }
     hw = found; /* table writes need it from here on */
@@ -37,7 +125,7 @@ void iommu_init(void) {
 
 bool iommu_active(void) { return hw != NULL; }
 
-uint64_t iommu_deadline(unsigned ms) { return rdtsc() + (tsc_hz ? tsc_hz / 1000 : 3000000ull) * ms; }
+uint64_t iommu_deadline(unsigned ms) { return rdtsc() + tsc_hz / 1000 * ms; }
 bool iommu_expired(uint64_t deadline) { return (int64_t)(rdtsc() - deadline) > 0; }
 
 bool iommu_fault_report(void) {
@@ -94,7 +182,9 @@ static volatile uint64_t *entry(struct iommu_domain *dom, uint64_t iova, unsigne
     }
 }
 
-bool iommu_map(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
+/* The entries only: a domain no unit uses yet needs no flush. */
+static bool map_range(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count,
+                      unsigned access) {
     for (size_t i = 0; i < count;) {
         uint64_t pa = frames ? frames[i] : base + i * PAGE_SIZE;
         unsigned level = 1;
@@ -105,10 +195,14 @@ bool iommu_map(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, 
         }
         volatile uint64_t *e = entry(dom, pa, level, true);
         if (!e) return false;
-        iommu_entry_write(e, hw->leaf(pa, level));
+        iommu_entry_write(e, hw->leaf(pa, level, access));
         i += 1ull << (shift_of(level) - 12);
     }
-    return !dom->d || hw->flush(dom, false);
+    return true;
+}
+
+bool iommu_map(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
+    return map_range(dom, frames, base, count, IOMMU_READ | IOMMU_WRITE) && (!dom->d || hw->flush(dom, false));
 }
 
 bool iommu_unmap(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
@@ -143,103 +237,274 @@ struct iommu_domain *iommu_domain_of(const struct pci_device *d) {
     return NULL;
 }
 
+static bool member_of(const struct iommu_domain *dom, const struct pci_device *d) {
+    for (unsigned i = 0; i < dom->nmembers; i++)
+        if (dom->members[i] == d) return true;
+    return false;
+}
+
+bool iommu_in_use(const struct pci_device *d) {
+    for (struct iommu_domain *dom = attached; dom; dom = dom->next)
+        if (member_of(dom, d)) return true;
+    for (struct iommu_domain *dom = held; dom; dom = dom->next)
+        if (member_of(dom, d)) return true;
+    return false;
+}
+
 /* ---- requester IDs ---- */
+struct ids {
+    uint16_t *at;
+    size_t n, room;
+};
+
 static uint16_t requester_id(const struct pci_device *d) { return d->bus << 8 | d->dev << 3 | d->func; }
 
-static bool id_add(uint16_t *ids, unsigned *n, uint16_t id) {
-    for (unsigned i = 0; i < *n; i++)
-        if (ids[i] == id) return true;
-    if (*n == IOMMU_IDS) return false;
-    ids[(*n)++] = id;
+static bool id_has(const struct ids *l, uint16_t id) {
+    for (size_t i = 0; i < l->n; i++)
+        if (l->at[i] == id) return true;
+    return false;
+}
+
+static bool id_add(struct ids *l, uint16_t id) {
+    if (id_has(l, id)) return true;
+    uint16_t *grown = kgrow(l->at, l->n, &l->room, sizeof *grown);
+    if (!grown) return false;
+    l->at = grown;
+    l->at[l->n++] = id;
     return true;
 }
 
-/* The IDs d's requests may arrive with: its own, and for each bridge to conventional PCI or
+/* Adds the IDs d's requests may arrive with: its own, and for each bridge to conventional PCI or
    PCI-X above it, which issues the requests from below as its own, the bridge's ID and its
-   secondary bus with device and function 0; then the firmware's aliases of those. 0 when there
-   are more than IOMMU_IDS. */
-unsigned iommu_requester_ids(const struct pci_device *d, uint16_t *ids) {
-    unsigned n = 0;
-    bool fits = id_add(ids, &n, requester_id(d));
-    for (const struct pci_device *b = pci_upstream(d); fits && b; b = pci_upstream(b)) {
+   secondary bus with device and function 0; then, when aliases, the firmware's aliases of
+   those. False without memory. */
+static bool ids_of(const struct pci_device *d, struct ids *l, bool aliases) {
+    size_t from = l->n;
+    if (!id_add(l, requester_id(d))) return false;
+    for (const struct pci_device *b = d->upstream; b; b = b->upstream) {
         if (b->pcie_cap && b->pcie_type != 7) continue; /* 7: PCI Express to PCI/PCI-X bridge */
-        uint8_t secondary = pci_read32(b->bus, b->dev, b->func, 0x18) >> 8;
-        fits = id_add(ids, &n, (uint16_t)secondary << 8) && id_add(ids, &n, requester_id(b));
+        if (!id_add(l, (uint16_t)(b->secondary << 8)) || !id_add(l, requester_id(b))) return false;
     }
-    for (unsigned i = 0, own = n; fits && hw->alias && i < own; i++) fits = id_add(ids, &n, hw->alias(ids[i]));
-    return fits ? n : 0;
+    for (size_t i = from, own = l->n; aliases && hw->alias && i < own; i++)
+        if (!id_add(l, hw->alias(l->at[i]))) return false;
+    return true;
 }
 
-/* Another function that sends with one of these IDs: a domain for d would take its requests
-   too. Bridges no driver runs send none that matter. */
-static const struct pci_device *sharer(const struct pci_device *d, const uint16_t *ids, unsigned n) {
+uint16_t *iommu_requester_ids(const struct pci_device *d, unsigned *n) {
+    struct ids l = {0};
+    if (!ids_of(d, &l, true)) {
+        kfree(l.at);
+        return NULL;
+    }
+    *n = (unsigned)l.n;
+    return l.at;
+}
+
+/* ---- groups ----
+   The functions a claimed one reaches, or that reach it, without their requests passing the
+   units: those sending with one of its requester IDs; the other functions of its device unless
+   its ACS sends what it addresses to them upstream; below a switch whose downstream port above
+   it does not redirect every request upstream, everything below that switch; and everything
+   when a root port above it cannot be made to. A root port without ACS P2P Request Redirect
+   has no peer-to-peer with the other root ports (ACS requires it of one that has). The group
+   closes over its members: what a member reaches, it reaches too. */
+#define ACS_V (1u << 0) /* source validation */
+#define ACS_B (1u << 1) /* translation blocking */
+#define ACS_R (1u << 2) /* P2P request redirect */
+#define ACS_C (1u << 3) /* P2P completion redirect */
+#define ACS_U (1u << 4) /* upstream forwarding */
+#define ACS_E (1u << 5) /* P2P egress control */
+#define ACS_T (1u << 6) /* direct translated P2P */
+#define ACS_PORT (ACS_V | ACS_R | ACS_C | ACS_U) /* what a switch downstream port with ACS has */
+
+struct fns {
+    struct pci_device **at;
+    size_t n, room;
+};
+
+static bool fn_has(const struct fns *g, const struct pci_device *o) {
+    for (size_t i = 0; i < g->n; i++)
+        if (g->at[i] == o) return true;
+    return false;
+}
+
+static bool fn_add(struct fns *g, struct pci_device *o) {
+    if (fn_has(g, o)) return true;
+    struct pci_device **grown = kgrow(g->at, g->n, &g->room, sizeof *grown);
+    if (!grown) return false;
+    g->at = grown;
+    g->at[g->n++] = o;
+    return true;
+}
+
+/* Bridges send no requests of their own that matter, unless a kernel driver runs them. */
+static bool sends(const struct pci_device *o) { return o->cls != 0x06 || o->kernel_owned; }
+
+/* Turns on the ACS controls of `want` that f has, and off egress control and direct translated
+   P2P (both let requests past the redirect): false without ACS. *has: the controls of `want` it
+   has; *set: those of them that read back on. */
+static bool acs_set(const struct pci_device *f, uint16_t want, uint16_t *has, uint16_t *set) {
+    *has = *set = 0;
+    uint16_t at = pci_find_ext_cap(f, 0x0D);
+    if (!at) return false;
+    *has = pci_read16(f->bus, f->dev, f->func, at + 4) & want;
+    uint16_t ctl = pci_read16(f->bus, f->dev, f->func, at + 6);
+    uint16_t now = (uint16_t)((ctl | *has) & ~(ACS_E | ACS_T));
+    if (now != ctl) pci_write16(f->bus, f->dev, f->func, at + 6, now);
+    *set = pci_read16(f->bus, f->dev, f->func, at + 6) & *has;
+    return true;
+}
+
+static bool add_below(struct fns *g, const struct pci_device *up) {
     for (int i = 0; i < pci_count(); i++) {
-        const struct pci_device *o = pci_at(i);
-        if (o == d || (o->cls == 0x06 && !o->kernel_owned)) continue;
-        uint16_t theirs[IOMMU_IDS];
-        unsigned m = iommu_requester_ids(o, theirs);
-        for (unsigned a = 0; a < n; a++)
-            for (unsigned b = 0; b < m; b++)
-                if (ids[a] == theirs[b]) return o;
+        struct pci_device *o = pci_at(i);
+        if (sends(o) && pci_below(up, o) && !fn_add(g, o)) return false;
     }
-    return NULL;
+    return true;
 }
 
-/* ---- ACS ----
-   A switch passes a request between the devices below it without the root complex, and so
-   without the IOMMU, unless its downstream ports redirect it upstream; root ports likewise.
-   Source validation, request and completion redirect and upstream forwarding, where a port
-   has them. */
-#define ACS_WANTED (1u << 0 | 1u << 2 | 1u << 3 | 1u << 4)
-static void acs_enable(const struct pci_device *d) {
-    for (const struct pci_device *b = pci_upstream(d); b; b = pci_upstream(b)) {
-        if (!b->pcie_cap || (b->pcie_type != 4 && b->pcie_type != 6)) continue; /* root, downstream port */
-        uint16_t acs = pci_find_ext_cap(b, 0x0D);
-        if (!acs) {
-            if (b->pcie_type == 6)
-                kprintf("iommu: switch port %02x:%02x.%u above %02x:%02x.%u has no ACS: requests between "
-                        "devices below that switch do not pass the IOMMU\n",
-                        b->bus, b->dev, b->func, d->bus, d->dev, d->func);
-            continue;
+/* Adds what m reaches, or what reaches m, past the units; *all when that is every function.
+   False without memory. */
+static bool reach(struct fns *g, struct pci_device *m, bool *all) {
+    uint16_t has, set;
+    bool alone = true;
+    for (int i = 0; i < pci_count() && alone; i++)
+        alone = pci_at(i) == m || !sends(pci_at(i)) || !pci_same_device(m, pci_at(i));
+    if (!alone) {
+        /* A function that has no P2P Request Redirect has no peer-to-peer with the other
+           functions; one without ACS may, as its device implements it. A device integrated in the
+           root complex has no port above it that the redirected requests are sure to pass. */
+        bool acs = acs_set(m, ACS_PORT | ACS_B, &has, &set);
+        if (!acs || !m->upstream || (set & (ACS_R | ACS_C)) != (has & (ACS_R | ACS_C))) {
+            kprintf("iommu: %02x:%02x.%u: %s; the device's other functions are in its group\n", m->bus, m->dev,
+                    m->func, !acs ? "no ACS" : !m->upstream ? "integrated in the root complex" : "its ACS did not turn on");
+            for (int i = 0; i < pci_count(); i++) {
+                struct pci_device *o = pci_at(i);
+                if (sends(o) && pci_same_device(m, o) && !fn_add(g, o)) return false;
+            }
         }
-        uint16_t want = pci_read16(b->bus, b->dev, b->func, acs + 4) & ACS_WANTED;
-        uint16_t ctl = pci_read16(b->bus, b->dev, b->func, acs + 6);
-        if ((ctl & want) != want) pci_write16(b->bus, b->dev, b->func, acs + 6, ctl | want);
     }
-}
-
-/* ---- the firmware's reserved memory ---- */
-#define MAX_RESERVED 32
-static struct reserved {
-    uint16_t first, last;
-    uint64_t start, end;
-} reserved[MAX_RESERVED];
-static unsigned nreserved;
-
-void iommu_reserved(uint16_t first, uint16_t last, uint64_t start, uint64_t end) {
-    if (first > last || start >= end) return;
-    for (unsigned i = 0; i < nreserved; i++) /* firmware repeats them (one per IVHD type, or scope) */
-        if (reserved[i].first == first && reserved[i].last == last && reserved[i].start == start &&
-            reserved[i].end == end)
-            return;
-    if (nreserved == MAX_RESERVED) {
-        kprintf("iommu: more than %u reserved ranges; %lx-%lx is not kept\n", MAX_RESERVED, start, end);
-        return;
+    for (const struct pci_device *b = m->upstream; b; b = b->upstream) {
+        if (!b->pcie_cap) continue; /* conventional: they share the IDs of the bridge to it */
+        if (b->pcie_type == 6) { /* a switch's downstream port: has all of ACS_PORT, or no ACS */
+            if (acs_set(b, ACS_PORT | ACS_B, &has, &set) && (has & ACS_PORT) == ACS_PORT && (set & ACS_PORT) == ACS_PORT)
+                continue;
+            kprintf("iommu: switch port %02x:%02x.%u above %02x:%02x.%u does not redirect requests between the "
+                    "devices below the switch: they are in its group\n", b->bus, b->dev, b->func, m->bus, m->dev,
+                    m->func);
+            if (!b->upstream) {
+                *all = true;
+                return true;
+            }
+            if (!add_below(g, b->upstream)) return false;
+        } else if (b->pcie_type == 4) {
+            /* a root port: what it has must turn on. One that forwards requests to other root
+               ports has to implement P2P Request Redirect (6.12.1.1), so one without ACS has no
+               peer-to-peer to stop. */
+            if (!acs_set(b, ACS_PORT | ACS_B, &has, &set) || (set & ACS_PORT) == (has & ACS_PORT)) continue;
+            kprintf("iommu: root port %02x:%02x.%u above %02x:%02x.%u: its ACS did not turn on; every function "
+                    "is in the group\n", b->bus, b->dev, b->func, m->bus, m->dev, m->func);
+            *all = true;
+            return true;
+        }
     }
-    reserved[nreserved++] = (struct reserved){first, last, start, end};
-}
-
-unsigned iommu_reserved_count(void) { return nreserved; }
-
-static bool reserved_map(struct iommu_domain *dom) {
-    for (unsigned r = 0; r < nreserved; r++)
-        for (unsigned i = 0; i < dom->nids; i++)
-            if (dom->ids[i] >= reserved[r].first && dom->ids[i] <= reserved[r].last) {
-                if (!iommu_map(dom, NULL, reserved[r].start, (reserved[r].end - reserved[r].start) / PAGE_SIZE))
-                    return false;
+    /* the functions that send with one of m's IDs */
+    struct ids mine = {0}, theirs = {0};
+    bool ok = ids_of(m, &mine, true);
+    for (int i = 0; ok && i < pci_count(); i++) {
+        struct pci_device *o = pci_at(i);
+        if (!sends(o) || fn_has(g, o)) continue;
+        theirs.n = 0;
+        ok = ids_of(o, &theirs, true);
+        for (size_t k = 0; ok && k < theirs.n; k++)
+            if (id_has(&mine, theirs.at[k])) {
+                ok = fn_add(g, o);
                 break;
             }
-    return true;
+    }
+    kfree(mine.at);
+    kfree(theirs.at);
+    return ok;
+}
+
+static int group_of(struct pci_device *d, struct fns *g) {
+    bool all = false;
+    if (!fn_add(g, d)) return -N_ERR_NO_MEMORY;
+    for (size_t i = 0; i < g->n && !all; i++)
+        if (!reach(g, g->at[i], &all)) return -N_ERR_NO_MEMORY;
+    for (int i = 0; all && i < pci_count(); i++)
+        if (sends(pci_at(i)) && !fn_add(g, pci_at(i))) return -N_ERR_NO_MEMORY;
+    return 0;
+}
+
+/* Every member free to join, and the group's IDs: each one seen by a unit and none the platform's. */
+static int group_check(const struct pci_device *d, const struct fns *g, struct ids *ids) {
+    for (size_t i = 0; i < g->n; i++) {
+        const struct pci_device *m = g->at[i];
+        const char *why = m == d ? NULL : m->kernel_owned ? "a kernel driver runs it" : m->claimed ? "it is claimed" : NULL;
+        if (!why && iommu_in_use(m)) why = "it is still in a domain the units did not confirm blocked";
+        if (why) {
+            kprintf("iommu: %02x:%02x.%u cannot be isolated: %02x:%02x.%u is in its group and %s\n", d->bus, d->dev,
+                    d->func, m->bus, m->dev, m->func, why);
+            return -N_ERR_BUSY;
+        }
+        struct ids own = {0};
+        bool ok = ids_of(m, &own, false);
+        for (size_t k = 0; ok && k < own.n; k++)
+            if (!is_covered(own.at[k])) {
+                kprintf("iommu: %02x:%02x.%u cannot be isolated: no unit sees requests with ID %02x:%02x.%u\n", d->bus,
+                        d->dev, d->func, own.at[k] >> 8, (own.at[k] >> 3) & 31, own.at[k] & 7);
+                kfree(own.at);
+                return -N_ERR_UNSUPPORTED;
+            }
+        kfree(own.at);
+        if (!ok || !ids_of(m, ids, true)) return -N_ERR_NO_MEMORY;
+    }
+    for (size_t k = 0; k < ids->n; k++)
+        if (is_kernel_id(ids->at[k])) {
+            kprintf("iommu: %02x:%02x.%u cannot be isolated: its group sends with ID %02x:%02x.%u, which the "
+                    "platform's interrupt controllers or timers use\n", d->bus, d->dev, d->func, ids->at[k] >> 8,
+                    (ids->at[k] >> 3) & 31, ids->at[k] & 7);
+            return -N_ERR_BUSY;
+        }
+    return 0;
+}
+
+/* ---- the firmware's reserved memory in a domain ----
+   The ranges for the domain's IDs, cut where any of them starts or ends: each piece is mapped
+   with every access a range over it allows. */
+static bool reserved_for(const struct reserved *r, const struct iommu_domain *dom) {
+    for (unsigned i = 0; i < dom->nids; i++)
+        if (dom->ids[i] >= r->first && dom->ids[i] <= r->last) return true;
+    return false;
+}
+
+static bool reserved_map(struct iommu_domain *dom) {
+    if (!nreserved) return true;
+    uint64_t *cut = kmalloc(nreserved * 2 * sizeof *cut);
+    if (!cut) return false;
+    size_t n = 0;
+    for (size_t r = 0; r < nreserved; r++)
+        if (reserved_for(&reserved[r], dom)) {
+            cut[n++] = reserved[r].start;
+            cut[n++] = reserved[r].end;
+        }
+    for (size_t i = 1; i < n; i++) /* a few: sorted in place */
+        for (size_t k = i; k && cut[k - 1] > cut[k]; k--) {
+            uint64_t t = cut[k];
+            cut[k] = cut[k - 1];
+            cut[k - 1] = t;
+        }
+    bool ok = true;
+    for (size_t i = 0; ok && i + 1 < n; i++) {
+        unsigned access = 0;
+        for (size_t r = 0; r < nreserved; r++)
+            if (reserved[r].start <= cut[i] && cut[i + 1] <= reserved[r].end && reserved_for(&reserved[r], dom))
+                access |= reserved[r].access;
+        if (access && cut[i] < cut[i + 1]) ok = map_range(dom, NULL, cut[i], (cut[i + 1] - cut[i]) / PAGE_SIZE, access);
+    }
+    kfree(cut);
+    return ok;
 }
 
 /* ---- domains of claimed functions ---- */
@@ -252,59 +517,107 @@ static uint16_t domain_id_new(void) {
     return 0;
 }
 
+static void domain_release(struct iommu_domain *dom) {
+    tables_free(dom->root, dom->levels);
+    if (dom->irt) pmm_free(dom->irt);
+    domain_used[dom->id / 8] &= ~(1u << (dom->id % 8));
+    kfree(dom->members);
+    kfree(dom->ids);
+    kfree(dom);
+}
+
+static void unlink(struct iommu_domain **list, struct iommu_domain *dom) {
+    for (struct iommu_domain **p = list; *p; p = &(*p)->next)
+        if (*p == dom) {
+            *p = dom->next;
+            return;
+        }
+}
+
+/* The blocks not confirmed yet, tried again: a group comes free once one is. */
+static void held_retry(void) {
+    for (struct iommu_domain *dom = held, *next; dom; dom = next) {
+        next = dom->next;
+        if (!hw->block(dom)) continue;
+        dom->blocked = true;
+        unlink(&held, dom);
+        kprintf("iommu: %02x:%02x.%u: blocking it is confirmed now\n", dom->d->bus, dom->d->dev, dom->d->func);
+        if (dom->unwanted) domain_release(dom);
+    }
+}
+
 int iommu_attach(struct pci_device *d, struct iommu_domain **out) {
     if (!hw) return -N_ERR_UNSUPPORTED;
-    uint16_t ids[IOMMU_IDS];
-    unsigned n = iommu_requester_ids(d, ids);
-    if (!n) return -N_ERR_UNSUPPORTED;
-    const struct pci_device *o = sharer(d, ids, n);
-    if (o) {
-        kprintf("iommu: %02x:%02x.%u sends with the same requester ID as %02x:%02x.%u: they cannot be "
-                "kept apart\n", d->bus, d->dev, d->func, o->bus, o->dev, o->func);
+    held_retry();
+    if (!pci_all_known()) {
+        kprintf("iommu: %02x:%02x.%u cannot be isolated: enumeration did not keep every function, so its group "
+                "is unknown\n", d->bus, d->dev, d->func);
+        return -N_ERR_UNSUPPORTED;
+    }
+    if (iommu_in_use(d)) {
+        kprintf("iommu: %02x:%02x.%u is still in a domain the units did not confirm blocked\n", d->bus, d->dev, d->func);
         return -N_ERR_BUSY;
     }
-    uint16_t id = domain_id_new();
-    if (!id) return -N_ERR_BUSY;
-    struct iommu_domain *dom = domain_alloc(id, hw->levels, 1);
-    if (!dom) {
+    struct fns g = {0};
+    struct ids ids = {0};
+    int r = group_of(d, &g);
+    if (!r) r = group_check(d, &g, &ids);
+    uint16_t id = r ? 0 : domain_id_new();
+    if (!r && !id) r = -N_ERR_BUSY;
+    struct iommu_domain *dom = r ? NULL : domain_alloc(id, hw->levels, 1);
+    if (!r && !dom) {
         domain_used[id / 8] &= ~(1u << (id % 8));
-        return -N_ERR_NO_MEMORY;
+        r = -N_ERR_NO_MEMORY;
+    }
+    if (r) {
+        kfree(g.at);
+        kfree(ids.at);
+        return r;
     }
     dom->d = d;
-    memcpy(dom->ids, ids, sizeof ids);
-    dom->nids = n;
-    acs_enable(d);
-    if (!reserved_map(dom) || !hw->attach(dom)) {
-        dom->blocked = true; /* nothing changed: the function still passes through */
-        iommu_domain_free(dom);
+    dom->members = g.at;
+    dom->nmembers = (unsigned)g.n;
+    dom->ids = ids.at;
+    dom->nids = (unsigned)ids.n;
+    if (!reserved_map(dom)) {
+        domain_release(dom);
         return -N_ERR_NO_MEMORY;
+    }
+    if (!hw->attach(dom)) {
+        kprintf("iommu: %02x:%02x.%u: the units did not confirm its domain\n", d->bus, d->dev, d->func);
+        iommu_domain_free(dom); /* what was written is blocked first */
+        return -N_ERR_IO;
     }
     dom->next = attached;
     attached = dom;
     kprintf("iommu: %02x:%02x.%u isolated in domain %u\n", d->bus, d->dev, d->func, id);
+    for (unsigned i = 1; i < dom->nmembers; i++)
+        kprintf("iommu: %02x:%02x.%u is in its group: its DMA reaches only that domain too\n", dom->members[i]->bus,
+                dom->members[i]->dev, dom->members[i]->func);
     *out = dom;
     return 0;
 }
 
 bool iommu_block(struct iommu_domain *dom) {
-    for (struct iommu_domain **p = &attached; *p; p = &(*p)->next)
-        if (*p == dom) {
-            *p = dom->next;
-            break;
-        }
+    unlink(&attached, dom);
+    unlink(&held, dom);
     if (!dom->blocked) dom->blocked = hw->block(dom);
-    if (!dom->blocked)
-        kprintf("iommu: %02x:%02x.%u: blocking it was not confirmed\n", dom->d->bus, dom->d->dev, dom->d->func);
+    if (!dom->blocked) {
+        kprintf("iommu: %02x:%02x.%u: blocking it was not confirmed; its group stays out of every claim until it "
+                "is\n", dom->d->bus, dom->d->dev, dom->d->func);
+        dom->next = held;
+        held = dom;
+    }
     return dom->blocked;
 }
 
 void iommu_domain_free(struct iommu_domain *dom) {
-    /* a unit may still walk the tables of a function it was not seen to block */
-    if (!dom->blocked && !iommu_block(dom)) return;
-    tables_free(dom->root, dom->levels);
-    if (dom->irt) pmm_free(dom->irt);
-    domain_used[dom->id / 8] &= ~(1u << (dom->id % 8));
-    kfree(dom);
+    /* a unit may still walk the tables of a group it was not seen to block */
+    if (dom->written && !dom->blocked && !iommu_block(dom)) {
+        dom->unwanted = true;
+        return;
+    }
+    domain_release(dom);
 }
 
 /* ---- interrupts and power ---- */
@@ -317,12 +630,10 @@ bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, uin
     return true;
 }
 
-void iommu_msi_clear(struct pci_device *d) {
-    if (hw) hw->msi_clear(d);
-}
+bool iommu_msi_clear(struct pci_device *d) { return !hw || hw->msi_clear(d); }
 
-uint64_t iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t rte) {
-    return hw ? hw->ioapic(ioapic_id, gsi, rte) : rte;
+bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
+    return !hw || hw->ioapic(ioapic_id, gsi, rte);
 }
 
 void iommu_resume(void) {

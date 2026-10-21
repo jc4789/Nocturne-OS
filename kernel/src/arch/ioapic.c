@@ -55,7 +55,7 @@ void ioapic_init(void) {
         }
         io->version = ver & 0xFF;
         io->pins = ((ver >> 16) & 0xFF) + 1;
-        io->id = (rd(io, REG_ID) >> 24) & 0xFF;
+        io->id = a[i].id; /* the MADT's: the one the DMAR's scopes name (its register may differ) */
         unsigned kept = 0;
         for (uint32_t pin = 0; pin < io->pins; pin++) {
             uint32_t lo = rd(io, REG_RTE(pin));
@@ -86,12 +86,17 @@ static struct ioapic *owner(uint32_t gsi, uint32_t *pin) {
     return NULL;
 }
 
-/* An entry given in the plain format, as interrupt remapping wants it (dev/iommu.h). */
-static void rte_write(struct ioapic *io, uint32_t pin, uint64_t rte) {
-    rte = iommu_ioapic_entry(io->id, io->gsi_base + pin, rte);
+/* An entry given in the plain format, as interrupt remapping wants it (dev/iommu.h): false when
+   it cannot be delivered, and the pin is masked. */
+static bool rte_write(struct ioapic *io, uint32_t pin, uint64_t rte) {
+    if (!iommu_ioapic_entry(io->id, io->gsi_base + pin, &rte)) {
+        wr(io, REG_RTE(pin), rd(io, REG_RTE(pin)) | RTE_MASK);
+        return false;
+    }
     wr(io, REG_RTE(pin), RTE_MASK | (uint32_t)rte); /* mask while the destination changes */
     wr(io, REG_RTE(pin) + 1, (uint32_t)(rte >> 32));
     wr(io, REG_RTE(pin), (uint32_t)rte);
+    return true;
 }
 
 bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool level, bool active_low) {
@@ -100,9 +105,9 @@ bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool leve
     if (!io || vector < 0x30 || vector == 0xFF || dest_apic_id > 0xFF) return false;
     uint32_t lo = vector | (level ? RTE_LEVEL : 0) | (active_low ? RTE_ACTIVELOW : 0); /* fixed, physical */
     uint64_t f = irq_save();
-    rte_write(io, pin, lo | (uint64_t)dest_apic_id << 56);
+    bool ok = rte_write(io, pin, lo | (uint64_t)dest_apic_id << 56);
     irq_restore(f);
-    return true;
+    return ok;
 }
 
 void ioapic_remap(void) {

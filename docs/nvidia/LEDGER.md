@@ -143,6 +143,29 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
+- 2026-10-21：0d7daeb の IOMMU を二つの監査で照合し、仕様（AMD 48882 3.10、Intel D51397-019、PCIe 4.0）
+  に沿って修理。共通層：claim は P2P で互いに届く装置のグループごとにドメインへ入れる（要求元 ID・
+  エイリアスの共有、ACS の効かない多機能装置・スイッチ下流ポート・ルートポート。ACS は読み戻して確かめ
+  E と T は切る）。グループのカバー（DRHD のスコープ・INCLUDE_PCI_ALL、IVHD の範囲）とカーネルの ID
+  （IOAPIC・HPET）を確かめ、だめなら claim を拒む。無効化の失敗・時間切れは握り潰さず `N_ERR_IO`、
+  遮断の未確認は保留して次の claim でやり直し、それまでの再 claim は BUSY、ベクターと DMA の RAM は
+  渡さない。固定上限は動的配列（`kgrow`）へ、TSC の 3 GHz 仮定は `tsc_hz` へ。IVMD の読み書き許可を
+  尊重。AMD-Vi：不正命令で止まった命令バッファーの再開、イベントログ溢れの §2.5.1 の順、INV_ALL が
+  無ければ見える ID だけ。VT-d：EIMER・IRREQ・MHMV、x2APIC 形式の宛先、IOAPIC は MADT の id で DMAR の
+  スコープと照合、文脈の全体無効化の後に IOTLB の全体無効化、DR/DW、PMEN の予約ビット保持、IQE の
+  回復。同意しなかった点：AMD の IRT は cached なので INV_IRT は残す、SMI は SMI フィルターがファーム
+  ウェアの SMI も止めうるので止めず文書化、ロック無しの指摘は BSP だけの設計なので該当せず。
+  確認：カーネル差分ビルドと全媒体（img・vhd・vhdx・iso）、警告なし。QEMU 一台ずつ（WHPX、4 コア、
+  4096 MiB、1920×1080、AHCI 起動、snapshot、`edu`）で q35＋`amd-iommu,intremap=on,dma-remap=on`
+  （/data は NVMe）、q35＋`intel-iommu,intremap=on`（同）、pc 機種（IOMMU 無し、/data は IDE）：
+  どれも `pcitest: 0 failed`・`nvrmtest: 0 failed`・`pcitest fbhold: 0 failed`。IOMMU の 2 構成は
+  「isolated: yes」で、claim 外の DMA は遮断（VT-d は理由 05h）。NVMe の MSI、e1000、DHCP も動いた。
+  3 構成とも JavaScript demo へのクリック、Alt+Left、ホイールの下端と上への戻りを実入力で見た（目視）。
+  QEMU の「Ignoring request for interrupt vector 0」はカーネル出力前（ファームウェア）に出ており無関係。
+  QEMU の amd-iommu が出す page fault イベントは、仕様の書式で読むと「interrupt at 0」になる（遮断は
+  されている。QEMU の符号化の問題と見ているが未確認。実機のイベントで確かめる）。
+  Ryzen 7600X＋RTX 4070 の実機は未実施（ユーザー）。
+
 - 2026-10-21：837f8789 の残り3件を修理。(1) C40：画面保持の30秒上限を削除（`fb_take_expiry` も削除）。
   保持は RM の解放か claim の終わりでだけ終わり、claim の終わりは装置を止めて（revoke、MSI・バスマスター
   無効、IOMMU 遮断、DMA 隔離）から画面を返す。止まったドライバーには既定無しの `fbhold=<秒>` でアプリを

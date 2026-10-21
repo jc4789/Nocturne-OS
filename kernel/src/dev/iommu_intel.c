@@ -3,12 +3,13 @@
    the invalidation queue, fault recording and interrupt remapping.
    Every unit gets the same picture. Its root table points every bus at one context table whose
    entries let a function through (pass-through, or the identity domain on a unit without it);
-   a bus with a claimed function gets a context table of its own in each unit, where that
-   function's entry points at the claim's domain and, once blocked, is not present.
+   a bus with a claimed function gets a context table of its own in each unit, where the entries
+   of the claim's group point at the claim's domain and, once blocked, are not present.
    Interrupt remapping, when every unit has it, takes every interrupt: compatibility-format
    interrupts are refused (they would let any device send any vector), so each MSI and IOAPIC
    pin is an entry of one shared table, checked against the requester ID of its source.
-   Entries 0..255 are the IOAPIC pins by GSI, then 32 for each function with MSI or MSI-X on. */
+   Entries 0..255 are the IOAPIC pins by GSI, then 32 for each function with MSI or MSI-X on.
+   Units that require it get the x2APIC entry format (Extended Interrupt Mode). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/ioapic.h"
@@ -16,11 +17,9 @@
 #include "dev/acpi.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
+#include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
-
-#define MAX_UNITS   8
-#define MAX_IOAPICS 8
 
 /* registers */
 #define R_VER     0x00
@@ -54,6 +53,7 @@
 #define FECTL_IM (1u << 31)
 #define PMEN_EPM (1u << 31)
 #define PMEN_PRS (1u << 0)
+#define IRTA_EIME (1ull << 11)
 
 #define CAP_RWBF     (1ull << 4)
 #define CAP_PLMR     (1ull << 5)
@@ -64,10 +64,16 @@
 #define CAP_FRO(c)   (((unsigned)((c) >> 24) & 0x3FF) * 16)
 #define CAP_SSLPS(c) ((unsigned)((c) >> 34) & 0xF)
 #define CAP_NFR(c)   (((unsigned)((c) >> 40) & 0xFF) + 1)
-#define ECAP_C  (1ull << 0)
-#define ECAP_QI (1ull << 1)
-#define ECAP_IR (1ull << 3)
-#define ECAP_PT (1ull << 6)
+#define CAP_DWD      (1ull << 54)
+#define CAP_DRD      (1ull << 55)
+#define ECAP_C     (1ull << 0)
+#define ECAP_QI    (1ull << 1)
+#define ECAP_IR    (1ull << 3)
+#define ECAP_EIM   (1ull << 4)
+#define ECAP_PT    (1ull << 6)
+#define ECAP_MHMV(e) ((unsigned)((e) >> 20) & 0xF)
+#define ECAP_EIMER (1ull << 61) /* interrupt remapping in Extended Interrupt Mode only */
+#define ECAP_IRREQ (1ull << 62) /* interrupts blocked while interrupt remapping is off */
 
 #define ADDR ((uint64_t)0x000FFFFFFFFFF000)
 /* root and context entries: two qwords, present bit 0 of the first */
@@ -83,6 +89,8 @@
 #define INV_CONTEXT_GLOBAL   (1ull | 1ull << 4)
 #define INV_IOTLB_GLOBAL     (2ull | 1ull << 4)
 #define INV_IOTLB_DOMAIN(id) (2ull | 2ull << 4 | (uint64_t)(id) << 16)
+#define INV_IOTLB_DW         (1ull << 6) /* drain writes, reads: what a version 1 unit needs asked */
+#define INV_IOTLB_DR         (1ull << 7)
 #define INV_IEC_GLOBAL       4ull
 #define INV_IEC(index, log2) (4ull | 1ull << 4 | (uint64_t)(log2) << 27 | (uint64_t)(index) << 32)
 #define INV_WAIT(token)      (5ull | 1ull << 5 | 1ull << 6 | (uint64_t)(token) << 32) /* status write, fence */
@@ -99,7 +107,6 @@
 #define IRTE_TM        (1ull << 4) /* level */
 #define IRTE_DLM(m)    ((uint64_t)(m) << 5)
 #define IRTE_VECTOR(v) ((uint64_t)(uint8_t)(v) << 16)
-#define IRTE_DEST(d)   ((uint64_t)(d) << 40) /* xAPIC: 8 bits */
 #define IRTE_SID(sid, svt) ((uint64_t)(sid) | (uint64_t)(svt) << 18) /* SVT 1: the ID, 2: a bus range */
 /* an IOAPIC entry in remappable format */
 #define RTE_KEPT (0xFFull | 1ull << 13 | 1ull << 15 | 1ull << 16) /* vector, polarity, trigger, mask */
@@ -114,18 +121,21 @@ struct unit {
     uint64_t pass;  /* the context table of every bus without a claimed function */
     uint64_t queue; /* invalidation queue: 256 descriptors */
     uint32_t tail;
+    bool lost;      /* a descriptor since the last sync was not done: that sync fails */
 };
-static struct unit units[MAX_UNITS];
-static unsigned nunits;
-static struct {
-    uint8_t id;
-    uint16_t sid;
-} ioapics[MAX_IOAPICS]; /* the requester IDs the IOAPICs send with */
-static unsigned nioapics;
+static struct unit *units;
+static size_t nunits, units_room;
+static struct ioapic_scope {
+    uint8_t id;   /* the MADT's */
+    uint16_t sid; /* the requester ID it sends with */
+} *ioapics;
+static size_t nioapics, ioapics_room;
 static uint8_t dmar_flags;
-static bool remap, caching_mode, write_buffers;
+static bool remap, x2, caching_mode, write_buffers, parse_lost;
+static unsigned iec_mask = 15; /* the largest IEC invalidation mask every unit takes (MHMV) */
 static struct iommu_domain *identity; /* units without pass-through */
 static uint64_t sems, irt;
+static size_t sem_pages;
 static uint32_t token;
 static int fault_vector = -1;
 static const struct pci_device *msi_owner[MSI_BLOCKS];
@@ -160,27 +170,55 @@ static void scopes(const uint8_t *b, unsigned at, unsigned end, void (*each)(con
     for (; at + 6 <= end && b[at + 1] >= 6 && at + b[at + 1] <= end; at += b[at + 1]) {
         int id = scope_id(b + at);
         if (id >= 0) each(b + at, id, arg);
+        else kprintf("iommu: a DMAR device scope leads through a bridge that is not there; ignored\n");
     }
 }
 
-static void ioapic_scope(const uint8_t *s, int id, void *arg) {
+/* The buses below a bridge with this ID, as its registers say. */
+static void bridge_buses(int id, uint16_t *first, uint16_t *last) {
+    uint32_t r = pci_read32((uint8_t)(id >> 8), (id >> 3) & 31, id & 7, 0x18);
+    *first = (uint16_t)((r >> 8 & 0xFF) << 8);
+    *last = (uint16_t)((r >> 16 & 0xFF) << 8 | 0xFF);
+}
+
+/* DRHD scopes (8.3.1): an endpoint, a bridge with everything below it, an IOAPIC (its
+   enumeration ID is the MADT's), an HPET that sends MSIs, an ACPI device. */
+static void drhd_scope(const uint8_t *s, int id, void *arg) {
     (void)arg;
-    if (s[0] == 3 && nioapics < MAX_IOAPICS) {
-        ioapics[nioapics].id = s[4];
-        ioapics[nioapics++].sid = (uint16_t)id;
+    uint16_t first, last;
+    switch (s[0]) {
+    case 1: iommu_cover((uint16_t)id, (uint16_t)id); break;
+    case 2:
+        iommu_cover((uint16_t)id, (uint16_t)id);
+        bridge_buses(id, &first, &last);
+        iommu_cover(first, last);
+        break;
+    case 3: {
+        iommu_kernel_id((uint16_t)id);
+        struct ioapic_scope *grown = kgrow(ioapics, nioapics, &ioapics_room, sizeof *grown);
+        if (!grown) {
+            parse_lost = true;
+            break;
+        }
+        ioapics = grown;
+        ioapics[nioapics++] = (struct ioapic_scope){s[4], (uint16_t)id};
+        break;
+    }
+    case 4: iommu_kernel_id((uint16_t)id); break;
     }
 }
 
 /* RMRR: memory the functions in its scopes reach by DMA from the firmware's start (a USB
-   controller's legacy emulation, a graphics device's stolen memory). A bridge's scope is
-   everything below it too. */
+   controller's legacy emulation, a graphics device's stolen memory), to be mapped for reading
+   and writing. A bridge's scope is everything below it too. */
 static void rmrr_scope(const uint8_t *s, int id, void *arg) {
     const uint64_t *range = arg;
+    uint16_t first, last;
     if (s[0] != 1 && s[0] != 2) return;
-    iommu_reserved((uint16_t)id, (uint16_t)id, range[0], range[1]);
+    iommu_reserved((uint16_t)id, (uint16_t)id, range[0], range[1], IOMMU_READ | IOMMU_WRITE);
     if (s[0] == 2) {
-        uint32_t r = pci_read32((uint8_t)(id >> 8), (id >> 3) & 31, id & 7, 0x18);
-        iommu_reserved((uint16_t)((r >> 8 & 0xFF) << 8), (uint16_t)((r >> 16 & 0xFF) << 8 | 0xFF), range[0], range[1]);
+        bridge_buses(id, &first, &last);
+        iommu_reserved(first, last, range[0], range[1], IOMMU_READ | IOMMU_WRITE);
     }
 }
 
@@ -198,10 +236,20 @@ static bool parse_dmar(void) {
             if (u16(b + off + 6) != 0) {
                 kprintf("iommu: VT-d unit at %lx is on PCI segment %u, which Nocturne does not reach\n", base,
                         u16(b + off + 6));
-            } else if (base && nunits < MAX_UNITS) {
-                units[nunits].base = base;
-                units[nunits++].pages = 1u << (b[off + 5] & 15);
-                scopes(b, off + 16, off + len, ioapic_scope, NULL);
+            } else if (!base) {
+                kprintf("iommu: the DMAR describes a VT-d unit without an address; not used\n");
+            } else {
+                struct unit *grown = kgrow(units, nunits, &units_room, sizeof *grown);
+                if (!grown) {
+                    parse_lost = true;
+                } else {
+                    units = grown;
+                    memset(&units[nunits], 0, sizeof *units);
+                    units[nunits].base = base;
+                    units[nunits++].pages = 1u << (b[off + 5] & 15);
+                    if (b[off + 4] & 1) iommu_cover(0, 0xFFFF); /* INCLUDE_PCI_ALL: what no other unit has */
+                    scopes(b, off + 16, off + len, drhd_scope, NULL);
+                }
             }
         } else if (type == 1 && len >= 24 && u16(b + off + 6) == 0) { /* RMRR */
             uint64_t limit;
@@ -215,25 +263,60 @@ static bool parse_dmar(void) {
     return nunits != 0;
 }
 
+/* Every IOAPIC of the MADT in the scope of exactly one unit (8.3.1.1): the source check of its
+   pins' entries needs the ID it sends with. */
+static bool ioapics_described(void) {
+    unsigned n;
+    const struct acpi_ioapic *a = acpi_ioapics(&n);
+    for (unsigned i = 0; i < n; i++) {
+        unsigned found = 0;
+        for (size_t k = 0; k < nioapics; k++) found += ioapics[k].id == a[i].id;
+        if (found != 1) {
+            kprintf("iommu: the DMAR names IOAPIC %u %s\n", a[i].id, found ? "more than once" : "under no unit");
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ---- commands ---- */
+static const char *command_name(uint32_t bit) {
+    switch (bit) {
+    case GCMD_TE: return "translation (TE)";
+    case GCMD_SRTP: return "its root table pointer (SRTP)";
+    case GCMD_QIE: return "its invalidation queue (QIE)";
+    case GCMD_IRE: return "interrupt remapping (IRE)";
+    case GCMD_SIRTP: return "its remapping table pointer (SIRTP)";
+    case GCMD_CFI: return "compatibility-format interrupts (CFI)";
+    default: return "a global command";
+    }
+}
+
 static bool command(struct unit *u, uint32_t bit, bool on) {
     uint32_t sts = rd32(u, R_GSTS) & ~GSTS_ONESHOT;
     wr32(u, R_GCMD, on ? sts | bit : sts & ~bit);
     for (uint64_t t = iommu_deadline(100); !(rd32(u, R_GSTS) & bit) == on; pause())
         if (iommu_expired(t)) {
-            kprintf("iommu: VT-d unit at %lx did not %s %08x\n", u->base, on ? "set" : "clear", bit);
+            kprintf("iommu: VT-d unit at %lx did not %s %s\n", u->base,
+                    bit & GSTS_ONESHOT ? "take" : on ? "turn on" : "turn off", command_name(bit));
             return false;
         }
     return true;
 }
 
+/* After tables changed, before the invalidations: units that buffer their writes write them. */
 static void write_buffers_flush(void) {
     if (!write_buffers) return;
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
         if (!(u->cap & CAP_RWBF)) continue;
         wr32(u, R_GCMD, (rd32(u, R_GSTS) & ~GSTS_ONESHOT) | GCMD_WBF);
-        for (uint64_t t = iommu_deadline(100); rd32(u, R_GSTS) & GCMD_WBF && !iommu_expired(t);) pause();
+        for (uint64_t t = iommu_deadline(100); rd32(u, R_GSTS) & GCMD_WBF; pause())
+            if (iommu_expired(t)) {
+                kprintf("iommu: VT-d unit at %lx did not flush its write buffers\n", u->base);
+                u->lost = true;
+                break;
+            }
     }
 }
 
@@ -244,21 +327,55 @@ static bool queue_start(struct unit *u) {
     return command(u, GCMD_QIE, true);
 }
 
-static bool submit(struct unit *u, uint64_t lo, uint64_t hi) {
-    uint32_t next = (u->tail + 16) % PAGE_SIZE;
-    for (uint64_t t = iommu_deadline(100); (rd64(u, R_IQH) & 0x7FFF0) == next; pause())
-        if (iommu_expired(t)) return false;
+/* A unit that rejected a descriptor fetches none until it is told (6.5.2.11): its queue starts
+   again, empty, and what it had not done is lost. */
+static void queue_restart(struct unit *u) {
+    kprintf("iommu: VT-d unit at %lx rejected a command; its queue started again\n", u->base);
+    command(u, GCMD_QIE, false); /* also sets its head to 0 */
+    wr32(u, R_FSTS, FSTS_IQE);
+    queue_start(u);
+    u->lost = true;
+}
+
+/* A descriptor for one unit: one it has no room for in time is lost (u->lost). IOTLB
+   invalidations ask for the draining a version 1 unit does only when asked (6.5.4). */
+static void submit(struct unit *u, uint64_t lo, uint64_t hi) {
+    if ((lo & 0xF) == 2) lo |= (u->cap & CAP_DRD ? INV_IOTLB_DR : 0) | (u->cap & CAP_DWD ? INV_IOTLB_DW : 0);
+    for (uint64_t t = iommu_deadline(100); (rd64(u, R_IQH) & 0x7FFF0) == (u->tail + 16) % PAGE_SIZE; pause()) {
+        if (rd32(u, R_FSTS) & FSTS_IQE) {
+            queue_restart(u);
+            break;
+        }
+        if (iommu_expired(t)) {
+            u->lost = true;
+            return;
+        }
+    }
     volatile uint64_t *slot = (volatile uint64_t *)((uint8_t *)phys_to_virt(u->queue) + u->tail);
     slot[0] = lo;
     slot[1] = hi;
     if (!intel.coherent) iommu_cache_flush(slot, 16);
-    u->tail = next;
-    wr64(u, R_IQT, next);
-    return true;
+    u->tail = (u->tail + 16) % PAGE_SIZE;
+    wr64(u, R_IQT, u->tail);
 }
 
 static void send(uint64_t lo) {
-    for (unsigned i = 0; i < nunits; i++) submit(&units[i], lo, 0);
+    for (size_t i = 0; i < nunits; i++) submit(&units[i], lo, 0);
+}
+
+/* Interrupt entries first..first + 2^log2 - 1 (first aligned to that), in descriptors whose
+   mask every unit takes. */
+static void send_iec(unsigned first, unsigned log2) {
+    unsigned mask = log2 < iec_mask ? log2 : iec_mask;
+    for (unsigned at = first; at < first + (1u << log2); at += 1u << mask) send(INV_IEC(at, mask));
+}
+
+/* A change of root or context entries: the context caches, then the IOTLBs, both whole (6.5.2.1:
+   a global context invalidation is followed by a global IOTLB one). */
+static void send_context_flush(void) {
+    write_buffers_flush();
+    send(INV_CONTEXT_GLOBAL);
+    send(INV_IOTLB_GLOBAL);
 }
 
 static void fault_show(const struct unit *u, uint64_t lo, uint64_t hi) {
@@ -290,38 +407,35 @@ static void faults_drain(struct unit *u) {
 
 static void fault_isr(struct regs *r) {
     (void)r;
-    for (unsigned i = 0; i < nunits; i++) faults_drain(&units[i]);
+    for (size_t i = 0; i < nunits; i++) faults_drain(&units[i]);
 }
 
-/* Waits until every unit has done every command sent before. A unit that rejected one has its
-   queue started again, empty. */
+/* Waits until every unit has done every descriptor sent since the last sync: false when one
+   was lost or rejected, or a unit did not finish them in time. */
 static bool sync(void) {
     volatile uint32_t *word = phys_to_virt(sems);
     if (!++token) token++;
-    bool ok = true;
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         word[i] = 0;
-        ok &= submit(&units[i], INV_WAIT(token), sems + i * 4);
+        submit(&units[i], INV_WAIT(token), sems + i * 4);
     }
-    for (unsigned i = 0; ok && i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
-        for (uint64_t t = iommu_deadline(100); word[i] != token; pause()) {
+        for (uint64_t t = iommu_deadline(100); !u->lost && word[i] != token; pause()) {
             if (rd32(u, R_FSTS) & FSTS_IQE) {
-                kprintf("iommu: VT-d unit at %lx rejected a command\n", u->base);
-                command(u, GCMD_QIE, false);
-                wr32(u, R_FSTS, FSTS_IQE);
-                queue_start(u);
-                ok = false;
-                break;
-            }
-            if (iommu_expired(t)) {
+                queue_restart(u);
+            } else if (iommu_expired(t)) {
                 kprintf("iommu: VT-d unit at %lx did not finish its commands\n", u->base);
-                ok = false;
-                break;
+                u->lost = true;
             }
         }
     }
-    for (unsigned i = 0; i < nunits; i++) faults_drain(&units[i]);
+    bool ok = true;
+    for (size_t i = 0; i < nunits; i++) {
+        faults_drain(&units[i]);
+        ok &= !units[i].lost;
+        units[i].lost = false;
+    }
     return ok;
 }
 
@@ -357,7 +471,7 @@ static void context_write(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
 }
 
 static void contexts_write(const struct iommu_domain *dom, uint64_t lo, uint64_t hi) {
-    for (unsigned i = 0; i < nunits; i++)
+    for (size_t i = 0; i < nunits; i++)
         for (unsigned n = 0; n < dom->nids; n++) context_write(context_entry(&units[i], dom->ids[n], false), lo, hi);
 }
 
@@ -370,18 +484,26 @@ static void irte_write(unsigned index, uint64_t lo, uint64_t hi) {
     if (!intel.coherent) iommu_cache_flush(e, 16);
 }
 
+/* The destination field (9.9): an xAPIC id in bits 47:40, or an x2APIC one in 63:32. */
+static uint64_t irte_dest(uint32_t dest) { return x2 ? (uint64_t)dest << 32 : (uint64_t)(dest & 0xFF) << 40; }
+
 /* What an entry checks the sender against: d's requester ID, or the buses of its IDs when a
-   bridge sends its requests as its own. */
+   bridge sends its requests as its own. 0 without memory. */
 static uint64_t irte_source(const struct pci_device *d) {
-    uint16_t ids[IOMMU_IDS];
-    unsigned n = iommu_requester_ids(d, ids);
-    if (n == 1) return IRTE_SID(ids[0], 1);
-    uint8_t first = 0xFF, last = 0;
-    for (unsigned i = 0; i < n; i++) {
-        if (ids[i] >> 8 < first) first = ids[i] >> 8;
-        if (ids[i] >> 8 > last) last = ids[i] >> 8;
+    unsigned n;
+    uint16_t *ids = iommu_requester_ids(d, &n);
+    if (!ids) return 0;
+    uint64_t source = IRTE_SID(ids[0], 1);
+    if (n > 1) {
+        uint8_t first = 0xFF, last = 0;
+        for (unsigned i = 0; i < n; i++) {
+            if (ids[i] >> 8 < first) first = ids[i] >> 8;
+            if (ids[i] >> 8 > last) last = ids[i] >> 8;
+        }
+        source = IRTE_SID((uint16_t)(first << 8 | last), 2);
     }
-    return n ? IRTE_SID((uint16_t)(first << 8 | last), 2) : 0;
+    kfree(ids);
+    return source;
 }
 
 static int msi_block(const struct pci_device *d, bool create) {
@@ -405,7 +527,7 @@ static bool msi_release(const struct pci_device *d) {
     unsigned first = IOAPIC_ENTRIES + (unsigned)b * MSI_BLOCK;
     for (unsigned i = 0; i < MSI_BLOCK; i++) irte_write(first + i, 0, 0);
     uint64_t f = irq_save();
-    send(INV_IEC(first, MSI_BLOCK_LOG2));
+    send_iec(first, MSI_BLOCK_LOG2);
     bool ok = sync();
     irq_restore(f);
     if (ok) msi_owner[b] = NULL; /* else kept: an entry may still be cached */
@@ -423,12 +545,12 @@ static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint
         return true;
     }
     int b = msi_block(d, true);
-    if (b < 0 || index + count > MSI_BLOCK) return false;
+    uint64_t source = b < 0 ? 0 : irte_source(d);
+    if (!source || index + count > MSI_BLOCK) return false;
     unsigned first = IOAPIC_ENTRIES + (unsigned)b * MSI_BLOCK, at = first + index;
-    uint64_t source = irte_source(d);
-    for (unsigned i = 0; i < count; i++) irte_write(at + i, IRTE_P | IRTE_VECTOR(vector + i) | IRTE_DEST(dest), source);
+    for (unsigned i = 0; i < count; i++) irte_write(at + i, IRTE_P | IRTE_VECTOR(vector + i) | irte_dest(dest), source);
     uint64_t f = irq_save();
-    send(INV_IEC(first, MSI_BLOCK_LOG2));
+    send_iec(first, MSI_BLOCK_LOG2);
     bool ok = sync();
     irq_restore(f);
     *address = 0xFEE00000u | (at & 0x7FFF) << 5 | 1u << 4 | 1u << 3 | (at >> 15 & 1) << 2; /* remappable, SHV */
@@ -436,29 +558,36 @@ static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint
     return ok;
 }
 
-static void intel_msi_clear(struct pci_device *d) {
-    if (remap) msi_release(d);
-}
+static bool intel_msi_clear(struct pci_device *d) { return !remap || msi_release(d); }
 
 /* Pin `gsi` is entry gsi; the IRTE takes what the plain entry said (delivery mode, logical
    destination, trigger, vector, 8-bit destination), the pin keeps polarity, trigger, vector
    (for the EOI of a level pin) and mask, with delivery mode 000. */
-static uint64_t intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t rte) {
-    if (!remap) return rte;
+static bool intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
+    if (!remap) return true;
     if (gsi >= IOAPIC_ENTRIES) {
         kprintf("iommu: GSI %u is beyond the IOAPIC entries: left masked\n", gsi);
-        return rte | 1ull << 16;
+        return false;
     }
-    uint64_t source = 0;
-    for (unsigned i = 0; i < nioapics; i++)
+    uint64_t source = 0, v = *rte;
+    for (size_t i = 0; i < nioapics; i++)
         if (ioapics[i].id == ioapic_id) source = IRTE_SID(ioapics[i].sid, 1);
-    irte_write(gsi, IRTE_P | (rte >> 11 & 1 ? IRTE_DM : 0) | (rte >> 15 & 1 ? IRTE_TM : 0) |
-                        IRTE_DLM(rte >> 8 & 7) | IRTE_VECTOR(rte) | IRTE_DEST(rte >> 56), source);
+    if (!source) {
+        kprintf("iommu: IOAPIC %u is under no VT-d unit: GSI %u left masked\n", ioapic_id, gsi);
+        return false;
+    }
+    irte_write(gsi, IRTE_P | (v >> 11 & 1 ? IRTE_DM : 0) | (v >> 15 & 1 ? IRTE_TM : 0) | IRTE_DLM(v >> 8 & 7) |
+                        IRTE_VECTOR(v) | irte_dest((uint32_t)(v >> 56)), source);
     uint64_t f = irq_save();
-    send(INV_IEC(gsi, 0));
-    sync();
+    send_iec(gsi, 0);
+    bool ok = sync();
     irq_restore(f);
-    return (rte & RTE_KEPT) | RTE_REMAPPABLE | (uint64_t)(gsi & 0x7FFF) << 49 | (uint64_t)(gsi >> 15 & 1) << 11;
+    if (!ok) {
+        kprintf("iommu: the units did not confirm the entry of GSI %u: left masked\n", gsi);
+        return false;
+    }
+    *rte = (v & RTE_KEPT) | RTE_REMAPPABLE | (uint64_t)(gsi & 0x7FFF) << 49 | (uint64_t)(gsi >> 15 & 1) << 11;
+    return true;
 }
 
 /* ---- domains ---- */
@@ -466,34 +595,38 @@ static uint64_t intel_table(uint64_t phys, unsigned level) {
     (void)level;
     return phys | SL_R | SL_W;
 }
-static uint64_t intel_leaf(uint64_t phys, unsigned level) { return phys | SL_R | SL_W | (level > 1 ? SL_PS : 0); }
+static uint64_t intel_leaf(uint64_t phys, unsigned level, unsigned access) {
+    return phys | (access & IOMMU_READ ? SL_R : 0) | (access & IOMMU_WRITE ? SL_W : 0) | (level > 1 ? SL_PS : 0);
+}
 
 /* A present context entry does not change in place: it goes not present, the caches drop it,
    then it comes back pointing at the domain. */
 static bool intel_attach(struct iommu_domain *dom) {
-    for (unsigned i = 0; i < nunits; i++) /* memory first: nothing changes when there is none */
+    for (size_t i = 0; i < nunits; i++) /* memory first: nothing changes for the group when there is none */
         for (unsigned n = 0; n < dom->nids; n++)
-            if (!context_entry(&units[i], dom->ids[n], true)) return false;
+            if (!context_entry(&units[i], dom->ids[n], true)) {
+                kprintf("iommu: no memory for a context table\n");
+                return false;
+            }
     uint64_t f = irq_save();
+    dom->written = true;
     contexts_write(dom, 0, 0);
-    send(INV_CONTEXT_GLOBAL);
-    send(INV_IOTLB_DOMAIN(PASS_DOMAIN));
-    sync();
-    write_buffers_flush();
-    contexts_write(dom, CTX_P | dom->root, (uint64_t)(dom->levels - 2) | (uint64_t)dom->id << 8);
-    send(INV_CONTEXT_GLOBAL);
-    send(INV_IOTLB_DOMAIN(dom->id));
-    sync();
+    send_context_flush();
+    bool ok = sync();
+    if (ok) {
+        contexts_write(dom, CTX_P | dom->root, (uint64_t)(dom->levels - 2) | (uint64_t)dom->id << 8);
+        send_context_flush();
+        ok = sync();
+    }
     irq_restore(f);
-    return true;
+    return ok;
 }
 
 static bool intel_block(struct iommu_domain *dom) {
     bool ok = !remap || msi_release(dom->d);
     uint64_t f = irq_save();
     contexts_write(dom, 0, 0);
-    send(INV_CONTEXT_GLOBAL);
-    send(INV_IOTLB_DOMAIN(dom->id));
+    send_context_flush();
     ok &= sync();
     irq_restore(f);
     return ok;
@@ -510,12 +643,21 @@ static bool intel_flush(struct iommu_domain *dom, bool unmapped) {
 }
 
 /* ---- the units ---- */
-static void unit_off(struct unit *u) {
+/* Translation, interrupt remapping and the queue off (the queue once it went quiet, 6.5.2),
+   fault events masked: false when the unit did not confirm one. */
+static bool unit_off(struct unit *u) {
     uint32_t sts = rd32(u, R_GSTS);
-    if (sts & GCMD_TE) command(u, GCMD_TE, false);
-    if (sts & GCMD_IRE) command(u, GCMD_IRE, false);
-    if (sts & GCMD_QIE) command(u, GCMD_QIE, false);
+    bool ok = true;
+    if (sts & GCMD_TE) ok &= command(u, GCMD_TE, false);
+    if (sts & GCMD_IRE) ok &= command(u, GCMD_IRE, false);
+    if (sts & GCMD_QIE) {
+        for (uint64_t t = iommu_deadline(10);
+             !(rd32(u, R_FSTS) & FSTS_IQE) && (rd64(u, R_IQH) & 0x7FFF0) != (rd64(u, R_IQT) & 0x7FFF0); pause())
+            if (iommu_expired(t)) break;
+        ok &= command(u, GCMD_QIE, false);
+    }
     wr32(u, R_FECTL, FECTL_IM);
+    return ok;
 }
 
 static bool unit_tables(struct unit *u, uint32_t bsp) {
@@ -529,38 +671,48 @@ static bool unit_tables(struct unit *u, uint32_t bsp) {
         wr32(u, R_FECTL, 0);
     }
     if (ok && remap) {
-        wr64(u, R_IRTA, irt | IRT_S); /* xAPIC destinations */
+        wr64(u, R_IRTA, irt | (x2 ? IRTA_EIME : 0) | IRT_S);
         ok = command(u, GCMD_SIRTP, true);
     }
     return ok;
 }
 
 /* cfi: compatibility-format interrupts still pass, until the IOAPIC entries are remappable. A
-   unit that does not take CFI blocks (and records) a pin that fires in between; remapping goes on. */
+   unit that does not take CFI blocks (and records) a pin that fires in between; remapping goes
+   on. In Extended Interrupt Mode they are blocked from the start (5.1.4): at boot only the
+   firmware's ExtINT pin is unmasked. */
 static bool units_on(bool cfi) {
     bool ok = true;
     uint32_t bsp = lapic_current_id();
-    for (unsigned i = 0; i < nunits; i++) ok &= unit_tables(&units[i], bsp);
+    write_buffers_flush();
+    for (size_t i = 0; i < nunits; i++) ok &= unit_tables(&units[i], bsp);
     if (!ok) return false;
     send(INV_CONTEXT_GLOBAL);
     send(INV_IOTLB_GLOBAL);
     if (remap) send(INV_IEC_GLOBAL);
     ok = sync();
-    for (unsigned i = 0; ok && i < nunits; i++) {
+    for (size_t i = 0; ok && i < nunits; i++) {
         struct unit *u = &units[i];
-        if (remap && cfi) command(u, GCMD_CFI, true);
+        if (remap && cfi && !x2 && !command(u, GCMD_CFI, true))
+            kprintf("iommu: VT-d unit at %lx blocks the IOAPIC pins until they are remappable\n", u->base);
         if (remap) ok = command(u, GCMD_IRE, true);
         ok = ok && command(u, GCMD_TE, true);
-        if (ok && u->cap & (CAP_PLMR | CAP_PHMR) && rd32(u, R_PMEN) & PMEN_EPM) { /* the firmware's protected ranges */
-            wr32(u, R_PMEN, 0);
-            for (uint64_t t = iommu_deadline(100); rd32(u, R_PMEN) & PMEN_PRS && !iommu_expired(t);) pause();
+        uint32_t pmen = rd32(u, R_PMEN);
+        if (ok && u->cap & (CAP_PLMR | CAP_PHMR) && pmen & PMEN_EPM) { /* the firmware's protected ranges */
+            wr32(u, R_PMEN, pmen & ~PMEN_EPM);
+            for (uint64_t t = iommu_deadline(100); rd32(u, R_PMEN) & PMEN_PRS; pause())
+                if (iommu_expired(t)) {
+                    kprintf("iommu: VT-d unit at %lx did not confirm its protected memory ranges off\n", u->base);
+                    break;
+                }
         }
     }
     return ok;
 }
 
 static void intel_shutdown(void) {
-    for (unsigned i = 0; i < nunits; i++) unit_off(&units[i]);
+    for (size_t i = 0; i < nunits; i++)
+        if (!unit_off(&units[i])) kprintf("iommu: VT-d unit at %lx did not turn off\n", units[i].base);
 }
 
 static void intel_resume(void) {
@@ -568,9 +720,9 @@ static void intel_resume(void) {
 }
 
 static void tables_free(void) {
-    if (sems) pmm_free(sems);
+    for (size_t p = 0; sems && p < sem_pages; p++) pmm_free(sems + p * PAGE_SIZE);
     for (unsigned at = 0; irt && at < IRT_ENTRIES * 16; at += PAGE_SIZE) pmm_free(irt + at);
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         if (units[i].root) pmm_free(units[i].root);
         if (units[i].pass) pmm_free(units[i].pass);
         if (units[i].queue) pmm_free(units[i].queue);
@@ -579,10 +731,11 @@ static void tables_free(void) {
 }
 
 static bool intel_start(void) {
-    sems = pmm_alloc_zeroed();
+    sem_pages = ALIGN_UP(nunits * 4, PAGE_SIZE) / PAGE_SIZE;
+    sems = pmm_alloc_contig(sem_pages);
     irt = remap ? pmm_alloc_contig(IRT_ENTRIES * 16 / PAGE_SIZE) : 0;
     bool ok = sems && (irt || !remap), pass_all = true;
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         units[i].root = pmm_alloc_zeroed();
         units[i].pass = pmm_alloc_zeroed();
         units[i].queue = pmm_alloc_zeroed();
@@ -591,7 +744,7 @@ static bool intel_start(void) {
     }
     if (ok && !pass_all) { /* all of RAM and the space below 4 GiB, in the largest pages every unit has */
         unsigned sllps = 0xF;
-        for (unsigned i = 0; i < nunits; i++) sllps &= CAP_SSLPS(units[i].cap);
+        for (size_t i = 0; i < nunits; i++) sllps &= CAP_SSLPS(units[i].cap);
         identity = iommu_domain_new(intel.levels, sllps & 2 ? 3 : sllps & 1 ? 2 : 1);
         uint64_t top = ALIGN_UP(pmm_highest_usable > (4ull << 30) ? pmm_highest_usable : 4ull << 30, 1ull << 30);
         ok = identity && iommu_map(identity, NULL, 0, top / PAGE_SIZE);
@@ -601,8 +754,9 @@ static bool intel_start(void) {
         tables_free();
         return false;
     }
+    memset(phys_to_virt(sems), 0, sem_pages * PAGE_SIZE);
     if (remap) memset(phys_to_virt(irt), 0, IRT_ENTRIES * 16);
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
         uint64_t *pass = phys_to_virt(u->pass), *root = phys_to_virt(u->root);
         for (unsigned e = 0; e < 256; e++) {
@@ -621,17 +775,19 @@ static bool intel_start(void) {
     ok = units_on(true);
     if (ok && remap) {
         ioapic_remap();
-        for (unsigned i = 0; i < nunits; i++) ok &= command(&units[i], GCMD_CFI, false);
+        for (size_t i = 0; !x2 && i < nunits; i++)
+            if (!command(&units[i], GCMD_CFI, false))
+                kprintf("iommu: VT-d unit at %lx still passes compatibility-format interrupts\n", units[i].base);
     }
     irq_restore(f);
     if (!ok) {
         intel_shutdown();
         return false; /* the tables stay: a unit may still read them */
     }
-    kprintf("iommu: VT-d on, %u unit%s, %u-level tables%s, interrupt remapping %s, %u reserved range%s: every "
-            "function passes through until an app claims it\n", nunits, nunits == 1 ? "" : "s", intel.levels,
-            pass_all ? "" : " (identity domain for units without pass-through)",
-            remap ? "on" : dmar_flags & 1 ? "missing on a unit" : "not offered by the firmware",
+    kprintf("iommu: VT-d on, %lu unit%s, %u-level tables%s, interrupt remapping %s, %u reserved range%s: every "
+            "function passes through until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s",
+            intel.levels, pass_all ? "" : " (identity domain for units without pass-through)",
+            remap ? (x2 ? "on (x2APIC format)" : "on") : dmar_flags & 1 ? "not possible on these units" : "not offered by the firmware",
             iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s");
     if (!remap) kprintf("iommu: interrupts are not remapped: a device given to an app can send any vector\n");
     return true;
@@ -654,17 +810,27 @@ static struct iommu_hw intel = {
 
 const struct iommu_hw *iommu_intel_probe(void) {
     if (!parse_dmar()) return NULL;
+    if (parse_lost) {
+        kprintf("iommu: no memory to keep the DMAR: VT-d not used\n");
+        return NULL;
+    }
     unsigned sagaw = 0x1F, domains = 1u << 16;
-    bool qi = true;
+    bool qi = true, eim = true, eimer = false, irreq = false;
     intel.coherent = true;
     remap = (dmar_flags & 1) != 0;
-    for (unsigned i = 0; i < nunits; i++) {
+    for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
-        u->regs = vmm_map_mmio(u->base, (uint64_t)u->pages * PAGE_SIZE);
+        if (!(u->regs = vmm_map_mmio(u->base, (uint64_t)u->pages * PAGE_SIZE))) {
+            kprintf("iommu: the registers of the VT-d unit at %lx cannot be mapped: VT-d not used\n", u->base);
+            return NULL;
+        }
         u->cap = rd64(u, R_CAP);
         u->ecap = rd64(u, R_ECAP);
         uint64_t need = ALIGN_UP(CAP_FRO(u->cap) + CAP_NFR(u->cap) * 16, PAGE_SIZE);
-        if (need > (uint64_t)u->pages * PAGE_SIZE) u->regs = vmm_map_mmio(u->base, need);
+        if (need > (uint64_t)u->pages * PAGE_SIZE && !(u->regs = vmm_map_mmio(u->base, need))) {
+            kprintf("iommu: the fault records of the VT-d unit at %lx cannot be mapped: VT-d not used\n", u->base);
+            return NULL;
+        }
         uint32_t ver = rd32(u, R_VER);
         kprintf("iommu: VT-d unit at %lx, version %u.%u, capabilities %lx, extended %lx\n", u->base, ver >> 4 & 15,
                 ver & 15, u->cap, u->ecap);
@@ -672,6 +838,10 @@ const struct iommu_hw *iommu_intel_probe(void) {
         if (1u << (4 + 2 * CAP_ND(u->cap)) < domains) domains = 1u << (4 + 2 * CAP_ND(u->cap));
         qi &= (u->ecap & ECAP_QI) != 0;
         remap &= (u->ecap & ECAP_IR) != 0;
+        eim &= (u->ecap & ECAP_EIM) != 0;
+        eimer |= (u->ecap & ECAP_EIMER) != 0;
+        irreq |= (u->ecap & ECAP_IRREQ) != 0;
+        if (ECAP_MHMV(u->ecap) < iec_mask) iec_mask = ECAP_MHMV(u->ecap);
         intel.coherent &= (u->ecap & ECAP_C) != 0;
         caching_mode |= (u->cap & CAP_CM) != 0;
         write_buffers |= (u->cap & CAP_RWBF) != 0;
@@ -680,12 +850,29 @@ const struct iommu_hw *iommu_intel_probe(void) {
     bool fits39 = pmm_highest_usable <= 1ull << 39;
     intel.levels = sagaw & 4 ? 4 : sagaw & 2 && fits39 ? 3 : sagaw & 8 ? 5 : 0;
     intel.domains = domains > 0xFFFF ? 0xFFFF : (uint16_t)domains;
+    if (remap && !ioapics_described()) {
+        kprintf("iommu: the IOAPICs' requester IDs are not known: interrupts are not remapped\n");
+        remap = false;
+    }
+    /* A unit that requires Extended Interrupt Mode blocks every interrupt without it (5.1.4),
+       and takes it with the CPUs in x2APIC mode only (5.1.6). */
+    if (remap && eimer && (!eim || !lapic_x2apic())) {
+        kprintf("iommu: a VT-d unit remaps interrupts in x2APIC format only, which %s: interrupts are not remapped\n",
+                eim ? "the CPUs do not use" : "another unit lacks");
+        remap = false;
+    }
+    x2 = remap && eimer;
     if (!qi) {
         kprintf("iommu: a VT-d unit has no invalidation queue: VT-d not used\n");
         return NULL;
     }
     if (!intel.levels) {
         kprintf("iommu: the VT-d units share no page table format: VT-d not used\n");
+        return NULL;
+    }
+    /* such a unit blocks every interrupt while remapping is off: left as the firmware set it */
+    if (irreq && !remap) {
+        kprintf("iommu: a VT-d unit requires interrupt remapping, which these units cannot give: VT-d not used\n");
         return NULL;
     }
     return &intel;
