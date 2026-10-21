@@ -49,6 +49,8 @@ NORETURN void panic(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void klog_write(const char *s, size_t n);
 /* true if the kernel command line contains this exact word (init.c) */
 bool cmdline_has(const char *word);
+/* key=<decimal> on the kernel command line: the last well-formed one (init.c) */
+bool cmdline_number(const char *key, uint64_t *out);
 size_t klog_read(char *buf, size_t max);
 
 #define ASSERT(x) do { if (!(x)) panic("assertion failed: %s (%s:%d)", #x, __FILE__, __LINE__); } while (0)

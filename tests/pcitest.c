@@ -197,6 +197,72 @@ static void composition_cases(const char *program) {
     if(exported>=0)n_handle_close(exported);if(ro>=0)n_handle_close(ro);
     if(slice>=0)n_handle_close(slice);if(joined>=0)n_handle_close(joined);
 }
+/* QEMU's standard VGA (1234:1111, -vga std) draws the boot screen through its prefetchable BAR 0.
+   The screen's pages are write-combined for as long as the system runs, and any device page has
+   one memory type while something maps it. A driver may hold the screen while it rebuilds how
+   the CPU reaches it; the claim's end gives back what it still holds. */
+static void screen_cases(const struct n_pciinfo *list, int n) {
+    int at = -1;
+    for (int i = 0; i < n; i++)
+        if (list[i].vendor == 0x1234 && list[i].device == 0x1111) at = i;
+    if (at < 0) {
+        printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
+        failed++;
+        return;
+    }
+    n_handle vga = n_pci_claim(list[at].bus, list[at].dev, list[at].func);
+    CHECK(vga >= 0, "claim the VGA: %s", n_result_text(vga));
+    if (vga < 0) return;
+    struct n_pci_function info;
+    CHECK(n_pci_info(vga, &info) == 0, "VGA info");
+    CHECK(info.framebuffer_bar == 0 && (info.bar[0].flags & N_PCI_BAR_PREFETCH), "the screen is in prefetchable BAR 0: %u %x",
+          info.framebuffer_bar, info.bar[0].flags);
+    uint64_t screen = (info.framebuffer_address - info.bar[0].address) & ~4095ull;
+    uint64_t past = (info.framebuffer_address - info.bar[0].address + info.framebuffer_size + 4095) & ~4095ull;
+    n_handle bar = n_pci_bar(vga, 0);
+    CHECK(bar >= 0, "VGA BAR: %s", n_result_text(bar));
+    if (bar >= 0 && info.framebuffer_bar == 0) {
+        n_handle uc = n_shared_view(bar, screen, 4096, N_CACHE_UNCACHED);
+        CHECK(uc >= 0 && !n_shared_map(uc, 4096, N_MEMORY_READ) && errno == N_ERR_DENIED,
+              "an uncached mapping of the write-combined screen is refused");
+        n_handle wc = n_shared_view(bar, screen, 4096, N_CACHE_WRITE_COMBINE);
+        void *wc_map = wc >= 0 ? n_shared_map(wc, 4096, N_MEMORY_READ) : NULL;
+        CHECK(wc_map != NULL, "the screen maps write-combined: %d", errno);
+        CHECK(!n_shared_map(bar, (size_t)info.bar[0].size, N_MEMORY_READ) && errno == N_ERR_DENIED,
+              "the whole BAR uncached would alias the screen");
+        if (past + 4096 <= info.bar[0].size) {
+            n_handle a = n_shared_view(bar, past, 4096, N_CACHE_UNCACHED);
+            n_handle b = n_shared_view(bar, past, 4096, N_CACHE_WRITE_COMBINE);
+            void *a_map = a >= 0 ? n_shared_map(a, 4096, N_MEMORY_READ_WRITE) : NULL;
+            CHECK(a_map != NULL, "uncached mapping past the screen: %d", errno);
+            void *a_again = a >= 0 ? n_shared_map(a, 4096, N_MEMORY_READ) : NULL;
+            CHECK(a_again != NULL, "a second mapping of the same type");
+            CHECK(b >= 0 && !n_shared_map(b, 4096, N_MEMORY_READ) && errno == N_ERR_DENIED,
+                  "a write-combined alias of an uncached device page is refused");
+            if (a_map) n_memory_release(a_map, 4096);
+            CHECK(b >= 0 && !n_shared_map(b, 4096, N_MEMORY_READ), "one mapping of the other type is still there");
+            if (a_again) n_memory_release(a_again, 4096);
+            void *b_map = b >= 0 ? n_shared_map(b, 4096, N_MEMORY_READ) : NULL;
+            CHECK(b_map != NULL, "once no uncached mapping is left the page takes write-combining: %d", errno);
+            if (b_map) n_memory_release(b_map, 4096);
+            if (a >= 0) n_handle_close(a);
+            if (b >= 0) n_handle_close(b);
+        } else {
+            printf("FAIL: no BAR page past the screen (%llu bytes)\n", (unsigned long long)info.bar[0].size);
+            failed++;
+        }
+        if (wc_map) n_memory_release(wc_map, 4096);
+        if (uc >= 0) n_handle_close(uc);
+        if (wc >= 0) n_handle_close(wc);
+    }
+    if (bar >= 0) n_handle_close(bar);
+    CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, true) == 0, "holds of the screen nest");
+    CHECK(n_pci_hold_screen(vga, false) == 0 && n_pci_hold_screen(vga, false) == 0, "and are released one by one");
+    CHECK(n_pci_hold_screen(vga, false) == -N_ERR_INVALID, "a release without a hold");
+    CHECK(n_pci_hold_screen(vga, true) == 0, "a hold the claim's end gives back");
+    n_handle_close(vga);
+}
+
 int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"revoked-reader"))return revoked_reader();
     struct n_pciinfo list[128];
@@ -238,6 +304,37 @@ int main(int argc,char **argv) {
     n_result cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
     CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 6) == 0, "command: memory and bus master");
     CHECK((n_pci_config_read(pci, N_PCI_SELF, 4, 2) & 6) == 6, "command reads back");
+    /* The bits that route, power or reset the function stay the system's: a write changing one is
+       refused, a read-modify-write that keeps them goes through at its own width. */
+    cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    CHECK(n_pci_config_write(pci, 4, 2, (uint32_t)cmd ^ 1) == -N_ERR_DENIED, "command: I/O decode is the system's");
+    CHECK(n_pci_config_write(pci, 4, 2, (uint32_t)cmd ^ 0x400) == -N_ERR_DENIED, "command: INTx disable is the system's");
+    CHECK(n_pci_config_write(pci, 4, 2, (uint32_t)cmd) == 0, "command: unchanged guarded bits pass");
+    CHECK(n_pci_config_write(pci, 0x0F, 1, 0x40) == -N_ERR_DENIED, "BIST cannot be started");
+    n_result line = n_pci_config_read(pci, N_PCI_SELF, 0x3C, 1);
+    CHECK(line >= 0 && n_pci_config_write(pci, 0x3C, 1, (uint32_t)line ^ 0xFF) == -N_ERR_DENIED, "interrupt line is the system's");
+    CHECK(line >= 0 && n_pci_config_write(pci, 0x3C, 1, (uint32_t)line) == 0, "interrupt line written as it is");
+    if (n_pci_config_read(pci, N_PCI_SELF, 6, 2) & 0x10) /* a capability list: power management, if any */
+        for (n_result at = n_pci_config_read(pci, N_PCI_SELF, 0x34, 1) & 0xFC, hops = 0; at && hops < 48; hops++) {
+            n_result head = n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at, 2);
+            if (head < 0) break;
+            if ((head & 0xFF) == 0x01) {
+                n_result pmcsr = n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 4, 2);
+                CHECK(pmcsr >= 0 && n_pci_config_write(pci, (uint32_t)at + 4, 2, ((uint32_t)pmcsr & ~3u) | 3) == -N_ERR_DENIED,
+                      "the function cannot be put into D3");
+                break;
+            }
+            at = (head >> 8) & 0xFC;
+        }
+    for (int i = 0; i < n; i++)
+        if (list[i].cls == 0x06) {
+            n_handle bridge = n_pci_claim(list[i].bus, list[i].dev, list[i].func);
+            CHECK(bridge == -N_ERR_DENIED, "bridge %02x:%02x.%u cannot be claimed: %s", list[i].bus, list[i].dev,
+                  list[i].func, n_result_text(bridge));
+            if (bridge >= 0) n_handle_close(bridge);
+            break;
+        }
+    CHECK(n_pci_hold_screen(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
     /* a function on bus 0 that is neither this device nor a bridge above it */
     for (int i = 0; i < n; i++)
         if (i != at && list[i].bus == e->bus && list[i].dev != e->dev && list[i].cls != 0x06) {
@@ -437,8 +534,11 @@ int main(int argc,char **argv) {
     if (mem >= 0) n_handle_close(mem);
 
     /* The BAR mapping outlives the claim: when the last handle goes, the device pages leave and the
-       range reads all-ones, as a function gone from the bus. */
+       range reads all-ones, as a function gone from the bus. A driver stops the function's bus
+       mastering before it lets go. */
     if (bar >= 0) n_handle_close(bar);
+    cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd & ~4u) == 0, "bus mastering off before release");
     n_handle_close(pci);
     if(mixed_map){
         CHECK(mixed_map[0]==0xFFFFFFFFu && mixed_map[4096/4]==0xFFFFFFFFu,"all composed BAR pages lose their claim");
@@ -455,8 +555,19 @@ int main(int argc,char **argv) {
     CHECK(back >= 0, "claim after release: %s", n_result_text(back));
     if (back >= 0) {
         CHECK((n_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0, "bus mastering stopped at release");
+        /* A driver that ends with bus mastering on is taken as crashed: the system stops the
+           function and keeps the DMA memory it had out of use (the system log says so). */
+        cmd = n_pci_config_read(back, N_PCI_SELF, 4, 2);
+        CHECK(cmd >= 0 && n_pci_config_write(back, 4, 2, (uint32_t)cmd | 6) == 0, "bus mastering on again");
+        n_handle left = n_dma_create(back, 4096, 0);
+        CHECK(left >= 0, "dma memory of the crashed driver: %s", n_result_text(left));
         n_handle_close(back);
+        if (left >= 0) n_handle_close(left);
+        back = n_pci_claim(e->bus, e->dev, e->func);
+        CHECK(back >= 0 && (n_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0, "a crashed driver's function is stopped");
+        if (back >= 0) n_handle_close(back);
     }
+    screen_cases(list, n);
     printf("pcitest: %d failed\n", failed);
     return failed != 0;
 }

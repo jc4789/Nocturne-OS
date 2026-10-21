@@ -58,6 +58,8 @@ struct nvrm_file {
     bool admin;                 /* RM treats the client as an administrator */
     mtx_t lock;                 /* the queue: RM posts from its interrupt and work threads */
     struct queued_event *head, *tail;
+    size_t data_events;         /* queued events that carry data (the others are one per object) */
+    bool overflowed;            /* data events were dropped since the client last collected */
     struct exported_mapping *mappings;
 };
 
@@ -230,10 +232,24 @@ uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
 
 /* RM posts an event for the client whose file the event belongs to (nv_event_t::nvfp). A post
  * that carries no data only says "this object fired": one is kept per object and index until
- * the client collects it. */
+ * the client collects it, so those are bounded by the client's own objects. Posts with data are
+ * each kept, up to EVENT_DATA_QUEUED: a client that never collects (or has hung) must not grow
+ * nvrm's memory, which every client and the GPU share, without end. Past it the newest are
+ * dropped and that is logged once until the client collects again. */
+#define EVENT_DATA_QUEUED 4096 /* about 160 KiB of records per client */
 void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle handle, NvU32 index, NvU32 info32, NvU16 info16,
                                NvBool data_valid) {
     struct nvrm_file *f = (struct nvrm_file *)event->nvfp;
+    if (data_valid) {
+        mtx_lock(&f->lock);
+        bool full = f->data_events >= EVENT_DATA_QUEUED, first = full && !f->overflowed;
+        if (full) f->overflowed = true;
+        mtx_unlock(&f->lock);
+        if (first)
+            nvrm_log("NVRM: app %u does not collect its RM events; dropping new ones (object 0x%x, index %u)",
+                     (unsigned)f->principal, (unsigned)handle, (unsigned)index);
+        if (full) return;
+    }
     struct queued_event *e = calloc(1, sizeof *e);
     if (!e) {
         nvrm_log("NVRM: no memory for an RM event (object 0x%x, index %u)", (unsigned)handle, (unsigned)index);
@@ -250,9 +266,11 @@ void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle handle, NvU32 index, 
         for (struct queued_event *q = f->head; q; q = q->next)
             if (!q->data_valid && q->object == handle && q->index == index) { keep = false; break; }
     }
+    if (keep && data_valid && f->data_events >= EVENT_DATA_QUEUED) keep = false; /* filled meanwhile */
     if (keep) {
         if (f->tail) f->tail->next = e; else f->head = e;
         f->tail = e;
+        f->data_events += data_valid;
     }
     mtx_unlock(&f->lock);
     if (!keep) free(e);
@@ -266,6 +284,8 @@ NvS32 NV_API_CALL nv_get_event(nv_file_private_t *nvfp, nv_event_t *event, NvU32
     if (e) {
         f->head = e->next;
         if (!f->head) f->tail = NULL;
+        f->data_events -= e->data_valid;
+        f->overflowed = false;
     }
     if (more) *more = f->head ? 1 : 0;
     mtx_unlock(&f->lock);

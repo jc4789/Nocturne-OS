@@ -25,3 +25,5 @@ int64_t pci_user_bar(struct file *f, uint32_t bar, uint64_t *address, uint64_t *
 bool pci_user_bar_prefetchable(struct file *f, uint32_t bar);
 int64_t pci_user_interrupts(struct file *f, uint32_t count);
 int64_t pci_user_interrupt_take(struct file *f, int64_t timeout_ms);
+/* n_pci_hold_screen: only for the function whose BAR the boot screen is drawn through. */
+int64_t pci_user_hold_screen(struct file *f, bool hold);

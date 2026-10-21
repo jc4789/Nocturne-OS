@@ -56,7 +56,14 @@ struct acpi_ecam {
 };
 const struct acpi_ecam *acpi_ecams(unsigned *count);
 
-/* Registry + MADT + MCFG, with a one-line log summary of each. Called once from acpi_init(). */
+/* ---- DMAR / IVRS: IOMMUs ----
+   Nocturne does not program an IOMMU: a device that masters the bus reaches all of memory, so
+   an app given a device (pci_user) is trusted with all of memory. BLOCKING: the firmware left a
+   unit translating (or VT-d protected memory regions on), and DMA it did not map is refused. */
+enum acpi_iommu { ACPI_IOMMU_NONE, ACPI_IOMMU_OFF, ACPI_IOMMU_BLOCKING };
+enum acpi_iommu acpi_iommu_state(void);
+
+/* Registry + MADT + MCFG + DMAR/IVRS, with a log summary of each. Called once from acpi_init(). */
 void acpi_tables_init(void);
 
 /* ---- AML (uACPI) ----

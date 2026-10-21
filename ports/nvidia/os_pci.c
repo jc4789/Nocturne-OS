@@ -10,6 +10,7 @@
  */
 #include "nvrm_os.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
@@ -19,6 +20,8 @@
 #define PAGE 4096ull
 #define ALIGN_UP(v, a) (((v) + ((a) - 1)) & ~((uint64_t)(a) - 1))
 #define ALIGN_DOWN(v, a) ((v) & ~((uint64_t)(a) - 1))
+
+enum { PCI_COMMAND = 0x04, PCI_COMMAND_MEMORY = 1u << 1, PCI_COMMAND_MASTER = 1u << 2 };
 
 struct nvrm_device nvrm_dev = { .pci = -1 };
 nv_state_t nvrm_ctl_state = { .flags = NV_FLAG_CONTROL };
@@ -324,7 +327,18 @@ void NV_API_CALL os_unmap_kernel_space(void *address, NvU64 size) {
 }
 
 /* x86 keeps DMA coherent; write-combining buffers are drained by the fences below. */
-NV_STATUS NV_API_CALL os_flush_cpu_cache_all(void) { return NV_OK; }
+/* RM writes back the whole CPU cache only for a GPU that cannot snoop (memdescFlushCpuCaches
+   asks kbifIsSnoopDmaCapable). A PCIe GPU on x86 snoops, so RM never asks here; an app could not
+   write back every cache of every CPU anyway, and reporting success would hide stale data. */
+NV_STATUS NV_API_CALL os_flush_cpu_cache_all(void) {
+    static atomic_flag said = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set(&said))
+        nvrm_log("NVRM: RM asked to write back all CPU caches (a GPU that does not snoop?); not supported");
+    return NV_ERR_NOT_SUPPORTED;
+}
+/* A client's request (NV0000_CTRL_CMD_OS_UNIX_FLUSH_USER_CACHE) for its cached system memory:
+   the GPU reaches cached memory snooped (GMMU SYS_COH), so on x86 there is nothing to write back.
+   Uncached and write-combined memory never has cache lines (nv_alloc_pages types it). */
 NV_STATUS NV_API_CALL os_flush_user_cache(void) { return NV_OK; }
 void NV_API_CALL os_flush_cpu_write_combine_buffer(void) { __asm__ volatile("sfence" ::: "memory"); }
 
@@ -364,16 +378,18 @@ NV_STATUS nvrm_pci_attach(void) {
     pci_apertures(g, nv);
     nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
     nv->fb = &nv->bars[NV_GPU_BAR_INDEX_FB];
+    /* RM maps the boot screen through BAR1's virtual mode only when it starts at BAR1 offset 0
+       (bPreserveBar1ConsoleEnabled); anywhere else the screen is lost once RM starts. */
+    if (g->framebuffer_bar != N_PCI_NONE)
+        nvrm_log("NVRM: boot screen %ux%u at 0x%llx (%llu KiB), BAR1 at 0x%llx: %s", (unsigned)g->framebuffer_width,
+                 (unsigned)g->framebuffer_height, (unsigned long long)g->framebuffer_address,
+                 (unsigned long long)(g->framebuffer_size >> 10), (unsigned long long)nv->fb->cpu_address,
+                 g->framebuffer_address == nv->fb->cpu_address ? "RM keeps it mapped"
+                                                               : "not at BAR1's start, RM will not keep it mapped");
 
-    /* PCI Local Bus, type-0 header: Command is a 16-bit register at 04h.
-       MSE (bit 1) admits CPU memory accesses; BME (bit 2) admits the function's
-       memory requests, including DMA and MSI. Read the actual value, not the
-       saved configuration image. In particular, do not silently reintroduce
-       the early BME write that froze the reported bare-metal machine. */
-    enum { PCI_COMMAND = 0x04, PCI_COMMAND_MEMORY = 1u << 1, PCI_COMMAND_MASTER = 1u << 2 };
     n_result command = n_pci_config_read(d->pci, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
     if (command < 0) return NV_ERR_OPERATING_SYSTEM;
-    nvrm_log("NVRM: PCI Command=0x%04x (memory=%u, bus-master=%u); DMA addresses are physical, IOMMU state unverified",
+    nvrm_log("NVRM: PCI Command=0x%04x at attach (memory=%u, bus-master=%u); DMA addresses are physical",
              (unsigned)command, !!(command & PCI_COMMAND_MEMORY), !!(command & PCI_COMMAND_MASTER));
 
     for (unsigned dw = 0; dw < NVRM_PCICFG_NUM_DWORDS; dw++) {
@@ -403,6 +419,35 @@ NV_STATUS nvrm_pci_attach(void) {
 
     d->sp = stack_ptr;
     return NV_OK;
+}
+
+/* PCI Local Bus, type-0 header: Command is a 16-bit register at 04h. MSE (bit 1) admits CPU
+   memory accesses; BME (bit 2) admits the function's memory requests, DMA and MSI included. RM
+   expects both on before rm_init_adapter (it sets them itself only when it recovers from a
+   function that stopped answering, or restores config space after a reset): without bus
+   mastering the SEC2 scrubber's first IMEM transfer never completes. The other bits stay as the
+   system set them (the kernel refuses changes to them). The write is read back: a function that
+   did not take it is not reported as mastering. */
+bool nvrm_pci_bus_master(bool on) {
+    struct nvrm_device *d = &nvrm_dev;
+    n_result command = n_pci_config_read(d->pci, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
+    if (command < 0) {
+        nvrm_log("NVRM: cannot read PCI Command: %s", n_result_text(command));
+        return false;
+    }
+    uint16_t want = on ? (uint16_t)command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER
+                       : (uint16_t)command & ~PCI_COMMAND_MASTER;
+    n_result r = n_pci_config_write(d->pci, PCI_COMMAND, sizeof(uint16_t), want);
+    n_result now = n_pci_config_read(d->pci, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
+    bool mastering = now >= 0 && (now & PCI_COMMAND_MASTER);
+    d->bus_master = on ? mastering : mastering && d->bus_master;
+    if (r < 0 || now < 0 || mastering != on) {
+        nvrm_log("NVRM: switching bus mastering %s failed: %s (Command 0x%04x)", on ? "on" : "off",
+                 n_result_text(r < 0 ? r : now < 0 ? now : -N_ERR_IO), (unsigned)(now < 0 ? command : now));
+        return false;
+    }
+    nvrm_log("NVRM: bus mastering %s (Command 0x%04x)", on ? "on" : "off", (unsigned)now);
+    return true;
 }
 
 void nvrm_pci_detach(void) {
@@ -456,6 +501,24 @@ void NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *base, NvU32 *width, N
     *depth = g->framebuffer_bpp;
     *pitch = g->framebuffer_pitch;
     *size = g->framebuffer_size;
+}
+
+/* RM brackets starting, disabling and shutting down the adapter (and power transitions) with
+   these when nv_get_screen_info reports the boot screen in this GPU's BAR: physical RM (GSP)
+   rebuilds BAR1 meanwhile, and a CPU write through BAR1 can disturb that. The system stops
+   drawing there (n_pci_hold_screen) until the matching enable. RM keeps the boot screen mapped
+   at BAR1 offset 0 through virtual mode when the screen starts there (logged at attach), so
+   drawing then goes on where it was. The system resumes drawing on its own if a hold lasts
+   longer than its limit; a release after that only ends the hold. */
+void NV_API_CALL os_disable_console_access(void) {
+    n_result r = n_pci_hold_screen(nvrm_dev.pci, true);
+    if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot hold the boot screen: %s", n_result_text(r));
+    else if (r >= 0) nvrm_log("NVRM: the system stopped drawing to the boot screen");
+}
+void NV_API_CALL os_enable_console_access(void) {
+    n_result r = n_pci_hold_screen(nvrm_dev.pci, false);
+    if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot release the boot screen: %s", n_result_text(r));
+    else if (r >= 0) nvrm_log("NVRM: the system draws to the boot screen again");
 }
 
 void NV_API_CALL nv_set_dma_address_size(nv_state_t *nv, NvU32 bits) {
@@ -607,6 +670,22 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     uint64_t mask = nv ? nv->dma_mask : UINT64_MAX;
     if ((flags & N_DMA_32BIT) && mask > UINT32_MAX) mask = UINT32_MAX;
     if (status == NV_OK) status = alloc_check_addresses(a, mask);
+    /* RM hands uncached and write-combined system memory to the GPU as non-snooped (GMMU
+       SYS_NONCOH) and does nothing to the CPU's caches itself: the memory must have that type
+       before RM learns its addresses. The first typed view makes it the object's type and
+       writes back what the system's zeroing left in the caches (n_shared_view on DMA memory);
+       every later mapping and view of the object uses that type. */
+    uint32_t typed = n_cache_for(cache_type, false);
+    if (status == NV_OK && typed != N_CACHE_WRITE_BACK) {
+        n_handle view = n_shared_view(a->root, 0, (size_t)bytes, typed);
+        if (view < 0) {
+            nvrm_log("NVRM: cannot make %llu KiB of DMA memory %s: %s", (unsigned long long)(bytes >> 10),
+                     typed == N_CACHE_UNCACHED ? "uncached" : "write-combined", n_result_text(view));
+            status = NV_ERR_NO_MEMORY;
+        } else {
+            n_handle_close(view);
+        }
+    }
     if (status != NV_OK) {
         alloc_destroy(a);
         return status;

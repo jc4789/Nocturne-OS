@@ -61,6 +61,24 @@ bool cmdline_has(const char *word) {
     return false;
 }
 
+bool cmdline_number(const char *key, uint64_t *out) {
+    size_t n = strlen(key);
+    bool found = false;
+    for (const char *p = kernel_cmdline; *p; p++) {
+        if ((p != kernel_cmdline && p[-1] != ' ') || strncmp(p, key, n) || p[n] != '=') continue;
+        const char *q = p + n + 1;
+        uint64_t value = 0;
+        bool valid = *q >= '0' && *q <= '9';
+        while (*q >= '0' && *q <= '9') {
+            unsigned digit = *q++ - '0';
+            if (value > (UINT64_MAX - digit) / 10) valid = false;
+            if (valid) value = value * 10 + digit;
+        }
+        if (valid && (!*q || *q == ' ')) { *out = value; found = true; }
+    }
+    return found;
+}
+
 /* Removes a RAM-root folder and everything below it. */
 static void remove_tree(char *path, size_t room) {
     struct vnode *v = vfs_lookup(path);

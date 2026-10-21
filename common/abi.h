@@ -103,6 +103,7 @@ enum {
     SYS_DMA_CREATE, SYS_DMA_ADDRESSES, SYS_SHARED_VIEW,
     SYS_SHARED_REVOKE, SYS_GPU_RENDER_LIST,
     SYS_CHANNEL_RECEIVE_FROM, SYS_SHARED_COMPOSE,
+    SYS_PCI_HOLD_SCREEN, /* (pci, hold): no drawing to the boot screen in the function's BAR */
     SYS_MAX = 192
 };
 

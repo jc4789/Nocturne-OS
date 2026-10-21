@@ -31,7 +31,13 @@ void NV_API_CALL nv_put_file_private(void *priv) { (void)priv; }
 
 /* ---------------------------------------------------------------- mmap bookkeeping */
 /* Live mapping publication/revocation and mmap locking belong to rm_api.c. */
-NvBool NV_API_CALL nv_is_gpu_accessible(nv_state_t *nv) { (void)nv; return NV_TRUE; }
+/* A client reaches the GPU only once the GPU started (rm_init_adapter succeeded), as opening a
+   GPU that failed to start fails. RM checks this when a client allocates the device
+   (deviceConstruct: NV_ERR_INSUFFICIENT_PERMISSIONS); the control device's requests (the
+   adapter status, system queries) stay available for diagnosis. */
+NvBool NV_API_CALL nv_is_gpu_accessible(nv_state_t *nv) {
+    return nv == &nvrm_dev.nv && nvrm_dev.adapter_ready;
+}
 NvBool NV_API_CALL nv_match_gpu_os_info(nv_state_t *nv, void *os_info) { (void)nv; (void)os_info; return NV_FALSE; }
 void NV_API_CALL nv_flush_coherent_cpu_cache_range(nv_state_t *nv, NvU64 address, NvU64 size) {
     (void)nv; (void)address; (void)size; /* x86 is coherent */
@@ -190,10 +196,6 @@ NV_STATUS NV_API_CALL os_get_smbios_header(NvU64 *address) { (void)address; retu
 NV_STATUS NV_API_CALL os_get_acpi_rsdp_from_uefi(NvU32 *address) { (void)address; return NOT_SUPPORTED; }
 void NV_API_CALL os_add_record_for_crashLog(void *record, NvU32 size) { (void)record; (void)size; }
 void NV_API_CALL os_delete_record_for_crashLog(void *record) { (void)record; }
-/* The firmware console's framebuffer lives in the GPU's BAR: nvrm cannot make other apps stop
-   drawing to it, so RM's request to keep the console quiet is acknowledged and ignored. */
-void NV_API_CALL os_disable_console_access(void) {}
-void NV_API_CALL os_enable_console_access(void) {}
 NvBool NV_API_CALL nv_is_chassis_notebook(void) { return NV_FALSE; }
 NvBool NV_API_CALL os_supports_kernel_suspend_notifiers(void) { return NV_FALSE; }
 

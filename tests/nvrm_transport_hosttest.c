@@ -52,6 +52,25 @@ int mtx_init(mtx_t *m, int type) { (void)m; (void)type; return thrd_success; }
 int mtx_lock(mtx_t *m) { (void)m; return thrd_success; }
 int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
 void mtx_destroy(mtx_t *m) { (void)m; }
+/* The server here accepts no client (n_channel_accept is never ready), so no client thread runs;
+   requests are driven directly on this thread through server_request. */
+static int threads_started, stop_wakes;
+int cnd_init(cnd_t *c) { (void)c; return thrd_success; }
+int cnd_signal(cnd_t *c) { (void)c; return thrd_success; }
+int cnd_wait(cnd_t *c, mtx_t *m) { (void)c; (void)m; CHECK(!"no client thread to wait for"); return thrd_error; }
+void cnd_destroy(cnd_t *c) { (void)c; }
+int thrd_create(thrd_t *t, thrd_start_t f, void *arg) { (void)t; (void)f; (void)arg; threads_started++; return thrd_error; }
+int thrd_detach(thrd_t t) { (void)t; return thrd_success; }
+n_result wake_address(volatile uint32_t *address, unsigned count) {
+    CHECK(*address == 1 && count == 0);
+    stop_wakes++;
+    return 0;
+}
+n_result n_events_watch_address(n_handle q, volatile uint32_t *address, uint32_t expected, uint64_t token) {
+    (void)q; (void)address; (void)expected; (void)token;
+    return -N_ERR_NOT_READY;
+}
+const char *n_result_text(n_result r) { (void)r; return "fixture"; }
 n_result n_handle_close(n_handle h) {
     if (h == 10 || h == 20 || h == 30) listener_closes++;
     if (h == 12) { server.file = NULL; server.arena = NULL; server.arena_handle = -1; }
@@ -173,7 +192,7 @@ n_result n_channel_receive(n_handle channel, void *data, size_t capacity, int fl
         return size;
     }
     CHECK(channel == 12 && !(flags & N_CHANNEL_PEEK));
-    server_request(-1, &server);
+    CHECK(server_request(&server)); /* the fixture's client stays connected */
     CHECK(outgoing && capacity >= outgoing_bytes);
     memcpy(data, outgoing, outgoing_bytes);
     if (attached) *attached = response_attachment;
@@ -342,6 +361,7 @@ int main(void) {
     listener_calls = watches = listener_closes = 0;
     CHECK(nvrm_serve(N_PCI_TARGET(3, 1, 0)) == -N_ERR_CANCELLED);
     CHECK(listener_calls == 2 && watches == 2 && listener_closes == 3);
+    CHECK(stop_wakes == 2 && threads_started == 0); /* the end is announced to client threads */
     printf("nvrm_transport_hosttest: %d failed (channel/RM fixtures; no GPU execution)\n", failures);
     return failures != 0;
 }

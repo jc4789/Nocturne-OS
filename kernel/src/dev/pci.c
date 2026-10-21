@@ -115,6 +115,15 @@ static const char *class_name(uint8_t c, uint8_t s) {
     }
 }
 
+static uint64_t bar_probe(const struct pci_device *d, unsigned bar);
+
+/* A bridge's header has two BARs and a CardBus bridge's one; the dwords after them are bus
+   numbers and windows, which must never be probed or written back as BARs. */
+unsigned pci_bar_count(const struct pci_device *d) {
+    unsigned type = (pci_read32(d->bus, d->dev, d->func, 0x0C) >> 16) & 0x7F;
+    return type == 0 ? 6 : type == 1 ? 2 : type == 2 ? 1 : 0;
+}
+
 void pci_init(void) {
     ecam = acpi_ecams(&necam);
     for (unsigned i = 0; i < necam; i++)
@@ -142,7 +151,12 @@ void pci_init(void) {
                     d->subcls = (cls >> 16) & 0xFF;
                     d->progif = (cls >> 8) & 0xFF;
                     d->irq = pci_read32(bus, dev, func, 0x3C) & 0xFF;
-                    for (int b = 0; b < 6; b++) d->bar[b] = pci_read32(bus, dev, func, 0x10 + b * 4);
+                    unsigned bars = pci_bar_count(d);
+                    for (unsigned b = 0; b < bars; b++) d->bar[b] = pci_read32(bus, dev, func, 0x10 + b * 4);
+                    for (unsigned b = 0; b < bars; b++) {
+                        d->bar_size[b] = bar_probe(d, b);
+                        if (!(d->bar[b] & 1) && (d->bar[b] & 6) == 4) b++; /* the upper half is no BAR */
+                    }
                     d->pcie_cap = pci_find_cap(d, 0x10);
                     if (d->pcie_cap) d->pcie_type = (pci_read16(bus, dev, func, d->pcie_cap + 2) >> 4) & 0xF;
                     kprintf("pci: %02x:%02x.%x %04x:%04x %s\n", bus, dev, func, d->vendor, d->device,
@@ -202,13 +216,19 @@ uint64_t pci_bar_address(const struct pci_device *d, unsigned bar) {
     return base;
 }
 
-/* Size a memory BAR by the standard all-ones probe, with memory decoding off meanwhile. */
-uint64_t pci_bar_size(const struct pci_device *d, unsigned bar) {
+/* Size a memory BAR by the standard all-ones probe, with memory decoding off meanwhile. Only
+   during enumeration: while decoding is off the function answers nothing, so the same probe on a
+   running device (a GPU the boot screen is drawn through, a driver's registers) would lose the
+   writes and read all-ones. */
+static uint64_t bar_probe(const struct pci_device *d, unsigned bar) {
     if (!pci_bar_address(d, bar)) return 0;
     bool wide = (d->bar[bar] & 6) == 4;
     uint8_t off = 0x10 + bar * 4;
     uint32_t cmd = pci_read32(d->bus, d->dev, d->func, 4) & 0xFFFF; /* not the write-1-to-clear status half */
     uint64_t f = irq_save();
+    /* The boot console may have drawn through this BAR: its write-combined pixels leave the CPU
+       before memory decoding goes off, or the function would drop them. */
+    __asm__ volatile("sfence" ::: "memory");
     pci_write32(d->bus, d->dev, d->func, 4, cmd & ~2u);
     pci_write32(d->bus, d->dev, d->func, off, 0xFFFFFFFFu);
     uint64_t mask = pci_read32(d->bus, d->dev, d->func, off) & ~15u;
@@ -224,6 +244,8 @@ uint64_t pci_bar_size(const struct pci_device *d, unsigned bar) {
     irq_restore(f);
     return mask ? ~mask + 1 : 0;
 }
+
+uint64_t pci_bar_size(const struct pci_device *d, unsigned bar) { return bar < 6 ? d->bar_size[bar] : 0; }
 
 uint8_t pci_find_cap(const struct pci_device *d, uint8_t id) {
     if (!(pci_read16(d->bus, d->dev, d->func, 6) & 0x10)) return 0;

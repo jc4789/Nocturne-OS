@@ -238,6 +238,22 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     `N_ERR_DENIED`。書きは自分だけで、BAR、
     拡張 ROM、MSI／MSI-X の機能はカーネルだけが書く（`N_ERR_DENIED`）。例外は、リセットで消えた
     BAR へ、カーネルが起動時に見た値をそのまま 32 ビットで書き戻すことだけ（戻せるが、動かせない）。
+    一部のビットだけがカーネルのものであるレジスターは、そのビットを変える書込みを `N_ERR_DENIED`
+    にする（読んで一部を変えて書き戻すなら通る）：Command の MSE・BME・パリティ応答以外（I/O、
+    INTx 無効化など）、BIST の開始、Interrupt Line、PMCSR の電源状態（D0 へ戻すことは可）、
+    PCIe Device Control の Max_Payload_Size・Phantom Functions・FLR、Link Control の Link Disable、
+    Link Control 2 の Compliance、拡張機能の Resizable BAR（VF 用も）の大きさ、SR-IOV の制御と
+    NumVFs、ACS・ATS・PRI・PASID の制御。ブリッジ（クラス 06h）は claim できない。
+  - ドライバーは装置を止め終えたらバスマスターを切ってから手放す。claim の終わりにバスマスターが
+    入ったままなら、ドライバーは途中で終わった（異常終了など）とみなし、装置上のファームウェアが
+    古いアドレスを持ったまま止まっていない可能性があるので、その装置の DMA 用 RAM は二度と
+    アロケーターへ戻さない（ログに出る）。
+  - `n_pci_hold_screen(pci, hold)`：起動時の画面がその機能の BAR にあるとき、ドライバーが
+    CPU から画面への経路を作り直す間（NVIDIA の RM は GSP が BAR1 を仮想モードにする間）、
+    システムは画面へ書かない。`true` は書込み中のものが終わってから戻り、入れ子にできる。最後の
+    `false`（または claim の終わり）で画面全体を描き直す。保持には時間の上限があり（起動項目
+    `fbhold=<秒>`、既定 30、0 で無制限）、過ぎると描画を再開してログに出す。画面が別の所なら
+    `N_ERR_NOT_FOUND`。パニック画面は保持に関係なく描く。
   - `n_pci_bar(pci, i)` はメモリ BAR を装置メモリの共有オブジェクト（既定は非キャッシュ）にする。
     1 ページ未満や境界の合わない BAR、I/O ポートは扱わない。
   - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を最大 32 本つなぎ、本数を返す。
@@ -246,6 +262,11 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
     オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
     `n_dma_addresses` が各ページのバスアドレスを返す（IOMMU は使わないので物理アドレス）。
+  - IOMMU：Nocturne は IOMMU（VT-d／AMD-Vi）を設定しない。バスマスターの装置は全メモリへ
+    DMA でき、装置を渡されたアプリは全メモリを任されているのと同じ（権限分離の対象外）。起動時に
+    ACPI の DMAR・IVRS を読み、各ユニットと、ファームウェアが変換（VT-d では保護メモリ領域も）を
+    入れたまま渡したかをログに出す。入ったままなら、ファームウェアが写していない DMA は装置から
+    届かない（claim のたびにログで知らせる）。カーネルはその設定を変えない。
   - `n_shared_view(shared, offset, bytes, cache)` は共有オブジェクトの一部を、別のキャッシュ
     属性（`N_CACHE_*`）で見る新しい共有オブジェクト。装置メモリは非キャッシュか
     write-combining だけ、DMA 用でも装置でもない共有オブジェクトは元の属性だけ。DMA 用の RAM は
@@ -253,6 +274,11 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     無い間に限り、最初に頼んだ別の型（非キャッシュか write-combining）がオブジェクトの型になり、
     カーネルの直接写像も同じ型に変わる。その後の別の型のビューと、写像がある間の型の変更は
     `N_ERR_DENIED`。`N_CACHE_DEFAULT` のビューと元のオブジェクトの写像はその型を使う。
+    装置メモリも、生きている写像の間では一つのページに型を一つだけ許す：あるページが非キャッシュで
+    写されている間、そのページを含む write-combining の写像は `N_ERR_DENIED`（逆も同じ。ログに
+    出る）。型は写像が全部外れると自由になる。起動時の画面の範囲はカーネルが write-combining で
+    写し続けているので、その範囲を含む非キャッシュの写像は常に `N_ERR_DENIED`。PAT の無い CPU では
+    write-combining は非キャッシュとして数える。
   - `n_shared_map` の書込み可（`N_MEMORY_READ_WRITE`）は、書込みで開いたハンドルにだけ許す。
     view も共有オブジェクトなので、`n_shared_map` で写し、チャネルの添付で他のアプリへ渡せる。
   - `n_shared_view_access(shared,offset,bytes,cache,access)` は READ または READ_WRITE の

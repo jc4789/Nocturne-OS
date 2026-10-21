@@ -88,6 +88,33 @@ void *n_shared_map(n_handle h, size_t bytes, int access) {
 }
 int n_memory_release(void *p, size_t bytes) { (void)p; (void)bytes; maps--; return 0; }
 n_result n_handle_close(n_handle h) { CHECK(h >= 0); live--; closes++; return 0; }
+const char *n_result_text(n_result r) { (void)r; return "mock"; }
+
+/* PCI Command of the claimed function: writes land unless the function ignores them. */
+static uint16_t command_register;
+static bool command_ignores_writes, command_unreadable;
+static int command_writes, screen_holds, screen_calls;
+static n_result screen_result;
+n_result n_pci_config_read(n_handle pci, uint32_t target, uint32_t offset, uint32_t width) {
+    (void)pci;
+    CHECK(target == N_PCI_SELF && offset == PCI_COMMAND && width == 2);
+    return command_unreadable ? -N_ERR_IO : command_register;
+}
+n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value) {
+    (void)pci;
+    CHECK(offset == PCI_COMMAND && width == 2 && value <= UINT16_MAX);
+    command_writes++;
+    if (!command_ignores_writes) command_register = (uint16_t)value;
+    return 0;
+}
+n_result n_pci_hold_screen(n_handle pci, bool hold) {
+    (void)pci;
+    screen_calls++;
+    if (screen_result < 0) return screen_result;
+    if (!hold && !screen_holds) return -N_ERR_INVALID;
+    screen_holds += hold ? 1 : -1;
+    return 0;
+}
 
 static void reset_fixture(void) {
     CHECK(live == 0 && maps == 0);
@@ -180,6 +207,49 @@ static void allocation_cases(void) {
                         NV_TRUE, NV_FALSE, 0, ptes, &priv) != NV_OK);
     CHECK(priv == NULL && live == 0);
     CHECK(allocation_flags == (N_DMA_CONTIGUOUS | N_DMA_32BIT));
+
+    /* Uncached and write-combined memory has its type before RM sees an address: the GPU reads
+       it without snooping, so no cache line of the system's zeroing may stay behind. */
+    reset_fixture();
+    nv.force_dma32_alloc = NV_FALSE;
+    CHECK(nv_alloc_pages(&nv, 2, PAGE, NV_TRUE, NV_MEMORY_UNCACHED,
+                        NV_TRUE, NV_FALSE, 0, ptes, &priv) == NV_OK);
+    CHECK(uc_views == 1 && views == 1 && view_cache == N_CACHE_UNCACHED && live == 1);
+    CHECK(nv_free_pages(&nv, 2, NV_TRUE, NV_MEMORY_UNCACHED, priv) == NV_OK);
+    CHECK(live == 0);
+    priv = NULL;
+
+    reset_fixture();
+    CHECK(nv_alloc_pages(&nv, 1, PAGE, NV_FALSE, NV_MEMORY_WRITECOMBINED,
+                        NV_TRUE, NV_FALSE, 0, ptes, &priv) == NV_OK);
+    CHECK(wc_views == 1 && views == 1 && live == 1);
+    CHECK(nv_free_pages(&nv, 1, NV_FALSE, NV_MEMORY_WRITECOMBINED, priv) == NV_OK);
+    priv = NULL;
+
+    reset_fixture();
+    CHECK(nv_alloc_pages(&nv, 1, PAGE, NV_TRUE, NV_MEMORY_CACHED,
+                        NV_TRUE, NV_FALSE, 0, ptes, &priv) == NV_OK);
+    CHECK(views == 0); /* cached memory keeps the system's write-back type */
+    CHECK(nv_free_pages(&nv, 1, NV_TRUE, NV_MEMORY_CACHED, priv) == NV_OK);
+    priv = NULL;
+
+    reset_fixture();
+    /* Memory that cannot take the type is not handed out. */
+    fail_view = true;
+    CHECK(nv_alloc_pages(&nv, 1, PAGE, NV_TRUE, NV_MEMORY_UNCACHED,
+                        NV_TRUE, NV_FALSE, 0, ptes, &priv) != NV_OK);
+    CHECK(priv == NULL && live == 0 && closes == 1);
+
+    reset_fixture();
+    /* Misaligned big pages: the aligned view, then the typed view over it. */
+    first_address = PAGE;
+    replacement_address = PAGE;
+    CHECK(nv_alloc_pages(&nv, 2, 2 * PAGE, NV_TRUE, NV_MEMORY_UNCACHED,
+                        NV_TRUE, NV_FALSE, 0, ptes, &priv) == NV_OK);
+    CHECK(views == 2 && uc_views == 1 && live == 2 && ptes[0] == 2 * PAGE);
+    CHECK(nv_free_pages(&nv, 2, NV_TRUE, NV_MEMORY_UNCACHED, priv) == NV_OK);
+    CHECK(live == 0);
+    priv = NULL;
 }
 
 static void mapping_cases(void) {
@@ -227,7 +297,9 @@ static void mapping_cases(void) {
                         NV_TRUE, NV_FALSE, 0, &pte, &priv) == NV_OK);
     address = nv_alloc_kernel_mapping(&nv, priv, 0, 0, 2 * PAGE, &mapping);
     CHECK(address == mapped && mapping != NULL);
-    CHECK(view_cache == N_CACHE_UNCACHED && views == 1 && maps == 1 && live == 1);
+    /* Two uncached views: the one nv_alloc_pages takes (and closes) to give the memory its type
+       before RM sees the addresses, and the kernel mapping's own. */
+    CHECK(view_cache == N_CACHE_UNCACHED && views == 2 && uc_views == 2 && maps == 1 && live == 1);
     nv_free_kernel_mapping(&nv, priv, address, mapping);
     CHECK(maps == 0 && live == 1);
     CHECK(nv_free_pages(&nv, 2, NV_TRUE, NV_MEMORY_UNCACHED, priv) == NV_OK);
@@ -362,10 +434,59 @@ static void bar_cases(void) {
     CHECK(live == 0 && maps == 0);
 }
 
+/* Bus mastering is reported only as the function took it; the other Command bits are kept. */
+static void bus_master_cases(void) {
+    command_register = 0x0402; /* memory decode, INTx disabled */
+    CHECK(nvrm_pci_bus_master(true));
+    CHECK(command_register == 0x0406 && nvrm_dev.bus_master);
+    CHECK(nvrm_pci_bus_master(false));
+    CHECK(command_register == 0x0402 && !nvrm_dev.bus_master);
+
+    command_register = 0x0000;
+    CHECK(nvrm_pci_bus_master(true));
+    CHECK(command_register == 0x0006); /* memory decode comes with it */
+    CHECK(nvrm_pci_bus_master(false));
+
+    /* A function that does not take the bit is not reported as mastering. */
+    command_ignores_writes = true;
+    command_register = 0x0002;
+    CHECK(!nvrm_pci_bus_master(true) && !nvrm_dev.bus_master);
+    /* ...and one that stays mastering after "off" is still known to be. */
+    command_register = 0x0006;
+    nvrm_dev.bus_master = true;
+    CHECK(!nvrm_pci_bus_master(false) && nvrm_dev.bus_master);
+    command_ignores_writes = false;
+
+    command_unreadable = true;
+    int writes = command_writes;
+    CHECK(!nvrm_pci_bus_master(true) && command_writes == writes); /* nothing written blind */
+    command_unreadable = false;
+    nvrm_dev.bus_master = false;
+}
+
+/* RM's console brackets hold and release the boot screen one for one; a GPU without the boot
+   screen in its BARs (NOT_FOUND) is not an error. */
+static void console_cases(void) {
+    screen_holds = screen_calls = 0;
+    os_disable_console_access();
+    os_disable_console_access();
+    CHECK(screen_holds == 2);
+    os_enable_console_access();
+    os_enable_console_access();
+    CHECK(screen_holds == 0 && screen_calls == 4);
+    screen_result = -N_ERR_NOT_FOUND;
+    os_disable_console_access();
+    os_enable_console_access();
+    CHECK(screen_holds == 0 && screen_calls == 6);
+    screen_result = 0;
+}
+
 int main(void) {
     allocation_cases();
     mapping_cases();
     bar_cases();
+    bus_master_cases();
+    console_cases();
     printf("nvrm_dma_hosttest: %d failed (native services mocked; no GPU execution)\n", failures);
     return failures != 0;
 }

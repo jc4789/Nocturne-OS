@@ -212,8 +212,11 @@ static bool bring_up(void) {
 
     if (!nvrm_irq_thread_start()) return false;
 
+    if (!nvrm_pci_bus_master(true)) return false;
     nvrm_log("NVRM: initialising the GPU (GSP firmware %s)...", NVRM_FIRMWARE_VERSION);
     if (!init_adapter(sp, nv)) {
+        /* RmInitAdapter shut down what it had started (RmShutdownAdapter) before it failed. */
+        nvrm_pci_bus_master(false);
         nvrm_log("NVRM: the GPU did not start");
         return true; /* RM's client API (without a working GPU) is still served for diagnosis */
     }
@@ -235,6 +238,7 @@ static void tear_down(void) {
     if (d->sp && d->adapter_ready) {
         rm_shutdown_adapter(d->sp, &d->nv);
         d->adapter_ready = false;
+        nvrm_pci_bus_master(false); /* stopped: the system may reuse the DMA memory */
     }
     nvrm_timers_stop();
     nvrm_work_stop();

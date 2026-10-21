@@ -2126,7 +2126,9 @@ static void wm_thread(void *arg) {
             if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
         }
         irq_restore(fl);
+        bool screen_back = fb_take_expiry(); /* a display driver's hold ran out: frames were lost */
         wm_lock();
+        if (screen_back) damage_all();
         struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
 
         while (in_tail != in_head) {
@@ -2367,20 +2369,8 @@ void wm_init(void) {
        deployment policy, not an invented hardware rate: boot configuration
        supplies wmrefresh=<Hz>. Zero/absent keeps the unpaced diagnostic path.
        Round UP to the scheduler's millisecond resolution, never exceed it. */
-    extern const char *kernel_cmdline;
-    const char prefix[] = "wmrefresh=";
-    for (const char *p = kernel_cmdline; *p; p++) {
-        if ((p != kernel_cmdline && p[-1] != ' ') || strncmp(p, prefix, sizeof prefix - 1)) continue;
-        const char *q = p + sizeof prefix - 1;
-        uint64_t hz = 0;
-        bool valid = *q >= '0' && *q <= '9';
-        while (*q >= '0' && *q <= '9') {
-            unsigned digit = *q++ - '0';
-            if (hz > (UINT64_MAX - digit) / 10) valid = false;
-            if (valid) hz = hz * 10 + digit;
-        }
-        if (valid && (!*q || *q == ' ')) refresh_hz = hz > 1000 ? 1000 : (uint32_t)hz;
-    }
+    uint64_t hz;
+    if (cmdline_number("wmrefresh", &hz)) refresh_hz = hz > 1000 ? 1000 : (uint32_t)hz;
     frame_period_ms = refresh_period(refresh_hz);
     deep_wanted = fb.simulated;
     kprintf("wm: configured frame period %lu ms (0=unpaced, no vblank signal)\n", frame_period_ms);

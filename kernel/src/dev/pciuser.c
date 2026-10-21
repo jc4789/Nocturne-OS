@@ -14,16 +14,29 @@
 #include "abi.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
+#include "dev/acpi.h"
 #include "dev/fb.h"
 #include "dev/pci.h"
 #include "dev/pciuser.h"
 #include "fs/vfs.h"
+#include "gui/wm.h"
 #include "mm/heap.h"
 #include "sys/proc.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 
 #define CLAIM_VECTORS 32 /* one pending bit each */
+#define CLAIM_GUARDS 32  /* registers with bits only the kernel changes (guards_init) */
+
+#define PCI_COMMAND_MEMORY (1u << 1)
+#define PCI_COMMAND_MASTER (1u << 2)
+#define PCI_COMMAND_PARITY (1u << 6)
+
+/* A config dword some of whose bits are the kernel's: a write that would change them is refused. */
+struct guard {
+    uint16_t offset;
+    uint32_t bits;
+};
 
 struct pci_claim {
     struct pci_device *d;
@@ -31,12 +44,13 @@ struct pci_claim {
     volatile uint32_t pending; /* message n arrived; cleared by take */
     struct wait_queue wq;
     unsigned vector_base, vectors;
-    /* BAR sizes, probed once at claim: the probe switches memory decoding off for a moment, which
-       would make a running function's registers read as all-ones (a GPU gone from the bus). */
-    uint64_t bar_size[6];
     unsigned refs;   /* the vnode and every BAR or DMA object made through it */
     bool released;   /* the last handle closed: BAR objects are revoked, the function stopped */
     bool dma_unsafe; /* stopping it was not confirmed: its DMA pages are never reused */
+    unsigned screen_holds; /* n_pci_hold_screen nesting; given back when the claim ends */
+    struct guard guards[CLAIM_GUARDS];
+    unsigned guard_count;
+    uint16_t pmcsr; /* the power management capability's control register, or 0 */
 };
 static struct pci_claim *claim_of_vector[256];
 
@@ -90,19 +104,38 @@ static bool function_quiet(struct pci_device *d) {
     }
 }
 
+/* A driver that is done with its device stops it and then switches bus mastering off: that is
+   how it tells the kernel the device will not reach memory again. A device that still masters
+   when its claim ends lost its driver in the middle (a crash, or a driver that never stopped
+   it), and what runs on it may be running still: a GPU's own firmware keeps the addresses it was
+   given, and switching bus mastering off only pauses it until the next driver switches it on.
+   Nothing here can stop such firmware (a function reset would also take the boot screen with
+   it), so the DMA memory it was given never returns to the allocator. */
 static void claim_release(struct vnode *v) {
     struct pci_claim *c = v->priv;
     struct pci_device *d = c->d;
     c->released = true;
     shared_revoke_claim(c); /* no process reaches the registers any more */
     interrupts_off(c);
-    pci_write16(d->bus, d->dev, d->func, 4, pci_read16(d->bus, d->dev, d->func, 4) & ~0x4u); /* bus mastering off */
+    uint16_t command = pci_read16(d->bus, d->dev, d->func, 4);
+    bool left_running = command & PCI_COMMAND_MASTER;
+    pci_write16(d->bus, d->dev, d->func, 4, command & ~PCI_COMMAND_MASTER);
     bool stopped = (pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) != 0xFFFF &&
-                   !(pci_read16(d->bus, d->dev, d->func, 4) & 4);
-    c->dma_unsafe = !stopped || !function_quiet(d);
-    if (c->dma_unsafe)
+                   !(pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER);
+    c->dma_unsafe = left_running || !stopped || !function_quiet(d);
+    if (left_running)
+        kprintf("pci: %02x:%02x.%u: its driver ended without stopping it (bus mastering was on); "
+                "its DMA memory stays out of use\n", d->bus, d->dev, d->func);
+    else if (c->dma_unsafe && stopped && !d->pcie_cap)
+        kprintf("pci: %02x:%02x.%u is conventional PCI and cannot report its requests done; its DMA memory "
+                "stays out of use\n", d->bus, d->dev, d->func);
+    else if (c->dma_unsafe)
         kprintf("pci: %02x:%02x.%u still has requests in flight; its DMA memory stays out of use\n",
                 d->bus, d->dev, d->func);
+    /* A driver that ended while it rebuilt the way to the screen leaves it however it is; drawing
+       again is the only way the desktop can come back. */
+    for (; c->screen_holds; c->screen_holds--)
+        if (fb_release()) wm_repaint();
     d->claimed = false;
     kprintf("pci: %02x:%02x.%u released\n", d->bus, d->dev, d->func);
     kfree(v);
@@ -142,6 +175,73 @@ static struct pci_device *upstream_of(const struct pci_device *d) {
     return NULL;
 }
 
+static void guard(struct pci_claim *c, uint32_t offset, uint32_t bits) {
+    ASSERT(!(offset & 3) && c->guard_count < CLAIM_GUARDS);
+    c->guards[c->guard_count++] = (struct guard){(uint16_t)offset, bits};
+}
+
+/* The registers a driver uses but some of whose bits decide things beyond its device: how the
+   function reaches the rest of the system, resets it, or changes what its BARs decode. The
+   whole-register ones (BARs, MSI, MSI-X) are kernel_register's. RM tolerates a refused write: it
+   does not check what the platform's config accessors return. */
+static void guards_init(struct pci_claim *c) {
+    struct pci_device *d = c->d;
+    /* Command: memory decode, bus mastering and parity response are the driver's. I/O decode
+       (apps reach no I/O ports), INTx (apps get no legacy interrupt; one left asserting would
+       hold a shared line) and the legacy PCI bits stay as the kernel set them. */
+    guard(c, 0x04, 0xFFFFu & ~(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER | PCI_COMMAND_PARITY));
+    guard(c, 0x0C, 1u << 30); /* BIST: start */
+    guard(c, 0x3C, 0xFF);     /* Interrupt Line: the platform's routing record */
+    uint8_t pm = pci_find_cap(d, 0x01);
+    if (pm) {
+        c->pmcsr = pm + 4;
+        guard(c, c->pmcsr, 3); /* power state: sleep belongs to dev/pm.c; waking to D0 is let through */
+    }
+    if (d->pcie_cap) {
+        /* Device Control: Max_Payload_Size must match the whole path to the root, phantom
+           functions widen the requester IDs, and Initiate FLR resets the function. */
+        guard(c, d->pcie_cap + 0x08, 7u << 5 | 1u << 9 | 1u << 15);
+        guard(c, d->pcie_cap + 0x10, 1u << 4);            /* Link Control: Link Disable */
+        guard(c, d->pcie_cap + 0x30, 1u << 4 | 1u << 10); /* Link Control 2: Enter (Modified) Compliance */
+    }
+    /* Extended capabilities (ECAM only): BAR sizes, virtual functions, and the controls that
+       decide how its requests are routed and translated. */
+    static const uint16_t sized[] = {0x15, 0x24}; /* Resizable BAR, VF Resizable BAR */
+    for (unsigned k = 0; k < 2; k++) {
+        uint16_t rebar = pci_find_ext_cap(d, sized[k]);
+        if (!rebar) continue;
+        unsigned bars = (pci_read32(d->bus, d->dev, d->func, rebar + 8) >> 5) & 7;
+        for (unsigned i = 0; i < bars && i < 6; i++) guard(c, rebar + 8 + 8 * i, 0x3F00); /* BAR Size */
+    }
+    uint16_t sriov = pci_find_ext_cap(d, 0x10);
+    if (sriov) {
+        guard(c, sriov + 0x08, 0xFFFF); /* SR-IOV Control */
+        guard(c, sriov + 0x10, 0xFFFF); /* NumVFs */
+    }
+    uint16_t acs = pci_find_ext_cap(d, 0x0D), ats = pci_find_ext_cap(d, 0x0F);
+    uint16_t pri = pci_find_ext_cap(d, 0x13), pasid = pci_find_ext_cap(d, 0x1B);
+    if (acs) guard(c, acs + 4, 0xFFFF0000);   /* ACS Control */
+    if (ats) guard(c, ats + 4, 0xFFFF0000);   /* ATS Control */
+    if (pri) guard(c, pri + 4, 0x3);          /* Page Request Control: enable, reset */
+    if (pasid) guard(c, pasid + 4, 0x70000);  /* PASID Control */
+}
+
+/* A write of `width` bytes at `offset` would change a bit only the kernel changes. */
+static bool guarded(const struct pci_claim *c, uint32_t offset, uint32_t width, uint32_t value) {
+    uint32_t dword = offset & ~3u, shift = (offset & 3) * 8;
+    uint32_t written = width == 4 ? ~0u : ((1u << (width * 8)) - 1) << shift;
+    for (unsigned i = 0; i < c->guard_count; i++) {
+        if (c->guards[i].offset != dword) continue;
+        const struct pci_device *d = c->d;
+        uint32_t old = pci_read32(d->bus, d->dev, d->func, dword);
+        uint32_t now = (old & ~written) | ((value << shift) & written);
+        uint32_t bits = c->guards[i].bits;
+        if (dword == c->pmcsr && !(now & 3)) bits &= ~3u; /* back to D0 */
+        if ((old ^ now) & bits) return true;
+    }
+    return false;
+}
+
 int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out) {
     struct task *t = task_process();
     /* Boot options: noappdrivers keeps every function with the kernel; appdrivers=any lets any
@@ -152,6 +252,8 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     struct pci_device *d = find_function(bus, dev, func);
     if (!d) return -N_ERR_NOT_FOUND;
     if (d->kernel_owned || d->claimed) return -N_ERR_BUSY;
+    /* A bridge's registers route other devices' memory, buses and resets. */
+    if (d->cls == 0x06) return -N_ERR_DENIED;
     struct vnode *v = kzalloc(sizeof *v);
     struct pci_claim *c = kzalloc(sizeof *c);
     if (!v || !c) { kfree(v); kfree(c); return -N_ERR_NO_MEMORY; }
@@ -163,14 +265,19 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     c->d = d;
     c->v = v;
     c->refs = 1;
-    for (unsigned i = 0; i < 6; i++) {
-        c->bar_size[i] = pci_bar_size(d, i);
-        if (c->bar_size[i] && !(d->bar[i] & 1) && ((d->bar[i] >> 1) & 3) == 2) i++; /* 64-bit: the upper half is no BAR */
-    }
+    guards_init(c);
+    /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
+       decoding off under a running function, and the boot screen may be drawn through it. */
     struct file *f = vfs_open_vnode(v, O_RDWR);
     if (!f) { kfree(c); kfree(v); return -N_ERR_NO_MEMORY; }
     d->claimed = true;
     kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d\n", bus, dev, func, d->vendor, d->device, t->pid);
+    static bool isolation_told;
+    if (acpi_iommu_state() == ACPI_IOMMU_BLOCKING)
+        kprintf("pci: %02x:%02x.%u: the firmware's IOMMU may refuse its DMA (see the acpi lines)\n", bus, dev, func);
+    else if (!isolation_told)
+        kprintf("pci: no IOMMU isolates devices given to apps: their DMA reaches all of memory\n");
+    isolation_told = true;
     *out = f;
     return 0;
 }
@@ -178,6 +285,19 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
 static unsigned msix_table_size(const struct pci_device *d) {
     uint8_t cap = pci_find_cap(d, 0x11);
     return cap ? ((pci_read32(d->bus, d->dev, d->func, cap) >> 16) & 0x7FF) + 1 : 0;
+}
+
+/* The memory BAR the boot screen is drawn through, or -1. */
+static int screen_bar(const struct pci_device *d) {
+    if (!fb.addr) return -1;
+    for (unsigned i = 0; i < pci_bar_count(d); i++) {
+        uint32_t raw = d->bar[i];
+        if (raw & 1) continue;
+        uint64_t address = pci_bar_address(d, i), size = pci_bar_size(d, i);
+        if (address && size && fb.phys >= address && fb.phys - address < size) return (int)i;
+        if (((raw >> 1) & 3) == 2) i++;
+    }
+    return -1;
 }
 
 int64_t pci_user_info(struct file *f, struct n_pci_function *out) {
@@ -196,28 +316,44 @@ int64_t pci_user_info(struct file *f, struct n_pci_function *out) {
     out->msix_vectors = msix_table_size(d);
     struct pci_device *up = upstream_of(d);
     out->upstream = up ? N_PCI_TARGET(up->bus, up->dev, up->func) : N_PCI_NONE;
-    out->framebuffer_bar = N_PCI_NONE;
-    for (unsigned i = 0; i < 6; i++) {
+    for (unsigned i = 0; i < pci_bar_count(d); i++) {
         uint32_t raw = d->bar[i];
         if (raw & 1) { out->bar[i] = (struct n_pci_bar){.address = raw & ~3u, .flags = N_PCI_BAR_IO}; continue; }
-        uint64_t address = pci_bar_address(d, i), size = c->bar_size[i];
+        uint64_t address = pci_bar_address(d, i), size = pci_bar_size(d, i);
         if (!address || !size) continue;
         uint32_t flags = N_PCI_BAR_MEMORY | (raw & 8 ? N_PCI_BAR_PREFETCH : 0);
         bool wide = ((raw >> 1) & 3) == 2;
         if (wide) flags |= N_PCI_BAR_64BIT;
         out->bar[i] = (struct n_pci_bar){.address = address, .size = size, .flags = flags};
-        uint64_t fb_bytes = (uint64_t)fb.pitch * fb.height;
-        if (fb.phys && fb.phys >= address && fb.phys - address < size) {
-            out->framebuffer_address = fb.phys;
-            out->framebuffer_size = fb_bytes;
-            out->framebuffer_bar = i;
-            out->framebuffer_width = fb.width;
-            out->framebuffer_height = fb.height;
-            out->framebuffer_pitch = fb.pitch;
-            out->framebuffer_bpp = fb.bpp;
-        }
         if (wide) i++; /* the upper half has no BAR of its own */
     }
+    out->framebuffer_bar = N_PCI_NONE;
+    int screen = screen_bar(d);
+    if (screen >= 0) {
+        out->framebuffer_address = fb.phys;
+        out->framebuffer_size = (uint64_t)fb.pitch * fb.height;
+        out->framebuffer_bar = (uint32_t)screen;
+        out->framebuffer_width = fb.width;
+        out->framebuffer_height = fb.height;
+        out->framebuffer_pitch = fb.pitch;
+        out->framebuffer_bpp = fb.bpp;
+    }
+    return 0;
+}
+
+int64_t pci_user_hold_screen(struct file *f, bool hold) {
+    struct pci_claim *c = claim_of(f);
+    if (!c) return -N_ERR_WRONG_KIND;
+    if (screen_bar(c->d) < 0) return -N_ERR_NOT_FOUND;
+    if (hold) {
+        if (c->screen_holds == UINT32_MAX) return -N_ERR_BUSY;
+        c->screen_holds++;
+        fb_hold();
+        return 0;
+    }
+    if (!c->screen_holds) return -N_ERR_INVALID;
+    c->screen_holds--;
+    if (fb_release()) wm_repaint();
     return 0;
 }
 
@@ -273,7 +409,8 @@ static bool kernel_register(const struct pci_device *d, uint32_t offset, uint32_
    never moved. Half way through a 64-bit BAR it decodes at a mixed address, but only requests
    inside the bridge window above it reach it, so that touches no other device. */
 static bool bar_restore(const struct pci_device *d, uint32_t offset, uint32_t width, uint32_t value) {
-    return width == 4 && offset >= 0x10 && offset < 0x28 && value == d->bar[(offset - 0x10) / 4];
+    return width == 4 && offset >= 0x10 && offset < 0x10 + 4 * pci_bar_count(d) &&
+           value == d->bar[(offset - 0x10) / 4];
 }
 
 int64_t pci_user_config_write(struct file *f, uint32_t offset, uint32_t width, uint32_t value) {
@@ -282,6 +419,7 @@ int64_t pci_user_config_write(struct file *f, uint32_t offset, uint32_t width, u
     if (!config_access_ok(offset, width)) return -N_ERR_INVALID;
     struct pci_device *d = c->d;
     if (kernel_register(d, offset, width) && !bar_restore(d, offset, width, value)) return -N_ERR_DENIED;
+    if (guarded(c, offset, width, value)) return -N_ERR_DENIED;
     if (width == 4) pci_write32(d->bus, d->dev, d->func, offset, value);
     else if (width == 2) pci_write16(d->bus, d->dev, d->func, offset, value);
     else pci_write8(d->bus, d->dev, d->func, offset, value);
@@ -293,7 +431,7 @@ int64_t pci_user_bar(struct file *f, uint32_t bar, uint64_t *address, uint64_t *
     if (!c) return -N_ERR_WRONG_KIND;
     if (bar > 5) return -N_ERR_INVALID;
     if (c->d->bar[bar] & 1) return -N_ERR_UNSUPPORTED; /* I/O ports */
-    uint64_t a = pci_bar_address(c->d, bar), s = c->bar_size[bar];
+    uint64_t a = pci_bar_address(c->d, bar), s = pci_bar_size(c->d, bar);
     if (!a || !s) return -N_ERR_NOT_FOUND;
     /* A smaller BAR shares its page with whatever lies beside it. */
     if ((a | s) & (PAGE_SIZE - 1)) return -N_ERR_UNSUPPORTED;

@@ -5,6 +5,7 @@
 #include "arch/cpu.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "sys/sched.h"
 
 struct fb_info fb;
 
@@ -20,6 +21,8 @@ static void build_lut(uint32_t *lut, uint8_t *size, uint8_t shift, uint32_t bpp)
     uint32_t max = (1u << *size) - 1;
     for (unsigned v = 0; v < 1024; v++) lut[v] = (v * max + 511) / 1023 << shift;
 }
+
+static void hold_limit_init(void);
 
 void fb_init(struct limine_framebuffer *f) {
     fb.addr = f->address;
@@ -43,6 +46,7 @@ void fb_init(struct limine_framebuffer *f) {
                 fb.rsize == 8 && fb.gsize == 8 && fb.bsize == 8;
     fb.native_bpc = fb.bpc;
     fb_set_simulated(cmdline_has("fbsim10"));
+    hold_limit_init();
 }
 
 /* Run the whole 10 bpc pipeline on an 8 bpc display (every QEMU/Hyper-V
@@ -73,6 +77,8 @@ static inline unsigned dither8(unsigned v10, unsigned threshold) {
 }
 
 struct present_job { const uint32_t *src; const uint8_t *deep; int pitch, deep_pitch, x, y, w, h; };
+static void present_area(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
+                         int x, int y, int w, int h);
 
 /* Disjoint row tiles only. No allocation, scheduling, device commands or FPU.
  * The framebuffer writes remain scalar: WHPX does not emulate SIMD MMIO. */
@@ -112,9 +118,93 @@ static void present_rows(size_t tile, void *context) {
     }
 }
 
+/* ---- holding the screen ----
+   A display driver that rebuilds the way the CPU reaches the framebuffer (NVIDIA's RM switches
+   the BAR the boot screen lies in to virtual mode during its start and stop) asks that nothing is
+   written there meanwhile. While a hold lasts, fb_present writes nothing: the compositor and the
+   console keep drawing into their RAM canvases, and the whole screen is drawn again when the last
+   hold ends. A hold that outlives the limit (boot option fbhold=<seconds>, 0 for none) is a driver
+   stuck in its start (a GPU that does not answer can keep RM there for minutes): drawing resumes
+   then, so the desktop and the driver's log can be seen again, and a late release only ends the
+   hold's bookkeeping. Kernel code runs on the BSP, but a present runs with interrupts on and can be
+   preempted half way (fbparallel tiles join before it returns): a hold waits until no present is
+   between its check and its end. The panic screen is drawn whatever is held. */
+static unsigned hold_count;    /* atomic */
+static unsigned presenting;    /* atomic: fb_present calls between their check and return */
+static uint64_t hold_since_ms; /* when hold_count left 0 */
+static bool hold_expired;      /* atomic: presents go on although hold_count > 0 */
+static bool expiry_noticed;    /* atomic: the compositor has been told (fb_take_expiry) */
+static bool holds_dropped;     /* the kernel stopped (panic): nothing is held any more */
+static uint64_t hold_limit_ms = 30000;
+
+static void hold_limit_init(void) {
+    uint64_t seconds;
+    if (cmdline_number("fbhold", &seconds)) hold_limit_ms = seconds > UINT64_MAX / 1000 ? 0 : seconds * 1000;
+}
+
+void fb_hold(void) {
+    if (__atomic_fetch_add(&hold_count, 1, __ATOMIC_ACQ_REL) == 0) {
+        hold_since_ms = uptime_ms();
+        __atomic_store_n(&expiry_noticed, false, __ATOMIC_RELAXED);
+        __atomic_store_n(&hold_expired, false, __ATOMIC_RELEASE);
+        if (hold_limit_ms)
+            kprintf("fb: a display driver holds the screen (drawing resumes after %lu s at most)\n",
+                    (unsigned long)(hold_limit_ms / 1000));
+        else
+            kprintf("fb: a display driver holds the screen (no time limit: fbhold=0)\n");
+    }
+    while (__atomic_load_n(&presenting, __ATOMIC_ACQUIRE)) sleep_ms(1);
+    __asm__ volatile("sfence" ::: "memory"); /* write-combined pixels already sent leave the CPU now */
+}
+
+bool fb_release(void) {
+    unsigned before = __atomic_load_n(&hold_count, __ATOMIC_ACQUIRE);
+    while (before && !__atomic_compare_exchange_n(&hold_count, &before, before - 1, false, __ATOMIC_ACQ_REL,
+                                                  __ATOMIC_ACQUIRE)) {
+    }
+    if (before != 1) return false;
+    bool expired = __atomic_exchange_n(&hold_expired, false, __ATOMIC_ACQ_REL);
+    kprintf("fb: the screen was released after %lu ms%s\n", (unsigned long)(uptime_ms() - hold_since_ms),
+            expired ? " (drawing had resumed at the limit)" : "");
+    return !expired;
+}
+
+/* Presents are skipped now. Past the limit this ends that; no logging here, a present may be
+   the console's own (kprintf -> fbcon -> fb_present). */
+static bool hold_blocks(void) {
+    if (holds_dropped || !__atomic_load_n(&hold_count, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&hold_expired, __ATOMIC_ACQUIRE))
+        return false;
+    if (!hold_limit_ms || uptime_ms() - hold_since_ms < hold_limit_ms) return true;
+    __atomic_store_n(&hold_expired, true, __ATOMIC_RELEASE);
+    return false;
+}
+
+bool fb_take_expiry(void) {
+    hold_blocks(); /* the limit passes while nothing is drawn, too */
+    if (!__atomic_load_n(&hold_expired, __ATOMIC_ACQUIRE) || __atomic_exchange_n(&expiry_noticed, true, __ATOMIC_ACQ_REL))
+        return false;
+    kprintf("fb: a display driver has held the screen for %lu s; drawing again (boot option fbhold=<s>)\n",
+            (unsigned long)(hold_limit_ms / 1000));
+    return true;
+}
+
+void fb_drop_holds(void) { holds_dropped = true; }
+
 void fb_present(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
                 int x, int y, int w, int h) {
     if (!src || !fb.addr || src_pitch<=0 || w<=0 || h<=0) return;
+    __atomic_add_fetch(&presenting, 1, __ATOMIC_ACQ_REL);
+    if (hold_blocks()) {
+        __atomic_sub_fetch(&presenting, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    present_area(src, src_pitch, deep, deep_pitch, x, y, w, h);
+    __atomic_sub_fetch(&presenting, 1, __ATOMIC_RELEASE);
+}
+
+static void present_area(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
+                         int x, int y, int w, int h) {
     int64_t right=(int64_t)x+w, bottom=(int64_t)y+h;
     if (x<0) x=0;
     if (y<0) y=0;

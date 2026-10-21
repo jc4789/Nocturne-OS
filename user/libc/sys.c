@@ -359,6 +359,7 @@ n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint3
 n_handle n_pci_bar(n_handle pci, uint32_t bar) { return (n_handle)NC5(SYS_PCI_BAR, pci, bar, 0, 0, 0); }
 n_result n_pci_interrupts(n_handle pci, uint32_t count) { return NC5(SYS_PCI_INTERRUPTS, pci, count, 0, 0, 0); }
 n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms) { return NC5(SYS_PCI_INTERRUPT_TAKE, pci, timeout_ms, 0, 0, 0); }
+n_result n_pci_hold_screen(n_handle pci, bool hold) { return NC5(SYS_PCI_HOLD_SCREEN, pci, hold ? 1 : 0, 0, 0, 0); }
 n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags) { return (n_handle)NC5(SYS_DMA_CREATE, pci, bytes, flags, 0, 0); }
 n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size_t count) {
     return NC5(SYS_DMA_ADDRESSES, shared, first_page, out, count, 0);

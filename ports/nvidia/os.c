@@ -176,7 +176,36 @@ static NvU32 debug_level;
 void NV_API_CALL os_dbg_init(void) {}
 void NV_API_CALL os_dbg_set_level(NvU32 level) { debug_level = level; }
 void NV_API_CALL os_dbg_breakpoint(void) { nvrm_log("NVRM: os_dbg_breakpoint (ignored)"); }
-void NV_API_CALL os_dump_stack(void) {}
+/* RM asks for the stack when it reports a failed assertion or a breakpoint. nvrm is built with
+   frame pointers (nvrm.mk) and linked at a fixed address, so the saved frame pointers chain
+   through this thread's stack and each return address is one of the nvrm binary in the build
+   (addr2line -e nvrm). The walk stays inside the stack and only moves toward its base, so a
+   damaged chain ends it instead of faulting or looping. */
+void NV_API_CALL os_dump_stack(void) {
+    uintptr_t low = 0, high = 0;
+    if (thread_stack_bounds(&low, &high) < 0) {
+        nvrm_log("NVRM: stack: this thread's stack is unknown");
+        return;
+    }
+    char line[256];
+    int used = snprintf(line, sizeof line, "NVRM: stack:");
+    const uintptr_t *frame = __builtin_frame_address(0);
+    for (;;) {
+        uintptr_t at = (uintptr_t)frame;
+        if (at % sizeof(uintptr_t) || at < low || high - at < 2 * sizeof(uintptr_t)) break;
+        uintptr_t return_address = frame[1];
+        if (!return_address) break;
+        if (used > (int)sizeof line - 24) {
+            nvrm_log("%s", line);
+            used = snprintf(line, sizeof line, "NVRM: stack (more):");
+        }
+        used += snprintf(line + used, sizeof line - (size_t)used, " %#llx", (unsigned long long)return_address);
+        const uintptr_t *caller = (const uintptr_t *)frame[0];
+        if ((uintptr_t)caller <= at) break;
+        frame = caller;
+    }
+    nvrm_log("%s", line);
+}
 void NV_API_CALL os_bug_check(NvU32 code, const char *message) {
     nvrm_log("NVRM: bug check 0x%x: %s", (unsigned)code, message ? message : "");
     nvrm_log_flush();

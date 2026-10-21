@@ -314,6 +314,7 @@ static void panic_draw(const char *msg, struct regs *r) {
     pr_y += 10;
     pline(&c, "Please restart the virtual machine. Sweet dreams.", 0xFF8E9AC8);
     enabled = true;
+    fb_drop_holds();
     fb_present(c.px, c.pitch, NULL, 0, 0, 0, c.w, c.h);
 }
 

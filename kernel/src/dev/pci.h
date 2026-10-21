@@ -6,6 +6,7 @@ struct pci_device {
     uint16_t vendor, device;
     uint8_t cls, subcls, progif, irq;
     uint32_t bar[6];
+    uint64_t bar_size[6]; /* memory BARs, measured once during enumeration; 0 for I/O, unused, upper halves */
     uint8_t pcie_cap;  /* PCI Express capability offset, 0 for conventional PCI */
     uint8_t pcie_type; /* device/port type field of the PCIe capability (valid when pcie_cap != 0) */
     uint16_t msix_entries;      /* set by pci_msix_init() */
@@ -28,6 +29,9 @@ int pci_count(void);
 struct pci_device *pci_at(int index);
 /* Memory BAR base (64-bit BARs combined); 0 for I/O, unassigned or out-of-range BARs. */
 uint64_t pci_bar_address(const struct pci_device *d, unsigned bar);
+/* How many BAR dwords the function's header type has (6, 2 for a bridge, 1 for CardBus). */
+unsigned pci_bar_count(const struct pci_device *d);
+/* Its size, as measured during enumeration (pci_init), so asking never touches the device. */
 uint64_t pci_bar_size(const struct pci_device *d, unsigned bar);
 uint8_t pci_find_cap(const struct pci_device *d, uint8_t id);
 /* Extended capability (config offset 0x100 chain, PCIe): its offset, or 0. Needs ECAM. */

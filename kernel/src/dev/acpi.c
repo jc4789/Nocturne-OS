@@ -248,6 +248,88 @@ static void parse_mcfg(void) {
     }
 }
 
+/* ---- DMAR (Intel VT-d) and IVRS (AMD I/O virtualization) ----
+   Read only: Nocturne does not program an IOMMU. What matters at boot is whether the firmware
+   handed over a unit still translating (or, on VT-d, with protected memory regions on): device
+   DMA outside what the firmware set up is then blocked. Register offsets are the VT-d
+   specification's (CAP 0x08, GSTS 0x1C, PMEN 0x64) and the AMD IOMMU specification's (control
+   0x18). */
+static enum acpi_iommu iommu_state = ACPI_IOMMU_NONE;
+
+static uint32_t iommu_reg32(uint64_t base, unsigned offset) {
+    const volatile uint8_t *regs = vmm_map_mmio(base, PAGE_SIZE);
+    return *(const volatile uint32_t *)(regs + offset);
+}
+
+static void iommu_found(bool blocking) {
+    if (blocking) iommu_state = ACPI_IOMMU_BLOCKING;
+    else if (iommu_state == ACPI_IOMMU_NONE) iommu_state = ACPI_IOMMU_OFF;
+}
+
+static void parse_dmar(void) {
+    const struct acpi_sdt *h = acpi_find("DMAR", 0);
+    if (!h || h->length < sizeof *h + 12) return;
+    const uint8_t *b = (const uint8_t *)h;
+    uint8_t flags = b[sizeof *h + 1];
+    kprintf("acpi: DMAR (VT-d), %u-bit addresses, interrupt remapping %s, DMA protection %s by the firmware\n",
+            b[sizeof *h] + 1u, flags & 1 ? "supported" : "absent", flags & 4 ? "requested" : "not requested");
+    for (uint32_t off = sizeof *h + 12; off + 4 <= h->length;) {
+        uint16_t type, length;
+        memcpy(&type, b + off, 2);
+        memcpy(&length, b + off + 2, 2);
+        if (length < 4 || off + length > h->length) break;
+        if (type == 0 && length >= 16) { /* DRHD: one remapping unit */
+            uint16_t segment;
+            uint64_t base;
+            memcpy(&segment, b + off + 6, 2);
+            memcpy(&base, b + off + 8, 8);
+            if (base) {
+                uint32_t cap = iommu_reg32(base, 0x08), status = iommu_reg32(base, 0x1C);
+                bool translating = status & (1u << 31);
+                bool protected = (cap & (3u << 5)) && (iommu_reg32(base, 0x64) & 1); /* PLMR/PHMR, PRS */
+                kprintf("acpi:   VT-d unit at %lx, segment %u%s: translation %s, protected memory regions %s\n",
+                        base, segment, b[off + 4] & 1 ? " (all other devices)" : "", translating ? "ON" : "off",
+                        protected ? "ON" : "off");
+                iommu_found(translating || protected);
+            }
+        }
+        off += length;
+    }
+}
+
+static void parse_ivrs(void) {
+    const struct acpi_sdt *h = acpi_find("IVRS", 0);
+    if (!h || h->length < sizeof *h + 12) return;
+    const uint8_t *b = (const uint8_t *)h;
+    uint64_t seen[8];
+    unsigned nseen = 0;
+    for (uint32_t off = sizeof *h + 12; off + 4 <= h->length;) {
+        uint8_t type = b[off];
+        uint16_t length;
+        memcpy(&length, b + off + 2, 2);
+        if (length < 4 || off + length > h->length) break;
+        /* Types 10h, 11h and 40h describe the same units at different detail: count each base once. */
+        if ((type == 0x10 || type == 0x11 || type == 0x40) && length >= 24) {
+            uint16_t segment;
+            uint64_t base;
+            memcpy(&base, b + off + 8, 8);
+            memcpy(&segment, b + off + 16, 2);
+            bool known = false;
+            for (unsigned i = 0; i < nseen; i++) known |= seen[i] == base;
+            if (base && !known) {
+                if (nseen < sizeof seen / sizeof *seen) seen[nseen++] = base;
+                bool translating = iommu_reg32(base, 0x18) & 1; /* IommuEn */
+                kprintf("acpi: IVRS (AMD-Vi) unit at %lx, segment %u: translation %s\n", base, segment,
+                        translating ? "ON" : "off");
+                iommu_found(translating);
+            }
+        }
+        off += length;
+    }
+}
+
+enum acpi_iommu acpi_iommu_state(void) { return iommu_state; }
+
 void acpi_tables_init(void) {
     if (tables_done) return;
     tables_done = true;
@@ -263,6 +345,11 @@ void acpi_tables_init(void) {
     kprintf("acpi: tables %s\n", line);
     parse_madt();
     parse_mcfg();
+    parse_dmar();
+    parse_ivrs();
+    if (iommu_state == ACPI_IOMMU_BLOCKING)
+        kprintf("acpi: the firmware left an IOMMU blocking DMA; Nocturne does not program it, so drivers' DMA "
+                "outside the firmware's own mappings will not reach memory\n");
 }
 
 uint64_t acpi_madt_lapic_addr(void) { return madt_lapic_addr; }

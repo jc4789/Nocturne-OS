@@ -169,24 +169,10 @@ static int e1000_send(const void *frame, size_t len) {
 }
 
 static uint32_t e1000_itr_ticks(void) {
-    extern const char *kernel_cmdline;
-    const char prefix[] = "e1000-itr-us=";
-    uint32_t ticks = ITR_DEFAULT_TICKS;
-    if (!kernel_cmdline) return ticks;
-    for (const char *p = kernel_cmdline; *p; p++) {
-        if ((p != kernel_cmdline && p[-1] != ' ') || strncmp(p, prefix, sizeof prefix - 1)) continue;
-        const char *q = p + sizeof prefix - 1;
-        uint64_t us = 0;
-        bool valid = *q >= '0' && *q <= '9';
-        while (*q >= '0' && *q <= '9') {
-            unsigned digit = *q++ - '0';
-            if (us > (UINT64_MAX - digit) / 10) valid = false;
-            if (valid) us = us * 10 + digit;
-        }
-        if (!valid || (*q && *q != ' ') || us > (uint64_t)UINT16_MAX * ITR_TICK_NS / 1000) continue;
-        ticks = (uint32_t)((us * 1000 + ITR_TICK_NS - 1) / ITR_TICK_NS);
-    }
-    return ticks;
+    uint64_t us;
+    if (!cmdline_number("e1000-itr-us", &us) || us > (uint64_t)UINT16_MAX * ITR_TICK_NS / 1000)
+        return ITR_DEFAULT_TICKS;
+    return (uint32_t)((us * 1000 + ITR_TICK_NS - 1) / ITR_TICK_NS);
 }
 
 /* Power change (dev/pm.h): no more interrupts, receive or transmit DMA. */

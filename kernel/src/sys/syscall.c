@@ -483,6 +483,82 @@ static uint64_t cache_pte(unsigned cache) {
     return 0;
 }
 
+/* Device memory has one memory type at a time. x86 leaves a physical page reached through
+ * linear addresses of different types undefined (Intel SDM vol. 3A, PAT: aliasing is not
+ * supported), so every mapping of a device range pins the type of its pages and a mapping asking
+ * another type of a pinned page is refused while the first lives. The boot screen stays
+ * write-combined in the direct map for as long as the system runs. A pin belongs to the claim
+ * its range came through and goes with that claim (shared_revoke_claim): no mapping reaches
+ * those pages after. BSP-owned, changed with interrupts disabled. */
+struct device_pin {struct device_pin *next;const struct pci_claim *claim;uint64_t start,end;size_t refs;uint8_t cache;};
+static struct device_pin *device_pins;
+static uint8_t device_cache(uint8_t cache) { /* the type a mapping really gets */
+    return cache==N_CACHE_WRITE_COMBINE && !pat_supported()?N_CACHE_UNCACHED:cache;
+}
+static const char *cache_name(uint8_t cache) {
+    return cache==N_CACHE_WRITE_COMBINE?"write-combined":cache==N_CACHE_UNCACHED?"uncached":"write-back";
+}
+static bool device_pin(const struct pci_claim *claim,uint64_t start,uint64_t end,uint8_t cache,int64_t *error) {
+    uint64_t screen=ALIGN_DOWN(fb.phys,PAGE_SIZE),screen_end=ALIGN_UP(fb.phys+(uint64_t)fb.pitch*fb.height,PAGE_SIZE);
+    uint8_t other=fb.addr && start<screen_end && screen<end && cache!=device_cache(N_CACHE_WRITE_COMBINE)?
+                  device_cache(N_CACHE_WRITE_COMBINE):N_CACHE_DEFAULT;
+    struct device_pin *same=NULL;
+    for(struct device_pin *d=device_pins;d && other==N_CACHE_DEFAULT;d=d->next){
+        if(start<d->end && d->start<end && d->cache!=cache)other=d->cache;
+        if(d->claim==claim && d->start==start && d->end==end && d->cache==cache)same=d;
+    }
+    if(other!=N_CACHE_DEFAULT){
+        struct task *t=task_process();
+        kprintf("[shared] pid %d (%s): device memory in %#lx-%#lx is mapped %s; a %s mapping is refused\n",
+                t?t->pid:0,t?t->name:"kernel",(unsigned long)start,(unsigned long)end-1,cache_name(other),cache_name(cache));
+        *error=-N_ERR_DENIED;return false;
+    }
+    if(same){same->refs++;return true;}
+    struct device_pin *d=kmalloc(sizeof *d);
+    if(!d){*error=-N_ERR_NO_MEMORY;return false;}
+    *d=(struct device_pin){.next=device_pins,.claim=claim,.start=start,.end=end,.refs=1,.cache=cache};
+    device_pins=d;return true;
+}
+static void device_unpin(const struct pci_claim *claim,uint64_t start,uint64_t end,uint8_t cache) {
+    for(struct device_pin **link=&device_pins;*link;link=&(*link)->next){
+        struct device_pin *d=*link;
+        if(d->claim!=claim || d->start!=start || d->end!=end || d->cache!=cache)continue;
+        if(!--d->refs){*link=d->next;kfree(d);}
+        return;
+    }
+    ASSERT(pci_user_revoked(claim)); /* its pins went with the claim */
+}
+/* Pins (add) or unpins the type of the first `limit` device segments p maps. Adding stops at a
+   segment whose pages have another type, or without memory for the record (*error); the return
+   is the number of segments done. */
+static size_t device_pins_walk(struct shared_pages *p,bool add,size_t limit,int64_t *error) {
+    size_t done=0;
+    for(size_t at=0;at<p->count && done<limit;){
+        size_t page=at,span;uint8_t cache;
+        struct shared_pages *leaf=shared_leaf(p,&page,&cache,NULL,&span);
+        span=MIN(span,p->count-at);at+=span;
+        if(leaf->kind!=SHARED_RANGE || leaf->owned)continue;
+        uint64_t start=leaf->base+page*PAGE_SIZE,end=start+span*PAGE_SIZE;
+        cache=device_cache(cache);
+        if(add && !device_pin(leaf->claim,start,end,cache,error))break;
+        if(!add)device_unpin(leaf->claim,start,end,cache);
+        done++;
+    }
+    return done;
+}
+static int64_t shared_device_pin(struct shared_pages *p) {
+    int64_t error=0;size_t done=device_pins_walk(p,true,SIZE_MAX,&error);
+    if(error)device_pins_walk(p,false,done,NULL);
+    return error;
+}
+static void shared_device_unpin(struct shared_pages *p) { device_pins_walk(p,false,SIZE_MAX,NULL); }
+static void device_pins_drop(const struct pci_claim *claim) {
+    for(struct device_pin **link=&device_pins;*link;){
+        struct device_pin *d=*link;
+        if(d->claim==claim){*link=d->next;kfree(d);}else link=&d->next;
+    }
+}
+
 /* A claimed function's memory BAR: device memory, uncached unless a view says otherwise. */
 static int64_t sys_pci_bar(int h,uint32_t bar) {
     struct file *pci=getfd_ref(h);
@@ -785,6 +861,7 @@ void shared_revoke_claim(const struct pci_claim *c) {
             if(shared_device_gone(m->file->vn->priv,c))vmm_user_free(t->pml4,m->va,m->bytes);
         }
     }
+    uint64_t irq=irq_save();device_pins_drop(c);irq_restore(irq);
 }
 /* A first touch of a reserved shared page, from user code or a kernel copy
  * on its behalf: allocate the object's frame (or adopt the one a peer already
@@ -854,8 +931,12 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
     /* Reserve the VA range (reusing released ones) before publishing any PTE, so
        no other reservation can choose this partially mapped span. */
     irq=irq_save();
-    uint64_t va=mmap_reserve(owner,bytes);
-    if(!va){irq_restore(irq);vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
+    int64_t pinned=shared_device_pin(p); /* device pages keep one memory type */
+    uint64_t va=pinned<0?0:mmap_reserve(owner,bytes);
+    if(!va){
+        if(pinned>=0)shared_device_unpin(p);
+        irq_restore(irq);vfs_close(f);kfree(m);return pinned<0?pinned:-N_ERR_NO_MEMORY;
+    }
     size_t mapped=0;
     uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO);
     /* Pin DMA cache types before installing the first PTE, including every
@@ -886,7 +967,7 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
         m->cancelled=m->revoking=true;
         irq_restore(irq);
         vmm_user_free(owner->pml4,va,bytes);
-        irq=irq_save();shared_build_remove(m);shared_dma_maps(p,false);
+        irq=irq_save();shared_build_remove(m);shared_dma_maps(p,false);shared_device_unpin(p);
         m->revoking=false;wq_wake_all(&m->build_wait);irq_restore(irq);
         mmap_hole_add(owner,va,bytes+PAGE_SIZE);
         vfs_close(f);kfree(m);return result;
@@ -901,7 +982,7 @@ static void shared_unmap(struct task *owner,struct shared_mapping *m) {
     /* Keep every DMA cache pin through PTE removal and the completed TLB
        shootdown. A preempting view cannot retype still-reachable old pages. */
     vmm_user_free(owner->pml4,m->va,m->bytes);
-    uint64_t irq=irq_save();shared_dma_maps(m->file->vn->priv,false);irq_restore(irq);
+    uint64_t irq=irq_save();shared_dma_maps(m->file->vn->priv,false);shared_device_unpin(m->file->vn->priv);irq_restore(irq);
     vfs_close(m->file);kfree(m);
 }
 void sys_shared_cleanup(struct task *owner) {
@@ -1677,7 +1758,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
     case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
     case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:
-    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: {
+    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: case SYS_PCI_HOLD_SCREEN: {
         struct file *f = getfd_ref((int)a);
         if (!f) { ret = -N_ERR_NO_HANDLE; break; }
         if (r->rax == SYS_PCI_INFO) {
@@ -1687,6 +1768,7 @@ void syscall_dispatch(struct regs *r) {
         } else if (r->rax == SYS_PCI_CONFIG_READ) ret = pci_user_config_read(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
         else if (r->rax == SYS_PCI_CONFIG_WRITE) ret = pci_user_config_write(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
         else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
+        else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);
         else ret = pci_user_interrupt_take(f,(int64_t)b);
         vfs_close(f);
         break;

@@ -47,6 +47,26 @@ int cnd_wait(cnd_t *c, mtx_t *m) {
 void call_once(once_flag *flag, void (*init)(void)) { (void)flag; init(); }
 void thrd_yield(void) {}
 n_result n_app_self(void) { return 2; }
+/* The system log, so a case can count what the driver reports; there is no /data to keep a file. */
+static unsigned dropped_reports;
+n_handle n_system_log_open(void) { return 50; }
+n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach) {
+    CHECK(h == 50 && attach == -1);
+    char line[1024];
+    size_t keep = n < sizeof line - 1 ? n : sizeof line - 1;
+    memcpy(line, data, keep);
+    line[keep] = 0;
+    if (strstr(line, "does not collect")) dropped_reports++;
+    return (n_result)n;
+}
+n_result n_entry_info(const char *path, struct n_entry *out) { (void)path; (void)out; return -N_ERR_NOT_FOUND; }
+n_result n_folder_create(const char *path) { (void)path; CHECK(false); return -N_ERR_DENIED; }
+n_result n_document_append(const char *path, const void *data, size_t size) {
+    (void)path; (void)data; (void)size;
+    CHECK(false);
+    return -N_ERR_DENIED;
+}
+uint64_t n_clock_uptime_ms(void) { return 0; }
 nv_state_t *NV_API_CALL nv_get_ctl_state(void) { return &nvrm_dev.nv; }
 
 NV_STATUS NV_API_CALL rm_ioctl(nvidia_stack_t *s, nv_state_t *nv, nv_file_private_t *f,
@@ -220,10 +240,35 @@ static void wait_queue_cases(void) {
     os_free_wait_queue(q);
 }
 
+/* Events with data queue up to the bound; past it the newest are dropped until the client
+   collects. Data-less events stay one per object and index. */
+static void event_cases(void) {
+    struct nvrm_file *f = nvrm_rm_file_open(false, 12);
+    CHECK(f);
+    if (!f) return;
+    nv_event_t post = {.nvfp = &f->nvfp}, got;
+    NvU32 more = 0;
+    for (unsigned i = 0; i < EVENT_DATA_QUEUED + 10; i++) nv_post_event(&post, 0x100, 1, i, 0, NV_TRUE);
+    CHECK(f->data_events == EVENT_DATA_QUEUED && f->overflowed && dropped_reports == 1);
+    nv_post_event(&post, 0x200, 2, 0, 0, NV_FALSE);
+    nv_post_event(&post, 0x200, 2, 0, 0, NV_FALSE);
+    unsigned collected = 0, data_less = 0;
+    while (nv_get_event(&f->nvfp, &got, &more) == 0) {
+        if (got.hObject == 0x100) CHECK(got.info32 == collected++); /* oldest first, none skipped */
+        else data_less++;
+    }
+    CHECK(collected == EVENT_DATA_QUEUED && data_less == 1 && !more);
+    CHECK(f->data_events == 0 && !f->overflowed);
+    nv_post_event(&post, 0x100, 1, 7, 0, NV_TRUE);
+    CHECK(nv_get_event(&f->nvfp, &got, &more) == 0 && got.info32 == 7);
+    nvrm_rm_file_close(f);
+}
+
 int main(void) {
     principal_cases();
     mapping_cases();
     wait_queue_cases();
+    event_cases();
     printf("nvrm_contract_hosttest: %d failed (RM/native services mocked; no GPU execution)\n", failures);
     return failures != 0;
 }

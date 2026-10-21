@@ -114,6 +114,17 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C36 | nvrm が BAR0 の写像を `nv->regs->map` に置いてよい | 却下 → 修理済み | RM の `RmSetupRegisters` は自分で写像し、`aperture->map == NULL` を表明する（実機で osinit.c:168）。nvrm は BAR0 全体の写像を自分だけで持ち、`os_map_kernel_space` がその一部を返す。`nv->regs->map` は RM が設定する |
 | C37 | 構成空間は自分の装置と上流のブリッジだけ読めればよい | 却下 → 修理済み | RM の `clStoreBusTopologyCache` は装置ごとに機能 0 が答えなければ他の機能を飛ばす。AMD ではルートポートが 00:01.1 で、00:01.0 はホストブリッジ。読めないと上流ポートも FHB（ホストブリッジ、チップセットの識別）も見つからない（実機で chipset.c:463／558 の表明と「Unable to get PCI port handles」）。カーネルは、上流の各ブリッジの装置の全機能とホストブリッジ（06/00）の読みも許す。無関係な装置は今まで通り `N_ERR_DENIED` |
 | C38 | rm_init_adapter が止まっても分かる | 却下 → 修理済み | GSP の起動はうまくいくと何も出さないので、固まったのか遅いのかが見分けられない。nvrm は rm_init_adapter の間 10 秒ごとに経過と処理した割り込みの数を、終わると所要時間と成否をログへ出す |
+| C39 | nvrm は BME（バスマスター）を入れなくてよい | 却下 → 修理済み | カーネルは claim の間 BME を入れない。`nvrm_pci_bus_master` が `rm_init_adapter` の前に Command の BME を入れ（読み戻しで確かめ、書込みが効かない装置は失敗）、初期化の失敗後と `rm_shutdown_adapter` の後に切る。claim の終わりに BME が残っていれば異常終了とみなし、DMA の RAM を隔離 |
+| C40 | 画面の取得・解放（`os_disable_console_access` 等）は空でよい | 却下 → 修理済み | RM が BAR1 を仮想モードにする間、システムが起動時の画面へ書くと GPU の外へ書く。新しい `n_pci_hold_screen`（入れ子、`fbhold=` 秒の上限つき、パニックは無視して描く、claim の終わりで返し全体を描き直す）。画面が他の所なら NOT_FOUND を無視 |
+| C41 | `nv_alloc_pages` のキャッシュ型と `os_flush_cpu_cache_all` は無視してよい | 却下 → 修理済み | UC／WC の確保は型つきの view を作って DMA の RAM の型を固定する（直接写像も同じ型）。全キャッシュの書出しは特権命令なので `NOT_SUPPORTED` を返し、RM の呼出し側に任せる（黙って成功しない） |
+| C42 | 装置メモリは UC と WC の別名があってもよい | 却下 → 修理済み | 生きている写像の間、装置の 1 ページに型は一つ（SDM の PAT 別名の規則）。違う型の写像は DENIED でログに出す。起動時の画面はカーネルが WC で写しているので UC の写像は常に DENIED |
+| C43 | 初期化に失敗した GPU も開ける | 却下 → 修理済み | `nv_is_gpu_accessible` は `adapter_ready` のときだけ真。RM 自身の `deviceConstruct` が権限不足で断り、制御装置の診断は使える（実ドライバーと同じ形） |
+| C44 | サーバーは一つのループで足りる | 却下 → 修理済み | 接続ごとにスレッド。受付はメインループだけ。RM の順序は RM の錠が決める。終了は `serving_ended` のアドレス監視で全スレッドを起こし、全部が終わるまで待つ。スレッドを作れない接続は閉じてログ |
+| C45 | イベントの待ち行列に上限は要らない | 却下 → 修理済み | データつきイベントは接続ごとに 4096 件まで。超えたら新しい方を捨て、接続ごとに一度ログ。取り出すと再び受け付ける。データなしは対象ごとに一つ（C32 を実際に上限つきへ） |
+| C46 | `os_dump_stack` は空でよい | 却下 → 修理済み | nvrm はフレームポインターつきでビルドしているので、スレッドのスタック範囲の中だけフレームを辿り、戻り番地をログへ出す（範囲外・逆向き・非整列で止まる） |
+| C47 | 構成空間の保護は Command と BAR だけで足りる | 却下 → 修理済み | ABI 文書 §9 の一覧（BIST、Interrupt Line、PMCSR、DevCtl、LinkCtl／2、ReBAR、SR-IOV、ACS・ATS・PRI・PASID）。読んで一部を変えて書き戻すなら通る。ブリッジは claim できない |
+| C48 | IOMMU で DMA を隔離している | 受理（限界として） | Nocturne は IOMMU を設定しない。起動時に DMAR／IVRS を読み、ファームウェアが変換を入れたまま渡したかをログに出し、claim のログで知らせる。隔離は対象外（C14） |
+| C49 | claim の時に BAR の大きさを測ってよい | 却下 → 修理済み | 測るとメモリデコードを切るので、起動時の画面がその BAR にあると壊れる。大きさは列挙時の値（`pci_bar_size`）を使う |
 
 ## 5. 担当と受け渡し
 
@@ -132,6 +143,19 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-21：3件の静的監査（A1〜A4、B1〜B5、F1〜F3）を照合し、C39〜C49 として修理。新しい ABI
+  `n_pci_hold_screen`（`SYS_PCI_HOLD_SCREEN`）のため全体ビルド（img・vhd・vhdx・iso）。ホスト試験
+  （dma・contract・transport）は 0 failed：型つき確保、BME の入切と読み戻し、画面保持の入れ子、
+  イベント上限（4096 件で止まり、古い順に欠けずに取れ、ログは一度）、サーバー停止の起こし方。
+  QEMU 一台（WHPX、4 コア、4096 MiB、1920×1080、AHCI 起動、snapshot、`-vga std -device edu`）：
+  `pcitest: 0 failed`（Command・BIST・Interrupt Line・D3 の拒否、ブリッジの claim 拒否、BME を残した
+  終了で DMA の RAM が隔離され次の claim で BME が 0、std VGA の画面ページの UC 拒否・WC 可・UC と WC の
+  別名拒否、画面保持の入れ子と claim 終了での返却）、`nvrmtest: 0 failed`。保持の解放後に机上と
+  ブラウザーが描き直されたこと、ホイールの下と上、JavaScript demo へのリンクと Alt+Left を実入力で
+  見た。回帰なし。q35＋`intel-iommu` で DMAR の行（fed90000、48 ビット、変換 off）を確認（q35 には
+  旧 IDE が無く /data は読めないので試験は pc 機種で）。従来型 PCI の解放ログが「要求が残っている」と
+  誤って言っていたのを「完了を報告できない」に直した。RTX 4070 の実機は未実施（ユーザー）。
 
 - 2026-10-20：実機 2 回目（ユーザー）。C35 の修理で rm_init_rm を越え、rm_init_adapter の中まで進んだ。
   BAR0 16 MiB at 0xfb000000、BAR1（ReBAR）16 GiB at 0xf800000000、ファームウェア 2 本を読込み。

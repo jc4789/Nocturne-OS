@@ -1,9 +1,13 @@
 /* nvrm's request server: clients connect on NVRM_CHANNEL (include/nvrm_protocol.h), each with an
-   argument arena both sides map; requests run one at a time through the RM OS layer
+   argument arena both sides map. Every client is served by a thread of its own, so a request that
+   waits on the GPU (a GSP control call, an idle wait, a fence) holds up only its own client; RM
+   orders concurrent requests with its own locks (the API lock and the GPU locks), as it does for
+   the threads of different processes in an ioctl. Requests go through the RM OS layer
    (nvrm_serve.h), and pointers inside them reach only the requesting client's arena. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include "nocturne.h"
 #include "nvrm_protocol.h"
 #include "nvrm_serve.h"
@@ -15,10 +19,13 @@
 
 #define LISTENER_TOKEN 0
 #define LEGACY_LISTENER_TOKEN 1
+/* A client thread's own event queue */
+#define CHANNEL_TOKEN 0
+#define STOP_TOKEN 1
 
 struct client {
-    struct client *next;
     n_handle channel, arena_handle;
+    n_handle events;          /* the client thread's: its channel and the server's end */
     uint8_t *arena;           /* nvrm's mapping */
     uint64_t arena_address;   /* the client's */
     size_t arena_bytes;
@@ -26,7 +33,13 @@ struct client {
     void *file;               /* RM's state for this client */
 };
 
-static struct client *clients, *current;
+/* The request a thread is serving: os_memcpy_from_user / os_memcpy_to_user run on it. */
+static thread_local struct client *current;
+
+static mtx_t threads_lock;
+static cnd_t thread_ended;
+static size_t client_threads;    /* client threads still running (threads_lock) */
+static uint32_t serving_ended;   /* set once, woken by address: every client thread ends */
 
 void *nvrm_user_translate(const void *user, size_t n) {
     uint64_t at = (uint64_t)(uintptr_t)user;
@@ -36,13 +49,12 @@ void *nvrm_user_translate(const void *user, size_t n) {
     return current->arena + off;
 }
 
-static void client_end(n_handle events, struct client *c) {
-    n_events_unwatch(events, (uint64_t)(uintptr_t)c);
-    for (struct client **link = &clients; *link; link = &(*link)->next)
-        if (*link == c) { *link = c->next; break; }
+/* Frees everything the client still holds in RM, then the connection. */
+static void client_end(struct client *c) {
     if (c->file) nvrm_rm_file_close(c->file);
     if (c->arena) n_memory_release(c->arena, c->arena_bytes);
     if (c->arena_handle >= 0) n_handle_close(c->arena_handle);
+    if (c->events >= 0) n_handle_close(c->events);
     n_handle_close(c->channel);
     free(c);
 }
@@ -79,17 +91,17 @@ static n_result hello(struct client *c, const struct nvrm_message *head, n_handl
     return c->file ? 0 : -N_ERR_NO_MEMORY;
 }
 
-static void request(n_handle events, struct client *c) {
+/* Serves the client's next message; false when the client is to be ended. */
+static bool request(struct client *c) {
     n_result pending = n_channel_receive(c->channel, NULL, 0, N_CHANNEL_PEEK, NULL);
-    if (pending == -N_ERR_NOT_READY) return;
-    /* The wire size field is uint32_t; no smaller driver-specific ceiling. */
+    if (pending == -N_ERR_NOT_READY) return true;
+    /* The wire size field is uint32_t; no smaller driver-specific ceiling. The message is already
+       in the system's channel buffer, so this copy is no larger than what the client sent. */
     if (pending < (n_result)sizeof(struct nvrm_message) ||
-        (uint64_t)pending - sizeof(struct nvrm_message) > UINT32_MAX || (uint64_t)pending > SIZE_MAX) {
-        client_end(events, c);
-        return;
-    }
+        (uint64_t)pending - sizeof(struct nvrm_message) > UINT32_MAX || (uint64_t)pending > SIZE_MAX)
+        return false;
     struct nvrm_message *packet = malloc((size_t)pending);
-    if (!packet) { client_end(events, c); return; }
+    if (!packet) return false;
     struct n_channel_message received = {.attached = -1};
     n_result got = n_channel_receive_from(c->channel, packet, (size_t)pending, 0, &received);
     n_handle attached = received.attached;
@@ -98,8 +110,7 @@ static void request(n_handle events, struct client *c) {
         /* the channel closed, or the client does not speak this protocol */
         if (attached >= 0) n_handle_close(attached);
         free(packet);
-        client_end(events, c);
-        return;
+        return false;
     }
     packet->offset = packet->bytes = 0;
     /* Credentials describe the sender at send time, not the endpoint creator.
@@ -154,26 +165,85 @@ static void request(n_handle events, struct client *c) {
     /* RM keeps its view handle until unmap/close, so it can revoke all derived maps. */
     bool sent = reply(c, packet, mapped);
     free(packet);
-    if (!sent) client_end(events, c);
-    return;
+    return sent;
 send:
-    {
-        bool sent = reply(c, packet, -1);
-        free(packet);
-        if (!sent) client_end(events, c);
+    sent = reply(c, packet, -1);
+    free(packet);
+    return sent;
+}
+
+/* One client's thread: its messages in order until it disconnects, sends what is not this
+   protocol, or the server ends. */
+static int client_thread(void *arg) {
+    struct client *c = arg;
+    /* Not ready: the server ended before this thread looked. */
+    bool open = n_events_watch_address(c->events, &serving_ended, 0, STOP_TOKEN) >= 0;
+    while (open) {
+        struct n_event ev[2];
+        n_result n = n_events_wait(c->events, ev, 2, -1);
+        if (n < 0) {
+            printf("nvrm: a client's event wait failed (%s); ending the client\n", n_result_text(n));
+            break;
+        }
+        for (n_result i = 0; i < n && open; i++) {
+            if (ev[i].token == STOP_TOKEN) open = false;
+            else if (ev[i].events & N_EVENT_RECEIVABLE) open = request(c); /* queued data first */
+            else if (ev[i].events & N_EVENT_CLOSED) open = false;
+        }
     }
+    client_end(c);
+    mtx_lock(&threads_lock);
+    client_threads--;
+    cnd_signal(&thread_ended);
+    mtx_unlock(&threads_lock);
+    return 0;
+}
+
+static void client_start(n_handle channel) {
+    struct client *c = calloc(1, sizeof *c);
+    if (!c) {
+        n_handle_close(channel);
+        return;
+    }
+    c->channel = channel;
+    c->arena_handle = -1;
+    c->events = n_events_create();
+    n_result r = c->events < 0 ? c->events : n_events_watch(c->events, channel, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, CHANNEL_TOKEN);
+    thrd_t thread;
+    if (r >= 0) {
+        mtx_lock(&threads_lock);
+        client_threads++;
+        mtx_unlock(&threads_lock);
+        if (thrd_create(&thread, client_thread, c) == thrd_success) {
+            thrd_detach(thread);
+            return;
+        }
+        mtx_lock(&threads_lock);
+        client_threads--;
+        mtx_unlock(&threads_lock);
+        r = -N_ERR_NO_MEMORY;
+    }
+    printf("nvrm: cannot serve a new client (%s)\n", n_result_text(r));
+    client_end(c);
 }
 
 n_result nvrm_serve(uint32_t pci_target) {
     if (pci_target > UINT16_MAX) return -N_ERR_INVALID;
+    if (mtx_init(&threads_lock, mtx_plain) != thrd_success) return -N_ERR_NO_MEMORY;
+    if (cnd_init(&thread_ended) != thrd_success) { mtx_destroy(&threads_lock); return -N_ERR_NO_MEMORY; }
+    __atomic_store_n(&serving_ended, 0, __ATOMIC_RELEASE);
     char name[NVRM_CHANNEL_NAME_BYTES];
     snprintf(name, sizeof name, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
     n_handle listener = n_channel_listen(name);
-    if (listener < 0) return listener;
+    if (listener < 0) { cnd_destroy(&thread_ended); mtx_destroy(&threads_lock); return listener; }
     n_handle events = n_events_create();
-    if (events < 0) { n_handle_close(listener); return events; }
+    if (events < 0) { n_handle_close(listener); cnd_destroy(&thread_ended); mtx_destroy(&threads_lock); return events; }
     n_result watched = n_events_watch(events, listener, N_EVENT_RECEIVABLE, LISTENER_TOKEN);
-    if (watched < 0) { n_handle_close(events); n_handle_close(listener); return watched; }
+    if (watched < 0) {
+        n_handle_close(events); n_handle_close(listener);
+        cnd_destroy(&thread_ended); mtx_destroy(&threads_lock);
+        return watched;
+    }
     /* Preserve the historical default rendezvous for existing /data/bin
        binaries. Only one daemon owns this optional alias; every GPU always
        retains its independent BDF endpoint. Alias failure never kills GPU #2. */
@@ -189,32 +259,22 @@ n_result nvrm_serve(uint32_t pci_target) {
         n_result n = n_events_wait(events, ev, 16, -1);
         if (n < 0) { ended = n; break; }
         for (n_result i = 0; i < n; i++) {
-            if (ev[i].token == LISTENER_TOKEN || ev[i].token == LEGACY_LISTENER_TOKEN) {
-                n_handle ready = ev[i].token == LISTENER_TOKEN ? listener : legacy;
-                n_handle ch;
-                while (ready >= 0 && (ch = n_channel_accept(ready)) >= 0) {
-                    struct client *c = calloc(1, sizeof *c);
-                    if (!c) { n_handle_close(ch); continue; }
-                    c->channel = ch;
-                    c->arena_handle = -1;
-                    c->next = clients;
-                    clients = c;
-                    n_events_watch(events, ch, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, (uint64_t)(uintptr_t)c);
-                }
-                continue;
-            }
-            struct client *c = (struct client *)(uintptr_t)ev[i].token;
-            bool known = false;
-            for (struct client *k = clients; k; k = k->next) known |= k == c;
-            if (!known) continue; /* ended earlier in this batch */
-            if (ev[i].events & N_EVENT_RECEIVABLE) request(events, c);
-            else if (ev[i].events & N_EVENT_CLOSED) client_end(events, c);
+            n_handle ready = ev[i].token == LISTENER_TOKEN ? listener : legacy;
+            n_handle ch;
+            while (ready >= 0 && (ch = n_channel_accept(ready)) >= 0) client_start(ch);
         }
     }
-    /* RM is about to shut down: every client frees what it still holds in RM first. */
-    while (clients) client_end(events, clients);
+    /* RM is about to shut down: no new client, and every client frees what it still holds in RM
+       first. A thread in the middle of a request finishes it (RM's own work) before it looks. */
     n_handle_close(events);
     if (legacy >= 0) n_handle_close(legacy);
     n_handle_close(listener);
+    __atomic_store_n(&serving_ended, 1, __ATOMIC_RELEASE);
+    wake_address(&serving_ended, 0);
+    mtx_lock(&threads_lock);
+    while (client_threads) cnd_wait(&thread_ended, &threads_lock);
+    mtx_unlock(&threads_lock);
+    cnd_destroy(&thread_ended);
+    mtx_destroy(&threads_lock);
     return ended;
 }
