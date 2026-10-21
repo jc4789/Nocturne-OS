@@ -18,8 +18,9 @@ unsigned ioapic_count(void);
    to dev/iommu.h are the MADT's, which the DMAR's device scopes name. */
 bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool level, bool active_low);
 bool ioapic_mask(uint32_t gsi);
-/* Interrupt remapping came on (dev/iommu_intel.c): the unmasked entries (the firmware's ExtINT
-   pin) are written again, remappable; one whose remapping entry the units did not confirm is masked. */
+/* Interrupt remapping came on (dev/iommu_intel.c) or went off again (dev/iommu.c): the unmasked
+   entries (the firmware's ExtINT pin) are written again from the plain entries they were given,
+   remappable while it is on; one whose remapping entry the units did not confirm is masked. */
 void ioapic_remap(void);
 /* ISA IRQ -> GSI honoring MADT interrupt source overrides. level/active_low (may be NULL) receive the
    trigger mode and polarity to use for that source (ISA default: edge, active high). */

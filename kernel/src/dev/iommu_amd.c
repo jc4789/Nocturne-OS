@@ -83,6 +83,7 @@ struct unit {
     uint64_t cmd, events;  /* rings */
     uint32_t cmd_tail;
     bool lost;             /* a command since the last sync was not done: that sync fails */
+    bool overflow_told;    /* its event log overflowed and is still writing: said once */
     struct span *listed;   /* the IDs its IVHD names: those it may have cached entries of */
     size_t nlisted, listed_room;
 };
@@ -317,9 +318,16 @@ static void events_drain(struct unit *u) {
     for (; head != tail; head = (head + 16) % RING_BYTES)
         event_show(u, (const volatile uint32_t *)((uint8_t *)phys_to_virt(u->events) + head));
     wr(u, R_EVT_HEAD, head);
-    if (status & ST_EVENT_OVERFLOW) { /* the log stopped: started again, empty (2.5.1) */
-        if (!stopped(u, ST_EVENTLOG_RUN))
-            kprintf("iommu: unit at %lx: its event log overflowed and does not stop\n", u->base);
+    /* The log overflowed: once it stopped writing (EventLogRun clear, the only time its registers
+       may change) it starts again, empty (2.5.1). Until then it is tried again at the next drain. */
+    if (status & ST_EVENT_OVERFLOW) {
+        if (!stopped(u, ST_EVENTLOG_RUN)) {
+            if (!u->overflow_told)
+                kprintf("iommu: unit at %lx: its event log overflowed and has not stopped yet\n", u->base);
+            u->overflow_told = true;
+            return;
+        }
+        u->overflow_told = false;
         uint64_t ctl = rd(u, R_CONTROL);
         wr(u, R_CONTROL, ctl & ~CTL_EVENTLOG_EN);
         wr(u, R_EVT_HEAD, 0);

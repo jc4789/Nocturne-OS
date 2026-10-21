@@ -37,6 +37,7 @@
 #define R_IQH     0x80
 #define R_IQT     0x88
 #define R_IQA     0x90
+#define R_IQERCD  0xB0
 #define R_IRTA    0xB8
 
 /* global command bits, and the status bits at the same positions */
@@ -94,6 +95,7 @@
 #define INV_IEC_GLOBAL       4ull
 #define INV_IEC(index, log2) (4ull | 1ull << 4 | (uint64_t)(log2) << 27 | (uint64_t)(index) << 32)
 #define INV_WAIT(token)      (5ull | 1ull << 5 | 1ull << 6 | (uint64_t)(token) << 32) /* status write, fence */
+#define INV_NOTHING          5ull /* a wait that writes nothing: what a rejected descriptor becomes */
 
 /* interrupt remapping table */
 #define IRT_ENTRIES    4096
@@ -121,6 +123,8 @@ struct unit {
     uint64_t pass;  /* the context table of every bus without a claimed function */
     uint64_t queue; /* invalidation queue: 256 descriptors */
     uint32_t tail;
+    bool queue_on;  /* the queue on is ours (queue_start), not one the firmware left on */
+    bool waiting;   /* a sync's wait descriptor went in */
     bool lost;      /* a descriptor since the last sync was not done: that sync fails */
 };
 static struct unit *units;
@@ -304,51 +308,58 @@ static bool command(struct unit *u, uint32_t bit, bool on) {
     return true;
 }
 
-/* After tables changed, before the invalidations: units that buffer their writes write them. */
-static void write_buffers_flush(void) {
-    if (!write_buffers) return;
-    for (size_t i = 0; i < nunits; i++) {
+/* Units that buffer their writes (CAP.RWBF) write them, for a change no invalidation follows:
+   the invalidations flush them first themselves (6.8). False when one did not confirm it. */
+static bool write_buffers_flush(void) {
+    bool ok = true;
+    for (size_t i = 0; write_buffers && i < nunits; i++) {
         struct unit *u = &units[i];
         if (!(u->cap & CAP_RWBF)) continue;
         wr32(u, R_GCMD, (rd32(u, R_GSTS) & ~GSTS_ONESHOT) | GCMD_WBF);
         for (uint64_t t = iommu_deadline(100); rd32(u, R_GSTS) & GCMD_WBF; pause())
             if (iommu_expired(t)) {
                 kprintf("iommu: VT-d unit at %lx did not flush its write buffers\n", u->base);
-                u->lost = true;
+                ok = false;
                 break;
             }
     }
+    return ok;
 }
 
 static bool queue_start(struct unit *u) {
     wr64(u, R_IQT, 0);
     u->tail = 0;
     wr64(u, R_IQA, u->queue); /* 128-bit descriptors, one page */
-    return command(u, GCMD_QIE, true);
+    u->queue_on = command(u, GCMD_QIE, true);
+    return u->queue_on;
 }
 
-/* A unit that rejected a descriptor fetches none until it is told (6.5.2.11): its queue starts
-   again, empty, and what it had not done is lost. */
-static void queue_restart(struct unit *u) {
-    kprintf("iommu: VT-d unit at %lx rejected a command; its queue started again\n", u->base);
-    command(u, GCMD_QIE, false); /* also sets its head to 0 */
+/* A unit that rejected a descriptor fetches none until IQE is cleared, its head on that
+   descriptor; the ones before it complete as normal (6.5.2.11). It becomes a wait that writes
+   nothing, the tail is written again (in case the tail was what it rejected) and the queue goes
+   on, never restarted under descriptors in flight: what the rejected one asked is lost. */
+static void queue_recover(struct unit *u) {
+    uint32_t head = (uint32_t)rd64(u, R_IQH) & (PAGE_SIZE - 16);
+    kprintf("iommu: VT-d unit at %lx rejected the command at %x (reason %u); it is skipped\n", u->base, head,
+            (unsigned)(rd64(u, R_IQERCD) & 15));
+    volatile uint64_t *slot = (volatile uint64_t *)((uint8_t *)phys_to_virt(u->queue) + head);
+    slot[0] = INV_NOTHING;
+    slot[1] = 0;
+    if (!intel.coherent) iommu_cache_flush(slot, 16);
+    wr64(u, R_IQT, u->tail);
     wr32(u, R_FSTS, FSTS_IQE);
-    queue_start(u);
     u->lost = true;
 }
 
-/* A descriptor for one unit: one it has no room for in time is lost (u->lost). IOTLB
-   invalidations ask for the draining a version 1 unit does only when asked (6.5.4). */
-static void submit(struct unit *u, uint64_t lo, uint64_t hi) {
+/* A descriptor for one unit: false, and lost (u->lost), when it had no room for it in time.
+   IOTLB invalidations ask for the draining a version 1 unit does only when asked (6.5.4). */
+static bool submit(struct unit *u, uint64_t lo, uint64_t hi) {
     if ((lo & 0xF) == 2) lo |= (u->cap & CAP_DRD ? INV_IOTLB_DR : 0) | (u->cap & CAP_DWD ? INV_IOTLB_DW : 0);
-    for (uint64_t t = iommu_deadline(100); (rd64(u, R_IQH) & 0x7FFF0) == (u->tail + 16) % PAGE_SIZE; pause()) {
-        if (rd32(u, R_FSTS) & FSTS_IQE) {
-            queue_restart(u);
-            break;
-        }
+    for (uint64_t t = iommu_deadline(100); (rd64(u, R_IQH) & (PAGE_SIZE - 16)) == (u->tail + 16) % PAGE_SIZE; pause()) {
+        if (rd32(u, R_FSTS) & FSTS_IQE) queue_recover(u);
         if (iommu_expired(t)) {
             u->lost = true;
-            return;
+            return false;
         }
     }
     volatile uint64_t *slot = (volatile uint64_t *)((uint8_t *)phys_to_virt(u->queue) + u->tail);
@@ -357,6 +368,7 @@ static void submit(struct unit *u, uint64_t lo, uint64_t hi) {
     if (!intel.coherent) iommu_cache_flush(slot, 16);
     u->tail = (u->tail + 16) % PAGE_SIZE;
     wr64(u, R_IQT, u->tail);
+    return true;
 }
 
 static void send(uint64_t lo) {
@@ -373,7 +385,6 @@ static void send_iec(unsigned first, unsigned log2) {
 /* A change of root or context entries: the context caches, then the IOTLBs, both whole (6.5.2.1:
    a global context invalidation is followed by a global IOTLB one). */
 static void send_context_flush(void) {
-    write_buffers_flush();
     send(INV_CONTEXT_GLOBAL);
     send(INV_IOTLB_GLOBAL);
 }
@@ -410,34 +421,37 @@ static void fault_isr(struct regs *r) {
     for (size_t i = 0; i < nunits; i++) faults_drain(&units[i]);
 }
 
-/* Waits until every unit has done every descriptor sent since the last sync: false when one
-   was lost or rejected, or a unit did not finish them in time. */
-static bool sync(void) {
+/* Waits until units first..first + n - 1 have done every descriptor sent since their last sync,
+   the last one a wait that completed: false when one was lost or rejected, or a unit did not
+   finish them in time. */
+static bool sync_units(size_t first, size_t n) {
     volatile uint32_t *word = phys_to_virt(sems);
     if (!++token) token++;
-    for (size_t i = 0; i < nunits; i++) {
+    for (size_t i = first; i < first + n; i++) {
         word[i] = 0;
-        submit(&units[i], INV_WAIT(token), sems + i * 4);
+        units[i].waiting = submit(&units[i], INV_WAIT(token), sems + i * 4);
     }
-    for (size_t i = 0; i < nunits; i++) {
+    for (size_t i = first; i < first + n; i++) {
         struct unit *u = &units[i];
-        for (uint64_t t = iommu_deadline(100); !u->lost && word[i] != token; pause()) {
-            if (rd32(u, R_FSTS) & FSTS_IQE) {
-                queue_restart(u);
-            } else if (iommu_expired(t)) {
+        for (uint64_t t = iommu_deadline(100); u->waiting && word[i] != token; pause()) {
+            if (rd32(u, R_FSTS) & FSTS_IQE) queue_recover(u); /* the wait behind it still comes */
+            if (iommu_expired(t)) {
                 kprintf("iommu: VT-d unit at %lx did not finish its commands\n", u->base);
                 u->lost = true;
+                break;
             }
         }
     }
     bool ok = true;
-    for (size_t i = 0; i < nunits; i++) {
+    for (size_t i = first; i < first + n; i++) {
         faults_drain(&units[i]);
         ok &= !units[i].lost;
         units[i].lost = false;
     }
     return ok;
 }
+
+static bool sync(void) { return sync_units(0, nunits); }
 
 /* ---- context entries ---- */
 static uint64_t pass_lo(const struct unit *u) {
@@ -632,36 +646,55 @@ static bool intel_block(struct iommu_domain *dom) {
     return ok;
 }
 
+/* New entries need no invalidation but where the units cache not-present ones (CAP.CM); then
+   only the write buffers are flushed, which an invalidation does itself (6.8). */
 static bool intel_flush(struct iommu_domain *dom, bool unmapped) {
-    write_buffers_flush();
-    if (!unmapped && !caching_mode) return true;
     uint64_t f = irq_save();
-    send(INV_IOTLB_DOMAIN(dom->id));
-    bool ok = sync();
+    bool ok;
+    if (!unmapped && !caching_mode) {
+        ok = write_buffers_flush();
+    } else {
+        send(INV_IOTLB_DOMAIN(dom->id));
+        ok = sync();
+    }
     irq_restore(f);
     return ok;
 }
 
 /* ---- the units ---- */
-/* Translation, interrupt remapping and the queue off (the queue once it went quiet, 6.5.2),
-   fault events masked: false when the unit did not confirm one. */
+/* The queue may go off once it is quiet (6.5.2): empty, the last descriptor done a wait. Ours
+   gets one now; one the firmware left on has to be empty without an error, as nothing is known
+   of what it holds. */
+static bool queue_quiet(struct unit *u) {
+    if (u->queue_on) return sync_units((size_t)(u - units), 1);
+    for (uint64_t t = iommu_deadline(10); (rd64(u, R_IQH) & 0x7FFF0) != (rd64(u, R_IQT) & 0x7FFF0); pause())
+        if (iommu_expired(t)) return false;
+    return !(rd32(u, R_FSTS) & FSTS_IQE);
+}
+
+/* Translation, interrupt remapping and the queue off, fault events masked: false when the unit
+   did not confirm one. A queue that does not go quiet stays on. */
 static bool unit_off(struct unit *u) {
     uint32_t sts = rd32(u, R_GSTS);
     bool ok = true;
     if (sts & GCMD_TE) ok &= command(u, GCMD_TE, false);
     if (sts & GCMD_IRE) ok &= command(u, GCMD_IRE, false);
     if (sts & GCMD_QIE) {
-        for (uint64_t t = iommu_deadline(10);
-             !(rd32(u, R_FSTS) & FSTS_IQE) && (rd64(u, R_IQH) & 0x7FFF0) != (rd64(u, R_IQT) & 0x7FFF0); pause())
-            if (iommu_expired(t)) break;
-        ok &= command(u, GCMD_QIE, false);
+        if (!queue_quiet(u)) {
+            kprintf("iommu: VT-d unit at %lx: its invalidation queue does not go quiet; it stays on\n", u->base);
+            ok = false;
+        } else if (command(u, GCMD_QIE, false)) {
+            u->queue_on = false;
+        } else {
+            ok = false;
+        }
     }
     wr32(u, R_FECTL, FECTL_IM);
     return ok;
 }
 
 static bool unit_tables(struct unit *u, uint32_t bsp) {
-    unit_off(u); /* also when the firmware left it on */
+    if (!unit_off(u)) return false; /* also when the firmware left it on */
     wr64(u, R_RTADDR, u->root); /* legacy mode */
     bool ok = command(u, GCMD_SRTP, true) && queue_start(u);
     if (fault_vector >= 0 && bsp <= 0xFF) {
@@ -680,11 +713,11 @@ static bool unit_tables(struct unit *u, uint32_t bsp) {
 /* cfi: compatibility-format interrupts still pass, until the IOAPIC entries are remappable. A
    unit that does not take CFI blocks (and records) a pin that fires in between; remapping goes
    on. In Extended Interrupt Mode they are blocked from the start (5.1.4): at boot only the
-   firmware's ExtINT pin is unmasked. */
+   firmware's ExtINT pin is unmasked. The global invalidations flush the write buffers the tables
+   went through (6.8). */
 static bool units_on(bool cfi) {
     bool ok = true;
     uint32_t bsp = lapic_current_id();
-    write_buffers_flush();
     for (size_t i = 0; i < nunits; i++) ok &= unit_tables(&units[i], bsp);
     if (!ok) return false;
     send(INV_CONTEXT_GLOBAL);
@@ -773,15 +806,15 @@ static bool intel_start(void) {
     if (fault_vector < 0 && (fault_vector = irq_vector_alloc(1, 1)) >= 0) vector_register(fault_vector, fault_isr);
     uint64_t f = irq_save();
     ok = units_on(true);
+    /* A unit that keeps passing compatibility-format interrupts lets any device send any vector
+       past the remapping table (5.1.4): it is not used then. */
     if (ok && remap) {
         ioapic_remap();
-        for (size_t i = 0; !x2 && i < nunits; i++)
-            if (!command(&units[i], GCMD_CFI, false))
-                kprintf("iommu: VT-d unit at %lx still passes compatibility-format interrupts\n", units[i].base);
+        for (size_t i = 0; !x2 && i < nunits; i++) ok &= command(&units[i], GCMD_CFI, false);
     }
     irq_restore(f);
     if (!ok) {
-        intel_shutdown();
+        intel_shutdown(); /* iommu_init writes the IOAPIC entries back plain */
         return false; /* the tables stay: a unit may still read them */
     }
     kprintf("iommu: VT-d on, %lu unit%s, %u-level tables%s, interrupt remapping %s, %u reserved range%s: every "

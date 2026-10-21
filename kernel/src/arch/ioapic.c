@@ -15,7 +15,6 @@
 #define RTE_MASK      (1u << 16)
 #define RTE_LEVEL     (1u << 15)
 #define RTE_ACTIVELOW (1u << 13)
-#define RTE_REMAPPABLE (1ull << 48)
 #define RTE_DELIV(x)  (((x) >> 8) & 7)
 #define DELIV_EXTINT  7
 
@@ -27,6 +26,9 @@ struct ioapic {
 
 static struct ioapic ios[IOAPIC_MAX];
 static unsigned nios;
+/* The entry each pin was given, in the plain format: written again through dev/iommu.h when
+   interrupt remapping comes on or goes off (ioapic_remap). */
+static uint64_t given[IOAPIC_MAX][256];
 
 static uint32_t rd(const struct ioapic *io, uint32_t reg) {
     io->regs[0] = reg;
@@ -60,12 +62,14 @@ void ioapic_init(void) {
         for (uint32_t pin = 0; pin < io->pins; pin++) {
             uint32_t lo = rd(io, REG_RTE(pin));
             if (RTE_DELIV(lo) == DELIV_EXTINT && !(lo & RTE_MASK)) { /* virtual wire B: leave the PIC's path */
+                given[nios][pin] = lo | (uint64_t)rd(io, REG_RTE(pin) + 1) << 32;
                 kept++;
                 continue;
             }
             wr(io, REG_RTE(pin), RTE_MASK | (lo & ~0xFFu)); /* mask first, then clear the destination */
             wr(io, REG_RTE(pin) + 1, 0);
             wr(io, REG_RTE(pin), RTE_MASK);
+            given[nios][pin] = RTE_MASK;
         }
         irq_restore(f);
         kprintf("ioapic: id %u at %x, version %x, GSI %u-%u, all masked%s\n", io->id, a[i].addr, io->version,
@@ -89,8 +93,10 @@ static struct ioapic *owner(uint32_t gsi, uint32_t *pin) {
 /* An entry given in the plain format, as interrupt remapping wants it (dev/iommu.h): false when
    it cannot be delivered, and the pin is masked. */
 static bool rte_write(struct ioapic *io, uint32_t pin, uint64_t rte) {
+    given[io - ios][pin] = rte;
     if (!iommu_ioapic_entry(io->id, io->gsi_base + pin, &rte)) {
         wr(io, REG_RTE(pin), rd(io, REG_RTE(pin)) | RTE_MASK);
+        given[io - ios][pin] |= RTE_MASK;
         return false;
     }
     wr(io, REG_RTE(pin), RTE_MASK | (uint32_t)rte); /* mask while the destination changes */
@@ -113,10 +119,8 @@ bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool leve
 void ioapic_remap(void) {
     uint64_t f = irq_save();
     for (unsigned i = 0; i < nios; i++)
-        for (uint32_t pin = 0; pin < ios[i].pins; pin++) {
-            uint64_t rte = rd(&ios[i], REG_RTE(pin)) | (uint64_t)rd(&ios[i], REG_RTE(pin) + 1) << 32;
-            if (!(rte & RTE_MASK) && !(rte & RTE_REMAPPABLE)) rte_write(&ios[i], pin, rte);
-        }
+        for (uint32_t pin = 0; pin < ios[i].pins; pin++)
+            if (!(given[i][pin] & RTE_MASK)) rte_write(&ios[i], pin, given[i][pin]);
     irq_restore(f);
 }
 
@@ -126,6 +130,7 @@ bool ioapic_mask(uint32_t gsi) {
     if (!io) return false;
     uint64_t f = irq_save();
     wr(io, REG_RTE(pin), rd(io, REG_RTE(pin)) | RTE_MASK);
+    given[io - ios][pin] |= RTE_MASK;
     irq_restore(f);
     return true;
 }

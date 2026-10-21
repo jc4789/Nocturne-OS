@@ -7,6 +7,7 @@
 #include "kernel.h"
 #include "abi.h"
 #include "arch/cpu.h"
+#include "arch/ioapic.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "mm/heap.h"
@@ -119,6 +120,7 @@ void iommu_init(void) {
     domain_used[0] |= 3; /* 0 is never used, 1 is the back end's */
     if (!hw->start()) {
         hw = NULL;
+        ioapic_remap(); /* entries a back end made remappable go back to the plain format */
         kprintf("iommu: not used: a device given to an app reaches all of memory\n");
     }
 }
