@@ -19,6 +19,7 @@
 #include "dev/blk.h"
 #include "dev/fb.h"
 #include "dev/hibernate.h"
+#include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
 #include "dev/timer.h"
@@ -715,6 +716,7 @@ void hibernate_restore(void) {
     }
     for (int irq = 0; irq < 16; irq++) pic_mask(irq);
     ioapic_mask_all();
+    iommu_shutdown(); /* the image's tables come with it, and its own resume turns the units on */
     lapic_tick_stop();
     hv_core_suspend(); /* the hypervisor's overlays would swallow the copy's writes to their frames */
     hv_reference_suspend();

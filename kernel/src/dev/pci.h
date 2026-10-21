@@ -27,6 +27,9 @@ struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls);
 void pci_enable_busmaster(struct pci_device *d);
 int pci_count(void);
 struct pci_device *pci_at(int index);
+struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func);
+/* The PCI-to-PCI bridge whose secondary bus is the function's bus, or NULL on the root buses. */
+struct pci_device *pci_upstream(const struct pci_device *d);
 /* Memory BAR base (64-bit BARs combined); 0 for I/O, unassigned or out-of-range BARs. */
 uint64_t pci_bar_address(const struct pci_device *d, unsigned bar);
 /* How many BAR dwords the function's header type has (6, 2 for a bridge, 1 for CardBus). */
@@ -37,8 +40,9 @@ uint8_t pci_find_cap(const struct pci_device *d, uint8_t id);
 /* Extended capability (config offset 0x100 chain, PCIe): its offset, or 0. Needs ECAM. */
 uint16_t pci_find_ext_cap(const struct pci_device *d, uint16_t id);
 
-/* Message-signalled interrupts. All of them target a physical APIC id; with no interrupt remapping the
-   MSI address carries only 8 bits of it, so ids above 255 (x2APIC systems with many CPUs) are refused.
+/* Message-signalled interrupts. All of them target a physical APIC id of at most 8 bits (the MSI
+   address, and the remapping entries dev/iommu.c writes, carry no more), so ids above 255 (x2APIC
+   systems with many CPUs) are refused. The address and data come from iommu_msi_message.
    Device interrupts are handled on the BSP only: pass lapic_current_id() from the BSP. */
 /* Deliver the function's interrupt as `vector` on the BSP through MSI or MSI-X (entry 0). */
 bool pci_msi_enable(struct pci_device *d, uint8_t vector);

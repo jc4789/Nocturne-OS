@@ -261,12 +261,18 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, timeout_ms)` がビットを取り出して消す。
   - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
     オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
-    `n_dma_addresses` が各ページのバスアドレスを返す（IOMMU は使わないので物理アドレス）。
-  - IOMMU：Nocturne は IOMMU（VT-d／AMD-Vi）を設定しない。バスマスターの装置は全メモリへ
-    DMA でき、装置を渡されたアプリは全メモリを任されているのと同じ（権限分離の対象外）。起動時に
-    ACPI の DMAR・IVRS を読み、各ユニットと、ファームウェアが変換（VT-d では保護メモリ領域も）を
-    入れたまま渡したかをログに出す。入ったままなら、ファームウェアが写していない DMA は装置から
-    届かない（claim のたびにログで知らせる）。カーネルはその設定を変えない。
+    `n_dma_addresses` が各ページのバスアドレスを返す（物理アドレス。IOMMU が隔離していても
+    同じ番地に写すので変わらない）。
+  - IOMMU（`kernel/src/dev/iommu.c`、AMD-Vi は `iommu_amd.c`、VT-d は `iommu_intel.c`）：起動時に
+    ACPI の IVRS か DMAR からユニットを見つけて設定する。claim されていない装置とカーネルの装置は
+    素通し（AMD-Vi は 0 の装置表エントリ、VT-d は pass-through の文脈エントリ）。claim した装置は
+    専用のドメインに入り、DMA が届くのはその claim で作った DMA オブジェクト（作成から解放まで）と
+    ファームウェアの予約範囲（IVMD・RMRR）だけ。割り込みは再マップ表で claim のベクターだけに限る
+    （VT-d は互換形式の割り込みを拒み、IOAPIC とカーネルの装置の MSI も表を通る）。claim の終了で
+    装置は遮断され、ユニットが確かめた後は BME を残した終了でも DMA の RAM は割り当て器へ戻る。
+    従来型 PCI のブリッジの後ろなどで別の装置と要求元 ID を共有する装置の claim は `N_ERR_BUSY`。
+    隔離されている装置は `n_pci_info` の `flags` に `N_PCI_ISOLATED`。IOMMU が無い機械と起動
+    オプション `noiommu` では従来どおり全メモリへ届き、claim のログでそう知らせる。
   - `n_shared_view(shared, offset, bytes, cache)` は共有オブジェクトの一部を、別のキャッシュ
     属性（`N_CACHE_*`）で見る新しい共有オブジェクト。装置メモリは非キャッシュか
     write-combining だけ、DMA 用でも装置でもない共有オブジェクトは元の属性だけ。DMA 用の RAM は

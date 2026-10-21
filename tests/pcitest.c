@@ -292,6 +292,7 @@ int main(int argc,char **argv) {
           info.bar[0].flags, (unsigned long long)info.bar[0].size);
     CHECK(info.msi_vectors >= 1, "msi vectors %u", info.msi_vectors);
     CHECK(info.framebuffer_bar == N_PCI_NONE, "edu has no screen");
+    printf("pcitest: isolated by an IOMMU: %s\n", info.flags & N_PCI_ISOLATED ? "yes" : "no");
 
     n_result id = n_pci_config_read(pci, N_PCI_SELF, 0, 4);
     CHECK(id == 0x11e81234, "config id %llx", (long long)id);
@@ -455,6 +456,17 @@ int main(int argc,char **argv) {
             CHECK(dma(pci, pages[0], 4096, 0), "dma to the device");
             CHECK(dma(pci, pages[0] + 4096, 4096, 1), "dma back to RAM");
             CHECK(!memcmp(ram, ram + 4096, 4096), "the copy came back intact");
+            /* Isolated, the function's DMA reaches nothing but the claim's DMA objects: a write
+               aimed at its own liveness register (which keeps the complement of what is
+               written) through the bus does not arrive. */
+            if (info.flags & N_PCI_ISOLATED) {
+                wr32(EDU_LIVENESS, 0x11111111);
+                memset(ram, 0x22, 4);
+                CHECK(dma(pci, pages[0], 4, 0), "a word to the device");
+                dma(pci, info.bar[0].address + EDU_LIVENESS, 4, 1);
+                CHECK(rd32(EDU_LIVENESS) == ~0x11111111u, "DMA outside the claim's memory arrived: %08x",
+                      rd32(EDU_LIVENESS));
+            }
         }
     }
     /* One memory type per page: the write-back mapping above fixes this object's type while it

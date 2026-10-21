@@ -88,7 +88,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C11 | RM の `arch/nvalloc/unix` は NVIDIA 自身の OS 中立層（MIT）で、使っても UNIX 互換を Nocturne に足すことにはならない | 受理 | Nocturne 側へ POSIX の API を足さず、RM の OS 層を Nocturne の API で実装する |
 | C12 | RTX 4070 は ReBAR 有効なら BAR1 が 16GB になり得る。BAR 全体を 4K で一度に写さない | 受理 | 16GB÷4K＝400 万 PTE。view で必要な部分だけ写す |
 | C13 | アプリ終了時は fd をすべて閉じてから共有マッピングを外すので、PCI の権利（fd 3）が DMA メモリの解放より先に終わり、バスマスターが先に止まる | 却下（順序だけでは足りない） → 修理済み | バスマスターを消しても発行済みの DMA は残る。クレームの解放は BAR の写像を全プロセスから失効 → 割り込み停止 → BME 消去 → Device Status の Transactions Pending が消えるまで待つ（上限 200 ms）。DMA オブジェクトはクレームを参照で持ち、静止を確かめられなかったクレームの RAM は解放せず隔離する。終了処理は PCI クレームを他の fd より先に閉じる。複製されたハンドルも参照数で同じ扱い |
-| C14 | MSI-X の表は BAR の中にあるので、BAR を写したドライバーは表を書き換えられる | 受理（危険として） | ドライバーアプリは init が起動する信頼済みのもの。IOMMU も無いので DMA でも同じ。権限分離の目標外と明記 |
+| C14 | MSI-X の表は BAR の中にあるので、BAR を写したドライバーは表を書き換えられる | 受理 → IOMMU のある機械では無害 | IOMMU（C48）の割り込み再マップ表が claim の要求元 ID とそのベクターだけを通すので、表を書き換えても他の割り込みは作れない。IOMMU の無い機械と `noiommu` では危険のまま（DMA も全メモリへ届く）で、claim のログが知らせる |
 | C15 | RM は割り込みを MSI-X でも MSI でも受けられ、INTx は不要 | 未確定（実機待ち） | OS 層は `n_pci_interrupts(1)` の後に `NV_FLAG_USES_MSIX`／`NV_FLAG_USES_MSI` を立てる。担当 B の調べでは RM はこの印を読まない。実際に割り込みが来るかは実機で |
 | C18 | RM の OS 層が RM の「spinlock」を mutex にしても正しい（割り込み処理もスレッドなので） | 受理 | `rm_isr` は普通のスレッドで動き、`os_is_isr` は `nvrm_in_isr` で真になる。眠ってはならない区間で眠る危険は、割り込み文脈が本物の割り込みでない以上ない |
 | C19 | 全クライアントが RM には同じ管理者権限のプロセスに見える | 修理済み | 接続ごとの権限（`nvrm_file.admin`）。チャネルは相手の素性を持たないので全クライアントが非特権（通常ユーザー相当）。管理者は nvrm 自身のスレッドだけ。根拠のある接続を `client_is_admin` で足せる |
@@ -122,7 +122,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C45 | イベントの待ち行列に上限は要らない | 却下 → 修理済み | データつきイベントは接続ごとに 4096 件まで。超えたら新しい方を捨て、接続ごとに一度ログ。取り出すと再び受け付ける。データなしは対象ごとに一つ（C32 を実際に上限つきへ） |
 | C46 | `os_dump_stack` は空でよい | 却下 → 修理済み | nvrm はフレームポインターつきでビルドしているので、スレッドのスタック範囲の中だけフレームを辿り、戻り番地をログへ出す（範囲外・逆向き・非整列で止まる） |
 | C47 | 構成空間の保護は Command と BAR だけで足りる | 却下 → 修理済み | ABI 文書 §9 の一覧（BIST、Interrupt Line、PMCSR、DevCtl、LinkCtl／2、ReBAR、SR-IOV、ACS・ATS・PRI・PASID）。読んで一部を変えて書き戻すなら通る。ブリッジは claim できない |
-| C48 | IOMMU で DMA を隔離している | 受理（限界として） | Nocturne は IOMMU を設定しない。起動時に DMAR／IVRS を読み、ファームウェアが変換を入れたまま渡したかをログに出し、claim のログで知らせる。隔離は対象外（C14） |
+| C48 | IOMMU で DMA を隔離している | 却下 → 修理済み | AMD-Vi（`iommu_amd.c`）と VT-d（`iommu_intel.c`）のドライバー、共通層は `iommu.c`。claim した装置は専用のドメインに入り、その claim の DMA オブジェクト（作成から解放まで、解放はユニットの確認の後）とファームウェアの予約範囲（IVMD・RMRR）だけへ届く。割り込みは再マップ表で claim のベクターだけ。claim の終了で遮断。要求元 ID を他と共有する装置は `N_ERR_BUSY`。隔離は `N_PCI_ISOLATED` でアプリに見える。詳細は ABI 文書 §9 |
 | C49 | claim の時に BAR の大きさを測ってよい | 却下 → 修理済み | 測るとメモリデコードを切るので、起動時の画面がその BAR にあると壊れる。大きさは列挙時の値（`pci_bar_size`）を使う |
 
 ## 5. 担当と受け渡し
@@ -142,6 +142,20 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-21：C48 を修理。ACPI の読むだけの DMAR／IVRS 表示を消し、AMD-Vi（`iommu_amd.c`）と VT-d
+  （`iommu_intel.c`）のドライバーを共通層 `iommu.c` の上に書いた。claim した装置は専用の恒等写像
+  ドメインへ入り、DMA は claim の DMA オブジェクトと予約範囲（IVMD・RMRR）だけ、割り込みは再マップ表で
+  claim のベクターだけ。claim しない装置は素通し。`N_PCI_ISOLATED` を足したので全体ビルド（img・vhd・
+  vhdx・iso）。QEMU 一台ずつ（WHPX、4 コア、4096 MiB、1920×1080、AHCI 起動、snapshot、`edu`）で 3 構成：
+  q35＋`amd-iommu,intremap=on,dma-remap=on`、q35＋`intel-iommu,intremap=on`（/data は NVMe）、pc 機種
+  （IOMMU 無し）。どれも `pcitest: 0 failed`・`nvrmtest: 0 failed`。IOMMU のある 2 構成では pcitest が
+  「isolated: yes」となり、claim 外への DMA が遮断されてユニットのイベント（VT-d は理由 05h）が出た。
+  NVMe・xHCI の MSI、e1000（VT-d では IOAPIC の再マップを通る INTx）、DHCP も動いた。3 構成とも、
+  リンクのクリックで JavaScript demo へ、Alt+Left で戻り、ホイールで下まで行って上へ戻るのを実入力で
+  見た。回帰なし。QEMU 11.1 の癖：`amd-iommu` は `dma-remap=on` を付けないと変換せず全部素通しにする。
+  `intel-iommu` は GCMD.CFI を持たないので、CFI は努力目標とした（取れなくても再マップは続ける）。
+  Ryzen 7600X と RTX 4070 の実機は未実施（ユーザー）。
 
 - 2026-10-21：3件の静的監査（A1〜A4、B1〜B5、F1〜F3）を照合し、C39〜C49 として修理。新しい ABI
   `n_pci_hold_screen`（`SYS_PCI_HOLD_SCREEN`）のため全体ビルド（img・vhd・vhdx・iso）。ホスト試験

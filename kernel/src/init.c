@@ -7,6 +7,7 @@
 #include "dev/fbcon.h"
 #include "dev/fb.h"
 #include "dev/pci.h"
+#include "dev/iommu.h"
 #include "dev/pm.h"
 #include "dev/hibernate.h"
 #include "arch/ioapic.h"
@@ -150,6 +151,7 @@ void kmain_late(void) {
     }
     pci_init();
     fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
+    iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
     drop_absent_firmware();
     usb_init();
     net_init();

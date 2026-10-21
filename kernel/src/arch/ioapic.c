@@ -4,6 +4,7 @@
 #include "arch/cpu.h"
 #include "arch/ioapic.h"
 #include "dev/acpi.h"
+#include "dev/iommu.h"
 #include "mm/vmm.h"
 
 #define IOAPIC_MAX 8
@@ -14,6 +15,7 @@
 #define RTE_MASK      (1u << 16)
 #define RTE_LEVEL     (1u << 15)
 #define RTE_ACTIVELOW (1u << 13)
+#define RTE_REMAPPABLE (1ull << 48)
 #define RTE_DELIV(x)  (((x) >> 8) & 7)
 #define DELIV_EXTINT  7
 
@@ -84,17 +86,33 @@ static struct ioapic *owner(uint32_t gsi, uint32_t *pin) {
     return NULL;
 }
 
+/* An entry given in the plain format, as interrupt remapping wants it (dev/iommu.h). */
+static void rte_write(struct ioapic *io, uint32_t pin, uint64_t rte) {
+    rte = iommu_ioapic_entry(io->id, io->gsi_base + pin, rte);
+    wr(io, REG_RTE(pin), RTE_MASK | (uint32_t)rte); /* mask while the destination changes */
+    wr(io, REG_RTE(pin) + 1, (uint32_t)(rte >> 32));
+    wr(io, REG_RTE(pin), (uint32_t)rte);
+}
+
 bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool level, bool active_low) {
     uint32_t pin;
     struct ioapic *io = owner(gsi, &pin);
     if (!io || vector < 0x30 || vector == 0xFF || dest_apic_id > 0xFF) return false;
     uint32_t lo = vector | (level ? RTE_LEVEL : 0) | (active_low ? RTE_ACTIVELOW : 0); /* fixed, physical */
     uint64_t f = irq_save();
-    wr(io, REG_RTE(pin), RTE_MASK | lo); /* mask while the destination changes */
-    wr(io, REG_RTE(pin) + 1, dest_apic_id << 24);
-    wr(io, REG_RTE(pin), lo);
+    rte_write(io, pin, lo | (uint64_t)dest_apic_id << 56);
     irq_restore(f);
     return true;
+}
+
+void ioapic_remap(void) {
+    uint64_t f = irq_save();
+    for (unsigned i = 0; i < nios; i++)
+        for (uint32_t pin = 0; pin < ios[i].pins; pin++) {
+            uint64_t rte = rd(&ios[i], REG_RTE(pin)) | (uint64_t)rd(&ios[i], REG_RTE(pin) + 1) << 32;
+            if (!(rte & RTE_MASK) && !(rte & RTE_REMAPPABLE)) rte_write(&ios[i], pin, rte);
+        }
+    irq_restore(f);
 }
 
 bool ioapic_mask(uint32_t gsi) {

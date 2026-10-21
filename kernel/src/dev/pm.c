@@ -7,6 +7,7 @@
 #include "dev/acpi.h"
 #include "dev/blk.h"
 #include "dev/hibernate.h"
+#include "dev/iommu.h"
 #include "gui/wm.h"
 #include "sys/sched.h"
 #include "arch/ioapic.h"
@@ -179,6 +180,7 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     lapic_resume();
     pic_restore(pic);
     serial_init(); /* the log port, reset with the rest */
+    iommu_resume(); /* before anything sends it an interrupt or a request */
     ioapic_resume();
     hv_reference_resume(); /* the hypervisor's overlay pages: reset, or the restoring kernel's */
     hv_core_resume();

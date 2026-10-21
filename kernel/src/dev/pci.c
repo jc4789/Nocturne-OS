@@ -3,6 +3,7 @@
 #include "arch/cpu.h"
 #include "dev/pci.h"
 #include "dev/acpi.h"
+#include "dev/iommu.h"
 #include "abi.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
@@ -206,6 +207,25 @@ int pci_count(void) { return ndevices; }
 
 struct pci_device *pci_at(int index) { return index >= 0 && index < ndevices ? &devices[index] : NULL; }
 
+struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func) {
+    for (int i = 0; i < ndevices; i++)
+        if (devices[i].bus == bus && devices[i].dev == dev && devices[i].func == func) return &devices[i];
+    return NULL;
+}
+
+static bool is_bridge(const struct pci_device *d) {
+    return ((pci_read32(d->bus, d->dev, d->func, 0x0C) >> 16) & 0x7F) == 1;
+}
+
+struct pci_device *pci_upstream(const struct pci_device *d) {
+    for (int i = 0; i < ndevices; i++) {
+        struct pci_device *b = &devices[i];
+        if (b != d && is_bridge(b) && ((pci_read32(b->bus, b->dev, b->func, 0x18) >> 8) & 0xFF) == d->bus)
+            return b;
+    }
+    return NULL;
+}
+
 uint64_t pci_bar_address(const struct pci_device *d, unsigned bar) {
     if (bar >= 6 || (d->bar[bar] & 1)) return 0;
     uint64_t base = d->bar[bar] & ~15u;
@@ -270,10 +290,6 @@ uint16_t pci_find_ext_cap(const struct pci_device *d, uint16_t id) {
     return 0;
 }
 
-/* The MSI address carries the destination APIC id in bits 19:12 (physical mode, no redirection hint);
-   without interrupt remapping that is all 8 bits there are. */
-static uint32_t msi_address(uint32_t dest_apic_id) { return 0xFEE00000u | dest_apic_id << 12; }
-
 static void intx_disable(struct pci_device *d) {
     uint16_t cmd = pci_read16(d->bus, d->dev, d->func, 4);
     pci_write16(d->bus, d->dev, d->func, 4, cmd | 0x400);
@@ -286,18 +302,20 @@ unsigned pci_msi_max_vectors(const struct pci_device *d) {
 }
 
 bool pci_msi_enable_multi(struct pci_device *d, uint8_t base_vector, unsigned count, uint32_t dest_apic_id) {
-    if (!lapic_present() || dest_apic_id > 0xFF) return false;
+    if (!lapic_present()) return false;
     uint8_t cap = pci_find_cap(d, 0x05);
     if (!cap || !count || count > 32 || (count & (count - 1)) || (base_vector & (count - 1))) return false;
     uint32_t h = pci_read32(d->bus, d->dev, d->func, cap);
     uint16_t ctl = h >> 16;
     if (count > (1u << ((ctl >> 1) & 7))) return false;
+    uint32_t address, message;
+    if (!iommu_msi_message(d, 0, count, base_vector, dest_apic_id, &address, &message)) return false;
     bool wide = ctl & 0x80;
-    pci_write32(d->bus, d->dev, d->func, cap + 4, msi_address(dest_apic_id));
+    pci_write32(d->bus, d->dev, d->func, cap + 4, address);
     if (wide) pci_write32(d->bus, d->dev, d->func, cap + 8, 0);
     uint8_t data_off = cap + (wide ? 0x0C : 0x08);
     uint32_t data = pci_read32(d->bus, d->dev, d->func, data_off);
-    pci_write32(d->bus, d->dev, d->func, data_off, (data & 0xFFFF0000u) | base_vector);
+    pci_write32(d->bus, d->dev, d->func, data_off, (data & 0xFFFF0000u) | message);
     if (ctl & 0x100) pci_write32(d->bus, d->dev, d->func, data_off + 4, 0); /* per-vector masking: all open */
     uint8_t msix = pci_find_cap(d, 0x11); /* never both: firmware may have left MSI-X on */
     if (msix) {
@@ -334,15 +352,19 @@ unsigned pci_msix_init(struct pci_device *d) {
 }
 
 bool pci_msix_route(struct pci_device *d, unsigned entry, uint8_t vector, uint32_t dest_apic_id) {
-    if (!lapic_present() || dest_apic_id > 0xFF || !d->msix_table || entry >= d->msix_entries) return false;
+    if (!lapic_present() || !d->msix_table || entry >= d->msix_entries) return false;
     volatile uint32_t *t = d->msix_table + entry * 4;
     uint32_t vc = t[3];
     t[3] = vc | 1; /* entry masked while its address/data change */
-    t[0] = msi_address(dest_apic_id);
-    t[1] = 0;
-    t[2] = vector;
+    uint32_t address, data;
+    bool ok = iommu_msi_message(d, entry, 1, vector, dest_apic_id, &address, &data);
+    if (ok) {
+        t[0] = address;
+        t[1] = 0;
+        t[2] = data;
+    }
     t[3] = vc;
-    return true;
+    return ok;
 }
 
 void pci_msix_mask(struct pci_device *d, unsigned entry, bool masked) {
@@ -364,6 +386,7 @@ void pci_msi_disable(struct pci_device *d) {
     if (cap) pci_write32(d->bus, d->dev, d->func, cap, pci_read32(d->bus, d->dev, d->func, cap) & ~0x00010000u);
     if (msix) pci_write32(d->bus, d->dev, d->func, msix,
                           pci_read32(d->bus, d->dev, d->func, msix) & ~0x80000000u);
+    iommu_msi_clear(d);
 }
 
 bool pci_msi_enable(struct pci_device *d, uint8_t vector) {

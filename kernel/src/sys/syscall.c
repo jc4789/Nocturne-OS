@@ -269,9 +269,11 @@ static int64_t stop_tree(int pid, int include_self) {
  * a view maps part of another object, which it holds open, with its own caching. DMA objects
  * are RAM (or an owned range) whose bus addresses n_dma_addresses reports.
  * BAR and DMA objects hold their PCI claim. A BAR object dies with the claim's last handle
- * (shared_revoke_claim). DMA RAM goes back to the allocator only once the device was seen
- * stopped, or while its driver still runs (freeing what its device still uses is the driver's
- * bug; there is no IOMMU to stop it). DMA RAM has one memory type for all its mappings and the
+ * (shared_revoke_claim). Where an IOMMU isolates the function, a DMA object's pages are in its
+ * domain from creation until release, which returns them once the IOMMU confirmed the device
+ * can no longer reach them. Without one, DMA RAM goes back to the allocator only once the device
+ * was seen stopped, or while its driver still runs (freeing what its device still uses is the
+ * driver's bug, which nothing stops then). DMA RAM has one memory type for all its mappings and the
  * direct map: write-back until the first uncached or write-combining view while nothing maps
  * it, then that type for good (x86 forbids one page with two types). */
 #define SHARED_LEAF (PAGE_SIZE/sizeof(uint64_t))
@@ -416,8 +418,9 @@ static uint64_t shared_frame(struct shared_pages *p,size_t index,bool create) {
 static void shared_release(struct vnode *v) {
     struct shared_pages *p=v->priv;
     if(p){
-        bool keep=p->dma && !pci_user_dma_reusable(p->claim); /* the device may still write there */
-        if(keep)kprintf("[dma] %lu pages stay out of use: their device was not seen to stop\n",(unsigned long)p->count);
+        bool keep=p->dma && (!pci_user_dma_unmap(p->claim,p->kind==SHARED_RAM?p->pages:NULL,p->base,p->count) ||
+                             !pci_user_dma_reusable(p->claim)); /* the device may still write there */
+        if(keep)kprintf("[dma] %lu pages stay out of use: their device may still reach them\n",(unsigned long)p->count);
         else if(p->dma && p->cache!=N_CACHE_WRITE_BACK)
             vmm_direct_type(p->kind==SHARED_RAM?p->pages:NULL,p->base,p->count,0);
         for(size_t i=0;!keep && i<shared_slots(p);i++){
@@ -612,6 +615,7 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
         }
     }
     p->dma=true;
+    if(!pci_user_dma_map(claim,p->kind==SHARED_RAM?p->pages:NULL,p->base,p->count)){shared_release(v);return -N_ERR_NO_MEMORY;}
     struct file *f=NULL;
     r=shared_open(v,O_RDWR,&f);
     return new_handle(r,f);

@@ -3,19 +3,21 @@
    (its device, the bridges above it with their devices, the host bridges), writes its own, maps BARs as
    shared objects (syscall.c) and waits for its message-signalled interrupts on the handle.
    The kernel keeps what decides where memory and interrupts go: BAR registers and the MSI and
-   MSI-X capabilities are written here only. The last handle's close stops the function: every
-   mapping of its BARs, in any process, loses the device pages; then no interrupts and no bus
-   mastering, and the kernel waits until the function has no request in flight before the app's
-   DMA memory can return to the allocator. A function that does not report its requests done in
-   time keeps its DMA pages out of use for good (syscall.c asks pci_user_claim_dma_reusable).
+   MSI-X capabilities are written here only. Where an IOMMU is on (dev/iommu.h) the function's
+   DMA reaches only the DMA objects made through its claim. The last handle's close stops the
+   function: every mapping of its BARs, in any process, loses the device pages; then no
+   interrupts, no bus mastering, and the IOMMU blocks it, after which the app's DMA memory can
+   return to the allocator. Without an IOMMU the kernel waits until the function has no request
+   in flight instead; a function that does not report its requests done in time keeps its DMA
+   pages out of use for good (syscall.c asks pci_user_dma_reusable).
    BAR and DMA objects hold the claim record, so a later claim of the same function is a new
    record and the old objects stay dead. */
 #include "kernel.h"
 #include "abi.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
-#include "dev/acpi.h"
 #include "dev/fb.h"
+#include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pciuser.h"
 #include "fs/vfs.h"
@@ -51,12 +53,15 @@ struct pci_claim {
     struct guard guards[CLAIM_GUARDS];
     unsigned guard_count;
     uint16_t pmcsr; /* the power management capability's control register, or 0 */
+    struct iommu_domain *domain; /* where an IOMMU isolates the function (dev/iommu.h) */
 };
 static struct pci_claim *claim_of_vector[256];
 
 static void claim_drop(struct pci_claim *c) {
     ASSERT(c->refs);
-    if (--c->refs == 0) kfree(c);
+    if (--c->refs) return;
+    if (c->domain) iommu_domain_free(c->domain); /* every DMA object of the claim is gone */
+    kfree(c);
 }
 
 static void claim_isr(struct regs *r) {
@@ -110,7 +115,9 @@ static bool function_quiet(struct pci_device *d) {
    it), and what runs on it may be running still: a GPU's own firmware keeps the addresses it was
    given, and switching bus mastering off only pauses it until the next driver switches it on.
    Nothing here can stop such firmware (a function reset would also take the boot screen with
-   it), so the DMA memory it was given never returns to the allocator. */
+   it). Where an IOMMU isolates the function, blocking it there settles that: nothing it sends
+   reaches memory any more. Without one, the DMA memory it was given never returns to the
+   allocator. */
 static void claim_release(struct vnode *v) {
     struct pci_claim *c = v->priv;
     struct pci_device *d = c->d;
@@ -120,10 +127,14 @@ static void claim_release(struct vnode *v) {
     uint16_t command = pci_read16(d->bus, d->dev, d->func, 4);
     bool left_running = command & PCI_COMMAND_MASTER;
     pci_write16(d->bus, d->dev, d->func, 4, command & ~PCI_COMMAND_MASTER);
+    bool blocked = c->domain && iommu_block(c->domain);
     bool stopped = (pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) != 0xFFFF &&
                    !(pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER);
-    c->dma_unsafe = left_running || !stopped || !function_quiet(d);
-    if (left_running)
+    c->dma_unsafe = !blocked && (left_running || !stopped || !function_quiet(d));
+    if (left_running && blocked)
+        kprintf("pci: %02x:%02x.%u: its driver ended without stopping it (bus mastering was on); "
+                "the IOMMU keeps it from memory\n", d->bus, d->dev, d->func);
+    else if (left_running)
         kprintf("pci: %02x:%02x.%u: its driver ended without stopping it (bus mastering was on); "
                 "its DMA memory stays out of use\n", d->bus, d->dev, d->func);
     else if (c->dma_unsafe && stopped && !d->pcie_cap)
@@ -154,25 +165,11 @@ struct pci_claim *pci_user_hold(struct file *f) {
 void pci_user_drop(struct pci_claim *c) { if (c) claim_drop(c); }
 bool pci_user_revoked(const struct pci_claim *c) { return c && c->released; }
 bool pci_user_dma_reusable(const struct pci_claim *c) { return !c || !c->dma_unsafe; }
-
-static struct pci_device *find_function(uint8_t bus, uint8_t dev, uint8_t func) {
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *d = pci_at(i);
-        if (d->bus == bus && d->dev == dev && d->func == func) return d;
-    }
-    return NULL;
+bool pci_user_dma_map(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
+    return !c->domain || iommu_map(c->domain, frames, base, count);
 }
-static bool is_bridge(const struct pci_device *d) {
-    return ((pci_read32(d->bus, d->dev, d->func, 0x0C) >> 16) & 0x7F) == 1;
-}
-/* The PCI-to-PCI bridge whose secondary bus is the function's bus, or NULL on bus 0's roots. */
-static struct pci_device *upstream_of(const struct pci_device *d) {
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *b = pci_at(i);
-        if (b != d && is_bridge(b) && ((pci_read32(b->bus, b->dev, b->func, 0x18) >> 8) & 0xFF) == d->bus)
-            return b;
-    }
-    return NULL;
+bool pci_user_dma_unmap(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
+    return !c->domain || iommu_unmap(c->domain, frames, base, count);
 }
 
 static void guard(struct pci_claim *c, uint32_t offset, uint32_t bits) {
@@ -249,7 +246,7 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     if (!t || cmdline_has("noappdrivers")) return -N_ERR_DENIED;
     if (t->pid != init_pid && !cmdline_has("appdrivers=any")) return -N_ERR_DENIED;
     if (dev > 31 || func > 7) return -N_ERR_INVALID;
-    struct pci_device *d = find_function(bus, dev, func);
+    struct pci_device *d = pci_find_function(bus, dev, func);
     if (!d) return -N_ERR_NOT_FOUND;
     if (d->kernel_owned || d->claimed) return -N_ERR_BUSY;
     /* A bridge's registers route other devices' memory, buses and resets. */
@@ -266,18 +263,21 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     c->v = v;
     c->refs = 1;
     guards_init(c);
+    /* From here the function reaches only the DMA objects made through the claim. */
+    int r = iommu_active() ? iommu_attach(d, &c->domain) : 0;
+    if (r < 0) { kfree(c); kfree(v); return r; }
     /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
        decoding off under a running function, and the boot screen may be drawn through it. */
     struct file *f = vfs_open_vnode(v, O_RDWR);
-    if (!f) { kfree(c); kfree(v); return -N_ERR_NO_MEMORY; }
+    if (!f) {
+        if (c->domain) iommu_domain_free(c->domain);
+        kfree(c);
+        kfree(v);
+        return -N_ERR_NO_MEMORY;
+    }
     d->claimed = true;
-    kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d\n", bus, dev, func, d->vendor, d->device, t->pid);
-    static bool isolation_told;
-    if (acpi_iommu_state() == ACPI_IOMMU_BLOCKING)
-        kprintf("pci: %02x:%02x.%u: the firmware's IOMMU may refuse its DMA (see the acpi lines)\n", bus, dev, func);
-    else if (!isolation_told)
-        kprintf("pci: no IOMMU isolates devices given to apps: their DMA reaches all of memory\n");
-    isolation_told = true;
+    kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d%s\n", bus, dev, func, d->vendor, d->device, t->pid,
+            c->domain ? "" : "; no IOMMU isolates it: its DMA reaches all of memory");
     *out = f;
     return 0;
 }
@@ -314,8 +314,9 @@ int64_t pci_user_info(struct file *f, struct n_pci_function *out) {
     out->interrupt_pin = (pci_read32(d->bus, d->dev, d->func, 0x3C) >> 8) & 0xFF;
     out->msi_vectors = pci_msi_max_vectors(d);
     out->msix_vectors = msix_table_size(d);
-    struct pci_device *up = upstream_of(d);
+    struct pci_device *up = pci_upstream(d);
     out->upstream = up ? N_PCI_TARGET(up->bus, up->dev, up->func) : N_PCI_NONE;
+    out->flags = c->domain ? N_PCI_ISOLATED : 0;
     for (unsigned i = 0; i < pci_bar_count(d); i++) {
         uint32_t raw = d->bar[i];
         if (raw & 1) { out->bar[i] = (struct n_pci_bar){.address = raw & ~3u, .flags = N_PCI_BAR_IO}; continue; }
@@ -371,7 +372,7 @@ static bool is_host_bridge(const struct pci_device *d) {
 }
 static bool may_read(const struct pci_device *d, const struct pci_device *target) {
     if (target->bus == d->bus && target->dev == d->dev) return true;
-    for (const struct pci_device *b = upstream_of(d); b; b = upstream_of(b))
+    for (const struct pci_device *b = pci_upstream(d); b; b = pci_upstream(b))
         if (target->bus == b->bus && target->dev == b->dev) return true;
     return is_host_bridge(target);
 }
@@ -383,7 +384,7 @@ int64_t pci_user_config_read(struct file *f, uint32_t target, uint32_t offset, u
     struct pci_device *t = c->d;
     if (target != N_PCI_SELF) {
         if (target > 0xFFFF) return -N_ERR_INVALID;
-        t = find_function(target >> 8, (target >> 3) & 31, target & 7);
+        t = pci_find_function(target >> 8, (target >> 3) & 31, target & 7);
         if (!t) return -N_ERR_NOT_FOUND;
         if (!may_read(c->d, t)) return -N_ERR_DENIED;
     }

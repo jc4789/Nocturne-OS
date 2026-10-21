@@ -4,8 +4,8 @@
  *   config space      n_pci_config_read / n_pci_config_write
  *   register BAR      n_pci_bar + n_shared_map (BAR0, mapped whole at start)
  *   other BAR ranges  n_pci_bar + n_shared_view (uncached or write-combining) + n_shared_map
- *   system memory     n_dma_create / n_dma_addresses (Nocturne currently returns physical
- *                     addresses; it does not establish an IOMMU translation domain)
+ *   system memory     n_dma_create / n_dma_addresses (physical addresses; where an IOMMU
+ *                     isolates the GPU, its domain maps them at the same addresses)
  *   interrupts        n_pci_interrupts / n_pci_interrupt_take
  */
 #include "nvrm_os.h"
@@ -389,8 +389,9 @@ NV_STATUS nvrm_pci_attach(void) {
 
     n_result command = n_pci_config_read(d->pci, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
     if (command < 0) return NV_ERR_OPERATING_SYSTEM;
-    nvrm_log("NVRM: PCI Command=0x%04x at attach (memory=%u, bus-master=%u); DMA addresses are physical",
-             (unsigned)command, !!(command & PCI_COMMAND_MEMORY), !!(command & PCI_COMMAND_MASTER));
+    nvrm_log("NVRM: PCI Command=0x%04x at attach (memory=%u, bus-master=%u); DMA addresses are physical, %s",
+             (unsigned)command, !!(command & PCI_COMMAND_MEMORY), !!(command & PCI_COMMAND_MASTER),
+             g->flags & N_PCI_ISOLATED ? "the IOMMU confines the GPU to its DMA memory" : "no IOMMU isolates the GPU");
 
     for (unsigned dw = 0; dw < NVRM_PCICFG_NUM_DWORDS; dw++) {
         n_result v = n_pci_config_read(d->pci, N_PCI_SELF, dw * 4, 4);
