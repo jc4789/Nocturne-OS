@@ -25,8 +25,22 @@ void call_once(once_flag *flag, void (*init)(void)) { (void)flag; init(); }
 
 void nvrm_log(const char *fmt, ...) { (void)fmt; }
 NvBool NV_API_CALL rm_disable_iomap_wc(void) { return disable_wc; }
-void *nvrm_user_mapping_new(void) { return NULL; }
-void *nvrm_user_mapping_current(void) { return NULL; }
+/* The lifetime records live in rm_api.c; here one record stands for the newest mapping. */
+static struct { uint64_t address, bytes; } user_mapping;
+static int user_mappings;
+void *nvrm_user_mapping_new(uint64_t bytes, uint64_t *address) {
+    user_mapping.address = (1ull << 63) + (uint64_t)user_mappings++ * (1ull << 40);
+    user_mapping.bytes = bytes;
+    *address = user_mapping.address;
+    return &user_mapping;
+}
+void *nvrm_user_mapping_current(void) { return user_mappings ? &user_mapping : NULL; }
+bool nvrm_user_mapping_span(const void *owner, uint64_t *address, uint64_t *bytes) {
+    if (owner != &user_mapping) return false;
+    *address = user_mapping.address;
+    *bytes = user_mapping.bytes;
+    return true;
+}
 void nvrm_user_mapping_free(void *owner) { (void)owner; }
 n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags) {
     (void)pci;
@@ -282,8 +296,19 @@ static void mapping_cases(void) {
 
     void *address = nv_alloc_kernel_mapping(&nv, priv, 1, PAGE - 1, 1, &mapping);
     CHECK(address == mapped + 2 * PAGE - 1 && maps == 1);
-    CHECK(nv_alloc_user_mapping(&nv, priv, 1, PAGE - 1, 1, 0, &user, NULL) == NV_OK);
-    CHECK(user == pte + 2 * PAGE - 1);
+    void *owner = NULL;
+    CHECK(nv_alloc_user_mapping(&nv, priv, 1, PAGE - 1, 1, 0, &user, NULL) == NV_ERR_INVALID_ARGUMENT);
+    CHECK(nv_alloc_user_mapping(&nv, priv, 1, PAGE - 1, 1, 0, &user, &owner) == NV_OK && owner);
+    /* The address names this mapping, not the memory: never the bus address of the page. */
+    uint64_t first_user = user, page_index = UINT64_MAX;
+    CHECK(user == user_mapping.address + 2 * PAGE - 1 && user_mapping.bytes == 2 * PAGE && user != pte + 2 * PAGE - 1);
+    CHECK(os_match_mmap_offset(priv, user & ~(PAGE - 1), &page_index) == NV_OK && page_index == 1);
+    CHECK(os_match_mmap_offset(priv, pte + PAGE, &page_index) == NV_ERR_OBJECT_NOT_FOUND);
+    /* A second mapping of the same page has addresses of its own. */
+    CHECK(nv_alloc_user_mapping(&nv, priv, 1, PAGE - 1, 1, 0, &user, &owner) == NV_OK);
+    CHECK(user != first_user && user == user_mapping.address + 2 * PAGE - 1);
+    CHECK(os_match_mmap_offset(priv, first_user & ~(PAGE - 1), &page_index) == NV_ERR_OBJECT_NOT_FOUND);
+    CHECK(os_match_mmap_offset(priv, user & ~(PAGE - 1), &page_index) == NV_OK && page_index == 1);
     nv_free_kernel_mapping(&nv, priv, address, mapping);
     CHECK(nv_free_pages(&nv, 2, NV_TRUE, NV_MEMORY_CACHED, priv) == NV_OK);
     CHECK(live == 0 && maps == 0);

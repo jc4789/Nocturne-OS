@@ -114,7 +114,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C37 | 構成空間は自分の装置と上流のブリッジだけ読めればよい | 却下 → 修理済み | RM の `clStoreBusTopologyCache` は装置ごとに機能 0 が答えなければ他の機能を飛ばす。AMD ではルートポートが 00:01.1 で、00:01.0 はホストブリッジ。読めないと上流ポートも FHB（ホストブリッジ、チップセットの識別）も見つからない（実機で chipset.c:463／558 の表明と「Unable to get PCI port handles」）。カーネルは、上流の各ブリッジの装置の全機能とホストブリッジ（06/00）の読みも許す。無関係な装置は今まで通り `N_ERR_DENIED` |
 | C38 | rm_init_adapter が止まっても分かる | 却下 → 修理済み | GSP の起動はうまくいくと何も出さないので、固まったのか遅いのかが見分けられない。nvrm は rm_init_adapter の間 10 秒ごとに経過と処理した割り込みの数を、終わると所要時間と成否をログへ出す |
 | C39 | nvrm は BME（バスマスター）を入れなくてよい | 却下 → 修理済み | カーネルは claim の間 BME を入れない。`nvrm_pci_bus_master` が `rm_init_adapter` の前に Command の BME を入れ（読み戻しで確かめ、書込みが効かない装置は失敗）、初期化の失敗後と `rm_shutdown_adapter` の後に切る。claim の終わりに BME が残っていれば異常終了とみなし、DMA の RAM を隔離 |
-| C40 | 画面の取得・解放（`os_disable_console_access` 等）は空でよい | 却下 → 修理済み | RM が BAR1 を仮想モードにする間、システムが起動時の画面へ書くと GPU の外へ書く。新しい `n_pci_hold_screen`（入れ子、`fbhold=` 秒の上限つき、パニックは無視して描く、claim の終わりで返し全体を描き直す）。画面が他の所なら NOT_FOUND を無視 |
+| C40 | 画面の取得・解放（`os_disable_console_access` 等）は空でよい | 却下 → 修理済み | RM が BAR1 を仮想モードにする間、システムが起動時の画面へ書くと GPU の外へ書く。新しい `n_pci_hold_screen`（入れ子、パニックは無視して描く、claim の終わりで返し全体を描き直す）。画面が他の所なら NOT_FOUND を無視。2026-10-21 訂正：30 秒で保持を無視して描く上限は、RM がまだ BAR1 を作り直している最中に競合を再開していた（RM の待ちはそれより長い）。時間切れの描画をやめ、保持は RM の解放か claim の終わり（装置を止めてから返す）でだけ終わる。止まったドライバーは `fbhold=<秒>`（既定無し）でアプリを止め、claim の終わりで画面を戻す |
 | C41 | `nv_alloc_pages` のキャッシュ型と `os_flush_cpu_cache_all` は無視してよい | 却下 → 修理済み | UC／WC の確保は型つきの view を作って DMA の RAM の型を固定する（直接写像も同じ型）。全キャッシュの書出しは特権命令なので `NOT_SUPPORTED` を返し、RM の呼出し側に任せる（黙って成功しない） |
 | C42 | 装置メモリは UC と WC の別名があってもよい | 却下 → 修理済み | 生きている写像の間、装置の 1 ページに型は一つ（SDM の PAT 別名の規則）。違う型の写像は DENIED でログに出す。起動時の画面はカーネルが WC で写しているので UC の写像は常に DENIED |
 | C43 | 初期化に失敗した GPU も開ける | 却下 → 修理済み | `nv_is_gpu_accessible` は `adapter_ready` のときだけ真。RM 自身の `deviceConstruct` が権限不足で断り、制御装置の診断は使える（実ドライバーと同じ形） |
@@ -143,6 +143,17 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
+- 2026-10-21：837f8789 の残り3件を修理。(1) C40：画面保持の30秒上限を削除（`fb_take_expiry` も削除）。
+  保持は RM の解放か claim の終わりでだけ終わり、claim の終わりは装置を止めて（revoke、MSI・バスマスター
+  無効、IOMMU 遮断、DMA 隔離）から画面を返す。止まったドライバーには既定無しの `fbhold=<秒>` でアプリを
+  止める。(2) C46：`os_dump_stack` は `high - at` の前に `at > high` を弾く。(3) 同じ範囲を A→B と map して
+  B を unmap すると A を取り消していた件：client の線形アドレスを bus アドレスから作るのをやめ、map ごとに
+  2^63 以上の再利用しない区間を割り当てて `pLinearAddress` を一意にした（sysmem は `os_match_mmap_offset`、
+  BAR は `osMapPciMemoryAreaUser`）。確認：ホスト試験3本 0 failed、`scripts/build.py image`、QEMU（WHPX、
+  -smp 4、4096MiB、1080p、`fbhold=20`）で pcitest・nvrmtest・`pcitest fbhold=20` が 0 failed。保持中の
+  画面2枚はバイト一致で、入力を送っても描かれず、20秒でアプリ停止→装置停止→画面解放の順に戻った
+  （目視）。ブラウザーのクリック遷移・戻る・ホイール上下に回帰なし。実機（RTX 4070）は未確認。
+  `user/include/nocturne.h` の `n_pci_hold_screen` の説明は、全体再ビルドを避けるため古いまま（30秒）。
 - 2026-10-21：C48 を修理。ACPI の読むだけの DMAR／IVRS 表示を消し、AMD-Vi（`iommu_amd.c`）と VT-d
   （`iommu_intel.c`）のドライバーを共通層 `iommu.c` の上に書いた。claim した装置は専用の恒等写像
   ドメインへ入り、DMA は claim の DMA オブジェクトと予約範囲（IVMD・RMRR）だけ、割り込みは再マップ表で

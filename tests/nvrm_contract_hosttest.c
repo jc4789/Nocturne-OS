@@ -71,22 +71,29 @@ nv_state_t *NV_API_CALL nv_get_ctl_state(void) { return &nvrm_dev.nv; }
 
 NV_STATUS NV_API_CALL rm_ioctl(nvidia_stack_t *s, nv_state_t *nv, nv_file_private_t *f,
                                NvU32 escape, void *args, NvU32 size) {
-    (void)s; (void)nv; (void)f;
+    (void)s; (void)nv;
     seen_principal = os_get_current_process();
     seen_admin = os_is_administrator();
     if (escape == NV_ESC_RM_MAP_MEMORY && size == sizeof(nv_ioctl_nvos33_parameters_with_fd)) {
         nv_ioctl_nvos33_parameters_with_fd *m = args;
         m->params.status = map_argument_status;
-        m->params.pLinearAddress = NV_PTR_TO_NvP64((void *)(uintptr_t)0x1000);
-        rm_mapping_private = nvrm_user_mapping_new();
+        uint64_t address = 0;
+        rm_mapping_private = nvrm_user_mapping_new(PAGE, &address);
+        m->params.pLinearAddress = NV_PTR_TO_NvP64((void *)(uintptr_t)address);
         pending_mapping.owner = rm_mapping_private;
         have_mapping = true;
     }
     if (park_nonmap) have_mapping = true;
     if (escape == NV_ESC_RM_UNMAP_MEMORY && size == sizeof(NVOS34_PARAMETERS)) {
-        nvrm_user_mapping_free(rm_mapping_private);
-        rm_mapping_private = NULL;
-        ((NVOS34_PARAMETERS *)args)->status = NV_OK;
+        /* As RM does: the mapping is the one its address names (refFindCpuMapping). */
+        NVOS34_PARAMETERS *u = args;
+        uint64_t at = (uint64_t)(uintptr_t)NvP64_VALUE(u->pLinearAddress);
+        struct exported_mapping *named = NULL;
+        for (struct exported_mapping *k = ((struct nvrm_file *)f)->mappings; k && !named; k = k->next)
+            if (at >= k->address && at - k->address < k->bytes) named = k;
+        if (named == rm_mapping_private) rm_mapping_private = NULL;
+        nvrm_user_mapping_free(named);
+        u->status = named ? NV_OK : NV_ERR_OBJECT_NOT_FOUND;
     }
     return return_status;
 }
@@ -147,6 +154,7 @@ static void mapping_cases(void) {
     uint64_t offset = 0, bytes = 0;
     uint32_t access = 0;
     CHECK(nvrm_rm_ioctl(f, NV_ESC_RM_MAP_MEMORY, &map, sizeof map) == NV_OK);
+    NvP64 first_linear = map.params.pLinearAddress;
     CHECK(nvrm_rm_mapping_object(f, &offset, &bytes, &access) == 40);
     CHECK(access == N_MEMORY_READ && native_access == N_MEMORY_READ && bytes == PAGE && offset == 0);
     CHECK(f->mappings && closed == 0);
@@ -166,18 +174,20 @@ static void mapping_cases(void) {
     CHECK(!safe_to_mmap && revokes == before_revoke);
     /* RM-owned lifetimes outside an IPC request are legal even while native
        publication is unsafe. Only their actual allocation can report OOM. */
-    void *orphan = nvrm_user_mapping_new();
+    uint64_t orphan_address = 0;
+    void *orphan = nvrm_user_mapping_new(PAGE, &orphan_address);
     CHECK(orphan && orphan_mappings == orphan && !((struct exported_mapping *)orphan)->file);
+    CHECK(orphan_address >= USER_ADDRESSES_FIRST && orphan_address != (uint64_t)(uintptr_t)NvP64_VALUE(first_linear));
     nvrm_user_mapping_free(orphan);
     CHECK(!orphan_mappings && revokes == before_revoke);
     fail_next_allocation = true;
-    CHECK(!nvrm_user_mapping_new() && !orphan_mappings);
+    CHECK(!nvrm_user_mapping_new(PAGE, &orphan_address) && !orphan_mappings);
+    CHECK(!nvrm_user_mapping_new(0, &orphan_address) && !orphan_mappings);
     CHECK(nvrm_rm_ioctl(f, NV_ESC_RM_MAP_MEMORY, &map, sizeof map) == NV_ERR_INVALID_STATE);
     nv_acquire_mmap_lock(&nvrm_dev.nv);
     nv_set_safe_to_mmap_locked(&nvrm_dev.nv, NV_TRUE);
     nv_release_mmap_lock(&nvrm_dev.nv);
-    NVOS34_PARAMETERS unmap = {.hClient = 1, .hDevice = 2, .hMemory = 3,
-        .pLinearAddress = NV_PTR_TO_NvP64((void *)(uintptr_t)0x1000)};
+    NVOS34_PARAMETERS unmap = {.hClient = 1, .hDevice = 2, .hMemory = 3, .pLinearAddress = first_linear};
     CHECK(nvrm_rm_ioctl(f, NV_ESC_RM_UNMAP_MEMORY, &unmap, sizeof unmap) == NV_OK);
     CHECK(!f->mappings && closed == 1);
     pending_mapping.prot = NV_PROTECT_WRITEABLE;
@@ -196,11 +206,22 @@ static void mapping_cases(void) {
     CHECK(rm_mapping_private != first_owner && f->mappings->next);
     nvrm_user_mapping_free(first_owner);
     CHECK(f->mappings && !f->mappings->next && f->mappings == rm_mapping_private && closed == 3);
+    /* A second map of the same memory, then the client's unmap of it by the address RM returned:
+       RM finds the mapping by that address alone, so the older one stays live with its view. */
+    struct exported_mapping *older = rm_mapping_private;
+    NvP64 older_linear = map.params.pLinearAddress;
+    CHECK(nvrm_rm_ioctl(f, NV_ESC_RM_MAP_MEMORY, &map, sizeof map) == NV_OK);
+    CHECK(nvrm_rm_mapping_object(f, &offset, &bytes, &access) == 40);
+    CHECK(rm_mapping_private != older && map.params.pLinearAddress != older_linear);
+    unmap.pLinearAddress = map.params.pLinearAddress;
+    CHECK(nvrm_rm_ioctl(f, NV_ESC_RM_UNMAP_MEMORY, &unmap, sizeof unmap) == NV_OK && unmap.status == NV_OK);
+    CHECK(f->mappings == older && !older->next && older->view == 40 && closed == 4);
+    rm_mapping_private = older;
     /* An implicit RM user-unmap callback, without an UNMAP escape, revokes the
        exact remaining view before the backing resource can be reused. */
     nvrm_user_mapping_free(rm_mapping_private);
     rm_mapping_private = NULL;
-    CHECK(!f->mappings && closed == 4);
+    CHECK(!f->mappings && closed == 5);
     /* An invalid protection still releases the taken dynamic mapping context. */
     pending_mapping.prot = 0;
     CHECK(nvrm_rm_ioctl(f, NV_ESC_RM_MAP_MEMORY, &map, sizeof map) == NV_OK);
@@ -221,10 +242,10 @@ static void mapping_cases(void) {
     park_nonmap = true;
     CHECK(nvrm_rm_ioctl(f, NV_ESC_RM_ALLOC_MEMORY, &map, sizeof map) == NV_OK && !have_mapping);
     park_nonmap = false;
-    orphan = nvrm_user_mapping_new();
+    orphan = nvrm_user_mapping_new(PAGE, &orphan_address);
     CHECK(orphan && !((struct exported_mapping *)orphan)->file);
     nvrm_rm_file_close(f);
-    CHECK(closed == 4 && !files);
+    CHECK(closed == 5 && !files);
     CHECK(orphan_mappings == orphan); /* a different lifetime, not this file's */
     nvrm_user_mapping_free(orphan);
     CHECK(!orphan_mappings);

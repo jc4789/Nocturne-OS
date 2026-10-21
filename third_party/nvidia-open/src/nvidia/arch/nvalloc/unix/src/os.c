@@ -25,8 +25,10 @@
 #ifdef NVRM_NOCTURNE
 /* Native user mappings have an RM-owned lifetime even outside an IPC request.
  * Registration returns NULL only on a real allocation failure, not for an
- * absent request or a temporary GPU mapping-admission state. */
-extern void *nvrm_user_mapping_new(void);
+ * absent request or a temporary GPU mapping-admission state. Each lifetime
+ * comes with addresses of its own (*address on, `bytes` of them) that name the
+ * mapping to RM, so two mappings of the same bus range are told apart. */
+extern void *nvrm_user_mapping_new(NvU64 bytes, NvU64 *address);
 extern void nvrm_user_mapping_free(void *);
 #endif
 #include <nv-priv.h>
@@ -1248,15 +1250,34 @@ NV_STATUS osMapPciMemoryAreaUser
         portMemCopy((*ppNvuap)->memArea.pRanges, totalRangeSize, memArea.pRanges, totalRangeSize);
 
 #ifdef NVRM_NOCTURNE
-        *pPriv = NV_PTR_TO_NvP64(nvrm_user_mapping_new());
-        if (NvP64_VALUE(*pPriv) == NULL)
         {
-            status = NV_ERR_NO_MEMORY;
-            os_free_mem((*ppNvuap)->memArea.pRanges);
-            goto free_nvuap;
+            // The address names this mapping, not the bus range: an unmap finds
+            // the mapping by it, and the same range may be mapped more than once.
+            NvU64 areaBytes = 0;
+            NvU64 first = 0;
+            NvU64 i;
+
+            for (i = 0; i < memArea.numRanges; i++)
+            {
+                if (!portSafeAddU64(areaBytes, memArea.pRanges[i].size, &areaBytes))
+                {
+                    status = NV_ERR_INVALID_LIMIT;
+                    os_free_mem((*ppNvuap)->memArea.pRanges);
+                    goto free_nvuap;
+                }
+            }
+            *pPriv = NV_PTR_TO_NvP64(nvrm_user_mapping_new(areaBytes, &first));
+            if (NvP64_VALUE(*pPriv) == NULL)
+            {
+                status = NV_ERR_NO_MEMORY;
+                os_free_mem((*ppNvuap)->memArea.pRanges);
+                goto free_nvuap;
+            }
+            *pVirtualAddress = (NvP64) (first + diffStart);
         }
-#endif
+#else
         *pVirtualAddress = (NvP64) (memArea.pRanges[0].start + diffStart);
+#endif
         goto unalign_and_return;
 
 free_nvuap:

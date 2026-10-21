@@ -117,9 +117,13 @@ void nvrm_drop_mapping(void);
  * the OS page size. On success, return the final offset and full page-rounded length. */
 n_handle nvrm_mapping_view(const struct nvrm_mapping *mapping, uint32_t access, uint64_t page_offset,
                            uint64_t *view_offset, uint64_t *bytes);
-/* Private tokens are kept by RM until explicit or implicit user unmap. */
-void *nvrm_user_mapping_new(void);
+/* Private tokens are kept by RM until explicit or implicit user unmap. Each comes with `bytes`
+ * addresses no other mapping is named by, from *address on: RM's address for the mapping is
+ * one of them (never a bus address, which two mappings of the same memory share). */
+void *nvrm_user_mapping_new(uint64_t bytes, uint64_t *address);
 void *nvrm_user_mapping_current(void);
+/* The addresses of a token from nvrm_user_mapping_new. */
+bool nvrm_user_mapping_span(const void *owner, uint64_t *address, uint64_t *bytes);
 void nvrm_user_mapping_free(void *owner);
 
 /* A new shared handle over pages of a system-memory allocation (caller closes it or sends

@@ -22,8 +22,6 @@ static void build_lut(uint32_t *lut, uint8_t *size, uint8_t shift, uint32_t bpp)
     for (unsigned v = 0; v < 1024; v++) lut[v] = (v * max + 511) / 1023 << shift;
 }
 
-static void hold_limit_init(void);
-
 void fb_init(struct limine_framebuffer *f) {
     fb.addr = f->address;
     fb.phys = (uint64_t)f->address - hhdm_offset;
@@ -46,7 +44,6 @@ void fb_init(struct limine_framebuffer *f) {
                 fb.rsize == 8 && fb.gsize == 8 && fb.bsize == 8;
     fb.native_bpc = fb.bpc;
     fb_set_simulated(cmdline_has("fbsim10"));
-    hold_limit_init();
 }
 
 /* Run the whole 10 bpc pipeline on an 8 bpc display (every QEMU/Hyper-V
@@ -123,35 +120,22 @@ static void present_rows(size_t tile, void *context) {
    the BAR the boot screen lies in to virtual mode during its start and stop) asks that nothing is
    written there meanwhile. While a hold lasts, fb_present writes nothing: the compositor and the
    console keep drawing into their RAM canvases, and the whole screen is drawn again when the last
-   hold ends. A hold that outlives the limit (boot option fbhold=<seconds>, 0 for none) is a driver
-   stuck in its start (a GPU that does not answer can keep RM there for minutes): drawing resumes
-   then, so the desktop and the driver's log can be seen again, and a late release only ends the
-   hold's bookkeeping. Kernel code runs on the BSP, but a present runs with interrupts on and can be
-   preempted half way (fbparallel tiles join before it returns): a hold waits until no present is
-   between its check and its end. The panic screen is drawn whatever is held. */
+   hold ends. Time never ends a hold: drawing while the driver still rebuilds is the very write
+   the hold keeps out. A hold ends when the driver gives it back, or when its claim ends
+   (dev/pciuser.c), which stops the device before it gives the holds back; that is also how a
+   driver stuck while holding is ended (pciuser.c, boot option fbhold=). Kernel code runs on the
+   BSP, but a present runs with interrupts on and can be preempted half way (fbparallel tiles join
+   before it returns): a hold waits until no present is between its check and its end. The panic
+   screen is drawn whatever is held. */
 static unsigned hold_count;    /* atomic */
 static unsigned presenting;    /* atomic: fb_present calls between their check and return */
 static uint64_t hold_since_ms; /* when hold_count left 0 */
-static bool hold_expired;      /* atomic: presents go on although hold_count > 0 */
-static bool expiry_noticed;    /* atomic: the compositor has been told (fb_take_expiry) */
 static bool holds_dropped;     /* the kernel stopped (panic): nothing is held any more */
-static uint64_t hold_limit_ms = 30000;
-
-static void hold_limit_init(void) {
-    uint64_t seconds;
-    if (cmdline_number("fbhold", &seconds)) hold_limit_ms = seconds > UINT64_MAX / 1000 ? 0 : seconds * 1000;
-}
 
 void fb_hold(void) {
     if (__atomic_fetch_add(&hold_count, 1, __ATOMIC_ACQ_REL) == 0) {
         hold_since_ms = uptime_ms();
-        __atomic_store_n(&expiry_noticed, false, __ATOMIC_RELAXED);
-        __atomic_store_n(&hold_expired, false, __ATOMIC_RELEASE);
-        if (hold_limit_ms)
-            kprintf("fb: a display driver holds the screen (drawing resumes after %lu s at most)\n",
-                    (unsigned long)(hold_limit_ms / 1000));
-        else
-            kprintf("fb: a display driver holds the screen (no time limit: fbhold=0)\n");
+        kprintf("fb: a display driver holds the screen\n");
     }
     while (__atomic_load_n(&presenting, __ATOMIC_ACQUIRE)) sleep_ms(1);
     __asm__ volatile("sfence" ::: "memory"); /* write-combined pixels already sent leave the CPU now */
@@ -163,30 +147,12 @@ bool fb_release(void) {
                                                   __ATOMIC_ACQUIRE)) {
     }
     if (before != 1) return false;
-    bool expired = __atomic_exchange_n(&hold_expired, false, __ATOMIC_ACQ_REL);
-    kprintf("fb: the screen was released after %lu ms%s\n", (unsigned long)(uptime_ms() - hold_since_ms),
-            expired ? " (drawing had resumed at the limit)" : "");
-    return !expired;
-}
-
-/* Presents are skipped now. Past the limit this ends that; no logging here, a present may be
-   the console's own (kprintf -> fbcon -> fb_present). */
-static bool hold_blocks(void) {
-    if (holds_dropped || !__atomic_load_n(&hold_count, __ATOMIC_ACQUIRE) ||
-        __atomic_load_n(&hold_expired, __ATOMIC_ACQUIRE))
-        return false;
-    if (!hold_limit_ms || uptime_ms() - hold_since_ms < hold_limit_ms) return true;
-    __atomic_store_n(&hold_expired, true, __ATOMIC_RELEASE);
-    return false;
-}
-
-bool fb_take_expiry(void) {
-    hold_blocks(); /* the limit passes while nothing is drawn, too */
-    if (!__atomic_load_n(&hold_expired, __ATOMIC_ACQUIRE) || __atomic_exchange_n(&expiry_noticed, true, __ATOMIC_ACQ_REL))
-        return false;
-    kprintf("fb: a display driver has held the screen for %lu s; drawing again (boot option fbhold=<s>)\n",
-            (unsigned long)(hold_limit_ms / 1000));
+    kprintf("fb: the screen was released after %lu ms\n", (unsigned long)(uptime_ms() - hold_since_ms));
     return true;
+}
+
+static bool hold_blocks(void) {
+    return !holds_dropped && __atomic_load_n(&hold_count, __ATOMIC_ACQUIRE);
 }
 
 void fb_drop_holds(void) { holds_dropped = true; }

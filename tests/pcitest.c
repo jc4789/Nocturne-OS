@@ -4,6 +4,7 @@
    Nocturne with tcc. Prints "pcitest: N failed". */
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 #include <stdatomic.h>
@@ -201,10 +202,14 @@ static void composition_cases(const char *program) {
    The screen's pages are write-combined for as long as the system runs, and any device page has
    one memory type while something maps it. A driver may hold the screen while it rebuilds how
    the CPU reaches it; the claim's end gives back what it still holds. */
-static void screen_cases(const struct n_pciinfo *list, int n) {
-    int at = -1;
+static int find_vga(const struct n_pciinfo *list, int n) {
     for (int i = 0; i < n; i++)
-        if (list[i].vendor == 0x1234 && list[i].device == 0x1111) at = i;
+        if (list[i].vendor == 0x1234 && list[i].device == 0x1111) return i;
+    return -1;
+}
+
+static void screen_cases(const struct n_pciinfo *list, int n) {
+    int at = find_vga(list, n);
     if (at < 0) {
         printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
         failed++;
@@ -263,8 +268,63 @@ static void screen_cases(const struct n_pciinfo *list, int n) {
     n_handle_close(vga);
 }
 
+/* A driver that holds the screen and never gives it back (run by stuck_holder_cases). */
+static int stuck_holder(void) {
+    struct n_pciinfo list[128];
+    int n = pcilist(list, 128), at = find_vga(list, n);
+    n_handle vga = at < 0 ? -1 : n_pci_claim(list[at].bus, list[at].dev, list[at].func);
+    if (vga < 0 || n_pci_hold_screen(vga, true) != 0) return 2;
+    for (;;) n_sleep_ms(60000);
+}
+
+/* Booted with fbhold=<seconds>: the system stops a driver that holds the screen that long, and
+   the end of its claim gives the screen back. Before the limit the hold stays, however long. */
+static void stuck_holder_cases(const char *program, const struct n_pciinfo *list, int n, uint64_t seconds) {
+    int at = find_vga(list, n);
+    if (at < 0) {
+        printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
+        failed++;
+        return;
+    }
+    const char *args[] = {program, "stuck-holder"};
+    int32_t handles[3];
+    for (int i = 0; i < 3; i++) handles[i] = n_handle_kind(i) >= 0 ? i : -1; /* the console it has */
+    struct n_launch launch = {.arguments = args, .argument_count = 2, .handles = handles, .handle_count = 3};
+    n_handle holder = n_app_launch(program, &launch);
+    CHECK(holder >= 0, "launch the stuck holder: %s", n_result_text(holder));
+    if (holder < 0) return;
+    int status = 0;
+    n_result early = n_app_result(holder, (int64_t)seconds * 500, &status);
+    CHECK(early == -N_ERR_TIMEOUT, "the holder keeps the screen before the limit: %s status %d", n_result_text(early),
+          status);
+    n_handle busy = n_pci_claim(list[at].bus, list[at].dev, list[at].func);
+    CHECK(busy == -N_ERR_BUSY, "the VGA is still the holder's: %s", n_result_text(busy));
+    if (busy >= 0) n_handle_close(busy);
+    n_result ended = n_app_result(holder, (int64_t)seconds * 1000 + 10000, &status);
+    CHECK(ended == 0 && status != 0 && status != 2, "the system stopped the holder past the limit: %s status %d",
+          n_result_text(ended), status);
+    if (ended < 0) n_app_stop(holder, 0);
+    n_handle_close(holder);
+    n_handle vga = n_pci_claim(list[at].bus, list[at].dev, list[at].func);
+    CHECK(vga >= 0, "the VGA can be claimed again: %s", n_result_text(vga));
+    if (vga < 0) return;
+    CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, false) == 0, "and held and given back");
+    n_handle_close(vga);
+}
+
 int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"revoked-reader"))return revoked_reader();
+    if(argc>1 && !strcmp(argv[1],"stuck-holder"))return stuck_holder();
+    /* pcitest fbhold=<seconds>: only the stopped-driver case, for a boot with that option */
+    if(argc>1 && !strncmp(argv[1],"fbhold=",7)){
+        struct n_pciinfo list[128];
+        int n = pcilist(list, 128);
+        uint64_t seconds = strtoull(argv[1] + 7, NULL, 10);
+        if (seconds) stuck_holder_cases(argv[0], list, n, seconds);
+        else { printf("FAIL: fbhold=<seconds> needs a number above 0\n"); failed++; }
+        printf("pcitest fbhold: %d failed\n", failed);
+        return failed != 0;
+    }
     struct n_pciinfo list[128];
     int n = pcilist(list, 128), at = -1;
     for (int i = 0; i < n; i++)

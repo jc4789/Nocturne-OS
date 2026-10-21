@@ -109,6 +109,67 @@ static bool function_quiet(struct pci_device *d) {
     }
 }
 
+/* ---- a driver that holds the screen (n_pci_hold_screen, dev/fb.c) ----
+   Only the function the boot screen lies in can hold it, so one claim at most does. Its hold
+   ends when the driver gives it back or when the claim ends; claim_release stops the function
+   first, so drawing never resumes while the driver can still reach the device. A driver stuck
+   while it holds is ended the same way: with boot option fbhold=<seconds>, a hold that lasts
+   that long stops the driver's app, and its claim's end gives the screen back. Without it no
+   time ends a hold: RM's waits follow one another without a bound a limit could be checked
+   against, and stopping a driver that is only slow loses its GPU. */
+static struct pci_claim *screen_holder; /* BSP, interrupts off */
+static int screen_holder_app;
+static uint64_t screen_held_since, screen_hold_limit_ms;
+static bool screen_holder_stopped, screen_watch_started;
+static struct wait_queue screen_watch_wq;
+
+static void screen_watch(void *arg) {
+    (void)arg;
+    for (;;) {
+        uint64_t irq = irq_save();
+        int stop = 0;
+        struct pci_device *d = NULL;
+        uint64_t held = screen_holder ? uptime_ms() - screen_held_since : 0;
+        if (!screen_holder || screen_holder_stopped) wq_wait(&screen_watch_wq);
+        else if (held < screen_hold_limit_ms) wq_wait_timeout(&screen_watch_wq, screen_hold_limit_ms - held);
+        else {
+            screen_holder_stopped = true;
+            stop = screen_holder_app;
+            d = screen_holder->d;
+        }
+        irq_restore(irq);
+        if (!stop) continue;
+        kprintf("pci: %02x:%02x.%u: its driver has held the screen for %lu s (fbhold=); stopping app %d, "
+                "the screen comes back once the function is stopped\n",
+                d->bus, d->dev, d->func, (unsigned long)(screen_hold_limit_ms / 1000), stop);
+        if (task_kill(stop) < 0) kprintf("pci: app %d cannot be stopped; the screen stays held\n", stop);
+    }
+}
+
+static void screen_hold_begin(struct pci_claim *c) {
+    if (!screen_watch_started) {
+        screen_watch_started = true;
+        uint64_t seconds;
+        if (cmdline_number("fbhold", &seconds) && seconds)
+            screen_hold_limit_ms = seconds > UINT64_MAX / 1000 ? UINT64_MAX : seconds * 1000;
+        if (screen_hold_limit_ms) kthread_create("screen hold", screen_watch, NULL);
+    }
+    uint64_t irq = irq_save();
+    screen_holder = c;
+    screen_holder_app = task_process()->pid;
+    screen_held_since = uptime_ms();
+    screen_holder_stopped = false;
+    wq_wake_all(&screen_watch_wq);
+    irq_restore(irq);
+}
+
+static void screen_hold_end(struct pci_claim *c) {
+    uint64_t irq = irq_save();
+    if (screen_holder == c) screen_holder = NULL;
+    wq_wake_all(&screen_watch_wq);
+    irq_restore(irq);
+}
+
 /* A driver that is done with its device stops it and then switches bus mastering off: that is
    how it tells the kernel the device will not reach memory again. A device that still masters
    when its claim ends lost its driver in the middle (a crash, or a driver that never stopped
@@ -143,8 +204,10 @@ static void claim_release(struct vnode *v) {
     else if (c->dma_unsafe)
         kprintf("pci: %02x:%02x.%u still has requests in flight; its DMA memory stays out of use\n",
                 d->bus, d->dev, d->func);
-    /* A driver that ended while it rebuilt the way to the screen leaves it however it is; drawing
-       again is the only way the desktop can come back. */
+    /* A driver that ended while it rebuilt the way to the screen leaves it however it is. The
+       function is stopped now and no process reaches its BARs, so drawing again disturbs nothing
+       that still runs, and it is the only way the desktop can come back. */
+    if (c->screen_holds) screen_hold_end(c);
     for (; c->screen_holds; c->screen_holds--)
         if (fb_release()) wm_repaint();
     d->claimed = false;
@@ -348,12 +411,12 @@ int64_t pci_user_hold_screen(struct file *f, bool hold) {
     if (screen_bar(c->d) < 0) return -N_ERR_NOT_FOUND;
     if (hold) {
         if (c->screen_holds == UINT32_MAX) return -N_ERR_BUSY;
-        c->screen_holds++;
+        if (!c->screen_holds++) screen_hold_begin(c);
         fb_hold();
         return 0;
     }
     if (!c->screen_holds) return -N_ERR_INVALID;
-    c->screen_holds--;
+    if (!--c->screen_holds) screen_hold_end(c);
     if (fb_release()) wm_repaint();
     return 0;
 }

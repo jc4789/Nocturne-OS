@@ -192,7 +192,8 @@ void NV_API_CALL os_dump_stack(void) {
     const uintptr_t *frame = __builtin_frame_address(0);
     for (;;) {
         uintptr_t at = (uintptr_t)frame;
-        if (at % sizeof(uintptr_t) || at < low || high - at < 2 * sizeof(uintptr_t)) break;
+        /* at > high first: high - at is unsigned and would wrap past the top instead of failing */
+        if (at % sizeof(uintptr_t) || at < low || at > high || high - at < 2 * sizeof(uintptr_t)) break;
         uintptr_t return_address = frame[1];
         if (!return_address) break;
         if (used > (int)sizeof line - 24) {

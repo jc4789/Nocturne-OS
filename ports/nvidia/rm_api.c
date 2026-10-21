@@ -36,7 +36,29 @@ struct exported_mapping {
     struct exported_mapping *next;
     struct nvrm_file *file;
     n_handle view;
+    uint64_t address, bytes;    /* the addresses RM names this mapping by (user_addresses_take) */
 };
+
+/* RM names a client's CPU mapping by the address its map returned, and an unmap finds the
+   mapping by that address alone (refFindCpuMapping; its own failure path unmaps the same way).
+   The bus address of the memory would name every mapping of that memory alike, and the unmap
+   of one would end another that is still in use. Each mapping gets addresses of its own
+   instead: a span in the upper half of the 64-bit space, where no bus address lies. Spans never
+   overlap (RM also looks a mapping up by an address inside it) and are not used again. */
+#define USER_ADDRESSES_FIRST (1ull << 63)
+static uint64_t next_user_address = USER_ADDRESSES_FIRST;
+
+static bool user_addresses_take(uint64_t bytes, uint64_t *first) {
+    if (!bytes || bytes > UINT64_MAX - (PAGE - 1)) return false;
+    uint64_t span = (bytes + PAGE - 1) & ~(PAGE - 1);
+    uint64_t at = __atomic_load_n(&next_user_address, __ATOMIC_RELAXED);
+    do {
+        if (span > UINT64_MAX - at) return false; /* 2^63 bytes named since nvrm started */
+    } while (!__atomic_compare_exchange_n(&next_user_address, &at, at + span, true, __ATOMIC_RELAXED,
+                                          __ATOMIC_RELAXED));
+    *first = at;
+    return true;
+}
 
 /* Events RM posts for a client wait here until the client asks for them with
  * NV_ESC_RM_GET_EVENT_DATA (rm_ioctl calls nv_get_event). The protocol is request and reply, so
@@ -80,12 +102,21 @@ static void mapping_close(struct exported_mapping *m) {
     free(m);
 }
 
-void *nvrm_user_mapping_new(void) {
+void *nvrm_user_mapping_new(uint64_t bytes, uint64_t *address) {
     /* This records an RM-owned lifetime, not a CPU map. RM can legitimately
        create it from its own work outside an IPC request. NULL means actual
-       allocation failure only; safety is checked when a native view is issued. */
+       allocation failure only (memory, or addresses to name it by); safety is
+       checked when a native view is issued. */
+    if (!address) return NULL;
     struct exported_mapping *m = calloc(1, sizeof *m);
     if (!m) return NULL;
+    if (!user_addresses_take(bytes, &m->address)) {
+        nvrm_log("NVRM: no address left to name a client mapping of 0x%llx bytes", (unsigned long long)bytes);
+        free(m);
+        return NULL;
+    }
+    m->bytes = bytes;
+    *address = m->address;
     m->view = -1;
     m->file = request_file;
     nv_acquire_mmap_lock(&nvrm_dev.nv);
@@ -98,6 +129,14 @@ void *nvrm_user_mapping_new(void) {
 }
 
 void *nvrm_user_mapping_current(void) { return pending_user_mapping; }
+
+bool nvrm_user_mapping_span(const void *owner, uint64_t *address, uint64_t *bytes) {
+    const struct exported_mapping *m = owner;
+    if (!m || !address || !bytes) return false;
+    *address = m->address;
+    *bytes = m->bytes;
+    return true;
+}
 
 void nvrm_user_mapping_free(void *owner) {
     struct exported_mapping *m = owner;

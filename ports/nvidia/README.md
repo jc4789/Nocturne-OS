@@ -107,7 +107,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `os_map_kernel_space`／`os_unmap_kernel_space` | BAR は `n_pci_bar`＋`n_shared_view`（UC／WC）＋`n_shared_map`。BAR0 は全体を一度だけ写す |
 | `nv_alloc_pages`／`nv_free_pages` | `n_dma_create`（`N_DMA_CONTIGUOUS`、`N_DMA_32BIT`）＋`n_dma_addresses`。ページ 4 KiB より大きいときは余分に取って view で整列 |
 | `nv_alloc_kernel_mapping`／`nv_free_kernel_mapping` | 共有の WB 写し、または view の写し |
-| `nv_alloc_user_mapping`／`nv_free_user_mapping`、`os_match_mmap_offset`、`nv_add_mapping_context_to_file` | クライアントのアドレス＝ページの bus 番地＋オフセット（`os_match_mmap_offset` が逆引き）。マップ要求の間だけスレッドに「保留の文脈」を置き、`nvrm_rm_mapping_object` が view ハンドルにしてクライアントへ添付で渡す |
+| `nv_alloc_user_mapping`／`nv_free_user_mapping`、`os_match_mmap_offset`、`nv_add_mapping_context_to_file` | クライアントのアドレス＝その写像だけの番地の範囲＋ページ位置＋オフセット（`os_match_mmap_offset` が同じ要求の写像から逆引き）。マップ要求の間だけスレッドに「保留の文脈」を置き、`nvrm_rm_mapping_object` が view ハンドルにしてクライアントへ添付で渡す |
 | `nvrm_irq_enable`（`os_pci.c`） | `n_pci_interrupts(1)`。ここで `nv->flags` に **`NV_FLAG_USES_MSIX`（MSI-X が使えたとき）か `NV_FLAG_USES_MSI`** を立てる（RM は読まない） |
 | `nv_get_screen_info`、`nv_set_dma_address_size`、`nv_requires_dma_remap` | 起動時フレームバッファーを RM に知らせて保護（D8）／マスクの検査／IOMMU が無いので不要 |
 | `os_flush_cpu_cache_all`／`write_combine_buffer`／`user_cache` | x86 の DMA はコヒーレントなので多くは空。WC バッファーは `sfence` |
@@ -132,7 +132,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 ## 既知のリスク・不確かなこと
 
 - 4 KiB を超えるページサイズの連続確保は、余分に取って整列する。非連続の大きなページも連続を強いるので、大きな確保は失敗しうる。
-- `nv_alloc_user_mapping` の符号化は bus 番地が一意であることに頼る（IOMMU が無いので成り立つ）。
+- RM はクライアントの写像を、map が返した番地だけで探す（unmap、RM 自身の失敗時の後始末、番地を含む写像の検索）。bus 番地を返すと同じ範囲の二つの写像が同じ名になり、片方の unmap が生きている他方を失効させる。そこで写像ごとに 64 ビット空間の上半分（bus 番地の無い所）から重ならない番地の範囲を割当て、それを RM の番地にする（`nvrm_user_mapping_new`、system memory は `nv_alloc_user_mapping`、BAR は `osMapPciMemoryAreaUser` の `NVRM_NOCTURNE` 部）。範囲は再利用しない（nvrm の起動から 2^63 バイト分で尽き、尽きたら map は失敗してログに出る）。
 - 再配置可能な BAR（Resizable BAR）で BAR1／BAR2 が 16 GiB のとき、カーネル側の写しが失敗しうる。
 - 非連続 BAR range は順序を保持して native `n_shared_compose` で一つの VA へ並べる。範囲数に人工的な上限は無く、ページ境界・整数幅・実資源を検証する。各範囲の cache、RO 上限、source view の取消、PCI claim の寿命を合成・派生 view へ引き継ぐ。
 - `os_is_efi_enabled` は常に真。`os_disable_console_access` は何もしない（表示の乗っ取りは GSP 初期化の間にありうる。D8）。

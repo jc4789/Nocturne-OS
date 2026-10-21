@@ -2126,9 +2126,7 @@ static void wm_thread(void *arg) {
             if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
         }
         irq_restore(fl);
-        bool screen_back = fb_take_expiry(); /* a display driver's hold ran out: frames were lost */
         wm_lock();
-        if (screen_back) damage_all();
         struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
 
         while (in_tail != in_head) {

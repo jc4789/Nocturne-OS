@@ -509,8 +509,9 @@ void NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *base, NvU32 *width, N
    rebuilds BAR1 meanwhile, and a CPU write through BAR1 can disturb that. The system stops
    drawing there (n_pci_hold_screen) until the matching enable. RM keeps the boot screen mapped
    at BAR1 offset 0 through virtual mode when the screen starts there (logged at attach), so
-   drawing then goes on where it was. The system resumes drawing on its own if a hold lasts
-   longer than its limit; a release after that only ends the hold. */
+   drawing then goes on where it was. Only the enable or the end of nvrm's claim (which stops
+   the GPU first) gives the screen back; with boot option fbhold=<s> the system stops nvrm when
+   a hold lasts that long. */
 void NV_API_CALL os_disable_console_access(void) {
     n_result r = n_pci_hold_screen(nvrm_dev.pci, true);
     if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot hold the boot screen: %s", n_result_text(r));
@@ -797,19 +798,21 @@ void NV_API_CALL nv_free_kernel_mapping(nv_state_t *nv, void *priv, void *addres
 
 /* ---- mappings for a client ----
  *
- * RM's "user address" for system memory is the bus address of the page plus the offset in
- * it (the value an mmap offset carried on the systems RM was written for). RM hands it back
- * in rm_create_mmap_context, and os_match_mmap_offset turns it into a page index again. */
+ * RM's "user address" for system memory names the mapping (nvrm_user_mapping_new gives each
+ * one addresses of its own, as many as the whole allocation has bytes) and says which page of
+ * the allocation it starts at and where in that page. RM hands it back in
+ * rm_create_mmap_context of the same request, and os_match_mmap_offset turns it into a page
+ * index again. */
 NV_STATUS NV_API_CALL nv_alloc_user_mapping(nv_state_t *nv, void *priv, NvU64 page_index, NvU32 page_offset,
                                             NvU64 size, NvU32 protect, NvU64 *user_address, void **priv_data) {
     (void)nv; (void)protect;
     struct nvrm_alloc *a = priv;
-    if (!user_address || !alloc_range_valid(a, page_index, page_offset, size)) return NV_ERR_INVALID_ARGUMENT;
-    *user_address = alloc_page_address(a, page_index) + page_offset;
-    if (priv_data) {
-        *priv_data = nvrm_user_mapping_new();
-        if (!*priv_data) return NV_ERR_NO_MEMORY;
-    }
+    if (!user_address || !priv_data || !alloc_range_valid(a, page_index, page_offset, size))
+        return NV_ERR_INVALID_ARGUMENT;
+    uint64_t first;
+    *priv_data = nvrm_user_mapping_new(a->pages * PAGE, &first);
+    if (!*priv_data) return NV_ERR_NO_MEMORY;
+    *user_address = first + page_index * PAGE + page_offset;
     return NV_OK;
 }
 void NV_API_CALL nv_free_user_mapping(nv_state_t *nv, void *priv, NvU64 address, void *priv_data) {
@@ -817,21 +820,16 @@ void NV_API_CALL nv_free_user_mapping(nv_state_t *nv, void *priv, NvU64 address,
     nvrm_user_mapping_free(priv_data);
 }
 
+/* offset is the page-aligned address of the mapping this request just made of the allocation. */
 NV_STATUS NV_API_CALL os_match_mmap_offset(void *priv, NvU64 offset, NvU64 *page_index) {
     struct nvrm_alloc *a = priv;
     if (!a || !page_index) return NV_ERR_INVALID_ARGUMENT;
-    if (a->contiguous) {
-        if (offset < a->base || offset - a->base >= a->pages * PAGE) return NV_ERR_OBJECT_NOT_FOUND;
-        *page_index = (offset - a->base) / PAGE;
-        return NV_OK;
-    }
-    for (uint64_t i = 0; i < a->pages; i++) {
-        if (a->addr[i] == offset) {
-            *page_index = i;
-            return NV_OK;
-        }
-    }
-    return NV_ERR_OBJECT_NOT_FOUND;
+    uint64_t first, bytes;
+    if (!nvrm_user_mapping_span(nvrm_user_mapping_current(), &first, &bytes) || bytes != a->pages * PAGE ||
+        offset < first || offset - first >= bytes)
+        return NV_ERR_OBJECT_NOT_FOUND;
+    *page_index = (offset - first) / PAGE;
+    return NV_OK;
 }
 
 n_handle nvrm_alloc_view(struct nvrm_alloc *a, uint64_t page_index, uint64_t bytes, uint32_t nv_caching,
