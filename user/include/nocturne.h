@@ -114,8 +114,11 @@ n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms);
 /* While the driver changes how the CPU reaches the boot screen in the function's BAR (as
    n_pci_info reports it), the system must not write there. hold true returns once nothing is
    being written and keeps the screen untouched; holds nest, and the last false (or the end of
-   the claim) has the whole screen drawn again. A hold has a time limit (boot option fbhold=<s>,
-   30 by default): past it the system draws again. N_ERR_NOT_FOUND: the boot screen is elsewhere. */
+   the claim) has the whole screen drawn again. No timeout ever draws over a hold: that is the
+   very race it prevents. The end of the claim stops the function (its BAR mappings, interrupts
+   and bus mastering) before the screen comes back. With the boot option fbhold=<s> (none by
+   default) the system stops the app of a driver that held the screen that long, and the end of
+   its claim gives the screen back. N_ERR_NOT_FOUND: the boot screen is elsewhere. */
 n_result n_pci_hold_screen(n_handle pci, bool hold);
 /* Zeroed RAM that a claimed function may read and write by DMA: a shared object (N_DMA_*
    flags), held while any handle or mapping holds it. n_dma_addresses gives the bus address of
