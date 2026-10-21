@@ -47,8 +47,8 @@ int main(int argc, char **argv) {
         }
         n_channel_send(out, "ABC日本語D\n", strlen("ABC日本語D\n"), -1);
     } else {
-        window_t *w = win_open(740, 340, "日本語 中文 한글 — Unifont 全字形", WIN_RESIZABLE);
-        if (!w) return 1;
+        window_t *w;
+        if (win_open(740, 340, "日本語 中文 한글 — Unifont 全字形", WIN_RESIZABLE, &w) < 0) return 1;
         win_move(w, 160, 180);
         gfx_fill(&w->c, 0, 0, w->w, w->h, RGB(24, 22, 42));
         for (unsigned i = 0; i < sizeof lines / sizeof *lines; i++) bitmap_text(&w->c, 20, 16 + i * 26, lines[i], 1);
@@ -56,13 +56,13 @@ int main(int argc, char **argv) {
         bitmap_text(&w->c, 20, 215, "Aa 0123456789 ←→ ★☆", 2);
         /* Body uses the exact embedded bitmap; window decorations are drawn by the kernel. */
         win_update(w);
-        window_t *short_title = win_open(180, 60, "日本語の長い題名の省略を確認", WIN_RESIZABLE);
-        if (!short_title) return 1;
+        window_t *short_title;
+        if (win_open(180, 60, "日本語の長い題名の省略を確認", WIN_RESIZABLE, &short_title) < 0) return 1;
         win_move(short_title, 940, 180);
         gfx_fill(&short_title->c, 0, 0, short_title->w, short_title->h, RGB(24, 22, 42));
         win_update(short_title);
     }
     printf("unifont_guest: glyphs=%u narrow=%u wide=%u, 0 failures\n", total, narrow, wide);
-    msleep(60000);
+    n_sleep_ms(60000);
     return 0;
 }

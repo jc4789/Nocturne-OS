@@ -118,7 +118,7 @@ int main(void) {
     uint64_t took = uptime_ms() - t0;
     CHECK(took >= 950 && took <= 1400, "1 s of sound took %lu ms to play", (unsigned long)took);
     printf("1 s of sound played in %lu ms\n", (unsigned long)took);
-    msleep(300);
+    n_sleep_ms(300);
 
     /* a submitter that does not wait: the stream takes 8192 frames at most */
     a = n_audio_open();
@@ -193,7 +193,7 @@ int main(void) {
         took = uptime_ms() - t0;
         CHECK(rc == 0, "play %s: exit %d", wavs[i].name, rc);
         CHECK(took >= 450 && took <= 900, "play %s took %lu ms", wavs[i].name, (unsigned long)took);
-        msleep(300);
+        n_sleep_ms(300);
     }
     n_document_save("/home/bad.wav", "RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x55\0\x02\0", 22);
     const char *badargs[] = {"/bin/play", "/home/bad.wav"};
@@ -207,14 +207,14 @@ int main(void) {
     CHECK(took >= 380 && took <= 800, "beep -l 400 took %lu ms", (unsigned long)took);
     const char *nargs[] = {"/bin/beep", "H9"};
     CHECK(run_quiet(nargs, 2) == 2, "beep H9 should be refused");
-    msleep(300);
+    n_sleep_ms(300);
 
     /* the Sound Player plays the file it is opened with (alone in its folder, so nothing follows) */
     n_folder_create("/home/ptest");
     make_wav("/home/ptest/tone.wav", 1, 16, 2, 32000, 1200, 750, 0.6, false);
     int id = gui_launch("/bin/player", "/home/ptest/tone.wav");
     CHECK(id > 0, "the Sound Player did not start (%d)", id);
-    msleep(1300);
+    n_sleep_ms(1300);
     if (id > 0) {
         n_handle player = n_app_open(id);
         CHECK(player >= 0 && n_app_stop(player, 0) == 0, "the Sound Player quit by itself");
@@ -223,10 +223,10 @@ int main(void) {
             n_handle_close(player);
         }
     }
-    msleep(300);
+    n_sleep_ms(300);
     const char *largs[] = {"/bin/beep", "-l", "10000", "-f", "300"};
     n_handle beep = start_quiet("/bin/beep", largs, 5);
-    msleep(300);
+    n_sleep_ms(300);
     t0 = uptime_ms();
     n_app_stop(beep, 0);
     n_app_result(beep, -1, NULL);

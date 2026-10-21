@@ -1294,7 +1294,7 @@ static bool host_presentation(void *opaque,web_doc *document,web_node *element,i
     if(mode==1){if(win_fullscreen(w,true)<0)return false;browser_fullscreen=true;fullscreen_doc=document;focus=F_PAGE;need_layout=need_paint=true;return true;}
     if(mode==2){
         if(pip_window)return false;
-        window_t *window=win_open(420,236,"Nocturne — Picture in Picture",WIN_RESIZABLE|WIN_ALWAYS_ON_TOP);if(!window)return false;
+        window_t *window;if(win_open(420,236,"Nocturne — Picture in Picture",WIN_RESIZABLE|WIN_ALWAYS_ON_TOP,&window)<0)return false;
         pip_window=window;pip_doc=document;pip_node=element;pip_revision=UINT64_MAX;
         web_presentation_resize(document,window->w,window->h);
         web_avmedia_pip_paint(document,element,&window->c);win_update(window);return true;

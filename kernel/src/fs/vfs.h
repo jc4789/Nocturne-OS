@@ -167,6 +167,9 @@ int channel_accept(struct file *listener,struct file **server);
 int message_channel_pair(struct file **a, struct file **b);
 bool message_channel_is(struct file *f);
 int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct file *attach);
+/* A message from the kernel's own buffer that never waits: a full queue is
+   N_ERR_NOT_READY and the message is dropped. */
+int64_t message_channel_post(struct file *f, const void *data, size_t n);
 int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek, bool discard,
                                 struct file **attached, uint64_t *sender_app);
 

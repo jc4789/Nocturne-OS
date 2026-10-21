@@ -59,7 +59,7 @@ static void step(void){
         bool same=true;for(int y=0;y<32;y++)if(memcmp(pixels+y*320,first_frame+y*96,96*4)){same=false;break;}
         CHECK(same);early_frames++; /* Future 100ms decoder frame must not overwrite presentation. */
     }
-    msleep(2);
+    n_sleep_ms(2);
 }
 static void first_picture(void){
     char error[160];nmedia *m=nmedia_open("/data/tests/media-fixtures/" AVMEDIA_FRAME_FIXTURE,error,sizeof error);CHECK(m!=NULL);if(!m)return;
@@ -87,7 +87,7 @@ int main(void){
     memset(queue,0,sizeof queue);requested=0;
     const char *pending="<script>var a=document.createElement('video');a.preload='none';a.src='" AVMEDIA_FRAME_FIXTURE "';a.play().catch(()=>{});</script>";
     doc=web_live(pending,strlen(pending),"https://avmedia.test/","utf-8",&host);CHECK(doc!=NULL);
-    if(doc){deadline=uptime_ms()+3000;while(!requested&&uptime_ms()<deadline){web_tick(doc,uptime_ms());msleep(1);}CHECK(requested==1);int before=cancels;web_free(doc);doc=NULL;CHECK(cancels==before+1);}
+    if(doc){deadline=uptime_ms()+3000;while(!requested&&uptime_ms()<deadline){web_tick(doc,uptime_ms());n_sleep_ms(1);}CHECK(requested==1);int before=cancels;web_free(doc);doc=NULL;CHECK(cancels==before+1);}
     CHECK(audio_slots()==slots);
     printf(AVMEDIA_TEST_NAME ": %d checks, %d failed; audio_slots=%d\n",checks,failed,slots);return failed!=0;
 }

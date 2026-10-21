@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 #include "webnet.h"
 
@@ -31,7 +30,7 @@ static uint64_t request(struct result *r, uint64_t generation) {
 }
 static void pump(unsigned ms) {
     uint64_t until = uptime_ms() + ms;
-    do { webnet_pump(net, uptime_ms()); msleep(5); } while (uptime_ms() < until);
+    do { webnet_pump(net, uptime_ms()); n_sleep_ms(5); } while (uptime_ms() < until);
 }
 static bool idle(unsigned ms) {
     uint64_t until = uptime_ms() + ms;
@@ -42,7 +41,7 @@ static bool idle(unsigned ms) {
 static int child_wait(n_handle app, int *status, unsigned ms) {
     uint64_t until = uptime_ms() + ms;
     n_result got;
-    while ((got = n_app_result(app, 0, status)) == -N_ERR_NOT_READY && uptime_ms() < until) msleep(5);
+    while ((got = n_app_result(app, 0, status)) == -N_ERR_NOT_READY && uptime_ms() < until) n_sleep_ms(5);
     if (got == -N_ERR_NOT_READY) { n_app_stop(app, 0); n_app_result(app, -1, status); return 0; }
     return got == 0;
 }
@@ -64,9 +63,9 @@ static bool waiter_blocked(n_handle app) {
 }
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--wait")) {
-        int s = tcp_connect(HOST, (uint16_t)atoi(argv[2]), 5000);
-        if (s < 0) { printf("FAIL tcp capacity waiter errno=%d\n", errno); return 1; }
-        tcp_close(s); return 0;
+        n_result s = tcp_connect(HOST, (uint16_t)atoi(argv[2]), 5000);
+        if (s < 0) { printf("FAIL tcp capacity waiter: %s\n", n_result_text(s)); return 1; }
+        tcp_close((n_handle)s); return 0;
     }
     FILE *f = fopen("/data/tests/tcpport", "r"); char line[64] = "";
     if (f) { fgets(line, sizeof line, f); fclose(f); }
@@ -80,12 +79,12 @@ int main(int argc, char **argv) {
         /* The runner's isolated slirp subnet has no guest at .250. Probe before
            any TCB saturation, so a fresh ARP miss must honor the same budget. */
         uint64_t before = uptime_ms();
-        int s = tcp_connect(0x0a0002fa, (uint16_t)tcp_port, 150), error = errno;
+        n_result s = tcp_connect(0x0a0002fa, (uint16_t)tcp_port, 150);
         uint64_t elapsed = uptime_ms() - before;
-        printf("TCP-CAPACITY-ARP elapsed=%lu errno=%d\n", (unsigned long)elapsed, error);
-        check(s < 0 && error != EMFILE && elapsed < 1000 && (error != ETIMEDOUT || elapsed >= 100),
+        printf("TCP-CAPACITY-ARP elapsed=%lu result=%s\n", (unsigned long)elapsed, s < 0 ? n_result_text(s) : "connected");
+        check(s < 0 && s != -N_ERR_NO_MEMORY && elapsed < 1000 && (s != -N_ERR_TIMEOUT || elapsed >= 100),
             "fresh isolated-subnet ARP lookup honors 150ms connect budget");
-        if (s >= 0) tcp_close(s);
+        if (s >= 0) tcp_close((n_handle)s);
     } else puts("SKIP tcp capacity isolated-subnet ARP probe outside runner network");
     net = webnet_create();
     if (!net) { puts("FAIL tcp capacity worker allocation"); return 1; }
@@ -99,10 +98,10 @@ int main(int argc, char **argv) {
     }
     check(filled, "all finite active slots held without file descriptors");
     if (filled) {
-        uint64_t before = uptime_ms(); int extra = tcp_connect(HOST, (uint16_t)tcp_port, 150), error = errno;
+        uint64_t before = uptime_ms(); n_result extra = tcp_connect(HOST, (uint16_t)tcp_port, 150);
         uint64_t elapsed = uptime_ms() - before;
-        check(extra < 0 && error == ETIMEDOUT && elapsed >= 100 && elapsed < 1000, "full pool waits within original deadline, not immediate EMFILE");
-        if (extra >= 0) tcp_close(extra);
+        check(extra == -N_ERR_TIMEOUT && elapsed >= 100 && elapsed < 1000, "full pool waits within original deadline, not an immediate N_ERR_NO_MEMORY");
+        if (extra >= 0) tcp_close((n_handle)extra);
         struct result cancelled[2] = {0};
         check(request(&cancelled[0], 100) && request(&cancelled[1], 100), "two worker requests queued under TCB pressure");
         pump(200); before = uptime_ms(); webnet_cancel_generation(net, 100);
@@ -112,7 +111,7 @@ int main(int argc, char **argv) {
         int status = -1;
         check(app >= 0, "launch cooperative capacity waiter");
         if (app >= 0) {
-            msleep(200);
+            n_sleep_ms(200);
             bool running = n_app_result(app, 0, &status) == -N_ERR_NOT_READY;
             check(running, "waiter remains blocked while all slots are active");
             tcp_close(held[0]); held[0] = -1;
@@ -124,7 +123,7 @@ int main(int argc, char **argv) {
         check(held[0] >= 0, "closing waiter slot is reclaimed only after protocol lifetime");
         app = waiter(argv[0]); status = -1;
         if (app >= 0) {
-            msleep(200);
+            n_sleep_ms(200);
             bool running = n_app_result(app, 0, &status) == -N_ERR_NOT_READY;
             bool blocked = running && waiter_blocked(app);
             check(blocked, "stop target is a still-running native blocked capacity waiter");

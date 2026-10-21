@@ -54,7 +54,7 @@ int main(void){
     while(!done&&uptime_ms()<deadline){
         deliver(doc,&classic_request,classic,"https://current.test/classic.js");
         deliver(doc,&defer_request,deferred,"https://current.test/defer.js");
-        web_tick(doc,uptime_ms());msleep(1);
+        web_tick(doc,uptime_ms());n_sleep_ms(1);
     }
     if(!done||checks!=21||errors){printf("FAIL currentScript completion done=%d checks=%d errors=%d\n",done,checks,errors);failures++;}
     web_free(doc);printf("currentscripttest: %d checks, %d failed\n",checks,failures);return failures?1:0;

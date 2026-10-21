@@ -188,7 +188,7 @@ int thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
     uint64_t ms = (uint64_t)duration->tv_sec * 1000u + (uint64_t)(duration->tv_nsec + 999999L) / 1000000u;
     while (ms) {
         unsigned step = ms > 0x7fffffffu ? 0x7fffffffu : (unsigned)ms;
-        msleep(step);
+        n_sleep_ms(step);
         ms -= step;
     }
     if (remaining) { remaining->tv_sec = 0; remaining->tv_nsec = 0; }

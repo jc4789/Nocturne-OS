@@ -134,17 +134,43 @@ static void message_free(struct message *m) {
 
 bool message_channel_is(struct file *f) { return f && f->vn->ops == &message_ops; }
 
-int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct file *attach) {
-    struct vnode *v = f->vn;
-    struct message_link *l = v->priv;
-    int peer = !message_side(v);
-    if (n > SIZE_MAX - sizeof(struct message)) return -N_ERR_TOO_LARGE;
+static struct message *message_new(size_t n) {
+    if (n > SIZE_MAX - sizeof(struct message)) return NULL;
     struct message *m = kmalloc(sizeof *m + n);
-    if (!m) return -N_ERR_NO_MEMORY;
+    if (!m) return NULL;
     m->next = NULL;
     m->size = n;
     m->attached = NULL;
     m->sender_app = (uint64_t)task_process()->pid;
+    return m;
+}
+
+/* Queues m for the peer of f, or frees it. With wait, a full queue is waited
+ * out; without, it is N_ERR_NOT_READY. */
+static int64_t message_queue(struct file *f, struct message *m, struct file *attach, bool wait) {
+    struct message_link *l = f->vn->priv;
+    int peer = !message_side(f->vn);
+    uint64_t fl = irq_save();
+    while (l->open[peer] && message_queue_full(l, peer)) {
+        if (!wait) { irq_restore(fl); kfree(m); return -N_ERR_NOT_READY; }
+        if (current_task->killed) { irq_restore(fl); kfree(m); return -N_ERR_STOPPED; }
+        wq_wait(&l->send_wait[peer]);
+    }
+    if (!l->open[peer]) { irq_restore(fl); kfree(m); return -N_ERR_CLOSED; }
+    size_t n = m->size;
+    if (attach) m->attached = vfs_dup(attach);
+    *l->tail[peer] = m;
+    l->tail[peer] = &m->next;
+    l->queued[peer] += n;
+    wq_wake_all(&l->wait[peer]);
+    vfs_poll_notify(l->end[peer]);
+    irq_restore(fl);
+    return (int64_t)n;
+}
+
+int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct file *attach) {
+    struct message *m = message_new(n);
+    if (!m) return n > SIZE_MAX - sizeof(struct message) ? -N_ERR_TOO_LARGE : -N_ERR_NO_MEMORY;
     /* Copy in fixed pieces: a large message never makes one long
        non-preemptible copy, and a sibling unmapping the source is caught. */
     for (size_t done = 0; done < n;) {
@@ -156,20 +182,14 @@ int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct
         if (!ok) { kfree(m); return -N_ERR_BAD_ADDRESS; }
         done += piece;
     }
-    uint64_t fl = irq_save();
-    while (l->open[peer] && message_queue_full(l, peer)) {
-        if (current_task->killed) { irq_restore(fl); kfree(m); return -N_ERR_STOPPED; }
-        wq_wait(&l->send_wait[peer]);
-    }
-    if (!l->open[peer]) { irq_restore(fl); kfree(m); return -N_ERR_CLOSED; }
-    if (attach) m->attached = vfs_dup(attach);
-    *l->tail[peer] = m;
-    l->tail[peer] = &m->next;
-    l->queued[peer] += n;
-    wq_wake_all(&l->wait[peer]);
-    vfs_poll_notify(l->end[peer]);
-    irq_restore(fl);
-    return (int64_t)n;
+    return message_queue(f, m, attach, true);
+}
+
+int64_t message_channel_post(struct file *f, const void *data, size_t n) {
+    struct message *m = message_new(n);
+    if (!m) return -N_ERR_NO_MEMORY;
+    memcpy(m->bytes, data, n);
+    return message_queue(f, m, NULL, false);
 }
 
 /* peek reports the next message's size without taking it. A message larger

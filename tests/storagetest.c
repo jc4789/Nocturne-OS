@@ -37,7 +37,7 @@ static bool script(const char *url,const char *code){
     web_doc *d=web_live(html,strlen(html),url,"utf-8",&host);free(html);
     check(d!=NULL,"live document allocation");if(!d)return false;
     uint64_t deadline=uptime_ms()+20000;
-    while(!done && uptime_ms()<deadline){web_tick(d,uptime_ms());msleep(1);}
+    while(!done && uptime_ms()<deadline){web_tick(d,uptime_ms());n_sleep_ms(1);}
     web_free(d);check(done,"JS completed");return done;
 }
 static int direct(const char *origin,int kind,int op,const char *key,const char *value,struct web_storage_result *out){

@@ -41,7 +41,7 @@ static node_t *find_id(web_doc *d,const char *id){
     return NULL;
 }
 static struct web_frame *frame(const char *id){node_t *n=find_id(top,id);return n?web_frame_find(top,n):NULL;}
-static void pump(void){for(int i=0;i<8;i++){web_tick(top,uptime_ms());msleep(1);}}
+static void pump(void){for(int i=0;i<8;i++){web_tick(top,uptime_ms());n_sleep_ms(1);}}
 static bool deliver(const char *needle,const char *url,const char *extra,const char *body){
     for(unsigned i=0;i<32;i++)if(queued[i].used&&strstr(queued[i].url,needle)){
         struct web_response r={.status=200};web_response_set_url(&r,url?url:queued[i].url);

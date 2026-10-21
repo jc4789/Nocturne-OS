@@ -16,13 +16,13 @@ int main(void) {
     if (!pixels) return 1;
     int width=MIN(sw-190,900),height=MIN(sh-90,600);
     for (unsigned i=0;i<WINDOWS;i++) {
-        wins[i]=win_open(width,height,"WM診断: HMP title drag / real shared RAM",0);
-        if (!wins[i]) { printf("wmholdtest: FAIL capacity=%u\n",i); goto cleanup; }
+        n_result opened=win_open(width,height,"WM診断: HMP title drag / real shared RAM",0,&wins[i]);
+        if (opened<0) { printf("wmholdtest: FAIL capacity=%u (%s)\n",i,n_result_text(opened)); goto cleanup; }
         win_move(wins[i],40+(int)(i%4)*19,30+(int)(i%5)*13);
         gfx_fill(&wins[i]->c,0,0,width,height,color(i));
         win_update(wins[i]);
     }
-    msleep(200);
+    n_sleep_ms(200);
     if (screen_grab(pixels,(size_t)gw*gh*4,&gw,&gh)<0) goto cleanup;
     int x=40+27%4*19,y=30+27%5*13;
     if (pixels[(size_t)(y+28+90)*gw+x+1+80]!=color(27)) {
@@ -31,7 +31,7 @@ int main(void) {
     printf("wmholdtest: READY windows=28 hold_ms=%u title_x=%d title_y=%d client_x=%d client_y=%d client_w=%d client_h=%d screen_w=%d screen_h=%d\n",
            (unsigned)HOLD_MS,x+width/2,y+14,x+1,y+28,width,height,gw,gh);
     /* 保持中はuserを眠らせる。dummy忙しいloop/追加damage/serial出力なし。 */
-    msleep(HOLD_MS);
+    n_sleep_ms(HOLD_MS);
     if (screen_grab(pixels,(size_t)gw*gh*4,&gw,&gh)<0) goto cleanup;
     unsigned found=0;
     for (size_t i=0;i<(size_t)gw*gh;i++) if (pixels[i]==color(27)) found++;

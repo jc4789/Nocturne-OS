@@ -125,7 +125,7 @@ int main(int argc,char **argv) {
             strcpy(r.url,"https://canvas.test/fixture.svg");
             web_resource_loaded(doc,image_request,&r); image_request=0;
         }
-        msleep(1);
+        n_sleep_ms(1);
     }
     printf("CANVAS-STAGE final-layout-paint\n");fflush(stdout);
     canvas_t c;gfx_init(&c,pixels,128,128,128);web_layout(doc,128,128);web_paint(doc,&c,0,0,128,128,0,0);

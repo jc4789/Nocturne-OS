@@ -1393,5 +1393,9 @@ void task_printf_stderr(struct task *t, const char *fmt, ...) {
     uint64_t flags = irq_save();
     struct file *file = owner->fd_capacity>2 && owner->fds[2] ? vfs_dup(owner->fds[2]) : NULL;
     irq_restore(flags);
-    if (file) { vfs_write(file, buf, n); vfs_close(file); }
+    if (!file) return;
+    /* A message channel has no byte write: the text goes as one message. */
+    if (message_channel_is(file)) message_channel_post(file, buf, (size_t)n);
+    else vfs_write(file, buf, n);
+    vfs_close(file);
 }

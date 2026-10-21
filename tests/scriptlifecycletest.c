@@ -289,7 +289,7 @@ int main(void) {
         deliver(doc,&deferred_request,deferred,"https://lifecycle.test/deferred.js");
         deliver(doc,&following_request,following,"https://lifecycle.test/following.js");
         deliver(doc,&module_request,load_module,"https://lifecycle.test/load-await.js");
-        web_tick(doc,uptime_ms()); msleep(1);
+        web_tick(doc,uptime_ms()); n_sleep_ms(1);
     }
     if (!done || checks!=22 || errors) {
         printf("FAIL script lifecycle completion done=%d checks=%d errors=%d\n",done,checks,errors);

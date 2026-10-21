@@ -42,7 +42,7 @@ static web_doc *document(webstorage *store,const char *suffix){
 }
 static void pump(web_doc *a,web_doc *b,web_doc *c,unsigned ms){
     uint64_t end=uptime_ms()+ms;
-    while(uptime_ms()<end){uint64_t now=uptime_ms();if(a)web_tick(a,now);if(b)web_tick(b,now);if(c)web_tick(c,now);msleep(1);}
+    while(uptime_ms()<end){uint64_t now=uptime_ms();if(a)web_tick(a,now);if(b)web_tick(b,now);if(c)web_tick(c,now);n_sleep_ms(1);}
 }
 static volatile uint32_t lease_stage;
 static char lease_path[128];
@@ -64,9 +64,9 @@ int main(int argc,char **argv){
     n_handle lease=n_document_open(lease_path,N_DOCUMENT_CREATE);check(lease>=0&&n_document_claim(lease,false)==0,"lease-owner-lock");
     n_handle other=n_document_open(lease_path,N_DOCUMENT_EDIT);check(other>=0&&n_document_release(other)<0,"lease-other-handle-cannot-release");if(other>=0)n_handle_close(other);
     int tid=thread_create(lease_waiter,NULL);check(tid>0,"lease-waiter-created");
-    uint64_t deadline=uptime_ms()+1000;while(!lease_stage&&uptime_ms()<deadline)msleep(1);
-    msleep(20);check(lease_stage==1,"lease-separate-open-waits");n_handle_close(lease);
-    deadline=uptime_ms()+1000;while(lease_stage==1&&uptime_ms()<deadline)msleep(1);
+    uint64_t deadline=uptime_ms()+1000;while(!lease_stage&&uptime_ms()<deadline)n_sleep_ms(1);
+    n_sleep_ms(20);check(lease_stage==1,"lease-separate-open-waits");n_handle_close(lease);
+    deadline=uptime_ms()+1000;while(lease_stage==1&&uptime_ms()<deadline)n_sleep_ms(1);
     check(lease_stage==2,"lease-last-close-releases");if(lease_stage!=1&&tid>0)thread_join(tid);n_entry_remove(lease_path);
     webstorage *a=webstorage_create(),*b=webstorage_create();struct web_storage_result out={0};
     check(access(a,WEB_STORAGE_CLEAR,NULL,NULL,&out)==WEB_STORAGE_OK,"native-initial-clear");

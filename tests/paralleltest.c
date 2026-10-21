@@ -23,7 +23,7 @@ static void work(size_t i, void *context) {
 static void leaf(size_t i, void *context) { ((unsigned *)context)[i]++; }
 static void nested(size_t i, void *context) { parallel_for(2, leaf, (unsigned *)context + i * 2); }
 static void profiled_skew(size_t i, void *context) {
-    if (!i) msleep(20); /* uneven duration, not a performance benchmark */
+    if (!i) n_sleep_ms(20); /* uneven duration, not a performance benchmark */
     work(i,context);
     parallel_record_work(PARALLEL_GENERIC,i+1);
 }

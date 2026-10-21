@@ -43,7 +43,7 @@ static bool hit(web_doc *d, node_t *n, int x, int y) {
 static bool evaluate(web_doc *d, const char *source) { return web_console_eval(d, source, strlen(source)); }
 static bool pump(web_doc *d, bool *ready) {
     uint64_t deadline = uptime_ms() + 3000;
-    while (!*ready && uptime_ms() < deadline) { web_tick(d, uptime_ms()); msleep(10); }
+    while (!*ready && uptime_ms() < deadline) { web_tick(d, uptime_ms()); n_sleep_ms(10); }
     return *ready;
 }
 
@@ -96,7 +96,7 @@ int main(void) {
     check("native live document allocated", d != NULL); if (!d) goto end;
     /* web_live is incremental: finish the initial parser task before author
        setup reads elements. A layout call alone does not advance JS parsing. */
-    for (int i = 0; i < 8; i++) { web_tick(d, uptime_ms()); msleep(1); }
+    for (int i = 0; i < 8; i++) { web_tick(d, uptime_ms()); n_sleep_ms(1); }
     web_layout(d, 480, 240);
     check("flat shadow and observer setup", evaluate(d, init));
     web_layout(d, 480, 240);

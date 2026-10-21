@@ -1,7 +1,5 @@
 /* host: DNS lookup */
 #include <stdio.h>
-#include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 
 int main(int argc, char **argv) {
@@ -17,8 +15,9 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         uint32_t ip;
         char buf[16];
-        if (net_resolve(argv[i], &ip) < 0) {
-            printf("%s: %s\n", argv[i], errno == ENOENT ? "not found" : strerror(errno));
+        n_result r = net_resolve(argv[i], &ip);
+        if (r < 0) {
+            printf("%s: %s\n", argv[i], n_result_text(r));
             status = 1;
         } else {
             printf("%s has address %s\n", argv[i], ip_format(ip, buf));

@@ -369,7 +369,7 @@ static bool wait_request(void *opaque,uint64_t id,const bool *completed) {
     if(!found)return *completed;
     uint64_t end=uptime_ms()+5000;
     f->native_wait=true;f->preload_joins++;
-    while(!*completed&&uptime_ms()<end){deliver(f);msleep(1);}
+    while(!*completed&&uptime_ms()<end){deliver(f);n_sleep_ms(1);}
     f->native_wait=false;return *completed;
 }
 static void close_case(void);
@@ -428,7 +428,7 @@ static bool pump(const char *marker, unsigned timeout_ms) {
         if(fixture.mark_allocation_failed)return false;
         if (marker && has_mark(&fixture, marker)) return true;
         if (!marker && !queued_count(&fixture) && web_deadline(fixture.doc) < 0) return true;
-        msleep(1);
+        n_sleep_ms(1);
     }
     return false;
 }
@@ -578,7 +578,7 @@ static void test_image_invalidation(void) {
     }
     test_check("image-lazy-candidate-updated",image_url);
     test_check("image-picture-source-updated",picture_url);
-    for(int i=0;i<30;i++){step(&fixture);msleep(1);}
+    for(int i=0;i<30;i++){step(&fixture);n_sleep_ms(1);}
     int previous_requests=fixture.requests;
     const char *idle="requestIdleCallback(()=>{globalThis.lastIdleImage=new Image();lastIdleImage.src='last-idle-image.svg';mark('last-idle-image-set');});";
     test_check("last-idle-image-queued",web_console_eval(fixture.doc,idle,strlen(idle)));
@@ -615,7 +615,7 @@ static void test_image_invalidation(void) {
         step(&fixture);web_layout(fixture.doc,VW,VH);
         uint64_t now=uptime_ms();int64_t deadline=web_deadline(fixture.doc);
         if(i>=8 && deadline>(int64_t)now)future++;
-        msleep(1);
+        n_sleep_ms(1);
     }
     test_check("image-queue-full-deadline-waits",future==8);
     test_check("image-queue-load-still-blocked",!has_mark(&fixture,"image-queue-load"));

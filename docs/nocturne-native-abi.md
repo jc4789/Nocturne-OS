@@ -33,6 +33,12 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   `N_ERR_NOT_EMPTY`、`N_ERR_IO`、`N_ERR_UNSUPPORTED`。
 - `n_result_text(r)` が表示用の文を返す。ISO Cの関数が失敗理由を残す必要がある場合、
   libcは `errno` に `n_result` の正の値を入れる（名前は `N_ERR_*` のみ）。
+- `nocturne.h`／`gpu.h`／`display.h` のlibc関数も同じで、`errno` は触らない：
+  ネットワーク（`net_*`、`udp_*`、`tcp_*`。ソケットは `n_handle`）、窓と画面
+  （`win_*`、`screen_*`、`clipboard_*`、`gui_launch`）、GPU（`gpu_*`、`gfx_render3d*`）、
+  `proclist`、`sysinfo`、`thread_stack_bounds`、`poweroff`／`reboot`。何かを作って渡す関数は
+  出力引数に置いて `n_result` を返す（`win_open(w, h, title, flags, &win)`、
+  `n_memory_reserve`。失敗では出力は NULL）。
 
 ## 3. 文書とフォルダー（`open`／`lseek`／`readdir`／`chdir` の置き換え）
 
@@ -124,6 +130,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   `n_terminal(h)` がこれを読む。端末はキー入力をそのまま送るので、行の編集と表示は
   アプリ側（libcの `readline`）が行う。ISO Cの `stdout`／`stderr`／
   `stdin` は、起動時に渡された出力／入力チャンネル（無ければ記録先のログ）に結び付く。
+  アプリが例外（ページフォルト等）で止められると、カーネルはその報告文を一つの
+  メッセージとして記録先のログ（ハンドル2）へ送る。待ち行列が満杯なら待たずに捨てる。
 - Ctrl+C：端末はシェルにハンドル3として「割込み」チャンネルを渡し（設定
   `INTERRUPTS=3`）、Ctrl+C ごとにメッセージを一つ送る。シェルは前面のジョブを
   `n_app_stop(h, N_APP_STOP_TREE)` で止め、プロンプトでは入力中の行を取り消す。
@@ -150,7 +158,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - `n_app_open(id)`：アプリ一覧の識別子から、動作中のアプリのハンドルを得る（タスク
   マネージャーや `kill` が `n_app_stop` するため）。`n_app_id(h)`：ハンドルの識別子
   （終了後は0）。
-- `n_app_list`、`n_system_info` 等の状態取得は現行の `proclist`／`sysinfo` を引き継ぐ。
+- `n_app_list`、`n_system_info` 等の状態取得は現行の `proclist`（件数）／`sysinfo`（0）を
+  引き継ぐ。どちらも失敗では負の `n_result`。
 
 ## 6. イベント待ち行列（`poll`／`O_NONBLOCK`／`fcntl` の置き換え）
 
@@ -173,7 +182,9 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 ## 7. メモリ（`sbrk`／`mmap`／`mprotect` の置き換え）
 
 - `n_memory_reserve(bytes, n_memory_access, &memory)`：ゼロ初期化の領域を確保し、
-  `memory` に置く（失敗では NULL と負の `n_result`）。
+  `memory` に置く（失敗では NULL と負の `n_result`）。大きさの独自上限は無い：
+  空きメモリや予約領域を超えれば `N_ERR_NO_MEMORY`、0 やページ丸めで桁あふれする
+  大きさは `N_ERR_INVALID`。
 - `n_memory_release(addr, bytes)`、`n_memory_protect(addr, bytes, access)`：0 か負の `n_result`。
 - `access` は列挙：`N_MEMORY_READ`、`N_MEMORY_READ_WRITE`、`N_MEMORY_READ_EXECUTE`。
   書込みと実行の同時許可は無い（W^X）。
@@ -200,7 +211,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 
 ## 8. 時間
 
-- `n_clock_uptime_ms()`、`n_clock_wall()`（壁時計の秒）、`n_sleep_ms(ms)`。
+- `n_clock_uptime_ms()`、`n_clock_wall()`（壁時計の秒）、`n_sleep_ms(ms)`（結果は無い。
+  旧 `msleep` は削除した。ISO Cの `thrd_sleep` はこれの上に作る）。
 - `n_random(buf, n)`：システムのエントロピーから `n` バイト（`/dev/urandom` の置き換え）。
 - `gettimeofday`、`struct timeval` は無い。ISO Cの `time`／`timespec_get`／`localtime` は
   これらの上に実装する。

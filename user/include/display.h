@@ -4,8 +4,8 @@
 #include "display_abi.h"
 #include "nocturne.h"
 
-/* The work area and colour format. 0, or -1 with errno set. */
-int screen_format(struct screen_format *out);
+/* The work area and colour format. 0, or a negative n_result. */
+n_result screen_format(struct screen_format *out);
 /* Bits per channel the desktop delivers: 8, or 10 on a deep display. */
 int display_bits_per_channel(void);
 /* The deep plane of the window's current canvas (one byte per pixel, pitch

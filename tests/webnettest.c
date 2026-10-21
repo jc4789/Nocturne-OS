@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 
 struct result {
     int calls, status;
@@ -39,16 +38,16 @@ static void completed(webnet *n, uint64_t id, uint64_t generation,
 }
 static void pump_for(unsigned ms) {
     uint64_t until = uptime_ms() + ms;
-    do { webnet_pump(net, uptime_ms()); msleep(5); } while (uptime_ms() < until);
+    do { webnet_pump(net, uptime_ms()); n_sleep_ms(5); } while (uptime_ms() < until);
 }
 static bool wait_result(struct result *r, unsigned ms) {
     uint64_t until = uptime_ms() + ms;
-    while (!r->calls && uptime_ms() < until) { webnet_pump(net, uptime_ms()); msleep(5); }
+    while (!r->calls && uptime_ms() < until) { webnet_pump(net, uptime_ms()); n_sleep_ms(5); }
     return r->calls == 1;
 }
 static bool wait_idle(unsigned ms) {
     uint64_t until = uptime_ms() + ms;
-    while (webnet_busy(net) && uptime_ms() < until) { webnet_pump(net, uptime_ms()); msleep(5); }
+    while (webnet_busy(net) && uptime_ms() < until) { webnet_pump(net, uptime_ms()); n_sleep_ms(5); }
     return !webnet_busy(net);
 }
 static int children(void) {
@@ -682,7 +681,7 @@ static void concurrency_tests(void) {
     while (webnet_busy(net) && uptime_ms() < until) {
         webnet_pump(net, uptime_ms());
         if (transports() > 4 || children()!=1) good = false;
-        msleep(5);
+        n_sleep_ms(5);
     }
     for (int i = 0; i < 3; i++) good = good && success(&r[i]);
     check(good && !webnet_busy(net) && transports() == 0 && children()==1, "queued requests complete and release all request transports in the pooled service");
@@ -1112,16 +1111,16 @@ static void paused_stream_transport_test(void){
     bool submitted=true;for(unsigned i=0;i<5;i++){ids[i]=webnet_submit(net,&q,paused_stream_received,&results[i]);submitted&=ids[i]!=0;}
     uint64_t until=uptime_ms()+5000;unsigned headers=0;
     do{webnet_pump(net,uptime_ms());headers=0;for(unsigned i=0;i<5;i++)headers+=results[i].headers;
-        if(headers==5&&!transports())break;msleep(5);
+        if(headers==5&&!transports())break;n_sleep_ms(5);
     }while(uptime_ms()<until);
     check(submitted&&headers==5&&transports()==0&&children()==1,"native small paused response writers retire while their unread bounded channels remain owned");
     bool unread=webnet_busy(net);for(unsigned i=0;i<5;i++)unread&=!results[i].chunks&&!results[i].ends&&!results[i].failed;
     check(unread,"native transport retirement does not publish unread chunks or a fabricated END");
     ids[5]=webnet_submit(net,&q,paused_stream_received,&results[5]);until=uptime_ms()+5000;
-    while(!results[5].headers&&uptime_ms()<until){webnet_pump(net,uptime_ms());msleep(5);}
+    while(!results[5].headers&&uptime_ms()<until){webnet_pump(net,uptime_ms());n_sleep_ms(5);}
     check(ids[5]&&results[5].headers==1&&!results[5].failed,"sixth same-origin Fetch progresses while five response bodies remain paused");
     until=uptime_ms()+5000;
-    while(webnet_busy(net)&&uptime_ms()<until){for(unsigned i=0;i<6;i++)if(ids[i])webnet_resume(net,ids[i]);webnet_pump(net,uptime_ms());msleep(5);}
+    while(webnet_busy(net)&&uptime_ms()<until){for(unsigned i=0;i<6;i++)if(ids[i])webnet_resume(net,ids[i]);webnet_pump(net,uptime_ms());n_sleep_ms(5);}
     bool drained=!webnet_busy(net)&&transports()==0&&children()==1;
     for(unsigned i=0;i<6;i++)drained&=results[i].headers==1&&results[i].chunks>0&&results[i].ends==1&&!results[i].failed;
     check(drained,"native resume preserves ordered headers/chunks/END and reaps all transport owners");
@@ -1170,7 +1169,7 @@ static void setup_cancel_service_test(void){
     int service_pid=setup_service_pid();unsigned submitted=0,entered=0,callbacks=0;
     bool admitted=service_pid>0,reclaimed=true,quiet=true;
     uint64_t settled=uptime_ms()+150;
-    while(setup_service_threads(service_pid,false)>0&&uptime_ms()<settled)msleep(2);
+    while(setup_service_threads(service_pid,false)>0&&uptime_ms()<settled)n_sleep_ms(2);
     admitted&=setup_service_threads(service_pid,false)==0;
     for(unsigned batch=0;batch<8;batch++){
         uint64_t ids[6]={0};int previous=setup_service_threads(service_pid,true);
@@ -1181,18 +1180,18 @@ static void setup_cancel_service_test(void){
             ids[i]=webnet_submit(net,&q,setup_unexpected_response,&callbacks);submitted+=ids[i]!=0;
         }
         uint64_t until=uptime_ms()+500;
-        while(transports()<6&&uptime_ms()<until){webnet_pump(net,uptime_ms());msleep(2);}
+        while(transports()<6&&uptime_ms()<until){webnet_pump(net,uptime_ms());n_sleep_ms(2);}
         /* Keep the requests live after sending their prefixes, so cancellation
            exercises the worker's setup syscall, rather than an unread queue. */
         pump_for(60);
         int active=setup_service_threads(service_pid,true);until=uptime_ms()+500;
-        while(active<previous+6&&uptime_ms()<until){webnet_pump(net,uptime_ms());msleep(2);active=setup_service_threads(service_pid,true);}
+        while(active<previous+6&&uptime_ms()<until){webnet_pump(net,uptime_ms());n_sleep_ms(2);active=setup_service_threads(service_pid,true);}
         if(previous>=0&&active>=previous+6&&transports()==6)entered+=6;else admitted=false;
         quiet&=callbacks==0;
         for(unsigned i=0;i<6;i++)if(ids[i])webnet_cancel(net,ids[i]);
         until=uptime_ms()+150;
         do{webnet_pump(net,uptime_ms());active=setup_service_threads(service_pid,false);
-            if(!webnet_busy(net)&&active==0)break;msleep(2);
+            if(!webnet_busy(net)&&active==0)break;n_sleep_ms(2);
         }while(uptime_ms()<until);
         reclaimed&=!webnet_busy(net)&&transports()==0&&active==0;
     }
@@ -1244,11 +1243,11 @@ static void pacing_tests(void){
     setup_cancel_service_test();
 }
 static volatile bool udp_wait_started;
-static int udp_wait_handle,udp_wait_result,udp_wait_errno;
+static int udp_wait_handle;
+static n_result udp_wait_result;
 static void udp_wait_closed(void *unused) {
     (void)unused;char byte;udp_wait_started=true;
     udp_wait_result=udp_recvfrom(udp_wait_handle,&byte,1,3000,NULL);
-    udp_wait_errno=errno;
 }
 static int udp_capacity_test(void) {
     if(!net_wait_up(20000)){puts("FAIL UDP network did not come up");return 1;}
@@ -1270,22 +1269,23 @@ static int udp_capacity_test(void) {
     int tid=udp_wait_handle>=0?thread_create(udp_wait_closed,NULL):-1;
     check(tid>=0,"native UDP blocked receive thread starts");
     if(tid>=0) {
-        while(!udp_wait_started)msleep(1);
-        msleep(30);udp_close(udp_wait_handle);
+        while(!udp_wait_started)n_sleep_ms(1);
+        n_sleep_ms(30);udp_close(udp_wait_handle);
         int replacement=udp_socket(0);
         check(replacement==udp_wait_handle,"closed slot can be reused while its old receive is sleeping");
         thread_join(tid);
-        check(udp_wait_result==-1&&udp_wait_errno==EBADF,"blocked receive never consumes a replacement socket generation");
+        check(udp_wait_result==-N_ERR_NO_HANDLE,"blocked receive never consumes a replacement socket generation");
         if(replacement>=0)udp_close(replacement);
     } else if(udp_wait_handle>=0)udp_close(udp_wait_handle);
     printf("webnet-udp-capacity: %d failed\n",failed);return failed!=0;
 }
 static volatile bool tcp_wait_started,tcp_wait_finished;
-static int tcp_wait_handle,tcp_wait_result,tcp_wait_errno;
+static int tcp_wait_handle;
+static n_result tcp_wait_result;
 static void tcp_wait_closed(void *unused) {
     (void)unused;char byte;tcp_wait_started=true;
     tcp_wait_result=tcp_recv(tcp_wait_handle,&byte,1,3000);
-    tcp_wait_errno=errno;tcp_wait_finished=true;
+    tcp_wait_finished=true;
 }
 static int tcp_capacity_test(void) {
     int sockets[24];
@@ -1307,14 +1307,14 @@ static int tcp_capacity_test(void) {
     int tid=tcp_wait_handle>=0?thread_create(tcp_wait_closed,NULL):-1;
     check(tid>=0,"native TCP socket-local blocked receive starts");
     if(tid>=0) {
-        while(!tcp_wait_started)msleep(1);
-        msleep(30);
+        while(!tcp_wait_started)n_sleep_ms(1);
+        n_sleep_ms(30);
         check(!tcp_wait_finished,"idle TCP receive remains pending before close");
         check(tcp_close(tcp_wait_handle)==0,"close wakes the socket-local receive queue");
         int replacement=tcp_connect(0x0a000202,(uint16_t)ports[0],5000);
         check(replacement>=0,"fresh TCP connection progresses while old receive resumes");
         thread_join(tid);
-        check(tcp_wait_finished&&tcp_wait_result==-1&&tcp_wait_errno==EBADF,
+        check(tcp_wait_finished&&tcp_wait_result==-N_ERR_NO_HANDLE,
               "blocked TCP receive retains its closed connection generation");
         if(replacement>=0)tcp_close(replacement);
     } else if(tcp_wait_handle>=0)tcp_close(tcp_wait_handle);

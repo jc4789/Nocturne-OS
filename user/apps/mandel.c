@@ -61,8 +61,7 @@ static void restart(void) {
 }
 
 int main(void) {
-    w = win_open(640, 480, "Mandelbrot", WIN_RESIZABLE);
-    if (!w) return 1;
+    if (win_open(640, 480, "Mandelbrot", WIN_RESIZABLE, &w) < 0) return 1;
     make_palette();
     restart();
     for (;;) {

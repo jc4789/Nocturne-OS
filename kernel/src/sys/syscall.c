@@ -1095,7 +1095,8 @@ static int access_flags(int access) {
 static int64_t sys_memory_reserve(size_t len, int access) {
     struct task *t = task_process();
     int vp = access_flags(access & ~N_MEMORY_LOW);
-    if (len == 0 || len > (1ULL << 32) || vp < 0) return -N_ERR_INVALID;
+    /* No size cap of its own: free memory and the address region bound it. */
+    if (len == 0 || len > SIZE_MAX - (PAGE_SIZE - 1) || vp < 0) return -N_ERR_INVALID;
     len = ALIGN_UP(len, PAGE_SIZE);
     if (len / PAGE_SIZE > pmm_free_pages()) { report_memory_exhaustion(t, len); return -N_ERR_NO_MEMORY; }
     uint64_t va = access & N_MEMORY_LOW ? region_reserve(&t->low_holes, &t->low_next, USER_LOW_TOP, len)

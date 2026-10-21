@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 
 #define PAD    6
@@ -450,9 +449,9 @@ static void handle_key(struct gui_event *e) {
 }
 
 int main(int argc, char **argv) {
-    win = win_open(PAD * 2 + 88 * CW, PAD * 2 + 28 * CH, "Terminal", WIN_RESIZABLE);
-    if (!win) {
-        fprintf(stderr, "term: cannot open window\n");
+    n_result opened = win_open(PAD * 2 + 88 * CW, PAD * 2 + 28 * CH, "Terminal", WIN_RESIZABLE, &win);
+    if (opened < 0) {
+        fprintf(stderr, "term: cannot open window: %s\n", n_result_text(opened));
         return 1;
     }
     resize_grid(win->w, win->h);

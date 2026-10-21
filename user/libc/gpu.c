@@ -3,25 +3,23 @@
 #include "nocturne.h"
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <math.h>
 
-static int result(long r) { if (r<0) { errno=(int)-r; return -1; } return (int)r; }
-int gpu_info(struct n_gpu_info *out) {
-    return result(__syscall(SYS_GPU_INFO,(long)out,0,0,0,0));
+n_result gpu_info(struct n_gpu_info *out) {
+    return __syscall(SYS_GPU_INFO,(long)out,0,0,0,0);
 }
-int gpu_render(const struct n_gpu_render *r, uint32_t *pixels, size_t bytes) {
-    return result(__syscall(SYS_GPU_RENDER,(long)r,(long)pixels,(long)bytes,0,0));
+n_result gpu_render(const struct n_gpu_render *r, uint32_t *pixels, size_t bytes) {
+    return __syscall(SYS_GPU_RENDER,(long)r,(long)pixels,(long)bytes,0,0);
 }
-int gpu_render_batch(const struct n_gpu_batch *r, uint32_t *pixels, size_t bytes) {
-    return result(__syscall(SYS_GPU_RENDER_BATCH,(long)r,(long)pixels,(long)bytes,0,0));
+n_result gpu_render_batch(const struct n_gpu_batch *r, uint32_t *pixels, size_t bytes) {
+    return __syscall(SYS_GPU_RENDER_BATCH,(long)r,(long)pixels,(long)bytes,0,0);
 }
-int gpu_render_list(const struct n_gpu_scene *r,const struct n_gpu_vertex *v,uint32_t *pixels,size_t bytes) {
-    return result(__syscall(SYS_GPU_RENDER_LIST,(long)r,(long)v,(long)pixels,(long)bytes,0));
+n_result gpu_render_list(const struct n_gpu_scene *r,const struct n_gpu_vertex *v,uint32_t *pixels,size_t bytes) {
+    return __syscall(SYS_GPU_RENDER_LIST,(long)r,(long)v,(long)pixels,(long)bytes,0);
 }
-int gpu_blit(const struct n_gpu_blit *r,const uint32_t *source,size_t source_bytes,
-             uint32_t *pixels,size_t bytes) {
-    return result(__syscall(SYS_GPU_BLIT,(long)r,(long)source,(long)source_bytes,(long)pixels,(long)bytes));
+n_result gpu_blit(const struct n_gpu_blit *r,const uint32_t *source,size_t source_bytes,
+                  uint32_t *pixels,size_t bytes) {
+    return __syscall(SYS_GPU_BLIT,(long)r,(long)source,(long)source_bytes,(long)pixels,(long)bytes);
 }
 struct vertex { double p[4], c[4]; };
 static double plane(const struct vertex *v, unsigned p) {
@@ -105,10 +103,9 @@ static canvas_t clipped(canvas_t *dst) {
     safe.cy0=MAX(0,MIN(safe.cy0,safe.h)); safe.cy1=MAX(safe.cy0,MIN(safe.cy1,safe.h));
     return safe;
 }
-int gfx_render3d(canvas_t *dst,const struct n_gpu_render *r) {
-    if (!dst || !dst->px || !valid(r) || dst->w<(int)r->width || dst->h<(int)r->height || dst->pitch<dst->w) {
-        errno=EINVAL; return -1;
-    }
+n_result gfx_render3d(canvas_t *dst,const struct n_gpu_render *r) {
+    if (!dst || !dst->px || !valid(r) || dst->w<(int)r->width || dst->h<(int)r->height || dst->pitch<dst->w)
+        return -N_ERR_INVALID;
     canvas_t safe=clipped(dst); dst=&safe;
     size_t bytes=(size_t)r->width*r->height*4;
     uint32_t *pixels=malloc(bytes);
@@ -121,15 +118,14 @@ int gfx_render3d(canvas_t *dst,const struct n_gpu_render *r) {
     if (r->operation==N_GPU_TRIANGLE) draw_triangle(dst,r->vertex,r->width,r->height);
     return N_GPU_BACKEND_CPU;
 }
-int gfx_render3d_batch(canvas_t *dst,const struct n_gpu_batch *request) {
-    if (!request) { errno=EINVAL; return -1; }
+n_result gfx_render3d_batch(canvas_t *dst,const struct n_gpu_batch *request) {
+    if (!request) return -N_ERR_INVALID;
     /* Keep input stable even when its storage aliases the output canvas. */
     struct n_gpu_batch r=*request;
     if (!dst || !dst->px || !n_gpu_frame_bytes(r.width,r.height) ||
         r.triangle_count>N_GPU_MAX_TRIANGLES || !valid_vertices(r.vertex,r.triangle_count*3) ||
-        dst->w<(int)r.width || dst->h<(int)r.height || dst->pitch<dst->w) {
-        errno=EINVAL; return -1;
-    }
+        dst->w<(int)r.width || dst->h<(int)r.height || dst->pitch<dst->w)
+        return -N_ERR_INVALID;
     canvas_t safe=clipped(dst); dst=&safe;
     size_t bytes=(size_t)r.width*r.height*4;
     bool direct=dst->w==(int)r.width && dst->h==(int)r.height && dst->pitch==(int)r.width &&
@@ -149,18 +145,18 @@ int gfx_render3d_batch(canvas_t *dst,const struct n_gpu_batch *request) {
     for (unsigned i=0;i<r.triangle_count;i++) draw_triangle(dst,&r.vertex[i*3],r.width,r.height);
     return N_GPU_BACKEND_CPU;
 }
-int gfx_render3d_list(canvas_t *dst,const struct n_gpu_scene *request,const struct n_gpu_vertex *v) {
-    if(!request){errno=EINVAL;return -1;}
+n_result gfx_render3d_list(canvas_t *dst,const struct n_gpu_scene *request,const struct n_gpu_vertex *v) {
+    if(!request)return -N_ERR_INVALID;
     struct n_gpu_scene r=*request;
     size_t bytes=n_gpu_frame_bytes(r.width,r.height),count=(size_t)r.triangle_count*3;
     if(!dst || !dst->px || !bytes || (count && !v) ||
-       dst->w<(int)r.width || dst->h<(int)r.height || dst->pitch<dst->w){errno=EINVAL;return -1;}
+       dst->w<(int)r.width || dst->h<(int)r.height || dst->pitch<dst->w)return -N_ERR_INVALID;
     size_t vertex_bytes=count*sizeof *v;
-    if(vertex_bytes/sizeof *v!=count){errno=EINVAL;return -1;}
+    if(vertex_bytes/sizeof *v!=count)return -N_ERR_INVALID;
     struct n_gpu_vertex *snapshot=count?malloc(vertex_bytes):NULL;
-    if(count && !snapshot){errno=ENOMEM;return -1;}
+    if(count && !snapshot)return -N_ERR_NO_MEMORY;
     if(count)memcpy(snapshot,v,vertex_bytes);
-    if(!valid_vertices(snapshot,count)){free(snapshot);errno=EINVAL;return -1;}
+    if(!valid_vertices(snapshot,count)){free(snapshot);return -N_ERR_INVALID;}
     canvas_t safe=clipped(dst);dst=&safe;
     bool direct=dst->w==(int)r.width && dst->h==(int)r.height && dst->pitch==(int)r.width &&
         dst->cx0==0 && dst->cy0==0 && dst->cx1==(int)r.width && dst->cy1==(int)r.height;

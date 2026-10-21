@@ -43,7 +43,7 @@ static void test_frame_ui(void){
     const char *page="<!doctype html><html><head></head><frameset cols='25%,*'><frame name='red' src='/frame-red.html'><frame name='green' src='/frame-green.html'></frameset></html>";
     fixture.doc=web_live(page,strlen(page),BASE,"utf-8",&host);test_check("frameset-live-context",fixture.doc!=NULL);if(!fixture.doc)return;
     uint64_t end=uptime_ms()+5000;
-    while(uptime_ms()<end && (!has_mark(&fixture,"frame-red-ready") || !has_mark(&fixture,"frame-green-ready"))){frame_test_deliver();step(&fixture);msleep(1);}
+    while(uptime_ms()<end && (!has_mark(&fixture,"frame-red-ready") || !has_mark(&fixture,"frame-green-ready"))){frame_test_deliver();step(&fixture);n_sleep_ms(1);}
     test_check("frameset-two-child-documents",has_mark(&fixture,"frame-red-ready") && has_mark(&fixture,"frame-green-ready"));
     step(&fixture);
     test_check("frameset-native-red-paint",(pixels[300*VW+100]&0xffffff)==0xff0000);
@@ -67,7 +67,7 @@ static void test_frame_ui(void){
         test_check("frame-local-click-coordinate",has_mark(&fixture,"frame-local-click-coordinate"));
         test_check("frame-named-native-navigation",web_frame_navigate(fixture.doc,anchor,hit.href));
         end=uptime_ms()+5000;
-        while(uptime_ms()<end && !has_mark(&fixture,"frame-green-next")){frame_test_deliver();step(&fixture);msleep(1);}
+        while(uptime_ms()<end && !has_mark(&fixture,"frame-green-next")){frame_test_deliver();step(&fixture);n_sleep_ms(1);}
         test_check("frame-named-navigation-loaded",has_mark(&fixture,"frame-green-next"));
         test_check("frame-native-link-no-top-navigation",fixture.navigations==0);
     }
@@ -84,7 +84,7 @@ static void test_frames(void){
     struct web_host host={.opaque=&fixture,.request=frame_test_request,.cancel=cancel,.console=receive_log,.scroll=scroll_position,.navigate=navigate};
     fixture.doc=web_live(page,strlen(page),BASE,"utf-8",&host);free(page);test_check("frame-live-context",fixture.doc!=NULL);if(!fixture.doc)return;
     uint64_t end=uptime_ms()+15000;
-    while(uptime_ms()<end && !has_mark(&fixture,"frames-done")){frame_test_deliver();step(&fixture);msleep(1);}
+    while(uptime_ms()<end && !has_mark(&fixture,"frames-done")){frame_test_deliver();step(&fixture);n_sleep_ms(1);}
     if(fixture.errors || fixture.js_failures){
         printf("frames診断: load段階 ");for(unsigned i=1;i<=5;i++){char marker[32];snprintf(marker,sizeof marker,"frame-load-step-%u",i);printf("%u=%s ",i,has_mark(&fixture,marker)?"完了":"未完了");}printf("\n");fflush(stdout);
     }

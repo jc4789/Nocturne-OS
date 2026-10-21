@@ -49,7 +49,7 @@
 #elif DETECT_OS_WINDOWS
 #  include <windows.h>
 #elif DETECT_OS_NOCTURNE
-#  include <nocturne.h> /* msleep, yield */
+#  include <nocturne.h> /* n_sleep_ms, yield */
 #else
 #  error Unsupported OS
 #endif
@@ -99,7 +99,7 @@ os_time_sleep(int64_t usecs)
    }
 #elif DETECT_OS_NOCTURNE
    if (usecs > 0)
-      msleep((unsigned)((usecs + 999) / 1000));
+      n_sleep_ms((uint64_t)((usecs + 999) / 1000));
 #else
 #  error Unsupported OS
 #endif

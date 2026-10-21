@@ -15,7 +15,7 @@ static void log_line(void *unused,int level,const char *text){
     else if(level>=2){errors++;printf("ERROR %s\n",text);}
 }
 static bool eval(web_doc *doc,const char *source){return web_console_eval(doc,source,strlen(source));}
-static void settle(web_doc *top,unsigned ticks){for(unsigned i=0;i<ticks;i++){web_tick(top,uptime_ms());msleep(1);}}
+static void settle(web_doc *top,unsigned ticks){for(unsigned i=0;i<ticks;i++){web_tick(top,uptime_ms());n_sleep_ms(1);}}
 int main(void){
     const char page[]="<!doctype html><iframe srcdoc='<p>initial frame</p>'></iframe>";
     struct web_host host={.console=log_line,.js_task_budget_ms=5000};

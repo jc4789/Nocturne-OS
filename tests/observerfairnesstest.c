@@ -37,7 +37,7 @@ int main(void){
     struct web_host host={.console=log_line,.js_task_budget_ms=5000};
     web_doc *doc=web_live(page,sizeof page-1,"https://observer-fairness.test/","utf-8",&host);if(!doc)return 1;
     web_layout(doc,400,300);uint64_t deadline=uptime_ms()+5000;
-    while(!done&&uptime_ms()<deadline){web_tick(doc,uptime_ms());msleep(20);}
+    while(!done&&uptime_ms()<deadline){web_tick(doc,uptime_ms());n_sleep_ms(20);}
     if(!done||checks!=11||errors){printf("FAIL observer fairness completion done=%d checks=%d errors=%d\n",done,checks,errors);failures++;}
     web_free(doc);printf("observerfairnesstest: %d checks, %d failed\n",checks,failures);return failures?1:0;
 }

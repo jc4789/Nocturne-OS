@@ -25,7 +25,7 @@ void ns_set_timeout(net_stream *s,int n){(void)s;(void)n;}
 #endif
 #ifdef _WIN32
 void yield(void){}
-int msleep(unsigned n){(void)n;return 0;}
+void n_sleep_ms(uint64_t n){(void)n;}
 #endif
 struct http2_connection *http2_new(net_stream *s){(void)s;abort();}
 void http2_free(struct http2_connection *c){if(c)abort();}

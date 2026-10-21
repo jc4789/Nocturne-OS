@@ -35,13 +35,14 @@ static void publish_entered(void) {
     unsigned value=1;__asm__ volatile("movl %1, %0":"=m"(sender_entered):"r"(value):"memory");
 }
 static long cancelled_prefix;
-static int cancelled_error, cancel_socket;
+static n_result cancelled_error;
+static int cancel_socket;
 static void blocked_sender(void *unused) {
     (void)unused;size_t sent=0;uint64_t deadline=uptime_ms()+3000;
     publish_entered();
     while(sent<(8u<<20)) {
-        long n=tcp_send_until(cancel_socket,upload+sent,(8u<<20)-sent,deadline);
-        if(n<=0){cancelled_error=errno;break;}sent+=(size_t)n;
+        n_result n=tcp_send_until(cancel_socket,upload+sent,(8u<<20)-sent,deadline);
+        if(n<=0){cancelled_error=n;break;}sent+=(size_t)n;
     }
     cancelled_prefix=(long)sent;
 }
@@ -50,18 +51,18 @@ static void send_deadlines(void) {
     memset(upload,0x5a,8u<<20);
     int s=open_stall();check(s>=0,"zero-window fixture READY");
     if(s>=0) {
-        uint64_t start=uptime_ms(),deadline=start+500;size_t sent=0;int error=0;
+        uint64_t start=uptime_ms(),deadline=start+500;size_t sent=0;n_result error=0;
         while(sent<(8u<<20)) {
-            long n=tcp_send_until(s,upload+sent,(8u<<20)-sent,deadline);
-            if(n<=0){error=errno;break;}sent+=(size_t)n;
+            n_result n=tcp_send_until(s,upload+sent,(8u<<20)-sent,deadline);
+            if(n<=0){error=n;break;}sent+=(size_t)n;
         }
         uint64_t elapsed=uptime_ms()-start;
-        printf("SEND-DEADLINE accepted=%lu elapsed=%lu errno=%d\n",(unsigned long)sent,(unsigned long)elapsed,error);
-        check(sent>0 && sent<(8u<<20) && error==ETIMEDOUT && elapsed>=450 && elapsed<1000,
+        printf("SEND-DEADLINE accepted=%lu elapsed=%lu result=%s\n",(unsigned long)sent,(unsigned long)elapsed,n_result_text(error));
+        check(sent>0 && sent<(8u<<20) && error==-N_ERR_TIMEOUT && elapsed>=450 && elapsed<1000,
               "full transmit storage returns accepted prefix within original 500ms deadline");
-        errno=0;check(tcp_send_until(s,"x",1,uptime_ms())<0 && errno==ETIMEDOUT,"expired deadline enqueues no new byte");
-        start=uptime_ms();errno=0;long immediate=tcp_send_some(s,upload,8u<<20);
-        check((immediate>=0 && immediate<=65536) || (immediate<0 && errno==EAGAIN),"nonblocking send returns bounded prefix or EAGAIN");
+        check(tcp_send_until(s,"x",1,uptime_ms())==-N_ERR_TIMEOUT,"expired deadline enqueues no new byte");
+        start=uptime_ms();n_result immediate=tcp_send_some(s,upload,8u<<20);
+        check((immediate>=0 && immediate<=65536) || immediate==-N_ERR_NOT_READY,"nonblocking send returns bounded prefix or N_ERR_NOT_READY");
         check(uptime_ms()-start<150,"nonblocking send never waits for the peer window");
         tcp_cancel(s);tcp_close(s);
     }
@@ -71,13 +72,13 @@ static void send_deadlines(void) {
         int tid=thread_create(blocked_sender,NULL);check(tid>=0,"create blocking native sender");
         if(tid>=0) {
             while(!load_entered())yield();
-            msleep(150);uint64_t start=uptime_ms();
+            n_sleep_ms(150);uint64_t start=uptime_ms();
             check(tcp_cancel(cancel_socket)==0,"cancel native connection");
-            check(thread_join(tid)==0 && cancelled_error==ECANCELED && cancelled_prefix>0 &&
+            check(thread_join(tid)==0 && cancelled_error==-N_ERR_CANCELLED && cancelled_prefix>0 &&
                   cancelled_prefix<(8u<<20) && uptime_ms()-start<750,"cancellation wakes full-buffer sender and preserves prefix result");
-            char byte;errno=0;
-            check(tcp_recv(cancel_socket,&byte,1,0)<0 && errno==ECANCELED,"cancelled receive does not expose abandoned data");
-            errno=0;check(tcp_send(cancel_socket,"x",1)<0 && errno==ECANCELED,"cancelled connection cannot silently resend");
+            char byte;
+            check(tcp_recv(cancel_socket,&byte,1,0)==-N_ERR_CANCELLED,"cancelled receive does not expose abandoned data");
+            check(tcp_send(cancel_socket,"x",1)==-N_ERR_CANCELLED,"cancelled connection cannot silently resend");
         }
         tcp_close(cancel_socket);
     }
@@ -94,9 +95,9 @@ static void dns_regression(void) {
           "truncated UDP answer is retrieved over length-framed TCP");
     check(net_resolve_at("alias.fixture.test",ips,32,&result,&resolver)==0 && result.count==1 && ips[0]==HOST,
           "CNAME chain ignores unrelated answer addresses");
-    check(net_resolve_at("missing.fixture.test",ips,32,&result,&resolver)<0 && result.status==N_DNS_NXDOMAIN && errno==ENOENT,
+    check(net_resolve_at("missing.fixture.test",ips,32,&result,&resolver)==-N_ERR_NOT_FOUND && result.status==N_DNS_NXDOMAIN,
           "DNS NXDOMAIN has typed status");
-    check(net_resolve_at("servfail.fixture.test",ips,32,&result,&resolver)<0 && result.status==N_DNS_SERVFAIL && errno==EAGAIN,
+    check(net_resolve_at("servfail.fixture.test",ips,32,&result,&resolver)==-N_ERR_NOT_READY && result.status==N_DNS_SERVFAIL,
           "DNS temporary server error is distinct from NXDOMAIN");
     check(net_resolve_at("refused.fixture.test",ips,32,&result,&resolver)<0 && result.status==N_DNS_REFUSED,
           "DNS REFUSED has distinct status");
@@ -115,7 +116,7 @@ static void dns_regression(void) {
     check(cached,"more than eight long hostnames retain complete fresh cached results");
     check(net_resolve_at("multi.fixture.test",ips,1,&result,&resolver)==0 && result.count==3,"small caller capacity reports complete candidate count");
 }
-struct setup_case {int fd,mode,result,error;unsigned dns_status;volatile uint32_t entered,release;};
+struct setup_case {int fd,mode;n_result result;unsigned dns_status;volatile uint32_t entered,release;};
 static unsigned load_flag(const volatile uint32_t *flag) {
     unsigned value;__asm__ volatile("movl %1, %0":"=r"(value):"m"(*flag):"memory");return value;
 }
@@ -124,19 +125,20 @@ static void set_flag(volatile uint32_t *flag) {
 }
 static void setup_worker(void *opaque) {
     struct setup_case *test=opaque;
-    if(net_set_setup_cancel_channel(test->fd)<0){test->error=errno;set_flag(&test->entered);return;}
+    n_result scoped=net_set_setup_cancel_channel(test->fd);
+    if(scoped<0){test->result=scoped;set_flag(&test->entered);return;}
     set_flag(&test->entered);
     if(test->mode==3) {
         while(!load_flag(&test->release))yield();
         return; /* kernel thread-exit must release the retained endpoint */
     }
     if(test->mode==1) {
-        test->result=tcp_connect(0x0a0002fa,(uint16_t)tcp_port,5000);test->error=errno;
-        if(test->result>=0)tcp_close(test->result);
+        test->result=tcp_connect(0x0a0002fa,(uint16_t)tcp_port,5000);
+        if(test->result>=0)tcp_close((n_handle)test->result);
     } else {
         struct n_sockaddr resolver={.ip=HOST,.port=(uint16_t)dns_port};struct n_dns_result result;uint32_t address;
         test->result=net_resolve_at(test->mode==2?"tcstall.fixture.test":"stall.fixture.test",&address,1,&result,&resolver);
-        test->error=errno;test->dns_status=result.status;
+        test->dns_status=result.status;
     }
     net_set_setup_cancel_channel(-1);
 }
@@ -153,17 +155,17 @@ static void setup_cancellation(void) {
     for(unsigned mode=0;mode<3;mode++) {
         int peer,local;channel_ends(&peer,&local);
         if(local<0){check(false,"setup cancellation channel pair");if(peer>=0)n_handle_close(peer);continue;}
-        struct setup_case test={.fd=local,.mode=(int)mode,.result=0,.error=0,.dns_status=N_DNS_OK};
+        struct setup_case test={.fd=local,.mode=(int)mode,.result=0,.dns_status=N_DNS_OK};
         int tid=thread_create(setup_worker,&test);check(tid>=0,"create setup cancellation worker");
         if(tid>=0) {
             while(!load_flag(&test.entered))yield();
-            msleep(120);
+            n_sleep_ms(120);
             /* Close our handle while the context retains the original endpoint:
                the peer must not see a close, and cancelling it must still be seen. */
             n_handle_close(local);local=-1;
             check(!peer_closed(peer),"setup cancellation pins endpoint across handle close");
             uint64_t before=uptime_ms();n_handle_close(peer);peer=-1;
-            check(thread_join(tid)==0 && test.result<0 && test.error==ECANCELED && uptime_ms()-before<600,
+            check(thread_join(tid)==0 && test.result==-N_ERR_CANCELLED && uptime_ms()-before<600,
                   mode==0?"unanswered DNS setup cancels promptly":mode==1?"ARP and TCP setup cancels promptly":"DNS TCP fallback setup cancels promptly");
             if(mode!=1)check(test.dns_status==N_DNS_CANCELLED,"setup cancellation preserves typed resolver status");
         }
@@ -187,8 +189,8 @@ static void setup_cancellation(void) {
     int peer,local;channel_ends(&peer,&local);
     if(established>=0 && local>=0) {
         check(net_set_setup_cancel_channel(local)==0,"install calling-thread setup scope");n_handle_close(peer);peer=-1;
-        uint32_t address;errno=0;
-        check(net_resolve("localhost",&address)<0 && errno==ECANCELED,"closed peer cancels new setup before publication");
+        uint32_t address;
+        check(net_resolve("localhost",&address)==-N_ERR_CANCELLED,"closed peer cancels new setup before publication");
         const char request[]="GET 4 1\n";uint8_t data[4];size_t done=0;
         bool sent=tcp_send(established,request,sizeof request-1)==(long)sizeof request-1;
         while(sent && done<sizeof data){long n=tcp_recv(established,data+done,sizeof data-done,1000);if(n<=0)break;done+=(size_t)n;}
@@ -199,10 +201,10 @@ static void setup_cancellation(void) {
     } else check(false,"established transport cancellation fixture");
     if(established>=0)tcp_close(established);if(local>=0)n_handle_close(local);if(peer>=0)n_handle_close(peer);
 }
-struct close_case {int socket,error;long result;volatile uint32_t entered;uint8_t bytes[32];};
+struct close_case {int socket;n_result result;volatile uint32_t entered;uint8_t bytes[32];};
 static void waiting_receiver(void *opaque) {
     struct close_case *test=opaque;set_flag(&test->entered);
-    test->result=tcp_recv(test->socket,test->bytes,sizeof test->bytes,5000);test->error=errno;
+    test->result=tcp_recv(test->socket,test->bytes,sizeof test->bytes,5000);
 }
 static bool blocked_thread(int tid) {
     struct n_procinfo processes[256];int count=proclist(processes,256);
@@ -212,7 +214,7 @@ static bool blocked_thread(int tid) {
 static uint8_t race_payload[65536];
 static void racing_sender(void *opaque) {
     struct close_case *test=opaque;set_flag(&test->entered);
-    test->result=tcp_send_some(test->socket,race_payload,sizeof race_payload);test->error=errno;
+    test->result=tcp_send_some(test->socket,race_payload,sizeof race_payload);
 }
 static void close_lifetime(void) {
     int old=open_stall();check(old>=0,"native close lifetime stall fixture");
@@ -221,7 +223,7 @@ static void close_lifetime(void) {
         int tid=thread_create(waiting_receiver,&test);check(tid>=0,"create blocked old-generation receiver");
         if(tid>=0) {
             uint64_t until=uptime_ms()+1000;
-            while(!blocked_thread(tid) && uptime_ms()<until)msleep(1);
+            while(!blocked_thread(tid) && uptime_ms()<until)n_sleep_ms(1);
             check(blocked_thread(tid),"old-generation receive entered native progress wait");
             tcp_cancel(old);tcp_close(old);old=-1;
             /* Retain lower free slots if another lingering tuple expired in
@@ -239,7 +241,7 @@ static void close_lifetime(void) {
                 const char request[]="GET 32 113\n";fresh_ok=tcp_send(fresh,request,sizeof request-1)==(long)sizeof request-1;
             }
             thread_join(tid);bool untouched=true;for(unsigned i=0;i<sizeof test.bytes;i++)if(test.bytes[i]!=0xcc)untouched=false;
-            check(test.result<0 && (test.error==EBADF||test.error==ECANCELED) && untouched,
+            check((test.result==-N_ERR_NO_HANDLE||test.result==-N_ERR_CANCELLED) && untouched,
                   "closed receive cannot copy from a reused socket generation");
             if(fresh>=0) {
                 uint8_t bytes[32];size_t done=0;
@@ -263,7 +265,8 @@ static void close_lifetime(void) {
         while(!load_flag(&test.entered))yield();
         tcp_close(socket);thread_join(tid);
         if(test.result>0)copied++;
-        if(!((test.result>0&&test.result<=65536)||(test.result<0&&(test.error==EBADF||test.error==EPIPE||test.error==EAGAIN))))safe=false;
+        if(!((test.result>0&&test.result<=65536)||test.result==-N_ERR_NO_HANDLE||test.result==-N_ERR_CLOSED||
+             test.result==-N_ERR_NOT_READY))safe=false;
     }
     printf("TCP-CLOSE-RACE copied=%u rounds=24\n",copied);
     check(safe,"native close joins any AP ring owner before protocol teardown");

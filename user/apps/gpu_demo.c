@@ -5,8 +5,9 @@
 #include <stdio.h>
 #include <string.h>
 int main(void) {
-    window_t *win=win_open(400,400,"Nocturne 3D",WIN_CENTER);
-    if (!win) { puts("No GUI display");return 1; }
+    window_t *win;
+    n_result opened=win_open(400,400,"Nocturne 3D",WIN_CENTER,&win);
+    if (opened<0) { printf("No GUI display: %s\n",n_result_text(opened));return 1; }
     struct n_gpu_info info={0};gpu_info(&info);
     struct n_gpu_batch r={.width=400,.height=400,.triangle_count=4,.clear_argb=RGB(22,20,42)};
     unsigned colors[3]={RGB(250,90,130),RGB(80,230,150),RGB(90,130,250)};

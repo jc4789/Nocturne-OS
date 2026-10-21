@@ -21,7 +21,6 @@ typedef int64_t n_result;
 
 /* malloc's heap: bytes in its n_memory regions, and bytes in allocated blocks. */
 void malloc_usage(size_t *heap, size_t *used);
-int msleep(unsigned ms);
 uint64_t uptime_ms(void);
 /* Native memory (docs/nocturne-native-abi.md §7): zero-filled pages with
  * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access; reserve also takes
@@ -178,9 +177,10 @@ n_result n_path_join(const char *folder, const char *name, char *out, size_t cap
    setting TERMINAL, e.g. "0 1 2". */
 bool n_terminal(n_handle h);
 
-int proclist(struct n_procinfo *out, int max);
-int sysinfo(struct n_sysinfo *si);
+/* The count of processes and threads (at most max written), or a negative n_result. */
+n_result proclist(struct n_procinfo *out, int max);
 /* 0, or a negative n_result; errno is left alone. */
+n_result sysinfo(struct n_sysinfo *si);
 n_result cpu_info(struct n_cpuinfo *info);
 n_result clock_info(struct n_clockinfo *info);
 /* Native tasks sharing this process's address space and descriptors. create
@@ -202,8 +202,8 @@ unsigned cpu_index(void);
 #define N_TLS_CALL_ONCE 8    /* Mesa's call-once-with-data argument */
 void *thread_local_get(unsigned slot);
 void thread_local_set(unsigned slot, void *value);
-/* Actual reserved stack interval of the calling native task. */
-int thread_stack_bounds(uintptr_t *low, uintptr_t *high);
+/* Actual reserved stack interval of the calling native task: 0, or a negative n_result. */
+n_result thread_stack_bounds(uintptr_t *low, uintptr_t *high);
 /* timeout_ms == UINT32_MAX waits indefinitely; count == 0 wakes all.
  * The wait returns 0 when woken, -N_ERR_NOT_READY when *address no longer
  * holds expected, -N_ERR_TIMEOUT or -N_ERR_STOPPED; wake returns how many
@@ -213,8 +213,9 @@ n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned
 n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms);
 n_result wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
-int poweroff(void);
-int reboot(void);
+/* These return only on failure, with a negative n_result. */
+n_result poweroff(void);
+n_result reboot(void);
 /* The count of PCI functions (at most max written), or a negative n_result. */
 n_result pcilist(struct n_pciinfo *out, int max);
 long __syscall(long n, long a, long b, long c, long d, long e);
@@ -230,44 +231,46 @@ bool find_program(const char *name, char *out, size_t n);
 int readline(const char *prompt, char *buf, size_t size, int flags);
 
 /* ---- networking (net.c) ----
-   IPv4 addresses are uint32_t in host order (10.0.2.15 is 0x0A00020F). Functions return -1 and
-   set errno on failure. Timeouts are in milliseconds; -1 waits forever. */
-int net_info(struct n_netinfo *ni);
-int net_ping(uint32_t ip, int seq, int timeout_ms); /* round-trip time in ms */
-int net_resolve(const char *name, uint32_t *ip);    /* DNS lookup or dotted quad */
-int net_resolve_all(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result);
-int net_resolve_at(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result,
-                   const struct n_sockaddr *resolver);
-int net_stats(struct n_netstats *stats);
+   IPv4 addresses are uint32_t in host order (10.0.2.15 is 0x0A00020F). Functions return their
+   result or a negative n_result, and leave errno alone. Timeouts are in milliseconds; -1 waits
+   forever, and an expired wait is -N_ERR_NOT_READY or -N_ERR_TIMEOUT. */
+n_result net_info(struct n_netinfo *ni);
+n_result net_ping(uint32_t ip, int seq, int timeout_ms); /* round-trip time in ms */
+n_result net_resolve(const char *name, uint32_t *ip);    /* DNS lookup or dotted quad */
+n_result net_resolve_all(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result);
+n_result net_resolve_at(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result,
+                        const struct n_sockaddr *resolver);
+n_result net_stats(struct n_netstats *stats);
 /* Calling thread only: abort DNS/ARP/connect if this request channel's peer
    closes. -1 clears the context. Established/shared TCP I/O is unaffected. */
-int net_set_setup_cancel_channel(n_handle channel);
+n_result net_set_setup_cancel_channel(n_handle channel);
 bool ip_parse(const char *s, uint32_t *ip);
 char *ip_format(uint32_t ip, char *buf); /* buf: at least 16 bytes */
-int udp_socket(uint16_t port);           /* 0 picks an ephemeral port */
-int udp_sendto(int s, uint32_t ip, uint16_t port, const void *buf, size_t len);
-int udp_recvfrom(int s, void *buf, size_t len, int timeout_ms, struct n_sockaddr *from);
-int udp_close(int s);
-int tcp_connect(uint32_t ip, uint16_t port, int timeout_ms);
-long tcp_send(int s, const void *buf, size_t len);
+n_result udp_socket(uint16_t port);      /* a connection handle; 0 picks an ephemeral port */
+n_result udp_sendto(n_handle s, uint32_t ip, uint16_t port, const void *buf, size_t len);
+n_result udp_recvfrom(n_handle s, void *buf, size_t len, int timeout_ms, struct n_sockaddr *from);
+n_result udp_close(n_handle s);
+n_result tcp_connect(uint32_t ip, uint16_t port, int timeout_ms); /* a connection handle */
+n_result tcp_send(n_handle s, const void *buf, size_t len);
 /* Absolute uptime_ms deadline; zero waits without a deadline. A positive
    result is the accepted prefix, never a claim that the peer acknowledged it. */
-long tcp_send_until(int s, const void *buf, size_t len, uint64_t deadline_ms);
-long tcp_send_some(int s, const void *buf, size_t len); /* prefix or EAGAIN, never waits for space */
-/* Abort the connection, waking send/receive waiters with ECANCELED. */
-int tcp_cancel(int s);
-long tcp_recv(int s, void *buf, size_t len, int timeout_ms); /* 0 = connection closed */
-int tcp_close(int s);
+n_result tcp_send_until(n_handle s, const void *buf, size_t len, uint64_t deadline_ms);
+/* The accepted prefix, or -N_ERR_NOT_READY; never waits for space. */
+n_result tcp_send_some(n_handle s, const void *buf, size_t len);
+/* Abort the connection, waking send/receive waiters with -N_ERR_CANCELLED. */
+n_result tcp_cancel(n_handle s);
+n_result tcp_recv(n_handle s, void *buf, size_t len, int timeout_ms); /* 0 = connection closed */
+n_result tcp_close(n_handle s);
 /* Passive open: tcp_listen returns a listener on a local address (0: all of them, or e.g.
    127.0.0.1 for this system only; port 0 picks one; backlog <= 0 uses a default), tcp_accept
    the next established connection, ordinary for tcp_send/tcp_recv/tcp_close.
    tcp_close on the listener refuses connections not yet accepted. */
-int tcp_listen(uint32_t ip, uint16_t port, int backlog);
-int tcp_accept(int listener, int timeout_ms, struct n_sockaddr *remote);
-int tcp_address(int s, struct n_sockaddr *local, struct n_sockaddr *remote); /* either may be NULL */
-int tcp_finish(int s); /* stop sending (FIN after the queued data) but keep receiving; tcp_close later */
+n_result tcp_listen(uint32_t ip, uint16_t port, int backlog);
+n_result tcp_accept(n_handle listener, int timeout_ms, struct n_sockaddr *remote);
+n_result tcp_address(n_handle s, struct n_sockaddr *local, struct n_sockaddr *remote); /* either may be NULL */
+n_result tcp_finish(n_handle s); /* stop sending (FIN after the queued data) but keep receiving; tcp_close later */
 /* simulated packet loss/reordering on this process's TCP connections, and TCP counters (either may be NULL) */
-int net_test(const struct n_netfault *set, struct n_tcpstats *stats);
+n_result net_test(const struct n_netfault *set, struct n_tcpstats *stats);
 bool net_wait_up(int timeout_ms); /* wait for DHCP; false if no network */
 
 /* ---- GUI ---- */
@@ -284,29 +287,33 @@ typedef struct window {
     bool frame_acquired;
 } window_t;
 
+/* The calls below return their result (0 unless noted), or a negative n_result,
+   and leave errno alone. */
 bool gui_available(void);
-int screen_size(int *w, int *h);
-window_t *win_open(int w, int h, const char *title, int flags);
+n_result screen_size(int *w, int *h); /* w and h are written only on success */
+/* Opens a window into *out; *out is NULL on failure. */
+n_result win_open(int w, int h, const char *title, int flags, window_t **out);
 void win_close(window_t *win);
-void win_update(window_t *win);
-void win_update_rect(window_t *win, int x, int y, int w, int h);
+/* -N_ERR_BUSY for a double-buffered window whose frame was not begun. */
+n_result win_update(window_t *win);
+n_result win_update_rect(window_t *win, int x, int y, int w, int h);
 /* WIN_DOUBLE_BUFFER only: acquire a writable canvas before drawing a complete
    frame. No retained/partial drawing across submissions; update invalidates c.
-   Returns zero or a negative error. Completion is also reported as EV_FRAME. */
-int win_begin_frame(window_t *win);
-void win_set_title(window_t *win, const char *title);
-void win_move(window_t *win, int x, int y);
-int win_state(window_t *win); /* WIN_STATE_* bitmask, negative on failure */
-int win_fullscreen(window_t *win,bool enabled); /* resize delivered by EV_RESIZE */
+   Completion is also reported as EV_FRAME. */
+n_result win_begin_frame(window_t *win);
+n_result win_set_title(window_t *win, const char *title);
+n_result win_move(window_t *win, int x, int y);
+n_result win_state(window_t *win); /* WIN_STATE_* bitmask */
+n_result win_fullscreen(window_t *win,bool enabled); /* resize delivered by EV_RESIZE */
 /* wait up to timeout_ms (-1 = forever) for an event; returns 1 if *e was filled, 0 on timeout,
-   -1 if the window is gone. EV_RESIZE is handled (buffer reallocated) before being returned. */
-int win_event(window_t *win, struct gui_event *e, int timeout_ms);
-int clipboard_set(const char *s, size_t n);
-int clipboard_get(char *buf, size_t n);
-int gui_launch(const char *path, const char *arg);
+   negative once the window is gone. EV_RESIZE is handled (buffer reallocated) before being returned. */
+n_result win_event(window_t *win, struct gui_event *e, int timeout_ms);
+n_result clipboard_set(const char *s, size_t n);
+n_result clipboard_get(char *buf, size_t n); /* the whole length; at most n bytes are copied */
+n_result gui_launch(const char *path, const char *arg);
 /* copy the whole screen (taskbar included) into buf as 0xAARRGGBB pixels. bytes = 0 only reports
-   the size. 0 or -1 (E2BIG: buffer too small) */
-int screen_grab(uint32_t *buf, size_t bytes, int *w, int *h);
+   the size. -N_ERR_TOO_LARGE: the buffer is too small */
+n_result screen_grab(uint32_t *buf, size_t bytes, int *w, int *h);
 
 /* ---- sound (sound.c) ----
    Streams come from n_audio_open (above; up to 8 play at once) and hold about 170 ms

@@ -10,7 +10,7 @@
 #include "http2.h"
 extern uint64_t uptime_ms(void);
 extern void yield(void);
-extern int msleep(unsigned);
+extern void n_sleep_ms(uint64_t);
 
 /* Each stream may buffer as much as one HTTP/1.1 connection's TCP receive
    storage, so multiplexing never narrows a transfer below the separate
@@ -786,7 +786,7 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
         if(cancelled||uptime_ms()-s->progress>=s->timeout) {
             enter(c);if(waiting)c->header_waiters--;start_remove(c,&waiter);leave(c);errno=cancelled?ECANCELED:ETIMEDOUT;goto invalid;
         }
-        msleep(1);enter(c);
+        n_sleep_ms(1);enter(c);
     }
     if(waiting)c->header_waiters--;
     start_remove(c,&waiter);
@@ -848,7 +848,7 @@ long http2_read(struct http2_stream *s,void *out,size_t n) {
         }
         if(s->ended){leave(c);return 0;}
         leave(c);
-        msleep(1);
+        n_sleep_ms(1);
     }
 }
 int http2_finish(struct http2_stream *s,bool consumed,const struct http_stream_hooks *hooks) {
@@ -859,7 +859,7 @@ int http2_finish(struct http2_stream *s,bool consumed,const struct http_stream_h
         enter(c);check(s,cancelled);pump(c);
         if(s->first){reset(c,s->id,1);stream_fail(s,EPROTO,"unexpected HTTP/2 response body");}
         bool done=s->ended||s->error;int error=s->error;leave(c);
-        if(done){if(error){errno=error;return -1;}return 0;}msleep(1);
+        if(done){if(error){errno=error;return -1;}return 0;}n_sleep_ms(1);
     }
 }
 const char *http2_error(struct http2_stream *s){return s->message;}

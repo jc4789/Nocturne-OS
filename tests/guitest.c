@@ -36,18 +36,19 @@ int main(void) {
     }
     long base = count(before, w * h, MAGENTA);
 
-    window_t *win = win_open(200, 150, "guitest", 0);
-    if (!win) {
-        printf("guitest: win_open failed\n");
+    window_t *win;
+    n_result opened = win_open(200, 150, "guitest", 0, &win);
+    if (opened < 0) {
+        printf("guitest: win_open failed: %s\n", n_result_text(opened));
         return 1;
     }
     gfx_fill(&win->c, 0, 0, win->w, win->h, MAGENTA);
     win_update(win);
-    msleep(300); /* let the compositor present it */
+    n_sleep_ms(300); /* let the compositor present it */
     uint32_t *during = grab(&w, &h);
     long shown = count(during, w * h, MAGENTA) - base;
     win_close(win);
-    msleep(300);
+    n_sleep_ms(300);
     uint32_t *after = grab(&w, &h);
     long left = count(after, w * h, MAGENTA) - base;
     if (shown < 200 * 150 * 9 / 10) {

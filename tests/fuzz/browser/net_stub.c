@@ -18,7 +18,7 @@ void stub_reset(const uint8_t *in, size_t len, size_t chunk, bool h2) {
 }
 uint64_t uptime_ms(void) { return stub_clock += 1; }
 void yield(void) {}
-int msleep(unsigned ms) { stub_clock += ms; return 0; }
+void n_sleep_ms(uint64_t ms) { stub_clock += ms; }
 
 net_stream *ns_open_http_cancelled_timed(const char *h, uint16_t p, bool t, int to, char *e, size_t el,
     struct http_transport_timing *tm, const char *part, int (*c)(void *), void *x) { return &the_stream; }

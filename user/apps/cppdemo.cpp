@@ -41,7 +41,7 @@ struct Global {
 std::atomic<int> constructed{0};
 struct Local {
     int value;
-    Local() { ++constructed; msleep(20); value = 91; }
+    Local() { ++constructed; n_sleep_ms(20); value = 91; }
     ~Local() { ++local_destroyed; }
 };
 Local &singleton() { static Local value; return value; }

@@ -6,7 +6,7 @@
 #include <errno.h>
 #ifdef _WIN32
 #include "../user/include/http.h"
-extern int msleep(unsigned);
+extern void n_sleep_ms(uint64_t);
 extern int thread_create(void (*)(void *),void *);
 extern int thread_join(int);
 extern uint64_t uptime_ms(void);
@@ -42,8 +42,8 @@ static void h1_tests(void) {
     CHECK(request("eof","GET","one",&r,&result)==0&&r.body_len>0);http_resp_free(&r);
     CHECK(request("plain","GET","one",&r,&result)==0&&!result.reused&&connection(&r)!=id);http_resp_free(&r);
     CHECK(request("stale","GET","one",&r,&result)==0);id=connection(&r);http_resp_free(&r);
-    msleep(10);CHECK(request("plain","GET","one",&r,&result)==0&&connection(&r)!=id);http_resp_free(&r);
-    CHECK(request("stale","GET","post",&r,&result)==0);http_resp_free(&r);msleep(10);
+    n_sleep_ms(10);CHECK(request("plain","GET","one",&r,&result)==0&&connection(&r)!=id);http_resp_free(&r);
+    CHECK(request("stale","GET","post",&r,&result)==0);http_resp_free(&r);n_sleep_ms(10);
     CHECK(request("plain","POST","post",&r,&result)<0);CHECK(result.response_bytes_received==0&&result.error!=HTTP_ERR_NONE);http_resp_free(&r);
     http_pool_clear();
 }
@@ -135,8 +135,8 @@ static void stalled_request(void *ctx) {
 static void backpressure_test(void) {
     http_pool_clear();struct stalled_upload s={0};s.body=malloc(8u*1024*1024);CHECK(s.body!=NULL);if(!s.body)return;
     memset(s.body,'b',8u*1024*1024);int tid=thread_create(stalled_request,&s);CHECK(tid>=0);if(tid<0){free(s.body);return;}
-    while(!load_running(&s.running))msleep(1);
-    msleep(50);char url[256];address(url,sizeof url,h2_port,"/trailers?while-upload-blocked");
+    while(!load_running(&s.running))n_sleep_ms(1);
+    n_sleep_ms(50);char url[256];address(url,sizeof url,h2_port,"/trailers?while-upload-blocked");
     struct http_req rq={.url=url,.timeout_ms=200};struct http_resp r;struct http_transport_result result;
     uint64_t started=uptime_ms();int code=http_request_h2_prior_knowledge_ex(&rq,&r,1048576,NULL,"h2-stall",&result);
     uint64_t elapsed=uptime_ms()-started;thread_join(tid);
@@ -174,7 +174,7 @@ static void h2_tests(void) {
     CHECK(h2_request("/goaway","GET",NULL,0,NULL,NULL,NULL,&r,&result)==0);http_resp_free(&r);
     CHECK(h2_request("/trailers","GET",NULL,0,NULL,NULL,NULL,&r,&result)==0&&connection(&r)!=id);http_resp_free(&r);
     CHECK(h2_request("/late-goaway","GET",NULL,0,NULL,NULL,NULL,&r,&result)==0);id=connection(&r);http_resp_free(&r);
-    msleep(100);
+    n_sleep_ms(100);
     CHECK(h2_request("/trailers","GET",NULL,0,NULL,NULL,NULL,&r,&result)==0&&connection(&r)!=id);http_resp_free(&r);
     struct http_stream_hooks hooks={.cancelled=cancelled};
     CHECK(h2_request("/large","GET",NULL,0,&hooks,NULL,NULL,&r,&result)<0&&result.error==HTTP_ERR_CANCELLED&&result.request_bytes_sent==0);http_resp_free(&r);
@@ -243,7 +243,7 @@ static void tls_h2_get_tests(const char *peer) {
     uint64_t started=uptime_ms();bool initial_wait_timed_out=false;
     while(!load_running(&g[0].request_accepted)&&!load_running(&g[0].done)) {
         if(uptime_ms()-started>=35000){initial_wait_timed_out=true;break;}
-        msleep(1);
+        n_sleep_ms(1);
     }
     CHECK(load_running(&g[0].request_accepted)&&!load_running(&g[0].headers_seen));
     int second=thread_create(tls_get_request,&g[1]);CHECK(second>=0);

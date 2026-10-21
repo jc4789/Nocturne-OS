@@ -291,7 +291,7 @@ static int resource_regression(const struct n_clockinfo *clock) {
         else {
             while (!load_acquire(&blocked_read_entered))
                 wait_on_address(&blocked_read_entered, 0, 2000);
-            msleep(20);
+            n_sleep_ms(20);
             n_handle reused = -1;
             if (n_handle_close(ends[0]) < 0 || (reused = n_events_create()) < 0)
                 resource_failed(THREADS, RC_BLOCK_REPLACE, -1);
@@ -354,7 +354,7 @@ int main(int argc, char **argv) {
        stack_marker<stack_low || stack_marker>=stack_high)bad++;
     uintptr_t unchanged=stack_marker;
     errno=0;
-    if(thread_stack_bounds(&unchanged,NULL)!=-1 || errno!=EFAULT || unchanged!=stack_marker)bad++;
+    if(thread_stack_bounds(&unchanged,NULL)!=-N_ERR_BAD_ADDRESS || errno!=0 || unchanged!=stack_marker)bad++;
     if (cpu_info(&info) || clock_info(&clock)) return 1;
     printf("threadtest: scheduler=%u online=%u clock_flags=%u\n", info.scheduler_cpus, info.online_cpus, clock.flags);
     static const char shared_document[] = "/data/threadtest-shared.tmp";

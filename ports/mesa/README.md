@@ -38,7 +38,7 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/c11/threads.h`、`src/c11/time.h` | libc の ISO C11 `threads.h`、`timespec_get`（`TIME_UTC`／`TIME_MONOTONIC`）を使う。 |
 | `src/util/cnd_monotonic.c/.h` | ISO C11 の条件変数で単調時計の期限待ちを作る。 |
 | `src/util/rwlock.c/.h` | ISO C11 の mutex と条件変数で読み書きロックを作る。 |
-| `src/util/os_time.c/.h` | `msleep`／`yield` と ISO `localtime` を使う。 |
+| `src/util/os_time.c/.h` | `n_sleep_ms`／`yield` と ISO `localtime` を使う。 |
 | `src/util/os_misc.c` | 物理メモリ量などを `sysinfo` で得る。 |
 | `src/util/memstream.c/.h` | メモリ上の FILE は無いので、`/tmp`（RAM）の一時文書を書き、flush／close で読み戻す。 |
 | `src/util/u_string.h` | `asprintf` 系は libc に無いので、Mesa 自身の Windows 用実装を使う。 |

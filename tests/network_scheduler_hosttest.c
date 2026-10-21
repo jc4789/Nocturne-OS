@@ -65,7 +65,7 @@ FILE *stderr;
 int fprintf(FILE *stream,const char *format,...){(void)stream;va_list args;
     va_start(args,format);int n=vprintf(format,args);va_end(args);return n;}
 n_result cpu_info(struct n_cpuinfo *cpu){memset(cpu,0,sizeof *cpu);cpu->online_cpus=4;return 0;}
-int sysinfo(struct n_sysinfo *memory){memset(memory,0,sizeof *memory);memory->free_mem=2ull<<30;return 0;}
+n_result sysinfo(struct n_sysinfo *memory){memset(memory,0,sizeof *memory);memory->free_mem=2ull<<30;return 0;}
 bool url_parse_owned(const char *raw,struct url_owned *out){(void)raw;memset(out,0,sizeof *out);return false;}
 void url_owned_free(struct url_owned *out){(void)out;}
 enum http_url_result http_origin_owned(const char *raw,char **out){(void)raw;*out=NULL;return HTTP_URL_OPAQUE;}

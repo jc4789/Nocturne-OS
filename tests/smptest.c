@@ -12,6 +12,8 @@ static unsigned long ticks(void) {
     __asm__ volatile("rdtsc" : "=a"(a), "=d"(d));
     return ((unsigned long)d << 32) | a;
 }
+/* SYS_SLEEP's result register: 0 unless the continuation lost the user context. */
+static long sleep_result(unsigned long ms) { return __syscall(SYS_SLEEP, (long)ms, 0, 0, 0, 0); }
 static unsigned apic_id(void) {
     unsigned a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
@@ -33,7 +35,7 @@ static int gs_tls_probe(const struct n_cpuinfo *info, unsigned seed) {
             thread_local_get(7) != sentinel) ok = 0;
         /* Unlike the AP's read-only identity calls, sleep retires the AP user
            context and executes the syscall continuation on the BSP. */
-        if (msleep(1) || n_app_self() != pid || thread_id() != tid ||
+        if (sleep_result(1) || n_app_self() != pid || thread_id() != tid ||
             cpu_index() >= info->detected_cpus || thread_local_get(7) != sentinel) ok = 0;
     }
     __asm__ volatile("movw %0, %%gs" : : "r"(saved) : "memory");
@@ -67,14 +69,14 @@ static int child(unsigned long start, unsigned seed) {
             unsigned long in[4] = {seed + round, seed * 17UL, 0x123456789abcdef0UL + seed,
                                    0xfedcba9876543210UL - round}, out[4];
             if (avx_sleep(in, out) || memcmp(in, out, sizeof in)) r.xstate = 0;
-        } else if (msleep(2)) r.xstate = 0;
+        } else if (sleep_result(2)) r.xstate = 0;
     }
     unsigned long t0 = ticks();
-    if (msleep(20)) return 2;
+    if (sleep_result(20)) return 2;
     unsigned long per_ms = (ticks() - t0) / 20;
     if (!per_ms) return 2;
     unsigned long now = uptime_ms();
-    if (now < start && msleep((unsigned)(start - now))) return 2;
+    if (now < start && sleep_result((unsigned)(start - now))) return 2;
     volatile unsigned long value = seed;
     r.magic = 0x534d5031;
     for (unsigned i = 0; i < SAMPLES; i++) {
@@ -181,7 +183,7 @@ int main(int argc, char **argv) {
     n_handle kreader, kapp = start_child(argv[0], kargs, 2, false, &kreader);
     if (kapp < 0) return 1;
     char ready = 0;
-    if (n_channel_receive(kreader, &ready, 1, N_CHANNEL_WAIT, NULL) != 1 || ready != 'K' || msleep(20) ||
+    if (n_channel_receive(kreader, &ready, 1, N_CHANNEL_WAIT, NULL) != 1 || ready != 'K' || sleep_result(20) ||
         n_app_stop(kapp, 0) < 0 || !finish_child(kapp, &status) || status != 130) ok = 0;
     n_handle_close(kreader);
     printf("smptest: fault/CR2/kill/retire %s\n", ok ? "PASS" : "FAIL");

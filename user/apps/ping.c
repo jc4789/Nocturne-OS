@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 
 int main(int argc, char **argv) {
@@ -21,8 +20,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     uint32_t ip;
-    if (net_resolve(host, &ip) < 0) {
-        fprintf(stderr, "ping: %s: %s\n", host, strerror(errno));
+    n_result resolved = net_resolve(host, &ip);
+    if (resolved < 0) {
+        fprintf(stderr, "ping: %s: %s\n", host, n_result_text(resolved));
         return 1;
     }
     char buf[16];
@@ -30,18 +30,19 @@ int main(int argc, char **argv) {
     int sent = 0, got = 0, min = 1 << 30, max = 0, sum = 0;
     for (int seq = 1; count <= 0 || seq <= count; seq++) {
         uint64_t t0 = n_clock_uptime_ms();
-        int rtt = net_ping(ip, seq, 2000);
+        n_result reply = net_ping(ip, seq, 2000);
         sent++;
-        if (rtt >= 0) {
+        if (reply >= 0) {
+            int rtt = (int)reply;
             got++;
             sum += rtt;
             if (rtt < min) min = rtt;
             if (rtt > max) max = rtt;
             printf("reply from %s: seq=%d time=%d ms\n", buf, seq, rtt);
-        } else if (errno == EINTR) {
+        } else if (reply == -N_ERR_STOPPED) {
             break;
         } else {
-            printf("seq=%d: %s\n", seq, strerror(errno));
+            printf("seq=%d: %s\n", seq, n_result_text(reply));
         }
         if (count <= 0 || seq < count) {
             uint64_t spent = n_clock_uptime_ms() - t0;

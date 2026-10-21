@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 
 static int failures,checks;
 static void check(const char *name,bool ok) { checks++; if (!ok) { printf("FAIL GPU %s\n",name); failures++; } }
@@ -21,17 +20,17 @@ static void blit_test(bool required,const struct n_gpu_info *info) {
     struct n_gpu_blit r={.source_width=4,.source_height=3,.source_x=1,.source_y=1,
         .source_w=2,.source_h=2,.width=4,.height=4};
     check("blit-abi",sizeof r==32);
-    check("blit-request-span",gpu_blit((void *)1,input,sizeof input,output+1,64)<0 && errno==EFAULT);
-    check("blit-source-span",gpu_blit(&r,(void *)1,sizeof input,output+1,64)<0 && errno==EFAULT);
-    check("blit-output-span",gpu_blit(&r,input,sizeof input,(void *)1,64)<0 && errno==EFAULT);
-    check("blit-source-overflow-span",gpu_blit(&r,(void *)(uintptr_t)-16,sizeof input,output+1,64)<0 && errno==EFAULT);
-    check("blit-output-overflow-span",gpu_blit(&r,input,sizeof input,(void *)(uintptr_t)-16,64)<0 && errno==EFAULT);
-    check("blit-short-source",gpu_blit(&r,input,sizeof input-4,output+1,64)<0 && errno==EINVAL);
-    check("blit-short-output",gpu_blit(&r,input,sizeof input,output+1,60)<0 && errno==EINVAL);
+    check("blit-request-span",gpu_blit((void *)1,input,sizeof input,output+1,64)==-N_ERR_BAD_ADDRESS);
+    check("blit-source-span",gpu_blit(&r,(void *)1,sizeof input,output+1,64)==-N_ERR_BAD_ADDRESS);
+    check("blit-output-span",gpu_blit(&r,input,sizeof input,(void *)1,64)==-N_ERR_BAD_ADDRESS);
+    check("blit-source-overflow-span",gpu_blit(&r,(void *)(uintptr_t)-16,sizeof input,output+1,64)==-N_ERR_BAD_ADDRESS);
+    check("blit-output-overflow-span",gpu_blit(&r,input,sizeof input,(void *)(uintptr_t)-16,64)==-N_ERR_BAD_ADDRESS);
+    check("blit-short-source",gpu_blit(&r,input,sizeof input-4,output+1,64)==-N_ERR_INVALID);
+    check("blit-short-output",gpu_blit(&r,input,sizeof input,output+1,60)==-N_ERR_INVALID);
     struct n_gpu_blit bad=r;bad.source_x=UINT32_MAX;
-    check("blit-crop-overflow",gpu_blit(&bad,input,sizeof input,output+1,64)<0 && errno==EINVAL);
+    check("blit-crop-overflow",gpu_blit(&bad,input,sizeof input,output+1,64)==-N_ERR_INVALID);
     bad=r;bad.source_width=UINT32_MAX;
-    check("blit-reject-dimensions",gpu_blit(&bad,input,sizeof input,output+1,64)<0 && errno==EINVAL);
+    check("blit-reject-dimensions",gpu_blit(&bad,input,sizeof input,output+1,64)==-N_ERR_INVALID);
     if (info->capabilities&N_GPU_CAP_BLIT) {
         struct n_gpu_info before,after;
         bool ok=gpu_info(&before)==0 && gpu_blit(&r,input,sizeof input,output+1,64)==0 && gpu_info(&after)==0;
@@ -55,9 +54,9 @@ static void blit_test(bool required,const struct n_gpu_info *info) {
             memset(large,0,bytes);large[512*512-1]=0x42123456;
             r=(struct n_gpu_blit){.source_width=512,.source_height=512,.source_x=511,.source_y=511,
                 .source_w=1,.source_h=1,.width=1,.height=1};
-            int result=gpu_blit(&r,large,bytes,output+1,4),error=errno;
+            n_result result=gpu_blit(&r,large,bytes,output+1,4);
             bool matched=result==0 && output[1]==0x42123456;
-            if(!matched)printf("GPU blit last-pixel: result=%d errno=%d actual=%08x expected=%08x\n",result,error,output[1],0x42123456);
+            if(!matched)printf("GPU blit last-pixel: result=%s actual=%08x expected=%08x\n",n_result_text(result),output[1],0x42123456);
             check("blit-max-source-last-pixel",matched);
             /* Same real API, four edges and a containing region. These
                distinguish stale readback from a crop/origin error without
@@ -66,28 +65,28 @@ static void blit_test(bool required,const struct n_gpu_info *info) {
             for(unsigned corner=0;corner<4;corner++){
                 r.source_x=(corner&1)?511:0;r.source_y=(corner&2)?511:0;
                 uint32_t actual=0xdeadbeef,expected=corner==3?0x42123456:0;
-                int rc=gpu_blit(&r,large,bytes,&actual,sizeof actual);
+                n_result rc=gpu_blit(&r,large,bytes,&actual,sizeof actual);
                 if(rc<0 || actual!=expected){
-                    printf("GPU blit corner=%u result=%d errno=%d actual=%08x expected=%08x\n",corner,rc,errno,actual,expected);
+                    printf("GPU blit corner=%u result=%s actual=%08x expected=%08x\n",corner,n_result_text(rc),actual,expected);
                     corners=false;
                 }
             }
             check("blit-four-source-corners",corners);
             r.source_x=r.source_y=510;r.source_w=r.source_h=r.width=r.height=2;
             uint32_t block[4]={0xdeadbeef,0xdeadbeef,0xdeadbeef,0xdeadbeef};
-            int rc=gpu_blit(&r,large,bytes,block,sizeof block);
+            n_result rc=gpu_blit(&r,large,bytes,block,sizeof block);
             bool block_ok=rc==0 && !block[0] && !block[1] && !block[2] && block[3]==0x42123456;
-            if(!block_ok)printf("GPU blit edge-block result=%d errno=%d pixels=%08x,%08x,%08x,%08x\n",rc,errno,block[0],block[1],block[2],block[3]);
+            if(!block_ok)printf("GPU blit edge-block result=%s pixels=%08x,%08x,%08x,%08x\n",n_result_text(rc),block[0],block[1],block[2],block[3]);
             check("blit-containing-edge-block",block_ok);
             r.source_x=r.source_y=511;r.source_w=r.source_h=1;
             rc=gpu_blit(&r,large,bytes,block,sizeof block);
             bool scaled=rc==0;
             for(unsigned i=0;i<4;i++)if(block[i]!=0x42123456)scaled=false;
-            if(!scaled)printf("GPU blit scaled-edge result=%d errno=%d pixels=%08x,%08x,%08x,%08x\n",rc,errno,block[0],block[1],block[2],block[3]);
+            if(!scaled)printf("GPU blit scaled-edge result=%s pixels=%08x,%08x,%08x,%08x\n",n_result_text(rc),block[0],block[1],block[2],block[3]);
             check("blit-scaled-edge-pixel",scaled);
             free(large);
         }
-    } else check("blit-unavailable-truthful",gpu_blit(&r,input,sizeof input,output+1,64)<0 && errno==ENOSYS && !required);
+    } else check("blit-unavailable-truthful",gpu_blit(&r,input,sizeof input,output+1,64)==-N_ERR_UNSUPPORTED && !required);
     printf("GPU blit cap=%u (texture replace/nearest; not WebGL)\n",(unsigned)((info->capabilities&N_GPU_CAP_BLIT)!=0));
 }
 static void batch_test(bool required,const struct n_gpu_info *info) {
@@ -116,11 +115,11 @@ static void batch_test(bool required,const struct n_gpu_info *info) {
     } else check("batch-fallback-truthful",backend==N_GPU_BACKEND_CPU && !required);
     struct n_gpu_batch bad=r; bad.triangle_count=N_GPU_MAX_TRIANGLES+1;
     uint32_t unchanged=pixels[1+16*32+24];
-    check("batch-reject-count",gpu_render_batch(&bad,pixels+1,32*32*4)<0 && errno==EINVAL &&
+    check("batch-reject-count",gpu_render_batch(&bad,pixels+1,32*32*4)==-N_ERR_INVALID &&
         gfx_render3d_batch(&c,&bad)<0 && pixels[1+16*32+24]==unchanged);
     bad=r; bad.vertex[last+2].w=0;
-    check("batch-reject-last-vertex",gpu_render_batch(&bad,pixels+1,32*32*4)<0 && errno==EINVAL && gfx_render3d_batch(&c,&bad)<0);
-    check("batch-reject-short-output",gpu_render_batch(&r,pixels+1,4)<0 && errno==EINVAL);
+    check("batch-reject-last-vertex",gpu_render_batch(&bad,pixels+1,32*32*4)==-N_ERR_INVALID && gfx_render3d_batch(&c,&bad)<0);
+    check("batch-reject-short-output",gpu_render_batch(&r,pixels+1,4)==-N_ERR_INVALID);
     /* Overlapping primitives are ordered overwrite, not independent clears. */
     r.triangle_count=2;
     memcpy(&r.vertex[3],r.vertex,3*sizeof r.vertex[0]);
@@ -185,8 +184,8 @@ static void scalable_test(bool required,const struct n_gpu_info *info) {
         pixels[1+(r.height/2)*r.width+r.width/2]==0xff0000ff);
     check("scalable-output-canaries",pixels[0]==0x12345678 && pixels[bytes/4+1]==0x87654321);
     check("scalable-backend-truthful",(info->capabilities&N_GPU_CAP_BATCH)?backend==N_GPU_BACKEND_VIRGL:backend==N_GPU_BACKEND_CPU && !required);
-    check("scalable-invalid-vertex-span",gpu_render_list(&r,(void *)1,pixels+1,bytes)<0 && errno==EFAULT);
-    check("scalable-short-output",gpu_render_list(&r,v,pixels+1,bytes-4)<0 && errno==EINVAL);
+    check("scalable-invalid-vertex-span",gpu_render_list(&r,(void *)1,pixels+1,bytes)==-N_ERR_BAD_ADDRESS);
+    check("scalable-short-output",gpu_render_list(&r,v,pixels+1,bytes-4)==-N_ERR_INVALID);
     r.triangle_count=0;
     check("scalable-empty-list",gfx_render3d_list(&canvas,&r,NULL)==backend && pixels[1]==r.clear_argb);
     struct n_gpu_render large={.width=r.width,.height=r.height,.operation=N_GPU_CLEAR,.clear_argb=0xff315579};
@@ -207,7 +206,7 @@ int main(int argc,char **argv) {
     check("clear-pixels",equal);
     check("output-canaries",storage[0]==0x12345678 && storage[32*32+1]==0x87654321);
     struct n_gpu_render bad=r; bad.width=UINT32_MAX;
-    check("reject-dimensions",gpu_render(&bad,storage+1,32*32*4)<0 && errno==EINVAL);
+    check("reject-dimensions",gpu_render(&bad,storage+1,32*32*4)==-N_ERR_INVALID);
     check("reject-short-buffer",gpu_render(&r,storage+1,4)<0);
     r.operation=N_GPU_TRIANGLE;
     r.vertex[0]=(struct n_gpu_vertex){-49152,-49152,0,65536,0xffff0000};
@@ -216,7 +215,7 @@ int main(int argc,char **argv) {
     int backend=gfx_render3d(&c,&r);
     check("triangle-actual-pixels",backend>=0 && storage[1]==r.clear_argb && storage[1+16*32+16]!=r.clear_argb);
     bad=r; bad.vertex[0].w=0;
-    check("reject-zero-w",gpu_render(&bad,storage+1,32*32*4)<0 && errno==EINVAL && gfx_render3d(&c,&bad)<0);
+    check("reject-zero-w",gpu_render(&bad,storage+1,32*32*4)==-N_ERR_INVALID && gfx_render3d(&c,&bad)==-N_ERR_INVALID);
     if (info.capabilities&N_GPU_CAP_TRIANGLE) {
         check("strict-device",gpu_render(&r,storage+1,32*32*4)==0);
         check("device-output",storage[1]==r.clear_argb && storage[1+16*32+16]!=r.clear_argb);

@@ -15,7 +15,7 @@ struct net_stream{SOCKET socket;uint64_t sent;char error[128];int (*cancelled)(v
 static void error(net_stream *s){int e=WSAGetLastError();errno=e==WSAETIMEDOUT?ETIMEDOUT:e==WSAECONNRESET?ECONNRESET:EIO;snprintf(s->error,sizeof s->error,"winsock %d",e);}
 uint64_t uptime_ms(void){return GetTickCount64();}
 void yield(void){SwitchToThread();}
-int msleep(unsigned n){Sleep(n);return 0;}
+void n_sleep_ms(uint64_t n){Sleep((DWORD)n);}
 struct native_thread{void (*fn)(void*);void *arg;};
 static DWORD WINAPI run_thread(void *arg){struct native_thread t=*(struct native_thread*)arg;free(arg);t.fn(t.arg);return 0;}
 int thread_create(void (*fn)(void*),void *arg){struct native_thread *t=malloc(sizeof *t);if(!t)return -1;t->fn=fn;t->arg=arg;HANDLE h=CreateThread(NULL,0,run_thread,t,0,NULL);return h?(int)(intptr_t)h:-1;}

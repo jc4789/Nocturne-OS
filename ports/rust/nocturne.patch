@@ -1014,7 +1014,7 @@ index 88d9d42..1a6fa99 100644
          pub use self::xous::*;
 diff --git a/library/std/src/sys/pal/nocturne/abi.rs b/library/std/src/sys/pal/nocturne/abi.rs
 new file mode 100644
-index 0000000..710dc4c
+index 0000000..4cb12ba
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/abi.rs
 @@ -0,0 +1,174 @@
@@ -1176,7 +1176,7 @@ index 0000000..710dc4c
 +    pub fn n_terminal(h: n_handle) -> bool;
 +    pub static n_settings: *const *mut c_char;
 +
-+    pub fn msleep(ms: c_uint) -> c_int;
++    pub fn n_sleep_ms(ms: u64);
 +    #[link_name = "yield"]
 +    pub fn yield_now() -> ();
 +    pub fn thread_create(f: extern "C" fn(*mut c_void), arg: *mut c_void) -> n_result;
@@ -1819,7 +1819,7 @@ index 9816981..f62e689 100644
          pub use sgx::{Thread, current_os_id, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
 diff --git a/library/std/src/sys/thread/nocturne.rs b/library/std/src/sys/thread/nocturne.rs
 new file mode 100644
-index 0000000..11a858f
+index 0000000..caaef18
 --- /dev/null
 +++ b/library/std/src/sys/thread/nocturne.rs
 @@ -0,0 +1,91 @@
@@ -1909,8 +1909,8 @@ index 0000000..11a858f
 +    // Whole milliseconds, rounded up so it never returns early.
 +    let mut ms = dur.as_millis() + u128::from(dur.subsec_nanos() % 1_000_000 != 0);
 +    while ms > 0 {
-+        let step = ms.min(u32::MAX as u128 - 1) as u32;
-+        unsafe { abi::msleep(step) };
++        let step = ms.min(u64::MAX as u128) as u64;
++        unsafe { abi::n_sleep_ms(step) };
 +        ms -= step as u128;
 +    }
 +}

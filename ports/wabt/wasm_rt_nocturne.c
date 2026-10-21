@@ -237,7 +237,8 @@ static int coroutine_owner(const wasm_rt_coroutine *co) {
 wasm_rt_coroutine *wasm_rt_coroutine_create(void (*entry)(void *), void *opaque) {
     if (!entry) { errno = EINVAL; return NULL; }
     uintptr_t task_low, task_high;
-    if (thread_stack_bounds(&task_low, &task_high) < 0) return NULL;
+    n_result bounds = thread_stack_bounds(&task_low, &task_high);
+    if (bounds < 0) { errno = (int)-bounds; return NULL; }
     if (task_high <= task_low || task_high - task_low > SIZE_MAX - N_PAGE_SIZE) {
         errno = ENOMEM; return NULL;
     }

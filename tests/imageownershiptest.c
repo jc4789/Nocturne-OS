@@ -122,7 +122,7 @@ int main(void) {
             check(got==want,"current image painted before property getter");
             printf("IMAGE-OWN-PAINT rgb=%06x expected=%06x\n",got,want); state.paint=0;
         }
-        msleep(1);
+        n_sleep_ms(1);
     }
     check(state.done,"asynchronous cases completed");
     check(state.first==1&&state.replacement==1&&state.detached==1&&state.broken==1&&state.old==1&&state.latest==1&&state.clone==1,"unique resource counts");

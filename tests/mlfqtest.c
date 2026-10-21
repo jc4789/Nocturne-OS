@@ -1,5 +1,5 @@
 /* 実 Nocturne n_app_launch/n_channel_pair/window の scheduler 負荷。速度閾値で成功を偽装しない。
-   4 CPU-bound 子を終了まで走らせ、BSP GUI 子の sleep 復帰遅延を実測する。 */
+   4 CPU-bound 子を終了まで走らせ、GUI 子の sleep 復帰遅延を実測する。 */
 #include <nocturne.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,24 +12,19 @@
 #define REPORT_MAGIC 0x4d4c4651u
 #define RUN_TIMEOUT_MS 20000
 struct report {
-    unsigned magic, kind, count, pin_ok;
-    unsigned long begin_ms, end_ms, cpu_ms, blocks, checksum;
+    unsigned magic, kind, count, present_ok;
+    unsigned long begin_ms, end_ms, cpu_ms, blocks, checksum, cpu_mask;
     unsigned long lateness[SAMPLES];
 };
-static unsigned apic_id(void) {
-    unsigned a, b, c, d;
-    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
-    return b >> 24;
-}
 static unsigned long own_cpu_ms(void) {
     struct n_procinfo info[64];
     int n = proclist(info, 64), pid = (int)n_app_self();
     for (int i = 0; i < n; i++) if (info[i].pid == pid) return (unsigned long)info[i].cpu_ms;
     return 0;
 }
-static int await_start(unsigned long start) {
+static void await_start(unsigned long start) {
     unsigned long now = (unsigned long)uptime_ms();
-    return now >= start || msleep((unsigned)(start - now)) == 0;
+    if (now < start) n_sleep_ms(start - now);
 }
 /* One report is one channel message. */
 static int send_report(const struct report *r) {
@@ -38,7 +33,7 @@ static int send_report(const struct report *r) {
 static int child_burn(unsigned long start, unsigned seed) {
     struct report r = {0};
     r.magic = REPORT_MAGIC; r.kind = 1;
-    if (!await_start(start)) return 2;
+    await_start(start);
     r.begin_ms = (unsigned long)uptime_ms();
     unsigned long cpu_begin = own_cpu_ms();
     volatile unsigned long value = seed;
@@ -54,29 +49,29 @@ static int child_burn(unsigned long start, unsigned seed) {
 }
 static int child_interactive(unsigned long start) {
     struct report r = {0};
-    r.magic = REPORT_MAGIC; r.kind = 2; r.pin_ok = 1;
-    window_t *win = win_open(240, 80, "MLFQ: wake/present 診断", 0);
-    if (!win) return 2;
-    /* writable window mapping により sched_pin_space が sticky BSP pin する。 */
-    unsigned bsp = apic_id();
+    r.magic = REPORT_MAGIC; r.kind = 2;
+    window_t *win;
+    if (win_open(240, 80, "MLFQ: wake/present 診断", 0, &win) < 0) return 2;
+    /* 窓を持つ app も他の app と同じく任意の scheduler CPU で走る（BSP 固定はない）。
+       負荷下でも毎回の present が成功することを要求し、走った CPU は記録だけする。 */
     gfx_fill(&win->c, 0, 0, win->w, win->h, RGB(32, 28, 50));
-    win_update(win);
-    if (!await_start(start)) { win_close(win); return 2; }
+    r.present_ok = win_update(win) == 0;
+    await_start(start);
     r.begin_ms = (unsigned long)uptime_ms();
     unsigned long cpu_begin = own_cpu_ms();
     for (unsigned i = 0; i < SAMPLES; i++) {
         unsigned long due = (unsigned long)uptime_ms() + 20;
-        if (msleep(20)) { win_close(win); return 2; }
+        n_sleep_ms(20);
         unsigned long woke = (unsigned long)uptime_ms();
         r.lateness[r.count++] = woke > due ? woke - due : 0;
-        if (apic_id() != bsp) r.pin_ok = 0;
+        r.cpu_mask |= 1UL << (cpu_index() % 64);
         gfx_fill(&win->c, 8, 8, 24, 24, (i & 1) ? RGB(170, 130, 240) : RGB(90, 190, 180));
-        win_update_rect(win, 8, 8, 24, 24);
+        if (win_update_rect(win, 8, 8, 24, 24) != 0) r.present_ok = 0;
     }
     r.end_ms = (unsigned long)uptime_ms();
     r.cpu_ms = own_cpu_ms() - cpu_begin;
     win_close(win);
-    return r.pin_ok && send_report(&r) ? 0 : 2;
+    return r.present_ok && send_report(&r) ? 0 : 2;
 }
 /* Waits on an event queue until the child's report arrives or the deadline passes. */
 static int receive_until(n_handle channel, void *data, size_t bytes, unsigned long deadline) {
@@ -126,13 +121,14 @@ int main(int argc, char **argv) {
         n_handle_close(app[i]); app[i] = -1; completed++;
         if (i && (r[i].kind != 1 || r[i].blocks != WORK_BLOCKS)) ok = 0;
     }
-    if (r[0].kind != 2 || r[0].count != SAMPLES || !r[0].pin_ok) ok = 0;
+    if (r[0].kind != 2 || r[0].count != SAMPLES || !r[0].present_ok) ok = 0;
     for (unsigned i = 0; i < SAMPLES; i++) for (unsigned j = i + 1; j < SAMPLES; j++)
         if (r[0].lateness[j] < r[0].lateness[i]) {
             unsigned long temp = r[0].lateness[i]; r[0].lateness[i] = r[0].lateness[j]; r[0].lateness[j] = temp;
         }
-    printf("mlfqtest: scheduler_cpus=%u workers=%u completed=%d/%u interactive_pin=%s\n",
-           cpu.scheduler_cpus, cpu.worker_cpus, completed, (unsigned)CHILDREN, r[0].pin_ok ? "PASS" : "FAIL");
+    printf("mlfqtest: scheduler_cpus=%u workers=%u completed=%d/%u interactive_present=%s cpu_mask=%lx\n",
+           cpu.scheduler_cpus, cpu.worker_cpus, completed, (unsigned)CHILDREN, r[0].present_ok ? "PASS" : "FAIL",
+           r[0].cpu_mask);
     printf("mlfqtest: wake_lateness_ms samples=%u p50=%lu p95=%lu max=%lu interactive_wall=%lu cpu=%lu (measurement, no speed threshold)\n",
            r[0].count, r[0].lateness[SAMPLES / 2], r[0].lateness[(SAMPLES * 95) / 100 - 1],
            r[0].lateness[SAMPLES - 1], r[0].end_ms - r[0].begin_ms, r[0].cpu_ms);

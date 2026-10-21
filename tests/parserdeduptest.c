@@ -11,7 +11,7 @@ static void check(bool ok,const char *name){checks++;if(!ok){failures++;printf("
 static void log_line(void *context,int level,const char *text){(void)context;if(level>=2){errors++;printf("ERROR %s\n",text);}}
 static bool checkpoint(void *context){(void)context;return true;}
 static bool eval(web_doc *d,const char *source){return web_console_eval(d,source,strlen(source));}
-static void settle(web_doc *top,unsigned count){for(unsigned i=0;i<count;i++){web_tick(top,uptime_ms());msleep(1);}}
+static void settle(web_doc *top,unsigned count){for(unsigned i=0;i<count;i++){web_tick(top,uptime_ms());n_sleep_ms(1);}}
 static node_t *find_id(node_t *n,const char *id){
     if(!n)return NULL;if(n->id&&!strcmp(n->id,id))return n;
     for(node_t *c=n->first;c;c=c->next){node_t *found=find_id(c,id);if(found)return found;}

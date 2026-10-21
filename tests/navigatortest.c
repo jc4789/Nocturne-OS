@@ -68,7 +68,7 @@ static void run_case(const char *cases,unsigned cpus,int mode){
             f.enabled=false;if(!web_console_eval(doc,disabled,strlen(disabled)))f.failed++;
             f.enabled=true;if(!web_console_eval(doc,enabled,strlen(enabled)))f.failed++;toggled=true;
         }
-        msleep(1);
+        n_sleep_ms(1);
     }
     if(!f.ready||!f.done||!toggled||f.errors||f.checks!=(mode==1?104:55)){printf("FAIL navigator completion mode=%d ready=%d done=%d checks=%d errors=%d\n",mode,f.ready,f.done,f.checks,f.errors);f.failed++;}
     checks+=f.checks;failures+=f.failed;web_free(doc);webcookie_free(f.jar);

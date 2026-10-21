@@ -97,15 +97,15 @@ static void lifecycle(void) {
     node_t *a=element(d,d->body,"animation:fade 1s linear -.25s both paused");layout(d);
     struct css_motion_state *identity=a->css_motion;
     check("paused initial negative delay",opacity(a,.25));
-    msleep(20);restyle(d,a);check("paused wall time does not advance",opacity(a,.25));
+    n_sleep_ms(20);restyle(d,a);check("paused wall time does not advance",opacity(a,.25));
     d->style_full_dirty=d->need_style=d->need_boxes=true;layout(d);
     check("full style rebuild retains playback",a->css_motion==identity && opacity(a,.25));
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both");layout(d);
     check("resume schedules native frame",css_motion_deadline(d,uptime_ms())>=0);
-    msleep(35);css_motion_tick(d,uptime_ms());layout(d);
+    n_sleep_ms(35);css_motion_tick(d,uptime_ms());layout(d);
     check("resume advances actual native time",a->style->opacity>.27f && a->style->opacity<.6f);
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both paused");layout(d);
-    msleep(20);restyle(d,a);;
+    n_sleep_ms(20);restyle(d,a);;
     ;
     doc_node_attr(d,a,"style","opacity:.4;animation:none");layout(d);
     ;
@@ -118,7 +118,7 @@ static void lifecycle(void) {
     doc_node_remove(d,a);;
     doc_node_move(d,d->body,a,NULL);layout(d);check("reconnection starts fresh",opacity(a,0));
     doc_node_attr(d,a,"style","animation:fade 40ms linear forwards");layout(d);
-    msleep(65);css_motion_tick(d,uptime_ms());layout(d);
+    n_sleep_ms(65);css_motion_tick(d,uptime_ms());layout(d);
     ;
     ;
     doc_node_attr(d,a,"style","opacity:.4;animation:fade 0s linear");layout(d);

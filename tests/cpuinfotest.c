@@ -1,4 +1,4 @@
-/* detected、pure worker、実user scheduler役を区別する。 */
+/* detected、online、kernel job worker（全AP）、user scheduler（CPU 0とrunner AP）を区別する。 */
 #include <nocturne.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,8 +42,9 @@ int main(void) {
     memset(&info, 0xa5, sizeof info);
     if (cpu_info(&info) < 0 || info.version != 1 || !info.detected_cpus ||
         !info.online_cpus || info.online_cpus > info.detected_cpus ||
-        info.worker_cpus + info.scheduler_cpus != info.online_cpus ||
-        !info.scheduler_cpus || info.scheduler_cpus > 2 ||
+        /* Every online AP runs kernel jobs; CPU 0 and any of them run user tasks. */
+        info.worker_cpus != info.online_cpus - 1 ||
+        !info.scheduler_cpus || info.scheduler_cpus > info.online_cpus ||
         !!(info.flags & N_CPU_AP_WORKERS) != !!info.worker_cpus ||
         !(info.flags & N_CPU_SSE2) ||
         (info.worker_cpus && (!info.parallel_jobs || !info.worker_chunks))) {

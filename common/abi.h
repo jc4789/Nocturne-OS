@@ -215,6 +215,8 @@ struct n_reference_tsc {
     volatile int64_t offset;
 };
 
+/* worker_cpus: the online APs, all of which run kernel jobs. scheduler_cpus:
+   CPU 0 plus the APs that also run user tasks, so the two overlap. */
 struct n_cpuinfo {
     uint32_t version, detected_cpus, online_cpus, worker_cpus, scheduler_cpus, flags;
     uint64_t parallel_jobs, worker_chunks;

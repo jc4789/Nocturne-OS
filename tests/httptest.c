@@ -12,23 +12,28 @@ static bool engine_closed;
 #define CHECK(c) do{checks++;if(!(c)){failed++;printf("FAIL TLS deadline:%d %s\n",__LINE__,#c);}}while(0)
 uint64_t uptime_ms(void){return clock_ms;}
 bool net_wait_up(int timeout){(void)timeout;return true;}
-int net_resolve(const char *host,uint32_t *ip){(void)host;*ip=0x0a000202;return 0;}
-int net_resolve_all(const char *host,uint32_t *ips,size_t capacity,struct n_dns_result *result){
+n_result net_resolve(const char *host,uint32_t *ip){(void)host;*ip=0x0a000202;return 0;}
+n_result net_resolve_all(const char *host,uint32_t *ips,size_t capacity,struct n_dns_result *result){
     *result=(struct n_dns_result){.version=1,.status=N_DNS_OK,.count=1,.ttl=60};
-    uint32_t ip;int code=net_resolve(host,&ip);if(code==0&&capacity)ips[0]=ip;return code;}
+    uint32_t ip;n_result code=net_resolve(host,&ip);if(code==0&&capacity)ips[0]=ip;return code;}
 void yield(void){}
-int tcp_connect(uint32_t ip,uint16_t port,int timeout){(void)ip;(void)port;CHECK(timeout<=20000);
-    if(connect_delay>=(unsigned)timeout){clock_ms+=timeout;errno=ETIMEDOUT;return -1;}
+/* One host thread: a held lock is never waited on, so a wait returns at once. */
+n_result wait_on_address(volatile uint32_t *address,uint32_t expected,unsigned timeout_ms){(void)timeout_ms;return *address==expected?0:-N_ERR_NOT_READY;}
+n_result wake_address(volatile uint32_t *address,unsigned count){(void)address;(void)count;return 0;}
+const char *n_result_text(n_result r){static char text[32];snprintf(text,sizeof text,"N_ERR %lld",(long long)(r<0?-r:r));return text;}
+n_result tcp_cancel(n_handle socket){CHECK(socket==7);return 0;}
+n_result tcp_connect(uint32_t ip,uint16_t port,int timeout){(void)ip;(void)port;CHECK(timeout<=20000);
+    if(connect_delay>=(unsigned)timeout){clock_ms+=timeout;return -N_ERR_TIMEOUT;}
     clock_ms+=connect_delay;return 7;}
-int tcp_close(int socket){CHECK(socket==7);closed++;return 0;}
-long tcp_send(int socket,const void *data,size_t n){(void)socket;(void)data;return (long)n;}
-long tcp_send_until(int socket,const void *data,size_t n,uint64_t deadline){(void)deadline;return tcp_send(socket,data,n);}
-long tcp_send_some(int socket,const void *data,size_t n){return tcp_send(socket,data,n);}
-long tcp_recv(int socket,void *data,size_t n,int timeout){(void)socket;(void)n;
+n_result tcp_close(n_handle socket){CHECK(socket==7);closed++;return 0;}
+n_result tcp_send(n_handle socket,const void *data,size_t n){(void)socket;(void)data;return (n_result)n;}
+n_result tcp_send_until(n_handle socket,const void *data,size_t n,uint64_t deadline){(void)deadline;return tcp_send(socket,data,n);}
+n_result tcp_send_some(n_handle socket,const void *data,size_t n){return tcp_send(socket,data,n);}
+n_result tcp_recv(n_handle socket,void *data,size_t n,int timeout){(void)socket;(void)n;
     if(read_count<32)last_timeouts[read_count]=timeout;read_count++;
     if(failure_mode==1)return 0;
-    if(failure_mode==2){errno=ECONNRESET;return -1;}
-    if(timeout>=0&&read_delay&&(unsigned)timeout<=read_delay){clock_ms+=(unsigned)timeout;errno=EAGAIN;return -1;}
+    if(failure_mode==2)return -N_ERR_CONNECTION_RESET;
+    if(timeout>=0&&read_delay&&(unsigned)timeout<=read_delay){clock_ms+=(unsigned)timeout;return -N_ERR_NOT_READY;}
     clock_ms+=read_delay;*(unsigned char*)data=1;return 1;}
 void br_ssl_client_init_full(br_ssl_client_context *cc,br_x509_minimal_context *xc,
     const br_x509_trust_anchor *anchors,size_t count){(void)xc;(void)anchors;(void)count;memset(cc,0,sizeof *cc);}

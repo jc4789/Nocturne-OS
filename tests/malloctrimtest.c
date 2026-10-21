@@ -72,14 +72,19 @@ static void check(int ok,const char *what) {
     printf("%s %s\n",ok?"PASS":"FAIL",what);
     if(ok)passed++;else failed++;
 }
-static uint64_t free_memory(void) {
+/* Bytes of physical pages this process holds. Reservations past a few pages
+   receive frames on first touch, so callers write a whole block before measuring;
+   the process's own count is unaffected by other apps. */
+static uint64_t resident(void) {
 #ifdef MALLOCTRIM_MODEL
     uint64_t n=0;
-    for(size_t k=0;k<POOL_PAGES;k++)n+=model_state[k]==0;
+    for(size_t k=0;k<POOL_PAGES;k++)n+=model_state[k]==1;
     return n*TEST_PAGE;
 #else
-    struct n_sysinfo info;
-    return sysinfo(&info)==0?info.free_mem:0;
+    static struct n_procinfo processes[64];
+    int pid=(int)n_app_self(),n=proclist(processes,64);
+    for(int i=0;i<n;i++)if(processes[i].pid==pid)return processes[i].mem_kb*KIB;
+    return 0;
 #endif
 }
 static size_t heap_bytes(void) { size_t heap=0; malloc_usage(&heap,NULL); return heap; }
@@ -169,13 +174,13 @@ int main(void) {
     /* The newest region keeps one growth quantum warm and returns the rest. */
     unsigned char *big=malloc(900u*KIB);
     check(big!=NULL,"a block larger than any free space");if(!big)return 1;
-    mark_bytes(big,900u*KIB,0x63);
-    size_t high=heap_bytes();uint64_t before=free_memory();
+    memset(big,0x63,900u*KIB);mark_bytes(big,900u*KIB,0x63);
+    size_t high=heap_bytes();uint64_t before=resident();
     errno=EIO;free(big);
     check(errno==EIO,"free preserves errno across page release");
     size_t low=heap_bytes();
     check(low+600u*KIB<=high,"freeing the newest region's tail returns its pages to the system");
-    check(free_memory()>=before+600u*KIB,"the returned pages are physical pages");
+    check(resident()+600u*KIB<=before,"the returned pages are physical pages");
     check(bytes_intact(anchor,128,0x71),"page release preserves an earlier live block");
     unsigned char *small=malloc(128);check(small!=NULL,"warm residual allocation");
 #ifdef MALLOCTRIM_MODEL
@@ -241,15 +246,15 @@ int main(void) {
 #endif
 
     /* Large blocks are regions of their own. */
-    before=free_memory();
+    before=resident();
     big=malloc(8u*MIB);check(big!=NULL,"large own-region allocation");if(!big)return 1;
-    mark_bytes(big,8u*MIB,0x5a);high=heap_bytes();
-    uint64_t taken=free_memory();
-    check(before>=taken+7u*MIB,"a large allocation takes its pages");
+    memset(big,0x5a,8u*MIB);mark_bytes(big,8u*MIB,0x5a);high=heap_bytes();
+    uint64_t taken=resident();
+    check(taken>=before+7u*MIB,"a large allocation takes its pages");
     unsigned char *kept=realloc(big,3u*MIB);check(kept==big && big[0]==0x5a,"large shrink keeps the block in place");
     check(heap_bytes()+4u*MIB<=high,"large shrink returns the pages it no longer needs");
     errno=EIO;free(big);check(errno==EIO,"large free preserves errno");
-    check(free_memory()>=taken+7u*MIB,"large free returns all its pages");
+    check(resident()+7u*MIB<=taken,"large free returns all its pages");
     check(bytes_intact(anchor,128,0x71),"large-block traffic leaves small blocks intact");
 
 #ifdef MALLOCTRIM_MODEL

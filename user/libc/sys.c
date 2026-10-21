@@ -40,14 +40,6 @@ long __syscall(long n, long a, long b, long c, long d, long e) {
     return r;
 }
 
-static long ret(long r) {
-    if (r < 0 && r > -4096) {
-        errno = (int)-r;
-        return -1;
-    }
-    return r;
-}
-
 #define SC0(n) __syscall(n, 0, 0, 0, 0, 0)
 #define SC1(n, a) __syscall(n, (long)(a), 0, 0, 0, 0)
 #define SC2(n, a, b) __syscall(n, (long)(a), (long)(b), 0, 0, 0)
@@ -77,7 +69,6 @@ static const char *script_interp(const char *path, char *buf, size_t n) {
     return "/bin/sh";
 }
 
-int msleep(unsigned ms) { return (int)SC1(SYS_SLEEP, ms); }
 static struct n_clockinfo user_clock;
 static unsigned clock_initialized;
 static uint64_t clock_last;
@@ -169,9 +160,7 @@ int thread_id(void) {
     return t ? t->tid : (int)SC0(SYS_THREAD_ID);
 }
 unsigned cpu_index(void) { return (unsigned)SC0(SYS_CPU_INDEX); }
-int thread_stack_bounds(uintptr_t *low, uintptr_t *high) {
-    return (int)ret(SC2(SYS_THREAD_STACK_BOUNDS, low, high));
-}
+n_result thread_stack_bounds(uintptr_t *low, uintptr_t *high) { return SC2(SYS_THREAD_STACK_BOUNDS, low, high); }
 /* The calling thread's C11 tss value array with room for `need` keys, or
    NULL when it cannot grow (need == 0 only queries the current array). */
 void **__libc_tss_values(size_t need, size_t *capacity) {
@@ -403,12 +392,12 @@ n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t time
 uint64_t n_clock_uptime_ms(void) { return uptime_ms(); }
 int64_t n_clock_wall(void) { return SC0(SYS_TIME); }
 void n_sleep_ms(uint64_t ms) { SC1(SYS_SLEEP, ms); }
-int proclist(struct n_procinfo *out, int max) { return (int)ret(SC2(SYS_PROCLIST, out, max)); }
-int sysinfo(struct n_sysinfo *si) { return (int)ret(SC1(SYS_SYSINFO, si)); }
+n_result proclist(struct n_procinfo *out, int max) { return SC2(SYS_PROCLIST, out, max); }
+n_result sysinfo(struct n_sysinfo *si) { return SC1(SYS_SYSINFO, si); }
 n_result cpu_info(struct n_cpuinfo *info) { return SC1(SYS_CPU_INFO, info); }
 void yield(void) { SC0(SYS_YIELD); }
-int poweroff(void) { return (int)ret(SC1(SYS_POWER, POWER_OFF)); }
-int reboot(void) { return (int)ret(SC1(SYS_POWER, POWER_REBOOT)); }
+n_result poweroff(void) { return SC1(SYS_POWER, POWER_OFF); }
+n_result reboot(void) { return SC1(SYS_POWER, POWER_REBOOT); }
 n_result pcilist(struct n_pciinfo *out, int max) { return SC2(SYS_PCILIST, out, max); }
 
 static bool is_document(const char *path) {

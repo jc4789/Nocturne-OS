@@ -11,7 +11,7 @@
 #include "browser_identity.h"
 extern uint64_t uptime_ms(void);
 extern void yield(void);
-extern int msleep(unsigned);
+extern void n_sleep_ms(uint64_t);
 
 /* The pool is process-local. It never coalesces certificate names or origins.
    Keys include the exact caller partition and credential header bytes; no
@@ -112,11 +112,11 @@ static struct pooled_connection *pool_acquire(const struct http_req *rq,const st
                 if(!p->h2)ns_set_timeout(p->stream,timeout);return p;
             }
         }
-        if(opening&&(opening>=POOL_OPEN_PER_KEY||uptime_ms()-newest_open<POOL_OPEN_PATIENCE_MS)){pool_leave();msleep(1);continue;}
+        if(opening&&(opening>=POOL_OPEN_PER_KEY||uptime_ms()-newest_open<POOL_OPEN_PATIENCE_MS)){pool_leave();n_sleep_ms(1);continue;}
         if(oldest&&(oldest->retire||pool_count>=POOL_MAX)) {
             pool_unlink(oldest);pool_leave();pool_destroy(oldest);continue;
         }
-        if(pool_count>=POOL_MAX){pool_leave();msleep(1);continue;}
+        if(pool_count>=POOL_MAX){pool_leave();n_sleep_ms(1);continue;}
         struct pooled_connection *p=calloc(1,sizeof *p);
         if(!p){pool_leave();errno=ENOMEM;break;}
         size_t host_len=strlen(u->host);p->host=malloc(host_len+1);

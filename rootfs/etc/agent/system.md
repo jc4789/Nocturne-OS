@@ -47,14 +47,18 @@ build-and-test loops are cheap.
   inline asm). Not C++.
 - Headers are in `/usr/include` and TinyCC's own in `/usr/lib/tcc/include`. The libc is small
   and custom: when unsure whether a function exists, `grep NAME /usr/include/*.h`.
-  - Standard: stdio, stdlib, string, ctype, math, time, errno, setjmp, stdint, stdbool,
-    stddef, stdarg, limits, inttypes, float, assert, fcntl, unistd, alloca, sys/time.h.
-  - No: fork/exec (use `spawn`, `run_wait` or `system`), signals, threads, BSD sockets, select,
-    mmap of files, locale, wide chars, dynamic libraries.
-  - `nocturne.h`: system calls and Nocturne APIs: files (open/read/readdir/stat), processes
-    (spawn, waitpid, kill, run_wait), time (uptime_ms, msleep), networking (net_resolve,
-    tcp_connect/tcp_send/tcp_recv, udp_*), GUI windows (win_open, win_event, win_update),
-    readline, the clipboard, screen_grab.
+  - Standard C11: stdio, stdlib, string, ctype, math, time, errno, setjmp, threads, fenv,
+    stdint, stdbool, stddef, stdarg, limits, inttypes, float, assert.
+  - Nocturne is not UNIX: there is no unistd.h, fcntl.h, sys/*.h, fork/exec, signals, BSD
+    sockets, select or dynamic libraries. Start programs with `n_app_launch`, `run_wait` or
+    `system`.
+  - `nocturne.h`: the native API. Calls return their result, or a negative `n_result`
+    (`N_ERR_*`; `n_result_text(r)` describes it) and leave errno alone. Documents and folders
+    (n_document_load/save/open/read_at, n_folder_list, n_entry_info), apps (n_app_launch,
+    n_app_result, n_app_stop, run_wait), channels, time (n_clock_uptime_ms, n_sleep_ms),
+    networking (net_resolve, tcp_connect/tcp_send/tcp_recv, udp_*), GUI windows
+    (`win_open(w, h, title, flags, &win)`, win_event, win_update), readline, the clipboard,
+    screen_grab.
   - `ui.h`: the UI engine every GUI app uses (widgets, text in Noto Sans and Maple Mono, themes).
   - `gfx.h`: drawing on a canvas_t: pixels, lines, rects, circles, gradients, text (8x16 and
     16x32 fonts), blits. Colours are RGB(r,g,b) = 0xFFRRGGBB.

@@ -14,7 +14,7 @@ extern const br_x509_trust_anchor tls_trust_anchors[];
 extern const size_t tls_trust_anchors_num;
 
 struct net_stream {
-    int sock;
+    n_handle sock;
     int timeout_ms;
     bool tls;
     bool io_limited, handshaking, closing, transport_eof;
@@ -91,6 +91,13 @@ static bool io_cancelled(net_stream *s) {
     s->transport_errno=errno=ECANCELED;
     snprintf(s->err,sizeof s->err,"request cancelled");return true;
 }
+/* The tcp_* calls return a negative n_result; the ns_* functions report it to
+   their callers in errno. A zero-byte transfer means the peer reset. */
+static n_result transport_failed(net_stream *s, n_result r) {
+    if(r>=0)r=-N_ERR_CONNECTION_RESET;
+    s->transport_errno=errno=(int)-r;
+    return r;
+}
 
 /* The timeout is per public read operation, not per encrypted record. A
    peer dribbling partial records must not renew one blocking operation. */
@@ -123,22 +130,22 @@ static int sock_read(void *ctx, unsigned char *buf, size_t len) {
         if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
         return -1;
     }
-    long r;
+    n_result r;
     do {
         int slice=s->cancelled&&(timeout<0||timeout>100)?100:timeout;
         r=tcp_recv(s->sock,buf,len,slice);
-        if(r>=0||(errno!=EAGAIN&&errno!=ETIMEDOUT)||slice==timeout)break;
+        if(r>=0||(r!=-N_ERR_NOT_READY&&r!=-N_ERR_TIMEOUT)||slice==timeout)break;
         if(io_timeout(s,&timeout)<0)return -1;
     }while(1);
-    int cause=r<0?errno:0;
     if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
     if (r > 0)return (int)r;
-    s->transport_errno=cause;s->transport_eof=r==0;
+    s->transport_errno=r<0?(int)-r:0;s->transport_eof=r==0;
+    if(r<0)errno=s->transport_errno;
     if(r==0)snprintf(s->err,sizeof s->err,"peer closed connection%s",
                      s->handshaking?" during TLS handshake":"");
     else snprintf(s->err,sizeof s->err,"%s%s",
                   s->handshaking?"TLS handshake: ":"",
-                  s->transport_errno==EAGAIN||s->transport_errno==ETIMEDOUT?"timed out":strerror(s->transport_errno));
+                  r==-N_ERR_NOT_READY?"timed out":n_result_text(r));
     return -1;
 }
 
@@ -150,19 +157,19 @@ static int sock_write(void *ctx, const unsigned char *buf, size_t len) {
         if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
         return -1;
     }
-    long r;
+    n_result r;
     do {
         uint64_t deadline=s->io_limited?s->io_deadline:0;
         if(s->cancelled){uint64_t slice=uptime_ms()+100;if(!deadline||slice<deadline)deadline=slice;}
         r=tcp_send_until(s->sock,buf,len,deadline);
-        if(r>=0||errno!=ETIMEDOUT||!s->cancelled)break;
+        if(r>=0||r!=-N_ERR_TIMEOUT||!s->cancelled)break;
         if(io_timeout(s,&timeout)<0)return -1;
     }while(1);
-    int cause=r<0?errno:0;
     if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
     if (r > 0){s->bytes_sent+=(uint64_t)r;return (int)r;}
-    s->transport_errno=cause;s->transport_eof=r==0;
-    snprintf(s->err,sizeof s->err,"%s",r==0?"connection closed while sending":strerror(s->transport_errno));
+    s->transport_errno=r<0?(int)-r:0;s->transport_eof=r==0;
+    if(r<0)errno=s->transport_errno;
+    snprintf(s->err,sizeof s->err,"%s",r==0?"connection closed while sending":n_result_text(r));
     return -1;
 }
 
@@ -206,15 +213,16 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     if(cancelled&&cancelled(cancel_ctx)){errno=ECANCELED;snprintf(err,errlen,"request cancelled");return NULL;}
     if (!net_wait_up(5000)) {
         if(timing)timing->resolve_ms=uptime_ms()-resolve_started;
-        snprintf(err, errlen, "network is down");
+        errno=N_ERR_NETWORK_DOWN;snprintf(err, errlen, "network is down");
         return NULL;
     }
     uint32_t first[16],*ips=first;
     struct n_dns_result dns;
-    if (net_resolve_all(host, first,16,&dns) < 0) {
-        int cause=errno;
+    n_result resolved=net_resolve_all(host, first,16,&dns);
+    if (resolved < 0) {
         if(timing)timing->resolve_ms=uptime_ms()-resolve_started;
-        snprintf(err, errlen, "%s: %s", host, cause == ENOENT ? "host not found" : strerror(cause));
+        errno=(int)-resolved;
+        snprintf(err, errlen, "%s: %s", host, resolved == -N_ERR_NOT_FOUND ? "host not found" : n_result_text(resolved));
         return NULL;
     }
     size_t count=dns.count;
@@ -222,7 +230,11 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         if(count>SIZE_MAX/sizeof *ips || !(ips=malloc(count*sizeof *ips))) {
             errno=ENOMEM;snprintf(err,errlen,"out of memory resolving host");return NULL;
         }
-        if(net_resolve_all(host,ips,count,&dns)<0){free(ips);return NULL;}
+        resolved=net_resolve_all(host,ips,count,&dns);
+        if(resolved<0){
+            free(ips);errno=(int)-resolved;
+            snprintf(err,errlen,"%s: %s",host,n_result_text(resolved));return NULL;
+        }
         if(dns.count<count)count=dns.count;
     }
     /* Preserve the established TCP-only connect policy. TLS has always used
@@ -232,30 +244,30 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     uint64_t connect_started=uptime_ms();
     if(timing){timing->resolve_ms=connect_started-resolve_started;timing->phase=HTTP_PHASE_CONNECT;}
     uint64_t connect_deadline=connect_started+(uint64_t)connect_ms;
-    int sock=-1;uint32_t attempts=0,peer_ip=0;
+    n_result sock=-N_ERR_NOT_FOUND;uint32_t attempts=0,peer_ip=0;
     for(size_t i=0;i<count;i++) {
-        uint64_t now=uptime_ms();if(now>=connect_deadline){errno=ETIMEDOUT;break;}
+        uint64_t now=uptime_ms();if(now>=connect_deadline){sock=-N_ERR_TIMEOUT;break;}
         /* An unresponsive first address must leave later DNS candidates a
            fair share of the one connect deadline. */
         uint64_t left=connect_deadline-now,remaining=count-i;
         int allowance=(int)(left/remaining);if(allowance<1)allowance=1;
         attempts++;sock=tcp_connect(ips[i],port,allowance);if(sock>=0){peer_ip=ips[i];break;}
-        if(errno!=ETIMEDOUT&&errno!=ECONNREFUSED&&errno!=EHOSTUNREACH&&errno!=ENETUNREACH)break;
+        if(sock!=-N_ERR_TIMEOUT&&sock!=-N_ERR_CONNECTION_REFUSED&&sock!=-N_ERR_UNREACHABLE)break;
     }
     if(ips!=first)free(ips);
-    int connect_error=sock<0?errno:0;
     if(timing){tls_started=uptime_ms();timing->connect_ms=tls_started-connect_started;}
     if (sock < 0) {
-        snprintf(err, errlen, "connect to %s:%d: %s", host, port, strerror(connect_error));
+        errno=(int)-sock;
+        snprintf(err, errlen, "connect to %s:%d: %s", host, port, n_result_text(sock));
         return NULL;
     }
     net_stream *s = calloc(1, tls ? sizeof *s : offsetof(net_stream, cc));
     if (!s) {
-        tcp_close(sock);
+        tcp_close((n_handle)sock);
         snprintf(err, errlen, "out of memory");
         return NULL;
     }
-    s->sock = sock;
+    s->sock = (n_handle)sock;
     s->connection=(struct ns_connection_info){1,(uint32_t)count,attempts,peer_ip};
     s->tls = tls;
     s->http_alpn=http;
@@ -316,7 +328,7 @@ fail:
     if(timing){timing->tls_ms=uptime_ms()-tls_started;
         timing->tls_other_ms=timing->tls_ms>=timing->tls_io_ms?timing->tls_ms-timing->tls_io_ms:0;}
     snprintf(err, errlen, "%s", s->err);
-    tcp_close(sock);
+    tcp_close(s->sock);
     free(s->session_key);
     free(s);
     return NULL;
@@ -365,15 +377,19 @@ long ns_write(net_stream *s, const void *buf, size_t n) {
 long ns_read(net_stream *s, void *buf, size_t n) {
     if (!s->tls) {
         io_begin(s,s->timeout_ms);
-        int timeout;long r=-1;
+        int timeout;
         while(io_timeout(s,&timeout)==0) {
             int slice=s->cancelled&&(timeout<0||timeout>100)?100:timeout;
-            r=tcp_recv(s->sock,buf,n,slice);
-            if(r>=0||(errno!=EAGAIN&&errno!=ETIMEDOUT)||slice==timeout)break;
+            n_result r=tcp_recv(s->sock,buf,n,slice);
+            if(r<0&&(r==-N_ERR_NOT_READY||r==-N_ERR_TIMEOUT)&&slice!=timeout)continue;
+            s->io_limited=false;
+            if(r>=0)return r;
+            errno=(int)-r;
+            snprintf(s->err, sizeof s->err, "%s", r == -N_ERR_NOT_READY ? "timed out" : n_result_text(r));
+            return -1;
         }
         s->io_limited=false;
-        if (r < 0) snprintf(s->err, sizeof s->err, "%s", errno == EAGAIN ? "timed out" : strerror(errno));
-        return r;
+        return -1; /* io_timeout set errno and the message */
     }
     io_begin(s,s->timeout_ms);
     int r = br_sslio_read(&s->io, buf, n);
@@ -387,8 +403,9 @@ long ns_read(net_stream *s, void *buf, size_t n) {
 long ns_try_read(net_stream *s,void *buf,size_t n) {
     if(io_cancelled(s))return -1;
     if(!s->tls) {
-        long got=tcp_recv(s->sock,buf,n,0);
-        if(got<0&&errno==EAGAIN)return -2;
+        n_result got=tcp_recv(s->sock,buf,n,0);
+        if(got==-N_ERR_NOT_READY)return -2;
+        if(got<0){errno=(int)-got;return -1;}
         return got;
     }
     for(unsigned steps=0;steps<32;steps++) {
@@ -404,19 +421,18 @@ long ns_try_read(net_stream *s,void *buf,size_t n) {
         }
         if(state&BR_SSL_SENDREC) {
             p=br_ssl_engine_sendrec_buf(&s->cc.eng,&size);
-            long got=tcp_send_some(s->sock,p,size);
-            if(got<0&&errno==EAGAIN)return -2;
-            if(got<=0){s->transport_errno=errno?errno:ECONNRESET;set_tls_error(s);return -1;}
+            n_result got=tcp_send_some(s->sock,p,size);
+            if(got==-N_ERR_NOT_READY)return -2;
+            if(got<=0){transport_failed(s,got);set_tls_error(s);return -1;}
             s->bytes_sent+=(uint64_t)got;
             br_ssl_engine_sendrec_ack(&s->cc.eng,(size_t)got);continue;
         }
         if(state&BR_SSL_RECVREC) {
             p=br_ssl_engine_recvrec_buf(&s->cc.eng,&size);
-            long got=tcp_recv(s->sock,p,size,0);
-            if(got<0&&errno==EAGAIN)return -2;
+            n_result got=tcp_recv(s->sock,p,size,0);
+            if(got==-N_ERR_NOT_READY)return -2;
             if(got<=0) {
-                s->transport_errno=errno=got==0?ECONNRESET:errno;
-                snprintf(s->err,sizeof s->err,"TLS transport: %s",strerror(errno));return -1;
+                snprintf(s->err,sizeof s->err,"TLS transport: %s",n_result_text(transport_failed(s,got)));return -1;
             }
             br_ssl_engine_recvrec_ack(&s->cc.eng,(size_t)got);continue;
         }
@@ -439,11 +455,10 @@ long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,volatile uint3
     if(io_cancelled(s))return -1;
     if(!s->tls) {
         if(lock)ns_engine_unlock(lock);
-        long got=tcp_recv(s->sock,buf,n,timeout_ms);int cause=errno;
+        n_result got=tcp_recv(s->sock,buf,n,timeout_ms);
         if(lock)ns_engine_lock(lock);
-        errno=cause;
-        if(got<0&&(errno==EAGAIN||errno==ETIMEDOUT))return -2;
-        if(got<0)snprintf(s->err,sizeof s->err,"%s",strerror(errno));
+        if(got==-N_ERR_NOT_READY||got==-N_ERR_TIMEOUT)return -2;
+        if(got<0){errno=(int)-got;snprintf(s->err,sizeof s->err,"%s",n_result_text(got));return -1;}
         return got;
     }
     for(unsigned steps=0;steps<32;steps++) {
@@ -453,14 +468,13 @@ long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,volatile uint3
         if(!(state&BR_SSL_RECVREC)||(state&BR_SSL_SENDREC))return -2;
         size_t size;unsigned char *p=br_ssl_engine_recvrec_buf(&s->cc.eng,&size);
         if(lock)ns_engine_unlock(lock);
-        got=tcp_recv(s->sock,p,size,timeout_ms);int cause=errno;
+        n_result received=tcp_recv(s->sock,p,size,timeout_ms);
         if(lock)ns_engine_lock(lock);
-        errno=cause;
-        if(got<0&&(errno==EAGAIN||errno==ETIMEDOUT))return -2;
-        if(got<=0) {
-            s->transport_errno=errno=got==0?ECONNRESET:errno;
-            snprintf(s->err,sizeof s->err,"TLS transport: %s",strerror(errno));return -1;
+        if(received==-N_ERR_NOT_READY||received==-N_ERR_TIMEOUT)return -2;
+        if(received<=0) {
+            snprintf(s->err,sizeof s->err,"TLS transport: %s",n_result_text(transport_failed(s,received)));return -1;
         }
+        got=received;
         br_ssl_engine_recvrec_ack(&s->cc.eng,(size_t)got);
         timeout_ms=0;
     }
@@ -469,19 +483,19 @@ long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,volatile uint3
 long ns_try_write(net_stream *s,const void *buf,size_t n) {
     if(io_cancelled(s))return -1;
     if(!s->tls) {
-        if(!n)return 0;long got=tcp_send_some(s->sock,buf,n);
-        if(got<0&&errno==EAGAIN)return -2;
-        if(got>0)s->bytes_sent+=(uint64_t)got;
-        else if(got<0)snprintf(s->err,sizeof s->err,"%s",strerror(errno));
+        if(!n)return 0;n_result got=tcp_send_some(s->sock,buf,n);
+        if(got==-N_ERR_NOT_READY)return -2;
+        if(got<0){errno=(int)-got;snprintf(s->err,sizeof s->err,"%s",n_result_text(got));return -1;}
+        s->bytes_sent+=(uint64_t)got;
         return got;
     }
     for(unsigned steps=0;steps<32;steps++) {
         unsigned state=br_ssl_engine_current_state(&s->cc.eng);size_t size;unsigned char *p;
         if(state&BR_SSL_CLOSED){set_tls_error(s);if(!errno)errno=ECONNRESET;return -1;}
         if(state&BR_SSL_SENDREC) {
-            p=br_ssl_engine_sendrec_buf(&s->cc.eng,&size);long got=tcp_send_some(s->sock,p,size);
-            if(got<0&&errno==EAGAIN)return -2;
-            if(got<=0){s->transport_errno=errno?errno:ECONNRESET;set_tls_error(s);return -1;}
+            p=br_ssl_engine_sendrec_buf(&s->cc.eng,&size);n_result got=tcp_send_some(s->sock,p,size);
+            if(got==-N_ERR_NOT_READY)return -2;
+            if(got<=0){transport_failed(s,got);set_tls_error(s);return -1;}
             s->bytes_sent+=(uint64_t)got;br_ssl_engine_sendrec_ack(&s->cc.eng,(size_t)got);continue;
         }
         if(state&BR_SSL_SENDAPP) {

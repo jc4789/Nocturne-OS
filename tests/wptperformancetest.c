@@ -190,7 +190,7 @@ static bool wait_request(void *opaque,uint64_t id,const bool *complete) {
         bool found=false;
         for(struct pending *p=r->pending;p;p=p->next)if(p->native_id==id){found=true;break;}
         if(!found)return false;
-        webnet_pump(r->net,uptime_ms());if(!*complete)msleep(1);
+        webnet_pump(r->net,uptime_ms());if(!*complete)n_sleep_ms(1);
     }
     return *complete;
 }
@@ -207,7 +207,7 @@ static bool sync_request(void *opaque,const struct web_request *in,struct web_re
         .same_origin=in->same_origin,.redirect_error=in->redirect_error,.cache_mode=(enum webnet_cache)in->cache_mode};
     uint64_t id=webnet_submit(r->net,&request,sync_complete,&m);
     if(!id)return false;
-    while(!m.done && uptime_ms()<r->deadline){webnet_pump(r->net,uptime_ms());if(!m.done)msleep(1);}
+    while(!m.done && uptime_ms()<r->deadline){webnet_pump(r->net,uptime_ms());if(!m.done)n_sleep_ms(1);}
     if(!m.done||!m.valid){webnet_cancel(r->net,id);web_response_free(&m.response);return false;}
     *out=m.response;return !out->error[0]&&out->status>=200&&out->status<300;
 }
@@ -261,7 +261,7 @@ static bool run_case(const char *base,const struct original *original,unsigned *
     struct webnet_request nav={.kind=WEBNET_NAVIGATION,.generation=1,.url=url,.origin=url,
         .method="GET",.user_navigation=true,.credentials=WEBNET_CREDENTIALS_SAME_ORIGIN};
     if(!webnet_submit(r.net,&nav,navigation_complete,&r))goto end;
-    while(!r.navigation_done&&uptime_ms()-begin<CASE_MS){webnet_pump(r.net,uptime_ms());msleep(1);}
+    while(!r.navigation_done&&uptime_ms()-begin<CASE_MS){webnet_pump(r.net,uptime_ms());n_sleep_ms(1);}
     if(!r.navigation_done||r.infrastructure)goto end;
     r.deadline=begin+CASE_MS;
     struct web_host host={.opaque=&r,.request=request,.cancel=cancel,.release_request=cancel,
@@ -281,7 +281,7 @@ static bool run_case(const char *base,const struct original *original,unsigned *
         if(dirty)web_layout(r.doc,VIEW_W,VIEW_H);
         if(dirty||paint){canvas_t canvas;gfx_init(&canvas,r.pixels,VIEW_W,VIEW_H,VIEW_W);
             web_paint(r.doc,&canvas,0,0,VIEW_W,VIEW_H,r.scroll_x,r.scroll_y);}
-        msleep(1);
+        n_sleep_ms(1);
     }
     *results+=r.result_count;*failed+=r.failed;
     ok=r.complete&&r.observer_ready&&r.harness_status==0&&r.result_count==original->tests&&
@@ -303,7 +303,7 @@ static bool render_reference(const char *base,const struct original *original,ui
     struct webnet_request nav={.kind=WEBNET_NAVIGATION,.generation=1,.url=url,.origin=url,
         .method="GET",.user_navigation=true,.credentials=WEBNET_CREDENTIALS_SAME_ORIGIN};
     if(!webnet_submit(r.net,&nav,navigation_complete,&r))goto end;
-    while(!r.navigation_done&&uptime_ms()-begin<CASE_MS){webnet_pump(r.net,uptime_ms());msleep(1);}
+    while(!r.navigation_done&&uptime_ms()-begin<CASE_MS){webnet_pump(r.net,uptime_ms());n_sleep_ms(1);}
     if(!r.navigation_done||r.infrastructure)goto end;
     r.deadline=begin+CASE_MS;
     struct web_host host={.opaque=&r,.request=request,.cancel=cancel,.release_request=cancel,
@@ -323,7 +323,7 @@ static bool render_reference(const char *base,const struct original *original,ui
             web_paint(r.doc,&canvas,0,0,VIEW_W,VIEW_H,0,0);
             if(!web_dirty(r.doc)&&!web_paint_dirty(r.doc))settled++;else settled=0;
         }else settled=0;
-        if(settled<2)msleep(1);
+        if(settled<2)n_sleep_ms(1);
     }
     ok=r.complete&&r.observer_ready&&settled==2&&!r.infrastructure;
     if(ok){*pixels=r.pixels;r.pixels=NULL;}

@@ -21,8 +21,8 @@ int main(int argc,char **argv) {
     if (!frames) return 1;
     int sw,sh,gw,gh;
     if (screen_size(&sw,&sh)<0 || screen_grab(NULL,0,&gw,&gh)<0) return 1;
-    window_t *win=win_open(sw/2,sh/2,"二重バッファ: 解放通知・画素確認",WIN_DOUBLE_BUFFER);
-    if (!win) return 1;
+    window_t *win;
+    if (win_open(sw/2,sh/2,"二重バッファ: 解放通知・画素確認",WIN_DOUBLE_BUFFER,&win)<0) return 1;
     win_move(win,sw/4,sh/4);
     uint32_t *screen=malloc((size_t)gw*gh*sizeof *screen);
     int result=1;
@@ -80,7 +80,7 @@ int main(int argc,char **argv) {
     printf("wmframetest: PASS second-only-map resize destroy\n");
     printf("wmframetest: PASS frames=%lu elapsed_ms=%lu indexed-copy-free=1 releases=checked other-buffer=isolated screen-grab=correct\n",frames,(unsigned long)(uptime_ms()-start));
     printf("wmframetest: READY visual hold_ms=%lu\n",hold);
-    msleep(hold);
+    n_sleep_ms(hold);
     result=0;
 done:
     free(screen);win_close(win);

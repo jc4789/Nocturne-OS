@@ -45,7 +45,7 @@ int main(void) {
             "https://canvas-probe.test/private?private=not-logged", "utf-8", &host);
         check("document allocated", d != NULL); if (!d) continue;
         /* Match the real browser's incremental parser/task lifecycle. */
-        for (int i = 0; i < 8; i++) { web_tick(d, uptime_ms()); msleep(1); }
+        for (int i = 0; i < 8; i++) { web_tick(d, uptime_ms()); n_sleep_ms(1); }
         web_layout(d, 100, 100);
         check("native JS evaluated", web_console_eval(d, source, sizeof source - 1));
         check("no runtime exception", errors == 0);

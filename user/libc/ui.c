@@ -2048,8 +2048,8 @@ static void open_window(struct ui_session *s, uint32_t id, uint32_t width, uint3
     else {
         memcpy(name, title.p, title.n);
         name[title.n] = 0;
-        w->win = win_open((int)width, (int)height, name, (int)(flags & UI_WINDOW_FLAGS));
-        if (!w->win) { result = -N_ERR_UNSUPPORTED; free(w); w = NULL; }
+        result = win_open((int)width, (int)height, name, (int)(flags & UI_WINDOW_FLAGS), &w->win);
+        if (result < 0) { free(w); w = NULL; }
     }
     free(name);
     if (w) {

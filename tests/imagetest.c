@@ -76,7 +76,7 @@ int main(int argc,char **argv){
     state.doc=web_live(html,strlen(html),"http://image.fixture/index.html","utf-8",&host);free(html);
     if(!state.doc){puts("FAIL Image document allocation");return 1;}
     uint64_t deadline=uptime_ms()+15000;
-    while(!state.done&&uptime_ms()<deadline){deliver();web_tick(state.doc,uptime_ms());web_layout(state.doc,800,600);msleep(1);}
+    while(!state.done&&uptime_ms()<deadline){deliver();web_tick(state.doc,uptime_ms());web_layout(state.doc,800,600);n_sleep_ms(1);}
     if(!state.done){state.failures++;puts("FAIL Image test timeout");}
     if(state.images<5||state.completions<5){state.failures++;puts("FAIL detached image transport was not exercised");}
     web_free(state.doc);

@@ -30,9 +30,9 @@ n_result wait_on_address(volatile uint32_t *p,uint32_t expected,unsigned timeout
 n_result wake_address(volatile uint32_t *p,unsigned count){(void)p;(void)count;return 0;}
 long cache_test_read(int fd,void *data,size_t bytes){(void)fd;(void)data;(void)bytes;read_calls++;return 0;}
 int cache_test_close(int fd){(void)fd;CHECK(setup_calls==2&&setup_fds[1]==-1);close_calls++;return 0;}
-int net_set_setup_cancel_channel(int fd){
+n_result net_set_setup_cancel_channel(n_handle fd){
     CHECK(setup_calls<4);setup_fds[setup_calls++]=fd;
-    return fd>=0&&fail_setup?-1:0;
+    return fd>=0&&fail_setup?-N_ERR_INVALID:0;
 }
 int poll(struct n_pollfd *p,int count,int timeout){(void)timeout;for(int i=0;i<count;i++)p[i].revents=peer_hup?N_POLLHUP:0;return peer_hup?count:0;}
 const char *http_response_headers(const struct http_resp *r){return r->headers_full?r->headers_full:r->headers;}
