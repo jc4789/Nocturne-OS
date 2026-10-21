@@ -49,8 +49,9 @@ static bool region_registered(const struct shared_region *region) {
 static struct shared_region *region_map(n_handle handle, size_t bytes, int access) {
     struct shared_region *region = calloc(1, sizeof *region);
     if (!region) { n_handle_close(handle); return NULL; }
-    region->data = n_shared_map(handle, bytes, access);
-    if (!region->data) { n_handle_close(handle); free(region); return NULL; }
+    void *mapping;
+    if (n_shared_map(handle, bytes, access, &mapping) < 0) { n_handle_close(handle); free(region); return NULL; }
+    region->data = mapping;
     region->bytes = bytes; region->handle = handle;
     region->next = regions; regions = region;
     return region;

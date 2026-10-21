@@ -218,9 +218,11 @@ static void video_io(nmedia_mse_worker *w){
        !nmsw_shared_size(v->shared_capacity,&shared_bytes)){if(attached>=0)n_handle_close(attached);stop(w,"invalid MSE VIDEO wire");return;}
     if(fresh){
         /* The mapping keeps the pages; the handle is not needed after it. */
-        struct nmsw_shared_video *shared=n_shared_map(attached,shared_bytes,N_MEMORY_READ_WRITE);
+        void *mapping;
+        n_result mapped=n_shared_map(attached,shared_bytes,N_MEMORY_READ_WRITE,&mapping);
         n_handle_close(attached);
-        if(!shared){stop(w,"MSE shared VIDEO import failed");return;}
+        if(mapped<0){stop(w,"MSE shared VIDEO import failed");return;}
+        struct nmsw_shared_video *shared=mapping;
         if(w->shared_video)n_memory_release(w->shared_video,w->video_shared_bytes);
         w->shared_video=shared;w->video_shared_bytes=shared_bytes;w->video_shared_id=v->shared_id;
     }else if(shared_bytes!=w->video_shared_bytes){stop(w,"MSE shared VIDEO geometry changed without a new owner");return;}

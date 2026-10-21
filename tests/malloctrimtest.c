@@ -20,11 +20,12 @@ _Alignas(4096) static unsigned char model_pool[POOL_PAGES*TEST_PAGE];
 static unsigned char model_state[POOL_PAGES+1]; /* 0 free, 1 reserved, 2 guard; the extra entry is past the pool */
 static unsigned model_reserves, model_releases;
 static int model_reject_reserve, model_reject_release;
-void *n_memory_reserve(size_t bytes, int access) {
+n_result n_memory_reserve(size_t bytes, int access, void **memory) {
     size_t pages=(bytes+TEST_PAGE-1)/TEST_PAGE;
-    if(!bytes || access!=N_MEMORY_READ_WRITE){errno=EINVAL;return NULL;}
+    *memory=NULL;
+    if(!bytes || access!=N_MEMORY_READ_WRITE)return -N_ERR_INVALID;
     model_reserves++;
-    if(model_reject_reserve || pages>=POOL_PAGES){errno=ENOMEM;return NULL;}
+    if(model_reject_reserve || pages>=POOL_PAGES)return -N_ERR_NO_MEMORY;
     for(size_t first=0;first+pages<POOL_PAGES;first++) {
         size_t k=0;
         while(k<=pages && model_state[first+k]==0)k++;
@@ -32,18 +33,19 @@ void *n_memory_reserve(size_t bytes, int access) {
         memset(model_state+first,1,pages);
         model_state[first+pages]=2;
         memset(model_pool+first*TEST_PAGE,0,pages*TEST_PAGE);
-        return model_pool+first*TEST_PAGE;
+        *memory=model_pool+first*TEST_PAGE;
+        return 0;
     }
-    errno=ENOMEM;return NULL;
+    return -N_ERR_NO_MEMORY;
 }
-int n_memory_release(void *addr, size_t bytes) {
+n_result n_memory_release(void *addr, size_t bytes) {
     uintptr_t a=(uintptr_t)addr,base=(uintptr_t)model_pool;
     model_releases++;
-    if(!bytes || (a&(TEST_PAGE-1)) || a<base || a>=base+sizeof model_pool){errno=EINVAL;return -1;}
+    if(!bytes || (a&(TEST_PAGE-1)) || a<base || a>=base+sizeof model_pool)return -N_ERR_INVALID;
     size_t first=(a-base)/TEST_PAGE,pages=(bytes+TEST_PAGE-1)/TEST_PAGE;
-    if(pages>POOL_PAGES-first){errno=EINVAL;return -1;}
-    for(size_t k=0;k<pages;k++)if(model_state[first+k]!=1){errno=EINVAL;return -1;}
-    if(model_reject_release){errno=ENOMEM;return -1;}
+    if(pages>POOL_PAGES-first)return -N_ERR_INVALID;
+    for(size_t k=0;k<pages;k++)if(model_state[first+k]!=1)return -N_ERR_INVALID;
+    if(model_reject_release)return -N_ERR_NO_MEMORY;
     memset(model_pool+first*TEST_PAGE,0xdd,pages*TEST_PAGE);
     memset(model_state+first,0,pages);
     if(model_state[first+pages]==2 && first+pages<POOL_PAGES) {

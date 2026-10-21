@@ -10,7 +10,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <errno.h>
 #include "nocturne.h"
 
 #define HDR      16
@@ -174,16 +173,11 @@ static bool trim(blk *b) {
     blk *end = next_blk(b);
     if (!is_end(end)) return false;
     size_t size = bsize(b);
-    int saved_errno = errno;
     if (!b->prev && end != newest_end) {
         /* the region is wholly free: regions start at the first block */
-        if (n_memory_release(b, size + HDR) == 0) {
-            heap_total -= size + HDR;
-            errno = saved_errno;
-            return true;
-        }
-        errno = saved_errno;
-        return false;
+        if (n_memory_release(b, size + HDR) < 0) return false;
+        heap_total -= size + HDR;
+        return true;
     }
     /* Keep one growth quantum warm in the newest region: the one grow() would
        reserve next, so freeing and reallocating a block of up to that size never
@@ -204,7 +198,6 @@ static bool trim(blk *b) {
         marker->prev = bsize(b);
         if (end == newest_end) newest_end = marker;
     }
-    errno = saved_errno;
     return false;
 }
 
@@ -215,8 +208,9 @@ static int grow(size_t need) {
     size_t step = grow_step();
     size_t n = need + HDR > step ? need + HDR : step;
     n = (n + PAGE - 1) & ~(size_t)(PAGE - 1);
-    blk *b = n_memory_reserve(n, N_MEMORY_READ_WRITE);
-    if (!b) return -1;
+    void *region;
+    if (n_memory_reserve(n, N_MEMORY_READ_WRITE, &region) < 0) return -1;
+    blk *b = region;
     heap_total += n;
     b->prev = 0;
     b->size = n - HDR; /* free */
@@ -277,8 +271,9 @@ static void free_locked(void *p) {
 static void *map_alloc(size_t n) {
     if (n > ((size_t)1 << 40)) return NULL;
     size_t total = (n + HDR + PAGE - 1) & ~(size_t)(PAGE - 1);
-    blk *b = n_memory_reserve(total, N_MEMORY_READ_WRITE);
-    if (!b) return NULL;
+    void *region;
+    if (n_memory_reserve(total, N_MEMORY_READ_WRITE, &region) < 0) return NULL;
+    blk *b = region;
     b->size = total | MAPPED | USED;
     b->prev = 0;
     __atomic_add_fetch(&mapped_total, total, __ATOMIC_RELAXED);
@@ -345,7 +340,6 @@ void *malloc(size_t n) {
 }
 void free(void *p) {
     if (!p) return;
-    int saved_errno = errno;
     blk *b = (blk *)((char *)p - HDR);
     if (b->size & MAPPED) map_free(b);
     else {
@@ -353,7 +347,6 @@ void free(void *p) {
         free_locked(p);
         heap_unlock();
     }
-    errno = saved_errno;
 }
 void malloc_usage(size_t *heap, size_t *used) {
     size_t mapped = __atomic_load_n(&mapped_total, __ATOMIC_RELAXED);
@@ -373,10 +366,7 @@ void *realloc(void *p, size_t n) {
             size_t keep = (n + HDR + PAGE - 1) & ~(size_t)(PAGE - 1);
             if (n >= MAP_MIN && keep < bsize(b)) {
                 size_t release = bsize(b) - keep;
-                int saved_errno = errno;
-                bool released = n_memory_release((char *)b + keep, release) == 0;
-                errno = saved_errno;
-                if (released) {
+                if (n_memory_release((char *)b + keep, release) == 0) {
                     __atomic_sub_fetch(&mapped_total, release, __ATOMIC_RELAXED);
                     b->size = keep | MAPPED | USED;
                 }

@@ -202,7 +202,9 @@ static void resource_worker(void *arg) {
         struct n_clockinfo clock = {0};
         if (clock_info(&clock) || clock.reference_page != resource_clock_page)
             resource_failed(id, RC_CLOCK, (long)clock.reference_page);
-        unsigned char *map = n_memory_reserve(4096, N_MEMORY_READ_WRITE);
+        void *page;
+        n_memory_reserve(4096, N_MEMORY_READ_WRITE, &page);
+        unsigned char *map = page;
         resource_maps[id][round] = map;
         if (!map) { resource_failed(id, RC_RESERVE, 0); continue; }
         memset(map, (int)id + 19, 4096);
@@ -362,8 +364,9 @@ int main(int argc, char **argv) {
     errno = 701;
     thread_local_set(7, (void *)(uintptr_t)9001);
     for (unsigned i = 0; i < THREADS; i++) {
-        tids[i] = thread_create(worker, (void *)(uintptr_t)i);
-        if (tids[i] < 0) { printf("threadtest: create failed errno=%d\n", errno); return 1; }
+        n_result tid = thread_create(worker, (void *)(uintptr_t)i);
+        if (tid < 0) { printf("threadtest: create failed: %s\n", n_result_text(tid)); return 1; }
+        tids[i] = (int)tid;
     }
     while (entered != THREADS) {
         unsigned before = entered;
@@ -458,8 +461,7 @@ int main(int argc, char **argv) {
     }
     if (clock.flags & N_CLOCK_HV_REFERENCE) {
         if (!clock.reference_page ||
-            n_memory_protect((void *)(uintptr_t)clock.reference_page, 4096, N_MEMORY_READ_WRITE) != -1 ||
-            errno != EPERM) bad++;
+            n_memory_protect((void *)(uintptr_t)clock.reference_page, 4096, N_MEMORY_READ_WRITE) != -N_ERR_DENIED) bad++;
     }
     printf("threadtest: CPU mask=%x active=%u shared malloc/TLS/handle/wait %s errors=%u\n",
            cpu_mask, active, !bad && !failures ? "PASS" : "FAIL", failures + bad);

@@ -33,7 +33,6 @@ static int listener_calls, watches, listener_closes;
 static bool legacy_busy;
 FILE *stdout; /* The native FILE global is not MinGW's __acrt_iob_func(). */
 int fflush(FILE *stream) { (void)stream; return 0; }
-int *__errno_location(void) { static int native_errno; return &native_errno; }
 
 /* The original statically linked clients have this exact wire layout. */
 struct legacy_header {
@@ -77,7 +76,7 @@ n_result n_handle_close(n_handle h) {
     return 0;
 }
 n_result n_events_unwatch(n_handle q, uint64_t token) { (void)q; (void)token; return 0; }
-int n_memory_release(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
+n_result n_memory_release(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
 n_handle n_channel_connect(const char *name) { snprintf(connected_name, sizeof connected_name, "%s", name); return connect_result; }
 n_handle n_channel_listen(const char *name) {
     listener_calls++;
@@ -98,16 +97,18 @@ n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t time
     return -N_ERR_CANCELLED;
 }
 n_handle n_shared_reserve(size_t bytes) { (void)bytes; return reserve_result; }
-void *n_shared_map(n_handle h, size_t bytes, int access) {
+n_result n_shared_map(n_handle h, size_t bytes, int access, void **mapping) {
     (void)bytes;
-    if (h == 43 && fail_arena_map) { errno = N_ERR_NO_MEMORY; return NULL; }
+    *mapping = NULL;
+    if (h == 43 && fail_arena_map) return -N_ERR_NO_MEMORY;
     if (h == 42) {
         map_access = access; map_calls++;
-        if (access != N_MEMORY_READ) return NULL; /* native maximum RO fixture */
+        if (access != N_MEMORY_READ) return -N_ERR_DENIED; /* native maximum RO fixture */
     }
-    return shared_page;
+    *mapping = shared_page;
+    return 0;
 }
-int pcilist(struct n_pciinfo *list, int capacity) {
+n_result pcilist(struct n_pciinfo *list, int capacity) {
     /* The ready GPU follows several non-display entries, so truncation misses it. */
     struct n_pciinfo entries[] = {
         {.vendor = 0x1234}, {.vendor = 0x10de, .cls = 0x04},
@@ -351,7 +352,8 @@ int main(void) {
     rm_result = NV_OK;
     /* Old binaries always requested RW mapping. The new server's immutable RO
        view must reject that, not relax protection for compatibility. */
-    CHECK(!n_shared_map(42, N_PAGE_SIZE, N_MEMORY_READ_WRITE));
+    void *refused;
+    CHECK(n_shared_map(42, N_PAGE_SIZE, N_MEMORY_READ_WRITE, &refused) == -N_ERR_DENIED && !refused);
 
     legacy_busy = true;
     CHECK(nvrm_serve(N_PCI_TARGET(2, 1, 0)) == -N_ERR_CANCELLED);

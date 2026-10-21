@@ -143,6 +143,23 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
+- 2026-10-21：ドライバー（`ports/nvidia`）と NVK の nvkmd（`nvkmd_nocturne_rm.c`）から `errno` と `msleep` を
+  除いた。POSIX の「-1＋errno」ではなく、Nocturne のネイティブ関数が失敗を負の `n_result` で返す形に
+  ドライバーが使う関数をそろえた：`n_shared_map(h, bytes, access, &mapping)`、
+  `n_memory_reserve(bytes, access, &memory)`、`n_memory_release`、`n_memory_protect`、`thread_create`、
+  `thread_join`、`cpu_info`、`clock_info`、`pcilist`（どれも errno に触れない）。待ちは `n_sleep_ms`。
+  C11 の `thrd_create` は `thread_create` の結果から `thrd_nomem`／`thrd_error` を決める。全呼出し側
+  （libc、malloc、アプリ、wabt・tinycc・Mesa の移植部、Rust std の移植、試験）を同じ形へ直し、
+  malloc の errno 退避も不要になったので消した。
+  確認：host 試験（nvrm_dma・contract・transport、nvk_rm、malloc の模型）0 failed。全媒体を警告の
+  増加なしでビルドし、Rust std を作り直した。QEMU（q35＋VT-d、WHPX、4 コア、4096 MiB、AHCI 起動、
+  snapshot）で `pcitest`・`nvrmtest`・`pcitest flr`・`nvrm_servetest`（127 本受け、33 本断る）・
+  `sharedpagetest`・`nativeabitest`・`wxtest`・`threadtest` が 0 failed。ブラウザーで JavaScript demo への
+  クリック、Alt+Left、ホイールの下と上を撮影して見た。今回と関係なく前からの失敗：`memreservetest` の
+  1 TiB 要求（カーネルは 4 GiB を超える要求を N_ERR_INVALID で断り、試験は N_ERR_NO_MEMORY を期待）、
+  `cpuinfotest`（scheduler_cpus ≤ 2 を期待、4 CPU では 4）、`malloctrimtest` の物理ページ数の 3 件
+  （システム全体の空きを測る）。実機は未実施（ユーザー）。
+
 - 2026-10-21：2d0973be への第二の監査（残件 4、新規 3、重複コード、小さな指摘 7）を AMD 48882 3.10、
   Intel D51397-019、PCIe 6.0、PCI Local Bus 3.0 と照合して修理。
   残件：(a) nvrm のクライアントごとのスレッドは上限（プロセスあたり 128）で断るだけで失敗しない。

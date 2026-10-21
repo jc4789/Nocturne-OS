@@ -18,15 +18,14 @@ static struct n_pciinfo pci_list[] = {
 };
 #define CHECK(x) do { if (!(x)) { printf("失敗 %d: %s\n", __LINE__, #x); failures++; } } while (0)
 
-int *__errno_location(void) { static int value; return &value; }
 int mtx_init(mtx_t *m, int type) { (void)m; (void)type; return thrd_success; }
 int mtx_lock(mtx_t *m) { (void)m; return thrd_success; }
 int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
 void mtx_destroy(mtx_t *m) { (void)m; }
 void thrd_yield(void) {}
 
-int pcilist(struct n_pciinfo *out, int capacity) {
-   if (pci_failure) { errno=N_ERR_NO_MEMORY; return -1; }
+n_result pcilist(struct n_pciinfo *out, int capacity) {
+   if (pci_failure) return -N_ERR_NO_MEMORY;
    unsigned count=sizeof(pci_list)/sizeof(pci_list[0]);
    if ((unsigned)capacity<count) count=capacity;
    memcpy(out,pci_list,count*sizeof(*out));

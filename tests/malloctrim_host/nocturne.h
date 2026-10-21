@@ -4,6 +4,7 @@
 #error "The allocator region-model header is only for the host model"
 #endif
 #include <stddef.h>
-#define N_MEMORY_READ_WRITE 2
-void *n_memory_reserve(size_t bytes, int access);
-int n_memory_release(void *addr, size_t bytes);
+#include "../../common/abi.h"
+typedef int64_t n_result;
+n_result n_memory_reserve(size_t bytes, int access, void **memory);
+n_result n_memory_release(void *addr, size_t bytes);

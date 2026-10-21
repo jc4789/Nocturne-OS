@@ -123,8 +123,7 @@ static int rt_mem(TCCState *s1, int size)
 #elif CONFIG_TCC_NOCTURNE
     /* Page-aligned, below 2 GiB: the linked libc objects hold 32-bit absolute
        addresses of their own code and data. */
-    ptr = n_memory_reserve(size, N_MEMORY_READ_WRITE | N_MEMORY_LOW);
-    if (!ptr)
+    if (n_memory_reserve(size, N_MEMORY_READ_WRITE | N_MEMORY_LOW, &ptr) < 0)
         return tcc_error_noabort("tccrun: could not allocate memory");
 #else
     ptr = tcc_malloc(size += PAGESIZE); /* one extra page to align malloc memory */

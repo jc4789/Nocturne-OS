@@ -258,8 +258,8 @@ class JitArena {
     if (!current_ || current_->size - current_->used < need) {
       size_t bytes_needed = (need + kPage - 1) & ~(kPage - 1);
       size_t chunk_size = std::max(kChunk, bytes_needed);
-      void* p = n_memory_reserve(chunk_size, N_MEMORY_READ_WRITE);
-      if (!p) return nullptr;
+      void* p;
+      if (n_memory_reserve(chunk_size, N_MEMORY_READ_WRITE, &p) < 0) return nullptr;
       JitChunk* chunk = new JitChunk{static_cast<u8*>(p), chunk_size, 0, 0};
       if (current_ && current_->live == 0) Unmap(current_);
       current_ = chunk;

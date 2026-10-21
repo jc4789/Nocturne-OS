@@ -2110,8 +2110,10 @@ static void set_surface(struct ui_session *s, uint32_t id, uint32_t width, uint3
         struct surface *fresh = calloc(1, sizeof *fresh);
         size_t bytes = ((size_t)width * height * (deep ? 5 : 4) + 4095) & ~(size_t)4095;
         n_handle shared = fresh ? n_shared_create(bytes) : -1;
-        uint32_t *px = shared >= 0 ? n_shared_map(shared, bytes, N_MEMORY_READ_WRITE) : NULL;
-        if (!px || (!sf && !grow_array((void **)&s->surfaces, &s->capsurfaces, s->nsurfaces + 1, sizeof *s->surfaces))) {
+        void *mapping = NULL;
+        if (shared >= 0) n_shared_map(shared, bytes, N_MEMORY_READ_WRITE, &mapping);
+        uint32_t *px = mapping;
+        if (!px ||(!sf && !grow_array((void **)&s->surfaces, &s->capsurfaces, s->nsurfaces + 1, sizeof *s->surfaces))) {
             if (px) n_memory_release(px, bytes);
             if (shared >= 0) n_handle_close(shared);
             free(fresh);

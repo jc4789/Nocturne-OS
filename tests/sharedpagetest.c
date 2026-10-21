@@ -5,7 +5,6 @@
 #include "nocturne.h"
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 static unsigned checks,failed;
 #define CHECK(x) do{checks++;if(!(x)){failed++;printf("共有ページ失敗 行 %d\n",__LINE__);}}while(0)
 #define BYTES 8193u
@@ -33,7 +32,8 @@ static n_handle launch(const char *self,const char *mode,n_handle *parent_end){
    mapping must outlive this child's handle, mapping and process. */
 static int child(void){
     n_handle h=n_shared_create(BYTES);if(h<0)return 2;
-    unsigned char *p=n_shared_map(h,MAPPED,N_MEMORY_READ_WRITE);if(!p){n_handle_close(h);return 3;}
+    void *m;if(n_shared_map(h,MAPPED,N_MEMORY_READ_WRITE,&m)<0){n_handle_close(h);return 3;}
+    unsigned char *p=m;
     for(size_t i=0;i<BYTES;i++)p[i]=(unsigned char)(i*31u+7);
     if(n_channel_send(0,"shared",6,h)!=6)return 4;
     int ack=0;if(!receive(0,&ack,sizeof ack,NULL)||ack!=1||p[8192]!=0x49)return 5;
@@ -46,7 +46,8 @@ static int child(void){
 static int reader(void){
     n_handle h=-1;char tag[4];
     if(!receive(0,tag,sizeof tag,&h)||h<0||n_handle_kind(h)!=N_KIND_SHARED)return 2;
-    const unsigned char *p=n_shared_map(h,MAPPED,N_MEMORY_READ);if(!p)return 3;
+    void *m;if(n_shared_map(h,MAPPED,N_MEMORY_READ,&m)<0)return 3;
+    const unsigned char *p=m;
     for(size_t i=0;i<BYTES;i++)if(p[i]!=(unsigned char)(i*13u+5))return 4;
     n_handle_close(h);
     if(n_channel_send(0,"r",1,-1)!=1)return 5;
@@ -57,7 +58,8 @@ static int reader(void){
 static int writer_ro(void){
     n_handle h=-1;char tag[4];
     if(!receive(0,tag,sizeof tag,&h)||h<0)return 2;
-    unsigned char *p=n_shared_map(h,MAPPED,N_MEMORY_READ);if(!p)return 3;
+    void *m;if(n_shared_map(h,MAPPED,N_MEMORY_READ,&m)<0)return 3;
+    unsigned char *p=m;
     p[0]=1;
     return 0; /* survived: the mapping was writable */
 }
@@ -67,16 +69,17 @@ int main(int argc,char **argv){
     if(argc>1&&!strcmp(argv[1],"writer-ro"))return writer_ro();
     n_handle h=n_shared_create(BYTES);CHECK(h>=0);if(h<0)return 1;
     CHECK(n_handle_kind(h)==N_KIND_SHARED);
-    unsigned char *p=n_shared_map(h,MAPPED,N_MEMORY_READ_WRITE);CHECK(p!=NULL);
-    unsigned char *ro=n_shared_map(h,MAPPED,N_MEMORY_READ);CHECK(ro!=NULL);
-    CHECK(n_shared_map(h,4096,N_MEMORY_READ_WRITE)==NULL);
-    CHECK(n_shared_map(h,MAPPED,N_MEMORY_READ_EXECUTE)==NULL);
+    void *pm,*rom,*none;
+    CHECK(n_shared_map(h,MAPPED,N_MEMORY_READ_WRITE,&pm)==0);unsigned char *p=pm;
+    CHECK(n_shared_map(h,MAPPED,N_MEMORY_READ,&rom)==0);unsigned char *ro=rom;
+    CHECK(n_shared_map(h,4096,N_MEMORY_READ_WRITE,&none)<0&&!none);
+    CHECK(n_shared_map(h,MAPPED,N_MEMORY_READ_EXECUTE,&none)<0&&!none);
     n_handle doc=n_document_open("/etc/motd",N_DOCUMENT_READ);
-    CHECK(doc>=0&&n_shared_map(doc,MAPPED,N_MEMORY_READ)==NULL);
+    CHECK(doc>=0&&n_shared_map(doc,MAPPED,N_MEMORY_READ,&none)<0);
     if(doc>=0)n_handle_close(doc);
-    CHECK(n_shared_map(0x7fffffff,MAPPED,N_MEMORY_READ)==NULL);
+    CHECK(n_shared_map(0x7fffffff,MAPPED,N_MEMORY_READ,&none)<0);
     CHECK(n_handle_close(h)==0);
-    CHECK(n_shared_map(h,MAPPED,N_MEMORY_READ)==NULL); /* the handle is gone */
+    CHECK(n_shared_map(h,MAPPED,N_MEMORY_READ,&none)<0); /* the handle is gone */
     if(p&&ro){p[0]=0x71;p[4096]=0x26;p[8192]=0x58;
         CHECK(ro[0]==0x71&&ro[4096]==0x26&&ro[8192]==0x58);
         CHECK(n_memory_release(p,4096)<0&&p[8192]==0x58);
@@ -88,7 +91,8 @@ int main(int argc,char **argv){
     /* A lazily zeroed object reads as zero in every mapping. */
     n_handle lazy=n_shared_reserve(BYTES);CHECK(lazy>=0);
     if(lazy>=0){
-        unsigned char *a=n_shared_map(lazy,MAPPED,N_MEMORY_READ_WRITE),*b=n_shared_map(lazy,MAPPED,N_MEMORY_READ);
+        void *am,*bm;n_shared_map(lazy,MAPPED,N_MEMORY_READ_WRITE,&am);n_shared_map(lazy,MAPPED,N_MEMORY_READ,&bm);
+        unsigned char *a=am,*b=bm;
         CHECK(a&&b&&!a[0]&&!b[8192]);
         if(a&&b){a[8192]=0x3c;CHECK(b[8192]==0x3c);}
         n_handle_close(lazy);
@@ -102,7 +106,8 @@ int main(int argc,char **argv){
     if(app>=0){
         n_handle child_h=-1;char tag[6];
         bool got=receive(reader_end,tag,sizeof tag,&child_h);CHECK(got&&child_h>=0&&n_handle_kind(child_h)==N_KIND_SHARED);
-        unsigned char *imported=got?n_shared_map(child_h,MAPPED,N_MEMORY_READ_WRITE):NULL;CHECK(imported!=NULL);
+        void *im=NULL;if(got)n_shared_map(child_h,MAPPED,N_MEMORY_READ_WRITE,&im);
+        unsigned char *imported=im;CHECK(imported!=NULL);
         if(imported){CHECK(imported[0]==7&&imported[8192]==(unsigned char)(8192u*31u+7));imported[8192]=0x49;}
         int ack=imported?1:0;CHECK(n_channel_send(reader_end,&ack,sizeof ack,-1)==(n_result)sizeof ack);
         if(child_h>=0)n_handle_close(child_h);
@@ -114,7 +119,8 @@ int main(int argc,char **argv){
 
     /* Parent to child: the child maps it read-only; the parent's later writes are visible there. */
     n_handle down=n_shared_create(BYTES);CHECK(down>=0);
-    unsigned char *dp=down>=0?n_shared_map(down,MAPPED,N_MEMORY_READ_WRITE):NULL;CHECK(dp!=NULL);
+    void *dm=NULL;if(down>=0)n_shared_map(down,MAPPED,N_MEMORY_READ_WRITE,&dm);
+    unsigned char *dp=dm;CHECK(dp!=NULL);
     if(dp){
         for(size_t i=0;i<BYTES;i++)dp[i]=(unsigned char)(i*13u+5);
         app=launch(argv[0],"reader",&reader_end);CHECK(app>=0);

@@ -1179,10 +1179,10 @@ index 0000000..710dc4c
 +    pub fn msleep(ms: c_uint) -> c_int;
 +    #[link_name = "yield"]
 +    pub fn yield_now() -> ();
-+    pub fn thread_create(f: extern "C" fn(*mut c_void), arg: *mut c_void) -> c_int;
-+    pub fn thread_join(tid: c_int) -> c_int;
++    pub fn thread_create(f: extern "C" fn(*mut c_void), arg: *mut c_void) -> n_result;
++    pub fn thread_join(tid: c_int) -> n_result;
 +    pub fn thread_id() -> c_int;
-+    pub fn cpu_info(info: *mut n_cpuinfo) -> c_int;
++    pub fn cpu_info(info: *mut n_cpuinfo) -> n_result;
 +    pub fn wait_on_address(address: *const u32, expected: u32, timeout_ms: c_uint) -> n_result;
 +    pub fn wake_address(address: *const u32, count: c_uint) -> n_result;
 +}
@@ -1822,7 +1822,7 @@ new file mode 100644
 index 0000000..11a858f
 --- /dev/null
 +++ b/library/std/src/sys/thread/nocturne.rs
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,91 @@
 +//! Threads on Nocturne: the native `thread_create` / `thread_join`.
 +//!
 +//! The kernel gives every thread a fixed-size stack (256 KiB) and a process at
@@ -1865,14 +1865,9 @@ index 0000000..11a858f
 +        if tid < 0 {
 +            // The thread never started, so the init was not consumed.
 +            drop(unsafe { Box::from_raw(data) });
-+            let err = unsafe { *abi::__errno_location() };
-+            return Err(io::Error::from_raw_os_error(if err > 0 {
-+                err
-+            } else {
-+                abi::N_ERR_NO_MEMORY
-+            }));
++            return Err(io::Error::from_raw_os_error(abi::code(tid)));
 +        }
-+        Ok(Thread { tid })
++        Ok(Thread { tid: tid as i32 })
 +    }
 +
 +    pub fn join(self) {

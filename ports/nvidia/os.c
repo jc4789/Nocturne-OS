@@ -339,7 +339,7 @@ static void delay_ns(uint64_t ns, bool may_sleep) {
         if (now >= deadline) return;
         uint64_t left = deadline - now;
         if (may_sleep && left > 2000000ull) {
-            msleep((unsigned)((left - 1000000ull) / 1000000ull));
+            n_sleep_ms((left - 1000000ull) / 1000000ull);
         } else {
             for (int i = 0; i < 64; i++) __builtin_ia32_pause();
         }

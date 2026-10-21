@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <limits.h>
-#include <errno.h>
 #include <string.h>
 #include <threads.h>
 #include "nocturne.h"
@@ -51,12 +50,10 @@ int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out) {
     if (rm->channel < 0) { result = rm->channel; goto fail; }
     rm->arena_handle = n_shared_reserve(ARENA_BYTES);
     if (rm->arena_handle < 0) { result = rm->arena_handle; goto fail; }
-    int saved_errno = errno;
-    errno = 0;
-    rm->arena = n_shared_map(rm->arena_handle, ARENA_BYTES, N_MEMORY_READ_WRITE);
-    int map_errno = errno;
-    errno = saved_errno;
-    if (!rm->arena) { result = map_errno > 0 && map_errno < N_RESULT_CODES ? -map_errno : -N_ERR_IO; goto fail; }
+    void *arena;
+    result = n_shared_map(rm->arena_handle, ARENA_BYTES, N_MEMORY_READ_WRITE, &arena);
+    rm->arena = arena;
+    if (result < 0) goto fail;
     int initialized = mtx_init(&rm->lock, mtx_recursive);
     if (initialized != thrd_success) { result = initialized == thrd_nomem ? -N_ERR_NO_MEMORY : -N_ERR_IO; goto fail; }
     lock_ready = true;
@@ -99,7 +96,7 @@ static struct nvrm *connect_any(bool ready_only) {
        rather than truncating the set of GPUs to a driver-specific constant. */
     struct n_pciinfo *list = NULL;
     size_t capacity = 1;
-    int count;
+    n_result count;
     for (;;) {
         if (capacity > INT_MAX || capacity > SIZE_MAX / sizeof *list) { free(list); return NULL; }
         struct n_pciinfo *grown = realloc(list, capacity * sizeof *list);
@@ -112,7 +109,7 @@ static struct nvrm *connect_any(bool ready_only) {
         capacity *= 2;
     }
     struct nvrm *rm = NULL;
-    for (int i = 0; i < count && !rm; i++) {
+    for (n_result i = 0; i < count && !rm; i++) {
         if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif)) continue;
         rm = nvrm_connect_device(N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func));
         if (rm && ready_only && !nvrm_device_ready(rm)) { nvrm_disconnect(rm); rm = NULL; }
@@ -258,8 +255,7 @@ uint32_t nvrm_map(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t me
         r = NV_ERR_OPERATING_SYSTEM;
     if (r == NV_OK) {
         m->bytes = (size_t)head.bytes;
-        m->base = n_shared_map(shared, m->bytes, head.access);
-        if (!m->base) r = NV_ERR_NO_MEMORY;
+        if (n_shared_map(shared, m->bytes, head.access, &m->base) < 0) r = NV_ERR_NO_MEMORY;
     }
     if (shared >= 0) n_handle_close(shared); /* the mapping keeps the object */
     if (r == NV_OK) {

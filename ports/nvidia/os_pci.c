@@ -280,9 +280,11 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode) {
     uint32_t cache = bar_cache((unsigned)i, nvrm_dev.info.bar[i].address + astart, length, mode);
     n_handle view = n_shared_view(bar, (size_t)astart, (size_t)length, cache);
     if (view < 0) return NULL;
-    uint8_t *base = n_shared_map(view, (size_t)length, N_MEMORY_READ_WRITE);
+    void *mapping;
+    n_result mapped = n_shared_map(view, (size_t)length, N_MEMORY_READ_WRITE, &mapping);
     n_handle_close(view);
-    if (!base) return NULL;
+    if (mapped < 0) return NULL;
+    uint8_t *base = mapping;
     call_once(&bar_once, bar_setup);
     mtx_lock(&bar_lock);
     if (kmap_count == kmap_cap) {
@@ -412,11 +414,14 @@ NV_STATUS nvrm_pci_attach(void) {
     }
     /* nvrm keeps one mapping of the whole BAR0; os_map_kernel_space hands out pieces of it.
        nv->regs->map stays NULL: RM sets it itself (RmSetupRegisters) and asserts it was unset. */
-    bars[registers].map = n_shared_map(h0, (size_t)b0->size, N_MEMORY_READ_WRITE);
-    if (!bars[registers].map) {
-        nvrm_log("NVRM: mapping BAR0 (%llu bytes) failed", (unsigned long long)b0->size);
+    void *whole;
+    n_result mapped = n_shared_map(h0, (size_t)b0->size, N_MEMORY_READ_WRITE, &whole);
+    if (mapped < 0) {
+        nvrm_log("NVRM: mapping BAR0 (%llu bytes) failed: %s", (unsigned long long)b0->size,
+                 n_result_text(mapped));
         return NV_ERR_GENERIC;
     }
+    bars[registers].map = whole;
 
     d->sp = stack_ptr;
     return NV_OK;
@@ -755,7 +760,9 @@ void *NV_API_CALL nv_alloc_kernel_mapping(nv_state_t *nv, void *priv, NvU64 page
     uint32_t cache = n_cache_for(a->cache, false);
     if (cache == N_CACHE_WRITE_BACK) {
         mtx_lock(&alloc_lock);
-        if (!a->kmap) a->kmap = n_shared_map(a->root, (size_t)(a->pages * PAGE), N_MEMORY_READ_WRITE);
+        void *whole;
+        if (!a->kmap && n_shared_map(a->root, (size_t)(a->pages * PAGE), N_MEMORY_READ_WRITE, &whole) >= 0)
+            a->kmap = whole;
         uint8_t *base = a->kmap;
         if (base) a->kmap_refs++;
         mtx_unlock(&alloc_lock);
@@ -764,9 +771,11 @@ void *NV_API_CALL nv_alloc_kernel_mapping(nv_state_t *nv, void *priv, NvU64 page
     }
     n_handle view = n_shared_view(a->root, (size_t)(page_index * PAGE), (size_t)span, cache);
     if (view < 0) return NULL;
-    uint8_t *base = n_shared_map(view, (size_t)span, N_MEMORY_READ_WRITE);
+    void *mapping;
+    n_result mapped = n_shared_map(view, (size_t)span, N_MEMORY_READ_WRITE, &mapping);
     n_handle_close(view);
-    if (!base) return NULL;
+    if (mapped < 0) return NULL;
+    uint8_t *base = mapping;
     struct kern_mapping *m = malloc(sizeof *m);
     if (!m) {
         n_memory_release(base, (size_t)span);

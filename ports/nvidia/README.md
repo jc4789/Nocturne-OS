@@ -86,8 +86,9 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `nvlink_*`／`nvswitch_os_*` | 48 | `nvlink_os.c`（実装 48。GPU に NVLink／NVSwitch は無いので、DMA・イベント・fabric manager は未対応を返す） |
 | `libspdm_*`（暗号バックエンド） | 71 | `spdm_stubs.c`（0 を返す。SPDM は Hopper 以降の機密計算と認証にだけ使われ、Ada では始まらない） |
 
-最後に残るのは libc の関数（`malloc`・`mtx_*`・`thrd_*`・`snprintf` など）と Nocturne の `n_*`／`clock_info`／`cpu_info`／`msleep`
-だけ。これらは `user/libc/sys.c` などが持つ。
+最後に残るのは ISO C の関数（`malloc`・`mtx_*`・`thrd_*`・`snprintf` など）と Nocturne のネイティブ関数
+（`n_*`／`clock_info`／`cpu_info`／`pcilist`）だけ。これらは `user/libc/sys.c` などが持つ。ネイティブ関数は
+失敗を負の `n_result` で返し、`errno` には触れない。ドライバーも `errno` を使わない。
 
 ## OS 層の対応表（実装したもの）
 
@@ -96,7 +97,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `nv_printf`、`nv_vprintf`、`nv_dev_vprintf`、`os_log_error`、`nv_log_error` | システムログ（`n_system_log_open`）と、`/data` があれば `/data/logs/nvrm.log`（`nvrm_log`）へ |
 | `os_alloc_mem`／`os_free_mem`、`os_mem_*`、`os_string_*`、`os_snprintf` ほか | `malloc`／`free`／libc の文字列関数（`os_alloc_mem` は 0 初期化しない。RM の約束どおり） |
 | `os_memcpy_from_user`／`to_user` | リクエストサーバーの `nvrm_user_translate`。クライアントの「引数の場」の中の番地だけを nvrm の番地へ読み替える。場の外は `NV_ERR_INVALID_ADDRESS`（台帳 D4） |
-| `os_get_system_time`、`os_get_monotonic_time_ns*`、`os_delay*`、`os_schedule` | `clock_info`（TSC）、`msleep`、`thrd_yield`、`timespec_get` |
+| `os_get_system_time`、`os_get_monotonic_time_ns*`、`os_delay*`、`os_schedule` | `clock_info`（TSC）、`n_sleep_ms`、`thrd_yield`、`timespec_get` |
 | `os_alloc_mutex`／`os_acquire_mutex` ほか、`os_alloc_spinlock`、`os_alloc_semaphore`、`os_alloc_rwlock_*`、`os_alloc_wait_queue` | C11 の `mtx_t`／`cnd_t`。スピンロックも mutex（ISR も普通のスレッドのため）。待ち行列は `cnd_t`＋ラッチ |
 | `os_queue_work_item`、`os_flush_work_queue`、`os_is_queue_flush_ongoing` | 最大 8 本のワーカースレッド（`rm_execute_work_item`） |
 | `nv_start_rc_timer`／`nv_stop_rc_timer`、`nv_create_nano_timer` ほか | 1 本のタイマースレッド（1 Hz の RC、nano タイマー） |

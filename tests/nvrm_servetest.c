@@ -202,11 +202,12 @@ n_handle nvrm_rm_mapping_object(void *file, uint64_t *offset, uint64_t *bytes, u
     if (!pending || memory == MEM_UNEXPORTABLE) return -1;
     n_handle h = n_shared_create(MAP_BYTES);
     if (h < 0) return -1;
-    uint8_t *p = n_shared_map(h, MAP_BYTES, N_MEMORY_READ_WRITE);
-    if (!p) {
+    void *mapping;
+    if (n_shared_map(h, MAP_BYTES, N_MEMORY_READ_WRITE, &mapping) < 0) {
         n_handle_close(h);
         return -1;
     }
+    uint8_t *p = mapping;
     for (unsigned i = 0; i < 64; i++) p[MAP_OFFSET + i] = map_byte(memory, i);
     n_memory_release(p, MAP_BYTES);
     mtx_lock(&fake.lock);

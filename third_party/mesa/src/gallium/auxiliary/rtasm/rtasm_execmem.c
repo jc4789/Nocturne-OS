@@ -143,9 +143,10 @@ rtasm_exec_malloc(size_t size)
    size_t bytes = (size + EXEC_PAGE + EXEC_PAGE - 1) & ~(size_t)(EXEC_PAGE - 1);
    if (bytes < size)
       return NULL;
-   size_t *block = n_memory_reserve(bytes, N_MEMORY_READ_WRITE);
-   if (!block)
+   void *pages;
+   if (n_memory_reserve(bytes, N_MEMORY_READ_WRITE, &pages) < 0)
       return NULL;
+   size_t *block = pages;
    *block = bytes;
    return (unsigned char *)block + EXEC_PAGE;
 }

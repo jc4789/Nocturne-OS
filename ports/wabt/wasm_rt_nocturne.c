@@ -247,13 +247,11 @@ wasm_rt_coroutine *wasm_rt_coroutine_create(void (*entry)(void *), void *opaque)
     /* Use the real native task's reserved stack capacity. n_memory_reserve
        leaves a trailing unmapped page; release the leading page for a lower
        guard. */
-    char *mapping = n_memory_reserve(usable + N_PAGE_SIZE, N_MEMORY_READ_WRITE);
-    if (!mapping) { free(co); return NULL; } /* errno set by the reserve */
-    if (n_memory_release(mapping, N_PAGE_SIZE) < 0) {
-        int error = errno;
+    void *mapping;
+    n_result r = n_memory_reserve(usable + N_PAGE_SIZE, N_MEMORY_READ_WRITE, &mapping);
+    if (r >= 0 && (r = n_memory_release(mapping, N_PAGE_SIZE)) < 0)
         n_memory_release(mapping, usable + N_PAGE_SIZE);
-        errno = error; free(co); return NULL;
-    }
+    if (r < 0) { errno = (int)-r; free(co); return NULL; }
     co->runtime.stack_low = (uintptr_t)mapping + N_PAGE_SIZE;
     co->runtime.stack_high = co->runtime.stack_low + usable;
     co->runtime.coroutine = co;
@@ -301,9 +299,9 @@ int wasm_rt_coroutine_bounds(const wasm_rt_coroutine *co, uintptr_t *low, uintpt
 int wasm_rt_coroutine_destroy(wasm_rt_coroutine *co) {
     if (coroutine_owner(co) < 0) return -1;
     if (co->running || (co->started && !co->done)) { errno = EBUSY; return -1; }
-    if (n_memory_release((void *)co->runtime.stack_low,
-                         co->runtime.stack_high - co->runtime.stack_low) < 0)
-        return -1;
+    n_result r = n_memory_release((void *)co->runtime.stack_low,
+                                  co->runtime.stack_high - co->runtime.stack_low);
+    if (r < 0) { errno = (int)-r; return -1; }
     free(co);
     return 0;
 }

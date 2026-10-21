@@ -25,11 +25,11 @@ int msleep(unsigned ms);
 uint64_t uptime_ms(void);
 /* Native memory (docs/nocturne-native-abi.md §7): zero-filled pages with
  * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access; reserve also takes
- * N_MEMORY_LOW added to the access, for pages below 2 GiB. reserve returns NULL
- * and sets errno on failure; release and protect return -1. */
-void *n_memory_reserve(size_t bytes, int access);
-int n_memory_release(void *addr, size_t bytes);
-int n_memory_protect(void *addr, size_t bytes, int access);
+ * N_MEMORY_LOW added to the access, for pages below 2 GiB. reserve puts the
+ * pages in *memory (NULL on failure). */
+n_result n_memory_reserve(size_t bytes, int access, void **memory);
+n_result n_memory_release(void *addr, size_t bytes);
+n_result n_memory_protect(void *addr, size_t bytes, int access);
 /* Shared pages: a handle is a private capability that travels to another app
  * only as a channel attachment (n_channel_send). A mapping keeps the pages
  * after the handle closes; n_memory_release of the whole mapping ends it. */
@@ -37,8 +37,8 @@ n_handle n_shared_create(size_t bytes);
 /* Like n_shared_create, but pages are zero-filled at first touch by any mapper. */
 n_handle n_shared_reserve(size_t bytes);
 /* Map all of the pages (bytes is their page-rounded size) with N_MEMORY_READ
- * or N_MEMORY_READ_WRITE access; NULL and errno on failure. */
-void *n_shared_map(n_handle shared, size_t bytes, int access);
+ * or N_MEMORY_READ_WRITE access into *mapping (NULL on failure). */
+n_result n_shared_map(n_handle shared, size_t bytes, int access, void **mapping);
 
 const char *n_result_text(n_result r); /* either sign */
 n_result n_handle_close(n_handle h);   /* commits an N_DOCUMENT_REPLACE handle */
@@ -177,11 +177,14 @@ bool n_terminal(n_handle h);
 
 int proclist(struct n_procinfo *out, int max);
 int sysinfo(struct n_sysinfo *si);
-int cpu_info(struct n_cpuinfo *info);
-int clock_info(struct n_clockinfo *info);
-/* Native tasks sharing this process's address space and descriptors. */
-int thread_create(void (*fn)(void *), void *arg);
-int thread_join(int tid);
+/* 0, or a negative n_result; errno is left alone. */
+n_result cpu_info(struct n_cpuinfo *info);
+n_result clock_info(struct n_clockinfo *info);
+/* Native tasks sharing this process's address space and descriptors. create
+ * returns the thread's id; a process has at most 128 running threads, past
+ * that N_ERR_NOT_READY. Both return a negative n_result and leave errno alone. */
+n_result thread_create(void (*fn)(void *), void *arg);
+n_result thread_join(int tid);
 NOCTURNE_NORETURN void thread_exit(void);
 int thread_id(void);
 unsigned cpu_index(void);
@@ -209,7 +212,8 @@ n_result wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
 int poweroff(void);
 int reboot(void);
-int pcilist(struct n_pciinfo *out, int max);
+/* The count of PCI functions (at most max written), or a negative n_result. */
+n_result pcilist(struct n_pciinfo *out, int max);
 long __syscall(long n, long a, long b, long c, long d, long e);
 
 /* run a program (searching /bin) and wait for it; returns exit status or negative error */

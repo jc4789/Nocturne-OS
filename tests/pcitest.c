@@ -8,7 +8,6 @@
 #include <string.h>
 #include <threads.h>
 #include <stdatomic.h>
-#include <errno.h>
 #include "nocturne.h"
 
 static int failed;
@@ -63,8 +62,9 @@ static int dma(n_handle pci, uint64_t ram, uint32_t count, int to_ram) {
 static int revoked_reader(void) {
     n_handle view=-1;char signal=0;
     if(n_channel_receive(3,&signal,1,N_CHANNEL_WAIT,&view)!=1 || view<0)return 10;
-    const volatile uint32_t *p=n_shared_map(view,4096,N_MEMORY_READ);
-    if(!p || p[0]!=0x12345678)return 11;
+    void *m;if(n_shared_map(view,4096,N_MEMORY_READ,&m)<0)return 11;
+    const volatile uint32_t *p=m;
+    if(p[0]!=0x12345678)return 11;
     /* Receiving a view must not confer the issuer's cancellation authority. */
     if(n_shared_revoke(view)!=-N_ERR_DENIED)return 12;
     if(n_channel_send(3,"r",1,-1)!=1)return 13;
@@ -73,12 +73,12 @@ static int revoked_reader(void) {
     return value==0x12345678?15:16;
 }
 struct map_race {
-    n_handle view;size_t bytes;atomic_int ready,go,done;void *result;int error;
+    n_handle view;size_t bytes;atomic_int ready,go,done;void *result;n_result error;
 };
 static int mapping_builder(void *arg) {
     struct map_race *r=arg;atomic_store(&r->ready,1);
     while(!atomic_load(&r->go))thrd_yield();
-    r->result=n_shared_map(r->view,r->bytes,N_MEMORY_READ);r->error=errno;
+    r->error=n_shared_map(r->view,r->bytes,N_MEMORY_READ,&r->result);
     atomic_store(&r->done,1);return 0;
 }
 static void construction_cancel_case(void) {
@@ -96,16 +96,17 @@ static void construction_cancel_case(void) {
     CHECK(created==thrd_success,"construction race builder");
     if(created==thrd_success){
         while(!atomic_load(&race.ready))thrd_yield();
-        uint32_t *probe=n_shared_map(root,bytes,N_MEMORY_READ_WRITE);
+        void *candidate;n_shared_map(root,bytes,N_MEMORY_READ_WRITE,&candidate);
+        uint32_t *probe=candidate;
         CHECK(probe!=NULL,"reserve known candidate VA before racing");
         if(probe){probe[0]=0x19384756;CHECK(n_memory_release(probe,bytes)==0,"release candidate VA for the builder");}
         atomic_store(&race.go,1);
         bool observed=false,released=false;
         while(probe && !atomic_load(&race.done)){
-            n_result state=__syscall(SYS_MEMORY_PROTECT,(long)probe,4096,N_MEMORY_READ,0,0);
+            n_result state=n_memory_protect(probe,4096,N_MEMORY_READ);
             if(state==-N_ERR_NOT_READY){
                 observed=true;
-                n_result release=__syscall(SYS_MEMORY_RELEASE,(long)probe,bytes,0,0,0);
+                n_result release=n_memory_release(probe,bytes);
                 /* It may finish between these two syscalls. Either the still
                    constructing range is protected, or a finished map releases. */
                 CHECK(release==-N_ERR_NOT_READY || release==0,"release respects constructing or completed map lifetime: %lld",(long long)release);
@@ -118,7 +119,7 @@ static void construction_cancel_case(void) {
         CHECK(!probe || n_channel_send(channel[0],probe,sizeof *probe,-1)==-N_ERR_BAD_ADDRESS,
               "after cancellation returns, even guessed in-flight PTE cannot be copied");
         thrd_join(builder,NULL);
-        CHECK(!race.result?race.error==N_ERR_CLOSED:race.result==probe,
+        CHECK(!race.result?race.error==-N_ERR_CLOSED:race.result==probe,
               "builder either closes or had already published the known mapping");
         if(race.result && !released)n_memory_release(race.result,bytes);
     }
@@ -128,7 +129,9 @@ static void construction_cancel_case(void) {
 static void composition_cases(const char *program) {
     const size_t page=4096; /* native x86-64 shared-page granularity */
     n_handle a=n_shared_create(3*page),b=n_shared_reserve(2*page);
-    uint32_t *a_map=n_shared_map(a,3*page,N_MEMORY_READ_WRITE);
+    void *am,*joinedm,*bm,*slicem,*exportm,*none;
+    n_shared_map(a,3*page,N_MEMORY_READ_WRITE,&am);
+    uint32_t *a_map=am;
     CHECK(a>=0 && b>=0 && a_map,"composition backing objects");
     if(a_map){a_map[0]=0x11111111;a_map[2*page/4]=0x33333333;}
     struct n_shared_range ranges[]={
@@ -137,11 +140,13 @@ static void composition_cases(const char *program) {
         {.shared=a,.offset=0,.bytes=page}
     };
     n_handle joined=n_shared_compose(ranges,3,N_MEMORY_READ_WRITE);
-    uint32_t *mapped=n_shared_map(joined,3*page,N_MEMORY_READ_WRITE);
+    n_shared_map(joined,3*page,N_MEMORY_READ_WRITE,&joinedm);
+    uint32_t *mapped=joinedm;
     CHECK(joined>=0 && mapped && mapped[0]==0x33333333 && mapped[page/4]==0 && mapped[2*page/4]==0x11111111,
           "ordered nonadjacent slices and untouched demand page share one VA");
     if(mapped){mapped[0]=0x12345678;mapped[page/4]=0x55555555;}
-    uint32_t *b_map=n_shared_map(b,2*page,N_MEMORY_READ);
+    n_shared_map(b,2*page,N_MEMORY_READ,&bm);
+    uint32_t *b_map=bm;
     CHECK(a_map && b_map && a_map[2*page/4]==0x12345678 && b_map[page/4]==0x55555555,
           "composition aliases backing pages, including first-touch allocation");
     if(a_map)n_memory_release(a_map,3*page);
@@ -149,7 +154,8 @@ static void composition_cases(const char *program) {
     if(a>=0)n_handle_close(a);if(b>=0)n_handle_close(b);
     CHECK(mapped && mapped[0]==0x12345678 && mapped[page/4]==0x55555555,"source handle close retains backing");
     n_handle slice=n_shared_view(joined,page,2*page,N_CACHE_DEFAULT);
-    const uint32_t *slice_map=n_shared_map(slice,2*page,N_MEMORY_READ);
+    n_shared_map(slice,2*page,N_MEMORY_READ,&slicem);
+    const uint32_t *slice_map=slicem;
     CHECK(slice>=0 && slice_map && slice_map[0]==0x55555555 && slice_map[page/4]==0x11111111,
           "view of composite crosses segment boundaries");
     struct n_shared_range invalid[]={{.shared=joined,.bytes=page},{.shared=-1,.bytes=page}};
@@ -159,13 +165,14 @@ static void composition_cases(const char *program) {
     struct n_shared_range readonly={.shared=ro,.bytes=3*page};
     CHECK(n_shared_compose(&readonly,1,N_MEMORY_READ_WRITE)==-N_ERR_DENIED,"composition cannot upgrade read-only source");
     n_handle nested=n_shared_compose(&readonly,1,N_MEMORY_READ);
-    CHECK(nested>=0 && !n_shared_map(nested,3*page,N_MEMORY_READ_WRITE),"read-only composite maximum is immutable");
+    CHECK(nested>=0 && n_shared_map(nested,3*page,N_MEMORY_READ_WRITE,&none)<0,"read-only composite maximum is immutable");
     CHECK(n_shared_view_access(nested,0,page,N_CACHE_DEFAULT,N_MEMORY_READ_WRITE)==-N_ERR_DENIED,
           "view cannot upgrade read-only composite");
     n_handle derived=n_shared_view(nested,0,page,N_CACHE_DEFAULT);
     struct n_shared_range nested_range={.shared=derived,.bytes=page};
     n_handle exported=n_shared_compose(&nested_range,1,N_MEMORY_READ);
-    const uint32_t *export_map=n_shared_map(exported,page,N_MEMORY_READ);
+    n_shared_map(exported,page,N_MEMORY_READ,&exportm);
+    const uint32_t *export_map=exportm;
     CHECK(export_map && export_map[0]==0x12345678,"nested composition and view retain original order");
     if(nested>=0)n_handle_close(nested);if(derived>=0)n_handle_close(derived);
     n_handle pair[2]={-1,-1},reader=-1;
@@ -188,7 +195,7 @@ static void composition_cases(const char *program) {
         if(result<0)n_app_stop(reader,0);n_handle_close(reader);
     }
     if(pair[0]>=0)n_handle_close(pair[0]);
-    CHECK(!n_shared_map(exported,page,N_MEMORY_READ) && n_shared_view(exported,0,page,N_CACHE_DEFAULT)==-N_ERR_CLOSED,
+    CHECK(n_shared_map(exported,page,N_MEMORY_READ,&none)<0 &&n_shared_view(exported,0,page,N_CACHE_DEFAULT)==-N_ERR_CLOSED,
           "nested composite cannot escape revoked dependency");
     CHECK(!export_map || n_memory_protect((void *)export_map,page,N_MEMORY_READ)<0,"nested parent mapping also lost its PTE");
     CHECK(mapped && mapped[0]==0x12345678,"source-view cancellation preserves independent composite owner");
@@ -227,28 +234,31 @@ static void screen_cases(const struct n_pciinfo *list, int n) {
     n_handle bar = n_pci_bar(vga, 0);
     CHECK(bar >= 0, "VGA BAR: %s", n_result_text(bar));
     if (bar >= 0 && info.framebuffer_bar == 0) {
+        void *none;
         n_handle uc = n_shared_view(bar, screen, 4096, N_CACHE_UNCACHED);
-        CHECK(uc >= 0 && !n_shared_map(uc, 4096, N_MEMORY_READ) && errno == N_ERR_DENIED,
+        CHECK(uc >= 0 && n_shared_map(uc, 4096, N_MEMORY_READ, &none) == -N_ERR_DENIED,
               "an uncached mapping of the write-combined screen is refused");
         n_handle wc = n_shared_view(bar, screen, 4096, N_CACHE_WRITE_COMBINE);
-        void *wc_map = wc >= 0 ? n_shared_map(wc, 4096, N_MEMORY_READ) : NULL;
-        CHECK(wc_map != NULL, "the screen maps write-combined: %d", errno);
-        CHECK(!n_shared_map(bar, (size_t)info.bar[0].size, N_MEMORY_READ) && errno == N_ERR_DENIED,
+        void *wc_map = NULL;
+        n_result mapped = wc >= 0 ? n_shared_map(wc, 4096, N_MEMORY_READ, &wc_map) : wc;
+        CHECK(mapped >= 0, "the screen maps write-combined: %s", n_result_text(mapped));
+        CHECK(n_shared_map(bar, (size_t)info.bar[0].size, N_MEMORY_READ, &none) == -N_ERR_DENIED,
               "the whole BAR uncached would alias the screen");
         if (past + 4096 <= info.bar[0].size) {
             n_handle a = n_shared_view(bar, past, 4096, N_CACHE_UNCACHED);
             n_handle b = n_shared_view(bar, past, 4096, N_CACHE_WRITE_COMBINE);
-            void *a_map = a >= 0 ? n_shared_map(a, 4096, N_MEMORY_READ_WRITE) : NULL;
-            CHECK(a_map != NULL, "uncached mapping past the screen: %d", errno);
-            void *a_again = a >= 0 ? n_shared_map(a, 4096, N_MEMORY_READ) : NULL;
+            void *a_map = NULL, *a_again = NULL, *b_map = NULL;
+            mapped = a >= 0 ? n_shared_map(a, 4096, N_MEMORY_READ_WRITE, &a_map) : a;
+            CHECK(mapped >= 0, "uncached mapping past the screen: %s", n_result_text(mapped));
+            if (a >= 0) n_shared_map(a, 4096, N_MEMORY_READ, &a_again);
             CHECK(a_again != NULL, "a second mapping of the same type");
-            CHECK(b >= 0 && !n_shared_map(b, 4096, N_MEMORY_READ) && errno == N_ERR_DENIED,
+            CHECK(b >= 0 && n_shared_map(b, 4096, N_MEMORY_READ, &none) == -N_ERR_DENIED,
                   "a write-combined alias of an uncached device page is refused");
             if (a_map) n_memory_release(a_map, 4096);
-            CHECK(b >= 0 && !n_shared_map(b, 4096, N_MEMORY_READ), "one mapping of the other type is still there");
+            CHECK(b >= 0 && n_shared_map(b, 4096, N_MEMORY_READ, &none) < 0, "one mapping of the other type is still there");
             if (a_again) n_memory_release(a_again, 4096);
-            void *b_map = b >= 0 ? n_shared_map(b, 4096, N_MEMORY_READ) : NULL;
-            CHECK(b_map != NULL, "once no uncached mapping is left the page takes write-combining: %d", errno);
+            mapped = b >= 0 ? n_shared_map(b, 4096, N_MEMORY_READ, &b_map) : b;
+            CHECK(mapped >= 0, "once no uncached mapping is left the page takes write-combining: %s", n_result_text(mapped));
             if (b_map) n_memory_release(b_map, 4096);
             if (a >= 0) n_handle_close(a);
             if (b >= 0) n_handle_close(b);
@@ -335,7 +345,9 @@ static int virtio_status(n_handle pci, int set) {
     struct n_pci_function info;
     if (!virtio_common(pci, &bar, &offset) || bar > 5 || n_pci_info(pci, &info) != 0 || !info.bar[bar].size) return -1;
     n_handle h = n_pci_bar(pci, bar);
-    volatile uint8_t *m = h >= 0 ? n_shared_map(h, info.bar[bar].size, N_MEMORY_READ_WRITE) : NULL;
+    void *whole = NULL;
+    if (h >= 0) n_shared_map(h, info.bar[bar].size, N_MEMORY_READ_WRITE, &whole);
+    volatile uint8_t *m = whole;
     int status = -1;
     if (m) {
         if (set >= 0) m[offset + 0x14] = (uint8_t)set;
@@ -498,7 +510,9 @@ int main(int argc,char **argv) {
 
     n_handle bar = n_pci_bar(pci, 0);
     CHECK(bar >= 0 && n_handle_kind(bar) == N_KIND_SHARED, "bar: %s", n_result_text(bar));
-    regs = bar >= 0 ? n_shared_map(bar, 1 << 20, N_MEMORY_READ_WRITE) : NULL;
+    void *bar_map = NULL;
+    if (bar >= 0) n_shared_map(bar, 1 << 20, N_MEMORY_READ_WRITE, &bar_map);
+    regs = bar_map;
     CHECK(regs != NULL, "map bar");
     if (regs) {
         CHECK(rd32(EDU_IDENT) >> 16 == 0x0100 && (rd32(EDU_IDENT) & 0xFF) == 0xed, "ident %08x", rd32(EDU_IDENT));
@@ -514,7 +528,8 @@ int main(int argc,char **argv) {
         {.shared=mixed_ram,.offset=0,.bytes=4096}
     };
     n_handle mixed=n_shared_compose(mixed_ranges,3,N_MEMORY_READ_WRITE);
-    volatile uint32_t *mixed_map=n_shared_map(mixed,3*4096,N_MEMORY_READ_WRITE);
+    void *mixed_whole=NULL;n_shared_map(mixed,3*4096,N_MEMORY_READ_WRITE,&mixed_whole);
+    volatile uint32_t *mixed_map=mixed_whole;
     CHECK(mixed>=0 && mixed_map && regs && mixed_map[4096/4]==rd32(EDU_IDENT),"noncontiguous BAR slices compose with RAM");
     if(mixed_map)mixed_map[2*4096/4]=0x51525354;
     CHECK(n_shared_view(mixed,0,3*4096,N_CACHE_WRITE_BACK)==-N_ERR_DENIED,"explicit cache cannot collapse heterogeneous segments");
@@ -522,8 +537,11 @@ int main(int argc,char **argv) {
     CHECK(mixed_view>=0,"default composite view preserves heterogeneous cache attributes");
     n_handle bar_slice=n_shared_view(mixed,4096,4096,N_CACHE_UNCACHED);
     n_handle ram_slice=n_shared_view(mixed_view,4096,4096,N_CACHE_WRITE_BACK);
-    const volatile uint32_t *bar_slice_map=n_shared_map(bar_slice,4096,N_MEMORY_READ);
-    const uint32_t *ram_slice_map=n_shared_map(ram_slice,4096,N_MEMORY_READ);
+    void *bar_slice_whole=NULL,*ram_slice_whole=NULL;
+    n_shared_map(bar_slice,4096,N_MEMORY_READ,&bar_slice_whole);
+    n_shared_map(ram_slice,4096,N_MEMORY_READ,&ram_slice_whole);
+    const volatile uint32_t *bar_slice_map=bar_slice_whole;
+    const uint32_t *ram_slice_map=ram_slice_whole;
     CHECK(bar_slice>=0 && bar_slice_map && regs && bar_slice_map[0]==rd32(EDU_IDENT),"explicit UC on only the BAR portion of a mixed object");
     CHECK(ram_slice>=0 && ram_slice_map && ram_slice_map[0]==0x51525354,"nested partial view selects only WB RAM, not preceding UC BAR");
     if(bar_slice_map)n_memory_release((void *)bar_slice_map,4096);
@@ -537,7 +555,9 @@ int main(int argc,char **argv) {
     CHECK(wb == -N_ERR_DENIED, "write-back view of device memory: %s", n_result_text(wb));
     CHECK(n_shared_view(bar, 100, 4096, N_CACHE_UNCACHED) == -N_ERR_INVALID, "unaligned view");
     if (wc >= 0) {
-        volatile uint32_t *buf = n_shared_map(wc, 4096, N_MEMORY_READ_WRITE);
+        void *wc_map = NULL;
+        n_shared_map(wc, 4096, N_MEMORY_READ_WRITE, &wc_map);
+        volatile uint32_t *buf = wc_map;
         CHECK(buf != NULL, "map view");
         if (buf && regs) {
             /* the liveness register through the write-combining view, read back through the BAR */
@@ -580,7 +600,9 @@ int main(int argc,char **argv) {
     CHECK(mem >= 0 && n_dma_addresses(mem, 0, pages, 4) == 2, "dma addresses");
     CHECK(pages[1] == pages[0] + 4096 && pages[0] && pages[0] < (1ull << 32), "contiguous below 4 GiB: %llx %llx",
           (unsigned long long)pages[0], (unsigned long long)pages[1]);
-    uint8_t *ram = mem >= 0 ? n_shared_map(mem, 8192, N_MEMORY_READ_WRITE) : NULL;
+    void *mem_map = NULL;
+    if (mem >= 0) n_shared_map(mem, 8192, N_MEMORY_READ_WRITE, &mem_map);
+    uint8_t *ram = mem_map;
     CHECK(ram != NULL, "map dma");
     if (ram) CHECK(ram[0] == 0 && ram[8191] == 0, "dma memory starts zeroed");
     if (ram && regs && vectors >= 1) {
@@ -616,27 +638,30 @@ int main(int argc,char **argv) {
           "no write-back view of uncached dma memory");
     uint64_t through = 0;
     CHECK(low >= 0 && n_dma_addresses(low, 0, &through, 1) == 1 && through == pages[1], "addresses through a view");
-    volatile uint8_t *uc = low >= 0 ? n_shared_map(low, 4096, N_MEMORY_READ_WRITE) : NULL;
+    void *low_map = NULL;
+    if (low >= 0) n_shared_map(low, 4096, N_MEMORY_READ_WRITE, &low_map);
+    volatile uint8_t *uc = low_map;
     CHECK(uc != NULL, "map the uncached view");
     if (uc) {
         CHECK(uc[0] == (uint8_t)3 || !regs || vectors < 1, "the uncached view sees the copy: %u", uc[0]);
         n_memory_release((void *)uc, 4096);
     }
     n_handle plain = n_shared_create(4096);
-    uint32_t *plain_map=n_shared_map(plain,4096,N_MEMORY_READ_WRITE);
+    void *plain_whole=NULL,*ro_whole=NULL,*child_whole=NULL,*refused;
+    n_shared_map(plain,4096,N_MEMORY_READ_WRITE,&plain_whole);
+    uint32_t *plain_map=plain_whole;
     if(plain_map)plain_map[0]=0x12345678;
     n_handle ro=n_shared_view_access(plain,0,4096,N_CACHE_DEFAULT,N_MEMORY_READ);
     CHECK(ro>=0,"read-only maximum view");
-    CHECK(!n_shared_map(ro,4096,N_MEMORY_READ_WRITE),"read-only view refuses writable map");
-    const uint32_t *ro_map=n_shared_map(ro,4096,N_MEMORY_READ);
+    CHECK(n_shared_map(ro,4096,N_MEMORY_READ_WRITE,&refused)<0,"read-only view refuses writable map");
+    n_shared_map(ro,4096,N_MEMORY_READ,&ro_whole);
+    const uint32_t *ro_map=ro_whole;
     CHECK(ro_map && ro_map[0]==0x12345678,"read-only view maps original bytes");
-    /* n_memory_protect is the -1/errno convenience API, not n_result. The
-       original check incorrectly compared it with the raw native error. */
-    CHECK(!ro_map || (n_memory_protect((void *)ro_map,4096,N_MEMORY_READ_WRITE)==-1 && errno==N_ERR_DENIED),"read-only page cannot be upgraded");
-    CHECK(!ro_map || __syscall(SYS_MEMORY_PROTECT,(long)ro_map,4096,N_MEMORY_READ_WRITE,0,0)==-N_ERR_DENIED,"raw native protect preserves maximum access");
+    CHECK(!ro_map || n_memory_protect((void *)ro_map,4096,N_MEMORY_READ_WRITE)==-N_ERR_DENIED,"read-only page cannot be upgraded");
     CHECK(n_shared_view_access(ro,0,4096,N_CACHE_DEFAULT,N_MEMORY_READ_WRITE)==-N_ERR_DENIED,"derived view cannot enlarge maximum access");
     n_handle child=n_shared_view(ro,0,4096,N_CACHE_DEFAULT);
-    const uint32_t *child_map=n_shared_map(child,4096,N_MEMORY_READ);
+    n_shared_map(child,4096,N_MEMORY_READ,&child_whole);
+    const uint32_t *child_map=child_whole;
     CHECK(child>=0 && child_map && child_map[0]==0x12345678,"derived read-only view");
     n_handle channel[2]={-1,-1},reader=-1;
     if(n_channel_pair(channel)==0){
@@ -662,7 +687,7 @@ int main(int argc,char **argv) {
         n_handle_close(reader);
     }
     if(channel[0]>=0)n_handle_close(channel[0]);
-    CHECK(!n_shared_map(child,4096,N_MEMORY_READ),"revoked child cannot remap");
+    CHECK(n_shared_map(child,4096,N_MEMORY_READ,&refused)<0,"revoked child cannot remap");
     CHECK(n_shared_view(child,0,4096,N_CACHE_DEFAULT)==-N_ERR_CLOSED,"revoked descendant cannot escape through view");
     CHECK(!child_map || n_memory_protect((void *)child_map,4096,N_MEMORY_READ)<0,"existing descendant mapping lost its PTE");
     CHECK(plain_map && plain_map[0]==0x12345678,"independent owner mapping survives view revoke");
@@ -692,7 +717,8 @@ int main(int argc,char **argv) {
         CHECK(mixed_map[2*4096/4]==0x51525354,"claim loss does not destroy unrelated composed RAM");
         n_memory_release((void *)mixed_map,3*4096);
     }
-    CHECK(!n_shared_map(mixed,3*4096,N_MEMORY_READ),"composed revoked BAR cannot be remapped");
+    void *revoked;
+    CHECK(n_shared_map(mixed,3*4096,N_MEMORY_READ,&revoked)<0,"composed revoked BAR cannot be remapped");
     if(mixed>=0)n_handle_close(mixed);
     if (regs) {
         CHECK(rd32(EDU_IDENT) == 0xFFFFFFFFu, "the BAR mapping is revoked with the claim: %08x", rd32(EDU_IDENT));

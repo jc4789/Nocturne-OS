@@ -172,8 +172,9 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 
 ## 7. メモリ（`sbrk`／`mmap`／`mprotect` の置き換え）
 
-- `n_memory_reserve(bytes, n_memory_access)`：ゼロ初期化の領域を確保。
-- `n_memory_release(addr, bytes)`、`n_memory_protect(addr, bytes, access)`。
+- `n_memory_reserve(bytes, n_memory_access, &memory)`：ゼロ初期化の領域を確保し、
+  `memory` に置く（失敗では NULL と負の `n_result`）。
+- `n_memory_release(addr, bytes)`、`n_memory_protect(addr, bytes, access)`：0 か負の `n_result`。
 - `access` は列挙：`N_MEMORY_READ`、`N_MEMORY_READ_WRITE`、`N_MEMORY_READ_EXECUTE`。
   書込みと実行の同時許可は無い（W^X）。
 - 確保時だけ `access` に `N_MEMORY_LOW` を足せる：2GiB未満の低位領域（1GiB〜2GiB、
@@ -182,7 +183,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   低位領域は通常領域と別の空き一覧・境界を持ち、解放・保護は同じ関数で行う。
 - 共有ページ：`n_shared_create(bytes)` は確保済み、`n_shared_reserve(bytes)` は最初に
   触れたページから割り当てる共有オブジェクトのハンドルを返す。`n_shared_map(h, bytes,
-  N_MEMORY_READ | N_MEMORY_READ_WRITE)` は自分が持つハンドルだけを写す（NULL＋`errno`）。
+  N_MEMORY_READ | N_MEMORY_READ_WRITE, &mapping)` は自分が持つハンドルだけを写す
+  （失敗では `mapping` が NULL で、負の `n_result`）。
   他のアプリへはチャンネルの添付で渡す。他アプリのハンドル番号を指す手段や、番号札で
   受け渡す仕組みは無い。ブラウザーの SharedArrayBuffer／共有WebAssemblyメモリは、本文の
   前に添付だけを運ぶ搬送メッセージ（一つに一個）を送って Worker へ渡す。

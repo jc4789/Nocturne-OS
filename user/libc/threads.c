@@ -1,7 +1,6 @@
 /* ISO C11 <threads.h> on Nocturne native threads (thread_create/join) and
  * address waits (wait_on_address/wake_address). Not a POSIX layer. */
 #include <threads.h>
-#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,10 +146,10 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
     t->arg = arg;
     t->refs = 2;
     t->started_here = true;
-    int tid = thread_create(thrd_entry, t);
-    if (tid < 0) { free(t); return errno == ENOMEM ? thrd_nomem : thrd_error; }
+    n_result tid = thread_create(thrd_entry, t);
+    if (tid < 0) { free(t); return tid == -N_ERR_NO_MEMORY ? thrd_nomem : thrd_error; }
     /* The child also records its id; both writes store the same value. */
-    t->tid = tid;
+    t->tid = (int)tid;
     *thr = t;
     return thrd_success;
 }

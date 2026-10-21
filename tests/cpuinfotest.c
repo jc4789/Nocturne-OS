@@ -2,7 +2,6 @@
 #include <nocturne.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 
 /* TinyCCのassemblerはAVX mnemonic/SIMD clobber名を持たない。
    noinline整数関数の通常call ABIでSIMD caller-saveを表し、固定GPRで命令を符号化する。 */
@@ -51,7 +50,7 @@ int main(void) {
         puts("cpuinfotest: invalid capability snapshot");
         return 1;
     }
-    if (cpu_info(NULL) != -1 || errno != EFAULT) {
+    if (cpu_info(NULL) != -N_ERR_BAD_ADDRESS) {
         puts("cpuinfotest: invalid pointer was not rejected");
         return 1;
     }

@@ -18,7 +18,6 @@
  *   VOLTA_USERMODE_A                                        the doorbell page
  */
 #include <limits.h>
-#include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -106,9 +105,9 @@ pci_snapshot(struct n_pciinfo **out, uint32_t *count)
          break;
       }
       list = next;
-      int len = pcilist(list, (int)capacity);
+      n_result len = pcilist(list, (int)capacity);
       if (len < 0) {
-         status = errno == N_ERR_NO_MEMORY ? NV_ERR_NO_MEMORY : NV_ERR_OPERATING_SYSTEM;
+         status = len == -N_ERR_NO_MEMORY ? NV_ERR_NO_MEMORY : NV_ERR_OPERATING_SYSTEM;
          break;
       }
       if ((size_t)len < capacity) {

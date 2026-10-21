@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 
 static int failed;
@@ -34,15 +33,17 @@ static int probe(const char *what) {
         return ((int (*)(void))(void *)p)();
     } else if (!strcmp(what, "exec-after-protect-rw")) {
         /* Generated code is made executable, then made writable again: it must lose execute. */
-        unsigned char *p = n_memory_reserve(4096, N_MEMORY_READ_WRITE);
-        if (!p) return 0;
+        void *page;
+        if (n_memory_reserve(4096, N_MEMORY_READ_WRITE, &page) < 0) return 0;
+        unsigned char *p = page;
         memcpy(p, code42, sizeof code42);
         if (n_memory_protect(p, 4096, N_MEMORY_READ_EXECUTE) ||
             n_memory_protect(p, 4096, N_MEMORY_READ_WRITE)) return 0;
         return ((int (*)(void))(void *)p)();
     } else if (!strcmp(what, "write-after-protect-rx")) {
-        unsigned char *p = n_memory_reserve(4096, N_MEMORY_READ_WRITE);
-        if (!p) return 0;
+        void *page;
+        if (n_memory_reserve(4096, N_MEMORY_READ_WRITE, &page) < 0) return 0;
+        unsigned char *p = page;
         memcpy(p, code42, sizeof code42);
         if (n_memory_protect(p, 4096, N_MEMORY_READ_EXECUTE)) return 0;
         *(volatile unsigned char *)p = 0xC3;
@@ -76,7 +77,9 @@ int main(int argc, char **argv) {
     }
 
     /* JIT-style: write code into RW memory, flip it to RX, call it */
-    unsigned char *p = n_memory_reserve(8192, N_MEMORY_READ_WRITE);
+    void *pages = NULL, *none;
+    n_memory_reserve(8192, N_MEMORY_READ_WRITE, &pages);
+    unsigned char *p = pages;
     check("n_memory_reserve", p && ((uintptr_t)p & 4095) == 0);
     if (p) {
         check("reserved memory is zeroed", !p[0] && !p[8191]);
@@ -88,8 +91,7 @@ int main(int argc, char **argv) {
         check("second page stays writable", (p[4096] = 1, p[4096] == 1));
         check("release", n_memory_release(p, 8192) == 0);
     }
-    errno = 0;
-    check("reserve without an access fails", !n_memory_reserve(4096, N_MEMORY_LOW) && errno == N_ERR_INVALID);
+    check("reserve without an access fails", n_memory_reserve(4096, N_MEMORY_LOW, &none) == -N_ERR_INVALID && !none);
     check("protect unmapped fails", n_memory_protect((void *)0x500000000000, 4096, N_MEMORY_READ) < 0);
 
     /* the kernel must refuse to write into read-only memory for us, not crash */

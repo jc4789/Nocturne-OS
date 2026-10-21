@@ -94,13 +94,14 @@ n_handle n_pci_bar(n_handle pci, uint32_t index) {
     live++;
     return 200 + index;
 }
-void *n_shared_map(n_handle h, size_t bytes, int access) {
+n_result n_shared_map(n_handle h, size_t bytes, int access, void **mapping) {
     (void)h; (void)access;
     CHECK(bytes <= sizeof mapped);
     maps++;
-    return mapped;
+    *mapping = mapped;
+    return 0;
 }
-int n_memory_release(void *p, size_t bytes) { (void)p; (void)bytes; maps--; return 0; }
+n_result n_memory_release(void *p, size_t bytes) { (void)p; (void)bytes; maps--; return 0; }
 n_result n_handle_close(n_handle h) { CHECK(h >= 0); live--; closes++; return 0; }
 const char *n_result_text(n_result r) { (void)r; return "mock"; }
 

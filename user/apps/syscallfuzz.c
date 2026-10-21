@@ -448,8 +448,8 @@ static void checks(void) {
         call5(SYS_HANDLE_KIND, h, 0, 0, 0, 0);
     }
     /* Memory: a protect/release that names more than was reserved; a mapping released twice. */
-    void *m = n_memory_reserve(3 * 4096, N_MEMORY_READ_WRITE);
-    if (m) {
+    void *m;
+    if (n_memory_reserve(3 * 4096, N_MEMORY_READ_WRITE, &m) >= 0) {
         call5(SYS_MEMORY_PROTECT, (long)(uintptr_t)m + 1, 4096, N_MEMORY_READ, 0, 0);
         call5(SYS_MEMORY_PROTECT, (long)(uintptr_t)m, 4096, 7, 0, 0);
         call5(SYS_MEMORY_PROTECT, (long)(uintptr_t)m, 4096, N_MEMORY_READ_WRITE | N_MEMORY_READ_EXECUTE, 0, 0);
@@ -489,7 +489,9 @@ static volatile uint32_t race_gate;
 static void racer(void *arg) {
     long id = (long)(uintptr_t)arg;
     uint64_t x = 0x9E3779B97F4A7C15ULL * (uint64_t)(id + 1) ^ rng_state; /* private sequence per thread */
-    uint8_t *local = (uint8_t *)n_memory_reserve(4096, N_MEMORY_READ_WRITE);
+    void *page;
+    n_memory_reserve(4096, N_MEMORY_READ_WRITE, &page);
+    uint8_t *local = page;
     struct n_event ev[4];
     while (!__atomic_load_n(&race_go, __ATOMIC_ACQUIRE) && !stop_all) {}
     while (__atomic_load_n(&race_go, __ATOMIC_ACQUIRE) && !stop_all) {
@@ -618,9 +620,12 @@ int main(int argc, char **argv) {
     started_ms = n_clock_uptime_ms();
     deadline_ms = started_ms + (uint64_t)seconds * 1000;
 
-    buf = n_memory_reserve(BUFSZ, N_MEMORY_READ_WRITE);
-    uint8_t *two = n_memory_reserve(8192, N_MEMORY_READ_WRITE);
-    if (!buf || !two) { logf_("syscallfuzz: cannot reserve memory"); return 1; }
+    void *pages, *pair = NULL;
+    n_result reserved = n_memory_reserve(BUFSZ, N_MEMORY_READ_WRITE, &pages);
+    if (reserved >= 0) reserved = n_memory_reserve(8192, N_MEMORY_READ_WRITE, &pair);
+    buf = pages;
+    uint8_t *two = pair;
+    if (reserved < 0) { logf_("syscallfuzz: cannot reserve memory"); return 1; }
     n_memory_release(two + 4096, 4096); /* the second page is now a hole: edge points into it */
     edge = two + 4096;
     for (int i = 0; i < BUFSZ; i++) buf[i] = (uint8_t)(rnd() >> 24);

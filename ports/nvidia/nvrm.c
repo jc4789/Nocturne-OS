@@ -58,7 +58,7 @@ static int irq_thread(void *unused) {
                 continue;
             }
         } else {
-            msleep(IRQ_POLL_MS);
+            n_sleep_ms(IRQ_POLL_MS);
         }
         irq_run_rm();
     }

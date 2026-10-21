@@ -62,7 +62,9 @@ static bool video_publish(struct video_tx *v,const struct nmedia_output *o,uint3
         if(!nmsw_shared_size(capacity,&total))return false;
         struct video_storage *s=nmedia_ff_mallocz(sizeof *s);if(!s)return false;
         s->handle=n_shared_create(total);s->bytes=total;s->capacity=capacity;s->id=++v->storage_id;
-        if(s->handle<0 || !(s->shared=n_shared_map(s->handle,total,N_MEMORY_READ_WRITE))){video_storage_free(s);return false;}
+        void *mapping;
+        if(s->handle<0 || n_shared_map(s->handle,total,N_MEMORY_READ_WRITE,&mapping)<0){video_storage_free(s);return false;}
+        s->shared=mapping;
         s->shared->id=s->id; /* immutable backing identity, not only wire state */
         if(v->storage){v->storage->next=v->retired;v->retired=v->storage;}
         v->storage=s;

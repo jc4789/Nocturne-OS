@@ -104,11 +104,13 @@ static void os_print_last_error(const char* msg) {
 #error "WASM_RT_MEMCHECK_GUARD_PAGES needs fault recovery, which Nocturne lacks"
 #endif
 static void* os_mmap(size_t size) {
-  return n_memory_reserve(size, N_MEMORY_READ_WRITE);
+  void* pages;
+  n_memory_reserve(size, N_MEMORY_READ_WRITE, &pages);
+  return pages;
 }
 
 static int os_munmap(void* addr, size_t size) {
-  return n_memory_release(addr, size);
+  return n_memory_release(addr, size) < 0 ? -1 : 0;
 }
 
 static int os_mprotect(void* addr, size_t size) {

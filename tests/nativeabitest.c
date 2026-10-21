@@ -265,8 +265,10 @@ static void apps(const char *self) {
 /* Pages below 2 GiB for code with 32-bit absolute addresses, beside the usual ones. */
 static void memory(void) {
     const uintptr_t low_top = (uintptr_t)1 << 31;
-    char *p = n_memory_reserve(3 * 4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW);
-    char *q = n_memory_reserve(4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW);
+    void *pm, *qm, *againm, *highm, *none;
+    CHECK(n_memory_reserve(3 * 4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW, &pm) == 0);
+    CHECK(n_memory_reserve(4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW, &qm) == 0);
+    char *p = pm, *q = qm;
     CHECK(p && q && (uintptr_t)p + 3 * 4096 <= low_top && (uintptr_t)q + 4096 <= low_top && !((uintptr_t)p & 4095));
     if (!p || !q) return;
     CHECK(!p[0] && !p[3 * 4096 - 1]);
@@ -274,18 +276,20 @@ static void memory(void) {
     CHECK(n_memory_protect(p, 4096, N_MEMORY_READ_EXECUTE) == 0);
     CHECK(n_memory_protect(p, 4096, N_MEMORY_READ_WRITE) == 0 && p[0] == 1);
     CHECK(n_memory_release(p + 4096, 2 * 4096) == 0 && n_memory_release(p, 4096) == 0);
-    char *again = n_memory_reserve(3 * 4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW);
+    n_memory_reserve(3 * 4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW, &againm);
+    char *again = againm;
     CHECK(again == p && !again[0]); /* the freed range is reused, zero-filled */
     CHECK(q[0] == 3);
     CHECK(n_memory_release(again, 3 * 4096) == 0 && n_memory_release(q, 4096) == 0);
-    char *high = n_memory_reserve(4096, N_MEMORY_READ_WRITE);
+    n_memory_reserve(4096, N_MEMORY_READ_WRITE, &highm);
+    char *high = highm;
     CHECK(high && (uintptr_t)high >= low_top);
     if (high) n_memory_release(high, 4096);
     errno = 0;
-    CHECK(!n_memory_reserve(4096, N_MEMORY_LOW) && errno == N_ERR_INVALID);
-    errno = 0;
-    CHECK(!n_memory_reserve((size_t)3 << 29, N_MEMORY_READ_WRITE | N_MEMORY_LOW) && errno == N_ERR_NO_MEMORY);
-    CHECK(n_memory_release((void *)(uintptr_t)0x10000000, 4096) == -1 && errno == N_ERR_INVALID);
+    CHECK(n_memory_reserve(4096, N_MEMORY_LOW, &none) == -N_ERR_INVALID && !none);
+    CHECK(n_memory_reserve((size_t)3 << 29, N_MEMORY_READ_WRITE | N_MEMORY_LOW, &none) == -N_ERR_NO_MEMORY && !none);
+    CHECK(n_memory_release((void *)(uintptr_t)0x10000000, 4096) == -N_ERR_INVALID);
+    CHECK(errno == 0); /* the native calls leave errno alone */
 }
 
 int main(int argc, char **argv) {

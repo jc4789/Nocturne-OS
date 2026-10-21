@@ -86,7 +86,7 @@ static uint64_t user_rdtsc(void) {
     __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
     return (uint64_t)hi << 32 | lo;
 }
-int clock_info(struct n_clockinfo *info) { return (int)ret(SC1(SYS_CLOCK_INFO, info)); }
+n_result clock_info(struct n_clockinfo *info) { return SC1(SYS_CLOCK_INFO, info); }
 static uint64_t clock_publish(uint64_t ms) {
     uint64_t previous = __atomic_load_n(&clock_last, __ATOMIC_RELAXED);
     while (ms > previous && !__atomic_compare_exchange_n(&clock_last, &previous, ms, false,
@@ -158,11 +158,11 @@ static _Noreturn void libc_thread_entry(void (*fn)(void *), void *arg) {
     fn(arg);
     thread_exit();
 }
-int thread_create(void (*fn)(void *), void *arg) {
-    if (!fn) { errno = EINVAL; return -1; }
-    return (int)ret(SC3(SYS_THREAD_CREATE, fn, arg, libc_thread_entry));
+n_result thread_create(void (*fn)(void *), void *arg) {
+    if (!fn) return -N_ERR_INVALID;
+    return SC3(SYS_THREAD_CREATE, fn, arg, libc_thread_entry);
 }
-int thread_join(int tid) { return (int)ret(SC1(SYS_THREAD_JOIN, tid)); }
+n_result thread_join(int tid) { return SC1(SYS_THREAD_JOIN, tid); }
 _Noreturn void thread_exit(void) { SC0(SYS_THREAD_EXIT); for (;;) {} }
 int thread_id(void) {
     struct libc_thread *t = libc_thread_current();
@@ -204,9 +204,10 @@ time_t time(time_t *t) {
 }
 n_handle n_shared_create(size_t bytes) { return (n_handle)__syscall(SYS_SHARED_CREATE, (long)bytes, 0, 0, 0, 0); }
 n_handle n_shared_reserve(size_t bytes) { return (n_handle)__syscall(SYS_SHARED_RESERVE, (long)bytes, 0, 0, 0, 0); }
-void *n_shared_map(n_handle shared, size_t bytes, int access) {
-    long r = ret(SC3(SYS_SHARED_MAP, shared, bytes, access));
-    return r < 0 ? NULL : (void *)r;
+n_result n_shared_map(n_handle shared, size_t bytes, int access, void **mapping) {
+    long r = SC3(SYS_SHARED_MAP, shared, bytes, access);
+    *mapping = r < 0 ? NULL : (void *)r;
+    return r < 0 ? r : 0;
 }
 
 /* ---- native ABI: results come back as they are, errno is left alone ---- */
@@ -247,8 +248,9 @@ n_result n_document_load(const char *path, void **data, size_t *size) {
     if (h < 0) return h;
     n_result r = n_document_size(h);
     size_t reserved = r > 0 ? (size_t)r : 0, bytes = 0;
-    uint8_t *buf = NULL;
-    if (reserved && !(buf = n_memory_reserve(reserved, N_MEMORY_READ_WRITE))) r = -N_ERR_NO_MEMORY;
+    void *pages = NULL;
+    if (reserved) r = n_memory_reserve(reserved, N_MEMORY_READ_WRITE, &pages);
+    uint8_t *buf = pages;
     while (r >= 0 && bytes < reserved) {
         r = n_document_read_at(h, bytes, buf + bytes, reserved - bytes);
         if (r <= 0) break; /* 0: it shrank meanwhile */
@@ -403,11 +405,11 @@ int64_t n_clock_wall(void) { return SC0(SYS_TIME); }
 void n_sleep_ms(uint64_t ms) { SC1(SYS_SLEEP, ms); }
 int proclist(struct n_procinfo *out, int max) { return (int)ret(SC2(SYS_PROCLIST, out, max)); }
 int sysinfo(struct n_sysinfo *si) { return (int)ret(SC1(SYS_SYSINFO, si)); }
-int cpu_info(struct n_cpuinfo *info) { return (int)ret(SC1(SYS_CPU_INFO, info)); }
+n_result cpu_info(struct n_cpuinfo *info) { return SC1(SYS_CPU_INFO, info); }
 void yield(void) { SC0(SYS_YIELD); }
 int poweroff(void) { return (int)ret(SC1(SYS_POWER, POWER_OFF)); }
 int reboot(void) { return (int)ret(SC1(SYS_POWER, POWER_REBOOT)); }
-int pcilist(struct n_pciinfo *out, int max) { return (int)ret(SC2(SYS_PCILIST, out, max)); }
+n_result pcilist(struct n_pciinfo *out, int max) { return SC2(SYS_PCILIST, out, max); }
 
 static bool is_document(const char *path) {
     struct n_entry e;
@@ -699,13 +701,12 @@ void __libc_fini_array(void) {
 }
 
 /* ---- native memory: zero-filled pages, never writable and executable at once ---- */
-void *n_memory_reserve(size_t bytes, int access) {
-    long r = ret(__syscall(SYS_MEMORY_RESERVE, (long)bytes, access, 0, 0, 0));
-    return r < 0 ? NULL : (void *)r;
+n_result n_memory_reserve(size_t bytes, int access, void **memory) {
+    long r = SC2(SYS_MEMORY_RESERVE, bytes, access);
+    *memory = r < 0 ? NULL : (void *)r;
+    return r < 0 ? r : 0;
 }
-int n_memory_release(void *addr, size_t bytes) {
-    return (int)ret(__syscall(SYS_MEMORY_RELEASE, (long)addr, (long)bytes, 0, 0, 0));
-}
-int n_memory_protect(void *addr, size_t bytes, int access) {
-    return (int)ret(__syscall(SYS_MEMORY_PROTECT, (long)addr, (long)bytes, access, 0, 0));
+n_result n_memory_release(void *addr, size_t bytes) { return SC2(SYS_MEMORY_RELEASE, addr, bytes); }
+n_result n_memory_protect(void *addr, size_t bytes, int access) {
+    return SC3(SYS_MEMORY_PROTECT, addr, bytes, access);
 }
