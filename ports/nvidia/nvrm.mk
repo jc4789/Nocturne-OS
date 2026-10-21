@@ -131,12 +131,14 @@ $(NVRM_OUT)/os/%.o: ports/nvidia/%.c ports/nvidia/nvrm_os.h ports/nvidia/nvrm_se
 # libnvrm: how an app (NVK's nvkmd/nocturne) talks to /bin/nvrm. An ordinary libc member, built
 # with the program flags; it only needs the RM SDK's types and parameter structures.
 NVRM_CLIENT_OBJ := $(NVRM_OUT)/libnvrm.o
+# What a client's source includes: the protocol and libnvrm, and the RM SDK's parameter structures.
+NVRM_CLIENT_INC := -Iports/nvidia/include \
+    $(addprefix -I$(NVRM_VENDOR)/src/,common/sdk/nvidia/inc nvidia/arch/nvalloc/unix/include)
 $(BUILD)/u/user/apps/init.o: UCFLAGS += -Iports/nvidia/include
 $(NVRM_CLIENT_OBJ): ports/nvidia/libnvrm.c
 	@mkdir -p $(dir $@)
 	@echo "  CC   $<"
-	@$(CC) $(UCFLAGS) -Iports/nvidia/include \
-	    $(addprefix -I$(NVRM_VENDOR)/src/,common/sdk/nvidia/inc nvidia/arch/nvalloc/unix/include) -c $< -o $@
+	@$(CC) $(UCFLAGS) $(NVRM_CLIENT_INC) -c $< -o $@
 
 # ---------------------------------------------------------------- targets
 .PHONY: nvrm-objs nvrm-rm nvrm-os nvrm-undefined

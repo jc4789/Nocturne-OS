@@ -26,6 +26,7 @@
 #define R_EVENTLOG  0x0010
 #define R_CONTROL   0x0018
 #define R_EFR       0x0030
+#define R_PERF_OPT  0x016C
 #define R_CMD_HEAD  0x2000
 #define R_CMD_TAIL  0x2008
 #define R_EVT_HEAD  0x2010
@@ -42,7 +43,9 @@
 #define ST_COMWAIT_INT    (1u << 2)
 #define ST_EVENTLOG_RUN   (1u << 3)
 #define ST_CMDBUF_RUN     (1u << 4)
-#define EFR_IA (1ull << 6) /* INVALIDATE_IOMMU_ALL */
+#define EFR_IA       (1ull << 6)  /* INVALIDATE_IOMMU_ALL */
+#define EFR_PERF_OPT (1ull << 45) /* the performance optimization register (3.4.9) */
+#define PERF_OPT_EN  (1u << 13)
 #define CAP_NP_CACHE (1u << 26) /* caches not-present entries: a map needs an invalidation too */
 #define CAP_EFR      (1u << 27)
 
@@ -113,13 +116,9 @@ static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 /* ---- IVRS ---- */
 static void alias_add(uint16_t first, uint16_t last, uint16_t as) {
     if (first > last) return;
-    struct alias *grown = kgrow(aliases, naliases, &aliases_room, sizeof *grown);
-    if (!grown) {
-        parse_lost = true;
-        return;
-    }
-    aliases = grown;
-    aliases[naliases++] = (struct alias){first, last, as};
+    struct alias *a = kappend(&aliases, &naliases, &aliases_room, sizeof *a);
+    if (a) *a = (struct alias){first, last, as};
+    else parse_lost = true;
 }
 
 /* IDs the unit sees requests with: covered (a claim may isolate them), and named, so that what
@@ -127,13 +126,9 @@ static void alias_add(uint16_t first, uint16_t last, uint16_t as) {
 static void listed_add(struct unit *u, uint16_t first, uint16_t last, bool cover) {
     if (first > last) return;
     if (cover) iommu_cover(first, last);
-    struct span *grown = kgrow(u->listed, u->nlisted, &u->listed_room, sizeof *grown);
-    if (!grown) {
-        parse_lost = true;
-        return;
-    }
-    u->listed = grown;
-    u->listed[u->nlisted++] = (struct span){first, last};
+    struct span *s = kappend(&u->listed, &u->nlisted, &u->listed_room, sizeof *s);
+    if (s) *s = (struct span){first, last};
+    else parse_lost = true;
 }
 
 /* Device entries (Table 95 on): 4 bytes below type 40h, 8 below 80h, ACPI HID entries (F0h) 22
@@ -218,16 +213,10 @@ static bool parse_ivrs(void) {
                 } else if (pass == 0 && !base) {
                     kprintf("iommu: the IVRS describes an AMD-Vi unit without an address; not used\n");
                 } else if (pass == 0 && !u) {
-                    struct unit *grown = kgrow(units, nunits, &units_room, sizeof *grown);
-                    if (!grown) {
+                    if ((u = kappend(&units, &nunits, &units_room, sizeof *u)))
+                        *u = (struct unit){.base = base, .type = type};
+                    else
                         parse_lost = true;
-                    } else {
-                        units = grown;
-                        u = &units[nunits++];
-                        memset(u, 0, sizeof *u);
-                        u->base = base;
-                        u->type = type;
-                    }
                 } else if (pass == 0 && type > u->type) {
                     u->type = type;
                 } else if (pass == 1 && u && u->type == type) {
@@ -247,8 +236,25 @@ static bool parse_ivrs(void) {
 }
 
 /* ---- commands and events ---- */
-/* A unit stops fetching commands after an illegal or failed one (events 5 and 6, CmdBufRun
-   clear): its buffer starts again, empty. What it had not done is lost, and the next sync says so. */
+/* Waits until the status bits `bits` read `want`: false when they did not in time. */
+static bool status_wait(const struct unit *u, uint32_t bits, uint32_t want) {
+    for (uint64_t t = iommu_deadline(10); (rd(u, R_STATUS) & bits) != want; pause())
+        if (iommu_expired(t)) return false;
+    return true;
+}
+
+/* CmdBufRun is a level: set once CmdBufEn is written with 1 and the unit fetches commands, clear
+   only when it halts them for cause, after an illegal or failed command (events 5 and 6), and
+   then clear until CmdBufEn is written with 1 again (3.4.16). The unit is waited for after every
+   such write, so reading it clear after that says the unit halted. It starts again as 2.4 says:
+   with CmdBufRun clear, CmdBufEn off, the pointers set, CmdBufEn on; its buffer empty. What it
+   had not done is lost, and the next sync says so. */
+static bool commands_started(const struct unit *u) {
+    if (status_wait(u, ST_CMDBUF_RUN, ST_CMDBUF_RUN)) return true;
+    kprintf("iommu: unit at %lx does not start fetching commands\n", u->base);
+    return false;
+}
+
 static void commands_restart(struct unit *u) {
     kprintf("iommu: unit at %lx stopped taking commands; started again\n", u->base);
     uint64_t ctl = rd(u, R_CONTROL);
@@ -258,6 +264,7 @@ static void commands_restart(struct unit *u) {
     u->cmd_tail = 0;
     u->lost = true;
     wr(u, R_CONTROL, ctl | CTL_CMDBUF_EN);
+    commands_started(u);
 }
 
 /* A command for one unit: one it has no room for in time is lost (u->lost). */
@@ -305,12 +312,6 @@ static void event_show(const struct unit *u, const volatile uint32_t *e) {
     }
 }
 
-static bool stopped(const struct unit *u, uint64_t run) {
-    for (uint64_t t = iommu_deadline(10); rd(u, R_STATUS) & run; pause())
-        if (iommu_expired(t)) return false;
-    return true;
-}
-
 static void events_drain(struct unit *u) {
     uint32_t status = (uint32_t)rd(u, R_STATUS);
     wr(u, R_STATUS, status & ST_EVENT_INT);
@@ -321,14 +322,17 @@ static void events_drain(struct unit *u) {
     /* The log overflowed: once it stopped writing (EventLogRun clear, the only time its registers
        may change) it starts again, empty (2.5.1). Until then it is tried again at the next drain. */
     if (status & ST_EVENT_OVERFLOW) {
-        if (!stopped(u, ST_EVENTLOG_RUN)) {
+        if (!status_wait(u, ST_EVENTLOG_RUN, 0)) {
             if (!u->overflow_told)
                 kprintf("iommu: unit at %lx: its event log overflowed and has not stopped yet\n", u->base);
             u->overflow_told = true;
             return;
         }
         u->overflow_told = false;
+        /* CmdBufEn written with 1 restarts a halted command buffer where it halted: one that
+           halted is left to commands_restart */
         uint64_t ctl = rd(u, R_CONTROL);
+        if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) ctl &= ~CTL_CMDBUF_EN;
         wr(u, R_CONTROL, ctl & ~CTL_EVENTLOG_EN);
         wr(u, R_EVT_HEAD, 0);
         wr(u, R_EVT_TAIL, 0);
@@ -486,11 +490,19 @@ static bool amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
 }
 
 /* ---- the units ---- */
+/* Off, also when the firmware left it on, then on with this code's tables. Two features let
+   requests past the device table, and both stay off: MARC's apertures (2.9), whose global enable
+   MarcEn is a control bit never set here, and the performance optimization (3.4.9), which lets
+   integrated devices such as GPUs reach memory without the unit, in a register of its own. */
 static bool program(struct unit *u) {
-    wr(u, R_CONTROL, 0); /* off, also when the firmware left it on */
-    if (!stopped(u, ST_EVENTLOG_RUN | ST_CMDBUF_RUN)) {
+    wr(u, R_CONTROL, 0);
+    if (!status_wait(u, ST_EVENTLOG_RUN | ST_CMDBUF_RUN, 0)) {
         kprintf("iommu: unit at %lx does not stop its command buffer and event log\n", u->base);
         return false;
+    }
+    if (u->efr & EFR_PERF_OPT) {
+        volatile uint32_t *perf = (volatile uint32_t *)(u->regs + R_PERF_OPT);
+        *perf &= ~PERF_OPT_EN;
     }
     wr(u, R_DEVTAB, devtab | (DT_BYTES / PAGE_SIZE - 1));
     wr(u, R_CMDBUF, u->cmd | RING_LEN);
@@ -512,7 +524,7 @@ static bool program(struct unit *u) {
     if (u->flags & 32) ctl |= 1ull << 10;
     if (event_vector >= 0 && u->fn) ctl |= CTL_EVENTINT_EN;
     wr(u, R_CONTROL, ctl);
-    return true;
+    return commands_started(u);
 }
 
 /* What a unit may have cached before it was ours, or before a sleep: everything at once where
@@ -538,7 +550,7 @@ static bool units_off(void) {
     bool ok = true;
     for (size_t i = 0; i < nunits; i++) {
         wr(&units[i], R_CONTROL, 0);
-        if (!stopped(&units[i], ST_EVENTLOG_RUN | ST_CMDBUF_RUN)) {
+        if (!status_wait(&units[i], ST_EVENTLOG_RUN | ST_CMDBUF_RUN, 0)) {
             kprintf("iommu: unit at %lx does not stop\n", units[i].base);
             ok = false;
         }
@@ -569,7 +581,10 @@ static void tables_free(void) {
     devtab = sems = 0;
 }
 
-static bool amd_start(void) {
+/* Only with translation: interrupts pass a unit that is off as they are (an AMD-Vi unit has
+   nothing like VT-d's ECAP.IRREQ), so there is no reason to start one without. */
+static bool amd_start(bool translate) {
+    if (!translate) return false;
     sem_pages = ALIGN_UP(nunits * 8, PAGE_SIZE) / PAGE_SIZE;
     devtab = pmm_alloc_contig(DT_BYTES / PAGE_SIZE);
     sems = pmm_alloc_contig(sem_pages);
@@ -611,6 +626,7 @@ static bool amd_start(void) {
             kprintf("iommu: unit at %lx has no event interrupt: blocked requests show after commands only\n",
                     units[i].base);
     }
+    amd.translating = true;
     kprintf("iommu: AMD-Vi on, %lu unit%s; %lu alias%s, %u reserved range%s: every function passes through "
             "until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s", (unsigned long)naliases,
             naliases == 1 ? "" : "es", iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s");

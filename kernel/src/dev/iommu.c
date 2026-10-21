@@ -49,26 +49,18 @@ void iommu_reserved(uint16_t first, uint16_t last, uint64_t start, uint64_t end,
             reserved[i].access |= access;
             return;
         }
-    struct reserved *grown = kgrow(reserved, nreserved, &reserved_room, sizeof *grown);
-    if (!grown) {
-        lost("reserved memory ranges");
-        return;
-    }
-    reserved = grown;
-    reserved[nreserved++] = (struct reserved){first, last, start, end, access};
+    struct reserved *r = kappend(&reserved, &nreserved, &reserved_room, sizeof *r);
+    if (r) *r = (struct reserved){first, last, start, end, access};
+    else lost("reserved memory ranges");
 }
 
 unsigned iommu_reserved_count(void) { return (unsigned)nreserved; }
 
 void iommu_cover(uint16_t first, uint16_t last) {
     if (first > last) return;
-    struct span *grown = kgrow(covered, ncovered, &covered_room, sizeof *grown);
-    if (!grown) {
-        lost("device scopes");
-        return;
-    }
-    covered = grown;
-    covered[ncovered++] = (struct span){first, last};
+    struct span *s = kappend(&covered, &ncovered, &covered_room, sizeof *s);
+    if (s) *s = (struct span){first, last};
+    else lost("device scopes");
 }
 
 static bool is_covered(uint16_t id) {
@@ -80,13 +72,9 @@ static bool is_covered(uint16_t id) {
 void iommu_kernel_id(uint16_t id) {
     for (size_t i = 0; i < nkernel_ids; i++)
         if (kernel_ids[i] == id) return;
-    uint16_t *grown = kgrow(kernel_ids, nkernel_ids, &kernel_ids_room, sizeof *grown);
-    if (!grown) {
-        lost("IOAPIC and HPET IDs");
-        return;
-    }
-    kernel_ids = grown;
-    kernel_ids[nkernel_ids++] = id;
+    uint16_t *at = kappend(&kernel_ids, &nkernel_ids, &kernel_ids_room, sizeof *at);
+    if (at) *at = id;
+    else lost("IOAPIC and HPET IDs");
 }
 
 static bool is_kernel_id(uint16_t id) {
@@ -95,39 +83,37 @@ static bool is_kernel_id(uint16_t id) {
     return false;
 }
 
+/* Units are found also with noiommu, or when the firmware's descriptions could not be kept: a
+   VT-d unit that requires interrupt remapping (ECAP.IRREQ) blocks every interrupt message while
+   it is off (5.1.4), so such units are started with interrupt remapping alone. */
 void iommu_init(void) {
-    if (cmdline_has("noiommu")) {
-        kprintf("iommu: off (noiommu): a device given to an app reaches all of memory\n");
-        return;
-    }
-    /* every wait on a unit is bounded by the TSC */
-    if (!tsc_hz) {
-        kprintf("iommu: the TSC rate is unknown, so waits on the units cannot be bounded: not used; a device "
-                "given to an app reaches all of memory\n");
-        return;
-    }
+    const char *off = cmdline_has("noiommu") ? "off (noiommu)" : NULL; /* why DMA is not translated */
     const struct iommu_hw *found = iommu_amd_probe();
     if (!found) found = iommu_intel_probe();
     if (!found) {
-        kprintf("iommu: none described (no IVRS or DMAR): a device given to an app reaches all of memory\n");
+        kprintf("iommu: %s: a device given to an app reaches all of memory\n",
+                off ? off : "none described (no IVRS or DMAR)");
         return;
     }
-    if (described_lost) {
-        kprintf("iommu: not used: a device given to an app reaches all of memory\n");
-        return;
-    }
+    if (!off && described_lost) off = "not used (the firmware's descriptions were not all kept)";
     hw = found; /* table writes need it from here on */
     domain_used[0] |= 3; /* 0 is never used, 1 is the back end's */
-    if (!hw->start()) {
+    if (!hw->start(!off)) {
         hw = NULL;
         ioapic_remap(); /* entries a back end made remappable go back to the plain format */
-        kprintf("iommu: not used: a device given to an app reaches all of memory\n");
+        kprintf("iommu: %s: a device given to an app reaches all of memory\n", off ? off : "not used");
+    } else if (!hw->translating) {
+        kprintf("iommu: %s remaps interrupts only: a device given to an app reaches all of memory\n", hw->name);
     }
 }
 
-bool iommu_active(void) { return hw != NULL; }
+bool iommu_active(void) { return hw && hw->translating; }
 
-uint64_t iommu_deadline(unsigned ms) { return rdtsc() + tsc_hz / 1000 * ms; }
+/* Waits on the units are bounded by the TSC. Where its rate is unknown (no PIT to measure it
+   against, no hypervisor to say it) one above any x86 CPU's TSC is assumed: a wait then lasts at
+   least as long as asked on every real CPU, longer on a slower TSC, and still ends. */
+#define TSC_HZ_CEILING 10000000000ull
+uint64_t iommu_deadline(unsigned ms) { return rdtsc() + (tsc_hz ? tsc_hz : TSC_HZ_CEILING) / 1000 * ms; }
 bool iommu_expired(uint64_t deadline) { return (int64_t)(rdtsc() - deadline) > 0; }
 
 bool iommu_fault_report(void) {
@@ -269,11 +255,9 @@ static bool id_has(const struct ids *l, uint16_t id) {
 
 static bool id_add(struct ids *l, uint16_t id) {
     if (id_has(l, id)) return true;
-    uint16_t *grown = kgrow(l->at, l->n, &l->room, sizeof *grown);
-    if (!grown) return false;
-    l->at = grown;
-    l->at[l->n++] = id;
-    return true;
+    uint16_t *at = kappend(&l->at, &l->n, &l->room, sizeof *at);
+    if (at) *at = id;
+    return at != NULL;
 }
 
 /* Adds the IDs d's requests may arrive with: its own, and for each bridge to conventional PCI or
@@ -307,9 +291,18 @@ uint16_t *iommu_requester_ids(const struct pci_device *d, unsigned *n) {
    units: those sending with one of its requester IDs; the other functions of its device unless
    its ACS sends what it addresses to them upstream; below a switch whose downstream port above
    it does not redirect every request upstream, everything below that switch; and everything
-   when a root port above it cannot be made to. A root port without ACS P2P Request Redirect
-   has no peer-to-peer with the other root ports (ACS requires it of one that has). The group
-   closes over its members: what a member reaches, it reaches too. */
+   when a root port above it has no ACS, or its ACS does not turn on. Such a root port validates
+   no requester ID (Source Validation is ACS's, 6.12.1.1), so what is below it may send with any
+   function's ID, and whether it passes requests to the other root ports is the root complex's
+   own choice (1.3.1). A function integrated in the root complex has no port: its requests reach
+   the units with the ID the root complex gives them, those to its peers too (VT-d 3.17; AMD-Vi
+   2.1, the IOMMU sees every request of the devices it serves), except that its device's other
+   functions may be reached inside the device, ACS or not (where an integrated function's ACS
+   redirects to is the root complex's choice, 6.12.1.2). The group closes over its members: what
+   a member reaches, it reaches too.
+   An attempt changes ACS controls on the way: written back when no domain comes of it (a
+   refused or unisolated claim leaves the bus as it was), kept while the domain lives and after
+   (its group stays blocked, dev/iommu.h). */
 #define ACS_V (1u << 0) /* source validation */
 #define ACS_B (1u << 1) /* translation blocking */
 #define ACS_R (1u << 2) /* P2P request redirect */
@@ -332,29 +325,48 @@ static bool fn_has(const struct fns *g, const struct pci_device *o) {
 
 static bool fn_add(struct fns *g, struct pci_device *o) {
     if (fn_has(g, o)) return true;
-    struct pci_device **grown = kgrow(g->at, g->n, &g->room, sizeof *grown);
-    if (!grown) return false;
-    g->at = grown;
-    g->at[g->n++] = o;
-    return true;
+    struct pci_device **at = kappend(&g->at, &g->n, &g->room, sizeof *at);
+    if (at) *at = o;
+    return at != NULL;
 }
 
 /* Bridges send no requests of their own that matter, unless a kernel driver runs them. */
 static bool sends(const struct pci_device *o) { return o->cls != 0x06 || o->kernel_owned; }
 
+/* ACS Control registers an attempt changed, as they were before */
+struct acs_change {
+    const struct pci_device *f;
+    uint16_t at, ctl;
+};
+struct acs_log {
+    struct acs_change *at;
+    size_t n, room;
+};
+
+static void acs_undo(const struct acs_log *log) {
+    for (size_t i = log->n; i--;)
+        pci_write16(log->at[i].f->bus, log->at[i].f->dev, log->at[i].f->func, log->at[i].at, log->at[i].ctl);
+}
+
 /* Turns on the ACS controls of `want` that f has, and off egress control and direct translated
-   P2P (both let requests past the redirect): false without ACS. *has: the controls of `want` it
-   has; *set: those of them that read back on. */
-static bool acs_set(const struct pci_device *f, uint16_t want, uint16_t *has, uint16_t *set) {
+   P2P (both let requests past the redirect), noting what the register was in log: 1; 0 without
+   ACS; -1 without memory to note it, nothing written. *has: the controls of `want` it has; *set:
+   those of them that read back on. */
+static int acs_set(struct acs_log *log, const struct pci_device *f, uint16_t want, uint16_t *has, uint16_t *set) {
     *has = *set = 0;
     uint16_t at = pci_find_ext_cap(f, 0x0D);
-    if (!at) return false;
+    if (!at) return 0;
     *has = pci_read16(f->bus, f->dev, f->func, at + 4) & want;
     uint16_t ctl = pci_read16(f->bus, f->dev, f->func, at + 6);
     uint16_t now = (uint16_t)((ctl | *has) & ~(ACS_E | ACS_T));
-    if (now != ctl) pci_write16(f->bus, f->dev, f->func, at + 6, now);
+    if (now != ctl) {
+        struct acs_change *c = kappend(&log->at, &log->n, &log->room, sizeof *c);
+        if (!c) return -1;
+        *c = (struct acs_change){f, (uint16_t)(at + 6), ctl};
+        pci_write16(f->bus, f->dev, f->func, at + 6, now);
+    }
     *set = pci_read16(f->bus, f->dev, f->func, at + 6) & *has;
-    return true;
+    return 1;
 }
 
 static bool add_below(struct fns *g, const struct pci_device *up) {
@@ -367,16 +379,18 @@ static bool add_below(struct fns *g, const struct pci_device *up) {
 
 /* Adds what m reaches, or what reaches m, past the units; *all when that is every function.
    False without memory. */
-static bool reach(struct fns *g, struct pci_device *m, bool *all) {
+static bool reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool *all) {
     uint16_t has, set;
     bool alone = true;
     for (int i = 0; i < pci_count() && alone; i++)
         alone = pci_at(i) == m || !sends(pci_at(i)) || !pci_same_device(m, pci_at(i));
     if (!alone) {
         /* A function that has no P2P Request Redirect has no peer-to-peer with the other
-           functions; one without ACS may, as its device implements it. A device integrated in the
-           root complex has no port above it that the redirected requests are sure to pass. */
-        bool acs = acs_set(m, ACS_PORT | ACS_B, &has, &set);
+           functions (6.12.1.2); one without ACS may, as its device implements it. A device
+           integrated in the root complex has no port above it that the redirected requests are
+           sure to pass. */
+        int acs = acs_set(log, m, ACS_PORT | ACS_B, &has, &set);
+        if (acs < 0) return false;
         if (!acs || !m->upstream || (set & (ACS_R | ACS_C)) != (has & (ACS_R | ACS_C))) {
             kprintf("iommu: %02x:%02x.%u: %s; the device's other functions are in its group\n", m->bus, m->dev,
                     m->func, !acs ? "no ACS" : !m->upstream ? "integrated in the root complex" : "its ACS did not turn on");
@@ -387,10 +401,13 @@ static bool reach(struct fns *g, struct pci_device *m, bool *all) {
         }
     }
     for (const struct pci_device *b = m->upstream; b; b = b->upstream) {
-        if (!b->pcie_cap) continue; /* conventional: they share the IDs of the bridge to it */
+        /* conventional bridges: what is below shares their IDs; switch upstream ports: what
+           passes them passed a downstream port or root port of their own */
+        if (!b->pcie_cap || (b->pcie_type != 4 && b->pcie_type != 6)) continue;
+        int acs = acs_set(log, b, ACS_PORT | ACS_B, &has, &set);
+        if (acs < 0) return false;
         if (b->pcie_type == 6) { /* a switch's downstream port: has all of ACS_PORT, or no ACS */
-            if (acs_set(b, ACS_PORT | ACS_B, &has, &set) && (has & ACS_PORT) == ACS_PORT && (set & ACS_PORT) == ACS_PORT)
-                continue;
+            if (acs && (has & ACS_PORT) == ACS_PORT && (set & ACS_PORT) == ACS_PORT) continue;
             kprintf("iommu: switch port %02x:%02x.%u above %02x:%02x.%u does not redirect requests between the "
                     "devices below the switch: they are in its group\n", b->bus, b->dev, b->func, m->bus, m->dev,
                     m->func);
@@ -399,13 +416,15 @@ static bool reach(struct fns *g, struct pci_device *m, bool *all) {
                 return true;
             }
             if (!add_below(g, b->upstream)) return false;
-        } else if (b->pcie_type == 4) {
-            /* a root port: what it has must turn on. One that forwards requests to other root
-               ports has to implement P2P Request Redirect (6.12.1.1), so one without ACS has no
-               peer-to-peer to stop. */
-            if (!acs_set(b, ACS_PORT | ACS_B, &has, &set) || (set & ACS_PORT) == (has & ACS_PORT)) continue;
-            kprintf("iommu: root port %02x:%02x.%u above %02x:%02x.%u: its ACS did not turn on; every function "
-                    "is in the group\n", b->bus, b->dev, b->func, m->bus, m->dev, m->func);
+        } else {
+            /* a root port: Source Validation is required of one with ACS, P2P Request Redirect
+               too when it passes requests to other root ports (6.12.1.1); what it has must turn
+               on */
+            if (acs && (has & ACS_V) && (set & ACS_PORT) == (has & ACS_PORT)) continue;
+            kprintf("iommu: root port %02x:%02x.%u above %02x:%02x.%u %s: what is below it may send with any ID "
+                    "and reach the other root ports; every function is in the group\n", b->bus, b->dev, b->func,
+                    m->bus, m->dev, m->func,
+                    !acs ? "has no ACS" : !(has & ACS_V) ? "cannot validate requester IDs" : "did not turn its ACS on");
             *all = true;
             return true;
         }
@@ -429,25 +448,31 @@ static bool reach(struct fns *g, struct pci_device *m, bool *all) {
     return ok;
 }
 
-static int group_of(struct pci_device *d, struct fns *g) {
+static bool group_of(struct pci_device *d, struct fns *g, struct acs_log *log) {
     bool all = false;
-    if (!fn_add(g, d)) return -N_ERR_NO_MEMORY;
+    if (!fn_add(g, d)) return false;
     for (size_t i = 0; i < g->n && !all; i++)
-        if (!reach(g, g->at[i], &all)) return -N_ERR_NO_MEMORY;
+        if (!reach(g, log, g->at[i], &all)) return false;
     for (int i = 0; all && i < pci_count(); i++)
-        if (sends(pci_at(i)) && !fn_add(g, pci_at(i))) return -N_ERR_NO_MEMORY;
-    return 0;
+        if (sends(pci_at(i)) && !fn_add(g, pci_at(i))) return false;
+    return true;
 }
 
-/* Every member free to join, and the group's IDs: each one seen by a unit and none the platform's. */
-static int group_check(const struct pci_device *d, const struct fns *g, struct ids *ids) {
+static void cannot_isolate(const struct pci_device *d, const struct pci_device *m, const char *why) {
+    kprintf("iommu: %02x:%02x.%u cannot be isolated: %02x:%02x.%u is in its group and %s\n", d->bus, d->dev, d->func,
+            m->bus, m->dev, m->func, why);
+}
+
+/* Whether the group can join a domain, and its IDs. What the platform decides first: no member
+   the kernel drives, every ID seen by a unit and none the platform's own; an error then with
+   *fixed set, as no later attempt finds it otherwise. Then the members' claims: -N_ERR_BUSY
+   while one is claimed or still in a domain. */
+static int group_check(const struct pci_device *d, const struct fns *g, struct ids *ids, bool *fixed) {
+    *fixed = true;
     for (size_t i = 0; i < g->n; i++) {
         const struct pci_device *m = g->at[i];
-        const char *why = m == d ? NULL : m->kernel_owned ? "a kernel driver runs it" : m->claimed ? "it is claimed" : NULL;
-        if (!why && iommu_in_use(m)) why = "it is still in a domain the units did not confirm blocked";
-        if (why) {
-            kprintf("iommu: %02x:%02x.%u cannot be isolated: %02x:%02x.%u is in its group and %s\n", d->bus, d->dev,
-                    d->func, m->bus, m->dev, m->func, why);
+        if (m->kernel_owned) {
+            cannot_isolate(d, m, "a kernel driver runs it");
             return -N_ERR_BUSY;
         }
         struct ids own = {0};
@@ -460,7 +485,10 @@ static int group_check(const struct pci_device *d, const struct fns *g, struct i
                 return -N_ERR_UNSUPPORTED;
             }
         kfree(own.at);
-        if (!ok || !ids_of(m, ids, true)) return -N_ERR_NO_MEMORY;
+        if (!ok || !ids_of(m, ids, true)) {
+            *fixed = false;
+            return -N_ERR_NO_MEMORY;
+        }
     }
     for (size_t k = 0; k < ids->n; k++)
         if (is_kernel_id(ids->at[k])) {
@@ -469,6 +497,18 @@ static int group_check(const struct pci_device *d, const struct fns *g, struct i
                     (ids->at[k] >> 3) & 31, ids->at[k] & 7);
             return -N_ERR_BUSY;
         }
+    *fixed = false;
+    for (size_t i = 0; i < g->n; i++) {
+        const struct pci_device *m = g->at[i];
+        if (m != d && m->claimed) {
+            cannot_isolate(d, m, "it is claimed");
+            return -N_ERR_BUSY;
+        }
+        if (iommu_in_use(m)) {
+            cannot_isolate(d, m, "it is in another claim's domain, or one whose block the units did not confirm");
+            return -N_ERR_BUSY;
+        }
+    }
     return 0;
 }
 
@@ -536,63 +576,92 @@ static void unlink(struct iommu_domain **list, struct iommu_domain *dom) {
         }
 }
 
+/* Whether the units drop what dom's functions send (pci_device.iommu_blocked). */
+static void members_blocked(const struct iommu_domain *dom, bool blocked) {
+    for (unsigned i = 0; i < dom->nmembers; i++) dom->members[i]->iommu_blocked = blocked;
+}
+
 /* The blocks not confirmed yet, tried again: a group comes free once one is. */
 static void held_retry(void) {
     for (struct iommu_domain *dom = held, *next; dom; dom = next) {
         next = dom->next;
         if (!hw->block(dom)) continue;
         dom->blocked = true;
+        members_blocked(dom, true);
         unlink(&held, dom);
         kprintf("iommu: %02x:%02x.%u: blocking it is confirmed now\n", dom->d->bus, dom->d->dev, dom->d->func);
         if (dom->unwanted) domain_release(dom);
     }
 }
 
+/* What the platform keeps from being isolated is claimed as on a machine without an IOMMU,
+   unless the units block a function of its group: an earlier claim's device may still hold
+   addresses it was given, and nothing else would keep it from memory. */
+static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
+    bool blocked = d->iommu_blocked;
+    for (size_t i = 0; i < g->n; i++) blocked |= g->at[i]->iommu_blocked;
+    if (!blocked) return 0;
+    kprintf("iommu: %02x:%02x.%u: its group was blocked when an earlier claim ended, and it cannot be isolated "
+            "now\n", d->bus, d->dev, d->func);
+    return r;
+}
+
 int iommu_attach(struct pci_device *d, struct iommu_domain **out) {
-    if (!hw) return -N_ERR_UNSUPPORTED;
+    *out = NULL;
+    if (!iommu_active()) return 0;
     held_retry();
-    if (!pci_all_known()) {
-        kprintf("iommu: %02x:%02x.%u cannot be isolated: enumeration did not keep every function, so its group "
-                "is unknown\n", d->bus, d->dev, d->func);
-        return -N_ERR_UNSUPPORTED;
-    }
     if (iommu_in_use(d)) {
-        kprintf("iommu: %02x:%02x.%u is still in a domain the units did not confirm blocked\n", d->bus, d->dev, d->func);
+        kprintf("iommu: %02x:%02x.%u is in another claim's domain, or one whose block the units did not confirm\n",
+                d->bus, d->dev, d->func);
         return -N_ERR_BUSY;
     }
     struct fns g = {0};
     struct ids ids = {0};
-    int r = group_of(d, &g);
-    if (!r) r = group_check(d, &g, &ids);
-    uint16_t id = r ? 0 : domain_id_new();
-    if (!r && !id) r = -N_ERR_BUSY;
-    struct iommu_domain *dom = r ? NULL : domain_alloc(id, hw->levels, 1);
-    if (!r && !dom) {
-        domain_used[id / 8] &= ~(1u << (id % 8));
-        r = -N_ERR_NO_MEMORY;
+    struct acs_log acs = {0};
+    struct iommu_domain *dom = NULL;
+    bool fixed = !pci_all_known();
+    int r = -N_ERR_NO_MEMORY;
+    if (fixed) {
+        kprintf("iommu: %02x:%02x.%u cannot be isolated: enumeration did not keep every function, so its group "
+                "is unknown\n", d->bus, d->dev, d->func);
+        r = -N_ERR_UNSUPPORTED;
+    } else if (group_of(d, &g, &acs) && !(r = group_check(d, &g, &ids, &fixed))) {
+        uint16_t id = domain_id_new();
+        if (!id) r = -N_ERR_BUSY;
+        else if (!(dom = domain_alloc(id, hw->levels, 1))) domain_used[id / 8] &= ~(1u << (id % 8));
+        else {
+            dom->d = d;
+            dom->members = g.at;
+            dom->nmembers = (unsigned)g.n;
+            dom->ids = ids.at;
+            dom->nids = (unsigned)ids.n;
+            g.at = NULL;
+            ids.at = NULL;
+            if (reserved_map(dom)) r = 0;
+            else {
+                domain_release(dom);
+                dom = NULL;
+            }
+        }
     }
-    if (r) {
-        kfree(g.at);
-        kfree(ids.at);
-        return r;
-    }
-    dom->d = d;
-    dom->members = g.at;
-    dom->nmembers = (unsigned)g.n;
-    dom->ids = ids.at;
-    dom->nids = (unsigned)ids.n;
-    if (!reserved_map(dom)) {
-        domain_release(dom);
-        return -N_ERR_NO_MEMORY;
-    }
-    if (!hw->attach(dom)) {
+    if (r && fixed) r = unisolated(d, &g, r);
+    if (dom && !hw->attach(dom)) {
         kprintf("iommu: %02x:%02x.%u: the units did not confirm its domain\n", d->bus, d->dev, d->func);
+        if (!dom->written) acs_undo(&acs);
         iommu_domain_free(dom); /* what was written is blocked first */
-        return -N_ERR_IO;
+        dom = NULL;
+        r = -N_ERR_IO;
+    } else if (!dom) {
+        acs_undo(&acs);
     }
+    kfree(acs.at);
+    kfree(g.at);
+    kfree(ids.at);
+    if (!dom) return r;
+    members_blocked(dom, false);
     dom->next = attached;
     attached = dom;
-    kprintf("iommu: %02x:%02x.%u isolated in domain %u\n", d->bus, d->dev, d->func, id);
+    kprintf("iommu: %02x:%02x.%u isolated in domain %u\n", d->bus, d->dev, d->func, dom->id);
     for (unsigned i = 1; i < dom->nmembers; i++)
         kprintf("iommu: %02x:%02x.%u is in its group: its DMA reaches only that domain too\n", dom->members[i]->bus,
                 dom->members[i]->dev, dom->members[i]->func);
@@ -604,7 +673,8 @@ bool iommu_block(struct iommu_domain *dom) {
     unlink(&attached, dom);
     unlink(&held, dom);
     if (!dom->blocked) dom->blocked = hw->block(dom);
-    if (!dom->blocked) {
+    if (dom->blocked) members_blocked(dom, true);
+    else {
         kprintf("iommu: %02x:%02x.%u: blocking it was not confirmed; its group stays out of every claim until it "
                 "is\n", dom->d->bus, dom->d->dev, dom->d->func);
         dom->next = held;

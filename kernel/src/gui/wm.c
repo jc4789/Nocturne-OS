@@ -17,6 +17,7 @@
 #include "dev/fbcon.h"
 #include "dev/audio.h"
 #include "dev/input.h"
+#include "dev/pciuser.h"
 #include "dev/timer.h"
 #include "fs/vfs.h"
 #include "mm/vmm.h"
@@ -1793,6 +1794,8 @@ static void handle_key(const struct key_event *k) {
     struct window *f = focused();
     if (k->pressed) {
         bool ctrl = k->mods & MOD_CTRL, alt = k->mods & MOD_ALT;
+        /* while an app's driver holds the screen: stop it, the screen comes back (dev/pciuser.c) */
+        if (ctrl && alt && k->key == KEY_ESC && pci_user_screen_take_back()) return;
         if (k->key == KEY_SUPER || (ctrl && k->key == KEY_ESC)) {
             set_menu(!menu_open);
             return;

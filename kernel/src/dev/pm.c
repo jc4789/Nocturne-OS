@@ -180,7 +180,9 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     lapic_resume();
     pic_restore(pic);
     serial_init(); /* the log port, reset with the rest */
-    iommu_resume(); /* before anything sends it an interrupt or a request */
+    /* before anything sends it an interrupt or a request; units that never slept are still on,
+       translating with the claims' tables, and are left alone */
+    if (slept) iommu_resume();
     ioapic_resume();
     hv_reference_resume(); /* the hypervisor's overlay pages: reset, or the restoring kernel's */
     hv_core_resume();

@@ -4,6 +4,7 @@
    orders concurrent requests with its own locks (the API lock and the GPU locks), as it does for
    the threads of different processes in an ioctl. Requests go through the RM OS layer
    (nvrm_serve.h), and pointers inside them reach only the requesting client's arena. */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,12 +84,19 @@ static n_result hello(struct client *c, const struct nvrm_message *head, n_handl
         return -N_ERR_INVALID;
     c->arena = n_shared_map(arena, (size_t)head->arena_bytes, N_MEMORY_READ_WRITE);
     if (!c->arena) return -N_ERR_INVALID;
+    c->file = nvrm_rm_file_open(client_is_admin(c), principal);
+    if (!c->file) {
+        /* Not connected: the caller closes the arena handle, and a later HELLO maps afresh
+           instead of replacing (and losing) this mapping. */
+        n_memory_release(c->arena, (size_t)head->arena_bytes);
+        c->arena = NULL;
+        return -N_ERR_NO_MEMORY;
+    }
     c->arena_handle = arena;
     c->arena_address = head->arena_address;
     c->arena_bytes = (size_t)head->arena_bytes;
-    c->file = nvrm_rm_file_open(client_is_admin(c), principal);
-    if (c->file) c->principal = principal;
-    return c->file ? 0 : -N_ERR_NO_MEMORY;
+    c->principal = principal;
+    return 0;
 }
 
 /* Serves the client's next message; false when the client is to be ended. */
@@ -214,16 +222,20 @@ static void client_start(n_handle channel) {
         mtx_lock(&threads_lock);
         client_threads++;
         mtx_unlock(&threads_lock);
-        if (thrd_create(&thread, client_thread, c) == thrd_success) {
+        int made = thrd_create(&thread, client_thread, c);
+        if (made == thrd_success) {
             thrd_detach(thread);
             return;
         }
         mtx_lock(&threads_lock);
         client_threads--;
         mtx_unlock(&threads_lock);
-        r = -N_ERR_NO_MEMORY;
+        r = made == thrd_nomem ? -N_ERR_NO_MEMORY : -errno; /* the kernel's reason */
     }
-    printf("nvrm: cannot serve a new client (%s)\n", n_result_text(r));
+    if (r == -N_ERR_NOT_READY)
+        printf("nvrm: cannot serve a new client (nvrm has as many threads as a process may)\n");
+    else
+        printf("nvrm: cannot serve a new client (%s)\n", n_result_text(r));
     client_end(c);
 }
 

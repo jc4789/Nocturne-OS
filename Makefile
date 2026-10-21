@@ -257,9 +257,13 @@ $(BUILD)/u/tests/media_cenc_test.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_pa
 $(BUILD)/u/tests/media_cenc_test.o: user/libc/media_mse.c
 $(BUILD)/u/tests/nvk_contracttest.o: UCFLAGS += -Ithird_party/mesa/include
 $(BUILD)/tests/nvk_contracttest: private ULDFLAGS += --gc-sections
-$(BUILD)/tests/media_cenc_test $(BUILD)/tests/nvk_contracttest: $(BUILD)/tests/%: $(BUILD)/u/tests/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+# nvrm's request server exactly as /bin/nvrm links it, against the test's fake RM OS layer.
+$(BUILD)/u/tests/nvrm_servetest.o: UCFLAGS += $(NVRM_CLIENT_INC)
+$(BUILD)/tests/nvrm_servetest: private TEST_OBJ := $(NVRM_OUT)/os/nvrm_serve.o
+$(BUILD)/tests/nvrm_servetest: $(NVRM_OUT)/os/nvrm_serve.o
+$(BUILD)/tests/media_cenc_test $(BUILD)/tests/nvk_contracttest $(BUILD)/tests/nvrm_servetest: $(BUILD)/tests/%: $(BUILD)/u/tests/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
-	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
+	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< $(TEST_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 CXX_HEADERS := $(shell find user/include -type f) common/abi.h common/gfx.h
 # One producer owns the archive and all generated members. A missing member

@@ -7,6 +7,7 @@
 #include "abi.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
+#include "sys/sched.h"
 
 /* ---- ECAM (MCFG) ----
    Only segment 0 is used (struct pci_device has no segment). A function's 4 KiB config page is mapped
@@ -104,19 +105,16 @@ static void ecam_activate(uint8_t bus, uint8_t dev, uint8_t func, uint32_t id) {
 /* Every function enumeration found. The array grows while pci_init runs only: drivers keep
    pointers into it from then on. */
 static struct pci_device *devices;
-static int ndevices;
-static size_t devices_room;
+static size_t ndevices, devices_room;
 static bool devices_lost;
 
 static struct pci_device *device_new(void) {
-    struct pci_device *grown = kgrow(devices, (size_t)ndevices, &devices_room, sizeof *grown);
-    if (!grown) {
+    struct pci_device *d = kappend(&devices, &ndevices, &devices_room, sizeof *d);
+    if (!d) {
         if (!devices_lost) kprintf("pci: no memory to keep more functions; the rest are not used\n");
         devices_lost = true;
         return NULL;
     }
-    devices = grown;
-    struct pci_device *d = &devices[ndevices++];
     memset(d, 0, sizeof *d);
     return d;
 }
@@ -193,20 +191,20 @@ void pci_init(void) {
         }
     }
     /* Bus numbers stay as the firmware gave them (sleep writes them back), so the tree is found once. */
-    for (int i = 0; i < ndevices; i++)
-        for (int k = 0; k < ndevices && !devices[i].upstream; k++)
+    for (size_t i = 0; i < ndevices; i++)
+        for (size_t k = 0; k < ndevices && !devices[i].upstream; k++)
             if (k != i && devices[k].bridge && devices[k].secondary == devices[i].bus)
                 devices[i].upstream = &devices[k];
 }
 
 struct pci_device *pci_find(uint16_t vendor, uint16_t device) {
-    for (int i = 0; i < ndevices; i++)
+    for (size_t i = 0; i < ndevices; i++)
         if (devices[i].vendor == vendor && devices[i].device == device) return &devices[i];
     return NULL;
 }
 
 struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls) {
-    for (int i = 0; i < ndevices; i++)
+    for (size_t i = 0; i < ndevices; i++)
         if (devices[i].cls == cls && devices[i].subcls == subcls) return &devices[i];
     return NULL;
 }
@@ -220,7 +218,7 @@ void pci_enable_busmaster(struct pci_device *d) {
 
 int pci_list(struct n_pciinfo *out, int max) {
     int n = 0;
-    for (int i = 0; i < ndevices && n < max; i++, n++) {
+    for (size_t i = 0; i < ndevices && n < max; i++, n++) {
         out[n].bus = devices[i].bus;
         out[n].dev = devices[i].dev;
         out[n].func = devices[i].func;
@@ -233,12 +231,12 @@ int pci_list(struct n_pciinfo *out, int max) {
     return n;
 }
 
-int pci_count(void) { return ndevices; }
+int pci_count(void) { return (int)ndevices; } /* at most 256 buses of 32 devices of 8 functions */
 
-struct pci_device *pci_at(int index) { return index >= 0 && index < ndevices ? &devices[index] : NULL; }
+struct pci_device *pci_at(int index) { return index >= 0 && (size_t)index < ndevices ? &devices[index] : NULL; }
 
 struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func) {
-    for (int i = 0; i < ndevices; i++)
+    for (size_t i = 0; i < ndevices; i++)
         if (devices[i].bus == bus && devices[i].dev == dev && devices[i].func == func) return &devices[i];
     return NULL;
 }
@@ -430,85 +428,148 @@ bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
     return true;
 }
 
-/* ---- sleep ----
-   After S3 a function comes back reset: no BARs, no command bits, no MSI. The header, the MSI and
-   MSI-X state (the MSI-X table lives in a BAR), the PCIe control registers and ACS control (what
-   keeps a claimed function's requests on their way to the IOMMU, dev/iommu.c) are saved before
-   and written back before any driver touches its device again. Device-specific registers past
-   the capabilities are the driver's. */
-static struct pci_saved {
+/* ---- a function's configuration, kept across a reset ----
+   After S3 or a Function Level Reset a function comes back reset: no BARs, no command bits, no
+   MSI. The header, the MSI and MSI-X state (the MSI-X table lives in a BAR), the PCIe control
+   registers and ACS control (what keeps a claimed function's requests on their way to the
+   IOMMU, dev/iommu.c) are saved before and written back before any driver touches its device
+   again. Device-specific registers past the capabilities are the driver's. */
+struct pci_saved {
     uint32_t id, hdr[16];
     uint8_t msi, msix, msi_dwords;
     uint32_t msi_regs[5];
     uint32_t msix_ctl, *msix_table;
     uint16_t pcie_ctl[4];
     uint16_t acs, acs_ctl; /* the ACS capability's offset and its control register */
-} *saved;
+};
+static const uint8_t pcie_ctl_off[4] = {PCIE_DEVCTL, 0x10, PCIE_DEVCTL2, 0x30}; /* device, link, device 2, link 2 */
+
+/* table: the MSI-X table's entries too, into s->msix_table (allocated once, kept); false without
+   memory for it. */
+static bool state_save(const struct pci_device *d, struct pci_saved *s, bool table) {
+    for (unsigned k = 0; k < 16; k++) s->hdr[k] = pci_read32(d->bus, d->dev, d->func, k * 4);
+    s->id = s->hdr[0];
+    s->msi = pci_find_cap(d, 0x05);
+    if (s->msi) {
+        uint16_t ctl = pci_read32(d->bus, d->dev, d->func, s->msi) >> 16;
+        /* control, address (+ high half), data, and the mask bits when there are any */
+        s->msi_dwords = 3 + !!(ctl & 0x80) + !!(ctl & 0x100);
+        for (unsigned j = 0; j < s->msi_dwords; j++) s->msi_regs[j] = pci_read32(d->bus, d->dev, d->func, s->msi + 4 * j);
+    }
+    s->msix = pci_find_cap(d, 0x11);
+    if (s->msix) {
+        s->msix_ctl = pci_read32(d->bus, d->dev, d->func, s->msix);
+        if (table && d->msix_table) {
+            if (!s->msix_table && !(s->msix_table = kmalloc(d->msix_entries * 16))) return false;
+            for (unsigned j = 0; j < d->msix_entries * 4u; j++) s->msix_table[j] = d->msix_table[j];
+        }
+    }
+    if (d->pcie_cap)
+        for (unsigned j = 0; j < 4; j++) s->pcie_ctl[j] = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j]);
+    s->acs = pci_find_ext_cap(d, 0x0D);
+    if (s->acs) s->acs_ctl = pci_read16(d->bus, d->dev, d->func, s->acs + 6);
+    return true;
+}
+
+static void state_restore(const struct pci_device *d, const struct pci_saved *s) {
+    /* cache line and latency, not BIST (a write there starts a self test); then BARs and the
+       rest of the header (bus numbers and windows for a bridge); command last */
+    pci_write16(d->bus, d->dev, d->func, 0x0C, s->hdr[3] & 0xFFFF);
+    for (unsigned k = 4; k < 16; k++) pci_write32(d->bus, d->dev, d->func, k * 4, s->hdr[k]);
+    if (d->pcie_cap)
+        for (unsigned j = 0; j < 4; j++) pci_write16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
+    if (s->acs) pci_write16(d->bus, d->dev, d->func, s->acs + 6, s->acs_ctl); /* before bus mastering */
+    pci_write16(d->bus, d->dev, d->func, 4, s->hdr[1] & 0xFFFF);
+    if (s->msix) {
+        /* the table is memory space, which the command register has just opened */
+        pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl | 0xC0000000u);
+        if (d->msix_table && s->msix_table)
+            for (unsigned j = 0; j < d->msix_entries * 4u; j++) d->msix_table[j] = s->msix_table[j];
+        pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl);
+    }
+    if (s->msi) {
+        for (unsigned j = 1; j < s->msi_dwords; j++) pci_write32(d->bus, d->dev, d->func, s->msi + 4 * j, s->msi_regs[j]);
+        pci_write32(d->bus, d->dev, d->func, s->msi, s->msi_regs[0]);
+    }
+}
+
+/* ---- sleep ---- */
+static struct pci_saved *saved;
 static bool saved_valid;
-static const uint8_t pcie_ctl_off[4] = {0x08, 0x10, 0x28, 0x30}; /* device, link, device 2, link 2 */
 
 const char *pci_suspend(void) {
     saved_valid = false;
-    if (!saved) saved = kzalloc((size_t)ndevices * sizeof *saved);
+    if (!saved) saved = kzalloc(ndevices * sizeof *saved);
     if (!saved) return "PCI (no memory to save it)";
-    for (int i = 0; i < ndevices; i++) {
-        struct pci_device *d = &devices[i];
-        struct pci_saved *s = &saved[i];
-        for (unsigned k = 0; k < 16; k++) s->hdr[k] = pci_read32(d->bus, d->dev, d->func, k * 4);
-        s->id = s->hdr[0];
-        s->msi = pci_find_cap(d, 0x05);
-        if (s->msi) {
-            uint16_t ctl = pci_read32(d->bus, d->dev, d->func, s->msi) >> 16;
-            /* control, address (+ high half), data, and the mask bits when there are any */
-            s->msi_dwords = 3 + !!(ctl & 0x80) + !!(ctl & 0x100);
-            for (unsigned j = 0; j < s->msi_dwords; j++)
-                s->msi_regs[j] = pci_read32(d->bus, d->dev, d->func, s->msi + 4 * j);
-        }
-        s->msix = pci_find_cap(d, 0x11);
-        if (s->msix) {
-            s->msix_ctl = pci_read32(d->bus, d->dev, d->func, s->msix);
-            if (d->msix_table && !s->msix_table) s->msix_table = kmalloc(d->msix_entries * 16);
-            if (d->msix_table && !s->msix_table) return "PCI (no memory to save it)";
-            if (d->msix_table)
-                for (unsigned j = 0; j < d->msix_entries * 4u; j++) s->msix_table[j] = d->msix_table[j];
-        }
-        if (d->pcie_cap)
-            for (unsigned j = 0; j < 4; j++) s->pcie_ctl[j] = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j]);
-        s->acs = pci_find_ext_cap(d, 0x0D);
-        if (s->acs) s->acs_ctl = pci_read16(d->bus, d->dev, d->func, s->acs + 6);
-    }
+    for (size_t i = 0; i < ndevices; i++)
+        if (!state_save(&devices[i], &saved[i], true)) return "PCI (no memory to save it)";
     saved_valid = true;
     return NULL;
 }
 
 void pci_resume(void) {
     if (!saved_valid) return; /* the sleep was called off before anything went down */
-    for (int i = 0; i < ndevices; i++) {
+    for (size_t i = 0; i < ndevices; i++) {
         struct pci_device *d = &devices[i];
-        struct pci_saved *s = &saved[i];
-        if (pci_read32(d->bus, d->dev, d->func, 0) != s->id) {
+        if (pci_read32(d->bus, d->dev, d->func, 0) != saved[i].id) {
             kprintf("pci: %02x:%02x.%x is not there after sleep\n", d->bus, d->dev, d->func);
             continue;
         }
-        /* cache line and latency, not BIST (a write there starts a self test); then BARs and the
-           rest of the header (bus numbers and windows for a bridge); command last */
-        pci_write16(d->bus, d->dev, d->func, 0x0C, s->hdr[3] & 0xFFFF);
-        for (unsigned k = 4; k < 16; k++) pci_write32(d->bus, d->dev, d->func, k * 4, s->hdr[k]);
-        if (d->pcie_cap)
-            for (unsigned j = 0; j < 4; j++) pci_write16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
-        if (s->acs) pci_write16(d->bus, d->dev, d->func, s->acs + 6, s->acs_ctl); /* before bus mastering */
-        pci_write16(d->bus, d->dev, d->func, 4, s->hdr[1] & 0xFFFF);
-        if (s->msix) {
-            /* the table is memory space, which the command register has just opened */
-            pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl | 0xC0000000u);
-            if (d->msix_table && s->msix_table)
-                for (unsigned j = 0; j < d->msix_entries * 4u; j++) d->msix_table[j] = s->msix_table[j];
-            pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl);
-        }
-        if (s->msi) {
-            for (unsigned j = 1; j < s->msi_dwords; j++)
-                pci_write32(d->bus, d->dev, d->func, s->msi + 4 * j, s->msi_regs[j]);
-            pci_write32(d->bus, d->dev, d->func, s->msi, s->msi_regs[0]);
-        }
+        state_restore(d, &saved[i]);
     }
+}
+
+/* ---- a function's requests, and its reset (PCI Express Base 6.0) ---- */
+static bool present(const struct pci_device *d) {
+    return (pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) != 0xFFFF;
+}
+
+bool pci_requests_done(const struct pci_device *d, unsigned ms) {
+    if (!d->pcie_cap) return present(d);
+    for (uint64_t since = uptime_ms();; sleep_ms(1)) {
+        if (!present(d)) return false;
+        if (!(pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING)) return true;
+        if (uptime_ms() - since >= ms) return false;
+    }
+}
+
+/* The longest a request of d may wait for its completion (Device Control 2, Completion Timeout
+   Value: the upper end of each range, 7.5.3.16); 0 when the timeout is disabled. */
+static unsigned completion_timeout_ms(const struct pci_device *d) {
+    static const unsigned range_ms[16] = {50, 1, 10, 64000, 64000, 55, 210, 64000,
+                                          64000, 900, 3500, 64000, 64000, 13000, 64000, 64000};
+    uint16_t ctl2 = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL2);
+    return ctl2 & PCIE_DEVCTL2_CT_DISABLE ? 0 : range_ms[ctl2 & 15];
+}
+
+/* 6.6.2: the function completes the reset within 100 ms; when it had requests pending, it is not
+   set up again before their completions had time to arrive (the Completion Timeout it had, or no
+   less than 100 ms where that was disabled). It may then answer with Request Retry Status while
+   it initializes: its ID reads back once it is ready, which polling waits up to a second after a
+   reset for (6.22; 5.9 gives a function 1.0 s after an FLR). The read that returns the ID
+   also follows anything it posted before. The reset clears Bus Master Enable and MSI: what was
+   saved comes back. May sleep. */
+#define FLR_DONE_MS  100
+#define FLR_READY_MS 1000
+bool pci_function_reset(struct pci_device *d) {
+    if (!d->pcie_cap || !present(d)) return false;
+    if (!(pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) return false;
+    struct pci_saved s = {0};
+    state_save(d, &s, false);
+    unsigned wait = FLR_DONE_MS;
+    if (pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING) {
+        unsigned timeout = completion_timeout_ms(d);
+        if (timeout > wait) wait = timeout;
+    }
+    pci_write16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL, s.pcie_ctl[0] | PCIE_DEVCTL_FLR);
+    uint64_t since = uptime_ms(), ready_by = wait > FLR_READY_MS ? wait : FLR_READY_MS;
+    while (uptime_ms() - since < wait) sleep_ms(wait - (uptime_ms() - since));
+    for (; pci_read32(d->bus, d->dev, d->func, 0) != s.id; sleep_ms(1))
+        if (uptime_ms() - since >= ready_by) {
+            kprintf("pci: %02x:%02x.%u is not ready %lu ms after its Function Level Reset\n", d->bus, d->dev, d->func,
+                    (unsigned long)ready_by);
+            return false;
+        }
+    state_restore(d, &s);
+    return true;
 }

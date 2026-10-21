@@ -123,7 +123,7 @@ static void present_rows(size_t tile, void *context) {
    hold ends. Time never ends a hold: drawing while the driver still rebuilds is the very write
    the hold keeps out. A hold ends when the driver gives it back, or when its claim ends
    (dev/pciuser.c), which stops the device before it gives the holds back; that is also how a
-   driver stuck while holding is ended (pciuser.c, boot option fbhold=). Kernel code runs on the
+   driver stuck while holding is ended (pciuser.c: Ctrl+Alt+Esc, boot option fbhold=). Kernel code runs on the
    BSP, but a present runs with interrupts on and can be preempted half way (fbparallel tiles join
    before it returns): a hold waits until no present is between its check and its end. The panic
    screen is drawn whatever is held. */

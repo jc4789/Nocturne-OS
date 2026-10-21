@@ -8,8 +8,8 @@
    function: every mapping of its BARs, in any process, loses the device pages; then no
    interrupts, no bus mastering, and the IOMMU blocks it, after which the app's DMA memory can
    return to the allocator. Without an IOMMU the kernel waits until the function has no request
-   in flight instead; a function that does not report its requests done in time keeps its DMA
-   pages out of use for good (syscall.c asks pci_user_dma_reusable).
+   in flight instead, or resets it; a function that does neither in time keeps its DMA pages out
+   of use for good (syscall.c asks pci_user_dma_reusable).
    BAR and DMA objects hold the claim record, so a later claim of the same function is a new
    record and the old objects stay dead. */
 #include "kernel.h"
@@ -93,58 +93,65 @@ static bool claim_can_read(struct vnode *v, struct file *f) {
     (void)f;
     return ((struct pci_claim *)v->priv)->pending != 0;
 }
-/* After bus mastering is off the function starts no request, but some may still be in flight.
-   A PCI Express function says so in Device Status (Transactions Pending), and the config read
-   that sees it clear also follows any write it posted before (a completion does not pass a
-   posted write). Conventional PCI provides no such completion proof: retain its DMA pages.
-   Busy waiting with interrupts possibly off, so by the TSC, bounded: this runs once, when a
-   driver ends. */
-#define QUIESCE_MS 200
-static bool function_quiet(struct pci_device *d) {
-    if (!d->pcie_cap || !tsc_hz) return false;
-    uint64_t since = rdtsc();
-    for (;;) {
-        if ((pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) == 0xFFFF) return false;
-        if (!(pci_read16(d->bus, d->dev, d->func, d->pcie_cap + 0x0A) & 0x20)) return true;
-        if (rdtsc() - since > tsc_hz / 1000 * QUIESCE_MS) return false;
-        pause();
+
+/* The memory BAR the boot screen is drawn through, or -1. */
+static int screen_bar(const struct pci_device *d) {
+    if (!fb.addr) return -1;
+    for (unsigned i = 0; i < pci_bar_count(d); i++) {
+        uint32_t raw = d->bar[i];
+        if (raw & 1) continue;
+        uint64_t address = pci_bar_address(d, i), size = pci_bar_size(d, i);
+        if (address && size && fb.phys >= address && fb.phys - address < size) return (int)i;
+        if (((raw >> 1) & 3) == 2) i++;
     }
+    return -1;
 }
 
 /* ---- a driver that holds the screen (n_pci_hold_screen, dev/fb.c) ----
    Only the function the boot screen lies in can hold it, so one claim at most does. Its hold
    ends when the driver gives it back or when the claim ends; claim_release stops the function
    first, so drawing never resumes while the driver can still reach the device. A driver stuck
-   while it holds is ended the same way: with boot option fbhold=<seconds>, a hold that lasts
-   that long stops the driver's app, and its claim's end gives the screen back. Without it no
-   time ends a hold: RM's waits follow one another without a bound a limit could be checked
-   against, and stopping a driver that is only slow loses its GPU. */
+   while it holds is ended the same way: the user's Ctrl+Alt+Esc (gui/wm.c) stops the driver's
+   app, and its claim's end gives the screen back; so does a hold that lasts as long as boot
+   option fbhold=<seconds> says. No time ends a hold by itself: RM's waits follow one another
+   without a bound a limit could be checked against, and stopping a driver that is only slow
+   loses its GPU, so only the user, who sees the screen, decides that it is stuck. */
 static struct pci_claim *screen_holder; /* BSP, interrupts off */
 static int screen_holder_app;
 static uint64_t screen_held_since, screen_hold_limit_ms;
 static bool screen_holder_stopped, screen_watch_started;
 static struct wait_queue screen_watch_wq;
 
+/* Stops the app whose driver holds the screen, once a hold: false when none does. */
+static bool screen_holder_stop(const char *why) {
+    uint64_t irq = irq_save();
+    int app = screen_holder && !screen_holder_stopped ? screen_holder_app : 0;
+    struct pci_device *d = app ? screen_holder->d : NULL;
+    if (app) screen_holder_stopped = true;
+    irq_restore(irq);
+    if (!app) return false;
+    kprintf("pci: %02x:%02x.%u: %s; stopping app %d, the screen comes back once the function is stopped\n", d->bus,
+            d->dev, d->func, why, app);
+    if (task_kill(app) < 0) kprintf("pci: app %d cannot be stopped; the screen stays held\n", app);
+    return true;
+}
+
+bool pci_user_screen_take_back(void) { return screen_holder_stop("Ctrl+Alt+Esc takes the screen back from its driver"); }
+
 static void screen_watch(void *arg) {
     (void)arg;
+    char why[64];
+    ksnprintf(why, sizeof why, "its driver has held the screen for %lu s (fbhold=)",
+              (unsigned long)(screen_hold_limit_ms / 1000));
     for (;;) {
         uint64_t irq = irq_save();
-        int stop = 0;
-        struct pci_device *d = NULL;
+        bool stop = false;
         uint64_t held = screen_holder ? uptime_ms() - screen_held_since : 0;
         if (!screen_holder || screen_holder_stopped) wq_wait(&screen_watch_wq);
         else if (held < screen_hold_limit_ms) wq_wait_timeout(&screen_watch_wq, screen_hold_limit_ms - held);
-        else {
-            screen_holder_stopped = true;
-            stop = screen_holder_app;
-            d = screen_holder->d;
-        }
+        else stop = true;
         irq_restore(irq);
-        if (!stop) continue;
-        kprintf("pci: %02x:%02x.%u: its driver has held the screen for %lu s (fbhold=); stopping app %d, "
-                "the screen comes back once the function is stopped\n",
-                d->bus, d->dev, d->func, (unsigned long)(screen_hold_limit_ms / 1000), stop);
-        if (task_kill(stop) < 0) kprintf("pci: app %d cannot be stopped; the screen stays held\n", stop);
+        if (stop) screen_holder_stop(why);
     }
 }
 
@@ -177,10 +184,13 @@ static void screen_hold_end(struct pci_claim *c) {
    when its claim ends lost its driver in the middle (a crash, or a driver that never stopped
    it), and what runs on it may be running still: a GPU's own firmware keeps the addresses it was
    given, and switching bus mastering off only pauses it until the next driver switches it on.
-   Nothing here can stop such firmware (a function reset would also take the boot screen with
-   it). Where an IOMMU isolates the function, blocking it there settles that: nothing it sends
-   reaches memory any more. Without one, the DMA memory it was given never returns to the
+   Such a function, or one whose requests are not seen to end, is reset (Function Level Reset,
+   dev/pci.h), which stops what runs on it too; not the one the boot screen is drawn through,
+   which the reset would take with it. Where an IOMMU isolates the function, blocking it there
+   settles the rest: nothing it sends reaches memory any more. Otherwise, unless the reset or the
+   function itself says its requests are done, the DMA memory it was given never returns to the
    allocator. */
+#define QUIESCE_MS 200
 static void claim_release(struct vnode *v) {
     struct pci_claim *c = v->priv;
     struct pci_device *d = c->d;
@@ -193,19 +203,19 @@ static void claim_release(struct vnode *v) {
     bool blocked = c->domain && iommu_block(c->domain);
     bool stopped = (pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) != 0xFFFF &&
                    !(pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER);
-    c->dma_unsafe = !blocked && (left_running || !stopped || !function_quiet(d));
-    if (left_running && blocked)
-        kprintf("pci: %02x:%02x.%u: its driver ended without stopping it (bus mastering was on); "
-                "the IOMMU keeps it from memory\n", d->bus, d->dev, d->func);
-    else if (left_running)
-        kprintf("pci: %02x:%02x.%u: its driver ended without stopping it (bus mastering was on); "
-                "its DMA memory stays out of use\n", d->bus, d->dev, d->func);
-    else if (c->dma_unsafe && stopped && !d->pcie_cap)
-        kprintf("pci: %02x:%02x.%u is conventional PCI and cannot report its requests done; its DMA memory "
-                "stays out of use\n", d->bus, d->dev, d->func);
-    else if (c->dma_unsafe)
-        kprintf("pci: %02x:%02x.%u still has requests in flight; its DMA memory stays out of use\n",
-                d->bus, d->dev, d->func);
+    bool running = left_running || !stopped || !pci_requests_done(d, QUIESCE_MS);
+    bool screen = screen_bar(d) >= 0;
+    bool reset = running && !screen && pci_function_reset(d);
+    c->dma_unsafe = running && !blocked && !reset;
+    if (running)
+        kprintf("pci: %02x:%02x.%u: %s; %s%s\n", d->bus, d->dev, d->func,
+                left_running ? "its driver ended without stopping it (bus mastering was on)"
+                : !stopped   ? "it does not stop"
+                             : "it still has requests in flight",
+                reset ? "it was reset" : blocked ? "the IOMMU keeps it from memory" : "its DMA memory stays out of use",
+                reset ? "" : screen ? " (the boot screen is drawn through it, so it is not reset: what runs on it may "
+                                      "still run)"
+                                    : " (it has no Function Level Reset, or the reset did not complete)");
     /* A driver that ended while it rebuilt the way to the screen leaves it however it is. The
        function is stopped now and no process reaches its BARs, so drawing again disturbs nothing
        that still runs, and it is the only way the desktop can come back. */
@@ -262,7 +272,7 @@ static void guards_init(struct pci_claim *c) {
     if (d->pcie_cap) {
         /* Device Control: Max_Payload_Size must match the whole path to the root, phantom
            functions widen the requester IDs, and Initiate FLR resets the function. */
-        guard(c, d->pcie_cap + 0x08, 7u << 5 | 1u << 9 | 1u << 15);
+        guard(c, d->pcie_cap + PCIE_DEVCTL, 7u << 5 | 1u << 9 | PCIE_DEVCTL_FLR);
         guard(c, d->pcie_cap + 0x10, 1u << 4);            /* Link Control: Link Disable */
         guard(c, d->pcie_cap + 0x30, 1u << 4 | 1u << 10); /* Link Control 2: Enter (Modified) Compliance */
     }
@@ -329,7 +339,7 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     c->refs = 1;
     guards_init(c);
     /* From here the function reaches only the DMA objects made through the claim. */
-    int r = iommu_active() ? iommu_attach(d, &c->domain) : 0;
+    int r = iommu_attach(d, &c->domain);
     if (r < 0) { kfree(c); kfree(v); return r; }
     /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
        decoding off under a running function, and the boot screen may be drawn through it. */
@@ -342,7 +352,8 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     }
     d->claimed = true;
     kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d%s\n", bus, dev, func, d->vendor, d->device, t->pid,
-            c->domain ? "" : "; no IOMMU isolates it: its DMA reaches all of memory");
+            c->domain ? "" : iommu_active() ? "; the IOMMU cannot isolate it: its DMA reaches all of memory"
+                                            : "; no IOMMU isolates it: its DMA reaches all of memory");
     *out = f;
     return 0;
 }
@@ -350,19 +361,6 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
 static unsigned msix_table_size(const struct pci_device *d) {
     uint8_t cap = pci_find_cap(d, 0x11);
     return cap ? ((pci_read32(d->bus, d->dev, d->func, cap) >> 16) & 0x7FF) + 1 : 0;
-}
-
-/* The memory BAR the boot screen is drawn through, or -1. */
-static int screen_bar(const struct pci_device *d) {
-    if (!fb.addr) return -1;
-    for (unsigned i = 0; i < pci_bar_count(d); i++) {
-        uint32_t raw = d->bar[i];
-        if (raw & 1) continue;
-        uint64_t address = pci_bar_address(d, i), size = pci_bar_size(d, i);
-        if (address && size && fb.phys >= address && fb.phys - address < size) return (int)i;
-        if (((raw >> 1) & 3) == 2) i++;
-    }
-    return -1;
 }
 
 int64_t pci_user_info(struct file *f, struct n_pci_function *out) {

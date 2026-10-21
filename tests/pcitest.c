@@ -312,9 +312,84 @@ static void stuck_holder_cases(const char *program, const struct n_pciinfo *list
     n_handle_close(vga);
 }
 
+/* A virtio function's common configuration (virtio 1.x, vendor capability type 1): its BAR and
+   the offset in it, false when it has none. */
+static int virtio_common(n_handle pci, uint32_t *bar, uint32_t *offset) {
+    for (n_result at = n_pci_config_read(pci, N_PCI_SELF, 0x34, 1) & 0xFC, hops = 0; at && hops < 48; hops++) {
+        n_result head = n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at, 4);
+        if (head < 0) return 0;
+        if ((head & 0xFF) == 0x09 && ((head >> 24) & 0xFF) == 1) {
+            *bar = (uint32_t)n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 4, 1);
+            *offset = (uint32_t)n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 8, 4);
+            return 1;
+        }
+        at = (head >> 8) & 0xFC;
+    }
+    return 0;
+}
+
+/* The virtio device status byte (common configuration + 0x14) through the BAR; -1 when it cannot
+   be reached. A write of `set` first when set >= 0. */
+static int virtio_status(n_handle pci, int set) {
+    uint32_t bar, offset;
+    struct n_pci_function info;
+    if (!virtio_common(pci, &bar, &offset) || bar > 5 || n_pci_info(pci, &info) != 0 || !info.bar[bar].size) return -1;
+    n_handle h = n_pci_bar(pci, bar);
+    volatile uint8_t *m = h >= 0 ? n_shared_map(h, info.bar[bar].size, N_MEMORY_READ_WRITE) : NULL;
+    int status = -1;
+    if (m) {
+        if (set >= 0) m[offset + 0x14] = (uint8_t)set;
+        status = m[offset + 0x14];
+        n_memory_release((void *)m, info.bar[bar].size);
+    }
+    if (h >= 0) n_handle_close(h);
+    return status;
+}
+
+/* pcitest flr: a driver that ends with bus mastering on leaves a running device; one with
+   Function Level Reset is reset when its claim ends (QEMU: -device virtio-rng-pci behind a
+   pcie-root-port, which gives it FLR). Its virtio device status reads 0 again, its BARs read as
+   they were and bus mastering is off. */
+static void reset_cases(const struct n_pciinfo *list, int n) {
+    int at = -1;
+    for (int i = 0; i < n && at < 0; i++)
+        if (list[i].vendor == 0x1af4 && list[i].cls != 0x06) at = i;
+    if (at < 0) {
+        printf("FAIL: no virtio function (run QEMU with -device virtio-rng-pci behind a pcie-root-port)\n");
+        failed++;
+        return;
+    }
+    const struct n_pciinfo *v = &list[at];
+    n_handle pci = n_pci_claim(v->bus, v->dev, v->func);
+    CHECK(pci >= 0, "claim the virtio function %02x:%02x.%u: %s", v->bus, v->dev, v->func, n_result_text(pci));
+    if (pci < 0) return;
+    n_result bars[6], cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    for (int i = 0; i < 6; i++) bars[i] = n_pci_config_read(pci, N_PCI_SELF, 0x10 + 4 * (uint32_t)i, 4);
+    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 6) == 0, "command: memory and bus master");
+    CHECK(virtio_status(pci, 1) == 1, "the virtio device status takes ACKNOWLEDGE");
+    n_handle_close(pci); /* bus mastering still on: the driver did not stop it */
+    pci = n_pci_claim(v->bus, v->dev, v->func);
+    CHECK(pci >= 0, "claim it again: %s", n_result_text(pci));
+    if (pci < 0) return;
+    cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    CHECK(cmd >= 0 && !(cmd & 4), "bus mastering is off after the claim ended: command %llx", (long long)cmd);
+    for (int i = 0; i < 6; i++)
+        CHECK(n_pci_config_read(pci, N_PCI_SELF, 0x10 + 4 * (uint32_t)i, 4) == bars[i], "BAR %d is as it was", i);
+    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 2) == 0, "command: memory");
+    int status = virtio_status(pci, -1);
+    CHECK(status == 0, "the reset cleared the virtio device status: %d", status);
+    n_handle_close(pci);
+}
+
 int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"revoked-reader"))return revoked_reader();
     if(argc>1 && !strcmp(argv[1],"stuck-holder"))return stuck_holder();
+    if(argc>1 && !strcmp(argv[1],"flr")){
+        struct n_pciinfo list[128];
+        reset_cases(list, pcilist(list, 128));
+        printf("pcitest flr: %d failed\n", failed);
+        return failed != 0;
+    }
     /* pcitest fbhold=<seconds>: only the stopped-driver case, for a boot with that option */
     if(argc>1 && !strncmp(argv[1],"fbhold=",7)){
         struct n_pciinfo list[128];

@@ -136,6 +136,7 @@ static struct ioapic_scope {
 static size_t nioapics, ioapics_room;
 static uint8_t dmar_flags;
 static bool remap, x2, caching_mode, write_buffers, parse_lost;
+static bool irreq; /* a unit requires interrupt remapping (ECAP.IRREQ) */
 static unsigned iec_mask = 15; /* the largest IEC invalidation mask every unit takes (MHMV) */
 static struct iommu_domain *identity; /* units without pass-through */
 static uint64_t sems, irt;
@@ -199,13 +200,9 @@ static void drhd_scope(const uint8_t *s, int id, void *arg) {
         break;
     case 3: {
         iommu_kernel_id((uint16_t)id);
-        struct ioapic_scope *grown = kgrow(ioapics, nioapics, &ioapics_room, sizeof *grown);
-        if (!grown) {
-            parse_lost = true;
-            break;
-        }
-        ioapics = grown;
-        ioapics[nioapics++] = (struct ioapic_scope){s[4], (uint16_t)id};
+        struct ioapic_scope *a = kappend(&ioapics, &nioapics, &ioapics_room, sizeof *a);
+        if (a) *a = (struct ioapic_scope){s[4], (uint16_t)id};
+        else parse_lost = true;
         break;
     }
     case 4: iommu_kernel_id((uint16_t)id); break;
@@ -243,14 +240,11 @@ static bool parse_dmar(void) {
             } else if (!base) {
                 kprintf("iommu: the DMAR describes a VT-d unit without an address; not used\n");
             } else {
-                struct unit *grown = kgrow(units, nunits, &units_room, sizeof *grown);
-                if (!grown) {
+                struct unit *u = kappend(&units, &nunits, &units_room, sizeof *u);
+                if (!u) {
                     parse_lost = true;
                 } else {
-                    units = grown;
-                    memset(&units[nunits], 0, sizeof *units);
-                    units[nunits].base = base;
-                    units[nunits++].pages = 1u << (b[off + 5] & 15);
+                    *u = (struct unit){.base = base, .pages = 1u << (b[off + 5] & 15)};
                     if (b[off + 4] & 1) iommu_cover(0, 0xFFFF); /* INCLUDE_PCI_ALL: what no other unit has */
                     scopes(b, off + 16, off + len, drhd_scope, NULL);
                 }
@@ -714,7 +708,8 @@ static bool unit_tables(struct unit *u, uint32_t bsp) {
    unit that does not take CFI blocks (and records) a pin that fires in between; remapping goes
    on. In Extended Interrupt Mode they are blocked from the start (5.1.4): at boot only the
    firmware's ExtINT pin is unmasked. The global invalidations flush the write buffers the tables
-   went through (6.8). */
+   went through (6.8). Translation goes on only when intel.translating; the firmware's protected
+   memory ranges go off either way, as every function's DMA is then to reach memory as it is. */
 static bool units_on(bool cfi) {
     bool ok = true;
     uint32_t bsp = lapic_current_id();
@@ -729,7 +724,7 @@ static bool units_on(bool cfi) {
         if (remap && cfi && !x2 && !command(u, GCMD_CFI, true))
             kprintf("iommu: VT-d unit at %lx blocks the IOAPIC pins until they are remappable\n", u->base);
         if (remap) ok = command(u, GCMD_IRE, true);
-        ok = ok && command(u, GCMD_TE, true);
+        if (intel.translating) ok = ok && command(u, GCMD_TE, true);
         uint32_t pmen = rd32(u, R_PMEN);
         if (ok && u->cap & (CAP_PLMR | CAP_PHMR) && pmen & PMEN_EPM) { /* the firmware's protected ranges */
             wr32(u, R_PMEN, pmen & ~PMEN_EPM);
@@ -763,7 +758,34 @@ static void tables_free(void) {
     sems = irt = 0;
 }
 
-static bool intel_start(void) {
+/* The units on with the tables made, translating or not: false leaves them off. A unit that
+   keeps passing compatibility-format interrupts lets any device send any vector past the
+   remapping table (5.1.4); where translation isolates claims it is not used then, without
+   translation every device reaches all of memory anyway. */
+static bool units_start(bool translate) {
+    intel.translating = translate;
+    bool ok = units_on(true);
+    if (ok && remap) {
+        ioapic_remap();
+        for (size_t i = 0; !x2 && i < nunits; i++)
+            if (!command(&units[i], GCMD_CFI, false)) {
+                kprintf("iommu: VT-d unit at %lx keeps passing compatibility-format interrupts\n", units[i].base);
+                ok &= !translate;
+            }
+    }
+    if (!ok) {
+        intel.translating = false;
+        intel_shutdown(); /* iommu_init writes the IOAPIC entries back plain */
+    }
+    return ok;
+}
+
+/* translate false, or no page table format the units share: interrupt remapping alone, for a
+   unit that requires it (ECAP.IRREQ: every interrupt message is blocked while it is off, 5.1.4).
+   DMA then passes the units untranslated. */
+static bool intel_start(bool translate) {
+    translate &= intel.levels != 0;
+    if (!translate && !irreq) return false;
     sem_pages = ALIGN_UP(nunits * 4, PAGE_SIZE) / PAGE_SIZE;
     sems = pmm_alloc_contig(sem_pages);
     irt = remap ? pmm_alloc_contig(IRT_ENTRIES * 16 / PAGE_SIZE) : 0;
@@ -775,7 +797,7 @@ static bool intel_start(void) {
         ok &= units[i].root && units[i].pass && units[i].queue;
         pass_all &= (units[i].ecap & ECAP_PT) != 0;
     }
-    if (ok && !pass_all) { /* all of RAM and the space below 4 GiB, in the largest pages every unit has */
+    if (ok && translate && !pass_all) { /* all of RAM and the space below 4 GiB, in the largest pages every unit has */
         unsigned sllps = 0xF;
         for (size_t i = 0; i < nunits; i++) sllps &= CAP_SSLPS(units[i].cap);
         identity = iommu_domain_new(intel.levels, sllps & 2 ? 3 : sllps & 1 ? 2 : 1);
@@ -805,17 +827,20 @@ static bool intel_start(void) {
     if (remap && !intel.coherent) iommu_cache_flush(phys_to_virt(irt), IRT_ENTRIES * 16);
     if (fault_vector < 0 && (fault_vector = irq_vector_alloc(1, 1)) >= 0) vector_register(fault_vector, fault_isr);
     uint64_t f = irq_save();
-    ok = units_on(true);
-    /* A unit that keeps passing compatibility-format interrupts lets any device send any vector
-       past the remapping table (5.1.4): it is not used then. */
-    if (ok && remap) {
-        ioapic_remap();
-        for (size_t i = 0; !x2 && i < nunits; i++) ok &= command(&units[i], GCMD_CFI, false);
+    ok = units_start(translate);
+    if (!ok && translate && irreq) {
+        kprintf("iommu: VT-d did not start translating; a unit requires interrupt remapping: trying that alone\n");
+        ok = units_start(false);
     }
     irq_restore(f);
     if (!ok) {
-        intel_shutdown(); /* iommu_init writes the IOAPIC entries back plain */
+        if (irreq) kprintf("iommu: a VT-d unit that requires interrupt remapping is off: it blocks every interrupt message\n");
         return false; /* the tables stay: a unit may still read them */
+    }
+    if (!intel.translating) {
+        kprintf("iommu: VT-d remaps interrupts only%s, %lu unit%s\n", x2 ? " (x2APIC format)" : "",
+                (unsigned long)nunits, nunits == 1 ? "" : "s");
+        return true;
     }
     kprintf("iommu: VT-d on, %lu unit%s, %u-level tables%s, interrupt remapping %s, %u reserved range%s: every "
             "function passes through until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s",
@@ -848,7 +873,7 @@ const struct iommu_hw *iommu_intel_probe(void) {
         return NULL;
     }
     unsigned sagaw = 0x1F, domains = 1u << 16;
-    bool qi = true, eim = true, eimer = false, irreq = false;
+    bool qi = true, eim = true, eimer = false;
     intel.coherent = true;
     remap = (dmar_flags & 1) != 0;
     for (size_t i = 0; i < nunits; i++) {
@@ -895,18 +920,18 @@ const struct iommu_hw *iommu_intel_probe(void) {
         remap = false;
     }
     x2 = remap && eimer;
-    if (!qi) {
-        kprintf("iommu: a VT-d unit has no invalidation queue: VT-d not used\n");
+    /* A unit that requires interrupt remapping blocks every interrupt message while it is off
+       (5.1.4): it is started to remap them even where nothing else of VT-d is used. Without the
+       queue (which remapping needs for its invalidations) or the remapping it is left as the
+       firmware set it. */
+    const char *unused = !qi ? "a VT-d unit has no invalidation queue"
+                       : irreq && !remap ? "a VT-d unit requires interrupt remapping, which these units cannot give"
+                       : !intel.levels && !irreq ? "the VT-d units share no page table format" : NULL;
+    if (unused) {
+        kprintf("iommu: %s: VT-d not used%s\n", unused,
+                irreq ? "; unless the firmware left remapping on, every interrupt message is blocked" : "");
         return NULL;
     }
-    if (!intel.levels) {
-        kprintf("iommu: the VT-d units share no page table format: VT-d not used\n");
-        return NULL;
-    }
-    /* such a unit blocks every interrupt while remapping is off: left as the firmware set it */
-    if (irreq && !remap) {
-        kprintf("iommu: a VT-d unit requires interrupt remapping, which these units cannot give: VT-d not used\n");
-        return NULL;
-    }
+    if (!intel.levels) kprintf("iommu: the VT-d units share no page table format: DMA is not translated\n");
     return &intel;
 }

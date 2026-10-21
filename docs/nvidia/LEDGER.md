@@ -143,6 +143,39 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
+- 2026-10-21：2d0973be への第二の監査（残件 4、新規 3、重複コード、小さな指摘 7）を AMD 48882 3.10、
+  Intel D51397-019、PCIe 6.0、PCI Local Bus 3.0 と照合して修理。
+  残件：(a) nvrm のクライアントごとのスレッドは上限（プロセスあたり 128）で断るだけで失敗しない。
+  `tests/nvrm_servetest.c`（実 RM の代わりの偽 OS 層で `nvrm_serve.c` を動かす）で 127 本受け、
+  33 本断ることを確かめた。失敗した HELLO が arena を漏らす不具合も修理。断る理由はカーネルの
+  戻り値どおりに出す（以前は常に「メモリ不足」）。(b) 異常終了後の GPU：BME が残った、止まらない、
+  要求が 200 ms 内に終わらない機能を claim の終わりに Function Level Reset する（`pci_function_reset`、
+  §6.6.2：100 ms、要求が残れば Completion Timeout、ID が読めるまで最大 1 s（§6.22、§5.9）、設定を
+  書き戻す）。起動画面の機能は画面ごと消えるのでリセットしない。(c) 以前のバスマスター凍結は実機
+  でしか調べられず未解明。(d) `function_quiet` の数値は `PCIE_DEVCAP/DEVCTL/DEVSTA/DEVCTL2` へ。
+  新規：(1) 隔離できない装置（ACS の無い／効かないルートポート等）は claim を拒まず、隔離なしで
+  渡してログに出す。グループ内に以前の claim の遮断が残る時だけ拒む。(2) VT-d の IRREQ=1 の
+  ユニットは、DMA 変換が使えない（`noiommu`、ページ表の形式が無い、起動失敗）時も割り込みの
+  再マップだけで起動し、割り込みを失わない（§5.1.4）。AMD には IRREQ に当たるものが無い。TSC の
+  周波数が分からない時の時間切れは 10 GHz を上限に見積もる。(3) 画面の保持は Ctrl+Alt+Esc で
+  取り戻せる（保持中のドライバーを止め、機能が止まってから画面が戻る）。`fbhold=` は任意の上限。
+  重複：配列を伸ばす 11 か所の写しを `kappend`（mm/heap）へまとめた。
+  小さな指摘：ルートポートは ACS と Source Validation があり、要求した P2P の制御が読み戻せる時だけ
+  分ける（PCIe 6.0 §6.12.1.1、§1.3.1、VT-d §3.17）。中断した休止ではユニットを設定し直さない。
+  AMD の CmdBufRun は有効にした後に確かめ、PerfOptEn を切る。Intel の queue_restart は 2d0973be で
+  修理済み。拒んだ claim の ACS の書込みは元へ戻す。同じグループの他の機能は解放後も遮断のまま
+  （P2P の到達を理由に文書化）。claim ごとの IOTLB 全体無効化は性能だけの問題で、正しさのため残す。
+  従来型 PCI は Bus Master を切って読み返せば要求は終わっている（PCI 3.0 §3.2.5、§3.3.3.3.3）ので、
+  IOMMU が無くても正常終了なら DMA の RAM を戻す（以前は常に隔離し、毎回ログに出ていた）。
+  確認：警告なしでカーネルと全媒体（img・vhd・vhdx・iso）をビルド。QEMU を一台ずつ（WHPX、4 コア、
+  4096 MiB、1920×1080、AHCI 起動、snapshot、`edu`、pcie-root-port の下に virtio-rng）で q35＋AMD-Vi、
+  q35＋VT-d、pc 機種（IOMMU 無し）：どれも `pcitest`・`nvrmtest`・`nvrm_servetest`・`pcitest fbhold`
+  が 0 failed、IOMMU の 2 構成は `pcitest flr` も 0 failed（BME を残した virtio が「it was reset」、
+  BAR は戻り virtio の状態は 0）。VT-d 構成で `fbhold=20` の保持中に Ctrl+Alt+Esc を送り、5.6 s で
+  画面が戻ることを撮影して見た。3 構成とも JavaScript demo へのクリック、Alt+Left、ホイールの
+  下と上への戻りを実入力で見た（目視）。IRREQ=1、ACS の無いルートポート、FLR の時間切れ、実 GPU の
+  リセットは QEMU では起こせず未試験。実機は未実施（ユーザー）。
+
 - 2026-10-21：8131ca1a の IOMMU への追加監査 4 件を仕様と照合し、すべて正しかったので修理。
   (1) VT-d の CFI：§5.1.4 のとおり CFI のままでは互換形式の MSI が IRTE の検査を経ない。起動の最後に
   CFI を切って確かめ、だめなら VT-d を使わず、IOAPIC の項目を通常の形式へ書き戻す（`ioapic.c` に

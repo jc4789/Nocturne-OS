@@ -33,3 +33,7 @@ int64_t pci_user_interrupts(struct file *f, uint32_t count);
 int64_t pci_user_interrupt_take(struct file *f, int64_t timeout_ms);
 /* n_pci_hold_screen: only for the function whose BAR the boot screen is drawn through. */
 int64_t pci_user_hold_screen(struct file *f, bool hold);
+/* The user's way out of a stuck driver that holds the screen (Ctrl+Alt+Esc, gui/wm.c): its app
+   is stopped and the claim's end gives the screen back. False when no driver holds it, or its
+   app is already being stopped. May sleep. */
+bool pci_user_screen_take_back(void);
