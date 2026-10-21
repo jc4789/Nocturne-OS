@@ -5,11 +5,12 @@
 #include <string.h>
 #include "../ports/nvidia/os_pci.c"
 
-static int failures, creates, closes, maps, views, live;
+static int failures, creates, closes, maps, views, live, fail_view_at, wc_views, uc_views;
 static uint64_t first_address, replacement_address, scattered[3];
 static size_t allocated_bytes;
 static uint32_t allocation_flags, view_cache, view_access;
-static bool fail_addresses, fail_view;
+static bool fail_addresses, fail_view, disable_wc, fail_compose;
+static size_t composed_count, composed_bytes;
 static uint8_t mapped[3 * NV_RM_PAGE_SIZE];
 
 #define CHECK(expr) do { if (!(expr)) { \
@@ -23,6 +24,7 @@ int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
 void call_once(once_flag *flag, void (*init)(void)) { (void)flag; init(); }
 
 void nvrm_log(const char *fmt, ...) { (void)fmt; }
+NvBool NV_API_CALL rm_disable_iomap_wc(void) { return disable_wc; }
 void *nvrm_user_mapping_new(void) { return NULL; }
 void *nvrm_user_mapping_current(void) { return NULL; }
 void nvrm_user_mapping_free(void *owner) { (void)owner; }
@@ -47,14 +49,29 @@ n_handle n_shared_view(n_handle h, size_t offset, size_t bytes, uint32_t cache) 
     (void)h;
     view_cache = cache;
     views++;
+    wc_views += cache == N_CACHE_WRITE_COMBINE;
+    uc_views += cache == N_CACHE_UNCACHED;
     CHECK(offset <= allocated_bytes && bytes <= allocated_bytes - offset);
-    if (fail_view) return -N_ERR_NO_MEMORY;
+    if (fail_view || views == fail_view_at) return -N_ERR_NO_MEMORY;
     live++;
     return 100;
 }
 n_handle n_shared_view_access(n_handle h, size_t offset, size_t bytes, uint32_t cache, uint32_t access) {
     view_access = access;
     return n_shared_view(h, offset, bytes, cache);
+}
+n_handle n_shared_compose(const struct n_shared_range *ranges, size_t count, uint32_t access) {
+    CHECK(access == N_MEMORY_READ || access == N_MEMORY_READ_WRITE);
+    composed_count = count;
+    composed_bytes = 0;
+    for (size_t i = 0; i < count; i++) {
+        CHECK(ranges[i].shared >= 0 && ranges[i].reserved == 0 && ranges[i].offset == 0);
+        CHECK(ranges[i].bytes && !(ranges[i].bytes & (PAGE - 1)));
+        composed_bytes += ranges[i].bytes;
+    }
+    if (fail_compose) return -N_ERR_NO_MEMORY;
+    live++;
+    return 300;
 }
 n_handle n_pci_bar(n_handle pci, uint32_t index) {
     (void)pci;
@@ -75,8 +92,10 @@ n_result n_handle_close(n_handle h) { CHECK(h >= 0); live--; closes++; return 0;
 static void reset_fixture(void) {
     CHECK(live == 0 && maps == 0);
     creates = closes = views = 0;
+    wc_views = uc_views = fail_view_at = 0;
+    composed_count = composed_bytes = 0;
     allocation_flags = view_cache = view_access = 0;
-    fail_addresses = fail_view = false;
+    fail_addresses = fail_view = disable_wc = fail_compose = false;
     first_address = replacement_address = PAGE;
 }
 
@@ -179,6 +198,18 @@ static void mapping_cases(void) {
     CHECK(nv_alloc_user_mapping(&nv, priv, 1, PAGE - 1, 2, 0, &user, NULL) == NV_ERR_INVALID_ARGUMENT);
     CHECK(maps == 0 && views == 0);
 
+    struct nvrm_mapping context = {.is_alloc = true, .alloc = priv, .size = PAGE,
+                                  .caching = NV_MEMORY_DEFAULT};
+    uint64_t view_offset = 0, view_bytes = 0;
+    n_handle published = nvrm_mapping_view(&context, N_MEMORY_READ, 1, &view_offset, &view_bytes);
+    CHECK(published >= 0 && view_offset == 1 && view_bytes == 2 * PAGE && view_access == N_MEMORY_READ);
+    n_handle_close(published);
+    context.page_index = 1;
+    CHECK(nvrm_mapping_view(&context, N_MEMORY_READ, 1, &view_offset, &view_bytes) == -N_ERR_INVALID);
+    context.page_index = 0;
+    context.size = UINT64_MAX;
+    CHECK(nvrm_mapping_view(&context, N_MEMORY_READ, 1, &view_offset, &view_bytes) == -N_ERR_INVALID);
+
     void *address = nv_alloc_kernel_mapping(&nv, priv, 1, PAGE - 1, 1, &mapping);
     CHECK(address == mapped + 2 * PAGE - 1 && maps == 1);
     CHECK(nv_alloc_user_mapping(&nv, priv, 1, PAGE - 1, 1, 0, &user, NULL) == NV_OK);
@@ -239,7 +270,7 @@ static void bar_cases(void) {
         n_handle h = nvrm_bar_view(g->bar[2 * a].address + 1, PAGE - 1,
                                    NV_MEMORY_WRITECOMBINED, N_MEMORY_READ, &offset);
         CHECK(h >= 0 && offset == 1 && view_access == N_MEMORY_READ);
-        CHECK(view_cache == (a == NV_GPU_BAR_INDEX_FB ? N_CACHE_WRITE_COMBINE : N_CACHE_UNCACHED));
+        CHECK(view_cache == (a == NV_GPU_BAR_INDEX_REGS ? N_CACHE_UNCACHED : N_CACHE_WRITE_COMBINE));
         n_handle_close(h);
     }
     g->bar[2].flags &= ~N_PCI_BAR_PREFETCH;
@@ -247,8 +278,32 @@ static void bar_cases(void) {
     n_handle h = nvrm_bar_view(g->bar[2].address, PAGE, NV_MEMORY_WRITECOMBINED, N_MEMORY_READ_WRITE, &offset);
     CHECK(h >= 0 && view_cache == N_CACHE_UNCACHED && view_access == N_MEMORY_READ_WRITE);
     n_handle_close(h);
-    nvrm_pci_detach();
-    CHECK(live == 0);
+    g->bar[2].flags |= N_PCI_BAR_PREFETCH;
+
+    /* RM supplies USERD's BAR1 interval. A partial page overlap is UC, but
+       the adjacent framebuffer page and BAR2 remain WC. */
+    nv->ud.cpu_address = g->bar[2].address + 2 * PAGE + 16;
+    nv->ud.size = 32;
+    h = nvrm_bar_view(g->bar[2].address + 2 * PAGE, 1, NV_MEMORY_WRITECOMBINED, N_MEMORY_READ, &offset);
+    CHECK(h >= 0 && view_cache == N_CACHE_UNCACHED);
+    n_handle_close(h);
+    h = nvrm_bar_view(g->bar[2].address + 3 * PAGE, PAGE, NV_MEMORY_WRITECOMBINED, N_MEMORY_READ, &offset);
+    CHECK(h >= 0 && view_cache == N_CACHE_WRITE_COMBINE);
+    n_handle_close(h);
+    void *mapped_bar = os_map_kernel_space(g->bar[4].address, PAGE, NV_MEMORY_WRITECOMBINED);
+    CHECK(mapped_bar != NULL && view_cache == N_CACHE_WRITE_COMBINE);
+    os_unmap_kernel_space(mapped_bar, PAGE);
+    mapped_bar = os_map_kernel_space(g->bar[2].address + 2 * PAGE, PAGE, NV_MEMORY_WRITECOMBINED);
+    CHECK(mapped_bar != NULL && view_cache == N_CACHE_UNCACHED);
+    os_unmap_kernel_space(mapped_bar, PAGE);
+    disable_wc = true;
+    h = nvrm_bar_view(g->bar[2].address, PAGE, NV_MEMORY_WRITECOMBINED, N_MEMORY_READ, &offset);
+    CHECK(h >= 0 && view_cache == N_CACHE_UNCACHED);
+    n_handle_close(h);
+    mapped_bar = os_map_kernel_space(g->bar[4].address, PAGE, NV_MEMORY_WRITECOMBINED);
+    CHECK(mapped_bar != NULL && view_cache == N_CACHE_UNCACHED);
+    os_unmap_kernel_space(mapped_bar, PAGE);
+    disable_wc = false;
 
     MemoryRange ranges[20]; /* Crosses the removed historical 16-range limit. */
     for (unsigned i = 0; i < sizeof ranges / sizeof ranges[0]; i++)
@@ -258,10 +313,53 @@ static void bar_cases(void) {
     u.memArea.pRanges = ranges;
     CHECK(nv_add_mapping_context_to_file(nv, &u, NV_PROTECT_READABLE, NULL, 0, 0) == NV_OK);
     struct nvrm_mapping m;
-    CHECK(nvrm_take_mapping(&m) && m.range.start == PAGE && m.range.size == sizeof ranges / sizeof ranges[0] * PAGE);
+    CHECK(nvrm_take_mapping(&m) && m.range_count == sizeof ranges / sizeof ranges[0]);
     ranges[1].start += PAGE;
-    CHECK(nv_add_mapping_context_to_file(nv, &u, NV_PROTECT_READABLE, NULL, 0, 0) == NV_ERR_NOT_SUPPORTED);
+    CHECK(m.ranges[1].start == 2 * PAGE); /* callback retained its own copy */
+    nvrm_mapping_release(&m);
+    CHECK(nv_add_mapping_context_to_file(nv, &u, NV_PROTECT_READABLE, NULL, 0, 0) == NV_OK);
+    CHECK(nvrm_take_mapping(&m) && m.ranges[1].start == 3 * PAGE);
+    nvrm_mapping_release(&m);
+
+    /* Disjoint BAR1 pages followed by BAR2: page order and per-range cache
+       survive composition; all temporary native views are closed. */
+    MemoryRange disjoint[] = {
+        {.start = g->bar[2].address + 3 * PAGE, .size = PAGE},
+        {.start = g->bar[2].address + 2 * PAGE, .size = PAGE},
+        {.start = g->bar[4].address + PAGE, .size = PAGE},
+    };
+    u.memArea.numRanges = sizeof disjoint / sizeof disjoint[0];
+    u.memArea.pRanges = disjoint;
+    u.caching = NV_MEMORY_WRITECOMBINED;
+    CHECK(nv_add_mapping_context_to_file(nv, &u, NV_PROTECT_READABLE, NULL, 0, 0) == NV_OK);
+    CHECK(nvrm_take_mapping(&m));
+    int was_live = live, was_wc = wc_views, was_uc = uc_views;
+    uint64_t bytes = 0;
+    h = nvrm_mapping_view(&m, N_MEMORY_READ, 7, &offset, &bytes);
+    CHECK(h >= 0 && offset == 7 && bytes == 3 * PAGE);
+    CHECK(composed_count == 3 && composed_bytes == 3 * PAGE);
+    CHECK(wc_views - was_wc == 2 && uc_views - was_uc == 1 && live == was_live + 1);
+    n_handle_close(h);
+    fail_view_at = views + 2;
+    CHECK(nvrm_mapping_view(&m, N_MEMORY_READ, 0, &offset, &bytes) == -N_ERR_NO_MEMORY);
+    CHECK(live == was_live);
+    fail_view_at = 0;
+    fail_compose = true;
+    CHECK(nvrm_mapping_view(&m, N_MEMORY_READ, 0, &offset, &bytes) == -N_ERR_NO_MEMORY);
+    CHECK(live == was_live);
+    fail_compose = false;
+    nvrm_mapping_release(&m);
+    CHECK(nv_add_mapping_context_to_file(nv, &u, NV_PROTECT_READABLE, NULL, 0, 0) == NV_OK);
+    nvrm_drop_mapping();
     CHECK(!nvrm_take_mapping(&m));
+    u.memArea.numRanges = UINT64_MAX;
+    CHECK(nv_add_mapping_context_to_file(nv, &u, NV_PROTECT_READABLE, NULL, 0, 0) == NV_ERR_INVALID_ARGUMENT);
+    u.memArea.numRanges = sizeof disjoint / sizeof disjoint[0];
+    disjoint[1].size = UINT64_MAX;
+    CHECK(nv_add_mapping_context_to_file(nv, &u, NV_PROTECT_READABLE, NULL, 0, 0) == NV_ERR_INVALID_ARGUMENT);
+    CHECK(!nvrm_take_mapping(&m));
+    nvrm_pci_detach();
+    CHECK(live == 0 && maps == 0);
 }
 
 int main(void) {

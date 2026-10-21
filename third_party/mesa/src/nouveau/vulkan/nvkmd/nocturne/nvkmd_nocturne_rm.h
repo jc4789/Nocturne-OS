@@ -53,14 +53,15 @@ struct nnrm_gpu_info {
    uint16_t cls_gpfifo, cls_vdec;
 };
 
-/* Number of NVIDIA display functions; an unready daemon is skipped on open. */
-uint32_t nnrm_gpu_count(void);
-
-/* Open GPU `gpu_index`: a new RM client, the device and subdevice, the
- * default GPU address space.  `info` may be NULL. */
-uint32_t nnrm_open(uint32_t gpu_index, struct nnrm **out, struct nnrm_gpu_info *info);
-/* Reopen the exact PCI function retained by a physical device. */
+/* Caller-owned snapshot of PCI targets with an explicitly ready RM adapter
+ * and a probed GPU whose PCI identity matches the endpoint. Free *targets on
+ * success, including zero results. Errors are not silently represented by an
+ * empty list. */
+uint32_t nnrm_enumerate_gpus(uint32_t **targets, uint32_t *count);
+/* Open the exact PCI function retained by a physical device. A new RM client
+ * and address space are created; info may be NULL. */
 uint32_t nnrm_open_device(uint32_t pci_target, struct nnrm **out, struct nnrm_gpu_info *info);
+/* Release the owner's reference; channels keep the address space alive. */
 void nnrm_close(struct nnrm *rm);
 
 /* VRAM in use (bytes), 0 when RM does not say */
@@ -124,8 +125,9 @@ struct nnrm_gp {
 uint32_t nnrm_chan_create(struct nnrm *rm, uint32_t engines, struct nnrm_chan **out);
 void nnrm_chan_destroy(struct nnrm_chan *chan);
 
-/* Queue GP entries and ring the doorbell.  Waits (bounded polling) for ring
- * space.  The caller serialises calls on one channel. */
+/* Queue GP entries and ring the doorbell. Waits for ring space. The caller
+ * serialises submissions and destruction of the same channel. Different
+ * channels retain the shared address-space BAR1 read target independently. */
 uint32_t nnrm_chan_submit(struct nnrm_chan *chan, const struct nnrm_gp *gps, uint32_t count);
 
 /* true once the channel has hit an error (RM reset it) or /bin/nvrm has gone */
@@ -135,6 +137,7 @@ bool nnrm_chan_has_error(struct nnrm_chan *chan);
 
 /* VkResult for an RM status; `out_of_device` picks the memory error flavour */
 int nnrm_vk_result(uint32_t nv_status, bool out_of_device);
+bool nnrm_gpu_unavailable(uint32_t nv_status);
 const char *nnrm_status_name(uint32_t nv_status);
 
 #endif /* NVKMD_NOCTURNE_RM_H */

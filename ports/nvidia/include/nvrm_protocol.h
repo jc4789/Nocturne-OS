@@ -17,6 +17,10 @@
 #define NVRM_CHANNEL_NAME_BYTES (sizeof(NVRM_CHANNEL) + 1 + 2 * sizeof(uint16_t))
 #define NVRM_PROTOCOL 1
 #define NVRM_HELLO 0x1000u   /* escapes below 0x1000 are RM's NV_ESC_* numbers */
+/* HELLO reply capabilities in access (arena_bytes on the request). Old arena
+   sizes are page aligned, so these low bits cannot be mistaken for an echo. */
+#define NVRM_HELLO_STATUS_PRESENT (UINT64_C(1) << 0)
+#define NVRM_HELLO_ADAPTER_READY (UINT64_C(1) << 1)
 
 struct nvrm_message {
     uint32_t protocol;      /* NVRM_PROTOCOL */
@@ -25,7 +29,8 @@ struct nvrm_message {
     int32_t status;         /* reply: 0, or negative n_result; old clients fail closed on RM errors */
     /* Preserve Protocol1's size/offsets for statically linked apps. Hello uses
        arena fields; later replies use those previously-unused slots for status
-       and maximum mapping access. RM errors also set status<0 for old clients. */
+       and maximum mapping access. RM errors also set status<0 for old clients,
+       but keep the updated argument block, including partial-success handles. */
     union { uint64_t arena_address; uint64_t rm_status; };
     union { uint64_t arena_bytes; uint64_t access; };
     uint64_t offset, bytes; /* map reply: the mapping inside the attached object */

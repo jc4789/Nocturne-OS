@@ -23,7 +23,9 @@
 
 #include <nv.h>                     // NV device driver interface
 #ifdef NVRM_NOCTURNE
-/* Native user mappings are revocable capabilities with an RM-owned lifetime. */
+/* Native user mappings have an RM-owned lifetime even outside an IPC request.
+ * Registration returns NULL only on a real allocation failure, not for an
+ * absent request or a temporary GPU mapping-admission state. */
 extern void *nvrm_user_mapping_new(void);
 extern void nvrm_user_mapping_free(void *);
 #endif

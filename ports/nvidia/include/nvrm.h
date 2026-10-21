@@ -13,8 +13,21 @@
 struct nvrm;
 
 struct nvrm *nvrm_connect(void); /* NULL when no driver runs */
+/* First adapter explicitly reported ready; diagnostic-only daemons are skipped. */
+struct nvrm *nvrm_connect_ready(void);
 /* Select a domain-zero PCI function, encoded by N_PCI_TARGET(bus, dev, func). */
 struct nvrm *nvrm_connect_device(uint32_t pci_target);
+/* 0 with *out set; otherwise a negative native N_ERR_* result. In particular,
+   endpoint absence is not confused with OOM or an invalid protocol reply. */
+int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out);
+/* Adapter state confirmed by this connection's HELLO snapshot. The daemon
+   starts serving only after adapter initialization finishes. False includes a
+   diagnostic-only daemon and old servers that do not explicitly report state. */
+bool nvrm_device_ready(const struct nvrm *rm);
+/* NVIDIA's display functions accepted by this RM port, per PCI class encoding. */
+static inline bool nvrm_pci_is_gpu(uint16_t vendor, uint8_t cls, uint8_t subcls, uint8_t progif) {
+    return vendor == 0x10de && cls == 0x03 && progif == 0x00 && (subcls == 0x00 || subcls == 0x02);
+}
 void nvrm_disconnect(struct nvrm *rm);
 
 /* NV_ESC_RM_ALLOC: *object 0 asks RM for a handle (as for a new client: root 0, parent 0). */

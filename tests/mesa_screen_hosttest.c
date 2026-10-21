@@ -2,8 +2,8 @@
 #include <stdio.h>
 #include "../ports/mesa/nocturne_gl.c"
 
-static unsigned failures, gpu_attempts, cpu_attempts, gpu_clears, cpu_maps;
-static bool daemon_ready;
+static unsigned failures, gpu_attempts, cpu_attempts, gpu_clears, cpu_maps, probes, closes;
+static bool daemon_present, daemon_ready, zink_available;
 static struct pipe_screen software = {.caps = {.accelerated = 0}};
 static struct pipe_screen hardware = {.caps = {.accelerated = 1}};
 #define CHECK(x) do { if (!(x)) { printf("失敗 %d: %s\n", __LINE__, #x); failures++; } } while (0)
@@ -14,13 +14,16 @@ void _simple_mtx_plain_init_once(simple_mtx_t *m) { (void)m; }
 void util_call_once_data_slow(once_flag *flag, util_call_once_data_func func, const void *data) {
     (void)flag; func(data);
 }
-struct nvrm *nvrm_connect(void) { return daemon_ready ? (struct nvrm *)&daemon_ready : NULL; }
-void nvrm_disconnect(struct nvrm *rm) { CHECK(rm == (struct nvrm *)&daemon_ready); }
+struct nvrm *nvrm_connect_ready(void) {
+    probes++; return daemon_present && daemon_ready ? (struct nvrm *)&daemon_ready : NULL;
+}
+void nvrm_disconnect(struct nvrm *rm) { CHECK(rm == (struct nvrm *)&daemon_ready); closes++; }
 struct pipe_screen *softpipe_create_screen(struct sw_winsys *ws) {
     CHECK(ws == &mem_winsys); cpu_attempts++; return &software;
 }
 struct pipe_screen *zink_create_screen(struct sw_winsys *ws, const struct pipe_screen_config *config) {
-    CHECK(ws == &mem_winsys && config == NULL && daemon_ready); gpu_attempts++; return &hardware;
+    CHECK(ws == &mem_winsys && config == NULL && daemon_ready); gpu_attempts++;
+    return zink_available ? &hardware : NULL;
 }
 static void clear(struct pipe_context *pipe, struct pipe_resource *res, unsigned level,
                   const struct pipe_box *box, const void *data) {
@@ -41,14 +44,20 @@ int main(void) {
     CHECK(get_screen() == first && gpu_attempts == 0 && cpu_attempts == 1);
     struct ngl_context old = {.base = {.fscreen = first}, .on_gpu = false};
     CHECK(ngl_has_major_performance_caveat(&old));
+    daemon_present = true; /* 接続可能な診断daemonだけではGPUに昇格しない。 */
+    CHECK(get_screen() == first && gpu_attempts == 0 && cpu_attempts == 1);
     daemon_ready = true;
+    /* probe後のZink/NVK再検査でGPUが消えてもCPU screenを失わない。 */
+    CHECK(get_screen() == first && gpu_attempts == 1 && closes == 1 && old.base.fscreen == first);
+    zink_available = true;
     struct pipe_frontend_screen *later = get_screen();
-    CHECK(later && later != first && later->screen == &hardware && gpu_attempts == 1);
+    CHECK(later && later != first && later->screen == &hardware && gpu_attempts == 2 && closes == 2);
     CHECK(first->screen == &software && old.base.fscreen == first);
     struct ngl_context newer = {.base = {.fscreen = later}, .on_gpu = true};
     CHECK(!ngl_has_major_performance_caveat(&newer));
     CHECK(ngl_has_major_performance_caveat(&old));
-    CHECK(get_screen() == later && gpu_attempts == 1 && cpu_attempts == 1);
+    unsigned before_probes = probes;
+    CHECK(get_screen() == later && gpu_attempts == 2 && cpu_attempts == 1 && probes == before_probes);
     struct pipe_context pipe = {.clear_texture = clear, .texture_map = map, .texture_unmap = unmap};
     struct pipe_resource texture = {.width0 = 1, .height0 = 1};
     init_texture(&pipe, &texture, 0, old.on_gpu);

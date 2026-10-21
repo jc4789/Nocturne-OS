@@ -71,6 +71,132 @@ static int revoked_reader(void) {
     volatile uint32_t value=p[0]; /* expected access fault after parent revoke */
     return value==0x12345678?15:16;
 }
+struct map_race {
+    n_handle view;size_t bytes;atomic_int ready,go,done;void *result;int error;
+};
+static int mapping_builder(void *arg) {
+    struct map_race *r=arg;atomic_store(&r->ready,1);
+    while(!atomic_load(&r->go))thrd_yield();
+    r->result=n_shared_map(r->view,r->bytes,N_MEMORY_READ);r->error=errno;
+    atomic_store(&r->done,1);return 0;
+}
+static void construction_cancel_case(void) {
+    struct n_sysinfo info={0};
+    CHECK(sysinfo(&info)==0,"construction race memory information");
+    /* A legal sparse object as large as the actually available RAM gives the
+       scheduler work to interleave, without allocating/touching all frames or
+       introducing a product/test-only delay or fixed resource ceiling. */
+    size_t bytes=(size_t)(info.free_mem&~(uint64_t)4095);
+    n_handle root=n_shared_reserve(bytes),view=n_shared_view_access(root,0,bytes,N_CACHE_DEFAULT,N_MEMORY_READ);
+    n_handle channel[2]={-1,-1};
+    CHECK(root>=0 && view>=0 && n_channel_pair(channel)==0,"construction race resources");
+    struct map_race race={.view=view,.bytes=bytes};thrd_t builder;
+    int created=thrd_create(&builder,mapping_builder,&race);
+    CHECK(created==thrd_success,"construction race builder");
+    if(created==thrd_success){
+        while(!atomic_load(&race.ready))thrd_yield();
+        uint32_t *probe=n_shared_map(root,bytes,N_MEMORY_READ_WRITE);
+        CHECK(probe!=NULL,"reserve known candidate VA before racing");
+        if(probe){probe[0]=0x19384756;CHECK(n_memory_release(probe,bytes)==0,"release candidate VA for the builder");}
+        atomic_store(&race.go,1);
+        bool observed=false,released=false;
+        while(probe && !atomic_load(&race.done)){
+            n_result state=__syscall(SYS_MEMORY_PROTECT,(long)probe,4096,N_MEMORY_READ,0,0);
+            if(state==-N_ERR_NOT_READY){
+                observed=true;
+                n_result release=__syscall(SYS_MEMORY_RELEASE,(long)probe,bytes,0,0,0);
+                /* It may finish between these two syscalls. Either the still
+                   constructing range is protected, or a finished map releases. */
+                CHECK(release==-N_ERR_NOT_READY || release==0,"release respects constructing or completed map lifetime: %lld",(long long)release);
+                released=release==0;break;
+            }
+            thrd_yield();
+        }
+        CHECK(observed,"native map yields with a tracked constructing VA");
+        CHECK(n_shared_revoke(view)==0,"cancel view while map builds");
+        CHECK(!probe || n_channel_send(channel[0],probe,sizeof *probe,-1)==-N_ERR_BAD_ADDRESS,
+              "after cancellation returns, even guessed in-flight PTE cannot be copied");
+        thrd_join(builder,NULL);
+        CHECK(!race.result?race.error==N_ERR_CLOSED:race.result==probe,
+              "builder either closes or had already published the known mapping");
+        if(race.result && !released)n_memory_release(race.result,bytes);
+    }
+    if(channel[0]>=0)n_handle_close(channel[0]);if(channel[1]>=0)n_handle_close(channel[1]);
+    if(view>=0)n_handle_close(view);if(root>=0)n_handle_close(root);
+}
+static void composition_cases(const char *program) {
+    const size_t page=4096; /* native x86-64 shared-page granularity */
+    n_handle a=n_shared_create(3*page),b=n_shared_reserve(2*page);
+    uint32_t *a_map=n_shared_map(a,3*page,N_MEMORY_READ_WRITE);
+    CHECK(a>=0 && b>=0 && a_map,"composition backing objects");
+    if(a_map){a_map[0]=0x11111111;a_map[2*page/4]=0x33333333;}
+    struct n_shared_range ranges[]={
+        {.shared=a,.offset=2*page,.bytes=page},
+        {.shared=b,.offset=page,.bytes=page},
+        {.shared=a,.offset=0,.bytes=page}
+    };
+    n_handle joined=n_shared_compose(ranges,3,N_MEMORY_READ_WRITE);
+    uint32_t *mapped=n_shared_map(joined,3*page,N_MEMORY_READ_WRITE);
+    CHECK(joined>=0 && mapped && mapped[0]==0x33333333 && mapped[page/4]==0 && mapped[2*page/4]==0x11111111,
+          "ordered nonadjacent slices and untouched demand page share one VA");
+    if(mapped){mapped[0]=0x12345678;mapped[page/4]=0x55555555;}
+    uint32_t *b_map=n_shared_map(b,2*page,N_MEMORY_READ);
+    CHECK(a_map && b_map && a_map[2*page/4]==0x12345678 && b_map[page/4]==0x55555555,
+          "composition aliases backing pages, including first-touch allocation");
+    if(a_map)n_memory_release(a_map,3*page);
+    if(b_map)n_memory_release(b_map,2*page);
+    if(a>=0)n_handle_close(a);if(b>=0)n_handle_close(b);
+    CHECK(mapped && mapped[0]==0x12345678 && mapped[page/4]==0x55555555,"source handle close retains backing");
+    n_handle slice=n_shared_view(joined,page,2*page,N_CACHE_DEFAULT);
+    const uint32_t *slice_map=n_shared_map(slice,2*page,N_MEMORY_READ);
+    CHECK(slice>=0 && slice_map && slice_map[0]==0x55555555 && slice_map[page/4]==0x11111111,
+          "view of composite crosses segment boundaries");
+    struct n_shared_range invalid[]={{.shared=joined,.bytes=page},{.shared=-1,.bytes=page}};
+    CHECK(n_shared_compose(invalid,2,N_MEMORY_READ)==-N_ERR_NO_HANDLE,"invalid later segment rolls back composition");
+    CHECK(n_shared_compose(ranges,SIZE_MAX,N_MEMORY_READ)==-N_ERR_TOO_LARGE,"composition metadata multiplication cannot overflow");
+    n_handle ro=n_shared_view_access(joined,0,3*page,N_CACHE_DEFAULT,N_MEMORY_READ);
+    struct n_shared_range readonly={.shared=ro,.bytes=3*page};
+    CHECK(n_shared_compose(&readonly,1,N_MEMORY_READ_WRITE)==-N_ERR_DENIED,"composition cannot upgrade read-only source");
+    n_handle nested=n_shared_compose(&readonly,1,N_MEMORY_READ);
+    CHECK(nested>=0 && !n_shared_map(nested,3*page,N_MEMORY_READ_WRITE),"read-only composite maximum is immutable");
+    CHECK(n_shared_view_access(nested,0,page,N_CACHE_DEFAULT,N_MEMORY_READ_WRITE)==-N_ERR_DENIED,
+          "view cannot upgrade read-only composite");
+    n_handle derived=n_shared_view(nested,0,page,N_CACHE_DEFAULT);
+    struct n_shared_range nested_range={.shared=derived,.bytes=page};
+    n_handle exported=n_shared_compose(&nested_range,1,N_MEMORY_READ);
+    const uint32_t *export_map=n_shared_map(exported,page,N_MEMORY_READ);
+    CHECK(export_map && export_map[0]==0x12345678,"nested composition and view retain original order");
+    if(nested>=0)n_handle_close(nested);if(derived>=0)n_handle_close(derived);
+    n_handle pair[2]={-1,-1},reader=-1;
+    if(exported>=0 && n_channel_pair(pair)==0){
+        const char *args[]={program,"revoked-reader"};int32_t handles[]={0,1,2,pair[1]};
+        struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=4};
+        reader=n_app_launch(program,&launch);n_handle_close(pair[1]);pair[1]=-1;
+        CHECK(reader>=0,"launch nested composition reader");
+        if(reader>=0){
+            char ready=0;
+            CHECK(n_channel_send(pair[0],"m",1,exported)==1 &&
+                  n_channel_receive(pair[0],&ready,1,N_CHANNEL_WAIT,NULL)==1 && ready=='r',"child reads nested composition before source revoke");
+        }
+    }else CHECK(0,"nested composition reader channel");
+    CHECK(n_shared_revoke(ro)==0,"source view issuer cancels nested compositions");
+    if(reader>=0){
+        int status=0;CHECK(n_channel_send(pair[0],"x",1,-1)==1,"release nested reader after cancellation");
+        n_result result=n_app_result(reader,2000,&status);
+        CHECK(result==0 && status==128+14,"nested existing map faults after source revoke: result=%lld status=%d",(long long)result,status);
+        if(result<0)n_app_stop(reader,0);n_handle_close(reader);
+    }
+    if(pair[0]>=0)n_handle_close(pair[0]);
+    CHECK(!n_shared_map(exported,page,N_MEMORY_READ) && n_shared_view(exported,0,page,N_CACHE_DEFAULT)==-N_ERR_CLOSED,
+          "nested composite cannot escape revoked dependency");
+    CHECK(!export_map || n_memory_protect((void *)export_map,page,N_MEMORY_READ)<0,"nested parent mapping also lost its PTE");
+    CHECK(mapped && mapped[0]==0x12345678,"source-view cancellation preserves independent composite owner");
+    if(export_map)n_memory_release((void *)export_map,page);
+    if(slice_map)n_memory_release((void *)slice_map,2*page);
+    if(mapped)n_memory_release(mapped,3*page);
+    if(exported>=0)n_handle_close(exported);if(ro>=0)n_handle_close(ro);
+    if(slice>=0)n_handle_close(slice);if(joined>=0)n_handle_close(joined);
+}
 int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"revoked-reader"))return revoked_reader();
     struct n_pciinfo list[128];
@@ -146,6 +272,32 @@ int main(int argc,char **argv) {
         wr32(EDU_LIVENESS, 0x12345678);
         CHECK(rd32(EDU_LIVENESS) == ~0x12345678u, "liveness %08x", rd32(EDU_LIVENESS));
     }
+    /* Two disjoint BAR pages plus RAM: per-segment types and claim lifetime
+       must survive composition. The register page intentionally comes second. */
+    n_handle mixed_ram=n_shared_create(4096);
+    struct n_shared_range mixed_ranges[]={
+        {.shared=bar,.offset=8192,.bytes=4096},
+        {.shared=bar,.offset=0,.bytes=4096},
+        {.shared=mixed_ram,.offset=0,.bytes=4096}
+    };
+    n_handle mixed=n_shared_compose(mixed_ranges,3,N_MEMORY_READ_WRITE);
+    volatile uint32_t *mixed_map=n_shared_map(mixed,3*4096,N_MEMORY_READ_WRITE);
+    CHECK(mixed>=0 && mixed_map && regs && mixed_map[4096/4]==rd32(EDU_IDENT),"noncontiguous BAR slices compose with RAM");
+    if(mixed_map)mixed_map[2*4096/4]=0x51525354;
+    CHECK(n_shared_view(mixed,0,3*4096,N_CACHE_WRITE_BACK)==-N_ERR_DENIED,"explicit cache cannot collapse heterogeneous segments");
+    n_handle mixed_view=n_shared_view(mixed,4096,2*4096,N_CACHE_DEFAULT);
+    CHECK(mixed_view>=0,"default composite view preserves heterogeneous cache attributes");
+    n_handle bar_slice=n_shared_view(mixed,4096,4096,N_CACHE_UNCACHED);
+    n_handle ram_slice=n_shared_view(mixed_view,4096,4096,N_CACHE_WRITE_BACK);
+    const volatile uint32_t *bar_slice_map=n_shared_map(bar_slice,4096,N_MEMORY_READ);
+    const uint32_t *ram_slice_map=n_shared_map(ram_slice,4096,N_MEMORY_READ);
+    CHECK(bar_slice>=0 && bar_slice_map && regs && bar_slice_map[0]==rd32(EDU_IDENT),"explicit UC on only the BAR portion of a mixed object");
+    CHECK(ram_slice>=0 && ram_slice_map && ram_slice_map[0]==0x51525354,"nested partial view selects only WB RAM, not preceding UC BAR");
+    if(bar_slice_map)n_memory_release((void *)bar_slice_map,4096);
+    if(ram_slice_map)n_memory_release((void *)ram_slice_map,4096);
+    if(bar_slice>=0)n_handle_close(bar_slice);if(ram_slice>=0)n_handle_close(ram_slice);
+    if(mixed_view>=0)n_handle_close(mixed_view);
+    if(mixed_ram>=0)n_handle_close(mixed_ram);
     n_handle wc = n_shared_view(bar, 0, 4096, N_CACHE_WRITE_COMBINE);
     CHECK(wc == -N_ERR_DENIED, "non-prefetchable register BAR refuses write-combining: %s", n_result_text(wc));
     n_handle wb = n_shared_view(bar, 0, 4096, N_CACHE_WRITE_BACK);
@@ -278,6 +430,8 @@ int main(int argc,char **argv) {
     CHECK(n_shared_view(plain, 0, 4096, N_CACHE_UNCACHED) == -N_ERR_DENIED, "ordinary memory keeps its caching");
     CHECK(n_dma_addresses(plain, 0, &through, 1) == -N_ERR_WRONG_KIND, "no addresses of ordinary memory");
     n_handle_close(plain);
+    composition_cases(argv[0]);
+    construction_cancel_case();
     if (low >= 0) n_handle_close(low);
     if (ram) n_memory_release(ram, 8192);
     if (mem >= 0) n_handle_close(mem);
@@ -286,6 +440,13 @@ int main(int argc,char **argv) {
        range reads all-ones, as a function gone from the bus. */
     if (bar >= 0) n_handle_close(bar);
     n_handle_close(pci);
+    if(mixed_map){
+        CHECK(mixed_map[0]==0xFFFFFFFFu && mixed_map[4096/4]==0xFFFFFFFFu,"all composed BAR pages lose their claim");
+        CHECK(mixed_map[2*4096/4]==0x51525354,"claim loss does not destroy unrelated composed RAM");
+        n_memory_release((void *)mixed_map,3*4096);
+    }
+    CHECK(!n_shared_map(mixed,3*4096,N_MEMORY_READ),"composed revoked BAR cannot be remapped");
+    if(mixed>=0)n_handle_close(mixed);
     if (regs) {
         CHECK(rd32(EDU_IDENT) == 0xFFFFFFFFu, "the BAR mapping is revoked with the claim: %08x", rd32(EDU_IDENT));
         n_memory_release((void *)regs, 1 << 20);

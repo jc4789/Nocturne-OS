@@ -13,6 +13,15 @@
 static int failures, map_access, map_calls, rm_calls, unmap_calls;
 static uint32_t rm_result, individual_status;
 static bool fail_export, corrupt_protocol;
+static bool partial_alloc, partial_control;
+static n_result connect_result = 12, reserve_result = 43;
+static bool fail_arena_map;
+static uint64_t sender_app = 10;
+static uint64_t queued_sender;
+static bool fixture_adapter_ready = true, legacy_hello;
+static bool multi_gpu_ready, override_hello;
+static uint64_t hello_flags;
+static size_t last_reply_size;
 static n_handle response_attachment;
 static struct nvrm_message *incoming, *outgoing;
 static size_t incoming_bytes, outgoing_bytes;
@@ -24,6 +33,7 @@ static int listener_calls, watches, listener_closes;
 static bool legacy_busy;
 FILE *stdout; /* The native FILE global is not MinGW's __acrt_iob_func(). */
 int fflush(FILE *stream) { (void)stream; return 0; }
+int *__errno_location(void) { static int native_errno; return &native_errno; }
 
 /* The original statically linked clients have this exact wire layout. */
 struct legacy_header {
@@ -42,10 +52,14 @@ int mtx_init(mtx_t *m, int type) { (void)m; (void)type; return thrd_success; }
 int mtx_lock(mtx_t *m) { (void)m; return thrd_success; }
 int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
 void mtx_destroy(mtx_t *m) { (void)m; }
-n_result n_handle_close(n_handle h) { if (h == 10 || h == 20 || h == 30) listener_closes++; return 0; }
+n_result n_handle_close(n_handle h) {
+    if (h == 10 || h == 20 || h == 30) listener_closes++;
+    if (h == 12) { server.file = NULL; server.arena = NULL; server.arena_handle = -1; }
+    return 0;
+}
 n_result n_events_unwatch(n_handle q, uint64_t token) { (void)q; (void)token; return 0; }
 int n_memory_release(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
-n_handle n_channel_connect(const char *name) { snprintf(connected_name, sizeof connected_name, "%s", name); return 12; }
+n_handle n_channel_connect(const char *name) { snprintf(connected_name, sizeof connected_name, "%s", name); return connect_result; }
 n_handle n_channel_listen(const char *name) {
     listener_calls++;
     if (!strcmp(name, NVRM_CHANNEL)) return legacy_busy ? -N_ERR_EXISTS : 30;
@@ -64,9 +78,10 @@ n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t time
     (void)q; (void)out; (void)max; (void)timeout_ms;
     return -N_ERR_CANCELLED;
 }
-n_handle n_shared_reserve(size_t bytes) { (void)bytes; return 43; }
+n_handle n_shared_reserve(size_t bytes) { (void)bytes; return reserve_result; }
 void *n_shared_map(n_handle h, size_t bytes, int access) {
     (void)bytes;
+    if (h == 43 && fail_arena_map) { errno = N_ERR_NO_MEMORY; return NULL; }
     if (h == 42) {
         map_access = access; map_calls++;
         if (access != N_MEMORY_READ) return NULL; /* native maximum RO fixture */
@@ -77,18 +92,36 @@ int pcilist(struct n_pciinfo *list, int capacity) {
     /* The ready GPU follows several non-display entries, so truncation misses it. */
     struct n_pciinfo entries[] = {
         {.vendor = 0x1234}, {.vendor = 0x10de, .cls = 0x04},
+        {.vendor = 0x10de, .cls = 0x03, .subcls = 0x01},
+        {.vendor = 0x10de, .cls = 0x03, .subcls = 0x00, .progif = 1},
         {.bus = 3, .dev = 4, .func = 1, .vendor = 0x10de, .cls = 0x03},
+        {.bus = 4, .vendor = 0x10de, .cls = 0x03, .subcls = 0x02},
     };
     int count = sizeof entries / sizeof entries[0];
     if (count > capacity) count = capacity;
     memcpy(list, entries, count * sizeof *list);
     return count;
 }
-void *nvrm_rm_file_open(bool admin) { CHECK(!admin); return &rm_calls; }
+void *nvrm_rm_file_open(bool admin, uint32_t principal) { CHECK(!admin && principal == sender_app); return &rm_calls; }
+bool nvrm_rm_adapter_ready(void) {
+    return fixture_adapter_ready && (!multi_gpu_ready || strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+}
 void nvrm_rm_file_close(void *file) { (void)file; }
 uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
     (void)file;
     rm_calls++;
+    if (partial_alloc && escape == NV_ESC_RM_ALLOC && size == sizeof(NVOS21_PARAMETERS)) {
+        NVOS21_PARAMETERS *a = args;
+        a->hObjectNew = 0x1234;
+        a->status = NV_OK;
+        if (a->paramsSize == sizeof(uint32_t)) *(uint32_t *)NvP64_VALUE(a->pAllocParms) = 0xcafe;
+    }
+    if (partial_control && escape == NV_ESC_RM_CONTROL && size == sizeof(NVOS54_PARAMETERS)) {
+        NVOS54_PARAMETERS *a = args;
+        a->status = NV_OK;
+        if (a->paramsSize == sizeof(uint32_t)) *(uint32_t *)NvP64_VALUE(a->params) = 0xbeef;
+    }
+    if (escape == 0x777 && size == sizeof(uint32_t)) *(uint32_t *)args = 0xabcdef;
     if (escape == NV_ESC_RM_MAP_MEMORY && size == sizeof(nv_ioctl_nvos33_parameters_with_fd)) {
         nv_ioctl_nvos33_parameters_with_fd *m = args;
         m->params.status = individual_status;
@@ -98,6 +131,8 @@ uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
         unmap_calls++;
         ((NVOS34_PARAMETERS *)args)->status = individual_status;
     }
+    if (escape == NV_ESC_RM_FREE && size == sizeof(NVOS00_PARAMETERS))
+        ((NVOS00_PARAMETERS *)args)->status = individual_status;
     return rm_result;
 }
 n_handle nvrm_rm_mapping_object(void *file, uint64_t *offset, uint64_t *bytes, uint32_t *access) {
@@ -116,9 +151,13 @@ n_result n_channel_send(n_handle channel, const void *data, size_t bytes, n_hand
     CHECK(*destination);
     memcpy(*destination, data, bytes);
     *length = bytes;
+    if (channel == 12) queued_sender = sender_app;
     if (channel == 11) {
+        last_reply_size = (*destination)->size;
         response_attachment = attached;
         if (corrupt_protocol) (*destination)->protocol++;
+        if (legacy_hello && (*destination)->escape == NVRM_HELLO) (*destination)->access = ARENA_BYTES;
+        if (override_hello && (*destination)->escape == NVRM_HELLO) (*destination)->access = hello_flags;
     }
     return bytes;
 }
@@ -142,22 +181,53 @@ n_result n_channel_receive(n_handle channel, void *data, size_t capacity, int fl
     free(outgoing); outgoing = NULL; outgoing_bytes = 0;
     return size;
 }
+n_result n_channel_receive_from(n_handle channel, void *data, size_t capacity, int flags,
+                                 struct n_channel_message *message) {
+    message->reserved = 0;
+    message->sender_app = queued_sender;
+    return n_channel_receive(channel, data, capacity, flags, &message->attached);
+}
 
 int main(void) {
     server.channel = 11;
     server.arena_handle = -1;
     server.file = &rm_calls;
-    struct nvrm rm = {.channel = 12};
+    server.principal = sender_app;
+    struct nvrm rm = {.channel = 12, .arena = shared_page};
     uint32_t untouched = 0;
     rm_result = NV_ERR_INVALID_ARGUMENT;
     CHECK(nvrm_escape(&rm, 0, &untouched, sizeof untouched) == NV_ERR_INVALID_ARGUMENT && untouched == 0);
     rm_result = NV_ERR_NOT_SUPPORTED;
     CHECK(nvrm_escape(&rm, 0x777, &untouched, 0) == NV_ERR_NOT_SUPPORTED);
+    CHECK(nvrm_escape(&rm, 0x777, &untouched, sizeof untouched) == NV_ERR_NOT_SUPPORTED);
+    CHECK(untouched == 0xabcdef && last_reply_size == sizeof untouched);
+    partial_alloc = true;
+    uint32_t object = 0, parameter = 0;
+    CHECK(nvrm_alloc(&rm, 0, 0, &object, 1, &parameter, sizeof parameter) == NV_ERR_NOT_SUPPORTED);
+    CHECK(object == 0x1234 && parameter == 0xcafe && last_reply_size == sizeof(NVOS21_PARAMETERS));
+    corrupt_protocol = true;
+    object = parameter = 0;
+    CHECK(nvrm_alloc(&rm, 0, 0, &object, 1, &parameter, sizeof parameter) == NV_ERR_OPERATING_SYSTEM);
+    CHECK(object == 0 && parameter == 0); /* no trusted reply, no invented output */
+    corrupt_protocol = false;
+    partial_alloc = false;
+    partial_control = true;
+    parameter = 0;
+    CHECK(nvrm_control(&rm, 1, 2, 3, &parameter, sizeof parameter) == NV_ERR_NOT_SUPPORTED);
+    CHECK(parameter == 0xbeef);
+    partial_control = false;
+    individual_status = NV_ERR_PROTECTION_FAULT;
+    CHECK(nvrm_free(&rm, 1, 2, 3) == NV_ERR_NOT_SUPPORTED); /* dispatcher error has precedence */
+    rm_result = NV_OK;
+    CHECK(nvrm_free(&rm, 1, 2, 3) == NV_ERR_PROTECTION_FAULT);
+    individual_status = NV_OK;
     /* No driver-specific 1024-byte argument truncation. */
     uint8_t args[2 * N_PAGE_SIZE] = {0};
     rm_result = NV_OK;
     CHECK(nvrm_escape(&rm, 0, args, sizeof args) == NV_OK);
     corrupt_protocol = true;
+    untouched = 7;
+    CHECK(nvrm_escape(&rm, 0x777, &untouched, sizeof untouched) == NV_ERR_OPERATING_SYSTEM && untouched == 7);
     CHECK(nvrm_escape(&rm, 0, &untouched, sizeof untouched) == NV_ERR_OPERATING_SYSTEM);
     corrupt_protocol = false;
     void *address = NULL;
@@ -173,18 +243,83 @@ int main(void) {
     CHECK(nvrm_map(&rm, 1, 2, 3, 0, N_PAGE_SIZE, 0, &address) == NV_ERR_PROTECTION_FAULT);
     CHECK(map_calls == 1);
     individual_status = NV_OK;
+    rm_result = NV_ERR_INVALID_ADDRESS;
+    before = unmap_calls;
+    CHECK(nvrm_map(&rm, 1, 2, 3, 0, N_PAGE_SIZE, 0, &address) == NV_ERR_INVALID_ADDRESS);
+    CHECK(unmap_calls == before + 1 && map_calls == 1); /* partial map is returned to RM */
+    rm_result = NV_OK;
+
+    /* Transferring a connected endpoint does not transfer its bound identity. */
+    int before_calls = rm_calls;
+    sender_app = 11;
+    CHECK(nvrm_escape(&rm, 0, &untouched, sizeof untouched) == NV_ERR_OPERATING_SYSTEM);
+    CHECK(rm_calls == before_calls && last_reply_size == 0);
+    sender_app = 10;
 
     /* Public default API still finds a single ready GPU; device opens use its
        BDF, not the first daemon that wins a shared service-name race. */
     server.file = NULL;
     struct nvrm *connection = nvrm_connect();
     CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+    CHECK(nvrm_device_ready(connection));
     nvrm_disconnect(connection);
     server.file = NULL; server.arena = NULL; server.arena_handle = -1;
     connection = nvrm_connect_device(N_PCI_TARGET(7, 0, 0));
     CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.0700"));
+    CHECK(nvrm_device_ready(connection));
     nvrm_disconnect(connection);
+    server.file = NULL; server.arena = NULL; server.arena_handle = -1;
+    fixture_adapter_ready = false;
+    connection = nvrm_connect_device(0);
+    CHECK(connection && !nvrm_device_ready(connection)); /* diagnostic access survives */
+    nvrm_disconnect(connection);
+    fixture_adapter_ready = true;
+    server.file = NULL; server.arena = NULL; server.arena_handle = -1;
+    legacy_hello = true;
+    connection = nvrm_connect_device(0);
+    CHECK(connection && !nvrm_device_ready(connection)); /* old state echo is not proof */
+    nvrm_disconnect(connection);
+    legacy_hello = false;
+    override_hello = true;
+    uint64_t flags[] = {
+        0, NVRM_HELLO_ADAPTER_READY, NVRM_HELLO_STATUS_PRESENT,
+        UINT64_C(1) << 63, NVRM_HELLO_STATUS_PRESENT | (UINT64_C(1) << 63),
+        NVRM_HELLO_STATUS_PRESENT | NVRM_HELLO_ADAPTER_READY | (UINT64_C(1) << 63),
+    };
+    for (size_t i = 0; i < sizeof flags / sizeof flags[0]; i++) {
+        hello_flags = flags[i];
+        connection = nvrm_connect_device(0);
+        CHECK(connection && nvrm_device_ready(connection) == (i == sizeof flags / sizeof flags[0] - 1));
+        nvrm_disconnect(connection);
+    }
+    override_hello = false;
+    multi_gpu_ready = true;
+    connection = nvrm_connect();
+    CHECK(connection && !nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.0321"));
+    nvrm_disconnect(connection);
+    connection = nvrm_connect_ready();
+    CHECK(connection && nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.0400"));
+    nvrm_disconnect(connection);
+    multi_gpu_ready = false;
     CHECK(!nvrm_connect_device((uint32_t)UINT16_MAX + 1));
+    CHECK(nvrm_pci_is_gpu(0x10de, 0x03, 0x02, 0x00));
+    CHECK(!nvrm_pci_is_gpu(0x10de, 0x03, 0x01, 0x00));
+    CHECK(!nvrm_pci_is_gpu(0x10de, 0x03, 0x00, 0x01));
+
+    struct nvrm *status_connection = NULL;
+    connect_result = -N_ERR_NOT_FOUND;
+    CHECK(nvrm_connect_device_status(0, &status_connection) == -N_ERR_NOT_FOUND && !status_connection);
+    connect_result = 12;
+    reserve_result = -N_ERR_NO_MEMORY;
+    CHECK(nvrm_connect_device_status(0, &status_connection) == -N_ERR_NO_MEMORY && !status_connection);
+    reserve_result = 43;
+    fail_arena_map = true;
+    CHECK(nvrm_connect_device_status(0, &status_connection) == -N_ERR_NO_MEMORY && !status_connection);
+    fail_arena_map = false;
+    server.file = NULL; server.arena = NULL; server.arena_handle = -1;
+    corrupt_protocol = true;
+    CHECK(nvrm_connect_device_status(0, &status_connection) == -N_ERR_PROTOCOL && !status_connection);
+    corrupt_protocol = false;
 
     /* A legacy reader ignores the newly-used union slots. It must still fail
        on dispatcher failure instead of reading zeroed argument.status as OK. */

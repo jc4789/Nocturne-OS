@@ -212,12 +212,23 @@ static uint32_t n_cache_for(uint32_t nv_caching, bool device) {
     }
 }
 
-static uint32_t bar_cache(unsigned index, uint32_t nv_caching) {
-    /* Only the framebuffer aperture contains normal VRAM. Registers, user
-       doorbells and instance-memory control windows require UC even if a caller
-       requests WC or the PCI BAR happens to be prefetchable. */
-    if (index != aperture_bar[NV_GPU_BAR_INDEX_FB] ||
-        !(nvrm_dev.info.bar[index].flags & N_PCI_BAR_PREFETCH)) return N_CACHE_UNCACHED;
+static bool ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
+    return a_size && b_size && (a >= b ? a - b < b_size : b - a < a_size);
+}
+
+static uint32_t bar_cache(unsigned index, uint64_t phys, uint64_t bytes, uint32_t nv_caching) {
+    /* Register/doorbell accesses remain UC. RM requests WC for both framebuffer
+       and instance memory, subject to the native BAR's prefetchable capability.
+       USERD is a special UC region inside BAR1, supplied by RM in nv->ud.
+       Test the actual page-rounded span: even a partial USERD overlap must not
+       create a WC alias for its page. */
+    const nv_state_t *nv = &nvrm_dev.nv;
+    if (index == aperture_bar[NV_GPU_BAR_INDEX_REGS] ||
+        !(nvrm_dev.info.bar[index].flags & N_PCI_BAR_PREFETCH) ||
+        (index == aperture_bar[NV_GPU_BAR_INDEX_FB] && nv->ud.cpu_address &&
+         ranges_overlap(phys, bytes, nv->ud.cpu_address, nv->ud.size)) ||
+        (nv_caching == NV_MEMORY_WRITECOMBINED && rm_disable_iomap_wc()))
+        return N_CACHE_UNCACHED;
     return n_cache_for(nv_caching, true);
 }
 
@@ -233,7 +244,8 @@ n_handle nvrm_bar_view(uint64_t phys, uint64_t bytes, uint32_t nv_caching, uint3
     uint64_t start = ALIGN_DOWN(off, PAGE);
     uint64_t end = ALIGN_UP(off + bytes, PAGE);
     if (view_offset) *view_offset = off - start;
-    return n_shared_view_access(bar, (size_t)start, (size_t)(end - start), bar_cache((unsigned)i, nv_caching), access);
+    uint32_t cache = bar_cache((unsigned)i, nvrm_dev.info.bar[i].address + start, end - start, nv_caching);
+    return n_shared_view_access(bar, (size_t)start, (size_t)(end - start), cache, access);
 }
 
 /* Kernel mappings of BAR ranges (os_map_kernel_space). BAR0 registers come out of the whole
@@ -262,7 +274,8 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode) {
     if (!size || off > SIZE_MAX - size || off + size > SIZE_MAX - (PAGE - 1)) return NULL;
     uint64_t astart = ALIGN_DOWN(off, PAGE);
     uint64_t length = ALIGN_UP(off + size, PAGE) - astart;
-    n_handle view = n_shared_view(bar, (size_t)astart, (size_t)length, bar_cache((unsigned)i, mode));
+    uint32_t cache = bar_cache((unsigned)i, nvrm_dev.info.bar[i].address + astart, length, mode);
+    n_handle view = n_shared_view(bar, (size_t)astart, (size_t)length, cache);
     if (view < 0) return NULL;
     uint8_t *base = n_shared_map(view, (size_t)length, N_MEMORY_READ_WRITE);
     n_handle_close(view);
@@ -756,9 +769,9 @@ static thread_local bool parked_valid;
 NV_STATUS NV_API_CALL nv_add_mapping_context_to_file(nv_state_t *nv, nv_usermap_access_params_t *nvuap, NvU32 prot,
                                                      void *alloc_priv, NvU64 page_index, NvU32 fd) {
     (void)nv; (void)fd;
-    parked_valid = false;
+    nvrm_drop_mapping();
+    if (!nvuap) return NV_ERR_INVALID_ARGUMENT;
     struct nvrm_mapping *m = &parked;
-    memset(m, 0, sizeof *m);
     m->owner = nvrm_user_mapping_current();
     m->prot = prot;
     m->caching = nvuap->caching;
@@ -770,18 +783,25 @@ NV_STATUS NV_API_CALL nv_add_mapping_context_to_file(nv_state_t *nv, nv_usermap_
     } else {
         m->access_start = nvuap->access_start;
         m->access_size = nvuap->access_size;
-        uint32_t n = nvuap->memArea.numRanges;
-        if (!n || !nvuap->memArea.pRanges) return NV_ERR_INVALID_ARGUMENT;
-        /* A native shared view covers one contiguous run. Coalesce any number
-           of adjacent RM ranges; reject only genuinely disjoint backing. */
-        for (uint32_t i = 0; i < n; i++) {
+        uint64_t n = nvuap->memArea.numRanges;
+        if (!n || !nvuap->memArea.pRanges || n > SIZE_MAX / sizeof *m->ranges)
+            return NV_ERR_INVALID_ARGUMENT;
+        uint64_t total = 0;
+        for (uint64_t i = 0; i < n; i++) {
             uint64_t start = nvuap->memArea.pRanges[i].start;
             uint64_t size = nvuap->memArea.pRanges[i].size;
-            if (!size || start > UINT64_MAX - size) return NV_ERR_INVALID_ARGUMENT;
-            if (!i) m->range.start = start;
-            else if (m->range.start + m->range.size != start) return NV_ERR_NOT_SUPPORTED;
-            if (m->range.size > UINT64_MAX - size) return NV_ERR_INVALID_ARGUMENT;
-            m->range.size += size;
+            /* Each disjoint extent represents whole OS pages. RM rounds the
+               first/last extent before installing this context. */
+            if (!size || start > UINT64_MAX - size || total > SIZE_MAX - size ||
+                (n > 1 && ((start | size) & (PAGE - 1)))) return NV_ERR_INVALID_ARGUMENT;
+            total += size;
+        }
+        m->ranges = malloc((size_t)n * sizeof *m->ranges);
+        if (!m->ranges) return NV_ERR_NO_MEMORY;
+        m->range_count = (size_t)n;
+        for (size_t i = 0; i < m->range_count; i++) {
+            m->ranges[i].start = nvuap->memArea.pRanges[i].start;
+            m->ranges[i].size = nvuap->memArea.pRanges[i].size;
         }
     }
     parked_valid = true;
@@ -789,9 +809,64 @@ NV_STATUS NV_API_CALL nv_add_mapping_context_to_file(nv_state_t *nv, nv_usermap_
 }
 
 bool nvrm_take_mapping(struct nvrm_mapping *out) {
-    if (!parked_valid) return false;
+    if (!out || !parked_valid) return false;
     *out = parked;
+    memset(&parked, 0, sizeof parked);
     parked_valid = false;
     return true;
 }
-void nvrm_drop_mapping(void) { parked_valid = false; }
+void nvrm_mapping_release(struct nvrm_mapping *m) {
+    if (!m) return;
+    free(m->ranges);
+    memset(m, 0, sizeof *m);
+}
+void nvrm_drop_mapping(void) {
+    nvrm_mapping_release(&parked);
+    parked_valid = false;
+}
+
+n_handle nvrm_mapping_view(const struct nvrm_mapping *m, uint32_t access, uint64_t page_offset,
+                           uint64_t *view_offset, uint64_t *bytes) {
+    if (!m || !view_offset || !bytes || page_offset >= PAGE) return -N_ERR_INVALID;
+    if (m->is_alloc) {
+        uint64_t whole = nvrm_alloc_size(m->alloc);
+        if (!m->size || m->page_index > UINT64_MAX / PAGE ||
+            m->size > SIZE_MAX - page_offset - (PAGE - 1)) return -N_ERR_INVALID;
+        uint64_t start = m->page_index * PAGE;
+        uint64_t length = ALIGN_UP(page_offset + m->size, PAGE);
+        if (start >= whole || length > whole - start) return -N_ERR_INVALID;
+        n_handle h = nvrm_alloc_view(m->alloc, m->page_index, length, m->caching, access);
+        if (h >= 0) { *view_offset = page_offset; *bytes = length; }
+        return h;
+    }
+    if (!m->range_count || !m->ranges) return -N_ERR_INVALID;
+    if (m->range_count == 1) {
+        uint64_t off = 0, size = m->ranges[0].size;
+        if (size > SIZE_MAX - (PAGE - 1) - (PAGE - 1)) return -N_ERR_TOO_LARGE;
+        n_handle h = nvrm_bar_view(m->ranges[0].start, size, m->caching, access, &off);
+        if (h >= 0) { *view_offset = page_offset + off; *bytes = ALIGN_UP(off + size, PAGE); }
+        return h;
+    }
+    if (m->range_count > SIZE_MAX / sizeof(struct n_shared_range)) return -N_ERR_TOO_LARGE;
+    struct n_shared_range *parts = calloc(m->range_count, sizeof *parts);
+    if (!parts) return -N_ERR_NO_MEMORY;
+    size_t made = 0;
+    uint64_t total = 0;
+    n_handle h = -N_ERR_INVALID;
+    for (size_t i = 0; i < m->range_count; i++) {
+        const struct nvrm_range *r = &m->ranges[i];
+        if (!r->size || ((r->start | r->size) & (PAGE - 1)) || r->size > SIZE_MAX - total) goto done;
+        uint64_t off;
+        h = nvrm_bar_view(r->start, r->size, m->caching, access, &off);
+        if (h < 0) goto done;
+        parts[made++] = (struct n_shared_range){.shared = h, .bytes = r->size};
+        total += r->size;
+        h = -N_ERR_INVALID;
+    }
+    h = n_shared_compose(parts, made, access);
+    if (h >= 0) { *view_offset = page_offset; *bytes = total; }
+done:
+    for (size_t i = 0; i < made; i++) n_handle_close(parts[i].shared);
+    free(parts);
+    return h;
+}

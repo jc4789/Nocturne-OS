@@ -4,6 +4,7 @@
 #include <string.h>
 #include <limits.h>
 #include "nocturne.h"
+#include "nvrm.h"
 
 /* Launch path with up to two arguments and the given input, output and log, in
    this app's folder. Settings beyond FOLDER (such as TERMINAL) are passed in extra. */
@@ -63,7 +64,7 @@ static void start_drivers(void) {
         capacity *= 2;
     }
     for (int i = 0; i < n; i++) {
-        if (list[i].vendor != 0x10de || list[i].cls != 0x03) continue;
+        if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif)) continue;
         char where[16];
         snprintf(where, sizeof where, "%02x:%02x.%u", list[i].bus, list[i].dev, list[i].func);
         n_handle pci = n_pci_claim(list[i].bus, list[i].dev, list[i].func);

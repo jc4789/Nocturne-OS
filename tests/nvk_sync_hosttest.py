@@ -21,12 +21,14 @@ common = [str(cc), "-std=gnu11", "-O2", "-ffreestanding", "-ffunction-sections",
            *("-Ithird_party/mesa/" + d for d in dirs),
            *("-Ibuild/mesa/gen/" + d for d in dirs if d != "include"),
            "-Iuser/include", "-Icommon", "-Wl,--gc-sections"]
-for name, extras in [
-    ("nvk_sync", ["third_party/mesa/src/util/u_dynarray.c", "third_party/mesa/src/util/ralloc.c"]),
-    ("mesa_screen", ["-DGALLIUM_ZINK", "-Iports/mesa", "-Iports/nvidia/include"]),
+for name, prefix, extras in [
+    ("nvk_sync", [], ["third_party/mesa/src/util/u_dynarray.c", "third_party/mesa/src/util/ralloc.c"]),
+    ("mesa_screen", [], ["-DGALLIUM_ZINK", "-Iports/mesa", "-Iports/nvidia/include"]),
+    ("nvk_rm", ["-Iports/nvidia/include", "-Ithird_party/nvidia-open/src/common/sdk/nvidia/inc",
+                "-Ithird_party/nvidia-open/src/nvidia/arch/nvalloc/unix/include"], []),
 ]:
     exe = root / ("build/" + name.replace("_", "-") + "-hosttest.exe")
-    result = subprocess.run([*common, "tests/" + name + "_hosttest.c", *extras, "-o", str(exe)], cwd=root, env=env)
+    result = subprocess.run([common[0], *prefix, *common[1:], "tests/" + name + "_hosttest.c", *extras, "-o", str(exe)], cwd=root, env=env)
     if result.returncode:
         sys.exit(result.returncode)
     result = subprocess.run([str(exe)], cwd=root, env=env)

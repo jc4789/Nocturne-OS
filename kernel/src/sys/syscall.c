@@ -30,6 +30,7 @@ int pci_list(struct n_pciinfo *out, int max);
 void vmm_user_pages_split(uint64_t pml4, uint64_t out[6]);
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
 static int copy_to_user(void *udst, const void *src, size_t n);
+static int copy_from_user(void *dst, const void *usrc, size_t n);
 
 /* ---- user memory access ---- */
 
@@ -274,20 +275,30 @@ static int64_t stop_tree(int pid, int include_self) {
  * direct map: write-back until the first uncached or write-combining view while nothing maps
  * it, then that type for good (x86 forbids one page with two types). */
 #define SHARED_LEAF (PAGE_SIZE/sizeof(uint64_t))
-enum {SHARED_RAM,SHARED_DEMAND,SHARED_RANGE,SHARED_VIEW};
+enum {SHARED_RAM,SHARED_DEMAND,SHARED_RANGE,SHARED_VIEW,SHARED_COMPOSITE};
 /* Physical views remain flattened. Revocation ancestry is independent of the
    backing, so creating a child never escapes an issuer's cancellation scope.
    References are released iteratively, not through an unbounded C call stack. */
 struct shared_scope {struct shared_scope *parent;size_t refs;int issuer;bool revoked;};
+/* Composite segments point only at backing roots, never at another composite.
+   Cancellation references are separate, so flattening cannot discard a view's
+   issuer or a nested composite's lifetime. end is the exclusive logical page. */
+struct shared_part {struct file *file;size_t first,end;uint8_t cache;};
 struct shared_pages {
     size_t count;uint8_t kind,cache;bool dma,owned,wc_allowed;
     struct shared_scope *scope;
-    uint32_t maps;            /* a DMA root: mappings of it or its views, in any process */
+    size_t maps;              /* a DMA root: mapping references, including composite segments */
     struct pci_claim *claim;  /* a BAR or DMA root: the claim it was made through */
     uint64_t base;struct file *parent;size_t first; /* a range's first frame; a view's object and first page */
+    struct shared_part *parts;size_t part_count;
+    struct shared_scope **dependencies;size_t dependency_count;
     uint64_t pages[];
 };
-struct shared_mapping {struct shared_mapping *next;struct file *file;uint64_t va,flags;size_t bytes;};
+struct shared_mapping {
+    struct shared_mapping *next;struct file *file;uint64_t va,flags;size_t bytes;
+    struct task *building_owner;bool cancelled,revoking;struct wait_queue build_wait;
+};
+static struct shared_mapping *shared_building; /* BSP-owned, before returning a VA */
 static size_t shared_slots(const struct shared_pages *p) {
     return p->kind==SHARED_DEMAND?(p->count+SHARED_LEAF-1)/SHARED_LEAF:p->kind==SHARED_RAM?p->count:0;
 }
@@ -306,11 +317,96 @@ static bool scope_within(const struct shared_scope *s,const struct shared_scope 
 static void scope_drop(struct shared_scope *s) {
     while(s && !--s->refs){struct shared_scope *parent=s->parent;kfree(s);s=parent;}
 }
+static bool shared_cancelled(struct shared_pages *p) {
+    if(scope_revoked(p->scope))return true;
+    struct shared_pages *root=shared_root(p);
+    for(size_t i=0;i<root->dependency_count;i++)if(scope_revoked(root->dependencies[i]))return true;
+    return false;
+}
+static bool shared_depends(struct shared_pages *p,const struct shared_scope *scope) {
+    if(scope_within(p->scope,scope))return true;
+    struct shared_pages *root=shared_root(p);
+    for(size_t i=0;i<root->dependency_count;i++)if(scope_within(root->dependencies[i],scope))return true;
+    return false;
+}
+static struct shared_part *shared_part_at(struct shared_pages *p,size_t page) {
+    size_t lo=0,hi=p->part_count;
+    while(lo<hi){size_t mid=lo+(hi-lo)/2;if(page<p->parts[mid].end)hi=mid;else lo=mid+1;}
+    ASSERT(lo<p->part_count);return &p->parts[lo];
+}
+/* Resolve one logical page without recursion. Optional backing/span are used
+   when composing or counting DMA mapping references, not once per byte. */
+static struct shared_pages *shared_leaf(struct shared_pages *p,size_t *index,uint8_t *cache,
+                                        struct file **backing,size_t *span) {
+    *cache=p->cache;
+    while(p->kind==SHARED_VIEW){
+        *index+=p->first;if(backing)*backing=p->parent;p=p->parent->vn->priv;
+    }
+    if(p->kind==SHARED_COMPOSITE){
+        struct shared_part *part=shared_part_at(p,*index);
+        size_t start=part==p->parts?0:part[-1].end;
+        if(span)*span=part->end-*index;
+        *index=part->first+*index-start;*cache=part->cache;
+        if(backing)*backing=part->file;p=part->file->vn->priv;
+    }else if(span)*span=p->count-*index;
+    if(p->dma)*cache=p->cache;
+    return p;
+}
+static bool shared_device_gone(struct shared_pages *p,const struct pci_claim *claim) {
+    struct shared_pages *root=shared_root(p);
+    if(root->kind!=SHARED_COMPOSITE)
+        return root->kind==SHARED_RANGE && !root->owned &&
+               (claim?root->claim==claim:pci_user_revoked(root->claim));
+    for(size_t i=0;i<root->part_count;i++){
+        struct shared_pages *leaf=root->parts[i].file->vn->priv;
+        if(leaf->kind==SHARED_RANGE && !leaf->owned &&
+           (claim?leaf->claim==claim:pci_user_revoked(leaf->claim)))return true;
+    }
+    return false;
+}
+static void shared_build_remove(struct shared_mapping *m) {
+    struct shared_mapping **link=&shared_building;
+    while(*link && *link!=m)link=&(*link)->next;
+    ASSERT(*link==m);*link=m->next;
+}
+static bool shared_build_overlap(struct task *owner,uint64_t va,size_t bytes) {
+    uint64_t irq=irq_save();bool overlap=false;
+    for(struct shared_mapping *m=shared_building;m;m=m->next)
+        if(m->building_owner==owner && va<m->va+m->bytes && m->va<va+bytes){overlap=true;break;}
+    irq_restore(irq);return overlap;
+}
+/* Mark before removing PTEs: each install tests cancelled in its own bounded
+   critical section. The constructor joins a running revoker before it can
+   drop this record or exit, keeping the owner address space alive as well.
+   Large removals retain vmm_user_free's existing bounded TLB batches. */
+static void shared_cancel_builds(const struct shared_scope *scope,const struct pci_claim *claim) {
+    for(;;){
+        uint64_t irq=irq_save();struct shared_mapping *found=NULL;
+        for(struct shared_mapping *m=shared_building;m;m=m->next){
+            bool match=scope?shared_depends(m->file->vn->priv,scope):shared_device_gone(m->file->vn->priv,claim);
+            if(match && (m->revoking || !m->cancelled)){found=m;break;}
+        }
+        if(!found){irq_restore(irq);return;}
+        if(found->revoking){wq_wait(&found->build_wait);irq_restore(irq);continue;}
+        found->cancelled=found->revoking=true;
+        irq_restore(irq);
+        vmm_user_free(found->building_owner->pml4,found->va,found->bytes);
+        irq=irq_save();found->revoking=false;wq_wake_all(&found->build_wait);irq_restore(irq);
+    }
+}
+static void shared_dma_maps(struct shared_pages *p,bool add) {
+    for(size_t at=0;at<p->count;){
+        size_t page=at,span;uint8_t cache;
+        struct shared_pages *leaf=shared_leaf(p,&page,&cache,NULL,&span);
+        if(leaf->dma){if(add)leaf->maps++;else {ASSERT(leaf->maps);leaf->maps--;}}
+        at+=MIN(span,p->count-at);
+    }
+}
 /* BSP-owned, called with interrupts disabled or from the fault handler. */
 static uint64_t shared_frame(struct shared_pages *p,size_t index,bool create) {
+    uint8_t cache;p=shared_leaf(p,&index,&cache,NULL,NULL);
     if(p->kind==SHARED_RAM)return p->pages[index];
     if(p->kind==SHARED_RANGE)return p->base+index*PAGE_SIZE;
-    if(p->kind==SHARED_VIEW)return shared_frame(p->parent->vn->priv,p->first+index,create);
     uint64_t *leaf=&p->pages[index/SHARED_LEAF];
     if(!*leaf){if(!create || !(*leaf=pmm_alloc_zeroed()))return 0;}
     uint64_t *slot=(uint64_t *)phys_to_virt(*leaf)+index%SHARED_LEAF;
@@ -332,6 +428,9 @@ static void shared_release(struct vnode *v) {
         }
         if(p->kind==SHARED_RANGE && p->owned && !keep)for(size_t i=0;i<p->count;i++)pmm_free(p->base+i*PAGE_SIZE);
         if(p->parent)vfs_close(p->parent);
+        for(size_t i=0;i<p->part_count;i++)vfs_close(p->parts[i].file);
+        for(size_t i=0;i<p->dependency_count;i++)scope_drop(p->dependencies[i]);
+        kfree(p->parts);kfree(p->dependencies);
         scope_drop(p->scope);
         pci_user_drop(p->claim);
         kfree(p);
@@ -446,9 +545,15 @@ static int64_t sys_dma_addresses(int h,size_t first,uint64_t *uout,size_t count)
     struct file *f=getfd_ref(h);
     if(!f)return -N_ERR_NO_HANDLE;
     int64_t r=0;struct shared_pages *p=f->vn->priv;
-    if(f->vn->type!=VT_SHARED || (!shared_root(p)->dma && shared_root(p)->kind!=SHARED_RANGE))r=-N_ERR_WRONG_KIND;
-    else if(scope_revoked(p->scope) || (!shared_root(p)->dma && pci_user_revoked(shared_root(p)->claim)))r=-N_ERR_CLOSED;
+    if(f->vn->type!=VT_SHARED)r=-N_ERR_WRONG_KIND;
+    else if(shared_cancelled(p) || shared_device_gone(p,NULL))r=-N_ERR_CLOSED;
     else if(first>=p->count)r=-N_ERR_INVALID;
+    else for(size_t at=first,n=MIN(count,p->count-first);at-first<n;){
+        size_t page=at,span;uint8_t cache;
+        struct shared_pages *leaf=shared_leaf(p,&page,&cache,NULL,&span);
+        if(!leaf->dma && leaf->kind!=SHARED_RANGE){r=-N_ERR_WRONG_KIND;break;}
+        at+=MIN(span,n-(at-first));
+    }
     for(size_t done=0,n=r<0?0:MIN(count,p->count-first);done<n;){
         uint64_t piece[64];size_t k=MIN(n-done,ARRAY_SIZE(piece));
         uint64_t irq=irq_save();
@@ -471,13 +576,22 @@ static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache,u
             cache>N_CACHE_UNCACHED || (maximum && maximum!=N_MEMORY_READ && maximum!=N_MEMORY_READ_WRITE))r=-N_ERR_INVALID;
     if(r<0){vfs_close(f);return r;}
     struct shared_pages *src=f->vn->priv,*root=shared_root(src);
-    if(scope_revoked(src->scope)){vfs_close(f);return -N_ERR_CLOSED;}
+    if(shared_cancelled(src) || shared_device_gone(src,NULL)){vfs_close(f);return -N_ERR_CLOSED;}
     int access=f->flags&O_ACCMODE;
     if(maximum==N_MEMORY_READ_WRITE && access==O_RDONLY){vfs_close(f);return -N_ERR_DENIED;}
     if(maximum==N_MEMORY_READ)access=O_RDONLY;
     bool device=root->kind==SHARED_RANGE && !root->owned;
-    if(device && pci_user_revoked(root->claim)){vfs_close(f);return -N_ERR_CLOSED;}
-    if(root->dma){
+    if(root->kind==SHARED_COMPOSITE){
+        /* A default view preserves each segment's type. An explicit single
+           type must describe all selected pages; it cannot silently collapse
+           heterogeneous BAR/RAM attributes into a different cache alias. */
+        if(cache!=N_CACHE_DEFAULT)for(size_t at=offset/PAGE_SIZE,left=bytes/PAGE_SIZE;left;){
+            size_t page=at,span;uint8_t type;
+            shared_leaf(src,&page,&type,NULL,&span);
+            if(cache!=type){vfs_close(f);return -N_ERR_DENIED;}
+            span=MIN(span,left);at+=span;left-=span;
+        }
+    }else if(root->dma){
         if(cache==N_CACHE_DEFAULT)cache=root->cache;
         else if(cache!=root->cache){
             if(root->cache!=N_CACHE_WRITE_BACK || root->maps){vfs_close(f);return -N_ERR_DENIED;}
@@ -505,6 +619,77 @@ static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache,u
     r=shared_open(v,access,&view);
     return new_handle(r,view);
 }
+static int64_t sys_shared_compose(const struct n_shared_range *uranges,size_t count,uint32_t access) {
+    if(!count || (access!=N_MEMORY_READ && access!=N_MEMORY_READ_WRITE))return -N_ERR_INVALID;
+    struct compose_input {struct file *file;size_t first,count;};
+    if(count>SIZE_MAX/sizeof(struct compose_input) || count>SIZE_MAX/sizeof(*uranges))return -N_ERR_TOO_LARGE;
+    if(count>(UINTPTR_MAX-(uintptr_t)uranges)/sizeof(*uranges))return -N_ERR_BAD_ADDRESS;
+    struct compose_input *inputs=kzalloc(count*sizeof *inputs);
+    if(!inputs)return -N_ERR_NO_MEMORY;
+    int64_t r=0;size_t bytes=0,parts=0,dependencies=0;
+    struct vnode *v=NULL;struct shared_pages *p=NULL;
+    for(size_t i=0;i<count;i++){
+        struct n_shared_range range;
+        if((r=copy_from_user(&range,&uranges[i],sizeof range))<0)goto out;
+        if(range.reserved || !range.bytes || (range.offset|range.bytes)&(PAGE_SIZE-1)){
+            r=-N_ERR_INVALID;goto out;
+        }
+        struct file *f=inputs[i].file=getfd_ref(range.shared);
+        if(!f){r=-N_ERR_NO_HANDLE;goto out;}
+        if(f->vn->type!=VT_SHARED){r=-N_ERR_WRONG_KIND;goto out;}
+        if(range.offset>f->vn->size || range.bytes>f->vn->size-range.offset){r=-N_ERR_INVALID;goto out;}
+        if(access==N_MEMORY_READ_WRITE && (f->flags&O_ACCMODE)==O_RDONLY){r=-N_ERR_DENIED;goto out;}
+        struct shared_pages *src=f->vn->priv,*root=shared_root(src);
+        if(shared_cancelled(src) || shared_device_gone(src,NULL)){r=-N_ERR_CLOSED;goto out;}
+        if(range.bytes>SIZE_MAX-bytes || root->dependency_count>SIZE_MAX-dependencies ||
+           (src->scope && root->dependency_count==SIZE_MAX-dependencies)){r=-N_ERR_TOO_LARGE;goto out;}
+        bytes+=range.bytes;dependencies+=root->dependency_count+(src->scope!=NULL);
+        inputs[i].first=range.offset/PAGE_SIZE;inputs[i].count=range.bytes/PAGE_SIZE;
+        for(size_t at=inputs[i].first,left=inputs[i].count;left;){
+            size_t page=at,span;uint8_t cache;
+            shared_leaf(src,&page,&cache,NULL,&span);
+            if(parts==SIZE_MAX){r=-N_ERR_TOO_LARGE;goto out;}parts++;
+            span=MIN(span,left);at+=span;left-=span;
+        }
+    }
+    if(parts>SIZE_MAX/sizeof(struct shared_part) || dependencies>SIZE_MAX/sizeof(struct shared_scope *)){
+        r=-N_ERR_TOO_LARGE;goto out;
+    }
+    p=shared_new(bytes,SHARED_COMPOSITE,0,&v);
+    if(!p){r=-N_ERR_NO_MEMORY;goto out;}
+    p->count=bytes/PAGE_SIZE;
+    p->parts=kmalloc(parts*sizeof *p->parts);
+    if(dependencies)p->dependencies=kmalloc(dependencies*sizeof *p->dependencies);
+    p->scope=kzalloc(sizeof *p->scope);
+    if(p->scope){p->scope->refs=1;p->scope->issuer=task_process()->pid;}
+    if(!p->parts || (dependencies && !p->dependencies) || !p->scope){r=-N_ERR_NO_MEMORY;goto out;}
+    size_t end=0;
+    for(size_t i=0;i<count;i++){
+        struct shared_pages *src=inputs[i].file->vn->priv,*root=shared_root(src);
+        if(src->scope){src->scope->refs++;p->dependencies[p->dependency_count++]=src->scope;}
+        for(size_t j=0;j<root->dependency_count;j++){
+            root->dependencies[j]->refs++;p->dependencies[p->dependency_count++]=root->dependencies[j];
+        }
+        for(size_t at=inputs[i].first,left=inputs[i].count;left;){
+            size_t page=at,span;uint8_t cache;struct file *backing=inputs[i].file;
+            shared_leaf(src,&page,&cache,&backing,&span);
+            span=MIN(span,left);end+=span;
+            p->parts[p->part_count++]=(struct shared_part){.file=vfs_dup(backing),.first=page,.end=end,.cache=cache};
+            at+=span;left-=span;
+        }
+    }
+    if(shared_cancelled(p) || shared_device_gone(p,NULL)){r=-N_ERR_CLOSED;goto out;}
+    {
+        struct file *composite=NULL;
+        r=shared_open(v,access==N_MEMORY_READ?O_RDONLY:O_RDWR,&composite);
+        v=NULL;p=NULL; /* shared_open consumes the vnode even on failure */
+        r=new_handle(r,composite);
+    }
+out:
+    if(v)shared_release(v);
+    for(size_t i=0;i<count;i++)if(inputs[i].file)vfs_close(inputs[i].file);
+    kfree(inputs);return r;
+}
 static int64_t sys_shared_revoke(int h) {
     struct file *f=getfd_ref(h);
     if(!f)return -N_ERR_NO_HANDLE;
@@ -514,10 +699,11 @@ static int64_t sys_shared_revoke(int h) {
     /* Revoked is published before any PTE removal, including SMP shootdown.
        A concurrent fault cannot restore a page while cancellation runs. */
     scope->revoked=true;
+    shared_cancel_builds(scope,NULL);
     for(struct task *t=task_list;t;t=t->all_next){
         if(t->is_thread || !t->pml4 || t->pml4==kernel_pml4)continue;
         for(struct shared_mapping *m=t->shared_mappings;m;m=m->next)
-            if(scope_within(((struct shared_pages *)m->file->vn->priv)->scope,scope))
+            if(shared_depends(m->file->vn->priv,scope))
                 vmm_user_free(t->pml4,m->va,m->bytes);
     }
     vfs_close(f);return 0;
@@ -592,11 +778,11 @@ int shared_program_segment(struct task *t,const char *path,uint64_t va,const uin
 }
 static uint64_t gone_device_page; /* shared_demand_fault: what revoked device mappings show */
 void shared_revoke_claim(const struct pci_claim *c) {
+    shared_cancel_builds(NULL,c);
     for(struct task *t=task_list;t;t=t->all_next){
         if(t->is_thread || !t->pml4 || t->pml4==kernel_pml4)continue;
         for(struct shared_mapping *m=t->shared_mappings;m;m=m->next){
-            struct shared_pages *root=shared_root(m->file->vn->priv);
-            if(root->kind==SHARED_RANGE && !root->owned && root->claim==c)vmm_user_free(t->pml4,m->va,m->bytes);
+            if(shared_device_gone(m->file->vn->priv,c))vmm_user_free(t->pml4,m->va,m->bytes);
         }
     }
 }
@@ -617,9 +803,11 @@ bool shared_demand_fault(uint64_t addr,bool write) {
     uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE),irq=irq_save();bool ok=false,starved=false;
     for(struct shared_mapping *m=owner->shared_mappings;m;m=m->next){
         if(page<m->va || page-m->va>=m->bytes)continue;
-        struct shared_pages *p=m->file->vn->priv,*root=shared_root(p);
-        if(scope_revoked(p->scope))break;
-        if(root->kind==SHARED_RANGE && !root->owned && pci_user_revoked(root->claim)){
+        struct shared_pages *p=m->file->vn->priv;
+        if(shared_cancelled(p))break;
+        size_t index=(page-m->va)/PAGE_SIZE;uint8_t cache;
+        struct shared_pages *leaf=shared_leaf(p,&index,&cache,NULL,NULL);
+        if(leaf->kind==SHARED_RANGE && !leaf->owned && pci_user_revoked(leaf->claim)){
             /* The device's driver ended. One kernel page, all-ones at first, stands in for every
                register and aperture page: reads see a function gone from the bus, writes (a
                doorbell) land nowhere that matters. */
@@ -630,11 +818,13 @@ bool shared_demand_fault(uint64_t addr,bool write) {
                                                 m->flags&~(PTE_PWT|PTE_PCD|PTE_PAT4K));
             break;
         }
-        if(root->kind!=SHARED_DEMAND || (write && !(m->flags&PTE_W)))break;
+        /* Claim loss removes the entire composite mapping. Its other RAM or
+           live-device segments still refer to their own valid backing. */
+        if((leaf->kind!=SHARED_DEMAND && !shared_device_gone(p,NULL)) || (write && !(m->flags&PTE_W)))break;
         if(vmm_get_pte(owner->pml4,page)&PTE_P){ok=true;break;}
         uint64_t frame=shared_frame(p,(page-m->va)/PAGE_SIZE,true);
         starved=!frame;
-        ok=frame && vmm_map_page(owner->pml4,page,frame,m->flags);
+        ok=frame && vmm_map_page(owner->pml4,page,frame,m->flags|cache_pte(cache));
         break;
     }
     irq_restore(irq);
@@ -654,9 +844,8 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
     if(f->vn->type!=VT_SHARED){vfs_close(f);return -N_ERR_WRONG_KIND;}
     /* the handle's own rights bound the mapping's: a read-only handle maps read-only */
     if(access==N_MEMORY_READ_WRITE && (f->flags&O_ACCMODE)==O_RDONLY){vfs_close(f);return -N_ERR_DENIED;}
-    struct shared_pages *root=shared_root(f->vn->priv);
-    if(scope_revoked(((struct shared_pages *)f->vn->priv)->scope)){vfs_close(f);return -N_ERR_CLOSED;}
-    if(root->kind==SHARED_RANGE && !root->owned && pci_user_revoked(root->claim)){vfs_close(f);return -N_ERR_CLOSED;}
+    struct shared_pages *p=f->vn->priv;
+    if(shared_cancelled(p) || shared_device_gone(p,NULL)){vfs_close(f);return -N_ERR_CLOSED;}
     uint64_t irq;
     bytes=ALIGN_UP(bytes,PAGE_SIZE);
     if(bytes!=f->vn->size){vfs_close(f);return -N_ERR_INVALID;}
@@ -664,32 +853,56 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
     if(!m){vfs_close(f);return -N_ERR_NO_MEMORY;}
     /* Reserve the VA range (reusing released ones) before publishing any PTE, so
        no other reservation can choose this partially mapped span. */
+    irq=irq_save();
     uint64_t va=mmap_reserve(owner,bytes);
-    if(!va){vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
-    struct shared_pages *p=f->vn->priv;size_t mapped=0;
-    /* DMA RAM: the root's type, which a later view may have set after this view was made */
-    uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO)|
-                   cache_pte(root->dma?root->cache:p->cache);
+    if(!va){irq_restore(irq);vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
+    size_t mapped=0;
+    uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO);
+    /* Pin DMA cache types before installing the first PTE, including every
+       selected composite segment; rollback drops the same references. */
+    shared_dma_maps(p,true);
+    *m=(struct shared_mapping){.next=shared_building,.file=f,.va=va,.flags=flags,.bytes=bytes,
+                               .building_owner=owner,.cancelled=shared_cancelled(p) || shared_device_gone(p,NULL)};
+    shared_building=m;irq_restore(irq);
     /* Demand pages not yet touched by any peer stay unmapped until a fault. */
     for(;mapped<p->count;mapped++){
-        irq=irq_save();uint64_t frame=shared_frame(p,mapped,false);irq_restore(irq);
-        if(frame && !vmm_map_page(owner->pml4,va+mapped*PAGE_SIZE,frame,flags))break;
+        size_t index=mapped;uint8_t cache;
+        irq=irq_save();
+        if(m->cancelled || current_task->killed){irq_restore(irq);break;}
+        shared_leaf(p,&index,&cache,NULL,NULL);
+        uint64_t frame=shared_frame(p,mapped,false);
+        bool ok=!frame || vmm_map_page(owner->pml4,va+mapped*PAGE_SIZE,frame,flags|cache_pte(cache));
+        irq_restore(irq);if(!ok)break;
+        if(need_resched)schedule();
     }
-    if(mapped!=p->count){vmm_user_free(owner->pml4,va,mapped*PAGE_SIZE);
+    /* A cancellation during construction cannot miss an unpublished mapping
+       and leave it live afterward. Publication and this final check are one
+       BSP critical section. */
+    irq=irq_save();
+    int64_t result=m->cancelled || shared_cancelled(p) || shared_device_gone(p,NULL)?-N_ERR_CLOSED:
+                   current_task->killed?-N_ERR_STOPPED:-N_ERR_NO_MEMORY;
+    if(mapped!=p->count || result!=-N_ERR_NO_MEMORY){
+        while(m->revoking)wq_wait(&m->build_wait);
+        m->cancelled=m->revoking=true;
+        irq_restore(irq);
+        vmm_user_free(owner->pml4,va,bytes);
+        irq=irq_save();shared_build_remove(m);shared_dma_maps(p,false);
+        m->revoking=false;wq_wake_all(&m->build_wait);irq_restore(irq);
         mmap_hole_add(owner,va,bytes+PAGE_SIZE);
-        vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;
+        vfs_close(f);kfree(m);return result;
     }
-    irq=irq_save();*m=(struct shared_mapping){.next=owner->shared_mappings,.file=f,.va=va,.flags=flags,.bytes=bytes};
+    shared_build_remove(m);m->building_owner=NULL;m->next=owner->shared_mappings;
     owner->shared_mappings=m;irq_restore(irq);
-    if(root->dma)root->maps++;
     return (int64_t)va;
 }
 /* Removes a mapping's pages (and the all-ones pages a revoked device range may have received)
    and drops its object. */
 static void shared_unmap(struct task *owner,struct shared_mapping *m) {
-    struct shared_pages *root=shared_root(m->file->vn->priv);
-    if(root->dma){ASSERT(root->maps);root->maps--;}
-    vmm_user_free(owner->pml4,m->va,m->bytes);vfs_close(m->file);kfree(m);
+    /* Keep every DMA cache pin through PTE removal and the completed TLB
+       shootdown. A preempting view cannot retype still-reachable old pages. */
+    vmm_user_free(owner->pml4,m->va,m->bytes);
+    uint64_t irq=irq_save();shared_dma_maps(m->file->vn->priv,false);irq_restore(irq);
+    vfs_close(m->file);kfree(m);
 }
 void sys_shared_cleanup(struct task *owner) {
     while(owner->shared_mappings){struct shared_mapping *m=owner->shared_mappings;
@@ -819,6 +1032,7 @@ static int64_t sys_memory_release(uint64_t va, size_t len) {
     if (va & (PAGE_SIZE - 1) || va < base || va + len > frontier || va + len < va) return -N_ERR_INVALID;
     if(len>SIZE_MAX-(PAGE_SIZE-1))return -N_ERR_INVALID;
     len=ALIGN_UP(len,PAGE_SIZE);
+    if(shared_build_overlap(t,va,len))return -N_ERR_NOT_READY;
     struct shared_mapping **link=&t->shared_mappings;
     while(*link){struct shared_mapping *m=*link;
         if(va<m->va+m->bytes && m->va<va+len){
@@ -844,6 +1058,7 @@ static int64_t sys_memory_release(uint64_t va, size_t len) {
 static int64_t sys_memory_protect(uint64_t va, size_t len, int access) {
     int vp = access_flags(access);
     if (vp < 0 || va & (PAGE_SIZE - 1) || va >= USER_TOP || va + len > USER_TOP || va + len < va) return -N_ERR_INVALID;
+    if(shared_build_overlap(task_process(),va,len))return -N_ERR_NOT_READY;
     return vmm_user_protect(current_task->pml4, va, len, vp);
 }
 
@@ -1132,18 +1347,20 @@ static int64_t sys_channel_send(int h, const void *udata, size_t n, int attach) 
     return r;
 }
 
-static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, int32_t *uattached) {
-    if (uattached && !user_ok_w(uattached, sizeof *uattached)) return -N_ERR_BAD_ADDRESS;
+static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, void *uoutput, bool credentials) {
+    size_t output_size=credentials?sizeof(struct n_channel_message):sizeof(int32_t);
+    if ((credentials && !uoutput) || (uoutput && !user_ok_w(uoutput,output_size))) return -N_ERR_BAD_ADDRESS;
     struct file *f = getfd_ref(h);
     if (!f) return -N_ERR_NO_HANDLE;
     bool wait = flags & N_CHANNEL_WAIT, peek = flags & N_CHANNEL_PEEK, discard = flags & N_CHANNEL_DISCARD;
     if (flags & ~(N_CHANNEL_WAIT | N_CHANNEL_PEEK | N_CHANNEL_DISCARD) || (peek && discard)) { vfs_close(f); return -N_ERR_INVALID; }
     int64_t r;
     struct file *att = NULL;
+    struct n_channel_message message={.attached=-1};
     if (message_channel_is(f)) {
-        r = message_channel_receive(f, ubuf, cap, wait, peek, discard, &att);
+        r = message_channel_receive(f, ubuf, cap, wait, peek, discard, &att, &message.sender_app);
     } else if (byte_channel(f)) {
-        if (peek || discard) r = -N_ERR_UNSUPPORTED;
+        if (credentials || peek || discard) r = -N_ERR_UNSUPPORTED;
         else if (!cap) r = 0;
         else {
             uint64_t irq = irq_save();
@@ -1156,10 +1373,15 @@ static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, int
         r = -N_ERR_WRONG_KIND;
     }
     vfs_close(f);
-    if (r >= 0 && !peek && uattached) {
-        int32_t handle = att ? (int32_t)install(att) : -1;
-        att = NULL;
-        if (copy_to_user(uattached, &handle, sizeof handle) < 0 && handle >= 0) handle_drop(handle);
+    if (r >= 0 && uoutput && (credentials || !peek)) {
+        if (att && !peek) {
+            message.attached=(int32_t)install(att);att=NULL;
+            if (message.attached<0) r=message.attached;
+        }
+        if (r>=0 && copy_to_user(uoutput,credentials?(const void *)&message:(const void *)&message.attached,output_size)<0) {
+            if (message.attached>=0) handle_drop(message.attached);
+            r=-N_ERR_BAD_ADDRESS;
+        }
     }
     if (att) vfs_close(att); /* the caller did not ask for attachments */
     return r;
@@ -1443,6 +1665,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SHARED_RESERVE: ret = sys_shared_create(a,true); break;
     case SYS_SHARED_MAP: ret = sys_shared_map((int)a,b,(int)c); break;
     case SYS_SHARED_VIEW: ret = sys_shared_view((int)a,b,c,(uint32_t)d,(uint32_t)e); break;
+    case SYS_SHARED_COMPOSE: ret = sys_shared_compose((const struct n_shared_range *)a,b,(uint32_t)c); break;
     case SYS_SHARED_REVOKE: ret = sys_shared_revoke((int)a); break;
     case SYS_PCI_CLAIM: {
         struct file *f = NULL;
@@ -1677,7 +1900,8 @@ void syscall_dispatch(struct regs *r) {
     case SYS_FOLDER_LIST: ret = sys_folder_list((const char *)a, (struct n_entry *)b, c, d); break;
     case SYS_CHANNEL_PAIR: ret = sys_channel_pair((int32_t *)a); break;
     case SYS_CHANNEL_SEND: ret = sys_channel_send((int)a, (const void *)b, c, (int)d); break;
-    case SYS_CHANNEL_RECEIVE: ret = sys_channel_receive((int)a, (void *)b, c, (int)d, (int32_t *)e); break;
+    case SYS_CHANNEL_RECEIVE: ret = sys_channel_receive((int)a, (void *)b, c, (int)d, (void *)e, false); break;
+    case SYS_CHANNEL_RECEIVE_FROM: ret = sys_channel_receive((int)a, (void *)b, c, (int)d, (void *)e, true); break;
     case SYS_APP_LAUNCH: ret = sys_app_launch((const char *)a, (const struct n_launch *)b); break;
     case SYS_APP_RESULT: ret = sys_app_result((int)a, (int64_t)b, (int *)c); break;
     case SYS_APP_STOP: ret = sys_app_stop((int)a, (int)b); break;

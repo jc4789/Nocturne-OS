@@ -384,15 +384,17 @@ struct nvkmd_ctx {
  * an inline wrapper in case we want to move something into "core" NVKMD.
  */
 
-/** Number of GPUs the platform lists (0 when it has none or cannot be reached) */
-uint32_t nvkmd_get_gpu_count(struct vk_object_base *log_obj);
+/** Caller-owned platform identity snapshot. Free *gpu_ids after enumeration.
+ * Discovery failures are returned separately from a successful empty list. */
+VkResult MUST_CHECK
+nvkmd_enumerate_gpus(struct vk_object_base *log_obj, uint32_t **gpu_ids, uint32_t *count);
 
-/** Create the pdev for GPU `gpu_index` (0 .. nvkmd_get_gpu_count() - 1)
+/** Create the pdev for a platform identity returned by nvkmd_enumerate_gpus.
  *
  * VK_ERROR_INCOMPATIBLE_DRIVER means this GPU is not one NVK drives and is skipped.
  */
 VkResult MUST_CHECK
-nvkmd_try_create_pdev(uint32_t gpu_index,
+nvkmd_try_create_pdev(uint32_t gpu_id,
                       struct vk_object_base *log_obj,
                       enum nvk_debug debug_flags,
                       struct nvkmd_pdev **pdev_out);

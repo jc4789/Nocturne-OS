@@ -22,6 +22,7 @@ struct client {
     uint8_t *arena;           /* nvrm's mapping */
     uint64_t arena_address;   /* the client's */
     size_t arena_bytes;
+    uint32_t principal;      /* authenticated HELLO sender; every message must match */
     void *file;               /* RM's state for this client */
 };
 
@@ -48,22 +49,22 @@ static void client_end(n_handle events, struct client *c) {
 
 static bool reply(struct client *c, struct nvrm_message *packet, n_handle attach) {
     if (packet->rm_status) packet->status = -N_ERR_IO;
-    if (packet->status < 0) packet->size = 0;
+    /* A dispatcher may update handles/status before its final error. Preserve
+       all valid arguments on RM failure; only native/transport rejection has
+       no argument result. Old Protocol1 clients still fail closed on status. */
+    if (packet->status < 0 && !packet->rm_status) packet->size = 0;
     return n_channel_send(c->channel, packet, sizeof *packet + packet->size, attach) >= 0;
 }
 
-/* Whether RM treats the client's requests as an administrator's. A channel carries no identity
-   of its peer, so no connection has a basis for it: every client is unprivileged, like an
-   ordinary user of RM's control device, which is all graphics clients (NVK) need. nvrm's own
-   threads (interrupts, work, timers) are the only administrators. A connection that can prove
-   where it comes from would be granted here, per connection. */
+/* An authenticated app identity is not an administrator capability. Ordinary
+   channel clients remain unprivileged; only nvrm's own work is administrative. */
 static bool client_is_admin(const struct client *c) {
     (void)c;
     return false;
 }
 
 /* The client's first message: its arena, mapped here too. */
-static n_result hello(struct client *c, const struct nvrm_message *head, n_handle arena) {
+static n_result hello(struct client *c, const struct nvrm_message *head, n_handle arena, uint32_t principal) {
     if (c->file) return -N_ERR_INVALID;
     if (arena < 0 || !head->arena_bytes || head->arena_bytes > SIZE_MAX || head->arena_bytes % N_PAGE_SIZE ||
         head->arena_address > UINT64_MAX - head->arena_bytes)
@@ -73,7 +74,8 @@ static n_result hello(struct client *c, const struct nvrm_message *head, n_handl
     c->arena_handle = arena;
     c->arena_address = head->arena_address;
     c->arena_bytes = (size_t)head->arena_bytes;
-    c->file = nvrm_rm_file_open(client_is_admin(c));
+    c->file = nvrm_rm_file_open(client_is_admin(c), principal);
+    if (c->file) c->principal = principal;
     return c->file ? 0 : -N_ERR_NO_MEMORY;
 }
 
@@ -88,8 +90,9 @@ static void request(n_handle events, struct client *c) {
     }
     struct nvrm_message *packet = malloc((size_t)pending);
     if (!packet) { client_end(events, c); return; }
-    n_handle attached = -1;
-    n_result got = n_channel_receive(c->channel, packet, (size_t)pending, 0, &attached);
+    struct n_channel_message received = {.attached = -1};
+    n_result got = n_channel_receive_from(c->channel, packet, (size_t)pending, 0, &received);
+    n_handle attached = received.attached;
     if (got < (n_result)sizeof *packet || packet->protocol != NVRM_PROTOCOL ||
         packet->size != (size_t)got - sizeof *packet) {
         /* the channel closed, or the client does not speak this protocol */
@@ -99,10 +102,21 @@ static void request(n_handle events, struct client *c) {
         return;
     }
     packet->offset = packet->bytes = 0;
+    /* Credentials describe the sender at send time, not the endpoint creator.
+       A channel transferred to another app cannot impersonate the old peer. */
+    if (!received.sender_app || received.sender_app > UINT32_MAX ||
+        (c->file && received.sender_app != c->principal)) {
+        packet->access = packet->rm_status = 0;
+        packet->status = -N_ERR_DENIED;
+        if (attached >= 0) n_handle_close(attached);
+        goto send;
+    }
     if (packet->escape == NVRM_HELLO) {
-        packet->status = (int32_t)hello(c, packet, attached);
+        packet->status = (int32_t)hello(c, packet, attached, (uint32_t)received.sender_app);
         /* The union slots are arena inputs until hello has consumed them. */
         packet->access = packet->rm_status = 0;
+        if (!packet->status)
+            packet->access = NVRM_HELLO_STATUS_PRESENT | (nvrm_rm_adapter_ready() ? NVRM_HELLO_ADAPTER_READY : 0);
         if (packet->status < 0 && attached >= 0 && attached != c->arena_handle) n_handle_close(attached);
         packet->size = 0;
         goto send;

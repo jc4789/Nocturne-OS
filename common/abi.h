@@ -102,6 +102,7 @@ enum {
     SYS_PCI_INTERRUPTS, SYS_PCI_INTERRUPT_TAKE,
     SYS_DMA_CREATE, SYS_DMA_ADDRESSES, SYS_SHARED_VIEW,
     SYS_SHARED_REVOKE, SYS_GPU_RENDER_LIST,
+    SYS_CHANNEL_RECEIVE_FROM, SYS_SHARED_COMPOSE,
     SYS_MAX = 192
 };
 
@@ -136,6 +137,14 @@ struct n_entry {
 #define N_CHANNEL_WAIT 1
 #define N_CHANNEL_PEEK 2  /* report the next message's size, leave it queued */
 #define N_CHANNEL_DISCARD 4 /* copy up to cap bytes of the next message, then drop it; its size */
+
+/* Credentials belong to the message's actual sending app, not the endpoint's
+   creator or its current holder. sender_app is the non-reused n_app_self ID. */
+struct n_channel_message {
+    int32_t attached;       /* -1 on peek/discard, or when no handle was sent */
+    uint32_t reserved;
+    uint64_t sender_app;
+};
 
 /* n_app_launch. Handle i of the new app is handles[i] of the launcher (-1:
    none); by convention 0 is its input, 1 its output and 2 its log. Settings
@@ -255,6 +264,13 @@ struct n_pci_function {
 #define N_CACHE_WRITE_BACK 1u
 #define N_CACHE_WRITE_COMBINE 2u
 #define N_CACHE_UNCACHED 3u
+
+/* Page-aligned slices concatenated by n_shared_compose, in array order. */
+struct n_shared_range {
+    int32_t shared;
+    uint32_t reserved;
+    uint64_t offset, bytes;
+};
 
 /* power */
 #define POWER_OFF 0

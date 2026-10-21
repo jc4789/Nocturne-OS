@@ -1529,14 +1529,14 @@ nvk_get_vram_heap_available(struct nvk_physical_device *pdev)
 
 VkResult
 nvk_create_physical_device(struct vk_instance *_instance,
-                          uint32_t gpu_index,
+                          uint32_t gpu_id,
                           struct vk_physical_device **pdev_out)
 {
    struct nvk_instance *instance = (struct nvk_instance *)_instance;
    VkResult result;
 
    struct nvkmd_pdev *nvkmd;
-   result = nvkmd_try_create_pdev(gpu_index, &instance->vk.base,
+   result = nvkmd_try_create_pdev(gpu_id, &instance->vk.base,
                                   instance->debug_flags, &nvkmd);
    if (result != VK_SUCCESS)
       return result;
@@ -1756,15 +1756,20 @@ nvk_enumerate_physical_devices(struct vk_instance *vk_instance)
 {
    struct nvk_instance *instance = (struct nvk_instance *)vk_instance;
 
-   /* The platform (nvkmd) lists its GPUs; a GPU NVK does not drive is skipped. */
-   const uint32_t gpu_count = nvkmd_get_gpu_count(&instance->vk.base);
+   /* Platform identities are stable for this enumeration, unlike an index
+    * into a set whose ready daemons can change between count and open. */
+   uint32_t *gpu_ids = NULL, gpu_count = 0;
+   VkResult result = nvkmd_enumerate_gpus(&instance->vk.base, &gpu_ids, &gpu_count);
+   if (result != VK_SUCCESS)
+      return result;
    for (uint32_t i = 0; i < gpu_count; i++) {
       struct vk_physical_device *pdev;
-      VkResult result = nvk_create_physical_device(vk_instance, i, &pdev);
+      result = nvk_create_physical_device(vk_instance, gpu_ids[i], &pdev);
       if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
          continue;
 
       if (result != VK_SUCCESS) {
+         free(gpu_ids);
          list_for_each_entry_safe(struct vk_physical_device, listed,
                                   &instance->vk.physical_devices.list, link) {
             list_del(&listed->link);
@@ -1776,6 +1781,7 @@ nvk_enumerate_physical_devices(struct vk_instance *vk_instance)
       list_addtail(&pdev->link, &instance->vk.physical_devices.list);
    }
 
+   free(gpu_ids);
    return VK_SUCCESS;
 }
 

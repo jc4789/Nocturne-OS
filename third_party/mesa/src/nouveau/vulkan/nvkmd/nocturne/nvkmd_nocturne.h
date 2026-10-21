@@ -22,9 +22,10 @@
 #include "util/vma.h"
 #include "vk_sync.h"
 
-uint32_t nvkmd_nocturne_get_gpu_count(struct vk_object_base *log_obj);
+VkResult nvkmd_nocturne_enumerate_gpus(struct vk_object_base *log_obj,
+                                      uint32_t **gpu_ids, uint32_t *count);
 
-VkResult nvkmd_nocturne_try_create_pdev(uint32_t gpu_index,
+VkResult nvkmd_nocturne_try_create_pdev(uint32_t pci_target,
                                         struct vk_object_base *log_obj,
                                         enum nvk_debug debug_flags,
                                         struct nvkmd_pdev **pdev_out);

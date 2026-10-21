@@ -168,7 +168,7 @@ int message_channel_pair(struct file **a, struct file **b);
 bool message_channel_is(struct file *f);
 int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct file *attach);
 int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek, bool discard,
-                                struct file **attached);
+                                struct file **attached, uint64_t *sender_app);
 
 /* FAT (fs/fat.c) */
 struct blkdev;

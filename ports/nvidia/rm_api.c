@@ -54,7 +54,7 @@ struct queued_event {
 struct nvrm_file {
     nv_file_private_t nvfp;
     struct nvrm_file *next;
-    uint32_t principal;          /* connection identity, never reused during this daemon */
+    uint32_t principal;          /* authenticated native app identity */
     bool admin;                 /* RM treats the client as an administrator */
     mtx_t lock;                 /* the queue: RM posts from its interrupt and work threads */
     struct queued_event *head, *tail;
@@ -62,10 +62,12 @@ struct nvrm_file {
 };
 
 static struct nvrm_file *files;
-static uint32_t next_principal = 1; /* zero means the actual uint32_t RM identity space is exhausted */
-static bool all_mappings_revoked;
+static struct exported_mapping *orphan_mappings;
+static bool safe_to_mmap = true;
 static thread_local struct nvrm_file *request_file;
 static thread_local struct exported_mapping *pending_user_mapping;
+
+bool nvrm_rm_adapter_ready(void) { return nvrm_dev.adapter_ready; }
 
 static void mapping_close(struct exported_mapping *m) {
     /* A client retaining a derived view must not retain access after RM unmap. */
@@ -77,19 +79,17 @@ static void mapping_close(struct exported_mapping *m) {
 }
 
 void *nvrm_user_mapping_new(void) {
-    if (!request_file) return NULL;
+    /* This records an RM-owned lifetime, not a CPU map. RM can legitimately
+       create it from its own work outside an IPC request. NULL means actual
+       allocation failure only; safety is checked when a native view is issued. */
     struct exported_mapping *m = calloc(1, sizeof *m);
     if (!m) return NULL;
     m->view = -1;
     m->file = request_file;
     nv_acquire_mmap_lock(&nvrm_dev.nv);
-    if (__atomic_load_n(&nvrm_dev.mappings_revoked, __ATOMIC_ACQUIRE)) {
-        nv_release_mmap_lock(&nvrm_dev.nv);
-        free(m);
-        return NULL;
-    }
-    m->next = request_file->mappings;
-    request_file->mappings = m;
+    struct exported_mapping **list = request_file ? &request_file->mappings : &orphan_mappings;
+    m->next = *list;
+    *list = m;
     pending_user_mapping = m;
     nv_release_mmap_lock(&nvrm_dev.nv);
     return m;
@@ -101,7 +101,7 @@ void nvrm_user_mapping_free(void *owner) {
     struct exported_mapping *m = owner;
     if (!m) return;
     nv_acquire_mmap_lock(&nvrm_dev.nv);
-    struct exported_mapping **at = &m->file->mappings;
+    struct exported_mapping **at = m->file ? &m->file->mappings : &orphan_mappings;
     while (*at && *at != m) at = &(*at)->next;
     if (*at) {
         *at = m->next;
@@ -112,27 +112,24 @@ void nvrm_user_mapping_free(void *owner) {
 }
 
 NV_STATUS NV_API_CALL nv_revoke_gpu_mappings(nv_state_t *nv) {
-    nv_acquire_mmap_lock(nv);
-    __atomic_store_n(&nvrm_dev.mappings_revoked, true, __ATOMIC_RELEASE);
-    bool complete = true;
-    for (struct nvrm_file *f = files; f; f = f->next)
-        for (struct exported_mapping *m = f->mappings; m; m = m->next)
-            if (m->view >= 0 && n_shared_revoke(m->view) < 0) complete = false;
-    all_mappings_revoked = complete;
-    nv_release_mmap_lock(nv);
-    return complete ? NV_OK : NV_ERR_OPERATING_SYSTEM;
+    (void)nv;
+    /* RM uses this for temporary GPU power-idle revocation, with fault-driven
+       restoration. Native shared_revoke is permanent and must NOT substitute
+       for it, revoke system RAM, or change admission of future maps. Dynamic
+       power is unavailable on this port; leave all state and views untouched. */
+    return NV_ERR_NOT_SUPPORTED;
 }
 NvBool NV_API_CALL nv_get_all_mappings_revoked_locked(nv_state_t *nv) {
     (void)nv;
-    return all_mappings_revoked ? NV_TRUE : NV_FALSE;
+    return NV_FALSE; /* temporary revocation/restoration has not been implemented */
 }
 void NV_API_CALL nv_set_safe_to_mmap_locked(nv_state_t *nv, NvBool safe) {
     (void)nv;
-    __atomic_store_n(&nvrm_dev.mappings_revoked, !safe, __ATOMIC_RELEASE);
-    if (safe) all_mappings_revoked = false;
+    __atomic_store_n(&safe_to_mmap, !!safe, __ATOMIC_RELEASE);
 }
 
-void *nvrm_rm_file_open(bool admin) {
+void *nvrm_rm_file_open(bool admin, uint32_t principal) {
+    if (!principal) return NULL;
     struct nvrm_file *f = calloc(1, sizeof *f);
     if (!f) return NULL;
     if (mtx_init(&f->lock, mtx_plain) != thrd_success) {
@@ -142,26 +139,20 @@ void *nvrm_rm_file_open(bool admin) {
     f->nvfp.deviceInstance = NV_MAX_DEVICES;
     f->nvfp.gpuInstanceId = NV_U32_MAX;
     f->admin = admin;
-    /* No authenticated channel-peer identity exists in the native API. Give
-       each open connection a distinct RM process principal instead of accepting
-       an app-supplied PID or conflating all callers with the daemon. Do not reuse
-       identities: an explicit sharing policy may outlive its original file. */
-    n_result daemon = n_app_self();
+    /* The server supplies the kernel-authenticated message sender, not a PID
+       from request arguments. Native app IDs are not reused by the kernel. */
+    f->principal = principal;
     nv_acquire_mmap_lock(&nvrm_dev.nv);
-    if (daemon > 0 && (uint64_t)daemon <= UINT32_MAX && next_principal) {
-        if (next_principal == (uint32_t)daemon) next_principal++;
-        f->principal = next_principal;
-        if (next_principal) next_principal++;
-    }
-    if (f->principal) { f->next = files; files = f; }
+    f->next = files; files = f;
     nv_release_mmap_lock(&nvrm_dev.nv);
-    if (!f->principal) { mtx_destroy(&f->lock); free(f); return NULL; }
     return f;
 }
 
 void nvrm_rm_file_close(void *file) {
     struct nvrm_file *f = file;
     if (!f) return;
+    nvrm_drop_mapping();
+    pending_user_mapping = NULL;
     bool admin = nvrm_thread_admin;
     uint32_t principal = nvrm_thread_process;
     struct nvrm_file *saved_file = request_file;
@@ -176,6 +167,8 @@ void nvrm_rm_file_close(void *file) {
     nvrm_thread_admin = f->admin;
     nvrm_thread_process = f->principal;
     rm_cleanup_file_private(nvrm_dev.sp, nv_get_ctl_state(), &f->nvfp);
+    nvrm_drop_mapping();
+    pending_user_mapping = NULL;
     nvrm_thread_admin = admin;
     nvrm_thread_process = principal;
     request_file = saved_file;
@@ -206,8 +199,8 @@ uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
     last_linear = 0;
     pending_user_mapping = NULL;
     if (escape == NV_ESC_RM_MAP_MEMORY && size == sizeof(nv_ioctl_nvos33_parameters_with_fd) &&
-        __atomic_load_n(&nvrm_dev.mappings_revoked, __ATOMIC_ACQUIRE)) {
-        /* RM revoked the GPU mappings (nv_revoke_gpu_mappings): no new ones until it allows them. */
+        !__atomic_load_n(&safe_to_mmap, __ATOMIC_ACQUIRE)) {
+        /* Independent admission state, not a claim of temporary revocation. */
         ((nv_ioctl_nvos33_parameters_with_fd *)args)->params.status = NV_ERR_INVALID_STATE;
         return NV_ERR_INVALID_STATE;
     }
@@ -222,8 +215,15 @@ uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
     nvrm_thread_admin = admin;
     nvrm_thread_process = principal;
     request_file = saved_file;
-    if (status == NV_OK && escape == NV_ESC_RM_MAP_MEMORY && size == sizeof(nv_ioctl_nvos33_parameters_with_fd)) {
+    if (status == NV_OK && escape == NV_ESC_RM_MAP_MEMORY && size == sizeof(nv_ioctl_nvos33_parameters_with_fd) &&
+        ((nv_ioctl_nvos33_parameters_with_fd *)args)->params.status == NV_OK) {
         last_linear = (uint64_t)((nv_ioctl_nvos33_parameters_with_fd *)args)->params.pLinearAddress;
+    } else {
+        /* Only the server's immediately following successful MAP publication
+           may take this dynamic context. ALLOC_MEMORY/control/error callbacks
+           must not retain arrays until another request (or daemon shutdown). */
+        nvrm_drop_mapping();
+        pending_user_mapping = NULL;
     }
     return status;
 }
@@ -282,36 +282,23 @@ n_handle nvrm_rm_mapping_object(void *file, uint64_t *offset, uint64_t *bytes, u
     struct nvrm_file *f = file;
     struct nvrm_mapping m;
     if (!nvrm_take_mapping(&m)) return -1;
-    if (m.prot != NV_PROTECT_READABLE && m.prot != NV_PROTECT_WRITEABLE && m.prot != NV_PROTECT_READ_WRITE)
+    if (m.prot != NV_PROTECT_READABLE && m.prot != NV_PROTECT_WRITEABLE && m.prot != NV_PROTECT_READ_WRITE) {
+        nvrm_mapping_release(&m);
         return -N_ERR_DENIED;
+    }
     uint32_t native_access = m.prot == NV_PROTECT_READABLE ? N_MEMORY_READ : N_MEMORY_READ_WRITE;
-    /* Native memory has RO/RW, not write-only. Never silently add read access. */
-    if (m.prot == NV_PROTECT_WRITEABLE) return -N_ERR_UNSUPPORTED;
+    /* NVOS33 explicitly permits RW for WRITE_ONLY. x86 writable user pages are
+       also readable, so WRITEABLE is a valid RW map, not an unsupported request.
+       Preserve the native immutable RO ceiling for READABLE mappings. */
     nv_acquire_mmap_lock(&nvrm_dev.nv);
     n_handle h = -N_ERR_INVALID;
-    if (__atomic_load_n(&nvrm_dev.mappings_revoked, __ATOMIC_ACQUIRE)) goto done;
+    if (!__atomic_load_n(&safe_to_mmap, __ATOMIC_ACQUIRE)) goto done;
     struct exported_mapping *exported = m.owner;
     bool known = false;
     for (struct exported_mapping *k = f->mappings; k; k = k->next) known |= k == exported;
     if (!known || exported->file != f || exported->view >= 0) goto done;
-    uint64_t in_page = last_linear & (PAGE - 1);
-    uint64_t length;
-    if (m.is_alloc) {
-        uint64_t whole = nvrm_alloc_size(m.alloc);
-        if (m.page_index > UINT64_MAX / PAGE || m.size > UINT64_MAX - in_page - (PAGE - 1)) goto done;
-        uint64_t start = m.page_index * PAGE;
-        length = (in_page + m.size + PAGE - 1) & ~(PAGE - 1);
-        if (!m.size || start >= whole || length > whole - start) goto done;
-        h = nvrm_alloc_view(m.alloc, m.page_index, length, m.caching, native_access);
-    } else {
-        /* A BAR mapping is one run of pages; the ranges are already page aligned. */
-        uint64_t view_offset = 0, size = m.range.size;
-        if (!size || size > UINT64_MAX - (PAGE - 1) - (PAGE - 1)) goto done;
-        h = nvrm_bar_view(m.range.start, size, m.caching, native_access, &view_offset);
-        /* The view is whole pages; the client maps all of it, as for system memory. */
-        length = (view_offset + size + PAGE - 1) & ~(PAGE - 1);
-        in_page += view_offset;
-    }
+    uint64_t in_page = 0, length = 0;
+    h = nvrm_mapping_view(&m, native_access, last_linear & (PAGE - 1), &in_page, &length);
     if (h < 0) {
         nvrm_log("NVRM: no shared object for the mapping: %s", n_result_text(h));
         goto done;
@@ -320,8 +307,8 @@ n_handle nvrm_rm_mapping_object(void *file, uint64_t *offset, uint64_t *bytes, u
     *bytes = length;
     *access = native_access;
     exported->view = h;
-    all_mappings_revoked = false;
 done:
     nv_release_mmap_lock(&nvrm_dev.nv);
+    nvrm_mapping_release(&m);
     return h;
 }

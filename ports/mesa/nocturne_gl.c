@@ -145,11 +145,11 @@ static struct pipe_frontend_screen *get_screen(void) {
     simple_mtx_lock(&screen_lock);
 #ifdef GALLIUM_ZINK
     if (!gpu_fscreen) {
-        /* The daemon publishes only after initialization.  Probe its native
-         * endpoint before constructing Vulkan/Zink again; no-GPU and early
-         * WebGL calls still take the immediate software path.  A later
-         * context can promote without invalidating any existing CPU context. */
-        struct nvrm *ready = nvrm_connect();
+        /* Diagnostic endpoints can exist after adapter initialization fails.
+         * Probe for an explicitly ready adapter before constructing Zink;
+         * the helper also searches past unready GPUs. Vulkan revalidates its
+         * own snapshot, and failure here keeps existing CPU contexts alive. */
+        struct nvrm *ready = nvrm_connect_ready();
         if (ready) {
             nvrm_disconnect(ready);
             gpu_fscreen = frontend_screen(zink_create_screen(&mem_winsys, NULL));

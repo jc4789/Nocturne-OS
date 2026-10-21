@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <limits.h>
+#include <errno.h>
 #include <string.h>
 #include <threads.h>
 #include "nocturne.h"
@@ -32,37 +33,68 @@ struct nvrm {
     unsigned depth;        /* nvrm_lock nesting */
     mtx_t lock;
     struct mapping *mappings;
+    uint64_t hello_capabilities;
 };
 
-struct nvrm *nvrm_connect_device(uint32_t pci_target) {
-    if (pci_target > UINT16_MAX) return NULL;
+int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out) {
+    if (!out) return -N_ERR_INVALID;
+    *out = NULL;
+    if (pci_target > UINT16_MAX) return -N_ERR_INVALID;
     char channel[NVRM_CHANNEL_NAME_BYTES];
     snprintf(channel, sizeof channel, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
     struct nvrm *rm = calloc(1, sizeof *rm);
-    if (!rm) return NULL;
+    if (!rm) return -N_ERR_NO_MEMORY;
+    n_result result;
+    bool lock_ready = false;
     rm->channel = n_channel_connect(channel);
-    rm->arena_handle = rm->channel >= 0 ? n_shared_reserve(ARENA_BYTES) : -1;
-    rm->arena = rm->arena_handle >= 0 ? n_shared_map(rm->arena_handle, ARENA_BYTES, N_MEMORY_READ_WRITE) : NULL;
-    if (!rm->arena || mtx_init(&rm->lock, mtx_recursive) != thrd_success) goto fail;
+    rm->arena_handle = -1;
+    if (rm->channel < 0) { result = rm->channel; goto fail; }
+    rm->arena_handle = n_shared_reserve(ARENA_BYTES);
+    if (rm->arena_handle < 0) { result = rm->arena_handle; goto fail; }
+    int saved_errno = errno;
+    errno = 0;
+    rm->arena = n_shared_map(rm->arena_handle, ARENA_BYTES, N_MEMORY_READ_WRITE);
+    int map_errno = errno;
+    errno = saved_errno;
+    if (!rm->arena) { result = map_errno > 0 && map_errno < N_RESULT_CODES ? -map_errno : -N_ERR_IO; goto fail; }
+    int initialized = mtx_init(&rm->lock, mtx_recursive);
+    if (initialized != thrd_success) { result = initialized == thrd_nomem ? -N_ERR_NO_MEMORY : -N_ERR_IO; goto fail; }
+    lock_ready = true;
     struct nvrm_message hello = {.protocol = NVRM_PROTOCOL, .escape = NVRM_HELLO,
                                  .arena_address = (uint64_t)(uintptr_t)rm->arena, .arena_bytes = ARENA_BYTES};
     struct nvrm_message reply;
-    if (n_channel_send(rm->channel, &hello, sizeof hello, rm->arena_handle) < 0 ||
-        n_channel_receive(rm->channel, &reply, sizeof reply, N_CHANNEL_WAIT, NULL) != (n_result)sizeof reply ||
-        reply.protocol != NVRM_PROTOCOL || reply.escape != NVRM_HELLO || reply.size || reply.status < 0) {
-        mtx_destroy(&rm->lock);
-        goto fail;
-    }
-    return rm;
+    result = n_channel_send(rm->channel, &hello, sizeof hello, rm->arena_handle);
+    if (result < 0) goto fail;
+    if (result != sizeof hello) { result = -N_ERR_PROTOCOL; goto fail; }
+    result = n_channel_receive(rm->channel, &reply, sizeof reply, N_CHANNEL_WAIT, NULL);
+    if (result < 0) goto fail;
+    if (result != sizeof reply || reply.protocol != NVRM_PROTOCOL || reply.escape != NVRM_HELLO ||
+        reply.size || reply.status > 0) { result = -N_ERR_PROTOCOL; goto fail; }
+    if (reply.status < 0) { result = reply.status; goto fail; }
+    rm->hello_capabilities = reply.access;
+    *out = rm;
+    return 0;
 fail:
+    if (lock_ready) mtx_destroy(&rm->lock);
     if (rm->arena) n_memory_release(rm->arena, ARENA_BYTES);
     if (rm->arena_handle >= 0) n_handle_close(rm->arena_handle);
     if (rm->channel >= 0) n_handle_close(rm->channel);
     free(rm);
-    return NULL;
+    return result;
 }
 
-struct nvrm *nvrm_connect(void) {
+struct nvrm *nvrm_connect_device(uint32_t pci_target) {
+    struct nvrm *rm = NULL;
+    nvrm_connect_device_status(pci_target, &rm);
+    return rm;
+}
+
+bool nvrm_device_ready(const struct nvrm *rm) {
+    const uint64_t ready = NVRM_HELLO_STATUS_PRESENT | NVRM_HELLO_ADAPTER_READY;
+    return rm && (rm->hello_capabilities & ready) == ready;
+}
+
+static struct nvrm *connect_any(bool ready_only) {
     /* pcilist fills the supplied capacity. Grow until the complete snapshot fits,
        rather than truncating the set of GPUs to a driver-specific constant. */
     struct n_pciinfo *list = NULL;
@@ -81,12 +113,16 @@ struct nvrm *nvrm_connect(void) {
     }
     struct nvrm *rm = NULL;
     for (int i = 0; i < count && !rm; i++) {
-        if (list[i].vendor != 0x10de || list[i].cls != 0x03) continue;
+        if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif)) continue;
         rm = nvrm_connect_device(N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func));
+        if (rm && ready_only && !nvrm_device_ready(rm)) { nvrm_disconnect(rm); rm = NULL; }
     }
     free(list);
     return rm;
 }
+
+struct nvrm *nvrm_connect(void) { return connect_any(false); }
+struct nvrm *nvrm_connect_ready(void) { return connect_any(true); }
 
 void nvrm_disconnect(struct nvrm *rm) {
     if (!rm) return;
@@ -122,7 +158,8 @@ void *nvrm_scratch(struct nvrm *rm, size_t bytes) {
 
 /* One request and its reply; the reply's arguments overwrite args. Called locked. */
 static uint32_t request(struct nvrm *rm, uint32_t escape, void *args, uint32_t size, n_handle *attached,
-                        struct nvrm_message *head) {
+                        struct nvrm_message *head, bool *returned) {
+    if (returned) *returned = false;
     size_t bytes = sizeof(struct nvrm_message) + size;
     if (bytes < size) return NV_ERR_INVALID_ARGUMENT;
     struct nvrm_message *msg = malloc(bytes);
@@ -134,16 +171,17 @@ static uint32_t request(struct nvrm *rm, uint32_t escape, void *args, uint32_t s
     if (n_channel_send(rm->channel, msg, bytes, -1) < 0) goto done;
     n_result got = n_channel_receive(rm->channel, msg, bytes, N_CHANNEL_WAIT, attached);
     if (got < (n_result)sizeof *msg || msg->protocol != NVRM_PROTOCOL || msg->escape != escape) goto invalid;
-    if (msg->status < 0) {
-        /* Protocol1 peers used these slots only for hello. A new server carries
-           RM's exact error here; old peers still see a generic transport error. */
-        if (msg->rm_status && msg->rm_status <= UINT32_MAX && !msg->size && (size_t)got == sizeof *msg)
-            result = (uint32_t)msg->rm_status;
+    if (msg->rm_status > UINT32_MAX || msg->status > 0) goto invalid;
+    if (msg->status < 0 && !msg->rm_status) goto invalid; /* native rejection, not RM output */
+    if (msg->status < 0 && !msg->size && (size_t)got == sizeof *msg && size) {
+        /* Older server: retain its exact error, but do not invent absent args. */
+        result = (uint32_t)msg->rm_status;
         goto invalid;
     }
-    if (msg->rm_status > UINT32_MAX || msg->size != size || (size_t)got != bytes) goto invalid;
+    if (msg->size != size || (size_t)got != bytes) goto invalid;
     if (size) memcpy(args, msg + 1, size);
     if (head) *head = *msg;
+    if (returned) *returned = true;
     result = (uint32_t)msg->rm_status;
     goto done;
 invalid:
@@ -167,12 +205,13 @@ uint32_t nvrm_alloc(struct nvrm *rm, uint32_t root, uint32_t parent, uint32_t *o
     void *in = arena_copy(rm, params, size);
     NVOS21_PARAMETERS a = {.hRoot = root, .hObjectParent = parent, .hObjectNew = *object, .hClass = cls,
                            .pAllocParms = NV_PTR_TO_NvP64(in), .paramsSize = size};
-    uint32_t r = params && size && !in ? NV_ERR_INSUFFICIENT_RESOURCES : request(rm, NV_ESC_RM_ALLOC, &a, sizeof a, NULL, NULL);
-    if (r == NV_OK) {
-        r = a.status;
+    bool returned = false;
+    uint32_t r = params && size && !in ? NV_ERR_INSUFFICIENT_RESOURCES : request(rm, NV_ESC_RM_ALLOC, &a, sizeof a, NULL, NULL, &returned);
+    if (returned) {
         *object = a.hObjectNew;
         if (in) memcpy(params, in, size);
     }
+    if (r == NV_OK) r = a.status;
     nvrm_unlock(rm);
     return r;
 }
@@ -180,7 +219,7 @@ uint32_t nvrm_alloc(struct nvrm *rm, uint32_t root, uint32_t parent, uint32_t *o
 uint32_t nvrm_free(struct nvrm *rm, uint32_t root, uint32_t parent, uint32_t object) {
     NVOS00_PARAMETERS a = {.hRoot = root, .hObjectParent = parent, .hObjectOld = object};
     nvrm_lock(rm);
-    uint32_t r = request(rm, NV_ESC_RM_FREE, &a, sizeof a, NULL, NULL);
+    uint32_t r = request(rm, NV_ESC_RM_FREE, &a, sizeof a, NULL, NULL, NULL);
     nvrm_unlock(rm);
     return r == NV_OK ? a.status : r;
 }
@@ -191,11 +230,10 @@ uint32_t nvrm_control(struct nvrm *rm, uint32_t client, uint32_t object, uint32_
     void *in = arena_copy(rm, params, size);
     NVOS54_PARAMETERS a = {.hClient = client, .hObject = object, .cmd = cmd, .params = NV_PTR_TO_NvP64(in),
                            .paramsSize = size};
-    uint32_t r = params && size && !in ? NV_ERR_INSUFFICIENT_RESOURCES : request(rm, NV_ESC_RM_CONTROL, &a, sizeof a, NULL, NULL);
-    if (r == NV_OK) {
-        r = a.status;
-        if (in) memcpy(params, in, size);
-    }
+    bool returned = false;
+    uint32_t r = params && size && !in ? NV_ERR_INSUFFICIENT_RESOURCES : request(rm, NV_ESC_RM_CONTROL, &a, sizeof a, NULL, NULL, &returned);
+    if (returned && in) memcpy(params, in, size);
+    if (r == NV_OK) r = a.status;
     nvrm_unlock(rm);
     return r;
 }
@@ -211,7 +249,8 @@ uint32_t nvrm_map(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t me
     struct nvrm_message head;
     n_handle shared = -1;
     nvrm_lock(rm);
-    uint32_t r = request(rm, NV_ESC_RM_MAP_MEMORY, &a, sizeof a, &shared, &head);
+    bool returned = false;
+    uint32_t r = request(rm, NV_ESC_RM_MAP_MEMORY, &a, sizeof a, &shared, &head, &returned);
     if (r == NV_OK) r = a.params.status;
     if (r == NV_OK && (shared < 0 || !head.bytes || head.bytes > SIZE_MAX || head.offset >= head.bytes ||
                       length > head.bytes - head.offset ||
@@ -229,11 +268,11 @@ uint32_t nvrm_map(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t me
         m->next = rm->mappings;
         rm->mappings = m;
         *address = m->address;
-    } else if (a.params.status == NV_OK && a.params.pLinearAddress) {
+    } else if (returned && a.params.status == NV_OK && a.params.pLinearAddress) {
         /* RM mapped it but this app cannot: give RM's mapping back */
         NVOS34_PARAMETERS u = {.hClient = client, .hDevice = device, .hMemory = memory,
                                .pLinearAddress = a.params.pLinearAddress, .flags = flags};
-        request(rm, NV_ESC_RM_UNMAP_MEMORY, &u, sizeof u, NULL, NULL);
+        request(rm, NV_ESC_RM_UNMAP_MEMORY, &u, sizeof u, NULL, NULL, NULL);
     }
     nvrm_unlock(rm);
     if (r != NV_OK) free(m);
@@ -252,7 +291,7 @@ uint32_t nvrm_unmap(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t 
         n_memory_release(m->base, m->bytes);
         NVOS34_PARAMETERS u = {.hClient = client, .hDevice = device, .hMemory = memory,
                                .pLinearAddress = m->linear, .flags = flags};
-        r = request(rm, NV_ESC_RM_UNMAP_MEMORY, &u, sizeof u, NULL, NULL);
+        r = request(rm, NV_ESC_RM_UNMAP_MEMORY, &u, sizeof u, NULL, NULL, NULL);
         if (r == NV_OK) r = u.status;
         free(m);
     }
@@ -262,7 +301,7 @@ uint32_t nvrm_unmap(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t 
 
 uint32_t nvrm_escape(struct nvrm *rm, uint32_t escape, void *args, uint32_t size) {
     nvrm_lock(rm);
-    uint32_t r = request(rm, escape, args, size, NULL, NULL);
+    uint32_t r = request(rm, escape, args, size, NULL, NULL, NULL);
     nvrm_unlock(rm);
     return r;
 }

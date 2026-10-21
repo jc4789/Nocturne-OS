@@ -103,6 +103,7 @@ struct message {
     struct message *next;
     struct file *attached;
     size_t size;
+    uint64_t sender_app;
     uint8_t bytes[];
 };
 struct message_link {
@@ -143,6 +144,7 @@ int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct
     m->next = NULL;
     m->size = n;
     m->attached = NULL;
+    m->sender_app = (uint64_t)task_process()->pid;
     /* Copy in fixed pieces: a large message never makes one long
        non-preemptible copy, and a sibling unmapping the source is caught. */
     for (size_t done = 0; done < n;) {
@@ -175,7 +177,7 @@ int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct
  * message off the queue whatever its size, copies only its first cap bytes,
  * closes its attachment and reports its whole size. */
 int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek,
-                                bool discard, struct file **attached) {
+                                bool discard, struct file **attached, uint64_t *sender_app) {
     struct vnode *v = f->vn;
     struct message_link *l = v->priv;
     int side = message_side(v);
@@ -184,7 +186,10 @@ int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wai
         uint64_t fl = irq_save();
         struct message *m = l->head[side];
         if (m) {
-            if (peek) { irq_restore(fl); return (int64_t)m->size; }
+            if (peek) {
+                if (sender_app) *sender_app = m->sender_app;
+                irq_restore(fl); return (int64_t)m->size;
+            }
             if (!discard && m->size > cap) { irq_restore(fl); return -N_ERR_TOO_LARGE; }
             size_t copy = MIN(m->size, cap);
             if (!user_ok_w(ubuf, copy)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
@@ -207,6 +212,7 @@ int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wai
                 done += piece;
             }
             int64_t size = (int64_t)m->size;
+            if (sender_app) *sender_app = m->sender_app;
             if (discard) { message_free(m); return size; }
             *attached = m->attached;
             m->attached = NULL;

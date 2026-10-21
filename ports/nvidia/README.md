@@ -6,8 +6,8 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 `fork`・`ioctl`・`mmap` などの互換層は無い。修理は OS 層へ統合し、RM 本体の変更は既存の MIT
 `arch/nvalloc/unix/src/os.c` の Nocturne 条件付き user-map 寿命コールバックに限定する。
 
-状態：RM、OS 層、クライアントと NVK の接続がある。2026-10-20 の修理は
-`docs/nvidia/repair-rm-first.md` と第二検討報告へ記録する。ホスト試験は native サービスを mock にするため、
+状態：RM、OS 層、クライアントと NVK の接続がある。2026-10-20 の再監査修理は
+`docs/nvidia/review-87dd1e2f-map.json` で責務と検証範囲を管理する。ホスト試験は native サービスを mock にするため、
 その成功から PCI、GPU DMA、キャッシュ、GSP 起動の成功を推論しない。**NVIDIA 実機は未確認。**
 
 ## 構成
@@ -30,14 +30,21 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 → `rm_init_private_state` → `rm_init_event_locks` → `rm_set_rm_firmware_requested` → 割り込みスレッド
 → `rm_init_adapter`（ここで GSP が起動する）→ `rm_get_device_name` をログへ → `nvrm_serve()`。
 `rm_init_adapter` が失敗しても、診断のためにサーバーは動かし続ける（ログに失敗を残す）。
+init／libnvrm／NVK は共通の PCI 選別条件（NVIDIA、VGA または 3D、progif 0）を使う。
+NVK は生の PCI 件数を GPU 数にせず、HELLO で adapter 初期化成功を確認し、接続先 RM の probed ID と PCI 情報が一致する BDF の動的 snapshot を列挙する。probed ID だけでは初期化成功を保証しない。
 
 装置ごとに `nocturne.nvidia.rm.<N_PCI_TARGETの4桁16進数>` を公開する。
 `nvrm_connect_device()` は指定装置へ、従来の `nvrm_connect()` は動的 PCI 列挙から最初に接続可能な装置へつなぐ。
+描画側の `nvrm_connect_ready()` は診断専用の未初期化装置を飛ばし、後続の ready 装置も探す。旧 HELLO の echo を ready と誤認しない。
 従来名 `nocturne.nvidia.rm` は一つの daemon だけが既存アプリ用 alias として公開する。
 Protocol1 の48byte header と field offset は維持し、通常応答で未使用だった hello 用領域へ
 RM 戻り値と map access を格納する。旧バイナリーにも RM 関数失敗を負の status で通知する。
+RM が引数を更新してからエラーを返した場合も、有効な応答の引数と arena 内の結果を呼出し元へ返す。
+通信の破損・未実行の要求と RM のエラーを区別し、作成済み handle の後始末情報を捨てない。
 RO view を RW map しようとする旧クライアントは拒否される。RO 対応には新しい libnvrm との再リンクが必要で、
 互換性のために写像権利を緩めない。
+RM の WRITE_ONLY 要求は NVOS33 が許す RW 写像で提供する（x86 の writable page は readable でもある）。
+READ_ONLY の最大権利は引き続き RO であり、派生 view や合成 view でも昇格できない。
 
 ファームウェア：`/usr/share/firmware/nvidia/615.78.08/`、無ければ `/data/firmware/nvidia/615.78.08/`
 （`nv_get_firmware`）。git には入れない（台帳 D9）。
@@ -95,7 +102,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `nv_start_rc_timer`／`nv_stop_rc_timer`、`nv_create_nano_timer` ほか | 1 本のタイマースレッド（1 Hz の RC、nano タイマー） |
 | `nv_get_firmware`／`nv_put_firmware` | `n_document_load`（上のフォルダー順。ログの追記は `n_document_append`） |
 | `os_get_cpu_count`／`os_get_cpu_number`／`os_get_cpu_frequency` | `cpu_info`／`cpu_index` |
-| `os_get_current_process`／`_name`／`os_get_current_thread`、`os_get_euid`、`os_is_administrator`、`os_check_access` | 要求／cleanup は再利用しない接続固有の RM 主体と非特権 TLS で実行。daemon 自身のスレッドは daemon の PID と管理者権限。認証済み peer PID API が無いため、同一アプリの別接続も暗黙に同一主体とはしない |
+| `os_get_current_process`／`_name`／`os_get_current_thread`、`os_get_euid`、`os_is_administrator`、`os_check_access` | 要求／cleanup はカーネルが送信時に認証した native app ID と非特権 TLS で実行。同じ app の別接続・thread は同じ主体。HELLO 後の全 message でも送信元を照合し、endpoint を別 app に渡しても偽装できない。daemon 自身の thread は daemon の PID と管理者権限 |
 | `os_pci_init_handle`、`os_pci_read_*`／`write_*` | `n_pci_config_read／write`。自分の機能だけ書ける。他の機能（上流ブリッジ）は読むだけ |
 | `os_map_kernel_space`／`os_unmap_kernel_space` | BAR は `n_pci_bar`＋`n_shared_view`（UC／WC）＋`n_shared_map`。BAR0 は全体を一度だけ写す |
 | `nv_alloc_pages`／`nv_free_pages` | `n_dma_create`（`N_DMA_CONTIGUOUS`、`N_DMA_32BIT`）＋`n_dma_addresses`。ページ 4 KiB より大きいときは余分に取って view で整列 |
@@ -118,7 +125,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 - **ACPI メソッド**（`_DSM`、`_DDC`、`_DOD`、`_ROM`、MUX、電源）：アプリから AML を実行する手段が無い。
 - **NUMA・ページ・IOMMU・dma-buf・scatter-gather の取り込み・ユーザーページの固定・P2P**：Nocturne にその概念が無い。クライアントのメモリは「共有オブジェクト」で渡す。
 - **仮想化**（vGPU、GRID、VFIO）、**cgroup**、**IMEX チャンネル**、**能力ファイル**（`nvidia_caps_root` は NULL）。
-- **電源管理**（ランタイムサスペンド、S0ix、動的電源）：最初は扱わない。
+- **電源管理**（ランタイムサスペンド、S0ix、動的電源）：未対応。`nv_revoke_gpu_mappings` は、fault 時復元を伴う一時失効を提供できないため、状態・既存写像を変えず `NV_ERR_NOT_SUPPORTED` を返す。永久取消で代用しない。`safe_to_mmap` は独立した新規写像の許可状態で、取消完了の報告とは混同しない。
 - **イベント**：`nv_post_event` はクライアント（`struct nvrm_file`）ごとのキューに積み、`nv_get_event`（`NV_ESC_RM_GET_EVENT_DATA`）で取り出す。プロトコルは要求・応答なのでクライアントがポーリングし、プッシュ通知は無い。`nv_get_file_private` は無し（記述子が無い）。
 - **ファイル**（`os_allocate_temporary_file` など）：ページアウト用。無い。
 
@@ -127,11 +134,12 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 - 4 KiB を超えるページサイズの連続確保は、余分に取って整列する。非連続の大きなページも連続を強いるので、大きな確保は失敗しうる。
 - `nv_alloc_user_mapping` の符号化は bus 番地が一意であることに頼る（IOMMU が無いので成り立つ）。
 - 再配置可能な BAR（Resizable BAR）で BAR1／BAR2 が 16 GiB のとき、カーネル側の写しが失敗しうる。
-- 隣接 BAR range は個数制限なしで結合するが、真に非連続の BAR mapping は native shared view の能力外。
+- 非連続 BAR range は順序を保持して native `n_shared_compose` で一つの VA へ並べる。範囲数に人工的な上限は無く、ページ境界・整数幅・実資源を検証する。各範囲の cache、RO 上限、source view の取消、PCI claim の寿命を合成・派生 view へ引き継ぐ。
 - `os_is_efi_enabled` は常に真。`os_disable_console_access` は何もしない（表示の乗っ取りは GSP 初期化の間にありうる。D8）。
-- memory BAR の有効索引と64bit幅から RM aperture を割当てる。通常 VRAM 以外は UC に固定する。
+- memory BAR の有効索引と64bit幅から RM aperture を割当てる。register／doorbell は UC、prefetchable な FB／IMEM は RM の WC 要求を尊重する。RM が設定する USERD 範囲と重なるページは UC、`rm_disable_iomap_wc()` は user／kernel 両経路へ反映する。BAR0 全体の UC 写像と矛盾する cache alias は作らない。
 - user-map ごとの RM private token を保持し、明示／暗黙 unmap と close で当該 view と派生写像を失効する。
-  `nv_revoke_gpu_mappings` は既存全 view を失効し、失効に失敗した場合は成功と報告しない。
+  RM 自身の処理中にも token を作成でき、IPC request 不在や一時的な写像禁止をメモリ不足として報告しない。
+- NVK の BAR1 読み戻し領域は nnrm／VAspace 単位で共有し、channel が寿命参照を保持する。owner を先に閉じても生存 channel から参照でき、最後の参照で解放する。読み戻し→GPPut→fence→doorbell の順序は保持する。実機での速度改善は未測定。
 - `cnd_timedwait` は `TIME_UTC` の期限で待つ。Nocturne の `TIME_UTC` は戻らない（libc の `time.c`）ので、壁時計が進められても待ちが早く終わるだけで、タイマーの線は単調時計で測り直す。
 - RM の呼出しの深さに対し、スレッドのスタックが 256 KiB で足りるかは未確認。
 - 実機でのファームウェア起動・割り込み・ブートの結果は未確認。

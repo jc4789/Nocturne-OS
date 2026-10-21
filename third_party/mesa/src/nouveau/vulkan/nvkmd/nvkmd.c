@@ -81,19 +81,19 @@ nvkmd_mem_init(struct nvkmd_dev *dev,
    simple_mtx_init(&mem->map_mutex, mtx_plain);
 }
 
-uint32_t
-nvkmd_get_gpu_count(struct vk_object_base *log_obj)
+VkResult
+nvkmd_enumerate_gpus(struct vk_object_base *log_obj, uint32_t **gpu_ids, uint32_t *count)
 {
-   return nvkmd_nocturne_get_gpu_count(log_obj);
+   return nvkmd_nocturne_enumerate_gpus(log_obj, gpu_ids, count);
 }
 
 VkResult
-nvkmd_try_create_pdev(uint32_t gpu_index,
+nvkmd_try_create_pdev(uint32_t gpu_id,
                       struct vk_object_base *log_obj,
                       enum nvk_debug debug_flags,
                       struct nvkmd_pdev **pdev_out)
 {
-   return nvkmd_nocturne_try_create_pdev(gpu_index, log_obj,
+   return nvkmd_nocturne_try_create_pdev(gpu_id, log_obj,
                                          debug_flags, pdev_out);
 }
 

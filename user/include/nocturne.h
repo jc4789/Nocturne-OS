@@ -70,6 +70,10 @@ n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach)
    N_CHANNEL_DISCARD copies at most cap bytes of it, then drops it.
    A message larger than cap stays queued and gives N_ERR_TOO_LARGE. */
 n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handle *attached);
+/* Message channels only. Kernel-authenticated send-time app ID; all threads
+   of one app agree, including across connections or transferred endpoints.
+   message is required. Peek reports credentials without taking an attachment. */
+n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message);
 /* Named rendezvous, not a folder or network name: the key bytes are matched in
    full, so callers put their own identity into it. listen owns the key until
    its handle closes (N_ERR_EXISTS meanwhile); connect gives a message channel
@@ -118,6 +122,10 @@ n_handle n_shared_view(n_handle shared, size_t offset, size_t bytes, uint32_t ca
 /* A view with an immutable maximum access (N_MEMORY_READ or READ_WRITE).
    Derived views and transferred handles cannot enlarge this access. */
 n_handle n_shared_view_access(n_handle shared, size_t offset, size_t bytes, uint32_t cache, uint32_t access);
+/* One shared object over ordered slices, retaining their backing, cache types
+   and cancellation dependencies. READ/READ_WRITE cannot exceed any source's
+   maximum rights. Source handles may close after success. No pages are copied. */
+n_handle n_shared_compose(const struct n_shared_range *ranges, size_t count, uint32_t access);
 /* Only the app which issued a view may revoke it. Existing mappings and all
    derived views lose access; the underlying object and independent views remain alive. */
 n_result n_shared_revoke(n_handle view);

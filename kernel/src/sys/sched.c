@@ -26,7 +26,9 @@ static struct task *idle_task;
 struct run_queue { struct task *head, *tail; };
 static struct run_queue kq;
 static struct task *dead_list;
-static int next_pid;
+/* The public app/thread IDs are signed 32-bit. Never wrap or reuse an ID:
+   queued channel credentials remain meaningful after their sender ends. */
+static uint32_t next_pid;
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void kthread_trampoline(void);
@@ -585,6 +587,12 @@ struct task *task_alloc(const char *name) {
         return NULL;
     }
     uint64_t f = irq_save();
+    if (next_pid > INT32_MAX) {
+        irq_restore(f);
+        vfree(t->kstack, KSTACK_PAGES);
+        kfree(t);
+        return NULL;
+    }
     t->pid = next_pid++;
     t->all_next = task_list;
     task_list = t;

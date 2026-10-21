@@ -14,11 +14,13 @@
 /* RM drives Turing and later (the GSP generations) */
 #define NVKMD_NOCTURNE_MIN_CHIPSET 0x160
 
-uint32_t
-nvkmd_nocturne_get_gpu_count(struct vk_object_base *log_obj)
+VkResult
+nvkmd_nocturne_enumerate_gpus(struct vk_object_base *log_obj,
+                             uint32_t **gpu_ids, uint32_t *count)
 {
-   (void)log_obj;
-   return nnrm_gpu_count();
+   uint32_t st = nnrm_enumerate_gpus(gpu_ids, count);
+   return st == 0 ? VK_SUCCESS : vk_errorf(log_obj, nnrm_vk_result(st, false),
+      "Failed to enumerate RM-probed GPUs: %s", nnrm_status_name(st));
 }
 
 static const char *
@@ -87,18 +89,22 @@ fill_dev_info(struct nv_device_info *info, const struct nnrm_gpu_info *gpu)
 }
 
 VkResult
-nvkmd_nocturne_try_create_pdev(uint32_t gpu_index,
+nvkmd_nocturne_try_create_pdev(uint32_t pci_target,
                                struct vk_object_base *log_obj,
                                enum nvk_debug debug_flags,
                                struct nvkmd_pdev **pdev_out)
 {
    struct nnrm *rm;
    struct nnrm_gpu_info gpu;
-   uint32_t st = nnrm_open(gpu_index, &rm, &gpu);
+   uint32_t st = nnrm_open_device(pci_target, &rm, &gpu);
    if (st != 0) {
       if (debug_flags & NVK_DEBUG_VM)
-         fprintf(stderr, "nvk: GPU %u: %s\n", gpu_index, nnrm_status_name(st));
-      return VK_ERROR_INCOMPATIBLE_DRIVER;
+         fprintf(stderr, "nvk: PCI target %x: %s\n", pci_target, nnrm_status_name(st));
+      /* A snapshot member can disappear before it is opened. Do not turn
+       * host OOM or a failing RM command into an absent/unsupported GPU. */
+      if (nnrm_gpu_unavailable(st))
+         return VK_ERROR_INCOMPATIBLE_DRIVER;
+      return vk_error(log_obj, nnrm_vk_result(st, false));
    }
 
    if (gpu.chipset < NVKMD_NOCTURNE_MIN_CHIPSET || gpu.cls_gpfifo == 0 ||

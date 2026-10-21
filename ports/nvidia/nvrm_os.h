@@ -37,7 +37,6 @@ struct nvrm_device {
     nv_state_t nv;                   /* what RM sees */
     nvidia_stack_t *sp;              /* RM's (dummy) altstack; no __use_altstack__ here */
     bool adapter_ready;              /* rm_init_adapter succeeded */
-    bool mappings_revoked;           /* RM revoked the GPU mappings: no new client mappings (atomic) */
     char name[128];                  /* rm_get_device_name text */
 };
 
@@ -66,7 +65,7 @@ extern thread_local bool nvrm_in_isr;
  * and back to true after; threads of the process itself (interrupts, work, timers) are
  * administrators. */
 extern thread_local bool nvrm_thread_admin;
-/* Nonzero, non-reused connection principal during a request; zero for daemon work. */
+/* Kernel-authenticated native app ID during a request; zero for daemon work. */
 extern thread_local uint32_t nvrm_thread_process;
 
 /* ------------------------------------------------------------------------------------------
@@ -81,8 +80,9 @@ extern thread_local uint32_t nvrm_thread_process;
  * RM calls nv_add_mapping_context_to_file while the server handles a "map this memory to the
  * client" request (rm_create_mmap_context). The context is parked in a per-thread slot; the
  * rm_api.c (nvrm_rm_mapping_object) takes it with nvrm_take_mapping and turns it into a
- * shared object with nvrm_alloc_view (system memory) or nvrm_bar_view (a range of a BAR),
- * which it sends to the client as a channel attachment.
+ * shared object with nvrm_mapping_view, which it sends to the client as a channel attachment.
+ * BAR ranges may have disjoint backing; their native views retain their individual cache
+ * policy and are composed into one contiguous virtual mapping.
  * ---------------------------------------------------------------------------------------- */
 
 struct nvrm_alloc; /* a system-memory allocation made by nv_alloc_pages; opaque */
@@ -102,13 +102,20 @@ struct nvrm_mapping {
     uint64_t size;                   /* nvuap->size, bytes */
     /* !is_alloc: BAR memory */
     uint64_t access_start, access_size;
-    struct nvrm_range range;        /* contiguous physical run, coalesced from RM's ranges */
+    struct nvrm_range *ranges;       /* owned copy, in the order of the client's virtual pages */
+    size_t range_count;
 };
 
 /* Moves the parked context of this thread into *out; false when there is none. */
 bool nvrm_take_mapping(struct nvrm_mapping *out);
+/* Releases the copied ranges, not the RM private lifetime token. */
+void nvrm_mapping_release(struct nvrm_mapping *mapping);
 /* Forgets a parked context nobody took (a failed request). */
 void nvrm_drop_mapping(void);
+/* Publish a context as one native object. page_offset is RM's returned address modulo
+ * the OS page size. On success, return the final offset and full page-rounded length. */
+n_handle nvrm_mapping_view(const struct nvrm_mapping *mapping, uint32_t access, uint64_t page_offset,
+                           uint64_t *view_offset, uint64_t *bytes);
 /* Private tokens are kept by RM until explicit or implicit user unmap. */
 void *nvrm_user_mapping_new(void);
 void *nvrm_user_mapping_current(void);

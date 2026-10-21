@@ -314,6 +314,9 @@ n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach)
 n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handle *attached) {
     return NC5(SYS_CHANNEL_RECEIVE, h, buf, cap, flags, attached);
 }
+n_result n_channel_receive_from(n_handle h, void *buf, size_t cap, int flags, struct n_channel_message *message) {
+    return NC5(SYS_CHANNEL_RECEIVE_FROM, h, buf, cap, flags, message);
+}
 n_handle n_app_launch(const char *path, const struct n_launch *launch) {
     n_handle app = (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
     if (app != -N_ERR_NOT_PROGRAM || !launch) return app;
@@ -367,6 +370,9 @@ n_handle n_shared_view_access(n_handle shared, size_t offset, size_t bytes, uint
     return (n_handle)NC5(SYS_SHARED_VIEW, shared, offset, bytes, cache, access);
 }
 n_result n_shared_revoke(n_handle view) { return NC5(SYS_SHARED_REVOKE, view, 0, 0, 0, 0); }
+n_handle n_shared_compose(const struct n_shared_range *ranges, size_t count, uint32_t access) {
+    return NC5(SYS_SHARED_COMPOSE, ranges, count, access, 0, 0);
+}
 n_handle n_audio_open(void) { return (n_handle)NC5(SYS_AUDIO_OPEN, 0, 0, 0, 0, 0); }
 n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags) {
     return NC5(SYS_AUDIO_SUBMIT, a, frames, count, flags, 0);

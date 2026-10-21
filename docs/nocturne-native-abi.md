@@ -105,6 +105,17 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - アプリの入出力に渡される文字装置（コンソール、カーネルログ、null）にも
   `n_channel_send`／`receive` が使える。ただし境界と添付は無く、`N_CHANNEL_PEEK` は
   `N_ERR_UNSUPPORTED`。バイト列のパイプは無い。
+- `n_channel_receive_from(h,buf,cap,flags,&message)` はメッセージチャンネル専用。
+  `n_channel_message` の `attached`、`reserved`（0）、`sender_app` を返す。
+  `sender_app` はカーネルが実送信時に記録する `n_app_self()` と同じ識別子で、
+  endpoint の作成者・接続者の固定値でも、本文で申告された番号でもない。
+  同じアプリの全 thread と別接続で一致し、endpoint を起動先へ引き渡すと起動先の主体になる。
+  識別子は再利用せず、送信者終了後の待ちメッセージにも値を保持する。
+  `message` は必須。`PEEK` は主体を調べられるが添付を取り出さず、`DISCARD` は添付を閉じる。
+  両者の `attached` は -1。旧 receive の番号と形式は変えない。
+  添付の設置失敗や出力先の失効は負の結果を返し、設置済み添付も回収する。
+  この段階の失敗は既に取り出したメッセージを待ち行列へ戻さない。失敗時の出力値は利用しない。
+  接続単位の認証を必要とするサービスは、最初の主体へ bind し各 request の主体も照合する。
 - ISO Cの入力は、`cap` より大きいメッセージを `N_CHANNEL_PEEK` で測り、バッファーを
   広げて丸ごと受け取る。長さ0のメッセージは読む内容が無いので次を待つ。
 - 端末は、子アプリの「入力」「出力」チャンネルとメッセージをやり取りする一つの
@@ -244,6 +255,22 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     `N_ERR_DENIED`。`N_CACHE_DEFAULT` のビューと元のオブジェクトの写像はその型を使う。
   - `n_shared_map` の書込み可（`N_MEMORY_READ_WRITE`）は、書込みで開いたハンドルにだけ許す。
     view も共有オブジェクトなので、`n_shared_map` で写し、チャネルの添付で他のアプリへ渡せる。
+  - `n_shared_view_access(shared,offset,bytes,cache,access)` は READ または READ_WRITE の
+    最大権利を指定する。元ハンドルの権利を拡大できず、RO は map・派生 view・合成でも RW にならない。
+    `n_shared_revoke(view)` は発行アプリだけが実行でき、子孫 view とそれに依存する合成の既存 PTE も取り消す。
+    元の独立した所有者の写像は取り消さない。受信だけでは取消権限は得ない。
+  - `n_shared_compose(ranges,count,access)` は `n_shared_range` の
+    `{int32_t shared; uint32_t reserved; uint64_t offset,bytes;}` を配列順に連結した共有ハンドルを返す。
+    reserved は0、offset/bytes はページ境界、bytes と count は非0。
+    各 source 内の範囲、配列・総サイズの overflow と実確保資源を検査し、source 数の固定上限は設けない。
+    新ハンドルの最大権利は全 source の権利内。source を close しても backing と取消依存は保持する。
+    非連続 BAR page、RAM、DMA の属性を segment ごとに保ち、ページを複製しない。
+    DEFAULT の派生 view は異種 cache を維持し、明示する単一 cache は対象範囲の全 segment と一致する必要がある。
+    source view の取消は nested composite/view にも及ぶ。BAR claim 消失時は該当 page が all-ones となり、
+    他 segment の独立 RAM は生存する。失効済み BAR を含む合成の新しい map/view/再合成は拒否する。
+    DMA の cache pin は PTE/TLB 除去の完了まで保持する。部分失敗では取得した参照を回収する。
+    map 構築も取消対象として追跡し、取消済み範囲に後から PTE を設置しない。
+    まだ返却していない構築中 VA へ別 thread が release/protect を要求した場合は `N_ERR_NOT_READY`。
 
 ## 10. 移行の段階
 
