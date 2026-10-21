@@ -122,9 +122,12 @@ struct iommu_hw {
     bool (*shutdown)(void);
 };
 /* The units the firmware describes (IVRS, DMAR), their registers mapped and read: the back end,
-   or NULL. Nothing is written to them before start. */
-const struct iommu_hw *iommu_amd_probe(void);
-const struct iommu_hw *iommu_intel_probe(void);
+   or NULL. Nothing is written to them before start. On NULL, plain_safe is true only with no
+   description or after ALL described units were identified and observed not to interfere with
+   plain delivery or own live queues/tables. An incomplete description/read is not proof of off;
+   mandatory interrupt remapping (VT-d IRREQ) is not plain-safe even with every enable clear. */
+const struct iommu_hw *iommu_amd_probe(bool *plain_safe);
+const struct iommu_hw *iommu_intel_probe(bool *plain_safe);
 /* What the back ends find in the firmware's tables while they probe.
    reserved: memory the functions with requester IDs first..last reach by DMA as it is (AMD-Vi
    IVMD, VT-d RMRR) with IOMMU_READ / IOMMU_WRITE access, mapped in their domains when claimed.

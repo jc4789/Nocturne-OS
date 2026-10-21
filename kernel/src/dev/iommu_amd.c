@@ -28,6 +28,7 @@
 #define R_EXCL_BASE 0x0020
 #define R_EFR       0x0030
 #define R_PERF_OPT  0x016C
+#define R_VSTATUS   0x0190
 #define R_CMD_HEAD  0x2000
 #define R_CMD_TAIL  0x2008
 #define R_EVT_HEAD  0x2010
@@ -38,7 +39,17 @@
 #define CTL_IOMMU_EN    (1ull << 0)
 #define CTL_EVENTLOG_EN (1ull << 2)
 #define CTL_EVENTINT_EN (1ull << 3)
+#define CTL_COMWAITINT_EN (1ull << 4)
 #define CTL_CMDBUF_EN   (1ull << 12)
+#define CTL_PPRLOG_EN   (1ull << 13)
+#define CTL_PPRINT_EN   (1ull << 14)
+#define CTL_PPR_EN      (1ull << 15)
+#define CTL_GA_EN       (1ull << 17)
+#define CTL_GALOG_EN    (1ull << 28)
+#define CTL_GAINT_EN    (1ull << 29)
+#define CTL_MARC_EN     (1ull << 40)
+#define CTL_VCMD_EN     (1ull << 52)
+#define CTL_VIOMMU_EN   (1ull << 53)
 #define EXCL_ENABLE    (1ull << 0)
 #define EXCL_ALLOW_ALL (1ull << 1)
 #define ST_EVENT_OVERFLOW (1u << 0)
@@ -46,7 +57,15 @@
 #define ST_COMWAIT_INT    (1u << 2)
 #define ST_EVENTLOG_RUN   (1u << 3)
 #define ST_CMDBUF_RUN     (1u << 4)
+#define ST_PPRLOG_RUN     (1u << 7)
+#define ST_GALOG_RUN      (1u << 8)
+#define VST_IOMMU_RUN     (1u << 0)
+#define VST_CMDBUF_RUN    (1u << 1)
+#define EFR_PPR      (1ull << 1)
+#define EFR_GA       (1ull << 7)
+#define EFR_VIOMMU   (1ull << 55)
 #define EFR_IA       (1ull << 6)  /* INVALIDATE_IOMMU_ALL */
+#define EFR_MARC_MASK (3ull << 42) /* MarcSup: 00 is unsupported; 01/10 specify aperture counts */
 #define EFR_PERF_OPT (1ull << 45) /* the performance optimization register (3.4.9) */
 #define PERF_OPT_EN  (1u << 13)
 #define CAP_NP_CACHE (1u << 26) /* caches not-present entries: a map needs an invalidation too */
@@ -71,6 +90,12 @@
 #define PTE_IR (1ull << 61)
 #define PTE_IW (1ull << 62)
 #define PTE_NEXT_LEVEL (7ull << 9)
+/* 2.2.3: 4-KiB tables, 8-byte entries and a 52-bit physical address field;
+   DTE.Mode (Table 7) and EFR.HATS allow at most six host levels. */
+#define HOST_PAGE_SHIFT 12u
+#define HOST_INDEX_BITS 9u
+#define HOST_PHYS_BITS  52u
+#define HOST_MAX_LEVELS 6u
 
 enum { CMD_COMPLETION_WAIT = 1, CMD_INV_DEVTAB = 2, CMD_INV_PAGES = 3, CMD_INV_IRT = 5, CMD_INV_ALL = 8 };
 enum { EVENT_ILLEGAL_DTE = 1, EVENT_PAGE_FAULT = 2 };
@@ -87,6 +112,7 @@ struct unit {
     uint8_t type, flags;   /* the IVHD the unit's description came from */
     uint16_t cap;          /* its capability in the function's config space */
     uint64_t efr;
+    uint64_t state_efr; /* engine/bypass停止確認専用: 実MMIOとfirmware imageの和 */
     uint8_t msi_num;       /* event-log MSI-X entry, IVHD IOMMU info[4:0] */
     bool hat_dis, event_irq;
     uint64_t cmd, events;  /* rings */
@@ -123,6 +149,7 @@ static void wr32(const struct unit *u, unsigned off, uint32_t v) { *(volatile ui
 #endif
 
 static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+static bool engines_off(const struct unit *u, bool wait);
 
 /* ---- IVRS ---- */
 static void alias_add(uint16_t first, uint16_t last, uint16_t as) {
@@ -220,9 +247,8 @@ static struct unit *unit_at(uint64_t base) {
 
 /* Types 10h, 11h and 40h describe the same unit in more detail each: the most detailed one
    this code reads is used. */
-static bool parse_ivrs(void) {
-    const struct acpi_sdt *h = acpi_find("IVRS", 0);
-    if (!h || h->length < 48) return false;
+static bool parse_ivrs(const struct acpi_sdt *h) {
+    if (h->length < 48 || (h->revision != 1 && h->revision != 2)) return false;
     const uint8_t *b = (const uint8_t *)h;
     memcpy(&ivinfo, b + 36, sizeof ivinfo);
     for (int pass = 0; pass < 2; pass++) {
@@ -237,8 +263,8 @@ static bool parse_ivrs(void) {
                 uint64_t base;
                 memcpy(&base, b + off + 8, 8);
                 struct unit *u = unit_at(base);
-                if (pass == 0 && !base) {
-                    kprintf("iommu: the IVRS describes an AMD-Vi unit without an address; not used\n");
+                if (pass == 0 && (!base || (base & (MMIO_BYTES - 1)) || base > UINT64_MAX - MMIO_BYTES)) {
+                    kprintf("iommu: the IVRS describes an AMD-Vi unit with an invalid register address; not used\n");
                     parse_lost = true;
                 } else if (pass == 0 && !u) {
                     if ((u = kappend(&units, &nunits, &units_room, sizeof *u)))
@@ -274,12 +300,88 @@ static bool parse_ivrs(void) {
     return nunits != 0;
 }
 
+/* Isolation metadata may be unusable while the hardware is already safely off. Audit only
+   unit identity and live engines, independently of device entries, IVMD and usable widths.
+   No registers are written and no firmware queue is taken over on this path. */
+static bool ivrs_plain_safe(const struct acpi_sdt *h) {
+    if (h->length < 48 || (h->revision != 1 && h->revision != 2)) return false;
+    const uint8_t *b = (const uint8_t *)h;
+    uint32_t summary;
+    memcpy(&summary, b + 36, sizeof summary);
+    bool identified = false;
+    uint32_t at = 48;
+    while (h->length - at >= 4) {
+        uint8_t type = b[at];
+        uint16_t len = u16(b + at + 2);
+        if (len < 4 || len > h->length - at) return false;
+        if (type == 0x10 || type == 0x11 || type == 0x40) {
+            if (len < (type == 0x10 ? 24 : 40)) return false;
+            uint64_t base;
+            memcpy(&base, b + at + 8, sizeof base);
+            if (!base || (base & (MMIO_BYTES - 1)) || base > UINT64_MAX - MMIO_BYTES) return false;
+            struct unit *known = unit_at(base);
+            struct unit u = {.base = base, .regs = known ? known->regs : NULL};
+            if (!u.regs && !(u.regs = vmm_map_mmio(base, MMIO_BYTES))) return false;
+            /* Include nonzero PCI segments: their physical register addresses are still
+               known even though this PCI layer cannot configure their functions. */
+            uint16_t id = u16(b + at + 4), cap = u16(b + at + 6);
+            struct pci_device *fn = !u16(b + at + 16) && cap >= 0x40 && cap <= 0xEC && !(cap & 3)
+                ? pci_find_function(id >> 8, (id >> 3) & 31, id & 7) : NULL;
+            uint32_t header = fn ? pci_read32(fn->bus, fn->dev, fn->func, cap) : 0;
+            uint64_t efr = ((summary & 1) || (header & CAP_EFR)) ? rd(&u, R_EFR) : 0;
+            if (type != 0x10) {
+                uint64_t image;
+                memcpy(&image, b + at + 24, sizeof image);
+                /* The image overrides supported features for normal use. For an off
+                   audit, neither it nor actual hardware may hide an existing engine. */
+                efr |= image;
+            }
+            u.state_efr = efr;
+            if (!engines_off(&u, false)) return false;
+            identified = true;
+        } else if (type < 0x20 || type > 0x22) {
+            return false; /* unknown IVDBs might describe an unenumerated hardware unit */
+        }
+        at += len;
+    }
+    return at == h->length && identified;
+}
+
 /* ---- commands and events ---- */
 /* Waits until the status bits `bits` read `want`: false when they did not in time. */
-static bool status_wait(const struct unit *u, uint32_t bits, uint32_t want) {
-    for (uint64_t t = iommu_deadline(10); (rd(u, R_STATUS) & bits) != want; pause())
+static bool register_wait(const struct unit *u, unsigned off, uint32_t bits, uint32_t want) {
+    for (uint64_t t = iommu_deadline(10); (rd(u, off) & bits) != want; pause())
         if (iommu_expired(t)) return false;
     return true;
+}
+
+static bool status_wait(const struct unit *u, uint32_t bits, uint32_t want) {
+    return register_wait(u, R_STATUS, bits, want);
+}
+
+/* Control/Status (3.4, pp212-216, 249-250), vIOMMU Status (3.4.11).
+   Test only architected bits of supported features, not reserved/RO policy bits. Probe
+   observes once without touching firmware; shutdown/program wait after disabling engines. */
+static bool engines_off(const struct unit *u, bool wait) {
+    uint64_t efr = u->efr | u->state_efr;
+    uint64_t enabled = CTL_IOMMU_EN | CTL_CMDBUF_EN | CTL_EVENTLOG_EN |
+                       CTL_EVENTINT_EN | CTL_COMWAITINT_EN;
+    uint32_t running = ST_CMDBUF_RUN | ST_EVENTLOG_RUN;
+    if (efr & EFR_PPR) {
+        enabled |= CTL_PPR_EN | CTL_PPRLOG_EN | CTL_PPRINT_EN;
+        running |= ST_PPRLOG_RUN;
+    }
+    if (efr & EFR_GA) {
+        enabled |= CTL_GA_EN | CTL_GALOG_EN | CTL_GAINT_EN;
+        running |= ST_GALOG_RUN;
+    }
+    if (efr & EFR_MARC_MASK) enabled |= CTL_MARC_EN;
+    if (efr & EFR_VIOMMU) enabled |= CTL_VIOMMU_EN | CTL_VCMD_EN;
+    if (rd(u, R_CONTROL) & enabled) return false;
+    if (wait ? !status_wait(u, running, 0) : (rd(u, R_STATUS) & running) != 0) return false;
+    if (!(efr & EFR_VIOMMU)) return true;
+    uint32_t virtual_running = VST_IOMMU_RUN | VST_CMDBUF_RUN;
+    return wait ? register_wait(u, R_VSTATUS, virtual_running, 0) : !(rd(u, R_VSTATUS) & virtual_running);
 }
 
 /* CmdBufRun is a level: set once CmdBufEn is written with 1 and the unit fetches commands, clear
@@ -541,8 +643,8 @@ static bool amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
    integrated devices such as GPUs reach memory without the unit, in a register of its own. */
 static bool program(struct unit *u) {
     wr(u, R_CONTROL, 0);
-    if ((rd(u, R_CONTROL) & CTL_IOMMU_EN) || !status_wait(u, ST_EVENTLOG_RUN | ST_CMDBUF_RUN, 0)) {
-        kprintf("iommu: unit at %lx does not stop its command buffer and event log\n", u->base);
+    if (!engines_off(u, true)) {
+        kprintf("iommu: unit at %lx does not stop its translation and queue engines\n", u->base);
         return false;
     }
     /* Control=0 does not reset this register. Firmware's Allow=1 would bypass every
@@ -552,7 +654,8 @@ static bool program(struct unit *u) {
         kprintf("iommu: unit at %lx retains its firmware exclusion bypass\n", u->base);
         return false;
     }
-    if (u->efr & EFR_PERF_OPT) {
+    /* 通常のfeature選択で実在bypassの解除を省かない。新tableの公開前に確認する。 */
+    if ((u->efr | u->state_efr) & EFR_PERF_OPT) {
         wr32(u, R_PERF_OPT, 0); /* the other bits are reserved (3.4.9) */
         if (rd32(u, R_PERF_OPT) & PERF_OPT_EN) {
             kprintf("iommu: unit at %lx retains its performance-optimization bypass\n", u->base);
@@ -605,8 +708,7 @@ static bool units_off(void) {
     bool ok = true;
     for (size_t i = 0; i < nunits; i++) {
         wr(&units[i], R_CONTROL, 0);
-        if ((rd(&units[i], R_CONTROL) & CTL_IOMMU_EN) ||
-            !status_wait(&units[i], ST_EVENTLOG_RUN | ST_CMDBUF_RUN, 0)) {
+        if (!engines_off(&units[i], true)) {
             kprintf("iommu: unit at %lx does not stop\n", units[i].base);
             ok = false;
         }
@@ -740,11 +842,17 @@ static struct iommu_hw amd = {
 static bool va_width_valid(unsigned bits) { return bits == 32 || bits == 40 || bits == 48 || bits == 64; }
 static bool pa_width_valid(unsigned bits) { return bits == 40 || bits == 48 || bits == 52; }
 
-const struct iommu_hw *iommu_amd_probe(void) {
-    if (!parse_ivrs()) return NULL;
+const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
+    *plain_safe = false;
+    const struct acpi_sdt *h = acpi_find("IVRS", 0);
+    if (!h) {
+        *plain_safe = true;
+        return NULL;
+    }
+    if (!parse_ivrs(h)) goto rejected;
     if (parse_lost) {
         kprintf("iommu: incomplete or malformed IVRS: AMD-Vi not used\n");
-        return NULL;
+        goto rejected;
     }
     amd.coherent = true;
     unsigned summary_va = (ivinfo >> 15) & 0x7F, summary_pa = (ivinfo >> 8) & 0x7F;
@@ -753,38 +861,49 @@ const struct iommu_hw *iommu_amd_probe(void) {
        architected width in that case, then require a defined width for EVERY unit.
        Without its PCI function a unit still needs both valid IVinfo widths below. */
     amd.iova_bits = va_width_valid(summary_va) ? summary_va : 64;
-    amd.phys_bits = pa_width_valid(summary_pa) ? summary_pa : 52;
-    amd.levels = 6; /* maximum host depth, EFR.HATS (3.4) */
+    amd.phys_bits = pa_width_valid(summary_pa) ? summary_pa : HOST_PHYS_BITS;
+    unsigned max_levels = HOST_MAX_LEVELS;
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
         if (u->hat_dis) {
             kprintf("iommu: unit at %lx cannot translate host addresses\n", u->base);
-            return NULL;
+            goto rejected;
         }
         if (!(u->regs = vmm_map_mmio(u->base, MMIO_BYTES))) {
             kprintf("iommu: the registers of the AMD-Vi unit at %lx cannot be mapped: AMD-Vi not used\n", u->base);
-            return NULL;
+            goto rejected;
         }
         /* without its function the capability header is unknown: assume the cautious answers */
         uint32_t header = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap)
                                 : CAP_NP_CACHE | (ivinfo & 1 ? CAP_EFR : 0);
-        if (u->type == 0x10) u->efr = header & CAP_EFR ? rd(u, R_EFR) : 0;
+        u->state_efr = ((header & CAP_EFR) || (ivinfo & 1)) ? rd(u, R_EFR) : 0;
+        if (u->type == 0x10) u->efr = header & CAP_EFR ? u->state_efr : 0;
+        u->state_efr |= u->efr;
         uint32_t info = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap + 0x10) : ivinfo;
         unsigned va = (info >> 15) & 0x7F, pa = (info >> 8) & 0x7F;
         /* Only these widths are defined by Capability+10h (3.2, pp203-204). No guessed
            width is safe: a high bit could be discarded or a table address truncated. */
         if (!va_width_valid(va) || !pa_width_valid(pa) || ((u->efr >> 10) & 3) == 3) {
             kprintf("iommu: unit at %lx reports reserved address widths\n", u->base);
-            return NULL;
+            goto rejected;
         }
         amd.iova_bits = MIN(amd.iova_bits, va);
         amd.phys_bits = MIN(amd.phys_bits, pa);
-        amd.levels = MIN(amd.levels, 4u + ((unsigned)(u->efr >> 10) & 3));
+        max_levels = MIN(max_levels, 4u + ((unsigned)(u->efr >> 10) & 3));
         np_cache |= (header & CAP_NP_CACHE) != 0;
         amd.coherent &= (u->flags & 32) != 0;
         kprintf("iommu: AMD-Vi unit at %lx (IVHD %02xh, function %02x:%02x.%u), extended features %lx\n", u->base,
                 u->type, u->fn ? u->fn->bus : 0, u->fn ? u->fn->dev : 0, u->fn ? u->fn->func : 0, u->efr);
     }
-    amd.iova_bits = MIN(amd.iova_bits, 12 + 9 * amd.levels);
+    amd.iova_bits = MIN(amd.iova_bits, HOST_PAGE_SHIFT + HOST_INDEX_BITS * max_levels);
+    /* HATS is a maximum, not a required depth. Domains currently use identity DMA;
+       iommu_dma_limit accepts only min(input, physical, PTE physical width). Retain
+       the real input capability, but do not walk levels that those mappings never use. */
+    unsigned bits = MIN(amd.iova_bits, MIN(amd.phys_bits, HOST_PHYS_BITS));
+    amd.levels = 1;
+    while (HOST_PAGE_SHIFT + HOST_INDEX_BITS * amd.levels < bits) amd.levels++;
     return &amd;
+rejected:
+    *plain_safe = ivrs_plain_safe(h);
+    return NULL;
 }

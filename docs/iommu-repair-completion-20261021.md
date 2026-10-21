@@ -15,4 +15,4 @@
 
 詳細と根拠：[修理・受入記録](iommu-repair-20261021.md)。
 
-J-space最終手続きは未通過。同期直後のview停止を同じinventoryで切り分け、作業対象外の`hyperv/Nocturne-data.vhdx`だけの変化を確認した。ユーザーのVM/データを停止・操作せず、controllerを改変・skipせずに保持する。製品依存hashの一致、実製品検査、担当報告の独立受入と、全repo fingerprintの未確定は分離する。
+J-space初回最終viewは、作業対象外の`hyperv/Nocturne-data.vhdx`だけの変化で停止した。その後の標準検査でinventory一致を確認したため、ユーザーのVM/データを操作せず最終読取りを行う。controllerの改変・skipは行わず、製品受入と手続きの結果を分離する。最終判定は`build/iommu-repair-20261021/ship-check.log`へ保存する。

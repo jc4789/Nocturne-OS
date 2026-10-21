@@ -90,17 +90,20 @@ static bool is_kernel_id(uint16_t id) {
    it is off (5.1.4), so such units are started with interrupt remapping alone. */
 void iommu_init(void) {
     const char *off = cmdline_has("noiommu") ? "off (noiommu)" : NULL; /* why DMA is not translated */
-    const struct iommu_hw *found = iommu_amd_probe();
-    if (!found) found = iommu_intel_probe();
+    bool amd_plain = false, intel_plain = false;
+    const struct iommu_hw *found = iommu_amd_probe(&amd_plain);
+    if (!found) found = iommu_intel_probe(&intel_plain);
     if (!found) {
-        /* A rejected description is not proof that firmware left the hardware stopped.
-           Preserve this uncertainty even when no backend can safely expose callbacks. */
-        bool declared = acpi_find("IVRS", 0) || acpi_find("DMAR", 0);
-        if (declared) restore_failed = true;
-        if (declared)
+        /* Parsing support and hardware state are separate. Rejecting an isolation table
+           must not disable plain interrupts when every unit is independently confirmed off.
+           Conversely, a malformed/unreadable description cannot establish that fact. */
+        if (!amd_plain || !intel_plain) restore_failed = true;
+        if (restore_failed)
             kprintf("iommu: firmware description unusable; hardware stop unconfirmed; app claims and new interrupt routes disabled\n");
         else kprintf("iommu: %s: app drivers require appdrivers-unisolated to run without isolation\n",
-                     off ? off : "none described (no IVRS or DMAR)");
+                     off ? off : acpi_find("IVRS", 0) || acpi_find("DMAR", 0)
+                         ? "not used (rejected tables, all units confirmed off)"
+                         : "none described (no IVRS or DMAR)");
         return;
     }
     if (!off && described_lost) off = "not used (the firmware's descriptions were not all kept)";
@@ -191,19 +194,14 @@ static bool range_fits(uint64_t base, size_t count, unsigned bits) {
 
 uint64_t iommu_alloc_pages(size_t count) {
     if (!count || count > SIZE_MAX / PAGE_SIZE) return 0;
-    uint64_t base = count == 1 ? pmm_alloc() : pmm_alloc_contig(count);
     unsigned bits = hw->phys_bits;
     /* Both back ends encode table addresses in bits 51:12. */
     if (bits > 52) bits = 52;
+    if (!bits) return 0;
+    uint64_t base = count == 1 ? pmm_alloc_below(1ull << bits) : pmm_alloc_contig(count);
     if (base && !range_fits(base, count, bits)) {
         for (size_t i = 0; i < count; i++) pmm_free(base + i * PAGE_SIZE);
-        /* Preserve the ordinary allocator's search hint on the hot one-page path. Only a
-           unit narrower than available RAM needs a search from the lowest free frame. */
-        base = count == 1 ? pmm_alloc_contig(1) : 0;
-        if (base && !range_fits(base, count, bits)) {
-            pmm_free(base);
-            base = 0;
-        }
+        base = 0;
     }
     if (base) memset(phys_to_virt(base), 0, count * PAGE_SIZE);
     return base;

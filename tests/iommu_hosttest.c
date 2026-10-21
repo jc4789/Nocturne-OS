@@ -13,6 +13,8 @@ static struct pmm_range *ram_ranges;
 static unsigned ram_count;
 static bool ram_complete = true;
 static bool firmware_declared;
+static bool probe_plain;
+static bool intel_probe_plain = true;
 static uint16_t pic_masks = UINT16_MAX;
 static bool pins_masked, route_ok = true, start_ok;
 static unsigned starts, stops, routes;
@@ -62,6 +64,11 @@ uint64_t pmm_alloc_contig(uint64_t n) {
     return 0;
 }
 uint64_t pmm_alloc(void) { return pmm_alloc_contig(1); }
+uint64_t pmm_alloc_below(uint64_t limit) {
+    for (size_t i = 0; i < ARRAY_SIZE(used) && (i + 2) * PAGE_SIZE <= limit; i++)
+        if (!used[i]) { used[i] = true; live_pages++; return (i + 1) * PAGE_SIZE; }
+    return 0;
+}
 unsigned pmm_ram_ranges(const struct pmm_range **out) { *out = ram_ranges; return ram_count; }
 bool pmm_ram_complete(void) { return ram_complete; }
 void pmm_free(uint64_t p) { CHECK(p && p / PAGE_SIZE <= ARRAY_SIZE(used) && used[p / PAGE_SIZE - 1]); used[p / PAGE_SIZE - 1] = false; live_pages--; frees++; }
@@ -74,8 +81,8 @@ uint16_t pci_find_ext_cap(const struct pci_device *d,uint16_t id) { (void)d;(voi
 uint16_t pci_read16(uint8_t b,uint8_t d,uint8_t f,uint16_t at) { (void)b;(void)d;(void)f;(void)at;return 0; }
 void pci_write16(uint8_t b,uint8_t d,uint8_t f,uint16_t at,uint16_t v) { (void)b;(void)d;(void)f;(void)at;(void)v; }
 static const struct iommu_hw *probe_backend;
-const struct iommu_hw *iommu_amd_probe(void) { return probe_backend; }
-const struct iommu_hw *iommu_intel_probe(void) { return NULL; }
+const struct iommu_hw *iommu_amd_probe(bool *plain_safe) { *plain_safe = !firmware_declared || probe_plain; return probe_backend; }
+const struct iommu_hw *iommu_intel_probe(bool *plain_safe) { *plain_safe = intel_probe_plain; return NULL; }
 const void *acpi_find(const char sig[4],unsigned index) { (void)sig;(void)index;return firmware_declared ? &firmware_declared : NULL; }
 uint16_t pic_mask_all(void) { uint16_t old = pic_masks; pic_masks = UINT16_MAX; return old; }
 void pic_restore_mask(uint16_t masks) { pic_masks = masks; }
@@ -204,6 +211,21 @@ static void test_policy_and_power(void) {
     probe_backend = NULL; firmware_declared = true;
     iommu_init();
     CHECK(!iommu_power_ready() && !iommu_shutdown()); /* probe NULLでも既知hardwareを無かったことにしない */
+    restore_failed = false; probe_plain = true;
+    iommu_init();
+    CHECK(iommu_power_ready() && !hw); /* 表の拒否と全unit停止の独立確認を区別 */
+    address=0x12345678; data=0xABCDEF01; rte=0x123456789ABCDEF0ull;
+    CHECK(iommu_msi_message(&device,0,1,0x50,0,&address,&data) && data == 0x50);
+    CHECK(iommu_ioapic_entry(0,0,&rte) && rte == 0x123456789ABCDEF0ull);
+    CHECK(iommu_msi_clear(&device));
+    intel_probe_plain = false;
+    iommu_init();
+    CHECK(!iommu_power_ready()); /* 一方がoffでも他方のunknown/IRREQを迂回しない */
+    address=0x12345678; data=0xABCDEF01;
+    CHECK(!iommu_msi_message(&device,0,1,0x50,0,&address,&data));
+    CHECK(address == 0x12345678 && data == 0xABCDEF01);
+    intel_probe_plain = true;
+    probe_plain = false;
     firmware_declared = false; restore_failed = false;
     iommu_init();
     CHECK(iommu_power_ready() && iommu_shutdown()); /* 本当にIOMMU不在ならPMを不必要に止めない */

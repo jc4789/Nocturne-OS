@@ -8,6 +8,7 @@
 #include <string.h>
 #include <threads.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include "nocturne.h"
 
 static int failed;
@@ -407,9 +408,104 @@ static void reset_cases(const struct n_pciinfo *list, int n) {
     n_handle_close(pci);
 }
 
+/* 任意サイズの非連続DMA確保を実native経路で観測する診断。時間の合否閾値や
+   GPU性能の主張は設けない。通常のpcitestの操作・受入条件とは独立している。 */
+static int dma_allocation_case(const char *text) {
+    const size_t page = 4096; /* Nocturne x86-64のページ粒度 */
+    size_t bytes = 0;
+    bool valid = *text != 0;
+    for (const char *p = text; valid && *p; p++) {
+        if (*p < '0' || *p > '9') { valid = false; break; }
+        unsigned digit = (unsigned)(*p - '0');
+        if (bytes > (SIZE_MAX - digit) / 10) { valid = false; break; }
+        bytes = bytes * 10 + digit;
+    }
+    CHECK(valid && bytes && bytes <= SIZE_MAX - (page - 1),
+          "dma=<10進バイト数>が不正: %s", n_result_text(-N_ERR_INVALID));
+    if (!valid || !bytes || bytes > SIZE_MAX - (page - 1)) return 1;
+    size_t rounded = (bytes + page - 1) & ~(page - 1), pages = rounded / page;
+    struct n_pciinfo edu = {0};
+    bool found = false;
+    /* pcilistは書き込んだ件数を返す。固定一覧上限を足さず、実一覧に合わせて拡張する。 */
+    for (int capacity = 1; !found;) {
+        if ((size_t)capacity > SIZE_MAX / sizeof(struct n_pciinfo)) {
+            CHECK(0, "PCI一覧サイズ: %s", n_result_text(-N_ERR_TOO_LARGE)); return 1;
+        }
+        struct n_pciinfo *list = malloc((size_t)capacity * sizeof *list);
+        if (!list) { CHECK(0, "PCI一覧確保: %s", n_result_text(-N_ERR_NO_MEMORY)); return 1; }
+        n_result n = pcilist(list, capacity);
+        for (n_result i = 0; i < n && i < capacity; i++)
+            if (list[i].vendor == 0x1234 && list[i].device == 0x11e8) { edu = list[i]; found = true; break; }
+        free(list);
+        if (found) break;
+        if (n < 0 || n < capacity) {
+            CHECK(0, "EDU一覧取得: %s", n_result_text(n < 0 ? n : -N_ERR_NOT_FOUND)); return 1;
+        }
+        if (capacity > INT_MAX / 2) {
+            CHECK(0, "PCI一覧のnative int範囲: %s", n_result_text(-N_ERR_TOO_LARGE)); return 1;
+        }
+        capacity *= 2;
+    }
+    n_handle pci = n_pci_claim(edu.bus, edu.dev, edu.func), mem = -1, views[2] = {-1, -1};
+    void *maps[2] = {NULL, NULL};
+    uint64_t *addresses = NULL;
+    CHECK(pci >= 0, "DMA診断のEDU claim: %s", n_result_text(pci));
+    if (pci < 0) return 1;
+    struct n_pci_function info = {0};
+    n_result result = n_pci_info(pci, &info);
+    CHECK(result == 0 && (info.flags & N_PCI_ISOLATED), "DMA診断には隔離済みEDUが必要: %s flags=%x",
+          n_result_text(result), info.flags);
+    if (result < 0 || !(info.flags & N_PCI_ISOLATED)) goto done;
+    uint64_t began = uptime_ms();
+    mem = n_dma_create(pci, bytes, 0); /* CONTIGUOUS/32BITのどちらも指定しない。 */
+    uint64_t elapsed = uptime_ms() - began;
+    printf("pcitest dma: 要求=%llu 丸め=%llu ページ=%llu flags=0 確保=%llums 結果=%s\n",
+           (unsigned long long)bytes, (unsigned long long)rounded, (unsigned long long)pages,
+           (unsigned long long)elapsed, n_result_text(mem < 0 ? mem : 0));
+    CHECK(mem >= 0, "非連続DMA確保: %s", n_result_text(mem));
+    if (mem < 0) goto done;
+    if (pages > SIZE_MAX / sizeof *addresses || !(addresses = malloc(pages * sizeof *addresses))) {
+        CHECK(0, "DMAアドレス一覧確保: %s", n_result_text(-N_ERR_NO_MEMORY)); goto done;
+    }
+    result = n_dma_addresses(mem, 0, addresses, pages);
+    CHECK(result == (n_result)pages, "全DMAアドレスの件数: %lld / %llu", (long long)result,
+          (unsigned long long)pages);
+    if (result != (n_result)pages) goto done;
+    bool aligned = true;
+    for (size_t i = 0; i < pages; i++)
+        if (!addresses[i] || (addresses[i] & (page - 1))) { aligned = false; break; }
+    CHECK(aligned, "全DMAページの非zero・ページ整列");
+    uint64_t past;
+    CHECK(n_dma_addresses(mem, pages, &past, 1) == -N_ERR_INVALID, "DMA一覧の終端を確認");
+    printf("pcitest dma: 全ページ=%llu 先頭=%llx 末尾=%llx\n", (unsigned long long)pages,
+           (unsigned long long)addresses[0], (unsigned long long)addresses[pages - 1]);
+    for (unsigned i = 0; i < 2; i++) {
+        views[i] = n_shared_view(mem, i ? rounded - page : 0, page, N_CACHE_DEFAULT);
+        result = views[i] < 0 ? views[i] : n_shared_map(views[i], page, N_MEMORY_READ_WRITE, &maps[i]);
+        CHECK(result == 0 && maps[i], "DMA先頭/末尾ページの写像%u: %s", i, n_result_text(result));
+    }
+    if (maps[0] && maps[1]) {
+        volatile uint8_t *first = maps[0], *last = maps[1];
+        CHECK(first[0] == 0 && last[page - 1] == 0, "DMA先頭/末尾はzero初期化済み");
+        first[0] = 0x5A; last[page - 1] = 0xA5;
+        CHECK(first[0] == 0x5A && last[page - 1] == 0xA5, "DMA先頭/末尾へCPU読書き");
+    }
+done:
+    for (unsigned i = 0; i < 2; i++) {
+        if (maps[i]) CHECK(n_memory_release(maps[i], page) == 0, "DMA診断写像%uの解放", i);
+        if (views[i] >= 0) CHECK(n_handle_close(views[i]) == 0, "DMA診断view%uの解放", i);
+    }
+    free(addresses);
+    if (mem >= 0) CHECK(n_handle_close(mem) == 0, "DMA診断objectの解放");
+    CHECK(n_handle_close(pci) == 0, "DMA診断claimの解放");
+    printf("pcitest dma: %d件失敗（実GPU性能は未検証）\n", failed);
+    return failed != 0;
+}
+
 int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"revoked-reader"))return revoked_reader();
     if(argc>1 && !strcmp(argv[1],"stuck-holder"))return stuck_holder();
+    if(argc>1 && !strncmp(argv[1],"dma=",4))return dma_allocation_case(argv[1]+4);
     if(argc>1 && !strcmp(argv[1],"flr")){
         struct n_pciinfo list[128];
         reset_cases(list, pcilist(list, 128));

@@ -4,6 +4,9 @@
 struct limine_memmap_response;
 void pmm_init(struct limine_memmap_response *mm);
 uint64_t pmm_alloc(void);
+/* One frame whose entire page is below the exclusive byte limit. Uses the ordinary
+   allocation hint within that range, including for repeated restricted DMA allocations. */
+uint64_t pmm_alloc_below(uint64_t limit);
 uint64_t pmm_alloc_zeroed(void);
 uint64_t pmm_alloc_contig(uint64_t count);
 void pmm_free(uint64_t phys);

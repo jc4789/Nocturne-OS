@@ -67,4 +67,4 @@ firmware/SMMとのsole-producer契約、probe前のfirmware queueメモリー寿
 
 最終repo sync後のroot viewは`Repository changed`で停止した。controllerと同じinventory比較で原因を一度調べたところ、差分は作業対象外の`hyperv/Nocturne-data.vhdx`だけで、branch変更はなかった。製品/試験/報告の依存hashは別に照合して一致した。
 
-ユーザーのHyper-Vを停止したり、そのデータを移動・書換えしたりしてfingerprintを固定していない。標準controllerに任意除外のCLIもなかったため、内部関数の差替えや検査のskipで合格を作っていない。最終全員viewとship手続きは未通過として扱う。これは製品検査の失敗でもJ-spaceの合格でもなく、対象外データの変動で手続きが完了できない境界である。同じ失敗を反復せず、外部媒体が静止した時点の最終読取りを残件とする。
+ユーザーのHyper-Vを停止したり、そのデータを移動・書換えしたりしてfingerprintを固定していない。標準controllerの内部関数差替えや検査skipも行っていない。後続の標準ship検査ではinventoryが一致し、失敗理由がrootの最終view receipt不足へ変わった。この静止区間に正規の最終読取りだけを行う。初回の停止は製品検査の失敗やJ-spaceの合格へ読み替えず、最終ツール判定は`build/iommu-repair-20261021/ship-check.log`へ保存する。

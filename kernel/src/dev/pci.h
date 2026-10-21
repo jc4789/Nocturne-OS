@@ -29,10 +29,15 @@ void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t 
 uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off);
 void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t v);
 void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v);
+#define PCI_COMMAND        0x04 /* Command register (7.5.1.1.3), narrow writes preserve Status */
 #define PCI_COMMAND_MASTER (1u << 2) /* Command.Bus Master Enable (7.5.1.1.3) */
+#define PCI_CONFIG_RRS_ID  0xFFFF0001u /* Vendor/Device ID read with RRS Software Visibility (2.3.1) */
 struct pci_device *pci_find(uint16_t vendor, uint16_t device);
 struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls);
 void pci_enable_busmaster(struct pci_device *d);
+/* Clear BME and confirm the same function still answers with BME off. Optionally report its
+   previous BME state. This stops new Memory/I/O Requests, not a posted DMA drain. No wait. */
+bool pci_disable_busmaster(struct pci_device *d, bool *was_mastering);
 int pci_count(void);
 struct pci_device *pci_at(int index);
 struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func);
@@ -80,11 +85,20 @@ bool pci_msi_disable(struct pci_device *d);
 #define PCIE_DEVCAP  0x04
 #define PCIE_DEVCTL  0x08
 #define PCIE_DEVSTA  0x0A
+#define PCIE_LNKCTL  0x10
+#define PCIE_ROOTCTL 0x1C
+#define PCIE_ROOTCAP 0x1E
 #define PCIE_DEVCTL2 0x28
+#define PCIE_LNKCTL2 0x30
 #define PCIE_DEVCAP_FLR         (1u << 28) /* Function Level Reset Capability */
 #define PCIE_DEVCTL_FLR         (1u << 15) /* Initiate Function Level Reset */
 #define PCIE_DEVSTA_PENDING     (1u << 5)  /* Transactions Pending */
 #define PCIE_DEVCTL2_CT_DISABLE (1u << 4)  /* Completion Timeout Disable */
+#define PCIE_LNKCTL_DISABLE      (1u << 4)  /* Link Disable (7.5.3.7) */
+#define PCIE_LNKCTL2_COMPLIANCE  (1u << 4)  /* Enter Compliance (7.5.3.19) */
+#define PCIE_LNKCTL2_MOD_COMPLIANCE (1u << 10) /* Enter Modified Compliance (7.5.3.19) */
+#define PCIE_ROOTCTL_RRS_VISIBLE (1u << 4) /* Configuration RRS Software Visibility Enable (7.5.3.12) */
+#define PCIE_ROOTCAP_RRS_VISIBLE (1u << 0) /* Configuration RRS Software Visibility (7.5.3.13) */
 /* After bus mastering is off a function starts no memory/I/O request, but some may still be in
    flight. Transactions Pending reports outstanding non-posted PCIe requests only. A host read
    flushes TC0 writes under the ordering rules; other TCs and relaxed/ID ordering require the
@@ -101,9 +115,15 @@ bool pci_requests_done(const struct pci_device *d, unsigned ms);
    mastering afterwards, or is not configuration-ready yet. A pending reset keeps its saved
    configuration for a later call; cancellation must not discard or recapture that state.
    This resets device state, not an IOMMU drain
-   confirmation: its success alone must not release quarantined DMA pages. May sleep: up to its
-   Completion Timeout when requests were pending, or the FLR/readiness time the function reports.
-   Pending requests with no known Completion Timeout require device/platform recovery instead. */
+   confirmation: its success alone must not release quarantined DMA pages. May sleep, with
+   cancellation during scheduler waits: FLR/RTR, or while software-visible RRS reports
+   initialization. A supporting upstream Root Port is enabled and rechecked, but an unsupported
+   platform/RCRB or a rejected enable may still retry inside a synchronous configuration read;
+   cancellation of such hardware retries is not guaranteed here.
+   BME must be confirmed off and pre-FLR Transactions Pending must actually clear for every
+   Completion Timeout value: a previous driver may have re-enabled timeout without starting
+   timers for existing requests. No invented delay substitutes for that observation or
+   device/platform-specific quiescence. */
 bool pci_function_reset(struct pci_device *d);
 /* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (BSP,
    before the drivers resume). pci_suspend allocates and so runs with interrupts on; it returns

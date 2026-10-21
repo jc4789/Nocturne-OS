@@ -25,6 +25,12 @@ static unsigned checks, failed;
 
 /* バッファの寸法は製品側で定義されたMMIO窓・DeviceID・MSI-Xフィールドに対応する。 */
 static uint64_t registers[MMIO_BYTES / sizeof(uint64_t)];
+static uint64_t second_registers[MMIO_BYTES / sizeof(uint64_t)];
+static const uint64_t first_base = 0xFED90000;
+static bool plain_safe;
+static uint64_t map_failed_base;
+static unsigned register_writes, virtual_status_reads;
+static uint64_t control_readonly;
 static bool control_locked, exclusion_locked, perf_locked;
 static volatile uint8_t *locked_control_regs;
 static unsigned freed_pages;
@@ -48,10 +54,13 @@ static bool defer_completion, deliver_late_completion;
 static uint64_t pending_address, pending_data, late_address, late_data;
 
 static uint64_t rd(const struct unit *u, unsigned off) {
-    return ((const uint64_t *)u->regs)[off / sizeof(uint64_t)];
+    if (off == 0x190) virtual_status_reads++;
+    uint64_t value = ((const uint64_t *)u->regs)[off / sizeof(uint64_t)];
+    return value | (off == R_CONTROL ? control_readonly : 0);
 }
 
 static void wr(const struct unit *u, unsigned off, uint64_t value) {
+    register_writes++;
     uint64_t *r = (uint64_t *)u->regs;
     uint64_t old = r[off / sizeof(uint64_t)];
     if (off == R_CONTROL) {
@@ -109,6 +118,7 @@ static uint32_t rd32(const struct unit *u, unsigned off) {
 }
 
 static void wr32(const struct unit *u, unsigned off, uint32_t value) {
+    register_writes++;
     CHECK(off == R_PERF_OPT);
     perf_writes++;
     if (!perf_locked) *(uint32_t *)(u->regs + off) = value;
@@ -138,7 +148,11 @@ uint32_t pci_read32(uint8_t b, uint8_t d, uint8_t f, uint16_t off) {
         return second_cap_info;
     return cap_info;
 }
-void *vmm_map_mmio(uint64_t base, uint64_t bytes) { (void)base; CHECK(bytes == MMIO_BYTES); return registers; }
+void *vmm_map_mmio(uint64_t base, uint64_t bytes) {
+    CHECK(bytes == MMIO_BYTES);
+    if (base == map_failed_base) return NULL;
+    return base == first_base + MMIO_BYTES ? second_registers : registers;
+}
 void iommu_cover(uint16_t first, uint16_t last) { for (uint32_t i = first; i <= last; i++) covered_ids[i] = true; }
 void iommu_kernel_id(uint16_t id) { platform_ids[id] = true; }
 void iommu_reserved(uint16_t first, uint16_t last, uint64_t start, uint64_t end, unsigned access) {
@@ -183,6 +197,9 @@ static void reset(void) {
     free(units); free(aliases);
     units = NULL; nunits = units_room = 0; aliases = NULL; naliases = aliases_room = 0;
     memset(registers, 0, sizeof registers); memset(covered_ids, 0, sizeof covered_ids);
+    memset(second_registers, 0, sizeof second_registers);
+    plain_safe = true; map_failed_base = 0; register_writes = virtual_status_reads = 0;
+    control_readonly = 0;
     memset(platform_ids, 0, sizeof platform_ids);
     parse_lost = np_cache = false; control_locked = exclusion_locked = perf_locked = false;
     locked_control_regs = NULL; freed_pages = 0;
@@ -229,6 +246,28 @@ static void test_handoff(void) {
     reset(); u = (struct unit){.regs = (void *)registers};
     registers[R_CONTROL / 8] = CTL_IOMMU_EN; control_locked = true;
     CHECK(!program(&u) && table_writes == 0);
+}
+
+static void test_optional_stop(void) {
+    const struct { uint64_t feature; unsigned off; uint64_t running; } cases[] = {
+        {EFR_PPR, R_STATUS, ST_PPRLOG_RUN}, {EFR_GA, R_STATUS, ST_GALOG_RUN},
+        {EFR_VIOMMU, R_VSTATUS, VST_IOMMU_RUN}, {EFR_VIOMMU, R_VSTATUS, VST_CMDBUF_RUN}
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        reset();
+        units = calloc(1, sizeof *units); nunits = units_room = 1;
+        units[0].regs = (void *)registers; units[0].efr = cases[i].feature;
+        registers[cases[i].off / 8] = cases[i].running;
+        CHECK(!program(&units[0]) && !table_writes);
+        CHECK(!amd_shutdown());
+    }
+    reset();
+    struct unit u = {.regs = (void *)registers};
+    /* 未対応機能のreserved bitはread-as-zeroの保証でない。停止判定へ混ぜない。 */
+    control_readonly = CTL_VIOMMU_EN | (1ull << 49);
+    registers[R_STATUS / 8] = ST_PPRLOG_RUN | ST_GALOG_RUN;
+    registers[R_VSTATUS / 8] = VST_IOMMU_RUN | VST_CMDBUF_RUN;
+    CHECK(program(&u) && !virtual_status_reads);
 }
 
 static void test_event_restart(void) {
@@ -285,15 +324,15 @@ static void test_ivrs(void) {
     put64(hd + 8, 0xFED90000); put64(hd + 24, 1ull << 10 | EFR_PERF_OPT);
     hd[40] = 2; put16(hd + 41, 0x110); firmware = h;
     cap_info = 64u << 15 | 52u << 8;
-    const struct iommu_hw *hw = iommu_amd_probe();
+    const struct iommu_hw *hw = iommu_amd_probe(&plain_safe);
     CHECK(hw == &amd && amd.levels == 5 && amd.iova_bits == 57 && amd.phys_bits == 52);
     CHECK(units[0].efr & EFR_PERF_OPT); /* IVHD11 EFRがMMIOより優先 */
     reset(); h->length = 48 + 24; put16(hd + 2, 24); firmware = h;
-    CHECK(!iommu_amd_probe() && parse_lost); /* short IVHD11を24byte IVHD10扱いしない */
+    CHECK(!iommu_amd_probe(&plain_safe) && parse_lost); /* short IVHD11を24byte IVHD10扱いしない */
     reset(); h->length = sizeof table; put16(hd + 2, 44); hd[20] = 1; firmware = h;
-    CHECK(!iommu_amd_probe()); /* HATDis */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* HATDis */
     reset(); hd[20] = 0; firmware = h; cap_info = 1u << 15 | 48u << 8;
-    CHECK(!iommu_amd_probe()); /* reserved VAsize */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* reserved VAsize */
 
     /* IVHD10/EFRなしは有効なlegacy記述。値はTables86/89とCapability+10hに従う。
        QEMUが実際にこの内容を公開することまでは、この入力では証明しない。 */
@@ -302,12 +341,12 @@ static void test_ivrs(void) {
     h->length = sizeof legacy; h->revision = 1; put32(legacy + 36, 48u << 15 | 48u << 8);
     hd = legacy + 48; hd[0] = 0x10; hd[1] = 32; put16(hd + 2, 28); put16(hd + 6, 0x40);
     put64(hd + 8, 0xFED90000); hd[24] = 1; cap_header = 0; firmware = h;
-    CHECK(iommu_amd_probe() == &amd && amd.levels == 4 && amd.iova_bits == 48 && amd.phys_bits == 48);
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.levels == 4 && amd.iova_bits == 48 && amd.phys_bits == 48);
     CHECK(!units[0].efr && !parse_lost && covered_ids[0x110]);
     reset(); firmware = h; cap_header = 0; cap_info = 40u << 15 | 40u << 8;
-    CHECK(iommu_amd_probe() == &amd && amd.iova_bits == 40 && amd.phys_bits == 40); /* 共通幅との最小値 */
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.iova_bits == 40 && amd.phys_bits == 40); /* 共通幅との最小値 */
     reset(); firmware = h; cap_header = 0; cap_info = 48u << 15 | 41u << 8;
-    CHECK(!iommu_amd_probe()); /* 実装未定義の幅を推測して受理しない */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* 実装未定義の幅を推測して受理しない */
 }
 
 static void test_probe_widths(void) {
@@ -321,29 +360,29 @@ static void test_probe_widths(void) {
     put64(hd + 8, 0xFED90000); hd[24] = 1;
 
     reset(); firmware = h; put32(table + 36, 1 | 40u << 8); cap_info = 48u << 15 | 40u << 8;
-    CHECK(iommu_amd_probe() == &amd && amd.iova_bits == 48 && amd.phys_bits == 40); /* 要約VA欠損 */
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.iova_bits == 48 && amd.phys_bits == 40); /* 要約VA欠損 */
     reset(); firmware = h; put32(table + 36, 0);
-    CHECK(iommu_amd_probe() == &amd && amd.iova_bits == 48 && amd.phys_bits == 48); /* 両要約欠損 */
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.iova_bits == 48 && amd.phys_bits == 48); /* 両要約欠損 */
     reset(); firmware = h; put32(table + 36, 1u << 15 | 40u << 8);
-    CHECK(iommu_amd_probe() == &amd && amd.iova_bits == 48 && amd.phys_bits == 40); /* 予約VAは上限にしない */
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.iova_bits == 48 && amd.phys_bits == 40); /* 予約VAは上限にしない */
     reset(); firmware = h; put32(table + 36, 40u << 15 | 41u << 8);
-    CHECK(iommu_amd_probe() == &amd && amd.iova_bits == 40 && amd.phys_bits == 48); /* 有効VAだけ上限 */
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.iova_bits == 40 && amd.phys_bits == 48); /* 有効VAだけ上限 */
     reset(); firmware = h; put32(table + 36, 32u << 15 | 40u << 8); cap_info = 64u << 15 | 52u << 8;
-    CHECK(iommu_amd_probe() == &amd && amd.iova_bits == 32 && amd.phys_bits == 40); /* 有効要約の縮小維持 */
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.iova_bits == 32 && amd.phys_bits == 40); /* 有効要約の縮小維持 */
     reset(); firmware = h; put32(table + 36, 64u << 15 | 52u << 8); cap_info = 32u << 15 | 40u << 8;
-    CHECK(iommu_amd_probe() == &amd && amd.iova_bits == 32 && amd.phys_bits == 40); /* 実値の縮小維持 */
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.iova_bits == 32 && amd.phys_bits == 40); /* 実値の縮小維持 */
     reset(); firmware = h; put32(table + 36, 48u << 15 | 48u << 8); cap_info = 48u << 8;
-    CHECK(!iommu_amd_probe()); /* 実VA0は有効要約で補わない */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* 実VA0は有効要約で補わない */
     reset(); firmware = h; cap_info = 48u << 15;
-    CHECK(!iommu_amd_probe()); /* 実PA0も拒否 */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* 実PA0も拒否 */
     reset(); firmware = h; cap_info = 48u << 15 | 41u << 8;
-    CHECK(!iommu_amd_probe()); /* 実reserved PAも拒否 */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* 実reserved PAも拒否 */
     reset(); firmware = h; function.bus = 1; put32(table + 36, 40u << 8);
-    CHECK(!iommu_amd_probe()); /* 実capabilityなし・要約VA0を推測で補わない */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* 実capabilityなし・要約VA0を推測で補わない */
     reset(); firmware = h; function.bus = 1; put32(table + 36, 48u << 15);
-    CHECK(!iommu_amd_probe()); /* 実capabilityなし・要約PA0も拒否 */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* 実capabilityなし・要約PA0も拒否 */
     reset(); firmware = h; function.bus = 1; put32(table + 36, 40u << 15 | 40u << 8);
-    CHECK(iommu_amd_probe() == &amd && amd.iova_bits == 40 && amd.phys_bits == 40); /* 有効要約fallback維持 */
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && amd.iova_bits == 40 && amd.phys_bits == 40); /* 有効要約fallback維持 */
 
     h->length = sizeof table;
     uint8_t *second_hd = hd + 24 + 4;
@@ -351,12 +390,191 @@ static void test_probe_widths(void) {
     put64(second_hd + 8, 0xFED90000 + MMIO_BYTES);
     reset(); firmware = h; second_function_present = true; put32(table + 36, 0);
     cap_info = 64u << 15 | 52u << 8; second_cap_info = 40u << 15 | 40u << 8;
-    CHECK(iommu_amd_probe() == &amd && nunits == 2 && amd.iova_bits == 40 && amd.phys_bits == 40);
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && nunits == 2 && amd.iova_bits == 40 && amd.phys_bits == 40);
     CHECK(units[0].fn == &function && units[1].fn == &second_function); /* 全実unitの最小値 */
     reset(); firmware = h; second_function_present = true; second_cap_info = 1u << 15 | 40u << 8;
-    CHECK(!iommu_amd_probe()); /* 後続unitの実reserved VAを見落とさない */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* 後続unitの実reserved VAを見落とさない */
     reset(); firmware = h;
-    CHECK(!iommu_amd_probe()); /* 第一unitだけ実値があっても欠損要約では足りない */
+    CHECK(!iommu_amd_probe(&plain_safe)); /* 第一unitだけ実値があっても欠損要約では足りない */
+}
+
+static void check_rejected_state(bool safe) {
+    CHECK(!iommu_amd_probe(&plain_safe));
+    CHECK(plain_safe == safe);
+    CHECK(!register_writes); /* 拒否を理由にfirmwareのengineやqueueを書き換えない */
+}
+
+static void test_probe_rejection_state(void) {
+    /* 二つの44-byte IVHD11、33-byte不正IVMDと3-byte端数を個別に試す領域。 */
+    uint8_t table[48 + (40 + 4) * 2 + 33 + 3] = {0};
+    struct acpi_sdt *h = (void *)table;
+    uint8_t *hd = table + 48, *next = hd + 44;
+    h->length = 48 + 44; h->revision = 2;
+    put32(table + 36, 1 | 48u << 15 | 48u << 8);
+    hd[0] = 0x11; put16(hd + 2, 44); put16(hd + 6, 0x40);
+    put64(hd + 8, first_base);
+    put64(hd + 24, (1ull << 55) | (1ull << 7) | (1ull << 1)); /* vIOMMU/GA/PPR */
+    hd[40] = 1;
+    reset();
+    CHECK(!iommu_amd_probe(&plain_safe) && plain_safe && !register_writes); /* IVRSなし */
+    reset(); firmware = h; cap_info = 48u << 15 | 41u << 8;
+    registers[R_CONTROL / 8] = 1ull << 10; /* Coherentはengineのenableではない */
+    check_rejected_state(true);
+    CHECK(virtual_status_reads != 0);
+    const uint64_t enabled[] = {
+        CTL_IOMMU_EN, CTL_CMDBUF_EN, CTL_EVENTLOG_EN, CTL_EVENTINT_EN,
+        1ull << 4, /* ComWaitIntEn */
+        1ull << 13, 1ull << 14, 1ull << 15, /* PPRLogEn/PprIntEn/PPREn */
+        1ull << 17, 1ull << 28, 1ull << 29, /* GAEn/GALogEn/GAIntEn */
+        1ull << 52, 1ull << 53 /* vCmdEn/vIommuEn */
+    };
+    for (size_t i = 0; i < sizeof enabled / sizeof *enabled; i++) {
+        reset(); firmware = h; cap_info = 48u << 15 | 41u << 8;
+        registers[R_CONTROL / 8] = enabled[i];
+        check_rejected_state(false);
+        CHECK(registers[R_CONTROL / 8] == enabled[i]);
+    }
+    const uint64_t running[] = {ST_CMDBUF_RUN, ST_EVENTLOG_RUN, 1ull << 7, 1ull << 8}; /* PPRLogRun/GALogRun */
+    for (size_t i = 0; i < sizeof running / sizeof *running; i++) {
+        reset(); firmware = h; cap_info = 48u << 15 | 41u << 8;
+        registers[R_STATUS / 8] = running[i];
+        check_rejected_state(false);
+    }
+    for (unsigned bit = 0; bit < 2; bit++) { /* vIOMMU StatusのvIommuRun/vCmdRun */
+        reset(); firmware = h; cap_info = 48u << 15 | 41u << 8;
+        registers[0x190 / 8] = 1ull << bit;
+        check_rejected_state(false);
+    }
+    reset(); firmware = h; put16(hd + 6, 0x3C); check_rejected_state(true); /* cap範囲外 */
+    put16(hd + 6, 0x40);
+    reset(); firmware = h; hd[20] = 1; check_rejected_state(true); /* HATDis */
+    hd[20] = 0;
+    reset(); firmware = h; hd[40] = 0x80; check_rejected_state(true); /* entry長不明 */
+    reset(); firmware = h; hd[40] = 3; check_rejected_state(true); /* range終端欠損 */
+    hd[40] = 1;
+    reset(); firmware = h; h->length = 48 + 43; put16(hd + 2, 43);
+    check_rejected_state(true); /* IVHD内部端数でも次IVDB位置は明確 */
+    h->length = 48 + 44; put16(hd + 2, 44);
+    reset(); firmware = h; put16(hd + 16, 1); check_rejected_state(true); /* 全unit非zero segment */
+    registers[R_CONTROL / 8] = CTL_IOMMU_EN; check_rejected_state(false);
+    put16(hd + 16, 0);
+    reset(); firmware = h; next[0] = 0x20; put16(next + 2, 33); h->length = 48 + 44 + 33;
+    check_rejected_state(true); /* IVMD長違反とunit列挙は別 */
+    reset(); firmware = h; put16(next + 2, 32); h->length = 48 + 44 + 32;
+    put64(next + 16, UINT64_MAX - 1); put64(next + 24, 8);
+    check_rejected_state(true); /* IVMD加算overflow */
+    memcpy(next, hd, 44); put16(next + 4, 1); put64(next + 8, first_base + MMIO_BYTES);
+    reset(); firmware = h; h->length = 48 + 44 * 2; cap_info = 48u << 15 | 41u << 8;
+    check_rejected_state(true);
+    second_registers[R_CONTROL / 8] = CTL_IOMMU_EN; check_rejected_state(false);
+    reset(); firmware = h; cap_info = 48u << 15 | 41u << 8; map_failed_base = first_base + MMIO_BYTES;
+    check_rejected_state(false);
+    put16(next + 16, 1); /* 未対応segmentの後続unitも状態監査の対象 */
+    reset(); firmware = h; cap_info = 48u << 15 | 41u << 8;
+    second_registers[R_CONTROL / 8] = CTL_IOMMU_EN; check_rejected_state(false);
+    reset(); firmware = h; h->length = 48 + 44; map_failed_base = first_base;
+    check_rejected_state(false);
+    reset(); firmware = h; h->length = 48 + 44 + 3; check_rejected_state(false); /* 外周端数 */
+    reset(); firmware = h; h->length = 48 + 44; put16(hd + 2, 0); check_rejected_state(false);
+    reset(); firmware = h; h->length = 48 + 24; put16(hd + 2, 24); check_rejected_state(false); /* header欠損 */
+    reset(); firmware = h; h->length = 48 + 44; put16(hd + 2, 44); put64(hd + 8, 0); check_rejected_state(false);
+    reset(); firmware = h; put64(hd + 8, first_base + 1); check_rejected_state(false); /* MMIO alignment */
+    put64(hd + 8, first_base);
+    reset(); firmware = h; hd[0] = 0x90; check_rejected_state(false); /* 未知IVDB */
+    reset(); firmware = h; h->revision = 3; check_rejected_state(false); /* 未定義format */
+    reset(); firmware = h; h->revision = 2; h->length = 48; check_rejected_state(false); /* unitなし */
+    reset(); firmware = h; h->length = 47; check_rejected_state(false); /* IVRS header欠損 */
+    reset(); firmware = h; hd[0] = 0x10; hd[24] = 0x80; put16(hd + 2, 28); h->length = 48 + 28;
+    put32(table + 36, 48u << 15 | 48u << 8); cap_header = 0;
+    check_rejected_state(true);
+    CHECK(!virtual_status_reads); /* EFRなしのreserved仮想statusを読まない */
+}
+
+static void test_probe_depth(void) {
+    uint8_t table[48 + 40 + 4] = {0};
+    struct acpi_sdt *h = (void *)table;
+    uint8_t *hd = table + 48;
+    h->length = sizeof table; h->revision = 2;
+    put32(table + 36, 1 | 64u << 15 | 52u << 8);
+    hd[0] = 0x11; put16(hd + 2, 44); put16(hd + 6, 0x40); put64(hd + 8, first_base); hd[40] = 1;
+    const struct { unsigned va, pa, hats, levels, iova; } cases[] = {
+        {32, 40, 0, 3, 32}, {40, 40, 2, 4, 40}, {48, 48, 1, 4, 48},
+        {64, 52, 2, 5, 64}, {64, 52, 0, 4, 48}, {64, 52, 1, 5, 57}, {64, 40, 2, 4, 64}
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        reset(); firmware = h; cap_info = cases[i].va << 15 | cases[i].pa << 8;
+        put64(hd + 24, (uint64_t)cases[i].hats << 10);
+        CHECK(iommu_amd_probe(&plain_safe) == &amd);
+        CHECK(amd.levels == cases[i].levels && amd.iova_bits == cases[i].iova);
+        unsigned bits = MIN(amd.iova_bits, amd.phys_bits);
+        CHECK(12 + 9 * amd.levels >= bits && 12 + 9 * (amd.levels - 1) < bits);
+    }
+    reset(); firmware = h; put64(hd + 24, 3ull << 10);
+    check_rejected_state(true); /* reserved HATSの拒否を緩めない */
+    reset(); firmware = h; put64(hd + 24, 0);
+    registers[R_EFR / 8] = EFR_VIOMMU;
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && !units[0].efr && (units[0].state_efr & EFR_VIOMMU));
+    registers[R_VSTATUS / 8] = VST_CMDBUF_RUN;
+    CHECK(!program(&units[0]) && !table_writes); /* firmware imageが実engineの停止確認を隠さない */
+}
+
+static void test_bypass_handoff(void) {
+    uint8_t table[48 + 40 + 4] = {0};
+    struct acpi_sdt *h = (void *)table;
+    uint8_t *hd = table + 48;
+    h->length = sizeof table; h->revision = 2;
+    put32(table + 36, 1 | 48u << 15 | 48u << 8);
+    hd[0] = 0x11; put16(hd + 2, 44); put16(hd + 6, 0x40);
+    put64(hd + 8, first_base); hd[40] = 1;
+    const struct { uint64_t hardware, image; bool locked; } perf[] = {
+        {EFR_PERF_OPT, 0, false}, {EFR_PERF_OPT, 0, true},
+        {0, EFR_PERF_OPT, false}, {EFR_PERF_OPT, EFR_PERF_OPT, false}
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(perf); i++) {
+        reset(); firmware = h;
+        registers[R_EFR / 8] = perf[i].hardware;
+        put64(hd + 24, perf[i].image);
+        *(uint32_t *)((uint8_t *)registers + R_PERF_OPT) = PERF_OPT_EN;
+        perf_locked = perf[i].locked;
+        CHECK(iommu_amd_probe(&plain_safe) == &amd);
+        CHECK(units[0].efr == perf[i].image && (units[0].state_efr & EFR_PERF_OPT));
+        CHECK(program(&units[0]) == !perf[i].locked);
+        CHECK(perf_reads == 1 && perf_writes == 1);
+        if (perf[i].locked) {
+            CHECK(!table_writes && !(rd(&units[0], R_CONTROL) & CTL_IOMMU_EN));
+        } else {
+            CHECK(table_writes == 1 && !(*(uint32_t *)((uint8_t *)registers + R_PERF_OPT) & PERF_OPT_EN));
+        }
+    }
+    /* MarcSup[43:42]の定義済み値01/10。実機能とimage双方から停止確認へ接続する。 */
+    const uint64_t marc[] = {1ull << 42, 2ull << 42};
+    for (size_t i = 0; i < ARRAY_SIZE(marc); i++) {
+        for (unsigned image = 0; image < 2; image++) {
+            reset(); firmware = h;
+            registers[R_EFR / 8] = image ? 0 : marc[i];
+            put64(hd + 24, image ? marc[i] : 0);
+            CHECK(iommu_amd_probe(&plain_safe) == &amd);
+            control_readonly = 1ull << 40; /* MarcEnがControl=0の後も残るreadback失敗 */
+            CHECK(!program(&units[0]) && !table_writes);
+            CHECK(!amd_shutdown());
+            control_readonly = 0;
+            registers[R_CONTROL / 8] = 1ull << 40;
+            table_writes = 0;
+            CHECK(program(&units[0]) && table_writes == 1 && !(rd(&units[0], R_CONTROL) & (1ull << 40)));
+            CHECK(amd_shutdown());
+        }
+    }
+    reset(); firmware = h;
+    put64(hd + 24, 0); registers[R_EFR / 8] = EFR_PERF_OPT;
+    *(uint32_t *)((uint8_t *)registers + R_PERF_OPT) = PERF_OPT_EN;
+    cap_info = 48u << 15 | 41u << 8; /* 隔離拒否と、無効なunitのplain配送は別の責務 */
+    check_rejected_state(true);
+    CHECK(!perf_reads && !perf_writes && *(uint32_t *)((uint8_t *)registers + R_PERF_OPT) == PERF_OPT_EN);
+    reset();
+    struct unit u = {.regs = (void *)registers};
+    control_readonly = 1ull << 40;
+    *(uint32_t *)((uint8_t *)registers + R_PERF_OPT) = PERF_OPT_EN;
+    CHECK(program(&u) && !perf_reads && !perf_writes); /* 未対応のreserved bit/レジスターを0要求しない */
 }
 
 static void test_commands_and_dte(void) {
@@ -458,6 +676,7 @@ static void test_partial_program(void) {
 
 int main(void) {
     test_handoff(); test_event_restart(); test_ivrs(); test_probe_widths(); test_commands_and_dte(); test_shared_msix();
+    test_probe_rejection_state(); test_probe_depth(); test_optional_stop(); test_bypass_handoff();
     test_late_completion(); test_partial_program(); reset();
     printf("AMD IOMMU focused検査: %u件、失敗%u件（実機・QEMU未検証）\n", checks, failed);
     return failed ? 1 : 0;

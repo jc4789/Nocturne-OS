@@ -129,16 +129,18 @@ uint64_t pmm_low_range(uint64_t *pages) {
     return low_base;
 }
 
-uint64_t pmm_alloc(void) {
+uint64_t pmm_alloc_below(uint64_t limit) {
     cpu_require_bsp();
     uint64_t f = irq_save();
-    uint64_t words = (total_pages + 63) / 64;
+    uint64_t pages = MIN(total_pages, limit / PAGE_SIZE);
+    uint64_t words = (pages + 63) / 64;
     for (uint64_t n = 0; n < words; n++) {
         uint64_t w = (search_hint / 64 + n) % words;
-        if (bitmap[w] == ~0ULL) continue;
-        uint64_t bit = __builtin_ctzll(~bitmap[w]);
+        uint64_t available = ~bitmap[w];
+        if (w == words - 1 && pages % 64) available &= (1ULL << (pages % 64)) - 1;
+        if (!available) continue;
+        uint64_t bit = __builtin_ctzll(available);
         uint64_t p = w * 64 + bit;
-        if (p >= total_pages) continue;
         set_used(p);
         free_pages--;
         search_hint = p;
@@ -148,6 +150,8 @@ uint64_t pmm_alloc(void) {
     irq_restore(f);
     return 0;
 }
+
+uint64_t pmm_alloc(void) { return pmm_alloc_below(UINT64_MAX); }
 
 uint64_t pmm_alloc_zeroed(void) {
     uint64_t p = pmm_alloc();

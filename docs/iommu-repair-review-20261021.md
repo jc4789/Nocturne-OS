@@ -24,4 +24,4 @@
 
 この境界を保持した三担当の最終第二報告を、controllerの独立reviewへ登録する。
 
-最終全repoのviewは、作業対象外`hyperv/Nocturne-data.vhdx`の変化で停止した。同じinventoryの差分はこの一ファイルだけ、全担当の最新製品/報告依存hashは一致していた。ユーザーの媒体やcontrollerを操作して合格を作らず、全員の最終view/ship手続きは未通過とする。これは上記の製品・証拠の範囲付き独立受入とは別の残件である。
+最終全repoの初回viewは、作業対象外`hyperv/Nocturne-data.vhdx`の変化で停止した。同じinventoryの差分はこの一ファイルだけ、全担当の最新製品/報告依存hashは一致していた。後続の標準検査でinventory一致となったため、ユーザーの媒体やcontrollerを操作せず正規の最終読取りを行う。最終view/ship結果と上記の製品・証拠の範囲付き独立受入は区別し、前者は`ship-check.log`に残す。

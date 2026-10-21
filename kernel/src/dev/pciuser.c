@@ -179,15 +179,6 @@ static void screen_hold_end(struct pci_claim *c) {
     irq_restore(irq);
 }
 
-/* Readback is not a DMA drain; it only prevents new requests while recovery is deferred. */
-static bool busmaster_off(struct pci_device *d, bool *was_mastering) {
-    uint16_t command = pci_read16(d->bus, d->dev, d->func, 4);
-    if (was_mastering) *was_mastering = (command & PCI_COMMAND_MASTER) != 0;
-    pci_write16(d->bus, d->dev, d->func, 4, command & ~PCI_COMMAND_MASTER);
-    return pci_read32(d->bus, d->dev, d->func, 0) == ((uint32_t)d->device << 16 | d->vendor) &&
-           !(pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER);
-}
-
 /* A driver that is done with its device stops it and then switches bus mastering off: that is
    how it tells the kernel the device will not reach memory again. A device that still masters
    when its claim ends lost its driver in the middle (a crash, or a driver that never stopped
@@ -206,7 +197,7 @@ static void claim_release(struct vnode *v) {
     shared_revoke_claim(c); /* no process reaches the registers any more */
     interrupts_off(c);
     bool left_running;
-    bool stopped = busmaster_off(d, &left_running);
+    bool stopped = pci_disable_busmaster(d, &left_running);
     if (c->domain && c->domain->nmembers > 1) {
         /* P2P lets the old driver program every member. FLR resets only its target
            Function (PCIe 6.0, 6.6.2), not its peers: even a clean primary must be
@@ -214,7 +205,7 @@ static void claim_release(struct vnode *v) {
         for (unsigned i = 0; i < c->domain->nmembers; i++) {
             struct pci_device *peer = c->domain->members[i];
             peer->needs_reset = true;
-            if (peer != d && !busmaster_off(peer, NULL))
+            if (peer != d && !pci_disable_busmaster(peer, NULL))
                 kprintf("pci: %02x:%02x.%u: peer bus mastering did not stop; group recovery is required\n",
                         peer->bus, peer->dev, peer->func);
         }
@@ -278,7 +269,7 @@ static void guards_init(struct pci_claim *c) {
     /* Command: memory decode, bus mastering and parity response are the driver's. I/O decode
        (apps reach no I/O ports), INTx (apps get no legacy interrupt; one left asserting would
        hold a shared line) and the legacy PCI bits stay as the kernel set them. */
-    guard(c, 0x04, 0xFFFFu & ~(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER | PCI_COMMAND_PARITY));
+    guard(c, PCI_COMMAND, 0xFFFFu & ~(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER | PCI_COMMAND_PARITY));
     guard(c, 0x0C, 1u << 30); /* BIST: start */
     guard(c, 0x3C, 0xFF);     /* Interrupt Line: the platform's routing record */
     uint8_t pm = pci_find_cap(d, 0x01);
@@ -290,8 +281,8 @@ static void guards_init(struct pci_claim *c) {
         /* Device Control: Max_Payload_Size must match the whole path to the root, phantom
            functions widen the requester IDs, and Initiate FLR resets the function. */
         guard(c, d->pcie_cap + PCIE_DEVCTL, 7u << 5 | 1u << 9 | PCIE_DEVCTL_FLR);
-        guard(c, d->pcie_cap + 0x10, 1u << 4);            /* Link Control: Link Disable */
-        guard(c, d->pcie_cap + 0x30, 1u << 4 | 1u << 10); /* Link Control 2: Enter (Modified) Compliance */
+        guard(c, d->pcie_cap + PCIE_LNKCTL, PCIE_LNKCTL_DISABLE);
+        guard(c, d->pcie_cap + PCIE_LNKCTL2, PCIE_LNKCTL2_COMPLIANCE | PCIE_LNKCTL2_MOD_COMPLIANCE);
     }
     /* Extended capabilities (ECAM only): BAR sizes, virtual functions, and the controls that
        decide how its requests are routed and translated. */
@@ -350,7 +341,7 @@ static bool claim_recover(struct pci_claim *c) {
             if (!pci_function_reset(m) || !pci_msi_disable(m)) return false;
             m->needs_reset = false;
         }
-        if (m != d && !busmaster_off(m, NULL) && !m->needs_reset) {
+        if (m != d && !pci_disable_busmaster(m, NULL) && !m->needs_reset) {
             m->needs_reset = true;
             return false;
         }
@@ -365,7 +356,7 @@ static bool claim_recover(struct pci_claim *c) {
         } else if (m != d) {
             return false;
         } else {
-            if (!busmaster_off(d, NULL)) return false;
+            if (!pci_disable_busmaster(d, NULL)) return false;
             kprintf("pci: %02x:%02x.%u: isolated, but native driver recovery is still required%s\n",
                     d->bus, d->dev, d->func, screen ? "; boot display is not automatically reset" : "");
         }

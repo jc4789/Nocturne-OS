@@ -580,8 +580,8 @@ static int64_t sys_pci_bar(int h,uint32_t bar) {
     r=shared_open(v,O_RDWR,&f);
     return new_handle(r,f);
 }
-/* Zeroed RAM a claimed function may reach by DMA. A contiguous run is allocated whole; pages
-   below 4 GiB come from the low end of memory, where the allocator's run search begins. */
+/* Zeroed RAM a claimed function may reach by DMA. A contiguous run is allocated whole;
+   independent pages use the allocator's hint even with a device/IOMMU address ceiling. */
 static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
     struct file *pci=getfd_ref(h);
     if(!pci)return -N_ERR_NO_HANDLE;
@@ -610,8 +610,7 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
         if(!(p=shared_new(bytes,SHARED_RAM,count,&v))){pci_user_drop(claim);return -N_ERR_NO_MEMORY;}
         p->claim=claim;
         for(;p->count<count;p->count++){
-            uint64_t frame=limit==UINT64_MAX?pmm_alloc():pmm_alloc_contig(1);
-            if(frame && frame+PAGE_SIZE>limit){pmm_free(frame);frame=0;}
+            uint64_t frame=pmm_alloc_below(limit);
             if(!frame){shared_release(v);return -N_ERR_NO_MEMORY;}
             memset(phys_to_virt(frame),0,PAGE_SIZE);
             p->pages[p->count]=frame;

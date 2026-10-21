@@ -107,6 +107,7 @@
 #define IQA_DW               (1ull << 11)
 #define IQA_QS               7u
 #define INV_BYTES            16u
+#define DRHD_SIZE_MASK       0x0Fu /* 8.3: log2 of 4KiB register pages; upper four bits reserved */
 
 /* interrupt remapping table */
 #define IRT_ENTRIES    4096
@@ -128,11 +129,14 @@
 struct unit {
     uint64_t base;
     volatile uint8_t *regs;
-    unsigned pages; /* of registers, as the DMAR says */
+    uint64_t reg_bytes; /* the DRHD's complete register aperture, not a license to map beyond it */
     uint64_t cap, ecap;
     uint64_t root;  /* root table */
     uint64_t pass;  /* the context table of every bus without a claimed function */
     uint64_t queue; /* invalidation queue: 256 descriptors */
+    uint64_t handoff; /* owned replacement for an inherited queue, followed by its status page */
+    unsigned handoff_config; /* inherited IQA.QS/DW: offsets stay valid during the live IQA change */
+    uint32_t handoff_tail, handoff_token;
     uint32_t tail;
     bool queue_on;  /* the queue on is ours (queue_start), not one the firmware left on */
     bool waiting;   /* a sync's wait descriptor went in */
@@ -149,6 +153,7 @@ static size_t nioapics, ioapics_room;
 static uint8_t dmar_flags;
 static unsigned host_bits;
 static bool remap, x2, caching_mode, write_buffers, parse_lost;
+static bool units_incomplete; /* separate from unsupported/malformed device-scope policy */
 static bool irreq; /* a unit requires interrupt remapping (ECAP.IRREQ) */
 static unsigned iec_mask = 15; /* the largest IEC invalidation mask every unit takes (MHMV) */
 static struct iommu_domain *identity; /* units without pass-through */
@@ -187,7 +192,11 @@ static int scope_id(const uint8_t *s) {
 /* Device scopes from `at` to `end`, each passed with its requester ID. */
 static void scopes(const uint8_t *b, unsigned at, unsigned end, void (*each)(const uint8_t *s, int id, void *arg),
                    void *arg) {
-    for (; at + 6 <= end && b[at + 1] >= 6 && at + b[at + 1] <= end; at += b[at + 1]) {
+    for (; at < end; at += b[at + 1]) {
+        if (end - at < 6 || b[at + 1] < 8 || b[at + 1] > end - at || (b[at + 1] - 6) % 2) {
+            parse_lost = true;
+            return;
+        }
         int id = scope_id(b + at);
         if (id >= 0) each(b + at, id, arg);
         else kprintf("iommu: a DMAR device scope leads through a bridge that is not there; ignored\n");
@@ -244,36 +253,62 @@ static bool parse_dmar(void) {
     const uint8_t *b = (const uint8_t *)h;
     host_bits = (unsigned)b[36] + 1; /* DMAR Host Address Width, 8.1 */
     dmar_flags = b[37];
-    for (uint32_t off = 48; off + 4 <= h->length;) {
+    uint32_t off = 48;
+    for (; h->length - off >= 4;) {
         uint16_t type = u16(b + off), len = u16(b + off + 2);
-        if (len < 4 || off + len > h->length) break;
+        if (len < 4 || len > h->length - off) { parse_lost = units_incomplete = true; break; }
         uint64_t base;
-        if (type == 0 && len >= 16) { /* DRHD */
+        if (type == 0) { /* DRHD */
+            if (len < 16) { parse_lost = units_incomplete = true; break; }
             memcpy(&base, b + off + 8, 8);
-            if (u16(b + off + 6) != 0) {
+            unsigned size = b[off + 5];
+            uint64_t reg_bytes = (uint64_t)PAGE_SIZE << (size & DRHD_SIZE_MASK);
+            bool segment_supported = u16(b + off + 6) == 0;
+            if (!segment_supported) {
+                parse_lost = true; /* still observe this unit's registers, independently of PCI scope support */
                 kprintf("iommu: VT-d unit at %lx is on PCI segment %u, which Nocturne does not reach\n", base,
                         u16(b + off + 6));
-            } else if (!base) {
-                kprintf("iommu: the DMAR describes a VT-d unit without an address; not used\n");
+            }
+            /* 8.3 requires alignment to the entire advertised register set. A shifted
+               base can make unrelated registers look like a valid, stopped unit. Reject
+               it before any mapping/read, including for a plain-safe observation. */
+            if (size & ~DRHD_SIZE_MASK || !base || base & (reg_bytes - 1) || base > UINT64_MAX - reg_bytes) {
+                parse_lost = units_incomplete = true;
+                kprintf("iommu: the DMAR describes an invalid VT-d register range at %lx (size %u); not used\n",
+                        base, size);
             } else {
                 struct unit *u = kappend(&units, &nunits, &units_room, sizeof *u);
                 if (!u) {
-                    parse_lost = true;
+                    parse_lost = units_incomplete = true;
                 } else {
-                    *u = (struct unit){.base = base, .pages = 1u << (b[off + 5] & 15)};
-                    if (b[off + 4] & 1) iommu_cover(0, 0xFFFF); /* INCLUDE_PCI_ALL: what no other unit has */
-                    scopes(b, off + 16, off + len, drhd_scope, NULL);
+                    *u = (struct unit){.base = base, .reg_bytes = reg_bytes};
+                    if (segment_supported) {
+                        if (b[off + 4] & 1) iommu_cover(0, 0xFFFF); /* INCLUDE_PCI_ALL: what no other unit has */
+                        scopes(b, off + 16, off + len, drhd_scope, NULL);
+                    }
                 }
             }
-        } else if (type == 1 && len >= 24 && u16(b + off + 6) == 0) { /* RMRR */
-            uint64_t limit;
-            memcpy(&base, b + off + 8, 8);
-            memcpy(&limit, b + off + 16, 8);
-            uint64_t range[2] = {ALIGN_DOWN(base, PAGE_SIZE), ALIGN_UP(limit + 1, PAGE_SIZE)};
-            if (limit >= base) scopes(b, off + 24, off + len, rmrr_scope, range);
-        }
+        } else if (type == 1) { /* RMRR, 8.4: fixed header followed by one or more scopes */
+            if (len <= 24) parse_lost = true;
+            else {
+                uint64_t limit;
+                memcpy(&base, b + off + 8, 8);
+                memcpy(&limit, b + off + 16, 8);
+                uint64_t end = limit + 1;
+                /* Base and size must be page aligned. Do not round malformed bounds
+                   into a wider reservation, or let either addition wrap it to empty.
+                   Losing a mandatory reservation prevents translation, not independent
+                   observation of every DRHD's stopped/plain-safe state. */
+                if (limit <= base || !end || (base | end) & (PAGE_SIZE - 1)) parse_lost = true;
+                else if (u16(b + off + 6) == 0) {
+                    uint64_t range[2] = {base, end};
+                    scopes(b, off + 24, off + len, rmrr_scope, range);
+                }
+            }
+        } else if (type > 6) units_incomplete = true; /* skip per 8.2, but do not attest unknown state as plain-safe */
         off += len;
     }
+    if (off != h->length) parse_lost = units_incomplete = true;
     return nunits != 0;
 }
 
@@ -380,7 +415,8 @@ static bool queue_check(struct unit *u) {
         return false;
     }
     uint32_t errors = rd32(u, R_FSTS) & FSTS_QUEUE_ERRORS;
-    if (!errors && (!u->queue_on || rd32(u, R_GSTS) & GCMD_QIE)) return true;
+    if (!errors && (!u->queue_on ||
+        (rd32(u, R_GSTS) & GCMD_QIE && rd64(u, R_IQA) == u->queue))) return true;
     kprintf("iommu: VT-d unit at %lx: invalidation failed, status %x, head %lx, record %lx; completion unknown\n",
             u->base, errors, rd64(u, R_IQH), rd64(u, R_IQERCD));
     u->failed = true;
@@ -722,18 +758,64 @@ static bool intel_flush(struct iommu_domain *dom, bool unmapped) {
 }
 
 /* ---- the units ---- */
-/* The queue may go off only when empty with a completed wait last (6.5.2). This driver is
-   the sole OS producer after the boot/wake handoff; TE/IRE changes do not establish that
-   ownership. Quiesce before disabling either protection, including an inherited queue.
-   Drain the inherited queue without
-   changing IQA, width or in-flight slots, then append our fence to its free tail slot.
-   Do not create a mapping to an unknown firmware address: the direct map must already
-   reach that exact page. A failed wait keeps its semaphore and queue memory alive. */
+/* A mapping or PMM used bit is not ownership. Unknown firmware queues may only be
+   inherited outside ALL allocator/bootloader/module RAM, whose contents could already
+   have been reused before probe. Do not read or write their descriptors. */
+static bool queue_address_safe(const struct unit *u, uint64_t iqa) {
+    if (u->queue && iqa == u->queue) return true;
+    if (u->handoff && iqa == (u->handoff | u->handoff_config)) return true;
+    if (iqa & ~(ADDR | IQA_DW | IQA_QS) || !intel.phys_bits || !pmm_ram_complete()) return false;
+    uint64_t base = iqa & ADDR, bytes = (uint64_t)PAGE_SIZE << (iqa & IQA_QS);
+    if (!base || base + bytes < base || (base + bytes - 1) >> intel.phys_bits) return false;
+    const struct pmm_range *ram;
+    unsigned n = pmm_ram_ranges(&ram);
+    for (unsigned i = 0; i < n; i++)
+        if (base < ram[i].end && ram[i].base < base + bytes) return false;
+    return true;
+}
+
+/* Run for every unit before allocating/zeroing any translation or queue metadata. */
+static bool queues_address_safe(void) {
+    for (size_t i = 0; i < nunits; i++) {
+        struct unit *u = &units[i];
+        if (rd32(u, R_GSTS) & GCMD_QIE && !queue_address_safe(u, rd64(u, R_IQA))) return false;
+    }
+    return true;
+}
+
+static void handoff_free(struct unit *u) {
+    if (!u->handoff) return;
+    size_t pages = ((size_t)1 << (u->handoff_config & IQA_QS)) + 1;
+    for (size_t i = 0; i < pages; i++) pmm_free(u->handoff + i * PAGE_SIZE);
+    u->handoff = 0;
+}
+
+/* Empty alone does NOT prove completion (6.5.2). Once empty, IQA may be changed
+   (11.4.9.3). Preserve QS/DW and offsets, move to owned memory, then submit a fenced
+   wait there. The extra page is its private status word; it is never reused after an
+   uncertain publication. Firmware/SMM producer handoff remains a platform obligation. */
 static bool queue_quiet(struct unit *u) {
-    /* start(false), or allocation failure before publication, may have no status page.
-       An active inherited queue then cannot be fenced: keep its protection and memory. */
-    if (!sems) return false;
-    if (u->queue_on) {
+    if (!queue_check(u)) return false;
+    uint64_t iqa = rd64(u, R_IQA), head = rd64(u, R_IQH), tail = rd64(u, R_IQT);
+    unsigned bytes = PAGE_SIZE << (iqa & IQA_QS), width = iqa & IQA_DW ? 2 * INV_BYTES : INV_BYTES;
+    if (!queue_address_safe(u, iqa) || (head | tail) & ~IQ_PTR_MASK ||
+        head >= bytes || tail >= bytes || (head | tail) & (width - 1)) {
+        if (u->queue_on || u->handoff) u->failed = true;
+        return false;
+    }
+    if (u->handoff && iqa == (u->handoff | u->handoff_config)) {
+        volatile uint32_t *word = phys_to_virt(u->handoff + bytes);
+        if (head != u->handoff_tail || tail != head || *word != u->handoff_token) {
+            u->failed = true;
+            return false;
+        }
+        return queue_check(u);
+    }
+    if (u->queue && iqa == u->queue) {
+        if (!sems) return false;
+        if (u->queue_on && tail != u->tail) { u->failed = true; return false; }
+        u->queue_on = true; /* retained OS allocation, not an address/used-bit guess after S3 */
+        u->tail = (uint32_t)tail;
         if (!sync_units((size_t)(u - units), 1)) return false;
         /* Status writes precede all effects being visible in the head register. */
         for (uint64_t t = iommu_deadline(100); rd64(u, R_IQH) != u->tail; pause())
@@ -741,40 +823,50 @@ static bool queue_quiet(struct unit *u) {
                 u->failed = true;
                 return false;
             }
+        if (rd64(u, R_IQT) != u->tail) { u->failed = true; return false; }
         return queue_check(u);
     }
-    if (!queue_check(u)) return false;
-    uint64_t iqa = rd64(u, R_IQA), head = rd64(u, R_IQH), tail = rd64(u, R_IQT);
-    unsigned bytes = PAGE_SIZE << (iqa & IQA_QS), width = iqa & IQA_DW ? 2 * INV_BYTES : INV_BYTES;
-    if ((head | tail) & ~IQ_PTR_MASK || head >= bytes || tail >= bytes || (head | tail) & (width - 1))
-        return false;
     for (uint64_t t = iommu_deadline(100); rd64(u, R_IQH) != tail; pause())
         if (!queue_check(u) || iommu_expired(t)) return false;
-    /* Recheck the producer state before borrowing its one free descriptor slot. */
-    if (rd64(u, R_IQT) != tail || rd64(u, R_IQA) != iqa || !queue_check(u)) return false;
-    uint64_t base = iqa & ~((uint64_t)PAGE_SIZE - 1);
-    if (base > ADDR || base + tail < base) return false;
-    uint64_t pa = base + tail;
-    if (!intel.phys_bits || (pa + width - 1) >> intel.phys_bits) return false;
-    volatile uint64_t *slot = phys_to_virt(pa);
-    if (vmm_translate(kernel_pml4, (uint64_t)slot) != pa) return false;
-    size_t index = (size_t)(u - units);
-    volatile uint32_t *word = (volatile uint32_t *)phys_to_virt(sems) + index;
+    if (u->handoff) return false; /* never overwrite retained, possibly hardware-owned storage */
+    u->handoff_config = (unsigned)(iqa & (IQA_QS | IQA_DW));
+    u->handoff = iommu_alloc_pages(bytes / PAGE_SIZE + 1);
+    if (!u->handoff) return false;
+    /* Allocation may take time. No IQA replacement until the queue is still empty
+       at the same producer position, with no error and QIES still set. */
+    if (!(rd32(u, R_GSTS) & GCMD_QIE) || rd64(u, R_IQH) != tail ||
+        rd64(u, R_IQT) != tail || rd64(u, R_IQA) != iqa || !queue_check(u)) {
+        handoff_free(u); /* this allocation was never published */
+        return false;
+    }
+    volatile uint64_t *slot = (volatile uint64_t *)((uint8_t *)phys_to_virt(u->handoff) + tail);
+    volatile uint32_t *word = phys_to_virt(u->handoff + bytes);
     if (!++token) token++;
+    u->handoff_token = token;
     *word = 0;
     slot[0] = INV_WAIT(token);
-    slot[1] = sems + index * sizeof *word;
+    slot[1] = u->handoff + bytes;
     if (width > INV_BYTES) slot[2] = slot[3] = 0;
     if (!intel.coherent) iommu_cache_flush(slot, width);
     __asm__ volatile("sfence" ::: "memory");
-    tail = (tail + width) % bytes;
-    wr64(u, R_IQT, tail);
-    for (uint64_t t = iommu_deadline(100); *word != token || rd64(u, R_IQH) != tail; pause()) {
+    wr64(u, R_IQA, u->handoff | u->handoff_config);
+    if (rd64(u, R_IQA) != (u->handoff | u->handoff_config)) {
+        u->failed = true; /* the hardware may have taken the pointer: retain both pages */
+        return false;
+    }
+    u->handoff_tail = (uint32_t)((tail + width) % bytes);
+    wr64(u, R_IQT, u->handoff_tail);
+    for (uint64_t t = iommu_deadline(100); *word != u->handoff_token || rd64(u, R_IQH) != u->handoff_tail; pause()) {
         if (!queue_check(u)) return false;
         if (iommu_expired(t)) {
             u->failed = true;
             return false;
         }
+    }
+    if (rd64(u, R_IQA) != (u->handoff | u->handoff_config) ||
+        rd64(u, R_IQT) != u->handoff_tail || !(rd32(u, R_GSTS) & GCMD_QIE)) {
+        u->failed = true;
+        return false;
     }
     return queue_check(u);
 }
@@ -786,7 +878,8 @@ static bool unit_quiet(struct unit *u) {
     uint32_t sts = rd32(u, R_GSTS);
     if (sts & GCMD_QIE && !queue_quiet(u)) {
         kprintf("iommu: VT-d unit at %lx: its invalidation queue does not go quiet; protection stays on\n", u->base);
-        u->failed = true; /* a later call must not reuse a possibly live status-write word */
+        /* queue_quiet latches uncertainty after publication. Validation/allocation
+           failure before publication has no OS status word whose late write could alias. */
         wr32(u, R_FECTL, rd32(u, R_FECTL) | FECTL_IM);
         return false;
     }
@@ -865,6 +958,7 @@ static bool units_on(void) {
 
 static bool intel_shutdown(void) {
     bool ok = true;
+    if (!queues_address_safe()) return false;
     /* An error in a later unit must not turn an earlier unit's protected DMA into bypass. */
     for (size_t i = 0; i < nunits; i++) ok &= queue_check(&units[i]);
     if (!ok) return false;
@@ -875,6 +969,7 @@ static bool intel_shutdown(void) {
             kprintf("iommu: VT-d unit at %lx did not turn off\n", units[i].base);
             return false; /* no further command after an unconfirmed one */
         }
+    for (size_t i = 0; i < nunits; i++) handoff_free(&units[i]);
     return true;
 }
 
@@ -896,6 +991,7 @@ static void tables_free(void) {
         if (units[i].root) pmm_free(units[i].root);
         if (units[i].pass) pmm_free(units[i].pass);
         if (units[i].queue) pmm_free(units[i].queue);
+        units[i].root = units[i].pass = units[i].queue = 0;
     }
     sems = irt = 0;
 }
@@ -918,6 +1014,10 @@ static bool units_start(bool translate) {
 static bool intel_start(bool translate) {
     translate &= intel.levels != 0;
     if (!translate && !irreq) return false;
+    if (!queues_address_safe()) {
+        kprintf("iommu: an inherited VT-d queue overlaps OS-managed or unclassified RAM; not touched\n");
+        return false;
+    }
     sem_pages = ALIGN_UP(nunits * 4, PAGE_SIZE) / PAGE_SIZE;
     sems = iommu_alloc_pages(sem_pages);
     irt = remap ? iommu_alloc_pages(IRT_ENTRIES * 16 / PAGE_SIZE) : 0;
@@ -1003,32 +1103,52 @@ static struct iommu_hw intel = {
     .shutdown = intel_shutdown,
 };
 
-const struct iommu_hw *iommu_intel_probe(void) {
-    if (!parse_dmar()) return NULL;
-    if (parse_lost) {
-        kprintf("iommu: no memory to keep the DMAR: VT-d not used\n");
-        return NULL;
+/* Rejection and observation are separate: unsupported queue/table formats do not
+   themselves tell us whether firmware left translation or mandatory IR active.
+   No command or fault acknowledgement is issued while making this observation. */
+static bool units_plain_safe(void) {
+    if (units_incomplete || !nunits) return false;
+    for (size_t i = 0; i < nunits; i++) {
+        const struct unit *u = &units[i];
+        if (!u->regs || u->ecap & ECAP_IRREQ ||
+            rd32(u, R_GSTS) & (GCMD_TE | GCMD_IRE | GCMD_QIE | GCMD_WBF) ||
+            rd64(u, R_CCMD) >> 63 || rd64(u, ECAP_IRO(u->ecap) + 8) >> 63 ||
+            (u->cap & CAP_ECMDS && rd64(u, R_ECRSP) & 1) ||
+            (u->cap & (CAP_PLMR | CAP_PHMR) && rd32(u, R_PMEN) & (PMEN_EPM | PMEN_PRS))) return false;
     }
+    return true;
+}
+
+const struct iommu_hw *iommu_intel_probe(bool *plain_safe) {
+    *plain_safe = false;
+    if (!acpi_find("DMAR", 0)) { *plain_safe = true; return NULL; }
+    if (acpi_find("DMAR", 1) || !parse_dmar()) return NULL;
     unsigned sagaw = 0xE, domains = 1u << 16, mgaw = host_bits;
     bool qi = true, eim = true, eimer = false;
     intel.coherent = true;
     remap = (dmar_flags & 1) != 0;
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
-        if (!(u->regs = vmm_map_mmio(u->base, (uint64_t)u->pages * PAGE_SIZE))) {
+        if (!(u->regs = vmm_map_mmio(u->base, u->reg_bytes))) {
             kprintf("iommu: the registers of the VT-d unit at %lx cannot be mapped: VT-d not used\n", u->base);
             return NULL;
         }
         u->cap = rd64(u, R_CAP);
         u->ecap = rd64(u, R_ECAP);
-        uint64_t need = ALIGN_UP(CAP_FRO(u->cap) + CAP_NFR(u->cap) * 16, PAGE_SIZE);
-        uint64_t iotlb_end = ALIGN_UP(ECAP_IRO(u->ecap) + 16, PAGE_SIZE);
-        if (iotlb_end > need) need = iotlb_end;
-        if (need > (uint64_t)u->pages * PAGE_SIZE && !(u->regs = vmm_map_mmio(u->base, need))) {
-            kprintf("iommu: the fault records of the VT-d unit at %lx cannot be mapped: VT-d not used\n", u->base);
+        /* The minimum DRHD aperture is 4KiB, covering fixed registers through ECRSP.
+           Capability-selected fault records and IOTLB registers must fit that same
+           reported set; do not expand an untrusted aperture to make them accessible. */
+        uint64_t fault_end = (uint64_t)CAP_FRO(u->cap) + (uint64_t)CAP_NFR(u->cap) * 16;
+        uint64_t iotlb_end = (uint64_t)ECAP_IRO(u->ecap) + 16;
+        if (fault_end > u->reg_bytes || iotlb_end > u->reg_bytes) {
+            kprintf("iommu: VT-d unit at %lx reports registers outside its DRHD range: VT-d not used\n", u->base);
             return NULL;
         }
         uint32_t ver = rd32(u, R_VER);
+        if (!(ver >> 4 & 15) || ver == UINT32_MAX || u->cap == UINT64_MAX || u->ecap == UINT64_MAX) {
+            kprintf("iommu: the VT-d unit at %lx does not give usable register values\n", u->base);
+            return NULL;
+        }
         kprintf("iommu: VT-d unit at %lx, version %u.%u, capabilities %lx, extended %lx\n", u->base, ver >> 4 & 15,
                 ver & 15, u->cap, u->ecap);
         sagaw &= CAP_SAGAW(u->cap);
@@ -1064,6 +1184,11 @@ const struct iommu_hw *iommu_intel_probe(void) {
     }
     x2 = remap && eimer;
     intel.interrupt_remapping_required = irreq;
+    *plain_safe = units_plain_safe();
+    if (parse_lost) {
+        kprintf("iommu: the DMAR scope or structure is not supported: VT-d not used\n");
+        return NULL;
+    }
     /* A unit that requires interrupt remapping blocks every interrupt message while it is off
        (5.1.4): it is started to remap them even where nothing else of VT-d is used. Without the
        queue (which remapping needs for its invalidations) or the remapping it is left as the

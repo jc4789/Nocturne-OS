@@ -211,9 +211,9 @@ struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls) {
 
 void pci_enable_busmaster(struct pci_device *d) {
     d->kernel_owned = true;
-    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, 4);
+    uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
     cmd |= 0x7; /* I/O, memory, bus master */
-    pci_write16(d->bus, d->dev, d->func, 4, cmd);
+    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd);
 }
 
 int pci_list(struct n_pciinfo *out, int max) {
@@ -447,7 +447,7 @@ struct pci_saved {
     uint16_t pcie_ctl[4];
     uint16_t acs, acs_ctl; /* the ACS capability's offset and its control register */
 };
-static const uint8_t pcie_ctl_off[4] = {PCIE_DEVCTL, 0x10, PCIE_DEVCTL2, 0x30}; /* device, link, device 2, link 2 */
+static const uint8_t pcie_ctl_off[4] = {PCIE_DEVCTL, PCIE_LNKCTL, PCIE_DEVCTL2, PCIE_LNKCTL2};
 
 /* table: the MSI-X table's entries too, into s->msix_table (allocated once, kept); false without
    memory for it. */
@@ -484,7 +484,7 @@ static void state_restore(const struct pci_device *d, const struct pci_saved *s)
     if (d->pcie_cap)
         for (unsigned j = 0; j < 4; j++) pci_write16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
     if (s->acs) pci_write16(d->bus, d->dev, d->func, s->acs + 6, s->acs_ctl); /* before bus mastering */
-    pci_write16(d->bus, d->dev, d->func, 4, s->hdr[1] & 0xFFFF);
+    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, s->hdr[1] & 0xFFFF);
     if (s->msix) {
         /* the table is memory space, which the command register has just opened */
         pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl | 0xC0000000u);
@@ -530,6 +530,13 @@ static bool present(const struct pci_device *d) {
     return pci_read32(d->bus, d->dev, d->func, 0) == ((uint32_t)d->device << 16 | d->vendor);
 }
 
+bool pci_disable_busmaster(struct pci_device *d, bool *was_mastering) {
+    uint16_t command = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
+    if (was_mastering) *was_mastering = (command & PCI_COMMAND_MASTER) != 0;
+    pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, command & ~PCI_COMMAND_MASTER);
+    return present(d) && !(pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER);
+}
+
 bool pci_requests_done(const struct pci_device *d, unsigned ms) {
     if (!d->pcie_cap) return present(d);
     for (uint64_t since = uptime_ms();; sleep_ms(1)) {
@@ -539,13 +546,29 @@ bool pci_requests_done(const struct pci_device *d, unsigned ms) {
     }
 }
 
-/* The longest a request of d may wait for its completion (Device Control 2, Completion Timeout
-   Value: the upper end of each defined range, 7.5.3.16 Table 7-34). Round 100 us up to the
-   scheduler's millisecond unit; 0 means disabled or a reserved encoding, not a guessed timeout. */
-static unsigned completion_timeout_ms(const struct pci_device *d) {
-    static const unsigned range_ms[16] = {50, 1, 10, 0, 0, 55, 210, 0, 0, 900, 3500, 0, 0, 13000, 64000, 0};
-    uint16_t ctl2 = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL2);
-    return ctl2 & PCIE_DEVCTL2_CT_DISABLE ? 0 : range_ms[ctl2 & 15];
+/* RRS reaches software only when the Root Complex exposes it (2.3.2). Enable a
+   supporting Root Port before FLR and before each readiness read, including a saved
+   reset resumed after cancellation/S3. Never write an endpoint/switch's reserved
+   Root Control, or infer support from an absent function's all-ones response.
+   RCRB-managed/unsupported roots retain their existing config-access behavior;
+   synchronous hardware retries there are not made cancellable by this helper. */
+static bool reset_rrs_visible(const struct pci_device *d) {
+    for (const struct pci_device *b = pci_upstream(d); b; b = pci_upstream(b)) {
+        if (!b->pcie_cap || b->pcie_type != 4) continue;
+        unsigned cap = b->pcie_cap;
+        if (b->dev > 31 || b->func > 7 || cap < 0x40 || (cap & 3) ||
+            cap > 256 - (PCIE_ROOTCAP + sizeof(uint16_t)) || !present(b)) return false;
+        uint32_t header = pci_read32(b->bus, b->dev, b->func, cap);
+        if ((header & 0xFF) != 0x10 || ((header >> 20) & 15) != 4 ||
+            !(pci_read16(b->bus, b->dev, b->func, cap + PCIE_ROOTCAP) & PCIE_ROOTCAP_RRS_VISIBLE))
+            return false;
+        uint16_t control = pci_read16(b->bus, b->dev, b->func, cap + PCIE_ROOTCTL);
+        if (!(control & PCIE_ROOTCTL_RRS_VISIBLE))
+            pci_write16(b->bus, b->dev, b->func, cap + PCIE_ROOTCTL, control | PCIE_ROOTCTL_RRS_VISIBLE);
+        return present(b) &&
+               (pci_read16(b->bus, b->dev, b->func, cap + PCIE_ROOTCTL) & PCIE_ROOTCTL_RRS_VISIBLE);
+    }
+    return false;
 }
 
 /* FLR must finish in 100 ms (6.6.2), but device-specific initialization may still return RRS.
@@ -573,27 +596,41 @@ struct pci_reset {
     unsigned wait;
 };
 
+/* Claim recovery and task_kill run on the BSP. Keep the cancellation check and the
+   scheduler's wait registration atomic against kill_locked: otherwise a kill just
+   before sleep_ms could lose its wake for the remaining FLR/readiness wait.
+   schedule switches stacks: the next task resumes its own irq_restore (or startup/
+   interrupt return), not this caller's IRQ guard. No IRQ-disabled busy wait or new
+   polling/deadline slice is imposed while this task is blocked. */
+static bool reset_wait(uint64_t ms) {
+    uint64_t flags = irq_save();
+    bool cancelled = current_task && current_task->killed;
+    if (!cancelled) sleep_ms(ms);
+    irq_restore(flags);
+    return !cancelled;
+}
+
 bool pci_function_reset(struct pci_device *d) {
     if (current_task && current_task->killed) return false;
+    (void)reset_rrs_visible(d); /* best effort, not a prerequisite on unsupported roots */
     struct pci_reset *r = d->reset;
     if (!r) {
         if (!d->pcie_cap || !present(d)) return false;
         if (!(pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) return false;
-        uint16_t command = pci_read16(d->bus, d->dev, d->func, 4);
-        pci_write16(d->bus, d->dev, d->func, 4, command & ~PCI_COMMAND_MASTER);
-        if (!present(d)) return false;
-        bool mastering = pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER;
+        if (!pci_disable_busmaster(d, NULL)) return false;
         unsigned wait = flr_ready_ms(d);
-        if (mastering || (pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING)) {
-            unsigned timeout = completion_timeout_ms(d);
-            /* With completion timeout disabled the specification gives only a 100 ms minimum,
-               not a system-specific stale-completion bound. Do not invent one or reuse tags. */
-            if (!timeout) return false;
-            if (timeout > wait) wait = timeout;
+        /* A former driver may have cleared CT Disable after issuing Requests: the
+           current timeout value does not prove those Requests have timers (7.5.3.16).
+           Observe their actual completion BEFORE FLR discards tags (6.6.2), with new
+           Memory/I/O Requests prohibited by the confirmed BME clear. */
+        while (!pci_requests_done(d, 0)) {
+            if ((current_task && current_task->killed) || !present(d)) return false;
+            if (!reset_wait(1)) return false; /* scheduler resolution, not a deadline */
         }
+        if (current_task && current_task->killed) return false;
         if (!(r = kzalloc(sizeof *r))) return false;
         state_save(d, &r->state, false);
-        /* Even a failed BME-clear readback must never be replayed after FLR. */
+        /* Restoring configuration must never re-enable bus mastering. */
         r->state.hdr[1] &= ~PCI_COMMAND_MASTER;
         r->state.pcie_ctl[0] &= ~PCIE_DEVCTL_FLR;
         r->wait = wait;
@@ -606,16 +643,28 @@ bool pci_function_reset(struct pci_device *d) {
         uint64_t elapsed = uptime_ms() - r->since;
         if (current_task && current_task->killed) return false;
         if (elapsed >= r->wait) break;
-        sleep_ms(r->wait - elapsed);
+        if (!reset_wait(r->wait - elapsed)) return false;
     }
-    if (pci_read32(d->bus, d->dev, d->func, 0) != r->state.id ||
+    /* RRS Software Visibility returns FFFF0001h for this dword (2.3.1). Additional
+       initialization after the 100ms FLR is permitted (6.6.2), even without RTR.
+       Preserve the same saved state, yield, and let the caller cancel instead of
+       failing a usable device at its first RRS or guessing a universal deadline. */
+    uint32_t id;
+    for (;;) {
+        if (current_task && current_task->killed) return false;
+        (void)reset_rrs_visible(d); /* Root Control may have lost its state while asleep. */
+        id = pci_read32(d->bus, d->dev, d->func, 0);
+        if (id != PCI_CONFIG_RRS_ID) break;
+        if (!reset_wait(1)) return false;
+    }
+    if (id != r->state.id ||
         (pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING)) {
         kprintf("pci: %02x:%02x.%u: FLR is not configuration-ready; saved state is retained for recovery\n",
                 d->bus, d->dev, d->func);
         return false;
     }
     state_restore(d, &r->state);
-    if (!present(d) || (pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER)) return false;
+    if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
     d->reset = NULL;
     kfree(r);
     return true;
