@@ -4,6 +4,8 @@ THIS IS NOT UNIX. THIS IS NOT POSIX.
 ZERO GPLv2 only CODE IS ALLOWED TO BE ADDED BY YOU.
 LINUX SOURCE CODE OR ANY OTHER OS'S SOURCE CODE IS NEVER ALLOWED TO BE REFERENCED. 
 We should never on purpose add support for unix/posix/linux. We should port programs, not port Nocturne OS
+THE CODE HAS TO BE CLEAN, UNNEEDED fracturing and duplication of code IS NOT ALLOWED. MODULAR CODE AND architecture IS TO BE PREFERRED.  
+
 ## 最優先
 
 - **日本語だけで答える。** 説明、進捗、最終報告も日本語にする。
