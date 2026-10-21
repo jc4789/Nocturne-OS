@@ -12,8 +12,8 @@
    driver reached them through the claimed function's peer-to-peer requests, so they may hold
    addresses it gave them, and no kernel driver uses them meanwhile (none runs a group member).
    A block the units did not confirm keeps the group out of every claim until a later attempt
-   confirms it. A function the platform keeps from being isolated (see iommu_attach) is claimed
-   as on a machine without an IOMMU. */
+   confirms it. Claims require isolation unless the administrator explicitly selected
+   appdrivers-unisolated at boot; that opt-in never overrides a previous domain's quarantine. */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -23,11 +23,12 @@ struct iommu_domain;
 
 void iommu_init(void); /* after pci_init, before a driver enables an interrupt */
 bool iommu_active(void); /* the units translate DMA: claims can be isolated */
+bool iommu_power_ready(void); /* false: unconfirmed hardware state forbids sleep/image restoration */
 /* A new domain for d with nothing of the app's mapped yet, attached to every requester ID of its
-   group: 0 with *out set. 0 with *out NULL when the platform cannot isolate d: no unit
+   group: 0 with *out set. Only with appdrivers-unisolated, 0 with *out NULL when no unit
    translates, no unit sees one of its requester IDs, its group holds a function the kernel
-   drives or that sends as the platform, or the bus was not all enumerated; d is then claimed as
-   on a machine without an IOMMU. Not when the units block a function of its group (an earlier
+   drives or that sends as the platform, or the bus was not all enumerated. Without that explicit
+   opt-in these are errors, not a downgrade. Never when the units block a function of its group (an earlier
    claim's): -N_ERR_UNSUPPORTED (a unit does not see an ID, the group is unknown) or -N_ERR_BUSY
    (the kernel's or the platform's function) then. -N_ERR_BUSY when a function of the group is
    claimed or still in a domain (also one whose block was not confirmed), or no domain id is
@@ -63,8 +64,8 @@ bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte);
    memory, before the IOAPICs and devices are, and only after the machine really slept (an
    aborted sleep leaves them on). shutdown turns them off: a hibernation restore, whose image
    brings tables of its own. Interrupts off. */
-void iommu_resume(void);
-void iommu_shutdown(void);
+bool iommu_resume(void); /* false: do not restore PCI DMA/interrupts */
+bool iommu_shutdown(void); /* false: do not overwrite the hardware's live tables */
 
 /* ---- for the back ends ---- */
 #define IOMMU_READ  1u
@@ -89,14 +90,19 @@ struct iommu_domain {
 };
 struct iommu_hw {
     const char *name;
+    bool interrupt_remapping_required; /* stopped units cannot deliver plain interrupts (VT-d IRREQ) */
     bool coherent;   /* the units snoop their table reads; else every written entry is flushed */
     unsigned levels; /* of a claimed function's page tables */
+    unsigned iova_bits; /* usable input address width shared by every translating unit */
+    unsigned phys_bits; /* physical address width shared by every unit; table addresses too */
     uint16_t domains; /* domain ids 1 .. domains - 1; 1 is the back end's own domain */
     /* Entries, bit 0 present in both formats (AMD-Vi PR, VT-d read): one at `level` pointing at
        a table, one mapping phys with IOMMU_READ / IOMMU_WRITE access */
     uint64_t (*table)(uint64_t phys, unsigned level);
     uint64_t (*leaf)(uint64_t phys, unsigned level, unsigned access);
-    /* Tables made, units on; false leaves them off. translate false (noiommu, or the firmware's
+    bool (*is_leaf)(uint64_t entry, unsigned level); /* do not follow a large-page leaf as a table */
+    /* Tables made, units on. False does not prove the units are off: the caller must confirm
+       shutdown before treating hardware-owned tables/queues as stopped. translate false (noiommu, or the firmware's
        descriptions not all kept): only a unit that must remap interrupts is started, remapping
        them alone, and false when there is none. */
     bool (*start)(bool translate);
@@ -112,8 +118,8 @@ struct iommu_hw {
                 uint32_t *address, uint32_t *data);
     bool (*msi_clear)(struct pci_device *d);
     bool (*ioapic)(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte);
-    void (*resume)(void);
-    void (*shutdown)(void);
+    bool (*resume)(void);
+    bool (*shutdown)(void);
 };
 /* The units the firmware describes (IVRS, DMAR), their registers mapped and read: the back end,
    or NULL. Nothing is written to them before start. */
@@ -122,7 +128,8 @@ const struct iommu_hw *iommu_intel_probe(void);
 /* What the back ends find in the firmware's tables while they probe.
    reserved: memory the functions with requester IDs first..last reach by DMA as it is (AMD-Vi
    IVMD, VT-d RMRR) with IOMMU_READ / IOMMU_WRITE access, mapped in their domains when claimed.
-   Page aligned, end exclusive.
+   Page aligned, end exclusive. Access zero forbids mapping the range (AMD IVMD); overlapping
+   restrictions intersect, and app DMA allocations cannot enlarge those permissions.
    cover: requests with IDs first..last pass a unit (IVHD device entries, DRHD scopes); a function
    whose requests no unit sees cannot be isolated.
    kernel_id: requests with this ID are the platform's (IOAPIC, HPET): never in a claim's domain. */
@@ -140,12 +147,16 @@ uint16_t *iommu_requester_ids(const struct pci_device *d, unsigned *n);
 /* Writes a table entry the units may read, flushing it from the caches when they do not snoop. */
 void iommu_entry_write(volatile uint64_t *e, uint64_t v);
 void iommu_cache_flush(const volatile void *p, size_t bytes);
+/* Zeroed physically contiguous pages for hardware tables/queues. Addresses fit every unit's
+   physical width and the page-table format; freed with pmm_free, one page at a time. */
+uint64_t iommu_alloc_pages(size_t count);
+/* Exclusive physical ceiling for identity-mapped DMA; UINT64_MAX for an unisolated claim. */
+uint64_t iommu_dma_limit(const struct iommu_domain *dom);
 /* Whether to log one more blocked request: a few a second, so a device that keeps sending
    them cannot drown the log. */
 bool iommu_fault_report(void);
-/* A TSC deadline `ms` from now and whether it passed: units are polled with interrupts off.
-   Without a known TSC rate a rate above any x86 TSC's is assumed: waits stay bounded, only
-   longer. */
+/* A measured-TSC deadline `ms` from now: units are polled with interrupts off. An unknown
+   TSC rate cannot prove elapsed time and expires immediately; unconfirmed hardware stays owned. */
 uint64_t iommu_deadline(unsigned ms);
 bool iommu_expired(uint64_t deadline);
 /* The plain MSI address for a physical APIC id (bits 19:12, no redirection hint). */

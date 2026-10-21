@@ -413,7 +413,12 @@ bool pci_msi_disable(struct pci_device *d) {
     if (cap) pci_write32(d->bus, d->dev, d->func, cap, pci_read32(d->bus, d->dev, d->func, cap) & ~0x00010000u);
     if (msix) pci_write32(d->bus, d->dev, d->func, msix,
                           pci_read32(d->bus, d->dev, d->func, msix) & ~0x80000000u);
-    return iommu_msi_clear(d);
+    /* A stale Enable must not be saved and replayed by a later FLR, nor may its vector
+       be recycled merely because interrupt-table invalidation completed. */
+    bool off = (!cap || !(pci_read32(d->bus, d->dev, d->func, cap) & 0x00010000u)) &&
+               (!msix || !(pci_read32(d->bus, d->dev, d->func, msix) & 0x80000000u));
+    bool cleared = iommu_msi_clear(d); /* still revoke its remapping entry when a device refuses */
+    return off && cleared;
 }
 
 bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
@@ -521,7 +526,8 @@ void pci_resume(void) {
 
 /* ---- a function's requests, and its reset (PCI Express Base 6.0) ---- */
 static bool present(const struct pci_device *d) {
-    return (pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) != 0xFFFF;
+    /* RRS Software Visibility may return Vendor ID 0001h: that is not a ready function. */
+    return pci_read32(d->bus, d->dev, d->func, 0) == ((uint32_t)d->device << 16 | d->vendor);
 }
 
 bool pci_requests_done(const struct pci_device *d, unsigned ms) {
@@ -534,42 +540,83 @@ bool pci_requests_done(const struct pci_device *d, unsigned ms) {
 }
 
 /* The longest a request of d may wait for its completion (Device Control 2, Completion Timeout
-   Value: the upper end of each range, 7.5.3.16); 0 when the timeout is disabled. */
+   Value: the upper end of each defined range, 7.5.3.16 Table 7-34). Round 100 us up to the
+   scheduler's millisecond unit; 0 means disabled or a reserved encoding, not a guessed timeout. */
 static unsigned completion_timeout_ms(const struct pci_device *d) {
-    static const unsigned range_ms[16] = {50, 1, 10, 64000, 64000, 55, 210, 64000,
-                                          64000, 900, 3500, 64000, 64000, 13000, 64000, 64000};
+    static const unsigned range_ms[16] = {50, 1, 10, 0, 0, 55, 210, 0, 0, 900, 3500, 0, 0, 13000, 64000, 0};
     uint16_t ctl2 = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL2);
     return ctl2 & PCIE_DEVCTL2_CT_DISABLE ? 0 : range_ms[ctl2 & 15];
 }
 
-/* 6.6.2: the function completes the reset within 100 ms; when it had requests pending, it is not
-   set up again before their completions had time to arrive (the Completion Timeout it had, or no
-   less than 100 ms where that was disabled). It may then answer with Request Retry Status while
-   it initializes: its ID reads back once it is ready, which polling waits up to a second after a
-   reset for (6.22; 5.9 gives a function 1.0 s after an FLR). The read that returns the ID
-   also follows anything it posted before. The reset clears Bus Master Enable and MSI: what was
-   saved comes back. May sleep. */
+/* FLR must finish in 100 ms (6.6.2), but device-specific initialization may still return RRS.
+   When valid, Readiness Time Reporting (7.9.16) supplies a configuration-ready time: its 9-bit
+   value is multiplied by 32^scale nanoseconds, rounded up to the scheduler's millisecond unit.
+   No generic one-second readiness deadline exists for all PFs. */
 #define FLR_DONE_MS  100
-#define FLR_READY_MS 1000
+static unsigned flr_ready_ms(const struct pci_device *d) {
+    uint16_t cap = pci_find_ext_cap(d, 0x22);
+    if (!cap || !(pci_read32(d->bus, d->dev, d->func, cap + 4) & (1u << 31))) return FLR_DONE_MS;
+    unsigned time = pci_read32(d->bus, d->dev, d->func, cap + 8) & 0xFFF;
+    unsigned scale = time >> 9;
+    if (time > 0xA1E || scale > 5) return FLR_DONE_MS; /* Table 7-280's maximum; scales 6/7 reserved */
+    uint64_t ns = (uint64_t)(time & 0x1FF) << (5 * scale);
+    unsigned ms = (unsigned)((ns + 1000000 - 1) / 1000000);
+    return ms > FLR_DONE_MS ? ms : FLR_DONE_MS;
+}
+
+/* Owned by its enumerated device, not the app performing recovery. A failed readiness check or
+   a cancelled claim must not lose the pre-FLR BARs/ACS or initiate a second FLR over empty state.
+   PCI claim/recovery runs on the BSP; its caller reserves d->claimed across any sleep. */
+struct pci_reset {
+    struct pci_saved state;
+    uint64_t since;
+    unsigned wait;
+};
+
 bool pci_function_reset(struct pci_device *d) {
-    if (!d->pcie_cap || !present(d)) return false;
-    if (!(pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) return false;
-    struct pci_saved s = {0};
-    state_save(d, &s, false);
-    unsigned wait = FLR_DONE_MS;
-    if (pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING) {
-        unsigned timeout = completion_timeout_ms(d);
-        if (timeout > wait) wait = timeout;
-    }
-    pci_write16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL, s.pcie_ctl[0] | PCIE_DEVCTL_FLR);
-    uint64_t since = uptime_ms(), ready_by = wait > FLR_READY_MS ? wait : FLR_READY_MS;
-    while (uptime_ms() - since < wait) sleep_ms(wait - (uptime_ms() - since));
-    for (; pci_read32(d->bus, d->dev, d->func, 0) != s.id; sleep_ms(1))
-        if (uptime_ms() - since >= ready_by) {
-            kprintf("pci: %02x:%02x.%u is not ready %lu ms after its Function Level Reset\n", d->bus, d->dev, d->func,
-                    (unsigned long)ready_by);
-            return false;
+    if (current_task && current_task->killed) return false;
+    struct pci_reset *r = d->reset;
+    if (!r) {
+        if (!d->pcie_cap || !present(d)) return false;
+        if (!(pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR)) return false;
+        uint16_t command = pci_read16(d->bus, d->dev, d->func, 4);
+        pci_write16(d->bus, d->dev, d->func, 4, command & ~PCI_COMMAND_MASTER);
+        if (!present(d)) return false;
+        bool mastering = pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER;
+        unsigned wait = flr_ready_ms(d);
+        if (mastering || (pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING)) {
+            unsigned timeout = completion_timeout_ms(d);
+            /* With completion timeout disabled the specification gives only a 100 ms minimum,
+               not a system-specific stale-completion bound. Do not invent one or reuse tags. */
+            if (!timeout) return false;
+            if (timeout > wait) wait = timeout;
         }
-    state_restore(d, &s);
+        if (!(r = kzalloc(sizeof *r))) return false;
+        state_save(d, &r->state, false);
+        /* Even a failed BME-clear readback must never be replayed after FLR. */
+        r->state.hdr[1] &= ~PCI_COMMAND_MASTER;
+        r->state.pcie_ctl[0] &= ~PCIE_DEVCTL_FLR;
+        r->wait = wait;
+        d->reset = r; /* publish before FLR or any cancellable wait */
+        pci_write16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL,
+                    r->state.pcie_ctl[0] | PCIE_DEVCTL_FLR);
+        r->since = uptime_ms(); /* allow the full delay after the initiating configuration write */
+    }
+    for (;;) {
+        uint64_t elapsed = uptime_ms() - r->since;
+        if (current_task && current_task->killed) return false;
+        if (elapsed >= r->wait) break;
+        sleep_ms(r->wait - elapsed);
+    }
+    if (pci_read32(d->bus, d->dev, d->func, 0) != r->state.id ||
+        (pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVSTA) & PCIE_DEVSTA_PENDING)) {
+        kprintf("pci: %02x:%02x.%u: FLR is not configuration-ready; saved state is retained for recovery\n",
+                d->bus, d->dev, d->func);
+        return false;
+    }
+    state_restore(d, &r->state);
+    if (!present(d) || (pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER)) return false;
+    d->reset = NULL;
+    kfree(r);
     return true;
 }

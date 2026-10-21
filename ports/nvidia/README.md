@@ -110,7 +110,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `nv_alloc_kernel_mapping`／`nv_free_kernel_mapping` | 共有の WB 写し、または view の写し |
 | `nv_alloc_user_mapping`／`nv_free_user_mapping`、`os_match_mmap_offset`、`nv_add_mapping_context_to_file` | クライアントのアドレス＝その写像だけの番地の範囲＋ページ位置＋オフセット（`os_match_mmap_offset` が同じ要求の写像から逆引き）。マップ要求の間だけスレッドに「保留の文脈」を置き、`nvrm_rm_mapping_object` が view ハンドルにしてクライアントへ添付で渡す |
 | `nvrm_irq_enable`（`os_pci.c`） | `n_pci_interrupts(1)`。ここで `nv->flags` に **`NV_FLAG_USES_MSIX`（MSI-X が使えたとき）か `NV_FLAG_USES_MSI`** を立てる（RM は読まない） |
-| `nv_get_screen_info`、`nv_set_dma_address_size`、`nv_requires_dma_remap` | 起動時フレームバッファーを RM に知らせて保護（D8）／マスクの検査／IOMMU が無いので不要 |
+| `nv_get_screen_info`、`nv_set_dma_address_size`、`nv_requires_dma_remap` | 起動時フレームバッファーを RM に知らせて保護（D8）／マスクの検査／native DMAはIOMMUの有無によらず物理アドレスと同じbus addressを返すので追加変換不要 |
 | `os_flush_cpu_cache_all`／`write_combine_buffer`／`user_cache` | x86 の DMA はコヒーレントなので多くは空。WC バッファーは `sfence` |
 | `os_get_random_bytes`、`os_get_version_info` ほか | `n_random`（システムの乱数）、版は "Nocturne OS" の固定値 |
 
@@ -124,7 +124,12 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 
 - **Tegra／SoC**（クロック、I2C、DCE、IMP、BPMP、輝度）：PCI の GPU ではない。
 - **ACPI メソッド**（`_DSM`、`_DDC`、`_DOD`、`_ROM`、MUX、電源）：アプリから AML を実行する手段が無い。
-- **NUMA・ページ・IOMMU・dma-buf・scatter-gather の取り込み・ユーザーページの固定・P2P**：Nocturne にその概念が無い。クライアントのメモリは「共有オブジェクト」で渡す。
+- **NUMA・dma-buf・外部scatter-gatherの取り込み・任意ユーザーページの固定・P2P API**：クライアントのメモリはnative共有オブジェクトで渡す。IOMMU隔離はカーネルのPCI/DMA経路が担当し、nvrmが独自のIOMMU表を作らない。
+
+PCI claimは既定でDMA隔離を必須とする。管理者が`appdrivers-unisolated`を明示すると非隔離利用を許すが、
+全物理メモリへ届く危険がある。異常終了したGPUの非隔離再claimは許可しない。
+`N_PCI_NEEDS_RECOVERY`がある場合、nvrmは未回復をログに残してRMの初期化へ進む。
+起動画面GPUのgeneric FLRやscanoutの再建を行ったという意味ではなく、実GPUの回復は別途受入が必要。
 - **仮想化**（vGPU、GRID、VFIO）、**cgroup**、**IMEX チャンネル**、**能力ファイル**（`nvidia_caps_root` は NULL）。
 - **電源管理**（ランタイムサスペンド、S0ix、動的電源）：未対応。`nv_revoke_gpu_mappings` は、fault 時復元を伴う一時失効を提供できないため、状態・既存写像を変えず `NV_ERR_NOT_SUPPORTED` を返す。永久取消で代用しない。`safe_to_mmap` は独立した新規写像の許可状態で、取消完了の報告とは混同しない。
 - **イベント**：`nv_post_event` はクライアント（`struct nvrm_file`）ごとのキューに積み、`nv_get_event`（`NV_ESC_RM_GET_EVENT_DATA`）で取り出す。プロトコルは要求・応答なのでクライアントがポーリングし、プッシュ通知は無い。`nv_get_file_private` は無し（記述子が無い）。

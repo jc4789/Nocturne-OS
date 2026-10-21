@@ -134,6 +134,7 @@ static NORETURN void finish(enum pm_action action) {
 
 /* ---- sleep (S3) and hibernation ---- */
 static const char *sleep_blocker(bool hibernate) {
+    if (!iommu_power_ready()) return "IOMMU hardware state is unconfirmed";
     const char *why = hibernate ? hibernate_blocker() : !acpi_sleep_supported(3) ? "the firmware has no S3" : NULL;
     if (why) return why;
     if (!wake_available()) return "no wake page below 1 MiB";
@@ -172,18 +173,25 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     uint64_t f = irq_save();
     if (!stuck) stuck = pm_quiesce_devices(true);
     uint32_t pic = pic_state();
+    pic_mask_all();
     ioapic_suspend();
     timer_suspend();
     /* called off, the way back is the one after an enter() that returned */
     bool slept = !stuck && wake_sleep(enter);
     /* awake (or never asleep): the CPU is back; now what it talks to */
+    /* Wake firmware may have enabled plain routes. Stop their sources before any
+       remapping mode transition; the saved routes remain intact for the final restore. */
+    pic_mask_all();
+    ioapic_mask_all();
     lapic_resume();
-    pic_restore(pic);
     serial_init(); /* the log port, reset with the rest */
     /* before anything sends it an interrupt or a request; units that never slept are still on,
        translating with the claims' tables, and are left alone */
-    if (slept) iommu_resume();
+    if (slept && !iommu_resume())
+        panic("IOMMU restore failed; PCI DMA and interrupt delivery remain stopped");
     ioapic_resume();
+    if (slept) pic_restore(pic);
+    else pic_restore_mask((uint16_t)pic); /* no reset occurred: do not erase a pending edge */
     hv_reference_resume(); /* the hypervisor's overlay pages: reset, or the restoring kernel's */
     hv_core_resume();
     int64_t secs = timer_resume();

@@ -114,6 +114,8 @@ void pic_unmask(int irq);
 void pic_mask(int irq);
 void pic_eoi(int irq);
 uint32_t pic_state(void);           /* masks (bit n: IRQ n masked) and, above them, the ELCR */
+uint16_t pic_mask_all(void);        /* mask every source; return the previous masks, without reinitializing */
+void pic_restore_mask(uint16_t masks); /* restore masks only, preserving pending PIC requests */
 void pic_restore(uint32_t state);   /* after S3: pic_init, then that state again */
 void fpu_init(void);
 void cpu_get_brand(char *out);

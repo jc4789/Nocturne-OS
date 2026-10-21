@@ -358,10 +358,10 @@ static int virtio_status(n_handle pci, int set) {
     return status;
 }
 
-/* pcitest flr: a driver that ends with bus mastering on leaves a running device; one with
-   Function Level Reset is reset when its claim ends (QEMU: -device virtio-rng-pci behind a
-   pcie-root-port, which gives it FLR). Its virtio device status reads 0 again, its BARs read as
-   they were and bus mastering is off. */
+/* pcitest flr: release records a crashed driver without waiting for/resetting its device. An
+   isolated next claim performs FLR (QEMU: virtio-rng-pci behind a pcie-root-port). Its virtio
+   device status reads 0, BARs are retained and BME stays off. A nonisolated next claim is refused:
+   resetting the device alone is not permission to reuse the old driver's DMA memory. */
 static void reset_cases(const struct n_pciinfo *list, int n) {
     int at = -1;
     for (int i = 0; i < n && at < 0; i++)
@@ -375,14 +375,25 @@ static void reset_cases(const struct n_pciinfo *list, int n) {
     n_handle pci = n_pci_claim(v->bus, v->dev, v->func);
     CHECK(pci >= 0, "claim the virtio function %02x:%02x.%u: %s", v->bus, v->dev, v->func, n_result_text(pci));
     if (pci < 0) return;
+    struct n_pci_function info;
+    n_result described = n_pci_info(pci, &info);
+    CHECK(described == 0, "describe the FLR function: %s", n_result_text(described));
+    if (described < 0) { n_handle_close(pci); return; }
     n_result bars[6], cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
     for (int i = 0; i < 6; i++) bars[i] = n_pci_config_read(pci, N_PCI_SELF, 0x10 + 4 * (uint32_t)i, 4);
     CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 6) == 0, "command: memory and bus master");
     CHECK(virtio_status(pci, 1) == 1, "the virtio device status takes ACKNOWLEDGE");
     n_handle_close(pci); /* bus mastering still on: the driver did not stop it */
     pci = n_pci_claim(v->bus, v->dev, v->func);
+    if (!(info.flags & N_PCI_ISOLATED)) {
+        CHECK(pci == -N_ERR_NOT_READY, "a crashed nonisolated function cannot be reopened: %s", n_result_text(pci));
+        if (pci >= 0) n_handle_close(pci);
+        return;
+    }
     CHECK(pci >= 0, "claim it again: %s", n_result_text(pci));
     if (pci < 0) return;
+    CHECK(n_pci_info(pci, &info) == 0 && !(info.flags & N_PCI_NEEDS_RECOVERY),
+          "completed FLR cleared the recovery requirement");
     cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
     CHECK(cmd >= 0 && !(cmd & 4), "bus mastering is off after the claim ended: command %llx", (long long)cmd);
     for (int i = 0; i < 6; i++)
@@ -390,6 +401,9 @@ static void reset_cases(const struct n_pciinfo *list, int n) {
     CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 2) == 0, "command: memory");
     int status = virtio_status(pci, -1);
     CHECK(status == 0, "the reset cleared the virtio device status: %d", status);
+    cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd & ~4u) == 0,
+          "the recovered driver leaves bus mastering off");
     n_handle_close(pci);
 }
 
@@ -737,7 +751,15 @@ int main(int argc,char **argv) {
         n_handle_close(back);
         if (left >= 0) n_handle_close(left);
         back = n_pci_claim(e->bus, e->dev, e->func);
-        CHECK(back >= 0 && (n_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0, "a crashed driver's function is stopped");
+        if (info.flags & N_PCI_ISOLATED) {
+            CHECK(back >= 0 && (n_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0,
+                  "an isolated crashed driver's function has bus mastering off");
+            struct n_pci_function recovery;
+            CHECK(back >= 0 && n_pci_info(back, &recovery) == 0 && (recovery.flags & N_PCI_NEEDS_RECOVERY),
+                  "EDU has no generic FLR: native recovery remains explicit");
+        } else {
+            CHECK(back == -N_ERR_NOT_READY, "a crashed nonisolated function is quarantined: %s", n_result_text(back));
+        }
         if (back >= 0) n_handle_close(back);
     }
     screen_cases(list, n);

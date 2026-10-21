@@ -271,9 +271,10 @@ static int64_t stop_tree(int pid, int include_self) {
  * BAR and DMA objects hold their PCI claim. A BAR object dies with the claim's last handle
  * (shared_revoke_claim). Where an IOMMU isolates the function, a DMA object's pages are in its
  * domain from creation until release, which returns them once the IOMMU confirmed the device
- * can no longer reach them. Without one, DMA RAM goes back to the allocator only once the device
- * was seen stopped, or while its driver still runs (freeing what its device still uses is the
- * driver's bug, which nothing stops then). DMA RAM has one memory type for all its mappings and the
+ * can no longer reach them. After a nonisolated claim ends, remaining DMA RAM stays quarantined:
+ * BME clear/Transactions Pending alone do not prove all posted DMA drained. While the claim is
+ * live, caller-driven free still requires the driver's own device synchronization.
+ * DMA RAM has one memory type for all its mappings and the
  * direct map: write-back until the first uncached or write-combining view while nothing maps
  * it, then that type for good (x86 forbids one page with two types). */
 #define SHARED_LEAF (PAGE_SIZE/sizeof(uint64_t))
@@ -592,6 +593,8 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
     if(r<0){pci_user_drop(claim);return r;}
     bytes=ALIGN_UP(bytes,PAGE_SIZE);size_t count=bytes/PAGE_SIZE;
     uint64_t limit=flags&N_DMA_32BIT?0x100000000ull:UINT64_MAX;
+    uint64_t iommu_limit=pci_user_dma_limit(claim);
+    if(iommu_limit<limit)limit=iommu_limit;
     struct vnode *v;struct shared_pages *p;
     if(flags&N_DMA_CONTIGUOUS){
         uint64_t base=pmm_alloc_contig(count);

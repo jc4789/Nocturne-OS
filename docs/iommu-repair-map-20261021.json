@@ -1,0 +1,26 @@
+{
+  "summary": "IOMMU実機向け修理。開始時の既存差分はAGENTS.mdのみ。AMD/Intelのバックエンド、共通隔離、PCIのclaim/resetとNVIDIA接続を責務別に調査・修理する。",
+  "areas": [
+    {"path":"kernel/src/dev/iommu.c","purpose":"root: requester group、隔離方針、domainとDMA寿命"},
+    {"path":"kernel/src/dev/iommu.h","purpose":"root: IOMMU共通契約、backend interface"},
+    {"path":"kernel/src/dev/iommu_intel.c","purpose":"intel: VT-dキュー、変換・割込み、firmware引継ぎ"},
+    {"path":"kernel/src/dev/iommu_amd.c","purpose":"amd: AMD-ViのDTE・command/event・変換・割込み"},
+    {"path":"kernel/src/dev/pci.c","purpose":"pci: configuration保存復元、BMEとFLR"},
+    {"path":"kernel/src/dev/pciuser.c","purpose":"pci: claim終了と再claimの安全な回復、画面所有"},
+    {"path":"kernel/src/dev/pm.c","purpose":"root: IOMMU確認をPCI/割込み再開とsleep許可へ伝播"},
+    {"path":"kernel/src/arch/ioapic.c","purpose":"root: PIC/IOAPICマスク中の形式移行と経路変換の失敗伝播"},
+    {"path":"ports/nvidia","purpose":"root: nvrmの隔離要求・接続資源とnative ABI連携"},
+    {"path":"tests/pcitest.c","purpose":"pci: 実QEMU EDUのDMA・IRQ・claim/reset検証"},
+    {"path":"Makefile","purpose":"root: 既存の差分ビルドとIMG/VHD/VHDX/ISO梱包"}
+  ],
+  "contracts": [
+    "実機仕様が基準。QEMUは模擬デバイスの検証であり実NVIDIA成功の代用ではない。",
+    "日本語のみ。他OS本体を参照しない。GPLv2-onlyを追加しない。人工上限と根拠のない数値を追加しない。native ABIを保全する。",
+    "共有tree。intel/amd/pciは所有ファイル以外を編集せず境界提案を報告。重いビルドとQEMUはrootのみ。",
+    "QEMUは一台、WHPX・4CPU・4096MiB・1080p・AHCI起動・専用snapshot。Hyper-Vと通常data.imgは操作しない。"
+  ],
+  "facts": [
+    {"claim":"IOMMU backendとclaim用domainは実VA/PA幅・leaf判定・bool電源遷移を共有する。既定隔離必須、明示appdrivers-unisolatedだけが固定的な隔離不能のfallbackを許す。","evidence":"kernel/src/dev/iommu.h"}
+  ],
+  "unknowns": ["実機DMA・S3・NVIDIA回復とfirmware引継ぎ", "nvrmの同一主体idle接続によるthread占有と公平性", "EIME/IRREQ実機、FLR中ACS/group probe全体の無アクセス、性能"]
+}

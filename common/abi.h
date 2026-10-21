@@ -233,6 +233,7 @@ struct n_pciinfo {
    addresses: where an IOMMU isolates the function (N_PCI_ISOLATED) its domain maps each DMA
    object at the same address, and nothing else but the firmware's reserved ranges. */
 #define N_PCI_ISOLATED 1u /* n_pci_function.flags: its DMA reaches only the claim's DMA objects */
+#define N_PCI_NEEDS_RECOVERY 2u /* previous driver ended active; native device recovery is required */
 #define N_PCI_BAR_MEMORY 1u
 #define N_PCI_BAR_64BIT 2u
 #define N_PCI_BAR_PREFETCH 4u
@@ -250,7 +251,7 @@ struct n_pci_function {
     uint8_t cls, subcls, progif, interrupt_pin;
     uint32_t msi_vectors, msix_vectors; /* what the function offers, 0 without */
     uint32_t upstream;                  /* N_PCI_TARGET of the bridge above it, or N_PCI_NONE */
-    uint32_t flags;                     /* N_PCI_ISOLATED */
+    uint32_t flags;                     /* N_PCI_ISOLATED, N_PCI_NEEDS_RECOVERY */
     struct n_pci_bar bar[6];
     /* The screen the firmware set up, when its pixels lie in one of this function's BARs
        (framebuffer_bar, else N_PCI_NONE): drivers must keep that memory as it is. */

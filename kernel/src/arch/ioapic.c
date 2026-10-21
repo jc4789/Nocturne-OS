@@ -116,12 +116,19 @@ bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool leve
     return ok;
 }
 
-void ioapic_remap(void) {
+bool ioapic_remap(void) {
     uint64_t f = irq_save();
+    bool ok = true;
     for (unsigned i = 0; i < nios; i++)
-        for (uint32_t pin = 0; pin < ios[i].pins; pin++)
-            if (!(given[i][pin] & RTE_MASK)) rte_write(&ios[i], pin, given[i][pin]);
+        for (uint32_t pin = 0; pin < ios[i].pins; pin++) {
+            uint64_t requested = given[i][pin];
+            if (!(requested & RTE_MASK) && !rte_write(&ios[i], pin, requested)) {
+                given[i][pin] = requested; /* transition rollback, not a new failed route */
+                ok = false;
+            }
+        }
     irq_restore(f);
+    return ok;
 }
 
 bool ioapic_mask(uint32_t gsi) {
@@ -163,6 +170,7 @@ void ioapic_suspend(void) {
         for (uint32_t pin = 0; pin < ios[i].pins && pin < 256; pin++)
             saved_rte[i][pin] = rd(&ios[i], REG_RTE(pin)) | (uint64_t)rd(&ios[i], REG_RTE(pin) + 1) << 32;
     }
+    ioapic_mask_all(); /* saved state is the requested route; no source emits during unit restore */
 }
 
 void ioapic_mask_all(void) {

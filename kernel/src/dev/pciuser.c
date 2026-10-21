@@ -7,9 +7,10 @@
    DMA reaches only the DMA objects made through its claim. The last handle's close stops the
    function: every mapping of its BARs, in any process, loses the device pages; then no
    interrupts, no bus mastering, and the IOMMU blocks it, after which the app's DMA memory can
-   return to the allocator. Without an IOMMU the kernel waits until the function has no request
-   in flight instead, or resets it; a function that does neither in time keeps its DMA pages out
-   of use for good (syscall.c asks pci_user_dma_reusable).
+   return to the allocator. Without a confirmed IOMMU block, DMA pages that outlive the claim
+   stay out of use for good: neither BME nor Transactions Pending proves every posted write
+   arrived. Release never waits for a failed device or resets it (syscall.c asks
+   pci_user_dma_reusable).
    BAR and DMA objects hold the claim record, so a later claim of the same function is a new
    record and the old objects stay dead. */
 #include "kernel.h"
@@ -31,7 +32,6 @@
 #define CLAIM_GUARDS 32  /* registers with bits only the kernel changes (guards_init) */
 
 #define PCI_COMMAND_MEMORY (1u << 1)
-#define PCI_COMMAND_MASTER (1u << 2)
 #define PCI_COMMAND_PARITY (1u << 6)
 
 /* A config dword some of whose bits are the kernel's: a write that would change them is refused. */
@@ -48,7 +48,7 @@ struct pci_claim {
     unsigned vector_base, vectors;
     unsigned refs;   /* the vnode and every BAR or DMA object made through it */
     bool released;   /* the last handle closed: BAR objects are revoked, the function stopped */
-    bool dma_unsafe; /* stopping it was not confirmed: its DMA pages are never reused */
+    bool dma_unsafe; /* the ended claim's IOMMU block was not confirmed: retain its DMA pages */
     unsigned screen_holds; /* n_pci_hold_screen nesting; given back when the claim ends */
     struct guard guards[CLAIM_GUARDS];
     unsigned guard_count;
@@ -130,7 +130,7 @@ static bool screen_holder_stop(const char *why) {
     if (app) screen_holder_stopped = true;
     irq_restore(irq);
     if (!app) return false;
-    kprintf("pci: %02x:%02x.%u: %s; stopping app %d, the screen comes back once the function is stopped\n", d->bus,
+    kprintf("pci: %02x:%02x.%u: %s; stopping app %d; framebuffer writes resume at release, device recovery may be needed\n", d->bus,
             d->dev, d->func, why, app);
     if (task_kill(app) < 0) kprintf("pci: app %d cannot be stopped; the screen stays held\n", app);
     return true;
@@ -179,46 +179,62 @@ static void screen_hold_end(struct pci_claim *c) {
     irq_restore(irq);
 }
 
+/* Readback is not a DMA drain; it only prevents new requests while recovery is deferred. */
+static bool busmaster_off(struct pci_device *d, bool *was_mastering) {
+    uint16_t command = pci_read16(d->bus, d->dev, d->func, 4);
+    if (was_mastering) *was_mastering = (command & PCI_COMMAND_MASTER) != 0;
+    pci_write16(d->bus, d->dev, d->func, 4, command & ~PCI_COMMAND_MASTER);
+    return pci_read32(d->bus, d->dev, d->func, 0) == ((uint32_t)d->device << 16 | d->vendor) &&
+           !(pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER);
+}
+
 /* A driver that is done with its device stops it and then switches bus mastering off: that is
    how it tells the kernel the device will not reach memory again. A device that still masters
    when its claim ends lost its driver in the middle (a crash, or a driver that never stopped
    it), and what runs on it may be running still: a GPU's own firmware keeps the addresses it was
    given, and switching bus mastering off only pauses it until the next driver switches it on.
-   Such a function, or one whose requests are not seen to end, is reset (Function Level Reset,
-   dev/pci.h), which stops what runs on it too; not the one the boot screen is drawn through,
-   which the reset would take with it. Where an IOMMU isolates the function, blocking it there
-   settles the rest: nothing it sends reaches memory any more. Otherwise, unless the reset or the
-   function itself says its requests are done, the DMA memory it was given never returns to the
-   allocator. */
-#define QUIESCE_MS 200
+   Record that recovery is needed, but do not wait for it in process exit. A later non-display
+   claim attempts FLR; the boot display cannot be generically reset without losing its scanout.
+   Where an IOMMU isolates the function, a confirmed block settles DMA lifetime. Otherwise BME
+   clear and no pending non-posted request do not prove that posted requests using other TCs,
+   relaxed ordering or ID ordering have arrived (PCIe 6.0, 6.4). Keep the claim's remaining DMA
+   pages even after a clean driver close; FLR success later is not proof of their drain either. */
 static void claim_release(struct vnode *v) {
     struct pci_claim *c = v->priv;
     struct pci_device *d = c->d;
     c->released = true;
     shared_revoke_claim(c); /* no process reaches the registers any more */
     interrupts_off(c);
-    uint16_t command = pci_read16(d->bus, d->dev, d->func, 4);
-    bool left_running = command & PCI_COMMAND_MASTER;
-    pci_write16(d->bus, d->dev, d->func, 4, command & ~PCI_COMMAND_MASTER);
+    bool left_running;
+    bool stopped = busmaster_off(d, &left_running);
+    if (c->domain && c->domain->nmembers > 1) {
+        /* P2P lets the old driver program every member. FLR resets only its target
+           Function (PCIe 6.0, 6.6.2), not its peers: even a clean primary must be
+           recovered if it becomes another owner's peer. Never wait/reset at exit. */
+        for (unsigned i = 0; i < c->domain->nmembers; i++) {
+            struct pci_device *peer = c->domain->members[i];
+            peer->needs_reset = true;
+            if (peer != d && !busmaster_off(peer, NULL))
+                kprintf("pci: %02x:%02x.%u: peer bus mastering did not stop; group recovery is required\n",
+                        peer->bus, peer->dev, peer->func);
+        }
+    }
     bool blocked = c->domain && iommu_block(c->domain);
-    bool stopped = (pci_read32(d->bus, d->dev, d->func, 0) & 0xFFFF) != 0xFFFF &&
-                   !(pci_read16(d->bus, d->dev, d->func, 4) & PCI_COMMAND_MASTER);
-    bool running = left_running || !stopped || !pci_requests_done(d, QUIESCE_MS);
-    bool screen = screen_bar(d) >= 0;
-    bool reset = running && !screen && pci_function_reset(d);
-    c->dma_unsafe = running && !blocked && !reset;
+    bool running = left_running || !stopped || !pci_requests_done(d, 0);
+    d->needs_reset |= running;
+    c->dma_unsafe = !blocked;
     if (running)
         kprintf("pci: %02x:%02x.%u: %s; %s%s\n", d->bus, d->dev, d->func,
                 left_running ? "its driver ended without stopping it (bus mastering was on)"
                 : !stopped   ? "it does not stop"
                              : "it still has requests in flight",
-                reset ? "it was reset" : blocked ? "the IOMMU keeps it from memory" : "its DMA memory stays out of use",
-                reset ? "" : screen ? " (the boot screen is drawn through it, so it is not reset: what runs on it may "
-                                      "still run)"
-                                    : " (it has no Function Level Reset, or the reset did not complete)");
-    /* A driver that ended while it rebuilt the way to the screen leaves it however it is. The
-       function is stopped now and no process reaches its BARs, so drawing again disturbs nothing
-       that still runs, and it is the only way the desktop can come back. */
+                blocked ? "the IOMMU keeps it from memory" : "its DMA memory stays out of use",
+                "; recovery is deferred to the next driver, not process exit");
+    else if (!blocked)
+        kprintf("pci: %02x:%02x.%u: bus mastering is off, but posted DMA drain is unconfirmed; remaining DMA memory stays out of use\n",
+                d->bus, d->dev, d->func);
+    /* Revoke CPU access before returning screen holds. Resuming CPU framebuffer writes is only
+       a best-effort redraw: neither BME clear nor IOMMU blocking rebuilds a GPU's BAR/scanout. */
     if (c->screen_holds) screen_hold_end(c);
     for (; c->screen_holds; c->screen_holds--)
         if (fb_release()) wm_repaint();
@@ -240,6 +256,7 @@ struct pci_claim *pci_user_hold(struct file *f) {
 void pci_user_drop(struct pci_claim *c) { if (c) claim_drop(c); }
 bool pci_user_revoked(const struct pci_claim *c) { return c && c->released; }
 bool pci_user_dma_reusable(const struct pci_claim *c) { return !c || !c->dma_unsafe; }
+uint64_t pci_user_dma_limit(const struct pci_claim *c) { return iommu_dma_limit(c->domain); }
 bool pci_user_dma_map(struct pci_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
     return !c->domain || iommu_map(c->domain, frames, base, count);
 }
@@ -314,6 +331,48 @@ static bool guarded(const struct pci_claim *c, uint32_t offset, uint32_t width, 
     return false;
 }
 
+/* No app has a handle yet. The attached domain reserves every member across FLR sleeps;
+   the primary is reserved by the caller too. A fresh peer must stop mastering even when
+   it has not belonged to an app. An old app's peer also needs FLR: BME off pauses, not
+   erases, its retained DMA state. Only the new primary can delegate missing generic reset
+   to its native driver; that driver cannot enumerate/recover a dirty display/FLR-less peer. */
+static bool claim_recover(struct pci_claim *c) {
+    struct pci_device *d = c->d;
+    unsigned count = c->domain ? c->domain->nmembers : 1;
+    if (d->needs_reset && !c->domain) return false;
+    for (unsigned i = 0; i < count; i++) {
+        struct pci_device *m = c->domain ? c->domain->members[i] : d;
+        if (current_task && current_task->killed) return false;
+        /* The earlier caller may have left before the FLR wait finished. Rejoin that
+           saved operation before BME/MSI accesses: Requests can be discarded during
+           FLR (6.6.2), so their readback is not a replacement for its remaining wait. */
+        if (m->reset) {
+            if (!pci_function_reset(m) || !pci_msi_disable(m)) return false;
+            m->needs_reset = false;
+        }
+        if (m != d && !busmaster_off(m, NULL) && !m->needs_reset) {
+            m->needs_reset = true;
+            return false;
+        }
+        if (!m->needs_reset) continue;
+        if (!pci_msi_disable(m)) return false; /* do not preserve an old MSI Enable in FLR state */
+        bool screen = screen_bar(m) >= 0;
+        bool flr = m->reset || (m->pcie_cap &&
+            (pci_read32(m->bus, m->dev, m->func, m->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR));
+        if (!screen && flr) {
+            if (!pci_function_reset(m)) return false;
+            m->needs_reset = false;
+        } else if (m != d) {
+            return false;
+        } else {
+            if (!busmaster_off(d, NULL)) return false;
+            kprintf("pci: %02x:%02x.%u: isolated, but native driver recovery is still required%s\n",
+                    d->bus, d->dev, d->func, screen ? "; boot display is not automatically reset" : "");
+        }
+    }
+    return !(current_task && current_task->killed);
+}
+
 int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out) {
     struct task *t = task_process();
     /* Boot options: noappdrivers keeps every function with the kernel; appdrivers=any lets any
@@ -337,15 +396,26 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     c->d = d;
     c->v = v;
     c->refs = 1;
-    guards_init(c);
     /* From here the function reaches only the DMA objects made through the claim. */
     int r = iommu_attach(d, &c->domain);
     if (r < 0) { kfree(c); kfree(v); return r; }
+    d->claimed = true;
+    if (!claim_recover(c)) {
+        /* FLR may still be pending on any member: retain its device-owned saved state,
+           expose no handle, and re-block the whole group before dropping the reservation. */
+        if (c->domain) iommu_domain_free(c->domain);
+        d->claimed = false;
+        kfree(c);
+        kfree(v);
+        return -N_ERR_NOT_READY;
+    }
+    guards_init(c); /* pending FLR is complete: capability offsets/control now describe the handle */
     /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
        decoding off under a running function, and the boot screen may be drawn through it. */
     struct file *f = vfs_open_vnode(v, O_RDWR);
     if (!f) {
         if (c->domain) iommu_domain_free(c->domain);
+        d->claimed = false;
         kfree(c);
         kfree(v);
         return -N_ERR_NO_MEMORY;
@@ -380,6 +450,7 @@ int64_t pci_user_info(struct file *f, struct n_pci_function *out) {
     struct pci_device *up = pci_upstream(d);
     out->upstream = up ? N_PCI_TARGET(up->bus, up->dev, up->func) : N_PCI_NONE;
     out->flags = c->domain ? N_PCI_ISOLATED : 0;
+    if (d->needs_reset) out->flags |= N_PCI_NEEDS_RECOVERY;
     for (unsigned i = 0; i < pci_bar_count(d); i++) {
         uint32_t raw = d->bar[i];
         if (raw & 1) { out->bar[i] = (struct n_pci_bar){.address = raw & ~3u, .flags = N_PCI_BAR_IO}; continue; }

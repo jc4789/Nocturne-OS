@@ -25,6 +25,7 @@
 #define R_CMDBUF    0x0008
 #define R_EVENTLOG  0x0010
 #define R_CONTROL   0x0018
+#define R_EXCL_BASE 0x0020
 #define R_EFR       0x0030
 #define R_PERF_OPT  0x016C
 #define R_CMD_HEAD  0x2000
@@ -38,6 +39,8 @@
 #define CTL_EVENTLOG_EN (1ull << 2)
 #define CTL_EVENTINT_EN (1ull << 3)
 #define CTL_CMDBUF_EN   (1ull << 12)
+#define EXCL_ENABLE    (1ull << 0)
+#define EXCL_ALLOW_ALL (1ull << 1)
 #define ST_EVENT_OVERFLOW (1u << 0)
 #define ST_EVENT_INT      (1u << 1)
 #define ST_COMWAIT_INT    (1u << 2)
@@ -67,6 +70,7 @@
 #define PTE_PR (1ull << 0)
 #define PTE_IR (1ull << 61)
 #define PTE_IW (1ull << 62)
+#define PTE_NEXT_LEVEL (7ull << 9)
 
 enum { CMD_COMPLETION_WAIT = 1, CMD_INV_DEVTAB = 2, CMD_INV_PAGES = 3, CMD_INV_IRT = 5, CMD_INV_ALL = 8 };
 enum { EVENT_ILLEGAL_DTE = 1, EVENT_PAGE_FAULT = 2 };
@@ -83,6 +87,8 @@ struct unit {
     uint8_t type, flags;   /* the IVHD the unit's description came from */
     uint16_t cap;          /* its capability in the function's config space */
     uint64_t efr;
+    uint8_t msi_num;       /* event-log MSI-X entry, IVHD IOMMU info[4:0] */
+    bool hat_dis, event_irq;
     uint64_t cmd, events;  /* rings */
     uint32_t cmd_tail;
     bool lost;             /* a command since the last sync was not done: that sync fails */
@@ -104,18 +110,23 @@ struct alias {
 };
 static struct alias *aliases;
 static size_t naliases, aliases_room;
-static bool parse_lost; /* no memory kept part of the IVRS: the units are not used */
+static bool parse_lost; /* incomplete allocation or malformed IVRS: the units are not used */
+static uint32_t ivinfo;
 
 static struct iommu_hw amd;
 
+#ifndef IOMMU_AMD_HOSTTEST
 static uint64_t rd(const struct unit *u, unsigned off) { return *(volatile uint64_t *)(u->regs + off); }
 static void wr(const struct unit *u, unsigned off, uint64_t v) { *(volatile uint64_t *)(u->regs + off) = v; }
+static uint32_t rd32(const struct unit *u, unsigned off) { return *(volatile uint32_t *)(u->regs + off); }
+static void wr32(const struct unit *u, unsigned off, uint32_t v) { *(volatile uint32_t *)(u->regs + off) = v; }
+#endif
 
 static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 
 /* ---- IVRS ---- */
 static void alias_add(uint16_t first, uint16_t last, uint16_t as) {
-    if (first > last) return;
+    if (first > last) { parse_lost = true; return; }
     struct alias *a = kappend(&aliases, &naliases, &aliases_room, sizeof *a);
     if (a) *a = (struct alias){first, last, as};
     else parse_lost = true;
@@ -124,14 +135,14 @@ static void alias_add(uint16_t first, uint16_t last, uint16_t as) {
 /* IDs the unit sees requests with: covered (a claim may isolate them), and named, so that what
    it cached of them is invalidated where it cannot invalidate everything at once */
 static void listed_add(struct unit *u, uint16_t first, uint16_t last, bool cover) {
-    if (first > last) return;
+    if (first > last) { parse_lost = true; return; }
     if (cover) iommu_cover(first, last);
     struct span *s = kappend(&u->listed, &u->nlisted, &u->listed_room, sizeof *s);
     if (s) *s = (struct span){first, last};
     else parse_lost = true;
 }
 
-/* Device entries (Table 95 on): 4 bytes below type 40h, 8 below 80h, ACPI HID entries (F0h) 22
+/* Device entries (Tables 101-108): 4 bytes below type 40h, 8 below 80h, ACPI HID entries (F0h) 22
    plus their UID. Select (02h, 42h, 46h), all (01h), and ranges from a start (03h, 43h, 47h) to
    an end (04h); 42h and 43h add the ID the requests arrive as. Special devices (48h) are the
    IOAPICs and HPETs, the platform's. Their DTE settings (byte 3: the LINT, NMI, INIT and ExtInt
@@ -139,25 +150,32 @@ static void listed_add(struct unit *u, uint16_t first, uint16_t last, bool cover
 static void parse_devices(struct unit *u, const uint8_t *b, uint32_t at, uint32_t end) {
     uint16_t first = 0, as = 0;
     bool range = false, alias_range = false;
-    while (at + 4 <= end) {
+    while (end - at >= 4) {
         uint8_t type = b[at];
-        uint32_t len = type < 0x40 ? 4 : type < 0x80 ? 8 : type == 0xF0 && at + 22 <= end ? 22u + b[at + 21] : 0;
-        if (!len || at + len > end) break;
+        uint32_t len = type < 0x40 ? 4 : type < 0x80 ? 8 : type == 0xF0 && end - at >= 22 ? 22u + b[at + 21] : 0;
+        if (!len || len > end - at) { parse_lost = true; return; }
         uint16_t id = u16(b + at + 1);
         switch (type) {
         case 0x01: listed_add(u, 0, 0xFFFF, true); break;
         case 0x02: case 0x46: listed_add(u, id, id, true); break;
-        case 0x03: case 0x47: first = id, range = true, alias_range = false; break;
+        case 0x03: case 0x47:
+            if (range) parse_lost = true;
+            first = id, range = true, alias_range = false;
+            break;
         case 0x42:
             listed_add(u, id, id, true);
-            listed_add(u, u16(b + at + 5), u16(b + at + 5), false);
+            listed_add(u, u16(b + at + 5), u16(b + at + 5), true);
             alias_add(id, id, u16(b + at + 5));
             break;
-        case 0x43: first = id, as = u16(b + at + 5), range = alias_range = true; break;
+        case 0x43:
+            if (range) parse_lost = true;
+            first = id, as = u16(b + at + 5), range = alias_range = true;
+            break;
         case 0x04:
+            if (!range) parse_lost = true;
             if (range) listed_add(u, first, id, true);
             if (range && alias_range) {
-                listed_add(u, as, as, false);
+                listed_add(u, as, as, true);
                 alias_add(first, id, as);
             }
             range = alias_range = false;
@@ -166,23 +184,31 @@ static void parse_devices(struct unit *u, const uint8_t *b, uint32_t at, uint32_
             iommu_kernel_id(u16(b + at + 5));
             listed_add(u, u16(b + at + 5), u16(b + at + 5), false);
             break;
-        case 0xF0: listed_add(u, id, id, false); break;
+        case 0xF0:
+            iommu_kernel_id(id); /* ACPI-named platform device: not a PCI claim's requester */
+            listed_add(u, id, id, false);
+            break;
         }
         at += len;
     }
+    if (at != end || range) parse_lost = true;
 }
 
 /* IVMD: memory a function reaches by DMA from the firmware's start: unity mapped with the
    access its IR and IW flags give (none: not mapped), or excluded from translation (then
    reached as it is, the flags ignored). A claimed function's domain maps it as it is. */
 static void parse_memory(const uint8_t *b) {
+    if (b[0] != 0x20 && u16(b + 8)) return; /* PCI segment, Table 110 */
     unsigned flags = b[1], access = flags & 8 ? IOMMU_READ | IOMMU_WRITE
-                                  : flags & 1 ? (flags & 2 ? IOMMU_READ : 0) | (flags & 4 ? IOMMU_WRITE : 0) : 0;
-    if (!access) return;
+                                  : (flags & 2 ? IOMMU_READ : 0) | (flags & 4 ? IOMMU_WRITE : 0);
     uint64_t start, length;
     memcpy(&start, b + 16, 8);
     memcpy(&length, b + 24, 8);
     uint16_t first = b[0] == 0x20 ? 0 : u16(b + 4), last = b[0] == 0x20 ? 0xFFFF : b[0] == 0x22 ? u16(b + 6) : first;
+    if (first > last || length > UINT64_MAX - start || start + length > UINT64_MAX - (PAGE_SIZE - 1)) {
+        parse_lost = true;
+        return;
+    }
     if (length) iommu_reserved(first, last, ALIGN_DOWN(start, PAGE_SIZE), ALIGN_UP(start + length, PAGE_SIZE), access);
 }
 
@@ -198,20 +224,22 @@ static bool parse_ivrs(void) {
     const struct acpi_sdt *h = acpi_find("IVRS", 0);
     if (!h || h->length < 48) return false;
     const uint8_t *b = (const uint8_t *)h;
+    memcpy(&ivinfo, b + 36, sizeof ivinfo);
     for (int pass = 0; pass < 2; pass++) {
-        for (uint32_t off = 48; off + 4 <= h->length;) {
+        uint32_t off = 48;
+        for (; h->length - off >= 4;) {
             uint8_t type = b[off];
             uint16_t len = u16(b + off + 2);
-            if (len < 4 || off + len > h->length) break;
-            if ((type == 0x10 || type == 0x11 || type == 0x40) && len >= 24) {
+            if (len < 4 || len > h->length - off) { parse_lost = true; break; }
+            if (type == 0x10 || ((ivinfo & 1) && (type == 0x11 || (h->revision >= 2 && type == 0x40)))) {
+                if (len < (type == 0x10 ? 24 : 40)) { parse_lost = true; break; }
+                if (u16(b + off + 16)) { off += len; continue; } /* this PCI layer addresses segment zero */
                 uint64_t base;
                 memcpy(&base, b + off + 8, 8);
                 struct unit *u = unit_at(base);
-                if (pass == 0 && u16(b + off + 16) != 0) {
-                    kprintf("iommu: AMD-Vi unit at %lx is on PCI segment %u, which Nocturne does not reach\n",
-                            base, u16(b + off + 16));
-                } else if (pass == 0 && !base) {
+                if (pass == 0 && !base) {
                     kprintf("iommu: the IVRS describes an AMD-Vi unit without an address; not used\n");
+                    parse_lost = true;
                 } else if (pass == 0 && !u) {
                     if ((u = kappend(&units, &nunits, &units_room, sizeof *u)))
                         *u = (struct unit){.base = base, .type = type};
@@ -223,14 +251,25 @@ static bool parse_ivrs(void) {
                     uint16_t id = u16(b + off + 4);
                     u->flags = b[off + 1];
                     u->cap = u16(b + off + 6);
+                    /* The capability and its +10h register must fit conventional PCI
+                       configuration space (3.2); no wrap into another function/register. */
+                    if (u->cap < 0x40 || u->cap > 0xEC || (u->cap & 3)) parse_lost = true;
+                    u->msi_num = u16(b + off + 18) & 31;
+                    if (type != 0x10) {
+                        u->hat_dis = (b[off + 20] & 1) != 0;
+                        memcpy(&u->efr, b + off + 24, sizeof u->efr);
+                    }
                     u->fn = pci_find_function(id >> 8, (id >> 3) & 31, id & 7);
+                    iommu_kernel_id(id);
                     parse_devices(u, b, off + (type == 0x10 ? 24 : 40), off + len);
                 }
-            } else if (pass == 1 && type >= 0x20 && type <= 0x22 && len >= 32) {
-                parse_memory(b + off);
+            } else if (pass == 1 && type >= 0x20 && type <= 0x22) {
+                if (len != 32) parse_lost = true;
+                else parse_memory(b + off);
             }
             off += len;
         }
+        if (off != h->length) parse_lost = true;
     }
     return nunits != 0;
 }
@@ -351,7 +390,8 @@ static void event_isr(struct regs *r) {
    lost or a unit did not finish them in time. */
 static bool sync(void) {
     volatile uint64_t *word = phys_to_virt(sems);
-    token++;
+    /* Zero is the pending word, never completion, including at the store field's wrap. */
+    if (!++token) ++token;
     for (size_t i = 0; i < nunits; i++) {
         uint64_t at = sems + i * 8;
         word[i] = 0;
@@ -397,7 +437,7 @@ static void send_entry_flush(const struct iommu_domain *dom) {
 }
 
 static bool amd_attach(struct iommu_domain *dom) {
-    if (!(dom->irt = pmm_alloc_zeroed())) {
+    if (!(dom->irt = iommu_alloc_pages(1))) {
         kprintf("iommu: no memory for an interrupt remapping table\n");
         return false;
     }
@@ -445,6 +485,10 @@ static uint64_t amd_leaf(uint64_t phys, unsigned level, unsigned access) {
     (void)level; /* 4 KiB pages only: NextLevel 0 */
     return phys | (access & IOMMU_READ ? PTE_IR : 0) | (access & IOMMU_WRITE ? PTE_IW : 0) | PTE_PR;
 }
+static bool amd_is_leaf(uint64_t entry, unsigned level) {
+    (void)level;
+    return !(entry & PTE_NEXT_LEVEL) || (entry & PTE_NEXT_LEVEL) == PTE_NEXT_LEVEL;
+}
 
 static uint16_t amd_alias(uint16_t id) {
     for (size_t i = 0; i < naliases; i++)
@@ -476,7 +520,8 @@ static bool amd_msi(struct pci_device *d, unsigned index, unsigned count, uint8_
     *address = iommu_msi_plain(dest);
     *data = dom ? index : vector;
     if (!dom) return true;
-    return index + count <= 1u << IRT_LOG2 && irt_write(dom, index, count, vector, dest, true);
+    return index < 1u << IRT_LOG2 && count && count <= (1u << IRT_LOG2) - index &&
+           irt_write(dom, index, count, vector, dest, true);
 }
 
 static bool amd_msi_clear(struct pci_device *d) {
@@ -490,19 +535,29 @@ static bool amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
 }
 
 /* ---- the units ---- */
-/* Off, also when the firmware left it on, then on with this code's tables. Two features let
-   requests past the device table, and both stay off: MARC's apertures (2.9), whose global enable
+/* Off, also when the firmware left it on, then on with this code's tables. Bypasses stay off:
+   the exclusion range (3.4, offset 0020h), MARC's apertures (2.9), whose global enable
    MarcEn is a control bit never set here, and the performance optimization (3.4.9), which lets
    integrated devices such as GPUs reach memory without the unit, in a register of its own. */
 static bool program(struct unit *u) {
     wr(u, R_CONTROL, 0);
-    if (!status_wait(u, ST_EVENTLOG_RUN | ST_CMDBUF_RUN, 0)) {
+    if ((rd(u, R_CONTROL) & CTL_IOMMU_EN) || !status_wait(u, ST_EVENTLOG_RUN | ST_CMDBUF_RUN, 0)) {
         kprintf("iommu: unit at %lx does not stop its command buffer and event log\n", u->base);
         return false;
     }
+    /* Control=0 does not reset this register. Firmware's Allow=1 would bypass every
+       claimed DTE in its range, including blocked domains (3.4, offset 0020h). */
+    wr(u, R_EXCL_BASE, 0); /* reserved bits must also be written zero (Chapter 3) */
+    if (rd(u, R_EXCL_BASE) & (EXCL_ENABLE | EXCL_ALLOW_ALL)) {
+        kprintf("iommu: unit at %lx retains its firmware exclusion bypass\n", u->base);
+        return false;
+    }
     if (u->efr & EFR_PERF_OPT) {
-        volatile uint32_t *perf = (volatile uint32_t *)(u->regs + R_PERF_OPT);
-        *perf &= ~PERF_OPT_EN;
+        wr32(u, R_PERF_OPT, 0); /* the other bits are reserved (3.4.9) */
+        if (rd32(u, R_PERF_OPT) & PERF_OPT_EN) {
+            kprintf("iommu: unit at %lx retains its performance-optimization bypass\n", u->base);
+            return false;
+        }
     }
     wr(u, R_DEVTAB, devtab | (DT_BYTES / PAGE_SIZE - 1));
     wr(u, R_CMDBUF, u->cmd | RING_LEN);
@@ -522,7 +577,7 @@ static bool program(struct unit *u) {
     if (u->flags & 4) ctl |= 1ull << 9;
     if (u->flags & 8) ctl |= 1ull << 11;
     if (u->flags & 32) ctl |= 1ull << 10;
-    if (event_vector >= 0 && u->fn) ctl |= CTL_EVENTINT_EN;
+    if (u->event_irq) ctl |= CTL_EVENTINT_EN;
     wr(u, R_CONTROL, ctl);
     return commands_started(u);
 }
@@ -550,7 +605,8 @@ static bool units_off(void) {
     bool ok = true;
     for (size_t i = 0; i < nunits; i++) {
         wr(&units[i], R_CONTROL, 0);
-        if (!status_wait(&units[i], ST_EVENTLOG_RUN | ST_CMDBUF_RUN, 0)) {
+        if ((rd(&units[i], R_CONTROL) & CTL_IOMMU_EN) ||
+            !status_wait(&units[i], ST_EVENTLOG_RUN | ST_CMDBUF_RUN, 0)) {
             kprintf("iommu: unit at %lx does not stop\n", units[i].base);
             ok = false;
         }
@@ -558,9 +614,9 @@ static bool units_off(void) {
     return ok;
 }
 
-static void amd_shutdown(void) { units_off(); }
+static bool amd_shutdown(void) { return units_off(); }
 
-static void amd_resume(void) {
+static bool amd_resume(void) {
     bool ok = true;
     for (size_t i = 0; i < nunits; i++) ok &= program(&units[i]);
     if (ok) {
@@ -568,6 +624,7 @@ static void amd_resume(void) {
         ok = sync();
     }
     if (!ok) kprintf("iommu: AMD-Vi did not come back after sleep\n");
+    return ok;
 }
 
 static void tables_free(void) {
@@ -581,17 +638,53 @@ static void tables_free(void) {
     devtab = sems = 0;
 }
 
+/* One PCI function may represent several units and exposes MSI or MSI-X, not necessarily MSI
+   (3.1, Capability+10h). Initialize its MSI-X table once so later units do not mask earlier
+   entries. Every unit keeps its IVHD event message number (Table 91). */
+static void event_interrupts_enable(void) {
+    for (size_t i = 0; i < nunits; i++) {
+        struct pci_device *fn = units[i].fn;
+        if (!fn) continue;
+        bool seen = false;
+        for (size_t j = 0; j < i; j++) seen |= units[j].fn == fn;
+        if (seen) continue;
+        pci_enable_busmaster(fn);
+        if (event_vector < 0) {
+            kprintf("iommu: function %02x:%02x.%u has no event vector\n", fn->bus, fn->dev, fn->func);
+            continue;
+        }
+        unsigned entries = pci_msix_init(fn);
+        bool msi = !entries && pci_msi_enable(fn, (uint8_t)event_vector);
+        for (size_t j = i; j < nunits; j++) {
+            struct unit *u = &units[j];
+            if (u->fn != fn) continue;
+            u->event_irq = entries ? u->msi_num < entries &&
+                pci_msix_route(fn, u->msi_num, (uint8_t)event_vector, lapic_current_id()) : msi && !u->msi_num;
+            if (u->event_irq && entries) pci_msix_mask(fn, u->msi_num, false);
+            if (u->event_irq) {
+                uint64_t ctl = rd(u, R_CONTROL);
+                if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) ctl &= ~CTL_CMDBUF_EN;
+                wr(u, R_CONTROL, ctl | CTL_EVENTINT_EN);
+            } else {
+                kprintf("iommu: unit at %lx has no event interrupt: blocked requests show after commands only\n",
+                        u->base);
+            }
+        }
+        if (entries) pci_msix_function_mask(fn, false);
+    }
+}
+
 /* Only with translation: interrupts pass a unit that is off as they are (an AMD-Vi unit has
    nothing like VT-d's ECAP.IRREQ), so there is no reason to start one without. */
 static bool amd_start(bool translate) {
     if (!translate) return false;
     sem_pages = ALIGN_UP(nunits * 8, PAGE_SIZE) / PAGE_SIZE;
-    devtab = pmm_alloc_contig(DT_BYTES / PAGE_SIZE);
-    sems = pmm_alloc_contig(sem_pages);
+    devtab = iommu_alloc_pages(DT_BYTES / PAGE_SIZE);
+    sems = iommu_alloc_pages(sem_pages);
     bool ok = devtab && sems;
     for (size_t i = 0; i < nunits; i++) {
-        units[i].cmd = pmm_alloc_zeroed();
-        units[i].events = pmm_alloc_zeroed();
+        units[i].cmd = iommu_alloc_pages(1);
+        units[i].events = iommu_alloc_pages(1);
         ok &= units[i].cmd && units[i].events;
     }
     if (!ok) {
@@ -599,8 +692,6 @@ static bool amd_start(bool translate) {
         tables_free();
         return false;
     }
-    memset(phys_to_virt(devtab), 0, DT_BYTES);
-    memset(phys_to_virt(sems), 0, sem_pages * PAGE_SIZE);
     if (!amd.coherent) iommu_cache_flush(phys_to_virt(devtab), DT_BYTES);
     event_vector = irq_vector_alloc(1, 1);
     if (event_vector >= 0) vector_register(event_vector, event_isr);
@@ -618,14 +709,7 @@ static bool amd_start(bool translate) {
         if (off) tables_free(); /* else a unit may still read them: they stay */
         return false;
     }
-    for (size_t i = 0; i < nunits; i++) {
-        struct pci_device *fn = units[i].fn;
-        if (!fn) continue;
-        pci_enable_busmaster(fn); /* the kernel's: no app may claim the unit */
-        if (event_vector < 0 || !pci_msi_enable(fn, (uint8_t)event_vector))
-            kprintf("iommu: unit at %lx has no event interrupt: blocked requests show after commands only\n",
-                    units[i].base);
-    }
+    event_interrupts_enable();
     amd.translating = true;
     kprintf("iommu: AMD-Vi on, %lu unit%s; %lu alias%s, %u reserved range%s: every function passes through "
             "until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s", (unsigned long)naliases,
@@ -639,6 +723,7 @@ static struct iommu_hw amd = {
     .domains = 0xFFFF,
     .table = amd_table,
     .leaf = amd_leaf,
+    .is_leaf = amd_is_leaf,
     .start = amd_start,
     .alias = amd_alias,
     .attach = amd_attach,
@@ -651,26 +736,55 @@ static struct iommu_hw amd = {
     .shutdown = amd_shutdown,
 };
 
+/* Capability+10h, 3.2 (pp203-204); Table86 uses the same encodings in IVinfo. */
+static bool va_width_valid(unsigned bits) { return bits == 32 || bits == 40 || bits == 48 || bits == 64; }
+static bool pa_width_valid(unsigned bits) { return bits == 40 || bits == 48 || bits == 52; }
+
 const struct iommu_hw *iommu_amd_probe(void) {
     if (!parse_ivrs()) return NULL;
     if (parse_lost) {
-        kprintf("iommu: no memory to keep the IVRS: AMD-Vi not used\n");
+        kprintf("iommu: incomplete or malformed IVRS: AMD-Vi not used\n");
         return NULL;
     }
     amd.coherent = true;
+    unsigned summary_va = (ivinfo >> 15) & 0x7F, summary_pa = (ivinfo >> 8) & 0x7F;
+    /* IVinfo summarizes all units. A defined firmware width remains an upper bound;
+       a missing/reserved summary field cannot describe one. Start at the largest
+       architected width in that case, then require a defined width for EVERY unit.
+       Without its PCI function a unit still needs both valid IVinfo widths below. */
+    amd.iova_bits = va_width_valid(summary_va) ? summary_va : 64;
+    amd.phys_bits = pa_width_valid(summary_pa) ? summary_pa : 52;
+    amd.levels = 6; /* maximum host depth, EFR.HATS (3.4) */
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
+        if (u->hat_dis) {
+            kprintf("iommu: unit at %lx cannot translate host addresses\n", u->base);
+            return NULL;
+        }
         if (!(u->regs = vmm_map_mmio(u->base, MMIO_BYTES))) {
             kprintf("iommu: the registers of the AMD-Vi unit at %lx cannot be mapped: AMD-Vi not used\n", u->base);
             return NULL;
         }
         /* without its function the capability header is unknown: assume the cautious answers */
-        uint32_t header = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap) : CAP_NP_CACHE;
-        u->efr = header & CAP_EFR ? rd(u, R_EFR) : 0;
+        uint32_t header = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap)
+                                : CAP_NP_CACHE | (ivinfo & 1 ? CAP_EFR : 0);
+        if (u->type == 0x10) u->efr = header & CAP_EFR ? rd(u, R_EFR) : 0;
+        uint32_t info = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap + 0x10) : ivinfo;
+        unsigned va = (info >> 15) & 0x7F, pa = (info >> 8) & 0x7F;
+        /* Only these widths are defined by Capability+10h (3.2, pp203-204). No guessed
+           width is safe: a high bit could be discarded or a table address truncated. */
+        if (!va_width_valid(va) || !pa_width_valid(pa) || ((u->efr >> 10) & 3) == 3) {
+            kprintf("iommu: unit at %lx reports reserved address widths\n", u->base);
+            return NULL;
+        }
+        amd.iova_bits = MIN(amd.iova_bits, va);
+        amd.phys_bits = MIN(amd.phys_bits, pa);
+        amd.levels = MIN(amd.levels, 4u + ((unsigned)(u->efr >> 10) & 3));
         np_cache |= (header & CAP_NP_CACHE) != 0;
         amd.coherent &= (u->flags & 32) != 0;
         kprintf("iommu: AMD-Vi unit at %lx (IVHD %02xh, function %02x:%02x.%u), extended features %lx\n", u->base,
                 u->type, u->fn ? u->fn->bus : 0, u->fn ? u->fn->dev : 0, u->fn ? u->fn->func : 0, u->efr);
     }
+    amd.iova_bits = MIN(amd.iova_bits, 12 + 9 * amd.levels);
     return &amd;
 }

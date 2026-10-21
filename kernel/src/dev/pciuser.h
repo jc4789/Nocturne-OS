@@ -12,12 +12,14 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
 bool pci_user_is_claim(struct file *f);
 /* The claim record behind a handle, held by a BAR or DMA object for its whole life (NULL when f
    is no claim). revoked: its last handle closed, so its BARs are no longer the app's to map.
-   dma_reusable: the function was seen stopped (or still runs under its driver), so DMA pages
-   it could reach may go back to the allocator. BSP. */
+   dma_reusable: its driver still owns the live claim, or the IOMMU confirmed the ended claim's
+   group is blocked. BME clear alone does not let remaining DMA pages return to the allocator. BSP. */
 struct pci_claim *pci_user_hold(struct file *f);
 void pci_user_drop(struct pci_claim *c);
 bool pci_user_revoked(const struct pci_claim *c);
 bool pci_user_dma_reusable(const struct pci_claim *c);
+/* Exclusive physical address limit imposed by the attached IOMMU's translation widths. */
+uint64_t pci_user_dma_limit(const struct pci_claim *c);
 /* DMA pages made through the claim (frames, or count pages from base when frames is NULL): where
    an IOMMU isolates the function, its domain maps them at their physical addresses. unmap is
    false when the IOMMU did not confirm the function can no longer reach them. BSP. */

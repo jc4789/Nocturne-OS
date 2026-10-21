@@ -143,7 +143,7 @@ void kmain_late(void) {
     }
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
-    ioapic_init(); /* maps and masks the pins; nothing routes through it yet (devices stay on the PIC / MSI) */
+    ioapic_init(); /* non-ExtINT pins masked; preserve any firmware virtual-wire PIC path */
     if (vmbus_init()) {
         hv_input_init();
         hv_util_init();

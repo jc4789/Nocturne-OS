@@ -360,6 +360,9 @@ NV_STATUS nvrm_pci_attach(void) {
         return NV_ERR_GENERIC;
     }
     const struct n_pci_function *g = &d->info;
+    if (g->flags & N_PCI_NEEDS_RECOVERY)
+        nvrm_log("NVRM: the previous driver ended with an active GPU; DMA is isolated, but RM must recover the GPU. "
+                 "The boot display was not reset and recovery is not yet confirmed");
     nv_state_t *nv = &d->nv;
     memset(nv, 0, sizeof *nv);
     nv->os_state = d;
@@ -514,8 +517,9 @@ void NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *base, NvU32 *width, N
    rebuilds BAR1 meanwhile, and a CPU write through BAR1 can disturb that. The system stops
    drawing there (n_pci_hold_screen) until the matching enable. RM keeps the boot screen mapped
    at BAR1 offset 0 through virtual mode when the screen starts there (logged at attach), so
-   drawing then goes on where it was. Only the enable or the end of nvrm's claim (which stops
-   the GPU first) gives the screen back; with boot option fbhold=<s> the system stops nvrm when
+   drawing then goes on where it was. Only the enable or the end of nvrm's claim (which revokes
+   BAR access, interrupts and bus mastering first) releases drawing. This does not guarantee
+   recovery of GPU firmware or scanout; with boot option fbhold=<s> the system stops nvrm when
    a hold lasts that long. */
 void NV_API_CALL os_disable_console_access(void) {
     n_result r = n_pci_hold_screen(nvrm_dev.pci, true);

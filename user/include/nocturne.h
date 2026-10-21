@@ -94,7 +94,9 @@ n_handle n_system_log_open(void); /* a handle whose messages are added to the sy
 n_result n_app_id(n_handle app); /* its identifier; 0 once it has ended */
 /* Drivers in apps (docs/nocturne-native-abi.md §9). Only init may claim a PCI function; it
    hands the N_KIND_PCI handle to the driver app it launches. A claim is exclusive until its
-   last handle closes, which also turns the function's interrupts off. */
+   last handle closes, which also turns the function's interrupts off. Isolation is required
+   unless appdrivers-unisolated was explicitly selected at boot. A device left active needs
+   recovery; n_pci_info reports N_PCI_NEEDS_RECOVERY if generic FLR was not possible. */
 n_handle n_pci_claim(uint8_t bus, uint8_t dev, uint8_t func);
 n_result n_pci_info(n_handle pci, struct n_pci_function *out);
 /* Config space: width 1, 2 or 4 at an offset below 4096 aligned to it. Reads may name another
@@ -114,10 +116,11 @@ n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms);
 /* While the driver changes how the CPU reaches the boot screen in the function's BAR (as
    n_pci_info reports it), the system must not write there. hold true returns once nothing is
    being written and keeps the screen untouched; holds nest, and the last false (or the end of
-   the claim) has the whole screen drawn again. No timeout ever draws over a hold: that is the
+   the claim) resumes framebuffer drawing, not necessarily GPU scanout. It does not guarantee
+   recovery after a driver crash or reset. No timeout ever draws over a hold: that is the
    very race it prevents. The end of the claim stops the function (its BAR mappings, interrupts
-   and bus mastering) before the screen comes back. A driver stuck while it holds is the user's
-   to end: Ctrl+Alt+Esc stops its app, and the end of its claim gives the screen back; so does a
+   and bus mastering) before CPU drawing resumes. A driver stuck while it holds is the user's
+   to end: Ctrl+Alt+Esc stops its app, and the end of its claim releases the hold; so does a
    hold that lasts as long as the boot option fbhold=<s> says (no time by default).
    N_ERR_NOT_FOUND: the boot screen is elsewhere. */
 n_result n_pci_hold_screen(n_handle pci, bool hold);

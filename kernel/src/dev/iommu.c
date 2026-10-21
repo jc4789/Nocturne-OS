@@ -8,6 +8,7 @@
 #include "abi.h"
 #include "arch/cpu.h"
 #include "arch/ioapic.h"
+#include "dev/acpi.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "mm/heap.h"
@@ -16,6 +17,7 @@
 #define PTE_ADDR 0x000FFFFFFFFFF000ull
 
 static const struct iommu_hw *hw;
+static bool restore_failed; /* never downgrade an active domain after an unconfirmed power transition */
 /* attached: the claims' domains; held: blocked without the units' confirmation (iommu_block) */
 static struct iommu_domain *attached, *held;
 static uint8_t domain_used[65536 / 8];
@@ -42,11 +44,11 @@ static void lost(const char *what) {
 
 void iommu_reserved(uint16_t first, uint16_t last, uint64_t start, uint64_t end, unsigned access) {
     access &= IOMMU_READ | IOMMU_WRITE;
-    if (first > last || start >= end || !access) return;
+    if (first > last || start >= end) return;
     for (size_t i = 0; i < nreserved; i++) /* firmware repeats them (one per IVHD type, or scope) */
         if (reserved[i].first == first && reserved[i].last == last && reserved[i].start == start &&
             reserved[i].end == end) {
-            reserved[i].access |= access;
+            reserved[i].access &= access;
             return;
         }
     struct reserved *r = kappend(&reserved, &nreserved, &reserved_room, sizeof *r);
@@ -91,30 +93,56 @@ void iommu_init(void) {
     const struct iommu_hw *found = iommu_amd_probe();
     if (!found) found = iommu_intel_probe();
     if (!found) {
-        kprintf("iommu: %s: a device given to an app reaches all of memory\n",
-                off ? off : "none described (no IVRS or DMAR)");
+        /* A rejected description is not proof that firmware left the hardware stopped.
+           Preserve this uncertainty even when no backend can safely expose callbacks. */
+        bool declared = acpi_find("IVRS", 0) || acpi_find("DMAR", 0);
+        if (declared) restore_failed = true;
+        if (declared)
+            kprintf("iommu: firmware description unusable; hardware stop unconfirmed; app claims and new interrupt routes disabled\n");
+        else kprintf("iommu: %s: app drivers require appdrivers-unisolated to run without isolation\n",
+                     off ? off : "none described (no IVRS or DMAR)");
         return;
     }
     if (!off && described_lost) off = "not used (the firmware's descriptions were not all kept)";
     hw = found; /* table writes need it from here on */
     domain_used[0] |= 3; /* 0 is never used, 1 is the back end's */
-    if (!hw->start(!off)) {
+    /* ExtINT may still be the firmware's virtual-wire PIC path. Prevent the PIC from
+       emitting it until both the units and the IOAPIC route have changed format.
+       Mask-only restore preserves pending PIC requests, unlike PIC reinitialization. */
+    uint64_t irq = irq_save();
+    uint16_t pic = pic_mask_all();
+    ioapic_mask_all();
+    bool started = hw->start(!off);
+    if (started) started = ioapic_remap();
+    if (!started) {
+        /* false may leave a live firmware queue or an unconfirmed command, not merely an
+           unused unit. Do not later approve overwriting its tables during hibernate restore. */
+        bool stopped = hw->shutdown();
+        bool plain = stopped && !hw->interrupt_remapping_required;
+        if (!plain) restore_failed = true;
         hw = NULL;
-        ioapic_remap(); /* entries a back end made remappable go back to the plain format */
-        kprintf("iommu: %s: a device given to an app reaches all of memory\n", off ? off : "not used");
+        if (plain) {
+            /* No table remains active: restore original plain requests, including a
+               route whose remapping failed. Never rewrite routes under uncertain units. */
+            if (!ioapic_remap()) restore_failed = true;
+        } else ioapic_mask_all();
+        if (restore_failed)
+            kprintf("iommu: initialization/interrupt delivery unconfirmed; app claims and new interrupt routes disabled\n");
+        else kprintf("iommu: %s: app drivers require appdrivers-unisolated to run without isolation\n", off ? off : "not used");
     } else if (!hw->translating) {
-        kprintf("iommu: %s remaps interrupts only: a device given to an app reaches all of memory\n", hw->name);
+        kprintf("iommu: %s remaps interrupts only: app drivers require appdrivers-unisolated\n", hw->name);
     }
+    pic_restore_mask(pic);
+    irq_restore(irq);
 }
 
-bool iommu_active(void) { return hw && hw->translating; }
+bool iommu_active(void) { return hw && hw->translating && !restore_failed; }
+bool iommu_power_ready(void) { return !restore_failed; }
 
-/* Waits on the units are bounded by the TSC. Where its rate is unknown (no PIT to measure it
-   against, no hypervisor to say it) one above any x86 CPU's TSC is assumed: a wait then lasts at
-   least as long as asked on every real CPU, longer on a slower TSC, and still ends. */
-#define TSC_HZ_CEILING 10000000000ull
-uint64_t iommu_deadline(unsigned ms) { return rdtsc() + (tsc_hz ? tsc_hz : TSC_HZ_CEILING) / 1000 * ms; }
-bool iommu_expired(uint64_t deadline) { return (int64_t)(rdtsc() - deadline) > 0; }
+/* An unknown clock cannot establish a millisecond wait. Check ready status once, then fail
+   conservatively instead of inventing a maximum x86 frequency or spinning without a bound. */
+uint64_t iommu_deadline(unsigned ms) { return rdtsc() + tsc_hz / 1000 * ms; }
+bool iommu_expired(uint64_t deadline) { return !tsc_hz || (int64_t)(rdtsc() - deadline) >= 0; }
 
 bool iommu_fault_report(void) {
     static uint64_t second;
@@ -129,8 +157,17 @@ bool iommu_fault_report(void) {
 }
 
 void iommu_cache_flush(const volatile void *p, size_t bytes) {
-    uintptr_t at = (uintptr_t)p & ~63ull, end = (uintptr_t)p + bytes;
-    for (; at < end; at += 64) __asm__ volatile("clflush (%0)" ::"r"(at) : "memory");
+    static unsigned line;
+    static bool known;
+    if (!known) {
+        uint32_t a, b, c, d;
+        cpuid(1, 0, &a, &b, &c, &d);
+        if (d & (1u << 19)) line = ((b >> 8) & 0xFF) * 8; /* CPUID.01H:EBX[15:8], eight-byte units */
+        known = true;
+    }
+    if (!line) { __asm__ volatile("wbinvd" ::: "memory"); return; }
+    uintptr_t at = (uintptr_t)p / line * line, end = (uintptr_t)p + bytes;
+    for (; at < end; at += line) __asm__ volatile("clflush (%0)" ::"r"(at) : "memory");
     __asm__ volatile("mfence" ::: "memory");
 }
 
@@ -142,8 +179,57 @@ void iommu_entry_write(volatile uint64_t *e, uint64_t v) {
 /* ---- page tables ---- */
 static unsigned shift_of(unsigned level) { return 12 + 9 * (level - 1); }
 
+/* Reject high bits before indexing or encoding a PTE. Masking an address would instead map a
+   different page, and a wrapped range could silently modify unrelated mappings. */
+static bool range_fits(uint64_t base, size_t count, unsigned bits) {
+    if (!bits || bits > 64 || (base & (PAGE_SIZE - 1))) return false;
+    uint64_t last = bits == 64 ? UINT64_MAX : (1ull << bits) - 1;
+    if (last < PAGE_SIZE - 1) return false;
+    last -= PAGE_SIZE - 1;
+    return base <= last && (!count || count - 1 <= (last - base) / PAGE_SIZE);
+}
+
+uint64_t iommu_alloc_pages(size_t count) {
+    if (!count || count > SIZE_MAX / PAGE_SIZE) return 0;
+    uint64_t base = count == 1 ? pmm_alloc() : pmm_alloc_contig(count);
+    unsigned bits = hw->phys_bits;
+    /* Both back ends encode table addresses in bits 51:12. */
+    if (bits > 52) bits = 52;
+    if (base && !range_fits(base, count, bits)) {
+        for (size_t i = 0; i < count; i++) pmm_free(base + i * PAGE_SIZE);
+        /* Preserve the ordinary allocator's search hint on the hot one-page path. Only a
+           unit narrower than available RAM needs a search from the lowest free frame. */
+        base = count == 1 ? pmm_alloc_contig(1) : 0;
+        if (base && !range_fits(base, count, bits)) {
+            pmm_free(base);
+            base = 0;
+        }
+    }
+    if (base) memset(phys_to_virt(base), 0, count * PAGE_SIZE);
+    return base;
+}
+
+uint64_t iommu_dma_limit(const struct iommu_domain *dom) {
+    if (!dom) return UINT64_MAX;
+    unsigned bits = MIN(hw->iova_bits, hw->phys_bits);
+    unsigned indexed = shift_of(dom->levels) + 9;
+    if (bits > indexed) bits = indexed;
+    if (bits > 52) bits = 52; /* the leaf's physical address field */
+    return bits ? 1ull << bits : 0;
+}
+
+static bool pages_fit(const struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
+    uint64_t limit = iommu_dma_limit(dom);
+    if (!limit || count > SIZE_MAX / PAGE_SIZE) return false;
+    unsigned bits = 63 - __builtin_clzll(limit);
+    if (!frames) return range_fits(base, count, bits);
+    for (size_t i = 0; i < count; i++)
+        if (!range_fits(frames[i], 1, bits)) return false;
+    return true;
+}
+
 static uint64_t table_new(void) {
-    uint64_t t = pmm_alloc_zeroed();
+    uint64_t t = iommu_alloc_pages(1);
     if (t && !hw->coherent) iommu_cache_flush(phys_to_virt(t), PAGE_SIZE);
     return t;
 }
@@ -151,7 +237,7 @@ static uint64_t table_new(void) {
 static void tables_free(uint64_t table, unsigned level) {
     const uint64_t *e = phys_to_virt(table);
     for (unsigned i = 0; level > 1 && i < 512; i++)
-        if (e[i] & 1) tables_free(e[i] & PTE_ADDR, level - 1);
+        if ((e[i] & 1) && !hw->is_leaf(e[i], level)) tables_free(e[i] & PTE_ADDR, level - 1);
     pmm_free(table);
 }
 
@@ -165,7 +251,7 @@ static volatile uint64_t *entry(struct iommu_domain *dom, uint64_t iova, unsigne
             uint64_t t = create ? table_new() : 0;
             if (!t) return NULL;
             iommu_entry_write(e, hw->table(t, l));
-        }
+        } else if (dom->leaf_levels > 1 && hw->is_leaf(*e, l)) return NULL;
         table = *e & PTE_ADDR;
     }
 }
@@ -173,6 +259,7 @@ static volatile uint64_t *entry(struct iommu_domain *dom, uint64_t iova, unsigne
 /* The entries only: a domain no unit uses yet needs no flush. */
 static bool map_range(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count,
                       unsigned access) {
+    if (!pages_fit(dom, frames, base, count)) return false;
     for (size_t i = 0; i < count;) {
         uint64_t pa = frames ? frames[i] : base + i * PAGE_SIZE;
         unsigned level = 1;
@@ -189,15 +276,47 @@ static bool map_range(struct iommu_domain *dom, const uint64_t *frames, uint64_t
     return true;
 }
 
+static bool reserved_for(const struct reserved *r, const struct iommu_domain *dom);
+
+/* Firmware restrictions are maximum access, not permission to allocate such a page to a driver
+   and overwrite its protected PTE. All DMA objects are read/write; restricted pages cannot be
+   used for them. The allocator normally excludes firmware-owned RAM independently. */
+static bool dma_pages_allowed(const struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
+    if (!dom->d) return true; /* the kernel's identity domain, not an app allocation */
+    if (!pages_fit(dom, frames, base, count)) return false;
+    for (size_t r = 0; r < nreserved; r++) {
+        const struct reserved *s = &reserved[r];
+        if (!reserved_for(s, dom)) continue;
+        if (!frames) {
+            if (count && base < s->end && s->start < base + count * PAGE_SIZE) return false;
+        } else for (size_t i = 0; i < count; i++)
+            if (frames[i] < s->end && s->start < frames[i] + PAGE_SIZE) return false;
+    }
+    return true;
+}
+
 bool iommu_map(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
+    if (!dma_pages_allowed(dom, frames, base, count)) return false;
     return map_range(dom, frames, base, count, IOMMU_READ | IOMMU_WRITE) && (!dom->d || hw->flush(dom, false));
 }
 
 bool iommu_unmap(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, size_t count) {
     ASSERT(dom->leaf_levels == 1);
+    /* map_range preflights the complete input before changing any PTE. Its rejected input must
+       not be truncated here either, but it has no mapping to invalidate or DMA pages to pin. */
+    if (!pages_fit(dom, frames, base, count) || !dma_pages_allowed(dom, frames, base, count)) return true;
     for (size_t i = 0; i < count; i++) {
-        volatile uint64_t *e = entry(dom, frames ? frames[i] : base + i * PAGE_SIZE, 1, false);
-        if (e && *e) iommu_entry_write(e, 0);
+        uint64_t pa = frames ? frames[i] : base + i * PAGE_SIZE;
+        volatile uint64_t *e = entry(dom, pa, 1, false);
+        /* A DMA object's lifetime does not end the firmware's reservation. */
+        unsigned access = IOMMU_READ | IOMMU_WRITE;
+        bool present = false;
+        for (size_t r = 0; r < nreserved; r++)
+            if (reserved[r].start <= pa && pa < reserved[r].end && reserved_for(&reserved[r], dom)) {
+                access &= reserved[r].access;
+                present = true;
+            }
+        if (e && *e) iommu_entry_write(e, present && access ? hw->leaf(pa, 1, access) : 0);
     }
     return hw->flush(dom, true);
 }
@@ -513,18 +632,35 @@ static int group_check(const struct pci_device *d, const struct fns *g, struct i
 }
 
 /* ---- the firmware's reserved memory in a domain ----
-   The ranges for the domain's IDs, cut where any of them starts or ends: each piece is mapped
-   with every access a range over it allows. */
+   The ranges for the domain's IDs, cut where any starts or ends. A piece never gains a
+   permission a covering firmware restriction forbids, including an explicit no-access range. */
 static bool reserved_for(const struct reserved *r, const struct iommu_domain *dom) {
     for (unsigned i = 0; i < dom->nids; i++)
         if (dom->ids[i] >= r->first && dom->ids[i] <= r->last) return true;
     return false;
 }
 
-static bool reserved_map(struct iommu_domain *dom) {
-    if (!nreserved) return true;
+/* A permanent firmware mapping must never expose allocator-owned RAM. Intel VT-d 3.16
+   requires OS-visible DMA addresses not to overlap RMRRs. IVMD permissions likewise do not
+   transfer ownership of kernel/app RAM to firmware. A malformed/incomplete memory map is not
+   evidence of exclusion; refuse the domain rather than pin or leak arbitrary live OS pages. */
+static bool reserved_piece_safe(uint64_t start, uint64_t end) {
+    const struct pmm_range *ram;
+    unsigned count = pmm_ram_ranges(&ram);
+    if (!pmm_ram_complete()) return false;
+    for (unsigned i = 0; i < count; i++)
+        if (start < ram[i].end && ram[i].base < end) {
+            kprintf("iommu: firmware DMA reservation %lx..%lx overlaps OS-owned RAM; claim refused\n", start, end);
+            return false;
+        }
+    return true;
+}
+
+static int reserved_map(struct iommu_domain *dom) {
+    if (!nreserved) return 0;
+    if (nreserved > SIZE_MAX / (2 * sizeof(uint64_t))) return -N_ERR_NO_MEMORY;
     uint64_t *cut = kmalloc(nreserved * 2 * sizeof *cut);
-    if (!cut) return false;
+    if (!cut) return -N_ERR_NO_MEMORY;
     size_t n = 0;
     for (size_t r = 0; r < nreserved; r++)
         if (reserved_for(&reserved[r], dom)) {
@@ -537,16 +673,24 @@ static bool reserved_map(struct iommu_domain *dom) {
             cut[k] = cut[k - 1];
             cut[k - 1] = t;
         }
-    bool ok = true;
-    for (size_t i = 0; ok && i + 1 < n; i++) {
-        unsigned access = 0;
+    int result = 0;
+    for (size_t i = 0; !result && i + 1 < n; i++) {
+        unsigned access = IOMMU_READ | IOMMU_WRITE;
+        bool present = false;
         for (size_t r = 0; r < nreserved; r++)
             if (reserved[r].start <= cut[i] && cut[i + 1] <= reserved[r].end && reserved_for(&reserved[r], dom))
-                access |= reserved[r].access;
-        if (access && cut[i] < cut[i + 1]) ok = map_range(dom, NULL, cut[i], (cut[i + 1] - cut[i]) / PAGE_SIZE, access);
+            {
+                access &= reserved[r].access;
+                present = true;
+            }
+        if (present && access && cut[i] < cut[i + 1]) {
+            /* Check effective pieces: a no-access overlap can legitimately exclude OS RAM. */
+            if (!reserved_piece_safe(cut[i], cut[i + 1])) result = -N_ERR_UNSUPPORTED;
+            else if (!map_range(dom, NULL, cut[i], (cut[i + 1] - cut[i]) / PAGE_SIZE, access)) result = -N_ERR_NO_MEMORY;
+        }
     }
     kfree(cut);
-    return ok;
+    return result;
 }
 
 /* ---- domains of claimed functions ---- */
@@ -594,13 +738,17 @@ static void held_retry(void) {
     }
 }
 
-/* What the platform keeps from being isolated is claimed as on a machine without an IOMMU,
-   unless the units block a function of its group: an earlier claim's device may still hold
-   addresses it was given, and nothing else would keep it from memory. */
+/* No automatic loss of the security boundary. The boot opt-in permits only a platform's fixed
+   inability to isolate, never a failed invalidation or an earlier claim's quarantine. */
 static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
     bool blocked = d->iommu_blocked;
     for (size_t i = 0; i < g->n; i++) blocked |= g->at[i]->iommu_blocked;
-    if (!blocked) return 0;
+    if (!blocked && cmdline_has("appdrivers-unisolated")) return 0;
+    if (!blocked) {
+        kprintf("iommu: %02x:%02x.%u: refusing an unisolated app driver (no appdrivers-unisolated opt-in)\n",
+                d->bus, d->dev, d->func);
+        return r;
+    }
     kprintf("iommu: %02x:%02x.%u: its group was blocked when an earlier claim ended, and it cannot be isolated "
             "now\n", d->bus, d->dev, d->func);
     return r;
@@ -608,7 +756,13 @@ static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
 
 int iommu_attach(struct pci_device *d, struct iommu_domain **out) {
     *out = NULL;
-    if (!iommu_active()) return 0;
+    if (restore_failed) return -N_ERR_IO;
+    if (!iommu_active()) {
+        if (cmdline_has("appdrivers-unisolated")) return 0;
+        kprintf("iommu: %02x:%02x.%u: isolation is required but no translating IOMMU is active\n",
+                d->bus, d->dev, d->func);
+        return -N_ERR_UNSUPPORTED;
+    }
     held_retry();
     if (iommu_in_use(d)) {
         kprintf("iommu: %02x:%02x.%u is in another claim's domain, or one whose block the units did not confirm\n",
@@ -626,6 +780,9 @@ int iommu_attach(struct pci_device *d, struct iommu_domain **out) {
                 "is unknown\n", d->bus, d->dev, d->func);
         r = -N_ERR_UNSUPPORTED;
     } else if (group_of(d, &g, &acs) && !(r = group_check(d, &g, &ids, &fixed))) {
+        /* group_check success is not attach success: allocation failure must not return an
+           unisolated claim, even when the administrator did not permit any downgrade. */
+        r = -N_ERR_NO_MEMORY;
         uint16_t id = domain_id_new();
         if (!id) r = -N_ERR_BUSY;
         else if (!(dom = domain_alloc(id, hw->levels, 1))) domain_used[id / 8] &= ~(1u << (id % 8));
@@ -637,8 +794,8 @@ int iommu_attach(struct pci_device *d, struct iommu_domain **out) {
             dom->nids = (unsigned)ids.n;
             g.at = NULL;
             ids.at = NULL;
-            if (reserved_map(dom)) r = 0;
-            else {
+            r = reserved_map(dom);
+            if (r) {
                 domain_release(dom);
                 dom = NULL;
             }
@@ -695,6 +852,7 @@ void iommu_domain_free(struct iommu_domain *dom) {
 /* ---- interrupts and power ---- */
 bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                        uint32_t *address, uint32_t *data) {
+    if (restore_failed) return false;
     if (hw) return hw->msi(d, index, count, vector, dest, address, data);
     if (dest > 0xFF) return false;
     *address = iommu_msi_plain(dest);
@@ -702,16 +860,18 @@ bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, uin
     return true;
 }
 
-bool iommu_msi_clear(struct pci_device *d) { return !hw || hw->msi_clear(d); }
+bool iommu_msi_clear(struct pci_device *d) { return !restore_failed && (!hw || hw->msi_clear(d)); }
 
 bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
-    return !hw || hw->ioapic(ioapic_id, gsi, rte);
+    return !restore_failed && (!hw || hw->ioapic(ioapic_id, gsi, rte));
 }
 
-void iommu_resume(void) {
-    if (hw) hw->resume();
+bool iommu_resume(void) {
+    if (hw && !hw->resume()) restore_failed = true;
+    return !restore_failed;
 }
 
-void iommu_shutdown(void) {
-    if (hw) hw->shutdown();
+bool iommu_shutdown(void) {
+    if (hw && !hw->shutdown()) restore_failed = true;
+    return !restore_failed;
 }

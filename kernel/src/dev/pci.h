@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+struct pci_reset;
 struct pci_device {
     uint8_t bus, dev, func;
     uint16_t vendor, device;
@@ -17,6 +18,8 @@ struct pci_device {
     bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster): no app may claim it */
     bool claimed;      /* an app drives it (dev/pciuser.c) */
     bool iommu_blocked; /* in an ended claim's group: the IOMMU drops what it sends (dev/iommu.c) */
+    bool needs_reset; /* stopped state unconfirmed, or residual state from an ended multi-function group */
+    struct pci_reset *reset; /* saved configuration while an FLR awaits readiness or its caller was cancelled */
 };
 void pci_init(void);
 /* Config space access. offsets are 0..4095: below 256 CF8/CFC or ECAM, 256 and up ECAM only (an
@@ -26,6 +29,7 @@ void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t 
 uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off);
 void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t v);
 void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v);
+#define PCI_COMMAND_MASTER (1u << 2) /* Command.Bus Master Enable (7.5.1.1.3) */
 struct pci_device *pci_find(uint16_t vendor, uint16_t device);
 struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls);
 void pci_enable_busmaster(struct pci_device *d);
@@ -69,8 +73,8 @@ unsigned pci_msix_init(struct pci_device *d);
 bool pci_msix_route(struct pci_device *d, unsigned entry, uint8_t vector, uint32_t dest_apic_id);
 void pci_msix_mask(struct pci_device *d, unsigned entry, bool masked);
 void pci_msix_function_mask(struct pci_device *d, bool masked);
-/* Turns off both MSI and MSI-X: false when interrupt remapping did not confirm the function's
-   messages lead nowhere, so that its vectors must not be given to anything else. */
+/* Turns off both MSI and MSI-X: false when Enable readback or interrupt remapping did not
+   confirm the function's messages lead nowhere; its vectors must not be given to anything else. */
 bool pci_msi_disable(struct pci_device *d);
 /* Registers of the PCI Express capability (PCI Express Base 6.0, 7.5.3), at pcie_cap + offset */
 #define PCIE_DEVCAP  0x04
@@ -81,20 +85,25 @@ bool pci_msi_disable(struct pci_device *d);
 #define PCIE_DEVCTL_FLR         (1u << 15) /* Initiate Function Level Reset */
 #define PCIE_DEVSTA_PENDING     (1u << 5)  /* Transactions Pending */
 #define PCIE_DEVCTL2_CT_DISABLE (1u << 4)  /* Completion Timeout Disable */
-/* After bus mastering is off a function starts no request, but some may still be in flight. A
-   PCI Express function says when none is (Device Status, Transactions Pending), and the config
-   read that sees it so also follows any write it posted before (a completion does not pass a
-   posted write). Waits up to ms for that. A conventional PCI master waits for no completion: its
+/* After bus mastering is off a function starts no memory/I/O request, but some may still be in
+   flight. Transactions Pending reports outstanding non-posted PCIe requests only. A host read
+   flushes TC0 writes under the ordering rules; other TCs and relaxed/ID ordering require the
+   driver's own synchronization (6.4, 2.4). This is not a universal DMA drain. Waits up to ms;
+   ms == 0 checks once without sleeping. A conventional PCI master waits for no completion: its
    memory writes are posted, and the read that saw bus mastering off pulled them out of every
    bridge on the way (PCI Local Bus 3.0, 3.2.5); a read a bridge still holds for it is never
    repeated, and its data is discarded (3.3.3.3.3). So for conventional PCI the function only has
    to still be there. False for a function gone from the bus. May sleep. */
 bool pci_requests_done(const struct pci_device *d, unsigned ms);
 /* Function Level Reset (6.6.2), its configuration saved before and written back after (the MSI-X
-   table's entries excepted: a driver's, which it set up for itself). Afterwards the function
-   starts no request and leaves the memory it was given alone until it is set up again. False
-   when it has no FLR, is gone, or was not ready in time. May sleep: up to its Completion Timeout
-   when requests were pending, otherwise about a second at most. */
+   table's entries excepted: a driver's, which it set up for itself), with Bus Master Enable
+   always cleared in the restored configuration. False when it has no FLR, is gone, is still
+   mastering afterwards, or is not configuration-ready yet. A pending reset keeps its saved
+   configuration for a later call; cancellation must not discard or recapture that state.
+   This resets device state, not an IOMMU drain
+   confirmation: its success alone must not release quarantined DMA pages. May sleep: up to its
+   Completion Timeout when requests were pending, or the FLR/readiness time the function reports.
+   Pending requests with no known Completion Timeout require device/platform recovery instead. */
 bool pci_function_reset(struct pci_device *d);
 /* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (BSP,
    before the drivers resume). pci_suspend allocates and so runs with interrupts on; it returns

@@ -132,14 +132,24 @@ uint32_t pic_state(void) {
     return inb(0x21) | (uint32_t)inb(0xA1) << 8 | (uint32_t)inb(0x4D0) << 16 | (uint32_t)inb(0x4D1) << 24;
 }
 
+uint16_t pic_mask_all(void) {
+    uint16_t masks = inb(0x21) | (uint16_t)inb(0xA1) << 8;
+    pic_restore_mask(UINT16_MAX);
+    return masks;
+}
+
+void pic_restore_mask(uint16_t masks) {
+    outb(0x21, (uint8_t)masks);
+    outb(0xA1, (uint8_t)(masks >> 8));
+}
+
 void pic_restore(uint32_t state) {
     pic_init();
     if ((state >> 16) != 0xFFFF) { /* 0xFFFF: nothing answers there */
         outb(0x4D0, (uint8_t)(state >> 16));
         outb(0x4D1, (uint8_t)(state >> 24));
     }
-    outb(0x21, (uint8_t)state);
-    outb(0xA1, (uint8_t)(state >> 8));
+    pic_restore_mask((uint16_t)state);
 }
 
 void pic_unmask(int irq) {
