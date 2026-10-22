@@ -41,9 +41,12 @@ static int64_t kmsg_read(struct vnode *v, struct file *f, void *buf, uint64_t of
 static int64_t kmsg_read_user(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
     return kmsg_read_common(v, f, buf, off, n, true);
 }
+/* An app's system log lines go where the kernel's own go, the text console included: a driver
+   app (nvrm) has no other place to say how far it got before the screen stops changing. */
 static int64_t kmsg_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
     klog_write(buf, n);
     serial_write(buf, n);
+    fbcon_write_kernel(buf, n);
     return n;
 }
 static struct vnode_ops kmsg_ops = {.read = kmsg_read, .read_user = kmsg_read_user, .write = kmsg_write};

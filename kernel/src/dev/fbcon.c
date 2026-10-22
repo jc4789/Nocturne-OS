@@ -252,12 +252,17 @@ void fbcon_write_kernel(const char *s, size_t n) {
     fbcon_write(s, n);
 }
 
+void fbcon_repaint(void) {
+    if (!ready || !enabled) return;
+    uint64_t f = irq_save();
+    mark(0, cv.h);
+    flush();
+    irq_restore(f);
+}
+
 void fbcon_set_enabled(bool on) {
     enabled = on;
-    if (on && ready) {
-        mark(0, cv.h);
-        flush();
-    }
+    fbcon_repaint();
 }
 
 bool fbcon_enabled(void) { return ready && enabled; }

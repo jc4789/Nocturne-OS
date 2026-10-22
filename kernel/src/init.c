@@ -7,6 +7,7 @@
 #include "dev/fbcon.h"
 #include "dev/fb.h"
 #include "dev/pci.h"
+#include "dev/pciuser.h"
 #include "dev/iommu.h"
 #include "dev/pm.h"
 #include "dev/hibernate.h"
@@ -32,6 +33,9 @@ void rdp_init(void);
 static void console_key_sink(const struct key_event *e) {
     if (!e->pressed) return;
     uint16_t k = e->key;
+    /* while an app's driver holds the screen: stop it, the screen comes back (dev/pciuser.c) */
+    if (k == KEY_ESC && (e->mods & (MOD_CTRL | MOD_ALT)) == (MOD_CTRL | MOD_ALT) && pci_user_screen_take_back())
+        return;
     if (k < 0x80) {
         char c = (char)k;
         if ((e->mods & MOD_CTRL) && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) c &= 0x1F;

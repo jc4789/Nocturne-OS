@@ -1599,7 +1599,7 @@ static int64_t sys_app_id(int h) {
     return r;
 }
 
-/* A handle whose messages are added to the system log (and the serial port). */
+/* A handle whose messages are added to the system log (the serial port and the text console). */
 static int64_t sys_system_log_open(void) {
     struct file *f;
     int r = vfs_open("/dev/kmsg", O_WRONLY, &f);
