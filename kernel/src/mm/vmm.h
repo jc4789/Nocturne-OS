@@ -46,8 +46,11 @@ uint64_t vmm_unmap_page(uint64_t pml4, uint64_t va);
 uint64_t vmm_translate(uint64_t pml4, uint64_t va); /* returns phys or 0 */
 uint64_t vmm_get_pte(uint64_t pml4, uint64_t va);
 uint64_t vmm_get_leaf(uint64_t pml4, uint64_t va); /* the raw 4 KiB leaf, present or not; 0 when none */
+/* Device memory, uncached, at its direct-map address; NULL when a page table could not be allocated
+   (the pages mapped before it stay mapped, as any later call for them would map them again). */
 void *vmm_map_mmio(uint64_t phys, uint64_t size);
-/* Any physical range: RAM through the write-back direct map, everything else as vmm_map_mmio. */
+/* Any physical range: RAM through the write-back direct map, everything else as vmm_map_mmio
+   (NULL likewise). */
 void *vmm_map_phys(uint64_t phys, uint64_t size);
 /* The direct map's memory type of RAM pages (frames, or base on when frames is NULL): the leaf's
    PWT/PCD/PAT bits, 0 for write-back. False when splitting large pages found no memory. */

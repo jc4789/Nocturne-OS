@@ -147,8 +147,13 @@ uint64_t iommu_alloc_pages(size_t count) {
     return (uintptr_t)p;
 }
 void pmm_free(uint64_t p) { (void)p; freed_pages++; } /* allocation lifetime is fixture-owned */
-bool pmm_ram_complete(void) { return ram_complete; }
-unsigned pmm_ram_ranges(const struct pmm_range **out) { *out = model_ram; return model_nram; }
+/* iommu.cの所有判定のモデル: 不完全なmapはOS所有を否定できない。 */
+bool iommu_os_ram(uint64_t start, uint64_t end) {
+    if (!ram_complete) return true;
+    for (unsigned i = 0; i < model_nram; i++)
+        if (start < model_ram[i].end && model_ram[i].base < end) return true;
+    return false;
+}
 uint64_t vmm_translate(uint64_t root, uint64_t va) { (void)root; return mapped_slot ? va : 0; }
 void *vmm_map_mmio(uint64_t pa, uint64_t size) {
     mmio_maps++;

@@ -52,16 +52,21 @@ static bool checksum_ok(const void *p, size_t n) {
 }
 
 const struct acpi_sdt *acpi_map_table(uint64_t phys) {
-    vmm_map_mmio(phys, 4096); /* make sure the header is mapped (uncached is fine for tables) */
-    const struct acpi_sdt *h = phys_to_virt(phys);
+    /* the header first (uncached is fine for tables), then the length it gives */
+    const struct acpi_sdt *h = vmm_map_mmio(phys, 4096);
+    if (!h) return NULL;
     uint32_t len = h->length;
-    if (len > 4096 && len <= MAX_TABLE_LEN) vmm_map_mmio(phys, len);
+    if (len > 4096 && len <= MAX_TABLE_LEN && !vmm_map_mmio(phys, len)) return NULL;
     return h;
 }
 
 static void add_table(uint64_t phys) {
     if (!phys) return;
     const struct acpi_sdt *t = acpi_map_table(phys);
+    if (!t) {
+        kprintf("acpi: no memory to map the table at %lx, skipped\n", phys);
+        return;
+    }
     if (t->length < sizeof *t || t->length > MAX_TABLE_LEN) {
         kprintf("acpi: table at %lx has bad length %u, skipped\n", phys, t->length);
         return;
@@ -82,7 +87,7 @@ static void add_table(uint64_t phys) {
 /* Walk one root table (XSDT: 8-byte entries, RSDT: 4-byte entries). False if the root is unusable. */
 static bool walk_root(uint64_t phys, unsigned entry_size, const char *sig) {
     const struct acpi_sdt *r = acpi_map_table(phys);
-    if (memcmp(r->sig, sig, 4) || r->length < sizeof *r || r->length > MAX_TABLE_LEN ||
+    if (!r || memcmp(r->sig, sig, 4) || r->length < sizeof *r || r->length > MAX_TABLE_LEN ||
         !checksum_ok(r, r->length))
         return false;
     unsigned n = (r->length - sizeof *r) / entry_size;

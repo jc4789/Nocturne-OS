@@ -411,7 +411,6 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
         kfree(v);
         return -N_ERR_NO_MEMORY;
     }
-    d->claimed = true;
     kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d%s\n", bus, dev, func, d->vendor, d->device, t->pid,
             c->domain ? "" : iommu_active() ? "; the IOMMU cannot isolate it: its DMA reaches all of memory"
                                             : "; no IOMMU isolates it: its DMA reaches all of memory");

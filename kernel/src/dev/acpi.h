@@ -16,7 +16,8 @@ struct acpi_sdt {
 void acpi_registry_init(void);
 /* index-th valid table with this signature ("FACP", "APIC", "MCFG", ...), or NULL. Mapped, never freed. */
 const void *acpi_find(const char sig[4], unsigned index);
-/* Map a table that is not in the root tables (the DSDT) given its physical address; no checksum check. */
+/* Map a table that is not in the root tables (the DSDT) given its physical address; no checksum check.
+   NULL when no page table could be allocated for it. */
 const struct acpi_sdt *acpi_map_table(uint64_t phys);
 unsigned acpi_table_count(void);
 const struct acpi_sdt *acpi_table_at(unsigned index);

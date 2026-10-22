@@ -52,8 +52,8 @@ void *kappend(void *at,size_t *n,size_t *room,size_t bytes) {
     }
     return (char *)*(void **)at + (*n)++ * bytes;
 }
-uint64_t pmm_alloc_contig(uint64_t n) {
-    for (size_t i = 0, run = 0; i < ARRAY_SIZE(used); i++) {
+uint64_t pmm_alloc_contig_below(uint64_t n, uint64_t limit) {
+    for (size_t i = 0, run = 0; i < ARRAY_SIZE(used) && (i + 2) * PAGE_SIZE <= limit; i++) {
         run = used[i] ? 0 : run + 1;
         if (run == n) {
             for (size_t j = i + 1 - n; j <= i; j++) used[j] = true;
@@ -63,6 +63,7 @@ uint64_t pmm_alloc_contig(uint64_t n) {
     }
     return 0;
 }
+uint64_t pmm_alloc_contig(uint64_t n) { return pmm_alloc_contig_below(n, UINT64_MAX); }
 uint64_t pmm_alloc(void) { return pmm_alloc_contig(1); }
 uint64_t pmm_alloc_below(uint64_t limit) {
     for (size_t i = 0; i < ARRAY_SIZE(used) && (i + 2) * PAGE_SIZE <= limit; i++)

@@ -10,6 +10,44 @@ static inline uint16_t inw(uint16_t port) { uint16_t v; __asm__ volatile("inw %1
 static inline uint32_t inl(uint16_t port) { uint32_t v; __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 static inline void io_wait(void) { outb(0x80, 0); }
 
+/* Device registers (MMIO): one plain mov of exactly that width, kept in order with every other
+   memory access. Through a volatile dereference the compiler may fold the access into another
+   instruction (a push of an argument, an arithmetic operand), which a hypervisor emulating the
+   register then has to decode; QEMU's WHPX emulator stops at such a push. Memory the CPU shares
+   with devices (rings, tables, frame buffers) is RAM and keeps plain volatile accesses. */
+static inline uint8_t mmio_read8(const volatile void *p) {
+    uint8_t v;
+    __asm__ volatile("movb %1, %0" : "=q"(v) : "m"(*(const volatile uint8_t *)p) : "memory");
+    return v;
+}
+static inline uint16_t mmio_read16(const volatile void *p) {
+    uint16_t v;
+    __asm__ volatile("movw %1, %0" : "=r"(v) : "m"(*(const volatile uint16_t *)p) : "memory");
+    return v;
+}
+static inline uint32_t mmio_read32(const volatile void *p) {
+    uint32_t v;
+    __asm__ volatile("movl %1, %0" : "=r"(v) : "m"(*(const volatile uint32_t *)p) : "memory");
+    return v;
+}
+static inline uint64_t mmio_read64(const volatile void *p) {
+    uint64_t v;
+    __asm__ volatile("movq %1, %0" : "=r"(v) : "m"(*(const volatile uint64_t *)p) : "memory");
+    return v;
+}
+static inline void mmio_write8(volatile void *p, uint8_t v) {
+    __asm__ volatile("movb %1, %0" : "=m"(*(volatile uint8_t *)p) : "q"(v) : "memory");
+}
+static inline void mmio_write16(volatile void *p, uint16_t v) {
+    __asm__ volatile("movw %1, %0" : "=m"(*(volatile uint16_t *)p) : "r"(v) : "memory");
+}
+static inline void mmio_write32(volatile void *p, uint32_t v) {
+    __asm__ volatile("movl %1, %0" : "=m"(*(volatile uint32_t *)p) : "r"(v) : "memory");
+}
+static inline void mmio_write64(volatile void *p, uint64_t v) {
+    __asm__ volatile("movq %1, %0" : "=m"(*(volatile uint64_t *)p) : "r"(v) : "memory");
+}
+
 static inline void cli(void) { __asm__ volatile("cli" ::: "memory"); }
 static inline void sti(void) { __asm__ volatile("sti" ::: "memory"); }
 static inline void hlt(void) { __asm__ volatile("hlt" ::: "memory"); }

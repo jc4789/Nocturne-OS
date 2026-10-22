@@ -76,8 +76,8 @@ static volatile bool rx_irq_pending;
 static bool new_eerd; /* 82574-style EERD layout */
 static struct netif nif = {.driver = "e1000"};
 
-static uint32_t rd(uint32_t r) { return *(volatile uint32_t *)(mmio + r); }
-static void wr(uint32_t r, uint32_t v) { *(volatile uint32_t *)(mmio + r) = v; }
+static uint32_t rd(uint32_t r) { return mmio_read32(mmio + r); }
+static void wr(uint32_t r, uint32_t v) { mmio_write32(mmio + r, v); }
 
 static uint16_t eeprom_read(uint8_t addr) {
     if (new_eerd) wr(REG_EERD, 1 | ((uint32_t)addr << 2));
@@ -273,10 +273,10 @@ bool e1000_probe(void) {
         if (d) new_eerd = ids[i] == 0x10D3;
     }
     if (!d || (d->bar[0] & 1)) return false;
-    pci_enable_busmaster(d);
     uint64_t phys = d->bar[0] & ~0xFULL;
     if ((d->bar[0] & 6) == 4) phys |= (uint64_t)d->bar[1] << 32;
-    mmio = vmm_map_mmio(phys, 0x20000);
+    if (!(mmio = vmm_map_mmio(phys, 0x20000))) return false;
+    pci_enable_busmaster(d);
     hw_reset();
 
     uint32_t ral = rd(REG_RAL), rah = rd(REG_RAH);

@@ -106,23 +106,22 @@ void *NV_API_CALL os_pci_init_handle(NvU32 domain, NvU8 bus, NvU8 slot, NvU8 fun
     return t;
 }
 
+/* RM's osPciRead* return *value without looking at the status, so a failed read stores what
+   a function that does not answer reads as, all ones, instead of leaving it uninitialized. */
 NV_STATUS NV_API_CALL os_pci_read_byte(void *handle, NvU32 offset, NvU8 *value) {
     n_result r = pci_read(handle, offset, 1);
-    if (r < 0) return NV_ERR_GENERIC;
-    *value = (NvU8)r;
-    return NV_OK;
+    *value = r < 0 ? 0xFF : (NvU8)r;
+    return r < 0 ? NV_ERR_GENERIC : NV_OK;
 }
 NV_STATUS NV_API_CALL os_pci_read_word(void *handle, NvU32 offset, NvU16 *value) {
     n_result r = pci_read(handle, offset, 2);
-    if (r < 0) return NV_ERR_GENERIC;
-    *value = (NvU16)r;
-    return NV_OK;
+    *value = r < 0 ? 0xFFFF : (NvU16)r;
+    return r < 0 ? NV_ERR_GENERIC : NV_OK;
 }
 NV_STATUS NV_API_CALL os_pci_read_dword(void *handle, NvU32 offset, NvU32 *value) {
     n_result r = pci_read(handle, offset, 4);
-    if (r < 0) return NV_ERR_GENERIC;
-    *value = (NvU32)r;
-    return NV_OK;
+    *value = r < 0 ? 0xFFFFFFFFu : (NvU32)r;
+    return r < 0 ? NV_ERR_GENERIC : NV_OK;
 }
 
 static NV_STATUS pci_write(void *handle, NvU32 offset, uint32_t width, NvU32 value) {
@@ -644,7 +643,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
 
     /* No scattered retry for big pages: page_size is the GPU's page granularity, and RM promises
        its callers whole aligned chunks of it. When the run cannot be had, the failure goes back
-       to RM, which retries the allocation with 4 KiB pages itself (memdescAlloc). */
+       to RM; sysmemConstruct retries with smaller pages only when the page size was the default. */
     n_handle dma = n_dma_create(nvrm_dev.pci, (size_t)bytes, flags);
     if (dma < 0) {
         free(a);

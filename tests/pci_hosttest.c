@@ -10,8 +10,10 @@
 static struct task *test_current;
 #define current_task test_current
 static bool kill_on_irq_save;
+static unsigned resets;
+/* CF8アクセスもirq_saveを使うため、killはFLR発行後の最初のirq_save（reset_waitの境界）で起こす。 */
 static uint64_t test_irq_save(void) {
-    if (kill_on_irq_save && test_current) test_current->killed = true;
+    if (kill_on_irq_save && resets && test_current) test_current->killed = true;
     return 0;
 }
 static void test_irq_restore(uint64_t flags) { (void)flags; }
@@ -49,7 +51,7 @@ static struct pci_device root_port;
 static bool root_model, require_visibility, refuse_visibility, lose_visibility_on_sleep;
 static bool untimed_request;
 static unsigned root_writes, root_narrow_writes;
-static unsigned resets, sleeps, failures;
+static unsigned sleeps, failures;
 static bool refuse_master_clear, ready_after_reset, cancel_on_sleep, force_master_after_reset;
 static bool force_pending_after_reset;
 static bool block_confirmed;
@@ -171,20 +173,25 @@ static uint32_t *selected_config(void) {
     unsigned bdf=(selected>>8)&0xFFFF;
     if (root_model && bdf == TEST_ROOT_BDF) return root_config;
     CHECK(bdf==0 || bdf==1, "モデルの二機能以外へconfigを送らない");
-    if (root_model && require_visibility && (resets || untimed_request))
-        CHECK(root_config[(TEST_PCIE_CAP + TEST_ROOTCTL) / 4] & TEST_RRS_ENABLE,
-              "保留FLR再開とRRS照会より先に実Root Portのvisibilityを再確認する");
     if (bdf<2 && claim_model && check_pending_access && functions[bdf].reset) {
         struct pci_reset *r=functions[bdf].reset;
         CHECK(timer_ticks-r->since>=r->wait, "pending FLRの残waitより先にconfigへアクセスしない");
     }
     uint32_t *r=bdf==1?peer_config:config;
+    if (root_model && require_visibility && r[0] == PCI_CONFIG_RRS_ID)
+        CHECK(root_config[(TEST_PCIE_CAP + TEST_ROOTCTL) / 4] & TEST_RRS_ENABLE,
+              "初期化中の機能への照会より先に実Root Portのvisibilityを再確認する");
     if (resets && r[0]==PCI_CONFIG_RRS_ID)
         CHECK((selected&0xFC)==0, "RRS中はVendor IDだけを照会し未準備のconfigを復元しない");
     return r;
 }
+static unsigned rrs_reads_left; /* 機能0のVendor ID照会がRRSを返す残り回数（S3復帰の模擬） */
 static uint32_t config_inl(uint16_t port) {
     CHECK(port == 0xCFC, "config読出しport");
+    if (rrs_reads_left && ((selected >> 8) & 0xFFFF) == 0 && (selected & 0xFC) == 0) {
+        rrs_reads_left--;
+        return PCI_CONFIG_RRS_ID;
+    }
     return selected_config()[(selected & 0xFC) / 4];
 }
 static void emulate_flr(void) {
@@ -443,45 +450,83 @@ static struct pci_device visibility_fixture(void) {
     return d;
 }
 
+static uint32_t root_control(void) { return root_config[(TEST_PCIE_CAP + TEST_ROOTCTL) / 4]; }
+
 static void visibility_cases(void) {
+    const uint32_t firmware = (1u << 16) | 0x2B; /* Root Capabilities.RRS visibility、Root ControlはRRS bit以外 */
     struct pci_device d = visibility_fixture();
     require_visibility = true; ready_after_reset = false; ready_at = FLR_DONE_MS + 3;
-    CHECK(pci_function_reset(&d) && root_writes == 1 && root_narrow_writes == 1,
-          "対応Root Portのdefault-off RRS visibilityを一度narrow writeして進行する");
-    CHECK(root_config[(TEST_PCIE_CAP + TEST_ROOTCTL) / 4] == ((1u << 16) | 0x2B | TEST_RRS_ENABLE),
-          "Root Controlの他bitと隣接Root Capabilitiesを保存する");
+    CHECK(pci_function_reset(&d) && root_writes == 2 && root_narrow_writes == 2,
+          "対応Root Portのdefault-off RRS visibilityをFLRからreadinessまでだけnarrow writeで有効にする");
+    CHECK(root_control() == firmware && !root_port.rrs_holds,
+          "readiness後はRoot Controlを元の値へ戻し、他bitと隣接Root Capabilitiesを保存する");
+
+    d = visibility_fixture(); require_visibility = true; ready_after_reset = false; ready_at = FLR_DONE_MS + 3;
+    root_config[(TEST_PCIE_CAP + TEST_ROOTCTL) / 4] |= TEST_RRS_ENABLE;
+    CHECK(pci_function_reset(&d) && !root_writes && root_control() == (firmware | TEST_RRS_ENABLE),
+          "firmwareが既に有効にしていたvisibilityは書かず、reset後も消さない");
 
     d = visibility_fixture(); require_visibility = true; cancel_on_sleep = true;
-    CHECK(!pci_function_reset(&d) && d.reset && resets == 1, "visible FLRの取消でも保存状態を保持する");
+    CHECK(!pci_function_reset(&d) && d.reset && resets == 1 && (root_control() & TEST_RRS_ENABLE),
+          "visible FLRの取消では保存状態とvisibilityの保持を残す");
     root_config[(TEST_PCIE_CAP + TEST_ROOTCTL) / 4] &= ~TEST_RRS_ENABLE;
     cancel_on_sleep = false; test_task.killed = false; check_pending_access = true;
-    CHECK(pci_function_reset(&d) && !d.reset && resets == 1 && root_writes == 2,
-          "Root Control喪失後のpending resetも対象configより前にvisibilityを再確認する");
+    CHECK(pci_function_reset(&d) && !d.reset && resets == 1 && root_control() == firmware && !root_port.rrs_holds,
+          "Root Control喪失後のpending resetも照会前にvisibilityを戻し、完了後に解除する");
 
     d = visibility_fixture(); require_visibility = true; lose_visibility_on_sleep = true;
-    CHECK(pci_function_reset(&d) && root_writes == 2,
-          "FLR待機中のRoot Control喪失もreadiness read前に再設定する");
+    CHECK(pci_function_reset(&d) && root_writes == 3 && root_control() == firmware,
+          "FLR待機中のRoot Control喪失もreadiness read前に再設定し、完了後に解除する");
 
-    for (unsigned mode = 0; mode < 6; mode++) {
+    /* 同じRoot Port下の二機能：先のresetが保留中なら、後のresetの完了でvisibilityを消さない */
+    d = visibility_fixture(); require_visibility = true;
+    memcpy(peer_config, config, sizeof config);
+    struct pci_device peer = d;
+    peer.func = 1;
+    cancel_on_sleep = true;
+    CHECK(!pci_function_reset(&d) && d.reset && root_port.rrs_holds == 1, "一機能目のFLRを保留にする");
+    cancel_on_sleep = false; test_task.killed = false;
+    CHECK(pci_function_reset(&peer) && !peer.reset && root_port.rrs_holds == 1 &&
+          (root_control() & TEST_RRS_ENABLE), "他機能の保留resetがある間はvisibilityを保持する");
+    CHECK(pci_function_reset(&d) && !d.reset && !root_port.rrs_holds && root_control() == firmware,
+          "最後の保留resetの完了でRoot Controlを元へ戻す");
+
+    for (unsigned mode = 0; mode < 2; mode++) {
         d = visibility_fixture();
         if (mode == 0) root_config[(TEST_PCIE_CAP + TEST_ROOTCTL) / 4] &= ~(1u << 16);
         if (mode == 1) root_config[0] = UINT32_MAX;
-        if (mode == 2) root_config[TEST_PCIE_CAP / 4] = 0x10 | (6u << 20);
-        if (mode == 3) root_config[TEST_PCIE_CAP / 4] = 0x05 | (4u << 20);
-        if (mode == 4) root_port.dev = 32;
-        if (mode == 5) root_port.pcie_cap = 0xFC;
-        CHECK(pci_function_reset(&d) && !root_writes,
-              "非対応/不在/別cap/type/不正BDF/短いcapのRoot Portへ書かず従来FLRを妨げない");
+        CHECK(pci_function_reset(&d) && !root_writes && !root_port.rrs_holds,
+              "RRS visibility非対応・応答しないRoot Portへ書かず従来FLRを妨げない");
     }
     d = visibility_fixture(); refuse_visibility = true;
-    CHECK(pci_function_reset(&d) && !(root_config[(TEST_PCIE_CAP + TEST_ROOTCTL) / 4] & TEST_RRS_ENABLE),
-          "visibility書込拒否を可視化成功と偽らず既存ready装置のFLRも拒否しない");
-    CHECK(!reset_rrs_visible(&d), "visibilityのEnable readback拒否をhelperも成功と報告しない");
+    CHECK(pci_function_reset(&d) && root_control() == firmware && !root_port.rrs_holds,
+          "visibility書込拒否でも既存ready装置のFLRを拒否せず、保持を残さない");
     d = visibility_fixture();
     struct pci_device switch_port = {.pcie_type = 6, .pcie_cap = TEST_PCIE_CAP, .upstream = &root_port};
     d.upstream = &switch_port; require_visibility = true;
-    CHECK(pci_function_reset(&d) && root_writes == 1,
+    CHECK(pci_function_reset(&d) && root_writes == 2 && root_control() == firmware,
           "switch portを誤選択せず実上流Root Portの対応だけを使用する");
+}
+
+/* S3復帰：Conventional Reset後の初期化中（RRS）の機能を不在と判定せず、1秒の猶予内で復元する */
+uint64_t tsc_hz;
+static void resume_cases(void) {
+    struct pci_device d = fixture();
+    struct pci_saved s = {0};
+    devices = &d; ndevices = 1; saved = &s;
+    CHECK(pci_suspend() == NULL && saved_valid, "保存できる");
+    config[0x10 / 4] = 0; config[1] = 0; /* 復帰後のreset状態 */
+    tsc_hz = 1000000000ull; rrs_reads_left = 3;
+    pci_resume();
+    CHECK(!rrs_reads_left && config[0x10 / 4] == test_bar && (config[1] & 7) == 7,
+          "RRSを返す間は待ち、準備後に構成を復元する");
+    config[0x10 / 4] = 0; config[1] = 0;
+    tsc_hz = 1000; rrs_reads_left = UINT32_MAX; /* 期限を短くし、永久にRRSを返す機能 */
+    pci_resume();
+    CHECK(config[0x10 / 4] == 0 && rrs_reads_left != UINT32_MAX,
+          "期限を過ぎてもRRSなら復元せず不在扱いにする");
+    rrs_reads_left = 0;
+    devices = NULL; ndevices = 0; saved = NULL; saved_valid = false;
 }
 
 static void claim_release_cases(void) {
@@ -682,6 +727,7 @@ int main(void) {
     recovery_progress_cases();
     completion_history_cases();
     visibility_cases();
+    resume_cases();
     claim_release_cases();
     group_recovery_cases();
     printf("PCIホスト検査: %u件失敗（実機DMA・画面・QEMUは未検証）\n", failures);

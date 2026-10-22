@@ -1395,7 +1395,7 @@ void task_printf_stderr(struct task *t, const char *fmt, ...) {
     irq_restore(flags);
     if (!file) return;
     /* A message channel has no byte write: the text goes as one message. */
-    if (message_channel_is(file)) message_channel_post(file, buf, (size_t)n);
+    if (message_channel_is(file)) message_channel_post(file, buf, (size_t)n, (uint64_t)owner->pid);
     else vfs_write(file, buf, n);
     vfs_close(file);
 }

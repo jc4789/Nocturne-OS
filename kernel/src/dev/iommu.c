@@ -198,11 +198,8 @@ uint64_t iommu_alloc_pages(size_t count) {
     /* Both back ends encode table addresses in bits 51:12. */
     if (bits > 52) bits = 52;
     if (!bits) return 0;
-    uint64_t base = count == 1 ? pmm_alloc_below(1ull << bits) : pmm_alloc_contig(count);
-    if (base && !range_fits(base, count, bits)) {
-        for (size_t i = 0; i < count; i++) pmm_free(base + i * PAGE_SIZE);
-        base = 0;
-    }
+    uint64_t limit = 1ull << bits;
+    uint64_t base = count == 1 ? pmm_alloc_below(limit) : pmm_alloc_contig_below(count, limit);
     if (base) memset(phys_to_virt(base), 0, count * PAGE_SIZE);
     return base;
 }
@@ -638,20 +635,23 @@ static bool reserved_for(const struct reserved *r, const struct iommu_domain *do
     return false;
 }
 
+bool iommu_os_ram(uint64_t start, uint64_t end) {
+    if (!pmm_ram_complete()) return true;
+    const struct pmm_range *ram;
+    unsigned count = pmm_ram_ranges(&ram);
+    for (unsigned i = 0; i < count; i++)
+        if (start < ram[i].end && ram[i].base < end) return true;
+    return false;
+}
+
 /* A permanent firmware mapping must never expose allocator-owned RAM. Intel VT-d 3.16
    requires OS-visible DMA addresses not to overlap RMRRs. IVMD permissions likewise do not
    transfer ownership of kernel/app RAM to firmware. A malformed/incomplete memory map is not
    evidence of exclusion; refuse the domain rather than pin or leak arbitrary live OS pages. */
 static bool reserved_piece_safe(uint64_t start, uint64_t end) {
-    const struct pmm_range *ram;
-    unsigned count = pmm_ram_ranges(&ram);
-    if (!pmm_ram_complete()) return false;
-    for (unsigned i = 0; i < count; i++)
-        if (start < ram[i].end && ram[i].base < end) {
-            kprintf("iommu: firmware DMA reservation %lx..%lx overlaps OS-owned RAM; claim refused\n", start, end);
-            return false;
-        }
-    return true;
+    if (!iommu_os_ram(start, end)) return true;
+    kprintf("iommu: firmware DMA reservation %lx..%lx may overlap OS-owned RAM; claim refused\n", start, end);
+    return false;
 }
 
 static int reserved_map(struct iommu_domain *dom) {

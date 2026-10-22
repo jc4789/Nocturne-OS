@@ -134,14 +134,14 @@ static void message_free(struct message *m) {
 
 bool message_channel_is(struct file *f) { return f && f->vn->ops == &message_ops; }
 
-static struct message *message_new(size_t n) {
+static struct message *message_new(size_t n, uint64_t sender_app) {
     if (n > SIZE_MAX - sizeof(struct message)) return NULL;
     struct message *m = kmalloc(sizeof *m + n);
     if (!m) return NULL;
     m->next = NULL;
     m->size = n;
     m->attached = NULL;
-    m->sender_app = (uint64_t)task_process()->pid;
+    m->sender_app = sender_app;
     return m;
 }
 
@@ -169,7 +169,7 @@ static int64_t message_queue(struct file *f, struct message *m, struct file *att
 }
 
 int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct file *attach) {
-    struct message *m = message_new(n);
+    struct message *m = message_new(n, (uint64_t)task_process()->pid);
     if (!m) return n > SIZE_MAX - sizeof(struct message) ? -N_ERR_TOO_LARGE : -N_ERR_NO_MEMORY;
     /* Copy in fixed pieces: a large message never makes one long
        non-preemptible copy, and a sibling unmapping the source is caught. */
@@ -185,8 +185,8 @@ int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct
     return message_queue(f, m, attach, true);
 }
 
-int64_t message_channel_post(struct file *f, const void *data, size_t n) {
-    struct message *m = message_new(n);
+int64_t message_channel_post(struct file *f, const void *data, size_t n, uint64_t sender_app) {
+    struct message *m = message_new(n, sender_app);
     if (!m) return -N_ERR_NO_MEMORY;
     memcpy(m->bytes, data, n);
     return message_queue(f, m, NULL, false);

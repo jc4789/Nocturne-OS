@@ -462,9 +462,8 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
 void *vmm_map_mmio(uint64_t phys, uint64_t size) {
     uint64_t base = ALIGN_DOWN(phys, PAGE_SIZE);
     uint64_t end = ALIGN_UP(phys + size, PAGE_SIZE);
-    for (uint64_t p = base; p < end; p += PAGE_SIZE) {
-        vmm_map_page(kernel_pml4, hhdm_offset + p, p, PTE_W | PTE_PCD | PTE_PWT | pte_nx);
-    }
+    for (uint64_t p = base; p < end; p += PAGE_SIZE)
+        if (!vmm_map_page(kernel_pml4, hhdm_offset + p, p, PTE_W | PTE_PCD | PTE_PWT | pte_nx)) return NULL;
     return phys_to_virt(phys);
 }
 
@@ -512,7 +511,7 @@ bool vmm_direct_type(const uint64_t *frames, uint64_t base, size_t pages, uint64
 void *vmm_map_phys(uint64_t phys, uint64_t size) {
     uint64_t end = ALIGN_UP(phys + size, PAGE_SIZE);
     for (uint64_t p = ALIGN_DOWN(phys, PAGE_SIZE); p < end; p += PAGE_SIZE)
-        if (!is_ram(p)) vmm_map_mmio(p, PAGE_SIZE);
+        if (!is_ram(p) && !vmm_map_mmio(p, PAGE_SIZE)) return NULL;
     return phys_to_virt(phys);
 }
 

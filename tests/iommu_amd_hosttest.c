@@ -181,6 +181,10 @@ int irq_vector_alloc(unsigned count, unsigned align) { (void)count; (void)align;
 void irq_vector_free(unsigned first, unsigned count) { (void)first; (void)count; }
 void vector_register(int vector, irq_handler_t handler) { (void)vector; (void)handler; }
 uint32_t lapic_current_id(void) { return 0; }
+static bool x2apic;
+bool lapic_x2apic(void) { return x2apic; }
+static uint64_t os_ram_start, os_ram_end;
+bool iommu_os_ram(uint64_t start, uint64_t end) { return start < os_ram_end && os_ram_start < end; }
 void pci_enable_busmaster(struct pci_device *d) { d->kernel_owned = true; }
 bool pci_msi_enable(struct pci_device *d, uint8_t vector) { (void)d; (void)vector; msi_calls++; return true; }
 unsigned pci_msix_init(struct pci_device *d) {
@@ -212,6 +216,7 @@ static void reset(void) {
     firmware = NULL; claimed_domain = NULL; amd.coherent = true; event_vector = -1;
     defer_completion = deliver_late_completion = false;
     pending_address = pending_data = late_address = late_data = 0;
+    x2apic = wide = false; os_ram_start = os_ram_end = 0;
 }
 
 static void put16(uint8_t *b, uint16_t n) { memcpy(b, &n, sizeof n); }
@@ -327,6 +332,15 @@ static void test_ivrs(void) {
     const struct iommu_hw *hw = iommu_amd_probe(&plain_safe);
     CHECK(hw == &amd && amd.levels == 5 && amd.iova_bits == 57 && amd.phys_bits == 52);
     CHECK(units[0].efr & EFR_PERF_OPT); /* IVHD11 EFRがMMIOより優先 */
+    CHECK(!wide); /* xAPICでは32bit IRTE */
+    /* 2.2.5.3: x2APICではXTSupとGASupの両方がある時だけ128bit IRTE。片方だけでは32bitのまま。 */
+    reset(); firmware = h; x2apic = true; put64(hd + 24, 1ull << 10 | EFR_XT | EFR_GA);
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && wide);
+    reset(); firmware = h; x2apic = true; put64(hd + 24, 1ull << 10 | EFR_XT);
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && !wide);
+    reset(); firmware = h; put64(hd + 24, 1ull << 10 | EFR_XT | EFR_GA);
+    CHECK(iommu_amd_probe(&plain_safe) == &amd && !wide);
+    put64(hd + 24, 1ull << 10 | EFR_PERF_OPT);
     reset(); h->length = 48 + 24; put16(hd + 2, 24); firmware = h;
     CHECK(!iommu_amd_probe(&plain_safe) && parse_lost); /* short IVHD11を24byte IVHD10扱いしない */
     reset(); h->length = sizeof table; put16(hd + 2, 44); hd[20] = 1; firmware = h;
@@ -597,10 +611,29 @@ static void test_commands_and_dte(void) {
     CHECK(amd_is_leaf(PTE_PR | PTE_NEXT_LEVEL, 2));
     CHECK(!amd_is_leaf(amd_table(0x200000, 5), 5));
     uint16_t id = 0x110; struct iommu_domain dom = {.id = 7, .ids = &id, .nids = 1};
+    memset(commands, 0, RING_BYTES); units[0].cmd_tail = 0; registers[R_CMD_HEAD / 8] = 0;
     CHECK(amd_block(&dom));
-    CHECK(dte[0] == (DTE_V | DTE_TV) && dte[1] == 7 && dte[2] == DTE_IV);
+    /* Table 7: 解放後に再利用されるIDを、Mode0/root0のblock DTEへ残さない。旧IDのpageは2.4.2で消す。 */
+    CHECK(dte[0] == (DTE_V | DTE_TV) && dte[1] == BLOCK_DOMAIN && dte[2] == DTE_IV);
+    CHECK(commands[2 * 4 + 1] == (CMD_INV_PAGES << 28 | 7));
     uint32_t address, data; claimed_domain = &dom;
     CHECK(!amd_msi(&function, UINT_MAX, 2, 0x60, 0, &address, &data));
+    dom.irt = (uint64_t)calloc(1, PAGE_SIZE);
+    CHECK(amd_msi(&function, 1, 2, 0x60, 0x12, &address, &data) && address == 0xFEE00000u && data == 1);
+    CHECK(((uint32_t *)phys_to_virt(dom.irt))[1] == (1u | 0x12u << 8 | 0x60u << 16));
+    CHECK(!amd_msi(&function, 0, 1, 0x60, 0x100, &address, &data)); /* 32bit IRTEは8bit宛先だけ */
+    /* x2APIC: Figure 19のGuestMode=0形式。Dest[23:0]→31:8、Vector→71:64、Dest[31:24]→127:120。 */
+    wide = true;
+    CHECK(amd_msi(&function, 1, 2, 0x60, 0x12345678, &address, &data) && address == 0xFEE00000u && data == 1);
+    uint64_t *wide_irt = phys_to_virt(dom.irt);
+    CHECK(wide_irt[2] == (1u | 0x345678ull << 8) && wide_irt[3] == (0x60 | 0x12ull << 56));
+    CHECK(wide_irt[4] == (1u | 0x345678ull << 8) && wide_irt[5] == (0x61 | 0x12ull << 56));
+    CHECK(amd_msi(&function, 1, 1, 0x70, 3, &address, &data) && wide_irt[2] == (1u | 3u << 8) && wide_irt[3] == 0x70);
+    CHECK(amd_msi_clear(&function) && !wide_irt[2] && !wide_irt[3] && !wide_irt[4] && !wide_irt[5]);
+    claimed_domain = NULL; /* 未claimの平文MSIは128bit IRTEでも8bit宛先しか持てない */
+    CHECK(!amd_msi(&function, 0, 1, 0x60, 0x100, &address, &data));
+    CHECK(amd_msi(&function, 0, 1, 0x60, 0x12, &address, &data) && address == iommu_msi_plain(0x12) && data == 0x60);
+    wide = false; claimed_domain = &dom; free(phys_to_virt(dom.irt)); dom.irt = 0;
     registers[R_STATUS / 8] = 0; /* command processor faultの再開は当該syncを成功させない */
     CHECK(!amd_block(&dom));
     CHECK(amd_block(&dom)); /* 全invalidationを再発行してから確認する */
@@ -611,6 +644,56 @@ static void test_commands_and_dte(void) {
     control_locked = false; CHECK(amd_shutdown());
     free(phys_to_virt(devtab)); free(phys_to_virt(sems));
     free(phys_to_virt(units[0].cmd)); free(phys_to_virt(units[0].events)); devtab = sems = 0;
+}
+
+static void test_stalled_unit(void) {
+    reset();
+    units = calloc(1, sizeof *units); nunits = units_room = 1;
+    units[0].regs = (void *)registers; units[0].cmd = (uint64_t)calloc(1, RING_BYTES);
+    units[0].events = (uint64_t)calloc(1, RING_BYTES); sems = (uint64_t)calloc(1, PAGE_SIZE);
+    units[0].listed = calloc(1, sizeof *units[0].listed); units[0].nlisted = units[0].listed_room = 1;
+    units[0].listed[0] = (struct span){0x10, 0x10};
+    registers[R_CONTROL / 8] = CTL_IOMMU_EN | CTL_CMDBUF_EN; registers[R_STATUS / 8] = ST_CMDBUF_RUN;
+    /* IASupなし: 掲載IDのDTE/IRTと、block DTEのdomainのpageを消す。 */
+    send_everything_flush();
+    uint32_t *commands = phys_to_virt(units[0].cmd);
+    CHECK(commands[1] == (CMD_INV_PAGES << 28 | BLOCK_DOMAIN));
+    CHECK(commands[5] == (CMD_INV_DEVTAB << 28) && commands[4] == 0x10 && commands[9] == (CMD_INV_IRT << 28));
+    CHECK(sync());
+    /* 止まったユニット: 最初の1件だけ待ち、残り（全ID分）を各100ms待たない。syncで解除。 */
+    units[0].listed[0] = (struct span){0, 0xFFFF};
+    registers[R_CMD_HEAD / 8] = (units[0].cmd_tail + 16) % RING_BYTES;
+    deadline_count = 0;
+    send_everything_flush();
+    CHECK(deadline_count == 1 && units[0].lost && units[0].stalled);
+    CHECK(!sync() && deadline_count == 2 && !units[0].lost && !units[0].stalled);
+    registers[R_CMD_HEAD / 8] = units[0].cmd_tail;
+    CHECK(sync());
+    free(phys_to_virt(sems)); free(phys_to_virt(units[0].cmd)); free(phys_to_virt(units[0].events)); sems = 0;
+}
+
+/* 2.3.1/2.6.4.5: firmwareのSMI filterとStopMark遮断はengineの停止・再有効化で消さない。
+   2.2.5.3: x2APICではXTEnとGAEn（GAMEn=000b）。引継ぎ時の表がOS所有RAMにあれば検出する。 */
+static void test_firmware_bits(void) {
+    reset();
+    units = calloc(1, sizeof *units); nunits = units_room = 1;
+    struct unit *u = &units[0];
+    *u = (struct unit){.regs = (void *)registers, .efr = EFR_XT | EFR_GA};
+    wide = true;
+    registers[R_CONTROL / 8] = CTL_IOMMU_EN | CTL_FIRMWARE | CTL_PPR_EN;
+    CHECK(program(u));
+    CHECK((rd(u, R_CONTROL) & (CTL_FIRMWARE | CTL_XT_EN | CTL_GA_EN | CTL_PPR_EN | 7ull << 25)) ==
+          (CTL_FIRMWARE | CTL_XT_EN | CTL_GA_EN));
+    CHECK(units_off() && rd(u, R_CONTROL) == CTL_FIRMWARE);
+    wide = false; registers[R_CONTROL / 8] = CTL_SMIF_EN | CTL_XT_EN | CTL_GA_EN;
+    CHECK(program(u) && (rd(u, R_CONTROL) & (CTL_FIRMWARE | CTL_XT_EN | CTL_GA_EN)) == CTL_SMIF_EN);
+    registers[R_DEVTAB / 8] = 0x200000 | 1; registers[R_CMDBUF / 8] = 0x400000 | RING_LEN;
+    registers[R_EVENTLOG / 8] = 0x300000 | RING_LEN;
+    os_ram_start = 0x300000; os_ram_end = 0x301000;
+    CHECK(left_in_os_ram(u, CTL_IOMMU_EN | CTL_EVENTLOG_EN));
+    CHECK(!left_in_os_ram(u, CTL_IOMMU_EN | CTL_CMDBUF_EN) && !left_in_os_ram(u, CTL_EVENTLOG_EN));
+    os_ram_start = 0x201000; os_ram_end = 0x202000;
+    CHECK(left_in_os_ram(u, CTL_IOMMU_EN)); /* Size 1は2ページ */
 }
 
 static void test_shared_msix(void) {
@@ -677,7 +760,7 @@ static void test_partial_program(void) {
 int main(void) {
     test_handoff(); test_event_restart(); test_ivrs(); test_probe_widths(); test_commands_and_dte(); test_shared_msix();
     test_probe_rejection_state(); test_probe_depth(); test_optional_stop(); test_bypass_handoff();
-    test_late_completion(); test_partial_program(); reset();
+    test_late_completion(); test_partial_program(); test_stalled_unit(); test_firmware_bits(); reset();
     printf("AMD IOMMU focused検査: %u件、失敗%u件（実機・QEMU未検証）\n", checks, failed);
     return failed ? 1 : 0;
 }

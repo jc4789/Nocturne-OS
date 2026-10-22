@@ -20,6 +20,8 @@ struct pci_device {
     bool iommu_blocked; /* in an ended claim's group: the IOMMU drops what it sends (dev/iommu.c) */
     bool needs_reset; /* stopped state unconfirmed, or residual state from an ended multi-function group */
     struct pci_reset *reset; /* saved configuration while an FLR awaits readiness or its caller was cancelled */
+    unsigned rrs_holds;  /* a Root Port: resets below it awaiting readiness through it (pci.c) */
+    bool rrs_firmware;   /* a Root Port: RRS Software Visibility was already on at the first hold */
 };
 void pci_init(void);
 /* Config space access. offsets are 0..4095: below 256 CF8/CFC or ECAM, 256 and up ECAM only (an
@@ -31,7 +33,7 @@ void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t 
 void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v);
 #define PCI_COMMAND        0x04 /* Command register (7.5.1.1.3), narrow writes preserve Status */
 #define PCI_COMMAND_MASTER (1u << 2) /* Command.Bus Master Enable (7.5.1.1.3) */
-#define PCI_CONFIG_RRS_ID  0xFFFF0001u /* Vendor/Device ID read with RRS Software Visibility (2.3.1) */
+#define PCI_CONFIG_RRS_ID  0xFFFF0001u /* Vendor/Device ID read with RRS Software Visibility (2.3.2) */
 struct pci_device *pci_find(uint16_t vendor, uint16_t device);
 struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls);
 void pci_enable_busmaster(struct pci_device *d);
@@ -117,9 +119,9 @@ bool pci_requests_done(const struct pci_device *d, unsigned ms);
    This resets device state, not an IOMMU drain
    confirmation: its success alone must not release quarantined DMA pages. May sleep, with
    cancellation during scheduler waits: FLR/RTR, or while software-visible RRS reports
-   initialization. A supporting upstream Root Port is enabled and rechecked, but an unsupported
-   platform/RCRB or a rejected enable may still retry inside a synchronous configuration read;
-   cancellation of such hardware retries is not guaranteed here.
+   initialization. The Root Port above shows RRS from the FLR until readiness and then gets its
+   former Root Control back; without one that supports it (an RCiEP, an RCRB root) the Root
+   Complex retries inside the configuration read, which no cancellation can interrupt.
    BME must be confirmed off and pre-FLR Transactions Pending must actually clear for every
    Completion Timeout value: a previous driver may have re-enabled timeout without starting
    timers for existing requests. No invented delay substitutes for that observation or

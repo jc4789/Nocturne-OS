@@ -192,8 +192,8 @@ struct usb_call {
 static struct usb_call *calls, **calls_tail = &calls;
 static struct wait_queue calls_wq;
 
-static inline uint32_t rd32(volatile uint8_t *b, unsigned off) { return *(volatile uint32_t *)(b + off); }
-static inline void wr32(volatile uint8_t *b, unsigned off, uint32_t v) { *(volatile uint32_t *)(b + off) = v; }
+static inline uint32_t rd32(volatile uint8_t *b, unsigned off) { return mmio_read32(b + off); }
+static inline void wr32(volatile uint8_t *b, unsigned off, uint32_t v) { mmio_write32(b + off, v); }
 static inline void wr64(volatile uint8_t *b, unsigned off, uint64_t v) {
     wr32(b, off, (uint32_t)v);
     wr32(b, off + 4, (uint32_t)(v >> 32));
@@ -251,7 +251,7 @@ static uint64_t ring_push(struct ring *r, uint64_t param, uint32_t status, uint3
 
 static void doorbell(struct usb_hc *hc, unsigned slot, unsigned target) {
     barrier();
-    hc->db[slot] = target;
+    mmio_write32(hc->db + slot, target);
 }
 
 /* ---- events ---- */
@@ -1155,8 +1155,11 @@ static bool hc_start(struct usb_hc *hc) {
     /* The BAR is sized only after the firmware let go: the sizing probe turns memory decoding off
      * for a moment, which firmware still driving the controller from SMM would trip over. Until
      * then a provisional window covers the capability, operational and extended registers. */
+    if (!(hc->cap = vmm_map_mmio(base, size))) {
+        kprintf("usb: controller %d: no memory to map its registers\n", hc->index);
+        return false;
+    }
     pci_enable_busmaster(pci);
-    hc->cap = vmm_map_mmio(base, size);
     hc->op = hc->cap + (rd32(hc->cap, 0) & 0xFF);
     uint32_t hcs1 = rd32(hc->cap, 4), hcs2 = rd32(hc->cap, 8), hcc1 = rd32(hc->cap, 0x10);
     hc->max_slots = hcs1 & 0xFF;
@@ -1175,7 +1178,7 @@ static bool hc_start(struct usb_hc *hc) {
             if (v & (1u << 16)) {
                 /* only the OS semaphore byte: a whole-register write could put back a BIOS bit
                  * the firmware cleared in between */
-                *(volatile uint8_t *)(hc->cap + x + 3) = 1;
+                mmio_write8(hc->cap + x + 3, 1);
                 if (!wait_reg(hc->cap, x, 1u << 16, 0, 1000))
                     kprintf("usb: controller %d firmware kept ownership, taking it anyway\n", hc->index);
             }
@@ -1215,7 +1218,10 @@ static bool hc_start(struct usb_hc *hc) {
         kprintf("usb: controller %d register window unusable\n", hc->index);
         return false;
     }
-    if (bar > size) vmm_map_mmio(base, bar > (16u << 20) ? 16u << 20 : bar);
+    if (bar > size && !vmm_map_mmio(base, bar > (16u << 20) ? 16u << 20 : bar)) {
+        kprintf("usb: controller %d: no memory to map its registers\n", hc->index);
+        return false;
+    }
     /* a restart after a fatal error reuses the memory: the reset took it back from the controller */
     if (hc->dcbaa) memset(hc->dcbaa, 0, 4096);
     else if (!(hc->dcbaa = dma_page(&hc->dcbaa_phys))) return false;

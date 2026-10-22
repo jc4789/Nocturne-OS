@@ -26,10 +26,10 @@ static int timer_vector;
    offset/16 + 0x800 のMSR、64bit ICRだけは送信側で別扱いする。 */
 static void lapic_write(uint32_t reg, uint32_t v) {
     if (x2_mode) wrmsr(X2APIC_MSR_BASE + (reg >> 4), v);
-    else lapic[reg / 4] = v;
+    else mmio_write32(lapic + reg / 4, v);
 }
 static uint32_t lapic_read(uint32_t reg) {
-    return x2_mode ? (uint32_t)rdmsr(X2APIC_MSR_BASE + (reg >> 4)) : lapic[reg / 4];
+    return x2_mode ? (uint32_t)rdmsr(X2APIC_MSR_BASE + (reg >> 4)) : mmio_read32(lapic + reg / 4);
 }
 
 void apic_init(void) {
@@ -112,8 +112,8 @@ bool lapic_start_ap(uint32_t apic_id, uint64_t page) {
             wrmsr(X2APIC_ICR, ((uint64_t)apic_id << 32) | cmd[i]);
         } else {
             if (!xapic_ipi_ready()) return false;
-            lapic[0x310 / 4] = apic_id << 24;
-            lapic[0x300 / 4] = cmd[i];
+            mmio_write32(lapic + 0x310 / 4, apic_id << 24);
+            mmio_write32(lapic + 0x300 / 4, cmd[i]);
             if (!xapic_ipi_ready()) return false;
         }
         spin_us(i ? 200 : 10000);
@@ -127,8 +127,8 @@ bool lapic_send_init(uint32_t apic_id) {
         wrmsr(X2APIC_ICR, ((uint64_t)apic_id << 32) | 0x4500);
     } else {
         if (!xapic_ipi_ready()) return false;
-        lapic[0x310 / 4] = apic_id << 24;
-        lapic[0x300 / 4] = 0x4500;
+        mmio_write32(lapic + 0x310 / 4, apic_id << 24);
+        mmio_write32(lapic + 0x300 / 4, 0x4500);
         if (!xapic_ipi_ready()) return false;
     }
     spin_us(10000);
@@ -157,7 +157,7 @@ bool lapic_worker_init(void) {
 
 static bool xapic_ipi_ready(void) {
     for (unsigned i = 0; i < 1000000; i++) {
-        if (!(lapic[0x300 / 4] & (1u << 12))) return true;
+        if (!(mmio_read32(lapic + 0x300 / 4) & (1u << 12))) return true;
         pause();
     }
     return false;
@@ -179,8 +179,8 @@ bool lapic_send_ipi(uint32_t apic_id, uint8_t vector) {
         ok = xapic_ipi_ready();
         if (ok) {
             /* ICR highはxAPIC専用。汎用MSR helperへ0x310を渡さない。 */
-            lapic[0x310 / 4] = apic_id << 24;
-            lapic[0x300 / 4] = vector; /* fixed, physical, edge-triggered */
+            mmio_write32(lapic + 0x310 / 4, apic_id << 24);
+            mmio_write32(lapic + 0x300 / 4, vector); /* fixed, physical, edge-triggered */
             ok = xapic_ipi_ready();
         }
     }

@@ -148,12 +148,12 @@ static uint64_t link_checked;
 static uint32_t macver;
 static struct netif nif = {.driver = "rtl8125"};
 
-static uint8_t rd8(uint32_t r) { return *(volatile uint8_t *)(mmio + r); }
-static uint16_t rd16(uint32_t r) { return *(volatile uint16_t *)(mmio + r); }
-static uint32_t rd32(uint32_t r) { return *(volatile uint32_t *)(mmio + r); }
-static void wr8(uint32_t r, uint8_t v) { *(volatile uint8_t *)(mmio + r) = v; }
-static void wr16(uint32_t r, uint16_t v) { *(volatile uint16_t *)(mmio + r) = v; }
-static void wr32(uint32_t r, uint32_t v) { *(volatile uint32_t *)(mmio + r) = v; }
+static uint8_t rd8(uint32_t r) { return mmio_read8(mmio + r); }
+static uint16_t rd16(uint32_t r) { return mmio_read16(mmio + r); }
+static uint32_t rd32(uint32_t r) { return mmio_read32(mmio + r); }
+static void wr8(uint32_t r, uint8_t v) { mmio_write8(mmio + r, v); }
+static void wr16(uint32_t r, uint16_t v) { mmio_write16(mmio + r, v); }
+static void wr32(uint32_t r, uint32_t v) { mmio_write32(mmio + r, v); }
 
 static void udelay(unsigned us) {
     if (tsc_hz >= 1000000) {
@@ -546,8 +546,8 @@ bool rtl8125_probe(void) {
             net_delay_ms(10);
         }
     }
+    if (!(mmio = vmm_map_mmio(base, size && size < 0x10000 ? size : 0x10000))) return false;
     pci_enable_busmaster(d);
-    mmio = vmm_map_mmio(base, size && size < 0x10000 ? size : 0x10000);
 
     uint32_t txcfg = rd32(TXCFG);
     macver = txcfg & 0xFCF00000;

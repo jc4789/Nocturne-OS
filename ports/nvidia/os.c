@@ -94,14 +94,14 @@ static void log_emit(const char *text, size_t length, bool urgent) {
     if (log_handle >= 0) {
         /* The system log keeps what it is sent as is: each line ends with its own newline. */
         char piece[NVRM_LOG_CHUNK + 1];
-        for (size_t at = 0; at < length || !length;) {
+        size_t at = 0;
+        do {
             size_t part = length - at < NVRM_LOG_CHUNK ? length - at : NVRM_LOG_CHUNK;
             memcpy(piece, text + at, part);
             at += part;
             if (at == length) piece[part++] = '\n';
             n_channel_send(log_handle, piece, part, -1);
-            if (!length) break;
-        }
+        } while (at < length);
     }
     if (log_file_enabled) {
         size_t need = length + 1;
@@ -172,9 +172,10 @@ NV_STATUS NV_API_CALL nv_log_error(nv_state_t *nv, NvU32 error_number, const cha
     return NV_OK;
 }
 
-static NvU32 debug_level;
+/* nv_printf logs everything it is given: RM filters NV_PRINTF itself (nvDbg_PrintMsg), so the
+   level the ResmanDebugLevel registry key passes here is not used. */
 void NV_API_CALL os_dbg_init(void) {}
-void NV_API_CALL os_dbg_set_level(NvU32 level) { debug_level = level; }
+void NV_API_CALL os_dbg_set_level(NvU32 level) { (void)level; }
 void NV_API_CALL os_dbg_breakpoint(void) { nvrm_log("NVRM: os_dbg_breakpoint (ignored)"); }
 /* RM asks for the stack when it reports a failed assertion or a breakpoint. nvrm is built with
    frame pointers (nvrm.mk) and linked at a fixed address, so the saved frame pointers chain
@@ -555,7 +556,13 @@ void *NV_API_CALL os_alloc_rwlock(void) {
     cnd_init(&l->cv);
     return l;
 }
-void NV_API_CALL os_free_rwlock(void *rwlock) { free(rwlock); }
+void NV_API_CALL os_free_rwlock(void *rwlock) {
+    struct nvrm_rwlock *l = rwlock;
+    if (!l) return;
+    cnd_destroy(&l->cv);
+    mtx_destroy(&l->lock);
+    free(l);
+}
 
 NV_STATUS NV_API_CALL os_acquire_rwlock_read(void *rwlock) {
     struct nvrm_rwlock *l = rwlock;

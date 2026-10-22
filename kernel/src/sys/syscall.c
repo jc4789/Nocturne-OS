@@ -597,9 +597,9 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
     if(iommu_limit<limit)limit=iommu_limit;
     struct vnode *v;struct shared_pages *p;
     if(flags&N_DMA_CONTIGUOUS){
-        uint64_t base=pmm_alloc_contig(count);
+        uint64_t base=pmm_alloc_contig_below(count,limit);
         if(!base){pci_user_drop(claim);return -N_ERR_NO_MEMORY;}
-        if(base+bytes>limit || !(p=shared_new(bytes,SHARED_RANGE,0,&v))){
+        if(!(p=shared_new(bytes,SHARED_RANGE,0,&v))){
             for(size_t i=0;i<count;i++)pmm_free(base+i*PAGE_SIZE);
             pci_user_drop(claim);return -N_ERR_NO_MEMORY;
         }

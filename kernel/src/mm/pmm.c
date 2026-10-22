@@ -159,11 +159,11 @@ uint64_t pmm_alloc_zeroed(void) {
     return p;
 }
 
-uint64_t pmm_alloc_contig(uint64_t count) {
+uint64_t pmm_alloc_contig_below(uint64_t count, uint64_t limit) {
     cpu_require_bsp();
     uint64_t f = irq_save();
-    uint64_t run = 0;
-    for (uint64_t p = 256; p < total_pages; p++) {
+    uint64_t run = 0, pages = MIN(total_pages, limit / PAGE_SIZE);
+    for (uint64_t p = 256; p < pages; p++) {
         if (is_used(p)) { run = 0; continue; }
         if (++run == count) {
             uint64_t start = p - count + 1;
@@ -176,6 +176,8 @@ uint64_t pmm_alloc_contig(uint64_t count) {
     irq_restore(f);
     return 0;
 }
+
+uint64_t pmm_alloc_contig(uint64_t count) { return pmm_alloc_contig_below(count, UINT64_MAX); }
 
 void pmm_free(uint64_t phys) {
     cpu_require_bsp();

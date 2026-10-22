@@ -39,6 +39,9 @@ _Static_assert(VERTEX_BYTES <= PAGE_SIZE, "bounded vertex DMA page");
 _Static_assert(sizeof(struct n_gpu_batch) == 1936, "fixed batch ABI");
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "fixed texture blit ABI");
 
+/* Device registers, each touched at its own width (arch/cpu.h mmio_*); the 64-bit ones as two
+   32-bit halves, low first, which virtio 1.x allows for them. Every field sits at its natural
+   alignment. */
 struct virtio_common {
     volatile uint32_t device_feature_select, device_feature;
     volatile uint32_t driver_feature_select, driver_feature;
@@ -46,8 +49,9 @@ struct virtio_common {
     volatile uint8_t device_status, config_generation;
     volatile uint16_t queue_select, queue_size, queue_msix_vector;
     volatile uint16_t queue_enable, queue_notify_off;
-    volatile uint64_t queue_desc, queue_driver, queue_device;
-} PACKED;
+    volatile uint32_t queue_desc[2], queue_driver[2], queue_device[2];
+};
+_Static_assert(sizeof(struct virtio_common) == 56, "virtio common configuration layout");
 struct descriptor { uint64_t addr; uint32_t len; uint16_t flags, next; } PACKED;
 struct avail { volatile uint16_t flags, idx; uint16_t ring[QSIZE]; } PACKED;
 struct used_entry { volatile uint32_t id, len; } PACKED;
@@ -139,30 +143,30 @@ static bool transport_init(struct pci_device *d) {
                 notify_multiplier = config32(d, cap + 16);
             } else if (type == 4) {
                 volatile uint32_t *config=cap_map(d,cap,&length);
-                if (config && length>=16) capset_count=config[3];
+                if (config && length>=16) capset_count=mmio_read32(config + 3);
             }
         }
         cap = (uint8_t)next;
     }
     if (!common || !notify_base) return false;
     pci_enable_busmaster(d);
-    common->device_status = 0;
-    barrier();
+    mmio_write8(&common->device_status, 0);
     uint64_t deadline = uptime_ms() + 100;
-    for (unsigned spins = 0; common->device_status; spins++) {
+    for (unsigned spins = 0; mmio_read8(&common->device_status); spins++) {
         if (uptime_ms() >= deadline || spins > 1000000) return false;
         pause();
     }
-    common->device_status = 1 | 2; /* ACKNOWLEDGE | DRIVER */
-    common->device_feature_select = 0;
-    if (!(common->device_feature & VIRGL_FEATURE)) return false;
-    common->device_feature_select = 1;
-    if (!(common->device_feature & VERSION_1)) return false;
-    common->driver_feature_select = 0; common->driver_feature = VIRGL_FEATURE;
-    common->driver_feature_select = 1; common->driver_feature = VERSION_1;
-    common->device_status = 1 | 2 | 8;
-    barrier();
-    if (!(common->device_status & 8)) return false;
+    mmio_write8(&common->device_status, 1 | 2); /* ACKNOWLEDGE | DRIVER */
+    mmio_write32(&common->device_feature_select, 0);
+    if (!(mmio_read32(&common->device_feature) & VIRGL_FEATURE)) return false;
+    mmio_write32(&common->device_feature_select, 1);
+    if (!(mmio_read32(&common->device_feature) & VERSION_1)) return false;
+    mmio_write32(&common->driver_feature_select, 0);
+    mmio_write32(&common->driver_feature, VIRGL_FEATURE);
+    mmio_write32(&common->driver_feature_select, 1);
+    mmio_write32(&common->driver_feature, VERSION_1);
+    mmio_write8(&common->device_status, 1 | 2 | 8);
+    if (!(mmio_read8(&common->device_status) & 8)) return false;
 
     uint64_t ring_phys = pmm_alloc_zeroed();
     packets_phys = pmm_alloc_contig(2);
@@ -172,34 +176,37 @@ static bool transport_init(struct pci_device *d) {
     avail = (struct avail *)((uint8_t *)desc + 256);
     used = (struct used *)((uint8_t *)desc + 512);
     avail->flags = 1;
-    common->queue_select = 0;
-    common->config_msix_vector = 0xFFFF;
-    if (common->queue_size < QSIZE || common->queue_enable) return false;
-    common->queue_size = QSIZE;
-    common->queue_msix_vector = 0xFFFF;
-    common->queue_desc = ring_phys;
-    common->queue_driver = ring_phys + 256;
-    common->queue_device = ring_phys + 512;
-    uint64_t notify_off = (uint64_t)common->queue_notify_off * notify_multiplier;
+    mmio_write16(&common->queue_select, 0);
+    mmio_write16(&common->config_msix_vector, 0xFFFF);
+    if (mmio_read16(&common->queue_size) < QSIZE || mmio_read16(&common->queue_enable)) return false;
+    mmio_write16(&common->queue_size, QSIZE);
+    mmio_write16(&common->queue_msix_vector, 0xFFFF);
+    const uint64_t rings[3] = {ring_phys, ring_phys + 256, ring_phys + 512};
+    volatile uint32_t *ring_regs[3] = {common->queue_desc, common->queue_driver, common->queue_device};
+    for (unsigned i = 0; i < 3; i++) {
+        mmio_write32(ring_regs[i], (uint32_t)rings[i]);
+        mmio_write32(ring_regs[i] + 1, (uint32_t)(rings[i] >> 32));
+    }
+    uint64_t notify_off = (uint64_t)mmio_read16(&common->queue_notify_off) * notify_multiplier;
     if (notify_length < 2 || notify_off > notify_length - 2) return false;
     notify = (volatile uint16_t *)(notify_base + notify_off);
     int vector=irq_vector_alloc(1,1);
     if(vector>=0){
         vector_register(vector,gpu_isr);
         if(pci_msix_init(d) && pci_msix_route(d,0,(uint8_t)vector,lapic_current_id())){
-            common->queue_msix_vector=0;
-            if(common->queue_msix_vector==0){
+            mmio_write16(&common->queue_msix_vector, 0);
+            if(mmio_read16(&common->queue_msix_vector)==0){
                 pci_msix_mask(d,0,false);pci_msix_function_mask(d,false);
                 completion_irq=true;avail->flags=0;
             }
         }
         if(!completion_irq && pci_msi_disable(d))irq_vector_free((unsigned)vector,1); /* else it stays taken */
     }
-    common->queue_enable = 1;
-    common->device_status = 1 | 2 | 8 | 4;
-    barrier();
+    mmio_write16(&common->queue_enable, 1);
+    mmio_write8(&common->device_status, 1 | 2 | 8 | 4);
+    unsigned status = mmio_read8(&common->device_status);
     kprintf("gpu: queue desc=%lx avail=%lx used=%lx notify=%p off=%lu mult=%u size=%u status=%x\n",
-        ring_phys,ring_phys+256,ring_phys+512,notify,notify_off,notify_multiplier,common->queue_size,common->device_status);
+        ring_phys,ring_phys+256,ring_phys+512,notify,notify_off,notify_multiplier,QSIZE,status);
     return true;
 }
 
@@ -218,7 +225,7 @@ static bool exchange(const void *request, size_t len, uint32_t response_type) {
     barrier();
     avail->idx++;
     barrier();
-    *notify = 0;
+    mmio_write16(notify, 0);
     /* The descriptor, packet and resource backing stay driver-owned while
      * this continuation sleeps. Timeout retires the device without freeing
      * any possibly in-flight DMA or reusing the serialized packet buffers. */
@@ -229,9 +236,10 @@ static bool exchange(const void *request, size_t len, uint32_t response_type) {
         uint64_t now=uptime_ms();
         if (now>=deadline || (current_task->kstack && current_task->killed)) {
                 uint64_t ticks=rdtsc()-started_tsc;
+                unsigned status=mmio_read8(&common->device_status);
                 kprintf("gpu: timeout request=%x ctx=%u fence=%lu len=%lu used=%u seen=%u avail=%u elapsed_ms=%lu tsc_ms=%lu spins=%u status=%x desc0=%lx/%u desc1=%lx/%u notify=%p\n",
                     h->type,h->ctx,h->fence,len,used->idx,seen_used,avail->idx,uptime_ms()-started,
-                    tsc_hz?ticks/(tsc_hz/1000):0,spins,common->device_status,
+                    tsc_hz?ticks/(tsc_hz/1000):0,spins,status,
                     desc[0].addr,desc[0].len,desc[1].addr,desc[1].len,notify);
                 goto failed;
         }
@@ -570,7 +578,7 @@ void gpu_init(void) {
         return;
     }
     if (!transport_init(d)) {
-        if (common) common->device_status|=128;
+        if (common) mmio_write8(&common->device_status, mmio_read8(&common->device_status) | 128); /* FAILED */
         kprintf("gpu: virgl transport unavailable; boot framebuffer unchanged\n");
         return;
     }

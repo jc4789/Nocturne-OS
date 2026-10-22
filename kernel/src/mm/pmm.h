@@ -8,7 +8,10 @@ uint64_t pmm_alloc(void);
    allocation hint within that range, including for repeated restricted DMA allocations. */
 uint64_t pmm_alloc_below(uint64_t limit);
 uint64_t pmm_alloc_zeroed(void);
+/* count contiguous frames, the lowest free run above 1 MiB; _below: one that ends at or below the
+   exclusive byte limit. 0 when there is none. */
 uint64_t pmm_alloc_contig(uint64_t count);
+uint64_t pmm_alloc_contig_below(uint64_t count, uint64_t limit);
 void pmm_free(uint64_t phys);
 void pmm_release_range(uint64_t phys, uint64_t size); /* consumed bootloader memory → allocator */
 uint64_t pmm_free_pages(void);

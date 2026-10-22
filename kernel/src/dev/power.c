@@ -43,13 +43,14 @@ static bool s5_ok;
 /* Write a Generic Address Structure register (system memory or I/O space). */
 static void gas_write(const struct gas *g, uint64_t v) {
     if (g->space == 0) {
-        void *p = vmm_map_mmio(g->address & ~0xFFFULL, 4096);
-        p = (uint8_t *)p + (g->address & 0xFFF);
+        uint8_t *p = vmm_map_mmio(g->address & ~0xFFFULL, 4096);
+        if (!p) return;
+        p += g->address & 0xFFF;
         switch (g->bit_width) {
-        case 16: *(volatile uint16_t *)p = (uint16_t)v; break;
-        case 32: *(volatile uint32_t *)p = (uint32_t)v; break;
-        case 64: *(volatile uint64_t *)p = v; break;
-        default: *(volatile uint8_t *)p = (uint8_t)v; break;
+        case 16: mmio_write16(p, (uint16_t)v); break;
+        case 32: mmio_write32(p, (uint32_t)v); break;
+        case 64: mmio_write64(p, v); break;
+        default: mmio_write8(p, (uint8_t)v); break;
         }
     } else if (g->space == 1) {
         switch (g->bit_width) {
@@ -71,9 +72,10 @@ void acpi_init(void) {
     }
     uint64_t dsdt_phys = (fadt->h.length >= 148 && fadt->x_dsdt) ? fadt->x_dsdt : fadt->dsdt;
     const struct acpi_sdt *dsdt = acpi_map_table(dsdt_phys);
-    const uint8_t *p = (const uint8_t *)(dsdt + 1);
-    const uint8_t *end = (const uint8_t *)dsdt + dsdt->length;
-    for (; p + 4 < end; p++) {
+    if (!dsdt) kprintf("acpi: no memory to map the DSDT\n"); /* no S5 from it; the AML interpreter still runs */
+    const uint8_t *p = dsdt ? (const uint8_t *)(dsdt + 1) : NULL;
+    const uint8_t *end = dsdt ? (const uint8_t *)dsdt + dsdt->length : NULL;
+    for (; p && p + 4 < end; p++) {
         if (memcmp(p, "_S5_", 4)) continue;
         if (!((p[-1] == 0x08) || (p[-2] == 0x08 && p[-1] == '\\'))) continue;
         const uint8_t *q = p + 4;

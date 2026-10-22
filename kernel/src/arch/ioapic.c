@@ -31,13 +31,13 @@ static unsigned nios;
 static uint64_t given[IOAPIC_MAX][256];
 
 static uint32_t rd(const struct ioapic *io, uint32_t reg) {
-    io->regs[0] = reg;
-    return io->regs[4];
+    mmio_write32(io->regs, reg);
+    return mmio_read32(io->regs + 4);
 }
 
 static void wr(const struct ioapic *io, uint32_t reg, uint32_t v) {
-    io->regs[0] = reg;
-    io->regs[4] = v;
+    mmio_write32(io->regs, reg);
+    mmio_write32(io->regs + 4, v);
 }
 
 void ioapic_init(void) {
@@ -46,7 +46,10 @@ void ioapic_init(void) {
     for (unsigned i = 0; i < n && nios < IOAPIC_MAX; i++) {
         if (!a[i].addr) continue;
         struct ioapic *io = &ios[nios];
-        io->regs = vmm_map_mmio(a[i].addr, 4096);
+        if (!(io->regs = vmm_map_mmio(a[i].addr, 4096))) {
+            kprintf("ioapic: id %u at %x: no memory to map it, ignored\n", a[i].id, a[i].addr);
+            continue;
+        }
         io->gsi_base = a[i].gsi_base;
         uint64_t f = irq_save();
         uint32_t ver = rd(io, REG_VER);

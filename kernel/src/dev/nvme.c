@@ -84,8 +84,8 @@ struct ns {
 static struct nvme ctrls[MAX_CTRL];
 static int nctrls, ndisks;
 
-static uint32_t rd32(struct nvme *c, unsigned off) { return *(volatile uint32_t *)(c->regs + off); }
-static void wr32(struct nvme *c, unsigned off, uint32_t v) { *(volatile uint32_t *)(c->regs + off) = v; }
+static uint32_t rd32(struct nvme *c, unsigned off) { return mmio_read32(c->regs + off); }
+static void wr32(struct nvme *c, unsigned off, uint32_t v) { mmio_write32(c->regs + off, v); }
 static uint64_t rd64(struct nvme *c, unsigned off) { return rd32(c, off) | (uint64_t)rd32(c, off + 4) << 32; }
 static void wr64(struct nvme *c, unsigned off, uint64_t v) { /* low half first */
     wr32(c, off, (uint32_t)v);
@@ -389,8 +389,12 @@ static void start(struct nvme *c) {
         kprintf("nvme%d: no register window\n", c->index);
         return;
     }
-    pci_enable_busmaster(pci);
     c->regs = vmm_map_mmio(base, 0x4000); /* registers and the doorbells of the first queue pairs */
+    if (!c->regs) {
+        kprintf("nvme%d: no memory to map its registers\n", c->index);
+        return;
+    }
+    pci_enable_busmaster(pci);
     uint64_t cap = rd64(c, CAP);
     c->stride = 4u << (cap >> 32 & 0xF);
     unsigned to = (unsigned)(cap >> 24 & 0xFF);

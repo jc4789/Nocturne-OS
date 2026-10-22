@@ -27,8 +27,7 @@ static volatile uint32_t *ecam_regs(uint8_t bus, uint8_t dev, uint8_t func, bool
         uint64_t phys = ecam[i].base + ((uint64_t)(bus - ecam[i].start_bus) << 20 | (uint64_t)dev << 15 |
                                          (uint64_t)func << 12);
         if (!(ecam_active[bdf >> 3] & (1u << (bdf & 7)))) {
-            if (!map) return NULL;
-            vmm_map_mmio(phys, 4096);
+            if (!map || !vmm_map_mmio(phys, 4096)) return NULL;
             ecam_active[bdf >> 3] |= 1u << (bdf & 7);
         }
         return phys_to_virt(phys);
@@ -36,27 +35,21 @@ static volatile uint32_t *ecam_regs(uint8_t bus, uint8_t dev, uint8_t func, bool
     return NULL;
 }
 
-static uint32_t cf8_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off) {
-    outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (off & 0xFC));
-    return inl(0xCFC);
+/* Mechanism #1 is an address register and a data window: an interrupt handler's own access
+   between the two would redirect this one, so the pair runs with interrupts off. */
+static uint32_t cf8_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
+    uint64_t f = irq_save();
+    outl(0xCF8, 0x80000000u | (uint32_t)bus << 16 | (uint32_t)dev << 11 | (uint32_t)func << 8 | (off & 0xFC));
+    uint32_t v = inl(0xCFC);
+    irq_restore(f);
+    return v;
 }
 
 uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
     volatile uint32_t *r = ecam_regs(bus, dev, func, off >= 256);
-    if (r) return r[(off & 0xFFC) >> 2];
+    if (r) return mmio_read32(r + ((off & 0xFFC) >> 2));
     if (off >= 256) return 0xFFFFFFFFu;
-    return cf8_read32(bus, dev, func, (uint8_t)off);
-}
-
-void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v) {
-    volatile uint32_t *r = ecam_regs(bus, dev, func, off >= 256);
-    if (r) {
-        r[(off & 0xFFC) >> 2] = v;
-        return;
-    }
-    if (off >= 256) return;
-    outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (off & 0xFC));
-    outl(0xCFC, v);
+    return cf8_read32(bus, dev, func, off);
 }
 
 uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
@@ -65,39 +58,43 @@ uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
 
 /* Narrow writes are narrow on the bus too: a read-modify-write of the whole dword would write
    back the register beside this one, and Status (beside Command) clears its error bits on a
-   written 1. */
-static void cf8_select(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
-    outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (off & 0xFC));
+   written 1. bytes: 1, 2 or 4, at an offset aligned to it. */
+static void config_write(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v, unsigned bytes) {
+    volatile uint8_t *r = (volatile uint8_t *)ecam_regs(bus, dev, func, off >= 256);
+    if (r) {
+        if (bytes == 4) mmio_write32(r + (off & 0xFFC), v);
+        else if (bytes == 2) mmio_write16(r + (off & 0xFFE), (uint16_t)v);
+        else mmio_write8(r + (off & 0xFFF), (uint8_t)v);
+        return;
+    }
+    if (off >= 256) return;
+    uint64_t f = irq_save();
+    outl(0xCF8, 0x80000000u | (uint32_t)bus << 16 | (uint32_t)dev << 11 | (uint32_t)func << 8 | (off & 0xFC));
+    if (bytes == 4) outl(0xCFC, v);
+    else if (bytes == 2) outw(0xCFC + (off & 2), (uint16_t)v);
+    else outb(0xCFC + (off & 3), (uint8_t)v);
+    irq_restore(f);
+}
+
+void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t v) {
+    config_write(bus, dev, func, off, v, 4);
 }
 
 void pci_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t v) {
-    volatile uint32_t *r = ecam_regs(bus, dev, func, off >= 256);
-    if (r) {
-        *(volatile uint16_t *)((volatile uint8_t *)r + (off & 0xFFE)) = v;
-        return;
-    }
-    if (off >= 256) return;
-    cf8_select(bus, dev, func, off);
-    outw(0xCFC + (off & 2), v);
+    config_write(bus, dev, func, off, v, 2);
 }
 
 void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v) {
-    volatile uint32_t *r = ecam_regs(bus, dev, func, off >= 256);
-    if (r) {
-        *((volatile uint8_t *)r + (off & 0xFFF)) = v;
-        return;
-    }
-    if (off >= 256) return;
-    cf8_select(bus, dev, func, off);
-    outb(0xCFC + (off & 3), v);
+    config_write(bus, dev, func, off, v, 1);
 }
 
 /* Switch a found function to ECAM, checking that ECAM really reaches it (a wrong MCFG base turns it off). */
 static void ecam_activate(uint8_t bus, uint8_t dev, uint8_t func, uint32_t id) {
     volatile uint32_t *r = ecam_regs(bus, dev, func, true);
-    if (r && r[0] != id) {
+    uint32_t seen = r ? mmio_read32(r) : id;
+    if (seen != id) {
         kprintf("pci: ECAM read of %02x:%02x.%x gave %08x, expected %08x; falling back to CF8/CFC\n", bus, dev,
-                func, r[0], id);
+                func, seen, id);
         ecam_off = true;
     }
 }
@@ -142,7 +139,17 @@ unsigned pci_bar_count(const struct pci_device *d) {
     return type == 0 ? 6 : type == 1 ? 2 : type == 2 ? 1 : 0;
 }
 
+/* A function still initializing answers RRS (FFFF0001h) where its Root Port shows that
+   (2.3.2), and counts as broken only once 1.0 s has passed since its reset (6.6.1). `since`
+   is a TSC count no earlier than that reset; the wait spins, as callers may have interrupts off. */
+static uint32_t ready_id(uint8_t bus, uint8_t dev, uint8_t func, uint64_t since) {
+    uint32_t id;
+    while ((id = pci_read32(bus, dev, func, 0)) == PCI_CONFIG_RRS_ID && rdtsc() - since < tsc_hz) pause();
+    return id;
+}
+
 void pci_init(void) {
+    uint64_t since = rdtsc(); /* the platform reset was before the firmware ran */
     ecam = acpi_ecams(&necam);
     for (unsigned i = 0; i < necam; i++)
         if (ecam[i].segment == 0)
@@ -151,8 +158,10 @@ void pci_init(void) {
     for (int bus = 0; bus < 256; bus++) {
         for (int dev = 0; dev < 32; dev++) {
             for (int func = 0; func < 8; func++) {
-                uint32_t id = pci_read32(bus, dev, func, 0);
-                if ((id & 0xFFFF) == 0xFFFF) {
+                uint32_t id = ready_id(bus, dev, func, since);
+                if (id == PCI_CONFIG_RRS_ID)
+                    kprintf("pci: %02x:%02x.%x still initializing 1 s: not used\n", bus, dev, func);
+                if ((id & 0xFFFF) == 0xFFFF || id == PCI_CONFIG_RRS_ID) {
                     if (func == 0) break;
                     continue;
                 }
@@ -338,6 +347,8 @@ bool pci_msi_enable_multi(struct pci_device *d, uint8_t base_vector, unsigned co
     uint32_t address, message;
     if (!iommu_msi_message(d, 0, count, base_vector, dest_apic_id, &address, &message)) return false;
     bool wide = ctl & 0x80;
+    /* off while address and data change (firmware may have left it on): no message half old, half new */
+    if (ctl & 1) pci_write16(d->bus, d->dev, d->func, cap + 2, ctl & ~1u);
     pci_write32(d->bus, d->dev, d->func, cap + 4, address);
     if (wide) pci_write32(d->bus, d->dev, d->func, cap + 8, 0);
     uint8_t data_off = cap + (wide ? 0x0C : 0x08);
@@ -351,7 +362,7 @@ bool pci_msi_enable_multi(struct pci_device *d, uint8_t base_vector, unsigned co
     }
     unsigned log2 = __builtin_ctz(count);
     ctl = (ctl & ~0x70u) | (uint16_t)(log2 << 4) | 1; /* `count` messages, enabled */
-    pci_write32(d->bus, d->dev, d->func, cap, (h & 0xFFFF) | (uint32_t)ctl << 16);
+    pci_write16(d->bus, d->dev, d->func, cap + 2, ctl);
     intx_disable(d);
     return true;
 }
@@ -364,7 +375,7 @@ unsigned pci_msix_init(struct pci_device *d) {
     uint64_t base = pci_bar_address(d, table & 7);
     unsigned entries = ((h >> 16) & 0x7FF) + 1;
     if (!base) return 0;
-    if (!d->msix_table) d->msix_table = vmm_map_mmio(base + (table & ~7u), entries * 16);
+    if (!d->msix_table && !(d->msix_table = vmm_map_mmio(base + (table & ~7u), entries * 16))) return 0;
     d->msix_entries = entries;
     uint8_t msi = pci_find_cap(d, 0x05); /* never both */
     if (msi) {
@@ -373,7 +384,10 @@ unsigned pci_msix_init(struct pci_device *d) {
     }
     /* enable with the whole function masked while the entries are written */
     pci_write32(d->bus, d->dev, d->func, cap, (h & 0x3FFFFFFF) | 0xC0000000u);
-    for (unsigned i = 0; i < entries; i++) d->msix_table[i * 4 + 3] |= 1;
+    for (unsigned i = 0; i < entries; i++) {
+        volatile uint32_t *vc = d->msix_table + i * 4 + 3;
+        mmio_write32(vc, mmio_read32(vc) | 1);
+    }
     intx_disable(d);
     return entries;
 }
@@ -381,24 +395,25 @@ unsigned pci_msix_init(struct pci_device *d) {
 bool pci_msix_route(struct pci_device *d, unsigned entry, uint8_t vector, uint32_t dest_apic_id) {
     if (!lapic_present() || !d->msix_table || entry >= d->msix_entries) return false;
     volatile uint32_t *t = d->msix_table + entry * 4;
-    uint32_t vc = t[3];
-    t[3] = vc | 1; /* entry masked while its address/data change */
+    uint32_t vc = mmio_read32(t + 3);
+    mmio_write32(t + 3, vc | 1); /* entry masked while its address/data change */
     uint32_t address, data;
     bool ok = iommu_msi_message(d, entry, 1, vector, dest_apic_id, &address, &data);
     if (ok) {
-        t[0] = address;
-        t[1] = 0;
-        t[2] = data;
+        mmio_write32(t, address);
+        mmio_write32(t + 1, 0);
+        mmio_write32(t + 2, data);
     }
-    t[3] = vc;
+    mmio_write32(t + 3, vc);
     return ok;
 }
 
 void pci_msix_mask(struct pci_device *d, unsigned entry, bool masked) {
     if (!d->msix_table || entry >= d->msix_entries) return;
     volatile uint32_t *t = d->msix_table + entry * 4;
-    t[3] = masked ? t[3] | 1 : t[3] & ~1u;
-    (void)t[3]; /* read back: the unmask must reach the device before the caller proceeds */
+    uint32_t vc = mmio_read32(t + 3);
+    mmio_write32(t + 3, masked ? vc | 1 : vc & ~1u);
+    (void)mmio_read32(t + 3); /* read back: the unmask must reach the device before the caller proceeds */
 }
 
 void pci_msix_function_mask(struct pci_device *d, bool masked) {
@@ -436,18 +451,27 @@ bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
 /* ---- a function's configuration, kept across a reset ----
    After S3 or a Function Level Reset a function comes back reset: no BARs, no command bits, no
    MSI. The header, the MSI and MSI-X state (the MSI-X table lives in a BAR), the PCIe control
-   registers and ACS control (what keeps a claimed function's requests on their way to the
-   IOMMU, dev/iommu.c) are saved before and written back before any driver touches its device
-   again. Device-specific registers past the capabilities are the driver's. */
+   registers, the Resizable BAR sizes (a BAR's size, which its address must match, 7.8.6) and ACS
+   control (what keeps a claimed function's requests on their way to the IOMMU, dev/iommu.c) are
+   saved before and written back before any driver touches its device again. Device-specific
+   registers past the capabilities are the driver's. */
 struct pci_saved {
     uint32_t id, hdr[16];
     uint8_t msi, msix, msi_dwords;
     uint32_t msi_regs[5];
     uint32_t msix_ctl, *msix_table;
-    uint16_t pcie_ctl[4];
+    uint16_t pcie_ctl[5];
+    uint16_t rebar;          /* the Resizable BAR capability's offset */
+    uint8_t rebars;          /* how many of its BARs are resizable */
+    uint32_t rebar_ctl[6];   /* their control registers, BAR Size in bits 13:8 */
     uint16_t acs, acs_ctl; /* the ACS capability's offset and its control register */
 };
-static const uint8_t pcie_ctl_off[4] = {PCIE_DEVCTL, PCIE_LNKCTL, PCIE_DEVCTL2, PCIE_LNKCTL2};
+/* Root Control exists in Root Ports and Root Complex Event Collectors only (7.5.3.12) */
+static const uint8_t pcie_ctl_off[5] = {PCIE_DEVCTL, PCIE_LNKCTL, PCIE_DEVCTL2, PCIE_LNKCTL2, PCIE_ROOTCTL};
+static unsigned pcie_ctls(const struct pci_device *d) {
+    if (!d->pcie_cap) return 0;
+    return d->pcie_type == 4 || d->pcie_type == 10 ? 5 : 4;
+}
 
 /* table: the MSI-X table's entries too, into s->msix_table (allocated once, kept); false without
    memory for it. */
@@ -466,30 +490,43 @@ static bool state_save(const struct pci_device *d, struct pci_saved *s, bool tab
         s->msix_ctl = pci_read32(d->bus, d->dev, d->func, s->msix);
         if (table && d->msix_table) {
             if (!s->msix_table && !(s->msix_table = kmalloc(d->msix_entries * 16))) return false;
-            for (unsigned j = 0; j < d->msix_entries * 4u; j++) s->msix_table[j] = d->msix_table[j];
+            for (unsigned j = 0; j < d->msix_entries * 4u; j++) s->msix_table[j] = mmio_read32(d->msix_table + j);
         }
     }
-    if (d->pcie_cap)
-        for (unsigned j = 0; j < 4; j++) s->pcie_ctl[j] = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j]);
+    for (unsigned j = 0; j < pcie_ctls(d); j++)
+        s->pcie_ctl[j] = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j]);
+    s->rebar = pci_find_ext_cap(d, 0x15);
+    s->rebars = s->rebar ? (pci_read32(d->bus, d->dev, d->func, s->rebar + 8) >> 5) & 7 : 0;
+    if (s->rebars > 6) s->rebars = 6; /* 1..6 (7.8.6.3) */
+    for (unsigned j = 0; j < s->rebars; j++)
+        s->rebar_ctl[j] = pci_read32(d->bus, d->dev, d->func, s->rebar + 8 + 8 * j);
     s->acs = pci_find_ext_cap(d, 0x0D);
     if (s->acs) s->acs_ctl = pci_read16(d->bus, d->dev, d->func, s->acs + 6);
     return true;
 }
 
 static void state_restore(const struct pci_device *d, const struct pci_saved *s) {
-    /* cache line and latency, not BIST (a write there starts a self test); then BARs and the
-       rest of the header (bus numbers and windows for a bridge); command last */
+    /* cache line and latency, not BIST (a write there starts a self test); the BAR sizes, with
+       memory decoding off first (wake firmware may have turned it on) since a size written
+       leaves its BAR undefined (7.8.6); then BARs and the rest of the header (bus numbers and
+       windows for a bridge); command last */
     pci_write16(d->bus, d->dev, d->func, 0x0C, s->hdr[3] & 0xFFFF);
+    if (s->rebars) {
+        uint16_t cmd = pci_read16(d->bus, d->dev, d->func, PCI_COMMAND);
+        if (cmd & 2) pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, cmd & ~2u);
+        for (unsigned j = 0; j < s->rebars; j++)
+            pci_write32(d->bus, d->dev, d->func, s->rebar + 8 + 8 * j, s->rebar_ctl[j]);
+    }
     for (unsigned k = 4; k < 16; k++) pci_write32(d->bus, d->dev, d->func, k * 4, s->hdr[k]);
-    if (d->pcie_cap)
-        for (unsigned j = 0; j < 4; j++) pci_write16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
+    for (unsigned j = 0; j < pcie_ctls(d); j++)
+        pci_write16(d->bus, d->dev, d->func, d->pcie_cap + pcie_ctl_off[j], s->pcie_ctl[j]);
     if (s->acs) pci_write16(d->bus, d->dev, d->func, s->acs + 6, s->acs_ctl); /* before bus mastering */
     pci_write16(d->bus, d->dev, d->func, PCI_COMMAND, s->hdr[1] & 0xFFFF);
     if (s->msix) {
         /* the table is memory space, which the command register has just opened */
         pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl | 0xC0000000u);
         if (d->msix_table && s->msix_table)
-            for (unsigned j = 0; j < d->msix_entries * 4u; j++) d->msix_table[j] = s->msix_table[j];
+            for (unsigned j = 0; j < d->msix_entries * 4u; j++) mmio_write32(d->msix_table + j, s->msix_table[j]);
         pci_write32(d->bus, d->dev, d->func, s->msix, s->msix_ctl);
     }
     if (s->msi) {
@@ -512,12 +549,18 @@ const char *pci_suspend(void) {
     return NULL;
 }
 
+/* Every function has been through a Conventional Reset together, so one readiness deadline
+   (ready_id) covers them all. Root Ports come first in enumeration order: theirs is the Root
+   Control the functions below them are read through. */
 void pci_resume(void) {
     if (!saved_valid) return; /* the sleep was called off before anything went down */
+    uint64_t since = rdtsc();
     for (size_t i = 0; i < ndevices; i++) {
         struct pci_device *d = &devices[i];
-        if (pci_read32(d->bus, d->dev, d->func, 0) != saved[i].id) {
-            kprintf("pci: %02x:%02x.%x is not there after sleep\n", d->bus, d->dev, d->func);
+        uint32_t id = ready_id(d->bus, d->dev, d->func, since);
+        if (id != saved[i].id) {
+            kprintf("pci: %02x:%02x.%x is %s after sleep (ID %08x, was %08x)\n", d->bus, d->dev, d->func,
+                    id == PCI_CONFIG_RRS_ID ? "still initializing 1 s" : "not there", id, saved[i].id);
             continue;
         }
         state_restore(d, &saved[i]);
@@ -546,29 +589,37 @@ bool pci_requests_done(const struct pci_device *d, unsigned ms) {
     }
 }
 
-/* RRS reaches software only when the Root Complex exposes it (2.3.2). Enable a
-   supporting Root Port before FLR and before each readiness read, including a saved
-   reset resumed after cancellation/S3. Never write an endpoint/switch's reserved
-   Root Control, or infer support from an absent function's all-ones response.
-   RCRB-managed/unsupported roots retain their existing config-access behavior;
-   synchronous hardware retries there are not made cancellable by this helper. */
-static bool reset_rrs_visible(const struct pci_device *d) {
-    for (const struct pci_device *b = pci_upstream(d); b; b = pci_upstream(b)) {
-        if (!b->pcie_cap || b->pcie_type != 4) continue;
-        unsigned cap = b->pcie_cap;
-        if (b->dev > 31 || b->func > 7 || cap < 0x40 || (cap & 3) ||
-            cap > 256 - (PCIE_ROOTCAP + sizeof(uint16_t)) || !present(b)) return false;
-        uint32_t header = pci_read32(b->bus, b->dev, b->func, cap);
-        if ((header & 0xFF) != 0x10 || ((header >> 20) & 15) != 4 ||
-            !(pci_read16(b->bus, b->dev, b->func, cap + PCIE_ROOTCAP) & PCIE_ROOTCAP_RRS_VISIBLE))
-            return false;
-        uint16_t control = pci_read16(b->bus, b->dev, b->func, cap + PCIE_ROOTCTL);
-        if (!(control & PCIE_ROOTCTL_RRS_VISIBLE))
-            pci_write16(b->bus, b->dev, b->func, cap + PCIE_ROOTCTL, control | PCIE_ROOTCTL_RRS_VISIBLE);
-        return present(b) &&
-               (pci_read16(b->bus, b->dev, b->func, cap + PCIE_ROOTCTL) & PCIE_ROOTCTL_RRS_VISIBLE);
-    }
-    return false;
+/* RRS Software Visibility (Root Control, 7.5.3.12): with it on, a Vendor ID read of a function
+   still initializing completes with FFFF0001h (2.3.2) instead of the Root Complex retrying it
+   inside the CPU's access, so a reset's readiness wait stays a scheduler wait its caller can
+   cancel. The Root Port above a reset shows RRS while some reset below it awaits readiness, and
+   gets the firmware's setting back after the last. A root that cannot (no Root Port above, as
+   for a Root Complex Integrated Endpoint, or no Root Capabilities support) keeps its hardware
+   retries. */
+static struct pci_device *rrs_port(const struct pci_device *d) {
+    for (struct pci_device *b = d->upstream; b; b = b->upstream)
+        if (b->pcie_cap && b->pcie_type == 4)
+            return present(b) &&
+                   (pci_read16(b->bus, b->dev, b->func, b->pcie_cap + PCIE_ROOTCAP) & PCIE_ROOTCAP_RRS_VISIBLE)
+                       ? b : NULL;
+    return NULL;
+}
+
+static void rrs_show(const struct pci_device *port, bool on) {
+    uint16_t ctl = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL);
+    uint16_t want = on ? ctl | PCIE_ROOTCTL_RRS_VISIBLE : ctl & ~PCIE_ROOTCTL_RRS_VISIBLE;
+    if (want != ctl) pci_write16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL, want);
+}
+
+static void rrs_hold(struct pci_device *port) {
+    if (!port->rrs_holds++)
+        port->rrs_firmware = pci_read16(port->bus, port->dev, port->func, port->pcie_cap + PCIE_ROOTCTL) &
+                             PCIE_ROOTCTL_RRS_VISIBLE;
+    rrs_show(port, true);
+}
+
+static void rrs_release(struct pci_device *port) {
+    if (!--port->rrs_holds && !port->rrs_firmware) rrs_show(port, false);
 }
 
 /* FLR must finish in 100 ms (6.6.2), but device-specific initialization may still return RRS.
@@ -594,6 +645,7 @@ struct pci_reset {
     struct pci_saved state;
     uint64_t since;
     unsigned wait;
+    struct pci_device *rrs; /* the Root Port held showing RRS until readiness, or NULL */
 };
 
 /* Claim recovery and task_kill run on the BSP. Keep the cancellation check and the
@@ -610,9 +662,10 @@ static bool reset_wait(uint64_t ms) {
     return !cancelled;
 }
 
+static bool reset_cancelled(void) { return current_task && current_task->killed; }
+
 bool pci_function_reset(struct pci_device *d) {
-    if (current_task && current_task->killed) return false;
-    (void)reset_rrs_visible(d); /* best effort, not a prerequisite on unsupported roots */
+    if (reset_cancelled()) return false;
     struct pci_reset *r = d->reset;
     if (!r) {
         if (!d->pcie_cap || !present(d)) return false;
@@ -624,16 +677,17 @@ bool pci_function_reset(struct pci_device *d) {
            Observe their actual completion BEFORE FLR discards tags (6.6.2), with new
            Memory/I/O Requests prohibited by the confirmed BME clear. */
         while (!pci_requests_done(d, 0)) {
-            if ((current_task && current_task->killed) || !present(d)) return false;
+            if (!present(d)) return false;
             if (!reset_wait(1)) return false; /* scheduler resolution, not a deadline */
         }
-        if (current_task && current_task->killed) return false;
+        if (reset_cancelled()) return false;
         if (!(r = kzalloc(sizeof *r))) return false;
         state_save(d, &r->state, false);
         /* Restoring configuration must never re-enable bus mastering. */
         r->state.hdr[1] &= ~PCI_COMMAND_MASTER;
         r->state.pcie_ctl[0] &= ~PCIE_DEVCTL_FLR;
         r->wait = wait;
+        if ((r->rrs = rrs_port(d))) rrs_hold(r->rrs);
         d->reset = r; /* publish before FLR or any cancellable wait */
         pci_write16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL,
                     r->state.pcie_ctl[0] | PCIE_DEVCTL_FLR);
@@ -641,20 +695,18 @@ bool pci_function_reset(struct pci_device *d) {
     }
     for (;;) {
         uint64_t elapsed = uptime_ms() - r->since;
-        if (current_task && current_task->killed) return false;
+        if (reset_cancelled()) return false;
         if (elapsed >= r->wait) break;
         if (!reset_wait(r->wait - elapsed)) return false;
     }
-    /* RRS Software Visibility returns FFFF0001h for this dword (2.3.1). Additional
+    /* RRS Software Visibility returns FFFF0001h for this dword (2.3.2). Additional
        initialization after the 100ms FLR is permitted (6.6.2), even without RTR.
        Preserve the same saved state, yield, and let the caller cancel instead of
        failing a usable device at its first RRS or guessing a universal deadline. */
     uint32_t id;
     for (;;) {
-        if (current_task && current_task->killed) return false;
-        (void)reset_rrs_visible(d); /* Root Control may have lost its state while asleep. */
-        id = pci_read32(d->bus, d->dev, d->func, 0);
-        if (id != PCI_CONFIG_RRS_ID) break;
+        if (r->rrs) rrs_show(r->rrs, true); /* sleep or firmware may have rewritten Root Control */
+        if ((id = pci_read32(d->bus, d->dev, d->func, 0)) != PCI_CONFIG_RRS_ID) break;
         if (!reset_wait(1)) return false;
     }
     if (id != r->state.id ||
@@ -663,6 +715,8 @@ bool pci_function_reset(struct pci_device *d) {
                 d->bus, d->dev, d->func);
         return false;
     }
+    if (r->rrs) rrs_release(r->rrs); /* ready: no later read of it can see RRS until another reset */
+    r->rrs = NULL;
     state_restore(d, &r->state);
     if (!present(d) || (pci_read16(d->bus, d->dev, d->func, PCI_COMMAND) & PCI_COMMAND_MASTER)) return false;
     d->reset = NULL;

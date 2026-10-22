@@ -102,6 +102,71 @@ void acpi_wake(unsigned state) { (void)state; }
 void acpi_links_forget(void) {}
 void wm_notify(const char *title,const char *text) { (void)title;(void)text; }
 
+/* ここから下は idt.c/pm.c のうち本試験が到達しない経路（割込み入口、sleep開始、shutdown、
+   ACPI/IOAPIC初期化）が参照する境界。PEリンカーは未解決を許さないため定義するだけで、
+   挙動は模擬しない。万一到達したら黙って成功せず異常終了する。 */
+uint64_t hhdm_offset, isr_stub_table[256];
+volatile uint64_t timer_ticks;
+volatile bool tick_stopped;
+static NORETURN void unreached(const char *name) {
+    fprintf(stderr,"試験が到達しない境界関数に到達: %s\n",name); abort();
+}
+size_t strlcpy(char *d,const char *s,size_t n) {
+    size_t len=strlen(s);
+    if (n) { size_t keep=len < n-1 ? len : n-1; memcpy(d,s,keep); d[keep]=0; }
+    return len;
+}
+const struct acpi_ioapic *acpi_ioapics(unsigned *count) { (void)count; unreached(__func__); }
+const struct acpi_iso *acpi_isos(unsigned *count) { (void)count; unreached(__func__); }
+void acpi_links_save(void) { unreached(__func__); }
+bool acpi_sleep_enter(unsigned state) { (void)state; unreached(__func__); }
+bool acpi_sleep_prepare(unsigned state) { (void)state; unreached(__func__); }
+bool acpi_sleep_supported(unsigned state) { (void)state; unreached(__func__); }
+int blk_count(void) { unreached(__func__); }
+struct blkdev *blk_get(int i) { (void)i; unreached(__func__); }
+void blk_hold(void) { unreached(__func__); }
+void blk_release(void) { unreached(__func__); }
+bool cpu_is_runner(void) { unreached(__func__); }
+bool cpu_is_worker(void) { unreached(__func__); }
+void cpu_require_bsp(void) { unreached(__func__); }
+void cpu_worker_fault(struct regs *regs) { (void)regs; unreached(__func__); }
+bool smp_suspend(void) { unreached(__func__); }
+void smp_resume(void) { unreached(__func__); }
+void entropy_add(uint64_t v) { (void)v; unreached(__func__); }
+void lapic_eoi(void) { unreached(__func__); }
+const char *hibernate_blocker(void) { unreached(__func__); }
+bool hibernate_prepare(const char **why) { (void)why; unreached(__func__); }
+void hibernate_snapshot(void) { unreached(__func__); }
+const char *hibernate_write(void) { unreached(__func__); }
+void hibernate_cleanup(bool restored) { (void)restored; unreached(__func__); }
+bool iommu_power_ready(void) { unreached(__func__); }
+struct task *kthread_create(const char *name,void (*fn)(void *),void *arg) {
+    (void)name; (void)fn; (void)arg; unreached(__func__);
+}
+void wq_wait(struct wait_queue *wq) { (void)wq; unreached(__func__); }
+void wq_wake_all(struct wait_queue *wq) { (void)wq; unreached(__func__); }
+void sleep_ms(uint64_t ms) { (void)ms; unreached(__func__); }
+int task_stop_apps(void) { unreached(__func__); }
+void task_exit_app(int code) { (void)code; unreached(__func__); }
+void task_printf_stderr(struct task *t,const char *fmt,...) { (void)t; (void)fmt; unreached(__func__); }
+void sched_ap_interrupt(struct regs *r) { (void)r; unreached(__func__); }
+void sched_user_return(struct regs *r) { (void)r; unreached(__func__); }
+void syscall_dispatch(struct regs *r) { (void)r; unreached(__func__); }
+void panic_regs(const char *what,struct regs *r) { (void)what; (void)r; unreached(__func__); }
+void power_off(void) { unreached(__func__); }
+void power_reboot(void) { unreached(__func__); }
+void timer_wake(void) { unreached(__func__); }
+bool vmm_handle_user_fault(uint64_t addr,uint64_t err) { (void)addr; (void)err; unreached(__func__); }
+void *vmm_map_mmio(uint64_t phys,uint64_t size) { (void)phys; (void)size; unreached(__func__); }
+void vmm_tlb_ipi(void) { unreached(__func__); }
+uint64_t vmm_translate(uint64_t pml4,uint64_t va) { (void)pml4; (void)va; unreached(__func__); }
+bool wake_available(void) { unreached(__func__); }
+int wm_window_count(char *top_title,size_t n) { (void)top_title; (void)n; unreached(__func__); }
+void wm_close_windows(void) { unreached(__func__); }
+void wm_repaint(void) { unreached(__func__); }
+int pci_count(void) { unreached(__func__); }
+struct pci_device *pci_at(int i) { (void)i; unreached(__func__); }
+
 static void reset_model(void) {
     memset(ios,0,sizeof ios); memset(window,0,sizeof window); memset(stages,0,sizeof stages);
     nios=1; ios[0].regs=window; ios[0].pins=1;

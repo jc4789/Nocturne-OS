@@ -8,8 +8,9 @@
    claim's own whose entries are the claim's vectors; once blocked they let nothing through. The
    IOAPICs, the HPET and the kernel's devices keep zero entries, so their interrupts never depend
    on the units. The units cannot block system management interrupts by device table entry (only
-   their SMI filter can, which the firmware's own SMIs may need): a claimed device that sends an
-   SMI message reaches the firmware's handler as on a machine without an IOMMU. */
+   their SMI filter can, which is the firmware's and stays as it set it): a claimed device that
+   sends an SMI message the filter lets through reaches the firmware's handler as on a machine
+   without an IOMMU. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
@@ -45,11 +46,18 @@
 #define CTL_PPRINT_EN   (1ull << 14)
 #define CTL_PPR_EN      (1ull << 15)
 #define CTL_GA_EN       (1ull << 17)
+#define CTL_SMIF_EN     (1ull << 22)
+#define CTL_SMIF_LOG_EN (1ull << 24)
 #define CTL_GALOG_EN    (1ull << 28)
 #define CTL_GAINT_EN    (1ull << 29)
 #define CTL_MARC_EN     (1ull << 40)
+#define CTL_BLK_STOP_MRK_EN (1ull << 41)
+#define CTL_XT_EN       (1ull << 50)
 #define CTL_VCMD_EN     (1ull << 52)
 #define CTL_VIOMMU_EN   (1ull << 53)
+/* The firmware's, not engines: its SMI filter, which 2.3.1 sets up only where the firmware did
+   not, and StopMark blocking, on from reset (2.6.4.5). Every write of Control keeps them. */
+#define CTL_FIRMWARE    (CTL_SMIF_EN | CTL_SMIF_LOG_EN | CTL_BLK_STOP_MRK_EN)
 #define EXCL_ENABLE    (1ull << 0)
 #define EXCL_ALLOW_ALL (1ull << 1)
 #define ST_EVENT_OVERFLOW (1u << 0)
@@ -62,6 +70,7 @@
 #define VST_IOMMU_RUN     (1u << 0)
 #define VST_CMDBUF_RUN    (1u << 1)
 #define EFR_PPR      (1ull << 1)
+#define EFR_XT       (1ull << 2)
 #define EFR_GA       (1ull << 7)
 #define EFR_VIOMMU   (1ull << 55)
 #define EFR_IA       (1ull << 6)  /* INVALIDATE_IOMMU_ALL */
@@ -75,6 +84,9 @@
 #define RING_LEN   (8ull << 56)   /* log2 of their entry count */
 #define DT_BYTES   (65536 * 32)
 #define IRT_LOG2   5              /* a claim's 32 vectors */
+/* Every blocked entry's DomainID: iommu.c keeps ID 1 for the back end. Entries that share an ID
+   must agree on Mode and root (Table 7), and a released claim's ID is soon another's. */
+#define BLOCK_DOMAIN 1
 
 /* device table entry: qword 0 DMA, 1 domain, 2 interrupts */
 #define DTE_V        (1ull << 0)
@@ -118,6 +130,7 @@ struct unit {
     uint64_t cmd, events;  /* rings */
     uint32_t cmd_tail;
     bool lost;             /* a command since the last sync was not done: that sync fails */
+    bool stalled;          /* it took no command in time: none more are sent until that sync */
     bool overflow_told;    /* its event log overflowed and is still writing: said once */
     struct span *listed;   /* the IDs its IVHD names: those it may have cached entries of */
     size_t nlisted, listed_room;
@@ -125,6 +138,9 @@ struct unit {
 static struct unit *units;
 static size_t nunits, units_room;
 static bool np_cache; /* a unit caches not-present entries */
+/* The CPUs in x2APIC mode take 32-bit destinations, which only the 128-bit remapping entry holds:
+   XTEn and GAEn select it on every unit, all units using one entry size (2.2.5.2-3). */
+static bool wide;
 static uint64_t devtab, sems; /* device table; one completion word a unit */
 static size_t sem_pages;
 static uint64_t token;
@@ -142,10 +158,10 @@ static uint32_t ivinfo;
 static struct iommu_hw amd;
 
 #ifndef IOMMU_AMD_HOSTTEST
-static uint64_t rd(const struct unit *u, unsigned off) { return *(volatile uint64_t *)(u->regs + off); }
-static void wr(const struct unit *u, unsigned off, uint64_t v) { *(volatile uint64_t *)(u->regs + off) = v; }
-static uint32_t rd32(const struct unit *u, unsigned off) { return *(volatile uint32_t *)(u->regs + off); }
-static void wr32(const struct unit *u, unsigned off, uint32_t v) { *(volatile uint32_t *)(u->regs + off) = v; }
+static uint64_t rd(const struct unit *u, unsigned off) { return mmio_read64(u->regs + off); }
+static void wr(const struct unit *u, unsigned off, uint64_t v) { mmio_write64(u->regs + off, v); }
+static uint32_t rd32(const struct unit *u, unsigned off) { return mmio_read32(u->regs + off); }
+static void wr32(const struct unit *u, unsigned off, uint32_t v) { mmio_write32(u->regs + off, v); }
 #endif
 
 static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
@@ -408,15 +424,17 @@ static void commands_restart(struct unit *u) {
     commands_started(u);
 }
 
-/* A command for one unit: one it has no room for in time is lost (u->lost). */
+/* A command for one unit: one it has no room for in time is lost (u->lost), and so are the ones
+   after it until the sync, which would each wait as long with interrupts off. */
 static void command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    if (u->stalled) return;
     for (uint64_t t = iommu_deadline(100); (rd(u, R_CMD_HEAD) & 0x7FFF0) == (u->cmd_tail + 16) % RING_BYTES; pause()) {
         if (!(rd(u, R_STATUS) & ST_CMDBUF_RUN)) {
             commands_restart(u);
             break;
         }
         if (iommu_expired(t)) {
-            u->lost = true;
+            u->lost = u->stalled = true;
             return;
         }
     }
@@ -435,7 +453,10 @@ static void send(unsigned op, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
 }
 
 /* Every page of a domain, the page directory caches with them. */
-static void send_domain_flush(uint16_t id) { send(CMD_INV_PAGES, 0, id, 0xFFFFF000u | 3, 0x7FFFFFFFu); }
+static void domain_flush(struct unit *u, uint16_t id) { command(u, CMD_INV_PAGES, 0, id, 0xFFFFF000u | 3, 0x7FFFFFFFu); }
+static void send_domain_flush(uint16_t id) {
+    for (size_t i = 0; i < nunits; i++) domain_flush(&units[i], id);
+}
 
 static void event_show(const struct unit *u, const volatile uint32_t *e) {
     unsigned code = e[1] >> 28;
@@ -515,7 +536,7 @@ static bool sync(void) {
     for (size_t i = 0; i < nunits; i++) {
         events_drain(&units[i]);
         ok &= !units[i].lost;
-        units[i].lost = false;
+        units[i].lost = units[i].stalled = false;
     }
     return ok;
 }
@@ -560,10 +581,11 @@ static bool amd_attach(struct iommu_domain *dom) {
 }
 
 /* Valid, translation on, mode 0 (no page tables) with neither read nor write allowed: every DMA
-   aborts. Interrupts valid with IntCtl 00 and no pass bits: every interrupt aborts. */
+   aborts. Interrupts valid with IntCtl 00 and no pass bits: every interrupt aborts. What the
+   units cached under the domain's own ID goes (2.4.2) before that ID is released. */
 static bool amd_block(struct iommu_domain *dom) {
     uint64_t f = irq_save();
-    for (unsigned i = 0; i < dom->nids; i++) dte_write(dom->ids[i], DTE_V | DTE_TV, dom->id, DTE_IV);
+    for (unsigned i = 0; i < dom->nids; i++) dte_write(dom->ids[i], DTE_V | DTE_TV, BLOCK_DOMAIN, DTE_IV);
     send_entry_flush(dom);
     send_domain_flush(dom->id);
     bool ok = sync();
@@ -599,15 +621,37 @@ static uint16_t amd_alias(uint16_t id) {
 }
 
 /* ---- interrupts ----
-   A claimed function's message carries its remapping table index in data bits 10:0: entry n
-   is message n, fixed delivery to a physical APIC id (the 32-bit entry format). The table is
-   cached: every change is invalidated (2.3.2). */
+   A claimed function's message carries its remapping table index in data bits 10:0 and no
+   destination: entry n is message n, fixed delivery to a physical APIC id. The entries are the
+   128-bit format with GuestMode 0 (Figure 19), whose destination has 32 bits, where the units
+   are wide, else the 32-bit format (Figure 15) with 8. The table is cached: every change is
+   invalidated (2.3.2). */
+
+/* A 128-bit entry changes in one store the unit cannot see half done, as one that remaps must
+   (2.3.2): cmpxchg16b on the 16-byte aligned entry. */
+static void irte_store(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
+    uint64_t old_lo = e[0], old_hi = e[1];
+    bool stored;
+    do __asm__ volatile("lock cmpxchg16b %1"
+                        : "=@ccz"(stored), "+m"(*(volatile unsigned __int128 *)e), "+a"(old_lo), "+d"(old_hi)
+                        : "b"(lo), "c"(hi)
+                        : "memory");
+    while (!stored);
+}
+
 static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, uint8_t vector, uint32_t dest,
                       bool on) {
-    volatile uint32_t *irt = phys_to_virt(dom->irt);
-    for (unsigned i = 0; i < count; i++)
-        irt[first + i] = on ? 1u | dest << 8 | (uint32_t)(uint8_t)(vector + i) << 16 : 0;
-    if (!amd.coherent) iommu_cache_flush(irt + first, count * 4);
+    uint8_t *irt = phys_to_virt(dom->irt);
+    size_t size = wide ? 16 : 4;
+    for (unsigned i = 0; i < count; i++) {
+        uint8_t v = (uint8_t)(vector + i);
+        if (wide)
+            irte_store((volatile uint64_t *)(irt + (first + i) * size), on ? 1u | (uint64_t)(dest & 0xFFFFFF) << 8 : 0,
+                       on ? v | (uint64_t)(dest >> 24) << 56 : 0);
+        else
+            ((volatile uint32_t *)irt)[first + i] = on ? 1u | dest << 8 | (uint32_t)v << 16 : 0;
+    }
+    if (!amd.coherent) iommu_cache_flush(irt + first * size, count * size);
     uint64_t f = irq_save();
     for (unsigned i = 0; i < dom->nids; i++) send(CMD_INV_IRT, dom->ids[i], 0, 0, 0);
     bool ok = sync();
@@ -617,9 +661,9 @@ static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, 
 
 static bool amd_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                     uint32_t *address, uint32_t *data) {
-    if (dest > 0xFF) return false;
     struct iommu_domain *dom = iommu_domain_of(d);
-    *address = iommu_msi_plain(dest);
+    if (dest > 0xFF && !(dom && wide)) return false;
+    *address = iommu_msi_plain(dom ? 0 : dest);
     *data = dom ? index : vector;
     if (!dom) return true;
     return index < 1u << IRT_LOG2 && count && count <= (1u << IRT_LOG2) - index &&
@@ -642,7 +686,8 @@ static bool amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
    MarcEn is a control bit never set here, and the performance optimization (3.4.9), which lets
    integrated devices such as GPUs reach memory without the unit, in a register of its own. */
 static bool program(struct unit *u) {
-    wr(u, R_CONTROL, 0);
+    uint64_t kept = rd(u, R_CONTROL) & CTL_FIRMWARE;
+    wr(u, R_CONTROL, kept);
     if (!engines_off(u, true)) {
         kprintf("iommu: unit at %lx does not stop its translation and queue engines\n", u->base);
         return false;
@@ -670,11 +715,12 @@ static bool program(struct unit *u) {
     wr(u, R_EVT_HEAD, 0);
     wr(u, R_EVT_TAIL, 0);
     u->cmd_tail = 0;
-    u->lost = false;
+    u->lost = u->stalled = false;
     wr(u, R_STATUS, ST_EVENT_OVERFLOW | ST_EVENT_INT | ST_COMWAIT_INT);
     /* the IVHD flags HtTunEn, PassPW, ResPassPW, Isoc and Coherent are the firmware's settings
        for control bits 1, 8, 9, 11 and 10 */
-    uint64_t ctl = CTL_IOMMU_EN | CTL_EVENTLOG_EN | CTL_CMDBUF_EN;
+    uint64_t ctl = kept | CTL_IOMMU_EN | CTL_EVENTLOG_EN | CTL_CMDBUF_EN;
+    if (wide) ctl |= CTL_XT_EN | CTL_GA_EN; /* GAMEn 000b: remapping only, no guest APIC */
     if (u->flags & 1) ctl |= 1ull << 1;
     if (u->flags & 2) ctl |= 1ull << 8;
     if (u->flags & 4) ctl |= 1ull << 9;
@@ -686,8 +732,8 @@ static bool program(struct unit *u) {
 }
 
 /* What a unit may have cached before it was ours, or before a sleep: everything at once where
-   it can be told so, else the entries of every ID its IVHD names (a domain's pages are
-   invalidated before the domain is first used). */
+   it can be told so, else the entries of every ID its IVHD names and the pages of the blocked
+   entries' domain (a claim's are invalidated before the claim first uses them). */
 static void send_everything_flush(void) {
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
@@ -695,6 +741,7 @@ static void send_everything_flush(void) {
             command(u, CMD_INV_ALL, 0, 0, 0, 0);
             continue;
         }
+        domain_flush(u, BLOCK_DOMAIN);
         for (size_t s = 0; s < u->nlisted; s++)
             for (uint32_t id = u->listed[s].first; id <= u->listed[s].last; id++) {
                 command(u, CMD_INV_DEVTAB, id, 0, 0, 0);
@@ -707,7 +754,7 @@ static void send_everything_flush(void) {
 static bool units_off(void) {
     bool ok = true;
     for (size_t i = 0; i < nunits; i++) {
-        wr(&units[i], R_CONTROL, 0);
+        wr(&units[i], R_CONTROL, rd(&units[i], R_CONTROL) & CTL_FIRMWARE);
         if (!engines_off(&units[i], true)) {
             kprintf("iommu: unit at %lx does not stop\n", units[i].base);
             ok = false;
@@ -842,6 +889,22 @@ static struct iommu_hw amd = {
 static bool va_width_valid(unsigned bits) { return bits == 32 || bits == 40 || bits == 48 || bits == 64; }
 static bool pa_width_valid(unsigned bits) { return bits == 40 || bits == 48 || bits == 52; }
 
+/* A unit the firmware left on reads its device table and command buffer and writes its event
+   log (3.4, offsets 0000h-0010h) until program() stops it: whether one of them lies in RAM the
+   OS owns, which the kernel may have reused before then. */
+static bool left_in_os_ram(const struct unit *u, uint64_t control) {
+    static const struct { unsigned reg; uint64_t enable; } live[] = {
+        {R_DEVTAB, CTL_IOMMU_EN}, {R_CMDBUF, CTL_CMDBUF_EN}, {R_EVENTLOG, CTL_EVENTLOG_EN}};
+    bool found = false;
+    for (size_t i = 0; i < sizeof live / sizeof *live; i++) {
+        if (!(control & CTL_IOMMU_EN) || !(control & live[i].enable)) continue;
+        uint64_t v = rd(u, live[i].reg), base = v & 0x000FFFFFFFFFF000ull;
+        uint64_t bytes = live[i].reg == R_DEVTAB ? ((v & 0x1FF) + 1) * PAGE_SIZE : 16ull << (v >> 56 & 15);
+        found |= iommu_os_ram(base, base + bytes);
+    }
+    return found;
+}
+
 const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
     *plain_safe = false;
     const struct acpi_sdt *h = acpi_find("IVRS", 0);
@@ -892,9 +955,22 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         max_levels = MIN(max_levels, 4u + ((unsigned)(u->efr >> 10) & 3));
         np_cache |= (header & CAP_NP_CACHE) != 0;
         amd.coherent &= (u->flags & 32) != 0;
-        kprintf("iommu: AMD-Vi unit at %lx (IVHD %02xh, function %02x:%02x.%u), extended features %lx\n", u->base,
-                u->type, u->fn ? u->fn->bus : 0, u->fn ? u->fn->dev : 0, u->fn ? u->fn->func : 0, u->efr);
+        uint64_t control = rd(u, R_CONTROL);
+        kprintf("iommu: AMD-Vi unit at %lx (IVHD %02xh, function %02x:%02x.%u), extended features %lx; "
+                "left with control %lx, status %lx\n", u->base, u->type, u->fn ? u->fn->bus : 0,
+                u->fn ? u->fn->dev : 0, u->fn ? u->fn->func : 0, u->efr, control, rd(u, R_STATUS));
+        if (left_in_os_ram(u, control))
+            kprintf("iommu: unit at %lx was left on with its tables in RAM the OS owns: what it read and "
+                    "wrote there until now is not known\n", u->base);
     }
+    if (ivinfo & 2) kprintf("iommu: the firmware protected memory from DMA with AMD-Vi before boot (IVinfo %x)\n", ivinfo);
+    /* 2.2.5.3: with the CPUs in x2APIC mode the units are wide where every unit can be. Else a
+       claimed function's remapped interrupts reach the APIC IDs the 32-bit entry holds. */
+    wide = lapic_x2apic();
+    for (size_t i = 0; i < nunits; i++) wide &= (units[i].efr & (EFR_XT | EFR_GA)) == (EFR_XT | EFR_GA);
+    if (lapic_x2apic() && !wide)
+        kprintf("iommu: an AMD-Vi unit lacks x2APIC interrupt remapping (XTSup, GASup): claimed functions' "
+                "interrupts go to APIC IDs below 256 only\n");
     amd.iova_bits = MIN(amd.iova_bits, HOST_PAGE_SHIFT + HOST_INDEX_BITS * max_levels);
     /* HATS is a maximum, not a required depth. Domains currently use identity DMA;
        iommu_dma_limit accepts only min(input, physical, PTE physical width). Retain

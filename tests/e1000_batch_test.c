@@ -38,6 +38,14 @@ void pci_enable_busmaster(struct pci_device *device) { (void)device; }
 void irq_register(int irq, irq_handler_t handler) { (void)irq; (void)handler; }
 void pic_unmask(int irq) { (void)irq; }
 void net_register(struct netif *iface) { (void)iface; }
+void pm_register(struct pm_device *d) { (void)d; }
+static bool itr_given;
+static uint64_t itr_us;
+bool cmdline_number(const char *key, uint64_t *out) {
+    if (strcmp(key, "e1000-itr-us") || !itr_given) return false;
+    *out = itr_us;
+    return true;
+}
 void net_delay_ms(uint64_t ms) { (void)ms; }
 int kprintf(const char *fmt, ...) { (void)fmt; return 0; }
 
@@ -140,7 +148,7 @@ static void transmit_cases(void) {
     bool all_sent = true;
     for (size_t i = 0; i < NTX - 1; i++) all_sent &= e1000_send(frame, sizeof frame) == 0;
     check(all_sent && tx_cur == (int)NTX - 1 && tx_clean == 0, "TX ringの利用可能descriptorを使う");
-    check(e1000_send(frame, sizeof frame) == -EAGAIN && tx_cur == (int)NTX - 1, "TX満杯はspinせず成功偽装もしない");
+    check(e1000_send(frame, sizeof frame) == -N_ERR_NOT_READY && tx_cur == (int)NTX - 1, "TX満杯はspinせず成功偽装もしない");
     check(rd(REG_TDT) == NTX - 1, "TX満杯でheadとtailを同値にしない");
     check(!memcmp(tx_pixels[0], frame, sizeof frame) && tx[0].len == sizeof frame, "TX frameを完全に保存");
     tx[0].status = DESC_DD;
@@ -148,26 +156,27 @@ static void transmit_cases(void) {
     e1000_irq(NULL);
     check(notifications == 1 && e1000_rx_pending(), "TX completionがnet threadを起こす");
     check(e1000_send(frame, sizeof frame) == 0 && tx_cur == 0 && tx_clean == 1, "completion後のretryとTX wrap");
-    check(e1000_send(frame, sizeof frame) == -EAGAIN, "残りcompletion前は再び資源待ち");
+    check(e1000_send(frame, sizeof frame) == -N_ERR_NOT_READY, "残りcompletion前は再び資源待ち");
     check(test_irq_enabled, "TX資源待ちでもIRQ状態を復元");
-    check(e1000_send(frame, BUFSZ + 1) == -EINVAL, "TX buffer範囲外を拒否");
+    check(e1000_send(frame, BUFSZ + 1) == -N_ERR_INVALID, "TX buffer範囲外を拒否");
 }
 
+/* 数値の解析（token境界・不正値・overflow）は init.c の cmdline_number の責務。ここでは
+   その結果を与え、e1000 側の単位変換とレジスター範囲だけを確かめる。 */
 static void itr_cases(void) {
-    kernel_cmdline = NULL;
+    itr_given = false;
     check(e1000_itr_ticks() == ITR_DEFAULT_TICKS, "ITR未指定はIntel推奨値");
-    kernel_cmdline = "e1000-itr-us=0";
+    itr_given = true;
+    itr_us = 0;
     check(e1000_itr_ticks() == 0, "ITRを明示無効化");
-    kernel_cmdline = "abc e1000-itr-us=1 def";
+    itr_us = 1;
     check(e1000_itr_ticks() == 4, "microsecondを256ns単位へ切上げ");
-    kernel_cmdline = "e1000-itr-us=16776";
+    itr_us = 16776;
     check(e1000_itr_ticks() == 65532, "ITRレジスター上限近傍");
-    kernel_cmdline = "e1000-itr-us=16777";
+    itr_us = 16777;
     check(e1000_itr_ticks() == ITR_DEFAULT_TICKS, "16bitレジスター溢れを拒否");
-    kernel_cmdline = "e1000-itr-us=18446744073709551616";
-    check(e1000_itr_ticks() == ITR_DEFAULT_TICKS, "数値parse overflowを拒否");
-    kernel_cmdline = "xe1000-itr-us=0 e1000-itr-us=1x e1000-itr-us=";
-    check(e1000_itr_ticks() == ITR_DEFAULT_TICKS, "token境界と不正値を拒否");
+    itr_us = UINT64_MAX;
+    check(e1000_itr_ticks() == ITR_DEFAULT_TICKS, "単位変換のoverflowを拒否");
 }
 
 int main(void) {
