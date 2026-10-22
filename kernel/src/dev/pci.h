@@ -16,18 +16,31 @@ struct pci_device {
     struct pci_device *upstream;  /* the bridge whose secondary bus this function is on, or NULL */
     uint16_t msix_entries;      /* set by pci_msix_init() */
     volatile uint32_t *msix_table; /* mapped MSI-X table, 16 bytes per entry */
+    /* What its MSI and each MSI-X entry were last given (pci_msi_enable_multi, pci_msix_route),
+       vector 0 for nothing: made again where the units that remapped them did not come back
+       from a sleep (pci_resume). msix_given has msix_entries entries, allocated with the table. */
+    struct pci_msi_given {
+        uint32_t dest;
+        uint8_t vector, count;
+    } msi_given, *msix_given;
     bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster): no app may claim it */
     bool claimed;      /* an app drives it (dev/pciuser.c) */
     bool iommu_blocked; /* in an ended claim's group: the IOMMU drops what it sends (dev/iommu.c) */
     bool needs_reset; /* stopped state unconfirmed, or residual state from an ended multi-function group */
-    /* While set, an FLR is under way (quiesce and stale-Completion wait, the reset, readiness),
-       kept when its caller is cancelled or a sleep comes between: no configuration access but
-       pci_function_reset's may reach the function until it completes, as a function may discard
-       Requests during its FLR (6.6.2). Software that does not own the reset asks
-       pci_config_blocked. */
+    /* While set, the function is being reset (pci_function_reset) and its configuration from
+       before is held to be written back: kept when an attempt is cancelled or fails, or a sleep
+       comes between, until an FLR has been seen through. A function may discard Requests during
+       its FLR (6.6.2): software that does not own the reset asks pci_config_blocked. */
     struct pci_reset *reset;
-    unsigned rrs_holds;  /* a Root Port: resets below it awaiting readiness through it (pci.c) */
+    unsigned rrs_holds;  /* a Root Port: reset attempts or readiness waits below it running (pci.c) */
     bool rrs_firmware;   /* a Root Port: RRS Software Visibility was already on at the first hold */
+    /* A Downstream Port after a Conventional Reset (sleep, pci_bus_reset), as TSC counts, 0 while
+       not yet known: when the reset of its link ended, and from when what is below it may be
+       read (UINT64_MAX: its link is down) */
+    uint64_t reset_end, below;
+    /* A Downstream Port: a configuration written back changed the Common Clock Configuration of
+       the device below since its link trained, which takes effect once the link retrains (pci.c) */
+    bool retrain;
 };
 void pci_init(void);
 /* Config space access. offsets are 0..4095: below 256 CF8/CFC or ECAM, 256 and up ECAM only (an
@@ -45,6 +58,8 @@ void pci_write8(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint8_t v)
 #define PCI_COMMAND_SERR   (1u << 8)  /* SERR# Enable */
 #define PCI_COMMAND_INTX_DISABLE (1u << 10) /* Interrupt Disable: set, no INTx is asserted */
 #define PCI_CONFIG_RRS_ID  0xFFFF0001u /* Vendor/Device ID read with RRS Software Visibility (2.3.2) */
+#define PCI_BRIDGE_CONTROL 0x3E        /* a bridge's Bridge Control register (7.5.1.3.13) */
+#define PCI_BRIDGE_CONTROL_SBR (1u << 6) /* Secondary Bus Reset */
 struct pci_device *pci_find(uint16_t vendor, uint16_t device);
 struct pci_device *pci_find_class(uint8_t cls, uint8_t subcls);
 void pci_enable_busmaster(struct pci_device *d);
@@ -95,25 +110,35 @@ void pci_msix_function_mask(struct pci_device *d, bool masked);
    confirm the function's messages lead nowhere; its vectors must not be given to anything else. */
 bool pci_msi_disable(struct pci_device *d);
 /* Registers of the PCI Express capability (PCI Express Base 6.0, 7.5.3), at pcie_cap + offset */
+#define PCIE_CAPS    0x02
 #define PCIE_DEVCAP  0x04
 #define PCIE_DEVCTL  0x08
 #define PCIE_DEVSTA  0x0A
 #define PCIE_LNKCAP  0x0C
 #define PCIE_LNKCTL  0x10
 #define PCIE_LNKSTA  0x12
+#define PCIE_SLOTCAP 0x14
 #define PCIE_ROOTCTL 0x1C
 #define PCIE_ROOTCAP 0x1E
 /* version 2 and later only (pcie_v2) */
 #define PCIE_DEVCAP2 0x24
 #define PCIE_DEVCTL2 0x28
 #define PCIE_LNKCTL2 0x30
+#define PCIE_CAPS_SLOT          (1u << 8)  /* Slot Implemented (7.5.3.2) */
+#define PCIE_SLOTCAP_HOTPLUG    (1u << 6)  /* Hot-Plug Capable (7.5.3.9) */
 #define PCIE_DEVCAP_FLR         (1u << 28) /* Function Level Reset Capability */
 #define PCIE_DEVCTL_FLR         (1u << 15) /* Initiate Function Level Reset */
 #define PCIE_DEVSTA_PENDING     (1u << 5)  /* Transactions Pending */
 #define PCIE_DEVCTL2_CT_DISABLE (1u << 4)  /* Completion Timeout Disable */
 #define PCIE_LNKCAP_SPEED        0xFu       /* Max Link Speed: above 2, faster than 5.0 GT/s (7.5.3.6) */
 #define PCIE_LNKCAP_DLL_REPORTING (1u << 20) /* Data Link Layer Link Active Reporting Capable */
+#define PCIE_DEVCTL2_LTR         (1u << 10) /* LTR Mechanism Enable (7.5.3.16) */
 #define PCIE_LNKCTL_DISABLE      (1u << 4)  /* Link Disable (7.5.3.7) */
+#define PCIE_LNKCTL_RETRAIN      (1u << 5)  /* Retrain Link (7.5.3.7) */
+#define PCIE_LNKCTL_CCC          (1u << 6)  /* Common Clock Configuration (7.5.3.7) */
+#define PCIE_LNKSTA_SPEED        0xFu       /* Current Link Speed (7.5.3.8) */
+#define PCIE_LNKSTA_WIDTH        (0x3Fu << 4) /* Negotiated Link Width */
+#define PCIE_LNKSTA_TRAINING     (1u << 11) /* Link Training (7.5.3.8) */
 #define PCIE_LNKSTA_DLL_ACTIVE   (1u << 13) /* Data Link Layer Link Active (7.5.3.8) */
 #define PCIE_LNKCTL2_COMPLIANCE  (1u << 4)  /* Enter Compliance (7.5.3.19) */
 #define PCIE_LNKCTL2_MOD_COMPLIANCE (1u << 10) /* Enter Modified Compliance (7.5.3.19) */
@@ -142,21 +167,62 @@ bool pci_requests_done(const struct pci_device *d);
    Complex stops retrying, until the reported FLR Time, or 1.0 s without one (the time 6.6.1
    and 5.10.1 give before a function may be declared broken; 6.6.2 itself sets no limit). False
    when it has no FLR, is gone, is still mastering afterwards, or is not configuration-ready
-   yet. A pending reset keeps its saved configuration for a later call (d->reset); cancellation
-   must not discard or recapture that state. A sleep in between stands in for the FLR: its
-   Conventional Reset did the same, and the next call waits for readiness from the resume
-   (pci_resume). This resets device state, not an IOMMU drain confirmation: its success alone
+   yet. An unfinished reset keeps its saved configuration for a later call (d->reset);
+   cancellation must not discard or recapture that state. A call cancelled in an FLR's waits
+   goes on with that FLR; one that ends before its FLR, or finds the function not ready by the
+   limit, leaves the next call to stop the function and issue another, once its Vendor ID read
+   gives its ID (a write to a function answering RRS is retried by the Root Complex, 2.3.2).
+   A sleep or a bus reset in between counts as no FLR (pci_resume, pci_bus_reset). A function
+   without FLR whose configuration a bus reset left held gets it back once it answers, and the
+   call is false. This resets device state, not an IOMMU drain confirmation: its success alone
    must not release quarantined DMA pages. May sleep, with cancellation during scheduler waits.
-   The Root Port above shows RRS from the FLR until readiness and then gets its former Root
-   Control back; without one that supports it (an RCiEP, an RCRB root) the Root Complex retries
-   inside the configuration read, which no cancellation can interrupt. */
+   The Root Port above shows RRS during each call and then gets its former Root Control back;
+   without one that supports it (an RCiEP, an RCRB root) the Root Complex retries inside the
+   configuration read, which no cancellation can interrupt. */
 bool pci_function_reset(struct pci_device *d);
-/* True while an FLR is under way on bus:dev.func (pci_device.reset): no configuration request
-   may then go to it from software other than the reset's (AML's PCI_Config regions, dev/acpi.c),
-   which drops it. The first refusal during each reset is logged. */
+/* d's reset did not end because d did not come back: by the limit after its FLR, or at a later
+   call, its Vendor ID read did not give its ID, or its requests were still pending; or it did
+   not answer after a Conventional Reset (pci_bus_reset, sleep). Its Bus Master Enable is off,
+   cleared before its FLR or by the reset. The kernel reaches it only through its reset (its ACS
+   is not read either, dev/iommu.c); the firmware's AML not at all while it answers RRS
+   (pci_config_blocked). What remains is a Conventional Reset (pci_bus_reset). */
+bool pci_reset_stuck(const struct pci_device *d);
+/* The Downstream Port whose Secondary Bus Reset resets d (pci_bus_reset), or NULL: d is not
+   right below a Root Port or a Switch Downstream Port; that port's link leads to a hot-plug
+   slot, whose link changes are events for the slot's software (6.7.3.3), the firmware's here;
+   or d did not answer after the last Conventional Reset it had, after which software may take
+   it as broken (6.6.1), and has not answered since. */
+struct pci_device *pci_bus_reset_port(const struct pci_device *d);
+/* A Secondary Bus Reset of port (pci_bus_reset_port): a hot reset, a Conventional Reset of every
+   function below it (6.6.1, 7.5.1.3.13). The caller has all of them reserved: none another
+   claim's or a kernel driver's, none the boot screen's. Each one's configuration is held first,
+   its bus mastering stopped and kept off in it but for bridges (which forward the requests of
+   what is below them). Secondary Bus Reset is held at least Trst (1 ms, PCI Local Bus 3.0,
+   4.3.2) and, where the port reports it, until its link is down; the reset ends 2 ms after it
+   is cleared (4.2.7.11). The functions are then read as 6.6.1 has it: 100 ms after the reset,
+   or after their link trained above 5.0 GT/s, up to 1.0 s for their IDs. Each configuration is
+   written back once its function answers, after the port's LTR Mechanism Enable, which its link
+   going down cleared (7.5.3.16; closest to the Root Port first, 6.18). A function with an
+   unfinished FLR is left to its next pci_function_reset: a Conventional Reset does not stop
+   what an FLR stops (6.6.2). One that does not answer keeps its configuration held
+   (pci_reset_stuck). Sleeps, not cancellable once the reset is sent: about 1.1 s at most for
+   each link on the way. False when nothing was reset: a function below does not answer and has
+   no configuration held, there is no memory to hold them, enumeration did not keep every
+   function, a conventional PCI bus is below (its first access waits Trhfa, 2^25 of its clocks,
+   which are not known here: 6.6.1, PCI Local Bus 3.0 4.3.2), or the port is in reset already or
+   set to Enter Compliance (4.2.7.2.2). */
+bool pci_bus_reset(struct pci_device *port);
+/* True while bus:dev.func is kept from software other than its reset's (AML's PCI_Config
+   regions, dev/acpi.c), which drops the access: during a reset attempt or a bus reset, up to the
+   readiness limit of an FLR issued, and while it last answered RRS (until its Vendor ID read,
+   repeated here, gives its ID). The first refusal during each reset is logged. */
 bool pci_config_blocked(uint8_t bus, uint8_t dev, uint8_t func);
 /* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (BSP,
    before the drivers resume). pci_suspend allocates and so runs with interrupts on; it returns
-   NULL, or what could not be saved (the sleep is then called off and pci_resume writes nothing). */
+   NULL, or what could not be saved (the sleep is then called off and pci_resume writes nothing).
+   slept: the machine went to sleep, or a hibernation image was restored (machine_sleep).
+   remake: the IOMMU's units did not come back (iommu_resume): each function's messages are made
+   again from what they were given (iommu_msi_message), one that cannot be is left off, and a
+   function in an ended claim's group keeps bus mastering off, as no unit drops its requests. */
 const char *pci_suspend(void);
-void pci_resume(void);
+void pci_resume(bool slept, bool remake);

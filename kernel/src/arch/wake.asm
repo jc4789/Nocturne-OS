@@ -18,6 +18,12 @@ section .text
 %define TD_ARG     (TRAMP_DATA + 88)
 %define TD_ID_REG  (TRAMP_DATA + 96)
 %define TD_APIC_ID (TRAMP_DATA + 104)
+%define TD_ID_MASK (TRAMP_DATA + 108)
+%define TD_BASE    (TRAMP_DATA + 112)
+%define TD_BASE_MASK (TRAMP_DATA + 120)
+%define TD_FLAGS   (TRAMP_DATA + 128)
+%define TDF_X2     1            ; the kernel is in x2APIC mode
+%define TDF_XAIDN  2            ; AMD's 8-bit xAPIC ID is to be turned on (arch/apic.c)
 
 global tramp_start, tramp_pm32, tramp_lm64, tramp_end
 tramp_start:
@@ -57,12 +63,40 @@ tramp_pm32:
 bits 64
 tramp_lm64:
     mov ebx, ebx
-    mov rax, [rbx + TD_ID_REG]  ; a STARTUP that may have reached other CPUs (arch/wake.h):
-    test rax, rax               ; this one goes on only with the APIC ID it was sent to
-    jz .own
-    mov eax, [rax]
+    mov r8d, [rbx + TD_APIC_ID] ; a STARTUP that may have reached other CPUs (arch/wake.h):
+    cmp r8d, -1                 ; this one goes on only with the APIC ID it was sent to
+    je .own
+    mov ecx, 0x1B               ; IA32_APIC_BASE
+    rdmsr
+    test dword [rbx + TD_FLAGS], TDF_X2
+    jz .xapic
+    bt eax, 10                  ; the kernel's x2APIC mode, which this APIC takes from xAPIC mode,
+    jc .x2                      ; keeping its x2APIC ID (SDM 11.12.5.1); a disabled one takes no
+    bts eax, 10                 ; STARTUP (SDM 11.4.3, 42300 2.4.8.1.15)
+    wrmsr
+.x2:
+    mov ecx, 0x802              ; the x2APIC ID
+    rdmsr
+    cmp eax, r8d
+    jne .other
+    jmp .own
+.xapic:
+    bt eax, 10                  ; the kernel's xAPIC mode, which an APIC in x2APIC mode takes later,
+    jc .x2                      ; where it may (arch/apic.c), lapic_worker_init
+    shl rdx, 32
+    or rax, rdx
+    and rax, [rbx + TD_BASE_MASK]
+    cmp rax, [rbx + TD_BASE]    ; enabled, at the kernel's xAPIC page
+    jne .other
+    mov rsi, [rbx + TD_ID_REG]
+    test dword [rbx + TD_FLAGS], TDF_XAIDN
+    jz .xid
+    or dword [rsi + 0x410 - 0x20], 4 ; the 8-bit ID, which INIT turned off (APM 16.3.2)
+.xid:
+    mov eax, [rsi]
     shr eax, 24
-    cmp eax, [rbx + TD_APIC_ID]
+    and eax, [rbx + TD_ID_MASK]
+    cmp eax, r8d
     jne .other
 .own:
     mov rsp, [rbx + TD_STACK]

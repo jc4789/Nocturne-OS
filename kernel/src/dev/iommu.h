@@ -23,7 +23,9 @@ struct iommu_domain;
 
 void iommu_init(void); /* after pci_init, before a driver enables an interrupt */
 bool iommu_active(void); /* the units translate DMA: claims can be isolated */
-bool iommu_power_ready(void); /* false: unconfirmed hardware state forbids sleep/image restoration */
+/* false: unconfirmed hardware state, or units that did not come back from a sleep, forbid
+   sleep/image restoration */
+bool iommu_power_ready(void);
 /* A new domain for d with nothing of the app's mapped yet, attached to every requester ID of its
    group: 0 with *out set. Only with appdrivers-unisolated, 0 with *out NULL when no unit
    translates, no unit sees one of its requester IDs, its group holds a function the kernel
@@ -32,11 +34,15 @@ bool iommu_power_ready(void); /* false: unconfirmed hardware state forbids sleep
    claim's): -N_ERR_UNSUPPORTED (a unit does not see an ID, the group is unknown) or -N_ERR_BUSY
    (the kernel's or the platform's function) then. -N_ERR_BUSY when a function of the group is
    claimed or still in a domain (also one whose block was not confirmed), or no domain id is
-   free; -N_ERR_NO_MEMORY; -N_ERR_IO when the units did not confirm it. ACS controls the attempt
-   turned on are put back as they were when no domain comes of it. */
-int iommu_attach(struct pci_device *d, struct iommu_domain **out);
+   free; -N_ERR_NO_MEMORY; -N_ERR_IO when the units did not confirm it; -N_ERR_NOT_READY with
+   *resetting set when forming the group has to read a function being reset (pci_device.reset),
+   which only its reset may access: the group is formed once that is done. ACS controls the
+   attempt turned on are put back as they were when no domain comes of it. */
+int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting);
 /* Whether d is in a domain: attached, or blocked without the units' confirmation. */
 bool iommu_in_use(const struct pci_device *d);
+/* Whether d is a member of dom (its claimed function or the rest of its group). */
+bool iommu_member(const struct iommu_domain *dom, const struct pci_device *d);
 /* Nothing the group sends gets through any more; true once the units confirmed it. */
 bool iommu_block(struct iommu_domain *dom);
 /* Blocked first when it was not; kept (and its functions with it) until a block is confirmed. */
@@ -62,9 +68,14 @@ bool iommu_msi_clear(struct pci_device *d);
 bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte);
 /* Sleep (dev/pm.c): the units come back reset; resume programs them again from the tables in
    memory, before the IOAPICs and devices are, and only after the machine really slept (an
-   aborted sleep leaves them on). shutdown turns them off: a hibernation restore, whose image
-   brings tables of its own. Interrupts off. */
-bool iommu_resume(void); /* false: do not restore PCI DMA/interrupts */
+   aborted sleep leaves them on). NULL once they are back. Units that do not come back are
+   turned off where they confirm it, as iommu_init does with units that do not start: interrupt
+   routes are then given in the plain format (iommu_msi_message, iommu_ioapic_entry), unless a
+   unit must remap them, and then none is; no claim and no sleep follow until a restart. It
+   returns that loss, for the user, and the routes given before it are to be made again (the
+   IOAPICs' and the PCI functions' messages). shutdown turns them off: a hibernation restore,
+   whose image brings tables of its own. Interrupts off. */
+const char *iommu_resume(void);
 bool iommu_shutdown(void); /* false: do not overwrite the hardware's live tables */
 /* Why the units keep the CPUs out of x2APIC mode, or NULL: the firmware asks for it (VT-d
    X2APIC_OPT_OUT), or a unit remaps interrupts in xAPIC format only (VT-d without EIM, AMD-Vi

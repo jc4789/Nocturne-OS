@@ -279,15 +279,34 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     またはRRSを見せないRoot Complexが再試行を打ち切った失敗読み（全ビット1）をFLR Timeまで、
     無ければ1.0秒まで待つ（§6.6.1・§5.10.1が故障と判断してよいまでの時間。§6.6.2自体に上限は
     無い）。未準備・取消は保存状態を保持し、次の試行で再開する。途中でスリープ（S3）を挟んだ
-    FLRは、復帰時のConventional Resetが代わりを果たしたものとし、復帰時点から同じ読みで準備を
-    待って保存状態を戻す。FLRの途中の機能へは他の経路から構成アクセスしない：次のclaimは、
-    どのclaimも持たない途中のFLRを先に完了させてからgroupを調べ、AML（PCI_Config領域）の読みは
-    全ビット1、書込みは捨てる。
+    FLRは完了とみなさない：Conventional ResetはFLRの代わりにならない（§6.6.2「Other defined
+    reset operations do not guarantee that external I/O operations will be stopped」）。復帰時は
+    応答を待つだけで、次の試行が改めて止めてFLRする。FLRの途中の機能へは他の経路から構成
+    アクセスしない：次のclaimは、どのclaimも持たない途中のFLRを先に完了させてからgroupを調べ、
+    FLR・SBRの途中、またはRRSを返している間のAML（PCI_Config領域）の読みは全ビット1、書込みは
+    捨てる（RRSの間はAMLのアクセスごとにVendor IDを読み直し、戻った機能を閉ざし続けない）。
+    FLRで戻らない機能（上限までにIDを返さない・要求が残る）は、その装置のリンクのDownstream
+    Port（Root PortまたはSwitch Downstream Port）のSecondary Bus Reset（§7.5.1.3.13、hot reset）
+    で戻し、その後に改めてFLRする。SBRはそのポートの下の全機能をresetするので、下の全機能が
+    claim自身（primary、対象、domainのmember）か未使用のときだけ、claimの試行ごとに同じポートは
+    1回まで行う。下にカーネルdriverの機能・起動画面の機能・他のclaimやdomainの機能がある、
+    ポートがhot-plug slotへ通じる（リンクの変化はfirmwareのhot-plug処理のもの、§6.7.3.3）、
+    下に従来PCIバスがある（Trhfa、§6.6.1）、ポートがEnter Complianceの設定、または対象が前回の
+    Conventional Reset後に応答しなかった、のいずれかならSBRしない。SBRはTrst（1ms）以上かつ
+    リンクが落ちるまで保持し、解除の2ms後（§4.2.7.11）から§6.6.1の待機（5.0GT/s以下のポートは
+    100ms、それ以上はData Link Layer Link Activeの100ms後、IDは1.0秒まで）で読む。下の
+    Switchのポートのリンクはそのポート自身のreset終了から数える。ポートのLTR Mechanism Enable
+    （DL_Downで消える、§7.5.3.16）を先に戻してから各機能の構成を戻し、Common Clock
+    Configurationを戻したリンクを再学習させる（§7.5.3.7）。下の未使用機能はバスマスターを
+    切った構成で戻る。
     起動画面機能は汎用FLRせず、隔離下でnative driverに回復を要求する。FLR成功だけでは旧DMAを解放しない。
     P2Pで到達できる複数機能groupでは、終了したアプリの状態が全機能へ残り得るため、clean終了でも
     全機能を回復対象にする。次claimは全peerのBME停止を確認し、旧dirty peerのMSI無効化と個別FLRを
     確認してからhandleを返す。FLRは対象Functionだけをresetするので、新primaryだけの成功では不足する。
-    回復不能・取消・未準備・起動画面のpeerは`N_ERR_NOT_READY`としてgroupを再遮断する。
+    FLRとSBRの後も応答しないpeerは、バスマスター停止のままclaimのdomainに閉じ込め（送るものは
+    domainの外へ届かない）、カーネルはそのresetの経路以外で触れず（ACSは無いものとしてgroupを
+    作る）、回復が必要な機能として残す。primaryが戻らない場合と、回復不能・取消・未準備・
+    起動画面のpeerは`N_ERR_NOT_READY`としてgroupを再遮断する。
     native driverへの回復委任は新primaryだけであり、未知peerの回復を暗黙に委ねない。
   - `n_pci_hold_screen(pci, hold)`：起動時の画面がその機能の BAR にあるとき、ドライバーが
     CPU から画面への経路を作り直す間（NVIDIA の RM は GSP が BAR1 を仮想モードにする間）、
@@ -370,7 +389,13 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     非隔離claimは全メモリへ届くため、その危険をログに残す。対応幅を超す物理アドレスをPTEへ切り詰めず拒否し、
     DMA確保は実際の変換幅内へ制限する。IVMDのaccess=0/ROをDMAオブジェクトが拡大せず、解放で予約を消さない。
     S3では保存したPIC/IOAPIC経路をマスクし、復帰ファームウェアが再有効化した経路も再び止めてから
-    IOMMU→IOAPIC→PIC→PCIの順で再開する。IOMMU再開失敗はPCI/IOAPIC再開前に停止し、
+    IOMMU→IOAPIC→PIC→PCIの順で再開する。IOAPICの経路は、与えられた要求から毎回作り直す。
+    IOMMUが戻らない場合は停止（panic）せず、起動時の失敗と同じ段階で縮退する：ユニットが停止を
+    確認し、IRREQも無ければ、IOAPICの経路とPCI機能のMSI/MSI-Xを、保存した再マップ形式ではなく、
+    与えられた要求（ベクターと宛先）から通常形式で作り直す。DMAは変換なしで続ける。終わったclaimの
+    グループに属する機能はBus Master Enableを切ったままにする。停止が未確認、またはIRREQなら
+    装置割込みを全て切ったままにする。どちらの場合も、再起動まで claim・再スリープ・休止を拒否し、
+    ユーザーへ通知する。x2APICモードは再マップなしで戻る（起動時と同じ、SDM 11.12.7 からの既知の逸脱）。
     休止復元で停止できない表へメモリを上書きしない。中止sleepではPICを再初期化せずmaskだけ戻す。
     実edge割込みの無損失はこの順序だけでは保証しない。
   - `n_shared_view(shared, offset, bytes, cache)` は共有オブジェクトの一部を、別のキャッシュ

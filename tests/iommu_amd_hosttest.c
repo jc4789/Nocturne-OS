@@ -29,7 +29,7 @@ static uint64_t second_registers[MMIO_BYTES / sizeof(uint64_t)];
 static const uint64_t first_base = 0xFED90000;
 static bool plain_safe;
 static uint64_t map_failed_base;
-static unsigned register_writes, virtual_status_reads;
+static unsigned map_calls, register_writes, virtual_status_reads;
 static uint64_t control_readonly;
 static bool control_locked, exclusion_locked, perf_locked;
 static volatile uint8_t *locked_control_regs;
@@ -65,6 +65,9 @@ static void wr(const struct unit *u, unsigned off, uint64_t value) {
     uint64_t old = r[off / sizeof(uint64_t)];
     if (off == R_CONTROL) {
         if (control_locked && (!locked_control_regs || u->regs == locked_control_regs)) return;
+        /* 実EFRにXTSup/GASupが無ければXTEnは予約・GAEnへの書込みは無視（3.4, 0018h）：書いても立たない */
+        if (!(r[R_EFR / sizeof(uint64_t)] & EFR_XT)) value &= ~CTL_XT_EN;
+        if (!(r[R_EFR / sizeof(uint64_t)] & EFR_GA)) value &= ~CTL_GA_EN;
         uint64_t *status = r + R_STATUS / sizeof(uint64_t);
         if ((value & CTL_CMDBUF_EN) && !(*status & ST_CMDBUF_RUN)) command_restarts++;
         if (!(value & CTL_IOMMU_EN) || !(value & CTL_CMDBUF_EN)) *status &= ~ST_CMDBUF_RUN;
@@ -150,6 +153,7 @@ uint32_t pci_read32(uint8_t b, uint8_t d, uint8_t f, uint16_t off) {
 }
 void *vmm_map_mmio(uint64_t base, uint64_t bytes) {
     CHECK(bytes == MMIO_BYTES);
+    map_calls++;
     if (base == map_failed_base) return NULL;
     return base == first_base + MMIO_BYTES ? second_registers : registers;
 }
@@ -202,7 +206,7 @@ static void reset(void) {
     units = NULL; nunits = units_room = 0; aliases = NULL; naliases = aliases_room = 0;
     memset(registers, 0, sizeof registers); memset(covered_ids, 0, sizeof covered_ids);
     memset(second_registers, 0, sizeof second_registers);
-    plain_safe = true; map_failed_base = 0; register_writes = virtual_status_reads = 0;
+    plain_safe = true; map_failed_base = 0; map_calls = register_writes = virtual_status_reads = 0;
     control_readonly = 0;
     memset(platform_ids, 0, sizeof platform_ids);
     parse_lost = np_cache = false; control_locked = exclusion_locked = perf_locked = false;
@@ -333,14 +337,16 @@ static void test_ivrs(void) {
     CHECK(hw == &amd && amd.levels == 5 && amd.iova_bits == 57 && amd.phys_bits == 52);
     CHECK(units[0].efr & EFR_PERF_OPT); /* IVHD11 EFRがMMIOより優先 */
     CHECK(!wide); /* xAPICでは32bit IRTE */
-    /* 2.2.5.3: x2APICでは全unitにXTEnとGAEnが必須。実MMIO EFRにXTSup/GASupがなければXTEnは予約・GAEnは無視
-       （3.4, 0018h）、IVHD imageになければfirmwareが取り下げた機能（1.3）。どちらかが欠ければ32bit IRTEへ
-       落とさずAMD-Viを使わない。xAPICは影響を受けない。 */
+    /* 2.2.5.3: x2APICでは全unitにXTEnとGAEnが必須。機能はIVHD imageの報告に従い、実MMIO EFRには頼らない
+       （1.3: ACPIにも報告される機能でEFRに頼るべきでない、5.2: 11hがMMIO registerに優先）。imageに無ければ
+       firmwareが取り下げた機能で、32bit IRTEへ落とさずAMD-Viを使わない。実EFRとの不一致はprobeが記録し、
+       XTEn/GAEnが立つかはprogramが確かめる（test_firmware_bits）。xAPICは影響を受けない。 */
     const struct { uint64_t image, hardware; bool x2apic, used; } xt[] = {
         {EFR_XT | EFR_GA, EFR_XT | EFR_GA, true, true},
         {EFR_XT, EFR_XT | EFR_GA, true, false}, {EFR_GA, EFR_XT | EFR_GA, true, false},
-        {EFR_XT | EFR_GA, EFR_XT, true, false}, {EFR_XT | EFR_GA, EFR_GA, true, false},
-        {EFR_XT | EFR_GA, 0, true, false}, /* imageだけの申告では128bit IRTEを使わない */
+        {EFR_XT | EFR_GA, EFR_XT, true, true}, {EFR_XT | EFR_GA, EFR_GA, true, true},
+        {EFR_XT | EFR_GA, 0, true, true}, /* 表の申告が実EFRに優先する */
+        {0, EFR_XT | EFR_GA, true, false}, /* 実EFRだけの申告では128bit IRTEを使わない */
         {EFR_XT | EFR_GA, EFR_XT | EFR_GA, false, true}, {EFR_XT | EFR_GA, 0, false, true}, {0, 0, false, true}
     };
     for (size_t i = 0; i < ARRAY_SIZE(xt); i++) {
@@ -374,11 +380,12 @@ static void test_ivrs(void) {
     CHECK(!iommu_amd_probe(&plain_safe)); /* 実装未定義の幅を推測して受理しない */
 
     /* IVinfo[EFRSup]=1のIVHD10：IOMMU Feature Reporting（+20h, Table 92）がEFRに優先する（1.3）。
-       XTSup bit0・IASup bit5・GASup bit6・HATS 31:30をEFRの位置で使い、x2APICでは表とMMIOの両方を要する。 */
-    const struct { uint32_t reported; uint64_t hardware; bool used; } reported[] = {
-        {1u | 1u << 5 | 1u << 6 | 1u << 30, EFR_XT | EFR_GA, true},
-        {1u, EFR_XT | EFR_GA, false},          /* 表がGASupを取り下げた */
-        {1u | 1u << 6, 0, false},              /* 表だけの申告 */
+       XTSup bit0・IASup bit5・GASup bit6・HATS 31:30をEFRの位置で使い、x2APICでは表の申告を要する。 */
+    const struct { uint32_t reported; uint64_t hardware, efr; bool used; } reported[] = {
+        {1u | 1u << 5 | 1u << 6 | 1u << 30, EFR_XT | EFR_GA, EFR_XT | EFR_IA | EFR_GA | 1ull << 10, true},
+        {1u, EFR_XT | EFR_GA, 0, false},           /* 表がGASupを取り下げた */
+        {1u | 1u << 6, 0, EFR_XT | EFR_GA, true},  /* 表の申告が実EFRに優先する */
+        {0, EFR_XT | EFR_GA, 0, false},            /* 実EFRだけの申告 */
     };
     for (size_t i = 0; i < ARRAY_SIZE(reported); i++) {
         reset(); firmware = h; x2apic = true;
@@ -386,7 +393,7 @@ static void test_ivrs(void) {
         registers[R_EFR / 8] = reported[i].hardware;
         CHECK((iommu_amd_probe(&plain_safe) == &amd) == reported[i].used);
         if (reported[i].used)
-            CHECK(wide && units[0].efr == (EFR_XT | EFR_IA | EFR_GA | 1ull << 10));
+            CHECK(wide && units[0].efr == reported[i].efr);
         else
             CHECK(plain_safe && !register_writes);
     }
@@ -444,12 +451,14 @@ static void test_probe_widths(void) {
     reset(); firmware = h; second_function_present = true; x2apic = true;
     registers[R_EFR / 8] = second_registers[R_EFR / 8] = EFR_XT | EFR_GA;
     CHECK(iommu_amd_probe(&plain_safe) == &amd && nunits == 2 && wide);
+    put32(second_hd + 20, 1u << 6); /* 後続unitの表はXTSupを報告しない */
     reset(); firmware = h; second_function_present = true; x2apic = true;
-    registers[R_EFR / 8] = EFR_XT | EFR_GA; second_registers[R_EFR / 8] = EFR_GA;
+    registers[R_EFR / 8] = second_registers[R_EFR / 8] = EFR_XT | EFR_GA;
     CHECK(!iommu_amd_probe(&plain_safe) && plain_safe && !register_writes);
     reset(); firmware = h; second_function_present = true;
-    registers[R_EFR / 8] = EFR_XT | EFR_GA; second_registers[R_EFR / 8] = EFR_GA;
+    registers[R_EFR / 8] = second_registers[R_EFR / 8] = EFR_XT | EFR_GA;
     CHECK(iommu_amd_probe(&plain_safe) == &amd && nunits == 2 && !wide); /* xAPICは従来どおり */
+    put32(second_hd + 20, 1u | 1u << 6);
     reset(); firmware = h; second_function_present = true; second_cap_info = 1u << 15 | 40u << 8;
     CHECK(!iommu_amd_probe(&plain_safe)); /* 後続unitの実reserved VAを見落とさない */
     reset(); firmware = h;
@@ -457,8 +466,8 @@ static void test_probe_widths(void) {
 }
 
 /* apic_initがpci_initより前に問う、CPUをx2APICモードに置けない理由（2.2.5.3: 全unitにXTEnとGAEn）:
-   読むIVHD（同じunitでは11hが10hに優先、5.2）の機能報告と実EFRの両方にXTSupとGASupが要る。
-   別segment、mapできない・整列しないunitは使わないので何も求めない。何も書かない。 */
+   読むIVHD（同じunitでは11hが10hに優先、5.2）の機能報告にXTSupとGASupが要る。実EFRには頼らない（1.3）ので
+   registerをmapも読みもしない。別segment、整列しない基底のunitは使わないので何も求めない。何も書かない。 */
 static void test_x2apic_conflict(void) {
     uint8_t table[48 + 24 + 40 + 24] = {0};
     struct acpi_sdt *h = (void *)table;
@@ -472,14 +481,15 @@ static void test_x2apic_conflict(void) {
         {TEN, 1, xt_ga, 0, EFR_XT | EFR_GA, 2, 0, false, false, NULL},
         {TEN, 1, 1u, 0, EFR_XT | EFR_GA, 2, 0, false, false, "IVHD"},             /* 表がGASupを取り下げた */
         {TEN, 0, xt_ga, 0, EFR_XT | EFR_GA, 2, 0, false, false, "IVHD"},          /* EFRSup=0: 機能の報告なし */
-        {TEN, 1, xt_ga, 0, EFR_XT, 2, 0, false, false, "lacks"},                  /* 実装にGASupなし */
-        {TEN, 1, xt_ga, 0, 0, 2, 0, false, false, "lacks"},
+        {TEN, 1, xt_ga, 0, EFR_XT, 2, 0, false, false, NULL},                     /* 表が実EFRに優先する */
+        {TEN, 1, xt_ga, 0, 0, 2, 0, false, false, NULL},
+        {TEN, 1, 0, 0, EFR_XT | EFR_GA, 2, 0, false, false, "IVHD"},              /* 実EFRだけの申告 */
         {BOTH, 1, 0, EFR_XT | EFR_GA, EFR_XT | EFR_GA, 2, 0, false, false, NULL}, /* 11hが10hに優先 */
         {BOTH, 1, 0, EFR_XT | EFR_GA, EFR_XT | EFR_GA, 2, 0, false, true, "IVHD"}, /* 別unitの11hは優先しない */
         {BOTH, 1, xt_ga, EFR_XT, EFR_XT | EFR_GA, 2, 0, false, false, "IVHD"},
         {BOTH, 0, xt_ga, EFR_XT | EFR_GA, EFR_XT | EFR_GA, 2, 0, false, false, "IVHD"}, /* EFRSup=0の11hは予約 */
-        {TEN, 1, xt_ga, 0, 0, 2, 0, true, false, NULL},                           /* mapできないunitは使わない */
-        {TEN, 1, 0, 0, 0, 2, 0, true, false, NULL},                               /* 表の機能より先に除外 */
+        {TEN, 1, xt_ga, 0, 0, 2, 0, true, false, NULL},                           /* registerは使わない */
+        {TEN, 1, 0, 0, 0, 2, 0, true, false, "IVHD"},
         {TEN, 1, xt_ga, 0, 0, 2, 0x1000, false, false, NULL},                     /* 16KiBに揃わない基底 */
         {TEN, 1, 0, 0, 0, 2, 0x1000, false, false, NULL},
         {OTHER, 1, 0, EFR_XT | EFR_GA, EFR_XT | EFR_GA, 2, 0, false, false, NULL}, /* segment 1は使わない */
@@ -500,7 +510,7 @@ static void test_x2apic_conflict(void) {
         firmware = h;
         const char *why = iommu_amd_x2apic_conflict();
         CHECK(cases[i].why ? why && strstr(why, cases[i].why) : !why);
-        CHECK(!register_writes);
+        CHECK(!register_writes && !map_calls);
     }
 }
 
@@ -615,10 +625,10 @@ static void test_probe_depth(void) {
         unsigned bits = MIN(amd.iova_bits, amd.phys_bits);
         CHECK(12 + 9 * amd.levels >= bits && 12 + 9 * (amd.levels - 1) < bits);
     }
-    /* HATSは表と実EFRの両方が許す段数まで: 表は機能を取り下げられ（1.3）、実装を超える段数は歩けない。
-       実EFRの予約値11bは表の値に従う。 */
+    /* HATSは表が許す段数まで: ACPIにも報告される機能は実EFRに頼らない（1.3、5.2）。実EFRの予約値11bも
+       表の値に従う。 */
     const struct { unsigned image, hardware, iova; } hats[] = {
-        {2, 1, 57}, {1, 2, 57}, {0, 2, 48}, {2, 0, 48}, {1, 3, 57}, {2, 2, 64}
+        {2, 1, 64}, {1, 2, 57}, {0, 2, 48}, {2, 0, 64}, {1, 3, 57}, {2, 2, 64}
     };
     for (size_t i = 0; i < ARRAY_SIZE(hats); i++) {
         reset(); firmware = h; cap_info = 64u << 15 | 52u << 8;
@@ -704,10 +714,10 @@ static void test_commands_and_dte(void) {
     CHECK(commands[0] == 0 && commands[1] == (CMD_INV_PAGES << 28 | 7));
     CHECK(commands[2] == 0xFFFFF003u && commands[3] == 0x7FFFFFFFu);
     CHECK(sync());
-    /* INVALIDATE_IOMMU_ALLは表と実EFRの両方がIASupを報告するときだけ: 実装に無ければILLEGAL_COMMAND
-       （2.4.8、0030h）、表に無ければfirmwareが取り下げた（1.3）。無いunitはblock domainとIDごとに消す。 */
+    /* INVALIDATE_IOMMU_ALLは表がIASupを報告するときだけ: ACPIにも報告される機能は実EFRに頼らない
+       （1.3、5.2）。表に無ければfirmwareが取り下げた。無いunitはblock domainとIDごとに消す。 */
     const struct { uint64_t image, hardware; bool all; } ia[] = {
-        {EFR_IA, EFR_IA, true}, {EFR_IA, 0, false}, {0, EFR_IA, false}
+        {EFR_IA, EFR_IA, true}, {EFR_IA, 0, true}, {0, EFR_IA, false}
     };
     for (size_t i = 0; i < ARRAY_SIZE(ia); i++) {
         memset(commands, 0, RING_BYTES); units[0].cmd_tail = 0; registers[R_CMD_HEAD / 8] = 0;
@@ -796,6 +806,14 @@ static void test_firmware_bits(void) {
     struct unit *u = &units[0];
     *u = (struct unit){.regs = (void *)registers, .efr = EFR_XT | EFR_GA};
     wide = true;
+    /* 表の申告に従っても、実装がXTEn/GAEnを取らなければ（3.4, 0018h）128bit IRTEで動かさない */
+    const uint64_t hardware[] = {EFR_XT, EFR_GA, 0};
+    for (size_t i = 0; i < ARRAY_SIZE(hardware); i++) {
+        registers[R_EFR / 8] = hardware[i]; registers[R_CONTROL / 8] = 0;
+        CHECK(!program(u));
+        CHECK(units_off());
+    }
+    registers[R_EFR / 8] = EFR_XT | EFR_GA;
     registers[R_CONTROL / 8] = CTL_IOMMU_EN | CTL_FIRMWARE | CTL_PPR_EN;
     CHECK(program(u));
     CHECK((rd(u, R_CONTROL) & (CTL_FIRMWARE | CTL_XT_EN | CTL_GA_EN | CTL_PPR_EN | 7ull << 25)) ==
@@ -880,6 +898,8 @@ static void test_wide_start(void) {
     reset();
     units = calloc(2, sizeof *units); nunits = units_room = 2;
     units[0].regs = (void *)registers; units[1].regs = (void *)second_registers;
+    units[0].efr = units[1].efr = EFR_XT | EFR_GA;
+    registers[R_EFR / 8] = second_registers[R_EFR / 8] = EFR_XT | EFR_GA;
     wide = true;
     CHECK(amd_start(true));
     for (size_t i = 0; i < nunits; i++)

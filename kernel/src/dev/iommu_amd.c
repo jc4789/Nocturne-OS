@@ -123,11 +123,14 @@ struct unit {
     struct pci_device *fn; /* its PCI function: the event interrupt is its MSI */
     uint8_t type, flags;   /* the IVHD the unit's description came from */
     uint16_t cap;          /* its capability in the function's config space */
-    /* efr: the features the IVHD reports, which supersede the register's (1.3): its EFR image
+    /* efr: the features the IVHD reports, which supersede the register's (1.3: "Software should
+       not rely on the feature support information conveyed by the IOMMU Extended Feature
+       Register for any feature that is also reported in the ACPI tables"; 5.2): its EFR image
        (11h, 40h) or its Feature Reporting field (10h), none with IVinfo[EFRSup] clear (5.2);
        mmio_efr: MMIO Offset 0030h itself, 0 where reserved. Engines and bypasses of either are
-       stopped; a feature (XT, GA, IA, the HATS levels) is used only where both report it: the
-       register's lack makes its control reserved or its command an error (3.4, offset 0018h). */
+       stopped; a feature is used (XT, GA, IA, the HATS levels) as efr reports it, the probe
+       logging where the register differs, and program confirming XTEn and GAEn, which the
+       register's lack makes reserved or ignored (3.4, offset 0018h). */
     uint64_t efr, mmio_efr;
     uint8_t msi_num;       /* event-log MSI-X entry, IVHD IOMMU info[4:0] */
     bool hat_dis, event_irq;
@@ -267,7 +270,7 @@ static struct unit *unit_at(uint64_t base) {
 
 /* Types 10h, 11h and 40h describe the same unit in more detail each; 11h and 40h only where
    IVinfo[EFRSup] says their EFR images are valid. Of those this code reads, the most detailed one
-   is used (5.2: 11h supersedes 10h). */
+   is used (5.2: 11h supersedes 10h and the registers). */
 static bool ivhd_read(const struct acpi_sdt *h, uint8_t type, uint32_t info) {
     return type == 0x10 || ((info & 1) && (type == 0x11 || (h->revision >= 2 && type == 0x40)));
 }
@@ -303,9 +306,9 @@ static const uint8_t *ivhd_next(const struct acpi_sdt *h, uint32_t info, uint32_
 }
 
 /* x2APIC mode needs XTEn and GAEn on every unit (2.2.5.3), so XTSup and GASup where the IVHD read
-   for it reports its features (1.3) and in its register, where without them XTEn is reserved and
-   GAEn ignored (3.4, offset 0018h): the probe's test, before the probe. A unit this code does
-   not use (another segment, registers out of reach) asks nothing. */
+   for it reports its features, which supersede the register's (1.3): the probe's test, before
+   the probe, and without the registers (program confirms the enables). A unit this code does
+   not use (another segment, an invalid register address) asks nothing. */
 const char *iommu_amd_x2apic_conflict(void) {
     const struct acpi_sdt *h = acpi_find("IVRS", 0);
     if (!h || h->length < 48 || (h->revision != 1 && h->revision != 2)) return NULL;
@@ -316,16 +319,11 @@ const char *iommu_amd_x2apic_conflict(void) {
         bool superseded = false;
         for (uint32_t at = 48; !superseded && (t = ivhd_next(h, info, &at));)
             superseded = t[0] > s[0] && !memcmp(t + 8, s + 8, 8);
-        if (superseded) continue;
-        struct unit u = {0};
-        memcpy(&u.base, s + 8, sizeof u.base);
-        if (!u.base || (u.base & (MMIO_BYTES - 1)) || u.base > UINT64_MAX - MMIO_BYTES ||
-            !(u.regs = vmm_map_mmio(u.base, MMIO_BYTES)))
-            continue;
+        uint64_t base;
+        memcpy(&base, s + 8, sizeof base);
+        if (superseded || !base || (base & (MMIO_BYTES - 1)) || base > UINT64_MAX - MMIO_BYTES) continue;
         if ((ivhd_features(s, info) & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA))
             return "an AMD-Vi unit's IVHD does not report x2APIC interrupt remapping (XTSup, GASup)";
-        if ((rd(&u, R_EFR) & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA))
-            return "an AMD-Vi unit lacks x2APIC interrupt remapping (XTSup, GASup)";
     }
     return NULL;
 }
@@ -787,6 +785,12 @@ static bool program(struct unit *u) {
     if (u->flags & 32) ctl |= 1ull << 10;
     if (u->event_irq) ctl |= CTL_EVENTINT_EN;
     wr(u, R_CONTROL, ctl);
+    /* the IVHD's XTSup and GASup, which this follows (1.3), confirmed: without the register's,
+       XTEn is reserved and GAEn ignored (3.4, offset 0018h) */
+    if (wide && (rd(u, R_CONTROL) & (CTL_XT_EN | CTL_GA_EN)) != (CTL_XT_EN | CTL_GA_EN)) {
+        kprintf("iommu: unit at %lx did not take x2APIC interrupt remapping (XTEn, GAEn)\n", u->base);
+        return false;
+    }
     return commands_started(u);
 }
 
@@ -796,7 +800,7 @@ static bool program(struct unit *u) {
 static void send_everything_flush(void) {
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
-        if (u->efr & u->mmio_efr & EFR_IA) {
+        if (u->efr & EFR_IA) {
             command(u, CMD_INV_ALL, 0, 0, 0, 0);
             continue;
         }
@@ -1010,9 +1014,8 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         }
         amd.iova_bits = MIN(amd.iova_bits, va);
         amd.phys_bits = MIN(amd.phys_bits, pa);
-        /* HATS: the most levels the IVHD and the register both allow (a reserved 11b in the
-           register, superseded by the IVHD's value, allows that) */
-        max_levels = MIN(max_levels, 4u + MIN((unsigned)(u->efr >> 10) & 3, (unsigned)(u->mmio_efr >> 10) & 3));
+        /* HATS: the most levels the IVHD allows (a reserved 11b in the register is superseded) */
+        max_levels = MIN(max_levels, 4u + ((unsigned)(u->efr >> 10) & 3));
         np_cache |= (header & CAP_NP_CACHE) != 0;
         amd.coherent &= (u->flags & 32) != 0;
         uint64_t control = rd(u, R_CONTROL);
@@ -1022,10 +1025,13 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         if (left_in_os_ram(u, control))
             kprintf("iommu: unit at %lx was left on with its tables in RAM the OS owns: what it read and "
                     "wrote there until now is not known\n", u->base);
+        const uint64_t selected = EFR_XT | EFR_GA | EFR_IA | 3ull << 10;
+        if (u->mmio_efr && ((u->efr ^ u->mmio_efr) & selected))
+            kprintf("iommu: unit at %lx: the IVHD's features (XTSup, GASup, IASup, HATS) differ from its "
+                    "register's; the IVHD's are used (1.3)\n", u->base);
         /* 2.2.5.3: with the CPUs in x2APIC mode every unit must have XTEn and GAEn, whatever it
-           remaps. Where the register lacks XTSup or GASup, XTEn is reserved and GAEn ignored (3.4,
-           offset 0018h); where the IVHD lacks them, the firmware withdrew them (1.3). */
-        if (wide && (u->efr & u->mmio_efr & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA)) {
+           remaps; where the IVHD lacks them, the firmware withdrew them (1.3). */
+        if (wide && (u->efr & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA)) {
             kprintf("iommu: unit at %lx lacks the x2APIC interrupt remapping (XTSup, GASup) the CPUs' x2APIC "
                     "mode requires: AMD-Vi not used\n", u->base);
             goto rejected;

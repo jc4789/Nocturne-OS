@@ -38,13 +38,23 @@ struct tramp_data {
     uint32_t cr3, pad3;   /* 56 */
     uint32_t efer, pad4;  /* 64 */
     uint64_t entry, stack, arg; /* 72, 80, 88 */
-    uint64_t id_reg;      /* 96: lapic_id_register(), 0 for any CPU */
-    uint32_t apic_id;     /* 104 */
+    uint64_t id_reg;      /* 96: struct lapic_ident's */
+    uint32_t apic_id;     /* 104: WAKE_ANY_CPU for any CPU */
+    uint32_t id_mask;     /* 108 */
+    uint64_t base, base_mask; /* 112, 120 */
+    uint32_t flags;       /* 128: TDF_ */
 } PACKED;
+#define TDF_X2    1u
+#define TDF_XAIDN 2u
 _Static_assert(__builtin_offsetof(struct tramp_data, far32) == 40, "wake.asm TD_FAR32");
 _Static_assert(__builtin_offsetof(struct tramp_data, cr3) == 56, "wake.asm TD_CR3");
 _Static_assert(__builtin_offsetof(struct tramp_data, arg) == 88, "wake.asm TD_ARG");
+_Static_assert(__builtin_offsetof(struct tramp_data, id_reg) == 96, "wake.asm TD_ID_REG");
 _Static_assert(__builtin_offsetof(struct tramp_data, apic_id) == 104, "wake.asm TD_APIC_ID");
+_Static_assert(__builtin_offsetof(struct tramp_data, id_mask) == 108, "wake.asm TD_ID_MASK");
+_Static_assert(__builtin_offsetof(struct tramp_data, base) == 112, "wake.asm TD_BASE");
+_Static_assert(__builtin_offsetof(struct tramp_data, base_mask) == 120, "wake.asm TD_BASE_MASK");
+_Static_assert(__builtin_offsetof(struct tramp_data, flags) == 128, "wake.asm TD_FLAGS");
 
 extern const uint8_t tramp_start[], tramp_pm32[], tramp_lm64[], tramp_end[];
 extern struct { uint16_t limit; uint64_t base; } PACKED wake_gdtr;
@@ -108,8 +118,14 @@ void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg, uint32_t apic_id
     d->entry = entry;
     d->stack = stack;
     d->arg = arg;
-    d->id_reg = apic_id == WAKE_ANY_CPU ? 0 : (uint64_t)(uintptr_t)lapic_id_register();
+    struct lapic_ident id;
+    lapic_ident(&id);
+    d->id_reg = (uint64_t)(uintptr_t)id.id_reg;
     d->apic_id = apic_id;
+    d->id_mask = id.id_mask;
+    d->base = id.base;
+    d->base_mask = id.base_mask;
+    d->flags = (id.x2 ? TDF_X2 : 0) | (id.xaidn ? TDF_XAIDN : 0);
     /* the kernel half as it is now: entries added since the last time count too */
     uint64_t *low = phys_to_virt(page + 0x1000), *kernel = phys_to_virt(kernel_pml4 & PTE_ADDR);
     for (unsigned i = 256; i < 512; i++) low[i] = kernel[i];

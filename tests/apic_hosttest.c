@@ -35,6 +35,9 @@ struct machine {
     bool zero_width;     /* CPUID.80000008H:EAX[7:0]が0（実在のCPUには無い値） */
     uint32_t leaf7_c;    /* CPUID.(EAX=7,ECX=0):ECX。bit 13はIntelのTME（IA32_TME_ACTIVATEがある） */
     uint64_t tme;        /* IA32_TME_ACTIVATE */
+    uint32_t signature;  /* CPUID.1:EAX（family、0は既定の0） */
+    unsigned nodes;      /* AMDのnorthbridge（bus 0、device 18h〜）の数 */
+    uint32_t f68[2];     /* 各nodeのF0x68（bit 18 ApicExtId、bit 17 ApicExtBrdCst） */
 };
 
 static struct machine now;
@@ -209,6 +212,7 @@ static void model_cpuid(uint32_t leaf, uint32_t sub, uint32_t *a, uint32_t *b, u
         else *b = 0x756E6547, *d = 0x49656E69, *c = 0x6C65746E;          /* GenuineIntel */
     }
     if (leaf == 1) {
+        *a = now.signature;
         *c = now.x2_cpu ? 1u << 21 : 0;
         *d = (now.no_mca ? 0 : 1u << 14 | 1u << 7) | (!no_apic && ((apic_base & BASE_EN) || now.apic_bit_fixed) ? 1u << 9 : 0);
     }
@@ -260,6 +264,11 @@ void *vmm_map_mmio(uint64_t phys, uint64_t size) {
     mapped = true;
     mapped_at = phys;
     return xapic_page;
+}
+/* 構成空間はAMDのnorthbridgeだけ（BKDG 32559 4.1: bus 0、device 18h＋node、function 0） */
+uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off) {
+    if (bus || func || dev < 0x18 || dev - 0x18u >= now.nodes) return UINT32_MAX;
+    return off == 0 ? 0x11001022u : off == 0x68 ? now.f68[dev - 0x18] : 0;
 }
 uint64_t hv_apic_hz(void) { return 0; }
 uint64_t hv_tsc_hz(void) { return 0; }
@@ -457,14 +466,70 @@ static void test_setup(void) {
     CHECK(!lapic_send_startup(0x0F, 0x9000) && !lapic_send_startup(0x0E, 0x9001) &&
           !lapic_send_startup(0x0E, 0x100000) && REG(0x300) == 0x4609);
     /* xAPICではSTARTUPが届いたCPUが自分のID registerを読む（wake.h）。x2APICでは宛先だけで決まる */
-    CHECK(lapic_id_register() == &REG(LAPIC_ID));
+    struct lapic_ident ident;
+    lapic_ident(&ident);
+    CHECK(!ident.x2 && ident.id_reg == &REG(LAPIC_ID) && ident.id_mask == 0x0F && !ident.xaidn);
+    CHECK(ident.base == (BASE_ADDR | BASE_EN) && ident.base_mask == (0x7FFFFFF000ull | BASE_EN));
     reset(&plain_x2);
     CHECK(init(NULL));
     CHECK(!lapic_send_init(UINT32_MAX) && icr == 0);
     CHECK(lapic_send_init(0x100) && icr == (0x100ull << 32 | 0x4500) && !gp);
     icr_writes = 0;
     CHECK(lapic_send_startup(0x100, 0x8000) && icr == (0x100ull << 32 | 0x4608) && icr_writes == 2 && !gp);
-    CHECK(lapic_id_register() == NULL);
+    lapic_ident(&ident);
+    CHECK(ident.x2 && !ident.id_reg && !ident.xaidn);
+}
+
+/* AMDのxAPICで使えるIDの幅。0Fh・10hは全nodeのnorthbridge（F0x68のApicExtIdとApicExtBrdCst）
+   だけで8bit（10hのExtApicIdEnは任意）、15hはそれとExtApicIdEn（ExtApicIdCapのあるとき、BKDG
+   42300 APIC410）、他の機種はAPMのXAIDCとXAIDN。XAIDNはINITで消えるのでトランポリンにも渡す。
+   4bitでは、ID registerのbit 7:4は予約（読んだ値を使わない）。 */
+static void test_amd_ids(void) {
+    const uint32_t both = 3u << 17, narrow_ext = 0x00040003; /* narrow_ext: XAIDCなし */
+    const struct { uint32_t signature, ext; unsigned nodes; uint32_t f68_0, f68_1; bool wide, xaidn; } cases[] = {
+        {0x00000F00, 0, 2, both, both, true, false},                /* 0Fh: northbridgeだけ */
+        {0x00000F00, AMD_EXT, 2, both, 1u << 18, false, false},     /* 一つのnodeにApicExtBrdCstが無い */
+        {0x00000F00, AMD_EXT, 0, 0, 0, false, false},               /* northbridgeが見えない */
+        {0x00100F00, narrow_ext, 1, both, 0, true, false},          /* 10h: F0x68だけで8bit */
+        {0x00100F00, AMD_EXT, 1, 1u << 17, 0, false, false},
+        {0x00600F00, AMD_EXT, 2, both, both, true, true},           /* 15h: F0x68とExtApicIdEn */
+        {0x00600F00, narrow_ext, 2, both, both, false, false},      /* ExtApicIdCapが無い */
+        {0x00600F00, AMD_EXT, 2, both, 0, false, false},            /* F0x68が一部のnodeだけ */
+        {0x00600F00, AMD_EXT, 0, 0, 0, false, false},
+        {0x00700F00, AMD_EXT, 0, 0, 0, true, true},                 /* 16h: APMどおり */
+        {0x00700F00, narrow_ext, 0, 0, 0, false, false},
+        {0x00800F00, AMD_EXT, 0, 0, 0, true, true},                 /* 17h */
+        {0x00A00F00, AMD_EXT, 2, 0, 0, true, true},                 /* 19h: northbridgeは見ない */
+        {0x00A00F00, narrow_ext, 2, both, both, false, false},
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        struct machine m = {BASE_EN, true, 7, 0, 0, 0, 3, true, AMD_V, cases[i].ext};
+        m.signature = cases[i].signature;
+        m.nodes = cases[i].nodes;
+        m.f68[0] = cases[i].f68_0;
+        m.f68[1] = cases[i].f68_1;
+        reset(&m);
+        CHECK(init(NULL) && !gp && set_up(true));
+        CHECK(lapic_addressable(0x0E) && lapic_addressable(0xFE) == cases[i].wide);
+        CHECK(((REG(0x410) & 4) != 0) == cases[i].xaidn);
+        struct lapic_ident ident;
+        lapic_ident(&ident);
+        CHECK(!ident.x2 && ident.id_reg == &REG(0x20) && ident.xaidn == cases[i].xaidn);
+        CHECK(ident.id_mask == (cases[i].wide ? 0xFFu : 0x0Fu));
+        REG(0x20) = 0xA3u << 24;
+        CHECK(lapic_current_id() == (cases[i].wide ? 0xA3u : 0x03u));
+    }
+    /* x2APICから出る判断も同じ幅で: 15hでF0x68が無ければID 0x0Fは使えない */
+    struct machine m = {X2, true, 7, 0, 0, 0, 0x0F, true, AMD_V, AMD_EXT};
+    m.signature = 0x00600F00;
+    reset(&m);
+    conflict = "IOMMU";
+    CHECK(init(NULL) && lapic_x2apic() && strstr(messages, "this CPU's APIC ID"));
+    m.nodes = 1;
+    m.f68[0] = both;
+    reset(&m);
+    conflict = "IOMMU";
+    CHECK(init(NULL) && !lapic_x2apic() && (REG(0x410) & 4) && lapic_current_id() == 0x0F);
 }
 
 /* S3からの復帰: IntelはxAPIC（EN=1）、AMDは無効（APM 16.10）で戻り、firmwareがx2APICにして
@@ -528,6 +593,7 @@ static void test_worker(void) {
 int main(void) {
     test_leave_decision();
     test_setup();
+    test_amd_ids();
     test_resume();
     test_worker();
     printf("APIC mode検査: %u判定、失敗%u（MSR・CPUIDは模擬、実機のAPICは未検証）\n", checks, failed);

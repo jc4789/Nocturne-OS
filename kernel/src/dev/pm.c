@@ -134,7 +134,7 @@ static NORETURN void finish(enum pm_action action) {
 
 /* ---- sleep (S3) and hibernation ---- */
 static const char *sleep_blocker(bool hibernate) {
-    if (!iommu_power_ready()) return "IOMMU hardware state is unconfirmed";
+    if (!iommu_power_ready()) return "the IOMMU's state is unconfirmed, or it did not come back from a sleep";
     const char *why = hibernate ? hibernate_blocker() : !acpi_sleep_supported(3) ? "the firmware has no S3" : NULL;
     if (why) return why;
     if (!wake_available()) return "no wake page below 1 MiB";
@@ -183,12 +183,15 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
        remapping mode transition; the saved routes remain intact for the final restore. */
     pic_mask_all();
     ioapic_mask_all();
-    lapic_resume();
     serial_init(); /* the log port, reset with the rest */
-    /* before anything sends it an interrupt or a request; units that never slept are still on,
-       translating with the claims' tables, and are left alone */
-    if (slept && !iommu_resume())
-        panic("IOMMU restore failed; PCI DMA and interrupt delivery remain stopped");
+    /* before anything sends it an interrupt or a request, and before the APICs go back to x2APIC
+       mode, which comes after interrupt remapping with extended IDs (SDM 11.12.7); units that
+       never slept are still on, translating with the claims' tables, and are left alone. Units
+       that do not come back are turned off where they confirm it (iommu_resume): the IOAPICs'
+       entries and the PCI functions' messages are then made again plain, or left off, and x2APIC
+       mode comes back without remapping, the deviation arch/apic.c describes for the boot. */
+    const char *units_lost = slept ? iommu_resume() : NULL;
+    lapic_resume();
     ioapic_resume();
     if (slept) pic_restore(pic);
     else pic_restore_mask((uint16_t)pic); /* no reset occurred: do not erase a pending edge */
@@ -197,7 +200,7 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     int64_t secs = timer_resume();
     sched_clock_resume();
     acpi_wake_prepare(state);
-    pci_resume();
+    pci_resume(slept, units_lost != NULL);
     irq_restore(f);
     /* a hibernation's snapshot is no sleep: the firmware heard of none */
     if (state == 3 || slept) acpi_wake(state);
@@ -212,6 +215,7 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
             if (!lost) lost = d->name;
         }
     acpi_freeze(false);
+    if (units_lost) wm_notify("The IOMMU did not come back from sleep", units_lost);
     if (lost) wm_notify(slept ? "A device did not wake up" : "A device did not restart", lost);
     if (slept) kprintf("pm: awake after %ld s\n", (long)secs);
     if (stuck) {

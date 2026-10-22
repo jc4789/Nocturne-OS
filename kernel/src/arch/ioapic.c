@@ -27,7 +27,7 @@ struct ioapic {
 static struct ioapic ios[IOAPIC_MAX];
 static unsigned nios;
 /* The entry each pin was given, in the plain format: written again through dev/iommu.h when
-   interrupt remapping comes on or goes off (ioapic_remap). */
+   interrupt remapping comes on, goes off or is back from a sleep (ioapic_remap). */
 static uint64_t given[IOAPIC_MAX][256];
 
 static uint32_t rd(const struct ioapic *io, uint32_t reg) {
@@ -163,17 +163,15 @@ uint32_t ioapic_isa_to_gsi(unsigned isa_irq, bool *level, bool *active_low) {
     return gsi;
 }
 
-/* Sleep: every redirection entry and the id, written back after S3 (the chip comes back reset). */
-static uint64_t saved_rte[IOAPIC_MAX][256];
+/* Sleep: the id, written back after S3 (the chip comes back reset), and every entry made again
+   from the one it was given (ioapic_remap): remappable where interrupt remapping came back with
+   the units, plain where they were turned off instead (dev/iommu.h), never the remappable one
+   of before under units that no longer remap. */
 static uint32_t saved_id[IOAPIC_MAX];
 
 void ioapic_suspend(void) {
-    for (unsigned i = 0; i < nios; i++) {
-        saved_id[i] = rd(&ios[i], REG_ID);
-        for (uint32_t pin = 0; pin < ios[i].pins && pin < 256; pin++)
-            saved_rte[i][pin] = rd(&ios[i], REG_RTE(pin)) | (uint64_t)rd(&ios[i], REG_RTE(pin) + 1) << 32;
-    }
-    ioapic_mask_all(); /* saved state is the requested route; no source emits during unit restore */
+    for (unsigned i = 0; i < nios; i++) saved_id[i] = rd(&ios[i], REG_ID);
+    ioapic_mask_all(); /* the given entries are the requested routes; no source emits during unit restore */
 }
 
 void ioapic_mask_all(void) {
@@ -183,13 +181,6 @@ void ioapic_mask_all(void) {
 }
 
 void ioapic_resume(void) {
-    for (unsigned i = 0; i < nios; i++) {
-        wr(&ios[i], REG_ID, saved_id[i]);
-        for (uint32_t pin = 0; pin < ios[i].pins && pin < 256; pin++) {
-            uint64_t v = saved_rte[i][pin];
-            wr(&ios[i], REG_RTE(pin), (uint32_t)v | RTE_MASK); /* masked while the destination goes in */
-            wr(&ios[i], REG_RTE(pin) + 1, (uint32_t)(v >> 32));
-            wr(&ios[i], REG_RTE(pin), (uint32_t)v);
-        }
-    }
+    for (unsigned i = 0; i < nios; i++) wr(&ios[i], REG_ID, saved_id[i]);
+    if (!ioapic_remap()) kprintf("ioapic: an entry stays masked after sleep\n");
 }

@@ -9,9 +9,13 @@
 static void model_step(void);
 static uint64_t model_irq_save(void) { return 0; }
 static void model_irq_restore(uint64_t f) { (void)f; }
+/* FSTS is RW1CS (11.4.7.1): the product's writes clear the bits they set; the model sets them
+   (model_raise). */
+static void model_mmio_write32(volatile void *p, uint32_t v);
 #define pause model_step
 #define irq_save model_irq_save
 #define irq_restore model_irq_restore
+#define mmio_write32 model_mmio_write32
 #pragma clang diagnostic push
 /* 製品はLP64、WindowsホストはLLP64。kernel kprintf自体はこのfixtureで整形しない。 */
 #pragma clang diagnostic ignored "-Wformat"
@@ -20,6 +24,7 @@ static void model_irq_restore(uint64_t f) { (void)f; }
 #undef pause
 #undef irq_save
 #undef irq_restore
+#undef mmio_write32
 
 uint64_t hhdm_offset, kernel_pml4, pmm_highest_usable;
 /* A second page exposes capabilities that point outside an advertised one-page set. */
@@ -39,7 +44,10 @@ static bool have_dmar;
 static void **allocations;
 static size_t allocation_count;
 static unsigned cache_flushes;
-static uint32_t error_on_publish;
+static uint32_t error_on_publish; /* FSTS bits the next fetch raises, with error_record in IQERCD */
+static uint64_t error_record;
+static unsigned error_repeats; /* further fetches that raise it again */
+static bool queue_enabled_with_error; /* QIE set while an IQE/ITE kept the queue from fetching */
 static bool require_quiet_before_off, protection_dropped_early;
 static enum { CFI_WRITABLE, CFI_BLOCKED, CFI_PASS_ONLY } cfi_behavior;
 static bool cfi_on_requested, cfi_clear_requested, remapping_bypass_started;
@@ -64,6 +72,20 @@ static unsigned te_under_pmr;
 static struct unit *te_stuck_unit; /* TEを確認しないunit */
 
 #define CHECK(x) do { checks++; if (!(x)) { printf("失敗 %d行: %s\n", __LINE__, #x); failures++; } } while (0)
+
+static volatile uint32_t *model_fsts(const struct unit *u) { return (volatile uint32_t *)(u->regs + R_FSTS); }
+
+/* Hardware reporting queue errors: an IQERCD field is recorded only while its FSTS bit is clear
+   (11.4.9.9). */
+static void model_raise(struct unit *u, uint32_t errors, uint64_t record) {
+    uint32_t old = *model_fsts(u);
+    uint64_t kept = rd64(u, R_IQERCD);
+    if (errors & FSTS_IQE && !(old & FSTS_IQE)) kept = (kept & ~0xFull) | (record & 0xF);
+    if (errors & FSTS_ITE && !(old & FSTS_ITE)) kept = (kept & ~(0xFFFFull << 32)) | (record & 0xFFFFull << 32);
+    if (errors & FSTS_ICE && !(old & FSTS_ICE)) kept = (kept & ~(0xFFFFull << 48)) | (record & 0xFFFFull << 48);
+    wr64(u, R_IQERCD, kept);
+    *model_fsts(u) = old | errors;
+}
 
 static void model_step_unit(struct unit *u) {
     if (pmen_model) {
@@ -100,20 +122,36 @@ static void model_step_unit(struct unit *u) {
             ((old & ~next) & (GCMD_TE | GCMD_IRE)) && !completed_waits) protection_dropped_early = true;
         if (cmd & GCMD_SRTP) next |= GCMD_SRTP;
         if (cmd & GCMD_SIRTP) next |= GCMD_SIRTP;
+        if (!(old & GCMD_QIE) && next & GCMD_QIE && rd32(u, R_FSTS) & (FSTS_IQE | FSTS_ITE))
+            queue_enabled_with_error = true;
         wr32(u, R_GSTS, next);
         if (old & GCMD_QIE && !(next & GCMD_QIE)) wr64(u, R_IQH, 0);
     }
+    /* IQE and ITE stop the fetches until cleared, an ICE does not (6.5.2.11) */
     if (!run_queue || !(rd32(u, R_GSTS) & GCMD_QIE) ||
-        rd32(u, R_FSTS) & FSTS_QUEUE_ERRORS) return;
+        rd32(u, R_FSTS) & (FSTS_IQE | FSTS_ITE)) return;
     uint64_t iqa = rd64(u, R_IQA), head = rd64(u, R_IQH), tail = rd64(u, R_IQT);
     unsigned bytes = PAGE_SIZE << (iqa & IQA_QS), width = iqa & IQA_DW ? 32 : 16;
-    if (head != tail && error_on_publish) {
-        wr32(u, R_FSTS, error_on_publish);
-        error_on_publish = 0;
+    if (head == tail) return;
+    /* the head stays at the descriptor in error; IQEI 1: a tail outside the queue, 6: one
+       misaligned to 256-bit descriptors */
+    if (tail >= bytes || tail & (width - 1)) {
+        model_raise(u, FSTS_IQE, tail >= bytes || tail & 15 ? 1 : 6);
         return;
+    }
+    if (error_on_publish) {
+        uint32_t error = error_on_publish;
+        if (error_repeats) error_repeats--;
+        else error_on_publish = 0;
+        model_raise(u, error, error_record);
+        if (error & (FSTS_IQE | FSTS_ITE)) return;
     }
     while (head != tail) {
         uint64_t *slot = (uint64_t *)((uintptr_t)(iqa & ~(PAGE_SIZE - 1)) + head);
+        if ((slot[0] & 15) < 1 || (slot[0] & 15) > 5) { /* legacy mode types (Table 26): IQEI 3 */
+            model_raise(u, FSTS_IQE, 3);
+            return;
+        }
         if ((slot[0] & 15) == 5 && slot[0] & (1ull << 5)) {
             if (defer_status_write) {
                 late_status = (uint32_t *)(uintptr_t)slot[1];
@@ -130,6 +168,18 @@ static void model_step_unit(struct unit *u) {
 
 static void model_step(void) {
     for (size_t i = 0; i < nunits; i++) model_step_unit(&units[i]);
+}
+
+static void model_mmio_write32(volatile void *p, uint32_t v) {
+    for (size_t i = 0; i < nunits; i++) {
+        struct unit *u = &units[i];
+        if (p != u->regs + R_FSTS) continue;
+        uint32_t old = *model_fsts(u);
+        *model_fsts(u) = old & ~(v & (FSTS_PFO | FSTS_QUEUE_ERRORS));
+        if (old & v & (FSTS_IQE | FSTS_ITE)) model_step_unit(u); /* fetching from its head again at once */
+        return;
+    }
+    *(volatile uint32_t *)p = v;
 }
 
 uint64_t iommu_deadline(unsigned ms) { (void)ms; model_step(); return ticks + 1; }
@@ -232,7 +282,9 @@ static void reset_model(void) {
     run_queue = mapped_slot = true;
     run_commands = false;
     ticks = completed_waits = cache_flushes = 0;
-    error_on_publish = 0;
+    error_on_publish = error_repeats = 0;
+    error_record = 0;
+    queue_enabled_with_error = false;
     require_quiet_before_off = protection_dropped_early = false;
     cfi_behavior = CFI_WRITABLE;
     cfi_on_requested = cfi_clear_requested = remapping_bypass_started = false;
@@ -267,25 +319,95 @@ static void reset_model(void) {
     wr64(&model_unit, R_IQA, model_unit.queue);
 }
 
+static uint64_t *queue_slot(unsigned i) { return (uint64_t *)own_queue + 2 * i; } /* 128-bit descriptors */
+
 static void queue_failure_cases(void) {
-    for (unsigned reason = 0; reason <= 15; reason++) { /* IQEI field, including unavailable/undefined values */
+    /* IQE at the head, past a descriptor already done (6.5.2.11), for every IQEI value
+       including unavailable/undefined ones. Corrected: the descriptors from the head on fenced,
+       every cache invalidated, a wait of its own. Otherwise nothing is rewritten or published. */
+    for (unsigned reason = 0; reason <= 15; reason++) {
+        bool correctable = reason <= 1 || reason == 3 || reason == 4;
         reset_model();
-        ((uint64_t *)own_queue)[0] = INV_IOTLB_GLOBAL;
-        wr32(&model_unit, R_FSTS, FSTS_IQE);
-        wr64(&model_unit, R_IQERCD, reason | (0x1234ull << 32) | (0x5678ull << 48));
-        CHECK(!write_buffers_flush());
-        CHECK(!submit(&model_unit, INV_CONTEXT_GLOBAL, 0));
-        CHECK(!sync() && !sync());
-        CHECK(model_unit.failed && ((uint64_t *)own_queue)[0] == INV_IOTLB_GLOBAL);
-        CHECK(rd32(&model_unit, R_FSTS) == FSTS_IQE && rd64(&model_unit, R_IQT) == 0);
-        CHECK(rd32(&model_unit, R_FECTL) & FECTL_IM);
+        CHECK(submit(&model_unit, INV_CONTEXT_GLOBAL, 0));
+        model_step();
+        CHECK(rd64(&model_unit, R_IQH) == INV_BYTES);
+        CHECK(submit(&model_unit, INV_IOTLB_GLOBAL, 0));
+        error_on_publish = FSTS_IQE;
+        error_record = reason | 0x1234ull << 32 | 0x5678ull << 48;
+        CHECK(sync() == correctable && model_unit.failed == !correctable);
+        CHECK(queue_slot(0)[0] == INV_CONTEXT_GLOBAL); /* behind the head: not touched */
+        if (correctable) {
+            CHECK(queue_slot(1)[0] == INV_FENCE && !queue_slot(1)[1]);
+            CHECK(queue_slot(2)[0] == INV_FENCE && !queue_slot(2)[1]); /* the wait the error held */
+            CHECK(queue_slot(3)[0] == INV_CONTEXT_GLOBAL && queue_slot(4)[0] == INV_IOTLB_GLOBAL);
+            CHECK(queue_slot(5)[0] == INV_WAIT(token) && queue_slot(5)[1] == sems && token == 2);
+            CHECK(model_unit.token == token && *(uint32_t *)semaphore_page == token && completed_waits == 1);
+            CHECK(rd64(&model_unit, R_IQH) == 6 * INV_BYTES && rd64(&model_unit, R_IQT) == 6 * INV_BYTES);
+            CHECK(rd32(&model_unit, R_FSTS) == 0 && !(rd32(&model_unit, R_FECTL) & FECTL_IM));
+            CHECK(submit(&model_unit, INV_IOTLB_GLOBAL, 0) && sync() && write_buffers_flush());
+        } else {
+            CHECK(queue_slot(1)[0] == INV_IOTLB_GLOBAL && queue_slot(2)[0] == INV_WAIT(1));
+            CHECK(rd32(&model_unit, R_FSTS) == FSTS_IQE && (rd64(&model_unit, R_IQERCD) & 0xF) == reason);
+            CHECK(rd64(&model_unit, R_IQH) == INV_BYTES && rd64(&model_unit, R_IQT) == 3 * INV_BYTES);
+            CHECK(rd32(&model_unit, R_FECTL) & FECTL_IM && !completed_waits);
+            *(uint32_t *)semaphore_page = token; /* a late status write confirms nothing */
+            CHECK(!write_buffers_flush() && !submit(&model_unit, INV_CONTEXT_GLOBAL, 0) && !sync());
+            CHECK(rd64(&model_unit, R_IQT) == 3 * INV_BYTES && rd32(&model_unit, R_FSTS) == FSTS_IQE);
+        }
     }
-    const uint32_t errors[] = {FSTS_ICE, FSTS_ITE};
-    for (unsigned i = 0; i < ARRAY_SIZE(errors); i++) {
-        reset_model();
-        wr32(&model_unit, R_FSTS, errors[i]);
-        CHECK(!sync() && model_unit.failed);
-    }
+
+    /* An error already set when a sync starts: the recovery's wait, then this sync's own. */
+    reset_model();
+    CHECK(submit(&model_unit, INV_CONTEXT_GLOBAL, 0));
+    model_raise(&model_unit, FSTS_IQE, 4);
+    CHECK(sync() && !model_unit.failed && rd32(&model_unit, R_FSTS) == 0);
+    CHECK(queue_slot(0)[0] == INV_FENCE && queue_slot(3)[0] == INV_WAIT(2) && queue_slot(4)[0] == INV_WAIT(1));
+    CHECK(model_unit.token == 1 && *(uint32_t *)semaphore_page == 1 && completed_waits == 2);
+
+    /* Errors the model itself finds. IQEI 3: a type legacy mode does not have (Table 26). */
+    reset_model();
+    CHECK(submit(&model_unit, 7, 0));
+    CHECK(sync() && !model_unit.failed && (rd64(&model_unit, R_IQERCD) & 0xF) == 3);
+    CHECK(queue_slot(0)[0] == INV_FENCE && queue_slot(1)[0] == INV_FENCE && queue_slot(4)[0] == INV_WAIT(2));
+    /* IQEI 1: a tail outside the queue, corrected from the OS's own record of it */
+    reset_model();
+    CHECK(submit(&model_unit, INV_CONTEXT_GLOBAL, 0));
+    wr64(&model_unit, R_IQT, PAGE_SIZE);
+    model_step();
+    CHECK(rd32(&model_unit, R_FSTS) == FSTS_IQE && (rd64(&model_unit, R_IQERCD) & 0xF) == 1);
+    CHECK(sync() && !model_unit.failed && rd32(&model_unit, R_FSTS) == 0);
+    CHECK(queue_slot(0)[0] == INV_FENCE && rd64(&model_unit, R_IQT) == model_unit.tail);
+    CHECK(rd64(&model_unit, R_IQH) == model_unit.tail && completed_waits == 2);
+
+    /* ITE: the waits it aborted are fetched again from the head, nothing rewritten; still every
+       cache invalidated and confirmed by a wait of its own. */
+    reset_model();
+    CHECK(submit(&model_unit, INV_CONTEXT_GLOBAL, 0));
+    error_on_publish = FSTS_ITE;
+    error_record = 0x0108ull << 32;
+    CHECK(sync() && !model_unit.failed && rd32(&model_unit, R_FSTS) == 0);
+    CHECK(queue_slot(0)[0] == INV_CONTEXT_GLOBAL && queue_slot(1)[0] == INV_WAIT(1));
+    CHECK(queue_slot(2)[0] == INV_CONTEXT_GLOBAL && queue_slot(3)[0] == INV_IOTLB_GLOBAL);
+    CHECK(queue_slot(4)[0] == INV_WAIT(2) && model_unit.token == 2 && completed_waits == 2);
+
+    /* ICE: the unit went on with the queue; only recorded and cleared. */
+    reset_model();
+    error_on_publish = FSTS_ICE;
+    error_record = 0x0210ull << 48;
+    CHECK(sync() && !model_unit.failed && rd32(&model_unit, R_FSTS) == 0);
+    CHECK(model_unit.tail == INV_BYTES && completed_waits == 1);
+
+    /* An error again while recovering is final, the second error's evidence kept. */
+    reset_model();
+    CHECK(submit(&model_unit, INV_CONTEXT_GLOBAL, 0));
+    error_on_publish = FSTS_IQE;
+    error_record = 4;
+    error_repeats = 1;
+    CHECK(!sync() && model_unit.failed && !completed_waits);
+    CHECK(rd32(&model_unit, R_FSTS) == FSTS_IQE && rd32(&model_unit, R_FECTL) & FECTL_IM);
+    CHECK(queue_slot(0)[0] == INV_FENCE && queue_slot(1)[0] == INV_FENCE && rd64(&model_unit, R_IQT) == 2 * INV_BYTES);
+    CHECK(!sync() && rd64(&model_unit, R_IQT) == 2 * INV_BYTES);
+
     reset_model();
     run_queue = false;
     CHECK(!sync() && model_unit.failed);
@@ -311,6 +433,69 @@ static void queue_failure_cases(void) {
     reset_model();
     wr64(&model_unit, R_IQT, INV_BYTES); /* an untracked publication in our queue */
     CHECK(!queue_quiet(&model_unit) && model_unit.failed);
+}
+
+/* Queue errors outside the OS's own running queue, and who clears them. */
+static void queue_error_state_cases(void) {
+    /* Left by an earlier queue (RW1CS, sticky, 11.3): cleared before this one goes on, whatever
+       their cause, or it would never fetch. */
+    reset_model();
+    model_unit.queue_on = false;
+    run_commands = true;
+    wr32(&model_unit, R_GSTS, 0);
+    model_raise(&model_unit, FSTS_QUEUE_ERRORS, 6 | 0x0108ull << 32 | 0x0210ull << 48);
+    CHECK(queue_start(&model_unit) && !queue_enabled_with_error && rd32(&model_unit, R_FSTS) == 0);
+    CHECK(submit(&model_unit, INV_CONTEXT_GLOBAL, 0) && sync() && completed_waits == 1 && !model_unit.failed);
+
+    /* The fault interrupt clears an ICE only. IQE/ITE wait for the queue's next user, which can
+       submit and wait; no fault event comes meanwhile (7.3). */
+    reset_model();
+    CHECK(submit(&model_unit, INV_CONTEXT_GLOBAL, 0));
+    model_raise(&model_unit, FSTS_IQE | FSTS_ICE, 3 | 0x0210ull << 48);
+    fault_isr(NULL);
+    CHECK(rd32(&model_unit, R_FSTS) == FSTS_IQE && !model_unit.failed);
+    CHECK(rd64(&model_unit, R_IQT) == INV_BYTES && queue_slot(0)[0] == INV_CONTEXT_GLOBAL);
+    CHECK(sync() && rd32(&model_unit, R_FSTS) == 0 && queue_slot(0)[0] == INV_FENCE);
+
+    /* An inherited queue: after an ITE the unit fetches from its head again and the handoff's
+       wait confirms it. An IQE names a descriptor the OS must not rewrite. */
+    reset_model();
+    model_unit.queue_on = false;
+    wr64(&model_unit, R_IQA, (uintptr_t)firmware_queue);
+    model_raise(&model_unit, FSTS_ITE, 0x0108ull << 32);
+    CHECK(queue_quiet(&model_unit) && !model_unit.failed && rd32(&model_unit, R_FSTS) == 0 && completed_waits == 1);
+    reset_model();
+    model_unit.queue_on = false;
+    wr64(&model_unit, R_IQA, (uintptr_t)firmware_queue);
+    model_raise(&model_unit, FSTS_IQE, 3);
+    CHECK(!queue_quiet(&model_unit) && model_unit.failed && !model_unit.handoff);
+    CHECK(rd32(&model_unit, R_FSTS) == FSTS_IQE && rd64(&model_unit, R_IQA) == (uintptr_t)firmware_queue);
+
+    /* Interrupt entries are released once the recovery's IEC invalidation is confirmed, kept
+       while completion is unknown. Its IOTLB invalidation drains as every other one does. */
+    for (unsigned correctable = 0; correctable <= 1; correctable++) {
+        reset_model();
+        model_unit.cap = CAP_DRD | CAP_DWD;
+        remap = true;
+        irt = iommu_alloc_pages(IRT_ENTRIES * 16 / PAGE_SIZE);
+        requester_id = 0x0108;
+        struct pci_device d = {0};
+        uint32_t address, data;
+        CHECK(intel_msi(&d, 0, 1, 0x40, 0x45, &address, &data));
+        error_on_publish = FSTS_IQE;
+        error_record = correctable ? 4 : 2;
+        CHECK(intel_msi_clear(&d) == correctable && (msi_block(&d, false) < 0) == correctable);
+        unsigned n = model_unit.tail / INV_BYTES;
+        if (correctable) {
+            CHECK(queue_slot(n - 4)[0] == INV_CONTEXT_GLOBAL);
+            CHECK(queue_slot(n - 3)[0] == (INV_IOTLB_GLOBAL | INV_IOTLB_DR | INV_IOTLB_DW));
+            CHECK(queue_slot(n - 2)[0] == INV_IEC_GLOBAL && queue_slot(n - 1)[0] == INV_WAIT(token));
+        }
+        memset(msi_owner, 0, sizeof msi_owner); /* the fixture's device goes out of scope */
+    }
+    remap = false;
+    irt = 0;
+    requester_id = 0;
 }
 
 static void completion_cases(void) {
@@ -922,18 +1107,27 @@ static void power_transition_cases(void) {
     CHECK(!intel_shutdown());
     CHECK(rd32(&model_unit, R_GSTS) == (GCMD_QIE | GCMD_TE)); /* uncertainty never disables isolation */
 
-    const uint32_t errors[] = {FSTS_IQE, FSTS_ICE, FSTS_ITE};
+    /* No fault ISR observed these errors yet (IQEI 0: not recorded). Protection goes off only
+       after a recovery confirmed every cache invalidated; never on a fetch error (IQEI 2). */
+    const struct { uint32_t error; unsigned reason, waits; } errors[] = {
+        {FSTS_IQE, 0, 2}, {FSTS_ICE, 0, 1}, {FSTS_ITE, 0, 2}, {FSTS_IQE, 2, 0}};
     for (unsigned i = 0; i < ARRAY_SIZE(errors); i++) {
         reset_model();
-        run_commands = true;
+        run_commands = require_quiet_before_off = true;
         uint32_t on = GCMD_QIE | GCMD_TE | GCMD_IRE;
         wr32(&model_unit, R_GCMD, on);
         wr32(&model_unit, R_GSTS, on);
-        wr32(&model_unit, R_FSTS, errors[i]); /* no fault ISR observed this error yet */
-        CHECK(!model_unit.failed && !intel_shutdown() && model_unit.failed);
-        CHECK(rd32(&model_unit, R_GSTS) == on && rd32(&model_unit, R_GCMD) == on);
-        CHECK(rd32(&model_unit, R_FSTS) == errors[i]);
-        CHECK(!intel_resume() && rd32(&model_unit, R_GSTS) == on);
+        model_raise(&model_unit, errors[i].error, errors[i].reason);
+        bool corrected = errors[i].waits != 0;
+        CHECK(!model_unit.failed && intel_shutdown() == corrected && model_unit.failed == !corrected);
+        CHECK(!protection_dropped_early && completed_waits == errors[i].waits);
+        CHECK(rd32(&model_unit, R_FSTS) == (corrected ? 0 : errors[i].error));
+        if (corrected) {
+            CHECK(!(rd32(&model_unit, R_GSTS) & on));
+        } else {
+            CHECK(rd32(&model_unit, R_GSTS) == on && rd32(&model_unit, R_GCMD) == on);
+            CHECK(!intel_resume() && rd32(&model_unit, R_GSTS) == on);
+        }
     }
     for (unsigned inherited = 0; inherited <= 1; inherited++) {
         reset_model();
@@ -944,6 +1138,7 @@ static void power_transition_cases(void) {
         model_unit.queue_on = !inherited;
         if (inherited) wr64(&model_unit, R_IQA, (uintptr_t)firmware_queue);
         error_on_publish = FSTS_IQE; /* the newly appended wait cannot be fetched */
+        error_record = 2; /* a fetch error: corrected in neither queue */
         CHECK(!intel_shutdown() && model_unit.failed);
         CHECK(rd32(&model_unit, R_GSTS) == on && rd32(&model_unit, R_GCMD) == on);
         uint64_t original_tail = rd64(&model_unit, R_IQT), original_sems = sems;
@@ -1003,11 +1198,16 @@ static void power_transition_cases(void) {
     CHECK(!intel_shutdown()); /* the first unit confirming is not an all-unit confirmation */
     CHECK(rd32(&pair[0], R_GSTS) == (GCMD_QIE | GCMD_TE | GCMD_IRE));
     pair[1].failed = false;
-    wr32(&pair[1], R_FSTS, FSTS_IQE); /* unobserved fault in a later unit also preserves the first */
-    CHECK(!intel_shutdown() && pair[1].failed);
+    /* unobserved fault in a later unit also preserves the first: an IQE in the queue firmware
+       left running there */
+    wr32(&pair[1], R_GSTS, GCMD_QIE);
+    wr64(&pair[1], R_IQA, (uintptr_t)firmware_queue);
+    model_raise(&pair[1], FSTS_IQE, 3);
+    CHECK(!intel_shutdown() && pair[1].failed && rd32(&pair[1], R_FSTS) == FSTS_IQE);
     CHECK(rd32(&pair[0], R_GSTS) == (GCMD_QIE | GCMD_TE | GCMD_IRE));
     pair[1].failed = false;
-    wr32(&pair[1], R_FSTS, 0);
+    *model_fsts(&pair[1]) = 0;
+    wr32(&pair[1], R_GSTS, 0);
     wr64(&pair[1], R_CCMD, 1ull << 63);
     CHECK(!intel_shutdown() && pair[1].command_failed);
     CHECK(rd32(&pair[0], R_GSTS) == (GCMD_QIE | GCMD_TE | GCMD_IRE));
@@ -1405,6 +1605,7 @@ int main(void) {
     firmware_queue = _aligned_malloc(PAGE_SIZE << IQA_QS, PAGE_SIZE);
     if (!own_queue || !semaphore_page || !firmware_queue) return 2;
     queue_failure_cases();
+    queue_error_state_cases();
     completion_cases();
     firmware_cases();
     dma_lifetime_cases();

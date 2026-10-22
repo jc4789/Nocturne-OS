@@ -58,6 +58,10 @@
 #define FSTS_ICE (1u << 5)
 #define FSTS_ITE (1u << 6)
 #define FSTS_QUEUE_ERRORS (FSTS_IQE | FSTS_ICE | FSTS_ITE)
+/* IQERCD (11.4.9.9): the IQE's cause, and the requester of an ITE/ICE (0: not recorded) */
+#define IQEI(r)   ((unsigned)(r) & 0xF)
+#define ITESID(r) ((unsigned)((r) >> 32) & 0xFFFF)
+#define ICESID(r) ((unsigned)((r) >> 48) & 0xFFFF)
 #define FECTL_IM (1u << 31)
 #define PMEN_EPM (1u << 31)
 #define PMEN_PRS (1u << 0)
@@ -151,9 +155,12 @@ struct unit {
     unsigned handoff_config; /* inherited IQA.QS/DW: offsets stay valid during the live IQA change */
     uint32_t handoff_tail, handoff_token;
     uint32_t tail;
+    uint32_t token; /* the status data of its last sync's wait, or of a recovery's (queue_recover) */
     bool queue_on;  /* the queue on is ours (queue_start), not one the firmware left on */
     bool waiting;   /* a sync's wait descriptor went in */
-    bool failed;   /* completion is uncertain: never reuse its semaphore or report a later sync successful */
+    bool recovering; /* re-synchronizing after a queue error: another error is final */
+    bool failed;   /* completion is uncertain, and no recovery confirmed it: never reuse its semaphore or
+                      report a later sync successful */
     bool command_failed; /* a timed-out register command may still own the command interface */
 };
 static struct unit *units;
@@ -174,10 +181,13 @@ static uint64_t sems, irt;
 static size_t sem_pages;
 static uint32_t token;
 static int fault_vector = -1;
+static uint32_t fault_cpu; /* the BSP's APIC ID, the fault events' destination: after sleep its APIC
+                              is in the kernel's mode only after the units (dev/pm.c) */
 static const struct pci_device *msi_owner[MSI_BLOCKS];
 
 static struct iommu_hw intel;
 static bool queue_check(struct unit *u);
+static bool queue_recover(struct unit *u, uint32_t errors, uint64_t record);
 static bool units_off(void);
 
 static uint32_t rd32(const struct unit *u, unsigned off) { return mmio_read32(u->regs + off); }
@@ -454,7 +464,9 @@ static bool write_buffers_flush(void) {
 }
 
 static bool queue_start(struct unit *u) {
-    if (u->failed || u->command_failed || rd32(u, R_GSTS) & GCMD_QIE) return false;
+    /* An IQE/ITE an earlier queue left keeps this one from being fetched (6.5.2): queue_check
+       clears it while no queue is on. */
+    if (rd32(u, R_GSTS) & GCMD_QIE || !queue_check(u)) return false;
     /* QI must not be enabled over register-based invalidations (6.5.2). */
     if (!command_idle(u)) {
         u->failed = true;
@@ -467,20 +479,48 @@ static bool queue_start(struct unit *u) {
     return u->queue_on;
 }
 
-/* IQEI=1 is a bad tail, 2 a fetch failure, 3/4 descriptor errors, 5..7 configuration
-   errors (11.4.9.9). Replacing the head cannot correct all of them. ICE/ITE also make
-   completion uncertain (6.5.2.11). Keep the evidence and the live queue intact; callers
-   must retain DMA memory/IR entries rather than turn a later wait into a false recovery. */
+static void queue_errors_show(const struct unit *u, uint32_t errors, uint64_t record) {
+    if (errors & FSTS_IQE)
+        kprintf("iommu: VT-d unit at %lx: invalidation queue error %u (IQEI) at head %lx\n", u->base, IQEI(record),
+                rd64(u, R_IQH));
+    if (errors & FSTS_ITE)
+        kprintf("iommu: VT-d unit at %lx: a Device-TLB invalidation of requester %04x timed out (ITE)\n", u->base,
+                ITESID(record));
+    if (errors & FSTS_ICE && iommu_fault_report()) /* a device sends these at will */
+        kprintf("iommu: VT-d unit at %lx: requester %04x sent an invalid Device-TLB invalidation completion (ICE)\n",
+                u->base, ICESID(record));
+}
+
+/* Queue errors (6.5.2.11). An ICE is a Device-TLB invalidation completion that matches no ITag
+   (4.3), and the unit goes on with the queue: this kernel sends no Device-TLB invalidation and
+   its context entries block Translation Requests (TT 00b/10b, 9.3), so no completion it waits
+   for is lost. It is recorded and cleared. IQE and ITE stop the queue until cleared (6.5.2): on
+   the OS's own queue, queue_recover; with no queue on, they are what an earlier one left (sticky,
+   11.3), cleared for the next. On an inherited queue an ITE is cleared too: the unit fetches
+   from its head again, and queue_quiet's wait confirms the queue. An IQE there is not: it names
+   a descriptor the OS must not rewrite. Uncertain completion stays latched (failed), with the
+   evidence; callers retain DMA memory/IR entries rather than turn a later wait into a false
+   recovery. Not for the fault interrupt: recovery submits and waits. */
 static bool queue_check(struct unit *u) {
     if (u->failed || u->command_failed) {
         wr32(u, R_FECTL, rd32(u, R_FECTL) | FECTL_IM);
         return false;
     }
     uint32_t errors = rd32(u, R_FSTS) & FSTS_QUEUE_ERRORS;
-    if (!errors && (!u->queue_on ||
-        (rd32(u, R_GSTS) & GCMD_QIE && rd64(u, R_IQA) == u->queue))) return true;
+    bool live = (rd32(u, R_GSTS) & GCMD_QIE) != 0, ours = live && u->queue_on && rd64(u, R_IQA) == u->queue;
+    bool stopped = live && errors & (FSTS_IQE | FSTS_ITE);
+    uint64_t record = errors ? rd64(u, R_IQERCD) : 0;
+    if (errors) queue_errors_show(u, errors, record);
+    if (u->queue_on && !ours) {
+        /* the unit lost QIES or IQA of the queue the OS still owns */
+    } else if (!stopped || (!ours && !(errors & FSTS_IQE))) {
+        if (errors) wr32(u, R_FSTS, errors);
+        return true;
+    } else if (ours && !u->recovering && queue_recover(u, errors, record)) {
+        return true;
+    }
     kprintf("iommu: VT-d unit at %lx: invalidation failed, status %x, head %lx, record %lx; completion unknown\n",
-            u->base, errors, rd64(u, R_IQH), rd64(u, R_IQERCD));
+            u->base, errors, rd64(u, R_IQH), record);
     u->failed = true;
     wr32(u, R_FECTL, rd32(u, R_FECTL) | FECTL_IM); /* retain the error without an interrupt storm */
     return false;
@@ -553,31 +593,43 @@ static void faults_drain(struct unit *u) {
     }
 }
 
+/* An ICE is cleared here. IQE and ITE wait for the queue's next user (queue_check), whose
+   recovery submits and waits; no fault event comes while they are set (7.3). */
 static void fault_isr(struct regs *r) {
     (void)r;
     for (size_t i = 0; i < nunits; i++) {
-        queue_check(&units[i]);
-        faults_drain(&units[i]);
+        struct unit *u = &units[i];
+        if (rd32(u, R_FSTS) & FSTS_ICE) {
+            queue_errors_show(u, FSTS_ICE, rd64(u, R_IQERCD));
+            wr32(u, R_FSTS, FSTS_ICE);
+        }
+        faults_drain(u);
     }
 }
 
+static uint32_t token_next(void) {
+    if (!++token) token++;
+    return token;
+}
+
 /* Waits until units first..first + n - 1 have done every descriptor sent since their last sync,
-   the last one a wait that completed: false when one was lost or rejected, or a unit did not
-   finish them in time. */
+   the last one a wait that completed (u->token; a recovery on the way puts its own wait there):
+   false when one was lost or rejected, or a unit did not finish them in time. */
 static bool sync_units(size_t first, size_t n) {
     volatile uint32_t *word = phys_to_virt(sems);
-    if (!++token) token++;
+    uint32_t data = token_next();
     for (size_t i = first; i < first + n; i++) {
-        if (!queue_check(&units[i])) {
-            units[i].waiting = false;
+        struct unit *u = &units[i];
+        if (!queue_check(u)) {
+            u->waiting = false;
             continue;
         }
         word[i] = 0;
-        units[i].waiting = submit(&units[i], INV_WAIT(token), sems + i * 4);
+        if ((u->waiting = submit(u, INV_WAIT(data), sems + i * 4))) u->token = data;
     }
     for (size_t i = first; i < first + n; i++) {
         struct unit *u = &units[i];
-        for (uint64_t t = iommu_deadline(100); u->waiting && word[i] != token; pause()) {
+        for (uint64_t t = iommu_deadline(100); u->waiting && word[i] != u->token; pause()) {
             if (!queue_check(u)) break;
             if (iommu_expired(t)) {
                 kprintf("iommu: VT-d unit at %lx did not finish its commands\n", u->base);
@@ -595,6 +647,41 @@ static bool sync_units(size_t first, size_t n) {
 }
 
 static bool sync(void) { return sync_units(0, nunits); }
+
+/* The OS's own queue after an IQE/ITE (6.5.2.11): what is ahead of the head completes as normal,
+   nothing from the head on is fetched until the error is cleared, then the unit fetches from the
+   head again. IQE: the head references the descriptor in error, and software corrects the cause
+   first. The OS corrects what it wrote: the tail (IQEI 1) from its own record, a descriptor
+   (3: its type, Table 26; 4: a reserved field) by turning every one from the head on into a
+   fence, whose invalidations the global ones below subsume; without a record (0) both. A fetch
+   error (2), the width or root table mode its registers hold (5..7) or an undefined code is
+   nothing it can correct. ITE: the pending waits were aborted, and nothing behind a timed-out
+   Device-TLB invalidation is guaranteed (this kernel sends none). Either way the waits already
+   sent no longer confirm what preceded them: once the error is cleared, every cache is
+   invalidated whole and a wait of its own confirms it (6.5.2.12). */
+static bool queue_recover(struct unit *u, uint32_t errors, uint64_t record) {
+    uint64_t head = rd64(u, R_IQH);
+    if (!sems || head & ~IQ_PTR_MASK || head >= PAGE_SIZE) return false;
+    if (errors & FSTS_IQE) {
+        unsigned code = IQEI(record);
+        if (code == 2 || code > 4) return false;
+        for (uint32_t at = (uint32_t)head; at != u->tail; at = (at + INV_BYTES) % PAGE_SIZE) {
+            volatile uint64_t *slot = (volatile uint64_t *)((uint8_t *)phys_to_virt(u->queue) + at);
+            slot[0] = INV_FENCE;
+            slot[1] = 0;
+        }
+        if (!intel.coherent) iommu_cache_flush(phys_to_virt(u->queue), PAGE_SIZE);
+        __asm__ volatile("sfence" ::: "memory"); /* the fences before the unit fetches them */
+        wr64(u, R_IQT, u->tail); /* no descriptor beyond the ones above */
+    }
+    wr32(u, R_FSTS, errors); /* only now may the unit fetch again */
+    u->recovering = true;
+    bool ok = submit(u, INV_CONTEXT_GLOBAL, 0) && submit(u, INV_IOTLB_GLOBAL, 0) &&
+              (!remap || submit(u, INV_IEC_GLOBAL, 0)) && sync_units((size_t)(u - units), 1);
+    u->recovering = false;
+    if (ok) kprintf("iommu: VT-d unit at %lx: its invalidation queue recovered, every cache invalidated\n", u->base);
+    return ok;
+}
 
 /* ---- context entries ---- */
 static uint64_t pass_lo(const struct unit *u) {
@@ -906,9 +993,8 @@ static bool queue_quiet(struct unit *u) {
     for (unsigned at = 0; at < bytes; at += width) *(volatile uint64_t *)(queue + at) = INV_FENCE;
     volatile uint64_t *slot = (volatile uint64_t *)(queue + tail);
     volatile uint32_t *word = phys_to_virt(u->handoff + bytes);
-    if (!++token) token++;
-    u->handoff_token = token;
-    slot[0] = INV_WAIT(token);
+    u->handoff_token = token_next();
+    slot[0] = INV_WAIT(u->handoff_token);
     slot[1] = u->handoff + bytes;
     if (!intel.coherent) iommu_cache_flush(queue, bytes + sizeof *word);
     __asm__ volatile("sfence" ::: "memory");
@@ -1036,9 +1122,8 @@ static bool unit_tables(struct unit *u, uint32_t bsp) {
    every unit that keeps them, just before its own. */
 static bool units_on(void) {
     if (!units_off()) return false; /* also when firmware left any unit on */
-    uint32_t bsp = lapic_current_id();
     for (size_t i = 0; i < nunits; i++)
-        if (!unit_tables(&units[i], bsp)) return false;
+        if (!unit_tables(&units[i], fault_cpu)) return false;
     send(INV_CONTEXT_GLOBAL);
     send(INV_IOTLB_GLOBAL);
     if (remap) send(INV_IEC_GLOBAL);
@@ -1168,6 +1253,7 @@ static bool intel_start(bool translate) {
     }
     if (remap && !intel.coherent) iommu_cache_flush(phys_to_virt(irt), IRT_ENTRIES * 16);
     if (fault_vector < 0 && (fault_vector = irq_vector_alloc(1, 1)) >= 0) vector_register(fault_vector, fault_isr);
+    fault_cpu = lapic_current_id();
     uint64_t f = irq_save();
     ok = units_start(translate);
     if (!ok && translate && irreq) {

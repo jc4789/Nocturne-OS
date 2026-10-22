@@ -51,6 +51,7 @@ struct pci_claim {
     unsigned guard_count;
     uint16_t pmcsr; /* the power management capability's control register, or 0 */
     struct iommu_domain *domain; /* where an IOMMU isolates the function (dev/iommu.h) */
+    struct pci_device *reset_port; /* where this claim's attempt sent a Secondary Bus Reset (bus_reset) */
 };
 static struct pci_claim *claim_of_vector[256];
 
@@ -198,11 +199,12 @@ static void claim_release(struct vnode *v) {
     if (c->domain && c->domain->nmembers > 1) {
         /* P2P lets the old driver program every member. FLR resets only its target
            Function (PCIe 6.0, 6.6.2), not its peers: even a clean primary must be
-           recovered if it becomes another owner's peer. Never wait/reset at exit. */
+           recovered if it becomes another owner's peer. Never wait/reset at exit. A peer
+           left under reset (claim_recover) masters no more and is its reset's alone. */
         for (unsigned i = 0; i < c->domain->nmembers; i++) {
             struct pci_device *peer = c->domain->members[i];
             peer->needs_reset = true;
-            if (peer != d && !pci_disable_busmaster(peer, NULL))
+            if (peer != d && !peer->reset && !pci_disable_busmaster(peer, NULL))
                 kprintf("pci: %02x:%02x.%u: peer bus mastering did not stop; group recovery is required\n",
                         peer->bus, peer->dev, peer->func);
         }
@@ -320,36 +322,89 @@ static bool guarded(const struct pci_claim *c, uint32_t offset, uint32_t width, 
     return false;
 }
 
-/* Completes an FLR an earlier caller left (its task was killed in one of its waits), with MSI
-   off: the saved configuration may hold an old MSI Enable. */
-static bool reset_finish(struct pci_device *m) {
-    if (!pci_function_reset(m) || !pci_msi_disable(m)) return false;
+/* A Secondary Bus Reset (dev/pci.h) for m, which its FLR did not bring back, at the narrowest
+   Downstream Port above it: once per port in a claim's attempt. Everything below that port is
+   reset, so only where all of it is the claim's (its function, m, its domain's members) or in no
+   one's use: never a function a kernel driver runs, the one the boot screen is drawn through
+   (its scanout would be lost), one another claim holds or one in another domain. The others are
+   reserved meanwhile. False when it was not done. */
+static bool claim_owns(const struct pci_claim *c, const struct pci_device *m, const struct pci_device *f) {
+    return f == c->d || f == m || (c->domain && iommu_member(c->domain, f));
+}
+
+static void others_reserve(const struct pci_claim *c, const struct pci_device *m, const struct pci_device *port,
+                           bool reserve) {
+    for (int i = 0; i < pci_count(); i++) {
+        struct pci_device *f = pci_at(i);
+        if (pci_below(port, f) && !claim_owns(c, m, f)) f->claimed = reserve;
+    }
+}
+
+static bool bus_reset(struct pci_claim *c, struct pci_device *m) {
+    struct pci_device *port = pci_bus_reset_port(m);
+    if (!port || port == c->reset_port || (current_task && current_task->killed)) return false;
+    for (int i = 0; i < pci_count(); i++) {
+        struct pci_device *f = pci_at(i);
+        if (!pci_below(port, f)) continue;
+        bool ours = claim_owns(c, m, f);
+        const char *why = f->kernel_owned              ? "a kernel driver runs it"
+                          : screen_bar(f) >= 0         ? "the boot screen is drawn through it"
+                          : !ours && f->claimed        ? "it is claimed"
+                          : !ours && iommu_in_use(f)   ? "it is in another claim's domain"
+                                                       : NULL;
+        if (why) {
+            kprintf("pci: %02x:%02x.%u: no Secondary Bus Reset at %02x:%02x.%u: %02x:%02x.%u is below it and %s\n",
+                    m->bus, m->dev, m->func, port->bus, port->dev, port->func, f->bus, f->dev, f->func, why);
+            return false;
+        }
+    }
+    c->reset_port = port;
+    others_reserve(c, m, port, true);
+    bool done = pci_bus_reset(port);
+    others_reserve(c, m, port, false);
+    return done;
+}
+
+/* Completes a reset an earlier caller left (cancelled, or the function not ready then), with
+   MSI off: the saved configuration may hold an old MSI Enable. A function its FLR did not bring
+   back gets a Secondary Bus Reset where one may be done (bus_reset), and its FLR again after it:
+   a Conventional Reset does not stop all that an FLR stops (PCIe 6.0, 6.6.2). */
+static bool reset_finish(struct pci_claim *c, struct pci_device *m) {
+    bool done = pci_function_reset(m);
+    if (!done && pci_reset_stuck(m) && bus_reset(c, m)) done = pci_function_reset(m);
+    if (!done || !pci_msi_disable(m)) return false;
     m->needs_reset = false;
     return true;
 }
 
-/* No configuration access but the reset's own may reach a function under reset (dev/pci.h),
-   and forming a claim's group reads its members' ACS (dev/iommu.c refuses one under reset).
-   So an unfinished reset that no claim or domain holds is finished first, its function reserved
-   meanwhile. One that does not finish stays for a later claim, and groups with its function
-   are refused until then. False only when the caller was cancelled. */
-static bool resets_finish(void) {
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *m = pci_at(i);
-        if (!m->reset || m->claimed || iommu_in_use(m)) continue;
-        m->claimed = true;
-        reset_finish(m);
-        m->claimed = false;
-        if (current_task && current_task->killed) return false;
+/* The claim's domain (iommu_attach). Forming the group reads its functions' ACS, which no
+   access but a reset's own may reach while one is under reset (dev/pci.h): such a reset is
+   finished first, its function reserved meanwhile, and the group formed again. Only the
+   group's own resets: a claim does not wait on other functions'. One that another claim or
+   domain holds, or that does not finish, leaves the claim -N_ERR_NOT_READY; one that does not
+   come back is taken as without ACS (dev/iommu.c), which claim_recover settles. */
+static int claim_attach(struct pci_claim *c) {
+    for (;;) {
+        struct pci_device *m;
+        int r = iommu_attach(c->d, &c->domain, &m);
+        if (r != -N_ERR_NOT_READY || !m) return r;
+        bool peer = m != c->d; /* c->d is reserved by the caller */
+        if (peer && (m->claimed || iommu_in_use(m))) return r;
+        if (peer) m->claimed = true;
+        bool done = reset_finish(c, m);
+        if (peer) m->claimed = false;
+        if (!done && m->reset && !pci_reset_stuck(m)) return r;
     }
-    return true;
 }
 
 /* No app has a handle yet. The attached domain reserves every member across FLR sleeps;
    the primary is reserved by the caller too. A fresh peer must stop mastering even when
    it has not belonged to an app. An old app's peer also needs FLR: BME off pauses, not
    erases, its retained DMA state. Only the new primary can delegate missing generic reset
-   to its native driver; that driver cannot enumerate/recover a dirty display/FLR-less peer. */
+   to its native driver; that driver cannot enumerate/recover a dirty display/FLR-less peer.
+   A peer that does not come back from its resets is left where it is: its bus mastering is
+   off (cleared before its FLR, or by the reset), whatever it sends stays in the claim's domain,
+   and the kernel reaches it only through its reset (dev/pci.h). The primary must come back. */
 static bool claim_recover(struct pci_claim *c) {
     struct pci_device *d = c->d;
     unsigned count = c->domain ? c->domain->nmembers : 1;
@@ -357,10 +412,13 @@ static bool claim_recover(struct pci_claim *c) {
     for (unsigned i = 0; i < count; i++) {
         struct pci_device *m = c->domain ? c->domain->members[i] : d;
         if (current_task && current_task->killed) return false;
-        /* A reset left unfinished since resets_finish (a member no group read). Rejoin it
-           before BME/MSI accesses: Requests can be discarded during an FLR (6.6.2), so their
+        /* A reset left unfinished that forming the group did not read (claim_attach). Rejoin
+           it before BME/MSI accesses: Requests can be discarded during an FLR (6.6.2), so their
            readback is not a replacement for its remaining wait. */
-        if (m->reset && !reset_finish(m)) return false;
+        if (m->reset && !reset_finish(c, m)) {
+            if (m != d && pci_reset_stuck(m)) continue;
+            return false;
+        }
         if (m != d && !pci_disable_busmaster(m, NULL) && !m->needs_reset) {
             m->needs_reset = true;
             return false;
@@ -368,11 +426,12 @@ static bool claim_recover(struct pci_claim *c) {
         if (!m->needs_reset) continue;
         if (!pci_msi_disable(m)) return false; /* do not preserve an old MSI Enable in FLR state */
         bool screen = screen_bar(m) >= 0;
-        bool flr = m->reset || (m->pcie_cap &&
-            (pci_read32(m->bus, m->dev, m->func, m->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR));
+        bool flr = m->pcie_cap && (pci_read32(m->bus, m->dev, m->func, m->pcie_cap + PCIE_DEVCAP) & PCIE_DEVCAP_FLR);
         if (!screen && flr) {
-            if (!pci_function_reset(m)) return false;
-            m->needs_reset = false;
+            if (!reset_finish(c, m)) {
+                if (m != d && pci_reset_stuck(m)) continue;
+                return false;
+            }
         } else if (m != d) {
             return false;
         } else {
@@ -380,6 +439,17 @@ static bool claim_recover(struct pci_claim *c) {
             kprintf("pci: %02x:%02x.%u: isolated, but native driver recovery is still required%s\n",
                     d->bus, d->dev, d->func, screen ? "; boot display is not automatically reset" : "");
         }
+    }
+    /* A bus reset for one member resets the others below its port too: one it brought back
+       still owes its FLR, and one may not have come back from it. */
+    for (unsigned i = 0; i < count; i++) {
+        struct pci_device *m = c->domain ? c->domain->members[i] : d;
+        if (m->reset && !pci_reset_stuck(m) && !reset_finish(c, m) && !pci_reset_stuck(m)) return false;
+        if (!m->reset) continue;
+        if (m == d) return false;
+        m->needs_reset = true;
+        kprintf("pci: %02x:%02x.%u does not answer after its resets: left as it is, bus mastering off, what it "
+                "sends kept in the domain of %02x:%02x.%u\n", m->bus, m->dev, m->func, d->bus, d->dev, d->func);
     }
     return !(current_task && current_task->killed);
 }
@@ -395,7 +465,6 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     if (!d) return -N_ERR_NOT_FOUND;
     /* A bridge's registers route other devices' memory, buses and resets. */
     if (d->cls == 0x06) return -N_ERR_DENIED;
-    if (!resets_finish()) return -N_ERR_NOT_READY; /* may sleep: d is checked after */
     if (d->kernel_owned || d->claimed) return -N_ERR_BUSY;
     struct vnode *v = kzalloc(sizeof *v);
     struct pci_claim *c = kzalloc(sizeof *c);
@@ -408,10 +477,15 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     c->d = d;
     c->v = v;
     c->refs = 1;
+    d->claimed = true; /* reserved across the resets' waits */
     /* From here the function reaches only the DMA objects made through the claim. */
-    int r = iommu_attach(d, &c->domain);
-    if (r < 0) { kfree(c); kfree(v); return r; }
-    d->claimed = true;
+    int r = claim_attach(c);
+    if (r < 0) {
+        d->claimed = false;
+        kfree(c);
+        kfree(v);
+        return r;
+    }
     if (!claim_recover(c)) {
         /* FLR may still be pending on any member: retain its device-owned saved state,
            expose no handle, and re-block the whole group before dropping the reservation. */

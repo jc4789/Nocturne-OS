@@ -18,6 +18,9 @@
 
 static const struct iommu_hw *hw;
 static bool restore_failed; /* never downgrade an active domain after an unconfirmed power transition */
+/* the units did not come back from a sleep (iommu_resume): no claim and no other sleep until a
+   restart, however far iommu_init's way down took them */
+static bool lost_in_sleep;
 /* attached: the claims' domains; held: blocked without the units' confirmation (iommu_block) */
 static struct iommu_domain *attached, *held;
 static uint8_t domain_used[65536 / 8];
@@ -90,6 +93,19 @@ const char *iommu_x2apic_conflict(void) {
     return why ? why : iommu_intel_x2apic_conflict();
 }
 
+/* Units that did not start (iommu_init) or come back from a sleep (iommu_resume), with the PIC
+   and the IOAPICs masked: off where they confirm it. Interrupts then go in the plain format
+   unless a unit must remap them (VT-d ECAP.IRREQ: every interrupt is blocked while it is off,
+   5.1.4); else no interrupt route is given out (restore_failed). True: plain. */
+static bool units_abandon(void) {
+    /* false may leave a live firmware queue or an unconfirmed command, not merely an unused
+       unit. Do not later approve overwriting its tables during hibernate restore. */
+    bool plain = hw->shutdown() && !hw->interrupt_remapping_required;
+    if (!plain) restore_failed = true;
+    hw = NULL;
+    return plain;
+}
+
 /* Units are found also with noiommu, or when the firmware's descriptions could not be kept: a
    VT-d unit that requires interrupt remapping (ECAP.IRREQ) blocks every interrupt message while
    it is off (5.1.4), so such units are started with interrupt remapping alone. */
@@ -123,17 +139,10 @@ void iommu_init(void) {
     bool started = hw->start(!off);
     if (started) started = ioapic_remap();
     if (!started) {
-        /* false may leave a live firmware queue or an unconfirmed command, not merely an
-           unused unit. Do not later approve overwriting its tables during hibernate restore. */
-        bool stopped = hw->shutdown();
-        bool plain = stopped && !hw->interrupt_remapping_required;
-        if (!plain) restore_failed = true;
-        hw = NULL;
-        if (plain) {
-            /* No table remains active: restore original plain requests, including a
-               route whose remapping failed. Never rewrite routes under uncertain units. */
-            if (!ioapic_remap()) restore_failed = true;
-        } else ioapic_mask_all();
+        /* No table remains active once they are off: the original plain requests go back,
+           including a route whose remapping failed. Never rewrite routes under uncertain units. */
+        if (!units_abandon()) ioapic_mask_all();
+        else if (!ioapic_remap()) restore_failed = true;
         if (restore_failed)
             kprintf("iommu: initialization/interrupt delivery unconfirmed; app claims and new interrupt routes disabled\n");
         else kprintf("iommu: %s: app drivers require appdrivers-unisolated to run without isolation\n", off ? off : "not used");
@@ -145,7 +154,7 @@ void iommu_init(void) {
 }
 
 bool iommu_active(void) { return hw && hw->translating && !restore_failed; }
-bool iommu_power_ready(void) { return !restore_failed; }
+bool iommu_power_ready(void) { return !restore_failed && !lost_in_sleep; }
 
 /* An unknown clock cannot establish a millisecond wait. Check ready status once, then fail
    conservatively instead of inventing a maximum x86 frequency or spinning without a bound. */
@@ -344,7 +353,7 @@ struct iommu_domain *iommu_domain_of(const struct pci_device *d) {
     return NULL;
 }
 
-static bool member_of(const struct iommu_domain *dom, const struct pci_device *d) {
+bool iommu_member(const struct iommu_domain *dom, const struct pci_device *d) {
     for (unsigned i = 0; i < dom->nmembers; i++)
         if (dom->members[i] == d) return true;
     return false;
@@ -352,9 +361,9 @@ static bool member_of(const struct iommu_domain *dom, const struct pci_device *d
 
 bool iommu_in_use(const struct pci_device *d) {
     for (struct iommu_domain *dom = attached; dom; dom = dom->next)
-        if (member_of(dom, d)) return true;
+        if (iommu_member(dom, d)) return true;
     for (struct iommu_domain *dom = held; dom; dom = dom->next)
-        if (member_of(dom, d)) return true;
+        if (iommu_member(dom, d)) return true;
     return false;
 }
 
@@ -460,6 +469,7 @@ struct acs_change {
 struct acs_log {
     struct acs_change *at;
     size_t n, room;
+    struct pci_device *resetting; /* the function under reset that stopped the attempt, or NULL */
 };
 
 static void acs_undo(const struct acs_log *log) {
@@ -469,14 +479,21 @@ static void acs_undo(const struct acs_log *log) {
 
 /* Turns on the ACS controls of `want` that f has, and off egress control and direct translated
    P2P (both let requests past the redirect), noting what the register was in log: 1; 0 without
-   ACS; -N_ERR_NO_MEMORY without memory to note it, nothing written; -N_ERR_NOT_READY while an
-   FLR is under way on f, which no other configuration access may reach (dev/pci.h). *has: the
-   controls of `want` it has; *set: those of them that read back on. */
-static int acs_set(struct acs_log *log, const struct pci_device *f, uint16_t want, uint16_t *has, uint16_t *set) {
+   ACS; -N_ERR_NO_MEMORY without memory to note it, nothing written; -N_ERR_NOT_READY, f noted,
+   while f is being reset, as no other configuration access may reach it (dev/pci.h). A function
+   that did not come back from its reset is not read either, and is taken as without ACS: its
+   ACS is not known. *has: the controls of `want` it has; *set: those of them that read back on. */
+static int acs_set(struct acs_log *log, struct pci_device *f, uint16_t want, uint16_t *has, uint16_t *set) {
     *has = *set = 0;
+    if (pci_reset_stuck(f)) {
+        kprintf("iommu: %02x:%02x.%u does not answer after its reset: taken as without ACS\n", f->bus, f->dev,
+                f->func);
+        return 0;
+    }
     if (f->reset) {
         kprintf("iommu: %02x:%02x.%u is being reset: its group is formed once it is ready\n", f->bus, f->dev,
                 f->func);
+        log->resetting = f;
         return -N_ERR_NOT_READY;
     }
     uint16_t at = pci_find_ext_cap(f, 0x0D);
@@ -525,7 +542,7 @@ static int reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool 
             }
         }
     }
-    for (const struct pci_device *b = m->upstream; b; b = b->upstream) {
+    for (struct pci_device *b = m->upstream; b; b = b->upstream) {
         /* conventional bridges: what is below shares their IDs; switch upstream ports: what
            passes them passed a downstream port or root port of their own */
         if (!b->pcie_cap || (b->pcie_type != 4 && b->pcie_type != 6)) continue;
@@ -766,9 +783,15 @@ static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
     return r;
 }
 
-int iommu_attach(struct pci_device *d, struct iommu_domain **out) {
+int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting) {
     *out = NULL;
+    *resetting = NULL;
     if (restore_failed) return -N_ERR_IO;
+    if (lost_in_sleep) { /* not the platform's fixed inability the boot opt-in permits (unisolated) */
+        kprintf("iommu: %02x:%02x.%u: the units did not come back from a sleep: no app driver until a restart\n",
+                d->bus, d->dev, d->func);
+        return -N_ERR_UNSUPPORTED;
+    }
     if (!iommu_active()) {
         if (cmdline_has("appdrivers-unisolated")) return 0;
         kprintf("iommu: %02x:%02x.%u: isolation is required but no translating IOMMU is active\n",
@@ -823,6 +846,7 @@ int iommu_attach(struct pci_device *d, struct iommu_domain **out) {
     } else if (!dom) {
         acs_undo(&acs);
     }
+    *resetting = acs.resetting;
     kfree(acs.at);
     kfree(g.at);
     kfree(ids.at);
@@ -878,9 +902,15 @@ bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte) {
     return !restore_failed && (!hw || hw->ioapic(ioapic_id, gsi, rte));
 }
 
-bool iommu_resume(void) {
-    if (hw && !hw->resume()) restore_failed = true;
-    return !restore_failed;
+const char *iommu_resume(void) {
+    if (!hw || hw->resume()) return NULL;
+    lost_in_sleep = true;
+    if (units_abandon()) {
+        kprintf("iommu: the units did not come back after sleep: off, interrupts go plain, DMA untranslated\n");
+        return "Device isolation, app drivers and sleep are off until a restart";
+    }
+    kprintf("iommu: the units did not come back after sleep, and are not confirmed off: no interrupt routes\n");
+    return "Device interrupts are off until a restart";
 }
 
 bool iommu_shutdown(void) {

@@ -19,15 +19,17 @@ unsigned ioapic_count(void);
    to dev/iommu.h are the MADT's, which the DMAR's device scopes name. */
 bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool level, bool active_low);
 bool ioapic_mask(uint32_t gsi);
-/* Interrupt remapping came on (dev/iommu_intel.c) or went off again (dev/iommu.c): the unmasked
-   entries (the firmware's ExtINT pin) are written again from the plain entries they were given,
-   remappable while it is on; one whose remapping entry the units did not confirm stays masked.
-   False if any requested route failed; retain its plain request for a safe rollback/retry. */
+/* Interrupt remapping came on (dev/iommu_intel.c), went off again (dev/iommu.c), or is back
+   from a sleep (ioapic_resume): the unmasked entries (the firmware's ExtINT pin) are written
+   again from the plain entries they were given, remappable while it is on; one whose remapping
+   entry the units did not confirm stays masked. False if any requested route failed; retain its
+   plain request for a safe rollback/retry. */
 bool ioapic_remap(void);
 /* ISA IRQ -> GSI honoring MADT interrupt source overrides. level/active_low (may be NULL) receive the
    trigger mode and polarity to use for that source (ISA default: edge, active high). */
 uint32_t ioapic_isa_to_gsi(unsigned isa_irq, bool *level, bool *active_low);
-/* Sleep (dev/pm.c), interrupts off: save every entry and mask it before S3; restore after IOMMU. */
+/* Sleep (dev/pm.c), interrupts off: mask every entry before S3; after the IOMMU (iommu_resume),
+   the ids back and every entry made again from the one it was given (ioapic_remap). */
 void ioapic_suspend(void);
 void ioapic_resume(void);
 void ioapic_mask_all(void); /* a hibernation restore: nothing more comes in before the image takes over */

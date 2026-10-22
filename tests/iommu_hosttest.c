@@ -73,13 +73,20 @@ uint64_t pmm_alloc_below(uint64_t limit) {
 unsigned pmm_ram_ranges(const struct pmm_range **out) { *out = ram_ranges; return ram_count; }
 bool pmm_ram_complete(void) { return ram_complete; }
 void pmm_free(uint64_t p) { CHECK(p && p / PAGE_SIZE <= ARRAY_SIZE(used) && used[p / PAGE_SIZE - 1]); used[p / PAGE_SIZE - 1] = false; live_pages--; frees++; }
-int pci_count(void) { return 0; }
-struct pci_device *pci_at(int i) { (void)i; return NULL; }
+/* 列挙された機能（groupの形成が辿る）と、resetから戻らなかった機能（pci_reset_stuck）。
+   reset中の印はpci_device.resetが非NULLであることだけで、その中身はpci.cのもの。 */
+static struct pci_device *enumerated[4];
+static int enumerated_count;
+static const struct pci_device *stuck_function;
+static unsigned config_reads; /* ACSを探す・読む構成アクセス */
+int pci_count(void) { return enumerated_count; }
+struct pci_device *pci_at(int i) { return i >= 0 && i < enumerated_count ? enumerated[i] : NULL; }
 bool pci_all_known(void) { return true; }
 bool pci_below(const struct pci_device *a,const struct pci_device *b) { (void)a;(void)b;return false; }
 bool pci_same_device(const struct pci_device *a,const struct pci_device *b) { return a == b; }
-uint16_t pci_find_ext_cap(const struct pci_device *d,uint16_t id) { (void)d;(void)id;return 0; }
-uint16_t pci_read16(uint8_t b,uint8_t d,uint8_t f,uint16_t at) { (void)b;(void)d;(void)f;(void)at;return 0; }
+bool pci_reset_stuck(const struct pci_device *d) { return d->reset && d == stuck_function; }
+uint16_t pci_find_ext_cap(const struct pci_device *d,uint16_t id) { (void)d;(void)id;config_reads++;return 0; }
+uint16_t pci_read16(uint8_t b,uint8_t d,uint8_t f,uint16_t at) { (void)b;(void)d;(void)f;(void)at;config_reads++;return 0; }
 void pci_write16(uint8_t b,uint8_t d,uint8_t f,uint16_t at,uint16_t v) { (void)b;(void)d;(void)f;(void)at;(void)v; }
 static const struct iommu_hw *probe_backend;
 const struct iommu_hw *iommu_amd_probe(bool *plain_safe) { *plain_safe = !firmware_declared || probe_plain; return probe_backend; }
@@ -99,6 +106,11 @@ static bool host_is_leaf(uint64_t e,unsigned level) { return level == 1 || (e & 
 static bool host_flush(struct iommu_domain *dom,bool unmapped) { (void)dom;(void)unmapped;flushes++;return true; }
 static bool host_power_ok(void) { return true; }
 static bool host_power_fail(void) { return false; }
+static unsigned shutdown_calls;
+static bool host_shutdown_ok(void) { shutdown_calls++; return true; }
+static bool host_shutdown_fail(void) { shutdown_calls++; return false; }
+static bool host_attach(struct iommu_domain *dom) { (void)dom; return true; }
+static bool host_block(struct iommu_domain *dom) { (void)dom; return true; }
 static bool host_start_unused(bool translate) { (void)translate; return false; }
 static bool host_start_route(bool translate) {
     (void)translate; starts++; CHECK(pic_masks == UINT16_MAX && pins_masked); return start_ok;

@@ -154,9 +154,17 @@ bool lapic_runner_timer_start(void); /* BSPで較正済みのperiodic tickだけ
 void lapic_resume(void); /* BSP after S3: registers and the calibrated tick again */
 bool lapic_send_init(uint32_t apic_id); /* INIT: the AP waits for a STARTUP, running nothing */
 bool lapic_send_startup(uint32_t apic_id, uint64_t page); /* after an INIT: into real mode at page */
-/* The xAPIC ID register's mapping (NULL in x2APIC mode), which a CPU a STARTUP reached reads to
-   learn whether the STARTUP was its own (arch/wake.h). */
-const volatile uint32_t *lapic_id_register(void);
+/* What a CPU a STARTUP reached needs to learn whether the STARTUP was its own (arch/wake.h): the
+   kernel's mode, and in xAPIC mode the ID register's mapping, the bits of it that hold the ID,
+   the IA32_APIC_BASE value (under base_mask) of an APIC at that mapping, and whether AMD's 8-bit
+   ID is to be turned on before the register is read. */
+struct lapic_ident {
+    bool x2, xaidn;
+    const volatile uint32_t *id_reg;
+    uint32_t id_mask;
+    uint64_t base, base_mask;
+};
+void lapic_ident(struct lapic_ident *out);
 /* Tickless idle, after lapic_timer_start: stop this CPU's tick, fire it once after ms, or go
    back to the periodic tick. */
 void lapic_tick_stop(void);
