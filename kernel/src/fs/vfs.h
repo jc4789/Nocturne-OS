@@ -28,6 +28,7 @@ struct dirent {
 
 struct vnode;
 struct file;
+struct content;
 struct poll_entry;
 struct poll_wait {
     struct wait_queue wq;
@@ -48,14 +49,19 @@ struct vnode_ops {
     int (*create)(struct vnode *dir, const char *name, int type, struct vnode **out);
     int (*unlink)(struct vnode *dir, const char *name);
     int (*truncate)(struct vnode *v, uint64_t size);
-    /* Swap in new content whole: readers see the old or the new bytes, never
-       a mix. Consumes data (kmalloc'd) whether or not it succeeds. */
-    int (*replace)(struct vnode *v, uint8_t *data, uint64_t size);
+    /* An unnamed, unpublished new version of document name in dir (which need not exist yet),
+       empty: written like any document, then published (publish, on the staged vnode's ops) as the
+       document's whole content in one step that is on the medium when it returns. Dropping the
+       last handle unpublished discards it. docs/nosfs.md §4. */
+    int (*stage)(struct vnode *dir, const char *name, struct vnode **out);
+    int (*publish)(struct vnode *staged);
     /* Rename/move an entry within one filesystem; the target name must be free. */
     int (*move)(struct vnode *from_dir, const char *from, struct vnode *to_dir, const char *to);
     /* What was written to v is on the medium when this returns (a written document's handle is
        closed). NULL: nothing to wait for, as in memory. */
     int (*sync)(struct vnode *v);
+    /* The size as the handle sees it (a read-only handle keeps the version it opened). NULL: v->size. */
+    uint64_t (*size)(struct vnode *v, struct file *f);
     bool (*can_read)(struct vnode *v, struct file *f);
     bool (*can_write)(struct vnode *v, struct file *f);
     bool (*hangup)(struct vnode *v, struct file *f);
@@ -73,15 +79,13 @@ struct vnode {
     int64_t mtime;
     int refs;
     bool unlinked;
+    bool staged; /* an unpublished version (stage): parent and name say where it goes */
     struct vnode_ops *ops;
     void *priv;
     struct vnode *mounted;  /* fs root mounted on top of this dir */
     struct vnode *parent;
-    /* ramfs storage. cap 0 with data set: the bytes are the initrd archive's, read in place; the
-       first change copies them out (fs/initrd.c gets the pages back once nothing reads them). */
-    struct vnode *children, *sibling;
-    uint8_t *data;
-    uint64_t cap;
+    struct vnode *children, *sibling; /* ramfs folders */
+    struct content *content;          /* ramfs documents (fs/content.h) */
     struct file *lease_owner;
     struct wait_queue lease_wait;
     struct poll_entry *pollers;
@@ -134,9 +138,13 @@ int vfs_write_whole(const char *abspath, const void *data, uint64_t size);
 int vfs_document_open(const char *abspath, int access, struct file **out);
 int64_t vfs_document_read_user(struct file *f, uint64_t off, void *buf, size_t n);
 int64_t vfs_document_write_user(struct file *f, uint64_t off, const void *buf, size_t n);
-int vfs_document_commit(struct file *f); /* REPLACE handles: swap the staged content in */
-int vfs_replace(const char *abspath, uint8_t *data, uint64_t size); /* consumes data */
+/* A REPLACE handle publishes its version; any handle's writes reach the medium. */
+int vfs_document_commit(struct file *f);
+/* The whole new content of a document (made if missing), from user memory: written into an
+   unpublished version and published, never copied whole into the kernel. */
+int vfs_save_user(const char *abspath, const void *udata, uint64_t size);
 int vfs_append_user(const char *abspath, const void *udata, uint64_t size);
+uint64_t vfs_file_size(struct file *f);
 int vfs_entry_info(const char *abspath, struct dirent *out);
 int vfs_folder_list(const char *abspath, uint64_t start, struct dirent *out, size_t max);
 int vfs_move(const char *from, const char *to);
@@ -149,10 +157,8 @@ struct vnode *ramfs_new_root(void);
 struct vnode *ramfs_new_node(const char *name, int type);
 void ramfs_add_child(struct vnode *dir, struct vnode *child);
 extern struct vnode_ops ramfs_ops;
-struct vnode *ramfs_replace_new(const char *abspath); /* staging for N_DOCUMENT_REPLACE */
-bool ramfs_is_replace(struct vnode *v);
-int ramfs_replace_commit(struct vnode *v);
-void ramfs_borrow(struct vnode *v, const uint8_t *data, uint64_t size); /* initrd bytes, in place */
+/* initrd bytes, read in place; false: nothing borrowed (not a ramfs document, empty, no memory) */
+bool ramfs_borrow(struct vnode *v, const uint8_t *data, uint64_t size);
 
 /* event queues (sys/events.c) */
 struct event_watch;
@@ -188,7 +194,9 @@ int fat_extents(struct vnode *v, int (*run)(void *ctx, struct blkdev *d, uint64_
 
 /* initrd: the archive stays where the bootloader put it and its files are read from it */
 void initrd_load(void *data, uint64_t size);
-void initrd_unborrow(const uint8_t *data, uint64_t size); /* nothing reads these bytes any more */
+/* Nothing reads these bytes of a file any more (any number of times; a page goes back to the
+   allocator once no file's bytes in it are read there). */
+void initrd_unborrow(const uint8_t *data, uint64_t size);
 /* Hibernation: the archive's pages that still hold what the bootloader loaded (the next boot
    loads them again, so an image need not carry them). */
 bool initrd_range(uint64_t *phys, uint64_t *pages);

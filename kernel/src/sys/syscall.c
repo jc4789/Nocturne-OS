@@ -1273,7 +1273,7 @@ static int64_t sys_document_size(int h) {
     int64_t r;
     struct file *f = document_ref(h, &r);
     if (!f) return r;
-    r = (int64_t)f->vn->size;
+    r = (int64_t)vfs_file_size(f);
     vfs_close(f);
     return r;
 }
@@ -1299,12 +1299,7 @@ static int64_t sys_document_claim(int h, bool claim, bool wait) {
 static int64_t sys_document_save(const char *upath, const void *udata, size_t n) {
     char path[PATH_MAX_LEN];
     int r = native_path(upath, path);
-    if (r < 0) return r;
-    uint8_t *data = n ? kmalloc(n) : NULL;
-    if (n && !data) return -N_ERR_NO_MEMORY;
-    r = copy_from_user(data, udata, n);
-    if (r < 0) { kfree(data); return r; }
-    return vfs_replace(path, data, n);
+    return r < 0 ? r : vfs_save_user(path, udata, n);
 }
 
 static int64_t sys_document_append(const char *upath, const void *udata, size_t n) {

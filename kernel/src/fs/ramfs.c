@@ -1,67 +1,41 @@
-/* ramfs: the in-memory root filesystem. */
+/* ramfs: the in-memory root filesystem. A document's bytes are a content (fs/content.h) with no
+   medium: pages of its own, or the initrd archive's bytes read in place until a page is changed. */
 #include "fs/vfs.h"
+#include "fs/content.h"
 #include "mm/heap.h"
 #include "arch/cpu.h"
 #include "dev/timer.h"
 
+/* A read-only handle reads the version it opened (f->priv); the others read the document's. */
+static struct content *view(struct vnode *v, struct file *f) {
+    return f && f->priv ? f->priv : v->content;
+}
+
 static int64_t ram_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
-    if (off >= v->size) return 0;
-    if (n > v->size - off) n = v->size - off;
-    memcpy(buf, v->data + off, n);
-    return n;
-}
-
-static bool borrowed(struct vnode *v) { return v->data && !v->cap; }
-
-/* A file read in place from the initrd gets its own copy before its first change. */
-static int own(struct vnode *v, uint64_t need) {
-    uint64_t nc = MAX(MAX(need, v->size), 1);
-    uint8_t *nd = kmalloc(nc);
-    if (!nd) return -N_ERR_NO_MEMORY;
-    memcpy(nd, v->data, v->size);
-    initrd_unborrow(v->data, v->size);
-    v->data = nd;
-    v->cap = nc;
-    return 0;
-}
-
-static void drop_data(uint8_t *data, uint64_t cap, uint64_t size) {
-    if (data && !cap) initrd_unborrow(data, size);
-    else kfree(data);
-}
-
-static int ensure_cap(struct vnode *v, uint64_t need) {
-    if (borrowed(v)) return own(v, need);
-    if (need <= v->cap) return 0;
-    /* The first write sizes the file exactly (the initrd unpacks each file in
-       one write, as do most whole-file saves); later growth doubles. */
-    uint64_t nc = v->cap ? v->cap * 2 : need;
-    if (nc < need) nc = need;
-    uint8_t *nd = krealloc(v->data, nc);
-    if (!nd) return -N_ERR_NO_MEMORY;
-    v->data = nd;
-    v->cap = nc;
-    return 0;
+    return content_read(view(v, f), buf, off, n);
 }
 
 static int64_t ram_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
-    if (!n) return 0; /* an empty file has no backing storage to offset into */
-    if (off + n < off) return -N_ERR_NO_SPACE;
-    if (ensure_cap(v, off + n) < 0) return -N_ERR_NO_SPACE;
-    if (off > v->size) memset(v->data + v->size, 0, off - v->size);
-    memcpy(v->data + off, buf, n);
-    if (off + n > v->size) v->size = off + n;
-    return n;
+    int64_t r = content_write(v->content, buf, off, n);
+    v->size = content_size(v->content);
+    return r;
 }
 
 static int ram_truncate(struct vnode *v, uint64_t size) {
-    if (borrowed(v) && own(v, size) < 0) return -N_ERR_NO_SPACE;
-    if (size > v->size) {
-        if (ensure_cap(v, size) < 0) return -N_ERR_NO_SPACE;
-        memset(v->data + v->size, 0, size - v->size);
-    }
-    v->size = size;
-    return 0;
+    int r = content_truncate(v->content, size);
+    v->size = content_size(v->content);
+    return r;
+}
+
+static uint64_t ram_size(struct vnode *v, struct file *f) { return content_size(view(v, f)); }
+
+static void ram_open(struct vnode *v, struct file *f) {
+    if (v->type == VT_FILE && (f->flags & O_ACCMODE) == O_RDONLY) f->priv = content_ref(v->content);
+}
+
+static void ram_close(struct vnode *v, struct file *f) {
+    if (v->type == VT_FILE && f->priv) content_unref(f->priv);
+    f->priv = NULL;
 }
 
 static int ram_readdir(struct vnode *v, uint64_t idx, struct dirent *out) {
@@ -81,15 +55,27 @@ static struct vnode *ram_lookup(struct vnode *dir, const char *name) {
     return NULL;
 }
 
-struct vnode *ramfs_new_node(const char *name, int type) {
+/* A node holding content c (documents only; consumed). */
+static struct vnode *node_new(const char *name, int type, struct content *c) {
     struct vnode *v = kzalloc(sizeof *v);
+    if (!v || (type == VT_FILE && !c)) {
+        kfree(v);
+        content_unref(c);
+        return NULL;
+    }
     strlcpy(v->name, name, sizeof v->name);
     v->type = type;
     v->ops = &ramfs_ops;
     v->mode = type == VT_DIR ? 0755 : 0644;
     v->mtime = time_now();
     v->refs = 1; /* the directory's reference */
+    v->content = c;
+    v->size = c ? content_size(c) : 0;
     return v;
+}
+
+struct vnode *ramfs_new_node(const char *name, int type) {
+    return node_new(name, type, type == VT_FILE ? content_new(NULL, NULL) : NULL);
 }
 
 void ramfs_add_child(struct vnode *dir, struct vnode *child) {
@@ -111,7 +97,7 @@ static int ram_create(struct vnode *dir, const char *name, int type, struct vnod
 }
 
 static void ram_release(struct vnode *v) {
-    drop_data(v->data, v->cap, v->size);
+    content_unref(v->content);
     kfree(v);
 }
 
@@ -128,25 +114,15 @@ static int ram_unlink(struct vnode *dir, const char *name) {
     return 0;
 }
 
-static int ram_replace(struct vnode *v, uint8_t *data, uint64_t size) {
-    uint64_t flags = irq_save();
-    uint8_t *old = v->data;
-    uint64_t old_cap = v->cap, old_size = v->size;
-    v->data = data;
-    v->size = data ? size : 0;
-    v->cap = data ? MAX(size, 1) : 0; /* owned: never 0, which means borrowed */
-    v->mtime = time_now();
-    irq_restore(flags);
-    drop_data(old, old_cap, old_size);
-    return 0;
-}
-
-void ramfs_borrow(struct vnode *v, const uint8_t *data, uint64_t size) {
-    if (v->ops != &ramfs_ops || !size) return;
-    drop_data(v->data, v->cap, v->size);
-    v->data = (uint8_t *)data;
+bool ramfs_borrow(struct vnode *v, const uint8_t *data, uint64_t size) {
+    if (v->ops != &ramfs_ops || v->type != VT_FILE || !size) return false;
+    struct content *c = content_new(NULL, NULL);
+    if (!c) return false;
+    content_borrow(c, data, size);
+    content_unref(v->content);
+    v->content = c;
     v->size = size;
-    v->cap = 0;
+    return true;
 }
 
 static int ram_move(struct vnode *from_dir, const char *from, struct vnode *to_dir, const char *to) {
@@ -163,6 +139,68 @@ static int ram_move(struct vnode *from_dir, const char *from, struct vnode *to_d
     return 0;
 }
 
+/* ---- unpublished versions (N_DOCUMENT_REPLACE): an unnamed node that remembers its folder and
+   name; publishing hands its content to the document there, or makes the document. */
+
+static struct vnode_ops staged_ops;
+
+static int ram_stage(struct vnode *dir, const char *name, struct vnode **out) {
+    if (strlen(name) >= NAME_MAX_LEN) return -N_ERR_NAME_TOO_LONG;
+    struct vnode *v = ramfs_new_node(name, VT_FILE);
+    if (!v) return -N_ERR_NO_MEMORY;
+    v->ops = &staged_ops;
+    v->refs = 0; /* its handles' only */
+    v->unlinked = true;
+    v->staged = true;
+    v->parent = dir;
+    vnode_ref(dir);
+    *out = v;
+    return 0;
+}
+
+static int ram_publish(struct vnode *s) {
+    struct vnode *dir = s->parent;
+    if (dir->unlinked) return -N_ERR_NOT_FOUND;
+    struct vnode *old = ram_lookup(dir, s->name);
+    if (old && old->type == VT_DIR) return -N_ERR_IS_FOLDER;
+    if (old && (old->type != VT_FILE || old->ops != &ramfs_ops)) return -N_ERR_WRONG_KIND;
+    struct content *empty = content_new(NULL, NULL), *c = s->content;
+    if (!empty) return -N_ERR_NO_MEMORY;
+    if (old) {
+        struct content *was = old->content;
+        old->content = c;
+        old->size = content_size(c);
+        old->mtime = time_now();
+        content_unref(was); /* read-only handles keep the version they opened */
+    } else {
+        struct vnode *v = node_new(s->name, VT_FILE, c);
+        if (!v) {
+            content_unref(empty);
+            return -N_ERR_NO_MEMORY;
+        }
+        ramfs_add_child(dir, v);
+    }
+    s->content = empty;
+    s->size = 0;
+    s->staged = false;
+    return 0;
+}
+
+static void staged_release(struct vnode *v) {
+    struct vnode *dir = v->parent;
+    ram_release(v);
+    vnode_unref(dir);
+}
+
+static struct vnode_ops staged_ops = {
+    .read = ram_read,
+    .write = ram_write,
+    .truncate = ram_truncate,
+    .size = ram_size,
+    .publish = ram_publish,
+    .release = staged_release,
+};
+
 struct vnode_ops ramfs_ops = {
     .read = ram_read,
     .write = ram_write,
@@ -171,58 +209,12 @@ struct vnode_ops ramfs_ops = {
     .create = ram_create,
     .unlink = ram_unlink,
     .truncate = ram_truncate,
-    .replace = ram_replace,
+    .stage = ram_stage,
     .move = ram_move,
+    .size = ram_size,
+    .open = ram_open,
+    .close = ram_close,
     .release = ram_release,
 };
-
-/* N_DOCUMENT_REPLACE staging: an unnamed in-memory document that remembers
-   its destination. Committing hands its bytes to the destination's replace. */
-static void replace_release(struct vnode *v) {
-    kfree(v->priv);
-    kfree(v->data);
-    kfree(v);
-}
-
-static struct vnode_ops replace_ops = {
-    .read = ram_read,
-    .write = ram_write,
-    .truncate = ram_truncate,
-    .release = replace_release,
-};
-/* A staging document after its commit: a duplicated handle closing later
-   must not commit again, which would replace the document with nothing. */
-static struct vnode_ops replaced_ops = {
-    .read = ram_read,
-    .release = replace_release,
-};
-
-struct vnode *ramfs_replace_new(const char *path) {
-    struct vnode *v = kzalloc(sizeof *v);
-    char *target = strdup(path);
-    if (!v || !target) { kfree(v); kfree(target); return NULL; }
-    strlcpy(v->name, "replacement", sizeof v->name);
-    v->type = VT_FILE;
-    v->ops = &replace_ops;
-    v->mode = 0644;
-    v->mtime = time_now();
-    v->priv = target;
-    v->unlinked = true; /* freed with its last handle */
-    return v;
-}
-
-bool ramfs_is_replace(struct vnode *v) { return v->ops == &replace_ops; }
-
-int ramfs_replace_commit(struct vnode *v) {
-    uint64_t flags = irq_save();
-    if (v->ops != &replace_ops) { irq_restore(flags); return 0; }
-    uint8_t *data = v->data;
-    uint64_t size = v->size;
-    v->data = NULL;
-    v->size = v->cap = 0;
-    v->ops = &replaced_ops;
-    irq_restore(flags);
-    return vfs_replace(v->priv, data, size);
-}
 
 struct vnode *ramfs_new_root(void) { return ramfs_new_node("", VT_DIR); }

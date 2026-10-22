@@ -37,6 +37,7 @@ struct fat_node {
     uint32_t first;    /* first data cluster, 0 = empty file */
     uint32_t dir_clus; /* first cluster of the directory holding our entry (0 for the root) */
     uint32_t ent_off;  /* byte offset of our short entry in that directory */
+    uint32_t at, at_idx; /* the cluster last read or written and its place in the chain (at 0: none) */
 };
 
 struct fat_dirent {
@@ -196,6 +197,45 @@ static void chain_free(struct fat_fs *fs, uint32_t c) {
 static uint32_t chain_nth(struct fat_fs *fs, uint32_t c, uint64_t n) {
     while (n-- && clus_valid(fs, c)) c = fat_get(fs, c);
     return clus_valid(fs, c) ? c : 0;
+}
+
+/* Link count free clusters after last (0: they make a new chain, whose start goes to *first).
+   Each is marked the chain's end before the one before it names it, and each FAT sector is
+   written once per run of entries in it. Out of space, the chain keeps what it got. */
+static int chain_grow(struct fat_fs *fs, uint32_t last, uint64_t count, uint32_t *first) {
+    uint64_t have = 0, pending = 0;
+    uint32_t start = clus_valid(fs, fs->free_hint) ? fs->free_hint : 2, c = start;
+    int err = 0;
+    while (have < count && !err) {
+        if (fat_get(fs, c) == 0) {
+            err = fat_put(fs, c, 0x0FFFFFFF, &pending);
+            if (!err && last) err = fat_put(fs, last, c, &pending);
+            else if (!err) *first = c;
+            if (!err) {
+                last = c;
+                have++;
+            }
+        }
+        if (++c >= fs->nclus + 2) c = 2;
+        if (c == start && have < count && !err) err = -N_ERR_NO_SPACE;
+    }
+    int put = fat_put_end(fs, &pending);
+    fs->free_hint = c;
+    return err ? err : put;
+}
+
+/* How many clusters from c on (at most max) follow each other on the disk; *next gets the
+   chain's cluster after them (0: none). One transfer moves them all. */
+#define RUN_SECTORS 65536u
+static uint32_t clus_run(struct fat_fs *fs, uint32_t c, uint64_t max, uint32_t *next) {
+    uint32_t run = 1, after = fat_get(fs, c);
+    max = MIN(max, (uint64_t)(RUN_SECTORS / fs->spc));
+    while (run < max && after == c + run) {
+        run++;
+        after = fat_get(fs, after);
+    }
+    *next = clus_valid(fs, after) ? after : 0;
+    return run;
 }
 
 /* ---------------------------------------------------------------- directories */
@@ -419,26 +459,66 @@ static int node_sync(struct vnode *v) {
 
 /* ---------------------------------------------------------------- vnode ops */
 
+/* The idx-th cluster of a document's chain, walked from the one last used when that lies before
+   it, so reading or writing a long document in order stays linear. A shorter chain: 0, with its
+   length in *len and its last cluster in *last (when asked). */
+static uint32_t node_cluster(struct fat_node *n, uint64_t idx, uint64_t *len, uint32_t *last) {
+    struct fat_fs *fs = n->fs;
+    uint32_t c = n->first, prev = 0;
+    uint64_t i = 0;
+    if (n->at && n->at_idx <= idx) {
+        c = n->at;
+        i = n->at_idx;
+    }
+    for (; clus_valid(fs, c) && i < idx; i++) {
+        prev = c;
+        c = fat_get(fs, c);
+    }
+    if (clus_valid(fs, c)) {
+        n->at = c;
+        n->at_idx = (uint32_t)i;
+        return c;
+    }
+    if (len) *len = i;
+    if (last) *last = prev;
+    return 0;
+}
+
+/* Go on to next, the chain's idx-th cluster (0: the chain ended before it). */
+static uint32_t node_step(struct fat_node *n, uint32_t next, uint64_t idx) {
+    if (!next) return 0;
+    n->at = next;
+    n->at_idx = (uint32_t)idx;
+    return next;
+}
+
 static int64_t fat_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t len) {
     struct fat_node *n = v->priv;
     struct fat_fs *fs = n->fs;
     if (off >= v->size) return 0;
     if (len > v->size - off) len = v->size - off; /* off + len could wrap */
-    uint8_t *tmp = kmalloc(fs->cbytes);
-    if (!tmp) return -N_ERR_NO_MEMORY;
-    uint32_t c = chain_nth(fs, n->first, off / fs->cbytes);
+    uint8_t *tmp = NULL;
+    uint64_t idx = off / fs->cbytes;
+    uint32_t c = node_cluster(n, idx, NULL, NULL), next;
     size_t done = 0;
     while (done < len && c) {
         uint32_t in = (uint32_t)((off + done) % fs->cbytes);
-        size_t take = MIN(len - done, (size_t)(fs->cbytes - in));
-        if (in == 0 && take == fs->cbytes) {
-            if (clus_read(fs, c, (uint8_t *)buf + done) < 0) break;
+        if (in == 0 && len - done >= fs->cbytes) {
+            uint32_t run = clus_run(fs, c, (len - done) / fs->cbytes, &next);
+            if (disk_read(fs, clus_lba(fs, c), run * fs->spc, (uint8_t *)buf + done) < 0) break;
+            done += (size_t)run * fs->cbytes;
+            idx += run;
         } else {
+            size_t take = MIN(len - done, (size_t)(fs->cbytes - in));
+            if (!tmp && !(tmp = kmalloc(fs->cbytes))) break;
             if (clus_read(fs, c, tmp) < 0) break;
             memcpy((uint8_t *)buf + done, tmp + in, take);
+            done += take;
+            next = done < len ? fat_get(fs, c) : 0;
+            next = clus_valid(fs, next) ? next : 0;
+            idx++;
         }
-        done += take;
-        if (done < len) c = chain_nth(fs, c, 1);
+        c = done < len ? node_step(n, next, idx) : 0;
     }
     kfree(tmp);
     return done ? (int64_t)done : -N_ERR_IO;
@@ -452,56 +532,47 @@ static int64_t fat_store(struct vnode *v, const void *buf, uint64_t off, uint64_
     struct fat_fs *fs = n->fs;
     if (!len) return 0;
     if (off + len > 0xFFFFFFFFull) return -N_ERR_NO_SPACE; /* FAT32 file size limit */
-    uint64_t need = (off + len + fs->cbytes - 1) / fs->cbytes;
-    /* grow the chain to cover the write */
-    uint64_t have = 0;
-    uint32_t last = 0;
-    /* Count only as far as this write needs: a damaged, circular chain must not hang the count. */
-    for (uint32_t c = n->first; clus_valid(fs, c) && have < need; c = fat_get(fs, c)) {
-        have++;
-        last = c;
-    }
-    while (have < need) {
-        uint32_t c = clus_alloc(fs, last, false);
-        if (!c) return -N_ERR_NO_SPACE;
-        if (!n->first) n->first = c;
-        last = c;
-        have++;
-    }
-    uint8_t *tmp = kmalloc(fs->cbytes);
-    if (!tmp) return -N_ERR_NO_MEMORY;
-    uint32_t c = chain_nth(fs, n->first, off / fs->cbytes);
-    uint64_t done = 0;
+    uint64_t need = (off + len + fs->cbytes - 1) / fs->cbytes, have;
+    uint32_t last;
     int err = 0;
-    bool zeroed = false;
-    while (done < len && c) {
+    /* Walk only as far as this write needs: a damaged, circular chain must not hang it. */
+    if (!node_cluster(n, need - 1, &have, &last) && (err = chain_grow(fs, last, need - have, &n->first)))
+        return err;
+    uint8_t *tmp = NULL;
+    uint64_t idx = off / fs->cbytes, done = 0;
+    uint32_t c = node_cluster(n, idx, NULL, NULL), next;
+    while (done < len && c && !err) {
         uint32_t in = (uint32_t)((off + done) % fs->cbytes);
-        size_t take = (size_t)MIN(len - done, (uint64_t)(fs->cbytes - in));
-        if (in == 0 && take == fs->cbytes) {
-            if (buf) err = clus_write(fs, c, (const uint8_t *)buf + done);
-            else {
-                if (!zeroed) memset(tmp, 0, fs->cbytes);
-                zeroed = true;
-                err = clus_write(fs, c, tmp);
-            }
+        if (buf && in == 0 && len - done >= fs->cbytes) {
+            uint32_t run = clus_run(fs, c, (len - done) / fs->cbytes, &next);
+            if ((err = disk_write(fs, clus_lba(fs, c), run * fs->spc, (const uint8_t *)buf + done))) break;
+            done += (uint64_t)run * fs->cbytes;
+            idx += run;
         } else {
-            zeroed = false;
-            err = clus_read(fs, c, tmp);
+            size_t take = (size_t)MIN(len - done, (uint64_t)(fs->cbytes - in));
+            if (!tmp && !(tmp = kmalloc(fs->cbytes))) {
+                err = -N_ERR_NO_MEMORY;
+                break;
+            }
+            if (take < fs->cbytes) err = clus_read(fs, c, tmp);
             if (!err) {
                 if (buf) memcpy(tmp + in, (const uint8_t *)buf + done, take);
                 else memset(tmp + in, 0, take);
                 err = clus_write(fs, c, tmp);
             }
+            if (err) break;
+            done += take;
+            next = done < len ? fat_get(fs, c) : 0;
+            next = clus_valid(fs, next) ? next : 0;
+            idx++;
         }
-        if (err) break;
-        done += take;
-        if (done < len) c = chain_nth(fs, c, 1);
+        c = done < len ? node_step(n, next, idx) : 0;
     }
     kfree(tmp);
     if (off + done > v->size) v->size = off + done;
     v->mtime = time_now();
     node_sync(v);
-    return done ? (int64_t)done : -N_ERR_IO;
+    return done ? (int64_t)done : err ? err : -N_ERR_IO;
 }
 
 static int64_t fat_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t len) {
@@ -532,9 +603,9 @@ static int fat_truncate(struct vnode *v, uint64_t size) {
     int err = 0;
     if (keep == 0) {
         rest = n->first;
-        n->first = 0;
+        n->first = n->at = 0;
     } else {
-        uint32_t c = chain_nth(fs, n->first, keep - 1);
+        uint32_t c = node_cluster(n, keep - 1, NULL, NULL); /* the remembered place stays in the chain */
         if (c) {
             rest = fat_get(fs, c);
             err = fat_set(fs, c, 0x0FFFFFFF);
@@ -640,13 +711,20 @@ static void make_short(const uint8_t *buf, uint32_t len, const char *name, uint8
 
 /* Write a long-name run and short entry for name into dir. The short entry
    copies tmpl's attributes, first cluster, size and times. */
-static int dir_insert(struct vnode *dir, const char *name, const struct fat_dirent *tmpl, struct entry *out) {
-    struct fat_node *dn = dir->priv;
-    struct fat_fs *fs = dn->fs;
+static int name_check(const char *name) {
     size_t nl = strlen(name);
     if (!nl || nl >= NAME_MAX_LEN) return -N_ERR_NAME_TOO_LONG;
     for (const char *p = name; *p; p++)
         if (strchr("\\/:*?\"<>|", *p) || (uint8_t)*p < 32) return -N_ERR_INVALID;
+    return 0;
+}
+
+static int dir_insert(struct vnode *dir, const char *name, const struct fat_dirent *tmpl, struct entry *out) {
+    struct fat_node *dn = dir->priv;
+    struct fat_fs *fs = dn->fs;
+    size_t nl = strlen(name);
+    int bad = name_check(name);
+    if (bad) return bad;
     uint32_t first = dir_first(dir);
     uint32_t len;
     uint8_t *buf = dir_load(fs, first, &len);
@@ -818,41 +896,93 @@ static int fat_create(struct vnode *dir, const char *name, int type, struct vnod
     return 0;
 }
 
-/* Replace a document's content: the new bytes go into a fresh cluster chain, which reaches the
-   medium before one directory-sector write switches the entry to it; the old chain is freed only
-   once that switch is on the medium too. A failure at any point leaves the old content in place. */
-static int fat_replace(struct vnode *v, uint8_t *data, uint64_t size) {
-    struct fat_node *n = v->priv;
-    struct fat_fs *fs = n->fs;
-    struct fat_node staged = {.fs = fs};
-    struct vnode tmp;
-    memset(&tmp, 0, sizeof tmp);
-    tmp.type = VT_FILE;
-    tmp.unlinked = true; /* no directory entry to sync */
-    tmp.ops = &fat_ops;
-    tmp.priv = &staged;
-    int64_t r = size ? fat_store(&tmp, data, 0, size) : 0;
-    kfree(data);
-    int err = r < 0 ? (int)r : (uint64_t)r < size ? -N_ERR_IO : 0;
-    if ((err = persist(fs, err))) {
-        chain_free(fs, staged.first);
-        return persist(fs, err);
+/* An unpublished version: a cluster chain no entry names yet, written like any document. */
+static struct vnode_ops fat_stage_ops;
+static void fat_release(struct vnode *v);
+
+static int fat_stage(struct vnode *dir, const char *name, struct vnode **out) {
+    int bad = name_check(name);
+    if (bad) return bad;
+    struct vnode *v = kzalloc(sizeof *v);
+    struct fat_node *n = kzalloc(sizeof *n);
+    if (!v || !n) {
+        kfree(v);
+        kfree(n);
+        return -N_ERR_NO_MEMORY;
     }
-    uint32_t old = n->first;
-    uint64_t old_size = v->size;
-    int64_t old_mtime = v->mtime;
-    n->first = staged.first;
-    v->size = size;
+    n->fs = ((struct fat_node *)dir->priv)->fs;
+    strlcpy(v->name, name, sizeof v->name);
+    v->type = VT_FILE;
+    v->mode = 0644;
     v->mtime = time_now();
-    if ((err = persist(fs, node_sync(v)))) {
-        n->first = old;
-        v->size = old_size;
-        v->mtime = old_mtime;
-        node_sync(v);
-        return persist(fs, err); /* the new chain is left unused: the entry may name it already */
+    v->ops = &fat_stage_ops;
+    v->priv = n;
+    v->unlinked = true; /* no directory entry to sync; freed with its last handle */
+    v->staged = true;
+    v->parent = dir;
+    vnode_ref(dir);
+    *out = v;
+    return 0;
+}
+
+/* The staged chain reaches the medium before one directory-sector write makes the entry name it
+   (a new entry, or the document's switched from its old chain); the old chain is freed only once
+   that switch is on the medium too. A failure at any point leaves the old content in place. */
+static int fat_publish(struct vnode *s) {
+    struct fat_node *sn = s->priv;
+    struct fat_fs *fs = sn->fs;
+    struct vnode *dir = s->parent;
+    if (dir->unlinked) return -N_ERR_NOT_FOUND;
+    if (s->size && !sn->first) return -N_ERR_IO; /* a publish that failed midway lost it */
+    int err = persist(fs, 0);
+    if (err) return err;
+    struct vnode *v = fat_lookup(dir, s->name);
+    if (v && v->type != VT_FILE) return -N_ERR_IS_FOLDER;
+    if (!v) {
+        struct fat_dirent tmpl;
+        memset(&tmpl, 0, sizeof tmpl);
+        tmpl.attr = ATTR_ARCH;
+        tmpl.clus_hi = (uint16_t)(sn->first >> 16);
+        tmpl.clus_lo = (uint16_t)sn->first;
+        tmpl.size = (uint32_t)s->size;
+        fat_time(time_now(), &tmpl);
+        tmpl.cdate = tmpl.adate = tmpl.mdate;
+        tmpl.ctime = tmpl.mtime;
+        struct entry ne;
+        if ((err = persist(fs, dir_insert(dir, s->name, &tmpl, &ne)))) return err;
+        if ((v = node_get(fs, dir == fs->root ? 0 : dir_first(dir), &ne))) v->parent = dir;
+    } else {
+        struct fat_node *n = v->priv;
+        uint32_t old = n->first;
+        uint64_t old_size = v->size;
+        int64_t old_mtime = v->mtime;
+        n->first = sn->first;
+        n->at = 0;
+        v->size = s->size;
+        v->mtime = time_now();
+        if ((err = persist(fs, node_sync(v)))) {
+            n->first = old;
+            v->size = old_size;
+            v->mtime = old_mtime;
+            node_sync(v);
+            /* The staged chain is left unused, never freed: the entry may name it already. The
+               version is lost with it, and publishing it again fails (a size with no chain). */
+            sn->first = sn->at = 0;
+            return persist(fs, err);
+        }
+        chain_free(fs, old);
+        if ((err = persist(fs, 0))) return err;
     }
-    chain_free(fs, old);
-    return persist(fs, 0);
+    sn->first = sn->at = 0;
+    s->size = 0;
+    s->staged = false;
+    return 0;
+}
+
+static void fat_stage_release(struct vnode *v) {
+    struct vnode *dir = v->parent;
+    fat_release(v);
+    vnode_unref(dir);
 }
 
 /* Rename or move within one volume: the new entry is written first, then the
@@ -969,28 +1099,14 @@ int fat_reserve(struct vnode *v, uint64_t size) {
     struct fat_node *n = v->priv;
     struct fat_fs *fs = n->fs;
     if (n->first || size > 0xFFFFFFFFull) return -N_ERR_INVALID;
-    uint64_t need = (size + fs->cbytes - 1) / fs->cbytes, have = 0, pending = 0;
-    uint32_t prev = 0, start = clus_valid(fs, fs->free_hint) ? fs->free_hint : 2, c = start;
-    int err = 0;
-    while (have < need && !err) {
-        if (fat_get(fs, c) == 0) {
-            if (prev) err = fat_put(fs, prev, c, &pending);
-            else n->first = c;
-            if (!err) err = fat_put(fs, c, 0x0FFFFFFF, &pending);
-            prev = c;
-            have++;
-        }
-        if (++c >= fs->nclus + 2) c = 2;
-        if (c == start && have < need) err = -N_ERR_NO_SPACE;
-    }
-    if (!err) err = fat_put_end(fs, &pending);
-    else fat_put_end(fs, &pending);
+    uint32_t first = 0;
+    int err = chain_grow(fs, 0, (size + fs->cbytes - 1) / fs->cbytes, &first);
     if (err) {
-        chain_free(fs, n->first);
-        n->first = 0;
+        chain_free(fs, first);
         return err;
     }
-    fs->free_hint = c;
+    n->first = first;
+    n->at = 0;
     v->size = size;
     v->mtime = time_now();
     return persist(fs, node_sync(v));
@@ -1035,10 +1151,19 @@ static struct vnode_ops fat_ops = {
     .create = fat_create,
     .unlink = fat_unlink,
     .truncate = fat_truncate,
-    .replace = fat_replace,
+    .stage = fat_stage,
     .move = fat_move,
     .sync = fat_sync,
     .release = fat_release,
+};
+
+static struct vnode_ops fat_stage_ops = {
+    .read = fat_read,
+    .write = fat_write,
+    .truncate = fat_truncate,
+    .sync = fat_sync,
+    .publish = fat_publish,
+    .release = fat_stage_release,
 };
 
 /* ---------------------------------------------------------------- mounting */

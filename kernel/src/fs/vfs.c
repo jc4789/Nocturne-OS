@@ -232,7 +232,10 @@ static int64_t file_read(struct file *f, void *buf, size_t n, bool user) {
     else {
         /* Cap the request at the current EOF under the shared-offset
            reservation; even a later size change cannot enlarge this request. */
-        if (user && v->type == VT_FILE) n = f->off < v->size ? MIN(n, v->size - f->off) : 0;
+        if (user && v->type == VT_FILE) {
+            uint64_t size = vfs_file_size(f);
+            n = f->off < size ? MIN(n, size - f->off) : 0;
+        }
         r = user && !user_ok_w(buf, n) ? -N_ERR_BAD_ADDRESS : v->ops->read(v, f, buf, f->off, n);
     }
     if (r > 0 && (v->type == VT_FILE)) f->off += r;
@@ -331,7 +334,7 @@ void vfs_close(struct file *f) {
     struct vnode *v = f->vn;
     /* Callers that must hear of a failure commit first (vfs_document_commit); a handle that
        is simply dropped still leaves its writes durable. */
-    if (f->written && !file_io_begin(f)) { file_sync(f); file_io_end(f); }
+    if (f->written && !v->staged && !file_io_begin(f)) { file_sync(f); file_io_end(f); }
     vfs_lease(f, false);
     if (v->ops && v->ops->close) v->ops->close(v, f);
     vnode_unref(v);
@@ -400,7 +403,7 @@ int vfs_read_whole(const char *path, uint8_t **data, uint64_t *size) {
         vfs_close(f);
         return -N_ERR_IS_FOLDER;
     }
-    uint64_t sz = f->vn->size;
+    uint64_t sz = vfs_file_size(f);
     uint8_t *buf = kmalloc(sz + 1);
     if (!buf) {
         vfs_close(f);
@@ -474,18 +477,17 @@ int vfs_document_open(const char *path, int access, struct file **out) {
     case N_DOCUMENT_EDIT: r = existing_document(path, &v); break;
     case N_DOCUMENT_CREATE: r = create_document(path, &v); break;
     case N_DOCUMENT_REPLACE: {
-        /* The staged content lives in memory until the handle is closed with
-           n_handle_close; an app that ends first leaves the old document. */
+        /* An unpublished version on the document's own volume, published when the handle is
+           closed with n_handle_close; an app that ends first leaves the old document. */
         struct vnode *old = vfs_lookup(path);
         char leaf[NAME_MAX_LEN];
         struct vnode *dir = lookup_parent(path, leaf);
         if (old && old->type == VT_DIR) return -N_ERR_IS_FOLDER;
         if (old && old->type != VT_FILE) return -N_ERR_WRONG_KIND;
-        if (!old && (!dir || !leaf[0])) return -N_ERR_NOT_FOUND;
-        if (!old && dir->type != VT_DIR) return -N_ERR_NOT_FOLDER;
-        if (!(old ? old->ops : dir->ops)->replace) return -N_ERR_UNSUPPORTED;
-        v = ramfs_replace_new(path);
-        r = v ? 0 : -N_ERR_NO_MEMORY;
+        if (!dir || !leaf[0]) return -N_ERR_NOT_FOUND;
+        if (dir->type != VT_DIR) return -N_ERR_NOT_FOLDER;
+        if (!dir->ops->stage) return -N_ERR_UNSUPPORTED;
+        r = dir->ops->stage(dir, leaf, &v);
         break;
     }
     default: return -N_ERR_INVALID;
@@ -493,7 +495,7 @@ int vfs_document_open(const char *path, int access, struct file **out) {
     if (r < 0) return r;
     struct file *f = vfs_open_vnode(v, flags);
     if (!f) {
-        if (ramfs_is_replace(v)) v->ops->release(v);
+        if (v->staged) v->ops->release(v);
         return -N_ERR_NO_MEMORY;
     }
     *out = f;
@@ -509,7 +511,8 @@ int64_t vfs_document_read_user(struct file *f, uint64_t off, void *buf, size_t n
     if (!v->ops->read) return -N_ERR_UNSUPPORTED;
     int error = file_io_begin(f);
     if (error) return error;
-    n = off < v->size ? MIN(n, v->size - off) : 0;
+    uint64_t size = vfs_file_size(f);
+    n = off < size ? MIN(n, size - off) : 0;
     int64_t r = !n ? 0 : !user_ok_w(buf, n) ? -N_ERR_BAD_ADDRESS : v->ops->read(v, f, buf, off, n);
     file_io_end(f);
     return r;
@@ -533,26 +536,37 @@ int64_t vfs_document_write_user(struct file *f, uint64_t off, const void *buf, s
     return r;
 }
 
-/* A REPLACE handle swaps its staged content in; an EDIT handle's writes become durable. */
 int vfs_document_commit(struct file *f) {
-    if (f->vn->type != VT_FILE) return 0;
+    struct vnode *v = f->vn;
+    if (v->type != VT_FILE) return 0;
     int error = file_io_begin(f);
     if (error) return error;
-    error = ramfs_is_replace(f->vn) ? ramfs_replace_commit(f->vn) : file_sync(f);
+    if (v->staged) {
+        error = v->ops->publish(v);
+        /* Published: the version is the document's now, and this handle (and its duplicates)
+           has nothing left to write. */
+        if (!error) f->flags = (f->flags & ~O_ACCMODE) | O_RDONLY;
+        f->written = false;
+    } else {
+        error = file_sync(f);
+    }
     file_io_end(f);
     return error;
 }
 
-int vfs_replace(const char *path, uint8_t *data, uint64_t size) {
-    struct vnode *v = vfs_lookup(path);
-    int r = 0;
-    if (!v) r = create_document(path, &v);
-    else if (v->type == VT_DIR) r = -N_ERR_IS_FOLDER;
-    else if (v->type != VT_FILE) r = -N_ERR_WRONG_KIND;
-    else if (!v->ops->replace) r = -N_ERR_UNSUPPORTED;
-    if (r < 0) { kfree(data); return r; }
-    if (!v->ops->replace) { kfree(data); return -N_ERR_UNSUPPORTED; }
-    return v->ops->replace(v, data, size);
+int vfs_save_user(const char *path, const void *udata, uint64_t size) {
+    struct file *f;
+    int r = vfs_document_open(path, N_DOCUMENT_REPLACE, &f);
+    if (r < 0) return r;
+    int64_t n = vfs_document_write_user(f, 0, udata, size);
+    r = n < 0 ? (int)n : (uint64_t)n < size ? -N_ERR_NO_SPACE : vfs_document_commit(f);
+    vfs_close(f);
+    return r;
+}
+
+uint64_t vfs_file_size(struct file *f) {
+    struct vnode *v = f->vn;
+    return v->ops && v->ops->size ? v->ops->size(v, f) : v->size;
 }
 
 /* Log-style append of user bytes. The document's claim is held from taking
@@ -618,13 +632,27 @@ int vfs_move(const char *from, const char *to) {
         int moved = from_dir->ops->move(from_dir, from_leaf, to_dir, to_leaf);
         if (moved != -N_ERR_UNSUPPORTED) return moved;
     }
-    /* Another filesystem: a document is copied whole, then the original is
-       removed. A folder would need a recursive copy that could fail halfway. */
+    /* Another filesystem: a document is copied piece by piece into an unpublished version there,
+       published, then the original is removed. A folder would need a recursive copy that could
+       fail halfway. */
     if (v->type != VT_FILE) return -N_ERR_UNSUPPORTED;
-    uint8_t *data;
-    uint64_t size;
-    int r = vfs_read_whole(from, &data, &size);
+    struct file *src, *dst;
+    int r = vfs_open(from, O_RDONLY, &src);
     if (r < 0) return r;
-    r = vfs_replace(to, data, size);
+    if ((r = vfs_document_open(to, N_DOCUMENT_REPLACE, &dst)) < 0) {
+        vfs_close(src);
+        return r;
+    }
+    enum { PIECE = 256 * 1024 };
+    uint8_t *buf = kmalloc(PIECE);
+    r = buf ? 0 : -N_ERR_NO_MEMORY;
+    for (int64_t n; !r && (n = vfs_read(src, buf, PIECE)) != 0;) {
+        int64_t w = n < 0 ? n : vfs_write(dst, buf, (size_t)n);
+        r = w < 0 ? (int)w : w < n ? -N_ERR_NO_SPACE : 0;
+    }
+    kfree(buf);
+    if (!r) r = vfs_document_commit(dst);
+    vfs_close(dst);
+    vfs_close(src);
     return r < 0 ? r : vfs_unlink(from);
 }
