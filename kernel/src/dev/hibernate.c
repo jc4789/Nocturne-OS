@@ -216,7 +216,7 @@ static int disk_at(uint64_t off, void *buf, uint64_t len, bool write) {
     return left ? -N_ERR_IO : 0;
 }
 
-static bool disk_flush(void) { return !h.disk->flush || h.disk->flush(h.disk) >= 0; }
+static bool disk_flush(void) { return blk_persist(h.disk) >= 0; }
 
 /* ---- memory set aside ---- */
 static void *nosave_pages(uint64_t n) {

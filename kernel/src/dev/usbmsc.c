@@ -311,7 +311,8 @@ static void probe_lun(struct msc *m, unsigned lun) {
     l->blk.sectors = blocks * (block / 512);
     l->blk.read = msc_read;
     l->blk.write = msc_write;
-    l->blk.flush = msc_flush;
+    l->blk.persist = msc_flush;
+    l->blk.block = block;
     l->blk.priv = l;
     blk_register(&l->blk);
 }

@@ -255,6 +255,7 @@ static int64_t file_write(struct file *f, const void *buf, size_t n, bool user) 
     if (r > 0 && v->type == VT_FILE) {
         f->off += r;
         v->mtime = time_now();
+        f->written = true;
     }
     file_io_end(f);
     return r;
@@ -274,8 +275,17 @@ int vfs_truncate(struct file *f, uint64_t size) {
     if (error) return error;
     error = v->ops->truncate(v, size);
     if (!error) v->mtime = time_now();
+    if (!error) f->written = true;
     file_io_end(f);
     return error;
+}
+
+/* Wait until what was written through f is on the medium. Caller holds f's I/O claim. */
+static int file_sync(struct file *f) {
+    struct vnode *v = f->vn;
+    if (!f->written || !v->ops->sync) return 0;
+    f->written = false;
+    return v->ops->sync(v);
 }
 
 static int vfs_lease_mode(struct file *f, bool acquire, bool blocking) {
@@ -319,6 +329,9 @@ void vfs_close(struct file *f) {
     /* The last close callback can drain audio and sleep. Reference ownership,
        not an IRQ-disabled driver invocation, keeps this detached file alive. */
     struct vnode *v = f->vn;
+    /* Callers that must hear of a failure commit first (vfs_document_commit); a handle that
+       is simply dropped still leaves its writes durable. */
+    if (f->written && !file_io_begin(f)) { file_sync(f); file_io_end(f); }
     vfs_lease(f, false);
     if (v->ops && v->ops->close) v->ops->close(v, f);
     vnode_unref(v);
@@ -411,6 +424,7 @@ int vfs_write_whole(const char *path, const void *data, uint64_t size) {
     int r = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC, &f);
     if (r < 0) return r;
     int64_t n = vfs_write(f, data, size);
+    if (n >= 0) n = vfs_document_commit(f);
     vfs_close(f);
     return n < 0 ? (int)n : 0;
 }
@@ -511,16 +525,20 @@ int64_t vfs_document_write_user(struct file *f, uint64_t off, const void *buf, s
     int error = file_io_begin(f);
     if (error) return error;
     int64_t r = !user_ok(buf, n) ? -N_ERR_BAD_ADDRESS : v->ops->write(v, f, buf, off, n);
-    if (r > 0) v->mtime = time_now();
+    if (r > 0) {
+        v->mtime = time_now();
+        f->written = true;
+    }
     file_io_end(f);
     return r;
 }
 
+/* A REPLACE handle swaps its staged content in; an EDIT handle's writes become durable. */
 int vfs_document_commit(struct file *f) {
-    if (!ramfs_is_replace(f->vn)) return 0;
+    if (f->vn->type != VT_FILE) return 0;
     int error = file_io_begin(f);
     if (error) return error;
-    error = ramfs_replace_commit(f->vn);
+    error = ramfs_is_replace(f->vn) ? ramfs_replace_commit(f->vn) : file_sync(f);
     file_io_end(f);
     return error;
 }
@@ -550,6 +568,7 @@ int vfs_append_user(const char *path, const void *data, uint64_t size) {
     if (!f) return -N_ERR_NO_MEMORY;
     int64_t n = vfs_lease(f, true);
     if (!n) n = vfs_write_user(f, data, size);
+    if (n >= 0) { int s = vfs_document_commit(f); if (s < 0) n = s; }
     vfs_close(f); /* releases the claim */
     return n < 0 ? (int)n : (uint64_t)n < size ? -N_ERR_NO_SPACE : 0;
 }

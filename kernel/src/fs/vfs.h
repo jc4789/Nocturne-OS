@@ -53,6 +53,9 @@ struct vnode_ops {
     int (*replace)(struct vnode *v, uint8_t *data, uint64_t size);
     /* Rename/move an entry within one filesystem; the target name must be free. */
     int (*move)(struct vnode *from_dir, const char *from, struct vnode *to_dir, const char *to);
+    /* What was written to v is on the medium when this returns (a written document's handle is
+       closed). NULL: nothing to wait for, as in memory. */
+    int (*sync)(struct vnode *v);
     bool (*can_read)(struct vnode *v, struct file *f);
     bool (*can_write)(struct vnode *v, struct file *f);
     bool (*hangup)(struct vnode *v, struct file *f);
@@ -91,6 +94,7 @@ struct file {
     int refs;
     void *priv;
     bool io_busy;
+    bool written;              /* a document changed through it since its last sync */
     struct wait_queue io_wait; /* regular-file shared offset; device directions stay independent */
     struct event_watch *watchers; /* event-queue watches on this handle, dropped at the last close */
 };

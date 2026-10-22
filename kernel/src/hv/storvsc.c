@@ -172,16 +172,19 @@ static int rw(struct scsi_disk *d, uint64_t lba, uint32_t count, uint8_t *buf, b
         lba += n;
         count -= n;
     }
-    if (write) { /* SYNCHRONIZE CACHE: make sure it reaches the virtual disk before we report success */
-        uint8_t cdb[10] = {0x35};
-        return scsi(s, d->lun, cdb, 10, DIR_NONE, 0);
-    }
     return 0;
 }
 
 static int blk_scsi_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) { return rw(b->priv, lba, n, buf, false); }
 static int blk_scsi_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf) {
     return rw(b->priv, lba, n, (uint8_t *)buf, true);
+}
+
+/* SYNCHRONIZE CACHE(10) (SBC): what was written reaches the virtual disk. */
+static int blk_scsi_persist(struct blkdev *b) {
+    struct scsi_disk *d = b->priv;
+    uint8_t cdb[10] = {0x35};
+    return scsi(d->hba, d->lun, cdb, 10, DIR_NONE, 0);
 }
 
 static void probe_lun(struct storvsc *s, uint8_t lun) {
@@ -213,6 +216,7 @@ static void probe_lun(struct storvsc *s, uint8_t lun) {
     d->blk.sectors = last + 1;
     d->blk.read = blk_scsi_read;
     d->blk.write = blk_scsi_write;
+    d->blk.persist = blk_scsi_persist;
     d->blk.priv = d;
     blk_register(&d->blk);
 }

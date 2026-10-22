@@ -311,17 +311,22 @@ static int flush(struct ns *s) {
     return command(s->c, &s->c->io, cmd, IO_MS, NULL) ? -1 : 0;
 }
 
-/* 512-byte sectors on top of the namespace's logical blocks; larger blocks are read, patched and
-   written back when a request covers them only partly. */
-static int rw(struct ns *s, bool write, uint64_t lba, uint32_t count, uint8_t *p) {
-    struct nvme *c = s->c;
-    if (lba + count > s->blk.sectors) return -N_ERR_IO;
+/* The controller for one request: back from a sleep, it is enabled again first. */
+static void lock_awake(struct nvme *c) {
     lock(c);
     if (c->woke) {
         c->woke = false;
         if (enable(c)) kprintf("nvme%d: ready again after sleep\n", c->index);
         else kprintf("nvme%d: did not come back after sleep\n", c->index);
     }
+}
+
+/* 512-byte sectors on top of the namespace's logical blocks; larger blocks are read, patched and
+   written back when a request covers them only partly. */
+static int rw(struct ns *s, bool write, uint64_t lba, uint32_t count, uint8_t *p) {
+    struct nvme *c = s->c;
+    if (lba + count > s->blk.sectors) return -N_ERR_IO;
+    lock_awake(c);
     int result = -N_ERR_IO;
     unsigned per = s->block / 512, most = c->max_xfer / s->block;
     while (count) {
@@ -343,8 +348,7 @@ static int rw(struct ns *s, bool write, uint64_t lba, uint32_t count, uint8_t *p
         count -= take / 512;
         p += take;
     }
-    /* like the other disk drivers, a write is on the medium when it returns */
-    result = write && c->vwc && flush(s) < 0 ? -N_ERR_IO : 0;
+    result = 0;
 out:
     unlock(c);
     return result;
@@ -353,6 +357,15 @@ out:
 static int blk_nvme_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) { return rw(b->priv, false, lba, n, buf); }
 static int blk_nvme_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf) {
     return rw(b->priv, true, lba, n, (uint8_t *)buf);
+}
+
+/* Flush (NVMe base 7.1): the volatile write cache reaches the medium. */
+static int blk_nvme_persist(struct blkdev *b) {
+    struct ns *s = b->priv;
+    lock_awake(s->c);
+    int r = flush(s) < 0 ? -N_ERR_IO : 0;
+    unlock(s->c);
+    return r;
 }
 
 static void add_namespace(struct nvme *c, uint32_t nsid, const char *model) {
@@ -378,6 +391,8 @@ static void add_namespace(struct nvme *c, uint32_t nsid, const char *model) {
     s->blk.sectors = blocks * (s->block / 512);
     s->blk.read = blk_nvme_read;
     s->blk.write = blk_nvme_write;
+    if (c->vwc) s->blk.persist = blk_nvme_persist;
+    s->blk.block = s->block;
     s->blk.priv = s;
     blk_register(&s->blk);
 }

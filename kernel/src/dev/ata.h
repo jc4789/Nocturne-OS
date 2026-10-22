@@ -18,3 +18,4 @@ int ata_count(void);
 struct ata_disk *ata_get(int i);
 int ata_read(struct ata_disk *d, uint64_t lba, uint32_t count, void *buf);
 int ata_write(struct ata_disk *d, uint64_t lba, uint32_t count, const void *buf);
+int ata_flush(struct ata_disk *d);

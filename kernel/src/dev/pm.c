@@ -98,13 +98,8 @@ static void stop_apps(void) {
 
 static bool flush_disks(void) {
     bool ok = true;
-    for (int i = 0; i < blk_count(); i++) {
-        struct blkdev *d = blk_get(i);
-        if (d->flush && d->flush(d) < 0) {
-            kprintf("pm: %s: cache flush failed\n", d->name);
-            ok = false;
-        }
-    }
+    for (int i = 0; i < blk_count(); i++)
+        if (blk_persist(blk_get(i)) < 0) ok = false; /* blk logs it */
     return ok;
 }
 

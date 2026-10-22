@@ -99,6 +99,7 @@ static int blk_ata_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) {
 static int blk_ata_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf) {
     return ata_write(b->priv, lba, n, buf);
 }
+static int blk_ata_persist(struct blkdev *b) { return ata_flush(b->priv); }
 
 void ata_init(void) {
     probe(0x1F0, 0x3F6, false);
@@ -112,6 +113,7 @@ void ata_init(void) {
         b->sectors = disks[i].sectors;
         b->read = blk_ata_read;
         b->write = blk_ata_write;
+        b->persist = blk_ata_persist;
         b->priv = &disks[i];
         blk_register(b);
     }
@@ -181,9 +183,17 @@ int ata_write(struct ata_disk *d, uint64_t lba, uint32_t count, const void *buf)
         lba += n;
         count -= n;
     }
-    /* make sure it reaches the disk image before we report success */
+    return wait_not_busy(d) < 0 ? -N_ERR_IO : 0;
+}
+
+/* FLUSH CACHE (EXT): the drive's write cache reaches the medium (ATA8-ACS 7.10, 7.11). */
+int ata_flush(struct ata_disk *d) {
+    if (wait_not_busy(d) < 0) return -N_ERR_IO;
+    outb(d->io + REG_DRIVE, 0xA0 | (d->slave ? 0x10 : 0));
+    delay400(d->ctl);
     if (wait_not_busy(d) < 0) return -N_ERR_IO;
     outb(d->io + REG_COMMAND, d->lba48 ? 0xEA : 0xE7);
-    if (wait_not_busy(d) < 0) return -N_ERR_IO;
-    return 0;
+    delay400(d->ctl);
+    int s = wait_not_busy(d);
+    return s < 0 || s & (ST_ERR | ST_DF) ? -N_ERR_IO : 0;
 }
