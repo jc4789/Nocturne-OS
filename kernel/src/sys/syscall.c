@@ -1231,7 +1231,7 @@ static int64_t sys_handle_close(int h) {
     if (!f) return -N_ERR_NO_HANDLE;
     /* Only an explicit close commits a replacement: an app that ends with the
        handle open leaves the old document as it was. */
-    int committed = vfs_document_commit(f);
+    int committed = vfs_document_commit(f, N_COMMIT_WAIT);
     vfs_close(f);
     int closed = (int)handle_drop(h);
     return committed < 0 ? committed : closed;
@@ -1292,6 +1292,15 @@ static int64_t sys_document_claim(int h, bool claim, bool wait) {
     struct file *f = document_ref(h, &r);
     if (!f) return r;
     r = !claim ? vfs_lease(f, false) : wait ? vfs_lease(f, true) : vfs_try_lease(f);
+    vfs_close(f);
+    return r;
+}
+
+static int64_t sys_document_commit(int h, int how) {
+    int64_t r;
+    struct file *f = document_ref(h, &r);
+    if (!f) return r;
+    r = vfs_document_commit(f, how);
     vfs_close(f);
     return r;
 }
@@ -1977,6 +1986,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_DOCUMENT_RELEASE: ret = sys_document_claim((int)a, false, false); break;
     case SYS_DOCUMENT_SAVE: ret = sys_document_save((const char *)a, (const void *)b, c); break;
     case SYS_DOCUMENT_APPEND: ret = sys_document_append((const char *)a, (const void *)b, c); break;
+    case SYS_DOCUMENT_COMMIT: ret = sys_document_commit((int)a, (int)b); break;
     case SYS_ENTRY_INFO: ret = sys_entry_info((const char *)a, (struct n_entry *)b); break;
     case SYS_ENTRY_REMOVE: ret = sys_entry_remove((const char *)a); break;
     case SYS_ENTRY_MOVE: ret = sys_entry_move((const char *)a, (const char *)b); break;

@@ -6,6 +6,7 @@
 #include "dev/pm.h"
 #include "dev/acpi.h"
 #include "dev/blk.h"
+#include "fs/vfs.h"
 #include "dev/hibernate.h"
 #include "dev/iommu.h"
 #include "gui/wm.h"
@@ -117,6 +118,7 @@ const char *pm_quiesce_devices(bool stop_at_failure) {
 }
 
 static NORETURN void finish(enum pm_action action) {
+    vfs_sync();    /* what was saved reaches its volume first */
     flush_disks(); /* a disk that fails is logged: the power goes off all the same */
     if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
     cli();
@@ -239,6 +241,7 @@ static void sleep_now(bool hibernate) {
         return;
     }
     kprintf("pm: going to %s\n", hibernate ? "hibernate" : "sleep");
+    vfs_sync(); /* what was saved is on its volume, whatever becomes of the sleep */
     /* no transfer is cut off by the controllers losing their state, and after a snapshot nothing
        but the image reaches the disks */
     blk_hold();

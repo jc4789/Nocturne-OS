@@ -2,7 +2,7 @@
 #include "dev/audio.h"
 #include "sys/syscall.h"
 #include "arch/cpu.h"
-#include "fs/vfs.h"
+#include "fs/ramfs.h"
 #include "mm/heap.h"
 #include "sys/sched.h"
 #include "abi.h"

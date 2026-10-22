@@ -480,10 +480,11 @@ image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar $(BUILD)/data-blank.vhdx
 qemu-image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar
 	@bash scripts/mkimage.sh --raw-only
 
-# an empty 2 GiB data disk for Hyper-V (hyperv.ps1 copies it once; it is dynamic, so tiny on disk)
+# an empty 2 GiB disk for Hyper-V, where Nocturne makes the volume / lives on (hyperv.ps1 copies it
+# once; it is dynamic, so tiny on disk)
 $(BUILD)/data-blank.vhdx: scripts/mkdata.sh
 	@rm -f $(BUILD)/data-blank.img
-	@bash scripts/mkdata.sh $(BUILD)/data-blank.img 2048
+	@MKDATA_BLANK=1 bash scripts/mkdata.sh $(BUILD)/data-blank.img 2048
 	@qemu-img convert -f raw -O vhdx -o subformat=dynamic $(BUILD)/data-blank.img $@
 	@rm -f $(BUILD)/data-blank.img
 

@@ -2,7 +2,8 @@
 #include "kernel.h"
 #include "dev/entropy.h"
 #include "limine.h"
-#include "fs/vfs.h"
+#include "fs/ramfs.h"
+#include "fs/nos.h"
 #include "dev/input.h"
 #include "dev/fbcon.h"
 #include "dev/fb.h"
@@ -83,39 +84,18 @@ bool cmdline_number(const char *key, uint64_t *out) {
     return found;
 }
 
-/* Removes a RAM-root folder and everything below it. */
-static void remove_tree(char *path, size_t room) {
-    struct vnode *v = vfs_lookup(path);
-    if (!v) return;
-    if (v->type == VT_DIR) {
-        struct dirent *e = kmalloc(sizeof *e);
-        size_t len = strlen(path);
-        /* Always list from the start: each pass removes what it returned. */
-        while (e && vfs_folder_list(path, 0, e, 1) == 1) {
-            size_t name = strlen(e->name);
-            if (len + 1 + name + 1 > room) break;
-            path[len] = '/'; memcpy(path + len + 1, e->name, name + 1);
-            remove_tree(path, room);
-            bool gone = !vfs_lookup(path);
-            path[len] = 0;
-            if (!gone) break;
-        }
-        kfree(e);
-    }
-    vfs_unlink(path);
-}
-
 /* GPU firmware is large and only the driver of a present GPU reads it: the
-   RAM root keeps it only when such a display controller is on the bus. */
+   base keeps it only when such a display controller is on the bus (dropped
+   from the base, not removed by the user: docs/nosfs.md §8). */
 static void drop_absent_firmware(void) {
     for (int i = 0; i < pci_count(); i++) {
         struct pci_device *d = pci_at(i);
         if (d && d->vendor == 0x10DE && d->cls == 0x03) return;
     }
-    char path[PATH_MAX_LEN] = "/usr/share/firmware/nvidia";
-    if (!vfs_lookup(path)) return;
+    const char *path = "/usr/share/firmware/nvidia";
+    if (!ramfs_base_find(path)) return;
     uint64_t heap = heap_used_bytes(), free = pmm_free_pages();
-    remove_tree(path, sizeof path);
+    ramfs_base_remove(path);
     /* files copied into the heap shrink it, files read in place give archive pages back */
     int64_t gone = (int64_t)(heap - heap_used_bytes()) + (int64_t)((pmm_free_pages() - free) * PAGE_SIZE);
     kprintf("initrd: no NVIDIA display controller, firmware dropped (%ld MiB)\n", (long)(gone / 1048576));
@@ -126,8 +106,8 @@ void kmain_late(void) {
     prof_init();
     heap_trim_start();
     vfs_init();
-    vfs_mkdir("/home");
-    vfs_mkdir("/tmp");
+    struct vnode *tmp = ramfs_new_root(); /* emptied by every restart: never on the volume */
+    if (!tmp || vfs_mount("/tmp", tmp) < 0) panic("vfs: cannot mount /tmp");
     devfs_init();
     if (module_req.response && module_req.response->module_count) {
         struct limine_file *m = module_req.response->modules[0];
@@ -162,8 +142,11 @@ void kmain_late(void) {
     storvsc_init();
     nvme_init();
     usb_wait_settled(8000); /* USB disks present at boot can hold /data */
-    fat_mount_data();
-    hibernate_restore(); /* returns only when there is no image to go back to */
+    bool persistent = nos_attach(); /* the volume / is on, when one of Nocturne's disks has it */
+    fat_mount_data(persistent ? "/media/NOCTDATA" : "/data");
+    hibernate_restore(); /* returns only when there is no image to go back to; nothing was committed */
+    if (!vfs_lookup("/data")) vfs_mkdir("/data");
+    if (!vfs_lookup("/home")) vfs_mkdir("/home");
 
     bool gui = !cmdline_has("nogui");
     if (gui) wm_init();

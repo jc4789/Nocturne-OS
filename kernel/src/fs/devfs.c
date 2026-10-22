@@ -1,5 +1,5 @@
 /* Device nodes under /dev. */
-#include "fs/vfs.h"
+#include "fs/ramfs.h"
 #include "mm/heap.h"
 #include "arch/cpu.h"
 #include "dev/fbcon.h"
@@ -128,8 +128,8 @@ static void add_dev(struct vnode *dir, const char *name, struct vnode_ops *ops) 
 }
 
 void devfs_init(void) {
-    vfs_mkdir("/dev");
-    struct vnode *dev = vfs_lookup("/dev");
+    struct vnode *dev = ramfs_new_root(); /* a tree of its own: never recorded */
+    if (!dev || vfs_mount("/dev", dev) < 0) panic("devfs: cannot mount /dev");
     add_dev(dev, "null", &null_ops);
     add_dev(dev, "zero", &zero_ops);
     add_dev(dev, "random", &random_ops);

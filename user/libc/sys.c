@@ -224,6 +224,7 @@ n_result n_document_size(n_handle h) { return NC5(SYS_DOCUMENT_SIZE, h, 0, 0, 0,
 n_result n_document_set_size(n_handle h, uint64_t size) { return NC5(SYS_DOCUMENT_SET_SIZE, h, size, 0, 0, 0); }
 n_result n_document_claim(n_handle h, bool wait) { return NC5(SYS_DOCUMENT_CLAIM, h, wait, 0, 0, 0); }
 n_result n_document_release(n_handle h) { return NC5(SYS_DOCUMENT_RELEASE, h, 0, 0, 0, 0); }
+n_result n_document_commit(n_handle h, int how) { return NC5(SYS_DOCUMENT_COMMIT, h, how, 0, 0, 0); }
 n_result n_document_save(const char *path, const void *data, size_t size) {
     return NC5(SYS_DOCUMENT_SAVE, path, data, size, 0, 0);
 }

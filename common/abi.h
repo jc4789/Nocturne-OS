@@ -104,6 +104,7 @@ enum {
     SYS_SHARED_REVOKE, SYS_GPU_RENDER_LIST,
     SYS_CHANNEL_RECEIVE_FROM, SYS_SHARED_COMPOSE,
     SYS_PCI_HOLD_SCREEN, /* (pci, hold): no drawing to the boot screen in the function's BAR */
+    SYS_DOCUMENT_COMMIT, /* (document, N_COMMIT_*) */
     SYS_MAX = 192
 };
 
@@ -123,7 +124,13 @@ enum {
 #define N_DOCUMENT_READ 1     /* read an existing document */
 #define N_DOCUMENT_EDIT 2     /* read and write an existing document */
 #define N_DOCUMENT_CREATE 3   /* a new, empty document; N_ERR_EXISTS if the name is taken */
-#define N_DOCUMENT_REPLACE 4  /* new content, swapped in whole by n_handle_close */
+#define N_DOCUMENT_REPLACE 4  /* new content, swapped in whole when saved (or by n_handle_close) */
+
+/* n_document_commit: save the document (a REPLACE handle's version is published first and the
+   handle reads it from then on). */
+#define N_COMMIT_WAIT 1       /* until it is on the medium */
+#define N_COMMIT_START 2      /* return at once; N_EVENT_SAVED reports the outcome */
+#define N_COMMIT_RESULT 3     /* the last started save's outcome (N_ERR_NOT_READY: not yet) */
 
 /* An entry of a folder, or the entry a path names. Times are wall seconds. */
 struct n_entry {
@@ -165,6 +172,7 @@ struct n_launch {
 #define N_EVENT_APP_ENDED 8u
 #define N_EVENT_TIMER 16u
 #define N_EVENT_ADDRESS 32u    /* a watched memory word was notified */
+#define N_EVENT_SAVED 64u      /* a document save started with N_COMMIT_START has its outcome */
 struct n_event {
     uint64_t token;
     uint32_t events;

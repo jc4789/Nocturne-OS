@@ -50,6 +50,7 @@ n_result n_document_size(n_handle h);
 n_result n_document_set_size(n_handle h, uint64_t size); /* new bytes read as zero */
 n_result n_document_claim(n_handle h, bool wait);        /* N_ERR_NOT_READY when not waiting */
 n_result n_document_release(n_handle h);
+n_result n_document_commit(n_handle h, int how);         /* N_COMMIT_*: save it, now or in the background */
 n_result n_document_save(const char *path, const void *data, size_t size); /* whole and atomic */
 n_result n_document_append(const char *path, const void *data, size_t size);
 /* The whole document in fresh n_memory pages; free with n_memory_release(*data, *size). */

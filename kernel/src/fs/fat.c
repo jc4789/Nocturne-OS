@@ -619,7 +619,11 @@ static int fat_truncate(struct vnode *v, uint64_t size) {
     return persist(fs, 0);
 }
 
-static int fat_sync(struct vnode *v) { return persist(((struct fat_node *)v->priv)->fs, 0); }
+/* Writes go to the medium as they are made: a save waits for them there, and is done on return. */
+static int fat_save(struct vnode *v, uint64_t *ticket) {
+    *ticket = 0;
+    return persist(((struct fat_node *)v->priv)->fs, 0);
+}
 
 static uint32_t dir_first(struct vnode *dir) {
     struct fat_node *n = dir->priv;
@@ -928,7 +932,8 @@ static int fat_stage(struct vnode *dir, const char *name, struct vnode **out) {
 /* The staged chain reaches the medium before one directory-sector write makes the entry name it
    (a new entry, or the document's switched from its old chain); the old chain is freed only once
    that switch is on the medium too. A failure at any point leaves the old content in place. */
-static int fat_publish(struct vnode *s) {
+static int fat_publish(struct vnode *s, uint64_t *ticket) {
+    *ticket = 0;
     struct fat_node *sn = s->priv;
     struct fat_fs *fs = sn->fs;
     struct vnode *dir = s->parent;
@@ -1090,15 +1095,16 @@ static int fat_unlink(struct vnode *dir, const char *name) {
     return persist(fs, 0);
 }
 
-bool fat_is(struct vnode *v) { return v && v->ops == &fat_ops; }
+static bool fat_is(struct vnode *v) { return v && v->ops == &fat_ops; }
 
 /* An empty file grows to size bytes of clusters nobody wrote: a hibernation image is written
    into them directly (fat_extents), with no change to the volume's tables afterwards. */
-int fat_reserve(struct vnode *v, uint64_t size) {
+static int fat_reserve(struct vnode *v, uint64_t size) {
     if (!fat_is(v) || v->type != VT_FILE) return -N_ERR_INVALID;
     struct fat_node *n = v->priv;
     struct fat_fs *fs = n->fs;
-    if (n->first || size > 0xFFFFFFFFull) return -N_ERR_INVALID;
+    if (n->first) return -N_ERR_INVALID;
+    if (size > 0xFFFFFFFFull) return -N_ERR_TOO_LARGE; /* past what a FAT file can hold */
     uint32_t first = 0;
     int err = chain_grow(fs, 0, (size + fs->cbytes - 1) / fs->cbytes, &first);
     if (err) {
@@ -1113,7 +1119,8 @@ int fat_reserve(struct vnode *v, uint64_t size) {
 }
 
 /* The file's clusters as runs of whole-disk sectors, in file order. */
-int fat_extents(struct vnode *v, int (*run)(void *ctx, struct blkdev *d, uint64_t lba, uint64_t sectors), void *ctx) {
+static int fat_extents(struct vnode *v, int (*run)(void *ctx, struct blkdev *d, uint64_t lba, uint64_t sectors),
+                       void *ctx) {
     if (!fat_is(v)) return -N_ERR_INVALID;
     struct fat_node *n = v->priv;
     struct fat_fs *fs = n->fs;
@@ -1153,16 +1160,17 @@ static struct vnode_ops fat_ops = {
     .truncate = fat_truncate,
     .stage = fat_stage,
     .move = fat_move,
-    .sync = fat_sync,
+    .save = fat_save,
     .release = fat_release,
+    .reserve = fat_reserve,
+    .extents = fat_extents,
 };
 
 static struct vnode_ops fat_stage_ops = {
     .read = fat_read,
     .write = fat_write,
     .truncate = fat_truncate,
-    .sync = fat_sync,
-    .publish = fat_publish,
+    .save = fat_publish,
     .release = fat_stage_release,
 };
 
@@ -1289,7 +1297,7 @@ static int gpt_starts(struct blkdev *d, uint64_t *starts, int max) {
     return n;
 }
 
-void fat_mount_data(void) {
+void fat_mount_data(const char *path) {
     for (int i = 0; i < blk_count(); i++) {
         struct blkdev *d = blk_get(i);
         uint8_t mbr[SECTOR];
@@ -1316,7 +1324,7 @@ void fat_mount_data(void) {
             struct fat_fs *fs = try_volume(d, starts[s], label);
             if (!fs) continue;
             if (!strcasecmp(label, "NOCTDATA")) {
-                mount_fs(fs, "/data", label);
+                mount_fs(fs, path, label);
                 return;
             }
             kprintf("fat: %s: volume \"%s\" at sector %lu is not NOCTDATA\n", d->name, label, starts[s]);
@@ -1324,6 +1332,5 @@ void fat_mount_data(void) {
             kfree(fs);
         }
     }
-    vfs_mkdir("/data");
-    kprintf("fat: no NOCTDATA volume found; /data is not persistent\n");
+    kprintf("fat: no NOCTDATA volume found\n");
 }

@@ -29,6 +29,8 @@ struct dirent {
 struct vnode;
 struct file;
 struct content;
+struct ramfs_volume;
+struct blkdev;
 struct poll_entry;
 struct poll_wait {
     struct wait_queue wq;
@@ -50,16 +52,18 @@ struct vnode_ops {
     int (*unlink)(struct vnode *dir, const char *name);
     int (*truncate)(struct vnode *v, uint64_t size);
     /* An unnamed, unpublished new version of document name in dir (which need not exist yet),
-       empty: written like any document, then published (publish, on the staged vnode's ops) as the
-       document's whole content in one step that is on the medium when it returns. Dropping the
-       last handle unpublished discards it. docs/nosfs.md §4. */
+       empty: written like any document, then published by saving it (save, on the staged vnode's
+       ops) as the document's whole content in one step. Dropping the last handle unpublished
+       discards it. docs/nosfs.md §3. */
     int (*stage)(struct vnode *dir, const char *name, struct vnode **out);
-    int (*publish)(struct vnode *staged);
     /* Rename/move an entry within one filesystem; the target name must be free. */
     int (*move)(struct vnode *from_dir, const char *from, struct vnode *to_dir, const char *to);
-    /* What was written to v is on the medium when this returns (a written document's handle is
-       closed). NULL: nothing to wait for, as in memory. */
-    int (*sync)(struct vnode *v);
+    /* Save the document's newest version (a staged one is published first). *ticket: what saved
+       waits for (0: nothing, it is on the medium or there is no medium). NULL: nothing to save. */
+    int (*save)(struct vnode *v, uint64_t *ticket);
+    /* The outcome of the save with ticket: 0 on the medium, an error, or -N_ERR_NOT_READY while it
+       is on its way (wait: until it is known). NULL: saves are done when save returns. */
+    int (*saved)(struct vnode *v, uint64_t ticket, bool wait);
     /* The size as the handle sees it (a read-only handle keeps the version it opened). NULL: v->size. */
     uint64_t (*size)(struct vnode *v, struct file *f);
     bool (*can_read)(struct vnode *v, struct file *f);
@@ -69,6 +73,12 @@ struct vnode_ops {
     void (*open)(struct vnode *v, struct file *f);
     void (*close)(struct vnode *v, struct file *f);
     void (*release)(struct vnode *v); /* last reference dropped after unlink */
+    /* Hibernation (docs/nosfs.md §11): an empty document gets blocks of its own for size bytes
+       that nothing else writes, recorded before it returns; extents says where they are on the
+       disk, in order. NULL: the filesystem cannot hold an image. */
+    int (*reserve)(struct vnode *v, uint64_t size);
+    int (*extents)(struct vnode *v, int (*run)(void *ctx, struct blkdev *d, uint64_t lba, uint64_t sectors),
+                   void *ctx);
 };
 
 struct vnode {
@@ -84,8 +94,23 @@ struct vnode {
     void *priv;
     struct vnode *mounted;  /* fs root mounted on top of this dir */
     struct vnode *parent;
-    struct vnode *children, *sibling; /* ramfs folders */
-    struct content *content;          /* ramfs documents (fs/content.h) */
+    /* ramfs (fs/ramfs.h) */
+    struct vnode *children, *sibling; /* folders */
+    struct ramfs_volume *vol;         /* the volume the tree is on (NULL: RAM only) */
+    struct vnode *origin;             /* the base item it shows (NULL: none) */
+    uint64_t id;                      /* its ID on the volume (0: not recorded) */
+    uint64_t entry_dir, entry_pos;    /* where the volume keeps its entry (entry_dir 0: nowhere yet) */
+    uint64_t vol_txn;                 /* the volume's open commit it is in, and where there */
+    size_t vol_item;
+    uint8_t loaded;                   /* folders: 0 not read in, 1 being read, 2 read */
+    bool transient;                   /* a mount point (or a folder of them): never recorded */
+    /* documents (fs/content.h, docs/nosfs.md §3): the committed version (NULL: not read in from
+       the volume yet); the newest one a save took (the committed one when no save is on its way;
+       NULL with it); the working one (NULL until something writes) */
+    struct content *content, *head, *work;
+    bool saving;                  /* a save is taking the working version */
+    uint64_t ticket;              /* the latest save's (0: nothing to wait for) */
+    struct wait_queue save_wait;
     struct file *lease_owner;
     struct wait_queue lease_wait;
     struct poll_entry *pollers;
@@ -98,7 +123,9 @@ struct file {
     int refs;
     void *priv;
     bool io_busy;
-    bool written;              /* a document changed through it since its last sync */
+    bool written;              /* a document changed through it since its last save */
+    bool save_unread;          /* a save started (N_COMMIT_START) whose outcome was not read yet */
+    uint64_t save_ticket;      /* the latest save through it (0: nothing to wait for) */
     struct wait_queue io_wait; /* regular-file shared offset; device directions stay independent */
     struct event_watch *watchers; /* event-queue watches on this handle, dropped at the last close */
 };
@@ -138,8 +165,11 @@ int vfs_write_whole(const char *abspath, const void *data, uint64_t size);
 int vfs_document_open(const char *abspath, int access, struct file **out);
 int64_t vfs_document_read_user(struct file *f, uint64_t off, void *buf, size_t n);
 int64_t vfs_document_write_user(struct file *f, uint64_t off, const void *buf, size_t n);
-/* A REPLACE handle publishes its version; any handle's writes reach the medium. */
-int vfs_document_commit(struct file *f);
+/* Save the document f writes (a REPLACE handle publishes its version first), how: N_COMMIT_WAIT
+   (until it is on the medium), N_COMMIT_START (N_EVENT_SAVED says when), N_COMMIT_RESULT (the
+   outcome of the last started one; reading it ends the event). docs/nosfs.md §10. */
+int vfs_document_commit(struct file *f, int how);
+bool vfs_save_known(struct file *f); /* a started save's outcome is there to read */
 /* The whole new content of a document (made if missing), from user memory: written into an
    unpublished version and published, never copied whole into the kernel. */
 int vfs_save_user(const char *abspath, const void *udata, uint64_t size);
@@ -149,16 +179,10 @@ int vfs_entry_info(const char *abspath, struct dirent *out);
 int vfs_folder_list(const char *abspath, uint64_t start, struct dirent *out, size_t max);
 int vfs_move(const char *from, const char *to);
 int vfs_kind(struct vnode *v);
+/* Everything changed and saved so far is on the media (power changes). */
+int vfs_sync(void);
 void vnode_ref(struct vnode *v);
 void vnode_unref(struct vnode *v);
-
-/* ramfs */
-struct vnode *ramfs_new_root(void);
-struct vnode *ramfs_new_node(const char *name, int type);
-void ramfs_add_child(struct vnode *dir, struct vnode *child);
-extern struct vnode_ops ramfs_ops;
-/* initrd bytes, read in place; false: nothing borrowed (not a ramfs document, empty, no memory) */
-bool ramfs_borrow(struct vnode *v, const uint8_t *data, uint64_t size);
 
 /* event queues (sys/events.c) */
 struct event_watch;
@@ -185,12 +209,8 @@ int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wai
                                 struct file **attached, uint64_t *sender_app);
 
 /* FAT (fs/fat.c) */
-struct blkdev;
-void fat_mount_data(void);
-bool fat_is(struct vnode *v);
-int fat_reserve(struct vnode *v, uint64_t size); /* empty file -> size bytes, nothing written */
-int fat_extents(struct vnode *v, int (*run)(void *ctx, struct blkdev *d, uint64_t lba, uint64_t sectors),
-                void *ctx);
+/* The FAT volume labelled NOCTDATA, mounted at path (the first one found). */
+void fat_mount_data(const char *path);
 
 /* initrd: the archive stays where the bootloader put it and its files are read from it */
 void initrd_load(void *data, uint64_t size);

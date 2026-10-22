@@ -23,7 +23,7 @@
 #include "dev/pci.h"
 #include "dev/pm.h"
 #include "dev/timer.h"
-#include "fs/vfs.h"
+#include "fs/ramfs.h"
 #include "arch/hyperv.h"
 #include "hv/hv.h"
 #include "hv/vmbus.h"
@@ -162,7 +162,9 @@ const char *hibernate_blocker(void) {
     if (!wake_available() || !wake_spare_page()) return "no room below 1 MiB";
     if (vmbus_ready()) return "Hyper-V devices cannot come back from it yet";
     if (!pmm_ram_complete()) return "the memory map has more ranges than can be saved";
-    if (!fat_is(vfs_lookup("/data"))) return "no disk holds /data";
+    struct vnode *data = vfs_lookup("/data");
+    /* a namespace folder holds blocks when a volume records it */
+    if (!data || !data->ops->reserve || (data->ops == &ramfs_ops && !data->vol)) return "no disk holds /data";
     return NULL;
 }
 
@@ -185,10 +187,10 @@ static int add_extent(void *ctx, struct blkdev *d, uint64_t lba, uint64_t sector
 
 static bool map_file(struct vnode *v) {
     unsigned n = 0;
-    if (fat_extents(v, count_extent, &n) < 0 || !n) return false;
+    if (v->ops->extents(v, count_extent, &n) < 0 || !n) return false;
     h.ext = kmalloc(n * sizeof *h.ext);
     h.nexts = 0;
-    return h.ext && fat_extents(v, add_extent, &n) == 0 && h.nexts == n;
+    return h.ext && v->ops->extents(v, add_extent, &n) == 0 && h.nexts == n;
 }
 
 /* off and len in whole sectors, within the file's clusters */
@@ -245,7 +247,7 @@ bool hibernate_prepare(const char **why) {
         h.file = NULL;
         goto fail;
     }
-    if (!fat_is(h.file->vn)) goto fail;
+    if (!h.file->vn->ops->reserve || !h.file->vn->ops->extents) goto fail;
     struct header hd;
     describe(&hd);
     h.map_bytes = hd.map_bytes;
@@ -264,10 +266,11 @@ bool hibernate_prepare(const char **why) {
 
     /* the file: that large, or as large as /data has room for (images compress well) */
     int err = -N_ERR_NO_SPACE;
-    for (uint64_t want = h.data_off + stream; err == -N_ERR_NO_SPACE && want >= h.data_off + (16ULL << 20);
+    for (uint64_t want = h.data_off + stream;
+         (err == -N_ERR_NO_SPACE || err == -N_ERR_TOO_LARGE) && want >= h.data_off + (16ULL << 20);
          want = want / 4 * 3) {
-        err = fat_reserve(h.file->vn, MIN(want, 0xFFFFF000ULL));
-        if (!err) h.file_bytes = MIN(want, 0xFFFFF000ULL);
+        err = h.file->vn->ops->reserve(h.file->vn, want);
+        if (!err) h.file_bytes = want;
     }
     if (err) {
         if (err == -N_ERR_NO_SPACE) *why = "not enough free space on /data";
@@ -608,7 +611,7 @@ void hibernate_restore(void) {
         why = "noresume";
         goto drop;
     }
-    if (!fat_is(v) || !map_file(v) || !(h.stage = kmalloc(STAGE_BYTES)) || disk_at(0, h.stage, PAGE_SIZE, false) < 0)
+    if (!v->ops->extents || !map_file(v) || !(h.stage = kmalloc(STAGE_BYTES)) || disk_at(0, h.stage, PAGE_SIZE, false) < 0)
         goto drop;
     memcpy(&hd, h.stage, sizeof hd);
     if ((why = check(&hd))) goto drop;

@@ -58,6 +58,7 @@ static uint32_t watch_ready(struct event_watch *w) {
         if (vfs_can_read(f)) ready |= N_EVENT_RECEIVABLE;
         if (vfs_can_write(f)) ready |= N_EVENT_SENDABLE;
         if (v->ops && v->ops->hangup && v->ops->hangup(v, f)) ready |= N_EVENT_CLOSED;
+        if (v->type == VT_FILE && vfs_save_known(f)) ready |= N_EVENT_SAVED;
     }
     return ready & w->interest;
 }

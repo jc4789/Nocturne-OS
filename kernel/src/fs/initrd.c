@@ -1,7 +1,8 @@
-/* Unpack a USTAR archive (the Limine module) into the root ramfs. The files' bytes stay in the
-   archive and are read there (ramfs_borrow); a page of it goes back to the allocator once no file
+/* Unpack a USTAR archive (the Limine module) into the base (fs/ramfs.h): the tree the namespace
+   shows where the volume has nothing of its own (docs/nosfs.md §8). The files' bytes stay in the
+   archive and are read there (content_borrow); a page of it goes back to the allocator once no file
    reads any of its bytes any more (they were changed, removed or replaced). */
-#include "fs/vfs.h"
+#include "fs/ramfs.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 
@@ -97,24 +98,15 @@ void initrd_load(void *data, uint64_t size) {
             break;
         }
         if (type == '5') {
-            vfs_mkdir(path);
-            dirs++;
+            if (ramfs_base_folder(path)) dirs++;
         } else if (type == '0' || type == 0) {
-            struct vnode *v = vfs_lookup(path);
-            if (!v) {
-                struct file *f;
-                if (vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC, &f) == 0) {
-                    vfs_close(f);
-                    struct vnode *n = vfs_lookup(path);
-                    uint64_t at = hhdm_virt_to_phys(p + 512) - base;
-                    if (n && given_back && ramfs_borrow(n, p + 512, fsize))
-                        mark(at / BLOCK, MIN(ALIGN_UP(at + fsize, BLOCK), npages * PAGE_SIZE) / BLOCK, true);
-                    else if (n) vfs_write_whole(path, p + 512, fsize);
-                    files++;
-                }
+            uint64_t at = hhdm_virt_to_phys(p + 512) - base;
+            bool borrow = given_back && fsize;
+            /* the first entry of a name wins (mkinitrd packs each name once) */
+            if (!ramfs_base_document(path, (uint32_t)octal(h + 100, 8), p + 512, fsize, borrow)) {
+                if (borrow) mark(at / BLOCK, MIN(ALIGN_UP(at + fsize, BLOCK), npages * PAGE_SIZE) / BLOCK, true);
+                files++;
             }
-            struct vnode *n = vfs_lookup(path);
-            if (n) n->mode = (uint32_t)octal(h + 100, 8);
         }
         uint64_t padded = ALIGN_UP(fsize, 512);
         p += 512 + (padded > avail ? avail : padded); /* a short final block stays inside the archive */

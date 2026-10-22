@@ -63,9 +63,15 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - `n_document_open(path, n_document_access)`。`access` はビットフラグではなく列挙：
     `N_DOCUMENT_READ`、`N_DOCUMENT_EDIT`（既存の読み書き）、
     `N_DOCUMENT_CREATE`（新規作成。既に有れば `N_ERR_EXISTS`）、
-    `N_DOCUMENT_REPLACE`（空の新しい内容をメモリー上に作る）。差し替えは
-    `n_handle_close` で明示的に閉じた時だけ行う。閉じずに終了したアプリの内容は捨てられ、
-    元の文書はそのまま残る。
+    `N_DOCUMENT_REPLACE`（空の新しい内容をメモリー上に作る）。差し替えは保存
+    （`n_document_commit` か、`n_handle_close` で明示的に閉じた時）だけで行う。閉じずに
+    終了したアプリの内容は捨てられ、元の文書はそのまま残る。
+  - 保存：`n_document_commit(h, how)`。`N_COMMIT_WAIT` は媒体に届くまで待つ。
+    `N_COMMIT_START` はすぐ戻り、届いたら（失敗も）イベント待ち行列で監視している
+    ハンドルに `N_EVENT_SAVED` が来る。`N_COMMIT_RESULT` は最後に始めた保存の結果
+    （まだなら `N_ERR_NOT_READY`）。結果を読むと `N_EVENT_SAVED` は報告されなくなる。
+    書いたハンドルの `n_handle_close` は `N_COMMIT_WAIT` と同じ。`READ` のハンドルは
+    開いた時点で最後に保存された版を読み続ける（docs/nosfs.md §3）。
   - `n_document_read_at(h, offset, buf, n)`、`n_document_write_at(h, offset, buf, n)`、
     `n_document_size(h)`、`n_document_set_size(h, size)`。**共有カーソル（シーク位置）は無い**。
     `N_DOCUMENT_READ` のハンドルへの書込みは `N_ERR_DENIED`。

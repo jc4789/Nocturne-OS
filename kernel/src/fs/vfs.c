@@ -1,5 +1,5 @@
 /* Virtual filesystem layer: path walking, open files, mounts. */
-#include "fs/vfs.h"
+#include "fs/ramfs.h"
 #include "mm/heap.h"
 #include "arch/cpu.h"
 #include "dev/timer.h"
@@ -74,7 +74,7 @@ void vnode_unref(struct vnode *v) {
 }
 
 void vfs_init(void) {
-    vfs_root = ramfs_new_root();
+    vfs_root = ramfs_namespace_root();
     vfs_root->refs = 1;
 }
 
@@ -174,6 +174,7 @@ struct file *vfs_open_vnode(struct vnode *v, int flags) {
 
 int vfs_open(const char *path, int flags, struct file **out) {
     struct vnode *v = vfs_lookup(path);
+    bool truncated = false;
     if (!v) {
         if (!(flags & O_CREAT)) return -N_ERR_NOT_FOUND;
         char leaf[NAME_MAX_LEN];
@@ -184,13 +185,14 @@ int vfs_open(const char *path, int flags, struct file **out) {
         int r = dir->ops->create(dir, leaf, VT_FILE, &v);
         if (r < 0) return r;
     } else if ((flags & O_TRUNC) && v->type == VT_FILE) {
-        if (v->ops->truncate) v->ops->truncate(v, 0);
+        truncated = v->ops->truncate && v->size && !v->ops->truncate(v, 0);
     }
     if ((flags & O_DIRECTORY) && v->type != VT_DIR) return -N_ERR_NOT_FOLDER;
     if (v->type == VT_DIR && (flags & O_ACCMODE) != O_RDONLY) return -N_ERR_IS_FOLDER;
     struct file *f = vfs_open_vnode(v, flags);
     if (!f) return -N_ERR_NO_MEMORY;
     if (flags & O_APPEND) f->off = v->size;
+    f->written = truncated; /* saved with the handle's writes */
     *out = f;
     return 0;
 }
@@ -283,13 +285,29 @@ int vfs_truncate(struct file *f, uint64_t size) {
     return error;
 }
 
-/* Wait until what was written through f is on the medium. Caller holds f's I/O claim. */
-static int file_sync(struct file *f) {
+/* Start saving the document f writes (a staged version is published). Caller holds f's I/O claim
+   or its last reference. */
+static int save_start(struct file *f) {
     struct vnode *v = f->vn;
-    if (!f->written || !v->ops->sync) return 0;
+    bool staged = v->staged;
+    if (!f->written && !staged) return 0; /* nothing new through it: its last save stands */
+    uint64_t ticket = 0;
+    int error = v->ops->save ? v->ops->save(v, &ticket) : 0;
+    if (error) return error;
+    /* Published: the version is the document's now, and this handle (and its duplicates) has
+       nothing left to write. */
+    if (staged) f->flags = (f->flags & ~O_ACCMODE) | O_RDONLY;
     f->written = false;
-    return v->ops->sync(v);
+    f->save_ticket = ticket;
+    return 0;
 }
+
+static int save_outcome(struct file *f, bool wait) {
+    struct vnode *v = f->vn;
+    return f->save_ticket && v->ops->saved ? v->ops->saved(v, f->save_ticket, wait) : 0;
+}
+
+bool vfs_save_known(struct file *f) { return f->save_unread && save_outcome(f, false) != -N_ERR_NOT_READY; }
 
 static int vfs_lease_mode(struct file *f, bool acquire, bool blocking) {
     struct vnode *v = f->vn;
@@ -333,8 +351,8 @@ void vfs_close(struct file *f) {
        not an IRQ-disabled driver invocation, keeps this detached file alive. */
     struct vnode *v = f->vn;
     /* Callers that must hear of a failure commit first (vfs_document_commit); a handle that
-       is simply dropped still leaves its writes durable. */
-    if (f->written && !v->staged && !file_io_begin(f)) { file_sync(f); file_io_end(f); }
+       is simply dropped still saves its writes (an app being stopped does not wait for them). */
+    if (f->written && !v->staged && !save_start(f) && !current_task->killed) save_outcome(f, true);
     vfs_lease(f, false);
     if (v->ops && v->ops->close) v->ops->close(v, f);
     vnode_unref(v);
@@ -371,13 +389,10 @@ int vfs_unlink(const char *path) {
 }
 
 int vfs_mount(const char *path, struct vnode *root) {
-    struct vnode *v = vfs_lookup(path);
-    if (!v) {
-        int r = vfs_mkdir(path);
-        if (r < 0) return r;
-        v = vfs_lookup(path);
-    }
-    if (!v || v->type != VT_DIR) return -N_ERR_NOT_FOLDER;
+    struct vnode *v;
+    int r = ramfs_mount_point(path, &v);
+    if (r < 0) return r;
+    if (v->type != VT_DIR) return -N_ERR_NOT_FOLDER;
     v->mounted = root;
     root->parent = v->parent;
     return 0;
@@ -427,10 +442,12 @@ int vfs_write_whole(const char *path, const void *data, uint64_t size) {
     int r = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC, &f);
     if (r < 0) return r;
     int64_t n = vfs_write(f, data, size);
-    if (n >= 0) n = vfs_document_commit(f);
+    if (n >= 0) n = vfs_document_commit(f, N_COMMIT_WAIT);
     vfs_close(f);
     return n < 0 ? (int)n : 0;
 }
+
+int vfs_sync(void) { return ramfs_sync(); }
 
 /* ---- native documents and folders ---- */
 
@@ -536,22 +553,24 @@ int64_t vfs_document_write_user(struct file *f, uint64_t off, const void *buf, s
     return r;
 }
 
-int vfs_document_commit(struct file *f) {
+int vfs_document_commit(struct file *f, int how) {
     struct vnode *v = f->vn;
+    if (how != N_COMMIT_WAIT && how != N_COMMIT_START && how != N_COMMIT_RESULT) return -N_ERR_INVALID;
     if (v->type != VT_FILE) return 0;
+    if (how == N_COMMIT_RESULT) {
+        if (!f->save_unread) return 0;
+        int r = save_outcome(f, false);
+        if (r != -N_ERR_NOT_READY) f->save_unread = false;
+        return r;
+    }
     int error = file_io_begin(f);
     if (error) return error;
-    if (v->staged) {
-        error = v->ops->publish(v);
-        /* Published: the version is the document's now, and this handle (and its duplicates)
-           has nothing left to write. */
-        if (!error) f->flags = (f->flags & ~O_ACCMODE) | O_RDONLY;
-        f->written = false;
-    } else {
-        error = file_sync(f);
-    }
+    error = save_start(f);
     file_io_end(f);
-    return error;
+    if (error || how == N_COMMIT_WAIT) return error ? error : save_outcome(f, true);
+    f->save_unread = true;
+    if (vfs_save_known(f)) vfs_poll_notify(v); /* done already: the event is there at once */
+    return 0;
 }
 
 int vfs_save_user(const char *path, const void *udata, uint64_t size) {
@@ -559,7 +578,7 @@ int vfs_save_user(const char *path, const void *udata, uint64_t size) {
     int r = vfs_document_open(path, N_DOCUMENT_REPLACE, &f);
     if (r < 0) return r;
     int64_t n = vfs_document_write_user(f, 0, udata, size);
-    r = n < 0 ? (int)n : (uint64_t)n < size ? -N_ERR_NO_SPACE : vfs_document_commit(f);
+    r = n < 0 ? (int)n : (uint64_t)n < size ? -N_ERR_NO_SPACE : vfs_document_commit(f, N_COMMIT_WAIT);
     vfs_close(f);
     return r;
 }
@@ -582,7 +601,7 @@ int vfs_append_user(const char *path, const void *data, uint64_t size) {
     if (!f) return -N_ERR_NO_MEMORY;
     int64_t n = vfs_lease(f, true);
     if (!n) n = vfs_write_user(f, data, size);
-    if (n >= 0) { int s = vfs_document_commit(f); if (s < 0) n = s; }
+    if (n >= 0) { int s = vfs_document_commit(f, N_COMMIT_WAIT); if (s < 0) n = s; }
     vfs_close(f); /* releases the claim */
     return n < 0 ? (int)n : (uint64_t)n < size ? -N_ERR_NO_SPACE : 0;
 }
@@ -651,7 +670,7 @@ int vfs_move(const char *from, const char *to) {
         r = w < 0 ? (int)w : w < n ? -N_ERR_NO_SPACE : 0;
     }
     kfree(buf);
-    if (!r) r = vfs_document_commit(dst);
+    if (!r) r = vfs_document_commit(dst, N_COMMIT_WAIT);
     vfs_close(dst);
     vfs_close(src);
     return r < 0 ? r : vfs_unlink(from);
