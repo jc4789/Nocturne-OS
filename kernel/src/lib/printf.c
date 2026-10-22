@@ -175,6 +175,7 @@ NORETURN void panic(const char *fmt, ...) {
     serial_write("\n*** KERNEL PANIC: ", 19);
     serial_write(buf, strlen(buf));
     serial_write("\n", 1);
+    serial_flush();
     klog_write("KERNEL PANIC: ", 14);
     klog_write(buf, strlen(buf));
     panic_screen(buf);

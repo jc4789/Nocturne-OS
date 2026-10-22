@@ -5,6 +5,7 @@
 #include "sys/sched.h"
 #include "dev/timer.h"
 #include "dev/audio.h"
+#include "dev/serial.h"
 #include "sys/prof.h"
 #include "arch/pstate.h"
 
@@ -41,6 +42,7 @@ static void timer_irq(struct regs *r) {
     if (pstate_sampling()) pstate_tick();
     if (!catch_up()) timer_ticks++;
     audio_tick();
+    serial_tick();
     sched_tick();
 }
 
@@ -48,11 +50,12 @@ static void timer_irq(struct regs *r) {
    BSP's window longer while it idles, so they do not keep the tick running. */
 bool timer_tickless(void) { return tickless && !prof_enabled(); }
 
-/* BSP idle task, interrupts off. When nothing runs anywhere and no sound plays, the tick waits
-   for the earliest timeout instead (at most a second). Any interrupt starts it again
-   (timer_wake), so handlers always see the current uptime_ms. */
+/* BSP idle task, interrupts off. When nothing runs anywhere, no sound plays and no log output
+   waits for the serial line, the tick waits for the earliest timeout instead (at most a second).
+   Any interrupt starts it again (timer_wake), so handlers always see the current uptime_ms. */
 void timer_idle(void) {
-    if (tick_stopped || !timer_tickless() || audio_needs_tick() || !sched_bsp_quiet()) return;
+    if (tick_stopped || !timer_tickless() || audio_needs_tick() || serial_needs_tick() || !sched_bsp_quiet())
+        return;
     catch_up();
     uint64_t now = timer_ticks, next = sched_next_wake();
     if (next <= now + 1) return; /* due by the next tick anyway */

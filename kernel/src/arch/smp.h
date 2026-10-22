@@ -63,6 +63,9 @@ bool cpu_tlb_ipi(unsigned index);    /* BSP: false when that AP is not running *
 bool cpu_worker_poll(void); /* AP idle stack only: execute a published bounded job */
 bool cpu_worker_pending(void); /* AP: 公開済みで未実行のjobがある（user実行を退かせて受ける） */
 void cpu_runner_check(void); /* BSP: failed APはcontextを保持してpanic */
+/* BSP, waiting since rdtsc() == since for an AP to answer an IPI (a TLB shootdown, a retire):
+   whether it is too late for a working AP. *spins counts the waits where the TSC rate is unknown. */
+bool cpu_ap_answer_late(uint64_t since, uint64_t *spins);
 bool cpu_jobs_active(void);
 void cpu_require_bsp(void);
 void cpu_worker_fault(struct regs *regs) __attribute__((noreturn));

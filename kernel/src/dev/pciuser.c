@@ -496,6 +496,11 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
         return -N_ERR_NOT_READY;
     }
     guards_init(c); /* pending FLR is complete: capability offsets/control now describe the handle */
+    /* The driver reads its BARs from the APs, which a read the device leaves unanswered stalls
+       without interrupts: the Root Port's Completion Timeout must end it (pci_cpu_reads_bounded). */
+    if (!pci_cpu_reads_bounded(d))
+        kprintf("pci: %02x:%02x.%u: its Root Port does not end an unanswered read within %u ms\n", bus, dev, func,
+                PCI_CPU_READ_MAX_MS);
     /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
        decoding off under a running function, and the boot screen may be drawn through it. */
     struct file *f = vfs_open_vnode(v, O_RDWR);

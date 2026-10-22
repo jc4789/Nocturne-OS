@@ -530,7 +530,7 @@ void sched_quiesce_space(uint64_t pml4) {
             q_unlock(q);
             if (done) break;
             cpu_runner_check();
-            if ((tsc_hz && rdtsc() - since > tsc_hz) || ++spins > 100000000)
+            if (cpu_ap_answer_late(since, &spins))
                 panic("smp: user retire timeout; task/space/context retained");
             pause();
         }

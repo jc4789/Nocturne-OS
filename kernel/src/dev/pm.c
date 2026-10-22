@@ -127,6 +127,7 @@ static NORETURN void finish(enum pm_action action) {
     cli();
     kprintf("pm: stopping the devices\n");
     pm_quiesce_devices(false);
+    serial_flush();
     if (action == PM_REBOOT) power_reboot();
     power_off();
     for (;;) hlt();
@@ -176,6 +177,7 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     pic_mask_all();
     ioapic_suspend();
     timer_suspend();
+    serial_flush(); /* the tick that drains the log port is stopped */
     /* called off, the way back is the one after an enter() that returned */
     bool slept = !stuck && wake_sleep(enter);
     /* awake (or never asleep): the CPU is back; now what it talks to */

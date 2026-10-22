@@ -174,11 +174,12 @@ void vmm_ap_uaccess_end(void) {
     __atomic_store_n(&cpu_uaccess[cpu_current_index()], 0, __ATOMIC_RELEASE);
 }
 
+/* An AP stalled in a read of an app driver's device answers late, not never (cpu_ap_answer_late). */
 static bool tlb_wait(uint64_t *word, uint64_t want, bool equal) {
     uint64_t since = rdtsc(), spins = 0;
     while ((__atomic_load_n(word, __ATOMIC_ACQUIRE) == want) != equal) {
         cpu_runner_check();
-        if ((tsc_hz && rdtsc() - since > tsc_hz) || ++spins > 100000000) return false;
+        if (cpu_ap_answer_late(since, &spins)) return false;
         pause();
     }
     return true;

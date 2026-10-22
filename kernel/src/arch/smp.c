@@ -9,6 +9,7 @@
 #include "sys/sched.h"
 #include "arch/pstate.h"
 #include "arch/pat.h"
+#include "dev/pci.h"
 #include "arch/wake.h"
 
 #define AP_STACK_SIZE (32 * 1024)
@@ -128,6 +129,16 @@ bool cpu_tlb_ipi(unsigned i) {
         panic("smp: TLB shootdown IPI failed; context retained");
     return true;
 }
+/* An AP takes an IPI between instructions. One that reads an app driver's device BAR is stalled
+   inside that read until the device answers or the Root Port times the read out, which
+   dev/pci.c keeps within PCI_CPU_READ_MAX_MS; a second more covers the IPI and its handler. Only
+   an AP silent for longer is not working. */
+#define AP_ANSWER_MS (PCI_CPU_READ_MAX_MS + 1000)
+bool cpu_ap_answer_late(uint64_t since, uint64_t *spins) {
+    if (tsc_hz) return rdtsc() - since > tsc_hz * AP_ANSWER_MS / 1000;
+    return ++*spins > 100000000ull * AP_ANSWER_MS / 1000;
+}
+
 void cpu_runner_check(void) {
     for (unsigned i = 1; i < slots; i++) if (cpu_runner_ready_at(i) && __atomic_load_n(&workers[i].failed, __ATOMIC_ACQUIRE)) {
         struct cpu_worker *w = &workers[i];
