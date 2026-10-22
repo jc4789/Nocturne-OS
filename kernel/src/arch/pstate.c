@@ -39,19 +39,17 @@ static struct pstate_sample {
 
 static void detect(void) {
     uint32_t a, b, c, d, max, ext;
-    char vendor[13];
     cpuid(0, 0, &max, &b, &c, &d);
-    memcpy(vendor, &b, 4); memcpy(vendor + 4, &d, 4); memcpy(vendor + 8, &c, 4);
-    vendor[12] = 0;
+    enum cpu_vendor vendor = cpu_vendor_of(b, c, d);
     cpuid(1, 0, &a, &b, &c, &d);
     hypervisor = c & (1u << 31);
     if (max >= 6) {
         cpuid(6, 0, &a, &b, &c, &d);
         have_aperf = c & 1u;
-        if (!strcmp(vendor, "GenuineIntel") && (a & (1u << 7))) method = PSTATE_INTEL_HWP;
+        if (vendor == CPU_VENDOR_INTEL && (a & (1u << 7))) method = PSTATE_INTEL_HWP;
     }
     cpuid(0x80000000, 0, &ext, &b, &c, &d);
-    if (!strcmp(vendor, "AuthenticAMD") || !strcmp(vendor, "HygonGenuine")) {
+    if (vendor == CPU_VENDOR_AMD) {
         if (ext >= 0x80000008) {
             cpuid(0x80000008, 0, &a, &b, &c, &d);
             if (b & (1u << 27)) method = PSTATE_AMD_CPPC;

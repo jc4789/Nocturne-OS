@@ -111,7 +111,7 @@ static bool rte_write(struct ioapic *io, uint32_t pin, uint64_t rte) {
 bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest_apic_id, bool level, bool active_low) {
     uint32_t pin;
     struct ioapic *io = owner(gsi, &pin);
-    if (!io || vector < 0x30 || vector == 0xFF || dest_apic_id > 0xFF) return false;
+    if (!io || vector < 0x30 || vector == 0xFF || dest_apic_id > 0xFE || !lapic_addressable(dest_apic_id)) return false;
     uint32_t lo = vector | (level ? RTE_LEVEL : 0) | (active_low ? RTE_ACTIVELOW : 0); /* fixed, physical */
     uint64_t f = irq_save();
     bool ok = rte_write(io, pin, lo | (uint64_t)dest_apic_id << 56);

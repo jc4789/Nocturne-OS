@@ -213,8 +213,14 @@ static void exception(struct regs *r, uint64_t cr2, unsigned source_cpu) {
     panic_regs(name, r);
 }
 
+extern char wrmsr_checked_write[], wrmsr_checked_refused[];
+
 void isr_dispatch(struct regs *r) {
     uint64_t v = r->vector;
+    if (v == 13 && !(r->cs & 3) && r->rip == (uint64_t)wrmsr_checked_write) { /* cpu.h: wrmsr_checked */
+        r->rip = (uint64_t)wrmsr_checked_refused;
+        return;
+    }
     if (v == VEC_TLB_SHOOTDOWN) {
         /* Any AP state: user (returns straight to ring 3), idle HLT or a job. */
         vmm_tlb_ipi();

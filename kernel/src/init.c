@@ -10,7 +10,6 @@
 #include "dev/iommu.h"
 #include "dev/pm.h"
 #include "dev/hibernate.h"
-#include "arch/ioapic.h"
 #include "dev/ata.h"
 #include "dev/audio.h"
 #include "dev/usb.h"
@@ -143,7 +142,6 @@ void kmain_late(void) {
     }
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
-    ioapic_init(); /* non-ExtINT pins masked; preserve any firmware virtual-wire PIC path */
     if (vmbus_init()) {
         hv_input_init();
         hv_util_init();

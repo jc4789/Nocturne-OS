@@ -84,6 +84,9 @@ void pci_write16(uint8_t b,uint8_t d,uint8_t f,uint16_t at,uint16_t v) { (void)b
 static const struct iommu_hw *probe_backend;
 const struct iommu_hw *iommu_amd_probe(bool *plain_safe) { *plain_safe = !firmware_declared || probe_plain; return probe_backend; }
 const struct iommu_hw *iommu_intel_probe(bool *plain_safe) { *plain_safe = intel_probe_plain; return NULL; }
+static const char *amd_conflict, *intel_conflict;
+const char *iommu_amd_x2apic_conflict(void) { return amd_conflict; }
+const char *iommu_intel_x2apic_conflict(void) { return intel_conflict; }
 const void *acpi_find(const char sig[4],unsigned index) { (void)sig;(void)index;return firmware_declared ? &firmware_declared : NULL; }
 uint16_t pic_mask_all(void) { uint16_t old = pic_masks; pic_masks = UINT16_MAX; return old; }
 void pic_restore_mask(uint16_t masks) { pic_masks = masks; }
@@ -247,8 +250,21 @@ static void test_interrupt_transition(void) {
     probe_backend = NULL;
 }
 
+/* x2APICを離れる理由はどちらの後端からでも: 片方の機械には片方の表しかない。 */
+static void test_x2apic_conflict(void) {
+    const char *amd = "amd", *intel = "intel";
+    const struct { const char *amd, *intel, *why; } cases[] = {
+        {NULL, NULL, NULL}, {amd, NULL, amd}, {NULL, intel, intel}, {amd, intel, amd}
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        amd_conflict = cases[i].amd; intel_conflict = cases[i].intel;
+        CHECK(iommu_x2apic_conflict() == cases[i].why);
+    }
+    amd_conflict = intel_conflict = NULL;
+}
+
 int main(void) {
-    test_addresses(); test_reservations(); test_policy_and_power(); test_interrupt_transition();
+    test_addresses(); test_reservations(); test_policy_and_power(); test_interrupt_transition(); test_x2apic_conflict();
     printf("共通IOMMU focused検査: %u件、失敗%u件（実機・QEMU未検証）\n",checks,failed);
     return failed ? 1 : 0;
 }

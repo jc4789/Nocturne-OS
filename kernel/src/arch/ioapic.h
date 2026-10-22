@@ -6,11 +6,12 @@
    8259 path (LAPIC LINT0 in virtual-wire mode, see apic.c) is independent of the IOAPIC and unaffected.
    Entries the firmware left as unmasked ExtINT (virtual-wire mode B: 8259 through IOAPIC pin 0) are kept.
    Destinations are 8-bit physical APIC IDs (the plain RTE format and the remapping entries
-   dev/iommu.c writes carry no more), and the vector must be a LAPIC vector >= 0x30 (0x20-0x2F
+   dev/iommu.c writes carry no more), not FFh, the broadcast, nor one lapic_addressable refuses
+   (an AMD APIC's 4-bit IDs), and the vector must be a LAPIC vector >= 0x30 (0x20-0x2F
    belong to the PIC). Entries go through iommu_ioapic_entry, which makes them remappable where
    interrupt remapping is on. Call from the BSP only; register access is serialised by disabling
    interrupts. */
-void ioapic_init(void); /* after acpi_init(); masks non-ExtINT pins of each IOAPIC found in the MADT */
+void ioapic_init(void); /* after acpi_tables_init(), before apic_init(); masks non-ExtINT pins of each IOAPIC found in the MADT */
 unsigned ioapic_count(void);
 /* Redirect GSI `gsi` to `vector` on the CPU with physical APIC id `dest_apic_id` (fixed delivery),
    unmasked. level/active_low describe the source. False if no IOAPIC owns the GSI, an argument is

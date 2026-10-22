@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <string.h>
 #include "kernel.h"
 #include "arch/cpu.h"
 
@@ -27,7 +28,7 @@ static struct unit model_unit;
 static void *own_queue, *firmware_queue, *semaphore_page;
 static uint64_t ticks;
 static bool run_queue, run_commands, mapped_slot;
-static unsigned failures, completed_waits;
+static unsigned checks, failures, completed_waits;
 enum {
     DMAR_HEADER_BYTES = 48, DRHD_HEADER_BYTES = 16, RMRR_HEADER_BYTES = 24, DEVICE_SCOPE_BYTES = 8,
     DMAR_SINGLE_BYTES = DMAR_HEADER_BYTES + DRHD_HEADER_BYTES,
@@ -44,7 +45,7 @@ static enum { CFI_WRITABLE, CFI_BLOCKED, CFI_PASS_ONLY } cfi_behavior;
 static bool cfi_on_requested, cfi_clear_requested, remapping_bypass_started;
 static struct unit *cfi_pass_only_unit;
 static bool early_unit_enable, ioapic_pin_masked, ioapic_pin_remappable, compatibility_pin_blocked;
-static bool eime_without_sirtp;
+static bool eime_without_sirtp, fault_event_before_sirtp; /* 後者: EIMEの前に故障イベントのmaskが外れた */
 static struct pmm_range model_ram[3]; /* own queue, status page, optional overlap counterexample */
 static unsigned model_nram;
 static bool ram_complete, fail_allocation;
@@ -57,10 +58,21 @@ static uint32_t late_data;
 static unsigned freed_pages;
 static unsigned reserved_calls;
 static uint64_t reserved_start, reserved_end;
+/* PMEN模擬: PRSがEPMに従う。TE有効化時にPRSが立っていたunitのbit、他unitのTE前にPRSが落ちたか。 */
+static bool pmen_model, pmr_released_early, te_requested, cpus_x2apic;
+static unsigned te_under_pmr;
+static struct unit *te_stuck_unit; /* TEを確認しないunit */
 
-#define CHECK(x) do { if (!(x)) { printf("失敗 %d行: %s\n", __LINE__, #x); failures++; } } while (0)
+#define CHECK(x) do { checks++; if (!(x)) { printf("失敗 %d行: %s\n", __LINE__, #x); failures++; } } while (0)
 
 static void model_step_unit(struct unit *u) {
+    if (pmen_model) {
+        uint32_t pmen = rd32(u, R_PMEN);
+        if (pmen & PMEN_PRS && !(pmen & PMEN_EPM) && intel.translating)
+            for (size_t i = 0; i < nunits; i++)
+                if (&units[i] != u && !(rd32(&units[i], R_GSTS) & GCMD_TE)) pmr_released_early = true;
+        wr32(u, R_PMEN, pmen & PMEN_EPM ? pmen | PMEN_PRS : pmen & ~PMEN_PRS);
+    }
     if (run_commands) {
         uint32_t old = rd32(u, R_GSTS), cmd = rd32(u, R_GCMD);
         uint32_t next = cmd & ~GSTS_ONESHOT;
@@ -69,6 +81,9 @@ static void model_step_unit(struct unit *u) {
         if (!(cmd & GCMD_CFI) && (old & GCMD_CFI)) cfi_clear_requested = true;
         if (cfi_behavior == CFI_BLOCKED) next &= ~GCMD_CFI;
         if (cfi_behavior == CFI_PASS_ONLY || u == cfi_pass_only_unit) next |= GCMD_CFI;
+        if (cmd & GCMD_TE) te_requested = true;
+        if (u == te_stuck_unit) next &= ~GCMD_TE;
+        if (!(old & GCMD_TE) && next & GCMD_TE && rd32(u, R_PMEN) & PMEN_PRS) te_under_pmr |= 1u << (u - units);
         if (!extended && !(old & GCMD_IRE) && (next & (GCMD_IRE | GCMD_CFI)) == (GCMD_IRE | GCMD_CFI))
             remapping_bypass_started = true;
         if (!extended && !(old & GCMD_IRE) && (next & GCMD_IRE))
@@ -76,6 +91,8 @@ static void model_step_unit(struct unit *u) {
                 if (rd32(&units[i], R_GSTS) & GCMD_CFI) early_unit_enable = true;
         if (extended && !(old & GCMD_IRE) && (next & GCMD_IRE) && !(old & GCMD_SIRTP))
             eime_without_sirtp = true;
+        if ((cmd & GCMD_SIRTP) && !(old & GCMD_SIRTP) && !(rd32(u, R_FECTL) & FECTL_IM))
+            fault_event_before_sirtp = true;
         if (!ioapic_pin_masked && !ioapic_pin_remappable && (next & GCMD_IRE) &&
             (extended || !(next & GCMD_CFI)))
             compatibility_pin_blocked = true;
@@ -176,8 +193,13 @@ bool iommu_map(struct iommu_domain *dom, const uint64_t *frames, uint64_t base, 
     (void)dom; (void)frames; (void)base; (void)count; return false;
 }
 void iommu_domain_free(struct iommu_domain *dom) { (void)dom; }
+static uint16_t requester_id; /* the one ID every function sends with, 0: not known */
 uint16_t *iommu_requester_ids(const struct pci_device *device, unsigned *count) {
-    (void)device; *count = 0; return NULL;
+    (void)device;
+    uint16_t *ids = requester_id ? malloc(sizeof *ids) : NULL;
+    if (ids) ids[0] = requester_id;
+    *count = ids ? 1 : 0;
+    return ids;
 }
 uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {
     (void)bus; (void)dev; (void)fn; (void)off; return UINT32_MAX;
@@ -187,7 +209,7 @@ const void *acpi_find(const char sig[4], unsigned index) {
 }
 const struct acpi_ioapic *acpi_ioapics(unsigned *count) { *count = 0; return NULL; }
 uint32_t lapic_current_id(void) { return 0; }
-bool lapic_x2apic(void) { return false; }
+bool lapic_x2apic(void) { return cpus_x2apic; }
 int irq_vector_alloc(unsigned count, unsigned align) { (void)count; (void)align; return -1; }
 void vector_register(int vector, irq_handler_t handler) { (void)vector; (void)handler; }
 
@@ -216,7 +238,7 @@ static void reset_model(void) {
     cfi_on_requested = cfi_clear_requested = remapping_bypass_started = false;
     cfi_pass_only_unit = NULL;
     early_unit_enable = ioapic_pin_remappable = compatibility_pin_blocked = false;
-    eime_without_sirtp = false;
+    eime_without_sirtp = fault_event_before_sirtp = false;
     ioapic_pin_masked = true;
     parse_lost = false;
     units_incomplete = false;
@@ -232,6 +254,11 @@ static void reset_model(void) {
     freed_pages = 0;
     reserved_calls = 0;
     reserved_start = reserved_end = 0;
+    pmen_model = pmr_released_early = te_requested = cpus_x2apic = false;
+    requester_id = 0;
+    te_under_pmr = 0;
+    te_stuck_unit = NULL;
+    dmar_flags = 0;
     model_nram = 2;
     model_ram[0] = (struct pmm_range){(uintptr_t)own_queue, (uintptr_t)own_queue + PAGE_SIZE};
     model_ram[1] = (struct pmm_range){(uintptr_t)semaphore_page, (uintptr_t)semaphore_page + PAGE_SIZE};
@@ -1102,6 +1129,276 @@ static void compatibility_blocking_cases(void) {
     CHECK(!remapping_bypass_started); /* isolation is not evidence of lossless pin migration */
 }
 
+/* 停止した二unit、それぞれVER.MAJORがmajor0/major1で、ファームウェアのPMRが有効。 */
+static uint64_t pair_registers[PAGE_SIZE / sizeof(uint64_t)];
+static struct unit pmr_pair[2];
+static void pmr_pair_setup(unsigned major0, unsigned major1) {
+    reset_model();
+    memset(pair_registers, 0, sizeof pair_registers);
+    pmr_pair[0] = pmr_pair[1] = model_unit;
+    pmr_pair[1].regs = (volatile uint8_t *)pair_registers;
+    pmr_pair[1].queue = iommu_alloc_pages(1);
+    units = pmr_pair;
+    nunits = ARRAY_SIZE(pmr_pair);
+    const unsigned majors[] = {major0, major1};
+    for (unsigned i = 0; i < ARRAY_SIZE(pmr_pair); i++) {
+        struct unit *u = &pmr_pair[i];
+        u->queue_on = false;
+        u->root = (uintptr_t)own_queue;
+        u->cap = CAP_PLMR;
+        wr32(u, R_VER, majors[i] << 4);
+        wr32(u, R_GSTS, 0);
+        wr32(u, R_PMEN, PMEN_EPM | PMEN_PRS);
+    }
+    run_commands = pmen_model = true;
+}
+
+static void protected_memory_cases(void) {
+    const uint32_t on = PMEN_EPM | PMEN_PRS;
+    /* VER 2以上: PMRはTE下でも遮断する。全unitのTE確認後に別の段で解除する（11.4.8.1）。 */
+    pmr_pair_setup(2, 2);
+    CHECK(units_start(true));
+    CHECK(rd32(&pmr_pair[0], R_PMEN) == 0 && rd32(&pmr_pair[1], R_PMEN) == 0);
+    CHECK(te_under_pmr == 3 && !pmr_released_early);
+    /* 後のunitのTEが確認されなければ、先のunitのPMRも解除しない。共通層のshutdownも同じ。 */
+    pmr_pair_setup(2, 2);
+    te_stuck_unit = &pmr_pair[1];
+    CHECK(!units_start(true) && pmr_pair[1].command_failed);
+    CHECK(rd32(&pmr_pair[0], R_PMEN) == on && rd32(&pmr_pair[1], R_PMEN) == on);
+    CHECK(!intel_shutdown() && rd32(&pmr_pair[0], R_PMEN) == on && rd32(&pmr_pair[1], R_PMEN) == on);
+
+    /* VER 2未満: TE下で再割当て要求をPMRへ通しうるため、TE前に解除する。VER 2のunitのTEが先。 */
+    pmr_pair_setup(1, 2);
+    CHECK(units_start(true));
+    CHECK(te_under_pmr == 2 && !pmr_released_early);
+    CHECK(rd32(&pmr_pair[0], R_PMEN) == 0 && rd32(&pmr_pair[1], R_PMEN) == 0);
+    CHECK((rd32(&pmr_pair[0], R_GSTS) & GCMD_TE) && (rd32(&pmr_pair[1], R_GSTS) & GCMD_TE));
+    pmr_pair_setup(1, 2);
+    te_stuck_unit = &pmr_pair[1]; /* VER 2のTE失敗: 旧unitのPMRには触れない */
+    CHECK(!units_start(true));
+    CHECK(rd32(&pmr_pair[0], R_PMEN) == on && !(rd32(&pmr_pair[0], R_GSTS) & GCMD_TE));
+    pmr_pair_setup(2, 1);
+    te_stuck_unit = &pmr_pair[1]; /* 旧unit自身のTE失敗: 解除済みは自分だけ、VER 2のPMRは残る */
+    CHECK(!units_start(true) && !pmr_released_early);
+    CHECK(rd32(&pmr_pair[0], R_PMEN) == on && rd32(&pmr_pair[1], R_PMEN) == 0);
+    CHECK(!(te_under_pmr & 2));
+
+    /* 停止のまま残す経路: shutdownはPMRも解除し、units_plain_safeの「plain」と一致する。 */
+    reset_model();
+    model_unit.queue_on = false;
+    model_unit.readable = true;
+    model_unit.cap = CAP_PLMR;
+    run_commands = pmen_model = true;
+    wr32(&model_unit, R_GSTS, 0);
+    wr32(&model_unit, R_PMEN, on);
+    CHECK(!units_plain_safe());
+    CHECK(!intel_start(false) && rd32(&model_unit, R_PMEN) == on); /* 不要な開始はPMRに触れない */
+    CHECK(intel_shutdown() && rd32(&model_unit, R_PMEN) == 0 && units_plain_safe());
+    reset_model();
+    model_unit.queue_on = false;
+    model_unit.readable = true;
+    model_unit.cap = CAP_PHMR;
+    run_commands = true; /* PRSが落ちない */
+    wr32(&model_unit, R_GSTS, 0);
+    wr32(&model_unit, R_PMEN, on);
+    CHECK(!intel_shutdown() && model_unit.command_failed && !units_plain_safe());
+    CHECK(!intel_shutdown()); /* 未確認のPMEN操作の後に次の命令を出さない */
+}
+
+/* A DMAR with these flags and one DRHD over the model unit's registers, which report ecap. */
+static void dmar_one_unit(uint8_t flags, uint64_t ecap) {
+    memset(dmar_fixture, 0, sizeof dmar_fixture);
+    ((struct acpi_sdt *)dmar_fixture)->length = DMAR_SINGLE_BYTES;
+    dmar_fixture[36] = 47; /* HAW=48 */
+    dmar_fixture[DMAR_FLAGS] = flags;
+    dmar_fixture[DMAR_HEADER_BYTES + 2] = DRHD_HEADER_BYTES;
+    uint64_t address = (uintptr_t)registers;
+    memcpy(dmar_fixture + DMAR_HEADER_BYTES + 8, &address, sizeof address);
+    wr64(&model_unit, R_CAP, (47ull << 16) | (4ull << 8)); /* MGAW=48, SAGAW=48 */
+    wr64(&model_unit, R_ECAP, ecap);
+    units = NULL;
+    nunits = units_room = 0;
+    have_dmar = true;
+}
+
+static void dmar_flag_cases(void) {
+    /* DMA_REMAP_OPT_OUT（8.1）: TEを書かない。対照としてflagなしではTEが立つ。 */
+    for (unsigned opt_out = 0; opt_out <= 1; opt_out++) {
+        reset_model();
+        model_unit.queue_on = false;
+        run_commands = true;
+        wr32(&model_unit, R_GSTS, 0);
+        dmar_flags = opt_out ? DMAR_DMA_REMAP_OPT_OUT : 0;
+        CHECK(intel_start(true) == !opt_out);
+        CHECK(intel.translating == !opt_out && te_requested == !opt_out);
+        CHECK(intel_shutdown());
+    }
+    /* 割込み再割当てが必須のunitでは再割当てだけを開始し、変換なしと報告する。PMRはIRE確認後に解除。 */
+    reset_model();
+    model_unit.queue_on = false;
+    model_unit.cap = CAP_PLMR;
+    remap = irreq = run_commands = pmen_model = true;
+    wr32(&model_unit, R_GSTS, 0);
+    wr32(&model_unit, R_PMEN, PMEN_EPM | PMEN_PRS);
+    dmar_flags = DMAR_INTR_REMAP | DMAR_DMA_REMAP_OPT_OUT;
+    CHECK(intel_start(true));
+    CHECK(!intel.translating && !te_requested);
+    CHECK((rd32(&model_unit, R_GSTS) & (GCMD_IRE | GCMD_TE)) == GCMD_IRE);
+    CHECK(rd32(&model_unit, R_PMEN) == 0);
+
+    /* CPUをx2APICモードに置けない理由（8.1、5.1.4、5.1.6、11.4.10）: DMARとunitのECAPだけを読み、
+       レジスターへは何も書かない。X2APIC_OPT_OUTはINTR_REMAPがあるときだけ有効で、EIMERのunitが
+       あるときは無視する（8.1: そのときClearでなければならない）。 */
+    const uint64_t plain_ecap = ECAP_C | ECAP_QI | (16ull << 8);
+    reset_model();
+    have_dmar = false;
+    CHECK(!iommu_intel_x2apic_conflict());
+    const struct { uint8_t flags; uint64_t ecap; const char *why; } conflict_cases[] = {
+        {0, ECAP_IR, NULL},                   /* 割込み再割当てを記述しない */
+        {DMAR_X2APIC_OPT_OUT, ECAP_IR, NULL}, /* INTR_REMAPなしのflagは無効 */
+        {DMAR_INTR_REMAP, ECAP_IR | ECAP_EIM, NULL},
+        {DMAR_INTR_REMAP, ECAP_IR, "no EIM"}, /* xAPIC形式だけで再割当てする */
+        {DMAR_INTR_REMAP, 0, NULL},           /* unitが再割当てしない */
+        {DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT, ECAP_IR | ECAP_EIM, "X2APIC_OPT_OUT"},
+        {DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT | DMAR_DMA_REMAP_OPT_OUT, ECAP_IR | ECAP_EIM, "X2APIC_OPT_OUT"},
+        {DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT, ECAP_IR, "X2APIC_OPT_OUT"},
+        {DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT, 0, "X2APIC_OPT_OUT"}, /* 再割当てしなくても依頼は有効 */
+        {DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT, ECAP_IR | ECAP_EIM | ECAP_EIMER, NULL},
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(conflict_cases); i++) {
+        reset_model();
+        dmar_one_unit(conflict_cases[i].flags, plain_ecap | conflict_cases[i].ecap);
+        uint64_t before[ARRAY_SIZE(registers)];
+        memcpy(before, registers, sizeof before);
+        const char *why = iommu_intel_x2apic_conflict();
+        CHECK(conflict_cases[i].why ? why && strstr(why, conflict_cases[i].why) : !why);
+        CHECK(!memcmp(before, registers, sizeof before));
+        have_dmar = false;
+    }
+    /* 読まないunit（mapできない、基底がレジスター集合に揃わない、Sizeの予約bit: 8.3）は何も
+       再割当てしない。読み違えれば見えるECAP（EIMなしの再割当て）を、ずれた位置にも置く。 */
+    for (unsigned how = 0; how < 3; how++)
+        for (unsigned opt_out = 0; opt_out <= 1; opt_out++) {
+            reset_model();
+            dmar_one_unit(DMAR_INTR_REMAP | (opt_out ? DMAR_X2APIC_OPT_OUT : 0), plain_ecap | ECAP_IR);
+            if (how == 0) unreadable_mmio = (uintptr_t)registers;
+            if (how == 1) {
+                uint64_t shifted = (uintptr_t)registers + PAGE_SIZE / 2;
+                memcpy(dmar_fixture + 56, &shifted, sizeof shifted);
+                wr64(&model_unit, PAGE_SIZE / 2 + R_ECAP, plain_ecap | ECAP_IR);
+            }
+            if (how == 2) dmar_fixture[DMAR_HEADER_BYTES + 5] = 0x10;
+            const char *why = iommu_intel_x2apic_conflict();
+            CHECK(opt_out ? why && strstr(why, "X2APIC_OPT_OUT") : !why);
+            have_dmar = false;
+        }
+    /* 再割当てする全unitを数える。読めないunitがあればprobeはVT-dを使わず、EIMERとも数えない。 */
+    const struct { bool unread; uint8_t flags; uint64_t second; const char *why; } pair_cases[] = {
+        {false, DMAR_INTR_REMAP, ECAP_IR, "no EIM"},
+        {true, DMAR_INTR_REMAP, ECAP_IR, NULL},
+        {true, DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT, ECAP_IR | ECAP_EIM, "X2APIC_OPT_OUT"},
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(pair_cases); i++) {
+        reset_model();
+        dmar_one_unit(pair_cases[i].flags, plain_ecap | ECAP_IR | ECAP_EIM);
+        ((struct acpi_sdt *)dmar_fixture)->length = DMAR_PAIR_BYTES;
+        dmar_fixture[DMAR_SINGLE_BYTES + 2] = DRHD_HEADER_BYTES;
+        uint64_t second = (uintptr_t)registers + PAGE_SIZE;
+        memcpy(dmar_fixture + DMAR_SINGLE_BYTES + 8, &second, sizeof second);
+        wr64(&model_unit, PAGE_SIZE + R_ECAP, plain_ecap | pair_cases[i].second);
+        if (pair_cases[i].unread) unreadable_mmio = (uintptr_t)registers;
+        const char *why = iommu_intel_x2apic_conflict();
+        CHECK(pair_cases[i].why ? why && strstr(why, pair_cases[i].why) : !why);
+        have_dmar = false;
+    }
+    reset_model();
+    dmar_one_unit(DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT, plain_ecap | ECAP_IR);
+    ((struct acpi_sdt *)dmar_fixture)->length = DMAR_HEADER - 1; /* Flagsはあるが固定部が欠ける */
+    CHECK(!iommu_intel_x2apic_conflict());
+    have_dmar = false;
+
+    /* Extended Interrupt ModeはCPUのモードに従う（11.4.10）: x2APICのCPUには全unitのEIMが要り、
+       無ければ再割当てしない。xAPICのCPUではEIMのunitでもxAPIC形式で再割当てする。 */
+    const struct { bool cpus, eim, remap, x2; } mode_cases[] = {
+        {true, true, true, true}, {true, false, false, false}, {false, true, true, false}, {false, false, true, false},
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(mode_cases); i++) {
+        reset_model();
+        dmar_one_unit(DMAR_INTR_REMAP, plain_ecap | ECAP_IR | (mode_cases[i].eim ? ECAP_EIM : 0));
+        cpus_x2apic = mode_cases[i].cpus;
+        bool plain_safe;
+        CHECK(iommu_intel_probe(&plain_safe) == &intel);
+        CHECK(remap == mode_cases[i].remap && x2 == mode_cases[i].x2);
+        free(units);
+        units = NULL;
+        have_dmar = false;
+    }
+
+    /* EIMERとX2APIC_OPT_OUTの矛盾: unitの要件（EIME）とCPUの実際のモードで決まる。 */
+    for (unsigned cpus = 0; cpus <= 1; cpus++) {
+        reset_model();
+        dmar_one_unit(DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT, plain_ecap | ECAP_IR | ECAP_EIM | ECAP_EIMER);
+        cpus_x2apic = cpus;
+        bool plain_safe;
+        CHECK(iommu_intel_probe(&plain_safe) == &intel && x2apic_opt_out(dmar_flags));
+        CHECK(remap == !!cpus && x2 == !!cpus);
+        free(units);
+        units = NULL;
+        have_dmar = false;
+    }
+}
+
+/* 割込みメッセージはCPUのAPICモードに従う: x2APICの255超の宛先はIRTEのbit 63:32（9.10）と障害
+   通知のFEUADDR bit 31:8（5.1.6.2、11.4.7.5）へ入る。通常のメッセージとxAPICのIRTEは8 bitだけ
+   なので、それより大きい宛先は断る。 */
+static void x2apic_message_cases(void) {
+    reset_model();
+    irt = iommu_alloc_pages(IRT_ENTRIES * 16 / PAGE_SIZE);
+    requester_id = 0x0108;
+    struct pci_device d = {0};
+    volatile uint64_t *entry = (volatile uint64_t *)(uintptr_t)irt + IOAPIC_ENTRIES * 2; /* block 0, message 0 */
+    const uint32_t remappable = 0xFEE00000u | IOAPIC_ENTRIES << 5 | 1u << 4 | 1u << 3;
+    for (unsigned extended = 0; extended <= 1; extended++) {
+        remap = true;
+        x2 = extended;
+        uint32_t address = 0, data = 1;
+        CHECK(intel_msi(&d, 0, 1, 0x40, 0x1234, &address, &data) == extended);
+        if (extended)
+            CHECK(entry[0] == (IRTE_P | IRTE_VECTOR(0x40) | 0x1234ull << 32) && entry[1] == IRTE_SID(0x0108, 1));
+        CHECK(intel_msi(&d, 0, 1, 0x41, 0xAB, &address, &data));
+        CHECK(entry[0] == (IRTE_P | IRTE_VECTOR(0x41) | (extended ? 0xABull << 32 : 0xABull << 40)));
+        CHECK(address == remappable && data == 0);
+        CHECK(intel_msi_clear(&d) && !entry[0]);
+    }
+    remap = x2 = false;
+    uint32_t address = 0, data = 0;
+    CHECK(!intel_msi(&d, 0, 1, 0x40, 0x100, &address, &data));
+    CHECK(intel_msi(&d, 0, 1, 0x40, 0xAB, &address, &data) && address == iommu_msi_plain(0xAB) && data == 0x40);
+
+    for (unsigned extended = 0; extended <= 1; extended++)
+        for (unsigned wide = 0; wide <= 1; wide++) {
+            reset_model();
+            model_unit.queue_on = false;
+            model_unit.root = (uintptr_t)own_queue;
+            run_commands = remap = true;
+            x2 = extended;
+            fault_vector = 0x50;
+            wr32(&model_unit, R_GSTS, 0);
+            wr32(&model_unit, R_FECTL, FECTL_IM);
+            uint32_t bsp = wide ? 0x12345 : 0x45;
+            bool sent = extended || !wide;
+            CHECK(unit_tables(&model_unit, bsp));
+            CHECK(rd32(&model_unit, R_FEDATA) == (sent ? 0x50u : 0));
+            CHECK(rd32(&model_unit, R_FEADDR) == (sent ? iommu_msi_plain(0x45) : 0));
+            CHECK(rd32(&model_unit, R_FEUADDR) == (sent ? bsp & ~0xFFu : 0));
+            CHECK(rd32(&model_unit, R_FECTL) == (sent ? 0 : FECTL_IM));
+            CHECK(rd64(&model_unit, R_IRTA) == (irt | (extended ? IRTA_EIME : 0) | IRT_S));
+            CHECK(!fault_event_before_sirtp);
+        }
+    fault_vector = -1;
+    irt = 0;
+}
+
 int main(void) {
     own_queue = _aligned_malloc(PAGE_SIZE, PAGE_SIZE);
     semaphore_page = _aligned_malloc(PAGE_SIZE, PAGE_SIZE);
@@ -1114,6 +1411,9 @@ int main(void) {
     startup_cases();
     power_transition_cases();
     compatibility_blocking_cases();
+    protected_memory_cases();
+    dmar_flag_cases();
+    x2apic_message_cases();
     width_probe_case();
     probe_plain_cases();
     probe_register_bounds_cases();
@@ -1123,6 +1423,6 @@ int main(void) {
     _aligned_free(own_queue);
     _aligned_free(semaphore_page);
     _aligned_free(firmware_queue);
-    printf("Intel VT-d MMIO模擬検証: 失敗 %u（実機DMA・割込みは未検証）\n", failures);
+    printf("Intel VT-d MMIO模擬検証: 検査 %u、失敗 %u（実機DMA・割込みは未検証）\n", checks, failures);
     return failures != 0;
 }

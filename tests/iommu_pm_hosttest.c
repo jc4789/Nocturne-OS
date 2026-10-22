@@ -84,6 +84,8 @@ bool wake_sleep(void (*enter)(void)) {
     return slept_model;
 }
 void lapic_resume(void) { CHECK(pic_masks == UINT16_MAX && (window[4] & RTE_MASK)); }
+static uint32_t addressable_max = 0x0E; /* 4bit IDのAMD APIC（0x0Fは放送）、またはx2APIC */
+bool lapic_addressable(uint32_t id) { return id <= addressable_max; }
 void serial_init(void) {}
 bool iommu_resume(void) {
     CHECK(pic_masks == UINT16_MAX && (window[4] & RTE_MASK));
@@ -106,6 +108,7 @@ void wm_notify(const char *title,const char *text) { (void)title;(void)text; }
    ACPI/IOAPIC初期化）が参照する境界。PEリンカーは未解決を許さないため定義するだけで、
    挙動は模擬しない。万一到達したら黙って成功せず異常終了する。 */
 uint64_t hhdm_offset, isr_stub_table[256];
+char wrmsr_checked_write[1], wrmsr_checked_refused[1]; /* isr.asmの番地: 割込み入口の比較だけが参照 */
 volatile uint64_t timer_ticks;
 volatile bool tick_stopped;
 static NORETURN void unreached(const char *name) {
@@ -186,7 +189,19 @@ static void test_routes(void) {
     CHECK(!ioapic_route(0,0x30,0,false,false));
     CHECK(given[0][0] & RTE_MASK); /* failed new route must not revive a caller's retired vector */
     unsigned before=remap_calls; route_ok=true;
+    /* 宛先にできないID（4bit IDの0x0F、x2APICでも8bitのRTEでは放送の0xFF、8bitを超えるID）へは
+       経路を書かない */
+    CHECK(!ioapic_route(0,0x30,0x0F,false,false));
+    addressable_max=UINT32_MAX-1;
+    CHECK(!ioapic_route(0,0x30,0xFF,false,false) && !ioapic_route(0,0x30,0x100,false,false));
+    addressable_max=0x0E;
+    CHECK(remap_calls == before && (given[0][0] & RTE_MASK));
     CHECK(ioapic_remap() && remap_calls == before);
+    /* 境界の内側: x2APICでも8bit RTEに入る0xFEは書く */
+    addressable_max=UINT32_MAX-1;
+    CHECK(ioapic_route(0,0x30,0xFE,false,false) && remap_calls == before+1);
+    CHECK(!(given[0][0] & RTE_MASK) && (given[0][0] >> 56) == 0xFE);
+    addressable_max=0x0E;
     reset_model(); ioapic_suspend();
     CHECK((window[4] & RTE_MASK) && !(saved_rte[0][0] & RTE_MASK));
     ioapic_resume(); CHECK(!(window[4] & RTE_MASK));

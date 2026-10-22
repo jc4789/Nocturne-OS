@@ -288,9 +288,14 @@ void smp_resume(void) {
         __atomic_store_n(&w->ready, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&w->failed, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&w->runner_ready, 0, __ATOMIC_RELEASE);
-        /* worker_main as if called: the return address slot below an aligned top */
-        wake_prepare((uint64_t)worker_main, (uint64_t)w->stack + sizeof w->stack - 8, (uint64_t)w);
-        bool sent = lapic_start_ap(w->apic_id, wake_page());
+        /* The INIT before the wake page names this CPU: one still on its way through the page from
+           an earlier STARTUP (wake.h) is reset, not let in as this one. worker_main as if called:
+           the return address slot below an aligned top. */
+        bool sent = lapic_send_init(w->apic_id);
+        if (sent) {
+            wake_prepare((uint64_t)worker_main, (uint64_t)w->stack + sizeof w->stack - 8, (uint64_t)w, w->apic_id);
+            sent = lapic_send_startup(w->apic_id, wake_page());
+        }
         uint64_t since = rdtsc(), spins = 0;
         while (sent && !__atomic_load_n(&w->ready, __ATOMIC_ACQUIRE) && !__atomic_load_n(&w->failed, __ATOMIC_ACQUIRE) &&
                !deadline(since, START_TIMEOUT_MS, ++spins)) pause();
@@ -495,10 +500,14 @@ static void selftest(void) {
 
 void smp_init(struct limine_mp_response *response) {
     if (response && response->cpu_count) detected = (unsigned)MIN(response->cpu_count, 0xFFFFFFFFULL);
-    if (!response || cmdline_has("nosmp") || !lapic_present() ||
-        ((response->flags & LIMINE_MP_RESPONSE_X86_64_X2APIC) != 0) != lapic_x2apic() ||
-        response->bsp_lapic_id != lapic_current_id()) {
-        kprintf("smp: single CPU fallback (%s)\n", cmdline_has("nosmp") ? "nosmp" : "MP/APIC unavailable or mode/ID mismatch");
+    /* The APs may be in another APIC mode than the BSP (apic_init left x2APIC mode for the IOMMU,
+       iommu_x2apic_conflict): lapic_worker_init takes each one started to the BSP's. One not
+       started (nosmp, beyond CPU_MAX_COUNT) stays parked by the bootloader in its mode, and is
+       sent no interrupt. The BSP's own ID has to be one an IPI can name too (lapic_addressable). */
+    if (!response || cmdline_has("nosmp") || !lapic_present() || response->bsp_lapic_id != lapic_current_id() ||
+        !lapic_addressable(response->bsp_lapic_id)) {
+        kprintf("smp: single CPU fallback (%s)\n",
+                cmdline_has("nosmp") ? "nosmp" : "MP/APIC unavailable, or the BSP's APIC ID mismatched or not addressable");
         selftest();
         return;
     }
@@ -512,8 +521,7 @@ void smp_init(struct limine_mp_response *response) {
     if (have_pat) bsp_pat = rdmsr(0x277);
     for (uint64_t i = 0; i < response->cpu_count && slots < CPU_MAX_COUNT; i++) {
         struct limine_mp_info *info = response->cpus[i];
-        if (!info || info->lapic_id == bsp_apic_id || info->lapic_id == UINT32_MAX ||
-            (!lapic_x2apic() && info->lapic_id >= 255)) continue;
+        if (!info || info->lapic_id == bsp_apic_id || !lapic_addressable(info->lapic_id)) continue;
         bool duplicate = false;
         for (unsigned j = 1; j < slots; j++) if (workers[j].apic_id == info->lapic_id) duplicate = true;
         if (duplicate) continue;

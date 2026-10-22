@@ -75,6 +75,18 @@ static inline uint64_t rdmsr(uint32_t msr) {
 static inline void wrmsr(uint32_t msr, uint64_t v) {
     __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
 }
+/* A write the manuals allow but a model's own document says faults (arch/apic.c): false where
+   it raised #GP, which isr_dispatch resumes past (arch/isr.asm). */
+bool wrmsr_checked(uint32_t msr, uint64_t v);
+/* The vendor CPUID leaf 0 names in EBX, EDX, ECX ("GenuineIntel"; "AuthenticAMD", and
+   "HygonGenuine", which follows AMD's manuals). */
+enum cpu_vendor { CPU_VENDOR_OTHER, CPU_VENDOR_INTEL, CPU_VENDOR_AMD };
+static inline enum cpu_vendor cpu_vendor_of(uint32_t b, uint32_t c, uint32_t d) {
+    if (b == 0x756E6547 && d == 0x49656E69 && c == 0x6C65746E) return CPU_VENDOR_INTEL;
+    if ((b == 0x68747541 && d == 0x69746E65 && c == 0x444D4163) || (b == 0x6F677948 && d == 0x6E65476E && c == 0x656E6975))
+        return CPU_VENDOR_AMD;
+    return CPU_VENDOR_OTHER;
+}
 static inline uint64_t read_cr0(void) { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
 static inline void write_cr0(uint64_t v) { __asm__ volatile("mov %0, %%cr0" : : "r"(v) : "memory"); }
 static inline uint64_t read_cr2(void) { uint64_t v; __asm__ volatile("mov %%cr2, %0" : "=r"(v)); return v; }
@@ -129,16 +141,22 @@ void irq_register(int irq, irq_handler_t h); /* a line may have a few handlers; 
 void irq_unregister(int irq, irq_handler_t h);
 void vector_register(int vec, irq_handler_t h);
 bool lapic_present(void);
-bool lapic_x2apic(void); /* Limineが選んだBSP/AP共通mode。起動後の切替は禁止。 */
+bool lapic_x2apic(void); /* BSP/AP共通mode：Limineの選択（IOMMUの要件、iommu_x2apic_conflictではapic_initがxAPICへ戻す）。以後の切替は禁止。 */
 uint32_t lapic_current_id(void);
+/* A physical destination the APIC mode in use addresses, not its broadcast: below FFh in xAPIC
+   mode (below Fh on an AMD APIC without the 8-bit ID), below FFFFFFFFh in x2APIC mode. */
+bool lapic_addressable(uint32_t apic_id);
 bool lapic_worker_init(void);
 bool lapic_send_ipi(uint32_t apic_id, uint8_t vector);
 void lapic_eoi(void);
 bool lapic_timer_start(unsigned hz, int vector);
 bool lapic_runner_timer_start(void); /* BSPで較正済みのperiodic tickだけをAPで再使用 */
 void lapic_resume(void); /* BSP after S3: registers and the calibrated tick again */
-bool lapic_start_ap(uint32_t apic_id, uint64_t page); /* INIT-SIPI-SIPI into real mode at page */
-bool lapic_send_init(uint32_t apic_id); /* INIT only: the AP waits for a STARTUP, running nothing */
+bool lapic_send_init(uint32_t apic_id); /* INIT: the AP waits for a STARTUP, running nothing */
+bool lapic_send_startup(uint32_t apic_id, uint64_t page); /* after an INIT: into real mode at page */
+/* The xAPIC ID register's mapping (NULL in x2APIC mode), which a CPU a STARTUP reached reads to
+   learn whether the STARTUP was its own (arch/wake.h). */
+const volatile uint32_t *lapic_id_register(void);
 /* Tickless idle, after lapic_timer_start: stop this CPU's tick, fire it once after ms, or go
    back to the periodic tick. */
 void lapic_tick_stop(void);

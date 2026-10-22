@@ -330,11 +330,17 @@ uacpi_status uacpi_kernel_pci_device_open(uacpi_pci_address a, uacpi_handle *out
 }
 void uacpi_kernel_pci_device_close(uacpi_handle h) { kfree(h); }
 
-static uint32_t cfg_read(struct pci_handle *h, uacpi_size off) { return pci_read32(h->bus, h->dev, h->fn, off & ~3u); }
+/* None goes to a function an FLR is under way on (dev/pci.h), which may discard it: a read gets
+   all-ones, as from a function that does not answer, and a write is dropped. */
+static uint32_t cfg_read(struct pci_handle *h, uacpi_size off) {
+    if (pci_config_blocked(h->bus, h->dev, h->fn)) return 0xFFFFFFFFu;
+    return pci_read32(h->bus, h->dev, h->fn, off & ~3u);
+}
 
 /* Writes as wide as asked: a read-modify-write of the dword would write back the registers beside
    it, and status registers clear their bits when written with 1. */
 static void cfg_write(struct pci_handle *h, uacpi_size off, uint32_t v, unsigned bytes) {
+    if (pci_config_blocked(h->bus, h->dev, h->fn)) return;
     if (bytes == 1) pci_write8(h->bus, h->dev, h->fn, off, (uint8_t)v);
     else if (bytes == 2) pci_write16(h->bus, h->dev, h->fn, off, (uint16_t)v);
     else pci_write32(h->bus, h->dev, h->fn, off & ~3u, v);

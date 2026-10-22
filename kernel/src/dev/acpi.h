@@ -57,8 +57,9 @@ struct acpi_ecam {
 };
 const struct acpi_ecam *acpi_ecams(unsigned *count);
 
-/* Registry + MADT + MCFG, with a log summary of each. Called once from acpi_init(). The IOMMU
-   tables (DMAR, IVRS) are dev/iommu_intel.c's and dev/iommu_amd.c's. */
+/* Registry + MADT + MCFG, with a log summary of each, once: from boot (the IOAPICs are masked
+   before the APIC is set up) and acpi_init(). The IOMMU tables (DMAR, IVRS) are
+   dev/iommu_intel.c's and dev/iommu_amd.c's. */
 void acpi_tables_init(void);
 
 /* ---- AML (uACPI) ----

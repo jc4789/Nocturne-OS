@@ -31,9 +31,6 @@
 #define CLAIM_VECTORS 32 /* one pending bit each */
 #define CLAIM_GUARDS 32  /* registers with bits only the kernel changes (guards_init) */
 
-#define PCI_COMMAND_MEMORY (1u << 1)
-#define PCI_COMMAND_PARITY (1u << 6)
-
 /* A config dword some of whose bits are the kernel's: a write that would change them is refused. */
 struct guard {
     uint16_t offset;
@@ -211,7 +208,7 @@ static void claim_release(struct vnode *v) {
         }
     }
     bool blocked = c->domain && iommu_block(c->domain);
-    bool running = left_running || !stopped || !pci_requests_done(d, 0);
+    bool running = left_running || !stopped || !pci_requests_done(d);
     d->needs_reset |= running;
     c->dma_unsafe = !blocked;
     if (running)
@@ -282,7 +279,8 @@ static void guards_init(struct pci_claim *c) {
            functions widen the requester IDs, and Initiate FLR resets the function. */
         guard(c, d->pcie_cap + PCIE_DEVCTL, 7u << 5 | 1u << 9 | PCIE_DEVCTL_FLR);
         guard(c, d->pcie_cap + PCIE_LNKCTL, PCIE_LNKCTL_DISABLE);
-        guard(c, d->pcie_cap + PCIE_LNKCTL2, PCIE_LNKCTL2_COMPLIANCE | PCIE_LNKCTL2_MOD_COMPLIANCE);
+        if (d->pcie_v2)
+            guard(c, d->pcie_cap + PCIE_LNKCTL2, PCIE_LNKCTL2_COMPLIANCE | PCIE_LNKCTL2_MOD_COMPLIANCE);
     }
     /* Extended capabilities (ECAM only): BAR sizes, virtual functions, and the controls that
        decide how its requests are routed and translated. */
@@ -322,6 +320,31 @@ static bool guarded(const struct pci_claim *c, uint32_t offset, uint32_t width, 
     return false;
 }
 
+/* Completes an FLR an earlier caller left (its task was killed in one of its waits), with MSI
+   off: the saved configuration may hold an old MSI Enable. */
+static bool reset_finish(struct pci_device *m) {
+    if (!pci_function_reset(m) || !pci_msi_disable(m)) return false;
+    m->needs_reset = false;
+    return true;
+}
+
+/* No configuration access but the reset's own may reach a function under reset (dev/pci.h),
+   and forming a claim's group reads its members' ACS (dev/iommu.c refuses one under reset).
+   So an unfinished reset that no claim or domain holds is finished first, its function reserved
+   meanwhile. One that does not finish stays for a later claim, and groups with its function
+   are refused until then. False only when the caller was cancelled. */
+static bool resets_finish(void) {
+    for (int i = 0; i < pci_count(); i++) {
+        struct pci_device *m = pci_at(i);
+        if (!m->reset || m->claimed || iommu_in_use(m)) continue;
+        m->claimed = true;
+        reset_finish(m);
+        m->claimed = false;
+        if (current_task && current_task->killed) return false;
+    }
+    return true;
+}
+
 /* No app has a handle yet. The attached domain reserves every member across FLR sleeps;
    the primary is reserved by the caller too. A fresh peer must stop mastering even when
    it has not belonged to an app. An old app's peer also needs FLR: BME off pauses, not
@@ -334,13 +357,10 @@ static bool claim_recover(struct pci_claim *c) {
     for (unsigned i = 0; i < count; i++) {
         struct pci_device *m = c->domain ? c->domain->members[i] : d;
         if (current_task && current_task->killed) return false;
-        /* The earlier caller may have left before the FLR wait finished. Rejoin that
-           saved operation before BME/MSI accesses: Requests can be discarded during
-           FLR (6.6.2), so their readback is not a replacement for its remaining wait. */
-        if (m->reset) {
-            if (!pci_function_reset(m) || !pci_msi_disable(m)) return false;
-            m->needs_reset = false;
-        }
+        /* A reset left unfinished since resets_finish (a member no group read). Rejoin it
+           before BME/MSI accesses: Requests can be discarded during an FLR (6.6.2), so their
+           readback is not a replacement for its remaining wait. */
+        if (m->reset && !reset_finish(m)) return false;
         if (m != d && !pci_disable_busmaster(m, NULL) && !m->needs_reset) {
             m->needs_reset = true;
             return false;
@@ -373,9 +393,10 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     if (dev > 31 || func > 7) return -N_ERR_INVALID;
     struct pci_device *d = pci_find_function(bus, dev, func);
     if (!d) return -N_ERR_NOT_FOUND;
-    if (d->kernel_owned || d->claimed) return -N_ERR_BUSY;
     /* A bridge's registers route other devices' memory, buses and resets. */
     if (d->cls == 0x06) return -N_ERR_DENIED;
+    if (!resets_finish()) return -N_ERR_NOT_READY; /* may sleep: d is checked after */
+    if (d->kernel_owned || d->claimed) return -N_ERR_BUSY;
     struct vnode *v = kzalloc(sizeof *v);
     struct pci_claim *c = kzalloc(sizeof *c);
     if (!v || !c) { kfree(v); kfree(c); return -N_ERR_NO_MEMORY; }
@@ -491,9 +512,7 @@ static bool config_access_ok(uint32_t offset, uint32_t width) {
      device by device and gives up on a device whose function 0 does not answer, and a root port
      is often function 1 or later beside a host-bridge function 0;
    - the host bridges, which tell the driver what chipset the path starts at. */
-static bool is_host_bridge(const struct pci_device *d) {
-    return ((pci_read32(d->bus, d->dev, d->func, 0x08) >> 16) & 0xFFFF) == 0x0600;
-}
+static bool is_host_bridge(const struct pci_device *d) { return d->cls == 0x06 && d->subcls == 0x00; }
 static bool may_read(const struct pci_device *d, const struct pci_device *target) {
     if (target->bus == d->bus && target->dev == d->dev) return true;
     for (const struct pci_device *b = pci_upstream(d); b; b = pci_upstream(b))
@@ -511,6 +530,8 @@ int64_t pci_user_config_read(struct file *f, uint32_t target, uint32_t offset, u
         t = pci_find_function(target >> 8, (target >> 3) & 31, target & 7);
         if (!t) return -N_ERR_NOT_FOUND;
         if (!may_read(c->d, t)) return -N_ERR_DENIED;
+        /* under an FLR (dev/pci.h): another claim's, or one an ended claim left for a later claim to finish */
+        if (t->reset) return -N_ERR_NOT_READY;
     }
     uint32_t v = pci_read32(t->bus, t->dev, t->func, offset & ~3u) >> ((offset & 3) * 8);
     return width == 4 ? v : v & ((1u << (width * 8)) - 1);

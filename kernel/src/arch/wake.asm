@@ -2,8 +2,8 @@
 ; from S3 (the FACS waking vector), and each AP that the kernel starts itself with INIT-SIPI.
 ; arch/wake.c copies tramp_start..tramp_end to a page below 1 MiB and fills the data block at
 ; TRAMP_DATA in that page. Real mode -> 32-bit protected mode -> long mode through a page table
-; in low memory that maps the page itself and the kernel's upper half, then a jump to `entry`
-; with rsp = `stack` and rdi = `arg`.
+; in low memory that maps the page itself and the kernel's upper half, then, for the CPU the data
+; block names (arch/wake.h), a jump to `entry` with rsp = `stack` and rdi = `arg`.
 bits 16
 section .text
 
@@ -16,6 +16,8 @@ section .text
 %define TD_ENTRY   (TRAMP_DATA + 72)
 %define TD_STACK   (TRAMP_DATA + 80)
 %define TD_ARG     (TRAMP_DATA + 88)
+%define TD_ID_REG  (TRAMP_DATA + 96)
+%define TD_APIC_ID (TRAMP_DATA + 104)
 
 global tramp_start, tramp_pm32, tramp_lm64, tramp_end
 tramp_start:
@@ -55,10 +57,22 @@ tramp_pm32:
 bits 64
 tramp_lm64:
     mov ebx, ebx
+    mov rax, [rbx + TD_ID_REG]  ; a STARTUP that may have reached other CPUs (arch/wake.h):
+    test rax, rax               ; this one goes on only with the APIC ID it was sent to
+    jz .own
+    mov eax, [rax]
+    shr eax, 24
+    cmp eax, [rbx + TD_APIC_ID]
+    jne .other
+.own:
     mov rsp, [rbx + TD_STACK]
     mov rdi, [rbx + TD_ARG]
     mov rax, [rbx + TD_ENTRY]
     jmp rax
+.other:                         ; nothing written: halted until an INIT
+    cli
+    hlt
+    jmp .other
 tramp_end:
 
 ; ---- the BSP across S3 ----

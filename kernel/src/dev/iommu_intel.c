@@ -9,7 +9,9 @@
    interrupts are refused (they would let any device send any vector), so each MSI and IOAPIC
    pin is an entry of one shared table, checked against the requester ID of its source.
    Entries 0..255 are the IOAPIC pins by GSI, then 32 for each function with MSI or MSI-X on.
-   Units that require it get the x2APIC entry format (Extended Interrupt Mode). */
+   The entries take the CPUs' APIC mode: in x2APIC mode every unit uses the x2APIC format
+   (Extended Interrupt Mode), and remapping is off where a unit lacks EIM, or, in xAPIC mode,
+   requires it (EIMER). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/ioapic.h"
@@ -61,6 +63,7 @@
 #define PMEN_PRS (1u << 0)
 #define IRTA_EIME (1ull << 11)
 
+#define VER_MAJOR(v) (((unsigned)(v) >> 4) & 0xF)
 #define CAP_RWBF     (1ull << 4)
 #define CAP_PLMR     (1ull << 5)
 #define CAP_PHMR     (1ull << 6)
@@ -109,6 +112,14 @@
 #define IQA_QS               7u
 #define INV_BYTES            16u
 #define DRHD_SIZE_MASK       0x0Fu /* 8.3: log2 of 4KiB register pages; upper four bits reserved */
+
+/* the DMAR's fixed fields (8.1): Host Address Width, Flags, then the remapping structures */
+#define DMAR_HAW               36
+#define DMAR_FLAGS             37
+#define DMAR_HEADER            48
+#define DMAR_INTR_REMAP        (1u << 0)
+#define DMAR_X2APIC_OPT_OUT    (1u << 1) /* valid only with INTR_REMAP */
+#define DMAR_DMA_REMAP_OPT_OUT (1u << 3)
 
 /* interrupt remapping table */
 #define IRT_ENTRIES    4096
@@ -167,7 +178,7 @@ static const struct pci_device *msi_owner[MSI_BLOCKS];
 
 static struct iommu_hw intel;
 static bool queue_check(struct unit *u);
-static bool intel_shutdown(void);
+static bool units_off(void);
 
 static uint32_t rd32(const struct unit *u, unsigned off) { return mmio_read32(u->regs + off); }
 static void wr32(const struct unit *u, unsigned off, uint32_t v) { mmio_write32(u->regs + off, v); }
@@ -249,35 +260,84 @@ static void rmrr_scope(const uint8_t *s, int id, void *arg) {
     }
 }
 
-static bool parse_dmar(void) {
+/* The DMAR, when it holds its fixed fields: NULL otherwise. */
+static const struct acpi_sdt *dmar_table(void) {
     const struct acpi_sdt *h = acpi_find("DMAR", 0);
-    if (!h || h->length < 48) return false;
+    return h && h->length >= DMAR_HEADER ? h : NULL;
+}
+
+/* The register set of the DRHD at s (8.3): at *base, *bytes long (Size: log2 of its 4 KiB pages,
+   upper four bits reserved). False where it is not aligned to that whole set, as 8.3 requires: a
+   shifted base can make unrelated registers look like a valid, stopped unit, so nothing of it
+   may be mapped or read then. */
+static bool drhd_registers(const uint8_t *s, uint64_t *base, uint64_t *bytes) {
+    unsigned size = s[5];
+    memcpy(base, s + 8, sizeof *base);
+    *bytes = (uint64_t)PAGE_SIZE << (size & DRHD_SIZE_MASK);
+    return !(size & ~DRHD_SIZE_MASK) && *base && !(*base & (*bytes - 1)) && *base <= UINT64_MAX - *bytes;
+}
+
+/* X2APIC_OPT_OUT counts only with INTR_REMAP set (8.1). */
+static bool x2apic_opt_out(uint8_t flags) {
+    return (flags & (DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT)) == (DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT);
+}
+
+/* With interrupt remapping (INTR_REMAP), CPUs in x2APIC mode need every unit in Extended
+   Interrupt Mode, "x2APIC mode is active" (11.4.10), which a unit supports where it reports EIM
+   (5.1.6); the firmware may also ask the OS not to enable that mode (X2APIC_OPT_OUT, 8.1). A unit
+   that remaps in that mode only (EIMER) requires it (5.1.4), and the flag must then be Clear
+   (8.1): nothing keeps the CPUs out of it. A unit whose registers cannot be read remaps nothing
+   here (the probe does not use VT-d then). acpi_find walks the root tables on its first call. */
+const char *iommu_intel_x2apic_conflict(void) {
+    const struct acpi_sdt *h = dmar_table();
+    if (!h) return NULL;
     const uint8_t *b = (const uint8_t *)h;
-    host_bits = (unsigned)b[36] + 1; /* DMAR Host Address Width, 8.1 */
-    dmar_flags = b[37];
-    uint32_t off = 48;
+    if (!(b[DMAR_FLAGS] & DMAR_INTR_REMAP)) return NULL;
+    bool remaps = true, eim = true, eimer = false;
+    for (uint32_t off = DMAR_HEADER; h->length - off >= 4;) {
+        uint16_t type = u16(b + off), len = u16(b + off + 2);
+        if (len < 4 || len > h->length - off) break;
+        uint64_t base, bytes;
+        if (type == 0 && len >= 16) {
+            volatile uint8_t *regs = drhd_registers(b + off, &base, &bytes) ? vmm_map_mmio(base, PAGE_SIZE) : NULL;
+            uint64_t ecap = regs ? mmio_read64(regs + R_ECAP) : UINT64_MAX;
+            remaps &= ecap != UINT64_MAX && (ecap & ECAP_IR);
+            eim &= (ecap & ECAP_EIM) != 0;
+            eimer |= ecap != UINT64_MAX && (ecap & ECAP_EIMER);
+        }
+        off += len;
+    }
+    if (eimer) return NULL;
+    if (x2apic_opt_out(b[DMAR_FLAGS])) return "the DMAR asks for it (X2APIC_OPT_OUT)";
+    return remaps && !eim ? "a VT-d unit remaps interrupts in xAPIC format only (no EIM)" : NULL;
+}
+
+static bool parse_dmar(void) {
+    const struct acpi_sdt *h = dmar_table();
+    if (!h) return false;
+    const uint8_t *b = (const uint8_t *)h;
+    host_bits = (unsigned)b[DMAR_HAW] + 1;
+    dmar_flags = b[DMAR_FLAGS];
+    uint32_t off = DMAR_HEADER;
     for (; h->length - off >= 4;) {
         uint16_t type = u16(b + off), len = u16(b + off + 2);
         if (len < 4 || len > h->length - off) { parse_lost = units_incomplete = true; break; }
         uint64_t base;
         if (type == 0) { /* DRHD */
             if (len < 16) { parse_lost = units_incomplete = true; break; }
-            memcpy(&base, b + off + 8, 8);
-            unsigned size = b[off + 5];
-            uint64_t reg_bytes = (uint64_t)PAGE_SIZE << (size & DRHD_SIZE_MASK);
+            uint64_t reg_bytes;
+            bool aligned = drhd_registers(b + off, &base, &reg_bytes);
             bool segment_supported = u16(b + off + 6) == 0;
             if (!segment_supported) {
                 parse_lost = true; /* still observe this unit's registers, independently of PCI scope support */
                 kprintf("iommu: VT-d unit at %lx is on PCI segment %u, which Nocturne does not reach\n", base,
                         u16(b + off + 6));
             }
-            /* 8.3 requires alignment to the entire advertised register set. A shifted
-               base can make unrelated registers look like a valid, stopped unit. Reject
-               it before any mapping/read, including for a plain-safe observation. */
-            if (size & ~DRHD_SIZE_MASK || !base || base & (reg_bytes - 1) || base > UINT64_MAX - reg_bytes) {
+            /* rejected before any mapping or read, also for a plain-safe observation */
+            if (!aligned) {
                 parse_lost = units_incomplete = true;
                 kprintf("iommu: the DMAR describes an invalid VT-d register range at %lx (size %u); not used\n",
-                        base, size);
+                        base, b[off + 5]);
             } else {
                 struct unit *u = kappend(&units, &nunits, &units_room, sizeof *u);
                 if (!u) {
@@ -635,7 +695,7 @@ static bool msi_release(const struct pci_device *d) {
    block entry of message 0, the data the subhandle the function adds the message number to. */
 static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
                       uint32_t *address, uint32_t *data) {
-    if (dest > 0xFF) return false;
+    if (!x2 && dest > 0xFF) return false; /* the 8-bit destination of a plain message and an xAPIC IRTE */
     if (!remap) {
         *address = iommu_msi_plain(dest);
         *data = vector;
@@ -702,7 +762,7 @@ static bool intel_is_leaf(uint64_t entry, unsigned level) { return level == 1 ||
    (6.5.4, 11.4.2). PCI BME/Transactions Pending does not replace this guarantee. */
 static bool dma_draining(void) {
     for (size_t i = 0; i < nunits; i++)
-        if ((rd32(&units[i], R_VER) >> 4 & 15) < 2 &&
+        if (VER_MAJOR(rd32(&units[i], R_VER)) < 2 &&
             (units[i].cap & (CAP_DRD | CAP_DWD)) != (CAP_DRD | CAP_DWD)) return false;
     return true;
 }
@@ -905,18 +965,61 @@ static bool unit_disable(struct unit *u) {
     return true;
 }
 
+/* The firmware's protected memory ranges off (11.4.8.1): PMEN is read-only without PLMR/PHMR;
+   EPM changes only after the last command completed (6.9), and PRS tells when it took effect.
+   Blocked requests leave no fault record, so ranges left on would silently refuse DMA. */
+static bool pmr_release(struct unit *u) {
+    if (!(u->cap & (CAP_PLMR | CAP_PHMR)) || !(rd32(u, R_PMEN) & (PMEN_EPM | PMEN_PRS))) return true;
+    if (!command_idle(u)) return false; /* also an EPM change still in flight */
+    uint32_t pmen = rd32(u, R_PMEN);
+    if (pmen & PMEN_EPM) wr32(u, R_PMEN, pmen & ~PMEN_EPM);
+    for (uint64_t t = iommu_deadline(100); rd32(u, R_PMEN) & PMEN_PRS; pause())
+        if (iommu_expired(t)) {
+            kprintf("iommu: VT-d unit at %lx did not confirm its protected memory ranges off\n", u->base);
+            u->command_failed = true;
+            return false;
+        }
+    return true;
+}
+
+static bool pmrs_release(void) {
+    for (size_t i = 0; i < nunits; i++)
+        if (!pmr_release(&units[i])) return false;
+    return true;
+}
+
+/* Version 2 and later block DMA to protected memory whether or not translation is on; an
+   earlier unit may let remapped requests through to it under TE, and then no mapping may
+   reach it (11.4.8.1). Which pre-version-2 units do block is not visible in the registers. */
+static bool pmr_open_under_te(const struct unit *u) { return VER_MAJOR(rd32(u, R_VER)) < 2; }
+
+/* TE on the units whose protected ranges hold under translation, or (open) on the others,
+   each of whose ranges go off just before its TE. */
+static bool translation_on(bool open) {
+    for (size_t i = 0; i < nunits; i++) {
+        struct unit *u = &units[i];
+        if (pmr_open_under_te(u) != open) continue;
+        if (open && !pmr_release(u)) return false;
+        if (!command(u, GCMD_TE, true)) return false;
+    }
+    return true;
+}
+
 static bool unit_tables(struct unit *u, uint32_t bsp) {
     wr64(u, R_RTADDR, u->root); /* legacy mode */
     bool ok = command(u, GCMD_SRTP, true) && queue_start(u);
-    if (ok && fault_vector >= 0 && bsp <= 0xFF) {
-        wr32(u, R_FEDATA, (uint32_t)fault_vector);
-        wr32(u, R_FEADDR, iommu_msi_plain(bsp));
-        wr32(u, R_FEUADDR, 0);
-        wr32(u, R_FECTL, 0);
-    }
     if (ok && remap) {
         wr64(u, R_IRTA, irt | (x2 ? IRTA_EIME : 0) | IRT_S);
         ok = command(u, GCMD_SIRTP, true);
+    }
+    /* the fault event message (5.1.6): in x2APIC mode the destination's bits 31:8 in FEUADDR,
+       which a unit with EIM implements (11.4.7.5). The unit reads it in x2APIC mode once the
+       pointer above set EIME (5.1.6.2), so it is unmasked only then. */
+    if (ok && fault_vector >= 0 && (x2 || bsp <= 0xFF)) {
+        wr32(u, R_FEDATA, (uint32_t)fault_vector);
+        wr32(u, R_FEADDR, iommu_msi_plain(bsp & 0xFF));
+        wr32(u, R_FEUADDR, x2 ? bsp & ~0xFFu : 0);
+        wr32(u, R_FECTL, 0);
     }
     return ok;
 }
@@ -927,39 +1030,29 @@ static bool unit_tables(struct unit *u, uint32_t bsp) {
    Enabling CFI temporarily is not a prerequisite for remapping (11.4.4.1). A plain IOAPIC entry may be blocked
    until its caller converts/restores it, not delivered through an isolation bypass.
    The global invalidations flush the table write buffers (6.8). Translation goes on only
-   when intel.translating; protected memory ranges go off once these tables are active. */
+   when intel.translating. The firmware's protected memory ranges stay on until every unit
+   confirmed its remapping and translation, so a start that fails keeps them; only a unit that
+   would leave them open under TE (pmr_open_under_te) drops its ranges earlier: after the TE of
+   every unit that keeps them, just before its own. */
 static bool units_on(void) {
-    if (!intel_shutdown()) return false; /* also when firmware left any unit on */
-    bool ok = true;
+    if (!units_off()) return false; /* also when firmware left any unit on */
     uint32_t bsp = lapic_current_id();
     for (size_t i = 0; i < nunits; i++)
         if (!unit_tables(&units[i], bsp)) return false;
     send(INV_CONTEXT_GLOBAL);
     send(INV_IOTLB_GLOBAL);
     if (remap) send(INV_IEC_GLOBAL);
-    ok = sync();
+    bool ok = sync();
     for (size_t i = 0; ok && remap && !x2 && i < nunits; i++)
         ok = command(&units[i], GCMD_CFI, false);
-    for (size_t i = 0; ok && i < nunits; i++) {
-        struct unit *u = &units[i];
-        if (remap) ok = command(u, GCMD_IRE, true);
-        if (intel.translating) ok = ok && command(u, GCMD_TE, true);
-        uint32_t pmen = rd32(u, R_PMEN);
-        if (ok && u->cap & (CAP_PLMR | CAP_PHMR) && pmen & PMEN_EPM) { /* the firmware's protected ranges */
-            wr32(u, R_PMEN, pmen & ~PMEN_EPM);
-            for (uint64_t t = iommu_deadline(100); rd32(u, R_PMEN) & PMEN_PRS; pause())
-                if (iommu_expired(t)) {
-                    kprintf("iommu: VT-d unit at %lx did not confirm its protected memory ranges off\n", u->base);
-                    u->command_failed = true;
-                    ok = false;
-                    break;
-                }
-        }
-    }
-    return ok;
+    for (size_t i = 0; ok && remap && i < nunits; i++)
+        ok = command(&units[i], GCMD_IRE, true);
+    if (ok && intel.translating) ok = translation_on(false) && translation_on(true);
+    return ok && pmrs_release();
 }
 
-static bool intel_shutdown(void) {
+/* Every unit quiet, then off; the protected memory ranges as they were. */
+static bool units_off(void) {
     bool ok = true;
     if (!queues_address_safe()) return false;
     /* An error in a later unit must not turn an earlier unit's protected DMA into bypass. */
@@ -975,6 +1068,10 @@ static bool intel_shutdown(void) {
     for (size_t i = 0; i < nunits; i++) handoff_free(&units[i]);
     return true;
 }
+
+/* Off as on a machine without VT-d (what units_plain_safe takes as plain): the protected memory
+   ranges too, once every unit confirmed it is off. */
+static bool intel_shutdown(void) { return units_off() && pmrs_release(); }
 
 static bool intel_resume(void) {
     /* Called only after the machine really slept. Registers may have reset or been
@@ -1000,21 +1097,27 @@ static void tables_free(void) {
 }
 
 /* Backend start only: the common caller keeps sources masked until it publishes IOAPIC
-   entries. Failure retains uncertain commands and their table storage. */
+   entries. Failure retains uncertain commands and their table storage, and the protected
+   memory ranges until the caller's shutdown. */
 static bool units_start(bool translate) {
     intel.translating = translate;
     bool ok = units_on();
     if (!ok) {
         intel.translating = false;
-        intel_shutdown(); /* iommu_init writes the IOAPIC entries back plain */
+        units_off(); /* iommu_init writes the IOAPIC entries back plain */
     }
     return ok;
 }
 
-/* translate false, or no page table format the units share: interrupt remapping alone, for a
-   unit that requires it (ECAP.IRREQ: every interrupt message is blocked while it is off, 5.1.4).
-   DMA then passes the units untranslated. */
+/* translate false, no page table format the units share, or the firmware's DMA_REMAP_OPT_OUT
+   (8.1): interrupt remapping alone, for a unit that requires it (ECAP.IRREQ: every interrupt
+   message is blocked while it is off, 5.1.4). DMA then passes the units untranslated. */
 static bool intel_start(bool translate) {
+    if (translate && dmar_flags & DMAR_DMA_REMAP_OPT_OUT) {
+        kprintf("iommu: the firmware asks the OS not to enable VT-d DMA remapping (DMAR DMA_REMAP_OPT_OUT): "
+                "DMA is not translated, a claimed device gets no DMA isolation\n");
+        translate = false;
+    }
     translate &= intel.levels != 0;
     if (!translate && !irreq) return false;
     if (!queues_address_safe()) {
@@ -1084,7 +1187,8 @@ static bool intel_start(bool translate) {
     kprintf("iommu: VT-d on, %lu unit%s, %u-level tables%s, interrupt remapping %s, %u reserved range%s: every "
             "function passes through until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s",
             intel.levels, pass_all ? "" : " (identity domain for units without pass-through)",
-            remap ? (x2 ? "on (x2APIC format)" : "on") : dmar_flags & 1 ? "not possible on these units" : "not offered by the firmware",
+            remap ? (x2 ? "on (x2APIC format)" : "on")
+                  : dmar_flags & DMAR_INTR_REMAP ? "not possible on these units" : "not offered by the firmware",
             iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s");
     if (!remap) kprintf("iommu: interrupts are not remapped: a device given to an app can send any vector\n");
     return true;
@@ -1135,7 +1239,7 @@ static bool unit_read(struct unit *u) {
     u->cap = rd64(u, R_CAP);
     u->ecap = rd64(u, R_ECAP);
     uint32_t ver = rd32(u, R_VER);
-    if (!(ver >> 4 & 15) || ver == UINT32_MAX || u->cap == UINT64_MAX || u->ecap == UINT64_MAX) {
+    if (!VER_MAJOR(ver) || ver == UINT32_MAX || u->cap == UINT64_MAX || u->ecap == UINT64_MAX) {
         kprintf("iommu: the VT-d unit at %lx does not give usable register values\n", u->base);
         return false;
     }
@@ -1145,7 +1249,7 @@ static bool unit_read(struct unit *u) {
         kprintf("iommu: VT-d unit at %lx reports registers outside its DRHD range\n", u->base);
         return false;
     }
-    kprintf("iommu: VT-d unit at %lx, version %u.%u, capabilities %lx, extended %lx\n", u->base, ver >> 4 & 15,
+    kprintf("iommu: VT-d unit at %lx, version %u.%u, capabilities %lx, extended %lx\n", u->base, VER_MAJOR(ver),
             ver & 15, u->cap, u->ecap);
     return u->readable = true;
 }
@@ -1172,7 +1276,7 @@ const struct iommu_hw *iommu_intel_probe(bool *plain_safe) {
     unsigned sagaw = 0xE, domains = 1u << 16, mgaw = host_bits;
     bool qi = true, eim = true, eimer = false;
     intel.coherent = true;
-    remap = (dmar_flags & 1) != 0;
+    remap = (dmar_flags & DMAR_INTR_REMAP) != 0;
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
         sagaw &= CAP_SAGAW(u->cap);
@@ -1199,14 +1303,27 @@ const struct iommu_hw *iommu_intel_probe(bool *plain_safe) {
         kprintf("iommu: the IOAPICs' requester IDs are not known: interrupts are not remapped\n");
         remap = false;
     }
-    /* A unit that requires Extended Interrupt Mode blocks every interrupt without it (5.1.4),
-       and takes it with the CPUs in x2APIC mode only (5.1.6). */
-    if (remap && eimer && (!eim || !lapic_x2apic())) {
-        kprintf("iommu: a VT-d unit remaps interrupts in x2APIC format only, which %s: interrupts are not remapped\n",
-                eim ? "the CPUs do not use" : "another unit lacks");
+    /* X2APIC_OPT_OUT asks the OS to keep the CPUs out of x2APIC mode, and must be Clear where a
+       unit reports EIMER (8.1), which requires that mode (iommu_intel_x2apic_conflict): the units'
+       requirements and the CPUs' actual mode decide below, not the flag. */
+    if (x2apic_opt_out(dmar_flags)) {
+        if (lapic_x2apic())
+            kprintf("iommu: the DMAR asks the OS not to use x2APIC mode (X2APIC_OPT_OUT), but the CPUs are in it\n");
+        if (eimer)
+            kprintf("iommu: the DMAR sets X2APIC_OPT_OUT although a VT-d unit remaps interrupts in x2APIC "
+                    "format only (EIMER), which the firmware must not do\n");
+    }
+    /* Every unit remaps in the CPUs' mode: Extended Interrupt Mode, "x2APIC mode is active"
+       (11.4.10), needs each unit's EIM (5.1.6) with the CPUs in x2APIC mode; with them in xAPIC
+       mode a unit that remaps in that mode only (EIMER) blocks every interrupt (5.1.4). */
+    if (remap && (lapic_x2apic() ? !eim : eimer)) {
+        kprintf("iommu: %s: interrupts are not remapped\n",
+                lapic_x2apic() ? "a VT-d unit remaps interrupts in xAPIC format only (no EIM), and the CPUs are in "
+                                 "x2APIC mode"
+                               : "a VT-d unit remaps interrupts in x2APIC format only (EIMER), which the CPUs do not use");
         remap = false;
     }
-    x2 = remap && eimer;
+    x2 = remap && lapic_x2apic();
     intel.interrupt_remapping_required = irreq;
     if (parse_lost) {
         kprintf("iommu: the DMAR scope or structure is not supported: VT-d not used\n");

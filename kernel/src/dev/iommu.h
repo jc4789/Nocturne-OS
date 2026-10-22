@@ -66,6 +66,11 @@ bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint64_t *rte);
    brings tables of its own. Interrupts off. */
 bool iommu_resume(void); /* false: do not restore PCI DMA/interrupts */
 bool iommu_shutdown(void); /* false: do not overwrite the hardware's live tables */
+/* Why the units keep the CPUs out of x2APIC mode, or NULL: the firmware asks for it (VT-d
+   X2APIC_OPT_OUT), or a unit remaps interrupts in xAPIC format only (VT-d without EIM, AMD-Vi
+   without XTSup and GASup). For apic_init, before pci_init and iommu_init: read from the
+   firmware's tables and the units' registers alone, nothing written. */
+const char *iommu_x2apic_conflict(void);
 
 /* ---- for the back ends ---- */
 #define IOMMU_READ  1u
@@ -128,6 +133,9 @@ struct iommu_hw {
    mandatory interrupt remapping (VT-d IRREQ) is not plain-safe even with every enable clear. */
 const struct iommu_hw *iommu_amd_probe(bool *plain_safe);
 const struct iommu_hw *iommu_intel_probe(bool *plain_safe);
+/* iommu_x2apic_conflict for the units each back end describes */
+const char *iommu_amd_x2apic_conflict(void);
+const char *iommu_intel_x2apic_conflict(void);
 /* What the back ends find in the firmware's tables while they probe.
    reserved: memory the functions with requester IDs first..last reach by DMA as it is (AMD-Vi
    IVMD, VT-d RMRR) with IOMMU_READ / IOMMU_WRITE access, mapped in their domains when claimed.

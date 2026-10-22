@@ -5,6 +5,8 @@
 #include "arch/smp.h"
 #include "arch/hyperv.h"
 #include "arch/pat.h"
+#include "arch/ioapic.h"
+#include "dev/acpi.h"
 #include "dev/serial.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
@@ -54,7 +56,7 @@ uint64_t hhdm_offset;
 const char *kernel_cmdline = "";
 char cpu_brand[64];
 
-void apic_init(void);
+void apic_init(const struct limine_mp_response *mp);
 void kmain_late(void);
 
 static const char *memtype(uint64_t t) {
@@ -105,7 +107,12 @@ void kmain(void) {
             pmm_free_pages() * 4096 / 1048576);
 
     pic_init();
-    apic_init();
+    /* The IOAPICs' pins masked (but a firmware virtual-wire PIC path, the PIC masked above) before
+       the APICs change mode: apic_init may leave x2APIC mode and the APs take the BSP's, through
+       the disabled state, where no interrupt may be sent to the APIC (SDM 11.4.3). */
+    acpi_tables_init();
+    ioapic_init();
+    apic_init(mp_req.response);
     sched_init();
     timer_init();
     pstate_init_bsp();

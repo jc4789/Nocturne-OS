@@ -38,10 +38,13 @@ struct tramp_data {
     uint32_t cr3, pad3;   /* 56 */
     uint32_t efer, pad4;  /* 64 */
     uint64_t entry, stack, arg; /* 72, 80, 88 */
+    uint64_t id_reg;      /* 96: lapic_id_register(), 0 for any CPU */
+    uint32_t apic_id;     /* 104 */
 } PACKED;
 _Static_assert(__builtin_offsetof(struct tramp_data, far32) == 40, "wake.asm TD_FAR32");
 _Static_assert(__builtin_offsetof(struct tramp_data, cr3) == 56, "wake.asm TD_CR3");
 _Static_assert(__builtin_offsetof(struct tramp_data, arg) == 88, "wake.asm TD_ARG");
+_Static_assert(__builtin_offsetof(struct tramp_data, apic_id) == 104, "wake.asm TD_APIC_ID");
 
 extern const uint8_t tramp_start[], tramp_pm32[], tramp_lm64[], tramp_end[];
 extern struct { uint16_t limit; uint64_t base; } PACKED wake_gdtr;
@@ -86,7 +89,7 @@ NORETURN void wake_hibernate_jump(uint64_t pml4, uint64_t list, uint64_t image_w
 }
 uint64_t wake_page(void) { return page; }
 
-void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg) {
+void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg, uint32_t apic_id) {
     uint8_t *p = phys_to_virt(page);
     memcpy(p, tramp_start, (size_t)(tramp_end - tramp_start));
     struct tramp_data *d = (struct tramp_data *)(p + TRAMP_DATA);
@@ -105,6 +108,8 @@ void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg) {
     d->entry = entry;
     d->stack = stack;
     d->arg = arg;
+    d->id_reg = apic_id == WAKE_ANY_CPU ? 0 : (uint64_t)(uintptr_t)lapic_id_register();
+    d->apic_id = apic_id;
     /* the kernel half as it is now: entries added since the last time count too */
     uint64_t *low = phys_to_virt(page + 0x1000), *kernel = phys_to_virt(kernel_pml4 & PTE_ADDR);
     for (unsigned i = 256; i < 512; i++) low[i] = kernel[i];
@@ -165,7 +170,7 @@ bool wake_sleep(void (*enter)(void)) {
     __asm__ volatile("sidt %0" : "=m"(cpu.idtr));
     fpu_save(&fpu);
     mtrr_save();
-    wake_prepare((uint64_t)wake_resume64, (uint64_t)resume_stack + sizeof resume_stack, 0);
+    wake_prepare((uint64_t)wake_resume64, (uint64_t)resume_stack + sizeof resume_stack, 0, WAKE_ANY_CPU);
     if (!wake_suspend(enter)) return false;
     /* back from the firmware: memory types first, everything after runs faster for it */
     mtrr_sync();

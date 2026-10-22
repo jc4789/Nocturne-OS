@@ -157,3 +157,19 @@ user_trampoline:
     call sched_user_return
     mov rsp, rbx
     jmp isr_exit
+
+; bool wrmsr_checked(uint32_t msr, uint64_t value): false where the WRMSR raised #GP, which
+; isr_dispatch resumes at wrmsr_checked_refused (arch/cpu.h).
+global wrmsr_checked, wrmsr_checked_write, wrmsr_checked_refused
+wrmsr_checked:
+    mov ecx, edi
+    mov eax, esi
+    mov rdx, rsi
+    shr rdx, 32
+wrmsr_checked_write:
+    wrmsr
+    mov eax, 1
+    ret
+wrmsr_checked_refused:
+    xor eax, eax
+    ret

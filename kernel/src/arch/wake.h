@@ -9,8 +9,16 @@ void wake_init(void);      /* after vmm_init: find the wake page in low memory *
 bool wake_available(void); /* false when no usable page below 1 MiB was found */
 uint64_t wake_page(void);  /* its physical address: the FACS waking vector, the SIPI page */
 /* The next CPU through the wake page jumps to entry in long mode on the kernel's page tables'
-   upper half, with rsp = stack and rdi = arg, interrupts off, no IDT, the page's own GDT. */
-void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg);
+   upper half, with rsp = stack and rdi = arg, interrupts off, no IDT, the page's own GDT.
+   apic_id: the AP a STARTUP is for, sent after its INIT and this call (arch/smp.c), or
+   WAKE_ANY_CPU for the BSP the firmware wakes. In xAPIC mode a STARTUP can reach other CPUs too:
+   an AMD APIC after INIT compares a destination's low four bits only (APM 16.10, 16.3.6). Each
+   reads its APIC ID register (SDM 9.4.4.2) before it touches the stack; one that is not apic_id
+   stops in the page, halted with interrupts off, until an INIT. The register is read at the BSP's
+   xAPIC address (lapic_id_register): an AP the firmware gave another APIC base reads whatever is
+   there instead, which names apic_id only by chance, and so it stops as well, not started. */
+#define WAKE_ANY_CPU UINT32_MAX
+void wake_prepare(uint64_t entry, uint64_t stack, uint64_t arg, uint32_t apic_id);
 
 /* BSP, interrupts off: save this CPU (control registers, MSRs, GDT/IDT/TSS, FPU, MTRRs) and call
    enter(), which puts the machine to sleep. Returns true after the firmware woke it and this CPU

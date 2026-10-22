@@ -123,8 +123,12 @@ struct unit {
     struct pci_device *fn; /* its PCI function: the event interrupt is its MSI */
     uint8_t type, flags;   /* the IVHD the unit's description came from */
     uint16_t cap;          /* its capability in the function's config space */
-    uint64_t efr;
-    uint64_t state_efr; /* engine/bypass停止確認専用: 実MMIOとfirmware imageの和 */
+    /* efr: the features the IVHD reports, which supersede the register's (1.3): its EFR image
+       (11h, 40h) or its Feature Reporting field (10h), none with IVinfo[EFRSup] clear (5.2);
+       mmio_efr: MMIO Offset 0030h itself, 0 where reserved. Engines and bypasses of either are
+       stopped; a feature (XT, GA, IA, the HATS levels) is used only where both report it: the
+       register's lack makes its control reserved or its command an error (3.4, offset 0018h). */
+    uint64_t efr, mmio_efr;
     uint8_t msi_num;       /* event-log MSI-X entry, IVHD IOMMU info[4:0] */
     bool hat_dis, event_irq;
     uint64_t cmd, events;  /* rings */
@@ -138,8 +142,8 @@ struct unit {
 static struct unit *units;
 static size_t nunits, units_room;
 static bool np_cache; /* a unit caches not-present entries */
-/* The CPUs in x2APIC mode take 32-bit destinations, which only the 128-bit remapping entry holds:
-   XTEn and GAEn select it on every unit, all units using one entry size (2.2.5.2-3). */
+/* The CPUs are in x2APIC mode: every unit has XTEn and GAEn (2.2.5.3), which select the 128-bit
+   remapping entry with its 32-bit destination, all units using one entry size (2.2.5.2). */
 static bool wide;
 static uint64_t devtab, sems; /* device table; one completion word a unit */
 static size_t sem_pages;
@@ -261,8 +265,71 @@ static struct unit *unit_at(uint64_t base) {
     return NULL;
 }
 
-/* Types 10h, 11h and 40h describe the same unit in more detail each: the most detailed one
-   this code reads is used. */
+/* Types 10h, 11h and 40h describe the same unit in more detail each; 11h and 40h only where
+   IVinfo[EFRSup] says their EFR images are valid. Of those this code reads, the most detailed one
+   is used (5.2: 11h supersedes 10h). */
+static bool ivhd_read(const struct acpi_sdt *h, uint8_t type, uint32_t info) {
+    return type == 0x10 || ((info & 1) && (type == 0x11 || (h->revision >= 2 && type == 0x40)));
+}
+
+/* The features the IVHD at s reports, at their MMIO Offset 0030h positions: the EFR image of 11h
+   and 40h (Table 94), or the IOMMU Feature Reporting field of 10h (Table 92) for the features
+   this driver selects by (XTSup, IASup, GASup, HATS). None with IVinfo[EFRSup] clear (5.2). */
+static uint64_t ivhd_features(const uint8_t *s, uint32_t info) {
+    uint64_t efr = 0;
+    uint32_t r;
+    if (!(info & 1)) return 0;
+    if (s[0] != 0x10) {
+        memcpy(&efr, s + 24, sizeof efr);
+        return efr;
+    }
+    memcpy(&r, s + 20, sizeof r);
+    return (r & 1 ? EFR_XT : 0) | (r & (1u << 5) ? EFR_IA : 0) | (r & (1u << 6) ? EFR_GA : 0) |
+           (uint64_t)(r >> 30) << 10;
+}
+
+/* The next whole IVHD of segment 0 this code reads from *off on, *off then past it; NULL at the
+   end or at a structure that does not fit the table. */
+static const uint8_t *ivhd_next(const struct acpi_sdt *h, uint32_t info, uint32_t *off) {
+    const uint8_t *b = (const uint8_t *)h;
+    while (h->length - *off >= 4) {
+        const uint8_t *s = b + *off;
+        uint16_t len = u16(s + 2);
+        if (len < 4 || len > h->length - *off) return NULL;
+        *off += len;
+        if (ivhd_read(h, s[0], info) && len >= (s[0] == 0x10 ? 24 : 40) && !u16(s + 16)) return s;
+    }
+    return NULL;
+}
+
+/* x2APIC mode needs XTEn and GAEn on every unit (2.2.5.3), so XTSup and GASup where the IVHD read
+   for it reports its features (1.3) and in its register, where without them XTEn is reserved and
+   GAEn ignored (3.4, offset 0018h): the probe's test, before the probe. A unit this code does
+   not use (another segment, registers out of reach) asks nothing. */
+const char *iommu_amd_x2apic_conflict(void) {
+    const struct acpi_sdt *h = acpi_find("IVRS", 0);
+    if (!h || h->length < 48 || (h->revision != 1 && h->revision != 2)) return NULL;
+    uint32_t info;
+    memcpy(&info, (const uint8_t *)h + 36, sizeof info);
+    const uint8_t *s, *t;
+    for (uint32_t off = 48; (s = ivhd_next(h, info, &off));) {
+        bool superseded = false;
+        for (uint32_t at = 48; !superseded && (t = ivhd_next(h, info, &at));)
+            superseded = t[0] > s[0] && !memcmp(t + 8, s + 8, 8);
+        if (superseded) continue;
+        struct unit u = {0};
+        memcpy(&u.base, s + 8, sizeof u.base);
+        if (!u.base || (u.base & (MMIO_BYTES - 1)) || u.base > UINT64_MAX - MMIO_BYTES ||
+            !(u.regs = vmm_map_mmio(u.base, MMIO_BYTES)))
+            continue;
+        if ((ivhd_features(s, info) & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA))
+            return "an AMD-Vi unit's IVHD does not report x2APIC interrupt remapping (XTSup, GASup)";
+        if ((rd(&u, R_EFR) & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA))
+            return "an AMD-Vi unit lacks x2APIC interrupt remapping (XTSup, GASup)";
+    }
+    return NULL;
+}
+
 static bool parse_ivrs(const struct acpi_sdt *h) {
     if (h->length < 48 || (h->revision != 1 && h->revision != 2)) return false;
     const uint8_t *b = (const uint8_t *)h;
@@ -273,7 +340,7 @@ static bool parse_ivrs(const struct acpi_sdt *h) {
             uint8_t type = b[off];
             uint16_t len = u16(b + off + 2);
             if (len < 4 || len > h->length - off) { parse_lost = true; break; }
-            if (type == 0x10 || ((ivinfo & 1) && (type == 0x11 || (h->revision >= 2 && type == 0x40)))) {
+            if (ivhd_read(h, type, ivinfo)) {
                 if (len < (type == 0x10 ? 24 : 40)) { parse_lost = true; break; }
                 if (u16(b + off + 16)) { off += len; continue; } /* this PCI layer addresses segment zero */
                 uint64_t base;
@@ -297,10 +364,8 @@ static bool parse_ivrs(const struct acpi_sdt *h) {
                        configuration space (3.2); no wrap into another function/register. */
                     if (u->cap < 0x40 || u->cap > 0xEC || (u->cap & 3)) parse_lost = true;
                     u->msi_num = u16(b + off + 18) & 31;
-                    if (type != 0x10) {
-                        u->hat_dis = (b[off + 20] & 1) != 0;
-                        memcpy(&u->efr, b + off + 24, sizeof u->efr);
-                    }
+                    if (type != 0x10) u->hat_dis = (b[off + 20] & 1) != 0;
+                    u->efr = ivhd_features(b + off, ivinfo);
                     u->fn = pci_find_function(id >> 8, (id >> 3) & 31, id & 7);
                     iommu_kernel_id(id);
                     parse_devices(u, b, off + (type == 0x10 ? 24 : 40), off + len);
@@ -344,15 +409,9 @@ static bool ivrs_plain_safe(const struct acpi_sdt *h) {
             struct pci_device *fn = !u16(b + at + 16) && cap >= 0x40 && cap <= 0xEC && !(cap & 3)
                 ? pci_find_function(id >> 8, (id >> 3) & 31, id & 7) : NULL;
             uint32_t header = fn ? pci_read32(fn->bus, fn->dev, fn->func, cap) : 0;
-            uint64_t efr = ((summary & 1) || (header & CAP_EFR)) ? rd(&u, R_EFR) : 0;
-            if (type != 0x10) {
-                uint64_t image;
-                memcpy(&image, b + at + 24, sizeof image);
-                /* The image overrides supported features for normal use. For an off
-                   audit, neither it nor actual hardware may hide an existing engine. */
-                efr |= image;
-            }
-            u.state_efr = efr;
+            u.mmio_efr = ((summary & 1) || (header & CAP_EFR)) ? rd(&u, R_EFR) : 0;
+            /* neither the image nor the register may hide an existing engine */
+            if (type != 0x10) memcpy(&u.efr, b + at + 24, sizeof u.efr);
             if (!engines_off(&u, false)) return false;
             identified = true;
         } else if (type < 0x20 || type > 0x22) {
@@ -379,7 +438,7 @@ static bool status_wait(const struct unit *u, uint32_t bits, uint32_t want) {
    Test only architected bits of supported features, not reserved/RO policy bits. Probe
    observes once without touching firmware; shutdown/program wait after disabling engines. */
 static bool engines_off(const struct unit *u, bool wait) {
-    uint64_t efr = u->efr | u->state_efr;
+    uint64_t efr = u->efr | u->mmio_efr;
     uint64_t enabled = CTL_IOMMU_EN | CTL_CMDBUF_EN | CTL_EVENTLOG_EN |
                        CTL_EVENTINT_EN | CTL_COMWAITINT_EN;
     uint32_t running = ST_CMDBUF_RUN | ST_EVENTLOG_RUN;
@@ -623,9 +682,9 @@ static uint16_t amd_alias(uint16_t id) {
 /* ---- interrupts ----
    A claimed function's message carries its remapping table index in data bits 10:0 and no
    destination: entry n is message n, fixed delivery to a physical APIC id. The entries are the
-   128-bit format with GuestMode 0 (Figure 19), whose destination has 32 bits, where the units
-   are wide, else the 32-bit format (Figure 15) with 8. The table is cached: every change is
-   invalidated (2.3.2). */
+   128-bit format with GuestMode 0 (Figure 19), whose destination has 32 bits, with the CPUs in
+   x2APIC mode (wide), else the 32-bit format (Figure 15) with 8. The table is cached: every
+   change is invalidated (2.3.2). */
 
 /* A 128-bit entry changes in one store the unit cannot see half done, as one that remaps must
    (2.3.2): cmpxchg16b on the 16-byte aligned entry. */
@@ -700,7 +759,7 @@ static bool program(struct unit *u) {
         return false;
     }
     /* 通常のfeature選択で実在bypassの解除を省かない。新tableの公開前に確認する。 */
-    if ((u->efr | u->state_efr) & EFR_PERF_OPT) {
+    if ((u->efr | u->mmio_efr) & EFR_PERF_OPT) {
         wr32(u, R_PERF_OPT, 0); /* the other bits are reserved (3.4.9) */
         if (rd32(u, R_PERF_OPT) & PERF_OPT_EN) {
             kprintf("iommu: unit at %lx retains its performance-optimization bypass\n", u->base);
@@ -737,7 +796,7 @@ static bool program(struct unit *u) {
 static void send_everything_flush(void) {
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
-        if (u->efr & EFR_IA) {
+        if (u->efr & u->mmio_efr & EFR_IA) {
             command(u, CMD_INV_ALL, 0, 0, 0, 0);
             continue;
         }
@@ -926,6 +985,7 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
     amd.iova_bits = va_width_valid(summary_va) ? summary_va : 64;
     amd.phys_bits = pa_width_valid(summary_pa) ? summary_pa : HOST_PHYS_BITS;
     unsigned max_levels = HOST_MAX_LEVELS;
+    wide = lapic_x2apic();
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
         if (u->hat_dis) {
@@ -939,9 +999,7 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         /* without its function the capability header is unknown: assume the cautious answers */
         uint32_t header = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap)
                                 : CAP_NP_CACHE | (ivinfo & 1 ? CAP_EFR : 0);
-        u->state_efr = ((header & CAP_EFR) || (ivinfo & 1)) ? rd(u, R_EFR) : 0;
-        if (u->type == 0x10) u->efr = header & CAP_EFR ? u->state_efr : 0;
-        u->state_efr |= u->efr;
+        u->mmio_efr = ((header & CAP_EFR) || (ivinfo & 1)) ? rd(u, R_EFR) : 0;
         uint32_t info = u->fn ? pci_read32(u->fn->bus, u->fn->dev, u->fn->func, u->cap + 0x10) : ivinfo;
         unsigned va = (info >> 15) & 0x7F, pa = (info >> 8) & 0x7F;
         /* Only these widths are defined by Capability+10h (3.2, pp203-204). No guessed
@@ -952,25 +1010,28 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         }
         amd.iova_bits = MIN(amd.iova_bits, va);
         amd.phys_bits = MIN(amd.phys_bits, pa);
-        max_levels = MIN(max_levels, 4u + ((unsigned)(u->efr >> 10) & 3));
+        /* HATS: the most levels the IVHD and the register both allow (a reserved 11b in the
+           register, superseded by the IVHD's value, allows that) */
+        max_levels = MIN(max_levels, 4u + MIN((unsigned)(u->efr >> 10) & 3, (unsigned)(u->mmio_efr >> 10) & 3));
         np_cache |= (header & CAP_NP_CACHE) != 0;
         amd.coherent &= (u->flags & 32) != 0;
         uint64_t control = rd(u, R_CONTROL);
-        kprintf("iommu: AMD-Vi unit at %lx (IVHD %02xh, function %02x:%02x.%u), extended features %lx; "
-                "left with control %lx, status %lx\n", u->base, u->type, u->fn ? u->fn->bus : 0,
-                u->fn ? u->fn->dev : 0, u->fn ? u->fn->func : 0, u->efr, control, rd(u, R_STATUS));
+        kprintf("iommu: AMD-Vi unit at %lx (IVHD %02xh, function %02x:%02x.%u), extended features %lx "
+                "(register %lx); left with control %lx, status %lx\n", u->base, u->type, u->fn ? u->fn->bus : 0,
+                u->fn ? u->fn->dev : 0, u->fn ? u->fn->func : 0, u->efr, u->mmio_efr, control, rd(u, R_STATUS));
         if (left_in_os_ram(u, control))
             kprintf("iommu: unit at %lx was left on with its tables in RAM the OS owns: what it read and "
                     "wrote there until now is not known\n", u->base);
+        /* 2.2.5.3: with the CPUs in x2APIC mode every unit must have XTEn and GAEn, whatever it
+           remaps. Where the register lacks XTSup or GASup, XTEn is reserved and GAEn ignored (3.4,
+           offset 0018h); where the IVHD lacks them, the firmware withdrew them (1.3). */
+        if (wide && (u->efr & u->mmio_efr & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA)) {
+            kprintf("iommu: unit at %lx lacks the x2APIC interrupt remapping (XTSup, GASup) the CPUs' x2APIC "
+                    "mode requires: AMD-Vi not used\n", u->base);
+            goto rejected;
+        }
     }
     if (ivinfo & 2) kprintf("iommu: the firmware protected memory from DMA with AMD-Vi before boot (IVinfo %x)\n", ivinfo);
-    /* 2.2.5.3: with the CPUs in x2APIC mode the units are wide where every unit can be. Else a
-       claimed function's remapped interrupts reach the APIC IDs the 32-bit entry holds. */
-    wide = lapic_x2apic();
-    for (size_t i = 0; i < nunits; i++) wide &= (units[i].efr & (EFR_XT | EFR_GA)) == (EFR_XT | EFR_GA);
-    if (lapic_x2apic() && !wide)
-        kprintf("iommu: an AMD-Vi unit lacks x2APIC interrupt remapping (XTSup, GASup): claimed functions' "
-                "interrupts go to APIC IDs below 256 only\n");
     amd.iova_bits = MIN(amd.iova_bits, HOST_PAGE_SHIFT + HOST_INDEX_BITS * max_levels);
     /* HATS is a maximum, not a required depth. Domains currently use identity DMA;
        iommu_dma_limit accepts only min(input, physical, PTE physical width). Retain

@@ -85,6 +85,11 @@ static bool is_kernel_id(uint16_t id) {
     return false;
 }
 
+const char *iommu_x2apic_conflict(void) {
+    const char *why = iommu_amd_x2apic_conflict();
+    return why ? why : iommu_intel_x2apic_conflict();
+}
+
 /* Units are found also with noiommu, or when the firmware's descriptions could not be kept: a
    VT-d unit that requires interrupt remapping (ECAP.IRREQ) blocks every interrupt message while
    it is off (5.1.4), so such units are started with interrupt remapping alone. */
@@ -464,10 +469,16 @@ static void acs_undo(const struct acs_log *log) {
 
 /* Turns on the ACS controls of `want` that f has, and off egress control and direct translated
    P2P (both let requests past the redirect), noting what the register was in log: 1; 0 without
-   ACS; -1 without memory to note it, nothing written. *has: the controls of `want` it has; *set:
-   those of them that read back on. */
+   ACS; -N_ERR_NO_MEMORY without memory to note it, nothing written; -N_ERR_NOT_READY while an
+   FLR is under way on f, which no other configuration access may reach (dev/pci.h). *has: the
+   controls of `want` it has; *set: those of them that read back on. */
 static int acs_set(struct acs_log *log, const struct pci_device *f, uint16_t want, uint16_t *has, uint16_t *set) {
     *has = *set = 0;
+    if (f->reset) {
+        kprintf("iommu: %02x:%02x.%u is being reset: its group is formed once it is ready\n", f->bus, f->dev,
+                f->func);
+        return -N_ERR_NOT_READY;
+    }
     uint16_t at = pci_find_ext_cap(f, 0x0D);
     if (!at) return 0;
     *has = pci_read16(f->bus, f->dev, f->func, at + 4) & want;
@@ -475,7 +486,7 @@ static int acs_set(struct acs_log *log, const struct pci_device *f, uint16_t wan
     uint16_t now = (uint16_t)((ctl | *has) & ~(ACS_E | ACS_T));
     if (now != ctl) {
         struct acs_change *c = kappend(&log->at, &log->n, &log->room, sizeof *c);
-        if (!c) return -1;
+        if (!c) return -N_ERR_NO_MEMORY;
         *c = (struct acs_change){f, (uint16_t)(at + 6), ctl};
         pci_write16(f->bus, f->dev, f->func, at + 6, now);
     }
@@ -492,8 +503,8 @@ static bool add_below(struct fns *g, const struct pci_device *up) {
 }
 
 /* Adds what m reaches, or what reaches m, past the units; *all when that is every function.
-   False without memory. */
-static bool reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool *all) {
+   0, or an error from acs_set (or -N_ERR_NO_MEMORY). */
+static int reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool *all) {
     uint16_t has, set;
     bool alone = true;
     for (int i = 0; i < pci_count() && alone; i++)
@@ -504,13 +515,13 @@ static bool reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool
            integrated in the root complex has no port above it that the redirected requests are
            sure to pass. */
         int acs = acs_set(log, m, ACS_PORT | ACS_B, &has, &set);
-        if (acs < 0) return false;
+        if (acs < 0) return acs;
         if (!acs || !m->upstream || (set & (ACS_R | ACS_C)) != (has & (ACS_R | ACS_C))) {
             kprintf("iommu: %02x:%02x.%u: %s; the device's other functions are in its group\n", m->bus, m->dev,
                     m->func, !acs ? "no ACS" : !m->upstream ? "integrated in the root complex" : "its ACS did not turn on");
             for (int i = 0; i < pci_count(); i++) {
                 struct pci_device *o = pci_at(i);
-                if (sends(o) && pci_same_device(m, o) && !fn_add(g, o)) return false;
+                if (sends(o) && pci_same_device(m, o) && !fn_add(g, o)) return -N_ERR_NO_MEMORY;
             }
         }
     }
@@ -519,7 +530,7 @@ static bool reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool
            passes them passed a downstream port or root port of their own */
         if (!b->pcie_cap || (b->pcie_type != 4 && b->pcie_type != 6)) continue;
         int acs = acs_set(log, b, ACS_PORT | ACS_B, &has, &set);
-        if (acs < 0) return false;
+        if (acs < 0) return acs;
         if (b->pcie_type == 6) { /* a switch's downstream port: has all of ACS_PORT, or no ACS */
             if (acs && (has & ACS_PORT) == ACS_PORT && (set & ACS_PORT) == ACS_PORT) continue;
             kprintf("iommu: switch port %02x:%02x.%u above %02x:%02x.%u does not redirect requests between the "
@@ -527,9 +538,9 @@ static bool reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool
                     m->func);
             if (!b->upstream) {
                 *all = true;
-                return true;
+                return 0;
             }
-            if (!add_below(g, b->upstream)) return false;
+            if (!add_below(g, b->upstream)) return -N_ERR_NO_MEMORY;
         } else {
             /* a root port: Source Validation is required of one with ACS, P2P Request Redirect
                too when it passes requests to other root ports (6.12.1.1); what it has must turn
@@ -540,7 +551,7 @@ static bool reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool
                     m->bus, m->dev, m->func,
                     !acs ? "has no ACS" : !(has & ACS_V) ? "cannot validate requester IDs" : "did not turn its ACS on");
             *all = true;
-            return true;
+            return 0;
         }
     }
     /* the functions that send with one of m's IDs */
@@ -559,17 +570,20 @@ static bool reach(struct fns *g, struct acs_log *log, struct pci_device *m, bool
     }
     kfree(mine.at);
     kfree(theirs.at);
-    return ok;
+    return ok ? 0 : -N_ERR_NO_MEMORY;
 }
 
-static bool group_of(struct pci_device *d, struct fns *g, struct acs_log *log) {
+/* 0, or why the group could not be formed (reach) */
+static int group_of(struct pci_device *d, struct fns *g, struct acs_log *log) {
     bool all = false;
-    if (!fn_add(g, d)) return false;
-    for (size_t i = 0; i < g->n && !all; i++)
-        if (!reach(g, log, g->at[i], &all)) return false;
+    if (!fn_add(g, d)) return -N_ERR_NO_MEMORY;
+    for (size_t i = 0; i < g->n && !all; i++) {
+        int r = reach(g, log, g->at[i], &all);
+        if (r) return r;
+    }
     for (int i = 0; all && i < pci_count(); i++)
-        if (sends(pci_at(i)) && !fn_add(g, pci_at(i))) return false;
-    return true;
+        if (sends(pci_at(i)) && !fn_add(g, pci_at(i))) return -N_ERR_NO_MEMORY;
+    return 0;
 }
 
 static void cannot_isolate(const struct pci_device *d, const struct pci_device *m, const char *why) {
@@ -777,7 +791,7 @@ int iommu_attach(struct pci_device *d, struct iommu_domain **out) {
         kprintf("iommu: %02x:%02x.%u cannot be isolated: enumeration did not keep every function, so its group "
                 "is unknown\n", d->bus, d->dev, d->func);
         r = -N_ERR_UNSUPPORTED;
-    } else if (group_of(d, &g, &acs) && !(r = group_check(d, &g, &ids, &fixed))) {
+    } else if (!(r = group_of(d, &g, &acs)) && !(r = group_check(d, &g, &ids, &fixed))) {
         /* group_check success is not attach success: allocation failure must not return an
            unisolated claim, even when the administrator did not permit any downgrade. */
         r = -N_ERR_NO_MEMORY;
