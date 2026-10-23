@@ -19,7 +19,7 @@
 
 ## 再生成
 
-先に Nocturne の `build/sysroot/usr/lib/libc.a` を作る。その後:
+先に Nocturne の SDK の `build/sdk/Lib/libc.a`（`scripts/mksdk.sh`）を作る。その後:
 
 ```
 python ports/ffmpeg/prepare.py --source "D:/Programes/cloned repos/ffmpeg-9.0.2" --profile browser --stage build/media-browser-simd-20261017 --import-vendor

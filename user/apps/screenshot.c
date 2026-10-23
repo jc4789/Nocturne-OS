@@ -1,4 +1,5 @@
-/* screenshot: save the screen as a PNG. usage: screenshot [-s N] [-d SECONDS] [file.png] */
+/* screenshot: save the screen as a PNG, by default in the user's Pictures folder.
+   usage: screenshot [-s N] [-d SECONDS] [file.png] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,11 +18,15 @@ int main(int argc, char **argv) {
             return 2;
         } else path = argv[i];
     }
-    char name[64];
-    if (!path) {
+    char name[64], saved[1024];
+    if (!path) { /* by default into the user's Pictures folder */
         time_t t = time(NULL);
-        strftime(name, sizeof name, "/home/screenshot-%H%M%S.png", localtime(&t));
-        path = name;
+        strftime(name, sizeof name, "Pictures\\screenshot-%H%M%S.png", localtime(&t));
+        if (n_path_join(n_user_folder(), name, saved, sizeof saved) < 0) {
+            fprintf(stderr, "screenshot: the path is too long\n");
+            return 1;
+        }
+        path = saved;
     }
     if (delay > 0) n_sleep_ms((uint64_t)delay * 1000);
     int w, h;

@@ -503,6 +503,8 @@ done:
 }
 
 int main(int argc,char **argv) {
+    char program[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if(n_path_complete(argv[0],program,sizeof program)>=0)argv[0]=program;
     if(argc>1 && !strcmp(argv[1],"revoked-reader"))return revoked_reader();
     if(argc>1 && !strcmp(argv[1],"stuck-holder"))return stuck_holder();
     if(argc>1 && !strncmp(argv[1],"dma=",4))return dma_allocation_case(argv[1]+4);

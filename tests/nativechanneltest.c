@@ -32,6 +32,8 @@ static int server(void) {
     n_handle_close(0);n_handle_close(h);return result;
 }
 int main(int argc,char **argv) {
+    char program[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if(n_path_complete(argv[0],program,sizeof program)>=0)argv[0]=program;
     if(argc>1 && !strcmp(argv[1],"server"))return server();
     if(argc>1 && !strcmp(argv[1],"sender"))return transferred_sender();
     uint64_t self=(uint64_t)n_app_self();

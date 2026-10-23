@@ -40,7 +40,7 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/util/rwlock.c/.h` | ISO C11 の mutex と条件変数で読み書きロックを作る。 |
 | `src/util/os_time.c/.h` | `n_sleep_ms`／`yield` と ISO `localtime` を使う。 |
 | `src/util/os_misc.c` | 物理メモリ量などを `sysinfo` で得る。 |
-| `src/util/memstream.c/.h` | メモリ上の FILE は無いので、`/tmp`（RAM）の一時文書を書き、flush／close で読み戻す。 |
+| `src/util/memstream.c/.h` | メモリ上の FILE は無いので、一時文書を書き、flush／close で読み戻す。 |
 | `src/util/u_string.h` | `asprintf` 系は libc に無いので、Mesa 自身の Windows 用実装を使う。 |
 | `src/util/log.c` | 共有の一時フォルダーは無い。`MESA_LOG_FILE` だけを使う。 |
 | `src/util/u_debug.h` | set-user-ID プログラムは無い。 |
@@ -61,7 +61,7 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/gallium/auxiliary/util/u_tests.c` | フェンスの記述子は無い。 |
 | `src/mesa/program/program_lexer.l` | 文字列だけを読むので `never-interactive`（`isatty` を使わない）。`generated/` の `lex.yy.c` も再生成済み。 |
 | `src/util/u_dl.c` | 共有ライブラリーは無い。`util_dl_open("vulkan")` は同じプログラムにリンクされた Vulkan ドライバー（NVK）を指し、`vk_icdGetInstanceProcAddr`／`vk_common_GetDeviceProcAddr`（弱参照）でローダーと同じ答え方をする。ドライバーが無ければ NULL。 |
-| `src/gallium/drivers/zink/zink_screen.c` | `VK_LIBNAME` は `"vulkan"`。`unistd.h` を読まず、DRM の記述子を閉じない。 |
+| `src/gallium/drivers/zink/zink_screen.c`、`zink_public.h` | `VK_LIBNAME` は `"vulkan"`。`unistd.h` を読まず、DRM の記述子を閉じない。DRM の記述子から screen を作る `zink_drm_create_screen` を外す（GL は `zink_create_screen` で作る）。 |
 | `src/gallium/drivers/zink/zink_resource.c`、`zink_context.c`、`zink_fence.c/.h` | ファイル記述子が無いので、dma-buf／opaque-fd のメモリ共有と sync file のフェンス取込みを外す。 |
 
 ## Zink（GPU での WebGL）
@@ -75,7 +75,7 @@ driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で�
 ## NVK（NVIDIA の Vulkan、Turing 以降）
 
 `nvk.mk` が Vulkan 共通 runtime、NVK、NAK・nil（Rust）を作る。GPU との間は DRM ではなく
-`src/nouveau/vulkan/nvkmd/nocturne/`（Nocturne 専用の nvkmd）が、ユーザー空間の RM `/bin/nvrm`
+`src/nouveau/vulkan/nvkmd/nocturne/`（Nocturne 専用の nvkmd）が、ユーザー空間の RM `C:\Nocturne\System\nvrm`
 （`ports/nvidia/`）へ libnvrm でつなぐ。
 
 - `nvkmd_nocturne_rm.c`：RM の SDK の型を使う唯一の層（client／device／subdevice、メモリ、VA、
@@ -88,8 +88,8 @@ driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で�
 
 Rust の 3 crate（NAK、nil、nvk_rs）と std は `rustc` の staticlib `libnvk_mesa_rs.a` 一つにまとめる。
 NVK・Zink・libnvrm・Rust は libc の遅延メンバーで、`nocturne_gl.c` の強い参照により GL を使う
-プログラムにだけ入る。sysroot の `libc.a` には Rust の .a の各メンバーを展開して入れる。
-GPU が無い（`/bin/nvrm` が動いていない）機械では、チャンネル接続がすぐ失敗し、Zink は softpipe へ戻る。
+プログラムにだけ入る。SDK の `libc.a`（`scripts/mksdk.sh`）には Rust の .a の各メンバーを展開して入れる。
+GPU が無い（`C:\Nocturne\System\nvrm` が動いていない）機械では、チャンネル接続がすぐ失敗し、Zink は softpipe へ戻る。
 
 | 変更したファイル（NVK・Vulkan） | 内容 |
 |---|---|

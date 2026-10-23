@@ -3,6 +3,7 @@
 #include "js_opfs.h"
 #include "http.h"
 #include "nocturne.h"
+#include <webstorage.h>
 #include <bearssl_hash.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -10,9 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OPFS_ROOT "/data/browser/opfs"
-#define OPFS_PATH 512 /* the kernel's path limit, including the terminator */
-#define OPFS_NAME 255 /* a FAT long name */
+#define OPFS_PATH 1024 /* room for a complete path, including the terminator */
+#define OPFS_NAME 255 /* the longest name of a document or folder */
 
 /* Results shared with js_opfs.js, which maps them to DOMException names. */
 enum {
@@ -68,15 +68,18 @@ static int opfs_root(JSContext *ctx, char *out, size_t size) {
     br_sha256_update(&h, origin, n);
     br_sha256_out(&h, digest);
     free(origin);
-    int used = snprintf(out, size, OPFS_ROOT "/");
-    for (int i = 0; i < 32; i++) used += snprintf(out + used, size - (size_t)used, "%02x", digest[i]);
-    if (!ensure_directory("/data/browser") || !ensure_directory(OPFS_ROOT) || !ensure_directory(out))
+    char name[65], folder[OPFS_PATH];
+    for (int i = 0; i < 32; i++) snprintf(name + i * 2, 3, "%02x", digest[i]);
+    /* opfs in the browser's profile folder, made when absent */
+    const char *profile = web_profile_folder(false);
+    if (!profile || n_path_join(profile, "opfs", folder, sizeof folder) < 0 ||
+        n_path_join(folder, name, out, size) < 0 || !ensure_directory(folder) || !ensure_directory(out))
         return OPFS_IO;
     return 0;
 }
 
 /* Web names are any non-empty USVString except "." and ".." without '/'
- * or '\\'. FAT folds case and strips trailing dots, so only [a-z0-9_.-]
+ * or '\\'. Names compare case-insensitively and cannot end in '.', so only [a-z0-9_.-]
  * keep their spelling: an uppercase letter becomes '~' and its lowercase,
  * every other byte (and a final '.') becomes %xx of its UTF-8 bytes. */
 static int encode_name(const char *name, size_t n, char *out, size_t *used, size_t size) {
@@ -139,7 +142,7 @@ static bool decode_name(const char *in, char *out, size_t *n) {
     return true;
 }
 
-/* root + "/" + each encoded name of the JS array parts. */
+/* root + "\" + each encoded name of the JS array parts. */
 static int opfs_path(JSContext *ctx, JSValueConst parts, char *out, size_t size) {
     int r = opfs_root(ctx, out, size);
     if (r) return r;
@@ -156,7 +159,7 @@ static int opfs_path(JSContext *ctx, JSValueConst parts, char *out, size_t size)
         if (!name) return OPFS_STATE;
         if (used + 1 >= size) r = OPFS_BAD_NAME;
         else {
-            out[used++] = '/';
+            out[used++] = '\\';
             r = encode_name(name, n, out, &used, size);
         }
         JS_FreeCString(ctx, name);
@@ -234,7 +237,7 @@ static int remove_tree(char *path, size_t size, bool recursive) {
     for (size_t at = 0; at < bytes && !r; at += strlen(names + at) + 1) {
         size_t n = strlen(names + at);
         if (base + 1 + n >= size) { r = OPFS_IO; break; }
-        path[base] = '/';
+        path[base] = '\\';
         memcpy(path + base + 1, names + at, n + 1);
         r = remove_tree(path, size, true);
         path[base] = 0;
@@ -272,9 +275,9 @@ static int move_tree(char *from, char *to, size_t size) {
     for (size_t at = 0; at < bytes && !r; at += strlen(names + at) + 1) {
         size_t n = strlen(names + at);
         if (a + 1 + n >= size || b + 1 + n >= size) { r = OPFS_IO; break; }
-        from[a] = '/';
+        from[a] = '\\';
         memcpy(from + a + 1, names + at, n + 1);
-        to[b] = '/';
+        to[b] = '\\';
         memcpy(to + b + 1, names + at, n + 1);
         r = move_tree(from, to, size);
         from[a] = 0;
@@ -299,7 +302,7 @@ static int64_t tree_usage(char *path, size_t size) {
     for (size_t at = 0; at < bytes; at += strlen(names + at) + 1) {
         size_t n = strlen(names + at);
         if (base + 1 + n >= size) continue;
-        path[base] = '/';
+        path[base] = '\\';
         memcpy(path + base + 1, names + at, n + 1);
         int64_t child = tree_usage(path, size);
         path[base] = 0;
@@ -386,7 +389,7 @@ static JSValue opfs_list(JSContext *ctx, JSValueConst self, int argc, JSValueCon
         size_t n;
         size_t raw = strlen(names + at);
         if (raw > OPFS_NAME || !decode_name(names + at, decoded, &n) || base + 1 + raw >= sizeof path) continue;
-        path[base] = '/';
+        path[base] = '\\';
         memcpy(path + base + 1, names + at, raw + 1);
         int kind = kind_of(path);
         path[base] = 0;
@@ -488,11 +491,9 @@ static JSValue opfs_move(JSContext *ctx, JSValueConst self, int argc, JSValueCon
     if (!strcmp(from, to)) return opfs_result(ctx, kind_of(from) > 0 ? 0 : OPFS_NOT_FOUND);
     size_t n = strlen(from);
     /* A directory cannot move into its own subtree. */
-    if (!strncmp(from, to, n) && to[n] == '/') return opfs_result(ctx, OPFS_STATE);
+    if (!strncmp(from, to, n) && to[n] == '\\') return opfs_result(ctx, OPFS_STATE);
     char parent[OPFS_PATH];
-    memcpy(parent, to, sizeof parent);
-    char *slash = strrchr(parent, '/');
-    if (slash) *slash = 0;
+    if (n_path_join(to, "..", parent, sizeof parent) < 0) return opfs_result(ctx, OPFS_IO);
     if (kind_of(parent) != 2) return opfs_result(ctx, OPFS_NOT_FOUND);
     return opfs_result(ctx, move_tree(from, to, sizeof from));
 }

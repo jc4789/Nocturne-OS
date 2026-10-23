@@ -7,10 +7,12 @@
 #define CONFIG_TCC_NOCTURNE 1
 #define CONFIG_TCC_SEMLOCK 1
 #define CONFIG_TCC_PREDEFS 1     /* tccdefs.h compiled in */
-#define CONFIG_TCCDIR "/usr/lib/tcc"
-#define CONFIG_TCC_SYSINCLUDEPATHS "{B}/include:/usr/include"
-#define CONFIG_TCC_LIBPATHS "{B}:/usr/lib:/data/lib"
-#define CONFIG_TCC_CRTPREFIX "/usr/lib"
+/* The SDK, C:\Nocturne\SDK (scripts/mksdk.sh): TinyCC's own files in Lib\tcc, the headers in
+   Include, crt1.o, libc.a and the other libraries in Lib. Paths are separated by ';'. */
+#define CONFIG_TCCDIR "C:\\Nocturne\\SDK\\Lib\\tcc"
+#define CONFIG_TCC_SYSINCLUDEPATHS "{B}\\include;C:\\Nocturne\\SDK\\Include"
+#define CONFIG_TCC_LIBPATHS "{B};C:\\Nocturne\\SDK\\Lib"
+#define CONFIG_TCC_CRTPREFIX "C:\\Nocturne\\SDK\\Lib"
 #define CONFIG_TCC_ELFINTERP "-"
 #define CONFIG_TCC_SWITCHES "-static"
 #define CONFIG_RUNMEM_RO 1       /* tcc -run: code read+execute, data read+write (W^X) */

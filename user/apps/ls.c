@@ -17,18 +17,26 @@ static void human(uint64_t n, char *out) {
     else sprintf(out, "%.1fM", n / 1048576.0);
 }
 
-static const char *color(const struct n_entry *d, const char *dir) {
+static const char *color(const struct n_entry *d, bool programs) {
     if (!tty) return "";
     if (d->kind == N_KIND_FOLDER) return "\x1b[1;34m";
-    if (d->kind == N_KIND_DEVICE) return "\x1b[33m";
-    if (!strcmp(dir, "/bin")) return "\x1b[1;32m";
+    if (programs) return "\x1b[1;32m";
     const char *dot = strrchr(d->name, '.');
     if (dot && !strcmp(dot, ".sh")) return "\x1b[32m";
     return "";
 }
 
+/* A line of ls -l; name: the entry as it is shown. */
+static void long_line(const struct n_entry *e, const char *name, bool programs) {
+    char sz[16];
+    human(e->size, sz);
+    bool folder = e->kind == N_KIND_FOLDER;
+    printf("%s %8s  %s%s%s%s\n", folder ? "dir " : "file", folder ? "-" : sz, color(e, programs), name,
+           tty ? "\x1b[0m" : "", folder ? "\\" : "");
+}
+
 static int list(const char *name, bool header) {
-    char path[512];
+    char path[1024];
     struct n_entry st;
     n_result r = n_path_complete(name, path, sizeof path);
     if (r >= 0) r = n_entry_info(path, &st);
@@ -37,7 +45,8 @@ static int list(const char *name, bool header) {
         return 1;
     }
     if (st.kind != N_KIND_FOLDER) {
-        printf("%s\n", name);
+        if (opt_l) long_line(&st, name, false);
+        else printf("%s\n", name);
         return 0;
     }
     struct n_entry *all;
@@ -50,19 +59,13 @@ static int list(const char *name, bool header) {
     for (int i = 0; i < (int)r; i++)
         if (opt_a || all[i].name[0] != '.') all[n++] = all[i];
     qsort(all, n, sizeof *all, cmp);
+    bool programs = program_folder(path);
     if (header) printf("%s:\n", name);
     if (opt_l) {
-        for (int i = 0; i < n; i++) {
-            char sz[16];
-            human(all[i].size, sz);
-            bool folder = all[i].kind == N_KIND_FOLDER;
-            const char *t = folder ? "dir " : all[i].kind == N_KIND_DEVICE ? "dev " : "file";
-            printf("%s %8s  %s%s%s%s\n", t, folder ? "-" : sz, color(&all[i], path), all[i].name, tty ? "\x1b[0m" : "",
-                   folder ? "/" : "");
-        }
+        for (int i = 0; i < n; i++) long_line(&all[i], all[i].name, programs);
     } else if (!tty) {
         /* piped or redirected: one name per line, so `ls | wc -l` and scripts work */
-        for (int i = 0; i < n; i++) printf("%s%s\n", all[i].name, all[i].kind == N_KIND_FOLDER ? "/" : "");
+        for (int i = 0; i < n; i++) printf("%s%s\n", all[i].name, all[i].kind == N_KIND_FOLDER ? "\\" : "");
     } else {
         int width = 0;
         for (int i = 0; i < n; i++)
@@ -70,7 +73,7 @@ static int list(const char *name, bool header) {
         int percol = width ? 78 / width : 1;
         if (percol < 1) percol = 1;
         for (int i = 0; i < n; i++) {
-            printf("%s%s\x1b[0m%*s", color(&all[i], path), all[i].name, width - (int)strlen(all[i].name), "");
+            printf("%s%s\x1b[0m%*s", color(&all[i], programs), all[i].name, width - (int)strlen(all[i].name), "");
             if ((i + 1) % percol == 0 || i == n - 1) printf("\n");
         }
     }

@@ -4,7 +4,7 @@ Rust 1.98.1（コミット `48a229ceaefd4985c50990b14116b6d856af0985`）の標�
 `target_os = "nocturne"` を足す差分です。コンパイラー本体は変えません。Mesa の Rust
 コード（NAK シェーダーコンパイラー、`nil`）を Nocturne 向けに作ることが目的で、
 Nocturne のアプリをRustで書くためにも使えます。Rust は MIT または Apache-2.0 です。
-標準ライブラリーが入った実行ファイルには、初期 RAMfs の `/usr/share/licenses/rust`
+標準ライブラリーが入った実行ファイルには、`C:\Nocturne\Licenses\rust`
 （`COPYRIGHT`、`LICENSE-APACHE`、`LICENSE-MIT`）を添えます。
 
 Nocturne は UNIX でも POSIX でもないので、`target_family = "unix"` も `std::os::unix` も
@@ -18,23 +18,24 @@ Nocturne は UNIX でも POSIX でもないので、`target_family = "unix"` も
 ```
 ports/rust/setup-src.sh      # rust-src 1.98.1 を tools/rust/src に展開して nocturne.patch を当てる
 ports/rust/build-std.sh      # 標準ライブラリーを作り、tools/rust/sysroot に置く
-make                         # tools/rust/sysroot があれば ports/rust/apps/* が /bin/<名前> になる
+make                         # tools/rust/sysroot があれば ports/rust/apps/* が C:\Nocturne\System\<名前> になる
 ```
 
 - 安定版の `rustc` / `cargo` 1.98.1 が要ります。`RUSTC_BOOTSTRAP=1` で `-Zbuild-std` を使います
   （スクリプトが設定します）。ネットワークは要りません（依存クレートは rust-src の `library/vendor`）。
 - `build-std.sh` の結果は `tools/rust/target`（cargo のビルド）と `tools/rust/sysroot`
   （`lib/rustlib/x86_64-unknown-nocturne/lib/*.rlib`）です。`tools/` は git の管理外です。
-- 一つのプログラムだけ作るとき：
+- 一つのプログラムだけ作るとき：`make build/programs/rusttest`、または
   `ports/rust/rustc-nocturne.sh ports/rust/apps/rusttest/main.rs build/rust/rusttest`
   （直前の `make` が作った `build/u/user/libc/crt0.asm.o` と `build/libc-objects.list` を使います）。
 - Makefile への組み込みは `ports/rust/rust.mk` です。`tools/rust/sysroot` が無ければ何も作らないので、
   通常の `make` は変わりません。Makefile には Go のブロックの後（`LIBC_RSP` の定義より後）に
-  `include ports/rust/rust.mk` を足し、`$(BUILD)/initrd.tar` の依存に `$(RUST_FILES)` を加えます。
+  `include ports/rust/rust.mk` を足し、ディスクに入れるファイル（`DISK_FILES`）に `$(RUST_FILES)` を加えます。
 - 差分は `tools/rust/src` の `git diff` から作ります（`nocturne.patch`）。新しい rust-src に
   当てて同じ内容になることを確認済みです。
 
-アプリは `ports/rust/apps/<名前>/main.rs` に置くと `/bin/<名前>` になります。C のアプリと同じく
+アプリは `ports/rust/apps/<名前>/main.rs` に置くと、システムのプログラム `C:\Nocturne\System\<名前>`
+（ビルドでは `build/programs/<名前>`）になり、名前だけで起動できます（`find_program`）。C のアプリと同じく
 `user/user.ld`、`crt0.asm.o`、C ライブラリーの object（`--start-lib @build/libc-objects.list`）で
 `ld.lld` が静的リンクします（0x400000 から。`--gc-sections`）。C の `main` から呼ぶ場合は
 `--crate-type staticlib` でも作れます。この場合は Rust の起動処理（`lang_start`）が走らないので、
@@ -52,8 +53,9 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 | スレッドローカル | ネイティブの `#[thread_local]`（C ライブラリーが各スレッドの FS を設定する）。 |
 | 時刻（`sys/time`） | `timespec_get` の `TIME_MONOTONIC`（Instant）と `TIME_UTC`（SystemTime）。分解能は 1 ms。 |
 | 標準入出力（`sys/stdio`） | 出力は C の `stdout`/`stderr`（チャンネルでも文書でも C ライブラリーが扱う）。入力はハンドル 0 を直接読み、チャンネルは 1 メッセージずつ、大きいメッセージの残りは次へ持ち越す。文書なら自分で位置を持つ。 |
-| ファイル（`sys/fs`） | `n_document_*`、`n_entry_*`、`n_folder_*`。共有カーソルが無いので `File` が位置を持つ。追記は排他を取って末尾へ書く。`rename` は C ライブラリーの `rename`（既存の文書を原子的に置き換える）。パスは `n_path_complete`（`FOLDER` を基準に `.`/`..` を解決）で完全指定にしてから渡す。 |
-| パス（`sys/paths`） | `current_dir` は設定 `FOLDER`（無ければ `/`）、`set_current_dir` は `n_folder_set`。`temp_dir` は `/tmp`、`home_dir` は `HOME`（既定 `/home`）。区切りは `/`、`PATH` 区切りは `:`。 |
+| ファイル（`sys/fs`） | `n_document_*`、`n_entry_*`、`n_folder_*`。共有カーソルが無いので `File` が位置を持つ。追記は排他を取って末尾へ書く。`sync_all`/`sync_data` は `n_document_commit`（`N_COMMIT_WAIT`：媒体に書かれるまで待つ）。`rename` は C ライブラリーの `rename`（既存の文書を原子的に置き換える）。パスは `n_path_complete`（`FOLDER` を基準に `.`/`..` を解決）で完全指定にしてから渡す。 |
+| パスの形（`sys/path`） | ドライブは `C:` だけで、区切りは `\`（主）と `/`。接頭辞はドライブ `X:`（`Prefix::Disk`）だけで、UNC や `\\?\` は無い。根のあるパス（`C:\a`、`\a`、`/a`）が完全指定（`is_absolute`）。根の無い `C:`、`C:a` は今のフォルダーとその中の名前。`path::absolute` は C ライブラリーの `n_path_complete`（`C:\...`、`.`/`..` を解決）。 |
+| フォルダー（`sys/paths`） | `current_dir` は設定 `FOLDER` を `n_path_complete` で完全指定にしたもの（無ければ `C:\`）、`set_current_dir` は `n_folder_set`。`temp_dir` は `n_temp_folder`（設定 `TEMP`）、`home_dir` は `n_user_folder`（設定 `USERFOLDER`）。`split_paths`/`join_paths` の区切りは `;`。`PATH` と `HOME` は無い。 |
 | エラー（`sys/io/error`） | OS エラーの値は ABI の `N_ERR_*`（正の数）。`ErrorKind` に対応付け、文言は `n_result_text`。 |
 | 乱数（`sys/random`） | `n_random`（`HashMap` の鍵もこれ）。 |
 | プロセス | `process::id` は `n_app_self`、`process::exit` は `exit`、`abort` は `abort`。 |
@@ -74,8 +76,9 @@ make                         # tools/rust/sysroot があれば ports/rust/apps/*
 `rusttest` は println/eprintln、Vec/HashMap/BTreeMap/HashSet/BinaryHeap/VecDeque、8 MiB の確保、
 64 バイト配置、`OnceLock`、4 本のスレッド（`Arc<Mutex<Vec>>`、アトミック、スレッドローカル、
 `join`）、`Condvar`、`RwLock`、`thread::scope`、`park`/`unpark`、`env`（`var`、`vars`、
-`set_var`、`remove_var`、`args`）、`/tmp` での `fs`（作成、追記、シーク、`copy`、`rename`、
-`read_dir`、`remove_*`、`NotFound`）、`Instant`/`SystemTime`、`CString`、`RandomState`、
+`set_var`、`remove_var`、`args`）、ドライブのパス（`components`、`is_absolute`、`join`、
+`current_dir`、`temp_dir`、`path::absolute`、`set_current_dir`）、一時フォルダーでの `fs`（作成、追記、
+シーク、`sync_all`、`copy`、`rename`、`read_dir`、`remove_*`、`NotFound`）、`Instant`/`SystemTime`、`CString`、`RandomState`、
 `catch_unwind` を確かめ、すべて通れば `rusttest: ok (N checks)` を出して終了コード 0 です。
 Nocturne 上では端末から `rusttest` を実行して確かめます。
 

@@ -2,7 +2,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-/* libnvrm: an app's connection to /bin/nvrm, the NVIDIA resource manager (nvrm_protocol.h).
+/* libnvrm: an app's connection to nvrm, the NVIDIA resource manager (nvrm_protocol.h).
    Every call returns RM's NV_STATUS (NV_OK is 0; nvstatuscodes.h in the RM SDK), and
    NV_ERR_OPERATING_SYSTEM when the driver cannot be reached. Calls on one connection are
    serialised, so threads may share it.
@@ -46,7 +46,7 @@ uint32_t nvrm_unmap(struct nvrm *rm, uint32_t client, uint32_t device, uint32_t 
    rm_ioctl's NV_STATUS; the individual API's status is the struct's status field. */
 uint32_t nvrm_escape(struct nvrm *rm, uint32_t escape, void *args, uint32_t size);
 
-/* false once /bin/nvrm has gone (its end of the connection is closed); polling waits use it to
+/* false once nvrm has gone (its end of the connection is closed); polling waits use it to
    give up. Safe to call from any thread, locked or not. */
 bool nvrm_alive(struct nvrm *rm);
 

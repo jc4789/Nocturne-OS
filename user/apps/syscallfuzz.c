@@ -31,8 +31,9 @@
 #include "nocturne.h"
 
 #define BUFSZ 8192
-#define SCRATCH "/data/syscallfuzz.tmp"
 #define HANG_MS 10000
+
+static char scratch[1024]; /* the scratch document, in the temporary folder (set by main) */
 
 static uint64_t rng_state = 1;
 static uint64_t rnd(void) { /* xorshift64*, same sequence for the same seed */
@@ -42,7 +43,7 @@ static uint64_t rnd(void) { /* xorshift64*, same sequence for the same seed */
     return x * 0x2545F4914F6CDD1DULL;
 }
 
-static uint8_t *buf;     /* BUFSZ bytes, random content that never begins a path with '/' */
+static uint8_t *buf;     /* BUFSZ bytes, random content that never begins a complete path */
 static uint8_t *edge;    /* first byte of an unmapped page; the page before it is mapped */
 static n_handle loghandle = -1;
 static volatile int stop_all;
@@ -241,11 +242,11 @@ static void live_drop(long h) {
 static void live_refill(void) {
     n_handle p[2];
     long h;
-    if ((h = n_document_open(SCRATCH, N_DOCUMENT_CREATE)) < 0) h = n_document_open(SCRATCH, N_DOCUMENT_EDIT);
+    if ((h = n_document_open(scratch, N_DOCUMENT_CREATE)) < 0) h = n_document_open(scratch, N_DOCUMENT_EDIT);
     live_add(h);
-    live_add(n_document_open("/", N_DOCUMENT_READ));
-    live_add(n_document_open(SCRATCH, N_DOCUMENT_READ));
-    live_add(n_document_open(SCRATCH, N_DOCUMENT_REPLACE));
+    live_add(n_document_open("C:\\", N_DOCUMENT_READ));
+    live_add(n_document_open(scratch, N_DOCUMENT_READ));
+    live_add(n_document_open(scratch, N_DOCUMENT_REPLACE));
     if (n_channel_pair(p) == 0) { live_add(p[0]); live_add(p[1]); }
     live_add(n_events_create());
     live_add(n_shared_create(8192));
@@ -306,8 +307,8 @@ static void sweep(bool use_live, int rounds) {
 
 /* ---- phase 3: cases with a known answer ---- */
 static void checks(void) {
-    n_handle d = n_document_open(SCRATCH, N_DOCUMENT_CREATE);
-    if (d < 0) d = n_document_open(SCRATCH, N_DOCUMENT_EDIT);
+    n_handle d = n_document_open(scratch, N_DOCUMENT_CREATE);
+    if (d < 0) d = n_document_open(scratch, N_DOCUMENT_EDIT);
     if (d < 0) { logf_("syscallfuzz: no scratch document (%s), checks use the root folder only", n_result_text(d)); }
     static const char hello[] = "hello";
     if (d >= 0) n_document_write_at(d, 0, hello, sizeof hello);
@@ -321,13 +322,13 @@ static void checks(void) {
             MUST_FAIL("document_write_at from a bad pointer", call5(SYS_DOCUMENT_WRITE_AT, d, 0, p, 6, 0));
         }
         MUST_FAIL("entry_info on a bad path", call5(SYS_ENTRY_INFO, p, (long)(uintptr_t)buf, 0, 0, 0));
-        MUST_FAIL("entry_info into a bad result", call5(SYS_ENTRY_INFO, (long)(uintptr_t)"/", p, 0, 0, 0));
+        MUST_FAIL("entry_info into a bad result", call5(SYS_ENTRY_INFO, (long)(uintptr_t)"C:\\", p, 0, 0, 0));
         MUST_FAIL("document_open of a bad path", call5(SYS_DOCUMENT_OPEN, p, N_DOCUMENT_READ, 0, 0, 0));
-        call5(SYS_FOLDER_LIST, (long)(uintptr_t)"/", p, 4, 0, 0); /* an empty folder writes nothing: no verdict */
+        call5(SYS_FOLDER_LIST, (long)(uintptr_t)"C:\\", p, 4, 0, 0); /* an empty folder writes nothing: no verdict */
         MUST_FAIL("folder_create of a bad path", call5(SYS_FOLDER_CREATE, p, 0, 0, 0, 0));
         MUST_FAIL("entry_remove of a bad path", call5(SYS_ENTRY_REMOVE, p, 0, 0, 0, 0));
-        MUST_FAIL("entry_move of a bad path", call5(SYS_ENTRY_MOVE, p, (long)(uintptr_t)"/x", 0, 0, 0));
-        MUST_FAIL("document_save of bad data", call5(SYS_DOCUMENT_APPEND, (long)(uintptr_t)SCRATCH, p, 16, 0, 0));
+        MUST_FAIL("entry_move of a bad path", call5(SYS_ENTRY_MOVE, p, (long)(uintptr_t)"C:\\x", 0, 0, 0));
+        MUST_FAIL("document_save of bad data", call5(SYS_DOCUMENT_APPEND, (long)(uintptr_t)scratch, p, 16, 0, 0));
         MUST_FAIL("channel_listen on a bad key", call5(SYS_CHANNEL_LISTEN, p, 0, 0, 0, 0));
         call5(SYS_SYSTEM_LOG, p, 64, 0, 0, 0);
         MUST_FAIL("random into a bad buffer", call5(SYS_RANDOM, p, 16, 0, 0, 0));
@@ -374,8 +375,8 @@ static void checks(void) {
             n_document_set_size(d, 8);
         }
         if (absurd) {
-            MUST_FAIL("document_save of a length past the address space", call5(SYS_DOCUMENT_SAVE, (long)(uintptr_t)SCRATCH, (long)(uintptr_t)buf, h, 0, 0));
-            MUST_FAIL("document_append of a length past the address space", call5(SYS_DOCUMENT_APPEND, (long)(uintptr_t)SCRATCH, (long)(uintptr_t)buf, h, 0, 0));
+            MUST_FAIL("document_save of a length past the address space", call5(SYS_DOCUMENT_SAVE, (long)(uintptr_t)scratch, (long)(uintptr_t)buf, h, 0, 0));
+            MUST_FAIL("document_append of a length past the address space", call5(SYS_DOCUMENT_APPEND, (long)(uintptr_t)scratch, (long)(uintptr_t)buf, h, 0, 0));
             MUST_FAIL("channel_send of a length past the address space", call5(SYS_CHANNEL_SEND, nlive ? live[0] : -1, (long)(uintptr_t)buf, h, -1, 0));
             MUST_FAIL("random of a length past the address space", call5(SYS_RANDOM, (long)(uintptr_t)buf, h, 0, 0, 0));
             MUST_FAIL("memory_reserve of an impossible size", call5(SYS_MEMORY_RESERVE, h, N_MEMORY_READ_WRITE, 0, 0, 0) > 0 ? 1 : -1);
@@ -383,21 +384,32 @@ static void checks(void) {
             MUST_FAIL("shared_reserve of an impossible size", call5(SYS_SHARED_RESERVE, h, 0, 0, 0, 0));
         }
         call5(SYS_SYSTEM_LOG, (long)(uintptr_t)buf, h, 0, 0, 0);
-        call5(SYS_FOLDER_LIST, (long)(uintptr_t)"/", (long)(uintptr_t)buf, h, 0, 0);
-        call5(SYS_FOLDER_LIST, (long)(uintptr_t)"/", (long)(uintptr_t)buf, 4, h, 0);
+        call5(SYS_FOLDER_LIST, (long)(uintptr_t)"C:\\", (long)(uintptr_t)buf, h, 0, 0);
+        call5(SYS_FOLDER_LIST, (long)(uintptr_t)"C:\\", (long)(uintptr_t)buf, 4, h, 0);
         call5(SYS_EVENTS_TIMER, nlive ? live[0] : -1, h, 0, 1, 0);
     }
-    /* Paths: too long, many separators, "..", control bytes, a name that ends at an unmapped page. */
-    static char longp[5000];
+    /* Paths, in every form the parser reads: drive letters and "C:" alone, other drives, '\' and '/'
+       mixed, "." and ".." (also past the root), a name and a path that are too long, characters and
+       bytes a name cannot hold, a name that ends at an unmapped page. Each is refused or names a
+       folder that exists (the root, C:\Nocturne), so nothing is created or removed by the calls. */
+    static char longp[5000], name256[258];
     memset(longp, 'a', sizeof longp - 1);
-    longp[0] = '/';
+    longp[0] = '\\';
     longp[sizeof longp - 1] = 0;
+    name256[0] = '\\'; /* a name one byte past the longest */
+    memset(name256 + 1, 'a', 256);
     static char dots[600];
-    for (size_t i = 0; i + 3 < sizeof dots; i += 3) memcpy(dots + i, "/..", 3);
+    for (size_t i = 0; i + 3 < sizeof dots; i += 3) memcpy(dots + i, "\\..", 3);
     dots[sizeof dots - 1] = 0;
     static char slashes[600];
-    memset(slashes, '/', sizeof slashes - 1);
-    const char *paths[] = {longp, dots, slashes, "", "/", "//", "/..", "/a/./b/../../..", "relative", "/\x01\x7f\xff", "/data/..", longp + 4000};
+    memset(slashes, '\\', sizeof slashes - 1);
+    const char *paths[] = {
+        longp, name256, dots, slashes, longp + 4000, "", "relative", "a\\b", ".", "..",
+        "C:", "c:", "C", ":", "::", ":\\", "C::\\", "C:x", "C:a\\b", "1:\\x", "D:\\x", "d:\\", "Z:\\", "\\\\server\\share",
+        "C:\\", "c:\\", "C:/", "\\", "/", "//", "\\\\", "C:\\\\", "C:\\.", "C:\\..", "c:/../..", "\\.",
+        "\\a\\.\\b\\..\\..\\..", "/a/./b/../../..", "C:/\\a/..\\\\..//", "c:\\NOCTURNE\\system\\..",
+        "C:\\a:b", "\\a*b", "\\a?b", "\\a\"b", "\\a<b", "\\a>b", "\\a|b", "\\a\tb", "\\a\x01" "b", "\\a\x7f",
+        "\\trailing ", "\\trailing.", "\\...", "\\\xc2\x85", "\\\xff\xfe", "\\\xc0\x80", "\\\xed\xa0\x80", "\\\xf4\x90\x80\x80"};
     for (size_t i = 0; i < sizeof paths / sizeof *paths && !out_of_time(); i++) {
         long p = (long)(uintptr_t)paths[i];
         struct n_entry en;
@@ -476,7 +488,7 @@ static void checks(void) {
     if (d >= 0) {
         call5(SYS_HANDLE_CLOSE, d, 0, 0, 0, 0);
     }
-    call5(SYS_ENTRY_REMOVE, (long)(uintptr_t)SCRATCH, 0, 0, 0, 0);
+    call5(SYS_ENTRY_REMOVE, (long)(uintptr_t)scratch, 0, 0, 0, 0);
 }
 
 /* ---- phase 4: races ---- */
@@ -543,7 +555,7 @@ static void racer(void *arg) {
 static long race_make(int kind) {
     n_handle p[2];
     switch (kind) {
-    case 0: { long h = n_document_open(SCRATCH, N_DOCUMENT_CREATE); return h < 0 ? n_document_open(SCRATCH, N_DOCUMENT_EDIT) : h; }
+    case 0: { long h = n_document_open(scratch, N_DOCUMENT_CREATE); return h < 0 ? n_document_open(scratch, N_DOCUMENT_EDIT) : h; }
     case 1: if (n_channel_pair(p) == 0) { n_handle_close(p[1]); return p[0]; } return -1; /* keep one end; sends then fail or queue */
     case 2: return n_events_create();
     case 3: return n_shared_create(8192);
@@ -580,7 +592,7 @@ static void races(int rounds) {
         for (int i = 0; i < made; i++) thread_join(tids[i]);
         call5(SYS_HANDLE_CLOSE, race_h, 0, 0, 0, 0);
     }
-    n_entry_remove(SCRATCH);
+    n_entry_remove(scratch);
 }
 
 /* ---- driver ---- */
@@ -629,13 +641,13 @@ int main(int argc, char **argv) {
     n_memory_release(two + 4096, 4096); /* the second page is now a hole: edge points into it */
     edge = two + 4096;
     for (int i = 0; i < BUFSZ; i++) buf[i] = (uint8_t)(rnd() >> 24);
-    buf[0] = 'x'; /* any path made from buf is relative, and so refused */
+    buf[0] = 'x'; /* any path made from buf is relative (or on another drive), and so refused */
     memset(two, 'a', 4096);
-    two[0] = '/';
+    two[0] = '\\';
 
     logf_("syscallfuzz: start seed=%llu rounds=%d seconds=%u (buf %p, hole %p)", (unsigned long long)seed_arg,
           rounds_arg, seconds, (void *)buf, (void *)edge);
-    n_folder_create("/data"); /* harmless when it exists; the scratch document lives there */
+    n_path_join(n_temp_folder(), "syscallfuzz.tmp", scratch, sizeof scratch);
 
     int tid = thread_create(worker, NULL);
     if (tid <= 0) { logf_("syscallfuzz: cannot start the worker thread"); return 1; }

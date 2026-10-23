@@ -13,7 +13,8 @@
 #include "../sys/sched.h"
 #include "../sys/syscall.h"
 #include "../mm/vmm.h"
-#include "../fs/vfs.h"
+#include "../sys/object.h"
+#include "../sys/channel.h"
 #include "dns_name.h"
 
 static struct netif *nif;
@@ -95,27 +96,28 @@ static bool net_wait_timeout(struct wait_queue *queue, uint64_t ms) {
     for (unsigned i=0;i<depth;i++) net_bsp_enter();
     return ready;
 }
-/* The retained file identifies an endpoint, independently of descriptor reuse.
-   Only setup paths consult it: a cancelled HTTP/2 stream must never abort a
-   shared established TCP connection while pumping another stream's records. */
+/* The retained handle identifies a channel end, independently of handle number
+   reuse; its peer closing cancels. Only setup paths consult it: a cancelled HTTP/2
+   stream must never abort a shared established TCP connection while pumping
+   another stream's records. */
 static bool net_setup_cancelled(void) {
-    struct file *file=current_task->net_setup_cancel_file;
-    if(!file)return false;
+    struct handle *h=current_task->net_setup_cancel;
+    if(!h)return false;
     uint64_t flags=irq_save();
-    bool closed=file->vn->ops && file->vn->ops->hangup && file->vn->ops->hangup(file->vn,file);
+    bool closed=handle_ready(h)&N_EVENT_CLOSED;
     irq_restore(flags);
     return closed;
 }
 static bool net_setup_wait_timeout(struct wait_queue *queue,uint64_t ms) {
     /* Task wait queues remain BSP-owned. Bound only the setup context's
        sleep; normal TCP/UDP waits retain their existing progress semantics. */
-    if(current_task->net_setup_cancel_file && ms>50)ms=50;
+    if(current_task->net_setup_cancel && ms>50)ms=50;
     return net_wait_timeout(queue,ms);
 }
 void net_task_exit(struct task *task) {
-    struct file *file=task->net_setup_cancel_file;
-    task->net_setup_cancel_file=NULL;
-    if(file)vfs_close(file);
+    struct handle *h=task->net_setup_cancel;
+    task->net_setup_cancel=NULL;
+    handle_close(h);
 }
 
 static uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
@@ -2500,20 +2502,19 @@ bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint
 static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     switch (num) {
     case SYS_NET_SETUP_CANCEL_CHANNEL: {
-        int fd=(int)a;
-        if(fd < -1)return -N_ERR_INVALID;
-        struct file *file=NULL;
-        if(fd>=0) {
+        int index=(int)a;
+        if(index < -1)return -N_ERR_INVALID;
+        struct handle *h=NULL;
+        if(index>=0) {
             uint64_t flags=irq_save();
-            struct task *owner=task_process();
-            if((size_t)fd<owner->fd_capacity)file=owner->fds[fd];
-            if(!file){irq_restore(flags);return -N_ERR_NO_HANDLE;}
-            if(file->vn->type!=VT_CHANNEL || !file->vn->ops || !file->vn->ops->hangup){irq_restore(flags);return -N_ERR_INVALID;}
-            vfs_dup(file);irq_restore(flags);
+            h=handle_peek(index);
+            if(!h){irq_restore(flags);return -N_ERR_NO_HANDLE;}
+            if(!message_channel_is(h)){irq_restore(flags);return -N_ERR_INVALID;}
+            handle_ref(h);irq_restore(flags);
         }
-        struct file *old=current_task->net_setup_cancel_file;
-        current_task->net_setup_cancel_file=file;
-        if(old)vfs_close(old);
+        struct handle *old=current_task->net_setup_cancel;
+        current_task->net_setup_cancel=h;
+        handle_close(old);
         return 0;
     }
     case SYS_NET_INFO: {

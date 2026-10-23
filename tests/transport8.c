@@ -281,13 +281,13 @@ static int tls_tests(const char *host) {
 int main(int argc,char **argv) {
     if(argc>1&&!strcmp(argv[1],"--header-budget")) {
         if(argc>2)snprintf(host,sizeof host,"%s",argv[2]);
-        h2_port=argc>3?(unsigned)strtoul(argv[3],NULL,10):port_file("/data/tests/h2port");
+        h2_port=argc>3?(unsigned)strtoul(argv[3],NULL,10):port_file("C:\\Tests\\h2port");
         if(!h2_port){printf("FAIL transport8 header-budget port unavailable\n");return 1;}
         header_budget_test();printf("transport8 header-budget: %u checks, %u failed\n",checks,failed);return failed!=0;
     }
     if(argc>1&&!strcmp(argv[1],"--late-cancel")) {
         if(argc>2)snprintf(host,sizeof host,"%s",argv[2]);
-        h2_port=argc>3?(unsigned)strtoul(argv[3],NULL,10):port_file("/data/tests/h2port");
+        h2_port=argc>3?(unsigned)strtoul(argv[3],NULL,10):port_file("C:\\Tests\\h2port");
         if(!h2_port){printf("FAIL transport8 late-cancel port unavailable\n");return 1;}
         late_cancel_test();printf("transport8 late-cancel: %u checks, %u failed\n",checks,failed);return failed!=0;
     }
@@ -299,12 +299,12 @@ int main(int argc,char **argv) {
 #endif
     if(argc>1&&!strcmp(argv[1],"--tls"))return tls_tests(argc>2?argv[2]:"nghttp2.org");
     if(argc>1&&!strcmp(argv[1],"--tls-cancel")) {
-        unsigned port=argc>3?(unsigned)strtoul(argv[3],NULL,10):port_file("/data/tests/tlssilentport");
+        unsigned port=argc>3?(unsigned)strtoul(argv[3],NULL,10):port_file("C:\\Tests\\tlssilentport");
         if(!port){printf("FAIL transport8 TLS-cancel port unavailable\n");return 1;}
         return tls_cancel_test(argc>2?argv[2]:"10.0.2.2",port);
     }
     if(argc>3){snprintf(host,sizeof host,"%s",argv[1]);http_port=(unsigned)strtoul(argv[2],NULL,10);h2_port=(unsigned)strtoul(argv[3],NULL,10);}
-    else {http_port=port_file("/data/tests/webports");h2_port=port_file("/data/tests/h2port");}
+    else {http_port=port_file("C:\\Tests\\webports");h2_port=port_file("C:\\Tests\\h2port");}
     if(!http_port||!h2_port){printf("FAIL transport8 fixture ports unavailable\n");return 1;}
     h1_tests();h2_tests();late_cancel_test();header_budget_test();backpressure_test();printf("transport8: %u checks, %u failed\n",checks,failed);return failed!=0;
 }

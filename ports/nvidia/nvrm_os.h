@@ -1,4 +1,4 @@
-/* Nocturne OS layer for NVIDIA RM (/bin/nvrm): shared declarations.
+/* Nocturne OS layer for NVIDIA RM (nvrm): shared declarations.
  *
  * RM itself (third_party/nvidia-open) is OS neutral and calls the os_* / nv_* functions
  * implemented in os.c, os_pci.c, os_stubs.c, nvlink_os.c and spdm_stubs.c. This header holds
@@ -47,7 +47,7 @@ extern struct nvrm_device nvrm_dev;
 extern nv_state_t nvrm_ctl_state;
 
 /* ------------------------------------------------------------------------------------------
- * Logging (os.c): system log (n_system_log_open) and /data/logs/nvrm.log when /data exists
+ * Logging (os.c): system log (n_system_log_open) and nvrm.log in AppData\NVIDIA of the user's folder
  * ---------------------------------------------------------------------------------------- */
 
 void nvrm_log_init(void);

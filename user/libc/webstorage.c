@@ -3,8 +3,8 @@
  * write only the inactive slot and keep the previous confirmed slot intact.
  * A complete write and successful close publish the inactive snapshot; checksum
  * validation happens once when opening a store, not after every write. No
- * copy-and-unlink rename is used. Shared RAM journals publish per-key changes
- * between windows; persistent snapshots remain debounced. */
+ * copy-and-unlink rename is used. Shared journals in the temporary folder publish
+ * per-key changes between windows; persistent snapshots remain debounced. */
 #include <webstorage.h>
 #include <nocturne.h>
 #include <limits.h>
@@ -13,12 +13,40 @@
 #include <string.h>
 #include <bearssl_hash.h>
 
-/* Only native regression translation units override this constant. */
+#define STORAGE_PATH 1024
+const char *web_profile_folder(bool temporary) {
+    static char folders[2][STORAGE_PATH];
+    static int found[2];
+    if (!__atomic_load_n(&found[temporary], __ATOMIC_ACQUIRE)) {
+        char *folder = folders[temporary];
+        n_result at = temporary ? n_path_join(n_temp_folder(), "Browser", folder, STORAGE_PATH)
+                                : n_app_data_folder("Browser", folder, STORAGE_PATH);
+        if (at >= 0 && temporary && (at = n_folder_create(folder)) == -N_ERR_EXISTS) at = 0;
+        if (at < 0) return NULL;
+        __atomic_store_n(&found[temporary], 1, __ATOMIC_RELEASE);
+    }
+    return folders[temporary];
+}
+/* The snapshots live in storage in the profile folder, the journals shared between windows in
+ * storage in its temporary folder; NULL when the folder cannot be found. Only native regression
+ * translation units override these constants. */
+#if !defined(WEBSTORAGE_ROOT) || !defined(WEBSTORAGE_SHARED_ROOT)
+static const char *storage_root(bool shared) {
+    static char roots[2][STORAGE_PATH];
+    static int found[2];
+    if (!__atomic_load_n(&found[shared], __ATOMIC_ACQUIRE)) {
+        const char *profile = web_profile_folder(shared);
+        if (!profile || n_path_join(profile, "storage", roots[shared], STORAGE_PATH) < 0) return NULL;
+        __atomic_store_n(&found[shared], 1, __ATOMIC_RELEASE);
+    }
+    return roots[shared];
+}
+#endif
 #ifndef WEBSTORAGE_ROOT
-#define WEBSTORAGE_ROOT "/data/browser/storage"
+#define WEBSTORAGE_ROOT storage_root(false)
 #endif
 #ifndef WEBSTORAGE_SHARED_ROOT
-#define WEBSTORAGE_SHARED_ROOT "/tmp/browser-storage"
+#define WEBSTORAGE_SHARED_ROOT storage_root(true)
 #endif
 #define STORAGE_MAX_ORIGINS 64u
 #define STORAGE_MAX_KEYS 4096u
@@ -49,7 +77,7 @@ struct storage_area {
     n_handle shared, shared_log; /* leased control and delta documents, or -1 */
     uint64_t shared_epoch, shared_cursor;
     bool shared_holder;
-    /* Compared with freshly read RAM-root bytes under the native lease.
+    /* Compared with freshly read shared-root bytes under the native lease.
      * Reusing validated headers never replaces observing other windows. */
     bool shared_control_cached;
     uint8_t shared_control_bytes[256];
@@ -120,12 +148,13 @@ static void storage_hash(const void *data, size_t n, uint8_t out[32]) {
     br_sha256_context context;
     br_sha256_init(&context); br_sha256_update(&context, data, n); br_sha256_out(&context, out);
 }
-static void storage_path_at(const char *root,const char *origin, int slot, char path[160]) {
+/* An empty path, which no operation accepts, when there is no root or the path does not fit. */
+static void storage_path_at(const char *root,const char *origin, int slot, char path[STORAGE_PATH]) {
     uint8_t digest[32]; char name[65]; const char hex[] = "0123456789abcdef";
     storage_hash(origin, strlen(origin), digest);
     for (int i = 0; i < 32; i++) { name[2*i] = hex[digest[i] >> 4]; name[2*i+1] = hex[digest[i] & 15]; }
     name[64] = 0;
-    snprintf(path, 160, "%s/%s.%d", root, name, slot);
+    if (!root || snprintf(path, STORAGE_PATH, "%s\\%s.%d", root, name, slot) >= STORAGE_PATH) path[0] = 0;
 }
 static uint32_t storage_u32(const uint8_t *p) {
     return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
@@ -137,7 +166,8 @@ static void storage_put64(uint8_t *p, uint64_t v) { storage_put32(p,(uint32_t)v)
 /* 0 absent, 1 valid, -1 invalid/I/O. An invalid existing store is never silently
  * reset to an empty map. A valid other slot can recover an interrupted write. */
 static int storage_read_at(const char *root,const char *origin, int slot, struct storage_area **out) {
-    char path[160]; storage_path_at(root,origin, slot, path);
+    char path[STORAGE_PATH]; storage_path_at(root,origin, slot, path);
+    if (!path[0]) return -1;
     struct n_entry entry;
     n_result found = n_entry_info(path, &entry);
     if (found < 0) return found == -N_ERR_NOT_FOUND ? 0 : -1;
@@ -189,10 +219,9 @@ static bool storage_directory(const char *path) {
     return n_entry_info(path,&entry)>=0 && entry.kind==N_KIND_FOLDER;
 }
 static bool storage_dirs_at(const char *root) {
-    /* Paths are native constants only. Do not create /data itself when absent. */
-    char parent[160]; snprintf(parent,sizeof parent,"%s",root);
-    char *slash=strrchr(parent,'/'); if (!slash || slash==parent) return false; *slash=0;
-    return storage_directory(parent) && storage_directory(root);
+    /* The folder holding root is made when absent, never the ones above it. */
+    char parent[STORAGE_PATH];
+    return root && n_path_join(root, "..", parent, sizeof parent) >= 0 && storage_directory(parent) && storage_directory(root);
 }
 static int storage_save_at(const char *root,struct storage_area *a, struct web_storage_result *out) {
     if (a->generation==UINT64_MAX || !storage_dirs_at(root)) return WEB_STORAGE_IO;
@@ -210,11 +239,11 @@ static int storage_save_at(const char *root,struct storage_area *a, struct web_s
     }
     storage_hash(bytes+40,n-40,bytes+8);
     int slot=a->slot==0?1:0;
-    char path[160]; storage_path_at(root,a->origin,slot,path);
+    char path[STORAGE_PATH]; storage_path_at(root,a->origin,slot,path);
     /* The inactive slot is swapped in whole: a failed save leaves its older,
      * lower-generation snapshot, never a torn one, and the other completed
      * slot stays the recovery copy. Reopening and rehashing would add
-     * synchronous storvsc I/O, but not durability. */
+     * synchronous disk I/O, but not durability. */
     int result=WEB_STORAGE_IO;
     if (n_document_save(path,bytes,n)>=0) { result=WEB_STORAGE_OK; a->generation++; a->slot=slot; }
     free(bytes); return result;

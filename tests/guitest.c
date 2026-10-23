@@ -60,10 +60,15 @@ int main(void) {
         return 1;
     }
 
-    char *argv[] = {"screenshot", "/home/guitest.png", NULL};
+    char png[4096];
+    if (n_path_join(n_temp_folder(), "guitest.png", png, sizeof png) < 0) {
+        printf("guitest: the temporary folder's path is too long\n");
+        return 1;
+    }
+    char *argv[] = {"screenshot", png, NULL};
     int st = run_wait("screenshot", argv);
     unsigned char sig[8] = {0};
-    n_handle doc = n_document_open("/home/guitest.png", N_DOCUMENT_READ);
+    n_handle doc = n_document_open(png, N_DOCUMENT_READ);
     if (doc >= 0) {
         n_document_read_at(doc, 0, sig, 8);
         n_handle_close(doc);

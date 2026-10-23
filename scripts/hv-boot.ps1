@@ -25,9 +25,8 @@ $vm = Get-VM -Name $Name
 if ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
 $dvd = Get-VMDvdDrive -VM $vm | Select-Object -First 1
 if ($dvd -and $dvd.Path) { Copy-Item build\nocturne.iso $dvd.Path -Force }
-# a VM that boots from a disk image instead: refresh its *-boot.vhdx
-Get-VMHardDiskDrive -VM $vm | Where-Object { $_.Path -like '*-boot.vhdx' } |
-    ForEach-Object { Copy-Item build\nocturne.vhdx $_.Path -Force }
+# a VM that boots from its disk instead: the new system on it, the user's files kept
+elseif (Get-VMHardDiskDrive -VM $vm) { & "$root\hyperv.ps1" -Name $Name -Update -NoStart }
 
 $pipe = ((Get-VMComPort -VM $vm -Number 1).Path -replace '^\\\\\.\\pipe\\', '')
 $log = Join-Path (Resolve-Path $Out) "$Name-serial.log"

@@ -1,4 +1,4 @@
-/* nvrm_servetest: /bin/nvrm's request server (ports/nvidia/nvrm_serve.c, linked unchanged) against
+/* nvrm_servetest: C:\Nocturne\System\nvrm's request server (ports/nvidia/nvrm_serve.c, linked unchanged) against
    a fake RM OS layer, with clients on libnvrm's public API as NVK uses it. The server runs on a
    thread of this app; its clients connect from here. Checked:
    - HELLO (adapter state, the authenticated principal, never admin) and requests carrying

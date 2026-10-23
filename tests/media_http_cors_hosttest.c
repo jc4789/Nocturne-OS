@@ -115,7 +115,7 @@ int main(void) {
     nmedia_http *r=nmedia_http_open_cors("http://cdn.test/video","HTTP://CDN.TEST:80/page#x",error,sizeof error);
     CHECK(r&&get_requests==1&&options==0);clean(r); /* canonical same-origin, no OPTIONS */
     unsigned before=opened;
-    const char *invalid[]={"https://media.test/page","file:///home/page","about:blank","http://user@media.test/","http://media.test/a\r\nx"};
+    const char *invalid[]={"https://media.test/page","file:///C:/Users/User/page","about:blank","http://user@media.test/","http://media.test/a\r\nx"};
     for(size_t i=0;i<sizeof invalid/sizeof invalid[0];i++) {
         r=nmedia_http_open_cors("http://cdn.test/video",invalid[i],error,sizeof error);CHECK(!r);clean(r);
     }

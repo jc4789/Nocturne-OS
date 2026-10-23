@@ -14,9 +14,9 @@ POSIX / Windows のファイル・性能測定ポート、CLI、ネットワー�
 
 既存の freestanding x86-64 ユーザーランド設定で静的オブジェクトとしてビルドし、
 通常アプリと TinyCC の `libc.a` に必要な部分だけをリンクします。
-TinyCC 用ヘッダーは `/usr/include/lexbor` に配置します。
-ライセンスと由来情報も初期 RAMfs の `/usr/share/licenses/lexbor` に配置します。
-ルート RAMfs、GUI、既存システムコール、永続 `/data` に変更を加えません。
+TinyCC 用ヘッダーは SDK の `C:\Nocturne\SDK\Include\lexbor` に配置します（`scripts/mksdk.sh`）。
+ライセンスと由来情報は `C:\Nocturne\Licenses\lexbor` に配置します。
+ファイルシステム、GUI、既存システムコールに変更を加えません。
 
 HTML・DOM・CSS・文字コードのライブラリー移植と、ブラウザーへの利用接続は別です。
 この移植だけで JavaScript のブラウザー API や実サイト動作が完成するわけではありません。

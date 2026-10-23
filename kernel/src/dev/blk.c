@@ -61,6 +61,35 @@ int blk_write(struct blkdev *d, uint64_t lba, uint32_t n, const void *buf) {
     return r ? failed(d, "write", lba, n, r) : 0;
 }
 
+int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, uint8_t *p, uint8_t *bounce,
+                  unsigned most, bool direct, blk_move_fn move, void *ctx) {
+    if (lba + count > d->sectors) return -N_ERR_IO;
+    unsigned per = d->block / 512;
+    while (count) {
+        uint64_t first = lba / per;
+        unsigned off = (unsigned)(lba % per) * 512, want = count * 512u;
+        unsigned n = (off + want + d->block - 1) / d->block;
+        if (n > most) n = most;
+        unsigned take = n * d->block - off;
+        if (take > want) take = want;
+        bool whole = !off && take == n * d->block;
+        if (whole && direct) {
+            if (move(ctx, write, first, n, p) < 0) return -N_ERR_IO;
+        } else if (write) {
+            if (!whole && move(ctx, false, first, n, bounce) < 0) return -N_ERR_IO;
+            memcpy(bounce + off, p, take);
+            if (move(ctx, true, first, n, bounce) < 0) return -N_ERR_IO;
+        } else {
+            if (move(ctx, false, first, n, bounce) < 0) return -N_ERR_IO;
+            memcpy(p, bounce + off, take);
+        }
+        lba += take / 512;
+        count -= take / 512;
+        p += take;
+    }
+    return 0;
+}
+
 /* Nothing written since the last persist: the medium has it all already. */
 int blk_persist(struct blkdev *d) {
     if (!d->persist) return 0;

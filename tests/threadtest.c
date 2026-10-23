@@ -14,7 +14,10 @@ static unsigned results[THREADS];
 static const char *shared_path;
 #define RESOURCE_ROUNDS 40
 #define RECORD_SIZE 16
-static const char resource_path[] = "/data/threadtest-resources.tmp";
+/* The document in the temporary folder that the resource workers share, that folder (worker 0
+   switches FOLDER between it and "C:\"), and what a name "probe" completes to inside it. Set up
+   by resource_regression before the workers start. */
+static char resource_path[512], resource_folder[512], resource_probe[640];
 static n_handle resource_window;
 static uint64_t resource_clock_page;
 static void *resource_maps[THREADS][RESOURCE_ROUNDS];
@@ -144,7 +147,7 @@ static void resource_worker(void *arg) {
                 if (old >= 0) n_handle_close(old);
             }
             if (resource_window >= 0) racing_window = round & 1 ? resource_window : racing;
-            if (n_folder_set(round & 1 ? "/data" : "/") < 0) resource_failed(id, RC_FOLDER_SET, -1);
+            if (n_folder_set(round & 1 ? resource_folder : "C:\\") < 0) resource_failed(id, RC_FOLDER_SET, -1);
         }
         /* Retain/replace, independent slot allocation and nonblocking lookups must not
            dereference a sibling's freed object. */
@@ -157,7 +160,7 @@ static void resource_worker(void *arg) {
         r = n_document_read_at(h, 0, &byte, 1);
         if (r < 0 && !gone_or_other(r)) resource_failed(id, RC_DOCUMENT_READ, r);
         struct n_entry list[4];
-        r = n_folder_list("/data", list, 4, 0);
+        r = n_folder_list(resource_folder, list, 4, 0);
         if (r < 0) resource_failed(id, RC_FOLDER_LIST, r);
         r = n_channel_receive(h, NULL, 0, N_CHANNEL_PEEK, NULL);
         if (r < 0 && !gone_or_other(r) && r != -N_ERR_NOT_READY && r != -N_ERR_CLOSED)
@@ -177,9 +180,9 @@ static void resource_worker(void *arg) {
         /* GUI state reports a raw negative result, not -1 plus TLS errno. */
         int state = resource_window >= 0 ? win_state(&probe) : 0;
         if (state < 0 && !gone_or_other(state)) resource_failed(id, RC_WINDOW_STATE, state);
-        char complete[64];
+        char complete[640];
         if (n_path_complete("probe", complete, sizeof complete) < 0 ||
-            (strcmp(complete, "/probe") && strcmp(complete, "/data/probe")))
+            (strcmp(complete, "C:\\probe") && strcmp(complete, resource_probe)))
             resource_failed(id, RC_PATH, -1);
         n_handle first = n_document_open(resource_path, N_DOCUMENT_READ);
         n_handle second = first >= 0 ? n_document_open(resource_path, N_DOCUMENT_READ) : -1;
@@ -225,7 +228,11 @@ static int resource_regression(const struct n_clockinfo *clock) {
     unsigned before = failures;
     const char *folder = getenv("FOLDER");
     char saved_folder[256];
-    snprintf(saved_folder, sizeof saved_folder, "%s", folder && folder[0] == '/' ? folder : "/");
+    snprintf(saved_folder, sizeof saved_folder, "%s", folder && n_path_is_complete(folder) ? folder : "C:\\");
+    if (n_path_join(n_temp_folder(), ".", resource_folder, sizeof resource_folder) < 0 ||
+        n_path_join(resource_folder, "threadtest-resources.tmp", resource_path, sizeof resource_path) < 0 ||
+        n_path_join(resource_folder, "probe", resource_probe, sizeof resource_probe) < 0)
+        return 1;
     n_entry_remove(resource_path);
     if (n_document_save(resource_path, "", 0) < 0) return 1;
     racing = n_document_open(resource_path, N_DOCUMENT_READ);
@@ -313,11 +320,15 @@ static int resource_regression(const struct n_clockinfo *clock) {
     return 0; /* detailed failures are already counted in the shared total */
 }
 
-/* Launches this program in a helper mode; the handles it gets are 0 input, 1 output, 2 log (or -1). */
+/* Launches this program (self: argv[0], as it was typed) in a helper mode; the handles it gets are
+   0 input, 1 output, 2 log (or -1). */
 static n_handle start_helper(const char *self, const char *mode, const int32_t *handles) {
+    char path[4096]; /* an app is launched by its complete path */
+    n_result r = n_path_complete(self, path, sizeof path);
+    if (r < 0) return (n_handle)r;
     const char *args[] = {self, mode};
     struct n_launch launch = {.arguments = args, .argument_count = 2, .handles = handles, .handle_count = handles ? 3 : 0};
-    return n_app_launch(self, &launch);
+    return n_app_launch(path, &launch);
 }
 
 int main(int argc, char **argv) {
@@ -357,7 +368,8 @@ int main(int argc, char **argv) {
     if(thread_stack_bounds(&unchanged,NULL)!=-N_ERR_BAD_ADDRESS || errno!=0 || unchanged!=stack_marker)bad++;
     if (cpu_info(&info) || clock_info(&clock)) return 1;
     printf("threadtest: scheduler=%u online=%u clock_flags=%u\n", info.scheduler_cpus, info.online_cpus, clock.flags);
-    static const char shared_document[] = "/data/threadtest-shared.tmp";
+    static char shared_document[512];
+    if (n_path_join(n_temp_folder(), "threadtest-shared.tmp", shared_document, sizeof shared_document) < 0) return 1;
     n_entry_remove(shared_document);
     if (n_document_save(shared_document, "", 0) < 0) return 1;
     shared_path = shared_document;

@@ -120,6 +120,11 @@ enum {
 #define N_KIND_CONNECTION 9
 #define N_KIND_PCI 10       /* the right to drive one PCI function */
 
+/* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
+   which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
+#define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
+#define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
+
 /* n_document_open access: one of these, not a bit set. */
 #define N_DOCUMENT_READ 1     /* read an existing document */
 #define N_DOCUMENT_EDIT 2     /* read and write an existing document */
@@ -135,7 +140,7 @@ enum {
 /* An entry of a folder, or the entry a path names. Times are wall seconds. */
 struct n_entry {
     char name[256];
-    uint32_t kind;     /* N_KIND_DOCUMENT, N_KIND_FOLDER or N_KIND_DEVICE */
+    uint32_t kind;     /* N_KIND_DOCUMENT or N_KIND_FOLDER */
     uint32_t reserved;
     uint64_t size;
     int64_t modified;

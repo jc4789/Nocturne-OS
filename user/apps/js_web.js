@@ -1,5 +1,5 @@
 /*
- * js_web.js - web-platform globals for the /bin/js terminal runtime.
+ * js_web.js - web-platform globals for the js terminal runtime.
  *
  * This file is a FUNCTION BODY: js.c wraps it as `(function (host, internal) { ... })`
  * and calls it once after the core chunk.  It installs Event, EventTarget, CustomEvent,
@@ -521,15 +521,15 @@ function decodeUtf8(u) {
 }
 
 const bodyMixin = {
-  // Streams are not supported in /bin/js: `body` is always null.
+  // Streams are not supported in js: `body` is always null.
   get body() { bst(this); return null; },
   get bodyUsed() { return bst(this).used; },
   async arrayBuffer() { return toAB(takeBody(this)); },
   async bytes() { return takeBody(this); },
   async text() { return decodeUtf8(takeBody(this)); },
   async json() { return JSON.parse(decodeUtf8(takeBody(this))); },
-  async blob() { bst(this); throw new TypeError('blob() is not supported in /bin/js'); },
-  async formData() { bst(this); throw new TypeError('formData() is not supported in /bin/js'); },
+  async blob() { bst(this); throw new TypeError('blob() is not supported in js'); },
+  async formData() { bst(this); throw new TypeError('formData() is not supported in js'); },
 };
 const installBody = C => Object.defineProperties(C.prototype, Object.getOwnPropertyDescriptors(bodyMixin));
 

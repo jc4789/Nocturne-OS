@@ -16,6 +16,7 @@ struct resource {struct resource *next;uint32_t id;};
  * is in the page's wait queue, so a record wakes the page without a timer. */
 struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;n_handle app,channel;int64_t task;int creator_referrer_policy;bool started,stopped,closing,inherit_policy,shared,isolated,watched;struct web_inbox inbox;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;};
 #define WEB_WORKER_TOKEN (UINT64_C(0x4a) << 56)
+#define WORKER_PROGRAM N_FOLDER_SYSTEM "\\browserjsworker"
 struct shared_ref {struct shared_ref *next;struct child *child;};
 struct event {struct event *next;uint32_t id;struct njw_header h;uint8_t *data;struct web_inbox inbox;bool from_child;};
 struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;int creator_referrer_policy;bool isolated;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
@@ -156,8 +157,8 @@ static bool spawn_child(web_workers *w,struct child *c){
        abort on the page owner's diagnostic stream, else in the system log. */
     const char *args[]={"browserjsworker"};int32_t handles[]={pair[1],pair[1],2};
     struct n_launch launch={.arguments=args,.argument_count=1,.handles=handles,.handle_count=3};
-    n_handle app=n_app_launch("/bin/browserjsworker",&launch);
-    if(app==-N_ERR_NO_HANDLE){handles[2]=-1;app=n_app_launch("/bin/browserjsworker",&launch);}
+    n_handle app=n_app_launch(WORKER_PROGRAM,&launch);
+    if(app==-N_ERR_NO_HANDLE){handles[2]=-1;app=n_app_launch(WORKER_PROGRAM,&launch);}
     n_handle_close(pair[1]);
     if(app<0){n_handle_close(pair[0]);fail(w,c,"Cannot spawn native dedicated Worker");return false;}
     c->app=app;c->task=n_app_id(app);c->channel=pair[0];active_children++;
@@ -178,7 +179,7 @@ static bool shared_transport(web_workers*w,struct child*c,bool*created){
        ends itself once every connected owner has gone. */
     if(*created){const char*args[]={"browserjsworker","--shared-server",c->url};const int32_t handles[]={listener};
         struct n_launch launch={.arguments=args,.argument_count=3,.handles=handles,.handle_count=1};
-        n_handle app=n_app_launch("/bin/browserjsworker",&launch);if(app<0){n_handle_close(listener);free(key);return false;}n_handle_close(app);}
+        n_handle app=n_app_launch(WORKER_PROGRAM,&launch);if(app<0){n_handle_close(listener);free(key);return false;}n_handle_close(app);}
     n_handle channel=n_channel_connect(key);if(listener>=0)n_handle_close(listener);free(key);if(channel<0)return false;
     c->channel=channel;return true;
 }

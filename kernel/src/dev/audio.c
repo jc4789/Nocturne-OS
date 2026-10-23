@@ -1,10 +1,10 @@
-/* Sound: /dev/audio streams, the mixer and the clock that drives the sink (see audio.h). */
+/* Sound: the apps' streams, the mixer and the clock that drives the sink (see audio.h). */
 #include "dev/audio.h"
 #include "sys/syscall.h"
 #include "arch/cpu.h"
-#include "fs/ramfs.h"
 #include "mm/heap.h"
 #include "sys/sched.h"
+#include "sys/object.h"
 #include "abi.h"
 
 #define MAX_STREAMS 8
@@ -25,13 +25,13 @@ struct stream {
     unsigned issued_head,issued_count;
     uint32_t device_pending;
     bool clock_error;
+    struct object object; /* an app's stream: what its handle reaches */
 };
 static uint64_t card_submitted,card_consumed;
 
-/* the last slot is the system's own stream, which no file owns */
+/* the last slot is the system's own stream, which no app owns */
 static struct stream *streams[MAX_STREAMS + 1];
 static struct wait_queue audio_wq; /* writers waiting for room, closers waiting to drain */
-static struct vnode *audio_vnode;
 static int volume = 80;            /* percent */
 static bool muted;
 static int32_t gain = 80 * 80 * 65536 / 10000; /* volume squared, 16.16: loudness feels linear */
@@ -114,6 +114,12 @@ static void trace_commit(struct stream *s, uint32_t bytes) {
     irq_restore(f);
 }
 
+/* The apps' streams moved on: waits for room look again. Interrupts off. */
+static void streams_changed(void) {
+    wq_wake_all(&audio_wq);
+    for (int i = 0; i < MAX_STREAMS; i++) if (streams[i]) object_notify(&streams[i]->object);
+}
+
 static bool mix(int16_t *out, int frames,bool card) {
     if(frames<=0||(unsigned)frames>RING_BYTES/AUDIO_FRAME)return false;
     uint64_t f = irq_save();
@@ -163,10 +169,7 @@ static bool mix(int16_t *out, int frames,bool card) {
         s->tail += (uint32_t)n * AUDIO_FRAME;
     }
     if(card&&any)card_submitted+=(uint32_t)frames;
-    if (any||error) {
-        wq_wake_all(&audio_wq);
-        vfs_poll_notify(audio_vnode);
-    }
+    if (any||error) streams_changed();
     irq_restore(f);
     return any;
 }
@@ -189,7 +192,7 @@ void audio_card_played(uint64_t ordinal){
                 s->issued_head=(at+1)&31;s->issued_count--;
             }
         }
-        wq_wake_all(&audio_wq);vfs_poll_notify(audio_vnode);
+        streams_changed();
     }
     irq_restore(f);
 }
@@ -273,121 +276,29 @@ void audio_system_tone(int hz, int ms) {
     s->head += (uint32_t)frames * AUDIO_FRAME;
 }
 
-/* ---- /dev/audio ---- */
+/* ---- the apps' streams (docs/nocturne-native-abi.md §9) ---- */
 
-static void audio_open(struct vnode *v, struct file *f) {
-    struct stream *s = kzalloc(sizeof *s);
-    if (s) s->ring = kmalloc(RING_BYTES);
-    if (!s || !s->ring) {
-        if (s) kfree(s);
-        return; /* writes fail with N_ERR_NO_MEMORY */
-    }
-    uint64_t fl = irq_save();
-    for (int i = 0; i < MAX_STREAMS; i++)
-        if (!streams[i]) {
-            streams[i] = s;
-            f->priv = s;
-            break;
-        }
-    irq_restore(fl);
-    if (!f->priv) { /* too many streams: writes fail with N_ERR_BUSY */
-        kfree(s->ring);
-        kfree(s);
-        f->priv = (void *)1;
-    }
+static struct stream *stream_of(struct handle *h) { return h->object->priv; }
+
+static bool stream_broken(const struct stream *s) {
+    return s->clock_error||s->head-s->tail>RING_BYTES||s->issued_head>=ARRAY_SIZE(s->issued)||
+           s->issued_count>ARRAY_SIZE(s->issued);
 }
 
-static struct stream *stream_of(struct file *f, int64_t *err) {
-    if (!f->priv) *err = -N_ERR_NO_MEMORY;
-    else if (f->priv == (void *)1) *err = -N_ERR_BUSY;
-    else return f->priv;
-    return NULL;
+/* No room: the ring is full, or the card's descriptors all carry this stream's frames. */
+static bool stream_full(const struct stream *s) {
+    return s->head-s->tail>=RING_BYTES||(card_fill&&!remote_users&&s->issued_count==ARRAY_SIZE(s->issued));
 }
 
-static int64_t audio_write_common(struct file *f, const void *buf, size_t n, bool user, bool wait) {
-    int64_t err;
-    struct stream *s = stream_of(f, &err);
-    if (!s) return err;
-    const uint8_t *p = buf;
-    size_t done = 0;
-    while (done < n) {
-        uint32_t queued=s->head-s->tail;
-        if(s->clock_error||queued>RING_BYTES||s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued))return done?(int64_t)done:-N_ERR_IO;
-        uint32_t room = RING_BYTES - queued;
-        if(card_fill&&!remote_users&&s->issued_count==ARRAY_SIZE(s->issued))room=0;
-        if (!room) {
-            if (done) break; /* report what went in; the caller writes the rest */
-            if (!wait) return -N_ERR_NOT_READY;
-            if (current_task->killed) return -N_ERR_STOPPED;
-            uint64_t fl = irq_save();
-            if (s->head - s->tail == RING_BYTES||(card_fill&&!remote_users&&s->issued_count==ARRAY_SIZE(s->issued))) wq_wait(&audio_wq);
-            irq_restore(fl);
-            continue;
-        }
-        /* copy outside the lock: only this task writes past head, and user memory may fault */
-        uint32_t c = (uint32_t)MIN((size_t)room, n - done);
-        if (user && !user_ok(p + done, c)) return done ? (int64_t)done : -N_ERR_BAD_ADDRESS;
-        uint32_t at = s->head % RING_BYTES, first = MIN(c, RING_BYTES - at);
-        memcpy(s->ring + at, p + done, first);
-        memcpy(s->ring, p + done + first, c - first);
-        __sync_synchronize();
-        s->head += c;
-        s->committed_bytes+=c;
-        trace_commit(s, c);
-        done += c;
-    }
-    return (int64_t)done;
-}
-static int64_t audio_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
-    return audio_write_common(f, buf, n, false, !(f->flags & O_NONBLOCK));
-}
-static int64_t audio_write_user(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
-    return audio_write_common(f, buf, n, true, !(f->flags & O_NONBLOCK));
+static uint32_t stream_ready(struct handle *h) {
+    struct stream *s = stream_of(h);
+    return s->clock_error||!stream_full(s) ? N_EVENT_SENDABLE : 0;
 }
 
-/* Reading a stream tells how far ahead of the sink it is: a uint32_t, in frames. */
-static int64_t audio_read_common(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n, bool user) {
-    int64_t err;
-    struct stream *s = stream_of(f, &err);
-    if (!s) return err;
-    if(s->clock_error||s->head-s->tail>RING_BYTES||s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued))return -N_ERR_IO;
-    if (n < 4) return -N_ERR_INVALID;
-    size_t bytes = n >= sizeof(struct n_audio_status) ? sizeof(struct n_audio_status) : sizeof(uint32_t);
-    if (user && !user_ok_w(buf, bytes)) return -N_ERR_BAD_ADDRESS;
-    if(n>=sizeof(struct n_audio_status)){
-        uint64_t fl=irq_save();
-        uint32_t software=(s->head-s->tail)/AUDIO_FRAME;
-        uint32_t hardware=remote_users?0:s->device_pending;
-        uint64_t committed=s->committed_bytes/AUDIO_FRAME;
-        uint64_t remaining=(uint64_t)software+hardware;
-        struct n_audio_status status={.queued_frames=software,.device_pending_frames=hardware,
-            .played_frames=committed>=remaining?committed-remaining:0,.committed_frames=committed,
-            .generation=s->generation,.flags=remote_users?N_AUDIO_CLOCK_ESTIMATED|N_AUDIO_CLOCK_REMOTE:card_fill?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED};
-        irq_restore(fl);memcpy(buf,&status,sizeof status);return sizeof status;
-    }
-    uint32_t q = (s->head - s->tail) / AUDIO_FRAME;
-    memcpy(buf, &q, 4);
-    return 4;
-}
-static int64_t audio_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
-    return audio_read_common(v, f, buf, off, n, false);
-}
-static int64_t audio_read_user(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
-    return audio_read_common(v, f, buf, off, n, true);
-}
-
-static bool audio_can_write(struct vnode *v, struct file *f) {
-    int64_t err;
-    struct stream *s = stream_of(f, &err);
-    return !s||s->clock_error||(s->head-s->tail<RING_BYTES&&(!card_fill||remote_users||s->issued_count<ARRAY_SIZE(s->issued)));
-}
-
-/* Closing lets what is queued play out (as when a program writes a sound and exits), unless the
-   program is being killed. */
-static void audio_close(struct vnode *v, struct file *f) {
-    int64_t err;
-    struct stream *s = stream_of(f, &err);
-    if (!s) return;
+/* The last handle closed: what is queued plays out (as when a program writes a sound and exits),
+   unless the program is being stopped. */
+static void stream_close(struct handle *h) {
+    struct stream *s = stream_of(h);
     uint64_t give_up = uptime_ms() + 1000;
     while (!current_task->killed && !s->clock_error && (s->head - s->tail >= AUDIO_FRAME||s->device_pending) && uptime_ms() < give_up) {
         uint64_t fl = irq_save();
@@ -401,93 +312,101 @@ static void audio_close(struct vnode *v, struct file *f) {
             streams[i] = NULL;
         }
     irq_restore(fl);
+}
+
+static void stream_release(struct object *o) {
+    struct stream *s = o->priv;
     kfree(s->ring);
     kfree(s);
 }
 
-static struct vnode_ops audio_ops = {.open = audio_open, .close = audio_close, .write = audio_write,
-                                     .read = audio_read, .read_user = audio_read_user,
-                                     .write_user = audio_write_user, .can_write = audio_can_write};
+static const struct object_ops stream_ops = {
+    .kind = N_KIND_DEVICE, .ready = stream_ready, .close = stream_close, .release = stream_release,
+};
 
-int audio_flush_file(struct file *f) {
-    if (!audio_stream_is(f)) return -N_ERR_WRONG_KIND;
-    int64_t err = 0;
-    struct stream *s = stream_of(f, &err);
-    if (!s) return (int)err;
+bool audio_stream_is(struct handle *h) { return handle_is(h, &stream_ops); }
+
+int audio_stream_open(struct handle **out) {
+    struct stream *s = kzalloc(sizeof *s);
+    if (s) s->ring = kmalloc(RING_BYTES);
+    if (!s || !s->ring) { if (s) kfree(s); return -N_ERR_NO_MEMORY; }
+    object_init(&s->object, &stream_ops, s);
+    struct handle *h = handle_open(&s->object, true);
+    if (!h) { stream_release(&s->object); return -N_ERR_NO_MEMORY; }
+    uint64_t fl = irq_save();
+    int slot = -1;
+    for (int i = 0; i < MAX_STREAMS && slot < 0; i++) if (!streams[i]) slot = i;
+    if (slot >= 0) streams[slot] = s;
+    irq_restore(fl);
+    if (slot < 0) { handle_close(h); return -N_ERR_BUSY; } /* nothing queued: no wait */
+    *out = h;
+    return 0;
+}
+
+/* Queue frames from the app's memory; returns the frames taken. Without wait a full stream gives
+   N_ERR_NOT_READY. */
+int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, bool wait) {
+    struct stream *s = stream_of(h);
+    if (count > SIZE_MAX / AUDIO_FRAME) return -N_ERR_TOO_LARGE;
+    const uint8_t *p = frames;
+    size_t n = count * AUDIO_FRAME, done = 0;
+    while (done < n) {
+        if (stream_broken(s)) return done ? (int64_t)(done / AUDIO_FRAME) : -N_ERR_IO;
+        uint32_t room = stream_full(s) ? 0 : RING_BYTES - (s->head - s->tail);
+        if (!room) {
+            if (done) break; /* report what went in; the caller sends the rest */
+            if (!wait) return -N_ERR_NOT_READY;
+            if (current_task->killed) return -N_ERR_STOPPED;
+            uint64_t fl = irq_save();
+            if (stream_full(s)) wq_wait(&audio_wq);
+            irq_restore(fl);
+            continue;
+        }
+        /* copy outside the lock: only this task writes past head */
+        uint32_t c = (uint32_t)MIN((size_t)room, n - done);
+        if (!user_ok(p + done, c)) return done ? (int64_t)(done / AUDIO_FRAME) : -N_ERR_BAD_ADDRESS;
+        uint32_t at = s->head % RING_BYTES, first = MIN(c, RING_BYTES - at);
+        memcpy(s->ring + at, p + done, first);
+        memcpy(s->ring, p + done + first, c - first);
+        __sync_synchronize();
+        s->head += c;
+        s->committed_bytes+=c;
+        trace_commit(s, c);
+        done += c;
+    }
+    return (int64_t)(done / AUDIO_FRAME);
+}
+
+/* How far ahead of the sink the stream is, and how much of it was played. */
+int audio_stream_status(struct handle *h, struct n_audio_status *user_out) {
+    struct stream *s = stream_of(h);
+    if (stream_broken(s)) return -N_ERR_IO;
+    uint64_t fl = irq_save();
+    uint32_t software=(s->head-s->tail)/AUDIO_FRAME;
+    uint32_t hardware=remote_users?0:s->device_pending;
+    uint64_t committed=s->committed_bytes/AUDIO_FRAME;
+    uint64_t remaining=(uint64_t)software+hardware;
+    struct n_audio_status status={.queued_frames=software,.device_pending_frames=hardware,
+        .played_frames=committed>=remaining?committed-remaining:0,.committed_frames=committed,
+        .generation=s->generation,.flags=remote_users?N_AUDIO_CLOCK_ESTIMATED|N_AUDIO_CLOCK_REMOTE:card_fill?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED};
+    bool ok = user_ok_w(user_out, sizeof status);
+    if (ok) memcpy(user_out, &status, sizeof status);
+    irq_restore(fl);
+    return ok ? 0 : -N_ERR_BAD_ADDRESS;
+}
+
+int audio_stream_flush(struct handle *h) {
+    struct stream *s = stream_of(h);
     uint64_t fl = irq_save();
     s->tail = s->head;
     s->committed_bytes=0;s->issued_head=s->issued_count=0;s->device_pending=0;s->generation++;s->clock_error=false;
     if (audio_trace_active) for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i] == s) trace.stream[i].flushes++;
-    wq_wake_all(&audio_wq);
-    vfs_poll_notify(f->vn);
+    streams_changed();
     irq_restore(fl);
     return 0;
 }
 
-/* ---- native audio streams (docs/nocturne-native-abi.md §9) ---- */
-
-bool audio_stream_is(struct file *f) { return f && f->vn && f->vn->ops == &audio_ops; }
-
-int audio_stream_open(struct file **out) {
-    struct file *f = audio_vnode ? vfs_open_vnode(audio_vnode, O_RDWR) : NULL;
-    if (!f) return audio_vnode ? -N_ERR_NO_MEMORY : -N_ERR_UNSUPPORTED;
-    int64_t err;
-    if (!stream_of(f, &err)) {
-        vfs_close(f);
-        return (int)err;
-    }
-    *out = f;
-    return 0;
-}
-
-/* Queue frames from user memory; returns the frames taken. Without wait a full
-   stream gives N_ERR_NOT_READY. */
-int64_t audio_submit_file(struct file *f, const void *frames, size_t count, bool wait) {
-    if (!audio_stream_is(f)) return -N_ERR_WRONG_KIND;
-    if (count > SIZE_MAX / AUDIO_FRAME) return -N_ERR_TOO_LARGE;
-    int64_t r = audio_write_common(f, frames, count * AUDIO_FRAME, true, wait);
-    return r < 0 ? r : r / AUDIO_FRAME;
-}
-
-int audio_status_file(struct file *f, struct n_audio_status *user_out) {
-    if (!audio_stream_is(f)) return -N_ERR_WRONG_KIND;
-    int64_t r = audio_read_common(f->vn, f, user_out, 0, sizeof *user_out, true);
-    return r < 0 ? (int)r : 0;
-}
-
-/* ---- /dev/volume: the master volume as text, 0 to 100 ---- */
-
-static int64_t volume_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
-    char tmp[8];
-    int len = ksnprintf(tmp, sizeof tmp, "%d\n", volume);
-    if (off >= (uint64_t)len) return 0;
-    size_t c = MIN(n, (size_t)len - off);
-    memcpy(buf, tmp + off, c);
-    f->off += c;
-    return (int64_t)c;
-}
-
-static int64_t volume_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
-    const char *p = buf;
-    int val = 0, digits = 0;
-    for (size_t i = 0; i < n && p[i] >= '0' && p[i] <= '9' && digits < 4; i++, digits++) val = val * 10 + (p[i] - '0');
-    if (!digits) return -N_ERR_INVALID;
-    audio_set_volume(val);
-    return (int64_t)n;
-}
-
-static struct vnode_ops volume_ops = {.read = volume_read, .write = volume_write};
-
 void audio_init(void) {
-    struct vnode *dev = vfs_lookup("/dev");
-    struct vnode *a = ramfs_new_node("audio", VT_CHAR), *vol = ramfs_new_node("volume", VT_CHAR);
-    a->ops = &audio_ops;
-    audio_vnode = a;
-    a->mode = 0666;
-    vol->ops = &volume_ops;
-    vol->mode = 0666;
-    ramfs_add_child(dev, a);
-    ramfs_add_child(dev, vol);
     ac97_init();
 }

@@ -13,7 +13,7 @@ static void console(void *unused,int level,const char *message){
     else if(!strncmp(message,"GRADIENT-",9))puts(message);
 }
 int main(void){
-    FILE *file=fopen("/data/tests/js_canvas_gradient_cases.js","rb");
+    FILE *file=fopen("C:\\Tests\\js_canvas_gradient_cases.js","rb");
     if(!file){puts("canvasgradient: fixture missing");return 1;}
     fseek(file,0,SEEK_END);long length=ftell(file);fseek(file,0,SEEK_SET);
     char *source=length>0?malloc((size_t)length+1):NULL;

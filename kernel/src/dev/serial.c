@@ -4,7 +4,7 @@
 
 /* COM1, the log port. What is written goes into a ring and leaves through the UART's transmit
    FIFO as fast as the line takes it: at 115200 baud a character takes 87 us, and no writer waits
-   for the line (kprintf runs with interrupts off; an app's log lines come through /dev/kmsg; the
+   for the line (kprintf runs with interrupts off; an app's log lines come through the system log; the
    console echoes here), or a driver app that logs much would hold the BSP, and with it every other
    task, input and the screen, for as long as the line needs. The FIFO is filled whenever it is
    empty: by each write, and by the 1 kHz tick while anything waits (dev/timer.c), 16 characters a

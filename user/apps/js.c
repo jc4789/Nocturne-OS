@@ -51,7 +51,7 @@ static const char src_crypto[] = {
 };
 
 #define VERSION "1.0"
-#define PATH_CAP 1024
+#define PATH_CAP 4096
 
 static JSRuntime *rt;
 static JSContext *ctx;
@@ -311,10 +311,7 @@ static JSValue h_info(JSContext *c, JSValueConst this, int argc, JSValueConst *a
     n_result r = n_entry_info(path, &e);
     if (r == -N_ERR_NOT_FOUND || r == -N_ERR_NOT_FOLDER) return JS_NULL;
     if (r < 0) return throw_result("info", path, r);
-    if (!e.name[0]) {
-        const char *slash = strrchr(path, '/');
-        snprintf(e.name, sizeof e.name, "%s", slash ? slash + 1 : path);
-    }
+    if (!e.name[0]) snprintf(e.name, sizeof e.name, "%s", n_path_name(path));
     return entry_object(&e, path);
 }
 
@@ -360,9 +357,16 @@ static JSValue h_complete(JSContext *c, JSValueConst this, int argc, JSValueCons
     return JS_NewString(ctx, path);
 }
 
+/* The app's folder (the setting FOLDER), as a complete path. */
 static JSValue h_cwd(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    const char *f = getenv("FOLDER");
-    return JS_NewString(ctx, f && f[0] == '/' ? f : "/");
+    char path[PATH_CAP];
+    n_result r = n_path_complete(".", path, sizeof path);
+    return r < 0 ? throw_result("folder", NULL, r) : JS_NewString(ctx, path);
+}
+
+/* The temporary folder (the setting TEMP), emptied at every start. */
+static JSValue h_temp_folder(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    return JS_NewString(ctx, n_temp_folder());
 }
 
 static JSValue h_chdir(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
@@ -448,12 +452,7 @@ static JSValue h_run(JSContext *c, JSValueConst this, int argc, JSValueConst *ar
     const char *program = JS_ToCString(ctx, argv[0]);
     if (!program) return JS_EXCEPTION;
     char full[PATH_CAP];
-    bool found;
-    if (strchr(program, '/')) {
-        struct n_entry e;
-        found = n_path_complete(program, full, sizeof full) >= 0 && n_entry_info(full, &e) >= 0;
-    } else found = find_program(program, full, sizeof full);
-    if (!found) {
+    if (!find_program(program, full, sizeof full)) {
         JSValue r = throw_result("run", program, -N_ERR_NOT_FOUND);
         JS_FreeCString(ctx, program);
         return r;
@@ -465,8 +464,7 @@ static JSValue h_run(JSContext *c, JSValueConst this, int argc, JSValueConst *ar
     char **args = calloc(count + 2, sizeof *args);
     uint32_t nargs = 0;
     if (args) {
-        const char *slash = strrchr(program, '/');
-        args[nargs++] = strdup(slash ? slash + 1 : program);
+        args[nargs++] = strdup(n_path_name(program));
         for (uint32_t i = 0; i < count; i++) {
             JSValue v = JS_GetPropertyUint32(ctx, argv[1], i);
             const char *s = JS_ToCString(ctx, v);
@@ -503,7 +501,7 @@ static JSValue h_run(JSContext *c, JSValueConst this, int argc, JSValueConst *ar
     }
     if (list) {
         const char *f = getenv("FOLDER");
-        if (!f || f[0] != '/') f = "/";
+        if (!f || !n_path_is_complete(f)) f = "C:\\";
         size_t size = strlen(f) + 8;
         if ((list[n] = malloc(size))) snprintf(list[n++], size, "FOLDER=%s", f), folder = true;
     }
@@ -1172,7 +1170,7 @@ static int run_file(const char *path) {
 static void eval_globals(void) {
     JSValue global = JS_GetGlobalObject(ctx);
     char base[PATH_CAP];
-    if (n_path_complete("[eval]", base, sizeof base) < 0) strcpy(base, "/[eval]");
+    if (n_path_complete("[eval]", base, sizeof base) < 0) strcpy(base, "C:\\[eval]");
     JSValue req = internal_call("requireFrom", 1, (JSValue[]){JS_NewString(ctx, base)});
     if (!JS_IsException(req)) JS_DefinePropertyValueStr(ctx, global, "require", req, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     else JS_FreeValue(ctx, JS_GetException(ctx));
@@ -1183,7 +1181,7 @@ static void eval_globals(void) {
 
 static int run_code(const char *code, size_t len, const char *name, bool print) {
     char path[PATH_CAP];
-    if (n_path_complete(name, path, sizeof path) < 0) snprintf(path, sizeof path, "/%s", name);
+    if (n_path_complete(name, path, sizeof path) < 0) snprintf(path, sizeof path, "C:\\%s", name);
     eval_globals();
     if (!print && JS_DetectModule(code, len))
         return run_module(path, JS_Eval(ctx, code, len, path, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY));
@@ -1304,6 +1302,7 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("move", 2, h_move),
     JS_CFUNC_DEF("complete", 1, h_complete),
     JS_CFUNC_DEF("cwd", 0, h_cwd),
+    JS_CFUNC_DEF("tempFolder", 0, h_temp_folder),
     JS_CFUNC_DEF("chdir", 1, h_chdir),
     JS_CFUNC_DEF("getSetting", 1, h_get_setting),
     JS_CFUNC_DEF("setSetting", 2, h_set_setting),

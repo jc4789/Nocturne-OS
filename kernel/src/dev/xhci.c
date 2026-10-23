@@ -1364,21 +1364,6 @@ void usb_run(void (*fn)(void *arg), void *arg) {
     wait_flag(&c.done, &calls_wq);
 }
 
-void usb_wait_settled(unsigned ms) {
-    if (!usb_task) return;
-    uint64_t end = uptime_ms() + ms;
-    while (!usb_settled && uptime_ms() < end) {
-        if (!current_task->kstack) {
-            sti();
-            hlt();
-            schedule();
-        } else {
-            sleep_ms(10);
-        }
-    }
-    if (!usb_settled) kprintf("usb: still enumerating after %u ms, going on\n", ms);
-}
-
 static bool any_port_pending(void) {
     for (int i = 0; i < ncontrollers; i++)
         for (unsigned w = 0; w < 8; w++)

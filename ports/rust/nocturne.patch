@@ -10,6 +10,19 @@ index 98856b5..c8dc8bf 100644
          || target_os == "hermit"
          || target_os == "trusty"
          || target_os == "l4re"
+diff --git a/library/std/src/path.rs b/library/std/src/path.rs
+index 578783a..1b8bdbd 100644
+--- a/library/std/src/path.rs
++++ b/library/std/src/path.rs
+@@ -1353,7 +1353,7 @@ impl PathBuf {
+             need_sep = false
+         }
+ 
+-        let need_clear = if cfg!(target_os = "cygwin") {
++        let need_clear = if cfg!(any(target_os = "cygwin", target_os = "nocturne")) {
+             // If path is absolute and its prefix is none, it is like `/foo`,
+             // and will be handled below.
+             path.prefix().is_some()
 diff --git a/library/std/src/sys/alloc/mod.rs b/library/std/src/sys/alloc/mod.rs
 index f2f1d1c..c2be461 100644
 --- a/library/std/src/sys/alloc/mod.rs
@@ -360,10 +373,10 @@ index 0c297c5..2f9abd0 100644
          use solid as imp;
 diff --git a/library/std/src/sys/fs/nocturne.rs b/library/std/src/sys/fs/nocturne.rs
 new file mode 100644
-index 0000000..6a7fd85
+index 0000000..e984323
 --- /dev/null
 +++ b/library/std/src/sys/fs/nocturne.rs
-@@ -0,0 +1,558 @@
+@@ -0,0 +1,557 @@
 +//! Documents and folders on Nocturne.
 +//!
 +//! A file is a document handle (`n_document_open`). The kernel has no shared
@@ -382,7 +395,7 @@ index 0000000..6a7fd85
 +use crate::sync::atomic::{AtomicU64, Ordering};
 +pub use crate::sys::fs::common::{Dir, copy, exists, remove_dir_all};
 +use crate::sys::pal::abi::{self, n_entry};
-+use crate::sys::pal::{cvt, unsupported, with_complete_path};
++use crate::sys::pal::{c_path, cvt, unsupported, with_complete_path};
 +use crate::sys::time::SystemTime;
 +
 +/// Entries asked of `n_folder_list` at a time.
@@ -646,11 +659,12 @@ index 0000000..6a7fd85
 +    }
 +
 +    pub fn fsync(&self) -> io::Result<()> {
-+        Ok(())
++        // Returns once the document is on the medium.
++        cvt(unsafe { abi::n_document_commit(self.handle, abi::N_COMMIT_WAIT) }).map(|_| ())
 +    }
 +
 +    pub fn datasync(&self) -> io::Result<()> {
-+        Ok(())
++        self.fsync()
 +    }
 +
 +    pub fn lock(&self) -> io::Result<()> {
@@ -917,9 +931,7 @@ index 0000000..6a7fd85
 +pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
 +    with_complete_path(p, &|full| {
 +        info(full)?;
-+        let bytes = unsafe { CStr::from_ptr(full) }.to_bytes().to_vec();
-+        // SAFETY: path bytes.
-+        Ok(PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(bytes) }))
++        Ok(unsafe { c_path(full) })
 +    })
 +}
 diff --git a/library/std/src/sys/io/error/mod.rs b/library/std/src/sys/io/error/mod.rs
@@ -1014,10 +1026,10 @@ index 88d9d42..1a6fa99 100644
          pub use self::xous::*;
 diff --git a/library/std/src/sys/pal/nocturne/abi.rs b/library/std/src/sys/pal/nocturne/abi.rs
 new file mode 100644
-index 0000000..4cb12ba
+index 0000000..c2621da
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/abi.rs
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,180 @@
 +//! Declarations of the Nocturne native ABI as the C library exports it
 +//! (`user/include/nocturne.h`, `common/abi.h`, `docs/nocturne-native-abi.md`).
 +//!
@@ -1079,6 +1091,9 @@ index 0000000..4cb12ba
 +pub const N_DOCUMENT_EDIT: c_int = 2;
 +pub const N_DOCUMENT_CREATE: c_int = 3;
 +pub const N_DOCUMENT_REPLACE: c_int = 4;
++
++// ---- n_document_commit ----
++pub const N_COMMIT_WAIT: c_int = 1;
 +
 +// ---- n_channel_receive flags ----
 +pub const N_CHANNEL_WAIT: c_int = 1;
@@ -1156,6 +1171,7 @@ index 0000000..4cb12ba
 +    pub fn n_document_set_size(h: n_handle, size: u64) -> n_result;
 +    pub fn n_document_claim(h: n_handle, wait: bool) -> n_result;
 +    pub fn n_document_release(h: n_handle) -> n_result;
++    pub fn n_document_commit(h: n_handle, how: c_int) -> n_result;
 +    pub fn n_document_save(path: *const c_char, data: *const c_void, size: usize) -> n_result;
 +    pub fn n_entry_info(path: *const c_char, out: *mut n_entry) -> n_result;
 +    pub fn n_entry_remove(path: *const c_char) -> n_result;
@@ -1171,6 +1187,8 @@ index 0000000..4cb12ba
 +    ) -> n_result;
 +    pub fn n_path_complete(name: *const c_char, out: *mut c_char, cap: usize) -> n_result;
 +    pub fn n_folder_set(name: *const c_char) -> n_result;
++    pub fn n_user_folder() -> *const c_char;
++    pub fn n_temp_folder() -> *const c_char;
 +    pub fn n_random(buf: *mut c_void, n: usize) -> n_result;
 +    pub fn n_app_self() -> n_result;
 +    pub fn n_terminal(h: n_handle) -> bool;
@@ -1265,10 +1283,10 @@ index 0000000..f4b3799
 +}
 diff --git a/library/std/src/sys/pal/nocturne/mod.rs b/library/std/src/sys/pal/nocturne/mod.rs
 new file mode 100644
-index 0000000..71caaf0
+index 0000000..ad549ff
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/mod.rs
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,89 @@
 +//! System bindings for Nocturne OS.
 +//!
 +//! Nocturne is its own operating system, not UNIX and not POSIX. This target
@@ -1281,7 +1299,9 @@ index 0000000..71caaf0
 +#![deny(unsafe_op_in_unsafe_fn)]
 +#![allow(missing_docs, nonstandard_style)]
 +
++use crate::ffi::{CStr, OsStr, c_char};
 +use crate::io as std_io;
++use crate::path::PathBuf;
 +
 +pub mod abi;
 +pub mod futex;
@@ -1321,18 +1341,100 @@ index 0000000..71caaf0
 +}
 +
 +/// Runs `f` with the complete, normalised form of `path` (`n_path_complete`:
-+/// relative names are taken inside the `FOLDER` setting, `.` and `..` are
-+/// resolved by name). Every call that names a document or folder goes through
-+/// here because the kernel only accepts complete paths.
++/// `C:\...`, relative names are taken inside the `FOLDER` setting, `.` and
++/// `..` are resolved by name). Every call that names a document or folder goes
++/// through here because the kernel only accepts complete paths.
 +pub fn with_complete_path<T>(
 +    path: &crate::path::Path,
-+    f: &dyn Fn(*const crate::ffi::c_char) -> std_io::Result<T>,
++    f: &dyn Fn(*const c_char) -> std_io::Result<T>,
 +) -> std_io::Result<T> {
 +    crate::sys::helpers::run_path_with_cstr(path, &|name| {
-+        let mut full = [0 as crate::ffi::c_char; 4096];
-+        cvt(unsafe { abi::n_path_complete(name.as_ptr(), full.as_mut_ptr(), full.len()) })?;
-+        f(full.as_ptr())
++        let mut stack = [0 as c_char; 4096];
++        let mut heap: Vec<c_char> = Vec::new();
++        let mut full: &mut [c_char] = &mut stack;
++        loop {
++            let r = unsafe { abi::n_path_complete(name.as_ptr(), full.as_mut_ptr(), full.len()) };
++            if r != -(abi::N_ERR_TOO_LARGE as abi::n_result) {
++                cvt(r)?;
++                return f(full.as_ptr());
++            }
++            // Paths have no length limit: try again with more room.
++            let len = full.len() * 2;
++            heap.resize(len, 0);
++            full = &mut heap[..];
++        }
 +    })
++}
++
++/// The path in a string the C library gives.
++///
++/// # Safety
++///
++/// `p` must point to a NUL-terminated string.
++pub unsafe fn c_path(p: *const c_char) -> PathBuf {
++    let bytes = unsafe { CStr::from_ptr(p) }.to_bytes();
++    // SAFETY: Nocturne paths are plain bytes, like the encoded bytes of an OsStr.
++    PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(bytes) })
++}
+diff --git a/library/std/src/sys/path/mod.rs b/library/std/src/sys/path/mod.rs
+index bbb7577..e9fc136 100644
+--- a/library/std/src/sys/path/mod.rs
++++ b/library/std/src/sys/path/mod.rs
+@@ -40,6 +40,10 @@ cfg_select! {
+         mod windows_prefix;
+         pub use cygwin::*;
+     }
++    target_os = "nocturne" => {
++        mod nocturne;
++        pub use nocturne::*;
++    }
+     _ => {
+         mod unix;
+         pub use unix::*;
+diff --git a/library/std/src/sys/path/nocturne.rs b/library/std/src/sys/path/nocturne.rs
+new file mode 100644
+index 0000000..b4f9e45
+--- /dev/null
++++ b/library/std/src/sys/path/nocturne.rs
+@@ -0,0 +1,39 @@
++//! Nocturne paths: one drive, `C:`, with `\` and `/` as separators.
++//!
++//! A path is complete when it has a root (`C:\a`, `\a`, `/a`). A drive
++//! without a root (`C:`, `C:a`) names the current folder, like a relative
++//! path. The C library completes paths (`n_path_complete`).
++
++use crate::ffi::OsStr;
++use crate::io;
++use crate::path::{Path, PathBuf, Prefix};
++use crate::sys::pal::{c_path, with_complete_path};
++
++path_separator_bytes!(b'\\', b'/');
++
++#[inline]
++pub const fn is_verbatim_sep(b: u8) -> bool {
++    is_sep_byte(b)
++}
++
++/// The only prefix is a drive, `X:`: there are no UNC or verbatim paths.
++pub fn parse_prefix(path: &OsStr) -> Option<Prefix<'_>> {
++    match path.as_encoded_bytes() {
++        [drive, b':', ..] if drive.is_ascii_alphabetic() => {
++            Some(Prefix::Disk(drive.to_ascii_uppercase()))
++        }
++        _ => None,
++    }
++}
++
++pub const HAS_PREFIXES: bool = true;
++
++/// `C:\...` inside the `FOLDER` setting, with `.` and `..` resolved.
++pub(crate) fn absolute(path: &Path) -> io::Result<PathBuf> {
++    // SAFETY: `with_complete_path` gives a NUL-terminated path.
++    with_complete_path(path, &|full| Ok(unsafe { c_path(full) }))
++}
++
++pub(crate) fn is_absolute(path: &Path) -> bool {
++    path.has_root()
 +}
 diff --git a/library/std/src/sys/paths/mod.rs b/library/std/src/sys/paths/mod.rs
 index 8880a83..97b25e6 100644
@@ -1351,40 +1453,31 @@ index 8880a83..97b25e6 100644
          use uefi as imp;
 diff --git a/library/std/src/sys/paths/nocturne.rs b/library/std/src/sys/paths/nocturne.rs
 new file mode 100644
-index 0000000..4a2dc8d
+index 0000000..70f07d6
 --- /dev/null
 +++ b/library/std/src/sys/paths/nocturne.rs
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,101 @@
 +//! Folders and paths on Nocturne.
 +//!
-+//! There is no kernel working directory: an app's "current folder" is its
++//! There is no kernel working directory: an app's current folder is its
 +//! `FOLDER` setting, which `n_path_complete` uses to complete relative names
-+//! and which is passed on to the apps it launches. Paths use `/` and the
-+//! search-path separator is `:`.
++//! and which is passed on to the apps it launches. The user's folder and the
++//! temporary folder are the settings `USERFOLDER` and `TEMP`, which the C
++//! library reads. Path lists are separated by `;`.
 +
-+use crate::ffi::{CStr, OsStr, OsString};
++use crate::ffi::{OsStr, OsString};
 +use crate::io;
 +use crate::marker::PhantomData;
-+use crate::path::{self, PathBuf};
-+use crate::sys::pal::abi;
++use crate::path::{Path, PathBuf};
++use crate::sys::pal::{abi, c_path};
 +use crate::{fmt, vec};
 +
 +pub fn getcwd() -> io::Result<PathBuf> {
-+    // SAFETY: `getenv` returns a NUL-terminated string or NULL.
-+    unsafe {
-+        let p = abi::getenv(c"FOLDER".as_ptr());
-+        if !p.is_null() {
-+            let bytes = CStr::from_ptr(p).to_bytes();
-+            if bytes.first() == Some(&b'/') {
-+                return Ok(PathBuf::from(OsString::from_encoded_bytes_unchecked(bytes.to_vec())));
-+            }
-+        }
-+    }
-+    Ok(PathBuf::from("/"))
++    // `FOLDER` completed, or "C:\" when it is missing or not complete.
++    crate::sys::path::absolute(Path::new("."))
 +}
 +
-+pub fn chdir(p: &path::Path) -> io::Result<()> {
-+    crate::sys::with_complete_path(p, &|_| Ok(()))?;
++pub fn chdir(p: &Path) -> io::Result<()> {
 +    crate::sys::helpers::run_path_with_cstr(p, &|name| {
 +        crate::sys::cvt(unsafe { abi::n_folder_set(name.as_ptr()) })?;
 +        Ok(())
@@ -1402,7 +1495,7 @@ index 0000000..4a2dc8d
 +pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
 +    let parts: Vec<PathBuf> = unparsed
 +        .as_encoded_bytes()
-+        .split(|&b| b == b':')
++        .split(|&b| b == b';')
 +        .map(|part| {
 +            // SAFETY: a piece between ASCII separators of an encoded OsStr.
 +            PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(part) })
@@ -1433,9 +1526,9 @@ index 0000000..4a2dc8d
 +    for (i, path) in paths.enumerate() {
 +        let path = path.as_ref().as_encoded_bytes();
 +        if i > 0 {
-+            joined.push(b':')
++            joined.push(b';')
 +        }
-+        if path.contains(&b':') {
++        if path.contains(&b';') {
 +            return Err(JoinPathsError);
 +        }
 +        joined.extend_from_slice(path);
@@ -1446,7 +1539,7 @@ index 0000000..4a2dc8d
 +
 +impl fmt::Display for JoinPathsError {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        "path segment contains separator `:`".fmt(f)
++        "path segment contains separator `;`".fmt(f)
 +    }
 +}
 +
@@ -1457,11 +1550,13 @@ index 0000000..4a2dc8d
 +}
 +
 +pub fn temp_dir() -> PathBuf {
-+    PathBuf::from("/tmp")
++    // SAFETY: a NUL-terminated path ("C:\" without a complete `TEMP`).
++    unsafe { c_path(abi::n_temp_folder()) }
 +}
 +
 +pub fn home_dir() -> Option<PathBuf> {
-+    crate::env::var_os("HOME").map(PathBuf::from).or_else(|| Some(PathBuf::from("/home")))
++    // SAFETY: a NUL-terminated path ("C:\" without a complete `USERFOLDER`).
++    Some(unsafe { c_path(abi::n_user_folder()) })
 +}
 diff --git a/library/std/src/sys/process/mod.rs b/library/std/src/sys/process/mod.rs
 index ee61175..091629d 100644

@@ -5,20 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 #include "quickjs.h"
-static int aes_test_open(const char *path,int flags,...){return !strcmp(path,"/dev/random")&&flags==O_RDONLY?42:-1;}
-static ssize_t aes_test_read(int fd,void *bytes,size_t size){if(fd!=42||size>65536)return -1;return BCryptGenRandom(NULL,bytes,(ULONG)size,BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0?-1:(ssize_t)size;}
-static int aes_test_close(int fd){return fd==42?0:-1;}
-#define open aes_test_open
-#define read aes_test_read
-#define close aes_test_close
+/* The product asks the system for random bytes with n_random (n_result is int64_t); the harness answers
+   with the Windows CSPRNG. */
+static int64_t aes_test_random(void *bytes,size_t size){if(size>65536)return -1;return BCryptGenRandom(NULL,bytes,(ULONG)size,BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0?-1:(int64_t)size;}
+#define n_random aes_test_random
 #include "../user/libc/web/js_crypto.c"
-#undef open
-#undef read
-#undef close
+#undef n_random
 static void exception(JSContext *ctx){JSValue e=JS_GetException(ctx),stack=JS_GetPropertyStr(ctx,e,"stack");const char *s=JS_ToCString(ctx,e),*t=JS_ToCString(ctx,stack);fprintf(stderr,"%s\n%s\n",s?s:"exception",t?t:"");JS_FreeCString(ctx,s);JS_FreeCString(ctx,t);JS_FreeValue(ctx,stack);JS_FreeValue(ctx,e);}
 static JSValue evaluate(JSContext *ctx,const char *source,const char *name){JSValue v=JS_Eval(ctx,source,strlen(source),name,JS_EVAL_TYPE_GLOBAL);if(JS_IsException(v)){exception(ctx);exit(2);}return v;}
 static void load(JSContext *ctx,const char *path){FILE *f=fopen(path,"rb");if(!f){perror(path);exit(2);}fseek(f,0,SEEK_END);long size=ftell(f);rewind(f);char *source=malloc((size_t)size+1);if(!source||fread(source,1,(size_t)size,f)!=(size_t)size)exit(2);fclose(f);source[size]=0;JS_FreeValue(ctx,evaluate(ctx,source,path));free(source);}

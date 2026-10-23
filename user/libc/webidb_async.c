@@ -8,6 +8,8 @@
 #include <string.h>
 #include <limits.h>
 
+#define STORAGE_WORKER N_FOLDER_SYSTEM "\\browserstorageworker"
+
 struct idb_packet {
     struct idb_packet *next;
     struct webidb_wire_command command;
@@ -62,8 +64,8 @@ static bool spawn_broker(webidb_async *db) {
     /* The worker's diagnostics go to the page owner's stream, else the system log. */
     const char *arguments[]={"browserstorageworker"};int32_t handles[]={pair[1],pair[1],2};
     struct n_launch launch={.arguments=arguments,.argument_count=1,.handles=handles,.handle_count=3};
-    n_handle app=n_app_launch("/bin/browserstorageworker",&launch);
-    if(app==-N_ERR_NO_HANDLE){handles[2]=-1;app=n_app_launch("/bin/browserstorageworker",&launch);}
+    n_handle app=n_app_launch(STORAGE_WORKER,&launch);
+    if(app==-N_ERR_NO_HANDLE){handles[2]=-1;app=n_app_launch(STORAGE_WORKER,&launch);}
     n_handle_close(pair[1]);
     db->channel=pair[0];
     if(app<0){stop(db);return false;}

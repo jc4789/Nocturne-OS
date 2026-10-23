@@ -45,7 +45,7 @@ general-purpose OS for daily use (see [Limits](#limits)).
 
 ## What's inside
 
-### Kernel (`kernel/`, about 29,000 lines of C and assembly)
+### Kernel (`kernel/`, about 43,000 lines of C and assembly)
 
 - **Boot**: Limine (BIOS or UEFI) into a 64-bit higher-half kernel. The boot menu has three entries: the default
   1920×1080, 1024×768, and text console only (`nogui`).
@@ -60,11 +60,12 @@ general-purpose OS for daily use (see [Limits](#limits)).
   - W^X: no page is ever both writable and executable. Generated code is written first and then made executable.
   - The native memory API (`n_memory_reserve`, `protect`, `release`) and shared pages. Shared pages reach another
     app only as an attachment to a channel message.
-  - The initrd is unpacked into the RAM root, and the archive's pages are then given back.
-- **Files**: the root is in RAM (built from the initrd and lost on reboot). `/data` is a FAT32 volume named
-  `NOCTDATA` that survives reboots; it is found on MBR, GPT or unpartitioned disks.
+- **Files**: the Nocturne partition of the boot disk is drive C: (`fs/`). It has its own copy-on-write format:
+  4 KiB blocks, a B+ tree catalog, a CRC-32C on every block and two superblocks written in turn, so a power cut in
+  the middle of a write leaves the last commit. The kernel finds C: by the boot disk's GPT identity that Limine
+  reports (on the live ISO, C: is the volume Limine brought into memory).
 - **Drivers**
-  - Storage: ATA (PIO), NVMe, USB mass storage (BOT + SCSI) and Hyper-V SCSI.
+  - Storage: AHCI (SATA, DMA), ATA (PIO), NVMe, USB mass storage (BOT + SCSI) and Hyper-V SCSI.
   - USB: xHCI, USB 2.0 and SuperSpeed hubs, HID keyboards and mice.
   - Input: PS/2 keyboard and wheel mouse, Hyper-V synthetic keyboard and absolute mouse, USB HID.
   - Network: Intel e1000, DEC 21140/21143 (tulip), Hyper-V's synthetic adapter, Realtek RTL8125B (2.5GbE) and
@@ -88,7 +89,7 @@ general-purpose OS for daily use (see [Limits](#limits)).
   - Kernel text uses GNU Unifont Japanese 18.0.01 bitmaps (57,086 glyphs, 8×16 half-width and 16×16 full-width).
 - **Settings**: the Settings app (the gear on the desktop, Settings in the start menu) changes the display
   (10-bit colour, refresh rate), the mouse (pointer speed, vertical direction) and the volume with the mouse alone.
-  Changes apply at once and are saved on `/data`, so they survive a restart. No terminal opens at startup, and
+  Changes apply at once and are saved in `AppData\Settings\desktop.conf` in the user's folder, so they survive a restart. No terminal opens at startup, and
   nothing in everyday use needs one.
 - **Hyper-V**: VMBus and the synthetic devices, heartbeat, shutdown and restart from Hyper-V Manager, time sync,
   KVP (Hyper-V Manager shows the VM's IP address and OS), Hyper-V sockets, and the RDP server on them for the
@@ -101,8 +102,9 @@ This is Nocturne as a program sees it (`user/include/nocturne.h`, `common/abi.h`
 
 - **Handles**: every resource is a typed handle (document, folder, channel, window, shared pages, app, events,
   device, connection). Failures return a negative `N_ERR_*`, and `n_result_text` describes it.
-- **Documents and folders** are always named by a complete path starting with `/`. The kernel has no working folder
-  and no file position. The shell's current folder reaches apps as the setting `FOLDER=`. There are whole-document
+- **Documents and folders** are always named by a complete path (`C:\Users\User\a.txt`; `\` and `/` are the same,
+  and `\a` is `C:\a`). Names are not case-sensitive and keep the case they were written in. The kernel has no
+  working folder and no file position. The shell's current folder reaches apps as the setting `FOLDER=`. There are whole-document
   load, atomic save and append, reads and writes at a given offset, and exclusive claims.
 - **Channels**: two-way message passing, in place of pipes. A message can carry a document or shared-page handle.
   Channels can also be listened for and connected to by name.
@@ -132,9 +134,9 @@ An ISO C library (`stdio`, `stdlib`, `string`, `math`, `time`, `threads` and so 
   surfaces) as a message and gets back events that name a widget by its place. The engine does layout, painting,
   pointer and keyboard, focus, scrolling and animation, and repaints only the widgets that changed since the last
   picture. C calls it directly; JavaScript/TypeScript (`nocturne/ui`) and Go (`ports/go/ui`) use the same format through
-  `/bin/uihost`. No language has its own widget implementation. Text is Noto Sans (CJK included), monospace is Maple Mono.
+  `C:\Nocturne\System\uihost`. No language has its own widget implementation. Text is Noto Sans (CJK included), monospace is Maple Mono.
 - **Shell** (`sh`)
-  - Pipes (channels), redirection (`< > >> 2>`), `&`, `;`, `&&`, `||`, quoting, `*` and `?` globbing, `~` and `#` comments.
+  - Pipes (channels), redirection (`< > >> 2>`), `&`, `;`, `&&`, `||`, quoting, `*` and `?` globbing (not case-sensitive) and `#` comments.
   - `$?` and script arguments (`$0` to `$9`, `$#`, `$@`). There are no variables, `if` or loops.
   - History, tab completion, and `cd`, `pwd`, `history`, `help`.
 - **Terminal**: 16 ANSI colours, UTF-8, 1000 lines of scrollback, copying the screen and pasting, and resizing.
@@ -144,7 +146,8 @@ An ISO C library (`stdio`, `stdlib`, `string`, `math`, `time`, `threads` and so 
 - **Network**: `ifconfig`, `ping`, `host` (DNS) and `fetch` (HTTP and HTTPS).
 - **Sound**: `beep` (tones and melodies), `play` (WAV) and `volume`, for scripts; everything they do can also be
   done from the desktop.
-- **Development**: `tcc`, `js`, `tsgo`, `wasm2c`, `cppdemo`. The source of every app in `/bin` is in `/usr/src/apps`.
+- **Development**: `tcc`, `js`, `tsgo`, `wasm2c`, `cppdemo`. Programs live in `C:\Nocturne\System` (commands) and
+  `C:\Programs` (desktop apps); the C, JavaScript and TypeScript sources are in `C:\Nocturne\SDK\Source\Apps`.
 - **AI**: `agent` (see [The AI agent](#the-ai-agent)).
 - **Desktop apps**: Terminal, Files, Web Browser, Text Editor, Paint, Calculator, Clock, System Monitor, Piano,
   Sound Player, Media Player, Settings and About.
@@ -162,21 +165,20 @@ powershell -ExecutionPolicy Bypass -File build.ps1 run
 
 `build.ps1 run` (`make run`) uses 2048 MiB, 4 CPUs and TCG (emulation) by default. Change them with variables,
 for example `make run QEMU_ACCEL=whpx QEMU_MEMORY=4096M`. Sound is an AC'97 card and the network is QEMU's
-default e1000 with user-mode NAT.
+default e1000 with user-mode NAT. It boots a disk of its own, `build\run.img`: a copy of `build\nocturne.img` the
+first time, and after that only the system on it is replaced by each new build, so files saved on C: stay (see
+[Drive C: and saving](#drive-c-and-saving)).
 
-Under WHPX, a boot disk on IDE makes Limine read the roughly 450 MB initrd through IDE PIO, and the kernel takes
-about 3 minutes to start. With the boot disk on AHCI it takes about 8 seconds. This is the setup used for development:
+The kernel's ATA driver uses PIO, so attach the boot disk to AHCI (DMA). To try the built disk as it is
+(`snapshot=on`: whatever is written to C: is dropped when QEMU stops):
 
 ```powershell
 & "C:\Program Files\qemu\qemu-system-x86_64.exe" -M pc -accel whpx -smp 4 -m 4096M -vga std `
   -device ahci,id=ahci `
   -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on `
   -device ide-hd,drive=boot,bus=ahci.0,bootindex=0 `
-  -drive file=build/data.img,format=raw,if=ide,index=1 `
   -audiodev dsound,id=snd -device AC97,audiodev=snd -serial stdio
 ```
-
-The kernel has no AHCI driver, so keep the `/data` disk (`data.img`) on IDE.
 
 ### Hyper-V
 
@@ -187,12 +189,11 @@ powershell -ExecutionPolicy Bypass -File hyperv.ps1 -MemoryMB 4096
 ```
 
 It creates a **Generation 2** VM called `Nocturne`, starts it and opens VMConnect. The settings:
-- Static memory (512 MB by default) and 1 CPU. The boot image unpacks an initrd of about 450 MB into RAM, so raise
-  it with `-MemoryMB` (development testing uses 4096 MiB). The CPU count can be raised in Hyper-V Manager, and the
-  kernel uses the added CPUs.
+- Static memory (512 MB by default) and 1 CPU. Change the memory with `-MemoryMB` (development testing uses
+  4096 MiB). The CPU count can be raised in Hyper-V Manager, and the kernel uses the added CPUs.
 - Secure Boot off (the boot loader is not signed). No checkpoints.
-- The boot disk (`hyperv\<Name>-boot.vhdx`) on SCSI 0:0 and the [data disk](#persistent-storage-data)
-  (`hyperv\<Name>-data.vhdx`, 2 GB dynamic) on SCSI 0:1.
+- One disk (`hyperv\<Name>.vhdx`, SCSI 0:0), the VM's own. It starts as a copy of `build\nocturne.img`, with the
+  boot part and [drive C:](#drive-c-and-saving).
 - A network adapter on the **Default Switch**, so the VM gets an address by DHCP and can reach the internet.
 - The Enhanced Session over Hyper-V sockets. If the host has Enhanced Session Mode turned off, the script turns it on.
 - COM1 connected to `\\.\pipe\<lowercase name>-com1`.
@@ -209,21 +210,21 @@ Other options:
 
 | Command | What it does |
 |---|---|
-| `hyperv.ps1 -Update` | Copy a freshly built boot disk into the existing VM and restart it. The data disk is kept. Refuses media older than kernel.elf or initrd.tar. |
+| `hyperv.ps1 -Update` | Turn the VM off, put the newly built system (the boot part, `C:\Nocturne` and the bundled apps' folders) on its disk and start it again. The user's files and the apps the user put in `C:\Programs` stay. Rewriting needs free space of twice the disk's size in `hyperv\`. An older VM's data disk (`<Name>-data.vhdx`) is detached and left on the host. |
 | `hyperv.ps1 -Generation 1` | Create a Generation 1 VM instead (see below). |
-| `hyperv.ps1 -Iso` | Boot from `build\nocturne.iso` on the DVD drive instead of the disk. |
-| `hyperv.ps1 -Remove` | Delete the VM. The data disk is deleted only with `-DeleteData`. |
+| `hyperv.ps1 -Iso` | Boot the live ISO (`build\nocturne.iso`) on the DVD drive instead of the disk. Its C: is in memory, and changes are lost at power-off. Without `-MemoryMB` the VM gets 2048 MB; `-Update -Iso` on an existing VM raises its startup memory if it is less. |
+| `hyperv.ps1 -Remove` | Delete the VM. Its disk stays, with the user's files, and a new VM with the same name takes it up again. `-DeleteDisk` deletes the disk too. |
 | `hyperv.ps1 -NoStart` | Create the VM without starting it. |
 | `hyperv.ps1 -NoNetwork` | Create the VM without a network adapter. |
 | `hyperv.ps1 -Switch "Name"` | Connect to a different virtual switch. |
 | `hyperv.ps1 -Name Foo -MemoryMB 4096` | Use a different VM name and memory size. |
-| `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | Write the AI agent's API key to the data disk (`-Endpoint` and `-Model` too). |
+| `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | Write the AI agent's API key to C: on the VM's disk (`-Endpoint` and `-Model` too). |
 
 To create a Gen 2 VM by hand, turn Secure Boot off, attach `build\nocturne.vhdx` as a SCSI disk, and set
 `Set-VM -EnhancedSessionTransportType HvSocket` for the Enhanced Session.
 
-**Generation 1** emulates a legacy PC: `build\nocturne.vhd` on IDE, the data disk on IDE 0:1 and a *legacy*
-network adapter (an emulated DEC 21140). VMConnect shows the basic console only.
+**Generation 1** emulates a legacy PC: the disk is a fixed VHD (`hyperv\<Name>.vhd`, the same format as
+`build\nocturne.vhd`) on IDE 0:0, with a *legacy* network adapter (an emulated DEC 21140). VMConnect shows the basic console only.
 
 **Tips for VMConnect**
 - In the basic console, click inside the window to capture the mouse. **Ctrl+Alt+Left Arrow** releases it.
@@ -241,7 +242,7 @@ network adapter (an emulated DEC 21140). VMConnect shows the basic console only.
 
 | Script | What it does |
 |---|---|
-| `hv-boot.ps1 -Name VM -Build` | Build, refresh the VM's boot media, boot, record COM1 and take a console screenshot. |
+| `hv-boot.ps1 -Name VM -Build` | Build, refresh the VM's ISO or the system on its disk (`hyperv.ps1 -Update -NoStart`), boot, record COM1 and take a console screenshot. |
 | `hv-esm.ps1 -Name VM` | Open an Enhanced Session in VMConnect and save a picture of the window. |
 | `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | Test the Enhanced Session without VMConnect: a small RDP client types and clicks, and saves the desktop it receives as a PNG. `clip:TEXT` and `chord:1d,2a,2f` test the clipboard, `resize:1600x900` a window resize. The sound it receives is saved as a WAV next to the PNG, with the tones in it listed. |
 | `hv-input.ps1 -Name VM -Steps "text:...","click:1"` | Send keyboard and mouse input to the basic console. |
@@ -251,13 +252,14 @@ network adapter (an emulated DEC 21140). VMConnect shows the basic console only.
 
 ### Real hardware
 
-Write `build\nocturne.img` (an MBR disk with FAT32 that boots from both BIOS and UEFI) to a USB stick, turn
-Secure Boot off and boot it. On a 12-thread AMD machine (booted from USB, RTL8125B wired LAN, USB keyboard and
-mouse) it reached the desktop and showed a video page in the browser. This is still early:
+Write `build\nocturne.img` (a GPT disk that boots from both BIOS and UEFI) to a USB stick, turn Secure Boot off
+and boot it. On a 12-thread AMD machine (booted from USB, RTL8125B wired LAN, USB keyboard and mouse) it reached
+the desktop and showed a video page in the browser. That was before the single disk with drive C:, which has not
+been tried on real hardware yet. This is still early:
 - There is no step-by-step guide and no list of supported machines.
 - There is no sound (Intel HD Audio is not supported), and no GPU driver; the firmware's display mode is used.
-- To keep `/data`, some disk (a USB stick, NVMe and so on) needs a FAT32 volume named `NOCTDATA`. Without one,
-  `/data` lives in RAM and is lost on reboot.
+- Files are saved on the stick's C: and survive reboots. C: keeps the image's size (it does not grow to fill a
+  larger stick), with about 2 GB free.
 
 ## Building
 
@@ -271,24 +273,27 @@ The host is Windows. The toolchain lives in `tools/`, which is not part of the r
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1          # build everything into .\build
 powershell -ExecutionPolicy Bypass -File build.ps1 run      # build and boot in QEMU
-powershell -ExecutionPolicy Bypass -File build.ps1 clean    # delete build (keeps data.img)
+powershell -ExecutionPolicy Bypass -File build.ps1 clean    # delete build (keeps run.img)
 python -X utf8 scripts/build.py -j 8 cxx                    # any Makefile target (cxx, bitmap-fonts, ...)
 ```
 
 Outputs in `build\`:
-- `kernel.elf`, `initrd.tar`: the kernel and the contents of the RAM root.
-- `nocturne.img`: raw MBR boot disk (QEMU, USB sticks).
+- `kernel.elf`: the kernel.
+- `nocturne.img`: the raw GPT boot disk, with the EFI system partition and drive C: (QEMU, USB sticks).
 - `nocturne.vhd`: fixed VHD for Hyper-V Generation 1.
 - `nocturne.vhdx`: dynamic VHDX for Hyper-V Generation 2.
-- `nocturne.iso`: hybrid BIOS/UEFI ISO.
-- `data.img`: the `/data` disk for QEMU (512 MB). Created on the first build and never overwritten.
-- `data-blank.vhdx`: an empty data disk for Hyper-V (2 GB).
+- `nocturne.iso`: a live BIOS/UEFI ISO with Limine, the kernel and C: (`boot/c.img`, a bare volume without a GPT),
+  which Limine loads into memory as a module. Changes to C: are lost at power-off, and it cannot hibernate. C: has
+  at least 256 MiB free (about 390 MiB now) and takes its whole size in RAM (about 960 MiB now). The full build makes it; `qemu-image` and
+  `run` do not.
+- `run.img`: the disk of `build.ps1 run`. Made by the first `run`; after that only its system is replaced.
+- `host\store.exe`: the host tool that makes, reads, writes and checks C: (`store list`, `get`, `put`, `check` and more).
 
 **Optional components** (the OS builds without them, but the calculator is written in Go and Settings and About in
 TypeScript, so a complete desktop needs both; toolchains in `tools/go` and `tools/typescript-go` are used automatically):
 - **Go** ([ports/go](ports/go/README.md)): build Go 1.27.2 with `ports/go/nocturne.patch` applied, then
-  `make GO=<Go source>/bin/go.exe` puts `ports/go/apps/*` into `/bin`.
-- **TypeScript-Go** ([ports/tsgo](ports/tsgo/README.md)): add `TSGO=<TypeScript-Go source>` to get `/bin/tsgo`.
+  `make GO=<Go source>/bin/go.exe` puts `ports/go/apps/*` into `C:\Nocturne\System` (the calculator into `C:\Programs\Calculator`).
+- **TypeScript-Go** ([ports/tsgo](ports/tsgo/README.md)): add `TSGO=<TypeScript-Go source>` to get `C:\Nocturne\System\tsgo`.
   `js file.ts` uses it.
 - **virgl** ([ports/virgl](ports/virgl/README.md)): only for trying virtio-gpu in the host's QEMU (`QEMU_GPU=virgl`).
 
@@ -300,13 +305,15 @@ powershell -ExecutionPolicy Bypass -File build.ps1 test-quick  # skips compiling
 powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # adds tcc rebuilding itself inside the OS
 ```
 
-`scripts/test.py` boots the image headless in QEMU with a throwaway data disk holding `tests/`; your own
-`data.img` is not touched. The in-OS `tcc` compiles the test runner (`tests/runtests.c`), which runs about 220
-tests in about 100 groups and checks each one's exit status and output. Results come back over the serial port,
-and afterwards the host checks the FAT32 volume the OS wrote with `fatcheck.py`. The tests cover:
+`scripts/test.py` copies `build\nocturne.img` to `build\test.img`, puts `tests/` in its `C:\Tests` and boots it
+headless in QEMU. It first checks that the copy's kernel and programs are the current build's; your `run.img` is
+not touched. The in-OS `tcc` compiles the test runner (`tests/runtests.c`), which runs about 220 tests in about
+110 groups and checks each one's exit status and output. Results come back over the serial port, and afterwards
+the host checks the C: the OS wrote with `store check` (the copy is kept only when that finds problems). The tests cover:
 - The shell and commands, `malloc`, the native ABI, threads and parallel work.
 - W^X: writing code or read-only data, and running the stack or heap, must stop the app.
-- FAT32 and the RAM filesystem: many sizes, long names, 150 entries, rename and nested folders.
+- The store (drive C:): documents of many sizes around the edges of 4 KiB blocks, replace, append, resize and positional
+  writes, move, long names, names in any case, nested folders, listing and removal.
 - `tcc`: printf and math, compiling every app, and self-hosting. C++.
 - The GUI: a window appears on screen and is gone after it closes.
 - Sound: streams, waiting and non-waiting writes, eight streams at once, the volume, `beep`, and `play` with many
@@ -321,7 +328,8 @@ and afterwards the host checks the FAT32 volume the OS wrote with `fatcheck.py`.
 The network tests need internet access from the host. Without it, use `python scripts/test.py --no-net`.
 `--accel whpx`, `--cpus`, `--memory` and group names (`python scripts/test.py web tcp`) can also be given.
 
-`scripts/qtest.py` drives a running image with keystrokes, mouse moves and screenshots:
+`scripts/qtest.py` boots `build\nocturne.img` with `snapshot=on` (whatever is written to C: is dropped when QEMU
+stops) and drives it with keystrokes, mouse moves and screenshots:
 
 ```
 python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dclick shot:files
@@ -341,20 +349,33 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 | Shift+PgUp / PgDn, mouse wheel | Terminal scrollback |
 | Ctrl+C | Stop the running command |
 
-The root filesystem lives in RAM, so files you create there are lost when you reboot. Save anything you want to
-keep under `/data`. `/home` has a few sample files; try `sh hello.sh`. `/home/JavaScript` has samples for `js`.
+The terminal and apps start in the user's folder, `C:\Users\User`. `Documents` has a few sample files; try
+`sh Documents\hello.sh`. `Documents\JavaScript` has samples for `js`.
 
-### Persistent storage: /data
+### Drive C: and saving
 
-Everything outside `/data` lives in RAM and is reset on every boot. `/data` is a FAT32 volume named `NOCTDATA`,
-so files saved there survive reboots and rebuilds.
-- **QEMU**: `build\data.img` (512 MB), created on the first build and never overwritten. `build.ps1 clean` leaves
-  it alone. Delete it by hand to start fresh.
-- **Hyper-V**: `hyperv.ps1` attaches `hyperv\<Name>-data.vhdx` (2 GB, dynamic) as the second disk. `-Update`
-  replaces only the boot disk.
-- **Real hardware**: a FAT32 volume named `NOCTDATA` on any disk.
+There is one disk, with an EFI system partition (Limine and the kernel) and drive C:. C: is a copy-on-write store,
+and files saved on it survive reboots.
+- `C:\Nocturne`: the system (programs in `System`, `Fonts`, `SDK`, `Licenses` and more). Apps can read it but not
+  change it.
+- `C:\Programs`: the desktop apps, a folder each (`Browser`, `Notepad` and so on). The folders of the apps that come
+  with the system cannot be changed either; your own apps get their folders here.
+- `C:\Users\User`: the user's files (`Documents`, `Desktop`, `Downloads`, `Music`, `Pictures`, `Videos`). An app's
+  data goes in `AppData\<app>`, temporary files in `AppData\Temp` (emptied on every boot).
+- What is written is committed about 5 seconds after the first change, or when the document is closed. If the power
+  goes in the middle of a write, everything up to the last commit stays.
 
-Apps are looked up in `/bin` and then `/data/bin`, so programs installed there run by name.
+Where C: lives:
+- **QEMU**: `build\run.img`, the disk of `build.ps1 run`. A rebuild replaces only its system, and `build.ps1 clean`
+  leaves it alone. Delete it by hand to start fresh.
+- **Hyper-V**: the VM's disk (`hyperv\<Name>.vhdx`). `-Update` replaces only the system on it.
+- **Real hardware**: the USB stick's C:.
+- The live ISO's C: is in memory, and changes to it are lost at power-off.
+
+From the host, `build\host\store.exe` looks into C: (`store list build\run.img C:\Users\User`, `store get`, `store put`).
+
+The shell looks up a bare command name in `C:\Nocturne\System` and then in each folder of `C:\Programs` (there is no
+`PATH`), so a program put in `C:\Programs\<Name>` runs by name.
 
 ## Sound
 
@@ -368,7 +389,7 @@ Apps are looked up in `/bin` and then `/data/bin`, so programs installed there r
 - **Media Player:** plays MP3, FLAC, AAC and Ogg (Vorbis, Opus) audio and MP4, WebM, AVI and MOV video (H.264,
   HEVC, VP8, VP9 and more) through FFmpeg. Double-clicking audio or video in Files opens it. Space plays or pauses,
   Left and Right jump 5 seconds, and Ctrl+O opens a file or URL.
-- **Music:** `/home/Music` has three short pieces made for Nocturne (synthesized at build time by `scripts/mksounds.py`).
+- **Music:** `C:\Users\User\Music` has three short pieces made for Nocturne (synthesized at build time by `scripts/mksounds.py`).
 - **Piano** plays two octaves from the mouse or the keyboard (Z S X D C V G B H N J M for the lower octave,
   Q 2 W 3 E R 5 T 6 Y 7 U I for the upper), in three sounds (Tab), with Left and Right to change octave.
 - Snake, Tetris and Minesweeper have sound effects.
@@ -398,7 +419,7 @@ a second or two after the desktop appears.
 ping -c 3 example.com
 host example.com
 fetch -i http://example.com
-fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
+fetch -o C:\Users\User\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
 ```
 
 - **TCP/IP** (`kernel/src/net/`): Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS and TCP.
@@ -422,7 +443,7 @@ Limits: no IPv6, no IP fragmentation, no TCP SACK or timestamps. One network ada
 
 ![The web browser showing Wikipedia](docs/browser.png)
 
-Open **Web Browser** from the desktop or the start menu, or run `browser URL` (or `browser /path/file.html`).
+Open **Web Browser** from the desktop or the start menu, or run `browser URL` (or `browser C:\path\file.html`).
 Files opens `.html` files in it. It starts on a page with a search box and links. Each window is one process;
 there are no tabs, you open more windows instead (`window.open` also makes a new window).
 
@@ -498,11 +519,12 @@ in [docs/browser-missing-20261012.md](docs/browser-missing-20261012.md) (in Japa
 `tcc` is TinyCC 0.9.28rc, built for Nocturne:
 
 ```
-tcc -run /usr/src/apps/mandel.c           # compile in memory and run
-tcc -o /data/bin/hello hello.c            # build a program; it now runs as `hello`
+tcc -run C:\Nocturne\SDK\Source\Apps\mandel.c   # compile in memory and run
+mkdir C:\Programs\Hello
+tcc -o C:\Programs\Hello\hello hello.c          # build a program; it now runs as `hello`
 ```
 
-Programs are linked statically against Nocturne's libc. They can use:
+Programs are linked statically against Nocturne's libc; the headers and libraries are in `C:\Nocturne\SDK`. They can use:
 - `nocturne.h`: the native API and windows.
 - `ui.h`: the UI engine (views of widgets and their events; see [Userland](#userland-user)).
 - `gfx.h` (drawing), `font.h` (TrueType), `image.h` (images), `media.h` (audio and video), `gpu.h`.
@@ -522,7 +544,8 @@ parts are not available. See [docs/cpp-support.md](docs/cpp-support.md) (in Japa
 
 [ports/go](ports/go/README.md) ports Go to `GOOS=nocturne GOARCH=amd64`. It runs on Nocturne's API, not as a UNIX
 flavour. Goroutines run on several CPUs, and `os`, `os/exec`, `net` (TCP, UDP, DNS, `net.Listen`) and `crypto/tls`
-work. Programs are cross-compiled on the host; `ports/go/apps/<name>` becomes `/bin/<name>`.
+work. Programs are cross-compiled on the host; `ports/go/apps/<name>` becomes `C:\Nocturne\System\<name>` (a
+desktop app goes in `C:\Programs\<App>`).
 
 ### JavaScript and TypeScript
 
@@ -549,9 +572,9 @@ js -e 'console.log(1 + 2)'  # -p prints the result, js - reads input, js alone s
   `TextDecoder`, `crypto` (`getRandomValues`, `subtle`), `structuredClone`, `atob`, `btoa`, `EventTarget` and
   `DOMException`. DOMException, Encoding, URL and Web Crypto share the browser's implementation. `fetch` talks on a
   thread inside the app, so other work goes on while it waits.
-- **Types**: the `nocturne` type definitions are in `/node_modules/@types/nocturne`, so projects in any folder find
-  them. `js file.ts` checks with `--strict` and does not run code with type errors (output goes to `/tmp/js-ts`;
-  packages are looked up from the source's location). TypeScript needs a build that includes `tsgo`.
+- **Types**: the `nocturne` type definitions are in `C:\Nocturne\SDK\Types\nocturne`; `js file.ts` and the
+  `tsconfig.json` from `js --init` use them. `js file.ts` checks with `--strict` and does not run code with type
+  errors (output goes to `js-ts` in the temporary folder; packages are looked up from the source's location). TypeScript needs a build that includes `tsgo`.
 - **Exit**: an uncaught exception or unhandled Promise rejection prints its stack and exits with status 1; a
   top-level `await` that never finishes exits with 13. The prompt only prints them and carries on.
 
@@ -561,7 +584,7 @@ The runtime is `user/apps/js.c` (system bindings, module loading, the event loop
 ### WebAssembly
 
 `wasm2c` is WABT's converter. Its C output can be compiled with the in-OS `tcc` together with the runtime in
-`/usr/include` and `/usr/src/wasm2c`.
+`C:\Nocturne\SDK\Include` and `C:\Nocturne\SDK\Source\wasm2c`.
 
 ## The AI agent
 
@@ -578,18 +601,20 @@ It writes C, compiles it with `tcc`, runs it and fixes what breaks.
 
 ```
 agent                                   # interactive session (type /help)
-agent write a tetris clone in /data/projects/tetris and install it as /data/bin/tet
+agent write a tetris clone in C:\Users\User\Documents\tetris and install it as C:\Programs\Tet\tet
 agent -r                                # resume the previous session
 ```
 
-The model's instructions are in `/etc/agent/system.md`, sessions and the agent's notes in `/data/agent`, and
-settings in `/data/etc/agent.conf`:
+The model's instructions are in `C:\Nocturne\Agent\system.md`. The settings (`agent.conf`), the session
+(`session.json`) and the agent's notes (`NOTES.md`) are in `AppData\Agent` in the user's folder. The settings:
 - `endpoint` and `model`.
 - `max_tokens` and `context_limit`.
 - `reasoning`, `show_thinking` and `vision`. Set `vision=0` for models that cannot take images.
 
-**API key.** The key is stored only on the data disk, never in the repository or the boot image:
-- QEMU: `python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]`
+**API key.** The key is stored only in `AppData\Agent\agent.conf` on the C: of the disk you use, never in the
+repository or the built `nocturne.img`:
+- QEMU: `python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]` (writes to `build\run.img`; make it
+  first with `build.ps1 run`. `--img` names another disk.)
 - Hyper-V: `hyperv.ps1 -Update -ApiKeyFile KEYFILE`
 - Or start `agent` and paste the key when it asks (`/key` enters it again).
 
@@ -599,20 +624,21 @@ and `glm-5.3-flash`. Keep key files outside this folder.
 ## Limits
 
 What Nocturne does not have, so nobody is surprised:
-- **No users or permissions.** Every app is isolated in its own address space, but all of them can read and write every file.
+- **No users or permissions.** Every app is isolated in its own address space, but all of them can read and write
+  every file outside the system's part (`C:\Nocturne` and the bundled apps' folders).
 - **CPU 0 does the kernel's work.** App threads run on every CPU, but most system calls, interrupts, drivers, the
   GUI and the network stack are handled on CPU 0.
 - **The window manager runs in the kernel.**
 - **No dynamic linking and no swap.** Every program is linked statically.
-- **Simple disks.** ATA uses PIO, and NVMe has one command in flight. The kernel has no AHCI driver. FAT32 has no
-  journal, so power loss during a write can leave the volume inconsistent. Names may be up to 255 characters.
+- **Simple disks.** AHCI and NVMe have one command in flight, and ATA uses PIO. The only drive is C: on the boot
+  disk; other disks and USB sticks cannot be read. Names may be up to 255 bytes of UTF-8.
 - **The networking limits** are listed [above](#networking) (IPv4 only, TLS up to 1.2).
 - **A plain Enhanced Session.** It carries the picture, keyboard, mouse, sound and text on the clipboard: no images
   or files on the clipboard, no microphone, drive or printer sharing. The RDP server uses no encryption; it is
   reachable only through a Hyper-V socket on the host, never over the network.
 - **Sound out only, AC'97 or the Enhanced Session only.** No Intel HD Audio, no USB audio, no recording.
 - **No GPU driver.** Drawing is done on the CPU (WebGL too).
-- **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
+- **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files in `C:\Users`.
 - **The browser is a work in progress.** Many sites display, but some features don't work and some pages are slow (see [above](#the-web-browser)).
 - **Real hardware has only just been tried.** Few machines have been checked, and there is no guide yet.
 
@@ -622,15 +648,17 @@ What Nocturne does not have, so nobody is surprised:
 boot/         limine.conf
 common/       ABI shared by kernel and userland (abi.h, gpu_abi.h), 2D drawing, Unifont bitmaps
 kernel/src/   arch/ (GDT, IDT, APIC, SMP, FPU, PAT, P-states, Hyper-V detection), mm/,
-              sys/ (apps, the Kei scheduler, system calls, events, profiler),
-              fs/ (VFS, RAM, FAT32, initrd, channels), dev/ (ATA, NVMe, xHCI and USB, PCI, ACPI, sound, display, input),
+              sys/ (apps, the Kei scheduler, system calls, events, channels, profiler),
+              fs/ (drive C:'s store: volume, catalog, namespace, documents),
+              dev/ (AHCI, ATA, NVMe, xHCI and USB, PCI, ACPI, sound, display, input),
               gui/ (window manager, desktop), net/ (TCP/IP, e1000, tulip, RTL8125B),
               hv/ (VMBus and Hyper-V devices), rdp/ (the Enhanced Session's RDP server)
 user/         libc/ (web/ is the browser engine), include/, apps/ (apps, browser helper processes, js's .js files)
-rootfs/       files copied into the initrd (/etc, /home, /node_modules, /usr/share/fonts and more)
-ports/        build settings and patches for ported code (tcc, go, tsgo, lexbor, freetype, ffmpeg, mesa, wabt, virgl)
+rootfs/       files put on C: (Nocturne\: the system's documents, fonts and type definitions; Users\: samples)
+host/         host tools (store: makes, reads, writes and checks C:; limine: lets Limine's installer handle disks over 2 GiB)
+ports/        build settings and patches for ported code (tcc, go, rust, tsgo, lexbor, freetype, ffmpeg, mesa, nvidia, wabt, virgl)
 third_party/  vendored sources (see Credits)
-scripts/      image, initrd and sysroot builders, test.py, qtest.py, setkey.py, fatcheck.py, hv-*.ps1
+scripts/      boot disk (mkimage.sh, layout.py) and SDK (mksdk.sh) builders, test.py, qtest.py, setkey.py, hv-*.ps1
 tests/        the in-OS test suite (runtests.c and the programs it compiles), host-side checks, test material
 docs/         README pictures, design documents and work logs
 build.ps1     build entry point
@@ -676,10 +704,10 @@ parts of them out of date.
 - [TypeScript-Go](https://github.com/microsoft/typescript-go) 7.0.2 (Apache-2.0, only when built with `TSGO=`).
 - Build-time Python modules Mako, MarkupSafe and PyYAML (`third_party/python-build`, not in the image).
 
-**Fonts** (all under the SIL Open Font License 1.1; licenses in `rootfs/usr/share/fonts`)
+**Fonts** (all under the SIL Open Font License 1.1; licenses in `rootfs/Nocturne/Fonts`)
 - Kernel bitmaps from [GNU Unifont Japanese](https://unifoundry.com/unifont/index.html) 18.0.01. The original BDF,
-  the license and the conversion are in `third_party/unifont/`, and the license inside the boot image is in
-  `/usr/share/licenses/unifont/`. Regenerate with `python -X utf8 scripts/build.py bitmap-fonts`.
+  the license and the conversion are in `third_party/unifont/`, and the license on the boot disk is in
+  `C:\Nocturne\Licenses\unifont\`. Regenerate with `python -X utf8 scripts/build.py bitmap-fonts`.
 - Maple Mono NF (unmodified TTFs; each file's SHA-256 is in `MapleMono-manifest.json`).
 - [Noto](https://fonts.google.com/noto) Sans/Serif, Sans/Serif CJK JP and Color Emoji.
 - Plangothic (Fitzgerald P. Köeingsegg).

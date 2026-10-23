@@ -33,7 +33,7 @@ int main(void){
         "var abort=new AbortController();m.addEventListener('change',()=>{throw Error('aborted listener');},{signal:abort.signal});abort.abort();"
         "addEventListener('media-check',()=>{if(seen!==2||m.matches)throw Error('final state');m.removeListener(legacy);m.onchange=null;});"
         "console.log('MEDIA_READY');</script></body>";
-    FILE *f=fopen("/data/tests/js_media_cases.js","rb");CHECK(f!=NULL);if(!f)return 1;
+    FILE *f=fopen("C:\\Tests\\js_media_cases.js","rb");CHECK(f!=NULL);if(!f)return 1;
     char *script=malloc(65536);CHECK(script!=NULL);if(!script){fclose(f);return 1;}
     size_t n=fread(script,1,65535,f);fclose(f);script[n]=0;
     size_t size=strlen(prefix)+n+strlen(tail)+1;char *page=malloc(size);CHECK(page!=NULL);if(!page){free(script);return 1;}

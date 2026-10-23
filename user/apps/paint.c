@@ -42,7 +42,8 @@ static uint32_t fg = RGB(30, 110, 230), bg = RGB(255, 255, 255);
 static bool drawing;
 static int sx0, sy0, lx, ly;
 static uint32_t dcol;
-static char status[160];
+static char status[1100];
+static char save_path[1024]; /* where Save writes: painting.ppm in the user's Pictures folder */
 static int hot_swatch = -1;
 /* places in the view that events name */
 static uint32_t tool_node[NTOOL], size_node, undo_node, clear_node, save_node, canvas_node, palette_node;
@@ -432,8 +433,9 @@ int main(int argc, char **argv) {
     gfx_init(&img, pix, CWID, CHGT, CWID);
     gfx_init(&snap_c, snap, CWID, CHGT, CWID);
     gfx_fill(&img, 0, 0, CWID, CHGT, bg);
-    snprintf(status, sizeof status, "Save writes /home/painting.ppm");
-    char named[512];
+    n_path_join(n_user_folder(), "Pictures\\painting.ppm", save_path, sizeof save_path);
+    snprintf(status, sizeof status, "Save writes %s", save_path);
+    char named[1024];
     if (argc > 1 && n_path_complete(argv[1], named, sizeof named) > 0) load(named);
     push_undo();
     srand((unsigned)n_clock_uptime_ms());
@@ -457,7 +459,7 @@ int main(int argc, char **argv) {
                     if (e.node == tool_node[i]) tool = i, view = true;
                 if (e.node == undo_node) do_undo();
                 else if (e.node == clear_node) do_clear();
-                else if (e.node == save_node) save("/home/painting.ppm"), view = true;
+                else if (e.node == save_node) save(save_path), view = true;
                 break;
             case UI_EVENT_SLIDE:
                 if (e.node == size_node) size = MAX(1, MIN(32, (int)lround(e.a))), view = true;
@@ -483,7 +485,7 @@ int main(int argc, char **argv) {
                 if (e.flags & UI_UP) break;
                 int k = (int)e.a;
                 if ((e.mods & NMOD_CTRL) && (k == 'z' || k == 'Z')) do_undo();
-                else if ((e.mods & NMOD_CTRL) && (k == 's' || k == 'S')) save("/home/painting.ppm"), view = true;
+                else if ((e.mods & NMOD_CTRL) && (k == 's' || k == 'S')) save(save_path), view = true;
                 else if (k == '[') size = MAX(1, size - 1), view = true;
                 else if (k == ']') size = MIN(32, size + 1), view = true;
                 else if (k >= '1' && k <= '9' && k - '1' < NTOOL) tool = k - '1', view = true;

@@ -67,10 +67,10 @@ int main(int argc, char **argv) {
         if (s < 0) { printf("FAIL tcp capacity waiter: %s\n", n_result_text(s)); return 1; }
         tcp_close((n_handle)s); return 0;
     }
-    FILE *f = fopen("/data/tests/tcpport", "r"); char line[64] = "";
+    FILE *f = fopen("C:\\Tests\\tcpport", "r"); char line[64] = "";
     if (f) { fgets(line, sizeof line, f); fclose(f); }
     tcp_port = atoi(line);
-    f = fopen("/data/tests/webports", "r");
+    f = fopen("C:\\Tests\\webports", "r");
     if (f) { fgets(line, sizeof line, f); fclose(f); web_port = atoi(line); }
     if (!tcp_port || !web_port || !net_wait_up(5000)) { puts("FAIL tcp capacity fixture/configuration missing"); return 1; }
     struct n_netinfo ni;

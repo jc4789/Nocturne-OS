@@ -29,8 +29,6 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#elif defined(NOCTURNE)
-#include "nocturne.h"
 #endif
 
 /* Windows and Nocturne back the stream with a scratch file and copy it
@@ -72,10 +70,7 @@ u_memstream_open(struct u_memstream *mem, char **bufp, size_t *sizep)
 
    return success;
 #elif defined(NOCTURNE)
-   static unsigned serial;
-   snprintf(mem->temp, sizeof mem->temp, "/tmp/mesa-memstream-%d-%u",
-            (int)n_app_self(), __atomic_fetch_add(&serial, 1, __ATOMIC_RELAXED));
-   FILE *f = fopen(mem->temp, "w+b");
+   FILE *f = tmpfile();
    if (!f)
       return false;
    *bufp = NULL;
@@ -117,7 +112,9 @@ u_memstream_close(struct u_memstream *mem)
 
 #ifdef MEMSTREAM_SCRATCH_FILE
    u_memstream_update_buffer(mem);
+#ifndef NOCTURNE /* a tmpfile goes when it is closed */
    remove(mem->temp);
+#endif
 #endif
 
    fclose(f);

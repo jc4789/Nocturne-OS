@@ -106,7 +106,7 @@ int main(void){char error[160],byte;net_stream *s;
 #else
 /* HTTP transport regressions, not website acceptance tests. ns_read is the
    narrow substituted boundary; the production HTTP parser/inflater are linked.
-   Run inside Nocturne: tcc -o /home/httptest /data/tests/httptest.c && /home/httptest */
+   Run inside Nocturne: tcc -o C:\Users\User\httptest C:\Tests\httptest.c && C:\Users\User\httptest */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -131,7 +131,6 @@ net_stream *ns_open_timed(const char *host,uint16_t port,bool tls,int timeout,ch
                           struct http_transport_timing *timing){
     memset(timing,0,sizeof *timing);timing->connect_ms=2;timing->tls_ms=tls?3:0;
     return ns_open(host,port,tls,timeout,error,n);}
-uint64_t uptime_ms(void){return 0;}
 long ns_write(net_stream *s, const void *data, size_t n) {
     (void)s;
     if (n > sizeof sent_request - sent_request_len - 1) return -1;

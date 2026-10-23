@@ -1,9 +1,7 @@
 /* Late kernel initialisation: filesystems, devices, GUI and the first process. */
 #include "kernel.h"
 #include "dev/entropy.h"
-#include "limine.h"
-#include "fs/ramfs.h"
-#include "fs/nos.h"
+#include "fs/store.h"
 #include "dev/input.h"
 #include "dev/fbcon.h"
 #include "dev/fb.h"
@@ -17,18 +15,21 @@
 #include "dev/usb.h"
 #include "gui/wm.h"
 #include "hv/vmbus.h"
+#include "sys/object.h"
 #include "sys/proc.h"
 #include "sys/sched.h"
 #include "sys/prof.h"
-#include "mm/pmm.h"
+#include "sys/stream.h"
 #include "mm/heap.h"
 
-extern volatile struct limine_module_request module_req;
 extern const char *kernel_cmdline;
 void acpi_init(void);
+void ahci_init(void);
 void net_init(void);
 void nvme_init(void);
 void rdp_init(void);
+
+#define INIT_PATH N_FOLDER_SYSTEM "\\init"
 
 /* text-mode keyboard: translate key events into terminal byte sequences */
 static void console_key_sink(const struct key_event *e) {
@@ -84,46 +85,10 @@ bool cmdline_number(const char *key, uint64_t *out) {
     return found;
 }
 
-/* GPU firmware is large and only the driver of a present GPU reads it: the
-   base keeps it only when such a display controller is on the bus (dropped
-   from the base, not removed by the user: docs/nosfs.md §8). */
-static void drop_absent_firmware(void) {
-    for (int i = 0; i < pci_count(); i++) {
-        struct pci_device *d = pci_at(i);
-        if (d && d->vendor == 0x10DE && d->cls == 0x03) return;
-    }
-    const char *path = "/usr/share/firmware/nvidia";
-    if (!ramfs_base_find(path)) return;
-    uint64_t heap = heap_used_bytes(), free = pmm_free_pages();
-    ramfs_base_remove(path);
-    /* files copied into the heap shrink it, files read in place give archive pages back */
-    int64_t gone = (int64_t)(heap - heap_used_bytes()) + (int64_t)((pmm_free_pages() - free) * PAGE_SIZE);
-    kprintf("initrd: no NVIDIA display controller, firmware dropped (%ld MiB)\n", (long)(gone / 1048576));
-}
-
 void kmain_late(void) {
     entropy_init();
     prof_init();
     heap_trim_start();
-    vfs_init();
-    struct vnode *tmp = ramfs_new_root(); /* emptied by every restart: never on the volume */
-    if (!tmp || vfs_mount("/tmp", tmp) < 0) panic("vfs: cannot mount /tmp");
-    devfs_init();
-    if (module_req.response && module_req.response->module_count) {
-        struct limine_file *m = module_req.response->modules[0];
-        initrd_load(m->address, m->size);
-        kprintf("initrd: %lu KiB loaded from %s\n", m->size / 1024, m->path);
-        uint64_t phys, pages;
-        if (initrd_range(&phys, &pages)) {
-            kprintf("initrd: files read in place from the archive\n");
-        } else { /* every file was copied into ramfs; the archive itself is dead weight */
-            uint64_t before = pmm_free_pages();
-            pmm_release_range(hhdm_virt_to_phys(m->address), m->size);
-            kprintf("initrd: archive released, %lu MiB returned\n", (unsigned long)((pmm_free_pages() - before) * PAGE_SIZE / 1048576));
-        }
-    } else {
-        kprintf("initrd: none found!\n");
-    }
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
     if (vmbus_init()) {
@@ -134,19 +99,16 @@ void kmain_late(void) {
     pci_init();
     fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
     iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
-    drop_absent_firmware();
     usb_init();
     net_init();
     audio_init();
     ata_init();
+    ahci_init();
     storvsc_init();
     nvme_init();
-    usb_wait_settled(8000); /* USB disks present at boot can hold /data */
-    bool persistent = nos_attach(); /* the volume / is on, when one of Nocturne's disks has it */
-    fat_mount_data(persistent ? "/media/NOCTDATA" : "/data");
-    hibernate_restore(); /* returns only when there is no image to go back to; nothing was committed */
-    if (!vfs_lookup("/data")) vfs_mkdir("/data");
-    if (!vfs_lookup("/home")) vfs_mkdir("/home");
+    store_init();        /* C:, from the disk the system started from (waiting for it to appear) */
+    hibernate_restore(); /* returns only when there is no image to go back to */
+    store_start();
 
     bool gui = !cmdline_has("nogui");
     if (gui) wm_init();
@@ -154,16 +116,17 @@ void kmain_late(void) {
     if (!gui || !wm_running()) input_set_sinks(console_key_sink, NULL);
     pm_sleep_check(); /* every driver has registered: whether the start menu offers Sleep */
 
-    struct file *con = NULL;
-    vfs_open("/dev/console", O_RDWR, &con);
-    struct file *fds[3] = {con, con, con};
-    char *argv[] = {"/bin/init", NULL};
     /* its input, output and log are the console */
-    char *settings[] = {"FOLDER=/home", "TERMINAL=0 1 2"};
+    struct handle *con = stream_console_open();
+    struct handle *handles[3] = {con, con, con};
+    char folder[sizeof "FOLDER=C:\\Users\\" + 255];
+    ksnprintf(folder, sizeof folder, "FOLDER=%s", store_user_folder());
+    char *argv[] = {INIT_PATH, NULL};
+    char *settings[] = {folder, "TERMINAL=0 1 2"};
     struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 2, .settings = settings,
-                            .handles = fds, .handle_count = 3};
-    int pid = proc_launch("/bin/init", &l);
+                            .handles = handles, .handle_count = 3};
+    int pid = proc_launch(INIT_PATH, &l);
     if (pid > 0) init_pid = pid;
-    if (pid < 0) kprintf("init: failed to start /bin/init (%d)\n", pid);
-    if (con) vfs_close(con);
+    if (pid < 0) kprintf("init: failed to start %s (%d)\n", INIT_PATH, pid);
+    if (con) handle_close(con);
 }

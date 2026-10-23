@@ -45,7 +45,7 @@ static void pump(web_doc *a,web_doc *b,web_doc *c,unsigned ms){
     while(uptime_ms()<end){uint64_t now=uptime_ms();if(a)web_tick(a,now);if(b)web_tick(b,now);if(c)web_tick(c,now);n_sleep_ms(1);}
 }
 static volatile uint32_t lease_stage;
-static char lease_path[128];
+static char lease_path[1024];
 static void lease_waiter(void *unused){
     /* This x86-64/TCC fixture exchanges only an aligned volatile stage word;
      * no payload publication or unsupported compiler atomic builtins. */
@@ -54,12 +54,15 @@ static void lease_waiter(void *unused){
     else lease_stage=3;
 }
 int main(int argc,char **argv){
+    char program[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if(n_path_complete(argv[0],program,sizeof program)>=0)argv[0]=program;
     if(argc==3 && !strcmp(argv[1],"--writer")){
         strcpy(origin,argv[2]);webstorage *s=webstorage_create();struct web_storage_result out={0};
         int result=access(s,WEB_STORAGE_SET,"process-key","child",&out);webstorage_free(s);return result!=WEB_STORAGE_OK;
     }
     snprintf(origin,sizeof origin,"https://storage-window-%d.test",(int)n_app_self());
-    snprintf(lease_path,sizeof lease_path,"/tmp/storage-lease-%d",(int)n_app_self());
+    char lease_leaf[48];snprintf(lease_leaf,sizeof lease_leaf,"storage-lease-%d",(int)n_app_self());
+    check(n_path_join(n_temp_folder(),lease_leaf,lease_path,sizeof lease_path)>0,"lease-path-in-temporary-folder");
     n_entry_remove(lease_path);
     n_handle lease=n_document_open(lease_path,N_DOCUMENT_CREATE);check(lease>=0&&n_document_claim(lease,false)==0,"lease-owner-lock");
     n_handle other=n_document_open(lease_path,N_DOCUMENT_EDIT);check(other>=0&&n_document_release(other)<0,"lease-other-handle-cannot-release");if(other>=0)n_handle_close(other);

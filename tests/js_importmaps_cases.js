@@ -57,7 +57,7 @@ globalThis.runImportMapCases=async function(){
     const detached=document.createElement('script');detached.type='importmap';detached.text='{"imports":{"detachedOnly":"/map/shared.mjs"}}';
     await rejects('detachedOnly','TypeError','detached map inactive');document.head.appendChild(detached);eq(await import('detachedOnly'),shared,'connected map activates');
     detached.text='{"imports":{"mutatedOnly":"/map/shared.mjs"}}';await rejects('mutatedOnly','TypeError','already-started map text does not reactivate');
-    await rejects('file:///data/secret.mjs','TypeError','HTTP document local-file policy preserved');
+    await rejects('file:///C:/Users/User/secret.mjs','TypeError','HTTP document local-file policy preserved');
     await rejects('/map/mime.mjs','ReferenceError','non-JavaScript MIME remains rejected');
     await rejects('/map/cors.mjs','ReferenceError','host CORS refusal remains rejected');
     eq(typeof globalThis.importMapsBridge,'undefined','resolver remains private');

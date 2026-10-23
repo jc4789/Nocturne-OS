@@ -64,9 +64,9 @@ struct nvme {
     uint8_t vector;
     volatile bool kick;
     struct wait_queue wq;
-    bool busy, live, vwc;
+    bool live, vwc;
     bool woke; /* back from a sleep: enable again before the next command (under the lock) */
-    struct wait_queue idle;
+    struct mutex lock;
     uint16_t cid;
     uint8_t *data;
     uint64_t data_phys;
@@ -95,21 +95,6 @@ static void doorbell(struct nvme *c, uint16_t qid, bool cq, uint16_t v) {
     wr32(c, 0x1000 + (2u * qid + (cq ? 1 : 0)) * c->stride, v);
 }
 
-/* The boot task (later the idle task) has no stack of its own to sleep on: it halts until the
-   next interrupt instead and lets the other kernel threads run. */
-static void nap(struct nvme *c, unsigned ms) {
-    if (!current_task->kstack) {
-        sti();
-        hlt();
-        schedule();
-        return;
-    }
-    uint64_t f = irq_save();
-    if (!c || !c->kick) wq_wait_timeout(c ? &c->wq : NULL, ms);
-    if (c) c->kick = false;
-    irq_restore(f);
-}
-
 static void nvme_isr(struct regs *r) {
     for (int i = 0; i < nctrls; i++) {
         struct nvme *c = &ctrls[i];
@@ -117,30 +102,6 @@ static void nvme_isr(struct regs *r) {
         c->kick = true;
         wq_wake_all(&c->wq);
     }
-}
-
-static void lock(struct nvme *c) {
-    uint64_t f = irq_save();
-    while (c->busy) {
-        irq_restore(f);
-        if (!current_task->kstack) {
-            sti();
-            hlt();
-            schedule();
-        } else {
-            f = irq_save();
-            if (c->busy) wq_wait_timeout(&c->idle, 100);
-            irq_restore(f);
-        }
-        f = irq_save();
-    }
-    c->busy = true;
-    irq_restore(f);
-}
-
-static void unlock(struct nvme *c) {
-    c->busy = false;
-    wq_wake_all(&c->idle);
 }
 
 static bool queue_init(struct queue *q, uint16_t qid, uint16_t size) {
@@ -195,7 +156,7 @@ static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], unsigned t
             kprintf("nvme%d: command %02x on queue %u timed out\n", c->index, cmd[0] & 0xFF, q->qid);
             return FAILED;
         }
-        nap(c, c->vector ? 10 : 1);
+        wq_nap(&c->wq, &c->kick, c->vector ? 10 : 1);
     }
 }
 
@@ -207,7 +168,7 @@ static bool wait_ready(struct nvme *c, bool ready) {
         if (ready && (csts & CSTS_CFS)) return false;
         if (!!(csts & CSTS_RDY) == ready) return true;
         if (uptime_ms() >= end) return false;
-        nap(NULL, 1);
+        wq_nap(NULL, NULL, 1);
     }
 }
 
@@ -282,9 +243,11 @@ static void set_prps(struct nvme *c, uint32_t cmd[16], unsigned bytes) {
     *(uint64_t *)&cmd[8] = prp2;
 }
 
-/* Read or write `n` logical blocks between the device and the bounce buffer. */
-static int transfer(struct ns *s, bool write, uint64_t lba, unsigned n) {
+/* Read or write `n` logical blocks between the device and the bounce buffer (buf, blk_by_blocks). */
+static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *buf) {
+    struct ns *s = ctx;
     struct nvme *c = s->c;
+    (void)buf;
     for (int attempt = 0;; attempt++) {
         uint32_t cmd[16] = {write ? OP_WRITE : OP_READ};
         cmd[1] = s->nsid;
@@ -313,7 +276,7 @@ static int flush(struct ns *s) {
 
 /* The controller for one request: back from a sleep, it is enabled again first. */
 static void lock_awake(struct nvme *c) {
-    lock(c);
+    mutex_lock(&c->lock);
     if (c->woke) {
         c->woke = false;
         if (enable(c)) kprintf("nvme%d: ready again after sleep\n", c->index);
@@ -321,37 +284,13 @@ static void lock_awake(struct nvme *c) {
     }
 }
 
-/* 512-byte sectors on top of the namespace's logical blocks; larger blocks are read, patched and
-   written back when a request covers them only partly. */
+/* 512-byte sectors on top of the namespace's logical blocks, through the bounce buffer. */
 static int rw(struct ns *s, bool write, uint64_t lba, uint32_t count, uint8_t *p) {
     struct nvme *c = s->c;
-    if (lba + count > s->blk.sectors) return -N_ERR_IO;
     lock_awake(c);
-    int result = -N_ERR_IO;
-    unsigned per = s->block / 512, most = c->max_xfer / s->block;
-    while (count) {
-        uint64_t first = lba / per;
-        unsigned off = (unsigned)(lba % per) * 512, want = count * 512u;
-        unsigned n = (off + want + s->block - 1) / s->block;
-        if (n > most) n = most;
-        unsigned take = n * s->block - off;
-        if (take > want) take = want;
-        if (write) {
-            if ((off || take < n * s->block) && transfer(s, false, first, n) < 0) goto out;
-            memcpy(c->data + off, p, take);
-            if (transfer(s, true, first, n) < 0) goto out;
-        } else {
-            if (transfer(s, false, first, n) < 0) goto out;
-            memcpy(p, c->data + off, take);
-        }
-        lba += take / 512;
-        count -= take / 512;
-        p += take;
-    }
-    result = 0;
-out:
-    unlock(c);
-    return result;
+    int r = blk_by_blocks(&s->blk, write, lba, count, p, c->data, c->max_xfer / s->block, false, transfer, s);
+    mutex_unlock(&c->lock);
+    return r;
 }
 
 static int blk_nvme_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) { return rw(b->priv, false, lba, n, buf); }
@@ -364,7 +303,7 @@ static int blk_nvme_persist(struct blkdev *b) {
     struct ns *s = b->priv;
     lock_awake(s->c);
     int r = flush(s) < 0 ? -N_ERR_IO : 0;
-    unlock(s->c);
+    mutex_unlock(&s->c->lock);
     return r;
 }
 

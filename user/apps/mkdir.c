@@ -9,7 +9,7 @@ int main(int argc, char **argv) {
     }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p")) continue;
-        char path[512];
+        char path[1024];
         n_result r = n_path_complete(argv[i], path, sizeof path);
         if (r >= 0) r = n_folder_create(path);
         if (r < 0 && r != -N_ERR_EXISTS) {

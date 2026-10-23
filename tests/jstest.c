@@ -466,7 +466,7 @@ static char *script_page(const char *source) { return script_page_after(source,"
 /* Isolated API regressions supplement, never replace, public-site GUI checks. */
 static void external_case_expected(const char *file, const char *tail, const char *url, int expected_errors) {
     printf("jstest: API batch %s\n", file); fflush(stdout);
-    char path[160]; snprintf(path, sizeof path, "/data/tests/%s", file);
+    char path[160]; snprintf(path, sizeof path, "C:\\Tests\\%s", file);
     FILE *f = fopen(path, "rb"); test_check(file, f != NULL); if (!f) return;
     if (fseek(f, 0, SEEK_END)) { fclose(f); test_check("api-seek", false); return; }
     long len = ftell(f); rewind(f);
@@ -1042,7 +1042,7 @@ static void test_fetch_and_cancel(void) {
         "const post=await fetch('api/post',{method:'POST',headers:{'X-Fixture':'yes'},body:'Nocturne request body'});check('fetch-post',await post.text()==='Nocturne request body');"
         "const controller=new AbortController(),promise=fetch('api/slow',{signal:controller.signal});controller.abort();"
         "try{await promise;check('fetch-aborted',false);}catch(e){check('fetch-aborted',e.name==='AbortError');}"
-        "try{await fetch('file:///data/secret');check('fetch-local-rejected',false);}catch(e){check('fetch-local-rejected',e instanceof TypeError);}"
+        "try{await fetch('file:///C:/Users/User/secret');check('fetch-local-rejected',false);}catch(e){check('fetch-local-rejected',e instanceof TypeError);}"
         "try{await fetch('api/json',{method:'TRACE'});check('fetch-method-rejected',false);}catch(e){check('fetch-method-rejected',e instanceof TypeError);}"
         "try{await fetch('api/json',{body:'not allowed'});check('fetch-get-body-rejected',false);}catch(e){check('fetch-get-body-rejected',true);}"
         "document.getElementById('target').textContent='received '+json.value;document.title='Fetched 42';mark('fetch-done');}exercise();";
@@ -1323,7 +1323,7 @@ static void test_html_parser(void){
     if(replaced&&open_case(replaced,false)){test_check("stream-resource-generation",pump("stream-resource-done",5000));test_check("stream-resource-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}free(replaced);
 }
 static void test_network_stream(void){
-    FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char text[96],origin[128];
+    FILE *ports=fopen("C:\\Tests\\webports","r");unsigned first=0,second=0;char text[96],origin[128];
     test_check("stream-fixture-ports",ports&&fgets(text,sizeof text,ports)&&sscanf(text,"%u %u",&first,&second)==2&&first);
     if(ports)fclose(ports);if(!first)return;
     snprintf(origin,sizeof origin,"http://10.0.2.2:%u/",first);
@@ -1332,7 +1332,7 @@ static void test_network_stream(void){
     case_real_network=false;
 }
 static void test_html_worker(void){
-    FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char port_text[96];
+    FILE *ports=fopen("C:\\Tests\\webports","r");unsigned first=0,second=0;char port_text[96];
     test_check("worker-fixture-ports",ports && fgets(port_text,sizeof port_text,ports) && sscanf(port_text,"%u %u",&first,&second)==2 && first);
     if(ports)fclose(ports);if(!first)return;
     char origin[128],tail[1600];snprintf(origin,sizeof origin,"http://10.0.2.2:%u/",first);
@@ -1340,7 +1340,7 @@ static void test_html_worker(void){
     case_real_network=true;external_case("js_parser_worker_safety_cases.js",tail,origin);case_real_network=false;
 }
 static void test_html_csp(void){
-    FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char port_text[96],origin[128];
+    FILE *ports=fopen("C:\\Tests\\webports","r");unsigned first=0,second=0;char port_text[96],origin[128];
     test_check("csp-fixture-ports",ports&&fgets(port_text,sizeof port_text,ports)&&sscanf(port_text,"%u %u",&first,&second)==2&&first);
     if(ports)fclose(ports);if(!first)return;snprintf(origin,sizeof origin,"http://10.0.2.2:%u/dir/index.html",first);
     const char *headers[]={
@@ -1470,7 +1470,7 @@ int main(int argc, char **argv) {
         external_case("js_wasm_cases.js",";runWasmJspiCases().then(n=>{console.log('WebAssembly JSPI checks '+n);mark('api-done');},e=>{check('wasm-jspi-unexpected-error',false);console.log('FAIL wasm-jspi '+e+' '+e.stack);mark('api-done');});",BASE);
     }
     if(argc>1 && !strcmp(argv[1],"wasm-worker")){
-        FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char port_text[96],origin[128],tail[512];
+        FILE *ports=fopen("C:\\Tests\\webports","r");unsigned first=0,second=0;char port_text[96],origin[128],tail[512];
         test_check("wasm-worker-fixture-ports",ports&&fgets(port_text,sizeof port_text,ports)&&sscanf(port_text,"%u %u",&first,&second)==2&&first);
         if(ports)fclose(ports);
         if(first){
@@ -1493,7 +1493,7 @@ int main(int argc, char **argv) {
         }
     }
     if(argc>1 && !strcmp(argv[1],"wasm-worker-policy")){
-        FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;
+        FILE *ports=fopen("C:\\Tests\\webports","r");unsigned first=0,second=0;
         char port_text[sizeof "65535 65535\n"],origin[sizeof "http://10.0.2.2:65535/"];
         const char suffix[]="').then(n=>{console.log('WebAssembly worker policy checks '+n);mark('api-done');},e=>{check('wasm-worker-policy-error',false);console.log('FAIL wasm-worker-policy '+e+' '+e.stack);mark('api-done');});";
         char tail[sizeof ";runWasmWorkerPolicyCases('"+sizeof origin+sizeof suffix];

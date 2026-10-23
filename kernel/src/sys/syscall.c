@@ -7,7 +7,10 @@
 #include "sys/syscall.h"
 #include "sys/proc.h"
 #include "sys/events.h"
-#include "fs/vfs.h"
+#include "sys/object.h"
+#include "sys/channel.h"
+#include "sys/stream.h"
+#include "fs/store.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "mm/heap.h"
@@ -29,8 +32,6 @@ extern char cpu_brand[64];
 int pci_list(struct n_pciinfo *out, int max);
 void vmm_user_pages_split(uint64_t pml4, uint64_t out[6]);
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
-static int copy_to_user(void *udst, const void *src, size_t n);
-static int copy_from_user(void *dst, const void *usrc, size_t n);
 
 /* ---- user memory access ---- */
 
@@ -80,48 +81,35 @@ int user_str(char *dst, const char *src, size_t max) {
     return -N_ERR_NAME_TOO_LONG;
 }
 
-
-/* Raw lookup is allowed only inside a BSP IRQ guard. Never carry this
-   borrowed pointer across validation, preemption or a blocking operation. */
-static struct file *getfd(int fd) {
-    if (fd < 0 || (size_t)fd >= task_process()->fd_capacity) return NULL;
-    return task_process()->fds[fd];
-}
-
-static struct file *getfd_ref(int fd) {
-    uint64_t flags = irq_save();
-    struct file *f = getfd(fd);
-    if (f) vfs_dup(f);
-    irq_restore(flags);
-    return f;
-}
-
-static int allocfd_locked(struct file *f) {
-    return task_fd_alloc(task_process(),f);
-}
-
-/* Consumes the caller's reference only on successful publication. */
-static int allocfd(struct file *f) {
-    uint64_t flags = irq_save();
-    int fd = allocfd_locked(f);
-    irq_restore(flags);
-    return fd;
-}
-
-/* ---- handlers ---- */
-
-static int64_t handle_drop(int fd) {
-    uint64_t flags = irq_save();
-    struct file *f = getfd(fd);
-    if (!f) { irq_restore(flags); return -N_ERR_NO_HANDLE; }
-    task_process()->fds[fd] = NULL;
-    vfs_poll_notify(f->vn);
-    if((size_t)fd<task_process()->fd_hint)task_process()->fd_hint=(size_t)fd;
-    irq_restore(flags);
-    /* Final audio close may sleep. The detached slot's reference owns f. */
-    vfs_close(f);
+int user_string(const char *u, char **out) {
+    /* its length first, a page at a time, then a copy of that many bytes */
+    size_t n = 0;
+    for (;;) {
+        uint64_t address = (uint64_t)u + n;
+        if (address < (uint64_t)u) return -N_ERR_BAD_ADDRESS;
+        size_t end = PAGE_SIZE - (address & (PAGE_SIZE - 1)), i = 0;
+        uint64_t flags = irq_save();
+        bool ok = user_ok((const void *)address, 1);
+        if (ok) while (i < end && ((const char *)address)[i]) i++;
+        irq_restore(flags);
+        if (!ok) return -N_ERR_BAD_ADDRESS;
+        n += i;
+        if (i < end) break;
+        if (need_resched) schedule();
+        if (current_task->killed) return -N_ERR_STOPPED;
+    }
+    char *s = kmalloc(n + 1);
+    if (!s) return -N_ERR_NO_MEMORY;
+    /* a sibling may change or unmap it meanwhile: the copy is checked again */
+    int r = copy_from_user(s, u, n);
+    if (r < 0) { kfree(s); return r; }
+    s[n] = 0;
+    *out = s;
     return 0;
 }
+
+
+/* ---- handlers ---- */
 
 /* Physical memory ran out under a memory request: name the largest user
    processes once per interval, so the owner of the memory is visible. */
@@ -165,27 +153,27 @@ static void report_memory_exhaustion(struct task *t, int64_t inc) {
 /* Snapshot the explicit native key length once; never rescan mutable user
  * strings in the registry, and never constrain identity to a guessed path cap. */
 static int64_t sys_channel_named(const char *ukey,size_t length,bool listen) {
-    if(!length || length>SIZE_MAX-sizeof(struct file))return -N_ERR_INVALID;
+    if(!length)return -N_ERR_INVALID;
     char *key=kmalloc(length);if(!key)return -N_ERR_NO_MEMORY;
-    struct file *file=NULL;uint64_t flags=irq_save();
+    struct handle *h=NULL;uint64_t flags=irq_save();
     if(!user_ok(ukey,length)){irq_restore(flags);kfree(key);return -N_ERR_BAD_ADDRESS;}
     memcpy(key,ukey,length);
-    int slot=task_fd_find(task_process());
-    int result=slot>=0?(listen?channel_listen(key,length,&file):channel_connect(key,length,&file)):slot;
-    if(!result)result=allocfd_locked(file);
+    int slot=handle_table_find(task_process());
+    int result=slot>=0?(listen?channel_listen(key,length,&h):channel_connect(key,length,&h)):slot;
+    if(!result)result=handle_install_locked(h);
     irq_restore(flags);kfree(key);
     /* The slot was checked and published in one BSP IRQ guard. If that
      * invariant changes, closing the unpublished reference remains safe. */
-    if(result<0 && file)vfs_close(file);
+    if(result<0 && h)handle_close(h);
     return result;
 }
-static int64_t sys_channel_accept(int fd) {
-    struct file *listener=getfd_ref(fd);if(!listener)return -N_ERR_NO_HANDLE;
-    struct file *server=NULL;uint64_t flags=irq_save();int slot=task_fd_find(task_process());
+static int64_t sys_channel_accept(int index) {
+    struct handle *listener=handle_get(index);if(!listener)return -N_ERR_NO_HANDLE;
+    struct handle *server=NULL;uint64_t flags=irq_save();int slot=handle_table_find(task_process());
     int result=slot>=0?channel_accept(listener,&server):slot;
-    if(!result)result=allocfd_locked(server);
-    irq_restore(flags);vfs_close(listener);
-    if(result<0 && server)vfs_close(server);
+    if(!result)result=handle_install_locked(server);
+    irq_restore(flags);handle_close(listener);
+    if(result<0 && server)handle_close(server);
     return result;
 }
 
@@ -286,19 +274,20 @@ struct shared_scope {struct shared_scope *parent;size_t refs;int issuer;bool rev
 /* Composite segments point only at backing roots, never at another composite.
    Cancellation references are separate, so flattening cannot discard a view's
    issuer or a nested composite's lifetime. end is the exclusive logical page. */
-struct shared_part {struct file *file;size_t first,end;uint8_t cache;};
+struct shared_part {struct object *object;size_t first,end;uint8_t cache;};
 struct shared_pages {
-    size_t count;uint8_t kind,cache;bool dma,owned,wc_allowed;
+    size_t count,bytes;uint8_t kind,cache;bool dma,owned,wc_allowed;
     struct shared_scope *scope;
     size_t maps;              /* a DMA root: mapping references, including composite segments */
     struct pci_claim *claim;  /* a BAR or DMA root: the claim it was made through */
-    uint64_t base;struct file *parent;size_t first; /* a range's first frame; a view's object and first page */
+    uint64_t base;struct object *parent;size_t first; /* a range's first frame; a view's object and first page */
     struct shared_part *parts;size_t part_count;
     struct shared_scope **dependencies;size_t dependency_count;
+    struct object object;
     uint64_t pages[];
 };
 struct shared_mapping {
-    struct shared_mapping *next;struct file *file;uint64_t va,flags;size_t bytes;
+    struct shared_mapping *next;struct object *object;uint64_t va,flags;size_t bytes;
     struct task *building_owner;bool cancelled,revoking;struct wait_queue build_wait;
 };
 static struct shared_mapping *shared_building; /* BSP-owned, before returning a VA */
@@ -306,7 +295,7 @@ static size_t shared_slots(const struct shared_pages *p) {
     return p->kind==SHARED_DEMAND?(p->count+SHARED_LEAF-1)/SHARED_LEAF:p->kind==SHARED_RAM?p->count:0;
 }
 static struct shared_pages *shared_root(struct shared_pages *p) {
-    while(p->kind==SHARED_VIEW)p=p->parent->vn->priv;
+    while(p->kind==SHARED_VIEW)p=p->parent->priv;
     return p;
 }
 static bool scope_revoked(const struct shared_scope *s) {
@@ -340,17 +329,17 @@ static struct shared_part *shared_part_at(struct shared_pages *p,size_t page) {
 /* Resolve one logical page without recursion. Optional backing/span are used
    when composing or counting DMA mapping references, not once per byte. */
 static struct shared_pages *shared_leaf(struct shared_pages *p,size_t *index,uint8_t *cache,
-                                        struct file **backing,size_t *span) {
+                                        struct object **backing,size_t *span) {
     *cache=p->cache;
     while(p->kind==SHARED_VIEW){
-        *index+=p->first;if(backing)*backing=p->parent;p=p->parent->vn->priv;
+        *index+=p->first;if(backing)*backing=p->parent;p=p->parent->priv;
     }
     if(p->kind==SHARED_COMPOSITE){
         struct shared_part *part=shared_part_at(p,*index);
         size_t start=part==p->parts?0:part[-1].end;
         if(span)*span=part->end-*index;
         *index=part->first+*index-start;*cache=part->cache;
-        if(backing)*backing=part->file;p=part->file->vn->priv;
+        if(backing)*backing=part->object;p=part->object->priv;
     }else if(span)*span=p->count-*index;
     if(p->dma)*cache=p->cache;
     return p;
@@ -361,7 +350,7 @@ static bool shared_device_gone(struct shared_pages *p,const struct pci_claim *cl
         return root->kind==SHARED_RANGE && !root->owned &&
                (claim?root->claim==claim:pci_user_revoked(root->claim));
     for(size_t i=0;i<root->part_count;i++){
-        struct shared_pages *leaf=root->parts[i].file->vn->priv;
+        struct shared_pages *leaf=root->parts[i].object->priv;
         if(leaf->kind==SHARED_RANGE && !leaf->owned &&
            (claim?leaf->claim==claim:pci_user_revoked(leaf->claim)))return true;
     }
@@ -386,7 +375,7 @@ static void shared_cancel_builds(const struct shared_scope *scope,const struct p
     for(;;){
         uint64_t irq=irq_save();struct shared_mapping *found=NULL;
         for(struct shared_mapping *m=shared_building;m;m=m->next){
-            bool match=scope?shared_depends(m->file->vn->priv,scope):shared_device_gone(m->file->vn->priv,claim);
+            bool match=scope?shared_depends(m->object->priv,scope):shared_device_gone(m->object->priv,claim);
             if(match && (m->revoking || !m->cancelled)){found=m;break;}
         }
         if(!found){irq_restore(irq);return;}
@@ -416,9 +405,9 @@ static uint64_t shared_frame(struct shared_pages *p,size_t index,bool create) {
     if(!*slot && create)*slot=pmm_alloc_zeroed();
     return *slot;
 }
-static void shared_release(struct vnode *v) {
-    struct shared_pages *p=v->priv;
-    if(p){
+static void shared_release(struct object *o) {
+    struct shared_pages *p=o->priv;
+    {
         bool keep=p->dma && (!pci_user_dma_unmap(p->claim,p->kind==SHARED_RAM?p->pages:NULL,p->base,p->count) ||
                              !pci_user_dma_reusable(p->claim)); /* the device may still write there */
         if(keep)kprintf("[dma] %lu pages stay out of use: their device may still reach them\n",(unsigned long)p->count);
@@ -431,55 +420,61 @@ static void shared_release(struct vnode *v) {
             pmm_free(p->pages[i]);
         }
         if(p->kind==SHARED_RANGE && p->owned && !keep)for(size_t i=0;i<p->count;i++)pmm_free(p->base+i*PAGE_SIZE);
-        if(p->parent)vfs_close(p->parent);
-        for(size_t i=0;i<p->part_count;i++)vfs_close(p->parts[i].file);
+        object_unref(p->parent);
+        for(size_t i=0;i<p->part_count;i++)object_unref(p->parts[i].object);
         for(size_t i=0;i<p->dependency_count;i++)scope_drop(p->dependencies[i]);
         kfree(p->parts);kfree(p->dependencies);
         scope_drop(p->scope);
         pci_user_drop(p->claim);
         kfree(p);
     }
-    kfree(v);
 }
-static struct vnode_ops shared_ops={.release=shared_release};
-/* An empty object record of `bytes` with `slots` page slots, write-back until told otherwise. */
-static struct shared_pages *shared_new(size_t bytes,uint8_t kind,size_t slots,struct vnode **out) {
+static const struct object_ops shared_ops={.kind=N_KIND_SHARED,.release=shared_release};
+/* An empty object record of `bytes` with `slots` page slots, write-back until told otherwise.
+   Nothing references it yet: the first handle or mapping takes a reference, and before that
+   shared_release frees it. */
+static struct shared_pages *shared_new(size_t bytes,uint8_t kind,size_t slots) {
     if(slots>(SIZE_MAX-sizeof(struct shared_pages))/sizeof(uint64_t))return NULL;
-    struct vnode *v=kzalloc(sizeof *v);if(!v)return NULL;
     struct shared_pages *p=kzalloc(sizeof *p+slots*sizeof(uint64_t));
-    if(!p){kfree(v);return NULL;}
-    p->kind=kind;p->cache=N_CACHE_WRITE_BACK;
-    v->type=VT_SHARED;v->size=bytes;v->unlinked=true;v->ops=&shared_ops;v->priv=p;
-    *out=v;return p;
+    if(!p)return NULL;
+    p->kind=kind;p->cache=N_CACHE_WRITE_BACK;p->bytes=bytes;
+    object_init(&p->object,&shared_ops,p);
+    return p;
 }
-static int64_t shared_open(struct vnode *v,int flags,struct file **out) {
-    struct file *f=vfs_open_vnode(v,flags);
-    if(!f){shared_release(v);return -N_ERR_NO_MEMORY;}
-    *out=f;return 0;
+/* A handle on a new object; without memory for it the object is freed. */
+static int64_t shared_open(struct shared_pages *p,bool writable,struct handle **out) {
+    struct handle *h=handle_open(&p->object,writable);
+    if(!h){shared_release(&p->object);return -N_ERR_NO_MEMORY;}
+    *out=h;return 0;
 }
-/* A file over a new shared object of `bytes` (page aligned). */
-static int64_t shared_object(size_t bytes,bool demand,int flags,struct file **out) {
+/* The shared pages a handle reaches (NULL: it reaches something else). */
+static struct shared_pages *shared_of(struct handle *h) {
+    return handle_is(h,&shared_ops)?h->object->priv:NULL;
+}
+/* A new shared object of `bytes` (page aligned). */
+static int64_t shared_object(size_t bytes,bool demand,struct shared_pages **out) {
     if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1))return -N_ERR_INVALID;
     bytes=ALIGN_UP(bytes,PAGE_SIZE);size_t count=bytes/PAGE_SIZE;
     size_t slots=demand?(count+SHARED_LEAF-1)/SHARED_LEAF:count;
     if(!demand && count>pmm_free_pages())return -N_ERR_NO_MEMORY;
-    struct vnode *v;struct shared_pages *p=shared_new(bytes,demand?SHARED_DEMAND:SHARED_RAM,slots,&v);
+    struct shared_pages *p=shared_new(bytes,demand?SHARED_DEMAND:SHARED_RAM,slots);
     if(!p)return -N_ERR_NO_MEMORY;
     if(demand)p->count=count;
     else for(;p->count<count;p->count++){
         p->pages[p->count]=pmm_alloc_zeroed();
-        if(!p->pages[p->count]){shared_release(v);return -N_ERR_NO_MEMORY;}
+        if(!p->pages[p->count]){shared_release(&p->object);return -N_ERR_NO_MEMORY;}
     }
-    return shared_open(v,flags,out);
+    *out=p;return 0;
 }
-static int64_t new_handle(int64_t r,struct file *f) {
-    if(r<0)return r;
-    int fd=allocfd(f);if(fd<0)vfs_close(f);return fd;
+/* The caller's handle number for a new object opened by shared_open (r: its result). */
+static int64_t new_handle(int64_t r,struct handle *h) {
+    return r<0?r:handle_install(h);
 }
 static int64_t sys_shared_create(size_t bytes,bool demand) {
-    struct file *f=NULL;
-    int64_t r=shared_object(bytes,demand,O_RDWR,&f);
-    return new_handle(r,f);
+    struct shared_pages *p;struct handle *h=NULL;
+    int64_t r=shared_object(bytes,demand,&p);
+    if(r>=0)r=shared_open(p,true,&h);
+    return new_handle(r,h);
 }
 static uint64_t cache_pte(unsigned cache) {
     if(cache==N_CACHE_WRITE_COMBINE && pat_supported())return PTE_PWT|PTE_PAT4K; /* PAT index 5 */
@@ -565,27 +560,27 @@ static void device_pins_drop(const struct pci_claim *claim) {
 
 /* A claimed function's memory BAR: device memory, uncached unless a view says otherwise. */
 static int64_t sys_pci_bar(int h,uint32_t bar) {
-    struct file *pci=getfd_ref(h);
+    struct handle *pci=handle_get(h);
     if(!pci)return -N_ERR_NO_HANDLE;
     uint64_t address=0,size=0;int64_t r=pci_user_bar(pci,bar,&address,&size);
     bool wc_allowed=pci_user_bar_prefetchable(pci,bar);
     if(r>=0 && size>SIZE_MAX)r=-N_ERR_TOO_LARGE;
-    struct vnode *v;struct shared_pages *p=r<0?NULL:shared_new(size,SHARED_RANGE,0,&v);
+    struct shared_pages *p=r<0?NULL:shared_new(size,SHARED_RANGE,0);
     if(p)p->claim=pci_user_hold(pci);
-    vfs_close(pci);
+    handle_close(pci);
     if(r<0)return r;
     if(!p)return -N_ERR_NO_MEMORY;
     p->base=address;p->count=size/PAGE_SIZE;p->cache=N_CACHE_UNCACHED;p->wc_allowed=wc_allowed;
-    struct file *f=NULL;
-    r=shared_open(v,O_RDWR,&f);
-    return new_handle(r,f);
+    struct handle *range=NULL;
+    r=shared_open(p,true,&range);
+    return new_handle(r,range);
 }
 /* Zeroed RAM a claimed function may reach by DMA. A contiguous run is allocated whole;
    independent pages use the allocator's hint even with a device/IOMMU address ceiling. */
 static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
-    struct file *pci=getfd_ref(h);
+    struct handle *pci=handle_get(h);
     if(!pci)return -N_ERR_NO_HANDLE;
-    struct pci_claim *claim=pci_user_hold(pci);vfs_close(pci);
+    struct pci_claim *claim=pci_user_hold(pci);handle_close(pci);
     if(!claim)return -N_ERR_WRONG_KIND;
     int64_t r=0;
     if(flags&~(N_DMA_CONTIGUOUS|N_DMA_32BIT) || !bytes || bytes>SIZE_MAX-(PAGE_SIZE-1))r=-N_ERR_INVALID;
@@ -595,11 +590,11 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
     uint64_t limit=flags&N_DMA_32BIT?0x100000000ull:UINT64_MAX;
     uint64_t iommu_limit=pci_user_dma_limit(claim);
     if(iommu_limit<limit)limit=iommu_limit;
-    struct vnode *v;struct shared_pages *p;
+    struct shared_pages *p;
     if(flags&N_DMA_CONTIGUOUS){
         uint64_t base=pmm_alloc_contig_below(count,limit);
         if(!base){pci_user_drop(claim);return -N_ERR_NO_MEMORY;}
-        if(!(p=shared_new(bytes,SHARED_RANGE,0,&v))){
+        if(!(p=shared_new(bytes,SHARED_RANGE,0))){
             for(size_t i=0;i<count;i++)pmm_free(base+i*PAGE_SIZE);
             pci_user_drop(claim);return -N_ERR_NO_MEMORY;
         }
@@ -607,27 +602,27 @@ static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
         memset(phys_to_virt(base),0,bytes);
         p->base=base;p->count=count;p->owned=true;
     }else{
-        if(!(p=shared_new(bytes,SHARED_RAM,count,&v))){pci_user_drop(claim);return -N_ERR_NO_MEMORY;}
+        if(!(p=shared_new(bytes,SHARED_RAM,count))){pci_user_drop(claim);return -N_ERR_NO_MEMORY;}
         p->claim=claim;
         for(;p->count<count;p->count++){
             uint64_t frame=pmm_alloc_below(limit);
-            if(!frame){shared_release(v);return -N_ERR_NO_MEMORY;}
+            if(!frame){shared_release(&p->object);return -N_ERR_NO_MEMORY;}
             memset(phys_to_virt(frame),0,PAGE_SIZE);
             p->pages[p->count]=frame;
         }
     }
     p->dma=true;
-    if(!pci_user_dma_map(claim,p->kind==SHARED_RAM?p->pages:NULL,p->base,p->count)){shared_release(v);return -N_ERR_NO_MEMORY;}
-    struct file *f=NULL;
-    r=shared_open(v,O_RDWR,&f);
-    return new_handle(r,f);
+    if(!pci_user_dma_map(claim,p->kind==SHARED_RAM?p->pages:NULL,p->base,p->count)){shared_release(&p->object);return -N_ERR_NO_MEMORY;}
+    struct handle *dma=NULL;
+    r=shared_open(p,true,&dma);
+    return new_handle(r,dma);
 }
 /* Bus addresses of a DMA object's (or a device range's) pages, also through views. */
 static int64_t sys_dma_addresses(int h,size_t first,uint64_t *uout,size_t count) {
-    struct file *f=getfd_ref(h);
-    if(!f)return -N_ERR_NO_HANDLE;
-    int64_t r=0;struct shared_pages *p=f->vn->priv;
-    if(f->vn->type!=VT_SHARED)r=-N_ERR_WRONG_KIND;
+    struct handle *object=handle_get(h);
+    if(!object)return -N_ERR_NO_HANDLE;
+    int64_t r=0;struct shared_pages *p=shared_of(object);
+    if(!p)r=-N_ERR_WRONG_KIND;
     else if(shared_cancelled(p) || shared_device_gone(p,NULL))r=-N_ERR_CLOSED;
     else if(first>=p->count)r=-N_ERR_INVALID;
     else for(size_t at=first,n=MIN(count,p->count-first);at-first<n;){
@@ -644,24 +639,24 @@ static int64_t sys_dma_addresses(int h,size_t first,uint64_t *uout,size_t count)
         if(copy_to_user(uout+done,piece,k*sizeof *piece)<0){r=-N_ERR_BAD_ADDRESS;break;}
         done+=k;r=(int64_t)done;
     }
-    vfs_close(f);return r;
+    handle_close(object);return r;
 }
 /* Part of a shared object as a new one with its own caching. Device memory only uncached or
    write-combining, and not after its claim ended; DMA RAM in its one type (the first other
    type asked while nothing maps it becomes that type); other objects only as they are. */
 static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache,uint32_t maximum) {
-    struct file *f=getfd_ref(h);
+    struct handle *f=handle_get(h);
     if(!f)return -N_ERR_NO_HANDLE;
-    int64_t r=0;
-    if(f->vn->type!=VT_SHARED)r=-N_ERR_WRONG_KIND;
-    else if(!bytes || (offset|bytes)&(PAGE_SIZE-1) || offset>f->vn->size || bytes>f->vn->size-offset ||
+    int64_t r=0;struct shared_pages *src=shared_of(f);
+    if(!src)r=-N_ERR_WRONG_KIND;
+    else if(!bytes || (offset|bytes)&(PAGE_SIZE-1) || offset>src->bytes || bytes>src->bytes-offset ||
             cache>N_CACHE_UNCACHED || (maximum && maximum!=N_MEMORY_READ && maximum!=N_MEMORY_READ_WRITE))r=-N_ERR_INVALID;
-    if(r<0){vfs_close(f);return r;}
-    struct shared_pages *src=f->vn->priv,*root=shared_root(src);
-    if(shared_cancelled(src) || shared_device_gone(src,NULL)){vfs_close(f);return -N_ERR_CLOSED;}
-    int access=f->flags&O_ACCMODE;
-    if(maximum==N_MEMORY_READ_WRITE && access==O_RDONLY){vfs_close(f);return -N_ERR_DENIED;}
-    if(maximum==N_MEMORY_READ)access=O_RDONLY;
+    if(r<0){handle_close(f);return r;}
+    struct shared_pages *root=shared_root(src);
+    if(shared_cancelled(src) || shared_device_gone(src,NULL)){handle_close(f);return -N_ERR_CLOSED;}
+    bool writable=f->writable;
+    if(maximum==N_MEMORY_READ_WRITE && !writable){handle_close(f);return -N_ERR_DENIED;}
+    if(maximum==N_MEMORY_READ)writable=false;
     bool device=root->kind==SHARED_RANGE && !root->owned;
     if(root->kind==SHARED_COMPOSITE){
         /* A default view preserves each segment's type. An explicit single
@@ -670,58 +665,60 @@ static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache,u
         if(cache!=N_CACHE_DEFAULT)for(size_t at=offset/PAGE_SIZE,left=bytes/PAGE_SIZE;left;){
             size_t page=at,span;uint8_t type;
             shared_leaf(src,&page,&type,NULL,&span);
-            if(cache!=type){vfs_close(f);return -N_ERR_DENIED;}
+            if(cache!=type){handle_close(f);return -N_ERR_DENIED;}
             span=MIN(span,left);at+=span;left-=span;
         }
     }else if(root->dma){
         if(cache==N_CACHE_DEFAULT)cache=root->cache;
         else if(cache!=root->cache){
-            if(root->cache!=N_CACHE_WRITE_BACK || root->maps){vfs_close(f);return -N_ERR_DENIED;}
+            if(root->cache!=N_CACHE_WRITE_BACK || root->maps){handle_close(f);return -N_ERR_DENIED;}
             if(!vmm_direct_type(root->kind==SHARED_RAM?root->pages:NULL,root->base,root->count,cache_pte(cache))){
-                vfs_close(f);return -N_ERR_NO_MEMORY;
+                handle_close(f);return -N_ERR_NO_MEMORY;
             }
             root->cache=(uint8_t)cache;
         }
     }else if(cache==N_CACHE_DEFAULT)cache=src->cache;
-    else if(device?(cache==N_CACHE_WRITE_BACK || (cache==N_CACHE_WRITE_COMBINE && !root->wc_allowed)):cache!=src->cache){vfs_close(f);return -N_ERR_DENIED;}
+    else if(device?(cache==N_CACHE_WRITE_BACK || (cache==N_CACHE_WRITE_COMBINE && !root->wc_allowed)):cache!=src->cache){handle_close(f);return -N_ERR_DENIED;}
     struct shared_scope *scope=kzalloc(sizeof *scope);
-    if(!scope){vfs_close(f);return -N_ERR_NO_MEMORY;}
+    if(!scope){handle_close(f);return -N_ERR_NO_MEMORY;}
     scope->refs=1;scope->issuer=task_process()->pid;scope->parent=src->scope;
     if(scope->parent)scope->parent->refs++;
-    struct vnode *v;struct shared_pages *p=shared_new(bytes,SHARED_VIEW,0,&v);
-    if(!p){scope_drop(scope);vfs_close(f);return -N_ERR_NO_MEMORY;}
+    struct shared_pages *p=shared_new(bytes,SHARED_VIEW,0);
+    if(!p){scope_drop(scope);handle_close(f);return -N_ERR_NO_MEMORY;}
     p->scope=scope;
-    p->count=bytes/PAGE_SIZE;p->first=offset/PAGE_SIZE;p->cache=(uint8_t)cache;p->parent=f; /* the view keeps our reference */
+    p->count=bytes/PAGE_SIZE;p->first=offset/PAGE_SIZE;p->cache=(uint8_t)cache;p->parent=f->object;
     if(src->kind==SHARED_VIEW){
         /* A view of a view points at the root object, so a chain of views (which any app can
            build, closing each parent) never grows the recursion in shared_frame and release. */
-        p->parent=vfs_dup(src->parent);p->first+=src->first;vfs_close(f);
+        p->parent=src->parent;p->first+=src->first;
     }
-    struct file *view=NULL;
-    r=shared_open(v,access,&view);
+    object_ref(p->parent);handle_close(f);
+    struct handle *view=NULL;
+    r=shared_open(p,writable,&view);
     return new_handle(r,view);
 }
 static int64_t sys_shared_compose(const struct n_shared_range *uranges,size_t count,uint32_t access) {
     if(!count || (access!=N_MEMORY_READ && access!=N_MEMORY_READ_WRITE))return -N_ERR_INVALID;
-    struct compose_input {struct file *file;size_t first,count;};
+    struct compose_input {struct handle *handle;size_t first,count;};
     if(count>SIZE_MAX/sizeof(struct compose_input) || count>SIZE_MAX/sizeof(*uranges))return -N_ERR_TOO_LARGE;
     if(count>(UINTPTR_MAX-(uintptr_t)uranges)/sizeof(*uranges))return -N_ERR_BAD_ADDRESS;
     struct compose_input *inputs=kzalloc(count*sizeof *inputs);
     if(!inputs)return -N_ERR_NO_MEMORY;
     int64_t r=0;size_t bytes=0,parts=0,dependencies=0;
-    struct vnode *v=NULL;struct shared_pages *p=NULL;
+    struct shared_pages *p=NULL;
     for(size_t i=0;i<count;i++){
         struct n_shared_range range;
         if((r=copy_from_user(&range,&uranges[i],sizeof range))<0)goto out;
         if(range.reserved || !range.bytes || (range.offset|range.bytes)&(PAGE_SIZE-1)){
             r=-N_ERR_INVALID;goto out;
         }
-        struct file *f=inputs[i].file=getfd_ref(range.shared);
+        struct handle *f=inputs[i].handle=handle_get(range.shared);
         if(!f){r=-N_ERR_NO_HANDLE;goto out;}
-        if(f->vn->type!=VT_SHARED){r=-N_ERR_WRONG_KIND;goto out;}
-        if(range.offset>f->vn->size || range.bytes>f->vn->size-range.offset){r=-N_ERR_INVALID;goto out;}
-        if(access==N_MEMORY_READ_WRITE && (f->flags&O_ACCMODE)==O_RDONLY){r=-N_ERR_DENIED;goto out;}
-        struct shared_pages *src=f->vn->priv,*root=shared_root(src);
+        struct shared_pages *src=shared_of(f);
+        if(!src){r=-N_ERR_WRONG_KIND;goto out;}
+        if(range.offset>src->bytes || range.bytes>src->bytes-range.offset){r=-N_ERR_INVALID;goto out;}
+        if(access==N_MEMORY_READ_WRITE && !f->writable){r=-N_ERR_DENIED;goto out;}
+        struct shared_pages *root=shared_root(src);
         if(shared_cancelled(src) || shared_device_gone(src,NULL)){r=-N_ERR_CLOSED;goto out;}
         if(range.bytes>SIZE_MAX-bytes || root->dependency_count>SIZE_MAX-dependencies ||
            (src->scope && root->dependency_count==SIZE_MAX-dependencies)){r=-N_ERR_TOO_LARGE;goto out;}
@@ -737,7 +734,7 @@ static int64_t sys_shared_compose(const struct n_shared_range *uranges,size_t co
     if(parts>SIZE_MAX/sizeof(struct shared_part) || dependencies>SIZE_MAX/sizeof(struct shared_scope *)){
         r=-N_ERR_TOO_LARGE;goto out;
     }
-    p=shared_new(bytes,SHARED_COMPOSITE,0,&v);
+    p=shared_new(bytes,SHARED_COMPOSITE,0);
     if(!p){r=-N_ERR_NO_MEMORY;goto out;}
     p->count=bytes/PAGE_SIZE;
     p->parts=kmalloc(parts*sizeof *p->parts);
@@ -747,37 +744,38 @@ static int64_t sys_shared_compose(const struct n_shared_range *uranges,size_t co
     if(!p->parts || (dependencies && !p->dependencies) || !p->scope){r=-N_ERR_NO_MEMORY;goto out;}
     size_t end=0;
     for(size_t i=0;i<count;i++){
-        struct shared_pages *src=inputs[i].file->vn->priv,*root=shared_root(src);
+        struct shared_pages *src=shared_of(inputs[i].handle),*root=shared_root(src);
         if(src->scope){src->scope->refs++;p->dependencies[p->dependency_count++]=src->scope;}
         for(size_t j=0;j<root->dependency_count;j++){
             root->dependencies[j]->refs++;p->dependencies[p->dependency_count++]=root->dependencies[j];
         }
         for(size_t at=inputs[i].first,left=inputs[i].count;left;){
-            size_t page=at,span;uint8_t cache;struct file *backing=inputs[i].file;
+            size_t page=at,span;uint8_t cache;struct object *backing=inputs[i].handle->object;
             shared_leaf(src,&page,&cache,&backing,&span);
-            span=MIN(span,left);end+=span;
-            p->parts[p->part_count++]=(struct shared_part){.file=vfs_dup(backing),.first=page,.end=end,.cache=cache};
+            span=MIN(span,left);end+=span;object_ref(backing);
+            p->parts[p->part_count++]=(struct shared_part){.object=backing,.first=page,.end=end,.cache=cache};
             at+=span;left-=span;
         }
     }
     if(shared_cancelled(p) || shared_device_gone(p,NULL)){r=-N_ERR_CLOSED;goto out;}
     {
-        struct file *composite=NULL;
-        r=shared_open(v,access==N_MEMORY_READ?O_RDONLY:O_RDWR,&composite);
-        v=NULL;p=NULL; /* shared_open consumes the vnode even on failure */
+        struct handle *composite=NULL;
+        r=shared_open(p,access==N_MEMORY_READ_WRITE,&composite);
+        p=NULL; /* shared_open consumes the object even on failure */
         r=new_handle(r,composite);
     }
 out:
-    if(v)shared_release(v);
-    for(size_t i=0;i<count;i++)if(inputs[i].file)vfs_close(inputs[i].file);
+    if(p)shared_release(&p->object);
+    for(size_t i=0;i<count;i++)handle_close(inputs[i].handle);
     kfree(inputs);return r;
 }
 static int64_t sys_shared_revoke(int h) {
-    struct file *f=getfd_ref(h);
+    struct handle *f=handle_get(h);
     if(!f)return -N_ERR_NO_HANDLE;
-    if(f->vn->type!=VT_SHARED){vfs_close(f);return -N_ERR_WRONG_KIND;}
-    struct shared_scope *scope=((struct shared_pages *)f->vn->priv)->scope;
-    if(!scope || scope->issuer!=task_process()->pid){vfs_close(f);return -N_ERR_DENIED;}
+    struct shared_pages *p=shared_of(f);
+    if(!p){handle_close(f);return -N_ERR_WRONG_KIND;}
+    struct shared_scope *scope=p->scope;
+    if(!scope || scope->issuer!=task_process()->pid){handle_close(f);return -N_ERR_DENIED;}
     /* Revoked is published before any PTE removal, including SMP shootdown.
        A concurrent fault cannot restore a page while cancellation runs. */
     scope->revoked=true;
@@ -785,32 +783,31 @@ static int64_t sys_shared_revoke(int h) {
     for(struct task *t=task_list;t;t=t->all_next){
         if(t->is_thread || !t->pml4 || t->pml4==kernel_pml4)continue;
         for(struct shared_mapping *m=t->shared_mappings;m;m=m->next)
-            if(shared_depends(m->file->vn->priv,scope))
+            if(shared_depends(m->object->priv,scope))
                 vmm_user_free(t->pml4,m->va,m->bytes);
     }
-    vfs_close(f);return 0;
+    handle_close(f);return 0;
 }
 /* Read-only ELF segments: every task running the same program bytes maps one
  * set of frames, so concurrent instances (a worker pool) hold one copy of their
- * code and constants. A spawn compares its file bytes with the cached frames
- * and makes a new object when the program file changed. The cache's own
+ * code and constants. A start compares its program's bytes with the cached frames
+ * and makes a new object when the program document changed. The cache's own
  * reference is dropped once no task maps an object. */
-struct program_segment {struct program_segment *next;struct file *file;uint64_t va,filesz,memsz;bool exec;char path[];};
+struct program_segment {struct program_segment *next;struct shared_pages *pages;uint64_t va,filesz,memsz;bool exec;char path[];};
 static struct program_segment *program_segments;
 /* Unlinks the objects only the cache still references; the caller closes them. */
 static struct program_segment *program_segments_unused(void) {
     struct program_segment *unused=NULL;uint64_t irq=irq_save();
     for(struct program_segment **link=&program_segments;*link;){
         struct program_segment *s=*link;
-        if(s->file->refs==1){*link=s->next;s->next=unused;unused=s;}else link=&s->next;
+        if(s->pages->object.refs==1){*link=s->next;s->next=unused;unused=s;}else link=&s->next;
     }
     irq_restore(irq);return unused;
 }
 static void program_segments_free(struct program_segment *s) {
-    while(s){struct program_segment *n=s->next;vfs_close(s->file);kfree(s);s=n;}
+    while(s){struct program_segment *n=s->next;object_unref(&s->pages->object);kfree(s);s=n;}
 }
-static bool program_segment_matches(struct file *f,uint64_t offset,const uint8_t *bytes,uint64_t filesz) {
-    struct shared_pages *p=f->vn->priv;
+static bool program_segment_matches(struct shared_pages *p,uint64_t offset,const uint8_t *bytes,uint64_t filesz) {
     for(uint64_t at=0;at<filesz;){
         uint64_t page=(offset+at)/PAGE_SIZE,within=(offset+at)%PAGE_SIZE,chunk=MIN(filesz-at,PAGE_SIZE-within);
         if(memcmp((uint8_t *)phys_to_virt(p->pages[page])+within,bytes+at,chunk))return false;
@@ -821,24 +818,27 @@ static bool program_segment_matches(struct file *f,uint64_t offset,const uint8_t
 int shared_program_segment(struct task *t,const char *path,uint64_t va,const uint8_t *bytes,
                            uint64_t filesz,uint64_t memsz,bool exec) {
     uint64_t start=ALIGN_DOWN(va,PAGE_SIZE),end=ALIGN_UP(va+memsz,PAGE_SIZE),offset=va-start;
-    size_t path_len=strlen(path);struct file *f=NULL;
+    size_t path_len=strlen(path);struct shared_pages *p=NULL;
     program_segments_free(program_segments_unused());
     uint64_t irq=irq_save();
     for(struct program_segment *s=program_segments;s;s=s->next)
-        if(s->va==va && s->filesz==filesz && s->memsz==memsz && s->exec==exec && !strcmp(s->path,path)){f=vfs_dup(s->file);break;}
+        if(s->va==va && s->filesz==filesz && s->memsz==memsz && s->exec==exec && !strcmp(s->path,path)){
+            p=s->pages;object_ref(&p->object);break;
+        }
     irq_restore(irq);
-    if(f && !program_segment_matches(f,offset,bytes,filesz)){vfs_close(f);f=NULL;}
-    if(!f){
-        int64_t r=shared_object(end-start,false,O_RDONLY,&f);
+    if(p && !program_segment_matches(p,offset,bytes,filesz)){object_unref(&p->object);p=NULL;}
+    if(!p){
+        int64_t r=shared_object(end-start,false,&p);
         if(r<0)return (int)r;
-        struct shared_pages *p=f->vn->priv;
+        object_ref(&p->object); /* the mapping's */
         for(uint64_t at=0;at<filesz;){
             uint64_t page=(offset+at)/PAGE_SIZE,within=(offset+at)%PAGE_SIZE,chunk=MIN(filesz-at,PAGE_SIZE-within);
             memcpy((uint8_t *)phys_to_virt(p->pages[page])+within,bytes+at,chunk);at+=chunk;
         }
         struct program_segment *s=kmalloc(sizeof *s+path_len+1);
         if(s){
-            *s=(struct program_segment){.file=vfs_dup(f),.va=va,.filesz=filesz,.memsz=memsz,.exec=exec};
+            object_ref(&p->object);
+            *s=(struct program_segment){.pages=p,.va=va,.filesz=filesz,.memsz=memsz,.exec=exec};
             memcpy(s->path,path,path_len+1);
             /* An object for older bytes of this program stays with its tasks only. */
             struct program_segment *stale=NULL;irq=irq_save();
@@ -849,12 +849,11 @@ int shared_program_segment(struct task *t,const char *path,uint64_t va,const uin
         }
     }
     struct shared_mapping *m=kzalloc(sizeof *m);
-    if(!m){vfs_close(f);return -N_ERR_NO_MEMORY;}
-    struct shared_pages *p=f->vn->priv;
+    if(!m){object_unref(&p->object);return -N_ERR_NO_MEMORY;}
     uint64_t flags=PTE_U|PTE_SHARED|PTE_SHARED_RO|(exec?0:pte_nx);size_t mapped=0;
     for(;mapped<p->count;mapped++)if(!vmm_map_page(t->pml4,start+mapped*PAGE_SIZE,p->pages[mapped],flags))break;
-    if(mapped!=p->count){vmm_user_free(t->pml4,start,mapped*PAGE_SIZE);vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
-    irq=irq_save();*m=(struct shared_mapping){.next=t->shared_mappings,.file=f,.va=start,.flags=flags,.bytes=end-start};
+    if(mapped!=p->count){vmm_user_free(t->pml4,start,mapped*PAGE_SIZE);object_unref(&p->object);kfree(m);return -N_ERR_NO_MEMORY;}
+    irq=irq_save();*m=(struct shared_mapping){.next=t->shared_mappings,.object=&p->object,.va=start,.flags=flags,.bytes=end-start};
     t->shared_mappings=m;irq_restore(irq);
     return 0;
 }
@@ -864,7 +863,7 @@ void shared_revoke_claim(const struct pci_claim *c) {
     for(struct task *t=task_list;t;t=t->all_next){
         if(t->is_thread || !t->pml4 || t->pml4==kernel_pml4)continue;
         for(struct shared_mapping *m=t->shared_mappings;m;m=m->next){
-            if(shared_device_gone(m->file->vn->priv,c))vmm_user_free(t->pml4,m->va,m->bytes);
+            if(shared_device_gone(m->object->priv,c))vmm_user_free(t->pml4,m->va,m->bytes);
         }
     }
     uint64_t irq=irq_save();device_pins_drop(c);irq_restore(irq);
@@ -886,7 +885,7 @@ bool shared_demand_fault(uint64_t addr,bool write) {
     uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE),irq=irq_save();bool ok=false,starved=false;
     for(struct shared_mapping *m=owner->shared_mappings;m;m=m->next){
         if(page<m->va || page-m->va>=m->bytes)continue;
-        struct shared_pages *p=m->file->vn->priv;
+        struct shared_pages *p=m->object->priv;
         if(shared_cancelled(p))break;
         size_t index=(page-m->va)/PAGE_SIZE;uint8_t cache;
         struct shared_pages *leaf=shared_leaf(p,&index,&cache,NULL,NULL);
@@ -922,18 +921,20 @@ bool shared_demand_fault(uint64_t addr,bool write) {
    as a channel attachment): there is no reaching into another app's handles. */
 static int64_t sys_shared_map(int h,size_t bytes,int access) {
     if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1) || (access!=N_MEMORY_READ && access!=N_MEMORY_READ_WRITE))return -N_ERR_INVALID;
-    struct task *owner=task_process();struct file *f=getfd_ref(h);
+    struct task *owner=task_process();struct handle *f=handle_get(h);
     if(!f)return -N_ERR_NO_HANDLE;
-    if(f->vn->type!=VT_SHARED){vfs_close(f);return -N_ERR_WRONG_KIND;}
+    struct shared_pages *p=shared_of(f);
+    if(!p){handle_close(f);return -N_ERR_WRONG_KIND;}
     /* the handle's own rights bound the mapping's: a read-only handle maps read-only */
-    if(access==N_MEMORY_READ_WRITE && (f->flags&O_ACCMODE)==O_RDONLY){vfs_close(f);return -N_ERR_DENIED;}
-    struct shared_pages *p=f->vn->priv;
-    if(shared_cancelled(p) || shared_device_gone(p,NULL)){vfs_close(f);return -N_ERR_CLOSED;}
+    if(access==N_MEMORY_READ_WRITE && !f->writable){handle_close(f);return -N_ERR_DENIED;}
+    /* the mapping holds the object itself: the handle may be closed while it stays */
+    object_ref(&p->object);handle_close(f);
+    if(shared_cancelled(p) || shared_device_gone(p,NULL)){object_unref(&p->object);return -N_ERR_CLOSED;}
     uint64_t irq;
     bytes=ALIGN_UP(bytes,PAGE_SIZE);
-    if(bytes!=f->vn->size){vfs_close(f);return -N_ERR_INVALID;}
+    if(bytes!=p->bytes){object_unref(&p->object);return -N_ERR_INVALID;}
     struct shared_mapping *m=kzalloc(sizeof *m);
-    if(!m){vfs_close(f);return -N_ERR_NO_MEMORY;}
+    if(!m){object_unref(&p->object);return -N_ERR_NO_MEMORY;}
     /* Reserve the VA range (reusing released ones) before publishing any PTE, so
        no other reservation can choose this partially mapped span. */
     irq=irq_save();
@@ -941,14 +942,14 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
     uint64_t va=pinned<0?0:mmap_reserve(owner,bytes);
     if(!va){
         if(pinned>=0)shared_device_unpin(p);
-        irq_restore(irq);vfs_close(f);kfree(m);return pinned<0?pinned:-N_ERR_NO_MEMORY;
+        irq_restore(irq);object_unref(&p->object);kfree(m);return pinned<0?pinned:-N_ERR_NO_MEMORY;
     }
     size_t mapped=0;
     uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO);
     /* Pin DMA cache types before installing the first PTE, including every
        selected composite segment; rollback drops the same references. */
     shared_dma_maps(p,true);
-    *m=(struct shared_mapping){.next=shared_building,.file=f,.va=va,.flags=flags,.bytes=bytes,
+    *m=(struct shared_mapping){.next=shared_building,.object=&p->object,.va=va,.flags=flags,.bytes=bytes,
                                .building_owner=owner,.cancelled=shared_cancelled(p) || shared_device_gone(p,NULL)};
     shared_building=m;irq_restore(irq);
     /* Demand pages not yet touched by any peer stay unmapped until a fault. */
@@ -976,7 +977,7 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
         irq=irq_save();shared_build_remove(m);shared_dma_maps(p,false);shared_device_unpin(p);
         m->revoking=false;wq_wake_all(&m->build_wait);irq_restore(irq);
         mmap_hole_add(owner,va,bytes+PAGE_SIZE);
-        vfs_close(f);kfree(m);return result;
+        object_unref(&p->object);kfree(m);return result;
     }
     shared_build_remove(m);m->building_owner=NULL;m->next=owner->shared_mappings;
     owner->shared_mappings=m;irq_restore(irq);
@@ -988,8 +989,8 @@ static void shared_unmap(struct task *owner,struct shared_mapping *m) {
     /* Keep every DMA cache pin through PTE removal and the completed TLB
        shootdown. A preempting view cannot retype still-reachable old pages. */
     vmm_user_free(owner->pml4,m->va,m->bytes);
-    uint64_t irq=irq_save();shared_dma_maps(m->file->vn->priv,false);shared_device_unpin(m->file->vn->priv);irq_restore(irq);
-    vfs_close(m->file);kfree(m);
+    uint64_t irq=irq_save();shared_dma_maps(m->object->priv,false);shared_device_unpin(m->object->priv);irq_restore(irq);
+    object_unref(m->object);kfree(m);
 }
 void sys_shared_cleanup(struct task *owner) {
     while(owner->shared_mappings){struct shared_mapping *m=owner->shared_mappings;
@@ -1175,25 +1176,17 @@ static int gpu_user_span(void *pointer,size_t bytes,bool write) {
 
 /* ---- native ABI (docs/nocturne-native-abi.md) ---- */
 
-/* Paths are complete: there is no working directory to resolve against. */
-static int native_path(const char *upath, char *out) {
-    char tmp[PATH_MAX_LEN];
-    int r = user_str(tmp, upath, sizeof tmp);
-    if (r < 0) return r;
-    if (tmp[0] != '/') return -N_ERR_INVALID;
-    return vfs_normalize("/", tmp, out);
-}
-
-/* Publish a new handle; on failure the caller's reference is dropped. */
-static int64_t install(struct file *f) {
-    int h = allocfd(f);
-    if (h < 0) vfs_close(f);
-    return h;
+/* The caller's handle h when is(h) holds: a reference to close, or NULL with *error set. */
+static struct handle *handle_get_as(int h, bool (*is)(struct handle *), int64_t *error) {
+    struct handle *handle = handle_get(h);
+    *error = !handle ? -N_ERR_NO_HANDLE : !is(handle) ? -N_ERR_WRONG_KIND : 0;
+    if (*error && handle) { handle_close(handle); handle = NULL; }
+    return handle;
 }
 
 /* Copy user bytes in bounded pieces: no long non-preemptible copy, and a
    sibling unmapping the source meanwhile is reported, not faulted on. */
-static int copy_from_user(void *dst, const void *usrc, size_t n) {
+int copy_from_user(void *dst, const void *usrc, size_t n) {
     for (size_t done = 0; done < n;) {
         size_t piece = MIN(n - done, (size_t)16384);
         uint64_t flags = irq_save();
@@ -1206,7 +1199,7 @@ static int copy_from_user(void *dst, const void *usrc, size_t n) {
     return 0;
 }
 
-static int copy_to_user(void *udst, const void *src, size_t n) {
+int copy_to_user(void *udst, const void *src, size_t n) {
     uint64_t flags = irq_save();
     bool ok = user_ok_w(udst, n);
     if (ok) memcpy(udst, src, n);
@@ -1227,176 +1220,148 @@ static int gpu_user_copy(void *destination,const void *source,size_t bytes,bool 
 }
 
 static int64_t sys_handle_close(int h) {
-    struct file *f = getfd_ref(h);
-    if (!f) return -N_ERR_NO_HANDLE;
+    struct handle *handle = handle_get(h);
+    if (!handle) return -N_ERR_NO_HANDLE;
     /* Only an explicit close commits a replacement: an app that ends with the
        handle open leaves the old document as it was. */
-    int committed = vfs_document_commit(f, N_COMMIT_WAIT);
-    vfs_close(f);
-    int closed = (int)handle_drop(h);
+    int committed = store_document_is(handle) ? store_document_commit(handle, N_COMMIT_WAIT) : 0;
+    handle_close(handle);
+    int closed = handle_remove(h);
     return committed < 0 ? committed : closed;
 }
 
 static int64_t sys_handle_kind(int h) {
     uint64_t flags = irq_save();
-    struct file *f = getfd(h);
-    int kind = f ? vfs_kind(f->vn) : -N_ERR_NO_HANDLE;
+    struct handle *handle = handle_peek(h);
+    int kind = handle ? handle_kind(handle) : -N_ERR_NO_HANDLE;
     irq_restore(flags);
     return kind;
 }
 
+/* Documents: the store checks the handle's kind and access itself. */
 static int64_t sys_document_open(const char *upath, int access) {
-    char path[PATH_MAX_LEN];
-    int r = native_path(upath, path);
+    char *path;
+    int r = user_string(upath, &path);
     if (r < 0) return r;
-    struct file *f;
-    r = vfs_document_open(path, access, &f);
-    return r < 0 ? r : install(f);
+    struct handle *h;
+    r = store_document_open(path, access, &h);
+    kfree(path);
+    return r < 0 ? r : handle_install(h);
 }
 
 static int64_t sys_document_io(int h, uint64_t off, void *buf, size_t n, bool write) {
-    struct file *f = getfd_ref(h);
-    if (!f) return -N_ERR_NO_HANDLE;
-    int64_t r = write ? vfs_document_write_user(f, off, buf, n) : vfs_document_read_user(f, off, buf, n);
-    vfs_close(f);
+    struct handle *d = handle_get(h);
+    if (!d) return -N_ERR_NO_HANDLE;
+    int64_t r = write ? store_document_write(d, off, buf, n, true) : store_document_read(d, off, buf, n, true);
+    handle_close(d);
     return r;
 }
 
-static struct file *document_ref(int h, int64_t *error) {
-    struct file *f = getfd_ref(h);
-    *error = !f ? -N_ERR_NO_HANDLE : f->vn->type != VT_FILE ? -N_ERR_WRONG_KIND : 0;
-    if (*error && f) { vfs_close(f); f = NULL; }
-    return f;
-}
-
 static int64_t sys_document_size(int h) {
-    int64_t r;
-    struct file *f = document_ref(h, &r);
-    if (!f) return r;
-    r = (int64_t)vfs_file_size(f);
-    vfs_close(f);
+    struct handle *d = handle_get(h);
+    if (!d) return -N_ERR_NO_HANDLE;
+    int64_t r = store_document_size(d);
+    handle_close(d);
     return r;
 }
 
 static int64_t sys_document_set_size(int h, uint64_t size) {
-    int64_t r;
-    struct file *f = document_ref(h, &r);
-    if (!f) return r;
-    r = (f->flags & O_ACCMODE) == O_RDONLY ? -N_ERR_DENIED : vfs_truncate(f, size);
-    vfs_close(f);
+    struct handle *d = handle_get(h);
+    if (!d) return -N_ERR_NO_HANDLE;
+    int64_t r = store_document_set_size(d, size);
+    handle_close(d);
     return r;
 }
 
 static int64_t sys_document_claim(int h, bool claim, bool wait) {
-    int64_t r;
-    struct file *f = document_ref(h, &r);
-    if (!f) return r;
-    r = !claim ? vfs_lease(f, false) : wait ? vfs_lease(f, true) : vfs_try_lease(f);
-    vfs_close(f);
+    struct handle *d = handle_get(h);
+    if (!d) return -N_ERR_NO_HANDLE;
+    int64_t r = claim ? store_document_claim(d, wait) : store_document_release(d);
+    handle_close(d);
     return r;
 }
 
 static int64_t sys_document_commit(int h, int how) {
-    int64_t r;
-    struct file *f = document_ref(h, &r);
-    if (!f) return r;
-    r = vfs_document_commit(f, how);
-    vfs_close(f);
+    struct handle *d = handle_get(h);
+    if (!d) return -N_ERR_NO_HANDLE;
+    int64_t r = store_document_commit(d, how);
+    handle_close(d);
     return r;
 }
 
-static int64_t sys_document_save(const char *upath, const void *udata, size_t n) {
-    char path[PATH_MAX_LEN];
-    int r = native_path(upath, path);
-    return r < 0 ? r : vfs_save_user(path, udata, n);
-}
-
-static int64_t sys_document_append(const char *upath, const void *udata, size_t n) {
-    char path[PATH_MAX_LEN];
-    int r = native_path(upath, path);
-    return r < 0 ? r : vfs_append_user(path, udata, n);
-}
-
-static void entry_from(struct n_entry *e, const struct dirent *d) {
-    memset(e, 0, sizeof *e);
-    strlcpy(e->name, d->name, sizeof e->name);
-    e->kind = d->type == VT_DIR ? N_KIND_FOLDER : d->type == VT_FILE ? N_KIND_DOCUMENT : N_KIND_DEVICE;
-    e->size = d->size;
-    e->modified = d->mtime;
+static int64_t sys_document_save(const char *upath, const void *udata, size_t n, bool append) {
+    char *path;
+    int r = user_string(upath, &path);
+    if (r < 0) return r;
+    r = append ? store_append(path, udata, n, true) : store_save(path, udata, n, true);
+    kfree(path);
+    return r;
 }
 
 static int64_t sys_entry_info(const char *upath, struct n_entry *uout) {
-    char path[PATH_MAX_LEN];
-    int r = native_path(upath, path);
-    if (r < 0) return r;
-    struct dirent d;
-    memset(&d, 0, sizeof d);
-    r = vfs_entry_info(path, &d);
+    char *path;
+    int r = user_string(upath, &path);
     if (r < 0) return r;
     struct n_entry e;
-    entry_from(&e, &d);
-    return copy_to_user(uout, &e, sizeof e);
+    r = store_entry_info(path, true, &e);
+    kfree(path);
+    return r < 0 ? r : copy_to_user(uout, &e, sizeof e);
 }
 
 static int64_t sys_folder_list(const char *upath, struct n_entry *uout, size_t max, uint64_t start) {
-    char path[PATH_MAX_LEN];
-    int r = native_path(upath, path);
-    if (r < 0) return r;
     if (max > SIZE_MAX / sizeof *uout) return -N_ERR_INVALID;
-    enum { BATCH = 16 };
-    struct dirent *batch = kmalloc(BATCH * sizeof *batch);
-    struct n_entry *entries = kmalloc(BATCH * sizeof *entries);
-    int64_t done = 0;
-    if (!batch || !entries) done = -N_ERR_NO_MEMORY;
-    while (done >= 0 && (size_t)done < max) {
-        size_t want = MIN(max - (size_t)done, (size_t)BATCH);
-        memset(batch, 0, want * sizeof *batch);
-        int n = vfs_folder_list(path, start + (uint64_t)done, batch, want);
-        if (n < 0) { if (!done) done = n; break; }
-        for (int i = 0; i < n; i++) entry_from(&entries[i], &batch[i]);
-        if (copy_to_user(uout + done, entries, (size_t)n * sizeof *entries) < 0) { done = -N_ERR_BAD_ADDRESS; break; }
-        done += n;
-        if ((size_t)n < want) break;
-    }
-    kfree(batch);
-    kfree(entries);
-    return done;
+    char *path;
+    int r = user_string(upath, &path);
+    if (r < 0) return r;
+    int64_t n = store_folder_list(path, start, uout, max, true);
+    kfree(path);
+    return n;
 }
 
 static int64_t sys_entry_remove(const char *upath) {
-    char path[PATH_MAX_LEN];
-    int r = native_path(upath, path);
-    return r < 0 ? r : vfs_unlink(path);
+    char *path;
+    int r = user_string(upath, &path);
+    if (r < 0) return r;
+    r = store_entry_remove(path, true);
+    kfree(path);
+    return r;
 }
 
 static int64_t sys_entry_move(const char *ufrom, const char *uto) {
-    char from[PATH_MAX_LEN], to[PATH_MAX_LEN];
-    int r = native_path(ufrom, from);
+    char *from, *to = NULL;
+    int r = user_string(ufrom, &from);
     if (r < 0) return r;
-    r = native_path(uto, to);
-    return r < 0 ? r : vfs_move(from, to);
+    r = user_string(uto, &to);
+    if (r >= 0) r = store_entry_move(from, to, true);
+    kfree(from);
+    kfree(to);
+    return r;
 }
 
 static int64_t sys_folder_create(const char *upath) {
-    char path[PATH_MAX_LEN];
-    int r = native_path(upath, path);
-    return r < 0 ? r : vfs_mkdir(path);
+    char *path;
+    int r = user_string(upath, &path);
+    if (r < 0) return r;
+    r = store_folder_create(path, true);
+    kfree(path);
+    return r;
 }
 
 static int64_t sys_channel_pair(int32_t *uout) {
     if (!user_ok_w(uout, 2 * sizeof *uout)) return -N_ERR_BAD_ADDRESS;
-    struct file *a, *b;
+    struct handle *a, *b;
     int e = message_channel_pair(&a, &b);
     if (e < 0) return e;
     uint64_t flags = irq_save();
-    int ha = allocfd_locked(a), hb = ha < 0 ? ha : allocfd_locked(b);
+    int ha = handle_install_locked(a), hb = ha < 0 ? ha : handle_install_locked(b);
     int error = hb < 0 ? hb : !user_ok_w(uout, 2 * sizeof *uout) ? -N_ERR_BAD_ADDRESS : 0;
     if (error) {
-        if (hb >= 0) task_process()->fds[hb] = NULL;
-        if (ha >= 0) { task_process()->fds[ha] = NULL; task_process()->fd_hint = (size_t)ha; }
+        /* the table's references come back to us: each end is closed once */
+        if (hb >= 0) handle_take_locked(hb);
+        if (ha >= 0) handle_take_locked(ha);
         irq_restore(flags);
-        vfs_close(a);
-        vfs_close(b);
+        handle_close(a);
+        handle_close(b);
         return error;
     }
     uout[0] = ha;
@@ -1405,109 +1370,97 @@ static int64_t sys_channel_pair(int32_t *uout) {
     return 0;
 }
 
-/* Byte pipes, byte channels and the character devices given to apps as their
-   input, output and log (console, kernel log, null) remain until the old ABI
-   is removed (stage 5): on them a send is a write and a receive takes what is
-   there, without message boundaries or attachments. */
-static bool byte_channel(struct file *f) {
-    return f->vn->type == VT_CHAR ||
-           (f->vn->type == VT_CHANNEL && !message_channel_is(f));
+/* The byte streams given to apps as their input, output and log when no app is at the other end
+   (the console, the system log, nothing; sys/stream.h): a send is all of it, a receive takes
+   what is there, without message boundaries or attachments (docs/nocturne-native-abi.md §4). */
+static bool byte_stream(struct handle *h) {
+    return h->object->ops->read || h->object->ops->write;
 }
 
 static int64_t sys_channel_send(int h, const void *udata, size_t n, int attach) {
-    struct file *f = getfd_ref(h);
+    struct handle *f = handle_get(h);
     if (!f) return -N_ERR_NO_HANDLE;
-    struct file *att = NULL;
+    struct handle *att = NULL;
     int64_t r = 0;
     if (attach >= 0) {
-        att = getfd_ref(attach);
+        att = handle_get(attach);
         if (!att) r = -N_ERR_NO_HANDLE;
         /* documents and shared pages only: a channel end sent through its own
            channel would keep itself alive */
-        else if (att->vn->type != VT_FILE && att->vn->type != VT_SHARED) r = -N_ERR_WRONG_KIND;
+        else if (handle_kind(att) != N_KIND_DOCUMENT && handle_kind(att) != N_KIND_SHARED) r = -N_ERR_WRONG_KIND;
     }
     if (r < 0) {
     } else if (message_channel_is(f)) {
         r = message_channel_send(f, udata, n, att);
-    } else if (byte_channel(f)) {
-        r = att ? -N_ERR_UNSUPPORTED : vfs_write_user(f, udata, n);
+    } else if (byte_stream(f)) {
+        r = att || !f->object->ops->write ? -N_ERR_UNSUPPORTED : f->object->ops->write(f, udata, n, true);
     } else {
         r = -N_ERR_WRONG_KIND;
     }
-    if (att) vfs_close(att);
-    vfs_close(f);
+    handle_close(att);
+    handle_close(f);
     return r;
 }
 
 static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, void *uoutput, bool credentials) {
     size_t output_size=credentials?sizeof(struct n_channel_message):sizeof(int32_t);
     if ((credentials && !uoutput) || (uoutput && !user_ok_w(uoutput,output_size))) return -N_ERR_BAD_ADDRESS;
-    struct file *f = getfd_ref(h);
+    struct handle *f = handle_get(h);
     if (!f) return -N_ERR_NO_HANDLE;
     bool wait = flags & N_CHANNEL_WAIT, peek = flags & N_CHANNEL_PEEK, discard = flags & N_CHANNEL_DISCARD;
-    if (flags & ~(N_CHANNEL_WAIT | N_CHANNEL_PEEK | N_CHANNEL_DISCARD) || (peek && discard)) { vfs_close(f); return -N_ERR_INVALID; }
+    if (flags & ~(N_CHANNEL_WAIT | N_CHANNEL_PEEK | N_CHANNEL_DISCARD) || (peek && discard)) { handle_close(f); return -N_ERR_INVALID; }
     int64_t r;
-    struct file *att = NULL;
+    struct handle *att = NULL;
     struct n_channel_message message={.attached=-1};
     if (message_channel_is(f)) {
         r = message_channel_receive(f, ubuf, cap, wait, peek, discard, &att, &message.sender_app);
-    } else if (byte_channel(f)) {
-        if (credentials || peek || discard) r = -N_ERR_UNSUPPORTED;
+    } else if (byte_stream(f)) {
+        if (credentials || peek || discard || !f->object->ops->read) r = -N_ERR_UNSUPPORTED;
         else if (!cap) r = 0;
         else {
-            uint64_t irq = irq_save();
-            bool ready = vfs_can_read(f);
-            irq_restore(irq);
-            r = !ready && !wait ? -N_ERR_NOT_READY : vfs_read_user(f, ubuf, cap);
-            if (r == 0) r = -N_ERR_CLOSED; /* the writer has gone */
+            r = f->object->ops->read(f, ubuf, cap, true, wait);
+            if (r == 0) r = -N_ERR_CLOSED; /* nothing more will come */
         }
     } else {
         r = -N_ERR_WRONG_KIND;
     }
-    vfs_close(f);
+    handle_close(f);
     if (r >= 0 && uoutput && (credentials || !peek)) {
         if (att && !peek) {
-            message.attached=(int32_t)install(att);att=NULL;
+            message.attached=(int32_t)handle_install(att);att=NULL;
             if (message.attached<0) r=message.attached;
         }
         if (r>=0 && copy_to_user(uoutput,credentials?(const void *)&message:(const void *)&message.attached,output_size)<0) {
-            if (message.attached>=0) handle_drop(message.attached);
+            if (message.attached>=0) handle_remove(message.attached);
             r=-N_ERR_BAD_ADDRESS;
         }
     }
-    if (att) vfs_close(att); /* the caller did not ask for attachments */
+    handle_close(att); /* the caller did not ask for attachments */
     return r;
 }
 
-/* A user string of any length up to max, copied into the kernel. */
-static char *user_strdup(const char *u, char *scratch, size_t max, int *error) {
-    int n = user_str(scratch, u, max);
-    if (n < 0) { *error = n; return NULL; }
-    char *s = strdup(scratch);
-    if (!s) *error = -N_ERR_NO_MEMORY;
-    return s;
-}
-
 static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
-    char path[PATH_MAX_LEN];
-    int r = native_path(upath, path);
+    char *path;
+    int r = user_string(upath, &path);
     if (r < 0) return r;
-    struct n_launch l;
-    r = copy_from_user(&l, ul, sizeof l);
-    if (r < 0) return r;
-    if (l.flags) return -N_ERR_INVALID;
+    struct n_launch l = {0};
+    char **argv = NULL, **settings = NULL;
+    struct handle **handles = NULL, *app = NULL;
+    size_t argc = 0, bytes = 0;
+    int64_t ret = copy_from_user(&l, ul, sizeof l);
     const size_t limit = USER_STACK_MAX / 2; /* what the new app's stack can hold */
-    if (l.argument_count > limit / 8 || l.setting_count > limit / 8 || l.handle_count > 4096)
-        return -N_ERR_TOO_MANY_ARGUMENTS;
-    size_t argc = l.argument_count ? l.argument_count : 1;
-    char **argv = kzalloc(argc * sizeof *argv);
-    char **settings = kzalloc((l.setting_count + 1) * sizeof *settings);
-    struct file **handles = kzalloc((l.handle_count + 1) * sizeof *handles);
-    char *scratch = kmalloc(65536);
-    struct file *app_file = NULL;
-    int64_t ret = 0;
-    size_t bytes = 0;
-    if (!argv || !settings || !handles || !scratch) { ret = -N_ERR_NO_MEMORY; goto out; }
+    if (ret < 0) goto out;
+    if (l.flags) { ret = -N_ERR_INVALID; goto out; }
+    if (l.argument_count > limit / 8 || l.setting_count > limit / 8 || l.handle_count > 4096) {
+        l = (struct n_launch){0};
+        ret = -N_ERR_TOO_MANY_ARGUMENTS;
+        goto out;
+    }
+    argc = l.argument_count ? l.argument_count : 1;
+    argv = kzalloc(argc * sizeof *argv);
+    settings = kzalloc((l.setting_count + 1) * sizeof *settings);
+    handles = kzalloc((l.handle_count + 1) * sizeof *handles);
+    if (!argv || !settings || !handles) { ret = -N_ERR_NO_MEMORY; goto out; }
     if (!l.argument_count) {
         argv[0] = strdup(path);
         if (!argv[0]) { ret = -N_ERR_NO_MEMORY; goto out; }
@@ -1515,13 +1468,13 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
     for (size_t i = 0; i < l.argument_count; i++) {
         const char *ua;
         if ((r = copy_from_user(&ua, &l.arguments[i], sizeof ua)) < 0) { ret = r; goto out; }
-        if (!(argv[i] = user_strdup(ua, scratch, 65536, &r))) { ret = r; goto out; }
+        if ((r = user_string(ua, &argv[i])) < 0) { ret = r; goto out; }
         bytes += strlen(argv[i]) + 1;
     }
     for (size_t i = 0; i < l.setting_count; i++) {
         const char *us;
         if ((r = copy_from_user(&us, &l.settings[i], sizeof us)) < 0) { ret = r; goto out; }
-        if (!(settings[i] = user_strdup(us, scratch, 65536, &r))) { ret = r; goto out; }
+        if ((r = user_string(us, &settings[i])) < 0) { ret = r; goto out; }
         bytes += strlen(settings[i]) + 1;
         if (!strchr(settings[i], '=')) { ret = -N_ERR_INVALID; goto out; }
     }
@@ -1530,56 +1483,44 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
         int32_t h;
         if ((r = copy_from_user(&h, &l.handles[i], sizeof h)) < 0) { ret = r; goto out; }
         if (h < 0) continue;
-        if (!(handles[i] = getfd_ref(h))) { ret = -N_ERR_NO_HANDLE; goto out; }
+        if (!(handles[i] = handle_get(h))) { ret = -N_ERR_NO_HANDLE; goto out; }
     }
-    struct vnode *app = proc_app_new();
-    if (!app || !(app_file = vfs_open_vnode(app, O_RDONLY))) {
-        if (app) app->ops->release(app);
-        ret = -N_ERR_NO_MEMORY;
-        goto out;
-    }
+    if ((r = proc_app_create(&app)) < 0) { ret = r; goto out; }
     struct proc_launch launch = {.argc = (int)argc, .argv = argv, .setting_count = (int)l.setting_count,
                                  .settings = settings, .handles = handles, .handle_count = l.handle_count,
-                                 .parent = task_process(), .app = app};
+                                 .parent = task_process(), .app = app->object};
     r = proc_launch(path, &launch);
     if (r < 0) ret = r;
-    else { ret = install(app_file); app_file = NULL; }
+    else { ret = handle_install(app); app = NULL; }
 out:
-    if (app_file) vfs_close(app_file);
+    handle_close(app);
     if (argv) for (size_t i = 0; i < argc; i++) kfree(argv[i]);
     if (settings) for (size_t i = 0; i < l.setting_count; i++) kfree(settings[i]);
-    if (handles) for (size_t i = 0; i < l.handle_count; i++) if (handles[i]) vfs_close(handles[i]);
+    if (handles) for (size_t i = 0; i < l.handle_count; i++) handle_close(handles[i]);
     kfree(argv);
     kfree(settings);
     kfree(handles);
-    kfree(scratch);
+    kfree(path);
     return ret;
-}
-
-static struct file *app_ref(int h, int64_t *error) {
-    struct file *f = getfd_ref(h);
-    *error = !f ? -N_ERR_NO_HANDLE : !proc_app_is(f->vn) ? -N_ERR_WRONG_KIND : 0;
-    if (*error && f) { vfs_close(f); f = NULL; }
-    return f;
 }
 
 static int64_t sys_app_result(int h, int64_t timeout_ms, int *ustatus) {
     int64_t r;
-    struct file *f = app_ref(h, &r);
-    if (!f) return r;
+    struct handle *app = handle_get_as(h, proc_app_is, &r);
+    if (!app) return r;
     int status = 0;
-    r = proc_app_result(f->vn, timeout_ms < 0 ? UINT64_MAX : (uint64_t)timeout_ms, &status);
-    vfs_close(f);
+    r = proc_app_result(app, timeout_ms < 0 ? UINT64_MAX : (uint64_t)timeout_ms, &status);
+    handle_close(app);
     if (!r && ustatus) r = copy_to_user(ustatus, &status, sizeof status);
     return r;
 }
 
 static int64_t sys_app_stop(int h, int flags) {
     int64_t r;
-    struct file *f = app_ref(h, &r);
-    if (!f) return r;
-    int pid = proc_app_pid(f->vn);
-    vfs_close(f);
+    struct handle *app = handle_get_as(h, proc_app_is, &r);
+    if (!app) return r;
+    int pid = proc_app_pid(app);
+    handle_close(app);
     if (flags & ~N_APP_STOP_TREE) return -N_ERR_INVALID;
     if (!pid) return 0; /* it has already ended */
     if (flags & N_APP_STOP_TREE) stop_tree(pid, 1);
@@ -1589,57 +1530,58 @@ static int64_t sys_app_stop(int h, int flags) {
 
 static int64_t sys_app_open(int64_t id) {
     if (id <= 0 || id > 0x7fffffff) return -N_ERR_NO_APP;
-    struct file *f;
-    int r = proc_app_open((int)id, &f);
-    return r < 0 ? r : install(f);
+    struct handle *app;
+    int r = proc_app_open((int)id, &app);
+    return r < 0 ? r : handle_install(app);
 }
 
 static int64_t sys_app_id(int h) {
     int64_t r;
-    struct file *f = app_ref(h, &r);
-    if (!f) return r;
-    r = proc_app_pid(f->vn);
-    vfs_close(f);
+    struct handle *app = handle_get_as(h, proc_app_is, &r);
+    if (!app) return r;
+    r = proc_app_pid(app);
+    handle_close(app);
     return r;
 }
 
 /* A handle whose messages are added to the system log (the serial port and the text console). */
 static int64_t sys_system_log_open(void) {
-    struct file *f;
-    int r = vfs_open("/dev/kmsg", O_WRONLY, &f);
-    return r < 0 ? r : install(f);
+    struct handle *h = stream_system_log_open();
+    return h ? handle_install(h) : -N_ERR_NO_MEMORY;
 }
 
 /* A stream of its own on the sound mixer; N_ERR_BUSY when every stream is taken. */
 static int64_t sys_audio_open(void) {
-    struct file *f;
-    int r = audio_stream_open(&f);
-    return r < 0 ? r : install(f);
-}
-
-static struct file *audio_ref(int h, int64_t *error) {
-    struct file *f = getfd_ref(h);
-    *error = !f ? -N_ERR_NO_HANDLE : !audio_stream_is(f) ? -N_ERR_WRONG_KIND : 0;
-    if (*error && f) { vfs_close(f); f = NULL; }
-    return f;
+    struct handle *h;
+    int r = audio_stream_open(&h);
+    return r < 0 ? r : handle_install(h);
 }
 
 static int64_t sys_audio_submit(int h, const void *frames, uint64_t count, uint32_t flags) {
     if (flags & ~N_AUDIO_WAIT) return -N_ERR_INVALID;
     int64_t r;
-    struct file *f = audio_ref(h, &r);
-    if (!f) return r;
-    r = audio_submit_file(f, frames, count, flags & N_AUDIO_WAIT);
-    vfs_close(f);
+    struct handle *stream = handle_get_as(h, audio_stream_is, &r);
+    if (!stream) return r;
+    r = audio_stream_submit(stream, frames, count, flags & N_AUDIO_WAIT);
+    handle_close(stream);
     return r;
 }
 
 static int64_t sys_audio_status(int h, struct n_audio_status *out) {
     int64_t r;
-    struct file *f = audio_ref(h, &r);
-    if (!f) return r;
-    r = audio_status_file(f, out);
-    vfs_close(f);
+    struct handle *stream = handle_get_as(h, audio_stream_is, &r);
+    if (!stream) return r;
+    r = audio_stream_status(stream, out);
+    handle_close(stream);
+    return r;
+}
+
+static int64_t sys_audio_flush(int h) {
+    int64_t r;
+    struct handle *stream = handle_get_as(h, audio_stream_is, &r);
+    if (!stream) return r;
+    r = audio_stream_flush(stream);
+    handle_close(stream);
     return r;
 }
 
@@ -1664,72 +1606,63 @@ static int64_t sys_random(void *ubuf, size_t n) {
     return (int64_t)n;
 }
 
-static struct file *events_ref(int q, int64_t *error) {
-    struct file *f = getfd_ref(q);
-    *error = !f ? -N_ERR_NO_HANDLE : !events_is(f) ? -N_ERR_WRONG_KIND : 0;
-    if (*error && f) { vfs_close(f); f = NULL; }
-    return f;
-}
-
 static int64_t sys_events_create(void) {
-    struct vnode *v = events_new();
-    if (!v) return -N_ERR_NO_MEMORY;
-    struct file *f = vfs_open_vnode(v, O_RDONLY);
-    if (!f) { v->ops->release(v); return -N_ERR_NO_MEMORY; }
-    return install(f);
+    struct handle *h;
+    int r = events_create(&h);
+    return r < 0 ? r : handle_install(h);
 }
 
 static int64_t sys_events_watch(int q, int h, uint32_t interest, uint64_t token) {
     const uint32_t known = N_EVENT_RECEIVABLE | N_EVENT_SENDABLE | N_EVENT_CLOSED | N_EVENT_APP_ENDED | N_EVENT_SAVED;
     if (!interest || (interest & ~known)) return -N_ERR_INVALID;
     int64_t r;
-    struct file *queue = events_ref(q, &r);
+    struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
     struct event_watch *spare = kmalloc(events_watch_size());
-    if (!spare) { vfs_close(queue); return -N_ERR_NO_MEMORY; }
+    if (!spare) { handle_close(queue); return -N_ERR_NO_MEMORY; }
     uint64_t flags = irq_save();
-    struct file *f = getfd(h);
-    r = f ? events_watch_locked(queue, f, interest, token, &spare) : -N_ERR_NO_HANDLE;
+    struct handle *watched = handle_peek(h);
+    r = watched ? events_watch_locked(queue, watched, interest, token, &spare) : -N_ERR_NO_HANDLE;
     irq_restore(flags);
     kfree(spare);
-    vfs_close(queue);
+    handle_close(queue);
     return r;
 }
 
 static int64_t sys_events_watch_address(int q, uint64_t address, uint32_t expected, uint64_t token) {
     if ((address & 3) || !user_ok((void *)address, sizeof(uint32_t))) return -N_ERR_BAD_ADDRESS;
     int64_t r;
-    struct file *queue = events_ref(q, &r);
+    struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
     r = events_watch_address(queue, (volatile uint32_t *)address, expected, token);
-    vfs_close(queue);
+    handle_close(queue);
     return r;
 }
 
 static int64_t sys_events_timer(int q, uint64_t ms, int repeat, uint64_t token) {
     int64_t r;
-    struct file *queue = events_ref(q, &r);
+    struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
     r = events_timer(queue, ms, repeat != 0, token);
-    vfs_close(queue);
+    handle_close(queue);
     return r;
 }
 
 static int64_t sys_events_unwatch(int q, uint64_t token) {
     int64_t r;
-    struct file *queue = events_ref(q, &r);
+    struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
     r = events_unwatch(queue, token);
-    vfs_close(queue);
+    handle_close(queue);
     return r;
 }
 
 static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, int64_t timeout_ms) {
     int64_t r;
-    struct file *queue = events_ref(q, &r);
+    struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
     r = events_wait(queue, uout, max, timeout_ms);
-    vfs_close(queue);
+    handle_close(queue);
     return r;
 }
 
@@ -1744,12 +1677,7 @@ void syscall_dispatch(struct regs *r) {
     int64_t ret = -N_ERR_UNSUPPORTED;
     switch (r->rax) {
     case SYS_EXIT: task_exit_app((int)a);
-    case SYS_AUDIO_FLUSH: {
-        struct file *f = getfd_ref((int)a);
-        ret = f ? audio_flush_file(f) : -N_ERR_NO_HANDLE;
-        vfs_close(f);
-        break;
-    }
+    case SYS_AUDIO_FLUSH: ret = sys_audio_flush((int)a); break;
     case SYS_SLEEP: sleep_ms(a); ret = 0; break;
     case SYS_UPTIME: ret = uptime_ms(); break;
     case SYS_TIME: ret = time_now(); break;
@@ -1760,9 +1688,9 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SHARED_COMPOSE: ret = sys_shared_compose((const struct n_shared_range *)a,b,(uint32_t)c); break;
     case SYS_SHARED_REVOKE: ret = sys_shared_revoke((int)a); break;
     case SYS_PCI_CLAIM: {
-        struct file *f = NULL;
-        ret = pci_user_claim((uint8_t)a,(uint8_t)b,(uint8_t)c,&f);
-        ret = new_handle(ret,f);
+        struct handle *claim = NULL;
+        ret = pci_user_claim((uint8_t)a,(uint8_t)b,(uint8_t)c,&claim);
+        ret = new_handle(ret,claim);
         break;
     }
     case SYS_PCI_BAR: ret = sys_pci_bar((int)a,(uint32_t)b); break;
@@ -1770,7 +1698,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
     case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:
     case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: case SYS_PCI_HOLD_SCREEN: {
-        struct file *f = getfd_ref((int)a);
+        struct handle *f = handle_get((int)a);
         if (!f) { ret = -N_ERR_NO_HANDLE; break; }
         if (r->rax == SYS_PCI_INFO) {
             struct n_pci_function info;
@@ -1781,7 +1709,7 @@ void syscall_dispatch(struct regs *r) {
         else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
         else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);
         else ret = pci_user_interrupt_take(f,(int64_t)b);
-        vfs_close(f);
+        handle_close(f);
         break;
     }
     case SYS_MEMORY_RESERVE: ret = sys_memory_reserve(a, (int)b); break;
@@ -1984,8 +1912,8 @@ void syscall_dispatch(struct regs *r) {
     case SYS_DOCUMENT_SET_SIZE: ret = sys_document_set_size((int)a, b); break;
     case SYS_DOCUMENT_CLAIM: ret = sys_document_claim((int)a, true, b != 0); break;
     case SYS_DOCUMENT_RELEASE: ret = sys_document_claim((int)a, false, false); break;
-    case SYS_DOCUMENT_SAVE: ret = sys_document_save((const char *)a, (const void *)b, c); break;
-    case SYS_DOCUMENT_APPEND: ret = sys_document_append((const char *)a, (const void *)b, c); break;
+    case SYS_DOCUMENT_SAVE: ret = sys_document_save((const char *)a, (const void *)b, c, false); break;
+    case SYS_DOCUMENT_APPEND: ret = sys_document_save((const char *)a, (const void *)b, c, true); break;
     case SYS_DOCUMENT_COMMIT: ret = sys_document_commit((int)a, (int)b); break;
     case SYS_ENTRY_INFO: ret = sys_entry_info((const char *)a, (struct n_entry *)b); break;
     case SYS_ENTRY_REMOVE: ret = sys_entry_remove((const char *)a); break;

@@ -6,7 +6,7 @@
 #include "dev/pm.h"
 #include "dev/acpi.h"
 #include "dev/blk.h"
-#include "fs/vfs.h"
+#include "fs/store.h"
 #include "dev/hibernate.h"
 #include "dev/iommu.h"
 #include "gui/wm.h"
@@ -242,7 +242,7 @@ static void sleep_now(bool hibernate) {
         return;
     }
     kprintf("pm: going to %s\n", hibernate ? "hibernate" : "sleep");
-    vfs_sync(); /* what was saved is on its volume, whatever becomes of the sleep */
+    store_sync(); /* what was saved is on its volume, whatever becomes of the sleep */
     /* no transfer is cut off by the controllers losing their state, and after a snapshot nothing
        but the image reaches the disks */
     blk_hold();
@@ -258,7 +258,7 @@ static void sleep_now(bool hibernate) {
         slept = machine_sleep(hibernate_snapshot, 4, &why);
         if (!slept && !why) {
             /* the snapshot: the machine as it is from here on never comes back */
-            wm_notify("Hibernating", "Saving the memory to /data");
+            wm_notify("Hibernating", "Saving the memory to C:");
             if (!(why = hibernate_write())) {
                 stopping = true;
                 kprintf("pm: hibernated, power off\n");
@@ -303,7 +303,7 @@ static void pm_thread(void *arg) {
             wm_notify(action == PM_REBOOT ? "Restarting" : "Shutting down",
                       action == PM_REBOOT ? "See you in a moment..." : "Good night!");
             stop_apps();
-            vfs_sync(); /* what was saved reaches its volume first */
+            store_sync(); /* what was saved reaches its volume first */
             finish(action);
         }
         f = irq_save();

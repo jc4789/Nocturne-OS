@@ -73,7 +73,7 @@ globalThis.runFormValidationCases=async function(){
     email.value='';equal(email.validity.typeMismatch,false);email.multiple=true;email.value='a@b, c@d';equal(email.validity.typeMismatch,false);email.value='a@b,';equal(email.validity.typeMismatch,true);email.value='a@b,c';equal(email.validity.typeMismatch,true);
     email.pattern='.+@example\\.test';email.value='a@example.test,b@example.test';equal(email.validity.patternMismatch,false,'pattern matches each email');email.value='a@example.test,b@other.test';equal(email.validity.patternMismatch,true);
     const url=make('input',{type:'url'});
-    for(const value of ['https://example.test/a?q=1#f','mailto:a@example.test','urn:example:one','data:text/plain,hello','file:///data/example','https://日本.example/猫','http://[::1]/']){url.value=value;equal(url.validity.typeMismatch,false,value);}
+    for(const value of ['https://example.test/a?q=1#f','mailto:a@example.test','urn:example:one','data:text/plain,hello','file:///C:/Users/User/example','https://日本.example/猫','http://[::1]/']){url.value=value;equal(url.validity.typeMismatch,false,value);}
     for(const value of ['example.test','/relative','https://','http://[broken]/','http://host:70000/']){url.value=value;equal(url.validity.typeMismatch,true,value);}
     url.value='';equal(url.validity.typeMismatch,false);
 

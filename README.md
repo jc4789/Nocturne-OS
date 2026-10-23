@@ -44,7 +44,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 
 ## 中身
 
-### カーネル（`kernel/`、C とアセンブリーで約 29,000 行）
+### カーネル（`kernel/`、C とアセンブリーで約 43,000 行）
 
 - **起動**：Limine（BIOS・UEFI）から上位半分の 64 ビットカーネルへ。起動メニューには既定の
   1920×1080、1024×768、文字コンソールだけ（`nogui`）の 3 項目があります。
@@ -59,11 +59,12 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
   - W^X：書込み可能かつ実行可能なページは作りません。生成したコードは書いてから実行可能へ切り替えます。
   - ネイティブのメモリー API（`n_memory_reserve`・`protect`・`release`）と共有ページ。
     共有ページはチャンネルのメッセージに添付してだけ他のアプリへ渡せます。
-  - initrd は RAM のルートへ展開したあと、元の書庫のページを解放します。
-- **ファイル**：ルートは RAM（initrd から作成、再起動で消えます）。`/data` は `NOCTDATA` という
-  名前の FAT32 で、再起動しても残ります。MBR・GPT・パーティションなしのどれでも見つけます。
+- **ファイル**：起動ディスクの Nocturne パーティションがドライブ C: です（`fs/`）。独自のコピーオンライト形式で、
+  4 KiB のブロック、B+ 木の目録、全ブロックの CRC-32C、交互に書く 2 つのスーパーブロックを持ち、
+  書込み中に電源が切れても最後のコミットが残ります。カーネルは Limine が伝える起動ディスクの GPT の GUID で C: を見つけます
+  （ライブ ISO では、Limine がメモリーへ読んだボリュームが C: です）。
 - **ドライバー**
-  - 記憶装置：ATA（PIO）、NVMe、USB 大容量記憶装置（BOT＋SCSI）、Hyper-V の SCSI。
+  - 記憶装置：AHCI（SATA、DMA）、ATA（PIO）、NVMe、USB 大容量記憶装置（BOT＋SCSI）、Hyper-V の SCSI。
   - USB：xHCI、USB 2.0 と SuperSpeed のハブ、HID のキーボード・マウス。
   - 入力：PS/2 のキーボードとホイールマウス、Hyper-V の合成キーボードと絶対座標マウス、USB HID。
   - ネットワーク：Intel e1000、DEC 21140／21143（tulip）、Hyper-V の合成アダプター、
@@ -82,8 +83,8 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
   - タスクバー（スタートボタン、窓のボタン、音量、日付と時刻）、スタートメニュー、通知、1 MiB までのクリップボード。
   - カーネルの文字は GNU Unifont Japanese 18.0.01 のビットマップ（57,086 字形、半角 8×16・全角 16×16）です。
 - **設定**：設定アプリ（デスクトップの歯車、スタートメニューの Settings）で、画面（10-bit colour、更新頻度）、
-  マウス（ポインターの速さ、縦方向の向き）、音量をマウスだけで変えられます。変更はすぐ効き、`/data` に保存して
-  再起動後も残ります。起動時に端末は開きません。端末を開かなくても普段の操作はすべてできます。
+  マウス（ポインターの速さ、縦方向の向き）、音量をマウスだけで変えられます。変更はすぐ効き、ユーザーのフォルダーの
+  `AppData\Settings\desktop.conf` に保存して再起動後も残ります。起動時に端末は開きません。端末を開かなくても普段の操作はすべてできます。
 - **Hyper-V**：VMBus と合成デバイス、ハートビート、Hyper-V マネージャーからの終了と再起動、時刻の同期、
   KVP（VM の IP アドレスと OS を表示）、Hyper-V ソケット、その上の拡張セッション用 RDP サーバー。
 
@@ -94,7 +95,8 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 
 - **ハンドル**：資源はすべて種類付きのハンドルです（文書、フォルダー、チャンネル、窓、共有ページ、アプリ、
   イベント、装置、接続）。失敗は負の `N_ERR_*` で返り、`n_result_text` で説明を得られます。
-- **文書とフォルダー**：いつも `/` で始まる完全なパスで扱います。カーネルには作業フォルダーも読み書き位置もありません。
+- **文書とフォルダー**：いつも完全なパス（`C:\Users\User\a.txt`。`\` と `/` は同じで、`\a` は `C:\a`）で扱います。
+  名前は大文字と小文字を区別せず、書いたとおりに残ります。カーネルには作業フォルダーも読み書き位置もありません。
   シェルの現在のフォルダーは設定 `FOLDER=` でアプリへ渡ります。文書全体の読込み・原子的な保存・追記、
   位置を指定した読み書き、排他の取得があります。
 - **チャンネル**：双方向のメッセージ通信で、パイプの代わりです。文書や共有ページのハンドルを添付できます。
@@ -123,10 +125,10 @@ POSIX のヘッダー（`unistd.h`、`fcntl.h`、`sys/*.h`）は意図して用�
   アプリは部品の木（ビュー：列、行、文字、ボタン、入力欄、一覧、スイッチ、スライダー、キャンバス、サーフェス）を
   メッセージで送り、部品の場所を名指すイベントを受けます。配置、描画、ポインターとキーボード、フォーカス、
   スクロール、アニメーションはエンジンが受け持ち、前の絵から変わった部品だけを描き直します。
-  C はそのまま呼び、JavaScript・TypeScript（`nocturne/ui`）と Go（`ports/go/ui`）は `/bin/uihost` を通して
+  C はそのまま呼び、JavaScript・TypeScript（`nocturne/ui`）と Go（`ports/go/ui`）は `C:\Nocturne\System\uihost` を通して
   同じ形式で使います。言語ごとの部品の実装はありません。文字は Noto Sans（CJK を含む）、等幅は Maple Mono です。
 - **シェル**（`sh`）
-  - パイプ（チャンネル）、リダイレクト（`< > >> 2>`）、`&`、`;`、`&&`、`||`、引用符、`*` と `?` の展開、`~`、`#` の注釈。
+  - パイプ（チャンネル）、リダイレクト（`< > >> 2>`）、`&`、`;`、`&&`、`||`、引用符、`*` と `?` の展開（大文字・小文字を区別しない）、`#` の注釈。
   - `$?` とスクリプトの引数（`$0`〜`$9`、`$#`、`$@`）。変数、`if`、繰返しはありません。
   - 履歴、Tab 補完、`cd`・`pwd`・`history`・`help`。
 - **端末**：16 色の ANSI、UTF-8、1000 行のスクロールバック、画面のコピーと貼付け、大きさの変更。
@@ -135,7 +137,8 @@ POSIX のヘッダー（`unistd.h`、`fcntl.h`、`sys/*.h`）は意図して用�
   ps kill free dmesg lspci clear true false reboot poweroff neofetch fortune moonsay screenshot`
 - **ネットワーク**：`ifconfig`、`ping`、`host`（DNS）、`fetch`（HTTP・HTTPS）。
 - **音**：`beep`（音と旋律）、`play`（WAV）、`volume`。どれもデスクトップからもできることで、スクリプト用です。
-- **開発**：`tcc`、`js`、`tsgo`、`wasm2c`、`cppdemo`。`/bin` のすべてのアプリのソースは `/usr/src/apps` にあります。
+- **開発**：`tcc`、`js`、`tsgo`、`wasm2c`、`cppdemo`。プログラムは `C:\Nocturne\System`（コマンド）と `C:\Programs`
+  （デスクトップのアプリ）にあり、C・JavaScript・TypeScript のソースは `C:\Nocturne\SDK\Source\Apps` にあります。
 - **AI**：`agent`（[AI エージェント](#ai-エージェント)）。
 - **デスクトップのアプリ**：端末、ファイル、Web ブラウザー、テキストエディター、ペイント、電卓、時計、
   システムモニター、ピアノ、サウンドプレーヤー、メディアプレーヤー、設定、Nocturne について。
@@ -154,20 +157,19 @@ powershell -ExecutionPolicy Bypass -File build.ps1 run
 `build.ps1 run`（`make run`）は既定で 2048 MiB、4 CPU、TCG（エミュレーション）です。
 `make run QEMU_ACCEL=whpx QEMU_MEMORY=4096M` のように変数で変えられます。
 音は AC'97、ネットワークは QEMU 既定の e1000 とユーザーモードの NAT です。
+起動するのは自分用のディスク `build\run.img` です。最初は `build\nocturne.img` をコピーし、その後のビルドでは
+中のシステムだけを置き換えるので、C: に保存したファイルは残ります（[ドライブ C: と保存](#ドライブ-c-と保存)）。
 
-WHPX では起動ディスクを IDE につなぐと、Limine が約 450 MB の initrd を IDE の PIO で読むため、
-カーネルが始まるまで約 3 分かかります。起動ディスクを AHCI につなぐと約 8 秒です。開発で使っている構成は次のとおりです。
+カーネルの ATA ドライバーは PIO なので、起動ディスクは AHCI（DMA）につなぎます。ビルドしたディスクを
+そのまま試すときの構成は次のとおりです（`snapshot=on` なので、C: への書込みは QEMU の終了で捨てられます）。
 
 ```powershell
 & "C:\Program Files\qemu\qemu-system-x86_64.exe" -M pc -accel whpx -smp 4 -m 4096M -vga std `
   -device ahci,id=ahci `
   -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on `
   -device ide-hd,drive=boot,bus=ahci.0,bootindex=0 `
-  -drive file=build/data.img,format=raw,if=ide,index=1 `
   -audiodev dsound,id=snd -device AC97,audiodev=snd -serial stdio
 ```
-
-カーネルには AHCI のドライバーがないので、`/data` のディスク（`data.img`）は IDE のままにします。
 
 ### Hyper-V
 
@@ -178,12 +180,11 @@ powershell -ExecutionPolicy Bypass -File hyperv.ps1 -MemoryMB 4096
 ```
 
 `Nocturne` という名前の**第 2 世代** VM を作り、起動して VMConnect を開きます。設定は次のとおりです。
-- 静的メモリー（既定は 512 MB）と 1 CPU。起動イメージは約 450 MB の initrd を RAM に展開するので、
-  `-MemoryMB` で増やしてください（開発の試験は 4096 MiB で行っています）。CPU 数は Hyper-V マネージャーで増やせ、
-  カーネルは増やした CPU を使います。
+- 静的メモリー（既定は 512 MB）と 1 CPU。メモリーは `-MemoryMB` で変えられます（開発の試験は 4096 MiB で
+  行っています）。CPU 数は Hyper-V マネージャーで増やせ、カーネルは増やした CPU を使います。
 - セキュアブートは無効（ブートローダーは署名されていません）。チェックポイントなし。
-- 起動ディスク（`hyperv\<名前>-boot.vhdx`）は SCSI 0:0、[データディスク](#永続ストレージdata)
-  （`hyperv\<名前>-data.vhdx`、2 GB の可変長）は SCSI 0:1。
+- ディスクは 1 台（`hyperv\<名前>.vhdx`、SCSI 0:0）で、その VM 専用です。最初は `build\nocturne.img` のコピーで、
+  起動部分と[ドライブ C:](#ドライブ-c-と保存) が入っています。
 - ネットワークアダプターは **Default Switch** につなぐので、DHCP でアドレスを得てインターネットへ出られます。
 - 拡張セッションは Hyper-V ソケットで使います。ホストで拡張セッションモードが切れていれば、スクリプトが有効にします。
 - COM1 は `\\.\pipe\<名前の小文字>-com1` につながります。
@@ -199,21 +200,21 @@ RDP サーバーにつながり、デスクトップは選んだ大きさにな�
 
 | コマンド | 内容 |
 |---|---|
-| `hyperv.ps1 -Update` | 新しくビルドした起動ディスクを既存の VM へコピーして再起動します。データディスクは残します。ビルド成果物が kernel.elf や initrd.tar より古ければ拒否します。 |
+| `hyperv.ps1 -Update` | VM を止め、新しくビルドしたシステム（起動部分、`C:\Nocturne`、付属アプリのフォルダー）を VM のディスクへ入れて起動し直します。ユーザーのファイルと、ユーザーが `C:\Programs` に入れたアプリは残ります。書換えには `hyperv\` にディスクの 2 倍の空きが要ります。古い版の VM のデータディスク（`<名前>-data.vhdx`）は外し、ホストに残します。 |
 | `hyperv.ps1 -Generation 1` | 第 1 世代の VM を作ります（下記）。 |
-| `hyperv.ps1 -Iso` | ディスクの代わりに `build\nocturne.iso` を DVD ドライブから起動します。 |
-| `hyperv.ps1 -Remove` | VM を削除します。データディスクは `-DeleteData` を付けたときだけ消します。 |
+| `hyperv.ps1 -Iso` | ディスクの代わりにライブ ISO（`build\nocturne.iso`）を DVD ドライブから起動します。C: はメモリー上にあり、変更は電源を切ると消えます。`-MemoryMB` を指定しなければ 2048 MB にし、既存の VM に `-Update -Iso` とすると、起動メモリーが足りなければ引き上げます。 |
+| `hyperv.ps1 -Remove` | VM を削除します。ディスクはユーザーのファイルごと残り、同じ名前で作り直した VM がまた使います。`-DeleteDisk` を付けるとディスクも消します。 |
 | `hyperv.ps1 -NoStart` | VM を作るだけで起動しません。 |
 | `hyperv.ps1 -NoNetwork` | ネットワークアダプターなしで作ります。 |
 | `hyperv.ps1 -Switch "名前"` | 別の仮想スイッチにつなぎます。 |
 | `hyperv.ps1 -Name Foo -MemoryMB 4096` | VM の名前とメモリーを変えます。 |
-| `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | AI エージェントの API キーをデータディスクへ書きます（`-Endpoint`、`-Model` も指定可）。 |
+| `hyperv.ps1 -Update -ApiKeyFile KEYFILE` | AI エージェントの API キーを VM のディスクの C: へ書きます（`-Endpoint`、`-Model` も指定可）。 |
 
 手で第 2 世代の VM を作るなら、セキュアブートを切って `build\nocturne.vhdx` を SCSI ディスクとしてつなぎ、
 拡張セッションには `Set-VM -EnhancedSessionTransportType HvSocket` を設定します。
 
-**第 1 世代**は旧来の PC を模倣します。`build\nocturne.vhd` を IDE に、データディスクを IDE 0:1 に、
-*レガシー*ネットワークアダプター（DEC 21140 の模倣）をつなぎます。VMConnect は基本のコンソールだけです。
+**第 1 世代**は旧来の PC を模倣します。ディスクは固定長の VHD（`hyperv\<名前>.vhd`、`build\nocturne.vhd` と同じ形式）で
+IDE 0:0 に、*レガシー*ネットワークアダプター（DEC 21140 の模倣）をつなぎます。VMConnect は基本のコンソールだけです。
 
 **VMConnect のこつ**
 - 基本のコンソールでは、窓の中をクリックするとマウスを捕まえます。**Ctrl+Alt+←** で離します。
@@ -230,7 +231,7 @@ RDP サーバーにつながり、デスクトップは選んだ大きさにな�
 
 | スクリプト | 内容 |
 |---|---|
-| `hv-boot.ps1 -Name VM -Build` | ビルドし、VM の起動媒体を更新して起動し、COM1 を記録してコンソールを撮ります。 |
+| `hv-boot.ps1 -Name VM -Build` | ビルドし、VM の ISO、またはディスクのシステム（`hyperv.ps1 -Update -NoStart`）を新しくして起動し、COM1 を記録してコンソールを撮ります。 |
 | `hv-esm.ps1 -Name VM` | VMConnect で拡張セッションを開き、窓の画像を保存します。 |
 | `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | VMConnect なしで拡張セッションを試します。小さな RDP クライアントが打鍵・クリックし、受け取った画面を PNG に保存します。`clip:TEXT` と `chord:1d,2a,2f` はクリップボード、`resize:1600x900` は窓の大きさの変更を試します。受け取った音は PNG の隣に WAV で保存し、含まれる音の高さを一覧にします。 |
 | `hv-input.ps1 -Name VM -Steps "text:...","click:1"` | 基本のコンソールへキーボードとマウスの入力を送ります。 |
@@ -240,13 +241,14 @@ RDP サーバーにつながり、デスクトップは選んだ大きさにな�
 
 ### 実機
 
-`build\nocturne.img`（MBR の FAT32、BIOS・UEFI の両方で起動）を USB メモリーへ書き込み、
+`build\nocturne.img`（GPT の起動ディスク、BIOS・UEFI の両方で起動）を USB メモリーへ書き込み、
 セキュアブートを切って起動します。12 スレッドの AMD 機（USB 起動、RTL8125B の有線 LAN、USB の
-キーボード・マウス）で、デスクトップとブラウザーでの動画ページの表示まで確認しました。まだ初期段階です。
+キーボード・マウス）で、デスクトップとブラウザーでの動画ページの表示まで確認しました。この確認は 1 台のディスクと
+ドライブ C: の形式になる前のもので、今の形式の実機ではまだ確かめていません。まだ初期段階です。
 - 手順書や対応機種の一覧はありません。
 - 音は出ません（HD Audio は未対応）。GPU のドライバーはなく、ファームウェアの画面モードを使います。
-- `/data` を残すには、どれかのディスク（USB メモリー、NVMe など）に `NOCTDATA` という名前の
-  FAT32 ボリュームが必要です。無ければ `/data` は RAM になり、再起動で消えます。
+- ファイルは USB メモリーの C: に保存され、再起動しても残ります。C: の大きさはイメージのままで
+  （USB メモリーが大きくても広がりません）、空きは約 2 GB です。
 
 ## ビルド
 
@@ -261,25 +263,28 @@ RDP サーバーにつながり、デスクトップは選んだ大きさにな�
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1          # すべてを .\build へビルド
 powershell -ExecutionPolicy Bypass -File build.ps1 run      # ビルドして QEMU で起動
-powershell -ExecutionPolicy Bypass -File build.ps1 clean    # build を消す（data.img は残す）
+powershell -ExecutionPolicy Bypass -File build.ps1 clean    # build を消す（run.img は残す）
 python -X utf8 scripts/build.py -j 8 cxx                    # Makefile の任意の目標（cxx、bitmap-fonts など）
 ```
 
 `build\` にできるもの：
-- `kernel.elf`、`initrd.tar`：カーネルと RAM のルートの中身。
-- `nocturne.img`：MBR の起動ディスク（QEMU、USB メモリー）。
+- `kernel.elf`：カーネル。
+- `nocturne.img`：GPT の起動ディスク（EFI システムパーティションとドライブ C:。QEMU、USB メモリー）。
 - `nocturne.vhd`：Hyper-V 第 1 世代用の固定長 VHD。
 - `nocturne.vhdx`：Hyper-V 第 2 世代用の可変長 VHDX。
-- `nocturne.iso`：BIOS・UEFI 両用の ISO。
-- `data.img`：QEMU 用の `/data` ディスク（512 MB）。最初のビルドで作り、二度と上書きしません。
-- `data-blank.vhdx`：Hyper-V 用の空のデータディスク（2 GB）。
+- `nocturne.iso`：BIOS・UEFI 両用のライブ ISO。Limine、カーネル、C:（`boot/c.img`、GPT の無い単独のボリューム）が入り、
+  Limine が C: をモジュールとしてメモリーへ読みます。C: への変更は電源を切ると消え、ハイバネーションはできません。
+  C: の空きは 256 MiB 以上（今は約 390 MiB）で、C: の大きさ分（今は約 960 MiB）の RAM を使います。全体のビルドで作り、
+  `qemu-image` と `run` では作りません。
+- `run.img`：`build.ps1 run` 専用のディスク。最初の `run` で作り、その後はシステムだけを置き換えます。
+- `host\store.exe`：ホストで C: を作り、読み書きし、検査する道具（`store list`、`get`、`put`、`check` など）。
 
 **追加の部品**（無くても OS はビルドできます。ただし電卓は Go、設定と「Nocturne について」は TypeScript で
 書かれているので、揃ったデスクトップには両方が要ります。`tools/go` と `tools/typescript-go` に置けば自動で使います）：
 - **Go**（[ports/go](ports/go/README.md)）：Go 1.27.2 に `ports/go/nocturne.patch` を当ててビルドし、
-  `make GO=<Go のソース>/bin/go.exe` とすると `ports/go/apps/*` が `/bin` に入ります。
+  `make GO=<Go のソース>/bin/go.exe` とすると `ports/go/apps/*` が `C:\Nocturne\System`（電卓は `C:\Programs\Calculator`）に入ります。
 - **TypeScript-Go**（[ports/tsgo](ports/tsgo/README.md)）：さらに `TSGO=<TypeScript-Go のソース>` を付けると
-  `/bin/tsgo` が入ります。`js file.ts` は tsgo を使います。
+  `C:\Nocturne\System\tsgo` が入ります。`js file.ts` は tsgo を使います。
 - **virgl**（[ports/virgl](ports/virgl/README.md)）：ホストの QEMU で virtio-gpu を試すときだけ使います（`QEMU_GPU=virgl`）。
 
 ## 試験
@@ -290,13 +295,15 @@ powershell -ExecutionPolicy Bypass -File build.ps1 test-quick  # 全アプリの
 powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # OS の中で tcc が自分をビルドし直す試験も行う
 ```
 
-`scripts/test.py` はイメージを画面なしの QEMU で起動し、`tests/` を入れた使い捨てのデータディスクをつなぎます。
-自分の `data.img` には触れません。OS の中の `tcc` が試験の実行役（`tests/runtests.c`）をコンパイルし、
-約 100 の群・約 220 の試験を走らせ、終了状態と出力を確かめます。結果はシリアルで返り、最後にホストが
-`fatcheck.py` で OS が書いた FAT32 を検査します。主な対象は次のとおりです。
+`scripts/test.py` は `build\nocturne.img` のコピー（`build\test.img`）の `C:\Tests` に `tests/` を入れ、
+画面なしの QEMU で起動します。コピーのカーネルとプログラムが今のビルドのものかを先に確かめ、`run.img` には触れません。
+OS の中の `tcc` が試験の実行役（`tests/runtests.c`）をコンパイルし、約 110 の群・約 220 の試験を走らせ、
+終了状態と出力を確かめます。結果はシリアルで返り、最後にホストが `store check` で OS が書いた C: を検査します
+（問題があったときだけコピーを残します）。主な対象は次のとおりです。
 - シェルとコマンド、`malloc`、ネイティブ ABI、スレッドと並列処理。
 - W^X：コードや読込み専用データへの書込み、スタックやヒープの実行がアプリを止めること。
-- FAT32 と RAM のファイル：さまざまな大きさ、長い名前、150 個の項目、名前の変更、入れ子のフォルダー。
+- ドライブ C:：4 KiB のブロックの境目をまたぐさまざまな大きさ、置換・追記・大きさの変更・位置を指定した書込み、
+  移動、長い名前、大文字と小文字、入れ子のフォルダー、一覧、削除。
 - `tcc`：printf と数学関数、全アプリのコンパイル、自己ビルド。C++。
 - GUI：窓が画面に現れ、閉じると消えること。
 - 音：ストリーム、待つ書込みと待たない書込み、8 本同時、音量、`beep`、各種 WAV の `play`。QEMU が AC'97 の出力を
@@ -311,7 +318,8 @@ powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # OS の中で tc
 `python scripts/test.py --no-net` を使います。`--accel whpx`、`--cpus`、`--memory`、群の名前
 （`python scripts/test.py web tcp`）も指定できます。
 
-`scripts/qtest.py` は起動中のイメージを打鍵・マウス・画面の撮影で操作します。
+`scripts/qtest.py` は `build\nocturne.img` を `snapshot=on` で起動し（C: への書込みは終了で捨てられます）、
+打鍵・マウス・画面の撮影で操作します。
 
 ```
 python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dclick shot:files
@@ -331,20 +339,32 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 | Shift+PgUp / PgDn、ホイール | 端末のスクロールバック |
 | Ctrl+C | 実行中のコマンドを止める |
 
-ルートのファイルは RAM にあり、再起動で消えます。残したいものは `/data` に保存してください。
-`/home` には見本のファイルがあります。`sh hello.sh` を試してみてください。`/home/JavaScript` には `js` の見本があります。
+端末とアプリはユーザーのフォルダー `C:\Users\User` で始まります。`Documents` には見本のファイルがあります。
+`sh Documents\hello.sh` を試してみてください。`Documents\JavaScript` には `js` の見本があります。
 
-### 永続ストレージ：/data
+### ドライブ C: と保存
 
-`/data` 以外はすべて RAM にあり、起動のたびに戻ります。`/data` は `NOCTDATA` という名前の FAT32 で、
-保存したファイルは再起動やビルドのし直しでも残ります。
-- **QEMU**：`build\data.img`（512 MB）。最初のビルドで作り、上書きしません。`build.ps1 clean` も消しません。
+ディスクは 1 台で、EFI システムパーティション（Limine とカーネル）とドライブ C: があります。C: はコピーオンライトの
+格納庫で、保存したファイルは再起動しても残ります。
+- `C:\Nocturne`：システム（`System` のプログラム、`Fonts`、`SDK`、`Licenses` など）。アプリは読めますが、変えられません。
+- `C:\Programs`：デスクトップのアプリ（`Browser`、`Notepad` など、アプリごとのフォルダー）。システムと一緒に入る
+  アプリのフォルダーは `C:\Nocturne` と同じく変えられません。自分のアプリのフォルダーはここに作れます。
+- `C:\Users\User`：ユーザーのファイル（`Documents`、`Desktop`、`Downloads`、`Music`、`Pictures`、`Videos`）。
+  アプリのデータは `AppData\<アプリ>`、一時ファイルは `AppData\Temp`（起動のたびに空になります）。
+- 書き込んだ内容は、最初の変更から約 5 秒後か、文書を閉じたときにコミットされます。書込みの途中で電源が切れても、
+  最後のコミットまでの内容が残ります。
+
+保存先：
+- **QEMU**：`build.ps1 run` の `build\run.img`。ビルドし直してもシステムだけを置き換え、`build.ps1 clean` も消しません。
   まっさらにしたいときは手で消してください。
-- **Hyper-V**：`hyperv.ps1` が `hyperv\<名前>-data.vhdx`（2 GB、可変長）を 2 台目のディスクとしてつなぎます。
-  `-Update` は起動ディスクだけを置き換えます。
-- **実機**：どれかのディスクの `NOCTDATA` という FAT32 ボリューム。
+- **Hyper-V**：VM のディスク（`hyperv\<名前>.vhdx`）。`-Update` はシステムだけを置き換えます。
+- **実機**：USB メモリーの C:。
+- ライブ ISO の C: はメモリー上にあり、変更は電源を切ると消えます。
 
-アプリは `/bin` の次に `/data/bin` から探すので、そこへ入れたプログラムは名前だけで動きます。
+ホストからは `build\host\store.exe` で C: を見られます（`store list build\run.img C:\Users\User`、`store get`、`store put`）。
+
+シェルは名前だけのコマンドを `C:\Nocturne\System` と、`C:\Programs` の各フォルダーから探します（`PATH` はありません）。
+`C:\Programs\<名前>` に入れたプログラムは名前だけで動きます。
 
 ## 音
 
@@ -358,7 +378,7 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 - **メディアプレーヤー**：MP3、FLAC、AAC、Ogg（Vorbis、Opus）の音声と、MP4・WebM・AVI・MOV の動画
   （H.264、HEVC、VP8、VP9 など）を FFmpeg で再生します。ファイルで音声・動画をダブルクリックすると開きます。
   Space で再生・一時停止、←→ で 5 秒移動、Ctrl+O でファイルや URL を開きます。
-- **音楽**：`/home/Music` に Nocturne 用の短い曲が 3 つあります（ビルド時に `scripts/mksounds.py` が合成）。
+- **音楽**：`C:\Users\User\Music` に Nocturne 用の短い曲が 3 つあります（ビルド時に `scripts/mksounds.py` が合成）。
 - **ピアノ**：マウスかキーボードで 2 オクターブを弾けます（下のオクターブは Z S X D C V G B H N J M、
   上は Q 2 W 3 E R 5 T 6 Y 7 U I）。Tab で 3 種類の音色、←→ でオクターブを変えます。
 - スネーク、テトリス、マインスイーパーには効果音があります。
@@ -388,7 +408,7 @@ Hyper-V にはサウンドカードがないので、拡張セッションが VM
 ping -c 3 example.com
 host example.com
 fetch -i http://example.com
-fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
+fetch -o C:\Users\User\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
 ```
 
 - **TCP/IP**（`kernel/src/net/`）：Ethernet、ARP、IPv4、ICMP、UDP、DHCP、DNS、TCP。
@@ -409,7 +429,7 @@ fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
 
 ![Wikipedia を表示している Web ブラウザー](docs/browser.png)
 
-デスクトップかスタートメニューの **Web ブラウザー**、または `browser URL`（`browser /パス/file.html`）で開きます。
+デスクトップかスタートメニューの **Web ブラウザー**、または `browser URL`（`browser C:\パス\file.html`）で開きます。
 ファイルは `.html` をブラウザーで開きます。最初のページは検索欄とリンク集です。窓ごとに 1 つの処理で、
 タブの代わりに窓を増やします（`window.open` も新しい窓になります）。
 
@@ -482,11 +502,12 @@ AV1 と HDR、RSA・楕円曲線の署名、ダウンロードとブックマー
 `tcc` は Nocturne 向けにビルドした TinyCC 0.9.28rc です。
 
 ```
-tcc -run /usr/src/apps/mandel.c           # メモリー上でコンパイルして実行
-tcc -o /data/bin/hello hello.c            # プログラムを作る。以後 hello で動く
+tcc -run C:\Nocturne\SDK\Source\Apps\mandel.c   # メモリー上でコンパイルして実行
+mkdir C:\Programs\Hello
+tcc -o C:\Programs\Hello\hello hello.c          # プログラムを作る。以後 hello で動く
 ```
 
-プログラムは Nocturne の libc と静的にリンクします。使えるヘッダー：
+プログラムは Nocturne の libc と静的にリンクします。ヘッダーとライブラリーは `C:\Nocturne\SDK` にあります。使えるヘッダー：
 - `nocturne.h`：ネイティブ API と窓。
 - `ui.h`：UI エンジン（部品のビューとイベント。[ユーザーランド](#ユーザーランドuser)を参照）。
 - `gfx.h`（描画）、`font.h`（TrueType）、`image.h`（画像）、`media.h`（音声・動画）、`gpu.h`。
@@ -506,7 +527,8 @@ libc++ の文字列・コンテナーと C の GUI API を使う例が動きま�
 
 [ports/go](ports/go/README.md) は Go を `GOOS=nocturne GOARCH=amd64` へ移植したもので、UNIX 系としてではなく
 Nocturne の API の上で動きます。ゴルーチンは複数の CPU で動き、`os`、`os/exec`、`net`（TCP・UDP・DNS、
-`net.Listen`）、`crypto/tls` を使えます。ホストでクロスコンパイルし、`ports/go/apps/<名前>` が `/bin/<名前>` になります。
+`net.Listen`）、`crypto/tls` を使えます。ホストでクロスコンパイルし、`ports/go/apps/<名前>` が
+`C:\Nocturne\System\<名前>`（デスクトップのアプリは `C:\Programs\<アプリ>`）になります。
 
 ### JavaScript と TypeScript
 
@@ -533,9 +555,9 @@ js -e 'console.log(1 + 2)'  # -p は結果を表示、js - は入力から、js 
   `URL`、`TextEncoder`・`TextDecoder`、`crypto`（`getRandomValues`、`subtle`）、`structuredClone`、
   `atob`・`btoa`、`EventTarget`、`DOMException`。DOMException・Encoding・URL・Web Crypto は
   ブラウザーと同じ実装です。`fetch` はアプリ内のスレッドで通信し、待つ間も他の処理が進みます。
-- **型**：`nocturne` の型定義は `/node_modules/@types/nocturne` にあり、どのフォルダーの
-  プロジェクトからも見つかります。`js file.ts` は `--strict` で検査し、型の誤りがあれば実行しません
-  （出力は `/tmp/js-ts`、パッケージは元の場所から探します）。TypeScript には `tsgo` を入れたビルドが必要です。
+- **型**：`nocturne` の型定義は `C:\Nocturne\SDK\Types\nocturne` にあり、`js file.ts` と `js --init` の
+  `tsconfig.json` はそこを使います。`js file.ts` は `--strict` で検査し、型の誤りがあれば実行しません
+  （出力は一時フォルダーの `js-ts`、パッケージは元の場所から探します）。TypeScript には `tsgo` を入れたビルドが必要です。
 - **終了**：捕まえられなかった例外と処理されなかった Promise の拒否はスタックを表示して状態 1、
   終わらないトップレベルの `await` は状態 13。対話プロンプトでは表示だけして続けます。
 
@@ -544,7 +566,7 @@ js -e 'console.log(1 + 2)'  # -p は結果を表示、js - は入力から、js 
 
 ### WebAssembly
 
-`wasm2c` は WABT の変換器です。出力した C は、`/usr/include` と `/usr/src/wasm2c` のランタイムと一緒に
+`wasm2c` は WABT の変換器です。出力した C は、`C:\Nocturne\SDK\Include` と `C:\Nocturne\SDK\Source\wasm2c` のランタイムと一緒に
 OS の中の `tcc` でコンパイルできます。
 
 ## AI エージェント
@@ -562,17 +584,20 @@ C を書いて `tcc` でコンパイルし、実行し、壊れたところを�
 
 ```
 agent                                   # 対話（/help で命令の一覧）
-agent write a tetris clone in /data/projects/tetris and install it as /data/bin/tet
+agent write a tetris clone in C:\Users\User\Documents\tetris and install it as C:\Programs\Tet\tet
 agent -r                                # 前回の続き
 ```
 
-モデルへの指示は `/etc/agent/system.md`、会話とエージェントのメモは `/data/agent`、設定は `/data/etc/agent.conf` です。
+モデルへの指示は `C:\Nocturne\Agent\system.md` です。設定（`agent.conf`）、会話（`session.json`）、
+エージェントのメモ（`NOTES.md`）はユーザーのフォルダーの `AppData\Agent` にあります。
 - `endpoint` と `model`。
 - `max_tokens` と `context_limit`。
 - `reasoning`、`show_thinking`、`vision`。画像を受け取れないモデルでは `vision=0` にします。
 
-**API キー**：キーはデータディスクにだけ保存し、リポジトリーや起動イメージには入れません。
-- QEMU：`python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]`
+**API キー**：キーは使うディスクの C: の `AppData\Agent\agent.conf` にだけ保存し、リポジトリーやビルドした
+`nocturne.img` には入れません。
+- QEMU：`python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]`（`build\run.img` に書きます。
+  先に `build.ps1 run` で作ってください。別のディスクは `--img`）
 - Hyper-V：`hyperv.ps1 -Update -ApiKeyFile KEYFILE`
 - または `agent` を起動し、尋ねられたときに貼り付けます（`/key` で入れ直せます）。
 
@@ -582,20 +607,21 @@ agent -r                                # 前回の続き
 ## 制約
 
 驚かないように、Nocturne に無いもの：
-- **ユーザーと権限がありません。** アプリはそれぞれ自分のアドレス空間に隔離されますが、どのアプリもすべてのファイルを読み書きできます。
+- **ユーザーと権限がありません。** アプリはそれぞれ自分のアドレス空間に隔離されますが、システムの部分（`C:\Nocturne` と
+  付属アプリのフォルダー）を除き、どのアプリもすべてのファイルを読み書きできます。
 - **カーネルの仕事は CPU 0 が持ちます。** アプリのスレッドは全 CPU で動きますが、システムコール、割り込み、
   ドライバー、GUI、ネットワークのほとんどは CPU 0 で処理します。
 - **ウィンドウマネージャーはカーネルの中で動きます。**
 - **動的リンクとスワップはありません。** プログラムはすべて静的リンクです。
-- **ディスクは単純です。** ATA は PIO、NVMe は一度に 1 命令です。カーネルに AHCI のドライバーはありません。
-  FAT32 にはジャーナルがないので、書込み中の電源断でボリュームが不整合になることがあります。名前は 255 文字までです。
+- **ディスクは単純です。** AHCI と NVMe は一度に 1 命令、ATA は PIO です。ドライブは起動したディスクの C: だけで、
+  他のディスクや USB メモリーの中身は読めません。名前は UTF-8 で 255 バイトまでです。
 - **ネットワークの制約**は[上](#ネットワーク)のとおりです（IPv4 だけ、TLS 1.2 まで）。
 - **拡張セッションは素朴です。** 画面、キーボード、マウス、音、クリップボードの文字を運びます。画像やファイルのクリップボード、
   マイク、ドライブやプリンターの共有はありません。RDP サーバーは暗号化しませんが、ホストの Hyper-V ソケットからしか
   届かず、ネットワークには出ません。
 - **音は出力だけで、AC'97 か拡張セッションだけです。** HD Audio、USB オーディオ、録音はありません。
 - **GPU のドライバーはありません。** 描画は CPU です（WebGL もソフトウェア描画）。
-- **AI エージェントはモデルのコマンドを尋ねずに実行します。** VM の外には出ませんが、`/data` のファイルを消すことはあります。
+- **AI エージェントはモデルのコマンドを尋ねずに実行します。** VM の外には出ませんが、`C:\Users` のファイルを消すことはあります。
 - **ブラウザーは発展途上です。** 多くのサイトは表示できますが、動かない機能や遅いページがあります（[上](#web-ブラウザー)）。
 - **実機はまだ試し始めた段階です。** 確かめた機械は少なく、手順書もありません。
 
@@ -605,15 +631,17 @@ agent -r                                # 前回の続き
 boot/         limine.conf
 common/       カーネルとユーザーランドが共有する ABI（abi.h、gpu_abi.h）、2D 描画、Unifont のビットマップ
 kernel/src/   arch/（GDT、IDT、APIC、SMP、FPU、PAT、P ステート、Hyper-V の検出）、mm/、
-              sys/（アプリ、スケジューラー「継」、システムコール、イベント、プロファイラー）、
-              fs/（VFS、RAM、FAT32、initrd、チャンネル）、dev/（ATA、NVMe、xHCI と USB、PCI、ACPI、音、画面、入力）、
+              sys/（アプリ、スケジューラー「継」、システムコール、イベント、チャンネル、プロファイラー）、
+              fs/（ドライブ C: の格納庫：ボリューム、目録、名前空間、文書）、
+              dev/（AHCI、ATA、NVMe、xHCI と USB、PCI、ACPI、音、画面、入力）、
               gui/（ウィンドウマネージャー、デスクトップ）、net/（TCP/IP、e1000、tulip、RTL8125B）、
               hv/（VMBus と Hyper-V の装置）、rdp/（拡張セッションの RDP サーバー）
 user/         libc/（web/ はブラウザーのエンジン）、include/、apps/（アプリ、ブラウザーの補助処理、js の .js）
-rootfs/       initrd へ入れるファイル（/etc、/home、/node_modules、/usr/share/fonts など）
-ports/        Nocturne への移植の設定と差分（tcc、go、tsgo、lexbor、freetype、ffmpeg、mesa、wabt、virgl）
+rootfs/       C: へ入れるファイル（Nocturne\ はシステムの文書・フォント・型定義、Users\ は見本のファイル）
+host/         ホストの道具（store：C: の作成・読み書き・検査、limine：2 GiB を超えるディスクへの Limine の導入の補い）
+ports/        Nocturne への移植の設定と差分（tcc、go、rust、tsgo、lexbor、freetype、ffmpeg、mesa、nvidia、wabt、virgl）
 third_party/  取り込んだソース（下のクレジット）
-scripts/      イメージ・initrd・sysroot の作成、test.py、qtest.py、setkey.py、fatcheck.py、hv-*.ps1
+scripts/      起動ディスク（mkimage.sh、layout.py）と SDK（mksdk.sh）の作成、test.py、qtest.py、setkey.py、hv-*.ps1
 tests/        OS の中の試験（runtests.c とそれがコンパイルするプログラム）、ホストの検査、試験用の素材
 docs/         README の画像、設計の文書、作業の記録
 build.ps1     ビルドの入口
@@ -657,9 +685,9 @@ hyperv.ps1    Hyper-V の VM の作成
 - [TypeScript-Go](https://github.com/microsoft/typescript-go) 7.0.2（Apache-2.0、`TSGO=` を指定したときだけ）。
 - ビルド時だけ使う Python のモジュール Mako、MarkupSafe、PyYAML（`third_party/python-build`、イメージには入りません）。
 
-**フォント**（どれも SIL Open Font License 1.1。ライセンスは `rootfs/usr/share/fonts`）
+**フォント**（どれも SIL Open Font License 1.1。ライセンスは `rootfs/Nocturne/Fonts`）
 - [GNU Unifont Japanese](https://unifoundry.com/unifont/index.html) 18.0.01 のカーネル用ビットマップ。
-  原本・許諾・変換内容は `third_party/unifont/`、起動イメージ内の許諾は `/usr/share/licenses/unifont/`。
+  原本・許諾・変換内容は `third_party/unifont/`、起動ディスク内の許諾は `C:\Nocturne\Licenses\unifont\`。
   `python -X utf8 scripts/build.py bitmap-fonts` で作り直せます。
 - Maple Mono NF（未改変の TTF。各ファイルの SHA-256 は `MapleMono-manifest.json`）。
 - [Noto](https://fonts.google.com/noto) の Sans／Serif、Sans／Serif CJK JP、Color Emoji。

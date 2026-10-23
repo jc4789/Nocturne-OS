@@ -386,35 +386,13 @@ static enum http_url_result image_http_url(struct job *j, const char *raw,
     free(*canonical);*canonical=prepared;
     free(*origin); *origin = next_origin; return HTTP_URL_TUPLE;
 }
-static int hex(unsigned char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
+/* The path a file: URL names (n_path_from_url), in *out: 1; 0 invalid, -1 out of memory. */
 static int file_path(const char *url,char **out) {
-    *out=NULL;if(!url||strncmp(url,"file:///",8))return 0;
-    size_t length=strlen(url);if(length>UINT32_MAX||length>SIZE_MAX-2)return 0;
-    char *decoded=malloc(length+1);if(!decoded)return -1;
-    const char *p=url+7;size_t n=0;
-    while(*p&&*p!='?'&&*p!='#'){
-        unsigned char c=(unsigned char)*p++;
-        if(c=='%'){int a=hex((unsigned char)p[0]),b=p[0]?hex((unsigned char)p[1]):-1;if(a<0||b<0){free(decoded);return 0;}c=(unsigned char)((a<<4)|b);p+=2;}
-        if(!c||c<32||c==127||c=='\\'){free(decoded);return 0;}decoded[n++]=(char)c;
-    }
-    decoded[n]=0;char *path=malloc(n+2);if(!path){free(decoded);return -1;}
-    size_t at=1;path[0]='/';char *s=decoded;
-    while(*s){
-        while(*s=='/')s++;if(!*s)break;
-        char *end=strchr(s,'/');size_t l=end?(size_t)(end-s):strlen(s);
-        if(l==1&&s[0]=='.'){}
-        else if(l==2&&s[0]=='.'&&s[1]=='.'){
-            if(at==1){free(path);free(decoded);return 0;}
-            while(at>1&&path[at-1]!='/')at--;if(at>1)at--;
-        }else{if(at>1)path[at++]='/';memcpy(path+at,s,l);at+=l;}
-        s+=l;
-    }
-    path[at]=0;free(decoded);*out=path;return 1;
+    *out=NULL;size_t length=url?strlen(url):0;if(!url||length>UINT32_MAX)return 0;
+    char *path=malloc(length+4);if(!path)return -1;
+    n_result named=n_path_from_url(url,path,length+4);
+    if(named<0){free(path);return named==-N_ERR_NO_MEMORY?-1:0;}
+    *out=path;return 1;
 }
 static bool load_file_open(struct job *j,const char *path) {
     if(strcmp(j->method,"GET")||j->wire.body_len)return fail(j,"Local resources support GET only");
@@ -441,9 +419,8 @@ static bool load_file(struct job *j) {
     }else{
         parsed=file_path(j->document,&document_path);
         if(parsed!=1){fail(j,parsed<0?"Out of memory preparing local document URL":"Remote pages cannot open local files");goto out;}
-        char *slash=strrchr(document_path,'/');if(!slash){fail(j,"Invalid local document URL");goto out;}
-        size_t dl=(size_t)(slash-document_path)+1;
-        if(strncmp(path,document_path,dl)){fail(j,"Local resource escapes document directory");goto out;}
+        size_t dl=(size_t)(n_path_name(document_path)-document_path); /* the document's folder, with its '\' */
+        if(strncasecmp(path,document_path,dl)){fail(j,"Local resource escapes document directory");goto out;}
     }
     ok=load_file_open(j,path);
 out:
@@ -1957,7 +1934,7 @@ static int run_one(n_handle input,n_handle output) {
     j->cookies=webcookie_create();
     const char *cookie_psl_error="PSL open failed";
     if(j->cookies){
-        FILE *f=fopen("/usr/share/browser/public_suffix_list.dat","r");
+        FILE *f=fopen("C:\\Nocturne\\Web\\public_suffix_list.dat","r");
         if(f){
             char *text=malloc(WEBCOOKIE_PSL_MAX+1);
             if(!text)cookie_psl_error="PSL buffer allocation failed";

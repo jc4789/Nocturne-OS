@@ -462,16 +462,16 @@ int main(int argc, char **argv) {
     if (n_channel_pair(input) < 0 || n_channel_pair(output) < 0 || n_channel_pair(intr) < 0) return 1;
     const char *args[16] = {"sh"};
     uint32_t nargs = 1;
-    const char *prog = "/bin/sh";
+    const char *prog = "sh";
     if (argc > 1) {
         prog = argv[1];
         for (nargs = 0; nargs + 1 < (uint32_t)argc && nargs < 16; nargs++) args[nargs] = argv[nargs + 1];
     }
-    char path[256];
+    char path[1024];
     if (!find_program(prog, path, sizeof path)) strlcpy(path, prog, sizeof path);
     const char *f = getenv("FOLDER");
-    char folder[300];
-    snprintf(folder, sizeof folder, "FOLDER=%s", f && f[0] == '/' ? f : "/home");
+    char folder[4104];
+    snprintf(folder, sizeof folder, "FOLDER=%s", f && n_path_is_complete(f) ? f : n_user_folder());
     const char *settings[] = {folder, "TERMINAL=0 1 2", "INTERRUPTS=3"};
     int32_t handles[4] = {input[1], output[1], output[1], intr[1]};
     struct n_launch l = {.arguments = args, .settings = settings, .handles = handles, .argument_count = nargs,

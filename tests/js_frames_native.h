@@ -74,7 +74,7 @@ static void test_frame_ui(void){
     test_check("frame-ui-no-errors",fixture.errors==0 && fixture.js_failures==0);close_case();
 }
 static void test_frames(void){
-    FILE *file=fopen("/data/tests/js_frames_cases.js","rb");test_check("frame-case-source",file!=NULL);if(!file)return;
+    FILE *file=fopen("C:\\Tests\\js_frames_cases.js","rb");test_check("frame-case-source",file!=NULL);if(!file)return;
     fseek(file,0,SEEK_END);long n=ftell(file);rewind(file);
     char *source=n>=0 && n<65536?malloc((size_t)n+512):NULL;test_check("frame-case-memory",source!=NULL);
     if(!source){fclose(file);return;}size_t got=fread(source,1,(size_t)n,file);fclose(file);source[got]=0;

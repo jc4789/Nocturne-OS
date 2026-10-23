@@ -5,11 +5,12 @@
 #include <nocturne.h>
 #include <ui.h>
 #include <bearssl_hash.h>
+#include <webstorage.h>
 #include "form_autocomplete.h"
 #include "form_value.h"
 
-#define HISTORY_ROOT "/data/browser"
-#define HISTORY_PREF HISTORY_ROOT "/search-history.enabled"
+#define HISTORY_PATH 1024
+#define HISTORY_PREF "search-history.enabled"
 #define HISTORY_ORIGIN 192
 #define HISTORY_NAME 64
 #define HISTORY_VALUE 256
@@ -134,13 +135,22 @@ static void history_hash(const void *bytes, size_t n, uint8_t digest[32]) {
 }
 static uint32_t get32(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static void put32(uint8_t *p, uint32_t value) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(value >> (8 * i)); }
-static void history_path(int slot, char path[96]) { snprintf(path, 96, HISTORY_ROOT "/search-history.%d", slot); }
+/* The complete path of a document of the history, in the browser's profile folder; false without
+   the folder or when it does not fit. */
+static bool history_file(const char *name, char path[HISTORY_PATH]) {
+    const char *root = web_profile_folder(false);
+    return root && n_path_join(root, name, path, HISTORY_PATH) >= 0;
+}
+static bool history_path(int slot, char path[HISTORY_PATH]) {
+    char name[32]; snprintf(name, sizeof name, "search-history.%d", slot); return history_file(name, path);
+}
 static bool history_enabled(void) {
     /* Re-read for every native operation: disabling in another browser window
        must not leave an enabled process cache. Missing/invalid/I/O means off. */
     static const char marker[] = "Nocturne search history opt-in v1\n";
-    char bytes[sizeof marker];
-    n_handle h = n_document_open(HISTORY_PREF, N_DOCUMENT_READ); if (h < 0) return false;
+    char bytes[sizeof marker], pref[HISTORY_PATH];
+    if (!history_file(HISTORY_PREF, pref)) return false;
+    n_handle h = n_document_open(pref, N_DOCUMENT_READ); if (h < 0) return false;
     bool ok = n_document_size(h) == (n_result)(sizeof marker - 1) &&
         n_document_read_at(h, 0, bytes, sizeof marker - 1) == (n_result)(sizeof marker - 1);
     n_handle_close(h);
@@ -148,7 +158,8 @@ static bool history_enabled(void) {
 }
 /* 0 missing, 1 valid, -1 invalid/I/O. No unchecked raw struct serialization. */
 static int history_read(int slot, struct search_history *out) {
-    char path[96]; history_path(slot, path); void *data; size_t n;
+    char path[HISTORY_PATH]; void *data; size_t n;
+    if (!history_path(slot, path)) return -1;
     n_result loaded = n_document_load(path, &data, &n);
     if (loaded < 0) return loaded == -N_ERR_NOT_FOUND ? 0 : -1;
     uint8_t *bytes = data; uint8_t digest[32];
@@ -192,14 +203,16 @@ static struct search_history *history_load(void) {
     return a;
 }
 static bool history_directory(void) {
+    const char *root = web_profile_folder(false);
     struct n_entry entry;
-    n_result found = n_entry_info(HISTORY_ROOT, &entry);
+    if (!root) return false;
+    n_result found = n_entry_info(root, &entry);
     if (found >= 0) return entry.kind == N_KIND_FOLDER;
     if (found != -N_ERR_NOT_FOUND) return false;
-    n_result made = n_folder_create(HISTORY_ROOT);
+    n_result made = n_folder_create(root);
     if (made < 0 && made != -N_ERR_EXISTS) return false;
-    /* /data itself is never manufactured; it is the native persistent volume. */
-    return n_entry_info(HISTORY_ROOT, &entry) >= 0 && entry.kind == N_KIND_FOLDER;
+    /* Only the folder itself is made again; the user's AppData above it is not manufactured here. */
+    return n_entry_info(root, &entry) >= 0 && entry.kind == N_KIND_FOLDER;
 }
 static bool history_save(struct search_history *history) {
     if (history->generation == UINT64_MAX || !history_directory()) return false;
@@ -216,10 +229,10 @@ static bool history_save(struct search_history *history) {
         for (int j = 0; j < 3; j++) { memcpy(bytes + at, fields[j], sizes[j]); at += sizes[j]; }
     }
     history_hash(bytes + 40, n - 40, bytes + 8);
-    int slot = history->slot == 0 ? 1 : 0; char path[96]; history_path(slot, path);
+    int slot = history->slot == 0 ? 1 : 0; char path[HISTORY_PATH];
     /* The inactive slot is swapped in whole; a failed save leaves its older
        checksum snapshot, and the other slot stays the recovery copy. */
-    bool ok = n_document_save(path, bytes, n) >= 0;
+    bool ok = history_path(slot, path) && n_document_save(path, bytes, n) >= 0;
     if (ok) { history->generation = generation; history->slot = slot; }
     free(bytes); return ok;
 }
@@ -229,24 +242,26 @@ static bool history_remove(const char *path) {
     return removed >= 0 || removed == -N_ERR_NOT_FOUND;
 }
 static bool history_enable(bool enabled) {
-    if (!enabled) { popup_reset(); return history_remove(HISTORY_PREF); }
-    if (!history_directory()) return false;
+    char pref[HISTORY_PATH];
+    bool known = history_file(HISTORY_PREF, pref);
+    if (!enabled) { popup_reset(); return known && history_remove(pref); }
+    if (!known || !history_directory()) return false;
     static const char marker[] = "Nocturne search history opt-in v1\n";
-    bool ok = n_document_save(HISTORY_PREF, marker, sizeof marker - 1) >= 0 && history_enabled();
-    if (!ok) (void)history_remove(HISTORY_PREF); return ok;
+    bool ok = n_document_save(pref, marker, sizeof marker - 1) >= 0 && history_enabled();
+    if (!ok) (void)history_remove(pref); return ok;
 }
 static bool history_clear(void) {
     /* Disable first so other browser windows cannot offer old popup snapshots.
        A confirmed clear is removal of both native snapshots, not a tombstone
        that leaves old values available through recovery. */
     if (!history_enable(false)) return false;
-    bool ok = true; char path[96];
+    bool ok = true; char path[HISTORY_PATH];
     for (int slot = 0; slot < 2; slot++) {
-        history_path(slot, path);
-        if (!history_remove(path)) ok = false;
+        if (!history_path(slot, path) || !history_remove(path)) ok = false;
     }
     struct n_entry *entries = NULL;
-    n_result count = n_folder_entries(HISTORY_ROOT, &entries);
+    const char *root = web_profile_folder(false);
+    n_result count = root ? n_folder_entries(root, &entries) : -N_ERR_NOT_FOUND;
     if (count < 0) return ok && count == -N_ERR_NOT_FOUND;
     for (n_result i = 0; i < count; i++) {
         /* Earlier builds staged snapshots under these names; a confirmed clear
@@ -258,8 +273,8 @@ static bool history_clear(void) {
         bool digits = true;
         for (const char *p = tail; *p; p++) if (*p < '0' || *p > '9') digits = false;
         if (!digits) continue;
-        char temporary[384]; snprintf(temporary, sizeof temporary, HISTORY_ROOT "/%s", name);
-        if (!history_remove(temporary)) ok = false;
+        char temporary[HISTORY_PATH];
+        if (!history_file(name, temporary) || !history_remove(temporary)) ok = false;
     }
     free(entries);
     return ok;
@@ -350,9 +365,12 @@ void web_autocomplete_settings(void) {
             ui_node(&m, "text"); ui_str(&m, "text", "Native search completion"); ui_str(&m, "style", "heading"); ui_end(&m);
             ui_node(&m, "text"); ui_str(&m, "text", enabled ? "Search history is on" : "Search history is off");
             ui_num(&m, "colour", enabled ? t->success : t->textDim); ui_num(&m, "weight", 1); ui_end(&m);
-            static const char *const lines[] = {
+            char stored[HISTORY_PATH + 48];
+            const char *profile = web_profile_folder(false);
+            snprintf(stored, sizeof stored, "Stored only in %s; Clear removes every entry.", profile ? profile : "the browser's profile folder");
+            const char *const lines[] = {
                 "Stores typed search fields, separated by site and field name.",
-                "Stored only in /data/browser; Clear removes every entry.",
+                stored,
                 "On a search field: Down opens suggestions; Enter chooses.",
                 "Never type secrets in a search. Clear also disables history.",
             };
@@ -388,7 +406,7 @@ void web_autocomplete_settings(void) {
             }
             if (action >= 0) {
                 bool ok = action == 2 ? history_clear() : history_enable(action == 0);
-                strlcpy(message, !ok ? "Storage operation failed; verify the persistent /data volume." : action == 2 ?
+                strlcpy(message, !ok ? "Storage operation failed; verify the browser's data folder is writable." : action == 2 ?
                     "History removed and completion disabled." : action == 0 ? "Enabled. Past values are offered only on explicit selection." :
                     "Disabled. Stored history is kept until Clear is selected.", sizeof message);
                 break; /* the buttons say what it is now */

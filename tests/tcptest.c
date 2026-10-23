@@ -1,6 +1,6 @@
 /* tcptest: bulk TCP transfers against scripts/test.py's host server (10.0.2.2:PORT), clean and
    with simulated loss and reordering (SYS_NET_TEST), checking every byte.
-   usage: tcptest [PORT]   (default: the port in /data/tests/tcpport)
+   usage: tcptest [PORT]   (default: the port in C:\Tests\tcpport)
    Server protocol: "GET n seed\n" -> n pattern bytes; "PUT n seed\n" + n bytes -> "OK n\n" or "BAD off\n". */
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
     if (benchmark && (repeats < 2 || repeats > 100)) return 2;
     if (argc > 1 && !benchmark) port = atoi(argv[1]);
     else {
-        FILE *f = fopen("/data/tests/tcpport", "r");
+        FILE *f = fopen("C:\\Tests\\tcpport", "r");
         char line[16] = "";
         if (f) fgets(line, sizeof line, f), fclose(f);
         if (!(port = atoi(line))) {

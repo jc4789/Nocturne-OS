@@ -2,7 +2,7 @@
 
 NVIDIA の open-gpu-kernel-modules **615.78.08**（`version.mk` の `NVIDIA_VERSION`）から、
 RM のビルドに要る部分だけを取り込んだもの。Nocturne ではカーネルではなくユーザー空間の
-ドライバーアプリ `/bin/nvrm` として動かす（`ports/nvidia/`、台帳は `docs/nvidia/LEDGER.md`）。
+ドライバーアプリ `C:\Nocturne\System\nvrm` として動かす（`ports/nvidia/`、台帳は `docs/nvidia/LEDGER.md`）。
 
 **RM のソースは一行も変更していない。** 取り込み元（`D:\Programes\cloned repos\open-gpu-kernel-modules-615.78.08`）
 の `src/nvidia` と `src/common` の取り込んだ部分とは `diff -rq` で差がない（3126 ファイル、約 98 MB）。
@@ -48,7 +48,7 @@ OS ごとの違いは、RM が呼ぶ `os_*`／`nv_*` を `ports/nvidia/` で実�
     GPLv2 とは別系統の許諾的ライセンス。Nocturne のビルドでは clang の組込みヘッダーが先に使われうるが、取り込み済み。
 - 要約：GPLv2 専用のものは無い。MIT 以外は BSD-3-Clause（libspdm、nvSha256）、Apache-2.0
   （LLVM の stdatomic.h、元 Apache の protobuf 補助）。BSD-3-Clause の全文は `NOTICES` にまとめ、
-  `COPYING` とともに媒体の `/usr/share/licenses/nvidia-open/` へ入れる（Makefile）。
+  `COPYING` とともに起動ディスクの `C:\Nocturne\Licenses\nvidia-open\` へ入れる（Makefile）。
 
 ## `NV_BSD` について
 

@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
     }
     int nfiles = argc - first;
     for (int i = first; i < argc; i++) {
-        char path[512];
+        char path[1024];
         n_result r = n_path_complete(argv[i], path, sizeof path);
         n_handle h = r < 0 ? (n_handle)r : n_document_open(path, N_DOCUMENT_READ);
         if (h < 0) {

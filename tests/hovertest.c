@@ -17,7 +17,7 @@ static void receive(void *opaque, int level, const char *message) {
 }
 static void scroll(void *opaque,int *sx,int *sy) {(void)opaque;*sx=5;*sy=7;}
 int main(int argc,char **argv) {
-    const char *path=argc>1?argv[1]:"/src/tests/js_hover_cases.js";
+    const char *path=argc>1?argv[1]:"C:\\Tests\\js_hover_cases.js";
     FILE *f=fopen(path,"rb"); if(!f){printf("hovertest: missing %s\n",path);return 1;}
     fseek(f,0,SEEK_END);long size=ftell(f);rewind(f);
     if(size<0||size>65536){fclose(f);return 1;}

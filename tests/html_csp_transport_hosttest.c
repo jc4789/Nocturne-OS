@@ -36,7 +36,7 @@ int main(void){
     q.headers="Content-Type: application/csp-report\r\nAuthorization: not-authorized\r\n";CHECK(!webnet_submit(&net,&q,done,NULL));q.headers=WEBNET_CSP_REPORT_HEADERS;
     q.credentials=WEBNET_CREDENTIALS_INCLUDE;CHECK(!webnet_submit(&net,&q,done,NULL));q.credentials=WEBNET_CREDENTIALS_SAME_ORIGIN;
     q.redirect_error=false;CHECK(!webnet_submit(&net,&q,done,NULL));q.redirect_error=true;
-    q.url="file:///data/report";CHECK(!webnet_submit(&net,&q,done,NULL));q.url="https://collector.test/report";
+    q.url="file:///C:/Users/User/report";CHECK(!webnet_submit(&net,&q,done,NULL));q.url="https://collector.test/report";
     q.no_cors=true;CHECK(!webnet_submit(&net,&q,done,NULL));q.no_cors=false;
     while(net.queue){struct request *next=net.queue->next;request_free(net.queue);net.queue=next;}
     struct job report={.wire={.kind=WEBNET_REPORT,.credentials=WEBNET_CREDENTIALS_SAME_ORIGIN,.user_navigation=WEBNET_WIRE_REDIRECT_ERROR,.deadline=1000},.headers=WEBNET_CSP_REPORT_HEADERS,.document="https://worker.test/source.js",.origin="https://worker.test"};

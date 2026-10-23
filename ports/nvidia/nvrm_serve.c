@@ -257,8 +257,8 @@ n_result nvrm_serve(uint32_t pci_target) {
         cnd_destroy(&thread_ended); mtx_destroy(&threads_lock);
         return watched;
     }
-    /* Preserve the historical default rendezvous for existing /data/bin
-       binaries. Only one daemon owns this optional alias; every GPU always
+    /* Preserve the historical default rendezvous for programs built against
+       it. Only one daemon owns this optional alias; every GPU always
        retains its independent BDF endpoint. Alias failure never kills GPU #2. */
     n_handle legacy = n_channel_listen(NVRM_CHANNEL);
     if (legacy >= 0 && n_events_watch(events, legacy, N_EVENT_RECEIVABLE, LEGACY_LISTENER_TOKEN) < 0) {

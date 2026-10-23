@@ -7,6 +7,11 @@ NASM := nasm
 PY   := python
 
 BUILD := build
+# Where the system's parts are made before scripts/layout.py places them on C: every program, the
+# licences that go to C:\Nocturne\Licenses, and C:\Nocturne\SDK (scripts/mksdk.sh)
+PROGRAMS := $(BUILD)/programs
+LICENSES := $(BUILD)/licenses
+SDK      := $(BUILD)/sdk
 QEMU_MEMORY ?= 2048M
 QEMU_CPUS ?= 4
 QEMU_ACCEL ?= tcg
@@ -38,6 +43,24 @@ $(BUILD)/k/third_party/uacpi/%.o: third_party/uacpi/%.c
 	@mkdir -p $(dir $@)
 	@echo "  CC   $<"
 	@$(CC) $(filter-out -W%,$(KCFLAGS)) -w -c $< -o $@
+
+# The build host's tool for the volume (host/store/store.c): it makes the boot disk and puts the
+# system on drive C: with the kernel's own store code, host/store/shim standing in for the kernel.
+STORE_C := host/store/store.c $(addprefix kernel/src/fs/,names.c volume.c space.c catalog.c namespace.c) \
+           kernel/src/lib/crc32c.c
+$(BUILD)/host/store.exe: $(STORE_C) $(wildcard host/store/shim/*.h host/store/shim/*/*.h kernel/src/fs/*.h) \
+                         common/store_format.h common/abi.h
+	@mkdir -p $(dir $@)
+	@echo "  CC   $@"
+	@$(CC) -O2 -g -std=gnu11 -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -Ihost/store/shim -Ikernel/src \
+	    -Icommon $(STORE_C) -o $@
+
+# Limine's installer, built from the source in its release (tools/limine): the release's limine.exe
+# cannot reach past 2 GiB of the boot disk (host/limine/seek64.h)
+$(BUILD)/host/limine.exe: tools/limine/limine.c tools/limine/limine-bios-hdd.h host/limine/seek64.h
+	@mkdir -p $(dir $@)
+	@echo "  CC   $@"
+	@$(CC) -O2 -std=gnu99 -w -include host/limine/seek64.h -Itools/limine $< -o $@
 
 $(BUILD)/k/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
@@ -186,8 +209,8 @@ $(BUILD)/br/tls_roots.o: $(BUILD)/br/tls_roots.c
 
 APPS     := $(notdir $(basename $(wildcard user/apps/*.c)))
 CPP_APPS := $(notdir $(basename $(wildcard user/apps/*.cpp)))
-CPP_BINS := $(addprefix $(BUILD)/root/bin/,$(CPP_APPS))
-APP_BINS := $(addprefix $(BUILD)/root/bin/,$(APPS)) $(CPP_BINS)
+CPP_BINS := $(addprefix $(PROGRAMS)/,$(CPP_APPS))
+APP_BINS := $(addprefix $(PROGRAMS)/,$(APPS)) $(CPP_BINS)
 
 $(BUILD)/u/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -215,7 +238,7 @@ $(BUILD)/u/%.asm.o: %.asm
 
 # no archiver in the toolchain: lld's --start-lib gives archive semantics to plain objects
 # Keep C++/WABT as individual lazy archive members, including in the in-OS
-# sysroot. A C application or TinyCC itself does not pull the interpreter or
+# SDK. A C application or TinyCC itself does not pull the interpreter or
 # C++ ABI unless a reachable browser/JS object references it.
 WABT_SOURCES := $(shell $(PY) scripts/build_cxx.py wabt-sources)
 WABT_SRC := $(addprefix third_party/wabt/src/,$(WABT_SOURCES))
@@ -233,7 +256,7 @@ WASM_RT_INPUTS := $(wildcard third_party/wabt/wasm2c/* ports/wabt/include/*.h)
 CXX_RUNTIME_OBJ := $(addprefix $(BUILD)/cxx/libcxx/,algorithm.o hash.o memory.o string.o vector.o verbose_abort.o)
 WASM_BRIDGE := $(BUILD)/u/user/libc/web/js_wasm.cpp.o
 WASM_LINK := $(WASM_BRIDGE) $(BUILD)/u/user/libc/cxxabi.cpp.o $(WABT_OBJ) $(WASM2C_OBJ) $(CXX_RUNTIME_OBJ) $(BUILD)/tcc/libtcc.o $(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o
-# /bin/nvrm: NVIDIA's RM as a driver app (ports/nvidia/README.md). init starts it only when an
+# nvrm: NVIDIA's RM as a driver app (ports/nvidia/README.md). init starts it only when an
 # NVIDIA display function is present, so other machines just carry the file.
 include ports/nvidia/nvrm.mk
 include ports/mesa/mesa.mk
@@ -243,11 +266,11 @@ LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OB
     $(ZINK_OBJ) $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
 LIBC_RSP := $(BUILD)/libc-objects.list
 
-# Windowsのコマンド長上限を超えないよう、lldとsysrootに同じobject一覧を渡す。
+# Windowsのコマンド長上限を超えないよう、lldとSDKに同じobject一覧を渡す。
 $(LIBC_RSP): $(LIBC_LINK) Makefile
 	@$(file >$@,$(LIBC_LINK))
 
-$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+$(PROGRAMS)/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
@@ -257,7 +280,7 @@ $(BUILD)/u/tests/media_cenc_test.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_pa
 $(BUILD)/u/tests/media_cenc_test.o: user/libc/media_mse.c
 $(BUILD)/u/tests/nvk_contracttest.o: UCFLAGS += -Ithird_party/mesa/include
 $(BUILD)/tests/nvk_contracttest: private ULDFLAGS += --gc-sections
-# nvrm's request server exactly as /bin/nvrm links it, against the test's fake RM OS layer.
+# nvrm's request server exactly as nvrm links it, against the test's fake RM OS layer.
 $(BUILD)/u/tests/nvrm_servetest.o: UCFLAGS += $(NVRM_CLIENT_INC)
 $(BUILD)/tests/nvrm_servetest: private TEST_OBJ := $(NVRM_OUT)/os/nvrm_serve.o
 $(BUILD)/tests/nvrm_servetest: $(NVRM_OUT)/os/nvrm_serve.o
@@ -290,8 +313,8 @@ $(WASM_BRIDGE): user/libc/web/js_wasm.cpp $(BUILD)/wabt/libwabt.a $(CXX_HEADERS)
 $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o: third_party/wabt/src/tools/wasm2c.cc $(BUILD)/wabt/libwasm2c.a $(BUILD)/wabt/libwabt.a
 	@$(PY) scripts/build_cxx.py compile $< -o $@ -I ports/wabt/include -I third_party/wabt/include
 
-APP_BINS += $(BUILD)/root/bin/wasm2c
-$(BUILD)/root/bin/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/cxx.ld user/user.ld
+APP_BINS += $(PROGRAMS)/wasm2c
+$(PROGRAMS)/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/cxx.ld user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD++ $@"
 	@$(LD) $(patsubst user/user.ld,user/cxx.ld,$(ULDFLAGS)) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
@@ -307,45 +330,41 @@ ifneq ($(GO),)
 GOCACHE ?= $(CURDIR)/$(BUILD)/go-cache
 export GOCACHE
 GO_APPS  := $(notdir $(wildcard ports/go/apps/*))
-GO_BINS  := $(addprefix $(BUILD)/root/bin/,$(GO_APPS))
-GO_FILES := $(GO_BINS) $(BUILD)/root/usr/share/licenses/go/LICENSE $(BUILD)/root/usr/share/ca/ca-bundle.crt
-$(GO_BINS): $(BUILD)/root/bin/%: ports/go/apps/%/main.go $(wildcard ports/go/ui/*.go) ports/go/go.mod
+GO_BINS  := $(addprefix $(PROGRAMS)/,$(GO_APPS))
+GO_FILES := $(GO_BINS) $(LICENSES)/go/LICENSE
+$(GO_BINS): $(PROGRAMS)/%: ports/go/apps/%/main.go $(wildcard ports/go/ui/*.go) ports/go/go.mod ports/go/nocturne.patch
 	@mkdir -p $(dir $@)
 	@echo "  GO   $@"
 	@cd ports/go/apps/$* && GOOS=nocturne GOARCH=amd64 CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" main.go
-$(BUILD)/root/usr/share/licenses/go/LICENSE:
+$(LICENSES)/go/LICENSE:
 	@mkdir -p $(dir $@)
 	@cp "$$("$(GO)" env GOROOT)/LICENSE" $@
-# Go's crypto/x509 reads the trusted roots from this file.
-$(BUILD)/root/usr/share/ca/ca-bundle.crt: third_party/ca/ca-bundle.crt
-	@mkdir -p $(dir $@)
-	@cp $< $@
-# TSGO: the TypeScript-Go source (ports/tsgo/nocturne.patch applied) -> /bin/tsgo
+# TSGO: the TypeScript-Go source (ports/tsgo/nocturne.patch applied) -> tsgo
 ifneq ($(TSGO),)
-GO_FILES += $(BUILD)/root/bin/tsgo $(BUILD)/root/usr/share/licenses/typescript-go/LICENSE
-$(BUILD)/root/bin/tsgo: ports/tsgo/nocturne.patch
+GO_FILES += $(PROGRAMS)/tsgo $(LICENSES)/typescript-go/LICENSE
+$(PROGRAMS)/tsgo: ports/tsgo/nocturne.patch ports/go/nocturne.patch
 	@mkdir -p $(dir $@)
 	@echo "  GO   $@"
 	@cd "$(TSGO)" && GOOS=nocturne GOARCH=amd64 CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" ./cmd/tsgo
-$(BUILD)/root/usr/share/licenses/typescript-go/LICENSE:
+$(LICENSES)/typescript-go/LICENSE:
 	@mkdir -p $(dir $@)
 	@cp "$(TSGO)/LICENSE" "$(TSGO)/NOTICE.txt" $(dir $@)
 # The desktop apps written in TypeScript (user/apps/*.ts, the toolkit in
 # "nocturne/ui") are type-checked and compiled on the build host, so starting
-# one does not wait for tsgo: user/apps/settings.ts -> /bin/settings.js, run as
-# "js /bin/settings.js".
+# one does not wait for tsgo: user/apps/settings.ts -> C:\Nocturne\System\settings.js,
+# run as "js C:\Nocturne\System\settings.js".
 TS_APPS := $(notdir $(basename $(wildcard user/apps/*.ts)))
-TS_BINS := $(addprefix $(BUILD)/root/bin/,$(addsuffix .js,$(TS_APPS)))
+TS_BINS := $(addprefix $(PROGRAMS)/,$(addsuffix .js,$(TS_APPS)))
 GO_FILES += $(TS_BINS)
 $(BUILD)/host/tsgo.exe: ports/tsgo/nocturne.patch
 	@mkdir -p $(dir $@)
 	@echo "  GO   $@"
 	@cd "$(TSGO)" && GOOS= GOARCH= CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" ./cmd/tsgo
-$(BUILD)/apps-ts.stamp: $(BUILD)/host/tsgo.exe user/apps/tsconfig.json $(wildcard user/apps/*.ts) $(wildcard rootfs/node_modules/@types/nocturne/*.d.ts)
+$(BUILD)/apps-ts.stamp: $(BUILD)/host/tsgo.exe user/apps/tsconfig.json $(wildcard user/apps/*.ts) $(wildcard rootfs/Nocturne/SDK/Types/nocturne/*.d.ts)
 	@echo "  TSGO user/apps"
 	@$(BUILD)/host/tsgo.exe -p user/apps/tsconfig.json --pretty false
 	@touch $@
-$(TS_BINS): $(BUILD)/root/bin/%.js: $(BUILD)/apps-ts.stamp
+$(TS_BINS): $(PROGRAMS)/%.js: $(BUILD)/apps-ts.stamp
 	@mkdir -p $(dir $@)
 	@cp $(BUILD)/apps-ts/$*.js $@
 endif
@@ -353,33 +372,28 @@ endif
 
 include ports/rust/rust.mk
 
-NVRM_FILES := $(BUILD)/root/bin/nvrm $(BUILD)/root/usr/share/licenses/nvidia-open/COPYING \
-    $(BUILD)/root/usr/share/licenses/nvidia-open/NOTICES
-$(BUILD)/root/usr/share/licenses/nvidia-open/%: third_party/nvidia-open/%
+NVRM_FILES := $(PROGRAMS)/nvrm $(LICENSES)/nvidia-open/COPYING $(LICENSES)/nvidia-open/NOTICES
+# the licence texts of the third-party code in the system, as third_party has them
+$(LICENSES)/%: third_party/%
 	@mkdir -p $(dir $@)
 	@cp $< $@
-$(BUILD)/root/bin/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+LICENSE_FILES := $(LICENSES)/libcxx/LICENSE.TXT $(addprefix $(LICENSES)/,uacpi/LICENSE wabt/LICENSE wabt/UPSTREAM.json \
+    lexbor/LICENSE lexbor/NOTICE lexbor/UPSTREAM.json ffmpeg/LICENSE.md ffmpeg/COPYING.LGPLv2.1 ffmpeg/manifest.json \
+    ffmpeg/README.nocturne.md unifont/OFL-1.1.txt unifont/NOTICE.txt unifont/manifest.json)
+$(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
 
-$(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
+$(LICENSES)/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
 	@mkdir -p $(dir $@)
 	@cp $(BUILD)/cxx/LICENSE.libc++.txt $@
-
-$(BUILD)/root/usr/share/licenses/uacpi/LICENSE: third_party/uacpi/LICENSE
-	@mkdir -p $(dir $@)
-	@cp $< $@
-
-$(BUILD)/root/usr/share/licenses/wabt/LICENSE: third_party/wabt/LICENSE third_party/wabt/UPSTREAM.json
-	@mkdir -p $(dir $@)
-	@cp third_party/wabt/LICENSE third_party/wabt/UPSTREAM.json $(dir $@)
 
 $(BUILD)/u/%.cpp.o: %.cpp $(BUILD)/cxx/libc++.a $(CXX_HEADERS)
 	@echo "  CXX  $<"
 	@$(PY) scripts/build_cxx.py compile $< -o $@
 
-$(CPP_BINS): $(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.cpp.o $(BUILD)/u/user/libc/cxxabi.cpp.o $(BUILD)/cxx/libc++.a $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/user.ld user/cxx.ld
+$(CPP_BINS): $(PROGRAMS)/%: $(BUILD)/u/user/apps/%.cpp.o $(BUILD)/u/user/libc/cxxabi.cpp.o $(BUILD)/cxx/libc++.a $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/user.ld user/cxx.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD++ $@"
 	@$(LD) $(patsubst user/user.ld,user/cxx.ld,$(ULDFLAGS)) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< $(BUILD)/u/user/libc/cxxabi.cpp.o $(BUILD)/cxx/libc++.a --start-lib @$(LIBC_RSP) --end-lib -o $@
@@ -409,7 +423,7 @@ $(BUILD)/tcc/libtcc.o: $(wildcard $(TCC_DIR)/*.c $(TCC_DIR)/*.h) ports/tcc/confi
 	@echo "  CC   $(TCC_DIR)/libtcc.c"
 	@$(CC) $(TCC_CFLAGS) -c $(TCC_DIR)/libtcc.c -o $@
 
-$(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+$(PROGRAMS)/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
@@ -424,16 +438,14 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 	@mkdir -p $(dir $@)
 	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
 
-# headers and libraries for compiling inside Nocturne (an extra tree in the initrd)
-$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) $(TCCRT_OBJ) scripts/mksysroot.sh \
+# the SDK: headers and libraries for compiling inside Nocturne (C:\Nocturne\SDK)
+$(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) $(TCCRT_OBJ) scripts/mksdk.sh \
 		$(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h') \
 		$(LXB_HEADERS) ports/lexbor/include/memory.h third_party/lexbor/headers.list \
-		third_party/lexbor/LICENSE third_party/lexbor/NOTICE third_party/lexbor/UPSTREAM.json \
-		third_party/ffmpeg/LICENSE.md third_party/ffmpeg/COPYING.LGPLv2.1 third_party/ffmpeg/manifest.json third_party/ffmpeg/README.nocturne.md \
-		third_party/unifont/OFL-1.1.txt third_party/unifont/NOTICE.txt third_party/unifont/manifest.json \
-		common/abi.h common/gfx.h common/gpu_abi.h common/display_abi.h $(wildcard user/apps/*.c user/apps/*.js)
-	@echo "  SYSROOT"
-	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
+		common/abi.h common/gfx.h common/gpu_abi.h common/display_abi.h \
+		$(wildcard user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts)
+	@echo "  SDK"
+	@bash scripts/mksdk.sh $(SDK) $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images
@@ -442,67 +454,63 @@ $(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(
 all: image
 
 kernel: $(BUILD)/kernel.elf
-user: $(APP_BINS) $(NVRM_FILES) $(BUILD)/root/bin/tcc
-cxx: $(CPP_BINS) $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT
+user: $(APP_BINS) $(NVRM_FILES) $(PROGRAMS)/tcc
+cxx: $(CPP_BINS) $(LICENSES)/libcxx/LICENSE.TXT
 lexbor: $(LXB_OBJ)
 
-# NVIDIA GSP firmware for /bin/nvrm (docs/nvidia/LEDGER.md D9). It is never in git and never
-# distributed: a copy unpacked into local/ (ignored) goes into images built on this machine, and
-# images get none without it. NVIDIA_FIRMWARE= leaves it out explicitly.
+# NVIDIA GSP firmware for nvrm (docs/nvidia/LEDGER.md D9), C:\Nocturne\Firmware\NVIDIA\<version>.
+# It is never in git and never distributed: a copy unpacked into local/ (ignored) goes onto disks
+# built on this machine, and disks get none without it. NVIDIA_FIRMWARE= leaves it out explicitly.
 NVIDIA_FIRMWARE ?= local/firmware/nvidia/615.78.08
-NVIDIA_FW_PREFIX := usr/share/firmware/nvidia/615.78.08
+NVIDIA_FW_VERSION := 615.78.08
 NVIDIA_FW_STATE := $(BUILD)/nvidia-firmware.json
 # RM (osinit.c) needs both images of the GPU family: Ampere and Ada (the RTX 4070) use ga10x.
-# Content/selection changes update the stamp; an unchanged selection leaves its mtime alone.
-# Do not delete staging files while parsing make (including make -n). The packer excludes
-# old staged NVIDIA firmware and adds only this manifest's inputs, even when disabled.
+# Content/selection changes update the state; an unchanged selection leaves its mtime alone.
+# scripts/layout.py puts exactly the files it names on C:, none when it names none.
 .PHONY: nvidia-firmware-check
 nvidia-firmware-check:
-$(NVIDIA_FW_STATE): nvidia-firmware-check scripts/mkinitrd.py
-	@$(PY) scripts/mkinitrd.py --firmware-state "$@" --firmware-source "$(NVIDIA_FIRMWARE)" --firmware-prefix "$(NVIDIA_FW_PREFIX)"
+$(NVIDIA_FW_STATE): nvidia-firmware-check scripts/layout.py
+	@$(PY) scripts/layout.py --firmware-state "$@" --firmware-source "$(NVIDIA_FIRMWARE)" --firmware-version "$(NVIDIA_FW_VERSION)"
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/usr/share/licenses/uacpi/LICENSE $(GO_FILES) $(RUST_FILES) $(NVRM_FILES) $(NVIDIA_FW_STATE) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
-	@echo "  TAR  $@"
-	@$(PY) scripts/mkinitrd.py --firmware-manifest "$(NVIDIA_FW_STATE)" $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
+# everything scripts/layout.py puts on C:
+DISK_FILES := $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(NVRM_FILES) $(PROGRAMS)/tcc $(LICENSE_FILES) $(BUILD)/sdk.stamp \
+    $(BUILD)/sounds.stamp $(NVIDIA_FW_STATE) $(shell find rootfs -type f) third_party/ca/ca-bundle.crt
 
-# the music in /home/Music, made by a script
+# the music in the user's Music folder, made by a script
 $(BUILD)/sounds.stamp: scripts/mksounds.py
 	@echo "  GEN  sounds"
 	@rm -rf $(BUILD)/sounds
 	@$(PY) scripts/mksounds.py $(BUILD)/sounds
 	@touch $@
 
-image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar $(BUILD)/data-blank.vhdx
+# the boot disk, build/nocturne.img, its VHD and VHDX, and the live ISO (scripts/mkimage.sh)
+image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(BUILD)/host/limine.exe $(DISK_FILES)
 	@bash scripts/mkimage.sh
-	@bash scripts/mkdata.sh
 
-# the raw QEMU boot disk only, for test iterations (no VHD/VHDX/ISO)
-qemu-image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar
+# the raw QEMU boot disk only, for test iterations (no VHD/VHDX)
+qemu-image: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(BUILD)/host/limine.exe $(DISK_FILES)
 	@bash scripts/mkimage.sh --raw-only
 
-# an empty 2 GiB disk for Hyper-V, where Nocturne makes the volume / lives on (hyperv.ps1 copies it
-# once; it is dynamic, so tiny on disk)
-$(BUILD)/data-blank.vhdx: scripts/mkdata.sh
-	@rm -f $(BUILD)/data-blank.img
-	@MKDATA_BLANK=1 bash scripts/mkdata.sh $(BUILD)/data-blank.img 2048
-	@qemu-img convert -f raw -O vhdx -o subformat=dynamic $(BUILD)/data-blank.img $@
-	@rm -f $(BUILD)/data-blank.img
-
-run: image
-	@$(QEMU) -M pc -m $(QEMU_MEMORY) -smp $(QEMU_CPUS) -accel $(QEMU_ACCEL) $(QEMU_GRAPHICS) -drive file=$(BUILD)/nocturne.img,format=raw,if=ide,index=0 \
-		-drive file=$(BUILD)/data.img,format=raw,if=ide,index=1 -serial stdio -vga std \
+# QEMU on build/run.img, a disk of its own whose C:\Users stays from one run to the next while its
+# system is replaced by the new one (mkimage.sh --run)
+run: $(BUILD)/kernel.elf $(BUILD)/host/store.exe $(BUILD)/host/limine.exe $(DISK_FILES)
+	@bash scripts/mkimage.sh --run
+	@$(QEMU) -M pc -m $(QEMU_MEMORY) -smp $(QEMU_CPUS) -accel $(QEMU_ACCEL) $(QEMU_GRAPHICS) \
+		-device ahci,id=ahci -drive id=boot,file=$(BUILD)/run.img,format=raw,if=none \
+		-device ide-hd,drive=boot,bus=ahci.0,bootindex=0 -serial stdio -vga std \
 		-audiodev dsound,id=snd -device AC97,audiodev=snd
 
-# the in-OS test suite on a scratch data disk (see scripts/test.py; your data.img is not touched)
-test: image
+# the in-OS test suite on its own copy of build/nocturne.img (build/test.img, deleted after its store check;
+# see scripts/test.py)
+test: qemu-image
 	@$(PY) scripts/test.py
-test-quick: image
+test-quick: qemu-image
 	@$(PY) scripts/test.py --quick
-test-full: image
+test-full: qemu-image
 	@$(PY) scripts/test.py --full
 
-# keeps build/data.img: it is the persistent /data disk (your files, and the agent's key)
+# keeps build/run.img: `make run`'s disk, with C:\Users (your files, and the agent's key)
 clean:
-	find $(BUILD) -mindepth 1 -maxdepth 1 ! -name data.img -exec rm -rf {} +
+	find $(BUILD) -mindepth 1 -maxdepth 1 ! -name run.img -exec rm -rf {} +
 
 -include $(shell find $(BUILD) -name '*.d' 2>/dev/null)

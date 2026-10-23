@@ -42,20 +42,53 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 
 ## 3. 文書とフォルダー（`open`／`lseek`／`readdir`／`chdir` の置き換え）
 
-- 作業ディレクトリはない。パスは常に `/` からの完全指定。相対パスは
-  `N_ERR_INVALID`（`.` と `..` の要素はシステムが解決する）。シェルは自分の
-  「現在のフォルダー」を持ち、起動するアプリへ設定 `FOLDER=` として渡す（§5）。
-- 利用者が打った名前は `n_path_complete(name, out, cap)` で完全指定にする：`/` で
-  始まらない名前は設定 `FOLDER` の中（無ければ `/`）の名前とする。長さを返し、
-  収まらなければ `N_ERR_TOO_LARGE`。ISO Cの `fopen`／`remove`／`rename` もこれを使う。
+- ファイルシステムは一つ、ドライブも `C:` の一つだけ（ボリュームの形式は
+  `common/store_format.h`、実装は `kernel/src/fs`。二台目のドライブや装置ごとの別の
+  ファイルシステムは無い）。パスはドライブからの完全指定：`C:\Users\User\a.txt`。
+  区切りは `\`、`/` も同じに扱う。ドライブを省いた `\a`、`/a` も `C:\a`。ほかのドライブ文字は
+  `N_ERR_NOT_FOUND`。`.` と `..` の要素はシステムが名前の上で解決する。
+- 名前は 1〜255 バイトの UTF-8。制御文字、`\ / : * ? " < > |`、末尾の空白とピリオドは
+  使えない（`N_ERR_INVALID`。長すぎれば `N_ERR_NAME_TOO_LONG`）。名前は大文字・小文字を
+  区別せずに比べ（Unicode の単純な畳み込み。表はボリュームが持つので、どのカーネルでも同じ）、
+  付けられた形のまま保存・表示する。`n_entry_move` で同じ項目の大文字・小文字だけを変えられる。
+- 作業ディレクトリはない。カーネルは完全なパスだけを受け付け、`C:` だけ、`C:a`、`a` は
+  `N_ERR_INVALID`。シェルは自分の「現在のフォルダー」を持ち、起動するアプリへ設定
+  `FOLDER=` として渡す（§5）。
+- libc のパスの関数（`nocturne.h`）：
+  - `n_path_is_complete(path)`：ドライブの後（無ければ先頭）に区切りがあるか。`C:\…`、`\…`、
+    `/…` は完全。`C:` と `C:a` は現在のフォルダーとその中の `a`。
+  - `n_path_join(folder, name, out, cap)`：`name` を完全なフォルダー `folder`（完全でなければ
+    `C:\`）の中で取る。完全な `name` はそれだけで決まる。結果は常に `C:\a\b` の形
+    （大文字のドライブ、`\` 区切り、`.`／`..` 解決済み）。長さを返し、収まらなければ
+    `N_ERR_TOO_LARGE`。
+  - 利用者が打った名前は `n_path_complete(name, out, cap)` で完全指定にする：設定 `FOLDER`
+    （無いか完全でなければ `C:\`）の中で `n_path_join` する。ISO Cの `fopen`／`remove`／
+    `rename` もこれを使う。
+  - `n_path_name(path)`：最後の名前（根では `""`）。
+  - `n_path_from_url(url, out, cap)`／`n_path_to_url(path, out, cap)`：`file:` URL と
+    パスの変換（`file:///C:/Users/User/a%20b.html` ⇔ `C:\Users\User\a b.html`。ドライブの
+    無い `file:///Users/User` も C:）。
 - アプリが自分の現在のフォルダーを変えるのは `n_folder_set(name)`：名前を完全指定にし、
-  フォルダーであることを確かめてから、自分の設定 `FOLDER` を置き換える（以後の
-  `n_path_complete` と、libcが起動するアプリへ渡す `FOLDER` に効く）。
+  フォルダーであることを確かめてから（違えば `N_ERR_NOT_FOLDER`）、自分の設定 `FOLDER` を
+  置き換える（以後の `n_path_complete` と、libcが起動するアプリへ渡す `FOLDER` に効く）。
+- C: の構成（`common/abi.h` の `N_FOLDER_*`）：
+  - `C:\Nocturne`：システム。属性 SYSTEM の項目は、アプリは読めるが、それ自体も中身も
+    変えられない（作成・削除・名前変更・書込みは `N_ERR_DENIED`）。`System`（システムの
+    プログラム、`N_FOLDER_SYSTEM`）、`Fonts`、`Licenses`、`SDK`、`Certificates`、`Web`、
+    `Agent`、`Firmware` 等。`C:\Nocturne\Temp` はカーネルだけが使う（差し替え中の内容）。
+  - `C:\Programs`：アプリ（`N_FOLDER_PROGRAMS`）。アプリごとに一つのフォルダー。利用者は
+    アプリを入れられる。システムと一緒に入るアプリのフォルダーは SYSTEM。
+  - `C:\Users\<名前>`：利用者のフォルダー（設定 `USERFOLDER`、`n_user_folder()`）。アプリは
+    ここで始まる。`Desktop`、`Documents`、`Downloads`、`Music`、`Pictures`、`Videos`、
+    `AppData`。アプリのデータは `n_app_data_folder(name, out, cap)` が作って返す
+    `AppData\<name>`。`AppData\Temp` は一時フォルダー（設定 `TEMP`、`n_temp_folder()`）で、
+    起動のたびに空になる。
+  - UNIX の `/bin`、`/etc`、`/usr`、`/home`、`/tmp`、`/data` と、探索パス `PATH`、`HOME` は無い。
 - 丸ごとの操作（通常の用途）：
   - `n_document_load(path, void **data, size_t *size)`：内容を新しい `n_memory` ページで
     受け取る。`n_memory_release(*data, *size)` で返す。
   - `n_document_save(path, data, size)`：新しい内容を別に用意してから原子的に差し替える
-    （RAM：内容の付け替え、FAT：新しいクラスター列を書いてから目録の一項目を切替え）。
+    （ボリュームは書込み時複写なので、新しい内容のブロックを書いてから目録を切り替える）。
     書きかけの文書が見えることはない。
   - `n_document_append(path, data, size)`：ログ用の追記。無ければ作る。追記の間は
     文書の排他を持つので、同時に追記しても互いを上書きしない。
@@ -73,7 +106,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     書いていない書込み用ハンドルの保存は、文書のそれまでの記録（作成、名前変更、別の
     ハンドルの保存）が届くのを待つ。`READ` のハンドルの保存は何もせず待たない。
     `n_handle_close` は `N_COMMIT_WAIT` と同じ保存をしてから閉じる。`READ` のハンドルは
-    開いた時点で最後に保存された版を読み続ける（docs/nosfs.md §3）。
+    開いた時点で最後に保存された版を読み続ける。媒体への書込みは一つの確定（commit）単位で
+    原子的で、電源が切れても最後に確定した状態が残る（`common/store_format.h`）。
   - `n_document_read_at(h, offset, buf, n)`、`n_document_write_at(h, offset, buf, n)`、
     `n_document_size(h)`、`n_document_set_size(h, size)`。**共有カーソル（シーク位置）は無い**。
     `N_DOCUMENT_READ` のハンドルへの書込みは `N_ERR_DENIED`。
@@ -82,16 +116,18 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - 情報と操作：`n_entry_info(path, struct n_entry *)`、`n_folder_create(path)`、
   `n_entry_remove(path)`（空でないフォルダーは `N_ERR_NOT_EMPTY`）、
   `n_entry_move(from, to)`、`n_folder_list(path, struct n_entry *out, max, start)`（件数を返す）。
-- `n_entry_move` は既存の名前を決して上書きしない（`N_ERR_EXISTS`）。同じ装置内は
-  名前の付け替え、装置をまたぐ文書は丸ごと複写してから元を消す。装置をまたぐフォルダーは
-  `N_ERR_UNSUPPORTED`。フォルダーを自分の中へは移せない（`N_ERR_INVALID`）。
+- `n_entry_move` は名前の付け替えで、内容は動かない。既存の名前を決して上書きしない
+  （`N_ERR_EXISTS`。同じ項目の大文字・小文字の変更は除く）。フォルダーを自分の中へは
+  移せない（`N_ERR_INVALID`）。
 - ISO Cの `stdio` は文書ハンドルの上で自分の位置を持つ：`"r"`＝`READ`、`"r+"`＝`EDIT`、
   `"w"`＝既存なら `EDIT` で長さ0にし、無ければ `CREATE`（ISO Cの切り詰め）、`"wx"`＝`CREATE`、
   `"a"`＝`EDIT`／`CREATE` で、書出しのたびに排他を取って末尾へ書く。`fseek`／`ftell` は
   文書だけ（チャンネルは `N_ERR_WRONG_KIND`）。`remove`＝`n_entry_remove`。`rename` は
   `n_entry_move`、既存の文書が相手なら内容を丸ごと原子的に差し替えてから元を消す。
-  `tmpfile` は `/tmp` に作り、閉じるか終了で消す。標準の出力・記録が文書なら末尾へ追記する。
-- カーネルに作業ディレクトリは無い。`FOLDER` が無ければ `n_path_complete` は `/` を基準にする。
+  `tmpfile` は一時フォルダー（`n_temp_folder()`）に作り、閉じるか終了で消す。標準の出力・
+  記録が文書なら末尾へ追記する。終了（`exit`、`main` からの戻り）はISO Cのとおり全ストリームを
+  閉じたのと同じで、文書のストリームは書き出してから保存する（`N_COMMIT_START`：次に開く
+  アプリはその内容を読み、終了は媒体を待たない）。
 
 ## 4. チャンネル（`pipe`／標準入出力fd の置き換え）
 
@@ -155,9 +191,12 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - 設定は `"名前=値"` の形（`=` が無ければ `N_ERR_INVALID`）。起動されたアプリでは
     `n_settings`（NULL終端）として読め、`getenv` もこれを引く。
   - 引き渡すハンドルは、表の順に子アプリの 0, 1, 2, … 番になる（-1 は空き）。
-  - パスは完全指定。起動されたアプリは作業フォルダーを持たない。利用者の名前を
-    受け取るアプリのために、起動元は自分の現在のフォルダーを設定 `FOLDER=/…` で渡す
-    （§3の `n_path_complete`）。
+  - `path` は完全指定（§3）。名前だけのプログラムは libc の `find_program(name, out, n)` が
+    `N_FOLDER_SYSTEM`、次に `N_FOLDER_PROGRAMS` の各アプリのフォルダーで探す（`PATH` は無い）。
+    それ以外の名前は `n_path_complete` で完全指定にする。
+  - 起動されたアプリは作業フォルダーを持たない。利用者の名前を受け取るアプリのために、
+    起動元は自分の現在のフォルダーを設定 `FOLDER=C:\…` で渡す（§3の `n_path_complete`）。
+    カーネルは、起動元が渡さなければ `USERFOLDER` と `TEMP` を加える。
 - 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, timeout_ms, int *status)` で
   直接待つこともできる（-1 は無期限、0 は待たずに `N_ERR_NOT_READY`、期限切れは
   `N_ERR_TIMEOUT`）。ゾンビの回収は無く、最後のハンドルを閉じれば記録は消える。
@@ -243,7 +282,7 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - 主音量：`n_audio_volume()`、`n_audio_set_volume(0〜100)`（消音も解く）。
 - システムログ：`n_system_log(buf, cap)` で読み、`n_system_log_open()` の
   ハンドルへ `n_channel_send` で書く。
-- アプリの中の装置ドライバー（例：NVIDIA の資源管理 `/bin/nvrm`、`docs/nvidia/LEDGER.md`）：
+- アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/nvidia/LEDGER.md`）：
   - `n_pci_claim(bus, dev, func)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。呼べるのは
     init だけで、init は起動するドライバーアプリへハンドルを渡す。カーネルのドライバーが使う
     機能と、既に権利のある機能は `N_ERR_BUSY`。起動オプション `noappdrivers` で全部断る。最後のハンドルが閉じると、カーネルは
@@ -453,7 +492,7 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 ファイル操作の確認を行う。旧ABIの削除は、全利用箇所が新ABIへ移った後に限る。
 
 段階5で削除した番号（1〜18、22〜25、30〜32、35〜37、57、59〜63、90）は欠番のまま
-再利用しない。残る番号は意味を変えない（`/data/bin` のOS内で作ったプログラムのため）。
+再利用しない。残る番号は意味を変えない（OS内で tcc 等が作ったプログラムのため）。
 旧番号を使って作ったプログラムは作り直しが要る。新たに加えたもの：
 
 - `SYS_WIN_RECEIVE`（窓、`struct gui_event *out`、最大数、`timeout_ms`）：待ち行列から
@@ -471,10 +510,10 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 「ボタン3が押された」のようなイベントを受け取る。ホバー、押下、フォーカス、カーソル、
 スクロール、動き、配色はエンジン側が持つ。言語ごとに部品を作り直さない：
 
-- C と `/bin/js`（TypeScript／JavaScript）は同じプロセス内で `ui_session_send`／
+- C と `js`（TypeScript／JavaScript）は同じプロセス内で `ui_session_send`／
   `ui_session_peek` を呼ぶ。
 - C を呼べないプログラム（Go 等）は、メッセージチャンネルの一端をハンドル3として
-  `/bin/uihost` を起動し、同じバイト列をチャンネルの一メッセージずつ送受信する。
+  `C:\Nocturne\System\uihost` を起動し、同じバイト列をチャンネルの一メッセージずつ送受信する。
   `uihost` は自分の端が閉じられると終わる。
 
 数値はすべてリトルエンディアン。f64 は IEEE の倍精度、str は u32 の長さ＋UTF-8。

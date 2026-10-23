@@ -1,0 +1,6 @@
+{
+  "name": "@types/nocturne",
+  "version": "1.0.0",
+  "description": "TypeScript declarations for the built-in \"nocturne\" module of js, the JavaScript runtime of Nocturne OS",
+  "types": "index.d.ts"
+}

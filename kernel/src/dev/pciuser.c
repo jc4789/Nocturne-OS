@@ -1,5 +1,5 @@
 /* Drivers in apps (docs/nocturne-native-abi.md §9). Only init claims a PCI function; the claim
-   is a vnode whose handles init passes to the driver app it launches. The app reads config space
+   is an object whose handle init passes to the driver app it launches. The app reads config space
    (its device, the bridges above it with their devices, the host bridges), writes its own, maps BARs as
    shared objects (syscall.c) and waits for its message-signalled interrupts on the handle.
    The kernel keeps what decides where memory and interrupts go: BAR registers and the MSI and
@@ -22,10 +22,10 @@
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pciuser.h"
-#include "fs/vfs.h"
 #include "gui/wm.h"
 #include "mm/heap.h"
 #include "sys/proc.h"
+#include "sys/object.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 
@@ -40,11 +40,11 @@ struct guard {
 
 struct pci_claim {
     struct pci_device *d;
-    struct vnode *v;
+    struct object object; /* what the claim's handle reaches */
     volatile uint32_t pending; /* message n arrived; cleared by take */
     struct wait_queue wq;
     unsigned vector_base, vectors;
-    unsigned refs;   /* the vnode and every BAR or DMA object made through it */
+    unsigned refs;   /* the object and every BAR or DMA object made through it */
     bool released;   /* the last handle closed: BAR objects are revoked, the function stopped */
     bool dma_unsafe; /* the ended claim's IOMMU block was not confirmed: retain its DMA pages */
     unsigned screen_holds; /* n_pci_hold_screen nesting; given back when the claim ends */
@@ -68,7 +68,7 @@ static void claim_isr(struct regs *r) {
     if (!c) return;
     c->pending |= 1u << (r->vector - c->vector_base);
     wq_wake_all(&c->wq);
-    vfs_poll_notify(c->v);
+    object_notify(&c->object);
 }
 
 static void interrupts_off(struct pci_claim *c) {
@@ -85,12 +85,11 @@ static void interrupts_off(struct pci_claim *c) {
     /* A waiter must observe NOT_READY instead of sleeping forever after the
        driver disables its last interrupt (including an infinite take). */
     wq_wake_all(&c->wq);
-    vfs_poll_notify(c->v);
+    object_notify(&c->object);
 }
 
-static bool claim_can_read(struct vnode *v, struct file *f) {
-    (void)f;
-    return ((struct pci_claim *)v->priv)->pending != 0;
+static uint32_t claim_ready(struct handle *h) {
+    return ((struct pci_claim *)h->object->priv)->pending ? N_EVENT_RECEIVABLE : 0;
 }
 
 /* The memory BAR the boot screen is drawn through, or -1. */
@@ -218,8 +217,8 @@ static void screen_release(void) {
    clear and no pending non-posted request do not prove that posted requests using other TCs,
    relaxed ordering or ID ordering have arrived (PCIe 6.0, 6.4). Keep the claim's remaining DMA
    pages even after a clean driver close; FLR success later is not proof of their drain either. */
-static void claim_release(struct vnode *v) {
-    struct pci_claim *c = v->priv;
+static void claim_release(struct object *o) {
+    struct pci_claim *c = o->priv;
     struct pci_device *d = c->d;
     c->released = true;
     shared_revoke_claim(c); /* no process reaches the registers any more */
@@ -260,16 +259,15 @@ static void claim_release(struct vnode *v) {
         screen_release();
     d->claimed = false;
     kprintf("pci: %02x:%02x.%u released\n", d->bus, d->dev, d->func);
-    kfree(v);
     claim_drop(c);
 }
-static struct vnode_ops claim_ops = {.can_read = claim_can_read, .release = claim_release};
+static const struct object_ops claim_ops = {.kind = N_KIND_PCI, .ready = claim_ready, .release = claim_release};
 
-bool pci_user_is_claim(struct file *f) { return f && f->vn->ops == &claim_ops; }
-static struct pci_claim *claim_of(struct file *f) { return pci_user_is_claim(f) ? f->vn->priv : NULL; }
+bool pci_user_is_claim(struct handle *h) { return handle_is(h, &claim_ops); }
+static struct pci_claim *claim_of(struct handle *h) { return pci_user_is_claim(h) ? h->object->priv : NULL; }
 
-struct pci_claim *pci_user_hold(struct file *f) {
-    struct pci_claim *c = claim_of(f);
+struct pci_claim *pci_user_hold(struct handle *h) {
+    struct pci_claim *c = claim_of(h);
     if (c) c->refs++;
     return c;
 }
@@ -484,7 +482,7 @@ static bool claim_recover(struct pci_claim *c) {
     return !(current_task && current_task->killed);
 }
 
-int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out) {
+int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct handle **out) {
     struct task *t = task_process();
     /* Boot options: noappdrivers keeps every function with the kernel; appdrivers=any lets any
        app claim (tests drive QEMU's edu device from a program they compile) */
@@ -496,16 +494,10 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     /* A bridge's registers route other devices' memory, buses and resets. */
     if (d->cls == 0x06) return -N_ERR_DENIED;
     if (d->kernel_owned || d->claimed) return -N_ERR_BUSY;
-    struct vnode *v = kzalloc(sizeof *v);
     struct pci_claim *c = kzalloc(sizeof *c);
-    if (!v || !c) { kfree(v); kfree(c); return -N_ERR_NO_MEMORY; }
-    strlcpy(v->name, "pci", sizeof v->name);
-    v->type = VT_PCI;
-    v->ops = &claim_ops;
-    v->priv = c;
-    v->unlinked = true; /* the claim ends when its last handle closes */
+    if (!c) return -N_ERR_NO_MEMORY;
+    object_init(&c->object, &claim_ops, c); /* the claim ends when its last handle closes */
     c->d = d;
-    c->v = v;
     c->refs = 1;
     d->claimed = true; /* reserved across the resets' waits */
     /* From here the function reaches only the DMA objects made through the claim. */
@@ -513,7 +505,6 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
     if (r < 0) {
         d->claimed = false;
         kfree(c);
-        kfree(v);
         return r;
     }
     if (!claim_recover(c)) {
@@ -522,24 +513,22 @@ int64_t pci_user_claim(uint8_t bus, uint8_t dev, uint8_t func, struct file **out
         if (c->domain) iommu_domain_free(c->domain);
         d->claimed = false;
         kfree(c);
-        kfree(v);
         return -N_ERR_NOT_READY;
     }
     guards_init(c); /* pending FLR is complete: capability offsets/control now describe the handle */
     /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
        decoding off under a running function, and the boot screen may be drawn through it. */
-    struct file *f = vfs_open_vnode(v, O_RDWR);
-    if (!f) {
+    struct handle *h = handle_open(&c->object, true);
+    if (!h) {
         if (c->domain) iommu_domain_free(c->domain);
         d->claimed = false;
         kfree(c);
-        kfree(v);
         return -N_ERR_NO_MEMORY;
     }
     kprintf("pci: %02x:%02x.%u (%04x:%04x) claimed by pid %d%s\n", bus, dev, func, d->vendor, d->device, t->pid,
             c->domain ? "" : iommu_active() ? "; the IOMMU cannot isolate it: its DMA reaches all of memory"
                                             : "; no IOMMU isolates it: its DMA reaches all of memory");
-    *out = f;
+    *out = h;
     return 0;
 }
 
@@ -548,8 +537,8 @@ static unsigned msix_table_size(const struct pci_device *d) {
     return cap ? ((pci_read32(d->bus, d->dev, d->func, cap) >> 16) & 0x7FF) + 1 : 0;
 }
 
-int64_t pci_user_info(struct file *f, struct n_pci_function *out) {
-    struct pci_claim *c = claim_of(f);
+int64_t pci_user_info(struct handle *h, struct n_pci_function *out) {
+    struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     struct pci_device *d = c->d;
     memset(out, 0, sizeof *out);
@@ -591,8 +580,8 @@ int64_t pci_user_info(struct file *f, struct n_pci_function *out) {
     return 0;
 }
 
-int64_t pci_user_hold_screen(struct file *f, bool hold) {
-    struct pci_claim *c = claim_of(f);
+int64_t pci_user_hold_screen(struct handle *h, bool hold) {
+    struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (screen_bar(c->d) < 0) return -N_ERR_NOT_FOUND;
     if (hold) {
@@ -624,8 +613,8 @@ static bool may_read(const struct pci_device *d, const struct pci_device *target
     return is_host_bridge(target);
 }
 
-int64_t pci_user_config_read(struct file *f, uint32_t target, uint32_t offset, uint32_t width) {
-    struct pci_claim *c = claim_of(f);
+int64_t pci_user_config_read(struct handle *h, uint32_t target, uint32_t offset, uint32_t width) {
+    struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!config_access_ok(offset, width)) return -N_ERR_INVALID;
     struct pci_device *t = c->d;
@@ -663,8 +652,8 @@ static bool bar_restore(const struct pci_device *d, uint32_t offset, uint32_t wi
            value == d->bar[(offset - 0x10) / 4];
 }
 
-int64_t pci_user_config_write(struct file *f, uint32_t offset, uint32_t width, uint32_t value) {
-    struct pci_claim *c = claim_of(f);
+int64_t pci_user_config_write(struct handle *h, uint32_t offset, uint32_t width, uint32_t value) {
+    struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!config_access_ok(offset, width)) return -N_ERR_INVALID;
     struct pci_device *d = c->d;
@@ -676,8 +665,8 @@ int64_t pci_user_config_write(struct file *f, uint32_t offset, uint32_t width, u
     return 0;
 }
 
-int64_t pci_user_bar(struct file *f, uint32_t bar, uint64_t *address, uint64_t *size) {
-    struct pci_claim *c = claim_of(f);
+int64_t pci_user_bar(struct handle *h, uint32_t bar, uint64_t *address, uint64_t *size) {
+    struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (bar > 5) return -N_ERR_INVALID;
     if (c->d->bar[bar] & 1) return -N_ERR_UNSUPPORTED; /* I/O ports */
@@ -689,8 +678,8 @@ int64_t pci_user_bar(struct file *f, uint32_t bar, uint64_t *address, uint64_t *
     *size = s;
     return 0;
 }
-bool pci_user_bar_prefetchable(struct file *f, uint32_t bar) {
-    struct pci_claim *c=claim_of(f);
+bool pci_user_bar_prefetchable(struct handle *h, uint32_t bar) {
+    struct pci_claim *c=claim_of(h);
     return c && bar<6 && !(c->d->bar[bar]&1) && (c->d->bar[bar]&8);
 }
 
@@ -700,8 +689,8 @@ static unsigned floor_pow2(unsigned n) {
     return p;
 }
 
-int64_t pci_user_interrupts(struct file *f, uint32_t count) {
-    struct pci_claim *c = claim_of(f);
+int64_t pci_user_interrupts(struct handle *h, uint32_t count) {
+    struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     struct pci_device *d = c->d;
     interrupts_off(c);
@@ -737,8 +726,8 @@ int64_t pci_user_interrupts(struct file *f, uint32_t count) {
     return n;
 }
 
-int64_t pci_user_interrupt_take(struct file *f, int64_t timeout_ms) {
-    struct pci_claim *c = claim_of(f);
+int64_t pci_user_interrupt_take(struct handle *h, int64_t timeout_ms) {
+    struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     uint64_t give_up = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
     for (;;) {

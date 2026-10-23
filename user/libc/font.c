@@ -155,11 +155,15 @@ font_t *font_open_memory(const void *data,size_t length) {
     return f;
 }
 
-static font_t *open_bundled(const char *name) {
+/* The complete path of a bundled face: in C:\Nocturne\Fonts unless the launch setting FONT_DIR names another folder. */
+static bool bundled_path(const char *name, char *path, size_t size) {
     const char *dir = getenv("FONT_DIR");
-    char path[256];
-    snprintf(path, sizeof path, "%s/%s", dir && *dir ? dir : "/usr/share/fonts", name);
-    return font_open(path);
+    return n_path_join(dir && *dir ? dir : "C:\\Nocturne\\Fonts", name, path, size) >= 0;
+}
+
+static font_t *open_bundled(const char *name) {
+    char path[1024];
+    return bundled_path(name, path, sizeof path) ? font_open(path) : NULL;
 }
 
 /* A bundled color face is read through a file stream: FreeType extracts only
@@ -172,9 +176,8 @@ static unsigned long file_stream_read(FT_Stream s, unsigned long offset, unsigne
 }
 
 static font_t *open_bundled_stream(const char *name) {
-    const char *dir = getenv("FONT_DIR");
-    char path[256];
-    snprintf(path, sizeof path, "%s/%s", dir && *dir ? dir : "/usr/share/fonts", name);
+    char path[1024];
+    if (!bundled_path(name, path, sizeof path)) return NULL;
     if (!next_font_id || (!web_font_library && FT_Init_FreeType(&web_font_library))) return NULL;
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;

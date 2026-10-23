@@ -14,7 +14,7 @@ document.getElementById('run').addEventListener('click',async()=>{
     try{const r=await fetch('/api/redirect?url=/api/json');result('redirect final URL',r.redirected&&r.url.includes('/api/json'));}catch(e){result('redirect',false,e.message);}
     try{await fetch('/api/infinite-redirect');result('redirect loop rejected',false);}catch(e){result('redirect loop rejected',true);}
     try{await fetch('/api/oversize');result('16 MiB response limit',false);}catch(e){result('16 MiB response limit',true);}
-    try{await fetch('file:///data/secret');result('remote page cannot read local file',false);}catch(e){result('remote page cannot read local file',true);}
+    try{await fetch('file:///C:/Users/User/secret');result('remote page cannot read local file',false);}catch(e){result('remote page cannot read local file',true);}
     try{await fetch('/api/json',{headers:{Host:'forbidden.example'}});result('forbidden request header rejected',false);}catch(e){result('forbidden request header rejected',true);}
 });
 document.getElementById('abort').addEventListener('click',async()=>{

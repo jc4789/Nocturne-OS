@@ -31,6 +31,14 @@ struct blkdev *blk_get(int i);
 int blk_read(struct blkdev *d, uint64_t lba, uint32_t n, void *buf);
 int blk_write(struct blkdev *d, uint64_t lba, uint32_t n, const void *buf);
 int blk_persist(struct blkdev *d);
+/* For a driver whose device moves blocks of d->block bytes: a request in 512-byte sectors as moves
+   of whole blocks, at most `most` at a time. move(ctx, write, block, n, buf) moves n blocks between
+   the device and buf: `bounce`, or the caller's memory itself where that holds whole blocks and
+   `direct` is set (the device reaches any kernel memory). Blocks a write covers only partly are
+   read into `bounce` first. Returns 0 or -N_ERR_IO. */
+typedef int (*blk_move_fn)(void *ctx, bool write, uint64_t block, unsigned n, uint8_t *buf);
+int blk_by_blocks(struct blkdev *d, bool write, uint64_t lba, uint32_t count, uint8_t *p, uint8_t *bounce,
+                  unsigned most, bool direct, blk_move_fn move, void *ctx);
 /* Power changes: blk_hold waits for every transfer under way to end, and from then on only the
    calling thread reaches the disks; everyone else waits in blk_read/blk_write until blk_release.
    Across a sleep no request is lost with the controller's state, and between a hibernation

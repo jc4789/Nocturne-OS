@@ -117,10 +117,10 @@ index 00000000..d79ef614
 +}
 diff --git a/src/crypto/x509/root_nocturne.go b/src/crypto/x509/root_nocturne.go
 new file mode 100644
-index 00000000..5d47e061
+index 00000000..3a787835
 --- /dev/null
 +++ b/src/crypto/x509/root_nocturne.go
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,20 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -129,29 +129,105 @@ index 00000000..5d47e061
 +
 +package x509
 +
-+// Possible certificate files; stop after finding one. Nocturne installs
-+// the roots it trusts in /usr/share/ca; /data/etc/certs holds additions.
++// Possible certificate files; stop after finding one. Nocturne keeps the
++// roots it trusts, the ones its browser trusts, in C:\Nocturne\Certificates.
++// SSL_CERT_FILE and SSL_CERT_DIR name others.
 +var certFiles = []string{
-+	"/usr/share/ca/ca-bundle.crt",
++	`C:\Nocturne\Certificates\ca-bundle.crt`,
 +}
 +
-+var certDirectories = []string{
-+	"/data/etc/certs",
-+}
++var certDirectories []string
 +
 +func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate, err error) {
 +	return nil, nil
 +}
-diff --git a/src/internal/filepathlite/path_unix.go b/src/internal/filepathlite/path_unix.go
-index e31f1ae7..e2429191 100644
---- a/src/internal/filepathlite/path_unix.go
-+++ b/src/internal/filepathlite/path_unix.go
+diff --git a/src/internal/filepathlite/path_nocturne.go b/src/internal/filepathlite/path_nocturne.go
+new file mode 100644
+index 00000000..961e0f25
+--- /dev/null
++++ b/src/internal/filepathlite/path_nocturne.go
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package filepathlite
++
++import (
++	"internal/stringslite"
++	"syscall"
++)
++
++// Nocturne paths are drive paths on its one drive (syscall.FullPath):
++// "C:\Users\User\a.txt", with '\' or '/' between names.
++const (
++	Separator     = '\\' // OS-specific path separator
++	ListSeparator = ';'  // OS-specific path list separator
++)
++
++func IsPathSeparator(c uint8) bool {
++	return syscall.IsPathSeparator(c)
++}
++
++func isLocal(path string) bool {
++	if path == "" || IsPathSeparator(path[0]) {
++		return false
++	}
++	// A colon only follows a drive: no name holds one.
++	if stringslite.IndexByte(path, ':') >= 0 {
++		return false
++	}
++	path = Clean(path)
++	return path != ".." && !stringslite.HasPrefix(path, `..\`)
++}
++
++func localize(path string) (string, error) {
++	for i := 0; i < len(path); i++ {
++		switch path[i] {
++		case ':', '\\', 0:
++			return "", errInvalidPath
++		}
++	}
++	return FromSlash(path), nil
++}
++
++// IsAbs reports whether the path is absolute: whether a separator begins
++// it or follows its drive ("C:\a" or "\a"; "C:a" is in the current folder).
++func IsAbs(path string) bool {
++	return syscall.PathIsComplete(path)
++}
++
++// volumeNameLen returns the length of the path's drive ("C:"), or 0.
++func volumeNameLen(path string) int {
++	return syscall.PathDriveLength(path)
++}
++
++// postClean keeps Clean from giving a relative path a drive: "a/../c:b"
++// becomes `.\c:b`, not "c:b".
++func postClean(out *lazybuf) {
++	if out.volLen != 0 || out.buf == nil {
++		return
++	}
++	for _, c := range out.buf {
++		if IsPathSeparator(c) {
++			break
++		}
++		if c == ':' {
++			out.prepend('.', Separator)
++			return
++		}
++	}
++}
+diff --git a/src/internal/filepathlite/path_nonwindows.go b/src/internal/filepathlite/path_nonwindows.go
+index c9c4c02a..8b3e7e12 100644
+--- a/src/internal/filepathlite/path_nonwindows.go
++++ b/src/internal/filepathlite/path_nonwindows.go
 @@ -2,7 +2,7 @@
  // Use of this source code is governed by a BSD-style
  // license that can be found in the LICENSE file.
  
--//go:build unix || (js && wasm) || wasip1
-+//go:build unix || (js && wasm) || nocturne || wasip1
+-//go:build !windows
++//go:build !windows && !nocturne
  
  package filepathlite
  
@@ -1093,10 +1169,10 @@ index 00000000..fd52061b
 +}
 diff --git a/src/net/lookup_nocturne.go b/src/net/lookup_nocturne.go
 new file mode 100644
-index 00000000..56f32a49
+index 00000000..08b06369
 --- /dev/null
 +++ b/src/net/lookup_nocturne.go
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,157 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1110,9 +1186,13 @@ index 00000000..56f32a49
 +)
 +
 +// Nocturne resolves addresses in the system (NetDNSAll, IPv4, with one
-+// cache for every app); names in hostsFilePath come first. Other records
-+// go through Go's DNS client to the same resolver (dnsconfig_nocturne.go),
-+// as do all lookups of a Resolver with PreferGo or Dial.
++// cache for every app). Other records go through Go's DNS client to the
++// same resolver (dnsconfig_nocturne.go), as do all lookups of a Resolver
++// with PreferGo or Dial.
++
++// Nocturne has no table of fixed names: every name goes to the resolver,
++// so no lookup reads this.
++var hostsFilePath = ""
 +
 +// The system resolver plays the part that the C library does elsewhere.
 +const cgoAvailable = true
@@ -1127,7 +1207,7 @@ index 00000000..56f32a49
 +
 +func (r *Resolver) lookupHost(ctx context.Context, host string) ([]string, error) {
 +	if r.useGo() {
-+		return r.goLookupHostOrder(ctx, host, hostLookupFilesDNS, getSystemDNSConfig())
++		return r.goLookupHostOrder(ctx, host, hostLookupDNS, getSystemDNSConfig())
 +	}
 +	ips, err := r.lookupIP(ctx, "ip", host)
 +	if err != nil {
@@ -1142,11 +1222,8 @@ index 00000000..56f32a49
 +
 +func (r *Resolver) lookupIP(ctx context.Context, network, host string) ([]IPAddr, error) {
 +	if r.useGo() {
-+		ips, _, err := r.goLookupIPCNAMEOrder(ctx, network, host, hostLookupFilesDNS, getSystemDNSConfig())
++		ips, _, err := r.goLookupIPCNAMEOrder(ctx, network, host, hostLookupDNS, getSystemDNSConfig())
 +		return ips, err
-+	}
-+	if ips, _ := goLookupIPFiles(host); len(ips) > 0 {
-+		return ips, nil
 +	}
 +	if network == "ip6" {
 +		return nil, newDNSError(errNoSuchHost, host, "")
@@ -1213,7 +1290,7 @@ index 00000000..56f32a49
 +}
 +
 +func (r *Resolver) lookupCNAME(ctx context.Context, name string) (string, error) {
-+	return r.goLookupCNAME(ctx, name, hostLookupFilesDNS, getSystemDNSConfig())
++	return r.goLookupCNAME(ctx, name, hostLookupDNS, getSystemDNSConfig())
 +}
 +
 +func (r *Resolver) lookupSRV(ctx context.Context, service, proto, name string) (string, []*SRV, error) {
@@ -1233,7 +1310,7 @@ index 00000000..56f32a49
 +}
 +
 +func (r *Resolver) lookupAddr(ctx context.Context, addr string) ([]string, error) {
-+	return r.goLookupPTR(ctx, addr, hostLookupFilesDNS, getSystemDNSConfig())
++	return r.goLookupPTR(ctx, addr, hostLookupDNS, getSystemDNSConfig())
 +}
 +
 +// dnsReadConfig describes the system resolver for Go's DNS client; Nocturne
@@ -1255,10 +1332,10 @@ index 00000000..56f32a49
 +}
 diff --git a/src/net/sockopt_nocturne.go b/src/net/sockopt_nocturne.go
 new file mode 100644
-index 00000000..9746fa23
+index 00000000..1bd01450
 --- /dev/null
 +++ b/src/net/sockopt_nocturne.go
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,43 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1272,8 +1349,6 @@ index 00000000..9746fa23
 +
 +// Nocturne's TCP sends at once and sizes its own buffers; it has no
 +// keep-alive, lingering or multicast options.
-+
-+var hostsFilePath = "/data/etc/hosts"
 +
 +// maxListenerBacklog is 0: the system keeps its default number of
 +// connections waiting for Accept.
@@ -1703,10 +1778,10 @@ index 00000000..0994eecd
 +}
 diff --git a/src/os/exec/lp_nocturne.go b/src/os/exec/lp_nocturne.go
 new file mode 100644
-index 00000000..0023732c
+index 00000000..1d134b9c
 --- /dev/null
 +++ b/src/os/exec/lp_nocturne.go
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,55 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1718,11 +1793,11 @@ index 00000000..0023732c
 +	"io/fs"
 +	"os"
 +	"path/filepath"
-+	"strings"
++	"syscall"
 +)
 +
 +// ErrNotFound is the error resulting if a path search failed to find an executable file.
-+var ErrNotFound = errors.New("executable file not found in $PATH")
++var ErrNotFound = errors.New("program not found")
 +
 +// findExecutable accepts any document: Nocturne documents have no
 +// permission bits, and the launcher checks that it is a program.
@@ -1737,39 +1812,24 @@ index 00000000..0023732c
 +	return nil
 +}
 +
-+// lookPath searches the folders of the setting PATH, as Nocturne's
-+// launcher does ("/bin:/data/bin" without one).
++// lookPath finds a program as Nocturne's launchers do: a bare name in the
++// system's folder, then in each app's folder of C:\Programs; there is no
++// PATH. Any other name is in the current folder, or complete.
 +func lookPath(file string) (string, error) {
 +	if err := validateLookPath(filepath.Clean(file)); err != nil {
 +		return "", &Error{file, err}
 +	}
-+	if strings.Contains(file, "/") {
-+		err := findExecutable(file)
-+		if err == nil {
-+			return file, nil
++	if filepath.Base(file) != file {
++		if err := findExecutable(file); err != nil {
++			return "", &Error{file, err}
 +		}
-+		return "", &Error{file, err}
++		return file, nil
 +	}
-+	path := os.Getenv("PATH")
-+	if path == "" {
-+		path = "/bin:/data/bin"
++	path, err := syscall.FindProgram(file)
++	if err != nil {
++		return "", &Error{file, ErrNotFound}
 +	}
-+	for _, dir := range filepath.SplitList(path) {
-+		if dir == "" {
-+			continue
-+		}
-+		path := filepath.Join(dir, file)
-+		if err := findExecutable(path); err == nil {
-+			if !filepath.IsAbs(path) {
-+				if execerrdot.Value() != "0" {
-+					return path, &Error{file, ErrDot}
-+				}
-+				execerrdot.IncNonDefault()
-+			}
-+			return path, nil
-+		}
-+	}
-+	return "", &Error{file, ErrNotFound}
++	return path, nil
 +}
 +
 +// lookExtensions is a no-op on non-Windows platforms, since
@@ -1988,88 +2048,73 @@ index 0f70d21c..2867b927 100644
  
 diff --git a/src/os/executable_nocturne.go b/src/os/executable_nocturne.go
 new file mode 100644
-index 00000000..c1346282
+index 00000000..6a31ed50
 --- /dev/null
 +++ b/src/os/executable_nocturne.go
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,20 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
 +
 +package os
 +
-+import (
-+	"internal/stringslite"
-+	"syscall"
-+)
++import "syscall"
 +
-+// executable finds the program as Nocturne's launcher does: the first
-+// argument as a full path, or a name in the folders of the setting PATH.
++// executable finds the program by its first argument, as Nocturne's
++// launchers do (syscall.FindProgram).
 +func executable() (string, error) {
 +	if len(Args) == 0 || Args[0] == "" {
 +		return "", ErrNotExist
 +	}
-+	name := Args[0]
-+	if stringslite.IndexByte(name, '/') >= 0 {
-+		return syscall.FullPath(name), nil
++	full, err := syscall.FindProgram(Args[0])
++	if err != nil {
++		return "", ErrNotExist
 +	}
-+	path := Getenv("PATH")
-+	if path == "" {
-+		path = "/bin:/data/bin"
-+	}
-+	for path != "" {
-+		folder := path
-+		if i := stringslite.IndexByte(path, PathListSeparator); i >= 0 {
-+			folder, path = path[:i], path[i+1:]
-+		} else {
-+			path = ""
-+		}
-+		if folder == "" {
-+			continue
-+		}
-+		full := joinFolder(syscall.FullPath(folder), name)
-+		var e syscall.Entry
-+		if syscall.EntryInfo(full, &e) == nil && e.Kind == syscall.KIND_DOCUMENT {
-+			return full, nil
-+		}
-+	}
-+	return "", ErrNotExist
++	return full, nil
 +}
 diff --git a/src/os/file.go b/src/os/file.go
-index 764ce12c..13df4e51 100644
+index 764ce12c..de68d1d8 100644
 --- a/src/os/file.go
 +++ b/src/os/file.go
-@@ -525,6 +525,10 @@ func UserCacheDir() (string, error) {
+@@ -525,6 +525,14 @@ func UserCacheDir() (string, error) {
  		}
  		dir += "/lib/cache"
  
 +	case "nocturne":
-+		// /data is the persistent volume.
-+		dir = "/data/cache"
++		// Apps keep what they cache in a folder of their own in AppData.
++		dir = Getenv("USERFOLDER")
++		if dir == "" {
++			return "", errors.New("USERFOLDER is not defined")
++		}
++		dir += `\AppData`
 +
  	default: // Unix
  		dir = Getenv("XDG_CACHE_HOME")
  		if dir == "" {
-@@ -578,6 +582,10 @@ func UserConfigDir() (string, error) {
+@@ -578,6 +586,14 @@ func UserConfigDir() (string, error) {
  		}
  		dir += "/lib"
  
 +	case "nocturne":
-+		// /data is the persistent volume; /data/etc holds settings.
-+		dir = "/data/etc"
++		// Apps keep their settings in a folder of their own in AppData.
++		dir = Getenv("USERFOLDER")
++		if dir == "" {
++			return "", errors.New("USERFOLDER is not defined")
++		}
++		dir += `\AppData`
 +
  	default: // Unix
  		dir = Getenv("XDG_CONFIG_HOME")
  		if dir == "" {
-@@ -619,6 +627,8 @@ func UserHomeDir() (string, error) {
- 		return "/sdcard", nil
- 	case "ios":
- 		return "/", nil
+@@ -609,6 +625,8 @@ func UserHomeDir() (string, error) {
+ 		env, enverr = "USERPROFILE", "%userprofile%"
+ 	case "plan9":
+ 		env, enverr = "home", "$home"
 +	case "nocturne":
-+		return "/home", nil
++		env, enverr = "USERFOLDER", "USERFOLDER"
  	}
- 	return "", errors.New(enverr + " is not defined")
- }
+ 	if v := Getenv(env); v != "" {
+ 		return v, nil
 diff --git a/src/os/file_mutex_nocturne.go b/src/os/file_mutex_nocturne.go
 new file mode 100644
 index 00000000..ebed3d17
@@ -2148,10 +2193,10 @@ index 00000000..ebed3d17
 +}
 diff --git a/src/os/file_nocturne.go b/src/os/file_nocturne.go
 new file mode 100644
-index 00000000..ff587b36
+index 00000000..96fd6fe0
 --- /dev/null
 +++ b/src/os/file_nocturne.go
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,713 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -2248,8 +2293,9 @@ index 00000000..ff587b36
 +}
 +
 +// DevNull is the name of the operating system's “null device.”
-+// On Unix-like systems, it is "/dev/null"; on Windows, "NUL".
-+const DevNull = "/dev/null"
++// On Unix-like systems, it is "/dev/null"; on Windows and Nocturne, "NUL".
++// Nocturne has no device of that name: a File opened by it holds no handle.
++const DevNull = "NUL"
 +
 +// syscallMode returns the syscall-specific mode bits from Go's portable mode bits.
 +// Nocturne entries have no permission bits.
@@ -2261,10 +2307,10 @@ index 00000000..ff587b36
 +// opened for reading (DOCUMENT_READ) or for editing (DOCUMENT_EDIT), or are
 +// made (DOCUMENT_CREATE); the permission bits have no meaning on Nocturne.
 +func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
-+	full := syscall.FullPath(name)
-+	if full == DevNull {
++	if name == DevNull {
 +		return newFile(-1, name, "", kindNull), nil
 +	}
++	full := syscall.FullPath(name)
 +	write := flag&(O_WRONLY|O_RDWR) != 0
 +	access := syscall.DOCUMENT_READ
 +	if write {
@@ -2427,7 +2473,17 @@ index 00000000..ff587b36
 +// Sync commits the current contents of the file to stable storage.
 +// Nocturne writes reach the document's store when they return.
 +func (f *File) Sync() error {
-+	return f.checkValid("sync")
++	if err := f.incref("sync"); err != nil {
++		return err
++	}
++	defer f.decref()
++	if f.kind != syscall.KIND_DOCUMENT {
++		return nil
++	}
++	if e := syscall.DocumentCommit(f.sysfd, syscall.COMMIT_WAIT); e != nil {
++		return f.wrapErr("sync", e)
++	}
++	return nil
 +}
 +
 +// read reads up to len(b) bytes from the File.
@@ -2764,10 +2820,12 @@ index 00000000..ff587b36
 +	return &PathError{Op: "chown", Path: f.name, Err: syscall.ENOTSUP}
 +}
 +
++// tempDir is the setting TEMP: the user's temporary folder, emptied at
++// every start.
 +func tempDir() string {
-+	dir := Getenv("TMPDIR")
++	dir := Getenv("TEMP")
 +	if dir == "" {
-+		dir = "/tmp"
++		dir = `C:\`
 +	}
 +	return dir
 +}
@@ -2852,19 +2910,29 @@ index 00000000..ff587b36
 +func ignoringEINTR2[T any](fn func() (T, error)) (T, error) {
 +	return fn()
 +}
-diff --git a/src/os/path_unix.go b/src/os/path_unix.go
-index 0189bcd2..83bb6e57 100644
---- a/src/os/path_unix.go
-+++ b/src/os/path_unix.go
-@@ -2,7 +2,7 @@
- // Use of this source code is governed by a BSD-style
- // license that can be found in the LICENSE file.
- 
--//go:build unix || (js && wasm) || wasip1
-+//go:build unix || (js && wasm) || nocturne || wasip1
- 
- package os
- 
+diff --git a/src/os/path_nocturne.go b/src/os/path_nocturne.go
+new file mode 100644
+index 00000000..6235fed6
+--- /dev/null
++++ b/src/os/path_nocturne.go
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import "internal/filepathlite"
++
++const (
++	PathSeparator     = filepathlite.Separator     // OS-specific path separator
++	PathListSeparator = filepathlite.ListSeparator // OS-specific path list separator
++)
++
++// IsPathSeparator reports whether c is a directory separator character.
++func IsPathSeparator(c uint8) bool {
++	return filepathlite.IsPathSeparator(c)
++}
 diff --git a/src/os/rawconn.go b/src/os/rawconn.go
 index 14a495d9..7f42d6f0 100644
 --- a/src/os/rawconn.go
@@ -2891,6 +2959,22 @@ index 8e23df94..c026d09c 100644
  
  package os
  
+diff --git a/src/os/root.go b/src/os/root.go
+index 80e655e4..02f9abea 100644
+--- a/src/os/root.go
++++ b/src/os/root.go
+@@ -440,9 +440,9 @@ func isValidRootFSPath(name string) bool {
+ 	if !fs.ValidPath(name) {
+ 		return false
+ 	}
+-	if runtime.GOOS == "windows" {
++	if IsPathSeparator('\\') {
+ 		// fs.FS paths are /-separated.
+-		// On Windows, reject the path if it contains any \ separators.
++		// Where \ is a separator too (Windows, Nocturne), reject the path if it contains any.
+ 		// Other forms of invalid path (for example, "NUL") are handled by
+ 		// Root's usual file lookup mechanisms.
+ 		if stringslite.IndexByte(name, '\\') >= 0 {
 diff --git a/src/os/root_nocturne.go b/src/os/root_nocturne.go
 new file mode 100644
 index 00000000..1b0aa866
@@ -2962,7 +3046,7 @@ index 00000000..054536cf
 +func signalIgnored(sig int) bool { return false }
 diff --git a/src/os/stat_nocturne.go b/src/os/stat_nocturne.go
 new file mode 100644
-index 00000000..72dcd473
+index 00000000..8aae6a17
 --- /dev/null
 +++ b/src/os/stat_nocturne.go
 @@ -0,0 +1,71 @@
@@ -3005,18 +3089,18 @@ index 00000000..72dcd473
 +}
 +
 +func joinFolder(folder, name string) string {
-+	if folder != "" && folder[len(folder)-1] == '/' {
++	if folder != "" && IsPathSeparator(folder[len(folder)-1]) {
 +		return folder + name
 +	}
-+	return folder + "/" + name
++	return folder + string(PathSeparator) + name
 +}
 +
 +// statNolog implements Stat for Nocturne.
 +func statNolog(name string) (FileInfo, error) {
-+	full := syscall.FullPath(name)
-+	if full == DevNull {
-+		return &fileStat{name: "null", path: full, mode: ModeDevice | ModeCharDevice | 0666}, nil
++	if name == DevNull {
++		return &fileStat{name: DevNull, path: DevNull, mode: ModeDevice | ModeCharDevice | 0666}, nil
 +	}
++	full := syscall.FullPath(name)
 +	e := new(syscall.Entry)
 +	if err := syscall.EntryInfo(full, e); err != nil {
 +		return nil, &PathError{Op: "stat", Path: name, Err: err}
@@ -3118,10 +3202,10 @@ index 1b90a5a1..ab91db66 100644
  
 diff --git a/src/os/user/lookup_nocturne.go b/src/os/user/lookup_nocturne.go
 new file mode 100644
-index 00000000..2b881ad2
+index 00000000..e536822f
 --- /dev/null
 +++ b/src/os/user/lookup_nocturne.go
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,57 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -3130,12 +3214,13 @@ index 00000000..2b881ad2
 +
 +import (
 +	"os"
++	"path/filepath"
 +	"syscall"
 +)
 +
 +// Nocturne has one person at the machine and no user or group database.
-+// Current describes them by the settings USER and HOME; Lookup and the
-+// group calls are not supported.
++// Current describes them by their folder, the setting USERFOLDER
++// (C:\Users\<name>); Lookup and the group calls are not supported.
 +
 +func init() {
 +	userImplemented = false
@@ -3151,11 +3236,11 @@ index 00000000..2b881ad2
 +)
 +
 +func current() (*User, error) {
-+	name := os.Getenv("USER")
-+	if name == "" {
-+		name = "nocturne"
++	home, err := os.UserHomeDir()
++	if err != nil {
++		return nil, err
 +	}
-+	home, _ := os.UserHomeDir()
++	name := filepath.Base(home)
 +	return &User{Uid: "0", Gid: "0", Username: name, Name: name, HomeDir: home}, nil
 +}
 +
@@ -3191,19 +3276,146 @@ index 89dfe455..b926ddd8 100644
  
  package user
  
-diff --git a/src/path/filepath/path_unix.go b/src/path/filepath/path_unix.go
-index 6bc974db..cf000af8 100644
---- a/src/path/filepath/path_unix.go
-+++ b/src/path/filepath/path_unix.go
-@@ -2,7 +2,7 @@
- // Use of this source code is governed by a BSD-style
- // license that can be found in the LICENSE file.
+diff --git a/src/path/filepath/match.go b/src/path/filepath/match.go
+index 3c1c22bb..6801a2d5 100644
+--- a/src/path/filepath/match.go
++++ b/src/path/filepath/match.go
+@@ -8,7 +8,6 @@ import (
+ 	"errors"
+ 	"internal/filepathlite"
+ 	"os"
+-	"runtime"
+ 	"slices"
+ 	"strings"
+ 	"unicode/utf8"
+@@ -17,6 +16,11 @@ import (
+ // ErrBadPattern indicates a pattern was malformed.
+ var ErrBadPattern = errors.New("syntax error in pattern")
  
--//go:build unix || (js && wasm) || wasip1
-+//go:build unix || (js && wasm) || nocturne || wasip1
++// escapes reports whether '\\' escapes the character after it in a pattern:
++// where it is not a separator (on Windows and Nocturne it is one, and their
++// paths may begin with a drive).
++const escapes = Separator != '\\'
++
+ // Match reports whether name matches the shell file name pattern.
+ // The pattern syntax is:
+ //
+@@ -100,7 +104,7 @@ func scanChunk(pattern string) (star bool, chunk, rest string) {
+ 		switch pattern[i] {
+ 		case '\\':
+ 			// error check handled in matchChunk: bad pattern.
+-			if runtime.GOOS != "windows" && i+1 < len(pattern) {
++			if escapes && i+1 < len(pattern) {
+ 				i++
+ 			}
+ 		case '[':
+@@ -174,7 +178,7 @@ func matchChunk(chunk, s string) (rest string, ok bool, err error) {
+ 			chunk = chunk[1:]
  
- package filepath
+ 		case '\\':
+-			if runtime.GOOS != "windows" {
++			if escapes {
+ 				chunk = chunk[1:]
+ 				if len(chunk) == 0 {
+ 					return "", false, ErrBadPattern
+@@ -202,7 +206,7 @@ func getEsc(chunk string) (r rune, nchunk string, err error) {
+ 		err = ErrBadPattern
+ 		return
+ 	}
+-	if chunk[0] == '\\' && runtime.GOOS != "windows" {
++	if chunk[0] == '\\' && escapes {
+ 		chunk = chunk[1:]
+ 		if len(chunk) == 0 {
+ 			err = ErrBadPattern
+@@ -252,7 +256,7 @@ func globWithLimit(pattern string, depth int) (matches []string, err error) {
  
+ 	dir, file := Split(pattern)
+ 	volumeLen := 0
+-	if runtime.GOOS == "windows" {
++	if !escapes {
+ 		volumeLen, dir = cleanGlobPathWindows(dir)
+ 	} else {
+ 		dir = cleanGlobPath(dir)
+@@ -351,7 +355,7 @@ func glob(dir, pattern string, matches []string) (m []string, e error) {
+ // recognized by Match.
+ func hasMeta(path string) bool {
+ 	magicChars := `*?[`
+-	if runtime.GOOS != "windows" {
++	if escapes {
+ 		magicChars = `*?[\`
+ 	}
+ 	return strings.ContainsAny(path, magicChars)
+diff --git a/src/path/filepath/path_nocturne.go b/src/path/filepath/path_nocturne.go
+new file mode 100644
+index 00000000..5b87f1e3
+--- /dev/null
++++ b/src/path/filepath/path_nocturne.go
+@@ -0,0 +1,65 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package filepath
++
++import (
++	"os"
++	"strings"
++	"syscall"
++)
++
++// HasPrefix exists for historical compatibility and should not be used.
++//
++// Deprecated: HasPrefix does not respect path boundaries and
++// does not ignore case when required.
++func HasPrefix(p, prefix string) bool {
++	if strings.HasPrefix(p, prefix) {
++		return true
++	}
++	return strings.HasPrefix(strings.ToLower(p), strings.ToLower(prefix))
++}
++
++func splitList(path string) []string {
++	if path == "" {
++		return []string{}
++	}
++	return strings.Split(path, string(ListSeparator))
++}
++
++// abs completes path as the system does: in the current folder, with "."
++// and ".." resolved.
++func abs(path string) (string, error) {
++	return syscall.FullPath(path), nil
++}
++
++func join(elem []string) string {
++	var b strings.Builder
++	var lastChar byte
++	for _, e := range elem {
++		switch {
++		case b.Len() == 0:
++			// The first element that is not empty goes in as it is.
++		case lastChar == ':':
++			// After a drive alone the path stays in the current folder:
++			// Join(`C:`, `f`) is `C:f`, Join(`C:`, `\f`) is `C:\f`.
++		case !os.IsPathSeparator(lastChar):
++			b.WriteByte(Separator)
++			lastChar = Separator
++		}
++		if len(e) > 0 {
++			b.WriteString(e)
++			lastChar = e[len(e)-1]
++		}
++	}
++	if b.Len() == 0 {
++		return ""
++	}
++	return Clean(b.String())
++}
++
++// sameWord compares names as the system does, without case.
++func sameWord(a, b string) bool {
++	return strings.EqualFold(a, b)
++}
 diff --git a/src/runtime/lock_futex.go b/src/runtime/lock_futex.go
 index 1cf146b4..0273d825 100644
 --- a/src/runtime/lock_futex.go
@@ -3975,10 +4187,10 @@ index e1d7e213..0e83e7d9 100644
  
 diff --git a/src/syscall/syscall_nocturne.go b/src/syscall/syscall_nocturne.go
 new file mode 100644
-index 00000000..49bd6353
+index 00000000..ac11d559
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,1011 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4020,6 +4232,7 @@ index 00000000..49bd6353
 +	SYS_DOCUMENT_RELEASE  = 136
 +	SYS_DOCUMENT_SAVE     = 137
 +	SYS_DOCUMENT_APPEND   = 138
++	SYS_DOCUMENT_COMMIT   = 185
 +	SYS_ENTRY_INFO        = 139
 +	SYS_ENTRY_REMOVE      = 140
 +	SYS_ENTRY_MOVE        = 141
@@ -4058,6 +4271,13 @@ index 00000000..49bd6353
 +	DOCUMENT_EDIT    = 2 // read and write an existing document
 +	DOCUMENT_CREATE  = 3 // a new, empty document; ERR_EXISTS if the name is taken
 +	DOCUMENT_REPLACE = 4 // new content, swapped in whole by Close
++)
++
++// DocumentCommit modes.
++const (
++	COMMIT_WAIT   = 1 // until it is on the medium
++	COMMIT_START  = 2 // return at once
++	COMMIT_RESULT = 3 // the last started commit's outcome (ERR_NOT_READY: not yet)
 +)
 +
 +// ChannelReceive flags.
@@ -4292,25 +4512,126 @@ index 00000000..49bd6353
 +}
 +
 +// ---- paths ----
++//
++// Nocturne paths are drive paths on its one drive, C: ("C:\Users\User\a.txt"),
++// with '\' or '/' between names, which compare without case. A path is
++// complete when a separator follows its drive or begins it ("\Users" is
++// C:\Users); "C:a" and "C:" are in the current folder, like "a" and ".".
 +
-+// FullPath makes a name a full path: a name not starting with "/" is in
-+// the current folder (the setting FOLDER, else "/"). The system resolves
-+// "." and ".." elements.
++// The folders programs are found in (FindProgram): the system's, then a
++// folder of FOLDER_PROGRAMS for each app.
++const (
++	FOLDER_SYSTEM   = `C:\Nocturne\System`
++	FOLDER_PROGRAMS = `C:\Programs`
++)
++
++// IsPathSeparator reports whether c separates names in a path.
++func IsPathSeparator(c byte) bool {
++	return c == '\\' || c == '/'
++}
++
++// PathDriveLength returns the length of the drive ("C:") that begins path, or 0.
++func PathDriveLength(path string) int {
++	if len(path) >= 2 && path[1] == ':' && 'a' <= path[0]|0x20 && path[0]|0x20 <= 'z' {
++		return 2
++	}
++	return 0
++}
++
++// PathIsComplete reports whether path names a place by itself, without the
++// current folder.
++func PathIsComplete(path string) bool {
++	d := PathDriveLength(path)
++	return d < len(path) && IsPathSeparator(path[d])
++}
++
++// FullPath makes a name complete, as the C library's n_path_complete does:
++// a name that is not complete is in the current folder (the setting FOLDER,
++// else C:\). It is written "C:\a\b", with "." and ".." resolved.
 +func FullPath(name string) string {
-+	if len(name) > 0 && name[0] == '/' {
-+		return name
++	if !PathIsComplete(name) {
++		folder, _ := Getenv("FOLDER")
++		if !PathIsComplete(folder) {
++			folder = `C:\`
++		}
++		name = folder + `\` + name[PathDriveLength(name):]
 +	}
-+	folder, _ := Getenv("FOLDER")
-+	if folder == "" || folder[0] != '/' {
-+		folder = "/"
++	out := []byte{'C', ':'}
++	if PathDriveLength(name) != 0 {
++		out[0] = name[0] &^ 0x20
 +	}
-+	if name == "" || name == "." {
-+		return folder
++	for rest := name[PathDriveLength(name):]; rest != ""; {
++		n := 0
++		for n < len(rest) && !IsPathSeparator(rest[n]) {
++			n++
++		}
++		switch part := rest[:n]; part {
++		case "", ".":
++		case "..":
++			for len(out) > 2 && out[len(out)-1] != '\\' {
++				out = out[:len(out)-1]
++			}
++			if len(out) > 2 {
++				out = out[:len(out)-1]
++			}
++		default:
++			out = append(out, '\\')
++			out = append(out, part...)
++		}
++		if n < len(rest) {
++			n++
++		}
++		rest = rest[n:]
 +	}
-+	if folder[len(folder)-1] != '/' {
-+		folder += "/"
++	if len(out) == 2 {
++		out = append(out, '\\')
 +	}
-+	return folder + name
++	return string(out)
++}
++
++// FindProgram returns a program's complete path, as the C library's
++// find_program does: a bare name ("ls") is looked for in FOLDER_SYSTEM,
++// then in each folder of FOLDER_PROGRAMS; any other name is completed.
++func FindProgram(name string) (string, error) {
++	if name == "" || bytealg.IndexByteString(name, '\\') >= 0 || bytealg.IndexByteString(name, '/') >= 0 ||
++		bytealg.IndexByteString(name, ':') >= 0 {
++		full := FullPath(name)
++		return full, isProgram(full)
++	}
++	if full := FOLDER_SYSTEM + `\` + name; isProgram(full) == nil {
++		return full, nil
++	}
++	var apps [64]Entry
++	for start := 0; ; {
++		n, err := FolderList(FOLDER_PROGRAMS, apps[:], start)
++		if err != nil {
++			return "", err
++		}
++		for i := range apps[:n] {
++			if apps[i].Kind != KIND_FOLDER {
++				continue
++			}
++			if full := FOLDER_PROGRAMS + `\` + apps[i].EntryName() + `\` + name; isProgram(full) == nil {
++				return full, nil
++			}
++		}
++		if n < len(apps) {
++			return "", ERR_NOT_FOUND
++		}
++		start += n
++	}
++}
++
++// isProgram reports why there is no program at the complete path, or nil.
++func isProgram(full string) error {
++	var e Entry
++	if err := EntryInfo(full, &e); err != nil {
++		return err
++	}
++	if e.Kind != KIND_DOCUMENT {
++		return ERR_NOT_PROGRAM
++	}
++	return nil
 +}
 +
 +func pathPtr(name string) (*byte, error) {
@@ -4322,7 +4643,7 @@ index 00000000..49bd6353
 +}
 +
 +// Chdir changes the app's current folder: the setting FOLDER, which
-+// FullPath reads and which apps it launches inherit.
++// FullPath reads and which the apps it launches inherit.
 +func Chdir(path string) error {
 +	var e Entry
 +	full := FullPath(path)
@@ -4382,6 +4703,12 @@ index 00000000..49bd6353
 +
 +func DocumentRelease(h int) error {
 +	_, e := RawSyscall(SYS_DOCUMENT_RELEASE, uintptr(h), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// DocumentCommit saves what was written through h to the medium (COMMIT_*).
++func DocumentCommit(h int, how int) error {
++	_, e := Syscall(SYS_DOCUMENT_COMMIT, uintptr(h), uintptr(how), 0, 0, 0)
 +	return errnoErr(e)
 +}
 +
@@ -4959,7 +5286,7 @@ index 00000000..fe198077
 +}
 diff --git a/src/time/zoneinfo_nocturne.go b/src/time/zoneinfo_nocturne.go
 new file mode 100644
-index 00000000..c15dc609
+index 00000000..15c46c4e
 --- /dev/null
 +++ b/src/time/zoneinfo_nocturne.go
 @@ -0,0 +1,32 @@
@@ -4976,7 +5303,7 @@ index 00000000..c15dc609
 +var platformZoneSources []string
 +
 +// initLocal takes the zone named by the setting TZ ("Asia/Tokyo", or a
-+// zoneinfo document's full path); without one, local time is UTC.
++// zoneinfo document's complete path); without one, local time is UTC.
 +func initLocal() {
 +	tz, _ := syscall.Getenv("TZ")
 +	if tz != "" && tz[0] == ':' {
@@ -4984,7 +5311,7 @@ index 00000000..c15dc609
 +	}
 +	if tz != "" && tz != "UTC" {
 +		sources := platformZoneSources
-+		if tz[0] == '/' {
++		if syscall.PathIsComplete(tz) {
 +			sources = []string{""}
 +		}
 +		if z, err := loadLocation(tz, sources); err == nil {

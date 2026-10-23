@@ -78,7 +78,7 @@ static bool file_read(struct web_form_files *files, const char *path, const char
     if (n_entry_info(path, &st) < 0 || st.kind != N_KIND_DOCUMENT || st.size > SIZE_MAX ||
         (st.size ? (size_t)st.size : 1) > SIZE_MAX - files->allocation) return false;
     struct web_form_file *file = &files->files[files->count];
-    const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
+    const char *name = n_path_name(path);
     if (strlen(name) >= sizeof file->name || (relative && strlen(relative) >= sizeof file->relative_path)) return false;
     n_handle h = n_document_open(path, N_DOCUMENT_READ);
     if (h < 0) return false;
@@ -108,12 +108,11 @@ static bool file_directory(struct web_form_files *files, const char *path, const
     for (n_result index = 0; index < count && ok; index++) {
         const struct n_entry *entry = &entries[index];
         char child[1024], child_relative[1024];
-        int a = snprintf(child, sizeof child, "%s%s%s", path, !strcmp(path,"/") ? "" : "/", entry->name);
-        int b = snprintf(child_relative, sizeof child_relative, "%s/%s", relative, entry->name);
-        if (a < 0 || b < 0 || (size_t)a >= sizeof child || (size_t)b >= sizeof child_relative) { ok = false; break; }
+        n_result a = n_path_join(path, entry->name, child, sizeof child);
+        int b = snprintf(child_relative, sizeof child_relative, "%s/%s", relative, entry->name); /* a web path: '/' */
+        if (a < 0 || b < 0 || (size_t)b >= sizeof child_relative) { ok = false; break; }
         if (entry->kind == N_KIND_FOLDER) ok = file_directory(files, child, child_relative, depth + 1);
         else if (entry->kind == N_KIND_DOCUMENT) ok = file_read(files, child, child_relative);
-        // Never upload devices.
     }
     free(entries); return ok;
 }
@@ -124,8 +123,8 @@ bool web_input_file_paths(web_doc *d, web_node *input, const char *const *paths,
     struct web_form_files *files = web_input_files_create(); if (!files) return false;
     bool ok = true;
     for (unsigned i = 0; i < count && ok; i++) {
-        if (!paths[i] || paths[i][0] != '/') { ok = false; break; }
-        if (directory) { const char *name = strrchr(paths[i], '/'); name = name ? name + 1 : paths[i]; if (!*name) name = "root"; ok = file_directory(files, paths[i], name, 0); }
+        if (!paths[i] || !n_path_is_complete(paths[i])) { ok = false; break; }
+        if (directory) { const char *name = n_path_name(paths[i]); if (!*name) name = "root"; ok = file_directory(files, paths[i], name, 0); }
         else ok = file_read(files, paths[i], NULL);
     }
     if (ok) ok = web_input_files_replace(d, input, files);

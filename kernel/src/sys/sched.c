@@ -12,7 +12,8 @@
 #include "sys/syscall.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
-#include "fs/vfs.h"
+#include "sys/object.h"
+#include "sys/channel.h"
 #include "dev/pciuser.h"
 #include "sys/proc.h"
 #include "gui/wm.h"
@@ -562,7 +563,8 @@ void sched_get_stats(struct sched_stats *out) {
 void sched_init(void) {
     vector_register(VEC_USER_RETURN, runner_return_irq);
     idle_task = kzalloc(sizeof(struct task));
-    idle_task->fds=idle_task->initial_fds;idle_task->fd_capacity=MAX_FDS;
+    idle_task->handles = idle_task->initial_handles;
+    idle_task->handle_capacity = INITIAL_HANDLES;
     idle_task->pid = next_pid++;
     strlcpy(idle_task->name, "idle", sizeof idle_task->name);
     idle_task->state = TASK_RUNNING;
@@ -580,7 +582,8 @@ void sched_init(void) {
 struct task *task_alloc(const char *name) {
     struct task *t = kzalloc(sizeof(struct task));
     if (!t) return NULL;
-    t->fds=t->initial_fds;t->fd_capacity=MAX_FDS;
+    t->handles = t->initial_handles;
+    t->handle_capacity = INITIAL_HANDLES;
     t->kstack = vmalloc(KSTACK_PAGES);
     if (!t->kstack) {
         kfree(t);
@@ -661,29 +664,8 @@ static void free_task(struct task *t) {
             mmap_hole_add(t->process, t->user_stack - PAGE_SIZE, t->user_stack_size + 2 * PAGE_SIZE);
     }
     vfree(t->kstack, KSTACK_PAGES);
-    if(t->fds!=t->initial_fds)kfree(t->fds);
+    if (t->handles != t->initial_handles) kfree(t->handles);
     kfree(t);
-}
-
-int task_fd_reserve(struct task *owner,size_t minimum) {
-    const size_t limit=(size_t)INT32_MAX+1;
-    if(minimum>limit || minimum>SIZE_MAX/sizeof *owner->fds)return -N_ERR_NO_MEMORY;
-    if(minimum<=owner->fd_capacity)return 0;
-    size_t capacity=owner->fd_capacity;
-    while(capacity<minimum){if(capacity>limit/2){capacity=minimum;break;}capacity*=2;}
-    struct file **fds=kzalloc(capacity*sizeof *fds);if(!fds)return -N_ERR_NO_MEMORY;
-    memcpy(fds,owner->fds,owner->fd_capacity*sizeof *fds);
-    if(owner->fds!=owner->initial_fds)kfree(owner->fds);
-    owner->fds=fds;owner->fd_capacity=capacity;return 0;
-}
-int task_fd_find(struct task *owner) {
-    for(size_t i=owner->fd_hint;i<owner->fd_capacity;i++)if(!owner->fds[i])return (int)i;
-    size_t index=owner->fd_capacity;
-    int e=task_fd_reserve(owner,index+1);return e?e:(int)index;
-}
-int task_fd_alloc(struct task *owner,struct file *file) {
-    int fd=task_fd_find(owner);if(fd<0)return fd;
-    owner->fds[fd]=file;owner->fd_hint=(size_t)fd+1;return fd;
 }
 
 static void reap_dead(void) {
@@ -867,7 +849,47 @@ void wq_wake_all(struct wait_queue *wq) {
     irq_restore(f);
 }
 
+void wq_nap(struct wait_queue *wq, volatile bool *kick, uint64_t ms) {
+    if (!current_task->kstack) {
+        sti();
+        hlt();
+        schedule();
+        return;
+    }
+    uint64_t f = irq_save();
+    if (!kick || !*kick) wq_wait_timeout(wq, ms);
+    if (kick) *kick = false;
+    irq_restore(f);
+}
+
 void sleep_ms(uint64_t ms) { wq_wait_timeout(NULL, ms); }
+
+void mutex_lock(struct mutex *m) {
+    cpu_require_bsp();
+    uint64_t f = irq_save();
+    while (m->owner && m->owner != current_task) {
+        if (current_task->kstack) {
+            wq_wait(&m->wait);
+            continue;
+        }
+        irq_restore(f);
+        wq_nap(NULL, NULL, 0);
+        f = irq_save();
+    }
+    m->owner = current_task;
+    m->depth++;
+    irq_restore(f);
+}
+
+void mutex_unlock(struct mutex *m) {
+    uint64_t f = irq_save();
+    if (m->owner != current_task || !m->depth) panic("mutex: released by a task that does not hold it");
+    if (!--m->depth) {
+        m->owner = NULL;
+        wq_wake_all(&m->wait);
+    }
+    irq_restore(f);
+}
 
 /* ---- task lifecycle ---- */
 
@@ -956,7 +978,7 @@ struct address_watch {
     struct address_watch_queue *queue;
     uint64_t phys, seq, token;
 };
-struct address_watch_queue { struct address_watch *ready, **ready_tail; struct vnode *vn; };
+struct address_watch_queue { struct address_watch *ready, **ready_tail; struct object object; };
 static struct wait_queue address_wait;
 static struct address_watch *address_watches, **address_watch_tail = &address_watches;
 static uint64_t address_seq;
@@ -1059,7 +1081,7 @@ int task_wake_address(volatile uint32_t *address, unsigned count) {
             address_watch_unlink(watch_link);
             *w->queue->ready_tail = w;
             w->queue->ready_tail = &w->next;
-            vfs_poll_notify(w->queue->vn);
+            object_notify(&w->queue->object);
         } else if (task_link) {
             struct task *t = *task_link;
             *task_link = t->wq_next;
@@ -1074,29 +1096,9 @@ int task_wake_address(volatile uint32_t *address, unsigned count) {
     return (int)done;
 }
 
-static int64_t address_watch_read_user(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
-    (void)f; (void)off;
-    struct address_watch_queue *q = v->priv;
-    size_t want = n / sizeof(uint64_t), got = 0;
-    if (!want) return -N_ERR_INVALID;
-    struct address_watch *done = NULL;
-    uint64_t flags = irq_save();
-    if (!q->ready) { irq_restore(flags); return -N_ERR_NOT_READY; }
-    if (!user_ok_w(buf, want * sizeof(uint64_t))) { irq_restore(flags); return -N_ERR_BAD_ADDRESS; }
-    while (q->ready && got < want) {
-        struct address_watch *w = q->ready;
-        q->ready = w->next;
-        if (!q->ready) q->ready_tail = &q->ready;
-        ((uint64_t *)buf)[got++] = w->token;
-        w->next = done; done = w;
-    }
-    irq_restore(flags);
-    while (done) { struct address_watch *next = done->next; kfree(done); done = next; }
-    return (int64_t)(got * sizeof(uint64_t));
-}
 /* Take up to max notified tokens into a kernel array; BSP IRQ guard held. */
-size_t address_watch_take(struct vnode *v, uint64_t *tokens, size_t max) {
-    struct address_watch_queue *q = v->priv;
+size_t address_watch_take(struct object *queue, uint64_t *tokens, size_t max) {
+    struct address_watch_queue *q = queue->priv;
     size_t got = 0;
     while (q->ready && got < max) {
         struct address_watch *w = q->ready;
@@ -1107,12 +1109,8 @@ size_t address_watch_take(struct vnode *v, uint64_t *tokens, size_t max) {
     }
     return got;
 }
-static bool address_watch_can_read(struct vnode *v, struct file *f) {
-    (void)f;
-    return ((struct address_watch_queue *)v->priv)->ready != NULL;
-}
-static void address_watch_release(struct vnode *v) {
-    struct address_watch_queue *q = v->priv;
+static void address_watch_release(struct object *o) {
+    struct address_watch_queue *q = o->priv;
     struct address_watch *done = NULL;
     uint64_t flags = irq_save();
     for (struct address_watch **pw = &address_watches; *pw;) {
@@ -1125,25 +1123,19 @@ static void address_watch_release(struct vnode *v) {
     while (q->ready) { struct address_watch *next = q->ready->next; kfree(q->ready); q->ready = next; }
     while (done) { struct address_watch *next = done->next; kfree(done); done = next; }
     kfree(q);
-    kfree(v);
 }
-static struct vnode_ops address_watch_ops = {
-    .read_user = address_watch_read_user, .can_read = address_watch_can_read,
-    .release = address_watch_release,
-};
+static const struct object_ops address_watch_ops = {.kind = N_KIND_EVENTS, .release = address_watch_release};
 
-struct vnode *address_watch_queue_new(void) {
-    struct vnode *v = kzalloc(sizeof *v);
+struct object *address_watch_queue_new(void) {
     struct address_watch_queue *q = kzalloc(sizeof *q);
-    if (!v || !q) { kfree(v); kfree(q); return NULL; }
+    if (!q) return NULL;
     q->ready_tail = &q->ready;
-    q->vn = v;
-    v->type = VT_ADDRESS_WATCH; v->unlinked = true; v->ops = &address_watch_ops; v->priv = q;
-    return v;
+    object_init(&q->object, &address_watch_ops, q);
+    return &q->object;
 }
 
-int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t expected, uint64_t token) {
-    if (!queue || queue->type != VT_ADDRESS_WATCH) return -N_ERR_NO_HANDLE;
+int address_watch_add(struct object *queue, volatile uint32_t *address, uint32_t expected, uint64_t token) {
+    if (!queue || queue->ops != &address_watch_ops) return -N_ERR_NO_HANDLE;
     struct address_watch *w = kzalloc(sizeof *w);
     if (!w) return -N_ERR_NO_MEMORY;
     uint64_t flags = irq_save();
@@ -1164,8 +1156,8 @@ int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t 
     return 0;
 }
 
-int address_watch_remove(struct vnode *queue, uint64_t token) {
-    if (!queue || queue->type != VT_ADDRESS_WATCH) return -N_ERR_NO_HANDLE;
+int address_watch_remove(struct object *queue, uint64_t token) {
+    if (!queue || queue->ops != &address_watch_ops) return -N_ERR_NO_HANDLE;
     struct address_watch_queue *q = queue->priv;
     struct address_watch *found = NULL;
     int result = 0;
@@ -1260,10 +1252,10 @@ NORETURN void task_exit(int code) {
     /* PCI claims first, whatever their handle numbers: a driver's device is stopped (and seen
        to have no DMA in flight) before the DMA objects among its other handles can free RAM. */
     for (int claims = 1; claims >= 0; claims--)
-        for (size_t i = 0; i < t->fd_capacity; i++) {
-            if (t->fds[i] && (!claims || pci_user_is_claim(t->fds[i]))) {
-                vfs_close(t->fds[i]);
-                t->fds[i] = NULL;
+        for (size_t i = 0; i < t->handle_capacity; i++) {
+            if (t->handles[i] && (!claims || pci_user_is_claim(t->handles[i]))) {
+                handle_close(t->handles[i]);
+                t->handles[i] = NULL;
             }
         }
     wm_process_exit(t->pid);
@@ -1287,12 +1279,12 @@ NORETURN void task_exit(int code) {
         }
     }
     t->state = TASK_ZOMBIE;
-    struct vnode *app = t->app;
+    struct object *app = t->app;
     if (app) {
         /* An app reports through its handle; no parent collects it. */
         t->app = NULL;
         proc_app_ended(app, t->exit_code);
-        vnode_unref(app);
+        object_unref(app);
         if (t->app_launched) {
             if (t->parent) wq_wake_all(&t->parent->child_wait);
             t->parent = NULL;
@@ -1391,11 +1383,11 @@ void task_printf_stderr(struct task *t, const char *fmt, ...) {
     if (n > (int)sizeof buf - 1) n = sizeof buf - 1;
     struct task *owner = t->process ? t->process : t;
     uint64_t flags = irq_save();
-    struct file *file = owner->fd_capacity>2 && owner->fds[2] ? vfs_dup(owner->fds[2]) : NULL;
+    struct handle *h = owner->handle_capacity > 2 && owner->handles[2] ? handle_ref(owner->handles[2]) : NULL;
     irq_restore(flags);
-    if (!file) return;
+    if (!h) return;
     /* A message channel has no byte write: the text goes as one message. */
-    if (message_channel_is(file)) message_channel_post(file, buf, (size_t)n, (uint64_t)owner->pid);
-    else vfs_write(file, buf, n);
-    vfs_close(file);
+    if (message_channel_is(h)) message_channel_post(h, buf, (size_t)n, (uint64_t)owner->pid);
+    else if (h->object->ops->write) h->object->ops->write(h, buf, (size_t)n, false);
+    handle_close(h);
 }

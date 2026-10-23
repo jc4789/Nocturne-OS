@@ -16,7 +16,7 @@ static void console(void *unused,int level,const char *message){
     fflush(stdout);
 }
 int main(void){
-    FILE *file=fopen("/data/tests/js_image_bitmap_promise_cases.js","rb");
+    FILE *file=fopen("C:\\Tests\\js_image_bitmap_promise_cases.js","rb");
     if(!file){puts("imagebitmappromise: fixture missing");return 1;}
     fseek(file,0,SEEK_END);long length=ftell(file);fseek(file,0,SEEK_SET);
     char *source=length>0?malloc((size_t)length+1):NULL;

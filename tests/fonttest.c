@@ -39,8 +39,8 @@ static font_t *memory_face(const char *path) {
 }
 int main(void) {
     gfx_init(&canvas, pixels, 640, 96, 640);
-    font_t *cn = font_open("/usr/share/fonts/MapleMono-NF-CN-Regular.ttf");
-    font_t *raw = font_open("/usr/share/fonts/MapleMono-NF-Regular.ttf");
+    font_t *cn = font_open("C:\\Nocturne\\Fonts\\MapleMono-NF-CN-Regular.ttf");
+    font_t *raw = font_open("C:\\Nocturne\\Fonts\\MapleMono-NF-Regular.ttf");
     check(cn && raw, "bundled original fonts open");
     if (!cn || !raw) return 1;
     check(!font_has(raw, 0x65e5), "explicit Latin face does not pretend to contain CJK");
@@ -73,11 +73,11 @@ int main(void) {
     check(gfx_text_width("ABC日本",FONT_SMALL) == 56, "chrome width uses two CJK cells");
     check(gfx_text_width("ABC日本",FONT_LARGE) == 112, "large chrome width doubles");
     check(gfx_text(&canvas,0,0,"ABC日本",RGB(255,255,255),0,FONT_SMALL) == 56, "chrome draw agrees with width");
-    font_t *symbols = font_open("/usr/share/fonts/PlangothicP2-Regular.ttf");
+    font_t *symbols = font_open("C:\\Nocturne\\Fonts\\PlangothicP2-Regular.ttf");
     check(symbols && font_has(symbols,0x1f0a1), "bundled Plangothic has actual supplementary outline");
     check(!font_has(raw,0x1f0a1), "single Maple face still has no added fallback");
-    font_t *cjk[2] = {font_open("/usr/share/fonts/NotoSansCJKjp-Regular.otf"),
-                     font_open("/usr/share/fonts/NotoSerifCJKjp-Regular.otf")};
+    font_t *cjk[2] = {font_open("C:\\Nocturne\\Fonts\\NotoSansCJKjp-Regular.otf"),
+                     font_open("C:\\Nocturne\\Fonts\\NotoSerifCJKjp-Regular.otf")};
     check(cjk[0] && cjk[1], "both actual CFF CJK faces open");
     uint32_t family_hash[3] = {0};
     for (int family = 0; family < 3; family++) {
@@ -108,8 +108,8 @@ int main(void) {
     }
     check(family_hash[0] != family_hash[1] && family_hash[0] != family_hash[2] && family_hash[1] != family_hash[2], "generic families have distinct rasters");
     check(font_family(FONT_FAMILY_MONO,FONT_REGULAR) == font_ui(FONT_REGULAR), "mono preserves UI face identity");
-    font_t *latin = font_open("/usr/share/fonts/NotoSansLiving-Regular.ttf");
-    font_t *web = memory_face("/usr/share/fonts/NotoSansLiving-Regular.ttf");
+    font_t *latin = font_open("C:\\Nocturne\\Fonts\\NotoSansLiving-Regular.ttf");
+    font_t *web = memory_face("C:\\Nocturne\\Fonts\\NotoSansLiving-Regular.ttf");
     check(latin && web, "validated non-CJK web face opens from bytes");
     if (latin && web) {
         check(!font_has(latin,0x65e5) && font_has(web,0x65e5) && font_has(web,0x20bb7),

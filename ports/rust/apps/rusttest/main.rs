@@ -1,11 +1,13 @@
 // Nocturne OS Rust std smoke test. Everything NAK-style code needs from std:
-// printing, collections, Arc + Mutex + threads, OnceLock, env, fs under /tmp,
-// Instant, CString/CStr, thread-locals. Exits with 0 and prints "rusttest: ok"
-// when every check passed; otherwise it prints the failures and exits with 1.
+// printing, collections, Arc + Mutex + threads, OnceLock, env, drive paths, fs
+// in the temporary folder, Instant, CString/CStr, thread-locals. Exits with 0
+// and prints "rusttest: ok" when every check passed; otherwise it prints the
+// failures and exits with 1.
 
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, Prefix};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
@@ -73,7 +75,7 @@ fn main() {
     #[repr(align(64))]
     struct Aligned([u8; 64]);
     let boxed = Box::new(Aligned([1; 64]));
-    c.check("align 64 allocation", (&*boxed as *const Aligned as usize) % 64 == 0);
+    c.check("align 64 allocation", (&*boxed as *const Aligned as usize) % 64 == 0 && boxed.0[63] == 1);
 
     // Strings and formatting.
     let s = format!("{:>8.3}|{:#x}|{:?}", 3.14159f64, 255, "q\"uote");
@@ -144,8 +146,9 @@ fn main() {
     c.check("park/unpark", parked.join().unwrap() == 42);
 
     // Environment: the launch settings, set_var, remove_var.
-    let path = std::env::var("PATH");
-    println!("PATH={:?}", path);
+    for name in ["FOLDER", "USERFOLDER", "TEMP"] {
+        println!("{name}={:?}", std::env::var_os(name));
+    }
     println!("vars: {}", std::env::vars().count());
     unsafe { std::env::set_var("RUSTTEST_VAR", "value 1") };
     c.check("env set_var", std::env::var("RUSTTEST_VAR").as_deref() == Ok("value 1"));
@@ -157,10 +160,41 @@ fn main() {
     println!("args: {:?}", args);
     c.check("args has the program", !args.is_empty());
 
-    // File system under /tmp.
-    let dir = std::path::PathBuf::from("/tmp/rusttest");
+    // Paths: one drive, `\` and `/` both separate, a root makes a path complete.
+    let p = Path::new(r"C:\a\b");
+    let parts: Vec<Component<'_>> = p.components().collect();
+    c.check(
+        r"components of C:\a\b",
+        matches!(parts[..], [Component::Prefix(d), Component::RootDir, Component::Normal(a), Component::Normal(b)]
+            if d.kind() == Prefix::Disk(b'C') && a == "a" && b == "b"),
+    );
+    c.check(r"C:/a/b is C:\a\b", Path::new("C:/a/b") == p && Path::new(r"c:\a/b") == p);
+    c.check(
+        "is_absolute",
+        p.is_absolute() && Path::new(r"\a").is_absolute() && Path::new("/a").is_absolute()
+            && !Path::new(r"a\b").is_absolute() && !Path::new("C:a").is_absolute() && !Path::new("C:").is_absolute(),
+    );
+    c.check("parent and file_name", p.parent() == Some(Path::new(r"C:\a")) && p.file_name() == Some("b".as_ref()));
+    c.check("join", Path::new(r"C:\a").join("b") == p && Path::new(r"C:\x").join(r"\a\b") == p);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let temp = std::env::temp_dir();
+    println!("current_dir: {}, temp_dir: {}, home_dir: {:?}", cwd.display(), temp.display(), std::env::home_dir());
+    c.check("current_dir is complete", cwd.starts_with(r"C:\"));
+    c.check("temp_dir is complete", temp.starts_with(r"C:\"));
+    c.check("path::absolute", std::path::absolute(r"x\..\y").ok() == Some(cwd.join("y")));
+    c.check(r"absolute of /a//b/. is C:\a\b", std::path::absolute("/a//b/.").is_ok_and(|a| a.as_os_str() == r"C:\a\b"));
+
+    // File system in the temporary folder.
+    let dir = temp.join("rusttest");
     let _ = std::fs::remove_dir_all(&dir);
     c.check("create_dir_all", std::fs::create_dir_all(dir.join("sub")).is_ok());
+    c.check(
+        "set_current_dir",
+        std::env::set_current_dir(&dir).is_ok()
+            && std::env::current_dir().ok() == Some(dir.clone())
+            && std::fs::metadata("sub").is_ok_and(|m| m.is_dir()),
+    );
+    let _ = std::env::set_current_dir(&cwd);
     let file = dir.join("hello.txt");
     c.check("fs::write", std::fs::write(&file, b"hello nocturne\nsecond line\n").is_ok());
     let text = std::fs::read_to_string(&file).unwrap_or_default();
@@ -169,6 +203,7 @@ fn main() {
     {
         let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
         f.write_all(b"appended\n").unwrap();
+        c.check("sync_all", f.sync_all().is_ok());
     }
     {
         let mut f = std::fs::File::open(&file).unwrap();

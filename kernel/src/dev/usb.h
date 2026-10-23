@@ -91,8 +91,6 @@ bool usb_send_open(struct usb_device *d, uint8_t address, unsigned size, unsigne
 int usb_send(struct usb_device *d, uint8_t address, const void *a, unsigned alen, const void *b, unsigned blen);
 /* Run fn(arg) on the usb thread and wait for it: how other tasks reach a device. */
 void usb_run(void (*fn)(void *arg), void *arg);
-/* Wait (at most `ms`) until the devices present at boot are enumerated. */
-void usb_wait_settled(unsigned ms);
 
 /* hub support */
 struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsigned speed);

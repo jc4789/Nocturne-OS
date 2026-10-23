@@ -64,6 +64,8 @@ static int writer_ro(void){
     return 0; /* survived: the mapping was writable */
 }
 int main(int argc,char **argv){
+    char program[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if(n_path_complete(argv[0],program,sizeof program)>=0)argv[0]=program;
     if(argc>1&&!strcmp(argv[1],"child"))return child();
     if(argc>1&&!strcmp(argv[1],"reader"))return reader();
     if(argc>1&&!strcmp(argv[1],"writer-ro"))return writer_ro();
@@ -74,7 +76,7 @@ int main(int argc,char **argv){
     CHECK(n_shared_map(h,MAPPED,N_MEMORY_READ,&rom)==0);unsigned char *ro=rom;
     CHECK(n_shared_map(h,4096,N_MEMORY_READ_WRITE,&none)<0&&!none);
     CHECK(n_shared_map(h,MAPPED,N_MEMORY_READ_EXECUTE,&none)<0&&!none);
-    n_handle doc=n_document_open("/etc/motd",N_DOCUMENT_READ);
+    n_handle doc=n_document_open("C:\\Nocturne\\Welcome.txt",N_DOCUMENT_READ);
     CHECK(doc>=0&&n_shared_map(doc,MAPPED,N_MEMORY_READ,&none)<0);
     if(doc>=0)n_handle_close(doc);
     CHECK(n_shared_map(0x7fffffff,MAPPED,N_MEMORY_READ,&none)<0);

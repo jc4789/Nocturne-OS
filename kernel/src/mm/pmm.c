@@ -211,20 +211,3 @@ bool pmm_claim(uint64_t pfn) {
     return was_free;
 }
 uint64_t pmm_total_pages(void) { return usable_pages; }
-
-/* Hand frames the bootloader gave us (a module that has been consumed) to the
-   allocator for good. They count as usable memory from now on. */
-void pmm_release_range(uint64_t phys, uint64_t size) {
-    cpu_require_bsp();
-    uint64_t start = ALIGN_DOWN(phys, PAGE_SIZE) / PAGE_SIZE;
-    uint64_t end = ALIGN_UP(phys + size, PAGE_SIZE) / PAGE_SIZE;
-    if (start < 256) start = 256;
-    uint64_t f = irq_save();
-    for (uint64_t p = start; p < end && p < total_pages; p++) {
-        if (!is_used(p)) continue;
-        set_free(p);
-        free_pages++;
-        usable_pages++;
-    }
-    irq_restore(f);
-}

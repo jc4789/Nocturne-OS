@@ -1,9 +1,9 @@
 # Nocturne 用 TypeScript-Go（tsgo）
 
 TypeScript 7 の公式コンパイラー（TypeScript-Go、`github.com/microsoft/typescript-go`）を
-`GOOS=nocturne` の Go（`ports/go`）でビルドし、`/bin/tsgo` に入れます。
+`GOOS=nocturne` の Go（`ports/go`）でビルドし、`C:\Nocturne\System\tsgo` に入れます。
 TypeScript の標準ライブラリー（`lib.*.d.ts`）は実行ファイルに埋め込まれています。
-ライセンスは Apache-2.0 で、`LICENSE` と `NOTICE.txt` を `/usr/share/licenses/typescript-go` に置きます。
+ライセンスは Apache-2.0 で、`LICENSE` と `NOTICE.txt` を `C:\Nocturne\Licenses\typescript-go` に置きます。
 
 ## 作り方
 
@@ -19,9 +19,12 @@ TypeScript 7.0.2 のソース（`TypeScript-7.0.2/tsc`）で確認しました�
 Nocturne は UNIX ではないので、アプリを止めるのは `AppStop` で、終了シグナルは届きません。
 `cmd/tsgo` が `syscall.SIGTERM` を名指ししていた 3 か所を、OS ごとのファイルにある
 `stopSignals` に置き換えています（Nocturne では `os.Interrupt` だけ）。それ以外は
-Go の移植（`os`、`net`、`os/exec` 等）の上でそのまま動きます。
+Go の移植（`os`、`net`、`os/exec` 等）の上でそのまま動きます。TypeScript のパス（`tspath`）は
+OS によらず `C:/...` をドライブ付きの完全なパスとして扱い、作業フォルダー（`C:\Users\<名前>`）の
+`\` は `/` にそろえて使います。Nocturne の名前は大文字・小文字を区別しないので、tsgo の判定
+（実行ファイルを大文字・小文字を入れ替えた名前で探す）も区別しない側になります。
 
-## 確認したこと（QEMU、WHPX、4 CPU）
+## 確認したこと（QEMU、WHPX、4 CPU。ドライブパスのファイルシステムより前）
 
 - `tsgo --version` → `Version 7.0.2`
 - 単一ファイル：`tsgo /tmp/a.ts` で JavaScript を出力、型の誤りは `error TS2322` を表示。

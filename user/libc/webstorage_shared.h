@@ -1,4 +1,4 @@
-/* Native shared localStorage. The fixed leased control file is RAM-root only.
+/* Native shared localStorage. The fixed leased control file is in the shared root only.
  * Two checksummed headers commit an append, never an unvalidated tail. A
  * checkpoint replaces consumed deltas; live document event cursors prohibit
  * compaction of undelivered notifications. Persistent slots are unchanged. */
@@ -103,7 +103,7 @@ static bool storage_reader_alive(const uint8_t row[48],struct n_procinfo *list,i
     return false;
 }
 static n_handle storage_readers_open(struct storage_area *a) {
-    char path[160];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,3,path);
+    char path[STORAGE_PATH];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,3,path);
     return storage_document(path);
 }
 static bool storage_reader_register(struct storage_area *a,uint64_t token,bool holder,
@@ -171,11 +171,11 @@ static int storage_checkpoint(struct storage_area *a,struct storage_control *h) 
 static int storage_shared_lock(webstorage *s,struct storage_area *a,struct storage_control *h) {
     if(a->shared<0){
         if(!storage_dirs_at(WEBSTORAGE_SHARED_ROOT))return WEB_STORAGE_IO;
-        char path[160];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,2,path);
+        char path[STORAGE_PATH];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,2,path);
         a->shared=storage_document(path);if(a->shared<0)return WEB_STORAGE_IO;
     }
     if(a->shared_log<0){
-        char path[160];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,4,path);
+        char path[STORAGE_PATH];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,4,path);
         a->shared_log=storage_document(path);if(a->shared_log<0)return WEB_STORAGE_IO;
     }
     if(n_document_claim(a->shared,true)<0)return WEB_STORAGE_IO;

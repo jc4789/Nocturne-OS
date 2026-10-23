@@ -1,6 +1,6 @@
 /* uihost: the interface engine (libc/ui.c) for programs that cannot call C.
-   The program launches /bin/uihost with one end of a message channel as
-   handle 3 and sends it the session messages of ui.h, one per channel message;
+   The program launches uihost (found in C:\Nocturne\System) with one end of a message channel
+   as handle 3 and sends it the session messages of ui.h, one per channel message;
    it gets back the engine's messages the same way. Two additions for the
    channel: an 's' reply carries the surface's shared pages as its attachment,
    and a message the engine refused is answered by 'x' i32 result, u8 its type.

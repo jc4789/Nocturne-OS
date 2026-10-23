@@ -6,9 +6,9 @@
    gets back events ("button 3 was clicked", "the slider moved to 40"). The
    engine keeps everything between: hover, presses, focus, the caret, scrolling,
    animations, the theme. Apps talk to it in messages (a ui_session):
-     - C and /bin/js call ui_session_send / ui_session_peek in the same process;
+     - C and the js program call ui_session_send / ui_session_peek in the same process;
      - programs that cannot call C (Go) send the same bytes over a channel to
-       /bin/uihost, which runs a session for them.
+       uihost, which runs a session for them.
    docs/nocturne-native-abi.md §11 describes the format for binding authors.
 
    Colours are 0xAARRGGBB; the alpha byte is the opacity. */
@@ -70,7 +70,7 @@ extern const struct ui_theme ui_theme;
          0; 0xFFFFFFFF for the window), u32 mods (NMOD_*), u32 flags, f64 a, f64 b, str text
      'm' u32 request, f64 width, f64 line height, f64 baseline
      'q' u32 count, count x (u8 name length, name, f64 value)
-     's' u32 surface, i32 result, u32 width, u32 height; through /bin/uihost the
+     's' u32 surface, i32 result, u32 width, u32 height; through uihost the
          message carries the surface's shared pages (n_shared_map them) */
 enum {
     UI_EVENT_CLICK = 1,  /* button, list item, box with "clickable" */
@@ -136,7 +136,7 @@ void ui_session_pump(struct ui_session *s);
 bool ui_session_wait(struct ui_session *s, int timeout);
 bool ui_session_open(struct ui_session *s); /* whether it has a window */
 /* A surface's pixels (0xFFRRGGBB, opaque) for an app in the same process to draw
-   into, and the shared pages behind them for /bin/uihost to hand on; both stay
+   into, and the shared pages behind them for uihost to hand on; both stay
    valid until the surface is resized or dropped. */
 canvas_t *ui_session_surface(struct ui_session *s, uint32_t surface);
 n_handle ui_session_surface_handle(struct ui_session *s, uint32_t surface);

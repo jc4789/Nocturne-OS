@@ -21,10 +21,11 @@ static bool loaded(const char *path, const char *want, size_t n) {
     return same;
 }
 
+/* The stream calls on documents inside root, a complete path. */
 static void documents(const char *root) {
-    char a[96], b[96], buf[64];
-    snprintf(a, sizeof a, "%s/stdiotest-a.txt", root);
-    snprintf(b, sizeof b, "%s/stdiotest-b.txt", root);
+    char a[512], b[512], buf[64];
+    CHECK(n_path_join(root, "stdiotest-a.txt", a, sizeof a) > 0);
+    CHECK(n_path_join(root, "stdiotest-b.txt", b, sizeof b) > 0);
     n_entry_remove(a);
     n_entry_remove(b);
 
@@ -104,10 +105,16 @@ static void documents(const char *root) {
     CHECK(remove(b) == -1 && errno == N_ERR_NOT_FOUND);
 }
 
+/* How many entries the temporary folder has (all of them, a page at a time), or a negative error. */
 static int tmp_entries(void) {
     struct n_entry list[64];
-    n_result n = n_folder_list("/tmp", list, 64, 0);
-    return (int)n;
+    int total = 0;
+    for (;;) {
+        n_result n = n_folder_list(n_temp_folder(), list, 64, (uint64_t)total);
+        if (n < 0) return (int)n;
+        if (!n) return total;
+        total += (int)n;
+    }
 }
 
 static void temporary(void) {
@@ -125,16 +132,26 @@ static void temporary(void) {
 }
 
 static void relative(void) {
-    char was[512];
+    char was[512], one[512], two[512], gone[640], file[640], renamed[640];
     CHECK(n_path_complete(".", was, sizeof was) > 0);
-    CHECK(n_folder_set("/data") == 0 && n_folder_set("../home") == 0);
-    CHECK(n_folder_set("/home/no-such-folder") == -N_ERR_NOT_FOUND);
+    CHECK(n_path_join(n_temp_folder(), "stdiotest-one", one, sizeof one) > 0);
+    CHECK(n_path_join(n_temp_folder(), "stdiotest-two", two, sizeof two) > 0);
+    snprintf(gone, sizeof gone, "%s\\no-such-folder", two);
+    snprintf(file, sizeof file, "%s\\stdiotest-rel.txt", two);
+    snprintf(renamed, sizeof renamed, "%s\\stdiotest-rel2.txt", two);
+    CHECK(n_folder_create(one) == 0 && n_folder_create(two) == 0);
+    CHECK(n_folder_set(one) == 0 && n_folder_set("..\\stdiotest-two") == 0);
+    CHECK(n_folder_set(gone) == -N_ERR_NOT_FOUND);
+    CHECK(n_folder_set("D:\\") == -N_ERR_NOT_FOUND); /* there is no drive D: */
     FILE *f = fopen("stdiotest-rel.txt", "w");
     CHECK(f && fputs("rel", f) == 0 && fclose(f) == 0);
-    CHECK(loaded("/home/stdiotest-rel.txt", "rel", 3));
-    CHECK(rename("stdiotest-rel.txt", "../home/stdiotest-rel2.txt") == 0 && loaded("/home/stdiotest-rel2.txt", "rel", 3));
+    CHECK(loaded(file, "rel", 3));
+    CHECK(n_folder_set(file) == -N_ERR_NOT_FOLDER);
+    CHECK(rename("stdiotest-rel.txt", "..\\stdiotest-two\\stdiotest-rel2.txt") == 0 && loaded(renamed, "rel", 3));
     CHECK(remove("stdiotest-rel2.txt") == 0);
     n_folder_set(was);
+    n_entry_remove(one);
+    n_entry_remove(two);
 }
 
 /* Child modes. "print": output and log on whatever the launcher gave.
@@ -164,7 +181,8 @@ static int child(const char *mode) {
 }
 
 static void standard_streams(const char *self) {
-    const char *out = "/home/stdiotest-out.txt";
+    char out[512];
+    CHECK(n_path_join(n_temp_folder(), "stdiotest-out.txt", out, sizeof out) > 0);
     CHECK(n_document_save(out, "parent:", 7) == 0);
     n_handle doc = n_document_open(out, N_DOCUMENT_EDIT);
     CHECK(doc >= 0);
@@ -212,9 +230,11 @@ static void standard_streams(const char *self) {
 }
 
 int main(int argc, char **argv) {
+    char program[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if (n_path_complete(argv[0], program, sizeof program) >= 0) argv[0] = program;
     if (argc > 2 && !strcmp(argv[1], "child")) return child(argv[2]);
-    documents("/home");
-    documents("/data");
+    documents(n_temp_folder()); /* the temporary folder, and the user's folder that is kept */
+    documents(n_user_folder());
     temporary();
     relative();
     standard_streams(argv[0]);

@@ -148,7 +148,9 @@ n_result win_event(window_t *win, struct gui_event *e, int timeout_ms) {
 n_result clipboard_set(const char *s, size_t n) { return __syscall(SYS_CLIPBOARD_SET, (long)s, n, 0, 0, 0); }
 n_result clipboard_get(char *buf, size_t n) { return __syscall(SYS_CLIPBOARD_GET, (long)buf, n, 0, 0, 0); }
 n_result gui_launch(const char *path, const char *arg) {
-    return __syscall(SYS_GUI_LAUNCH, (long)path, (long)arg, 0, 0, 0);
+    char full[4096];
+    if (!find_program(path, full, sizeof full)) return -N_ERR_NOT_FOUND;
+    return __syscall(SYS_GUI_LAUNCH, (long)full, (long)arg, 0, 0, 0);
 }
 
 n_result screen_grab(uint32_t *buf, size_t bytes, int *w, int *h) {

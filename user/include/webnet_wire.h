@@ -52,7 +52,7 @@
 #define WEBNET_WIRE_REFERRER 1048576u
 /* Private native service transport. Each request has its own duplex channel;
    responses start with this byte credit and replenish only after host reads.
-   Legacy persisted /bin/webfetch stdin/stdout callers do not opt into credit. */
+   Legacy persisted webfetch stdin/stdout callers do not opt into credit. */
 #define WEBNET_WIRE_SERVICE 2097152u
 /* Trusted top-document metadata. The 8-byte extension follows the optional
    referrer extension; its URL bytes follow optional referrer URL bytes in the

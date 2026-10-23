@@ -1,6 +1,6 @@
-/* The native ABI (docs/nocturne-native-abi.md) on the real kernel: documents
- * in RAM and FAT folders, message channels, apps and event queues. Run in a
- * dedicated test VM; it says nothing about GUI or real-site acceptance. */
+/* The native ABI (docs/nocturne-native-abi.md) on the real kernel: the paths of the one drive C:
+ * and the documents in its folders, message channels, apps and event queues. Run in a dedicated
+ * test VM; it says nothing about GUI or real-site acceptance. */
 #include "nocturne.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,15 +19,26 @@ static bool loaded(const char *path, const char *want, size_t n) {
     return same;
 }
 
+/* Whether the listing of folder has name spelled exactly so (the volume keeps the case it was given). */
+static bool listed(const char *folder, const char *name) {
+    struct n_entry list[16];
+    n_result n = n_folder_list(folder, list, 16, 0);
+    for (n_result i = 0; i < n; i++)
+        if (!strcmp(list[i].name, name)) return true;
+    return false;
+}
+
+/* One run of the folder and document calls inside root, a complete path. */
 static void documents(const char *root) {
-    char folder[128], a[160], b[160], sub[160], c[160], moved[160], inner[160];
-    snprintf(folder, sizeof folder, "%s/nativeabi", root);
-    snprintf(a, sizeof a, "%s/a.txt", folder);
-    snprintf(b, sizeof b, "%s/b.txt", folder);
-    snprintf(sub, sizeof sub, "%s/sub", folder);
-    snprintf(c, sizeof c, "%s/c.txt", sub);
-    snprintf(moved, sizeof moved, "%s/moved", folder);
-    snprintf(inner, sizeof inner, "%s/inner", sub);
+    char folder[512], a[640], b[640], sub[640], c[640], moved[640], inner[640], caps[640], bad[640];
+    CHECK(n_path_join(root, "nativeabi", folder, sizeof folder) > 0);
+    snprintf(a, sizeof a, "%s\\a.txt", folder);
+    snprintf(b, sizeof b, "%s\\b.txt", folder);
+    snprintf(sub, sizeof sub, "%s\\sub", folder);
+    snprintf(c, sizeof c, "%s\\c.txt", sub);
+    snprintf(moved, sizeof moved, "%s\\moved", folder);
+    snprintf(inner, sizeof inner, "%s\\inner", sub);
+    snprintf(caps, sizeof caps, "%s\\A.TXT", folder); /* a.txt in capitals */
     CHECK(n_folder_create(folder) == 0);
     CHECK(n_folder_create(folder) == -N_ERR_EXISTS);
 
@@ -35,6 +46,7 @@ static void documents(const char *root) {
     CHECK(h >= 0);
     CHECK(n_handle_kind(h) == N_KIND_DOCUMENT);
     CHECK(n_document_open(a, N_DOCUMENT_CREATE) == -N_ERR_EXISTS);
+    CHECK(n_document_open(caps, N_DOCUMENT_CREATE) == -N_ERR_EXISTS); /* names compare without case */
     CHECK(n_document_write_at(h, 0, "hello", 5) == 5);
     CHECK(n_document_write_at(h, 10, "world", 5) == 5);
     CHECK(n_document_size(h) == 15);
@@ -43,6 +55,7 @@ static void documents(const char *root) {
     CHECK(n_document_read_at(h, 0, buf, sizeof buf) == 15);
     CHECK(!memcmp(buf, "hello\0\0\0\0\0world", 15));
     CHECK(n_document_read_at(h, 15, buf, 4) == 0);
+    CHECK(n_document_commit(h, N_COMMIT_WAIT) == 0); /* the 15 bytes are the saved version */
     n_handle reader = n_document_open(a, N_DOCUMENT_READ);
     CHECK(reader >= 0);
     CHECK(n_document_write_at(reader, 0, "x", 1) == -N_ERR_DENIED);
@@ -53,7 +66,10 @@ static void documents(const char *root) {
     CHECK(n_document_claim(reader, false) == 0);
     CHECK(n_document_release(reader) == 0);
     CHECK(n_document_set_size(h, 5) == 0);
-    CHECK(n_document_size(reader) == 5);
+    CHECK(n_document_size(h) == 5);
+    /* a READ opening keeps reading the version saved when it was opened (§3) */
+    CHECK(n_document_size(reader) == 15);
+    CHECK(n_document_read_at(reader, 10, buf, sizeof buf) == 5 && !memcmp(buf, "world", 5));
     CHECK(n_handle_close(reader) == 0);
     CHECK(n_handle_close(h) == 0);
     CHECK(n_handle_kind(h) == -N_ERR_NO_HANDLE);
@@ -77,7 +93,8 @@ static void documents(const char *root) {
     struct n_entry e;
     CHECK(n_entry_info(b, &e) == 0 && e.kind == N_KIND_DOCUMENT && e.size == 10 && !strcmp(e.name, "b.txt"));
     CHECK(n_entry_info(folder, &e) == 0 && e.kind == N_KIND_FOLDER);
-    CHECK(n_entry_info("relative/b.txt", &e) == -N_ERR_INVALID);
+    CHECK(n_entry_info(caps, &e) == 0 && e.kind == N_KIND_DOCUMENT && e.size == 11);
+    CHECK(n_entry_info("relative\\b.txt", &e) == -N_ERR_INVALID);
     CHECK(n_document_open("b.txt", N_DOCUMENT_READ) == -N_ERR_INVALID);
 
     struct n_entry list[8];
@@ -93,15 +110,37 @@ static void documents(const char *root) {
     CHECK(n_folder_list(folder, list, 8, 2) == 0);
     CHECK(n_folder_list(a, list, 8, 0) == -N_ERR_NOT_FOLDER);
 
+    /* Names the volume refuses: nothing is made, and the folder keeps its two entries. */
+    const char *refused[] = {"what?.txt", "a:b", "ends with a dot.", "ends with a space ", "tab\there", "pipe|"};
+    for (size_t i = 0; i < sizeof refused / sizeof *refused; i++) {
+        snprintf(bad, sizeof bad, "%s\\%s", folder, refused[i]);
+        CHECK(n_folder_create(bad) == -N_ERR_INVALID);
+        CHECK(n_document_open(bad, N_DOCUMENT_CREATE) == -N_ERR_INVALID);
+    }
+    int len = snprintf(bad, sizeof bad, "%s\\", folder);
+    memset(bad + len, 'n', 256);
+    bad[len + 256] = 0;
+    CHECK(n_folder_create(bad) == -N_ERR_NAME_TOO_LONG);
+    bad[len + 255] = 0; /* 255 bytes is the longest name */
+    CHECK(n_folder_create(bad) == 0);
+    CHECK(n_entry_remove(bad) == 0);
+    CHECK(n_folder_list(folder, list, 8, 0) == 2);
+
     CHECK(n_folder_create(sub) == 0);
+    CHECK(n_entry_move(b, caps) == -N_ERR_EXISTS); /* a.txt is there in capitals */
     CHECK(n_entry_move(b, c) == 0);
     CHECK(n_entry_info(b, &e) == -N_ERR_NOT_FOUND);
     CHECK(loaded(c, "saved+more", 10));
     CHECK(n_entry_move(a, c) == -N_ERR_EXISTS); /* never replaces */
     CHECK(loaded(a, "new content", 11));
+    /* The same item may take another case of its name; the listing shows the form it was given. */
+    CHECK(n_entry_move(a, caps) == 0);
+    CHECK(listed(folder, "A.TXT") && !listed(folder, "a.txt") && loaded(a, "new content", 11));
+    CHECK(n_entry_move(caps, a) == 0);
+    CHECK(listed(folder, "a.txt") && !listed(folder, "A.TXT"));
     CHECK(n_entry_move(sub, inner) == -N_ERR_INVALID);
     CHECK(n_entry_move(sub, moved) == 0);
-    snprintf(c, sizeof c, "%s/c.txt", moved);
+    snprintf(c, sizeof c, "%s\\c.txt", moved);
     CHECK(loaded(c, "saved+more", 10));
     CHECK(n_entry_info(sub, &e) == -N_ERR_NOT_FOUND);
     CHECK(n_entry_remove(folder) == -N_ERR_NOT_EMPTY);
@@ -110,6 +149,48 @@ static void documents(const char *root) {
     CHECK(n_entry_remove(a) == 0);
     CHECK(n_entry_remove(folder) == 0);
     CHECK(n_entry_info(folder, &e) == -N_ERR_NOT_FOUND);
+}
+
+/* The rules of a path: one drive C:, complete paths only, either separator, names without case. */
+static void paths(void) {
+    struct n_entry e;
+    CHECK(n_entry_info("C:\\", &e) == 0 && e.kind == N_KIND_FOLDER);
+    CHECK(n_entry_info("c:/", &e) == 0 && e.kind == N_KIND_FOLDER);
+    CHECK(n_entry_info("\\", &e) == 0 && e.kind == N_KIND_FOLDER); /* complete: C: is the only drive */
+    CHECK(n_entry_info(N_FOLDER_SYSTEM, &e) == 0 && e.kind == N_KIND_FOLDER);
+    CHECK(n_entry_info("c:/nocturne/system", &e) == 0 && e.kind == N_KIND_FOLDER);
+    CHECK(n_entry_info(N_FOLDER_SYSTEM "\\.\\..\\System\\", &e) == 0 && e.kind == N_KIND_FOLDER);
+    /* "C:", "C:a" and "a" are in a current folder, which the kernel does not have. */
+    CHECK(n_entry_info("C:", &e) == -N_ERR_INVALID);
+    CHECK(n_entry_info("C:Nocturne", &e) == -N_ERR_INVALID);
+    CHECK(n_entry_info("Nocturne", &e) == -N_ERR_INVALID);
+    CHECK(n_entry_info("", &e) == -N_ERR_INVALID);
+    CHECK(n_entry_info("D:\\", &e) == -N_ERR_NOT_FOUND);
+    CHECK(n_entry_info("D:\\Nocturne", &e) == -N_ERR_NOT_FOUND);
+    CHECK(n_document_open("Z:\\nativeabi.txt", N_DOCUMENT_CREATE) == -N_ERR_NOT_FOUND);
+    CHECK(n_entry_info("1:\\", &e) == -N_ERR_INVALID);
+    /* What belongs to the system is not changed by apps. */
+    CHECK(n_folder_create("C:\\Nocturne\\nativeabi") == -N_ERR_DENIED);
+    CHECK(n_document_save("C:\\Nocturne\\nativeabi.txt", "x", 1) == -N_ERR_DENIED);
+    CHECK(n_entry_remove("C:\\") == -N_ERR_DENIED);
+}
+
+/* A move to another folder gives the same document a new name: nothing is copied. */
+static void moves(void) {
+    char one[512], two[512], from[640], to[640];
+    CHECK(n_path_join(n_temp_folder(), "nativeabi-one", one, sizeof one) > 0);
+    CHECK(n_path_join(n_temp_folder(), "nativeabi-two", two, sizeof two) > 0);
+    snprintf(from, sizeof from, "%s\\across.txt", one);
+    snprintf(to, sizeof to, "%s\\across.txt", two);
+    CHECK(n_folder_create(one) == 0);
+    CHECK(n_folder_create(two) == 0);
+    CHECK(n_document_save(from, "across", 6) == 0);
+    CHECK(n_entry_move(from, to) == 0);
+    CHECK(loaded(to, "across", 6));
+    CHECK(n_entry_info(from, &(struct n_entry){0}) == -N_ERR_NOT_FOUND);
+    CHECK(n_entry_remove(to) == 0);
+    CHECK(n_entry_remove(one) == 0);
+    CHECK(n_entry_remove(two) == 0);
 }
 
 static void channels(void) {
@@ -131,8 +212,10 @@ static void channels(void) {
     CHECK(n_channel_receive(c[0], buf, sizeof buf, N_CHANNEL_WAIT, NULL) == 4 && !memcmp(buf, "back", 4));
 
     /* A document travels with its message and arrives as a new handle. */
-    CHECK(n_document_save("/home/nativeabi-attached", "attached", 8) == 0);
-    n_handle doc = n_document_open("/home/nativeabi-attached", N_DOCUMENT_READ);
+    char attached[512];
+    CHECK(n_path_join(n_temp_folder(), "nativeabi-attached", attached, sizeof attached) > 0);
+    CHECK(n_document_save(attached, "attached", 8) == 0);
+    n_handle doc = n_document_open(attached, N_DOCUMENT_READ);
     CHECK(doc >= 0);
     CHECK(n_channel_send(c[0], "doc", 3, doc) == 3);
     CHECK(n_handle_close(doc) == 0);
@@ -145,7 +228,7 @@ static void channels(void) {
     CHECK(n_channel_send(c[0], "plain", 5, -1) == 5);
     got = 7;
     CHECK(n_channel_receive(c[1], buf, sizeof buf, 0, &got) == 5 && got == -1);
-    n_entry_remove("/home/nativeabi-attached");
+    n_entry_remove(attached);
 
     /* Event queue: level-triggered readiness, closing, timers, memory words. */
     n_handle q = n_events_create();
@@ -253,8 +336,9 @@ static void apps(const char *self) {
     CHECK(n_app_launch(self, &l) == -N_ERR_NO_HANDLE); /* the table names closed handles */
     l.handle_count = 0;
 
-    CHECK(n_app_launch("nativeabitest", &l) == -N_ERR_INVALID);
-    CHECK(n_app_launch("/home/no-such-program", &l) == -N_ERR_NOT_FOUND);
+    CHECK(n_app_launch("nativeabitest", &l) == -N_ERR_INVALID); /* a name in no folder */
+    CHECK(n_app_launch(N_FOLDER_SYSTEM "\\no-such-program", &l) == -N_ERR_NOT_FOUND);
+    CHECK(n_app_launch("D:\\nativeabitest", &l) == -N_ERR_NOT_FOUND); /* there is no drive D: */
     const char *bad[] = {"NO_EQUALS"};
     l.settings = bad;
     CHECK(n_app_launch(self, &l) == -N_ERR_INVALID);
@@ -295,16 +379,14 @@ static void memory(void) {
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "child")) return child(argv[2]);
     memory();
-    documents("/home");
-    documents("/data");
-    /* Across folders on different devices the document is copied whole. */
-    CHECK(n_document_save("/home/nativeabi-cross", "across", 6) == 0);
-    CHECK(n_entry_move("/home/nativeabi-cross", "/data/nativeabi-cross") == 0);
-    CHECK(loaded("/data/nativeabi-cross", "across", 6));
-    CHECK(n_entry_info("/home/nativeabi-cross", &(struct n_entry){0}) == -N_ERR_NOT_FOUND);
-    n_entry_remove("/data/nativeabi-cross");
+    paths();
+    documents(n_temp_folder()); /* the temporary folder, and the user's folder that is kept */
+    documents(n_user_folder());
+    moves();
     channels();
-    apps(argv[0]);
+    char self[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    CHECK(n_path_complete(argv[0], self, sizeof self) >= 0);
+    apps(self);
     CHECK(!strcmp(n_result_text(-N_ERR_NOT_FOUND), "not found"));
     printf("nativeabitest: %u checks, %u failed\n", checks, failed);
     return failed != 0;

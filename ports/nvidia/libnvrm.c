@@ -1,4 +1,4 @@
-/* libnvrm: an app's connection to /bin/nvrm (include/nvrm.h, include/nvrm_protocol.h). */
+/* libnvrm: an app's connection to nvrm (include/nvrm.h, include/nvrm_protocol.h). */
 #include <stdlib.h>
 #include <stdio.h>
 #include <limits.h>

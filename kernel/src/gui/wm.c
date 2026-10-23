@@ -5,8 +5,8 @@
  * shared with the owning process (mapped into its address space). Apps draw
  * into it and call win_present(); the compositor redraws damaged screen
  * regions back-to-front into a backbuffer and copies them to the framebuffer.
- * Input events are delivered through the window's file descriptor, so a
- * window can be poll()ed together with pipes.
+ * Input events are delivered through the window's handle, so an event queue
+ * can watch a window together with channels.
  */
 #include "kernel.h"
 #include "arch/cpu.h"
@@ -19,7 +19,7 @@
 #include "dev/input.h"
 #include "dev/pciuser.h"
 #include "dev/timer.h"
-#include "fs/vfs.h"
+#include "sys/object.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "sys/sched.h"
@@ -66,7 +66,7 @@ struct window {
     struct gui_event ev[EVQ];
     int ev_head, ev_tail, ev_count;
     struct wait_queue wq;
-    struct vnode *vn;
+    struct object object; /* what the app's window handle reaches */
 };
 
 /* ---- state ---- */
@@ -87,30 +87,12 @@ static bool deep_wanted;
 static bool presenting_back;
 static struct wait_queue present_wait;
 
-/* BSP kernel continuations can be timer-preempted too. Serialize borrowed
-   window/frame state without masking interrupts during allocation or copies.
-   Reentrancy is needed for notifications and final vnode close from a WM call.
-   IRQ input sinks only enqueue input; they never acquire this sleeping lock. */
-static struct task *wm_owner;
-static unsigned wm_depth;
-static struct wait_queue wm_lock_wait;
-static void wm_lock(void) {
-    cpu_require_bsp();
-    uint64_t flags = irq_save();
-    while (wm_owner && wm_owner != current_task) wq_wait(&wm_lock_wait);
-    wm_owner = current_task;
-    wm_depth++;
-    irq_restore(flags);
-}
-static void wm_unlock(void) {
-    uint64_t flags = irq_save();
-    if (wm_owner != current_task || !wm_depth) panic("wm: invalid owner");
-    if (!--wm_depth) {
-        wm_owner = NULL;
-        wq_wake_all(&wm_lock_wait);
-    }
-    irq_restore(flags);
-}
+/* Window and frame state stays borrowed across allocations and copies. Reentrant: notifications
+   and a window handle's last close come from inside a WM call. IRQ input sinks only enqueue
+   input; they never take it. */
+static struct mutex wm_mutex;
+static void wm_lock(void) { mutex_lock(&wm_mutex); }
+static void wm_unlock(void) { mutex_unlock(&wm_mutex); }
 
 static struct window *zorder[MAX_WIN]; /* bottom .. top */
 static int nwin;
@@ -276,7 +258,7 @@ static void push_event(struct window *w, const struct gui_event *e) {
         w->frame_event = *e;
         w->frame_ready = true;
         wq_wake_all(&w->wq);
-        vfs_poll_notify(w->vn);
+        object_notify(&w->object);
         irq_restore(flags); return;
     }
     if (e->type == EV_MOUSE_MOVE && w->ev_count) {
@@ -291,7 +273,7 @@ static void push_event(struct window *w, const struct gui_event *e) {
     w->ev_head = (w->ev_head + 1) % EVQ;
     w->ev_count++;
     wq_wake_all(&w->wq);
-    vfs_poll_notify(w->vn);
+    object_notify(&w->object);
     irq_restore(flags);
 }
 
@@ -407,7 +389,7 @@ static void win_destroy_locked(struct window *w) {
     if (last_focus == w) last_focus = NULL;
     update_focus();
     wq_wake_all(&w->wq);
-    vfs_poll_notify(w->vn);
+    object_notify(&w->object);
     wake_compositor();
 }
 
@@ -453,20 +435,17 @@ static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, 
     }
 }
 
-static bool win_can_read(struct vnode *v, struct file *f) {
-    struct window *w = v->priv;
-    return w->ev_count > 0 || w->frame_ready || w->dead;
+static uint32_t win_ready(struct handle *h) {
+    struct window *w = h->object->priv;
+    return w->ev_count > 0 || w->frame_ready || w->dead ? N_EVENT_RECEIVABLE : 0;
 }
 
-static void win_close(struct vnode *v, struct file *f) { win_destroy(v->priv); }
+static void win_close(struct handle *h) { win_destroy(h->object->priv); }
 
-static void win_release(struct vnode *v) {
-    kfree(v->priv);
-    kfree(v);
-}
+static void win_release(struct object *o) { kfree(o->priv); }
 
-static struct vnode_ops win_ops = {
-    .can_read = win_can_read, .close = win_close, .release = win_release};
+static const struct object_ops win_ops = {
+    .kind = N_KIND_WINDOW, .ready = win_ready, .close = win_close, .release = win_release};
 
 static bool alloc_buffer(struct window *w, int cw, int ch) {
     w->deep = (w->flags & WIN_DEEP_COLOR) != 0; /* kept on 8 bpc: the depth can change */
@@ -588,28 +567,31 @@ struct app {
     const char *name;
     const char *path;
     int icon;
-    const char *arg; /* the one argument, or NULL: apps written in TypeScript run as /bin/js FILE.js */
+    const char *arg; /* the one argument, or NULL: apps written in TypeScript run as SYSTEM "js" FILE.js */
 };
 
+#define SYSTEM   N_FOLDER_SYSTEM "\\"
+#define PROGRAMS N_FOLDER_PROGRAMS "\\"
+
 static const struct app apps[] = {
-    {"Terminal", "/bin/term", ICON_TERMINAL},
-    {"Files", "/bin/files", ICON_FILES},
-    {"Web Browser", "/bin/browser", ICON_NET},
-    {"Text Editor", "/bin/notepad", ICON_EDITOR},
-    {"Paint", "/bin/paint", ICON_PAINT},
-    {"Calculator", "/bin/calc", ICON_CALC},
-    {"Clock", "/bin/clock", ICON_CLOCK},
-    {"System Monitor", "/bin/sysmon", ICON_MONITOR},
-    {"Piano", "/bin/piano", ICON_PIANO},
-    {"Sound Player", "/bin/player", ICON_SOUND},
-    {"Snake", "/bin/snake", ICON_SNAKE},
-    {"Tetris", "/bin/tetris", ICON_TETRIS},
-    {"Minesweeper", "/bin/mines", ICON_MINES},
-    {"Mandelbrot", "/bin/mandel", ICON_FRACTAL},
-    {"3D Cube", "/bin/cube", ICON_CUBE},
-    {"Game of Life", "/bin/life", ICON_LIFE},
-    {"Settings", "/bin/js", ICON_SETTINGS, "/bin/settings.js"},
-    {"About Nocturne", "/bin/js", ICON_ABOUT, "/bin/about.js"},
+    {"Terminal", SYSTEM "term", ICON_TERMINAL},
+    {"Files", SYSTEM "files", ICON_FILES},
+    {"Web Browser", PROGRAMS "Browser\\browser", ICON_NET},
+    {"Text Editor", PROGRAMS "Notepad\\notepad", ICON_EDITOR},
+    {"Paint", PROGRAMS "Paint\\paint", ICON_PAINT},
+    {"Calculator", PROGRAMS "Calculator\\calc", ICON_CALC},
+    {"Clock", PROGRAMS "Clock\\clock", ICON_CLOCK},
+    {"System Monitor", SYSTEM "sysmon", ICON_MONITOR},
+    {"Piano", PROGRAMS "Piano\\piano", ICON_PIANO},
+    {"Sound Player", PROGRAMS "Player\\player", ICON_SOUND},
+    {"Snake", PROGRAMS "Snake\\snake", ICON_SNAKE},
+    {"Tetris", PROGRAMS "Tetris\\tetris", ICON_TETRIS},
+    {"Minesweeper", PROGRAMS "Minesweeper\\mines", ICON_MINES},
+    {"Mandelbrot", PROGRAMS "Mandelbrot\\mandel", ICON_FRACTAL},
+    {"3D Cube", PROGRAMS "Cube\\cube", ICON_CUBE},
+    {"Game of Life", PROGRAMS "Life\\life", ICON_LIFE},
+    {"Settings", SYSTEM "js", ICON_SETTINGS, SYSTEM "settings.js"},
+    {"About Nocturne", SYSTEM "js", ICON_ABOUT, SYSTEM "about.js"},
     {"Sleep", "@sleep", ICON_SLEEP},
     {"Hibernate", "@hibernate", ICON_HIBERNATE},
     {"Restart", "@reboot", ICON_REBOOT},
@@ -1809,7 +1791,7 @@ static void handle_key(const struct key_event *k) {
             return;
         }
         if (ctrl && alt && (k->key == 't' || k->key == 'T')) {
-            launch("/bin/term", NULL);
+            launch(SYSTEM "term", NULL);
             return;
         }
         if (vol_open && k->key == KEY_ESC) {
@@ -2458,9 +2440,9 @@ void wm_close_windows(void) {
 }
 
 /* ---- syscalls ---- */
-static struct window *fd_window(struct file *f) {
-    if (!f || f->vn->type != VT_WINDOW) return NULL;
-    struct window *w = f->vn->priv;
+static struct window *handle_window(struct handle *h) {
+    if (!handle_is(h, &win_ops)) return NULL;
+    struct window *w = h->object->priv;
     return w->dead ? NULL : w;
 }
 
@@ -2504,38 +2486,22 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
         if (w->x + frame_w(w) > sw) w->x = MAX(0, sw - frame_w(w));
         if (w->y + frame_h(w) > sh - TASKBAR_H) w->y = MAX(0, sh - TASKBAR_H - frame_h(w));
     }
-    struct vnode *v = kzalloc(sizeof *v);
-    if (!v) {
+    object_init(&w->object, &win_ops, w);
+    struct handle *h = handle_open(&w->object, true);
+    if (!h) {
         vfree(w->buf, w->pages);
         vfree(w->user_buf, w->pages);
         kfree(w);
         return -N_ERR_NO_MEMORY;
     }
-    strlcpy(v->name, "window", sizeof v->name);
-    v->type = VT_WINDOW;
-    v->ops = &win_ops;
-    v->priv = w;
-    v->unlinked = true;
-    w->vn = v;
-    struct file *f = vfs_open_vnode(v, O_RDWR);
-    if (!f) {
-        vfree(w->buf, w->pages);
-        vfree(w->user_buf, w->pages);
-        kfree(w); kfree(v); return -N_ERR_NO_MEMORY;
-    }
-    uint64_t irq = irq_save();
-    int fd=task_fd_alloc(task_process(),f);
-    irq_restore(irq);
-    if (fd < 0) {
-        vfs_close(f); /* destroys the window and frees everything */
-        return fd;
-    }
+    int index = handle_install(h);
+    if (index < 0) return index; /* closing it destroyed the window and freed everything */
     w->pml4 = current_task->pml4;
     zorder[nwin++] = w;
     /* Use the ordinary WM transition and resize event. The client still owns
        its real framebuffer allocation; startup must not invent a viewport. */
     if (flags & WIN_START_MAXIMIZED) toggle_maximize(w);
-    return fd;
+    return index;
 }
 
 static void show_if_needed(struct window *w) {
@@ -2546,11 +2512,11 @@ static void show_if_needed(struct window *w) {
     damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H);
 }
 
-static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, struct file *file) {
+static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, struct handle *handle) {
     switch (num) {
     case SYS_WIN_CREATE: return sys_win_create((int)a, (int)b, (const char *)c, (int)d);
     case SYS_WIN_MAP: {
-        struct window *w = fd_window(file);
+        struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
         if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
         if (b >= ((w->flags & WIN_DOUBLE_BUFFER) ? WIN_BUFFER_COUNT : 1) || c > WIN_MAP_ACQUIRE) return -N_ERR_INVALID;
@@ -2571,13 +2537,13 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return va ? (int64_t)va : -N_ERR_NO_MEMORY;
     }
     case SYS_WIN_STATE: {
-        struct window *w=fd_window(file);
+        struct window *w=handle_window(handle);
         if(!w)return -N_ERR_NO_HANDLE;
         if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;
         return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0) | (w->fullscreen?WIN_STATE_FULLSCREEN:0);
     }
     case SYS_WIN_PRESENTATION: {
-        struct window *w=fd_window(file);if(!w)return -N_ERR_NO_HANDLE;
+        struct window *w=handle_window(handle);if(!w)return -N_ERR_NO_HANDLE;
         if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;if(b>1)return -N_ERR_INVALID;
         if(w->fullscreen==!!b)return 0;
         damage_window(w);struct gui_event resize={.type=EV_RESIZE};
@@ -2586,7 +2552,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         push_event(w,&resize);damage_window(w);damage_taskbar();wake_compositor();return 0;
     }
     case SYS_WIN_PRESENT: {
-        struct window *w = fd_window(file);
+        struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
         if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
         if (w->flags & WIN_DOUBLE_BUFFER) {
@@ -2622,7 +2588,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return 0;
     }
     case SYS_WIN_SET_TITLE: {
-        struct window *w = fd_window(file);
+        struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
         if (user_title(w->title, (const char *)b, sizeof w->title) < 0) return -N_ERR_BAD_ADDRESS;
         if (w->shown) {
@@ -2679,7 +2645,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return running ? 0 : -N_ERR_UNSUPPORTED;
     }
     case SYS_WIN_MOVE: {
-        struct window *w = fd_window(file);
+        struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
         damage_window(w);
         w->x = (int)b;
@@ -2701,7 +2667,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return (int64_t)clipboard_len;
     }
     case SYS_WIN_RESIZE: {
-        struct window *w = fd_window(file);
+        struct window *w = handle_window(handle);
         if (!w) return -N_ERR_NO_HANDLE;
         if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
         int ncw = MAX(16, MIN((int)b, sw)), nch = MAX(16, MIN((int)c, sh));
@@ -2749,11 +2715,14 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return (int64_t)sw << 16 | sh;
     }
     case SYS_GUI_LAUNCH: {
-        char path[PATH_MAX_LEN], arg[PATH_MAX_LEN];
-        if (user_str(path, (const char *)a, sizeof path) < 0) return -N_ERR_BAD_ADDRESS;
-        bool has_arg = b != 0;
-        if (has_arg && user_str(arg, (const char *)b, sizeof arg) < 0) return -N_ERR_BAD_ADDRESS;
-        return proc_spawn_simple(path, has_arg ? arg : NULL, NULL);
+        char *path, *arg = NULL;
+        int r = user_string((const char *)a, &path);
+        if (r < 0) return r;
+        if (b && (r = user_string((const char *)b, &arg)) < 0) { kfree(path); return r; }
+        r = proc_spawn_simple(path, arg, NULL);
+        kfree(path);
+        kfree(arg);
+        return r;
     }
     default: return -N_ERR_UNSUPPORTED;
     }
@@ -2761,30 +2730,21 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
 
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     if (num == SYS_GUI_LAUNCH) return wm_syscall_locked(num,a,b,c,d,e,NULL);
-    struct file *file = NULL;
+    struct handle *handle = NULL;
     if (num == SYS_WIN_RECEIVE) {
-        /* Waits without the WM lock; the file reference keeps the window's memory. */
-        uint64_t flags = irq_save();
-        int fd = (int)a;
-        if (fd >= 0 && (size_t)fd < task_process()->fd_capacity && task_process()->fds[fd])
-            file = vfs_dup(task_process()->fds[fd]);
-        irq_restore(flags);
-        int64_t result = !file ? -N_ERR_NO_HANDLE : file->vn->type != VT_WINDOW ? -N_ERR_WRONG_KIND
-                       : win_receive(file->vn->priv, (struct gui_event *)b, (size_t)c, (int64_t)d);
-        vfs_close(file);
+        /* Waits without the WM lock; the handle's reference keeps the window's memory. */
+        handle = handle_get((int)a);
+        int64_t result = !handle ? -N_ERR_NO_HANDLE : !handle_is(handle, &win_ops) ? -N_ERR_WRONG_KIND
+                       : win_receive(handle->object->priv, (struct gui_event *)b, (size_t)c, (int64_t)d);
+        handle_close(handle);
         return result;
     }
     if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENTATION || num == SYS_WIN_PRESENT ||
-        num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE) {
-        uint64_t flags = irq_save();
-        int fd = (int)a;
-        if (fd >= 0 && (size_t)fd < task_process()->fd_capacity && task_process()->fds[fd])
-            file = vfs_dup(task_process()->fds[fd]);
-        irq_restore(flags);
-    }
+        num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE)
+        handle = handle_get((int)a);
     wm_lock();
-    int64_t result = wm_syscall_locked(num,a,b,c,d,e,file);
+    int64_t result = wm_syscall_locked(num,a,b,c,d,e,handle);
     wm_unlock();
-    vfs_close(file);
+    handle_close(handle);
     return result;
 }

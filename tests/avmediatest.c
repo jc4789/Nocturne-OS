@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #ifndef AVMEDIA_CASES_SCRIPT
-#define AVMEDIA_CASES_SCRIPT "/data/tests/js_avmedia_cases.js"
+#define AVMEDIA_CASES_SCRIPT "C:\\Tests\\js_avmedia_cases.js"
 #define AVMEDIA_FRAME_FIXTURE "h264.mp4"
 #define AVMEDIA_TEST_NAME "avmediatest"
 #endif
@@ -36,7 +36,7 @@ static void deliver(void){
     for(int i=0;i<8;i++)if(queue[i].used&&queue[i].due<=uptime_ms()){
         queue[i].used=false;struct web_response response={0};strlcpy(response.url,queue[i].url,sizeof response.url);
         const char *name=strrchr(queue[i].url,'/');name=name?name+1:"";
-        bool overlong=!strcmp(name,"overlong.avi");char path[256];snprintf(path,sizeof path,"/data/tests/media-fixtures/%s",overlong?"mjpeg.avi":name);
+        bool overlong=!strcmp(name,"overlong.avi");char path[256];snprintf(path,sizeof path,"C:\\Tests\\media-fixtures\\%s",overlong?"mjpeg.avi":name);
         FILE *f=fopen(path,"rb");response.status=f?200:404;
         if(f){fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);if(n>0&&n<131072){response.body=malloc((size_t)n);if(response.body){response.body_len=fread(response.body,1,(size_t)n,f);}}fclose(f);}
         /* Own fixture, unchanged compressed frames: falsify AVI frame-count
@@ -62,7 +62,7 @@ static void step(void){
     n_sleep_ms(2);
 }
 static void first_picture(void){
-    char error[160];nmedia *m=nmedia_open("/data/tests/media-fixtures/" AVMEDIA_FRAME_FIXTURE,error,sizeof error);CHECK(m!=NULL);if(!m)return;
+    char error[160];nmedia *m=nmedia_open("C:\\Tests\\media-fixtures\\" AVMEDIA_FRAME_FIXTURE,error,sizeof error);CHECK(m!=NULL);if(!m)return;
     struct nmedia_output out;int r=NMEDIA_AGAIN;for(int i=0;i<100&&r==NMEDIA_AGAIN;i++)r=nmedia_step(m,&out);
     CHECK(r==NMEDIA_VIDEO&&out.pts_ms==0);
     canvas_t c;gfx_init(&c,first_frame,96,32,96);gfx_fill(&c,0,0,96,32,RGB(0,0,0));

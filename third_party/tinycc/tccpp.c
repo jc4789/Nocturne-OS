@@ -1629,7 +1629,7 @@ static CachedInclude *search_cached_include(TCCState *s1, const char *filename, 
     s = basename = tcc_basename(filename);
     h = TOK_HASH_INIT;
     while ((c = (unsigned char)*s) != 0) {
-#ifdef _WIN32
+#if defined _WIN32 || CONFIG_TCC_NOCTURNE
         h = TOK_HASH_FUNC(h, toup(c));
 #else
         h = TOK_HASH_FUNC(h, c);

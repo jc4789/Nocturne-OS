@@ -6,11 +6,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: cp SRC DST\n");
         return 1;
     }
-    char src[512], dst[512], named[512];
+    char src[1024], dst[1024], named[1024];
     struct n_entry e;
     n_result r = n_path_complete(argv[1], src, sizeof src);
     if (r >= 0) r = n_path_complete(argv[2], named, sizeof named);
-    if (r >= 0 && n_entry_info(named, &e) >= 0 && e.kind == N_KIND_FOLDER) r = n_path_join(named, strrchr(src, '/') + 1, dst, sizeof dst);
+    if (r >= 0 && n_entry_info(named, &e) >= 0 && e.kind == N_KIND_FOLDER) r = n_path_join(named, n_path_name(src), dst, sizeof dst);
     else if (r >= 0) memcpy(dst, named, sizeof dst);
     if (r < 0) {
         fprintf(stderr, "cp: %s: %s\n", argv[2], n_result_text(r));

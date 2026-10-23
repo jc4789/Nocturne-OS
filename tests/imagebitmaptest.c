@@ -206,7 +206,7 @@ int main(int argc,char **argv){
     if(argc>1&&!strcmp(argv[1],"--heap-oom"))return heap_oom_contract();
     if(argc>1&&!strcmp(argv[1],"--heap"))return heap_contract();
     native_lifetimes();
-    FILE *file=fopen("/data/tests/js_image_bitmap_cases.js","rb");if(!file){puts("imagebitmap: fixture missing");return 1;}
+    FILE *file=fopen("C:\\Tests\\js_image_bitmap_cases.js","rb");if(!file){puts("imagebitmap: fixture missing");return 1;}
     fseek(file,0,SEEK_END);long length=ftell(file);fseek(file,0,SEEK_SET);char *source=length>0?malloc((size_t)length+1):NULL;
     if(!source||fread(source,1,(size_t)length,file)!=(size_t)length){fclose(file);free(source);return 1;}fclose(file);source[length]=0;
     const uint32_t pixels[]={0xffff0000,0x8000ff00,0xff0000ff,0x00ffffff};uint8_t *png=NULL;size_t png_size=0;

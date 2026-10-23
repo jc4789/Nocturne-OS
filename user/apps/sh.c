@@ -9,14 +9,15 @@
 #define MAX_LINE 1024
 #define MAX_ARGS 64
 #define MAX_HIST 64
+#define WELCOME  "C:\\Nocturne\\Welcome.txt" /* shown when the shell starts at a terminal */
 
 static char *history[MAX_HIST];
 static int nhist;
 static int last_status;
 
-/* The current folder: names typed without a leading "/" are inside it, and the
+/* The current folder: names that are not complete paths are inside it, and the
    apps the shell starts get it as their FOLDER setting. */
-static char folder[512] = "/";
+static char folder[4096] = "C:\\";
 /* A channel on which the terminal sends a message for each Ctrl+C (setting INTERRUPTS). */
 static n_handle interrupts = -1;
 /* Which of the shell's own input, output and log exist. */
@@ -31,21 +32,52 @@ static void out(const char *s) {
 /* name typed by the user as a complete path */
 static bool complete_name(const char *name, char *path, size_t n) { return n_path_join(folder, name, path, n) >= 0; }
 
+/* The last folder separator in a typed name ('\', or '/' accepted as one), or NULL. */
+static const char *last_separator(const char *name) {
+    const char *b = strrchr(name, '\\'), *s = strrchr(name, '/');
+    return !b ? s : !s ? b : b > s ? b : s;
+}
+
 static void prompt_str(char *buf, size_t n) {
-    const char *shown = folder;
-    char tmp[520];
-    if (!strncmp(folder, "/home", 5) && (folder[5] == 0 || folder[5] == '/')) {
-        snprintf(tmp, sizeof tmp, "~%s", folder + 5);
-        shown = tmp;
-    }
-    snprintf(buf, n, "\x1b[1;35mnocturne\x1b[0m:\x1b[1;34m%s\x1b[0m%s ", shown, last_status ? "\x1b[31m$\x1b[0m" : "$");
+    snprintf(buf, n, "\x1b[1;35mnocturne\x1b[0m:\x1b[1;34m%s\x1b[0m%s ", folder, last_status ? "\x1b[31m$\x1b[0m" : "$");
 }
 
 /* ---- tab completion ---- */
+struct matches {
+    char common[sizeof ((struct n_entry *)0)->name]; /* the start every match shares */
+    bool folder;                                     /* the first match is a folder */
+    int count;
+    char list[1024];
+};
+
+/* Add the names in the folder at path that start with prefix; letter case aside, as names compare. */
+static void add_matches(const char *path, const char *prefix, struct matches *m) {
+    struct n_entry *ents;
+    n_result count = n_folder_entries(path, &ents);
+    size_t pl = strlen(prefix);
+    for (n_result i = 0; i < count; i++) {
+        const struct n_entry *d = &ents[i];
+        if (strncasecmp(d->name, prefix, pl)) continue;
+        if (m->count++ == 0) {
+            strcpy(m->common, d->name);
+            m->folder = d->kind == N_KIND_FOLDER;
+        } else {
+            int k = 0;
+            while (m->common[k] && tolower((unsigned char)m->common[k]) == tolower((unsigned char)d->name[k])) k++;
+            m->common[k] = 0;
+        }
+        if (strlen(m->list) + strlen(d->name) + 3 < sizeof m->list) {
+            strcat(m->list, d->name);
+            strcat(m->list, "  ");
+        }
+    }
+    if (count >= 0) free(ents);
+}
+
 static void complete(char *buf, int *len, int *cur) {
     int start = *cur;
     while (start > 0 && buf[start - 1] != ' ') start--;
-    char word[256];
+    char word[MAX_LINE];
     int wl = *cur - start;
     memcpy(word, buf + start, wl);
     word[wl] = 0;
@@ -53,59 +85,39 @@ static void complete(char *buf, int *len, int *cur) {
     for (int i = 0; i < start; i++)
         if (buf[i] != ' ') first = false;
 
-    char dir[256], prefix[256];
-    char *slash = strrchr(word, '/');
-    if (slash) {
-        int dl = (int)(slash - word);
-        if (dl == 0) strcpy(dir, "/");
-        else {
-            memcpy(dir, word, dl);
-            dir[dl] = 0;
-        }
-        strcpy(prefix, slash + 1);
-    } else {
-        strcpy(dir, first ? "/bin" : ".");
-        strcpy(prefix, word);
+    /* the folder typed so far keeps its separator, so that "\" alone is the root */
+    char dir[MAX_LINE] = ".", path[4096];
+    const char *prefix = word, *sep = last_separator(word);
+    if (sep) {
+        memcpy(dir, word, sep - word + 1);
+        dir[sep - word + 1] = 0;
+        prefix = sep + 1;
     }
-    char path[512];
-    struct n_entry *ents;
-    n_result count = complete_name(dir, path, sizeof path) ? n_folder_entries(path, &ents) : -1;
-    if (count < 0) return;
-    char match[256] = {0};
-    int nmatch = 0;
-    bool match_dir = false;
-    char list[1024] = {0};
-    for (int i = 0; i < (int)count; i++) {
-        const struct n_entry *d = &ents[i];
-        if (strncmp(d->name, prefix, strlen(prefix))) continue;
-        if (nmatch == 0) {
-            strcpy(match, d->name);
-            match_dir = d->kind == N_KIND_FOLDER;
-        } else {
-            /* keep the common prefix */
-            int k = 0;
-            while (match[k] && match[k] == d->name[k]) k++;
-            match[k] = 0;
-        }
-        if (strlen(list) + strlen(d->name) + 3 < sizeof list) {
-            strcat(list, d->name);
-            strcat(list, "  ");
-        }
-        nmatch++;
+    struct matches m = {0};
+    if (!sep && first) {
+        /* a program: the system's, then those in each app's folder (as find_program looks) */
+        add_matches(N_FOLDER_SYSTEM, prefix, &m);
+        struct n_entry *apps;
+        n_result count = n_folder_entries(N_FOLDER_PROGRAMS, &apps);
+        for (n_result i = 0; i < count; i++)
+            if (apps[i].kind == N_KIND_FOLDER && n_path_join(N_FOLDER_PROGRAMS, apps[i].name, path, sizeof path) >= 0)
+                add_matches(path, prefix, &m);
+        if (count >= 0) free(apps);
+    } else if (complete_name(dir, path, sizeof path)) {
+        add_matches(path, prefix, &m);
     }
-    free(ents);
-    if (!nmatch) return;
-    const char *add = match + strlen(prefix);
+    if (!m.count) return;
+    const char *add = m.common + strlen(prefix);
     int al = (int)strlen(add);
-    if (nmatch == 1) {
-        static char tmp[66];
-        snprintf(tmp, sizeof tmp, "%s%s", add, match_dir ? "/" : " ");
+    if (m.count == 1) {
+        static char tmp[sizeof m.common + 1];
+        snprintf(tmp, sizeof tmp, "%s%s", add, m.folder ? "\\" : " ");
         add = tmp;
         al = (int)strlen(tmp);
     }
-    if (al == 0 && nmatch > 1) {
+    if (al == 0 && m.count > 1) {
         out("\n");
-        out(list);
+        out(m.list);
         out("\n");
         return;
     }
@@ -160,7 +172,7 @@ static int read_byte(void) {
 }
 
 static void redraw(const char *prompt, const char *buf, int len, int cur) {
-    char tmp[MAX_LINE + 512];
+    char tmp[MAX_LINE + sizeof folder + 128];
     int n = snprintf(tmp, sizeof tmp, "\r%s%.*s\x1b[K", prompt, len, buf);
     if (len - cur > 0) n += snprintf(tmp + n, sizeof tmp - n, "\x1b[%dD", len - cur);
     fwrite(tmp, 1, (size_t)n, stdout);
@@ -169,7 +181,7 @@ static void redraw(const char *prompt, const char *buf, int len, int cur) {
 
 /* returns false on EOF */
 static bool read_line(char *buf) {
-    char prompt[400];
+    char prompt[sizeof folder + 64];
     prompt_str(prompt, sizeof prompt);
     out(prompt);
     int len = 0, cur = 0, hpos = nhist;
@@ -304,7 +316,6 @@ static int tokenize(const char *s, struct token *toks, int max) {
                 char q = *s++;
                 t->quoted = true;
                 while (*s && *s != q) {
-                    if (q == '"' && *s == '\\' && s[1]) s++;
                     if (q == '"' && *s == '$' && s[1] == '?') {
                         if (bl < MAX_LINE - 1) buf[bl++] = '\x01'; /* $?, expanded at run time */
                         s += 2;
@@ -314,15 +325,9 @@ static int tokenize(const char *s, struct token *toks, int max) {
                     s++;
                 }
                 if (*s) s++;
-            } else if (*s == '\\' && s[1]) {
-                s++;
-                if (bl < MAX_LINE - 1) buf[bl++] = *s++;
             } else if (*s == '$' && s[1] == '?') {
                 if (bl < MAX_LINE - 1) buf[bl++] = '\x01'; /* $?, expanded at run time */
                 s += 2;
-            } else if (*s == '~' && bl == 0 && (s[1] == 0 || s[1] == '/' || s[1] == ' ')) {
-                bl += snprintf(buf + bl, sizeof buf - bl, "/home");
-                s++;
             } else {
                 if (bl < MAX_LINE - 1) buf[bl++] = *s;
                 s++;
@@ -335,7 +340,7 @@ static int tokenize(const char *s, struct token *toks, int max) {
     return n;
 }
 
-/* glob matching with * and ? */
+/* glob matching with * and ?, letter case aside as names compare */
 static bool match(const char *p, const char *s) {
     if (!*p) return !*s;
     if (*p == '*') {
@@ -345,7 +350,7 @@ static bool match(const char *p, const char *s) {
         }
     }
     if (!*s) return false;
-    if (*p == '?' || *p == *s) return match(p + 1, s + 1);
+    if (*p == '?' || tolower((unsigned char)*p) == tolower((unsigned char)*s)) return match(p + 1, s + 1);
     return false;
 }
 
@@ -356,28 +361,23 @@ static int expand_glob(const char *pat, char **argv, int argc, int max) {
         argv[argc++] = strdup(pat);
         return argc;
     }
-    char dir[256] = ".", prefix[256] = "";
-    const char *file = pat;
-    const char *slash = strrchr(pat, '/');
-    if (slash) {
-        int dl = (int)(slash - pat);
-        memcpy(dir, pat, dl);
-        dir[dl] = 0;
-        if (!dl) strcpy(dir, "/");
-        memcpy(prefix, pat, dl + 1);
-        prefix[dl + 1] = 0;
-        file = slash + 1;
+    /* the folder as typed, with its separator: it starts every match */
+    char dir[MAX_LINE] = "";
+    const char *file = pat, *sep = last_separator(pat);
+    if (sep) {
+        memcpy(dir, pat, sep - pat + 1);
+        dir[sep - pat + 1] = 0;
+        file = sep + 1;
     }
     int start = argc;
-    char path[512];
+    char path[4096];
     struct n_entry *ents;
     n_result count = complete_name(dir, path, sizeof path) ? n_folder_entries(path, &ents) : -1;
     if (count >= 0) {
         for (int i = 0; i < (int)count && argc < max; i++) {
-            if (ents[i].name[0] == '.' && file[0] != '.') continue;
             if (!match(file, ents[i].name)) continue;
-            char full[768];
-            snprintf(full, sizeof full, "%s%s", prefix, ents[i].name);
+            char full[MAX_LINE + sizeof ents[i].name];
+            snprintf(full, sizeof full, "%s%s", dir, ents[i].name);
             argv[argc++] = strdup(full);
         }
         free(ents);
@@ -393,13 +393,13 @@ static void cmd_help(void) {
         "Syntax: cmd args | cmd2 > file, >> append, < input, 2> errors, & background,\n"
         "        cmd1 ; cmd2, cmd1 && cmd2, cmd1 || cmd2, wildcards * and ?\n"
         "Keys:   Up/Down history, Tab completion, Ctrl+C cancel, Ctrl+L clear\n"
-        "Try:    ls /bin, neofetch, ps, free, fortune, moonsay hi,\n"
+        "Try:    ls C:\\Nocturne\\System, neofetch, ps, free, fortune, moonsay hi,\n"
         "        ifconfig, ping example.com, fetch http://example.com\n");
 }
 
 static bool builtin(int argc, char **argv, int *status) {
     if (!strcmp(argv[0], "cd")) {
-        const char *d = argc > 1 ? argv[1] : "/home";
+        const char *d = argc > 1 ? argv[1] : n_user_folder();
         char path[sizeof folder];
         struct n_entry e;
         n_result r = complete_name(d, path, sizeof path) ? n_entry_info(path, &e) : -N_ERR_TOO_LARGE;
@@ -449,17 +449,31 @@ static void close_handle(n_handle *h) {
     *h = -1;
 }
 
-/* A program name as a complete path: names with a "/" are inside the current
-   folder, others are looked up in /bin and /data/bin. */
+/* A redirection's document: closing it saves it (n_handle_close). */
+struct output {
+    n_handle h;
+    const char *name;
+};
+
+/* Closed, so saved: true, with a message, when the save failed. */
+static bool close_output(struct output *o) {
+    n_result r = o->h >= 0 ? n_handle_close(o->h) : 0;
+    o->h = -1;
+    if (r < 0) fprintf(stderr, "sh: %s: not saved: %s\n", o->name, n_result_text(r));
+    return r < 0;
+}
+
+/* A program name as a complete path: a name with a folder in it is the current
+   folder's, a bare name is found by find_program. */
 static bool find_command(const char *name, char *path, size_t n) {
     struct n_entry e;
-    if (!strchr(name, '/')) return find_program(name, path, n);
+    if (!strpbrk(name, "\\/:")) return find_program(name, path, n);
     return complete_name(name, path, n) && n_entry_info(path, &e) >= 0 && e.kind == N_KIND_DOCUMENT;
 }
 
 /* A redirection target: ">" empties the document (ISO C "w"), ">>" adds to its end. */
 static n_handle open_output(const char *name, bool append) {
-    char path[512];
+    char path[4096];
     if (!complete_name(name, path, sizeof path)) return -N_ERR_TOO_LARGE;
     n_handle h = n_document_open(path, N_DOCUMENT_EDIT);
     if (h == -N_ERR_NOT_FOUND) return n_document_open(path, N_DOCUMENT_CREATE);
@@ -534,9 +548,14 @@ static int run_pipeline(struct cmd *cmds, int n, bool background) {
     n_handle apps[16];
     int napps = 0;
     n_handle prev = -1; /* the receiving end of the previous command's output */
+    /* Redirections of the commands waited for stay open until they end, so that closing them saves
+       what they wrote: it is on the medium when the pipeline is done. */
+    struct output outs[32];
+    int nouts = 0;
     int status = 0;
     for (int i = 0; i < n; i++) {
         struct cmd *c = &cmds[i];
+        bool waited = false;
         int32_t handles[3];
         for (int k = 0; k < 3; k++) handles[k] = std_open[k] ? k : -1;
         n_handle pipe_ends[2] = {-1, -1}, in = -1, outh = -1, err = -1;
@@ -550,7 +569,7 @@ static int run_pipeline(struct cmd *cmds, int n, bool background) {
             handles[1] = pipe_ends[1];
         }
         if (c->in) {
-            char path[512];
+            char path[4096];
             in = complete_name(c->in, path, sizeof path) ? n_document_open(path, N_DOCUMENT_READ) : -N_ERR_TOO_LARGE;
             if (in < 0) {
                 fprintf(stderr, "sh: %s: %s\n", c->in, n_result_text(in));
@@ -573,7 +592,7 @@ static int run_pipeline(struct cmd *cmds, int n, bool background) {
             if (err >= 0) handles[2] = err;
         }
         if (c->argc) {
-            char path[512];
+            char path[4096];
             int st;
             if (builtin(c->argc, c->argv, &st)) {
                 status = st;
@@ -591,6 +610,7 @@ static int run_pipeline(struct cmd *cmds, int n, bool background) {
                     n_handle_close(app);
                 } else if (napps < 16) {
                     apps[napps++] = app;
+                    waited = true;
                 } else {
                     n_handle_close(app);
                 }
@@ -601,11 +621,16 @@ static int run_pipeline(struct cmd *cmds, int n, bool background) {
         close_handle(&pipe_ends[1]);
         prev = pipe_ends[0];
         close_handle(&in);
-        close_handle(&outh);
-        close_handle(&err);
+        struct output o[2] = {{outh, c->out}, {err, c->err}};
+        for (int k = 0; k < 2; k++) {
+            if (waited && o[k].h >= 0) outs[nouts++] = o[k];
+            else if (close_output(&o[k]) && !status) status = 1;
+        }
     }
     close_handle(&prev);
     if (napps) status = wait_apps(apps, napps);
+    for (int i = 0; i < nouts; i++)
+        if (close_output(&outs[i]) && !status) status = 1;
     fflush(stdout);
     return status;
 }
@@ -619,18 +644,13 @@ static void free_cmds(struct cmd *cmds, int n) {
 static int pargc = 1;
 static char **pargv = (char *[]){"sh", NULL};
 
-/* Substitute positional parameters before tokenizing (not inside single quotes; \$ stays $).
-   Unquoted values are split into words by the tokenizer, as in POSIX sh. */
+/* Substitute positional parameters before tokenizing (not inside single quotes).
+   Unquoted values are split into words by the tokenizer. */
 static const char *expand_params(const char *line, char *out, size_t n) {
     if (!strchr(line, '$')) return line;
     size_t o = 0;
     bool sq = false, dq = false;
     for (const char *s = line; *s && o + 1 < n; s++) {
-        if (*s == '\\' && !sq && s[1]) {
-            out[o++] = *s++;
-            if (o + 1 < n) out[o++] = *s;
-            continue;
-        }
         if (*s == '\'' && !dq) sq = !sq;
         else if (*s == '"' && !sq) dq = !dq;
         if (*s != '$' || sq || !(isdigit((unsigned char)s[1]) || s[1] == '#' || s[1] == '@' || s[1] == '*')) {
@@ -724,7 +744,7 @@ static int execute(const char *raw) {
 }
 
 static int run_script(const char *name) {
-    char path[512];
+    char path[4096];
     FILE *f = complete_name(name, path, sizeof path) ? fopen(path, "r") : NULL;
     if (!f) {
         fprintf(stderr, "sh: %s: %s\n", name, n_result_text(-errno));
@@ -740,7 +760,7 @@ static int run_script(const char *name) {
 }
 
 int main(int argc, char **argv) {
-    if (n_path_complete(".", folder, sizeof folder) < 0) strcpy(folder, "/");
+    if (n_path_complete(".", folder, sizeof folder) < 0) strcpy(folder, "C:\\");
     for (int i = 0; i < 3; i++) std_open[i] = n_handle_kind(i) >= 0;
     if (argc > 2 && !strcmp(argv[1], "-c")) {
         /* sh -c CMD [NAME [ARGS...]]: NAME becomes $0 */
@@ -759,9 +779,9 @@ int main(int argc, char **argv) {
         n_events_watch(prompt_events, 0, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, TOKEN_INPUT);
         n_events_watch(prompt_events, interrupts, N_EVENT_RECEIVABLE, TOKEN_INTERRUPT);
     }
-    struct n_entry motd;
-    if (n_entry_info("/etc/motd", &motd) >= 0) {
-        char *a[] = {"cat", "/etc/motd", NULL};
+    struct n_entry welcome;
+    if (n_entry_info(WELCOME, &welcome) >= 0) {
+        char *a[] = {"cat", WELCOME, NULL};
         run_wait("cat", a);
     }
     char line[MAX_LINE];

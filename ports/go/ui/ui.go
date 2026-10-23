@@ -15,9 +15,9 @@
 //	})
 //
 // This package only translates. The system's interface engine (libc/ui.c, the
-// same one C programs and /bin/js use) lays the widgets out, paints them and
+// same one C programs and js use) lays the widgets out, paints them and
 // runs hover, presses, focus, scrolling and animations; Go reaches it through
-// /bin/uihost over a message channel, in the format of
+// uihost (C:\Nocturne\System) over a message channel, in the format of
 // docs/nocturne-native-abi.md §11. Properties are the engine's (Props keys are
 // its property names: "width", "padding", "align" for a box's children, "self"
 // for a widget's own alignment, "colour", ...).
@@ -423,7 +423,7 @@ func Measure(s string, size float64, weight int) Metrics {
 	return m
 }
 
-// ---- the session with /bin/uihost ----
+// ---- the session with uihost ----
 
 type reply struct {
 	b        []byte
@@ -461,11 +461,11 @@ func start() (*session, error) {
 			sessErr = err
 			return
 		}
-		app, err := syscall.AppLaunch("/bin/uihost", nil, nil, []int{-1, -1, -1, b})
+		app, err := syscall.AppLaunch(syscall.FOLDER_SYSTEM+`\uihost`, nil, nil, []int{-1, -1, -1, b})
 		syscall.Close(b)
 		if err != nil {
 			syscall.Close(a)
-			sessErr = fmt.Errorf("ui: cannot start /bin/uihost: %w", err)
+			sessErr = fmt.Errorf("ui: cannot start uihost: %w", err)
 			return
 		}
 		syscall.Close(app)

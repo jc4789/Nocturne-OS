@@ -102,11 +102,20 @@ func main() {
 	if err == nil {
 		fmt.Println("stat:", fi.Name(), fi.Size(), fi.Mode(), fi.ModTime().Format(time.TimeOnly))
 	}
-	entries, err := os.ReadDir("/bin")
-	fmt.Println("/bin entries:", len(entries), err)
+	entries, err := os.ReadDir(`C:\Nocturne\System`)
+	fmt.Println(`C:\Nocturne\System entries:`, len(entries), err)
 	wd, _ := os.Getwd()
 	fmt.Println("folder:", wd)
-	_, err = os.Stat("/no/such/thing")
+	home, _ := os.UserHomeDir()
+	config, _ := os.UserConfigDir()
+	fmt.Println("home:", home, "config:", config, "temp:", os.TempDir())
+	abs, _ := filepath.Abs(`C:a\..\b`)
+	fmt.Println("paths:", filepath.Join(`C:\Users`, "User", "a.txt"), filepath.Base(`C:/Users/User/a.txt`),
+		filepath.Dir(`C:\Users\User\a.txt`), filepath.IsAbs(`\Users`), filepath.IsAbs(`C:a`), abs)
+	ls, err := exec.LookPath("ls")
+	self, _ := os.Executable()
+	fmt.Println("ls:", ls, err, "self:", self)
+	_, err = os.Stat(`C:\no\such\thing`)
 	fmt.Println("missing:", err, os.IsNotExist(err))
 
 	ch := make(chan string)

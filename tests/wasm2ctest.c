@@ -1,5 +1,6 @@
 /* 実Nocturneのwasm2cとTCCで生成・コンパイル・実行を確認する。
- * 専用試験ディスク上の/homeのみを使い、ホストのコンパイラーを経由しない。 */
+ * 一時フォルダー（n_temp_folder()）に自分のフォルダーを作って使い、終わると消す。
+ * ホストのコンパイラーを経由しない。 */
 #include <nocturne.h>
 #include <stdio.h>
 #include <string.h>
@@ -14,6 +15,9 @@ static int save(const char *path,const void *data,size_t size){
 static int execute(const char *path,char *const argv[]){
     return run_wait(path,argv)==0;
 }
+/* The files of the run, by name inside the folder made for it. */
+enum {WASM,DRIVER,MODULE,HEADER,PROGRAM,FILES};
+static const char *const leaves[FILES]={"wasm2c-smoke.wasm","wasm2c-driver.c","wasm2c-smoke.c","wasm2c-smoke.h","wasm2c-smoke"};
 int main(void){
     /* (module (func (export "run") (param i32) (result i32)
      *   local.get 0 i32.const 1 i32.add)) */
@@ -28,13 +32,22 @@ int main(void){
         "unsigned result=w2c_smoke_run(&instance,41);"
         "wasm2c_smoke_free(&instance);wasm_rt_free();"
         "printf(\"WASM2C_NATIVE_RESULT %u\\n\",result);return result!=42;}\n";
-    char *translate[]={"wasm2c","-n","smoke","/home/wasm2c-smoke.wasm","-o","/home/wasm2c-smoke.c",NULL};
-    char *compile[]={"tcc","-I/home","-o","/home/wasm2c-smoke","/home/wasm2c-driver.c","/home/wasm2c-smoke.c","-lwasm-rt",NULL};
-    char *run[]={"/home/wasm2c-smoke",NULL};
-    int ok=save("/home/wasm2c-smoke.wasm",binary,sizeof binary)&&
-        save("/home/wasm2c-driver.c",driver,strlen(driver))&&
-        execute("/bin/wasm2c",translate)&&execute("/bin/tcc",compile)&&
+    char folder[512],path[FILES][640],include[640];
+    int ok=n_path_join(n_temp_folder(),"wasm2c-test",folder,sizeof folder)>0;
+    for(int i=0;i<FILES&&ok;i++)ok=n_path_join(folder,leaves[i],path[i],sizeof path[i])>0;
+    if(!ok){printf("FAIL wasm2ctest: no path for the files\n");return 1;}
+    snprintf(include,sizeof include,"-I%s",folder);
+    char *translate[]={"wasm2c","-n","smoke",path[WASM],"-o",path[MODULE],NULL};
+    char *compile[]={"tcc",include,"-o",path[PROGRAM],path[DRIVER],path[MODULE],"-lwasm-rt",NULL};
+    char *run[]={path[PROGRAM],NULL};
+    n_result made=n_folder_create(folder);
+    ok=(made==0||made==-N_ERR_EXISTS)&&
+        save(path[WASM],binary,sizeof binary)&&
+        save(path[DRIVER],driver,strlen(driver))&&
+        execute("wasm2c",translate)&&execute("tcc",compile)&&
         execute(run[0],run);
+    for(int i=0;i<FILES;i++)n_entry_remove(path[i]);
+    n_entry_remove(folder);
     printf("%s wasm2ctest: guest wasm2c -> guest TCC -> native executable\n",ok?"PASS":"FAIL");
     return !ok;
 }

@@ -1,7 +1,7 @@
 """Reproduce the freestanding FFmpeg subset from the user's unmodified source.
 
 Requires the repository's bundled MSYS2 tools and an already-built Nocturne
-build/sysroot/usr/lib/libc.a (used ONLY by configure's link feature probes).
+build/sdk/Lib/libc.a (used ONLY by configure's link feature probes).
 Runtime builds use the imported sources/config, never this host-side process.
 """
 import argparse, hashlib, json, os, pathlib, shutil, subprocess
@@ -35,7 +35,7 @@ def main():
     out=(root/(a.stage or default)).resolve()
     out.relative_to((root/'build').resolve())
     if out.exists():raise SystemExit('stage already exists; choose a fresh --stage (old evidence is preserved): '+str(out))
-    if not (root/'build/sysroot/usr/lib/libc.a').is_file():raise SystemExit('build the Nocturne sysroot libc.a first')
+    if not (root/'build/sdk/Lib/libc.a').is_file():raise SystemExit('build the Nocturne sysroot libc.a first')
     out.mkdir(parents=True)
     names=['configure','Makefile','RELEASE','VERSION','LICENSE.md','COPYING.LGPLv2.1','ffbuild','compat','libavutil','libavcodec','libavformat','libavdevice','libavfilter','libswscale','libswresample','fftools','doc','tests','tools']
     for name in names:
@@ -61,7 +61,7 @@ def main():
         '--enable-demuxer='+LEGACY_DEMUXERS+(',matroska,ogg' if a.profile in ['webm','adaptive','browser'] else '')+(',mpegts' if a.profile in ['adaptive','browser'] else ''),
         '--enable-parser='+LEGACY_PARSERS+(',vp8,vp9,opus,vorbis' if a.profile in ['webm','adaptive','browser'] else '')+(',hevc,ac3' if a.profile=='browser' else ''),
         '--extra-cflags=--target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mno-red-zone -msse2 -I'+prefix+'/ports/ffmpeg/include -I'+prefix+'/user/include -I'+prefix+'/common',
-        '--extra-ldflags=-m elf_x86_64 --entry=main','--extra-libs='+('' if a.scalar else 'nocturne-media-alloc.o ')+prefix+'/build/sysroot/usr/lib/libc.a']
+        '--extra-ldflags=-m elf_x86_64 --entry=main','--extra-libs='+('' if a.scalar else 'nocturne-media-alloc.o ')+prefix+'/build/sdk/Lib/libc.a']
     if a.profile=='browser':args+=['--enable-filter=abuffer,abuffersink,atempo']
     (out/'nocturne-prepare.json').write_text(json.dumps({'profile':a.profile,'source':str(src),'release_sha256':hashlib.sha256((src/'RELEASE').read_bytes()).hexdigest(),'configure_arguments':args},indent=2)+'\n',encoding='utf-8',newline='\n')
     with(out/'configure-output.log').open('w',encoding='utf-8')as log:subprocess.run(args,cwd=out,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)

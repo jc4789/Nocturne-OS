@@ -148,7 +148,7 @@ async function runXHRCases() {
     timers.length=0;for(let i=0;i<130;i++)timers.push(setTimeout(()=>{},60000));
     await backlogDone;for(const id of timers)clearTimeout(id);
     assert(!backlogError && backlog.status===200 && backlog.readyState===4,'completion task survives grown timer table');
-    const invalid=new XMLHttpRequest();invalid.open('GET','file:///home/not-a-network-url');let networkError=false;invalid.onerror=()=>networkError=true;
+    const invalid=new XMLHttpRequest();invalid.open('GET','file:///C:/Users/User/not-a-network-url');let networkError=false;invalid.onerror=()=>networkError=true;
     const ip=settle(invalid);invalid.send();assert(!networkError,'unsupported network error asynchronous');await ip;
     assert(networkError && invalid.status===0,'transport rejects non HTTP');
     const binary=new XMLHttpRequest();binary.open('POST','api/json');binary.send(new Uint8Array([1,0,2]));binary.abort();assert(binary.readyState===0,'binary upload can be cancelled');

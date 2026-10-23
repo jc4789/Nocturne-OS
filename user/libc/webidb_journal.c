@@ -1,5 +1,5 @@
 /* Checked delta journal plus dual small commit heads. Unchanged metadata and
- * reference spans are COPY operations, not whole-manifest FAT rewrites.
+ * reference spans are COPY operations, not whole-manifest rewrites.
  * The two heads keep the current/previous committed generations and their
  * immutable journal ancestry. Compaction only truncates an unreferenced lane. */
 #include "webidb_journal.h"
@@ -23,7 +23,7 @@ struct snapshot {
 };
 /* One database working set per broker. Switching evicts, never changes
  * database semantics or imposes a feature/record quota. No borrowed pointers. */
-static char cache_base[192];
+static char cache_base[WEBIDB_BASE_MAX];
 static struct snapshot cache[2];
 
 static uint64_t get64(const uint8_t *p){uint64_t n=0;for(unsigned i=0;i<8;i++)n|=(uint64_t)p[i]<<(i*8);return n;}
@@ -134,7 +134,7 @@ malformed:
 }
 struct frame {uint8_t *bytes;size_t length;};
 static int reconstruct(const char *base,const uint8_t *head,uint8_t **result,size_t *length){
-    unsigned journal=(unsigned)get64(head+72);char path[224];snprintf(path,sizeof path,"%s.journal%u",base,journal);
+    unsigned journal=(unsigned)get64(head+72);char path[WEBIDB_FILE_MAX];snprintf(path,sizeof path,"%s.journal%u",base,journal);
     n_handle h=n_document_open(path,N_DOCUMENT_READ);if(h<0)return -1;
     n_result size=n_document_size(h);if(size<0){n_handle_close(h);return -1;}
     uint64_t offset=get64(head+80),n=get64(head+88);uint8_t expected[32];memcpy(expected,head+104,32);
@@ -174,7 +174,7 @@ static int reconstruct(const char *base,const uint8_t *head,uint8_t **result,siz
 }
 int webidb_journal_read(const char *base,int slot,uint8_t **bytes,size_t *length){
     *bytes=NULL;*length=0;if(slot<0||slot>1)return -1;select_base(base);
-    char path[208];snprintf(path,sizeof path,"%s.%d",base,slot);
+    char path[WEBIDB_FILE_MAX];snprintf(path,sizeof path,"%s.%d",base,slot);
     n_handle h=n_document_open(path,N_DOCUMENT_READ);
     if(h==-N_ERR_NOT_FOUND){clear_snapshot(&cache[slot]);return 0;}
     if(h<0)return -1;
@@ -246,7 +246,7 @@ int webidb_journal_write(const char *base,int slot,const uint8_t *bytes,size_t l
         if(!operation(&patch,1,0,bytes,length)){free(patch.bytes);return -2;}
     }
     if(patch.length>SIZE_MAX-FRAME_HEAD){free(patch.bytes);return -2;}
-    char journal_path[224];snprintf(journal_path,sizeof journal_path,"%s.journal%u",base,journal);
+    char journal_path[WEBIDB_FILE_MAX];snprintf(journal_path,sizeof journal_path,"%s.journal%u",base,journal);
     n_handle lane=document(journal_path);
     if(lane<0){free(patch.bytes);return -1;}
     if(truncate&&n_document_set_size(lane,0)<0){n_handle_close(lane);free(patch.bytes);return -1;}
@@ -282,7 +282,7 @@ int webidb_journal_write(const char *base,int slot,const uint8_t *bytes,size_t l
     memcpy(head+104,frame+8,32);
     memcpy(head+COMMIT_HEAD,bytes+120,(size_t)on+(size_t)nn);
     hash(head+40,head_length-40,head+8);
-    char head_path[208];snprintf(head_path,sizeof head_path,"%s.%d",base,slot);
+    char head_path[WEBIDB_FILE_MAX];snprintf(head_path,sizeof head_path,"%s.%d",base,slot);
     /* The head is swapped in whole: a failed save leaves the previous head. */
     if(n_document_save(head_path,head,head_length)<0){free(head);return -1;}
     clear_snapshot(&cache[slot]);

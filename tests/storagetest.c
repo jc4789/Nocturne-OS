@@ -1,6 +1,6 @@
 /* Real web_live -> native_storage -> browser-equivalent storage callback ->
- * product libc persistence. Run ONLY with an isolated QEMU scratch /data disk:
- * tcc -run /data/tests/storagetest.c --isolated-scratch
+ * product libc persistence. Run ONLY with an isolated QEMU scratch disk:
+ * tcc -run C:\Tests\storagetest.c --isolated-scratch
  * Never run this on a user's normal disk. It creates only unique fixture origins. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,25 +50,34 @@ static void expect(const char *origin,int kind,const char *key,const char *value
     check(status==WEB_STORAGE_OK && (value?(out.text && out.text_len==strlen(value) && !memcmp(out.text,value,out.text_len)):!out.text),name);
     free(out.text);
 }
-static void fixture_path_at(const char *root,const char *origin,int slot,char path[160]){
-    br_sha256_context context;uint8_t digest[32];char hex[65];const char chars[]="0123456789abcdef";
+#define PATH_BYTES 1024
+/* The snapshots are in storage in the browser's profile folder, the journals shared between windows in
+ * storage in its temporary folder: the folders web_profile_folder names. */
+static bool storage_root(bool shared,char root[PATH_BYTES]){
+    const char *profile=web_profile_folder(shared);
+    return profile&&n_path_join(profile,"storage",root,PATH_BYTES)>=0;
+}
+/* The complete path of a slot of origin's snapshot; empty when there is none. */
+static void fixture_path_at(bool shared,const char *origin,int slot,char path[PATH_BYTES]){
+    br_sha256_context context;uint8_t digest[32];char hex[65],root[PATH_BYTES];const char chars[]="0123456789abcdef";
     br_sha256_init(&context);br_sha256_update(&context,origin,strlen(origin));br_sha256_out(&context,digest);
     for(int i=0;i<32;i++){hex[2*i]=chars[digest[i]>>4];hex[2*i+1]=chars[digest[i]&15];}hex[64]=0;
-    snprintf(path,160,"%s/%s.%d",root,hex,slot);
+    path[0]=0;
+    if(storage_root(shared,root)&&snprintf(path,PATH_BYTES,"%s\\%s.%d",root,hex,slot)>=PATH_BYTES)path[0]=0;
 }
-static void fixture_path(const char *origin,int slot,char path[160]){fixture_path_at("/data/browser/storage",origin,slot,path);}
-/* Simulate loss of RAM-root after closing all backends. Corrupting a disk slot
+static void fixture_path(const char *origin,int slot,char path[PATH_BYTES]){fixture_path_at(false,origin,slot,path);}
+/* Simulate loss of the temporary folder's journals after closing all backends. Corrupting a disk slot
  * must not replace the live shared map; cold recovery is a separate boundary. */
-static void cold_fixture(const char *origin){char path[160];for(int i=0;i<5;i++){fixture_path_at("/tmp/browser-storage",origin,i,path);n_entry_remove(path);}}
+static void cold_fixture(const char *origin){char path[PATH_BYTES];for(int i=0;i<5;i++){fixture_path_at(true,origin,i,path);if(path[0])n_entry_remove(path);}}
 static void corrupt(const char *origin,int slot){
-    char path[160];fixture_path(origin,slot,path);n_handle doc=n_document_open(path,N_DOCUMENT_EDIT);
+    char path[PATH_BYTES];fixture_path(origin,slot,path);n_handle doc=n_document_open(path,N_DOCUMENT_EDIT);
     check(doc>=0,"open OWN fixture snapshot");if(doc>=0){check(n_document_write_at(doc,0,"!",1)==1,"corrupt OWN fixture snapshot");n_handle_close(doc);}
 }
 int main(int argc,char **argv){
-    if(argc!=2 || strcmp(argv[1],"--isolated-scratch")){puts("REFUSE: isolated QEMU scratch /data is required; pass --isolated-scratch only there");return 2;}
+    if(argc!=2 || strcmp(argv[1],"--isolated-scratch")){puts("REFUSE: an isolated QEMU scratch disk is required; pass --isolated-scratch only there");return 2;}
     snprintf(fixture_origin,sizeof fixture_origin,"https://storage-fixture-%d-%llu.invalid",(int)n_app_self(),(unsigned long long)uptime_ms());
     store=webstorage_create();check(store!=NULL,"backend allocation");if(!store)return 1;
-    FILE *file=fopen("/data/tests/js_storage_cases.js","rb");check(file!=NULL,"JS fixture present");
+    FILE *file=fopen("C:\\Tests\\js_storage_cases.js","rb");check(file!=NULL,"JS fixture present");
     if(file){
         fseek(file,0,SEEK_END);long length=ftell(file);rewind(file);
         check(length>0 && length<65536,"JS fixture bounded");
@@ -87,7 +96,7 @@ int main(int argc,char **argv){
     script(url,"if(sessionStorage.getItem('navigation')!=='kept'||localStorage.getItem('persistent')!=='yes')console.log('FAIL canonical origin');console.log('STORAGE-DONE canonical');");
     script("https://other-storage-fixture.invalid/","if(sessionStorage.getItem('navigation')!==null||localStorage.getItem('persistent')!==null)console.log('FAIL origin isolation');console.log('STORAGE-DONE origin');");
     int oldcalls=calls;
-    script("file:///home/storage-fixture.html","for(const key of ['localStorage','sessionStorage']){let ok=false;try{globalThis[key];}catch(e){ok=e.name==='SecurityError';}if(!ok)console.log('FAIL opaque storage '+key);}console.log('STORAGE-DONE opaque');");
+    script("file:///C:/Users/User/storage-fixture.html","for(const key of ['localStorage','sessionStorage']){let ok=false;try{globalThis[key];}catch(e){ok=e.name==='SecurityError';}if(!ok)console.log('FAIL opaque storage '+key);}console.log('STORAGE-DONE opaque');");
     check(calls==oldcalls,"opaque origins never reach backend");
     expect(fixture_origin,WEB_STORAGE_SESSION,"navigation","kept","session survives document navigation");
     webstorage_free(store);cold_fixture(fixture_origin);store=webstorage_create();

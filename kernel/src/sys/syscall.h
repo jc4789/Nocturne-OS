@@ -5,7 +5,12 @@ struct task;
 void syscall_dispatch(struct regs *r);
 bool user_ok(const void *p, size_t n);   /* the process may read it */
 bool user_ok_w(void *p, size_t n);       /* the process may write it */
+/* Copies between the kernel and the calling app's memory: -N_ERR_BAD_ADDRESS where the app may not. */
+int copy_from_user(void *dst, const void *usrc, size_t n);
+int copy_to_user(void *udst, const void *src, size_t n);
 int user_str(char *dst, const char *src, size_t max);
+/* An app's string of any length (a path, an argument), copied into the kernel; kfree it after use. */
+int user_string(const char *u, char **out);
 void sys_shared_cleanup(struct task *owner);
 /* Return [va, va+len) of the mmap region (with its guard page) for reuse. */
 void mmap_hole_add(struct task *owner, uint64_t va, uint64_t len);

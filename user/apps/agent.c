@@ -2,15 +2,15 @@
 
    It talks to an OpenAI-compatible chat completions endpoint over HTTPS (BearSSL, in-process),
    streams the reply, and lets the model drive the machine through a few tools: run shell commands,
-   read/write/edit files, list directories, fetch URLs. Everything it builds can live on the
-   persistent disk under /data.
+   read/write/edit files, list directories, fetch URLs. Everything it builds lives on the
+   one disk, C:; its own files are in its data folder, C:\Users\<name>\AppData\Agent.
 
    usage: agent [-r] [-m model] [-c config] [task...]
      no task  interactive session (type /help inside)
      task     run that one task, then exit
-     -r       resume the previous session (/data/agent/session.json)
+     -r       resume the previous session (AppData\Agent\session.json)
 
-   Configuration lives in /data/etc/agent.conf (key=value lines):
+   Configuration lives in AppData\Agent\agent.conf (key=value lines):
      endpoint=https://hyper.charm.land/v1
      model=glm-5.3-flash
      api_key=...            (never shown; also asked for on first run)
@@ -24,11 +24,10 @@
 #include "json.h"
 #include "png.h"
 
-#define CONF_PATH    "/data/etc/agent.conf"
-#define AGENT_DIR    "/data/agent"
-#define SESSION_PATH "/data/agent/session.json"
-#define NOTES_PATH   "/data/agent/NOTES.md"
-#define SYSTEM_PATH  "/etc/agent/system.md"
+#define SYSTEM_PATH  "C:\\Nocturne\\Agent\\system.md"
+
+/* the agent's own files, in its data folder (n_app_data_folder): set once by agent_files */
+static char conf_path[1024], session_path[1024], notes_path[1024];
 
 #define TOOL_OUT_MAX  (24 * 1024) /* bytes of tool output the model sees */
 #define MAX_STEPS     60          /* model calls per task before asking to continue */
@@ -75,7 +74,7 @@ static void redact(char *s) {
 static n_result fs_error;
 
 static char *read_text(const char *name, size_t *len) {
-    char path[512];
+    char path[1024];
     n_result r = n_path_complete(name, path, sizeof path);
     n_handle h = r < 0 ? (n_handle)r : n_document_open(path, N_DOCUMENT_READ);
     if (h < 0) {
@@ -104,18 +103,18 @@ static char *read_text(const char *name, size_t *len) {
 
 /* create every missing folder above the document at the complete path */
 static void make_parents(const char *path) {
-    char tmp[512];
+    char tmp[1024];
     strlcpy(tmp, path, sizeof tmp);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p != '/') continue;
+    for (char *p = tmp + 3; *p; p++) { /* past "C:\" */
+        if (*p != '\\') continue;
         *p = 0;
         n_folder_create(tmp);
-        *p = '/';
+        *p = '\\';
     }
 }
 
 static int write_text(const char *name, const char *data, size_t len) {
-    char path[512];
+    char path[1024];
     n_result r = n_path_complete(name, path, sizeof path);
     if (r >= 0) {
         make_parents(path);
@@ -126,6 +125,15 @@ static int write_text(const char *name, const char *data, size_t len) {
         return -1;
     }
     return 0;
+}
+
+/* the agent's own files live in its data folder, <user>\AppData\Agent (the user's folder if that cannot be made) */
+static void agent_files(void) {
+    char dir[1024];
+    if (n_app_data_folder("Agent", dir, sizeof dir) < 0) strlcpy(dir, n_user_folder(), sizeof dir);
+    n_path_join(dir, "agent.conf", conf_path, sizeof conf_path);
+    n_path_join(dir, "session.json", session_path, sizeof session_path);
+    n_path_join(dir, "NOTES.md", notes_path, sizeof notes_path);
 }
 
 /* strip ANSI escape sequences and carriage returns (terminal decoration means nothing to a model) */
@@ -240,8 +248,8 @@ static char *build_system_prompt(void) {
     free(sys);
     time_t now = time(NULL);
     struct tm *tm = gmtime(&now);
-    char cwd[512];
-    if (n_path_complete(".", cwd, sizeof cwd) < 0) strlcpy(cwd, "/", sizeof cwd);
+    char cwd[1024];
+    if (n_path_complete(".", cwd, sizeof cwd) < 0) strlcpy(cwd, "C:\\", sizeof cwd);
     struct n_sysinfo si;
     sysinfo(&si);
     jb_printf(&b,
@@ -249,9 +257,9 @@ static char *build_system_prompt(void) {
               "- Free memory: %lu MiB\n",
               tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, cwd, cf.model,
               (unsigned long)(si.free_mem / 1048576));
-    char *notes = read_text(NOTES_PATH, NULL);
+    char *notes = read_text(notes_path, NULL);
     if (notes) {
-        jb_puts(&b, "\n# Your notes from earlier sessions (" NOTES_PATH ")\n");
+        jb_printf(&b, "\n# Your notes from earlier sessions (%s)\n", notes_path);
         jb_puts(&b, notes);
         free(notes);
     }
@@ -267,13 +275,13 @@ static void save_session(void) {
         jb_puts(&b, i + 1 < nmsgs ? ",\n" : "\n");
     }
     jb_puts(&b, "]\n");
-    if (!b.oom) write_text(SESSION_PATH, b.s, b.len);
+    if (!b.oom) write_text(session_path, b.s, b.len);
     jb_free(&b);
 }
 
 static bool load_session(void) {
     size_t len;
-    char *text = read_text(SESSION_PATH, &len);
+    char *text = read_text(session_path, &len);
     if (!text) return false;
     const char *err;
     struct json *arr = json_parse(text, len, &err);
@@ -432,13 +440,13 @@ static void tool_run(struct json *args, struct jbuf *out) {
     }
     n_handle_close(input[1]); /* the command finds its input already at the end */
     /* the command runs in the agent's folder; its output and log both come back here */
-    char folder[520] = "FOLDER=";
-    if (n_path_complete(".", folder + 7, sizeof folder - 7) < 0) strlcpy(folder + 7, "/", sizeof folder - 7);
+    char folder[1032] = "FOLDER=";
+    if (n_path_complete(".", folder + 7, sizeof folder - 7) < 0) strlcpy(folder + 7, "C:\\", sizeof folder - 7);
     const char *arguments[] = {"sh", "-c", cmd}, *settings[] = {folder};
     int32_t handles[] = {input[0], output[1], output[1]};
     struct n_launch launch = {.arguments = arguments, .settings = settings, .handles = handles,
                               .argument_count = 3, .setting_count = 1, .handle_count = 3};
-    n_handle app = n_app_launch("/bin/sh", &launch);
+    n_handle app = n_app_launch(N_FOLDER_SYSTEM "\\sh", &launch);
     n_handle_close(input[0]);
     n_handle_close(output[1]);
     if (app < 0) {
@@ -594,7 +602,7 @@ static void tool_edit(struct json *args, struct jbuf *out) {
 static void tool_list(struct json *args, struct jbuf *out) {
     const char *path = json_getstr(args, "path");
     if (!path) path = ".";
-    char full[512];
+    char full[1024];
     struct n_entry *entries = NULL;
     n_result count = n_path_complete(path, full, sizeof full);
     if (count >= 0) count = n_folder_entries(full, &entries);
@@ -604,7 +612,7 @@ static void tool_list(struct json *args, struct jbuf *out) {
     }
     for (n_result i = 0; i < count; i++) {
         const struct n_entry *e = &entries[i];
-        if (e->kind == N_KIND_FOLDER) jb_printf(out, "dir   %s/\n", e->name);
+        if (e->kind == N_KIND_FOLDER) jb_printf(out, "dir   %s\\\n", e->name);
         else jb_printf(out, "file  %s  (%llu bytes)\n", e->name, (unsigned long long)e->size);
         if (out->len > TOOL_OUT_MAX) {
             jb_puts(out, "[... truncated]\n");
@@ -1145,8 +1153,8 @@ static void run_task(bool interactive) {
 
 static void ask_key(void) {
     say("No API key configured. The agent talks to an OpenAI-compatible endpoint:\n  %s (model %s)\n"
-        "Paste the key with Ctrl+Shift+V. It is stored in " CONF_PATH " and never shown.\n",
-        cf.endpoint, cf.model);
+        "Paste the key with Ctrl+Shift+V. It is stored in %s and never shown.\n",
+        cf.endpoint, cf.model, conf_path);
     char key[512];
     if (readline("API key: ", key, sizeof key, RL_SECRET) <= 0) return;
     char *k = key;
@@ -1154,7 +1162,7 @@ static void ask_key(void) {
     strlcpy(cf.key, k, sizeof cf.key);
     for (char *p = cf.key + strlen(cf.key); p > cf.key && p[-1] == ' ';) *--p = 0;
     memset(key, 0, sizeof key);
-    conf_save(CONF_PATH);
+    conf_save(conf_path);
 }
 
 static void help(void) {
@@ -1163,9 +1171,10 @@ static void help(void) {
         "  /model NAME  switch model (saved)       /models   list the provider's models\n"
         "  /think       show or hide the model's reasoning\n"
         "  /key         enter a new API key\n"
-        "  /notes       show the agent's notes (" NOTES_PATH ")\n"
+        "  /notes       show the agent's notes (%s)\n"
         "  /exit        quit (Ctrl+D works too; Ctrl+C stops the agent at once)\n"
-        "The conversation is saved after every step; 'agent -r' resumes it.\n");
+        "The conversation is saved after every step; 'agent -r' resumes it.\n",
+        notes_path);
 }
 
 static void list_models(void) {
@@ -1204,7 +1213,7 @@ static bool command(const char *line) {
         while (*m == ' ') m++;
         if (*m) {
             strlcpy(cf.model, m, sizeof cf.model);
-            conf_save(CONF_PATH);
+            conf_save(conf_path);
         }
         say("model: %s\n", cf.model);
     } else if (!strcmp(line, "/models")) list_models();
@@ -1215,7 +1224,7 @@ static bool command(const char *line) {
         cf.key[0] = 0;
         ask_key();
     } else if (!strcmp(line, "/notes")) {
-        char *n = read_text(NOTES_PATH, NULL);
+        char *n = read_text(notes_path, NULL);
         say("%s\n", n ? n : "(no notes yet)");
         free(n);
     } else {
@@ -1225,13 +1234,14 @@ static bool command(const char *line) {
 }
 
 int main(int argc, char **argv) {
-    const char *conf_path = CONF_PATH, *model = NULL;
+    agent_files();
+    const char *config = conf_path, *model = NULL;
     bool resume = false;
     static char task[8192];
     size_t tl = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-r")) resume = true;
-        else if (!strcmp(argv[i], "-c") && i + 1 < argc) conf_path = argv[++i];
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc) config = argv[++i];
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             say("usage: agent [-r] [-m model] [-c config] [task...]\n");
@@ -1241,14 +1251,12 @@ int main(int argc, char **argv) {
             if (n > 0 && tl + n < sizeof task) tl += n;
         }
     }
-    conf_load(conf_path);
+    conf_load(config);
     if (model) strlcpy(cf.model, model, sizeof cf.model);
 
-    n_folder_create("/data"); /* N_ERR_EXISTS when the disk is there */
-    n_folder_create(AGENT_DIR);
     if (!cf.key[0]) {
         if (!n_terminal(0)) {
-            fprintf(stderr, "agent: no api_key in %s\n", conf_path);
+            fprintf(stderr, "agent: no api_key in %s\n", config);
             return 1;
         }
         ask_key();
@@ -1257,7 +1265,7 @@ int main(int argc, char **argv) {
     if (!net_wait_up(10000)) say(C_ERR "warning: the network is not up (no DHCP lease yet)" C_RESET "\n");
 
     if (resume) {
-        if (load_session()) say(C_DIM "resumed %d messages from " SESSION_PATH C_RESET "\n", nmsgs);
+        if (load_session()) say(C_DIM "resumed %d messages from %s" C_RESET "\n", nmsgs, session_path);
         else say(C_DIM "no saved session to resume" C_RESET "\n");
     }
 

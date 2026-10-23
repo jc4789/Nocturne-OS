@@ -157,7 +157,7 @@ async function runFetchCases() {
     await rejects(fetch(),'TypeError','fetch required input');
     let sync=false,bad;try{bad=fetch('api/json',{headers:{'bad name':'x'}});}catch(_){sync=true;}
     assert(!sync&&bad instanceof Promise,'validation failure is promise');await rejects(bad,'TypeError','validation rejection');
-    await rejects(fetch('file:///data/secret'),'TypeError','network local scheme rejected');
+    await rejects(fetch('file:///C:/Users/User/secret'),'TypeError','network local scheme rejected');
     for(const init of [{redirect:'manual'}])
         await rejects(fetch('api/json',init),'NotSupportedError','unsupported transport options explicit');
     await rejects(fetch('api/json',{integrity:'sha256-test'}),'TypeError','integrity mismatch is a network error');

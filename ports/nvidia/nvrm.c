@@ -1,4 +1,4 @@
-/* /bin/nvrm: NVIDIA's Resource Manager as a user-space driver app.
+/* nvrm: NVIDIA's Resource Manager as a user-space driver app (C:\Nocturne\System\nvrm).
  *
  * init claims the GPU's PCI function and starts this app with the N_KIND_PCI right as handle 3
  * (docs/nocturne-native-abi.md, section 9). nvrm brings RM up on it the way NVIDIA's kernel
@@ -10,7 +10,7 @@
  *   -> rm_get_device_name -> nvrm_serve
  *
  * Firmware (gsp_ga10x.bin, and for the log gsp_log_*.bin) comes from
- * /usr/share/firmware/nvidia/615.78.08/ or /data/firmware/nvidia/615.78.08/ (os.c).
+ * C:\Nocturne\Firmware\NVIDIA\615.78.08 (os.c).
  */
 #include "nvrm_os.h"
 

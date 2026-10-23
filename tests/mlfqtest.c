@@ -87,6 +87,8 @@ static int receive_until(n_handle channel, void *data, size_t bytes, unsigned lo
     return ok;
 }
 int main(int argc, char **argv) {
+    char program[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if (n_path_complete(argv[0], program, sizeof program) >= 0) argv[0] = program;
     if (argc == 4 && !strcmp(argv[1], "--burn"))
         return child_burn(strtoul(argv[2], NULL, 10), (unsigned)atoi(argv[3]));
     if (argc == 3 && !strcmp(argv[1], "--interactive"))

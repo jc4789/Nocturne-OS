@@ -3930,6 +3930,7 @@ zink_create_screen(struct sw_winsys *winsys, const struct pipe_screen_config *co
    return &ret->base;
 }
 
+#if !DETECT_OS_NOCTURNE /* a DRM device is a file descriptor, which Nocturne does not have */
 static inline int
 zink_render_rdev(int fd, int64_t *dev_major, int64_t *dev_minor)
 {
@@ -4005,6 +4006,7 @@ fail:
    zink_destroy_screen(&ret->base);
    return NULL;
 }
+#endif
 
 struct pipe_screen *
 zink_win32_create_screen(uint64_t adapter_luid)

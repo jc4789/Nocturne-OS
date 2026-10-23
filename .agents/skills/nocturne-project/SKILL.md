@@ -8,12 +8,12 @@ description: Nocturne OSの実装・不具合修正・検証を行う際のプ�
 ## 適用と不変条件
 
 - ユーザーへの応答・作業説明・報告は日本語のみ。
-- GUI-firstのC製OS。UNIX/POSIX互換OSへの再設計、fork、RAM-rootの置換をしない。`/data`の永続化と既存の`/data/bin` PATHを維持する。
+- GUI-firstのC製OS。UNIX/POSIX互換OSへの再設計やforkをしない。ファイルはディスク一台のC:だけ（`C:\Nocturne`は保護されたOS、`C:\Programs\<アプリ>`、`C:\Users\<名前>`）。`\`と`/`のどちらも受け付け、名前は大文字小文字を区別しない。`/bin`・`/data`・PATH・二台目のディスクを持ち込まない。
 - 既存実装・テスト・ユーザー変更を消して成功扱いにしない。変更範囲を限定し、既存の動作を保全する。
 - 原則の実行条件は`C:/Program Files/qemu`、WHPX、4コア（`-smp 4`）、4096MiB、1920×1080。ユーザーの今回の指定が優先。Hyper-V Gen2/Enhanced Sessionの実行はユーザー担当。
 - **ユーザーのPCに重い作業をしない。** QEMUは同時に一台だけ。確認のたびにbuildを消して全体ビルドしない。A/B比較のために`git stash`・revert・共有ファイル（`user/include/nocturne.h`、`common/abi.h`、`user/libc/sys.c`、`third_party/quickjs/quickjs.c`）の差替え・touchをしない。疑わしい`.c`を一つずつ差し替え、変わった分だけ差分ビルドする。
 - **QEMUはコマンドラインから直接操作する。** 窓付き`qemu-system-x86_64.exe -accel whpx`のHMP monitorへscreendump・sendkey・mouseを送り、その場で見る。固定秒数のPython一発スクリプトやcomputer-use撮影で代用しない。手順は[references/qemu-visual.md](references/qemu-visual.md)。
-- **起動ディスクはAHCIに接続する**（`-device ahci,id=ahci -drive id=boot,file=boot.img,format=raw,if=none,snapshot=on -device ide-hd,drive=boot,bus=ahci.0,bootindex=0`）。`if=ide`だとSeaBIOSのIDE PIO読込みがWHPXで極端に遅く、カーネル起動まで約3分かかる。AHCIなら約8秒。遅ければ待たずに異常として原因を扱う。
+- **ディスクはAHCIに接続する**（`-device ahci,id=ahci -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on -device ide-hd,drive=boot,bus=ahci.0,bootindex=0`）。一台のディスクにESPとC:があり、数秒で起動する。遅ければ待たずに異常として原因を扱う。
 - **文脈の劣化（context rot）と目的のずれ（context drift）に注意する。** 直前の訂正を忘れる、禁止された手段へ戻る、同じ失敗を繰り返す、推測を事実扱いする兆候が出たら、区切りで止め、差分・未完了・次の一手を短く記録して引き継ぐ。
 - 計画だけ、コードレビューだけ、スキル編集だけの依頼では、勝手にOS実装やVM試験を始めない。以前停止された作業は別の依頼だけでは再開しない。
 - J-spaceはユーザーの指定に従う。記録・再読・担当報告を実装と実画面確認の代わりにしない。指定された粒度の運用が実製品の確認を遅らせているなら、必要な記録を簡潔にして本作業へ戻る。

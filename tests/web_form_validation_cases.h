@@ -104,7 +104,7 @@ static void run_native_form_validation_cases(int *checks, int *errors) {
     doc_node_value(d, email, "a@b,", 4);
     FV("email-list-empty-token", (web_control_validity(d, email) & WEB_VALIDITY_TYPE_MISMATCH) != 0);
     doc_node_value(d, email, "", 0);
-    static const char *const good_urls[] = {"https://example.test/a", "mailto:a@example.test", "urn:example:one", "data:text/plain,hello", "file:///data/example", "https://xn--r8jz45g.example/", "http://[::1]/"};
+    static const char *const good_urls[] = {"https://example.test/a", "mailto:a@example.test", "urn:example:one", "data:text/plain,hello", "file:///C:/Users/User/example", "https://xn--r8jz45g.example/", "http://[::1]/"};
     static const char *const bad_urls[] = {"example.test", "/relative", "https://", "http://[broken]/", "http://host:70000/"};
     for (unsigned i = 0; i < sizeof good_urls / sizeof *good_urls; i++) {
         doc_node_value(d, url, good_urls[i], strlen(good_urls[i]));

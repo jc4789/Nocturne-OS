@@ -1,4 +1,4 @@
-/* Actual Nocturne DOM/QuickJS/private IPC/child/FAT path. No IndexedDB host
+/* Actual Nocturne DOM/QuickJS/private IPC/child/store path. No IndexedDB host
  * adapter or fabricated Promise resolution participates in this acceptance. */
 #define main nocturne_jstest_main
 #include "jstest.c"

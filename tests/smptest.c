@@ -112,6 +112,8 @@ static int finish_child(n_handle app, int *status) {
     return r >= 0;
 }
 int main(int argc, char **argv) {
+    char program[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if (n_path_complete(argv[0], program, sizeof program) >= 0) argv[0] = program;
     if (argc == 4 && !strcmp(argv[1], "--child")) return child(strtoul(argv[2], NULL, 10), (unsigned)atoi(argv[3]));
     if (argc == 2 && !strcmp(argv[1], "--fault")) {
         *(volatile unsigned char *)0x12345000UL = 1;

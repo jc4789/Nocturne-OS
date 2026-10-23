@@ -772,6 +772,23 @@ static void cors_tests(void) {
     expect_request(0, "/api/json", WEBNET_FETCH, "Cookie: forbidden\r\n", false, "page Cookie header is rejected");
     expect_request(0, "/api/json", WEBNET_FETCH, "X-Fixture: a\r\nx-fixture: b\r\n", false, "duplicate request headers are rejected");
 }
+/* The local resource fixture, in the temporary folder: inside.js in the folder webnet-fixture,
+   outside.js beside that folder. */
+static char fixture_folder[512], fixture_inside[640], fixture_outside[640];
+static bool fixture_create(void) {
+    if (n_path_join(n_temp_folder(), "webnet-fixture", fixture_folder, sizeof fixture_folder) <= 0 ||
+        n_path_join(fixture_folder, "inside.js", fixture_inside, sizeof fixture_inside) <= 0 ||
+        n_path_join(n_temp_folder(), "webnet-outside.js", fixture_outside, sizeof fixture_outside) <= 0)
+        return false;
+    n_result made = n_folder_create(fixture_folder);
+    return (made == 0 || made == -N_ERR_EXISTS) && n_document_save(fixture_inside, "// local-fixture\n", 17) == 0 &&
+           n_document_save(fixture_outside, "// local-fixture\n", 17) == 0;
+}
+static void fixture_remove(void) {
+    n_entry_remove(fixture_inside);
+    n_entry_remove(fixture_outside);
+    n_entry_remove(fixture_folder);
+}
 static void redirect_tests(void) {
     struct result r = {0};
     uint64_t id = request(&r, 0, "/api/redirect?url=%2Fapi%2Frequest-info", WEBNET_FETCH, "POST",
@@ -787,8 +804,16 @@ static void redirect_tests(void) {
           "cross-origin redirect strips authorization");
     release(&r);
     expect_request(0, "/api/infinite-redirect", WEBNET_FETCH, NULL, false, "redirect loop is bounded");
-    expect_request(0, "/api/redirect?url=file%3A%2F%2F%2Fhome%2Fwebnet-outside.js", WEBNET_RESOURCE, NULL, false,
-                   "HTTP redirect cannot cross into local files");
+    /* The redirect names a local file that exists. */
+    char outside_url[1200], encoded[1600], target[1700];
+    bool named = fixture_create() && n_path_to_url(fixture_outside, outside_url, sizeof outside_url) > 0 &&
+                 encode_query(outside_url, encoded, sizeof encoded);
+    check(named, "local redirect target");
+    if (named) {
+        snprintf(target, sizeof target, "/api/redirect?url=%s", encoded);
+        expect_request(0, target, WEBNET_RESOURCE, NULL, false, "HTTP redirect cannot cross into local files");
+    }
+    fixture_remove();
 }
 static void long_url_tests(void) {
     static struct result r;
@@ -825,19 +850,27 @@ static void file_request(const char *url, const char *origin, enum webnet_kind k
     if (!done) webnet_cancel_generation(net, 50);
     release(&r);
 }
+/* file: URLs inside the fixture folder: base is the folder's, a relative name is added after it. */
+static void file_request_in(const char *base, const char *name, const char *origin, enum webnet_kind kind, bool user,
+                            bool allow, const char *what) {
+    char url[1400];
+    snprintf(url, sizeof url, "%s/%s", base, name);
+    file_request(url, origin, kind, user, allow, what);
+}
 static void file_tests(void) {
-    n_folder_create("/home/webnet-fixture");
-    const char *paths[2] = {"/home/webnet-fixture/inside.js", "/home/webnet-outside.js"};
-    for (int i = 0; i < 2; i++)
-        check(n_document_save(paths[i], "// local-fixture\n", 17) == 0, "create local resource fixture");
-    const char *origin = "file:///home/webnet-fixture/index.html";
-    file_request("file:///home/webnet-fixture/%69nside.js", origin, WEBNET_MODULE, false, true, "local module within decoded document directory");
-    file_request("file:///home/webnet-fixture/%2e%2e/webnet-outside.js", origin, WEBNET_RESOURCE, false, false, "encoded parent traversal is rejected");
-    file_request("file:///home/webnet-fixture/%00.js", origin, WEBNET_RESOURCE, false, false, "encoded NUL filename is rejected");
-    file_request("file:///home/webnet-fixture/inside.js", document, WEBNET_CLASSIC, false, false, "remote document cannot read a local script");
-    file_request("file:///home/webnet-fixture/inside.js", origin, WEBNET_FETCH, false, false, "fetch cannot read local files");
-    file_request("file:///home/webnet-fixture/inside.js", origin, WEBNET_NAVIGATION, false, false, "local navigation requires user intent");
-    file_request("file:///home/webnet-fixture/inside.js", origin, WEBNET_NAVIGATION, true, true, "user local navigation is allowed");
+    char base[1200], origin[1400];
+    bool ready = fixture_create() && n_path_to_url(fixture_folder, base, sizeof base) > 0;
+    check(ready, "create local resource fixture");
+    if (!ready) return;
+    snprintf(origin, sizeof origin, "%s/index.html", base);
+    file_request_in(base, "%69nside.js", origin, WEBNET_MODULE, false, true, "local module within decoded document directory");
+    file_request_in(base, "%2e%2e/webnet-outside.js", origin, WEBNET_RESOURCE, false, false, "encoded parent traversal is rejected");
+    file_request_in(base, "%00.js", origin, WEBNET_RESOURCE, false, false, "encoded NUL filename is rejected");
+    file_request_in(base, "inside.js", document, WEBNET_CLASSIC, false, false, "remote document cannot read a local script");
+    file_request_in(base, "inside.js", origin, WEBNET_FETCH, false, false, "fetch cannot read local files");
+    file_request_in(base, "inside.js", origin, WEBNET_NAVIGATION, false, false, "local navigation requires user intent");
+    file_request_in(base, "inside.js", origin, WEBNET_NAVIGATION, true, true, "user local navigation is allowed");
+    fixture_remove();
 }
 static void limit_tests(void) {
     struct result r = {0};
@@ -1335,7 +1368,7 @@ int main(int argc, char **argv) {
         printf("webnettest: %d failed\n", failed);
         return failed != 0;
     }
-    FILE *f = fopen("/data/tests/webports", "r");
+    FILE *f = fopen("C:\\Tests\\webports", "r");
     char text[64] = "";
     if (f) { size_t n = fread(text, 1, sizeof text - 1, f); text[n] = 0; }
     if (!f || sscanf(text, "%d %d", &ports[0], &ports[1]) != 2 ||

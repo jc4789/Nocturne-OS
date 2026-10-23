@@ -75,7 +75,7 @@ static bool spawn_child(nmedia_worker *w) {
     /* No input, output or log: stray diagnostics cannot reach either channel. */
     const char *args[]={"browsermediaworker"};const int32_t handles[]={-1,-1,-1,control[1],video[1]};
     struct n_launch l={.arguments=args,.argument_count=1,.handles=handles,.handle_count=5};
-    w->app=n_app_launch("/bin/browsermediaworker",&l);
+    w->app=n_app_launch(N_FOLDER_SYSTEM "\\browsermediaworker",&l);
     n_handle_close(control[1]);n_handle_close(video[1]);
     w->control=control[0];w->video=video[0];
     if(w->app<0){w->app=-1;stop(w,"cannot launch native media worker");reap(w);return false;}

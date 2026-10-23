@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include "../common/abi.h"
+typedef int32_t n_handle;
+typedef int64_t n_result;
 typedef struct web_doc web_doc;
 typedef struct node node_t,web_node;
 struct node {web_doc *owner;unsigned type,namespace_id;const char *name,*target,*rel,*sandbox,*frame_name;node_t *parent,*first,*next;};
@@ -24,7 +27,11 @@ static bool web_frame_set_navigation(struct web_frame *f,const char *url,web_doc
 static bool has_prefix(const char *s,const char *prefix){return !strncmp(s,prefix,strlen(prefix));}
 static void console_add(const char *level,const char *message){(void)level;(void)message;errors++;}
 static void queue_navigation_body(const char *url,const void *body,size_t length,const char *content_type,int kind){(void)url;(void)body;(void)length;(void)content_type;(void)kind;queues++;}
-static int spawn(const char *path,char **args,int *fds,int flags){spawns++;free(spawn_url);spawn_url=strdup(args[1]);host_arguments_ok=!strcmp(path,"/bin/browser")&&!strcmp(args[0],"browser")&&args[2]==NULL&&fds[0]==0&&fds[1]==1&&fds[2]==2&&flags==0;return 1;}
+/* The product starts the new window with find_program("browser") and n_app_launch: the Browser app's folder in C:\Programs. */
+#define BROWSER_PATH N_FOLDER_PROGRAMS "\\Browser\\browser"
+static bool find_program(const char *name,char *out,size_t n){return !strcmp(name,"browser")&&(size_t)snprintf(out,n,"%s",BROWSER_PATH)<n;}
+static n_handle n_app_launch(const char *path,const struct n_launch *launch){spawns++;free(spawn_url);spawn_url=strdup(launch->arguments[1]);host_arguments_ok=!strcmp(path,BROWSER_PATH)&&!strcmp(launch->arguments[0],"browser")&&launch->argument_count==2&&launch->settings==NULL&&launch->handle_count==3&&launch->handles[0]==0&&launch->handles[1]==1&&launch->handles[2]==2&&launch->flags==0;return 1;}
+static n_result n_handle_close(n_handle handle){(void)handle;return 0;}
 #include "auxiliary_link29_product.inc"
 static void reset(void){spawns=queues=errors=warnings=0;last_warning[0]=0;}
 int main(void){
@@ -40,7 +47,7 @@ int main(void){
     reset();anchor.rel=NULL;anchor.target="_self";CHECK(!web_frame_navigate(&top,&anchor,url)&&spawns==0);
     reset();anchor.target="_top";CHECK(!web_frame_navigate(&top,&anchor,url)&&spawns==0);
     reset();anchor.target="missing-name";CHECK(web_frame_navigate(&top,&anchor,url)&&spawns==0&&warnings==1);
-    reset();anchor.target="_blank";CHECK(web_frame_navigate(&top,&anchor,"file:///data/private")&&spawns==0&&errors==1);
+    reset();anchor.target="_blank";CHECK(web_frame_navigate(&top,&anchor,"file:///C:/Users/User/private")&&spawns==0&&errors==1);
     reset();script.host.navigate_form=NULL;CHECK(web_frame_navigate(&top,&anchor,url)&&spawns==0&&errors==1);script.host.navigate_form=host_navigate_form;
     reset();top.live=false;CHECK(web_frame_navigate(&top,&anchor,url)&&spawns==0&&warnings==1);top.live=true;
     reset();top.inert=true;CHECK(web_frame_navigate(&top,&anchor,url)&&spawns==0&&warnings==1);top.inert=false;

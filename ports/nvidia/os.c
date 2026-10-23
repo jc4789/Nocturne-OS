@@ -52,16 +52,16 @@ thread_local bool nvrm_thread_admin = true;
 thread_local uint32_t nvrm_thread_process;
 
 /* ------------------------------------------------------------------------------------------
- * Logging
+ * Logging: the system log, and nvrm.log in nvrm's data folder (C:\Users\<name>\AppData\NVIDIA),
+ * which stays from one start to the next
  * ---------------------------------------------------------------------------------------- */
-#define NVRM_LOG_FOLDER "/data/logs"
-#define NVRM_LOG_PATH "/data/logs/nvrm.log"
 #define NVRM_LOG_CHUNK 900          /* bytes per system log message */
 #define NVRM_LOG_FILE_BUFFER 8192
 
 static mtx_t log_lock;
 static once_flag log_once = ONCE_FLAG_INIT;
 static n_handle log_handle = -1;
+static char log_path[1024];
 static bool log_file_enabled;
 static char log_file_buffer[NVRM_LOG_FILE_BUFFER];
 static size_t log_file_fill;
@@ -69,7 +69,7 @@ static uint64_t log_file_flushed_ms;
 
 static void log_file_flush_locked(void) {
     if (!log_file_enabled || !log_file_fill) return;
-    n_document_append(NVRM_LOG_PATH, log_file_buffer, log_file_fill);
+    n_document_append(log_path, log_file_buffer, log_file_fill);
     log_file_fill = 0;
     log_file_flushed_ms = n_clock_uptime_ms();
 }
@@ -77,11 +77,9 @@ static void log_file_flush_locked(void) {
 static void log_setup(void) {
     mtx_init(&log_lock, mtx_plain);
     log_handle = n_system_log_open();
-    struct n_entry entry;
-    if (n_entry_info("/data", &entry) >= 0) {
-        n_result r = n_folder_create(NVRM_LOG_FOLDER);
-        if (r >= 0 || r == -N_ERR_EXISTS) log_file_enabled = true;
-    }
+    char folder[sizeof log_path];
+    log_file_enabled = n_app_data_folder("NVIDIA", folder, sizeof folder) >= 0 &&
+                       n_path_join(folder, "nvrm.log", log_path, sizeof log_path) >= 0;
     log_file_flushed_ms = n_clock_uptime_ms();
 }
 
@@ -111,7 +109,7 @@ static void log_emit(const char *text, size_t length, bool urgent) {
             log_file_buffer[log_file_fill + length] = '\n';
             log_file_fill += need;
         } else {
-            n_document_append(NVRM_LOG_PATH, text, length);
+            n_document_append(log_path, text, length);
         }
         if (urgent || n_clock_uptime_ms() - log_file_flushed_ms >= 200) log_file_flush_locked();
     }
@@ -1026,18 +1024,15 @@ void NV_API_CALL nv_destroy_nano_timer(nv_state_t *nv, nv_nano_timer_t *timer) {
  * GSP firmware
  *
  * RM asks for gsp_<family>.bin, ucodes_<family>.bin and gsp_log_<family>.bin. The files are
- * not distributed with Nocturne (docs/nvidia/LEDGER.md D9); they are looked up in the system
- * folder, then in /data.
+ * not distributed with Nocturne (docs/nvidia/LEDGER.md D9); a disk built with them (the
+ * Makefile's NVIDIA_FIRMWARE) has them in C:\Nocturne\Firmware\NVIDIA\<version>.
  * ---------------------------------------------------------------------------------------- */
 struct nvrm_firmware {
     void *data;
     size_t size;
 };
 
-static const char *const firmware_folders[] = {
-    "/usr/share/firmware/nvidia/" NVRM_FIRMWARE_VERSION "/",
-    "/data/firmware/nvidia/" NVRM_FIRMWARE_VERSION "/",
-};
+#define FIRMWARE_FOLDER "C:\\Nocturne\\Firmware\\NVIDIA\\" NVRM_FIRMWARE_VERSION
 
 const void *NV_API_CALL nv_get_firmware(nv_state_t *nv, nv_firmware_type_t type,
                                         nv_firmware_chip_family_t family, const void **buffer,
@@ -1049,30 +1044,30 @@ const void *NV_API_CALL nv_get_firmware(nv_state_t *nv, nv_firmware_type_t type,
                  nv_firmware_chip_family_to_string(family));
         return NULL;
     }
-    for (size_t i = 0; i < sizeof firmware_folders / sizeof *firmware_folders; i++) {
-        char path[160];
-        snprintf(path, sizeof path, "%s%s.bin", firmware_folders[i], base);
-        void *data = NULL;
-        size_t length = 0;
-        if (n_document_load(path, &data, &length) < 0 || !data) continue;
-        if (length > 0xFFFFFFFFu) {
-            n_memory_release(data, length);
-            continue;
-        }
-        struct nvrm_firmware *fw = malloc(sizeof *fw);
-        if (!fw) {
-            n_memory_release(data, length);
-            return NULL;
-        }
-        fw->data = data;
-        fw->size = length;
-        *buffer = data;
-        *size = (NvU32)length;
-        nvrm_log("NVRM: firmware %s (%u bytes)", path, (unsigned)length);
-        return fw;
+    char path[160];
+    snprintf(path, sizeof path, FIRMWARE_FOLDER "\\%s.bin", base);
+    void *data = NULL;
+    size_t length = 0;
+    if (n_document_load(path, &data, &length) < 0 || !data) {
+        nvrm_log("NVRM: firmware %s not found", path);
+        return NULL;
     }
-    nvrm_log("NVRM: firmware %s.bin not found in %s or %s", base, firmware_folders[0], firmware_folders[1]);
-    return NULL;
+    if (length > 0xFFFFFFFFu) {
+        n_memory_release(data, length);
+        nvrm_log("NVRM: firmware %s is too large", path);
+        return NULL;
+    }
+    struct nvrm_firmware *fw = malloc(sizeof *fw);
+    if (!fw) {
+        n_memory_release(data, length);
+        return NULL;
+    }
+    fw->data = data;
+    fw->size = length;
+    *buffer = data;
+    *size = (NvU32)length;
+    nvrm_log("NVRM: firmware %s (%u bytes)", path, (unsigned)length);
+    return fw;
 }
 
 void NV_API_CALL nv_put_firmware(const void *handle) {

@@ -23,13 +23,23 @@ JSON="$(winpath "$HERE")/$TARGET.json"
 export RUSTC_BOOTSTRAP=1
 export __CARGO_TESTS_ONLY_SRC_ROOT="$LIB"
 
+# Cargo does not look for edits in the standard library's source (to it the
+# library is not a local package), so when the patch has changed since the
+# last build the library is built again from the start.
+mkdir -p "$TARGET_DIR"
+BUILT_PATCH=$TARGET_DIR/nocturne.patch
+if ! cmp -s "$HERE/nocturne.patch" "$BUILT_PATCH"; then
+    rm -rf "$TARGET_DIR/$TARGET/release/.fingerprint"
+fi
+
 cargo build --offline --release \
     --manifest-path "$HERE/stdbuild/Cargo.toml" \
-    --target-dir "$(mkdir -p "$TARGET_DIR" && winpath "$TARGET_DIR")" \
+    --target-dir "$(winpath "$TARGET_DIR")" \
     --config 'source.crates-io.replace-with="vendored-sources"' \
     --config "source.vendored-sources.directory=\"$LIB/vendor\"" \
     -Zbuild-std=core,alloc,std,panic_abort -Zbuild-std-features= \
     -Zjson-target-spec --target "$JSON"
+cp "$HERE/nocturne.patch" "$BUILT_PATCH"
 
 # rustc finds the standard library in <sysroot>/lib/rustlib/<target>/lib.
 DEST=$SYSROOT/lib/rustlib/$TARGET/lib

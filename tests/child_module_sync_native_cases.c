@@ -73,7 +73,7 @@ static void webnet_pump(webnet *net,uint64_t now){
     const char *headers="Content-Type: text/javascript\r\nAccess-Control-Allow-Origin: https://child.test\r\n";
     if(mode==1)headers="Content-Type: text/javascript\r\nAccess-Control-Allow-Origin: https://top.test\r\n";
     if(mode==2)headers="Content-Type: text/plain\r\nAccess-Control-Allow-Origin: https://child.test\r\n";
-    if(mode==3)final="file:///data/private.mjs";
+    if(mode==3)final="file:///C:/Users/User/private.mjs";
     if(mode==4)doc=replacement;
     if(mode==5)generation++;
     if(mode==6)pending_navigation=true;

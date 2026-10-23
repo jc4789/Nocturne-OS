@@ -1,4 +1,4 @@
-/* Nocturne browser requests. A browser-owned isolated /bin/webfetch service
+/* Nocturne browser requests. A browser-owned isolated webfetch service
    shares its connection pool/cache across request-specific native channels. */
 #pragma once
 #include <stddef.h>

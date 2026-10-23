@@ -4,7 +4,7 @@ FreeType 2.14.3（上流タグ `VER-2-14-3`）をメモリ専用で使用する�
 取得元: https://github.com/freetype/freetype/archive/refs/tags/VER-2-14-3.tar.gz
 ライセンスは FreeType Project License (`docs/FTL.TXT`) を選択する。
 上流の二重許諾文書・著作権表示はそのまま保全し、代替GPLv2は選択しない。
-配布媒体はFTL原文と使用・著作者表明を `/usr/share/licenses/freetype/` に収録する。
+配布媒体はFTL原文と使用・著作者表明を `C:\Nocturne\Licenses\freetype\`（`rootfs/Nocturne/Licenses/freetype`）に収録する。
 
 コンパイル対象は Makefile の `FT_C` に列挙した SFNT / TrueType / CFF と
 通常のグレースケールラスタライザのみ。ホストファイルシステム、CLI、

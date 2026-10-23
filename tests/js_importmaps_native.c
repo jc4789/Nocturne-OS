@@ -71,7 +71,7 @@ static void regression(const char *file) {
     if (page) source_case(page, "import-map-cases-done", 0); free(page);
 }
 int main(int argc, char **argv) {
-    regression(argc > 1 ? argv[1] : "/data/tests/js_importmaps_cases.js");
+    regression(argc > 1 ? argv[1] : "C:\\Tests\\js_importmaps_cases.js");
     source_case(START "<script id='parser-plain' type='application/json'>{}</script>"
         "<script id='parser-async' type='application/json' async>{}</script><script>"
         "(()=>{const s=document.createElement('script');"

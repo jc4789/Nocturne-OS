@@ -16,7 +16,7 @@ static const struct {const char *file,*mime,*codec;unsigned frames,pictures;} fi
 };
 int main(void){
     for(unsigned i=0;i<sizeof fixtures/sizeof *fixtures;i++){
-        char path[256],error[160];snprintf(path,sizeof path,"/data/tests/media-fixtures/%s",fixtures[i].file);
+        char path[256],error[160];snprintf(path,sizeof path,"C:\\Tests\\media-fixtures\\%s",fixtures[i].file);
         check(!strcmp(nmedia_can_play_type(fixtures[i].mime),"probably"),"built codec capability");
         FILE *f=fopen(path,"rb");check(f!=NULL,"fixture opens");if(!f)continue;fseek(f,0,SEEK_END);long size=ftell(f);rewind(f);
         check(size>0&&size<65536,"finite fixture size");if(size<=0||size>=65536){fclose(f);continue;}

@@ -11,7 +11,6 @@
 
 #define W        520
 #define H        500
-#define MUSIC    "/home/Music"
 #define AHEAD    4800 /* frames kept queued: 100 ms */
 #define CHUNK    960  /* frames made at a time: 20 ms */
 #define MAXT     200
@@ -22,7 +21,7 @@
 #define WINDOW   1
 #define SCOPE    1
 
-static char dir[256], names[MAXT][128], error[160];
+static char dir[1024], names[MAXT][128], error[160];
 static int ntracks, cur = -1;
 static n_handle stream = -1;
 static struct wav wav;
@@ -34,8 +33,6 @@ static int16_t scope[CHUNK * 2];
 static uint32_t n_prev, n_play, n_stop, n_next, n_seek, n_items;
 static uint32_t shown_sec = UINT32_MAX;
 static int shown_px = -1;
-
-static void join(char *out, size_t n, const char *name) { snprintf(out, n, "%s/%s", dir, name); }
 
 static int by_name(const void *a, const void *b) { return strcasecmp(a, b); }
 
@@ -76,9 +73,8 @@ static void play_track(int i) {
     error[0] = 0;
     if (i < 0 || i >= ntracks) return;
     cur = i;
-    char path[512];
-    join(path, sizeof path, names[i]);
-    const char *err = wav_open(&wav, path);
+    char path[1024];
+    const char *err = n_path_join(dir, names[i], path, sizeof path) < 0 ? "path too long" : wav_open(&wav, path);
     if (err) {
         snprintf(error, sizeof error, "%s: %s", names[i], err);
         return;
@@ -153,7 +149,7 @@ static uint32_t transport(struct ui_msg *m, const char *text, const char *icon, 
 
 static void show(struct ui_session *s) {
     const struct ui_theme *t = &ui_theme;
-    char title[160], info[160], head[300], t1[16], t2[16];
+    char title[160], info[160], head[1100], t1[16], t2[16];
     if (loaded) {
         strlcpy(title, names[cur], sizeof title);
         char *dot = strrchr(title, '.');
@@ -236,21 +232,17 @@ static void toggle(void) {
 }
 
 int main(int argc, char **argv) {
-    char full[256];
+    char full[1024], d[1024];
     const char *start = argc > 1 && n_path_complete(argv[1], full, sizeof full) > 0 ? full : NULL;
     struct n_entry st;
     if (start && n_entry_info(start, &st) == 0 && st.kind == N_KIND_FOLDER) {
         load_dir(start);
         start = NULL;
-    } else if (start) {
-        char d[256];
-        strlcpy(d, start, sizeof d);
-        char *slash = strrchr(d, '/'); /* a complete path: there is one */
-        if (slash == d) d[1] = 0;
-        else *slash = 0;
+    } else if (start && n_path_join(start, "..", d, sizeof d) >= 0) {
         load_dir(d);
     } else {
-        load_dir(MUSIC);
+        start = NULL;
+        if (n_path_join(n_user_folder(), "Music", d, sizeof d) >= 0) load_dir(d);
     }
     struct ui_session *s = ui_session_new();
     if (!s || ui_window(s, WINDOW, W, H, WIN_CENTER, "Sound Player", NULL, NULL) < 0) return 1;
@@ -258,7 +250,7 @@ int main(int argc, char **argv) {
     if (!wave) return 1;
     stream = n_audio_open();
     if (start) {
-        const char *base_name = strrchr(start, '/') ? strrchr(start, '/') + 1 : start;
+        const char *base_name = n_path_name(start);
         for (int i = 0; i < ntracks; i++)
             if (!strcmp(names[i], base_name)) play_track(i);
         if (cur < 0) snprintf(error, sizeof error, "%s: not a WAV file", base_name);

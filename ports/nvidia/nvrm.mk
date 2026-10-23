@@ -1,4 +1,4 @@
-# NVIDIA Resource Manager (RM) as a user-space driver app: /bin/nvrm
+# NVIDIA Resource Manager (RM) as a user-space driver app: nvrm, in C:\Nocturne\System
 #
 # Include this from the top-level Makefile (after UCFLAGS/BUILD/CC are defined). It only
 # defines variables and rules; the default goals of the top-level Makefile do not depend on
@@ -128,7 +128,7 @@ $(NVRM_OUT)/os/%.o: ports/nvidia/%.c ports/nvidia/nvrm_os.h ports/nvidia/nvrm_se
 	@$(CC) $(NVRM_OS_CFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------- client library
-# libnvrm: how an app (NVK's nvkmd/nocturne) talks to /bin/nvrm. An ordinary libc member, built
+# libnvrm: how an app (NVK's nvkmd/nocturne) talks to nvrm. An ordinary libc member, built
 # with the program flags; it only needs the RM SDK's types and parameter structures.
 NVRM_CLIENT_OBJ := $(NVRM_OUT)/libnvrm.o
 # What a client's source includes: the protocol and libnvrm, and the RM SDK's parameter structures.

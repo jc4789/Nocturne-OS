@@ -9,7 +9,7 @@ static int cat_input(void) {
     return ferror(stdin) != 0;
 }
 static int cat_document(const char *name) {
-    char path[512];
+    char path[1024];
     struct n_entry e;
     n_result r = n_path_complete(name, path, sizeof path);
     if (r >= 0) r = n_entry_info(path, &e);

@@ -123,20 +123,25 @@ int fflush(FILE *f) {
     return r;
 }
 
-/* At exit: everything written goes out, and temporary documents go away. */
+/* At exit, as ISO C closes every stream: everything written goes out and is its document's saved
+   content (an app opening the document next reads it; the medium has it moments later), and
+   temporary documents go away. */
 void __stdio_flush_all(void) {
     fflush(NULL);
+    if (stdout->kind == N_KIND_DOCUMENT) n_document_commit(stdout->h, N_COMMIT_START);
+    if (stderr->kind == N_KIND_DOCUMENT) n_document_commit(stderr->h, N_COMMIT_START);
     for (FILE *f = open_files; f; f = f->next)
         if (f->temp_name) {
             n_handle_close(f->h);
             f->kind = -1;
             n_entry_remove(f->temp_name);
+        } else if (f->kind == N_KIND_DOCUMENT) {
+            n_document_commit(f->h, N_COMMIT_START);
         }
 }
 
-/* A full path for a name: other names are taken inside the launcher's folder. */
+/* A full path for a name: a name that is not complete is taken inside the launcher's folder. */
 static const char *full_path(const char *name, char *out, size_t cap) {
-    if (name[0] == '/') return name;
     n_result r = n_path_complete(name, out, cap);
     if (r < 0) {
         errno = (int)-r;
@@ -156,7 +161,7 @@ static n_handle open_or_create(const char *path) {
 
 /* ISO C modes: r, w, a, each with an optional + and b; w may add x. */
 static n_handle open_document(const char *name, const char *m, bool *append) {
-    char buf[512];
+    char buf[4096];
     const char *path = full_path(name, buf, sizeof buf);
     if (!path) return -(n_result)errno;
     bool plus = strchr(m, '+') != NULL;
@@ -263,13 +268,18 @@ int fclose(FILE *f) {
     return r;
 }
 
-/* A new document that goes away when it is closed or the app ends. */
+/* A new document in the temporary folder that goes away when it is closed or the app ends. */
 FILE *tmpfile(void) {
     static unsigned serial;
-    char name[64];
+    char leaf[40], name[4096];
     for (int tries = 0; tries < 100; tries++) {
         uint64_t mix = n_clock_uptime_ms() * 0x9e3779b97f4a7c15ull + (uint64_t)(uintptr_t)&mix + ++serial;
-        snprintf(name, sizeof name, "/tmp/temporary-%llx", (unsigned long long)(mix ^ (mix >> 29)));
+        snprintf(leaf, sizeof leaf, "temporary-%llx", (unsigned long long)(mix ^ (mix >> 29)));
+        n_result joined = n_path_join(n_temp_folder(), leaf, name, sizeof name);
+        if (joined < 0) {
+            errno = (int)-joined;
+            return NULL;
+        }
         n_handle h = n_document_open(name, N_DOCUMENT_CREATE);
         if (h == -N_ERR_EXISTS) continue;
         if (h < 0) {
@@ -293,7 +303,7 @@ FILE *tmpfile(void) {
 }
 
 int remove(const char *name) {
-    char buf[512];
+    char buf[4096];
     const char *path = full_path(name, buf, sizeof buf);
     n_result r = path ? n_entry_remove(path) : -(n_result)errno;
     if (r < 0) {
@@ -306,7 +316,7 @@ int remove(const char *name) {
 /* An existing document under the new name takes the old one's content whole,
    swapped in atomically, and the old name goes. */
 int rename(const char *from, const char *to) {
-    char a[512], b[512];
+    char a[4096], b[4096];
     const char *src = full_path(from, a, sizeof a), *dst = src ? full_path(to, b, sizeof b) : NULL;
     n_result r = dst ? n_entry_move(src, dst) : -(n_result)errno;
     if (r == -N_ERR_EXISTS) {

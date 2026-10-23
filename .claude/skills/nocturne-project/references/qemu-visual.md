@@ -28,15 +28,14 @@ screendump build/nocturne-platform/<run>/after.ppm
 ユーザー指示（2026-10-16）：QEMUは同時に一台だけ。`C:\Program Files\qemu`をWHPXで使い、Python一発スクリプトではなくコマンドラインから直接操作する。
 
 1. 既存のQEMU processがないか確認する。あればそれを使い、二台目を起動しない。
-2. 窓付きで起動する（例。boot/dataは既存の試験用媒体を使い回し、毎回コピー・削除しない。通常の`build/data.img`は接続しない）。
+2. 窓付きで起動する。ディスクは一台だけ（ESPとC:を持つGPTの`build/nocturne.img`）。二台目のdataディスクは存在しない。`snapshot=on`ならビルド成果物を汚さないので、毎回コピーしない。
 
    ```text
    "C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -vga std
      -serial file:<run>/serial.log -monitor tcp:127.0.0.1:45454,server,nowait
      -device ahci,id=ahci
-     -drive id=boot,file=<run>/boot.img,format=raw,if=none,snapshot=on
+     -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on
      -device ide-hd,drive=boot,bus=ahci.0,bootindex=0
-     -drive file=<run>/data.img,format=raw,if=ide,index=0,snapshot=on
      -netdev user,id=qa -device e1000,netdev=qa
    ```
 
@@ -52,15 +51,18 @@ screendump build/nocturne-platform/<run>/after.ppm
 
 4. 保存したPNGをその場で自分で開いて見る。操作→撮影→目視を短く繰り返し、固定秒数の観察期間を設けない。
 
-- **起動ディスク（boot.img）は必ずAHCIに接続する**（上記の`-device ahci`＋`ide-hd,bus=ahci.0`）。`if=ide`で接続すると、limineが368MBの`initrd.tar`（libc.a、browser、browserjsworker、CJKフォント等）をSeaBIOSのIDE PIO経由で読み、WHPX環境ではこれが極端に遅く、カーネル起動まで約3分かかる。AHCIにするだけで約8秒になった（2026-10-16実測）。data.imgは`if=ide`のままでよい（カーネルのドライバーが読むため）。
-- **起動が遅ければ異常。** 待ち続けず、まず起動ディスクの接続方式を確認し、原因として扱い報告する。
-- ゲストは`/data/tests/autorun.sh`を実行し、終わると電源断する。対話確認ではブラウザーを前面で起動したままにする。autorunの差替えは`mcopy -o -i "<data.img>@@1048576" autorun.sh ::/tests/autorun.sh`（dataの区画は1MiB位置）。
+- **ディスクは標準でAHCIに接続する**（上記の`-device ahci`＋`ide-hd,bus=ahci.0`。実機のSATAと同じ経路）。カーネルはAHCI・NVMe・旧IDE（ATA）のどれからでもC:を読む。起動はserial.logの`store: C: "Nocturne" on sata0`で確かめる。数秒で起動しなければ異常として原因を扱う。
+- **NVMeで試すときはUEFIで起動する。** QEMUのSeaBIOSはNVMeディスクを起動できない（`could not read the boot disk`）。`-drive if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/share/edk2-x86_64-code.fd`と、`edk2-i386-vars.fd`の書込み用コピーを2台目のpflashに付け、`-device nvme,serial=nocturne,drive=boot,bootindex=0`にする。
+- HMPの`screendump`の保存先は**スラッシュ区切りの絶対path**にする（`"D:/.../now.png"`）。バックスラッシュのpathは黙って保存されない。
+- `C:\Tests\autorun.sh`があれば、initがそれを実行し、終わると電源断する（`scripts/test.py`・`platform_qa.py`のコピーだけに置く）。通常の`build/nocturne.img`にはないので、対話確認ではデスクトップのまま操作できる。
 - `snapshot=on`ではゲスト内の変更は残らず、ブラウザーprofileは毎回初回訪問者になる。サイトのA/B表示差もありうるので、参照画像と構成要素を照合して判断する。
+- **電源断・再起動をまたぐ保存の確認**は、`snapshot=on`ではなく使い捨てのqcow2 overlayで行う：`qemu-img create -f qcow2 -b "<絶対path>/build/nocturne.img" -F raw build/qa/persist.qcow2`（`tools\msys64\ucrt64\bin\qemu-img.exe`）。ゲストで書いた直後にHMPの`quit`で電源を切り、同じoverlayで再起動して確かめる。nocturne.imgを作り直したらoverlayも作り直し、終わったら消す。
+- WHPXでは`system_reset`後にVMが`paused (prelaunch)`のまま止まり、`cont`でも戻らない。再起動は`quit`してから起動し直す。
 - 終了はHMPの`quit`。この作業で起動したQEMUだけを止める。
 
 ## このcheckoutの既存ハーネス
 
-`scripts/platform_qa.py`は隔離boot/data、QEMU条件、撮影・キー入力の補助。**Pythonハーネスを使うこと自体は必須ではない。** 起動が必要な場合だけ現行引数を確認する。例：
+`scripts/platform_qa.py`は隔離した起動ディスクのコピー（AHCI、`snapshot=on`）、QEMU条件、撮影・キー入力の補助。**Pythonハーネスを使うこと自体は必須ではない。** 起動が必要な場合だけ現行引数を確認する。例：
 
 ```text
 python -X utf8 scripts/platform_qa.py --label <unique-run> --url <requested-url> --accel whpx --memory 4096 --resolution 1920x1080x32 --seconds <observation-period>
@@ -72,7 +74,7 @@ python -X utf8 scripts/platform_qa.py --label <unique-run> --url <requested-url>
 
 - `--ready-marker`待機中は通常の定期撮影に入らない。markerが来ないまま画面を見ずに待ち続けない。初回はmarkerなしの現画面取得か、独立した即時撮影機能を選ぶ。
 - `--defer-screen-png`はPNG化を終了まで保留する。終了前にPPMを開く経路がないなら、目視優先の作業では選ばない。
-- `--guest-file observer.js`はFATの`/tests`へコピーされ、OSからの絶対pathは **`/data/tests/observer.js`**。ブラウザー引数は`--console-file /data/tests/observer.js`。`/tests/observer.js`ではない。
+- `--guest-file observer.js`は隔離コピーのC:の`C:\Tests`へ置かれ、OSからの絶対pathは **`C:\Tests\observer.js`**。ブラウザー引数は`--console-file C:\Tests\observer.js`。
 - startup console入力はconsoleを開いてfocusする。PgDnはconsole履歴送りになり得る。実画面でconsoleを閉じ、ページへfocusしてからscrollする。
 - `--scroll-pages`を指定しただけでは合格にならない。前後画像、本文の移動、必要に応じてread-only scroll位置を自分で確認する。
 

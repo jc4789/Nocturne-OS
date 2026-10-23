@@ -3,6 +3,7 @@
  * once; commit writes only metadata. Two checksum-protected manifest slots
  * retain crash fallback, and payload GC keeps both committed generations. */
 #include <webidb.h>
+#include <webstorage.h>
 #include <nocturne.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +11,11 @@
 #include <limits.h>
 #include <bearssl.h>
 #include "webidb_journal.h"
-#define IDB_ROOT "/data/browser/indexeddb"
+/* The databases live in indexeddb in the browser's profile folder; false when it cannot be found. */
+static bool idb_root(char root[WEBIDB_BASE_MAX]){
+    const char *profile=web_profile_folder(false);
+    return profile&&n_path_join(profile,"indexeddb",root,WEBIDB_BASE_MAX)>=0;
+}
 #define IDB_HEAD 64u
 #define IDB_CATALOG_HEAD 120u
 struct idb_refs {uint8_t *data;size_t count;};
@@ -21,7 +26,7 @@ struct idb_tx {
     n_handle lease;
     int slot;
     uint64_t generation;
-    char path[160];
+    char path[WEBIDB_BASE_MAX];
     char *origin,*name;
     size_t name_length;
     struct idb_refs current,old;
@@ -42,17 +47,17 @@ static n_result read_whole(const char *path,uint8_t **out,size_t *length){*out=N
 static void hex(const uint8_t digest[32],char text[65]){for(unsigned i=0;i<32;i++)snprintf(text+i*2,3,"%02x",digest[i]);}
 static int unhex(const char *text,uint8_t digest[32]){if(!text||strlen(text)!=64)return 0;for(unsigned i=0;i<32;i++){unsigned v=0;for(unsigned j=0;j<2;j++){char c=text[i*2+j];int n=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:-1;if(n<0)return 0;v=v*16+(unsigned)n;}digest[i]=(uint8_t)v;}return 1;}
 static struct idb_tx *find(webidb *db,uint32_t token){struct idb_tx *p=db?db->active:NULL;while(p&&p->token!=token)p=p->next;return p;}
-static void payload_path(struct idb_tx *tx,const uint8_t digest[32],char path[240]){
+static void payload_path(struct idb_tx *tx,const uint8_t digest[32],char path[WEBIDB_FILE_MAX]){
     char text[65];hex(digest,text);
-    snprintf(path,240,"%s.values/%.2s/%s",tx->path,text,text);
+    snprintf(path,WEBIDB_FILE_MAX,"%s.values\\%.2s\\%s",tx->path,text,text);
 }
-static void legacy_payload_path(struct idb_tx *tx,const uint8_t digest[32],char path[240]){
-    char text[65];hex(digest,text);snprintf(path,240,"%s.v%s",tx->path,text);
+static void legacy_payload_path(struct idb_tx *tx,const uint8_t digest[32],char path[WEBIDB_FILE_MAX]){
+    char text[65];hex(digest,text);snprintf(path,WEBIDB_FILE_MAX,"%s.v%s",tx->path,text);
 }
 static int payload_directory(struct idb_tx *tx,const uint8_t digest[32]){
-    char text[65],path[224];hex(digest,text);
+    char text[65],path[WEBIDB_FILE_MAX];hex(digest,text);
     snprintf(path,sizeof path,"%s.values",tx->path);if(!directory(path))return 0;
-    snprintf(path,sizeof path,"%s.values/%.2s",tx->path,text);return directory(path);
+    snprintf(path,sizeof path,"%s.values\\%.2s",tx->path,text);return directory(path);
 }
 static int contains(const struct idb_refs *r,const uint8_t digest[32]){size_t lo=0,hi=r->count;while(lo<hi){size_t at=lo+(hi-lo)/2;int c=memcmp(r->data+at*32,digest,32);if(c<0)lo=at+1;else hi=at;}return lo<r->count&&!memcmp(r->data+lo*32,digest,32);}
 static int digest_compare(const void *a,const void *b){return memcmp(a,b,32);}
@@ -60,7 +65,7 @@ static void collect(struct idb_tx *tx,const struct idb_refs *r,const struct idb_
     for(size_t i=0;i<r->count;i++){
         const uint8_t *digest=r->data+i*32;
         if(contains(a,digest)||contains(b,digest))continue;
-        char path[240];payload_path(tx,digest,path);n_entry_remove(path);
+        char path[WEBIDB_FILE_MAX];payload_path(tx,digest,path);n_entry_remove(path);
         legacy_payload_path(tx,digest,path);n_entry_remove(path);
     }
 }
@@ -102,7 +107,7 @@ static int load(const char *base,int slot,uint8_t **bytes,size_t *length,uint64_
     return 1;
 }
 static int pending_clear(struct idb_tx *tx){
-    char path[176];snprintf(path,sizeof path,"%s.pending",tx->path);
+    char path[WEBIDB_FILE_MAX];snprintf(path,sizeof path,"%s.pending",tx->path);
     n_handle h=n_document_open(path,N_DOCUMENT_EDIT);
     if(h==-N_ERR_NOT_FOUND)return WEB_IDB_OK;
     if(h<0)return WEB_IDB_IO;
@@ -111,7 +116,7 @@ static int pending_clear(struct idb_tx *tx){
     return n_handle_close(h)<0||!ok?WEB_IDB_IO:WEB_IDB_OK;
 }
 static int pending_recover(struct idb_tx *tx){
-    char path[176];snprintf(path,sizeof path,"%s.pending",tx->path);
+    char path[WEBIDB_FILE_MAX];snprintf(path,sizeof path,"%s.pending",tx->path);
     uint8_t *data;size_t n;
     n_result loaded=read_whole(path,&data,&n);
     if(loaded==-N_ERR_NOT_FOUND)return WEB_IDB_OK;
@@ -122,7 +127,7 @@ static int pending_recover(struct idb_tx *tx){
     return pending_clear(tx);
 }
 static int pending_append(struct idb_tx *tx,const uint8_t digest[32]){
-    char path[176];snprintf(path,sizeof path,"%s.pending",tx->path);
+    char path[WEBIDB_FILE_MAX];snprintf(path,sizeof path,"%s.pending",tx->path);
     return n_document_append(path,digest,32)>=0?WEB_IDB_OK:WEB_IDB_IO;
 }
 webidb *webidb_create(void){return calloc(1,sizeof(webidb));}
@@ -138,7 +143,8 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
     *token=0;
     if(!db||!origin||!name||(strncmp(origin,"http://",7)&&strncmp(origin,"https://",8)))
         return WEB_IDB_SECURITY;
-    if(!directory("/data/browser")||!directory(IDB_ROOT))return WEB_IDB_IO;
+    char root[WEBIDB_BASE_MAX];
+    if(!idb_root(root)||!directory(root))return WEB_IDB_IO;
     br_sha256_context h;
     uint8_t len[8],digest[32];
     br_sha256_init(&h);
@@ -150,15 +156,14 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
     br_sha256_update(&h,name,name_length);
     br_sha256_out(&h,digest);
     struct idb_tx *tx=calloc(1,sizeof *tx);if(!tx)return WEB_IDB_MEMORY;
-    char text[65],lease[168],legacy[160],probe[168],shard[160];hex(digest,text);
-    snprintf(legacy,sizeof legacy,"%s/%s",IDB_ROOT,text);
+    char text[65],prefix[3],lease[WEBIDB_FILE_MAX],legacy[WEBIDB_BASE_MAX],probe[WEBIDB_FILE_MAX],shard[WEBIDB_BASE_MAX];hex(digest,text);
+    snprintf(prefix,sizeof prefix,"%.2s",text);
+    if(n_path_join(root,text,legacy,sizeof legacy)<0){free(tx);return WEB_IDB_IO;}
     struct n_entry existing;bool old_layout=false;
     for(unsigned slot=0;slot<2;slot++){snprintf(probe,sizeof probe,"%s.%u",legacy,slot);if(n_entry_info(probe,&existing)>=0)old_layout=true;}
     if(old_layout)snprintf(tx->path,sizeof tx->path,"%s",legacy);
     else{
-        snprintf(shard,sizeof shard,"%s/%.2s",IDB_ROOT,text);
-        if(!directory(shard)){free(tx);return WEB_IDB_IO;}
-        snprintf(tx->path,sizeof tx->path,"%s/%s",shard,text);
+        if(n_path_join(root,prefix,shard,sizeof shard)<0||!directory(shard)||n_path_join(shard,text,tx->path,sizeof tx->path)<0){free(tx);return WEB_IDB_IO;}
     }
     /* Nocturne vnode leases are same-process reentrant. Serialize conflicting
        transactions inside this broker too, not just between helper processes. */
@@ -216,7 +221,7 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
 int webidb_value(webidb *db,uint32_t token,const char *reference,uint8_t **bytes,size_t *length){
     *bytes=NULL;*length=0;struct idb_tx *tx=find(db,token);uint8_t digest[32];if(!tx||!unhex(reference,digest))return WEB_IDB_IO;
     int permitted=contains(&tx->current,digest);for(struct idb_stage *p=tx->staged;!permitted&&p;p=p->next)permitted=!memcmp(p->digest,digest,32);if(!permitted)return WEB_IDB_SECURITY;
-    char path[240];payload_path(tx,digest,path);uint8_t *data;size_t n;
+    char path[WEBIDB_FILE_MAX];payload_path(tx,digest,path);uint8_t *data;size_t n;
     n_result loaded=read_whole(path,&data,&n);
     if(loaded==-N_ERR_NOT_FOUND){legacy_payload_path(tx,digest,path);loaded=read_whole(path,&data,&n);}
     if(loaded<0)return loaded==-N_ERR_NO_MEMORY?WEB_IDB_MEMORY:WEB_IDB_IO;
@@ -231,7 +236,7 @@ int webidb_stage(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,ch
     if(contains(&tx->current,digest))return WEB_IDB_OK;
     for(struct idb_stage *p=tx->staged;p;p=p->next)if(!memcmp(p->digest,digest,32))return WEB_IDB_OK;
     struct idb_stage *p=malloc(sizeof *p);if(!p)return WEB_IDB_MEMORY;
-    char path[240];payload_path(tx,digest,path);
+    char path[WEBIDB_FILE_MAX];payload_path(tx,digest,path);
     if(!contains(&tx->old,digest)){
         if(!payload_directory(tx,digest)){free(p);return WEB_IDB_IO;}
         int journal=pending_append(tx,digest);if(journal){free(p);return journal;}
@@ -253,7 +258,7 @@ int webidb_abort(webidb *db,uint32_t token){
         struct idb_stage *s=tx->staged;
         tx->staged=s->next;
         if(!contains(&tx->current,s->digest)&&!contains(&tx->old,s->digest)){
-            char path[240];payload_path(tx,s->digest,path);n_entry_remove(path);
+            char path[WEBIDB_FILE_MAX];payload_path(tx,s->digest,path);n_entry_remove(path);
         }
         free(s);
     }
@@ -333,7 +338,7 @@ static int catalog(const char *base,int slot,const char *origin,struct webidb_da
     if(!ok){free(data);return -1;}
     /* Bind catalog names back to their private hashed filename, preventing
      * a malformed header from becoming a cross-origin database alias. */
-    br_sha256_context h;br_sha256_init(&h);uint8_t len[8];put64(len,on);br_sha256_update(&h,len,8);br_sha256_update(&h,origin,(size_t)on);put64(len,nn);br_sha256_update(&h,len,8);br_sha256_update(&h,data+IDB_CATALOG_HEAD+on,(size_t)nn);br_sha256_out(&h,digest);char text[65];hex(digest,text);const char *basename=strrchr(base,'/');if(!basename||strcmp(basename+1,text)){free(data);return -1;}
+    br_sha256_context h;br_sha256_init(&h);uint8_t len[8];put64(len,on);br_sha256_update(&h,len,8);br_sha256_update(&h,origin,(size_t)on);put64(len,nn);br_sha256_update(&h,len,8);br_sha256_update(&h,data+IDB_CATALOG_HEAD+on,(size_t)nn);br_sha256_out(&h,digest);char text[65];hex(digest,text);if(strcmp(n_path_name(base),text)){free(data);return -1;}
     item->name=malloc((size_t)nn+1);if(!item->name){free(data);return -2;}
     memcpy(item->name,data+IDB_CATALOG_HEAD+on,(size_t)nn);item->name[nn]=0;
     item->name_length=(size_t)nn;item->version=u64(data+112);*generation=u64(data+72);free(data);return 1;
@@ -347,13 +352,13 @@ static int catalog_scan(const char *directory_path,const char *origin,struct web
     for(n_result index=0;index<listed;index++){
         const struct n_entry *entry=&entries[index];
         if(shards&&entry->kind==N_KIND_FOLDER&&shard_name(entry->name)){
-            char child[160];snprintf(child,sizeof child,"%s/%s",directory_path,entry->name);
+            char child[WEBIDB_BASE_MAX];if(n_path_join(directory_path,entry->name,child,sizeof child)<0)continue;
             result=catalog_scan(child,origin,items,count,false);if(result)break;continue;
         }
         size_t len=strlen(entry->name);
         if(len!=66||entry->name[64]!='.'||(entry->name[65]!='0'&&entry->name[65]!='1'))continue;
         char text[65];memcpy(text,entry->name,64);text[64]=0;uint8_t digest[32];if(!unhex(text,digest))continue;
-        char base[160],lock[168];snprintf(base,sizeof base,"%s/%s",directory_path,text);snprintf(lock,sizeof lock,"%s.lock",base);
+        char base[WEBIDB_BASE_MAX],lock[WEBIDB_FILE_MAX];if(n_path_join(directory_path,text,base,sizeof base)<0)continue;snprintf(lock,sizeof lock,"%s.lock",base);
         n_handle lease=document(lock);if(lease<0){result=WEB_IDB_IO;break;}
         n_result claimed=n_document_claim(lease,false);
         if(claimed<0){result=claimed==-N_ERR_NOT_READY?WEB_IDB_BUSY:WEB_IDB_IO;n_handle_close(lease);break;}
@@ -364,14 +369,20 @@ static int catalog_scan(const char *directory_path,const char *origin,struct web
 int webidb_databases(webidb *db,const char *origin,struct webidb_database **items,size_t *count){
     *items=NULL;*count=0;
     if(!db||!origin||(strncmp(origin,"http://",7)&&strncmp(origin,"https://",8)))return WEB_IDB_SECURITY;
-    return catalog_scan(IDB_ROOT,origin,items,count,true);
+    char root[WEBIDB_BASE_MAX];
+    return idb_root(root)?catalog_scan(root,origin,items,count,true):WEB_IDB_IO;
 }
 
-/* RAM-root registry, so connection leases/notifications never survive reboot.
- * Process start times prevent PID reuse from resurrecting dead connections. */
+/* Registry in indexeddb in the profile's temporary folder, so connection leases/notifications never
+ * survive a restart. Process start times prevent PID reuse from resurrecting dead connections. */
 #define CLIENT_BYTES 48u
 struct client_table {uint8_t *rows;size_t count;struct n_procinfo *processes;int process_count;};
-static n_handle clients_open(struct idb_tx *tx){if(!directory("/tmp/browser-indexeddb"))return -1;const char *base=strrchr(tx->path,'/');char path[160];snprintf(path,sizeof path,"/tmp/browser-indexeddb/%s.clients",base?base+1:tx->path);return document(path);}
+static n_handle clients_open(struct idb_tx *tx){
+    const char *profile=web_profile_folder(true);char folder[WEBIDB_BASE_MAX],leaf[80],path[WEBIDB_BASE_MAX];
+    if(!profile||n_path_join(profile,"indexeddb",folder,sizeof folder)<0||!directory(folder))return -1;
+    snprintf(leaf,sizeof leaf,"%s.clients",n_path_name(tx->path));
+    return n_path_join(folder,leaf,path,sizeof path)<0?-1:document(path);
+}
 static int clients_lock(n_handle table){n_result claimed=n_document_claim(table,false);return claimed>=0?WEB_IDB_OK:claimed==-N_ERR_NOT_READY?WEB_IDB_BUSY:WEB_IDB_IO;}
 static int processes(struct client_table *t){int capacity=32;for(;;){t->processes=malloc((size_t)capacity*sizeof *t->processes);if(!t->processes)return WEB_IDB_MEMORY;int n=proclist(t->processes,capacity);if(n<0){free(t->processes);t->processes=NULL;return WEB_IDB_IO;}if(n<capacity){t->process_count=n;return WEB_IDB_OK;}free(t->processes);t->processes=NULL;if(capacity>INT_MAX/2)return WEB_IDB_MEMORY;capacity*=2;}}
 static int client_alive(struct client_table *t,uint8_t *row){for(int i=0;i<t->process_count;i++)if(t->processes[i].pid==(int)u64(row+8)&&t->processes[i].start_ms==u64(row+16)&&t->processes[i].state!=3)return 1;return 0;}
@@ -388,7 +399,7 @@ int webidb_disconnect(webidb *db,uint32_t connection){if(!db)return WEB_IDB_IO;s
 int webidb_forget_connection(webidb *db,uint32_t connection){
     int result=webidb_disconnect(db,connection);if(result!=WEB_IDB_BUSY)return result;
     struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;
-    /* This lease covers RAM-root row I/O only, never author code or a
+    /* This lease covers temporary-folder row I/O only, never author code or a
      * transaction. An unpublished OOM connection cannot be left for JS to close. */
     if(n_document_claim(c->table,true)<0)return WEB_IDB_IO;
     return webidb_disconnect(db,connection);

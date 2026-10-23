@@ -1,5 +1,5 @@
 /* wxtest: checks that memory protection (W^X) works. Built and run inside Nocturne by the test suite:
-     tcc -o /home/wxtest wxtest.c && /home/wxtest
+     tcc -o .\wxtest C:\Tests\wxtest.c && .\wxtest
    Each probe runs as a child process (wxtest PROBE) because a working probe dies with a page fault.
    Prints one "PASS name" / "FAIL name" line per check and "wxtest: N failed" at the end. */
 #include <stdio.h>
@@ -64,7 +64,8 @@ static int run_probe(const char *self, const char *what) {
 
 int main(int argc, char **argv) {
     if (argc > 1) return probe(argv[1]);
-    const char *self = argv[0];
+    char self[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if (n_path_complete(argv[0], self, sizeof self) < 0) return 1;
 
     check("code runs", ret42() == 42);
     const char *crash[] = {"write-code", "write-rodata", "exec-stack", "exec-heap", "exec-after-protect-rw",
@@ -95,10 +96,10 @@ int main(int argc, char **argv) {
     check("protect unmapped fails", n_memory_protect((void *)0x500000000000, 4096, N_MEMORY_READ) < 0);
 
     /* the kernel must refuse to write into read-only memory for us, not crash */
-    n_handle motd = n_document_open("/etc/motd", N_DOCUMENT_READ);
-    n_result r = motd >= 0 ? n_document_read_at(motd, 0, (void *)code42, 4) : motd;
+    n_handle welcome = n_document_open("C:\\Nocturne\\Welcome.txt", N_DOCUMENT_READ);
+    n_result r = welcome >= 0 ? n_document_read_at(welcome, 0, (void *)code42, 4) : welcome;
     check("document read into rodata is a bad address", r == -N_ERR_BAD_ADDRESS);
-    if (motd >= 0) n_handle_close(motd);
+    if (welcome >= 0) n_handle_close(welcome);
 
     printf("wxtest: %d failed\n", failed);
     return failed != 0;

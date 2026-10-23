@@ -1,5 +1,5 @@
 /* Encoding bindings that charge a document realm's allocation budget, kept
-   apart from js_encoding.c so realm-independent users (Workers, /bin/js) of
+   apart from js_encoding.c so realm-independent users (Workers, the js program) of
    the UTF-8 decoder do not depend on the document engine. */
 #include "js_encoding.h"
 #include "js_memory.h"

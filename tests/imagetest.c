@@ -63,7 +63,7 @@ int main(int argc,char **argv){
     int codec_failures=codec_regressions();
     if(argc>1&&!strcmp(argv[1],"--codec-only"))return codec_failures!=0;
     state.failures+=codec_failures;
-    FILE *file=fopen("/data/tests/js_image_cases.js","rb");if(!file){puts("FAIL Image test source missing");return 1;}
+    FILE *file=fopen("C:\\Tests\\js_image_cases.js","rb");if(!file){puts("FAIL Image test source missing");return 1;}
     fseek(file,0,SEEK_END);long length=ftell(file);rewind(file);
     if(length<0||length>65536){fclose(file);puts("FAIL Image test source length");return 1;}
     const char *head="<!doctype html><html><head></head><body><script>";

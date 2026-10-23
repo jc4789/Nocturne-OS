@@ -1565,6 +1565,22 @@ ST_FUNC int set_global_sym(TCCState *s1, const char *name, Section *sec, addr_t 
         ELFW(ST_INFO)(name ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE), 0, shn, name);
 }
 
+/* The thread-local storage block, laid out at START: IMAGE bytes of initialized data, then
+   zeros up to MEMSZ, at alignment ALIGN. xxx-link.c:relocate() addresses it from its end. */
+ST_FUNC void set_tls_layout(TCCState *s1, addr_t start, addr_t image, addr_t memsz, addr_t align)
+{
+    s1->tls_start = start;
+    s1->tls_end = start + memsz + (-memsz & (align - 1));
+#if CONFIG_TCC_NOCTURNE
+    /* Nocturne's libc makes each thread's block from these, as its linker script
+       (user/user.ld) defines them for the programs it links */
+    set_global_sym(s1, "__tls_image", NULL, start);
+    set_global_sym(s1, "__tls_image_end", NULL, start + image);
+    set_global_sym(s1, "__tls_memsz", NULL, memsz);
+    set_global_sym(s1, "__tls_align", NULL, align);
+#endif
+}
+
 static void add_init_array_defines(TCCState *s1, const char *section_name)
 {
     Section *s;
@@ -2529,16 +2545,17 @@ static int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
             ph2->p_align = 1;
         }
         if (f & SHF_TLS) {
-            ph2 = update_phdr(&d->phdr[d->tls], PT_TLS, s, addr, file_offset);
+            update_phdr(&d->phdr[d->tls], PT_TLS, s, addr, file_offset);
             if (s->sh_type == SHT_NOBITS)
                 addr -= s->sh_size;
-            /* for xxx-link.c:relocate() */
-            s1->tls_start = ph2->p_vaddr;
-            s1->tls_end = s1->tls_start + ph2->p_memsz + (-ph2->p_memsz & (ph2->p_align - 1));
         }
         if (s->sh_type == SHT_NOTE) {
             update_phdr(&d->phdr[d->notes], PT_NOTE, s, addr, file_offset);
         }
+    }
+    if (d->tls) {
+        ph2 = &d->phdr[d->tls];
+        set_tls_layout(s1, ph2->p_vaddr, ph2->p_filesz, ph2->p_memsz, ph2->p_align);
     }
 
     /* Fill other headers */
@@ -3278,6 +3295,25 @@ ST_FUNC int tcc_object_type(TCCInput *in, ElfW(Ehdr) *h)
     return 0;
 }
 
+/* Like the usual ELF linker scripts, the sections that -ffunction-sections and -fdata-sections
+   make for each function and variable (".text.foo", ".rodata.str1.1", ".bss.bar", ...) join the
+   section of their kind. As sections of their own, the many of a large library would outgrow
+   the 16 bits of a symbol's section index (st_shndx). */
+static const char *section_kind(const char *name)
+{
+    static const char *const kinds[] = { ".text", ".data", ".rodata", ".bss", ".tdata", ".tbss" };
+    size_t i, n;
+
+    if (!strcmp(name, rdata)) /* TinyCC's own read-only data stays apart */
+        return NULL;
+    for (i = 0; i < countof(kinds); i++) {
+        n = strlen(kinds[i]);
+        if (!strncmp(name, kinds[i], n) && name[n] == '.')
+            return kinds[i];
+    }
+    return NULL;
+}
+
 /* load an object file and merge it with current files */
 /* XXX: handle correctly stab (debug) info */
 ST_FUNC int tcc_load_object_file(TCCState *s1,
@@ -3288,6 +3324,8 @@ ST_FUNC int tcc_load_object_file(TCCState *s1,
     unsigned long size, offset, offseti;
     int i, j, nb_syms, sym_index, ret, seencompressed;
     char *strsec, *strtab;
+    const char *kind;
+    char kind_name[32];
     int stab_index, stabstr_index;
     int *old_to_new_syms;
     char *sh_name, *name;
@@ -3385,6 +3423,12 @@ invalid:
 
 	sh = &shdr[i];
         sh_name = strsec + sh->sh_name;
+        /* a relocation section follows the section it relocates */
+        kind = section_kind(strsec + shdr[sh->sh_type == SHT_RELX ? sh->sh_info : i].sh_name);
+        if (kind) {
+            snprintf(kind_name, sizeof kind_name, sh->sh_type == SHT_RELX ? REL_SECTION_FMT : "%s", kind);
+            sh_name = kind_name;
+        }
         if (sh->sh_addralign < 1)
             sh->sh_addralign = 1;
         /* find corresponding section, if any */
@@ -3418,10 +3462,19 @@ invalid:
         }
         /* not found: create new section */
         s = new_section(s1, sh_name, sh->sh_type, sh->sh_flags & ~SHF_GROUP);
+        if (s->sh_num >= SHN_LORESERVE) { /* a symbol's st_shndx could not name it */
+            tcc_error_noabort("too many sections (at '%s')", sh_name);
+            goto the_end;
+        }
         /* take as much info as possible from the section. sh_link and
            sh_info will be updated later */
         s->sh_addralign = sh->sh_addralign;
         s->sh_entsize = sh->sh_entsize;
+        if (kind && sh->sh_type != SHT_RELX) {
+            /* other contents of the kind join it: not mergeable constants or strings */
+            s->sh_flags &= ~(SHF_MERGE | SHF_STRINGS);
+            s->sh_entsize = 0;
+        }
         sm_table[i].new_section = 1;
     found:
         size = sh->sh_size;

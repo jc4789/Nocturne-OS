@@ -18,7 +18,7 @@
         registered device can resume.
 
    Hibernate (dev/hibernate.h): as sleep, but the firmware is not asked; RAM is
-   written to /data and the power goes off. A device that cannot resume may
+   written to C: and the power goes off. A device that cannot resume may
    still take part when it comes back by itself after a cold boot (cold_ok:
    the firmware's display).
 
@@ -67,7 +67,7 @@ bool pm_stopping(void); /* a power change has passed the point of no return */
 /* Whether sleep can be offered: the firmware has S3, there is a wake page, every registered
    device can resume. pm_sleep_check logs it once all the drivers have registered. */
 bool pm_can_sleep(void);
-bool pm_can_hibernate(void); /* /data on a disk, room below 1 MiB, every device back after it */
+bool pm_can_hibernate(void); /* C: on a disk, room below 1 MiB, every device back after it */
 void pm_sleep_check(void);
 /* Interrupts off: every registered device stops, stage by stage. NULL, or the first device that
    did not stop (with stop_at_failure, the ones after it are left running). */

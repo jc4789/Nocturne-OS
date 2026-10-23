@@ -27,6 +27,18 @@ static int failed;
         }                                                                                                              \
     } while (0)
 
+/* the system's programs this test runs: complete paths, as n_app_launch takes them */
+#define VOLUME N_FOLDER_SYSTEM "\\volume"
+#define BEEP N_FOLDER_SYSTEM "\\beep"
+#define PLAY N_FOLDER_SYSTEM "\\play"
+
+/* the complete path of a document or folder of this test, inside folder (the temporary folder when it is
+   NULL); empty when it does not fit, which fails whatever is done with it */
+static const char *in_temp(const char *folder, const char *leaf, char *out, size_t cap) {
+    if (n_path_join(folder ? folder : n_temp_folder(), leaf, out, cap) < 0) out[0] = 0;
+    return out;
+}
+
 static void put16(uint8_t *p, unsigned v) { p[0] = (uint8_t)v, p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v) { put16(p, v & 0xFFFF), put16(p + 2, v >> 16); }
 
@@ -159,12 +171,12 @@ int main(void) {
           (long)n_audio_volume());
     CHECK(n_audio_set_volume(-1) == -N_ERR_INVALID, "setting -1");
     n_audio_set_volume(100);
-    const char *vargs[] = {"/bin/volume", "-30"};
+    const char *vargs[] = {VOLUME, "-30"};
     CHECK(run_quiet(vargs, 2) == 0 && n_audio_volume() == 70, "volume -30: %ld", (long)n_audio_volume());
 
     /* a melody, at volume 0 so that the recording stays as described above */
     n_audio_set_volume(0);
-    const char *margs[] = {"/bin/beep", "-l", "50", "C4", "E4", "G4", "C5:100", "R", "Bb3"};
+    const char *margs[] = {BEEP, "-l", "50", "C4", "E4", "G4", "C5:100", "R", "Bb3"};
     t0 = uptime_ms();
     CHECK(run_quiet(margs, 9) == 0, "beep with a melody failed");
     took = uptime_ms() - t0;
@@ -179,40 +191,48 @@ int main(void) {
         double fl, fr;
         bool ext;
     } wavs[] = {
-        {"/home/t8.wav", 1, 8, 1, 22050, 600, 600, false},
-        {"/home/t16.wav", 1, 16, 2, 44100, 700, 900, false},
-        {"/home/t24.wav", 1, 24, 1, 96000, 800, 800, false},
-        {"/home/tf.wav", 3, 32, 2, 48000, 500, 1100, true},
+        {"t8.wav", 1, 8, 1, 22050, 600, 600, false},
+        {"t16.wav", 1, 16, 2, 44100, 700, 900, false},
+        {"t24.wav", 1, 24, 1, 96000, 800, 800, false},
+        {"tf.wav", 3, 32, 2, 48000, 500, 1100, true},
     };
+    char wav[4096];
     for (int i = 0; i < 4; i++) {
-        make_wav(wavs[i].name, wavs[i].tag, wavs[i].bits, wavs[i].ch, wavs[i].rate, wavs[i].fl, wavs[i].fr, 0.5,
+        in_temp(NULL, wavs[i].name, wav, sizeof wav);
+        make_wav(wav, wavs[i].tag, wavs[i].bits, wavs[i].ch, wavs[i].rate, wavs[i].fl, wavs[i].fr, 0.5,
                  wavs[i].ext);
-        const char *pargs[] = {"/bin/play", "-q", wavs[i].name};
+        const char *pargs[] = {PLAY, "-q", wav};
         t0 = uptime_ms();
         int rc = run_quiet(pargs, 3);
         took = uptime_ms() - t0;
         CHECK(rc == 0, "play %s: exit %d", wavs[i].name, rc);
         CHECK(took >= 450 && took <= 900, "play %s took %lu ms", wavs[i].name, (unsigned long)took);
         n_sleep_ms(300);
+        n_entry_remove(wav);
     }
-    n_document_save("/home/bad.wav", "RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x55\0\x02\0", 22);
-    const char *badargs[] = {"/bin/play", "/home/bad.wav"};
+    in_temp(NULL, "bad.wav", wav, sizeof wav);
+    n_document_save(wav, "RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x55\0\x02\0", 22);
+    const char *badargs[] = {PLAY, wav};
     CHECK(run_quiet(badargs, 2) != 0, "play accepted a broken file");
+    n_entry_remove(wav);
 
     /* beep: a plain tone, bad arguments, and being stopped while it plays */
-    const char *bargs[] = {"/bin/beep", "-l", "400"};
+    const char *bargs[] = {BEEP, "-l", "400"};
     t0 = uptime_ms();
     CHECK(run_quiet(bargs, 3) == 0, "beep failed");
     took = uptime_ms() - t0;
     CHECK(took >= 380 && took <= 800, "beep -l 400 took %lu ms", (unsigned long)took);
-    const char *nargs[] = {"/bin/beep", "H9"};
+    const char *nargs[] = {BEEP, "H9"};
     CHECK(run_quiet(nargs, 2) == 2, "beep H9 should be refused");
     n_sleep_ms(300);
 
     /* the Sound Player plays the file it is opened with (alone in its folder, so nothing follows) */
-    n_folder_create("/home/ptest");
-    make_wav("/home/ptest/tone.wav", 1, 16, 2, 32000, 1200, 750, 0.6, false);
-    int id = gui_launch("/bin/player", "/home/ptest/tone.wav");
+    char ptest[4096], tone_path[4096];
+    in_temp(NULL, "ptest", ptest, sizeof ptest);
+    n_folder_create(ptest);
+    in_temp(ptest, "tone.wav", tone_path, sizeof tone_path);
+    make_wav(tone_path, 1, 16, 2, 32000, 1200, 750, 0.6, false);
+    int id = gui_launch("player", tone_path);
     CHECK(id > 0, "the Sound Player did not start (%d)", id);
     n_sleep_ms(1300);
     if (id > 0) {
@@ -224,8 +244,8 @@ int main(void) {
         }
     }
     n_sleep_ms(300);
-    const char *largs[] = {"/bin/beep", "-l", "10000", "-f", "300"};
-    n_handle beep = start_quiet("/bin/beep", largs, 5);
+    const char *largs[] = {BEEP, "-l", "10000", "-f", "300"};
+    n_handle beep = start_quiet(BEEP, largs, 5);
     n_sleep_ms(300);
     t0 = uptime_ms();
     n_app_stop(beep, 0);

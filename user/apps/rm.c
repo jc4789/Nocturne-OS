@@ -14,7 +14,7 @@ static int rm(const char *path, const char *shown) {
         /* the folder shrinks as entries go, so always take the first */
         struct n_entry first;
         while (n_folder_list(path, &first, 1, 0) == 1) {
-            char sub[512];
+            char sub[1024];
             if (n_path_join(path, first.name, sub, sizeof sub) < 0 || rm(sub, sub)) return 1;
         }
     } else if (e.kind == N_KIND_FOLDER) {
@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
             continue;
         }
         files++;
-        char path[512];
+        char path[1024];
         n_result r = n_path_complete(argv[i], path, sizeof path);
         if (r < 0) {
             fprintf(stderr, "rm: %s: %s\n", argv[i], n_result_text(r));

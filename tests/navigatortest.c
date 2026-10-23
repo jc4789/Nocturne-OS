@@ -33,7 +33,7 @@ static void cookies_set(void *opaque,const char *url,const char *value){
     webcookie_set(f->jar,&context,value,strlen(value),time(NULL));
 }
 static char *read_cases(void){
-    FILE *file=fopen("/data/tests/js_navigator_cases.js","rb");if(!file)return NULL;
+    FILE *file=fopen("C:\\Tests\\js_navigator_cases.js","rb");if(!file)return NULL;
     if(fseek(file,0,SEEK_END)){fclose(file);return NULL;}long length=ftell(file);
     if(length<0||length>65536||fseek(file,0,SEEK_SET)){fclose(file);return NULL;}
     char *source=malloc((size_t)length+1);if(!source){fclose(file);return NULL;}

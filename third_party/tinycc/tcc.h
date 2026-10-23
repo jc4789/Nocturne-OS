@@ -125,10 +125,15 @@ extern long double strtold (const char *__nptr, char **__endptr);
 # define PRINTF_LIKE(x,y) __attribute__ ((format (printf, (x), (y))))
 #endif
 
-#ifdef _WIN32
+#if defined _WIN32 || CONFIG_TCC_NOCTURNE
+/* Nocturne paths are drive paths like Windows ones ("C:\Nocturne\SDK"), and names compare without case. */
 # define IS_DIRSEP(c) (c == '/' || c == '\\')
 # define IS_ABSPATH(p) (IS_DIRSEP(p[0]) || (p[0] && p[1] == ':' && IS_DIRSEP(p[2])))
-# define PATHCMP stricmp
+# if CONFIG_TCC_NOCTURNE
+#  define PATHCMP strcasecmp
+# else
+#  define PATHCMP stricmp
+# endif
 # define PATHSEP ";"
 #else
 # define IS_DIRSEP(c) (c == '/')
@@ -1602,6 +1607,7 @@ ST_FUNC addr_t get_sym_addr(TCCState *s, const char *name, int err, int forc);
 ST_FUNC void list_elf_symbols(TCCState *s, void *ctx,
     void (*symbol_cb)(void *ctx, const char *name, const void *val));
 ST_FUNC int set_global_sym(TCCState *s1, const char *name, Section *sec, addr_t offs);
+ST_FUNC void set_tls_layout(TCCState *s1, addr_t start, addr_t image, addr_t memsz, addr_t align);
 
 /* Browse each elem of type <type> in section <sec> starting at elem <startoff>
    using variable <elem> */

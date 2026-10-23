@@ -1,73 +1,110 @@
-/* Actual webidb.c and BearSSL hash; only native file/process/lease syscalls
- * are adapted to isolated host files. No browser or site success is inferred. */
+/* Actual webidb.c and BearSSL hash; only the native document, folder, process and lease calls are
+ * adapted to isolated host files. No browser or site success is inferred.
+ * The databases are where the browser keeps them, in the folders of C:\Users\User\AppData\Browser
+ * (and its temporary folder, C:\Users\User\AppData\Temp\Browser); the host holds those folders and
+ * files under build/idb-native-<serial>.
+ * Build with -idirafter user/include -Icommon -Ithird_party/bearssl/inc -Ithird_party/bearssl/src (the
+ * real nocturne.h, webstorage.h and webidb.h are used, the host's own errno.h and the like) and
+ * BearSSL's sha2small.c, enc32be.c and dec32be.c. */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <io.h>
 #include <direct.h>
 #include <process.h>
 #include <sys/stat.h>
-#include "../tools/msys64/ucrt64/include/fcntl.h"
-#undef SYS_OPEN
-#include "../common/abi.h"
+#include <nocturne.h>
+#include <webstorage.h>
+#define PROFILE_FOLDER "C:\\Users\\User\\AppData\\Browser"
+#define TEMPORARY_PROFILE_FOLDER "C:\\Users\\User\\AppData\\Temp\\Browser"
 struct file_entry{char path[400];int leased;};static struct file_entry files[2048];
-static char **directories;static size_t directory_count;
 static long long fail_write=-1;static size_t written_bytes,read_bytes;static int failures,checks;static unsigned fixture_serial;
 static long long fail_head_write=-1;
-static void path(const char *guest,char host[400]){snprintf(host,400,"build/idb-native-%u/",fixture_serial);size_t at=strlen(host);for(const char *p=guest;*p&&at<399;p++)host[at++]=*p=='/'?'_':*p;host[at]=0;}
-static int adapter_open(const char *guest,int flags,...){
-    if(flags&0x10000){if(!strcmp(guest,"/data/browser/indexeddb"))return 4095;for(size_t i=0;i<directory_count;i++)if(!strcmp(directories[i],guest))return 4096+(int)i;errno=ENOENT;return -1;}
-    char host[400];path(guest,host);int mode=(flags&3)==2?_O_RDWR:(flags&3)==1?_O_WRONLY:_O_RDONLY;if(flags&0x40)mode|=_O_CREAT;if(flags&0x200)mode|=_O_TRUNC;if(flags&0x400)mode|=_O_APPEND;int fd=_open(host,mode|_O_BINARY,_S_IREAD|_S_IWRITE);if(fd>=0){if(fd>=2048){_close(fd);errno=ENOMEM;return -1;}snprintf(files[fd].path,sizeof files[fd].path,"%s",host);files[fd].leased=0;}return fd;
-}
-static int adapter_fcntl(int fd,int cmd,...){if(cmd==F_NUNLOCK){files[fd].leased=0;return 0;}if(files[fd].leased)return 0;for(int i=0;i<2048;i++)if(i!=fd&&files[i].leased&&!strcmp(files[i].path,files[fd].path)){errno=EAGAIN;return -1;}files[fd].leased=1;return 0;}
-static ssize_t adapter_read(int fd,void *p,size_t n){int r=_read(fd,p,(unsigned)n);if(r>0)read_bytes+=(size_t)r;return r;}
-static ssize_t adapter_write(int fd,const void *p,size_t n){
-    size_t path_length=strlen(files[fd].path);long long *remaining=&fail_write;
-    if(fail_head_write>=0&&path_length>=2&&files[fd].path[path_length-2]=='.'&&(files[fd].path[path_length-1]=='0'||files[fd].path[path_length-1]=='1'))remaining=&fail_head_write;
-    if(*remaining==0){errno=EIO;return -1;}if(*remaining>=0&&(uint64_t)*remaining<n)n=(size_t)*remaining;
-    int r=_write(fd,p,(unsigned)n);if(r>0){written_bytes+=(size_t)r;if(*remaining>=0)*remaining-=r;}return r;
-}
-static int adapter_close(int fd){if(fd>=4095)return 0;files[fd].leased=0;files[fd].path[0]=0;return _close(fd);}
-static long long adapter_lseek(int fd,long long at,int whence){return _lseeki64(fd,at,whence);}
-static int adapter_unlink(const char *guest){char host[400];path(guest,host);return _unlink(host);}
-static int adapter_stat(const char *guest,struct n_stat *out){bool directory=!strcmp(guest,"/data/browser")||!strcmp(guest,"/data/browser/indexeddb")||!strcmp(guest,"/tmp/browser-indexeddb");for(size_t i=0;i<directory_count&&!directory;i++)directory=!strcmp(directories[i],guest);if(directory){memset(out,0,sizeof *out);out->type=2;return 0;}char host[400];path(guest,host);struct _stat64 st;if(_stat64(host,&st)<0)return -1;memset(out,0,sizeof *out);out->size=st.st_size;out->type=1;return 0;}
-static int adapter_fstat(int fd,struct n_stat *out){struct _stat64 st;if(_fstat64(fd,&st)<0)return -1;memset(out,0,sizeof *out);out->size=st.st_size;out->type=1;return 0;}
-static int adapter_mkdir(const char *p,unsigned mode){(void)mode;char **more=realloc(directories,(directory_count+1)*sizeof *more);if(!more)return -1;directories=more;directories[directory_count]=_strdup(p);if(!directories[directory_count])return -1;directory_count++;return 0;}
-static int adapter_pid(void){return 110;}
-static int adapter_processes(struct n_procinfo *p,int n){if(n){memset(p,0,sizeof *p);p->pid=110;p->start_ms=7;}return 1;}
-static int adapter_readdir(int fd,int index,struct n_dirent *out){
-    const char *directory=fd==4095?"/data/browser/indexeddb":directories[fd-4096];size_t prefix_length=strlen(directory);int current=0;
-    for(size_t i=0;i<directory_count;i++){
-        const char *name=directories[i];if(strncmp(name,directory,prefix_length)||name[prefix_length]!='/'||strchr(name+prefix_length+1,'/'))continue;
-        if(current++==index){memset(out,0,sizeof *out);snprintf(out->name,sizeof out->name,"%s",name+prefix_length+1);out->type=2;return 1;}
+/* The host path of a complete guest path: C: is dropped and '\' becomes '/'. */
+static void path(const char *guest,char host[400]){snprintf(host,400,"build/idb-native-%u",fixture_serial);size_t at=strlen(host);if(guest[0]&&guest[1]==':')guest+=2;for(const char *p=guest;*p&&at<399;p++)host[at++]=*p=='\\'?'/':*p;host[at]=0;}
+n_result n_path_join(const char *folder,const char *name,char *out,size_t cap){int n=snprintf(out,cap,"%s\\%s",folder,name);return n<0||(size_t)n>=cap?-N_ERR_TOO_LARGE:n;}
+const char *n_path_name(const char *guest){const char *name=guest;for(const char *p=guest;*p;p++)if(*p=='\\'||*p=='/')name=p+1;return name;}
+n_result n_entry_info(const char *guest,struct n_entry *out){char host[400];path(guest,host);struct _stat64 st;if(_stat64(host,&st)<0)return -N_ERR_NOT_FOUND;memset(out,0,sizeof *out);snprintf(out->name,sizeof out->name,"%s",n_path_name(guest));out->kind=(st.st_mode&_S_IFDIR)?N_KIND_FOLDER:N_KIND_DOCUMENT;out->size=(uint64_t)st.st_size;return 0;}
+n_result n_entry_remove(const char *guest){char host[400];path(guest,host);struct _stat64 st;if(_stat64(host,&st)<0)return -N_ERR_NOT_FOUND;return ((st.st_mode&_S_IFDIR)?_rmdir(host):_unlink(host))==0?0:-N_ERR_IO;}
+n_result n_folder_create(const char *guest){char host[400];path(guest,host);if(_mkdir(host)==0)return 0;return errno==EEXIST?-N_ERR_EXISTS:errno==ENOENT?-N_ERR_NOT_FOUND:-N_ERR_IO;}
+n_result n_folder_entries(const char *guest,struct n_entry **out){
+    char host[400],query[420];path(guest,host);*out=NULL;struct _stat64 st;if(_stat64(host,&st)<0)return -N_ERR_NOT_FOUND;if(!(st.st_mode&_S_IFDIR))return -N_ERR_NOT_FOLDER;
+    snprintf(query,sizeof query,"%s/*",host);struct __finddata64_t info;intptr_t search=_findfirst64(query,&info);struct n_entry *list=NULL;size_t count=0;
+    if(search!=-1){
+        do{if(!strcmp(info.name,".")||!strcmp(info.name,".."))continue;
+            struct n_entry *more=realloc(list,(count+1)*sizeof *list);if(!more){free(list);_findclose(search);return -N_ERR_NO_MEMORY;}
+            list=more;memset(&list[count],0,sizeof *list);snprintf(list[count].name,sizeof list[count].name,"%s",info.name);list[count].kind=(info.attrib&_A_SUBDIR)?N_KIND_FOLDER:N_KIND_DOCUMENT;list[count].size=(uint64_t)info.size;count++;
+        }while(_findnext64(search,&info)==0);
+        _findclose(search);
     }
-    char guest[400],query[400],prefix[400];snprintf(guest,sizeof guest,"%s/*",directory);path(guest,query);path(directory,prefix);
-    const char *basename=strrchr(prefix,'/');basename=basename?basename+1:prefix;size_t disk_prefix=strlen(basename);
-    struct __finddata64_t info;intptr_t search=_findfirst64(query,&info);if(search==-1)return 0;int result=0;
-    do{if(strncmp(info.name,basename,disk_prefix)||info.name[disk_prefix]!='_')continue;const char *name=info.name+disk_prefix+1;if(strchr(name,'_'))continue;
-        if(current++==index){memset(out,0,sizeof *out);snprintf(out->name,sizeof out->name,"%s",name);out->size=info.size;out->type=1;result=1;break;}
-    }while(_findnext64(search,&info)==0);_findclose(search);return result;
+    *out=list;return (n_result)count;
 }
-#define open adapter_open
-#define fcntl adapter_fcntl
-#define read adapter_read
-#define write adapter_write
-#define close adapter_close
-#define lseek adapter_lseek
-#define unlink adapter_unlink
-#define stat adapter_stat
-#define fstat adapter_fstat
-#define mkdir adapter_mkdir
-#define getpid adapter_pid
-#define proclist adapter_processes
-#define readdir adapter_readdir
+n_handle n_document_open(const char *guest,int access){
+    char host[400];path(guest,host);struct _stat64 st;int exists=_stat64(host,&st)==0;
+    if(exists&&(st.st_mode&_S_IFDIR))return -N_ERR_IS_FOLDER;
+    if(access==N_DOCUMENT_CREATE&&exists)return -N_ERR_EXISTS;
+    if(access!=N_DOCUMENT_CREATE&&!exists)return -N_ERR_NOT_FOUND;
+    if(access!=N_DOCUMENT_READ&&access!=N_DOCUMENT_EDIT&&access!=N_DOCUMENT_CREATE)return -N_ERR_UNSUPPORTED;
+    int mode=access==N_DOCUMENT_READ?_O_RDONLY:_O_RDWR;if(access==N_DOCUMENT_CREATE)mode|=_O_CREAT|_O_EXCL;
+    int fd=_open(host,mode|_O_BINARY,_S_IREAD|_S_IWRITE);
+    if(fd<0)return errno==ENOENT?-N_ERR_NOT_FOUND:-N_ERR_IO;
+    if(fd>=2048){_close(fd);return -N_ERR_NO_MEMORY;}
+    snprintf(files[fd].path,sizeof files[fd].path,"%s",host);files[fd].leased=0;return fd;
+}
+static bool open_handle(n_handle h){return h>=0&&h<2048&&files[h].path[0];}
+n_result n_document_read_at(n_handle h,uint64_t at,void *p,size_t n){
+    if(!open_handle(h))return -N_ERR_NO_HANDLE;
+    if(_lseeki64(h,(long long)at,SEEK_SET)<0)return -N_ERR_IO;
+    int r=_read(h,p,(unsigned)n);if(r<0)return -N_ERR_IO;read_bytes+=(size_t)r;return r;
+}
+/* The write budget that applies to a file: the heads (".0" and ".1") have their own when it is set. */
+static long long *write_budget(const char *host){size_t length=strlen(host);bool head=length>=2&&host[length-2]=='.'&&(host[length-1]=='0'||host[length-1]=='1');return fail_head_write>=0&&head?&fail_head_write:&fail_write;}
+n_result n_document_write_at(n_handle h,uint64_t at,const void *p,size_t n){
+    if(!open_handle(h))return -N_ERR_NO_HANDLE;
+    long long *remaining=write_budget(files[h].path);
+    if(*remaining==0)return -N_ERR_IO;if(*remaining>=0&&(uint64_t)*remaining<n)n=(size_t)*remaining;
+    if(_lseeki64(h,(long long)at,SEEK_SET)<0)return -N_ERR_IO;
+    int r=_write(h,p,(unsigned)n);if(r<0)return -N_ERR_IO;written_bytes+=(size_t)r;if(*remaining>=0)*remaining-=r;return r;
+}
+n_result n_document_size(n_handle h){if(!open_handle(h))return -N_ERR_NO_HANDLE;long long size=_filelengthi64(h);return size<0?-N_ERR_IO:(n_result)size;}
+n_result n_document_set_size(n_handle h,uint64_t size){if(!open_handle(h))return -N_ERR_NO_HANDLE;return _chsize_s(h,(long long)size)==0?0:-N_ERR_IO;}
+/* A claim belongs to one opening: another opening of the same document is not ready, the same one again is. */
+n_result n_document_claim(n_handle h,bool wait){
+    (void)wait;if(!open_handle(h))return -N_ERR_NO_HANDLE;if(files[h].leased)return 0;
+    for(int i=0;i<2048;i++)if(i!=h&&files[i].leased&&!strcmp(files[i].path,files[h].path))return -N_ERR_NOT_READY;
+    files[h].leased=1;return 0;
+}
+n_result n_document_release(n_handle h){if(!open_handle(h))return -N_ERR_NO_HANDLE;if(!files[h].leased)return -N_ERR_INVALID;files[h].leased=0;return 0;}
+n_result n_handle_close(n_handle h){if(!open_handle(h))return -N_ERR_NO_HANDLE;files[h].leased=0;files[h].path[0]=0;return _close(h)==0?0:-N_ERR_IO;}
+/* Save and append take the whole of data or nothing: a write budget that is too small fails the call and
+   leaves the document as it was, as a medium that gave out before the swap would. */
+static n_result put_document(const char *guest,const void *data,size_t n,bool append){
+    char host[400];path(guest,host);struct _stat64 st;
+    if(_stat64(host,&st)==0&&(st.st_mode&_S_IFDIR))return -N_ERR_IS_FOLDER;
+    long long *remaining=write_budget(host);
+    if(*remaining>=0&&(uint64_t)*remaining<n){*remaining=0;return -N_ERR_IO;}
+    int fd=_open(host,_O_WRONLY|_O_CREAT|(append?_O_APPEND:_O_TRUNC)|_O_BINARY,_S_IREAD|_S_IWRITE);
+    if(fd<0)return errno==ENOENT?-N_ERR_NOT_FOUND:-N_ERR_IO;
+    int r=n?_write(fd,data,(unsigned)n):0;if(_close(fd)!=0||r<0||(size_t)r!=n)return -N_ERR_IO;
+    written_bytes+=n;if(*remaining>=0)*remaining-=(long long)n;return 0;
+}
+n_result n_document_save(const char *guest,const void *data,size_t n){return put_document(guest,data,n,false);}
+n_result n_document_append(const char *guest,const void *data,size_t n){return put_document(guest,data,n,true);}
+n_result n_app_self(void){return 110;}
+n_result proclist(struct n_procinfo *p,int n){if(n){memset(p,0,sizeof *p);p->pid=110;p->start_ms=7;}return 1;}
+/* The browser's profile folders, made on the host when they are first asked for. */
+static void make_folders(const char *guest){char partial[400];size_t length=strlen(guest);for(size_t at=3;at<=length;at++)if(at==length||guest[at]=='\\'){memcpy(partial,guest,at);partial[at]=0;n_folder_create(partial);}}
+const char *web_profile_folder(bool temporary){const char *folder=temporary?TEMPORARY_PROFILE_FOLDER:PROFILE_FOLDER;make_folders(folder);return folder;}
 #include "../user/libc/webidb.c"
 #define hash idb_journal_hash
 #define put64 idb_journal_put64
+#define document idb_journal_document
 #include "../user/libc/webidb_journal.c"
+#undef document
 #undef put64
 #undef hash
 static void check(const char *label,int yes){checks++;if(!yes){failures++;printf("FAIL %s\n",label);}}
@@ -123,6 +160,5 @@ int main(void){fixture_serial=(unsigned)_getpid();char dir[100];snprintf(dir,siz
     check("journal-compaction-publishes-all-generations",compact_ok);webidb_free(a);a=webidb_create();
     check("compacted-cold-snapshot-reconstructs",webidb_begin(a,"https://idb.test","compact",7,&ta,&meta,&n)==0&&n==sizeof compact&&!memcmp(meta,compact,n));free(meta);webidb_abort(a,ta);
     free(snapshot);free(large);webidb_free(a);webidb_free(b);
-    for(size_t i=0;i<directory_count;i++)free(directories[i]);free(directories);
     printf("native IndexedDB: %d checks, %d failures\n",checks,failures);return failures?1:0;
 }

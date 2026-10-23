@@ -51,10 +51,10 @@ struct u_memstream
    size_t *sizep;
    char temp[PATH_MAX];
 #elif defined(NOCTURNE)
-   /* Nocturne has no in-memory FILE: a /tmp (RAM) file read back on flush. */
+   /* Nocturne has no in-memory FILE: a scratch document in the temporary folder (tmpfile, gone
+      when it is closed), read back on flush. */
    char **bufp;
    size_t *sizep;
-   char temp[64];
 #endif
 };
 

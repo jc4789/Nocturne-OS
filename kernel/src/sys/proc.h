@@ -1,7 +1,7 @@
 #pragma once
 #include "sys/sched.h"
-struct file;
-struct vnode;
+struct handle;
+struct object;
 
 /* Start a program. Handle i of the new app is handles[i] (NULL: none). Its
    settings are "NAME=value" strings, passed beside its arguments. When app is
@@ -11,20 +11,21 @@ struct proc_launch {
     char **argv;
     int setting_count;
     char **settings;
-    struct file **handles;
+    struct handle **handles;
     size_t handle_count;
     struct task *parent;
-    struct vnode *app;
+    struct object *app;
 };
 int proc_launch(const char *path, const struct proc_launch *launch);
-extern int init_pid; /* /bin/init: the only app that may claim a PCI function */
+extern int init_pid; /* the first app: the only one that may claim a PCI function */
 int proc_spawn_simple(const char *path, const char *arg1, struct task *parent);
 uint64_t proc_user_pages(struct task *t);
 
 /* App handles (docs/nocturne-native-abi.md §5). */
-struct vnode *proc_app_new(void);
-int proc_app_open(int pid, struct file **out);
-bool proc_app_is(struct vnode *v);
-void proc_app_ended(struct vnode *v, int status); /* BSP IRQ guard held */
-int proc_app_pid(struct vnode *v);
-int proc_app_result(struct vnode *v, uint64_t timeout_ms, int *status); /* UINT64_MAX: no limit */
+/* A new app record and the handle that will report its end (proc_launch's app is its object). */
+int proc_app_create(struct handle **out);
+int proc_app_open(int pid, struct handle **out);
+bool proc_app_is(struct handle *h);
+void proc_app_ended(struct object *app, int status); /* BSP IRQ guard held */
+int proc_app_pid(struct handle *h);
+int proc_app_result(struct handle *h, uint64_t timeout_ms, int *status); /* UINT64_MAX: no limit */

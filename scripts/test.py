@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""Run Nocturne's test suite: boot the built image headless in QEMU with a fresh test data disk.
+"""Run Nocturne's test suite: boot a copy of the built disk headless in QEMU with the tests on its C:.
 
-The disk carries tests/ and an autorun.sh. init runs that script at boot. It compiles
-tests/runtests.c with the in-OS tcc and runs it, then powers off. Results come back over the
-serial port. Afterwards the host checks the data disk's FAT with fatcheck.py, since the OS just
-wrote to it. For the TCP tests the host also runs a small server the guest reaches at 10.0.2.2
-(QEMU's user networking maps it to the host's 127.0.0.1); its port is in /data/tests/tcpport.
-The VM has an AC'97 sound card, recorded to build/test-audio.wav by QEMU's wav backend; when the
-audio tests ran, the host looks for the tones tests/audiotest.c plays in the recording.
+The built disk (build/nocturne.img, `make qemu-image`) is one GPT disk: the EFI system partition
+(FAT: Limine and the kernel) and drive C:. The test copies it to build/test.img, checks that the
+copy's kernel and system programs are the current build's, and puts tests/ and an autorun.sh in
+C:\\Tests with build/host/store.exe. The copy is the VM's only disk, on AHCI and without a
+snapshot. init runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
+and runs it, then powers off. Results come back over the serial port. Afterwards the host checks
+the volume the OS just wrote to with `store check`, and deletes the copy (it is kept only when the
+check finds problems, for looking into them). For the TCP tests the host also runs a small server
+the guest reaches at 10.0.2.2 (QEMU's user networking maps it to the host's 127.0.0.1); its port
+is in C:\\Tests\\tcpport. The VM has an AC'97 sound card, recorded to build/test-audio.wav by
+QEMU's wav backend; when the audio tests ran, the host looks for the tones tests/audiotest.c plays
+in the recording.
 
 usage: python scripts/test.py [--quick] [--full] [--no-net] [--timeout S] [group...]
-  --boot-image IMG  verify and boot a separate image with current kernel/initrd
+  --boot-image IMG  copy and boot this disk instead of build/nocturne.img (its kernel and programs
+                    must still be the current build's)
   --output-dir DIR  save into a new directory strictly under build/
   --quick   skip the slow tests (compile every app, tcc self-hosting)
   --full    also copy the TinyCC sources so tcc can rebuild itself inside the OS
   --no-net  skip the network tests (they need internet access from the host)
   group     run only these groups: sh tools mem fs tcc cxx gui audio media web tcp net agent
-Exit status 0 when every test passed. Build first (build.ps1). Your own build/data.img is not
-touched: the tests use build/test-data.img.
+Exit status 0 when every test passed. Build first (make qemu-image). The built disk and your
+build/run.img are never booted: the tests run on their own copy.
 """
 import argparse
 import glob
@@ -31,6 +37,7 @@ import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from functools import partial
@@ -38,16 +45,15 @@ from functools import partial
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "tools", "msys64", "ucrt64", "bin")
 USR_BIN = os.path.join(ROOT, "tools", "msys64", "usr", "bin")
-BASH = os.path.join(ROOT, "tools", "msys64", "usr", "bin", "bash.exe")
 QEMU = os.path.join("C:/Program Files/qemu", "qemu-system-x86_64.exe")
 if not os.path.isfile(QEMU):
     QEMU = os.path.join(BIN, "qemu-system-x86_64.exe")
 BUILD = os.path.join(ROOT, "build")
 CORE_BUILD = BUILD  # Generated toolchain inputs stay here when outputs are isolated.
-IMG = os.path.join(BUILD, "test-data.img")
+STORE = os.path.join(CORE_BUILD, "host", "store.exe")
+DISK = os.path.join(BUILD, "test.img")
 SERIAL = os.path.join(BUILD, "test-serial.log")
 AUDIO = os.path.join(BUILD, "test-audio.wav")
-PART = IMG + "@@1048576"
 
 
 def file_sha256(path):
@@ -64,11 +70,114 @@ def mtools(*args):
     # Resolve the bundled executable ourselves so an ordinary Python launch also works.
     executable = shutil.which(args[0], path=env["PATH"])
     if not executable:
-        sys.exit("test: cannot find bundled tool %s" % args[0])
+        sys.exit("cannot find the bundled tool %s" % args[0])
     r = subprocess.run([executable, *args[1:]], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode:
-        sys.exit("test: %s failed: %s" % (args[0], r.stderr.strip()))
+        sys.exit("%s failed: %s" % (args[0], r.stderr.strip()))
+
+
+def store(*args, fatal=True):
+    """build/host/store.exe (host/store/store.c) on a disk image; it changes only that image"""
+    r = subprocess.run([STORE, *args], cwd=ROOT, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if r.returncode and fatal:
+        sys.exit("store %s failed: %s" % (args[0], (r.stderr or r.stdout).strip()))
+    return r
+
+
+def mtools_name(path):
+    # mtools takes the image relative to ROOT, with forward slashes ("D:" would read as its drive).
+    return os.path.relpath(path, ROOT).replace("\\", "/")
+
+
+def esp(disk):
+    """mtools' name for the disk's EFI system partition, where `store esp` finds it in the GPT"""
+    offset = store("esp", disk).stdout.split()[0]
+    return mtools_name(disk) + "@@" + offset
+
+
+def system_payload(disk, scratch):
+    """sha256 of the disk's kernel (on its EFI system partition) and of each program scripts/layout.py
+    put on its C: (build/c.list names them), each the same as the current build's; exits otherwise"""
+    found = {}
+
+    def compare(name, copy, built):
+        actual = file_sha256(copy)
+        os.remove(copy)
+        if actual != file_sha256(built):
+            sys.exit("the disk is not the current build's: %s differs (make qemu-image)" % name)
+        found[name] = actual
+
+    kernel = os.path.join(scratch, "kernel.elf")
+    # -n: replace the host-side copy; -o alone still asks, and with no stdin mcopy then waits forever.
+    mtools("mcopy", "-n", "-o", "-i", esp(disk), "::/boot/kernel.elf", mtools_name(kernel))
+    compare("kernel.elf", kernel, os.path.join(CORE_BUILD, "kernel.elf"))
+    programs = os.path.normcase(os.path.join(CORE_BUILD, "programs"))
+    with open(os.path.join(CORE_BUILD, "c.list"), encoding="utf-8") as listing:
+        for line in listing:
+            fields = line.rstrip("\n").split("\t")
+            if line.startswith("#") or len(fields) < 2:
+                continue
+            host = os.path.normpath(os.path.join(ROOT, fields[1]))
+            if os.path.normcase(os.path.dirname(host)) != programs or not os.path.isfile(host):
+                continue
+            copy = os.path.join(scratch, "program")
+            store("get", disk, fields[0], copy)
+            compare(fields[0], copy, host)
+    return found
+
+
+def edit_boot_entry(disk, scratch, resolution=None, cmdline=""):
+    """Change the first entry of the limine.conf on the disk's EFI system partition: its resolution,
+    and words added to its kernel command line (a key=value word replaces the entry's own value for
+    that key). The other entries stay as they are."""
+    part = esp(disk)
+    conf = os.path.join(scratch, "limine.conf")
+    mtools("mcopy", "-n", "-o", "-i", part, "::/boot/limine/limine.conf", mtools_name(conf))
+    with open(conf, encoding="utf-8") as f:
+        config = f.read()
+    first_entry = config.split("\n/", 2)[1]
+    updated = first_entry
+    if resolution:
+        updated, count = re.subn(r"(?m)^    resolution: [^\n]+$", "    resolution: " + resolution, updated)
+        if count != 1:
+            sys.exit("the first boot entry must have exactly one resolution")
+    if cmdline:
+        def add(match):
+            words = match.group(1).split()
+            for word in cmdline.split():
+                if "=" in word:
+                    key = word.split("=", 1)[0] + "="
+                    words = [w for w in words if not w.startswith(key)]
+                if word not in words:
+                    words.append(word)
+            return "    cmdline: " + " ".join(words)
+        updated, count = re.subn(r"(?m)^    cmdline: ([^\n]*)$", add, updated)
+        if count == 0:
+            updated, count = re.subn(r"(?m)^(    path: [^\n]*)$", lambda m: m.group(1) + "\n    cmdline: " + cmdline,
+                                     updated)
+        if count != 1:
+            sys.exit("the first boot entry must have exactly one kernel and command line")
+    with open(conf, "w", encoding="utf-8", newline="\n") as f:
+        f.write(config.replace(first_entry, updated, 1))
+    mtools("mcopy", "-o", "-i", part, mtools_name(conf), "::/boot/limine/limine.conf")
+    os.remove(conf)
+
+
+def put_tests(disk, entries, scratch):
+    """Put (path in C:\\Tests, host file or folder) pairs on the disk's C: with one `store fill`.
+    What C:\\Tests held before goes first, so it holds exactly these."""
+    listing = os.path.join(scratch, "tests.list")
+    with open(listing, "w", encoding="utf-8", newline="\n") as f:
+        f.write("C:\\Tests\t!\nC:\\Tests\t-\n")
+        for path, host in entries:
+            if any(c in path + host for c in "\t\r\n"):
+                sys.exit("a test file's name cannot be listed: %r" % host)
+            f.write("%s\t%s\n" % (path, host))
+    done = store("fill", disk, listing).stdout.strip()
+    os.remove(listing)
+    return done
 
 
 PATTERNS = {}  # (n, seed) -> bytes, precomputed for tests/tcptest.c's transfers while the VM boots
@@ -143,24 +252,8 @@ def start_silent_tls_server():
     return srv
 
 
-def copy_test_sources(paths):
-    # A preserved baseline has a longer source prefix than the checkout. Keep
-    # each native Windows command below CreateProcess's UTF-16 argument bound;
-    # every source is still copied and mcopy errors remain fatal.
-    batch, length = [], 0
-    for path in paths:
-        cost = len(path) * 2 + 4
-        if batch and length + cost > 20000:
-            mtools("mcopy", "-i", PART, *batch, "::/tests/")
-            batch, length = [], 0
-        batch.append(path)
-        length += cost
-    if batch:
-        mtools("mcopy", "-i", PART, *batch, "::/tests/")
-
-
 def start_web_servers():
-    """Two ephemeral host origins for actual /bin/webfetch tests; no internet is required."""
+    """Two ephemeral host origins for the guest's actual webfetch tests; no internet is required."""
     fixture = os.path.join(ROOT, "tests", "fixtures", "js", "server.py")
     spec = importlib.util.spec_from_file_location("nocturne_web_fixture", fixture)
     module = importlib.util.module_from_spec(spec)
@@ -211,16 +304,11 @@ def start_dns_servers():
     return servers
 
 
-def make_disk(a, tcp_port, web_ports):
+def test_files(a, tcp_port, web_ports, scratch):
+    """what goes in C:\\Tests: (its path there, host file or folder)"""
     # A preserved source snapshot keeps native struct layouts and expectations
     # paired with the baseline boot image while the checkout is being repaired.
     source_root = a.source_tree or ROOT
-    if os.path.exists(IMG):
-        os.remove(IMG)
-    env = dict(os.environ, PATH=BIN + os.pathsep + USR_BIN + os.pathsep + os.environ.get("PATH", ""))
-    subprocess.run([BASH, "scripts/mkdata.sh", os.path.relpath(IMG, ROOT).replace("\\", "/"), "256"], cwd=ROOT, env=env, check=True,
-                   stdout=subprocess.DEVNULL)
-    mtools("mmd", "-i", PART, "::/tests")
     srcs = sorted(glob.glob(os.path.join(source_root, "tests", "*.c")))
     srcs += sorted(glob.glob(os.path.join(source_root, "tests", "js_*_cases.js")))
     # Internal metadata regression reads diagnostic counters from the real DOM.
@@ -237,46 +325,32 @@ def make_disk(a, tcp_port, web_ports):
         if a.source_tree or not os.path.isfile(cenc):
             sys.exit("test: build the matching native CENC test before selecting cenc")
         srcs.append(cenc)
-    copy_test_sources(srcs)
-    if getattr(a, "h2_port", None):
-        port_file = os.path.join(BUILD, "h2port")
-        with open(port_file, "w", encoding="utf-8", newline="\n") as f:
-            f.write(str(a.h2_port) + "\n")
-        mtools("mcopy", "-i", PART, port_file, "::/tests/h2port")
-    if getattr(a, "tls_silent_port", None):
-        port_file = os.path.join(BUILD, "tlssilentport")
-        with open(port_file, "w", encoding="utf-8", newline="\n") as f:
-            f.write(str(a.tls_silent_port) + "\n")
-        mtools("mcopy", "-i", PART, port_file, "::/tests/tlssilentport")
-    if getattr(a, "dns_port", None):
-        port_file = os.path.join(BUILD, "dnsport")
-        with open(port_file, "w", encoding="utf-8", newline="\n") as f:
-            f.write(str(a.dns_port) + "\n")
-        mtools("mcopy", "-i", PART, port_file, "::/tests/dnsport")
-    mtools("mcopy", "-i", PART, "-s", os.path.join(source_root, "tests", "media-fixtures"), "::/tests/")
+    files = [(os.path.basename(src), src) for src in srcs]
+    files.append(("media-fixtures", os.path.join(source_root, "tests", "media-fixtures")))
     if a.full:
         tcc = os.path.join(ROOT, "third_party", "tinycc")
-        files = sorted(glob.glob(os.path.join(tcc, "*.c")) + glob.glob(os.path.join(tcc, "*.h")) +
-                       glob.glob(os.path.join(tcc, "*.def")))
-        files += [os.path.join(ROOT, "ports", "tcc", "config.h"), os.path.join(CORE_BUILD, "tcc", "tccdefs_.h")]
-        mtools("mmd", "-i", PART, "::/tests/tcc")
-        mtools("mcopy", "-i", PART, *files, "::/tests/tcc/")
-    port_file = os.path.join(BUILD, "tcpport")
-    with open(port_file, "w", newline="\n") as f:
-        f.write("%d\n" % tcp_port)
-    mtools("mcopy", "-i", PART, port_file, "::/tests/tcpport")
-    os.remove(port_file)
-    web_file = os.path.join(BUILD, "webports")
-    with open(web_file, "w", encoding="utf-8", newline="\n") as f:
-        f.write("%d %d\n" % tuple(web_ports))
-    mtools("mcopy", "-i", PART, web_file, "::/tests/webports")
-    os.remove(web_file)
+        sources = sorted(glob.glob(os.path.join(tcc, "*.c")) + glob.glob(os.path.join(tcc, "*.h")) +
+                         glob.glob(os.path.join(tcc, "*.def")))
+        sources += [os.path.join(ROOT, "ports", "tcc", "config.h"), os.path.join(CORE_BUILD, "tcc", "tccdefs_.h")]
+        files += [("tcc\\" + os.path.basename(src), src) for src in sources]
+
+    def note(name, text):  # a small document made for this run
+        path = os.path.join(scratch, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        files.append((name, path))
+
+    note("tcpport", "%d\n" % tcp_port)
+    note("webports", "%d %d\n" % tuple(web_ports))
+    if getattr(a, "h2_port", None):
+        note("h2port", "%d\n" % a.h2_port)
+    if getattr(a, "tls_silent_port", None):
+        note("tlssilentport", "%d\n" % a.tls_silent_port)
+    if getattr(a, "dns_port", None):
+        note("dnsport", "%d\n" % a.dns_port)
     args = (["-quick"] if a.quick else []) + (["-nonet"] if a.no_net else []) + a.groups
-    script = os.path.join(BUILD, "autorun.sh")
-    with open(script, "w", newline="\n") as f:
-        f.write("tcc -o /home/runtests /data/tests/runtests.c && /home/runtests %s\n" % " ".join(args))
-    mtools("mcopy", "-i", PART, script, "::/tests/autorun.sh")
-    os.remove(script)
+    note("autorun.sh", "tcc -o C:\\Tests\\runtests C:\\Tests\\runtests.c && C:\\Tests\\runtests %s\n" % " ".join(args))
+    return [("C:\\Tests\\" + name, host) for name, host in files]
 
 
 # what tests/audiotest.c plays, in order: (left Hz, right Hz, seconds); the last one is killed early
@@ -352,59 +426,33 @@ def check_audio(path):
     return True, desc
 
 
+def prepare_disk(a, tcp_port, web_ports):
+    """The run's own disk: a copy of the boot image, checked against the build, with its boot entry
+    set for the run and the tests in C:\\Tests -> (sha256 of the boot image, of its payload)"""
+    image_hash = a.boot_hash or file_sha256(a.boot_image)
+    shutil.copyfile(a.boot_image, DISK)
+    a.disk_made = True
+    with tempfile.TemporaryDirectory(prefix="test-", dir=BUILD) as scratch:
+        # The same bytes as a preserved baseline's boot image: the same payload.
+        payload = a.baseline_payload or system_payload(DISK, scratch)
+        dns_endpoint = "10.0.2.2:%d" % a.dns_port if getattr(a, "dns_port", None) else None
+        if a.resolution or dns_endpoint:
+            edit_boot_entry(DISK, scratch, a.resolution, "dns-server=" + dns_endpoint if dns_endpoint else "")
+        print("test: C:\\Tests: " + put_tests(DISK, test_files(a, tcp_port, web_ports, scratch), scratch), flush=True)
+    return image_hash, payload
+
+
 def run_vm(a, tcp_port, web_ports, processes):
-    # 起動媒体も専用コピー。検証中の次ビルドと元imageを共有しない。
-    boot = os.path.join(BUILD, "test-boot.img")
-    shutil.copyfile(a.boot_image, boot)
+    image_hash, payload = prepare_disk(a, tcp_port, web_ports)
     dns_endpoint = "10.0.2.2:%d" % a.dns_port if getattr(a, "dns_port", None) else None
-    if a.resolution or dns_endpoint:
-        conf = os.path.join(BUILD, "test-limine.conf")
-        conf_arg = os.path.relpath(conf, ROOT).replace("\\", "/")
-        boot_part = os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576"
-        # -n: replace the host-side copy; -o alone still asks, and with no
-        # stdin mcopy then waits forever.
-        mtools("mcopy", "-n", "-o", "-i", boot_part, "::/boot/limine/limine.conf", conf_arg)
-        with open(conf, encoding="utf-8") as f:
-            config = f.read()
-        first_entry = config.split("\n/", 2)[1]
-        updated = first_entry
-        if a.resolution:
-            updated, count = re.subn(r"(?m)^    resolution: [^\n]+$", "    resolution: " + a.resolution, updated)
-            if count != 1:
-                sys.exit("test: primary boot entry must have exactly one resolution")
-        if dns_endpoint:
-            def default_dns(match):
-                arguments = match.group(1)
-                if re.search(r"(?:^|\s)dns-server=", arguments):
-                    sys.exit("test: primary boot entry already has a DNS resolver override")
-                return "    cmdline: " + arguments + " dns-server=" + dns_endpoint
-            updated, count = re.subn(r"(?m)^    cmdline: ([^\n]*)$", default_dns, updated)
-            if count != 1:
-                sys.exit("test: primary boot entry must have exactly one command line")
-        with open(conf, "w", encoding="utf-8", newline="\n") as f:
-            f.write(config.replace(first_entry, updated, 1))
-        mtools("mcopy", "-o", "-i", boot_part, conf_arg, "::/boot/limine/limine.conf")
-    payload = {}
-    for name in ("kernel.elf", "initrd.tar"):
-        extracted = os.path.join(BUILD, "test-" + name)
-        mtools("mcopy", "-n", "-o", "-i", os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576",
-               "::/boot/" + name, os.path.relpath(extracted, ROOT).replace("\\", "/"))
-        actual = file_sha256(extracted)
-        expected = (a.baseline_payload[name] if a.baseline_payload else
-                    file_sha256(os.path.join(CORE_BUILD, name)))
-        if actual != expected:
-            sys.exit("test: boot payload differs from " +
-                     ("preserved baseline: " if a.baseline_payload else "current build: ") + name)
-        payload[name] = actual
-    make_disk(a, tcp_port, web_ports)
-    image_hash = file_sha256(boot)
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
+    # The disk on AHCI, like a real machine's SATA; no snapshot: the volume is checked afterwards.
     cmd = [a.qemu, "-M", "pc", "-m", str(a.memory) + "M", "-smp", str(a.cpus), "-accel", a.accel,
            "-display", "egl-headless" if a.gpu == "virgl" else "none", "-vga", "std", "-no-reboot",
            "-serial", "file:" + SERIAL,
-           "-drive", "file=%s,format=raw,if=ide,index=0,snapshot=on" % boot,
-           "-drive", "file=%s,format=raw,if=ide,index=1" % IMG,
+           "-device", "ahci,id=ahci", "-drive", "id=boot,file=%s,format=raw,if=none" % DISK,
+           "-device", "ide-hd,drive=boot,bus=ahci.0,bootindex=0",
            "-audiodev", "wav,id=snd,path=%s,out.frequency=48000,out.buffer-length=20000,in.voices=0" % AUDIO, "-device", "AC97,audiodev=snd"]
     if a.gpu == "virgl":
         cmd += ["-device", "virtio-gpu-gl-pci"]
@@ -416,7 +464,7 @@ def run_vm(a, tcp_port, web_ports, processes):
     processes.append(q)
     metadata = {"pid": q.pid, "arguments": cmd, "boot_sha256": image_hash,
                 "boot_source": a.boot_image, "boot_payload_sha256": payload, "user_data_attached": False,
-                "test_source_tree": a.source_tree or ROOT,
+                "disk": DISK, "test_source_tree": a.source_tree or ROOT,
                 "baseline_metadata": a.baseline_metadata,
                 "requested_resolution": a.resolution, "native_dns_fixture": dns_endpoint}
     metadata_path = os.path.join(BUILD, "test-metadata.json")
@@ -454,10 +502,6 @@ def run_vm(a, tcp_port, web_ports, processes):
     video = re.search(r"video: (\d+)x(\d+), (\d+) bpp", log)
     actual_resolution = "x".join(video.groups()) if video else None
     resolution_matched = not a.resolution or actual_resolution == a.resolution
-    metadata.update(exit_code=q.returncode, timed_out=timed_out, elapsed_seconds=time.time()-t0, process_stopped=True,
-                    actual_resolution=actual_resolution, resolution_matched=resolution_matched)
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
     problems = []
     if not resolution_matched:
         problems.append("requested video resolution differs from the actual guest boot mode")
@@ -480,12 +524,14 @@ def run_vm(a, tcp_port, web_ports, processes):
             continue
         if m.group(2) != "wxtest":
             problems.append(m.group(0))
-    fc = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "fatcheck.py"), IMG],
-                        capture_output=True, text=True)
-    fc_out = (fc.stdout + fc.stderr).strip().splitlines()
-    print("%s fatcheck: %s" % ("PASS" if fc.returncode == 0 else "FAIL", fc_out[0] if fc_out else "?"))
-    if fc.returncode:
-        problems += ["fatcheck: " + l for l in fc_out]
+    # The OS wrote to C: (the tests' own folders, C:\Tests\fstest, the temporary folder); a stop
+    # that cut a commit short must leave it whole too.
+    check = store("check", DISK, fatal=False)
+    summary = check.stdout.strip().splitlines()
+    print("%s store check: %s" % ("PASS" if check.returncode == 0 else "FAIL", summary[0] if summary else "?"))
+    if check.returncode:
+        problems += ["store check: " + l for l in (check.stdout + check.stderr).strip().splitlines()]
+        a.keep_disk = True
 
     if re.search(r"^PASS audio/streams-beep-play", log, re.M):
         ok, msg = check_audio(AUDIO)
@@ -493,16 +539,23 @@ def run_vm(a, tcp_port, web_ports, processes):
         if not ok:
             problems.append("audio recording: " + msg)
 
+    metadata.update(exit_code=q.returncode, timed_out=timed_out, elapsed_seconds=time.time()-t0, process_stopped=True,
+                    actual_resolution=actual_resolution, resolution_matched=resolution_matched,
+                    store_check_passed=check.returncode == 0, disk_kept=a.keep_disk)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
     fails = re.findall(r"^FAIL ", log, re.M)
     for p in problems:
         print("PROBLEM", p)
     ok = not fails and not problems
     print("test: %s in %d s (serial log: %s)" % ("all passed" if ok else "FAILED", time.time() - t0, SERIAL))
+    if a.keep_disk:
+        print("test: kept %s for the store check's problems; delete it when done with it" % DISK)
     return 0 if ok else 1
 
 
 def main():
-    global BUILD, IMG, SERIAL, AUDIO, PART
+    global BUILD, DISK, SERIAL, AUDIO
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--full", action="store_true")
@@ -511,10 +564,10 @@ def main():
     ap.add_argument("--memory", type=int, default=2048, help="QEMU RAM in MiB (default: 2048)")
     ap.add_argument("--cpus", type=int, default=4, help="QEMU CPU count (default: 4)")
     ap.add_argument("--accel", choices=("tcg", "whpx"), default="tcg", help="No silent accelerator fallback")
-    ap.add_argument("--resolution", help="Override only the isolated primary boot entry: widthxheightx32")
+    ap.add_argument("--resolution", help="Override only the copy's primary boot entry: widthxheightx32")
     ap.add_argument("--qemu", default=QEMU, help="QEMU executable (prefer the installed QEMU)")
     ap.add_argument("--gpu", choices=("none", "virgl"), default="none", help="Optional secondary virgl GPU; requires host GL")
-    ap.add_argument("--boot-image", default=os.path.join(CORE_BUILD, "nocturne.img"), help="Boot input; internal payload must match current build")
+    ap.add_argument("--boot-image", default=os.path.join(CORE_BUILD, "nocturne.img"), help="Disk to copy; its payload must match the current build")
     ap.add_argument("--output-dir", help="New, unused directory under build/; preserve earlier test evidence")
     ap.add_argument("--source-tree", help="Preserved test/header source tree for the matching baseline image")
     ap.add_argument("--baseline-metadata", help="Preserved run metadata; strictly verify its boot hash and payload for --source-tree")
@@ -533,9 +586,10 @@ def main():
     if not os.path.isfile(a.qemu):
         ap.error("--qemu executable does not exist")
     a.boot_image = os.path.abspath(a.boot_image)
-    if not os.path.isfile(a.boot_image):
-        sys.exit("test: build first with the bundled toolchain")
-    a.baseline_payload = None
+    if not os.path.isfile(a.boot_image) or not os.path.isfile(STORE):
+        sys.exit("test: build first (make qemu-image)")
+    a.boot_hash = a.baseline_payload = None
+    a.disk_made = a.keep_disk = False
     if a.baseline_metadata:
         if not a.source_tree:
             ap.error("--baseline-metadata requires the preserved --source-tree")
@@ -545,10 +599,11 @@ def main():
         payload = baseline.get("boot_payload_sha256", {})
         valid_hash = lambda value: isinstance(value, str) and bool(re.fullmatch("[0-9a-f]{64}", value))
         if (baseline.get("process_stopped") is not True or baseline.get("user_data_attached") is not False or
-                not valid_hash(baseline.get("boot_sha256")) or
-                any(not valid_hash(payload.get(name)) for name in ("kernel.elf", "initrd.tar"))):
-            ap.error("baseline metadata must identify a stopped isolated run and both complete payload hashes")
-        if file_sha256(a.boot_image) != baseline["boot_sha256"]:
+                not valid_hash(baseline.get("boot_sha256")) or not isinstance(payload, dict) or
+                not valid_hash(payload.get("kernel.elf")) or any(not valid_hash(value) for value in payload.values())):
+            ap.error("baseline metadata must identify a stopped isolated run, its boot image and its payload hashes")
+        a.boot_hash = file_sha256(a.boot_image)
+        if a.boot_hash != baseline["boot_sha256"]:
             ap.error("baseline boot image does not match the preserved run hash")
         a.baseline_payload = payload
     if a.output_dir:
@@ -562,11 +617,8 @@ def main():
             ap.error("--output-dir must be a new directory strictly under build/")
         os.makedirs(output, exist_ok=False)
         BUILD = output
-        IMG, SERIAL, AUDIO = [os.path.join(BUILD, name) for name in
-                              ("test-data.img", "test-serial.log", "test-audio.wav")]
-        PART = IMG + "@@1048576"
-    overwritten = (IMG, SERIAL, AUDIO, *(os.path.join(BUILD, name) for name in
-                   ("test-boot.img", "test-kernel.elf", "test-initrd.tar", "test-metadata.json", "test-limine.conf", "tcpport", "webports", "autorun.sh")))
+        DISK, SERIAL, AUDIO = [os.path.join(BUILD, name) for name in ("test.img", "test-serial.log", "test-audio.wav")]
+    overwritten = (DISK, SERIAL, AUDIO, os.path.join(BUILD, "test-metadata.json"))
     if os.path.normcase(os.path.realpath(a.boot_image)) in {os.path.normcase(os.path.realpath(p)) for p in overwritten}:
         ap.error("--boot-image must not be a test output path")
     servers, processes = [], []
@@ -598,11 +650,16 @@ def main():
                         pass
                     process.wait()
         finally:
-            for server in servers:
-                try:
-                    server.shutdown()
-                finally:
-                    server.server_close()
+            try:
+                for server in servers:
+                    try:
+                        server.shutdown()
+                    finally:
+                        server.server_close()
+            finally:
+                # The run's copy of the disk does not pile up (QEMU has stopped by now).
+                if a.disk_made and not a.keep_disk and os.path.exists(DISK):
+                    os.remove(DISK)
 
 
 if __name__ == "__main__":

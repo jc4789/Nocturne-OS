@@ -1,4 +1,4 @@
-/* js_console.js - console + value inspection chunk of /bin/js.
+/* js_console.js - console + value inspection chunk of js.
  * Function body: (function (host, internal) { ... }). Defines internal.inspect,
  * internal.format and the global console. Node util.inspect-like output. */
 'use strict';

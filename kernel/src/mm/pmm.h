@@ -13,7 +13,6 @@ uint64_t pmm_alloc_zeroed(void);
 uint64_t pmm_alloc_contig(uint64_t count);
 uint64_t pmm_alloc_contig_below(uint64_t count, uint64_t limit);
 void pmm_free(uint64_t phys);
-void pmm_release_range(uint64_t phys, uint64_t size); /* consumed bootloader memory → allocator */
 uint64_t pmm_free_pages(void);
 /* Usable RAM below 1 MiB (the allocator never hands it out): base and page count, 0 when none. */
 uint64_t pmm_low_range(uint64_t *pages);

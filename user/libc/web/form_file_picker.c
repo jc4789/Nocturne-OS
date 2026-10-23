@@ -21,10 +21,6 @@ static int picker_compare(const void *a, const void *b) {
     if ((x->kind == N_KIND_FOLDER) != (y->kind == N_KIND_FOLDER)) return x->kind == N_KIND_FOLDER ? -1 : 1;
     return strcasecmp(x->name, y->name);
 }
-static bool picker_join(char *out, size_t capacity, const char *path, const char *name) {
-    int length = snprintf(out, capacity, "%s%s%s", path, !strcmp(path, "/") ? "" : "/", name);
-    return length > 0 && (size_t)length < capacity;
-}
 static void picker_load(struct picker_state *picker) {
     picker->count = 0; picker->cursor = -1; picker->folder++;
     struct n_entry *entries;
@@ -46,9 +42,10 @@ static void picker_load(struct picker_state *picker) {
     if (picker->count) qsort(picker->entries, picker->count, sizeof *picker->entries, picker_compare);
     snprintf(picker->message, sizeof picker->message, "%d entries", picker->count);
 }
+/* The root has no parent: it stays where it is. */
 static void picker_up(struct picker_state *picker) {
-    char *slash = strrchr(picker->path, '/');
-    if (slash) { if (slash == picker->path) slash[1] = 0; else *slash = 0; picker_load(picker); }
+    char parent[sizeof picker->path];
+    if (n_path_join(picker->path, "..", parent, sizeof parent) >= 0 && strcmp(parent, picker->path)) { strcpy(picker->path, parent); picker_load(picker); }
 }
 /* The places of the view's buttons and rows, for the events that name them. */
 struct picker_places { uint32_t up, cancel, choose, first; };
@@ -61,7 +58,7 @@ static struct picker_places picker_show(struct ui_session *s, struct picker_stat
         ui_node(&m, "row"); ui_nums(&m, "padding", (double[]){10, 12}, 2); ui_num(&m, "gap", 8);
         ui_str(&m, "align", "center"); ui_num(&m, "background", t->sidebar);
             p.up = ui_node(&m, "button"); ui_str(&m, "icon", "chevron-left"); ui_str(&m, "variant", "ghost");
-            ui_num(&m, "compact", 1); if (!strcmp(picker->path, "/")) ui_num(&m, "disabled", 1); ui_end(&m);
+            ui_num(&m, "compact", 1); if (!*n_path_name(picker->path)) ui_num(&m, "disabled", 1); ui_end(&m);
             ui_node(&m, "icon"); ui_str(&m, "icon", "folder"); ui_num(&m, "size", 16); ui_num(&m, "colour", t->textDim); ui_end(&m);
             ui_node(&m, "text"); ui_str(&m, "text", picker->path); ui_num(&m, "ellipsis", 1); ui_num(&m, "grow", 1); ui_end(&m);
             p.cancel = ui_node(&m, "button"); ui_str(&m, "text", "Cancel"); ui_str(&m, "variant", "secondary"); ui_end(&m);
@@ -93,7 +90,7 @@ static struct picker_places picker_show(struct ui_session *s, struct picker_stat
 static bool picker_commit(web_doc *d, node_t *input, struct picker_state *picker, bool directory) {
     if (directory) {
         char path[1024]; strlcpy(path, picker->path, sizeof path);
-        if (picker->cursor >= 0 && picker->entries[picker->cursor].kind == N_KIND_FOLDER && !picker_join(path, sizeof path, picker->path, picker->entries[picker->cursor].name)) return false;
+        if (picker->cursor >= 0 && picker->entries[picker->cursor].kind == N_KIND_FOLDER && n_path_join(picker->path, picker->entries[picker->cursor].name, path, sizeof path) < 0) return false;
         const char *paths[] = {path}; return web_input_file_paths(d, input, paths, 1, true);
     }
     unsigned count = 0;
@@ -106,7 +103,7 @@ static bool picker_commit(web_doc *d, node_t *input, struct picker_state *picker
     unsigned used = 0;
     for (int index = 0; ok && index < picker->count; index++) {
         struct picker_entry *entry = &picker->entries[index]; if (!entry->selected || entry->kind != N_KIND_DOCUMENT) continue;
-        if (!picker_join(storage[used], 1024, picker->path, entry->name)) { ok = false; break; }
+        if (n_path_join(picker->path, entry->name, storage[used], 1024) < 0) { ok = false; break; }
         paths[used] = storage[used]; used++;
     }
     ok = ok && web_input_file_paths(d, input, paths, used, false);
@@ -116,7 +113,7 @@ bool web_input_choose_files(web_doc *d, web_node *input) {
     if (!d || !web_input_is_file(input) || input->owner != d || web_control_disabled(input)) return false;
     bool directory = node_attr(input, "webkitdirectory") != NULL, multiple = node_attr(input, "multiple") != NULL;
     struct picker_state *picker = calloc(1, sizeof *picker); if (!picker) return false;
-    strcpy(picker->path, "/home"); picker_load(picker);
+    n_path_join(n_user_folder(), ".", picker->path, sizeof picker->path); picker_load(picker);
     struct ui_session *s = ui_session_new();
     if (!s || ui_window(s, 1, 640, 460, WIN_RESIZABLE | WIN_CENTER, directory ? "Select upload folder" : "Select upload files", NULL, NULL) < 0) {
         ui_session_free(s); free(picker->entries); free(picker); return false;
@@ -160,7 +157,7 @@ bool web_input_choose_files(web_doc *d, web_node *input) {
                 struct picker_entry *entry = &picker->entries[picker->cursor];
                 if (entry->kind == N_KIND_FOLDER) {
                     char path[1024];
-                    if (picker_join(path, sizeof path, picker->path, entry->name)) { strcpy(picker->path, path); picker_load(picker); last_index = -1; }
+                    if (n_path_join(picker->path, entry->name, path, sizeof path) >= 0) { strcpy(picker->path, path); picker_load(picker); last_index = -1; }
                 } else if (!directory) { entry->selected = true; commit = true; }
             }
             if (commit) {

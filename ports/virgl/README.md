@@ -1,6 +1,6 @@
 # Windows ホスト限定：virgl fence 待機の修理
 
-これは **Nocturne ゲストの POSIX 移植ではなく、QEMU のホスト側 DLL の限定 port** です。元の QEMU インストール、GPU driver、環境設定、既存 `/data`、Hyper-V VM は変更しません。既定の OS 起動は従来どおり CPU 描画、GPU は `gpu-enable` の明示指定時だけです。
+これは **Nocturne ゲストの POSIX 移植ではなく、QEMU のホスト側 DLL の限定 port** です。元の QEMU インストール、GPU driver、環境設定、既存の起動ディスク、Hyper-V VM は変更しません。既定の OS 起動は従来どおり CPU 描画、GPU は `gpu-enable` の明示指定時だけです。
 
 ## 固定 source と一行修理
 
@@ -33,19 +33,21 @@ pkgconf package の必須 SHA256 は `74b6fe685d84ec6ea19b9ee285d752d122e31b6b93
 4. 同じ checkout に `git apply --check` と一行 patch を適用、`diff --numstat` が +1/-1 のみと検査。同じ build 設定で修理 DLL を構築。
 5. 元 QEMU 本体・直下の DLL・COPYING を新規 `qemu-unmodified` と `qemu-fixed` へコピー。virgl DLL だけを各構築物へ置換。他ファイルの一致と元配置不変を全 SHA256 で確認。source、patch、COPYING、著作権通知と provenance を保持。
 
-出力や source の変更は workspace の `build` 内に限定し、既存 stage を上書きしません。clean 後はこの追跡された patch・手順から別の新規 stage を作成します。通常の OS build／initrd／boot 媒体をこのビルダーは変更しません。試験枠を調整し、CPU 性能測定と重い host build／GPU VM を同時に走らせないでください。
+出力や source の変更は workspace の `build` 内に限定し、既存 stage を上書きしません。clean 後はこの追跡された patch・手順から別の新規 stage を作成します。通常の OS build／起動ディスクをこのビルダーは変更しません。試験枠を調整し、CPU 性能測定と重い host build／GPU VM を同時に走らせないでください。
 
 ## QEMU 選択と独立試験
 
 専用コピーの `qemu-system-x86_64.exe` を検証 harness の `--qemu` に渡し、BIOS は元の `C:/Program Files/qemu/share` を `-L` で読み取り専用使用します。DLL だけを元インストールにコピーする運用は禁止です。
 
-同じ boot/data の scratch snapshot を使い、WHPX／4CPU／2GiB／`-display egl-headless -vga std -device virtio-gpu-gl-pci` の同条件で未修正→修理版を直列比較します。`gpu-enable gpu-timing` を明示指定し、公開 OS 経路は次の autorun です（前者が期待失敗しても後者を実行するため別行）。
+同じ起動ディスクの使い捨てコピーを使い、WHPX／4CPU／2GiB／`-display egl-headless -vga std -device virtio-gpu-gl-pci` の同条件で未修正→修理版を直列比較します。下の 2026-10-07 の比較は起動ディスクと `/data` の二台の時代の手順で、`gpu-enable gpu-timing` を明示指定し、次の autorun を実行しました（前者が期待失敗しても後者を実行するため別行）。
 
 ```text
 tcc -run /data/tests/gputest.c --require-gpu --bench
 tcc -run /data/tests/canvastest.c
 sleep 10
 ```
+
+今の `scripts/test.py` は `--qemu` と `--gpu virgl` で同じ QEMU 構成を作れますが、カーネルへの `gpu-enable gpu-timing` の指定と独自の autorun は持たず、`C:\Tests` の自分の autorun（`gui` 群の `tcc -run C:\Tests\gputest.c`、`web` 群の `canvastest.c`、どちらも `--require-gpu --bench` なし）だけを実行します。この比較はそのままでは再現できません。
 
 要求：cold 成功だけでなく **通常 2 秒 clear／triangle／readback 検査**、公開 syscall の GPU 必須試験、入力拒否・画素・canary・fence/submission、Canvas 実 paint、同入力ベンチ、全 transaction 時間、所有 PID の終了、媒体と DLL の hash。process exit 0 や trace 数だけでは受入れません。未修正／元配置の host では能力撤回と CPU fallback の画素成功を保持します。
 

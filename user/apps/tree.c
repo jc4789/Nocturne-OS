@@ -13,7 +13,7 @@ static void tree(const char *path, const char *prefix) {
         printf("%s%s%s%s\x1b[0m\n", prefix, last ? "└── " : "├── ", folder ? "\x1b[1;34m" : "", ents[i].name);
         if (folder) {
             dirs++;
-            char sub[512], np[512];
+            char sub[1024], np[512];
             if (n_path_join(path, ents[i].name, sub, sizeof sub) < 0) continue;
             snprintf(np, sizeof np, "%s%s", prefix, last ? "    " : "│   ");
             tree(sub, np);
@@ -25,7 +25,7 @@ static void tree(const char *path, const char *prefix) {
 }
 int main(int argc, char **argv) {
     const char *p = argc > 1 ? argv[1] : ".";
-    char path[512];
+    char path[1024];
     n_result r = n_path_complete(p, path, sizeof path);
     if (r < 0) {
         fprintf(stderr, "tree: %s: %s\n", p, n_result_text(r));

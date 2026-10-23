@@ -1,6 +1,6 @@
 /* Origin private file system storage for a process's QuickJS realms.
- * Each origin owns /data/browser/opfs/<sha256(origin)>; entry names are
- * encoded into case-insensitive FAT-safe spellings so every Web name keeps
+ * Each origin owns AppData\Browser\opfs\<sha256(origin)> in the user's folder; entry names are
+ * encoded into case-insensitive, file-name-safe spellings so every Web name keeps
  * its identity. Sync access handles are exclusive kernel vnode leases, so
  * Window, Worker and other browser processes see one lock per file. */
 #pragma once

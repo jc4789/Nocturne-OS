@@ -37,7 +37,7 @@ struct web_storage_result {
 };
 typedef struct webstorage webstorage;
 /* One instance per browser window, surviving document navigation. Local writes
- * go to the fixed /data/browser/storage managed directory. No path argument. */
+ * go to the fixed managed folder AppData\Browser\storage of the user's folder. No path argument. */
 webstorage *webstorage_create(void);
 void webstorage_free(webstorage *store);
 /* Mutations publish to RAM immediately. Idle commits coalesce all writes to an
@@ -49,3 +49,8 @@ int webstorage_access(webstorage *store, const char *origin,
                       const struct web_storage_request *request,
                       struct web_storage_result *out);
 void webstorage_result_free(struct web_storage_result *result);
+/* The browser's profile folder, where everything it keeps lives (localStorage, IndexedDB, OPFS,
+ * search history): Browser in the user's AppData. With temporary, its folder for what lasts only
+ * until the next start: Browser in the temporary folder. Made when absent and found once; NULL
+ * when it cannot be. */
+const char *web_profile_folder(bool temporary);

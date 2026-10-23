@@ -1,4 +1,4 @@
-/* Kernel random numbers for /dev/random (and through it, TLS keys in userland).
+/* Kernel random numbers for SYS_RANDOM (and through it, TLS keys in userland).
    Every interrupt mixes its timestamp-counter value into a 256-bit pool; RDRAND is added when the
    CPU has it. Output is a ChaCha20 keystream whose key is re-derived from the pool on every read,
    so the generator never repeats and later interrupts keep feeding fresh jitter in. */

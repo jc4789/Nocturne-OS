@@ -9,7 +9,7 @@
 static int checks, failed;
 #define CHECK(x) do { checks++; if (!(x)) { failed++; printf("FAIL media_codectest:%d %s\n",__LINE__,#x); } } while(0)
 static void decode(const char *name, bool audio, bool video, int min_frames, int max_frames) {
-    char path[256], error[160]; snprintf(path,sizeof path,"/data/tests/media-fixtures/%s",name);
+    char path[256], error[160]; snprintf(path,sizeof path,"C:\\Tests\\media-fixtures\\%s",name);
     nmedia *m=nmedia_open(path,error,sizeof error);
     CHECK(m!=NULL); if(!m){printf("%s: %s\n",name,error);return;}
     const struct nmedia_info *info=nmedia_get_info(m);
@@ -52,7 +52,7 @@ static void decode(const char *name, bool audio, bool video, int min_frames, int
     nmedia_close(m);
 }
 static void memory_cases(void){
-    const char *path="/data/tests/media-fixtures/stereo.flac";FILE *f=fopen(path,"rb");CHECK(f!=NULL);if(!f)return;
+    const char *path="C:\\Tests\\media-fixtures\\stereo.flac";FILE *f=fopen(path,"rb");CHECK(f!=NULL);if(!f)return;
     fseek(f,0,SEEK_END);long size=ftell(f);rewind(f);CHECK(size>0&&size<65536);
     uint8_t *data=malloc((size_t)size);CHECK(data!=NULL);if(!data){fclose(f);return;}
     CHECK(fread(data,1,(size_t)size,f)==(size_t)size);fclose(f);
@@ -75,8 +75,8 @@ static void memory_cases(void){
     CHECK(nmedia_open_memory(tiny,SIZE_MAX,error,sizeof error)==NULL);
     CHECK(nmedia_open_memory(tiny,0,error,sizeof error)==NULL);
     CHECK(nmedia_open_memory(tiny,sizeof tiny,error,sizeof error)==NULL);
-    CHECK(nmedia_open("/data/tests/media-fixtures/invalid.mp4",error,sizeof error)==NULL);
-    CHECK(nmedia_open("/data/tests/media-fixtures/not-found",error,sizeof error)==NULL);
+    CHECK(nmedia_open("C:\\Tests\\media-fixtures\\invalid.mp4",error,sizeof error)==NULL);
+    CHECK(nmedia_open("C:\\Tests\\media-fixtures\\not-found",error,sizeof error)==NULL);
     nmedia_close(NULL);CHECK(nmedia_get_info(NULL)==NULL);
 }
 static void capabilities(void){
@@ -143,7 +143,7 @@ static void drawing(void){
 }
 static void audio_flush_cases(void){
     CHECK(n_audio_flush(-1)==-N_ERR_NO_HANDLE);
-    n_handle other=n_document_open("/data/tests/media-fixtures/stereo.wav",N_DOCUMENT_READ);CHECK(other>=0);
+    n_handle other=n_document_open("C:\\Tests\\media-fixtures\\stereo.wav",N_DOCUMENT_READ);CHECK(other>=0);
     if(other>=0){CHECK(n_audio_flush(other)==-N_ERR_WRONG_KIND);n_handle_close(other);}
     n_handle a=n_audio_open();CHECK(a>=0);if(a<0)return;
     struct n_audio_status st;CHECK(n_audio_status(a,&st)==0&&st.queued_frames==0);

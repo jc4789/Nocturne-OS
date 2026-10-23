@@ -4,41 +4,48 @@
     Creates (or refreshes) a Hyper-V virtual machine that boots Nocturne OS.
 
 .DESCRIPTION
+    Nocturne has one disk: its boot part and drive C:, with the system (C:\Nocturne), the apps
+    (C:\Programs) and the user's files (C:\Users). The VM's disk is .\hyperv\<Name>.vhdx (Gen 2) or
+    .\hyperv\<Name>.vhd (Gen 1), the VM's own: -Update replaces only the system on it (the boot part,
+    C:\Nocturne and the desktop apps' folders, scripts\mkimage.sh --update), so the user's files and
+    the apps the user put in C:\Programs stay. A new VM's disk is a copy of build\nocturne.img; one
+    left by -Remove is taken up again.
+
     Generation 2 (the default for a new VM) is the native Hyper-V machine: UEFI, VMBus and only
     synthetic devices, which Nocturne drives (keyboard, mouse, SCSI disks, network, heartbeat,
     shutdown, time sync) - plus the Enhanced Session: VMConnect talks RDP to Nocturne over a
     Hyper-V socket, so the desktop takes the size of the window. For a Gen 2 VM this script:
-      * copies build\nocturne.vhdx to .\hyperv\<Name>-boot.vhdx (so rebuilding never fights a locked disk),
+      * writes the disk (above) and attaches it on SCSI 0:0 as the first boot device,
       * creates the VM with static memory, one CPU, no checkpoints, Secure Boot off (the boot loader
         is not signed) and a synthetic network adapter on the "Default Switch" for NAT internet access,
-      * attaches the boot disk on SCSI 0:0 and makes it the first boot device,
-      * attaches a persistent 2 GiB data disk (.\hyperv\<Name>-data.vhdx, FAT32 "NOCTDATA") on SCSI 0:1,
-        which Nocturne mounts at /data. It is created once and never replaced by -Update or -Remove,
       * selects the Hyper-V socket transport for the Enhanced Session and turns Enhanced Session Mode
         on for the host if it is off,
-      * optionally writes an AI provider key into /data/etc/agent.conf (-ApiKeyFile, for the agent program),
+      * optionally stores an AI provider key for the agent program in the user's
+        AppData\Agent\agent.conf (-ApiKeyFile, scripts\setkey.py),
       * routes COM1 to the named pipe \\.\pipe\<name>-com1 (kernel log),
       * starts the VM and opens a VMConnect window.
 
-    Generation 1 (-Generation 1) emulates a legacy PC: build\nocturne.vhd on IDE 0:0, the data disk
-    on IDE 0:1 and a legacy network adapter (an emulated DEC 21140).
+    Generation 1 (-Generation 1) emulates a legacy PC: the disk is a fixed VHD on IDE 0:0, and the
+    network adapter a legacy one (an emulated DEC 21140).
 
-    -Update keeps the generation of the existing VM.
+    -Update keeps the generation of the existing VM. The disk is rewritten through a raw copy next
+    to it (.\hyperv\<Name>-work.img), so the folder needs room for twice the disk's size.
 
 .EXAMPLE
     .\hyperv.ps1                 # create and start the Gen 2 VM "Nocturne"
 .EXAMPLE
     .\hyperv.ps1 -Name Nocturne-G1 -Generation 1   # a Gen 1 VM instead
 .EXAMPLE
-    .\hyperv.ps1 -Update         # after rebuilding: turn the VM off, copy the new disk, start it again
+    .\hyperv.ps1 -Update         # after rebuilding: turn the VM off, put the new system on its disk, start it again
 .EXAMPLE
-    .\hyperv.ps1 -Remove         # delete the VM (and its copied disk)
+    .\hyperv.ps1 -Remove         # delete the VM; its disk, with the user's files, stays
 .EXAMPLE
-    .\hyperv.ps1 -Iso            # boot from build\nocturne.iso on the virtual DVD drive instead of the disk
+    .\hyperv.ps1 -Iso            # boot the live system build\nocturne.iso on the virtual DVD drive instead of the disk
+                                 # (its C: is in memory and its changes go with it: 2048 MB unless -MemoryMB)
 .EXAMPLE
-    .\hyperv.ps1 -Update -ApiKeyFile C:\keys\llm.txt   # also store an API key for `agent` on the data disk
+    .\hyperv.ps1 -Update -ApiKeyFile C:\keys\llm.txt   # also store an API key for `agent`
 .EXAMPLE
-    .\hyperv.ps1 -Remove -DeleteData   # delete the VM, its disk *and* the data disk
+    .\hyperv.ps1 -Remove -DeleteDisk   # delete the VM and its disk
 #>
 param(
     [string]$Name = "Nocturne",
@@ -53,16 +60,18 @@ param(
     [string]$ApiKeyFile,
     [string]$Endpoint = "https://hyper.charm.land/v1",
     [string]$Model = "glm-5.3-flash",
-    [switch]$DeleteData
+    [switch]$DeleteDisk
 )
 
 $ErrorActionPreference = "Stop"
+# the ISO's C: is held in memory, all of it, next to the system
+if ($Iso -and -not $PSBoundParameters.ContainsKey("MemoryMB")) { $MemoryMB = 2048 }
 $Root = $PSScriptRoot
 $VmDir = Join-Path $Root "hyperv"
+$Img = Join-Path $Root "build\nocturne.img"
 $SrcIso = Join-Path $Root "build\nocturne.iso"
 $IsoCopy = Join-Path $VmDir "$Name.iso"
-$SrcData = Join-Path $Root "build\data-blank.vhdx"
-$DataVhd = Join-Path $VmDir "$Name-data.vhdx"
+$OldDataVhd = Join-Path $VmDir "$Name-data.vhdx" # an older Nocturne's second disk
 $Pipe = "\\.\pipe\$($Name.ToLower())-com1"
 
 function Say($msg) { Write-Host "[nocturne] $msg" -ForegroundColor Magenta }
@@ -81,16 +90,12 @@ function Stop-IfRunning($vm) {
 $existing = Get-VM -Name $Name -ErrorAction SilentlyContinue
 if ($existing) { $Generation = $existing.Generation }
 
-# Gen 1 boots the fixed-size VHD on IDE; Gen 2 boots the VHDX on SCSI
-if ($Generation -eq 1) {
-    $SrcDisk = Join-Path $Root "build\nocturne.vhd"
-    $Disk = Join-Path $VmDir "$Name.vhd"
-    $Bus = "IDE"
-}
-else {
-    $SrcDisk = Join-Path $Root "build\nocturne.vhdx"
-    $Disk = Join-Path $VmDir "$Name-boot.vhdx"
-    $Bus = "SCSI"
+# Gen 1 boots a fixed-size VHD on IDE; Gen 2 a VHDX on SCSI
+if ($Generation -eq 1) { $Ext = ".vhd"; $Bus = "IDE" } else { $Ext = ".vhdx"; $Bus = "SCSI" }
+$Disk = Join-Path $VmDir "$Name$Ext"
+if ($existing) {
+    $drive = Get-VMHardDiskDrive -VM $existing -ControllerType $Bus -ControllerNumber 0 -ControllerLocation 0
+    if ($drive) { $Disk = $drive.Path }
 }
 
 if ($Remove) {
@@ -102,38 +107,92 @@ if ($Remove) {
     # the configuration folder New-VM made, once Hyper-V has emptied it
     $cfg = Join-Path $VmDir $Name
     if ((Test-Path $cfg) -and -not (Get-ChildItem $cfg -Recurse -File)) { Remove-Item $cfg -Recurse -Force }
-    foreach ($f in @($Disk, $IsoCopy)) { if (Test-Path $f) { Remove-Item $f -Force } }
-    if ($DeleteData -and (Test-Path $DataVhd)) {
-        Remove-Item $DataVhd -Force
-        Say "deleted the data disk"
+    if (Test-Path $IsoCopy) { Remove-Item $IsoCopy -Force }
+    if ($DeleteDisk -and (Test-Path $Disk)) {
+        Remove-Item $Disk -Force
+        Say "deleted the disk $Disk"
     }
-    elseif (Test-Path $DataVhd) {
-        Say "kept the data disk $DataVhd (pass -DeleteData to delete it too)"
+    elseif (Test-Path $Disk) {
+        Say "kept the disk $Disk with the user's files: a new VM '$Name' takes it up again (-DeleteDisk deletes it too)"
     }
     return
 }
 
-if (-not (Test-Path $SrcDisk)) {
-    throw "$SrcDisk not found. Build first:  powershell -ExecutionPolicy Bypass -File build.ps1"
-}
-# `make qemu-image` refreshes only the raw disk, so the Hyper-V media can be
-# older than the kernel and initrd they should carry. Never hand those to a VM.
-$diskTime = (Get-Item $SrcDisk).LastWriteTime
-foreach ($part in @("build\kernel.elf", "build\initrd.tar")) {
-    $p = Join-Path $Root $part
-    if ((Test-Path $p) -and (Get-Item $p).LastWriteTime -gt $diskTime) {
-        throw "$SrcDisk is older than $part. Rebuild the Hyper-V media first:  powershell -ExecutionPolicy Bypass -File build.ps1"
+# A command in the build's own MSYS2 shell (its qemu-img and mtools, build\host\store.exe), run in
+# the project folder. Paths go in NOCTURNE_* environment variables: Windows PowerShell 5.1 drops
+# the quotes around native arguments, and the project path has spaces.
+function Invoke-Build([string]$Command, [switch]$Test) {
+    $env:MSYSTEM = "UCRT64"
+    $env:CHERE_INVOKING = "1"
+    $env:MSYS2_PATH_TYPE = "inherit"
+    Push-Location $Root
+    try {
+        & "$Root\tools\msys64\usr\bin\bash.exe" -lc $Command | Out-Host
+        $code = $LASTEXITCODE
     }
+    finally { Pop-Location }
+    if ($Test) { return $code -eq 0 }
+    if ($code) { throw "failed ($code): $Command" }
 }
-New-Item -ItemType Directory -Force $VmDir | Out-Null
 
-function Copy-Media {
-    Say "copying disk image -> $Disk"
-    Copy-Item $SrcDisk $Disk -Force
-    if ($Iso) {
-        if (-not (Test-Path $SrcIso)) { throw "build\nocturne.iso not found" }
-        Copy-Item $SrcIso $IsoCopy -Force
+# The VM's disk with the built system on it: its own disk (the user's files stay) or, when it has
+# none, a copy of build\nocturne.img. A disk with no C: volume is an older Nocturne's, which kept
+# the user's files on a second disk: it gets the new system whole.
+function Write-Disk {
+    foreach ($tool in @("build\kernel.elf", "build\host\store.exe")) {
+        if (-not (Test-Path (Join-Path $Root $tool))) { throw "$tool not found. Build first:  powershell -ExecutionPolicy Bypass -File build.ps1" }
     }
+    $fresh = -not (Test-Path $Disk)
+    $size = if ($fresh) { (Get-Item $Img -ErrorAction SilentlyContinue).Length } else { (Get-VHD -Path $Disk).Size }
+    $free = (Get-Item $VmDir).PSDrive.Free
+    if ($size -and $free -lt 2 * $size) {
+        throw "$VmDir has $([math]::Round($free / 1GB, 1)) GiB free; rewriting the disk needs $([math]::Round(2 * $size / 1GB, 1)) GiB"
+    }
+    $env:NOCTURNE_DISK = $Disk
+    $env:NOCTURNE_WORK = "hyperv/$Name-work.img"
+    $env:NOCTURNE_NEW = "hyperv/$Name-new$Ext"
+    $work = Join-Path $VmDir "$Name-work.img"
+    $new = Join-Path $VmDir "$Name-new$Ext"
+    try {
+        if (-not $fresh) {
+            Say "reading $Disk"
+            Invoke-Build 'qemu-img convert -O raw "$NOCTURNE_DISK" "$NOCTURNE_WORK"'
+            if (-not (Invoke-Build 'build/host/store.exe list "$NOCTURNE_WORK" C:/ >/dev/null 2>&1' -Test)) {
+                Say "$Disk is an older Nocturne's disk, with no drive C:; it gets the new system whole"
+                $fresh = $true
+            }
+        }
+        if ($fresh) {
+            # `make qemu-image` refreshes only the raw disk; never hand a VM one older than the kernel
+            if (-not (Test-Path $Img) -or (Get-Item (Join-Path $Root "build\kernel.elf")).LastWriteTime -gt (Get-Item $Img).LastWriteTime) {
+                throw "build\nocturne.img is missing or older than build\kernel.elf. Build first:  powershell -ExecutionPolicy Bypass -File build.ps1"
+            }
+            Say "copying build\nocturne.img"
+            Copy-Item $Img $work -Force
+        }
+        else {
+            Invoke-Build 'bash scripts/mkimage.sh --update "$NOCTURNE_WORK"'
+        }
+        if ($ApiKeyFile) {
+            $env:NOCTURNE_KEYFILE = (Resolve-Path $ApiKeyFile).Path
+            $env:NOCTURNE_ENDPOINT = $Endpoint
+            $env:NOCTURNE_MODEL = $Model
+            Invoke-Build 'python scripts/setkey.py "$NOCTURNE_KEYFILE" --endpoint "$NOCTURNE_ENDPOINT" --model "$NOCTURNE_MODEL" --img "$NOCTURNE_WORK"'
+        }
+        Invoke-Build 'bash scripts/mkimage.sh --hyperv "$NOCTURNE_WORK" "$NOCTURNE_NEW"'
+        # copied over the old disk, which keeps the access Hyper-V gave the VM to it
+        Say "writing $Disk"
+        Copy-Item $new $Disk -Force
+    }
+    finally {
+        foreach ($f in @($work, $new)) { if (Test-Path $f) { Remove-Item $f -Force } }
+    }
+}
+
+function Copy-Iso {
+    if (-not $Iso) { return }
+    if (-not (Test-Path $SrcIso)) { throw "build\nocturne.iso not found" }
+    Copy-Item $SrcIso $IsoCopy -Force
 }
 
 function Test-Switch {
@@ -158,44 +217,6 @@ function Add-Nic($vm) {
     }
 }
 
-function Add-DataDisk($vmName) {
-    if (-not (Test-Path $DataVhd)) {
-        if (-not (Test-Path $SrcData)) { throw "build\data-blank.vhdx not found; rebuild first" }
-        Say "creating the persistent data disk -> $DataVhd"
-        Copy-Item $SrcData $DataVhd
-    }
-    if (-not (Get-VMHardDiskDrive -VMName $vmName | Where-Object { $_.Path -eq $DataVhd })) {
-        Say "attaching the data disk on $Bus 0:1"
-        Add-VMHardDiskDrive -VMName $vmName -ControllerType $Bus -ControllerNumber 0 -ControllerLocation 1 -Path $DataVhd
-    }
-}
-
-# Write /etc/agent.conf onto the data disk (the VM must be off). The key is read from a text file that
-# either holds just the key or has a line like "api key: <key>"; it is never printed.
-function Set-AgentKey {
-    $text = Get-Content -Raw $ApiKeyFile
-    $key = $null
-    if ($text -match '(?im)^\s*api[ _-]?key\s*[:=]\s*(\S+)') { $key = $Matches[1] }
-    elseif ($text.Trim() -notmatch '\s') { $key = $text.Trim() }
-    if (-not $key) { throw "could not find the key in $ApiKeyFile (expected a line like 'api key: ...')" }
-    $disk = Mount-VHD -Path $DataVhd -Passthru | Get-Disk
-    try {
-        $part = Get-Partition -DiskNumber $disk.Number | Select-Object -First 1
-        if (-not $part.DriveLetter) {
-            $part | Add-PartitionAccessPath -AssignDriveLetter
-            $part = Get-Partition -DiskNumber $disk.Number | Select-Object -First 1
-        }
-        $etc = "$($part.DriveLetter):\etc"
-        New-Item -ItemType Directory -Force $etc | Out-Null
-        $conf = "# written by hyperv.ps1 -ApiKeyFile`nendpoint=$Endpoint`nmodel=$Model`napi_key=$key`n"
-        [System.IO.File]::WriteAllText("$etc\agent.conf", $conf)
-        Say "stored the API key in /data/etc/agent.conf (endpoint $Endpoint, model $Model)"
-    }
-    finally {
-        Dismount-VHD -Path $DataVhd
-    }
-}
-
 # Gen 2: the DVD drive (for -Iso) and the boot order
 function Set-Gen2Boot($vm) {
     $first = Get-VMHardDiskDrive -VM $vm | Where-Object { $_.Path -eq $Disk }
@@ -208,19 +229,32 @@ function Set-Gen2Boot($vm) {
     Set-VMFirmware -VM $vm -FirstBootDevice $first
 }
 
+New-Item -ItemType Directory -Force $VmDir | Out-Null
+
 if ($existing -and $Update) {
     Stop-IfRunning $existing
+    # an older Nocturne's second disk: Nocturne keeps everything on its one disk now
+    $old = Get-VMHardDiskDrive -VM $existing | Where-Object { $_.Path -eq $OldDataVhd }
+    if ($old) {
+        Remove-VMHardDiskDrive -VMHardDiskDrive $old
+        Say "detached the old data disk; Nocturne no longer uses it. It stays on the host: $OldDataVhd"
+    }
     Add-Nic $existing
-    Copy-Media
-    Add-DataDisk $Name
+    Write-Disk
+    Copy-Iso
+    if ($Iso -and $existing.MemoryStartup -lt $MemoryMB * 1MB) {
+        Say "giving '$Name' $MemoryMB MB for the ISO's C:"
+        Set-VMMemory -VM $existing -StartupBytes ($MemoryMB * 1MB)
+    }
     if ($Iso -and $Generation -eq 1) { Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy }
     if ($Generation -eq 2) { Set-Gen2Boot $existing }
 }
 elseif ($existing) {
-    throw "A VM called '$Name' already exists. Use -Update to refresh its disk, or -Remove to delete it."
+    throw "A VM called '$Name' already exists. Use -Update to put the new system on its disk, or -Remove to delete it."
 }
 else {
-    Copy-Media
+    Write-Disk
+    Copy-Iso
     Say "creating Generation $Generation VM '$Name' ($MemoryMB MB)"
     $vm = New-VM -Name $Name -Generation $Generation -MemoryStartupBytes ($MemoryMB * 1MB) -VHDPath $Disk -Path $VmDir
     Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
@@ -231,7 +265,6 @@ else {
     Set-VM -VM $vm -AutomaticStopAction TurnOff
     # kernel log on COM1 -> named pipe (read it with scripts\hv-serial.ps1, PuTTY or any pipe client)
     Set-VMComPort -VM $vm -Number 1 -Path $Pipe
-    Add-DataDisk $Name
     if ($Generation -eq 1) {
         if ($Iso) {
             Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy
@@ -253,8 +286,6 @@ if ($Generation -eq 2 -and -not (Get-VMHost).EnableEnhancedSessionMode) {
     Say "turning on Enhanced Session Mode for this Hyper-V host"
     Set-VMHost -EnableEnhancedSessionMode $true
 }
-
-if ($ApiKeyFile) { Set-AgentKey }
 
 if (-not $NoStart) {
     Say "starting '$Name'"

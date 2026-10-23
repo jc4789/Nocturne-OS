@@ -1,4 +1,4 @@
-/* nvrmtest: /bin/nvrm's start on a machine without an NVIDIA GPU. QEMU's "edu" device
+/* nvrmtest: C:\Nocturne\System\nvrm's start on a machine without an NVIDIA GPU. QEMU's "edu" device
    (-device edu,dma_mask=0xffffffff, 1234:11e8) stands in for the GPU: nvrm attaches to it, maps
    BAR 0 and runs rm_init_rm (RM's CPU, registry and OS objects, all before the GPU is touched),
    then RM must refuse the device and nvrm end with status 1. A crash there (status 128 + the
@@ -44,8 +44,8 @@ int main(void) {
     const char *args[2] = {"nvrm", where};
     int32_t handles[4] = {-1, log, log, pci};
     struct n_launch l = {.arguments = args, .handles = handles, .argument_count = 2, .handle_count = 4};
-    n_handle app = n_app_launch("/bin/nvrm", &l);
-    CHECK(app >= 0, "launch /bin/nvrm: %s", n_result_text(app));
+    n_handle app = n_app_launch(N_FOLDER_SYSTEM "\\nvrm", &l);
+    CHECK(app >= 0, "launch " N_FOLDER_SYSTEM "\\nvrm: %s", n_result_text(app));
     n_handle_close(pci);
     if (log >= 0) n_handle_close(log);
     if (app >= 0) {

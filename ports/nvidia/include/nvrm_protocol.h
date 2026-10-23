@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-/* The channel between /bin/nvrm, the NVIDIA resource manager running as an app, and its clients
+/* The channel between nvrm, the NVIDIA resource manager running as an app, and its clients
    (libnvrm, include/nvrm.h). It is Nocturne's own transport for RM's escapes, not a device file.
 
    A client connects to the PCI-function-specific channel and sends NVRM_HELLO with its argument arena attached: a

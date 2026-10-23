@@ -27,7 +27,7 @@ int test_pipe(int fds[2]){fds[0]=descriptor++;fds[1]=descriptor++;return 0;}
 int test_open(const char *path,int flags,...){(void)path;(void)flags;return descriptor++;}
 int test_close(int fd){(void)fd;return 0;}
 int test_spawn(const char *path,char *const argv[],const int fdmap[3],int flags) {
-    (void)argv;(void)fdmap;(void)flags;CHECK(!strcmp(path,"/bin/webfetch"));spawned++;return process++;
+    (void)argv;(void)fdmap;(void)flags;CHECK(!strcmp(path,N_FOLDER_SYSTEM "\\webfetch"));spawned++;return process++;
 }
 int test_fcntl(int fd,int cmd,...){(void)fd;(void)cmd;return 0;}
 int test_poll(struct n_pollfd *fds,int n,int timeout) {

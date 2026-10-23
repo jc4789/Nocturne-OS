@@ -42,7 +42,9 @@ n_result n_shared_map(n_handle shared, size_t bytes, int access, void **mapping)
 const char *n_result_text(n_result r); /* either sign */
 n_result n_handle_close(n_handle h);   /* commits an N_DOCUMENT_REPLACE handle */
 n_result n_handle_kind(n_handle h);    /* N_KIND_* */
-/* Documents and folders: paths are complete, starting at "/". */
+/* Documents and folders: paths are complete, "C:\a\b" ("\a\b" is the same, and '/' works as '\').
+   C: is the only drive. A name is 1 to 255 bytes of UTF-8 without control characters,
+   \ / : * ? " < > |, or a space or period at its end; names compare without regard to case. */
 n_handle n_document_open(const char *path, int access); /* N_DOCUMENT_* */
 n_result n_document_read_at(n_handle h, uint64_t offset, void *buf, size_t n); /* bytes; 0 at the end */
 n_result n_document_write_at(n_handle h, uint64_t offset, const void *buf, size_t n);
@@ -166,14 +168,32 @@ int64_t n_clock_wall(void); /* seconds since 1970-01-01 UTC */
 void n_sleep_ms(uint64_t ms);
 /* The launch settings ("name=value"), NULL-terminated. */
 extern char *const *n_settings;
-/* A complete path for a name the user typed: a name not starting at "/" is
-   taken inside the launch setting FOLDER (the launcher's current folder, "/"
-   if it gave none). Returns the length, or N_ERR_TOO_LARGE. The system
-   resolves "." and "..". */
+/* Whether path is complete: "C:\...", "\..." or "/...". "C:" and "C:a" are not: they are in the
+   current folder, like "a". */
+bool n_path_is_complete(const char *path);
+/* name taken inside folder (a complete path; the root when it is not one), written as "C:\a\b"
+   with "." and ".." resolved. A complete name stands alone. Returns the length, or N_ERR_TOO_LARGE. */
+n_result n_path_join(const char *folder, const char *name, char *out, size_t cap);
+/* A complete path for a name the user typed: n_path_join inside the launch setting FOLDER (the
+   launcher's current folder, "C:\" if it gave none). */
 n_result n_path_complete(const char *name, char *out, size_t cap);
 n_result n_folder_set(const char *name); /* this app's FOLDER; N_ERR_NOT_FOLDER if it is not one */
-/* name taken inside folder (a complete path), with "." and ".." resolved. */
-n_result n_path_join(const char *folder, const char *name, char *out, size_t cap);
+/* The last name of path, inside it ("" for the root). */
+const char *n_path_name(const char *path);
+/* The complete path a file: URL names: "file:///C:/Users/User/a%20b.html" is C:\Users\User\a b.html,
+   a path without a drive ("file:///Users/User") is on C: too, and "file://localhost/" is "file:///";
+   the query and fragment are not part of it. Returns the length, N_ERR_INVALID when url is not a
+   file: URL of a path, or N_ERR_TOO_LARGE. */
+n_result n_path_from_url(const char *url, char *out, size_t cap);
+/* The file: URL of a path, made complete first (n_path_join): C:\Users\User\a b.html is
+   file:///C:/Users/User/a%20b.html. Returns the length, or N_ERR_TOO_LARGE. */
+n_result n_path_to_url(const char *path, char *out, size_t cap);
+/* The user's folder (the launch setting USERFOLDER) and temporary folder (TEMP); "C:\" without them. */
+const char *n_user_folder(void);
+const char *n_temp_folder(void);
+/* The folder an app keeps its data in, <user's folder>\AppData\<name>, made when missing.
+   Returns the length of the path written to out. */
+n_result n_app_data_folder(const char *name, char *out, size_t cap);
 /* Whether handle h reaches a terminal: the launcher names such handles in the
    setting TERMINAL, e.g. "0 1 2". */
 bool n_terminal(n_handle h);
@@ -221,10 +241,14 @@ n_result reboot(void);
 n_result pcilist(struct n_pciinfo *out, int max);
 long __syscall(long n, long a, long b, long c, long d, long e);
 
-/* run a program (searching /bin) and wait for it; returns exit status or negative error */
+/* run a program (find_program) and wait for it; returns exit status or negative error */
 int run_wait(const char *path, char *const argv[]);
-/* find a program: "ls" -> "/bin/ls"; returns false if not found */
+/* A program's complete path: a bare name ("ls") is looked for in N_FOLDER_SYSTEM, then in each
+   folder of N_FOLDER_PROGRAMS; any other is completed (n_path_complete). False if there is none. */
 bool find_program(const char *name, char *out, size_t n);
+/* Whether the complete path folder is one find_program looks in: N_FOLDER_SYSTEM or a folder of
+   N_FOLDER_PROGRAMS. */
+bool program_folder(const char *folder);
 
 /* line editor for terminal programs (echo, editing keys, history). Returns the line length, or -1
    at end of input (Ctrl+D). RL_SECRET echoes '*' and keeps the line out of the history. */
@@ -311,6 +335,7 @@ n_result win_fullscreen(window_t *win,bool enabled); /* resize delivered by EV_R
 n_result win_event(window_t *win, struct gui_event *e, int timeout_ms);
 n_result clipboard_set(const char *s, size_t n);
 n_result clipboard_get(char *buf, size_t n); /* the whole length; at most n bytes are copied */
+/* start a program (find_program: "notepad" is enough) in its own window, with arg as its one argument */
 n_result gui_launch(const char *path, const char *arg);
 /* copy the whole screen (taskbar included) into buf as 0xAARRGGBB pixels. bytes = 0 only reports
    the size. -N_ERR_TOO_LARGE: the buffer is too small */

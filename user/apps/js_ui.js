@@ -1,4 +1,4 @@
-/* The "nocturne/ui" module of /bin/js: windows with declarative widgets.
+/* The "nocturne/ui" module of js: windows with declarative widgets.
  * A program describes its window with a view function that returns a tree of
  * widgets (column, row, text, button, segmented, toggle, slider, textField,
  * ...). This module only translates: it encodes the tree in the view format of

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Headless QEMU test driver.
+"""Headless QEMU test driver: boots build/nocturne.img (make qemu-image), the one disk, on AHCI;
+with --iso the live ISO, build/nocturne.iso (make image), on an AHCI CD drive instead.
 
-usage: qtest.py [--iso] [--wait N] [script...]
-script steps:  sleep:SECS  shot:NAME  key:KEYSPEC  type:TEXT  mouse:DX,DY  click[:BTN]
-Serial output goes to build/serial.log; screenshots to build/shots/NAME.png
+usage: qtest.py [--iso] [--q=QEMU-ARGS]... [script...]
+script steps:  sleep:SECS  shot:NAME  key:KEYSPEC  type:TEXT  mouse:DX,DY  goto:X,Y  click[:BTN]
+               dclick  down[:BTN]  up  mon:COMMAND
+The disk is attached with snapshot=on: what the OS writes to C: is dropped when QEMU stops, so
+the built disk stays as built (the ISO's C: is in memory). Serial output goes to build/serial.log;
+screenshots to build/shots/NAME.png
 """
 import os
 import socket
@@ -99,21 +103,25 @@ def keyname(ch):
 
 def main():
     args = sys.argv[1:]
-    media = ["-drive", "file=" + os.path.join(ROOT, "build", "nocturne.img") + ",format=raw,if=ide,index=0"]
-    extra = []
-    data = os.path.join(ROOT, "build", "data.img")
-    if os.path.exists(data):
-        extra += ["-drive", "file=" + data + ",format=raw,if=ide,index=1"]
+    disk = os.path.join(ROOT, "build", "nocturne.img")
+    media = ["-device", "ahci,id=ahci", "-drive", "id=boot,file=%s,format=raw,if=none,snapshot=on" % disk,
+             "-device", "ide-hd,drive=boot,bus=ahci.0,bootindex=0"]
+    memory = "512M"
     if args and args[0] == "--iso":
-        media = ["-cdrom", os.path.join(ROOT, "build", "nocturne.iso")]
+        iso = os.path.join(ROOT, "build", "nocturne.iso")
+        media = ["-device", "ahci,id=ahci",
+                 "-drive", "id=boot,file=%s,format=raw,if=none,media=cdrom,readonly=on" % iso,
+                 "-device", "ide-cd,drive=boot,bus=ahci.0,bootindex=0"]
+        memory = "2048M"  # the ISO's C: is held in memory, all of it, next to the system
         args = args[1:]
+    extra = []
     while args and args[0].startswith("--q="):
         extra += args[0][4:].split()
         args = args[1:]
     os.makedirs(SHOTS, exist_ok=True)
     port = 45454
     serial = os.path.join(ROOT, "build", "serial.log")
-    cmd = [QEMU, "-M", "pc", "-m", "512M", "-display", "none", "-vga", "std",
+    cmd = [QEMU, "-M", "pc", "-m", memory, "-display", "none", "-vga", "std",
            "-serial", "file:" + serial, "-monitor", "tcp:127.0.0.1:%d,server,nowait" % port,
            "-no-reboot"] + media + extra
     p = subprocess.Popen(cmd, cwd=ROOT)

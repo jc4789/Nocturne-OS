@@ -47,7 +47,7 @@ int cnd_wait(cnd_t *c, mtx_t *m) {
 void call_once(once_flag *flag, void (*init)(void)) { (void)flag; init(); }
 void thrd_yield(void) {}
 n_result n_app_self(void) { return 2; }
-/* The system log, so a case can count what the driver reports; there is no /data to keep a file. */
+/* The system log, so a case can count what the driver reports; there is no disk C: to keep a file. */
 static unsigned dropped_reports;
 n_handle n_system_log_open(void) { return 50; }
 n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach) {

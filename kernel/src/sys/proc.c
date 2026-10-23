@@ -4,7 +4,9 @@
 #include "sys/sched.h"
 #include "sys/proc.h"
 #include "sys/syscall.h"
-#include "fs/vfs.h"
+#include "sys/object.h"
+#include "sys/stream.h"
+#include "fs/store.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -43,52 +45,53 @@ struct app_record {
     int status;
     bool ended;
     struct wait_queue wait;
+    struct object object; /* freed when the app has ended and its last handle is closed */
 };
 
-static bool app_can_read(struct vnode *v, struct file *f) {
-    (void)f;
-    return ((struct app_record *)v->priv)->ended;
-}
-static void app_release(struct vnode *v) {
-    kfree(v->priv);
-    kfree(v);
-}
-static struct vnode_ops app_ops = {.can_read = app_can_read, .release = app_release};
+static struct app_record *app_record(struct handle *h) { return h->object->priv; }
 
-struct vnode *proc_app_new(void) {
-    struct vnode *v = kzalloc(sizeof *v);
+static uint32_t app_ready(struct handle *h) { return app_record(h)->ended ? N_EVENT_APP_ENDED : 0; }
+static void app_release(struct object *o) { kfree(o->priv); }
+static const struct object_ops app_ops = {.kind = N_KIND_APP, .ready = app_ready, .release = app_release};
+
+/* A record with no references yet. */
+static struct object *app_new(void) {
     struct app_record *rec = kzalloc(sizeof *rec);
-    if (!v || !rec) { kfree(v); kfree(rec); return NULL; }
-    strlcpy(v->name, "app", sizeof v->name);
-    v->type = VT_APP;
-    v->ops = &app_ops;
-    v->priv = rec;
-    v->unlinked = true; /* freed when the app has ended and its last handle is closed */
-    return v;
+    if (!rec) return NULL;
+    object_init(&rec->object, &app_ops, rec);
+    return &rec->object;
+}
+
+int proc_app_create(struct handle **out) {
+    struct object *o = app_new();
+    if (!o) return -N_ERR_NO_MEMORY;
+    *out = handle_open(o, false);
+    if (!*out) { app_release(o); return -N_ERR_NO_MEMORY; }
+    return 0;
 }
 
 /* The app's process is ending; BSP IRQ guard held. */
-void proc_app_ended(struct vnode *v, int status) {
-    struct app_record *rec = v->priv;
+void proc_app_ended(struct object *o, int status) {
+    struct app_record *rec = o->priv;
     rec->status = status;
     rec->ended = true;
     wq_wake_all(&rec->wait);
-    vfs_poll_notify(v);
+    object_notify(o);
 }
 
-bool proc_app_is(struct vnode *v) { return v && v->ops == &app_ops; }
+bool proc_app_is(struct handle *h) { return handle_is(h, &app_ops); }
 
 /* The app's identifier while it runs; 0 once it has ended. */
-int proc_app_pid(struct vnode *v) {
-    struct app_record *rec = v->priv;
+int proc_app_pid(struct handle *h) {
+    struct app_record *rec = app_record(h);
     uint64_t flags = irq_save();
     int pid = rec->ended ? 0 : rec->pid;
     irq_restore(flags);
     return pid;
 }
 
-int proc_app_result(struct vnode *v, uint64_t timeout_ms, int *status) {
-    struct app_record *rec = v->priv;
+int proc_app_result(struct handle *h, uint64_t timeout_ms, int *status) {
+    struct app_record *rec = app_record(h);
     uint64_t deadline = uptime_ms() + timeout_ms;
     uint64_t flags = irq_save();
     while (!rec->ended) {
@@ -107,31 +110,46 @@ int proc_app_result(struct vnode *v, uint64_t timeout_ms, int *status) {
 }
 
 /* A new handle on a running app, by the identifier the app list shows. An app
-   started by the old spawn gets its record here; its parent still collects it. */
-int proc_app_open(int pid, struct file **out) {
-    struct vnode *spare = proc_app_new();
+   the kernel started (proc_spawn_simple) gets its record here. */
+int proc_app_open(int pid, struct handle **out) {
+    struct object *spare = app_new();
     if (!spare) return -N_ERR_NO_MEMORY;
     uint64_t flags = irq_save();
     struct task *t = task_find(pid);
-    struct vnode *v = NULL;
+    struct object *o = NULL;
     if (t && t->is_user && !t->is_thread && t->state != TASK_ZOMBIE && !t->exiting) {
         if (!t->app) {
             ((struct app_record *)spare->priv)->pid = pid;
-            vnode_ref(spare); /* the task's reference, as proc_launch takes */
+            object_ref(spare); /* the task's reference, as proc_launch takes */
             t->app = spare;
             spare = NULL;
         }
-        v = t->app;
-        vnode_ref(v);
+        o = t->app;
+        object_ref(o);
     }
     irq_restore(flags);
-    if (spare) spare->ops->release(spare);
-    if (!v) return -N_ERR_NO_APP;
-    *out = vfs_open_vnode(v, O_RDONLY);
-    vnode_unref(v);
+    if (spare) app_release(spare);
+    if (!o) return -N_ERR_NO_APP;
+    *out = handle_open(o, false);
+    object_unref(o);
     return *out ? 0 : -N_ERR_NO_MEMORY;
 }
 
+/* The name a task runs under: the program document's name. */
+static const char *program_name(const char *path) {
+    const char *name = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '\\' || *p == '/') name = p + 1;
+    return name;
+}
+
+/* Whether the launcher gave the setting name ("NAME=..."). */
+static bool setting_given(const struct proc_launch *l, const char *name) {
+    size_t n = strlen(name);
+    for (int i = 0; i < l->setting_count; i++)
+        if (!strncmp(l->settings[i], name, n) && l->settings[i][n] == '=') return true;
+    return false;
+}
 
 int proc_launch(const char *path, const struct proc_launch *l) {
     int argc = l->argc;
@@ -139,7 +157,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     uint8_t *img;
     uint64_t size;
     uint64_t *pointers = NULL;
-    int r = vfs_read_whole(path, &img, &size);
+    int r = store_load(path, &img, &size);
     if (r < 0) return r;
     struct elf64_ehdr *eh = (struct elf64_ehdr *)img;
     if (size < sizeof *eh || memcmp(eh->ident, "\x7f" "ELF", 4) || eh->ident[4] != 2 || eh->machine != 0x3E ||
@@ -147,9 +165,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         kfree(img);
         return -N_ERR_NOT_PROGRAM;
     }
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    struct task *t = task_alloc(base);
+    struct task *t = task_alloc(program_name(path));
     if (!t) {
         kfree(img);
         return -N_ERR_NO_MEMORY;
@@ -191,12 +207,27 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     t->mmap_next = USER_MMAP_BASE;
     t->low_base = t->low_next = MAX(USER_LOW_BASE, ALIGN_UP(top, PAGE_SIZE)); /* above the program image */
 
+    /* The settings: the launcher's, then those of the system it did not give: the user's folder
+       and temporary folder. */
+    char user[sizeof "USERFOLDER=C:\\Users\\" + 255], temp[sizeof user + sizeof "\\AppData\\Temp"];
+    const char *own[2];
+    int owned = 0;
+    if (!setting_given(l, "USERFOLDER")) {
+        ksnprintf(user, sizeof user, "USERFOLDER=%s", store_user_folder());
+        own[owned++] = user;
+    }
+    if (!setting_given(l, "TEMP")) {
+        ksnprintf(temp, sizeof temp, "TEMP=%s", store_user_temp());
+        own[owned++] = temp;
+    }
+#define SETTING(i) ((i) < l->setting_count ? l->settings[i] : own[(i) - l->setting_count])
+
     /* User stack: the argument and setting strings, then their two
        null-terminated pointer arrays. They must fit well inside the stack. */
-    int settings = l->setting_count;
+    int settings = l->setting_count + owned;
     size_t strings = 0;
     for (int i = 0; i < argc; i++) strings += strlen(argv[i]) + 1;
-    for (int i = 0; i < settings; i++) strings += strlen(l->settings[i]) + 1;
+    for (int i = 0; i < settings; i++) strings += strlen(SETTING(i)) + 1;
     size_t pointer_bytes = ((size_t)argc + 1 + (size_t)settings + 1) * 8;
     if (strings + pointer_bytes > USER_STACK_MAX / 2) { r = -N_ERR_TOO_MANY_ARGUMENTS; goto fail; }
     pointers = kmalloc(pointer_bytes);
@@ -204,14 +235,15 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     /* pre-fault what the start needs plus 64 KiB; the rest grows on demand */
     uint64_t prefault = ALIGN_UP(strings + pointer_bytes + 64 + 65536, PAGE_SIZE);
     if (vmm_user_alloc(t->pml4, USER_STACK_TOP - prefault, prefault, VM_W) < 0) { r = -N_ERR_NO_MEMORY; goto fail; }
-    if (l->handle_count > t->fd_capacity && task_fd_reserve(t, l->handle_count) < 0) { r = -N_ERR_NO_MEMORY; goto fail; }
+    if (handle_table_reserve(t, l->handle_count) < 0) { r = -N_ERR_NO_MEMORY; goto fail; }
     uint64_t sp = USER_STACK_TOP;
     for (int i = settings - 1; i >= 0; i--) {
-        size_t n = strlen(l->settings[i]) + 1;
+        size_t n = strlen(SETTING(i)) + 1;
         sp -= n;
-        if (vmm_copy_to_space(t->pml4, sp, l->settings[i], n) < 0) goto fail;
+        if (vmm_copy_to_space(t->pml4, sp, SETTING(i), n) < 0) goto fail;
         pointers[argc + 1 + i] = sp;
     }
+#undef SETTING
     for (int i = argc - 1; i >= 0; i--) {
         size_t n = strlen(argv[i]) + 1;
         sp -= n;
@@ -246,11 +278,11 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     for (int i = 0; i < 6; i++) kpush(t, 0);
 
     for (size_t i = 0; i < l->handle_count; i++)
-        if (l->handles[i]) t->fds[i] = vfs_dup(l->handles[i]);
+        if (l->handles[i]) t->handles[i] = handle_ref(l->handles[i]);
     t->parent = l->parent;
     if (l->app) {
         /* The task's own reference keeps the record until it has reported. */
-        vnode_ref(l->app);
+        object_ref(l->app);
         ((struct app_record *)l->app->priv)->pid = t->pid;
         t->app = l->app;
         t->app_launched = true;
@@ -278,7 +310,7 @@ fail:
         if (*pp) *pp = t->all_next;
         irq_restore(f);
         vfree(t->kstack, KSTACK_PAGES);
-        if(t->fds!=t->initial_fds)kfree(t->fds);
+        if (t->handles != t->initial_handles) kfree(t->handles);
         kfree(t);
     }
     return r;
@@ -286,14 +318,15 @@ fail:
 
 int proc_spawn_simple(const char *path, const char *arg1, struct task *parent) {
     char *argv[3] = {(char *)path, (char *)arg1, NULL};
-    struct file *fds[3] = {NULL, NULL, NULL};
-    struct file *nul = NULL;
-    if (vfs_open("/dev/null", O_RDWR, &nul) == 0) fds[0] = fds[1] = fds[2] = nul;
-    char *settings[] = {"FOLDER=/home"};
+    struct handle *nul = stream_null_open();
+    struct handle *handles[3] = {nul, nul, nul};
+    char folder[sizeof "FOLDER=C:\\Users\\" + 255];
+    ksnprintf(folder, sizeof folder, "FOLDER=%s", store_user_folder());
+    char *settings[] = {folder};
     struct proc_launch l = {.argc = arg1 ? 2 : 1, .argv = argv, .setting_count = 1, .settings = settings,
-                            .handles = fds, .handle_count = 3, .parent = parent};
+                            .handles = handles, .handle_count = 3, .parent = parent};
     int r = proc_launch(path, &l);
-    if (nul) vfs_close(nul);
+    handle_close(nul);
     return r;
 }
 

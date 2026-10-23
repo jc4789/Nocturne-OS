@@ -28,7 +28,7 @@ static long anc = -1; /* selection anchor, -1 = none */
 static int top;       /* the first line shown */
 static float left;    /* how far the text is scrolled sideways, in pixels */
 static bool modified, prompt_open, dragging;
-static char path[256], prompt_buf[256], status[128];
+static char path[1024], prompt_buf[1024], status[128];
 static float want_x = -1; /* where Up/Down keep the caret sideways, -1 = not set */
 static int cur_line, total;
 
@@ -179,7 +179,7 @@ static void ensure_cursor_visible(void) {
 static void set_title(void) {
     static char last[300];
     char t[300];
-    const char *name = path[0] ? strrchr(path, '/') ? strrchr(path, '/') + 1 : path : "untitled";
+    const char *name = path[0] ? n_path_name(path) : "untitled";
     snprintf(t, sizeof t, "%s%s - Text Editor", modified ? "*" : "", name);
     if (!strcmp(t, last)) return;
     strlcpy(last, t, sizeof last);
@@ -237,7 +237,8 @@ static void open_prompt(int kind) {
     prompt_open = true;
     prompt_kind = kind;
     prompt_focus++;
-    strlcpy(prompt_buf, path[0] ? path : "/home/", sizeof prompt_buf);
+    if (path[0]) strlcpy(prompt_buf, path, sizeof prompt_buf);
+    else if (n_path_join(n_user_folder(), "Documents", prompt_buf, sizeof prompt_buf) >= 0) strlcat(prompt_buf, "\\", sizeof prompt_buf);
 }
 
 static void new_text(void) {
@@ -361,7 +362,7 @@ static void show(void) {
                 ui_num(&m, "colour", ui_theme.accent); ui_num(&m, "weight", 1); ui_nums(&m, "padding", (double[]){0, 4}, 2);
                 ui_end(&m);
                 prompt_field = ui_node(&m, "field"); ui_str(&m, "value", prompt_buf); ui_num(&m, "focus", prompt_focus);
-                ui_str(&m, "placeholder", "/home/file.txt");
+                ui_str(&m, "placeholder", "Documents\\file.txt");
                 ui_str(&m, "width", "fill"); ui_num(&m, "minWidth", 80); ui_end(&m);
             } else {
                 ui_node(&m, "text"); ui_str(&m, "text", path[0] ? path : "(not saved yet)"); ui_num(&m, "ellipsis", 1);
@@ -516,7 +517,7 @@ int main(int argc, char **argv) {
     if (!ed) return 1;
     set_title();
     draw_editor();
-    char shown[1024] = "";
+    char shown[2400] = "";
     show();
     for (bool running = true; running;) {
         ui_session_wait(sess, -1);
@@ -604,7 +605,7 @@ int main(int argc, char **argv) {
         if (follow) ensure_cursor_visible();
         if (redraw) draw_editor();
         /* a new view only when something it shows has changed */
-        char now[1024];
+        char now[2400];
         char right[96];
         right_status(right, sizeof right);
         snprintf(now, sizeof now, "%d|%d|%d|%d|%d|%d|%s|%s|%s|%s", win_w, win_h, closing, prompt_open, prompt_kind,

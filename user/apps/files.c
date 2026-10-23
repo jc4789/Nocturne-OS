@@ -20,8 +20,10 @@
 #define DOUBLE_MS 400  /* two clicks on a row this close are a double click */
 
 static struct ui_session *sess;
-static char cwd[512] = "/home";
-static char pathbuf[512];        /* what the path field holds */
+#define PATH_BYTES 1024
+static char cwd[PATH_BYTES];     /* the folder shown, a complete path (set by main) */
+static bool in_programs;         /* it holds programs: the system's folder, or an app's folder in C:\Programs */
+static char pathbuf[PATH_BYTES]; /* what the path field holds */
 static struct n_entry *ents;     /* the folder's entries (n_folder_entries) */
 static int nent, sel = -1, win_w = 620, win_h = 440;
 static char status[128];
@@ -39,9 +41,11 @@ static int cmp(const void *a, const void *b) {
     return strcasecmp(x->name, y->name);
 }
 
-static void join(char *out, size_t n, const char *dir, const char *name) {
-    if (!strcmp(dir, "/")) snprintf(out, n, "/%s", name);
-    else snprintf(out, n, "%s/%s", dir, name);
+/* the complete path of a name in the shown folder; false (and a status) when it does not fit */
+static bool entry_path(char *out, const char *name) {
+    if (n_path_join(cwd, name, out, PATH_BYTES) >= 0) return true;
+    snprintf(status, sizeof status, "the path of %s is too long", name);
+    return false;
 }
 
 static void load(void) {
@@ -50,6 +54,7 @@ static void load(void) {
     free(ents);
     ents = NULL;
     strlcpy(pathbuf, cwd, sizeof pathbuf);
+    in_programs = program_folder(cwd);
     n_result n = n_folder_entries(cwd, &ents);
     if (n < 0) {
         ents = NULL;
@@ -59,7 +64,7 @@ static void load(void) {
     nent = (int)n;
     qsort(ents, nent, sizeof ents[0], cmp);
     snprintf(status, sizeof status, "%d item%s", nent, nent == 1 ? "" : "s");
-    char t[300];
+    char t[PATH_BYTES + 16];
     snprintf(t, sizeof t, "Files - %s", cwd);
     ui_window_title(sess, WINDOW, t);
 }
@@ -70,18 +75,14 @@ static void go(const char *path) {
 }
 
 static void go_up(void) {
-    char *s = strrchr(cwd, '/');
-    if (!s) return;
-    if (s == cwd) cwd[1] = 0;
-    else *s = 0;
-    load();
+    char up[PATH_BYTES];
+    if (n_path_join(cwd, "..", up, sizeof up) >= 0) go(up); /* the root stays the root */
 }
 
 static const char *type_name(const struct n_entry *e) {
     if (e->kind == N_KIND_FOLDER) return "Folder";
-    if (e->kind == N_KIND_DEVICE) return "Device";
     const char *dot = strrchr(e->name, '.');
-    if (!strcmp(cwd, "/bin")) return "Program";
+    if (in_programs) return "Program";
     if (dot && !strcasecmp(dot, ".txt")) return "Text";
     if (dot && !strcasecmp(dot, ".ppm")) return "Picture";
     if (dot && !strcasecmp(dot, ".wav")) return "Sound";
@@ -97,7 +98,6 @@ static const char *icon_of(const struct n_entry *e, uint32_t *colour) {
     const char *t = type_name(e);
     *colour = ui_theme.textDim;
     if (e->kind == N_KIND_FOLDER) { *colour = ui_theme.warning; return "folder"; }
-    if (e->kind == N_KIND_DEVICE) return "display";
     if (!strcmp(t, "Sound") || !strcmp(t, "Media")) { *colour = ui_theme.accent; return "sound"; }
     if (!strcmp(t, "Program")) { *colour = ui_theme.success; return "chevron-right"; }
     if (!strcmp(t, "Picture")) { *colour = ui_theme.accentHover; return "display"; }
@@ -168,7 +168,7 @@ static void show(void) {
         ui_node(&m, "row"); ui_num(&m, "gap", 8);
             toolbar_button(&m, B_UP, "Up", NULL, false);
             toolbar_button(&m, B_HOME, "Home", NULL, false);
-            toolbar_button(&m, B_ROOT, "/", NULL, false);
+            toolbar_button(&m, B_ROOT, "C:\\", NULL, false);
             ui_node(&m, "field"); ui_str(&m, "value", pathbuf); ui_str(&m, "placeholder", "Folder");
             ui_str(&m, "width", "fill"); ui_num(&m, "minWidth", 80); ui_end(&m);
             toolbar_button(&m, B_NEWDIR, "New folder", "plus", false);
@@ -202,8 +202,8 @@ static void show(void) {
 
 static void open_entry(int i) {
     if (i < 0 || i >= nent) return;
-    char path[800];
-    join(path, sizeof path, cwd, ents[i].name);
+    char path[PATH_BYTES];
+    if (!entry_path(path, ents[i].name)) return;
     if (ents[i].kind == N_KIND_FOLDER) {
         go(path);
         return;
@@ -211,20 +211,20 @@ static void open_entry(int i) {
     const char *t = type_name(&ents[i]);
     int r;
     if (!strcmp(t, "Program")) r = gui_launch(path, NULL);
-    else if (!strcmp(t, "Picture")) r = gui_launch("/bin/paint", path);
-    else if (!strcmp(t, "Sound")) r = gui_launch("/bin/player", path);
-    else if (!strcmp(t, "Media")) r = gui_launch("/bin/mediaplayer", path);
-    else if (!strcmp(t, "Web page")) r = gui_launch("/bin/browser", path);
-    else r = gui_launch("/bin/notepad", path);
+    else if (!strcmp(t, "Picture")) r = gui_launch("paint", path);
+    else if (!strcmp(t, "Sound")) r = gui_launch("player", path);
+    else if (!strcmp(t, "Media")) r = gui_launch("mediaplayer", path);
+    else if (!strcmp(t, "Web page")) r = gui_launch("browser", path);
+    else r = gui_launch("notepad", path);
     snprintf(status, sizeof status, r < 0 ? "could not open %s" : "opened %s", ents[i].name);
 }
 
 static void make_new(bool dir) {
-    char path[800], name[256];
+    char path[PATH_BYTES], name[256];
     for (int n = 1; n < 100; n++) {
         if (n == 1) snprintf(name, sizeof name, dir ? "New folder" : "untitled.txt");
         else snprintf(name, sizeof name, dir ? "New folder %d" : "untitled%d.txt", n);
-        join(path, sizeof path, cwd, name);
+        if (!entry_path(path, name)) return;
         struct n_entry st;
         if (n_entry_info(path, &st) < 0) break;
     }
@@ -242,9 +242,9 @@ static void make_new(bool dir) {
 
 static void delete_sel(void) {
     if (sel < 0) return;
-    char path[800], name[256];
+    char path[PATH_BYTES], name[256];
     strlcpy(name, ents[sel].name, sizeof name);
-    join(path, sizeof path, cwd, name);
+    if (!entry_path(path, name)) return;
     n_result r = n_entry_remove(path);
     int keep = sel;
     load();
@@ -299,8 +299,8 @@ static bool key(const struct ui_event *e) {
 int main(int argc, char **argv) {
     sess = ui_session_new();
     if (!sess || ui_window(sess, WINDOW, win_w, win_h, WIN_RESIZABLE, "Files", &win_w, &win_h) < 0) return 1;
-    char start[512]; /* the named folder, else the one Files was started in */
-    if (n_path_complete(argc > 1 ? argv[1] : ".", start, sizeof start) < 0) strlcpy(start, "/home", sizeof start);
+    char start[PATH_BYTES]; /* the named folder, else the one Files was started in */
+    if (n_path_complete(argc > 1 ? argv[1] : ".", start, sizeof start) < 0) strlcpy(start, n_user_folder(), sizeof start);
     go(start);
     show();
     for (bool running = true; running;) {
@@ -312,8 +312,8 @@ int main(int argc, char **argv) {
             switch (e.type) {
             case UI_EVENT_CLICK:
                 if (e.node == btn_node[B_UP]) go_up();
-                else if (e.node == btn_node[B_HOME]) go("/home");
-                else if (e.node == btn_node[B_ROOT]) go("/");
+                else if (e.node == btn_node[B_HOME]) go(n_user_folder());
+                else if (e.node == btn_node[B_ROOT]) go("C:\\");
                 else if (e.node == btn_node[B_NEWDIR]) make_new(true);
                 else if (e.node == btn_node[B_NEWFILE]) make_new(false);
                 else if (e.node == btn_node[B_DELETE]) delete_sel();

@@ -320,8 +320,16 @@ static int tcc_relocate_ex(TCCState *s1, void *ptr, unsigned ptr_diff)
 {
     Section *s;
     unsigned offset, length, align, i, k, f;
-    unsigned n, copy;
-    addr_t mem, addr;
+    unsigned n, copy, tls_n, tls_align;
+    addr_t mem, addr, tls_start, tls_image, tls_end;
+
+    /* the thread-local sections make one block, at the alignment of the most aligned */
+    tls_n = 0, tls_align = 1, tls_start = tls_image = tls_end = 0;
+    for (i = 1; i < s1->nb_sections; i++) {
+        s = s1->sections[i];
+        if ((s->sh_flags & SHF_TLS) && s->sh_addralign > tls_align)
+            tls_align = s->sh_addralign;
+    }
 
     if (NULL == ptr) {
         s1->nb_errors = 0;
@@ -344,14 +352,19 @@ redo:
     if (copy == 3)
         return 0;
 
-    for (k = 0; k < 3; ++k) { /* 0:rx, 1:ro, 2:rw sections */
+    /* 0:rx, 1:ro, 2:rw sections, 3:thread-local data then 4:thread-local zeros, the image
+       that each thread's block is made from */
+    for (k = 0; k < 5; ++k) {
         n = 0; addr = 0;
         for(i = 1; i < s1->nb_sections; i++) {
-            static const char shf[] = {
-                SHF_ALLOC|SHF_EXECINSTR, SHF_ALLOC, SHF_ALLOC|SHF_WRITE
+            static const unsigned short shf[] = {
+                SHF_ALLOC|SHF_EXECINSTR, SHF_ALLOC, SHF_ALLOC|SHF_WRITE,
+                SHF_ALLOC|SHF_WRITE|SHF_TLS, SHF_ALLOC|SHF_WRITE|SHF_TLS
                 };
             s = s1->sections[i];
-            if (shf[k] != (s->sh_flags & (SHF_ALLOC|SHF_WRITE|SHF_EXECINSTR)))
+            if (shf[k] != (s->sh_flags & (SHF_ALLOC|SHF_WRITE|SHF_EXECINSTR|SHF_TLS)))
+                continue;
+            if (k >= 3 && (k == 4) != (s->sh_type == SHT_NOBITS))
                 continue;
             length = s->data_offset;
             if (copy == 2) {
@@ -374,11 +387,17 @@ redo:
                 continue;
             }
 
-            if ((s->sh_flags & SHF_TLS) && length)
-                return tcc_error_noabort("thread-local storage not supported with -run");
-
             align = s->sh_addralign;
-            if (++n == 1) {
+            if (k >= 3) {
+#if !CONFIG_TCC_NOCTURNE
+                /* on Nocturne, the program's own libc makes each thread's block from the
+                   image (ports/tcc/runmain.c, set_tls_layout()) */
+                if (length)
+                    return tcc_error_noabort("thread-local storage not supported with -run");
+#endif
+                if (++tls_n == 1)
+                    align = tls_align;
+            } else if (++n == 1) {
 #if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
                 /* To avoid that x86 processors would reload cached instructions
                    each time when data is written in the near, we need to make
@@ -395,6 +414,13 @@ redo:
             offset += -(addr + offset) & (align - 1);
             s->sh_addr = mem ? addr + offset : 0;
             offset += length;
+            if (k >= 3) {
+                if (tls_n == 1)
+                    tls_start = tls_image = s->sh_addr;
+                tls_end = s->sh_addr + length;
+                if (k == 3)
+                    tls_image = tls_end;
+            }
         }
         if (copy == 2) { /* set permissions */
             if (n == 0) /* no data  */
@@ -436,6 +462,8 @@ redo:
         goto redo;
     }
 
+    if (tls_n)
+        set_tls_layout(s1, tls_start, tls_image - tls_start, tls_end - tls_start, tls_align);
     /* relocate symbols */
     relocate_syms(s1, s1->symtab, 1);
     if (s1->nb_errors)

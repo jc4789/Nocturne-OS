@@ -1,6 +1,6 @@
 /* net_stream: TCP connections, optionally wrapped in TLS 1.2 by BearSSL.
    Certificates are checked against the Mozilla root store compiled in by scripts/mkroots.py, and
-   the current time comes from the CMOS clock. Entropy for the handshake comes from /dev/urandom. */
+   the current time comes from the CMOS clock. Entropy for the handshake comes from the system entropy pool (n_random). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

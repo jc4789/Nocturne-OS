@@ -47,7 +47,7 @@ struct webidb_async_result {
     size_t item_count;
 };
 webidb_async *webidb_async_create(void);
-/* Copies private input into owned queue storage; never opens /data or waits
+/* Copies private input into owned queue storage; never opens the browser's data or waits
  * for helper/disk. Zero means allocation/representation/spawn failure. */
 uint32_t webidb_async_submit(webidb_async *,const struct webidb_async_request *);
 /* At most 64 KiB per lane; nonblocking pipe I/O, no yield/wait or author JS. */

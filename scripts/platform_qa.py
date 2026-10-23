@@ -1,6 +1,8 @@
-"""Nocturneの隔離実機経路検証。既存dataとHyper-V VMは接続しない。"""
+"""Nocturneの隔離実機経路検証。build/nocturne.imgのラベル専用コピー一台をAHCI、snapshot=onで起動し、
+試験ファイルはそのC:\\Testsへ置く。利用者のディスクとHyper-V VMは接続しない。"""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
 
@@ -18,10 +21,10 @@ BIN = ROOT / 'tools/msys64/ucrt64/bin'
 USR = ROOT / 'tools/msys64/usr/bin'
 ENV = dict(os.environ, PATH=str(BIN)+os.pathsep+str(USR)+os.pathsep+os.environ.get('PATH', ''),
            MSYSTEM='UCRT64', CHERE_INVOKING='1', MTOOLS_SKIP_CHECK='1')
-
-
-def run(*args):
-    subprocess.run([str(x) for x in args], cwd=ROOT, env=ENV, check=True)
+# scripts/test.py owns the test disk: store.exe, the build check, the boot entry and C:\Tests.
+_spec = importlib.util.spec_from_file_location('nocturne_test_disk', ROOT / 'scripts/test.py')
+TEST = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(TEST)
 
 
 def digest(path):
@@ -180,8 +183,8 @@ def main():
     ap.add_argument('--label', required=True)
     ap.add_argument('--url')
     ap.add_argument('--command', action='append', default=[])
-    ap.add_argument('--guest-file', action='append', default=[], help='明示したconsole入力を隔離dataの/testsへコピー（サイトfixture用ではない）')
-    ap.add_argument('--guest-executable', action='append', default=[], help='クロスコンパイルしたELFを隔離dataの/testsへ配置（通常の配布媒体は変更しない）')
+    ap.add_argument('--guest-file', action='append', default=[], help='明示したconsole入力を隔離コピーのC:\\Testsへ置く（サイトfixture用ではない）')
+    ap.add_argument('--guest-executable', action='append', default=[], help='クロスコンパイルしたELFを隔離コピーのC:\\Testsへ置く（通常の配布媒体は変更しない）')
     ap.add_argument('--cmdline', default='')
     ap.add_argument('--resolution', help='隔離bootの通常entryだけに渡す幅x高さx32。元boot設定は変更しない')
     ap.add_argument('--seconds', type=float, default=60)
@@ -218,7 +221,7 @@ def main():
     ap.add_argument('--allow-panic', action='store_true', help='期待panicの負例検証だけで使用')
     ap.add_argument('--stop-when-expected', action='store_true')
     a = ap.parse_args()
-    if a.url and any(re.match(r'\s*(?:/data/bin/)?browser(?:\s|$)', command) for command in a.command):
+    if a.url and any(re.match(r'\s*(?:\S*[\\/])?browser(?:\s|$)', command) for command in a.command):
         ap.error('--urlとbrowser起動commandは併用できません。操作console付き起動は--commandだけ指定してください')
     if not re.fullmatch('[a-zA-Z0-9_-]+', a.label) or not 1 <= a.cpus <= 16 or not 256 <= a.memory <= 16384:
         ap.error('不正なラベル、CPU数またはRAMです')
@@ -275,18 +278,20 @@ def main():
     if a.virgl_disable_mt and not a.gl:
         ap.error('--virgl-disable-mtには--glが必要です')
     here = ROOT / 'build/nocturne-platform' / a.label
-    # A reused label overwrites its boot/data media in place instead of
-    # piling up new copies; earlier screens of the label are replaced below.
+    # A reused label overwrites its boot disk in place instead of piling up
+    # new copies; earlier screens of the label are replaced below.
     here.mkdir(parents=True, exist_ok=True)
-    for stale in [*here.glob('screen-*.p[np][gm]'), here / 'serial.log']:
+    # data.img/data.stamp: the second disk of the old layout, no longer used.
+    for stale in [*here.glob('screen-*.p[np][gm]'), here / 'serial.log', here / 'data.img', here / 'data.stamp']:
         if stale.is_file():
             stale.unlink()
-    boot = here / 'boot.img'
-    boot_part = boot.relative_to(ROOT).as_posix()+'@@1048576'
-    # QEMU opens both disks with snapshot=on, so a label's media never change
-    # while running. Copy the boot disk only when the build image or the boot
-    # options changed; otherwise the previous copy is already exact.
     source = ROOT / 'build/nocturne.img'
+    if not source.is_file() or not Path(TEST.STORE).is_file():
+        ap.error('先にbuildしてください（make qemu-image）')
+    boot = here / 'boot.img'
+    # QEMU opens the disk with snapshot=on, so what the guest writes never
+    # reaches the label's copy. Copy the built disk only when it or the boot
+    # options changed; otherwise only C:\Tests is replaced below.
     stamp = here / 'boot.stamp'
     wanted = json.dumps({'size': source.stat().st_size, 'mtime': source.stat().st_mtime_ns,
                          'cmdline': a.cmdline, 'resolution': a.resolution})
@@ -294,70 +299,38 @@ def main():
     if not reuse_boot:
         stamp.unlink(missing_ok=True)
         shutil.copyfile(source, boot)
-    hashes = {}
-    for name in ('kernel.elf', 'initrd.tar'):
-        extracted = here / ('extracted-'+name)
-        run(BIN / 'mcopy.exe', '-o', '-i', boot_part, '::/boot/'+name, extracted.relative_to(ROOT).as_posix())
-        hashes[name] = digest(extracted)
-        if hashes[name] != digest(ROOT / 'build' / name):
-            raise RuntimeError('起動媒体と最新buildが不一致: '+name)
-        extracted.unlink()
-    if (a.cmdline or a.resolution) and not reuse_boot:
-        config = (ROOT / 'boot/limine.conf').read_text(encoding='utf-8')
-        needle = '    path: boot():/boot/kernel.elf'
-        first_entry = config.split('\n/')[1].split('\n/')[0] if '\n/' in config else ''
-        if needle not in first_entry:
-            raise RuntimeError('予期しないLimine構成です')
-        updated = first_entry
-        if a.cmdline:
-            if re.search(r'(?m)^    cmdline: ', updated):
-                updated = re.sub(r'(?m)^(    cmdline: [^\n]*)$', lambda m: m[1]+' '+a.cmdline, updated, count=1)
-            else:
-                updated = updated.replace(needle, needle+'\n    cmdline: '+a.cmdline, 1)
-        if a.resolution:
-            updated, replacements = re.subn(r'(?m)^    resolution: [^\n]+$', '    resolution: '+a.resolution, updated)
-            if replacements != 1:
-                raise RuntimeError('通常entryの解像度指定が一意でありません')
-        conf = here / 'limine.conf'
-        conf.write_text(config.replace(first_entry, updated, 1), encoding='utf-8', newline='\n')
-        run(BIN / 'mcopy.exe', '-o', '-i', boot_part, conf.relative_to(ROOT).as_posix(), '::/boot/limine/limine.conf')
-    if not reuse_boot:
-        stamp.write_text(wanted, encoding='utf-8')
-    disk = here / 'data.img'
-    # The scratch data disk is formatted once per mkdata layout; each run only
-    # overwrites the files it ships (tests, guest files, autorun).
-    data_stamp = here / 'data.stamp'
-    data_wanted = digest(ROOT / 'scripts/mkdata.sh')
-    if not disk.is_file() or not data_stamp.is_file() or data_stamp.read_text(encoding='utf-8') != data_wanted:
-        data_stamp.unlink(missing_ok=True)
-        subprocess.run([str(USR / 'bash.exe'), 'scripts/mkdata.sh', disk.relative_to(ROOT).as_posix(), '128'],
-                       cwd=ROOT, env=dict(ENV, MKDATA_REPLACE='1'), check=True)
-        data_stamp.write_text(data_wanted, encoding='utf-8')
-    part = disk.relative_to(ROOT).as_posix()+'@@1048576'
-    run(BIN / 'mcopy.exe', '-o', '-i', part, '-s', 'tests', '::/')
+    files = [('C:\\Tests', str(ROOT / 'tests'))]
     guest_hashes = {}
     for source in a.guest_file:
         local = Path(source).resolve(strict=True)
         if not local.is_file() or local.stat().st_size > 16384 or not re.fullmatch('[a-zA-Z0-9_.-]+',local.name):
             ap.error('console入力は16KiB以内の通常ファイルです')
-        run(BIN / 'mcopy.exe','-o','-i',part,local,'::/tests/'+local.name)
+        files.append(('C:\\Tests\\'+local.name, str(local)))
         guest_hashes[local.name] = digest(local)
     executable_hashes = {}
     for name in a.guest_executable:
-        local = Path(name)
+        local = Path(name).resolve()
         if not local.is_file():
             ap.error('guest-executableは実在するELFファイルです')
         with local.open('rb') as executable:
             if executable.read(len(b'\x7fELF')) != b'\x7fELF':
                 ap.error('guest-executableはELFファイルである必要があります')
-        run(BIN / 'mcopy.exe','-o','-i',part,local,'::/tests/'+local.name)
+        files.append(('C:\\Tests\\'+local.name, str(local)))
         executable_hashes[local.name] = digest(local)
     commands = ['free', 'ps', *a.command]
     if a.url:
         commands += ['browser --debug-js '+a.url]
     script = here / 'autorun.sh'
     script.write_text('\n'.join(commands)+'\n', encoding='utf-8', newline='\n')
-    run(BIN / 'mcopy.exe', '-o', '-i', part, script.relative_to(ROOT).as_posix(), '::/tests/autorun.sh')
+    files.append(('C:\\Tests\\autorun.sh', str(script)))
+    with tempfile.TemporaryDirectory(prefix='scratch-', dir=here) as scratch:
+        # The copy's kernel and programs are the current build's, every run.
+        hashes = TEST.system_payload(str(boot), scratch)
+        if not reuse_boot:
+            if a.cmdline or a.resolution:
+                TEST.edit_boot_entry(str(boot), scratch, a.resolution, a.cmdline)
+            stamp.write_text(wanted, encoding='utf-8')
+        print('C:\\Tests:', TEST.put_tests(str(boot), files, scratch), flush=True)
     with socket.socket() as s:
         s.bind(('127.0.0.1', 0))
         port = s.getsockname()[1]
@@ -365,8 +338,8 @@ def main():
     args = [a.qemu, '-M', 'pc', '-m', str(a.memory)+'M', '-smp', str(a.cpus), '-accel', a.accel,
             '-display', 'egl-headless' if a.gl else 'none', '-vga', a.vga, '-no-reboot',
             '-serial', 'file:'+str(serial), '-monitor', f'tcp:127.0.0.1:{port},server,nowait',
-            '-drive', f'file={boot},format=raw,if=ide,index=0,snapshot=on',
-            '-drive', f'file={disk},format=raw,if=ide,index=1,snapshot=on',
+            '-device', 'ahci,id=ahci', '-drive', f'id=boot,file={boot},format=raw,if=none,snapshot=on',
+            '-device', 'ide-hd,drive=boot,bus=ahci.0,bootindex=0',
             '-netdev', 'user,id=qa', '-device', 'e1000,netdev=qa']
     if a.gl:
         args += ['-device', 'virtio-gpu-gl-pci']
@@ -379,7 +352,7 @@ def main():
     if a.audio:
         args += ['-audiodev', f'wav,id=snd,path={here / "audio.wav"}', '-device', 'AC97,audiodev=snd']
     metadata = {'arguments': args, 'boot_payload_sha256': hashes, 'user_data_attached': False,
-                'boot_snapshot': True, 'scratch_snapshot': True, 'requested_seconds': a.seconds,
+                'boot_snapshot': True, 'requested_seconds': a.seconds,
                 'requested_resolution': a.resolution,
                 'requested_scroll_interval': a.scroll_interval,
                 'expected_serial': a.expect, 'rejected_serial': a.reject,
@@ -623,8 +596,8 @@ def main():
                         mon.cmd('sendkey '+key)
             if a.scroll_pages and elapsed >= scroll_at and scroll_count < a.scroll_pages:
                 if scroll_count == 0 and not a.no_focus_click:
-                    # The first 15s frame may still be Limine loading the
-                    # larger rootfs. Focus the actual page at scrolling time.
+                    # The first 15s frame may still be the boot. Focus the
+                    # actual page at scrolling time.
                     mon.cmd('mouse_button 1')
                     mon.cmd('mouse_button 0')
                 shot(mon, 'page-'+str(scroll_count))

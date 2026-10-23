@@ -33585,7 +33585,7 @@ static const char js_bootstrap[] =
 "                return makeHandle('directory', []);\n"
 "            });\n"
 "        }\n"
-"        /* /data storage is never evicted by the browser. */\n"
+"        /* Storage in the browser's data folder is never evicted by the browser. */\n"
 "        persisted() { return P.resolve(true); }\n"
 "        persist() { return P.resolve(true); }\n"
 "    }\n"

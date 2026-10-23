@@ -24,6 +24,8 @@
 #ifndef ZINK_PUBLIC_H
 #define ZINK_PUBLIC_H
 
+#include "util/detect_os.h"
+
 struct pipe_screen;
 struct renderonly;
 struct sw_winsys;
@@ -32,8 +34,10 @@ struct pipe_screen_config;
 struct pipe_screen *
 zink_create_screen(struct sw_winsys *winsys, const struct pipe_screen_config *config);
 
+#if !DETECT_OS_NOCTURNE /* a DRM device is a file descriptor, which Nocturne does not have */
 struct pipe_screen *
 zink_drm_create_screen(int fd, const struct pipe_screen_config *config, struct renderonly *ro);
+#endif
 struct pipe_screen *
 zink_win32_create_screen(uint64_t adapter_luid);
 #endif

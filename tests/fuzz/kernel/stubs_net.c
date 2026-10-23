@@ -7,7 +7,16 @@
 
 #include "kernel.h"
 #include "sys/sched.h"
+#include "sys/object.h"
+#include "sys/channel.h"
 #include "net/net.h"
+
+/* The handle table: the harnesses give net.c no app's handles. */
+struct handle *handle_peek(int index) { (void)index; return NULL; }
+struct handle *handle_ref(struct handle *h) { return h; }
+void handle_close(struct handle *h) { (void)h; }
+uint32_t handle_ready(struct handle *h) { (void)h; return 0; }
+bool message_channel_is(struct handle *h) { (void)h; return false; }
 
 void cpu_bsp_wake(void) {}
 unsigned cpu_current_index(void) { return 0; }
@@ -25,8 +34,6 @@ void sched_yield(void) {}
 bool user_ok(const void *p, size_t n) { return p || !n; }
 bool user_ok_w(void *p, size_t n) { return p || !n; }
 int user_str(char *dst, const char *src, size_t max) { strlcpy(dst, src, max); return 0; }
-void vfs_close(struct file *f) { (void)f; }
-struct file *vfs_dup(struct file *f) { return f; }
 bool vmm_ap_uaccess_begin(void) { return true; }
 void vmm_ap_uaccess_end(void) {}
 uint64_t vmm_get_pte(uint64_t pml4, uint64_t va) { (void)pml4; (void)va; return 0; }

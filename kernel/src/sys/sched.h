@@ -5,9 +5,10 @@
 #include "sys/kei.h"
 
 struct regs;
-struct file;
+struct handle;
+struct object;
 
-#define MAX_FDS 32 /* initial inline capacity, never a descriptor limit */
+#define INITIAL_HANDLES 32 /* the inline table's size, never a handle limit */
 #define KSTACK_PAGES 8
 
 enum task_state { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE };
@@ -38,12 +39,12 @@ struct task {
     uint64_t ksp;
     uint8_t *kstack;
     uint64_t pml4;
-    struct file *initial_fds[MAX_FDS];
-    struct file **fds;
-    struct file *net_setup_cancel_file; /* thread-owned strong ref; never inherited */
-    size_t fd_capacity,fd_hint;
+    struct handle *initial_handles[INITIAL_HANDLES];
+    struct handle **handles;
+    struct handle *net_setup_cancel; /* thread-owned strong ref; never inherited */
+    size_t handle_capacity, handle_hint;
     struct task *parent;
-    struct vnode *app;        /* its handle record reports the end */
+    struct object *app;       /* its app record reports the end */
     bool app_launched;        /* by n_app_launch: no parent collects it */
     int exit_code;
     int kill_code;          /* ordinary kill=130; fatal sibling keeps exception status */
@@ -60,7 +61,7 @@ struct task {
        N_MEMORY_LOW for code that holds 32-bit absolute addresses. */
     uint64_t low_base, low_next;
     struct mmap_hole *low_holes;
-    struct shared_mapping *shared_mappings; /* native FD-backed page references */
+    struct shared_mapping *shared_mappings; /* shared pages this app has mapped */
     uint64_t cpu_ms;
     uint64_t start_ms;
     uint16_t cpu_subms_us;
@@ -115,10 +116,10 @@ bool address_ap_syscall(struct regs *r); /* AP: waiterのいないwake、値不�
  * as blocked tasks; a notify that selects it moves its token to the queue's
  * pollable ready list. Removing reports 1 while still waiting, 2 after it was
  * notified (the notifier already counted it), 0 for an unknown token. */
-struct vnode *address_watch_queue_new(void);
-int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t expected, uint64_t token);
-int address_watch_remove(struct vnode *queue, uint64_t token);
-size_t address_watch_take(struct vnode *queue, uint64_t *tokens, size_t max);
+struct object *address_watch_queue_new(void);
+int address_watch_add(struct object *queue, volatile uint32_t *address, uint32_t expected, uint64_t token);
+int address_watch_remove(struct object *queue, uint64_t token);
+size_t address_watch_take(struct object *queue, uint64_t *tokens, size_t max);
 NORETURN void task_exit(int code);
 NORETURN void task_exit_app(int code); /* SYS_EXIT or a fatal user exception: the whole app ends, from any of its threads */
 struct task *task_find(int pid);
@@ -126,15 +127,24 @@ int task_kill(int pid);
 int task_stop_apps(void); /* power change: kill every app task; returns how many have not ended yet */
 int task_wait(int pid, int *status, bool nohang);
 void task_printf_stderr(struct task *t, const char *fmt, ...);
-/* Descriptor representation helpers; caller holds a BSP IRQ guard. File
- * references transfer only on successful installation. Explicit indices may
- * grow to the int ABI's representable boundary, subject to real allocation. */
-int task_fd_reserve(struct task *owner,size_t minimum);
-int task_fd_find(struct task *owner);
-int task_fd_alloc(struct task *owner,struct file *file);
-
 /* wait queues; call with interrupts disabled for race-free condition checks */
 void wq_wait(struct wait_queue *wq);
 bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms); /* returns false on timeout */
 void wq_wake_all(struct wait_queue *wq);
+/* A driver waiting for its device: asleep on wq until *kick is set (its interrupt handler sets it,
+   then wakes wq) or for up to ms; *kick is cleared. wq and kick may be NULL: just the time. The
+   boot task (later the idle task) has no stack of its own to sleep on: it halts until the next
+   interrupt instead and lets the other kernel threads run. */
+void wq_nap(struct wait_queue *wq, volatile bool *kick, uint64_t ms);
 void sleep_ms(uint64_t ms);
+/* A sleeping lock for kernel code on the BSP, which a timer may preempt: state that stays
+   borrowed across allocations, copies or disk transfers. The holder may take it again. Interrupt
+   handlers never take one. The boot task, which cannot sleep, lets the holder run until it is
+   free. */
+struct mutex {
+    struct task *owner;
+    unsigned depth;
+    struct wait_queue wait;
+};
+void mutex_lock(struct mutex *m);
+void mutex_unlock(struct mutex *m);

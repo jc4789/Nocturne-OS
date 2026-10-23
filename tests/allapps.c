@@ -1,15 +1,23 @@
-/* allapps: compile every program in /usr/src/apps with tcc (to object files), so the in-OS
+/* allapps: compile every program in C:\Nocturne\SDK\Source\Apps with tcc (to object files), so the in-OS
    toolchain is known to handle the whole userland. Prints failures and "allapps: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
 
+#define APPS_FOLDER "C:\\Nocturne\\SDK\\Source\\Apps"
+
 int main(void) {
     struct n_entry *entries;
-    n_result count = n_folder_entries("/usr/src/apps", &entries);
+    n_result count = n_folder_entries(APPS_FOLDER, &entries);
     if (count < 0) {
-        printf("allapps: no /usr/src/apps\n");
+        printf("allapps: no " APPS_FOLDER "\n");
+        return 1;
+    }
+    char object[4096];
+    if (n_path_join(n_temp_folder(), "allapps.o", object, sizeof object) < 0) {
+        printf("allapps: no room for the object file's name\n");
+        free(entries);
         return 1;
     }
     int n = 0, failed = 0;
@@ -18,8 +26,8 @@ int main(void) {
         size_t l = strlen(name);
         if (l < 3 || strcmp(name + l - 2, ".c")) continue;
         char src[300];
-        snprintf(src, sizeof src, "/usr/src/apps/%s", name);
-        char *argv[] = {"tcc", "-c", "-o", "/home/allapps.o", src, NULL};
+        snprintf(src, sizeof src, APPS_FOLDER "\\%s", name);
+        char *argv[] = {"tcc", "-c", "-o", object, src, NULL};
         int st = run_wait("tcc", argv);
         n++;
         if (st != 0) {
@@ -28,6 +36,7 @@ int main(void) {
         }
     }
     free(entries);
+    n_entry_remove(object);
     printf("allapps: %d compiled, %d failed\n", n, failed);
     return failed != 0 || n < 40;
 }

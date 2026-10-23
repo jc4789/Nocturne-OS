@@ -1,4 +1,4 @@
-/* /bin/js core: module loading (ES modules, CommonJS, JSON), timers, the
+/* js core: module loading (ES modules, CommonJS, JSON), timers, the
  * "nocturne" module and the TypeScript entry. js.c compiles this file as the
  * body of function (host, internal) after DOMException and the Encoding API;
  * js_console.js and js_web.js follow. Everything js.c calls is on internal. */
@@ -146,24 +146,17 @@ function lazy(names, chunk) {
 lazy(['URL', 'URLSearchParams'], 'url');
 lazy(['crypto', 'Crypto', 'CryptoKey', 'SubtleCrypto', 'isSecureContext'], 'crypto');
 
-/* ---- paths ---- */
-function normalize(path) {
-    const out = [];
-    for (const part of path.split('/')) {
-        if (!part || part === '.') continue;
-        if (part === '..') out.pop();
-        else out.push(part);
-    }
-    return '/' + out.join('/');
-}
-const join = (...parts) => normalize(parts.join('/'));
-const dirname = path => { const i = path.lastIndexOf('/'); return i <= 0 ? '/' : path.slice(0, i); };
-const basename = path => path.slice(path.lastIndexOf('/') + 1);
+/* ---- paths: complete paths "C:\a\b" as libc's n_path_join writes them ('/' is taken as '\',
+   "." and ".." are resolved, ".." stops at the root "C:\"); the rest work on such paths ---- */
+const isComplete = path => /^(?:[A-Za-z]:(?:[\\/]|$)|[\\/])/.test(path);
+const join = (...parts) => host.complete(parts.join('\\'));
+const dirname = path => { const i = path.lastIndexOf('\\'); return i > 2 ? path.slice(0, i) : path.slice(0, 3); };
+const isRoot = path => dirname(path) === path;
+const basename = path => path.slice(path.lastIndexOf('\\') + 1);
 const extension = path => { const name = basename(path), i = name.lastIndexOf('.'); return i > 0 ? name.slice(i) : ''; };
 
 /* ---- the "nocturne" module ---- */
-const kinds = ['', 'document', 'folder', '', '', '', '', '', 'device'];
-const entry = raw => raw && {name: raw.name, path: raw.path, kind: kinds[raw.kind] || 'device', size: raw.size, modified: new Date(raw.modified * 1000)};
+const entry = raw => raw && {name: raw.name, path: raw.path, kind: raw.kind === 2 ? 'folder' : 'document', size: raw.size, modified: new Date(raw.modified * 1000)};
 const bytes = data => {
     if (typeof data === 'string' || data instanceof ArrayBuffer) return data;
     if (ArrayBuffer.isView(data)) return data instanceof Uint8Array ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
@@ -173,9 +166,10 @@ const info = path => entry(host.info(String(path)));
 function createFolder(path, options) {
     const full = host.complete(String(path));
     if (!options?.recursive) return void host.createFolder(full);
-    let at = '';
-    for (const part of full.split('/').filter(Boolean)) {
-        at += '/' + part;
+    const [drive, ...names] = full.split('\\');
+    let at = drive;
+    for (const part of names.filter(Boolean)) {
+        at += '\\' + part;
         const found = host.info(at);
         if (!found || found.kind !== 2) host.createFolder(at);
     }
@@ -229,16 +223,17 @@ const builtin = path => {
 };
 const isBuiltin = path => path === 'nocturne' || path === 'nocturne/ui';
 
-/* ---- module resolution: relative and absolute paths, node_modules packages ---- */
+/* ---- module resolution: relative and complete paths, node_modules packages ---- */
 const extensions = ['.js', '.mjs', '.cjs', '.json'];
 const kindOf = path => { try { return host.info(path)?.kind ?? 0; } catch { return 0; } };
 const packages = new Map();
 function readPackage(folder) {
     if (packages.has(folder)) return packages.get(folder);
     let pkg = null;
-    if (kindOf(folder + '/package.json') === 1) {
-        try { pkg = JSON.parse(host.readFile(folder + '/package.json', true)); }
-        catch (e) { throw new SyntaxError(`${folder}/package.json: ${e.message}`); }
+    const file = join(folder, 'package.json');
+    if (kindOf(file) === 1) {
+        try { pkg = JSON.parse(host.readFile(file, true)); }
+        catch (e) { throw new SyntaxError(`${file}: ${e.message}`); }
         if (pkg === null || typeof pkg !== 'object') pkg = {};
     }
     packages.set(folder, pkg);
@@ -254,7 +249,8 @@ function asFile(path) {
             const main = asFile(join(path, pkg.main));
             if (main) return main;
         }
-        for (const ext of extensions) if (kindOf(path + '/index' + ext) === 1) return path + '/index' + ext;
+        const index = join(path, 'index');
+        for (const ext of extensions) if (kindOf(index + ext) === 1) return index + ext;
     }
     return null;
 }
@@ -287,22 +283,23 @@ function packageExport(exports, sub, conditions) {
     }
     return null;
 }
-function resolvePackage(base, spec, conditions) {
+// The package's node_modules folder is looked for in from and each folder above it, up to the root.
+function resolvePackage(base, from, spec, conditions) {
     const m = /^((?:@[^/]+\/)?[^/]+)(\/.*)?$/.exec(spec);
     if (!m) return null;
     const name = m[1], sub = m[2] ? '.' + m[2] : '.';
-    for (let folder = dirname(base); ; folder = dirname(folder)) {
+    for (let folder = from; ; folder = dirname(folder)) {
         const root = join(folder, 'node_modules', name);
         if (kindOf(root) === 2) {
             const pkg = readPackage(root);
             if (pkg?.exports !== undefined && pkg.exports !== null) {
                 const target = packageExport(pkg.exports, sub, conditions);
-                if (!target) throw notFound(spec, base, `'${sub}' is not exported by ${root}/package.json`);
+                if (!target) throw notFound(spec, base, `'${sub}' is not exported by ${join(root, 'package.json')}`);
                 return asFile(join(root, target));
             }
             return asFile(sub === '.' ? root : join(root, sub));
         }
-        if (folder === '/') return null;
+        if (isRoot(folder)) return null;
     }
 }
 function notFound(spec, base, why) {
@@ -314,26 +311,32 @@ function notFound(spec, base, why) {
     e.code = 'MODULE_NOT_FOUND';
     return e;
 }
-/* js file.ts runs what tsgo wrote under tsOut (the source's own path inside
-   it): packages, and files tsgo did not write, are found beside the source. */
-const tsOut = '/tmp/js-ts';
-const fromTs = path => path.startsWith(tsOut + '/');
-const besideSource = path => fromTs(path) ? path.slice(tsOut.length) : path;
+/* js file.ts runs what tsgo wrote under tsOut, a folder of the temporary folder,
+   at the source's own path below the root inside it: packages, and files tsgo
+   did not write, are found beside the source. C: is the only drive. */
+const driveRoot = 'C:\\';
+const tsOut = join(host.tempFolder(), 'js-ts');
+const fromTs = path => path.startsWith(tsOut + '\\');
+const besideSource = path => fromTs(path) ? driveRoot + path.slice(tsOut.length + 1) : path;
 function tsSource(path) {
     if (!fromTs(path)) return path;
     const original = besideSource(path), ts = original.replace(/\.([cm]?)js$/, '.$1ts');
     return ts !== original && kindOf(ts) === 1 ? ts : original;
 }
+// Specifiers: "nocturne", "./x" and "../x" ('\' works too), complete paths ("/x" is C:\x), file: URLs, packages.
 function resolve(base, spec, conditions) {
     if (spec === 'nocturne' || spec === 'nocturne:') return 'nocturne';
     if (spec === 'nocturne/ui' || spec === 'nocturne:ui') return 'nocturne/ui';
-    if (spec.startsWith('file://')) spec = decodeURIComponent(spec.slice(7));
+    if (spec.startsWith('file://')) spec = decodeURIComponent(spec.slice(7)).replace(/^\/(?=[A-Za-z]:)/, '');
     let found;
-    if (spec.startsWith('/')) found = asFile(normalize(spec));
-    else if (spec === '.' || spec === '..' || spec.startsWith('./') || spec.startsWith('../')) {
-        found = asFile(join(base.startsWith('/') ? dirname(base) : host.cwd(), spec));
+    if (isComplete(spec)) found = asFile(join(spec));
+    else if (/^\.\.?(?:[\\/]|$)/.test(spec)) {
+        found = asFile(join(isComplete(base) ? dirname(base) : host.cwd(), spec));
         if (!found && fromTs(base)) found = asFile(join(dirname(besideSource(base)), spec));
-    } else found = resolvePackage(base.startsWith('/') ? besideSource(base) : host.cwd() + '/', spec, conditions);
+    } else {
+        const source = besideSource(base);
+        found = resolvePackage(source, isComplete(source) ? dirname(source) : host.cwd(), spec, conditions);
+    }
     if (!found) throw notFound(spec, base);
     return found;
 }
@@ -356,7 +359,7 @@ function packageType(folder) {
     for (;; folder = dirname(folder)) {
         const pkg = readPackage(folder);
         if (pkg) return pkg.type;
-        if (folder === '/') return undefined;
+        if (isRoot(folder)) return undefined;
     }
 }
 const cjsWrapper = text => text.startsWith('#!') ? '//' + text : text;
@@ -465,30 +468,34 @@ internal.namespace = (path, format) => {
         for (const name of exportNames(path)) { try { ns[name] = value[name]; } catch {} }
     return ns;
 };
+// C:\a\b is file:///C:/a/b (resolve() takes it back).
+const fileURL = path => 'file:///' + encodeURI(path.replaceAll('\\', '/')).replaceAll('?', '%3F').replaceAll('#', '%23');
 internal.fillMeta = (meta, path, main) => {
     const shown = tsSource(path);
-    meta.url = 'file://' + encodeURI(shown).replaceAll('?', '%3F').replaceAll('#', '%23');
+    meta.url = fileURL(shown);
     meta.filename = shown;
     meta.dirname = dirname(shown);
     meta.main = main;
     meta.resolve = spec => {
         const found = resolve(path, String(spec), importConditions);
-        return isBuiltin(found) ? found.replace('/', ':').replace(/^nocturne$/, 'nocturne:') : 'file://' + encodeURI(found);
+        return isBuiltin(found) ? found.replace('/', ':').replace(/^nocturne$/, 'nocturne:') : fileURL(found);
     };
 };
 
 /* ---- TypeScript: js file.ts type-checks and compiles with tsgo, then runs ---- */
+// The type root that holds the declarations of "nocturne" and "nocturne/ui" (its folder nocturne).
+const typeRoot = 'C:\\Nocturne\\SDK\\Types';
 internal.compileTypeScript = path => {
-    const args = [path, '--ignoreConfig', '--rootDir', '/', '--outDir', tsOut,
+    const args = [path, '--ignoreConfig', '--rootDir', driveRoot, '--outDir', tsOut,
         '--module', 'esnext', '--target', 'esnext', '--moduleResolution', 'bundler',
         '--moduleDetection', 'force', '--strict', '--skipLibCheck', '--noEmitOnError',
         '--sourceMap', 'false', '--declaration', 'false'];
-    if (kindOf('/node_modules/@types/nocturne') === 2) args.push('--types', 'nocturne');
+    if (kindOf(join(typeRoot, 'nocturne')) === 2) args.push('--typeRoots', typeRoot, '--types', 'nocturne');
     if (host.isTerminal(2)) args.push('--pretty');
     const status = host.run('tsgo', args);
     if (status !== 0) host.exit(status < 0 ? 1 : status);
     const js = path.replace(/\.([cm]?)ts$/, (_, m) => `.${m}js`);
-    return tsOut + js;
+    return join(tsOut, js.slice(driveRoot.length));
 };
 
 /* ---- js --init: a TypeScript project for tsgo and js ---- */
@@ -499,7 +506,7 @@ internal.init = folder => {
     const files = {
         'package.json': JSON.stringify({name: name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-'), version: '1.0.0', type: 'module', main: 'dist/main.js'}, null, 2) + '\n',
         'tsconfig.json': JSON.stringify({compilerOptions: {
-            rootDir: 'src', outDir: 'dist', module: 'nodenext', target: 'esnext', types: ['nocturne'],
+            rootDir: 'src', outDir: 'dist', module: 'nodenext', target: 'esnext', typeRoots: [typeRoot], types: ['nocturne'],
             strict: true, noUncheckedIndexedAccess: true, exactOptionalPropertyTypes: true,
             verbatimModuleSyntax: true, isolatedModules: true, moduleDetection: 'force', skipLibCheck: true,
         }}, null, 2) + '\n',
@@ -518,8 +525,8 @@ internal.init = folder => {
         host.writeFile(full, text, false);
         host.write(1, `created  ${full}\n`);
     }
-    host.write(1, `\nBuild with tsgo and run the result:\n  cd ${at}\n  tsgo\n  js dist/main.js\n` +
-        `Or type-check and run one file at once: js src/main.ts\n`);
+    host.write(1, `\nBuild with tsgo and run the result:\n  cd ${at}\n  tsgo\n  js dist\\main.js\n` +
+        `Or type-check and run one file at once: js src\\main.ts\n`);
 };
 
 /* ---- the interactive prompt ---- */

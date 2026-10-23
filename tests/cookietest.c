@@ -59,7 +59,7 @@ int main(int argc,char **argv) {
     CHECK(set(j,"https://example.com/","__Host-Http-x=1; Secure; HttpOnly; Path=/",false)==0);
     CHECK(set(j,"https://example.com/","__Host-Http-x=1; Secure; HttpOnly; Path=/",true)==1);
     CHECK(set(j,"https://example.com/","partitioned=1; Secure; Partitioned",true)==0);
-    CHECK(set(j,"file:///home/index.html","x=1",false)==0);
+    CHECK(set(j,"file:///C:/Users/User/index.html","x=1",false)==0);
     CHECK(set(j,"https://example.com@evil.com/","x=1",true)==0);
     CHECK(set(j,"https://example.com/","x=1\r\nCookie: secret",true)==0);
     CHECK(set(j,"https://example.com/","invalid name=1",true)==0);
@@ -175,7 +175,7 @@ int main(int argc,char **argv) {
     }
     webcookie_free(j);
     /* The deployed complete PSL, not merely the small policy-unit table. */
-    FILE *f=fopen(argc>1?argv[1]:"/usr/share/browser/public_suffix_list.dat","r");
+    FILE *f=fopen(argc>1?argv[1]:"C:\\Nocturne\\Web\\public_suffix_list.dat","r");
     CHECK(f!=NULL);
     if(f){
         char *text=malloc(WEBCOOKIE_PSL_MAX+1);CHECK(text!=NULL);

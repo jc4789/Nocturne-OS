@@ -47,7 +47,7 @@ long __syscall(long n, long a, long b, long c, long d, long e) {
 #define SC4(n, a, b, c, d) __syscall(n, (long)(a), (long)(b), (long)(c), (long)(d), 0)
 
 /* A text file that is not an ELF program is run as a script: by the interpreter named on a
-   "#!" first line, else by /bin/sh. Returns the interpreter path in buf, or NULL. */
+   "#!" first line, else by sh. Returns the interpreter path in buf, or NULL. */
 static const char *script_interp(const char *path, char *buf, size_t n) {
     char head[256];
     n_handle d = n_document_open(path, N_DOCUMENT_READ);
@@ -66,7 +66,7 @@ static const char *script_interp(const char *path, char *buf, size_t n) {
         buf[k] = 0;
         return buf;
     }
-    return "/bin/sh";
+    return N_FOLDER_SYSTEM "\\sh";
 }
 
 static struct n_clockinfo user_clock;
@@ -117,15 +117,19 @@ uint64_t uptime_ms(void) {
 }
 
 /* ELF TLS (x86-64 variant II): the linked image ends at the FS control
-   block. Programs linked without these symbols (TinyCC) have no TLS. */
+   block. The linker defines these (user/user.ld, or TinyCC's
+   set_tls_layout()); a program without TLS leaves them 0. */
 extern char __tls_image[] __attribute__((weak)), __tls_image_end[] __attribute__((weak));
 extern char __tls_memsz[] __attribute__((weak)), __tls_align[] __attribute__((weak));
+/* The thread pointer's alignment: the block's and the control block's. */
 static size_t libc_tls_align(void) {
     size_t align = (size_t)__tls_align;
     return align < _Alignof(struct libc_thread) ? _Alignof(struct libc_thread) : align;
 }
+/* The block as the linker addresses it back from the thread pointer: its
+   size rounded to its own alignment, not the control block's. */
 static size_t libc_tls_size(void) {
-    size_t align = libc_tls_align();
+    size_t align = __tls_align ? (size_t)__tls_align : 1;
     return ((size_t)__tls_memsz + align - 1) & ~(align - 1);
 }
 /* Bytes a thread needs for its TLS block plus control block. */
@@ -407,14 +411,22 @@ static bool is_document(const char *path) {
 }
 
 bool find_program(const char *name, char *out, size_t n) {
-    if (strchr(name, '/')) return n_path_complete(name, out, n) >= 0 && is_document(out);
-    /* built-in programs first, then the ones built or installed on the persistent data disk */
-    static const char *const dirs[] = {"/bin", "/data/bin"};
-    for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) {
-        snprintf(out, n, "%s/%s", dirs[i], name);
-        if (is_document(out)) return true;
-    }
-    return false;
+    if (!*name || strpbrk(name, "\\/:")) return n_path_complete(name, out, n) >= 0 && is_document(out);
+    if ((size_t)snprintf(out, n, "%s\\%s", N_FOLDER_SYSTEM, name) < n && is_document(out)) return true;
+    struct n_entry *apps;
+    n_result count = n_folder_entries(N_FOLDER_PROGRAMS, &apps);
+    bool found = false;
+    for (n_result i = 0; i < count && !found; i++)
+        found = apps[i].kind == N_KIND_FOLDER &&
+                (size_t)snprintf(out, n, "%s\\%s\\%s", N_FOLDER_PROGRAMS, apps[i].name, name) < n && is_document(out);
+    if (count >= 0) free(apps);
+    return found;
+}
+
+bool program_folder(const char *folder) {
+    char parent[4096];
+    return !strcasecmp(folder, N_FOLDER_SYSTEM) ||
+           (n_path_join(folder, "..", parent, sizeof parent) >= 0 && !strcasecmp(parent, N_FOLDER_PROGRAMS));
 }
 
 /* Run a program in place of this app: it gets this app's input, output and log,
@@ -424,11 +436,11 @@ static int run_here(const char *full, char *const argv[]) {
     while (argv[argc]) argc++;
     int32_t handles[3];
     for (int i = 0; i < 3; i++) handles[i] = n_handle_kind(i) >= 0 ? i : -1;
-    char folder[520], terminal[64];
+    char folder[4104], terminal[64];
     const char *settings[2];
     uint32_t ns = 0;
     const char *f = getenv("FOLDER"), *t = getenv("TERMINAL");
-    if (!f || f[0] != '/') f = "/";
+    if (!f || !n_path_is_complete(f)) f = "C:\\";
     snprintf(folder, sizeof folder, "FOLDER=%s", f);
     settings[ns++] = folder;
     if (t) {
@@ -446,17 +458,17 @@ static int run_here(const char *full, char *const argv[]) {
 }
 
 int run_wait(const char *path, char *const argv[]) {
-    char full[256];
+    char full[4096];
     if (!find_program(path, full, sizeof full)) return -N_ERR_NOT_FOUND;
     return run_here(full, argv);
 }
 
 int system(const char *cmd) {
     char *argv[] = {"sh", "-c", (char *)cmd, NULL};
-    return run_wait("/bin/sh", argv);
+    return run_wait("sh", argv);
 }
 
-/* Environment: there is no inherited environment, just these defaults plus whatever the program
+/* Environment: there is no inherited environment, just the launch settings plus whatever the program
    sets for itself. */
 static char **env_names, **env_vals;
 static int env_n;
@@ -475,46 +487,141 @@ char *getenv(const char *name) {
     size_t len = strlen(name);
     for (char *const *s = n_settings; *s; s++)
         if (!strncmp(*s, name, len) && (*s)[len] == '=') return *s + len + 1;
-    if (!strcmp(name, "HOME")) return "/home";
-    if (!strcmp(name, "PATH")) return "/bin:/data/bin";
     return NULL;
 }
 
+static bool is_separator(char c) { return c == '\\' || c == '/'; }
+
+/* the length of path's drive ("C:"), or 0 */
+static size_t drive_length(const char *path) {
+    return ((path[0] | 0x20) >= 'a' && (path[0] | 0x20) <= 'z' && path[1] == ':') ? 2 : 0;
+}
+
+bool n_path_is_complete(const char *path) { return is_separator(path[drive_length(path)]); }
+
+/* The drive comes from the complete part, upper case; the names after it are joined with '\'. A
+   name with a drive but no separator after it ("C:a") is in folder, as there is one drive. */
 n_result n_path_join(const char *folder, const char *name, char *out, size_t cap) {
-    const char *parts[2] = {name[0] == '/' || !folder || folder[0] != '/' ? "" : folder, name};
-    size_t used = 0;
+    bool alone = n_path_is_complete(name) || !folder || !n_path_is_complete(folder);
+    const char *base = alone ? name : folder;
+    size_t d = drive_length(base);
+    if (cap < 4) return -N_ERR_TOO_LARGE;
+    out[0] = d ? (char)(base[0] & ~0x20) : 'C';
+    out[1] = ':';
+    size_t root = 2, used = root;
+    const char *parts[2] = {alone ? name + d : folder + d, alone ? "" : name + drive_length(name)};
     for (int i = 0; i < 2; i++) {
         for (const char *s = parts[i]; *s;) {
-            while (*s == '/') s++;
+            while (is_separator(*s)) s++;
             const char *e = s;
-            while (*e && *e != '/') e++;
+            while (*e && !is_separator(*e)) e++;
             size_t len = (size_t)(e - s);
             if (len == 2 && s[0] == '.' && s[1] == '.') {
-                while (used && out[used - 1] != '/') used--;
-                if (used) used--;
+                while (used > root && out[used - 1] != '\\') used--;
+                if (used > root) used--;
             } else if (len && !(len == 1 && s[0] == '.')) {
                 if (used + 1 + len >= cap) return -N_ERR_TOO_LARGE;
-                out[used++] = '/';
+                out[used++] = '\\';
                 memmove(out + used, s, len);
                 used += len;
             }
             s = e;
         }
     }
-    if (cap < 2) return -N_ERR_TOO_LARGE;
-    if (!used) out[used++] = '/';
+    if (used == root) out[used++] = '\\';
     out[used] = 0;
     return (n_result)used;
 }
 
 n_result n_path_complete(const char *name, char *out, size_t cap) {
     const char *folder = getenv("FOLDER");
-    if (!folder || folder[0] != '/') folder = "/";
-    return n_path_join(folder, name, out, cap);
+    return n_path_join(folder && n_path_is_complete(folder) ? folder : "C:\\", name, out, cap);
+}
+
+const char *n_path_name(const char *path) {
+    const char *name = path + drive_length(path);
+    for (const char *p = name; *p; p++)
+        if (is_separator(*p)) name = p + 1;
+    return name;
+}
+
+static int hex_value(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : (c | 0x20) >= 'a' && (c | 0x20) <= 'f' ? (c | 0x20) - 'a' + 10 : -1;
+}
+
+n_result n_path_from_url(const char *url, char *out, size_t cap) {
+    if (!url || strncasecmp(url, "file://", 7)) return -N_ERR_INVALID;
+    const char *p = url + 7;
+    if (!strncasecmp(p, "localhost/", 10)) p += 9;
+    if (*p != '/') return -N_ERR_INVALID;
+    size_t length = strcspn(p, "?#"), n = 0;
+    char *decoded = malloc(length + 1);
+    if (!decoded) return -N_ERR_NO_MEMORY;
+    bool ok = true;
+    for (size_t i = 0; i < length && ok; i++) {
+        int c = (unsigned char)p[i];
+        if (c == '%') {
+            int high = i + 2 < length ? hex_value(p[i + 1]) : -1, low = high >= 0 ? hex_value(p[i + 2]) : -1;
+            c = low < 0 ? -1 : high << 4 | low;
+            i += 2;
+        }
+        /* a bad escape, a control byte or '\' is no part of a name in a URL */
+        ok = c >= 32 && c != 127 && c != '\\';
+        decoded[n++] = (char)c;
+    }
+    decoded[n] = 0;
+    /* "/C:/..." names the drive */
+    n_result r = ok ? n_path_join("C:\\", decoded + (drive_length(decoded + 1) ? 1 : 0), out, cap) : -N_ERR_INVALID;
+    free(decoded);
+    return r;
+}
+
+n_result n_path_to_url(const char *path, char *out, size_t cap) {
+    static const char digits[] = "0123456789ABCDEF";
+    char full[4096];
+    n_result r = n_path_join("C:\\", path, full, sizeof full);
+    if (r < 0) return r;
+    size_t used = 8;
+    if (cap <= used) return -N_ERR_TOO_LARGE;
+    memcpy(out, "file:///", used);
+    for (const char *s = full; *s; s++) {
+        unsigned char c = *s == '\\' ? '/' : (unsigned char)*s;
+        bool plain = (c >= '0' && c <= '9') || ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') || strchr("-_.~/:", c);
+        if (used + (plain ? 1 : 3) >= cap) return -N_ERR_TOO_LARGE;
+        if (plain) out[used++] = (char)c;
+        else {
+            out[used++] = '%';
+            out[used++] = digits[c >> 4];
+            out[used++] = digits[c & 15];
+        }
+    }
+    out[used] = 0;
+    return (n_result)used;
+}
+
+static const char *complete_setting(const char *name) {
+    const char *s = getenv(name);
+    return s && n_path_is_complete(s) ? s : "C:\\";
+}
+
+const char *n_user_folder(void) { return complete_setting("USERFOLDER"); }
+const char *n_temp_folder(void) { return complete_setting("TEMP"); }
+
+static n_result folder_ready(const char *path) {
+    n_result r = n_folder_create(path);
+    return r == -N_ERR_EXISTS ? 0 : r;
+}
+
+n_result n_app_data_folder(const char *name, char *out, size_t cap) {
+    char data[4096];
+    n_result r = n_path_join(n_user_folder(), "AppData", data, sizeof data), made;
+    if (r >= 0) r = n_path_join(data, name, out, cap);
+    if (r >= 0 && (made = folder_ready(data)) >= 0) made = folder_ready(out);
+    return r < 0 ? r : made < 0 ? made : r;
 }
 
 n_result n_folder_set(const char *name) {
-    char full[512];
+    char full[4096];
     n_result r = n_path_complete(name, full, sizeof full);
     if (r < 0) return r;
     struct n_entry e;

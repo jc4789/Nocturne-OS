@@ -156,7 +156,8 @@ static bool read_capacity(struct msc *m, unsigned lun, uint64_t *blocks, uint32_
 }
 
 /* `n` whole logical blocks from `first`, in one command. */
-static int transfer(struct lun *l, bool write, uint64_t first, unsigned n, void *data) {
+static int transfer(void *ctx, bool write, uint64_t first, unsigned n, uint8_t *data) {
+    struct lun *l = ctx;
     struct msc *m = l->m;
     unsigned bytes = n * l->block;
     uint8_t cdb[16] = {0};
@@ -193,46 +194,14 @@ struct io {
     int result;
 };
 
-/* 512-byte sectors over the unit's logical blocks. Larger blocks go through the bounce buffer;
- * a write that covers part of one reads it first. */
+/* 512-byte sectors over the unit's logical blocks: whole blocks straight from and to the caller's
+ * memory, the others through the bounce buffer. */
 static void do_io(void *arg) {
     struct io *io = arg;
     struct lun *l = io->l;
-    struct msc *m = l->m;
-    io->result = -1;
-    if (!m->dev || io->lba + io->count > l->blk.sectors) return;
-    unsigned per = l->block / 512, most = XFER / l->block;
-    uint64_t lba = io->lba;
-    uint32_t left = io->count;
-    uint8_t *p = io->buf;
-    while (left) {
-        if (per == 1) {
-            unsigned n = left < most ? left : most;
-            if (transfer(l, io->write, lba, n, p) < 0) return;
-            lba += n;
-            left -= n;
-            p += n * 512u;
-            continue;
-        }
-        uint64_t first = lba / per;
-        unsigned off = (unsigned)(lba % per) * 512, want = left * 512u;
-        unsigned n = (off + want + l->block - 1) / l->block;
-        if (n > most) n = most;
-        unsigned take = n * l->block - off;
-        if (take > want) take = want;
-        if (io->write) {
-            if ((off || take < n * l->block) && transfer(l, false, first, n, m->bounce) < 0) return;
-            memcpy(m->bounce + off, p, take);
-            if (transfer(l, true, first, n, m->bounce) < 0) return;
-        } else {
-            if (transfer(l, false, first, n, m->bounce) < 0) return;
-            memcpy(p, m->bounce + off, take);
-        }
-        lba += take / 512;
-        left -= take / 512;
-        p += take;
-    }
-    io->result = 0;
+    io->result = l->m->dev ? blk_by_blocks(&l->blk, io->write, io->lba, io->count, io->buf, l->m->bounce,
+                                           XFER / l->block, true, transfer, l)
+                           : -1;
 }
 
 static int msc_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf) {

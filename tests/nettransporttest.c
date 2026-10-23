@@ -380,7 +380,7 @@ static void tls_stream_candidates(void){
     check(tls_fixture_mode(false),"TLS candidate case restores ordinary external DNS answers");ns_sessions_clear();
 }
 int main(int argc,char **argv) {
-    tcp_port=read_port("/data/tests/tcpport");dns_port=read_port("/data/tests/dnsport");
+    tcp_port=read_port("C:\\Tests\\tcpport");dns_port=read_port("C:\\Tests\\dnsport");
     if(!tcp_port || !dns_port || !net_wait_up(5000)){puts("FAIL network transport fixture unavailable");return 1;}
     if(argc==2&&!strcmp(argv[1],"--stream-candidates")){stream_candidates();printf("nettransport stream: %d failed\n",failed);return failed!=0;}
     if(argc==2&&!strcmp(argv[1],"--tls-candidates")){tls_stream_candidates();printf("nettransport TLS candidates: %d failed\n",failed);return failed!=0;}

@@ -13,7 +13,7 @@ static void console(void *opaque,int level,const char *message){
     if(level==2||!strncmp(message,"FAIL paralleljs ",16)){failures++;printf("%s\n",message);}
 }
 int main(void){
-    FILE *file=fopen("/data/tests/js_native_mutation_cases.js","rb");if(!file)return 2;
+    FILE *file=fopen("C:\\Tests\\js_native_mutation_cases.js","rb");if(!file)return 2;
     fseek(file,0,SEEK_END);long length=ftell(file);rewind(file);char *code=malloc((size_t)length+128);
     if(!code){fclose(file);return 2;}size_t bytes=fread(code,1,(size_t)length,file);fclose(file);code[bytes]=0;
     strcat(code,";runNativeMutationCases().catch(e=>console.error(e.stack||e));");

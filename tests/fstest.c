@@ -1,8 +1,8 @@
-/* fstest DIR: exercise a filesystem under DIR (a complete path; created, then removed again except
-   for "keep/"). Documents of many sizes (around FAT cluster edges), replace, append, resize,
-   positional writes, move, long names, nested folders, folder listing, remove. The host checks
-   the FAT afterwards with scripts/fatcheck.py. Prints "FAIL ..." per failed check and
-   "fstest: N failed". */
+/* fstest DIR: exercise the store under the folder DIR (completed against the current folder when
+   it is not a complete path; created, then removed again). Documents of many sizes (around the
+   edges of the store's 4 KiB blocks), replace, append, resize, positional writes, move, long names,
+   names in any case, nested folders, folder listing, remove. The host checks the volume afterwards (the store check
+   of scripts/test.py). Prints "FAIL ..." per failed check and "fstest: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +22,7 @@ static char *path(const char *name) {
     static char buf[2][400];
     static int k;
     k ^= 1;
-    snprintf(buf[k], sizeof buf[k], "%s/%s", dir, name);
+    if (n_path_join(dir, name, buf[k], sizeof buf[k]) < 0) buf[k][0] = 0; /* names nothing: the call that gets it fails */
     return buf[k];
 }
 
@@ -82,11 +82,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: fstest DIR\n");
         return 2;
     }
-    snprintf(dir, sizeof dir, "%s", argv[1]);
+    if (n_path_complete(argv[1], dir, sizeof dir) < 0) {
+        fprintf(stderr, "fstest: DIR is too long\n");
+        return 2;
+    }
     n_folder_create(dir);
     char name[64];
 
-    /* sizes around 512-byte sectors and 4 KiB clusters, and a few big ones */
+    /* sizes around 512-byte sectors and 4 KiB blocks, and a few big ones */
     static const size_t sizes[] = {0, 1, 511, 512, 513, 4095, 4096, 4097, 8192, 12289, 65536, 100000, 1048576 + 7};
     for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
         snprintf(name, sizeof name, "size-%zu.bin", sizes[i]);
@@ -101,7 +104,7 @@ int main(int argc, char **argv) {
     }
     check("create-existing-fails", n_document_open(path("size-1.bin"), N_DOCUMENT_CREATE) == -N_ERR_EXISTS);
 
-    /* replace a big document with a small one and back: clusters must be freed and reused */
+    /* replace a big document with a small one and back: blocks must be freed and reused */
     check("shrink", write_file(path("size-100000.bin"), 300, 7, REPLACE) && check_file(path("size-100000.bin"), 300, 7));
     check("grow", write_file(path("size-100000.bin"), 200000, 8, REPLACE) && check_file(path("size-100000.bin"), 200000, 8));
     /* the same in place: truncate to nothing, then write */
@@ -139,7 +142,7 @@ int main(int argc, char **argv) {
         if (data) n_memory_release(data, length);
     }
 
-    /* positional overwrite in the middle, across a cluster boundary */
+    /* positional overwrite in the middle, across a block boundary */
     {
         n_handle h = n_document_open(path("size-12289.bin"), N_DOCUMENT_EDIT);
         char buf[16] = {0};
@@ -162,7 +165,15 @@ int main(int argc, char **argv) {
     check("rename-removes-old", n_entry_info(path(longname), &st) < 0);
     check("folder-entry", n_entry_info(path("sub/deeper"), &st) == 0 && st.kind == N_KIND_FOLDER && !strcmp(st.name, "deeper"));
 
-    /* many files in one folder (the folder grows past one cluster) */
+    /* a name is found in any case and keeps the spelling it was given; a change of case alone is a rename */
+    check("any-case", check_file(path("SUB\\Deeper\\MOVED.TXT"), 1234, 3));
+    check("stored-spelling", n_entry_info(path("Sub/DEEPER/Moved.TXT"), &st) == 0 && !strcmp(st.name, "moved.txt"));
+    check("one-name-any-case", n_document_open(path("sub/deeper/MOVED.txt"), N_DOCUMENT_CREATE) == -N_ERR_EXISTS);
+    check("rename-case", n_entry_move(path("sub/deeper/moved.txt"), path("sub/deeper/Moved.txt")) == 0 &&
+                             n_entry_info(path("sub/deeper/moved.txt"), &st) == 0 && !strcmp(st.name, "Moved.txt"));
+    check("move-into-itself-fails", n_entry_move(path("sub"), path("sub/deeper/sub")) == -N_ERR_INVALID);
+
+    /* many files in one folder (the folder grows past one block) */
     n_folder_create(path("many"));
     int okmany = 1;
     for (int i = 0; i < 150; i++) {

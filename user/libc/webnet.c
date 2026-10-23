@@ -159,7 +159,7 @@ static unsigned worker_budget(void){
     return MIN(budget,WORKERS);
 }
 static void load_cookie_psl(webcookie_jar *jar) {
-    FILE *f = fopen("/usr/share/browser/public_suffix_list.dat", "r");
+    FILE *f = fopen("C:\\Nocturne\\Web\\public_suffix_list.dat", "r");
     if (!f) return; /* Jar falls back to host-only, not a guessed suffix table. */
     char *text = malloc(WEBCOOKIE_PSL_MAX + 1);
     if (text) { size_t n = fread(text, 1, WEBCOOKIE_PSL_MAX + 1, f); if (n <= WEBCOOKIE_PSL_MAX) webcookie_psl_load(jar, text, n); free(text); }
@@ -486,7 +486,7 @@ static n_result service_start(webnet *n) {
     const char *args[]={"webfetch","--service"};
     const int32_t handles[]={listener};
     struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=1};
-    n_handle app=n_app_launch("/bin/webfetch",&launch);
+    n_handle app=n_app_launch(N_FOLDER_SYSTEM "\\webfetch",&launch);
     if(app<0){n_handle_close(listener);return app;}
     n->service=app;n->service_listener=listener;
     return 0;
@@ -497,7 +497,7 @@ static bool start(webnet *n,struct slot *s,struct request *r) {
     if(connected>=0)connected=n_channel_connect(n->service_key);
     if(connected>=0){s->channel=(n_handle)connected;s->live=true;return true;}
     r->finishing=true;
-    snprintf(r->error,sizeof r->error,"Cannot connect /bin/webfetch service: %s",n_result_text(connected));
+    snprintf(r->error,sizeof r->error,"Cannot connect webfetch service: %s",n_result_text(connected));
     return false;
 }
 static void wsock_free(struct wsock *s) {

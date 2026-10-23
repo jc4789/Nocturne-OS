@@ -8,7 +8,7 @@ int main(int argc, char **argv) {
     }
     int rc = 0;
     for (int i = 1; i < argc; i++) {
-        char path[512];
+        char path[1024];
         struct n_entry e;
         n_result r = n_path_complete(argv[i], path, sizeof path);
         if (r >= 0) r = n_entry_info(path, &e);

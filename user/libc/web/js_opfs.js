@@ -297,7 +297,7 @@ function installOriginPrivateFileSystem(host, secure, NavigatorInterface, dedica
                 return makeHandle('directory', []);
             });
         }
-        /* /data storage is never evicted by the browser. */
+        /* Storage in the browser's data folder is never evicted by the browser. */
         persisted() { return P.resolve(true); }
         persist() { return P.resolve(true); }
     }

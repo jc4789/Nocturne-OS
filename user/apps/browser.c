@@ -670,21 +670,9 @@ struct fetched {
     bool stopped;
 };
 
-static void pct_decode(char *s) {
-    char *o = s;
-    for (char *p = s; *p; p++) {
-        if (*p == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
-            char h[3] = {p[1], p[2], 0};
-            *o++ = (char)strtol(h, NULL, 16);
-            p += 2;
-        } else *o++ = *p;
-    }
-    *o = 0;
-}
-
 static const char *guess_type(const char *path) {
     const char *dot = strrchr(path, '.');
-    if (!dot || strchr(dot, '/')) return "";
+    if (!dot || strpbrk(dot, "\\/")) return "";
     static const char *map[][2] = {
         {".html", "text/html"}, {".htm", "text/html"}, {".css", "text/css"}, {".png", "image/png"},
         {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"}, {".gif", "image/gif"}, {".webp", "image/webp"},
@@ -696,19 +684,24 @@ static const char *guess_type(const char *path) {
     return "";
 }
 
+/* The file: URL of a path (n_path_to_url), malloc'd; NULL if it is too long or memory runs out. */
+static char *file_url(const char *path) {
+    size_t cap = 3 * (strlen(path) + 3) + 9; /* each byte of the complete path as %XX, after "file:///" */
+    char *url = malloc(cap);
+    if (url && n_path_to_url(path, url, cap) < 0) { free(url); url = NULL; }
+    return url;
+}
+
+/* A file: URL is read as the path it names (n_path_from_url). */
 static bool read_local(const char *url, struct fetched *f) {
-    char path[1024];
-    const char *p = url + 7;
-    if (has_prefix(p, "localhost/")) p += 9;
-    if (strcspn(p, "?#") >= sizeof path) {
-        strlcpy(f->err, "local path exceeds filesystem limit", sizeof f->err);
+    char path[4096];
+    n_result named = n_path_from_url(url, path, sizeof path);
+    if (named < 0) {
+        strlcpy(f->err, named == -N_ERR_TOO_LARGE ? "local path exceeds filesystem limit" : "invalid local path", sizeof f->err);
         return false;
     }
-    strlcpy(path, p, sizeof path);
-    char *q = strpbrk(path, "?#");
-    if (q) *q = 0;
-    pct_decode(path);
-    if (!path[0]) strcpy(path, "/");
+    size_t end = strcspn(url, "?#");
+    bool slash = end && url[end - 1] == '/'; /* the URL of a folder ends with '/' */
     struct n_entry info;
     if (n_entry_info(path, &info) < 0) {
         snprintf(f->err, sizeof f->err, "%s: no such file or folder", path);
@@ -729,14 +722,17 @@ static bool read_local(const char *url, struct fetched *f) {
                    "a{text-decoration:none}</style><h2>Index of ");
         sb_esc(&s, path, strlen(path));
         sb_str(&s, "</h2><table>");
-        if (strcmp(path, "/")) sb_str(&s, "<tr><td><a href=\"../\">../</a><td>");
+        if (strcmp(path, "C:\\")) sb_str(&s, "<tr><td><a href=\"../\">../</a><td>");
         for (n_result i = 0; i < count; i++) {
             const struct n_entry *d = &entries[i];
             bool dir = d->kind == N_KIND_FOLDER;
-            char sz[32] = "";
+            char sz[32] = "", child[4096];
+            char *href = n_path_join(path, d->name, child, sizeof child) >= 0 ? file_url(child) : NULL;
+            if (!href) continue;
             if (!dir) snprintf(sz, sizeof sz, "%llu bytes", (unsigned long long)d->size);
             sb_str(&s, "<tr><td><a href=\"");
-            sb_esc(&s, d->name, strlen(d->name));
+            sb_str(&s, href);
+            free(href);
             sb_str(&s, dir ? "/\">" : "\">");
             sb_esc(&s, d->name, strlen(d->name));
             sb_str(&s, dir ? "/</a><td>" : "</a><td>");
@@ -747,7 +743,7 @@ static bool read_local(const char *url, struct fetched *f) {
         f->body = s.b;
         f->len = s.n;
         strcpy(f->ctype, "text/html");
-        if (path[strlen(path) - 1] != '/') {
+        if (!slash) {
             size_t n = strlen(f->url);
             char *url = n <= SIZE_MAX - 2 ? realloc(f->url, n + 2) : NULL;
             if (!url) { strlcpy(f->err, "directory URL allocation failed", sizeof f->err); return false; }
@@ -781,7 +777,7 @@ static bool read_local(const char *url, struct fetched *f) {
 }
 
 /* ---------------------------------------------------------------- built-in pages */
-static const char home_page[] =
+static const char home_page_head[] =
     "<!doctype html><html><head><title>Nocturne Web</title><style>"
     "body{margin:0;font-family:sans-serif;background:#1e1c34;color:#e8e8f5}"
     ".wrap{max-width:640px;margin:0 auto;padding:56px 24px}"
@@ -811,8 +807,9 @@ static const char home_page[] =
     "<a href=\"https://lobste.rs/\">Lobsters<span>lobste.rs</span></a>"
     "<a href=\"https://developer.mozilla.org/en-US/docs/Web/CSS\">MDN CSS<span>developer.mozilla.org</span></a>"
     "<a href=\"https://example.com/\">Example<span>example.com</span></a>"
-    "<a href=\"file:///home/JavaScript/index.html\">JavaScript demo<span>DOM, events, timers and modules</span></a>"
-    "<a href=\"file:///home/\">Your files<span>file:///home/</span></a>"
+    ;
+/* then two links into the user's folder, which the user's folder decides (home_html) */
+static const char home_page_tail[] =
     "</div>"
     "<h2>Keys</h2><table>"
     "<tr><td><kbd>Ctrl+L</kbd><td>address bar (type words to search)"
@@ -824,6 +821,30 @@ static const char home_page[] =
     "<tr><td><kbd>Space</kbd> <kbd>PgDn</kbd> <kbd>PgUp</kbd><td>scroll a page"
     "<tr><td><kbd>Esc</kbd><td>stop loading"
     "</table></div></body></html>";
+
+/* The start page: the links to the web are fixed, those to the user's folder follow it. */
+static char *home_html(void) {
+    struct sb s = {0};
+    char demo[1024];
+    sb_str(&s, home_page_head);
+    char *url = n_path_join(n_user_folder(), "Documents\\JavaScript\\index.html", demo, sizeof demo) >= 0 ? file_url(demo) : NULL;
+    if (url) {
+        sb_str(&s, "<a href=\"");
+        sb_str(&s, url);
+        sb_str(&s, "\">JavaScript demo<span>DOM, events, timers and modules</span></a>");
+        free(url);
+    }
+    if ((url = file_url(n_user_folder()))) {
+        sb_str(&s, "<a href=\"");
+        sb_str(&s, url);
+        sb_str(&s, "\">Your files<span>");
+        sb_esc(&s, n_user_folder(), strlen(n_user_folder()));
+        sb_str(&s, "</span></a>");
+        free(url);
+    }
+    sb_str(&s, home_page_tail);
+    return s.b;
+}
 
 static char *error_page(const char *url, const char *msg) {
     struct sb s = {0};
@@ -1243,8 +1264,9 @@ static void host_navigate_form(void *opaque, const char *url, const void *body, 
         /* The new window shares this one's input, output and log, if it has them. */
         const char *args[]={"browser",url};int32_t handles[]={0,1,2};
         struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=3};
-        n_handle app=n_app_launch("/bin/browser",&launch);
-        if (app==-N_ERR_NO_HANDLE) { launch.handle_count=0; app=n_app_launch("/bin/browser",&launch); }
+        char self[1024];
+        n_handle app=find_program("browser",self,sizeof self)?n_app_launch(self,&launch):-N_ERR_NOT_FOUND;
+        if (app==-N_ERR_NO_HANDLE) { launch.handle_count=0; app=n_app_launch(self,&launch); }
         if (app<0) console_add("error","Unable to open the form destination window");
         else n_handle_close(app);
         return;
@@ -1803,7 +1825,7 @@ static void finish_navigation(void) {
     size_t hlen = 0;
     if (f->error[0]) html = error_page(navigation_url, f->error);
     else if (has_prefix(web_response_url(f), "about:"))
-        html = strdup(!strcasecmp(web_response_url(f), HOME) ? home_page : "<!doctype html><title>blank</title>");
+        html = !strcasecmp(web_response_url(f), HOME) ? home_html() : strdup("<!doctype html><title>blank</title>");
     else {
         bool sniff_html = !ctype[0] && f->body_len && memchr(f->body, '<', MIN(f->body_len, 512));
         if (has_prefix(ctype, "text/html") || has_prefix(ctype, "application/xhtml") || sniff_html) {
@@ -2009,8 +2031,8 @@ static void apply_pending_navigation(void) {
 
 static char *address_destination(const char *text) {
     const char *prefix = ""; bool search = false;
+    if (n_path_is_complete(text)) return file_url(text); /* C:\Users\User\a.html, \Users\User\a.html or /Users/User/a.html */
     if (strstr(text, "://") || has_prefix(text, "about:")) {}
-    else if (text[0] == '/') prefix = "file://";
     else if (strchr(text, ' ') || !strchr(text, '.')) { prefix = SEARCH; search = true; }
     else prefix = "https://";
     size_t n = strlen(prefix);
@@ -2895,19 +2917,8 @@ int main(int argc, char **argv) {
     ui_session_pump(ui); /* the surface gets its size */
     take_engine_events();
     redraw();
-    if (argc > 1) {
-        if (argv[1][0] == '/') {
-            size_t length = strlen(argv[1]);
-            char *u = length <= SIZE_MAX - 8 ? malloc(length + 8) : NULL;
-            if (!u) { console_add("error", "Local destination could not be allocated."); }
-            else {
-                memcpy(u, "file://", 7);
-                memcpy(u + 7, argv[1], length + 1);
-                navigate(u, NULL, NAV_PUSH);
-                free(u);
-            }
-        } else go_addr(argv[1]);
-    } else navigate(HOME, NULL, NAV_PUSH);
+    if (argc > 1) go_addr(argv[1]); /* a URL, a path (as Files opens one) or words to search */
+    else navigate(HOME, NULL, NAV_PUSH);
     while (!quit) {
         uint64_t now = n_clock_uptime_ms();
         webnet_pump(network, now);

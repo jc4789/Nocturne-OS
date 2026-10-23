@@ -1,15 +1,17 @@
 /* Settings: display, mouse and sound, all by mouse. Every change applies at
- * once and is kept in /data/settings/desktop.conf; at startup init runs
- * "js /bin/settings.js --apply", which puts the saved settings back before the
- * desktop is used. Nothing here needs a terminal or the boot command line. */
-import { args, createFolder, exists, exit, readText, writeText } from "nocturne";
+ * once and is kept in C:\Users\<name>\AppData\Settings\desktop.conf; at
+ * startup init runs "js C:\Nocturne\System\settings.js --apply", which puts the
+ * saved settings back before the desktop is used. Nothing here needs a
+ * terminal or the boot command line. */
+import { args, createFolder, exists, exit, getSetting, readText, resolvePath, writeText } from "nocturne";
 import {
     caption, card, column, desktop, heading, listItem, row, run, scroll, segmented, slider, spacer, text, theme, title,
     toggle, icon, type App, type Child, type DesktopSettings, type IconName,
 } from "nocturne/ui";
 
-const FOLDER = "/data/settings";
-const PATH = FOLDER + "/desktop.conf";
+/* The user's folder is the launch setting USERFOLDER ("C:\" without it, as libc's n_user_folder). */
+const FOLDER = resolvePath(`${getSetting("USERFOLDER") ?? "C:\\"}\\AppData\\Settings`);
+const PATH = FOLDER + "\\desktop.conf";
 const POINTER_Y_KEYS = ["auto", "normal", "invert"] as const;
 
 type Section = "display" | "mouse" | "sound";

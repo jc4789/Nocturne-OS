@@ -16,7 +16,7 @@ static const struct fixture {const char *name,*audio_codec;bool video;int frames
     {"vp9-high10.webm",NULL,true,0,"vp9"},
 };
 static uint8_t *read_fixture(const char *name,size_t *size){
-    char path[256];snprintf(path,sizeof path,"/data/tests/media-fixtures/%s",name);
+    char path[256];snprintf(path,sizeof path,"C:\\Tests\\media-fixtures\\%s",name);
     FILE *f=fopen(path,"rb");CHECK(f!=NULL);if(!f)return NULL;
     fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);CHECK(n>0&&n<65536);
     if(n<=0||n>=65536){fclose(f);return NULL;}
@@ -25,7 +25,7 @@ static uint8_t *read_fixture(const char *name,size_t *size){
     fclose(f);*size=(size_t)n;return p;
 }
 static void decode(const struct fixture *fixture,bool memory){
-    char path[256],error[160];snprintf(path,sizeof path,"/data/tests/media-fixtures/%s",fixture->name);
+    char path[256],error[160];snprintf(path,sizeof path,"C:\\Tests\\media-fixtures\\%s",fixture->name);
     nmedia *m=NULL;
     if(memory){size_t n=0;uint8_t *p=read_fixture(fixture->name,&n);if(!p)return;
         m=nmedia_open_memory(p,n,error,sizeof error);memset(p,0,n);free(p);
@@ -67,7 +67,7 @@ static void decode(const struct fixture *fixture,bool memory){
     nmedia_close(m);
 }
 static void reject(const char *name){
-    char path[256],error[160];snprintf(path,sizeof path,"/data/tests/media-fixtures/%s",name);
+    char path[256],error[160];snprintf(path,sizeof path,"C:\\Tests\\media-fixtures\\%s",name);
     nmedia *m=nmedia_open(path,error,sizeof error);bool rejected=!m;
     if(m){struct nmedia_output out;int r=NMEDIA_AGAIN;
         for(int i=0;i<1000&&r==NMEDIA_AGAIN;i++)r=nmedia_step(m,&out);

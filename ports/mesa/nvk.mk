@@ -237,7 +237,7 @@ NVK_FLAGS := $(NVK_INC) $(NVK_DEFS) -I.
 $(NVK_C_OBJ): MESA_CFLAGS += $(NVK_FLAGS)
 $(NVK_C_OBJ): MESA_CXXFLAGS += $(NVK_FLAGS)
 $(NVK_C_OBJ): $(NVK_RS_H)
-# nvkmd_nocturne_rm.c talks to /bin/nvrm (ports/nvidia) with the RM's own SDK headers. They go first:
+# nvkmd_nocturne_rm.c talks to nvrm (ports/nvidia) with the RM's own SDK headers. They go first:
 # the RM headers include <nvtypes.h> and must get the RM's, not the one in nouveau/headers.
 $(BUILD)/mesa/o/$(NVK_VK)/nvkmd/nocturne/nvkmd_nocturne_rm.c.o: MESA_CFLAGS := -Iports/nvidia/include \
     $(addprefix -Ithird_party/nvidia-open/src/,common/sdk/nvidia/inc nvidia/arch/nvalloc/unix/include) \

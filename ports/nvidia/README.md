@@ -1,4 +1,4 @@
-# ports/nvidia：NVIDIA RM を Nocturne のドライバーアプリ `/bin/nvrm` にする
+# ports/nvidia：NVIDIA RM を Nocturne のドライバーアプリ `C:\Nocturne\System\nvrm` にする
 
 RTX 4070（AD104、Ada）を、NVIDIA の open-gpu-kernel-modules 615.78.08 の RM（`third_party/nvidia-open`）で
 動かすための層。台帳は `docs/nvidia/LEDGER.md`。**Nocturne は Unix でも POSIX でもない。** この層は
@@ -46,13 +46,14 @@ RO view を RW map しようとする旧クライアントは拒否される。R
 RM の WRITE_ONLY 要求は NVOS33 が許す RW 写像で提供する（x86 の writable page は readable でもある）。
 READ_ONLY の最大権利は引き続き RO であり、派生 view や合成 view でも昇格できない。
 
-ファームウェア：`/usr/share/firmware/nvidia/615.78.08/`、無ければ `/data/firmware/nvidia/615.78.08/`
-（`nv_get_firmware`）。git には入れない（台帳 D9）。
+ファームウェア：`C:\Nocturne\Firmware\NVIDIA\615.78.08\` だけから読む（`nv_get_firmware`）。
+システムの部分なのでアプリからは変えられず、ビルド時にディスクへ入れる。git には入れない（台帳 D9）。
 
-ビルド時、Makefile は `NVIDIA_FIRMWARE`（既定 `local/firmware/nvidia/615.78.08`、gitignore 済み）に
-`firmware/gsp_ga10x.bin` があれば `gsp_ga10x.bin`・`ucodes_ga10x.bin`・`LICENSE` を initrd へ入れる。
-**その手元の媒体はファームウェアを含むので配布しない。** 配布する媒体は `make NVIDIA_FIRMWARE=` で作る
-（そのときは利用者が `/data/firmware/nvidia/615.78.08/` へ置く）。
+ビルド時、Makefile は `NVIDIA_FIRMWARE`（既定 `local/firmware/nvidia/615.78.08`、gitignore 済み）のフォルダーが
+あれば、その `firmware/gsp_ga10x.bin`・`firmware/ucodes_ga10x.bin`・`LICENSE` を C: の上のフォルダーへ入れる
+（`scripts/layout.py`。3 つのどれかが欠けていればビルドは失敗する）。
+**その手元のディスクはファームウェアを含むので配布しない。** 配布するディスクは `make NVIDIA_FIRMWARE=` で作り、
+ファームウェアを含まない。
 
 ## ビルド
 
@@ -61,12 +62,13 @@ make -f ports/nvidia/nvrm.mk BUILD=build CC=clang LD=ld.lld nvrm-objs    # RM＋
 make -f ports/nvidia/nvrm.mk ... nvrm-undefined                           # 未定義シンボル一覧（build/nvrm/undefined.txt）
 ```
 
-トップの Makefile に取り込むときは、`include ports/nvidia/nvrm.mk` の後に次の規則を足す
+トップの Makefile は `include ports/nvidia/nvrm.mk` の後の次の規則で nvrm をリンクし、
+`scripts/layout.py` がそれを `C:\Nocturne\System\nvrm` に置く
 （RM の 1100 個のオブジェクトは `nv-kernel.o` に部分リンクされ、`memcpy`／`memset` は局所化される）。
 `NM`／`OBJCOPY` は binutils の `nm`／`objcopy`（この環境に llvm-nm／llvm-objcopy は無い）。
 
 ```make
-$(BUILD)/root/bin/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+$(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
@@ -94,14 +96,14 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 
 | RM が呼ぶ関数 | Nocturne での実装 |
 |---|---|
-| `nv_printf`、`nv_vprintf`、`nv_dev_vprintf`、`os_log_error`、`nv_log_error` | システムログ（`n_system_log_open`）と、`/data` があれば `/data/logs/nvrm.log`（`nvrm_log`）へ |
+| `nv_printf`、`nv_vprintf`、`nv_dev_vprintf`、`os_log_error`、`nv_log_error` | システムログ（`n_system_log_open`）と、nvrm のデータフォルダーの `nvrm.log`（`n_app_data_folder("NVIDIA")`、`C:\Users\<名前>\AppData\NVIDIA\nvrm.log`。`nvrm_log`）へ |
 | `os_alloc_mem`／`os_free_mem`、`os_mem_*`、`os_string_*`、`os_snprintf` ほか | `malloc`／`free`／libc の文字列関数（`os_alloc_mem` は 0 初期化しない。RM の約束どおり） |
 | `os_memcpy_from_user`／`to_user` | リクエストサーバーの `nvrm_user_translate`。クライアントの「引数の場」の中の番地だけを nvrm の番地へ読み替える。場の外は `NV_ERR_INVALID_ADDRESS`（台帳 D4） |
 | `os_get_system_time`、`os_get_monotonic_time_ns*`、`os_delay*`、`os_schedule` | `clock_info`（TSC）、`n_sleep_ms`、`thrd_yield`、`timespec_get` |
 | `os_alloc_mutex`／`os_acquire_mutex` ほか、`os_alloc_spinlock`、`os_alloc_semaphore`、`os_alloc_rwlock_*`、`os_alloc_wait_queue` | C11 の `mtx_t`／`cnd_t`。スピンロックも mutex（ISR も普通のスレッドのため）。待ち行列は `cnd_t`＋ラッチ |
 | `os_queue_work_item`、`os_flush_work_queue`、`os_is_queue_flush_ongoing` | 最大 8 本のワーカースレッド（`rm_execute_work_item`） |
 | `nv_start_rc_timer`／`nv_stop_rc_timer`、`nv_create_nano_timer` ほか | 1 本のタイマースレッド（1 Hz の RC、nano タイマー） |
-| `nv_get_firmware`／`nv_put_firmware` | `n_document_load`（上のフォルダー順。ログの追記は `n_document_append`） |
+| `nv_get_firmware`／`nv_put_firmware` | `n_document_load`（上のフォルダーから。ログの追記は `n_document_append`） |
 | `os_get_cpu_count`／`os_get_cpu_number`／`os_get_cpu_frequency` | `cpu_info`／`cpu_index` |
 | `os_get_current_process`／`_name`／`os_get_current_thread`、`os_get_euid`、`os_is_administrator`、`os_check_access` | 要求／cleanup はカーネルが送信時に認証した native app ID と非特権 TLS で実行。同じ app の別接続・thread は同じ主体。HELLO 後の全 message でも送信元を照合し、endpoint を別 app に渡しても偽装できない。daemon 自身の thread は daemon の PID と管理者権限 |
 | `os_pci_init_handle`、`os_pci_read_*`／`write_*` | `n_pci_config_read／write`。自分の機能だけ書ける。他の機能（上流ブリッジ）は読むだけ |

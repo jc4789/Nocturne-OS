@@ -12,7 +12,7 @@ import urllib.request
 import idna
 
 SOURCE = "https://publicsuffix.org/list/public_suffix_list.dat"
-DEST = Path(__file__).resolve().parents[1] / "rootfs/usr/share/browser/public_suffix_list.dat"
+DEST = Path(__file__).resolve().parents[1] / "rootfs/Nocturne/Web/public_suffix_list.dat"
 
 def convert(raw: bytes) -> tuple[bytes, int]:
     lines = []
