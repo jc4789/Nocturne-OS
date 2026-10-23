@@ -66,11 +66,6 @@ void pci_enable_busmaster(struct pci_device *d);
 /* Clear BME and confirm the same function still answers with BME off. Optionally report its
    previous BME state. This stops new Memory/I/O Requests, not a posted DMA drain. No wait. */
 bool pci_disable_busmaster(struct pci_device *d, bool *was_mastering);
-/* The longest a CPU read of an app driver's device may stall its CPU: the top of Completion
-   Timeout Range C (PCI Express Base 6.0, 7.5.3.16), which pci_cpu_reads_bounded keeps the Root
-   Port above the device to. mm/vmm.c waits that long for a CPU stalled in such a read. */
-#define PCI_CPU_READ_MAX_MS 3500
-bool pci_cpu_reads_bounded(const struct pci_device *d);
 int pci_count(void);
 struct pci_device *pci_at(int index);
 struct pci_device *pci_find_function(uint8_t bus, uint8_t dev, uint8_t func);

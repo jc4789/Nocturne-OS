@@ -646,53 +646,19 @@ static void rrs_release(struct pci_device *port) {
    1 s, what 6.6.1 gives a device before software may decide it is broken. A structure before
    version 2 has neither register: its function has the default value. */
 #define COMPLETION_FLOOR_MS 1000
-/* The top of the range each Completion Timeout Value selects (7.5.3.16), 0 for reserved ones. */
-static const unsigned completion_top_ms[16] = {[0x0] = 50, [0x1] = 1, [0x2] = 10, [0x5] = 55, [0x6] = 210,
-                                               [0x9] = 900, [0xA] = 3500, [0xD] = 13000, [0xE] = 64000};
 static unsigned completion_window_ms(const struct pci_device *d) {
+    static const unsigned top_ms[16] = {[0x0] = 50, [0x1] = 1, [0x2] = 10, [0x5] = 55, [0x6] = 210,
+                                        [0x9] = 900, [0xA] = 3500, [0xD] = 13000, [0xE] = 64000};
     static const uint8_t range_longest[4] = {0x2, 0x6, 0xA, 0xE};
     unsigned value = 0, ranges = 0;
     if (d->pcie_v2) {
         value = pci_read16(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCTL2) & 0xF;
         ranges = pci_read32(d->bus, d->dev, d->func, d->pcie_cap + PCIE_DEVCAP2) & 0xF;
     }
-    unsigned ms = completion_top_ms[value] ? completion_top_ms[value] : completion_top_ms[0xE];
+    unsigned ms = top_ms[value] ? top_ms[value] : top_ms[0xE];
     for (unsigned r = 0; r < 4; r++)
-        if ((ranges & (1u << r)) && completion_top_ms[range_longest[r]] > ms) ms = completion_top_ms[range_longest[r]];
+        if ((ranges & (1u << r)) && top_ms[range_longest[r]] > ms) ms = top_ms[range_longest[r]];
     return ms > COMPLETION_FLOOR_MS ? ms : COMPLETION_FLOOR_MS;
-}
-
-/* A CPU read of a function's memory BAR that gets no Completion ends when the Root Port above it
-   times the Request out (Completion Timeout, 7.5.3.15/16; the read then returns all ones). Until
-   then the CPU that issued it is stalled inside one instruction and takes no interrupt, so the
-   BSP's TLB shootdowns (mm/vmm.c) wait for it. An app driver reads its device from the APs while
-   the device may not answer for a while (a GPU whose firmware boots, resets an engine or retrains
-   its memory once bus mastering lets it run), so the port's timer must run and end within
-   PCI_CPU_READ_MAX_MS: Completion Timeout Disable (firmware may leave it set) is cleared, and a
-   value in Range D (4 s to 64 s) is lowered to the longest of Range C, or to the default range
-   (50 us to 50 ms) where the port has no Range C. A port without Device Control 2 (a structure
-   before version 2) has the default range; without a Root Port (an integrated endpoint) the root
-   complex's own timer applies, which no register here sets. False only for a Root Port that keeps
-   a longer or disabled timer. */
-bool pci_cpu_reads_bounded(const struct pci_device *d) {
-    struct pci_device *port = d->upstream;
-    while (port && !(port->pcie_cap && port->pcie_type == 4)) port = port->upstream;
-    if (!port || !port->pcie_v2) return true;
-    uint16_t at = port->pcie_cap + PCIE_DEVCTL2;
-    uint16_t ctl = pci_read16(port->bus, port->dev, port->func, at);
-    uint32_t ranges = pci_read32(port->bus, port->dev, port->func, port->pcie_cap + PCIE_DEVCAP2) & 0xF;
-    uint16_t want = ctl & ~PCIE_DEVCTL2_CT_DISABLE;
-    if (completion_top_ms[want & 0xF] > PCI_CPU_READ_MAX_MS || !completion_top_ms[want & 0xF])
-        want = (want & ~0xFu) | (ranges & 4 ? 0xA : 0x0);
-    if (want != ctl) {
-        pci_write16(port->bus, port->dev, port->func, at, want);
-        kprintf("pci: %02x:%02x.%u: Completion Timeout of Root Port %02x:%02x.%u set from %s%x to %x\n", d->bus,
-                d->dev, d->func, port->bus, port->dev, port->func, ctl & PCIE_DEVCTL2_CT_DISABLE ? "disabled, " : "",
-                ctl & 0xF, want & 0xF);
-    }
-    uint16_t now = pci_read16(port->bus, port->dev, port->func, at);
-    return !(now & PCIE_DEVCTL2_CT_DISABLE) && completion_top_ms[now & 0xF] &&
-           completion_top_ms[now & 0xF] <= PCI_CPU_READ_MAX_MS;
 }
 
 /* FLR must finish in 100 ms (6.6.2); device-specific initialization may then still return RRS.
