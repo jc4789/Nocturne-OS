@@ -823,26 +823,26 @@ static bool give(struct content *x, struct content *f, uint64_t limit) {
     return true;
 }
 
-/* f's pages move into x, over x's own (x is cut at limit first); f reads all through x meanwhile. */
+/* x's own bytes of pages [from, to) go: f's take their place. Its frames there would otherwise be
+   read before the blocks f brings (x is committed: they are on the medium). */
+static void shadow(struct content *x, uint64_t from, uint64_t to) {
+    uint64_t *e;
+    for (uint64_t p = from; (e = next_entry(x, &p)) && p < to; p++) {
+        page_gone(x, *e);
+        *e = 0;
+    }
+    uint64_t at = from * PAGE_SIZE, end = MIN(to * PAGE_SIZE, x->borrow_total);
+    if (x->borrow && from < pages_of(x->borrow_size) && at < end) initrd_unborrow(x->borrow + at, end - at);
+}
+
+/* f's pages move into x, over x's own (x is cut at limit first); f reads all through x meanwhile.
+   The blocks go first: f's frames, which may hold the same pages, then come over them. */
 static bool take(struct content *f, struct content *x, uint64_t limit) {
     cut_from(x, limit);
     f->base_limit = UINT64_MAX;
-    uint64_t *e;
-    for (uint64_t p = 0; (e = next_entry(f, &p)); p++) {
-        uint64_t *s = slot(x, p, true);
-        if (!s) return false;
-        if (*s) page_gone(x, *s);
-        if (x->borrow && p < pages_of(x->borrow_size)) {
-            uint64_t at = p * PAGE_SIZE;
-            initrd_unborrow(x->borrow + at, MIN(PAGE_SIZE, x->borrow_total - at));
-        }
-        *s = *e;
-        *e = 0;
-        f->resident--;
-        x->resident++;
-    }
     for (size_t i = 0; i < f->nruns; i++) {
         struct run *r = &f->runs[i];
+        shadow(x, r->page, r->page + r->count);
         if (set_runs(x, r->page, r->count, r->block, true) < 0) {
             prune_runs(f);
             return false;
@@ -850,6 +850,16 @@ static bool take(struct content *f, struct content *x, uint64_t limit) {
         r->count = 0;
     }
     f->nruns = 0;
+    uint64_t *e;
+    for (uint64_t p = 0; (e = next_entry(f, &p)); p++) {
+        shadow(x, p, p + 1);
+        uint64_t *s = slot(x, p, true);
+        if (!s) return false;
+        *s = *e;
+        *e = 0;
+        f->resident--;
+        x->resident++;
+    }
     x->size = f->size;
     return true;
 }

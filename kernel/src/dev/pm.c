@@ -117,8 +117,9 @@ const char *pm_quiesce_devices(bool stop_at_failure) {
     return stuck;
 }
 
+/* The volume's saves are on the disks before (pm_thread): after a hibernation's snapshot nothing
+   may be committed, the image has the machine as it was before any of it. */
 static NORETURN void finish(enum pm_action action) {
-    vfs_sync();    /* what was saved reaches its volume first */
     flush_disks(); /* a disk that fails is logged: the power goes off all the same */
     if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
     cli();
@@ -302,6 +303,7 @@ static void pm_thread(void *arg) {
             wm_notify(action == PM_REBOOT ? "Restarting" : "Shutting down",
                       action == PM_REBOOT ? "See you in a moment..." : "Good night!");
             stop_apps();
+            vfs_sync(); /* what was saved reaches its volume first */
             finish(action);
         }
         f = irq_save();

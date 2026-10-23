@@ -619,8 +619,10 @@ static int fat_truncate(struct vnode *v, uint64_t size) {
     return persist(fs, 0);
 }
 
-/* Writes go to the medium as they are made: a save waits for them there, and is done on return. */
-static int fat_save(struct vnode *v, uint64_t *ticket) {
+/* Writes and entries go to the medium as they are made: a save, with edits or not, waits for them
+   there and is done on return. */
+static int fat_save(struct vnode *v, bool edits, uint64_t *ticket) {
+    (void)edits;
     *ticket = 0;
     return persist(((struct fat_node *)v->priv)->fs, 0);
 }
@@ -932,7 +934,8 @@ static int fat_stage(struct vnode *dir, const char *name, struct vnode **out) {
 /* The staged chain reaches the medium before one directory-sector write makes the entry name it
    (a new entry, or the document's switched from its old chain); the old chain is freed only once
    that switch is on the medium too. A failure at any point leaves the old content in place. */
-static int fat_publish(struct vnode *s, uint64_t *ticket) {
+static int fat_publish(struct vnode *s, bool edits, uint64_t *ticket) {
+    (void)edits; /* a staged node is saved by publishing it */
     *ticket = 0;
     struct fat_node *sn = s->priv;
     struct fat_fs *fs = sn->fs;

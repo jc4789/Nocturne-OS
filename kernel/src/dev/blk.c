@@ -51,17 +51,25 @@ int blk_read(struct blkdev *d, uint64_t lba, uint32_t n, void *buf) {
     return r ? failed(d, "read", lba, n, r) : 0;
 }
 
+/* A write is marked once the device has it, and a persist clears the mark before it flushes: what
+   was written before a persist began is in its flush, and what lands during it is in the next. */
 int blk_write(struct blkdev *d, uint64_t lba, uint32_t n, const void *buf) {
     enter();
     int r = d->write(d, lba, n, buf);
+    d->unpersisted = true;
     leave();
     return r ? failed(d, "write", lba, n, r) : 0;
 }
 
+/* Nothing written since the last persist: the medium has it all already. */
 int blk_persist(struct blkdev *d) {
     if (!d->persist) return 0;
     enter();
-    int r = d->persist(d);
+    int r = 0;
+    if (d->unpersisted) {
+        d->unpersisted = false;
+        if ((r = d->persist(d))) d->unpersisted = true;
+    }
     leave();
     return r ? failed(d, "cache flush", 0, 0, r) : 0;
 }

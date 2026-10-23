@@ -58,9 +58,10 @@ struct vnode_ops {
     int (*stage)(struct vnode *dir, const char *name, struct vnode **out);
     /* Rename/move an entry within one filesystem; the target name must be free. */
     int (*move)(struct vnode *from_dir, const char *from, struct vnode *to_dir, const char *to);
-    /* Save the document's newest version (a staged one is published first). *ticket: what saved
-       waits for (0: nothing, it is on the medium or there is no medium). NULL: nothing to save. */
-    int (*save)(struct vnode *v, uint64_t *ticket);
+    /* Save the document as recorded so far and, with edits (the handle wrote since its last save),
+       its newest version (a staged one is published first). *ticket: what saved waits for to have
+       them on the medium (0: nothing, they are there or there is no medium). NULL: nothing to save. */
+    int (*save)(struct vnode *v, bool edits, uint64_t *ticket);
     /* The outcome of the save with ticket: 0 on the medium, an error, or -N_ERR_NOT_READY while it
        is on its way (wait: until it is known). NULL: saves are done when save returns. */
     int (*saved)(struct vnode *v, uint64_t ticket, bool wait);
@@ -109,7 +110,6 @@ struct vnode {
        NULL with it); the working one (NULL until something writes) */
     struct content *content, *head, *work;
     bool saving;                  /* a save is taking the working version */
-    uint64_t ticket;              /* the latest save's (0: nothing to wait for) */
     struct wait_queue save_wait;
     struct file *lease_owner;
     struct wait_queue lease_wait;

@@ -285,15 +285,19 @@ int vfs_truncate(struct file *f, uint64_t size) {
     return error;
 }
 
-/* Start saving the document f writes (a staged version is published). Caller holds f's I/O claim
-   or its last reference. */
+/* Start saving the document f writes (a staged version is published); with nothing new through it,
+   the document as recorded so far (made, renamed, saved by another handle) is what it waits for.
+   Caller holds f's I/O claim or its last reference. */
 static int save_start(struct file *f) {
     struct vnode *v = f->vn;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return 0; /* a reader saves nothing: its last save stands */
     bool staged = v->staged;
-    if (!f->written && !staged) return 0; /* nothing new through it: its last save stands */
     uint64_t ticket = 0;
-    int error = v->ops->save ? v->ops->save(v, &ticket) : 0;
-    if (error) return error;
+    int error = v->ops->save ? v->ops->save(v, f->written || staged, &ticket) : 0;
+    if (error) {
+        if (staged && !v->staged) f->written = true; /* published, not saved: still its to save */
+        return error;
+    }
     /* Published: the version is the document's now, and this handle (and its duplicates) has
        nothing left to write. */
     if (staged) f->flags = (f->flags & ~O_ACCMODE) | O_RDONLY;

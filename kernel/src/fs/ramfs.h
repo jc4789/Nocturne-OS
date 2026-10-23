@@ -26,8 +26,8 @@ struct ramfs_entry {
    BSP; only load, content and saved sleep. */
 struct ramfs_volume {
     const struct content_store *store;
-    /* Read in folder dir (recorded: dir->id): ramfs_found for each entry, ramfs_hidden for each
-       base item hidden from dir->origin. */
+    /* Read in folder dir: ramfs_found for each entry recorded in it (when it has an ID),
+       ramfs_hidden for each base item hidden from dir->origin (when it shows one). */
     int (*load)(struct ramfs_volume *vol, struct vnode *dir, struct ramfs_load *ld);
     /* The committed content of document v (recorded, not read in yet). */
     int (*content)(struct ramfs_volume *vol, struct vnode *v, struct content **out);
@@ -43,6 +43,8 @@ struct ramfs_volume {
     /* 0: the commit with ticket is on the medium; an error; -N_ERR_NOT_READY while it is on its
        way (wait: until it is known). */
     int (*saved)(struct ramfs_volume *vol, uint64_t ticket, bool wait);
+    /* The ticket for v as recorded so far: its entry and its saves (0: nothing was). */
+    uint64_t (*recorded)(struct ramfs_volume *vol, struct vnode *v);
     /* Everything recorded so far is committed (waits). */
     int (*sync)(struct ramfs_volume *vol);
     /* Document v (recorded, empty, committed) gets blocks for size bytes: *out is the version

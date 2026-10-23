@@ -70,7 +70,9 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     `N_COMMIT_START` はすぐ戻り、届いたら（失敗も）イベント待ち行列で監視している
     ハンドルに `N_EVENT_SAVED` が来る。`N_COMMIT_RESULT` は最後に始めた保存の結果
     （まだなら `N_ERR_NOT_READY`）。結果を読むと `N_EVENT_SAVED` は報告されなくなる。
-    書いたハンドルの `n_handle_close` は `N_COMMIT_WAIT` と同じ。`READ` のハンドルは
+    書いていない書込み用ハンドルの保存は、文書のそれまでの記録（作成、名前変更、別の
+    ハンドルの保存）が届くのを待つ。`READ` のハンドルの保存は何もせず待たない。
+    `n_handle_close` は `N_COMMIT_WAIT` と同じ保存をしてから閉じる。`READ` のハンドルは
     開いた時点で最後に保存された版を読み続ける（docs/nosfs.md §3）。
   - `n_document_read_at(h, offset, buf, n)`、`n_document_write_at(h, offset, buf, n)`、
     `n_document_size(h)`、`n_document_set_size(h, size)`。**共有カーソル（シーク位置）は無い**。
@@ -172,7 +174,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - `n_events_create()` が待ち行列を作る。各スレッドは任意の数を持てる。
 - `n_events_watch(q, h, interest, token)`：ハンドルの関心事を登録。
   `N_EVENT_RECEIVABLE`（メッセージ、窓の入力、接続要求、受信データ）、`N_EVENT_SENDABLE`、
-  `N_EVENT_CLOSED`、`N_EVENT_APP_ENDED`。同じハンドルと同じ token の再登録は関心事の変更。
+  `N_EVENT_CLOSED`、`N_EVENT_APP_ENDED`、`N_EVENT_SAVED`（`N_COMMIT_START` で始めた保存の
+  結果が出た文書）。同じハンドルと同じ token の再登録は関心事の変更。
   待ち行列を待ち行列に入れることはできない（`N_ERR_WRONG_KIND`）。
 - 報告は状態に基づく（レベル）。準備ができたままのハンドルは毎回の待ちで報告される。
 - 監視はハンドルを保持しない。ハンドルが最後に閉じられると監視も消える。

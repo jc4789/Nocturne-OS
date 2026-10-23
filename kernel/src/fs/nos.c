@@ -828,7 +828,9 @@ static int put_extent(uint64_t id, uint64_t page, uint64_t block, uint64_t count
 }
 
 /* Pages [page, end) of document id are at the blocks from block on (0: nowhere). What the index
-   named there before is let go of; the version that has those blocks drops them later. */
+   named there before is let go of; the version that has those blocks drops them later.
+   A step that fails leaves the index naming each page where it did (the tail may be named twice,
+   the same way), so a failed commit's retry finds the extent again and ends where this would. */
 static int extents_set(uint64_t id, uint64_t page, uint64_t end, uint64_t block) {
     for (;;) {
         uint64_t s;
@@ -839,10 +841,10 @@ static int extents_set(uint64_t id, uint64_t page, uint64_t end, uint64_t block)
             break;
         }
         uint64_t from = MAX(s, page), to = MIN(s + e.count, end);
-        if ((r = tree_del(ext_key(id, s)))) return r;
-        if (s < page && (r = put_extent(id, s, e.block, page - s))) return r;
-        if (s + e.count > end && (r = put_extent(id, end, e.block + (end - s), s + e.count - end))) return r;
         if ((r = mark(e.block + (from - s), to - from, B_UNINDEX))) return r;
+        if (s + e.count > end && (r = put_extent(id, end, e.block + (end - s), s + e.count - end))) return r;
+        r = s < page ? put_extent(id, s, e.block, page - s) : tree_del(ext_key(id, s));
+        if (r) return r;
     }
     if (!block) return 0;
     int r = put_extent(id, page, block, end - page);
@@ -859,26 +861,35 @@ static uint8_t entry_buf[sizeof(struct entry_rec) + NAME_MAX_LEN + PATH_MAX_LEN 
 
 struct seq_ctx {
     const char *path; /* hides: the one looked for */
+    uint64_t id;      /* entries: the document's */
     uint64_t next;
+    struct key at;
     bool found;
 };
 
 static int seq_visit(void *ctx, struct key k, const uint8_t *val, uint16_t len) {
     struct seq_ctx *c = ctx;
-    if (c->path && len == strlen(c->path) && !memcmp(val, c->path, len)) {
+    if (c->path ? len == strlen(c->path) && !memcmp(val, c->path, len) :
+                  len >= sizeof(struct entry_rec) && ((const struct entry_rec *)val)->id == c->id) {
         c->found = true;
+        c->at = k;
         return 1;
     }
     if ((k.b & SEQ_MAX) == c->next) c->next++;
     return 0;
 }
 
-/* The first key of bucket (a, b) nothing uses (hides: *found when path is there already). */
-static int bucket_free(uint64_t a, uint64_t b, const char *path, struct key *out, bool *found) {
-    struct seq_ctx c = {path, 0, false};
+/* The key in bucket (a, b) for hide path or entry id: the one it has there already (*found), else
+   the first one nothing uses. */
+static int bucket_key(uint64_t a, uint64_t b, const char *path, uint64_t id, struct key *out, bool *found) {
+    struct seq_ctx c = {path, id, 0, {0, 0}, false};
     int r = scan((struct key){a, b}, (struct key){a, b | SEQ_MAX}, seq_visit, &c);
     if (r) return r;
-    if (found) *found = c.found;
+    *found = c.found;
+    if (c.found) {
+        *out = c.at;
+        return 0;
+    }
     if (c.next > SEQ_MAX) return -N_ERR_NO_SPACE;
     *out = (struct key){a, b | c.next};
     return 0;
@@ -919,13 +930,17 @@ static int apply_item(struct item *it) {
     memcpy(at + nl, it->origin, ol);
     memcpy(at + nl + ol, tiny, e->tiny_len);
     uint16_t len = sizeof *e + nl + ol + e->tiny_len;
-    bool same = old && was.a == it->parent && o->name_len == nl && !memcmp(old + sizeof *o, it->name, nl);
-    if (same) return tree_put(was, entry_buf, len);
-    if (old && (r = tree_del(was))) return r;
-    struct key k;
-    if ((r = bucket_free(it->parent, KIND(K_ENTRY) | (uint64_t)fnv32(it->name) << 24, NULL, &k, NULL)) ||
-        (r = tree_put(k, entry_buf, len)))
+    /* The entry keeps its key while it stays in its bucket. A new key is put before the old one
+       goes: a commit that fails in between leaves both, and its retry finds the new one by the ID
+       and ends the same way (the old one still has what the entry had). */
+    uint64_t bucket = KIND(K_ENTRY) | (uint64_t)fnv32(it->name) << 24;
+    struct key k = was;
+    bool found;
+    if ((!old || was.a != it->parent || (was.b & ~SEQ_MAX) != bucket) &&
+        (r = bucket_key(it->parent, bucket, NULL, v->id, &k, &found)))
         return r;
+    if ((r = tree_put(k, entry_buf, len))) return r;
+    if (old && kcmp(k, was) && (r = tree_del(was))) return r;
     v->entry_dir = k.a;
     v->entry_pos = k.b;
     return 0;
@@ -945,7 +960,7 @@ static int apply_hide(const char *path) {
     const char *name = path_split(path, folder);
     struct key k;
     bool found;
-    int r = bucket_free(fnv64(folder), KIND(K_HIDE) | (uint64_t)fnv32(name) << 24, path, &k, &found);
+    int r = bucket_key(fnv64(folder), KIND(K_HIDE) | (uint64_t)fnv32(name) << 24, path, 0, &k, &found);
     return r || found ? r : tree_put(k, path, strlen(path));
 }
 
@@ -1411,7 +1426,9 @@ static int nos_load(struct ramfs_volume *vol, struct vnode *dir, struct ramfs_lo
     (void)vol;
     char folder[PATH_MAX_LEN];
     tree_lock();
-    int r = scan((struct key){dir->id, KIND(K_ENTRY)}, (struct key){dir->id, KIND(K_ENTRY + 1) - 1}, entry_visit, ld);
+    int r = dir->id ? scan((struct key){dir->id, KIND(K_ENTRY)}, (struct key){dir->id, KIND(K_ENTRY + 1) - 1},
+                           entry_visit, ld)
+                    : 0;
     if (!r && dir->origin && !(r = ramfs_base_path(dir->origin, folder, sizeof folder))) {
         struct hide_ctx h = {ld, folder};
         uint64_t a = fnv64(folder);
@@ -1527,6 +1544,12 @@ static int nos_saved(struct ramfs_volume *vol, uint64_t ticket, bool wait) {
     }
     irq_restore(fl);
     return r;
+}
+
+/* The commit v's newest change is in: a failed one's changes move to the next (carry). */
+static uint64_t nos_recorded(struct ramfs_volume *vol, struct vnode *v) {
+    (void)vol;
+    return v->vol_txn;
 }
 
 static int nos_sync(struct ramfs_volume *vol) {
@@ -1675,10 +1698,27 @@ static bool overlaps(const struct part *p, uint64_t start, uint64_t end) {
     return p->type && p->type != TYPE_NOS && p->sectors && p->start < end && p->start + (uint64_t)p->sectors > start;
 }
 
-/* 1: d's volume is mounted; 0: d has none; an error: it has one that cannot be used. */
+static bool head_mark(const uint8_t *blk) { return !memcmp(((const struct head *)blk)->magic, "NOSfs\0\0\0", 8); }
+
+/* Where a volume is made on a disk with this MBR: Nocturne's own disks only, its boot medium past
+   the boot partition (with room for a larger image) or an empty data disk. 0: none is made there. */
+static uint64_t made_at(const uint8_t *mbr) {
+    uint32_t sig = *(const uint32_t *)(mbr + 440);
+    const struct part *pt = (const struct part *)(mbr + 446);
+    bool table = mbr[510] == 0x55 && mbr[511] == 0xAA;
+    uint64_t end = 0;
+    for (int p = 0; table && p < 4; p++)
+        if (pt[p].type) end = MAX(end, (uint64_t)pt[p].start + pt[p].sectors);
+    if (sig == SIG_NOCT && end) return ALIGN_UP(MAX(2 * end, end + GAP_SECTORS), 2048);
+    if (sig == SIG_DATA && !end) return 2048;
+    return 0;
+}
+
+/* 1: d's volume is mounted; 0: d has none; an error: it has one that cannot be used, or what d
+   has cannot be read. Nothing is made after an error: the volume could be where it would go. */
 static int find(struct blkdev *d) {
     uint8_t mbr[512], *b = nos.bounce;
-    if (blk_read(d, 0, 1, mbr) < 0) return 0;
+    if (blk_read(d, 0, 1, mbr) < 0) return -N_ERR_IO;
     struct part *pt = (struct part *)(mbr + 446);
     bool table = mbr[510] == 0x55 && mbr[511] == 0xAA;
     for (int p = 0; table && p < 4; p++) {
@@ -1689,20 +1729,34 @@ static int find(struct blkdev *d) {
         }
         return mount(d, b);
     }
-    /* the copy at the end: the partition table was written over (a boot image put on the disk again) */
-    uint64_t end = d->sectors & ~7ull;
-    if (end < 2 * SECTORS || blk_read(d, end - SECTORS, SECTORS, b) < 0) return 0;
+    /* No entry: the partition table was written over (a boot image put on the disk again). The
+       copy of the head at the end says where the volume is; without one, the head is looked for
+       where a volume is made. A head or copy that is there but damaged is never taken for none. */
+    uint64_t end = d->sectors & ~7ull, start = 0;
+    if (end < 2 * SECTORS) return 0;
+    if (blk_read(d, end - SECTORS, SECTORS, b) < 0) return -N_ERR_IO;
     const struct head *h = (const void *)b;
-    uint64_t start = h->first_lba;
-    if (!sealed(b) || memcmp(h->magic, "NOSfs\0\0\0", 8) || start >= end || !head_valid(b, start, d->sectors) ||
-        start + h->blocks * SECTORS != end)
-        return 0;
+    if (head_mark(b)) {
+        start = h->first_lba;
+        if (start >= end || !head_valid(b, start, d->sectors) || start + h->blocks * SECTORS != end) {
+            kprintf("nos: %s: the copy of a volume's head at the end is damaged\n", d->name);
+            return -N_ERR_IO;
+        }
+    } else {
+        start = made_at(mbr);
+        if (!start || start + 2 * SECTORS > end) return 0;
+        if (blk_read(d, start, SECTORS, b) < 0) return -N_ERR_IO;
+        if (!head_mark(b)) return 0;
+    }
     for (int p = 0; table && p < 4; p++)
         if (overlaps(&pt[p], start, end)) {
             kprintf("nos: %s: partition %d lies over the volume at sector %lu\n", d->name, p + 1, start);
             return -N_ERR_IO;
         }
-    if (blk_read(d, start, SECTORS, b) < 0 || !head_valid(b, start, d->sectors)) return -N_ERR_IO;
+    if (blk_read(d, start, SECTORS, b) < 0 || !head_valid(b, start, d->sectors)) {
+        kprintf("nos: %s: the volume's head at sector %lu cannot be read\n", d->name, start);
+        return -N_ERR_IO;
+    }
     int r = mount(d, b);
     if (r > 0) mbr_add(d, start, nos.hd.blocks);
     return r;
@@ -1793,23 +1847,14 @@ static int format(struct blkdev *d, uint64_t start) {
     return r < 0 ? r : 0;
 }
 
-/* Only Nocturne's own disks get a volume: its boot medium (past the boot partition, with room for
-   a larger image) or an empty data disk. 1: made and mounted. */
+/* A volume where made_at says, on a disk find saw none on. 1: made and mounted. */
 static int create(struct blkdev *d) {
     uint8_t mbr[512];
-    if (blk_read(d, 0, 1, mbr) < 0) return 0;
-    uint32_t sig = *(uint32_t *)(mbr + 440);
-    struct part *pt = (struct part *)(mbr + 446);
-    bool table = mbr[510] == 0x55 && mbr[511] == 0xAA;
-    uint64_t end = 0, start;
-    for (int p = 0; table && p < 4; p++)
-        if (pt[p].type) end = MAX(end, (uint64_t)pt[p].start + pt[p].sectors);
-    if (sig == SIG_NOCT && end) start = ALIGN_UP(MAX(2 * end, end + GAP_SECTORS), 2048);
-    else if (sig == SIG_DATA && !end) start = 2048;
-    else return 0;
-    uint64_t last = d->sectors & ~7ull;
+    if (blk_read(d, 0, 1, mbr) < 0) return -N_ERR_IO;
+    uint64_t start = made_at(mbr), last = d->sectors & ~7ull;
+    if (!start) return 0;
     if (start >= last || (last - start) / SECTORS < MIN_BLOCKS) {
-        kprintf("nos: %s: no room for a volume past sector %lu\n", d->name, end);
+        kprintf("nos: %s: no room for a volume from sector %lu\n", d->name, start);
         return 0;
     }
     int r = format(d, start);
@@ -1821,18 +1866,27 @@ static int create(struct blkdev *d) {
 }
 
 bool nos_attach(void) {
-    nos.vol = (struct ramfs_volume){&store,    nos_load,  nos_content, nos_changed, nos_hide,
-                                    nos_save,  nos_saved, nos_sync,    nos_reserve, nos_extents};
+    nos.vol = (struct ramfs_volume){.store = &store,       .load = nos_load,         .content = nos_content,
+                                    .changed = nos_changed, .hide = nos_hide,         .save = nos_save,
+                                    .saved = nos_saved,     .recorded = nos_recorded, .sync = nos_sync,
+                                    .reserve = nos_reserve, .extents = nos_extents};
     nos.bounce = kmalloc(BOUNCE * BS);
-    int found = 0;
-    bool made = false;
-    for (int i = 0; nos.bounce && i < blk_count() && !found; i++) found = find(blk_get(i));
-    for (int i = 0; nos.bounce && i < blk_count() && !found; i++) made = (found = create(blk_get(i))) > 0;
-    if (found <= 0) {
+    bool found = false, made = false, doubt = false; /* doubt: a disk find could not settle */
+    for (int i = 0; nos.bounce && i < blk_count() && !found; i++) {
+        int r = find(blk_get(i));
+        found = r > 0;
+        doubt |= r < 0;
+    }
+    for (int i = 0; nos.bounce && i < blk_count() && !found && !doubt; i++) {
+        int r = create(blk_get(i));
+        found = made = r > 0;
+        doubt |= r < 0;
+    }
+    if (!found) {
         kfree(nos.bounce);
         nos.bounce = NULL;
         ramfs_attach(NULL, 0);
-        kprintf("nos: no volume: / is not persistent\n");
+        kprintf("nos: no volume%s: / is not persistent\n", doubt ? " (one cannot be used, none is made)" : "");
         return false;
     }
     ramfs_attach(&nos.vol, ID_ROOT);

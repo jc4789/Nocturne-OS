@@ -262,7 +262,8 @@ static int dir_load(struct vnode *dir) {
     if (!mine) return 0;
     struct ramfs_load ld = {.dir = dir};
     vnode_ref(dir);
-    int r = dir->vol && dir->id ? dir->vol->load(dir->vol, dir, &ld) : 0;
+    /* a base folder the volume never recorded can still have items of it hidden */
+    int r = dir->vol && (dir->id || dir->origin) ? dir->vol->load(dir->vol, dir, &ld) : 0;
     if (!r && dir->origin) r = show_base(&ld);
     for (size_t i = 0; i < ld.count; i++) kfree(ld.hidden[i]);
     kfree(ld.hidden);
@@ -519,14 +520,15 @@ void ramfs_saved(struct vnode *v, struct content *c, int error) {
 }
 
 /* The working version becomes the newest a save took (frozen), and the volume commits it; edits
-   meanwhile go to a new working version on top of it. A save the volume refuses changes nothing. */
-static int ram_save(struct vnode *v, uint64_t *ticket) {
+   meanwhile go to a new working version on top of it. A save the volume refuses changes nothing.
+   Without edits (or none to take) the ticket is the one for the document as recorded so far. */
+static int ram_save(struct vnode *v, bool edits, uint64_t *ticket) {
     *ticket = 0;
     if (v->type != VT_FILE) return 0;
     wait_saving(v);
     struct content *f = v->work, *was = v->head;
-    if (!f) {
-        *ticket = v->ticket;
+    if (!edits || !f) {
+        if (v->vol) *ticket = v->vol->recorded(v->vol, v);
         return 0;
     }
     v->saving = true;
@@ -547,7 +549,6 @@ static int ram_save(struct vnode *v, uint64_t *ticket) {
             was = NULL;
         }
     }
-    if (!r) v->ticket = *ticket;
     content_unref(was);
     uint64_t fl = irq_save();
     v->saving = false;
@@ -576,7 +577,6 @@ static int ram_reserve(struct vnode *v, uint64_t size) {
         content_unref(v->head);
         v->head = c;
         v->size = size;
-        v->ticket = ticket;
     }
     uint64_t fl = irq_save();
     v->saving = false;
@@ -658,15 +658,16 @@ static int staged_truncate(struct vnode *s, uint64_t size) {
     return r;
 }
 
-static int staged_save(struct vnode *s, uint64_t *ticket) {
+static int staged_save(struct vnode *s, bool edits, uint64_t *ticket) {
     struct vnode *t = s->priv;
-    if (!s->staged) return ram_save(t, ticket); /* published before; its save failed */
+    if (!s->staged) return ram_save(t, edits, ticket); /* published before; its save failed */
     if (t ? t->unlinked : s->parent->unlinked) return -N_ERR_NOT_FOUND;
     if (!t) {
         int r = ram_create(s->parent, s->name, VT_FILE, &t);
         if (r) return r;
         vnode_ref(t);
         s->priv = t;
+        vfs_poll_notify(s); /* its watchers watch the document from now on (staged_poll_register) */
     }
     int r = loaded(t); /* the version replaced lets go of its blocks */
     if (r) return r;
@@ -676,7 +677,7 @@ static int staged_save(struct vnode *s, uint64_t *ticket) {
     t->size = content_size(s->content);
     t->mtime = time_now();
     s->staged = false;
-    return ram_save(t, ticket);
+    return ram_save(t, true, ticket);
 }
 
 static int staged_saved(struct vnode *s, uint64_t ticket, bool wait) { return ram_saved(s, ticket, wait); }

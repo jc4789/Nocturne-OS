@@ -1680,7 +1680,7 @@ static int64_t sys_events_create(void) {
 }
 
 static int64_t sys_events_watch(int q, int h, uint32_t interest, uint64_t token) {
-    const uint32_t known = N_EVENT_RECEIVABLE | N_EVENT_SENDABLE | N_EVENT_CLOSED | N_EVENT_APP_ENDED;
+    const uint32_t known = N_EVENT_RECEIVABLE | N_EVENT_SENDABLE | N_EVENT_CLOSED | N_EVENT_APP_ENDED | N_EVENT_SAVED;
     if (!interest || (interest & ~known)) return -N_ERR_INVALID;
     int64_t r;
     struct file *queue = events_ref(q, &r);
