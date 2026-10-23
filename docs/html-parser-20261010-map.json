@@ -1,0 +1,138 @@
+{
+  "summary": "既存Lexbor/native DOMを保全したHTML入力・木構築・JS API・Sanitizer/Trusted Types統合。20261011にDOCTYPE/srcdoc、4 scripting mode、協調yield、差分同期、stream世代、安全な取消後描画回復を拡張。外部fragment DSDの偽OOM回帰修理後、ユーザー許可でDOM clone/import registryと共通CSS寸法を追加修理。段階別媒体を区別して受入中。旧HTML5test得点を目的とする退行はしない。",
+  "areas": [
+    {
+      "path": "user/libc/web/html_lexbor.c",
+      "purpose": "バイトデコード、DOMString入力、script境界、断片文脈"
+    },
+    {
+      "path": "user/libc/web/html_lexbor_bridge.c",
+      "purpose": "native identityを維持した解析木の差分同期"
+    },
+    {
+      "path": "user/libc/web/js.c",
+      "purpose": "JS/native公開APIとscript/task統合"
+    },
+    {
+      "path": "user/libc/web/js_custom_elements.js",
+      "purpose": "既存CE反応・FACEの拡張"
+    },
+    {
+      "path": "third_party/lexbor/source/lexbor/html",
+      "purpose": "局所tree hookと新template木構築"
+    },
+    {
+      "path": "tests",
+      "purpose": "製品経路の回帰・新規契約試験"
+    },
+    {
+      "path": "scripts/platform_qa.py",
+      "purpose": "隔離WHPX guestで実サイト、console、trusted hover/click後のfocus ACKと実キー入力・スクロールを観測"
+    },
+    {
+      "path": "user/libc/web/html_encoding.c",
+      "purpose": "BOM/HTTP/prescan復号とtentative encoding再解析"
+    },
+    {
+      "path": "user/libc/web/html_policy.c",
+      "purpose": "native CSPヘッダ/metaとprivate policy snapshot"
+    },
+    {
+      "path": "user/libc/web/js_html_safety.js",
+      "purpose": "Sanitizer・Trusted Types・HTML更新API"
+    },
+    {
+      "path": "user/libc/web/js_pi_native.h",
+      "purpose": "native PI順序付き属性map"
+    },
+    {
+      "path": "user/apps/browserjsworker.c",
+      "purpose": "Workerのnative CSPとTrusted Types"
+    },
+    {
+      "path": "third_party/img/jebp.h",
+      "purpose": "共通WebP losslessデコード。paletteのceil幅・alpha差分累積・不正stream拒否"
+    },
+    {
+      "path": "user/libc/web/doc.c",
+      "purpose": "parser/native node寿命、文書状態、layoutの所有・取消後の描画回復"
+    },
+    {
+      "path": "docs/html-parser-20261011-work.md",
+      "purpose": "今回のmedium協調契約、変更前後の観測、失敗・訂正理由、媒体・残件"
+    },
+    {
+      "path": "user/libc/web/dom.c",
+      "purpose": "native clone/import/adoptionのregistry fallbackとtemplate/Shadow所有境界"
+    },
+    {
+      "path": "user/libc/web/layout.c",
+      "purpose": "replaced自然比、浮動／匿名blockの％参照、flex絶対静的位置とused auto margin"
+    },
+    {
+      "path": "user/libc/web/cssprop.c",
+      "purpose": "native計算長さASTのserializationと疎な取消点・失敗rollback"
+    },
+    {
+      "path": "user/libc/webnet.c",
+      "purpose": "既存worker通信。debug数値のみの特権診断除去と要求世代・本文/header/Cookie寿命"
+    }
+  ],
+  "facts": [
+    {
+      "claim": "html_resumeはscript境界でnative木を公開し、再開前にJS編集をexportする",
+      "evidence": "user/libc/web/html_lexbor.c"
+    },
+    {
+      "claim": "build.pyは同梱MSYS2でmakeを実行し、platform_qaは隔離bootのRAM・解像度・acceleratorを指定できる",
+      "evidence": "scripts/platform_qa.py"
+    },
+    {
+      "claim": "HTML解析結果はDONE/SCRIPT/INPUT_WAIT/YIELD/FAILED/CANCELLEDを分離し、同期入口は一般作者taskなしでYIELDをpumpする",
+      "evidence": "user/libc/web/html_lexbor.c; user/libc/web/webi.h"
+    },
+    {
+      "claim": "fragmentはallocation/registryのtargetとtokenizer/compat/scriptingのcontextを分離し、閉鎖tokenだけをscript実行候補にする",
+      "evidence": "user/libc/web/html_lexbor.c; user/libc/web/html_lexbor_bridge.c; user/libc/web/js_html_safety_host.h"
+    },
+    {
+      "claim": "bridgeはLexbor/private native subscriptionとdirty worklistを使い、fields準備後にcoherentリンクを公開する。全DOM走査が全て消えたわけではない",
+      "evidence": "user/libc/web/html_lexbor_bridge.c; user/libc/web/dom.c; user/libc/web/doc.c"
+    },
+    {
+      "claim": "coherent parser commitは実変更だけを他parser subscriptionへ公開し、isolated Shadow/templateの最終ownerをhost依存で解決する。fragmentのunbound external target hostは合法なnative owner境界であり解析木へ混ぜない",
+      "evidence": "user/libc/web/html_lexbor_bridge.c; tests/parserdeduptest.c; tests/lexbortest.c; tests/js_html_safety_cases.js"
+    },
+    {
+      "claim": "取消後の描画回復は作者・parser callback・layout・parallel workerのunwind/join後の外側境界だけで実行し、作者と中断parserを再開せずcoherent DOMからstyle/boxを再構築する",
+      "evidence": "user/libc/web/doc.c; user/libc/web/js.c; user/libc/web/paint.c; tests/parserdeduptest.c"
+    },
+    {
+      "claim": "Shadow CSS容量回帰はsnapshot cssmemと一意外部cached AST arenaの実allocatedを計数し、元の16MiB超/32MiB以内の条件を維持する",
+      "evidence": "tests/shadowtest.c; user/libc/web/webi.h; user/libc/web/doc.c"
+    }
+  ],
+  "contracts": [
+    "root: WebPクラッシュ修理・native統合・生成binding・全build/媒体・guest/real-site/console/実操作の独立受入",
+    "parser_fix: HTML mode/入力/yield/取消/fragment、取消後の外側native描画回復。共有doc/js責務は主担当と合意して編集",
+    "bridge_fix: Lexbor/private native subscription、差分worklist、identity/namespace/registry/ownerと寿命",
+    "script_fix: fragment実行規則、stylesheet待ち、document.open/TT再入とscript/resource世代",
+    "既存GUI-first/RAM-root/data semanticsを変更しない。既存検査を削除せず、失敗/未確認を成功扱いしない。"
+  ],
+  "tests": [
+    "python -X utf8 scripts/build.py -j 8 all",
+    "isolated tests and platform_qa with WHPX 4096MiB 1920x1080x32"
+  ],
+  "unknowns": [
+    "adoption-cssom媒体の正規allと全配布媒体内部一致は確認。native29群／実Amazon・Reddit受入中。CSSOM実insetを公開した後も作者inline負leftと空menuが残るためgeometry境界を調査。旧SVG exact prototype期待1失敗を保全し現行継承契約へ訂正中。",
+    "build-final媒体はguest20群と別寿命2群とも全合格。後続body-registry媒体は13合格/3失敗。新CE2/XHR4と基準JS19/worker6を区別し、次のinert初期値/XHR null/frame/浮動高さ修理へ旧成功を流用しない。",
+    "com/coは修理前最新媒体で採点・遷移/戻る/F5成立。.co Divide errorは共通WebP幅0修理で解消。現行PIと旧HTML5test comment期待の不一致は偽装しない。",
+    "float-flat-tree媒体のAmazon検索screen7/10/12で指定3商品bitmap、実検索・上下899→0・戻る/F5を主担当目視。ホーム自然855×1368画像も298×477へ復旧。Redditは実menuclick・feed・上下/F5成立、offsetParentはheaderへ繋がったがtooltip左端/menu本体欠落と次page読込error残る。CSSOM実insetとinert template内容clone→挿入直後CEupgrade境界を修理中。OpenAI WebGL/fontとサイト資源失敗は未解消。",
+    "厳密な同負荷性能比較とHyper-V実機は未確認。一般CSP source-list/XML parser/Reporting API report-toの未対応は今回変更で完成したとしない。"
+  ],
+  "inventory_exclusions": [
+    "tools/ is unchanged bundled MSYS2/toolchain; scripts/jspace_html_control.py excludes it from inventory, not source/evidence gates. Original controller state is retained under build/."
+  ],
+  "execution": "collaborative",
+  "level": "medium"
+}

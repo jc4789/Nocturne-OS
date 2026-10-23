@@ -1,0 +1,13 @@
+# 百度初期表示：別の第二考察
+
+第一追加報の最弱前提は「圧縮不足だけで白い1分を説明する」ことである。原homeはCSRで本文生成前が空でも、遅い取得、script compile/execute、作者Fetch、native DOM/CSS/layout、描画待ちが別々に存在する。identityからgzipへの約3.6倍のbyte削減は原資源の事実であり、Nocturne実表示の同倍率高速化ではない。
+
+主担当の今回比較前1VMでは、本文とhero画像が別の段階で出る。screen-0/1/2のbootをsite白画面と取り違えかけたため、主担当の時計・serial・後続原画像を照合して訂正した。screen-3/5は自分で見たが、主担当の確認を代行したとは言わない。35秒hero完成も完全な速度受入ではない。
+
+gzipを広告してもdecoderが本当に4MB脚本を読めなければ新しい互換性回帰になる。既存製品C decoderを元資源の実gzipに直接使い、4096BのHTTP reader境界、CRC/終端、復号bytesの一致を確認した。新decoderやサイト専用の展開経路を作らず、未支持codingを要求しない。Rangeをgzipにするとbyte offsetsの意味が変わるためidentityを保持する。作者へforbidden header権限を渡さない。
+
+stylesheet load gateの単純削除も反例だった。親CSSのresponse bytesだけ到着してchild import未到着なら、link.onloadで作者が寸法を読む時点が早すぎる。既存のimmutable AST／document-owned import traversalに、そのrootの未完了fetch判定を接続し、共有importの場合は各rootから同じ未完了cacheを確認する。FIFOの応答順や単一root所有番号に頼らない。全CSSを待つ代わりに正しい依存だけを待つ。
+
+完了時刻のdebug観測値はGUIがpumpへ戻れなかった期間も含むため、TCP／server遅延へ一律帰属しない。native taskとcompileの既存計時と併読し、default実行への常時clockを増やしていない。並列job累積値やCPU maskだけで速くなったとしない。
+
+主担当は記事のtoo many open filesをkernel UDP固定pool／所有・世代・FD寿命から別に修理中。gzipやCSS event成功を、この資源失敗や画像hover回帰の修理にすり替えない。新native owner fixture、最新helperを入れた完全媒体、同条件実site時系列・入力・上下scrollの結果を待ち、失敗した境界だけ次に直す。

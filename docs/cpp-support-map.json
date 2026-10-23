@@ -1,0 +1,29 @@
+{
+  "summary": "J-space medium。既存CとC++20を併用するホストclangビルドと、実Nocturneでの実行を追加。主担当が統合し、標準ライブラリと起動ABIを分担。",
+  "areas": [
+    {"path": "Makefile", "purpose": "既存Cと分離したC++コンパイル・リンク、正規initrdと全媒体生成"},
+    {"path": "scripts/build_cxx.py", "purpose": "ホストLLVMと指定llvm-projectのlibc++をNocturne用に構築"},
+    {"path": "user/libc/sys.c", "purpose": "C/C++共通起動と終了処理。既存Cアプリ・TinyCCとの互換を保全"},
+    {"path": "user/libc/cxxabi.cpp", "purpose": "ネイティブC++割当・静的初期化のABI"},
+    {"path": "user/user.ld", "purpose": "コンストラクターと終了配列の保持"},
+    {"path": "user/cxx.ld", "purpose": "C++だけで未対応ELF TLSをリンク時に拒否"},
+    {"path": "user/include", "purpose": "C ABIを維持するC++互換ヘッダーとlibc++構成"},
+    {"path": "user/apps/cppdemo.cpp", "purpose": "標準コンテナー・RAII・C GUI APIを使う実アプリとランタイム確認"}
+  ],
+  "contracts": [
+    "現在のCコンパイル旗、RAM-root、/data永続、/data/bin PATHを維持する。",
+    "外部llvm-projectとProgram Files LLVMは読取のみ。LLVM本体はOSへ移植しない。",
+    "初期C++構成は例外・RTTIなし。実物libc++を使用する。"
+  ],
+  "tests": [
+    "最終全媒体ビルド成功。実行済みkernel・initrd・cppdemoとのSHA-256一致。",
+    "隔離QEMUのC++ランタイムと既存C/TinyCC/GUI/メモリーの7検査がPASS、失敗0、skip0。",
+    "主担当がC++ GUIのEnter入力による個数5・合計15、Esc終了、既存C電卓の1+2=3を目視。",
+    "ELF thread_local負例はリンク時の未対応診断を確認。",
+    "独立したソースレビューを統合し、主担当も起動ABI・ライブラリー・ヘッダー・Makefileを確認。"
+  ],
+  "evidence": "docs/cpp-support.md。停止済み試験VMの一時媒体18ファイルを回収し、ログとPNGを保全。",
+  "unknowns": ["GUI追加ボタンのマウスクリックとHyper-V実機は未確認。"],
+  "limits": ["例外・RTTI・標準スレッド・ELF TLSは未対応。libc++は文字列・コンテナー・アルゴリズム等の初期構成で全標準ライブラリーではない。"],
+  "status": "依頼されたC/C++併用のホストクロスコンパイルと実OSアプリ実行を完了。"
+}

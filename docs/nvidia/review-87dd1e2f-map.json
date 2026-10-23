@@ -1,0 +1,49 @@
+{
+  "summary": "87dd1e2fに対するNVIDIA再監査A1〜A10を実装修理。開始treeはclean。RM属性・有効エラー応答・実app主体・BAR cache・非連続写像・ready列挙・共有BAR1寿命を修理し、既存RO/取消を維持。RTD3は未対応を正しく返す。host、増分build、実QEMU edu/native/GUIを確認。virgl本体は未変更、実NVIDIA/Hyper-V/性能は未確認。",
+  "areas": [
+    {"path":"ports/nvidia/rm_api.c","purpose":"gpu_rm: A1保護属性、A3一時失効と永久取消の分離、A4主体受渡し、A7写像公開、A9寿命tokenの正しい失敗種別"},
+    {"path":"ports/nvidia/nvrm_serve.c","purpose":"gpu_rm: A2 RM失敗でも有効引数返却、A4認証済みnative peer主体"},
+    {"path":"ports/nvidia/libnvrm.c","purpose":"gpu_rm: A2 copybackとエラー分離、A8選別の親との調整"},
+    {"path":"ports/nvidia/os_pci.c","purpose":"root: A5/A6用途・RM方針に基づくcache、A7非連続memAreaの保存とnative合成"},
+    {"path":"ports/nvidia/nvrm_os.h","purpose":"root: OS層mapping/cache契約。変更はRM担当と先に共有"},
+    {"path":"third_party/nvidia-open/src/nvidia/arch/nvalloc/unix/src/os.c","purpose":"gpu_rm: MIT限定のnative map寿命通知、A9状態をENOMEMへ偽装しない"},
+    {"path":"kernel/src/fs/channel.c","purpose":"gpu_kernel: A4のnative IPC認証済みpeer app identity"},
+    {"path":"kernel/src/sys/syscall.c","purpose":"gpu_kernel: A7非連続共有viewの合成、権利と取消/PCI寿命の継承"},
+    {"path":"common/abi.h","purpose":"gpu_kernel: 既存番号/layoutを保持するnative ABI拡張"},
+    {"path":"user/include/nocturne.h","purpose":"gpu_kernel: native peer/共有合成の公開宣言、user/libc/sys.cも同担当"},
+    {"path":"third_party/mesa/src/nouveau/vulkan/nvkmd/nocturne","purpose":"gpu_nvk: A8明示adapter readyと実RM probed ID/BDF/クラスの一致、A10参照領域の共有寿命"},
+    {"path":"ports/mesa/nocturne_gl.c","purpose":"gpu_nvk: 診断専用GPUを飛ばしたready走査、既存CPU contextの保持"},
+    {"path":"user/apps/init.c","purpose":"root: A8 NVIDIA display class/subclass/progifの選別"},
+    {"path":"tests","purpose":"各担当の反例試験、親の統合・実QEMU edu/native境界検証"}
+  ],
+  "contracts": [
+    "日本語のみ。非POSIX、人工上限禁止、GPLv2-only追加禁止。他OS本体を参照しない。kernel-openは独立NVIDIA比較資料のみ、uvm_common.cは参照も使用もしない。",
+    "開始HEAD87dd1e2f、tree clean。既存のRO最大権利、map scope取消、旧Protocol1/48byte、native ABI番号を保全。",
+    "製品修理と反例検証が主成果。三担当の第二検討と親の統合確認を行い、host/QEMU/NVIDIA実機を区別。",
+    "共有ABIはgpu_kernelが一元所有、nvrm_os.h/os_pci.cとinit.c/README/統合はroot。境界を先に通知し重複編集しない。",
+    "重いbuild/VMは親のみ。差分build、QEMU一台、AHCI boot、専用snapshot、Hyper-Vは操作しない。",
+    "SYS_CHANNEL_RECEIVE_FROMとSYS_SHARED_COMPOSEは既存ABIの末尾追加。メッセージのsender_appはsend時にkernelが保存し、HELLO後も全要求で一致を検証。",
+    "合成写像は各sourceのRO上限/cache/取消依存を保持。構築中VAも取消対象に載せ、ページinstallと取消を直列化、need_reschedで協調yield。",
+    "既存native eventの64件batch実装は今回変更しない。通信試験は96件すべての一意token・本文・認証主体を戻り件数ごとに消費し検証する。"
+  ],
+  "facts": [
+    {"claim":"NVOS33が許すWRITE_ONLY→RWを公開し、READ_ONLY上限を維持。一時revokeは状態無変更NOT_SUPPORTED、safe admissionと分離。非request tokenはorphan寿命に保持。","evidence":"ports/nvidia/rm_api.c"},
+    {"claim":"RMが引数を書き換えた有効エラーreplyは返却し、native拒否/破損replyと区別。送信主体はnative metadataに基づき固定する。","evidence":"ports/nvidia/nvrm_serve.c"},
+    {"claim":"alloc/controlの有効partial結果をcopyback。HELLO能力を検査し、ready専用接続は未ready装置の次も走査する。","evidence":"ports/nvidia/libnvrm.c"},
+    {"claim":"BAR2を含むprefetchable開口のWC、USERD overlapのUC、rm_disable_iomap_wcを両写像経路へ適用し、動的rangeをnative composeへ渡す。","evidence":"ports/nvidia/os_pci.c"},
+    {"claim":"shared compositeをflat backingと取消依存へ分解し、RO/cache/claim寿命を保持。構築中の推測VAも取消し、PTE/TLB除去後にDMA pinを戻す。","evidence":"kernel/src/sys/syscall.c"},
+    {"claim":"メッセージがendpoint作成者ではなく送信時task_processのapp IDを持つ。","evidence":"kernel/src/fs/channel.c"},
+    {"claim":"native IDは公開signed32bit幅でoverflowを検査し再利用しない。","evidence":"kernel/src/sys/sched.c"},
+    {"claim":"ready/BDF/probedを照合したPCI snapshotを使う。BAR1 drain pageはVAspace単位で共有しchannel参照が寿命を保持。partial alloc errorのhandleも回収。","evidence":"third_party/mesa/src/nouveau/vulkan/nvkmd/nocturne/nvkmd_nocturne_rm.c"},
+    {"claim":"initとclientが同じNVIDIA VGA/3D/progif選別predicateを使う。","evidence":"ports/nvidia/include/nvrm.h"},
+    {"claim":"親がhost、QEMUの実結果、画像、媒体の一致を独立に確認。試験不備と検証の限界を保持する。","evidence":"docs/nvidia/review-87dd1e2f-acceptance.md"}
+  ],
+  "tests": [
+    "tests/nvrm_dma_hosttest.py: 実7TU構文とDMA/契約/transportの3群、0失敗。native/RMはmock。",
+    "tests/nvk_sync_hosttest.py: 同期/screen/RM境界の3群、0失敗。実GPU/実並列threadではない。",
+    "最終kernelの実QEMU: pcitest 0失敗、nativeabitest 222/0、nvrmtest 0失敗、gputest 55/0。修正した通信試験は333/0。",
+    "実ブラウザー局所ページ: Canvas再描画、CPU WebGL二context、文字入力と送信、PageDownで下端・PageUpで上端復帰を親が画像確認。",
+    "正規増分qemu-image/image成功。IMG/VHD/VHDX/ISOと実行scratchのkernel/initrd、主要app/libc/native headersを照合。"
+  ],
+  "unknowns": ["NVIDIA実機のGSP、VRAM/cache/posted write、複数GPU、実RM dup、全異常競合、IOMMUと速度は未確認。", "RTD3のfault復元は未実装のまま。安全側の非対応返却を対応成功とは呼ばない。", "Hyper-V実機はユーザー担当。実サイト一般・全アプリの無回帰は本局所確認から証明しない。"]
+}
