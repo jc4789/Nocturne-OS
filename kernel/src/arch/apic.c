@@ -3,7 +3,7 @@
    PIT. Vectors 0x30 and up are LAPIC-delivered (timer, and later Hyper-V's SynIC) and need a LAPIC EOI. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/hyperv.h"
+#include "vm/vm.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "limine.h"
@@ -407,9 +407,8 @@ bool lapic_timer_start(unsigned hz, int vector) {
     if (!available || !hz || vector < 32 || vector >= 0xFF) return false;
     lapic_write(LAPIC_TIMER_DIV, 0xB);        /* divide by 1 */
     lapic_write(LAPIC_LVT_TIMER, 0x10000 | (uint32_t)vector);
-    const char *src = "Hyper-V";
-    uint64_t freq = hv_apic_hz();
-    if (freq) tsc_hz = hv_tsc_hz();
+    const char *src = "the hypervisor";
+    uint64_t freq = vm_timer_hz(&tsc_hz);
     if (!freq) {
         src = "PIT";
         freq = calibrate_with_pit();

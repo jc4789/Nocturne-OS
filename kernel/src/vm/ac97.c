@@ -5,6 +5,7 @@
    An empty software queue does not extend LVI with silence: the issued PCM drains, then
    the engine is paused until the next PCM. Idle service performs no port I/O. */
 #include "dev/audio.h"
+#include "vm/devices.h"
 #include "arch/cpu.h"
 #include "dev/pci.h"
 #include "dev/pm.h"

@@ -2,9 +2,12 @@
  * No raw command stream or shader supplied by users is submitted to the host.
  * PCI/queue layouts and GPU control packets: OASIS VirtIO 1.2 specification
  * (virtio-gpu device section); virgl command stream: the virgl protocol as documented.
- * The existing Limine display and Hyper-V/RDP remain independent fallbacks. */
+ * The existing Limine display and Hyper-V/RDP remain independent fallbacks.
+ * It is the only provider of dev/gpu.h, and only in a VM: on real hardware gpu_init looks for
+ * no device and the interface reports the CPU display. */
 #include "kernel.h"
 #include "dev/gpu.h"
+#include "vm/vm.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
 #include "arch/cpu.h"
@@ -571,6 +574,7 @@ void gpu_init(void) {
     if (attempted) return;
     attempted=true;
     strlcpy(statistics.name,"CPU display; no verified virgl pipeline",sizeof statistics.name);
+    if (!vm_hosted()) return;
     struct pci_device *d=pci_find(0x1af4,0x1050);
     if (!d || cmdline_has("nogpu")) return;
     if (!cmdline_has("gpu-enable") && !cmdline_has("gpu-slow-test")) {

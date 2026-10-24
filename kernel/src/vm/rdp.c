@@ -15,10 +15,11 @@
    client's window when it connects and whenever the window is resized, and goes back to its
    own when the client leaves. */
 #include "kernel.h"
+#include "vm/devices.h"
 #include "dev/audio.h"
 #include "dev/input.h"
 #include "gui/wm.h"
-#include "hv/hvsock.h"
+#include "vm/hv/hvsock.h"
 #include "mm/heap.h"
 #include "sys/sched.h"
 

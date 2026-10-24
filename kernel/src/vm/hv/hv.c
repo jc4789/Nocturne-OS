@@ -3,8 +3,8 @@
    read+execute only, so W^X holds for it too. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/hyperv.h"
-#include "hv/hv.h"
+#include "vm/hyperv.h"
+#include "vm/hv/hv.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 

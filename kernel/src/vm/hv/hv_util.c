@@ -8,7 +8,7 @@
 #include "arch/cpu.h"
 #include "dev/pm.h"
 #include "dev/timer.h"
-#include "hv/vmbus.h"
+#include "vm/hv/vmbus.h"
 #include "net/net.h"
 #include "sys/sched.h"
 

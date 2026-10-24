@@ -3,7 +3,7 @@
    its report descriptor to find the buttons, X, Y and wheel. */
 #include "kernel.h"
 #include "dev/input.h"
-#include "hv/vmbus.h"
+#include "vm/hv/vmbus.h"
 
 static const struct guid kbd_guid =
     GUID_INIT(0xf912ad6d, 0x2b17, 0x48ea, 0xbd, 0x65, 0xf9, 0x27, 0xa6, 0x1c, 0x76, 0x84);

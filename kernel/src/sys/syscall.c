@@ -2,7 +2,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
-#include "arch/hyperv.h"
+#include "vm/vm.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "sys/proc.h"
@@ -1936,12 +1936,12 @@ void syscall_dispatch(struct regs *r) {
         cpuid(0x80000000, 0, &max, &cb, &cc, &cd);
         cd = 0;
         if (max >= 0x80000007) cpuid(0x80000007, 0, &ca, &cb, &cc, &cd);
-        if (!hv.present && tsc_hz >= 1000000 && (cd & (1u << 8))) {
+        if (!vm_clock_owned() && tsc_hz >= 1000000 && (cd & (1u << 8))) {
             info.flags = N_CLOCK_USER_TSC;
             info.tsc_hz = tsc_hz;
         }
         uint64_t flags = irq_save();
-        uint64_t reference_phys = hv_reference_tsc_page();
+        uint64_t reference_phys = vm_clock_page();
         struct task *owner = task_process();
         if (reference_phys && !owner->clock_page &&
             owner->mmap_next <= USER_STACK_TOP - USER_STACK_MAX - 2 * PAGE_SIZE) {

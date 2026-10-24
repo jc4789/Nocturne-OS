@@ -6,6 +6,7 @@
 #include "sys/sched.h"
 #include "sys/object.h"
 #include "abi.h"
+#include "vm/vm.h"
 
 #define MAX_STREAMS 8
 #define RING_BYTES  (8192 * AUDIO_FRAME) /* 170 ms: what a writer may be ahead of the sink */
@@ -408,5 +409,5 @@ int audio_stream_flush(struct handle *h) {
 }
 
 void audio_init(void) {
-    ac97_init();
+    vm_audio_init(); /* no driver for real sound hardware yet */
 }

@@ -1,7 +1,7 @@
 /* Hyper-V detection and the bits of its CPUID/MSR interface the rest of the kernel needs. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/hyperv.h"
+#include "vm/hyperv.h"
 #include "mm/pmm.h"
 #include "abi.h"
 

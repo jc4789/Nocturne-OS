@@ -1,7 +1,7 @@
 /* PIT timer (1 kHz) and CMOS real-time clock. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "arch/hyperv.h"
+#include "vm/vm.h"
 #include "arch/smp.h"
 #include "sys/sched.h"
 #include "dev/timer.h"
@@ -23,7 +23,7 @@ volatile bool tick_stopped;
 /* Set the count from the clock; false without one (then each tick adds one). */
 static bool catch_up(void) {
     uint64_t reference;
-    if (reference_clock && hv_reference_time(&reference)) {
+    if (reference_clock && vm_clock_read(&reference)) {
         uint64_t ms = (reference - reference_base) / 10000;
         if (ms > timer_ticks) timer_ticks = ms;
     } else if (tsc_per_ms) {
@@ -51,7 +51,7 @@ void timer_clock_sample(uint64_t *ms, uint64_t *tsc, uint64_t *reference_100ns) 
     *ms = now;
     *tsc = tsc_per_ms ? tsc_base + now * tsc_per_ms : rdtsc();
     if (reference_clock) *reference_100ns = reference_base + now * 10000;
-    else if (!hv_reference_time(reference_100ns)) *reference_100ns = 0;
+    else if (!vm_clock_read(reference_100ns)) *reference_100ns = 0;
 }
 
 /* The tick counts milliseconds. An emulator may drop timer interrupts when it falls behind (QEMU
@@ -131,9 +131,9 @@ int64_t rtc_read_unix(void) {
 void timer_init(void) {
     /* The LAPIC timer works everywhere, including Hyper-V Generation 2, which has no PIT. */
     vector_register(VEC_TIMER, timer_irq);
-    hv_reference_tsc_page();
+    vm_clock_page();
     uint64_t reference;
-    reference_clock = hv_reference_time(&reference);
+    reference_clock = vm_clock_read(&reference);
     if (reference_clock) reference_base = reference - timer_ticks * 10000;
     if (lapic_timer_start(1000, VEC_TIMER)) {
         if (tsc_hz >= 1000000) { /* a TSC that is known and plausible */
@@ -191,7 +191,7 @@ void timer_suspend(void) {
 
 int64_t timer_resume(void) {
     uint64_t reference;
-    if (reference_clock && hv_reference_time(&reference)) reference_base = reference - timer_ticks * 10000;
+    if (reference_clock && vm_clock_read(&reference)) reference_base = reference - timer_ticks * 10000;
     if (tsc_per_ms) tsc_base = rdtsc() - timer_ticks * tsc_per_ms;
     tick_stopped = false;
     int64_t slept = rtc_read_unix() - rtc_before;

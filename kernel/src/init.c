@@ -10,11 +10,10 @@
 #include "dev/iommu.h"
 #include "dev/pm.h"
 #include "dev/hibernate.h"
-#include "dev/ata.h"
 #include "dev/audio.h"
 #include "dev/usb.h"
 #include "gui/wm.h"
-#include "hv/vmbus.h"
+#include "vm/vm.h"
 #include "sys/object.h"
 #include "sys/proc.h"
 #include "sys/sched.h"
@@ -27,7 +26,6 @@ void acpi_init(void);
 void ahci_init(void);
 void net_init(void);
 void nvme_init(void);
-void rdp_init(void);
 
 #define INIT_PATH N_FOLDER_SYSTEM "\\init"
 
@@ -91,21 +89,16 @@ void kmain_late(void) {
     heap_trim_start();
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
-    if (vmbus_init()) {
-        hv_input_init();
-        hv_util_init();
-        hvsock_init();
-    }
+    vm_init(); /* only in a VM: its own bus and the devices on it */
     pci_init();
     fb_pm_init(); /* the display joins the power changes once its PCI identity is known */
     iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
     usb_init();
     net_init();
     audio_init();
-    ata_init();
     ahci_init();
-    storvsc_init();
     nvme_init();
+    vm_storage_init();
     store_init();        /* C:, from the disk the system started from (waiting for it to appear) */
     hibernate_restore(); /* returns only when there is no image to go back to */
     store_start();
@@ -113,7 +106,7 @@ void kmain_late(void) {
 
     bool gui = !cmdline_has("nogui");
     if (gui) wm_init();
-    rdp_init();
+    vm_session_init();
     if (!gui || !wm_running()) input_set_sinks(console_key_sink, NULL);
     pm_sleep_check(); /* every driver has registered: whether the start menu offers Sleep */
 

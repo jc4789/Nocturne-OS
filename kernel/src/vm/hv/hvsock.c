@@ -6,9 +6,9 @@
    here: that is all a server needs. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "hv/hv.h"
-#include "hv/hvsock.h"
-#include "hv/vmbus.h"
+#include "vm/hv/hv.h"
+#include "vm/hv/hvsock.h"
+#include "vm/hv/vmbus.h"
 #include "mm/heap.h"
 #include "sys/sched.h"
 

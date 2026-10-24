@@ -26,10 +26,7 @@ void net_rx(const void *frame, size_t len);
    Also used for TX completion so a resource-blocked sender can retry. */
 void net_rx_notify(void);
 
-bool e1000_probe(void);
 bool rtl8125_probe(void);
-bool tulip_probe(void);
-bool netvsc_probe(void); /* hv/netvsc.c: Hyper-V synthetic network adapter */
 
 /* The adapter's MAC and IPv4 configuration (host byte order). False before DHCP has finished.
    Safe from interrupt context. */

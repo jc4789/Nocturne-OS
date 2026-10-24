@@ -17,8 +17,7 @@
 #include "dev/pci.h"
 #include "dev/timer.h"
 #include "dev/serial.h"
-#include "arch/hyperv.h"
-#include "hv/hv.h"
+#include "vm/vm.h"
 
 void power_off(void);
 void power_reboot(void);
@@ -195,8 +194,7 @@ static bool machine_sleep(void (*enter)(void), unsigned state, const char **why)
     ioapic_resume();
     if (slept) pic_restore(pic);
     else pic_restore_mask((uint16_t)pic); /* no reset occurred: do not erase a pending edge */
-    hv_reference_resume(); /* the hypervisor's overlay pages: reset, or the restoring kernel's */
-    hv_core_resume();
+    vm_resume(); /* the hypervisor's overlay pages: reset, or the restoring kernel's */
     int64_t secs = timer_resume();
     sched_clock_resume();
     acpi_wake_prepare(state);

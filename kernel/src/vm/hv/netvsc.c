@@ -5,9 +5,10 @@
    which we must complete so it can reuse the space); we copy ones we send into a section of the
    send buffer and tell the host which section (it completes that packet when done with it). */
 #include "kernel.h"
+#include "vm/devices.h"
 #include "abi.h"
 #include "arch/cpu.h"
-#include "hv/vmbus.h"
+#include "vm/hv/vmbus.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "net/net.h"

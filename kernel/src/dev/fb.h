@@ -34,5 +34,5 @@ void fb_drop_holds(void);
 /* Optional boot-time real-framebuffer test; only runs with the fbbench flag. */
 void fb_benchmark(const uint32_t *src, int src_pitch);
 /* Sleep (dev/pm.h): the display registers once PCI is known; it resumes only where the mode can
-   be set again (the Bochs VBE interface). */
+   be set again (in a VM, vm/vbe.c). */
 void fb_pm_init(void);

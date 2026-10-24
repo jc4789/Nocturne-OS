@@ -1,11 +1,12 @@
 /* Intel 8254x "e1000" network driver (QEMU's default NIC, also VirtualBox and VMware). */
 #include "kernel.h"
-#include "net.h"
-#include "../arch/cpu.h"
-#include "../dev/pci.h"
-#include "../dev/pm.h"
-#include "../mm/pmm.h"
-#include "../mm/vmm.h"
+#include "vm/devices.h"
+#include "net/net.h"
+#include "arch/cpu.h"
+#include "dev/pci.h"
+#include "dev/pm.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
 
 #define REG_CTRL   0x0000
 #define REG_EERD   0x0014

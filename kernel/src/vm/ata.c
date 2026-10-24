@@ -2,8 +2,9 @@
    That is all a Hyper-V Generation 1 VM or QEMU's "pc" machine needs. ATAPI (DVD) drives are
    skipped. The kernel is non-preemptive, so a transfer simply runs to completion. */
 #include "kernel.h"
+#include "vm/devices.h"
 #include "arch/cpu.h"
-#include "dev/ata.h"
+#include "vm/ata.h"
 
 #define REG_DATA    0
 #define REG_ERROR   1

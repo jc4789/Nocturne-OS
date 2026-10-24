@@ -4,7 +4,7 @@
    to completion before the caller continues. */
 #include "kernel.h"
 #include "dev/blk.h"
-#include "hv/vmbus.h"
+#include "vm/hv/vmbus.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 

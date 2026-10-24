@@ -5,8 +5,8 @@
    are supported, so the event flags page is all we need for host-to-guest signalling. */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "hv/hv.h"
-#include "hv/vmbus.h"
+#include "vm/hv/hv.h"
+#include "vm/hv/vmbus.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "sys/sched.h"

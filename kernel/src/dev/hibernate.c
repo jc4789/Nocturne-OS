@@ -23,9 +23,7 @@
 #include "dev/pm.h"
 #include "dev/timer.h"
 #include "fs/store.h"
-#include "arch/hyperv.h"
-#include "hv/hv.h"
-#include "hv/vmbus.h"
+#include "vm/vm.h"
 #include "lib/lz.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
@@ -145,7 +143,8 @@ static void describe(struct header *hd) {
 
 const char *hibernate_blocker(void) {
     if (!wake_available() || !wake_spare_page()) return "no room below 1 MiB";
-    if (vmbus_ready()) return "Hyper-V devices cannot come back from it yet";
+    const char *vm = vm_hibernate_blocker();
+    if (vm) return vm;
     if (!pmm_ram_complete()) return "the memory map has more ranges than can be saved";
     if (!store_raw_possible()) return "C: is not on a disk";
     return NULL;
@@ -633,8 +632,7 @@ void hibernate_restore(void) {
         power_reboot();
     } /* the image's tables come with it, and its own resume turns the units on */
     lapic_tick_stop();
-    hv_core_suspend(); /* the hypervisor's overlays would swallow the copy's writes to their frames */
-    hv_reference_suspend();
+    vm_suspend(); /* the hypervisor's overlays would swallow the copy's writes to their frames */
     wake_hibernate_jump(pml4, r.first, hd.wake_page);
 
 nomem:

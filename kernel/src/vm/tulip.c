@@ -1,11 +1,12 @@
 /* DEC 21140/21143 "tulip" network driver: the Hyper-V Generation 1 *legacy network adapter*
    (and QEMU's -nic model=tulip). Registers (CSRs) are accessed through the I/O BAR. */
 #include "kernel.h"
-#include "net.h"
-#include "../arch/cpu.h"
-#include "../dev/pci.h"
-#include "../dev/pm.h"
-#include "../mm/pmm.h"
+#include "vm/devices.h"
+#include "net/net.h"
+#include "arch/cpu.h"
+#include "dev/pci.h"
+#include "dev/pm.h"
+#include "mm/pmm.h"
 
 #define NRX   32
 #define NTX   16

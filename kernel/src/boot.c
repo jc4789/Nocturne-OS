@@ -3,7 +3,7 @@
 #include "limine.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
-#include "arch/hyperv.h"
+#include "vm/vm.h"
 #include "arch/pat.h"
 #include "arch/ioapic.h"
 #include "dev/acpi.h"
@@ -97,7 +97,7 @@ void kmain(void) {
         fbcon_init();
     }
     kprintf("cpu: %s\n", cpu_brand);
-    hv_detect();
+    vm_detect();
     kprintf("video: %ux%u, %u bpp, %u bpc (R%u@%u G%u@%u B%u@%u)%s, pitch %u\n", fb.width, fb.height,
             fb.bpp, fb.bpc, fb.rsize, fb.rshift, fb.gsize, fb.gshift, fb.bsize, fb.bshift,
             fb.simulated ? " simulated by fbsim10" : "", fb.pitch);

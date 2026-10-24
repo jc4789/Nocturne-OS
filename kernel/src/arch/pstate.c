@@ -12,6 +12,7 @@
 #include "arch/cpu.h"
 #include "arch/smp.h"
 #include "arch/pstate.h"
+#include "vm/vm.h"
 
 #define MSR_MPERF          0xE7
 #define MSR_APERF          0xE8
@@ -41,8 +42,7 @@ static void detect(void) {
     uint32_t a, b, c, d, max, ext;
     cpuid(0, 0, &max, &b, &c, &d);
     enum cpu_vendor vendor = cpu_vendor_of(b, c, d);
-    cpuid(1, 0, &a, &b, &c, &d);
-    hypervisor = c & (1u << 31);
+    hypervisor = vm_hosted();
     if (max >= 6) {
         cpuid(6, 0, &a, &b, &c, &d);
         have_aperf = c & 1u;

@@ -59,7 +59,6 @@ void audio_set_muted(bool muted);
    dropped while the last one still sounds. */
 void audio_system_tone(int hz, int ms);
 
-void ac97_init(void);
 
 /* Opt-in WM diagnostic only. BSP-owned, finite counters, no I/O in the
    measured interval. Queue shortages are raw observations, not EOF-aware

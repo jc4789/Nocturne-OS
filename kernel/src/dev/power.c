@@ -5,6 +5,7 @@
 #include "arch/cpu.h"
 #include "dev/acpi.h"
 #include "mm/vmm.h"
+#include "vm/vm.h"
 
 struct gas {
     uint8_t space, bit_width, bit_offset, access;
@@ -116,9 +117,7 @@ void power_off(void) {
         if (fadt->pm1b_cnt) outw(fadt->pm1b_cnt, (slp_typb << 10) | (1 << 13));
         for (int i = 0; i < 1000000; i++) io_wait();
     }
-    outw(0x604, 0x2000);  /* QEMU */
-    outw(0xB004, 0x2000); /* Bochs / old QEMU */
-    outw(0x4004, 0x3400); /* VirtualBox */
+    vm_power_off(); /* on real hardware no port of an emulator is written */
     for (;;) hlt();
 }
 

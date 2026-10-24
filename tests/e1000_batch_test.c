@@ -19,7 +19,7 @@ static void test_irq_restore(uint64_t flags) {
 }
 #define irq_save test_irq_save
 #define irq_restore test_irq_restore
-#include "../kernel/src/net/e1000.c"
+#include "../kernel/src/vm/e1000.c"
 #undef irq_save
 #undef irq_restore
 
