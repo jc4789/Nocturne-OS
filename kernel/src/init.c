@@ -109,6 +109,7 @@ void kmain_late(void) {
     store_init();        /* C:, from the disk the system started from (waiting for it to appear) */
     hibernate_restore(); /* returns only when there is no image to go back to */
     store_start();
+    stream_system_log_keep(); /* what this start says is kept on C: */
 
     bool gui = !cmdline_has("nogui");
     if (gui) wm_init();

@@ -1364,6 +1364,8 @@ void usb_run(void (*fn)(void *arg), void *arg) {
     wait_flag(&c.done, &calls_wq);
 }
 
+bool usb_enumerating(void) { return usb_task && !usb_settled; }
+
 static bool any_port_pending(void) {
     for (int i = 0; i < ncontrollers; i++)
         for (unsigned w = 0; w < 8; w++)

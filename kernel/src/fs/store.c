@@ -5,6 +5,7 @@
 #include "fs/space.h"
 #include "dev/blk.h"
 #include "dev/timer.h"
+#include "dev/usb.h"
 #include "limine.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
@@ -12,6 +13,7 @@
 
 #define WRITE_DELAY_MS 5000 /* the first change waits this long for more to commit with it */
 #define FIND_MS 10000       /* how long the disk the system started from may take to appear */
+#define FIND_MOST_MS 60000  /* ... while USB devices are still being looked at */
 #define GPT_ENTRIES_MAX (1u << 20)
 
 extern volatile struct limine_executable_file_request exe_file_req;
@@ -66,36 +68,41 @@ static uint32_t le32(const uint8_t *p) {
     return x;
 }
 
-/* The Nocturne partition of disk (its first sector and STORE_BLOCKs), and the disk's GUID. buf
-   holds 16 sectors. */
-static bool gpt_find(struct blkdev *disk, uint8_t *buf, uint8_t guid[16], uint64_t *first, uint64_t *blocks) {
+/* The Nocturne partition of disk (its first sector and STORE_BLOCKs), and the disk's GUID: 1 when
+   it has one, 0 when not, -1 when the disk could not be read (yet). buf holds 16 sectors. */
+static int gpt_find(struct blkdev *disk, uint8_t *buf, uint8_t guid[16], uint64_t *first, uint64_t *blocks) {
     static const uint8_t type[16] = STORE_PARTITION_TYPE;
-    if (disk->sectors < 64 || blk_read(disk, 0, 16, buf) < 0) return false;
+    if (disk->sectors < 64) return 0;
+    if (blk_read(disk, 0, 16, buf) < 0) return -1;
     /* the header is at the device's block 1, of 512 or 4096 bytes */
     uint32_t unit = !memcmp(buf + 512, "EFI PART", 8) ? 512 : !memcmp(buf + 4096, "EFI PART", 8) ? 4096 : 0;
-    if (!unit) return false;
+    if (!unit) return 0;
     const uint8_t *hd = buf + unit;
     memcpy(guid, hd + 56, 16);
     uint64_t at = le64(hd + 72) * (unit / 512);
     uint32_t count = le32(hd + 80), size = le32(hd + 84);
     uint64_t bytes = (uint64_t)count * size;
-    if (size < 128 || size % 8 || !bytes || bytes > GPT_ENTRIES_MAX) return false;
+    if (size < 128 || size % 8 || !bytes || bytes > GPT_ENTRIES_MAX) return 0;
     uint32_t sectors = (uint32_t)((bytes + 511) / 512);
+    if (at + sectors > disk->sectors) return 0;
     uint8_t *entries = kmalloc((size_t)sectors * 512);
-    bool found = false;
-    if (entries && at + sectors <= disk->sectors && blk_read(disk, at, sectors, entries) >= 0)
-        for (uint32_t i = 0; i < count && !found; i++) {
-            const uint8_t *e = entries + (size_t)i * size;
-            if (memcmp(e, type, 16)) continue;
-            uint64_t lo = le64(e + 32) * (unit / 512), hi = (le64(e + 40) + 1) * (unit / 512);
-            if (lo % (STORE_BLOCK / 512) || hi <= lo || hi > disk->sectors) {
-                kprintf("store: %s has a Nocturne partition the store cannot use (not on 4 KiB)\n", disk->name);
-                continue;
-            }
-            *first = lo;
-            *blocks = (hi - lo) / (STORE_BLOCK / 512);
-            found = true;
+    if (!entries || blk_read(disk, at, sectors, entries) < 0) {
+        kfree(entries);
+        return -1;
+    }
+    int found = 0;
+    for (uint32_t i = 0; i < count && !found; i++) {
+        const uint8_t *e = entries + (size_t)i * size;
+        if (memcmp(e, type, 16)) continue;
+        uint64_t lo = le64(e + 32) * (unit / 512), hi = (le64(e + 40) + 1) * (unit / 512);
+        if (lo % (STORE_BLOCK / 512) || hi <= lo || hi > disk->sectors) {
+            kprintf("store: %s has a Nocturne partition the store cannot use (not on 4 KiB)\n", disk->name);
+            continue;
         }
+        *first = lo;
+        *blocks = (hi - lo) / (STORE_BLOCK / 512);
+        found = 1;
+    }
     kfree(entries);
     return found;
 }
@@ -120,13 +127,17 @@ static void device_find(void) {
     uint8_t *buf = kmalloc(16 * 512);
     if (!buf) panic("store: no memory to find C:");
     uint64_t start = uptime_ms(), blocks = 0;
-    bool boot = false;
-    for (int scanned = 0; !boot;) {
-        for (; scanned < blk_count() && !boot; scanned++) {
-            struct blkdev *d = blk_get(scanned);
+    uint32_t looked = 0; /* the disks whose GPT was read; one that could not be is tried again */
+    bool boot = false, said = false;
+    for (;;) {
+        for (int i = 0; i < blk_count() && !boot; i++) {
+            struct blkdev *d = blk_get(i);
             uint8_t guid[16];
             uint64_t first, n;
-            if (!gpt_find(d, buf, guid, &first, &n)) continue;
+            bool kept = i < 32; /* the disks past the 32nd are read every time */
+            int r = kept && (looked >> i & 1) ? 0 : gpt_find(d, buf, guid, &first, &n);
+            if (r >= 0 && kept) looked |= 1u << i;
+            if (r <= 0) continue;
             boot = !known || !memcmp(guid, want, 16);
             if (boot || !part.disk) {
                 part.disk = d;
@@ -134,7 +145,14 @@ static void device_find(void) {
                 blocks = n;
             }
         }
-        if (boot || uptime_ms() - start >= FIND_MS) break;
+        /* A USB stick appears once its bus has been looked at, which can take longer than FIND_MS
+           on a machine with many devices. */
+        uint64_t waited = uptime_ms() - start;
+        if (boot || waited >= FIND_MOST_MS || (waited >= FIND_MS && !usb_enumerating())) break;
+        if (waited >= FIND_MS && !said) {
+            said = true;
+            kprintf("store: waiting for the disk the system started from: USB devices are still being looked at\n");
+        }
         sleep_ms(100);
     }
     kfree(buf);
@@ -250,8 +268,8 @@ static void writer(void *arg) {
     for (;;) {
         uint64_t flags = irq_save();
         while (!store.dirty) wq_wait(&store.kick);
-        for (uint64_t until = uptime_ms() + WRITE_DELAY_MS; !store.soon && uptime_ms() < until;)
-            wq_wait_timeout(&store.kick, until - uptime_ms());
+        for (uint64_t until = uptime_ms() + WRITE_DELAY_MS, now; !store.soon && (now = uptime_ms()) < until;)
+            wq_wait_timeout(&store.kick, until - now);
         store.dirty = store.soon = false;
         irq_restore(flags);
         mutex_lock(&store.v->lock);

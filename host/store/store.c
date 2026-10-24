@@ -22,7 +22,9 @@
      store test <MiB> [seed] [steps]         random changes, crashes, cut-short commits and damaged
                                              superblocks against a model of what the volume holds
 
-   <image> is a disk with a GPT (the volume is its Nocturne partition) or a bare volume. */
+   <image> is a disk with a GPT (the volume is its Nocturne partition) or a bare volume: an image
+   file, or on Windows a disk itself, \\.\PhysicalDriveN (as an administrator), such as the USB
+   stick a machine ran from. list, get and check only read it. */
 #include <stdarg.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -358,17 +360,20 @@ static int disk_make(const char *path, uint64_t mib, uint64_t esp_mib) {
 }
 
 /* The first and last sector of the partition of type in f's GPT: 1 when it is there, 0 when it is
-   not, -1 when f has no GPT. */
+   not, -1 when f has no GPT. The entries are read a whole sector at a time, as a disk itself
+   (\\.\PhysicalDriveN) reads nothing smaller. */
 static int gpt_partition(FILE *f, const uint8_t type[16], uint64_t *first, uint64_t *last) {
     struct gpt_header h;
     uint8_t sector[SECTOR];
     if (seek64(f, SECTOR, SEEK_SET) || fread(sector, SECTOR, 1, f) != 1 || memcmp(sector, "EFI PART", 8)) return -1;
     memcpy(&h, sector, sizeof h);
+    if (h.entry_size < sizeof(struct gpt_entry) || SECTOR % h.entry_size) return -1;
+    uint32_t per = SECTOR / h.entry_size;
     struct gpt_entry e;
     for (uint32_t i = 0; i < h.count && i < 1024; i++) {
-        if (seek64(f, (int64_t)(h.entries * SECTOR + (uint64_t)i * h.entry_size), SEEK_SET) ||
-            fread(&e, sizeof e, 1, f) != 1)
+        if (!(i % per) && (seek64(f, (int64_t)((h.entries + i / per) * SECTOR), SEEK_SET) || fread(sector, SECTOR, 1, f) != 1))
             break;
+        memcpy(&e, sector + i % per * h.entry_size, sizeof e);
         if (!memcmp(e.type, type, 16)) {
             *first = e.first, *last = e.last;
             return 1;
@@ -394,16 +399,21 @@ static int esp_show(const char *path) {
     return 0;
 }
 
-/* the volume in the image: its Nocturne partition, or all of it when it has no GPT */
-static int image_open(const char *path, struct image *im, struct store_device *dev) {
+/* the volume in the image: its Nocturne partition, or all of it when it has no GPT. Opened to be
+   read only unless write. */
+static int image_open(const char *path, bool write, struct image *im, struct store_device *dev) {
     memset(im, 0, sizeof *im);
-    if (!(im->f = fopen(path, "r+b"))) {
+    if (!(im->f = fopen(path, write ? "r+b" : "rb"))) {
         perror(path);
         return -1;
     }
-    seek64(im->f, 0, SEEK_END);
-    uint64_t bytes = (uint64_t)tell64(im->f), first = 0, last = bytes / SECTOR - 1;
-    if (!gpt_partition(im->f, store_type, &first, &last)) {
+    /* Unbuffered: each read and write is the whole blocks asked for at their own place, which a
+       disk itself needs. A disk has no end to seek to: its GPT tells where the volume is. */
+    setvbuf(im->f, NULL, _IONBF, 0);
+    int64_t end = seek64(im->f, 0, SEEK_END) ? -1 : tell64(im->f);
+    uint64_t bytes = end > 0 ? (uint64_t)end : 0, first = 0, last = bytes / SECTOR - 1;
+    int found = gpt_partition(im->f, store_type, &first, &last);
+    if (!found || (found < 0 && bytes < STORE_BLOCK)) {
         fprintf(stderr, "store: %s has no Nocturne partition\n", path);
         fclose(im->f);
         return -1;
@@ -1420,7 +1430,8 @@ int main(int argc, char **argv) {
     struct image im;
     struct store_device dev;
     struct volume *v = NULL;
-    if (image_open(argv[2], &im, &dev) < 0) return 1;
+    bool write = strcmp(cmd, "list") && strcmp(cmd, "get") && strcmp(cmd, "check");
+    if (image_open(argv[2], write, &im, &dev) < 0) return 1;
     int r;
     if (!strcmp(cmd, "format")) {
         if (argc != 4) return usage();

@@ -223,9 +223,13 @@ static void do_flush(void *arg) {
     static const uint8_t cdb[10] = {0x35};
     struct msc *m = io->l->m;
     io->result = -1;
-    if (!m->dev) return;
-    int r = scsi(m, io->l->lun, cdb, 10, NULL, 0, false);
-    io->result = r >= 0 || (r == BOT_FAILED && m->sense_key == 5) ? 0 : -1;
+    /* a unit attention (a reset, the power) or a moment's trouble is tried again, like a read */
+    for (int tries = 0; tries < 3 && m->dev; tries++) {
+        int r = scsi(m, io->l->lun, cdb, 10, NULL, 0, false);
+        if (r >= 0 || (r == BOT_FAILED && m->sense_key == 5)) { io->result = 0; return; } /* 5: no cache to flush */
+        if (r == BOT_FAILED && m->sense_key != 6)
+            kprintf("usbmsc: %s flush failed (sense %x/%02x/%02x)\n", io->l->blk.name, m->sense_key, m->asc, m->ascq);
+    }
 }
 
 static int msc_flush(struct blkdev *b) {

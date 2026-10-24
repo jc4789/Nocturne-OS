@@ -52,6 +52,9 @@ bool cmdline_has(const char *word);
 /* key=<decimal> on the kernel command line: the last well-formed one (init.c) */
 bool cmdline_number(const char *key, uint64_t *out);
 size_t klog_read(char *buf, size_t max);
+/* The log's text from its at'th byte ever written on, up to max bytes, and at moved past it. What
+   the ring no longer holds is skipped: lost tells how many bytes. */
+size_t klog_since(size_t *at, char *buf, size_t max, size_t *lost);
 
 #define ASSERT(x) do { if (!(x)) panic("assertion failed: %s (%s:%d)", #x, __FILE__, __LINE__); } while (0)
 

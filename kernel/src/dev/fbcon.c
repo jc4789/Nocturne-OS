@@ -276,6 +276,30 @@ static void pline(canvas_t *c, const char *s, uint32_t col) {
     pr_y += 18;
 }
 
+/* What the kernel said last, as many lines as fit below the rest: on a computer without a serial
+ * port a photo of this screen is the log of a start that never got to write it to C:. */
+static void panic_log_tail(canvas_t *c) {
+    static char tail[16384];
+    size_t n = klog_read(tail, sizeof tail);
+    pr_y += 18;
+    int rows = (c->h - 24 - pr_y) / 18;
+    if (rows <= 1) return;
+    pline(c, "The last lines of the log:", 0xFFE8C36A);
+    rows--;
+    size_t end = n && tail[n - 1] == '\n' ? n - 1 : n, start = end;
+    for (int shown = 1; start > 0; start--)
+        if (tail[start - 1] == '\n' && ++shown > rows) break;
+    char line[256];
+    for (size_t at = start; at < end;) {
+        size_t len = 0;
+        for (; at < end && tail[at] != '\n'; at++)
+            if (len < sizeof line - 1) line[len++] = tail[at] >= 0x20 || tail[at] < 0 ? tail[at] : ' ';
+        at++;
+        line[len] = 0;
+        pline(c, line, 0xFF9AA0C0);
+    }
+}
+
 static void panic_draw(const char *msg, struct regs *r) {
     if (!fb.addr) return;
     canvas_t c;
@@ -317,7 +341,8 @@ static void panic_draw(const char *msg, struct regs *r) {
         }
     }
     pr_y += 10;
-    pline(&c, "Please restart the virtual machine. Sweet dreams.", 0xFF8E9AC8);
+    pline(&c, "Restart the computer (hold the power button if it does not answer). Sweet dreams.", 0xFF8E9AC8);
+    panic_log_tail(&c);
     enabled = true;
     fb_drop_holds();
     fb_present(c.px, c.pitch, NULL, 0, 0, 0, c.w, c.h);

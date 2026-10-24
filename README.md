@@ -241,8 +241,8 @@ IDE 0:0 に、*レガシー*ネットワークアダプター（DEC 21140 の模
 
 ### 実機
 
-`build\nocturne.img`（GPT の起動ディスク、BIOS・UEFI の両方で起動）を USB メモリーへ書き込み、
-セキュアブートを切って起動します。12 スレッドの AMD 機（USB 起動、RTL8125B の有線 LAN、USB の
+`build\nocturne.img`（GPT の起動ディスク、BIOS・UEFI の両方で起動）を USB メモリーへそのまま（DD モードで）
+書き込み、セキュアブートを切って起動します。ISO を書き込むと C: はメモリー上になり、ログも保存も残りません。12 スレッドの AMD 機（USB 起動、RTL8125B の有線 LAN、USB の
 キーボード・マウス）で、デスクトップとブラウザーでの動画ページの表示まで確認しました。この確認は 1 台のディスクと
 ドライブ C: の形式になる前のもので、今の形式の実機ではまだ確かめていません。まだ初期段階です。
 - 手順書や対応機種の一覧はありません。
@@ -351,8 +351,11 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
   アプリのフォルダーは `C:\Nocturne` と同じく変えられません。自分のアプリのフォルダーはここに作れます。
 - `C:\Users\User`：ユーザーのファイル（`Documents`、`Desktop`、`Downloads`、`Music`、`Pictures`、`Videos`）。
   アプリのデータは `AppData\<アプリ>`、一時ファイルは `AppData\Temp`（起動のたびに空になります）。
-- 書き込んだ内容は、最初の変更から約 5 秒後か、文書を閉じたときにコミットされます。書込みの途中で電源が切れても、
-  最後のコミットまでの内容が残ります。
+- 書き込んだ内容は、最初の変更から約 5 秒後か、アプリが保存したときにコミットされます（文書を閉じただけでは
+  早まりません）。書込みの途中で電源が切れても、最後のコミットまでの内容が残ります。
+- カーネルのログ（`[browser log]` や NVIDIA ドライバーの行も含む）は、起動のたびに
+  `C:\Users\User\AppData\Nocturne\System.log` へ書かれます。前回の起動のものは `System-previous.log` です。
+  フリーズや電源断では最後の数秒が残らないことがあります。カーネルが止まった画面には、ログの最後の行が出ます。
 
 保存先：
 - **QEMU**：`build.ps1 run` の `build\run.img`。ビルドし直してもシステムだけを置き換え、`build.ps1 clean` も消しません。
@@ -362,6 +365,9 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 - ライブ ISO の C: はメモリー上にあり、変更は電源を切ると消えます。
 
 ホストからは `build\host\store.exe` で C: を見られます（`store list build\run.img C:\Users\User`、`store get`、`store put`）。
+Windows では円盤そのもの（`\\.\PhysicalDrive<番号>`、管理者として）も開けます。実機で使った USB メモリーのログは
+`store get \\.\PhysicalDrive<番号> C:\Users\User\AppData\Nocturne\System-previous.log <保存先>` で取り出せます。
+`list`、`get`、`check` は読むだけで、円盤へは書きません。
 
 シェルは名前だけのコマンドを `C:\Nocturne\System` と、`C:\Programs` の各フォルダーから探します（`PATH` はありません）。
 `C:\Programs\<名前>` に入れたプログラムは名前だけで動きます。

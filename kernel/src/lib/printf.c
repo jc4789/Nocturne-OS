@@ -148,6 +148,17 @@ size_t klog_read(char *buf, size_t max) {
     return n;
 }
 
+size_t klog_since(size_t *at, char *buf, size_t max, size_t *lost) {
+    uint64_t f = irq_save();
+    size_t oldest = klog_head < KLOG_SIZE ? 0 : klog_head - KLOG_SIZE;
+    *lost = *at < oldest ? oldest - *at : 0;
+    size_t from = *at + *lost, n = MIN(klog_head - from, max);
+    for (size_t i = 0; i < n; i++) buf[i] = klog_buf[(from + i) % KLOG_SIZE];
+    *at = from + n;
+    irq_restore(f);
+    return n;
+}
+
 int kprintf(const char *fmt, ...) {
     char buf[1024];
     va_list ap;

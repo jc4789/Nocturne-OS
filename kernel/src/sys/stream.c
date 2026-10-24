@@ -3,6 +3,8 @@
 #include "arch/cpu.h"
 #include "dev/fbcon.h"
 #include "dev/serial.h"
+#include "fs/store.h"
+#include "mm/heap.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "sys/object.h"
@@ -66,6 +68,55 @@ static const struct object_ops log_ops = {.kind = N_KIND_DEVICE, .write = log_wr
 static struct object log_object = {.ops = &log_ops};
 
 struct handle *stream_system_log_open(void) { return stream_open(&log_object); }
+
+/* ---- the system log on C: ----
+   A machine with no serial port loses the log with its power, and what a start said before it
+   stopped is what one wants to read. So the log is also kept in the user's AppData\Nocturne:
+   System.log for this start, System-previous.log for the one before. It can be read from Files,
+   or from another system (host/store). The writer commits it within seconds (fs/store.c). */
+
+#define KEEP_MS 500             /* how often new text goes to C: */
+#define KEEP_PIECE 65536        /* text taken from the log at a time */
+#define KEEP_MOST (32ull << 20) /* a start keeps this much at most: C: has its other uses */
+
+static void keep_note(const char *path, const char *fmt, unsigned long long n) {
+    char note[96];
+    int k = ksnprintf(note, sizeof note, fmt, n);
+    store_append(path, note, (size_t)MIN(k, (int)sizeof note - 1), false);
+}
+
+static void log_keep(void *arg) {
+    char *path = arg, *piece = kmalloc(KEEP_PIECE);
+    if (!piece) return;
+    uint64_t kept = 0;
+    for (size_t at = 0, lost, n;;) {
+        if (!(n = klog_since(&at, piece, KEEP_PIECE, &lost))) {
+            sleep_ms(KEEP_MS);
+            continue;
+        }
+        if (lost) keep_note(path, "\n[system log: %llu bytes were not kept here]\n", lost);
+        if (kept + n > KEEP_MOST) {
+            keep_note(path, "\n[system log: this start said more than %llu MiB; the rest is not kept]\n", KEEP_MOST >> 20);
+            break;
+        }
+        store_append(path, piece, n, false);
+        kept += n;
+    }
+    kfree(piece);
+}
+
+void stream_system_log_keep(void) {
+    if (!store_raw_possible()) return; /* C: in memory ends with the power too */
+    static char path[sizeof "C:\\Users\\" + 255 + sizeof "\\AppData\\Nocturne\\System-previous.log"];
+    char previous[sizeof path];
+    ksnprintf(path, sizeof path, "%s\\AppData\\Nocturne", store_user_folder());
+    int r = store_folder_create(path, false);
+    ksnprintf(previous, sizeof previous, "%s\\System-previous.log", path);
+    strlcat(path, "\\System.log", sizeof path);
+    if (r >= 0 || r == -N_ERR_EXISTS) r = store_entry_move(path, previous, true, false);
+    if (r < 0 && r != -N_ERR_NOT_FOUND) kprintf("system log: it cannot be kept on C: (%d)\n", r);
+    else if (!kthread_create("system log", log_keep, path)) kprintf("system log: it cannot be kept on C:\n");
+}
 
 /* ---- the console: text on the screen, keys from the keyboard ---- */
 

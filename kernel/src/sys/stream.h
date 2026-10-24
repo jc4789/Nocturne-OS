@@ -10,6 +10,9 @@ struct handle;
 struct handle *stream_console_open(void);
 struct handle *stream_system_log_open(void);
 struct handle *stream_null_open(void);
+/* From now on the system log is also kept on C: (the user's AppData\Nocturne\System.log), the
+   previous start's moved aside (System-previous.log). After store_start. */
+void stream_system_log_keep(void);
 
 /* Keyboard input for the console (the text-mode keyboard, init.c). */
 void console_input_char(char c);
