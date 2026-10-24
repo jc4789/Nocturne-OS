@@ -4,8 +4,9 @@
    system when a step fails, the reconnection of displays, and direct scanout: apps' images
    made, presented only while the system lets the app be shown directly (one flip waiting at a
    time), the pointer as the cursor over them, the desktop shown again when the system says so,
-   images freed off the screen (DESTROY, the connection's end, stop) and IMPORT's ownership and
-   RM sharing. No GPU, NVKMS, QEMU or real hardware runs.
+   images freed off the screen (DESTROY, the connection's end, stop), the system's hold on each
+   image for its panic screen (none made without it) and IMPORT's ownership and RM sharing. No
+   GPU, NVKMS, QEMU or real hardware runs.
    Run with tests/nvrm_display_hosttest.py (the flags come from ports/nvidia/nvrm.mk). */
 #include <stdarg.h>
 #include <stdio.h>
@@ -72,12 +73,14 @@ void nvrm_log(const char *fmt, ...) {
 #define VRAM_BUS (BAR1_BUS + 0x4000000ull)
 #define GOP_VIEW 40
 #define SURFACE_VIEW 41
+#define IMAGE_VIEW 50
+#define EXTRA_BUS (VRAM_BUS + 0x1000000ull) /* where extra_vram lies in BAR1 */
 
 struct nvrm_device nvrm_dev;
 static uint8_t gop[GOP_PITCH * H];
 static uint8_t vram[7680u * H + 4096u];
 /* What KAPI maps of the other memory it allocates: the cursor and apps' images. */
-#define EXTRA_VRAM 6
+#define EXTRA_VRAM 10
 static uint8_t extra_vram[EXTRA_VRAM][7680u * H];
 static uint64_t clock_ns;
 
@@ -94,13 +97,20 @@ n_handle nvrm_bar_view(uint64_t phys, uint64_t bytes, uint32_t nv_caching, uint3
     *view_offset = 0;
     if (phys == GOP_BUS) { called("view-gop"); return GOP_VIEW; }
     if (phys == VRAM_BUS) { called("view-surface"); return SURFACE_VIEW; }
+    if (phys >= EXTRA_BUS && phys < EXTRA_BUS + sizeof extra_vram && (phys - EXTRA_BUS) % sizeof extra_vram[0] == 0 &&
+        bytes == 7680ull * H && nv_caching == NV_MEMORY_WRITECOMBINED && access == N_MEMORY_READ_WRITE) {
+        called("view-image");
+        return IMAGE_VIEW;
+    }
     return -N_ERR_INVALID;
 }
 static bool mapping_not_bar;
 bool nvrm_kernel_mapping_phys(const void *address, uint64_t *phys) {
-    const uint8_t *p = address;
-    if (mapping_not_bar || p < vram || p >= vram + sizeof vram) return false;
-    *phys = VRAM_BUS + (uint64_t)(p - vram);
+    const uint8_t *p = address, *extra = &extra_vram[0][0];
+    if (mapping_not_bar) return false;
+    if (p >= vram && p < vram + sizeof vram) *phys = VRAM_BUS + (uint64_t)(p - vram);
+    else if (p >= extra && p < extra + sizeof extra_vram) *phys = EXTRA_BUS + (uint64_t)(p - extra);
+    else return false;
     return true;
 }
 n_result n_shared_map(n_handle shared, size_t bytes, int access, void **mapping) {
@@ -114,16 +124,50 @@ n_result n_handle_close(n_handle h) { called("close%d", (int)h); return 0; }
 
 static n_result give_result;
 static bool direct_refused;      /* the system refuses N_SCANOUT_DIRECT */
+static bool plain_refused;       /* the system refuses a surface without N_SCANOUT_DIRECT */
 static struct n_scanout given_desc;
 static n_handle given_surface;
+/* What the system draws its panic screen into besides the scanout (n_pci_screen_image): the
+   numbers it holds. It lets go of all of them when the scanout is no longer N_SCANOUT_DIRECT. */
+#define PANIC_IMAGES 64
+static bool panic_held[PANIC_IMAGES];
+static n_result panic_last, panic_refused;
+static struct n_scanout panic_desc;
+static unsigned panic_images(void) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < PANIC_IMAGES; i++) n += panic_held[i];
+    return n;
+}
 n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc) {
     (void)pci;
-    if (surface == N_SCANOUT_BOOT) { called("give-boot"); return 0; }
+    if (surface == N_SCANOUT_BOOT) {
+        called("give-boot");
+        memset(panic_held, 0, sizeof panic_held);
+        return 0;
+    }
     called((desc->format & N_SCANOUT_DIRECT) ? "give-surface-direct" : "give-surface");
     if (direct_refused && (desc->format & N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
+    if (plain_refused && !(desc->format & N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
     given_surface = surface;
     if (desc) given_desc = *desc;
+    if (!give_result && !(desc->format & N_SCANOUT_DIRECT)) memset(panic_held, 0, sizeof panic_held);
     return give_result;
+}
+n_result n_pci_screen_image(n_handle pci, n_handle surface, const struct n_scanout *desc) {
+    CHECK(pci == nvrm_dev.pci && surface == IMAGE_VIEW);
+    called("panic-image");
+    if (panic_refused) return panic_refused;
+    panic_desc = *desc;
+    CHECK(panic_last + 1 < PANIC_IMAGES);
+    panic_held[++panic_last] = true;
+    return panic_last;
+}
+n_result n_pci_screen_image_end(n_handle pci, n_result image) {
+    CHECK(pci == nvrm_dev.pci);
+    called("panic-image-end");
+    if (image <= 0 || image >= PANIC_IMAGES || !panic_held[image]) return -N_ERR_INVALID;
+    panic_held[image] = false;
+    return 0;
 }
 
 /* What the system says the screen shows (n_pci_screen_state). A wait on a state already seen
@@ -169,7 +213,12 @@ n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns
 }
 
 /* Single-threaded: the display thread is created but never run; the test calls rescan(). */
-int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) { (void)thr; (void)func; (void)arg; called("thread"); return thrd_success; }
+static bool thread_fails;
+int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
+    (void)thr; (void)func; (void)arg;
+    called(thread_fails ? "thread-fails" : "thread");
+    return thread_fails ? thrd_error : thrd_success;
+}
 int thrd_join(thrd_t thr, int *res) { (void)thr; (void)res; called("join"); return thrd_success; }
 int mtx_init(mtx_t *m, int type) { (void)m; (void)type; return thrd_success; }
 void mtx_destroy(mtx_t *m) { (void)m; }
@@ -253,7 +302,7 @@ static struct NvKmsKapiAllocateMemoryParams alloc_log[POOL];
 static struct NvKmsKapiCreateSurfaceParams surface_log[POOL];
 static bool cursor_caps_missing;
 static unsigned pending_polls;   /* polls before the flip in progress completes */
-static NvBool k_pending(const struct NvKmsKapiDevice *d, const NvU32 head, const NvU32 layer, NvBool *pending);
+static unsigned commit_failures; /* commits NVKMS refuses next */
 
 /* RM's handles of KAPI's memory (nvkms_kapi_rm.c reads them from KAPI's structures). */
 #define NVKMS_MEMORY(i) (0xcafe0000u + (i))
@@ -435,19 +484,29 @@ static NvBool k_apply(struct NvKmsKapiDevice *d, const struct NvKmsKapiRequested
     (void)d;
     called(commit ? "apply-commit" : "apply-check");
     if (!commit && apply_check_fails) return NV_FALSE;
+    if (commit && commit_failures) {
+        commit_failures--;
+        reply_config->flipResult = NV_KMS_FLIP_RESULT_INVALID_PARAMS;
+        return NV_FALSE;
+    }
     if (commit) last_request = *req;
     reply_config->flipResult = NV_KMS_FLIP_RESULT_SUCCESS;
     return NV_TRUE;
 }
-static NvBool k_pending(const struct NvKmsKapiDevice *d, const NvU32 head, const NvU32 layer, NvBool *pending) {
-    (void)d; (void)layer;
+/* The completion notifier of the primary layer's last flip (nvkms_kapi_rm.c reads KAPI's). */
+void nvrm_nvkms_flip_arm(struct NvKmsKapiDevice *d, uint32_t head, uint32_t layer) {
+    CHECK(d == (struct NvKmsKapiDevice *)&dev_obj && layer == NVKMS_KAPI_LAYER_PRIMARY_IDX);
+    called("flipArm-%u", (unsigned)head);
+}
+bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *d, uint32_t head, uint32_t layer) {
+    CHECK(d == (const struct NvKmsKapiDevice *)&dev_obj && layer == NVKMS_KAPI_LAYER_PRIMARY_IDX);
     /* A flip that never completes is polled every millisecond: record its first poll only. */
     static uint64_t pending_since = UINT64_MAX;
     if (!flip_pending_forever || pending_since != scr.vblanks) called("flipPending-%u", (unsigned)head);
     pending_since = flip_pending_forever ? scr.vblanks : UINT64_MAX;
-    *pending = flip_pending_forever || pending_polls;
+    bool pending = flip_pending_forever || pending_polls;
     if (pending_polls) pending_polls--;
-    return NV_TRUE;
+    return !pending;
 }
 static struct NvKmsKapiVblankIntrCallback *k_vblank_on(struct NvKmsKapiDevice *d, const NvU32 head,
                                                         NVRgInterruptCallbackProc proc, NvU64 param) {
@@ -485,7 +544,6 @@ NvBool nvKmsKapiGetFunctionsTable(struct NvKmsKapiFunctionsTable *t) {
     t->createSurface = k_surface;
     t->destroySurface = k_destroy_surface;
     t->applyModeSetConfig = k_apply;
-    t->getFlipPendingStatus = k_pending;
     t->registerVblankIntrCallback = k_vblank_on;
     t->unregisterVblankIntrCallback = k_vblank_off;
     t->framebufferConsoleDisabled = k_console_disabled;
@@ -511,7 +569,11 @@ static void reset(void) {
     dup_file = NULL;
     dup_result = 0;
     mem_used = surf_used = mem_freed = surf_destroyed = 0;
-    pending_polls = 0;
+    pending_polls = commit_failures = 0;
+    thread_fails = plain_refused = false;
+    memset(panic_held, 0, sizeof panic_held);
+    panic_last = panic_refused = 0;
+    memset(&panic_desc, 0, sizeof panic_desc);
     memset(extra_vram, 0xee, sizeof extra_vram);
     given_surface = -1;
     memset(&given_desc, 0, sizeof given_desc);
@@ -751,9 +813,21 @@ static void monitors_come_and_go(void) {
     CHECK(last_request.headsMask == 0x2 && head_cfg(1)->modeSetConfig.mode.timings.refreshRate == 120000);
     CHECK(head_cfg(1)->layerRequestedConfig[0].config.dstWidth == W);
 
+    /* 0x4 instead, whose flip is not seen to complete: lit all the same, its vertical blanks
+       followed, and the next flip waits for that one first. */
+    displays[1].connected = false;
+    displays[2].connected = true;
+    flip_pending_forever = true;
+    calls[0] = 0;
+    rescan();
+    CHECK(in_order("unregisterVblank-1 apply-commit apply-check flipArm-0 apply-commit flipPending-0 registerVblank-0"));
+    CHECK(scr.head_on && scr.display == 0x4 && scr.flipping && strstr(logs, "its first flip has not been seen to complete"));
+    flip_pending_forever = false;
+    CHECK(settle() && !scr.flipping);
+
     calls[0] = 0;
     nvrm_display_stop();
-    CHECK(in_order("give-boot unregisterVblank-1 close41 releaseOwnership destroySurface freeDevice"));
+    CHECK(in_order("give-boot unregisterVblank-0 close41 releaseOwnership destroySurface freeDevice"));
 }
 
 /* ---------------------------------------------------------------- direct scanout */
@@ -792,7 +866,11 @@ static void direct_scanout(void) {
     calls[0] = 0;
     CHECK(scanout(APP_FILE, APP, &r) == NV_OK);
     CHECK(r.image != 0 && r.width == W && r.height == H && r.pitch == 7680 && r.bytes == 7680ull * H);
-    CHECK(in_order("allocateMemory createSurface mapMemory unmapMemory") && never("apply-commit"));
+    /* RM's mapping stays, and the system holds a view of it for its panic screen (X8B8G8R8). */
+    CHECK(in_order("allocateMemory createSurface mapMemory view-image panic-image close50") &&
+          never("unmapMemory") && never("apply-commit"));
+    CHECK(panic_images() == 1 && panic_desc.width == W && panic_desc.height == H && panic_desc.pitch == 7680 &&
+          panic_desc.format == N_SCANOUT_XBGR8888 && panic_desc.offset == 0);
     CHECK(mem_used == 3 && alloc_log[2].type == NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT &&
           alloc_log[2].layout == NvKmsSurfaceMemoryLayoutPitch && alloc_log[2].useVideoMemory &&
           alloc_log[2].size == 7680ull * H);
@@ -826,7 +904,8 @@ static void direct_scanout(void) {
     screen_says(APP, true, 100, 50);
     calls[0] = 0;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, a) == NV_OK);
-    CHECK(in_order("flipPending-1 apply-commit") && never("apply-check"));
+    /* The mode set's flip completed in start: nothing awaited; this flip's notifier cleared first. */
+    CHECK(in_order("flipArm-1 apply-commit") && never("flipPending-1") && never("apply-check"));
     const struct NvKmsKapiHeadRequestedConfig *h = head_cfg(1);
     CHECK(last_request.headsMask == 0x2 && h->modeSetConfig.bActive && h->modeSetConfig.numDisplays == 1 &&
           h->modeSetConfig.displays[0] == 0x2 && h->modeSetConfig.mode.timings.refreshRate == 120000);
@@ -849,7 +928,7 @@ static void direct_scanout(void) {
     pending_polls = 2;
     calls[0] = 0;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, b) == NV_OK);
-    CHECK(in_order("flipPending-1 flipPending-1 flipPending-1 apply-commit"));
+    CHECK(in_order("flipPending-1 flipPending-1 flipPending-1 flipArm-1 apply-commit"));
     CHECK(head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(3) &&
           !head_cfg(1)->cursorRequestedConfig.flags.surfaceChanged && !head_cfg(1)->cursorRequestedConfig.flags.dstXYChanged);
     CHECK(scr.shown->number == b && scr.leaving && scr.leaving->number == a);
@@ -858,7 +937,7 @@ static void direct_scanout(void) {
     screen_says(APP, true, 400, 300);
     calls[0] = 0;
     follow_screen();
-    CHECK(in_order("apply-commit") && never("apply-check"));
+    CHECK(in_order("apply-commit") && never("apply-check") && never("flipArm-1"));
     c = &head_cfg(1)->cursorRequestedConfig;
     CHECK(c->flags.dstXYChanged && !c->flags.surfaceChanged && c->dstX == 392 && c->dstY == 292);
     CHECK(!head_cfg(1)->layerRequestedConfig[0].flags.surfaceChanged && !scr.leaving);
@@ -894,18 +973,21 @@ static void direct_scanout(void) {
     pending_polls = 1;
     calls[0] = 0;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_DESTROY, b) == NV_OK);
-    CHECK(in_order("flipPending-1 flipPending-1 destroySurface freeMemory") && never("apply-commit"));
-    CHECK(!scr.leaving && image_count() == 1 && scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, b) ==
-          NV_ERR_INVALID_OBJECT_HANDLE);
+    CHECK(in_order("flipPending-1 flipPending-1 panic-image-end unmapMemory destroySurface freeMemory") &&
+          never("apply-commit"));
+    CHECK(!scr.leaving && image_count() == 1 && panic_images() == 1 &&
+          scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, b) == NV_ERR_INVALID_OBJECT_HANDLE);
 
     /* DESTROY of the image shown: the desktop first, the flip completed, then freed. */
     screen_says(APP, true, 100, 50);
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, a) == NV_OK);
     calls[0] = 0;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_DESTROY, a) == NV_OK);
-    CHECK(in_order("flipPending-1 apply-commit flipPending-1 destroySurface freeMemory"));
+    CHECK(in_order("flipPending-1 flipArm-1 apply-commit flipPending-1 panic-image-end unmapMemory destroySurface "
+                   "freeMemory"));
     CHECK(head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(0) && !scr.shown && !scr.leaving &&
-          !scr.images);
+          !scr.images && panic_images() == 0);
+
 
     /* IMPORT: only the image's app; NVKMS's memory shared with the client named for DUP_OBJECT,
        duplicated by the app's own RM file, the share revoked at once. */
@@ -947,11 +1029,64 @@ static void direct_scanout(void) {
     CHECK(head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(0));
     (void)i4;
 
-    /* stop: the threads first, the remaining images and the cursor after ownership is released. */
+    /* A commit NVKMS refuses flips nothing: no completion is awaited after it. */
+    uint32_t i7 = create_image(APP_FILE, APP); /* memory 7 */
+    commit_failures = 1;
+    calls[0] = 0;
+    uint64_t t0 = clock_ns;
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, i7) == NV_ERR_INVALID_STATE && !scr.shown);
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, i7) == NV_OK && scr.shown && scr.shown->number == i7);
+    CHECK(in_order("flipArm-1 apply-commit flipArm-1 apply-commit") && never("flipPending-1") && clock_ns == t0);
+
+    /* DESTROY of the image shown when the flip back to the desktop fails: NVKMS takes the image
+       off the head as its surface goes, and the desktop is flipped back right after. */
+    commit_failures = 1;
+    calls[0] = 0;
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_DESTROY, i7) == NV_OK);
+    CHECK(in_order("apply-commit destroySurface freeMemory flipArm-1 apply-commit"));
+    CHECK(head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(0) && !scr.lost && !scr.shown &&
+          strstr(logs, "is still shown"));
+    /* When that fails too, the next change of the screen's state shows the desktop. */
+    uint32_t i8 = create_image(APP_FILE, APP); /* memory 8 */
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, i8) == NV_OK);
+    commit_failures = 2;
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_DESTROY, i8) == NV_OK);
+    CHECK(scr.lost && !scr.shown && strstr(logs, "the desktop is still not shown"));
+    screen_says(0, true, 100, 50);
+    calls[0] = 0;
+    follow_screen();
+    CHECK(in_order("flipArm-1 apply-commit") && !scr.lost);
+    CHECK(head_cfg(1)->layerRequestedConfig[0].flags.surfaceChanged &&
+          head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(0));
+    calls[0] = 0;
+    follow_screen();
+    CHECK(never("apply-commit"));
+    screen_says(APP, true, 100, 50);
+
+    /* An image the system cannot draw its panic screen into is not made: the app's window stays
+       composited rather than shown where a stopped kernel could not be seen. */
+    unsigned images = image_count();
+    panic_refused = -N_ERR_DENIED;
+    calls[0] = 0;
+    r = (struct nvrm_scanout_request){ .op = NVRM_SCANOUT_CREATE };
+    CHECK(scanout(APP_FILE, APP, &r) == NV_ERR_INSUFFICIENT_RESOURCES && !r.image); /* memory 9 */
+    CHECK(in_order("mapMemory view-image panic-image close50 unmapMemory destroySurface freeMemory"));
+    CHECK(image_count() == images && strstr(logs, "cannot draw its panic screen"));
+    panic_refused = 0;
+    mapping_not_bar = true; /* RM's mapping is not one stretch of a BAR */
+    calls[0] = 0;
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_INSUFFICIENT_RESOURCES); /* memory 10 */
+    CHECK(never("view-image") && never("panic-image") && in_order("mapMemory unmapMemory destroySurface freeMemory"));
+    CHECK(image_count() == images);
+    mapping_not_bar = false;
+
+    /* stop: the threads first, the remaining images and the cursor after ownership is released.
+       Giving the boot screen back let go of the images' views already. */
     calls[0] = 0;
     nvrm_display_stop();
     CHECK(in_order("join join give-boot unregisterVblank-1 close41 releaseOwnership destroySurface freeMemory "
                    "destroySurface unmapMemory freeMemory destroySurface unmapMemory freeMemory freeDevice"));
+    CHECK(in_order("give-boot panic-image-end unmapMemory destroySurface freeMemory") && panic_images() == 0);
     CHECK(mem_freed == mem_used && surf_destroyed == surf_used && !scr.images);
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_NOT_SUPPORTED);
 }
@@ -1009,6 +1144,14 @@ static void no_direct_scanout(void) {
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_NOT_SUPPORTED);
     nvrm_display_stop();
     CHECK(mem_freed == mem_used && surf_destroyed == surf_used);
+
+    /* No state thread, and the system keeps the surface with N_SCANOUT_DIRECT: it would hand
+       fullscreen windows to nvrm, which shows none. The boot screen back, nothing kept. */
+    reset();
+    thread_fails = plain_refused = true;
+    CHECK(!nvrm_display_start());
+    CHECK(in_order("give-surface-direct thread-fails give-surface give-boot releaseOwnership freeDevice"));
+    CHECK(!scr.direct && !scr.given && mem_freed == mem_used && surf_destroyed == surf_used);
 
     /* The system does not say what the screen shows: logged once, nothing presented. */
     reset();

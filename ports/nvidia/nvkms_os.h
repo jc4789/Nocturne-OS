@@ -59,4 +59,12 @@ struct NvKmsKapiMemory;
 bool nvrm_nvkms_memory_handle(const struct NvKmsKapiDevice *device, const struct NvKmsKapiMemory *memory,
                               uint32_t *client, uint32_t *object);
 
+/* The completion of a flip that puts a surface on a head's layer (nvkms_kapi_rm.c), which KAPI's
+ * table does not tell (its getFlipPendingStatus is NULL). nvrm_nvkms_flip_arm goes right before
+ * the commit: it clears the completion notifier that commit names. nvrm_nvkms_flip_done is true
+ * once the display engine has written that notifier, after a commit that succeeded; a commit
+ * that failed or put no surface on the layer names none. Both on the thread that commits. */
+void nvrm_nvkms_flip_arm(struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer);
+bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer);
+
 #endif

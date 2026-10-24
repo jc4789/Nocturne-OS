@@ -205,4 +205,10 @@ extern NvU32 NVreg_ExcludeAllGpus;
 bool nvrm_irq_thread_start(void);
 void nvrm_irq_thread_stop(void);
 
+/* The GPU node's ACPI Notify values to rm_acpi_notify (os_acpi.c), as the original's notifier
+ * (nv_acpi_register_notifier / nv_acpi_unregister_notifier): started once rm_init_adapter
+ * succeeded, stopped before rm_disable_adapter, both outside RM's locks. stop joins its thread. */
+void nvrm_acpi_notify_start(void);
+void nvrm_acpi_notify_stop(void);
+
 #endif

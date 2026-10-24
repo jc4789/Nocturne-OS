@@ -43,7 +43,7 @@ NVKMS_SHADER_OBJ := $(patsubst %,$(NVKMS_OUT)/shaders/%_shaders.xz.o,$(NVKMS_SHA
 # nvrm's own part of the core (nvkms_kapi_rm.c): it reads KAPI's private structures, so it is
 # compiled like NVKMS's sources, and its entry points are kept global like NVIDIA's exports.
 NVKMS_NOCTURNE_OBJ := $(NVKMS_OUT)/core/nocturne/nvkms_kapi_rm.o
-NVKMS_NOCTURNE_EXPORTS := nvrm_nvkms_memory_handle
+NVKMS_NOCTURNE_EXPORTS := nvrm_nvkms_memory_handle nvrm_nvkms_flip_arm nvrm_nvkms_flip_done
 
 NVKMS_OBJ := $(call nvkms_obj,$(NVKMS_SRCS)) $(call nvkms_cxx_obj,$(NVKMS_SRCS_CXX)) \
     $(NVKMS_OUT)/core/g_nvid_string.o $(NVKMS_SHADER_OBJ) $(NVKMS_NOCTURNE_OBJ)

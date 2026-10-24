@@ -770,7 +770,7 @@ void *acpi_node_child(void *node, uint32_t index) {
     return NULL;
 }
 
-static bool name_segment(const char *s) {
+bool acpi_name_segment(const char *s) {
     for (int i = 0; i < 4; i++) {
         char c = s[i];
         if (!(c == '_' || (c >= 'A' && c <= 'Z') || (i && c >= '0' && c <= '9'))) return false;
@@ -847,7 +847,7 @@ static int64_t result_write(uacpi_object *result, uint8_t *out, size_t out_size)
 int64_t acpi_node_eval(void *node, const char *name, const struct n_acpi_value *args, uint32_t nargs,
                        const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size) {
     if (!aml_ready || !node) return -N_ERR_NOT_FOUND;
-    if (!name_segment(name) || nargs > EVAL_ARGS_MAX) return -N_ERR_INVALID;
+    if (!acpi_name_segment(name) || nargs > EVAL_ARGS_MAX) return -N_ERR_INVALID;
     uacpi_object *list[EVAL_ARGS_MAX] = {0};
     int64_t r = 0;
     for (uint32_t i = 0; i < nargs && !r; i++) {

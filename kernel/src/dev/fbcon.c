@@ -345,7 +345,7 @@ static void panic_draw(const char *msg, struct regs *r) {
     panic_log_tail(&c);
     enabled = true;
     fb_drop_holds();
-    fb_present(c.px, c.pitch, NULL, 0, 0, 0, c.w, c.h);
+    fb_present_last(c.px, c.pitch, c.w, c.h);
 }
 
 void panic_screen(const char *msg) { panic_draw(msg, NULL); }

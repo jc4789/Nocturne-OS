@@ -732,11 +732,14 @@ int vmm_demand_fault(uint64_t pml4, uint64_t va, bool write) {
     return result;
 }
 
-/* mprotect: set exactly these permissions on already-mapped user pages */
-int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
+/* mprotect: set exactly these permissions on already-mapped user pages. shared: pages of one shared
+   mapping, whose owner checked prot against the mapping's access and keeps it for the pages that
+   are not present yet (they are skipped here); a read-only shared leaf (PTE_SHARED_RO, a paged
+   page bound for reading) gains no write access. */
+int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot, bool shared) {
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
     uint64_t f = irq_save();
-    for (uint64_t a = start; a < end; a += PAGE_SIZE) {
+    for (uint64_t a = start; !shared && a < end; a += PAGE_SIZE) {
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
         if (!pte || !(*pte & (PTE_P | PTE_DEMAND)) || huge || !(*pte & PTE_U)) { irq_restore(f); return -N_ERR_NO_MEMORY; }
@@ -746,16 +749,19 @@ int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
-        *pte = (*pte & ~(PTE_W | PTE_NX)) | (prot_flags(prot) & (PTE_W | PTE_NX));
+        if (shared && (!pte || huge || !(*pte & PTE_P))) continue;
+        uint64_t bits = shared && (*pte & PTE_SHARED_RO) ? PTE_NX : PTE_W | PTE_NX;
+        *pte = (*pte & ~bits) | (prot_flags(prot) & bits);
     }
     if (start < end) tlb_shootdown(pml4, start, (end - start) / PAGE_SIZE);
     irq_restore(f);
     return 0;
 }
 
-/* Takes write access away from the present 4 KiB leaves of [va, va+size) that have it, and
-   marks them read-only shared pages (PTE_SHARED_RO: no n_memory_protect gives it back). The
-   range is shot down in batches before this returns, so no CPU writes through an old entry. */
+/* Takes write access away from the present 4 KiB leaves of [va, va+size) and marks every one of
+   them a read-only shared page (PTE_SHARED_RO: no n_memory_protect gives it back), also those an
+   n_memory_protect had left without it. The leaves that had write access are shot down in
+   batches before this returns, so no CPU writes through an old entry. */
 void vmm_user_write_protect(uint64_t pml4, uint64_t va, uint64_t size) {
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
     for (uint64_t a = start; a < end; a += UNMAP_BATCH * PAGE_SIZE) {
@@ -764,9 +770,11 @@ void vmm_user_write_protect(uint64_t pml4, uint64_t va, uint64_t size) {
         for (uint64_t i = 0; i < n; i++) {
             bool huge = false;
             uint64_t *p = walk(pml4, a + i * PAGE_SIZE, &huge);
-            if (!p || huge || (*p & (PTE_P | PTE_W)) != (PTE_P | PTE_W)) continue;
-            if (!any) revoke_begin(pml4);
-            any = true;
+            if (!p || huge || !(*p & PTE_P)) continue;
+            if (*p & PTE_W) {
+                if (!any) revoke_begin(pml4);
+                any = true;
+            }
             *p = (*p & ~PTE_W) | PTE_SHARED_RO;
         }
         if (any) tlb_shootdown(pml4, a, n);

@@ -46,9 +46,17 @@ int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timest
    (gui/wm.c keeps the state). */
 struct n_screen_state;
 int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
+/* n_pci_screen_image: for that claim, a surface (as n_pci_give_screen's, without N_SCANOUT_DIRECT)
+   the display engine may show in its scanout's place, which the panic screen is drawn into too;
+   returns its number. n_pci_screen_image_end: that one no longer. The scanout's end, or a scanout
+   without N_SCANOUT_DIRECT, ends them all. */
+int64_t pci_user_screen_image(struct handle *h, struct handle *surface, const struct n_scanout *desc);
+int64_t pci_user_screen_image_end(struct handle *h, int64_t number);
 /* n_pci_acpi_eval and n_pci_acpi_notify_take: the function's part of the ACPI namespace
    (dev/acpi.c). which is N_ACPI_SELF, N_ACPI_UPSTREAM or N_ACPI_CHILD(i); the arguments, their
-   data and out are kernel copies. A thread that may block. */
+   data and out are kernel copies. The methods through which the system runs devices and the
+   platform (power, removal, resources, _OSC, wake, initialisation, sleep), and the upstream
+   bridge's own (not predefined) methods, are refused with N_ERR_DENIED. A thread that may block. */
 struct n_acpi_value;
 int64_t pci_user_acpi_eval(struct handle *h, uint32_t which, const char *name, const struct n_acpi_value *args,
                            uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size);

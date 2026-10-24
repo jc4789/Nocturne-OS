@@ -4,6 +4,7 @@
 #include "arch/smp.h"
 #include "arch/cpu.h"
 #include "dev/pm.h"
+#include "mm/heap.h"
 #include "mm/vmm.h"
 #include "sys/sched.h"
 #include "vm/vm.h"
@@ -26,6 +27,7 @@ struct scanout {
     size_t pages;
     uint32_t pitch, bpp;
     bool native;    /* 32bpp xRGB8888: rows are copied */
+    struct scanout *next; /* fb_scanout_also's list */
     uint32_t lut_r[1024], lut_g[1024], lut_b[1024];
 };
 /* The firmware's, and a driver's: the one shown and the one replacing it. */
@@ -153,7 +155,8 @@ static void present_rows(size_t tile, void *context) {
    driver stuck while holding is ended (pciuser.c: Ctrl+Alt+Esc, boot option fbhold=). Kernel code runs on the
    BSP, but a present runs with interrupts on and can be preempted half way (fbparallel tiles join
    before it returns): a hold, and a change of scanout, wait until no present is between its check
-   and its end. The panic screen is drawn whatever is held, on the scanout shown. */
+   and its end. The panic screen is drawn whatever is held, on the scanout shown and on what the
+   display engine may show in its place (fb_present_last). */
 static unsigned hold_count;    /* atomic */
 static unsigned presenting;    /* atomic: fb_present calls between their check and return */
 static uint64_t hold_since_ms; /* when hold_count left 0 */
@@ -204,7 +207,8 @@ int64_t fb_scanout_check(const struct n_scanout *d, uint64_t *bytes) {
     if (!fb.addr || d->width != fb.width || d->height != fb.height) return -N_ERR_INVALID;
     uint32_t format = d->format & N_SCANOUT_FORMAT_MASK;
     if (d->format & ~(N_SCANOUT_FORMAT_MASK | N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
-    if (format != N_SCANOUT_XRGB8888 && format != N_SCANOUT_XRGB2101010) return -N_ERR_INVALID;
+    if (format != N_SCANOUT_XRGB8888 && format != N_SCANOUT_XRGB2101010 && format != N_SCANOUT_XBGR8888)
+        return -N_ERR_INVALID;
     if (d->pitch < (uint64_t)d->width * 4 || d->pitch % 4) return -N_ERR_INVALID;
     uint64_t rows = (uint64_t)d->pitch * d->height;
     if (d->offset % 4 || d->offset > UINT64_MAX - rows) return -N_ERR_INVALID;
@@ -212,28 +216,81 @@ int64_t fb_scanout_check(const struct n_scanout *d, uint64_t *bytes) {
     return 0;
 }
 
-int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, size_t first_byte,
-                        const struct n_scanout *d) {
-    struct scanout *o = &scanouts[__atomic_load_n(&shown, __ATOMIC_ACQUIRE) == &scanouts[1] ? 2 : 1];
-    ASSERT(!o->map);
+/* o drawn into the given pages in d's format (fb_scanout_check passed). */
+static int64_t scanout_map(struct scanout *o, const uint64_t *frames, size_t pages, uint64_t type,
+                           size_t first_byte, const struct n_scanout *d) {
     void *map = vmalloc_map_frames(frames, pages, PTE_W | type | pte_nx);
     if (!map) return -N_ERR_NO_MEMORY;
-    bool deep = (d->format & N_SCANOUT_FORMAT_MASK) == N_SCANOUT_XRGB2101010;
+    uint32_t format = d->format & N_SCANOUT_FORMAT_MASK;
+    bool deep = format == N_SCANOUT_XRGB2101010, bgr = format == N_SCANOUT_XBGR8888;
     uint8_t rsize = deep ? 10 : 8, gsize = rsize, bsize = rsize;
-    build_lut(o->lut_r, &rsize, deep ? 20 : 16, 32);
+    build_lut(o->lut_r, &rsize, deep ? 20 : bgr ? 0 : 16, 32);
     build_lut(o->lut_g, &gsize, deep ? 10 : 8, 32);
-    build_lut(o->lut_b, &bsize, 0, 32);
+    build_lut(o->lut_b, &bsize, bgr ? 16 : 0, 32);
     o->map = map;
     o->pages = pages;
     o->addr = (uint8_t *)map + first_byte;
     o->pitch = d->pitch;
     o->bpp = 32;
-    o->native = !deep;
-    scanout_show(o);
+    o->native = format == N_SCANOUT_XRGB8888;
     return 0;
 }
 
+int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, size_t first_byte,
+                        const struct n_scanout *d) {
+    struct scanout *o = &scanouts[__atomic_load_n(&shown, __ATOMIC_ACQUIRE) == &scanouts[1] ? 2 : 1];
+    ASSERT(!o->map);
+    int64_t r = scanout_map(o, frames, pages, type, first_byte, d);
+    if (!r) scanout_show(o);
+    return r;
+}
+
 void fb_scanout_boot(void) { scanout_show(&scanouts[0]); }
+
+/* ---- what the display engine may show in the scanout's place ----
+   A driver that shows an app's window directly (N_SCANOUT_DIRECT, gui/wm.c) flips the display
+   engine from its scanout to the app's own images, which nothing of the system's is drawn into.
+   When the kernel stops, the engine goes on showing whichever was flipped last, and no driver runs
+   any more to flip back: the panic screen is drawn into each of them as well (fb_present_last).
+   Nothing else writes there. dev/pciuser.c adds and ends them, one call at a time. */
+static struct scanout *alsos; /* atomic: the list fb_present_last walks */
+
+int64_t fb_scanout_also(const uint64_t *frames, size_t pages, uint64_t type, size_t first_byte,
+                        const struct n_scanout *d, struct scanout **out) {
+    struct scanout *o = kmalloc(sizeof *o);
+    if (!o) return -N_ERR_NO_MEMORY;
+    memset(o, 0, sizeof *o);
+    int64_t r = scanout_map(o, frames, pages, type, first_byte, d);
+    if (r) {
+        kfree(o);
+        return r;
+    }
+    o->next = alsos;
+    __atomic_store_n(&alsos, o, __ATOMIC_RELEASE);
+    *out = o;
+    return 0;
+}
+
+void fb_scanout_also_end(struct scanout *o) {
+    for (struct scanout **at = &alsos; *at; at = &(*at)->next)
+        if (*at == o) {
+            __atomic_store_n(at, o->next, __ATOMIC_RELEASE);
+            break;
+        }
+    presents_drain(); /* a panic screen drawn into it meanwhile is done */
+    vunmap(o->map, o->pages);
+    kfree(o);
+}
+
+void fb_present_last(const uint32_t *src, int src_pitch, int w, int h) {
+    fb_present(src, src_pitch, NULL, 0, 0, 0, w, h);
+    if (!src || !fb.addr || src_pitch <= 0 || w <= 0 || h <= 0) return;
+    __atomic_add_fetch(&presenting, 1, __ATOMIC_SEQ_CST);
+    for (struct scanout *o = __atomic_load_n(&alsos, __ATOMIC_ACQUIRE); o;
+         o = __atomic_load_n(&o->next, __ATOMIC_ACQUIRE))
+        present_area(o, src, src_pitch, NULL, 0, 0, 0, w, h);
+    __atomic_sub_fetch(&presenting, 1, __ATOMIC_RELEASE);
+}
 
 void fb_present(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
                 int x, int y, int w, int h) {

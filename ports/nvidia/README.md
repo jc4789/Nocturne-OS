@@ -21,7 +21,7 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 | `os_ioctl.c` | nv.c の要求の受け口：全エスケープの引数の大きさの検査と、RM でないエスケープ（カード情報、GPU の結付け、版の照合、システム引数、NUMA、デバイス割り込み、開き終わりの状態）。`nvrm_gpu_get／put`（nvidia_dev_get／put） |
 | `rm_api.c` | リクエストサーバーが使う入口 `nvrm_rm_file_open／close／ioctl／mapping_object`（`os_ioctl.c` の後に `rm_ioctl` へ。GPU 専用のエスケープは GPU の `nv_state_t` で渡す） |
 | `os_caps.c` | RM の能力（nv-caps.c と nvlink_caps.c の fabric management）。能力ファイルの代わりに、認証済みの接続の権利で mode を判定する |
-| `os_acpi.c` | RM の ACPI メソッド（nv-acpi.c）と Notify。カーネルの PCI claim の ACPI ABI（`n_pci_acpi_eval`、`n_pci_acpi_notify_take`）で評価する。claim の外の名前は下の「未対応」 |
+| `os_acpi.c` | RM の ACPI メソッド（nv-acpi.c）と Notify。カーネルの PCI claim の ACPI ABI（`n_pci_acpi_eval`、`n_pci_acpi_notify_take`）で評価する。claim の外の名前は下の「未対応」。Notify の受取りスレッド（`nvrm_acpi_notify_start`／`_stop`、`nvrm.c` が呼ぶ）は RM が扱う値（0x81、0xC0、0xD1〜0xD5）だけを `rm_acpi_notify` へ渡し、ほかはログに書いて捨てる |
 | `os_stubs.c` | Nocturne に対応が無い、または RM のこの構成で要らない `os_*`／`nv_*`（下の「未対応」） |
 | `nvlink_os.c` | NVLink／NVSwitch ライブラリーが求める OS 関数（メモリ・文字列・時刻・識別） |
 | `spdm_crypto.c` | libspdm の暗号バックエンド 71 個（libspdm_*.c の移植）。BearSSL で SHA-2、HMAC、HKDF、AES-GCM、ECDH／ECDSA（P-256／P-384）、RSA-PSS、X.509 の検証、乱数は `n_random` |
@@ -33,8 +33,14 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 起動手順（`nvrm.c`）：init が `N_KIND_PCI` をハンドル 3 で渡す → `n_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
 `NVRM_REGISTRY_DWORDS`（環境変数、任意）を `rm_parse_option_string` へ → `rm_init_rm` → `rm_is_supported_device`
 → `rm_init_private_state` → `rm_init_event_locks` → `rm_set_rm_firmware_requested` → 割り込みスレッド
-→ `rm_init_adapter`（ここで GSP が起動する）→ `rm_get_device_name` をログへ → `nvrm_serve()`。
+→ `rm_init_adapter`（ここで GSP が起動する）→ ACPI の Notify の受取り（`nvrm_acpi_notify_start`）→
+`rm_request_dnotifier_state` → `rm_get_device_name` をログへ → `nvrm_serve()`。
 `rm_init_adapter` が失敗しても、診断のためにサーバーは動かし続ける（ログに失敗を残す）。
+後始末（`tear_down`）は Notify の受取りを `rm_disable_adapter` より前に止める（上流の `nv_stop_device` と同じ順）。
+RM は `nv_acpi_methods_init`／`_uninit` を `rm_init_adapter`／`rm_shutdown_adapter` の中で API ロックと GPU
+ロックを持ったまま呼び、`rm_acpi_notify` は同じロックを取るので、そこでスレッドを join するとデッドロックしうる。
+そのため受取りスレッドの開始と join は `nvrm.c` が RM のロックの外で行い、`nv_acpi_methods_init`／`_uninit` は
+RM の取決めどおりメソッドの準備と片付けだけをする。
 init／libnvrm／NVK は共通の PCI 選別条件（NVIDIA、VGA または 3D、progif 0）を使う。
 NVK は生の PCI 件数を GPU 数にせず、HELLO で adapter 初期化成功を確認し、接続先 RM の probed ID と PCI 情報が一致する BDF の動的 snapshot を列挙する。probed ID だけでは初期化成功を保証しない。
 
@@ -121,7 +127,8 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `os_flush_cpu_cache_all`／`write_combine_buffer`／`user_cache` | `os_flush_cpu_cache_all` は WB の DMA オブジェクトをすべて `clflush`（全 CPU のキャッシュに届き、GPU は IOMMU でこれらにしか届かない）。RM は DMA の能力を調べ終える前にファームウェアの写しで求める（実機で確認）。`user_cache` は空、WC バッファーは `sfence` |
 | `os_get_random_bytes`、`os_get_version_info` ほか | `n_random`（システムの乱数）、版は "Nocturne OS" の固定値 |
 
-スレッドの前提：割り込みスレッド（`n_pci_interrupt_take` → `rm_isr` → 必要なら `rm_isr_bh`）とリクエストスレッド
+スレッドの前提：割り込みスレッド（`n_pci_interrupt_take` → `rm_isr` → 必要なら `rm_isr_bh`）、ACPI の Notify の
+受取りスレッド（`n_pci_acpi_notify_take` → `rm_acpi_notify`）とリクエストスレッド
 は、**RM 自身のロック（GPU ロック、スピンロック＝mutex）だけで互いを守る**。nvrm はその外側に追加のロックを置かない。
 `nvrm_in_isr` は `rm_isr` の間だけ真。
 
@@ -141,7 +148,7 @@ RM が OS 層に求める約束（`os_*`／`nv_*`／`nvlink_*`／`libspdm_*`）�
 | `nv-pci.c` | PCI の probe／remove、BAR、バスマスター、電源 | `nvrm.c` の起動手順、`os_pci.c`（`nvrm_pci_attach`、`nvrm_pci_bus_master`、`nvrm_pci_detach`） | 移植済み。Grace の C2C／EGM／NUMA の部分は該当ハードウェア無し。ランタイム電源管理は下の「未対応」 |
 | `nv-pci-table.c` | 引き受ける PCI 装置の表 | init／libnvrm／NVK の共通の選別（NVIDIA、VGA か 3D、progif 0）と `rm_is_supported_device` | 移植済み |
 | `nv-msi.c` | MSI／MSI-X の有効化 | `os_pci.c`（`nvrm_irq_enable`：`n_pci_interrupts`、`NV_FLAG_USES_MSI(X)`） | 移植済み（ベクター 1 本） |
-| `nv-acpi.c` | GPU の ACPI メソッド（`_DSM`、`_ROM`、`_DOD`、`_DDC`、MUX）と Notify | `os_acpi.c`（全メソッド） | 移植済み：GPU の装置・その子・上流のブリッジのメソッドと Notify は、カーネルの PCI claim の ACPI ABI（`n_pci_acpi_eval`、`n_pci_acpi_notify_take`）で評価する。claim の外（`_PSR`、電池、`\_SB.NPCF`、NVIF／WMMX）は下の「未対応」 |
+| `nv-acpi.c` | GPU の ACPI メソッド（`_DSM`、`_ROM`、`_DOD`、`_DDC`、MUX）と Notify | `os_acpi.c`（全メソッド。`nv_acpi_register_notifier`／`unregister_notifier` は `nvrm_acpi_notify_start`／`_stop`） | 移植済み：GPU の装置・その子・上流のブリッジのメソッドと Notify は、カーネルの PCI claim の ACPI ABI（`n_pci_acpi_eval`、`n_pci_acpi_notify_take`）で評価する。カーネルが断る ACPI のメソッド（ABI 文書 §9。電源・取出し・`_OSC` など）は RM のどのメソッドにも当たらない。claim の外（`_PSR`、電池、`\_SB.NPCF`、NVIF／WMMX）は下の「未対応」 |
 | `nv-caps.c` | 能力（MIG、fabric、profiler など）の木と、その証明 | `os_caps.c`（`os_nv_cap_*`。能力ファイルの代わりに、システムが認証した接続の権利で mode を判定） | 移植済み |
 | `nvlink_caps.c` | NVLink の能力ファイル（fabric-mgmt） | `os_caps.c`（`nvlink_fabric_mgmt`、RM の FM session） | 移植済み |
 | `nv-caps-imex.c` | IMEX チャンネル（複数ノードの NVLink のメモリ共有） | `os_stubs.c`（`os_imex_channel_get` は −1、`count` は 0） | 該当ハードウェア無し（複数ノードの NVLink 構成） |
@@ -297,7 +304,13 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
 6. 面：pitch を NVKMS の pitch の整列に揃えた pitch linear の X8R8G8B8 を、`allocateMemory`（vidmem、SCANOUT、
    noDisplayCaching）で取り、`mapMemory`（KERNEL）→ `createSurface`。
 7. GOP の画面を面へ行ごとに写す（読めなければ黒）。
-8. `applyModeSetConfig`（commit=FALSE で検査 → TRUE で確定）→ `getFlipPendingStatus` で最大 3 秒フリップの完了を待つ。
+8. `applyModeSetConfig`（commit=FALSE で検査 → TRUE で確定）→ 最大 3 秒フリップの完了を待つ。KAPI の関数表の
+   `getFlipPendingStatus` は `nvKmsKapiGetFunctionsTable` が埋めない（NULL。nvidia-drm は `FLIP_OCCURRED` のイベントを待つ）。
+   そこで `nvkms_kapi_rm.c` が KAPI の通知面を読む：層に面を載せる commit ごとに KAPI はその層の二つの完了通知の片方
+   （`layerState[head][layer].currFlipNotifierIndex` の次）を名指し、表示エンジンがフリップの完了でそこへ「完了」を書く。
+   KAPI は名指す前に通知を消さないので、二つ前のフリップの書込みが残っている。`nvrm_nvkms_flip_arm` が commit の直前に
+   その通知を「未開始」へ戻し、`nvrm_nvkms_flip_done` が commit の後で読む（`nvKmsResetNotifier`／`nvKmsParseNotifier`）。
+   失敗した commit は何もフリップしないので待たない。
 9. カーソル：表示エンジンが 32×32 の A8R8G8B8（非 premultiplied のアルファ）のカーソルと、主層の X8B8G8R8 を扱えれば、
    pitch linear の vidmem（pitch は NVKMS の 32×32 の最小の 256）を取り、写して `createSurface` する。直接表示（下）で
    アプリの絵の上にポインターを出すのに使う。
@@ -337,6 +350,12 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 
 - **CREATE**：画面の大きさ・pitch の X8B8G8R8（pitch linear、vidmem、SCANOUT）を KAPI で取り、`createSurface`。他のアプリが
   使った VRAM の中身が見えないよう、黒で埋めてから返す。番号・幅・高さ・pitch・バイト数を返す。絵は接続とアプリのもの。
+  さらに、RM が写した BAR1 の範囲の view を `n_pci_screen_image`（`N_SCANOUT_XBGR8888`）でカーネルに登録する。カーネルが
+  止まると、表示エンジンは最後にフリップした絵を出し続け、デスクトップへ戻すフリップをする者はもういない。カーネルは
+  パニック画面をデスクトップの面と登録された絵のすべてへ描く。BAR1 のひと続きの範囲でないか、登録を断られた絵は作らない
+  （`NV_ERR_INSUFFICIENT_RESOURCES`）。パニック画面を出せない絵をフリップしないため。絵の解放では最初に
+  `n_pci_screen_image_end` で登録を外し、それから写しと面と memory を解放する。`N_SCANOUT_DIRECT` 無しの渡し直しと起動画面へ
+  戻すことでも、カーネルは登録をすべて外す。
 - **IMPORT**：絵の memory をアプリの RM client のものにする。Nocturne には Linux の `exportMemory` の fd が無いので、NVKMS の
   RM client（`nvkms_kapi_rm.c` の `nvrm_nvkms_memory_handle` で KAPI の構造から読む）が、カーネル権限の `NV04_SHARE` で
   その memory を要求者が名指した client だけに DUP_OBJECT で共有し（RS_SHARE_TYPE_CLIENT）、アプリの**自分の** RM ファイルで
@@ -350,14 +369,19 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 - **状態スレッド**：`n_pci_screen_state` で変化を待ち、出しているアプリがもう直接表示されないならデスクトップの面へ戻し、
   そのままならカーソルを動かす。
 - **DESTROY**・接続の終わり・stop：出ている絵はデスクトップへ戻すフリップの完了を、一つ前に出ていた絵はそのフリップの完了を
-  待ってから `destroySurface`／`freeMemory` する。他のアプリの絵は「無い」と同じ `NV_ERR_INVALID_OBJECT_HANDLE`。
+  待ってから `destroySurface`／`freeMemory` する。デスクトップへ戻すフリップが失敗したときは、NVKMS が面の破棄で絵を head
+  から外す（head には面が無くなる）ので、絵を解放した直後と、以後の画面の状態の変化ごとに、デスクトップへ戻すフリップを
+  やり直す（`scr.lost`）。他のアプリの絵は「無い」と同じ `NV_ERR_INVALID_OBJECT_HANDLE`。
 - 抜き差しのモード設定はデスクトップの面を出す。head が無ければ PRESENT は断る。
 - 排他：head を変えるもの（作業スレッド、状態スレッド、要求のスレッド）は `scr.head_lock` で順に行う。
 
 試験：`python tests/nvrm_display_hosttest.py`（偽の KAPI・RM・ハンドルで、立ち上げと後始末の順序、モードの選択、失敗時に
-画面を渡さないこと、抜き差し、直接表示（作成、許可の有無と PRESENT、一つ前のフリップ待ち、カーソル、デスクトップへの戻り、
-DESTROY・接続の終わり・stop の順序、IMPORT の持ち主と共有→DUP→取消、直接表示が無いとき）を確かめる。製品の `display.c` を
-対象の設定でも構文検査する）。`tests/nvrm_servetest.c` は `NVRM_SCANOUT` が接続の RM ファイルと principal 付きで届くことと、
+画面を渡さないこと、抜き差し（フリップの完了が見えないまま点いた head）、直接表示（作成とパニック画面の登録、登録を断られた
+ときと BAR1 のひと続きでないときに絵を作らないこと、許可の有無と PRESENT、一つ前の
+フリップ待ち、commit の直前の完了通知の消去、失敗した commit の後は待たないこと、カーソル、デスクトップへの戻り、戻すフリップの
+失敗からの回復、DESTROY・接続の終わり・stop の順序、IMPORT の持ち主と共有→DUP→取消、直接表示が無いとき、状態スレッドが
+無く `N_SCANOUT_DIRECT` 無しで渡し直せないとき）を確かめ、製品の `display.c` を対象の設定でも構文検査する。
+`tests/nvrm_servetest.c` は `NVRM_SCANOUT` が接続の RM ファイルと principal 付きで届くことと、
 接続の絵が RM ファイルより先に終わることを確かめる（Nocturne 上で動く）。
 
 ### nvidia-drm の全 43 ファイルとの対応
@@ -404,7 +428,8 @@ DESTROY・接続の終わり・stop の順序、IMPORT の持ち主と共有→D
   `importMemory` で面にする）は、`isVidmem`／`isContiguous` で走査面にできるかの確認とともに要るときに足す。
 - **窓の大きさの絵・オーバーレイ層**：今の絵は画面の大きさだけで、主層だけを使う。
 - **形式と色**：X8B8G8R8／X8R8G8B8 以外（ARGB8888、10 ビット、YUV）の対応表と、色処理の段。
-- **実機**：RTX 4070 での KAPI のフリップ・カーソル・`NV04_SHARE`＋DUP の挙動は未確認。
+- **実機**：RTX 4070 での KAPI のフリップ・フリップの完了通知の書込み・カーソル・`NV04_SHARE`＋DUP の挙動と、BAR1 の
+  絵へのパニック画面の描画は未確認。
 
 ## UVM（nvidia-uvm）
 
@@ -413,7 +438,9 @@ nvidia-uvm.ko ではなく nvrm の中に入れる。UVM は RM の `nvUvmInterf
 通して GPU を使うので、GPU を持つ nvrm の中に置き、RM との間に通信は挟まない。クライアントは RM と同じ接続で `NVRM_UVM`
 （`include/nvrm_protocol.h`）を送る。
 
-取り込み（上流 615.78.08 と同じ内容・同じ相対位置、変更なし）：`kernel-open/nvidia-uvm` の 223 ファイル（`hwref` を含む、
+取り込み（上流 615.78.08 と同じ相対位置。変更は `NVRM_NOCTURNE` の条件の追加だけ：`nvidia-uvm` の 40 ファイルで Linux の
+ヘッダーの読込みを外し、`uvm_linux.h` は Linux の層の代わりに `uvm_os.h` を、`nv_uvm_interface.c`・`nv_uvm_interface.h` は `uvm_rm.h` を
+読む。処理の本文は変えない）：`kernel-open/nvidia-uvm` の 223 ファイル（`hwref` を含む、
 約 15 万 4 千行）、`kernel-open/nvidia/nv_uvm_interface.c`、`kernel-open/common/inc` の `nv_uvm_interface.h`・`nv-kthread-q.h`・
 `rm-gpu-ops.h`。すべて MIT（`COPYING`）で、`NOTICES` に加える物は無い。`uvm_common.c` は GPLv2 以降なので取り込まず、
 本文も参照しない（`uvm_common.h` の宣言する関数は `uvm_os.c` が自前で持つ）。`uvm_linux.c`（Linux の memcg と scatterlist）と

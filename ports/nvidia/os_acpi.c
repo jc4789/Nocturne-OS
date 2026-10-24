@@ -5,7 +5,8 @@
  * firmware), _DOD (the display outputs), _DDC of an internal panel's child device, the MUX
  * methods MXDS/MXDM of a switchable output's child device, and _DSM of the upstream bridge for
  * D3cold. It also listens to the GPU node's Notify events (rm_acpi_notify: display hotplug, GPS
- * and D-notifier events).
+ * and D-notifier events) while the adapter runs, as the original's notifier does (nvrm.c starts
+ * and stops it, outside RM's locks).
  *
  * Nocturne's kernel holds the AML interpreter (uACPI, kernel/src/dev/acpi.c); a driver app
  * reaches its claimed function's part of the namespace through the PCI claim: the function's
@@ -56,6 +57,7 @@ static NV_STATUS acpi_eval(uint32_t node, const char *path, const struct n_acpi_
         if (r == -N_ERR_INVALID) return NV_ERR_INVALID_INDEX; /* no such node: past the last child */
         if (r == -N_ERR_UNSUPPORTED) return NV_ERR_NOT_SUPPORTED;
         if (r == -N_ERR_TOO_LARGE) return NV_ERR_BUFFER_TOO_SMALL;
+        if (r == -N_ERR_DENIED) return NV_ERR_INSUFFICIENT_PERMISSIONS; /* a method the system keeps */
         return NV_ERR_OPERATING_SYSTEM;
     }
     out->nodes = out->block;
@@ -169,14 +171,16 @@ static NV_STATUS acpi_dsm(uint32_t node, const NvU8 *guid, NvU32 revision, NvU32
     return status;
 }
 
-/* The first device under the GPU's node whose _ADR passes match. */
+/* The first device under the GPU's node whose _ADR passes match. A child without an _ADR the
+   original could read (none, or not an integer) is skipped, as there. Any other failure ends the
+   search: one of the claim or the system would come again for every number (a failed _ADR
+   method answers as they do, NV_ERR_OPERATING_SYSTEM). */
 static NV_STATUS acpi_find_child(bool (*match)(NvU64 address, NvU32 wanted), NvU32 wanted, uint32_t *node) {
     for (uint32_t i = 0;; i++) {
         NvU64 address;
         NV_STATUS status = acpi_eval_integer(N_ACPI_CHILD(i), "_ADR", &address);
         if (status == NV_ERR_INVALID_INDEX) return NV_ERR_GENERIC; /* past the last child: none matched */
-        if (status == NV_ERR_NOT_SUPPORTED || status == NV_ERR_NO_MEMORY) return status;
-        /* a child without an _ADR the original could read is skipped, as there */
+        if (status != NV_OK && status != NV_ERR_OBJECT_NOT_FOUND && status != NV_ERR_INVALID_DATA) return status;
         if (status == NV_OK && match(address, wanted)) {
             *node = N_ACPI_CHILD(i);
             return NV_OK;
@@ -185,11 +189,24 @@ static NV_STATUS acpi_find_child(bool (*match)(NvU64 address, NvU32 wanted), NvU
 }
 
 /* ---------------------------------------------------------------- notifications */
+/* Notify(GPU node, value) to rm_acpi_notify on a thread of its own, from nvrm_acpi_notify_start
+   to nvrm_acpi_notify_stop (nvrm_os.h). Not from nv_acpi_methods_init/uninit: RM calls those from
+   rm_init_adapter and rm_shutdown_adapter holding its API and GPU locks, which rm_acpi_notify
+   takes, so a join there could wait for a thread that waits for them. */
 static thrd_t notify_thread;
 static bool notify_running;
 static atomic_bool notify_stop;
 
-/* Notify(GPU node, value) to rm_acpi_notify, as the original's notify handler. */
+/* The values rm_acpi_notify handles (RM's platform/acpi_common.h): display hotplug
+   (ACPI_VIDEO_NOTIFY_PROBE), the GPS status (ACPI_NOTIFY_GPS_STATUS_CHANGE) and the D-notifier's
+   power levels (ACPI_NOTIFY_POWER_LEVEL_D1..D5). RM asserts on any other; those go to the log. */
+static void notify_rm(n_result value) {
+    if (value == 0x81 || value == 0xC0 || (value >= 0xD1 && value <= 0xD5))
+        rm_acpi_notify(nvrm_dev.sp, &nvrm_dev.nv, (NvU32)value);
+    else
+        nvrm_log("NVRM: ACPI Notify 0x%x on the GPU is not one RM handles; dropped", (unsigned)value);
+}
+
 static int notify_loop(void *arg) {
     (void)arg;
     nvrm_thread_admin = true;
@@ -197,29 +214,42 @@ static int notify_loop(void *arg) {
         n_result value = n_pci_acpi_notify_take(nvrm_dev.pci, 250);
         if (value == -N_ERR_TIMEOUT) continue;
         if (value < 0) break;
-        rm_acpi_notify(nvrm_dev.sp, &nvrm_dev.nv, (NvU32)value);
+        notify_rm(value);
     }
     return 0;
 }
 
-/* RM's "which global ACPI handles exist" (NVIF, WMMX); called when the adapter starts. */
+void nvrm_acpi_notify_start(void) {
+    if (notify_running) return;
+    /* The first take starts the system's feed, so a Notify sent once this returns is kept (the
+       D-notifier's state that rm_request_dnotifier_state asks the firmware for next). */
+    n_result first = n_pci_acpi_notify_take(nvrm_dev.pci, 0);
+    if (first < 0 && first != -N_ERR_TIMEOUT) {
+        nvrm_log("NVRM: no ACPI notifications for the GPU (%s)", n_result_text(first));
+        return; /* no node of its own (or no AML): nothing can come */
+    }
+    if (first >= 0) notify_rm(first);
+    atomic_store(&notify_stop, false);
+    notify_running = thrd_create(&notify_thread, notify_loop, NULL) == thrd_success;
+    if (!notify_running) nvrm_log("NVRM: no thread for the GPU's ACPI notifications");
+}
+
+void nvrm_acpi_notify_stop(void) {
+    if (!notify_running) return;
+    atomic_store(&notify_stop, true);
+    thrd_join(notify_thread, NULL);
+    notify_running = false;
+}
+
+/* RM's "which global ACPI handles exist" (NVIF, WMMX); called when the adapter starts, inside
+   RM's locks. */
 void NV_API_CALL nv_acpi_methods_init(NvU32 *handlesPresent) {
     if (!handlesPresent) return;
     *handlesPresent = 0; /* NVIF and WMMX live outside the claim */
-    if (!notify_running) {
-        atomic_store(&notify_stop, false);
-        notify_running = thrd_create(&notify_thread, notify_loop, NULL) == thrd_success;
-        if (!notify_running) nvrm_log("NVRM: no thread for the GPU's ACPI notifications");
-    }
 }
 
-void NV_API_CALL nv_acpi_methods_uninit(void) {
-    if (notify_running) {
-        atomic_store(&notify_stop, true);
-        thrd_join(notify_thread, NULL);
-        notify_running = false;
-    }
-}
+/* The adapter's shutdown, inside RM's locks: no handle was kept, nothing to let go. */
+void NV_API_CALL nv_acpi_methods_uninit(void) {}
 
 /* NVIF and WMMX: no handle was found (nv_acpi_methods_init), as the original then answers. */
 NV_STATUS NV_API_CALL nv_acpi_method(NvU32 method, NvU32 function, NvU32 sub_function, void *in, NvU16 in_size,

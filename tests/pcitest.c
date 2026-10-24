@@ -237,7 +237,9 @@ static void acpi_cases(n_handle vga, const struct n_pciinfo *at) {
           r < 0 ? n_result_text(r) : "another layout");
     CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof *v) == -N_ERR_TOO_LARGE,
           "a result larger than the room is refused");
-    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "NONE", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_NOT_FOUND,
+    /* QEMU's tables give the host bridge no _ROM (its own names, as "NONE", are refused:
+       acpi_refused_cases) */
+    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_ROM", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_NOT_FOUND,
           "a missing name");
     CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID &&
               n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_SB_.PCI0", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
@@ -258,6 +260,55 @@ static void acpi_cases(n_handle vga, const struct n_pciinfo *at) {
                   v[0].value == ((uint64_t)at->dev << 16 | at->func),
               "the VGA's own _ADR: %s", r < 0 ? n_result_text(r) : "another value");
         CHECK(n_pci_acpi_notify_take(vga, 0) == -N_ERR_TIMEOUT, "no notification waiting");
+    }
+}
+
+/* The ACPI methods through which the system runs devices and the platform stay the system's, as
+   the config bits do: refused on every node before the node is looked up, so edu gets the same
+   answer whether QEMU's tables give it a node of its own or not, and a child past the last is
+   refused too. On the bridge above it (q35's host bridge, whose _OSC exists: without the refusal
+   it would answer N_ERR_IO, the AML wanting 4 arguments) the firmware's own names are refused as
+   well. The names a driver uses (RM's) answer as they did. */
+static void acpi_refused_cases(n_handle pci, const struct n_pciinfo *at) {
+    static uint64_t out[512];
+    struct n_acpi_value *v = (struct n_acpi_value *)out;
+    static const char *const system_methods[] = {
+        "_PS0", "_PS1", "_PS2", "_PS3", "_ON_", "_OFF", "_RST", "_EJ0", "_EJ1", "_EJ2", "_EJ3", "_EJ4", "_LCK", "_DCK",
+        "_DIS", "_SRS", "_OSC", "_OST", "_PSW", "_DSW", "_INI", "_REG", "_EVT", "_PTS", "_WAK", "_TTS", "_GTS", "_BFS",
+    };
+    static const uint32_t nodes[] = {N_ACPI_SELF, N_ACPI_UPSTREAM, N_ACPI_CHILD(0), N_ACPI_CHILD(1000)};
+    for (size_t i = 0; i < sizeof system_methods / sizeof *system_methods; i++)
+        for (size_t k = 0; k < sizeof nodes / sizeof *nodes; k++) {
+            n_result r = n_pci_acpi_eval(pci, nodes[k], system_methods[i], NULL, 0, NULL, 0, out, sizeof out);
+            CHECK(r == -N_ERR_DENIED, "%s on node %x is the system's: %s", system_methods[i], nodes[k],
+                  n_result_text(r));
+        }
+    n_result r = n_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "NONE", NULL, 0, NULL, 0, out, sizeof out);
+    CHECK(r == -N_ERR_DENIED, "the bridge's own names are the platform's: %s", n_result_text(r));
+    r = n_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out);
+    CHECK(r == -N_ERR_INVALID, "a malformed name stays malformed on the bridge: %s", n_result_text(r));
+    /* as before the refusals */
+    r = n_pci_acpi_eval(pci, N_ACPI_SELF, "NONE", NULL, 0, NULL, 0, out, sizeof out);
+    CHECK(r == -N_ERR_NOT_FOUND, "the function's own names are not refused: %s", n_result_text(r));
+    r = n_pci_acpi_eval(pci, N_ACPI_SELF, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
+    CHECK(r == -N_ERR_NOT_FOUND, "edu has no _ROM: %s", n_result_text(r));
+    r = n_pci_acpi_eval(pci, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    CHECK(r == -N_ERR_NOT_FOUND || (r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER &&
+                                    v[0].value == ((uint64_t)at->dev << 16 | at->func)),
+          "edu's own _ADR, when it has a node: %s", r < 0 ? n_result_text(r) : "another value");
+    r = n_pci_acpi_eval(pci, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    CHECK(r == -N_ERR_INVALID, "edu has no child devices: %s", n_result_text(r));
+    r = n_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
+    CHECK(r == -N_ERR_NOT_FOUND, "a predefined name the host bridge lacks: %s", n_result_text(r));
+    /* RM's names on the nodes it uses them on (those that take arguments get none here, so no AML
+       of theirs runs: whatever the answer, it is not a refusal) */
+    static const struct { uint32_t node; const char *name; } rm[] = {
+        {N_ACPI_SELF, "_DSM"}, {N_ACPI_SELF, "_ROM"}, {N_ACPI_SELF, "_DOD"}, {N_ACPI_UPSTREAM, "_DSM"},
+        {N_ACPI_CHILD(0), "_ADR"}, {N_ACPI_CHILD(0), "_DDC"}, {N_ACPI_CHILD(0), "MXDS"}, {N_ACPI_CHILD(0), "MXDM"},
+    };
+    for (size_t i = 0; i < sizeof rm / sizeof *rm; i++) {
+        r = n_pci_acpi_eval(pci, rm[i].node, rm[i].name, NULL, 0, NULL, 0, out, sizeof out);
+        CHECK(r != -N_ERR_DENIED, "RM's %s on node %x is not refused", rm[i].name, rm[i].node);
     }
 }
 
@@ -371,9 +422,19 @@ static bool direct_heard(window_t *win, int key) {
         if (win_event(win, &e, 200) > 0 && e.type == EV_DIRECT && e.key == key) return true;
     return false;
 }
-static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout *d) {
-    struct n_scanout direct = *d;
+/* The images such a driver shows in its scanout's place, the app's own (n_pci_screen_image): the
+   panic screen is drawn into them too, as no driver runs then to show the scanout again. They are
+   in the format NVIDIA's are, red in the low byte. The last is in the second buffer (when there is
+   room), apart from the scanout's own rows; with linger_s (and the Bochs registers) it is shown
+   that long, as a driver shows an app's window: a panic meanwhile (QEMU's monitor: nmi) is to be
+   seen on it, red and blue swapped, as the display reads XRGB8888, and in its own colors on the
+   scanout. */
+static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout *d, n_handle edu_bar,
+                         uint64_t second, volatile uint16_t *dispi, unsigned linger_s) {
+    struct n_scanout direct = *d, image = *d, bad;
     direct.format |= N_SCANOUT_DIRECT;
+    image.format = N_SCANOUT_XBGR8888;
+    CHECK(n_pci_screen_image(vga, surface, &image) == -N_ERR_DENIED, "no image while the boot screen is shown");
     n_result r = n_pci_give_screen(vga, surface, &direct);
     CHECK(r == 0, "a surface that can show fullscreen windows directly: %s", n_result_text(r));
     if (r) return;
@@ -384,6 +445,20 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
     r = n_pci_screen_state(vga, seen, &st, 100);
     CHECK(r == -N_ERR_TIMEOUT && st.serial == seen && uptime_ms() - t0 >= 90, "the state waits for a change: %s",
           n_result_text(r));
+    bad = image, bad.format |= N_SCANOUT_DIRECT;
+    CHECK(n_pci_screen_image(vga, surface, &bad) == -N_ERR_INVALID, "an image is no scanout of its own");
+    bad = image, bad.width++;
+    CHECK(n_pci_screen_image(vga, surface, &bad) == -N_ERR_INVALID, "an image of another width");
+    bad = image, bad.format = 99;
+    CHECK(n_pci_screen_image(vga, surface, &bad) == -N_ERR_INVALID, "an image of an unknown format");
+    if (edu_bar >= 0)
+        CHECK(n_pci_screen_image(vga, edu_bar, &image) == -N_ERR_DENIED, "an image in another claim's BAR");
+    n_result one = n_pci_screen_image(vga, surface, &image), two = n_pci_screen_image(vga, surface, &image);
+    CHECK(one > 0 && two > 0 && one != two, "two images the panic screen is drawn into: %lld %lld", (long long)one,
+          (long long)two);
+    r = n_pci_screen_image_end(vga, one);
+    CHECK(r == 0 && n_pci_screen_image_end(vga, one) == -N_ERR_INVALID && n_pci_screen_image_end(vga, 0) == -N_ERR_INVALID,
+          "an image ended once: %s", n_result_text(r));
     window_t *win = NULL;
     if (!gui_available() || win_open(320, 200, "pcitest", 0, &win) < 0) {
         CHECK(0, "a window to show directly");
@@ -404,8 +479,23 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
         win_close(win);
         CHECK(screen_app(vga, &st, 0), "a closed window is no longer shown");
     }
+    r = n_pci_give_screen(vga, surface, d);
+    CHECK(r == 0 && n_pci_screen_image_end(vga, two) == -N_ERR_INVALID,
+          "a scanout without N_SCANOUT_DIRECT ends the images: %s", n_result_text(r));
+    r = n_pci_give_screen(vga, surface, &direct);
+    if (second) image.offset = second;
+    one = r ? r : n_pci_screen_image(vga, surface, &image);
+    CHECK(one > 0, "an image again%s: %s", second ? ", in the second buffer" : "", n_result_text(one));
+    if (one > 0 && linger_s && dispi && second) {
+        show_row(dispi, (uint32_t)(second / d->pitch));
+        printf("pcitest: the image in the second buffer is shown for %u s; a panic meanwhile is drawn there too\n",
+               linger_s);
+        n_sleep_ms(linger_s * 1000);
+        show_row(dispi, (uint32_t)(d->offset / d->pitch));
+    }
     r = n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL);
-    CHECK(r == 0 && n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "the boot screen back ends direct showing");
+    CHECK(r == 0 && n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED && n_pci_screen_image_end(vga, one) == -N_ERR_INVALID,
+          "the boot screen back ends direct showing and its images");
     n_sleep_ms(300);
 }
 
@@ -462,6 +552,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     if (edu >= 0) {
         CHECK(n_pci_give_screen(edu, edu_bar, &d) == -N_ERR_DENIED, "edu is no display function");
         CHECK(n_pci_give_screen(vga, edu_bar, &d) == -N_ERR_DENIED, "another claim's BAR");
+        CHECK(n_pci_screen_image(edu, edu_bar, &d) == -N_ERR_DENIED, "edu shows no images");
     }
     bad = d, bad.width++;
     CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "another width");
@@ -491,6 +582,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(r == 0, "the boot screen's memory as the driver's surface: %s", n_result_text(r));
     struct n_screen_state st;
     CHECK(n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "no screen state without N_SCANOUT_DIRECT");
+    CHECK(n_pci_screen_image(vga, surface, &d) == -N_ERR_DENIED, "no image without N_SCANOUT_DIRECT");
     n_sleep_ms(300);
     CHECK(marks(gop) == 0, "all of the screen is drawn again: %d marks left", marks(gop));
     uint64_t count = 0;
@@ -537,11 +629,14 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL) == -N_ERR_INVALID, "given back once");
     CHECK(n_pci_screen_vblank(vga, ++count, 0) == -N_ERR_DENIED, "no vertical blanks of the boot screen");
     CHECK(n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "no screen state of the boot screen");
-    direct_cases(vga, surface, &d);
+    direct_cases(vga, surface, &d, edu_bar, second + frame <= size ? second : 0, dispi, linger_s);
 
-    /* the claim's end gives the screen back */
-    r = n_pci_give_screen(vga, surface, &d);
-    CHECK(r == 0, "a surface the claim's end gives back: %s", n_result_text(r));
+    /* the claim's end gives the screen back, and ends its images */
+    struct n_scanout direct = d;
+    direct.format |= N_SCANOUT_DIRECT;
+    r = n_pci_give_screen(vga, surface, &direct);
+    if (!r) r = n_pci_screen_image(vga, surface, &d);
+    CHECK(r > 0, "a surface the claim's end gives back, with an image: %s", n_result_text(r));
     n_sleep_ms(300);
     mark(gop);
     n_memory_release(whole, size);
@@ -894,6 +989,7 @@ int main(int argc,char **argv) {
             if (bridge >= 0) n_handle_close(bridge);
             break;
         }
+    acpi_refused_cases(pci, e);
     CHECK(n_pci_hold_screen(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
     give_screen_cases(pci, list, n, 0);
     /* a function on bus 0 that is neither this device nor a bridge above it */

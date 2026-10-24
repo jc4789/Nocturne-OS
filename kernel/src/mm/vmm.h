@@ -63,9 +63,10 @@ int vmm_user_reserve(uint64_t pml4, uint64_t va, uint64_t size, int prot); /* ze
 /* First touch of a reserved page: 1 when mapped (or already present), 0 when
    va is no reserved page, -N_ERR_NO_MEMORY when no frame is left. */
 int vmm_demand_fault(uint64_t pml4, uint64_t va, bool write);
-int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot);
+/* shared: pages of one shared mapping whose access the caller checked; absent pages are skipped */
+int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot, bool shared);
 void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size);
-void vmm_user_write_protect(uint64_t pml4, uint64_t va, uint64_t size); /* present pages lose W */
+void vmm_user_write_protect(uint64_t pml4, uint64_t va, uint64_t size); /* present pages lose W for good */
 int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n);
 bool vmm_handle_user_fault(uint64_t addr, uint64_t err);
 void vmm_switch(uint64_t pml4); /* PCID対応。gen が進んだ space のtagだけ破棄 */

@@ -710,8 +710,11 @@ static void os_free(struct uvm_os_vma *os)
 
 /* A committed mapping ends (mmap_lock held for writing): UVM's close, then it leaves the
    address space and the file's mappings, and its memory loses every page, so nothing UVM frees
-   later stays reachable by the client. */
-static void vma_close(struct uvm_os_mm *conn, struct vm_area_struct *vma)
+   later stays reachable by the client. Returns the file the mapping held (vm_file), which the
+   caller puts once mmap_lock is released: UVM's release is written for Linux, where it never
+   runs under mmap_lock (an unmap drops the lock before the file's last reference goes, which
+   may be this one once the client has closed the file). */
+static struct file *vma_close(struct uvm_os_mm *conn, struct vm_area_struct *vma)
 {
     struct uvm_os_vma *os = vma->os;
     if (vma->vm_ops && vma->vm_ops->close)
@@ -728,7 +731,10 @@ static void vma_close(struct uvm_os_mm *conn, struct vm_area_struct *vma)
     }
     if (os->watched && conn->events >= 0)
         n_events_unwatch(conn->events, vma->vm_start);
+    struct file *file = vma->vm_file;
+    vma->vm_file = NULL;
     os_free(os);
+    return file;
 }
 
 /* ---- the fault thread ---- */
@@ -823,9 +829,10 @@ static void mapping_gone(struct uvm_os_mm *conn, uint64_t start)
 {
     mmap_write_lock(&conn->mm);
     struct vm_area_struct *vma = vma_at(&conn->mm, start);
-    if (vma)
-        vma_close(conn, vma);
+    struct file *file = vma ? vma_close(conn, vma) : NULL;
     mmap_write_unlock(&conn->mm);
+    if (file)
+        fput(file);
 }
 
 #define STOP_TOKEN 0   /* mappings' tokens are their start addresses, never 0 */
@@ -1008,9 +1015,10 @@ int uvm_os_map_commit(struct mm_struct *mm, uint64_t token, uint64_t address)
     if (!fault_thread_start(conn)) {
         printk("nvidia-uvm: app %u: no fault thread; its mapping at 0x%llx is taken back\n", conn->principal,
                (unsigned long long)address);
-        os->file = NULL;
-        vma_close(conn, vma);
+        struct file *file = vma_close(conn, vma);
         mmap_write_unlock(mm);
+        if (file)
+            fput(file);
         return -ENOMEM;
     }
     n_result watched = n_events_watch(conn->events, os->pager, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, vma->vm_start);
@@ -1032,11 +1040,12 @@ int uvm_os_unmap(struct mm_struct *mm, uint64_t address, uint64_t token)
     int r = 0;
     if (address) {
         struct vm_area_struct *vma = vma_at(mm, address);
-        if (vma)
-            vma_close(conn, vma);
-        else
+        struct file *file = vma ? vma_close(conn, vma) : NULL;
+        if (!vma)
             r = -ENOENT;
         mmap_write_unlock(mm);
+        if (file)
+            fput(file);
         return r;
     }
     struct uvm_os_vma *os = pending_take(conn, token);
@@ -1058,15 +1067,26 @@ static void exit_mmap(struct uvm_os_mm *conn)
         rb_erase(&conn->arena.mm_node, &mm->vmas);
         conn->has_arena = false;
     }
-    struct rb_node *node;
-    while ((node = rb_first(&mm->vmas)))
-        vma_close(conn, rb_entry(node, struct vm_area_struct, mm_node));
-    struct uvm_os_vma *os;
-    while ((os = list_first_entry_or_null(&conn->pending, struct uvm_os_vma, pending))) {
-        list_del_init(&os->pending);
-        os_free(os);
-    }
     mmap_write_unlock(mm);
+    /* One at a time: each mapping's file, and each uncommitted map's, is put with mmap_lock
+       released (vma_close). */
+    for (;;) {
+        struct file *file = NULL;
+        struct uvm_os_vma *os = NULL;
+        mmap_write_lock(mm);
+        struct rb_node *node = rb_first(&mm->vmas);
+        if (node)
+            file = vma_close(conn, rb_entry(node, struct vm_area_struct, mm_node));
+        else if ((os = list_first_entry_or_null(&conn->pending, struct uvm_os_vma, pending)))
+            list_del_init(&os->pending);
+        mmap_write_unlock(mm);
+        if (!node && !os)
+            break;
+        if (file)
+            fput(file);
+        if (os)
+            os_free(os);
+    }
 }
 
 void mmput(struct mm_struct *mm)

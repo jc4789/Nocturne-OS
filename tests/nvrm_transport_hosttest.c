@@ -140,6 +140,15 @@ n_result nvrm_uvm_request(struct nvrm_uvm_client **client, uint32_t principal, v
     return 0;
 }
 void nvrm_uvm_client_end(struct nvrm_uvm_client *client) { (void)client; }
+/* The screen (display.h), as the server sees it when nvrm shows none it can show images on
+   (tests/nvrm_servetest.c checks what reaches it). */
+n_result nvrm_display_scanout(void *file, uint32_t principal, void *args, uint32_t size) {
+    CHECK(file == &rm_calls && principal == sender_app);
+    if (size != sizeof(struct nvrm_scanout_request)) return -N_ERR_INVALID;
+    ((struct nvrm_scanout_request *)args)->status = NV_ERR_NOT_SUPPORTED;
+    return 0;
+}
+void nvrm_display_connection_end(void *file) { CHECK(file == &rm_calls); }
 uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
     (void)file;
     rm_calls++;

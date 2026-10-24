@@ -125,6 +125,9 @@ enum {
     SYS_PCI_ACPI_NOTIFY_TAKE, /* (pci, timeout_ms): the next Notify value of the function's node */
     /* A display driver that shows windows directly (N_SCANOUT_DIRECT) follows the screen */
     SYS_PCI_SCREEN_STATE,  /* (pci, seen serial, struct n_screen_state *out, timeout_ms) */
+    /* What such a driver may show in its scanout's place, which the panic screen is drawn into too */
+    SYS_PCI_SCREEN_IMAGE,     /* (pci, surface, const struct n_scanout *): the image's number */
+    SYS_PCI_SCREEN_IMAGE_END, /* (pci, number) */
     SYS_MAX = 208          /* above every number (what syscallfuzz tries) */
 };
 
@@ -322,6 +325,7 @@ struct n_pci_function {
    from one row to the next, offset the first row's place in the surface. */
 #define N_SCANOUT_XRGB8888 1u    /* 32 bits: x8 r8 g8 b8, blue in the lowest byte */
 #define N_SCANOUT_XRGB2101010 2u /* 32 bits: x2 r10 g10 b10, blue in the lowest bits */
+#define N_SCANOUT_XBGR8888 3u    /* 32 bits: x8 b8 g8 r8, red in the lowest byte */
 #define N_SCANOUT_BOOT (-1)      /* the surface argument: the firmware's framebuffer again */
 /* A flag in format: the driver can show a window's own images instead of the desktop and draw
    the pointer itself while it does (n_pci_screen_state says when and where). */

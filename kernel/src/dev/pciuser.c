@@ -235,14 +235,42 @@ static struct shared_scanout screen_surface;
 /* The scanout shown has N_SCANOUT_DIRECT: its driver shows the windows the window manager lets it
    show directly (gui/wm.c, n_pci_screen_state). */
 static bool screen_direct;
+/* The images such a driver may show in its scanout's place (n_pci_screen_image): the panic screen
+   is drawn into them too (dev/fb.c, fb_scanout_also), as no driver runs then to show the desktop's
+   surface again. They live while the owner's scanout has N_SCANOUT_DIRECT. Under screen_lock. */
+struct screen_image {
+    struct screen_image *next;
+    int64_t number;          /* never 0 or negative */
+    struct shared_scanout surface;
+    struct scanout *out;
+};
+static struct screen_image *screen_images;
+static int64_t screen_image_last;
 
 static void screen_say(const struct pci_claim *c, const char *what) {
     kprintf("pci: %02x:%02x.%u: %s\n", c->d->bus, c->d->dev, c->d->func, what);
 }
 
+/* Nothing is drawn into it any more, nor mapped or pinned. screen_lock held, out of the list. */
+static void screen_image_free(struct screen_image *i) {
+    fb_scanout_also_end(i->out);
+    shared_scanout_close(&i->surface);
+    kfree(i);
+}
+
+/* Every image of the owner's: when its scanout is gone or no longer N_SCANOUT_DIRECT. */
+static void screen_images_end(void) {
+    while (screen_images) {
+        struct screen_image *i = screen_images;
+        screen_images = i->next;
+        screen_image_free(i);
+    }
+}
+
 /* The boot screen again, when c shows its surface: true when it did. screen_lock held. */
 static bool screen_give_back(struct pci_claim *c) {
     if (screen_owner != c) return false;
+    screen_images_end();
     fb_scanout_boot();
     shared_scanout_close(&screen_surface);
     __atomic_store_n(&screen_owner, NULL, __ATOMIC_RELEASE);
@@ -657,10 +685,14 @@ int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const str
             screen_surface = s;
             __atomic_store_n(&screen_owner, c, __ATOMIC_RELEASE);
             screen_direct = (desc->format & N_SCANOUT_DIRECT) != 0;
+            if (!screen_direct) screen_images_end(); /* nothing is shown in the scanout's place now */
+            uint32_t format = desc->format & N_SCANOUT_FORMAT_MASK;
             char line[160];
             ksnprintf(line, sizeof line, "the desktop is drawn into its driver's %ux%u %s scanout (pitch %u)%s",
                       desc->width, desc->height,
-                      (desc->format & N_SCANOUT_FORMAT_MASK) == N_SCANOUT_XRGB2101010 ? "XRGB2101010" : "XRGB8888",
+                      format == N_SCANOUT_XRGB2101010 ? "XRGB2101010"
+                      : format == N_SCANOUT_XBGR8888  ? "XBGR8888"
+                                                      : "XRGB8888",
                       desc->pitch, screen_direct ? ", which can show fullscreen windows directly" : "");
             screen_say(c, line);
         }
@@ -692,6 +724,50 @@ int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_s
     return wm_screen_state(seen, out, timeout_ms);
 }
 
+int64_t pci_user_screen_image(struct handle *h, struct handle *surface, const struct n_scanout *desc) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    uint64_t bytes = 0;
+    int64_t r = desc->format & N_SCANOUT_DIRECT ? -N_ERR_INVALID : fb_scanout_check(desc, &bytes);
+    if (r) return r;
+    struct screen_image *i = kmalloc(sizeof *i);
+    if (!i) return -N_ERR_NO_MEMORY;
+    memset(i, 0, sizeof *i);
+    mutex_lock(&screen_lock);
+    if (screen_owner != c || !screen_direct) r = -N_ERR_DENIED;
+    if (!r) r = shared_scanout_open(surface, c, desc->offset, bytes, &i->surface);
+    if (!r) {
+        r = fb_scanout_also(i->surface.frames, i->surface.pages, i->surface.type, i->surface.first_byte, desc,
+                            &i->out);
+        if (r) shared_scanout_close(&i->surface);
+    }
+    if (!r) {
+        i->number = r = ++screen_image_last;
+        i->next = screen_images;
+        screen_images = i;
+    }
+    mutex_unlock(&screen_lock);
+    if (r < 0) kfree(i);
+    return r;
+}
+
+int64_t pci_user_screen_image_end(struct handle *h, int64_t number) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    int64_t r = -N_ERR_INVALID;
+    mutex_lock(&screen_lock);
+    for (struct screen_image **at = &screen_images; screen_owner == c && *at; at = &(*at)->next)
+        if ((*at)->number == number) {
+            struct screen_image *i = *at;
+            *at = i->next;
+            screen_image_free(i);
+            r = 0;
+            break;
+        }
+    mutex_unlock(&screen_lock);
+    return r;
+}
+
 /* ---- the function's part of the ACPI namespace (dev/acpi.c) ---- */
 
 /* The function's node and the one above it, once. acpi_lock held. */
@@ -702,10 +778,41 @@ static void acpi_look(struct pci_claim *c) {
     c->acpi_upstream = c->d->upstream ? acpi_pci_node(c->d->upstream) : acpi_pci_host(c->d);
 }
 
+/* The predefined methods through which the system itself runs devices and the platform, as the
+   kernel runs its config bits (guards_init): power and reset, removal and docking, resources, the
+   handshake that decides what the firmware or the system controls, wake, initialisation and
+   handlers (operation regions, GPIO events), system sleep. A driver's evaluation would change
+   behind the kernel what it keeps track of (dev/pm.c, dev/pci.c), and on the bridge above it
+   every function below that bridge. None is part of a driver's own protocol with its firmware
+   (RM's: _DSM, _ROM, _DOD, _DDC, _ADR, MXDS, MXDM). */
+static const char acpi_system_methods[][5] = {
+    "_PS0", "_PS1", "_PS2", "_PS3", "_ON_", "_OFF", "_RST", /* power, reset */
+    "_EJ0", "_EJ1", "_EJ2", "_EJ3", "_EJ4", "_LCK", "_DCK", /* removal, docking */
+    "_DIS", "_SRS",                                         /* resources */
+    "_OSC", "_OST",                                         /* the system and firmware's handshake */
+    "_PSW", "_DSW",                                         /* wake */
+    "_INI", "_REG", "_EVT",                                 /* initialisation, handlers */
+    "_PTS", "_WAK", "_TTS", "_GTS", "_BFS",                 /* system sleep */
+};
+
+/* Whether a driver may evaluate name (a name segment) on node which: none of the methods above,
+   and on the bridge above it predefined names only: the bridge's own methods (the firmware's
+   power and link control of its slot) belong to the platform and every function below it, as
+   its registers do (a bridge is never claimed). Decided before the node is looked up, so a
+   function with a node and one without get the same answer. */
+static bool acpi_name_allowed(uint32_t which, const char *name) {
+    if (which == N_ACPI_UPSTREAM && name[0] != '_') return false;
+    for (size_t i = 0; i < ARRAY_SIZE(acpi_system_methods); i++)
+        if (!memcmp(name, acpi_system_methods[i], 4)) return false;
+    return true;
+}
+
 int64_t pci_user_acpi_eval(struct handle *h, uint32_t which, const char *name, const struct n_acpi_value *args,
                            uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
+    if (!acpi_name_segment(name)) return -N_ERR_INVALID;
+    if (!acpi_name_allowed(which, name)) return -N_ERR_DENIED;
     if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
     mutex_lock(&c->acpi_lock);
     acpi_look(c);

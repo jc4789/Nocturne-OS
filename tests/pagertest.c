@@ -2,18 +2,24 @@
  * this app: it answers touches of unbound pages from a backing object it holds. Covered: the
  * fault round trip, bound pages needing no pager, the write upgrade, revocation of write access
  * and of frames, replacing a bound frame, kernel copies through paged memory, a failed fault
- * (access violation in another app), that no other app can use or receive the pager, and the end
- * of the pager (bound pages stay, unbound ones fail) and of the memory (N_ERR_CLOSED). */
+ * (access violation in another app), that no other app can use or receive the pager, the end
+ * of the pager (bound pages stay, unbound ones fail) and of the memory (N_ERR_CLOSED); also that
+ * n_memory_protect holds for pages bound later and for a page bound for writing (a kernel copy
+ * is a bad address, another app's write an access violation), that revoking a view a page was
+ * supplied from (or its parent) unbinds the page in every mapping, and that a composite is no
+ * source. */
 #include "nocturne.h"
 #include <stdio.h>
 #include <string.h>
 static unsigned checks,failed;
 #define CHECK(x) do{checks++;if(!(x)){failed++;printf("ページャー失敗 行 %d\n",__LINE__);}}while(0)
 #define PAGE N_PAGE_SIZE
-#define PAGES 8
+#define PAGES 10
 #define BYTES ((size_t)PAGES*PAGE)
 #define FAIL_PAGE 6   /* the pager fails touches of this page */
 #define KFAIL_PAGE 7  /* and of this one, touched by a kernel copy */
+#define PROTECT_PAGE 8 /* made read-only by n_memory_protect before it is bound */
+#define VIEW_PAGE 9   /* supplied from views that are then revoked */
 
 static n_handle pager=-1,memory=-1,backing=-1;
 static volatile int stop;
@@ -73,6 +79,19 @@ static int toucher(size_t page){
     char go;if(!receive(0,&go,1,NULL))return 5;
     return m[page*PAGE]==0xEE?6:7; /* a failed touch never returns */
 }
+/* Another app maps the memory for writing and makes a page bound for writing read-only: its write
+   there is an access violation (status 128+14) and never lands. */
+static int protect_writer(void){
+    n_handle h=-1;char tag[3]; /* "mem" */
+    if(!receive(0,tag,sizeof tag,&h)||h<0||n_handle_kind(h)!=N_KIND_SHARED)return 2;
+    void *mm;if(n_shared_map(h,BYTES,N_MEMORY_READ_WRITE,&mm)<0)return 3;
+    volatile unsigned char *m=mm;
+    unsigned char seen=m[PROTECT_PAGE*PAGE];
+    if(n_memory_protect((void *)(m+PROTECT_PAGE*PAGE),PAGE,N_MEMORY_READ)!=0)return 4;
+    if(n_channel_send(0,&seen,1,-1)!=1)return 5;
+    m[PROTECT_PAGE*PAGE]=0xEE;
+    return 6;
+}
 /* Another app given the pager handle at launch: it may neither take nor supply. */
 static int thief(void){
     struct n_pager_fault f;
@@ -106,6 +125,7 @@ int main(int argc,char **argv){
     if(argc>1&&!strcmp(argv[1],"touch-fail"))return toucher(FAIL_PAGE);
     if(argc>1&&!strcmp(argv[1],"touch-ended"))return toucher(5);
     if(argc>1&&!strcmp(argv[1],"thief"))return thief();
+    if(argc>1&&!strcmp(argv[1],"protect-write"))return protect_writer();
 
     pager=n_pager_create(BYTES-100,&memory); /* rounded up to whole pages */
     CHECK(pager>=0&&memory>=0);if(pager<0||memory<0)return 1;
@@ -133,6 +153,11 @@ int main(int argc,char **argv){
     n_handle ro=n_shared_view_access(backing,0,BYTES,N_CACHE_DEFAULT,N_MEMORY_READ);CHECK(ro>=0);
     bad=(struct n_pager_supply){.offset=0,.bytes=PAGE,.source=ro,.access=N_MEMORY_READ_WRITE};
     CHECK(n_pager_supply(pager,&bad,1)==-N_ERR_DENIED); /* write access needs a writable source */
+    struct n_shared_range part={.shared=alt,.offset=0,.bytes=PAGE};
+    n_handle composite=n_shared_compose(&part,1,N_MEMORY_READ);CHECK(composite>=0);
+    bad=(struct n_pager_supply){.offset=0,.bytes=PAGE,.source=composite,.access=N_MEMORY_READ};
+    CHECK(n_pager_supply(pager,&bad,1)==-N_ERR_DENIED); /* a composite: its parts are supplied themselves */
+    n_handle_close(composite);
     CHECK(n_pager_revoke(pager,0,PAGE,N_MEMORY_READ_WRITE)==-N_ERR_INVALID);
     CHECK(n_pager_revoke(pager,0,BYTES+PAGE,0)==-N_ERR_INVALID);
     CHECK(n_shared_view_access(memory,0,PAGE,N_CACHE_DEFAULT,N_MEMORY_READ)==-N_ERR_WRONG_KIND);
@@ -182,6 +207,53 @@ int main(int argc,char **argv){
     /* ... and one the pager fails is a bad address, not a crash. */
     CHECK(n_channel_send(c[0],(const void *)(m+KFAIL_PAGE*PAGE),64,-1)==-N_ERR_BAD_ADDRESS);
     CHECK(faults==6&&last_page==KFAIL_PAGE);
+    /* n_memory_protect holds for pages the pager binds later: a page made read-only before it was
+       bound stays so after a binding for writing (a kernel copy into it is a bad address), and
+       read/write gives the write back. */
+    unsigned before=faults;
+    volatile unsigned char *pp=m+PROTECT_PAGE*PAGE;
+    CHECK(n_memory_protect((void *)pp,PAGE,N_MEMORY_READ)==0); /* nothing bound there yet */
+    CHECK(pp[3]==pattern(PROTECT_PAGE*PAGE+3)&&faults==before+1&&last_access==N_MEMORY_READ);
+    run=(struct n_pager_supply){.offset=PROTECT_PAGE*PAGE,.bytes=PAGE,.source_offset=PROTECT_PAGE*PAGE,
+                                .source=backing,.access=N_MEMORY_READ_WRITE};
+    CHECK(n_pager_supply(pager,&run,1)==0);
+    CHECK(n_random((void *)pp,16)==-N_ERR_BAD_ADDRESS&&faults==before+1);
+    CHECK(back[PROTECT_PAGE*PAGE]==pattern(PROTECT_PAGE*PAGE));
+    CHECK(n_memory_protect((void *)pp,PAGE,N_MEMORY_READ_WRITE)==0);
+    CHECK(n_channel_send(c[0],"pqrs",4,-1)==4&&receive(c[1],(void *)pp,4,NULL));
+    CHECK(back[PROTECT_PAGE*PAGE]=='p'&&faults==before+1);
+    /* Another app making the page read-only cannot write it either. */
+    n_handle wend=-1;
+    n_handle wapp=launch(argv[0],"protect-write",-1,&wend);CHECK(wapp>=0);
+    if(wapp>=0){
+        CHECK(n_channel_send(wend,"mem",3,memory)==3);
+        unsigned char seen=0;CHECK(receive(wend,&seen,1,NULL)&&seen=='p');
+        int status=-1;CHECK(n_app_result(wapp,-1,&status)==0&&status==128+14);
+        if(status==128+14)printf("pagertest: expected writer fault status=%d (protected page)\n",status); /* test.py lets it be */
+        CHECK(back[PROTECT_PAGE*PAGE]=='p'&&faults==before+1);
+        n_handle_close(wapp);n_handle_close(wend);
+    }
+    /* A page supplied from a view goes with the revocation of the view (here its parent's), in
+       every mapping: the next touch asks the pager again, and the revoked view binds nothing. */
+    n_handle view=n_shared_view_access(alt,0,BYTES,N_CACHE_DEFAULT,N_MEMORY_READ_WRITE);CHECK(view>=0);
+    n_handle child=n_shared_view_access(view,0,BYTES,N_CACHE_DEFAULT,N_MEMORY_READ);CHECK(child>=0);
+    run=(struct n_pager_supply){.offset=VIEW_PAGE*PAGE,.bytes=PAGE,.source_offset=VIEW_PAGE*PAGE,
+                                .source=child,.access=N_MEMORY_READ};
+    CHECK(n_pager_supply(pager,&run,1)==0);
+    CHECK(m[VIEW_PAGE*PAGE]==0xA9&&r[VIEW_PAGE*PAGE+7]==0xA9&&faults==before+1);
+    CHECK(n_shared_revoke(view)==0);
+    CHECK(r[VIEW_PAGE*PAGE+7]==pattern(VIEW_PAGE*PAGE+7)&&faults==before+2&&last_page==VIEW_PAGE);
+    CHECK(m[VIEW_PAGE*PAGE]==pattern(VIEW_PAGE*PAGE)&&faults==before+2);
+    CHECK(n_pager_supply(pager,&run,1)==-N_ERR_CLOSED);
+    /* The same frame supplied again through the root: the page answers to the root now, so the
+       revocation of the view it came through before leaves it bound. */
+    n_handle again=n_shared_view(alt,0,BYTES,N_CACHE_DEFAULT);CHECK(again>=0);
+    run.source=again;CHECK(n_pager_supply(pager,&run,1)==0);
+    CHECK(m[VIEW_PAGE*PAGE]==0xA9&&faults==before+2);
+    run.source=alt;CHECK(n_pager_supply(pager,&run,1)==0);
+    CHECK(n_shared_revoke(again)==0);
+    CHECK(m[VIEW_PAGE*PAGE]==0xA9&&r[VIEW_PAGE*PAGE]==0xA9&&faults==before+2);
+    n_handle_close(view);n_handle_close(child);n_handle_close(again);
     /* A failed touch in another app is an access violation there; its bound pages read fine. */
     expect_fault(argv[0],FAIL_PAGE,"pager failed it");
     /* Nobody else may use the pager, even holding its handle. */

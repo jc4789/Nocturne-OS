@@ -7,8 +7,8 @@
  *
  *   options (NVRM_REGISTRY_DWORDS) -> rm_init_rm -> n_pci_info / BAR0 -> rm_is_supported_device
  *   -> rm_init_private_state -> interrupts -> rm_init_adapter (GSP firmware boots here)
- *   -> rm_get_device_name -> NVKMS (nvkms_os.c) and the screen (display.c) -> UVM (uvm_rm.c)
- *   -> nvrm_serve
+ *   -> ACPI notifications (os_acpi.c) -> rm_get_device_name -> NVKMS (nvkms_os.c) and the
+ *   screen (display.c) -> UVM (uvm_rm.c) -> nvrm_serve
  *
  * Firmware (gsp_ga10x.bin, and for the log gsp_log_*.bin) comes from
  * C:\Nocturne\Firmware\NVIDIA\615.78.08 (os.c).
@@ -266,6 +266,10 @@ static bool bring_up(void) {
         return true; /* RM's client API (without a working GPU) is still served for diagnosis */
     }
     d->adapter_ready = true;
+    /* The GPU node's ACPI notifications, then RM's request for the D-notifier's state (on
+       notebooks the firmware answers it with a Notify), as nv_start_device. */
+    nvrm_acpi_notify_start();
+    rm_request_dnotifier_state(sp, nv);
 
     const char *name = rm_get_device_name(d->info.device, d->info.subsystem_vendor, d->info.subsystem_id);
     snprintf(d->name, sizeof d->name, "%s", name ? name : "(unknown)");
@@ -282,9 +286,10 @@ static bool bring_up(void) {
     return true;
 }
 
-/* Everything that enters RM from its own threads (interrupts, timers, work items) is stopped and
-   joined before the state it uses is freed: stop the GPU, then the interrupt thread, then
-   RM's shutdown of the adapter (which still needs timers and work), then timers and workers. */
+/* Everything that enters RM from its own threads (ACPI notifications, interrupts, timers, work
+   items) is stopped and joined before the state it uses is freed: the notifications, stop the
+   GPU, then the interrupt thread, then RM's shutdown of the adapter (which still needs timers
+   and work), then timers and workers. Each join happens here, holding none of RM's locks. */
 static void tear_down(void) {
     struct nvrm_device *d = &nvrm_dev;
     /* UVM (every client's UVM state ended with the request server), the screen back to the
@@ -292,6 +297,7 @@ static void tear_down(void) {
     nvrm_uvm_stop();
     nvrm_display_stop();
     nvrm_nvkms_stop();
+    nvrm_acpi_notify_stop(); /* before the adapter goes, as nv_stop_device */
     if (d->sp && d->adapter_ready) rm_disable_adapter(d->sp, &d->nv);
     nvrm_irq_thread_stop();
     if (d->sp && d->adapter_ready) {

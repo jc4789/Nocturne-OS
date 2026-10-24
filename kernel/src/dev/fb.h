@@ -46,6 +46,17 @@ int64_t fb_scanout_check(const struct n_scanout *d, uint64_t *bytes);
 int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, size_t first_byte,
                         const struct n_scanout *d);
 void fb_scanout_boot(void);
+/* What the display engine may show in the scanout's place (an app's image shown directly,
+   n_pci_screen_image, dev/pciuser.c, the only caller, one call at a time): fb_scanout_also maps
+   the pages as fb_scanout_take would, but nothing is drawn there except the panic screen.
+   fb_scanout_also_end returns once nothing writes there any more and it is no longer mapped. */
+struct scanout;
+int64_t fb_scanout_also(const uint64_t *frames, size_t pages, uint64_t type, size_t first_byte,
+                        const struct n_scanout *d, struct scanout **out);
+void fb_scanout_also_end(struct scanout *o);
+/* The kernel's last screen (the panic screen), a full-screen 32bpp xRGB buffer: into the scanout
+   shown and everything fb_scanout_also added. */
+void fb_present_last(const uint32_t *src, int src_pitch, int w, int h);
 /* Optional boot-time real-framebuffer test; only runs with the fbbench flag. */
 void fb_benchmark(const uint32_t *src, int src_pitch);
 /* Sleep (dev/pm.h): the display registers once PCI is known; it resumes only where the mode can

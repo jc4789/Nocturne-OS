@@ -25,7 +25,9 @@ uint64_t uptime_ms(void);
 /* Native memory (docs/nocturne-native-abi.md §7): zero-filled pages with
  * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access; reserve also takes
  * N_MEMORY_LOW added to the access, for pages below 2 GiB. reserve puts the
- * pages in *memory (NULL on failure). */
+ * pages in *memory (NULL on failure). protect on a shared mapping keeps within
+ * one mapping and its access (never execution), and holds for its pages not
+ * mapped yet too. */
 n_result n_memory_reserve(size_t bytes, int access, void **memory);
 n_result n_memory_release(void *addr, size_t bytes);
 n_result n_memory_protect(void *addr, size_t bytes, int access);
@@ -139,7 +141,8 @@ n_result n_pci_hold_screen(n_handle pci, bool hold);
    any more. surface: a writable shared object made through this claim, its BAR (prefetchable;
    drawn write-combined, so a view of it the driver maps must be write-combining too) or a DMA
    object whose type is not write-back (a write-combining or uncached view sets it), or a view of
-   either; desc says where in it (offset, pitch) and how (N_SCANOUT_XRGB8888 or XRGB2101010).
+   either; desc says where in it (offset, pitch) and how (N_SCANOUT_XRGB8888, XRGB2101010 or
+   XBGR8888).
    Its width and height must be the screen's as the firmware set it (n_pci_info's framebuffer_width
    and framebuffer_height on the function it is in); a change of size is not offered yet.
    Returns once nothing is drawn into what was shown before; the new surface is drawn in full.
@@ -157,6 +160,18 @@ n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns
    N_ERR_TIMEOUT: out is the state numbered seen. N_ERR_DENIED: the screen is not drawn into this
    claim's surface or it has no N_SCANOUT_DIRECT. */
 n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
+/* For that driver: a surface its display engine may show in its scanout's place (an app's image
+   shown directly), given as n_pci_give_screen's surface is (format without N_SCANOUT_DIRECT;
+   N_SCANOUT_XBGR8888 too). The system never draws there but once: its panic screen, which goes to
+   the scanout and to every such surface, as the engine keeps showing what it was flipped to last
+   and no driver runs any more. Returns the surface's number (positive); n_pci_screen_image_end
+   with it lets go before the driver frees the memory. A scanout without N_SCANOUT_DIRECT, the
+   boot screen given back, or the claim's end lets go of them all. N_ERR_DENIED: the screen is not
+   drawn into this claim's N_SCANOUT_DIRECT scanout, or the object is not one n_pci_give_screen
+   takes; N_ERR_INVALID: another size, an unknown format, a range beyond the object, or (end) no
+   such number. */
+n_result n_pci_screen_image(n_handle pci, n_handle surface, const struct n_scanout *desc);
+n_result n_pci_screen_image_end(n_handle pci, n_result image);
 /* The function's part of the ACPI namespace, as the firmware describes it: its device node
    (N_ACPI_SELF), that node's device children (N_ACPI_CHILD(i), in namespace order), and the node
    of the bridge it is below (N_ACPI_UPSTREAM; the host bridge's on a root bus). n_pci_acpi_eval
@@ -164,11 +179,18 @@ n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *
    (at most 7) integer, string or buffer arguments whose bytes are in data (at most 64 KiB), and
    writes the result to out: struct n_acpi_value records, the first one the result, then the
    bytes of its strings and buffers; it returns how many bytes it wrote (at most 1 MiB).
+   N_ERR_DENIED, on every node and whether it exists or not: the methods through which the system
+   itself runs devices and the platform: power and reset (_PS0 to _PS3, _ON_, _OFF, _RST), removal
+   and docking (_EJ0 to _EJ4, _LCK, _DCK), resources (_DIS, _SRS), the handshake that decides what
+   the firmware controls (_OSC, _OST), wake (_PSW, _DSW), initialisation and handlers (_INI, _REG,
+   _EVT), system sleep (_PTS, _WAK, _TTS, _GTS, _BFS); and on N_ACPI_UPSTREAM every name not
+   starting with _ (the bridge's own methods belong to the platform and every function below it).
    N_ERR_NOT_FOUND: no such node or object; N_ERR_INVALID: a child number past the last (a
-   function without a node has no children), a malformed name or argument; N_ERR_TOO_LARGE: out is too small; N_ERR_IO: the AML failed;
-   N_ERR_UNSUPPORTED: the system runs without AML. n_pci_acpi_notify_take returns the next
-   Notify value of the function's node from its first call on (it waits like
-   n_pci_interrupt_take; 32 not taken are kept, the oldest give way). */
+   function without a node has no children), a malformed name or argument; N_ERR_TOO_LARGE: out
+   is too small; N_ERR_IO: the AML failed; N_ERR_UNSUPPORTED: the system runs without AML.
+   n_pci_acpi_notify_take returns the next Notify value of the function's node from its first
+   call on (it waits like n_pci_interrupt_take; 32 not taken are kept, the oldest give way;
+   N_ERR_NOT_FOUND: the function has no node). */
 n_result n_pci_acpi_eval(n_handle pci, uint32_t node, const char *name, const struct n_acpi_value *args,
                          uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size);
 n_result n_pci_acpi_notify_take(n_handle pci, int64_t timeout_ms);
@@ -197,10 +219,12 @@ n_result n_shared_revoke(n_handle view);
    n_pager_take gives such faults (up to max; timeout_ms -1 waits, 0 polls: N_ERR_TIMEOUT;
    N_ERR_CLOSED once the memory is gone), and the handle is N_EVENT_RECEIVABLE while some wait.
    n_pager_supply binds runs of pages to RAM the pager holds (write-back; a DMA object's too),
-   which every mapper then reaches without asking again; n_pager_revoke takes the frames
-   (access 0) or the write access (N_MEMORY_READ) of a run away from every mapper at once;
-   n_pager_fail makes the waiting touches of a run access violations. When the pager handle
-   closes, bound pages stay and the others fail. Paged memory has no views. */
+   given as a root or a view of one (not a composite), which every mapper then reaches without
+   asking again; revoking the view a page came through (or a view it descends from) unbinds
+   that page everywhere. n_pager_revoke takes the frames (access 0) or the write access
+   (N_MEMORY_READ) of a run away from every mapper at once; n_pager_fail makes the waiting
+   touches of a run access violations. When the pager handle closes, bound pages stay and the
+   others fail. Paged memory has no views; n_memory_protect holds for its unbound pages too. */
 n_handle n_pager_create(size_t bytes, n_handle *memory);
 n_result n_pager_take(n_handle pager, struct n_pager_fault *out, size_t max, int64_t timeout_ms);
 n_result n_pager_supply(n_handle pager, const struct n_pager_supply *runs, size_t count);

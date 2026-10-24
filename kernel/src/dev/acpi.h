@@ -97,6 +97,10 @@ struct pci_device;
 void *acpi_pci_node(const struct pci_device *d);
 void *acpi_pci_host(const struct pci_device *d);
 void *acpi_node_child(void *node, uint32_t index);
+/* Whether s is one name segment: 4 characters of A-Z, 0-9 and _, the first not a digit (names of
+   fewer characters are padded with _, as "_ON_"). Names starting with _ are ACPI's predefined
+   ones; the others are the firmware's own. */
+bool acpi_name_segment(const char *s);
 /* Evaluates the object name (one name segment, directly under node: no search upwards) with
    the arguments args[0..nargs) whose bytes lie in data, and writes the result to out as
    struct n_acpi_value records (the first one is the result) followed by the strings' and
