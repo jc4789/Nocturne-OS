@@ -11,6 +11,12 @@
 int space_format(struct volume *v);
 int space_mount(struct volume *v);
 void space_destroy(struct volume *v);
+/* The volume of blocks (more than it has, the device as large) in the open generation: the map for
+   the new size in the room grown by, the old copies and odd superblock let go (volume_grow).
+   Fails whole, with nothing changed; -N_ERR_INVALID when that room is too small for the map. */
+int space_grow(struct volume *v, uint64_t blocks);
+/* Bitmap blocks both copies hold as memory has them: out of memory, read again when needed. */
+void space_trim(struct volume *v);
 
 /* Room for blocks the caller will ask for later (content written into memory now): -N_ERR_NO_SPACE
    when it would leave less than catalog commits need. */

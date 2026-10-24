@@ -44,7 +44,7 @@ static uint8_t *map_get(struct volume *v, uint64_t m, int *error) {
 
 static int space_new(struct volume *v) {
     struct space *s = &v->space;
-    s->layout = store_layout(v->super.blocks);
+    s->layout = store_layout_of(&v->super);
     s->counts = kzalloc(s->layout.maps * sizeof *s->counts);
     s->maps = kzalloc(s->layout.maps * sizeof *s->maps);
     s->index_changed = kzalloc(s->layout.indexes * sizeof *s->index_changed);
@@ -318,9 +318,93 @@ int space_format(struct volume *v) {
         for (uint64_t i = end - first; i < BITS; i++) w[i / 64] |= 1ULL << (i % 64); /* past the end */
         changed(v, m);
     }
-    /* the superblocks and both copies of the map itself */
-    if ((r = mark(v, 0, s->layout.first, true)) < 0) return r;
+    /* the superblocks and both copies of the map itself, right after block 0 */
+    v->super.map_copy[0] = s->layout.copy[0];
+    v->super.map_copy[1] = s->layout.copy[1];
+    if ((r = mark(v, 0, 1 + 2 * (s->layout.indexes + s->layout.maps), true)) < 0) return r;
     return mark(v, total - 1, 1, true);
+}
+
+/* the bits of map block m for start .. end - 1 (all in it) cleared: free blocks of a larger volume */
+static void map_open(struct volume *v, uint64_t m, uint64_t start, uint64_t end) {
+    uint64_t *w = bits_of(v->space.maps[m]);
+    for (uint64_t i = start - m * BITS; i < end - m * BITS; i++) w[i / 64] &= ~(1ULL << (i % 64));
+    v->space.counts[m].free += (uint32_t)(end - start);
+}
+
+int space_grow(struct volume *v, uint64_t blocks) {
+    struct space *s = &v->space;
+    uint64_t old = v->super.blocks;
+    struct store_layout from = s->layout, l = store_layout(blocks);
+    uint64_t n = l.indexes + l.maps;
+    if (blocks <= old || blocks - old < 2 * n + 1) return -N_ERR_INVALID;
+    /* every bitmap block of the size before in memory: they all go to the new copies */
+    for (uint64_t m = 0; m < from.maps; m++) {
+        int error = 0;
+        if (!map_get(v, m, &error)) return error;
+    }
+    struct store_space_count *counts = kzalloc(l.maps * sizeof *counts);
+    uint8_t **maps = kzalloc(l.maps * sizeof *maps);
+    uint64_t *index_changed = kzalloc(l.indexes * sizeof *index_changed);
+    bool ok = counts && maps && index_changed;
+    for (uint64_t m = from.maps; m < l.maps && ok; m++) ok = (maps[m] = kzalloc(STORE_BLOCK)) != NULL;
+    /* room for the holds and pendings of the three ranges let go below: they cannot fail then */
+    size_t holds = s->holds.n, pending = s->npending;
+    for (int k = 0; k < 3 && ok; k++)
+        ok = kappend(&s->holds.r, &s->holds.n, &s->holds.room, sizeof *s->holds.r) &&
+             kappend(&s->pending, &s->npending, &s->pending_room, sizeof *s->pending);
+    s->holds.n = holds;
+    s->npending = pending;
+    if (!ok) {
+        if (maps)
+            for (uint64_t m = from.maps; m < l.maps; m++) kfree(maps[m]);
+        kfree(counts);
+        kfree(maps);
+        kfree(index_changed);
+        return -N_ERR_NO_MEMORY;
+    }
+    memcpy(counts, s->counts, from.maps * sizeof *counts);
+    memcpy(maps, s->maps, from.maps * sizeof *maps);
+    kfree(s->counts);
+    kfree(s->maps);
+    kfree(s->index_changed);
+    s->counts = counts;
+    s->maps = maps;
+    s->index_changed = index_changed;
+    /* the blocks past the old end are free, those past the new end stay in use */
+    for (uint64_t m = old / BITS; m < l.maps; m++) {
+        uint64_t first = m * BITS, end = MIN(first + BITS, blocks);
+        if (m >= from.maps) {
+            uint64_t *w = bits_of(maps[m]);
+            for (uint64_t i = end - first; i < BITS; i++) w[i / 64] |= 1ULL << (i % 64);
+        }
+        map_open(v, m, MAX(first, old), end);
+    }
+    /* the new copies at the start of the room grown by, the odd superblock at the new end */
+    l.copy[0] = old;
+    l.copy[1] = old + n;
+    s->layout = l;
+    v->super.blocks = blocks;
+    v->super.map_copy[0] = l.copy[0];
+    v->super.map_copy[1] = l.copy[1];
+    for (uint64_t m = 0; m < l.maps; m++) changed(v, m);
+    mark(v, old, 2 * n, true);
+    mark(v, blocks - 1, 1, true);
+    /* the copies and the odd superblock of the size before: the commit before this one stands on them */
+    uint64_t was = from.indexes + from.maps;
+    space_let_go(v, from.copy[0], was);
+    space_let_go(v, from.copy[1], was);
+    space_let_go(v, old - 1, 1);
+    return 0;
+}
+
+void space_trim(struct volume *v) {
+    struct space *s = &v->space;
+    for (uint64_t m = 0; m < s->layout.maps; m++)
+        if (s->maps[m] && s->counts[m].changed + 1 <= v->durable) {
+            kfree(s->maps[m]);
+            s->maps[m] = NULL;
+        }
 }
 
 int space_mount(struct volume *v) {

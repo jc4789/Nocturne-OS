@@ -629,7 +629,7 @@ static void problem(struct check *c, const char *fmt, ...) {
 
 static bool name_block(struct check *c, uint64_t block, const char *what) {
     struct volume *v = c->v;
-    if (block < v->space.layout.first || block >= v->super.blocks - 1) {
+    if (!block || block >= v->super.blocks - 1 || store_layout_has(&v->space.layout, block)) {
         problem(c, "%s names block %llu, outside the room for them", what, (unsigned long long)block);
         return false;
     }
@@ -791,7 +791,7 @@ static long check_volume(struct volume *v, bool quiet) {
     /* the space map: exactly the superblocks, the map itself and what the catalog names are used */
     uint64_t used = 0, wrong = 0;
     for (uint64_t b = 0; b < v->super.blocks; b++) {
-        bool want = b < v->space.layout.first || b == v->super.blocks - 1 || (c.named[b / 8] & (1u << b % 8));
+        bool want = !b || b == v->super.blocks - 1 || store_layout_has(&v->space.layout, b) || (c.named[b / 8] & (1u << b % 8));
         int got = space_used(v, b);
         used += want;
         if (got < 0) {
@@ -846,6 +846,7 @@ struct test {
     const char *op;
     struct memory mem;
     struct store_device dev;
+    uint64_t full; /* the blocks of memory: the device grows up to it */
     struct volume *v;
     struct mnode *now, *saved, *before; /* now, at the last commit, at the commit before it */
     bool before_valid;
@@ -1205,6 +1206,36 @@ static void op_take(struct test *t) {
     from->content = blob_new(0);
 }
 
+/* The device grows and the volume with it, as the kernel grows C: to the end of its disk: an
+   even commit first, then the growth, which the power may cut short; the next mount tries again. */
+static void op_grow(struct test *t) {
+    uint64_t was = t->v->super.blocks, durable = t->v->durable;
+    if (was == t->full) return;
+    uint64_t to = was + 1 + below(t->full - was);
+    struct store_layout l = store_layout(to);
+    if (to - was < 2 * (l.indexes + l.maps) + 1) return; /* no room for the map of that size */
+    /* what is open first, so that the growth's commits hold no document's change */
+    expect(t, volume_commit(t->v), 0, "volume_commit");
+    expect(t, volume_even(t->v), 0, "volume_even");
+    committed(t, durable);
+    durable = t->v->durable;
+    t->dev.blocks = to;
+    for (bool cut = below(2); t->v->super.blocks != to; cut = false) {
+        if (cut) t->mem.fail_after = (long)below(60);
+        int r = volume_grow(t->v, to);
+        t->mem.fail_after = -1;
+        if (r >= 0) break;
+        expect(t, r, -N_ERR_READ_ONLY, "a growth cut short");
+        /* the volume as it was or grown, the same documents either way */
+        remount(t);
+        model_now(t, t->saved);
+        t->before_valid = false;
+    }
+    t->ops[13]++;
+    committed(t, durable); /* the commits of the growth change no document */
+    if (check_volume(t->v, true)) fail(t, "the volume has problems after growing");
+}
+
 /* the volume against the model, everything in it */
 static void verify_node(struct test *t, const struct mnode *m) {
     struct volume *v = t->v;
@@ -1253,7 +1284,9 @@ static int test_run(uint64_t mib, uint64_t seed, long steps) {
     random_state = seed * 0x9e3779b97f4a7c15ULL + 1;
     t.mem.data = calloc(1, mib << 20);
     t.mem.fail_after = -1;
-    t.dev = (struct store_device){.blocks = (mib << 20) / STORE_BLOCK, .read = memory_read, .write = memory_write, .priv = &t.mem};
+    t.full = (mib << 20) / STORE_BLOCK;
+    /* a volume smaller than the memory most of the time, to grow later */
+    t.dev = (struct store_device){.blocks = t.full / (1 + below(4)), .read = memory_read, .write = memory_write, .priv = &t.mem};
     uint8_t id[16];
     random_bytes(id, sizeof id);
     int r = volume_format(&t.dev, "test", id, &t.v);
@@ -1265,12 +1298,12 @@ static int test_run(uint64_t mib, uint64_t seed, long steps) {
     t.now->id = STORE_ID_ROOT;
     t.saved = mnode_copy(t.now, NULL);
     static const char *const names[] = {"create document", "create folder", "update", "remove", "move", "read",
-                                        "commit", "crash", "cut-short commit", "damaged superblock", "verify", "take"};
+                                        "commit", "crash", "cut-short commit", "damaged superblock", "verify", "take", "grow"};
     for (t.step = 0; t.step < steps; t.step++) {
         uint64_t roll = below(1000), durable = t.v->durable;
         size_t nodes = count_nodes(t.now);
         int op = roll < 140 ? 0 : roll < 220 ? 1 : roll < 440 ? 2 : roll < 470 ? 11 : roll < 560 ? 3 : roll < 660 ? 4
-               : roll < 840 ? 5 : roll < 900 ? 6 : roll < 925 ? 7 : roll < 950 ? 8 : roll < 965 ? 9 : 10;
+               : roll < 840 ? 5 : roll < 900 ? 6 : roll < 925 ? 7 : roll < 950 ? 8 : roll < 965 ? 9 : roll < 975 ? 12 : 10;
         if (nodes > 300 && op <= 1) op = 3;
         t.op = names[op];
         t.ops[op]++;
@@ -1310,7 +1343,7 @@ static int test_run(uint64_t mib, uint64_t seed, long steps) {
             expect(&t, volume_commit(t.v), 0, "volume_commit");
             committed(&t, durable);
             if (!t.before_valid) break;
-            t.mem.data[(t.v->durable % 2 ? t.dev.blocks - 1 : 0) * STORE_BLOCK + 200] ^= 0x5a;
+            t.mem.data[(t.v->durable % 2 ? t.v->super.blocks - 1 : 0) * STORE_BLOCK + 200] ^= 0x5a;
             remount(&t);
             model_now(&t, t.before);
             mnode_free(t.saved);
@@ -1319,6 +1352,7 @@ static int test_run(uint64_t mib, uint64_t seed, long steps) {
             break;
         case 10: verify(&t); break;
         case 11: op_take(&t); break;
+        case 12: op_grow(&t); break;
         }
         check_reserved(&t);
         if (t.step % 16 == 0) heap_check();
@@ -1331,8 +1365,8 @@ static int test_run(uint64_t mib, uint64_t seed, long steps) {
     remount(&t);
     verify(&t);
     printf("test passed (seed %llu, %ld steps):", (unsigned long long)seed, steps);
-    for (int i = 0; i < 12; i++) printf(" %s %ld,", names[i], t.ops[i]);
-    printf(" out of memory %ld, out of space %ld\n", t.ops[14], t.ops[15]);
+    for (int i = 0; i < 13; i++) printf(" %s %ld,", names[i], t.ops[i]);
+    printf(" grown %ld, out of memory %ld, out of space %ld\n", t.ops[13], t.ops[14], t.ops[15]);
     volume_free(t.v);
     mnode_free(t.now);
     mnode_free(t.saved);

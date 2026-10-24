@@ -20,8 +20,13 @@ IMG=$B/nocturne.img
 ISO=$B/nocturne.iso
 FIRMWARE=$B/nvidia-firmware.json
 ESP_MB=64
-FREE_MB=2048    # room on C: for the user's files
-ISO_FREE_MB=256 # the same on the ISO's C:, which takes its whole size of memory
+FREE_MB=128     # room on C: before it grows: the kernel takes C: to the end of the disk the image
+                # is written to on its first start, so the image itself carries little more than
+                # what is put on it
+ISO_FREE_MB=256 # the room on the ISO's C:, which takes its whole size of memory and never grows
+RUN_MB=16384    # build/run.img, sparse: C: grows into it on its first start
+VHD_MB=4096     # Hyper-V Gen 1's fixed VHD (a sparse file), at least
+VHDX_MB=65536   # Hyper-V Gen 2's dynamic VHDX, at least: its file holds only what is written
 MIB=$((1024 * 1024))
 
 # The boot part of disk $1: its EFI system partition (FAT: Limine and the kernel) and Limine's BIOS
@@ -40,14 +45,20 @@ boot_install() {
 }
 
 # Hyper-V's disk $2 from the raw disk $1: a fixed VHD (.vhd, Generation 1) or a dynamic VHDX
-# (.vhdx, Generation 2)
+# (.vhdx, Generation 2), of the raw disk's size or larger (VHD_MB, VHDX_MB): C: grows to its end
+# on the next start
 hyperv_disk() {
-    rm -f "$2"
+    local fmt opts min size
     case "$2" in
-    *.vhd) qemu-img convert -f raw -O vpc -o subformat=fixed,force_size=on "$1" "$2" ;;
-    *.vhdx) qemu-img convert -f raw -O vhdx -o subformat=dynamic "$1" "$2" ;;
+    *.vhd) fmt=vpc opts=subformat=fixed,force_size=on min=$VHD_MB ;;
+    *.vhdx) fmt=vhdx opts=subformat=dynamic min=$VHDX_MB ;;
     *) echo "mkimage: $2 is neither a .vhd nor a .vhdx" >&2; return 1 ;;
     esac
+    size=$(($(stat -c %s "$1") / MIB))
+    [ "$size" -ge "$min" ] || size=$min
+    rm -f "$2"
+    qemu-img create -q -f $fmt -o $opts "$2" "${size}M"
+    qemu-img convert -n --target-is-zero -f raw -O $fmt "$1" "$2"
 }
 
 # The ISO: Limine for BIOS and UEFI, the kernel, and C: as boot/c.img, a bare volume of the size
@@ -92,8 +103,8 @@ if [ "$1" = --hyperv ]; then
 fi
 
 PAYLOAD=$(python scripts/layout.py --firmware-manifest $FIRMWARE $B/c.list)
-# C: holds what is put on it, its catalog and the user's room; the disk is whole 256 MiB
-SIZE_MB=$(((ESP_MB + 64 + PAYLOAD / MIB * 105 / 100 + FREE_MB + 255) / 256 * 256))
+# C: holds what is put on it, its catalog and a little room; the disk is whole 64 MiB
+SIZE_MB=$(((ESP_MB + 64 + PAYLOAD / MIB * 105 / 100 + FREE_MB + 63) / 64 * 64))
 
 echo "  IMG  $IMG ($SIZE_MB MiB)"
 rm -f $IMG
@@ -108,8 +119,9 @@ case "$1" in
 --run)
     RUN=$B/run.img
     if [ ! -f $RUN ]; then
-        echo "  RUN  $RUN (new)"
-        cp $IMG $RUN
+        echo "  RUN  $RUN (new, $RUN_MB MiB)"
+        qemu-img convert -f raw -O raw $IMG $RUN
+        qemu-img resize -q -f raw $RUN ${RUN_MB}M
     else
         echo "  RUN  $RUN (its system replaced, the user's files kept)"
         update $RUN

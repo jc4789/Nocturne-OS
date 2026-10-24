@@ -15,6 +15,7 @@
 #define FIND_MS 10000       /* how long the disk the system started from may take to appear */
 #define FIND_MOST_MS 60000  /* ... while USB devices are still being looked at */
 #define GPT_ENTRIES_MAX (1u << 20)
+#define GROW_MIN_BLOCKS 4096 /* 16 MiB: less is not worth growing C: by */
 
 extern volatile struct limine_executable_file_request exe_file_req;
 extern volatile struct limine_module_request module_req;
@@ -56,45 +57,69 @@ static int memory_write(struct store_device *d, uint64_t block, uint32_t count, 
 /* where C: is, for messages */
 static const char *medium(void) { return part.disk ? part.disk->name : "memory"; }
 
-static uint64_t le64(const uint8_t *p) {
-    uint64_t x;
-    memcpy(&x, p, 8);
-    return x;
-}
+/* ---- the GPT ---- */
 
-static uint32_t le32(const uint8_t *p) {
-    uint32_t x;
-    memcpy(&x, p, 4);
-    return x;
+static const uint8_t store_type[16] = STORE_PARTITION_TYPE;
+
+struct gpt_header {
+    char signature[8];
+    uint32_t revision, size, check, reserved;
+    uint64_t self, other, first_usable, last_usable;
+    uint8_t disk[16];
+    uint64_t entries;
+    uint32_t count, entry_size, entries_check;
+} PACKED;
+
+struct gpt_entry {
+    uint8_t type[16], unique[16];
+    uint64_t first, last, attributes;
+} PACKED;
+
+/* A disk's GPT as read. */
+struct gpt {
+    uint32_t unit; /* the bytes of its LBAs: 512 or 4096 */
+    struct gpt_header h;
+    uint8_t *entries; /* in whole LBAs */
+    uint32_t sectors; /* the 512-byte sectors they take */
+};
+
+static struct gpt_entry *gpt_entry(struct gpt *g, uint32_t i) { return (void *)(g->entries + (size_t)i * g->h.entry_size); }
+
+/* disk's GPT: 1, 0 when it has none the store reads, -1 when the disk could not be read (yet).
+   buf holds 16 sectors: the first LBAs of the disk. */
+static int gpt_read(struct blkdev *disk, uint8_t *buf, struct gpt *g) {
+    memset(g, 0, sizeof *g);
+    if (disk->sectors < 64) return 0;
+    if (blk_read(disk, 0, 16, buf) < 0) return -1;
+    /* the header is at the device's block 1, of 512 or 4096 bytes */
+    g->unit = !memcmp(buf + 512, "EFI PART", 8) ? 512 : !memcmp(buf + 4096, "EFI PART", 8) ? 4096 : 0;
+    if (!g->unit) return 0;
+    memcpy(&g->h, buf + g->unit, sizeof g->h);
+    uint64_t bytes = (uint64_t)g->h.count * g->h.entry_size, f = g->unit / 512;
+    if (g->h.entry_size < 128 || g->h.entry_size % 8 || !bytes || bytes > GPT_ENTRIES_MAX) return 0;
+    g->sectors = (uint32_t)((bytes + g->unit - 1) / g->unit * f);
+    if (g->h.entries >= disk->sectors / f || g->h.entries * f + g->sectors > disk->sectors) return 0;
+    if (!(g->entries = kmalloc((size_t)g->sectors * 512)) || blk_read(disk, g->h.entries * f, g->sectors, g->entries) < 0) {
+        kfree(g->entries);
+        g->entries = NULL;
+        return -1;
+    }
+    return 1;
 }
 
 /* The Nocturne partition of disk (its first sector and STORE_BLOCKs), and the disk's GUID: 1 when
    it has one, 0 when not, -1 when the disk could not be read (yet). buf holds 16 sectors. */
 static int gpt_find(struct blkdev *disk, uint8_t *buf, uint8_t guid[16], uint64_t *first, uint64_t *blocks) {
-    static const uint8_t type[16] = STORE_PARTITION_TYPE;
-    if (disk->sectors < 64) return 0;
-    if (blk_read(disk, 0, 16, buf) < 0) return -1;
-    /* the header is at the device's block 1, of 512 or 4096 bytes */
-    uint32_t unit = !memcmp(buf + 512, "EFI PART", 8) ? 512 : !memcmp(buf + 4096, "EFI PART", 8) ? 4096 : 0;
-    if (!unit) return 0;
-    const uint8_t *hd = buf + unit;
-    memcpy(guid, hd + 56, 16);
-    uint64_t at = le64(hd + 72) * (unit / 512);
-    uint32_t count = le32(hd + 80), size = le32(hd + 84);
-    uint64_t bytes = (uint64_t)count * size;
-    if (size < 128 || size % 8 || !bytes || bytes > GPT_ENTRIES_MAX) return 0;
-    uint32_t sectors = (uint32_t)((bytes + 511) / 512);
-    if (at + sectors > disk->sectors) return 0;
-    uint8_t *entries = kmalloc((size_t)sectors * 512);
-    if (!entries || blk_read(disk, at, sectors, entries) < 0) {
-        kfree(entries);
-        return -1;
-    }
-    int found = 0;
-    for (uint32_t i = 0; i < count && !found; i++) {
-        const uint8_t *e = entries + (size_t)i * size;
-        if (memcmp(e, type, 16)) continue;
-        uint64_t lo = le64(e + 32) * (unit / 512), hi = (le64(e + 40) + 1) * (unit / 512);
+    struct gpt g;
+    int found = gpt_read(disk, buf, &g);
+    if (found <= 0) return found;
+    memcpy(guid, g.h.disk, 16);
+    uint64_t f = g.unit / 512;
+    found = 0;
+    for (uint32_t i = 0; i < g.h.count && !found; i++) {
+        const struct gpt_entry *e = gpt_entry(&g, i);
+        if (memcmp(e->type, store_type, 16)) continue;
+        uint64_t lo = e->first * f, hi = (e->last + 1) * f;
         if (lo % (STORE_BLOCK / 512) || hi <= lo || hi > disk->sectors) {
             kprintf("store: %s has a Nocturne partition the store cannot use (not on 4 KiB)\n", disk->name);
             continue;
@@ -103,8 +128,131 @@ static int gpt_find(struct blkdev *disk, uint8_t *buf, uint8_t guid[16], uint64_
         *blocks = (hi - lo) / (STORE_BLOCK / 512);
         found = 1;
     }
-    kfree(entries);
+    kfree(g.entries);
     return found;
+}
+
+/* the CRC-32 of GPT (IEEE 802.3): a few blocks, once */
+static uint32_t gpt_crc(const void *data, size_t n) {
+    const uint8_t *p = data;
+    uint32_t c = 0xffffffffu;
+    for (size_t i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++) c = c >> 1 ^ (0xedb88320u & -(c & 1));
+    }
+    return ~c;
+}
+
+static uint32_t gpt_header_crc(struct gpt_header h) {
+    h.check = 0;
+    return gpt_crc(&h, sizeof h);
+}
+
+/* The STORE_BLOCKs C:'s partition can have when it reaches the end of its disk (an image written
+   to a larger disk), or 0: the GPT reaches the end already, does not check out, or another
+   partition follows. *mine: its entry. */
+static uint64_t gpt_room(struct gpt *g, struct gpt_entry **mine) {
+    struct blkdev *disk = part.disk;
+    uint64_t f = g->unit / 512, last = disk->sectors / f - 1, usable = last - 1 - g->sectors / f;
+    if (usable <= g->h.last_usable) return 0;
+    if (g->h.size != sizeof g->h || g->h.self != 1 || gpt_header_crc(g->h) != g->h.check ||
+        gpt_crc(g->entries, (size_t)g->h.count * g->h.entry_size) != g->h.entries_check) {
+        kprintf("store: the GPT of %s does not check out: C: keeps its size\n", disk->name);
+        return 0;
+    }
+    static const uint8_t none[16];
+    *mine = NULL;
+    for (uint32_t i = 0; i < g->h.count; i++) {
+        struct gpt_entry *e = gpt_entry(g, i);
+        if (!memcmp(e->type, store_type, 16) && e->first * f == part.first) *mine = e;
+    }
+    if (!*mine) return 0;
+    for (uint32_t i = 0; i < g->h.count; i++) {
+        struct gpt_entry *e = gpt_entry(g, i);
+        if (e != *mine && memcmp(e->type, none, 16) && e->last > (*mine)->last) {
+            kprintf("store: a partition follows C: on %s: C: keeps its size\n", disk->name);
+            return 0;
+        }
+    }
+    return (usable + 1 - (*mine)->first) * f / (STORE_BLOCK / 512);
+}
+
+static int write_lbas(struct gpt *g, uint64_t lba, const void *data, uint64_t lbas) {
+    uint64_t f = g->unit / 512;
+    int r = blk_write(part.disk, lba * f, (uint32_t)(lbas * f), data);
+    return r < 0 ? r : blk_persist(part.disk);
+}
+
+/* C:'s partition to blocks (gpt_room's), its GPT's copy at the end of the disk. buf: gpt_read's. */
+static int gpt_grow(struct gpt *g, struct gpt_entry *mine, uint8_t *buf, uint64_t blocks) {
+    struct blkdev *disk = part.disk;
+    uint64_t f = g->unit / 512, last = disk->sectors / f - 1, lbas = g->sectors / f;
+    uint8_t *block = kzalloc(MAX(g->unit, STORE_BLOCK));
+    if (!block) return -N_ERR_NO_MEMORY;
+    /* no superblock of what the disk held before at C:'s new last block */
+    int r = blk_write(disk, part.first + (blocks - 1) * (STORE_BLOCK / 512), STORE_BLOCK / 512, block);
+    if (r >= 0) r = blk_persist(disk);
+    mine->last = mine->first + blocks * (STORE_BLOCK / 512) / f - 1;
+    struct gpt_header h = g->h;
+    h.last_usable = last - 1 - lbas;
+    h.other = last;
+    h.entries_check = gpt_crc(g->entries, (size_t)h.count * h.entry_size);
+    struct gpt_header copy = h;
+    copy.self = last;
+    copy.other = 1;
+    copy.entries = last - lbas;
+    copy.check = gpt_header_crc(copy);
+    h.check = gpt_header_crc(h);
+    /* the copy first: until the header at block 1 changes, it and the old copy are the GPT */
+    if (r >= 0) r = write_lbas(g, copy.entries, g->entries, lbas);
+    memcpy(block, &copy, sizeof copy);
+    if (r >= 0) r = write_lbas(g, last, block, 1);
+    if (r >= 0) r = write_lbas(g, h.entries, g->entries, lbas);
+    memset(block, 0, g->unit);
+    memcpy(block, &h, sizeof h);
+    if (r >= 0) r = write_lbas(g, 1, block, 1);
+    /* the protective MBR over the whole disk */
+    if (r >= 0 && buf[446 + 4] == 0xee) {
+        uint32_t size = last > 0xffffffffu ? 0xffffffffu : (uint32_t)last;
+        memcpy(buf + 446 + 12, &size, 4);
+        r = blk_write(disk, 0, 1, buf);
+        if (r >= 0) r = blk_persist(disk);
+    }
+    kfree(block);
+    return r;
+}
+
+/* C: to the end of its disk, on the first start from an image written to a larger one: its
+   partition, then the volume (fs/volume.h says in which order). The next start tries again what
+   this one could not finish. */
+static void store_grow(struct volume *v) {
+    if (!part.disk || volume_writable(v) < 0) return;
+    uint8_t *buf = kmalloc(16 * 512);
+    struct gpt g = {0};
+    struct gpt_entry *mine = NULL;
+    uint64_t room = buf && gpt_read(part.disk, buf, &g) > 0 ? gpt_room(&g, &mine) : 0, was = v->super.blocks;
+    uint64_t to = MAX(room, device.blocks);
+    struct store_layout l = store_layout(to);
+    /* at least as much room as the new map takes */
+    if (to >= was + MAX(GROW_MIN_BLOCKS, 4 * (l.indexes + l.maps))) {
+        int r = volume_even(v);
+        if (r >= 0 && room > device.blocks && (r = gpt_grow(&g, mine, buf, room)) >= 0) device.blocks = room;
+        if (r >= 0) r = volume_grow(v, device.blocks);
+        if (r >= 0) {
+            kprintf("store: C: grew from %lu MiB to %lu MiB, the rest of %s\n", (unsigned long)(was * STORE_BLOCK >> 20),
+                    (unsigned long)(v->super.blocks * STORE_BLOCK >> 20), part.disk->name);
+        } else {
+            /* The partition may be larger than the volume now: an even commit cut short would leave
+               nothing that finds the odd superblock of the size before. */
+            kprintf("store: C: could not grow to the end of %s (%d): it is read only until the next start\n",
+                    part.disk->name, r);
+            mutex_lock(&v->lock);
+            v->error = -N_ERR_READ_ONLY;
+            mutex_unlock(&v->lock);
+        }
+    }
+    kfree(g.entries);
+    kfree(buf);
 }
 
 /* The disk the system started from, by its GPT identity; any disk with a Nocturne partition when
@@ -239,6 +387,7 @@ static void writer(void *arg);
 
 void store_start(void) {
     struct volume *v = store.v;
+    store_grow(v); /* not before: a hibernation image goes back to the volume as it was */
     mutex_lock(&v->lock);
     uint64_t system = 0, users = 0;
     int r = folder_at(v, STORE_ID_ROOT, "Nocturne", STORE_SYSTEM, &system);

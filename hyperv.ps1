@@ -29,7 +29,8 @@
     network adapter a legacy one (an emulated DEC 21140).
 
     -Update keeps the generation of the existing VM. The disk is rewritten through a raw copy next
-    to it (.\hyperv\<Name>-work.img), so the folder needs room for twice the disk's size.
+    to it (.\hyperv\<Name>-work.img, sparse), so the folder needs room for twice what the disk
+    holds (its file's size, not the size the guest sees).
 
 .EXAMPLE
     .\hyperv.ps1                 # create and start the Gen 2 VM "Nocturne"
@@ -143,7 +144,8 @@ function Write-Disk {
         if (-not (Test-Path (Join-Path $Root $tool))) { throw "$tool not found. Build first:  powershell -ExecutionPolicy Bypass -File build.ps1" }
     }
     $fresh = -not (Test-Path $Disk)
-    $size = if ($fresh) { (Get-Item $Img -ErrorAction SilentlyContinue).Length } else { (Get-VHD -Path $Disk).Size }
+    # what the disk holds: the raw copy is a sparse file, and a dynamic VHDX's file is that much
+    $size = if ($fresh) { (Get-Item $Img -ErrorAction SilentlyContinue).Length } else { (Get-VHD -Path $Disk).FileSize }
     $free = (Get-Item $VmDir).PSDrive.Free
     if ($size -and $free -lt 2 * $size) {
         throw "$VmDir has $([math]::Round($free / 1GB, 1)) GiB free; rewriting the disk needs $([math]::Round(2 * $size / 1GB, 1)) GiB"

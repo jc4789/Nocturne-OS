@@ -518,6 +518,32 @@ int volume_commit(struct volume *v) {
     return r < 0 ? v->error : 0;
 }
 
+int volume_even(struct volume *v) {
+    mutex_lock(&v->lock);
+    wait_commit(v);
+    bool odd = v->durable % 2;
+    if (odd) v->changed = true; /* a commit with nothing new in it */
+    mutex_unlock(&v->lock);
+    return odd ? volume_commit(v) : volume_writable(v);
+}
+
+int volume_grow(struct volume *v, uint64_t blocks) {
+    mutex_lock(&v->lock);
+    wait_commit(v);
+    int r = v->error ? v->error : v->durable % 2 || blocks > v->dev->blocks ? -N_ERR_INVALID : 0;
+    if (r >= 0) r = space_grow(v, blocks);
+    mutex_unlock(&v->lock);
+    /* the growth, then the commit that writes the other copy of the map and frees the old one */
+    if (r >= 0) r = volume_commit(v);
+    if (r >= 0) r = volume_commit(v);
+    if (r >= 0) {
+        mutex_lock(&v->lock);
+        space_trim(v);
+        mutex_unlock(&v->lock);
+    }
+    return r;
+}
+
 /* ---- mounting ---- */
 
 static struct volume *volume_new(struct store_device *dev) {
@@ -555,8 +581,13 @@ static bool super_valid(const uint8_t *block, uint64_t address, uint64_t device_
     uint32_t check = crc32c(crc32c(0, &head, sizeof head), block + sizeof head, STORE_BLOCK - sizeof head);
     if (s.head.magic != STORE_MAGIC_SUPER || check != s.head.check) return false;
     if (memcmp(s.signature, STORE_SIGNATURE, 8) || s.version != STORE_VERSION || s.block_size != STORE_BLOCK) return false;
-    struct store_layout l = store_layout(s.blocks);
-    if (s.blocks > device_blocks || s.blocks < l.first + 16) return false;
+    struct store_layout l = store_layout_of(&s);
+    uint64_t n = l.indexes + l.maps;
+    if (s.blocks > device_blocks || s.blocks < 2 * n + 17) return false;
+    /* the map's copies between the superblocks, apart */
+    for (int q = 0; q < 2; q++)
+        if (l.copy[q] < 1 || l.copy[q] > s.blocks - 1 - n) return false;
+    if (l.copy[0] < l.copy[1] ? l.copy[0] + n > l.copy[1] : l.copy[1] + n > l.copy[0]) return false;
     if (s.head.address != (s.head.generation % 2 ? s.blocks - 1 : 0) || address != s.head.address) return false;
     *out = s;
     return true;
@@ -565,19 +596,27 @@ static bool super_valid(const uint8_t *block, uint64_t address, uint64_t device_
 int volume_mount(struct store_device *dev, struct volume **out) {
     uint8_t *block = kmalloc(STORE_BLOCK);
     if (!block) return -N_ERR_NO_MEMORY;
-    struct store_super found[2];
+    struct store_super found[3];
     int n = 0;
     if (dev->read(dev, 0, 1, block) >= 0 && super_valid(block, 0, dev->blocks, &found[n])) n++;
-    /* the odd generations' superblock is at the volume's last block: try each candidate's size */
-    struct store_super odd;
-    uint64_t last = n ? found[0].blocks - 1 : dev->blocks - 1;
-    if (dev->read(dev, last, 1, block) >= 0 && super_valid(block, last, dev->blocks, &odd)) found[n++] = odd;
-    kfree(block);
-    if (n == 2 && found[1].head.generation > found[0].head.generation) {
-        struct store_super t = found[0];
-        found[0] = found[1];
-        found[1] = t;
+    /* The odd generations' superblock is at the volume's last block: where block 0's size puts it,
+       and at the device's end, where a volume grown to it in an odd generation has it while block 0
+       still has the size before. Another volume's left there is not this one's. */
+    uint64_t last[2] = {n ? found[0].blocks - 1 : dev->blocks - 1, dev->blocks - 1};
+    for (int k = 0; k < 2; k++) {
+        struct store_super odd;
+        if (k && last[1] == last[0]) break;
+        if (dev->read(dev, last[k], 1, block) < 0 || !super_valid(block, last[k], dev->blocks, &odd)) continue;
+        if (n && memcmp(odd.volume_id, found[0].volume_id, 16)) continue;
+        found[n++] = odd;
     }
+    kfree(block);
+    for (int i = 1; i < n; i++) /* the newest first */
+        for (int j = i; j > 0 && found[j].head.generation > found[j - 1].head.generation; j--) {
+            struct store_super t = found[j];
+            found[j] = found[j - 1];
+            found[j - 1] = t;
+        }
     int r = -N_ERR_NOT_FOUND;
     for (int i = 0; i < n; i++) {
         /* the newest commit whose catalog and space map are whole */
@@ -605,7 +644,7 @@ int volume_mount(struct store_device *dev, struct volume **out) {
 
 int volume_format(struct store_device *dev, const char *label, const uint8_t volume_id[16], struct volume **out) {
     struct store_layout l = store_layout(dev->blocks);
-    if (dev->blocks < l.first + 16) return -N_ERR_NO_SPACE;
+    if (dev->blocks < 2 * (l.indexes + l.maps) + 17) return -N_ERR_NO_SPACE;
     struct volume *v = volume_new(dev);
     uint8_t *zero = kzalloc(STORE_BLOCK);
     if (!v || !zero) {

@@ -92,6 +92,12 @@ void volume_free(struct volume *v);
 /* Writes the open generation and everything before it to the medium. Takes v->lock itself, and
    lets other changes go on in the next generation while the blocks are written. */
 int volume_commit(struct volume *v);
+/* Growing the volume to blocks, once its device is that large (common/store_format.h): after
+   volume_even, which leaves the last commit an even generation's (a commit with nothing new when
+   it is not), while the device has the size before; then volume_grow, in an odd generation's
+   commit and the one after it. Each takes v->lock itself. */
+int volume_even(struct volume *v);
+int volume_grow(struct volume *v, uint64_t blocks);
 /* -N_ERR_READ_ONLY once a write failed, else 0: every change asks first. */
 int volume_writable(struct volume *v);
 

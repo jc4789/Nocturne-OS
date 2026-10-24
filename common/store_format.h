@@ -12,6 +12,12 @@
      ...                 catalog nodes and document contents, wherever the space map has room
      last block          superblock of the odd generations
 
+   A volume grows to the end of a larger medium (an image written to a larger disk) in one commit
+   of an odd generation: the space map for the new size goes into the room it grew by, where the
+   superblock says (map_copy), and the odd superblock to the new last block. Block 0 keeps the
+   superblock of the size before until the next commit, so a growth cut short leaves the volume as
+   it was; the copies and the odd superblock of the size before are freed as any blocks are.
+
    A commit writes the new catalog nodes and contents into free blocks, the space map into the copy
    of its generation's parity, waits until they are on the medium, then writes its superblock. The
    superblock of the other parity still describes the previous commit, whose blocks the new one
@@ -74,6 +80,8 @@ struct store_super {
     uint64_t used;          /* blocks in use, the superblocks and space maps included */
     int64_t created;        /* nanoseconds since 1970-01-01 UTC */
     char label[32];
+    uint64_t map_copy[2];   /* where each copy of the space map starts (0: as store_layout places
+                               them, in a volume made before volumes grew) */
 };
 
 /* ---- the space map ---- */
@@ -92,17 +100,29 @@ struct store_space_count {
 struct store_layout {
     uint64_t maps, indexes; /* bitmap and index blocks of one copy */
     uint64_t copy[2];       /* where each copy starts: its index blocks, then its bitmap blocks */
-    uint64_t first;         /* the first block for catalog nodes and contents */
 };
 
+/* The space map of a new volume of blocks: both copies right after block 0. */
 static inline struct store_layout store_layout(uint64_t blocks) {
     struct store_layout l;
     l.maps = (blocks + STORE_BITS_PER_MAP - 1) / STORE_BITS_PER_MAP;
     l.indexes = (l.maps + STORE_COUNTS_PER_INDEX - 1) / STORE_COUNTS_PER_INDEX;
     l.copy[0] = 1;
     l.copy[1] = 1 + l.indexes + l.maps;
-    l.first = 1 + 2 * (l.indexes + l.maps);
     return l;
+}
+
+/* The space map of the volume s describes. */
+static inline struct store_layout store_layout_of(const struct store_super *s) {
+    struct store_layout l = store_layout(s->blocks);
+    if (s->map_copy[0] || s->map_copy[1]) l.copy[0] = s->map_copy[0], l.copy[1] = s->map_copy[1];
+    return l;
+}
+
+/* Whether block is one of the space map's. */
+static inline int store_layout_has(const struct store_layout *l, uint64_t block) {
+    uint64_t n = l->indexes + l->maps;
+    return (block >= l->copy[0] && block - l->copy[0] < n) || (block >= l->copy[1] && block - l->copy[1] < n);
 }
 
 /* ---- the catalog ---- */
