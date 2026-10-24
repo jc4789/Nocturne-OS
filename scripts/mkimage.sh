@@ -24,9 +24,6 @@ FREE_MB=128     # room on C: before it grows: the kernel takes C: to the end of 
                 # is written to on its first start, so the image itself carries little more than
                 # what is put on it
 ISO_FREE_MB=256 # the room on the ISO's C:, which takes its whole size of memory and never grows
-RUN_MB=16384    # build/run.img, sparse: C: grows into it on its first start
-VHD_MB=4096     # Hyper-V Gen 1's fixed VHD (a sparse file), at least
-VHDX_MB=65536   # Hyper-V Gen 2's dynamic VHDX, at least: its file holds only what is written
 MIB=$((1024 * 1024))
 
 # The boot part of disk $1: its EFI system partition (FAT: Limine and the kernel) and Limine's BIOS
@@ -45,20 +42,15 @@ boot_install() {
 }
 
 # Hyper-V's disk $2 from the raw disk $1: a fixed VHD (.vhd, Generation 1) or a dynamic VHDX
-# (.vhdx, Generation 2), of the raw disk's size or larger (VHD_MB, VHDX_MB): C: grows to its end
-# on the next start
+# (.vhdx, Generation 2), of the raw disk's size. Made larger in Hyper-V, the disk takes C: with it
+# on the next start.
 hyperv_disk() {
-    local fmt opts min size
+    rm -f "$2"
     case "$2" in
-    *.vhd) fmt=vpc opts=subformat=fixed,force_size=on min=$VHD_MB ;;
-    *.vhdx) fmt=vhdx opts=subformat=dynamic min=$VHDX_MB ;;
+    *.vhd) qemu-img convert -f raw -O vpc -o subformat=fixed,force_size=on "$1" "$2" ;;
+    *.vhdx) qemu-img convert -f raw -O vhdx -o subformat=dynamic "$1" "$2" ;;
     *) echo "mkimage: $2 is neither a .vhd nor a .vhdx" >&2; return 1 ;;
     esac
-    size=$(($(stat -c %s "$1") / MIB))
-    [ "$size" -ge "$min" ] || size=$min
-    rm -f "$2"
-    qemu-img create -q -f $fmt -o $opts "$2" "${size}M"
-    qemu-img convert -n --target-is-zero -f raw -O $fmt "$1" "$2"
 }
 
 # The ISO: Limine for BIOS and UEFI, the kernel, and C: as boot/c.img, a bare volume of the size
@@ -119,9 +111,8 @@ case "$1" in
 --run)
     RUN=$B/run.img
     if [ ! -f $RUN ]; then
-        echo "  RUN  $RUN (new, $RUN_MB MiB)"
-        qemu-img convert -f raw -O raw $IMG $RUN
-        qemu-img resize -q -f raw $RUN ${RUN_MB}M
+        echo "  RUN  $RUN (new)"
+        cp $IMG $RUN
     else
         echo "  RUN  $RUN (its system replaced, the user's files kept)"
         update $RUN

@@ -15,7 +15,6 @@
 #define FIND_MS 10000       /* how long the disk the system started from may take to appear */
 #define FIND_MOST_MS 60000  /* ... while USB devices are still being looked at */
 #define GPT_ENTRIES_MAX (1u << 20)
-#define GROW_MIN_BLOCKS 4096 /* 16 MiB: less is not worth growing C: by */
 
 extern volatile struct limine_executable_file_request exe_file_req;
 extern volatile struct limine_module_request module_req;
@@ -233,8 +232,8 @@ static void store_grow(struct volume *v) {
     uint64_t room = buf && gpt_read(part.disk, buf, &g) > 0 ? gpt_room(&g, &mine) : 0, was = v->super.blocks;
     uint64_t to = MAX(room, device.blocks);
     struct store_layout l = store_layout(to);
-    /* at least as much room as the new map takes */
-    if (to >= was + MAX(GROW_MIN_BLOCKS, 4 * (l.indexes + l.maps))) {
+    /* room for the new map's two copies and the new last superblock (space_grow) */
+    if (to > was + 2 * (l.indexes + l.maps)) {
         int r = volume_even(v);
         if (r >= 0 && room > device.blocks && (r = gpt_grow(&g, mine, buf, room)) >= 0) device.blocks = room;
         if (r >= 0) r = volume_grow(v, device.blocks);

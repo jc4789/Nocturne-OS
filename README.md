@@ -191,8 +191,8 @@ powershell -ExecutionPolicy Bypass -File hyperv.ps1 -MemoryMB 4096
   行っています）。CPU 数は Hyper-V マネージャーで増やせ、カーネルは増やした CPU を使います。
 - セキュアブートは無効（ブートローダーは署名されていません）。チェックポイントなし。
 - ディスクは 1 台（`hyperv\<名前>.vhdx`、SCSI 0:0）で、その VM 専用です。最初は `build\nocturne.img` を写した
-  64 GiB の可変長 VHDX（ホストのファイルは書いた分だけ）で、起動部分と[ドライブ C:](#ドライブ-c-と保存) が入っています。
-  C: は最初の起動でディスクの最後まで広がります。Hyper-V でディスクを大きくすれば、次の起動で C: もそこまで広がります。
+  可変長 VHDX（イメージと同じ大きさ）で、起動部分と[ドライブ C:](#ドライブ-c-と保存) が入っています。
+  Hyper-V でディスクを大きくすれば（ディスクの編集の「拡張」）、次の起動で C: もそこまで広がります。
 - ネットワークアダプターは **Default Switch** につなぐので、DHCP でアドレスを得てインターネットへ出られます。
 - 拡張セッションは Hyper-V ソケットで使います。ホストで拡張セッションモードが切れていれば、スクリプトが有効にします。
 - COM1 は `\\.\pipe\<名前の小文字>-com1` につながります。
@@ -279,8 +279,8 @@ python -X utf8 scripts/build.py -j 8 cxx                    # Makefile の任意
 - `kernel.elf`：カーネル。
 - `nocturne.img`：GPT の起動ディスク（EFI システムパーティションとドライブ C:。QEMU、USB メモリー）。中身の分だけの
   大きさ（今は約 1 GB）で、C: は最初の起動で書き込んだディスクの最後まで広がります。
-- `nocturne.vhd`：Hyper-V 第 1 世代用の 4 GiB の固定長 VHD（疎なファイル）。
-- `nocturne.vhdx`：Hyper-V 第 2 世代用の 64 GiB の可変長 VHDX（ファイルは書いた分だけ）。
+- `nocturne.vhd`：Hyper-V 第 1 世代用の固定長 VHD（イメージと同じ大きさ）。
+- `nocturne.vhdx`：Hyper-V 第 2 世代用の可変長 VHDX（イメージと同じ大きさ）。
 - `nocturne.iso`：BIOS・UEFI 両用のライブ ISO。Limine、カーネル、C:（`boot/c.img`、GPT の無い単独のボリューム）が入り、
   Limine が C: をモジュールとしてメモリーへ読みます。C: への変更は電源を切ると消え、ハイバネーションはできません。
   C: の空きは 256 MiB 以上で、C: の大きさ分（今は 1 GiB）の RAM を使います。全体のビルドで作り、
@@ -355,8 +355,8 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 
 ディスクは 1 台で、EFI システムパーティション（Limine とカーネル）とドライブ C: があります。C: はコピーオンライトの
 格納庫で、保存したファイルは再起動しても残ります。
-- イメージ（`build\nocturne.img`）は入れる物の大きさしかありません。書き込んだディスクのほうが大きければ、最初の起動で
-  C: のパーティションと C: 自身がディスクの最後まで広がります（GPT の予備の写しもディスクの最後へ移ります）。
+- イメージ（`build\nocturne.img`）は入れる物の大きさしかありません。書き込んだディスクのほうが大きければ（後からディスクを
+  大きくした場合も）、次の起動で C: のパーティションと C: 自身がディスクの最後まで広がります（GPT の予備の写しもディスクの最後へ移ります）。
   途中で電源が切れても C: は前の大きさのまま残り、次の起動でもう一度広げます。C: のパーティションの後ろに
   別のパーティションがあれば広げません。
 - `C:\Nocturne`：システム（`System` のプログラム、`Fonts`、`SDK`、`Licenses` など）。アプリは読めますが、変えられません。
@@ -371,7 +371,7 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
   フリーズや電源断では最後の数秒が残らないことがあります。カーネルが止まった画面には、ログの最後の行が出ます。
 
 保存先：
-- **QEMU**：`build.ps1 run` の `build\run.img`（16 GiB の疎なファイル）。ビルドし直してもシステムだけを置き換え、`build.ps1 clean` も消しません。
+- **QEMU**：`build.ps1 run` の `build\run.img`。ビルドし直してもシステムだけを置き換え、`build.ps1 clean` も消しません。
   まっさらにしたいときは手で消してください。
 - **Hyper-V**：VM のディスク（`hyperv\<名前>.vhdx`）。`-Update` はシステムだけを置き換えます。
 - **実機**：USB メモリーの C:。
