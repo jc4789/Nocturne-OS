@@ -373,10 +373,10 @@ index 0c297c5..2f9abd0 100644
          use solid as imp;
 diff --git a/library/std/src/sys/fs/nocturne.rs b/library/std/src/sys/fs/nocturne.rs
 new file mode 100644
-index 0000000..e984323
+index 0000000..ba61989
 --- /dev/null
 +++ b/library/std/src/sys/fs/nocturne.rs
-@@ -0,0 +1,557 @@
+@@ -0,0 +1,562 @@
 +//! Documents and folders on Nocturne.
 +//!
 +//! A file is a document handle (`n_document_open`). The kernel has no shared
@@ -415,6 +415,7 @@ index 0000000..e984323
 +    size: u64,
 +    kind: u32,
 +    modified: i64,
++    modified_ns: u32,
 +}
 +
 +pub struct ReadDir {
@@ -466,7 +467,7 @@ index 0000000..e984323
 +
 +impl FileAttr {
 +    fn from_entry(e: &n_entry) -> FileAttr {
-+        FileAttr { size: e.size, kind: e.kind, modified: e.modified }
++        FileAttr { size: e.size, kind: e.kind, modified: e.modified, modified_ns: e.modified_ns }
 +    }
 +
 +    pub fn size(&self) -> u64 {
@@ -482,7 +483,11 @@ index 0000000..e984323
 +    }
 +
 +    pub fn modified(&self) -> io::Result<SystemTime> {
-+        SystemTime::new(self.modified.max(0), 0)
++        // SystemTime starts at 1970: an older entry shows as that.
++        if self.modified < 0 {
++            return Ok(SystemTime::MIN);
++        }
++        SystemTime::new(self.modified, self.modified_ns.into())
 +    }
 +
 +    pub fn accessed(&self) -> io::Result<SystemTime> {
@@ -1026,10 +1031,10 @@ index 88d9d42..1a6fa99 100644
          pub use self::xous::*;
 diff --git a/library/std/src/sys/pal/nocturne/abi.rs b/library/std/src/sys/pal/nocturne/abi.rs
 new file mode 100644
-index 0000000..c2621da
+index 0000000..305ba59
 --- /dev/null
 +++ b/library/std/src/sys/pal/nocturne/abi.rs
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,181 @@
 +//! Declarations of the Nocturne native ABI as the C library exports it
 +//! (`user/include/nocturne.h`, `common/abi.h`, `docs/nocturne-native-abi.md`).
 +//!
@@ -1106,14 +1111,15 @@ index 0000000..c2621da
 +pub struct n_entry {
 +    pub name: [c_char; 256],
 +    pub kind: u32,
-+    pub reserved: u32,
++    pub modified_ns: u32,
 +    pub size: u64,
 +    pub modified: i64,
++    pub id: u64,
 +}
 +
 +impl n_entry {
 +    pub const fn zeroed() -> n_entry {
-+        n_entry { name: [0; 256], kind: 0, reserved: 0, size: 0, modified: 0 }
++        n_entry { name: [0; 256], kind: 0, modified_ns: 0, size: 0, modified: 0, id: 0 }
 +    }
 +}
 +

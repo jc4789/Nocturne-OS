@@ -788,74 +788,123 @@ static int64_t sys_shared_revoke(int h) {
     }
     handle_close(f);return 0;
 }
-/* Read-only ELF segments: every task running the same program bytes maps one
- * set of frames, so concurrent instances (a worker pool) hold one copy of their
- * code and constants. A start compares its program's bytes with the cached frames
- * and makes a new object when the program document changed. The cache's own
- * reference is dropped once no task maps an object. */
-struct program_segment {struct program_segment *next;struct shared_pages *pages;uint64_t va,filesz,memsz;bool exec;char path[];};
-static struct program_segment *program_segments;
-/* Unlinks the objects only the cache still references; the caller closes them. */
-static struct program_segment *program_segments_unused(void) {
-    struct program_segment *unused=NULL;uint64_t irq=irq_save();
-    for(struct program_segment **link=&program_segments;*link;){
-        struct program_segment *s=*link;
-        if(s->pages->object.refs==1){*link=s->next;s->next=unused;unused=s;}else link=&s->next;
+/* Read-only ELF segments: every task running a program maps one set of frames
+ * for them, so concurrent instances (a worker pool) hold one copy of their code
+ * and constants, and a start of a program that is still or was recently running
+ * (a compiler's driver, then its compiler and its linker) neither reads nor
+ * copies them again. A program is its document's content, known by its identity
+ * (store_document_identity): a start of a changed document reads it anew, and
+ * the tasks running the older content keep theirs. A program joins the cache
+ * when a start has read all of it. Programs that no task runs stay, the most
+ * recently started first, while they hold at most a sixteenth of memory and an
+ * eighth stays free; an app that asks for more memory than is free gets theirs. */
+struct program_segment {struct program_segment *next;struct shared_pages *pages;uint64_t va,filesz,memsz;bool exec;};
+enum {PROGRAM_NEW,PROGRAM_CACHED,PROGRAM_RETIRED};
+struct program {
+    struct program *next;
+    uint64_t document;void *identity;size_t identity_bytes;
+    struct program_segment *segments;
+    size_t starts; /* starts holding it */
+    int state;
+};
+static struct program *programs; /* the cache, the most recently started first */
+static void program_free(struct program *p) {
+    while(p->segments){struct program_segment *s=p->segments;p->segments=s->next;object_unref(&s->pages->object);kfree(s);}
+    kfree(p->identity);kfree(p);
+}
+/* Its frames, when no task maps them and no start holds it; else 0. */
+static uint64_t program_idle_pages(const struct program *p) {
+    uint64_t pages=0;
+    if(p->starts)return 0;
+    for(const struct program_segment *s=p->segments;s;s=s->next){
+        if(s->pages->object.refs!=1)return 0;
+        pages+=s->pages->count;
     }
-    irq_restore(irq);return unused;
+    return pages;
 }
-static void program_segments_free(struct program_segment *s) {
-    while(s){struct program_segment *n=s->next;object_unref(&s->pages->object);kfree(s);s=n;}
-}
-static bool program_segment_matches(struct shared_pages *p,uint64_t offset,const uint8_t *bytes,uint64_t filesz) {
-    for(uint64_t at=0;at<filesz;){
-        uint64_t page=(offset+at)/PAGE_SIZE,within=(offset+at)%PAGE_SIZE,chunk=MIN(filesz-at,PAGE_SIZE-within);
-        if(memcmp((uint8_t *)phys_to_virt(p->pages[page])+within,bytes+at,chunk))return false;
-        at+=chunk;
+/* Programs no task runs leave the cache, the least recently started first, while
+ * they hold more than a sixteenth of memory, or fewer than an eighth of it and
+ * `need` more pages are free. */
+static void programs_trim(uint64_t need) {
+    uint64_t budget=pmm_total_pages()/16,floor=pmm_total_pages()/8+need;
+    for(;;){
+        uint64_t idle=0,irq=irq_save();struct program **last=NULL,*gone=NULL;
+        for(struct program **link=&programs;*link;link=&(*link)->next){
+            uint64_t pages=program_idle_pages(*link);
+            if(pages){idle+=pages;last=link;}
+        }
+        if(last && (idle>budget || pmm_free_pages()<floor)){gone=*last;*last=gone->next;gone->state=PROGRAM_RETIRED;}
+        irq_restore(irq);
+        if(!gone)return;
+        program_free(gone);
     }
-    return true;
 }
-int shared_program_segment(struct task *t,const char *path,uint64_t va,const uint8_t *bytes,
-                           uint64_t filesz,uint64_t memsz,bool exec) {
-    uint64_t start=ALIGN_DOWN(va,PAGE_SIZE),end=ALIGN_UP(va+memsz,PAGE_SIZE),offset=va-start;
-    size_t path_len=strlen(path);struct shared_pages *p=NULL;
-    program_segments_free(program_segments_unused());
-    uint64_t irq=irq_save();
-    for(struct program_segment *s=program_segments;s;s=s->next)
-        if(s->va==va && s->filesz==filesz && s->memsz==memsz && s->exec==exec && !strcmp(s->path,path)){
-            p=s->pages;object_ref(&p->object);break;
+/* Whether pages more frames are free, once idle programs gave theirs back if not. */
+static bool frames_free(uint64_t pages) {
+    if(pages<=pmm_free_pages())return true;
+    programs_trim(pages);
+    return pages<=pmm_free_pages();
+}
+struct program *program_get(struct handle *doc) {
+    struct n_entry entry;void *identity;size_t bytes;
+    if(store_document_info(doc,&entry)<0 || store_document_identity(doc,&identity,&bytes)<0)return NULL;
+    programs_trim(0);
+    uint64_t irq=irq_save();struct program *p=NULL;
+    for(struct program **link=&programs;*link;link=&(*link)->next)
+        if((*link)->document==entry.id && (*link)->identity_bytes==bytes && !memcmp((*link)->identity,identity,bytes)){
+            p=*link;*link=p->next;p->next=programs;programs=p; /* the most recently started */
+            p->starts++;break;
         }
     irq_restore(irq);
-    if(p && !program_segment_matches(p,offset,bytes,filesz)){object_unref(&p->object);p=NULL;}
+    if(p){kfree(identity);return p;}
+    if(!(p=kzalloc(sizeof *p))){kfree(identity);return NULL;}
+    *p=(struct program){.document=entry.id,.identity=identity,.identity_bytes=bytes,.starts=1,.state=PROGRAM_NEW};
+    return p;
+}
+void program_put(struct program *p,bool complete) {
+    if(!p)return;
+    struct program *replaced=NULL;uint64_t irq=irq_save();
+    if(p->state==PROGRAM_NEW && complete && p->segments){
+        /* An older content of the document stays with the tasks running it. */
+        for(struct program **link=&programs;*link;link=&(*link)->next)
+            if((*link)->document==p->document){replaced=*link;*link=replaced->next;replaced->state=PROGRAM_RETIRED;break;}
+        p->next=programs;programs=p;p->state=PROGRAM_CACHED;
+    }
+    bool gone=!--p->starts && p->state!=PROGRAM_CACHED;
+    if(replaced && replaced->starts)replaced=NULL; /* its last start lets go of it */
+    irq_restore(irq);
+    if(replaced)program_free(replaced);
+    if(gone)program_free(p);
+}
+int program_map(struct task *t,struct program *prog,uint64_t va,uint64_t filesz,uint64_t memsz,bool exec) {
+    uint64_t start=ALIGN_DOWN(va,PAGE_SIZE),end=ALIGN_UP(va+memsz,PAGE_SIZE);
+    struct shared_pages *p=NULL;struct program_segment *fresh=NULL;
+    for(struct program_segment *s=prog->segments;s;s=s->next)
+        if(s->va==va && s->filesz==filesz && s->memsz==memsz && s->exec==exec){p=s->pages;break;}
     if(!p){
-        int64_t r=shared_object(end-start,false,&p);
-        if(r<0)return (int)r;
-        object_ref(&p->object); /* the mapping's */
-        for(uint64_t at=0;at<filesz;){
-            uint64_t page=(offset+at)/PAGE_SIZE,within=(offset+at)%PAGE_SIZE,chunk=MIN(filesz-at,PAGE_SIZE-within);
-            memcpy((uint8_t *)phys_to_virt(p->pages[page])+within,bytes+at,chunk);at+=chunk;
-        }
-        struct program_segment *s=kmalloc(sizeof *s+path_len+1);
-        if(s){
-            object_ref(&p->object);
-            *s=(struct program_segment){.pages=p,.va=va,.filesz=filesz,.memsz=memsz,.exec=exec};
-            memcpy(s->path,path,path_len+1);
-            /* An object for older bytes of this program stays with its tasks only. */
-            struct program_segment *stale=NULL;irq=irq_save();
-            for(struct program_segment **link=&program_segments;*link;link=&(*link)->next)
-                if((*link)->va==va && !strcmp((*link)->path,path)){stale=*link;*link=stale->next;stale->next=NULL;break;}
-            s->next=program_segments;program_segments=s;irq_restore(irq);
-            program_segments_free(stale);
-        }
+        /* Others may map a cached program's frames already: only a new one gets more. */
+        if(prog->state!=PROGRAM_NEW)return -N_ERR_INVALID;
+        if(!(fresh=kmalloc(sizeof *fresh)))return -N_ERR_NO_MEMORY;
+        int64_t r=frames_free((end-start)/PAGE_SIZE)?shared_object(end-start,false,&p):-N_ERR_NO_MEMORY;
+        if(r<0){kfree(fresh);return (int)r;}
     }
     struct shared_mapping *m=kzalloc(sizeof *m);
-    if(!m){object_unref(&p->object);return -N_ERR_NO_MEMORY;}
     uint64_t flags=PTE_U|PTE_SHARED|PTE_SHARED_RO|(exec?0:pte_nx);size_t mapped=0;
-    for(;mapped<p->count;mapped++)if(!vmm_map_page(t->pml4,start+mapped*PAGE_SIZE,p->pages[mapped],flags))break;
-    if(mapped!=p->count){vmm_user_free(t->pml4,start,mapped*PAGE_SIZE);object_unref(&p->object);kfree(m);return -N_ERR_NO_MEMORY;}
-    irq=irq_save();*m=(struct shared_mapping){.next=t->shared_mappings,.object=&p->object,.va=start,.flags=flags,.bytes=end-start};
+    if(m)for(;mapped<p->count;mapped++)if(!vmm_map_page(t->pml4,start+mapped*PAGE_SIZE,p->pages[mapped],flags))break;
+    if(!m || mapped!=p->count){
+        vmm_user_free(t->pml4,start,mapped*PAGE_SIZE);kfree(m);
+        if(fresh){shared_release(&p->object);kfree(fresh);}
+        return -N_ERR_NO_MEMORY;
+    }
+    if(fresh){
+        object_ref(&p->object); /* the program's */
+        *fresh=(struct program_segment){.next=prog->segments,.pages=p,.va=va,.filesz=filesz,.memsz=memsz,.exec=exec};
+        prog->segments=fresh;
+    }
+    object_ref(&p->object); /* the mapping's */
+    uint64_t irq=irq_save();*m=(struct shared_mapping){.next=t->shared_mappings,.object=&p->object,.va=start,.flags=flags,.bytes=end-start};
     t->shared_mappings=m;irq_restore(irq);
-    return 0;
+    return fresh!=NULL;
 }
 static uint64_t gone_device_page; /* shared_demand_fault: what revoked device mappings show */
 void shared_revoke_claim(const struct pci_claim *c) {
@@ -998,7 +1047,7 @@ void sys_shared_cleanup(struct task *owner) {
         shared_unmap(owner,m);
     }
     mmap_holes_free(owner);
-    program_segments_free(program_segments_unused());
+    programs_trim(0); /* its programs may be idle now */
 }
 
 /* Freed address space of the mmap region. Without reuse every map/unmap cycle
@@ -1099,7 +1148,7 @@ static int64_t sys_memory_reserve(size_t len, int access) {
     /* No size cap of its own: free memory and the address region bound it. */
     if (len == 0 || len > SIZE_MAX - (PAGE_SIZE - 1) || vp < 0) return -N_ERR_INVALID;
     len = ALIGN_UP(len, PAGE_SIZE);
-    if (len / PAGE_SIZE > pmm_free_pages()) { report_memory_exhaustion(t, len); return -N_ERR_NO_MEMORY; }
+    if (!frames_free(len / PAGE_SIZE)) { report_memory_exhaustion(t, len); return -N_ERR_NO_MEMORY; }
     uint64_t va = access & N_MEMORY_LOW ? region_reserve(&t->low_holes, &t->low_next, USER_LOW_TOP, len)
                                         : mmap_reserve(t, len);
     if (!va) return -N_ERR_NO_MEMORY;
@@ -1244,7 +1293,7 @@ static int64_t sys_document_open(const char *upath, int access) {
     int r = user_string(upath, &path);
     if (r < 0) return r;
     struct handle *h;
-    r = store_document_open(path, access, &h);
+    r = store_document_open(path, access, true, &h);
     kfree(path);
     return r < 0 ? r : handle_install(h);
 }
@@ -1263,6 +1312,15 @@ static int64_t sys_document_size(int h) {
     int64_t r = store_document_size(d);
     handle_close(d);
     return r;
+}
+
+static int64_t sys_document_info(int h, struct n_entry *uout) {
+    struct handle *d = handle_get(h);
+    if (!d) return -N_ERR_NO_HANDLE;
+    struct n_entry e;
+    int r = store_document_info(d, &e);
+    handle_close(d);
+    return r < 0 ? r : copy_to_user(uout, &e, sizeof e);
 }
 
 static int64_t sys_document_set_size(int h, uint64_t size) {
@@ -1327,12 +1385,12 @@ static int64_t sys_entry_remove(const char *upath) {
     return r;
 }
 
-static int64_t sys_entry_move(const char *ufrom, const char *uto) {
+static int64_t sys_entry_move(const char *ufrom, const char *uto, bool replace) {
     char *from, *to = NULL;
     int r = user_string(ufrom, &from);
     if (r < 0) return r;
     r = user_string(uto, &to);
-    if (r >= 0) r = store_entry_move(from, to, true);
+    if (r >= 0) r = store_entry_move(from, to, replace, true);
     kfree(from);
     kfree(to);
     return r;
@@ -1539,7 +1597,7 @@ static int64_t sys_app_id(int h) {
     int64_t r;
     struct handle *app = handle_get_as(h, proc_app_is, &r);
     if (!app) return r;
-    r = proc_app_pid(app);
+    r = proc_app_id(app);
     handle_close(app);
     return r;
 }
@@ -1752,9 +1810,7 @@ void syscall_dispatch(struct regs *r) {
             info.flags = N_CLOCK_HV_REFERENCE;
             info.reference_page = owner->clock_page;
         }
-        info.tsc_sample = rdtsc();
-        info.uptime_ms = uptime_ms();
-        if (info.reference_page) hv_reference_time(&info.reference_sample_100ns);
+        timer_clock_sample(&info.uptime_ms, &info.tsc_sample, &info.reference_sample_100ns);
         memcpy((void *)a, &info, sizeof info);
         irq_restore(flags);
         ret = 0;
@@ -1764,9 +1820,10 @@ void syscall_dispatch(struct regs *r) {
         if (!user_ok((void *)a, 1) || !user_ok((void *)c, 1) ||
             (vmm_get_pte(current_task->pml4, a) & PTE_NX) ||
             (vmm_get_pte(current_task->pml4, c) & PTE_NX)) ret = -N_ERR_BAD_ADDRESS;
-        else ret = task_thread_create(c, a, b);
+        else ret = task_thread_create(c, a, b, d);
         break;
     case SYS_THREAD_JOIN: ret = task_thread_join((int)a); break;
+    case SYS_THREAD_DETACH: ret = task_thread_detach((int)a); break;
     case SYS_THREAD_EXIT: task_exit(0);
     case SYS_THREAD_ID: ret = current_task->pid; break;
     case SYS_CPU_INDEX: ret = 0; break;
@@ -1915,9 +1972,11 @@ void syscall_dispatch(struct regs *r) {
     case SYS_DOCUMENT_SAVE: ret = sys_document_save((const char *)a, (const void *)b, c, false); break;
     case SYS_DOCUMENT_APPEND: ret = sys_document_save((const char *)a, (const void *)b, c, true); break;
     case SYS_DOCUMENT_COMMIT: ret = sys_document_commit((int)a, (int)b); break;
+    case SYS_DOCUMENT_INFO: ret = sys_document_info((int)a, (struct n_entry *)b); break;
     case SYS_ENTRY_INFO: ret = sys_entry_info((const char *)a, (struct n_entry *)b); break;
     case SYS_ENTRY_REMOVE: ret = sys_entry_remove((const char *)a); break;
-    case SYS_ENTRY_MOVE: ret = sys_entry_move((const char *)a, (const char *)b); break;
+    case SYS_ENTRY_MOVE: ret = sys_entry_move((const char *)a, (const char *)b, false); break;
+    case SYS_ENTRY_REPLACE: ret = sys_entry_move((const char *)a, (const char *)b, true); break;
     case SYS_FOLDER_CREATE: ret = sys_folder_create((const char *)a); break;
     case SYS_FOLDER_LIST: ret = sys_folder_list((const char *)a, (struct n_entry *)b, c, d); break;
     case SYS_CHANNEL_PAIR: ret = sys_channel_pair((int32_t *)a); break;

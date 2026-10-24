@@ -295,9 +295,15 @@ ST_FUNC void tcc_input_close(TCCInput *in)
     in->document = TCC_NO_INPUT;
 }
 
+/* The size of an input file in bytes, or negative on failure. */
+ST_FUNC int64_t tcc_input_size(TCCInput *in)
+{
+    return n_document_size(in->document);
+}
+
 ST_FUNC char *tcc_load_text(TCCInput *in)
 {
-    int64_t len = n_document_size(in->document);
+    int64_t len = tcc_input_size(in);
     char *buf;
     if (len < 0)
         len = 0;

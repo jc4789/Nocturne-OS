@@ -60,7 +60,9 @@ static unsigned model_calls(void){return model_reserves+model_releases;}
 #define free trim_free
 #define calloc trim_calloc
 #define realloc trim_realloc
+#define aligned_alloc trim_aligned_alloc
 void *malloc(size_t n);void free(void *p);void *calloc(size_t n,size_t m);void *realloc(void *p,size_t n);
+void *aligned_alloc(size_t align,size_t n);
 #include "../user/libc/malloc.c"
 #define main malloc_stress_main
 #include "memtest.c"

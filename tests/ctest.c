@@ -1,5 +1,5 @@
-/* ctest: libc behaviour checks (run with tcc -run, and as a tcc -o program). Prints "FAIL ..."
-   lines and "ctest: ok". */
+/* ctest: libc and compiler behaviour checks (run with tcc -run, and as a tcc -o program).
+   Prints "FAIL ..." lines and "ctest: ok". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +28,18 @@ static void tls_thread(void *arg) {
     tls_counter = 7;
     tls_zero[7] = 2;
 }
+
+/* C23 #embed: this file's own first bytes, beside it */
+static const char embedded[] = {
+#embed "ctest.c" limit(2) suffix(, 0)
+};
+static const unsigned char embedded_empty[] = {
+#embed "ctest.c" limit(0) prefix(1,) if_empty(7)
+};
+#if __has_embed("ctest.c") != __STDC_EMBED_FOUND__ || __has_embed("absent.c") != __STDC_EMBED_NOT_FOUND__ \
+    || __has_embed("ctest.c" limit(0)) != __STDC_EMBED_EMPTY__
+#error __has_embed
+#endif
 
 int main(void) {
     char buf[128];
@@ -89,6 +101,18 @@ int main(void) {
     n_result tid = thread_create(tls_thread, NULL);
     CHECK(tid >= 0 && !thread_join((int)tid));
     CHECK(tls_fresh && tls_counter == 42 && tls_zero[7] == 1);
+
+    CHECK(!strcmp(embedded, "/*") && sizeof embedded_empty == 1 && embedded_empty[0] == 7);
+
+    /* GCC's value forms of the __atomic builtins, and its fences */
+    volatile int shared = 1;
+    int expected = 2;
+    CHECK(__atomic_exchange_n(&shared, 2, __ATOMIC_ACQ_REL) == 1);
+    CHECK(__atomic_compare_exchange_n(&shared, &expected, 3, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+    __sync_synchronize();
+    CHECK(__atomic_load_n(&shared, __ATOMIC_ACQUIRE) == 3);
+    __atomic_store_n(&shared, 4, __ATOMIC_RELEASE);
+    CHECK(!__atomic_compare_exchange_n(&shared, &expected, 5, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED) && expected == 4);
 
     if (!failed) printf("ctest: ok\n");
     return failed != 0;

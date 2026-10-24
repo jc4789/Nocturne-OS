@@ -1,4 +1,4 @@
-/* ISO C11 <threads.h> on Nocturne native threads (thread_create/join) and
+/* ISO C11 <threads.h> on Nocturne native threads (thread_create/join/detach) and
  * address waits (wait_on_address/wake_address). Not a POSIX layer. */
 #include <threads.h>
 #include <stdbool.h>
@@ -12,43 +12,11 @@ struct __nocturne_thrd {
     thrd_start_t func;
     void *arg;
     int tid, result;
-    /* 2 references while running and joinable; join drops one, the reaper of a
-       detached thread drops it after the native join. */
+    /* 2 references while running and joinable: the thread drops its own when it
+       ends, and join or detach drops the other. */
     volatile uint32_t refs;
-    volatile uint32_t finished; /* set by the thread once nothing of it is used any more */
-    struct __nocturne_thrd *detached_next;
     bool started_here;
 };
-
-/* A native thread stays a zombie (kernel stack and task record) until someone
-   joins it, so a detached thrd_t is joined by whichever thread next creates or
-   detaches one, once the thread has said it is finished. */
-static struct __nocturne_thrd *detached_list;
-static mtx_t detached_lock = { 0, mtx_plain, 0, 0 };
-
-static void thrd_release(struct __nocturne_thrd *t);
-
-static void thrd_reap_detached(void) {
-    struct __nocturne_thrd *done = NULL;
-    mtx_lock(&detached_lock);
-    for (struct __nocturne_thrd **link = &detached_list; *link;) {
-        struct __nocturne_thrd *t = *link;
-        if (__atomic_load_n(&t->finished, __ATOMIC_ACQUIRE)) {
-            *link = t->detached_next;
-            t->detached_next = done;
-            done = t;
-        } else {
-            link = &t->detached_next;
-        }
-    }
-    mtx_unlock(&detached_lock);
-    while (done) {
-        struct __nocturne_thrd *t = done;
-        done = t->detached_next;
-        thread_join(t->tid); /* the thread is past its last user-visible step; this returns promptly */
-        thrd_release(t);
-    }
-}
 
 static void thrd_release(struct __nocturne_thrd *t) {
     if (__atomic_sub_fetch(&t->refs, 1, __ATOMIC_ACQ_REL) == 0) free(t);
@@ -75,10 +43,12 @@ static mtx_t tss_lock = { 0, mtx_plain, 0, 0 };
 
 static void tss_run_dtors(void) {
     for (int round = 0; round < TSS_DTOR_ITERATIONS; round++) {
-        size_t cap = 0;
-        void **values = __libc_tss_values(0, &cap);
         bool ran = false;
-        for (size_t i = 0; values && i < cap; i++) {
+        for (size_t i = 0;; i++) {
+            /* A destructor may tss_set a new key, which moves the values. */
+            size_t cap = 0;
+            void **values = __libc_tss_values(0, &cap);
+            if (!values || i >= cap) break;
             void *value = values[i];
             if (!value) continue;
             mtx_lock(&tss_lock);
@@ -135,11 +105,9 @@ static void thrd_entry(void *opaque) {
     thread_local_set(7, t);
     t->result = t->func(t->arg);
     tss_run_dtors();
-    __atomic_store_n(&t->finished, 1, __ATOMIC_RELEASE);
     thrd_release(t);
 }
 int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
-    thrd_reap_detached();
     struct __nocturne_thrd *t = calloc(1, sizeof *t);
     if (!t) return thrd_nomem;
     t->func = func;
@@ -155,12 +123,9 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
 }
 thrd_t thrd_current(void) { return thrd_self_record(); }
 int thrd_detach(thrd_t thr) {
-    if (!thr || !thr->started_here) return thrd_error;
-    mtx_lock(&detached_lock);
-    thr->detached_next = detached_list;
-    detached_list = thr;
-    mtx_unlock(&detached_lock);
-    thrd_reap_detached();
+    /* The kernel frees the native thread once it has ended. */
+    if (!thr || !thr->started_here || thread_detach(thr->tid) < 0) return thrd_error;
+    thrd_release(thr);
     return thrd_success;
 }
 int thrd_equal(thrd_t a, thrd_t b) { return a == b; }
@@ -169,7 +134,6 @@ __attribute__((noreturn)) void thrd_exit(int res) {
     tss_run_dtors();
     if (t && t->started_here) {
         t->result = res;
-        __atomic_store_n(&t->finished, 1, __ATOMIC_RELEASE);
         thrd_release(t);
         thread_exit();
     }

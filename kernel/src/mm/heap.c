@@ -1,4 +1,6 @@
-/* Kernel heap: address-ordered block list with first-fit and coalescing. */
+/* Kernel heap: an address-ordered block list whose free neighbours merge, and an index of the free
+   blocks by size (two-level segregated fit), so that a block is found in a few steps however many
+   blocks the heap holds (the store's cache alone holds tens of thousands). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
@@ -20,18 +22,78 @@ struct block {
     uint32_t magic;
     uint32_t free;
     uint64_t size; /* payload bytes */
-    struct block *prev, *next;
+    struct block *prev, *next;           /* address order */
+    struct block *free_prev, *free_next; /* its size class's list, while free (a released block's
+                                            payload is not there to hold them) */
 };
 
 static struct block *head, *tail;
 static uint64_t heap_end = KHEAP_BASE;
 static uint64_t heap_used;
-/* Every block before scan_head (address order) is in use, so first-fit starts
-   here instead of walking the thousands of permanent file blocks at the front.
-   NULL means no hint yet (start at head). */
-static struct block *scan_head;
 static bool trim_pending;
 static struct wait_queue trim_wq;
+
+/* The free blocks' size classes: below SMALL bytes one per 16 bytes, from there SL_COUNT for each
+   power of two. A bit of class_map says which lists of a power of two have blocks, a bit of
+   power_map which powers of two have any. */
+#define SL_BITS 4
+#define SL_COUNT (1u << SL_BITS)
+#define SMALL_SHIFT (SL_BITS + 4)
+#define SMALL (1ULL << SMALL_SHIFT)
+#define FL_COUNT (64 - SMALL_SHIFT + 1)
+static struct block *lists[FL_COUNT][SL_COUNT];
+static uint16_t class_map[FL_COUNT];
+static uint64_t power_map;
+
+static void class_of(uint64_t size, unsigned *fl, unsigned *sl) {
+    if (size < SMALL) {
+        *fl = 0;
+        *sl = (unsigned)(size >> 4);
+        return;
+    }
+    unsigned top = 63u - (unsigned)__builtin_clzll(size);
+    *fl = top - SMALL_SHIFT + 1;
+    *sl = (unsigned)(size >> (top - SL_BITS)) & (SL_COUNT - 1);
+}
+
+static void list_add(struct block *b) {
+    unsigned fl, sl;
+    class_of(b->size, &fl, &sl);
+    b->free_prev = NULL;
+    b->free_next = lists[fl][sl];
+    if (b->free_next) b->free_next->free_prev = b;
+    lists[fl][sl] = b;
+    class_map[fl] |= (uint16_t)(1u << sl);
+    power_map |= 1ULL << fl;
+}
+
+static void list_remove(struct block *b) {
+    unsigned fl, sl;
+    class_of(b->size, &fl, &sl);
+    if (b->free_next) b->free_next->free_prev = b->free_prev;
+    if (b->free_prev) {
+        b->free_prev->free_next = b->free_next;
+    } else if (!(lists[fl][sl] = b->free_next)) {
+        class_map[fl] &= (uint16_t)~(1u << sl);
+        if (!class_map[fl]) power_map &= ~(1ULL << fl);
+    }
+}
+
+/* A free block of at least size bytes, or NULL. The size is rounded up to the next class, so any
+   block of the class found is large enough. */
+static struct block *find(uint64_t size) {
+    if (size >= SMALL) size += (1ULL << (63u - (unsigned)__builtin_clzll(size) - SL_BITS)) - 1;
+    unsigned fl, sl;
+    class_of(size, &fl, &sl);
+    unsigned classes = class_map[fl] & (~0u << sl);
+    if (!classes) {
+        uint64_t powers = power_map & (~0ULL << fl << 1);
+        if (!powers) return NULL;
+        fl = (unsigned)__builtin_ctzll(powers);
+        classes = class_map[fl];
+    }
+    return lists[fl][__builtin_ctz(classes)];
+}
 
 /* All or nothing: pages mapped before a failure go back, so heap_end never
    covers pages that no block accounts for. */
@@ -79,15 +141,20 @@ static void split(struct block *b, size_t size) {
         else tail = n;
         b->next = n;
         b->size = size;
+        list_add(n);
     }
 }
 
-/* Hands out free block b for size bytes; false when its pages cannot be backed. */
+/* Hands out free block b, which no list holds, for size bytes; false when its pages cannot be
+   backed (b is listed again). */
 static bool take(struct block *b, size_t size) {
     if (b->free & BLOCK_RELEASED) {
         /* The payload and the header split() may write after it. */
         uint64_t start = (uint64_t)(b + 1), end = start + MIN(b->size, size + sizeof(struct block));
-        if (!back(start, end)) return false;
+        if (!back(start, end)) {
+            list_add(b);
+            return false;
+        }
     }
     split(b, size);
     b->free = 0;
@@ -103,28 +170,20 @@ void *kmalloc(size_t size) {
     if (size > (uint64_t)1 << 40) return NULL;
     size = ALIGN_UP(size, 16);
     uint64_t f = irq_save();
-    bool prefix = true; /* no free block seen yet: the used run extends the hint */
-    for (struct block *b = scan_head ? scan_head : head; b; b = b->next) {
-        if (!b->free) {
-            if (prefix) scan_head = b;
-            continue;
-        }
-        prefix = false;
-        if (b->size >= size) {
-            bool ok = take(b, size);
-            irq_restore(f);
-            return ok ? b + 1 : NULL;
-        }
-    }
-    /* extend the heap */
-    uint64_t need = size + sizeof(struct block);
-    struct block *b;
-    if (tail && tail->free) {
-        uint64_t have = tail->size;
-        if (!grow(size - have)) { irq_restore(f); return NULL; }
+    struct block *b = find(size);
+    if (b) {
+        list_remove(b);
+    } else if (tail && tail->free) { /* the heap grows under its last block */
         b = tail;
+        list_remove(b);
+        if (b->size < size && !grow(size - b->size)) {
+            list_add(b);
+            irq_restore(f);
+            return NULL;
+        }
         b->size = heap_end - (uint64_t)(b + 1);
     } else {
+        uint64_t need = size + sizeof(struct block);
         uint64_t start = heap_end;
         if (!grow(need)) { irq_restore(f); return NULL; }
         b = (struct block *)start;
@@ -160,6 +219,7 @@ void kfree(void *p) {
     heap_used -= b->size;
     struct block *n = b->next;
     if (n && n->free) {
+        list_remove(n);
         b->free |= n->free;
         b->size += sizeof(struct block) + n->size;
         b->next = n->next;
@@ -169,6 +229,7 @@ void kfree(void *p) {
     }
     struct block *pr = b->prev;
     if (pr && pr->free) {
+        list_remove(pr);
         pr->free |= b->free;
         pr->size += sizeof(struct block) + b->size;
         pr->next = b->next;
@@ -177,30 +238,33 @@ void kfree(void *p) {
         b->magic = 0;
         b = pr;
     }
-    /* b is the free block that now covers the freed memory (a merged-away block
-       is above it, so the hint can never be left on one). */
-    if (scan_head > b) scan_head = b;
     /* The freed bytes are backed: a large block has pages to give back. */
     if (b->size >= TRIM_MIN) { b->free |= BLOCK_TRIM; trim_pending = true; }
+    list_add(b);
     irq_restore(f);
     if (trim_pending) wq_wake_all(&trim_wq);
 }
 
 /* Gives the interior pages of large free blocks back to the page allocator.
    Runs in the heap's own task: never inside kfree, whose callers may hold
-   interrupts off while APs wait on them, where a TLB shootdown could stall. */
+   interrupts off while APs wait on them, where a TLB shootdown could stall.
+   Blocks of TRIM_MIN bytes and more are in the classes from TRIM_MIN's on. */
 static void heap_trim(void) {
     uint64_t f = irq_save();
     trim_pending = false;
-    for (struct block *b = scan_head ? scan_head : head; b; b = b->next) {
-        if (!(b->free & BLOCK_TRIM)) continue;
-        b->free &= ~BLOCK_TRIM;
-        uint64_t first = ALIGN_UP((uint64_t)(b + 1), PAGE_SIZE);
-        uint64_t last = ALIGN_DOWN((uint64_t)(b + 1) + b->size, PAGE_SIZE);
-        if (last <= first) continue;
-        vfree((void *)first, (last - first) / PAGE_SIZE); /* frees only mapped pages */
-        b->free |= BLOCK_RELEASED;
-    }
+    unsigned first_fl, first_sl;
+    class_of(TRIM_MIN, &first_fl, &first_sl);
+    for (unsigned fl = first_fl; fl < FL_COUNT; fl++)
+        for (unsigned sl = 0; sl < SL_COUNT; sl++)
+            for (struct block *b = lists[fl][sl]; b; b = b->free_next) {
+                if (!(b->free & BLOCK_TRIM)) continue;
+                b->free &= ~BLOCK_TRIM;
+                uint64_t first = ALIGN_UP((uint64_t)(b + 1), PAGE_SIZE);
+                uint64_t last = ALIGN_DOWN((uint64_t)(b + 1) + b->size, PAGE_SIZE);
+                if (last <= first) continue;
+                vfree((void *)first, (last - first) / PAGE_SIZE); /* frees only mapped pages */
+                b->free |= BLOCK_RELEASED;
+            }
     irq_restore(f);
 }
 

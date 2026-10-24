@@ -310,6 +310,7 @@ def test_files(a, tcp_port, web_ports, scratch):
     # paired with the baseline boot image while the checkout is being repaired.
     source_root = a.source_tree or ROOT
     srcs = sorted(glob.glob(os.path.join(source_root, "tests", "*.c")))
+    srcs += sorted(glob.glob(os.path.join(source_root, "tests", "*.cpp")))  # the clang group's C++
     srcs += sorted(glob.glob(os.path.join(source_root, "tests", "js_*_cases.js")))
     # Internal metadata regression reads diagnostic counters from the real DOM.
     srcs.append(os.path.join(source_root, "user", "libc", "web", "webi.h"))
@@ -513,13 +514,14 @@ def run_vm(a, tcp_port, web_ports, processes):
         problems.append("the in-OS runner did not finish (did tcc fail to build it?)")
     for m in re.finditer(r"(?im)^.*(panic|kernel fault|double fault).*$", log):
         problems.append("kernel: " + m.group(0).strip())
-    # Permission probes and one explicitly confirmed native-helper UD2 are
-    # deliberate. Do not suppress other threadtest faults or multiple faults.
-    expected_helper_faults = int("threadtest: expected helper fault status=134" in log and
-                               re.search(r"^PASS threads/", log, re.M) is not None)
+    # Permission probes and the native-helper UD2 that each threadtest run (the
+    # threads group's, and the clang group's build of it) confirms in its output
+    # are deliberate. Do not suppress other threadtest faults, or more of them.
+    expected_helper_faults = len(re.findall(r"^  \| threadtest: expected helper fault status=134\r?$", log, re.M))
     for m in re.finditer(r"^\[(segfault|crash)\] pid \d+ \(([^)]*)\).*$", log, re.M):
         if expected_helper_faults and re.fullmatch(
-                r"\[crash\] pid \d+ \(threadtest\) cpu\d+: Invalid opcode at rip=[0-9a-fA-F]+\r?", m.group(0)):
+                r"\[crash\] pid \d+ \(threadtest\) cpu\d+: Invalid opcode at rip=[0-9a-fA-F]+"
+                r" rsp=[0-9a-fA-F]+ stack(?: [0-9a-fA-F]+)*\r?", m.group(0)):
             expected_helper_faults -= 1
             continue
         if m.group(2) != "wxtest":

@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/hyperv.h"
+#include "arch/smp.h"
 #include "sys/sched.h"
 #include "dev/timer.h"
 #include "dev/audio.h"
@@ -32,6 +33,25 @@ static bool catch_up(void) {
         return false;
     }
     return true;
+}
+
+/* uptime_ms as the clock has it now rather than at the last tick, for a deadline that must not come
+   early. Only the BSP sets the count; elsewhere it is the last tick's. */
+uint64_t timer_now_ms(void) {
+    if (cpu_current_index() == 0) catch_up();
+    return timer_ticks;
+}
+
+/* What SYS_CLOCK_INFO gives apps that read the clock themselves: the count now, with the readings
+   of the TSC and of the reference clock the count is set from at that count. An app's clock then
+   reads what catch_up sets, never less than the count, so a wait the kernel ends by the count does
+   not end before the app's clock says it should. */
+void timer_clock_sample(uint64_t *ms, uint64_t *tsc, uint64_t *reference_100ns) {
+    uint64_t now = timer_now_ms();
+    *ms = now;
+    *tsc = tsc_per_ms ? tsc_base + now * tsc_per_ms : rdtsc();
+    if (reference_clock) *reference_100ns = reference_base + now * 10000;
+    else if (!hv_reference_time(reference_100ns)) *reference_100ns = 0;
 }
 
 /* The tick counts milliseconds. An emulator may drop timer interrupts when it falls behind (QEMU

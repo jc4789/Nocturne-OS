@@ -76,7 +76,7 @@ def flags(upstream):
     # Nocturne's crt0. Freestanding C++ would mangle main and break that ABI.
     # Disable implicit libc substitutions without changing main's semantics.
     return ['--target=x86_64-unknown-none-elf', '-std=c++20', '-fno-builtin',
-            '-fno-exceptions', '-fno-rtti', '-fno-stack-protector', '-fno-pic',
+            '-fno-exceptions', '-fno-asynchronous-unwind-tables', '-fno-rtti', '-fno-stack-protector', '-fno-pic',
             '-fno-pie', '-mno-red-zone', '-msse2', '-O2', '-g', '-nostdinc++',
             '-fno-strict-aliasing', '-ffunction-sections', '-fdata-sections',
             '-Iuser/include/c++', '-I' + build_path(upstream / 'include'),

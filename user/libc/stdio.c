@@ -8,6 +8,9 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
+#include <limits.h>
+#include <wchar.h>
+#include <wctype.h>
 #include "nocturne.h"
 
 struct FILE {
@@ -20,7 +23,8 @@ struct FILE {
     int bufsize;
     int wlen;       /* bytes pending write */
     int rpos, rlen; /* read buffer window */
-    int ungot;
+    int ungot;      /* a pushed-back byte, or wide character on a wide stream; -1 for none */
+    signed char orientation; /* 0 until a character function first runs; -1 bytes, 1 wide (fwide) */
     bool eof, err, own_buf;
     char *temp_name; /* tmpfile: removed when closed */
     struct FILE *next;
@@ -241,6 +245,7 @@ FILE *freopen(const char *path, const char *mode, FILE *f) {
     f->pos = 0;
     f->wlen = f->rpos = f->rlen = 0;
     f->ungot = -1;
+    f->orientation = 0;
     f->eof = f->err = false;
     return f;
 }
@@ -313,26 +318,11 @@ int remove(const char *name) {
     return 0;
 }
 
-/* An existing document under the new name takes the old one's content whole,
-   swapped in atomically, and the old name goes. */
+/* A document under the new name is replaced in the commit of the move (n_entry_replace). */
 int rename(const char *from, const char *to) {
     char a[4096], b[4096];
     const char *src = full_path(from, a, sizeof a), *dst = src ? full_path(to, b, sizeof b) : NULL;
-    n_result r = dst ? n_entry_move(src, dst) : -(n_result)errno;
-    if (r == -N_ERR_EXISTS) {
-        struct n_entry s, d;
-        if (n_entry_info(src, &s) == 0 && n_entry_info(dst, &d) == 0 &&
-            s.kind == N_KIND_DOCUMENT && d.kind == N_KIND_DOCUMENT) {
-            void *data;
-            size_t size;
-            r = n_document_load(src, &data, &size);
-            if (r >= 0) {
-                r = n_document_save(dst, data, size);
-                if (data) n_memory_release(data, size);
-            }
-            if (r >= 0) r = n_entry_remove(src);
-        }
-    }
+    n_result r = dst ? n_entry_replace(src, dst) : -(n_result)errno;
     if (r < 0) {
         errno = (int)-r;
         return -1;
@@ -355,6 +345,10 @@ int setvbuf(FILE *f, char *buf, int mode, size_t size) {
         f->own_buf = true;
     }
     return 0;
+}
+
+void setbuf(FILE *f, char *buf) {
+    setvbuf(f, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
 }
 
 static int write_bytes(FILE *f, const char *s, size_t n) {
@@ -420,7 +414,14 @@ static int fill(FILE *f) {
     return 0;
 }
 
+/* A stream's first character function fixes its orientation. The byte and
+   wide functions both work on either: a wide stream's characters are UTF-8. */
+static void orient(FILE *f, int mode) {
+    if (!f->orientation) f->orientation = (signed char)mode;
+}
+
 int fgetc(FILE *f) {
+    orient(f, -1);
     if (f->ungot >= 0) {
         int c = f->ungot;
         f->ungot = -1;
@@ -435,9 +436,10 @@ int getchar(void) { return fgetc(stdin); }
 
 int ungetc(int c, FILE *f) {
     if (c == EOF) return EOF;
-    f->ungot = c;
+    orient(f, -1);
+    f->ungot = (unsigned char)c;
     f->eof = false;
-    return c;
+    return f->ungot;
 }
 
 char *fgets(char *s, int n, FILE *f) {
@@ -456,6 +458,7 @@ char *fgets(char *s, int n, FILE *f) {
 size_t fread(void *buf, size_t size, size_t n, FILE *f) {
     size_t total = size * n, got = 0;
     char *b = buf;
+    orient(f, -1);
     if (total && f->ungot >= 0) {
         b[got++] = (char)f->ungot;
         f->ungot = -1;
@@ -484,17 +487,22 @@ size_t fread(void *buf, size_t size, size_t n, FILE *f) {
 }
 
 size_t fwrite(const void *buf, size_t size, size_t n, FILE *f) {
+    orient(f, -1);
     if (write_bytes(f, buf, size * n)) return 0;
     return n;
 }
 
 int fputc(int c, FILE *f) {
     char ch = (char)c;
+    orient(f, -1);
     return write_bytes(f, &ch, 1) ? EOF : (unsigned char)c;
 }
 int putc(int c, FILE *f) { return fputc(c, f); }
 int putchar(int c) { return fputc(c, stdout); }
-int fputs(const char *s, FILE *f) { return write_bytes(f, s, strlen(s)) ? EOF : 0; }
+int fputs(const char *s, FILE *f) {
+    orient(f, -1);
+    return write_bytes(f, s, strlen(s)) ? EOF : 0;
+}
 int puts(const char *s) {
     if (fputs(s, stdout)) return EOF;
     return fputc('\n', stdout) == EOF ? EOF : 0;
@@ -503,6 +511,106 @@ int feof(FILE *f) { return f->eof; }
 int ferror(FILE *f) { return f->err; }
 void clearerr(FILE *f) { f->eof = f->err = false; }
 int fileno(FILE *f) { return f->h; }
+
+/* ---- wide characters: UTF-8 in the stream, one UTF-32 code unit each ---- */
+
+int fwide(FILE *f, int mode) {
+    if (mode) orient(f, mode > 0 ? 1 : -1);
+    return f->orientation;
+}
+
+/* The next byte, left in the buffer. */
+static int peek_byte(FILE *f) {
+    if (f->rpos >= f->rlen && fill(f) == EOF) return EOF;
+    return (unsigned char)f->buf[f->rpos];
+}
+
+/* A byte that cannot continue the character is left for the next read; the
+   bad character and an end inside one are encoding errors (EILSEQ), which set
+   the stream's error indicator. */
+wint_t fgetwc(FILE *f) {
+    orient(f, 1);
+    if (f->ungot >= 0) {
+        wint_t c = f->ungot;
+        f->ungot = -1;
+        return c;
+    }
+    mbstate_t st = {0};
+    for (bool first = true;; first = false) {
+        int b = peek_byte(f);
+        if (b == EOF) {
+            if (first || f->err) return WEOF;
+            errno = EILSEQ;
+            f->err = true;
+            return WEOF;
+        }
+        char unit = (char)b;
+        wchar_t c;
+        size_t r = mbrtowc(&c, &unit, 1, &st);
+        if (r != (size_t)-1 || first) f->rpos++;
+        if (r == (size_t)-1) {
+            f->err = true;
+            return WEOF;
+        }
+        if (r != (size_t)-2) return (wint_t)c;
+    }
+}
+wint_t getwc(FILE *f) { return fgetwc(f); }
+wint_t getwchar(void) { return fgetwc(stdin); }
+
+wint_t ungetwc(wint_t c, FILE *f) {
+    if (c < 0) return WEOF;
+    orient(f, 1);
+    f->ungot = (int)c;
+    f->eof = false;
+    return c;
+}
+
+wchar_t *fgetws(wchar_t *s, int n, FILE *f) {
+    int i = 0;
+    while (i < n - 1) {
+        wint_t c = fgetwc(f);
+        if (c == WEOF) {
+            if (ferror(f)) return NULL;
+            break;
+        }
+        s[i++] = (wchar_t)c;
+        if (c == L'\n') break;
+    }
+    if (i == 0 || n <= 0) return NULL;
+    s[i] = 0;
+    return s;
+}
+
+wint_t fputwc(wchar_t c, FILE *f) {
+    char units[4];
+    mbstate_t st = {0};
+    orient(f, 1);
+    size_t n = wcrtomb(units, c, &st);
+    if (n == (size_t)-1) {
+        f->err = true;
+        return WEOF;
+    }
+    return write_bytes(f, units, n) ? WEOF : (wint_t)c;
+}
+wint_t putwc(wchar_t c, FILE *f) { return fputwc(c, f); }
+wint_t putwchar(wchar_t c) { return fputwc(c, stdout); }
+
+int fputws(const wchar_t *s, FILE *f) {
+    orient(f, 1);
+    while (*s) {
+        char units[256];
+        mbstate_t st = {0};
+        size_t n = wcsrtombs(units, &s, sizeof units, &st);
+        if (n == (size_t)-1) {
+            f->err = true;
+            return EOF;
+        }
+        if (write_bytes(f, units, n)) return EOF;
+        if (!s) break;
+    }
+    return 0;
+}
 
 /* The stream's position: documents only; channels have none. */
 long ftell(FILE *f) {
@@ -550,16 +658,26 @@ void perror(const char *msg) {
     else fprintf(stderr, "%s\n", strerror(errno));
 }
 
-/* ---- formatting core ---- */
+/* ---- formatting core ----
+   The output is UTF-8 for the byte and the wide functions alike; for the wide
+   ones (wide) it is counted, padded and cut in characters. */
 typedef struct {
-    void (*put)(void *ctx, const char *s, size_t n);
+    bool (*put)(void *ctx, const char *s, size_t n); /* false when it could not be written */
     void *ctx;
     size_t count;
+    bool wide, failed;
 } out_t;
 
 static void emit(out_t *o, const char *s, size_t n) {
-    o->put(o->ctx, s, n);
-    o->count += n;
+    if (!o->put(o->ctx, s, n)) o->failed = true;
+    if (!o->wide) o->count += n;
+    else
+        for (size_t i = 0; i < n; i++) o->count += ((unsigned char)s[i] & 0xC0) != 0x80;
+}
+
+static void encoding_error(out_t *o) {
+    o->failed = true;
+    errno = EILSEQ;
 }
 
 static void pad(out_t *o, char c, int n) {
@@ -594,29 +712,26 @@ static int fmt_uint(char *buf, unsigned long long v, int base, bool upper) {
     return n;
 }
 
-/* ---- exact double -> decimal conversion ----
-   A double is m * 2^e with integer m, so its decimal expansion is finite. We compute all of its
-   digits with base-1e9 big integers (as musl does) and round them half-to-even, which gives the
-   same output as glibc: printf("%.0f", 2.5) is "2", and "%.20f" prints the true digits. */
-#define DEC_MAX 800 /* 2^-1074 has 751 significant digits; 2^1024 has 309 */
+/* ---- exact binary -> decimal conversion ----
+   A double or long double is m * 2^e with integer m, so its decimal expansion
+   is finite. All of its digits come from base-1e9 big integers and are rounded
+   half to even: printf("%.0f", 2.5) is "2", and "%.20f" prints the true digits. */
+#define DEC_MAX 800     /* double: 2^-1074 has 751 significant digits; 2^1024 has 309 */
+#define BIG_MAX 96
+#define LDEC_MAX 11520  /* long double: m * 2^-16445 has up to 11515; 2^16384 has 4933 */
+#define LBIG_MAX 1290
 
 struct dec {
-    char d[DEC_MAX]; /* digits, d[0] != '0' unless the value is zero */
-    int n;           /* number of digits (0 = zero) */
-    int pt;          /* value = 0.d[0]d[1]... * 10^pt */
+    char *d; /* digits, d[0] != '0' unless the value is zero */
+    int n;   /* number of digits (0 = zero) */
+    int pt;  /* value = 0.d[0]d[1]... * 10^pt */
 };
 
-static void dec_from_double(double v, struct dec *x) {
-    union { double d; uint64_t u; } bits = {v};
-    int be = (int)(bits.u >> 52 & 0x7FF);
-    uint64_t m = bits.u & ((1ULL << 52) - 1);
-    int e;
-    if (be) m |= 1ULL << 52, e = be - 1075;
-    else e = -1074;
+/* The digits of m * 2^e into x->d, with big as room for them in base 1e9. */
+static void dec_from_binary(uint64_t m, int e, struct dec *x, uint32_t *big) {
     x->n = 0;
     x->pt = 0;
     if (!m) return;
-    uint32_t big[96]; /* little-endian base 1e9 */
     int nl = 0;
     while (m) big[nl++] = (uint32_t)(m % 1000000000), m /= 1000000000;
     /* multiply by 2^e, or for e < 0 by 5^-e and move the decimal point -e places left */
@@ -681,29 +796,25 @@ static void dec_round(struct dec *x, int keep) {
 
 static char dec_digit(const struct dec *x, int i) { return i >= 0 && i < x->n ? x->d[i] : '0'; }
 
-/* %f: `prec` decimals; returns length */
-static int fmt_fixed(char *buf, struct dec *x, int prec) {
+/* %f: `prec` decimals (and the point without them for '#'); returns length */
+static int fmt_fixed(char *buf, struct dec *x, int prec, bool alt) {
     dec_round(x, x->pt + prec);
     int n = 0;
     if (x->n == 0 || x->pt <= 0) buf[n++] = '0';
     else
         for (int i = 0; i < x->pt; i++) buf[n++] = dec_digit(x, i);
-    if (prec) {
-        buf[n++] = '.';
-        for (int i = 0; i < prec; i++) buf[n++] = x->n ? dec_digit(x, x->pt + i) : '0';
-    }
+    if (prec || alt) buf[n++] = '.';
+    for (int i = 0; i < prec; i++) buf[n++] = x->n ? dec_digit(x, x->pt + i) : '0';
     return n;
 }
 
 /* %e: one digit, `prec` decimals, exponent */
-static int fmt_exp(char *buf, struct dec *x, int prec, bool upper) {
+static int fmt_exp(char *buf, struct dec *x, int prec, bool upper, bool alt) {
     dec_round(x, prec + 1);
     int e = x->n ? x->pt - 1 : 0, n = 0;
     buf[n++] = dec_digit(x, 0);
-    if (prec) {
-        buf[n++] = '.';
-        for (int i = 1; i <= prec; i++) buf[n++] = dec_digit(x, i);
-    }
+    if (prec || alt) buf[n++] = '.';
+    for (int i = 1; i <= prec; i++) buf[n++] = dec_digit(x, i);
     buf[n++] = upper ? 'E' : 'e';
     buf[n++] = e < 0 ? '-' : '+';
     if (e < 0) e = -e;
@@ -712,8 +823,198 @@ static int fmt_exp(char *buf, struct dec *x, int prec, bool upper) {
     return n;
 }
 
-static int core(out_t *o, const char *fmt, va_list ap) {
-    for (const char *p = fmt; *p; p++) {
+/* %a after its 0x: m * 2^e as 1.hhh...p+d (0p+0 for zero), with `prec` hex
+   digits rounded half to even, or as many as m needs when prec < 0. */
+static int fmt_hex(char *buf, uint64_t m, int e, int prec, bool upper, bool alt) {
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    uint64_t frac = 0; /* the bits after the leading 1, from bit 63 down */
+    int lead = 0, n = 0;
+    if (m) {
+        int top = 63 - __builtin_clzll(m);
+        frac = top ? m << (64 - top) : 0;
+        lead = 1, e += top;
+        if (prec >= 0 && prec < 16) {
+            uint64_t half = (uint64_t)1 << 63;
+            uint64_t kept = prec ? frac >> (64 - 4 * prec) : 0, rest = prec ? frac << (4 * prec) : frac;
+            /* a carry into the leading digit makes it 2: 1.0 times the next power */
+            if (rest > half || (rest == half && ((prec ? kept : 1) & 1)))
+                if (!prec || ++kept >> (4 * prec)) kept = 0, e++;
+            frac = prec ? kept << (64 - 4 * prec) : 0;
+        }
+    } else e = 0;
+    buf[n++] = digits[lead];
+    int count = prec;
+    if (count < 0)
+        for (count = 0; count < 16 && frac << (4 * count); count++) {}
+    if (count || alt) buf[n++] = '.';
+    for (int i = 0; i < count; i++) buf[n++] = i < 16 ? digits[frac >> (60 - 4 * i) & 15] : '0';
+    buf[n++] = upper ? 'P' : 'p';
+    buf[n++] = e < 0 ? '-' : '+';
+    n += fmt_uint(buf + n, (unsigned)(e < 0 ? -e : e), 10, false);
+    return n;
+}
+
+/* The letter, flags, width and precision of a %f %e %g %a conversion. */
+struct conv {
+    char c;
+    bool left, plus, space, zero, alt;
+    int width, prec;
+};
+
+/* A double or long double: m * 2^e, or the special value "inf" or "nan".
+   x->d, big and buf have room for the type's longest expansion. */
+static void put_float(out_t *o, const struct conv *cv, bool neg, const char *special, uint64_t m, int e,
+                      struct dec *x, uint32_t *big, char *buf) {
+    char c = cv->c, prefix[4] = {0};
+    bool upper = c == 'F' || c == 'E' || c == 'G' || c == 'A';
+    if (neg) strcpy(prefix, "-");
+    else if (cv->plus) strcpy(prefix, "+");
+    else if (cv->space) strcpy(prefix, " ");
+    if (special) {
+        emit_field(o, prefix, upper ? (*special == 'i' ? "INF" : "NAN") : special, 3, cv->width, cv->left, false);
+        return;
+    }
+    int prec = cv->prec > 340 ? 340 : cv->prec, n;
+    if (c == 'a' || c == 'A') {
+        strcat(prefix, upper ? "0X" : "0x");
+        n = fmt_hex(buf, m, e, prec, upper, cv->alt);
+    } else {
+        if (prec < 0) prec = 6;
+        dec_from_binary(m, e, x, big);
+        if (c == 'g' || c == 'G') {
+            if (prec == 0) prec = 1;
+            dec_round(x, prec); /* P significant digits decide the style */
+            int ex = x->n ? x->pt - 1 : 0;
+            if (ex < -4 || ex >= prec) n = fmt_exp(buf, x, prec - 1, upper, cv->alt);
+            else n = fmt_fixed(buf, x, prec - 1 - ex, cv->alt);
+            if (!cv->alt) {
+                /* strip trailing zeros in the fraction */
+                char *dot = memchr(buf, '.', n);
+                if (dot) {
+                    char *epos = memchr(buf, upper ? 'E' : 'e', n);
+                    int end = epos ? (int)(epos - buf) : n;
+                    int k = end;
+                    while (k > 0 && buf[k - 1] == '0') k--;
+                    if (k > 0 && buf[k - 1] == '.') k--;
+                    memmove(buf + k, buf + end, n - end);
+                    n -= end - k;
+                }
+            }
+        } else if (c == 'e' || c == 'E') {
+            n = fmt_exp(buf, x, prec, upper, cv->alt);
+        } else {
+            n = fmt_fixed(buf, x, prec, cv->alt);
+        }
+    }
+    emit_field(o, prefix, buf, n, cv->width, cv->left, cv->zero);
+}
+
+/* Each type keeps its large buffers out of core's frame. */
+static __attribute__((noinline)) void put_double(out_t *o, const struct conv *cv, double v) {
+    char digits[DEC_MAX], buf[720]; /* %f of 1e308 with 340 decimals */
+    uint32_t big[BIG_MAX];
+    struct dec x = {.d = digits};
+    union { double d; uint64_t u; } bits = {v};
+    int be = (int)(bits.u >> 52 & 0x7FF);
+    uint64_t m = bits.u & ((1ULL << 52) - 1);
+    const char *special = be == 0x7FF ? (m ? "nan" : "inf") : NULL;
+    if (be) m |= 1ULL << 52;
+    put_float(o, cv, bits.u >> 63, special, m, (be ? be : 1) - 1075, &x, big, buf);
+}
+
+/* long double is x87 extended precision: a 64-bit significand that holds its
+   integer bit, then the sign and a 15-bit exponent. */
+static __attribute__((noinline)) void put_long_double(out_t *o, const struct conv *cv, long double v) {
+    char digits[LDEC_MAX], buf[5400]; /* %Lf of 1e4932 with 340 decimals */
+    uint32_t big[LBIG_MAX];
+    struct dec x = {.d = digits};
+    union { long double d; struct { uint64_t m; uint16_t se; } p; } bits = {v};
+    int be = bits.p.se & 0x7FFF;
+    uint64_t m = bits.p.m;
+    const char *special = be == 0x7FFF ? (m << 1 ? "nan" : "inf") : NULL;
+    put_float(o, cv, bits.p.se >> 15, special, m, (be ? be : 1) - 16446, &x, big, buf);
+}
+
+/* The next character of a multibyte or a wide string, as UTF-8 in u: its
+   length, 0 at the string's end, or -1 for an encoding error. */
+static int next_char(const char **mb, const wchar_t **w, char *u) {
+    mbstate_t st = {0};
+    size_t r;
+    if (*w) {
+        if (!**w) return 0;
+        r = wcrtomb(u, *(*w)++, &st);
+        return r == (size_t)-1 ? -1 : (int)r;
+    }
+    wchar_t c;
+    r = mbrtowc(&c, *mb, MB_CUR_MAX, &st);
+    if (!r) return 0;
+    if (r > MB_CUR_MAX) return -1;
+    memcpy(u, *mb, r);
+    *mb += r;
+    return (int)r;
+}
+
+/* %s's text: a multibyte string, or with l a wide one. Its width and
+   precision count the output's units, and the precision never splits a
+   character; only as much of the string is read as is written. */
+static void put_text(out_t *o, const char *mb, const wchar_t *w, int prec, int width, bool left) {
+    if (!o->wide && mb) { /* bytes as they are */
+        int len = prec >= 0 ? (int)strnlen(mb, prec) : (int)strlen(mb);
+        emit_field(o, "", mb, len, width, left, false);
+        return;
+    }
+    const char *m = mb;
+    const wchar_t *x = w;
+    char u[4];
+    size_t units = 0, chars = 0;
+    int k = 0;
+    while ((prec < 0 || units < (size_t)prec) && (k = next_char(&m, &x, u)) > 0) {
+        size_t step = o->wide ? 1 : (size_t)k;
+        if (prec >= 0 && units + step > (size_t)prec) break;
+        units += step;
+        chars++;
+    }
+    if (k < 0 && (prec < 0 || units < (size_t)prec)) {
+        encoding_error(o);
+        return;
+    }
+    if (!left) pad(o, ' ', width - (int)units);
+    char batch[64];
+    size_t used = 0;
+    m = mb, x = w;
+    for (size_t i = 0; i < chars; i++) {
+        if (used + 4 > sizeof batch) emit(o, batch, used), used = 0;
+        used += (size_t)next_char(&m, &x, batch + used);
+    }
+    if (used) emit(o, batch, used);
+    if (left) pad(o, ' ', width - (int)units);
+}
+
+/* %c, or %lc with wide: the wide functions take %c's byte as btowc does. */
+static void put_char(out_t *o, int c, bool wide, int width, bool left) {
+    char u[4];
+    size_t n = 1;
+    u[0] = (char)c;
+    if (wide || o->wide) {
+        mbstate_t st = {0};
+        wint_t wc = wide ? (wint_t)c : btowc(c);
+        n = wc == WEOF ? (size_t)-1 : wcrtomb(u, (wchar_t)wc, &st);
+        if (n == (size_t)-1) {
+            encoding_error(o);
+            return;
+        }
+    }
+    int units = o->wide ? 1 : (int)n;
+    if (!left) pad(o, ' ', width - units);
+    emit(o, u, n);
+    if (left) pad(o, ' ', width - units);
+}
+
+/* The length modifiers: hh, h, none, l (also j, z and t, which are long), ll. */
+enum { SIZE_HH = -2, SIZE_H = -1, SIZE_INT = 0, SIZE_LONG = 1, SIZE_LONG_LONG = 2 };
+
+static void core(out_t *o, const char *fmt, va_list ap) {
+    for (const char *p = fmt; *p && !o->failed; p++) {
         if (*p != '%') {
             const char *s = p;
             while (p[1] && p[1] != '%') p++;
@@ -751,20 +1052,23 @@ static int core(out_t *o, const char *fmt, va_list ap) {
                 while (isdigit((unsigned char)*p)) prec = prec * 10 + (*p++ - '0');
             }
         }
-        int lng = 0;
-        for (;; p++) {
-            if (*p == 'l') lng++;
-            else if (*p == 'z' || *p == 'j' || *p == 't') lng = 2;
-            else if (*p == 'h') {}
-            else break;
-        }
-        char buf[720]; /* %f of 1e308 with 340 decimals */
+        int size = SIZE_INT;
+        bool ldbl = false;
+        if (*p == 'h') size = *++p == 'h' ? (p++, SIZE_HH) : SIZE_H;
+        else if (*p == 'l') size = *++p == 'l' ? (p++, SIZE_LONG_LONG) : SIZE_LONG;
+        else if (*p == 'j' || *p == 'z' || *p == 't') size = SIZE_LONG, p++;
+        else if (*p == 'L') ldbl = true, p++;
+        char buf[720]; /* an integer zero-padded to its precision */
         char prefix[4] = {0};
         int n = 0;
         switch (*p) {
         case 'd':
         case 'i': {
-            long long v = lng ? va_arg(ap, long long) : va_arg(ap, int);
+            long long v = size == SIZE_LONG_LONG ? va_arg(ap, long long)
+                          : size == SIZE_LONG    ? va_arg(ap, long)
+                                                 : va_arg(ap, int);
+            if (size == SIZE_HH) v = (signed char)v;
+            else if (size == SIZE_H) v = (short)v;
             unsigned long long u = v < 0 ? -(unsigned long long)v : (unsigned long long)v;
             if (v < 0) strcpy(prefix, "-");
             else if (plus) strcpy(prefix, "+");
@@ -786,7 +1090,11 @@ static int core(out_t *o, const char *fmt, va_list ap) {
         case 'x':
         case 'X':
         case 'o': {
-            unsigned long long v = lng ? va_arg(ap, unsigned long long) : va_arg(ap, unsigned int);
+            unsigned long long v = size == SIZE_LONG_LONG ? va_arg(ap, unsigned long long)
+                                   : size == SIZE_LONG    ? va_arg(ap, unsigned long)
+                                                          : va_arg(ap, unsigned int);
+            if (size == SIZE_HH) v = (unsigned char)v;
+            else if (size == SIZE_H) v = (unsigned short)v;
             int base = *p == 'u' ? 10 : *p == 'o' ? 8 : 16;
             n = fmt_uint(buf, v, base, *p == 'X');
             if (alt && v) {
@@ -810,72 +1118,39 @@ static int core(out_t *o, const char *fmt, va_list ap) {
             emit_field(o, "0x", buf, n, width, left, false);
             break;
         }
-        case 'c': {
-            buf[0] = (char)va_arg(ap, int);
-            emit_field(o, "", buf, 1, width, left, false);
+        case 'c': put_char(o, size == SIZE_LONG ? (int)va_arg(ap, wint_t) : va_arg(ap, int), size == SIZE_LONG, width, left); break;
+        case 's':
+            if (size == SIZE_LONG) {
+                const wchar_t *w = va_arg(ap, const wchar_t *);
+                put_text(o, NULL, w ? w : L"(null)", prec, width, left);
+            } else {
+                const char *s = va_arg(ap, const char *);
+                put_text(o, s ? s : "(null)", NULL, prec, width, left);
+            }
             break;
-        }
-        case 's': {
-            const char *s = va_arg(ap, const char *);
-            if (!s) s = "(null)";
-            int l = prec >= 0 ? (int)strnlen(s, prec) : (int)strlen(s);
-            emit_field(o, "", s, l, width, left, false);
-            break;
-        }
         case 'f':
         case 'F':
         case 'e':
         case 'E':
         case 'g':
-        case 'G': {
-            double v = va_arg(ap, double);
-            if (prec < 0) prec = 6;
-            if (v < 0 || (v == 0 && 1 / v < 0)) {
-                strcpy(prefix, "-");
-                v = -v;
-            } else if (plus) strcpy(prefix, "+");
-            else if (space) strcpy(prefix, " ");
-            if (__builtin_isnan(v)) {
-                emit_field(o, prefix, "nan", 3, width, left, false);
-                break;
-            }
-            if (__builtin_isinf(v)) {
-                emit_field(o, prefix, "inf", 3, width, left, false);
-                break;
-            }
-            char c = *p;
-            if (prec > 340) prec = 340;
-            struct dec x;
-            dec_from_double(v, &x);
-            if (c == 'g' || c == 'G') {
-                if (prec == 0) prec = 1;
-                dec_round(&x, prec); /* P significant digits decide the style */
-                int e = x.n ? x.pt - 1 : 0;
-                if (e < -4 || e >= prec) n = fmt_exp(buf, &x, prec - 1, c == 'G');
-                else n = fmt_fixed(buf, &x, prec - 1 - e);
-                if (!alt) {
-                    /* strip trailing zeros in the fraction */
-                    char *dot = memchr(buf, '.', n);
-                    if (dot) {
-                        char *epos = memchr(buf, c == 'G' ? 'E' : 'e', n);
-                        int end = epos ? (int)(epos - buf) : n;
-                        int k = end;
-                        while (k > 0 && buf[k - 1] == '0') k--;
-                        if (k > 0 && buf[k - 1] == '.') k--;
-                        memmove(buf + k, buf + end, n - end);
-                        n -= end - k;
-                    }
-                }
-            } else if (c == 'e' || c == 'E') {
-                n = fmt_exp(buf, &x, prec, c == 'E');
-            } else {
-                n = fmt_fixed(buf, &x, prec);
-            }
-            emit_field(o, prefix, buf, n, width, left, zero);
+        case 'G':
+        case 'a':
+        case 'A': {
+            struct conv cv = {*p, left, plus, space, zero, alt, width, prec};
+            if (ldbl) put_long_double(o, &cv, va_arg(ap, long double));
+            else put_double(o, &cv, va_arg(ap, double));
             break;
         }
         case '%': emit(o, "%", 1); break;
-        case 'n': *va_arg(ap, int *) = (int)o->count; break;
+        case 'n':
+            switch (size) {
+            case SIZE_HH: *va_arg(ap, signed char *) = (signed char)o->count; break;
+            case SIZE_H: *va_arg(ap, short *) = (short)o->count; break;
+            case SIZE_LONG: *va_arg(ap, long *) = (long)o->count; break;
+            case SIZE_LONG_LONG: *va_arg(ap, long long *) = (long long)o->count; break;
+            default: *va_arg(ap, int *) = (int)o->count; break;
+            }
+            break;
         default:
             emit(o, "%", 1);
             if (*p) emit(o, p, 1);
@@ -883,7 +1158,16 @@ static int core(out_t *o, const char *fmt, va_list ap) {
             break;
         }
     }
-    return (int)o->count;
+}
+
+/* What printf returns: the count, or -1 after an encoding or output error. */
+static int format(out_t *o, const char *fmt, va_list ap) {
+    core(o, fmt, ap);
+    if (!o->failed && o->count > INT_MAX) {
+        o->failed = true;
+        errno = ERANGE;
+    }
+    return o->failed ? -1 : (int)o->count;
 }
 
 struct sbuf {
@@ -891,20 +1175,21 @@ struct sbuf {
     size_t cap, len;
 };
 
-static void put_sbuf(void *ctx, const char *s, size_t n) {
+static bool put_sbuf(void *ctx, const char *s, size_t n) {
     struct sbuf *b = ctx;
     for (size_t i = 0; i < n; i++) {
         if (b->len + 1 < b->cap) b->buf[b->len] = s[i];
         b->len++;
     }
+    return true;
 }
 
 int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
     struct sbuf b = {buf, n, 0};
-    out_t o = {put_sbuf, &b, 0};
-    core(&o, fmt, ap);
+    out_t o = {.put = put_sbuf, .ctx = &b};
+    int r = format(&o, fmt, ap);
     if (n) buf[b.len < n ? b.len : n - 1] = 0;
-    return (int)b.len;
+    return r;
 }
 
 int vsprintf(char *buf, const char *fmt, va_list ap) { return vsnprintf(buf, (size_t)-1 >> 1, fmt, ap); }
@@ -925,23 +1210,28 @@ int sprintf(char *buf, const char *fmt, ...) {
     return r;
 }
 
-static void put_file(void *ctx, const char *s, size_t n) { write_bytes(ctx, s, n); }
+static bool put_file(void *ctx, const char *s, size_t n) { return write_bytes(ctx, s, n) == 0; }
 
-int vfprintf(FILE *f, const char *fmt, va_list ap) {
-    out_t o = {put_file, f, 0};
+/* fprintf and fwprintf. An unbuffered stream gets a short text in one send. */
+static int print_file(FILE *f, bool wide, const char *fmt, va_list ap) {
     if (f->mode == _IONBF) {
-        /* format into a temporary buffer so the output is one send */
         char tmp[512];
+        struct sbuf b = {tmp, sizeof tmp, 0};
+        out_t o = {put_sbuf, &b, .wide = wide};
         va_list ap2;
         va_copy(ap2, ap);
-        int n = vsnprintf(tmp, sizeof tmp, fmt, ap2);
+        int n = format(&o, fmt, ap2);
         va_end(ap2);
-        if (n < (int)sizeof tmp) {
-            write_bytes(f, tmp, n);
-            return n;
-        }
+        if (n < 0) return n;
+        if (b.len < sizeof tmp) return write_bytes(f, tmp, b.len) ? -1 : n;
     }
-    return core(&o, fmt, ap);
+    out_t o = {put_file, f, .wide = wide};
+    return format(&o, fmt, ap);
+}
+
+int vfprintf(FILE *f, const char *fmt, va_list ap) {
+    orient(f, -1);
+    return print_file(f, false, fmt, ap);
 }
 
 int vprintf(const char *fmt, va_list ap) { return vfprintf(stdout, fmt, ap); }
@@ -962,103 +1252,529 @@ int printf(const char *fmt, ...) {
     return r;
 }
 
-/* ---- sscanf (subset: %d %i %u %x %ld %lu %f %lf %s %c %[...] not supported) ---- */
+/* The wide functions give core their format as UTF-8: in small when it fits,
+   else in a block the caller frees. */
+static char *narrow_format(const wchar_t *fmt, char *small, size_t cap) {
+    mbstate_t st = {0};
+    const wchar_t *p = fmt;
+    size_t n = wcsrtombs(NULL, &p, 0, &st);
+    if (n == (size_t)-1) return NULL;
+    char *s = n < cap ? small : malloc(n + 1);
+    if (!s) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    p = fmt;
+    wcsrtombs(s, &p, n + 1, &st);
+    return s;
+}
+
+/* swprintf's output, decoded from core's UTF-8. */
+struct wbuf {
+    wchar_t *buf;
+    size_t cap, len;
+    mbstate_t st;
+};
+
+static bool put_wbuf(void *ctx, const char *s, size_t n) {
+    struct wbuf *b = ctx;
+    for (size_t i = 0; i < n; i++) {
+        wchar_t c;
+        if (mbrtowc(&c, s + i, 1, &b->st) == (size_t)-2) continue;
+        if (b->len < b->cap) b->buf[b->len] = c;
+        b->len++;
+    }
+    return true;
+}
+
+/* ISO C: -1 when n wide characters or more were to be written, which leaves
+   the first n - 1 and a null. */
+int vswprintf(wchar_t *s, size_t n, const wchar_t *fmt, va_list ap) {
+    char small[256], *narrow = narrow_format(fmt, small, sizeof small);
+    if (!narrow) return -1;
+    struct wbuf b = {.buf = s, .cap = n};
+    out_t o = {put_wbuf, &b, .wide = true};
+    int r = format(&o, narrow, ap);
+    if (narrow != small) free(narrow);
+    if (n) s[b.len < n ? b.len : n - 1] = 0;
+    return b.len >= n ? -1 : r;
+}
+
+int swprintf(wchar_t *s, size_t n, const wchar_t *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vswprintf(s, n, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int vfwprintf(FILE *f, const wchar_t *fmt, va_list ap) {
+    orient(f, 1);
+    char small[256], *narrow = narrow_format(fmt, small, sizeof small);
+    if (!narrow) return -1;
+    int r = print_file(f, true, narrow, ap);
+    if (narrow != small) free(narrow);
+    return r;
+}
+
+int vwprintf(const wchar_t *fmt, va_list ap) { return vfwprintf(stdout, fmt, ap); }
+
+int fwprintf(FILE *f, const wchar_t *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfwprintf(f, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int wprintf(const wchar_t *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfwprintf(stdout, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+/* ---- scanf: one engine for the byte and the wide functions ----
+   The input and the format are read in units: bytes for the byte functions,
+   wide characters for the wide ones. */
+
+struct scan_input {
+    const char *s;     /* a string's bytes, */
+    const wchar_t *ws; /* or its wide characters, */
+    FILE *f;           /* or a stream's */
+    bool wide;         /* the units are wide characters */
+    size_t count;      /* units read, for %n */
+};
+
+#define NOTHING_READ (-2)
+
+static int scan_get(struct scan_input *in) {
+    int c;
+    if (in->f) c = in->wide ? (int)fgetwc(in->f) : fgetc(in->f);
+    else if (in->wide) c = *in->ws ? (int)*in->ws++ : EOF;
+    else c = *in->s ? (unsigned char)*in->s++ : EOF;
+    if (c != EOF) in->count++;
+    return c;
+}
+
+/* Gives back the unit just read (one at most, as ungetc keeps). */
+static void scan_unget(struct scan_input *in, int c) {
+    if (c < 0) return;
+    in->count--;
+    if (!in->f) {
+        if (in->wide) in->ws--;
+        else in->s--;
+    } else if (in->wide) {
+        ungetwc((wint_t)c, in->f);
+    } else {
+        ungetc(c, in->f);
+    }
+}
+
+static bool scan_space(const struct scan_input *in, int c) {
+    return c >= 0 && (in->wide ? iswspace((wint_t)c) : isspace(c));
+}
+
+/* Skips white space; false at the input's end. */
+static bool skip_space(struct scan_input *in) {
+    int c;
+    while (scan_space(in, c = scan_get(in))) {}
+    scan_unget(in, c);
+    return c != EOF;
+}
+
+struct scan_format {
+    const char *s;
+    const wchar_t *ws;
+};
+static int fmt_unit(const struct scan_format *f, size_t i) { return f->ws ? (int)f->ws[i] : (unsigned char)f->s[i]; }
+
+/* %[: the units between start and end, where a-b is a range. */
+static bool in_scanset(const struct scan_format *f, size_t start, size_t end, bool negate, int c) {
+    bool found = false;
+    for (size_t i = start; i < end && !found; i++) {
+        int a = fmt_unit(f, i);
+        if (i + 2 < end && fmt_unit(f, i + 1) == '-') {
+            found = a <= c && c <= fmt_unit(f, i + 2);
+            i += 2;
+        } else {
+            found = a == c;
+        }
+    }
+    return found != negate;
+}
+
+/* A number's text, handed to strtol, strtod and the like. */
+struct number_text {
+    char small[64], *text;
+    size_t len, cap;
+    bool no_memory;
+};
+static void number_init(struct number_text *t) {
+    t->text = t->small;
+    t->small[0] = 0;
+    t->len = 0;
+    t->cap = sizeof t->small;
+    t->no_memory = false;
+}
+static void number_free(struct number_text *t) {
+    if (t->text != t->small) free(t->text);
+}
+static void number_push(struct number_text *t, int c) {
+    if (t->len + 1 >= t->cap) {
+        char *bigger = t->text == t->small ? malloc(t->cap * 2) : realloc(t->text, t->cap * 2);
+        if (!bigger) {
+            t->no_memory = true;
+            return;
+        }
+        if (t->text == t->small) memcpy(bigger, t->small, t->len + 1);
+        t->text = bigger;
+        t->cap *= 2;
+    }
+    t->text[t->len++] = (char)c;
+    t->text[t->len] = 0;
+}
+/* ISO C: the longest text that is, or begins, a number must be one whole. */
+static bool number_matches(const struct number_text *t, const char *end) {
+    return !t->no_memory && t->len && end == t->text + t->len;
+}
+
+/* Keeps c and reads the next unit while the field has room. */
+static int take(struct scan_input *in, struct number_text *t, int c, size_t *n, size_t width) {
+    number_push(t, c);
+    return ++*n < width ? scan_get(in) : NOTHING_READ;
+}
+static int ascii_lower(int c) { return c >= 0 && c < 0x80 ? tolower(c) : -1; }
+static int digit_value(int c) {
+    int l = ascii_lower(c);
+    return l >= '0' && l <= '9' ? l - '0' : l >= 'a' && l <= 'z' ? l - 'a' + 10 : 99;
+}
+
+/* An integer in base, or with base 0 in the base its prefix gives, as strtol. */
+static void scan_integer(struct scan_input *in, size_t width, int base, struct number_text *t) {
+    size_t n = 0;
+    int c = scan_get(in);
+    if (c == '+' || c == '-') c = take(in, t, c, &n, width);
+    if ((base == 0 || base == 16) && c == '0') {
+        c = take(in, t, c, &n, width);
+        if (ascii_lower(c) == 'x') c = take(in, t, c, &n, width), base = 16;
+        else if (!base) base = 8;
+    } else if (!base) {
+        base = 10;
+    }
+    while (digit_value(c) < base) c = take(in, t, c, &n, width);
+    scan_unget(in, c);
+}
+
+/* The letters of word, in either case, as far as they match; true for all. */
+static bool scan_word(struct scan_input *in, struct number_text *t, int *c, size_t *n, size_t width, const char *word) {
+    for (; *word; word++) {
+        if (ascii_lower(*c) != *word) return false;
+        *c = take(in, t, *c, n, width);
+    }
+    return true;
+}
+
+/* A floating number as strtod reads it: decimal, hexadecimal, inf or nan. */
+static void scan_float(struct scan_input *in, size_t width, struct number_text *t) {
+    size_t n = 0;
+    int c = scan_get(in);
+    if (c == '+' || c == '-') c = take(in, t, c, &n, width);
+    if (ascii_lower(c) == 'i') {
+        if (scan_word(in, t, &c, &n, width, "inf")) scan_word(in, t, &c, &n, width, "inity");
+    } else if (ascii_lower(c) == 'n') {
+        if (scan_word(in, t, &c, &n, width, "nan") && c == '(') {
+            c = take(in, t, c, &n, width);
+            while (digit_value(c) < 36 || c == '_') c = take(in, t, c, &n, width);
+            if (c == ')') c = take(in, t, c, &n, width);
+        }
+    } else {
+        bool hex = false, digits = false, dot = false;
+        if (c == '0') {
+            c = take(in, t, c, &n, width);
+            digits = true;
+            if (ascii_lower(c) == 'x') c = take(in, t, c, &n, width), hex = true, digits = false;
+        }
+        for (;; c = take(in, t, c, &n, width)) {
+            if (digit_value(c) < (hex ? 16 : 10)) digits = true;
+            else if (c == '.' && !dot) dot = true;
+            else break;
+        }
+        if (digits && ascii_lower(c) == (hex ? 'p' : 'e')) {
+            c = take(in, t, c, &n, width);
+            if (c == '+' || c == '-') c = take(in, t, c, &n, width);
+            while (digit_value(c) < 10) c = take(in, t, c, &n, width);
+        }
+    }
+    scan_unget(in, c);
+}
+
+static void store_integer(va_list *ap, int size, unsigned long long v) {
+    switch (size) {
+    case SIZE_HH: *va_arg(*ap, unsigned char *) = (unsigned char)v; break;
+    case SIZE_H: *va_arg(*ap, unsigned short *) = (unsigned short)v; break;
+    case SIZE_LONG: *va_arg(*ap, unsigned long *) = (unsigned long)v; break;
+    case SIZE_LONG_LONG: *va_arg(*ap, unsigned long long *) = v; break;
+    default: *va_arg(*ap, unsigned *) = (unsigned)v; break;
+    }
+}
+
+/* Where %c, %s and %[ store: bytes, or with l wide characters. Units of the
+   other kind are converted (mbrtowc, wcrtomb). */
+struct text_sink {
+    char *s;
+    wchar_t *w;
+    bool to_wide, bad;
+    mbstate_t st;
+};
+static void sink_put(struct text_sink *k, bool wide_input, int c) {
+    if (wide_input == k->to_wide) {
+        if (k->w) *k->w++ = (wchar_t)c;
+        else if (k->s) *k->s++ = (char)c;
+        return;
+    }
+    if (k->to_wide) {
+        char unit = (char)c;
+        wchar_t wc;
+        size_t r = mbrtowc(&wc, &unit, 1, &k->st);
+        if (r == (size_t)-1) k->bad = true;
+        else if (r != (size_t)-2 && k->w) *k->w++ = wc;
+    } else {
+        char units[4];
+        size_t r = wcrtomb(units, (wchar_t)c, &k->st);
+        if (r == (size_t)-1) k->bad = true;
+        else if (k->s) memcpy(k->s, units, r), k->s += r;
+    }
+}
+
+/* ISO C's scanf: the number of items assigned, or EOF when the input ended
+   (or failed) before the first conversion. */
+static int scan(struct scan_input *in, const struct scan_format *fmt, va_list args) {
+    va_list ap;
+    va_copy(ap, args);
+    int assigned = 0;
+    bool converted = false, input_failure = false;
+    for (size_t i = 0; fmt_unit(fmt, i); i++) {
+        int u = fmt_unit(fmt, i);
+        if (scan_space(in, u)) {
+            skip_space(in);
+            continue;
+        }
+        if (u != '%' || fmt_unit(fmt, i + 1) == '%') {
+            if (u == '%') {
+                i++;
+                skip_space(in);
+            }
+            int c = scan_get(in);
+            if (c == EOF) {
+                input_failure = true;
+                break;
+            }
+            if (c != u) {
+                scan_unget(in, c);
+                break;
+            }
+            continue;
+        }
+        i++;
+        bool skip = fmt_unit(fmt, i) == '*';
+        if (skip) i++;
+        size_t width = 0;
+        while (fmt_unit(fmt, i) >= '0' && fmt_unit(fmt, i) <= '9') width = width * 10 + (size_t)(fmt_unit(fmt, i++) - '0');
+        int size = SIZE_INT, m = fmt_unit(fmt, i);
+        bool ldbl = false;
+        if (m == 'h') size = fmt_unit(fmt, ++i) == 'h' ? (i++, SIZE_HH) : SIZE_H;
+        else if (m == 'l') size = fmt_unit(fmt, ++i) == 'l' ? (i++, SIZE_LONG_LONG) : SIZE_LONG;
+        else if (m == 'j' || m == 'z' || m == 't') size = SIZE_LONG, i++;
+        else if (m == 'L') ldbl = true, i++;
+        int spec = fmt_unit(fmt, i);
+        if (!spec) break;
+        if (spec != '[' && spec != 'c' && spec != 'n' && !skip_space(in)) {
+            input_failure = true;
+            break;
+        }
+        if (!width) width = spec == 'c' ? 1 : SIZE_MAX;
+        bool ok = true;
+        switch (spec) {
+        case 'n':
+            if (!skip) store_integer(&ap, size, in->count);
+            break;
+        case 'd':
+        case 'i':
+        case 'o':
+        case 'u':
+        case 'x':
+        case 'X':
+        case 'p': {
+            int base = spec == 'd' || spec == 'u' ? 10 : spec == 'i' ? 0 : spec == 'o' ? 8 : 16;
+            struct number_text t;
+            number_init(&t);
+            scan_integer(in, width, base, &t);
+            char *end;
+            unsigned long long v = spec == 'd' || spec == 'i' ? (unsigned long long)strtoll(t.text, &end, base)
+                                                              : strtoull(t.text, &end, base);
+            ok = number_matches(&t, end);
+            number_free(&t);
+            if (ok && !skip) {
+                if (spec == 'p') *va_arg(ap, void **) = (void *)(uintptr_t)v;
+                else store_integer(&ap, size, v);
+                assigned++;
+            }
+            break;
+        }
+        case 'a':
+        case 'A':
+        case 'e':
+        case 'E':
+        case 'f':
+        case 'F':
+        case 'g':
+        case 'G': {
+            struct number_text t;
+            number_init(&t);
+            scan_float(in, width, &t);
+            char *end;
+            if (ldbl) {
+                long double v = strtold(t.text, &end);
+                if ((ok = number_matches(&t, end)) && !skip) *va_arg(ap, long double *) = v;
+            } else if (size == SIZE_LONG) {
+                double v = strtod(t.text, &end);
+                if ((ok = number_matches(&t, end)) && !skip) *va_arg(ap, double *) = v;
+            } else {
+                float v = strtof(t.text, &end);
+                if ((ok = number_matches(&t, end)) && !skip) *va_arg(ap, float *) = v;
+            }
+            number_free(&t);
+            if (ok && !skip) assigned++;
+            break;
+        }
+        case 'c':
+        case 's':
+        case '[': {
+            size_t set = 0, set_end = 0;
+            bool negate = false;
+            if (spec == '[') {
+                set = ++i;
+                if (fmt_unit(fmt, set) == '^') negate = true, set = ++i;
+                if (fmt_unit(fmt, i) == ']') i++;
+                while (fmt_unit(fmt, i) && fmt_unit(fmt, i) != ']') i++;
+                if (!fmt_unit(fmt, i)) {
+                    ok = false;
+                    break;
+                }
+                set_end = i;
+            }
+            struct text_sink k = {.to_wide = size == SIZE_LONG};
+            if (!skip) {
+                if (k.to_wide) k.w = va_arg(ap, wchar_t *);
+                else k.s = va_arg(ap, char *);
+            }
+            size_t n = 0;
+            int c = NOTHING_READ;
+            while (n < width) {
+                c = scan_get(in);
+                if (c == EOF) break;
+                if (spec == 's' ? scan_space(in, c) : spec == '[' && !in_scanset(fmt, set, set_end, negate, c)) break;
+                sink_put(&k, in->wide, c);
+                n++;
+                c = NOTHING_READ;
+            }
+            scan_unget(in, c);
+            if (spec == 'c' ? n < width : !n) {
+                input_failure = c == EOF;
+                ok = false;
+            } else if (k.bad || !mbsinit(&k.st)) {
+                errno = EILSEQ;
+                ok = false;
+            } else if (!skip) {
+                if (spec != 'c') {
+                    if (k.w) *k.w = 0;
+                    else *k.s = 0;
+                }
+                assigned++;
+            }
+            break;
+        }
+        default: ok = false; break;
+        }
+        if (!ok) break;
+        if (spec != 'n') converted = true;
+    }
+    va_end(ap);
+    return input_failure && !converted ? EOF : assigned;
+}
+
+int vsscanf(const char *s, const char *fmt, va_list ap) {
+    struct scan_input in = {.s = s};
+    return scan(&in, &(struct scan_format){.s = fmt}, ap);
+}
+
 int sscanf(const char *s, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    int assigned = 0;
-    const char *p = s;
-    for (const char *f = fmt; *f; f++) {
-        if (isspace((unsigned char)*f)) {
-            while (isspace((unsigned char)*p)) p++;
-            continue;
-        }
-        if (*f != '%') {
-            if (*p != *f) break;
-            p++;
-            continue;
-        }
-        f++;
-        bool skip = false;
-        if (*f == '*') {
-            skip = true;
-            f++;
-        }
-        int width = 0;
-        while (isdigit((unsigned char)*f)) width = width * 10 + (*f++ - '0');
-        int lng = 0;
-        while (*f == 'l' || *f == 'h' || *f == 'z') {
-            if (*f == 'l' || *f == 'z') lng++;
-            f++;
-        }
-        if (*f != 'c') while (isspace((unsigned char)*p)) p++;
-        if (!*p) break;
-        char *end;
-        /* a field width limits how much a number may consume: parse a copy of that many chars */
-        char field[64];
-        const char *src = p;
-        if (width && strchr("diuxfge", *f)) {
-            int k = 0;
-            while (k < width && k < (int)sizeof field - 1 && p[k]) field[k] = p[k], k++;
-            field[k] = 0;
-            src = field;
-        }
-        switch (*f) {
-        case 'd':
-        case 'i':
-        case 'u':
-        case 'x': {
-            int base = *f == 'x' ? 16 : *f == 'i' ? 0 : 10;
-            long long v = (*f == 'u' || *f == 'x') ? (long long)strtoull(src, &end, base) : strtoll(src, &end, base);
-            if (end == src) goto done;
-            p += end - src;
-            if (!skip) {
-                if (lng) *va_arg(ap, long *) = (long)v;
-                else *va_arg(ap, int *) = (int)v;
-                assigned++;
-            }
-            break;
-        }
-        case 'f':
-        case 'g':
-        case 'e': {
-            double v = strtod(src, &end);
-            if (end == src) goto done;
-            p += end - src;
-            if (!skip) {
-                if (lng) *va_arg(ap, double *) = v;
-                else *va_arg(ap, float *) = (float)v;
-                assigned++;
-            }
-            break;
-        }
-        case 's': {
-            char *out = skip ? NULL : va_arg(ap, char *);
-            int n = 0;
-            while (*p && !isspace((unsigned char)*p) && (!width || n < width)) {
-                if (out) out[n] = *p;
-                n++;
-                p++;
-            }
-            if (out) {
-                out[n] = 0;
-                assigned++;
-            }
-            break;
-        }
-        case 'c': {
-            char *out = skip ? NULL : va_arg(ap, char *);
-            if (out) {
-                *out = *p;
-                assigned++;
-            }
-            p++;
-            break;
-        }
-        default: goto done;
-        }
-    }
-done:
+    int r = vsscanf(s, fmt, ap);
     va_end(ap);
-    return assigned;
+    return r;
+}
+
+int vfscanf(FILE *f, const char *fmt, va_list ap) {
+    orient(f, -1);
+    struct scan_input in = {.f = f};
+    return scan(&in, &(struct scan_format){.s = fmt}, ap);
+}
+
+int vscanf(const char *fmt, va_list ap) { return vfscanf(stdin, fmt, ap); }
+
+int fscanf(FILE *f, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfscanf(f, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int scanf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfscanf(stdin, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int vswscanf(const wchar_t *s, const wchar_t *fmt, va_list ap) {
+    struct scan_input in = {.ws = s, .wide = true};
+    return scan(&in, &(struct scan_format){.ws = fmt}, ap);
+}
+
+int swscanf(const wchar_t *s, const wchar_t *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vswscanf(s, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int vfwscanf(FILE *f, const wchar_t *fmt, va_list ap) {
+    orient(f, 1);
+    struct scan_input in = {.f = f, .wide = true};
+    return scan(&in, &(struct scan_format){.ws = fmt}, ap);
+}
+
+int vwscanf(const wchar_t *fmt, va_list ap) { return vfwscanf(stdin, fmt, ap); }
+
+int fwscanf(FILE *f, const wchar_t *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfwscanf(f, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int wscanf(const wchar_t *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfwscanf(stdin, fmt, ap);
+    va_end(ap);
+    return r;
 }

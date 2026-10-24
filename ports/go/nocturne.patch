@@ -1691,10 +1691,10 @@ index 00000000..026b7a32
 +func filePacketConn(f *os.File) (PacketConn, error) { return nil, syscall.ENOTSUP }
 diff --git a/src/os/dir_nocturne.go b/src/os/dir_nocturne.go
 new file mode 100644
-index 00000000..0994eecd
+index 00000000..edc3ee2c
 --- /dev/null
 +++ b/src/os/dir_nocturne.go
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,83 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1748,7 +1748,9 @@ index 00000000..0994eecd
 +		if mode == readdirName {
 +			names = append(names, e.EntryName())
 +		} else {
-+			f := fileInfoFromEntry(e, joinFolder(file.path, e.EntryName()))
++			// The info keeps its entry; the page is read over by the next listing.
++			own := *e
++			f := fileInfoFromEntry(&own, joinFolder(file.path, own.EntryName()))
 +			if mode == readdirDirEntry {
 +				dirents = append(dirents, dirEntry{f})
 +			} else {
@@ -2193,10 +2195,10 @@ index 00000000..ebed3d17
 +}
 diff --git a/src/os/file_nocturne.go b/src/os/file_nocturne.go
 new file mode 100644
-index 00000000..96fd6fe0
+index 00000000..29a1b1da
 --- /dev/null
 +++ b/src/os/file_nocturne.go
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,707 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -2418,6 +2420,18 @@ index 00000000..96fd6fe0
 +		return nil, err
 +	}
 +	defer f.decref()
++	if f.kind == syscall.KIND_DOCUMENT {
++		// The handle names the document itself, wherever it has moved since.
++		e := new(syscall.Entry)
++		if err := syscall.DocumentInfo(f.sysfd, e); err != nil {
++			return nil, &PathError{Op: "stat", Path: f.name, Err: err}
++		}
++		fs := fileInfoFromEntry(e, f.path)
++		if f.path == "" {
++			fs.name = filepathlite.Base(f.name)
++		}
++		return fs, nil
++	}
 +	if f.path != "" {
 +		var e syscall.Entry
 +		if err := syscall.EntryInfo(f.path, &e); err != nil {
@@ -2427,13 +2441,6 @@ index 00000000..96fd6fe0
 +	}
 +	fs := &fileStat{name: filepathlite.Base(f.name)}
 +	switch f.kind {
-+	case syscall.KIND_DOCUMENT:
-+		size, err := syscall.DocumentSize(f.sysfd)
-+		if err != nil {
-+			return nil, &PathError{Op: "stat", Path: f.name, Err: err}
-+		}
-+		fs.size = size
-+		fs.mode = 0666
 +	case kindNull:
 +		fs.mode = ModeDevice | ModeCharDevice | 0666
 +	case 0:
@@ -2731,21 +2738,10 @@ index 00000000..96fd6fe0
 +	return nil
 +}
 +
-+// rename moves an entry. Nocturne never moves onto an existing name; as
-+// Rename replaces an existing document, a document in the way is removed
-+// first.
++// rename moves an entry. As Rename replaces an existing document, a
++// document in the way is replaced in the same commit.
 +func rename(oldname, newname string) error {
-+	err := syscall.EntryMove(oldname, newname)
-+	if err == syscall.ERR_EXISTS {
-+		var from, to syscall.Entry
-+		if syscall.EntryInfo(oldname, &from) == nil && from.Kind != syscall.KIND_FOLDER &&
-+			syscall.EntryInfo(newname, &to) == nil && to.Kind != syscall.KIND_FOLDER {
-+			if err = syscall.EntryRemove(newname); err == nil {
-+				err = syscall.EntryMove(oldname, newname)
-+			}
-+		}
-+	}
-+	if err != nil {
++	if err := syscall.EntryReplace(oldname, newname); err != nil {
 +		return &LinkError{"rename", oldname, newname, err}
 +	}
 +	return nil
@@ -3046,7 +3042,7 @@ index 00000000..054536cf
 +func signalIgnored(sig int) bool { return false }
 diff --git a/src/os/stat_nocturne.go b/src/os/stat_nocturne.go
 new file mode 100644
-index 00000000..8aae6a17
+index 00000000..b01515c8
 --- /dev/null
 +++ b/src/os/stat_nocturne.go
 @@ -0,0 +1,71 @@
@@ -3073,7 +3069,7 @@ index 00000000..8aae6a17
 +		name:    name,
 +		path:    path,
 +		size:    int64(e.Size),
-+		modTime: time.Unix(e.Modified, 0),
++		modTime: time.Unix(e.Modified, int64(e.ModifiedNs)),
 +		sys:     e,
 +	}
 +	switch e.Kind {
@@ -3156,17 +3152,20 @@ index 00000000..df3ddc02
 +}
 diff --git a/src/os/types_nocturne.go b/src/os/types_nocturne.go
 new file mode 100644
-index 00000000..eee9d308
+index 00000000..080b5cfb
 --- /dev/null
 +++ b/src/os/types_nocturne.go
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,36 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
 +
 +package os
 +
-+import "time"
++import (
++	"syscall"
++	"time"
++)
 +
 +// A fileStat is the implementation of FileInfo returned by Stat and Lstat.
 +type fileStat struct {
@@ -3183,8 +3182,14 @@ index 00000000..eee9d308
 +func (fs *fileStat) ModTime() time.Time { return fs.modTime }
 +func (fs *fileStat) Sys() any           { return fs.sys }
 +
-+// Nocturne has no links: an entry is the same file only under the same path.
++// Nocturne has no links: two stats are the same file when they name the
++// same entry, whatever the spelling of the paths.
 +func sameFile(fs1, fs2 *fileStat) bool {
++	e1, ok1 := fs1.sys.(*syscall.Entry)
++	e2, ok2 := fs2.sys.(*syscall.Entry)
++	if ok1 && ok2 {
++		return e1.ID == e2.ID
++	}
 +	return fs1.path != "" && fs1.path == fs2.path
 +}
 diff --git a/src/os/types_unix.go b/src/os/types_unix.go
@@ -4187,10 +4192,10 @@ index e1d7e213..0e83e7d9 100644
  
 diff --git a/src/syscall/syscall_nocturne.go b/src/syscall/syscall_nocturne.go
 new file mode 100644
-index 00000000..ac11d559
+index 00000000..cd45034e
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,1011 @@
+@@ -0,0 +1,1038 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4233,9 +4238,11 @@ index 00000000..ac11d559
 +	SYS_DOCUMENT_SAVE     = 137
 +	SYS_DOCUMENT_APPEND   = 138
 +	SYS_DOCUMENT_COMMIT   = 185
++	SYS_DOCUMENT_INFO     = 186
 +	SYS_ENTRY_INFO        = 139
 +	SYS_ENTRY_REMOVE      = 140
 +	SYS_ENTRY_MOVE        = 141
++	SYS_ENTRY_REPLACE     = 187
 +	SYS_FOLDER_CREATE     = 142
 +	SYS_FOLDER_LIST       = 143
 +	SYS_CHANNEL_PAIR      = 144
@@ -4685,6 +4692,13 @@ index 00000000..ac11d559
 +	return int64(r), errnoErr(e)
 +}
 +
++// DocumentInfo describes the open document h as EntryInfo describes an
++// entry, with no name and the size h reads.
++func DocumentInfo(h int, out *Entry) error {
++	_, e := Syscall(SYS_DOCUMENT_INFO, uintptr(h), uintptr(unsafe.Pointer(out)), 0, 0, 0)
++	return errnoErr(e)
++}
++
 +func DocumentSetSize(h int, size int64) error {
 +	_, e := Syscall(SYS_DOCUMENT_SET_SIZE, uintptr(h), uintptr(size), 0, 0, 0)
 +	return errnoErr(e)
@@ -4735,13 +4749,16 @@ index 00000000..ac11d559
 +// ---- entries and folders ----
 +
 +// Entry is an entry of a folder, or the entry a path names
-+// (struct n_entry). Modified is in wall seconds.
++// (struct n_entry). Modified is in wall seconds and ModifiedNs the
++// nanoseconds within that second. ID is the entry itself on C:: it stays
++// with the entry when it moves and is never given to another one.
 +type Entry struct {
-+	Name     [256]byte
-+	Kind     uint32 // KIND_DOCUMENT, KIND_FOLDER or KIND_DEVICE
-+	reserved uint32
-+	Size     uint64
-+	Modified int64
++	Name       [256]byte
++	Kind       uint32 // KIND_DOCUMENT, KIND_FOLDER or KIND_DEVICE
++	ModifiedNs uint32
++	Size       uint64
++	Modified   int64
++	ID         uint64
 +}
 +
 +// EntryName returns the entry's name.
@@ -4783,6 +4800,21 @@ index 00000000..ac11d559
 +		return err
 +	}
 +	_, e := Syscall(SYS_ENTRY_MOVE, uintptr(unsafe.Pointer(f)), uintptr(unsafe.Pointer(t)), 0, 0, 0)
++	return errnoErr(e)
++}
++
++// EntryReplace is EntryMove that lets a document take the name of another
++// document, which is removed in the same commit.
++func EntryReplace(from, to string) error {
++	f, err := pathPtr(from)
++	if err != nil {
++		return err
++	}
++	t, err := pathPtr(to)
++	if err != nil {
++		return err
++	}
++	_, e := Syscall(SYS_ENTRY_REPLACE, uintptr(unsafe.Pointer(f)), uintptr(unsafe.Pointer(t)), 0, 0, 0)
 +	return errnoErr(e)
 +}
 +

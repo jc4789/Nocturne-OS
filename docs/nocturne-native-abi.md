@@ -116,14 +116,24 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - 情報と操作：`n_entry_info(path, struct n_entry *)`、`n_folder_create(path)`、
   `n_entry_remove(path)`（空でないフォルダーは `N_ERR_NOT_EMPTY`）、
   `n_entry_move(from, to)`、`n_folder_list(path, struct n_entry *out, max, start)`（件数を返す）。
+- `struct n_entry` は名前（保存された形）、`kind`、`size`、更新時刻（`modified` の壁時計の秒と
+  その秒の中のナノ秒 `modified_ns`）、`id` を持つ。`id` は C: 上の項目そのものの番号で、
+  `n_entry_move` で移しても変わらず、別の項目には決して使われない。リンクは無いので、
+  綴り（大文字・小文字、`/` と `\`）の違う二つのパスが同じ項目かは `id` で分かる。
+- `n_document_info(h, struct n_entry *)` は開いている文書の `struct n_entry` を返す。名前は空
+  （ハンドルは名前でなく文書そのものを指し、開いた後に移されても同じ文書のまま）で、`size` は
+  そのハンドルが読む長さ（`n_document_size` と同じ）。
 - `n_entry_move` は名前の付け替えで、内容は動かない。既存の名前を決して上書きしない
   （`N_ERR_EXISTS`。同じ項目の大文字・小文字の変更は除く）。フォルダーを自分の中へは
   移せない（`N_ERR_INVALID`）。
+- `n_entry_replace(from, to)` は `n_entry_move` と同じだが、文書 `from` は既存の文書 `to` の名前を
+  取れる。元の `to` は同じ確定（commit）の中で `n_entry_remove` と同じように消える（開いている
+  ハンドルは消えた文書を読み書きし続ける）。`to` が文書以外なら `N_ERR_EXISTS`。
 - ISO Cの `stdio` は文書ハンドルの上で自分の位置を持つ：`"r"`＝`READ`、`"r+"`＝`EDIT`、
   `"w"`＝既存なら `EDIT` で長さ0にし、無ければ `CREATE`（ISO Cの切り詰め）、`"wx"`＝`CREATE`、
   `"a"`＝`EDIT`／`CREATE` で、書出しのたびに排他を取って末尾へ書く。`fseek`／`ftell` は
-  文書だけ（チャンネルは `N_ERR_WRONG_KIND`）。`remove`＝`n_entry_remove`。`rename` は
-  `n_entry_move`、既存の文書が相手なら内容を丸ごと原子的に差し替えてから元を消す。
+  文書だけ（チャンネルは `N_ERR_WRONG_KIND`）。`remove`＝`n_entry_remove`。`rename`＝
+  `n_entry_replace`（既存の文書は一つの確定で置き換わる）。
   `tmpfile` は一時フォルダー（`n_temp_folder()`）に作り、閉じるか終了で消す。標準の出力・
   記録が文書なら末尾へ追記する。終了（`exit`、`main` からの戻り）はISO Cのとおり全ストリームを
   閉じたのと同じで、文書のストリームは書き出してから保存する（`N_COMMIT_START`：次に開く
@@ -190,6 +200,9 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   引き渡すハンドルの表（入力・出力・ログのチャンネル、共有ページ等）を持つ。
   - 設定は `"名前=値"` の形（`=` が無ければ `N_ERR_INVALID`）。起動されたアプリでは
     `n_settings`（NULL終端）として読め、`getenv` もこれを引く。
+  - 引数と設定の文字列（各 nul を含む。カーネルが加える設定も数える）と、二つの NULL 終端
+    ポインター配列（1 個 8 バイト）は、合わせて `N_LAUNCH_MAX_BYTES`（4 MiB）まで。
+    超えると `N_ERR_TOO_MANY_ARGUMENTS`。
   - 引き渡すハンドルは、表の順に子アプリの 0, 1, 2, … 番になる（-1 は空き）。
   - `path` は完全指定（§3）。名前だけのプログラムは libc の `find_program(name, out, n)` が
     `N_FOLDER_SYSTEM`、次に `N_FOLDER_PROGRAMS` の各アプリのフォルダーで探す（`PATH` は無い）。
@@ -201,10 +214,15 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   直接待つこともできる（-1 は無期限、0 は待たずに `N_ERR_NOT_READY`、期限切れは
   `N_ERR_TIMEOUT`）。ゾンビの回収は無く、最後のハンドルを閉じれば記録は消える。
 - `n_app_stop(h, N_APP_STOP_TREE か 0)`：停止要求。シグナルは無い。
+- スレッド：`thread_create(fn, arg)` は 256 KiB、`thread_create_sized(fn, arg, bytes)` は
+  少なくとも `bytes` のスタック（ページは初めて触れたときに割り当てる）で `fn` を動かし、
+  0 にならない識別子を返す。終わったスレッドは `thread_join` か `thread_detach` まで残る。
+  `thread_detach` 後は終わり次第カーネルが解放し、join はできない（`N_ERR_INVALID`）。
+  アプリの終了は全スレッドを止めて回収する。
 - `n_app_self()`、`n_app_parent()`：アプリ識別子（共有ページの受渡しの許可判定用）。
 - `n_app_open(id)`：アプリ一覧の識別子から、動作中のアプリのハンドルを得る（タスク
   マネージャーや `kill` が `n_app_stop` するため）。`n_app_id(h)`：ハンドルの識別子
-  （終了後は0）。
+  （終了後も同じ。識別子は再利用しない）。
 - `n_app_list`、`n_system_info` 等の状態取得は現行の `proclist`（件数）／`sysinfo`（0）を
   引き継ぐ。どちらも失敗では負の `n_result`。
 

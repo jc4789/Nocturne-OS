@@ -16,12 +16,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define __ATOMIC_RELAXED 0
-#define __ATOMIC_CONSUME 1
-#define __ATOMIC_ACQUIRE 2
-#define __ATOMIC_RELEASE 3
-#define __ATOMIC_ACQ_REL 4
-#define __ATOMIC_SEQ_CST 5
+/* The __ATOMIC_* orders, the __atomic_*_n value forms and the __atomic fences are
+   predefined (tccdefs.h), as GCC's are. */
 
 /* Memory ordering */
 typedef enum {
@@ -84,8 +80,6 @@ typedef struct {
 #define atomic_init(object, desired)                                      \
     atomic_store_explicit(object, desired, __ATOMIC_RELAXED)
 
-#define __atomic_store_n(ptr, val, order)                                 \
-    (*(ptr) = (val), __atomic_store((ptr), &(typeof(*(ptr))){val}, (order)))
 #define atomic_store_explicit(object, desired, order)                     \
     ({ __typeof__ (object) ptr = (object);                                \
        __typeof__ (*ptr) tmp = (desired);                                 \
@@ -94,10 +88,6 @@ typedef struct {
 #define atomic_store(object, desired)                                     \
      atomic_store_explicit (object, desired, __ATOMIC_SEQ_CST)
 
-#define __atomic_load_n(ptr, order)                                       \
-    ({ typeof(*(ptr)) __val;                                              \
-       __atomic_load((ptr), &__val, (order));                             \
-       __val; })
 #define atomic_load_explicit(object, order)                               \
     ({ __typeof__ (object) ptr = (object);                                \
        __typeof__ ((void)0,*ptr) tmp;                                             \
@@ -115,10 +105,6 @@ typedef struct {
     })
 #define atomic_exchange(object, desired)                                  \
   atomic_exchange_explicit (object, desired, __ATOMIC_SEQ_CST)
-#define __atomic_compare_exchange_n(ptr, expected, desired, weak, success, failure) \
-    ({ typeof(*(ptr)) __desired = (desired);                              \
-       __atomic_compare_exchange((ptr), (expected), &__desired,          \
-         (weak), (success), (failure)); })
 #define atomic_compare_exchange_strong_explicit(object, expected, desired, success, failure) \
     ({ __typeof__ (object) ptr = (object);                                \
        __typeof__ (*ptr) tmp = desired;                                   \
@@ -157,10 +143,7 @@ typedef struct {
 #define atomic_fetch_and_explicit __atomic_fetch_and
 
 extern void atomic_thread_fence (memory_order);
-#define __atomic_thread_fence(order) atomic_thread_fence (order)
 extern void atomic_signal_fence (memory_order);
-#define __atomic_signal_fence(order) atomic_signal_fence(order)
-#define atomic_signal_fence(order) __atomic_signal_fence  (order)
 extern bool __atomic_is_lock_free(size_t size, void *ptr);
 #define atomic_is_lock_free(OBJ) __atomic_is_lock_free (sizeof (*(OBJ)), (OBJ))
 

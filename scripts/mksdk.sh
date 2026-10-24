@@ -1,16 +1,31 @@
 #!/bin/bash
-# Stage the SDK, C:\Nocturne\SDK: the C development files for TinyCC running inside Nocturne.
-#   Include              libc, Nocturne and BearSSL headers (+ stdint.h, limits.h)
+# Stage the SDK, C:\Nocturne\SDK: the C development files for TinyCC and clang running inside
+# Nocturne.
+#   Include              libc, Nocturne, BearSSL, QuickJS and libnvrm headers (+ stdint.h, limits.h)
 #   Lib\tcc\include      TinyCC's own headers (stdarg.h, stddef.h, float.h, ...)
 #   Lib\tcc              libtcc1.a (compiler runtime), runmain.o (for tcc -run)
-#   Lib                  crt1.o crti.o crtn.o libc.a (libc + gfx + BearSSL), libwasm-rt.a
+#   Lib                  crt1.o crti.o crtn.o libc.a (libc + gfx + BearSSL), libwasm-rt.a,
+#                        user.ld (the program layout clang's driver links with)
 #   Source\Apps          sources of the system's programs (API examples)
+#   Source\libc          the private libc headers those sources include by their place
+#                        in the tree ("../libc/web/js_memory.h")
 #   Source\wasm2c        wasm2c's runtime, for programs it makes
+# and, with --llvm, what the Nocturne build of LLVM puts there (ports/llvm/build.py):
+#   Lib\clang            clang's headers (include) and runtime (lib\x86_64-unknown-nocturne)
+#   Include\c++\v1       libc++'s headers
+#   Include              libunwind's headers (unwind.h, libunwind.h)
+#   Lib                  libc++.a (libc++ with libc++abi), libc++experimental.a, libunwind.a
+#   Source\c++\v1        libc++'s std and std.compat modules, for import std
 # Objects are copied without debug info or unwind tables, which TinyCC has no use for.
-# usage: mksdk.sh OUTDIR LIBC_OBJS... -- TCCRT_OBJS... --wasmrt WASMRT_OBJS...
+# usage: mksdk.sh OUTDIR [--llvm LLVM_SDK] LIBC_OBJS... -- TCCRT_OBJS... --wasmrt WASMRT_OBJS...
 set -e
 S=$1
 shift
+L=
+if [ "${1:-}" = --llvm ]; then
+    L=$2
+    shift 2
+fi
 T=third_party/tinycc
 W=$S.tmp
 build_root=$(realpath -e -- build)
@@ -29,6 +44,9 @@ cp common/abi.h common/gfx.h common/gpu_abi.h common/display_abi.h "$S/Include/"
 cp ports/tcc/include/*.h "$S/Include/"
 cp third_party/bearssl/inc/*.h "$S/Include/"
 cp ports/lexbor/include/*.h "$S/Include/"
+# QuickJS and libnvrm are libc.a members like BearSSL and Lexbor
+cp third_party/quickjs/quickjs.h "$S/Include/"
+cp ports/nvidia/include/*.h "$S/Include/"
 # wasm2c's regular-memory runtime uses Nocturne-native trap/TLS/stack handling.
 # Its compiler-host symbol binder is not a member of the standalone runtime.
 cp third_party/wabt/wasm2c/wasm-rt.h third_party/wabt/wasm2c/wasm-rt-impl.h "$S/Include/"
@@ -45,6 +63,25 @@ done < third_party/lexbor/headers.list
 cp $T/include/*.h "$S/Lib/tcc/include/"
 # the sources of the system's programs, as examples of the APIs
 cp user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts "$S/Source/Apps/"
+# and the private libc files they #include or #embed by a relative path, with the ones those
+# include, at the same place beside Source\Apps (user/libc/web/x.h -> Source\libc\web\x.h)
+declare -A staged
+pending=(user/apps/*.c user/apps/*.h)
+while ((${#pending[@]})); do
+    f=${pending[-1]}
+    unset 'pending[-1]'
+    while read -r directive included; do
+        # a program's own files stay in Source\Apps
+        [[ "$f" == user/libc/* || "$included" == ../* ]] || continue
+        h=$(realpath -m --relative-to=. -- "${f%/*}/$included")
+        [[ "$h" == user/libc/* && -f "$h" && -z "${staged[$h]}" ]] || continue
+        staged[$h]=1
+        # an #embed'ded file is data
+        [[ "$directive" == embed ]] || pending+=("$h")
+        mkdir -p "$S/Source/$(dirname "${h#user/}")"
+        cp "$h" "$S/Source/${h#user/}"
+    done < <(sed -n 's/^[[:space:]]*#[[:space:]]*\(include\|embed\)[[:space:]]*"\([^"]*\)".*/\1 \2/p' "$f")
+done
 
 strip_obj() { objcopy --strip-debug -R .eh_frame -R .llvm_addrsig -R .comment "$1" "$2"; }
 
@@ -91,6 +128,7 @@ strip_obj "$crt0" "$S/Lib/crt1.o"
 printf '' > "$W/empty.asm"
 nasm -f elf64 "$W/empty.asm" -o "$S/Lib/crti.o"
 cp "$S/Lib/crti.o" "$S/Lib/crtn.o"
+cp user/user.ld "$S/Lib/user.ld"
 
 (cd "$W/libc" && ar rcs ../libc.a *.o)
 mv "$W/libc.a" "$S/Lib/libc.a"
@@ -100,3 +138,6 @@ mv "$W/rt/runmain.o" "$S/Lib/tcc/runmain.o"
 (cd "$W/rt" && ar rcs ../libtcc1.a *.o)
 mv "$W/libtcc1.a" "$S/Lib/tcc/libtcc1.a"
 rm -rf "$W"
+if [ -n "$L" ]; then
+    cp -R "$L"/. "$S/"
+fi

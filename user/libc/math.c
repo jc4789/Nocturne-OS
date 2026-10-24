@@ -12,6 +12,7 @@
 #include <fenv.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
 #include "math_tables.h"
 
 /* ---- floating-point environment (MXCSR and the x87 words together) ---- */
@@ -964,6 +965,51 @@ double frexp(double x, int *e) {
     *e = ex - 1022;
     v.u = (v.u & ~(0x7FFULL << 52)) | (1022ULL << 52);
     return v.d;
+}
+
+/* The unbiased exponent of a finite, nonzero x, as if it were normalized. A
+   subnormal's significand m stands for m * 2^-1074. */
+static int exponent_of(double x) {
+    uint64_t u = d2u(x);
+    int ex = (int)(u >> 52 & 0x7FF);
+    return ex ? ex - 1023 : -1011 - __builtin_clzll(u & F64_FRAC);
+}
+
+/* The same for x87 extended precision, whose significand holds its integer
+   bit: a subnormal's significand m stands for m * 2^-16445. */
+static int exponent_of_ld(long double x) {
+    union { long double d; struct { uint64_t m; uint16_t se; } p; } v = {x};
+    int ex = v.p.se & 0x7FFF;
+    return ex ? ex - 16383 : -16382 - __builtin_clzll(v.p.m);
+}
+
+static int ilogb_special(bool nan, bool zero) {
+    feraiseexcept(FE_INVALID);
+    return nan ? FP_ILOGBNAN : zero ? FP_ILOGB0 : INT_MAX;
+}
+
+int ilogb(double x) {
+    if (x == 0 || !isfinite(x)) return ilogb_special(isnan(x), x == 0);
+    return exponent_of(x);
+}
+int ilogbf(float x) { return ilogb(x); } /* float to double is exact */
+int ilogbl(long double x) {
+    if (x == 0 || !isfinite(x)) return ilogb_special(isnan(x), x == 0);
+    return exponent_of_ld(x);
+}
+
+/* -1 / +0 is -inf with FE_DIVBYZERO; x * x is +inf for either infinity and
+   NaN for NaN. */
+double logb(double x) {
+    if (x == 0) return -1 / fabs(x);
+    if (!isfinite(x)) return x * x;
+    return exponent_of(x);
+}
+float logbf(float x) { return (float)logb(x); }
+long double logbl(long double x) {
+    if (x == 0) return -1 / fabsl(x);
+    if (!isfinite(x)) return x * x;
+    return exponent_of_ld(x);
 }
 
 double modf(double x, double *ip) {

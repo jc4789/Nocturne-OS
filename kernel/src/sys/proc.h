@@ -27,5 +27,6 @@ int proc_app_create(struct handle **out);
 int proc_app_open(int pid, struct handle **out);
 bool proc_app_is(struct handle *h);
 void proc_app_ended(struct object *app, int status); /* BSP IRQ guard held */
-int proc_app_pid(struct handle *h);
+int proc_app_pid(struct handle *h); /* 0 once it has ended */
+int proc_app_id(struct handle *h);  /* its identifier, also after its end */
 int proc_app_result(struct handle *h, uint64_t timeout_ms, int *status); /* UINT64_MAX: no limit */

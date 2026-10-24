@@ -49,6 +49,8 @@ n_handle n_document_open(const char *path, int access); /* N_DOCUMENT_* */
 n_result n_document_read_at(n_handle h, uint64_t offset, void *buf, size_t n); /* bytes; 0 at the end */
 n_result n_document_write_at(n_handle h, uint64_t offset, const void *buf, size_t n);
 n_result n_document_size(n_handle h);
+/* The open document's entry as n_entry_info gives it, with no name and the size this handle reads. */
+n_result n_document_info(n_handle h, struct n_entry *out);
 n_result n_document_set_size(n_handle h, uint64_t size); /* new bytes read as zero */
 n_result n_document_claim(n_handle h, bool wait);        /* N_ERR_NOT_READY when not waiting */
 n_result n_document_release(n_handle h);
@@ -60,6 +62,9 @@ n_result n_document_load(const char *path, void **data, size_t *size);
 n_result n_entry_info(const char *path, struct n_entry *out);
 n_result n_entry_remove(const char *path);
 n_result n_entry_move(const char *from, const char *to); /* never replaces: N_ERR_EXISTS */
+/* n_entry_move that lets document from take the name of a document, which goes in the same commit
+   (as n_entry_remove takes it: its open handles keep it). Any other entry there: N_ERR_EXISTS. */
+n_result n_entry_replace(const char *from, const char *to);
 n_result n_folder_create(const char *path);
 n_result n_folder_list(const char *path, struct n_entry *out, size_t max, uint64_t start); /* count */
 /* Every entry of a folder in a new array (free it); returns the count. */
@@ -93,7 +98,7 @@ n_result n_app_parent(void);
 n_handle n_app_open(int64_t id); /* a running app by the identifier the app list shows */
 n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its length */
 n_handle n_system_log_open(void); /* a handle whose messages are added to the system log */
-n_result n_app_id(n_handle app); /* its identifier; 0 once it has ended */
+n_result n_app_id(n_handle app); /* its identifier, also after its end (identifiers are not reused) */
 /* Drivers in apps (docs/nocturne-native-abi.md §9). Only init may claim a PCI function; it
    hands the N_KIND_PCI handle to the driver app it launches. A claim is exclusive until its
    last handle closes, which also turns the function's interrupts off. Isolation is required
@@ -205,10 +210,15 @@ n_result sysinfo(struct n_sysinfo *si);
 n_result cpu_info(struct n_cpuinfo *info);
 n_result clock_info(struct n_clockinfo *info);
 /* Native tasks sharing this process's address space and descriptors. create
- * returns the thread's id; a process has at most 128 running threads, past
- * that N_ERR_NOT_READY. Both return a negative n_result and leave errno alone. */
+ * returns the thread's id (never 0); a process has at most 128 running threads,
+ * past that N_ERR_NOT_READY. The stack is 256 KiB, or with create_sized at least
+ * stack_bytes (0: 256 KiB); its pages are given on first touch. A thread ends
+ * when fn returns; join waits for that, and detach says no one will join it.
+ * All return a negative n_result on failure and leave errno alone. */
 n_result thread_create(void (*fn)(void *), void *arg);
+n_result thread_create_sized(void (*fn)(void *), void *arg, size_t stack_bytes);
 n_result thread_join(int tid);
+n_result thread_detach(int tid);
 NOCTURNE_NORETURN void thread_exit(void);
 int thread_id(void);
 unsigned cpu_index(void);

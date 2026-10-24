@@ -59,7 +59,7 @@ enum {
     SYS_THREAD_TLS,
     SYS_CHANNEL_LISTEN, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
     SYS_SHARED_CREATE,
-    SYS_THREAD_STACK_BOUNDS = 58,
+    SYS_THREAD_STACK_BOUNDS = 58, SYS_THREAD_DETACH,
     SYS_WIN_CREATE = 64, SYS_WIN_MAP, SYS_WIN_PRESENT, SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
@@ -105,6 +105,8 @@ enum {
     SYS_CHANNEL_RECEIVE_FROM, SYS_SHARED_COMPOSE,
     SYS_PCI_HOLD_SCREEN, /* (pci, hold): no drawing to the boot screen in the function's BAR */
     SYS_DOCUMENT_COMMIT, /* (document, N_COMMIT_*) */
+    SYS_DOCUMENT_INFO,   /* (document, struct n_entry *out) */
+    SYS_ENTRY_REPLACE,   /* (from, to): SYS_ENTRY_MOVE that may replace a document */
     SYS_MAX = 192
 };
 
@@ -137,13 +139,15 @@ enum {
 #define N_COMMIT_START 2      /* return at once; N_EVENT_SAVED reports the outcome */
 #define N_COMMIT_RESULT 3     /* the last started save's outcome (N_ERR_NOT_READY: not yet) */
 
-/* An entry of a folder, or the entry a path names. Times are wall seconds. */
+/* An entry of a folder, or the entry a path names. id is the entry itself on C:: it
+   stays with the entry when it moves and is never given to another one. */
 struct n_entry {
     char name[256];
-    uint32_t kind;     /* N_KIND_DOCUMENT or N_KIND_FOLDER */
-    uint32_t reserved;
+    uint32_t kind;        /* N_KIND_DOCUMENT or N_KIND_FOLDER */
+    uint32_t modified_ns; /* nanoseconds within the second `modified` names */
     uint64_t size;
-    int64_t modified;
+    int64_t modified;     /* wall seconds */
+    uint64_t id;
 };
 
 /* n_channel_receive flags */
@@ -168,6 +172,9 @@ struct n_launch {
     const int32_t *handles;
     uint32_t argument_count, setting_count, handle_count, flags;
 };
+/* The most bytes a launch's argument and setting strings (each with its nul) and their two
+   null-terminated pointer arrays (8 bytes a pointer) may take: N_ERR_TOO_MANY_ARGUMENTS past it. */
+#define N_LAUNCH_MAX_BYTES (4ULL << 20)
 #define N_APP_STOP_TREE 1  /* n_app_stop: also stop every app it launched */
 
 /* Event interests and reports (level-triggered). */

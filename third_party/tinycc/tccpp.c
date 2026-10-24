@@ -1338,19 +1338,24 @@ ST_FUNC void skip_to_eol(int warn)
 static CachedInclude *
 search_cached_include(TCCState *s1, const char *filename, int add);
 
-static int parse_include(TCCState *s1, int do_next, int test)
+/* The file name of an #include or #embed (DIRECTIVE): "name", <name>, or macros that make
+   one. Returns its first character, '"' or '<', with tok the token after it (EXPAND: with
+   macros replaced). */
+static int parse_include_name(char *name, int size, const char *directive, int expand)
 {
-    int c, i;
-    char name[1024], buf[1024], *p;
-    CachedInclude *e;
+    int c, i, flags = parse_flags;
+    char *p;
 
     c = skip_spaces();
     if (c == '<' || c == '\"') {
         cstr_reset(&tokcstr);
         file->buf_ptr = parse_pp_string(file->buf_ptr, c == '<' ? '>' : c, &tokcstr);
         i = tokcstr.size;
-        pstrncpy(name, sizeof name, tokcstr.data, i);
-        next_nomacro();
+        pstrncpy(name, size, tokcstr.data, i);
+        if (expand)
+            next();
+        else
+            next_nomacro();
     } else {
         /* computed #include : concatenate tokens until result is one of
            the two accepted forms.  Don't convert pp-tokens to tokens here. */
@@ -1366,45 +1371,82 @@ static int parse_include(TCCState *s1, int do_next, int test)
                  || (p[0] == '<' && p[i] == '>')))
                 break;
             if (tok == TOK_LINEFEED)
-                tcc_error("'#include' expects \"FILENAME\" or <FILENAME>");
-            pstrcat(name, sizeof name, get_tok_str(tok, &tokc));
+                tcc_error("'%s' expects \"FILENAME\" or <FILENAME>", directive);
+            pstrcat(name, size, get_tok_str(tok, &tokc));
 	}
+        /* for the expression or parameters after it */
+        parse_flags = flags;
         c = p[0];
         /* remove '<>|""' */
         memmove(p, p + 1, i - 1), p[i - 1] = 0;
     }
+    return c;
+}
 
+/* The I-th place to look for the file NAME (C its first character from parse_include_name())
+   in BUF: 1, or -1 when there is no such place for this name, or 0 after the last. */
+static int include_place(TCCState *s1, int i, int c, const char *name, char *buf, int size)
+{
+    const char *p;
+
+    if (i == 0) {
+        /* check absolute include path */
+        if (!IS_ABSPATH(name))
+            return -1;
+        buf[0] = '\0';
+    } else if (i == 1) {
+        /* search in file's dir if "header.h" */
+        if (c != '\"')
+            return -1;
+        p = file->true_filename;
+        pstrncpy(buf, size, p, tcc_basename(p) - p);
+    } else {
+        int j = i - 2, k = j - s1->nb_include_paths;
+        if (k < 0)
+            p = s1->include_paths[j];
+        else if (k < s1->nb_sysinclude_paths)
+            p = s1->sysinclude_paths[k];
+        else
+            return 0;
+        pstrcpy(buf, size, p);
+        pstrcat(buf, size, "/");
+    }
+    pstrcat(buf, size, name);
+    return 1;
+}
+
+/* For -MD: PATH, found at place I for the file BF, unless it is a system file. */
+static void include_dep(TCCState *s1, BufferedFile *bf, int i, const char *path)
+{
+    if (!s1->gen_deps)
+        return;
+    /* beside the file that names it, it is a system file if that one is */
+    for (; i == 1 && bf; bf = bf->prev)
+        i = bf->include_next_index;
+    if (s1->include_sys_deps || i - 2 < s1->nb_include_paths)
+        dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(path));
+}
+
+static int parse_include(TCCState *s1, int do_next, int test)
+{
+    int c, i, n;
+    char name[1024], buf[1024];
+    CachedInclude *e;
+
+    c = parse_include_name(name, sizeof name, "#include", 0);
     if (!test)
         skip_to_eol(1);
 
     i = do_next ? file->include_next_index : -1;
     for (;;) {
-        ++i;
-        if (i == 0) {
-            /* check absolute include path */
-            if (!IS_ABSPATH(name))
-                continue;
-            buf[0] = '\0';
-        } else if (i == 1) {
-            /* search in file's dir if "header.h" */
-            if (c != '\"')
-                continue;
-            p = file->true_filename;
-            pstrncpy(buf, sizeof buf, p, tcc_basename(p) - p);
-        } else {
-            int j = i - 2, k = j - s1->nb_include_paths;
-            if (k < 0)
-                p = s1->include_paths[j];
-            else if (k < s1->nb_sysinclude_paths)
-                p = s1->sysinclude_paths[k];
-            else if (test)
+        n = include_place(s1, ++i, c, name, buf, sizeof buf);
+        if (n < 0)
+            continue;
+        if (n == 0) {
+            if (test)
                 return 0;
-            else
-                tcc_error("include file '%s' not found", name);
-            pstrcpy(buf, sizeof buf, p);
-            pstrcat(buf, sizeof buf, "/");
+            tcc_error("include file '%s' not found", name);
         }
-        pstrcat(buf, sizeof buf, name);
         e = search_cached_include(s1, buf, 0);
         if (e && (define_find(e->ifndef_macro) || e->once)) {
             /* no need to parse the include because the 'ifndef macro'
@@ -1433,35 +1475,244 @@ static int parse_include(TCCState *s1, int do_next, int test)
         printf("%s: including %s\n", file->prev->filename, file->filename);
 #endif
         /* update target deps */
-        if (s1->gen_deps) {
-            BufferedFile *bf = file;
-            while (i == 1 && (bf = bf->prev))
-                i = bf->include_next_index;
-            /* skip system include files */
-            if (s1->include_sys_deps || i - 2 < s1->nb_include_paths)
-                dynarray_add(&s1->target_deps, &s1->nb_target_deps,
-                    tcc_strdup(buf));
-        }
+        include_dep(s1, file->prev, i, buf);
         /* add include file debug info */
         tcc_debug_bincl(s1);
     }
     return 1;
 }
 
-/* eval an expression for #if/#elif */
-static int expr_preprocess(TCCState *s1)
+/* The parameters of #embed and __has_embed (C23): at most LIMIT bytes, the tokens of
+   prefix(), suffix() and if_empty() (or NULL), and whether all are supported. */
+typedef struct EmbedParams {
+    int limit, supported;
+    TokenString *clause[3];
+} EmbedParams;
+
+static int pp_const_expr(TCCState *s1, int t0, int close);
+
+/* 0 for limit, 1 + its clause for prefix, suffix and if_empty (as NAME or __NAME__), or -1 */
+static int embed_param(int t)
 {
-    int c, t;
-    int t0 = tok;
+    static const char names[] = "limit\0prefix\0suffix\0if_empty\0";
+    const char *s = get_tok_str(t, NULL), *n;
+    int i, l = strlen(s);
+
+    if (l > 4 && !memcmp(s, "__", 2) && !memcmp(s + l - 2, "__", 2))
+        s += 2, l -= 4;
+    for (i = 0, n = names; *n; n += strlen(n) + 1, i++)
+        if (strlen(n) == l && !memcmp(s, n, l))
+            return i;
+    return -1;
+}
+
+/* The parameters after the file name, from tok up to CLOSE: the end of an #embed line, or
+   the ')' of __has_embed (where an unsupported one is not an error). */
+static void parse_embed_params(TCCState *s1, EmbedParams *ep, int close)
+{
+    int p, depth, flags, seen = 0;
     TokenString *str;
-    
+
+    memset(ep, 0, sizeof *ep);
+    ep->limit = INT_MAX;
+    ep->supported = 1;
+    while (tok != close) {
+        if (tok < TOK_IDENT)
+            expect(close == ')' ? "embed parameter or ')'" : "embed parameter");
+        p = embed_param(tok);
+        next();
+        if (tok == ':') {
+            /* a vendor's parameter, vendor::name */
+            next();
+            if (tok != ':')
+                expect("'::'");
+            next();
+            if (tok < TOK_IDENT)
+                expect("embed parameter");
+            next();
+            p = -1;
+        }
+        if (p < 0) {
+            if (close != ')')
+                tcc_error("unsupported #embed parameter");
+            ep->supported = 0;
+        } else {
+            if (seen & (1 << p))
+                tcc_error("repeated #embed parameter");
+            seen |= 1 << p;
+        }
+        if (tok != '(') {
+            if (p >= 0)
+                expect("'('");
+            continue;
+        }
+        if (p == 0) {
+            ep->limit = pp_const_expr(s1, TOK_EMBED, ')');
+            if (ep->limit < 0)
+                tcc_error("negative #embed limit");
+        } else {
+            /* a balanced token sequence, its numbers and strings as they are spelt */
+            str = tok_str_alloc();
+            flags = parse_flags;
+            parse_flags &= ~(PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR);
+            for (depth = 0;;) {
+                next();
+                if (tok == TOK_LINEFEED || tok == TOK_EOF)
+                    expect("')'");
+                if (tok == '(')
+                    depth++;
+                else if (tok == ')' && depth-- == 0)
+                    break;
+                tok_str_add2(str, tok, &tokc);
+            }
+            parse_flags = flags;
+            tok_str_add(str, 0);
+            if (p > 0)
+                ep->clause[p - 1] = str;
+            else
+                tok_str_free(str);
+        }
+        next();
+    }
+}
+
+static void free_embed_params(EmbedParams *ep)
+{
+    int i;
+    for (i = 0; i < 3; i++)
+        if (ep->clause[i])
+            tok_str_free(ep->clause[i]);
+}
+
+/* Open the #embed file NAME (C from parse_include_name()) as the #include search would find
+   it, its path in BUF. The place it was found at (include_place()), or -1. */
+static int embed_open(TCCState *s1, const char *name, int c, TCCInput *in, char *buf, int size)
+{
+    int i, n;
+
+    for (i = 0;; i++) {
+        n = include_place(s1, i, c, name, buf, size);
+        if (n == 0)
+            return -1;
+        if (n > 0 && tcc_input_open(buf, in) == 0)
+            return i;
+    }
+}
+
+/* __has_embed(file parameters): __STDC_EMBED_NOT_FOUND__ (0), __STDC_EMBED_FOUND__ (1) or
+   __STDC_EMBED_EMPTY__ (2) */
+static int has_embed(TCCState *s1)
+{
+    char name[1024], buf[1024];
+    EmbedParams ep;
+    TCCInput in;
+    int c, r = 0;
+
+    c = parse_include_name(name, sizeof name, "__has_embed", 1);
+    parse_embed_params(s1, &ep, ')');
+    if (embed_open(s1, name, c, &in, buf, sizeof buf) >= 0) {
+        if (ep.supported)
+            r = tcc_input_size(&in) > 0 && ep.limit ? 1 : 2;
+        tcc_input_close(&in);
+    }
+    free_embed_params(&ep);
+    return r;
+}
+
+/* Append the tokens of STR to CS as text. */
+static void cstr_cat_tokens(CString *cs, TokenString *str)
+{
+    const int *p = str->str;
+    CValue cv;
+    int t;
+
+    while (*p) {
+        TOK_GET(&t, &p, &cv);
+        cstr_cat(cs, get_tok_str(t, &cv), -1);
+        cstr_ccat(cs, ' ');
+    }
+}
+
+/* #embed (C23): the bytes of a file, as a comma separated list of integer constants that
+   the following lines read like an #include'd file's */
+static void parse_embed(TCCState *s1)
+{
+    char name[1024], buf[1024];
+    EmbedParams ep;
+    TCCInput in;
+    CString text;
+    unsigned char *data;
+    int64_t size;
+    int c, i, n;
+
+    c = parse_include_name(name, sizeof name, "#embed", 1);
+    parse_embed_params(s1, &ep, TOK_LINEFEED);
+    i = embed_open(s1, name, c, &in, buf, sizeof buf);
+    if (i < 0)
+        tcc_error("embed file '%s' not found", name);
+    size = tcc_input_size(&in);
+    if (size < 0)
+        tcc_error("cannot read embed file '%s'", buf);
+    if (size > ep.limit)
+        size = ep.limit;
+    data = load_data(&in, 0, size);
+    tcc_input_close(&in);
+
+    cstr_new(&text);
+    if (size == 0) {
+        if (ep.clause[2])
+            cstr_cat_tokens(&text, ep.clause[2]);
+    } else {
+        if (ep.clause[0])
+            cstr_cat_tokens(&text, ep.clause[0]);
+        for (n = 0; n < size; n++) {
+            if (n)
+                cstr_ccat(&text, ',');
+            if (data[n] >= 100)
+                cstr_ccat(&text, '0' + data[n] / 100);
+            if (data[n] >= 10)
+                cstr_ccat(&text, '0' + data[n] / 10 % 10);
+            cstr_ccat(&text, '0' + data[n] % 10);
+        }
+        if (ep.clause[1]) {
+            cstr_ccat(&text, ' ');
+            cstr_cat_tokens(&text, ep.clause[1]);
+        }
+    }
+    tcc_free(data);
+    free_embed_params(&ep);
+
+    if (s1->include_stack_ptr >= s1->include_stack + INCLUDE_STACK_SIZE)
+        tcc_error("#include recursion too deep");
+    include_dep(s1, file, i, buf);
+    *s1->include_stack_ptr++ = file;
+    tcc_open_bf(s1, buf, text.size);
+    memcpy(file->buffer, text.data, text.size);
+    cstr_free(&text);
+    tcc_debug_bincl(s1);
+}
+
+/* eval the expression after tok up to CLOSE for the directive T0: the end of the line for
+   #if/#elif, or the ')' of an #embed limit() */
+static int pp_const_expr(TCCState *s1, int t0, int close)
+{
+    int c, t, depth = 0, outer = pp_expr;
+    TokenString *str;
+
     str = tok_str_alloc();
     pp_expr = 1;
     while (1) {
         next(); /* do macro subst */
         t = tok;
         if (tok < TOK_IDENT) {
-            if (tok == TOK_LINEFEED || tok == TOK_EOF)
+            if (tok == TOK_LINEFEED || tok == TOK_EOF) {
+                if (close != TOK_LINEFEED)
+                    expect("')'");
+                break;
+            }
+            if (tok == '(')
+                depth++;
+            else if (tok == close && depth-- == 0)
                 break;
             if (tok >= TOK_STR && tok <= TOK_CLDOUBLE)
                 tcc_error("invalid constant in preprocessor expression");
@@ -1480,7 +1731,8 @@ static int expr_preprocess(TCCState *s1)
             c = 0;
             if (define_find(tok)
                 || tok == TOK___HAS_INCLUDE
-                || tok == TOK___HAS_INCLUDE_NEXT)
+                || tok == TOK___HAS_INCLUDE_NEXT
+                || tok == TOK___HAS_EMBED)
                 c = 1;
             if (t == '(') {
                 next();
@@ -1497,6 +1749,12 @@ static int expr_preprocess(TCCState *s1)
             c = parse_include(s1, t - TOK___HAS_INCLUDE, 1);
             if (tok != ')')
                 expect("')'");
+            goto c_number;
+        } else if (tok == TOK___HAS_EMBED) {
+            next();
+            if (tok != '(')
+                expect("'('");
+            c = has_embed(s1);
             goto c_number;
         } else {
             /* if undefined macro, replace with zero */
@@ -1518,10 +1776,16 @@ static int expr_preprocess(TCCState *s1)
     c = expr_const();
     if (tok != TOK_EOF)
         tcc_error("...");
-    pp_expr = 0;
+    pp_expr = outer;
     end_macro();
-    tok = t; /* restore LF or EOF */
-    return c != 0;
+    tok = t; /* restore LF, EOF or ')' */
+    return c;
+}
+
+/* eval an expression for #if/#elif */
+static int expr_preprocess(TCCState *s1)
+{
+    return pp_const_expr(s1, tok, TOK_LINEFEED) != 0;
 }
 
 ST_FUNC void pp_error(CString *cs)
@@ -1844,6 +2108,9 @@ ST_FUNC void preprocess(int is_bof)
     case TOK_INCLUDE_NEXT:
         parse_include(s1, tok - TOK_INCLUDE, 0);
         goto the_end;
+    case TOK_EMBED:
+        parse_embed(s1);
+        goto the_end;
     case TOK_IFNDEF:
         c = 1;
         goto do_ifdef;
@@ -1866,7 +2133,8 @@ ST_FUNC void preprocess(int is_bof)
         }
         if (define_find(tok)
             || tok == TOK___HAS_INCLUDE
-            || tok == TOK___HAS_INCLUDE_NEXT)
+            || tok == TOK___HAS_INCLUDE_NEXT
+            || tok == TOK___HAS_EMBED)
             c ^= 1;
         next_nomacro();
     do_if:

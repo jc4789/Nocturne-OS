@@ -585,8 +585,8 @@ int document_open(const char *path, int access, bool user, struct handle **out) 
     return r;
 }
 
-int store_document_open(const char *path, int access, struct handle **out) {
-    return document_open(path, access, true, out);
+int store_document_open(const char *path, int access, bool user, struct handle **out) {
+    return document_open(path, access, user, out);
 }
 
 bool store_document_is(struct handle *h) { return opening_of(h) != NULL; }
@@ -623,17 +623,89 @@ int64_t store_document_write(struct handle *h, uint64_t offset, const void *buf,
     return r;
 }
 
+/* The size op reads: a READ opening keeps the version it opened, the catalog's until a save
+   supersedes it. rec: its document's record, read here when NULL. */
+static int64_t opening_size(struct volume *v, const struct opening *op, const struct store_record *rec) {
+    if (op->access != N_DOCUMENT_READ) return (int64_t)op->doc->work.size;
+    if (op->version->superseded) return (int64_t)op->version->size;
+    struct store_record own;
+    if (!rec) {
+        int r = ns_record(v, op->doc->id, &own, NULL);
+        if (r < 0) return r;
+        rec = &own;
+    }
+    return (int64_t)rec->size;
+}
+
 int64_t store_document_size(struct handle *h) {
     struct opening *op = opening_of(h);
     if (!op) return -N_ERR_WRONG_KIND;
     struct volume *v = store.v;
     mutex_lock(&v->lock);
-    struct store_record rec;
-    int64_t r = (int64_t)op->doc->work.size;
-    if (op->access == N_DOCUMENT_READ && op->version->superseded) r = (int64_t)op->version->size;
-    else if (op->access == N_DOCUMENT_READ) r = (r = ns_record(v, op->doc->id, &rec, NULL)) < 0 ? r : (int64_t)rec.size;
+    int64_t r = opening_size(v, op, NULL);
     mutex_unlock(&v->lock);
     return r;
+}
+
+int store_document_info(struct handle *h, struct n_entry *out) {
+    struct opening *op = opening_of(h);
+    if (!op) return -N_ERR_WRONG_KIND;
+    struct volume *v = store.v;
+    mutex_lock(&v->lock);
+    struct store_record rec;
+    int r = ns_record(v, op->doc->id, &rec, NULL);
+    if (r >= 0) {
+        entry_fill(out, NULL, 0, op->doc->id, &rec);
+        out->size = (uint64_t)opening_size(v, op, &rec);
+    }
+    mutex_unlock(&v->lock);
+    return r < 0 ? r : 0;
+}
+
+/* A change writes the content it changes into new blocks, each with the CRC-32C of its bytes, so
+   the size, the blocks and their checks tell one content of a document from the others. */
+int store_document_identity(struct handle *h, void **out, size_t *n) {
+    struct opening *op = opening_of(h);
+    if (!op) return -N_ERR_WRONG_KIND;
+    if (op->access != N_DOCUMENT_READ) return -N_ERR_UNSUPPORTED; /* a work changes under it */
+    struct volume *v = store.v;
+    mutex_lock(&v->lock);
+    struct version *ver = op->version;
+    struct ns_extent *list = ver->extents;
+    size_t count = ver->n;
+    uint64_t size = ver->size;
+    int r = ver->content ? -N_ERR_UNSUPPORTED : 0;
+    if (!ver->superseded) {
+        struct store_record rec;
+        list = NULL;
+        if ((r = ns_record(v, op->doc->id, &rec, NULL)) >= 0) {
+            size = rec.size;
+            r = rec.flags & STORE_INLINE ? -N_ERR_UNSUPPORTED : ns_extents(v, op->doc->id, &list, &count);
+        }
+    }
+    size_t bytes = sizeof size;
+    for (size_t i = 0; r >= 0 && i < count; i++) {
+        if (!list[i].checked) r = -N_ERR_UNSUPPORTED; /* a raw document's blocks change in place */
+        bytes += 3 * sizeof(uint64_t) + 4 * list[i].count;
+    }
+    uint8_t *id = r >= 0 ? kmalloc(bytes) : NULL;
+    if (r >= 0 && !id) r = -N_ERR_NO_MEMORY;
+    if (r >= 0) {
+        uint8_t *at = id;
+        memcpy(at, &size, sizeof size);
+        at += sizeof size;
+        for (size_t i = 0; i < count; i++) {
+            uint64_t place[3] = {list[i].index, list[i].count, list[i].block};
+            memcpy(at, place, sizeof place);
+            memcpy(at + sizeof place, list[i].check, 4 * list[i].count);
+            at += sizeof place + 4 * list[i].count;
+        }
+        *out = id;
+        *n = bytes;
+    }
+    if (!ver->superseded) kfree(list);
+    mutex_unlock(&v->lock);
+    return r < 0 ? r : 0;
 }
 
 int store_document_set_size(struct handle *h, uint64_t size) {

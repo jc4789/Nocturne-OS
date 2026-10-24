@@ -1,0 +1,5348 @@
+diff --git a/clang/include/clang/Serialization/ModuleCache.h b/clang/include/clang/Serialization/ModuleCache.h
+index 50d643ef..3b0b10b6 100644
+--- a/clang/include/clang/Serialization/ModuleCache.h
++++ b/clang/include/clang/Serialization/ModuleCache.h
+@@ -17,7 +17,11 @@
+ 
+ #include <ctime>
+ #include <memory>
++#ifdef __nocturne__
++#include "llvm/Support/DataTypes.h" // off_t
++#else
+ #include <sys/types.h>
++#endif
+ #include <system_error>
+ 
+ namespace llvm {
+diff --git a/clang/lib/Basic/AtomicLineLogger.cpp b/clang/lib/Basic/AtomicLineLogger.cpp
+index dc0f2bf5..8aec4980 100644
+--- a/clang/lib/Basic/AtomicLineLogger.cpp
++++ b/clang/lib/Basic/AtomicLineLogger.cpp
+@@ -18,7 +18,7 @@
+ #include "llvm/Support/Format.h"
+ #include "llvm/Support/Process.h"
+ #include "llvm/Support/Threading.h"
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__nocturne__)
+ #include <unistd.h>
+ #endif
+ #ifdef __APPLE__
+@@ -45,7 +45,15 @@ static uint64_t getTimestampMillis() {
+ // This function only does one write (up to retry due to interrupts), and the
+ // single write is blocking and atomic on POSIX systems.
+ static bool writeLineToFD(int FD, const char *Data, size_t Size) {
+-#ifndef _WIN32
++#if defined(__nocturne__)
++  // An unbuffered stream writes it as one, and Nocturne holds the document
++  // while it writes at its end: the line stays whole among other apps' lines.
++  llvm::raw_fd_ostream OS(FD, /*shouldClose=*/false, /*unbuffered=*/true);
++  OS.write(Data, Size);
++  bool Written = !OS.has_error();
++  OS.clear_error();
++  return Written;
++#elif !defined(_WIN32)
+   ssize_t Written = llvm::sys::RetryAfterSignal(-1, write, FD, Data, Size);
+   return Written >= 0 && (static_cast<size_t>(Written) == Size);
+ #else
+diff --git a/clang/lib/Basic/Targets.cpp b/clang/lib/Basic/Targets.cpp
+index 8c01cfca..1c4a53c5 100644
+--- a/clang/lib/Basic/Targets.cpp
++++ b/clang/lib/Basic/Targets.cpp
+@@ -693,6 +693,9 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
+     case llvm::Triple::Serenity:
+       return std::make_unique<SerenityTargetInfo<X86_64TargetInfo>>(Triple,
+                                                                     Opts);
++    case llvm::Triple::Nocturne:
++      return std::make_unique<NocturneTargetInfo<X86_64TargetInfo>>(Triple,
++                                                                    Opts);
+     default:
+       return std::make_unique<X86_64TargetInfo>(Triple, Opts);
+     }
+diff --git a/clang/lib/Basic/Targets/OSTargets.h b/clang/lib/Basic/Targets/OSTargets.h
+index 7c466660..3b7b043c 100644
+--- a/clang/lib/Basic/Targets/OSTargets.h
++++ b/clang/lib/Basic/Targets/OSTargets.h
+@@ -1139,6 +1139,19 @@ public:
+   }
+ };
+ 
++// Nocturne OS target: a native ABI of its own, not UNIX or POSIX.
++template <typename Target>
++class LLVM_LIBRARY_VISIBILITY NocturneTargetInfo : public OSTargetInfo<Target> {
++protected:
++  void getOSDefines(const LangOptions &Opts, const llvm::Triple &Triple,
++                    MacroBuilder &Builder) const override {
++    Builder.defineMacro("__nocturne__");
++  }
++
++public:
++  using OSTargetInfo<Target>::OSTargetInfo;
++};
++
+ } // namespace targets
+ } // namespace clang
+ #endif // LLVM_CLANG_LIB_BASIC_TARGETS_OSTARGETS_H
+diff --git a/clang/lib/Driver/CMakeLists.txt b/clang/lib/Driver/CMakeLists.txt
+index 506536cd..bb2cbc9f 100644
+--- a/clang/lib/Driver/CMakeLists.txt
++++ b/clang/lib/Driver/CMakeLists.txt
+@@ -82,6 +82,7 @@ add_clang_library(clangDriver
+   ToolChains/MSP430.cpp
+   ToolChains/MSVC.cpp
+   ToolChains/NetBSD.cpp
++  ToolChains/Nocturne.cpp
+   ToolChains/OHOS.cpp
+   ToolChains/OpenBSD.cpp
+   ToolChains/PS4CPU.cpp
+diff --git a/clang/lib/Driver/Driver.cpp b/clang/lib/Driver/Driver.cpp
+index e606cdc4..cc3ed301 100644
+--- a/clang/lib/Driver/Driver.cpp
++++ b/clang/lib/Driver/Driver.cpp
+@@ -37,6 +37,7 @@
+ #include "ToolChains/MinGW.h"
+ #include "ToolChains/MipsLinux.h"
+ #include "ToolChains/NetBSD.h"
++#include "ToolChains/Nocturne.h"
+ #include "ToolChains/OHOS.h"
+ #include "ToolChains/OpenBSD.h"
+ #include "ToolChains/PPCFreeBSD.h"
+@@ -7164,6 +7165,9 @@ const ToolChain &Driver::getToolChain(const ArgList &Args,
+     case llvm::Triple::Managarm:
+       TC = std::make_unique<toolchains::Managarm>(*this, Target, Args);
+       break;
++    case llvm::Triple::Nocturne:
++      TC = std::make_unique<toolchains::Nocturne>(*this, Target, Args);
++      break;
+     case llvm::Triple::Serenity:
+       TC = std::make_unique<toolchains::Serenity>(*this, Target, Args);
+       break;
+diff --git a/clang/lib/Driver/ToolChain.cpp b/clang/lib/Driver/ToolChain.cpp
+index f894a063..b66e6699 100644
+--- a/clang/lib/Driver/ToolChain.cpp
++++ b/clang/lib/Driver/ToolChain.cpp
+@@ -1571,7 +1571,7 @@ ToolChain::UnwindLibType ToolChain::GetUnwindLibType(
+     ToolChain::RuntimeLibType RtLibType = GetRuntimeLibType(Args);
+     if (RtLibType == ToolChain::RLT_CompilerRT) {
+       if (getTriple().isAndroid() || getTriple().isOSAIX() ||
+-          getTriple().isOSSerenity())
++          getTriple().isOSSerenity() || getTriple().isOSNocturne())
+         unwindLibType = ToolChain::UNW_CompilerRT;
+       else
+         unwindLibType = ToolChain::UNW_None;
+diff --git a/clang/lib/Driver/ToolChains/Nocturne.cpp b/clang/lib/Driver/ToolChains/Nocturne.cpp
+new file mode 100644
+index 00000000..085a6143
+--- /dev/null
++++ b/clang/lib/Driver/ToolChains/Nocturne.cpp
+@@ -0,0 +1,153 @@
++//===--- Nocturne.cpp - Nocturne OS ToolChain Implementation ----*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "Nocturne.h"
++#include "clang/Driver/CommonArgs.h"
++#include "clang/Driver/Compilation.h"
++#include "clang/Driver/Driver.h"
++#include "clang/Options/Options.h"
++#include "llvm/Option/ArgList.h"
++#include "llvm/Support/Path.h"
++
++using namespace clang::driver;
++using namespace clang::driver::toolchains;
++using namespace clang;
++using namespace llvm::opt;
++
++void tools::nocturne::Linker::ConstructJob(Compilation &C, const JobAction &JA,
++                                           const InputInfo &Output,
++                                           const InputInfoList &Inputs,
++                                           const ArgList &Args,
++                                           const char *LinkingOutput) const {
++  const ToolChain &TC = getToolChain();
++  const Driver &D = TC.getDriver();
++  ArgStringList CmdArgs;
++
++  // A program is one static executable at the address the SDK's linker script
++  // gives it; Nocturne loads no shared or position-independent objects.
++  for (Arg *A : Args.filtered(options::OPT_shared, options::OPT_pie,
++                              options::OPT_static_pie, options::OPT_rdynamic))
++    D.Diag(diag::err_drv_unsupported_opt_for_target)
++        << A->getAsString(Args) << TC.getTripleString();
++  Args.ClaimAllArgs(options::OPT_static);
++  Args.ClaimAllArgs(options::OPT_no_pie);
++
++  const bool Relocatable = Args.hasArg(options::OPT_r);
++  const bool NoStdLib = Relocatable || Args.hasArg(options::OPT_nostdlib);
++  const bool NoStartFiles = NoStdLib || Args.hasArg(options::OPT_nostartfiles);
++  const bool NoDefaultLibs = NoStdLib || Args.hasArg(options::OPT_nodefaultlibs);
++
++  if (!Relocatable) {
++    CmdArgs.push_back("-static");
++    CmdArgs.push_back("--no-dynamic-linker");
++    CmdArgs.push_back("-z");
++    CmdArgs.push_back("max-page-size=0x1000");
++    // The SDK's libraries have a section for each function and variable, and
++    // a static program needs only those it reaches (-Wl,--no-gc-sections keeps
++    // them all).
++    CmdArgs.push_back("--gc-sections");
++    // user.ld places the program at 0x400000 and gives the C library its
++    // init/fini arrays and the thread-local image.
++    if (!Args.hasArg(options::OPT_T)) {
++      CmdArgs.push_back("-T");
++      CmdArgs.push_back(Args.MakeArgString(TC.GetFilePath("user.ld")));
++    }
++    // libunwind finds the handler of a C++ exception through this index of
++    // the unwind tables, which user.ld names.
++    CmdArgs.push_back("--eh-frame-hdr");
++  }
++
++  assert((Output.isFilename() || Output.isNothing()) && "Invalid output.");
++  if (Output.isFilename()) {
++    CmdArgs.push_back("-o");
++    CmdArgs.push_back(Output.getFilename());
++  }
++
++  if (!NoStartFiles)
++    CmdArgs.push_back(Args.MakeArgString(TC.GetFilePath("crt1.o")));
++
++  Args.addAllArgs(CmdArgs, {options::OPT_L, options::OPT_u});
++  TC.AddFilePathLibArgs(Args, CmdArgs);
++
++  if (auto LTO = TC.getLTOMode(Args); LTO != LTOK_None)
++    addLTOOptions(TC, Args, CmdArgs, Output, Inputs, LTO == LTOK_Thin);
++
++  Args.addAllArgs(CmdArgs, {options::OPT_T_Group, options::OPT_s,
++                            options::OPT_t, options::OPT_r});
++  addLinkerCompressDebugSectionsOption(TC, Args, CmdArgs);
++  AddLinkerInputs(TC, Inputs, Args, CmdArgs, JA);
++
++  if (!NoDefaultLibs) {
++    if (TC.ShouldLinkCXXStdlib(Args))
++      TC.AddCXXStdlibLibArgs(Args, CmdArgs);
++    if (!Args.hasArg(options::OPT_nolibc))
++      CmdArgs.push_back("-lc");
++    // The compiler's own runtime comes last: the C library may call it too.
++    AddRunTimeLibs(TC, D, CmdArgs, Args);
++  }
++  Args.ClaimAllArgs(options::OPT_stdlib_EQ);
++
++  const char *Exec = Args.MakeArgString(TC.GetLinkerPath());
++  C.addCommand(std::make_unique<Command>(JA, *this,
++                                         ResponseFileSupport::AtFileCurCP(),
++                                         Exec, CmdArgs, Inputs, Output));
++}
++
++Nocturne::Nocturne(const Driver &D, const llvm::Triple &Triple,
++                   const ArgList &Args)
++    : ToolChain(D, Triple, Args) {
++  getProgramPaths().push_back(getDriver().Dir);
++  SmallString<128> Lib(computeSysRoot());
++  llvm::sys::path::append(Lib, "Lib");
++  getFilePaths().push_back(std::string(Lib));
++}
++
++std::string Nocturne::computeSysRoot() const {
++  if (!getDriver().SysRoot.empty())
++    return getDriver().SysRoot;
++  return "C:\\Nocturne\\SDK";
++}
++
++Tool *Nocturne::buildLinker() const { return new tools::nocturne::Linker(*this); }
++
++void Nocturne::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
++                                         ArgStringList &CC1Args) const {
++  if (DriverArgs.hasArg(options::OPT_nostdinc))
++    return;
++
++  if (!DriverArgs.hasArg(options::OPT_nobuiltininc)) {
++    SmallString<128> P(getDriver().ResourceDir);
++    llvm::sys::path::append(P, "include");
++    addSystemInclude(DriverArgs, CC1Args, P);
++  }
++
++  if (DriverArgs.hasArg(options::OPT_nostdlibinc))
++    return;
++
++  SmallString<128> P(computeSysRoot());
++  llvm::sys::path::append(P, "Include");
++  addSystemInclude(DriverArgs, CC1Args, P);
++}
++
++void Nocturne::AddClangCXXStdlibIncludeArgs(const ArgList &DriverArgs,
++                                            ArgStringList &CC1Args) const {
++  if (DriverArgs.hasArg(options::OPT_nostdinc, options::OPT_nostdlibinc,
++                        options::OPT_nostdincxx))
++    return;
++
++  switch (GetCXXStdlibType(DriverArgs)) {
++  case ToolChain::CST_Libcxx: {
++    SmallString<128> P(computeSysRoot());
++    llvm::sys::path::append(P, "Include", "c++", "v1");
++    addSystemInclude(DriverArgs, CC1Args, P);
++    break;
++  }
++  default:
++    llvm_unreachable("invalid stdlib name");
++  }
++}
+diff --git a/clang/lib/Driver/ToolChains/Nocturne.h b/clang/lib/Driver/ToolChains/Nocturne.h
+new file mode 100644
+index 00000000..5ade0288
+--- /dev/null
++++ b/clang/lib/Driver/ToolChains/Nocturne.h
+@@ -0,0 +1,87 @@
++//===--- Nocturne.h - Nocturne OS ToolChain Implementation ------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_NOCTURNE_H
++#define LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_NOCTURNE_H
++
++#include "clang/Driver/Tool.h"
++#include "clang/Driver/ToolChain.h"
++
++namespace clang {
++namespace driver {
++namespace tools {
++namespace nocturne {
++
++// Nocturne programs are static ELF executables laid out by the SDK's linker
++// script: there are no shared libraries and no dynamic loader.
++class LLVM_LIBRARY_VISIBILITY Linker final : public Tool {
++public:
++  Linker(const ToolChain &TC) : Tool("nocturne::Linker", "ld.lld", TC) {}
++
++  bool hasIntegratedCPP() const override { return false; }
++  bool isLinkJob() const override { return true; }
++
++  void ConstructJob(Compilation &C, const JobAction &JA,
++                    const InputInfo &Output, const InputInfoList &Inputs,
++                    const llvm::opt::ArgList &TCArgs,
++                    const char *LinkingOutput) const override;
++};
++
++} // end namespace nocturne
++} // end namespace tools
++
++namespace toolchains {
++
++// The SDK (the sysroot, C:\Nocturne\SDK unless --sysroot names another) holds
++// the C and C++ library headers in Include and crt1.o, libc.a, libc++.a,
++// libunwind.a and user.ld in Lib.
++class LLVM_LIBRARY_VISIBILITY Nocturne final : public ToolChain {
++public:
++  Nocturne(const Driver &D, const llvm::Triple &Triple,
++           const llvm::opt::ArgList &Args);
++
++  bool HasNativeLLVMSupport() const override { return true; }
++  bool IsMathErrnoDefault() const override { return false; }
++  bool isPICDefault() const override { return false; }
++  bool isPIEDefault(const llvm::opt::ArgList &Args) const override {
++    return false;
++  }
++  bool isPICDefaultForced() const override { return false; }
++
++  RuntimeLibType GetDefaultRuntimeLibType() const override {
++    return ToolChain::RLT_CompilerRT;
++  }
++  CXXStdlibType GetDefaultCXXStdlibType() const override {
++    return ToolChain::CST_Libcxx;
++  }
++  // Only C++ exceptions unwind the stack, and -fexceptions gives the code they
++  // unwind through the tables it needs.
++  UnwindTableLevel
++  getDefaultUnwindTableLevel(const llvm::opt::ArgList &Args) const override {
++    return UnwindTableLevel::None;
++  }
++  const char *getDefaultLinker() const override { return "ld.lld"; }
++
++  std::string computeSysRoot() const override;
++
++  void
++  AddClangSystemIncludeArgs(const llvm::opt::ArgList &DriverArgs,
++                            llvm::opt::ArgStringList &CC1Args) const override;
++  void AddClangCXXStdlibIncludeArgs(
++      const llvm::opt::ArgList &DriverArgs,
++      llvm::opt::ArgStringList &CC1Args) const override;
++
++protected:
++  Tool *buildLinker() const override;
++};
++
++} // end namespace toolchains
++} // end namespace driver
++} // end namespace clang
++
++#endif // LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_NOCTURNE_H
+diff --git a/clang/lib/Lex/InitHeaderSearch.cpp b/clang/lib/Lex/InitHeaderSearch.cpp
+index e894086b..72e003f7 100644
+--- a/clang/lib/Lex/InitHeaderSearch.cpp
++++ b/clang/lib/Lex/InitHeaderSearch.cpp
+@@ -223,6 +223,7 @@ bool InitHeaderSearch::ShouldAddDefaultIncludePaths(
+   case llvm::Triple::LiteOS:
+   case llvm::Triple::Managarm:
+   case llvm::Triple::NetBSD:
++  case llvm::Triple::Nocturne:
+   case llvm::Triple::OpenBSD:
+   case llvm::Triple::PS4:
+   case llvm::Triple::PS5:
+diff --git a/clang/lib/Options/OptionUtils.cpp b/clang/lib/Options/OptionUtils.cpp
+index 77f89552..bb82d522 100644
+--- a/clang/lib/Options/OptionUtils.cpp
++++ b/clang/lib/Options/OptionUtils.cpp
+@@ -223,6 +223,11 @@ std::string clang::GetResourcesPath(StringRef BinaryPath) {
+       P = ConfiguredResourceDir;
+     else
+       llvm::sys::path::append(P, ConfiguredResourceDir);
++#if defined(__nocturne__)
++    // Nocturne has no links, so a folder's ".." is always its parent: the
++    // resource directory beside the binary's folder gets its own path.
++    llvm::sys::path::remove_dots(P, /*remove_dot_dot=*/true);
++#endif
+   } else {
+     // On Windows, libclang.dll is in bin/.
+     // On non-Windows, libclang.so/.dylib is in lib/.
+diff --git a/compiler-rt/cmake/Modules/BuiltinTests.cmake b/compiler-rt/cmake/Modules/BuiltinTests.cmake
+index 63c5f47c..8950c638 100644
+--- a/compiler-rt/cmake/Modules/BuiltinTests.cmake
++++ b/compiler-rt/cmake/Modules/BuiltinTests.cmake
+@@ -41,8 +41,6 @@ function(try_compile_only output)
+   endif()
+   set(SIMPLE_C ${CMAKE_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/src.c)
+   file(WRITE ${SIMPLE_C} "${ARG_SOURCE}\n")
+-  string(REGEX MATCHALL "<[A-Za-z0-9_]*>" substitutions
+-         ${CMAKE_C_COMPILE_OBJECT})
+ 
+   set(TRY_COMPILE_FLAGS "${ARG_FLAGS}")
+   if(CMAKE_C_COMPILER_ID MATCHES Clang AND CMAKE_C_COMPILER_TARGET)
+@@ -50,36 +48,28 @@ function(try_compile_only output)
+   endif()
+ 
+   string(REPLACE ";" " " extra_flags "${TRY_COMPILE_FLAGS}")
++  separate_arguments(flags NATIVE_COMMAND "${CMAKE_C_FLAGS} ${extra_flags}")
+ 
+-  set(test_compile_command "${CMAKE_C_COMPILE_OBJECT}")
+-  foreach(substitution ${substitutions})
+-    if(substitution STREQUAL "<CMAKE_C_COMPILER>")
+-      string(REPLACE "<CMAKE_C_COMPILER>"
+-             "${CMAKE_C_COMPILER}" test_compile_command ${test_compile_command})
+-    elseif(substitution STREQUAL "<OBJECT>")
+-      string(REPLACE "<OBJECT>"
+-             "${CMAKE_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/test.o"
+-             test_compile_command ${test_compile_command})
+-    elseif(substitution STREQUAL "<SOURCE>")
+-      string(REPLACE "<SOURCE>" "${SIMPLE_C}" test_compile_command
+-             ${test_compile_command})
+-    elseif(substitution STREQUAL "<FLAGS>")
+-      string(REPLACE "<FLAGS>" "${CMAKE_C_FLAGS} ${extra_flags}"
+-             test_compile_command ${test_compile_command})
+-    else()
+-      string(REPLACE "${substitution}" "" test_compile_command
+-             ${test_compile_command})
++  # The rule is split into its arguments before the placeholders are replaced,
++  # so a path with spaces in it (the compiler's, the build directory's) stays
++  # one argument. Splitting also removes the rule's quotes, which the compiler
++  # does not expect (see discussion on D62063).
++  separate_arguments(rule NATIVE_COMMAND "${CMAKE_C_COMPILE_OBJECT}")
++  set(test_compile_command)
++  foreach(arg ${rule})
++    if(arg STREQUAL "<FLAGS>")
++      list(APPEND test_compile_command ${flags})
++      continue()
++    endif()
++    string(REPLACE "<CMAKE_C_COMPILER>" "${CMAKE_C_COMPILER}" arg "${arg}")
++    string(REPLACE "<OBJECT>" "${CMAKE_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/test.o" arg "${arg}")
++    string(REPLACE "<SOURCE>" "${SIMPLE_C}" arg "${arg}")
++    string(REGEX REPLACE "<[A-Za-z0-9_]*>" "" arg "${arg}")
++    if(NOT arg STREQUAL "")
++      list(APPEND test_compile_command "${arg}")
+     endif()
+   endforeach()
+ 
+-  # Strip quotes from the compile command, as the compiler is not expecting
+-  # quoted arguments (see discussion on D62063 for when this can come up). If
+-  # the quotes were there for arguments with spaces in them, the quotes were
+-  # not going to help since the string gets split on spaces below.
+-  string(REPLACE "\"" "" test_compile_command "${test_compile_command}")
+-
+-  string(REPLACE " " ";" test_compile_command "${test_compile_command}")
+-
+   execute_process(
+     COMMAND ${test_compile_command}
+     RESULT_VARIABLE result
+diff --git a/compiler-rt/lib/builtins/CMakeLists.txt b/compiler-rt/lib/builtins/CMakeLists.txt
+index e128fea6..7b30b72c 100644
+--- a/compiler-rt/lib/builtins/CMakeLists.txt
++++ b/compiler-rt/lib/builtins/CMakeLists.txt
+@@ -274,7 +274,9 @@ option(COMPILER_RT_EXCLUDE_LIBC_PROVIDED_ARM_AEABI_BUILTINS
+   "Skip the standard C library provided arm aeabi builtins from compiler-rt)"
+   Off)
+ 
+-if(NOT FUCHSIA AND NOT COMPILER_RT_BAREMETAL_BUILD AND NOT COMPILER_RT_GPU_BUILD)
++# Nocturne has native thread-local storage, no executable stacks and no caller
++# of the old __eprintf.
++if(NOT FUCHSIA AND NOT NOCTURNE AND NOT COMPILER_RT_BAREMETAL_BUILD AND NOT COMPILER_RT_GPU_BUILD)
+   set(GENERIC_SOURCES
+     ${GENERIC_SOURCES}
+     emutls.c
+@@ -310,7 +312,8 @@ if(APPLE)
+   )
+ endif()
+ 
+-if (HAVE_UNWIND_H)
++# Nothing on Nocturne unwinds the stack, so it has no use for a personality.
++if (HAVE_UNWIND_H AND NOT NOCTURNE)
+   set(GENERIC_SOURCES
+     ${GENERIC_SOURCES}
+     gcc_personality_v0.c
+diff --git a/libcxx/include/CMakeLists.txt b/libcxx/include/CMakeLists.txt
+index b40f5861..c67d77d7 100644
+--- a/libcxx/include/CMakeLists.txt
++++ b/libcxx/include/CMakeLists.txt
+@@ -549,6 +549,7 @@ set(files
+   __locale_dir/support/llvm_libc.h
+   __locale_dir/support/netbsd.h
+   __locale_dir/support/newlib.h
++  __locale_dir/support/nocturne.h
+   __locale_dir/support/no_locale/characters.h
+   __locale_dir/support/no_locale/conversions.h
+   __locale_dir/support/no_locale/formatting.h
+diff --git a/libcxx/include/__atomic/atomic_waitable_traits.h b/libcxx/include/__atomic/atomic_waitable_traits.h
+index ed26a60d..253e0699 100644
+--- a/libcxx/include/__atomic/atomic_waitable_traits.h
++++ b/libcxx/include/__atomic/atomic_waitable_traits.h
+@@ -51,7 +51,7 @@ concept __atomic_waitable = requires(const _Tp __t, memory_order __order) {
+ 
+ #  ifdef __linux__
+ #    define _LIBCPP_NATIVE_PLATFORM_WAIT_SIZES(_APPLY) _APPLY(4)
+-#  elif defined(__APPLE__)
++#  elif defined(__APPLE__) || defined(__nocturne__)
+ #    define _LIBCPP_NATIVE_PLATFORM_WAIT_SIZES(_APPLY)                                                                 \
+       _APPLY(4)                                                                                                        \
+       _APPLY(8)
+diff --git a/libcxx/include/__config b/libcxx/include/__config
+index 3b0dfb18..8a8d1708 100644
+--- a/libcxx/include/__config
++++ b/libcxx/include/__config
+@@ -57,6 +57,14 @@
+ #    define _LIBCPP_HAS_OPEN_WITH_WCHAR 0
+ #  endif // defined(_WIN32)
+ 
++// Paths written with drive letters: '\' and '/' both separate names, '\' is
++// preferred, and a path may begin with a drive as its root name ("C:").
++#  if defined(_LIBCPP_WIN32API) || defined(__nocturne__)
++#    define _LIBCPP_HAS_DRIVE_LETTER_PATHS 1
++#  else
++#    define _LIBCPP_HAS_DRIVE_LETTER_PATHS 0
++#  endif
++
+ #  if defined(_AIX) && !defined(__64BIT__)
+ // The size of wchar is 2 byte on 32-bit mode on AIX.
+ #    define _LIBCPP_SHORT_WCHAR 1
+@@ -93,6 +101,12 @@
+ //      Use rand_s(), for use on Windows.
+ //      When this option is used, the token passed to `std::random_device`'s
+ //      constructor *must* be "/dev/urandom" -- anything else is an error.
++//
++// _LIBCPP_USING_NOCTURNE_RANDOM
++//      Use Nocturne's n_random() system call, which fills a buffer from the
++//      kernel's entropy pool; it fails only for memory the caller cannot write.
++//      When this option is used, the token passed to `std::random_device`'s
++//      constructor *must* be "/dev/urandom" -- anything else is an error.
+ #  if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) ||                     \
+       defined(__DragonFly__)
+ #    define _LIBCPP_USING_ARC4_RANDOM
+@@ -100,6 +114,8 @@
+ #    define _LIBCPP_USING_GETENTROPY
+ #  elif defined(__Fuchsia__)
+ #    define _LIBCPP_USING_FUCHSIA_CPRNG
++#  elif defined(__nocturne__)
++#    define _LIBCPP_USING_NOCTURNE_RANDOM
+ #  elif defined(_LIBCPP_WIN32API)
+ #    define _LIBCPP_USING_WIN32_RANDOM
+ #  else
+@@ -227,6 +243,9 @@ typedef __char32_t char32_t;
+ // TODO(44575): Switch to C11 thread API when possible.
+ #      undef _LIBCPP_HAS_THREAD_API_PTHREAD
+ #      define _LIBCPP_HAS_THREAD_API_PTHREAD 1
++#    elif defined(__nocturne__)
++#      undef _LIBCPP_HAS_THREAD_API_C11
++#      define _LIBCPP_HAS_THREAD_API_C11 1
+ #    elif defined(_LIBCPP_WIN32API)
+ #      undef _LIBCPP_HAS_THREAD_API_WIN32
+ #      define _LIBCPP_HAS_THREAD_API_WIN32 1
+@@ -265,7 +284,9 @@ typedef __char32_t char32_t;
+ 
+ // The glibc and Bionic implementation of pthreads implements
+ // pthread_mutex_destroy as nop for regular mutexes. Additionally, Win32
+-// mutexes have no destroy mechanism.
++// mutexes have no destroy mechanism, and neither have Nocturne's C11 mutexes
++// and condition variables: they hold no resources, only words that threads
++// wait on by address.
+ //
+ // This optimization can't be performed on Apple platforms, where
+ // pthread_mutex_destroy can allow the kernel to release resources.
+@@ -275,7 +296,7 @@ typedef __char32_t char32_t;
+ //               respective stakeholders.
+ // clang-format off
+ #  if (_LIBCPP_HAS_THREAD_API_PTHREAD && defined(__GLIBC__)) ||                                                        \
+-      (_LIBCPP_HAS_THREAD_API_C11 && defined(__Fuchsia__)) ||                                                          \
++      (_LIBCPP_HAS_THREAD_API_C11 && (defined(__Fuchsia__) || defined(__nocturne__))) ||                               \
+        _LIBCPP_HAS_THREAD_API_WIN32
+ // clang-format on
+ #    define _LIBCPP_HAS_TRIVIAL_MUTEX_DESTRUCTION 1
+@@ -291,14 +312,14 @@ typedef __char32_t char32_t;
+ //
+ // TODO(EricWF): This is potentially true for some pthread implementations
+ // as well.
+-#  if (_LIBCPP_HAS_THREAD_API_C11 && defined(__Fuchsia__)) || _LIBCPP_HAS_THREAD_API_WIN32
++#  if (_LIBCPP_HAS_THREAD_API_C11 && (defined(__Fuchsia__) || defined(__nocturne__))) || _LIBCPP_HAS_THREAD_API_WIN32
+ #    define _LIBCPP_HAS_TRIVIAL_CONDVAR_DESTRUCTION 1
+ #  else
+ #    define _LIBCPP_HAS_TRIVIAL_CONDVAR_DESTRUCTION 0
+ #  endif
+ 
+ #  if defined(__BIONIC__) || defined(__NuttX__) || defined(__Fuchsia__) || defined(__wasi__) ||                        \
+-      _LIBCPP_HAS_MUSL_LIBC || defined(__OpenBSD__) || _LIBCPP_LIBC_LLVM_LIBC
++      _LIBCPP_HAS_MUSL_LIBC || defined(__OpenBSD__) || _LIBCPP_LIBC_LLVM_LIBC || defined(__nocturne__)
+ #    define _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE
+ #  endif
+ 
+diff --git a/libcxx/include/__filesystem/path.h b/libcxx/include/__filesystem/path.h
+index a63c4ee6..f7290f19 100644
+--- a/libcxx/include/__filesystem/path.h
++++ b/libcxx/include/__filesystem/path.h
+@@ -80,7 +80,7 @@ struct __can_convert_char<char32_t> {
+ 
+ template <class _ECharT, __enable_if_t<__can_convert_char<_ECharT>::value, int> = 0>
+ _LIBCPP_HIDE_FROM_ABI bool __is_separator(_ECharT __e) {
+-#  if defined(_LIBCPP_WIN32API)
++#  if _LIBCPP_HAS_DRIVE_LETTER_PATHS
+   return __e == _ECharT('/') || __e == _ECharT('\\');
+ #  else
+   return __e == _ECharT('/');
+@@ -385,6 +385,9 @@ public:
+ #  if defined(_LIBCPP_WIN32API)
+   typedef wchar_t value_type;
+   static constexpr value_type preferred_separator = L'\\';
++#  elif _LIBCPP_HAS_DRIVE_LETTER_PATHS
++  typedef char value_type;
++  static constexpr value_type preferred_separator = '\\';
+ #  else
+   typedef char value_type;
+   static constexpr value_type preferred_separator = '/';
+@@ -468,11 +471,11 @@ public:
+ 
+ public:
+   // appends
+-#  if defined(_LIBCPP_WIN32API)
++#  if _LIBCPP_HAS_DRIVE_LETTER_PATHS
+   _LIBCPP_HIDE_FROM_ABI path& operator/=(const path& __p) {
+     auto __p_root_name      = __p.__root_name();
+     auto __p_root_name_size = __p_root_name.size();
+-    if (__p.is_absolute() || (!__p_root_name.empty() && __p_root_name != __string_view(root_name().__pn_))) {
++    if (__p.is_absolute() || (!__p_root_name.empty() && !__same_root_name(__p_root_name, __root_name()))) {
+       __pn_ = __p.__pn_;
+       return *this;
+     }
+@@ -602,8 +605,8 @@ public:
+   _LIBCPP_HIDE_FROM_ABI void clear() noexcept { __pn_.clear(); }
+ 
+   _LIBCPP_HIDE_FROM_ABI path& make_preferred() _LIBCPP_LIFETIMEBOUND {
+-#  if defined(_LIBCPP_WIN32API)
+-    std::replace(__pn_.begin(), __pn_.end(), L'/', L'\\');
++#  if _LIBCPP_HAS_DRIVE_LETTER_PATHS
++    std::replace(__pn_.begin(), __pn_.end(), value_type('/'), preferred_separator);
+ #  endif
+     return *this;
+   }
+@@ -753,20 +756,44 @@ public:
+ #    endif // _LIBCPP_HAS_LOCALIZATION
+ 
+   // generic format observers
++#    if _LIBCPP_HAS_DRIVE_LETTER_PATHS
++  // The generic format separates names with '/' only.
++  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI std::string generic_string() const {
++    std::string __s = __pn_;
++    std::replace(__s.begin(), __s.end(), '\\', '/');
++    return __s;
++  }
++#      if _LIBCPP_HAS_CHAR8_T
++  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI std::u8string generic_u8string() const {
++    std::u8string __s(__pn_.begin(), __pn_.end());
++    std::replace(__s.begin(), __s.end(), u8'\\', u8'/');
++    return __s;
++  }
++#      else
++  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI std::string generic_u8string() const { return generic_string(); }
++#      endif
++#    else
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI std::string generic_string() const { return __pn_; }
+-#    if _LIBCPP_HAS_CHAR8_T
++#      if _LIBCPP_HAS_CHAR8_T
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI std::u8string generic_u8string() const {
+     return std::u8string(__pn_.begin(), __pn_.end());
+   }
+-#    else
++#      else
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI std::string generic_u8string() const { return __pn_; }
+-#    endif
++#      endif
++#    endif // _LIBCPP_HAS_DRIVE_LETTER_PATHS
+ 
+ #    if _LIBCPP_HAS_LOCALIZATION
+   template <class _ECharT, class _Traits = char_traits<_ECharT>, class _Allocator = allocator<_ECharT> >
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI basic_string<_ECharT, _Traits, _Allocator>
+   generic_string(const _Allocator& __a = _Allocator()) const {
++#      if _LIBCPP_HAS_DRIVE_LETTER_PATHS
++    basic_string<_ECharT, _Traits, _Allocator> __s = string<_ECharT, _Traits, _Allocator>(__a);
++    std::replace(__s.begin(), __s.end(), static_cast<_ECharT>('\\'), static_cast<_ECharT>('/'));
++    return __s;
++#      else
+     return string<_ECharT, _Traits, _Allocator>(__a);
++#      endif
+   }
+ 
+ #      if _LIBCPP_HAS_WIDE_CHARACTERS
+@@ -788,6 +815,17 @@ private:
+   __string_view __stem() const;
+   __string_view __extension() const;
+ 
++#  if _LIBCPP_HAS_DRIVE_LETTER_PATHS
++  // Nocturne's drive names compare without regard to case.
++  _LIBCPP_HIDE_FROM_ABI static bool __same_root_name(__string_view __a, __string_view __b) {
++#    if defined(__nocturne__)
++    return __a.size() == __b.size() && (__a.empty() || (__a[0] | 0x20) == (__b[0] | 0x20));
++#    else
++    return __a == __b;
++#    endif
++  }
++#  endif
++
+ public:
+   // compare
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI int compare(const path& __p) const noexcept { return __compare(__p.__pn_); }
+@@ -799,7 +837,7 @@ public:
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI path root_name() const { return string_type(__root_name()); }
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI path root_directory() const { return string_type(__root_directory()); }
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI path root_path() const {
+-#  if defined(_LIBCPP_WIN32API)
++#  if _LIBCPP_HAS_DRIVE_LETTER_PATHS
+     return string_type(__root_path_raw());
+ #  else
+     return root_name().append(string_type(__root_directory()));
+diff --git a/libcxx/include/__locale_dir/locale_base_api.h b/libcxx/include/__locale_dir/locale_base_api.h
+index f973d95e..2478e670 100644
+--- a/libcxx/include/__locale_dir/locale_base_api.h
++++ b/libcxx/include/__locale_dir/locale_base_api.h
+@@ -120,6 +120,8 @@
+ #    include <__locale_dir/support/windows.h>
+ #  elif defined(__Fuchsia__)
+ #    include <__locale_dir/support/fuchsia.h>
++#  elif defined(__nocturne__)
++#    include <__locale_dir/support/nocturne.h>
+ #  elif _LIBCPP_LIBC_LLVM_LIBC
+ #    include <__locale_dir/support/llvm_libc.h>
+ #  elif defined(__linux__)
+diff --git a/libcxx/include/__locale_dir/support/nocturne.h b/libcxx/include/__locale_dir/support/nocturne.h
+new file mode 100644
+index 00000000..8d7da118
+--- /dev/null
++++ b/libcxx/include/__locale_dir/support/nocturne.h
+@@ -0,0 +1,217 @@
++//===-----------------------------------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef _LIBCPP___LOCALE_DIR_SUPPORT_NOCTURNE_H
++#define _LIBCPP___LOCALE_DIR_SUPPORT_NOCTURNE_H
++
++#include <__config>
++#include <__cstddef/size_t.h>
++#include <__std_mbstate_t.h>
++#include <__utility/forward.h>
++#include <climits>
++#include <clocale>
++#include <cstdio>
++#include <cstdlib>
++#if _LIBCPP_HAS_WIDE_CHARACTERS
++#  include <cwchar>
++#endif
++
++#if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
++#  pragma GCC system_header
++#endif
++
++// Nocturne has one locale, "C" (<locale.h>): its multibyte characters are
++// UTF-8, and the C library formats and parses numbers, money and times as ISO C
++// defines them for "C". Every __locale_t stands for that locale, so the
++// functions below are the plain ISO C ones, or are built from them.
++
++_LIBCPP_BEGIN_NAMESPACE_STD
++namespace __locale {
++
++//
++// Locale management
++//
++#define _LIBCPP_COLLATE_MASK (1 << LC_COLLATE)
++#define _LIBCPP_CTYPE_MASK (1 << LC_CTYPE)
++#define _LIBCPP_MONETARY_MASK (1 << LC_MONETARY)
++#define _LIBCPP_NUMERIC_MASK (1 << LC_NUMERIC)
++#define _LIBCPP_TIME_MASK (1 << LC_TIME)
++#define _LIBCPP_MESSAGES_MASK (1 << (LC_TIME + 1))
++#define _LIBCPP_ALL_MASK                                                                                               \
++  (_LIBCPP_COLLATE_MASK | _LIBCPP_CTYPE_MASK | _LIBCPP_MONETARY_MASK | _LIBCPP_NUMERIC_MASK | _LIBCPP_TIME_MASK |      \
++   _LIBCPP_MESSAGES_MASK)
++#define _LIBCPP_LC_ALL LC_ALL
++
++struct __nocturne_locale {};
++using __locale_t _LIBCPP_NODEBUG = const __nocturne_locale*;
++
++#if defined(_LIBCPP_BUILDING_LIBRARY)
++using __lconv_t _LIBCPP_NODEBUG = std::lconv;
++
++// The names setlocale accepts are names of the one locale; asking for it
++// changes nothing.
++inline _LIBCPP_HIDE_FROM_ABI __locale_t __newlocale(int, const char* __name, __locale_t) {
++  static const __nocturne_locale __c_locale;
++  return __name && std::setlocale(LC_ALL, __name) ? &__c_locale : nullptr;
++}
++
++inline _LIBCPP_HIDE_FROM_ABI void __freelocale(__locale_t) {}
++
++inline _LIBCPP_HIDE_FROM_ABI char* __setlocale(int __category, char const* __locale) {
++  return std::setlocale(__category, __locale);
++}
++
++inline _LIBCPP_HIDE_FROM_ABI __lconv_t* __localeconv(__locale_t&) { return std::localeconv(); }
++
++inline _LIBCPP_HIDE_FROM_ABI const char* __get_locale_encoding(__locale_t) { return "UTF-8"; }
++
++//
++// Conversions
++//
++inline _LIBCPP_HIDE_FROM_ABI decltype(MB_CUR_MAX) __mb_len_max(__locale_t) { return MB_CUR_MAX; }
++
++#  if _LIBCPP_HAS_WIDE_CHARACTERS
++inline _LIBCPP_HIDE_FROM_ABI wint_t __btowc(int __c, __locale_t) { return std::btowc(__c); }
++
++inline _LIBCPP_HIDE_FROM_ABI int __wctob(wint_t __c, __locale_t) { return std::wctob(__c); }
++
++inline _LIBCPP_HIDE_FROM_ABI size_t __wcrtomb(char* __s, wchar_t __wc, mbstate_t* __ps, __locale_t) {
++  return std::wcrtomb(__s, __wc, __ps);
++}
++
++inline _LIBCPP_HIDE_FROM_ABI size_t
++__mbrtowc(wchar_t* __pwc, const char* __s, size_t __n, mbstate_t* __ps, __locale_t) {
++  return std::mbrtowc(__pwc, __s, __n, __ps);
++}
++
++inline _LIBCPP_HIDE_FROM_ABI int __mbtowc(wchar_t* __pwc, const char* __pmb, size_t __max, __locale_t) {
++  return std::mbtowc(__pwc, __pmb, __max);
++}
++
++inline _LIBCPP_HIDE_FROM_ABI size_t __mbrlen(const char* __s, size_t __n, mbstate_t* __ps, __locale_t) {
++  return std::mbrlen(__s, __n, __ps);
++}
++
++inline _LIBCPP_HIDE_FROM_ABI size_t
++__mbsrtowcs(wchar_t* __dest, const char** __src, size_t __len, mbstate_t* __ps, __locale_t) {
++  return std::mbsrtowcs(__dest, __src, __len, __ps);
++}
++
++// mbsrtowcs that also stops after __nms bytes. A character cut off by that
++// limit stays in *__ps. On an encoding error *__src points at the bad
++// character, so that codecvt can count what came before it.
++inline _LIBCPP_HIDE_FROM_ABI size_t
++__mbsnrtowcs(wchar_t* __dest, const char** __src, size_t __nms, size_t __len, mbstate_t* __ps, __locale_t) {
++  const char* __s = *__src;
++  size_t __count  = 0;
++  for (; !__dest || __count < __len; ++__count) {
++    wchar_t __wc;
++    size_t __n = std::mbrtowc(&__wc, __s, __nms, __ps);
++    if (__n == size_t(-1)) {
++      if (__dest)
++        *__src = __s;
++      return __n;
++    }
++    if (__n == size_t(-2)) { // all of the __nms bytes are in *__ps
++      __s += __nms;
++      break;
++    }
++    if (__dest)
++      __dest[__count] = __wc;
++    if (__n == 0) {
++      if (__dest)
++        *__src = nullptr;
++      return __count;
++    }
++    __s += __n;
++    __nms -= __n;
++  }
++  if (__dest)
++    *__src = __s;
++  return __count;
++}
++
++// wcsrtombs that also stops after __nwc wide characters. It never writes part
++// of a character: UTF-8 has no shift states, so one that does not fit leaves
++// *__ps as it was.
++inline _LIBCPP_HIDE_FROM_ABI size_t
++__wcsnrtombs(char* __dest, const wchar_t** __src, size_t __nwc, size_t __len, mbstate_t* __ps, __locale_t) {
++  const wchar_t* __s = *__src;
++  size_t __count     = 0;
++  for (; __nwc; ++__s, --__nwc) {
++    char __buf[MB_LEN_MAX];
++    size_t __n = std::wcrtomb(__buf, *__s, __ps);
++    if (__n == size_t(-1)) {
++      if (__dest)
++        *__src = __s;
++      return __n;
++    }
++    if (__dest) {
++      if (__n > __len - __count)
++        break;
++      for (size_t __i = 0; __i < __n; ++__i)
++        __dest[__count + __i] = __buf[__i];
++    }
++    if (*__s == L'\0') {
++      if (__dest)
++        *__src = nullptr;
++      return __count;
++    }
++    __count += __n;
++  }
++  if (__dest)
++    *__src = __s;
++  return __count;
++}
++#  endif // _LIBCPP_HAS_WIDE_CHARACTERS
++#endif   // _LIBCPP_BUILDING_LIBRARY
++
++//
++// Formatting: the C library's printf family has no asprintf, so __asprintf
++// measures the result first.
++//
++_LIBCPP_DIAGNOSTIC_PUSH
++_LIBCPP_CLANG_DIAGNOSTIC_IGNORED("-Wgcc-compat")
++_LIBCPP_GCC_DIAGNOSTIC_IGNORED("-Wformat-nonliteral") // GCC doesn't support [[gnu::format]] on variadic templates
++#ifdef _LIBCPP_COMPILER_CLANG_BASED
++#  define _LIBCPP_VARIADIC_ATTRIBUTE_FORMAT(...) _LIBCPP_ATTRIBUTE_FORMAT(__VA_ARGS__)
++#else
++#  define _LIBCPP_VARIADIC_ATTRIBUTE_FORMAT(...) /* nothing */
++#endif
++
++template <class... _Args>
++_LIBCPP_HIDE_FROM_ABI _LIBCPP_VARIADIC_ATTRIBUTE_FORMAT(__printf__, 4, 5) int __snprintf(
++    char* __s, size_t __n, __locale_t, const char* __format, _Args&&... __args) {
++  return std::snprintf(__s, __n, __format, std::forward<_Args>(__args)...);
++}
++
++template <class... _Args>
++_LIBCPP_HIDE_FROM_ABI _LIBCPP_VARIADIC_ATTRIBUTE_FORMAT(__printf__, 3, 4) int __asprintf(
++    char** __s, __locale_t, const char* __format, _Args&&... __args) {
++  *__s     = nullptr;
++  int __len = std::snprintf(nullptr, 0, __format, __args...);
++  if (__len < 0)
++    return __len;
++  char* __buf = static_cast<char*>(std::malloc(static_cast<size_t>(__len) + 1));
++  if (!__buf)
++    return -1;
++  std::snprintf(__buf, static_cast<size_t>(__len) + 1, __format, __args...);
++  *__s = __buf;
++  return __len;
++}
++
++_LIBCPP_DIAGNOSTIC_POP
++#undef _LIBCPP_VARIADIC_ATTRIBUTE_FORMAT
++
++} // namespace __locale
++_LIBCPP_END_NAMESPACE_STD
++
++#include <__locale_dir/support/no_locale/characters.h>
++#include <__locale_dir/support/no_locale/strtonum.h>
++
++#endif // _LIBCPP___LOCALE_DIR_SUPPORT_NOCTURNE_H
+diff --git a/libcxx/include/fstream b/libcxx/include/fstream
+index 92c79e81..299d9356 100644
+--- a/libcxx/include/fstream
++++ b/libcxx/include/fstream
+@@ -240,6 +240,8 @@ public:
+   using native_handle_type = void*; // HANDLE
+ #      elif __has_include(<unistd.h>)
+   using native_handle_type = int; // POSIX file descriptor
++#      elif defined(__nocturne__)
++  using native_handle_type = int; // n_handle
+ #      else
+ #        error "Provide a native file handle!"
+ #      endif
+@@ -274,7 +276,7 @@ public:
+     _LIBCPP_ASSERT_UNCATEGORIZED(this->is_open(), "File must be opened");
+ #      if defined(_LIBCPP_WIN32API)
+     return std::__filebuf_windows_native_handle(__file_);
+-#      elif __has_include(<unistd.h>)
++#      elif __has_include(<unistd.h>) || defined(__nocturne__)
+     return fileno(__file_);
+ #      else
+ #        error "Provide a way to determine the file native handle!"
+@@ -1063,7 +1065,8 @@ template <class _CharT, class _Traits>
+ int basic_filebuf<_CharT, _Traits>::__fseek(FILE* __file, pos_type __offset, int __whence) {
+ #    if defined(_LIBCPP_MSVCRT_LIKE)
+   return _fseeki64(__file, __offset, __whence);
+-#    elif _LIBCPP_LIBC_NEWLIB
++#    elif _LIBCPP_LIBC_NEWLIB || defined(__nocturne__)
++  // On Nocturne long has 64 bits, so ISO C's fseek and ftell reach every offset.
+   return fseek(__file, __offset, __whence);
+ #    else
+   return ::fseeko(__file, __offset, __whence);
+@@ -1074,7 +1077,7 @@ template <class _CharT, class _Traits>
+ typename basic_filebuf<_CharT, _Traits>::pos_type basic_filebuf<_CharT, _Traits>::__ftell(FILE* __file) {
+ #    if defined(_LIBCPP_MSVCRT_LIKE)
+   return _ftelli64(__file);
+-#    elif _LIBCPP_LIBC_NEWLIB
++#    elif _LIBCPP_LIBC_NEWLIB || defined(__nocturne__)
+   return ftell(__file);
+ #    else
+   return ftello(__file);
+diff --git a/libcxx/include/module.modulemap.in b/libcxx/include/module.modulemap.in
+index 39b4e0bb..8b80cb78 100644
+--- a/libcxx/include/module.modulemap.in
++++ b/libcxx/include/module.modulemap.in
+@@ -1614,6 +1614,7 @@ module std {
+       textual header "__locale_dir/support/no_locale/conversions.h"
+       textual header "__locale_dir/support/no_locale/formatting.h"
+       textual header "__locale_dir/support/newlib.h"
++      textual header "__locale_dir/support/nocturne.h"
+       textual header "__locale_dir/support/no_locale/characters.h"
+       textual header "__locale_dir/support/no_locale/strtonum.h"
+       textual header "__locale_dir/support/openbsd.h"
+diff --git a/libcxx/src/atomic.cpp b/libcxx/src/atomic.cpp
+index 15e06921..0d9a2cfc 100644
+--- a/libcxx/src/atomic.cpp
++++ b/libcxx/src/atomic.cpp
+@@ -73,6 +73,10 @@
+ 
+ #  include <zircon/syscalls.h>
+ 
++#elif defined(__nocturne__)
++
++#  include <nocturne.h>
++
+ #else // <- Add other operating systems here
+ 
+ // Baseline needs no new headers
+@@ -360,6 +364,36 @@ static void __platform_wake_by_address(void const* __ptr, bool __notify_one) {
+   _zx_futex_wake(__get_zx_futex<_Size>(__ptr), __notify_one ? 1 : UINT32_MAX);
+ }
+ 
++#elif defined(__nocturne__)
++
++// Nocturne's kernel waits on 4- and 8-byte words. Timeouts are whole
++// milliseconds, rounded up; UINT32_MAX would mean no timeout at all.
++template <std::size_t _Size, class MaybeTimeout>
++static void __platform_wait_on_address(void const* __ptr, void const* __val, MaybeTimeout maybe_timeout_ns) {
++  static_assert(_Size == 4 || _Size == 8, "Can only wait on 4- or 8-byte values");
++  unsigned __timeout_ms = UINT32_MAX;
++  if constexpr (!is_same_v<MaybeTimeout, NoTimeout>) {
++    uint64_t __ms = maybe_timeout_ns / 1'000'000 + (maybe_timeout_ns % 1'000'000 != 0);
++    __timeout_ms  = static_cast<unsigned>(__ms < UINT32_MAX ? __ms : UINT32_MAX - 1);
++  }
++  if constexpr (_Size == 4) {
++    uint32_t __expected;
++    std::memcpy(&__expected, __val, _Size);
++    wait_on_address(static_cast<volatile uint32_t*>(const_cast<void*>(__ptr)), __expected, __timeout_ms);
++  } else {
++    uint64_t __expected;
++    std::memcpy(&__expected, __val, _Size);
++    wait_on_address64(static_cast<volatile uint64_t*>(const_cast<void*>(__ptr)), __expected, __timeout_ms);
++  }
++}
++
++template <std::size_t _Size>
++static void __platform_wake_by_address(void const* __ptr, bool __notify_one) {
++  static_assert(_Size == 4 || _Size == 8, "Can only wake up on 4- or 8-byte values");
++  // A count of 0 wakes every waiter.
++  wake_address(static_cast<volatile uint32_t*>(const_cast<void*>(__ptr)), __notify_one ? 1 : 0);
++}
++
+ #else // <- Add other operating systems here
+ 
+ // Baseline is just a timed backoff
+diff --git a/libcxx/src/chrono.cpp b/libcxx/src/chrono.cpp
+index af5fe7c0..277c8ea3 100644
+--- a/libcxx/src/chrono.cpp
++++ b/libcxx/src/chrono.cpp
+@@ -30,7 +30,8 @@
+ #  include <sys/time.h> // for gettimeofday and timeval
+ #endif
+ 
+-#if _LIBCPP_LIBC_LLVM_LIBC
++// Nocturne's C library has ISO C's timespec_get with TIME_UTC and TIME_MONOTONIC.
++#if _LIBCPP_LIBC_LLVM_LIBC || defined(__nocturne__)
+ #  define _LIBCPP_HAS_TIMESPEC_GET
+ #endif
+ 
+diff --git a/libcxx/src/filesystem/directory_entry.cpp b/libcxx/src/filesystem/directory_entry.cpp
+index 0c7f5955..26ebd6ec 100644
+--- a/libcxx/src/filesystem/directory_entry.cpp
++++ b/libcxx/src/filesystem/directory_entry.cpp
+@@ -18,6 +18,31 @@
+ _LIBCPP_BEGIN_NAMESPACE_FILESYSTEM
+ _LIBCPP_BEGIN_EXPLICIT_ABI_ANNOTATIONS
+ 
++#if defined(__nocturne__)
++error_code directory_entry::__do_refresh() noexcept {
++  __data_.__reset();
++  error_code failure_ec;
++
++  n_entry e;
++  file_status st = detail::entry_status(__p_, e, &failure_ec);
++  if (!status_known(st)) {
++    __data_.__reset();
++    return failure_ec;
++  }
++
++  // No entry is a link, so each has one name.
++  __data_.__cache_type_    = directory_entry::_RefreshNonSymlink;
++  __data_.__type_          = st.type();
++  __data_.__non_sym_perms_ = st.permissions();
++  if (filesystem::exists(st)) {
++    if (filesystem::is_regular_file(st))
++      __data_.__size_ = detail::get_file_size(e);
++    __data_.__nlink_      = 1;
++    __data_.__write_time_ = detail::get_write_time(e);
++  }
++  return failure_ec;
++}
++#else
+ error_code directory_entry::__do_refresh() noexcept {
+   __data_.__reset();
+   error_code failure_ec;
+@@ -70,6 +95,7 @@ error_code directory_entry::__do_refresh() noexcept {
+ 
+   return failure_ec;
+ }
++#endif // __nocturne__
+ 
+ _LIBCPP_END_EXPLICIT_ABI_ANNOTATIONS
+ _LIBCPP_END_NAMESPACE_FILESYSTEM
+diff --git a/libcxx/src/filesystem/directory_iterator.cpp b/libcxx/src/filesystem/directory_iterator.cpp
+index 5d682aee..66ceeaac 100644
+--- a/libcxx/src/filesystem/directory_iterator.cpp
++++ b/libcxx/src/filesystem/directory_iterator.cpp
+@@ -21,6 +21,9 @@
+ #  define WIN32_LEAN_AND_MEAN
+ #  define NOMINMAX
+ #  include <windows.h>
++#elif defined(__nocturne__)
++#  include <nocturne.h>
++#  include <stdlib.h> // free
+ #else
+ #  include <dirent.h> // for DIR & friends
+ #endif
+@@ -101,6 +104,68 @@ private:
+   HANDLE __stream_{INVALID_HANDLE_VALUE};
+   WIN32_FIND_DATAW __data_;
+ 
++public:
++  path __root_;
++  directory_entry __entry_;
++};
++#elif defined(__nocturne__)
++// The folder's entries are taken all at once when the stream opens, each with
++// its kind, size and time, so the folder changing meanwhile (remove_all
++// removing them, say) does not disturb the iteration.
++class __dir_stream {
++public:
++  __dir_stream()                               = delete;
++  __dir_stream& operator=(const __dir_stream&) = delete;
++
++  __dir_stream(__dir_stream&& other) noexcept
++      : __entries_(other.__entries_),
++        __count_(other.__count_),
++        __next_(other.__next_),
++        __root_(std::move(other.__root_)),
++        __entry_(std::move(other.__entry_)) {
++    other.__entries_ = nullptr;
++  }
++
++  __dir_stream(const path& root, directory_options opts, error_code& ec) : __root_(root) {
++    n_result r = detail::with_complete_path(root, [&](const char* full) { return n_folder_entries(full, &__entries_); });
++    if (r < 0) {
++      __entries_ = nullptr;
++      ec         = detail::native_error(r);
++      if (bool(opts & directory_options::skip_permission_denied) && ec == errc::permission_denied)
++        ec.clear();
++      return;
++    }
++    __count_ = static_cast<size_t>(r);
++    advance(ec);
++  }
++
++  ~__dir_stream() noexcept { close(); }
++
++  bool good() const noexcept { return __entries_ != nullptr; }
++
++  bool advance(error_code&) {
++    if (__entries_ && __next_ < __count_) {
++      const n_entry& e = __entries_[__next_++];
++      __entry_.__assign_iter_entry(
++          __root_ / e.name,
++          directory_entry::__create_iter_cached_result(
++              detail::get_file_type(e), detail::get_file_size(e), detail::get_file_perm(e), detail::get_write_time(e)));
++      return true;
++    }
++    close();
++    return false;
++  }
++
++private:
++  void close() noexcept {
++    free(__entries_);
++    __entries_ = nullptr;
++  }
++
++  n_entry* __entries_ = nullptr;
++  size_t __count_     = 0;
++  size_t __next_      = 0;
++
+ public:
+   path __root_;
+   directory_entry __entry_;
+diff --git a/libcxx/src/filesystem/file_descriptor.h b/libcxx/src/filesystem/file_descriptor.h
+index 9c279c45..126e5625 100644
+--- a/libcxx/src/filesystem/file_descriptor.h
++++ b/libcxx/src/filesystem/file_descriptor.h
+@@ -24,6 +24,9 @@
+ #  define WIN32_LEAN_AND_MEAN
+ #  define NOMINMAX
+ #  include <windows.h>
++#elif defined(__nocturne__)
++#  include <nocturne.h>
++#  include <string>
+ #else
+ #  include <dirent.h> // for DIR & friends
+ #  include <fcntl.h>  // values for fchmodat
+@@ -36,7 +39,97 @@ _LIBCPP_BEGIN_NAMESPACE_FILESYSTEM
+ 
+ namespace detail {
+ 
+-#if !defined(_LIBCPP_WIN32API)
++#if defined(__nocturne__)
++
++// Nocturne's C: holds documents and folders, each described by a struct
++// n_entry. It has no links, devices, owners or permission bits.
++
++// errno values are the N_ERR_* codes; a refused access is permission_denied
++// in the filesystem library's terms.
++inline error_code native_error(n_result r) {
++  if (r == -N_ERR_DENIED)
++    return make_error_code(errc::permission_denied);
++  return error_code(static_cast<int>(-r), generic_category());
++}
++
++// The complete path the native API takes for p: a path that is not complete
++// is inside the app's FOLDER setting. An empty path names nothing.
++inline n_result complete_path(const path& p, string& out) {
++  if (p.empty())
++    return -N_ERR_NOT_FOUND;
++  for (size_t cap = p.native().size() + 256;; cap *= 2) {
++    out.resize(cap);
++    n_result r = n_path_complete(p.c_str(), out.data(), cap);
++    if (r != -N_ERR_TOO_LARGE) {
++      out.resize(r < 0 ? 0 : static_cast<size_t>(r));
++      return r;
++    }
++  }
++}
++
++// Calls op, a native operation, with the complete path for p.
++template <class Op>
++n_result with_complete_path(const path& p, Op op) {
++  string full;
++  n_result r = complete_path(p, full);
++  return r < 0 ? r : op(full.c_str());
++}
++
++inline file_type get_file_type(const n_entry& e) {
++  return e.kind == N_KIND_FOLDER ? file_type::directory : file_type::regular;
++}
++inline uintmax_t get_file_size(const n_entry& e) { return e.size; }
++inline file_time_type get_write_time(const n_entry& e) {
++  TimeSpec ts = {e.modified, static_cast<long>(e.modified_ns)};
++  if (!fs_time::is_representable(ts))
++    return file_time_type::min();
++  return fs_time::convert_from_timespec(ts);
++}
++// The system decides each access as it is made, so an entry reports every permission.
++inline perms get_file_perm(const n_entry&) { return perms::all; }
++
++// The status of the entry p names, which fills e. As on other systems, a
++// missing entry is file_type::not_found with its error still set in *ec.
++inline file_status entry_status(const path& p, n_entry& e, error_code* ec) {
++  n_result r = with_complete_path(p, [&](const char* full) { return n_entry_info(full, &e); });
++  if (r >= 0) {
++    if (ec)
++      ec->clear();
++    return file_status(get_file_type(e), get_file_perm(e));
++  }
++  error_code m_ec = native_error(r);
++  if (ec)
++    *ec = m_ec;
++  if (r == -N_ERR_NOT_FOUND || r == -N_ERR_NOT_FOLDER)
++    return file_status(file_type::not_found);
++  ErrorHandler<void> err("status", ec, &p);
++  err.report(m_ec, "failed to determine attributes for the specified path");
++  return file_status(file_type::none);
++}
++
++inline file_status entry_status(const path& p, error_code* ec) {
++  n_entry e;
++  return entry_status(p, e, ec);
++}
++
++// An open document. Closing it saves what was written, and an
++// N_DOCUMENT_REPLACE document's new content takes the place of the old.
++struct Document {
++  n_handle h;
++
++  explicit Document(n_handle handle) : h(handle) {}
++  Document(const Document&)            = delete;
++  Document& operator=(const Document&) = delete;
++  ~Document() { close(); }
++
++  n_result close() {
++    n_result r = h >= 0 ? n_handle_close(h) : 0;
++    h          = -1;
++    return r;
++  }
++};
++
++#elif !defined(_LIBCPP_WIN32API)
+ 
+ #  if defined(DT_BLK)
+ template <class DirEntT, class = decltype(DirEntT::d_type)>
+@@ -111,8 +204,9 @@ inline perms get_file_perm(const WIN32_FIND_DATAW& data) {
+   return static_cast<perms>(st_mode) & perms::mask;
+ }
+ 
+-#endif // !_LIBCPP_WIN32API
++#endif // __nocturne__, !_LIBCPP_WIN32API
+ 
++#if !defined(__nocturne__)
+ //                       POSIX HELPERS
+ 
+ using value_type  = path::value_type;
+@@ -290,6 +384,7 @@ inline file_status FileDescriptor::refresh_status(error_code& ec) {
+   m_status = create_file_status(m_ec, name, m_stat, &ec);
+   return m_status;
+ }
++#endif // !__nocturne__
+ 
+ } // namespace detail
+ 
+diff --git a/libcxx/src/filesystem/filesystem_clock.cpp b/libcxx/src/filesystem/filesystem_clock.cpp
+index 96a1336d..37bd2321 100644
+--- a/libcxx/src/filesystem/filesystem_clock.cpp
++++ b/libcxx/src/filesystem/filesystem_clock.cpp
+@@ -32,7 +32,8 @@
+ #  include <sys/time.h> // for gettimeofday and timeval
+ #endif
+ 
+-#if _LIBCPP_LIBC_LLVM_LIBC
++// Nocturne's C library has ISO C's timespec_get with TIME_UTC.
++#if _LIBCPP_LIBC_LLVM_LIBC || defined(__nocturne__)
+ #  define _LIBCPP_HAS_TIMESPEC_GET
+ #endif
+ 
+diff --git a/libcxx/src/filesystem/operations.cpp b/libcxx/src/filesystem/operations.cpp
+index cd55b797..c5ab86cb 100644
+--- a/libcxx/src/filesystem/operations.cpp
++++ b/libcxx/src/filesystem/operations.cpp
+@@ -30,6 +30,8 @@
+ #  define WIN32_LEAN_AND_MEAN
+ #  define NOMINMAX
+ #  include <windows.h>
++#elif defined(__nocturne__)
++#  include <nocturne.h>
+ #else
+ #  include <dirent.h>
+ #  include <sys/stat.h>
+@@ -37,7 +39,9 @@
+ #  include <sys/types.h>
+ #  include <unistd.h>
+ #endif
+-#include <fcntl.h> /* values for fchmodat */
++#if !defined(__nocturne__)
++#  include <fcntl.h> /* values for fchmodat */
++#endif
+ #include <time.h>
+ 
+ // since Linux 4.5 and FreeBSD 13, but the Linux libc wrapper is only provided by glibc >= 2.27 and musl
+@@ -45,7 +49,9 @@
+ #  define _LIBCPP_FILESYSTEM_USE_COPY_FILE_RANGE
+ #endif
+ 
+-#if __has_include(<sys/sendfile.h>)
++#if defined(__nocturne__)
++// __copy_file reads and writes documents with the native API.
++#elif __has_include(<sys/sendfile.h>)
+ #  include <sys/sendfile.h>
+ #  define _LIBCPP_FILESYSTEM_USE_SENDFILE
+ #elif defined(__APPLE__) || __has_include(<copyfile.h>)
+@@ -73,7 +79,9 @@ _LIBCPP_BEGIN_EXPLICIT_ABI_ANNOTATIONS
+ 
+ using detail::capture_errno;
+ using detail::ErrorHandler;
++#if !defined(__nocturne__)
+ using detail::StatT;
++#endif
+ using detail::TimeSpec;
+ using parser::createView;
+ using parser::PathParser;
+@@ -100,7 +108,18 @@ path __canonical(path const& orig_p, error_code* ec) {
+   ErrorHandler<path> err("canonical", ec, &orig_p, &cwd);
+ 
+   path p = __do_absolute(orig_p, &cwd, ec);
+-#if (defined(_POSIX_VERSION) && _POSIX_VERSION >= 200112) || defined(_LIBCPP_WIN32API)
++#if defined(__nocturne__)
++  // Without links, the complete path with "." and ".." resolved is canonical
++  // once the entry is there.
++  string full;
++  n_entry e;
++  n_result r = detail::complete_path(p, full);
++  if (r >= 0)
++    r = n_entry_info(full.c_str(), &e);
++  if (r < 0)
++    return err.report(detail::native_error(r));
++  return {full};
++#elif (defined(_POSIX_VERSION) && _POSIX_VERSION >= 200112) || defined(_LIBCPP_WIN32API)
+   std::unique_ptr<path::value_type, decltype(&::free)> hold(detail::realpath(p.c_str(), nullptr), &::free);
+   if (hold.get() == nullptr)
+     return err.report(detail::get_last_error());
+@@ -126,6 +145,24 @@ void __copy(const path& from, const path& to, copy_options options, error_code*
+   const bool sym_status2 = bool(options & copy_options::copy_symlinks);
+ 
+   error_code m_ec1;
++#if defined(__nocturne__)
++  // No entry is a link, so the symlink options change nothing here.
++  (void)sym_status;
++  (void)sym_status2;
++  n_entry f_e, t_e;
++  const file_status f = detail::entry_status(from, f_e, &m_ec1);
++  if (m_ec1)
++    return err.report(m_ec1);
++
++  const file_status t = detail::entry_status(to, t_e, &m_ec1);
++
++  if (not status_known(t))
++    return err.report(m_ec1);
++
++  if (!exists(f) || (is_directory(f) && is_regular_file(t)) || (exists(t) && f_e.id == t_e.id)) {
++    return err.report(errc::function_not_supported);
++  }
++#else
+   StatT f_st;
+   const file_status f =
+       sym_status || sym_status2 ? detail::posix_lstat(from, f_st, &m_ec1) : detail::posix_stat(from, f_st, &m_ec1);
+@@ -142,6 +179,7 @@ void __copy(const path& from, const path& to, copy_options options, error_code*
+       (exists(t) && detail::stat_equivalent(f_st, t_st))) {
+     return err.report(errc::function_not_supported);
+   }
++#endif
+ 
+   if (is_symlink(f)) {
+     if (bool(copy_options::skip_symlinks & options)) {
+@@ -192,6 +230,80 @@ void __copy(const path& from, const path& to, copy_options options, error_code*
+   }
+ }
+ 
++#if defined(__nocturne__)
++bool __copy_file(const path& from, const path& to, copy_options options, error_code* ec) {
++  ErrorHandler<bool> err("copy_file", ec, &to, &from);
++
++  string from_full, to_full;
++  n_result r = detail::complete_path(from, from_full);
++  if (r >= 0)
++    r = detail::complete_path(to, to_full);
++  if (r < 0)
++    return err.report(detail::native_error(r));
++
++  detail::Document in(n_document_open(from_full.c_str(), N_DOCUMENT_READ));
++  if (in.h < 0)
++    return err.report(detail::native_error(in.h));
++  n_entry from_e;
++  if ((r = n_document_info(in.h, &from_e)) < 0)
++    return err.report(detail::native_error(r));
++
++  const bool skip_existing      = bool(copy_options::skip_existing & options);
++  const bool update_existing    = bool(copy_options::update_existing & options);
++  const bool overwrite_existing = bool(copy_options::overwrite_existing & options);
++
++  error_code m_ec;
++  n_entry to_e;
++  file_status to_st = detail::entry_status(to, to_e, &m_ec);
++  if (!status_known(to_st))
++    return err.report(m_ec);
++
++  const bool to_exists = exists(to_st);
++  if (to_exists && !is_regular_file(to_st))
++    return err.report(errc::not_supported);
++
++  if (to_exists && from_e.id == to_e.id)
++    return err.report(errc::file_exists);
++
++  if (to_exists && skip_existing)
++    return false;
++
++  bool ShouldCopy = [&]() {
++    if (to_exists && update_existing)
++      return from_e.modified > to_e.modified ||
++             (from_e.modified == to_e.modified && from_e.modified_ns > to_e.modified_ns);
++    if (!to_exists || overwrite_existing)
++      return true;
++    return err.report(errc::file_exists);
++  }();
++  if (!ShouldCopy)
++    return false;
++
++  // The copy is new content for to, which takes the place of the old whole
++  // when the document closes.
++  detail::Document out(n_document_open(to_full.c_str(), N_DOCUMENT_REPLACE));
++  if (out.h < 0)
++    return err.report(detail::native_error(out.h));
++  const size_t chunk = 1 << 20;
++  unique_ptr<char[]> buffer(new char[chunk]);
++  for (uint64_t offset = 0;;) {
++    n_result n = n_document_read_at(in.h, offset, buffer.get(), chunk);
++    if (n < 0)
++      return err.report(detail::native_error(n));
++    if (n == 0)
++      break;
++    n_result written = n_document_write_at(out.h, offset, buffer.get(), static_cast<size_t>(n));
++    if (written < 0)
++      return err.report(detail::native_error(written));
++    if (written != n)
++      return err.report(errc::io_error);
++    offset += static_cast<uint64_t>(n);
++  }
++  if ((r = out.close()) < 0)
++    return err.report(detail::native_error(r));
++  return true;
++}
++#else
+ namespace detail {
+ namespace {
+ 
+@@ -454,6 +566,7 @@ bool __copy_file(const path& from, const path& to, copy_options options, error_c
+ 
+   return true;
+ }
++#endif // __nocturne__
+ 
+ void __copy_symlink(const path& existing_symlink, const path& new_symlink, error_code* ec) {
+   const path real_path(__read_symlink(existing_symlink, ec));
+@@ -473,7 +586,7 @@ bool __create_directories(const path& p, error_code* ec) {
+   ErrorHandler<bool> err("create_directories", ec, &p);
+ 
+   error_code m_ec;
+-  auto const st = detail::posix_stat(p, &m_ec);
++  auto const st = __status(p, &m_ec);
+   if (!status_known(st))
+     return err.report(m_ec);
+   else if (is_directory(st))
+@@ -505,10 +618,18 @@ bool __create_directories(const path& p, error_code* ec) {
+ bool __create_directory(const path& p, error_code* ec) {
+   ErrorHandler<bool> err("create_directory", ec, &p);
+ 
++#if defined(__nocturne__)
++  n_result r = detail::with_complete_path(p, n_folder_create);
++  if (r >= 0)
++    return true;
++
++  error_code mec = detail::native_error(r);
++#else
+   if (detail::mkdir(p.c_str(), static_cast<int>(perms::all)) == 0)
+     return true;
+ 
+   error_code mec = detail::get_last_error();
++#endif
+   if (mec != errc::file_exists)
+     return err.report(mec);
+   error_code ignored_ec;
+@@ -521,8 +642,18 @@ bool __create_directory(const path& p, error_code* ec) {
+ bool __create_directory(path const& p, path const& attributes, error_code* ec) {
+   ErrorHandler<bool> err("create_directory", ec, &p, &attributes);
+ 
+-  StatT attr_stat;
+   error_code mec;
++#if defined(__nocturne__)
++  // A folder has no attributes to copy, but attributes must still be one.
++  file_status st = __status(attributes, &mec);
++  if (!status_known(st))
++    return err.report(mec);
++  if (!is_directory(st))
++    return err.report(errc::not_a_directory, "the specified attribute path is invalid");
++
++  return __create_directory(p, ec);
++#else
++  StatT attr_stat;
+   file_status st = detail::posix_stat(attributes, attr_stat, &mec);
+   if (!status_known(st))
+     return err.report(mec);
+@@ -541,37 +672,59 @@ bool __create_directory(path const& p, path const& attributes, error_code* ec) {
+   if (!is_directory(st))
+     return err.report(mec);
+   return false;
++#endif
+ }
+ 
++// Nocturne has no links, so it cannot make them.
+ void __create_directory_symlink(path const& from, path const& to, error_code* ec) {
+   ErrorHandler<void> err("create_directory_symlink", ec, &from, &to);
++#if defined(__nocturne__)
++  return err.report(errc::function_not_supported);
++#else
+   if (detail::symlink_dir(from.c_str(), to.c_str()) == -1)
+     return err.report(detail::get_last_error());
++#endif
+ }
+ 
+ void __create_hard_link(const path& from, const path& to, error_code* ec) {
+   ErrorHandler<void> err("create_hard_link", ec, &from, &to);
++#if defined(__nocturne__)
++  return err.report(errc::function_not_supported);
++#else
+   if (detail::link(from.c_str(), to.c_str()) == -1)
+     return err.report(detail::get_last_error());
++#endif
+ }
+ 
+ void __create_symlink(path const& from, path const& to, error_code* ec) {
+   ErrorHandler<void> err("create_symlink", ec, &from, &to);
++#if defined(__nocturne__)
++  return err.report(errc::function_not_supported);
++#else
+   if (detail::symlink_file(from.c_str(), to.c_str()) == -1)
+     return err.report(detail::get_last_error());
++#endif
+ }
+ 
+ path __current_path(error_code* ec) {
+   ErrorHandler<path> err("current_path", ec);
+ 
+-#if defined(_LIBCPP_WIN32API) || defined(__GLIBC__) || defined(__APPLE__)
++#if defined(__nocturne__)
++  // The app's FOLDER setting, which holds the paths that are not complete.
++  string full;
++  n_result r = detail::complete_path(".", full);
++  if (r < 0)
++    return err.report(detail::native_error(r));
++  return {full};
++#else
++#  if defined(_LIBCPP_WIN32API) || defined(__GLIBC__) || defined(__APPLE__)
+   // Common extension outside of POSIX getcwd() spec, without needing to
+   // preallocate a buffer. Also supported by a number of other POSIX libcs.
+   int size              = 0;
+   path::value_type* ptr = nullptr;
+   typedef decltype(&::free) Deleter;
+   Deleter deleter = &::free;
+-#else
++#  else
+   errno     = 0; // Note: POSIX mandates that modifying `errno` is thread-safe.
+   auto size = ::pathconf(".", _PC_PATH_MAX);
+   if (size == -1) {
+@@ -580,11 +733,11 @@ path __current_path(error_code* ec) {
+ 
+       // `pathconf` returns `-1` without an error to indicate no limit.
+     } else {
+-#  if defined(__MVS__) && !defined(PATH_MAX)
++#    if defined(__MVS__) && !defined(PATH_MAX)
+       size = _XOPEN_PATH_MAX + 1;
+-#  else
++#    else
+       size = PATH_MAX + 1;
+-#  endif
++#    endif
+     }
+   }
+ 
+@@ -597,25 +750,44 @@ path __current_path(error_code* ec) {
+     void operator()(void*) const {}
+   };
+   Deleter deleter;
+-#endif
++#  endif
+ 
+   unique_ptr<path::value_type, Deleter> hold(detail::getcwd(ptr, size), deleter);
+   if (hold.get() == nullptr)
+     return err.report(detail::get_last_error(), "call to getcwd failed");
+ 
+   return {hold.get()};
++#endif // __nocturne__
+ }
+ 
+ void __current_path(const path& p, error_code* ec) {
+   ErrorHandler<void> err("current_path", ec, &p);
++#if defined(__nocturne__)
++  n_result r = detail::with_complete_path(p, n_folder_set);
++  if (r < 0)
++    err.report(detail::native_error(r));
++#else
+   if (detail::chdir(p.c_str()) == -1)
+     err.report(detail::get_last_error());
++#endif
+ }
+ 
+ bool __equivalent(const path& p1, const path& p2, error_code* ec) {
+   ErrorHandler<bool> err("equivalent", ec, &p1, &p2);
+ 
+   error_code ec1, ec2;
++#if defined(__nocturne__)
++  // An entry's id is the entry itself, however a path spells its names.
++  n_entry e1, e2;
++  auto s1 = detail::entry_status(p1, e1, &ec1);
++  if (!exists(s1))
++    return err.report(errc::not_supported);
++  auto s2 = detail::entry_status(p2, e2, &ec2);
++  if (!exists(s2))
++    return err.report(errc::not_supported);
++
++  return e1.id == e2.id;
++#else
+   StatT st1 = {}, st2 = {};
+   auto s1 = detail::posix_stat(p1.native(), st1, &ec1);
+   if (!exists(s1))
+@@ -625,14 +797,20 @@ bool __equivalent(const path& p1, const path& p2, error_code* ec) {
+     return err.report(errc::not_supported);
+ 
+   return detail::stat_equivalent(st1, st2);
++#endif
+ }
+ 
+ uintmax_t __file_size(const path& p, error_code* ec) {
+   ErrorHandler<uintmax_t> err("file_size", ec, &p);
+ 
+   error_code m_ec;
++#if defined(__nocturne__)
++  n_entry st;
++  file_status fst = detail::entry_status(p, st, &m_ec);
++#else
+   StatT st;
+   file_status fst = detail::posix_stat(p, st, &m_ec);
++#endif
+   if (!exists(fst) || !is_regular_file(fst)) {
+     errc error_kind = is_directory(fst) ? errc::is_a_directory : errc::not_supported;
+     if (!m_ec)
+@@ -640,26 +818,43 @@ uintmax_t __file_size(const path& p, error_code* ec) {
+     return err.report(m_ec);
+   }
+   // is_regular_file(p) == true
++#if defined(__nocturne__)
++  return detail::get_file_size(st);
++#else
+   return static_cast<uintmax_t>(st.st_size);
++#endif
+ }
+ 
+ uintmax_t __hard_link_count(const path& p, error_code* ec) {
+   ErrorHandler<uintmax_t> err("hard_link_count", ec, &p);
+ 
+   error_code m_ec;
++#if defined(__nocturne__)
++  // No entry is a link, so each has one name.
++  __status(p, &m_ec);
++  if (m_ec)
++    return err.report(m_ec);
++  return 1;
++#else
+   StatT st;
+   detail::posix_stat(p, st, &m_ec);
+   if (m_ec)
+     return err.report(m_ec);
+   return static_cast<uintmax_t>(st.st_nlink);
++#endif
+ }
+ 
+ bool __fs_is_empty(const path& p, error_code* ec) {
+   ErrorHandler<bool> err("is_empty", ec, &p);
+ 
+   error_code m_ec;
++#if defined(__nocturne__)
++  n_entry pst;
++  auto st = detail::entry_status(p, pst, &m_ec);
++#else
+   StatT pst;
+   auto st = detail::posix_stat(p, pst, &m_ec);
++#endif
+   if (m_ec)
+     return err.report(m_ec);
+   else if (!is_directory(st) && !is_regular_file(st))
+@@ -670,7 +865,11 @@ bool __fs_is_empty(const path& p, error_code* ec) {
+       return false;
+     return it == directory_iterator{};
+   } else if (is_regular_file(st))
++#if defined(__nocturne__)
++    return detail::get_file_size(pst) == 0;
++#else
+     return static_cast<uintmax_t>(pst.st_size) == 0;
++#endif
+ 
+   __libcpp_unreachable();
+ }
+@@ -680,18 +879,33 @@ file_time_type __last_write_time(const path& p, error_code* ec) {
+   ErrorHandler<file_time_type> err("last_write_time", ec, &p);
+ 
+   error_code m_ec;
++#if defined(__nocturne__)
++  n_entry e;
++  detail::entry_status(p, e, &m_ec);
++  if (m_ec)
++    return err.report(m_ec);
++  file_time_type time = detail::get_write_time(e);
++  if (time == file_time_type::min())
++    return err.report(errc::value_too_large);
++  return time;
++#else
+   StatT st;
+   detail::posix_stat(p, st, &m_ec);
+   if (m_ec)
+     return err.report(m_ec);
+   return detail::__extract_last_write_time(p, st, ec);
++#endif
+ }
+ 
+ void __last_write_time(const path& p, file_time_type new_time, error_code* ec) {
+   using detail::fs_time;
+   ErrorHandler<void> err("last_write_time", ec, &p);
+ 
+-#if defined(_LIBCPP_WIN32API)
++#if defined(__nocturne__)
++  // An entry's time is the time it last changed; Nocturne has no call that sets it.
++  (void)new_time;
++  return err.report(errc::function_not_supported);
++#elif defined(_LIBCPP_WIN32API)
+   TimeSpec ts;
+   if (!fs_time::convert_to_timespec(ts, new_time))
+     return err.report(errc::value_too_large);
+@@ -741,7 +955,7 @@ void __permissions(const path& p, perms prms, perm_options opts, error_code* ec)
+   prms &= perms::mask;
+   if (!resolve_symlinks || (add_perms || remove_perms)) {
+     error_code m_ec;
+-    file_status st = resolve_symlinks ? detail::posix_stat(p, &m_ec) : detail::posix_lstat(p, &m_ec);
++    file_status st = resolve_symlinks ? __status(p, &m_ec) : __symlink_status(p, &m_ec);
+     set_sym_perms  = is_symlink(st);
+     if (m_ec)
+       return err.report(m_ec);
+@@ -753,44 +967,62 @@ void __permissions(const path& p, perms prms, perm_options opts, error_code* ec)
+     else if (remove_perms)
+       prms = st.permissions() & ~prms;
+   }
++#if defined(__nocturne__)
++  // Entries have no permission bits: each reports them all, the one value it
++  // can be given.
++  (void)set_sym_perms;
++  error_code m_ec;
++  __status(p, &m_ec);
++  if (m_ec)
++    return err.report(m_ec);
++  if (prms != perms::all)
++    return err.report(errc::function_not_supported);
++#else
+   const auto real_perms = static_cast<detail::ModeT>(prms & perms::mask);
+ 
+-#if defined(AT_SYMLINK_NOFOLLOW) && defined(AT_FDCWD)
++#  if defined(AT_SYMLINK_NOFOLLOW) && defined(AT_FDCWD)
+   const int flags = set_sym_perms ? AT_SYMLINK_NOFOLLOW : 0;
+   if (detail::fchmodat(AT_FDCWD, p.c_str(), real_perms, flags) == -1) {
+     return err.report(detail::get_last_error());
+   }
+-#else
++#  else
+   if (set_sym_perms)
+     return err.report(errc::operation_not_supported);
+   if (::chmod(p.c_str(), real_perms) == -1) {
+     return err.report(capture_errno());
+   }
+-#endif
++#  endif
++#endif // __nocturne__
+ }
+ 
+ path __read_symlink(const path& p, error_code* ec) {
+   ErrorHandler<path> err("read_symlink", ec, &p);
+ 
+-#if defined(PATH_MAX) || defined(MAX_SYMLINK_SIZE)
++#if defined(__nocturne__)
++  // No entry is a link.
++  error_code m_ec;
++  file_status st = __symlink_status(p, &m_ec);
++  return err.report(exists(st) ? make_error_code(errc::invalid_argument) : m_ec);
++#else
++#  if defined(PATH_MAX) || defined(MAX_SYMLINK_SIZE)
+   struct NullDeleter {
+     void operator()(void*) const {}
+   };
+-#  ifdef MAX_SYMLINK_SIZE
++#    ifdef MAX_SYMLINK_SIZE
+   const size_t size = MAX_SYMLINK_SIZE + 1;
+-#  else
++#    else
+   const size_t size = PATH_MAX + 1;
+-#  endif
++#    endif
+   path::value_type stack_buff[size];
+   auto buff = std::unique_ptr<path::value_type[], NullDeleter>(stack_buff);
+-#else
++#  else
+   StatT sb;
+   if (detail::lstat(p.c_str(), &sb) == -1) {
+     return err.report(detail::get_last_error());
+   }
+   const size_t size = sb.st_size + 1;
+   auto buff         = unique_ptr<path::value_type[]>(new path::value_type[size]);
+-#endif
++#  endif
+   detail::SSizeT ret;
+   if ((ret = detail::readlink(p.c_str(), buff.get(), size)) == -1)
+     return err.report(detail::get_last_error());
+@@ -799,16 +1031,26 @@ path __read_symlink(const path& p, error_code* ec) {
+     return err.report(errc::value_too_large);
+   buff[ret] = 0;
+   return {buff.get()};
++#endif // __nocturne__
+ }
+ 
+ bool __remove(const path& p, error_code* ec) {
+   ErrorHandler<bool> err("remove", ec, &p);
++#if defined(__nocturne__)
++  n_result r = detail::with_complete_path(p, n_entry_remove);
++  if (r < 0) {
++    if (r != -N_ERR_NOT_FOUND)
++      err.report(detail::native_error(r));
++    return false;
++  }
++#else
+   if (detail::remove(p.c_str()) == -1) {
+     error_code mec = detail::get_last_error();
+     if (mec != errc::no_such_file_or_directory)
+       err.report(mec);
+     return false;
+   }
++#endif
+   return true;
+ }
+ 
+@@ -819,7 +1061,9 @@ bool __remove(const path& p, error_code* ec) {
+ //
+ // The second implementation is used on platforms where `openat()` & friends are available,
+ // and it threads file descriptors through recursive calls to avoid such race conditions.
+-#if defined(_LIBCPP_WIN32API) || defined(__MVS__)
++// Nocturne's directory_iterator takes a folder's entries all at once, so removing
++// them meanwhile is safe.
++#if defined(_LIBCPP_WIN32API) || defined(__MVS__) || defined(__nocturne__)
+ #  define REMOVE_ALL_USE_DIRECTORY_ITERATOR
+ #endif
+ 
+@@ -961,19 +1205,47 @@ uintmax_t __remove_all(const path& p, error_code* ec) {
+ 
+ void __rename(const path& from, const path& to, error_code* ec) {
+   ErrorHandler<void> err("rename", ec, &from, &to);
++#if defined(__nocturne__)
++  // A document may take the name of a document, which goes; any other entry
++  // already at to is N_ERR_EXISTS, a folder included.
++  string from_full;
++  n_result r = detail::complete_path(from, from_full);
++  if (r >= 0)
++    r = detail::with_complete_path(to, [&](const char* to_full) { return n_entry_replace(from_full.c_str(), to_full); });
++  if (r < 0)
++    err.report(detail::native_error(r));
++#else
+   if (detail::rename(from.c_str(), to.c_str()) == -1)
+     err.report(detail::get_last_error());
++#endif
+ }
+ 
+ void __resize_file(const path& p, uintmax_t size, error_code* ec) {
+   ErrorHandler<void> err("resize_file", ec, &p);
++#if defined(__nocturne__)
++  n_result r = detail::with_complete_path(p, [&](const char* full) {
++    detail::Document doc(n_document_open(full, N_DOCUMENT_EDIT));
++    n_result resized = doc.h < 0 ? doc.h : n_document_set_size(doc.h, size);
++    n_result saved   = doc.close();
++    return resized < 0 ? resized : saved;
++  });
++  if (r < 0)
++    return err.report(detail::native_error(r));
++#else
+   if (detail::truncate(p.c_str(), static_cast< ::off_t>(size)) == -1)
+     return err.report(detail::get_last_error());
++#endif
+ }
+ 
+ space_info __space(const path& p, error_code* ec) {
+   ErrorHandler<void> err("space", ec, &p);
+   space_info si;
++#if defined(__nocturne__)
++  // Nocturne has no call that reports a volume's space.
++  err.report(errc::function_not_supported);
++  si.capacity = si.free = si.available = static_cast<uintmax_t>(-1);
++  return si;
++#else
+   detail::StatVFS m_svfs = {};
+   if (detail::statvfs(p.c_str(), &m_svfs) == -1) {
+     err.report(detail::get_last_error());
+@@ -990,16 +1262,27 @@ space_info __space(const path& p, error_code* ec) {
+   do_mult(si.free, m_svfs.f_bfree);
+   do_mult(si.available, m_svfs.f_bavail);
+   return si;
++#endif
+ }
+ 
++#if defined(__nocturne__)
++// No entry is a link, so an entry's status and its own status are the same.
++file_status __status(const path& p, error_code* ec) { return detail::entry_status(p, ec); }
++
++file_status __symlink_status(const path& p, error_code* ec) { return detail::entry_status(p, ec); }
++#else
+ file_status __status(const path& p, error_code* ec) { return detail::posix_stat(p, ec); }
+ 
+ file_status __symlink_status(const path& p, error_code* ec) { return detail::posix_lstat(p, ec); }
++#endif
+ 
+ path __temp_directory_path(error_code* ec) {
+   ErrorHandler<path> err("temp_directory_path", ec);
+ 
+-#if defined(_LIBCPP_WIN32API)
++#if defined(__nocturne__)
++  // The setting TEMP, or C:\ without it.
++  path p(n_temp_folder());
++#elif defined(_LIBCPP_WIN32API)
+   wchar_t buf[MAX_PATH];
+   DWORD retval = GetTempPathW(MAX_PATH, buf);
+   if (!retval)
+@@ -1029,7 +1312,7 @@ path __temp_directory_path(error_code* ec) {
+   path p(ret);
+ #endif
+   error_code m_ec;
+-  file_status st = detail::posix_stat(p, &m_ec);
++  file_status st = __status(p, &m_ec);
+   if (!status_known(st))
+     return err.report(m_ec, "cannot access path " PATH_CSTR_FMT, p.c_str());
+ 
+diff --git a/libcxx/src/filesystem/path_parser.h b/libcxx/src/filesystem/path_parser.h
+index 5968f449..1153c72d 100644
+--- a/libcxx/src/filesystem/path_parser.h
++++ b/libcxx/src/filesystem/path_parser.h
+@@ -22,7 +22,7 @@ _LIBCPP_BEGIN_NAMESPACE_FILESYSTEM
+ inline bool isSeparator(path::value_type C) {
+   if (C == '/')
+     return true;
+-#if defined(_LIBCPP_WIN32API)
++#if _LIBCPP_HAS_DRIVE_LETTER_PATHS
+   if (C == '\\')
+     return true;
+ #endif
+@@ -324,9 +324,12 @@ private:
+   }
+ 
+   PosPtr consumeRootName(PosPtr P, PosPtr End) const noexcept {
+-#if defined(_LIBCPP_WIN32API)
++#if _LIBCPP_HAS_DRIVE_LETTER_PATHS
+     if (PosPtr Ret = consumeDriveLetter(P, End))
+       return Ret;
++#endif
++    // Only Windows has network roots; elsewhere repeated separators are one.
++#if defined(_LIBCPP_WIN32API)
+     if (PosPtr Ret = consumeNetworkRoot(P, End))
+       return Ret;
+ #endif
+diff --git a/libcxx/src/filesystem/posix_compat.h b/libcxx/src/filesystem/posix_compat.h
+index ddd99d8a..c23aaafa 100644
+--- a/libcxx/src/filesystem/posix_compat.h
++++ b/libcxx/src/filesystem/posix_compat.h
+@@ -37,7 +37,7 @@
+ #  include <io.h>
+ #  include <windows.h>
+ #  include <winioctl.h>
+-#else
++#elif !defined(__nocturne__)
+ #  include <fcntl.h>
+ #  include <sys/stat.h>
+ #  include <sys/statvfs.h>
+@@ -453,6 +453,10 @@ inline SSizeT readlink(const wchar_t* path, wchar_t* ret_buf, size_t bufsize) {
+   return name_length / sizeof(wchar_t);
+ }
+ 
++#elif defined(__nocturne__)
++// Nocturne is not POSIX-like: the filesystem library calls its native API
++// (file_descriptor.h, operations.cpp) instead of helpers here.
++
+ #else
+ inline int symlink_file(const char* oldname, const char* newname) { return ::symlink(oldname, newname); }
+ inline int symlink_dir(const char* oldname, const char* newname) { return ::symlink(oldname, newname); }
+diff --git a/libcxx/src/filesystem/time_utils.h b/libcxx/src/filesystem/time_utils.h
+index 89352e5b..96964f8c 100644
+--- a/libcxx/src/filesystem/time_utils.h
++++ b/libcxx/src/filesystem/time_utils.h
+@@ -26,6 +26,8 @@
+ #  define WIN32_LEAN_AND_MEAN
+ #  define NOMINMAX
+ #  include <windows.h>
++#elif defined(__nocturne__)
++#  include <time.h>
+ #else
+ #  include <fcntl.h>
+ #  include <sys/stat.h>
+@@ -97,6 +99,10 @@ inline FILETIME timespec_to_filetime(TimeSpec ts) {
+   return ft;
+ }
+ 
++#elif defined(__nocturne__)
++// Nocturne's entries carry their times in struct n_entry (file_descriptor.h).
++using TimeSpec = struct timespec;
++
+ #else
+ using TimeSpec = struct timespec;
+ using TimeVal  = struct timeval;
+@@ -273,7 +279,9 @@ using fs_time = time_util<file_time_type, int64_t, TimeSpec>;
+ using fs_time = time_util<file_time_type, time_t, TimeSpec>;
+ #endif
+ 
+-#if defined(__APPLE__)
++#if defined(__nocturne__)
++// No StatT: nothing to extract, and Nocturne has no call that sets times.
++#elif defined(__APPLE__)
+ inline TimeSpec extract_mtime(StatT const& st) { return st.st_mtimespec; }
+ inline TimeSpec extract_atime(StatT const& st) { return st.st_atimespec; }
+ #elif defined(__MVS__)
+@@ -299,7 +307,7 @@ inline TimeSpec extract_mtime(StatT const& st) { return st.st_mtim; }
+ inline TimeSpec extract_atime(StatT const& st) { return st.st_atim; }
+ #endif
+ 
+-#if _LIBCPP_HAS_FILESYSTEM
++#if _LIBCPP_HAS_FILESYSTEM && !defined(__nocturne__)
+ 
+ #  if !defined(_LIBCPP_WIN32API)
+ inline bool posix_utimes(const path& p, std::array<TimeSpec, 2> const& TS, error_code& ec) {
+@@ -342,7 +350,7 @@ inline file_time_type __extract_last_write_time(const path& p, const StatT& st,
+   return fs_time::convert_from_timespec(ts);
+ }
+ 
+-#endif // _LIBCPP_HAS_FILESYSTEM
++#endif // _LIBCPP_HAS_FILESYSTEM && !__nocturne__
+ 
+ } // namespace detail
+ 
+diff --git a/libcxx/src/include/config_elast.h b/libcxx/src/include/config_elast.h
+index daec2429..febf8ec0 100644
+--- a/libcxx/src/include/config_elast.h
++++ b/libcxx/src/include/config_elast.h
+@@ -29,6 +29,8 @@
+ // No _LIBCPP_ELAST needed on NuttX
+ #elif defined(__Fuchsia__)
+ // No _LIBCPP_ELAST needed on Fuchsia
++#elif defined(__nocturne__)
++// No _LIBCPP_ELAST needed on Nocturne
+ #elif defined(__wasi__)
+ // No _LIBCPP_ELAST needed on WASI
+ #elif defined(__EMSCRIPTEN__)
+diff --git a/libcxx/src/random.cpp b/libcxx/src/random.cpp
+index 1e6308cc..21d029a2 100644
+--- a/libcxx/src/random.cpp
++++ b/libcxx/src/random.cpp
+@@ -33,6 +33,8 @@
+ #  endif
+ #elif defined(_LIBCPP_USING_FUCHSIA_CPRNG)
+ #  include <zircon/syscalls.h>
++#elif defined(_LIBCPP_USING_NOCTURNE_RANDOM)
++#  include <nocturne.h>
+ #endif
+ 
+ _LIBCPP_BEGIN_NAMESPACE_STD
+@@ -130,6 +132,23 @@ unsigned random_device::operator()() {
+   return r;
+ }
+ 
++#elif defined(_LIBCPP_USING_NOCTURNE_RANDOM)
++
++random_device::random_device(const string& __token) {
++  if (__token != "/dev/urandom")
++    std::__throw_system_error(ENOENT, ("random device not supported " + __token).c_str());
++}
++
++random_device::~random_device() {}
++
++unsigned random_device::operator()() {
++  unsigned r;
++  n_result err = n_random(&r, sizeof(r));
++  if (err < 0) // errno values are the N_ERR_* codes
++    std::__throw_system_error(static_cast<int>(-err), "random_device n_random failed");
++  return r;
++}
++
+ #else
+ #  error "Random device not implemented for this architecture"
+ #endif
+@@ -147,7 +166,8 @@ double random_device::entropy() const noexcept {
+     return std::numeric_limits<result_type>::digits;
+ 
+   return ent;
+-#elif defined(_LIBCPP_USING_ARC4_RANDOM) || defined(_LIBCPP_USING_FUCHSIA_CPRNG)
++#elif defined(_LIBCPP_USING_ARC4_RANDOM) || defined(_LIBCPP_USING_FUCHSIA_CPRNG) ||                                  \
++    defined(_LIBCPP_USING_NOCTURNE_RANDOM)
+   return std::numeric_limits<result_type>::digits;
+ #else
+   return 0;
+diff --git a/libcxx/src/system_error.cpp b/libcxx/src/system_error.cpp
+index cf3d2c29..83f7ecf9 100644
+--- a/libcxx/src/system_error.cpp
++++ b/libcxx/src/system_error.cpp
+@@ -142,7 +142,7 @@ std::optional<errc> __win_err_to_errc(int err) {
+ #endif
+ 
+ namespace {
+-#if _LIBCPP_HAS_THREADS
++#if _LIBCPP_HAS_THREADS && !defined(__nocturne__)
+ 
+ //  GLIBC also uses 1024 as the maximum buffer size internally.
+ constexpr size_t strerror_buff_size = 1024;
+@@ -208,7 +208,7 @@ string do_strerror_r(int ev) {
+ }
+ #  endif
+ 
+-#endif // _LIBCPP_HAS_THREADS
++#endif // _LIBCPP_HAS_THREADS && !defined(__nocturne__)
+ 
+ string make_error_str(const error_code& ec, string what_arg) {
+   if (ec) {
+@@ -229,7 +229,8 @@ string make_error_str(const error_code& ec) {
+ } // namespace
+ 
+ string __do_message::message(int ev) const {
+-#if !_LIBCPP_HAS_THREADS
++#if !_LIBCPP_HAS_THREADS || defined(__nocturne__)
++  // Nocturne's strerror returns constant strings, so any thread may call it.
+   return string(::strerror(ev));
+ #else
+   return do_strerror_r(ev);
+diff --git a/libcxx/src/thread.cpp b/libcxx/src/thread.cpp
+index d2aff1ee..e3c2b39e 100644
+--- a/libcxx/src/thread.cpp
++++ b/libcxx/src/thread.cpp
+@@ -26,6 +26,8 @@
+ 
+ #if defined(_LIBCPP_WIN32API)
+ #  include <windows.h>
++#elif defined(__nocturne__)
++#  include <nocturne.h>
+ #endif
+ 
+ #if defined(__ELF__) && defined(_LIBCPP_LINK_PTHREAD_LIB)
+@@ -76,6 +78,10 @@ unsigned thread::hardware_concurrency() noexcept {
+   return static_cast<unsigned>(result);
+ #elif defined(_LIBCPP_WIN32API)
+   return static_cast<unsigned>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
++#elif defined(__nocturne__)
++  // The processors the scheduler runs threads on.
++  struct n_cpuinfo info;
++  return cpu_info(&info) == 0 ? info.scheduler_cpus : 0;
+ #else // defined(CTL_HW) && defined(HW_NCPU)
+   // TODO: grovel through /proc or check cpuid on x86 and similar
+   // instructions on other architectures.
+diff --git a/libcxxabi/include/cxxabi.h b/libcxxabi/include/cxxabi.h
+index c65e353d..fb8a5023 100644
+--- a/libcxxabi/include/cxxabi.h
++++ b/libcxxabi/include/cxxabi.h
+@@ -179,8 +179,8 @@ __cxa_decrement_exception_refcount(void *primary_exception) _LIBCXXABI_NOEXCEPT;
+ extern _LIBCXXABI_FUNC_VIS bool __cxa_uncaught_exception() _LIBCXXABI_NOEXCEPT;
+ extern _LIBCXXABI_FUNC_VIS unsigned int __cxa_uncaught_exceptions() _LIBCXXABI_NOEXCEPT;
+ 
+-#if defined(__linux__) || defined(__Fuchsia__)
+-// Linux and Fuchsia TLS support. Not yet an official part of the Itanium ABI.
++#if defined(__linux__) || defined(__Fuchsia__) || defined(__nocturne__)
++// Linux, Fuchsia and Nocturne TLS support. Not yet an official part of the Itanium ABI.
+ // https://sourceware.org/glibc/wiki/Destructor%20support%20for%20thread_local%20variables
+ extern _LIBCXXABI_FUNC_VIS int __cxa_thread_atexit(void (*)(void *), void *,
+                                                    void *) _LIBCXXABI_NOEXCEPT;
+diff --git a/libcxxabi/src/CMakeLists.txt b/libcxxabi/src/CMakeLists.txt
+index dd23e9bb..bebe470f 100644
+--- a/libcxxabi/src/CMakeLists.txt
++++ b/libcxxabi/src/CMakeLists.txt
+@@ -36,7 +36,9 @@ else()
+   )
+ endif()
+ 
+-if (LIBCXXABI_ENABLE_THREADS AND (UNIX OR FUCHSIA) AND NOT (APPLE OR CYGWIN)
++# On Nocturne the C library has no __cxa_thread_atexit_impl, so libc++abi runs
++# thread_local destructors itself through C11 tss destructors.
++if (LIBCXXABI_ENABLE_THREADS AND (UNIX OR FUCHSIA OR NOCTURNE) AND NOT (APPLE OR CYGWIN)
+     AND NOT ("${CMAKE_SYSTEM_NAME}" MATCHES "AIX"))
+   list(APPEND LIBCXXABI_SOURCES
+     cxa_thread_atexit.cpp
+diff --git a/libcxxabi/src/cxa_thread_atexit.cpp b/libcxxabi/src/cxa_thread_atexit.cpp
+index 402a52c7..40806773 100644
+--- a/libcxxabi/src/cxa_thread_atexit.cpp
++++ b/libcxxabi/src/cxa_thread_atexit.cpp
+@@ -21,6 +21,10 @@ namespace __cxxabiv1 {
+ 
+   using Dtor = void(*)(void*);
+ 
++  // A Nocturne program links one static C library, which has no
++  // __cxa_thread_atexit_impl, so the list below is always the implementation
++  // and nothing is looked up at run time.
++#if !defined(__nocturne__)
+   extern "C"
+ #ifndef HAVE___CXA_THREAD_ATEXIT_IMPL
+   // A weak symbol is used to detect this function's presence in the C library
+@@ -28,6 +32,7 @@ namespace __cxxabiv1 {
+   _LIBCXXABI_WEAK
+ #endif
+   int __cxa_thread_atexit_impl(Dtor, void*, void*);
++#endif
+ 
+ #ifndef HAVE___CXA_THREAD_ATEXIT_IMPL
+ 
+@@ -106,16 +111,19 @@ namespace {
+ 
+ #endif // HAVE___CXA_THREAD_ATEXIT_IMPL
+ 
+-#if defined(__linux__) || defined(__Fuchsia__)
++#if defined(__linux__) || defined(__Fuchsia__) || defined(__nocturne__)
+ extern "C" {
+ 
+   _LIBCXXABI_FUNC_VIS int __cxa_thread_atexit(Dtor dtor, void* obj, void* dso_symbol) throw() {
+ #ifdef HAVE___CXA_THREAD_ATEXIT_IMPL
+     return __cxa_thread_atexit_impl(dtor, obj, dso_symbol);
+ #else
++#  if !defined(__nocturne__)
+     if (__cxa_thread_atexit_impl) {
+       return __cxa_thread_atexit_impl(dtor, obj, dso_symbol);
+-    } else {
++    } else
++#  endif
++    {
+       // Initialize the dtors std::__libcpp_tls_key (uses __cxa_guard_*() for
+       // one-time initialization and __cxa_atexit() for destruction)
+       static DtorsManager manager;
+@@ -142,5 +150,5 @@ extern "C" {
+ #endif // HAVE___CXA_THREAD_ATEXIT_IMPL
+   }
+ } // extern "C"
+-#endif // defined(__linux__) || defined(__Fuchsia__)
++#endif // defined(__linux__) || defined(__Fuchsia__) || defined(__nocturne__)
+ } // namespace __cxxabiv1
+diff --git a/libunwind/src/RWMutex.hpp b/libunwind/src/RWMutex.hpp
+index 344d3564..12e2a97e 100644
+--- a/libunwind/src/RWMutex.hpp
++++ b/libunwind/src/RWMutex.hpp
+@@ -15,6 +15,8 @@
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
++#elif defined(__nocturne__)
++#include <threads.h>
+ #elif !defined(_LIBUNWIND_HAS_NO_THREADS)
+ #include <pthread.h>
+ #if defined(__ELF__) && defined(_LIBUNWIND_LINK_PTHREAD_LIB)
+@@ -59,6 +61,21 @@ private:
+   SRWLOCK _lock = SRWLOCK_INIT;
+ };
+ 
++#elif defined(__nocturne__)
++
++// Nocturne's C11 mutex, which a zeroed mtx_t is (as for libc++'s std::mutex).
++// Readers take it alone too: what it guards is only looked at for a moment.
++class _LIBUNWIND_HIDDEN RWMutex {
++public:
++  bool lock_shared() { return lock(); }
++  bool unlock_shared() { return unlock(); }
++  bool lock() { return mtx_lock(&_lock) == thrd_success; }
++  bool unlock() { return mtx_unlock(&_lock) == thrd_success; }
++
++private:
++  mtx_t _lock = {};
++};
++
+ #elif !defined(LIBUNWIND_USE_WEAK_PTHREAD)
+ 
+ class _LIBUNWIND_HIDDEN RWMutex {
+diff --git a/lld/Common/Filesystem.cpp b/lld/Common/Filesystem.cpp
+index c2d36441..3605286e 100644
+--- a/lld/Common/Filesystem.cpp
++++ b/lld/Common/Filesystem.cpp
+@@ -75,6 +75,9 @@ void lld::unlinkAsync(StringRef path) {
+       sys::fs::remove(tmpName);
+   }
+   sys::fs::remove(path);
++#elif defined(__nocturne__)
++  // The output replaces the document when it is saved whole, so the document
++  // is left as it is: removing it would only leave its name without one.
+ #else
+   if (parallel::strategy.ThreadsRequested == 1)
+     return;
+diff --git a/lld/MachO/Driver.cpp b/lld/MachO/Driver.cpp
+index 2864c6d2..99d774b5 100644
+--- a/lld/MachO/Driver.cpp
++++ b/lld/MachO/Driver.cpp
+@@ -55,7 +55,7 @@
+ #include "llvm/TextAPI/Architecture.h"
+ #include "llvm/TextAPI/PackedVersion.h"
+ 
+-#if !_WIN32
++#if !_WIN32 && !defined(__nocturne__)
+ #include <sys/mman.h>
+ #endif
+ 
+@@ -368,7 +368,7 @@ void multiThreadedPageInBackground(DeferredFiles &deferred) {
+     totalBytes += buff.size();
+     numDeferedFilesAdvised += 1;
+ #endif
+-#if _WIN32
++#if _WIN32 || defined(__nocturne__)
+     // Reference all file's mmap'd pages to load them into memory.
+     for (const char *page = buff.data(), *end = page + buff.size();
+          page < end && !pageInQueue.stopAllWork; page += pageSize) {
+diff --git a/llvm/cmake/config-ix.cmake b/llvm/cmake/config-ix.cmake
+index aca87f15..681d2c31 100644
+--- a/llvm/cmake/config-ix.cmake
++++ b/llvm/cmake/config-ix.cmake
+@@ -28,7 +28,8 @@ elseif (APPLE)
+   set(HAVE_SYSEXITS_H 1)
+   set(HAVE_UNISTD_H 1)
+   set(HAVE_SYS_IOCTL_H 1)
+-elseif (WIN32)
++elseif (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Nocturne")
++  # Nocturne's C library is ISO C's and Nocturne's own (nocturne.h).
+   set(HAVE_MACH_MACH_H 0)
+   set(HAVE_MALLOC_MALLOC_H 0)
+   set(HAVE_PTHREAD_H 0)
+@@ -643,7 +644,8 @@ endif( MSVC )
+ 
+ if( LLVM_ENABLE_THREADS )
+   # Check if threading primitives aren't supported on this platform
+-  if( NOT HAVE_PTHREAD_H AND NOT WIN32 )
++  if( NOT HAVE_PTHREAD_H AND NOT WIN32 AND
++      NOT CMAKE_SYSTEM_NAME STREQUAL "Nocturne" )
+     set(LLVM_ENABLE_THREADS 0)
+   endif()
+ endif()
+diff --git a/llvm/cmake/modules/HandleLLVMOptions.cmake b/llvm/cmake/modules/HandleLLVMOptions.cmake
+index deca0485..da1e74f3 100644
+--- a/llvm/cmake/modules/HandleLLVMOptions.cmake
++++ b/llvm/cmake/modules/HandleLLVMOptions.cmake
+@@ -252,7 +252,8 @@ elseif(FUCHSIA OR UNIX OR CYGWIN)
+   else()
+     set(LLVM_HAVE_LINK_VERSION_SCRIPT 1)
+   endif()
+-elseif(CMAKE_SYSTEM_NAME STREQUAL "Generic")
++elseif(CMAKE_SYSTEM_NAME STREQUAL "Generic" OR CMAKE_SYSTEM_NAME STREQUAL "Nocturne")
++  # Nocturne is neither: lib/Support has its own Nocturne implementation.
+   set(LLVM_ON_UNIX 0)
+   set(LLVM_HAVE_LINK_VERSION_SCRIPT 0)
+ else()
+diff --git a/llvm/include/llvm-c/DataTypes.h b/llvm/include/llvm-c/DataTypes.h
+index 4eb0ac97..25d8e73e 100644
+--- a/llvm/include/llvm-c/DataTypes.h
++++ b/llvm/include/llvm-c/DataTypes.h
+@@ -40,7 +40,15 @@
+ #endif
+ 
+ /* Note that <inttypes.h> includes <stdint.h>, if this is a C99 system. */
++#ifdef __nocturne__
++/* Nocturne's C library has no <sys/types.h>: LLVM's ssize_t and off_t (a
++   position in a file) are its own. */
++#include <stddef.h>
++typedef ptrdiff_t ssize_t;
++typedef int64_t off_t;
++#else
+ #include <sys/types.h>
++#endif
+ 
+ #ifdef _AIX
+ // GCC is strict about defining large constants: they must have LL modifier.
+diff --git a/llvm/include/llvm-c/lto.h b/llvm/include/llvm-c/lto.h
+index d0a92a6d..d432ff02 100644
+--- a/llvm/include/llvm-c/lto.h
++++ b/llvm/include/llvm-c/lto.h
+@@ -24,7 +24,11 @@
+ #else
+ #include <stddef.h>
+ #endif
++#ifdef __nocturne__
++#include "llvm-c/DataTypes.h" /* off_t */
++#else
+ #include <sys/types.h>
++#endif
+ 
+ #ifndef __cplusplus
+ #if !defined(_MSC_VER)
+diff --git a/llvm/include/llvm/ADT/bit.h b/llvm/include/llvm/ADT/bit.h
+index 3ac23d6d..c5486aa6 100644
+--- a/llvm/include/llvm/ADT/bit.h
++++ b/llvm/include/llvm/ADT/bit.h
+@@ -49,7 +49,7 @@
+ #define LITTLE_ENDIAN 1234
+ #define BYTE_ORDER BIG_ENDIAN
+ #else
+-#if !defined(BYTE_ORDER) && !defined(_WIN32)
++#if !defined(BYTE_ORDER) && !defined(_WIN32) && !defined(__nocturne__)
+ #include <machine/endian.h>
+ #endif
+ #endif
+diff --git a/llvm/include/llvm/DebugInfo/GSYM/FileWriter.h b/llvm/include/llvm/DebugInfo/GSYM/FileWriter.h
+index 1ec34826..92155d59 100644
+--- a/llvm/include/llvm/DebugInfo/GSYM/FileWriter.h
++++ b/llvm/include/llvm/DebugInfo/GSYM/FileWriter.h
+@@ -15,7 +15,6 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
+-#include <sys/types.h>
+ 
+ namespace llvm {
+ class raw_pwrite_stream;
+diff --git a/llvm/include/llvm/Support/ExitCodes.h b/llvm/include/llvm/Support/ExitCodes.h
+index 4eb5dedc..89c259f4 100644
+--- a/llvm/include/llvm/Support/ExitCodes.h
++++ b/llvm/include/llvm/Support/ExitCodes.h
+@@ -20,9 +20,10 @@
+ 
+ #if HAVE_SYSEXITS_H
+ #include <sysexits.h>
+-#elif __MVS__ || defined(_WIN32)
+-// <sysexits.h> does not exist on z/OS and Windows. The only value used in LLVM
+-// is EX_IOERR, which is used to signal a special error condition (broken pipe).
++#elif __MVS__ || defined(_WIN32) || defined(__nocturne__)
++// <sysexits.h> does not exist on z/OS, Windows and Nocturne. The only value
++// used in LLVM is EX_IOERR, which is used to signal a special error condition
++// (broken pipe).
+ // Define the macro with its usual value from BSD systems, which is chosen to
+ // not clash with more standard exit codes like 1.
+ #define EX_IOERR 74
+diff --git a/llvm/include/llvm/Support/FileSystem.h b/llvm/include/llvm/Support/FileSystem.h
+index 1f66bca3..9fc3f7c3 100644
+--- a/llvm/include/llvm/Support/FileSystem.h
++++ b/llvm/include/llvm/Support/FileSystem.h
+@@ -147,6 +147,11 @@ protected:
+   uint32_t LastWriteTimeLow = 0;
+   uint32_t FileSizeHigh = 0;
+   uint32_t FileSizeLow = 0;
++  #elif defined(__nocturne__)
++  // A Nocturne entry records only when it last changed.
++  int64_t ModifiedSeconds = 0;
++  uint32_t ModifiedNanoseconds = 0;
++  uint64_t Size = 0;
+   #endif
+   file_type Type = file_type::status_error;
+   perms Perms = perms_not_known;
+@@ -174,6 +179,12 @@ public:
+         LastWriteTimeHigh(LastWriteTimeHigh),
+         LastWriteTimeLow(LastWriteTimeLow), FileSizeHigh(FileSizeHigh),
+         FileSizeLow(FileSizeLow), Type(Type), Perms(Perms) {}
++#elif defined(__nocturne__)
++  basic_file_status(file_type Type, perms Perms, int64_t ModifiedSeconds,
++                    uint32_t ModifiedNanoseconds, uint64_t Size)
++      : ModifiedSeconds(ModifiedSeconds),
++        ModifiedNanoseconds(ModifiedNanoseconds), Size(Size), Type(Type),
++        Perms(Perms) {}
+   #endif
+ 
+   // getters
+@@ -211,6 +222,11 @@ public:
+   uint64_t getSize() const {
+     return (uint64_t(FileSizeHigh) << 32) + FileSizeLow;
+   }
++#elif defined(__nocturne__)
++  // Nocturne has no owning users or groups.
++  uint32_t getUser() const { return 0; }
++  uint32_t getGroup() const { return 0; }
++  uint64_t getSize() const { return Size; }
+ #endif
+ 
+   // setters
+@@ -230,6 +246,10 @@ class file_status : public basic_file_status {
+   uint32_t NumLinks = 0;
+   uint32_t VolumeSerialNumber = 0;
+   uint64_t PathHash = 0;
++#elif defined(__nocturne__)
++  // The entry's identity on C:, which stays with it when it moves and is
++  // never given to another entry. There are no links: one name per entry.
++  uint64_t EntryID = 0;
+ #endif
+ 
+ public:
+@@ -256,6 +276,13 @@ public:
+                           FileSizeLow),
+         NumLinks(LinkCount), VolumeSerialNumber(VolumeSerialNumber),
+         PathHash(PathHash) {}
++  #elif defined(__nocturne__)
++  file_status(file_type Type, perms Perms, uint64_t EntryID,
++              int64_t ModifiedSeconds, uint32_t ModifiedNanoseconds,
++              uint64_t Size)
++      : basic_file_status(Type, Perms, ModifiedSeconds, ModifiedNanoseconds,
++                          Size),
++        EntryID(EntryID) {}
+   #endif
+ 
+   LLVM_ABI UniqueID getUniqueID() const;
+diff --git a/llvm/include/llvm/Support/Path.h b/llvm/include/llvm/Support/Path.h
+index 28e1e8ba..143873dc 100644
+--- a/llvm/include/llvm/Support/Path.h
++++ b/llvm/include/llvm/Support/Path.h
+@@ -39,7 +39,8 @@ constexpr bool is_style_posix(Style S) {
+     return true;
+   if (S != Style::native)
+     return false;
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__nocturne__)
++  // Nocturne paths are "C:\a\b" too, with '/' working as '\'.
+   return false;
+ #else
+   return true;
+diff --git a/llvm/include/llvm/Support/Program.h b/llvm/include/llvm/Support/Program.h
+index 575e4165..2eab959d 100644
+--- a/llvm/include/llvm/Support/Program.h
++++ b/llvm/include/llvm/Support/Program.h
+@@ -31,13 +31,16 @@ namespace sys {
+ // a colon on Unix or a semicolon on Windows.
+ #if defined(LLVM_ON_UNIX)
+ const char EnvPathSeparator = ':';
+-#elif defined(_WIN32)
++#elif defined(_WIN32) || defined(__nocturne__)
+ const char EnvPathSeparator = ';';
+ #endif
+ 
+ #if defined(_WIN32)
+ typedef unsigned long procid_t; // Must match the type of DWORD on Windows.
+ typedef void *process_t;        // Must match the type of HANDLE on Windows.
++#elif defined(__nocturne__)
++using procid_t = int64_t;  // The app's identifier (n_app_id), never reused.
++using process_t = int32_t; // The n_handle n_app_launch gave for the app.
+ #else
+ using procid_t = ::pid_t;
+ using process_t = procid_t;
+diff --git a/llvm/include/llvm/Support/Signals.h b/llvm/include/llvm/Support/Signals.h
+index d9bff20b..96d7f75e 100644
+--- a/llvm/include/llvm/Support/Signals.h
++++ b/llvm/include/llvm/Support/Signals.h
+@@ -149,8 +149,9 @@ LLVM_ABI void SetOneShotPipeSignalFunction(void (*Handler)());
+ /// code.
+ LLVM_ABI void DefaultOneShotPipeSignalHandler();
+ 
+-#ifdef _WIN32
+-/// Windows does not support signals and this handler must be called manually.
++#if defined(_WIN32) || defined(__nocturne__)
++/// Windows and Nocturne do not support signals and this handler must be
++/// called manually.
+ LLVM_ABI void CallOneShotPipeSignalHandler();
+ #endif
+ 
+diff --git a/llvm/include/llvm/Support/Threading.h b/llvm/include/llvm/Support/Threading.h
+index 89d90b34..4e4ebedd 100644
+--- a/llvm/include/llvm/Support/Threading.h
++++ b/llvm/include/llvm/Support/Threading.h
+@@ -34,6 +34,9 @@
+ #elif defined(LLVM_ON_UNIX) &&                                                 \
+     (defined(__powerpc__) && defined(__LITTLE_ENDIAN__))
+ #define LLVM_THREADING_USE_STD_CALL_ONCE 1
++#elif defined(__nocturne__)
++// libc++ on Nocturne's C11 threads.
++#define LLVM_THREADING_USE_STD_CALL_ONCE 1
+ #else
+ #define LLVM_THREADING_USE_STD_CALL_ONCE 0
+ #endif
+diff --git a/llvm/include/llvm/Support/thread.h b/llvm/include/llvm/Support/thread.h
+index 1a4874ea..3a9c5902 100644
+--- a/llvm/include/llvm/Support/thread.h
++++ b/llvm/include/llvm/Support/thread.h
+@@ -34,7 +34,7 @@ typedef PVOID HANDLE;
+ 
+ namespace llvm {
+ 
+-#if defined(LLVM_ON_UNIX) || defined(_WIN32)
++#if defined(LLVM_ON_UNIX) || defined(_WIN32) || defined(__nocturne__)
+ 
+ /// LLVM thread following std::thread interface with added constructor to
+ /// specify stack size.
+@@ -74,6 +74,15 @@ public:
+     GenericThreadProxy<CalleeTuple>(Ptr);
+     return 0;
+   }
++#elif defined(__nocturne__)
++  // A native thread is named by the id thread_create gave it, never 0.
++  using native_handle_type = int;
++  using id = int;
++  using start_routine_type = void (*)(void *);
++
++  template <typename CalleeTuple> static void ThreadProxy(void *Ptr) {
++    GenericThreadProxy<CalleeTuple>(Ptr);
++  }
+ #endif
+ 
+   LLVM_ABI static const std::optional<unsigned> DefaultStackSize;
+@@ -161,7 +170,7 @@ namespace this_thread {
+ inline thread::id get_id() { return llvm_thread_get_current_id_impl(); }
+ } // namespace this_thread
+ 
+-#else // !LLVM_ON_UNIX && !_WIN32
++#else // !LLVM_ON_UNIX && !_WIN32 && !__nocturne__
+ 
+ /// std::thread backed implementation of llvm::thread interface that ignores the
+ /// stack size request.
+@@ -214,7 +223,7 @@ namespace this_thread {
+ inline thread::id get_id() { return std::this_thread::get_id(); }
+ } // namespace this_thread
+ 
+-#endif // LLVM_ON_UNIX || _WIN32
++#endif // LLVM_ON_UNIX || _WIN32 || __nocturne__
+ 
+ } // namespace llvm
+ 
+diff --git a/llvm/include/llvm/TargetParser/Triple.h b/llvm/include/llvm/TargetParser/Triple.h
+index c5af2325..20569b3c 100644
+--- a/llvm/include/llvm/TargetParser/Triple.h
++++ b/llvm/include/llvm/TargetParser/Triple.h
+@@ -349,7 +349,8 @@ public:
+     Firmware,
+     QURT,
+     H2,
+-    LastOSType = H2
++    Nocturne, // Nocturne OS
++    LastOSType = Nocturne
+   };
+   enum EnvironmentType {
+     UnknownEnvironment,
+@@ -855,6 +856,9 @@ public:
+ 
+   bool isOSSerenity() const { return getOS() == Triple::Serenity; }
+ 
++  /// Tests whether the OS is Nocturne.
++  bool isOSNocturne() const { return getOS() == Triple::Nocturne; }
++
+   /// Tests whether the OS is QURT.
+   bool isOSQurt() const { return getOS() == Triple::QURT; }
+ 
+diff --git a/llvm/include/llvm/TargetParser/TripleName.def b/llvm/include/llvm/TargetParser/TripleName.def
+index bbc03b31..8485c720 100644
+--- a/llvm/include/llvm/TargetParser/TripleName.def
++++ b/llvm/include/llvm/TargetParser/TripleName.def
+@@ -81,6 +81,7 @@ TRIPLE_OS(ChipStar, "chipstar")
+ TRIPLE_OS(Firmware, "firmware")
+ TRIPLE_OS(QURT, "qurt")
+ TRIPLE_OS(H2, "h2")
++TRIPLE_OS(Nocturne, "nocturne")
+ 
+ #undef TRIPLE_OS
+ #undef TRIPLE_OS_ALIAS
+diff --git a/llvm/lib/BinaryFormat/Magic.cpp b/llvm/lib/BinaryFormat/Magic.cpp
+index 0786c4b9..44079107 100644
+--- a/llvm/lib/BinaryFormat/Magic.cpp
++++ b/llvm/lib/BinaryFormat/Magic.cpp
+@@ -14,12 +14,6 @@
+ #include "llvm/Support/Endian.h"
+ #include "llvm/Support/MemoryBuffer.h"
+ 
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
+-#include <unistd.h>
+-#else
+-#include <io.h>
+-#endif
+-
+ using namespace llvm;
+ using namespace llvm::support::endian;
+ using namespace llvm::sys::fs;
+diff --git a/llvm/lib/LTO/ThinLTOCodeGenerator.cpp b/llvm/lib/LTO/ThinLTOCodeGenerator.cpp
+index 2ad2f97b..05b529ec 100644
+--- a/llvm/lib/LTO/ThinLTOCodeGenerator.cpp
++++ b/llvm/lib/LTO/ThinLTOCodeGenerator.cpp
+@@ -59,12 +59,6 @@
+ #include "llvm/Transforms/IPO/WholeProgramDevirt.h"
+ #include "llvm/Transforms/Utils/FunctionImportUtils.h"
+ 
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
+-#include <unistd.h>
+-#else
+-#include <io.h>
+-#endif
+-
+ using namespace llvm;
+ using namespace ThinLTOCodeGeneratorImpl;
+ 
+diff --git a/llvm/lib/Object/ArchiveWriter.cpp b/llvm/lib/Object/ArchiveWriter.cpp
+index 9af8e0ef..1aba035e 100644
+--- a/llvm/lib/Object/ArchiveWriter.cpp
++++ b/llvm/lib/Object/ArchiveWriter.cpp
+@@ -39,12 +39,6 @@
+ #include <cerrno>
+ #include <map>
+ 
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
+-#include <unistd.h>
+-#else
+-#include <io.h>
+-#endif
+-
+ using namespace llvm;
+ using namespace llvm::object;
+ 
+diff --git a/llvm/lib/Support/CMakeLists.txt b/llvm/lib/Support/CMakeLists.txt
+index 1a3fa39c..f435e646 100644
+--- a/llvm/lib/Support/CMakeLists.txt
++++ b/llvm/lib/Support/CMakeLists.txt
+@@ -142,6 +142,15 @@ endif()
+ 
+ add_subdirectory(BLAKE3)
+ 
++# raw_socket_stream is made of UNIX domain sockets, which Nocturne does not have:
++# its programs talk over named channels (n_channel_*), which carry messages, not
++# a stream of bytes. Nothing in LLVM, clang or lld uses it.
++if (NOCTURNE)
++  list(APPEND LLVM_OPTIONAL_SOURCES raw_socket_stream.cpp)
++else()
++  set(SOCKET_FILES raw_socket_stream.cpp)
++endif()
++
+ add_llvm_component_library(LLVMSupport
+   ABIBreak.cpp
+   AMDGPUMetadata.cpp
+@@ -293,7 +302,7 @@ add_llvm_component_library(LLVMSupport
+   raw_os_ostream.cpp
+   raw_ostream.cpp
+   raw_ostream_proxy.cpp
+-  raw_socket_stream.cpp
++  ${SOCKET_FILES}
+   regcomp.c
+   regerror.c
+   regexec.c
+diff --git a/llvm/lib/Support/COM.cpp b/llvm/lib/Support/COM.cpp
+index f37b95ba..21fa9a03 100644
+--- a/llvm/lib/Support/COM.cpp
++++ b/llvm/lib/Support/COM.cpp
+@@ -19,4 +19,6 @@
+ #include "Unix/COM.inc"
+ #elif defined(_WIN32)
+ #include "Windows/COM.inc"
++#elif defined(__nocturne__)
++#include "Nocturne/COM.inc"
+ #endif
+diff --git a/llvm/lib/Support/Caching.cpp b/llvm/lib/Support/Caching.cpp
+index 40a5c447..6e2bb228 100644
+--- a/llvm/lib/Support/Caching.cpp
++++ b/llvm/lib/Support/Caching.cpp
+@@ -18,12 +18,6 @@
+ #include "llvm/Support/MemoryBuffer.h"
+ #include "llvm/Support/Path.h"
+ 
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
+-#include <unistd.h>
+-#else
+-#include <io.h>
+-#endif
+-
+ using namespace llvm;
+ 
+ Expected<FileCache> llvm::localCache(const Twine &CacheNameRef,
+diff --git a/llvm/lib/Support/CrashRecoveryContext.cpp b/llvm/lib/Support/CrashRecoveryContext.cpp
+index 493ba951..5608857e 100644
+--- a/llvm/lib/Support/CrashRecoveryContext.cpp
++++ b/llvm/lib/Support/CrashRecoveryContext.cpp
+@@ -10,6 +10,7 @@
+ #include "llvm/Config/llvm-config.h"
+ #include "llvm/Support/ErrorHandling.h"
+ #include "llvm/Support/ExitCodes.h"
++#include "llvm/Support/Process.h"
+ #include "llvm/Support/Signals.h"
+ #include "llvm/Support/thread.h"
+ #include <cassert>
+@@ -335,7 +336,15 @@ static void uninstallExceptionOrSignalHandlers() {
+   }
+ }
+ 
+-#else // !_WIN32
++#elif defined(__nocturne__)
++
++// Nocturne has no signals: a fault ends the app, and the system reports where.
++// Only HandleExit, which jumps back to RunSafely, is recovered from.
++static void installExceptionOrSignalHandlers(bool) {}
++
++static void uninstallExceptionOrSignalHandlers() {}
++
++#else // !_WIN32 && !__nocturne__
+ 
+ // Generic POSIX implementation.
+ //
+@@ -422,7 +431,7 @@ static void uninstallExceptionOrSignalHandlers() {
+     sigaction(Signals[i], &PrevActions[i], nullptr);
+ }
+ 
+-#endif // !_WIN32
++#endif // !_WIN32 && !__nocturne__
+ 
+ bool CrashRecoveryContext::RunSafely(function_ref<void()> Fn) {
+   // If crash recovery is disabled, do nothing.
+@@ -483,6 +492,9 @@ bool CrashRecoveryContext::throwIfCrash(int RetCode) {
+     return false;
+ #if defined(_WIN32)
+   ::RaiseException(RetCode, 0, 0, NULL);
++#elif defined(__nocturne__)
++  // End the app with the result it would have had.
++  sys::Process::Exit(RetCode, /*NoCleanup=*/true);
+ #else
+   llvm::sys::unregisterHandlers();
+   raise(RetCode - 128);
+diff --git a/llvm/lib/Support/DynamicLibrary.cpp b/llvm/lib/Support/DynamicLibrary.cpp
+index 61566d37..7b1f1a7d 100644
+--- a/llvm/lib/Support/DynamicLibrary.cpp
++++ b/llvm/lib/Support/DynamicLibrary.cpp
+@@ -140,6 +140,10 @@ Globals &getGlobals() {
+ 
+ #include "Windows/DynamicLibrary.inc"
+ 
++#elif defined(__nocturne__)
++
++#include "Nocturne/DynamicLibrary.inc"
++
+ #else
+ 
+ #include "Unix/DynamicLibrary.inc"
+diff --git a/llvm/lib/Support/ErrorHandling.cpp b/llvm/lib/Support/ErrorHandling.cpp
+index 097041f1..9ccb2b9f 100644
+--- a/llvm/lib/Support/ErrorHandling.cpp
++++ b/llvm/lib/Support/ErrorHandling.cpp
+@@ -38,6 +38,9 @@
+ # include <io.h>
+ # include <fcntl.h>
+ #endif
++#if defined(__nocturne__)
++#include <cstdio>
++#endif
+ 
+ using namespace llvm;
+ 
+@@ -64,6 +67,12 @@ static std::mutex BadAllocErrorHandlerMutex;
+ #endif
+ 
+ static bool write_retry(int fd, const char *buf, size_t count) {
++#if defined(__nocturne__)
++  // The C library's errors are unbuffered: they are written without memory
++  // to allocate, as running out of it is reported here.
++  assert(fd == 2 && "only errors are written here");
++  return fwrite(buf, 1, count, stderr) == count;
++#else
+   while (count > 0) {
+     ssize_t written = sys::RetryAfterSignal(-1, ::write, fd, buf, count);
+     if (written <= 0)
+@@ -72,6 +81,7 @@ static bool write_retry(int fd, const char *buf, size_t count) {
+     count -= written;
+   }
+   return true;
++#endif
+ }
+ 
+ void llvm::install_fatal_error_handler(fatal_error_handler_t handler,
+diff --git a/llvm/lib/Support/FileOutputBuffer.cpp b/llvm/lib/Support/FileOutputBuffer.cpp
+index c8b03598..64fab230 100644
+--- a/llvm/lib/Support/FileOutputBuffer.cpp
++++ b/llvm/lib/Support/FileOutputBuffer.cpp
+@@ -17,12 +17,6 @@
+ #include "llvm/Support/TimeProfiler.h"
+ #include <system_error>
+ 
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
+-#include <unistd.h>
+-#else
+-#include <io.h>
+-#endif
+-
+ using namespace llvm;
+ using namespace llvm::sys;
+ 
+@@ -124,7 +118,7 @@ createInMemoryBuffer(StringRef Path, size_t Size, unsigned Mode) {
+   return std::make_unique<InMemoryBuffer>(Path, MB, Size, Mode);
+ }
+ 
+-static Expected<std::unique_ptr<FileOutputBuffer>>
++[[maybe_unused]] static Expected<std::unique_ptr<FileOutputBuffer>>
+ createOnDiskBuffer(StringRef Path, size_t Size, unsigned Mode) {
+   Expected<fs::TempFile> FileOrErr =
+       fs::TempFile::create(Path + ".tmp%%%%%%%", Mode);
+@@ -186,10 +180,16 @@ FileOutputBuffer::create(StringRef Path, size_t Size, unsigned Flags) {
+   case fs::file_type::regular_file:
+   case fs::file_type::file_not_found:
+   case fs::file_type::status_error:
++#if defined(__nocturne__)
++    // Nocturne maps no document, and a document it replaces keeps its old
++    // content until the new one is saved whole: write it in one go.
++    return createInMemoryBuffer(Path, Size, Mode);
++#else
+     if (Flags & F_mmap)
+       return createInMemoryBuffer(Path, Size, Mode);
+     else
+       return createOnDiskBuffer(Path, Size, Mode);
++#endif
+   default:
+     return createInMemoryBuffer(Path, Size, Mode);
+   }
+diff --git a/llvm/lib/Support/FileUtilities.cpp b/llvm/lib/Support/FileUtilities.cpp
+index dbd6c324..3e3f0a20 100644
+--- a/llvm/lib/Support/FileUtilities.cpp
++++ b/llvm/lib/Support/FileUtilities.cpp
+@@ -309,7 +309,7 @@ Error FilePermissionsApplier::apply(
+   if (std::error_code EC = sys::fs::status(FD, OStat))
+     return createFileError(OutputFilename, EC);
+   if (OStat.type() == sys::fs::file_type::regular_file) {
+-#ifndef _WIN32
++#ifdef LLVM_ON_UNIX
+     // Keep ownership if llvm-objcopy is called under root.
+     if (OutputFilename == InputFilename && OStat.getUser() == 0)
+       sys::fs::changeFileOwnership(FD, Status.getUser(), Status.getGroup());
+diff --git a/llvm/lib/Support/Memory.cpp b/llvm/lib/Support/Memory.cpp
+index f1ba2d0c..3de65c4d 100644
+--- a/llvm/lib/Support/Memory.cpp
++++ b/llvm/lib/Support/Memory.cpp
+@@ -25,6 +25,9 @@
+ #ifdef _WIN32
+ #include "Windows/Memory.inc"
+ #endif
++#if defined(__nocturne__)
++#include "Nocturne/Memory.inc"
++#endif
+ 
+ #ifndef NDEBUG
+ 
+diff --git a/llvm/lib/Support/MemoryBuffer.cpp b/llvm/lib/Support/MemoryBuffer.cpp
+index 9c49c143..f5e6fac4 100644
+--- a/llvm/lib/Support/MemoryBuffer.cpp
++++ b/llvm/lib/Support/MemoryBuffer.cpp
+@@ -28,13 +28,7 @@
+ #include <cassert>
+ #include <cstring>
+ #include <new>
+-#include <sys/types.h>
+ #include <system_error>
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
+-#include <unistd.h>
+-#else
+-#include <io.h>
+-#endif
+ 
+ using namespace llvm;
+ 
+@@ -368,7 +362,7 @@ WritableMemoryBuffer::getNewMemBuffer(size_t Size, const Twine &BufferName) {
+ static bool shouldUseMmap(sys::fs::file_t FD,
+                           size_t FileSize,
+                           size_t MapSize,
+-                          off_t Offset,
++                          uint64_t Offset,
+                           bool RequiresNullTerminator,
+                           int PageSize,
+                           bool IsVolatile) {
+diff --git a/llvm/lib/Support/Nocturne/COM.inc b/llvm/lib/Support/Nocturne/COM.inc
+new file mode 100644
+index 00000000..ec7532a2
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/COM.inc
+@@ -0,0 +1,21 @@
++//===- Nocturne/COM.inc - Nocturne COM Implementation ----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Nocturne has no COM to initialize.
++//
++//===----------------------------------------------------------------------===//
++
++namespace llvm {
++namespace sys {
++
++InitializeCOMRAII::InitializeCOMRAII(COMThreadingMode Threading,
++                                     bool SpeedOverMemory) {}
++
++InitializeCOMRAII::~InitializeCOMRAII() = default;
++} // namespace sys
++} // namespace llvm
+diff --git a/llvm/lib/Support/Nocturne/DynamicLibrary.inc b/llvm/lib/Support/Nocturne/DynamicLibrary.inc
+new file mode 100644
+index 00000000..24e04297
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/DynamicLibrary.inc
+@@ -0,0 +1,43 @@
++//===- Nocturne/DynamicLibrary.inc - Nocturne DynamicLibrary ---*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// A Nocturne program is linked whole: there are no libraries to load into a
++// running app, and its own symbols are not looked up by name. Only symbols
++// added with DynamicLibrary::AddSymbol and the C streams below are found.
++//
++//===----------------------------------------------------------------------===//
++
++#include <cstdio>
++#include <cstring>
++
++DynamicLibrary::HandleSet::~HandleSet() {
++  // llvm_shutdown called, Return to default
++  DynamicLibrary::SearchOrder = DynamicLibrary::SO_Linker;
++}
++
++void *DynamicLibrary::HandleSet::DLOpen(const char *File, std::string *Err) {
++  if (Err)
++    *Err = "Nocturne loads no libraries into a running app";
++  return &Invalid;
++}
++
++void DynamicLibrary::HandleSet::DLClose(void *Handle) {}
++
++void *DynamicLibrary::HandleSet::DLSym(void *Handle, const char *Symbol) {
++  return nullptr;
++}
++
++static void *DoSearch(const char *SymbolName) {
++  if (!strcmp(SymbolName, "stdin"))
++    return &stdin;
++  if (!strcmp(SymbolName, "stdout"))
++    return &stdout;
++  if (!strcmp(SymbolName, "stderr"))
++    return &stderr;
++  return nullptr;
++}
+diff --git a/llvm/lib/Support/Nocturne/Memory.inc b/llvm/lib/Support/Nocturne/Memory.inc
+new file mode 100644
+index 00000000..eeb0ffb1
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/Memory.inc
+@@ -0,0 +1,106 @@
++//===- Nocturne/Memory.inc - Nocturne Memory Implementation ----*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Nocturne's memory pages are zero-filled and readable, and either writable or
++// executable, never both. An app does not choose where they go.
++//
++//===----------------------------------------------------------------------===//
++
++#include "Nocturne.h"
++#include "llvm/Support/Alignment.h"
++#include "llvm/Support/Errc.h"
++#include "llvm/Support/MathExtras.h"
++#include "llvm/Support/Process.h"
++
++namespace llvm {
++namespace sys {
++
++// The access Nocturne gives for Flags, or 0 for none it gives.
++static int accessFor(unsigned Flags) {
++  switch (Flags & Memory::MF_RWE_MASK) {
++  case Memory::MF_READ:
++    return N_MEMORY_READ;
++  case Memory::MF_WRITE:
++  case Memory::MF_READ | Memory::MF_WRITE:
++    return N_MEMORY_READ_WRITE;
++  case Memory::MF_EXEC:
++  case Memory::MF_READ | Memory::MF_EXEC:
++    return N_MEMORY_READ_EXECUTE;
++  default:
++    return 0;
++  }
++}
++
++MemoryBlock Memory::allocateMappedMemory(size_t NumBytes,
++                                         const MemoryBlock *const NearBlock,
++                                         unsigned PFlags, std::error_code &EC) {
++  EC = std::error_code();
++  if (NumBytes == 0)
++    return MemoryBlock();
++  int Access = accessFor(PFlags);
++  if (!Access) {
++    EC = make_error_code(errc::permission_denied);
++    return MemoryBlock();
++  }
++
++  static const size_t PageSize = Process::getPageSizeEstimate();
++  size_t Bytes = alignTo(NumBytes, PageSize);
++  void *Address = nullptr;
++  n_result R = n_memory_reserve(Bytes, Access, &Address);
++  if (R < 0) {
++    EC = nocturne::errorCode(R);
++    return MemoryBlock();
++  }
++
++  MemoryBlock Result;
++  Result.Address = Address;
++  Result.AllocatedSize = Bytes;
++  Result.Flags = PFlags;
++  return Result;
++}
++
++std::error_code Memory::releaseMappedMemory(MemoryBlock &M) {
++  if (M.Address == nullptr || M.AllocatedSize == 0)
++    return std::error_code();
++
++  n_result R = n_memory_release(M.Address, M.AllocatedSize);
++  if (R < 0)
++    return nocturne::errorCode(R);
++
++  M.Address = nullptr;
++  M.AllocatedSize = 0;
++  return std::error_code();
++}
++
++std::error_code Memory::protectMappedMemory(const MemoryBlock &M,
++                                            unsigned Flags) {
++  if (M.Address == nullptr || M.AllocatedSize == 0)
++    return std::error_code();
++  if (!Flags)
++    return make_error_code(errc::invalid_argument);
++  int Access = accessFor(Flags);
++  if (!Access)
++    return make_error_code(errc::permission_denied);
++
++  static const Align PageSize = Align(Process::getPageSizeEstimate());
++  uintptr_t Start =
++      alignAddr((const uint8_t *)M.Address - PageSize.value() + 1, PageSize);
++  uintptr_t End =
++      alignAddr((const uint8_t *)M.Address + M.AllocatedSize, PageSize);
++  n_result R = n_memory_protect(reinterpret_cast<void *>(Start), End - Start,
++                                Access);
++  if (R < 0)
++    return nocturne::errorCode(R);
++  return std::error_code();
++}
++
++// x86-64 keeps instruction caches coherent with the writes.
++void Memory::InvalidateInstructionCache(const void *Addr, size_t Len) {}
++
++} // namespace sys
++} // namespace llvm
+diff --git a/llvm/lib/Support/Nocturne/Nocturne.h b/llvm/lib/Support/Nocturne/Nocturne.h
+new file mode 100644
+index 00000000..ceb46dca
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/Nocturne.h
+@@ -0,0 +1,77 @@
++//===- llvm/Support/Nocturne/Nocturne.h - Common Nocturne Include File ---===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// The Nocturne implementations of the Support library use Nocturne's native
++// interface (nocturne.h): typed handles, documents and folders named by
++// complete paths, message channels and apps. This header holds what several
++// of them share.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_SUPPORT_NOCTURNE_NOCTURNE_H
++#define LLVM_LIB_SUPPORT_NOCTURNE_NOCTURNE_H
++
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/ADT/Twine.h"
++#include "llvm/Support/FileSystem.h"
++#include <cstdint>
++#include <nocturne.h>
++#include <string>
++#include <system_error>
++
++namespace llvm {
++namespace sys {
++namespace nocturne {
++
++/// A failed n_result is a negated N_ERR_* code, which is also the errno value
++/// for it, so the generic category names it and compares it with std::errc.
++inline std::error_code errorCode(n_result R) {
++  return std::error_code(static_cast<int>(-R), std::generic_category());
++}
++
++/// Sets *ErrMsg, when there is one, to Prefix and what EC says.
++inline void setErrMsg(std::string *ErrMsg, const Twine &Prefix,
++                      std::error_code EC) {
++  if (ErrMsg)
++    *ErrMsg = (Prefix + ": " + EC.message()).str();
++}
++
++/// Path as Nocturne takes it: complete ("C:\a\b", with "." and ".." resolved),
++/// taken inside this app's folder when it is not complete already. Result is
++/// followed by a nul that is not part of it.
++std::error_code completePath(const Twine &Path, SmallVectorImpl<char> &Result);
++
++/// The complete path of the program Name names, as find_program finds it: a
++/// bare name in the system's folder, then in each app's folder under Programs;
++/// any other name completed. Empty when there is none.
++std::string findProgram(StringRef Name);
++
++/// A document has no shared cursor, so fs keeps where each handle reads and
++/// writes next: from the start of a document fs opened, and at the end of one
++/// it opened to append to. A document the app was given (its input or output)
++/// is read from its start and written at its end, as another app reads that
++/// output after it. A channel carries the bytes in order, as messages.
++///
++/// Reading is fs::readNativeFile. write writes all of Data where H writes.
++std::error_code write(fs::file_t H, StringRef Data);
++
++/// Where H reads and writes next in a document, or -1 when H has no such
++/// place: it appends, or it is a channel.
++int64_t position(fs::file_t H);
++std::error_code setPosition(fs::file_t H, uint64_t Position);
++
++/// Closes H, which saves a document it replaces, and forgets what fs kept
++/// for it.
++std::error_code close(fs::file_t H);
++
++} // namespace nocturne
++} // namespace sys
++} // namespace llvm
++
++#endif
+diff --git a/llvm/lib/Support/Nocturne/Path.inc b/llvm/lib/Support/Nocturne/Path.inc
+new file mode 100644
+index 00000000..3f83d270
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/Path.inc
+@@ -0,0 +1,822 @@
++//===- Nocturne/Path.inc - Nocturne Path Implementation ---------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements the Path API on Nocturne's documents and folders.
++// Nocturne takes complete paths ("C:\a\b"); a name is taken inside the app's
++// folder (its setting FOLDER). Names compare without regard to case and are
++// kept as they were given. There are no links, owners or permissions, and an
++// entry's id identifies it for as long as it exists, wherever it moves.
++//
++//===----------------------------------------------------------------------===//
++
++#include "Nocturne.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/Support/Chrono.h"
++#include "llvm/Support/MathExtras.h"
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++
++namespace llvm {
++namespace sys {
++
++std::error_code nocturne::completePath(const Twine &Path,
++                                       SmallVectorImpl<char> &Result) {
++  SmallString<128> Storage;
++  StringRef Name = Path.toNullTerminatedStringRef(Storage);
++  // The folder it is taken in adds to its length; doubling finds room.
++  size_t Capacity = Name.size() + 256;
++  for (;;) {
++    Result.resize_for_overwrite(Capacity);
++    n_result Length = n_path_complete(Name.data(), Result.data(), Capacity);
++    if (Length >= 0) {
++      Result.truncate(Length); // the nul after it stays
++      return std::error_code();
++    }
++    if (Length != -N_ERR_TOO_LARGE) {
++      Result.clear();
++      return errorCode(Length);
++    }
++    Capacity *= 2;
++  }
++}
++
++std::string nocturne::findProgram(StringRef Name) {
++  std::string NameStr = Name.str();
++  char Program[4096];
++  if (!find_program(NameStr.c_str(), Program, sizeof(Program)))
++    return std::string();
++  return Program;
++}
++
++namespace {
++
++// What fs keeps for a handle it reads or writes (Nocturne.h). A channel gives
++// a message whole, so a read with less room than the message keeps the rest
++// for the reads after it.
++struct HandleState {
++  std::mutex Lock;
++  int64_t Kind = 0;      // N_KIND_*
++  bool Append = false;   // writes go to the document's end
++  bool Claimed = false;  // lockFile holds the document's claim
++  uint64_t Position = 0; // in a document
++  std::string Message;   // from a channel, read up to MessageRead
++  size_t MessageRead = 0;
++};
++
++class HandleStates {
++  std::mutex Lock;
++  DenseMap<fs::file_t, std::shared_ptr<HandleState>> States;
++
++public:
++  // A document fs opened.
++  void opened(fs::file_t H, bool Append) {
++    auto State = std::make_shared<HandleState>();
++    State->Kind = N_KIND_DOCUMENT;
++    State->Append = Append;
++    std::lock_guard<std::mutex> Guard(Lock);
++    States[H] = std::move(State);
++  }
++
++  // Null when H is not open. A handle fs did not open is one the app was
++  // given: a document of it is written at its end.
++  std::shared_ptr<HandleState> get(fs::file_t H) {
++    std::lock_guard<std::mutex> Guard(Lock);
++    std::shared_ptr<HandleState> &State = States[H];
++    if (!State) {
++      n_result Kind = n_handle_kind(H);
++      if (Kind < 0) {
++        States.erase(H);
++        return nullptr;
++      }
++      State = std::make_shared<HandleState>();
++      State->Kind = Kind;
++      State->Append = Kind == N_KIND_DOCUMENT;
++    }
++    return State;
++  }
++
++  void forget(fs::file_t H) {
++    std::lock_guard<std::mutex> Guard(Lock);
++    States.erase(H);
++  }
++};
++
++// Never destroyed: streams flush into it while static objects are destroyed.
++HandleStates &handleStates() {
++  static HandleStates *States = new HandleStates();
++  return *States;
++}
++
++} // end anonymous namespace
++
++std::error_code nocturne::write(fs::file_t H, StringRef Data) {
++  std::shared_ptr<HandleState> State = handleStates().get(H);
++  if (!State)
++    return make_error_code(errc::bad_file_descriptor);
++  std::lock_guard<std::mutex> Guard(State->Lock);
++  n_result R = 0;
++  if (State->Kind != N_KIND_DOCUMENT) {
++    while (R >= 0 && !Data.empty()) {
++      R = n_channel_send(H, Data.data(), Data.size(), -1);
++      if (R == 0)
++        R = -N_ERR_IO;
++      else if (R > 0)
++        Data = Data.drop_front(R);
++    }
++    return R < 0 ? errorCode(R) : std::error_code();
++  }
++  // Another app may write at the same end: the claim keeps it out until these
++  // bytes are there.
++  bool Claim = State->Append && !State->Claimed;
++  if (Claim && (R = n_document_claim(H, true)) < 0)
++    return errorCode(R);
++  if (State->Append && (R = n_document_size(H)) >= 0)
++    State->Position = R;
++  while (R >= 0 && !Data.empty()) {
++    R = n_document_write_at(H, State->Position, Data.data(), Data.size());
++    if (R == 0)
++      R = -N_ERR_IO;
++    else if (R > 0) {
++      State->Position += R;
++      Data = Data.drop_front(R);
++    }
++  }
++  if (Claim)
++    n_document_release(H);
++  return R < 0 ? errorCode(R) : std::error_code();
++}
++
++int64_t nocturne::position(fs::file_t H) {
++  std::shared_ptr<HandleState> State = handleStates().get(H);
++  if (!State)
++    return -1;
++  std::lock_guard<std::mutex> Guard(State->Lock);
++  if (State->Kind != N_KIND_DOCUMENT || State->Append)
++    return -1;
++  return State->Position;
++}
++
++std::error_code nocturne::setPosition(fs::file_t H, uint64_t Position) {
++  std::shared_ptr<HandleState> State = handleStates().get(H);
++  if (!State)
++    return make_error_code(errc::bad_file_descriptor);
++  std::lock_guard<std::mutex> Guard(State->Lock);
++  if (State->Kind != N_KIND_DOCUMENT || State->Append)
++    return make_error_code(errc::invalid_seek);
++  State->Position = Position;
++  return std::error_code();
++}
++
++std::error_code nocturne::close(fs::file_t H) {
++  handleStates().forget(H);
++  n_result R = n_handle_close(H);
++  return R < 0 ? errorCode(R) : std::error_code();
++}
++
++namespace fs {
++
++const file_t kInvalidFile = -1;
++
++std::string getMainExecutable(const char *Argv0, void *MainAddr) {
++  // Nocturne does not tell an app where its program is: it is the one its
++  // name finds, as it did when the app was launched.
++  return Argv0 ? nocturne::findProgram(Argv0) : std::string();
++}
++
++TimePoint<> basic_file_status::getLastAccessedTime() const {
++  // An entry records only when it last changed.
++  return getLastModificationTime();
++}
++
++TimePoint<> basic_file_status::getLastModificationTime() const {
++  return toTimePoint(ModifiedSeconds, ModifiedNanoseconds);
++}
++
++UniqueID file_status::getUniqueID() const { return UniqueID(0, EntryID); }
++
++uint32_t file_status::getLinkCount() const { return 1; }
++
++ErrorOr<space_info> disk_space(const Twine &Path) {
++  return make_error_code(errc::function_not_supported);
++}
++
++std::error_code current_path(SmallVectorImpl<char> &Result) {
++  sandbox::violationIfEnabled();
++
++  return nocturne::completePath(".", Result);
++}
++
++std::error_code set_current_path(const Twine &Path) {
++  sandbox::violationIfEnabled();
++
++  SmallString<128> Storage;
++  n_result R = n_folder_set(Path.toNullTerminatedStringRef(Storage).data());
++  return R < 0 ? nocturne::errorCode(R) : std::error_code();
++}
++
++std::error_code create_directory(const Twine &Path, bool IgnoreExisting,
++                                 perms Perms) {
++  SmallString<256> Full;
++  if (std::error_code EC = nocturne::completePath(Path, Full))
++    return EC;
++  n_result R = n_folder_create(Full.data());
++  if (R < 0 && !(R == -N_ERR_EXISTS && IgnoreExisting))
++    return nocturne::errorCode(R);
++  return std::error_code();
++}
++
++// Nocturne has no links: an entry has one name.
++std::error_code create_symlink(const Twine &To, const Twine &From) {
++  return make_error_code(errc::function_not_supported);
++}
++
++std::error_code create_link(const Twine &To, const Twine &From) {
++  return make_error_code(errc::function_not_supported);
++}
++
++std::error_code create_hard_link(const Twine &To, const Twine &From) {
++  return make_error_code(errc::function_not_supported);
++}
++
++std::error_code remove(const Twine &Path, bool IgnoreNonExisting) {
++  SmallString<256> Full;
++  if (std::error_code EC = nocturne::completePath(Path, Full))
++    return EC;
++  n_result R = n_entry_remove(Full.data());
++  if (R < 0 && !(R == -N_ERR_NOT_FOUND && IgnoreNonExisting))
++    return nocturne::errorCode(R);
++  return std::error_code();
++}
++
++std::error_code is_local(const Twine &Path, bool &Result) {
++  sandbox::violationIfEnabled();
++
++  // C: is the one volume, and it is in the computer.
++  Result = true;
++  return std::error_code();
++}
++
++std::error_code is_local(int FD, bool &Result) {
++  sandbox::violationIfEnabled();
++
++  Result = true;
++  return std::error_code();
++}
++
++std::error_code rename(const Twine &From, const Twine &To) {
++  SmallString<256> FullFrom, FullTo;
++  if (std::error_code EC = nocturne::completePath(From, FullFrom))
++    return EC;
++  if (std::error_code EC = nocturne::completePath(To, FullTo))
++    return EC;
++  // A document already at To goes in the same commit.
++  n_result R = n_entry_replace(FullFrom.data(), FullTo.data());
++  return R < 0 ? nocturne::errorCode(R) : std::error_code();
++}
++
++std::error_code resize_file(int FD, uint64_t Size) {
++  n_result R = n_document_set_size(FD, Size);
++  return R < 0 ? nocturne::errorCode(R) : std::error_code();
++}
++
++std::error_code resize_file_sparse(int FD, uint64_t Size) {
++  return resize_file(FD, Size);
++}
++
++std::error_code access(const Twine &Path, AccessMode Mode) {
++  sandbox::violationIfEnabled();
++
++  SmallString<256> Full;
++  if (std::error_code EC = nocturne::completePath(Path, Full))
++    return EC;
++  n_entry Entry;
++  n_result R = n_entry_info(Full.data(), &Entry);
++  if (R < 0)
++    return nocturne::errorCode(R);
++  // A program is a document; a folder is never run.
++  if (Mode == AccessMode::Execute && Entry.kind != N_KIND_DOCUMENT)
++    return make_error_code(errc::permission_denied);
++  return std::error_code();
++}
++
++bool can_execute(const Twine &Path) {
++  sandbox::violationIfEnabled();
++
++  return !access(Path, AccessMode::Execute);
++}
++
++bool equivalent(file_status A, file_status B) {
++  assert(status_known(A) && status_known(B));
++  // A channel or a device has no entry, so no id.
++  return A.EntryID && A.EntryID == B.EntryID;
++}
++
++std::error_code equivalent(const Twine &A, const Twine &B, bool &Result) {
++  sandbox::violationIfEnabled();
++
++  file_status StatusA, StatusB;
++  if (std::error_code EC = status(A, StatusA))
++    return EC;
++  if (std::error_code EC = status(B, StatusB))
++    return EC;
++  Result = equivalent(StatusA, StatusB);
++  return std::error_code();
++}
++
++void expand_tilde(const Twine &Path, SmallVectorImpl<char> &Dest) {
++  // "~" is a name like any other: the user's folder is the setting
++  // USERFOLDER (path::home_directory).
++  Dest.clear();
++  Path.toVector(Dest);
++}
++
++static file_type entryType(const n_entry &Entry) {
++  return Entry.kind == N_KIND_FOLDER ? file_type::directory_file
++                                     : file_type::regular_file;
++}
++
++static std::error_code fillStatus(n_result R, const n_entry &Entry,
++                                  file_status &Result) {
++  if (R < 0) {
++    std::error_code EC = nocturne::errorCode(R);
++    Result = file_status(EC == errc::no_such_file_or_directory
++                             ? file_type::file_not_found
++                             : file_type::status_error);
++    return EC;
++  }
++  Result = file_status(entryType(Entry), all_all, Entry.id, Entry.modified,
++                       Entry.modified_ns, Entry.size);
++  return std::error_code();
++}
++
++std::error_code status(const Twine &Path, file_status &Result, bool Follow) {
++  sandbox::violationIfEnabled();
++
++  SmallString<256> Full;
++  if (std::error_code EC = nocturne::completePath(Path, Full)) {
++    Result = file_status(file_type::status_error);
++    return EC;
++  }
++  n_entry Entry;
++  return fillStatus(n_entry_info(Full.data(), &Entry), Entry, Result);
++}
++
++std::error_code status(int FD, file_status &Result) {
++  sandbox::violationIfEnabled();
++
++  n_entry Entry;
++  n_result Kind = n_handle_kind(FD);
++  if (Kind == N_KIND_DOCUMENT || Kind < 0)
++    return fillStatus(Kind < 0 ? Kind : n_document_info(FD, &Entry), Entry,
++                      Result);
++  // A channel carries an app's input or output, as a pipe does elsewhere.
++  file_type Type = Kind == N_KIND_CHANNEL  ? file_type::fifo_file
++                   : Kind == N_KIND_DEVICE ? file_type::character_file
++                   : Kind == N_KIND_FOLDER ? file_type::directory_file
++                                           : file_type::type_unknown;
++  Result = file_status(Type, all_all, 0, 0, 0, 0);
++  return std::error_code();
++}
++
++unsigned getUmask() { return 0; }
++
++// Everything may be read, written and run; the system's own entries refuse
++// changes whatever their permissions would say.
++std::error_code setPermissions(const Twine &Path, perms Permissions) {
++  return std::error_code();
++}
++
++std::error_code setPermissions(int FD, perms Permissions) {
++  return std::error_code();
++}
++
++std::error_code setLastAccessAndModificationTime(int FD, TimePoint<> AccessTime,
++                                                 TimePoint<> ModificationTime) {
++  // An entry's time is when it was last changed, and only the system sets it.
++  return make_error_code(errc::function_not_supported);
++}
++
++// A document cannot be mapped: a region holds a copy of its part, read when
++// it is made. Changes to that copy never reach the document, so a readwrite
++// region is not offered.
++std::error_code mapped_file_region::init(int FD, uint64_t Offset, mapmode Mode,
++                                         const char *Name) {
++  assert(Size != 0);
++
++  if (Mode == readwrite)
++    return make_error_code(errc::function_not_supported);
++  size_t Bytes = alignTo(Size, alignment());
++  void *Memory;
++  n_result R = n_memory_reserve(Bytes, N_MEMORY_READ_WRITE, &Memory);
++  if (R < 0)
++    return nocturne::errorCode(R);
++  // Past the document's end, the region reads as zero.
++  for (size_t Done = 0; Done < Size;) {
++    R = n_document_read_at(FD, Offset + Done,
++                           static_cast<char *>(Memory) + Done, Size - Done);
++    if (R <= 0)
++      break;
++    Done += R;
++  }
++  if (R >= 0 && Mode == readonly)
++    R = n_memory_protect(Memory, Bytes, N_MEMORY_READ);
++  if (R < 0) {
++    n_memory_release(Memory, Bytes);
++    return nocturne::errorCode(R);
++  }
++  Mapping = Memory;
++  return std::error_code();
++}
++
++mapped_file_region::mapped_file_region(int FD, mapmode Mode, size_t Length,
++                                       uint64_t Offset, std::error_code &EC,
++                                       const char *Name)
++    : Size(Length), Mode(Mode) {
++  sandbox::violationIfEnabled();
++
++  EC = init(FD, Offset, Mode, Name);
++  if (EC)
++    copyFrom(mapped_file_region());
++}
++
++void mapped_file_region::unmapImpl() {
++  if (Mapping)
++    n_memory_release(Mapping, alignTo(Size, alignment()));
++}
++
++std::error_code mapped_file_region::sync() const {
++  // Nothing of a region goes back to its document.
++  return std::error_code();
++}
++
++void mapped_file_region::dontNeedImpl() {}
++
++void mapped_file_region::willNeedImpl() {}
++
++void mapped_file_region::randomAccessImpl() {}
++
++int mapped_file_region::alignment() { return Process::getPageSizeEstimate(); }
++
++namespace {
++
++// A folder's entries as they were when the iteration began: removing entries
++// while going through them (remove_directories) leaves the rest to come.
++struct FolderListing {
++  n_entry *Entries = nullptr;
++  size_t Count = 0, Next = 0;
++
++  ~FolderListing() { std::free(Entries); }
++};
++
++} // end anonymous namespace
++
++std::error_code detail::directory_iterator_construct(detail::DirIterState &It,
++                                                     StringRef Path,
++                                                     bool FollowSymlinks) {
++  sandbox::violationIfEnabled();
++
++  SmallString<256> Folder;
++  if (std::error_code EC = nocturne::completePath(Path, Folder))
++    return EC;
++  auto Listing = std::make_unique<FolderListing>();
++  n_result Count = n_folder_entries(Folder.data(), &Listing->Entries);
++  if (Count < 0)
++    return nocturne::errorCode(Count);
++  Listing->Count = Count;
++
++  It.IterationHandle = reinterpret_cast<intptr_t>(Listing.release());
++  // Add something for replace_filename to replace.
++  SmallString<128> PathWithDot(Path);
++  path::append(PathWithDot, ".");
++  It.CurrentEntry = directory_entry(PathWithDot.str(), FollowSymlinks);
++  return directory_iterator_increment(It);
++}
++
++std::error_code detail::directory_iterator_destruct(detail::DirIterState &It) {
++  delete reinterpret_cast<FolderListing *>(It.IterationHandle);
++  It.IterationHandle = 0;
++  It.CurrentEntry = directory_entry();
++  return std::error_code();
++}
++
++std::error_code detail::directory_iterator_increment(detail::DirIterState &It) {
++  sandbox::violationIfEnabled();
++
++  auto &Listing = *reinterpret_cast<FolderListing *>(It.IterationHandle);
++  if (Listing.Next == Listing.Count)
++    return directory_iterator_destruct(It);
++  const n_entry &Entry = Listing.Entries[Listing.Next++];
++  // The listing has what status needs: there is no other look at the entry.
++  It.CurrentEntry.replace_filename(
++      Entry.name, entryType(Entry),
++      basic_file_status(entryType(Entry), all_all, Entry.modified,
++                        Entry.modified_ns, Entry.size));
++  return std::error_code();
++}
++
++ErrorOr<basic_file_status> directory_entry::status() const { return Status; }
++
++std::error_code openFile(const Twine &Name, int &ResultFD,
++                         CreationDisposition Disp, FileAccess Access,
++                         OpenFlags Flags, unsigned Mode) {
++  sandbox::violationIfEnabled();
++
++  ResultFD = kInvalidFile;
++  SmallString<256> Path;
++  if (std::error_code EC = nocturne::completePath(Name, Path))
++    return EC;
++  // As elsewhere, appending opens the document that is there, or a new one.
++  if (Flags & OF_Append)
++    Disp = CD_OpenAlways;
++  int Existing = (Access & FA_Write) ? N_DOCUMENT_EDIT : N_DOCUMENT_READ;
++  n_handle H = -N_ERR_INVALID;
++  switch (Disp) {
++  case CD_CreateAlways:
++    // New content that takes the document's place when it is closed: until
++    // then, everyone else reads the document as it was.
++    H = n_document_open(Path.data(), N_DOCUMENT_REPLACE);
++    break;
++  case CD_CreateNew:
++    H = n_document_open(Path.data(), N_DOCUMENT_CREATE);
++    break;
++  case CD_OpenExisting:
++    H = n_document_open(Path.data(), Existing);
++    break;
++  case CD_OpenAlways:
++    H = n_document_open(Path.data(), Existing);
++    if (H == -N_ERR_NOT_FOUND)
++      H = n_document_open(Path.data(), N_DOCUMENT_CREATE);
++    if (H == -N_ERR_EXISTS) // made meanwhile
++      H = n_document_open(Path.data(), Existing);
++    break;
++  }
++  if (H < 0)
++    return nocturne::errorCode(H);
++  handleStates().opened(H, Flags & OF_Append);
++  ResultFD = H;
++  return std::error_code();
++}
++
++Expected<int> openNativeFile(const Twine &Name, CreationDisposition Disp,
++                             FileAccess Access, OpenFlags Flags,
++                             unsigned Mode) {
++  sandbox::violationIfEnabled();
++
++  int FD;
++  std::error_code EC = openFile(Name, FD, Disp, Access, Flags, Mode);
++  if (EC)
++    return errorCodeToError(EC);
++  return FD;
++}
++
++std::error_code openFileForRead(const Twine &Name, int &ResultFD,
++                                OpenFlags Flags,
++                                SmallVectorImpl<char> *RealPath) {
++  sandbox::violationIfEnabled();
++
++  std::error_code EC =
++      openFile(Name, ResultFD, CD_OpenExisting, FA_Read, Flags, 0666);
++  if (EC)
++    return EC;
++  // Left empty when it cannot be had, as elsewhere.
++  if (RealPath)
++    (void)real_path(Name, *RealPath);
++  return std::error_code();
++}
++
++Expected<file_t> openNativeFileForRead(const Twine &Name, OpenFlags Flags,
++                                       SmallVectorImpl<char> *RealPath) {
++  sandbox::violationIfEnabled();
++
++  file_t ResultFD;
++  std::error_code EC = openFileForRead(Name, ResultFD, Flags, RealPath);
++  if (EC)
++    return errorCodeToError(EC);
++  return ResultFD;
++}
++
++// The app's input, output and log, by convention.
++file_t getStdinHandle() { return 0; }
++file_t getStdoutHandle() { return 1; }
++file_t getStderrHandle() { return 2; }
++
++// The messages of a channel as one run of bytes, which ends when the other
++// end has gone.
++static Expected<size_t> readMessages(file_t H, HandleState &State,
++                                     MutableArrayRef<char> Buf) {
++  if (Buf.empty())
++    return 0;
++  while (State.MessageRead == State.Message.size()) {
++    n_result Read = n_channel_receive(H, Buf.data(), Buf.size(),
++                                      N_CHANNEL_WAIT, nullptr);
++    if (Read > 0)
++      return Read;
++    if (Read == -N_ERR_CLOSED)
++      return 0;
++    if (Read == -N_ERR_TOO_LARGE) {
++      Read = n_channel_receive(H, nullptr, 0, N_CHANNEL_WAIT | N_CHANNEL_PEEK,
++                               nullptr);
++      if (Read >= 0) {
++        State.Message.resize(Read);
++        Read = n_channel_receive(H, State.Message.data(), Read, N_CHANNEL_WAIT,
++                                 nullptr);
++      }
++      if (Read >= 0) {
++        State.Message.resize(Read);
++        State.MessageRead = 0;
++      }
++    }
++    if (Read < 0)
++      return errorCodeToError(nocturne::errorCode(Read));
++    // An empty message carries no bytes: the next one is waited for.
++  }
++  size_t Size = std::min(Buf.size(), State.Message.size() - State.MessageRead);
++  std::memcpy(Buf.data(), State.Message.data() + State.MessageRead, Size);
++  State.MessageRead += Size;
++  if (State.MessageRead == State.Message.size()) {
++    State.Message.clear();
++    State.MessageRead = 0;
++  }
++  return Size;
++}
++
++Expected<size_t> readNativeFile(file_t FD, MutableArrayRef<char> Buf) {
++  sandbox::violationIfEnabled();
++
++  std::shared_ptr<HandleState> State = handleStates().get(FD);
++  if (!State)
++    return errorCodeToError(make_error_code(errc::bad_file_descriptor));
++  std::lock_guard<std::mutex> Guard(State->Lock);
++  if (State->Kind != N_KIND_DOCUMENT)
++    return readMessages(FD, *State, Buf);
++  n_result Read =
++      n_document_read_at(FD, State->Position, Buf.data(), Buf.size());
++  if (Read < 0)
++    return errorCodeToError(nocturne::errorCode(Read));
++  State->Position += Read;
++  return Read;
++}
++
++Expected<size_t> readNativeFileSlice(file_t FD, MutableArrayRef<char> Buf,
++                                     uint64_t Offset) {
++  sandbox::violationIfEnabled();
++
++  n_result Read = n_document_read_at(FD, Offset, Buf.data(), Buf.size());
++  if (Read < 0)
++    return errorCodeToError(nocturne::errorCode(Read));
++  return Read;
++}
++
++// A document's claim is its lock: one opening holds it at a time, so a shared
++// lock is an exclusive one.
++static std::error_code claim(int FD, bool Wait) {
++  std::shared_ptr<HandleState> State = handleStates().get(FD);
++  if (!State)
++    return make_error_code(errc::bad_file_descriptor);
++  n_result R = n_document_claim(FD, Wait);
++  if (R < 0)
++    return nocturne::errorCode(R);
++  std::lock_guard<std::mutex> Guard(State->Lock);
++  State->Claimed = true;
++  return std::error_code();
++}
++
++std::error_code tryLockFile(int FD, std::chrono::milliseconds Timeout,
++                            LockKind Kind) {
++  auto End = std::chrono::steady_clock::now() + Timeout;
++  do {
++    std::error_code EC = claim(FD, false);
++    if (EC != errc::resource_unavailable_try_again)
++      return EC;
++    if (Timeout.count() == 0)
++      break;
++    n_sleep_ms(1);
++  } while (std::chrono::steady_clock::now() < End);
++  return make_error_code(errc::no_lock_available);
++}
++
++std::error_code lockFile(int FD, LockKind Kind) { return claim(FD, true); }
++
++std::error_code unlockFile(int FD) {
++  std::shared_ptr<HandleState> State = handleStates().get(FD);
++  if (!State)
++    return make_error_code(errc::bad_file_descriptor);
++  std::lock_guard<std::mutex> Guard(State->Lock);
++  State->Claimed = false;
++  n_result R = n_document_release(FD);
++  return R < 0 ? nocturne::errorCode(R) : std::error_code();
++}
++
++std::error_code closeFile(file_t &F) {
++  sandbox::violationIfEnabled();
++
++  file_t TmpF = F;
++  F = kInvalidFile;
++  return nocturne::close(TmpF);
++}
++
++static std::error_code removeContents(const Twine &Folder, bool IgnoreErrors) {
++  std::error_code EC;
++  directory_iterator Begin(Folder, EC, false);
++  directory_iterator End;
++  while (!EC && Begin != End) {
++    if (Begin->type() == file_type::directory_file) {
++      EC = removeContents(Begin->path(), IgnoreErrors);
++      if (EC && !IgnoreErrors)
++        return EC;
++    }
++    EC = fs::remove(Begin->path(), true);
++    if (EC && !IgnoreErrors)
++      return EC;
++    Begin.increment(EC);
++  }
++  return IgnoreErrors ? std::error_code() : EC;
++}
++
++std::error_code remove_directories(const Twine &Path, bool IgnoreErrors) {
++  std::error_code EC = removeContents(Path, IgnoreErrors);
++  if (!EC)
++    EC = fs::remove(Path, true);
++  return IgnoreErrors ? std::error_code() : EC;
++}
++
++std::error_code real_path(const Twine &Path, SmallVectorImpl<char> &Dest,
++                          bool ExpandTilde) {
++  sandbox::violationIfEnabled();
++
++  // No links and no "~" (expand_tilde): the real path is the complete one,
++  // with each name as its entry keeps it.
++  Dest.clear();
++  if (Path.isTriviallyEmpty())
++    return std::error_code();
++  SmallString<256> Full;
++  if (std::error_code EC = nocturne::completePath(Path, Full))
++    return EC;
++  const size_t Root = 3; // "C:\"
++  Dest.append(Full.begin(), Full.begin() + Root);
++  for (size_t Start = Root; Start < Full.size();) {
++    size_t End = std::min(Full.find('\\', Start), Full.size());
++    char After = Full.data()[End]; // '\\', or the nul after Full
++    Full.data()[End] = 0;
++    n_entry Entry;
++    n_result R = n_entry_info(Full.data(), &Entry);
++    Full.data()[End] = After;
++    if (R < 0) {
++      Dest.clear();
++      return nocturne::errorCode(R);
++    }
++    if (Dest.size() > Root)
++      Dest.push_back('\\');
++    Dest.append(Entry.name, Entry.name + std::strlen(Entry.name));
++    Start = End + 1;
++  }
++  return std::error_code();
++}
++
++std::error_code readlink(const Twine &Path, SmallVectorImpl<char> &Dest) {
++  // No entry is a link.
++  Dest.clear();
++  return make_error_code(errc::invalid_argument);
++}
++
++} // end namespace fs
++
++namespace path {
++
++static void assignFolder(SmallVectorImpl<char> &Result, const char *Folder) {
++  Result.assign(Folder, Folder + std::strlen(Folder));
++}
++
++bool home_directory(SmallVectorImpl<char> &Result) {
++  assignFolder(Result, n_user_folder());
++  return true;
++}
++
++// What an app keeps goes in the user's AppData, in a folder named for it.
++bool user_config_directory(SmallVectorImpl<char> &Result) {
++  assignFolder(Result, n_user_folder());
++  append(Result, "AppData");
++  return true;
++}
++
++bool cache_directory(SmallVectorImpl<char> &Result) {
++  return user_config_directory(Result);
++}
++
++void system_temp_directory(bool ErasedOnReboot, SmallVectorImpl<char> &Result) {
++  // The one temporary folder is emptied at every start.
++  assignFolder(Result, n_temp_folder());
++}
++
++} // end namespace path
++
++} // end namespace sys
++} // end namespace llvm
+diff --git a/llvm/lib/Support/Nocturne/Process.inc b/llvm/lib/Support/Nocturne/Process.inc
+new file mode 100644
+index 00000000..8feae661
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/Process.inc
+@@ -0,0 +1,110 @@
++//===- Nocturne/Process.inc - Nocturne Process Implementation --*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// An app reads its launch settings with getenv and is handed its input and
++// output as handles 0, 1 and 2. The launcher names in the setting TERMINAL the
++// handles that reach a terminal, which understands ANSI escape codes.
++//
++//===----------------------------------------------------------------------===//
++
++#include "Nocturne.h"
++#include "llvm/Support/ErrorHandling.h"
++#include <cstdlib>
++#include <optional>
++
++using namespace llvm;
++using namespace sys;
++
++Process::Pid Process::getProcessId() {
++  return static_cast<Pid>(n_app_self());
++}
++
++Expected<unsigned> Process::getPageSize() { return N_PAGE_SIZE; }
++
++size_t Process::GetMallocUsage() {
++  size_t Heap = 0, Used = 0;
++  malloc_usage(&Heap, &Used);
++  return Used;
++}
++
++// Nocturne does not tell an app the CPU time it has taken.
++void Process::GetTimeUsage(TimePoint<> &elapsed,
++                           std::chrono::nanoseconds &user_time,
++                           std::chrono::nanoseconds &sys_time) {
++  elapsed = std::chrono::system_clock::now();
++  user_time = std::chrono::nanoseconds::zero();
++  sys_time = std::chrono::nanoseconds::zero();
++}
++
++// Nocturne writes no core files.
++void Process::PreventCoreFiles() { coreFilesPrevented = true; }
++
++std::optional<std::string> Process::GetEnv(StringRef Name) {
++  std::string NameStr = Name.str();
++  const char *Val = ::getenv(NameStr.c_str());
++  if (!Val)
++    return std::nullopt;
++  return std::string(Val);
++}
++
++// Nocturne has no null device to put in a handle the launcher left out, so
++// writing to it fails.
++std::error_code Process::FixupStandardFileDescriptors() {
++  return std::error_code();
++}
++
++std::error_code Process::SafelyCloseFileDescriptor(int FD) {
++  return nocturne::close(FD);
++}
++
++bool Process::StandardInIsUserInput() { return FileDescriptorIsDisplayed(0); }
++
++bool Process::StandardOutIsDisplayed() { return FileDescriptorIsDisplayed(1); }
++
++bool Process::StandardErrIsDisplayed() { return FileDescriptorIsDisplayed(2); }
++
++bool Process::FileDescriptorIsDisplayed(int fd) { return n_terminal(fd); }
++
++// The terminal does not tell its size to the apps it runs.
++unsigned Process::StandardOutColumns() { return 0; }
++
++unsigned Process::StandardErrColumns() { return 0; }
++
++bool Process::FileDescriptorHasColors(int fd) { return n_terminal(fd); }
++
++bool Process::StandardOutHasColors() { return FileDescriptorHasColors(1); }
++
++bool Process::StandardErrHasColors() { return FileDescriptorHasColors(2); }
++
++void Process::UseANSIEscapeCodes(bool /*enable*/) {
++  // The terminal always takes ANSI escape codes.
++}
++
++bool Process::ColorNeedsFlush() {
++  // No, colors are escape codes in the output.
++  return false;
++}
++
++const char *Process::OutputColor(char code, bool bold, bool bg) {
++  return colorcodes[bg ? 1 : 0][bold ? 1 : 0][code & 15];
++}
++
++const char *Process::OutputBold(bool bg) { return "\033[1m"; }
++
++const char *Process::OutputReverse() { return "\033[7m"; }
++
++const char *Process::ResetColor() { return "\033[0m"; }
++
++unsigned llvm::sys::Process::GetRandomNumber() {
++  unsigned Number = 0;
++  if (n_random(&Number, sizeof(Number)) < 0)
++    report_fatal_error("n_random failed");
++  return Number;
++}
++
++[[noreturn]] void Process::ExitNoCleanup(int RetCode) { _Exit(RetCode); }
+diff --git a/llvm/lib/Support/Nocturne/Program.inc b/llvm/lib/Support/Nocturne/Program.inc
+new file mode 100644
+index 00000000..c9410c28
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/Program.inc
+@@ -0,0 +1,240 @@
++//===- Nocturne/Program.inc - Nocturne Program Implementation --*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// An app is launched with n_app_launch from its program's complete path, with
++// its arguments, its settings and the handles it gets as 0, 1 and 2. Nothing
++// is inherited: the launcher passes its folder (FOLDER) and names the handles
++// that reach a terminal (TERMINAL). The app handle reports its end and result.
++//
++//===----------------------------------------------------------------------===//
++
++#include "Nocturne.h"
++#include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/ScopeExit.h"
++#include "llvm/ADT/SmallString.h"
++#include "llvm/Support/Errc.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/Path.h"
++#include "llvm/Support/raw_ostream.h"
++#include <string>
++#include <vector>
++
++using namespace llvm;
++using namespace sys;
++
++ProcessInfo::ProcessInfo() : Pid(0), Process(-1), ReturnCode(0) {}
++
++ErrorOr<std::string> sys::findProgramByName(StringRef Name,
++                                            ArrayRef<StringRef> Paths) {
++  assert(!Name.empty() && "Must have a name!");
++  // A name with a folder in it names the program itself.
++  if (Name.find_first_of("\\/:") != StringRef::npos)
++    return std::string(Name);
++
++  // There is no PATH: a program is in the system's folder or its app's.
++  if (Paths.empty()) {
++    std::string Program = nocturne::findProgram(Name);
++    if (Program.empty())
++      return errc::no_such_file_or_directory;
++    return Program;
++  }
++
++  for (StringRef Path : Paths) {
++    if (Path.empty())
++      continue;
++    SmallString<128> FilePath(Path);
++    path::append(FilePath, Name);
++    if (fs::can_execute(FilePath))
++      return std::string(FilePath);
++  }
++  return errc::no_such_file_or_directory;
++}
++
++// The handle the app gets as Index for a redirect: the document it names, or
++// none when it is empty. Output starts the document over; the app writes at
++// its end, so output and errors sent to one document follow each other.
++static Expected<fs::file_t> openRedirect(StringRef Path, int Index) {
++  if (Path.empty())
++    return fs::kInvalidFile;
++  if (Index == 0)
++    return fs::openNativeFileForRead(Path);
++  Expected<fs::file_t> H =
++      fs::openNativeFileForWrite(Path, fs::CD_OpenAlways, fs::OF_None);
++  if (!H)
++    return H;
++  if (std::error_code EC = fs::resize_file(*H, 0)) {
++    fs::closeFile(*H);
++    return errorCodeToError(EC);
++  }
++  return H;
++}
++
++static bool Execute(ProcessInfo &PI, StringRef Program,
++                    ArrayRef<StringRef> Args,
++                    std::optional<ArrayRef<StringRef>> Env,
++                    ArrayRef<std::optional<StringRef>> Redirects,
++                    unsigned MemoryLimit, std::string *ErrMsg,
++                    BitVector *AffinityMask, bool DetachProcess) {
++  assert(!AffinityMask && "Nocturne does not place an app on chosen CPUs");
++  // Nocturne has no memory limit to set for an app, so MemoryLimit is unused.
++
++  SmallString<256> Path;
++  if (std::error_code EC = nocturne::completePath(Program, Path)) {
++    nocturne::setErrMsg(ErrMsg, "cannot find '" + Program + "'", EC);
++    return false;
++  }
++
++  // This app's own handle, a document a redirect names, or none.
++  int32_t Handles[3];
++  fs::file_t Opened[3] = {fs::kInvalidFile, fs::kInvalidFile,
++                          fs::kInvalidFile};
++  scope_exit CloseOpened([&] {
++    for (fs::file_t H : Opened)
++      if (H != fs::kInvalidFile)
++        fs::closeFile(H);
++  });
++  std::string Terminal;
++  for (int I = 0; I < 3; ++I) {
++    if (!Redirects.empty() && Redirects[I]) {
++      Expected<fs::file_t> H = openRedirect(*Redirects[I], I);
++      if (!H) {
++        nocturne::setErrMsg(ErrMsg,
++                            "cannot open '" + *Redirects[I] + "' for " +
++                                (I ? "output" : "input"),
++                            errorToErrorCode(H.takeError()));
++        return false;
++      }
++      Handles[I] = Opened[I] = *H;
++      continue;
++    }
++    Handles[I] = n_handle_kind(I) >= 0 ? I : -1;
++    if (Handles[I] >= 0 && n_terminal(I))
++      Terminal += (Terminal.empty() ? "" : " ") + std::to_string(I);
++  }
++
++  std::vector<std::string> Settings;
++  if (Env)
++    for (StringRef Setting : *Env)
++      Settings.push_back(Setting.str());
++  auto Given = [&](StringRef Name) {
++    return any_of(Settings, [&](StringRef Setting) {
++      return Setting.size() > Name.size() && Setting.starts_with(Name) &&
++             Setting[Name.size()] == '=';
++    });
++  };
++  if (!Given("FOLDER")) {
++    SmallString<256> Folder;
++    if (!nocturne::completePath(".", Folder))
++      Settings.push_back(("FOLDER=" + Folder).str());
++  }
++  // A detached app is not part of this app's terminal session.
++  if (!DetachProcess && !Terminal.empty() && !Given("TERMINAL"))
++    Settings.push_back("TERMINAL=" + Terminal);
++
++  std::vector<std::string> ArgStrings(Args.begin(), Args.end());
++  std::vector<const char *> Arguments, SettingPointers;
++  for (const std::string &Arg : ArgStrings)
++    Arguments.push_back(Arg.c_str());
++  for (const std::string &Setting : Settings)
++    SettingPointers.push_back(Setting.c_str());
++
++  struct n_launch Launch = {};
++  Launch.arguments = Arguments.data();
++  Launch.settings = SettingPointers.data();
++  Launch.handles = Handles;
++  Launch.argument_count = static_cast<uint32_t>(Arguments.size());
++  Launch.setting_count = static_cast<uint32_t>(SettingPointers.size());
++  Launch.handle_count = 3;
++  n_handle App = n_app_launch(Path.c_str(), &Launch);
++  if (App < 0) {
++    nocturne::setErrMsg(ErrMsg, "cannot launch '" + Program + "'",
++                        nocturne::errorCode(App));
++    return false;
++  }
++
++  PI.Pid = n_app_id(App);
++  PI.Process = App;
++  return true;
++}
++
++ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
++                            std::optional<unsigned> SecondsToWait,
++                            std::string *ErrMsg,
++                            std::optional<ProcessStatistics> *ProcStat,
++                            bool Polling) {
++  assert(PI.Pid && "invalid pid to wait on, process not started?");
++  // Nocturne does not tell what an app took to run.
++  if (ProcStat)
++    ProcStat->reset();
++
++  int64_t TimeoutMs = SecondsToWait ? int64_t(*SecondsToWait) * 1000 : -1;
++  int Status = 0;
++  n_result R = n_app_result(PI.Process, TimeoutMs, &Status);
++  if (R == -N_ERR_NOT_READY || (R == -N_ERR_TIMEOUT && Polling))
++    return ProcessInfo(); // It is still running.
++
++  ProcessInfo WaitResult = PI;
++  if (R == -N_ERR_TIMEOUT) {
++    // Stop it and the apps it launched, and wait for its end.
++    n_app_stop(PI.Process, N_APP_STOP_TREE);
++    n_app_result(PI.Process, -1, &Status);
++    n_handle_close(PI.Process);
++    if (ErrMsg)
++      *ErrMsg = "Child timed out";
++    WaitResult.ReturnCode = -2;
++    return WaitResult;
++  }
++  n_handle_close(PI.Process);
++  if (R < 0) {
++    nocturne::setErrMsg(ErrMsg, "Error waiting for child process",
++                        nocturne::errorCode(R));
++    WaitResult.ReturnCode = -1;
++    return WaitResult;
++  }
++  // An app the system ended has a result like any other: 128 and the
++  // exception's number for a fault, 130 when it was stopped.
++  WaitResult.ReturnCode = Status;
++  return WaitResult;
++}
++
++std::error_code llvm::sys::ChangeStdinMode(fs::OpenFlags Flags) {
++  return std::error_code();
++}
++
++std::error_code llvm::sys::ChangeStdoutMode(fs::OpenFlags Flags) {
++  return std::error_code();
++}
++
++// Documents and channels carry bytes as they are; text is not translated.
++std::error_code llvm::sys::ChangeStdinToBinary() { return std::error_code(); }
++
++std::error_code llvm::sys::ChangeStdoutToBinary() { return std::error_code(); }
++
++std::error_code
++llvm::sys::writeFileWithEncoding(StringRef FileName, StringRef Contents,
++                                 WindowsEncodingMethod Encoding /*unused*/) {
++  std::error_code EC;
++  raw_fd_ostream OS(FileName, EC, fs::OF_None);
++  if (EC)
++    return EC;
++  OS << Contents;
++  OS.close();
++  EC = OS.error();
++  OS.clear_error();
++  return EC;
++}
++
++bool llvm::sys::commandLineFitsWithinSystemLimits(StringRef Program,
++                                                  ArrayRef<StringRef> Args) {
++  // The arguments take a string and a pointer each; leave the settings half
++  // of the room the launch has for both.
++  uint64_t Bytes = 8;
++  for (StringRef Arg : Args)
++    Bytes += Arg.size() + 1 + 8;
++  return Bytes <= N_LAUNCH_MAX_BYTES / 2;
++}
+diff --git a/llvm/lib/Support/Nocturne/Signals.inc b/llvm/lib/Support/Nocturne/Signals.inc
+new file mode 100644
+index 00000000..7e7539f1
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/Signals.inc
+@@ -0,0 +1,146 @@
++//===- Nocturne/Signals.inc - Nocturne Signals Implementation --*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Nocturne has no signals. An app that faults ends, and the system reports
++// where; one that is stopped (Ctrl+C in a terminal) just ends. Neither runs
++// code of the app's, but neither leaves half of an output either: a document
++// an app replaces (fs::CD_CreateAlways) keeps its old content until the new one
++// is saved whole. What LLVM removes when it gives up (RunInterruptHandlers, as
++// report_fatal_error does) it removes here.
++//
++//===----------------------------------------------------------------------===//
++
++#include "Nocturne.h"
++#include "llvm/Support/ExitCodes.h"
++#include "llvm/Support/StringSaver.h"
++#include <atomic>
++#include <cstdlib>
++#include <mutex>
++#include <string>
++#include <vector>
++
++using namespace llvm;
++
++static StringRef Argv0;
++
++static std::atomic<void (*)()> OneShotPipeSignalFunction = nullptr;
++
++namespace {
++// The documents RemoveFileOnSignal named, by complete path: the app's folder
++// may change before they are removed.
++struct FilesToRemove {
++  std::mutex Lock;
++  std::vector<std::string> Paths;
++};
++} // namespace
++
++// Never destroyed: report_fatal_error may run while the app exits.
++static FilesToRemove &filesToRemove() {
++  static FilesToRemove *Files = new FilesToRemove();
++  return *Files;
++}
++
++static void removeFilesToRemove() {
++  FilesToRemove &Files = filesToRemove();
++  std::lock_guard<std::mutex> Guard(Files.Lock);
++  for (const std::string &Path : Files.Paths) {
++    // Only a document: never a folder that took its name since.
++    struct n_entry Entry;
++    if (n_entry_info(Path.c_str(), &Entry) >= 0 &&
++        Entry.kind == N_KIND_DOCUMENT)
++      n_entry_remove(Path.c_str());
++  }
++}
++
++static std::string completeName(StringRef Filename) {
++  SmallString<256> Path;
++  if (sys::nocturne::completePath(Filename, Path))
++    return Filename.str();
++  return std::string(Path);
++}
++
++void sys::unregisterHandlers() {}
++
++void sys::CleanupOnSignal(uintptr_t Context) {
++  removeFilesToRemove();
++  llvm::sys::RunSignalHandlers();
++}
++
++void sys::RunInterruptHandlers() { removeFilesToRemove(); }
++
++// There is no interrupt or information request for an app to answer.
++void llvm::sys::SetInterruptFunction(void (*IF)()) {}
++
++void llvm::sys::SetInfoSignalFunction(void (*Handler)()) {}
++
++void llvm::sys::SetOneShotPipeSignalFunction(void (*Handler)()) {
++  OneShotPipeSignalFunction.exchange(Handler);
++}
++
++void llvm::sys::DefaultOneShotPipeSignalHandler() { exit(EX_IOERR); }
++
++// A write found that no one reads the channel any more.
++void llvm::sys::CallOneShotPipeSignalHandler() {
++  if (auto Handler = OneShotPipeSignalFunction.exchange(nullptr))
++    Handler();
++}
++
++bool llvm::sys::RemoveFileOnSignal(StringRef Filename, std::string *ErrMsg) {
++  std::string Path = completeName(Filename);
++  FilesToRemove &Files = filesToRemove();
++  std::lock_guard<std::mutex> Guard(Files.Lock);
++  Files.Paths.push_back(std::move(Path));
++  return false;
++}
++
++void llvm::sys::DontRemoveFileOnSignal(StringRef Filename) {
++  std::string Path = completeName(Filename);
++  FilesToRemove &Files = filesToRemove();
++  std::lock_guard<std::mutex> Guard(Files.Lock);
++  llvm::erase(Files.Paths, Path);
++}
++
++void llvm::sys::AddSignalHandler(sys::SignalHandlerCallback FnPtr, void *Cookie,
++                                 bool NeedsPOSIXUtilitySignalHandling) {
++  insertSignalHandler(FnPtr, Cookie);
++}
++
++// A program is one image, linked where it runs: an address is its own offset.
++static bool findModulesAndOffsets(void **StackTrace, int Depth,
++                                  const char **Modules, intptr_t *Offsets,
++                                  const char *MainExecutableName,
++                                  StringSaver &StrPool) {
++  if (!MainExecutableName || !*MainExecutableName)
++    return false;
++  const char *Module = StrPool.save(MainExecutableName).data();
++  for (int I = 0; I < Depth; ++I) {
++    Modules[I] = Module;
++    Offsets[I] = reinterpret_cast<intptr_t>(StackTrace[I]);
++  }
++  return true;
++}
++
++static bool printMarkupContext(raw_ostream &OS,
++                               const char *MainExecutableName) {
++  return false;
++}
++
++// Nocturne does not yet give an app the frames of its stack.
++void llvm::sys::PrintStackTrace(raw_ostream &OS, int Depth) {}
++
++static void PrintStackTraceSignalHandler(void *) {
++  sys::PrintStackTrace(llvm::errs());
++}
++
++void llvm::sys::DisableSystemDialogsOnCrash() {}
++
++void llvm::sys::PrintStackTraceOnErrorSignal(StringRef Argv0,
++                                             bool DisableCrashReporting) {
++  ::Argv0 = Argv0;
++  AddSignalHandler(PrintStackTraceSignalHandler, nullptr);
++}
+diff --git a/llvm/lib/Support/Nocturne/Threading.inc b/llvm/lib/Support/Nocturne/Threading.inc
+new file mode 100644
+index 00000000..4921d980
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/Threading.inc
+@@ -0,0 +1,83 @@
++//===- Nocturne/Threading.inc - Nocturne Threading Impl. -------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Threads are Nocturne's native tasks: they share the process and are named by
++// the id thread_create gives them. The scheduler places them on its CPUs;
++// threads have no names, priorities or affinity to set.
++//
++//===----------------------------------------------------------------------===//
++
++#include "llvm/ADT/BitVector.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/Twine.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/thread.h"
++#include <nocturne.h>
++
++namespace llvm {
++
++thread::native_handle_type
++llvm_execute_on_thread_impl(thread::start_routine_type ThreadFunc, void *Arg,
++                            std::optional<unsigned> StackSizeInBytes) {
++  n_result Thread =
++      thread_create_sized(ThreadFunc, Arg, StackSizeInBytes.value_or(0));
++  if (Thread < 0)
++    report_fatal_error("thread_create failed: " + Twine(n_result_text(Thread)));
++  return static_cast<thread::native_handle_type>(Thread);
++}
++
++void llvm_thread_join_impl(thread::native_handle_type Thread) {
++  n_result R = thread_join(Thread);
++  if (R < 0)
++    report_fatal_error("thread_join failed: " + Twine(n_result_text(R)));
++}
++
++void llvm_thread_detach_impl(thread::native_handle_type Thread) {
++  n_result R = thread_detach(Thread);
++  if (R < 0)
++    report_fatal_error("thread_detach failed: " + Twine(n_result_text(R)));
++}
++
++thread::id llvm_thread_get_id_impl(thread::native_handle_type Thread) {
++  return Thread;
++}
++
++thread::id llvm_thread_get_current_id_impl() { return thread_id(); }
++
++} // namespace llvm
++
++uint64_t llvm::get_threadid() { return static_cast<uint64_t>(thread_id()); }
++
++uint32_t llvm::get_max_thread_name_length() { return 0; }
++
++void llvm::set_thread_name(const Twine &Name) {}
++
++void llvm::get_thread_name(SmallVectorImpl<char> &Name) { Name.clear(); }
++
++llvm::SetThreadPriorityResult
++llvm::set_thread_priority(ThreadPriority Priority) {
++  return SetThreadPriorityResult::FAILURE;
++}
++
++// The CPUs the scheduler runs threads on.
++static int computeHostNumHardwareThreads() {
++  struct n_cpuinfo Info = {};
++  if (cpu_info(&Info) < 0 || Info.scheduler_cpus == 0)
++    return 1;
++  return static_cast<int>(Info.scheduler_cpus);
++}
++
++void llvm::ThreadPoolStrategy::apply_thread_strategy(
++    unsigned ThreadPoolNum) const {}
++
++llvm::BitVector llvm::get_thread_affinity_mask() { return {}; }
++
++unsigned llvm::get_cpus() { return 1; }
++
++// Nocturne does not tell cores from hardware threads.
++int llvm::get_physical_cores() { return computeHostNumHardwareThreads(); }
+diff --git a/llvm/lib/Support/Nocturne/Watchdog.inc b/llvm/lib/Support/Nocturne/Watchdog.inc
+new file mode 100644
+index 00000000..e84d33f0
+--- /dev/null
++++ b/llvm/lib/Support/Nocturne/Watchdog.inc
+@@ -0,0 +1,20 @@
++//===- Nocturne/Watchdog.inc - Nocturne Watchdog Implementation -*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// The watchdog bounds the time a crashing program spends printing its stack.
++// Nocturne ends a faulting app itself and reports where it stopped, so there
++// is nothing to bound.
++//
++//===----------------------------------------------------------------------===//
++
++namespace llvm {
++namespace sys {
++Watchdog::Watchdog(unsigned int seconds) {}
++Watchdog::~Watchdog() {}
++} // namespace sys
++} // namespace llvm
+diff --git a/llvm/lib/Support/Path.cpp b/llvm/lib/Support/Path.cpp
+index 65e29402..bb0b54be 100644
+--- a/llvm/lib/Support/Path.cpp
++++ b/llvm/lib/Support/Path.cpp
+@@ -24,7 +24,9 @@
+ #include "llvm/Support/Signals.h"
+ #include <cctype>
+ 
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
++#if defined(__nocturne__)
++#include "Nocturne/Nocturne.h"
++#elif !defined(_MSC_VER) && !defined(__MINGW32__)
+ #include <unistd.h>
+ #else
+ #include <io.h>
+@@ -903,7 +905,7 @@ std::error_code createUniqueFile(const Twine &Model,
+   if (EC)
+     return EC;
+   // FD is only needed to avoid race conditions. Close it right away.
+-  close(FD);
++  sys::Process::SafelyCloseFileDescriptor(FD);
+   return EC;
+ }
+ 
+@@ -949,7 +951,7 @@ std::error_code createTemporaryFile(const Twine &Prefix, StringRef Suffix,
+   if (EC)
+     return EC;
+   // FD is only needed to avoid race conditions. Close it right away.
+-  close(FD);
++  sys::Process::SafelyCloseFileDescriptor(FD);
+   return EC;
+ }
+ 
+@@ -1014,28 +1016,35 @@ std::error_code create_directories(const Twine &Path, bool IgnoreExisting,
+   return create_directory(P, IgnoreExisting, Perms);
+ }
+ 
+-static std::error_code copy_file_internal(int ReadFD, int WriteFD) {
+-  const size_t BufSize = 4096;
+-  char *Buf = new char[BufSize];
+-  int BytesRead = 0, BytesWritten = 0;
+-  for (;;) {
+-    BytesRead = read(ReadFD, Buf, BufSize);
+-    if (BytesRead <= 0)
+-      break;
+-    while (BytesRead) {
+-      BytesWritten = write(WriteFD, Buf, BytesRead);
+-      if (BytesWritten < 0)
+-        break;
+-      BytesRead -= BytesWritten;
+-    }
++// Writes all of Data to FD.
++static std::error_code write_all(int FD, StringRef Data) {
++#if defined(__nocturne__)
++  return sys::nocturne::write(FD, Data);
++#else
++  while (!Data.empty()) {
++    int BytesWritten = write(FD, Data.data(), Data.size());
+     if (BytesWritten < 0)
+-      break;
++      return errnoAsErrorCode();
++    Data = Data.drop_front(BytesWritten);
+   }
+-  delete[] Buf;
+-
+-  if (BytesRead < 0 || BytesWritten < 0)
+-    return errnoAsErrorCode();
+   return std::error_code();
++#endif
++}
++
++static std::error_code copy_file_internal(int ReadFD, int WriteFD) {
++  constexpr size_t BufSize = 4096;
++  std::vector<char> Buf(BufSize);
++  for (;;) {
++    Expected<size_t> BytesRead = readNativeFile(convertFDToNativeFile(ReadFD),
++                                                MutableArrayRef<char>(Buf));
++    if (!BytesRead)
++      return errorToErrorCode(BytesRead.takeError());
++    if (!*BytesRead)
++      return std::error_code();
++    if (std::error_code EC =
++            write_all(WriteFD, StringRef(Buf.data(), *BytesRead)))
++      return EC;
++  }
+ }
+ 
+ #ifndef __APPLE__
+@@ -1045,16 +1054,16 @@ std::error_code copy_file(const Twine &From, const Twine &To) {
+     return EC;
+   if (std::error_code EC =
+           openFileForWrite(To, WriteFD, CD_CreateAlways, OF_None)) {
+-    close(ReadFD);
++    sys::Process::SafelyCloseFileDescriptor(ReadFD);
+     return EC;
+   }
+ 
+   std::error_code EC = copy_file_internal(ReadFD, WriteFD);
+ 
+-  close(ReadFD);
+-  close(WriteFD);
++  sys::Process::SafelyCloseFileDescriptor(ReadFD);
++  std::error_code CloseEC = sys::Process::SafelyCloseFileDescriptor(WriteFD);
+ 
+-  return EC;
++  return EC ? EC : CloseEC;
+ }
+ #endif
+ 
+@@ -1065,7 +1074,7 @@ std::error_code copy_file(const Twine &From, int ToFD) {
+ 
+   std::error_code EC = copy_file_internal(ReadFD, ToFD);
+ 
+-  close(ReadFD);
++  sys::Process::SafelyCloseFileDescriptor(ReadFD);
+ 
+   return EC;
+ }
+@@ -1076,17 +1085,17 @@ ErrorOr<MD5::MD5Result> md5_contents(int FD) {
+   MD5 Hash;
+ 
+   constexpr size_t BufSize = 4096;
+-  std::vector<uint8_t> Buf(BufSize);
+-  int BytesRead = 0;
++  std::vector<char> Buf(BufSize);
+   for (;;) {
+-    BytesRead = read(FD, Buf.data(), BufSize);
+-    if (BytesRead <= 0)
++    Expected<size_t> BytesRead =
++        readNativeFile(convertFDToNativeFile(FD), MutableArrayRef<char>(Buf));
++    if (!BytesRead)
++      return errorToErrorCode(BytesRead.takeError());
++    if (!*BytesRead)
+       break;
+-    Hash.update(ArrayRef(Buf.data(), BytesRead));
++    Hash.update(StringRef(Buf.data(), *BytesRead));
+   }
+ 
+-  if (BytesRead < 0)
+-    return errnoAsErrorCode();
+   MD5::MD5Result Result;
+   Hash.final(Result);
+   return Result;
+@@ -1100,7 +1109,7 @@ ErrorOr<MD5::MD5Result> md5_contents(const Twine &Path) {
+     return EC;
+ 
+   auto Result = md5_contents(FD);
+-  close(FD);
++  sys::Process::SafelyCloseFileDescriptor(FD);
+   return Result;
+ }
+ 
+@@ -1256,6 +1265,9 @@ Error readNativeFileToEOF(file_t FileHandle, SmallVectorImpl<char> &Buffer,
+ #if defined(_WIN32)
+ #include "Windows/Path.inc"
+ #endif
++#if defined(__nocturne__)
++#include "Nocturne/Path.inc"
++#endif
+ 
+ namespace llvm {
+ namespace sys {
+@@ -1280,10 +1292,9 @@ TempFile::~TempFile() { assert(Done); }
+ 
+ Error TempFile::discard() {
+   Done = true;
+-  if (FD != -1 && close(FD) == -1) {
+-    std::error_code EC = errnoAsErrorCode();
+-    return errorCodeToError(EC);
+-  }
++  if (FD != -1)
++    if (std::error_code EC = sys::Process::SafelyCloseFileDescriptor(FD))
++      return errorCodeToError(EC);
+   FD = -1;
+ 
+ #ifdef _WIN32
+@@ -1350,8 +1361,8 @@ Error TempFile::keep(const Twine &Name) {
+   if (!RenameEC)
+     TmpName = "";
+ 
+-  if (close(FD) == -1)
+-    return errorCodeToError(errnoAsErrorCode());
++  if (std::error_code EC = sys::Process::SafelyCloseFileDescriptor(FD))
++    return errorCodeToError(EC);
+   FD = -1;
+ 
+   return errorCodeToError(RenameEC);
+@@ -1370,8 +1381,8 @@ Error TempFile::keep() {
+ 
+   TmpName = "";
+ 
+-  if (close(FD) == -1)
+-    return errorCodeToError(errnoAsErrorCode());
++  if (std::error_code EC = sys::Process::SafelyCloseFileDescriptor(FD))
++    return errorCodeToError(EC);
+   FD = -1;
+ 
+   return Error::success();
+diff --git a/llvm/lib/Support/Process.cpp b/llvm/lib/Support/Process.cpp
+index 57bcc2d1..2d377063 100644
+--- a/llvm/lib/Support/Process.cpp
++++ b/llvm/lib/Support/Process.cpp
+@@ -124,3 +124,6 @@ bool Process::AreCoreFilesPrevented() { return coreFilesPrevented; }
+ #ifdef _WIN32
+ #include "Windows/Process.inc"
+ #endif
++#if defined(__nocturne__)
++#include "Nocturne/Process.inc"
++#endif
+diff --git a/llvm/lib/Support/Program.cpp b/llvm/lib/Support/Program.cpp
+index 23de621c..4eb3689a 100644
+--- a/llvm/lib/Support/Program.cpp
++++ b/llvm/lib/Support/Program.cpp
+@@ -103,3 +103,6 @@ void sys::printArg(raw_ostream &OS, StringRef Arg, bool Quote) {
+ #ifdef _WIN32
+ #include "Windows/Program.inc"
+ #endif
++#if defined(__nocturne__)
++#include "Nocturne/Program.inc"
++#endif
+diff --git a/llvm/lib/Support/RandomNumberGenerator.cpp b/llvm/lib/Support/RandomNumberGenerator.cpp
+index 2959fc2b..5da808c3 100644
+--- a/llvm/lib/Support/RandomNumberGenerator.cpp
++++ b/llvm/lib/Support/RandomNumberGenerator.cpp
+@@ -23,6 +23,8 @@
+ #include "llvm/Support/raw_ostream.h"
+ #ifdef _WIN32
+ #include "llvm/Support/Windows/WindowsSupport.h"
++#elif defined(__nocturne__)
++#include "Nocturne/Nocturne.h"
+ #else
+ #include "Unix/Unix.h"
+ #endif
+@@ -77,6 +79,9 @@ std::error_code llvm::getRandomBytes(void *Buffer, size_t Size) {
+       return std::error_code();
+   }
+   return std::error_code(GetLastError(), std::system_category());
++#elif defined(__nocturne__)
++  n_result R = n_random(Buffer, Size);
++  return R < 0 ? sys::nocturne::errorCode(R) : std::error_code();
+ #else
+   int Fd = open("/dev/urandom", O_RDONLY);
+   if (Fd != -1) {
+diff --git a/llvm/lib/Support/Signals.cpp b/llvm/lib/Support/Signals.cpp
+index 8b839c78..8591088b 100644
+--- a/llvm/lib/Support/Signals.cpp
++++ b/llvm/lib/Support/Signals.cpp
+@@ -363,3 +363,6 @@ static bool printMarkupStackTrace(StringRef Argv0, void **StackTrace, int Depth,
+ #ifdef _WIN32
+ #include "Windows/Signals.inc"
+ #endif
++#if defined(__nocturne__)
++#include "Nocturne/Signals.inc"
++#endif
+diff --git a/llvm/lib/Support/Threading.cpp b/llvm/lib/Support/Threading.cpp
+index 90352d2f..d143ba31 100644
+--- a/llvm/lib/Support/Threading.cpp
++++ b/llvm/lib/Support/Threading.cpp
+@@ -26,7 +26,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #if LLVM_ENABLE_THREADS == 0 ||                                                \
+-    (!defined(_WIN32) && !defined(HAVE_PTHREAD_H))
++    (!defined(_WIN32) && !defined(__nocturne__) && !defined(HAVE_PTHREAD_H))
+ 
+ using namespace llvm;
+ 
+@@ -59,6 +59,9 @@ static int computeHostNumHardwareThreads();
+ #ifdef _WIN32
+ #include "Windows/Threading.inc"
+ #endif
++#if defined(__nocturne__)
++#include "Nocturne/Threading.inc"
++#endif
+ 
+ using namespace llvm;
+ 
+@@ -89,6 +92,11 @@ const std::optional<unsigned> llvm::thread::DefaultStackSize = 8 * 1024 * 1024;
+   // This limit is easily reached when doing link-time thinLTO. AIX library
+   // developers have used 4MB, so we'll do the same.
+ const std::optional<unsigned> llvm::thread::DefaultStackSize = 4 * 1024 * 1024;
++#elif defined(__nocturne__)
++  // Nocturne gives a thread 256KB of stack unless asked, which a deep
++  // compilation outgrows. Stack pages are given on first touch, so ask for as
++  // much as the main thread has (8MB).
++const std::optional<unsigned> llvm::thread::DefaultStackSize = 8 * 1024 * 1024;
+ #else
+ const std::optional<unsigned> llvm::thread::DefaultStackSize;
+ #endif
+diff --git a/llvm/lib/Support/Watchdog.cpp b/llvm/lib/Support/Watchdog.cpp
+index 246f3dc7..b6d20eba 100644
+--- a/llvm/lib/Support/Watchdog.cpp
++++ b/llvm/lib/Support/Watchdog.cpp
+@@ -20,3 +20,6 @@
+ #ifdef _WIN32
+ #include "Windows/Watchdog.inc"
+ #endif
++#if defined(__nocturne__)
++#include "Nocturne/Watchdog.inc"
++#endif
+diff --git a/llvm/lib/Support/raw_ostream.cpp b/llvm/lib/Support/raw_ostream.cpp
+index 341dd561..4b978dd6 100644
+--- a/llvm/lib/Support/raw_ostream.cpp
++++ b/llvm/lib/Support/raw_ostream.cpp
+@@ -28,10 +28,20 @@
+ #include <algorithm>
+ #include <cerrno>
+ #include <cstdio>
++
++#if defined(__nocturne__)
++#include "Nocturne/Nocturne.h"
++#include "llvm/Support/Signals.h"
++// An app is given its input, output and errors as handles 0, 1 and 2.
++#define STDIN_FILENO 0
++#define STDOUT_FILENO 1
++#define STDERR_FILENO 2
++#else
+ #include <sys/stat.h>
+ 
+ // <fcntl.h> may provide O_BINARY.
+ # include <fcntl.h>
++#endif
+ 
+ #if defined(HAVE_UNISTD_H)
+ # include <unistd.h>
+@@ -622,7 +632,11 @@ raw_fd_ostream::raw_fd_ostream(int fd, bool shouldClose, bool unbuffered,
+ #endif
+ 
+   // Get the starting position.
++#if defined(__nocturne__)
++  int64_t loc = sys::nocturne::position(FD);
++#else
+   off_t loc = ::lseek(FD, 0, SEEK_CUR);
++#endif
+   sys::fs::file_status Status;
+   std::error_code EC = status(FD, Status);
+   IsRegularFile = Status.type() == sys::fs::file_type::regular_file;
+@@ -630,7 +644,7 @@ raw_fd_ostream::raw_fd_ostream(int fd, bool shouldClose, bool unbuffered,
+   // MSVCRT's _lseek(SEEK_CUR) doesn't return -1 for pipes.
+   SupportsSeeking = !EC && IsRegularFile;
+ #else
+-  SupportsSeeking = !EC && loc != (off_t)-1;
++  SupportsSeeking = !EC && loc != -1;
+ #endif
+   if (!SupportsSeeking)
+     pos = 0;
+@@ -729,6 +743,14 @@ void raw_fd_ostream::write_impl(const char *Ptr, size_t Size) {
+       return;
+ #endif
+ 
++#if defined(__nocturne__)
++  if (std::error_code EC = sys::nocturne::write(FD, StringRef(Ptr, Size))) {
++    // No one reads the channel any more.
++    if (EC == std::errc::broken_pipe)
++      llvm::sys::CallOneShotPipeSignalHandler();
++    error_detected(EC);
++  }
++#else
+   // The maximum write size is limited to INT32_MAX. A write
+   // greater than SSIZE_MAX is implementation-defined in POSIX,
+   // and Windows _write requires 32 bit input.
+@@ -780,6 +802,7 @@ void raw_fd_ostream::write_impl(const char *Ptr, size_t Size) {
+     Ptr += ret;
+     Size -= ret;
+   } while (Size > 0);
++#endif
+ }
+ 
+ void raw_fd_ostream::close() {
+@@ -796,6 +819,12 @@ uint64_t raw_fd_ostream::seek(uint64_t off) {
+   flush();
+ #ifdef _WIN32
+   pos = ::_lseeki64(FD, off, SEEK_SET);
++#elif defined(__nocturne__)
++  if (std::error_code EC = sys::nocturne::setPosition(FD, off)) {
++    error_detected(EC);
++    return pos = (uint64_t)-1;
++  }
++  pos = off;
+ #else
+   pos = ::lseek(FD, off, SEEK_SET);
+ #endif
+@@ -826,6 +855,11 @@ size_t raw_fd_ostream::preferred_buffer_size() const {
+   // The buffer size on z/OS is defined with macro BUFSIZ, which can be
+   // retrieved by invoking function raw_ostream::preferred_buffer_size().
+   return raw_ostream::preferred_buffer_size();
++#elif defined(__nocturne__)
++  // A terminal shows output as it comes, as on other systems. Every write is
++  // a call into the system, so documents and channels take large ones.
++  assert(FD >= 0 && "File not yet open!");
++  return is_displayed() ? 0 : 64 * 1024;
+ #else
+   assert(FD >= 0 && "File not yet open!");
+   struct stat statbuf;
+@@ -925,7 +959,17 @@ raw_fd_stream::raw_fd_stream(int fd, bool shouldClose)
+ 
+ ssize_t raw_fd_stream::read(char *Ptr, size_t Size) {
+   assert(get_fd() >= 0 && "File already closed.");
++#if defined(__nocturne__)
++  Expected<size_t> Read =
++      sys::fs::readNativeFile(get_fd(), MutableArrayRef(Ptr, Size));
++  if (!Read) {
++    error_detected(errorToErrorCode(Read.takeError()));
++    return -1;
++  }
++  ssize_t Ret = *Read;
++#else
+   ssize_t Ret = ::read(get_fd(), (void *)Ptr, Size);
++#endif
+   if (Ret >= 0)
+     inc_pos(Ret);
+   else
+diff --git a/llvm/lib/Support/regcomp.c b/llvm/lib/Support/regcomp.c
+index 6838b96a..cb932cb0 100644
+--- a/llvm/lib/Support/regcomp.c
++++ b/llvm/lib/Support/regcomp.c
+@@ -42,7 +42,6 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <sys/types.h>
+ 
+ #include "regex2.h"
+ #include "regutils.h"
+diff --git a/llvm/lib/Support/regerror.c b/llvm/lib/Support/regerror.c
+index 1d67c9a2..525ecf2b 100644
+--- a/llvm/lib/Support/regerror.c
++++ b/llvm/lib/Support/regerror.c
+@@ -35,7 +35,6 @@
+  *	@(#)regerror.c	8.4 (Berkeley) 3/20/94
+  */
+ 
+-#include <sys/types.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <ctype.h>
+diff --git a/llvm/lib/Support/regex_impl.h b/llvm/lib/Support/regex_impl.h
+index 8f0c5322..c38c5f65 100644
+--- a/llvm/lib/Support/regex_impl.h
++++ b/llvm/lib/Support/regex_impl.h
+@@ -38,8 +38,9 @@
+ #ifndef LLVM_SUPPORT_REGEX_IMPL_H
+ #define LLVM_SUPPORT_REGEX_IMPL_H
+ 
+-#include <sys/types.h>
+-typedef off_t llvm_regoff_t;
++#include <stddef.h>
++/* An offset into the string matched. */
++typedef ptrdiff_t llvm_regoff_t;
+ typedef struct {
+   llvm_regoff_t rm_so;		/* start of match */
+   llvm_regoff_t rm_eo;		/* end of match */
+diff --git a/llvm/lib/Support/regexec.c b/llvm/lib/Support/regexec.c
+index bd5e72d4..0dea7a10 100644
+--- a/llvm/lib/Support/regexec.c
++++ b/llvm/lib/Support/regexec.c
+@@ -42,7 +42,6 @@
+  * macros that code uses.  This lets the same code operate on two different
+  * representations for state sets.
+  */
+-#include <sys/types.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/llvm/lib/Support/regfree.c b/llvm/lib/Support/regfree.c
+index dc2b4af9..80a18f4f 100644
+--- a/llvm/lib/Support/regfree.c
++++ b/llvm/lib/Support/regfree.c
+@@ -35,7 +35,6 @@
+  *	@(#)regfree.c	8.3 (Berkeley) 3/20/94
+  */
+ 
+-#include <sys/types.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include "regex_impl.h"
+diff --git a/llvm/lib/Support/regstrlcpy.c b/llvm/lib/Support/regstrlcpy.c
+index 8b68afdf..eff6b991 100644
+--- a/llvm/lib/Support/regstrlcpy.c
++++ b/llvm/lib/Support/regstrlcpy.c
+@@ -16,7 +16,6 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
+-#include <sys/types.h>
+ #include <string.h>
+ 
+ #include "regex_impl.h"
+diff --git a/llvm/lib/TargetParser/Host.cpp b/llvm/lib/TargetParser/Host.cpp
+index 70c95a60..2e284151 100644
+--- a/llvm/lib/TargetParser/Host.cpp
++++ b/llvm/lib/TargetParser/Host.cpp
+@@ -34,6 +34,9 @@
+ #ifdef _WIN32
+ #include "Windows/Host.inc"
+ #endif
++#ifdef __nocturne__
++#include "Nocturne/Host.inc"
++#endif
+ #ifdef _MSC_VER
+ #include <intrin.h>
+ #endif
+diff --git a/llvm/lib/TargetParser/Nocturne/Host.inc b/llvm/lib/TargetParser/Nocturne/Host.inc
+new file mode 100644
+index 00000000..a0d98c06
+--- /dev/null
++++ b/llvm/lib/TargetParser/Nocturne/Host.inc
+@@ -0,0 +1,35 @@
++//===- llvm/TargetParser/Nocturne/Host.inc ----------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements the Nocturne Host support.
++//
++//===----------------------------------------------------------------------===//
++
++// We need to include config.h here because LLVM_DEFAULT_TARGET_TRIPLE is not
++// defined in llvm-config.h if it is unset.
++#include "llvm/Config/config.h"
++#include <cstdlib>
++#include <string>
++
++using namespace llvm;
++
++// Nocturne's triple carries no version.
++static std::string updateTripleOSVersion(std::string Triple) { return Triple; }
++
++std::string sys::getDefaultTargetTriple() {
++  const char *Triple = LLVM_DEFAULT_TARGET_TRIPLE;
++
++  // Override the default target with a launch setting named by
++  // LLVM_TARGET_TRIPLE_ENV.
++#if defined(LLVM_TARGET_TRIPLE_ENV)
++  if (const char *EnvTriple = std::getenv(LLVM_TARGET_TRIPLE_ENV))
++    Triple = EnvTriple;
++#endif
++
++  return Triple;
++}
+diff --git a/llvm/tools/llvm-ar/llvm-ar.cpp b/llvm/tools/llvm-ar/llvm-ar.cpp
+index 38f929f6..e7191faa 100644
+--- a/llvm/tools/llvm-ar/llvm-ar.cpp
++++ b/llvm/tools/llvm-ar/llvm-ar.cpp
+@@ -41,12 +41,6 @@
+ #include "llvm/ToolDrivers/llvm-dlltool/DlltoolDriver.h"
+ #include "llvm/ToolDrivers/llvm-lib/LibDriver.h"
+ 
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
+-#include <unistd.h>
+-#else
+-#include <io.h>
+-#endif
+-
+ #ifdef _WIN32
+ #include "llvm/Support/Windows/WindowsSupport.h"
+ #endif
+@@ -631,7 +625,7 @@ static void doExtract(StringRef Name, const object::Archive::Child &C) {
+         sys::fs::setLastAccessAndModificationTime(FD, ModTimeOrErr.get()));
+   }
+ 
+-  if (close(FD))
++  if (sys::Process::SafelyCloseFileDescriptor(FD))
+     fail("Could not close the file");
+ }
+ 

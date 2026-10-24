@@ -72,8 +72,13 @@ $(BUILD)/kernel.elf: $(KOBJ) kernel/linker.ld
 	@$(LD) $(KLDFLAGS) $(KOBJ) -o $@
 
 # ---------------------------------------------------------------- userland
+# The system's programs never unwind their stacks, so they carry no unwind tables (user.ld keeps
+# the tables for the C++ exceptions of programs that clang builds in Nocturne). Each function and
+# variable has a section of its own, so that --gc-sections leaves out of a program whatever of the
+# libc and the libraries it does not use, not only the objects it does not use.
 UCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
            -mno-red-zone -O2 -g -std=gnu11 -fno-strict-aliasing -msse2 -fomit-frame-pointer \
+           -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections \
            -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Iuser/include -Icommon -MMD -MP
 ULDFLAGS := -m elf_x86_64 -s -nostdlib -static -z max-page-size=0x1000 -T user/user.ld --no-dynamic-linker
 
@@ -226,6 +231,9 @@ $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
 user/libc/web/unicode_grapheme_data.h: scripts/unicode_grapheme.py third_party/unicode/18.0.0/GraphemeBreakProperty.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt third_party/unicode/18.0.0/emoji-data.txt
 	@$(PY) scripts/unicode_grapheme.py
 $(BUILD)/u/user/libc/web/layout.o: user/libc/web/unicode_grapheme_data.h
+user/libc/wctype_data.h: scripts/unicode_wctype.py third_party/unicode/18.0.0/UnicodeData.txt third_party/unicode/18.0.0/PropList.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt
+	@$(PY) scripts/unicode_wctype.py
+$(BUILD)/u/user/libc/wctype.o: user/libc/wctype_data.h
 user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_atob.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h
@@ -371,6 +379,7 @@ endif
 endif
 
 include ports/rust/rust.mk
+include ports/llvm/llvm.mk
 
 NVRM_FILES := $(PROGRAMS)/nvrm $(LICENSES)/nvidia-open/COPYING $(LICENSES)/nvidia-open/NOTICES
 # the licence texts of the third-party code in the system, as third_party has them
@@ -440,12 +449,13 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 
 # the SDK: headers and libraries for compiling inside Nocturne (C:\Nocturne\SDK)
 $(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) $(TCCRT_OBJ) scripts/mksdk.sh \
-		$(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h') \
+		$(shell find user/include ports/tcc/include third_party/bearssl/inc ports/nvidia/include $(TCC_DIR)/include -name '*.h') \
+		third_party/quickjs/quickjs.h $(shell find user/libc -name '*.h' -o -name '*.inc' -o -name '*.js') \
 		$(LXB_HEADERS) ports/lexbor/include/memory.h third_party/lexbor/headers.list \
-		common/abi.h common/gfx.h common/gpu_abi.h common/display_abi.h \
-		$(wildcard user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts)
+		common/abi.h common/gfx.h common/gpu_abi.h common/display_abi.h user/user.ld \
+		$(wildcard user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts) $(LLVM_SDK_FILES)
 	@echo "  SDK"
-	@bash scripts/mksdk.sh $(SDK) $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
+	@bash scripts/mksdk.sh $(SDK) $(if $(LLVM_SDK),--llvm $(LLVM_SDK)) $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images
@@ -473,7 +483,7 @@ $(NVIDIA_FW_STATE): nvidia-firmware-check scripts/layout.py
 	@$(PY) scripts/layout.py --firmware-state "$@" --firmware-source "$(NVIDIA_FIRMWARE)" --firmware-version "$(NVIDIA_FW_VERSION)"
 
 # everything scripts/layout.py puts on C:
-DISK_FILES := $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(NVRM_FILES) $(PROGRAMS)/tcc $(LICENSE_FILES) $(BUILD)/sdk.stamp \
+DISK_FILES := $(APP_BINS) $(GO_FILES) $(RUST_FILES) $(LLVM_FILES) $(NVRM_FILES) $(PROGRAMS)/tcc $(LICENSE_FILES) $(BUILD)/sdk.stamp \
     $(BUILD)/sounds.stamp $(NVIDIA_FW_STATE) $(shell find rootfs -type f) third_party/ca/ca-bundle.crt
 
 # the music in the user's Music folder, made by a script

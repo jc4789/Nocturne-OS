@@ -15,7 +15,6 @@ int64_t n_channel_send(int32_t, const void *, size_t, int32_t);
 int wait_on_address(volatile uint32_t *, uint32_t, unsigned);
 int wake_address(volatile uint32_t *, unsigned);
 void yield(void);
-void *__dso_handle = &__dso_handle;
 }
 
 namespace {

@@ -819,7 +819,7 @@ bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms) {
     uint64_t f = irq_save();
     struct task *t = current_task;
     t->timed_out = false;
-    uint64_t now = uptime_ms(), delay = ms ? ms : 1;
+    uint64_t now = timer_now_ms(), delay = ms ? ms : 1; /* at least ms, by the clock apps read */
     t->wake_at = delay > UINT64_MAX - now ? UINT64_MAX : now + delay;
     if (wq) {
         t->wq = wq;
@@ -893,19 +893,26 @@ void mutex_unlock(struct mutex *m) {
 
 /* ---- task lifecycle ---- */
 
-static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t argument) {
+static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t argument, uint64_t stack_bytes) {
     struct task *owner = task_process();
     if (!owner->is_user || owner->exiting || owner->killed) return -N_ERR_STOPPED;
+    /* No size cap of its own: the address region and free memory bound it. */
+    if (stack_bytes > UINT64_MAX - 3 * PAGE_SIZE) return -N_ERR_INVALID;
+    stack_bytes = stack_bytes ? ALIGN_UP(stack_bytes, PAGE_SIZE) : THREAD_STACK_DEFAULT;
     unsigned count = 0;
-    for (struct task *p = task_list; p; p = p->all_next)
-        if (p->is_thread && p->process == owner && p->state != TASK_ZOMBIE) count++; /* exited, not yet joined: no longer a running thread */
+    for (struct task *p = task_list, *next; p; p = next) {
+        next = p->all_next;
+        if (!p->is_thread || p->process != owner) continue;
+        if (p->state != TASK_ZOMBIE) count++; /* exited, not yet joined: no longer a running thread */
+        else if (p->detached) free_task(p);   /* no one joins it */
+    }
     if (count >= 128) return -N_ERR_NOT_READY;
     struct task *t = task_alloc(owner->name);
     if (!t) return -N_ERR_NO_MEMORY;
     t->is_user = t->is_thread = true;
     t->process = t->parent = owner;
     t->pml4 = owner->pml4;
-    t->user_stack_size = 256 * 1024;
+    t->user_stack_size = stack_bytes;
     /* Unmapped page at each end, distinct from every other thread's stack. */
     uint64_t reserved = mmap_reserve(owner, t->user_stack_size + PAGE_SIZE);
     if (!reserved) {
@@ -935,11 +942,25 @@ static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t
     return t->pid;
 }
 
-int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument) {
+int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument, uint64_t stack_bytes) {
     uint64_t flags = irq_save();
-    int tid = task_thread_create_locked(entry, function, argument);
+    int tid = task_thread_create_locked(entry, function, argument, stack_bytes);
     irq_restore(flags);
     return tid;
+}
+
+int task_thread_detach(int tid) {
+    struct task *owner = task_process();
+    uint64_t flags = irq_save();
+    struct task *t = NULL;
+    for (struct task *p = task_list; p; p = p->all_next)
+        if (p->pid == tid && p->is_thread && p->process == owner) { t = p; break; }
+    int r = 0;
+    if (!t || t->joining || t->detached) r = -N_ERR_INVALID;
+    else if (t->state == TASK_ZOMBIE) free_task(t); /* it has ended already */
+    else t->detached = true;                        /* the next thread_create or the app's end frees it */
+    irq_restore(flags);
+    return r;
 }
 
 int task_thread_join(int tid) {
@@ -948,7 +969,7 @@ int task_thread_join(int tid) {
     uint64_t flags = irq_save();
     for (struct task *p = task_list; p; p = p->all_next)
         if (p->pid == tid && p->is_thread && p->process == owner) { t = p; break; }
-    if (!t || t == current_task || t->joining) {
+    if (!t || t == current_task || t->joining || t->detached) {
         irq_restore(flags);
         return -N_ERR_INVALID;
     }

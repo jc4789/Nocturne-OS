@@ -30,6 +30,7 @@ struct task {
     bool is_thread;
     bool exiting;
     bool joining;
+    bool detached;            /* thread: freed when it has ended instead of joined */
     struct task *process;     /* shared VM / handles owner */
     uint64_t user_stack, user_stack_size;
     uint64_t wait_phys, wait_seq; /* address wait: physical key, FIFO order */
@@ -106,8 +107,12 @@ void sched_quiesce_space(uint64_t pml4); /* 0=shared kernel変更、他は該当
 bool sched_runner_idle(unsigned cpu);    /* BSP: そのAPにuser taskが無い（kernel jobに使える） */
 struct sched_stats { uint64_t handoffs, local_switches, dispatch_retires, stop_retires, steals, balances, kicks, borrows; };
 void sched_get_stats(struct sched_stats *out);
-int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument);
+/* stack_bytes 0 is THREAD_STACK_DEFAULT; others are rounded up to whole pages. */
+#define THREAD_STACK_DEFAULT (256 * 1024)
+int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument, uint64_t stack_bytes);
 int task_thread_join(int tid);
+/* No one will join the thread: it is freed once it has ended. */
+int task_thread_detach(int tid);
 /* wide: compare the 8-byte word at address (wasm memory.atomic.wait64). */
 int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms);
 int task_wake_address(volatile uint32_t *address, unsigned count);

@@ -5,11 +5,17 @@ NOCTURNE_BEGIN_DECLS
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 #define RAND_MAX 0x7FFFFFFF
+/* The longest multibyte character: the locale's characters are UTF-8 (<locale.h>). */
+#define MB_CUR_MAX ((size_t)4)
 void *malloc(size_t n);
 void *calloc(size_t n, size_t m);
 void *realloc(void *p, size_t n);
 void free(void *p);
+/* ISO C: alignment is a power of two; free and realloc take the block. */
+void *aligned_alloc(size_t alignment, size_t n);
 NOCTURNE_NORETURN void exit(int code);
+/* Ends the app at once: no atexit or C++ destructors, no stdio flush. */
+NOCTURNE_NORETURN void _Exit(int code);
 NOCTURNE_NORETURN void abort(void);
 int atexit(void (*fn)(void));
 int atoi(const char *s);
@@ -42,4 +48,9 @@ lldiv_t lldiv(long long a, long long b);
 void *bsearch(const void *key, const void *base, size_t n, size_t size, int (*cmp)(const void *, const void *));
 int setenv(const char *name, const char *value, int overwrite);
 int unsetenv(const char *name);
+int mblen(const char *s, size_t n);
+int mbtowc(wchar_t *pwc, const char *s, size_t n);
+int wctomb(char *s, wchar_t wc);
+size_t mbstowcs(wchar_t *dst, const char *src, size_t n);
+size_t wcstombs(char *dst, const wchar_t *src, size_t n);
 NOCTURNE_END_DECLS

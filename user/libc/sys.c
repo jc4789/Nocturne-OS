@@ -153,11 +153,17 @@ static _Noreturn void libc_thread_entry(void (*fn)(void *), void *arg) {
     fn(arg);
     thread_exit();
 }
-n_result thread_create(void (*fn)(void *), void *arg) {
+n_result thread_create_sized(void (*fn)(void *), void *arg, size_t stack_bytes) {
     if (!fn) return -N_ERR_INVALID;
-    return SC3(SYS_THREAD_CREATE, fn, arg, libc_thread_entry);
+    /* The caller asks for the stack fn runs on: libc_thread_entry's frame, with
+       the thread's TLS block and control block in it, comes on top. */
+    size_t area = stack_bytes ? libc_thread_area() + 64 : 0;
+    if (stack_bytes > SIZE_MAX - area) return -N_ERR_INVALID;
+    return SC4(SYS_THREAD_CREATE, fn, arg, libc_thread_entry, stack_bytes + area);
 }
+n_result thread_create(void (*fn)(void *), void *arg) { return thread_create_sized(fn, arg, 0); }
 n_result thread_join(int tid) { return SC1(SYS_THREAD_JOIN, tid); }
+n_result thread_detach(int tid) { return SC1(SYS_THREAD_DETACH, tid); }
 _Noreturn void thread_exit(void) { SC0(SYS_THREAD_EXIT); for (;;) {} }
 int thread_id(void) {
     struct libc_thread *t = libc_thread_current();
@@ -225,6 +231,7 @@ n_result n_document_write_at(n_handle h, uint64_t offset, const void *buf, size_
     return NC5(SYS_DOCUMENT_WRITE_AT, h, offset, buf, n, 0);
 }
 n_result n_document_size(n_handle h) { return NC5(SYS_DOCUMENT_SIZE, h, 0, 0, 0, 0); }
+n_result n_document_info(n_handle h, struct n_entry *out) { return NC5(SYS_DOCUMENT_INFO, h, out, 0, 0, 0); }
 n_result n_document_set_size(n_handle h, uint64_t size) { return NC5(SYS_DOCUMENT_SET_SIZE, h, size, 0, 0, 0); }
 n_result n_document_claim(n_handle h, bool wait) { return NC5(SYS_DOCUMENT_CLAIM, h, wait, 0, 0, 0); }
 n_result n_document_release(n_handle h) { return NC5(SYS_DOCUMENT_RELEASE, h, 0, 0, 0, 0); }
@@ -267,6 +274,7 @@ n_result n_document_load(const char *path, void **data, size_t *size) {
 n_result n_entry_info(const char *path, struct n_entry *out) { return NC5(SYS_ENTRY_INFO, path, out, 0, 0, 0); }
 n_result n_entry_remove(const char *path) { return NC5(SYS_ENTRY_REMOVE, path, 0, 0, 0, 0); }
 n_result n_entry_move(const char *from, const char *to) { return NC5(SYS_ENTRY_MOVE, from, to, 0, 0, 0); }
+n_result n_entry_replace(const char *from, const char *to) { return NC5(SYS_ENTRY_REPLACE, from, to, 0, 0, 0); }
 n_result n_folder_create(const char *path) { return NC5(SYS_FOLDER_CREATE, path, 0, 0, 0, 0); }
 n_result n_folder_list(const char *path, struct n_entry *out, size_t max, uint64_t start) {
     return NC5(SYS_FOLDER_LIST, path, out, max, start, 0);
@@ -701,6 +709,8 @@ struct exit_callback {
     void *argument, *dso;
     bool is_cxx;
 };
+/* A program is one static image: its C++ destructors all register with this handle. */
+void *__dso_handle = &__dso_handle;
 static struct exit_callback *exit_callbacks;
 static uint32_t exit_callbacks_lock;
 static void exit_lock(void) {
@@ -748,11 +758,15 @@ void __cxa_finalize(void *dso) {
     }
 }
 
+_Noreturn void _Exit(int code) {
+    SC1(SYS_EXIT, code);
+    for (;;) {}
+}
+
 _Noreturn void exit(int code) {
     __cxa_finalize(NULL);
     __stdio_flush_all();
-    SC1(SYS_EXIT, code);
-    for (;;) {}
+    _Exit(code);
 }
 
 _Noreturn void abort(void) {
@@ -764,7 +778,7 @@ void __libc_init(void) {
     void *area = main_thread_area;
     if (libc_thread_area() > sizeof main_thread_area) {
         long r = __syscall(SYS_MEMORY_RESERVE, (long)libc_thread_area(), N_MEMORY_READ_WRITE, 0, 0, 0);
-        if (r < 0 && r > -4096) SC1(SYS_EXIT, 127);
+        if (r < 0 && r > -4096) _Exit(127);
         area = (void *)r;
     }
     libc_thread_init(area);

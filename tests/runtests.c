@@ -111,6 +111,17 @@ static const struct test tests[] = {
     {"tcc", "self-host", "tcc -o .\\tcc2 C:\\Tests\\tcc\\tcc.c && .\\tcc2 -run C:\\Nocturne\\SDK\\Source\\Apps\\echo.c self-hosted",
      0, {"self-hosted"}, NULL, 300},
 
+    /* the LLVM toolchain (ports/llvm): clang, clang++ and ld.lld with the SDK's libc++ */
+    {"clang", "c-executable", "clang -O2 -o .\\ctest C:\\Tests\\ctest.c && .\\ctest", 0, {"ctest: ok"}, NULL, 300},
+    {"clang", "errors", "echo 'int main(void) { return x; }' > .\\bad.c; clang -c .\\bad.c", NONZERO,
+     {"undeclared identifier 'x'"}, NULL, 120},
+    {"clang", "cxx-executable", "clang++ -std=c++23 -O2 -o .\\cxxtest C:\\Tests\\cxxtest.cpp && .\\cxxtest", 0,
+     {"cxxtest: ok"}, "FAIL", 600},
+    {"clang", "threads-executable", "clang -O2 -o .\\threadtest C:\\Tests\\threadtest.c && .\\threadtest", 0,
+     {"threadtest: ", "PASS", "active="}, "FAIL", 300, false, true},
+    {"clang", "compile-all-apps", "tcc -o .\\allapps C:\\Tests\\allapps.c && .\\allapps clang", 0, {", 0 failed"},
+     NULL, 1200},
+
     /* desktop */
     {"gui", "window-and-screenshot", "tcc -o .\\guitest C:\\Tests\\guitest.c && .\\guitest", 0, {"guitest: ok"}, NULL, 60},
     {"gui", "gpu-or-explicit-fallback", "tcc -run C:\\Tests\\gputest.c", 0,
@@ -638,6 +649,8 @@ int main(int argc, char **argv) {
     }
     struct n_entry st;
     bool have_tcc_src = n_entry_info("C:\\Tests\\tcc\\tcc.c", &st) == 0;
+    /* the disk has LLVM when its Nocturne build was made (ports/llvm/README.md) */
+    bool have_llvm = n_entry_info("C:\\Nocturne\\System\\llvm", &st) == 0;
     printf("TESTS BEGIN\n");
     uint64_t t0 = uptime_ms();
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
@@ -653,6 +666,7 @@ int main(int argc, char **argv) {
         if (nonet && !strcmp(t->group, "net")) skip = "network tests disabled";
         if (!strcmp(t->name, "self-host") && (quick || !have_tcc_src)) skip = "needs --full (tcc sources)";
         if (quick && !strcmp(t->name, "compile-all-apps")) skip = "quick run";
+        if (!strcmp(t->group, "clang") && !have_llvm) skip = "no LLVM on the disk (ports/llvm)";
         if (skip) {
             result("SKIP", t, skip);
             nskip++;

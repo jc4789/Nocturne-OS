@@ -158,8 +158,36 @@
     #define _Nullable_result
     #define _Null_unspecified
 
+    /* GCC's memory orders for the __atomic builtins (and <stdatomic.h>'s memory_order) */
+    #define __ATOMIC_RELAXED 0
+    #define __ATOMIC_CONSUME 1
+    #define __ATOMIC_ACQUIRE 2
+    #define __ATOMIC_RELEASE 3
+    #define __ATOMIC_ACQ_REL 4
+    #define __ATOMIC_SEQ_CST 5
+
+    /* the values of __has_embed (C23) */
+    #define __STDC_EMBED_NOT_FOUND__ 0
+    #define __STDC_EMBED_FOUND__ 1
+    #define __STDC_EMBED_EMPTY__ 2
+
     /* skip __builtin... with -E */
     #ifndef __TCC_PP__
+
+    /* GCC's value forms of the __atomic builtins, on TinyCC's pointer forms
+       (tccgen.c:parse_atomic()). The value is held in the unqualified type of *ptr. */
+    #define __atomic_load_n(ptr, order) \
+        ({ __typeof__((void)0, *(ptr)) __atomic_v; \
+           __atomic_load((ptr), &__atomic_v, (order)); __atomic_v; })
+    #define __atomic_store_n(ptr, val, order) \
+        ({ __typeof__((void)0, *(ptr)) __atomic_v = (val); \
+           __atomic_store((ptr), &__atomic_v, (order)); })
+    #define __atomic_exchange_n(ptr, val, order) \
+        ({ __typeof__((void)0, *(ptr)) __atomic_v = (val), __atomic_old; \
+           __atomic_exchange((ptr), &__atomic_v, &__atomic_old, (order)); __atomic_old; })
+    #define __atomic_compare_exchange_n(ptr, expected, desired, weak, success, failure) \
+        ({ __typeof__((void)0, *(ptr)) __atomic_v = (desired); \
+           __atomic_compare_exchange((ptr), (expected), &__atomic_v, (weak), (success), (failure)); })
 
     #define __builtin_offsetof(type, field) ((__SIZE_TYPE__)&((type*)0)->field)
     #define __builtin_extract_return_addr(x) x
@@ -316,6 +344,10 @@
     __BOUND(void*, mmap, ())
     __BOUND(int, munmap, ())
 #endif
+    /* GCC's fences, in TinyCC's runtime (lib/atomic.S) */
+    void __atomic_thread_fence(int) __RENAME("atomic_thread_fence");
+    void __atomic_signal_fence(int) __RENAME("atomic_signal_fence");
+    #define __sync_synchronize() __atomic_thread_fence(__ATOMIC_SEQ_CST)
     #undef __BUILTINBC
     #undef __BUILTIN
     #undef __BOUND

@@ -35,6 +35,8 @@ void place_free(struct place *p);
 /* An app changes no SYSTEM entry and nothing in a SYSTEM folder: -N_ERR_DENIED. entry: the entry
    itself changes, not only the folder's list. */
 int place_may_change(const struct place *p, bool user, bool entry);
+/* out: entry id, called name (n bytes), as n_entry_info gives it from its record. */
+void entry_fill(struct n_entry *out, const char *name, size_t n, uint64_t id, const struct store_record *rec);
 
 /* Something changed: the writer commits it within seconds (soon: at once). */
 void store_dirty(bool soon);

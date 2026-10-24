@@ -14,7 +14,8 @@
 
 #define HDR      16
 #define USED     1
-#define MAPPED   2   /* the block is a whole region; size is its page-rounded length */
+#define MAPPED   2   /* the block is a whole region; size is its page-rounded length
+                        and prev how far into the region the block starts */
 #define MAP_MIN  (1024 * 1024)
 #define MIN_BLK  32
 #define GROW_MIN (256 * 1024)
@@ -279,10 +280,65 @@ static void *map_alloc(size_t n) {
     __atomic_add_fetch(&mapped_total, total, __ATOMIC_RELAXED);
     return (char *)b + HDR;
 }
+/* An aligned_alloc block starts inside its region; the others at its start. */
+static char *map_region(blk *b) { return (char *)b - b->prev; }
 static void map_free(blk *b) {
     size_t total = bsize(b);
     __atomic_sub_fetch(&mapped_total, total, __ATOMIC_RELAXED);
-    n_memory_release(b, total);
+    n_memory_release(map_region(b), total);
+}
+
+/* A region whose block's bytes start at a multiple of align. The whole pages
+   before and after the block go back at once. */
+static void *map_aligned(size_t align, size_t n) {
+    if (n > ((size_t)1 << 40) || align > ((size_t)1 << 40)) return NULL;
+    size_t total = (align + n + PAGE - 1) & ~(size_t)(PAGE - 1);
+    void *mem;
+    if (n_memory_reserve(total, N_MEMORY_READ_WRITE, &mem) < 0) return NULL;
+    char *region = mem;
+    size_t offset = (0 - ((uintptr_t)region + HDR)) & (align - 1);
+    size_t lead = offset & ~(size_t)(PAGE - 1);
+    if (lead && n_memory_release(region, lead) == 0) region += lead, offset -= lead, total -= lead;
+    size_t keep = (offset + HDR + n + PAGE - 1) & ~(size_t)(PAGE - 1);
+    if (keep < total && n_memory_release(region + keep, total - keep) == 0) total = keep;
+    blk *b = (blk *)(region + offset);
+    b->size = total | MAPPED | USED;
+    b->prev = offset;
+    __atomic_add_fetch(&mapped_total, total, __ATOMIC_RELAXED);
+    return (char *)b + HDR;
+}
+
+/* A heap block whose bytes start at a multiple of align: a block with room
+   for the alignment, whose bytes before that point (at least a block's worth)
+   and after the request go back as free blocks. */
+static void *aligned_locked(size_t align, size_t n) {
+    size_t need = (n + HDR + 15) & ~(size_t)15;
+    if (need < MIN_BLK) need = MIN_BLK;
+    char *p = malloc_locked(need - HDR + align + MIN_BLK);
+    if (!p) return NULL;
+    blk *b = (blk *)(p - HDR);
+    uintptr_t at = ((uintptr_t)p + align - 1) & ~(uintptr_t)(align - 1);
+    if (at != (uintptr_t)p && at - (uintptr_t)p < MIN_BLK) at += align;
+    if (at != (uintptr_t)p) {
+        size_t gap = at - (uintptr_t)p, total = bsize(b);
+        blk *a = (blk *)(at - HDR);
+        b->size = gap | USED;
+        a->size = (total - gap) | USED;
+        a->prev = gap;
+        next_blk(a)->prev = total - gap;
+        free_locked(p);
+        b = a;
+    }
+    size_t rest = bsize(b) - need;
+    if (rest >= MIN_BLK) {
+        b->size = need | USED;
+        blk *r = next_blk(b);
+        r->size = rest | USED;
+        r->prev = need;
+        next_blk(r)->prev = rest;
+        free_locked((char *)r + HDR);
+    }
+    return (char *)b + HDR;
 }
 
 void *calloc(size_t n, size_t m) {
@@ -348,6 +404,17 @@ void free(void *p) {
         heap_unlock();
     }
 }
+/* Heap blocks are 16-byte aligned already. Larger alignments up to a page
+   come from the heap while the padded request stays below MAP_MIN. */
+void *aligned_alloc(size_t align, size_t n) {
+    if (!align || (align & (align - 1))) return NULL;
+    if (align <= 16) return malloc(n);
+    if (align > PAGE || n >= MAP_MIN - align - MIN_BLK) return map_aligned(align, n);
+    heap_lock();
+    void *p = aligned_locked(align, n);
+    heap_unlock();
+    return p;
+}
 void malloc_usage(size_t *heap, size_t *used) {
     size_t mapped = __atomic_load_n(&mapped_total, __ATOMIC_RELAXED);
     heap_lock();
@@ -361,12 +428,13 @@ void *realloc(void *p, size_t n) {
     blk *b = (blk *)((char *)p - HDR);
     size_t have = bsize(b) - HDR;
     if (b->size & MAPPED) {
+        have -= b->prev;
         if (n <= have) {
             /* Give back whole pages a shrink no longer needs. */
-            size_t keep = (n + HDR + PAGE - 1) & ~(size_t)(PAGE - 1);
+            size_t keep = (b->prev + n + HDR + PAGE - 1) & ~(size_t)(PAGE - 1);
             if (n >= MAP_MIN && keep < bsize(b)) {
                 size_t release = bsize(b) - keep;
-                if (n_memory_release((char *)b + keep, release) == 0) {
+                if (n_memory_release(map_region(b) + keep, release) == 0) {
                     __atomic_sub_fetch(&mapped_total, release, __ATOMIC_RELAXED);
                     b->size = keep | MAPPED | USED;
                 }

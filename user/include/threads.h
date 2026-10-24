@@ -18,7 +18,10 @@ enum { mtx_plain = 1, mtx_recursive = 2, mtx_timed = 4 };
 
 typedef struct __nocturne_thrd *thrd_t;
 typedef int (*thrd_start_t)(void *);
-/* state: 0 unlocked, 1 locked, 2 locked with waiters. */
+/* state: 0 unlocked, 1 locked, 2 locked with waiters. A zeroed mtx_t is an
+   unlocked plain mutex and a zeroed cnd_t a condition nobody waits on, so a
+   static one needs no mtx_init or cnd_init (libc++'s std::mutex and
+   std::condition_variable, and libunwind, count on it). */
 typedef struct { volatile uint32_t state; int type; int owner; unsigned depth; } mtx_t;
 typedef struct { volatile uint32_t sequence; } cnd_t;
 /* 0 not run, 1 running, 2 done. */

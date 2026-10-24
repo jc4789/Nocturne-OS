@@ -1347,6 +1347,7 @@ ST_FUNC DLLReference *tcc_add_dllref(TCCState *s1, const char *dllname, int leve
 ST_FUNC char *tcc_load_text(TCCInput *in);
 ST_FUNC int tcc_input_open(const char *filename, TCCInput *in);
 ST_FUNC void tcc_input_close(TCCInput *in);
+ST_FUNC int64_t tcc_input_size(TCCInput *in);
 /* for #pragma once */
 ST_FUNC int normalized_PATHCMP(const char *f1, const char *f2);
 

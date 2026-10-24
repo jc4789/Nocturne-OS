@@ -10,6 +10,10 @@
 - https://www.unicode.org/Public/18.0.0/ucd/DerivedCoreProperties.txt
 - https://www.unicode.org/Public/18.0.0/ucd/emoji/emoji-data.txt
 - https://www.unicode.org/Public/18.0.0/ucd/auxiliary/GraphemeBreakTest.txt
+- https://www.unicode.org/Public/18.0.0/ucd/UnicodeData.txt（2026-10-23 取得、libc の
+  `wctype.h` の分類と大文字小文字変換）
+- https://www.unicode.org/Public/18.0.0/ucd/PropList.txt（2026-10-23 取得、同じく
+  White_Space）
 - https://www.unicode.org/license.txt
 - 規則 https://www.unicode.org/reports/tr29/tr29-49.html
 
@@ -18,6 +22,8 @@
 Extended_Pictographic のみを `user/libc/web/unicode_grapheme_data.h` へ
 生成する。生成物には各原データの SHA256 が入り、`--check` で原データとの
 一致を確認できる。Hangul LV/LVT の音節は UAX #29 の算式で分類する。
+`python -X utf8 scripts/unicode_wctype.py` は UnicodeData・PropList・DerivedCoreProperties から
+libc の `wctype.h` の分類と単純大文字小文字変換を `user/libc/wctype_data.h` へ同じ流儀で生成する。
 
 同版の公式 `GraphemeBreakTest.txt` はブラウザーの実 C helper に対して
 `python -X utf8 tests/check_grapheme.py` で検査する。ホスト分離検査であり、

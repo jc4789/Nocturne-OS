@@ -342,7 +342,7 @@ int place_may_change(const struct place *p, bool user, bool entry) {
     return entry && p->found && (p->record.attributes & STORE_SYSTEM) ? -N_ERR_DENIED : 0;
 }
 
-static void entry_fill(struct n_entry *out, const char *name, size_t n, uint64_t id, const struct store_record *rec) {
+void entry_fill(struct n_entry *out, const char *name, size_t n, uint64_t id, const struct store_record *rec) {
     memset(out, 0, sizeof *out);
     if (n) memcpy(out->name, name, MIN(n, sizeof out->name - 1));
     out->kind = rec->kind == STORE_FOLDER ? N_KIND_FOLDER : N_KIND_DOCUMENT;
@@ -350,7 +350,11 @@ static void entry_fill(struct n_entry *out, const char *name, size_t n, uint64_t
         int64_t now = document_size_now(id);
         out->size = now >= 0 ? (uint64_t)now : rec->size;
     }
-    out->modified = rec->modified / 1000000000;
+    int64_t seconds = rec->modified / 1000000000, ns = rec->modified % 1000000000;
+    if (ns < 0) { ns += 1000000000; seconds--; } /* before 1970: the second below */
+    out->modified = seconds;
+    out->modified_ns = (uint32_t)ns;
+    out->id = id;
 }
 
 int store_entry_info(const char *path, bool user, struct n_entry *out) {
@@ -457,7 +461,7 @@ int store_entry_remove(const char *path, bool user) {
     return r < 0 ? r : 0;
 }
 
-int store_entry_move(const char *from, const char *to, bool user) {
+int store_entry_move(const char *from, const char *to, bool replace, bool user) {
     struct volume *v = store.v;
     struct place a, b;
     mutex_lock(&v->lock);
@@ -466,9 +470,18 @@ int store_entry_move(const char *from, const char *to, bool user) {
         r = !a.found ? -N_ERR_NOT_FOUND : !a.n ? -N_ERR_DENIED : place_may_change(&a, user, true);
         if (r >= 0 && (r = place_find(to, user, &b)) >= 0) {
             /* the same entry may take another case of its name */
+            bool over = b.found && b.entry.id != a.entry.id;
             if (!b.n) r = -N_ERR_EXISTS;
-            else if (b.found && b.entry.id != a.entry.id) r = -N_ERR_EXISTS;
-            else r = place_may_change(&b, user, false);
+            else if (over && !(replace && a.record.kind == STORE_DOCUMENT && b.record.kind == STORE_DOCUMENT))
+                r = -N_ERR_EXISTS;
+            else r = place_may_change(&b, user, over);
+            /* the document replaced goes as store_entry_remove takes it, in the commit of the move */
+            if (r >= 0 && over) r = volume_writable(v);
+            if (r >= 0 && over && (r = document_hide(b.folder, b.name, b.n, b.entry.id)) == 0) {
+                struct ranges dropped = {0};
+                r = ns_remove(v, b.folder, b.name, b.n, &dropped);
+                space_release_list(v, &dropped);
+            }
             if (r >= 0 && (r = ns_move(v, a.folder, a.name, a.n, b.folder, b.name, b.n)) >= 0)
                 document_changed(a.entry.id);
             place_free(&b);
@@ -481,29 +494,6 @@ int store_entry_move(const char *from, const char *to, bool user) {
 }
 
 /* ---- whole documents ---- */
-
-int store_load(const char *path, uint8_t **data, uint64_t *size) {
-    struct handle *h;
-    int r = document_open(path, N_DOCUMENT_READ, false, &h);
-    if (r < 0) return r;
-    int64_t n = store_document_size(h);
-    uint8_t *buf = NULL;
-    if (n < 0) r = (int)n;
-    else if ((uint64_t)n >= SIZE_MAX / 2) r = -N_ERR_TOO_LARGE;
-    else if (!(buf = kmalloc(n ? (size_t)n : 1))) r = -N_ERR_NO_MEMORY;
-    if (r >= 0) {
-        int64_t got = store_document_read(h, 0, buf, (size_t)n, false);
-        r = got < 0 ? (int)got : got != n ? -N_ERR_IO : 0;
-    }
-    handle_close(h);
-    if (r < 0) {
-        kfree(buf);
-        return r;
-    }
-    *data = buf;
-    *size = (uint64_t)n;
-    return 0;
-}
 
 static int write_all(struct handle *h, uint64_t offset, const void *data, size_t n, bool user) {
     int64_t w = n ? store_document_write(h, offset, data, n, user) : 0;

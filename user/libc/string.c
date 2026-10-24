@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <emmintrin.h>
+#include <wchar.h>
 
 /* Most calls copy, fill or scan a few dozen bytes. rep movsb/stosb pay a
    startup cost of tens of cycles that only pays off for long runs, so short
@@ -208,6 +209,15 @@ int strncmp(const char *a, const char *b, size_t n) {
     return 0;
 }
 
+int strcoll(const char *a, const char *b) { return strcmp(a, b); }
+
+/* Byte order needs no transformation: the result is the string itself. */
+size_t strxfrm(char *d, const char *s, size_t n) {
+    size_t len = strlen(s);
+    if (len < n) memcpy(d, s, len + 1);
+    return len;
+}
+
 int strcasecmp(const char *a, const char *b) {
     while (*a && tolower(*a) == tolower(*b)) a++, b++;
     return tolower((unsigned char)*a) - tolower((unsigned char)*b);
@@ -299,6 +309,121 @@ char *strtok_r(char *s, const char *delim, char **save) {
 char *strtok(char *s, const char *delim) {
     static char *save;
     return strtok_r(s, delim, &save);
+}
+
+/* <wchar.h>'s strings of UTF-32 code units, compared by code point. */
+
+size_t wcslen(const wchar_t *s) {
+    const wchar_t *p = s;
+    while (*p) p++;
+    return (size_t)(p - s);
+}
+
+wchar_t *wmemcpy(wchar_t *d, const wchar_t *s, size_t n) { return memcpy(d, s, n * sizeof *s); }
+wchar_t *wmemmove(wchar_t *d, const wchar_t *s, size_t n) { return memmove(d, s, n * sizeof *s); }
+wchar_t *wmemset(wchar_t *s, wchar_t c, size_t n) {
+    for (size_t i = 0; i < n; i++) s[i] = c;
+    return s;
+}
+int wmemcmp(const wchar_t *a, const wchar_t *b, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    return 0;
+}
+wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (s[i] == c) return (wchar_t *)s + i;
+    return NULL;
+}
+
+wchar_t *wcscpy(wchar_t *d, const wchar_t *s) { return wmemcpy(d, s, wcslen(s) + 1); }
+wchar_t *wcsncpy(wchar_t *d, const wchar_t *s, size_t n) {
+    size_t i = 0;
+    for (; i < n && s[i]; i++) d[i] = s[i];
+    wmemset(d + i, 0, n - i);
+    return d;
+}
+wchar_t *wcscat(wchar_t *d, const wchar_t *s) {
+    wcscpy(d + wcslen(d), s);
+    return d;
+}
+wchar_t *wcsncat(wchar_t *d, const wchar_t *s, size_t n) {
+    wchar_t *e = d + wcslen(d);
+    size_t i = 0;
+    for (; i < n && s[i]; i++) e[i] = s[i];
+    e[i] = 0;
+    return d;
+}
+
+int wcscmp(const wchar_t *a, const wchar_t *b) {
+    while (*a && *a == *b) a++, b++;
+    return *a == *b ? 0 : *a < *b ? -1 : 1;
+}
+int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+        if (!a[i]) break;
+    }
+    return 0;
+}
+int wcscoll(const wchar_t *a, const wchar_t *b) { return wcscmp(a, b); }
+/* Code point order needs no transformation: the result is the string itself. */
+size_t wcsxfrm(wchar_t *d, const wchar_t *s, size_t n) {
+    size_t len = wcslen(s);
+    if (len < n) wmemcpy(d, s, len + 1);
+    return len;
+}
+
+wchar_t *wcschr(const wchar_t *s, wchar_t c) {
+    for (;; s++) {
+        if (*s == c) return (wchar_t *)s;
+        if (!*s) return NULL;
+    }
+}
+wchar_t *wcsrchr(const wchar_t *s, wchar_t c) {
+    const wchar_t *found = NULL;
+    for (;; s++) {
+        if (*s == c) found = s;
+        if (!*s) return (wchar_t *)found;
+    }
+}
+size_t wcsspn(const wchar_t *s, const wchar_t *accept) {
+    size_t n = 0;
+    while (s[n] && wcschr(accept, s[n])) n++;
+    return n;
+}
+size_t wcscspn(const wchar_t *s, const wchar_t *reject) {
+    size_t n = 0;
+    while (s[n] && !wcschr(reject, s[n])) n++;
+    return n;
+}
+wchar_t *wcspbrk(const wchar_t *s, const wchar_t *accept) {
+    s += wcscspn(s, accept);
+    return *s ? (wchar_t *)s : NULL;
+}
+wchar_t *wcsstr(const wchar_t *h, const wchar_t *n) {
+    size_t len = wcslen(n);
+    for (; *h; h++)
+        if (!wmemcmp(h, n, len)) return (wchar_t *)h;
+    return len ? NULL : (wchar_t *)h;
+}
+/* ISO C's wcstok keeps its place in *save, like strtok_r. */
+wchar_t *wcstok(wchar_t *s, const wchar_t *delim, wchar_t **save) {
+    if (!s) s = *save;
+    if (!s) return NULL;
+    s += wcsspn(s, delim);
+    if (!*s) {
+        *save = NULL;
+        return NULL;
+    }
+    wchar_t *e = s + wcscspn(s, delim);
+    if (*e) {
+        *e = 0;
+        *save = e + 1;
+    } else {
+        *save = NULL;
+    }
+    return s;
 }
 
 char *strerror(int e) {

@@ -6,6 +6,9 @@ NOCTURNE_BEGIN_DECLS
 #define FP_ZERO 2
 #define FP_SUBNORMAL 3
 #define FP_NORMAL 4
+/* What ilogb returns for zero and for NaN: INT_MIN for both, as usual on x86-64. */
+#define FP_ILOGB0 (-2147483647 - 1)
+#define FP_ILOGBNAN (-2147483647 - 1)
 #define M_PI 3.14159265358979323846
 #define M_E 2.7182818284590452354
 #define M_SQRT2 1.41421356237309504880
@@ -92,6 +95,15 @@ long double ldexpl(long double x, int e);
 float ldexpf(float x, int e);
 double scalbn(double x, int e);
 double frexp(double x, int *e);
+/* The exponent of x as if it were normalized: ilogb gives FP_ILOGB0 for zero,
+   INT_MAX for an infinity and FP_ILOGBNAN for NaN, raising FE_INVALID; logb
+   gives -inf (raising FE_DIVBYZERO), +inf and NaN. */
+int ilogb(double x);
+int ilogbf(float x);
+int ilogbl(long double x);
+double logb(double x);
+float logbf(float x);
+long double logbl(long double x);
 double modf(double x, double *ip);
 double copysign(double x, double y);
 double fmin(double a, double b);

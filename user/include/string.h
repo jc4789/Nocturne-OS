@@ -17,6 +17,9 @@ char *strcat(char *d, const char *s);
 char *strncat(char *d, const char *s, size_t n);
 int strcmp(const char *a, const char *b);
 int strncmp(const char *a, const char *b, size_t n);
+/* The locale's collation is byte order (<locale.h>). */
+int strcoll(const char *a, const char *b);
+size_t strxfrm(char *d, const char *s, size_t n);
 int strcasecmp(const char *a, const char *b);
 int strncasecmp(const char *a, const char *b, size_t n);
 char *strchr(const char *s, int c);
