@@ -21,7 +21,7 @@ GPU で描く。GPU が無い環境（QEMU、Hyper-V）は今の softpipe のま
 - GSP ファームウェア（`gsp_ga10x.bin`）は git に入れない・配布しない。手元の gitignore した
   場所に置くのは可。NVIDIA の抽出スクリプト（MIT）は使ってよい。
 - Rust の移植方法は任せる。補助に Sonnet 5.5 のサブエージェントを使う。
-- QEMU は一台だけ。全体再ビルドを避ける。`build/data.img`・Hyper-V に触らない。
+- QEMU は一台だけ。全体ビルドは必要なとき・役に立つときはいつでもしてよい（2026-10-23）。`build/data.img`・Hyper-V に触らない。
 - コミットは main、push しない。AGENTS.md・.agents・`docs/real hardware pics/` はコミットしない。
 
 ## 1. 決定事項（理由つき）
