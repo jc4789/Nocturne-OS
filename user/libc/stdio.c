@@ -1528,24 +1528,28 @@ struct text_sink {
     bool to_wide, bad;
     mbstate_t st;
 };
-static void sink_put(struct text_sink *k, bool wide_input, int c) {
+/* Puts the unit c; true when it ends a character. The field width counts characters: with l, a
+   multibyte character of the byte functions is one, however many bytes it has. */
+static bool sink_put(struct text_sink *k, bool wide_input, int c) {
     if (wide_input == k->to_wide) {
         if (k->w) *k->w++ = (wchar_t)c;
         else if (k->s) *k->s++ = (char)c;
-        return;
+        return true;
     }
+    size_t r;
     if (k->to_wide) {
         char unit = (char)c;
         wchar_t wc;
-        size_t r = mbrtowc(&wc, &unit, 1, &k->st);
-        if (r == (size_t)-1) k->bad = true;
-        else if (r != (size_t)-2 && k->w) *k->w++ = wc;
+        r = mbrtowc(&wc, &unit, 1, &k->st);
+        if (r == (size_t)-2) return false; /* the character goes on in the next byte */
+        if (r != (size_t)-1 && k->w) *k->w++ = wc;
     } else {
         char units[4];
-        size_t r = wcrtomb(units, (wchar_t)c, &k->st);
-        if (r == (size_t)-1) k->bad = true;
-        else if (k->s) memcpy(k->s, units, r), k->s += r;
+        r = wcrtomb(units, (wchar_t)c, &k->st);
+        if (r != (size_t)-1 && k->s) memcpy(k->s, units, r), k->s += r;
     }
+    if (r == (size_t)-1) k->bad = true;
+    return !k->bad;
 }
 
 /* ISO C's scanf: the number of items assigned, or EOF when the input ended
@@ -1670,22 +1674,21 @@ static int scan(struct scan_input *in, const struct scan_format *fmt, va_list ar
                 if (k.to_wide) k.w = va_arg(ap, wchar_t *);
                 else k.s = va_arg(ap, char *);
             }
-            size_t n = 0;
+            size_t n = 0; /* characters */
             int c = NOTHING_READ;
-            while (n < width) {
+            while (n < width && !k.bad) {
                 c = scan_get(in);
                 if (c == EOF) break;
                 if (spec == 's' ? scan_space(in, c) : spec == '[' && !in_scanset(fmt, set, set_end, negate, c)) break;
-                sink_put(&k, in->wide, c);
-                n++;
+                if (sink_put(&k, in->wide, c)) n++;
                 c = NOTHING_READ;
             }
             scan_unget(in, c);
-            if (spec == 'c' ? n < width : !n) {
-                input_failure = c == EOF;
-                ok = false;
-            } else if (k.bad || !mbsinit(&k.st)) {
+            if (k.bad || !mbsinit(&k.st)) { /* an invalid multibyte character, or one cut short */
                 errno = EILSEQ;
+                ok = false;
+            } else if (spec == 'c' ? n < width : !n) {
+                input_failure = c == EOF;
                 ok = false;
             } else if (!skip) {
                 if (spec != 'c') {

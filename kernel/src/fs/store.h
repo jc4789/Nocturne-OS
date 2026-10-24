@@ -53,9 +53,10 @@ int store_document_commit(struct handle *h, int how);
 int store_save(const char *path, const void *data, size_t n, bool user);
 int store_append(const char *path, const void *data, size_t n, bool user);
 
-/* Entries. store_folder_list fills up to max entries from the start'th on, and returns how many. */
+/* Entries. store_folder_list fills up to max entries from the start'th on, and returns how many:
+   the first bytes of each struct n_entry (N_ENTRY_FIRST_BYTES up to its size), that far apart. */
 int store_entry_info(const char *path, bool user, struct n_entry *out);
-int64_t store_folder_list(const char *path, uint64_t start, struct n_entry *out, size_t max, bool user);
+int64_t store_folder_list(const char *path, uint64_t start, void *out, size_t max, size_t bytes, bool user);
 int store_folder_create(const char *path, bool user);
 int store_entry_remove(const char *path, bool user);
 /* replace: a document may take the name of another document, which goes in the same commit. */

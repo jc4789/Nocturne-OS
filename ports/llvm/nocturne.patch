@@ -129,6 +129,21 @@ index f894a063..b66e6699 100644
          unwindLibType = ToolChain::UNW_CompilerRT;
        else
          unwindLibType = ToolChain::UNW_None;
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index db7893c5..6b9945ca 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -5949,7 +5949,9 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
+       Model = A->getValue();
+     } else
+       Model = TC.getThreadModel();
+-    if (Model != "posix") {
++    // cc1 knows the code of many threads (its default) and of one; a target's
++    // own name for its threads is the first.
++    if (Model == "single") {
+       CmdArgs.push_back("-mthread-model");
+       CmdArgs.push_back(Args.MakeArgString(Model));
+     }
 diff --git a/clang/lib/Driver/ToolChains/Nocturne.cpp b/clang/lib/Driver/ToolChains/Nocturne.cpp
 new file mode 100644
 index 00000000..085a6143
@@ -290,10 +305,10 @@ index 00000000..085a6143
 +}
 diff --git a/clang/lib/Driver/ToolChains/Nocturne.h b/clang/lib/Driver/ToolChains/Nocturne.h
 new file mode 100644
-index 00000000..5ade0288
+index 00000000..85ce6dc1
 --- /dev/null
 +++ b/clang/lib/Driver/ToolChains/Nocturne.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,93 @@
 +//===--- Nocturne.h - Nocturne OS ToolChain Implementation ------*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -362,6 +377,12 @@ index 00000000..5ade0288
 +    return UnwindTableLevel::None;
 +  }
 +  const char *getDefaultLinker() const override { return "ld.lld"; }
++  // Programs run on Nocturne's own threads (thread_create), the only model:
++  // code is built for many threads.
++  std::string getThreadModel() const override { return "nocturne"; }
++  bool isThreadModelSupported(const StringRef Model) const override {
++    return Model == "nocturne";
++  }
 +
 +  std::string computeSysRoot() const override;
 +
@@ -1367,7 +1388,7 @@ index 96a1336d..37bd2321 100644
  #endif
  
 diff --git a/libcxx/src/filesystem/operations.cpp b/libcxx/src/filesystem/operations.cpp
-index cd55b797..c5ab86cb 100644
+index cd55b797..5ed7ab6f 100644
 --- a/libcxx/src/filesystem/operations.cpp
 +++ b/libcxx/src/filesystem/operations.cpp
 @@ -30,6 +30,8 @@
@@ -1464,11 +1485,64 @@ index cd55b797..c5ab86cb 100644
  
    if (is_symlink(f)) {
      if (bool(copy_options::skip_symlinks & options)) {
-@@ -192,6 +230,80 @@ void __copy(const path& from, const path& to, copy_options options, error_code*
+@@ -192,6 +230,136 @@ void __copy(const path& from, const path& to, copy_options options, error_code*
    }
  }
  
 +#if defined(__nocturne__)
++namespace detail {
++namespace {
++
++// A new document in the temporary folder. It goes when this does, unless
++// publish has given it another name.
++struct TemporaryDocument {
++  string name;
++  Document doc{-1};
++
++  TemporaryDocument()                                    = default;
++  TemporaryDocument(const TemporaryDocument&)            = delete;
++  TemporaryDocument& operator=(const TemporaryDocument&) = delete;
++  ~TemporaryDocument() {
++    doc.close();
++    if (!name.empty())
++      n_entry_remove(name.c_str());
++  }
++
++  // Under a random name that no entry has. name is set only once the
++  // document is there, so this never removes another's.
++  n_result create() {
++    static const char digits[] = "0123456789abcdef";
++    n_result r                 = -N_ERR_EXISTS;
++    for (int tries = 0; tries < 100 && r == -N_ERR_EXISTS; ++tries) {
++      uint64_t number;
++      if ((r = n_random(&number, sizeof(number))) < 0)
++        break;
++      char leaf[] = "copy-0000000000000000";
++      for (int i = 0; i < 16; ++i)
++        leaf[5 + i] = digits[(number >> (4 * i)) & 15];
++      string full;
++      if ((r = complete_path(path(n_temp_folder()) / leaf, full)) >= 0 &&
++          (r = doc.h = n_document_open(full.c_str(), N_DOCUMENT_CREATE)) >= 0)
++        name = std::move(full);
++    }
++    return r;
++  }
++
++  // Saves what was written, then gives the document the name to. With
++  // replace, a document already there goes in the same commit.
++  n_result publish(const char* to, bool replace) {
++    n_result r = doc.close();
++    if (r >= 0)
++      r = replace ? n_entry_replace(name.c_str(), to) : n_entry_move(name.c_str(), to);
++    if (r >= 0)
++      name.clear();
++    return r;
++  }
++};
++
++} // namespace
++} // namespace detail
++
 +bool __copy_file(const path& from, const path& to, copy_options options, error_code* ec) {
 +  ErrorHandler<bool> err("copy_file", ec, &to, &from);
 +
@@ -1517,27 +1591,30 @@ index cd55b797..c5ab86cb 100644
 +  if (!ShouldCopy)
 +    return false;
 +
-+  // The copy is new content for to, which takes the place of the old whole
-+  // when the document closes.
-+  detail::Document out(n_document_open(to_full.c_str(), N_DOCUMENT_REPLACE));
-+  if (out.h < 0)
-+    return err.report(detail::native_error(out.h));
++  // The copy is made in a document of its own, which takes to's name only once
++  // it is saved whole: whatever fails before that leaves to as it was. (An
++  // N_DOCUMENT_REPLACE document cannot be given up: closing it saves it.)
 +  const size_t chunk = 1 << 20;
 +  unique_ptr<char[]> buffer(new char[chunk]);
++  detail::TemporaryDocument out;
++  if ((r = out.create()) < 0)
++    return err.report(detail::native_error(r));
 +  for (uint64_t offset = 0;;) {
 +    n_result n = n_document_read_at(in.h, offset, buffer.get(), chunk);
 +    if (n < 0)
 +      return err.report(detail::native_error(n));
 +    if (n == 0)
 +      break;
-+    n_result written = n_document_write_at(out.h, offset, buffer.get(), static_cast<size_t>(n));
++    n_result written = n_document_write_at(out.doc.h, offset, buffer.get(), static_cast<size_t>(n));
 +    if (written < 0)
 +      return err.report(detail::native_error(written));
 +    if (written != n)
 +      return err.report(errc::io_error);
 +    offset += static_cast<uint64_t>(n);
 +  }
-+  if ((r = out.close()) < 0)
++  // A document at to is replaced only when it was there as to was looked at
++  // above: one made since is not overwritten unasked (N_ERR_EXISTS).
++  if ((r = out.publish(to_full.c_str(), to_exists)) < 0)
 +    return err.report(detail::native_error(r));
 +  return true;
 +}
@@ -1545,7 +1622,7 @@ index cd55b797..c5ab86cb 100644
  namespace detail {
  namespace {
  
-@@ -454,6 +566,7 @@ bool __copy_file(const path& from, const path& to, copy_options options, error_c
+@@ -454,6 +622,7 @@ bool __copy_file(const path& from, const path& to, copy_options options, error_c
  
    return true;
  }
@@ -1553,7 +1630,7 @@ index cd55b797..c5ab86cb 100644
  
  void __copy_symlink(const path& existing_symlink, const path& new_symlink, error_code* ec) {
    const path real_path(__read_symlink(existing_symlink, ec));
-@@ -473,7 +586,7 @@ bool __create_directories(const path& p, error_code* ec) {
+@@ -473,7 +642,7 @@ bool __create_directories(const path& p, error_code* ec) {
    ErrorHandler<bool> err("create_directories", ec, &p);
  
    error_code m_ec;
@@ -1562,7 +1639,7 @@ index cd55b797..c5ab86cb 100644
    if (!status_known(st))
      return err.report(m_ec);
    else if (is_directory(st))
-@@ -505,10 +618,18 @@ bool __create_directories(const path& p, error_code* ec) {
+@@ -505,10 +674,18 @@ bool __create_directories(const path& p, error_code* ec) {
  bool __create_directory(const path& p, error_code* ec) {
    ErrorHandler<bool> err("create_directory", ec, &p);
  
@@ -1581,7 +1658,7 @@ index cd55b797..c5ab86cb 100644
    if (mec != errc::file_exists)
      return err.report(mec);
    error_code ignored_ec;
-@@ -521,8 +642,18 @@ bool __create_directory(const path& p, error_code* ec) {
+@@ -521,8 +698,18 @@ bool __create_directory(const path& p, error_code* ec) {
  bool __create_directory(path const& p, path const& attributes, error_code* ec) {
    ErrorHandler<bool> err("create_directory", ec, &p, &attributes);
  
@@ -1601,7 +1678,7 @@ index cd55b797..c5ab86cb 100644
    file_status st = detail::posix_stat(attributes, attr_stat, &mec);
    if (!status_known(st))
      return err.report(mec);
-@@ -541,37 +672,59 @@ bool __create_directory(path const& p, path const& attributes, error_code* ec) {
+@@ -541,37 +728,59 @@ bool __create_directory(path const& p, path const& attributes, error_code* ec) {
    if (!is_directory(st))
      return err.report(mec);
    return false;
@@ -1663,7 +1740,7 @@ index cd55b797..c5ab86cb 100644
    errno     = 0; // Note: POSIX mandates that modifying `errno` is thread-safe.
    auto size = ::pathconf(".", _PC_PATH_MAX);
    if (size == -1) {
-@@ -580,11 +733,11 @@ path __current_path(error_code* ec) {
+@@ -580,11 +789,11 @@ path __current_path(error_code* ec) {
  
        // `pathconf` returns `-1` without an error to indicate no limit.
      } else {
@@ -1678,7 +1755,7 @@ index cd55b797..c5ab86cb 100644
      }
    }
  
-@@ -597,25 +750,44 @@ path __current_path(error_code* ec) {
+@@ -597,25 +806,44 @@ path __current_path(error_code* ec) {
      void operator()(void*) const {}
    };
    Deleter deleter;
@@ -1724,7 +1801,7 @@ index cd55b797..c5ab86cb 100644
    StatT st1 = {}, st2 = {};
    auto s1 = detail::posix_stat(p1.native(), st1, &ec1);
    if (!exists(s1))
-@@ -625,14 +797,20 @@ bool __equivalent(const path& p1, const path& p2, error_code* ec) {
+@@ -625,14 +853,20 @@ bool __equivalent(const path& p1, const path& p2, error_code* ec) {
      return err.report(errc::not_supported);
  
    return detail::stat_equivalent(st1, st2);
@@ -1745,7 +1822,7 @@ index cd55b797..c5ab86cb 100644
    if (!exists(fst) || !is_regular_file(fst)) {
      errc error_kind = is_directory(fst) ? errc::is_a_directory : errc::not_supported;
      if (!m_ec)
-@@ -640,26 +818,43 @@ uintmax_t __file_size(const path& p, error_code* ec) {
+@@ -640,26 +874,43 @@ uintmax_t __file_size(const path& p, error_code* ec) {
      return err.report(m_ec);
    }
    // is_regular_file(p) == true
@@ -1789,7 +1866,7 @@ index cd55b797..c5ab86cb 100644
    if (m_ec)
      return err.report(m_ec);
    else if (!is_directory(st) && !is_regular_file(st))
-@@ -670,7 +865,11 @@ bool __fs_is_empty(const path& p, error_code* ec) {
+@@ -670,7 +921,11 @@ bool __fs_is_empty(const path& p, error_code* ec) {
        return false;
      return it == directory_iterator{};
    } else if (is_regular_file(st))
@@ -1801,7 +1878,7 @@ index cd55b797..c5ab86cb 100644
  
    __libcpp_unreachable();
  }
-@@ -680,18 +879,33 @@ file_time_type __last_write_time(const path& p, error_code* ec) {
+@@ -680,18 +935,33 @@ file_time_type __last_write_time(const path& p, error_code* ec) {
    ErrorHandler<file_time_type> err("last_write_time", ec, &p);
  
    error_code m_ec;
@@ -1836,7 +1913,7 @@ index cd55b797..c5ab86cb 100644
    TimeSpec ts;
    if (!fs_time::convert_to_timespec(ts, new_time))
      return err.report(errc::value_too_large);
-@@ -741,7 +955,7 @@ void __permissions(const path& p, perms prms, perm_options opts, error_code* ec)
+@@ -741,7 +1011,7 @@ void __permissions(const path& p, perms prms, perm_options opts, error_code* ec)
    prms &= perms::mask;
    if (!resolve_symlinks || (add_perms || remove_perms)) {
      error_code m_ec;
@@ -1845,7 +1922,7 @@ index cd55b797..c5ab86cb 100644
      set_sym_perms  = is_symlink(st);
      if (m_ec)
        return err.report(m_ec);
-@@ -753,44 +967,62 @@ void __permissions(const path& p, perms prms, perm_options opts, error_code* ec)
+@@ -753,44 +1023,62 @@ void __permissions(const path& p, perms prms, perm_options opts, error_code* ec)
      else if (remove_perms)
        prms = st.permissions() & ~prms;
    }
@@ -1917,7 +1994,7 @@ index cd55b797..c5ab86cb 100644
    detail::SSizeT ret;
    if ((ret = detail::readlink(p.c_str(), buff.get(), size)) == -1)
      return err.report(detail::get_last_error());
-@@ -799,16 +1031,26 @@ path __read_symlink(const path& p, error_code* ec) {
+@@ -799,16 +1087,26 @@ path __read_symlink(const path& p, error_code* ec) {
      return err.report(errc::value_too_large);
    buff[ret] = 0;
    return {buff.get()};
@@ -1944,7 +2021,7 @@ index cd55b797..c5ab86cb 100644
    return true;
  }
  
-@@ -819,7 +1061,9 @@ bool __remove(const path& p, error_code* ec) {
+@@ -819,7 +1117,9 @@ bool __remove(const path& p, error_code* ec) {
  //
  // The second implementation is used on platforms where `openat()` & friends are available,
  // and it threads file descriptors through recursive calls to avoid such race conditions.
@@ -1955,7 +2032,7 @@ index cd55b797..c5ab86cb 100644
  #  define REMOVE_ALL_USE_DIRECTORY_ITERATOR
  #endif
  
-@@ -961,19 +1205,47 @@ uintmax_t __remove_all(const path& p, error_code* ec) {
+@@ -961,19 +1261,47 @@ uintmax_t __remove_all(const path& p, error_code* ec) {
  
  void __rename(const path& from, const path& to, error_code* ec) {
    ErrorHandler<void> err("rename", ec, &from, &to);
@@ -2003,7 +2080,7 @@ index cd55b797..c5ab86cb 100644
    detail::StatVFS m_svfs = {};
    if (detail::statvfs(p.c_str(), &m_svfs) == -1) {
      err.report(detail::get_last_error());
-@@ -990,16 +1262,27 @@ space_info __space(const path& p, error_code* ec) {
+@@ -990,16 +1318,27 @@ space_info __space(const path& p, error_code* ec) {
    do_mult(si.free, m_svfs.f_bfree);
    do_mult(si.available, m_svfs.f_bavail);
    return si;
@@ -2032,7 +2109,7 @@ index cd55b797..c5ab86cb 100644
    wchar_t buf[MAX_PATH];
    DWORD retval = GetTempPathW(MAX_PATH, buf);
    if (!retval)
-@@ -1029,7 +1312,7 @@ path __temp_directory_path(error_code* ec) {
+@@ -1029,7 +1368,7 @@ path __temp_directory_path(error_code* ec) {
    path p(ret);
  #endif
    error_code m_ec;
@@ -2953,10 +3030,10 @@ index 097041f1..9ccb2b9f 100644
  
  void llvm::install_fatal_error_handler(fatal_error_handler_t handler,
 diff --git a/llvm/lib/Support/FileOutputBuffer.cpp b/llvm/lib/Support/FileOutputBuffer.cpp
-index c8b03598..64fab230 100644
+index c8b03598..33b5f7c4 100644
 --- a/llvm/lib/Support/FileOutputBuffer.cpp
 +++ b/llvm/lib/Support/FileOutputBuffer.cpp
-@@ -17,12 +17,6 @@
+@@ -17,10 +17,9 @@
  #include "llvm/Support/TimeProfiler.h"
  #include <system_error>
  
@@ -2964,12 +3041,43 @@ index c8b03598..64fab230 100644
 -#include <unistd.h>
 -#else
 -#include <io.h>
--#endif
--
- using namespace llvm;
- using namespace llvm::sys;
++#if defined(__nocturne__)
++#include "Nocturne/Nocturne.h"
++#include "llvm/Support/IOSandbox.h"
+ #endif
  
-@@ -124,7 +118,7 @@ createInMemoryBuffer(StringRef Path, size_t Size, unsigned Mode) {
+ using namespace llvm;
+@@ -95,6 +94,21 @@ public:
+       return Error::success();
+     }
+ 
++#if defined(__nocturne__)
++    // Closing a document opened with CD_CreateAlways would save what was
++    // written in FinalPath's place even after a failed write. n_document_save
++    // puts the content there whole once it is all saved, and a failure
++    // leaves the document there as it was. Entries have no permissions.
++    (void)Mode;
++    sys::sandbox::violationIfEnabled();
++    SmallString<256> Full;
++    if (std::error_code EC = sys::nocturne::completePath(FinalPath, Full))
++      return errorCodeToError(EC);
++    n_result R = n_document_save(Full.data(), Buffer.base(), BufferSize);
++    if (R < 0)
++      return errorCodeToError(sys::nocturne::errorCode(R));
++    return Error::success();
++#else
+     using namespace sys::fs;
+     int FD;
+     std::error_code EC;
+@@ -104,6 +118,7 @@ public:
+     raw_fd_ostream OS(FD, /*shouldClose=*/true, /*unbuffered=*/true);
+     OS << StringRef((const char *)Buffer.base(), BufferSize);
+     return Error::success();
++#endif
+   }
+ 
+ private:
+@@ -124,7 +139,7 @@ createInMemoryBuffer(StringRef Path, size_t Size, unsigned Mode) {
    return std::make_unique<InMemoryBuffer>(Path, MB, Size, Mode);
  }
  
@@ -2978,7 +3086,7 @@ index c8b03598..64fab230 100644
  createOnDiskBuffer(StringRef Path, size_t Size, unsigned Mode) {
    Expected<fs::TempFile> FileOrErr =
        fs::TempFile::create(Path + ".tmp%%%%%%%", Mode);
-@@ -186,10 +180,16 @@ FileOutputBuffer::create(StringRef Path, size_t Size, unsigned Flags) {
+@@ -186,10 +201,16 @@ FileOutputBuffer::create(StringRef Path, size_t Size, unsigned Flags) {
    case fs::file_type::regular_file:
    case fs::file_type::file_not_found:
    case fs::file_type::status_error:
@@ -4778,7 +4886,7 @@ index 00000000..e84d33f0
 +} // namespace sys
 +} // namespace llvm
 diff --git a/llvm/lib/Support/Path.cpp b/llvm/lib/Support/Path.cpp
-index 65e29402..bb0b54be 100644
+index 65e29402..b005d009 100644
 --- a/llvm/lib/Support/Path.cpp
 +++ b/llvm/lib/Support/Path.cpp
 @@ -24,7 +24,9 @@
@@ -4865,28 +4973,49 @@ index 65e29402..bb0b54be 100644
  }
  
  #ifndef __APPLE__
-@@ -1045,16 +1054,16 @@ std::error_code copy_file(const Twine &From, const Twine &To) {
+@@ -1043,17 +1052,34 @@ std::error_code copy_file(const Twine &From, const Twine &To) {
+   int ReadFD, WriteFD;
+   if (std::error_code EC = openFileForRead(From, ReadFD, OF_None))
      return EC;
-   if (std::error_code EC =
-           openFileForWrite(To, WriteFD, CD_CreateAlways, OF_None)) {
+-  if (std::error_code EC =
+-          openFileForWrite(To, WriteFD, CD_CreateAlways, OF_None)) {
 -    close(ReadFD);
++#if defined(__nocturne__)
++  // Closing a document opened with CD_CreateAlways saves it in To's place,
++  // also after a failed copy. The copy is made in a temporary document that
++  // takes To's name only once it is saved whole, so a failure leaves To as
++  // it was.
++  SmallString<256> Temp;
++  std::error_code EC = createTemporaryFile("copy", "", WriteFD, Temp);
++#else
++  std::error_code EC = openFileForWrite(To, WriteFD, CD_CreateAlways, OF_None);
++#endif
++  if (EC) {
 +    sys::Process::SafelyCloseFileDescriptor(ReadFD);
      return EC;
    }
  
-   std::error_code EC = copy_file_internal(ReadFD, WriteFD);
- 
+-  std::error_code EC = copy_file_internal(ReadFD, WriteFD);
+-
 -  close(ReadFD);
 -  close(WriteFD);
++  EC = copy_file_internal(ReadFD, WriteFD);
+ 
 +  sys::Process::SafelyCloseFileDescriptor(ReadFD);
 +  std::error_code CloseEC = sys::Process::SafelyCloseFileDescriptor(WriteFD);
- 
--  return EC;
-+  return EC ? EC : CloseEC;
++  if (!EC)
++    EC = CloseEC;
++#if defined(__nocturne__)
++  // A document already at To goes in the same commit.
++  if (!EC)
++    EC = fs::rename(Temp, To);
++  if (EC)
++    fs::remove(Temp);
++#endif
+   return EC;
  }
  #endif
- 
-@@ -1065,7 +1074,7 @@ std::error_code copy_file(const Twine &From, int ToFD) {
+@@ -1065,7 +1091,7 @@ std::error_code copy_file(const Twine &From, int ToFD) {
  
    std::error_code EC = copy_file_internal(ReadFD, ToFD);
  
@@ -4895,7 +5024,7 @@ index 65e29402..bb0b54be 100644
  
    return EC;
  }
-@@ -1076,17 +1085,17 @@ ErrorOr<MD5::MD5Result> md5_contents(int FD) {
+@@ -1076,17 +1102,17 @@ ErrorOr<MD5::MD5Result> md5_contents(int FD) {
    MD5 Hash;
  
    constexpr size_t BufSize = 4096;
@@ -4920,7 +5049,7 @@ index 65e29402..bb0b54be 100644
    MD5::MD5Result Result;
    Hash.final(Result);
    return Result;
-@@ -1100,7 +1109,7 @@ ErrorOr<MD5::MD5Result> md5_contents(const Twine &Path) {
+@@ -1100,7 +1126,7 @@ ErrorOr<MD5::MD5Result> md5_contents(const Twine &Path) {
      return EC;
  
    auto Result = md5_contents(FD);
@@ -4929,7 +5058,7 @@ index 65e29402..bb0b54be 100644
    return Result;
  }
  
-@@ -1256,6 +1265,9 @@ Error readNativeFileToEOF(file_t FileHandle, SmallVectorImpl<char> &Buffer,
+@@ -1256,6 +1282,9 @@ Error readNativeFileToEOF(file_t FileHandle, SmallVectorImpl<char> &Buffer,
  #if defined(_WIN32)
  #include "Windows/Path.inc"
  #endif
@@ -4939,7 +5068,7 @@ index 65e29402..bb0b54be 100644
  
  namespace llvm {
  namespace sys {
-@@ -1280,10 +1292,9 @@ TempFile::~TempFile() { assert(Done); }
+@@ -1280,10 +1309,9 @@ TempFile::~TempFile() { assert(Done); }
  
  Error TempFile::discard() {
    Done = true;
@@ -4953,18 +5082,36 @@ index 65e29402..bb0b54be 100644
    FD = -1;
  
  #ifdef _WIN32
-@@ -1350,8 +1361,8 @@ Error TempFile::keep(const Twine &Name) {
+@@ -1335,6 +1363,16 @@ Error TempFile::keep(const Twine &Name) {
+     else
+       remove(TmpName);
+   }
++#elif defined(__nocturne__)
++  // What was written is saved when the document closes, so it closes before
++  // it takes Name: a failed save leaves a document at Name as it was. C: is
++  // the only volume, so there is no other to copy to.
++  std::error_code RenameEC = sys::Process::SafelyCloseFileDescriptor(FD);
++  FD = -1;
++  if (!RenameEC)
++    RenameEC = fs::rename(TmpName, Name);
++  if (RenameEC)
++    fs::remove(TmpName);
+ #else
+   std::error_code RenameEC = fs::rename(TmpName, Name);
+   if (RenameEC) {
+@@ -1350,8 +1388,9 @@ Error TempFile::keep(const Twine &Name) {
    if (!RenameEC)
      TmpName = "";
  
 -  if (close(FD) == -1)
 -    return errorCodeToError(errnoAsErrorCode());
-+  if (std::error_code EC = sys::Process::SafelyCloseFileDescriptor(FD))
-+    return errorCodeToError(EC);
++  if (FD != -1)
++    if (std::error_code EC = sys::Process::SafelyCloseFileDescriptor(FD))
++      return errorCodeToError(EC);
    FD = -1;
  
    return errorCodeToError(RenameEC);
-@@ -1370,8 +1381,8 @@ Error TempFile::keep() {
+@@ -1370,8 +1409,8 @@ Error TempFile::keep() {
  
    TmpName = "";
  

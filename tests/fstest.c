@@ -1,8 +1,8 @@
 /* fstest DIR: exercise the store under the folder DIR (completed against the current folder when
    it is not a complete path; created, then removed again). Documents of many sizes (around the
-   edges of the store's 4 KiB blocks), replace, append, resize, positional writes, move, long names,
-   names in any case, nested folders, folder listing, remove. The host checks the volume afterwards (the store check
-   of scripts/test.py). Prints "FAIL ..." per failed check and "fstest: N failed". */
+   edges of the store's 4 KiB blocks), replace, append, resize, positional writes, move, moves that
+   replace (n_entry_replace), long names, names in any case, nested folders, folder listing, remove.
+   The host checks the volume afterwards (the store check of scripts/test.py). Prints "FAIL ..." per failed check and "fstest: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -172,6 +172,33 @@ int main(int argc, char **argv) {
     check("rename-case", n_entry_move(path("sub/deeper/moved.txt"), path("sub/deeper/Moved.txt")) == 0 &&
                              n_entry_info(path("sub/deeper/moved.txt"), &st) == 0 && !strcmp(st.name, "Moved.txt"));
     check("move-into-itself-fails", n_entry_move(path("sub"), path("sub/deeper/sub")) == -N_ERR_INVALID);
+
+    /* a document moved onto another takes its name, the one replaced still read by its opening; onto
+       anything else, or as anything else, the move changes nothing */
+    {
+        check("replace-setup", write_file(path("rep-a.bin"), 5000, 11, CREATE) && write_file(path("rep-b.bin"), 300, 12, CREATE) &&
+                                   write_file(path("rep-c.bin"), 700, 13, CREATE) && n_folder_create(path("rep-folder")) == 0);
+        n_handle old = n_document_open(path("rep-b.bin"), N_DOCUMENT_READ);
+        check("replace", n_entry_replace(path("rep-a.bin"), path("rep-b.bin")) == 0 && check_file(path("rep-b.bin"), 5000, 11) &&
+                             n_entry_info(path("rep-a.bin"), &st) < 0);
+        unsigned char buf[400];
+        n_result got = old >= 0 ? n_document_read_at(old, 0, buf, sizeof buf) : -1;
+        int same = got == 300;
+        for (int i = 0; same && i < 300; i++) same = buf[i] == pat((size_t)i, 12);
+        check("replace-keeps-opening", same);
+        if (old >= 0) n_handle_close(old);
+        check("replace-unopened", n_entry_replace(path("rep-c.bin"), path("rep-b.bin")) == 0 && check_file(path("rep-b.bin"), 700, 13) &&
+                                      n_entry_info(path("rep-c.bin"), &st) < 0);
+        check("replace-nothing-there", n_entry_replace(path("rep-b.bin"), path("rep-a.bin")) == 0 &&
+                                           check_file(path("rep-a.bin"), 700, 13) && n_entry_info(path("rep-b.bin"), &st) < 0);
+        check("replace-onto-folder-fails", n_entry_replace(path("rep-a.bin"), path("rep-folder")) == -N_ERR_EXISTS &&
+                                               check_file(path("rep-a.bin"), 700, 13) &&
+                                               n_entry_info(path("rep-folder"), &st) == 0 && st.kind == N_KIND_FOLDER);
+        check("replace-by-folder-fails", n_entry_replace(path("rep-folder"), path("rep-a.bin")) == -N_ERR_EXISTS &&
+                                             check_file(path("rep-a.bin"), 700, 13) &&
+                                             n_entry_info(path("rep-folder"), &st) == 0 && st.kind == N_KIND_FOLDER);
+        check("replace-clean-up", n_entry_remove(path("rep-a.bin")) == 0 && n_entry_remove(path("rep-folder")) == 0);
+    }
 
     /* many files in one folder (the folder grows past one block) */
     n_folder_create(path("many"));

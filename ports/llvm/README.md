@@ -69,6 +69,10 @@ clang の既定は Nocturne の SDK（`C:\Nocturne\SDK`、`--sysroot` で変更�
 SDK のライブラリーは関数と変数ごとのセクションでできているので、`--gc-sections` で使う物だけが
 プログラムに入ります（全部を残すなら `-Wl,--no-gc-sections`）。
 
+スレッドの方式は Nocturne のネイティブのスレッド（`thread_create`）だけで、`clang -v` は
+`Thread model: nocturne` と出します。`-mthread-model` に渡せるのも `nocturne` だけです
+（`posix` と `single` は誤り）。コードは多くのスレッドで走るものとして作ります。
+
 ## C++ の例外
 
 C++ の例外は使えます（`-fexceptions` は C++ の既定です）。libc++abi の `__cxa_throw` から呼ばれて
@@ -91,8 +95,8 @@ C++ の例外は使えます（`-fexceptions` は C++ の既定です）。libc+
 
 | 部分 | Nocturne での実装 |
 | --- | --- |
-| パス（`Path.inc`） | 文書とフォルダーを完全なパス（`C:\a\b`、`/` も区切り）で扱い、名前はアプリのフォルダー（設定 `FOLDER`）の中で解く。大文字小文字を区別しない。リンク、所有者、権限は無い。文書に共有の位置は無いので、順に読み書きする位置は土台層がハンドルごとに持つ。追記は文書を確保してから末尾へ書く。置き換え（`CD_CreateAlways`）は新しい中身が全部保存されるまで古い中身を保つ。 |
-| 出力のバッファー（`FileOutputBuffer.cpp`） | 文書を写像しないので、出力は全部メモリーに作って一度に書く。 |
+| パス（`Path.inc`） | 文書とフォルダーを完全なパス（`C:\a\b`、`/` も区切り）で扱い、名前はアプリのフォルダー（設定 `FOLDER`）の中で解く。大文字小文字を区別しない。リンク、所有者、権限は無い。文書に共有の位置は無いので、順に読み書きする位置は土台層がハンドルごとに持つ。追記は文書を確保してから末尾へ書く。置き換え（`CD_CreateAlways`）は閉じるまで古い中身を保つが、閉じれば書いた分が保存される（取りやめは無い）。失敗したら古い中身を残すべき `copy_file` と `TempFile::keep`（`Path.cpp`）は、一時フォルダーの文書を保存し終えてから名前を取らせる（`n_entry_replace`）。libc++ の `std::filesystem::copy_file` も同じ。 |
+| 出力のバッファー（`FileOutputBuffer.cpp`） | 文書を写像しないので、出力は全部メモリーに作り、`n_document_save` で一度に保存する。書けなければ元の文書はそのまま残る。 |
 | アプリ（`Program.inc`） | `n_app_launch` で、引数、設定、ハンドル 0〜2 を渡して起動する。何も引き継がないので、フォルダー（`FOLDER`）と端末につながるハンドル（`TERMINAL`）を渡す。PATH は無く、名前だけのプログラムはシステムとアプリのフォルダーで探す（`find_program`）。待つのは `n_app_result`、時間切れは `n_app_stop`。 |
 | プロセス（`Process.inc`） | 設定は `getenv`、ページの大きさ、端末（`TERMINAL`、ANSI のエスケープ）、色、乱数（`n_random`）。 |
 | メモリー（`Memory.inc`） | `n_memory_reserve`/`n_memory_protect`/`n_memory_release`。ページは書き込みか実行のどちらか一方。 |
@@ -121,9 +125,20 @@ C++ の例外は使えます（`-fexceptions` は C++ の既定です）。libc+
   文書の中身で見分ける（`store_document_identity`：大きさ、ブロックとその CRC-32C）。測った値：
   ディスクからの最初の起動 576 ms、二度目からの起動 1 ms。`clang -O2` で mandel.c が 271 ms
   （共有の前は 857 ms）、tetris.c が 285 ms（878 ms）、小さな C++23 のプログラムが約 2.0 s（4.2 s）。
+  共有するセグメントは起動のときに全部は読まず、初めて触れた頁を含む 16 頁の塊をディスクから読む
+  （`program_fill`）。走らせるタスクの無いプログラムのフレームは、メモリーを求めるアプリへ返す
+  （`frames_free`）ので、`sysinfo` の `free_mem` はその分も数える。
 - 走っているプログラムを入れ替えた次の起動は新しい中身を読む：大きさの違う入れ替え（echo を date に）
   と、同じ大きさの入れ替え（true と false、どちらも 20552 バイト）。
 - `sleep_for(20ms)` が `steady_clock` で 19 ms と測れることがあった（C++ と ISO C は「少なくとも」を
   求める）。アプリの時計（`n_clockinfo` の基準の組）とカーネルの数え方が同じ時刻から数えるように
   し、待ちの期限を最新の時刻から取るようにした（`kernel/src/dev/timer.c`）。後は 20 ms が 20〜21 ms、
   5 ms が 5〜6 ms。
+
+2026-10-24、同じ条件で、必要時の読み込みを入れた後に：
+
+- `python scripts/test.py --accel whpx --memory 4096 --cpus 4 clang tcc cxx threads fs sh tools nativeabi mem
+  sharedpages gui parallel wasm wasmworker`：50 件成功、失敗 0、飛ばし 1。ディスクの検査は問題 0。
+- 端末で：`clang -v` が `Thread model: nocturne` を出す。`echo` で書いた C を `clang -O2` でコンパイルして
+  走らせる。同じ起動で、Web ブラウザーの Firefox in WebAssembly（developer.puter.com/labs/firefox-wasm）
+  が Firefox を起動してページを描く。

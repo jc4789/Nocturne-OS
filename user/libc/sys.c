@@ -231,7 +231,7 @@ n_result n_document_write_at(n_handle h, uint64_t offset, const void *buf, size_
     return NC5(SYS_DOCUMENT_WRITE_AT, h, offset, buf, n, 0);
 }
 n_result n_document_size(n_handle h) { return NC5(SYS_DOCUMENT_SIZE, h, 0, 0, 0, 0); }
-n_result n_document_info(n_handle h, struct n_entry *out) { return NC5(SYS_DOCUMENT_INFO, h, out, 0, 0, 0); }
+n_result n_document_info(n_handle h, struct n_entry *out) { return NC5(SYS_DOCUMENT_INFO, h, out, sizeof *out, 0, 0); }
 n_result n_document_set_size(n_handle h, uint64_t size) { return NC5(SYS_DOCUMENT_SET_SIZE, h, size, 0, 0, 0); }
 n_result n_document_claim(n_handle h, bool wait) { return NC5(SYS_DOCUMENT_CLAIM, h, wait, 0, 0, 0); }
 n_result n_document_release(n_handle h) { return NC5(SYS_DOCUMENT_RELEASE, h, 0, 0, 0, 0); }
@@ -271,13 +271,15 @@ n_result n_document_load(const char *path, void **data, size_t *size) {
     *size = bytes;
     return 0;
 }
-n_result n_entry_info(const char *path, struct n_entry *out) { return NC5(SYS_ENTRY_INFO, path, out, 0, 0, 0); }
+/* Entries are asked for with the size of struct n_entry (common/abi.h); SYS_ENTRY_INFO and
+   SYS_FOLDER_LIST stay for programs built before its id. */
+n_result n_entry_info(const char *path, struct n_entry *out) { return NC5(SYS_ENTRY_INFO_SIZED, path, out, sizeof *out, 0, 0); }
 n_result n_entry_remove(const char *path) { return NC5(SYS_ENTRY_REMOVE, path, 0, 0, 0, 0); }
 n_result n_entry_move(const char *from, const char *to) { return NC5(SYS_ENTRY_MOVE, from, to, 0, 0, 0); }
 n_result n_entry_replace(const char *from, const char *to) { return NC5(SYS_ENTRY_REPLACE, from, to, 0, 0, 0); }
 n_result n_folder_create(const char *path) { return NC5(SYS_FOLDER_CREATE, path, 0, 0, 0, 0); }
 n_result n_folder_list(const char *path, struct n_entry *out, size_t max, uint64_t start) {
-    return NC5(SYS_FOLDER_LIST, path, out, max, start, 0);
+    return NC5(SYS_FOLDER_LIST_SIZED, path, out, max, start, sizeof *out);
 }
 n_result n_folder_entries(const char *path, struct n_entry **out) {
     size_t n = 0, cap = 64;

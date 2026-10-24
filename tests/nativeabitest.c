@@ -193,6 +193,80 @@ static void moves(void) {
     CHECK(n_entry_remove(two) == 0);
 }
 
+/* struct n_entry as programs built before its id have it: SYS_ENTRY_INFO and SYS_FOLDER_LIST
+   write that much of each entry, that far apart, and nothing past it. */
+struct first_entry {
+    char name[256];
+    uint32_t kind, reserved; /* reserved: 0 then, modified_ns now */
+    uint64_t size;
+    int64_t modified;
+};
+
+static bool untouched(const unsigned char *bytes, size_t from, size_t to) {
+    for (size_t i = from; i < to; i++)
+        if (bytes[i] != 0xa5) return false;
+    return true;
+}
+
+/* Entries go by the size of the caller's struct n_entry; id is the entry itself. */
+static void entries(void) {
+    char folder[512], one[640], two[640], moved[640], caps[640];
+    CHECK(n_path_join(n_temp_folder(), "nativeabi-entries", folder, sizeof folder) > 0);
+    snprintf(one, sizeof one, "%s\\one.txt", folder);
+    snprintf(two, sizeof two, "%s\\two.txt", folder);
+    snprintf(moved, sizeof moved, "%s\\moved.txt", folder);
+    snprintf(caps, sizeof caps, "%s\\MOVED.TXT", folder);
+    CHECK(n_folder_create(folder) == 0);
+    CHECK(n_document_save(one, "one", 3) == 0);
+    CHECK(n_document_save(two, "second", 6) == 0);
+
+    struct n_entry e, e2, list[4];
+    CHECK(n_entry_info(one, &e) == 0 && e.kind == N_KIND_DOCUMENT && e.size == 3 && e.modified_ns < 1000000000);
+    CHECK(n_entry_info(two, &e2) == 0 && e2.size == 6);
+    CHECK(e.id != 0 && e2.id != 0 && e.id != e2.id);
+    CHECK(n_folder_list(folder, list, 4, 0) == 2);
+    for (int i = 0; i < 2; i++) CHECK(list[i].id == (!strcmp(list[i].name, "one.txt") ? e.id : e2.id));
+
+    /* The first shape is the first N_ENTRY_FIRST_BYTES of today's, in the same order. */
+    CHECK(sizeof(struct first_entry) == N_ENTRY_FIRST_BYTES);
+    static unsigned char raw[3 * sizeof(struct n_entry)];
+    memset(raw, 0xa5, sizeof raw);
+    CHECK(__syscall(SYS_ENTRY_INFO, (long)(uintptr_t)one, (long)(uintptr_t)raw, 0, 0, 0) == 0);
+    CHECK(!memcmp(raw, &e, N_ENTRY_FIRST_BYTES) && untouched(raw, N_ENTRY_FIRST_BYTES, sizeof raw));
+    memset(raw, 0xa5, sizeof raw);
+    CHECK(__syscall(SYS_FOLDER_LIST, (long)(uintptr_t)folder, (long)(uintptr_t)raw, 3, 0, 0) == 2);
+    CHECK(!memcmp(raw, &list[0], N_ENTRY_FIRST_BYTES) &&
+          !memcmp(raw + N_ENTRY_FIRST_BYTES, &list[1], N_ENTRY_FIRST_BYTES));
+    CHECK(untouched(raw, 2 * N_ENTRY_FIRST_BYTES, sizeof raw)); /* two entries are 560 bytes */
+    memset(raw, 0xa5, sizeof raw);
+    CHECK(__syscall(SYS_FOLDER_LIST, (long)(uintptr_t)folder, (long)(uintptr_t)raw, 3, 1, 0) == 1);
+    CHECK(!memcmp(raw, &list[1], N_ENTRY_FIRST_BYTES) && untouched(raw, N_ENTRY_FIRST_BYTES, sizeof raw));
+    struct first_entry first;
+    memcpy(&first, raw, sizeof first);
+    CHECK(first.reserved == list[1].modified_ns && first.modified == list[1].modified);
+
+    /* A record shorter than the first, or longer than the kernel knows, is refused. */
+    CHECK(__syscall(SYS_ENTRY_INFO_SIZED, (long)(uintptr_t)one, (long)(uintptr_t)&e2, N_ENTRY_FIRST_BYTES - 1, 0, 0) == -N_ERR_INVALID);
+    CHECK(__syscall(SYS_ENTRY_INFO_SIZED, (long)(uintptr_t)one, (long)(uintptr_t)raw, sizeof e + 8, 0, 0) == -N_ERR_UNSUPPORTED);
+    CHECK(__syscall(SYS_FOLDER_LIST_SIZED, (long)(uintptr_t)folder, (long)(uintptr_t)list, 4, 0, 0) == -N_ERR_INVALID);
+    memset(raw, 0xa5, sizeof raw);
+    CHECK(__syscall(SYS_FOLDER_LIST_SIZED, (long)(uintptr_t)folder, (long)(uintptr_t)raw, 3, 0, N_ENTRY_FIRST_BYTES) == 2);
+    CHECK(!memcmp(raw + N_ENTRY_FIRST_BYTES, &list[1], N_ENTRY_FIRST_BYTES) && untouched(raw, 2 * N_ENTRY_FIRST_BYTES, sizeof raw));
+
+    /* The id stays with the entry: through its handle, a move and another spelling of its path. */
+    n_handle h = n_document_open(one, N_DOCUMENT_READ);
+    struct n_entry d;
+    CHECK(h >= 0 && n_document_info(h, &d) == 0 && d.id == e.id && d.size == 3 && !d.name[0]);
+    CHECK(__syscall(SYS_DOCUMENT_INFO, h, (long)(uintptr_t)&d, 0, 0, 0) == -N_ERR_INVALID);
+    CHECK(n_entry_move(one, moved) == 0);
+    CHECK(n_entry_info(caps, &d) == 0 && d.id == e.id && !strcmp(d.name, "moved.txt"));
+    CHECK(n_document_info(h, &d) == 0 && d.id == e.id);
+    CHECK(n_handle_close(h) == 0);
+    CHECK(n_entry_remove(moved) == 0);
+    CHECK(n_entry_remove(two) == 0);
+    CHECK(n_entry_remove(folder) == 0);
+}
+
 static void channels(void) {
     n_handle c[2];
     char buf[64];
@@ -383,6 +457,7 @@ int main(int argc, char **argv) {
     documents(n_temp_folder()); /* the temporary folder, and the user's folder that is kept */
     documents(n_user_folder());
     moves();
+    entries();
     channels();
     char self[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
     CHECK(n_path_complete(argv[0], self, sizeof self) >= 0);

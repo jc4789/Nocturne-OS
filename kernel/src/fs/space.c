@@ -236,9 +236,31 @@ int space_use(struct volume *v, uint64_t start, uint64_t count) {
     return r < 0 ? r : mark(v, start, count, true);
 }
 
+/* room for one more item of a kappend array, which it does not add */
+static bool room_for_one(void *array_at, size_t *count, size_t *room, size_t size) {
+    if (!kappend(array_at, count, room, size)) return false;
+    (*count)--;
+    return true;
+}
+
+/* the bitmap blocks of start .. start + count - 1 in memory, and room for one more hold: unmarking
+   and holding those blocks cannot fail then */
+static int unuse_ready(struct volume *v, uint64_t start, uint64_t count) {
+    struct space *s = &v->space;
+    if (start + count > v->super.blocks || start + count < start) return -N_ERR_INVALID;
+    for (uint64_t m = start / BITS; count && m <= (start + count - 1) / BITS; m++) {
+        int error = 0;
+        if (!map_get(v, m, &error)) return error;
+    }
+    return room_for_one(&s->holds.r, &s->holds.n, &s->holds.room, sizeof *s->holds.r) ? 0 : -N_ERR_NO_MEMORY;
+}
+
 int space_unuse(struct volume *v, uint64_t start, uint64_t count) {
-    int r = mark(v, start, count, false);
-    return r < 0 ? r : hold_add(&v->space, start, count);
+    int r = unuse_ready(v, start, count);
+    if (r < 0) return r;
+    mark(v, start, count, false);
+    hold_add(&v->space, start, count);
+    return 0;
 }
 
 int space_release(struct volume *v, uint64_t start, uint64_t count) {
@@ -247,6 +269,16 @@ int space_release(struct volume *v, uint64_t start, uint64_t count) {
     if (!p) return -N_ERR_NO_MEMORY;
     *p = (struct pending){start, count, v->generation};
     v->changed = true; /* the hold ends with a commit, so there must be one */
+    return 0;
+}
+
+int space_let_go(struct volume *v, uint64_t start, uint64_t count) {
+    struct space *s = &v->space;
+    int r = unuse_ready(v, start, count);
+    if (r < 0) return r;
+    if (!room_for_one(&s->pending, &s->npending, &s->pending_room, sizeof *s->pending)) return -N_ERR_NO_MEMORY;
+    space_unuse(v, start, count);
+    space_release(v, start, count);
     return 0;
 }
 

@@ -378,7 +378,7 @@ static struct {
     struct ns_entry last;
 } cursor;
 
-int64_t store_folder_list(const char *path, uint64_t start, struct n_entry *out, size_t max, bool user) {
+int64_t store_folder_list(const char *path, uint64_t start, void *out, size_t max, size_t bytes, bool user) {
     struct volume *v = store.v;
     struct place p;
     mutex_lock(&v->lock);
@@ -409,7 +409,7 @@ int64_t store_folder_list(const char *path, uint64_t start, struct n_entry *out,
         if ((user && (rec.attributes & STORE_PRIVATE)) || index++ < start) continue;
         struct n_entry ne;
         entry_fill(&ne, e->name, e->n, e->id, &rec);
-        if ((r = copy_out(out + got, &ne, sizeof ne, user)) < 0) break;
+        if ((r = copy_out((uint8_t *)out + got * bytes, &ne, bytes, user)) < 0) break;
         got++;
     }
     if (r >= 0 && got) {
@@ -475,15 +475,18 @@ int store_entry_move(const char *from, const char *to, bool replace, bool user) 
             else if (over && !(replace && a.record.kind == STORE_DOCUMENT && b.record.kind == STORE_DOCUMENT))
                 r = -N_ERR_EXISTS;
             else r = place_may_change(&b, user, over);
-            /* the document replaced goes as store_entry_remove takes it, in the commit of the move */
-            if (r >= 0 && over) r = volume_writable(v);
-            if (r >= 0 && over && (r = document_hide(b.folder, b.name, b.n, b.entry.id)) == 0) {
-                struct ranges dropped = {0};
-                r = ns_remove(v, b.folder, b.name, b.n, &dropped);
-                space_release_list(v, &dropped);
+            if (r >= 0 && over) {
+                /* the document replaced goes to the temp folder in the same change, or nothing
+                   changes; from there as store_entry_remove takes it, in the commit of the move */
+                char temp[17];
+                uint64_t number = ++store.temp_names;
+                size_t k = store_temp_name(number, temp);
+                if ((r = ns_replace(v, a.folder, a.name, a.n, b.folder, b.name, b.n, store.temp, temp, k)) >= 0)
+                    document_aside(b.entry.id, number);
+            } else if (r >= 0) {
+                r = ns_move(v, a.folder, a.name, a.n, b.folder, b.name, b.n);
             }
-            if (r >= 0 && (r = ns_move(v, a.folder, a.name, a.n, b.folder, b.name, b.n)) >= 0)
-                document_changed(a.entry.id);
+            if (r >= 0) document_changed(a.entry.id);
             place_free(&b);
         }
         place_free(&a);

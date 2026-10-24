@@ -140,9 +140,7 @@ static int cow(struct volume *v, struct trail *p, int d) {
     memcpy(b->data, old->data, STORE_BLOCK);
     node(b)->head.address = b->address;
     node(b)->head.generation = v->generation;
-    uint64_t was = old->address;
-    int r = space_unuse(v, was, 1);
-    if (r >= 0) r = space_release(v, was, 1);
+    int r = space_let_go(v, old->address, 1);
     if (r < 0) {
         cache_discard(v, b);
         return r;
@@ -296,19 +294,58 @@ int catalog_last(struct volume *v, const uint8_t *key, size_t klen, const uint8_
 
 /* ---- changes ---- */
 
-/* n's items with one more at `at` (key, value), shared out over n (the left half) and a new node
-   (the right half, returned) */
-static struct cblock *split(struct volume *v, struct store_node *n, unsigned at, const uint8_t *key, size_t klen,
-                            const void *value, size_t vlen, int *error) {
-    uint8_t *copy = kmalloc(STORE_BLOCK);
-    struct cblock *rb = copy ? node_new(v, n->level, error) : NULL;
-    if (!rb) {
-        if (!copy) *error = -N_ERR_NO_MEMORY;
-        kfree(copy);
-        return NULL;
+/* What a change may split into, made before it changes anything, so that it cannot fail half way:
+   a right half for each node that splits, a root over the old one when that splits too, and a
+   block to split from. */
+struct spare {
+    struct cblock *b[LEVELS + 1];
+    unsigned n;
+    uint8_t *copy;
+};
+
+/* how many nodes an item of size bytes into the path's leaf may need; freed: the room an item it
+   replaces there leaves */
+static unsigned spare_count(struct trail *p, size_t size, size_t freed) {
+    unsigned k = 0;
+    for (int d = p->depth; d >= 0; d--, freed = 0) {
+        if (room(node(p->b[d])) + freed >= size) return k;
+        k++;
+        size = 6 + STORE_KEY_MAX + sizeof(struct store_child); /* the separator into its parent, at most */
     }
+    return k + 1;
+}
+
+/* k spare nodes; spare_put in every case */
+static int spare_get(struct volume *v, struct spare *s, unsigned k) {
+    s->n = 0;
+    s->copy = k ? kmalloc(STORE_BLOCK) : NULL;
+    int error = k && !s->copy ? -N_ERR_NO_MEMORY : 0;
+    while (!error && s->n < k) {
+        struct cblock *b = node_new(v, 0, &error);
+        if (b) s->b[s->n++] = b;
+    }
+    return error;
+}
+
+static struct cblock *spare_take(struct spare *s, uint16_t level) {
+    if (!s->n) panic("store: a catalog change has no node made for its split");
+    struct cblock *b = s->b[--s->n];
+    node(b)->level = level;
+    return b;
+}
+
+/* the spare nodes the change did not take go */
+static void spare_put(struct volume *v, struct spare *s) {
+    while (s->n) cache_discard(v, s->b[--s->n]);
+    kfree(s->copy);
+}
+
+/* n's items with one more at `at` (key, value), shared out over n (the left half) and right (the
+   right half, a new node of n's level), by way of copy */
+static void split(struct store_node *n, struct store_node *right, uint8_t *copy, unsigned at, const uint8_t *key,
+                  size_t klen, const void *value, size_t vlen) {
     memcpy(copy, n, STORE_BLOCK);
-    struct store_node *old = (void *)copy, *right = node(rb);
+    struct store_node *old = (void *)copy;
     unsigned total = old->count + 1u;
     size_t bytes = 0, all = used(old) + 6 + klen + vlen;
     unsigned cut = 0;
@@ -329,22 +366,20 @@ static struct cblock *split(struct volume *v, struct store_node *n, unsigned at,
             put_item(to, to->count, key_of(it), klen_of(it), value_of(it), vlen_of(it));
         }
     }
-    kfree(copy);
-    return rb;
 }
 
-/* item (key, value) into the node at depth d of the path, at its place `at`; splits upwards */
-static int place_item(struct volume *v, struct trail *p, int d, unsigned at, const uint8_t *key, size_t klen,
-                      const void *value, size_t vlen) {
+/* item (key, value) into the node at depth d of the path, at its place `at`; splits upwards into
+   the spare nodes */
+static void place_item(struct volume *v, struct trail *p, int d, unsigned at, const uint8_t *key, size_t klen,
+                       const void *value, size_t vlen, struct spare *s) {
     struct store_node *n = node(p->b[d]);
     if (room(n) >= 6 + klen + vlen) {
         put_item(n, at, key, klen, value, vlen);
-        return 0;
+        return;
     }
-    int error = 0;
-    struct cblock *rb = split(v, n, at, key, klen, value, vlen, &error);
-    if (!rb) return error;
+    struct cblock *rb = spare_take(s, n->level);
     struct store_node *right = node(rb);
+    split(n, right, s->copy, at, key, klen, value, vlen);
     uint8_t *first = item(right, 0);
     uint8_t sep[STORE_KEY_MAX];
     size_t slen = klen_of(first);
@@ -352,8 +387,7 @@ static int place_item(struct volume *v, struct trail *p, int d, unsigned at, con
     struct store_child c = {rb->address, v->generation};
     cache_put(v, rb); /* a dirty node stays in memory without a reference */
     if (d == 0) { /* a new root over the two halves */
-        struct cblock *root = node_new(v, (uint16_t)(n->level + 1), &error);
-        if (!root) return error;
+        struct cblock *root = spare_take(s, (uint16_t)(n->level + 1));
         uint8_t *lfirst = item(n, 0);
         struct store_child l = {p->b[0]->address, v->generation};
         put_item(node(root), 0, key_of(lfirst), klen_of(lfirst), &l, sizeof l);
@@ -361,9 +395,9 @@ static int place_item(struct volume *v, struct trail *p, int d, unsigned at, con
         v->root = root->address;
         v->root_generation = v->generation;
         cache_put(v, root);
-        return 0;
+        return;
     }
-    return place_item(v, p, d - 1, p->at[d - 1] + 1, sep, slen, &c, sizeof c);
+    place_item(v, p, d - 1, p->at[d - 1] + 1, sep, slen, &c, sizeof c, s);
 }
 
 static int change(struct volume *v, const uint8_t *key, size_t klen, const void *value, size_t vlen, bool replace) {
@@ -379,8 +413,12 @@ static int change(struct volume *v, const uint8_t *key, size_t klen, const void 
         path_put(v, &p);
         return -N_ERR_EXISTS;
     }
-    if (exact) remove_item(n, at);
-    r = place_item(v, &p, p.depth, at, key, klen, value, vlen);
+    struct spare s;
+    if ((r = spare_get(v, &s, spare_count(&p, 6 + klen + vlen, exact ? 2 + item_size(item(n, at)) : 0))) >= 0) {
+        if (exact) remove_item(n, at);
+        place_item(v, &p, p.depth, at, key, klen, value, vlen, &s);
+    }
+    spare_put(v, &s);
     path_put(v, &p);
     return r;
 }
@@ -391,6 +429,15 @@ int catalog_put(struct volume *v, const uint8_t *key, size_t klen, const void *v
 
 int catalog_insert(struct volume *v, const uint8_t *key, size_t klen, const void *value, size_t vlen) {
     return change(v, key, klen, value, vlen, false);
+}
+
+int catalog_ready(struct volume *v, const uint8_t *key, size_t klen) {
+    int r = volume_writable(v);
+    if (r < 0) return r;
+    struct trail p;
+    if ((r = descend(v, key, klen, true, &p)) < 0) return r;
+    path_put(v, &p);
+    return 0;
 }
 
 /* a node out of the tree: its block (copied into this generation) was already let go */
@@ -440,7 +487,10 @@ int catalog_delete(struct volume *v, const uint8_t *key, size_t klen) {
         q.at[d - 1] = left;
         struct cblock *lb = left == p.at[d - 1] ? p.b[d] : ob, *rb = left == p.at[d - 1] ? ob : p.b[d];
         q.b[d] = lb;
-        if (lb == ob && (error = cow(v, &q, d)) < 0) {
+        /* a block of an earlier generation is let go as a copy lets it go: the left one's by its
+           copy, the right one's before its items leave it */
+        if (lb == ob ? (error = cow(v, &q, d)) < 0
+                     : !(ob->address & TEMP_ADDRESS) && (error = space_let_go(v, ob->address, 1)) < 0) {
             cache_put(v, ob);
             break;
         }
@@ -451,15 +501,9 @@ int catalog_delete(struct volume *v, const uint8_t *key, size_t klen) {
             put_item(l, l->count, key_of(it), klen_of(it), value_of(it), vlen_of(it));
         }
         remove_item(parent, left + 1);
-        if (rb == ob && (ob->address & TEMP_ADDRESS)) {
-            cache_discard(v, ob);
-        } else if (rb == ob) { /* from an earlier generation: its block is let go as a copy lets it go */
-            if (space_unuse(v, ob->address, 1) < 0 || space_release(v, ob->address, 1) < 0)
-                kprintf("store: a catalog block could not be let go\n");
-            cache_put(v, ob);
-        } else {
-            drop_node(v, &p, d);
-        }
+        if (rb == ob && (ob->address & TEMP_ADDRESS)) cache_discard(v, ob);
+        else if (rb == ob) cache_put(v, ob);
+        else drop_node(v, &p, d);
         p.b[d] = lb;
         p.at[d - 1] = left;
     }

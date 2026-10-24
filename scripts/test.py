@@ -518,11 +518,18 @@ def run_vm(a, tcp_port, web_ports, processes):
     # threads group's, and the clang group's build of it) confirms in its output
     # are deliberate. Do not suppress other threadtest faults, or more of them.
     expected_helper_faults = len(re.findall(r"^  \| threadtest: expected helper fault status=134\r?$", log, re.M))
+    # So is the write through a read-only shared mapping that sharedpagetest's parent confirms.
+    expected_writer_faults = len(re.findall(r"^  \| sharedpagetest: expected writer fault status=142\r?$", log, re.M))
     for m in re.finditer(r"^\[(segfault|crash)\] pid \d+ \(([^)]*)\).*$", log, re.M):
         if expected_helper_faults and re.fullmatch(
                 r"\[crash\] pid \d+ \(threadtest\) cpu\d+: Invalid opcode at rip=[0-9a-fA-F]+"
                 r" rsp=[0-9a-fA-F]+ stack(?: [0-9a-fA-F]+)*\r?", m.group(0)):
             expected_helper_faults -= 1
+            continue
+        if expected_writer_faults and re.fullmatch(
+                r"\[segfault\] pid \d+ \(sharedpagetest\) cpu\d+: Page fault at rip=[0-9a-fA-F]+"
+                r" addr=[0-9a-fA-F]+ err=7 rsp=[0-9a-fA-F]+ stack(?: [0-9a-fA-F]+)*\r?", m.group(0)):
+            expected_writer_faults -= 1
             continue
         if m.group(2) != "wxtest":
             problems.append(m.group(0))

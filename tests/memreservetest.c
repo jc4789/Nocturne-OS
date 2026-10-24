@@ -51,8 +51,8 @@ int main(void) {
     void *p;
     n_result saved=n_memory_reserve((size_t)request,N_MEMORY_READ_WRITE,&p);
     sysinfo(&after);
-    printf("pressure: requested=%llu free_before=%llu free_after=%llu\n",(unsigned long long)request,
-           (unsigned long long)before.free_mem,(unsigned long long)after.free_mem);
+    printf("pressure: requested=%llu free_before=%llu free_after=%llu result=%d region=%p\n",(unsigned long long)request,
+           (unsigned long long)before.free_mem,(unsigned long long)after.free_mem,(int)saved,p);
     uint64_t mapped_after=self_mapped_kb();
     printf("rollback: table_bound=%llu mapped_kb_before=%llu mapped_kb_after=%llu\n",
            (unsigned long long)table_bound,(unsigned long long)mapped_before,(unsigned long long)mapped_after);

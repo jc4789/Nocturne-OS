@@ -4192,10 +4192,10 @@ index e1d7e213..0e83e7d9 100644
  
 diff --git a/src/syscall/syscall_nocturne.go b/src/syscall/syscall_nocturne.go
 new file mode 100644
-index 00000000..cd45034e
+index 00000000..a673859b
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,1038 @@
+@@ -0,0 +1,1039 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4239,12 +4239,12 @@ index 00000000..cd45034e
 +	SYS_DOCUMENT_APPEND   = 138
 +	SYS_DOCUMENT_COMMIT   = 185
 +	SYS_DOCUMENT_INFO     = 186
-+	SYS_ENTRY_INFO        = 139
++	SYS_ENTRY_INFO_SIZED  = 188
 +	SYS_ENTRY_REMOVE      = 140
 +	SYS_ENTRY_MOVE        = 141
 +	SYS_ENTRY_REPLACE     = 187
 +	SYS_FOLDER_CREATE     = 142
-+	SYS_FOLDER_LIST       = 143
++	SYS_FOLDER_LIST_SIZED = 189
 +	SYS_CHANNEL_PAIR      = 144
 +	SYS_CHANNEL_SEND      = 145
 +	SYS_CHANNEL_RECEIVE   = 146
@@ -4695,7 +4695,7 @@ index 00000000..cd45034e
 +// DocumentInfo describes the open document h as EntryInfo describes an
 +// entry, with no name and the size h reads.
 +func DocumentInfo(h int, out *Entry) error {
-+	_, e := Syscall(SYS_DOCUMENT_INFO, uintptr(h), uintptr(unsafe.Pointer(out)), 0, 0, 0)
++	_, e := Syscall(SYS_DOCUMENT_INFO, uintptr(h), uintptr(unsafe.Pointer(out)), unsafe.Sizeof(*out), 0, 0)
 +	return errnoErr(e)
 +}
 +
@@ -4751,7 +4751,8 @@ index 00000000..cd45034e
 +// Entry is an entry of a folder, or the entry a path names
 +// (struct n_entry). Modified is in wall seconds and ModifiedNs the
 +// nanoseconds within that second. ID is the entry itself on C:: it stays
-+// with the entry when it moves and is never given to another one.
++// with the entry when it moves and is never given to another one. The
++// calls that fill entries pass this size: the kernel writes that much of each.
 +type Entry struct {
 +	Name       [256]byte
 +	Kind       uint32 // KIND_DOCUMENT, KIND_FOLDER or KIND_DEVICE
@@ -4775,7 +4776,7 @@ index 00000000..cd45034e
 +	if err != nil {
 +		return err
 +	}
-+	_, e := Syscall(SYS_ENTRY_INFO, uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(out)), 0, 0, 0)
++	_, e := Syscall(SYS_ENTRY_INFO_SIZED, uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(out)), unsafe.Sizeof(*out), 0, 0)
 +	return errnoErr(e)
 +}
 +
@@ -4838,7 +4839,7 @@ index 00000000..cd45034e
 +	if len(out) > 0 {
 +		first = uintptr(unsafe.Pointer(&out[0]))
 +	}
-+	r, e := Syscall(SYS_FOLDER_LIST, uintptr(unsafe.Pointer(p)), first, uintptr(len(out)), uintptr(start), 0)
++	r, e := Syscall(SYS_FOLDER_LIST_SIZED, uintptr(unsafe.Pointer(p)), first, uintptr(len(out)), uintptr(start), unsafe.Sizeof(Entry{}))
 +	return int(r), errnoErr(e)
 +}
 +

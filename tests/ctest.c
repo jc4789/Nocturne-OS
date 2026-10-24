@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
+#include <errno.h>
 #include <math.h>
 #include <setjmp.h>
 #include <ctype.h>
@@ -94,6 +96,19 @@ int main(void) {
     }
     int x = 0;
     CHECK(sscanf("12 abc", "%d %s", &x, buf) == 2 && x == 12 && !strcmp(buf, "abc"));
+    /* With l, %c, %s and %[ count the width in characters: あ (U+3042) and い (U+3044) are three
+       UTF-8 bytes each. Without l they count bytes. */
+    wchar_t wc = 0, ws[4] = {0};
+    CHECK(sscanf("\xe3\x81\x82", "%lc", &wc) == 1 && wc == 0x3042);
+    CHECK(sscanf("\xe3\x81\x82\xe3\x81\x84", "%2ls", ws) == 1 && ws[0] == 0x3042 && ws[1] == 0x3044 && !ws[2]);
+    CHECK(sscanf("\xe3\x81\x82\xe3\x81\x84", "%1ls%n", ws, &x) == 1 && ws[0] == 0x3042 && !ws[1] && x == 3);
+    CHECK(sscanf("\xe3\x81\x82\xe3\x81\x84,", "%1l[^,]", ws) == 1 && ws[0] == 0x3042 && !ws[1]);
+    CHECK(sscanf("\xe3\x81\x82", "%2c", buf) == 1 && !memcmp(buf, "\xe3\x81", 2));
+    CHECK(sscanf("\xe3\x81\x82", "%1s", buf) == 1 && !strcmp(buf, "\xe3"));
+    errno = 0;
+    CHECK(sscanf("\xff", "%lc", &wc) == 0 && errno == EILSEQ);
+    errno = 0;
+    CHECK(sscanf("\xe3\x81", "%lc", &wc) == 0 && errno == EILSEQ); /* cut short */
 
     CHECK(tls_counter == 41 && !tls_zero[0] && !tls_zero[7]);
     tls_counter++;

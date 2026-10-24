@@ -158,34 +158,111 @@ int ns_create(struct volume *v, uint64_t folder, const char *name, size_t n, uin
     return 0;
 }
 
-int ns_move(struct volume *v, uint64_t folder, const char *name, size_t n, uint64_t to_folder, const char *to_name,
-            size_t to_n) {
+/* An entry on its way from folder to to_folder's to_name, found and checked before anything
+   changes. */
+struct relink {
     struct ns_entry e;
-    int r = ns_find(v, folder, name, n, &e);
+    uint64_t folder, to_folder;
+    const char *to_name;
+    size_t to_n, klen;
+    uint8_t key[STORE_KEY_MAX]; /* its place in to_folder */
+    struct store_record rec;
+    uint8_t content[STORE_INLINE_MAX];
+    int inl;
+};
+
+/* name in folder, to go to to_folder's to_name, and what has that name now (*over, 0: nothing). 1:
+   that is the entry itself, which only changes the case of its name. */
+static int relink_find(struct volume *v, struct relink *m, uint64_t folder, const char *name, size_t n,
+                       uint64_t to_folder, const char *to_name, size_t to_n, uint64_t *over) {
+    int r = ns_find(v, folder, name, n, &m->e);
     if (r < 0) return r;
-    uint8_t key[STORE_KEY_MAX];
-    int k = entry_key(v, key, to_folder, to_name, to_n);
+    int k = entry_key(v, m->key, to_folder, to_name, to_n);
     if (k < 0) return k;
     if ((r = volume_writable(v)) < 0) return r;
-    if ((size_t)k == e.klen && !memcmp(key, e.key, e.klen)) /* the same entry: only its case changes */
-        return entry_put(v, key, (size_t)k, e.id, to_name, to_n, true);
-    struct store_record rec, up;
-    uint8_t content[STORE_INLINE_MAX];
-    int inl = ns_record(v, e.id, &rec, content);
-    if (inl < 0) return inl;
+    m->folder = folder;
+    m->to_folder = to_folder;
+    m->to_name = to_name;
+    m->to_n = to_n;
+    m->klen = (size_t)k;
+    if (m->klen == m->e.klen && !memcmp(m->key, m->e.key, m->klen)) return 1;
+    if ((m->inl = ns_record(v, m->e.id, &m->rec, m->content)) < 0) return m->inl;
     /* the folder it goes to must be a folder, and not this one or inside it */
+    struct store_record up;
     for (uint64_t at = to_folder;; at = up.parent) {
-        if (at == e.id) return -N_ERR_INVALID;
+        if (at == m->e.id) return -N_ERR_INVALID;
         if ((r = ns_record(v, at, &up, NULL)) < 0) return r;
         if (at == to_folder && up.kind != STORE_FOLDER) return -N_ERR_NOT_FOLDER;
         if (at == STORE_ID_ROOT) break;
     }
-    if ((r = entry_put(v, key, (size_t)k, e.id, to_name, to_n, false)) < 0) return r;
-    rec.parent = to_folder;
-    if ((r = catalog_delete(v, e.key, e.klen)) < 0 || (r = ns_record_put(v, e.id, &rec, content, (size_t)inl)) < 0 ||
-        (r = touch(v, folder)) < 0 || (r = touch(v, to_folder)) < 0)
-        return broken(v, r);
+    struct store_entry there = {0};
+    if ((r = catalog_get(v, m->key, m->klen, &there, sizeof there)) < 0 && r != -N_ERR_NOT_FOUND) return r;
+    if (r >= 0 && (size_t)r < sizeof there) return -N_ERR_IO;
+    *over = there.id;
     return 0;
+}
+
+/* Everything the move writes after its new entry, into the open generation (catalog_ready): it
+   cannot fail from then on. */
+static int relink_ready(struct volume *v, const struct relink *m) {
+    uint8_t key[9];
+    int r = catalog_ready(v, m->e.key, m->e.klen);
+    if (r >= 0) r = catalog_ready(v, key, key_head(key, m->e.id, STORE_KEY_RECORD));
+    if (r >= 0) r = catalog_ready(v, key, key_head(key, m->folder, STORE_KEY_RECORD));
+    if (r >= 0) r = catalog_ready(v, key, key_head(key, m->to_folder, STORE_KEY_RECORD));
+    return r;
+}
+
+/* the move after its new entry: the old one goes (unless another entry has its place now), its
+   record names its new folder, and both folders are touched */
+static int relink_finish(struct volume *v, struct relink *m, bool old) {
+    m->rec.parent = m->to_folder;
+    int r = old ? catalog_delete(v, m->e.key, m->e.klen) : 0;
+    if (r >= 0) r = ns_record_put(v, m->e.id, &m->rec, m->content, (size_t)m->inl);
+    if (r >= 0) r = touch(v, m->folder);
+    if (r >= 0) r = touch(v, m->to_folder);
+    return r;
+}
+
+/* ns_move, and ns_replace when aside_name is given. Everything that can fail comes before the first
+   change, but for the new entries, which fail whole. */
+static int move(struct volume *v, uint64_t folder, const char *name, size_t n, uint64_t to_folder, const char *to_name,
+                size_t to_n, uint64_t aside, const char *aside_name, size_t aside_n) {
+    struct relink m, *b = NULL; /* the entry that moves, and the document that goes aside from its name */
+    uint64_t over, taken;
+    int r = relink_find(v, &m, folder, name, n, to_folder, to_name, to_n, &over);
+    if (r == 1) return entry_put(v, m.key, m.klen, m.e.id, to_name, to_n, true); /* only its case changes */
+    if (r >= 0 && over && !aside_name) r = -N_ERR_EXISTS;
+    if (r >= 0 && over) {
+        b = kmalloc(sizeof *b);
+        r = b ? relink_find(v, b, to_folder, to_name, to_n, aside, aside_name, aside_n, &taken) : -N_ERR_NO_MEMORY;
+        if (r == 1) r = -N_ERR_INVALID; /* aside is where it is */
+        else if (r >= 0 && (b->rec.kind != STORE_DOCUMENT || taken)) r = -N_ERR_EXISTS;
+    }
+    if (r >= 0) r = relink_ready(v, &m);
+    if (r >= 0 && b) r = relink_ready(v, b);
+    if (r >= 0 && b) {
+        /* the document is named aside first; when the move cannot take its name then, that name
+           goes again, from a way just made: nothing has changed */
+        if ((r = entry_put(v, b->key, b->klen, b->e.id, aside_name, aside_n, false)) >= 0 &&
+            (r = entry_put(v, m.key, m.klen, m.e.id, to_name, to_n, true)) < 0 && catalog_delete(v, b->key, b->klen) < 0)
+            broken(v, r);
+    } else if (r >= 0) {
+        r = entry_put(v, m.key, m.klen, m.e.id, to_name, to_n, false);
+    }
+    if (r >= 0 && ((r = relink_finish(v, &m, true)) < 0 || (b && (r = relink_finish(v, b, false)) < 0))) broken(v, r);
+    kfree(b);
+    return r;
+}
+
+int ns_move(struct volume *v, uint64_t folder, const char *name, size_t n, uint64_t to_folder, const char *to_name,
+            size_t to_n) {
+    return move(v, folder, name, n, to_folder, to_name, to_n, 0, NULL, 0);
+}
+
+int ns_replace(struct volume *v, uint64_t folder, const char *name, size_t n, uint64_t to_folder, const char *to_name,
+               size_t to_n, uint64_t aside, const char *aside_name, size_t aside_n) {
+    return move(v, folder, name, n, to_folder, to_name, to_n, aside, aside_name, aside_n);
 }
 
 int ns_remove(struct volume *v, uint64_t folder, const char *name, size_t n, struct ranges *dropped) {

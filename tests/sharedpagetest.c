@@ -139,6 +139,7 @@ int main(int argc,char **argv){
         if(app>=0){
             CHECK(n_channel_send(reader_end,"down",4,down)==4);
             int status=-1;CHECK(n_app_result(app,-1,&status)==0&&status==128+14);
+            if(status==128+14)printf("sharedpagetest: expected writer fault status=%d\n",status); /* test.py lets that fault be */
             n_handle_close(app);n_handle_close(reader_end);
         }
         CHECK(dp[0]==5); /* the faulting write never reached the page */

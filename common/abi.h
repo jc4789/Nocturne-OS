@@ -105,8 +105,11 @@ enum {
     SYS_CHANNEL_RECEIVE_FROM, SYS_SHARED_COMPOSE,
     SYS_PCI_HOLD_SCREEN, /* (pci, hold): no drawing to the boot screen in the function's BAR */
     SYS_DOCUMENT_COMMIT, /* (document, N_COMMIT_*) */
-    SYS_DOCUMENT_INFO,   /* (document, struct n_entry *out) */
+    SYS_DOCUMENT_INFO,   /* (document, struct n_entry *out, sizeof *out) */
     SYS_ENTRY_REPLACE,   /* (from, to): SYS_ENTRY_MOVE that may replace a document */
+    /* SYS_ENTRY_INFO and SYS_FOLDER_LIST with the size of the caller's struct n_entry */
+    SYS_ENTRY_INFO_SIZED,  /* (path, struct n_entry *out, sizeof *out) */
+    SYS_FOLDER_LIST_SIZED, /* (path, struct n_entry *out, max, start, sizeof *out): count */
     SYS_MAX = 192
 };
 
@@ -140,7 +143,11 @@ enum {
 #define N_COMMIT_RESULT 3     /* the last started save's outcome (N_ERR_NOT_READY: not yet) */
 
 /* An entry of a folder, or the entry a path names. id is the entry itself on C:: it
-   stays with the entry when it moves and is never given to another one. */
+   stays with the entry when it moves and is never given to another one. New fields come at
+   the end: a call that returns entries takes the size of the caller's struct n_entry and
+   writes that much of each, entries that far apart (N_ERR_INVALID below N_ENTRY_FIRST_BYTES,
+   N_ERR_UNSUPPORTED past what the kernel knows). SYS_ENTRY_INFO and SYS_FOLDER_LIST, the
+   calls of programs built before id, write N_ENTRY_FIRST_BYTES. */
 struct n_entry {
     char name[256];
     uint32_t kind;        /* N_KIND_DOCUMENT or N_KIND_FOLDER */
@@ -149,6 +156,7 @@ struct n_entry {
     int64_t modified;     /* wall seconds */
     uint64_t id;
 };
+#define N_ENTRY_FIRST_BYTES 280 /* the first struct n_entry: name to modified */
 
 /* n_channel_receive flags */
 #define N_CHANNEL_WAIT 1
@@ -211,6 +219,8 @@ struct n_procinfo {
     uint64_t wait_phys; /* blocked in an address wait: the physical word, else 0 */
 };
 
+/* free_mem: what an app can have now, the free frames and those of programs no task runs, which
+   the system gives back to an app that asks for them. */
 struct n_sysinfo {
     uint64_t total_mem, free_mem, heap_used, uptime_ms;
     int ntasks;

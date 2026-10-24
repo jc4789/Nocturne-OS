@@ -35,26 +35,38 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
 
 /* ---- user memory access ---- */
 
+static bool shared_fault(uint64_t addr, bool write, bool *slept);
+
 /* Is [p, p+n) user memory the process may read (or, with write, also write)? Missing stack
    pages are faulted in. The kernel must not write to a read-only user page itself: CR0.WP is on,
-   so that would be a kernel page fault. */
+   so that would be a kernel page fault. A program page read from its document lets go of the
+   caller's guard while the disk works: a sibling may unmap what was checked before it, so the
+   check starts over, and the caller's copy follows a pass that did not sleep. */
 static bool user_access(const void *p, size_t n, bool write) {
     uint64_t a = (uint64_t)p;
     if (n == 0) return true;
     if (a >= USER_TOP || a + n > USER_TOP || a + n < a) return false;
     struct task *t = current_task;
-    for (uint64_t pg = ALIGN_DOWN(a, PAGE_SIZE); pg < a + n; pg += PAGE_SIZE) {
+    uint64_t pg = ALIGN_DOWN(a, PAGE_SIZE);
+    while (pg < a + n) {
         uint64_t pte = vmm_get_pte(t->pml4, pg);
         if (!(pte & PTE_P)) {
             if (pg >= USER_STACK_TOP - USER_STACK_MAX && pg < USER_STACK_TOP) {
                 if (vmm_user_alloc(t->pml4, pg, PAGE_SIZE, VM_W) < 0) return false;
+                pg += PAGE_SIZE;
                 continue;
             }
-            if (!shared_demand_fault(pg, write)) return false;
+            bool slept = false;
+            if (!shared_fault(pg, write, &slept)) return false;
+            if (slept) {
+                pg = ALIGN_DOWN(a, PAGE_SIZE);
+                continue;
+            }
             pte = vmm_get_pte(t->pml4, pg);
         }
         if (!(pte & PTE_U)) return false;
         if (write && !(pte & PTE_W)) return false;
+        pg += PAGE_SIZE;
     }
     return true;
 }
@@ -198,11 +210,14 @@ static int64_t sys_proclist(struct n_procinfo *out, int max) {
     return n;
 }
 
+static uint64_t programs_idle(void);
+
 static int64_t sys_sysinfo(struct n_sysinfo *si) {
     if (!user_ok_w(si, sizeof *si)) return -N_ERR_BAD_ADDRESS;
     memset(si, 0, sizeof *si);
     si->total_mem = pmm_total_pages() * PAGE_SIZE;
-    si->free_mem = pmm_free_pages() * PAGE_SIZE;
+    /* What an app can have: idle programs give their frames to one that asks (frames_free). */
+    si->free_mem = (pmm_free_pages() + programs_idle()) * PAGE_SIZE;
     si->heap_used = heap_used_bytes();
     si->uptime_ms = uptime_ms();
     uint64_t flags = irq_save();
@@ -283,6 +298,11 @@ struct shared_pages {
     uint64_t base;struct object *parent;size_t first; /* a range's first frame; a view's object and first page */
     struct shared_part *parts;size_t part_count;
     struct shared_scope **dependencies;size_t dependency_count;
+    size_t resident; /* a demand object's frames */
+    /* A program segment's demand object: its pages hold source's bytes from source_offset on,
+       source_bytes of them starting source_skip bytes into the first page, zeros elsewhere, read
+       on first touch. NULL while its program is idle (program_map gives a start's again). */
+    struct handle *source;uint64_t source_offset,source_bytes;size_t source_skip;
     struct object object;
     uint64_t pages[];
 };
@@ -394,16 +414,21 @@ static void shared_dma_maps(struct shared_pages *p,bool add) {
         at+=MIN(span,p->count-at);
     }
 }
+/* A demand object's slot for page index, its table made when create; NULL when there is none.
+   BSP IRQ guard held. */
+static uint64_t *demand_slot(struct shared_pages *p,size_t index,bool create) {
+    uint64_t *leaf=&p->pages[index/SHARED_LEAF];
+    if(!*leaf && (!create || !(*leaf=pmm_alloc_zeroed())))return NULL;
+    return (uint64_t *)phys_to_virt(*leaf)+index%SHARED_LEAF;
+}
 /* BSP-owned, called with interrupts disabled or from the fault handler. */
 static uint64_t shared_frame(struct shared_pages *p,size_t index,bool create) {
     uint8_t cache;p=shared_leaf(p,&index,&cache,NULL,NULL);
     if(p->kind==SHARED_RAM)return p->pages[index];
     if(p->kind==SHARED_RANGE)return p->base+index*PAGE_SIZE;
-    uint64_t *leaf=&p->pages[index/SHARED_LEAF];
-    if(!*leaf){if(!create || !(*leaf=pmm_alloc_zeroed()))return 0;}
-    uint64_t *slot=(uint64_t *)phys_to_virt(*leaf)+index%SHARED_LEAF;
-    if(!*slot && create)*slot=pmm_alloc_zeroed();
-    return *slot;
+    uint64_t *slot=demand_slot(p,index,create);
+    if(slot && !*slot && create && (*slot=pmm_alloc_zeroed()))p->resident++;
+    return slot?*slot:0;
 }
 static void shared_release(struct object *o) {
     struct shared_pages *p=o->priv;
@@ -426,6 +451,7 @@ static void shared_release(struct object *o) {
         kfree(p->parts);kfree(p->dependencies);
         scope_drop(p->scope);
         pci_user_drop(p->claim);
+        handle_close(p->source);
         kfree(p);
     }
 }
@@ -792,13 +818,19 @@ static int64_t sys_shared_revoke(int h) {
  * for them, so concurrent instances (a worker pool) hold one copy of their code
  * and constants, and a start of a program that is still or was recently running
  * (a compiler's driver, then its compiler and its linker) neither reads nor
- * copies them again. A program is its document's content, known by its identity
- * (store_document_identity): a start of a changed document reads it anew, and
- * the tasks running the older content keep theirs. A program joins the cache
- * when a start has read all of it. Programs that no task runs stay, the most
- * recently started first, while they hold at most a sixteenth of memory and an
- * eighth stays free; an app that asks for more memory than is free gets theirs. */
-struct program_segment {struct program_segment *next;struct shared_pages *pages;uint64_t va,filesz,memsz;bool exec;};
+ * copies them again. A segment's frames come on first touch: the pages around
+ * the touched one are read from the document (PROGRAM_AROUND), so a large
+ * program costs what it runs of itself, not its size. A program is its
+ * document's content, known by its identity (store_document_identity): a start
+ * of a changed document reads it anew, and the tasks running the older content
+ * keep theirs. Pages are read through a READ opening, which keeps reading the
+ * content it opened even when the document is changed, moved or removed. A
+ * program joins the cache when a start has mapped all of it. Programs that no
+ * task runs stay, the most recently started first, while they hold at most a
+ * sixteenth of memory and an eighth stays free; an app that asks for more memory
+ * than is free gets theirs. An idle program closes its openings, so it holds no
+ * removed or replaced content on C:; the next start gives its own. */
+struct program_segment {struct program_segment *next;struct shared_pages *pages;uint64_t offset,va,filesz,memsz;bool exec;};
 enum {PROGRAM_NEW,PROGRAM_CACHED,PROGRAM_RETIRED};
 struct program {
     struct program *next;
@@ -812,14 +844,25 @@ static void program_free(struct program *p) {
     while(p->segments){struct program_segment *s=p->segments;p->segments=s->next;object_unref(&s->pages->object);kfree(s);}
     kfree(p->identity);kfree(p);
 }
-/* Its frames, when no task maps them and no start holds it; else 0. */
+/* Whether no task maps it, reads a page of it, or starts it. */
+static bool program_idle(const struct program *p) {
+    if(p->starts)return false;
+    for(const struct program_segment *s=p->segments;s;s=s->next)
+        if(s->pages->object.refs!=1)return false;
+    return true;
+}
+/* Its frames, when it is idle; else 0. */
 static uint64_t program_idle_pages(const struct program *p) {
     uint64_t pages=0;
-    if(p->starts)return 0;
-    for(const struct program_segment *s=p->segments;s;s=s->next){
-        if(s->pages->object.refs!=1)return 0;
-        pages+=s->pages->count;
-    }
+    if(!program_idle(p))return 0;
+    for(const struct program_segment *s=p->segments;s;s=s->next)pages+=s->pages->resident;
+    return pages;
+}
+/* The frames of all idle programs: free for the asking. */
+static uint64_t programs_idle(void) {
+    uint64_t pages=0,irq=irq_save();
+    for(const struct program *p=programs;p;p=p->next)pages+=program_idle_pages(p);
+    irq_restore(irq);
     return pages;
 }
 /* Programs no task runs leave the cache, the least recently started first, while
@@ -835,8 +878,20 @@ static void programs_trim(uint64_t need) {
         }
         if(last && (idle>budget || pmm_free_pages()<floor)){gone=*last;*last=gone->next;gone->state=PROGRAM_RETIRED;}
         irq_restore(irq);
-        if(!gone)return;
+        if(!gone)break;
         program_free(gone);
+    }
+    /* The idle ones that stay let go of their openings (nothing can read a page of them). */
+    for(;;){
+        uint64_t irq=irq_save();struct handle *source=NULL;
+        for(struct program *p=programs;p && !source;p=p->next){
+            if(!program_idle(p))continue;
+            for(struct program_segment *s=p->segments;s && !source;s=s->next)
+                if((source=s->pages->source))s->pages->source=NULL;
+        }
+        irq_restore(irq);
+        if(!source)return;
+        handle_close(source);
     }
 }
 /* Whether pages more frames are free, once idle programs gave theirs back if not. */
@@ -876,35 +931,89 @@ void program_put(struct program *p,bool complete) {
     if(replaced)program_free(replaced);
     if(gone)program_free(p);
 }
-int program_map(struct task *t,struct program *prog,uint64_t va,uint64_t filesz,uint64_t memsz,bool exec) {
+int program_map(struct task *t,struct program *prog,struct handle *doc,uint64_t offset,uint64_t va,uint64_t filesz,
+                uint64_t memsz,bool exec) {
     uint64_t start=ALIGN_DOWN(va,PAGE_SIZE),end=ALIGN_UP(va+memsz,PAGE_SIZE);
     struct shared_pages *p=NULL;struct program_segment *fresh=NULL;
     for(struct program_segment *s=prog->segments;s;s=s->next)
-        if(s->va==va && s->filesz==filesz && s->memsz==memsz && s->exec==exec){p=s->pages;break;}
+        if(s->offset==offset && s->va==va && s->filesz==filesz && s->memsz==memsz && s->exec==exec){p=s->pages;break;}
     if(!p){
         /* Others may map a cached program's frames already: only a new one gets more. */
         if(prog->state!=PROGRAM_NEW)return -N_ERR_INVALID;
         if(!(fresh=kmalloc(sizeof *fresh)))return -N_ERR_NO_MEMORY;
-        int64_t r=frames_free((end-start)/PAGE_SIZE)?shared_object(end-start,false,&p):-N_ERR_NO_MEMORY;
+        int64_t r=shared_object(end-start,true,&p);
         if(r<0){kfree(fresh);return (int)r;}
+        p->source_offset=offset;p->source_bytes=filesz;p->source_skip=va-start;
     }
     struct shared_mapping *m=kzalloc(sizeof *m);
-    uint64_t flags=PTE_U|PTE_SHARED|PTE_SHARED_RO|(exec?0:pte_nx);size_t mapped=0;
-    if(m)for(;mapped<p->count;mapped++)if(!vmm_map_page(t->pml4,start+mapped*PAGE_SIZE,p->pages[mapped],flags))break;
-    if(!m || mapped!=p->count){
-        vmm_user_free(t->pml4,start,mapped*PAGE_SIZE);kfree(m);
+    if(!m){
+        if(fresh){shared_release(&p->object);kfree(fresh);}
+        return -N_ERR_NO_MEMORY;
+    }
+    /* The frames a peer read already are mapped now; the others on first touch. */
+    uint64_t flags=PTE_U|PTE_SHARED|PTE_SHARED_RO|(exec?0:pte_nx),irq;bool ok=true;
+    for(size_t i=0;ok && p->resident && i<p->count;i++){
+        irq=irq_save();
+        uint64_t frame=shared_frame(p,i,false);
+        ok=!frame || vmm_map_page(t->pml4,start+i*PAGE_SIZE,frame,flags);
+        irq_restore(irq);
+    }
+    irq=irq_save();
+    if(ok && !p->source)p->source=handle_ref(doc); /* a new segment's, or an idle one's: the same content */
+    if(!ok){
+        irq_restore(irq);
+        vmm_user_free(t->pml4,start,end-start);kfree(m);
         if(fresh){shared_release(&p->object);kfree(fresh);}
         return -N_ERR_NO_MEMORY;
     }
     if(fresh){
         object_ref(&p->object); /* the program's */
-        *fresh=(struct program_segment){.next=prog->segments,.pages=p,.va=va,.filesz=filesz,.memsz=memsz,.exec=exec};
+        *fresh=(struct program_segment){.next=prog->segments,.pages=p,.offset=offset,.va=va,.filesz=filesz,.memsz=memsz,
+                                        .exec=exec};
         prog->segments=fresh;
     }
     object_ref(&p->object); /* the mapping's */
-    uint64_t irq=irq_save();*m=(struct shared_mapping){.next=t->shared_mappings,.object=&p->object,.va=start,.flags=flags,.bytes=end-start};
+    *m=(struct shared_mapping){.next=t->shared_mappings,.object=&p->object,.va=start,.flags=flags,.bytes=end-start};
     t->shared_mappings=m;irq_restore(irq);
-    return fresh!=NULL;
+    return 0;
+}
+/* Pages a first touch of a program segment reads together: the touched one and the others of its
+   aligned 64 KiB that no task has read, in one read from the document. */
+#define PROGRAM_AROUND 16
+/* Reads page index of p and those around it from source and adopts those no peer adopted meanwhile.
+   Called with no guard held, holding p and source: the read waits for the disk. */
+static int program_fill(struct shared_pages *p,struct handle *source,size_t index) {
+    size_t first=ALIGN_DOWN(index,(size_t)PROGRAM_AROUND),last=MIN(first+PROGRAM_AROUND,p->count);
+    if(!frames_free(4096+(last-first)))first=index,last=index+1; /* memory is short: what is touched only */
+    uint64_t irq=irq_save();
+    for(uint64_t *slot;first<index && (slot=demand_slot(p,first,false)) && *slot;)first++;
+    for(uint64_t *slot;last>index+1 && (slot=demand_slot(p,last-1,false)) && *slot;)last--;
+    irq_restore(irq);
+    size_t bytes=(last-first)*PAGE_SIZE;
+    uint8_t *buf=kzalloc(bytes);
+    if(!buf)return -N_ERR_NO_MEMORY;
+    /* the window's part of [source_skip, source_skip + source_bytes) */
+    uint64_t lo=MAX((uint64_t)first*PAGE_SIZE,(uint64_t)p->source_skip),
+             hi=MIN((uint64_t)last*PAGE_SIZE,p->source_skip+p->source_bytes);
+    int r=0;
+    if(lo<hi){
+        int64_t got=store_document_read(source,p->source_offset+(lo-p->source_skip),buf+(lo-first*PAGE_SIZE),hi-lo,false);
+        r=got<0?(int)got:(uint64_t)got!=hi-lo?-N_ERR_IO:0;
+    }
+    for(size_t i=first;r>=0 && i<last;i++){
+        uint64_t frame=pmm_alloc();
+        if(!frame){if(i==index)r=-N_ERR_NO_MEMORY;continue;}
+        memcpy(phys_to_virt(frame),buf+(i-first)*PAGE_SIZE,PAGE_SIZE);
+        irq=irq_save();
+        uint64_t *slot=demand_slot(p,i,true);
+        bool adopted=slot && !*slot;
+        if(adopted){*slot=frame;p->resident++;}
+        irq_restore(irq);
+        if(!adopted)pmm_free(frame);
+        if(!slot && i==index)r=-N_ERR_NO_MEMORY;
+    }
+    kfree(buf);
+    return r;
 }
 static uint64_t gone_device_page; /* shared_demand_fault: what revoked device mappings show */
 void shared_revoke_claim(const struct pci_claim *c) {
@@ -919,8 +1028,10 @@ void shared_revoke_claim(const struct pci_claim *c) {
 }
 /* A first touch of a reserved shared page, from user code or a kernel copy
  * on its behalf: allocate the object's frame (or adopt the one a peer already
- * created) and map it with the mapping's own protection. */
-bool shared_demand_fault(uint64_t addr,bool write) {
+ * created) and map it with the mapping's own protection. A program's page is
+ * read from its document first, with the guard let go meanwhile (*slept): the
+ * mapping is looked up again after it. */
+static bool shared_fault(uint64_t addr,bool write,bool *slept) {
     struct task *owner=task_process();
     if(!owner)return false;
     int reserved=vmm_demand_fault(owner->pml4,addr,write); /* a private reserved page */
@@ -931,7 +1042,10 @@ bool shared_demand_fault(uint64_t addr,bool write) {
         report_memory_exhaustion(owner,PAGE_SIZE);
         return false;
     }
-    uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE),irq=irq_save();bool ok=false,starved=false;
+    uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE);
+again:;
+    uint64_t irq=irq_save();bool ok=false,starved=false;
+    struct shared_pages *fill=NULL;struct handle *source=NULL;size_t at=0;
     for(struct shared_mapping *m=owner->shared_mappings;m;m=m->next){
         if(page<m->va || page-m->va>=m->bytes)continue;
         struct shared_pages *p=m->object->priv;
@@ -953,12 +1067,28 @@ bool shared_demand_fault(uint64_t addr,bool write) {
            live-device segments still refer to their own valid backing. */
         if((leaf->kind!=SHARED_DEMAND && !shared_device_gone(p,NULL)) || (write && !(m->flags&PTE_W)))break;
         if(vmm_get_pte(owner->pml4,page)&PTE_P){ok=true;break;}
+        if(leaf->source && !shared_frame(leaf,index,false)){
+            /* A program's page no task has read: the object and its opening stay while it is read. */
+            fill=leaf;at=index;source=handle_ref(leaf->source);
+            object_ref(&fill->object);
+            break;
+        }
         uint64_t frame=shared_frame(p,(page-m->va)/PAGE_SIZE,true);
         starved=!frame;
         ok=frame && vmm_map_page(owner->pml4,page,frame,m->flags|cache_pte(cache));
         break;
     }
     irq_restore(irq);
+    if(fill){
+        int r=program_fill(fill,source,at);
+        handle_close(source);
+        object_unref(&fill->object);
+        if(slept)*slept=true;
+        if(r>=0)goto again; /* mapped from the frame now there, if the mapping still is */
+        if(r==-N_ERR_NO_MEMORY)starved=true;
+        else kprintf("[program] pid %d (%s): page %p could not be read from the program (%d)\n",
+                     owner->pid,owner->name,(void *)page,r);
+    }
     if(starved){
         kprintf("[shared] pid %d (%s): no frame for page %p, %lu pages free\n",
                 owner->pid,owner->name,(void *)page,(unsigned long)pmm_free_pages());
@@ -966,6 +1096,7 @@ bool shared_demand_fault(uint64_t addr,bool write) {
     }
     return ok;
 }
+bool shared_demand_fault(uint64_t addr,bool write) { return shared_fault(addr,write,NULL); }
 /* Maps a shared object the caller holds a handle to (its own, or one received
    as a channel attachment): there is no reaching into another app's handles. */
 static int64_t sys_shared_map(int h,size_t bytes,int access) {
@@ -1314,13 +1445,23 @@ static int64_t sys_document_size(int h) {
     return r;
 }
 
-static int64_t sys_document_info(int h, struct n_entry *uout) {
+/* An app's struct n_entry is the first bytes of the kernel's (common/abi.h): the calls fill the
+   whole entry and copy as much of it as the app's record holds. */
+_Static_assert(__builtin_offsetof(struct n_entry, id) == N_ENTRY_FIRST_BYTES, "the first n_entry ends before id");
+static int entry_bytes_check(size_t bytes) {
+    if (bytes < N_ENTRY_FIRST_BYTES) return -N_ERR_INVALID;
+    return bytes > sizeof(struct n_entry) ? -N_ERR_UNSUPPORTED : 0; /* a later record than this kernel's */
+}
+
+static int64_t sys_document_info(int h, void *uout, size_t bytes) {
+    int r = entry_bytes_check(bytes);
+    if (r < 0) return r;
     struct handle *d = handle_get(h);
     if (!d) return -N_ERR_NO_HANDLE;
     struct n_entry e;
-    int r = store_document_info(d, &e);
+    r = store_document_info(d, &e);
     handle_close(d);
-    return r < 0 ? r : copy_to_user(uout, &e, sizeof e);
+    return r < 0 ? r : copy_to_user(uout, &e, bytes);
 }
 
 static int64_t sys_document_set_size(int h, uint64_t size) {
@@ -1356,22 +1497,26 @@ static int64_t sys_document_save(const char *upath, const void *udata, size_t n,
     return r;
 }
 
-static int64_t sys_entry_info(const char *upath, struct n_entry *uout) {
+static int64_t sys_entry_info(const char *upath, void *uout, size_t bytes) {
+    int r = entry_bytes_check(bytes);
+    if (r < 0) return r;
     char *path;
-    int r = user_string(upath, &path);
+    r = user_string(upath, &path);
     if (r < 0) return r;
     struct n_entry e;
     r = store_entry_info(path, true, &e);
     kfree(path);
-    return r < 0 ? r : copy_to_user(uout, &e, sizeof e);
+    return r < 0 ? r : copy_to_user(uout, &e, bytes);
 }
 
-static int64_t sys_folder_list(const char *upath, struct n_entry *uout, size_t max, uint64_t start) {
-    if (max > SIZE_MAX / sizeof *uout) return -N_ERR_INVALID;
-    char *path;
-    int r = user_string(upath, &path);
+static int64_t sys_folder_list(const char *upath, void *uout, size_t max, uint64_t start, size_t bytes) {
+    int r = entry_bytes_check(bytes);
     if (r < 0) return r;
-    int64_t n = store_folder_list(path, start, uout, max, true);
+    if (max > SIZE_MAX / bytes) return -N_ERR_INVALID;
+    char *path;
+    r = user_string(upath, &path);
+    if (r < 0) return r;
+    int64_t n = store_folder_list(path, start, uout, max, bytes, true);
     kfree(path);
     return n;
 }
@@ -1972,13 +2117,15 @@ void syscall_dispatch(struct regs *r) {
     case SYS_DOCUMENT_SAVE: ret = sys_document_save((const char *)a, (const void *)b, c, false); break;
     case SYS_DOCUMENT_APPEND: ret = sys_document_save((const char *)a, (const void *)b, c, true); break;
     case SYS_DOCUMENT_COMMIT: ret = sys_document_commit((int)a, (int)b); break;
-    case SYS_DOCUMENT_INFO: ret = sys_document_info((int)a, (struct n_entry *)b); break;
-    case SYS_ENTRY_INFO: ret = sys_entry_info((const char *)a, (struct n_entry *)b); break;
+    case SYS_DOCUMENT_INFO: ret = sys_document_info((int)a, (void *)b, c); break;
+    case SYS_ENTRY_INFO: ret = sys_entry_info((const char *)a, (void *)b, N_ENTRY_FIRST_BYTES); break;
+    case SYS_ENTRY_INFO_SIZED: ret = sys_entry_info((const char *)a, (void *)b, c); break;
     case SYS_ENTRY_REMOVE: ret = sys_entry_remove((const char *)a); break;
     case SYS_ENTRY_MOVE: ret = sys_entry_move((const char *)a, (const char *)b, false); break;
     case SYS_ENTRY_REPLACE: ret = sys_entry_move((const char *)a, (const char *)b, true); break;
     case SYS_FOLDER_CREATE: ret = sys_folder_create((const char *)a); break;
-    case SYS_FOLDER_LIST: ret = sys_folder_list((const char *)a, (struct n_entry *)b, c, d); break;
+    case SYS_FOLDER_LIST: ret = sys_folder_list((const char *)a, (void *)b, c, d, N_ENTRY_FIRST_BYTES); break;
+    case SYS_FOLDER_LIST_SIZED: ret = sys_folder_list((const char *)a, (void *)b, c, d, e); break;
     case SYS_CHANNEL_PAIR: ret = sys_channel_pair((int32_t *)a); break;
     case SYS_CHANNEL_SEND: ret = sys_channel_send((int)a, (const void *)b, c, (int)d); break;
     case SYS_CHANNEL_RECEIVE: ret = sys_channel_receive((int)a, (void *)b, c, (int)d, (void *)e, false); break;

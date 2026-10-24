@@ -67,6 +67,9 @@ int64_t document_size_now(uint64_t id);
 /* Document id, the entry name in folder, is about to be removed: when it is open, the entry goes
    to the temp folder instead and the document with its last opening (1); 0 when it is not open. */
 int document_hide(uint64_t folder, const char *name, size_t n, uint64_t id);
+/* Document id went to the temp folder as name number (store_temp_name): it goes from there with its
+   last opening, or now when it is not open. */
+void document_aside(uint64_t id, uint64_t number);
 /* Document id was renamed or moved: a save of an opening that wrote nothing waits for it. */
 void document_changed(uint64_t id);
 /* Every document's unsaved writes into the catalog (the writer, store_sync). */

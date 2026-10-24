@@ -20,11 +20,13 @@ void space_unreserve(struct volume *v, uint64_t blocks);
 int space_alloc(struct volume *v, uint64_t want, bool reserved, struct range *out);
 /* held → used: the catalog names them now */
 int space_use(struct volume *v, uint64_t start, uint64_t count);
-/* used → held: the catalog no longer names them */
+/* used → held: the catalog no longer names them. Fails whole. */
 int space_unuse(struct volume *v, uint64_t start, uint64_t count);
 /* held → free once the open generation and the next one are on the medium: the last commit and
    the one before it stay whole while another is written */
 int space_release(struct volume *v, uint64_t start, uint64_t count);
+/* space_unuse and space_release in one, which fails whole */
+int space_let_go(struct volume *v, uint64_t start, uint64_t count);
 /* space_release for each range of a list, which is emptied */
 void space_release_list(struct volume *v, struct ranges *list);
 /* generation is on the medium */

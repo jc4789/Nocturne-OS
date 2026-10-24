@@ -20,15 +20,19 @@ uint64_t mmap_reserve(struct task *owner, uint64_t len);
 /* Programs whose read-only segments every task running them shares (syscall.c). A start holds the
    program its READ opening doc reads: the cached one when that content was read before, else a new
    one (NULL: the content has no identity to share it by, or no memory). program_map maps the
-   segment at va into t from the program's frames: 0 when they hold its bytes already, 1 when they
-   are new, for the start to read the bytes into; < 0 when it is not shared (the start copies it).
-   program_put ends the start's hold: a new program a start read completely joins the cache. */
+   segment at va, filesz bytes of doc from offset, into t from the program's frames: 0 when it is
+   mapped, its pages read from doc (which the program holds on to) when a task first touches them;
+   < 0 when it is not shared (the start copies it). program_put ends the start's hold: a new
+   program a start mapped completely joins the cache. */
 struct handle;
 struct program;
 struct program *program_get(struct handle *doc);
-int program_map(struct task *t, struct program *p, uint64_t va, uint64_t filesz, uint64_t memsz, bool exec);
+int program_map(struct task *t, struct program *p, struct handle *doc, uint64_t offset, uint64_t va, uint64_t filesz,
+                uint64_t memsz, bool exec);
 void program_put(struct program *p, bool complete);
-bool shared_demand_fault(uint64_t addr, bool write); /* first touch of a reserved shared page */
+/* First touch of a reserved shared page; false (after saying why) when it gets none: no memory, or
+   a program page its document could not give. It may wait for the disk. */
+bool shared_demand_fault(uint64_t addr, bool write);
 /* A PCI claim's last handle closed (dev/pciuser.c): every process loses the device pages of its
    BAR objects' mappings. The address ranges stay reserved; a touch there reads all-ones, as a
    function gone from the bus does, and writes go nowhere. */

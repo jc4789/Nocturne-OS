@@ -134,21 +134,24 @@ static struct doc *doc_get(uint64_t id) {
 
 static void discard(struct volume *v, struct work *w);
 
+/* the document named number in the temp folder goes, nothing having it open */
+static void temp_remove(struct volume *v, uint64_t number) {
+    char name[17];
+    size_t n = store_temp_name(number, name);
+    struct ranges dropped = {0};
+    int r = ns_remove(v, store.temp, name, n, &dropped);
+    space_release_list(v, &dropped);
+    if (r < 0) kprintf("store: a document stays in C:\\Nocturne\\Temp until the next start (%d)\n", r);
+    else store_dirty(false);
+}
+
 static void doc_put(struct volume *v, struct doc *d) {
     if (--d->users) return;
     discard(v, &d->work); /* a write that raced its opening's save leaves pages nothing saves */
     struct doc **at = &docs[d->id % BUCKETS];
     while (*at != d) at = &(*at)->next;
     *at = d->next;
-    if (d->temp) { /* nothing names it but the temp folder */
-        char name[17];
-        size_t n = store_temp_name(d->temp, name);
-        struct ranges dropped = {0};
-        int r = ns_remove(v, store.temp, name, n, &dropped);
-        space_release_list(v, &dropped);
-        if (r < 0) kprintf("store: a document removed while open stays in C:\\Nocturne\\Temp (%d)\n", r);
-        else store_dirty(false);
-    }
+    if (d->temp) temp_remove(v, d->temp); /* nothing names it but the temp folder */
     kfree(d->name);
     kfree(d);
 }
@@ -903,16 +906,24 @@ int64_t document_size_now(uint64_t id) {
 }
 
 int document_hide(uint64_t folder, const char *name, size_t n, uint64_t id) {
-    struct doc *d = doc_find(id);
-    if (!d) return 0;
+    if (!doc_find(id)) return 0;
     char temp[17];
     uint64_t number = ++store.temp_names;
     size_t k = store_temp_name(number, temp);
     int r = ns_move(store.v, folder, name, n, store.temp, temp, k);
     if (r < 0) return r;
+    document_aside(id, number);
+    return 1;
+}
+
+void document_aside(uint64_t id, uint64_t number) {
+    struct doc *d = doc_find(id);
+    if (!d) {
+        temp_remove(store.v, number);
+        return;
+    }
     d->temp = number;
     d->changed_in = store.v->generation;
-    return 1;
 }
 
 void document_changed(uint64_t id) {

@@ -227,17 +227,17 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         }
         if (ph[i].vaddr + ph[i].memsz > top) top = ph[i].vaddr + ph[i].memsz;
         /* A read-only segment whose pages no other segment touches is shared
-           with every task running the program. */
+           with every task running the program, its pages read when first touched. */
         bool alone = program && !(prot & VM_W);
         uint64_t first = ALIGN_DOWN(ph[i].vaddr, PAGE_SIZE), last = ALIGN_UP(ph[i].vaddr + ph[i].memsz, PAGE_SIZE);
         for (int j = 0; alone && j < eh.phnum; j++)
             if (j != i && ph[j].type == PT_LOAD && ph[j].memsz &&
                 ALIGN_DOWN(ph[j].vaddr, PAGE_SIZE) < last && ALIGN_UP(ph[j].vaddr + ph[j].memsz, PAGE_SIZE) > first)
                 alone = false;
-        int shared = alone ? program_map(t, program, ph[i].vaddr, ph[i].filesz, ph[i].memsz, prot & VM_X) : -1;
-        if (shared == 0) continue; /* its bytes are there */
+        if (alone && program_map(t, program, doc, ph[i].offset, ph[i].vaddr, ph[i].filesz, ph[i].memsz, prot & VM_X) == 0)
+            continue;
         /* Otherwise the file's bytes are copied now; the zero tail (.bss) gets frames on first touch. */
-        if (shared < 0 && vmm_user_reserve(t->pml4, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
+        if (vmm_user_reserve(t->pml4, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
         if ((r = load_bytes(t, doc, ph[i].offset, ph[i].vaddr, ph[i].filesz, buf)) < 0) goto fail;
     }
     program_put(program, true);

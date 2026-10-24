@@ -34,9 +34,14 @@ int ns_create(struct volume *v, uint64_t folder, const char *name, size_t n, uin
               uint16_t flags, uint64_t *id);
 /* The entry `name` of folder out of it (to_folder's to_name from then on). Never replaces an entry
    (-N_ERR_EXISTS), and a folder never goes into itself (-N_ERR_INVALID); a new name for the same
-   entry changes only its case. */
+   entry changes only its case. A move that fails changes nothing. */
 int ns_move(struct volume *v, uint64_t folder, const char *name, size_t n, uint64_t to_folder, const char *to_name,
             size_t to_n);
+/* ns_move onto the name of a document, which goes to aside's aside_name in the same change, or not
+   at all (anything else there, or anything at aside_name: -N_ERR_EXISTS); with nothing there, an
+   ns_move. */
+int ns_replace(struct volume *v, uint64_t folder, const char *name, size_t n, uint64_t to_folder, const char *to_name,
+               size_t to_n, uint64_t aside, const char *aside_name, size_t aside_n);
 /* The entry and its record go; a folder must be empty (-N_ERR_NOT_EMPTY). A document's blocks are
    added to dropped, held: they go back with space_release once nothing reads them. */
 int ns_remove(struct volume *v, uint64_t folder, const char *name, size_t n, struct ranges *dropped);

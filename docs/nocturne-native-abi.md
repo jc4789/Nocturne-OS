@@ -120,6 +120,14 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   その秒の中のナノ秒 `modified_ns`）、`id` を持つ。`id` は C: 上の項目そのものの番号で、
   `n_entry_move` で移しても変わらず、別の項目には決して使われない。リンクは無いので、
   綴り（大文字・小文字、`/` と `\`）の違う二つのパスが同じ項目かは `id` で分かる。
+- `struct n_entry` を返すシステムコールは、呼び出し側の `sizeof(struct n_entry)` を受け取り、
+  各項目のその長さだけを、その間隔で書く。新しい欄は末尾にだけ加える。長さが
+  `N_ENTRY_FIRST_BYTES`（280、`name` から `modified` まで）より短ければ `N_ERR_INVALID`、
+  カーネルの知る形より長ければ `N_ERR_UNSUPPORTED`。libc の `n_entry_info`／`n_folder_list`／
+  `n_document_info` は `SYS_ENTRY_INFO_SIZED`／`SYS_FOLDER_LIST_SIZED`／`SYS_DOCUMENT_INFO`
+  に自分の長さを渡す。`id` より前の SDK で作ったプログラムの `SYS_ENTRY_INFO`／`SYS_FOLDER_LIST`
+  は、今も最初の形（280バイト、一覧の間隔も280バイト）を受け取る。その形で 0 だった
+  `reserved` の位置は今の `modified_ns`（古いプログラムは読まない）。
 - `n_document_info(h, struct n_entry *)` は開いている文書の `struct n_entry` を返す。名前は空
   （ハンドルは名前でなく文書そのものを指し、開いた後に移されても同じ文書のまま）で、`size` は
   そのハンドルが読む長さ（`n_document_size` と同じ）。
@@ -520,6 +528,10 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   列挙外、または書込みと実行の同時指定は `N_ERR_INVALID`。
 - `SYS_SHARED_MAP`（共有ハンドル、バイト数、`access`）：自分のハンドルだけ。
 - `SYS_DMESG` は `SYS_SYSTEM_LOG`（同じ33番）。
+- `SYS_ENTRY_INFO_SIZED`（パス、`struct n_entry *out`、`sizeof *out`）、`SYS_FOLDER_LIST_SIZED`
+  （パス、`out`、最大数、`start`、`sizeof *out`。件数）、`SYS_DOCUMENT_INFO`（文書、`out`、
+  `sizeof *out`）：§3 の長さを渡す `struct n_entry`。`SYS_ENTRY_INFO`（139）と `SYS_FOLDER_LIST`
+  （143）は `id` の無い最初の形（`N_ENTRY_FIRST_BYTES`、280バイト）を書き続ける。
 
 ## 11. インターフェースエンジン（`ui.h`）
 

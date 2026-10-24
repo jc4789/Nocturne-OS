@@ -79,6 +79,7 @@ struct guard {
 
 static struct guard heap = {&heap, &heap, 0, 0}, freed = {&freed, &freed, 0, 0};
 static size_t freed_bytes;
+static long alloc_fail_after = -1; /* blocks still given before memory runs out (-1: no end) */
 
 static void guard_check(const struct guard *g) {
     if (g->magic != GUARD_MAGIC) panic("heap: the head of a block is overwritten");
@@ -100,6 +101,8 @@ static void heap_check(void) {
 }
 
 void *kmalloc(size_t n) {
+    if (alloc_fail_after == 0) return NULL;
+    if (alloc_fail_after > 0) alloc_fail_after--;
     struct guard *g = malloc(sizeof *g + n + GUARD_TAIL);
     if (!g) return NULL;
     *g = (struct guard){&heap, heap.next, n, GUARD_MAGIC};
@@ -1100,13 +1103,16 @@ static void op_remove(struct test *t) {
     mnode_free(m);
 }
 
+/* a move, half of them ns_replace: a document at the name goes to aside's aside_name */
 static void op_move(struct test *t) {
     struct mnode *m = pick(t, 0, false);
     if (!m) return;
     struct mnode *to = below(3) ? pick(t, STORE_FOLDER, true) : m->parent;
-    char name[300];
-    uint8_t key[STORE_KEY_MAX];
-    size_t n, klen;
+    struct mnode *aside = below(2) ? pick(t, STORE_FOLDER, true) : NULL, *over = NULL;
+    char name[300], aside_name[300];
+    uint8_t key[STORE_KEY_MAX], aside_key[STORE_KEY_MAX];
+    size_t n, klen, aside_n = 0, aside_klen = 0;
+    int aside_want = aside ? random_name(t, aside_name, &aside_n, aside_key, &aside_klen) : 0;
     int want;
     if (below(3) == 0) { /* the same name in another case */
         memcpy(name, m->name, m->n + 1);
@@ -1122,11 +1128,36 @@ static void op_move(struct test *t) {
     if (!want && !same) {
         for (struct mnode *at = to; at; at = at->parent)
             if (at == m) want = -N_ERR_INVALID;
-        if (!want && mnode_kid(to, key, klen)) want = -N_ERR_EXISTS;
+        if (!want && (over = mnode_kid(to, key, klen)) && !aside) want = -N_ERR_EXISTS;
+        /* what is there is checked as it would move to aside */
+        if (!want && over) want = aside_want;
+        if (!want && over && aside == to && aside_klen == klen && !memcmp(aside_key, key, klen)) want = -N_ERR_INVALID;
+        for (struct mnode *at = aside; !want && over && at; at = at->parent)
+            if (at == over) want = -N_ERR_INVALID;
+        if (!want && over && (over->kind != STORE_DOCUMENT || mnode_kid(aside, aside_key, aside_klen))) want = -N_ERR_EXISTS;
     }
-    int r = ns_move(t->v, m->parent->id, m->name, m->n, to->id, name, n);
-    expect(t, r, want, "ns_move");
+    /* memory may run out part of the way: then the move changes nothing, and C: stays writable */
+    bool starve = below(3) == 0;
+    if (starve) alloc_fail_after = (long)below(16);
+    int r = aside ? ns_replace(t->v, m->parent->id, m->name, m->n, to->id, name, n, aside->id, aside_name, aside_n)
+                  : ns_move(t->v, m->parent->id, m->name, m->n, to->id, name, n);
+    alloc_fail_after = -1;
+    if (starve && r == -N_ERR_NO_MEMORY) {
+        if (t->v->error) fail(t, "a move without memory left C: read only (%d)", t->v->error);
+        if (check_volume(t->v, true)) fail(t, "a move without memory left the volume with problems");
+        t->ops[14]++;
+        return;
+    }
+    expect(t, r, want, aside ? "ns_replace" : "ns_move");
     if (r < 0) return;
+    if (over) {
+        memcpy(over->name, aside_name, aside_n + 1);
+        over->n = aside_n;
+        memcpy(over->key, aside_key, aside_klen);
+        over->klen = aside_klen;
+        mnode_unlink(over);
+        mnode_link(over, aside);
+    }
     memcpy(m->name, name, n + 1);
     m->n = n;
     memcpy(m->key, key, klen);
@@ -1291,7 +1322,7 @@ static int test_run(uint64_t mib, uint64_t seed, long steps) {
     verify(&t);
     printf("test passed (seed %llu, %ld steps):", (unsigned long long)seed, steps);
     for (int i = 0; i < 12; i++) printf(" %s %ld,", names[i], t.ops[i]);
-    printf(" out of space %ld\n", t.ops[15]);
+    printf(" out of memory %ld, out of space %ld\n", t.ops[14], t.ops[15]);
     volume_free(t.v);
     mnode_free(t.now);
     mnode_free(t.saved);

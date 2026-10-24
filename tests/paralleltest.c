@@ -91,7 +91,7 @@ static void browser(void) {
     const char *html="<!doctype html><style>body{margin:0}#a,#b{display:flow-root;width:380px}"
         "#a{height:250px;background:linear-gradient(25deg,red,blue);border:9px solid green;border-radius:40px}"
         "#b{height:250px;background:radial-gradient(circle,white,black)}.f{display:flex}.f div{padding:5px}</style>"
-        "<div id=a>Hello one</div><div id=b>Hello two</div><div class=f>"
+        "<div id=a>Hello one</div><div id=b>Hello two</div><div class=f id=f>"
         "<div>Aa</div><div>Bb</div><div>Cc</div><div>Dd</div><div>Ee</div><div>Ff</div><div>Gg</div><div>Hh</div></div>";
     web_doc *d=web_parse(html,strlen(html),"https://parallel.test/","utf-8");
     check(d!=NULL,"document creation");if(!d)return;
@@ -99,11 +99,19 @@ static void browser(void) {
     uint32_t *left=calloc(800*600,4),*right=calloc(800*600,4);
     if(!left||!right){check(false,"paint canvases");free(left);free(right);web_free(d);return;}
     canvas_t c;gfx_init(&c,left,800,600,800);web_paint(d,&c,0,0,800,600,0,0);
-    parallel_enable(true);d->layout_valid=false;layout_invalidate(d->root_box);
-    uint64_t layout_jobs=parallel_jobs();web_layout(d,800,600);
-    check(parallel_jobs()>=layout_jobs+2,"intrinsic and full child layout execute helper jobs");
-    gfx_init(&c,right,800,600,800);web_paint(d,&c,0,0,800,600,0,0);
-    check(!memcmp(left,right,800*600*4),"parallel full layout and tiled raster match serial pixels");
+    /* The same document again, laid out whole with helpers. (Invalidating the root box would
+       not do: layout_invalidate dirties a box and its ancestors, and its children keep their
+       results while their inputs are the same.) */
+    parallel_enable(true);
+    web_doc *whole=web_parse(html,strlen(html),"https://parallel.test/","utf-8");
+    check(whole!=NULL,"second document creation");
+    if(whole){
+        uint64_t layout_jobs=parallel_jobs();web_layout(whole,800,600);
+        check(parallel_jobs()>=layout_jobs+2,"intrinsic and full child layout execute helper jobs");
+        gfx_init(&c,right,800,600,800);web_paint(whole,&c,0,0,800,600,0,0);
+        check(!memcmp(left,right,800*600*4),"parallel full layout and tiled raster match serial pixels");
+        web_free(whole);
+    }
     node_t *a=find(d->root,"a"),*b=find(d->root,"b");
     check(a&&b&&a->box&&b->box,"local layout boxes");
     if(a&&b&&a->box&&b->box) {
@@ -119,7 +127,12 @@ static void browser(void) {
             check(d->root_box==root&&b->box->runs==runs,"text mutation reuses unrelated layout");
         }
     }
-    d->layout_valid=false;layout_invalidate(d->root_box);
+    /* Every flex item's text changes: their intrinsic sizes are measured again, by helpers. */
+    node_t *f=find(d->root,"f");
+    unsigned changed=0;
+    for(node_t *k=f?f->first:NULL;k;k=k->next)
+        if(k->first&&k->first->type==N_TEXT&&doc_node_text(d,k->first,"Zz",2))changed++;
+    check(changed==8,"flex item text updates");
     uint64_t before=parallel_jobs();web_layout(d,800,600);
     check(parallel_jobs()>before,"flex subtree intrinsic parallel jobs");
     free(left);free(right);web_free(d);
