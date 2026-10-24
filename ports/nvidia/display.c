@@ -10,7 +10,10 @@
  *      mapping, through BAR1) -> createSurface (X8R8G8B8)
  *   -> the boot screen's pixels copied into it, so the switch shows no black or stale frame
  *   -> applyModeSetConfig (checked, then committed) -> the flip has completed
- *   -> n_pci_give_screen: the system draws the desktop into the surface from then on
+ *   -> the pointer's cursor surface (32x32 A8R8G8B8, mapped): with it the surface is offered for
+ *      direct scanout (N_SCANOUT_DIRECT)
+ *   -> n_pci_give_screen: the system draws the desktop into the surface from then on (without
+ *      N_SCANOUT_DIRECT when the system or the display engine cannot show windows directly)
  *   -> registerVblankIntrCallback: each vertical blank goes to n_pci_screen_vblank
  *
  * The surface is given to the system as a view of BAR1 over the same pages RM mapped
@@ -18,15 +21,27 @@
  * come and go: a display that goes away has its head turned off, and the first display that
  * is connected (the firmware's first, then any) gets the same procedure again.
  *
+ * Direct scanout (NVRM_SCANOUT, include/nvrm_protocol.h): an app's images are video memory of
+ * the screen's size (allocateMemory, createSurface X8B8G8R8) that its GPU work writes into
+ * (IMPORT duplicates the memory into the app's RM client). While n_pci_screen_state names the
+ * app, PRESENT flips the head's primary layer to an image (a flip, not a mode set: only the
+ * surface changes), and the display engine draws the pointer as its cursor. When the state
+ * names another app or none, the state thread flips back to the desktop's surface, which the
+ * system has kept drawing into, and the cursor goes. An image is off the screen, and its last
+ * flip away from it complete, before it is freed.
+ *
  * nvrm_display_stop undoes it in the opposite order: the boot screen back to the system, then
  * releaseOwnership, with which NVKMS shows the firmware's framebuffer console again
- * (nvkms-console-restore.c), then the surface and the device.
+ * (nvkms-console-restore.c), then the images, the cursor, the surface and the device.
  *
  * Threads: KAPI's event callback runs on NVKMS's work thread and only wakes this file's
  * display thread, which does the KAPI calls of a reconnection (they take NVKMS's lock). The
+ * state thread follows n_pci_screen_state. Requests come on nvrm's client threads
+ * (nvrm_display_scanout), between nvrm_display_start and nvrm_display_stop. All of them change
+ * the head, the images and the KAPI structures below under head_lock, one at a time. The
  * vertical-blank callback runs under NVKMS's lock on its timer thread and only counts and
- * tells the system. Before the display thread starts and after it is joined, the calling
- * thread (nvrm's main thread) is the only one that touches the state below.
+ * tells the system. Before the threads start and after they are joined, the calling thread
+ * (nvrm's main thread) is the only one that touches the state below.
  */
 #include "display.h"
 #include "nvkms_os.h"
@@ -46,13 +61,27 @@
 #include <class/cl0080.h>
 #include <ctrl/ctrl0000/ctrl0000gpu.h>
 #include <ctrl/ctrl0073/ctrl0073system.h>
+#include <nv_escape.h>
+#include "nvrm_protocol.h"
 
 #define LOG "NVRM display: "
 #define FLIP_TIMEOUT_MS 3000         /* a committed mode set whose flip has not completed by then failed */
 #define DEFAULT_REFRESH 60000u       /* RRx1k, when the monitor names no preferred mode */
 #define PAGE_BYTES 4096u
+#define STATE_WAIT_MS 1000           /* the state thread looks at its stop flag at least this often */
+#define CURSOR_MIN_PITCH 256u        /* NVKMS's for a 32x32 cursor (nvEvoGetHeadSetControlCursorValueC3) */
 
 static struct NvKmsKapiFunctionsTable kapi = { .versionString = NV_VERSION_STRING };
+
+/* An app's image for direct scanout (NVRM_SCANOUT): the screen's size, scr.pitch apart. */
+struct image {
+    struct image *next;
+    uint32_t number;                 /* nvrm-wide, never 0 */
+    uint32_t app;                    /* the app that made it (n_app_self's number) */
+    const void *connection;          /* the connection that made it (its RM file) */
+    struct NvKmsKapiMemory *memory;
+    struct NvKmsKapiSurface *surface;
+};
 
 static struct {
     struct NvKmsKapiDevice *device;
@@ -74,23 +103,46 @@ static struct {
     NvKmsKapiDisplay display;        /* the display nvrm lit, 0 none */
     uint32_t head;                   /* its head, while head_on */
     bool head_on;
+    struct NvKmsKapiDisplayMode mode;/* the head's mode, while head_on */
     struct NvKmsKapiVblankIntrCallback *vblank;
     uint32_t vblank_head;
     uint64_t vblanks;                /* atomic */
     bool vblank_refused;             /* atomic: the system refused one (logged once) */
 
-    bool sync_ready;                 /* lock and wake are initialised */
+    /* Direct scanout. The cursor shows the pointer over an image; its pixels stay mapped. */
+    bool direct;                     /* atomic: the system took the surface with N_SCANOUT_DIRECT */
+    struct NvKmsKapiMemory *cursor_memory;
+    void *cursor_pixels;
+    struct NvKmsKapiSurface *cursor_surface;
+    uint32_t cursor_pitch;
+    bool cursor_on;                  /* the head shows the cursor (head_lock) */
+    bool cursor_drawn;               /* cursor_pixels hold pointer number cursor_serial */
+    uint32_t cursor_serial;
+    int32_t cursor_x, cursor_y;      /* where the head shows it */
+    struct image *images;            /* head_lock */
+    uint32_t last_image;             /* the number given last */
+    struct image *shown;             /* the image the last flip put on the head; NULL the desktop */
+    struct image *leaving;           /* the image shown before it, read until that flip completes */
+
+    bool sync_ready;                 /* lock, wake and head_lock are initialised */
     mtx_t lock;
     cnd_t wake;
     bool rescan, stop;               /* under lock */
     thrd_t thread;
     bool thread_running;
+    mtx_t head_lock;                 /* the head, the images, the KAPI structures below */
+    thrd_t state_thread;
+    bool state_running;
+    bool state_stop;                 /* atomic */
 } scr = { .view = -1 };
 
-/* Large KAPI structures, used by one thread at a time (see the top of the file). */
+/* Large KAPI structures, used under head_lock or by the main thread alone (see the top of the
+   file). */
 static struct NvKmsKapiDynamicDisplayParams dyn;
 static struct NvKmsKapiRequestedModeSetConfig request;
 static struct NvKmsKapiModeSetReplyConfig reply;
+/* What the screen shows (n_pci_screen_state): the state thread's, and PRESENT's (head_lock). */
+static struct n_screen_state state_followed, state_now;
 
 static void mode_text(const struct NvKmsKapiDisplayMode *m, char *out, size_t cap) {
     snprintf(out, cap, "%ux%u at %u.%03u Hz", (unsigned)m->timings.hVisible, (unsigned)m->timings.vVisible,
@@ -339,28 +391,47 @@ static int bar_index_of(uint64_t phys) {
     return -1;
 }
 
+/* Bytes from one row of a pitch-linear surface width pixels wide (32 bits each) to the next. */
+static uint32_t pitch_of(uint32_t width) {
+    uint32_t align = scr.res.caps.pitchAlignment ? scr.res.caps.pitchAlignment : 256;
+    return ((uint32_t)width * 4 + align - 1) / align * align;   /* width <= UINT16_MAX */
+}
+
+/* Pitch-linear video memory the display engine can scan out, whole pages. */
+static struct NvKmsKapiMemory *scanout_memory(uint64_t bytes) {
+    NvU8 compressible = 0;
+    struct NvKmsKapiAllocateMemoryParams params = {
+        .layout = NvKmsSurfaceMemoryLayoutPitch,
+        .type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT,
+        .size = (bytes + PAGE_BYTES - 1) / PAGE_BYTES * PAGE_BYTES,
+        .noDisplayCaching = NV_TRUE,
+        .useVideoMemory = NV_TRUE,
+        .compressible = &compressible,
+    };
+    return kapi.allocateMemory(scr.device, &params);
+}
+
+static struct NvKmsKapiSurface *surface_of(struct NvKmsKapiMemory *memory, uint32_t width, uint32_t height,
+                                           uint32_t pitch, enum NvKmsSurfaceMemoryFormat format) {
+    struct NvKmsKapiCreateSurfaceParams surface = { 0 };
+    surface.planes[0].memory = memory;
+    surface.planes[0].offset = 0;
+    surface.planes[0].pitch = pitch;
+    surface.width = width;
+    surface.height = height;
+    surface.format = format;
+    return kapi.createSurface(scr.device, &surface);
+}
+
 static bool surface_create(void) {
     if (!scr.res.caps.hasVideoMemory) {
         nvrm_log(LOG "the GPU has no video memory for a surface the system can draw into");
         return false;
     }
-    uint64_t align = scr.res.caps.pitchAlignment ? scr.res.caps.pitchAlignment : 256;
-    uint64_t pitch = ((uint64_t)scr.width * 4 + align - 1) / align * align;
-    uint64_t bytes = (pitch * scr.height + PAGE_BYTES - 1) / PAGE_BYTES * PAGE_BYTES;
-    if (pitch > UINT32_MAX) return false;
-    scr.pitch = (uint32_t)pitch;
-    scr.bytes = bytes;
-
-    NvU8 compressible = 0;
-    struct NvKmsKapiAllocateMemoryParams params = {
-        .layout = NvKmsSurfaceMemoryLayoutPitch,
-        .type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT,
-        .size = bytes,
-        .noDisplayCaching = NV_TRUE,
-        .useVideoMemory = NV_TRUE,
-        .compressible = &compressible,
-    };
-    scr.memory = kapi.allocateMemory(scr.device, &params);
+    scr.pitch = pitch_of(scr.width);
+    scr.bytes = ((uint64_t)scr.pitch * scr.height + PAGE_BYTES - 1) / PAGE_BYTES * PAGE_BYTES;
+    uint64_t bytes = scr.bytes;
+    scr.memory = scanout_memory(bytes);
     if (!scr.memory) {
         nvrm_log(LOG "cannot allocate %llu KiB of video memory for the surface", (unsigned long long)(bytes >> 10));
         return false;
@@ -386,14 +457,7 @@ static bool surface_create(void) {
         return false;
     }
 
-    struct NvKmsKapiCreateSurfaceParams surface = { 0 };
-    surface.planes[0].memory = scr.memory;
-    surface.planes[0].offset = 0;
-    surface.planes[0].pitch = scr.pitch;
-    surface.width = scr.width;
-    surface.height = scr.height;
-    surface.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
-    scr.surface = kapi.createSurface(scr.device, &surface);
+    scr.surface = surface_of(scr.memory, scr.width, scr.height, scr.pitch, NvKmsSurfaceMemoryFormatX8R8G8B8);
     if (!scr.surface) {
         nvrm_log(LOG "NVKMS cannot make a %ux%u X8R8G8B8 surface", (unsigned)scr.width, (unsigned)scr.height);
         return false;
@@ -430,12 +494,89 @@ static void copy_boot_screen(void) {
     __asm__ volatile("sfence" ::: "memory");
 }
 
+/* The cursor that shows the pointer over an app's image: N_SCREEN_POINTER_SIZE square,
+   A8R8G8B8 (the system's 0xAARRGGBB pixels as they are), blended without premultiplied alpha.
+   False, with the reason logged, when the display engine has no such cursor. */
+static bool cursor_create(void) {
+    const uint32_t size = N_SCREEN_POINTER_SIZE;
+    const struct NvKmsKapiDeviceResourcesInfo *r = &scr.res;
+    if (!(r->caps.supportedCursorSurfaceMemoryFormats & (1ull << NvKmsSurfaceMemoryFormatA8R8G8B8)) ||
+        r->caps.maxCursorSizeInPixels < size ||
+        !(r->caps.validCursorCompositionModes & (1u << NVKMS_COMPOSITION_BLENDING_MODE_NON_PREMULT_ALPHA)) ||
+        !(r->supportedSurfaceMemoryFormats[NVKMS_KAPI_LAYER_PRIMARY_IDX] & (1ull << NvKmsSurfaceMemoryFormatX8B8G8R8))) {
+        nvrm_log(LOG "the display engine cannot show apps' X8B8G8R8 images with a %ux%u A8R8G8B8 cursor (cursor "
+                 "formats 0x%llx, up to %u pixels, blending 0x%x; primary formats 0x%llx)", (unsigned)size,
+                 (unsigned)size, (unsigned long long)r->caps.supportedCursorSurfaceMemoryFormats,
+                 (unsigned)r->caps.maxCursorSizeInPixels, (unsigned)r->caps.validCursorCompositionModes,
+                 (unsigned long long)r->supportedSurfaceMemoryFormats[NVKMS_KAPI_LAYER_PRIMARY_IDX]);
+        return false;
+    }
+    scr.cursor_pitch = pitch_of(size);
+    if (scr.cursor_pitch < CURSOR_MIN_PITCH) scr.cursor_pitch = CURSOR_MIN_PITCH;
+    scr.cursor_memory = scanout_memory((uint64_t)scr.cursor_pitch * size);
+    if (!scr.cursor_memory) {
+        nvrm_log(LOG "cannot allocate video memory for the cursor");
+        return false;
+    }
+    if (!kapi.mapMemory(scr.device, scr.cursor_memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &scr.cursor_pixels)) {
+        scr.cursor_pixels = NULL;
+        nvrm_log(LOG "RM cannot map the cursor");
+        return false;
+    }
+    scr.cursor_surface = surface_of(scr.cursor_memory, size, size, scr.cursor_pitch, NvKmsSurfaceMemoryFormatA8R8G8B8);
+    if (!scr.cursor_surface) {
+        nvrm_log(LOG "NVKMS cannot make a %ux%u A8R8G8B8 cursor", (unsigned)size, (unsigned)size);
+        return false;
+    }
+    return true;
+}
+
+static void cursor_destroy(void) {
+    if (scr.cursor_surface) kapi.destroySurface(scr.device, scr.cursor_surface);
+    scr.cursor_surface = NULL;
+    if (scr.cursor_pixels) kapi.unmapMemory(scr.device, scr.cursor_memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, scr.cursor_pixels);
+    scr.cursor_pixels = NULL;
+    if (scr.cursor_memory) kapi.freeMemory(scr.device, scr.cursor_memory);
+    scr.cursor_memory = NULL;
+    scr.cursor_drawn = false;
+}
+
 /* ------------------------------------------------------------------------------------------
  * Mode setting
  * ---------------------------------------------------------------------------------------- */
 
-/* Adds head to the request: display shown in mode with the surface on its primary layer
-   (scaled to the mode), its other layers empty; display 0 turns the head off. */
+/* The head's primary layer shows surface (the screen's size) scaled to mode. */
+static void primary_request(struct NvKmsKapiHeadRequestedConfig *h, struct NvKmsKapiSurface *surface,
+                            const struct NvKmsKapiDisplayMode *mode) {
+    struct NvKmsKapiLayerRequestedConfig *primary = &h->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
+    struct NvKmsKapiLayerConfig *c = &primary->config;
+    c->surface = surface;
+    c->compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE;
+    c->minPresentInterval = 1;
+    c->tearing = NV_FALSE;
+    c->srcX = c->srcY = 0;
+    c->srcWidth = (NvU16)scr.width;
+    c->srcHeight = (NvU16)scr.height;
+    c->dstX = c->dstY = 0;
+    c->dstWidth = (NvU16)mode->timings.hVisible;
+    c->dstHeight = (NvU16)mode->timings.vVisible;
+    c->inputColorSpace = NVKMS_INPUT_COLOR_SPACE_NONE;
+    primary->flags.surfaceChanged = NV_TRUE;
+}
+
+/* The head's display and mode as they are, for a flip (KAPI flips only an active head). */
+static void active_request(struct NvKmsKapiHeadRequestedConfig *h, NvKmsKapiDisplay display,
+                           const struct NvKmsKapiDisplayMode *mode) {
+    h->modeSetConfig.bActive = NV_TRUE;
+    h->modeSetConfig.numDisplays = 1;
+    h->modeSetConfig.displays[0] = display;
+    h->modeSetConfig.mode = *mode;
+    h->modeSetConfig.colorimetry = NVKMS_OUTPUT_COLORIMETRY_DEFAULT;
+}
+
+/* Adds head to the request: display shown in mode with the desktop's surface on its primary
+   layer (scaled to the mode), its other layers and the cursor empty; display 0 turns the head
+   off. */
 static void head_request(uint32_t head, NvKmsKapiDisplay display, const struct NvKmsKapiDisplayMode *mode) {
     struct NvKmsKapiHeadRequestedConfig *h = &request.headRequestedConfig[head];
     uint32_t layers = scr.res.numLayers[head] < NVKMS_KAPI_LAYER_MAX ? scr.res.numLayers[head] : NVKMS_KAPI_LAYER_MAX;
@@ -450,26 +591,9 @@ static void head_request(uint32_t head, NvKmsKapiDisplay display, const struct N
     }
     if (!display) return;
 
-    h->modeSetConfig.bActive = NV_TRUE;
-    h->modeSetConfig.numDisplays = 1;
-    h->modeSetConfig.displays[0] = display;
-    h->modeSetConfig.mode = *mode;
-    h->modeSetConfig.colorimetry = NVKMS_OUTPUT_COLORIMETRY_DEFAULT;
-
+    active_request(h, display, mode);
+    primary_request(h, scr.surface, mode);
     struct NvKmsKapiLayerRequestedConfig *primary = &h->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
-    struct NvKmsKapiLayerConfig *c = &primary->config;
-    c->surface = scr.surface;
-    c->compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE;
-    c->minPresentInterval = 1;
-    c->tearing = NV_FALSE;
-    c->srcX = c->srcY = 0;
-    c->srcWidth = (NvU16)scr.width;
-    c->srcHeight = (NvU16)scr.height;
-    c->dstX = c->dstY = 0;
-    c->dstWidth = (NvU16)mode->timings.hVisible;
-    c->dstHeight = (NvU16)mode->timings.vVisible;
-    c->inputColorSpace = NVKMS_INPUT_COLOR_SPACE_NONE;
-    primary->flags.surfaceChanged = NV_TRUE;
     primary->flags.srcXYChanged = NV_TRUE;
     primary->flags.srcWHChanged = NV_TRUE;
     primary->flags.dstXYChanged = NV_TRUE;
@@ -509,8 +633,8 @@ static bool flip_completed(uint32_t head) {
     }
 }
 
-/* display shows the surface in mode on head; the head nvrm used before is turned off when it
-   is another one. */
+/* display shows the desktop's surface in mode on head, without the cursor; the head nvrm used
+   before is turned off when it is another one. */
 static bool show_on(NvKmsKapiDisplay display, uint32_t head, const struct NvKmsKapiDisplayMode *mode) {
     memset(&request, 0, sizeof request);
     if (scr.head_on && scr.head != head) head_request(scr.head, 0, NULL);
@@ -519,7 +643,13 @@ static bool show_on(NvKmsKapiDisplay display, uint32_t head, const struct NvKmsK
     scr.head_on = true;
     scr.head = head;
     scr.display = display;
-    return flip_completed(head);
+    scr.mode = *mode;
+    scr.leaving = scr.shown;
+    scr.shown = NULL;
+    scr.cursor_on = false;
+    if (!flip_completed(head)) return false;
+    scr.leaving = NULL;
+    return true;
 }
 
 static bool head_off(void) {
@@ -528,7 +658,101 @@ static bool head_off(void) {
     head_request(scr.head, 0, NULL);
     if (!apply("turning the head off")) return false;
     scr.head_on = false;
+    scr.shown = scr.leaving = NULL;
+    scr.cursor_on = false;
     return true;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Flips: an app's image or the desktop's surface on the lit head, and the cursor over an image
+ * (head_lock)
+ * ---------------------------------------------------------------------------------------- */
+
+/* The last flip has completed: what it took off the head is no longer read. */
+static bool settle(void) {
+    if (scr.head_on && !flip_completed(scr.head)) return false;
+    scr.leaving = NULL;
+    return true;
+}
+
+/* Where the cursor's top left goes for the pointer of st, in the mode's pixels (the screen is
+   scaled to the mode). */
+static void cursor_place(const struct n_screen_state *st, int32_t *x, int32_t *y) {
+    int64_t px = ((int64_t)st->pointer_x - st->hot_x) * scr.mode.timings.hVisible / scr.width;
+    int64_t py = ((int64_t)st->pointer_y - st->hot_y) * scr.mode.timings.vVisible / scr.height;
+    *x = (int32_t)(px < INT16_MIN ? INT16_MIN : px > INT16_MAX ? INT16_MAX : px);
+    *y = (int32_t)(py < INT16_MIN ? INT16_MIN : py > INT16_MAX ? INT16_MAX : py);
+}
+
+/* The head shows image (NULL: the desktop's surface) from its next vertical blank, with the
+   pointer of st drawn by the cursor over an image; the desktop's surface has the pointer in it.
+   Waits for the flip before to complete first, not for this one. A flip, not a mode set: NVKMS
+   checks it as it commits it. */
+static bool show(struct image *image, const struct n_screen_state *st) {
+    if (!scr.head_on || !settle()) return false;
+    bool cursor = image && st && st->pointer_shown;
+    int32_t x = 0, y = 0;
+    if (cursor) cursor_place(st, &x, &y);
+    bool surface_changed = image != scr.shown;
+    bool cursor_changed = cursor != scr.cursor_on;
+    bool moved = cursor && (cursor_changed || x != scr.cursor_x || y != scr.cursor_y);
+    if (cursor && !(scr.cursor_drawn && scr.cursor_serial == st->pointer_serial)) {
+        for (uint32_t row = 0; row < N_SCREEN_POINTER_SIZE; row++)
+            memcpy((uint8_t *)scr.cursor_pixels + (uint64_t)row * scr.cursor_pitch,
+                   st->pointer + row * N_SCREEN_POINTER_SIZE, N_SCREEN_POINTER_SIZE * 4);
+        __asm__ volatile("sfence" ::: "memory");
+        scr.cursor_drawn = true;
+        scr.cursor_serial = st->pointer_serial;
+    }
+    if (!surface_changed && !cursor_changed && !moved) return true;
+
+    memset(&request, 0, sizeof request);
+    request.headsMask = 1u << scr.head;
+    struct NvKmsKapiHeadRequestedConfig *h = &request.headRequestedConfig[scr.head];
+    active_request(h, scr.display, &scr.mode);
+    if (surface_changed) primary_request(h, image ? image->surface : scr.surface, &scr.mode);
+    struct NvKmsKapiCursorRequestedConfig *c = &h->cursorRequestedConfig;
+    if (cursor_changed) {
+        c->surface = cursor ? scr.cursor_surface : NULL;
+        c->compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_NON_PREMULT_ALPHA;
+        c->compParams.surfaceAlpha = 0xff;
+        c->flags.surfaceChanged = NV_TRUE;
+    }
+    if (moved) {
+        c->dstX = (NvS16)x;
+        c->dstY = (NvS16)y;
+        c->flags.dstXYChanged = NV_TRUE;
+    }
+    memset(&reply, 0, sizeof reply);
+    if (!kapi.applyModeSetConfig(scr.device, &request, &reply, NV_TRUE) ||
+        reply.flipResult != NV_KMS_FLIP_RESULT_SUCCESS) {
+        nvrm_log(LOG "the flip to %s on head %u failed (flip result %d)", image ? "an app's image" : "the desktop",
+                 (unsigned)scr.head, (int)reply.flipResult);
+        return false;
+    }
+    if (surface_changed) {
+        if (!scr.shown) nvrm_log(LOG "app %u's images are shown directly", (unsigned)image->app);
+        else if (!image) nvrm_log(LOG "the desktop is shown again");
+        scr.leaving = scr.shown;
+        scr.shown = image;
+    }
+    scr.cursor_on = cursor;
+    if (moved) {
+        scr.cursor_x = x;
+        scr.cursor_y = y;
+    }
+    return true;
+}
+
+/* image is no longer read by the display engine: the desktop is shown instead of it, and the
+   flip away from it has completed. */
+static void take_off(struct image *image) {
+    if (image == scr.shown && !show(NULL, NULL))
+        nvrm_log(LOG "image %u is still shown; NVKMS takes it off the head as it is freed", (unsigned)image->number);
+    if (image == scr.leaving) settle();
+    /* Whether or not that worked, the image is gone for nvrm. */
+    if (image == scr.shown) scr.shown = NULL;
+    if (image == scr.leaving) scr.leaving = NULL;
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -569,7 +793,8 @@ static void kapi_event(const struct NvKmsKapiEvent *event) {
     mtx_unlock(&scr.lock);
 }
 
-/* The surface stays the system's throughout; only what shows it changes. */
+/* The surface stays the system's throughout; only what shows it changes. A display lit again
+   shows the desktop until the app shown directly presents its next image. Under head_lock. */
 static void rescan(void) {
     if (scr.display) {
         memset(&dyn, 0, sizeof dyn);
@@ -605,11 +830,179 @@ static int display_thread(void *unused) {
         }
         scr.rescan = false;
         mtx_unlock(&scr.lock);
+        mtx_lock(&scr.head_lock);
         rescan();
+        mtx_unlock(&scr.head_lock);
         mtx_lock(&scr.lock);
     }
     mtx_unlock(&scr.lock);
     return 0;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Direct scanout: what the system lets the screen show (the state thread) and apps' images
+ * (nvrm's client threads)
+ * ---------------------------------------------------------------------------------------- */
+
+/* The screen's state changed: an image of an app the system no longer shows directly goes, the
+   cursor follows the pointer over one that stays. Under head_lock. */
+static void follow(const struct n_screen_state *st) {
+    if (!scr.shown) return;
+    if (st->app != scr.shown->app) show(NULL, NULL);
+    else show(scr.shown, st);
+}
+
+static int state_thread(void *unused) {
+    (void)unused;
+    uint64_t seen = 0;
+    bool refused = false;
+    while (!__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) {
+        n_result r = n_pci_screen_state(nvrm_dev.pci, seen, &state_followed, STATE_WAIT_MS);
+        if (r == -N_ERR_TIMEOUT) continue;
+        if (r < 0) {
+            /* Not while nvrm's surface is given with N_SCANOUT_DIRECT; looked at again later. */
+            if (!refused) nvrm_log(LOG "the system does not say what the screen shows: %s", n_result_text(r));
+            refused = true;
+            n_sleep_ms(STATE_WAIT_MS);
+            continue;
+        }
+        refused = false;
+        seen = state_followed.serial;
+        mtx_lock(&scr.head_lock);
+        follow(&state_followed);
+        mtx_unlock(&scr.head_lock);
+    }
+    return 0;
+}
+
+static struct image *image_find(uint32_t number) {
+    for (struct image *i = scr.images; i; i = i->next)
+        if (i->number == number) return i;
+    return NULL;
+}
+
+/* Off the screen, out of the list and freed. Under head_lock. */
+static void image_free(struct image *image) {
+    take_off(image);
+    for (struct image **at = &scr.images; *at; at = &(*at)->next)
+        if (*at == image) {
+            *at = image->next;
+            break;
+        }
+    if (image->surface) kapi.destroySurface(scr.device, image->surface);
+    if (image->memory) kapi.freeMemory(scr.device, image->memory);
+    free(image);
+}
+
+static uint32_t image_create(uint32_t app, const void *connection, struct nvrm_scanout_request *r) {
+    struct image *image = calloc(1, sizeof *image);
+    if (!image) return NV_ERR_NO_MEMORY;
+    image->memory = scanout_memory(scr.bytes);
+    if (image->memory)
+        image->surface = surface_of(image->memory, scr.width, scr.height, scr.pitch, NvKmsSurfaceMemoryFormatX8B8G8R8);
+    /* Video memory comes as the last owner left it: black before the app may read it. */
+    void *pixels = NULL;
+    if (image->surface && kapi.mapMemory(scr.device, image->memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &pixels)) {
+        memset(pixels, 0, (size_t)scr.bytes);
+        __asm__ volatile("sfence" ::: "memory");
+        kapi.unmapMemory(scr.device, image->memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, pixels);
+    } else {
+        nvrm_log(LOG "cannot make a %ux%u image for app %u", (unsigned)scr.width, (unsigned)scr.height, (unsigned)app);
+        if (image->surface) kapi.destroySurface(scr.device, image->surface);
+        if (image->memory) kapi.freeMemory(scr.device, image->memory);
+        free(image);
+        return NV_ERR_NO_MEMORY;
+    }
+    do image->number = ++scr.last_image;
+    while (!image->number || image_find(image->number));
+    image->app = app;
+    image->connection = connection;
+    image->next = scr.images;
+    scr.images = image;
+    r->image = image->number;
+    r->width = scr.width;
+    r->height = scr.height;
+    r->pitch = scr.pitch;
+    r->bytes = scr.bytes;
+    return NV_OK;
+}
+
+static uint32_t image_present(uint32_t app, struct image *image) {
+    /* The latest state, not the one the state thread follows: that one may be older. */
+    n_result r = n_pci_screen_state(nvrm_dev.pci, 0, &state_now, 0);
+    if (r < 0 || state_now.app != app || !scr.head_on) return NV_ERR_INVALID_STATE;
+    return show(image, &state_now) ? NV_OK : NV_ERR_INVALID_STATE;
+}
+
+/* The image as memory of the app's RM client: NVKMS's RM client shares it with that client
+   alone (RS_SHARE_TYPE_CLIENT) while the app's own RM file duplicates it, so RM checks the
+   duplicate as it checks the app's other requests (the client must be the file's), and the
+   share is revoked again at once. */
+static uint32_t image_import(void *file, struct image *image, struct nvrm_scanout_request *r) {
+    uint32_t nvkms_client = 0, memory = 0;
+    if (!nvrm_nvkms_memory_handle(scr.device, image->memory, &nvkms_client, &memory)) return NV_ERR_INVALID_STATE;
+    nvidia_kernel_rmapi_ops_t share = { .op = NV04_SHARE };
+    share.params.share.hClient = nvkms_client;
+    share.params.share.hObject = memory;
+    share.params.share.sharePolicy.target = r->client;
+    share.params.share.sharePolicy.type = RS_SHARE_TYPE_CLIENT;
+    share.params.share.sharePolicy.action = RS_SHARE_ACTION_FLAG_COMPOSE;
+    RS_ACCESS_MASK_ADD(&share.params.share.sharePolicy.accessMask, RS_ACCESS_DUP_OBJECT);
+    rm_kernel_rmapi_op(nvrm_dev.sp, &share);
+    if (share.params.share.status != NV_OK) return share.params.share.status;
+
+    NVOS55_PARAMETERS dup = { .hClient = r->client, .hParent = r->parent, .hObject = r->object,
+                              .hClientSrc = nvkms_client, .hObjectSrc = memory };
+    uint32_t st = nvrm_rm_ioctl(file, NV_ESC_RM_DUP_OBJECT, &dup, sizeof dup);
+    if (st == NV_OK) st = dup.status;
+
+    share.params.share.sharePolicy.action = RS_SHARE_ACTION_FLAG_REVOKE | RS_SHARE_ACTION_FLAG_COMPOSE;
+    share.params.share.status = NV_OK;
+    rm_kernel_rmapi_op(nvrm_dev.sp, &share);
+    if (share.params.share.status != NV_OK)
+        nvrm_log(LOG "RM keeps image %u shared with client 0x%x: 0x%x", (unsigned)image->number, (unsigned)r->client,
+                 (unsigned)share.params.share.status);
+    if (st == NV_OK) r->object = dup.hObject;
+    return st;
+}
+
+n_result nvrm_display_scanout(void *file, uint32_t principal, void *args, uint32_t size) {
+    if (size != sizeof(struct nvrm_scanout_request)) return -N_ERR_INVALID;
+    struct nvrm_scanout_request *r = args;
+    /* Requests come only between start and stop; without direct scanout head_lock may not exist. */
+    if (!__atomic_load_n(&scr.direct, __ATOMIC_ACQUIRE)) {
+        r->status = NV_ERR_NOT_SUPPORTED;
+        return 0;
+    }
+    if (r->op < NVRM_SCANOUT_CREATE || r->op > NVRM_SCANOUT_IMPORT) {
+        r->status = NV_ERR_INVALID_ARGUMENT;
+        return 0;
+    }
+    mtx_lock(&scr.head_lock);
+    struct image *image = r->op == NVRM_SCANOUT_CREATE ? NULL : image_find(r->image);
+    if (r->op != NVRM_SCANOUT_CREATE && (!image || image->app != principal))
+        r->status = NV_ERR_INVALID_OBJECT_HANDLE; /* another app's image is not told apart from none */
+    else if (r->op == NVRM_SCANOUT_CREATE)
+        r->status = image_create(principal, file, r);
+    else if (r->op == NVRM_SCANOUT_DESTROY) {
+        image_free(image);
+        r->status = NV_OK;
+    } else if (r->op == NVRM_SCANOUT_PRESENT)
+        r->status = image_present(principal, image);
+    else
+        r->status = image_import(file, image, r);
+    mtx_unlock(&scr.head_lock);
+    return 0;
+}
+
+void nvrm_display_connection_end(void *file) {
+    if (!__atomic_load_n(&scr.direct, __ATOMIC_ACQUIRE)) return;
+    mtx_lock(&scr.head_lock);
+    for (struct image *i = scr.images, *next; i; i = next) {
+        next = i->next;
+        if (i->connection == file) image_free(i);
+    }
+    mtx_unlock(&scr.head_lock);
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -639,6 +1032,11 @@ bool nvrm_display_start(void) {
     }
     if (mtx_init(&scr.lock, mtx_plain) != thrd_success) return false;
     if (cnd_init(&scr.wake) != thrd_success) {
+        mtx_destroy(&scr.lock);
+        return false;
+    }
+    if (mtx_init(&scr.head_lock, mtx_plain) != thrd_success) {
+        cnd_destroy(&scr.wake);
         mtx_destroy(&scr.lock);
         return false;
     }
@@ -683,26 +1081,51 @@ bool nvrm_display_start(void) {
     copy_boot_screen();
     if (!show_on(display, head, &mode)) { why = "the mode set did not complete"; goto fail; }
 
+    /* Direct scanout needs the cursor, for the pointer over an app's image. */
+    bool direct = cursor_create();
+    if (!direct) cursor_destroy();
     struct n_scanout desc = {
         .width = scr.width,
         .height = scr.height,
         .pitch = scr.pitch,
-        .format = N_SCANOUT_XRGB8888,
+        .format = N_SCANOUT_XRGB8888 | (direct ? N_SCANOUT_DIRECT : 0),
         .offset = scr.view_offset,
     };
     given = n_pci_give_screen(nvrm_dev.pci, scr.view, &desc);
+    if (given < 0 && direct) {
+        nvrm_log(LOG "the system does not let nvrm show windows directly (%s); it composites them",
+                 n_result_text(given));
+        direct = false;
+        cursor_destroy();
+        desc.format = N_SCANOUT_XRGB8888;
+        given = n_pci_give_screen(nvrm_dev.pci, scr.view, &desc);
+    }
     if (given < 0) {
         nvrm_log(LOG "the system does not take the surface: %s", n_result_text(given));
         why = "the system keeps drawing into the boot screen";
         goto fail;
     }
     __atomic_store_n(&scr.given, true, __ATOMIC_RELEASE);
+    if (direct) {
+        __atomic_store_n(&scr.state_stop, false, __ATOMIC_RELEASE);
+        if (thrd_create(&scr.state_thread, state_thread, NULL) == thrd_success) {
+            scr.state_running = true;
+            __atomic_store_n(&scr.direct, true, __ATOMIC_RELEASE);
+        } else {
+            nvrm_log(LOG "cannot start the state thread; windows are not shown directly");
+            direct = false;
+            desc.format = N_SCANOUT_XRGB8888;
+            n_result r = n_pci_give_screen(nvrm_dev.pci, scr.view, &desc);
+            if (r < 0) nvrm_log(LOG "the system does not take the surface without direct scanout: %s", n_result_text(r));
+            cursor_destroy();
+        }
+    }
     vblank_on(head);
 
     if (thrd_create(&scr.thread, display_thread, NULL) == thrd_success) scr.thread_running = true;
     else nvrm_log(LOG "cannot start the display thread; displays coming and going are not followed");
-    nvrm_log(LOG "the desktop is drawn into nvrm's surface, shown on display 0x%08x (head %u)", (unsigned)display,
-             (unsigned)head);
+    nvrm_log(LOG "the desktop is drawn into nvrm's surface, shown on display 0x%08x (head %u)%s", (unsigned)display,
+             (unsigned)head, direct ? "; apps' fullscreen windows can be shown directly" : "");
     return true;
 
 fail:
@@ -712,6 +1135,12 @@ fail:
 }
 
 void nvrm_display_stop(void) {
+    __atomic_store_n(&scr.direct, false, __ATOMIC_RELEASE);
+    if (scr.state_running) {
+        __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
+        thrd_join(scr.state_thread, NULL); /* within STATE_WAIT_MS */
+        scr.state_running = false;
+    }
     if (scr.thread_running) {
         mtx_lock(&scr.lock);
         scr.stop = true;
@@ -737,6 +1166,10 @@ void nvrm_display_stop(void) {
     }
     scr.head_on = false;
     scr.display = 0;
+    scr.shown = scr.leaving = NULL;  /* nothing of nvrm's is shown any more */
+    scr.cursor_on = false;
+    while (scr.images) image_free(scr.images);
+    cursor_destroy();
     if (scr.surface) kapi.destroySurface(scr.device, scr.surface);
     scr.surface = NULL;
     if (scr.pixels) kapi.unmapMemory(scr.device, scr.memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, scr.pixels);
@@ -748,6 +1181,7 @@ void nvrm_display_stop(void) {
     if (scr.device) kapi.freeDevice(scr.device);
     scr.device = NULL;
     if (scr.sync_ready) {
+        mtx_destroy(&scr.head_lock);
         cnd_destroy(&scr.wake);
         mtx_destroy(&scr.lock);
         scr.sync_ready = false;

@@ -458,6 +458,20 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     デスクトップは自分の周期ではなく帰線ごとに 1 枚を描き始める。100 ms 届かなければ周期へ
     戻る。どちらで刻んでいるかは `wm:` の行が言う。軽い呼出し：描く絵が帰線を待っているとき
     だけ合成スレッドを起こす。画面がこの claim の面でなければ `N_ERR_DENIED`。
+  - 直接表示：`n_pci_give_screen` の `format` に `N_SCANOUT_DIRECT` を足したドライバーは、
+    全画面の窓の絵を合成を通さずに自分で映せる（デスクトップの合成はこれまでどおり渡した面へ
+    続く。ドライバーは映す面を切り替えるだけ）。窓は `win_direct(win, true)` で望み、
+    全画面・表示中・入力を持つ窓で、メニュー・音量・通知・大きさ変更の枠・遠隔の利用者が
+    無い間だけ許される。許可の出入りは窓へ `EV_DIRECT`（key 1 許可、0 取消し）、今の状態は
+    `win_state` の `WIN_STATE_DIRECT`。取り消された窓へは描き直しの損傷も送るので、
+    窓は自分の通常の面へ描き直す。
+  - `n_pci_screen_state(pci, seen, out, timeout_ms)`：直接表示を受け持つドライバーが、
+    許可された窓（`struct n_screen_state` の `app`。無ければ 0）と、その間ドライバーが
+    描くポインター（位置・表示の有無・32×32 の ARGB 画像とその要点、画像が変わると
+    `pointer_serial` が進む）を読む。`serial` が `seen` と同じ間は `timeout_ms` まで待つ
+    （0 は待たない。`N_ERR_TIMEOUT` でも今の状態を書く）。画面がこの claim の面でない、
+    または `N_SCANOUT_DIRECT` で渡していなければ `N_ERR_DENIED`。claim の終わりと起動時の
+    画面への返却で直接表示は終わり、許可も取り消す。
   - `n_pci_acpi_eval(pci, node, name, args, nargs, data, data_size, out, out_size)`：claim した
     機能に属する ACPI の名前を一つ評価する（カーネルの AML 解釈器で）。`node` は
     `N_ACPI_SELF`（その機能の装置：ホストブリッジの `_SEG`／`_BBN` から `_ADR` をたどる）、
@@ -735,6 +749,7 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 | 11 | POINTER | `pointer` 付きの上で：a、b＝その中の位置。flags に `UI_DOWN`（4）か `UI_UP`（8）（どちらも無ければ移動）、押しているボタンは `(flags >> 8) & 0xFF`（1 左、2 右、4 中）。押した後は全部離すまでその部品が受け取り、外へ出ると外の位置で移動を一つ送る |
 | 12 | WHEEL | `pointer` 付きの上で：a＝刻み数（手前が正） |
 | 13 | FOCUS | 入力欄がキーボードを得た（a＝1）／失った（a＝0。Escape で手放した時は flags に `UI_CANCEL`（16））。場所が窓（0xFFFFFFFF）なら窓のこと |
+| 14 | DIRECT | 場所は窓（0xFFFFFFFF）。`win_direct` を望んだ窓の直接表示が始まった（a＝1）／終わった（a＝0）（`EV_DIRECT`）。終わるとエンジンは窓を全体から描き直す |
 
 入力欄はカーソルと選択範囲をエンジン側で持つ（←→、Home／End、Shift で選択、Ctrl で単語
 単位、Ctrl+A／C／X／V、クリックとドラッグ）。入力欄が使わないキーは KEY としてアプリへ

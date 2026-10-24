@@ -25,6 +25,13 @@ void wm_repaint(void); /* the screen lost what was on it (after sleep): draw all
    start at them instead of after the configured period. Cheap: it wakes the compositor only when
    a frame waits for the blank. */
 void wm_vblank(uint64_t count, uint64_t timestamp_ns);
+/* Direct scanout (dev/pciuser.c): whether the display driver whose scanout the screen is drawn
+   into can show a window's own images (N_SCANOUT_DIRECT), and what it should show: waits up to
+   timeout_ms (-1: no limit) while the state is still numbered seen, then copies it to *out (kernel
+   memory). N_ERR_TIMEOUT with *out the unchanged state; N_ERR_STOPPED when the caller is stopped. */
+struct n_screen_state;
+void wm_screen_direct(bool able);
+int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
 
 /* Remote display: rectangle copies hold WM ownership only for the copy, never
    while encoding or sending a network packet. */

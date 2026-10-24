@@ -27,8 +27,8 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 | `spdm_crypto.c` | libspdm の暗号バックエンド 71 個（libspdm_*.c の移植）。BearSSL で SHA-2、HMAC、HKDF、AES-GCM、ECDH／ECDSA（P-256／P-384）、RSA-PSS、X.509 の検証、乱数は `n_random` |
 | `nvrm.c` | `main`、割り込みスレッド、起動手順 |
 | `nvrm_serve.c／.h`、`libnvrm.c`、`include/` | リクエストサーバー、クライアント側ライブラリー、通信規約 |
-| `nvkms.mk`、`nvkms_os.c／.h` | NVIDIA の画面設定ドライバー NVKMS（nvidia-modeset）を nvrm に入れるビルド規則、その OS 層と RM との接続（下の「NVKMS」） |
-| `display.c／.h` | nvrm が画面を持つ：KAPI の唯一のクライアントとしてモニターの接続を張り直し、カーネルの画面を走査面へ移す（下の「画面」） |
+| `nvkms.mk`、`nvkms_os.c／.h`、`nvkms_kapi_rm.c` | NVIDIA の画面設定ドライバー NVKMS（nvidia-modeset）を nvrm に入れるビルド規則、その OS 層と RM との接続、KAPI の memory の RM ハンドル（下の「NVKMS」「直接表示」） |
+| `display.c／.h` | nvrm が画面を持つ：KAPI の唯一のクライアントとしてモニターの接続を張り直し、カーネルの画面を走査面へ移す。全画面のアプリの絵の直接表示（下の「画面」） |
 
 起動手順（`nvrm.c`）：init が `N_KIND_PCI` をハンドル 3 で渡す → `n_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
 `NVRM_REGISTRY_DWORDS`（環境変数、任意）を `rm_parse_option_string` へ → `rm_init_rm` → `rm_is_supported_device`
@@ -297,9 +297,13 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
 6. 面：pitch を NVKMS の pitch の整列に揃えた pitch linear の X8R8G8B8 を、`allocateMemory`（vidmem、SCANOUT、
    noDisplayCaching）で取り、`mapMemory`（KERNEL）→ `createSurface`。
 7. GOP の画面を面へ行ごとに写す（読めなければ黒）。
-8. `applyModeSetConfig`（commit=FALSE で検査 → TRUE で確定）→ `getFlipPendingStatus` で最大 3 秒フリップの完了を待つ →
-   `n_pci_give_screen(view, {幅, 高さ, pitch, XRGB8888, offset})`。
-9. `registerVblankIntrCallback` → 抜き差しを追う作業スレッドを起動する。
+8. `applyModeSetConfig`（commit=FALSE で検査 → TRUE で確定）→ `getFlipPendingStatus` で最大 3 秒フリップの完了を待つ。
+9. カーソル：表示エンジンが 32×32 の A8R8G8B8（非 premultiplied のアルファ）のカーソルと、主層の X8B8G8R8 を扱えれば、
+   pitch linear の vidmem（pitch は NVKMS の 32×32 の最小の 256）を取り、写して `createSurface` する。直接表示（下）で
+   アプリの絵の上にポインターを出すのに使う。
+10. `n_pci_give_screen(view, {幅, 高さ, pitch, XRGB8888 | N_SCANOUT_DIRECT, offset})`。カーソルが作れないか、システムが
+   `N_SCANOUT_DIRECT` を断れば、カーソルを解放して `N_SCANOUT_DIRECT` 無しで渡し直す（直接表示は無し、合成のみ）。
+11. 直接表示ありなら画面の状態を追う状態スレッドを起動 → `registerVblankIntrCallback` → 抜き差しを追う作業スレッドを起動する。
 
 BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の一部を写したもの。`os_pci.c` が写像ごとに bus 番地を
 覚えておき、`nvrm_kernel_mapping_phys()`（`os_pci.c` の末尾）が写像の番地から bus 番地を返す。面の先頭と末尾がともに同じ写像の
@@ -315,16 +319,46 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 
 ### 後始末（`nvrm_display_stop`）
 
-作業スレッドを止める → `n_pci_give_screen(N_SCANOUT_BOOT)`（カーネルは GOP の面へ戻る）→ vblank を外す →
-view を閉じる → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で起動画面を復元する。コンソールの面が無いか
-復元に失敗したときは RM 側の復元に任せる）→ `destroySurface` → `unmapMemory` → `freeMemory` →
-`declareEventInterest(0)` → `freeDevice`。その後 `nvrm.c` が `nvrm_nvkms_stop()` を呼ぶ。
+直接表示の要求を止め、状態スレッドと作業スレッドを止める → `n_pci_give_screen(N_SCANOUT_BOOT)`（カーネルは GOP の面へ
+戻る）→ vblank を外す → view を閉じる → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で起動画面を復元する。
+コンソールの面が無いか復元に失敗したときは RM 側の復元に任せる）→ 残っているアプリの絵とカーソルを解放 →
+面の `destroySurface` → `unmapMemory` → `freeMemory` → `declareEventInterest(0)` → `freeDevice`。その後 `nvrm.c` が
+`nvrm_nvkms_stop()` を呼ぶ。
 
 上流の nvidia-drm は fbdev を使うとき `framebufferConsoleDisabled` を呼んで起動コンソールを捨てる。nvrm は終了時に起動画面へ
 戻すので呼ばない。
 
+### 直接表示（`NVRM_SCANOUT`）
+
+システムがアプリの全画面の窓を合成せずに出してよいと言う間（`N_SCANOUT_DIRECT` 付きで渡した画面の状態
+`n_pci_screen_state` の `app`）、そのアプリが GPU で描いた絵を head の主層へそのまま出す。規約は `nvrm_protocol.h` の
+`NVRM_SCANOUT`、クライアント側は libnvrm の `nvrm_scanout_create`／`_destroy`／`_present`／`_import`。サーバーは
+`nvrm_serve.c` が接続の RM ファイルと認証済みの principal を付けて `display.c` の `nvrm_display_scanout` へ渡す。
+
+- **CREATE**：画面の大きさ・pitch の X8B8G8R8（pitch linear、vidmem、SCANOUT）を KAPI で取り、`createSurface`。他のアプリが
+  使った VRAM の中身が見えないよう、黒で埋めてから返す。番号・幅・高さ・pitch・バイト数を返す。絵は接続とアプリのもの。
+- **IMPORT**：絵の memory をアプリの RM client のものにする。Nocturne には Linux の `exportMemory` の fd が無いので、NVKMS の
+  RM client（`nvkms_kapi_rm.c` の `nvrm_nvkms_memory_handle` で KAPI の構造から読む）が、カーネル権限の `NV04_SHARE` で
+  その memory を要求者が名指した client だけに DUP_OBJECT で共有し（RS_SHARE_TYPE_CLIENT）、アプリの**自分の** RM ファイルで
+  `NV_ESC_RM_DUP_OBJECT` を行い、共有はすぐ取り消す。DUP は利用者権限のファイルの要求なので、RM が他の要求と同じく
+  client がそのファイルのものかを確かめる（`rmclientValidate`）。
+- **PRESENT**：最新の画面の状態を読み、そのアプリが直接表示されていなければ `NV_ERR_INVALID_STATE`。前のフリップの完了を
+  待ってから、head の表示・モードはそのままで主層の面を替えるフリップ（commit のみの `applyModeSetConfig`）をする。待つのは
+  一つ前のフリップだけで、GPU の描画の完了は待たない（アプリが描画を待ってから PRESENT する）。
+- **カーソル**：絵を出している間は、システムのポインター（状態の 32×32 の画素、位置、hot spot）をカーソルの面へ写し、
+  モードの画素に直した位置でカーソル層に出す。デスクトップの面にはポインターが描かれているのでカーソルは消す。
+- **状態スレッド**：`n_pci_screen_state` で変化を待ち、出しているアプリがもう直接表示されないならデスクトップの面へ戻し、
+  そのままならカーソルを動かす。
+- **DESTROY**・接続の終わり・stop：出ている絵はデスクトップへ戻すフリップの完了を、一つ前に出ていた絵はそのフリップの完了を
+  待ってから `destroySurface`／`freeMemory` する。他のアプリの絵は「無い」と同じ `NV_ERR_INVALID_OBJECT_HANDLE`。
+- 抜き差しのモード設定はデスクトップの面を出す。head が無ければ PRESENT は断る。
+- 排他：head を変えるもの（作業スレッド、状態スレッド、要求のスレッド）は `scr.head_lock` で順に行う。
+
 試験：`python tests/nvrm_display_hosttest.py`（偽の KAPI・RM・ハンドルで、立ち上げと後始末の順序、モードの選択、失敗時に
-画面を渡さないこと、抜き差しを確かめる。製品の `display.c` を対象の設定でも構文検査する）。
+画面を渡さないこと、抜き差し、直接表示（作成、許可の有無と PRESENT、一つ前のフリップ待ち、カーソル、デスクトップへの戻り、
+DESTROY・接続の終わり・stop の順序、IMPORT の持ち主と共有→DUP→取消、直接表示が無いとき）を確かめる。製品の `display.c` を
+対象の設定でも構文検査する）。`tests/nvrm_servetest.c` は `NVRM_SCANOUT` が接続の RM ファイルと principal 付きで届くことと、
+接続の絵が RM ファイルより先に終わることを確かめる（Nocturne 上で動く）。
 
 ### nvidia-drm の全 43 ファイルとの対応
 
@@ -334,24 +368,24 @@ view を閉じる → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で�
 |---|---|---|---|
 | `nvidia-drm-linux.c` | モジュールの入口と出口 | `nvrm.c` の bring_up／tear_down | 済 |
 | `nvidia-drm.c／.h` | KAPI の関数表を得て装置を探す | `display.c` の `nvrm_display_start`（`nvKmsKapiGetFunctionsTable`） | 済 |
-| `nvidia-drm-drv.c／.h` | 装置の確保、所有、イベント、DRM の登録と ioctl | 確保・所有・イベント・解放は `display.c`。DRM の装置ノードと ioctl は無し（gem／prime／fence の ioctl は次） | 一部 |
+| `nvidia-drm-drv.c／.h` | 装置の確保、所有、イベント、DRM の登録と ioctl | 確保・所有・イベント・解放は `display.c`。DRM の装置ノードは無く、要求は nvrm の `NVRM_SCANOUT`（fence は次） | 一部 |
 | `nvidia-drm-priv.h` | 装置ごとの状態 | `display.c` の `scr` | 済 |
 | `nvidia-drm-connector.c／.h` | 接続の検出、モードの列挙と検査、EDID | `choose_display`、`pick_mode`、`edid_text` | 済 |
 | `nvidia-drm-encoder.c／.h` | ディスプレイと head の対応、抜き差しのイベント | `choose_display`、`kapi_event`、`rescan` | 済 |
-| `nvidia-drm-crtc.c／.h` | head と層の要求、面、vblank、カーソル、CRC、色 | `head_request`（PRIMARY 層だけ）、`surface_create`、`vblank_on／off`。カーソル・オーバーレイ・CRC は無し | 一部 |
-| `nvidia-drm-modeset.c／.h` | 設定の確定、フリップ、表示のセマフォ | `apply`、`flip_completed`。セマフォは次 | 一部 |
-| `nvidia-drm-fb.c／.h` | gem から走査面を作る | `surface_create`（固定の一面） | 一部 |
-| `nvidia-drm-format.c／.h` | DRM の画素形式と NVKMS の形式の変換 | X8R8G8B8 だけ（`N_SCANOUT_XRGB8888`） | 一部 |
+| `nvidia-drm-crtc.c／.h` | head と層の要求、面、vblank、カーソル、CRC、色 | `head_request`／`primary_request`（PRIMARY 層）、`surface_create`、`vblank_on／off`、カーソル（`cursor_create`、`show`）。オーバーレイ・CRC は無し | 一部 |
+| `nvidia-drm-modeset.c／.h` | 設定の確定、フリップ、表示のセマフォ | `apply`、`flip_completed`、フリップは `show`。セマフォは次 | 一部 |
+| `nvidia-drm-fb.c／.h` | gem から走査面を作る | `surface_create`（デスクトップ）、`image_create`（アプリの絵、画面の大きさ） | 一部 |
+| `nvidia-drm-format.c／.h` | DRM の画素形式と NVKMS の形式の変換 | デスクトップは X8R8G8B8（`N_SCANOUT_XRGB8888`）、アプリの絵は X8B8G8R8、カーソルは A8R8G8B8 | 一部 |
 | `nvidia-drm-utils.c／.h` | コネクター情報、モードの変換 | `mode_text`。KAPI のモードをそのまま使うので変換は要らない | 済 |
 | `nvidia-drm-color-pipeline.c／.h` | DRM の色処理の段 | 無し（csc は IDENTITY） | 次 |
 | `nvidia-drm-helper.c／.h` | DRM の atomic の補助 | 無し（DRM の構造を持たない） | 無し |
 | `nvidia-drm-gem.c／.h` | GEM の物体 | 無し | 次 |
-| `nvidia-drm-gem-nvkms-memory.c／.h` | NVKMS の memory を GEM にする | 無し | 次 |
+| `nvidia-drm-gem-nvkms-memory.c／.h` | NVKMS の memory を GEM にする | アプリの絵（NVKMS の memory）をアプリの RM client へ DUP する `image_import` | 一部 |
 | `nvidia-drm-gem-user-memory.c／.h` | ユーザーのページを GEM にする | 無し | 次 |
 | `nvidia-drm-gem-dma-buf.c／.h` | dma-buf の取り込み | 無し | 次 |
 | `nvidia-drm-fence.c／.h` | 描画完了のフェンス、セマフォ面 | 無し | 次 |
 | `nvidia-dma-resv-helper.h` | dma-buf の予約オブジェクトの補助 | 無し | 次 |
-| `nv_drm_common_ioctl.h` | nvidia-drm の ioctl の形 | 無し（Nocturne では nvrm の要求として決める） | 次 |
+| `nv_drm_common_ioctl.h` | nvidia-drm の ioctl の形 | nvrm の要求 `NVRM_SCANOUT`（`nvrm_protocol.h`） | 一部 |
 | `nvidia-drm-os-interface.c／.h` | 確保、作業スレッド、タイマー、ユーザーのページ、sync_file | libc の確保と `threads.h`（`display_thread`）。ユーザーのページと sync_file は次 | 一部 |
 | `nvidia-drm-conftest.h` | Linux カーネルの機能の判定 | 無し | 無し |
 | `nv-kthread-q.c` | 作業キュー | NVKMS 側は `nvkms_os.c` の作業スレッド、画面側は `display_thread` | 済 |
@@ -360,20 +394,17 @@ view を閉じる → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で�
 
 ### 次の段階（Mesa が走査面へ直接描く）
 
-今はカーネルの WM が CPU で面へ描く。NVK が描いた絵をそのまま出すには、次が要る。
+直接表示（上）で、nvrm が作った走査面の絵へ NVK が描き、全画面のアプリの間はそれを合成せずに出せる。画面の持ち主は
+カーネルの `N_SCANOUT_DIRECT` と `n_pci_screen_state` で決まる。残るもの：
 
-- **gem に当たるもの**：NVK のクライアントが RM で確保した vidmem（client と hMemory）を、nvrm の要求サーバーの新しい要求で
-  受け、KAPI の `importMemory`／`dupMemory` で NVKMS の memory にして `createSurface` する。クライアントの切断で
-  `destroySurface`／`freeMemory` する寿命の管理と、`isVidmem`／`isContiguous` による走査面にできるかの確認。
-- **prime／dma-buf に当たるもの**：プロセスの間の受け渡しは Nocturne の共有オブジェクトのハンドルで行い、`exportMemory` で
-  RM のハンドルへ戻す道。ユーザーのページを面にするなら `getMemoryPages`／`freeMemoryPages`。
-- **fence に当たるもの**：描画の完了を待ってからフリップする。KAPI の `importSemaphoreSurface`／
-  `registerSemaphoreSurfaceCallback`（または表示のセマフォ `tryInitDisplaySemaphore`／`signalDisplaySemaphore`／
-  `cancelDisplaySemaphore`）を使い、フリップの完了（FLIP_OCCURRED、vblank）をクライアントが待てる Nocturne の待ち合わせの
-  ハンドルとして返す。
-- **画面の持ち主**：Mesa の面を出す間、カーネルの画面を何にするか（WM の面をオーバーレイ層にする、または `n_pci_give_screen`
-  の面を差し替える）。カーネル側の ABI の追加が要る（担当はカーネル）。
-- **形式と色**：XRGB8888 以外（ARGB8888、10 ビット、YUV）の対応表と、色処理の段。
+- **fence に当たるもの**：今の PRESENT は一つ前のフリップを待つだけで、描画の完了はアプリが待つ。KAPI の
+  `importSemaphoreSurface`／`registerSemaphoreSurfaceCallback`（または表示のセマフォ）で、描画の完了を表示エンジンに待たせ、
+  フリップの完了をクライアントが待てる Nocturne の待ち合わせのハンドルとして返す。
+- **アプリが確保した memory を面にする**：今は nvrm が絵を確保してアプリへ DUP する向き。逆向き（アプリの vidmem を KAPI の
+  `importMemory` で面にする）は、`isVidmem`／`isContiguous` で走査面にできるかの確認とともに要るときに足す。
+- **窓の大きさの絵・オーバーレイ層**：今の絵は画面の大きさだけで、主層だけを使う。
+- **形式と色**：X8B8G8R8／X8R8G8B8 以外（ARGB8888、10 ビット、YUV）の対応表と、色処理の段。
+- **実機**：RTX 4070 での KAPI のフリップ・カーソル・`NV04_SHARE`＋DUP の挙動は未確認。
 
 ## UVM（nvidia-uvm）
 

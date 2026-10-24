@@ -32,6 +32,7 @@
 #define NVKMS_OS_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Loads NVKMS (nvKmsModuleLoad, which allocates its RM client) and registers nvrm's GPU with
  * it, so that KAPI's enumerateGpus lists it and allocateDevice can open it. Call after
@@ -48,5 +49,14 @@ void nvrm_nvkms_stop(void);
  * before RM's suspend and nvidia_modeset_resume after RM's resume). */
 void nvrm_nvkms_suspend(void);
 void nvrm_nvkms_resume(void);
+
+/* The RM client of a KAPI device and the RM handle of memory KAPI allocated on it
+ * (nvkms_kapi_rm.c), for duplicating the memory into another RM client: what nvidia-drm does
+ * through a file descriptor (KAPI's exportMemory), which nvrm does not have. False when either
+ * has no RM object. */
+struct NvKmsKapiDevice;
+struct NvKmsKapiMemory;
+bool nvrm_nvkms_memory_handle(const struct NvKmsKapiDevice *device, const struct NvKmsKapiMemory *memory,
+                              uint32_t *client, uint32_t *object);
 
 #endif

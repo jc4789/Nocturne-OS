@@ -1177,6 +1177,8 @@ void web_js_console(web_doc *d, int level, const char *message);
 /* Native trusted link activation only; not exposed as a script popup API. */
 bool web_js_auxiliary_link(web_doc *d,const char *url);
 bool web_js_video_present(web_doc *d,const struct web_video_patch *patch);
+/* Direct scanout presented a frame of d: run animation frames now. */
+void web_js_rendering_now(web_doc *d);
 void web_js_focus_control(web_doc *d, node_t *control);
 void web_js_face_reset(web_doc *d, node_t *form);
 node_t *web_autofocus_candidate(web_doc *d);

@@ -229,9 +229,12 @@ static void screen_release(void) {
    its surface (screen_owner); it gives the boot screen back itself, or its claim's end does once
    the function is stopped. Then the boot screen's memory is drawn into again, though the display
    engine may no longer show it: the driver that left reprogrammed it and nothing sets it back. */
-static struct mutex screen_lock; /* screen_owner and screen_surface change under it */
+static struct mutex screen_lock; /* screen_owner, screen_surface and screen_direct change under it */
 static struct pci_claim *screen_owner;
 static struct shared_scanout screen_surface;
+/* The scanout shown has N_SCANOUT_DIRECT: its driver shows the windows the window manager lets it
+   show directly (gui/wm.c, n_pci_screen_state). */
+static bool screen_direct;
 
 static void screen_say(const struct pci_claim *c, const char *what) {
     kprintf("pci: %02x:%02x.%u: %s\n", c->d->bus, c->d->dev, c->d->func, what);
@@ -243,6 +246,7 @@ static bool screen_give_back(struct pci_claim *c) {
     fb_scanout_boot();
     shared_scanout_close(&screen_surface);
     __atomic_store_n(&screen_owner, NULL, __ATOMIC_RELEASE);
+    screen_direct = false;
     return true;
 }
 
@@ -299,9 +303,11 @@ static void claim_release(struct object *o) {
     mutex_lock(&screen_lock);
     bool given_back = screen_give_back(c);
     mutex_unlock(&screen_lock);
-    if (given_back)
+    if (given_back) {
+        wm_screen_direct(false);
         screen_say(c, "its driver ended while the desktop was drawn into its scanout; the boot screen is drawn "
                       "again, but the display may not show it: nothing sets the display engine back");
+    }
     if (c->screen_holds) screen_hold_end(c);
     if (!c->screen_holds && given_back) screen_repaint();
     for (; c->screen_holds; c->screen_holds--)
@@ -650,15 +656,21 @@ int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const str
             shared_scanout_close(&screen_surface); /* the surface shown before, no longer mapped */
             screen_surface = s;
             __atomic_store_n(&screen_owner, c, __ATOMIC_RELEASE);
-            char line[128];
-            ksnprintf(line, sizeof line, "the desktop is drawn into its driver's %ux%u %s scanout (pitch %u)",
-                      desc->width, desc->height, desc->format == N_SCANOUT_XRGB2101010 ? "XRGB2101010" : "XRGB8888",
-                      desc->pitch);
+            screen_direct = (desc->format & N_SCANOUT_DIRECT) != 0;
+            char line[160];
+            ksnprintf(line, sizeof line, "the desktop is drawn into its driver's %ux%u %s scanout (pitch %u)%s",
+                      desc->width, desc->height,
+                      (desc->format & N_SCANOUT_FORMAT_MASK) == N_SCANOUT_XRGB2101010 ? "XRGB2101010" : "XRGB8888",
+                      desc->pitch, screen_direct ? ", which can show fullscreen windows directly" : "");
             screen_say(c, line);
         }
     }
+    bool direct = screen_direct;
     mutex_unlock(&screen_lock);
-    if (!r) screen_repaint();
+    if (!r) {
+        wm_screen_direct(direct);
+        screen_repaint();
+    }
     return r;
 }
 
@@ -668,6 +680,16 @@ int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timest
     if (__atomic_load_n(&screen_owner, __ATOMIC_ACQUIRE) != c) return -N_ERR_DENIED;
     wm_vblank(count, timestamp_ns);
     return 0;
+}
+
+int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    mutex_lock(&screen_lock);
+    bool ours = screen_owner == c && screen_direct;
+    mutex_unlock(&screen_lock);
+    if (!ours) return -N_ERR_DENIED;
+    return wm_screen_state(seen, out, timeout_ms);
 }
 
 /* ---- the function's part of the ACPI namespace (dev/acpi.c) ---- */

@@ -147,6 +147,11 @@ nvk_AllocateMemory(VkDevice device,
       vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
    const VkMemoryDedicatedAllocateInfo *dedicated_info =
       vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+#if DETECT_OS_NOCTURNE
+   const VkImportMemoryNocturneScanoutInfoMESA *scanout_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           IMPORT_MEMORY_NOCTURNE_SCANOUT_INFO_MESA);
+#endif
    const VkMemoryType *type =
       &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
 
@@ -208,7 +213,28 @@ nvk_AllocateMemory(VkDevice device,
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);
 
-   const bool is_import = fd_info && fd_info->handleType;
+   bool is_import = fd_info && fd_info->handleType;
+#if DETECT_OS_NOCTURNE
+   if (scanout_info != NULL) {
+      /* nvrm's direct-scanout image: video memory only the GPU and the
+       * display touch, like an imported dma-buf it keeps its own contents.
+       */
+      if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+         result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "Scanout images are not host-visible");
+         goto fail_alloc;
+      }
+
+      result = nvkmd_dev_import_nocturne_scanout(dev->nvkmd, &dev->vk.base,
+                                                 scanout_info->image,
+                                                 pAllocateInfo->allocationSize,
+                                                 &mem->mem);
+      if (result != VK_SUCCESS)
+         goto fail_alloc;
+
+      is_import = true;
+   } else
+#endif
    if (is_import) {
       assert(fd_info->handleType ==
                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||

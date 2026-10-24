@@ -28,6 +28,11 @@ static window_t *w;   /* behind the engine's window: its state, fullscreen and h
 static canvas_t view; /* the surface */
 static bool browser_fullscreen;
 static web_doc *fullscreen_doc,*pip_doc;
+/* Direct scanout (win_direct, web_direct_open): the display shows a fullscreen WebGL canvas's frames
+   itself. direct holds its context and the display's images from the first frame that can until the
+   display shows the window again (EV_DIRECT key 0); direct_shown is the display's last word. */
+static web_direct *direct;
+static bool direct_wanted, direct_shown;
 static web_node *pip_node;
 static window_t *pip_window;
 static uint64_t pip_revision;
@@ -484,9 +489,32 @@ static void console_add(const char *level, const char *message) {
     } while (*p);
 }
 
+/* The page is nothing but a fullscreen WebGL canvas (web_direct_open): its frames go to the display
+   instead of through the window, which asks for that only meanwhile. true: the display shows the
+   newest frame, and the window's surface (hidden) is not painted. */
+static bool direct_frame(void) {
+    /* The page waits for a script: the display keeps the frame it shows. */
+    if (native_wait) return direct && direct_shown;
+    bool allowed = w && doc && browser_fullscreen && fullscreen_doc == doc && !sel_node &&
+                   !devtools_overlay_visible() && view.px && view.w == w->w && view.h == w->h;
+    if (allowed && !direct) allowed = (direct = web_direct_open(doc, view.w, view.h)) != NULL;
+    int shown = allowed ? web_direct_present(direct, doc, view.w, view.h, direct_shown) : -2;
+    /* Not shown although the display shows the window directly: either it just stopped (EV_DIRECT key 0
+       follows) or the context can no longer (-2 now), when nothing else would ask again. */
+    if (shown == -1 && direct_shown) shown = web_direct_present(direct, doc, view.w, view.h, false);
+    if (shown == -2) {
+        allowed = false;
+        /* The images are given back once the display no longer shows them. */
+        if (direct && !direct_shown) { web_direct_close(direct); direct = NULL; }
+    }
+    if (allowed != direct_wanted && win_direct(w, allowed) >= 0) direct_wanted = allowed;
+    return shown >= 0;
+}
+
 static void redraw(void) {
     if(doc){int x,y,width,height;(void)web_take_paint_damage(doc,&x,&y,&width,&height);}
     if (!view.px) { need_paint = false; show_chrome(); return; }
+    if (direct_frame()) { need_paint = false; show_chrome(); return; }
     uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
     draw();
     uint64_t drawn = debug_js ? n_clock_uptime_ms() : 0;
@@ -501,6 +529,7 @@ static void redraw(void) {
 }
 static void redraw_damage(void){
     int x,y,width,height;
+    if(direct_frame()){if(doc)(void)web_take_paint_damage(doc,&x,&y,&width,&height);return;}
     if(!doc||!view.px||need_paint||sel_node||devtools_overlay_visible()||!web_take_paint_damage(doc,&x,&y,&width,&height)){redraw();return;}
     if(width<=0||height<=0)return;
     uint64_t start=debug_js?n_clock_uptime_ms():0;
@@ -1474,6 +1503,9 @@ static void take_engine_events(void) {
         case UI_EVENT_WHEEL:
             inbox_put((struct gui_event){.type = EV_WHEEL, .x = pointer_x, .y = pointer_y,
                                          .wheel = (int32_t)e.a, .mods = e.mods});
+            break;
+        case UI_EVENT_DIRECT:
+            inbox_put((struct gui_event){.type = EV_DIRECT, .key = e.a ? 1 : 0});
             break;
         default: break; /* the window's own size: the surface's comes as UI_EVENT_CANVAS */
         }
@@ -2616,6 +2648,7 @@ static void handle(const struct gui_event *e) {
         if (e->key == CMD_FOCUS && !(e->x == F_FIND && e->pressed) && !need_layout && !need_paint) { show_chrome(); return; }
         break;
     case EV_UNFOCUS: web_pointer_cancel(doc);web_active_release(doc);pressed_node=NULL;break;
+    case EV_DIRECT: direct_shown = e->key; need_paint = true; break; /* key 0: the window shows again */
     case EV_KEY:
         if (!e->pressed) {
             if (focus == F_PAGE) dispatch_native("keyup", doc ? web_focused(doc) : NULL, e, false);
@@ -2690,6 +2723,11 @@ static void handle(const struct gui_event *e) {
    QuickJS's synchronous module loader can be on the C stack while it is used. */
 static void handle_native_wait(const struct gui_event *e) {
     if (e->type == EV_CLOSE) { quit = true; sync_stopped = true; return; }
+    if (e->type == EV_DIRECT) {
+        direct_shown = e->key;
+        if (!direct_shown) { need_paint = true; if (native_wait_snapshot) redraw(); }
+        return;
+    }
     if (e->type == EV_RESIZE) {
         prepare_native_snapshot(true);native_wait_snapshot=web_native_input_ready(doc,true);
         if(native_wait_snapshot)redraw();return;

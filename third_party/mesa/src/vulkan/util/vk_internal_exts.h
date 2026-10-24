@@ -124,6 +124,21 @@ typedef struct VkRenderingAttachmentInitialLayoutInfoMESA {
    VkRenderingAttachmentInitialLayoutInfoMESA
 
 
+/*
+ * Nocturne: memory that is one of nvrm's direct-scanout images
+ * (ports/nvidia/include/nvrm_protocol.h, NVRM_SCANOUT_IMPORT).  Chained into
+ * VkMemoryAllocateInfo, it imports the image numbered `image` instead of
+ * allocating; allocationSize must not exceed the image's bytes.
+ */
+typedef struct VkImportMemoryNocturneScanoutInfoMESA {
+   VkStructureType sType;
+   const void *pNext;
+   uint32_t image;
+} VkImportMemoryNocturneScanoutInfoMESA;
+
+#define VK_STRUCTURE_TYPE_IMPORT_MEMORY_NOCTURNE_SCANOUT_INFO_MESA    (VkStructureType)1000001006
+#define VK_STRUCTURE_TYPE_IMPORT_MEMORY_NOCTURNE_SCANOUT_INFO_MESA_cast    VkImportMemoryNocturneScanoutInfoMESA
+
 struct nir_shader;
 
 typedef struct VkPipelineShaderStageNirCreateInfoMESA {

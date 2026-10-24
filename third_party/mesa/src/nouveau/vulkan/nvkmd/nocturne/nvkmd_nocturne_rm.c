@@ -698,6 +698,29 @@ nnrm_mem_alloc(struct nnrm *n, enum nnrm_mem_kind kind,
    return NV_OK;
 }
 
+uint32_t
+nnrm_mem_import_scanout(struct nnrm *n, uint32_t image, uint64_t size_B,
+                        struct nnrm_mem **out)
+{
+   struct nnrm_mem *mem = calloc(1, sizeof(*mem));
+   if (mem == NULL)
+      return NV_ERR_NO_MEMORY;
+
+   /* nvrm makes the image a memory object of this client under the device,
+    * so it is freed like any other (nnrm_mem_free). */
+   uint32_t st = nvrm_scanout_import(n->rm, image, n->client, n->device, &mem->handle);
+   if (st != NV_OK) {
+      free(mem);
+      return st;
+   }
+
+   mem->rm = n;
+   mem->kind = NNRM_MEM_VRAM;
+   mem->size_B = size_B;
+   *out = mem;
+   return NV_OK;
+}
+
 void
 nnrm_mem_free(struct nnrm_mem *mem)
 {

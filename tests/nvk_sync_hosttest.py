@@ -23,7 +23,8 @@ common = [str(cc), "-std=gnu11", "-O2", "-ffreestanding", "-ffunction-sections",
            "-Iuser/include", "-Icommon", "-Wl,--gc-sections"]
 for name, prefix, extras in [
     ("nvk_sync", [], ["third_party/mesa/src/util/u_dynarray.c", "third_party/mesa/src/util/ralloc.c"]),
-    ("mesa_screen", [], ["-DGALLIUM_ZINK", "-Iports/mesa", "-Iports/nvidia/include"]),
+    ("mesa_screen", [], ["-DGALLIUM_ZINK", "-Iports/mesa", "-Iports/nvidia/include",
+                     "-Ithird_party/nvidia-open/src/common/sdk/nvidia/inc"]),
     ("nvk_rm", ["-Iports/nvidia/include", "-Ithird_party/nvidia-open/src/common/sdk/nvidia/inc",
                 "-Ithird_party/nvidia-open/src/nvidia/arch/nvalloc/unix/include"], []),
 ]:

@@ -148,6 +148,13 @@ VkResult nvkmd_nocturne_alloc_tiled_mem(struct nvkmd_dev *dev,
                                         enum nvkmd_mem_flags flags,
                                         struct nvkmd_mem **mem_out);
 
+/* Import nvrm's direct-scanout image `image` (nvrm_scanout_create); size_B
+ * must not exceed the image's bytes. */
+VkResult nvkmd_nocturne_import_scanout(struct nvkmd_dev *dev,
+                                       struct vk_object_base *log_obj,
+                                       uint32_t image, uint64_t size_B,
+                                       struct nvkmd_mem **mem_out);
+
 /* ---- va ---- */
 
 struct nvkmd_nocturne_va {

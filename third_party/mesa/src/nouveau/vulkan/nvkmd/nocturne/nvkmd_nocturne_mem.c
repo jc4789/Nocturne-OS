@@ -131,6 +131,30 @@ nvkmd_nocturne_alloc_tiled_mem(struct nvkmd_dev *_dev,
                              va_flags, align_B, mem_out);
 }
 
+VkResult
+nvkmd_nocturne_import_scanout(struct nvkmd_dev *_dev,
+                              struct vk_object_base *log_obj,
+                              uint32_t image, uint64_t size_B,
+                              struct nvkmd_mem **mem_out)
+{
+   struct nvkmd_nocturne_dev *dev = nvkmd_nocturne_dev(_dev);
+
+   size_B = align64(size_B, NNRM_PAGE_SIZE);
+
+   struct nnrm_mem *rm_mem = NULL;
+   uint32_t st = nnrm_mem_import_scanout(dev->rm, image, size_B, &rm_mem);
+   if (st != 0) {
+      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "Failed to import scanout image %u: %s",
+                       image, nnrm_status_name(st));
+   }
+
+   /* Video memory the display reads: never mapped by the CPU */
+   return create_mem_or_free(dev, log_obj, NVKMD_MEM_VRAM | NVKMD_MEM_SHARED,
+                             rm_mem, size_B, 0 /* va_flags */,
+                             0 /* va_align_B */, mem_out);
+}
+
 static void
 nvkmd_nocturne_mem_free(struct nvkmd_mem *_mem)
 {

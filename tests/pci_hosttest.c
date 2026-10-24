@@ -161,6 +161,10 @@ int64_t shared_scanout_open(struct handle *surface, const struct pci_claim *clai
 }
 void shared_scanout_close(struct shared_scanout *s) { (void)s; abort(); }
 void wm_vblank(uint64_t count, uint64_t timestamp_ns) { (void)count; (void)timestamp_ns; abort(); }
+void wm_screen_direct(bool able) { (void)able; abort(); }
+int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeout_ms) {
+    (void)seen; (void)out; (void)timeout_ms; abort();
+}
 struct fb_info fb;
 int init_pid;
 NORETURN void panic(const char *fmt, ...) { (void)fmt; abort(); }

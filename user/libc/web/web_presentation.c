@@ -1,7 +1,11 @@
 #include "web_presentation.h"
 #include "avmedia.h"
 #include "frame.h"
+#include "js_canvas.h"
+#include "js_webgl.h"
+#include "web_dialog.h"
 #include "nocturne.h"
+#include <math.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
@@ -257,4 +261,70 @@ void web_presentation_style(web_doc *d,node_t *n,style_t *s){
     s->min_width=s->min_height=(len_t){.kind=LK_LEN};s->max_width=s->max_height=(len_t){.kind=LK_NONE};
     s->transform=s->rotate=s->scale=NULL;
     for(unsigned i=0;i<4;i++){s->inset[i]=(len_t){.kind=LK_LEN};s->margin[i]=(len_t){.kind=LK_LEN};}
+}
+
+/* ---- direct scanout of a fullscreen WebGL canvas (win_direct) ---- */
+struct web_direct {struct web_webgl *gl;uint64_t serial;bool shown;int rect[4];};
+/* Nothing of the element's own box is painted around, over or through its content. */
+static bool direct_plain(const box_t *b){
+    const style_t *s=b->st;
+    if(!s||s->visibility||s->opacity<1||s->filter||s->box_shadow||s->mask_image||s->motion.name)return false;
+    if(s->bg_color>>24||s->has_grad||s->bg_image||s->outline_width>0)return false;
+    for(int i=0;i<4;i++){if(b->b[i]>0)return false;
+        for(int axis=0;axis<2;axis++)if(s->corner_radius[i].axis[axis].kind!=LK_AUTO&&len_resolve(&s->corner_radius[i].axis[axis],axis?b->h:b->w)!=0)return false;}
+    return s->border_radius==0;
+}
+/* The WebGL canvas d (a top document) shows fullscreen with nothing over it and black around it, and where its
+   picture lands in d's viewport: fullscreen elements down the frame chain, no top-layer dialog in any of
+   those documents, nothing painted with or over the canvas, and its fitted picture inside its content box. */
+static node_t *direct_canvas(web_doc *d,int rect[4]){
+    if(!d||d->frame_parent||!active(d))return NULL;
+    web_doc *owner=d->fullscreen_owner;node_t *canvas=owner?owner->fullscreen_element:NULL;
+    if(!canvas||!valid(owner,canvas)||canvas->foreign||canvas->tag!=T_canvas||!canvas->box)return NULL;
+    struct web_webgl *gl=web_canvas_webgl(canvas);
+    if(!gl||!web_webgl_direct_capable(gl))return NULL;
+    double x=box_visual_x(canvas->box)-owner->view_x,y=box_visual_y(canvas->box)-owner->view_y;
+    for(web_doc *at=owner;;at=at->frame_parent){
+        node_t *e=at->fullscreen_element;
+        if(web_dialog_count(at)||!valid(at,e)||!e->box||!direct_plain(e->box))return NULL;
+        if(at==d)break;
+        /* The child's viewport is the content box of its fullscreen frame element. */
+        web_doc *parent=at->frame_parent;
+        if(!parent||parent->fullscreen_element!=at->frame_element||!at->frame_element->box)return NULL;
+        x+=box_visual_x(at->frame_element->box)-parent->view_x;y+=box_visual_y(at->frame_element->box)-parent->view_y;
+    }
+    box_t *b=canvas->box;
+    int X=(int)round(x),Y=(int)round(y),W=(int)roundf(b->w),H=(int)roundf(b->h);
+    if(!isfinite(x)||!isfinite(y)||!web_canvas_fit(canvas,b->st,X,Y,W,H,rect))return NULL;
+    /* The display scales the whole picture; one cropped by its box is painted through the window. */
+    if(rect[0]<X||rect[1]<Y||(int64_t)rect[0]+rect[2]>(int64_t)X+W||(int64_t)rect[1]+rect[3]>(int64_t)Y+H)return NULL;
+    return canvas;
+}
+web_direct *web_direct_open(web_doc *d,int screen_width,int screen_height){
+    int rect[4];node_t *canvas=direct_canvas(d,rect);
+    if(!canvas||screen_width<=0||screen_height<=0)return NULL;
+    struct web_webgl *gl=web_canvas_webgl(canvas);
+    if(!web_webgl_direct_begin(gl,(unsigned)screen_width,(unsigned)screen_height))return NULL;
+    web_direct *v=calloc(1,sizeof *v);if(!v)return NULL;
+    v->gl=gl;web_webgl_retain(gl);
+    return v;
+}
+int web_direct_present(web_direct *v,web_doc *d,int screen_width,int screen_height,bool shown){
+    int rect[4];node_t *canvas=v?direct_canvas(d,rect):NULL;
+    if(!canvas||web_canvas_webgl(canvas)!=v->gl)return -2;
+    /* The display shows the window's own buffer: the next frame shown directly is presented whole. */
+    if(!shown){v->shown=false;return -1;}
+    uint64_t serial=web_webgl_serial(v->gl);
+    if(v->shown&&serial==v->serial&&!memcmp(rect,v->rect,sizeof rect))return 0;
+    if(screen_width<=0||screen_height<=0||
+       !web_webgl_direct_present(v->gl,rect[0],rect[1],(unsigned)rect[2],(unsigned)rect[3],(unsigned)screen_width,(unsigned)screen_height))
+        return -1;
+    v->serial=serial;v->shown=true;memcpy(v->rect,rect,sizeof rect);
+    /* PRESENT returned at the display's vertical blank: animation frames follow it. */
+    for(web_doc *at=canvas->owner;at;at=at->frame_parent)web_js_rendering_now(at);
+    return 1;
+}
+void web_direct_close(web_direct *v){
+    if(!v)return;
+    web_webgl_direct_end(v->gl);web_webgl_release(v->gl);free(v);
 }

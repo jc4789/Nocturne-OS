@@ -63,6 +63,7 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/util/u_dl.c` | 共有ライブラリーは無い。`util_dl_open("vulkan")` は同じプログラムにリンクされた Vulkan ドライバー（NVK）を指し、`vk_icdGetInstanceProcAddr`／`vk_common_GetDeviceProcAddr`（弱参照）でローダーと同じ答え方をする。ドライバーが無ければ NULL。 |
 | `src/gallium/drivers/zink/zink_screen.c`、`zink_public.h` | `VK_LIBNAME` は `"vulkan"`。`unistd.h` を読まず、DRM の記述子を閉じない。DRM の記述子から screen を作る `zink_drm_create_screen` を外す（GL は `zink_create_screen` で作る）。 |
 | `src/gallium/drivers/zink/zink_resource.c`、`zink_context.c`、`zink_fence.c/.h` | ファイル記述子が無いので、dma-buf／opaque-fd のメモリ共有と sync file のフェンス取込みを外す。 |
+| `src/gallium/include/frontend/winsys_handle.h`、`src/gallium/drivers/zink/zink_resource.c` | ハンドルの型 `WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT`（nvrm の表示用画像の番号）を足す。`resource_from_handle` はこの型の PIPE_BUFFER だけを受け、`VkImportMemoryNocturneScanoutInfoMESA` を付けて VRAM に取り込む（下位割当て・キャッシュに入れない）。 |
 
 ## Zink（GPU での WebGL）
 
@@ -96,6 +97,7 @@ GPU が無い（`C:\Nocturne\System\nvrm` が動いていない）機械では�
 | `nvk_instance.c`、`nvk_physical_device.c/.h` | DRM の装置列挙ではなく `physical_devices.enumerate` で nvkmd の GPU を数える。ELF の build-id は無いので、版と NVK のビルド時刻の hash を driver identity にする。`NVX_binary_import` は libelf が要るので出さない。 |
 | `nvkmd/nvkmd.c/.h`、`nvkmd_device_info.c/.h` | 装置情報の共通部分を DRM 版から分け、Nocturne の nvkmd を登録する。同期の型と payload の複製は backend が渡す。 |
 | `nvk_device.c`、`nvk_buffer.c`、`nvk_image.c`、`nvk_device_memory.c`、`nvk_descriptor_table.c` | DRM の syncobj と dma-buf を使わない（backend に無ければ外部メモリは非対応と答える）。`sys/mman.h` を読まない。 |
+| `nvk_device_memory.c`、`nvkmd/nvkmd.c/.h`、`nvkmd/nocturne/` | `VkImportMemoryNocturneScanoutInfoMESA`（`vk_internal_exts.h`）が付いた割当ては、nvrm の表示用画像を `nvrm_scanout_import` で自分の装置のメモリー物体として取り込む（ホストから見えるメモリー型には付けられない。ゼロ初期化しない）。解放は他のメモリーと同じ。 |
 | `nak_bindings.h` | NAK のハードウェア試験用の winsys／DRM を読まない（試験は作らない）。 |
 | `vk_instance.c`、`vk_fence.c`、`vk_semaphore.c`、`wsi_common.c` | fd が無いので sync file・opaque fd・dma-buf の出し入れと `dlfcn.h` を外す。 |
 | `wsi_common_headless.c` | 待ちの期限は POSIX の `clock_gettime` ではなく `util/os_time`。 |
@@ -104,3 +106,18 @@ GPU が無い（`C:\Nocturne\System\nvrm` が動いていない）機械では�
 | `rmv/vk_rmv_exporter.c` | プロセス番号は無いので 0。 |
 
 段階4・5で旧 API 呼出しはすべてネイティブ ABI へ書き換えた。
+
+## 直接表示（全画面の WebGL）
+
+全画面の WebGL canvas の絵は、窓を通さず（C20 の読戻しをせず）GPU 上で表示用の画像へ写す。
+
+1. ブラウザー（`user/apps/browser.c`）は、ページが全画面の canvas だけのとき（`web_direct_open`：
+   上に dialog が無い、canvas の箱が自分では何も塗らない、object-fit した絵が箱に収まる、GPU で描き
+   alpha が無いか乗算済み）に限り `win_direct` を求める。GPU の無い softpipe の文脈は求めない。
+2. 系が `EV_DIRECT`（key 1）を送ると、各フレームを `ngl_scanout_present` で出す。`nocturne_gl.c` は
+   `nvrm_scanout_create` で画面の大きさの画像を三枚取り、Zink の `resource_from_handle` で buffer として
+   取り込む。描画バッファーを（大きさが違えば線形に拡大縮小してから）`image_copy_buffer` で画像の
+   該当位置へ写し、置く位置が変わった画像は先に黒で埋め、描画の完了を待って `nvrm_scanout_present`
+   する。PRESENT が返れば二つ前の画像は表示から外れているので、三枚を順に使う。
+3. PRESENT は垂直帰線で返るので、その時点を requestAnimationFrame の次の刻みにする。
+4. `EV_DIRECT`（key 0）や条件が外れたときは、窓へ全体を描き直す。画像は表示が窓へ戻った後で返す。

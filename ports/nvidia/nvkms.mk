@@ -40,8 +40,13 @@ nvkms_cxx_obj = $(addprefix $(NVKMS_OUT)/core/,$(subst ../,up/,$(1:.cpp=.cpp.o))
 NVKMS_SHADERS := turing ampere hopper blackwell gb20x
 NVKMS_SHADER_OBJ := $(patsubst %,$(NVKMS_OUT)/shaders/%_shaders.xz.o,$(NVKMS_SHADERS))
 
+# nvrm's own part of the core (nvkms_kapi_rm.c): it reads KAPI's private structures, so it is
+# compiled like NVKMS's sources, and its entry points are kept global like NVIDIA's exports.
+NVKMS_NOCTURNE_OBJ := $(NVKMS_OUT)/core/nocturne/nvkms_kapi_rm.o
+NVKMS_NOCTURNE_EXPORTS := nvrm_nvkms_memory_handle
+
 NVKMS_OBJ := $(call nvkms_obj,$(NVKMS_SRCS)) $(call nvkms_cxx_obj,$(NVKMS_SRCS_CXX)) \
-    $(NVKMS_OUT)/core/g_nvid_string.o $(NVKMS_SHADER_OBJ)
+    $(NVKMS_OUT)/core/g_nvid_string.o $(NVKMS_SHADER_OBJ) $(NVKMS_NOCTURNE_OBJ)
 
 # ---------------------------------------------------------------- compile flags
 NVKMS_COMMON := $(NVKMS_DIR)/../common
@@ -117,6 +122,11 @@ $(NVKMS_OUT)/core/g_nvid_string.o: $(NVKMS_OUT)/core/g_nvid_string.c
 	@echo "  KMS  $<"
 	@$(CC) $(NVKMS_CFLAGS) -Wno-missing-variable-declarations -c $< -o $@
 
+$(NVKMS_OUT)/core/nocturne/%.o: ports/nvidia/%.c ports/nvidia/nvkms_os.h
+	@mkdir -p $(dir $@)
+	@echo "  KMS  $<"
+	@$(CC) $(NVKMS_CFLAGS) -c $< -o $@
+
 # xz -C none: xzminidec is built without integrity checks (XZ_DEC_SINGLE, no CRC64/SHA-256).
 $(NVKMS_OUT)/shaders/%_shaders.xz: $(NVKMS_DIR)/src/shaders/g_%_shaders
 	@mkdir -p $(dir $@)
@@ -132,16 +142,16 @@ $(NVKMS_OUT)/shaders/%_shaders.xz.o: $(NVKMS_OUT)/shaders/%_shaders.xz
 # One nv-modeset-kernel.o, as NVIDIA's Makefile links it. On Linux the module boundary keeps
 # NVKMS's symbols apart from RM's (both carry, for example, their own nvstatus.c); here both
 # are in one program, so every global symbol except the entry points NVIDIA exports to the
-# kernel interface layer (exports_link_command.txt) is made local. Undefined references (the
-# nvkms_* OS interface, libc) stay as they are.
+# kernel interface layer (exports_link_command.txt) and nvrm's own (NVKMS_NOCTURNE_EXPORTS) is
+# made local. Undefined references (the nvkms_* OS interface, libc) stay as they are.
 # NVIDIA's nvkms.ld is not used: it merges the per-function sections for GNU ld, and doing that
 # with lld breaks the C++ COMDAT groups of the DisplayPort library (their member sections end up
 # inside .text, which objcopy rejects). Kept apart, the sections also stay collectable by nvrm's
 # --gc-sections. The groups keep their (now local) signatures; the names are DisplayPort:: and
 # _nv_dplibtimer, which nothing else in nvrm defines, so no group of another object replaces them.
-$(NVKMS_OUT)/exports.txt: $(NVKMS_DIR)/exports_link_command.txt
+$(NVKMS_OUT)/exports.txt: $(NVKMS_DIR)/exports_link_command.txt ports/nvidia/nvkms.mk
 	@mkdir -p $(dir $@)
-	@tr ' ' '\n' < $< | sed -n 's/^--undefined=//p' > $@
+	@{ tr ' ' '\n' < $< | sed -n 's/^--undefined=//p'; printf '%s\n' $(NVKMS_NOCTURNE_EXPORTS); } > $@
 
 $(NVKMS_OUT)/nv-modeset-kernel.o: $(NVKMS_OBJ) $(NVKMS_OUT)/exports.txt ports/nvidia/nvkms.mk
 	@echo "  LD   $@"

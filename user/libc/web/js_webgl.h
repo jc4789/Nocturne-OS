@@ -45,5 +45,21 @@ uint64_t web_webgl_serial(const struct web_webgl *gl);
  * buffer was clamped). With frame_end the buffer then follows
  * preserveDrawingBuffer: cleared unless preserved. */
 bool web_webgl_present(struct web_webgl *gl, uint32_t *dst, unsigned width, unsigned height, bool frame_end);
+/* Direct scanout (ngl_scanout, win_direct): whether frames can go to the
+ * display by themselves (drawn on the GPU, and without alpha or with
+ * premultiplied alpha, which over black is the color shown). */
+bool web_webgl_direct_capable(const struct web_webgl *gl);
+/* Takes the display's images for a screen of screen_width x screen_height
+ * (kept until web_webgl_direct_end). false: the context cannot show on it. */
+bool web_webgl_direct_begin(struct web_webgl *gl, unsigned screen_width, unsigned screen_height);
+/* Shows the drawing buffer scaled to x, y, width x height of the screen
+ * (screen_width x screen_height, black around it), waiting for the display,
+ * then follows preserveDrawingBuffer like web_webgl_present with frame_end
+ * (web_webgl_direct_begin first when needed). false: not shown; present it
+ * through the window. */
+bool web_webgl_direct_present(struct web_webgl *gl, int x, int y, unsigned width, unsigned height,
+                              unsigned screen_width, unsigned screen_height);
+/* Gives the display's images back (direct scanout ended). */
+void web_webgl_direct_end(struct web_webgl *gl);
 /* debug_js: per-entry-point timing in the debug log. */
 void web_webgl_set_profile(bool on);

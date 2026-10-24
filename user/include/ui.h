@@ -91,6 +91,8 @@ enum {
     UI_EVENT_WHEEL,      /* over a canvas or surface with "pointer": a = notches (positive: towards the user) */
     UI_EVENT_FOCUS,      /* a field got (a = 1) or lost (a = 0, flags UI_CANCEL when Escape gave it up) the
                             keyboard; for the window (node 0xFFFFFFFF): the window did */
+    UI_EVENT_DIRECT,     /* the window (node 0xFFFFFFFF) asked for win_direct: the display driver started (a = 1)
+                            or stopped (a = 0) showing the app's own images instead of the window (EV_DIRECT) */
 };
 /* A field holds its caret and selection itself (arrows, Home/End, Shift, Ctrl for words, Ctrl+A/C/X/V,
    clicks and drags); the keys it has no use for come as UI_EVENT_KEY. Some properties act when their

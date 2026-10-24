@@ -57,6 +57,14 @@ uint32_t nvrm_alloc(struct nvrm *rm,uint32_t root,uint32_t parent,uint32_t *id,
    if(cls==NV01_MEMORY_LOCAL_USER)local_allocs++;
    return fail?NV_ERR_NO_MEMORY:NV_OK;
 }
+/* 直接表示の画像：nvrmがクライアントの装置の下にメモリー物体として複製する。 */
+static uint32_t import_status;
+uint32_t nvrm_scanout_import(struct nvrm *rm,uint32_t image,uint32_t client,uint32_t parent,uint32_t *object) {
+   (void)client;
+   if(import_status)return import_status;
+   CHECK(image==0x100);
+   return nvrm_alloc(rm,client,parent,object,NV01_MEMORY_LOCAL_USER,NULL,0);
+}
 uint32_t nvrm_free(struct nvrm *rm,uint32_t root,uint32_t parent,uint32_t id) {
    (void)root;(void)parent;
    struct object *o=object(rm,id);
@@ -211,8 +219,19 @@ static void lifetime(void) {
    CHECK(posted_map(n)==NV_ERR_NO_MEMORY && object_count(n->rm)==live && n->posted_map==NULL);
    nnrm_close(n);CHECK(connections==0);
 }
+static void scanout_import(void) {
+   reset();struct nnrm *n=space();unsigned live=object_count(n->rm);struct nnrm_mem *mem=NULL;
+   CHECK(nnrm_mem_import_scanout(n,0x100,1<<20,&mem)==NV_OK && mem && mem->kind==NNRM_MEM_VRAM && mem->size_B==1<<20);
+   CHECK(mem && object(n->rm,mem->handle) && object(n->rm,mem->handle)->parent==n->device && object_count(n->rm)==live+1);
+   nnrm_mem_free(mem);CHECK(object_count(n->rm)==live);
+   /* 系が取込みを拒んだ：状態をそのまま返し、何も残さない。 */
+   import_status=NV_ERR_INVALID_OBJECT_HANDLE;mem=NULL;
+   CHECK(nnrm_mem_import_scanout(n,0x100,1<<20,&mem)==NV_ERR_INVALID_OBJECT_HANDLE && mem==NULL && object_count(n->rm)==live);
+   import_status=NV_OK;
+   nnrm_close(n);CHECK(connections==0);
+}
 int main(void) {
-   enumeration();lifetime();
+   enumeration();lifetime();scanout_import();
    printf("NVK RM境界ホスト試験: %u件失敗（実GPU・実並列threadは未検証）\n",failures);
    return failures!=0;
 }

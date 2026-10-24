@@ -151,6 +151,12 @@ n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanou
    blanks come, the desktop starts its frames at them instead of its own period; 100 ms without
    one and the period paces again. N_ERR_DENIED: the screen is not drawn into this claim's surface. */
 n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns);
+/* For a driver whose scanout has N_SCANOUT_DIRECT: waits up to timeout_ms (-1: no limit) while the
+   screen's state is still the one numbered seen (0 never is), then writes it to out (struct
+   n_screen_state says what the driver shows and draws while an app's window is shown directly).
+   N_ERR_TIMEOUT: out is the state numbered seen. N_ERR_DENIED: the screen is not drawn into this
+   claim's surface or it has no N_SCANOUT_DIRECT. */
+n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
 /* The function's part of the ACPI namespace, as the firmware describes it: its device node
    (N_ACPI_SELF), that node's device children (N_ACPI_CHILD(i), in namespace order), and the node
    of the bridge it is below (N_ACPI_UPSTREAM; the host bridge's on a root bus). n_pci_acpi_eval
@@ -391,6 +397,11 @@ n_result win_set_title(window_t *win, const char *title);
 n_result win_move(window_t *win, int x, int y);
 n_result win_state(window_t *win); /* WIN_STATE_* bitmask */
 n_result win_fullscreen(window_t *win,bool enabled); /* resize delivered by EV_RESIZE */
+/* Asks that, while the window is fullscreen, focused and nothing of the system is drawn over it,
+   the display driver show the app's own images (nvrm's direct scanout) instead of the desktop.
+   EV_DIRECT (key 1) says when that starts and (key 0) when it ends; in between the window's own
+   buffer is not shown. Without a display driver that can, it never starts. */
+n_result win_direct(window_t *win, bool wanted);
 /* wait up to timeout_ms (-1 = forever) for an event; returns 1 if *e was filled, 0 on timeout,
    negative once the window is gone. EV_RESIZE is handled (buffer reallocated) before being returned. */
 n_result win_event(window_t *win, struct gui_event *e, int timeout_ms);

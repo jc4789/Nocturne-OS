@@ -54,6 +54,37 @@ struct nvrm_uvm_request {
     uint32_t events;        /* reply to POLL */
 };
 
+/* Direct scanout: an app's own images shown on the screen instead of the desktop while the system
+   lets its fullscreen window be shown directly (n_pci_screen_state's app). One request, its
+   argument a struct nvrm_scanout_request. An image is video memory the display engine can scan
+   out, of the screen's size, 32 bits per pixel with red in the lowest byte (what a GPU writes for
+   R8G8B8A8; alpha is not shown). Images are numbered across nvrm (never 0), belong to the app that
+   made them and go with the connection that made them.
+     CREATE   reply: image, width, height, pitch (bytes from one row to the next), bytes.
+     DESTROY  image. One shown or about to be is taken off the screen first.
+     PRESENT  image: shown from the next vertical blank. Waits while the image presented before is
+              not shown yet, so at most one waits for a blank: of three images used in turn, the one
+              presented two before is no longer read once PRESENT returns. NV_ERR_INVALID_STATE
+              while the system does not let the caller's window be shown directly (the app shows
+              the frame through its window instead).
+     IMPORT   image, client, parent, object: the image as a memory object of the caller's RM client
+              on this connection, under parent (its device), with handle object (0: RM picks one;
+              reply), for the caller's GPU work to write into. Only the app that made it may. */
+#define NVRM_SCANOUT (NVRM_HELLO + 2u)
+#define NVRM_SCANOUT_CREATE 1u
+#define NVRM_SCANOUT_DESTROY 2u
+#define NVRM_SCANOUT_PRESENT 3u
+#define NVRM_SCANOUT_IMPORT 4u
+struct nvrm_scanout_request {
+    uint32_t op;
+    uint32_t image;
+    uint32_t width, height, pitch;
+    uint32_t client, parent, object;
+    uint64_t bytes;
+    uint32_t status;        /* reply: NV_STATUS */
+    uint32_t reserved;
+};
+
 struct nvrm_message {
     uint32_t protocol;      /* NVRM_PROTOCOL */
     uint32_t escape;        /* NV_ESC_* or NVRM_HELLO */

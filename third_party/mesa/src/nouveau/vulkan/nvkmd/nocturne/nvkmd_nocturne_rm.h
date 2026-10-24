@@ -81,6 +81,10 @@ enum nnrm_mem_kind {
 
 uint32_t nnrm_mem_alloc(struct nnrm *rm, enum nnrm_mem_kind kind,
                         uint64_t size_B, uint64_t align_B, struct nnrm_mem **out);
+/* The video memory of nvrm's direct-scanout image `image` (nvrm_scanout_create,
+ * made by any connection of this app); size_B is how much of it is used. */
+uint32_t nnrm_mem_import_scanout(struct nnrm *rm, uint32_t image, uint64_t size_B,
+                                 struct nnrm_mem **out);
 void nnrm_mem_free(struct nnrm_mem *mem);
 
 /* CPU mapping of the whole object (unmapped by nnrm_mem_unmap) */

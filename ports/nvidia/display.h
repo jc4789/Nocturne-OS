@@ -5,6 +5,9 @@
  * this file's, without DRM: display.c is KAPI's only client. It sets the mode the firmware
  * (GOP) had on the display the firmware lit, scans out a surface in video memory, and gives that
  * surface to the system (n_pci_give_screen), which draws the desktop into it from then on.
+ * While the system lets an app's fullscreen window be shown directly, the app's own images
+ * (NVRM_SCANOUT, include/nvrm_protocol.h) are flipped onto the screen instead, with the pointer
+ * as the display engine's cursor over them.
  *
  * Order in nvrm (nvrm.c):
  *
@@ -20,6 +23,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "nocturne.h"
+
 /* After nvrm_nvkms_start returned true. Returns true when the system draws into nvrm's
    surface; false (with the reason in the log) leaves the boot screen alone. */
 bool nvrm_display_start(void);
@@ -28,6 +33,17 @@ bool nvrm_display_start(void);
    frees everything display.c holds in NVKMS. Safe to call when nvrm_display_start failed or
    was never called; before nvrm_nvkms_stop. */
 void nvrm_display_stop(void);
+
+/* Serves one NVRM_SCANOUT request (include/nvrm_protocol.h) from the app principal on the
+   connection whose RM state is file (nvrm_serve.h); args/size are its struct
+   nvrm_scanout_request. Returns 0, the request's status being the NV_STATUS
+   (NV_ERR_NOT_SUPPORTED when nvrm shows no screen it can show images on), or a negative n_result
+   for a malformed request. Only between nvrm_display_start and nvrm_display_stop. */
+n_result nvrm_display_scanout(void *file, uint32_t principal, void *args, uint32_t size);
+
+/* The connection whose RM state is file ended: its images are taken off the screen and freed.
+   Before its RM state is freed. */
+void nvrm_display_connection_end(void *file);
 
 /* os_pci.c: the bus address that a kernel mapping RM made (os_map_kernel_space) shows at
    address. False when address is in none of them. */

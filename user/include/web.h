@@ -27,6 +27,21 @@ web_node *web_presentation_element(web_doc *,int kind);
 bool web_avmedia_pip_paint(web_doc *,web_node *,canvas_t *);
 uint64_t web_avmedia_pip_revision(web_doc *,web_node *);
 void web_presentation_resize(web_doc *,int width,int height);
+/* Direct scanout (win_direct) of a fullscreen WebGL canvas. Its frames go to the display by themselves
+   while it is d's fullscreen element (through the frame chain) with no dialog over it, its box paints
+   nothing of its own (background, border, outline, shadow, radius, opacity, filter, mask), its picture
+   fitted by object-fit lies within its box with black around it, and its context draws on the GPU with
+   color that needs no compositing over black. NULL when d is not like that now; the handle holds the
+   context and the display's images for a screen of screen_width x screen_height. */
+typedef struct web_direct web_direct;
+web_direct *web_direct_open(web_doc *d, int screen_width, int screen_height);
+/* The canvas's newest frame to the display (screen_width x screen_height: the fullscreen window's size)
+   while it shows the window directly (shown: EV_DIRECT key 1 last): 1 shown, animation frames run now;
+   0 nothing new; -1 not shown (paint it through the window; always when !shown); -2 d no longer shows
+   this context directly. */
+int web_direct_present(web_direct *v, web_doc *d, int screen_width, int screen_height, bool shown);
+/* Gives the display's images back. Only once the display no longer shows them (EV_DIRECT key 0). */
+void web_direct_close(web_direct *v);
 struct web_hit;
 
 /* charset: from the Content-Type header, or NULL (a <meta charset> or UTF-8 is used) */

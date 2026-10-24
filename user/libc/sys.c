@@ -372,6 +372,9 @@ n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanou
 n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns) {
     return NC5(SYS_PCI_SCREEN_VBLANK, pci, count, timestamp_ns, 0, 0);
 }
+n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms) {
+    return NC5(SYS_PCI_SCREEN_STATE, pci, seen, out, timeout_ms, 0);
+}
 n_result n_pci_acpi_eval(n_handle pci, uint32_t node, const char *name, const struct n_acpi_value *args,
                          uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size) {
     struct n_acpi_eval e = {node, nargs, name, args, data, data_size};

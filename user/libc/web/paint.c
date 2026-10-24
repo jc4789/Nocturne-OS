@@ -1221,7 +1221,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         if(web_frame_element(n)&&web_avmedia_snapshot_is_probe())break;
         if(web_frame_paint(n,c,X,Y,W,H))break;
         if (n->tag == T_canvas) {
-            web_canvas_paint(n,c,X,Y,W,H);
+            web_canvas_paint(n,st,c,X,Y,W,H);
             break;
         }
         if (n->tag == T_audio || n->tag == T_video) {

@@ -478,6 +478,14 @@ nvkmd_dev_import_dma_buf(struct nvkmd_dev *dev,
                          struct vk_object_base *log_obj,
                          int fd, struct nvkmd_mem **mem_out);
 
+/* Nocturne: the video memory of nvrm's direct-scanout image `image`
+ * (VkImportMemoryNocturneScanoutInfoMESA) */
+VkResult MUST_CHECK
+nvkmd_dev_import_nocturne_scanout(struct nvkmd_dev *dev,
+                                  struct vk_object_base *log_obj,
+                                  uint32_t image, uint64_t size_B,
+                                  struct nvkmd_mem **mem_out);
+
 struct nvkmd_mem *
 nvkmd_dev_lookup_mem_by_va(struct nvkmd_dev *dev,
                            uint64_t addr,

@@ -73,3 +73,15 @@ uint32_t nvrm_uvm_unmap(struct nvrm *rm, void *address);
 /* Waits up to timeout_ms (-1: until there are some) for file's events: *events gets UVM's POLL*
    bits (POLLIN 1, POLLPRI 2, POLLOUT 4, ...), 0 when the time ran out. */
 uint32_t nvrm_uvm_poll(struct nvrm *rm, int32_t file, int64_t timeout_ms, uint32_t *events);
+
+/* Direct scanout (nvrm_protocol.h, NVRM_SCANOUT): images of the screen's size an app's GPU work
+   writes into and the display shows instead of the desktop while the system lets the app's
+   fullscreen window be shown directly. NV_ERR_NOT_SUPPORTED when nvrm shows no screen. */
+uint32_t nvrm_scanout_create(struct nvrm *rm, uint32_t *image, uint32_t *width, uint32_t *height,
+                             uint32_t *pitch, uint64_t *bytes);
+uint32_t nvrm_scanout_destroy(struct nvrm *rm, uint32_t image);
+/* NV_ERR_INVALID_STATE: the app is not shown directly now. */
+uint32_t nvrm_scanout_present(struct nvrm *rm, uint32_t image);
+/* The image as memory object *object (0: RM picks it) of RM client `client` made on this
+   connection, under `parent`. */
+uint32_t nvrm_scanout_import(struct nvrm *rm, uint32_t image, uint32_t client, uint32_t parent, uint32_t *object);

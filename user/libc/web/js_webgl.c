@@ -148,6 +148,9 @@ struct webgl {
     void *owner;
     uint32_t *stage;
     size_t stage_pixels;
+    /* Direct scanout: the display's images, made at the first direct frame */
+    struct ngl_scanout *scanout;
+    bool scanout_failed;
     /* OffscreenCanvas owners without a DOM node: commit runs as a job once
        per presented frame, after the drawing buffer first changes. */
     JSValue commit;
@@ -156,6 +159,7 @@ struct webgl {
 };
 
 static void gl_free(struct webgl *gl) {
+    ngl_scanout_destroy(gl->scanout);
     if (gl->ngl) ngl_context_destroy(gl->ngl);
     free(gl->dead_syncs);
     free(gl->stage);
@@ -741,6 +745,42 @@ static bool present(struct webgl *gl, uint32_t *dst, unsigned width, unsigned he
     }
     if (ok && frame_end && !gl->attrs.preserve) ngl_clear_drawing_buffer(gl->ngl);
     return ok;
+}
+
+bool web_webgl_direct_capable(const struct web_webgl *handle) {
+    const struct webgl *gl = (const struct webgl *)handle;
+    /* Over black, premultiplied color is what compositing would show; unpremultiplied alpha is not. */
+    return gl->ngl && !gl->lost && !gl->scanout_failed && !ngl_has_major_performance_caveat(gl->ngl) &&
+           (!gl->attrs.alpha || gl->attrs.premultiplied);
+}
+
+bool web_webgl_direct_begin(struct web_webgl *handle, unsigned screen_width, unsigned screen_height) {
+    struct webgl *gl = (struct webgl *)handle;
+    if (!web_webgl_direct_capable(handle)) return false;
+    if (!gl->scanout && !(gl->scanout = ngl_scanout_create(gl->ngl))) {
+        gl->scanout_failed = true; /* no display driver that can: not asked again for this context */
+        return false;
+    }
+    unsigned scanout_width, scanout_height;
+    ngl_scanout_size(gl->scanout, &scanout_width, &scanout_height);
+    return scanout_width == screen_width && scanout_height == screen_height;
+}
+
+bool web_webgl_direct_present(struct web_webgl *handle, int x, int y, unsigned width, unsigned height,
+                              unsigned screen_width, unsigned screen_height) {
+    struct webgl *gl = (struct webgl *)handle;
+    if (!width || !height || !web_webgl_direct_begin(handle, screen_width, screen_height)) return false;
+    int shown = ngl_scanout_present(gl->scanout, gl->ngl, x, y, width, height);
+    if (shown < 0) gl->scanout_failed = true; /* the driver failed: frames go through the window from now on */
+    if (shown <= 0) return false;
+    if (!gl->attrs.preserve) ngl_clear_drawing_buffer(gl->ngl);
+    return true;
+}
+
+void web_webgl_direct_end(struct web_webgl *handle) {
+    struct webgl *gl = (struct webgl *)handle;
+    ngl_scanout_destroy(gl->scanout);
+    gl->scanout = NULL;
 }
 
 /* ---- method table plumbing ---- */

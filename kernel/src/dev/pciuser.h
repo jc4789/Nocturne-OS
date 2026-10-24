@@ -42,6 +42,10 @@ int64_t pci_user_hold_screen(struct handle *h, bool hold);
 struct n_scanout;
 int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const struct n_scanout *desc);
 int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timestamp_ns);
+/* n_pci_screen_state: for the claim whose N_SCANOUT_DIRECT scanout the screen is drawn into
+   (gui/wm.c keeps the state). */
+struct n_screen_state;
+int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
 /* n_pci_acpi_eval and n_pci_acpi_notify_take: the function's part of the ACPI namespace
    (dev/acpi.c). which is N_ACPI_SELF, N_ACPI_UPSTREAM or N_ACPI_CHILD(i); the arguments, their
    data and out are kernel copies. A thread that may block. */

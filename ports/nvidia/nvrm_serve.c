@@ -11,6 +11,7 @@
 #include "nocturne.h"
 #include "nvrm_protocol.h"
 #include "nvrm_serve.h"
+#include "display.h"
 #include "uvm_nvrm.h"
 #include "nvtypes.h"
 #include "nvstatus.h"
@@ -77,7 +78,12 @@ static void client_end(struct client *c) {
         nvrm_uvm_client_end(c->uvm);
         current = NULL;
     }
-    if (c->file) nvrm_rm_file_close(c->file);
+    if (c->file) {
+        /* Its direct-scanout images go with it, off the screen first (display.c); what it
+           duplicated of them goes with its RM state. */
+        nvrm_display_connection_end(c->file);
+        nvrm_rm_file_close(c->file);
+    }
     if (c->arena) n_memory_release(c->arena, c->arena_bytes);
     if (c->arena_handle >= 0) n_handle_close(c->arena_handle);
     if (c->events >= 0) n_handle_close(c->events);
@@ -178,6 +184,12 @@ static bool request(struct client *c) {
         bool sent = reply(c, packet, packet->status < 0 ? -1 : uvm_attach);
         free(packet);
         return sent;
+    }
+    if (c->file && packet->escape == NVRM_SCANOUT) {
+        current = c;
+        packet->status = (int32_t)nvrm_display_scanout(c->file, c->principal, packet + 1, packet->size);
+        current = NULL;
+        goto send;
     }
     if (!c->file || packet->escape >= NVRM_HELLO) {
         packet->status = -N_ERR_INVALID;

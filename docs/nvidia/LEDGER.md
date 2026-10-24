@@ -42,6 +42,7 @@ GPU が自分の DMA の外へ書いた観測は C51。
 | D7 | RM の取り込みは `src/nvidia` と `src/common` のうち、ビルドに要るものだけ（MIT）。`kernel-open/`・`nouveau/`・GPL の物は入れない | ライセンスと参照の制約 |
 | D8 | ~~最初は画面出力（display engine）に触らない~~（2026-10-24、D10 で置換）。起動時のフレームバッファーは `nv_get_screen_info` で RM に知らせて保護する | 実機で画面が消える危険を避ける。ただし RM が GPU を初期化した後は起動時の画面が凍るので、表示を GPU へ移す（D10） |
 | D10 | 表示は nvrm の中の NVKMS（nvidia-modeset、MIT）が組む：モード設定、VRAM の scanout 面、flip、垂直帰線。面は `n_pci_give_screen` でカーネルへ渡し、コンポジターはその面へ描いて `n_pci_screen_vblank` の帰線で刻む。claim の終わりで起動時の画面へ戻す | RM の初期化後、CPU の起動時の画面（GOP）は表示エンジンから切られる。GPU が画面をつなぎ直さなければ起動後の画面は凍ったまま |
+| D11 | 全画面で前面の窓が求めたら（`win_direct`）、NVKMS がその窓のアプリの画像をそのまま flip で出す（直接表示）。コンポジターは許可（全画面・前面・可視・メニュー／音量／通知／枠の表示なし・遠隔なし）を `n_pci_screen_state` でnvrm へ知らせ、ポインターの形と位置も渡す（nvrm はハードウェアカーソルで出す）。アプリの画像は nvrm が VRAM に作り（`NVRM_SCANOUT_*`）、NVK へ RM の dup で渡す。許可が無い間は従来どおり合成 | 全画面の WebGL を毎フレーム CPU へ読み戻して合成するのは 1080p で重い。デスクトップの合成は裏で続けるので、許可が切れた瞬間に戻せる |
 | D9 | ファームウェアは gitignore した `local/firmware/nvidia/615.78.08/` に置く。存在するときだけ手元のイメージへ入れる | git に入れない・配布しない |
 
 ## 2. 構成（予定）
@@ -99,7 +100,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C18 | RM の OS 層が RM の「spinlock」を mutex にしても正しい（割り込み処理もスレッドなので） | 受理 | `rm_isr` は普通のスレッドで動き、`os_is_isr` は `nvrm_in_isr` で真になる。眠ってはならない区間で眠る危険は、割り込み文脈が本物の割り込みでない以上ない |
 | C19 | 全クライアントが RM には同じ管理者権限のプロセスに見える | 修理済み | 接続ごとの権限（`nvrm_file.admin`）。チャネルは相手の素性を持たないので全クライアントが非特権（通常ユーザー相当）。管理者は nvrm 自身のスレッドだけ。根拠のある接続を `client_is_admin` で足せる |
 | C17 | Zink は Vulkan を `util_dl_open(VK_LIBNAME)` と `vkGetInstanceProcAddr` だけで得るので、Nocturne の util の dl 層に静的な表（"vkGetInstanceProcAddr"→NVK の `vk_icdGetInstanceProcAddr`、`vkGetDeviceProcAddr`）を置けば、zink 本体を変えずに静的リンクの NVK を使える | 未確定 | zink_screen.c 3481〜3492 行。ローダー無しで ICD の入口がローダーの代わりになるか（インスタンス拡張の列挙等）は P8 で確かめる |
-| C20 | GPU で描いた WebGL を毎フレーム CPU へ読み戻しても、softpipe より速い | 未確定（実機待ち） | 画面は起動時のフレームバッファー（D8）で、合成は CPU。読み戻しは Zink の staging コピーと待ち。遅ければ、読み戻しを非同期にするか表示側を GPU へ寄せる |
+| C20 | GPU で描いた WebGL を毎フレーム CPU へ読み戻しても、softpipe より速い | 一部修理（実機待ち） | 窓の中の WebGL は今も Zink の staging コピーで読み戻して CPU で合成する。2026-10-24：全画面の canvas は読み戻さない直接表示を足した（D11）。窓の中の読み戻しの重さは実機で測る |
 | C21 | GSP 下でも USERD とエラー通知を sysmem（CPU から見えるだけのページ）に置いてよい | 未確定（実機待ち） | `NV_CHANNEL_ALLOC_PARAMS` の `hUserdMemory[0]` と `hObjectError` に物理メモリ（sysmem）を渡す。NVIDIA の SDK の型と RM の受付けまで。RM が拒めば `nnrm_chan_create` が失敗を返す |
 | C22 | GP エントリーの `SYNC_WAIT` が nvkmd の `no_prefetch` に当たる | 未確定 | clc36f.h の GP_ENTRY1 の SYNC。前のエントリーの完了まで次を先読みしない、という意味として使った |
 | C23 | ホストのメソッド（セマフォ・WFI・MEM_OP）は GR チャンネルでは subchannel 0、コピー専用では 4 で出せる。初回に SET_OBJECT が要る | 未確定 | ctx.c の `host_subc`。ホストメソッドは subchannel を問わないはずだが、実機で確かめる |
@@ -134,7 +135,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C52 | RM の能力（`nv-caps`）は無くてよい | 却下 → 修理済み | `_sysCreateOs: RM Access Sys Cap creation failed: 0x56` は能力の根が無いための `NV_ERR_NOT_SUPPORTED`。`os_caps.c` が能力の木を持ち、ファイルの代わりに接続の権利で判定する |
 | C53 | RM が初期化すれば画面は GPU が出す | 却下 → 実装（実機未確認） | RM は表示エンジンを組まない（それは NVKMS の役）。nvrm に NVKMS を移植し（`nvkms.mk`、`nvkms_os.c`、KAPI の客 `display.c`）、`GPU started` の後にモード設定・VRAM の面・`n_pci_give_screen`・帰線の転送まで行う。カーネルは `fb.c` の出力先を切り替え、`wm.c` が帰線で描き始める。QEMU では NVIDIA が無いので、カーネル側の ABI だけを pcitest（VGA の BAR を面にする）で確かめた |
 | C54 | ACPI（`_DSM`、`_ROM`、`_DOD`、`_DDC`、MUX、Notify）は非対応で返してよい | 却下 → 実装（実機未確認） | 実機の notebook・GPS・JT は `_DSM` を要る。カーネルの uACPI で claim の範囲（機能の装置・その子・上流のブリッジ）だけを評価する `n_pci_acpi_eval` と `n_pci_acpi_notify_take`（ABI 文書 §9）。`os_acpi.c` は nv-acpi.c の移植。claim の外（`_PSR`、電池、NPCF、NVIF／WMMX）は非対応のまま |
-| C55 | UVM（nvidia-uvm）は要らない | 却下 → 移植（実機未確認） | `kernel-open/nvidia-uvm` の MIT 部分を nvrm に入れ、RM の割り込みの順序（MMU の障害 → UVM → `rm_isr`）と P2P の排出を元どおりに。ページの貸し借りはカーネルの pager ABI（ABI 文書 §7）。pagertest を足した |
+| C55 | UVM（nvidia-uvm）は要らない | 却下 → 移植（実機未確認） | `kernel-open/nvidia-uvm` の MIT 部分を nvrm に入れ、RM の割り込みの順序（MMU の障害 → UVM → `rm_isr`）と P2P の排出を元どおりに。ページの貸し借りはカーネルの pager ABI（ABI 文書 §7）。pagertest を足した。2026-10-24 訂正：報告で「Nocturne 本体の ABI には何も足していない」と書いたのは誤り。pager ABI（`SYS_PAGER_CREATE`〜`SYS_PAGER_FAIL`、`N_KIND_PAGER`）はこの移植のためにカーネルへ足した（8acc1589）。また `ports/nvidia/uvm_os.h`（約 1500 行）は、UVM が書かれている Linux カーネルの語彙（`struct page`、`mm_struct`／`vm_area_struct`、`file_operations`、`kmem_cache`、待ち行列など）を nvrm の中で Nocturne の物へ当てる層で、元のコードを無改造で通すための模倣を nvrm の中に持っている。Nocturne 本体へ Linux の API は出していない |
 | C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る |
 
 ## 5. 担当と受け渡し
@@ -151,11 +152,12 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
    （`NVRM display:`・`wm:`・`fb:` の行、起動後に画面が動き続けるか、C53）と、ブラウザーの WebGL が
    Zink で動くか（失敗ならログの `ZINK:`／`nvkmd`／RM の状態名）を見る。
 2. 実機の結果で C15・C21〜C23・C25・C26・C28 を受理か却下へ。失敗した境界から直す。
-3. 性能（C9・C20・C25）：同じ WebGL を softpipe と Zink で比べる。読み戻しとポーリングが重ければ直す。
+3. 性能（C9・C20・C25）：同じ WebGL を softpipe と Zink で比べる。全画面は直接表示（D11）になるか（ログの `wm:` の行）、窓の中の読み戻しとポーリングが重ければ直す。
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
 
+- 2026-10-24（3）：全画面の直接表示（D11・C20）。カーネル：`N_SCANOUT_DIRECT`、`win_direct`、`EV_DIRECT`、`WIN_STATE_DIRECT`、`n_pci_screen_state`（wm.c の許可とポインター）。nvrm：`NVRM_SCANOUT_CREATE／PRESENT／IMPORT／DESTROY`、flip のみの `applyModeSetConfig`、ハードウェアカーソル。Mesa：NVK の`VkImportMemoryNocturneScanoutInfoMESA`、Zink の `WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT`、ngl_scanout（3 枚、`ST_FLUSH_WAIT` の後に PRESENT）。ブラウザー：全画面の canvas を直接表示、UA の `:not(:root):fullscreen { object-fit: contain; }` と canvas の object-fit。確認：host 試験（nvrm_display、NVK sync、Mesa screen、NVK RM）通過、全体ビルド、QEMU の pcitest 0 失敗（直接表示の許可・取消・ポインター・窓の終わり）、pagertest 73 検査 0 失敗、QEMU の実サイト（get.webgl.org、webglsamples の aquarium、YouTube の再生・全画面の出入り・スクロール）で回帰なし。直接表示そのものは QEMU に NVIDIA が無いので未確認（実機で `wm:` の行と全画面 WebGL）。`tests/pci_hosttest.c` は以前の改名で 39 件のコンパイル誤りがあり古いまま（今回は宣言の足りない 2 関数だけ足した）。
 - 2026-10-24（2）：起動後に画面が凍る問題。RM は表示エンジンを組まず、CPU の起動時の画面から GPU へ表示を移す処理が
   無かった（D10・C53）。`kernel-open` の GPL でない部分をすべて移植：nvidia-modeset（NVKMS と KAPI）、
   nvidia（`os_caps.c`＝C52、`os_ioctl.c`、`os_acpi.c`＝C54、BearSSL の SPDM 暗号 `spdm_crypto.c`、レジストリーと

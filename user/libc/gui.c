@@ -98,6 +98,9 @@ n_result win_set_title(window_t *win, const char *title) { return __syscall(SYS_
 n_result win_move(window_t *win, int x, int y) { return __syscall(SYS_WIN_MOVE, win->handle, x, y, 0, 0); }
 n_result win_state(window_t *win) { return win && !win->closed ? __syscall(SYS_WIN_STATE,win->handle,0,0,0,0) : -N_ERR_NO_HANDLE; }
 n_result win_fullscreen(window_t *win,bool enabled) { return win&&!win->closed?__syscall(SYS_WIN_PRESENTATION,win->handle,enabled,0,0,0):-N_ERR_NO_HANDLE; }
+n_result win_direct(window_t *win, bool wanted) {
+    return win && !win->closed ? __syscall(SYS_WIN_DIRECT, win->handle, wanted, 0, 0, 0) : -N_ERR_NO_HANDLE;
+}
 
 /* One system call takes every queued event that fits, waiting up to timeout. */
 static n_result fetch(window_t *win, int timeout) {

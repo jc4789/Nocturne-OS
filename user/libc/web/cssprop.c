@@ -3530,6 +3530,8 @@ const char *css_ua_sheet(void) {
            "dialog:modal { position: fixed; inset: 0; max-width: calc(100% - 2em - 6px); "
            "max-height: calc(100% - 2em - 6px); overflow: auto; }\n"
            "dialog::backdrop { display: block; position: fixed; inset: 0; background-color: rgba(0,0,0,0.1); }\n"
+           /* The rest of the fullscreen UA rule is forced (web_presentation_style); this part is not. */
+           ":not(:root):fullscreen { object-fit: contain; }\n"
            "html, address, blockquote, body, center, dialog, div, figure, figcaption, footer, form, header, hr, "
            "legend, listing, main, p, plaintext, pre, search, xmp, article, aside, h1, h2, h3, h4, h5, h6, hgroup, "
            "nav, section, dir, dd, dl, dt, menu, ol, ul, details, summary, fieldset, optgroup { display: block; }\n"

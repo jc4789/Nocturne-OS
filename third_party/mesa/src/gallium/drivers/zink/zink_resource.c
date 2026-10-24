@@ -54,6 +54,11 @@
 #define ZINK_USE_DMABUF
 #endif
 
+#if DETECT_OS_NOCTURNE
+/* VkImportMemoryNocturneScanoutInfoMESA */
+#include "vk_internal_exts.h"
+#endif
+
 #if defined(ZINK_USE_DMABUF) && !defined(_WIN32)
 #include "drm-uapi/drm_fourcc.h"
 #else
@@ -1008,6 +1013,11 @@ get_export_flags(struct zink_screen *screen, const struct pipe_resource *templ, 
       if (alloc_info->whandle->type == WINSYS_HANDLE_TYPE_FD ||
           alloc_info->whandle->type == ZINK_EXTERNAL_MEMORY_HANDLE)
          needs_export |= true;
+#if DETECT_OS_NOCTURNE
+      /* imported through its own struct in allocate_bo, not an external handle type */
+      else if (alloc_info->whandle->type == WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT)
+         ;
+#endif
       else
          UNREACHABLE("unknown handle type");
    }
@@ -1124,6 +1134,20 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
    }
 #endif
 
+#endif
+
+#if DETECT_OS_NOCTURNE
+   /* nvrm's direct-scanout image; pNext keeps the bo out of suballocation and
+    * the bo cache, so it is freed (and the import released) with the resource */
+   VkImportMemoryNocturneScanoutInfoMESA imnsi = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_NOCTURNE_SCANOUT_INFO_MESA,
+   };
+   if (alloc_info->whandle &&
+       alloc_info->whandle->type == WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT) {
+      imnsi.image = alloc_info->whandle->handle;
+      imnsi.pNext = mai.pNext;
+      mai.pNext = &imnsi;
+   }
 #endif
 
    VkImportMemoryHostPointerInfoEXT imhpi = {
@@ -1309,6 +1333,12 @@ create_buffer(struct zink_screen *screen, struct zink_resource_object *obj,
       alloc_info->flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
    else
       alloc_info->flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+#if DETECT_OS_NOCTURNE
+   /* nvrm's direct-scanout image is video memory the CPU never maps */
+   if (alloc_info->whandle &&
+       alloc_info->whandle->type == WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT)
+      alloc_info->flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+#endif
 
    obj->is_buffer = true;
    obj->transfer_dst = true;
@@ -2364,6 +2394,20 @@ zink_resource_from_handle(struct pipe_screen *pscreen,
    }
 #endif
 
+   return pres;
+#elif DETECT_OS_NOCTURNE
+   /* Only nvrm's direct-scanout images, as buffers GPU copies write the
+    * screen's pixels into */
+   if (whandle->type != WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT ||
+       templ->target != PIPE_BUFFER)
+      return NULL;
+
+   struct pipe_resource *pres = resource_create(pscreen, templ, whandle, usage, NULL, 0, NULL, NULL);
+   if (!pres)
+      return NULL;
+
+   tc_buffer_disable_cpu_storage(pres);
+   zink_resource(pres)->obj->immutable_handle = true;
    return pres;
 #else
    return NULL;
@@ -3589,6 +3633,10 @@ zink_screen_resource_init(struct pipe_screen *pscreen)
       pscreen->resource_get_handle = zink_resource_get_handle;
       pscreen->resource_from_handle = zink_resource_from_handle;
    }
+#if DETECT_OS_NOCTURNE
+   /* nvrm's direct-scanout images, which need no external-memory extension */
+   pscreen->resource_from_handle = zink_resource_from_handle;
+#endif
    if (screen->info.have_EXT_external_memory_host) {
       pscreen->resource_from_user_memory = zink_resource_from_user_memory;
    }

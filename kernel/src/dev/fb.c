@@ -202,7 +202,9 @@ static void scanout_show(struct scanout *o) {
 
 int64_t fb_scanout_check(const struct n_scanout *d, uint64_t *bytes) {
     if (!fb.addr || d->width != fb.width || d->height != fb.height) return -N_ERR_INVALID;
-    if (d->format != N_SCANOUT_XRGB8888 && d->format != N_SCANOUT_XRGB2101010) return -N_ERR_INVALID;
+    uint32_t format = d->format & N_SCANOUT_FORMAT_MASK;
+    if (d->format & ~(N_SCANOUT_FORMAT_MASK | N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
+    if (format != N_SCANOUT_XRGB8888 && format != N_SCANOUT_XRGB2101010) return -N_ERR_INVALID;
     if (d->pitch < (uint64_t)d->width * 4 || d->pitch % 4) return -N_ERR_INVALID;
     uint64_t rows = (uint64_t)d->pitch * d->height;
     if (d->offset % 4 || d->offset > UINT64_MAX - rows) return -N_ERR_INVALID;
@@ -216,7 +218,7 @@ int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, siz
     ASSERT(!o->map);
     void *map = vmalloc_map_frames(frames, pages, PTE_W | type | pte_nx);
     if (!map) return -N_ERR_NO_MEMORY;
-    bool deep = d->format == N_SCANOUT_XRGB2101010;
+    bool deep = (d->format & N_SCANOUT_FORMAT_MASK) == N_SCANOUT_XRGB2101010;
     uint8_t rsize = deep ? 10 : 8, gsize = rsize, bsize = rsize;
     build_lut(o->lut_r, &rsize, deep ? 20 : 16, 32);
     build_lut(o->lut_g, &gsize, deep ? 10 : 8, 32);

@@ -55,6 +55,24 @@ void ngl_clear_drawing_buffer(struct ngl_context *context);
 void ngl_mark_dirty(struct ngl_context *context);
 uint64_t ngl_dirty_serial(const struct ngl_context *context);
 
+/* Direct scanout: the drawing buffer copied on the GPU into images of the
+ * screen (nvrm's NVRM_SCANOUT) the display shows instead of the desktop while
+ * the system shows the app's fullscreen window directly (EV_DIRECT). NULL from
+ * create when the context does not draw on a GPU whose driver shows the
+ * screen. */
+struct ngl_scanout;
+struct ngl_scanout *ngl_scanout_create(struct ngl_context *context);
+void ngl_scanout_destroy(struct ngl_scanout *scanout);
+void ngl_scanout_size(const struct ngl_scanout *scanout, unsigned *width, unsigned *height);
+/* Copies the drawing buffer into the next image, scaled to x, y, width x
+ * height of the screen and black around it, and has it shown from the next
+ * vertical blank. Waits for the rendering and while an image presented before
+ * still waits for its blank. 1 shown; 0 not shown because the system does not
+ * show the window directly now; -1 failed. Unless 1, the caller presents the
+ * frame through its window (ngl_read_drawing_buffer). */
+int ngl_scanout_present(struct ngl_scanout *scanout, struct ngl_context *context, int x, int y, unsigned width,
+                        unsigned height);
+
 #ifdef __cplusplus
 }
 #endif

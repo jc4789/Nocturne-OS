@@ -679,6 +679,19 @@ static int64_t sys_pci_give_screen(int h,int surface,const struct n_scanout *ude
     handle_close(s);handle_close(pci);
     return r;
 }
+/* What the screen should show, for a driver whose scanout shows windows directly (dev/pciuser.c,
+   gui/wm.c). The state is copied out even when the time ran out. */
+static int64_t sys_pci_screen_state(int h,uint64_t seen,struct n_screen_state *uout,int64_t timeout_ms) {
+    if(!user_ok_w(uout,sizeof *uout))return -N_ERR_BAD_ADDRESS;
+    struct handle *pci=handle_get(h);
+    if(!pci)return -N_ERR_NO_HANDLE;
+    struct n_screen_state *st=kmalloc(sizeof *st);
+    int64_t r=st?pci_user_screen_state(pci,seen,st,timeout_ms):-N_ERR_NO_MEMORY;
+    handle_close(pci);
+    if((r==0||r==-N_ERR_TIMEOUT)&&copy_to_user(uout,st,sizeof *st))r=-N_ERR_BAD_ADDRESS;
+    kfree(st);
+    return r;
+}
 /* An ACPI object of the claimed function's part of the namespace (dev/pciuser.c). The arguments'
    data and the result go through kernel copies of at most ACPI_DATA_MAX and ACPI_OUT_MAX bytes. */
 #define ACPI_ARGS_MAX 7
@@ -2362,6 +2375,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_PCI_BAR: ret = sys_pci_bar((int)a,(uint32_t)b); break;
     case SYS_PCI_GIVE_SCREEN: ret = sys_pci_give_screen((int)a,(int)b,(const struct n_scanout *)c); break;
     case SYS_PCI_ACPI_EVAL: ret = sys_pci_acpi_eval((int)a,(const struct n_acpi_eval *)b,(void *)c,d); break;
+    case SYS_PCI_SCREEN_STATE: ret = sys_pci_screen_state((int)a,b,(struct n_screen_state *)c,(int64_t)d); break;
     case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
     case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
     case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:

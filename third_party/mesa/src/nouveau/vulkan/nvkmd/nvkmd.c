@@ -174,6 +174,20 @@ nvkmd_dev_import_dma_buf(struct nvkmd_dev *dev,
 }
 
 VkResult MUST_CHECK
+nvkmd_dev_import_nocturne_scanout(struct nvkmd_dev *dev,
+                                  struct vk_object_base *log_obj,
+                                  uint32_t image, uint64_t size_B,
+                                  struct nvkmd_mem **mem_out)
+{
+   VkResult result = nvkmd_nocturne_import_scanout(dev, log_obj, image,
+                                                   size_B, mem_out);
+   if (result == VK_SUCCESS)
+      nvkmd_dev_add_mem(dev, *mem_out);
+
+   return result;
+}
+
+VkResult MUST_CHECK
 nvkmd_dev_alloc_va(struct nvkmd_dev *dev,
                    struct vk_object_base *log_obj,
                    enum nvkmd_va_flags flags, uint8_t pte_kind,

@@ -59,6 +59,7 @@ struct window {
     struct gui_event frame_event; /* durable mailbox, not a droppable input event */
     int flags;
     bool shown, minimized, maximized, dead,fullscreen;
+    bool direct_wanted; /* win_direct: its own images shown by the display driver when it can be */
     bool deep; /* WIN_DEEP_COLOR: each surface ends with its deep plane (read while back_deep exists) */
     struct rect restore;
     struct rect fullscreen_restore;
@@ -86,6 +87,20 @@ static uint64_t frame_period_ms, frame_started_ms;
 #define VBLANK_LOST_MS 100
 static uint64_t vblank_count, vblank_ns, vblank_at_ms, vblank_drawn;
 static bool vblank_seen, vblank_waiting, vblank_pacing;
+/* Direct scanout (n_pci_screen_state, dev/pciuser.c): a display driver whose scanout has
+   N_SCANOUT_DIRECT (direct_able) shows one app's own images instead of the desktop while that app's
+   window asked for it (win_direct), is fullscreen and focused, and nothing of the system is drawn
+   over it (the moon menu, the volume panel, a toast, a resize outline) or sent to a remote viewer.
+   It then draws the pointer itself. The desktop is still composited into the driver's surface
+   meanwhile, so it is current the moment the driver shows it again. direct_state is what the
+   driver reads; its serial changes with every change of it, the pointer's moves included while a
+   window is shown. Under the WM lock. */
+#define DIRECT_HOT 8 /* desktop_draw_cursor draws every shape in a box from (x-8, y-8) */
+static bool direct_able;
+static struct window *direct_win;
+static int direct_shape = -1;
+static struct n_screen_state direct_state = {.serial = 1, .hot_x = DIRECT_HOT, .hot_y = DIRECT_HOT};
+static struct wait_queue direct_wq;
 /* Settings (struct desktop_settings): cadence, pointer speed with its
    leftover quarter steps, and the deep-colour mode the compositor applies
    between frames. */
@@ -359,6 +374,93 @@ static void minimize_window(struct window *w) {
     update_focus();
 }
 
+/* ---- direct scanout ---- */
+static bool direct_eligible(struct window *w) {
+    return direct_able && w && w->direct_wanted && w->fullscreen && visible(w) && w == focused() && !menu_open &&
+           !vol_open && !toast_until && !resize_visible && !remote_users;
+}
+
+static void direct_event(struct window *w, bool shown) {
+    struct gui_event e = {.type = EV_DIRECT, .key = shown};
+    push_event(w, &e);
+}
+
+/* Brings direct_state up to what the screen should show; the driver and the windows concerned
+   hear of a change. The compositor does this once per pass, after its input; a window's end does
+   it at once, so direct_win never outlives its window. */
+static void direct_update(void) {
+    struct window *w = focused();
+    if (!direct_eligible(w)) w = NULL;
+    bool changed = false;
+    if (w != direct_win) {
+        if (direct_win) {
+            direct_event(direct_win, false);
+            damage_window(direct_win); /* its own buffer shows again once it presents one */
+        }
+        if (w) direct_event(w, true);
+        direct_win = w;
+        direct_state.app = w ? (uint32_t)w->pid : 0;
+        if (!w) direct_state.pointer_shown = 0; /* the desktop's own picture has the pointer again */
+        changed = true;
+    }
+    if (w) {
+        if (direct_shape != cursor_shape) {
+            canvas_t c;
+            memset(direct_state.pointer, 0, sizeof direct_state.pointer);
+            gfx_init(&c, direct_state.pointer, N_SCREEN_POINTER_SIZE, N_SCREEN_POINTER_SIZE, N_SCREEN_POINTER_SIZE);
+            desktop_draw_cursor(&c, DIRECT_HOT, DIRECT_HOT, cursor_shape);
+            direct_shape = cursor_shape;
+            direct_state.pointer_serial++;
+            changed = true;
+        }
+        if (!direct_state.pointer_shown || direct_state.pointer_x != mx || direct_state.pointer_y != my) {
+            direct_state.pointer_shown = 1;
+            direct_state.pointer_x = mx;
+            direct_state.pointer_y = my;
+            changed = true;
+        }
+    }
+    if (changed) {
+        direct_state.serial++;
+        wq_wake_all(&direct_wq);
+    }
+}
+
+void wm_screen_direct(bool able) {
+    wm_lock();
+    if (direct_able != able) {
+        direct_able = able;
+        kprintf("wm: %s\n", able ? "the display driver can show fullscreen windows directly"
+                                  : "fullscreen windows are composited into the desktop again");
+        direct_update();
+    }
+    wm_unlock();
+}
+
+int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeout_ms) {
+    uint64_t deadline = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
+    int64_t result = 0;
+    wm_lock();
+    while (direct_state.serial == seen) {
+        uint64_t now = timeout_ms > 0 ? uptime_ms() : 0;
+        if (current_task->killed) { result = -N_ERR_STOPPED; break; }
+        if (timeout_ms == 0 || (timeout_ms > 0 && now >= deadline)) { result = -N_ERR_TIMEOUT; break; }
+        /* Syscalls and the compositor run on the BSP: with interrupts off nothing changes the state
+           between the look and the wait. */
+        uint64_t fl = irq_save();
+        wm_unlock();
+        if (direct_state.serial == seen) {
+            if (timeout_ms > 0) wq_wait_timeout(&direct_wq, deadline - now);
+            else wq_wait(&direct_wq);
+        }
+        irq_restore(fl);
+        wm_lock();
+    }
+    *out = direct_state;
+    wm_unlock();
+    return result;
+}
+
 /* ---- window lifetime ---- */
 static void unmap_user(struct window *w) {
     if (!w->pml4) return;
@@ -396,6 +498,7 @@ static void win_destroy_locked(struct window *w) {
     if (hover_win == w) hover_win = NULL;
     if (last_focus == w) last_focus = NULL;
     update_focus();
+    if (direct_win == w) direct_update();
     wq_wake_all(&w->wq);
     object_notify(&w->object);
     wake_compositor();
@@ -2183,6 +2286,7 @@ static void wm_thread(void *arg) {
             struct rect t = toast_rect();
             damage_rect(t.x, t.y, t.w, t.h);
         }
+        direct_update();
         fl = irq_save();
         now = uptime_ms();
         bool render = (ndamage || pending_frames) && frame_due(now);
@@ -2586,7 +2690,17 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct window *w=handle_window(handle);
         if(!w)return -N_ERR_NO_HANDLE;
         if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;
-        return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0) | (w->fullscreen?WIN_STATE_FULLSCREEN:0);
+        return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0) | (w->fullscreen?WIN_STATE_FULLSCREEN:0) |
+               (direct_win==w?WIN_STATE_DIRECT:0);
+    }
+    case SYS_WIN_DIRECT: {
+        struct window *w = handle_window(handle);
+        if (!w) return -N_ERR_NO_HANDLE;
+        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (b > 1) return -N_ERR_INVALID;
+        w->direct_wanted = b != 0;
+        direct_update();
+        return 0;
     }
     case SYS_WIN_PRESENTATION: {
         struct window *w=handle_window(handle);if(!w)return -N_ERR_NO_HANDLE;
@@ -2786,7 +2900,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         return result;
     }
     if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENTATION || num == SYS_WIN_PRESENT ||
-        num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE)
+        num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE || num == SYS_WIN_DIRECT)
         handle = handle_get((int)a);
     wm_lock();
     int64_t result = wm_syscall_locked(num,a,b,c,d,e,handle);

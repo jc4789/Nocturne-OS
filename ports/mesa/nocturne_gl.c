@@ -11,8 +11,10 @@
 #include "pipe/p_state.h"
 #include "softpipe/sp_public.h"
 #ifdef GALLIUM_ZINK
+#include "frontend/winsys_handle.h"
 #include "zink/zink_public.h"
 #include "nvrm.h"
+#include "nvstatus.h"
 
 /* Zink opens "vulkan" through util/u_dl.c, which only refers weakly to the Vulkan driver's entry
  * point; this reference is what links the driver (NVK) into a program that draws with OpenGL. */
@@ -439,3 +441,182 @@ void ngl_clear_drawing_buffer(struct ngl_context *c) {
 void ngl_mark_dirty(struct ngl_context *c) { c->dirty++; }
 
 uint64_t ngl_dirty_serial(const struct ngl_context *c) { return c->dirty; }
+
+/* ---- direct scanout ---- */
+
+#ifdef GALLIUM_ZINK
+/* Three images in turn: once nvrm_scanout_present returns, the image presented
+   two before is no longer read by the display and can be drawn again. */
+#define SCANOUT_IMAGES 3
+
+struct ngl_scanout {
+    struct nvrm *rm; /* the images live as long as this connection */
+    struct pipe_screen *screen;
+    unsigned width, height, pitch;
+    unsigned next;
+    struct {
+        uint32_t image;
+        struct pipe_resource *buffer; /* the image's video memory, imported into the driver */
+        bool placed;                  /* x, y, width, height is where the image holds the picture */
+        int x, y;
+        unsigned width, height;
+    } images[SCANOUT_IMAGES];
+    struct pipe_resource *scaled; /* the drawing buffer at the size it is shown */
+};
+
+void ngl_scanout_destroy(struct ngl_scanout *s) {
+    if (!s) return;
+    pipe_resource_reference(&s->scaled, NULL);
+    for (unsigned i = 0; i < SCANOUT_IMAGES; i++) {
+        pipe_resource_reference(&s->images[i].buffer, NULL);
+        if (s->images[i].image) nvrm_scanout_destroy(s->rm, s->images[i].image);
+    }
+    nvrm_disconnect(s->rm);
+    FREE(s);
+}
+
+struct ngl_scanout *ngl_scanout_create(struct ngl_context *c) {
+    if (!c || !c->on_gpu) return NULL;
+    struct pipe_screen *screen = c->base.fscreen->screen;
+    if (!screen->resource_from_handle) return NULL;
+    struct ngl_scanout *s = CALLOC_STRUCT(ngl_scanout);
+    if (!s) return NULL;
+    s->screen = screen;
+    if (!(s->rm = nvrm_connect_ready())) {
+        FREE(s);
+        return NULL;
+    }
+    for (unsigned i = 0; i < SCANOUT_IMAGES; i++) {
+        uint32_t image = 0, width = 0, height = 0, pitch = 0;
+        uint64_t bytes = 0;
+        if (nvrm_scanout_create(s->rm, &image, &width, &height, &pitch, &bytes) != 0 || !image) goto fail;
+        s->images[i].image = image;
+        if (i == 0) {
+            s->width = width;
+            s->height = height;
+            s->pitch = pitch;
+        }
+        /* The copies address the image in whole pixels; the driver maps the buffer in pages,
+           which must lie within the image. */
+        uint64_t used = (uint64_t)pitch * height;
+        if (width != s->width || height != s->height || pitch != s->pitch || !width || !height || pitch % 4 ||
+            pitch / 4 < width || used > UINT32_MAX || (used + 4095) / 4096 * 4096 > bytes)
+            goto fail;
+
+        struct winsys_handle handle;
+        memset(&handle, 0, sizeof handle);
+        handle.type = WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT;
+        handle.handle = image;
+        handle.format = PIPE_FORMAT_R8_UNORM;
+        struct pipe_resource templ;
+        memset(&templ, 0, sizeof templ);
+        templ.target = PIPE_BUFFER;
+        templ.format = PIPE_FORMAT_R8_UNORM;
+        templ.width0 = (unsigned)used;
+        templ.height0 = templ.depth0 = templ.array_size = 1;
+        templ.usage = PIPE_USAGE_DEFAULT;
+        if (!(s->images[i].buffer = screen->resource_from_handle(screen, &templ, &handle, 0))) goto fail;
+    }
+    return s;
+fail:
+    ngl_scanout_destroy(s);
+    return NULL;
+}
+
+void ngl_scanout_size(const struct ngl_scanout *s, unsigned *width, unsigned *height) {
+    *width = s ? s->width : 0;
+    *height = s ? s->height : 0;
+}
+
+/* The drawing buffer at width x height: itself, or scaled linearly into s->scaled */
+static struct pipe_resource *scanout_source(struct ngl_scanout *s, struct pipe_context *pipe,
+                                            struct pipe_resource *color, unsigned width, unsigned height) {
+    if (color->width0 == width && color->height0 == height) return color;
+    if (!s->scaled || s->scaled->width0 != width || s->scaled->height0 != height ||
+        s->scaled->format != color->format) {
+        pipe_resource_reference(&s->scaled, NULL);
+        struct pipe_resource templ;
+        memset(&templ, 0, sizeof templ);
+        templ.target = PIPE_TEXTURE_2D;
+        templ.format = color->format;
+        templ.width0 = width;
+        templ.height0 = height;
+        templ.depth0 = templ.array_size = 1;
+        templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+        if (!(s->scaled = s->screen->resource_create(s->screen, &templ))) return NULL;
+    }
+    struct pipe_blit_info blit;
+    memset(&blit, 0, sizeof blit);
+    blit.src.resource = color;
+    blit.src.format = color->format;
+    u_box_2d(0, 0, color->width0, color->height0, &blit.src.box);
+    blit.dst.resource = s->scaled;
+    blit.dst.format = s->scaled->format;
+    u_box_2d(0, 0, width, height, &blit.dst.box);
+    blit.mask = PIPE_MASK_RGBA;
+    blit.filter = PIPE_TEX_FILTER_LINEAR;
+    pipe->blit(pipe, &blit);
+    return s->scaled;
+}
+
+int ngl_scanout_present(struct ngl_scanout *s, struct ngl_context *c, int x, int y, unsigned width,
+                        unsigned height) {
+    if (!s || !c || !c->on_gpu || c->base.fscreen->screen != s->screen || !width || !height || x < 0 || y < 0 ||
+        (unsigned)x >= s->width || (unsigned)y >= s->height || width > s->width - (unsigned)x ||
+        height > s->height - (unsigned)y)
+        return -1;
+    struct pipe_context *pipe = c->st->pipe;
+    unsigned index = s->next;
+    struct pipe_resource *buffer = s->images[index].buffer;
+    uint32_t zero = 0;
+    bool moved = !s->images[index].placed || s->images[index].x != x || s->images[index].y != y ||
+                 s->images[index].width != width || s->images[index].height != height;
+    if (moved) {
+        /* Black around the picture: each image is cleared whole once for each place it shows it at. */
+        pipe->clear_buffer(pipe, buffer, 0, buffer->width0, &zero, sizeof zero);
+        s->images[index].placed = false;
+    }
+    struct pipe_resource *color = c->textures[ST_ATTACHMENT_BACK_LEFT];
+    if (color && c->tex_width == c->width && c->tex_height == c->height) {
+        /* Rows go top-down, the orientation ngl_read_drawing_buffer reads. With alpha the color is
+           premultiplied (callers present nothing else), which over black is the color shown. */
+        struct pipe_resource *source = scanout_source(s, pipe, color, width, height);
+        if (!source) return -1;
+        struct pipe_box box;
+        u_box_2d(0, 0, width, height, &box);
+        pipe->image_copy_buffer(pipe, buffer, source, (unsigned)y * s->pitch + (unsigned)x * 4, s->pitch, 0, 0,
+                                &box);
+    } else if (!moved) {
+        /* Nothing drawn since the buffer was (re)made: transparent black, over black. */
+        pipe->clear_buffer(pipe, buffer, 0, buffer->width0, &zero, sizeof zero);
+    }
+    st_context_flush(c->st, ST_FLUSH_WAIT, NULL, NULL, NULL);
+    s->images[index].placed = true;
+    s->images[index].x = x;
+    s->images[index].y = y;
+    s->images[index].width = width;
+    s->images[index].height = height;
+    uint32_t status = nvrm_scanout_present(s->rm, s->images[index].image);
+    if (status != NV_OK) return status == NV_ERR_INVALID_STATE ? 0 : -1;
+    s->next = (index + 1) % SCANOUT_IMAGES;
+    return 1;
+}
+#else
+struct ngl_scanout *ngl_scanout_create(struct ngl_context *c) {
+    (void)c;
+    return NULL;
+}
+
+void ngl_scanout_destroy(struct ngl_scanout *s) { (void)s; }
+
+void ngl_scanout_size(const struct ngl_scanout *s, unsigned *width, unsigned *height) {
+    (void)s;
+    *width = *height = 0;
+}
+
+int ngl_scanout_present(struct ngl_scanout *s, struct ngl_context *c, int x, int y, unsigned width,
+                        unsigned height) {
+    (void)s; (void)c; (void)x; (void)y; (void)width; (void)height;
+    return -1;
+}
+#endif

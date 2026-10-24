@@ -422,3 +422,45 @@ uint32_t nvrm_uvm_poll(struct nvrm *rm, int32_t file, int64_t timeout_ms, uint32
         }
     }
 }
+
+/* ---- Direct scanout (NVRM_SCANOUT) ---- */
+
+/* One NVRM_SCANOUT request; nvrm's status, or the transport's failure. */
+static uint32_t scanout_request(struct nvrm *rm, struct nvrm_scanout_request *s) {
+    nvrm_lock(rm);
+    uint32_t r = request(rm, NVRM_SCANOUT, s, sizeof *s, NULL, NULL, NULL);
+    nvrm_unlock(rm);
+    return r == NV_OK ? s->status : r;
+}
+
+uint32_t nvrm_scanout_create(struct nvrm *rm, uint32_t *image, uint32_t *width, uint32_t *height,
+                             uint32_t *pitch, uint64_t *bytes) {
+    struct nvrm_scanout_request s = {.op = NVRM_SCANOUT_CREATE};
+    uint32_t r = scanout_request(rm, &s);
+    if (r == NV_OK) {
+        *image = s.image;
+        *width = s.width;
+        *height = s.height;
+        *pitch = s.pitch;
+        *bytes = s.bytes;
+    }
+    return r;
+}
+
+uint32_t nvrm_scanout_destroy(struct nvrm *rm, uint32_t image) {
+    struct nvrm_scanout_request s = {.op = NVRM_SCANOUT_DESTROY, .image = image};
+    return scanout_request(rm, &s);
+}
+
+uint32_t nvrm_scanout_present(struct nvrm *rm, uint32_t image) {
+    struct nvrm_scanout_request s = {.op = NVRM_SCANOUT_PRESENT, .image = image};
+    return scanout_request(rm, &s);
+}
+
+uint32_t nvrm_scanout_import(struct nvrm *rm, uint32_t image, uint32_t client, uint32_t parent, uint32_t *object) {
+    struct nvrm_scanout_request s = {.op = NVRM_SCANOUT_IMPORT, .image = image, .client = client, .parent = parent,
+                                     .object = *object};
+    uint32_t r = scanout_request(rm, &s);
+    if (r == NV_OK) *object = s.object;
+    return r;
+}

@@ -1791,6 +1791,13 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
     case EV_CLOSE:
         emit(w, UI_EVENT_CLOSE, NULL, 0, 0, 0, 0, NULL, 0);
         break;
+    case EV_DIRECT:
+        emit(w, UI_EVENT_DIRECT, NULL, 0, 0, e->key ? 1 : 0, 0, NULL, 0);
+        if (!e->key) {
+            w->shown_px = NULL; /* the window is shown again: painted whole */
+            w->dirty = true;
+        }
+        break;
     }
 }
 

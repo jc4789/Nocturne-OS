@@ -35,8 +35,8 @@ void fb_drop_holds(void);
 /* Where fb_present writes (dev/fb.c, "where the screen is drawn"): the firmware's framebuffer
    (fb.addr) until a display driver gives the system its own scanout (n_pci_give_screen,
    dev/pciuser.c, the only caller, one call at a time). fb_scanout_check: whether d describes a
-   scanout of this screen's size in a format fb_present writes, and the bytes from d->offset it
-   spans. fb_scanout_take: draw into the given pages from now on, mapped with the memory type in
+   scanout of this screen's size in a format fb_present writes (N_SCANOUT_DIRECT is the only flag
+   it may carry; what it means is the window manager's), and the bytes from d->offset it spans. fb_scanout_take: draw into the given pages from now on, mapped with the memory type in
    type (PTE bits, the type every other mapping of them has), the first row first_byte into the
    first page; a surface shown before is no longer mapped when it returns. fb_scanout_boot: the
    firmware's framebuffer again. Both return once no present writes to the old one any more; the

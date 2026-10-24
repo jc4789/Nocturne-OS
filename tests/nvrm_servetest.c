@@ -9,7 +9,9 @@
    - past the kernel's per-app thread limit the server refuses new clients without failing,
      keeps serving the others and takes a new client once one has gone;
    - NVRM_UVM requests reach the UVM layer (here a fake) with the client's arena, the memory a
-     map attaches stays the layer's, and a connection's UVM state ends before its RM file.
+     map attaches stays the layer's, and a connection's UVM state ends before its RM file;
+   - NVRM_SCANOUT requests reach the screen (display.c, here a fake) with the client's RM file
+     and principal, and a connection's images end before its RM file.
    No GPU and no PCI claim are needed. Prints "nvrm_servetest: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,7 @@
 #include "nvrm_protocol.h"
 #include "../ports/nvidia/nvrm_serve.h"
 #include "../ports/nvidia/uvm_nvrm.h"
+#include "../ports/nvidia/display.h"
 #include "nvtypes.h"
 #include "nvstatus.h"
 #include "nvos.h"
@@ -57,7 +60,9 @@ static int failed;
 struct fake_file {
     struct fake_file *next;
     uint32_t id, principal, owner, closes, map_memory, unmaps;
+    uint32_t display_ends;       /* nvrm_display_connection_end calls */
     bool admin, map_pending;
+    bool display_ended_open;     /* the last of them came before the file was closed */
     uint64_t map_linear, unmapped_linear;
     n_handle mapping; /* the view RM keeps until unmap or close */
 };
@@ -344,6 +349,58 @@ void nvrm_uvm_client_end(struct nvrm_uvm_client *c) {
     mtx_unlock(&fake.lock);
 }
 
+/* ---- the fake screen (display.h) ---- */
+
+#define FAKE_IMAGE 5u
+#define FAKE_DUP 0xd1u
+
+static struct {
+    unsigned requests;
+    uint32_t principal, file, client, parent;
+} screen;
+
+n_result nvrm_display_scanout(void *file, uint32_t principal, void *args, uint32_t size) {
+    if (size != sizeof(struct nvrm_scanout_request)) return -N_ERR_INVALID;
+    struct nvrm_scanout_request *r = args;
+    mtx_lock(&fake.lock);
+    screen.requests++;
+    screen.principal = principal;
+    screen.file = ((struct fake_file *)file)->id;
+    mtx_unlock(&fake.lock);
+    r->status = NV_OK;
+    switch (r->op) {
+    case NVRM_SCANOUT_CREATE:
+        r->image = FAKE_IMAGE;
+        r->width = 1920;
+        r->height = 1080;
+        r->pitch = 7680;
+        r->bytes = 7680ull * 1080;
+        break;
+    case NVRM_SCANOUT_DESTROY:
+    case NVRM_SCANOUT_PRESENT:
+        if (r->image != FAKE_IMAGE) r->status = NV_ERR_INVALID_OBJECT_HANDLE;
+        break;
+    case NVRM_SCANOUT_IMPORT:
+        mtx_lock(&fake.lock);
+        screen.client = r->client;
+        screen.parent = r->parent;
+        mtx_unlock(&fake.lock);
+        if (!r->object) r->object = FAKE_DUP;
+        break;
+    default:
+        r->status = NV_ERR_INVALID_ARGUMENT;
+    }
+    return 0;
+}
+
+void nvrm_display_connection_end(void *file) {
+    struct fake_file *f = file;
+    mtx_lock(&fake.lock);
+    f->display_ends++;
+    f->display_ended_open = !f->closes;
+    mtx_unlock(&fake.lock);
+}
+
 /* A copy of file `id`'s record, taken under the lock. */
 static struct fake_file file_record(uint32_t id) {
     struct fake_file copy = {.mapping = -1};
@@ -596,6 +653,50 @@ static void test_uvm(void) {
     CHECK(with_arena == all, "UVM's end ran with the client's arena still there");
 }
 
+static void test_scanout(void) {
+    struct nvrm *rm = NULL;
+    int64_t s = nvrm_connect_device_status(TARGET, &rm);
+    CHECK(s >= 0, "scanout client: %s", n_result_text(s));
+    if (!rm) return;
+    uint32_t id = echo(rm, 1, FAKE_CMD_ECHO, 0x5c);
+    uint32_t image = 0, width = 0, height = 0, pitch = 0;
+    uint64_t bytes = 0;
+    uint32_t r = nvrm_scanout_create(rm, &image, &width, &height, &pitch, &bytes);
+    CHECK(r == NV_OK && image == FAKE_IMAGE && width == 1920 && height == 1080 && pitch == 7680 &&
+              bytes == 7680ull * 1080,
+          "scanout create: %#x, image %u %ux%u pitch %u", r, image, width, height, pitch);
+    mtx_lock(&fake.lock);
+    uint32_t principal = screen.principal, file = screen.file;
+    mtx_unlock(&fake.lock);
+    CHECK(principal == (uint32_t)n_app_self(), "the screen sees the authenticated app (%u)", principal);
+    CHECK(file == id, "the screen gets the client's own RM file (%u, not %u)", file, id);
+    r = nvrm_scanout_present(rm, image);
+    CHECK(r == NV_OK, "scanout present: %#x", r);
+    r = nvrm_scanout_present(rm, image + 1);
+    CHECK(r == NV_ERR_INVALID_OBJECT_HANDLE, "the screen's status comes back: %#x", r);
+    uint32_t object = 0;
+    r = nvrm_scanout_import(rm, image, 0xc100, 0xc101, &object);
+    mtx_lock(&fake.lock);
+    uint32_t client = screen.client, parent = screen.parent;
+    mtx_unlock(&fake.lock);
+    CHECK(r == NV_OK && object == FAKE_DUP && client == 0xc100 && parent == 0xc101,
+          "scanout import: %#x, object %#x, client %#x parent %#x", r, object, client, parent);
+    object = 0x77;
+    r = nvrm_scanout_import(rm, image, 0xc100, 0xc101, &object);
+    CHECK(r == NV_OK && object == 0x77, "scanout import keeps the handle asked for: %#x, %#x", r, object);
+    r = nvrm_scanout_destroy(rm, image);
+    CHECK(r == NV_OK, "scanout destroy: %#x", r);
+    uint64_t small = 0;
+    r = nvrm_escape(rm, NVRM_SCANOUT, &small, sizeof small);
+    CHECK(r == NV_ERR_OPERATING_SYSTEM, "a malformed scanout request is refused: %#x", r);
+    CHECK(!file_record(id).display_ends, "the connection's images are not ended while it lasts");
+    nvrm_disconnect(rm);
+    CHECK(wait_closed(id), "the scanout client's RM file closed");
+    struct fake_file f = file_record(id);
+    CHECK(f.display_ends == 1 && f.display_ended_open,
+          "the connection's images ended once, before its RM file closed (%u)", f.display_ends);
+}
+
 struct worker {
     thrd_t thread;
     bool started;
@@ -791,6 +892,7 @@ int main(void) {
         test_concurrent();
         CHECK(uvm_ends() == ends, "clients that never asked for UVM have no UVM state to end");
         test_uvm();
+        test_scanout();
         test_blocking();
         test_thread_limit();
     }

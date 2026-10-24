@@ -64,6 +64,7 @@ enum {
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
     SYS_WIN_RECEIVE, /* (window, struct gui_event *out, max, timeout_ms): count, 0 on timeout */
+    SYS_WIN_DIRECT,  /* (window, wanted): ask to be shown by the display driver directly (EV_DIRECT) */
     SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
@@ -122,6 +123,8 @@ enum {
     /* A claimed function's part of the ACPI namespace (docs/nocturne-native-abi.md §9) */
     SYS_PCI_ACPI_EVAL,     /* (pci, const struct n_acpi_eval *, out, out_size): bytes written */
     SYS_PCI_ACPI_NOTIFY_TAKE, /* (pci, timeout_ms): the next Notify value of the function's node */
+    /* A display driver that shows windows directly (N_SCANOUT_DIRECT) follows the screen */
+    SYS_PCI_SCREEN_STATE,  /* (pci, seen serial, struct n_screen_state *out, timeout_ms) */
     SYS_MAX = 208          /* above every number (what syscallfuzz tries) */
 };
 
@@ -320,9 +323,31 @@ struct n_pci_function {
 #define N_SCANOUT_XRGB8888 1u    /* 32 bits: x8 r8 g8 b8, blue in the lowest byte */
 #define N_SCANOUT_XRGB2101010 2u /* 32 bits: x2 r10 g10 b10, blue in the lowest bits */
 #define N_SCANOUT_BOOT (-1)      /* the surface argument: the firmware's framebuffer again */
+/* A flag in format: the driver can show a window's own images instead of the desktop and draw
+   the pointer itself while it does (n_pci_screen_state says when and where). */
+#define N_SCANOUT_DIRECT 0x100u
+#define N_SCANOUT_FORMAT_MASK 0xffu
 struct n_scanout {
     uint32_t width, height, pitch, format;
     uint64_t offset;
+};
+
+/* n_pci_screen_state: what the screen should show, for a driver whose scanout has N_SCANOUT_DIRECT.
+   serial changes with every change of what follows and is never 0. app is the app (n_app_self's
+   number) whose fullscreen window the system lets show its own images directly, 0 when the
+   desktop is shown. While app is not 0 the driver draws the pointer: at pointer_x, pointer_y on
+   the screen (where its hot spot goes) when pointer_shown, the image in pointer (rows of
+   N_SCREEN_POINTER_SIZE pixels of 0xAARRGGBB, not premultiplied, transparent outside the shape)
+   with its hot spot at hot_x, hot_y; pointer_serial changes when the image does. */
+#define N_SCREEN_POINTER_SIZE 32u
+struct n_screen_state {
+    uint64_t serial;
+    uint32_t app;
+    uint32_t pointer_shown;
+    int32_t pointer_x, pointer_y;
+    uint32_t hot_x, hot_y;
+    uint32_t pointer_serial, reserved;
+    uint32_t pointer[N_SCREEN_POINTER_SIZE * N_SCREEN_POINTER_SIZE];
 };
 
 /* n_pci_acpi_eval: an ACPI object, an argument or a result. An integer's value is the number; a
@@ -403,6 +428,7 @@ struct n_audio_status {
 enum {
     EV_NONE = 0, EV_KEY, EV_MOUSE_MOVE, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_CLOSE, EV_FOCUS, EV_UNFOCUS,
     EV_WHEEL, EV_RESIZE, EV_FRAME,
+    EV_DIRECT, /* key 1: the window's own images are shown directly (win_direct); 0: no longer */
 };
 
 struct gui_event {
@@ -433,6 +459,7 @@ struct gui_event {
 #define WIN_STATE_VISIBLE 1
 #define WIN_STATE_FOCUSED 2
 #define WIN_STATE_FULLSCREEN 4
+#define WIN_STATE_DIRECT 8 /* the display driver shows the window's own images (EV_DIRECT) */
 
 struct screen_info {
     uint32_t width, height;

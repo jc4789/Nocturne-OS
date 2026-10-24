@@ -1,4 +1,5 @@
-/* 実frontendのscreen選択を使う。GPU未readyからreadyへの遷移と旧screenを検査する。 */
+/* 実frontendのscreen選択を使う。GPU未readyからreadyへの遷移と旧screenを検査する。
+   直接表示（ngl_scanout）の作成・提示・破棄と、GPUの無い文脈で作らないことも検査する。 */
 #include <stdio.h>
 #include "../ports/mesa/nocturne_gl.c"
 
@@ -38,6 +39,102 @@ static void *map(struct pipe_context *pipe, struct pipe_resource *res, unsigned 
 }
 static void unmap(struct pipe_context *pipe, struct pipe_transfer *transfer) { (void)pipe; (void)transfer; }
 
+/* 直接表示の画像：8x4、行は64バイト、1ページ。 */
+static unsigned scanout_creates, scanout_destroys, scanout_presents, imports, destroyed, buffer_clears, copies, flushes;
+static uint32_t present_status, last_presented;
+static unsigned copy_offset, copy_stride;
+static struct pipe_resource imported[3];
+uint32_t nvrm_scanout_create(struct nvrm *rm, uint32_t *image, uint32_t *width, uint32_t *height,
+                             uint32_t *pitch, uint64_t *bytes) {
+    CHECK(rm == (struct nvrm *)&daemon_ready);
+    *image = 0x100 + scanout_creates++; *width = 8; *height = 4; *pitch = 64; *bytes = 4096;
+    return NV_OK;
+}
+uint32_t nvrm_scanout_destroy(struct nvrm *rm, uint32_t image) {
+    CHECK(rm == (struct nvrm *)&daemon_ready && image >= 0x100 && image < 0x103); scanout_destroys++; return NV_OK;
+}
+uint32_t nvrm_scanout_present(struct nvrm *rm, uint32_t image) {
+    (void)rm; last_presented = image; scanout_presents++; return present_status;
+}
+static struct pipe_resource *from_handle(struct pipe_screen *screen, const struct pipe_resource *templ,
+                                         struct winsys_handle *handle, unsigned usage) {
+    CHECK(handle->type == WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT && handle->handle == 0x100 + imports);
+    CHECK(templ->target == PIPE_BUFFER && templ->width0 == 64 * 4 && usage == 0);
+    struct pipe_resource *r = &imported[imports++ % 3];
+    memset(r, 0, sizeof *r);
+    r->target = PIPE_BUFFER; r->width0 = templ->width0; r->screen = screen;
+    pipe_reference_init(&r->reference, 1);
+    return r;
+}
+static void resource_destroy(struct pipe_screen *screen, struct pipe_resource *r) {
+    (void)screen; CHECK(r >= imported && r < imported + 3); destroyed++;
+}
+static void clear_buffer(struct pipe_context *pipe, struct pipe_resource *res, unsigned offset, unsigned size,
+                         const void *value, int value_size) {
+    (void)pipe;
+    CHECK(offset == 0 && size == res->width0 && value_size == 4 && *(const uint32_t *)value == 0);
+    buffer_clears++;
+}
+static void copy_buffer(struct pipe_context *pipe, struct pipe_resource *dst, struct pipe_resource *src,
+                        unsigned offset, unsigned stride, unsigned layer_stride, unsigned level,
+                        const struct pipe_box *box) {
+    (void)pipe; (void)src;
+    CHECK(dst->target == PIPE_BUFFER && layer_stride == 0 && level == 0 && box->width == 4 && box->height == 2);
+    copy_offset = offset; copy_stride = stride; copies++;
+}
+void st_context_flush(struct st_context *st, unsigned flags, struct pipe_fence_handle **fence,
+                      void (*before_flush_cb)(void *), void *args) {
+    (void)st; (void)fence; (void)before_flush_cb; (void)args; CHECK(flags == ST_FLUSH_WAIT); flushes++;
+}
+
+static void scanout_cases(struct ngl_context *cpu, struct ngl_context *gpu) {
+    unsigned before_probes = probes, before_closes = closes;
+    /* GPUの無い文脈（softpipe）はnvrmへ繋がず、直接表示を作らない：窓の経路のまま。 */
+    CHECK(!ngl_scanout_create(cpu) && probes == before_probes && scanout_creates == 0);
+    /* 取込みのできないscreenでも作らない。 */
+    CHECK(!ngl_scanout_create(gpu) && probes == before_probes);
+    hardware.resource_from_handle = from_handle;
+    hardware.resource_destroy = resource_destroy;
+    struct ngl_scanout *s = ngl_scanout_create(gpu);
+    CHECK(s && scanout_creates == 3 && imports == 3 && probes == before_probes + 1);
+    unsigned width = 0, height = 0;
+    ngl_scanout_size(s, &width, &height);
+    CHECK(width == 8 && height == 4);
+    struct pipe_context pipe = {.clear_buffer = clear_buffer, .image_copy_buffer = copy_buffer};
+    static struct st_context st;
+    st.pipe = &pipe;
+    gpu->st = &st;
+    /* CPUの文脈と画面の外は提示しない。 */
+    CHECK(ngl_scanout_present(s, cpu, 0, 0, 8, 4) == -1);
+    CHECK(ngl_scanout_present(s, gpu, 1, 0, 8, 4) == -1 && ngl_scanout_present(s, gpu, 0, 0, 0, 4) == -1);
+    CHECK(scanout_presents == 0 && buffer_clears == 0);
+    /* 何も描かれていない：画像を黒で埋めて提示し、次の画像へ進む。 */
+    present_status = NV_OK;
+    CHECK(ngl_scanout_present(s, gpu, 0, 0, 8, 4) == 1 && last_presented == 0x100 && buffer_clears == 1 && flushes == 1);
+    /* 系が直接表示をやめた直後：0を返し、同じ画像を次も使う。 */
+    present_status = NV_ERR_INVALID_STATE;
+    CHECK(ngl_scanout_present(s, gpu, 0, 0, 8, 4) == 0 && last_presented == 0x101 && buffer_clears == 2);
+    /* 描画バッファーと同じ大きさ：位置(2,1)へ行の間隔64で写し、場所の変わった画像は先に黒で埋める。 */
+    struct pipe_resource color = {.target = PIPE_TEXTURE_2D, .width0 = 4, .height0 = 2};
+    gpu->textures[ST_ATTACHMENT_BACK_LEFT] = &color;
+    gpu->width = gpu->tex_width = 4;
+    gpu->height = gpu->tex_height = 2;
+    present_status = NV_OK;
+    CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == 1 && last_presented == 0x101 && buffer_clears == 3);
+    CHECK(copies == 1 && copy_offset == 1 * 64 + 2 * 4 && copy_stride == 64);
+    /* 同じ場所なら黒で埋め直さない（三枚目は初めてなので埋める）。 */
+    CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == 1 && last_presented == 0x102 && buffer_clears == 4);
+    CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == 1 && last_presented == 0x100 && buffer_clears == 5);
+    CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == 1 && last_presented == 0x101 && buffer_clears == 5 && copies == 4);
+    /* ドライバーの失敗は-1：呼出し側はこの文脈の直接表示をやめる。 */
+    present_status = NV_ERR_GENERIC;
+    CHECK(ngl_scanout_present(s, gpu, 2, 1, 4, 2) == -1 && last_presented == 0x102);
+    gpu->textures[ST_ATTACHMENT_BACK_LEFT] = NULL;
+    ngl_scanout_destroy(s);
+    CHECK(scanout_destroys == 3 && destroyed == 3 && closes == before_closes + 1);
+    gpu->st = NULL;
+}
+
 int main(void) {
     struct pipe_frontend_screen *first = get_screen();
     CHECK(first && first->screen == &software && cpu_attempts == 1 && gpu_attempts == 0);
@@ -63,6 +160,7 @@ int main(void) {
     init_texture(&pipe, &texture, 0, old.on_gpu);
     init_texture(&pipe, &texture, 0, newer.on_gpu);
     CHECK(cpu_maps == 1 && gpu_clears == 1);
+    scanout_cases(&old, &newer);
     free(first); free(later);
     printf("Mesa screenホスト試験: %u件失敗（実描画は未検証）\n", failures);
     return failures != 0;

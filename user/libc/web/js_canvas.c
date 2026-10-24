@@ -1071,16 +1071,42 @@ done:
     JS_FreeCString(ctx,text); return out;
 }
 
-void web_canvas_paint(node_t *n,canvas_t *dst,int x,int y,int w,int h) {
+bool web_canvas_fit(const node_t *n,const style_t *st,int x,int y,int w,int h,int fit[4]) {
+    /* The bitmap's size; before it exists, the size the attributes give it. */
+    const struct web_canvas *c=n?n->canvas:NULL;
+    unsigned bw=c&&c->w&&c->h?c->w:n?web_canvas_dimension(n,"width"):0;
+    unsigned bh=c&&c->w&&c->h?c->h:n?web_canvas_dimension(n,"height"):0;
+    if (!bw || !bh || w<=0 || h<=0) return false;
+    double fw=w,fh=h;
+    if (st && st->object_fit!=OF_FILL) {
+        /* As for images: the bitmap's own size scaled to contain or cover the content box. */
+        double factor=st->object_fit==OF_COVER?fmax((double)w/bw,(double)h/bh):fmin((double)w/bw,(double)h/bh);
+        if (st->object_fit==OF_NONE) factor=1;
+        else if (st->object_fit==OF_SCALE_DOWN) factor=fmin(factor,1);
+        fw=bw*factor; fh=bh*factor;
+    }
+    double dx=st?len_resolve(&st->object_pos[0],(float)(w-round(fw))):(w-round(fw))/2;
+    double dy=st?len_resolve(&st->object_pos[1],(float)(h-round(fh))):(h-round(fh))/2;
+    double fx=x+round(dx),fy=y+round(dy);
+    if (!isfinite(fx) || !isfinite(fy) || fw<1 || fh<1 || fw>INT32_MAX || fh>INT32_MAX || fabs(fx)>INT32_MAX/2 ||
+        fabs(fy)>INT32_MAX/2) return false;
+    fit[0]=(int)fx; fit[1]=(int)fy; fit[2]=(int)round(fw); fit[3]=(int)round(fh);
+    return true;
+}
+struct web_webgl *web_canvas_webgl(const node_t *n) { return n && n->canvas ? n->canvas->webgl : NULL; }
+void web_canvas_paint(node_t *n,const style_t *st,canvas_t *dst,int x,int y,int w,int h) {
     struct web_canvas *c=n?webgl_sync(n,true):NULL;
-    if (!c || !c->pixels || !c->w || !c->h || w<=0 || h<=0) return;
-    int x0=MAX(x,dst->cx0),y0=MAX(y,dst->cy0),x1=MIN((int64_t)x+w,dst->cx1),y1=MIN((int64_t)y+h,dst->cy1);
+    int fit[4];
+    if (!c || !c->pixels || !c->w || !c->h || !web_canvas_fit(n,st,x,y,w,h,fit)) return;
+    /* The fitted bitmap, clipped to the content box. */
+    int x0=MAX(MAX(x,fit[0]),dst->cx0),y0=MAX(MAX(y,fit[1]),dst->cy0);
+    int x1=MIN(MIN((int64_t)x+w,(int64_t)fit[0]+fit[2]),dst->cx1),y1=MIN(MIN((int64_t)y+h,(int64_t)fit[1]+fit[3]),dst->cy1);
     for (int yy=y0;yy<y1;yy++) {
         struct gfx_clip_span span={x0,x1,x0,x1};
         if(dst->mask_clip&&!gfx_clip_row(dst,yy,x0,x1,&span))continue;
-        unsigned sy=(unsigned)((uint64_t)(yy-y)*c->h/(unsigned)h);
+        unsigned sy=(unsigned)((uint64_t)(yy-fit[1])*c->h/(unsigned)fit[3]);
         for(int xx=span.x0;xx<span.x1;xx++) {
-            unsigned sx=(unsigned)((uint64_t)(xx-x)*c->w/(unsigned)w);
+            unsigned sx=(unsigned)((uint64_t)(xx-fit[0])*c->w/(unsigned)fit[2]);
             uint32_t source=c->pixels[(size_t)sy*c->w+sx];
             if(dst->mask_clip&&(xx<span.opaque0||xx>=span.opaque1))source=(((source>>24)*gfx_clip_alpha(dst,xx,yy)+127)/255)<<24|(source&0xffffffu);
             uint32_t *p=&dst->px[(size_t)yy*dst->pitch+xx]; *p=over(*p,source);

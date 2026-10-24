@@ -358,6 +358,57 @@ static void show_row(volatile uint16_t *dispi, uint32_t row) {
     if (dispi) dispi[DISPI(DISPI_Y_OFFSET) / 2] = (uint16_t)row;
 }
 
+/* A surface given with N_SCANOUT_DIRECT: the system says which fullscreen window the driver may
+   show itself (n_pci_screen_state), and that window hears of it (EV_DIRECT, WIN_STATE_DIRECT). */
+static bool screen_app(n_handle vga, struct n_screen_state *st, uint32_t app) {
+    for (uint64_t end = uptime_ms() + 2000; st->app != app && uptime_ms() < end;)
+        if (n_pci_screen_state(vga, st->serial, st, 200) == -N_ERR_DENIED) return false;
+    return st->app == app;
+}
+static bool direct_heard(window_t *win, int key) {
+    struct gui_event e;
+    for (uint64_t end = uptime_ms() + 2000; uptime_ms() < end;)
+        if (win_event(win, &e, 200) > 0 && e.type == EV_DIRECT && e.key == key) return true;
+    return false;
+}
+static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout *d) {
+    struct n_scanout direct = *d;
+    direct.format |= N_SCANOUT_DIRECT;
+    n_result r = n_pci_give_screen(vga, surface, &direct);
+    CHECK(r == 0, "a surface that can show fullscreen windows directly: %s", n_result_text(r));
+    if (r) return;
+    struct n_screen_state st = {0};
+    r = n_pci_screen_state(vga, 0, &st, 0);
+    CHECK(r == 0 && st.serial != 0 && st.app == 0, "no window shown directly yet: %s app %u", n_result_text(r), st.app);
+    uint64_t seen = st.serial, t0 = uptime_ms();
+    r = n_pci_screen_state(vga, seen, &st, 100);
+    CHECK(r == -N_ERR_TIMEOUT && st.serial == seen && uptime_ms() - t0 >= 90, "the state waits for a change: %s",
+          n_result_text(r));
+    window_t *win = NULL;
+    if (!gui_available() || win_open(320, 200, "pcitest", 0, &win) < 0) {
+        CHECK(0, "a window to show directly");
+    } else {
+        /* A window is shown from its first picture on. */
+        CHECK(win_update(win) == 0, "the window's first picture");
+        CHECK(win_direct(win, true) == 0 && win_fullscreen(win, true) == 0, "a fullscreen window asks for it");
+        CHECK(direct_heard(win, 1), "the window hears it is shown directly");
+        CHECK(screen_app(vga, &st, (uint32_t)n_app_self()), "the driver is told this app: %u", st.app);
+        CHECK((win_state(win) & WIN_STATE_DIRECT) != 0, "WIN_STATE_DIRECT");
+        uint32_t hot = st.pointer[st.hot_y * N_SCREEN_POINTER_SIZE + st.hot_x];
+        CHECK(st.pointer_shown && st.pointer_serial != 0 && hot >> 24 == 0xFF && st.pointer[0] == 0,
+              "the pointer the driver draws: shown %u, %08x at its hot spot", st.pointer_shown, hot);
+        CHECK(win_fullscreen(win, false) == 0 && direct_heard(win, 0), "a window no longer fullscreen hears it ends");
+        CHECK(screen_app(vga, &st, 0) && !(win_state(win) & WIN_STATE_DIRECT), "the driver is told it ends");
+        CHECK(win_fullscreen(win, true) == 0 && direct_heard(win, 1) && screen_app(vga, &st, (uint32_t)n_app_self()),
+              "shown directly again");
+        win_close(win);
+        CHECK(screen_app(vga, &st, 0), "a closed window is no longer shown");
+    }
+    r = n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL);
+    CHECK(r == 0 && n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "the boot screen back ends direct showing");
+    n_sleep_ms(300);
+}
+
 static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n, unsigned linger_s) {
     int at = find_vga(list, n);
     if (at < 0) {
@@ -418,6 +469,8 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "another height");
     bad = d, bad.format = 99;
     CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "an unknown format");
+    bad = d, bad.format |= 0x200;
+    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "an unknown flag");
     bad = d, bad.pitch = d.width * 4 - 4;
     CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "a pitch shorter than a row");
     bad = d, bad.offset = size - frame + 4;
@@ -436,6 +489,8 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     mark(gop);
     n_result r = n_pci_give_screen(vga, surface, &d);
     CHECK(r == 0, "the boot screen's memory as the driver's surface: %s", n_result_text(r));
+    struct n_screen_state st;
+    CHECK(n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "no screen state without N_SCANOUT_DIRECT");
     n_sleep_ms(300);
     CHECK(marks(gop) == 0, "all of the screen is drawn again: %d marks left", marks(gop));
     uint64_t count = 0;
@@ -481,6 +536,8 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(marks(gop) == 0, "the boot screen is drawn again: %d marks left", marks(gop));
     CHECK(n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL) == -N_ERR_INVALID, "given back once");
     CHECK(n_pci_screen_vblank(vga, ++count, 0) == -N_ERR_DENIED, "no vertical blanks of the boot screen");
+    CHECK(n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "no screen state of the boot screen");
+    direct_cases(vga, surface, &d);
 
     /* the claim's end gives the screen back */
     r = n_pci_give_screen(vga, surface, &d);

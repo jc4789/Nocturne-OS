@@ -470,6 +470,11 @@ bool web_js_video_present(web_doc *d, const struct web_video_patch *patch) {
     if (!d || !d->live || d->inert || !d->js || !d->js->host.video_present) return false;
     return d->js->host.video_present(d->js->host.opaque,d,patch);
 }
+void web_js_rendering_now(web_doc *d) {
+    /* The display took a frame and waited for its vertical blank: the next
+       rendering opportunity is now, so animation frames follow the display. */
+    if (d && d->js && !d->js->disabled) d->js->rendering_due = uptime_ms();
+}
 static void report_allocation_failure(struct web_js_state *s) {
     struct js_alloc_diagnostics *d=&s->runtime_owner->allocation;
     if(d->failures!=d->reported) {

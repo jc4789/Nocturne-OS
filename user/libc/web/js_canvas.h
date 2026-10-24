@@ -20,4 +20,11 @@ int web_canvas_webgl_source(JSContext *ctx, node_t *source, JSValueConst bitmap,
 void web_canvas_free(node_t *node);
 void web_canvas_attr_changed(node_t *node, const char *name);
 unsigned web_canvas_dimension(const node_t *node, const char *name);
-void web_canvas_paint(node_t *node, canvas_t *dst, int x, int y, int w, int h);
+/* Where the canvas's bitmap lands in its content box x, y, w x h under the
+ * style's object-fit and object-position (as for images): fit = x, y, width,
+ * height, which may reach past the box. false: the canvas or the box is empty. */
+bool web_canvas_fit(const node_t *node, const style_t *st, int x, int y, int w, int h, int fit[4]);
+/* The canvas's WebGL context (borrowed), NULL for 2D or none. */
+struct web_webgl *web_canvas_webgl(const node_t *node);
+/* Paints the bitmap fitted (web_canvas_fit) into the content box x, y, w x h. */
+void web_canvas_paint(node_t *node, const style_t *st, canvas_t *dst, int x, int y, int w, int h);
