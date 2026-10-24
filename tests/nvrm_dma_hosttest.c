@@ -161,7 +161,12 @@ static void allocation_cases(void) {
     CHECK(nv_alloc_pages(&nv, 1, PAGE, NV_TRUE, NV_MEMORY_CACHED,
                         NV_TRUE, NV_FALSE, 0, ptes, &priv) == NV_OK);
     CHECK(ptes[0] == first_address);
+    /* A write-back object without a mapping of nvrm's own is mapped to write its lines back,
+       and the mapping goes again; a freed one is no longer written back. */
+    int maps_before = maps;
+    CHECK(os_flush_cpu_cache_all() == NV_OK && maps == maps_before && cached_allocs == priv);
     CHECK(nv_free_pages(&nv, 1, NV_TRUE, NV_MEMORY_CACHED, priv) == NV_OK);
+    CHECK(cached_allocs == NULL && os_flush_cpu_cache_all() == NV_OK);
     priv = NULL;
 
     reset_fixture();

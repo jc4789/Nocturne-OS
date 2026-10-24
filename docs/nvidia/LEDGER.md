@@ -13,6 +13,11 @@ GPU で描く。GPU が無い環境（QEMU、Hyper-V）は今の softpipe のま
 [実機DMA調査](bare-metal-dma-20261020.md)を参照。以下の過去の「実機未実施」「修理済み」は、
 この最新の失敗報告を打ち消すものではない。
 
+**2026-10-24の実機状態更新（3 回目）：** IOMMU（AMD-Vi）が有効なまま `RmInitAdapter` が `RmInitX86Emu`
+で止まった（`0xA0000` の写像を断った、`0x32:0xffff:2178`）。原因は `primary_vga` を真にしていたこと。
+偽にし、`os_flush_cpu_cache_all` を実装した（C41・C50）。この修理の実機確認は未実施（4 回目待ち）。
+GPU が自分の DMA の外へ書いた観測は C51。
+
 ## 0. 動かない前提（ユーザーの指示）
 
 - 日本語で報告。UNIX／POSIX 互換を足さない。GPLv2 専用のコードを入れない。Linux や他 OS の
@@ -67,7 +72,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み、3 回目は未実施 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -115,7 +120,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C38 | rm_init_adapter が止まっても分かる | 却下 → 修理済み | GSP の起動はうまくいくと何も出さないので、固まったのか遅いのかが見分けられない。nvrm は rm_init_adapter の間 10 秒ごとに経過と処理した割り込みの数を、終わると所要時間と成否をログへ出す |
 | C39 | nvrm は BME（バスマスター）を入れなくてよい | 却下 → 修理済み | カーネルは claim の間 BME を入れない。`nvrm_pci_bus_master` が `rm_init_adapter` の前に Command の BME を入れ（読み戻しで確かめ、書込みが効かない装置は失敗）、初期化の失敗後と `rm_shutdown_adapter` の後に切る。claim の終わりに BME が残っていれば異常終了とみなし、DMA の RAM を隔離 |
 | C40 | 画面の取得・解放（`os_disable_console_access` 等）は空でよい | 却下 → 修理済み | RM が BAR1 を仮想モードにする間、システムが起動時の画面へ書くと GPU の外へ書く。新しい `n_pci_hold_screen`（入れ子、パニックは無視して描く、claim の終わりで返し全体を描き直す）。画面が他の所なら NOT_FOUND を無視。2026-10-21 訂正：30 秒で保持を無視して描く上限は、RM がまだ BAR1 を作り直している最中に競合を再開していた（RM の待ちはそれより長い）。時間切れの描画をやめ、保持は RM の解放か claim の終わり（装置を止めてから返す）でだけ終わる。止まったドライバーは `fbhold=<秒>`（既定無し）でアプリを止め、claim の終わりで画面を戻す |
-| C41 | `nv_alloc_pages` のキャッシュ型と `os_flush_cpu_cache_all` は無視してよい | 却下 → 修理済み | UC／WC の確保は型つきの view を作って DMA の RAM の型を固定する（直接写像も同じ型）。全キャッシュの書出しは特権命令なので `NOT_SUPPORTED` を返し、RM の呼出し側に任せる（黙って成功しない） |
+| C41 | `nv_alloc_pages` のキャッシュ型と `os_flush_cpu_cache_all` は無視してよい | 却下 → 修理済み | UC／WC の確保は型つきの view を作って DMA の RAM の型を固定する（直接写像も同じ型）。2026-10-24 訂正：`NOT_SUPPORTED` では足りない。実機で RM は `kbifInitDmaCaps` の前（DMA の能力が 0 でスヌープ不可扱い）にファームウェアの写しの後で求める。`wbinvd` は特権命令なので、nvrm が WB で確保した DMA オブジェクトを一覧に持ち、全行を `clflush`（全 CPU のキャッシュに届く）して `mfence`。GPU は IOMMU でこれらにしか届かないので、これで GPU から見えるメモリは全部書き戻る。nvrm の写像が無いものは一時的に写す。UC／WC は一覧に入らない |
 | C42 | 装置メモリは UC と WC の別名があってもよい | 却下 → 修理済み | 生きている写像の間、装置の 1 ページに型は一つ（SDM の PAT 別名の規則）。違う型の写像は DENIED でログに出す。起動時の画面はカーネルが WC で写しているので UC の写像は常に DENIED |
 | C43 | 初期化に失敗した GPU も開ける | 却下 → 修理済み | `nv_is_gpu_accessible` は `adapter_ready` のときだけ真。RM 自身の `deviceConstruct` が権限不足で断り、制御装置の診断は使える（実ドライバーと同じ形） |
 | C44 | サーバーは一つのループで足りる | 却下 → 修理済み | 接続ごとにスレッド。受付はメインループだけ。RM の順序は RM の錠が決める。終了は `serving_ended` のアドレス監視で全スレッドを起こし、全部が終わるまで待つ。スレッドを作れない接続は閉じてログ |
@@ -124,6 +129,8 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C47 | 構成空間の保護は Command と BAR だけで足りる | 却下 → 修理済み | ABI 文書 §9 の一覧（BIST、Interrupt Line、PMCSR、DevCtl、LinkCtl／2、ReBAR、SR-IOV、ACS・ATS・PRI・PASID）。読んで一部を変えて書き戻すなら通る。ブリッジは claim できない |
 | C48 | IOMMU で DMA を隔離している | 却下 → 修理済み | AMD-Vi（`iommu_amd.c`）と VT-d（`iommu_intel.c`）のドライバー、共通層は `iommu.c`。claim した装置は専用のドメインに入り、その claim の DMA オブジェクト（作成から解放まで、解放はユニットの確認の後）とファームウェアの予約範囲（IVMD・RMRR）だけへ届く。割り込みは再マップ表で claim のベクターだけ。claim の終了で遮断。要求元 ID を他と共有する装置は `N_ERR_BUSY`。隔離は `N_PCI_ISOLATED` でアプリに見える。詳細は ABI 文書 §9 |
 | C49 | claim の時に BAR の大きさを測ってよい | 却下 → 修理済み | 測るとメモリデコードを切るので、起動時の画面がその BAR にあると壊れる。大きさは列挙時の値（`pci_bar_size`）を使う |
+| C50 | 起動時の画面を持つ GPU は `primary_vga` | 却下 → 修理済み | `primary_vga` は VBIOS を通す旧 VGA の画面を意味し、RM は x86emu のために `0xA0000` と option ROM を写そうとする（実機 3 回目で停止）。Nocturne は VGA を使わない。起動画面は `nv_get_screen_info` が返す線形フレームバッファーで、RM はそれを client-managed console として保ち、`RmDeterminePrimaryDevice` で主装置にもなる。`primary_vga` は常に偽、`console_device` はフレームバッファーの BAR があるとき真 |
+| C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る |
 
 ## 5. 担当と受け渡し
 
@@ -142,6 +149,17 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-24：実機 3 回目（USB 起動、IOMMU 有効）。USB の GPT から System.log と nvrm.log を読み取り専用で
+  取り出した（`build/qa/realhw/`）。RM は `RmInitX86EmuState` で `0xA0000` を写せず停止。その前に
+  `os_flush_cpu_cache_all` を求めて `NOT_SUPPORTED` を受けていた。修理：`os_pci.c` で `primary_vga` を常に偽
+  （C50）、WB の DMA オブジェクトの一覧と `clflush` による全書戻し（C41 訂正）。GPU の遮断された DMA は
+  C51 に観測として記録。
+  確認：host 試験（nvrm_dma・contract・transport）0 failed。dma の試験に書戻しの場合（写像の後始末、
+  解放で一覧から外れる）を足した。contract の模擬は前の変更（ログを `n_app_data_folder` へ）に
+  追い付いておらずリンクで落ちていたので、データフォルダーが無い場合として直した。全体ビルド済み。
+  実機での確認は未実施（4 回目：RmInitAdapter が x86emu を越えて GSP の起動まで進むか、SEC2 の
+  scrubber の `0x65` が再発するか、C51 の遮断が RM のリセット後に止まるか）。
 
 - 2026-10-21：ドライバー（`ports/nvidia`）と NVK の nvkmd（`nvkmd_nocturne_rm.c`）から `errno` と `msleep` を
   除いた。POSIX の「-1＋errno」ではなく、Nocturne のネイティブ関数が失敗を負の `n_result` で返す形に

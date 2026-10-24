@@ -10,7 +10,6 @@
  */
 #include "nvrm_os.h"
 
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
@@ -328,15 +327,7 @@ void NV_API_CALL os_unmap_kernel_space(void *address, NvU64 size) {
 }
 
 /* x86 keeps DMA coherent; write-combining buffers are drained by the fences below. */
-/* RM writes back the whole CPU cache only for a GPU that cannot snoop (memdescFlushCpuCaches
-   asks kbifIsSnoopDmaCapable). A PCIe GPU on x86 snoops, so RM never asks here; an app could not
-   write back every cache of every CPU anyway, and reporting success would hide stale data. */
-NV_STATUS NV_API_CALL os_flush_cpu_cache_all(void) {
-    static atomic_flag said = ATOMIC_FLAG_INIT;
-    if (!atomic_flag_test_and_set(&said))
-        nvrm_log("NVRM: RM asked to write back all CPU caches (a GPU that does not snoop?); not supported");
-    return NV_ERR_NOT_SUPPORTED;
-}
+/* os_flush_cpu_cache_all is with the system memory below. */
 /* A client's request (NV0000_CTRL_CMD_OS_UNIX_FLUSH_USER_CACHE) for its cached system memory:
    the GPU reaches cached memory snooped (GMMU SYS_COH), so on x86 there is nothing to write back.
    Uncached and write-combined memory never has cache lines (nv_alloc_pages types it). */
@@ -376,7 +367,11 @@ NV_STATUS nvrm_pci_attach(void) {
     nv->handle = &self_token;
     nv->queue = nvrm_work_queue();
     nv->dma_mask = ~0ull;
-    nv->primary_vga = g->cls == 0x03 && g->subcls == 0x00 && g->framebuffer_bar != N_PCI_NONE;
+    /* primary_vga means the legacy VGA console that RM reaches through the VBIOS (x86emu over
+       0xA0000 and the option ROM). Nocturne never uses VGA: its boot screen is the linear
+       framebuffer nv_get_screen_info reports, which RM preserves as a client-managed console and
+       which makes the GPU the primary device all the same (RmDeterminePrimaryDevice). */
+    nv->primary_vga = NV_FALSE;
     nv->console_device = g->framebuffer_bar != N_PCI_NONE;
 
     pci_apertures(g, nv);
@@ -552,11 +547,58 @@ struct nvrm_alloc {
     uint64_t *addr;         /* !contiguous: bus address of each page */
     uint8_t *kmap;          /* shared write-back mapping of the whole object, while in use */
     uint32_t kmap_refs;
+    struct nvrm_alloc *prev, *next; /* in cached_allocs while write-back */
+    bool listed;
 };
 
 static mtx_t alloc_lock;
 static once_flag alloc_once = ONCE_FLAG_INIT;
 static void alloc_setup(void) { mtx_init(&alloc_lock, mtx_plain); }
+/* The write-back allocations: the only memory the GPU reaches (its IOMMU domain is made of these
+   objects) that the CPU's caches can hold lines of. */
+static struct nvrm_alloc *cached_allocs;
+
+static void alloc_list(struct nvrm_alloc *a) {
+    mtx_lock(&alloc_lock);
+    a->prev = NULL;
+    a->next = cached_allocs;
+    if (cached_allocs) cached_allocs->prev = a;
+    cached_allocs = a;
+    a->listed = true;
+    mtx_unlock(&alloc_lock);
+}
+
+/* RM asks for every CPU cache to be written back before the GPU reads system memory without
+   snooping (memdescFlushCpuCaches: before kbifInitDmaCaps has found the chipset coherent, and on
+   a GPU that does not snoop). Writing back a line with CLFLUSH reaches every cache of every CPU,
+   and the GPU can reach only nvrm's DMA objects, so writing back each write-back object, through
+   a mapping of its own when nvrm has none at the moment, is all of that. Uncached and
+   write-combined objects never have lines in the caches. */
+NV_STATUS NV_API_CALL os_flush_cpu_cache_all(void) {
+    uint32_t a = 1, b, c = 0, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    size_t line = ((b >> 8) & 0xFF) * 8;
+    if (!line) line = 64;
+    NV_STATUS status = NV_OK;
+    call_once(&alloc_once, alloc_setup);
+    mtx_lock(&alloc_lock);
+    for (struct nvrm_alloc *at = cached_allocs; at; at = at->next) {
+        size_t bytes = (size_t)(at->pages * PAGE);
+        void *own = NULL;
+        uint8_t *p = at->kmap;
+        if (!p && n_shared_map(at->root, bytes, N_MEMORY_READ, &own) >= 0) p = own;
+        if (!p) {
+            status = NV_ERR_NO_MEMORY;
+            continue;
+        }
+        for (size_t off = 0; off < bytes; off += line) __asm__ volatile("clflush (%0)" ::"r"(p + off) : "memory");
+        if (own) n_memory_release(own, bytes);
+    }
+    mtx_unlock(&alloc_lock);
+    __asm__ volatile("mfence" ::: "memory"); /* the write-backs are done before the GPU is told */
+    if (status != NV_OK) nvrm_log("NVRM: a DMA object could not be mapped to write its cache lines back");
+    return status;
+}
 
 uint64_t nvrm_alloc_size(const struct nvrm_alloc *a) { return a->pages * PAGE; }
 
@@ -567,6 +609,13 @@ static uint64_t alloc_page_address(const struct nvrm_alloc *a, uint64_t index) {
 /* One owner for the backing allocation, its optional aligned view and address
    table. Every failed construction follows the same unwind as a normal free. */
 static void alloc_destroy(struct nvrm_alloc *a) {
+    if (a->listed) {
+        mtx_lock(&alloc_lock);
+        if (a->prev) a->prev->next = a->next;
+        else cached_allocs = a->next;
+        if (a->next) a->next->prev = a->prev;
+        mtx_unlock(&alloc_lock);
+    }
     if (a->kmap) n_memory_release(a->kmap, (size_t)(a->pages * PAGE));
     if (a->root != a->dma && a->root >= 0) n_handle_close(a->root);
     if (a->dma >= 0) n_handle_close(a->dma);
@@ -700,6 +749,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
         alloc_destroy(a);
         return status;
     }
+    if (typed == N_CACHE_WRITE_BACK) alloc_list(a);
 
     if (a->contiguous) {
         pte_array[0] = a->base;

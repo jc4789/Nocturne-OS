@@ -59,8 +59,15 @@ n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach)
     if (strstr(line, "does not collect")) dropped_reports++;
     return (n_result)n;
 }
-n_result n_entry_info(const char *path, struct n_entry *out) { (void)path; (void)out; return -N_ERR_NOT_FOUND; }
-n_result n_folder_create(const char *path) { (void)path; CHECK(false); return -N_ERR_DENIED; }
+n_result n_app_data_folder(const char *name, char *out, size_t cap) {
+    (void)name; (void)out; (void)cap;
+    return -N_ERR_NOT_FOUND;
+}
+n_result n_path_join(const char *folder, const char *name, char *out, size_t cap) {
+    (void)folder; (void)name; (void)out; (void)cap;
+    CHECK(false);
+    return -N_ERR_DENIED;
+}
 n_result n_document_append(const char *path, const void *data, size_t size) {
     (void)path; (void)data; (void)size;
     CHECK(false);

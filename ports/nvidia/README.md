@@ -113,7 +113,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `nv_alloc_user_mapping`／`nv_free_user_mapping`、`os_match_mmap_offset`、`nv_add_mapping_context_to_file` | クライアントのアドレス＝その写像だけの番地の範囲＋ページ位置＋オフセット（`os_match_mmap_offset` が同じ要求の写像から逆引き）。マップ要求の間だけスレッドに「保留の文脈」を置き、`nvrm_rm_mapping_object` が view ハンドルにしてクライアントへ添付で渡す |
 | `nvrm_irq_enable`（`os_pci.c`） | `n_pci_interrupts(1)`。ここで `nv->flags` に **`NV_FLAG_USES_MSIX`（MSI-X が使えたとき）か `NV_FLAG_USES_MSI`** を立てる（RM は読まない） |
 | `nv_get_screen_info`、`nv_set_dma_address_size`、`nv_requires_dma_remap` | 起動時フレームバッファーを RM に知らせて保護（D8）／マスクの検査／native DMAはIOMMUの有無によらず物理アドレスと同じbus addressを返すので追加変換不要 |
-| `os_flush_cpu_cache_all`／`write_combine_buffer`／`user_cache` | x86 の DMA はコヒーレントなので多くは空。WC バッファーは `sfence` |
+| `os_flush_cpu_cache_all`／`write_combine_buffer`／`user_cache` | `os_flush_cpu_cache_all` は WB の DMA オブジェクトをすべて `clflush`（全 CPU のキャッシュに届き、GPU は IOMMU でこれらにしか届かない）。RM は DMA の能力を調べ終える前にファームウェアの写しで求める（実機で確認）。`user_cache` は空、WC バッファーは `sfence` |
 | `os_get_random_bytes`、`os_get_version_info` ほか | `n_random`（システムの乱数）、版は "Nocturne OS" の固定値 |
 
 スレッドの前提：割り込みスレッド（`n_pci_interrupt_take` → `rm_isr` → 必要なら `rm_isr_bh`）とリクエストスレッド
