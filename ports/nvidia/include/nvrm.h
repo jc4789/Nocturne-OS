@@ -54,3 +54,22 @@ void nvrm_lock(struct nvrm *rm);
 void nvrm_unlock(struct nvrm *rm);
 /* Arena memory that stays valid until nvrm_unlock (NULL when the arena is full). */
 void *nvrm_scratch(struct nvrm *rm, size_t bytes);
+
+/* NVIDIA UVM, CUDA's unified memory (nvrm_protocol.h, NVRM_UVM), on the same connection. A UVM
+   file is numbered per connection (UVM's parameter blocks call it an fd) and closes with it:
+   minor 0 is nvidia-uvm, 1 nvidia-uvm-tools. Calls return UVM's NV_STATUS, NV_ERR_NOT_SUPPORTED
+   when nvrm runs no UVM, NV_ERR_OPERATING_SYSTEM when the driver cannot be reached. */
+uint32_t nvrm_uvm_open(struct nvrm *rm, uint32_t minor, int32_t *file);
+uint32_t nvrm_uvm_close(struct nvrm *rm, int32_t file);
+/* UVM's ioctl cmd (UVM_*): params is copied through the arena and back, as for nvrm_control;
+   a pointer inside it must point into the arena (nvrm_scratch). The ioctl's own result is the
+   block's rmStatus. */
+uint32_t nvrm_uvm_ioctl(struct nvrm *rm, int32_t file, uint32_t cmd, void *params, uint32_t size);
+/* A read/write mapping of `bytes` (whole pages) of UVM memory through file: *address gets where
+   it is, which is also its offset in the file as UVM sees it. Its pages appear as UVM supplies
+   them on first touch. nvrm_uvm_unmap takes it back; the connection's end does too. */
+uint32_t nvrm_uvm_map(struct nvrm *rm, int32_t file, uint64_t bytes, void **address);
+uint32_t nvrm_uvm_unmap(struct nvrm *rm, void *address);
+/* Waits up to timeout_ms (-1: until there are some) for file's events: *events gets UVM's POLL*
+   bits (POLLIN 1, POLLPRI 2, POLLOUT 4, ...), 0 when the time ran out. */
+uint32_t nvrm_uvm_poll(struct nvrm *rm, int32_t file, int64_t timeout_ms, uint32_t *events);

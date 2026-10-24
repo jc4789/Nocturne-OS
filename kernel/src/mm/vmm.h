@@ -65,6 +65,7 @@ int vmm_user_reserve(uint64_t pml4, uint64_t va, uint64_t size, int prot); /* ze
 int vmm_demand_fault(uint64_t pml4, uint64_t va, bool write);
 int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot);
 void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size);
+void vmm_user_write_protect(uint64_t pml4, uint64_t va, uint64_t size); /* present pages lose W */
 int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n);
 bool vmm_handle_user_fault(uint64_t addr, uint64_t err);
 void vmm_switch(uint64_t pml4); /* PCID対応。gen が進んだ space のtagだけ破棄 */
@@ -78,4 +79,9 @@ void vmm_tlb_stats(uint64_t *shootdowns, uint64_t *ipis);
 
 void *vmalloc(size_t pages);
 void vfree(void *p, size_t pages);
+/* Existing frames at fresh kernel addresses with the given flags: a run from pa, or frames[i]
+   (NULL when a page table could not be allocated; nothing stays mapped then). vunmap takes such a
+   mapping away again; the frames stay their owner's. */
 void *vmalloc_map_phys(uint64_t pa, size_t pages, uint64_t flags);
+void *vmalloc_map_frames(const uint64_t *frames, size_t pages, uint64_t flags);
+void vunmap(void *p, size_t pages);

@@ -21,5 +21,11 @@ n_handle nvrm_rm_mapping_object(void *file, uint64_t *offset, uint64_t *bytes, u
 /* From the server, for os_memcpy_from_user / os_memcpy_to_user: nvrm's address of n bytes of the
    current client's arena at the client's address `user`, or NULL outside it. */
 void *nvrm_user_translate(const void *user, size_t n);
+/* For UVM's pinning of client memory (uvm_mm.c): a new handle to the shared object behind n
+   bytes of the current client's arena at `user` (a view of the arena from the page holding
+   `user`; *offset is where `user` is in it), or a negative n_result outside the arena. */
+n_handle nvrm_user_view(const void *user, size_t n, size_t *offset);
+/* The current client's arena as the client maps it; false when no request is being served. */
+bool nvrm_user_arena(uint64_t *address, uint64_t *bytes);
 /* Serve clients until the channel cannot be listened on; returns the reason. */
 n_result nvrm_serve(uint32_t pci_target);

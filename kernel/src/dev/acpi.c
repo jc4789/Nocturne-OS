@@ -699,3 +699,223 @@ void acpi_wake(unsigned state) {
 }
 
 bool acpi_reset(void) { return aml_ready && uacpi_reboot() == UACPI_STATUS_OK; }
+
+/* ---- a PCI function's part of the namespace (acpi.h) ----
+   Names are looked up directly under the node they are relative to (uacpi_eval does not search
+   upwards), and one name segment cannot leave it ("^" and "\" are no name characters): a driver
+   reaches its function's node, that node's children, and the bridge above it, nothing else. */
+#define PCI_DEPTH_MAX 32  /* bridges from a root bus down to a function */
+#define EVAL_DEPTH_MAX 32 /* packages in packages of one result */
+#define EVAL_ARGS_MAX 7   /* Arg0..Arg6 */
+
+struct host_search {
+    uint64_t bus;
+    uacpi_namespace_node *found;
+};
+
+/* A host bridge (PNP0A03, PNP0A08) of segment 0 whose root bus (_BBN, 0 without one) is bus. */
+static uacpi_iteration_decision found_host(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
+    (void)depth;
+    struct host_search *s = user;
+    uacpi_u64 segment = 0, bus = 0;
+    if (uacpi_eval_simple_integer(node, "_SEG", &segment) != UACPI_STATUS_OK) segment = 0;
+    if (uacpi_eval_simple_integer(node, "_BBN", &bus) != UACPI_STATUS_OK) bus = 0;
+    if (segment || bus != s->bus) return UACPI_ITERATION_DECISION_CONTINUE;
+    s->found = node;
+    return UACPI_ITERATION_DECISION_BREAK;
+}
+
+void *acpi_pci_host(const struct pci_device *d) {
+    static const uacpi_char *const hids[] = {"PNP0A03", "PNP0A08", UACPI_NULL};
+    if (!aml_ready || !d) return NULL;
+    for (unsigned n = 0; d->upstream && n < PCI_DEPTH_MAX; n++) d = d->upstream;
+    struct host_search s = {d->bus, UACPI_NULL};
+    uacpi_find_devices_at(uacpi_namespace_root(), hids, found_host, &s);
+    return s.found;
+}
+
+/* The device under parent whose _ADR is the function (dev << 16 | func), else one that stands
+   for all of the device's functions (func 0xFFFF). */
+static uacpi_namespace_node *child_at(uacpi_namespace_node *parent, uint8_t dev, uint8_t func) {
+    uacpi_namespace_node *iter = UACPI_NULL, *every = UACPI_NULL;
+    while (uacpi_namespace_node_next_typed(parent, &iter, UACPI_OBJECT_DEVICE_BIT) == UACPI_STATUS_OK) {
+        uacpi_u64 address;
+        if (uacpi_eval_simple_integer(iter, "_ADR", &address) != UACPI_STATUS_OK) continue;
+        if (address == ((uint64_t)dev << 16 | func)) return iter;
+        if (!every && address == ((uint64_t)dev << 16 | 0xFFFF)) every = iter;
+    }
+    return every;
+}
+
+void *acpi_pci_node(const struct pci_device *d) {
+    const struct pci_device *chain[PCI_DEPTH_MAX];
+    unsigned n = 0;
+    for (const struct pci_device *p = d; p; p = p->upstream) {
+        if (n == PCI_DEPTH_MAX) return NULL;
+        chain[n++] = p;
+    }
+    uacpi_namespace_node *node = n ? acpi_pci_host(d) : UACPI_NULL;
+    while (node && n) {
+        n--;
+        node = child_at(node, chain[n]->dev, chain[n]->func);
+    }
+    return node;
+}
+
+void *acpi_node_child(void *node, uint32_t index) {
+    uacpi_namespace_node *iter = UACPI_NULL;
+    if (!aml_ready || !node) return NULL;
+    while (uacpi_namespace_node_next_typed(node, &iter, UACPI_OBJECT_DEVICE_BIT) == UACPI_STATUS_OK)
+        if (!index--) return iter;
+    return NULL;
+}
+
+static bool name_segment(const char *s) {
+    for (int i = 0; i < 4; i++) {
+        char c = s[i];
+        if (!(c == '_' || (c >= 'A' && c <= 'Z') || (i && c >= '0' && c <= '9'))) return false;
+    }
+    return !s[4];
+}
+
+/* The values a result is written as: one for the object, then a package's elements. -1 when
+   packages nest deeper than EVAL_DEPTH_MAX. */
+static int64_t result_values(uacpi_object *o, unsigned depth) {
+    uacpi_object_array a;
+    if (depth > EVAL_DEPTH_MAX) return -1;
+    if (!o || uacpi_object_get_type(o) != UACPI_OBJECT_PACKAGE || uacpi_object_get_package(o, &a) != UACPI_STATUS_OK)
+        return 1;
+    int64_t n = 1;
+    for (size_t i = 0; i < a.count; i++) {
+        int64_t c = result_values(a.objects[i], depth + 1);
+        if (c < 0) return -1;
+        n += c;
+    }
+    return n;
+}
+
+/* The result as acpi.h says: its values in breadth-first order (a package's elements together),
+   then the bytes of its strings and buffers. */
+static int64_t result_write(uacpi_object *result, uint8_t *out, size_t out_size) {
+    int64_t count = result_values(result, 0);
+    if (count < 0) return -N_ERR_IO;
+    if ((uint64_t)count > out_size / sizeof(struct n_acpi_value)) return -N_ERR_TOO_LARGE;
+    uacpi_object **objects = kmalloc((size_t)count * sizeof *objects);
+    if (!objects) return -N_ERR_NO_MEMORY;
+    struct n_acpi_value *v = (struct n_acpi_value *)out;
+    size_t bytes = (size_t)count * sizeof *v, next = 1;
+    int64_t r = 0;
+    objects[0] = result;
+    for (size_t i = 0; i < (size_t)count && !r; i++) {
+        uacpi_object *o = objects[i];
+        uacpi_object_type type = o ? uacpi_object_get_type(o) : UACPI_OBJECT_UNINITIALIZED;
+        v[i] = (struct n_acpi_value){0};
+        if (type == UACPI_OBJECT_INTEGER) {
+            uacpi_u64 n = 0;
+            uacpi_object_get_integer(o, &n);
+            v[i] = (struct n_acpi_value){N_ACPI_INTEGER, 0, n};
+        } else if (type == UACPI_OBJECT_STRING || type == UACPI_OBJECT_BUFFER) {
+            uacpi_data_view view = {0};
+            uacpi_object_get_string_or_buffer(o, &view);
+            size_t length = view.length;
+            if (type == UACPI_OBJECT_STRING && length && !view.const_text[length - 1]) length--;
+            if (length > out_size - bytes) {
+                r = -N_ERR_TOO_LARGE;
+                break;
+            }
+            memcpy(out + bytes, view.const_data, length);
+            v[i] = (struct n_acpi_value){type == UACPI_OBJECT_STRING ? N_ACPI_STRING : N_ACPI_BUFFER, (uint32_t)length,
+                                         bytes};
+            bytes += length;
+        } else if (type == UACPI_OBJECT_PACKAGE) {
+            uacpi_object_array a = {0};
+            uacpi_object_get_package(o, &a);
+            if (a.count > (size_t)count - next) {
+                r = -N_ERR_IO; /* not what was counted */
+                break;
+            }
+            v[i] = (struct n_acpi_value){N_ACPI_PACKAGE, (uint32_t)a.count, next};
+            for (size_t k = 0; k < a.count; k++) objects[next++] = a.objects[k];
+        } else if (type != UACPI_OBJECT_UNINITIALIZED) {
+            v[i].type = N_ACPI_REFERENCE;
+        }
+    }
+    kfree(objects);
+    return r ? r : (int64_t)bytes;
+}
+
+int64_t acpi_node_eval(void *node, const char *name, const struct n_acpi_value *args, uint32_t nargs,
+                       const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size) {
+    if (!aml_ready || !node) return -N_ERR_NOT_FOUND;
+    if (!name_segment(name) || nargs > EVAL_ARGS_MAX) return -N_ERR_INVALID;
+    uacpi_object *list[EVAL_ARGS_MAX] = {0};
+    int64_t r = 0;
+    for (uint32_t i = 0; i < nargs && !r; i++) {
+        const struct n_acpi_value *a = &args[i];
+        if (a->type == N_ACPI_INTEGER) {
+            list[i] = uacpi_object_create_integer(a->value);
+        } else if (a->type == N_ACPI_BUFFER || a->type == N_ACPI_STRING) {
+            if (a->value > data_size || a->length > data_size - a->value) {
+                r = -N_ERR_INVALID;
+                break;
+            }
+            if (a->type == N_ACPI_BUFFER) {
+                list[i] = uacpi_object_create_buffer((uacpi_data_view){.const_data = data + a->value, .length = a->length});
+            } else { /* uACPI's strings end with their zero */
+                char *text = kmalloc((size_t)a->length + 1);
+                if (text) {
+                    memcpy(text, data + a->value, a->length);
+                    text[a->length] = 0;
+                    list[i] = uacpi_object_create_string((uacpi_data_view){.const_text = text, .length = a->length + 1});
+                    kfree(text);
+                }
+            }
+        } else {
+            r = -N_ERR_INVALID;
+            break;
+        }
+        if (!list[i]) r = -N_ERR_NO_MEMORY;
+    }
+    uacpi_object *result = UACPI_NULL;
+    if (!r) {
+        uacpi_object_array array = {list, nargs};
+        uacpi_status st = uacpi_eval(node, name, nargs ? &array : UACPI_NULL, &result);
+        if (st == UACPI_STATUS_OK) r = result_write(result, out, out_size);
+        else r = st == UACPI_STATUS_NOT_FOUND ? -N_ERR_NOT_FOUND : -N_ERR_IO;
+    }
+    if (result) uacpi_object_unref(result);
+    for (uint32_t i = 0; i < nargs; i++)
+        if (list[i]) uacpi_object_unref(list[i]);
+    return r;
+}
+
+struct acpi_watch {
+    uacpi_namespace_node *node;
+    void (*fn)(void *context, uint64_t value);
+    void *context;
+};
+
+static uacpi_status watch_notify(uacpi_handle context, uacpi_namespace_node *node, uacpi_u64 value) {
+    (void)node;
+    struct acpi_watch *w = context;
+    w->fn(w->context, value);
+    return UACPI_STATUS_OK;
+}
+
+struct acpi_watch *acpi_node_watch(void *node, void (*fn)(void *context, uint64_t value), void *context) {
+    if (!aml_ready || !node) return NULL;
+    struct acpi_watch *w = kmalloc(sizeof *w);
+    if (!w) return NULL;
+    *w = (struct acpi_watch){node, fn, context};
+    if (uacpi_install_notify_handler(node, watch_notify, w) != UACPI_STATUS_OK) {
+        kfree(w);
+        return NULL;
+    }
+    return w;
+}
+
+void acpi_node_unwatch(struct acpi_watch *w) {
+    if (!w) return;
+    uacpi_uninstall_notify_handler(w->node, watch_notify);
+    kfree(w);
+}

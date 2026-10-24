@@ -9,6 +9,8 @@
  *   interrupts        n_pci_interrupts / n_pci_interrupt_take
  */
 #include "nvrm_os.h"
+#include "display.h"
+#include "uvm_nvrm.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -255,6 +257,7 @@ struct kmap {
     void *address;   /* what os_map_kernel_space returned */
     uint8_t *base;   /* start of the n_shared_map mapping */
     size_t length;
+    uint64_t phys;   /* bus address of base (nvrm_kernel_mapping_phys) */
 };
 static struct kmap *kmaps;
 static size_t kmap_count, kmap_cap;
@@ -302,6 +305,7 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode) {
         kmap_cap = cap;
     }
     kmaps[kmap_count++] = (struct kmap){ base + (off - astart), base, (size_t)length };
+    kmaps[kmap_count - 1].phys = nvrm_dev.info.bar[i].address + astart;
     mtx_unlock(&bar_lock);
     return base + (off - astart);
 }
@@ -483,12 +487,68 @@ int nvrm_irq_enable(void) {
 }
 uint32_t nvrm_interrupt_count(void) { return irq_vectors; }
 
+/* nv-procfs's "information" and "power" of the GPU, as lines of nvrm's log: there is no proc
+   file system, and what the original shows a reader there is written once the GPU started. */
+static bool pci_express(void) {
+    n_result pointer = n_pci_config_read(nvrm_dev.pci, N_PCI_SELF, 0x34, 1);
+    for (unsigned hops = 0; pointer >= 0x40 && hops < 48; hops++) {
+        unsigned offset = (unsigned)pointer & 0xFCu;
+        n_result id = n_pci_config_read(nvrm_dev.pci, N_PCI_SELF, offset, 1);
+        if (id < 0) return false;
+        if (id == 0x10) return true;  /* PCI Express capability */
+        pointer = n_pci_config_read(nvrm_dev.pci, N_PCI_SELF, offset + 1, 1);
+    }
+    return false;
+}
+
+void nvrm_log_gpu_information(void) {
+    nv_state_t *nv = &nvrm_dev.nv;
+    nvidia_stack_t *sp = nvrm_dev.sp;
+    nvrm_log("NVRM: Model: %s", nvrm_dev.name[0] ? nvrm_dev.name : "Unknown");
+    nvrm_log("NVRM: IRQ: %u vector(s), %s", irq_vectors,
+             nv->flags & NV_FLAG_USES_MSIX ? "MSI-X" : nv->flags & NV_FLAG_USES_MSI ? "MSI" : "polled");
+    char *uuid = nv->nv_uuid_cache.valid ? rm_get_gpu_uuid(sp, nv) : NULL;
+    if (uuid) {
+        nvrm_log("NVRM: GPU UUID: %s", uuid);
+        os_free_mem(uuid);
+    } else if (!nv->nv_uuid_cache.valid) {
+        nvrm_log("NVRM: GPU UUID cache not valid!");
+    }
+    nvrm_log("NVRM: Video BIOS: %s", nv->cached_gpu_info.vbios_version[0] ? nv->cached_gpu_info.vbios_version
+                                                                           : "??.??.??.??.??");
+    nvrm_log("NVRM: Bus Type: %s", pci_express() ? "PCIe" : "PCI");
+    unsigned bits = 0;
+    for (NvU64 mask = nv->dma_mask; mask & 1; mask >>= 1) bits++;
+    nvrm_log("NVRM: DMA Size: %u bits, DMA Mask: 0x%llx", bits, (unsigned long long)nv->dma_mask);
+    nvrm_log("NVRM: Bus Location: %04x:%02x:%02x.%x", nv->pci_info.domain, nv->pci_info.bus, nv->pci_info.slot,
+             nv->pci_info.function);
+    nvrm_log("NVRM: GPU Firmware: %s",
+             nv->cached_gpu_info.firmware_version[0] ? nv->cached_gpu_info.firmware_version : "N/A");
+    nvrm_log("NVRM: GPU Excluded: %s", nv->flags & NV_FLAG_EXCLUDE ? "Yes" : "No");
+    if (!nvrm_dev.adapter_ready) return;
+    nv_power_info_t power = { 0 };
+    rm_get_power_info(sp, nv, &power);
+    nvrm_log("NVRM: Runtime D3 status: %s", power.dynamic_power_status ? power.dynamic_power_status : "?");
+    nvrm_log("NVRM: Video Memory: %s", power.vidmem_power_status ? power.vidmem_power_status : "?");
+    nvrm_log("NVRM: GPU Hardware Support: Video Memory Self Refresh: %s, Video Memory Off: %s",
+             power.gc6_support ? power.gc6_support : "?", power.gcoff_support ? power.gcoff_support : "?");
+    nvrm_log("NVRM: S0ix Power Management: %s", power.s0ix_status ? power.s0ix_status : "?");
+    nvrm_log("NVRM: Notebook Dynamic Boost: %s", power.db_support ? power.db_support : "?");
+}
+
 NV_STATUS NV_API_CALL nv_get_current_irq_priv_data(nv_state_t *nv, NvU32 *data) {
     (void)nv; (void)data;
     return NV_ERR_NOT_SUPPORTED;
 }
 nv_soc_irq_type_t NV_API_CALL nv_get_current_irq_type(nv_state_t *nv) { (void)nv; return NV_SOC_IRQ_INVALID_TYPE; }
-void NV_API_CALL nv_schedule_uvm_isr(nv_state_t *nv) { (void)nv; }
+/* UVM's part of RM's interrupt and P2P paths (nv.c), while UVM runs. */
+void NV_API_CALL nv_schedule_uvm_isr(nv_state_t *nv) { (void)nv; nvrm_uvm_interrupt(); }
+NV_STATUS NV_API_CALL nv_schedule_uvm_drain_p2p(NvU8 *uuid) {
+    return nvrm_uvm_running() ? nv_uvm_drain_P2P(uuid) : NV_ERR_NOT_SUPPORTED;
+}
+void NV_API_CALL nv_schedule_uvm_resume_p2p(NvU8 *uuid) {
+    if (nvrm_uvm_running()) nv_uvm_resume_P2P(uuid);
+}
 
 /* The boot screen, when the firmware put it into this GPU's BAR: RM then keeps that part of
    the framebuffer untouched (it is the console region). */
@@ -1009,4 +1069,31 @@ done:
     for (size_t i = 0; i < made; i++) n_handle_close(parts[i].shared);
     free(parts);
     return h;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * For nvrm's screen (display.c): where a kernel mapping RM made lies on the bus
+ * ---------------------------------------------------------------------------------------- */
+/* The surface NVKMS scans out is mapped through RM (KAPI mapMemory, a kernel mapping, which
+   os_map_kernel_space made from a BAR); the system is given the same pages as a view of that
+   BAR. Only os_map_kernel_space knows which bus address a mapping shows. */
+bool nvrm_kernel_mapping_phys(const void *address, uint64_t *phys) {
+    uintptr_t p = (uintptr_t)address;
+    unsigned registers = aperture_bar[NV_GPU_BAR_INDEX_REGS];
+    if (registers < BAR_COUNT && bars[registers].map && p >= (uintptr_t)bars[registers].map &&
+        p - (uintptr_t)bars[registers].map < nvrm_dev.info.bar[registers].size) {
+        *phys = nvrm_dev.info.bar[registers].address + (p - (uintptr_t)bars[registers].map);
+        return true;
+    }
+    bool found = false;
+    call_once(&bar_once, bar_setup);
+    mtx_lock(&bar_lock);
+    for (size_t k = 0; k < kmap_count && !found; k++) {
+        uintptr_t base = (uintptr_t)kmaps[k].base;
+        if (p < base || p - base >= kmaps[k].length) continue;
+        *phys = kmaps[k].phys + (p - base);
+        found = true;
+    }
+    mtx_unlock(&bar_lock);
+    return found;
 }

@@ -520,6 +520,8 @@ def run_vm(a, tcp_port, web_ports, processes):
     expected_helper_faults = len(re.findall(r"^  \| threadtest: expected helper fault status=134\r?$", log, re.M))
     # So is the write through a read-only shared mapping that sharedpagetest's parent confirms.
     expected_writer_faults = len(re.findall(r"^  \| sharedpagetest: expected writer fault status=142\r?$", log, re.M))
+    # And the touches of paged memory that pagertest's pager failed or left unanswered by ending.
+    expected_toucher_faults = len(re.findall(r"^  \| pagertest: expected toucher fault status=142 \(.*\)\r?$", log, re.M))
     for m in re.finditer(r"^\[(segfault|crash)\] pid \d+ \(([^)]*)\).*$", log, re.M):
         if expected_helper_faults and re.fullmatch(
                 r"\[crash\] pid \d+ \(threadtest\) cpu\d+: Invalid opcode at rip=[0-9a-fA-F]+"
@@ -530,6 +532,11 @@ def run_vm(a, tcp_port, web_ports, processes):
                 r"\[segfault\] pid \d+ \(sharedpagetest\) cpu\d+: Page fault at rip=[0-9a-fA-F]+"
                 r" addr=[0-9a-fA-F]+ err=7 rsp=[0-9a-fA-F]+ stack(?: [0-9a-fA-F]+)*\r?", m.group(0)):
             expected_writer_faults -= 1
+            continue
+        if expected_toucher_faults and re.fullmatch(
+                r"\[segfault\] pid \d+ \(pagertest\) cpu\d+: Page fault at rip=[0-9a-fA-F]+"
+                r" addr=[0-9a-fA-F]+ err=4 rsp=[0-9a-fA-F]+ stack(?: [0-9a-fA-F]+)*\r?", m.group(0)):
+            expected_toucher_faults -= 1
             continue
         if m.group(2) != "wxtest":
             problems.append(m.group(0))

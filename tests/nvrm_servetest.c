@@ -7,7 +7,9 @@
    - a request waiting inside RM holds up only its own client;
    - a client's disconnect closes its RM file exactly once, with what it still held;
    - past the kernel's per-app thread limit the server refuses new clients without failing,
-     keeps serving the others and takes a new client once one has gone.
+     keeps serving the others and takes a new client once one has gone;
+   - NVRM_UVM requests reach the UVM layer (here a fake) with the client's arena, the memory a
+     map attaches stays the layer's, and a connection's UVM state ends before its RM file.
    No GPU and no PCI claim are needed. Prints "nvrm_servetest: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +19,7 @@
 #include "nvrm.h"
 #include "nvrm_protocol.h"
 #include "../ports/nvidia/nvrm_serve.h"
+#include "../ports/nvidia/uvm_nvrm.h"
 #include "nvtypes.h"
 #include "nvstatus.h"
 #include "nvos.h"
@@ -220,6 +223,127 @@ n_handle nvrm_rm_mapping_object(void *file, uint64_t *offset, uint64_t *bytes, u
     return h;
 }
 
+/* ---- the fake UVM layer (uvm_nvrm.h) ---- */
+
+#define UVM_FAKE_POLL 4u
+#define UVM_FAKE_TOKEN 77u
+
+struct nvrm_uvm_client {
+    uint32_t principal;
+    int32_t files;
+    n_handle memory;          /* the last map's, kept as UVM keeps it */
+};
+
+/* The fake ioctl's parameter block */
+struct uvm_echo {
+    uint64_t in, out, through_view;
+};
+
+static struct {
+    unsigned requests, ends, ends_with_arena;
+    bool kept;
+    uint64_t committed, unmapped;
+    uint32_t principal;
+} uvm;
+
+/* The block through a view of the arena, as UVM's pinning reads it. */
+static uint64_t uvm_view_read(const struct uvm_echo *user) {
+    size_t offset;
+    n_handle view = nvrm_user_view(user, sizeof *user, &offset);
+    if (view < 0) return 0;
+    void *mapping = NULL;
+    size_t span = (offset + sizeof *user + N_PAGE_SIZE - 1) & ~(size_t)(N_PAGE_SIZE - 1);
+    uint64_t value = 0;
+    if (n_shared_map(view, span, N_MEMORY_READ_WRITE, &mapping) >= 0) {
+        value = ((const struct uvm_echo *)((uint8_t *)mapping + offset))->in;
+        n_memory_release(mapping, span);
+    }
+    n_handle_close(view);
+    return value;
+}
+
+n_result nvrm_uvm_request(struct nvrm_uvm_client **client, uint32_t principal, void *args, uint32_t size,
+                          n_handle *attach) {
+    *attach = -1;
+    if (size != sizeof(struct nvrm_uvm_request)) return -N_ERR_INVALID;
+    struct nvrm_uvm_request *r = args;
+    if (!*client) {
+        if (!(*client = calloc(1, sizeof **client))) {
+            r->status = NV_ERR_NO_MEMORY;
+            return 0;
+        }
+        (*client)->memory = -1;
+    }
+    struct nvrm_uvm_client *c = *client;
+    c->principal = principal;
+    mtx_lock(&fake.lock);
+    uvm.requests++;
+    uvm.principal = principal;
+    mtx_unlock(&fake.lock);
+    r->status = NV_OK;
+    switch (r->op) {
+    case NVRM_UVM_OPEN:
+        r->file = ++c->files;
+        break;
+    case NVRM_UVM_IOCTL: {
+        struct uvm_echo *e = nvrm_user_translate((const void *)(uintptr_t)r->arg, sizeof *e);
+        uint64_t arena, bytes;
+        bool in_arena = nvrm_user_arena(&arena, &bytes) && r->arg >= arena && r->arg - arena < bytes;
+        if (!e || !in_arena) {
+            r->status = NV_ERR_INVALID_ADDRESS;
+            break;
+        }
+        e->out = e->in * 3;
+        e->through_view = uvm_view_read((const struct uvm_echo *)(uintptr_t)r->arg);
+        break;
+    }
+    case NVRM_UVM_MAP: {
+        n_handle h = n_shared_create((size_t)r->bytes);
+        void *p = NULL;
+        if (h < 0 || n_shared_map(h, (size_t)r->bytes, N_MEMORY_READ_WRITE, &p) < 0) {
+            if (h >= 0) n_handle_close(h);
+            r->status = NV_ERR_NO_MEMORY;
+            break;
+        }
+        memset(p, 0x5a, (size_t)r->bytes);
+        n_memory_release(p, (size_t)r->bytes);
+        if (c->memory >= 0) n_handle_close(c->memory);
+        c->memory = *attach = h;
+        r->token = UVM_FAKE_TOKEN;
+        break;
+    }
+    case NVRM_UVM_MAP_COMMIT:
+        mtx_lock(&fake.lock);
+        uvm.committed = r->token == UVM_FAKE_TOKEN ? r->address : 0;
+        /* the server sent the memory without closing it: it is still this layer's */
+        uvm.kept = c->memory >= 0 && n_handle_kind(c->memory) == N_KIND_SHARED;
+        mtx_unlock(&fake.lock);
+        break;
+    case NVRM_UVM_UNMAP:
+        mtx_lock(&fake.lock);
+        uvm.unmapped = r->address;
+        mtx_unlock(&fake.lock);
+        break;
+    case NVRM_UVM_POLL:
+        r->events = UVM_FAKE_POLL;
+        break;
+    default:
+        r->status = NV_ERR_INVALID_ARGUMENT;
+    }
+    return 0;
+}
+
+void nvrm_uvm_client_end(struct nvrm_uvm_client *c) {
+    uint64_t arena, bytes;
+    bool with_arena = nvrm_user_arena(&arena, &bytes);
+    if (c->memory >= 0) n_handle_close(c->memory);
+    free(c);
+    mtx_lock(&fake.lock);
+    uvm.ends++;
+    uvm.ends_with_arena += with_arena;
+    mtx_unlock(&fake.lock);
+}
+
 /* A copy of file `id`'s record, taken under the lock. */
 static struct fake_file file_record(uint32_t id) {
     struct fake_file copy = {.mapping = -1};
@@ -350,7 +474,7 @@ static void test_single(struct nvrm *rm) {
     r = nvrm_escape(rm, NV_ESC_RM_MAP_MEMORY_DMA, &a, sizeof a);
     CHECK(r == NV_ERR_NOT_SUPPORTED, "RM's status comes back unchanged: %#x", r);
     unsigned before = __atomic_load_n(&fake.ioctls, __ATOMIC_RELAXED);
-    r = nvrm_escape(rm, NVRM_HELLO + 1, &a, sizeof a);
+    r = nvrm_escape(rm, NVRM_UVM + 1, &a, sizeof a);
     CHECK(r == NV_ERR_OPERATING_SYSTEM, "a non-RM escape is refused by the server: %#x", r);
     r = nvrm_escape(rm, NVRM_HELLO, &a, sizeof a);
     CHECK(r == NV_ERR_OPERATING_SYSTEM, "a second HELLO is refused: %#x", r);
@@ -408,6 +532,68 @@ static void test_single(struct nvrm *rm) {
     s = nvrm_connect_device_status(TARGET, &rm);
     CHECK(s >= 0, "the server serves the next client: %s", n_result_text(s));
     if (rm) nvrm_disconnect(rm);
+}
+
+static unsigned uvm_ends(void) {
+    mtx_lock(&fake.lock);
+    unsigned ends = uvm.ends;
+    mtx_unlock(&fake.lock);
+    return ends;
+}
+
+static void test_uvm(void) {
+    struct nvrm *rm = NULL;
+    int64_t s = nvrm_connect_device_status(TARGET, &rm);
+    CHECK(s >= 0, "UVM client: %s", n_result_text(s));
+    if (!rm) return;
+    uint32_t id = echo(rm, 1, FAKE_CMD_ECHO, 0x99);
+    unsigned ends = uvm_ends();
+    int32_t file = 0;
+    uint32_t r = nvrm_uvm_open(rm, 0, &file);
+    CHECK(r == NV_OK && file == 1, "UVM open: %#x, file %d", r, file);
+    mtx_lock(&fake.lock);
+    uint32_t principal = uvm.principal;
+    mtx_unlock(&fake.lock);
+    CHECK(principal == (uint32_t)n_app_self(), "UVM sees the authenticated app (%u)", principal);
+
+    struct uvm_echo e = {.in = 0x1234567};
+    r = nvrm_uvm_ioctl(rm, file, 1, &e, sizeof e);
+    CHECK(r == NV_OK && e.out == 0x1234567u * 3, "UVM ioctl through the arena: %#x", r);
+    CHECK(e.through_view == 0x1234567u, "a view of the arena is the same memory (%#llx)",
+          (unsigned long long)e.through_view);
+
+    void *address = NULL;
+    r = nvrm_uvm_map(rm, file, 2 * N_PAGE_SIZE, &address);
+    CHECK(r == NV_OK && address, "UVM map: %#x", r);
+    if (r == NV_OK && address) {
+        CHECK(((uint8_t *)address)[0] == 0x5a && ((uint8_t *)address)[2 * N_PAGE_SIZE - 1] == 0x5a,
+              "the client maps the attached memory");
+        mtx_lock(&fake.lock);
+        uint64_t committed = uvm.committed;
+        bool kept = uvm.kept;
+        mtx_unlock(&fake.lock);
+        CHECK(committed == (uint64_t)(uintptr_t)address, "the commit names where the client mapped it");
+        CHECK(kept, "the server did not close the memory UVM keeps");
+        r = nvrm_uvm_unmap(rm, address);
+        mtx_lock(&fake.lock);
+        uint64_t unmapped = uvm.unmapped;
+        mtx_unlock(&fake.lock);
+        CHECK(r == NV_OK && unmapped == (uint64_t)(uintptr_t)address, "UVM unmap: %#x", r);
+    }
+    uint32_t events = 0;
+    r = nvrm_uvm_poll(rm, file, 0, &events);
+    CHECK(r == NV_OK && events == UVM_FAKE_POLL, "UVM poll: %#x, events %#x", r, events);
+
+    uint64_t small = 0;
+    r = nvrm_escape(rm, NVRM_UVM, &small, sizeof small);
+    CHECK(r == NV_ERR_OPERATING_SYSTEM, "a malformed UVM request is refused: %#x", r);
+    nvrm_disconnect(rm);
+    CHECK(wait_closed(id), "the UVM client's RM file closed");
+    mtx_lock(&fake.lock);
+    unsigned ended = uvm.ends - ends, with_arena = uvm.ends_with_arena, all = uvm.ends;
+    mtx_unlock(&fake.lock);
+    CHECK(ended == 1, "the connection's UVM state ended once (%u)", ended);
+    CHECK(with_arena == all, "UVM's end ran with the client's arena still there");
 }
 
 struct worker {
@@ -601,7 +787,10 @@ int main(void) {
     struct nvrm *rm = first_connect();
     if (rm) {
         test_single(rm);
+        unsigned ends = uvm_ends();
         test_concurrent();
+        CHECK(uvm_ends() == ends, "clients that never asked for UVM have no UVM state to end");
+        test_uvm();
         test_blocking();
         test_thread_limit();
     }

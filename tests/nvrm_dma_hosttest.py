@@ -27,14 +27,25 @@ base_command = [
     *("-I" + str(vendor / d) for d in include_dirs),
     "-Iports/nvidia", "-Iports/nvidia/include", "-Iuser/include", "-Icommon",
 ]
+# libspdm's cryptography backend also takes libspdm's headers and configuration (NVIDIA's
+# openspdm.mk lists them, as for the build), and BearSSL's.
+openspdm = (vendor / "src/libraries/libspdm/nvidia/openspdm.mk").read_text(encoding="utf-8")
+spdm_version = re.search(r"^LIBSPDM_VERSION\s*:= (\S+)$", openspdm, re.MULTILINE).group(1)
+spdm_includes = re.findall(r"^LIBSPDM_INCLUDES \+= \$\(LIBSPDM_SOURCE_DIR\)/(\S+)$", openspdm, re.MULTILINE)
+spdm_command = [*base_command, "-Ithird_party/bearssl/inc",
+                *("-I" + str(vendor / "src/libraries/libspdm" / d.replace("$(LIBSPDM_VERSION)", spdm_version))
+                  for d in spdm_includes),
+                "-DLIBSPDM_CONFIG=<nvspdm_rmconfig.h>"]
 # Inclusion-based fixtures can accidentally supply a dependency from another
 # production .c file. Check each real translation unit on the target as well.
-for source in ("os.c", "os_pci.c", "os_stubs.c", "rm_api.c", "nvrm.c", "nvrm_serve.c", "libnvrm.c"):
-    checked = subprocess.run([*base_command, "--target=x86_64-unknown-none-elf", "-fsyntax-only",
+for source in ("os.c", "os_pci.c", "os_stubs.c", "os_caps.c", "os_acpi.c", "spdm_crypto.c", "os_ioctl.c",
+               "rm_api.c", "nvrm.c", "nvrm_serve.c", "libnvrm.c"):
+    command = spdm_command if source == "spdm_crypto.c" else base_command
+    checked = subprocess.run([*command, "--target=x86_64-unknown-none-elf", "-fsyntax-only",
                               "ports/nvidia/" + source], cwd=root, env=env)
     if checked.returncode:
         sys.exit(checked.returncode)
-for case in ("nvrm_dma_hosttest", "nvrm_contract_hosttest", "nvrm_transport_hosttest"):
+for case in ("nvrm_dma_hosttest", "nvrm_contract_hosttest", "nvrm_transport_hosttest", "nvrm_ioctl_hosttest"):
     exe = output / (case + ".exe")
     compiled = subprocess.run([*base_command, "-Wl,--gc-sections", "tests/" + case + ".c", "-o", str(exe)], cwd=root, env=env)
     if compiled.returncode:
@@ -42,3 +53,20 @@ for case in ("nvrm_dma_hosttest", "nvrm_contract_hosttest", "nvrm_transport_host
     result = subprocess.run([str(exe)], cwd=root, env=env)
     if result.returncode:
         sys.exit(result.returncode)
+# The cryptography against published test vectors, linked with BearSSL built for the host.
+crypto_objects = []
+for source in ("ports/nvidia/spdm_crypto.c", "tests/nvrm_spdm_crypto_hosttest.c"):
+    obj = output / (Path(source).stem + ".host.o")
+    compiled = subprocess.run([*spdm_command, "-c", source, "-o", str(obj)], cwd=root, env=env)
+    if compiled.returncode:
+        sys.exit(compiled.returncode)
+    crypto_objects.append(str(obj))
+bearssl_sources = sorted(str(p.relative_to(root)) for p in (root / "third_party/bearssl/src").rglob("*.c"))
+exe = output / "nvrm_spdm_crypto_hosttest.exe"
+compiled = subprocess.run([str(cc), "-O2", "-std=gnu11", "-Ithird_party/bearssl/inc", "-Ithird_party/bearssl/src",
+                           *bearssl_sources, *crypto_objects, "-o", str(exe)], cwd=root, env=env)
+if compiled.returncode:
+    sys.exit(compiled.returncode)
+result = subprocess.run([str(exe)], cwd=root, env=env)
+if result.returncode:
+    sys.exit(result.returncode)

@@ -45,7 +45,7 @@ NvBool os_cc_snp_vtom_enabled = NV_FALSE;
 NvBool os_cc_tdx_enabled = NV_FALSE;
 NvBool os_dma_buf_enabled = NV_FALSE;
 NvBool os_imex_channel_is_supported = NV_FALSE;
-nv_cap_t *nvidia_caps_root = NULL;
+/* nvidia_caps_root: os_caps.c */
 
 thread_local bool nvrm_in_isr = false;
 thread_local bool nvrm_thread_admin = true;
@@ -439,7 +439,7 @@ NV_STATUS NV_API_CALL os_get_random_bytes(NvU8 *bytes, NvU16 n) {
     return n_random(bytes, n) >= 0 ? NV_OK : NV_ERR_GENERIC;
 }
 
-NV_STATUS NV_API_CALL os_registry_init(void) { return NV_OK; }
+/* os_registry_init is with the registry, at the end. */
 
 /* ------------------------------------------------------------------------------------------
  * Locks
@@ -1075,4 +1075,174 @@ void NV_API_CALL nv_put_firmware(const void *handle) {
     if (!fw) return;
     n_memory_release(fw->data, fw->size);
     free(fw);
+}
+
+/* ------------------------------------------------------------------------------------------
+ * The registry (os-registry.c)
+ *
+ * RM keeps its options as a registry of named values and reads them as it starts. The original
+ * fills it from the module's parameters: the NVreg_* table nv-reg.h defines (the defaults, or
+ * what was given), a few strings, and the per-device lists once a GPU is probed. nvrm's
+ * parameters are its environment: the string parameters under their own names
+ * (NVreg_RmMsg=...), and NVreg_RegistryDwords as NVRM_REGISTRY_DWORDS, which nvrm.c parses
+ * (rm_parse_option_string, the original's step of this function) before rm_init_rm reads the
+ * registry, so the values it sets for the NVreg_* table are the ones written here.
+ * ---------------------------------------------------------------------------------------- */
+static void registry_strings(void) {
+    static const struct {
+        char **value;
+        const char *name;
+    } strings[] = {
+        { &NVreg_CoherentGPUMemoryMode, "NVreg_CoherentGPUMemoryMode" },
+        { &NVreg_RegistryDwordsPerDevice, "NVreg_RegistryDwordsPerDevice" },
+        { &NVreg_RegistryBinaryFilePerDevice, "NVreg_RegistryBinaryFilePerDevice" },
+        { &NVreg_RmMsg, "NVreg_RmMsg" },
+        { &NVreg_GpuBlacklist, "NVreg_GpuBlacklist" },
+        { &NVreg_TemporaryFilePath, "NVreg_TemporaryFilePath" },
+        { &NVreg_ExcludedGpus, "NVreg_ExcludedGpus" },
+        { &NVreg_RmNvlinkBandwidth, "NVreg_RmNvlinkBandwidth" },
+    };
+    for (size_t i = 0; i < sizeof strings / sizeof strings[0]; i++) {
+        char *value = getenv(strings[i].name);
+        if (value && *value) {
+            *strings[i].value = value;
+            nvrm_log("NVRM: %s=%s", strings[i].name, value);
+        }
+    }
+}
+
+NV_STATUS NV_API_CALL os_registry_init(void) {
+    nvidia_stack_t *sp = nvrm_dev.sp;
+    registry_strings();
+    if (NVreg_RmNvlinkBandwidth)
+        rm_write_registry_string(sp, NULL, "RmNvlinkBandwidth", NVreg_RmNvlinkBandwidth,
+                                 (NvU32)strlen(NVreg_RmNvlinkBandwidth));
+    if (NVreg_RmMsg) rm_write_registry_string(sp, NULL, "RmMsg", NVreg_RmMsg, (NvU32)strlen(NVreg_RmMsg));
+    /* CoherentGPUMemoryMode=driver is the older EnableUserNUMAManagement=0 */
+    if (NVreg_CoherentGPUMemoryMode)
+        NVreg_EnableUserNUMAManagement = strcmp(NVreg_CoherentGPUMemoryMode, "driver") ? 1 : 0;
+    for (nv_parm_t *entry = nv_parms; entry->name; entry++)
+        rm_write_registry_dword(sp, NULL, entry->name, *entry->data);
+    return NV_OK;
+}
+
+/* "bus:slot", "domain:bus:slot" or "domain:bus:slot.func", hexadecimal; spaces are ignored. */
+static NV_STATUS pci_str_to_bdf(const char *text, NvU32 *domain, NvU32 *bus, NvU32 *slot, NvU32 *func) {
+    char *copy = rm_remove_spaces(text);
+    if (!copy) return NV_ERR_NO_MEMORY;
+    NV_STATUS status = NV_ERR_INVALID_ARGUMENT;
+    char *rest = copy, *end, *at;
+    char *token = rm_string_token(&rest, '.');
+    unsigned long first, second, third;
+    if (!*copy || !token) goto done;
+    if (rest && (*rest < '0' || *rest > '7' || rest[1])) goto done; /* functions 0..7 */
+    *func = rest ? (NvU32)(*rest - '0') : 0;
+    first = strtoul(token, &end, 16);
+    if (end == token || *end != ':' || !end[1]) goto done;
+    at = end + 1;
+    second = strtoul(at, &end, 16);
+    if (end == at) goto done;
+    if (*end) {
+        if (*end != ':' || !end[1]) goto done;
+        at = end + 1;
+        third = strtoul(at, &end, 16);
+        if (end == at || *end) goto done;
+        *domain = (NvU32)first;
+        *bus = (NvU32)second;
+        *slot = (NvU32)third;
+    } else {
+        *domain = 0;
+        *bus = (NvU32)first;
+        *slot = (NvU32)second;
+    }
+    status = NV_OK;
+done:
+    os_free_mem(copy);
+    return status;
+}
+
+static bool is_device(const nv_state_t *nv, const char *bdf) {
+    NvU32 domain, bus, slot, func;
+    return pci_str_to_bdf(bdf, &domain, &bus, &slot, &func) == NV_OK && nv->pci_info.domain == domain &&
+           nv->pci_info.bus == bus && nv->pci_info.slot == slot && nv->pci_info.function == func;
+}
+
+/* A binary value from a file in the firmware folder, named relative to it (the original's
+   firmware search folder, "nvidia/"). The name stays inside the folder: no drive, no root,
+   no "..". */
+static NV_STATUS registry_binary_file(nvidia_stack_t *sp, nv_state_t *nv, const char *key, const char *relative) {
+    if (strchr(relative, ':') || relative[0] == '\\' || relative[0] == '/') return NV_ERR_INVALID_ARGUMENT;
+    for (const char *p = relative; *p; p++)
+        if (p[0] == '.' && p[1] == '.' && (p == relative || p[-1] == '\\' || p[-1] == '/') &&
+            (!p[2] || p[2] == '\\' || p[2] == '/'))
+            return NV_ERR_INVALID_ARGUMENT;
+    char path[512];
+    if ((size_t)snprintf(path, sizeof path, FIRMWARE_FOLDER "\\%s", relative) >= sizeof path)
+        return NV_ERR_INVALID_ARGUMENT;
+    void *data = NULL;
+    size_t length = 0;
+    if (n_document_load(path, &data, &length) < 0 || !data) {
+        nvrm_log("NVRM: NVreg_RegistryBinaryFilePerDevice key \"%s\": %s not found", key, path);
+        return NV_ERR_OBJECT_NOT_FOUND;
+    }
+    NV_STATUS status = length > NV_U32_MAX ? NV_ERR_INVALID_DATA
+                                           : rm_write_registry_binary(sp, nv, key, data, (NvU32)length);
+    if (status != NV_OK)
+        nvrm_log("NVRM: NVreg_RegistryBinaryFilePerDevice key \"%s\" (%s) was not written: 0x%x", key, path,
+                 (unsigned)status);
+    n_memory_release(data, length);
+    return status;
+}
+
+/* "pci=BDF;key=value;key=value;pci=BDF;...": the keys after a pci entry belong to that GPU. */
+static NV_STATUS per_device_list(nvidia_stack_t *sp, nv_state_t *nv, const char *list, bool binary) {
+    char *copy = rm_remove_spaces(list);
+    if (!copy) return NV_ERR_NO_MEMORY;
+    NV_STATUS status = NV_OK;
+    bool mine = false;
+    char *rest = copy, *token;
+    while (status == NV_OK && (token = rm_string_token(&rest, ';'))) {
+        if (!*token) continue;
+        char *name = rm_string_token(&token, '=');
+        char *value = rm_string_token(&token, '=');
+        if (!name || !*name || !value || !*value || rm_string_token(&token, '=')) {
+            if (binary) {
+                /* the original stops at a malformed binary entry */
+                nvrm_log("NVRM: NVreg_RegistryBinaryFilePerDevice has a malformed entry");
+                status = NV_ERR_INVALID_ARGUMENT;
+            }
+            continue;
+        }
+        if (!strcmp(name, NV_REG_PCI_DEVICE_BDF)) {
+            mine = is_device(nv, value);
+            continue;
+        }
+        if (!mine) continue;
+        if (binary) status = registry_binary_file(sp, nv, name, value);
+        else rm_write_registry_dword(sp, nv, name, (NvU32)strtoul(value, NULL, 0));
+    }
+    os_free_mem(copy);
+    return status;
+}
+
+NV_STATUS nvrm_registry_per_device(nvidia_stack_t *sp, nv_state_t *nv) {
+    if (!nv) return NV_ERR_INVALID_ARGUMENT;
+    NV_STATUS status = NV_OK;
+    if (NVreg_RegistryDwordsPerDevice) status = per_device_list(sp, nv, NVreg_RegistryDwordsPerDevice, false);
+    if (status == NV_OK && NVreg_RegistryBinaryFilePerDevice)
+        status = per_device_list(sp, nv, NVreg_RegistryBinaryFilePerDevice, true);
+    return status;
+}
+
+/* NVreg_ExcludedGpus (or the older NVreg_GpuBlacklist): GPU UUIDs separated by commas. */
+bool nvrm_gpu_excluded(const char *uuid) {
+    const char *input = NVreg_ExcludedGpus ? NVreg_ExcludedGpus : NVreg_GpuBlacklist;
+    if (!input || !uuid) return false;
+    char *list = rm_remove_spaces(input);
+    if (!list) return false;
+    bool found = false;
+    char *rest = list, *token;
+    while (!found && (token = rm_string_token(&rest, ','))) found = !strcmp(token, uuid);
+    os_free_mem(list);
+    return found;
 }

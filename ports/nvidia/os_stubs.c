@@ -5,9 +5,8 @@
  * for operations, NV_FALSE for "is X present", nothing for notifications. The list is the
  * "unsupported" table of ports/nvidia/README.md and is grouped the same way:
  *   - Tegra / SoC display (clocks, I2C, DCE, IMP, BPMP, brightness)
- *   - ACPI methods (Nocturne has no AML interpreter reachable from an app)
  *   - NUMA, struct page, user-page pinning, IOMMU/SVA, dma-buf, scatter-gather import, P2P
- *   - virtualisation (vGPU, GRID, VFIO), cgroups, IMEX channels, capability files
+ *   - virtualisation (vGPU, GRID, VFIO), cgroups, IMEX channels
  *   - power management hooks (runtime suspend, S0ix, dynamic power)
  *   - file descriptors (clients are channels; RM's second-file lookups find nothing)
  */
@@ -121,8 +120,6 @@ NV_STATUS NV_API_CALL nv_register_phys_pages(nv_state_t *nv, NvU64 *pte, NvU64 p
     return NOT_SUPPORTED;
 }
 void NV_API_CALL nv_unregister_phys_pages(nv_state_t *nv, void *priv) { (void)nv; (void)priv; }
-NV_STATUS NV_API_CALL nv_schedule_uvm_drain_p2p(NvU8 *uuid) { (void)uuid; return NOT_SUPPORTED; }
-void NV_API_CALL nv_schedule_uvm_resume_p2p(NvU8 *uuid) { (void)uuid; }
 
 NV_STATUS NV_API_CALL os_lock_user_pages(void *address, NvU64 pages, void **pagelist, NvU32 flags) {
     (void)address; (void)pages; (void)pagelist; (void)flags;
@@ -199,7 +196,8 @@ void NV_API_CALL os_delete_record_for_crashLog(void *record) { (void)record; }
 NvBool NV_API_CALL nv_is_chassis_notebook(void) { return NV_FALSE; }
 NvBool NV_API_CALL os_supports_kernel_suspend_notifiers(void) { return NV_FALSE; }
 
-/* ---------------------------------------------------------------- virtualisation, cgroups, caps */
+/* ---------------------------------------------------------------- virtualisation, cgroups, IMEX */
+/* Capabilities (nv-caps) are in os_caps.c, ACPI methods (nv-acpi) in os_acpi.c. */
 NvBool NV_API_CALL os_is_vgx_hyper(void) { return NV_FALSE; }
 NV_STATUS NV_API_CALL os_inject_vgx_msi(NvU16 guest, NvU64 address, NvU32 data) {
     (void)guest; (void)address; (void)data;
@@ -217,21 +215,6 @@ NV_STATUS NV_API_CALL os_find_ns_pid(void *pid_info, NvU32 *ns_pid) { (void)pid_
 NvBool NV_API_CALL os_is_init_ns(void) { return NV_TRUE; }
 NvS32 NV_API_CALL os_imex_channel_get(NvU64 descriptor) { (void)descriptor; return -1; }
 NvS32 NV_API_CALL os_imex_channel_count(void) { return 0; }
-NV_STATUS NV_API_CALL nv_acquire_fabric_mgmt_cap(int fd, int *duped) { (void)fd; (void)duped; return NOT_SUPPORTED; }
-
-/* RM's capability files (/proc/driver/nvidia/capabilities in the original): nvidia_caps_root is
-   NULL, so RM skips creating them and none of these is reached. */
-nv_cap_t *NV_API_CALL os_nv_cap_create_dir_entry(nv_cap_t *parent, const char *name, int mode) {
-    (void)parent; (void)name; (void)mode;
-    return NULL;
-}
-nv_cap_t *NV_API_CALL os_nv_cap_create_file_entry(nv_cap_t *parent, const char *name, int mode) {
-    (void)parent; (void)name; (void)mode;
-    return NULL;
-}
-void NV_API_CALL os_nv_cap_destroy_entry(nv_cap_t *cap) { (void)cap; }
-int NV_API_CALL os_nv_cap_validate_and_dup_fd(const nv_cap_t *cap, int fd) { (void)cap; (void)fd; return -1; }
-void NV_API_CALL os_nv_cap_close_fd(int fd) { (void)fd; }
 
 /* ---------------------------------------------------------------- power management */
 NV_STATUS NV_API_CALL nv_indicate_idle(nv_state_t *nv) { (void)nv; return NV_OK; }
@@ -245,39 +228,6 @@ NvBool NV_API_CALL nv_platform_supports_s0ix(void) { return NV_FALSE; }
 NvBool NV_API_CALL nv_s2idle_pm_configured(void) { return NV_FALSE; }
 void NV_API_CALL nv_pci_cxl_set_caching(nv_state_t *nv, NvBool enable) { (void)nv; (void)enable; }
 NV_STATUS NV_API_CALL nv_pci_read_gpu_pdi_from_dvsec(nv_state_t *nv, NvU64 *pdi) { (void)nv; (void)pdi; return NOT_SUPPORTED; }
-
-/* ---------------------------------------------------------------- ACPI */
-void NV_API_CALL nv_acpi_methods_init(NvU32 *handlesPresent) { if (handlesPresent) *handlesPresent = 0; }
-void NV_API_CALL nv_acpi_methods_uninit(void) {}
-NV_STATUS NV_API_CALL nv_acpi_d3cold_dsm_for_upstream_port(nv_state_t *nv, NvU8 *guid, NvU32 rev, NvU32 func,
-                                                          NvU32 *status) {
-    (void)nv; (void)guid; (void)rev; (void)func; (void)status;
-    return NOT_SUPPORTED;
-}
-NV_STATUS NV_API_CALL nv_acpi_dsm_method(nv_state_t *nv, NvU8 *guid, NvU32 rev, NvBool a, NvU32 func, void *in,
-                                         NvU16 in_size, NvU32 *status, void *out, NvU16 *out_size) {
-    (void)nv; (void)guid; (void)rev; (void)a; (void)func; (void)in; (void)in_size; (void)status; (void)out;
-    (void)out_size;
-    return NOT_SUPPORTED;
-}
-NV_STATUS NV_API_CALL nv_acpi_ddc_method(nv_state_t *nv, void *edid, NvU32 *size, NvBool read_short) {
-    (void)nv; (void)edid; (void)size; (void)read_short;
-    return NOT_SUPPORTED;
-}
-NV_STATUS NV_API_CALL nv_acpi_dod_method(nv_state_t *nv, NvU32 *devices, NvU32 *count) {
-    (void)nv; (void)devices; (void)count;
-    return NOT_SUPPORTED;
-}
-NV_STATUS NV_API_CALL nv_acpi_rom_method(nv_state_t *nv, NvU32 *offset, NvU32 *size) {
-    (void)nv; (void)offset; (void)size;
-    return NOT_SUPPORTED;
-}
-NV_STATUS NV_API_CALL nv_acpi_get_powersource(NvU32 *source) { (void)source; return NOT_SUPPORTED; }
-NvBool NV_API_CALL nv_acpi_is_battery_present(void) { return NV_FALSE; }
-NV_STATUS NV_API_CALL nv_acpi_mux_method(nv_state_t *nv, NvU32 *mode, NvU32 mux, const char *method) {
-    (void)nv; (void)mode; (void)mux; (void)method;
-    return NOT_SUPPORTED;
-}
 
 /* ---------------------------------------------------------------- I2C */
 void *NV_API_CALL nv_i2c_add_adapter(nv_state_t *nv, NvU32 port) { (void)nv; (void)port; return NULL; }

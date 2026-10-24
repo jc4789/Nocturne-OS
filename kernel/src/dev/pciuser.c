@@ -17,6 +17,7 @@
 #include "abi.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
+#include "dev/acpi.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
 #include "dev/iommu.h"
@@ -31,6 +32,7 @@
 
 #define CLAIM_VECTORS 32 /* one pending bit each */
 #define CLAIM_GUARDS 32  /* registers with bits only the kernel changes (guards_init) */
+#define CLAIM_ACPI_NOTES 32 /* Notify values of the function's node not yet taken */
 
 /* A config dword some of whose bits are the kernel's: a write that would change them is refused. */
 struct guard {
@@ -53,6 +55,16 @@ struct pci_claim {
     uint16_t pmcsr; /* the power management capability's control register, or 0 */
     struct iommu_domain *domain; /* where an IOMMU isolates the function (dev/iommu.h) */
     struct pci_device *reset_port; /* where this claim's attempt sent a Secondary Bus Reset (bus_reset) */
+    /* Its function's part of the ACPI namespace (n_pci_acpi_eval): the nodes, looked up at the
+       first evaluation under acpi_lock, and the function node's Notify values from the first
+       n_pci_acpi_notify_take on, kept until taken (a ring; the oldest give way). */
+    struct mutex acpi_lock;
+    bool acpi_looked;
+    void *acpi_node, *acpi_upstream;
+    struct acpi_watch *acpi_watch;
+    uint32_t acpi_notes[CLAIM_ACPI_NOTES];
+    unsigned acpi_first, acpi_count; /* interrupts off */
+    struct wait_queue acpi_wq;
 };
 static struct pci_claim *claim_of_vector[256];
 
@@ -198,12 +210,40 @@ static void screen_hold_end(struct pci_claim *c) {
     irq_restore(irq);
 }
 
-/* Gives back one hold. Nothing was drawn while the screen was held, so when the last hold ends
-   whoever draws it (the desktop, or the text console when there is none) draws all of it again. */
-static void screen_release(void) {
-    if (!fb_release()) return;
+/* Whoever draws the screen (the desktop, or the text console when there is none) draws all of it
+   again. */
+static void screen_repaint(void) {
     wm_repaint();
     fbcon_repaint();
+}
+
+/* Gives back one hold. Nothing was drawn while the screen was held, so when the last hold ends
+   all of it is drawn again. */
+static void screen_release(void) {
+    if (fb_release()) screen_repaint();
+}
+
+/* ---- a display driver's own scanout (n_pci_give_screen, dev/fb.c) ----
+   A display function's driver that set up a scanout of the screen's size gives the system that
+   surface, and the desktop is drawn there instead of the boot screen. One claim at a time shows
+   its surface (screen_owner); it gives the boot screen back itself, or its claim's end does once
+   the function is stopped. Then the boot screen's memory is drawn into again, though the display
+   engine may no longer show it: the driver that left reprogrammed it and nothing sets it back. */
+static struct mutex screen_lock; /* screen_owner and screen_surface change under it */
+static struct pci_claim *screen_owner;
+static struct shared_scanout screen_surface;
+
+static void screen_say(const struct pci_claim *c, const char *what) {
+    kprintf("pci: %02x:%02x.%u: %s\n", c->d->bus, c->d->dev, c->d->func, what);
+}
+
+/* The boot screen again, when c shows its surface: true when it did. screen_lock held. */
+static bool screen_give_back(struct pci_claim *c) {
+    if (screen_owner != c) return false;
+    fb_scanout_boot();
+    shared_scanout_close(&screen_surface);
+    __atomic_store_n(&screen_owner, NULL, __ATOMIC_RELEASE);
+    return true;
 }
 
 /* A driver that is done with its device stops it and then switches bus mastering off: that is
@@ -254,7 +294,16 @@ static void claim_release(struct object *o) {
                 d->bus, d->dev, d->func);
     /* Revoke CPU access before returning screen holds. Resuming CPU framebuffer writes is only
        a best-effort redraw: neither BME clear nor IOMMU blocking rebuilds a GPU's BAR/scanout. */
+    acpi_node_unwatch(c->acpi_watch); /* no Notify reaches the claim any more */
+    c->acpi_watch = NULL;
+    mutex_lock(&screen_lock);
+    bool given_back = screen_give_back(c);
+    mutex_unlock(&screen_lock);
+    if (given_back)
+        screen_say(c, "its driver ended while the desktop was drawn into its scanout; the boot screen is drawn "
+                      "again, but the display may not show it: nothing sets the display engine back");
     if (c->screen_holds) screen_hold_end(c);
+    if (!c->screen_holds && given_back) screen_repaint();
     for (; c->screen_holds; c->screen_holds--)
         screen_release();
     d->claimed = false;
@@ -580,10 +629,129 @@ int64_t pci_user_info(struct handle *h, struct n_pci_function *out) {
     return 0;
 }
 
+int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const struct n_scanout *desc) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    if (c->d->cls != 0x03) return -N_ERR_DENIED;
+    mutex_lock(&screen_lock);
+    int64_t r = 0;
+    if (screen_owner && screen_owner != c) r = -N_ERR_BUSY;
+    else if (!surface) {
+        if (!screen_give_back(c)) r = -N_ERR_INVALID;
+        else screen_say(c, "its driver gives the boot screen back; the desktop is drawn there again");
+    } else {
+        uint64_t bytes = 0;
+        struct shared_scanout s = {0};
+        r = fb_scanout_check(desc, &bytes);
+        if (!r) r = shared_scanout_open(surface, c, desc->offset, bytes, &s);
+        if (!r) r = fb_scanout_take(s.frames, s.pages, s.type, s.first_byte, desc);
+        if (r) shared_scanout_close(&s);
+        else {
+            shared_scanout_close(&screen_surface); /* the surface shown before, no longer mapped */
+            screen_surface = s;
+            __atomic_store_n(&screen_owner, c, __ATOMIC_RELEASE);
+            char line[128];
+            ksnprintf(line, sizeof line, "the desktop is drawn into its driver's %ux%u %s scanout (pitch %u)",
+                      desc->width, desc->height, desc->format == N_SCANOUT_XRGB2101010 ? "XRGB2101010" : "XRGB8888",
+                      desc->pitch);
+            screen_say(c, line);
+        }
+    }
+    mutex_unlock(&screen_lock);
+    if (!r) screen_repaint();
+    return r;
+}
+
+int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timestamp_ns) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    if (__atomic_load_n(&screen_owner, __ATOMIC_ACQUIRE) != c) return -N_ERR_DENIED;
+    wm_vblank(count, timestamp_ns);
+    return 0;
+}
+
+/* ---- the function's part of the ACPI namespace (dev/acpi.c) ---- */
+
+/* The function's node and the one above it, once. acpi_lock held. */
+static void acpi_look(struct pci_claim *c) {
+    if (c->acpi_looked) return;
+    c->acpi_looked = true;
+    c->acpi_node = acpi_pci_node(c->d);
+    c->acpi_upstream = c->d->upstream ? acpi_pci_node(c->d->upstream) : acpi_pci_host(c->d);
+}
+
+int64_t pci_user_acpi_eval(struct handle *h, uint32_t which, const char *name, const struct n_acpi_value *args,
+                           uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
+    mutex_lock(&c->acpi_lock);
+    acpi_look(c);
+    void *node = which == N_ACPI_SELF ? c->acpi_node : which == N_ACPI_UPSTREAM ? c->acpi_upstream : NULL;
+    int64_t r = 0;
+    if (which != N_ACPI_SELF && which != N_ACPI_UPSTREAM) {
+        node = c->acpi_node ? acpi_node_child(c->acpi_node, which) : NULL;
+        if (!node) r = -N_ERR_INVALID; /* past the last child (a function without a node has none) */
+    }
+    mutex_unlock(&c->acpi_lock);
+    if (r) return r;
+    if (!node) return -N_ERR_NOT_FOUND;
+    return acpi_node_eval(node, name, args, nargs, data, data_size, out, out_size);
+}
+
+/* Notify(function node, value), on the acpi thread. */
+static void acpi_noted(void *context, uint64_t value) {
+    struct pci_claim *c = context;
+    uint64_t irq = irq_save();
+    if (c->acpi_count == CLAIM_ACPI_NOTES) {
+        c->acpi_first = (c->acpi_first + 1) % CLAIM_ACPI_NOTES;
+        c->acpi_count--;
+    }
+    c->acpi_notes[(c->acpi_first + c->acpi_count++) % CLAIM_ACPI_NOTES] = (uint32_t)value;
+    wq_wake_all(&c->acpi_wq);
+    irq_restore(irq);
+}
+
+int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
+    mutex_lock(&c->acpi_lock);
+    acpi_look(c);
+    if (c->acpi_node && !c->acpi_watch) c->acpi_watch = acpi_node_watch(c->acpi_node, acpi_noted, c);
+    bool watched = c->acpi_watch != NULL;
+    mutex_unlock(&c->acpi_lock);
+    if (!watched) return c->acpi_node ? -N_ERR_NO_MEMORY : -N_ERR_NOT_FOUND;
+    uint64_t give_up = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
+    for (;;) {
+        uint64_t irq = irq_save();
+        if (c->acpi_count) {
+            uint32_t value = c->acpi_notes[c->acpi_first];
+            c->acpi_first = (c->acpi_first + 1) % CLAIM_ACPI_NOTES;
+            c->acpi_count--;
+            irq_restore(irq);
+            return value;
+        }
+        if (current_task->killed) { irq_restore(irq); return -N_ERR_STOPPED; }
+        if (!timeout_ms) { irq_restore(irq); return -N_ERR_TIMEOUT; }
+        if (timeout_ms < 0) wq_wait(&c->acpi_wq);
+        else {
+            uint64_t now = uptime_ms();
+            if (now >= give_up || !wq_wait_timeout(&c->acpi_wq, give_up - now)) {
+                bool late = c->acpi_count != 0;
+                irq_restore(irq);
+                if (!late) return -N_ERR_TIMEOUT;
+                continue;
+            }
+        }
+        irq_restore(irq);
+    }
+}
+
 int64_t pci_user_hold_screen(struct handle *h, bool hold) {
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (screen_bar(c->d) < 0) return -N_ERR_NOT_FOUND;
+    if (screen_bar(c->d) < 0 && __atomic_load_n(&screen_owner, __ATOMIC_ACQUIRE) != c) return -N_ERR_NOT_FOUND;
     if (hold) {
         if (c->screen_holds == UINT32_MAX) return -N_ERR_BUSY;
         if (!c->screen_holds++) screen_hold_begin(c);

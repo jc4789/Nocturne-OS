@@ -32,6 +32,7 @@ struct nvrm {
     unsigned depth;        /* nvrm_lock nesting */
     mtx_t lock;
     struct mapping *mappings;
+    struct mapping *uvm_mappings;  /* nvrm_uvm_map's (linear unused) */
     uint64_t hello_capabilities;
 };
 
@@ -121,14 +122,19 @@ static struct nvrm *connect_any(bool ready_only) {
 struct nvrm *nvrm_connect(void) { return connect_any(false); }
 struct nvrm *nvrm_connect_ready(void) { return connect_any(true); }
 
-void nvrm_disconnect(struct nvrm *rm) {
-    if (!rm) return;
-    while (rm->mappings) {
-        struct mapping *m = rm->mappings;
-        rm->mappings = m->next;
+static void mappings_release(struct mapping **list) {
+    while (*list) {
+        struct mapping *m = *list;
+        *list = m->next;
         n_memory_release(m->base, m->bytes);
         free(m);
     }
+}
+
+void nvrm_disconnect(struct nvrm *rm) {
+    if (!rm) return;
+    mappings_release(&rm->mappings);
+    mappings_release(&rm->uvm_mappings); /* nvrm takes UVM's side down with the connection */
     n_memory_release(rm->arena, ARENA_BYTES);
     n_handle_close(rm->arena_handle);
     n_handle_close(rm->channel); /* nvrm frees what this client still holds */
@@ -307,4 +313,112 @@ uint32_t nvrm_escape(struct nvrm *rm, uint32_t escape, void *args, uint32_t size
 bool nvrm_alive(struct nvrm *rm) {
     n_result r = n_channel_receive(rm->channel, NULL, 0, N_CHANNEL_PEEK, NULL);
     return r != -N_ERR_CLOSED && r != -N_ERR_NO_HANDLE;
+}
+
+/* ---- UVM (NVRM_UVM) ---- */
+
+/* One NVRM_UVM request; UVM's status, or the transport's failure. Called locked. */
+static uint32_t uvm_request(struct nvrm *rm, struct nvrm_uvm_request *u, n_handle *attached) {
+    uint32_t r = request(rm, NVRM_UVM, u, sizeof *u, attached, NULL, NULL);
+    return r == NV_OK ? u->status : r;
+}
+
+uint32_t nvrm_uvm_open(struct nvrm *rm, uint32_t minor, int32_t *file) {
+    struct nvrm_uvm_request u = {.op = NVRM_UVM_OPEN, .file = -1, .minor = minor};
+    nvrm_lock(rm);
+    uint32_t r = uvm_request(rm, &u, NULL);
+    nvrm_unlock(rm);
+    if (r == NV_OK) *file = u.file;
+    return r;
+}
+
+uint32_t nvrm_uvm_close(struct nvrm *rm, int32_t file) {
+    struct nvrm_uvm_request u = {.op = NVRM_UVM_CLOSE, .file = file};
+    nvrm_lock(rm);
+    uint32_t r = uvm_request(rm, &u, NULL);
+    nvrm_unlock(rm);
+    return r;
+}
+
+uint32_t nvrm_uvm_ioctl(struct nvrm *rm, int32_t file, uint32_t cmd, void *params, uint32_t size) {
+    nvrm_lock(rm);
+    void *in = arena_copy(rm, params, size);
+    struct nvrm_uvm_request u = {.op = NVRM_UVM_IOCTL, .file = file, .cmd = cmd,
+                                 .arg = (uint64_t)(uintptr_t)in};
+    uint32_t r = params && size && !in ? NV_ERR_INSUFFICIENT_RESOURCES : uvm_request(rm, &u, NULL);
+    /* UVM writes its results (and its status field) into the block whatever the outcome. */
+    if (in && r != NV_ERR_OPERATING_SYSTEM) memcpy(params, in, size);
+    nvrm_unlock(rm);
+    return r;
+}
+
+uint32_t nvrm_uvm_map(struct nvrm *rm, int32_t file, uint64_t bytes, void **address) {
+    if (!bytes || bytes > SIZE_MAX || bytes % N_PAGE_SIZE) return NV_ERR_INVALID_ARGUMENT;
+    struct mapping *m = calloc(1, sizeof *m);
+    if (!m) return NV_ERR_NO_MEMORY;
+    struct nvrm_uvm_request u = {.op = NVRM_UVM_MAP, .file = file, .bytes = bytes};
+    n_handle memory = -1;
+    nvrm_lock(rm);
+    uint32_t r = uvm_request(rm, &u, &memory);
+    if (r == NV_OK && memory < 0) r = NV_ERR_OPERATING_SYSTEM;
+    if (r == NV_OK) {
+        uint64_t token = u.token;
+        m->bytes = (size_t)bytes;
+        if (n_shared_map(memory, m->bytes, N_MEMORY_READ_WRITE, &m->base) < 0) {
+            /* give the uncommitted map back */
+            u = (struct nvrm_uvm_request){.op = NVRM_UVM_UNMAP, .file = file, .token = token};
+            uvm_request(rm, &u, NULL);
+            r = NV_ERR_NO_MEMORY;
+        } else {
+            u = (struct nvrm_uvm_request){.op = NVRM_UVM_MAP_COMMIT, .file = file, .token = token,
+                                          .address = (uint64_t)(uintptr_t)m->base};
+            r = uvm_request(rm, &u, NULL);
+            if (r != NV_OK) n_memory_release(m->base, m->bytes); /* nvrm took it back already */
+        }
+    }
+    if (memory >= 0) n_handle_close(memory); /* the mapping keeps the memory */
+    if (r == NV_OK) {
+        m->address = m->base;
+        m->next = rm->uvm_mappings;
+        rm->uvm_mappings = m;
+        *address = m->address;
+    }
+    nvrm_unlock(rm);
+    if (r != NV_OK) free(m);
+    return r;
+}
+
+uint32_t nvrm_uvm_unmap(struct nvrm *rm, void *address) {
+    nvrm_lock(rm);
+    struct mapping **link = &rm->uvm_mappings;
+    while (*link && (*link)->address != address) link = &(*link)->next;
+    struct mapping *m = *link;
+    uint32_t r = NV_ERR_INVALID_ADDRESS;
+    if (m) {
+        *link = m->next;
+        /* UVM lets go of it first, so nothing it frees stays reachable here meanwhile */
+        struct nvrm_uvm_request u = {.op = NVRM_UVM_UNMAP, .address = (uint64_t)(uintptr_t)m->base};
+        r = uvm_request(rm, &u, NULL);
+        n_memory_release(m->base, m->bytes);
+        free(m);
+    }
+    nvrm_unlock(rm);
+    return r;
+}
+
+uint32_t nvrm_uvm_poll(struct nvrm *rm, int32_t file, int64_t timeout_ms, uint32_t *events) {
+    uint64_t deadline = timeout_ms < 0 ? UINT64_MAX : n_clock_uptime_ms() + (uint64_t)timeout_ms;
+    for (;;) {
+        uint64_t now = n_clock_uptime_ms();
+        int64_t left = timeout_ms < 0 ? -1 : now >= deadline ? 0 : (int64_t)(deadline - now);
+        struct nvrm_uvm_request u = {.op = NVRM_UVM_POLL, .file = file, .timeout_ms = left};
+        /* one request at a time, so other threads' calls go between the waits */
+        nvrm_lock(rm);
+        uint32_t r = uvm_request(rm, &u, NULL);
+        nvrm_unlock(rm);
+        if (r != NV_OK || u.events || left == 0) {
+            *events = r == NV_OK ? u.events : 0;
+            return r;
+        }
+    }
 }

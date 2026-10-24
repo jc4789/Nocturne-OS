@@ -33,8 +33,22 @@ int64_t pci_user_bar(struct handle *h, uint32_t bar, uint64_t *address, uint64_t
 bool pci_user_bar_prefetchable(struct handle *h, uint32_t bar);
 int64_t pci_user_interrupts(struct handle *h, uint32_t count);
 int64_t pci_user_interrupt_take(struct handle *h, int64_t timeout_ms);
-/* n_pci_hold_screen: only for the function whose BAR the boot screen is drawn through. */
+/* n_pci_hold_screen: only for the function whose BAR the boot screen is drawn through, or the
+   one whose surface the screen is drawn into. */
 int64_t pci_user_hold_screen(struct handle *h, bool hold);
+/* n_pci_give_screen: a display function's surface (a shared object made through its claim; NULL
+   for the boot screen again) becomes where the screen is drawn; desc says how. n_pci_screen_vblank:
+   the surface shown had a vertical blank, which paces the desktop's frames (gui/wm.c). */
+struct n_scanout;
+int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const struct n_scanout *desc);
+int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timestamp_ns);
+/* n_pci_acpi_eval and n_pci_acpi_notify_take: the function's part of the ACPI namespace
+   (dev/acpi.c). which is N_ACPI_SELF, N_ACPI_UPSTREAM or N_ACPI_CHILD(i); the arguments, their
+   data and out are kernel copies. A thread that may block. */
+struct n_acpi_value;
+int64_t pci_user_acpi_eval(struct handle *h, uint32_t which, const char *name, const struct n_acpi_value *args,
+                           uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size);
+int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms);
 /* The user's way out of a stuck driver that holds the screen (Ctrl+Alt+Esc, gui/wm.c and the
    text console in init.c): its app is stopped and the claim's end gives the screen back. False
    when no driver holds it, or its app is already being stopped. Only asks the screen watch thread

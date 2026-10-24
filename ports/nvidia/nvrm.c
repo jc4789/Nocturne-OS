@@ -7,17 +7,23 @@
  *
  *   options (NVRM_REGISTRY_DWORDS) -> rm_init_rm -> n_pci_info / BAR0 -> rm_is_supported_device
  *   -> rm_init_private_state -> interrupts -> rm_init_adapter (GSP firmware boots here)
- *   -> rm_get_device_name -> nvrm_serve
+ *   -> rm_get_device_name -> NVKMS (nvkms_os.c) and the screen (display.c) -> UVM (uvm_rm.c)
+ *   -> nvrm_serve
  *
  * Firmware (gsp_ga10x.bin, and for the log gsp_log_*.bin) comes from
  * C:\Nocturne\Firmware\NVIDIA\615.78.08 (os.c).
  */
 #include "nvrm_os.h"
+#include "nvkms_os.h"
+#include "display.h"
+#include "uvm_nvrm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
+
+#include <os-interface.h>           /* os_free_mem */
 
 /* ------------------------------------------------------------------------------------------
  * Interrupts: one thread takes the device's message-signalled interrupts from the system and
@@ -35,10 +41,14 @@ static bool irq_polling;      /* no usable vector: the same thread runs rm_isr o
 
 static uint64_t irq_runs;     /* atomic: times rm_isr ran, for the bring-up progress lines */
 
+/* nvidia_isr's order: RM copies the MMU faults it serves out of the shadow buffer, UVM's top
+   half takes the replayable faults and access counters, then RM's interrupt handler. */
 static void irq_run_rm(void) {
     __atomic_add_fetch(&irq_runs, 1, __ATOMIC_RELAXED);
-    NvU32 need_bottom_half = 0;
+    NvU32 need_bottom_half = 0, rm_faults = 0;
     nvrm_in_isr = true;
+    rm_gpu_handle_mmu_faults(nvrm_dev.sp, &nvrm_dev.nv, &rm_faults);
+    nvrm_uvm_interrupt();
     NvBool handled = rm_isr(nvrm_dev.sp, &nvrm_dev.nv, &need_bottom_half);
     nvrm_in_isr = false;
     if (handled && need_bottom_half) rm_isr_bh(nvrm_dev.sp, &nvrm_dev.nv);
@@ -156,6 +166,33 @@ static bool init_adapter(nvidia_stack_t *sp, nv_state_t *nv) {
     return ok;
 }
 
+/* nv_check_and_exclude_gpu: whether the GPU stays unstarted because the options exclude it. */
+static bool excluded(nvidia_stack_t *sp, nv_state_t *nv) {
+    if (NVreg_ExcludeAllGpus) {
+        nvrm_log("NVRM: excluding all GPUs as requested");
+        nv->flags |= NV_FLAG_EXCLUDE;
+        return true;
+    }
+    char *uuid = rm_get_gpu_uuid(sp, nv);
+    if (!uuid) {
+        nvrm_log("NVRM: unable to read the GPU UUID");
+        return false;
+    }
+    bool out = false;
+    if (nvrm_gpu_excluded(uuid)) {
+        NV_STATUS st = rm_exclude_adapter(sp, nv);
+        if (st != NV_OK) {
+            nvrm_log("NVRM: failed to exclude GPU %s: %s (0x%x)", uuid, status_text(st), (unsigned)st);
+        } else {
+            nv->flags |= NV_FLAG_EXCLUDE;
+            nvrm_log("NVRM: GPU %s is excluded (NVreg_ExcludedGpus); it is not started", uuid);
+            out = true;
+        }
+    }
+    os_free_mem(uuid);
+    return out;
+}
+
 static bool bring_up(void) {
     struct nvrm_device *d = &nvrm_dev;
     nvidia_stack_t *sp;
@@ -208,7 +245,15 @@ static bool bring_up(void) {
         return false;
     }
     events_ready = true;
+    /* The rest of the original's probe: the UUID, the per-device options, the firmware, and
+       the exclusion lists (NVreg_ExcludeAllGpus, NVreg_ExcludedGpus), which keep the GPU from
+       being started. */
+    rm_get_gpu_uuid_raw(sp, nv);
+    st = nvrm_registry_per_device(sp, nv);
+    if (st != NV_OK)
+        nvrm_log("NVRM: the per-device options are not valid: %s (0x%x)", status_text(st), (unsigned)st);
     rm_set_rm_firmware_requested(sp, nv);
+    if (excluded(sp, nv)) return false;
 
     if (!nvrm_irq_thread_start()) return false;
 
@@ -225,6 +270,15 @@ static bool bring_up(void) {
     const char *name = rm_get_device_name(d->info.device, d->info.subsystem_vendor, d->info.subsystem_id);
     snprintf(d->name, sizeof d->name, "%s", name ? name : "(unknown)");
     nvrm_log("NVRM: GPU started: %s", d->name);
+    nvrm_log_gpu_information();
+
+    /* The screen: NVKMS sets the mode and the system draws into a GPU surface (display.c).
+       Either can fail with the reason in the log; the boot screen then stays as the firmware
+       set it, and RM is served to clients all the same. */
+    if (nvrm_nvkms_start()) nvrm_display_start();
+    /* UVM (nvidia-uvm): unified memory for compute clients. Without it RM and the screen are
+       served all the same, and NVRM_UVM requests are refused. */
+    nvrm_uvm_start();
     return true;
 }
 
@@ -233,6 +287,11 @@ static bool bring_up(void) {
    RM's shutdown of the adapter (which still needs timers and work), then timers and workers. */
 static void tear_down(void) {
     struct nvrm_device *d = &nvrm_dev;
+    /* UVM (every client's UVM state ended with the request server), the screen back to the
+       firmware's framebuffer, then NVKMS out, while RM still runs. */
+    nvrm_uvm_stop();
+    nvrm_display_stop();
+    nvrm_nvkms_stop();
     if (d->sp && d->adapter_ready) rm_disable_adapter(d->sp, &d->nv);
     nvrm_irq_thread_stop();
     if (d->sp && d->adapter_ready) {

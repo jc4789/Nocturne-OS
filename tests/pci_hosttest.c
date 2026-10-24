@@ -146,6 +146,21 @@ void iommu_domain_free(struct iommu_domain *domain) {
 }
 bool fb_release(void) { abort(); }
 void wm_repaint(void) { abort(); }
+/* 表示ドライバーの面（n_pci_give_screen）：claim の終わりは画面の持ち主を調べるだけ */
+void mutex_lock(struct mutex *m) { (void)m; }
+void mutex_unlock(struct mutex *m) { (void)m; }
+int64_t fb_scanout_check(const struct n_scanout *d, uint64_t *bytes) { (void)d; (void)bytes; abort(); }
+int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, size_t first_byte,
+                        const struct n_scanout *d) {
+    (void)frames; (void)pages; (void)type; (void)first_byte; (void)d; abort();
+}
+void fb_scanout_boot(void) { abort(); }
+int64_t shared_scanout_open(struct handle *surface, const struct pci_claim *claim, uint64_t offset, uint64_t bytes,
+                            struct shared_scanout *out) {
+    (void)surface; (void)claim; (void)offset; (void)bytes; (void)out; abort();
+}
+void shared_scanout_close(struct shared_scanout *s) { (void)s; abort(); }
+void wm_vblank(uint64_t count, uint64_t timestamp_ns) { (void)count; (void)timestamp_ns; abort(); }
 struct fb_info fb;
 int init_pid;
 NORETURN void panic(const char *fmt, ...) { (void)fmt; abort(); }

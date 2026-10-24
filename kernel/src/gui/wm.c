@@ -78,6 +78,14 @@ static uint8_t *back_deep, *wall_deep;
 static struct wait_queue wm_wq;
 static unsigned pending_frames;
 static uint64_t frame_period_ms, frame_started_ms;
+/* A display driver's vertical blanks (n_pci_screen_vblank, dev/pciuser.c) of the scanout the
+   screen is drawn into: while they come, a frame with damage starts at the next blank, not after
+   frame_period_ms; VBLANK_LOST_MS without one and the period paces frames again. vblank_count is
+   the driver's count of the last blank, vblank_drawn the one the last frame started at. BSP,
+   changed with interrupts off. */
+#define VBLANK_LOST_MS 100
+static uint64_t vblank_count, vblank_ns, vblank_at_ms, vblank_drawn;
+static bool vblank_seen, vblank_waiting, vblank_pacing;
 /* Settings (struct desktop_settings): cadence, pointer speed with its
    leftover quarter steps, and the deep-colour mode the compositor applies
    between frames. */
@@ -2096,6 +2104,26 @@ static void handle_mouse(const struct mouse_event *m) {
     }
 }
 
+void wm_vblank(uint64_t count, uint64_t timestamp_ns) {
+    uint64_t fl = irq_save();
+    vblank_count = count;
+    vblank_ns = timestamp_ns;
+    vblank_at_ms = uptime_ms();
+    vblank_seen = true;
+    if (vblank_waiting) {
+        vblank_waiting = false;
+        wake_compositor();
+    }
+    irq_restore(fl);
+}
+
+/* Whether vertical blanks pace frames at now. Interrupts off. */
+static bool vblank_paced(uint64_t now) { return vblank_seen && now - vblank_at_ms < VBLANK_LOST_MS; }
+/* Whether a frame with damage may start at now. Interrupts off. */
+static bool frame_due(uint64_t now) {
+    return vblank_paced(now) ? vblank_count != vblank_drawn : now - frame_started_ms >= frame_period_ms;
+}
+
 /* ---- compositor thread ---- */
 static void wm_thread(void *arg) {
     damage_all();
@@ -2104,13 +2132,27 @@ static void wm_thread(void *arg) {
         uint64_t fl = irq_save();
         uint64_t now = uptime_ms();
         bool work = ndamage || pending_frames;
-        uint64_t elapsed = now - frame_started_ms;
-        if (in_head == in_tail && (!work || elapsed < frame_period_ms)) {
+        if (in_head == in_tail && (!work || !frame_due(now))) {
             if (trace_active) { waited=true; waiting=rdtsc(); wt.waits++; }
-            wq_wait_timeout(&wm_wq, work ? frame_period_ms - elapsed : 250);
+            bool paced = work && vblank_paced(now);
+            vblank_waiting = paced; /* the next blank wakes the thread */
+            wq_wait_timeout(&wm_wq, !work ? 250 : paced ? VBLANK_LOST_MS - (now - vblank_at_ms)
+                                                        : frame_period_ms - (now - frame_started_ms));
+            vblank_waiting = false;
             if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
         }
+        bool pacing = vblank_paced(uptime_ms());
+        uint64_t first_count = vblank_count, first_ns = vblank_ns;
         irq_restore(fl);
+        if (pacing != vblank_pacing) {
+            vblank_pacing = pacing;
+            if (pacing)
+                kprintf("wm: frames paced by the display driver's vertical blank (count %lu at %lu ns)\n",
+                        (unsigned long)first_count, (unsigned long)first_ns);
+            else
+                kprintf("wm: no vertical blank for %u ms; frames paced by the %lu ms frame period\n", VBLANK_LOST_MS,
+                        (unsigned long)frame_period_ms);
+        }
         wm_lock();
         struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
 
@@ -2141,8 +2183,11 @@ static void wm_thread(void *arg) {
             struct rect t = toast_rect();
             damage_rect(t.x, t.y, t.w, t.h);
         }
+        fl = irq_save();
         now = uptime_ms();
-        bool render = (ndamage || pending_frames) && now - frame_started_ms >= frame_period_ms;
+        bool render = (ndamage || pending_frames) && frame_due(now);
+        if (render) vblank_drawn = vblank_count;
+        irq_restore(fl);
         if (trace_active && render) {
             frame.rects=ndamage; frame.jobs=cpu_parallel_jobs();
             for (int i=0;i<ndamage;i++) frame.area+=(uint64_t)damage[i].w*damage[i].h;
@@ -2356,7 +2401,8 @@ void wm_init(void) {
     if (cmdline_number("wmrefresh", &hz)) refresh_hz = hz > 1000 ? 1000 : (uint32_t)hz;
     frame_period_ms = refresh_period(refresh_hz);
     deep_wanted = fb.simulated;
-    kprintf("wm: configured frame period %lu ms (0=unpaced, no vblank signal)\n", frame_period_ms);
+    kprintf("wm: configured frame period %lu ms (0=unpaced); a display driver's vertical blanks pace frames "
+            "while they come\n", frame_period_ms);
     size_t pages = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
     if (!bb || !wp) {

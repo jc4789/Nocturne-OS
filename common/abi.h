@@ -110,7 +110,19 @@ enum {
     /* SYS_ENTRY_INFO and SYS_FOLDER_LIST with the size of the caller's struct n_entry */
     SYS_ENTRY_INFO_SIZED,  /* (path, struct n_entry *out, sizeof *out) */
     SYS_FOLDER_LIST_SIZED, /* (path, struct n_entry *out, max, start, sizeof *out): count */
-    SYS_MAX = 192
+    /* A display driver draws the screen's scanout (docs/nocturne-native-abi.md §9) */
+    SYS_PCI_GIVE_SCREEN,   /* (pci, surface or N_SCANOUT_BOOT, const struct n_scanout *) */
+    SYS_PCI_SCREEN_VBLANK, /* (pci, count, timestamp_ns): one vertical blank of that scanout */
+    /* Paged memory and its pager (docs/nocturne-native-abi.md §7) */
+    SYS_PAGER_CREATE,      /* (bytes, int32_t *memory_out): the pager handle */
+    SYS_PAGER_TAKE,        /* (pager, struct n_pager_fault *out, max, timeout_ms): count */
+    SYS_PAGER_SUPPLY,      /* (pager, const struct n_pager_supply *runs, count) */
+    SYS_PAGER_REVOKE,      /* (pager, offset, bytes, 0 or N_MEMORY_READ) */
+    SYS_PAGER_FAIL,        /* (pager, offset, bytes) */
+    /* A claimed function's part of the ACPI namespace (docs/nocturne-native-abi.md §9) */
+    SYS_PCI_ACPI_EVAL,     /* (pci, const struct n_acpi_eval *, out, out_size): bytes written */
+    SYS_PCI_ACPI_NOTIFY_TAKE, /* (pci, timeout_ms): the next Notify value of the function's node */
+    SYS_MAX = 208          /* above every number (what syscallfuzz tries) */
 };
 
 /* ---- native handles ---- */
@@ -124,6 +136,7 @@ enum {
 #define N_KIND_DEVICE 8
 #define N_KIND_CONNECTION 9
 #define N_KIND_PCI 10       /* the right to drive one PCI function */
+#define N_KIND_PAGER 11     /* the right to supply one paged memory object; never sent */
 
 /* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
    which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
@@ -300,6 +313,64 @@ struct n_pci_function {
 #define N_CACHE_WRITE_BACK 1u
 #define N_CACHE_WRITE_COMBINE 2u
 #define N_CACHE_UNCACHED 3u
+
+/* n_pci_give_screen: where in a surface the display engine reads the screen from. width and
+   height are the screen's as it is (the desktop keeps its size while it runs), pitch is the bytes
+   from one row to the next, offset the first row's place in the surface. */
+#define N_SCANOUT_XRGB8888 1u    /* 32 bits: x8 r8 g8 b8, blue in the lowest byte */
+#define N_SCANOUT_XRGB2101010 2u /* 32 bits: x2 r10 g10 b10, blue in the lowest bits */
+#define N_SCANOUT_BOOT (-1)      /* the surface argument: the firmware's framebuffer again */
+struct n_scanout {
+    uint32_t width, height, pitch, format;
+    uint64_t offset;
+};
+
+/* n_pci_acpi_eval: an ACPI object, an argument or a result. An integer's value is the number; a
+   string's or buffer's is where its bytes start (in the arguments' data, or in the result) and
+   length how many (a string's without a terminating zero); a package's value is the index of its
+   first element among the result's values and length how many. A reference (to a namespace
+   object) carries nothing a driver can use. */
+#define N_ACPI_NONE 0u      /* no value (a method that returned nothing, an uninitialised element) */
+#define N_ACPI_INTEGER 1u
+#define N_ACPI_STRING 2u
+#define N_ACPI_BUFFER 3u
+#define N_ACPI_PACKAGE 4u
+#define N_ACPI_REFERENCE 5u
+struct n_acpi_value {
+    uint32_t type, length;
+    uint64_t value;
+};
+/* Which node an evaluation is relative to: the function's own device node, the node of the bridge
+   it is below (the host bridge's on a root bus), or the function node's device child number i. */
+#define N_ACPI_SELF 0xFFFFFFFFu
+#define N_ACPI_UPSTREAM 0xFFFFFFFEu
+#define N_ACPI_CHILD(i) ((uint32_t)(i))
+/* What SYS_PCI_ACPI_EVAL evaluates: name (one name segment, 4 characters, as "_DSM") on node,
+   with nargs arguments (integers, strings or buffers) whose bytes are in data. */
+struct n_acpi_eval {
+    uint32_t node, nargs;
+    const char *name;
+    const struct n_acpi_value *args;
+    const void *data;
+    uint64_t data_size;
+};
+
+/* n_pager_take: a page of paged memory was touched without the access it needs. offset is
+   the page's (page aligned) in the memory, access N_MEMORY_READ or N_MEMORY_READ_WRITE (a
+   write), app the identifier of the app that touched it first. */
+struct n_pager_fault {
+    uint64_t offset;
+    uint32_t access;
+    uint32_t app;
+};
+/* n_pager_supply: [offset, offset+bytes) of the paged memory is bound to the pages of the
+   shared object `source` (a handle of the pager's) from source_offset on, with `access`
+   (N_MEMORY_READ or N_MEMORY_READ_WRITE). All three are page aligned. */
+struct n_pager_supply {
+    uint64_t offset, bytes, source_offset;
+    int32_t source;
+    uint32_t access;
+};
 
 /* Page-aligned slices concatenated by n_shared_compose, in array order. */
 struct n_shared_range {

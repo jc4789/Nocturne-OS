@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "gfx.h"
 #include "display_abi.h"
 
@@ -31,6 +32,20 @@ void fb_present(const uint32_t *src, int src_pitch, const uint8_t *deep, int dee
 void fb_hold(void);
 bool fb_release(void);
 void fb_drop_holds(void);
+/* Where fb_present writes (dev/fb.c, "where the screen is drawn"): the firmware's framebuffer
+   (fb.addr) until a display driver gives the system its own scanout (n_pci_give_screen,
+   dev/pciuser.c, the only caller, one call at a time). fb_scanout_check: whether d describes a
+   scanout of this screen's size in a format fb_present writes, and the bytes from d->offset it
+   spans. fb_scanout_take: draw into the given pages from now on, mapped with the memory type in
+   type (PTE bits, the type every other mapping of them has), the first row first_byte into the
+   first page; a surface shown before is no longer mapped when it returns. fb_scanout_boot: the
+   firmware's framebuffer again. Both return once no present writes to the old one any more; the
+   caller has the screen drawn again in full. */
+struct n_scanout;
+int64_t fb_scanout_check(const struct n_scanout *d, uint64_t *bytes);
+int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, size_t first_byte,
+                        const struct n_scanout *d);
+void fb_scanout_boot(void);
 /* Optional boot-time real-framebuffer test; only runs with the fbbench flag. */
 void fb_benchmark(const uint32_t *src, int src_pitch);
 /* Sleep (dev/pm.h): the display registers once PCI is known; it resumes only where the mode can

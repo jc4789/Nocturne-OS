@@ -1,8 +1,11 @@
 /* NVIDIA RM on Nocturne: the entry points the request server uses (nvrm_serve.h).
  *
- * A client of nvrm is what RM calls an open file of its control device: it gets an
- * nv_file_private_t, every escape goes to rm_ioctl on the control device's state, and closing
+ * A client of nvrm is what RM calls an open file of its control device (and of its GPU's
+ * device): it gets an nv_file_private_t, every escape goes to rm_ioctl on the control device's
+ * state (the few RM takes only on a GPU, on the GPU's), and closing
  * the client runs rm_cleanup_file_private, which frees every RM object the client still holds.
+ * os_ioctl.c sees each request first: it checks its size and answers the escapes nv.c answers
+ * itself.
  */
 #include "nvrm_os.h"
 
@@ -83,6 +86,7 @@ struct nvrm_file {
     size_t data_events;         /* queued events that carry data (the others are one per object) */
     bool overflowed;            /* data events were dropped since the client last collected */
     struct exported_mapping *mappings;
+    struct nvrm_gpu_attachments attached; /* NV_ESC_ATTACH_GPUS_TO_FD (os_ioctl.c) */
 };
 
 static struct nvrm_file *files;
@@ -208,6 +212,7 @@ void nvrm_rm_file_close(void *file) {
     nvrm_thread_admin = f->admin;
     nvrm_thread_process = f->principal;
     rm_cleanup_file_private(nvrm_dev.sp, nv_get_ctl_state(), &f->nvfp);
+    nvrm_nv_file_close(&f->attached);
     nvrm_drop_mapping();
     pending_user_mapping = NULL;
     nvrm_thread_admin = admin;
@@ -234,6 +239,12 @@ void nvrm_rm_file_close(void *file) {
     free(f);
 }
 
+/* RM takes these only on a GPU's own file (NV_ACTUAL_DEVICE_ONLY); the client is that file as
+   well as its control file (os_ioctl.c), so they go with the GPU's state. */
+static nv_state_t *escape_state(uint32_t escape) {
+    return escape == NV_ESC_RM_ALLOC_MEMORY || escape == NV_ESC_RM_I2C_ACCESS ? &nvrm_dev.nv : nv_get_ctl_state();
+}
+
 uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
     struct nvrm_file *f = file;
     nvrm_drop_mapping();
@@ -252,7 +263,9 @@ uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
     request_file = f;
     nvrm_thread_admin = f->admin;
     nvrm_thread_process = f->principal;
-    NV_STATUS status = rm_ioctl(nvrm_dev.sp, nv_get_ctl_state(), &f->nvfp, escape, args, size);
+    NV_STATUS status;
+    if (!nvrm_nv_ioctl(&f->attached, escape, args, size, &status))
+        status = rm_ioctl(nvrm_dev.sp, escape_state(escape), &f->nvfp, escape, args, size);
     nvrm_thread_admin = admin;
     nvrm_thread_process = principal;
     request_file = saved_file;

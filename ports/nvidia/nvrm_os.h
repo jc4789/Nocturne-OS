@@ -1,7 +1,8 @@
 /* Nocturne OS layer for NVIDIA RM (nvrm): shared declarations.
  *
  * RM itself (third_party/nvidia-open) is OS neutral and calls the os_* / nv_* functions
- * implemented in os.c, os_pci.c, os_stubs.c, nvlink_os.c and spdm_stubs.c. This header holds
+ * implemented in os.c, os_pci.c, os_stubs.c, os_caps.c, os_acpi.c, nvlink_os.c and spdm_crypto.c
+ * (libspdm's cryptography); os_ioctl.c and rm_api.c take the clients' requests. This header holds
  * what those files share, and the few entry points the request server (nvrm_serve) needs.
  *
  * Nothing here is POSIX; the implementation uses Nocturne's native ABI and ISO C
@@ -74,6 +75,31 @@ extern thread_local uint32_t nvrm_thread_process;
  * and provides nvrm_user_translate, which os_memcpy_from_user / os_memcpy_to_user use.
  * rm_api.c also holds the clients' RM event queues (nv_post_event, nv_get_event).
  * ---------------------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------------------------
+ * What nv.c answers itself of a request (os_ioctl.c)
+ *
+ * rm_api.c hands every request to nvrm_nv_ioctl first: it checks the argument size of every
+ * escape and answers the escapes that are not RM's (card info, GPU attachment, version check,
+ * system parameters, NUMA, the device interrupt, the open status). It returns false for RM's
+ * escapes, which go on to rm_ioctl; otherwise *status is the result.
+ * ---------------------------------------------------------------------------------------- */
+
+/* The GPUs a client attached its file to (NV_ESC_ATTACH_GPUS_TO_FD); part of the client. */
+struct nvrm_gpu_attachments {
+    NvU32 *ids;
+    size_t count;
+};
+
+bool nvrm_nv_ioctl(struct nvrm_gpu_attachments *attached, uint32_t escape, void *args, uint32_t size,
+                   NV_STATUS *status);
+/* When the client closes, after RM freed what it held: its GPUs are put. */
+void nvrm_nv_file_close(struct nvrm_gpu_attachments *attached);
+/* nvidia_dev_get / nvidia_dev_put for clients outside RM (a client's attachment, NVKMS, UVM):
+   the GPU must be the one nvrm serves, and started. Unless reset_aware, RM counts the client
+   as one that holds off a GPU reset. */
+NV_STATUS nvrm_gpu_get(NvU32 gpu_id, NvBool reset_aware);
+void nvrm_gpu_put(NvU32 gpu_id, NvBool reset_aware);
 
 /* ------------------------------------------------------------------------------------------
  * Client mappings (os_pci.c)
@@ -153,6 +179,8 @@ void nvrm_pci_detach(void);
 bool nvrm_pci_bus_master(bool on);
 uint32_t nvrm_interrupt_count(void); /* vectors enabled (0 before nvrm_irq_enable) */
 int nvrm_irq_enable(void);           /* n_pci_interrupts; returns the number of vectors */
+/* nv-procfs's GPU "information" and "power" pages as log lines; called once the GPU started. */
+void nvrm_log_gpu_information(void);
 
 /* os.c */
 uint64_t nvrm_now_ns(void);          /* monotonic, TSC based when the system offers it */
@@ -162,6 +190,15 @@ void nvrm_timers_stop(void);         /* stops and joins it; armed timers never f
 void nvrm_work_init(void);
 void nvrm_work_stop(void);           /* runs what is queued, stops and waits for the workers */
 struct os_work_queue *nvrm_work_queue(void);
+/* The registry's per-device lists (NVreg_RegistryDwordsPerDevice, NVreg_RegistryBinaryFilePerDevice)
+   for this GPU; the original applies them once the GPU's RM state exists (after
+   rm_init_private_state), before the adapter starts. */
+NV_STATUS nvrm_registry_per_device(nvidia_stack_t *sp, nv_state_t *nv);
+/* Whether NVreg_ExcludedGpus (or NVreg_GpuBlacklist) names this GPU UUID: the original then
+   excludes the adapter (rm_exclude_adapter) once it knows the UUID. */
+bool nvrm_gpu_excluded(const char *uuid);
+/* NVreg_ExcludeAllGpus (nv-reg.h, defined in os.c): no GPU is started. */
+extern NvU32 NVreg_ExcludeAllGpus;
 
 /* The interrupt thread (nvrm.c): MSI/MSI-X delivery, or a polling loop when the system gives no
  * vector. start returns false when no thread runs; stop joins it. */

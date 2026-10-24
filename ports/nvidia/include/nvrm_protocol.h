@@ -22,6 +22,38 @@
 #define NVRM_HELLO_STATUS_PRESENT (UINT64_C(1) << 0)
 #define NVRM_HELLO_ADAPTER_READY (UINT64_C(1) << 1)
 
+/* NVIDIA UVM (CUDA's unified memory, nvidia-uvm) through the same connection: one request, its
+   argument a struct nvrm_uvm_request. A UVM file is numbered per connection (what UVM's
+   parameter blocks call an fd) and closes with it. Mapping UVM memory takes two steps, because
+   only the system chooses where a mapping goes: NVRM_UVM_MAP replies with paged shared memory
+   attached (docs/nocturne-native-abi.md §7), which the client maps read/write wherever the
+   system puts it and releases the handle of, and NVRM_UVM_MAP_COMMIT names that address (UVM
+   requires a mapping's file offset to be its address). NVRM_UVM_UNMAP takes the mapping out of
+   UVM before the client releases it; releasing it without that does the same, later. */
+#define NVRM_UVM (NVRM_HELLO + 1u)
+#define NVRM_UVM_OPEN 1u        /* minor 0 nvidia-uvm, 1 nvidia-uvm-tools: reply file */
+#define NVRM_UVM_CLOSE 2u       /* file */
+#define NVRM_UVM_IOCTL 3u       /* file, cmd (UVM_*), arg: the parameter block's address in the arena */
+#define NVRM_UVM_MAP 4u         /* file, bytes: reply token, memory attached */
+#define NVRM_UVM_MAP_COMMIT 5u  /* token, address */
+#define NVRM_UVM_UNMAP 6u       /* address; address 0: token, a MAP not committed */
+/* file, timeout_ms (-1 waits): reply events (UVM's POLL* bits). One request waits at most a
+   second, so the connection's thread is never held longer; libnvrm repeats it for longer waits. */
+#define NVRM_UVM_POLL 7u
+struct nvrm_uvm_request {
+    uint32_t op;
+    int32_t file;
+    uint32_t minor;
+    uint32_t cmd;
+    uint64_t arg;
+    uint64_t address;
+    uint64_t bytes;
+    uint64_t token;
+    int64_t timeout_ms;
+    uint32_t status;        /* reply: NV_STATUS */
+    uint32_t events;        /* reply to POLL */
+};
+
 struct nvrm_message {
     uint32_t protocol;      /* NVRM_PROTOCOL */
     uint32_t escape;        /* NV_ESC_* or NVRM_HELLO */

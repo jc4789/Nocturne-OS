@@ -20,6 +20,11 @@ void wm_notify(const char *title, const char *text); /* desktop toast */
 int wm_window_count(char *top_title, size_t n);
 void wm_close_windows(void);
 void wm_repaint(void); /* the screen lost what was on it (after sleep): draw all of it again */
+/* A vertical blank of the display driver's scanout the screen is drawn into (dev/pciuser.c): count
+   is the driver's count of blanks, timestamp_ns its time of this one. While blanks come, frames
+   start at them instead of after the configured period. Cheap: it wakes the compositor only when
+   a frame waits for the blank. */
+void wm_vblank(uint64_t count, uint64_t timestamp_ns);
 
 /* Remote display: rectangle copies hold WM ownership only for the copy, never
    while encoding or sending a network packet. */

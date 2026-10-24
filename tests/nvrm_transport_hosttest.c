@@ -127,6 +127,19 @@ bool nvrm_rm_adapter_ready(void) {
     return fixture_adapter_ready && (!multi_gpu_ready || strcmp(connected_name, "nocturne.nvidia.rm.0321"));
 }
 void nvrm_rm_file_close(void *file) { (void)file; }
+/* UVM (uvm_nvrm.h), as the server sees it when nvrm runs no UVM. */
+static int uvm_requests;
+n_result nvrm_uvm_request(struct nvrm_uvm_client **client, uint32_t principal, void *args, uint32_t size,
+                          n_handle *attach) {
+    (void)client;
+    CHECK(principal == sender_app);
+    *attach = -1;
+    uvm_requests++;
+    if (size != sizeof(struct nvrm_uvm_request)) return -N_ERR_INVALID;
+    ((struct nvrm_uvm_request *)args)->status = NV_ERR_NOT_SUPPORTED;
+    return 0;
+}
+void nvrm_uvm_client_end(struct nvrm_uvm_client *client) { (void)client; }
 uint32_t nvrm_rm_ioctl(void *file, uint32_t escape, void *args, uint32_t size) {
     (void)file;
     rm_calls++;
@@ -250,6 +263,13 @@ int main(void) {
     CHECK(nvrm_escape(&rm, 0x777, &untouched, sizeof untouched) == NV_ERR_OPERATING_SYSTEM && untouched == 7);
     CHECK(nvrm_escape(&rm, 0, &untouched, sizeof untouched) == NV_ERR_OPERATING_SYSTEM);
     corrupt_protocol = false;
+    /* NVRM_UVM goes to UVM, never to RM; its status is UVM's */
+    int32_t uvm_file = 5;
+    int rm_before_uvm = rm_calls;
+    CHECK(nvrm_uvm_open(&rm, 0, &uvm_file) == NV_ERR_NOT_SUPPORTED && uvm_file == 5);
+    CHECK(uvm_requests == 1 && rm_calls == rm_before_uvm);
+    CHECK(nvrm_escape(&rm, NVRM_UVM, &untouched, sizeof untouched) == NV_ERR_OPERATING_SYSTEM);
+    CHECK(uvm_requests == 2 && rm_calls == rm_before_uvm);
     void *address = NULL;
     CHECK(nvrm_map(&rm, 1, 2, 3, 0, N_PAGE_SIZE, 0, &address) == NV_OK);
     CHECK(address == shared_page && map_access == N_MEMORY_READ && map_calls == 1);

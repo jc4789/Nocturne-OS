@@ -38,3 +38,19 @@ bool shared_demand_fault(uint64_t addr, bool write);
    function gone from the bus does, and writes go nowhere. */
 struct pci_claim;
 void shared_revoke_claim(const struct pci_claim *c);
+/* A display driver's surface the screen is drawn into (n_pci_give_screen, dev/pciuser.c): bytes
+   from offset of a writable shared object made through claim, a BAR's (which the system writes
+   write-combined, or uncached without PAT) or a DMA object's (in its one type, which must not be
+   write-back), views of them included. Open pins that type over the pages, as a mapping does, and
+   holds the object; frames are the pages from the one offset lies in, type their PTE bits, and
+   first_byte where offset is in the first. Close gives all of it back. BSP. */
+struct object;
+struct shared_scanout {
+    struct object *object;
+    uint64_t *frames;
+    size_t pages, first_byte;
+    uint64_t type;
+};
+int64_t shared_scanout_open(struct handle *surface, const struct pci_claim *claim, uint64_t offset, uint64_t bytes,
+                            struct shared_scanout *out);
+void shared_scanout_close(struct shared_scanout *s);

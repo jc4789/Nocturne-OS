@@ -389,10 +389,10 @@ $(LICENSES)/%: third_party/%
 LICENSE_FILES := $(LICENSES)/libcxx/LICENSE.TXT $(addprefix $(LICENSES)/,uacpi/LICENSE wabt/LICENSE wabt/UPSTREAM.json \
     lexbor/LICENSE lexbor/NOTICE lexbor/UPSTREAM.json ffmpeg/LICENSE.md ffmpeg/COPYING.LGPLv2.1 ffmpeg/manifest.json \
     ffmpeg/README.nocturne.md unifont/OFL-1.1.txt unifont/NOTICE.txt unifont/manifest.json)
-$(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+$(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(NVKMS_LINK_OBJ) $(UVM_LINK_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
+	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(NVKMS_LINK_OBJ) $(UVM_LINK_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 $(LICENSES)/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
 	@mkdir -p $(dir $@)

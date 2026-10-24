@@ -753,6 +753,27 @@ int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
     return 0;
 }
 
+/* Takes write access away from the present 4 KiB leaves of [va, va+size) that have it, and
+   marks them read-only shared pages (PTE_SHARED_RO: no n_memory_protect gives it back). The
+   range is shot down in batches before this returns, so no CPU writes through an old entry. */
+void vmm_user_write_protect(uint64_t pml4, uint64_t va, uint64_t size) {
+    uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
+    for (uint64_t a = start; a < end; a += UNMAP_BATCH * PAGE_SIZE) {
+        uint64_t n = MIN((uint64_t)UNMAP_BATCH, (end - a) / PAGE_SIZE), f = irq_save();
+        bool any = false;
+        for (uint64_t i = 0; i < n; i++) {
+            bool huge = false;
+            uint64_t *p = walk(pml4, a + i * PAGE_SIZE, &huge);
+            if (!p || huge || (*p & (PTE_P | PTE_W)) != (PTE_P | PTE_W)) continue;
+            if (!any) revoke_begin(pml4);
+            any = true;
+            *p = (*p & ~PTE_W) | PTE_SHARED_RO;
+        }
+        if (any) tlb_shootdown(pml4, a, n);
+        irq_restore(f);
+    }
+}
+
 void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size) {
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
     uint64_t old[UNMAP_BATCH];
@@ -789,7 +810,9 @@ int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n) {
 bool vmm_handle_user_fault(uint64_t addr, uint64_t err) {
     struct task *t = current_task;
     if (!t || !t->pml4 || t->pml4 == kernel_pml4) return false;
-    if (err & 1) return false; /* protection violation, not a missing page */
+    /* A protection violation is final, except a write to a page a pager gave read access to:
+       its pager may give write access (shared_demand_fault decides). */
+    if (err & 1) return (err & 2) && !(err & 16) && shared_demand_fault(addr, true);
     if (addr >= USER_STACK_TOP - USER_STACK_MAX && addr < USER_STACK_TOP) {
         return vmm_user_alloc(t->pml4, ALIGN_DOWN(addr, PAGE_SIZE), PAGE_SIZE, VM_W) == 0;
     }
@@ -815,21 +838,32 @@ void *vmalloc(size_t pages) {
     return (void *)va;
 }
 
-/* Map existing frames at fresh kernel addresses with the given flags (e.g. read+execute only). */
-void *vmalloc_map_phys(uint64_t pa, size_t pages, uint64_t flags) {
+static void unmap_kernel(uint64_t va, size_t pages, bool free_frames) {
+    uint64_t old[UNMAP_BATCH];
+    for (size_t i = 0; i < pages; i += UNMAP_BATCH) {
+        size_t n = MIN((size_t)UNMAP_BATCH, pages - i);
+        unmap_range(kernel_pml4, va + i * PAGE_SIZE, n, old);
+        for (size_t j = 0; free_frames && j < n; j++) if (old[j] & PTE_P) pmm_free(old[j] & PTE_ADDR);
+    }
+}
+
+/* Existing frames (frames[i], or a run from pa) at fresh kernel addresses (e.g. read+execute only). */
+static void *map_frames(const uint64_t *frames, uint64_t pa, size_t pages, uint64_t flags) {
     uint64_t f = irq_save();
     uint64_t va = vmalloc_next;
     vmalloc_next += (pages + 1) * PAGE_SIZE;
     irq_restore(f);
-    for (size_t i = 0; i < pages; i++) vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags);
+    for (size_t i = 0; i < pages; i++)
+        if (!vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, frames ? frames[i] : pa + i * PAGE_SIZE, flags)) {
+            unmap_kernel(va, i, false);
+            return NULL;
+        }
     return (void *)va;
 }
-
-void vfree(void *ptr, size_t pages) {
-    uint64_t va = (uint64_t)ptr, old[UNMAP_BATCH];
-    for (size_t i = 0; i < pages; i += UNMAP_BATCH) {
-        size_t n = MIN((size_t)UNMAP_BATCH, pages - i);
-        unmap_range(kernel_pml4, va + i * PAGE_SIZE, n, old);
-        for (size_t j = 0; j < n; j++) if (old[j] & PTE_P) pmm_free(old[j] & PTE_ADDR);
-    }
+void *vmalloc_map_phys(uint64_t pa, size_t pages, uint64_t flags) { return map_frames(NULL, pa, pages, flags); }
+void *vmalloc_map_frames(const uint64_t *frames, size_t pages, uint64_t flags) {
+    return map_frames(frames, 0, pages, flags);
 }
+void vunmap(void *ptr, size_t pages) { unmap_kernel((uint64_t)ptr, pages, false); }
+
+void vfree(void *ptr, size_t pages) { unmap_kernel((uint64_t)ptr, pages, true); }

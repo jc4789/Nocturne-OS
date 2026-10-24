@@ -8,7 +8,7 @@ GPU で描く。GPU が無い環境（QEMU、Hyper-V）は今の softpipe のま
 過去の成功は、現在のソースとビルドで確かめるまで証拠にしない。
 
 **2026-10-20の実機状態更新：** 提供写真ではSEC2 FalconのスクラバーIMEM DMAが `0x65` で時間切れ。
-`0x56` は別の非致命的な能力登録未対応。現在のDMA境界修正は実機復旧を証明していない。
+`0x56`（`NV_ERR_NOT_SUPPORTED`、`_sysCreateOs` の能力登録）は `os_caps.c` で修理済み（C52）。現在のDMA境界修正は実機復旧を証明していない。
 値の照合、修正範囲、未更新媒体は
 [実機DMA調査](bare-metal-dma-20261020.md)を参照。以下の過去の「実機未実施」「修理済み」は、
 この最新の失敗報告を打ち消すものではない。
@@ -40,7 +40,8 @@ GPU が自分の DMA の外へ書いた観測は C51。
 | D5 | Mesa は NVK（Vulkan）＋Zink（GL）を本線にし、`nvkmd/nocturne/` を足す。DRM の uAPI は作らない | 上流の既定（Turing 以降は Zink＋NVK）。nvkmd は DRM を必須にしない抽象 |
 | D6 | NAK などの Rust 部分のため、Rust の `std` を Nocturne へ移植する（Go の `GOOS=nocturne` と同じ形） | 上流の Mesa を書き換えずに済み、他の Rust プログラムにも使える |
 | D7 | RM の取り込みは `src/nvidia` と `src/common` のうち、ビルドに要るものだけ（MIT）。`kernel-open/`・`nouveau/`・GPL の物は入れない | ライセンスと参照の制約 |
-| D8 | 最初は画面出力（display engine）に触らない。起動時のフレームバッファーは `nv_get_screen_info` で RM に知らせて保護する | 実機で画面が消える危険を避ける |
+| D8 | ~~最初は画面出力（display engine）に触らない~~（2026-10-24、D10 で置換）。起動時のフレームバッファーは `nv_get_screen_info` で RM に知らせて保護する | 実機で画面が消える危険を避ける。ただし RM が GPU を初期化した後は起動時の画面が凍るので、表示を GPU へ移す（D10） |
+| D10 | 表示は nvrm の中の NVKMS（nvidia-modeset、MIT）が組む：モード設定、VRAM の scanout 面、flip、垂直帰線。面は `n_pci_give_screen` でカーネルへ渡し、コンポジターはその面へ描いて `n_pci_screen_vblank` の帰線で刻む。claim の終わりで起動時の画面へ戻す | RM の初期化後、CPU の起動時の画面（GOP）は表示エンジンから切られる。GPU が画面をつなぎ直さなければ起動後の画面は凍ったまま |
 | D9 | ファームウェアは gitignore した `local/firmware/nvidia/615.78.08/` に置く。存在するときだけ手元のイメージへ入れる | git に入れない・配布しない |
 
 ## 2. 構成（予定）
@@ -130,6 +131,10 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C48 | IOMMU で DMA を隔離している | 却下 → 修理済み | AMD-Vi（`iommu_amd.c`）と VT-d（`iommu_intel.c`）のドライバー、共通層は `iommu.c`。claim した装置は専用のドメインに入り、その claim の DMA オブジェクト（作成から解放まで、解放はユニットの確認の後）とファームウェアの予約範囲（IVMD・RMRR）だけへ届く。割り込みは再マップ表で claim のベクターだけ。claim の終了で遮断。要求元 ID を他と共有する装置は `N_ERR_BUSY`。隔離は `N_PCI_ISOLATED` でアプリに見える。詳細は ABI 文書 §9 |
 | C49 | claim の時に BAR の大きさを測ってよい | 却下 → 修理済み | 測るとメモリデコードを切るので、起動時の画面がその BAR にあると壊れる。大きさは列挙時の値（`pci_bar_size`）を使う |
 | C50 | 起動時の画面を持つ GPU は `primary_vga` | 却下 → 修理済み | `primary_vga` は VBIOS を通す旧 VGA の画面を意味し、RM は x86emu のために `0xA0000` と option ROM を写そうとする（実機 3 回目で停止）。Nocturne は VGA を使わない。起動画面は `nv_get_screen_info` が返す線形フレームバッファーで、RM はそれを client-managed console として保ち、`RmDeterminePrimaryDevice` で主装置にもなる。`primary_vga` は常に偽、`console_device` はフレームバッファーの BAR があるとき真 |
+| C52 | RM の能力（`nv-caps`）は無くてよい | 却下 → 修理済み | `_sysCreateOs: RM Access Sys Cap creation failed: 0x56` は能力の根が無いための `NV_ERR_NOT_SUPPORTED`。`os_caps.c` が能力の木を持ち、ファイルの代わりに接続の権利で判定する |
+| C53 | RM が初期化すれば画面は GPU が出す | 却下 → 実装（実機未確認） | RM は表示エンジンを組まない（それは NVKMS の役）。nvrm に NVKMS を移植し（`nvkms.mk`、`nvkms_os.c`、KAPI の客 `display.c`）、`GPU started` の後にモード設定・VRAM の面・`n_pci_give_screen`・帰線の転送まで行う。カーネルは `fb.c` の出力先を切り替え、`wm.c` が帰線で描き始める。QEMU では NVIDIA が無いので、カーネル側の ABI だけを pcitest（VGA の BAR を面にする）で確かめた |
+| C54 | ACPI（`_DSM`、`_ROM`、`_DOD`、`_DDC`、MUX、Notify）は非対応で返してよい | 却下 → 実装（実機未確認） | 実機の notebook・GPS・JT は `_DSM` を要る。カーネルの uACPI で claim の範囲（機能の装置・その子・上流のブリッジ）だけを評価する `n_pci_acpi_eval` と `n_pci_acpi_notify_take`（ABI 文書 §9）。`os_acpi.c` は nv-acpi.c の移植。claim の外（`_PSR`、電池、NPCF、NVIF／WMMX）は非対応のまま |
+| C55 | UVM（nvidia-uvm）は要らない | 却下 → 移植（実機未確認） | `kernel-open/nvidia-uvm` の MIT 部分を nvrm に入れ、RM の割り込みの順序（MMU の障害 → UVM → `rm_isr`）と P2P の排出を元どおりに。ページの貸し借りはカーネルの pager ABI（ABI 文書 §7）。pagertest を足した |
 | C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る |
 
 ## 5. 担当と受け渡し
@@ -142,7 +147,8 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 6. 次の一手
 
-1. P10（ユーザー）：RTX 4070 の実機で起動し、システムログの nvrm（GSP 起動）と、ブラウザーの WebGL が
+1. P10（ユーザー）：RTX 4070 の実機で起動し、システムログの nvrm（GSP 起動）、画面が NVKMS の面へ移るか
+   （`NVRM display:`・`wm:`・`fb:` の行、起動後に画面が動き続けるか、C53）と、ブラウザーの WebGL が
    Zink で動くか（失敗ならログの `ZINK:`／`nvkmd`／RM の状態名）を見る。
 2. 実機の結果で C15・C21〜C23・C25・C26・C28 を受理か却下へ。失敗した境界から直す。
 3. 性能（C9・C20・C25）：同じ WebGL を softpipe と Zink で比べる。読み戻しとポーリングが重ければ直す。
@@ -150,6 +156,13 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
+- 2026-10-24（2）：起動後に画面が凍る問題。RM は表示エンジンを組まず、CPU の起動時の画面から GPU へ表示を移す処理が
+  無かった（D10・C53）。`kernel-open` の GPL でない部分をすべて移植：nvidia-modeset（NVKMS と KAPI）、
+  nvidia（`os_caps.c`＝C52、`os_ioctl.c`、`os_acpi.c`＝C54、BearSSL の SPDM 暗号 `spdm_crypto.c`、レジストリーと
+  装置ごとの設定、GPU の除外、`rm_get_gpu_uuid_raw`・`rm_set_rm_firmware_requested` の順序）、nvidia-uvm（C55）。
+  カーネル：`n_pci_give_screen`・`n_pci_screen_vblank`（fb.c の出力先、wm.c の帰線）、pager ABI、ACPI ABI。
+  確認：host 試験（nvrm_display・dma・contract・transport・ioctl・spdm_crypto）通過、全体ビルド。QEMU の回帰は
+  §7 の次の記録または報告。実機（4 回目）で `NVRM display:` と `wm:` の行、画面が GPU の面へ移るかを見る。
 - 2026-10-24：実機 3 回目（USB 起動、IOMMU 有効）。USB の GPT から System.log と nvrm.log を読み取り専用で
   取り出した（`build/qa/realhw/`）。RM は `RmInitX86EmuState` で `0xA0000` を写せず停止。その前に
   `os_flush_cpu_cache_all` を求めて `NOT_SUPPORTED` を受けていた。修理：`os_pci.c` で `primary_vga` を常に偽

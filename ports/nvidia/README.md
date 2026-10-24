@@ -16,14 +16,19 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 |---|---|
 | `nvrm.mk` | RM と OS 層のビルド規則（トップの Makefile から `include` する。変数と規則だけで、既定の目標は変えない） |
 | `nvrm_os.h` | OS 層の各ファイルが共有する宣言（デバイス、ログ、スレッド局所の状態、クライアント側のマッピング） |
-| `os.c` | ログ、メモリ、文字列、時計・待ち、ロック、作業キュー、RC／nano タイマー、ファームウェア読込み、レジストリ表 |
-| `os_pci.c` | PCI 設定空間、BAR、DMA メモリ（`nv_alloc_pages`）、カーネル／クライアント向けマッピング、MSI／MSI-X |
-| `rm_api.c` | リクエストサーバーが使う入口 `nvrm_rm_file_open／close／ioctl／mapping_object`（`rm_ioctl` への橋） |
+| `os.c` | ログ、メモリ、文字列、時計・待ち、ロック、作業キュー、RC／nano タイマー、ファームウェア読込み、レジストリ（os-registry.c：`nv_parms` の表を RM へ書く、装置ごとの一覧、除外する GPU） |
+| `os_pci.c` | PCI 設定空間、BAR、DMA メモリ（`nv_alloc_pages`）、カーネル／クライアント向けマッピング、MSI／MSI-X、GPU の情報のログ（nv-procfs.c の information／power。`nvrm_log_gpu_information`） |
+| `os_ioctl.c` | nv.c の要求の受け口：全エスケープの引数の大きさの検査と、RM でないエスケープ（カード情報、GPU の結付け、版の照合、システム引数、NUMA、デバイス割り込み、開き終わりの状態）。`nvrm_gpu_get／put`（nvidia_dev_get／put） |
+| `rm_api.c` | リクエストサーバーが使う入口 `nvrm_rm_file_open／close／ioctl／mapping_object`（`os_ioctl.c` の後に `rm_ioctl` へ。GPU 専用のエスケープは GPU の `nv_state_t` で渡す） |
+| `os_caps.c` | RM の能力（nv-caps.c と nvlink_caps.c の fabric management）。能力ファイルの代わりに、認証済みの接続の権利で mode を判定する |
+| `os_acpi.c` | RM の ACPI メソッド（nv-acpi.c）と Notify。カーネルの PCI claim の ACPI ABI（`n_pci_acpi_eval`、`n_pci_acpi_notify_take`）で評価する。claim の外の名前は下の「未対応」 |
 | `os_stubs.c` | Nocturne に対応が無い、または RM のこの構成で要らない `os_*`／`nv_*`（下の「未対応」） |
 | `nvlink_os.c` | NVLink／NVSwitch ライブラリーが求める OS 関数（メモリ・文字列・時刻・識別） |
-| `spdm_stubs.c` | libspdm の暗号バックエンド（71 個、すべて 0 を返す） |
+| `spdm_crypto.c` | libspdm の暗号バックエンド 71 個（libspdm_*.c の移植）。BearSSL で SHA-2、HMAC、HKDF、AES-GCM、ECDH／ECDSA（P-256／P-384）、RSA-PSS、X.509 の検証、乱数は `n_random` |
 | `nvrm.c` | `main`、割り込みスレッド、起動手順 |
 | `nvrm_serve.c／.h`、`libnvrm.c`、`include/` | リクエストサーバー、クライアント側ライブラリー、通信規約 |
+| `nvkms.mk`、`nvkms_os.c／.h` | NVIDIA の画面設定ドライバー NVKMS（nvidia-modeset）を nvrm に入れるビルド規則、その OS 層と RM との接続（下の「NVKMS」） |
+| `display.c／.h` | nvrm が画面を持つ：KAPI の唯一のクライアントとしてモニターの接続を張り直し、カーネルの画面を走査面へ移す（下の「画面」） |
 
 起動手順（`nvrm.c`）：init が `N_KIND_PCI` をハンドル 3 で渡す → `n_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
 `NVRM_REGISTRY_DWORDS`（環境変数、任意）を `rm_parse_option_string` へ → `rm_init_rm` → `rm_is_supported_device`
@@ -68,10 +73,10 @@ make -f ports/nvidia/nvrm.mk ... nvrm-undefined                           # 未�
 `NM`／`OBJCOPY` は binutils の `nm`／`objcopy`（この環境に llvm-nm／llvm-objcopy は無い）。
 
 ```make
-$(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+$(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(NVKMS_LINK_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
+	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(NVKMS_LINK_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
 ```
 
 `nvrm.mk` の注意：`srcs.mk`（RM のソース一覧の正本）を読むので、RM のバージョンを替えても一覧は追従する。
@@ -79,14 +84,14 @@ $(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(LIBC_OBJ) $(BR_OBJ) $
 
 ## 未定義シンボルの内訳
 
-RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定義しない名前は **397 個**（libc の関数を除く）。
+RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定義しない名前は **400 個**。すべて OS 層が定義する。
 
 | 分類 | 個数 | どこで |
 |---|---|---|
-| `os_*`／`nv_*` のうち実装したもの | 138（`os.c` 96、`os_pci.c` 42） | 実装。下の対応表 |
-| `os_*`／`nv_*` のうち未対応・中立の答え | 140 | `os_stubs.c`（下の「未対応」） |
+| `os_*`／`nv_*` のうち実装したもの | 166（`os.c` 96、`os_pci.c` 44、`os_caps.c` 7、`rm_api.c` 9、`os_acpi.c` 10） | 実装。下の対応表 |
+| `os_*`／`nv_*` のうち未対応・中立の答え | 115 | `os_stubs.c`（下の「未対応」） |
 | `nvlink_*`／`nvswitch_os_*` | 48 | `nvlink_os.c`（実装 48。GPU に NVLink／NVSwitch は無いので、DMA・イベント・fabric manager は未対応を返す） |
-| `libspdm_*`（暗号バックエンド） | 71 | `spdm_stubs.c`（0 を返す。SPDM は Hopper 以降の機密計算と認証にだけ使われ、Ada では始まらない） |
+| `libspdm_*`（暗号バックエンド） | 71 | `spdm_crypto.c`（BearSSL で実装。既知の試験ベクターで `tests/nvrm_spdm_crypto_hosttest.c` が照合） |
 
 最後に残るのは ISO C の関数（`malloc`・`mtx_*`・`thrd_*`・`snprintf` など）と Nocturne のネイティブ関数
 （`n_*`／`clock_info`／`cpu_info`／`pcilist`）だけ。これらは `user/libc/sys.c` などが持つ。ネイティブ関数は
@@ -120,22 +125,342 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 は、**RM 自身のロック（GPU ロック、スピンロック＝mutex）だけで互いを守る**。nvrm はその外側に追加のロックを置かない。
 `nvrm_in_isr` は `rm_isr` の間だけ真。
 
+## kernel-open/nvidia の移植表
+
+NVIDIA の Linux 用モジュール（open-gpu-kernel-modules 615.78.08 の `kernel-open/nvidia/`、58 個の .c、すべて MIT）の
+各ファイルが Nocturne のどこにあるか。Linux の仕組み（デバイスファイル、procfs、kthread、`struct page`）は写さず、
+RM が OS 層に求める約束（`os_*`／`nv_*`／`nvlink_*`／`libspdm_*`）と、nv.c が自分で答える要求を移す。
+
+状態の意味：**移植済み**＝元の働きが Nocturne の方法である。**一部**＝働きの一部が無い（理由を書く）。
+**未移植**＝必要だが無い（何が要るかを書く）。**該当ハードウェア無し**＝x86 の dGPU（RTX 4070）の機械に存在しない
+ハードウェア向け。**対象外**＝RM もアプリも使わない、Linux の他のドライバー向けの口（理由を書く）。
+
+| 元のファイル | 役目 | Nocturne での置き場（関数） | 状態 |
+|---|---|---|---|
+| `nv.c` | モジュールの本体：制御デバイスと GPU デバイスの開閉、要求の受け口、GPU の get／put、カード情報、GPU の結付け、版の照合、NUMA、イベント、割り込み | `os_ioctl.c`（`nvrm_nv_ioctl`：全エスケープの大きさの検査、`CARD_INFO`、`ATTACH_GPUS_TO_FD`、`CHECK_VERSION_STR`、`SYS_PARAMS`、`NUMA_INFO`、`SET_NUMA_STATUS`、`QUERY_DEVICE_INTR`、`WAIT_OPEN_COMPLETE`、`nvrm_gpu_get／put`）、`rm_api.c`（`nvrm_rm_file_open／close／ioctl`、`nv_post_event`／`nv_get_event`。`ALLOC_MEMORY`／`I2C_ACCESS` は GPU の状態で RM へ）、`nvrm.c`（起動、割り込みスレッド） | 移植済み。`IOCTL_XFER_CMD` は該当しない（通信規約が引数全体を運ぶので `NOT_SUPPORTED`） |
+| `nv-pci.c` | PCI の probe／remove、BAR、バスマスター、電源 | `nvrm.c` の起動手順、`os_pci.c`（`nvrm_pci_attach`、`nvrm_pci_bus_master`、`nvrm_pci_detach`） | 移植済み。Grace の C2C／EGM／NUMA の部分は該当ハードウェア無し。ランタイム電源管理は下の「未対応」 |
+| `nv-pci-table.c` | 引き受ける PCI 装置の表 | init／libnvrm／NVK の共通の選別（NVIDIA、VGA か 3D、progif 0）と `rm_is_supported_device` | 移植済み |
+| `nv-msi.c` | MSI／MSI-X の有効化 | `os_pci.c`（`nvrm_irq_enable`：`n_pci_interrupts`、`NV_FLAG_USES_MSI(X)`） | 移植済み（ベクター 1 本） |
+| `nv-acpi.c` | GPU の ACPI メソッド（`_DSM`、`_ROM`、`_DOD`、`_DDC`、MUX）と Notify | `os_acpi.c`（全メソッド） | 移植済み：GPU の装置・その子・上流のブリッジのメソッドと Notify は、カーネルの PCI claim の ACPI ABI（`n_pci_acpi_eval`、`n_pci_acpi_notify_take`）で評価する。claim の外（`_PSR`、電池、`\_SB.NPCF`、NVIF／WMMX）は下の「未対応」 |
+| `nv-caps.c` | 能力（MIG、fabric、profiler など）の木と、その証明 | `os_caps.c`（`os_nv_cap_*`。能力ファイルの代わりに、システムが認証した接続の権利で mode を判定） | 移植済み |
+| `nvlink_caps.c` | NVLink の能力ファイル（fabric-mgmt） | `os_caps.c`（`nvlink_fabric_mgmt`、RM の FM session） | 移植済み |
+| `nv-caps-imex.c` | IMEX チャンネル（複数ノードの NVLink のメモリ共有） | `os_stubs.c`（`os_imex_channel_get` は −1、`count` は 0） | 該当ハードウェア無し（複数ノードの NVLink 構成） |
+| `nv-cray.c` | Cray XT／XE の機械へ誤りを渡す | 無し（RM は呼ばない） | 該当ハードウェア無し |
+| `nv-dma.c` | IOMMU による DMA の写し、他の GPU の BAR への写し | `os_stubs.c`（`nv_dma_map_*`）。`nv_requires_dma_remap` が偽なので RM の `iovaspace_id` は NONE になり、`osIovaMap` は呼ばれない。IOMMU 隔離はカーネルの PCI／DMA 経路が受け持ち、`n_dma_addresses` がバス番地を返す | 対象外（IOMMU はカーネル）。他の GPU との peer は該当ハードウェア無し（GPU 1 枚） |
+| `nv-dmabuf.c` | RM のメモリを dma-buf として書き出す | `os_ioctl.c`（`EXPORT_TO_DMABUF_FD` は `params->status = NOT_SUPPORTED`）、取り込みは `os_stubs.c` | 未移植：通信規約（`include/nvrm_protocol.h`）が共有オブジェクトを添えるのは `MAP_MEMORY` の応答だけなので、書き出したものをクライアントに渡せない。規約の拡張が要る |
+| `nv-i2c.c` | GPU の I2C ポートを Linux の I2C 層へ登録する、Tegra の I2C | `os_stubs.c`（`nv_i2c_add_adapter` は NULL、transfer／bus_status は Tegra） | 対象外：Nocturne に I2C 層が無い。アプリは `NV_ESC_RM_I2C_ACCESS`（GPU の状態で RM へ）で GPU の I2C に届く |
+| `nv-kthread-q.c` | カーネルスレッドの作業キュー | RM は使わない（RM の作業は `os.c` の `os_queue_work_item`）。UVM／NVKMS の分は各担当 | 対象外（RM） |
+| `nv-memdbg.c` | DEBUG ビルドの確保の追跡 | 無し（RM は呼ばない） | 対象外 |
+| `nv-mmap.c` | クライアントへの写像（mmap） | `rm_api.c`（`nvrm_rm_mapping_object`）、`os_pci.c`（`nvrm_mapping_view`、`nvrm_bar_view`、`nvrm_alloc_view`） | 一部：`nv_revoke_gpu_mappings`（電源管理で写像を一時的に失効し、fault で戻す）は `NOT_SUPPORTED` |
+| `nv-nano-timer.c` | ナノ秒のタイマー | `os.c`（`nv_create_nano_timer` ほか、タイマースレッド） | 移植済み |
+| `nv-p2p.c` | 他社のカーネルドライバー（GPUDirect RDMA の NIC）向けの P2P API | 無し | 該当ハードウェア無し（相手の NIC とそのドライバーが無い） |
+| `nv-procfs.c` | `/proc/driver/nvidia` の情報、レジストリ、版、suspend／unbind_lock | `os_pci.c`（`nvrm_log_gpu_information`：information と power をログへ）、`os.c`（与えられた NVreg の文字列をログへ）、版は `NVRM_FIRMWARE_VERSION` | 一部：proc ファイルシステムは無く、読む代わりにログに出す。`suspend`／`unbind_lock` の書込み口は電源管理・装置の切離しで未対応 |
+| `nv-report-err.c` | 他のカーネルモジュールが誤りの通知を登録する | 無し（RM は呼ばない） | 対象外 |
+| `nv-rsync.c` | Mellanox の rsync ドライバーとの同期（GPUDirect） | 無し | 該当ハードウェア無し |
+| `nv-usermap.c` | クライアント写像の番地 | `os_pci.c`（`nv_alloc_user_mapping`、`nv_free_user_mapping`、`nv_add_mapping_context_to_file`） | 移植済み |
+| `nv-vm.c` | DMA に使う system memory の確保 | `os_pci.c`（`nv_alloc_pages`／`nv_free_pages`：`n_dma_create`） | 移植済み |
+| `nv-vtophys.c` | カーネル番地から物理番地 | 無し（RM は呼ばない） | 対象外 |
+| `os-interface.c` | `os_*` の大部分（メモリ、時計、ロック、文字列、CPU） | `os.c`、`os_pci.c`、`os_stubs.c` | 移植済み（該当の無いものは下の「未対応」） |
+| `os-mlock.c` | クライアントのページを固定して DMA に使う | `os_stubs.c`（`os_lock_user_pages` ほか `NOT_SUPPORTED`） | 未移植：他のアプリのページを固定する ABI が無い。クライアントのメモリは native の共有オブジェクトで渡す。ホストのメモリを GPU に見せる機能（Vulkan の外部ホストメモリ）にはカーネルの ABI が要る |
+| `os-pci.c` | `os_pci_*` | `os_pci.c`（`n_pci_config_read／write`） | 移植済み |
+| `os-registry.c` | RM のレジストリ（`NVreg_*`） | `os.c`（`os_registry_init`：`nv_parms` の表を RM へ書く、`nvrm_registry_per_device`、`nvrm_gpu_excluded`）。`NVreg_RegistryDwords` は `nvrm.c` の `NVRM_REGISTRY_DWORDS` | 移植済み（装置ごとの一覧と除外は `nvrm.c` からの呼出しが要る） |
+| `os-usermap.c` | 写像の番地の照合 | `os_pci.c`（`os_match_mmap_offset`） | 移植済み |
+| `nvlink_linux.c` | NVLink ライブラリーの OS 関数と、NVLink のデバイスファイル | `nvlink_os.c`（`nvlink_*`） | 移植済み（OS 関数）。デバイスファイルと fabric manager は該当ハードウェア無し（RTX 4070 に NVLink は無い） |
+| `linux_nvswitch.c`、`i2c_nvswitch.c`、`procfs_nvswitch.c` | NVSwitch のドライバー | `nvlink_os.c`（RM が組み込む NVSwitch ライブラリーの `nvswitch_os_*`） | 該当ハードウェア無し |
+| `libspdm_aead.c`、`libspdm_aead_aes_gcm.c`、`libspdm_ec.c`、`libspdm_ecc.c`、`libspdm_hkdf.c`、`libspdm_hkdf_sha.c`、`libspdm_hmac_sha.c`、`libspdm_internal_crypt_lib.c`、`libspdm_rand.c`、`libspdm_rsa.c`、`libspdm_rsa_ext.c`、`libspdm_sha.c`、`libspdm_shash.c`、`libspdm_x509.c` | libspdm の暗号 | `spdm_crypto.c`（71 個、BearSSL と `n_random`） | 移植済み。NVIDIA 版が持たないもの（ECDSA の署名、RSA-PSS の検証など）は同じく false |
+| `nv-bpmp.c`、`nv-clk.c`、`nv-dsi-parse-panel-props.c`、`nv-gpio.c`、`nv-host1x.c`、`nv-imp.c`、`nv-ipc-soc.c`、`nv-platform.c`、`nv-platform-pm.c`、`nv-backlight.c` | Tegra（SoC）の表示・クロック・GPIO・電源・輝度 | `os_stubs.c`（`NOT_SUPPORTED`） | 該当ハードウェア無し（PCI の dGPU ではない） |
+| `nv-modeset-interface.c` | RM と NVKMS の間 | 下の「NVKMS」 | 担当外（NVKMS） |
+| `nv_uvm_interface.c` | RM と UVM の間 | UVM の移植 | 担当外（UVM） |
+
+`kernel-open/common/inc`：OS に依らないヘッダー（`nv.h`、`nv-ioctl*.h`、`nv-caps.h`、`os-interface.h`、`nvstatus.h` など）は
+同じものが `third_party/nvidia-open/src` にあり、そちらを使う。Linux の仕組みのヘッダー（`nv-linux.h`、`nv-mm.h`、
+`nv-pgprot.h`、`nv-lock.h`、`nv-time.h`、`nv-timer.h`、`nv-kref.h`、`nv-hash.h`、`nv-list-helpers.h`、`nv-pci*.h`、
+`nv-procfs*.h`、`nv-kthread-q*.h`、`nv-proto.h`、`nv-msi.h`、`nv-memdbg.h`、`conftest.h`、`nv-retpoline.h`、`nv-rethunk.h`）は
+写さず、その役目を `nvrm_os.h` が持つ。Tegra のヘッダー（`nv-platform.h`、`nv-tegra-clk.h`、`os_dsi_panel_props.h`、
+`os_gpio.h`）は該当ハードウェア無し。`nv-dmabuf.h` は上の dma-buf。`nv-modeset-interface.h` は NVKMS、
+`nv_uvm_interface.h`、`rm-gpu-ops.h` は UVM の担当。
+
 ## 未対応（`os_stubs.c`）
 
 どれも「未対応の値」（`NV_ERR_NOT_SUPPORTED`、`NV_FALSE`、何もしない）を返す。理由は種類別。
 
 - **Tegra／SoC**（クロック、I2C、DCE、IMP、BPMP、輝度）：PCI の GPU ではない。
-- **ACPI メソッド**（`_DSM`、`_DDC`、`_DOD`、`_ROM`、MUX、電源）：アプリから AML を実行する手段が無い。
-- **NUMA・dma-buf・外部scatter-gatherの取り込み・任意ユーザーページの固定・P2P API**：クライアントのメモリはnative共有オブジェクトで渡す。IOMMU隔離はカーネルのPCI/DMA経路が担当し、nvrmが独自のIOMMU表を作らない。
+- **claim の外の ACPI**：電源の状態（`_PSR`）、電池、`\_SB.NPCF`、NVIF／WMMX。カーネルの ACPI ABI は claim した機能の装置・その子・上流のブリッジにしか届かないので、`os_acpi.c` は `NV_ERR_NOT_SUPPORTED` を返す（RM はファームウェアにそのメソッドが無い機械として進む）。
+- **NUMA・dma-buf・外部scatter-gatherの取り込み・任意ユーザーページの固定・P2P API**：dma-buf の書き出し（`NV_ESC_EXPORT_TO_DMABUF_FD`）は `os_ioctl.c` が `NOT_SUPPORTED` を返す（通信規約が共有オブジェクトを添えるのは `MAP_MEMORY` の応答だけ）。クライアントのメモリはnative共有オブジェクトで渡す。IOMMU隔離はカーネルのPCI/DMA経路が担当し、nvrmが独自のIOMMU表を作らない。
 
 PCI claimは既定でDMA隔離を必須とする。管理者が`appdrivers-unisolated`を明示すると非隔離利用を許すが、
 全物理メモリへ届く危険がある。異常終了したGPUの非隔離再claimは許可しない。
 `N_PCI_NEEDS_RECOVERY`がある場合、nvrmは未回復をログに残してRMの初期化へ進む。
 起動画面GPUのgeneric FLRやscanoutの再建を行ったという意味ではなく、実GPUの回復は別途受入が必要。
-- **仮想化**（vGPU、GRID、VFIO）、**cgroup**、**IMEX チャンネル**、**能力ファイル**（`nvidia_caps_root` は NULL）。
+- **仮想化**（vGPU、GRID、VFIO）、**cgroup**、**IMEX チャンネル**（複数ノードの NVLink 構成）。能力は `os_caps.c` が接続の権利で判定する（ファイルは無い）。
 - **電源管理**（ランタイムサスペンド、S0ix、動的電源）：未対応。`nv_revoke_gpu_mappings` は、fault 時復元を伴う一時失効を提供できないため、状態・既存写像を変えず `NV_ERR_NOT_SUPPORTED` を返す。永久取消で代用しない。`safe_to_mmap` は独立した新規写像の許可状態で、取消完了の報告とは混同しない。
 - **イベント**：`nv_post_event` はクライアント（`struct nvrm_file`）ごとのキューに積み、`nv_get_event`（`NV_ESC_RM_GET_EVENT_DATA`）で取り出す。プロトコルは要求・応答なのでクライアントがポーリングし、プッシュ通知は無い。`nv_get_file_private` は無し（記述子が無い）。
 - **ファイル**（`os_allocate_temporary_file` など）：ページアウト用。無い。
+
+## NVKMS（nvidia-modeset）
+
+NVIDIA の画面設定の中核（`third_party/nvidia-open/src/nvidia-modeset`：EVO／NVDisplay、DisplayPort ライブラリー、
+HDMI パケット、EDID・タイミング、headsurface のシェーダー）を、Linux の別モジュール nvidia-modeset.ko ではなく
+nvrm の中に入れる。NVKMS は RM のカーネルクライアント（`rm_kernel_rmapi_op`）として GPU を使うので、
+GPU を持つ nvrm の中にあるのが自然な置き場で、RM との間に通信は挟まない。
+
+取り込み（上流 615.78.08 と同じ内容・同じ相対位置、変更なし）：`src/nvidia-modeset`（139 ファイル、
+`Makefile`・`srcs.mk`・`exports_link_command.txt`・生成済みの `g_nvkms-evo-states.c` とシェーダーを含む）、
+`src/common` の `displayport`・`modeset`（hdmipacket、timing）・`softfloat`・`unix`（nvidia-3d、nvidia-push、
+headsurface、xzminidec、共通の utils）、`kernel-open/common/inc/nv-modeset-interface.h`。
+ライセンスは MIT のほか、SoftFloat 3d（BSD-3）、xzminidec（パブリックドメイン）、`nvkms-pow.c` の fdlibm
+（Sun の許諾文）で、本文は `third_party/nvidia-open/NOTICES` にある。GPL のファイルは無い。
+
+### ビルド（`nvkms.mk`、`nvrm.mk` から `include`）
+
+```
+python scripts/build.py nvkms-objs        # NVKMS の中核と OS 層（build/nvkms/）
+python scripts/build.py nvkms-undefined   # RM＋NVKMS＋両 OS 層の未定義シンボル（build/nvkms/undefined.txt）
+```
+
+- ソース一覧は上流の `srcs.mk`（C 184、C++ 40）をそのまま読む。旗は上流の `Makefile`／`utils.mk` に従い、
+  カーネルモジュール専用のもの（`-mcmodel=kernel`、`-mno-sse`／`-msoft-float`、retpoline、`-fcf-protection`）を除いて
+  nvrm と同じプログラムの旗（`-msse2`、フレームポインター）にする。C++ は上流どおり `-std=gnu++11 -fno-rtti
+  -fno-exceptions`。DisplayPort ライブラリーは自前の `operator new` を持ち、C++ ライブラリーも静的初期化子も使わない。
+- 上流は gcc で作る。clang だけが出す警告（入れ子の初期化子の括弧、加算だけの変数、xzminidec の
+  `static inline __always_inline`、DisplayPort の `override` の付け方の不揃い）は、その 4 つだけを止めている（`NVKMS_CLANG_ONLY` ほか）。
+- シェーダーは上流どおり `xz -C none` で縮め、`ld -r --format=binary` で `_binary_<arch>_shaders_xz_start／_end` にする。
+- 全オブジェクトを `nv-modeset-kernel.o` に部分リンクし、`exports_link_command.txt` の入口（`nvKms*` の 23 個）以外の
+  大域シンボルを局所化する。RM も同じ共通ファイル（`nvstatus.c` など）を持つので、名前が衝突しない。
+  上流の `nvkms.ld` は使わない：GNU ld 用に関数ごとのセクションをまとめるもので、lld でそうすると C++ の COMDAT 群が
+  壊れる。セクションを分けたままなので nvrm の `--gc-sections` も効く。
+- トップの Makefile の nvrm のリンクに `$(NVKMS_LINK_OBJ)`（`nv-modeset-kernel.o`、`nvkms_os.o`）を加えた。
+
+### OS 層の対応（`nvkms_os.c`）
+
+`nvidia-modeset-os-interface.h` の関数すべてと、nvidia.ko 側の `nv-modeset-interface.c`（`nvidia_modeset_rm_ops_t`）の役目を
+一つのファイルで持つ。RM の OS 層（`os.c`）にある物は使い回し、同じ物を作り直さない。
+
+| NVKMS が呼ぶもの | Nocturne での実装 |
+|---|---|
+| `nvkms_call_rm` | `rm_kernel_rmapi_op(nvrm_dev.sp, ops)`。スタックは nvrm の共有のダミー（`NV_ENTER_RM_RUNTIME` はスタックを替えない） |
+| `nvkms_open_gpu`／`close_gpu` | `nvidia_dev_get／put` の移植。`nvrm_dev` の `gpu_id` で、`adapter_ready` かつ登録済みのときだけ成功。reset aware でなければ `rm_set_external_kernel_client_count` |
+| `nvkms_enumerate_gpus` | 登録済みなら nvrm の GPU 1 台（PCI 位置、`is_soc_disp`。NUMA の設定は不要、`os_device_ptr` は NULL） |
+| `nvkms_allow_write_combining` | 真（BAR は `N_CACHE_WRITE_COMBINE` で写せる。Linux の x86-64 と同じ） |
+| `nvkms_alloc`／`free`、`mem*`、`str*`、`*snprintf` | libc。`fail_malloc`／`malloc_verbose` も上流どおり |
+| `nvkms_usleep`、`nvkms_get_usec`、`nvkms_yield`、`nvkms_dump_stack` | `os_delay_us`（1 ms 未満は回って待つ）／`os_delay`（ms、0xFFF で頭打ち）、`nvrm_now_ns`、`os_schedule`、`os_dump_stack` |
+| `nvkms_copyin`／`copyout` | `os_memcpy_from_user`／`to_user`（クライアントの引数の場の番地だけを読み替える） |
+| `nvkms_log` | `nvrm_log`（`nvidia-modeset: ` ＋水準＋GPU の前置き） |
+| `nvkms_sema_*`、NVKMS の大域ロック、電源管理ロック | `os_alloc_semaphore`（1）、`os_alloc_rwlock`（読み手＝各入口、書き手＝サスペンド） |
+| タイマー（`nvkms_alloc_timer`、`_with_ref_ptr`、`nvkms_free_timer`）、`ref_ptr`、KAPI のイベント通知 | NVKMS の作業スレッド 1 本（Linux の `nvkms_kthread_q`）が、期限の来たタイマーと通知を順に、大域ロックの下で実行する |
+| `nvkms_open_from_kapi`／`close_from_kapi`／`ioctl_from_kapi`（`_try_pmlock`） | 上流どおり（close は通知を取り下げ、走っている通知を待ってから解放） |
+| 設定 | 起動設定 `NVKMS_OPTIONS`（`name=value;...`）。名前と既定値は Linux のモジュール引数と同じ（`output_rounding_fix=1`、`disable_hdmi_frl=0`、`disable_vrr_memclk_switch=0`、`hdmi_deepcolor=1`、`max_output_color_depth=10`、`opportunistic_display_sync=1`、`debug_force_color_space=0`、`enable_overlay_layers=1`、`fail_malloc=-1`、`malloc_verbose=0`、`force_frl_rate=0`、`conceal_vrr_caps=0`、`enhanced_pcon_support=0`、`fail_alloc_core_channel=-1`、`debug=0`、`config_file`＝無し） |
+| `config_file`（`nvKmsReadConf`） | `n_document_load`。EDID の上書きファイルも同じ関数で読む（8192 バイトまで） |
+
+作業スレッドを RM の作業キュー（`os.c`）に載せないのは、あちらが RM の作業項目（`rm_execute_work_item`）を最大 8 本で
+並行に走らせるのに対し、NVKMS の項目は互いに追い越してはならず、RM のキューにも入れられないため（上流でも
+RM と NVKMS は別々のキューを持つ）。汎用の `nv_kthread_q` 相当が OS 層にできれば、両方をそれに載せられる。
+
+nvrm の中の入口（`nvkms_os.h`）：`nvrm_nvkms_start()` を `rm_init_adapter` 成功（`adapter_ready`）の後に、
+`nvrm_nvkms_stop()` を終了時の `rm_disable_adapter` の前に呼ぶ。KAPI の関数表は `nvKmsKapiGetFunctionsTable`
+（`versionString` に `NV_VERSION_STRING` を入れて渡す）で得る。`nvrm_nvkms_suspend`／`resume` は nvrm にサスペンドの経路が
+できたとき用。
+
+### 無いもの（Nocturne に該当が無い）
+
+- **procfs**（`nvKmsGetProcFiles`）：Linux の `/proc/driver/nvidia-modeset`。呼ばない。
+- **バックライト**（`nvkms_register_backlight`）：Linux の backlight クラス。NULL（＝装置無し）を返す。
+  上流でも `CONFIG_BACKLIGHT_CLASS_DEVICE` の無いカーネルでは同じ。デスクトップの RTX 4070 には内蔵パネルも無い。
+- **Tegra の syncpoint**（`nvkms_syncpt_op`、`nvkms_kernel_supports_syncpts`）、**Android の extcon**：偽／何もしない。
+- **ユーザー空間のクライアント**（`/dev/nvidia-modeset`、`nvkms_get_per_open_data`、`nvkms_fd_is_nvidia_chardev`）：
+  nvrm に NVKMS 用のクライアントの通り道がまだ無いので、NULL／偽を返す。nvrm の中の利用者は KAPI を使う。
+
+未確認：NVKMS は実機でもホスト試験でも動かしていない（ビルドと未定義シンボルの照合だけ）。
+
+## 画面（nvidia-drm に当たるもの）
+
+`display.c` が NVKMS の KAPI の唯一のクライアントになり、起動時に GOP が点けていたモニターを GPU 側で設定し直して、
+カーネルの画面（WM が描く面）を GOP の面から VRAM の走査面へ移す。nvidia-drm の DRM の構造（drm_device、crtc、
+plane、connector のオブジェクトや atomic の状態）は真似ず、KMS の論理だけを移した。入口は `display.h` の
+`nvrm_display_start()`／`nvrm_display_stop()` で、`nvrm.c` が `nvrm_nvkms_start()` の成功後と `nvrm_nvkms_stop()` の前に呼ぶ。
+失敗しても RM の提供は続け、画面は渡さない（GOP のまま）。理由は `NVRM display:` の行でログに出る。
+
+### 立ち上げ（`nvrm_display_start`）
+
+1. 起動画面が NVIDIA の BAR に無い（`framebuffer_bar` が無い）か、32 bpp でなければ、NVKMS に触らずにやめる。
+2. `nvKmsKapiGetFunctionsTable` → `allocateDevice`（`nvrm_dev.nv.gpu_id`、MIG 無し、イベントは `kapi_event`）→
+   `grabOwnership` → `declareEventInterest`（DPY_CHANGED と DYNAMIC_DPY_CONNECTED）→ `getDeviceResourcesInfo`。
+   NVKMS がコンソールの面（RM の予約コンソールメモリー）を取り込めたかもログに出す。
+3. 起動ディスプレイ：RM のカーネルクライアントで `NV0073_CTRL_CMD_SYSTEM_GET_BOOT_DISPLAYS` を読む（root → device →
+   `NV04_DISPLAY_COMMON` → 制御 → client を解放）。KAPI のディスプレイのハンドルは dpyId のビットなので、それと照らす。
+4. `getDisplays` → 各ディスプレイの `getConnectorInfo`／`getStaticDisplayInfo`／`getDynamicDisplayInfo`。全部をログに出し
+   （コネクター、head、接続、EDID の製造者・製品・名前、起動時に点いていたか）、起動ディスプレイのうち繋がっている最初のもの
+   （無ければ繋がっている最初のもの）を選ぶ。head はそのディスプレイの `headMask` の最下位ビット。
+5. モード：`getDisplayMode` で列挙し、起動画面と同じ幅・高さで、interlaced／doubleScan・無効なものを除く。モニターの好む
+   モードのリフレッシュ（無ければ 60 Hz）に近い順、同じ近さなら高い方を先にして、先頭から `validateDisplayMode` で確かめる。
+   一つも通らなければ渡さない。
+6. 面：pitch を NVKMS の pitch の整列に揃えた pitch linear の X8R8G8B8 を、`allocateMemory`（vidmem、SCANOUT、
+   noDisplayCaching）で取り、`mapMemory`（KERNEL）→ `createSurface`。
+7. GOP の画面を面へ行ごとに写す（読めなければ黒）。
+8. `applyModeSetConfig`（commit=FALSE で検査 → TRUE で確定）→ `getFlipPendingStatus` で最大 3 秒フリップの完了を待つ →
+   `n_pci_give_screen(view, {幅, 高さ, pitch, XRGB8888, offset})`。
+9. `registerVblankIntrCallback` → 抜き差しを追う作業スレッドを起動する。
+
+BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の一部を写したもの。`os_pci.c` が写像ごとに bus 番地を
+覚えておき、`nvrm_kernel_mapping_phys()`（`os_pci.c` の末尾）が写像の番地から bus 番地を返す。面の先頭と末尾がともに同じ写像の
+中で連続していることを確かめ、`nvrm_bar_view`（写像の型 WC）で共有オブジェクトを作る。RM の写像と同じ範囲を WC で写すので、
+同じページに違う型の写像を作らない（C42）。
+
+垂直同期：NVKMS が head の vblank ごとに（nvkms の lock の下で）呼ぶコールバックで、渡している間だけ回数を進めて
+`n_pci_screen_vblank(回数, 時刻)` を呼ぶ。重い処理はしない。時刻は NVKMS の値（無ければ `nvrm_now_ns`）。
+
+抜き差し：イベントは作業スレッドへ起こすだけ。表示中のディスプレイが抜けたら vblank を外して head を止めるが、カーネルの
+画面は渡したままにする（WM はそのまま面へ描き続ける）。別のディスプレイが繋がったら同じ手順で選び直し、同じ大きさのモードが
+無ければ好むモードで拡大して出す。
+
+### 後始末（`nvrm_display_stop`）
+
+作業スレッドを止める → `n_pci_give_screen(N_SCANOUT_BOOT)`（カーネルは GOP の面へ戻る）→ vblank を外す →
+view を閉じる → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で起動画面を復元する。コンソールの面が無いか
+復元に失敗したときは RM 側の復元に任せる）→ `destroySurface` → `unmapMemory` → `freeMemory` →
+`declareEventInterest(0)` → `freeDevice`。その後 `nvrm.c` が `nvrm_nvkms_stop()` を呼ぶ。
+
+上流の nvidia-drm は fbdev を使うとき `framebufferConsoleDisabled` を呼んで起動コンソールを捨てる。nvrm は終了時に起動画面へ
+戻すので呼ばない。
+
+試験：`python tests/nvrm_display_hosttest.py`（偽の KAPI・RM・ハンドルで、立ち上げと後始末の順序、モードの選択、失敗時に
+画面を渡さないこと、抜き差しを確かめる。製品の `display.c` を対象の設定でも構文検査する）。
+
+### nvidia-drm の全 43 ファイルとの対応
+
+状態：**済**＝同じ役目を実装した、**一部**＝画面を移すのに要る分だけ、**次**＝下の「次の段階」、**無し**＝Nocturne に該当が無い。
+
+| 上流のファイル | 役目 | Nocturne での置き場 | 状態 |
+|---|---|---|---|
+| `nvidia-drm-linux.c` | モジュールの入口と出口 | `nvrm.c` の bring_up／tear_down | 済 |
+| `nvidia-drm.c／.h` | KAPI の関数表を得て装置を探す | `display.c` の `nvrm_display_start`（`nvKmsKapiGetFunctionsTable`） | 済 |
+| `nvidia-drm-drv.c／.h` | 装置の確保、所有、イベント、DRM の登録と ioctl | 確保・所有・イベント・解放は `display.c`。DRM の装置ノードと ioctl は無し（gem／prime／fence の ioctl は次） | 一部 |
+| `nvidia-drm-priv.h` | 装置ごとの状態 | `display.c` の `scr` | 済 |
+| `nvidia-drm-connector.c／.h` | 接続の検出、モードの列挙と検査、EDID | `choose_display`、`pick_mode`、`edid_text` | 済 |
+| `nvidia-drm-encoder.c／.h` | ディスプレイと head の対応、抜き差しのイベント | `choose_display`、`kapi_event`、`rescan` | 済 |
+| `nvidia-drm-crtc.c／.h` | head と層の要求、面、vblank、カーソル、CRC、色 | `head_request`（PRIMARY 層だけ）、`surface_create`、`vblank_on／off`。カーソル・オーバーレイ・CRC は無し | 一部 |
+| `nvidia-drm-modeset.c／.h` | 設定の確定、フリップ、表示のセマフォ | `apply`、`flip_completed`。セマフォは次 | 一部 |
+| `nvidia-drm-fb.c／.h` | gem から走査面を作る | `surface_create`（固定の一面） | 一部 |
+| `nvidia-drm-format.c／.h` | DRM の画素形式と NVKMS の形式の変換 | X8R8G8B8 だけ（`N_SCANOUT_XRGB8888`） | 一部 |
+| `nvidia-drm-utils.c／.h` | コネクター情報、モードの変換 | `mode_text`。KAPI のモードをそのまま使うので変換は要らない | 済 |
+| `nvidia-drm-color-pipeline.c／.h` | DRM の色処理の段 | 無し（csc は IDENTITY） | 次 |
+| `nvidia-drm-helper.c／.h` | DRM の atomic の補助 | 無し（DRM の構造を持たない） | 無し |
+| `nvidia-drm-gem.c／.h` | GEM の物体 | 無し | 次 |
+| `nvidia-drm-gem-nvkms-memory.c／.h` | NVKMS の memory を GEM にする | 無し | 次 |
+| `nvidia-drm-gem-user-memory.c／.h` | ユーザーのページを GEM にする | 無し | 次 |
+| `nvidia-drm-gem-dma-buf.c／.h` | dma-buf の取り込み | 無し | 次 |
+| `nvidia-drm-fence.c／.h` | 描画完了のフェンス、セマフォ面 | 無し | 次 |
+| `nvidia-dma-resv-helper.h` | dma-buf の予約オブジェクトの補助 | 無し | 次 |
+| `nv_drm_common_ioctl.h` | nvidia-drm の ioctl の形 | 無し（Nocturne では nvrm の要求として決める） | 次 |
+| `nvidia-drm-os-interface.c／.h` | 確保、作業スレッド、タイマー、ユーザーのページ、sync_file | libc の確保と `threads.h`（`display_thread`）。ユーザーのページと sync_file は次 | 一部 |
+| `nvidia-drm-conftest.h` | Linux カーネルの機能の判定 | 無し | 無し |
+| `nv-kthread-q.c` | 作業キュー | NVKMS 側は `nvkms_os.c` の作業スレッド、画面側は `display_thread` | 済 |
+| `nv-pci-table.c／.h` | 対応する PCI ID の表 | init／`nvrm.c` の共通の PCI 選別条件 | 済 |
+| `nv_common_utils.h` | 共通のマクロ | 無し（標準の C で足りる） | 無し |
+
+### 次の段階（Mesa が走査面へ直接描く）
+
+今はカーネルの WM が CPU で面へ描く。NVK が描いた絵をそのまま出すには、次が要る。
+
+- **gem に当たるもの**：NVK のクライアントが RM で確保した vidmem（client と hMemory）を、nvrm の要求サーバーの新しい要求で
+  受け、KAPI の `importMemory`／`dupMemory` で NVKMS の memory にして `createSurface` する。クライアントの切断で
+  `destroySurface`／`freeMemory` する寿命の管理と、`isVidmem`／`isContiguous` による走査面にできるかの確認。
+- **prime／dma-buf に当たるもの**：プロセスの間の受け渡しは Nocturne の共有オブジェクトのハンドルで行い、`exportMemory` で
+  RM のハンドルへ戻す道。ユーザーのページを面にするなら `getMemoryPages`／`freeMemoryPages`。
+- **fence に当たるもの**：描画の完了を待ってからフリップする。KAPI の `importSemaphoreSurface`／
+  `registerSemaphoreSurfaceCallback`（または表示のセマフォ `tryInitDisplaySemaphore`／`signalDisplaySemaphore`／
+  `cancelDisplaySemaphore`）を使い、フリップの完了（FLIP_OCCURRED、vblank）をクライアントが待てる Nocturne の待ち合わせの
+  ハンドルとして返す。
+- **画面の持ち主**：Mesa の面を出す間、カーネルの画面を何にするか（WM の面をオーバーレイ層にする、または `n_pci_give_screen`
+  の面を差し替える）。カーネル側の ABI の追加が要る（担当はカーネル）。
+- **形式と色**：XRGB8888 以外（ARGB8888、10 ビット、YUV）の対応表と、色処理の段。
+
+## UVM（nvidia-uvm）
+
+CUDA の統合メモリー（Unified Virtual Memory）を担う NVIDIA の UVM ドライバー（`kernel-open/nvidia-uvm`）を、Linux の別モジュール
+nvidia-uvm.ko ではなく nvrm の中に入れる。UVM は RM の `nvUvmInterface*`（nvidia.ko 側の `kernel-open/nvidia/nv_uvm_interface.c`）を
+通して GPU を使うので、GPU を持つ nvrm の中に置き、RM との間に通信は挟まない。クライアントは RM と同じ接続で `NVRM_UVM`
+（`include/nvrm_protocol.h`）を送る。
+
+取り込み（上流 615.78.08 と同じ内容・同じ相対位置、変更なし）：`kernel-open/nvidia-uvm` の 223 ファイル（`hwref` を含む、
+約 15 万 4 千行）、`kernel-open/nvidia/nv_uvm_interface.c`、`kernel-open/common/inc` の `nv_uvm_interface.h`・`nv-kthread-q.h`・
+`rm-gpu-ops.h`。すべて MIT（`COPYING`）で、`NOTICES` に加える物は無い。`uvm_common.c` は GPLv2 以降なので取り込まず、
+本文も参照しない（`uvm_common.h` の宣言する関数は `uvm_os.c` が自前で持つ）。`uvm_linux.c`（Linux の memcg と scatterlist）と
+`nv-kthread-q.c`（Linux のカーネルスレッド）も入れない。
+
+### ビルド（`uvm.mk`、`nvrm.mk` から `include`）
+
+```
+python scripts/build.py uvm-objs        # UVM の中核と OS 層（build/uvm/）
+python scripts/build.py uvm-undefined   # RM＋NVKMS＋UVM＋各 OS 層の未定義シンボル（build/uvm/undefined.txt）
+```
+
+- ソース一覧は上流の `nvidia-uvm-sources.Kbuild` をそのまま読む。定義は上流の `nvidia-uvm.Kbuild` から Linux の物
+  （`-D__KERNEL__`、conftest）を除いた物。`NVRM_NOCTURNE` が `uvm_linux.h` に `uvm_os.h` を選ばせる。
+- 全オブジェクトを `nvidia-uvm.o` に部分リンクし、入口（`nvrm_uvm_module_init`／`exit`）以外の大域シンボルを局所化する
+  （UVM も `nvstatus.c` などを自前で持つ）。
+- OS 層は二つの側に分かれる。`uvm_os.c`・`uvm_mm.c`・`uvm_serve.c` は UVM と同じ `uvm_os.h` で、`uvm_rm.c` と
+  `nv_uvm_interface.c` は RM の OS 層（`nvrm_os.h`、`uvm_rm.h`）で作る。両方が見るのは `uvm_nvrm.h` と `uvm_shared.h` だけ。
+- トップの Makefile の nvrm のリンクに `$(UVM_LINK_OBJ)` を加えた。
+
+### OS 層の対応
+
+| UVM が使うもの | Nocturne での実装 |
+|---|---|
+| `printk`、`dump_stack`、モジュール引数 | `nvrm_log`。引数は起動設定 `UVM_OPTIONS`（`name=value;...`、名前と既定値は Linux と同じ）（`uvm_os.c`） |
+| スレッド、`current`、`kthread_*`、`nv_kthread_q_*`、遅延作業 | C11 のスレッドと `wait_on_address`。要求を処理する間は、そのスレッドがクライアントのタスク（pid＝アプリ ID、mm＝接続のアドレス空間）になる |
+| ロック、待ち行列、ビット待ち、rb 木、radix 木、ビットマップ | C11 の mutex と条件、`wait_on_address`、自前の実装（`uvm_os.c`） |
+| `kmalloc`／`vmalloc`／`kmem_cache` | libc の確保（`vmalloc` は範囲で引ける登録つき） |
+| `alloc_pages`、`dma_alloc_coherent`、`dma_map_page` | RM の DMA メモリー（`nv_alloc_pages`、連続、write-back）。一回の確保が `struct page` の配列一つ（`uvm_mm.c`） |
+| `vmap` | 一つの群の連続したページはそのままの番地、それ以外は `n_shared_compose` で一つの写像にする |
+| `pci_dev`、BAR の写像（`nv_ioremap_cache`） | RM の PCI 情報（`nvrm_uvm_pci_info`）、`nvrm_bar_view` |
+| `vm_area_struct`、`vm_insert_page`、`remap_pfn_range`、`unmap_mapping_range` | ページャー（下記）の `n_pager_supply`／`n_pager_revoke` |
+| `get_user_pages_remote`、`copy_from_user`／`copy_to_user` | クライアントの引数の場（arena）の中だけ。`nvrm_user_view`／`nvrm_user_translate` |
+| `/dev/nvidia-uvm`、`/dev/nvidia-uvm-tools`（`cdev_add`、`fget`） | 接続ごとの番号つきのファイル（`uvm_serve.c`）。minor 0 が nvidia-uvm、1 が tools |
+
+### UVM のメモリーをクライアントが写す（ページャー）
+
+Linux では UVM のファイルを `mmap` すると、CPU のページフォールトが UVM のフォールト処理を呼ぶ。Nocturne では
+ページャーつきの共有メモリー（`docs/nocturne-native-abi.md` §7、`n_pager_*`）でこれを行う。
+
+1. クライアント（libnvrm の `nvrm_uvm_map`）が `NVRM_UVM_MAP` を送ると、nvrm は `n_pager_create` でメモリーを作り、
+   そのハンドルを返事に付ける。ハンドルは UVM が持ち続け、サーバーは送るだけで閉じない。
+2. クライアントがそれを読み書きで写し、`NVRM_UVM_MAP_COMMIT` で番地を知らせる。UVM は写像のファイル位置が番地であることを
+   求めるので、その番地で `vm_area_struct` を作り、UVM の `mmap` を呼ぶ。
+3. クライアントが写像のページに初めて触ると、そのスレッドは止まり、接続のフォールトスレッド（接続ごとに 1 本、最初の
+   写像のときに起こす）が `n_pager_take` で受け取って UVM のフォールト処理を走らせる。UVM の `vm_insert_page` が
+   `n_pager_supply` でページを結び、触れたスレッドが進む。処理がページを結ばなければ、その触りは `n_pager_fail` で失敗する。
+4. UVM がページを取り上げる（`unmap_mapping_range`）と `n_pager_revoke` で全ての写しから外れる。どのページが結ばれているかは
+   写像ごとに覚えていて（2 MiB ごとの表）、`vm_insert_page` が既に在るページに `-EBUSY` を返す、という UVM の前提を守る。
+5. `nvrm_uvm_unmap`（`NVRM_UVM_UNMAP`）か、クライアントが写像を手放して誰も持たなくなったとき（ページャーの CLOSED）、
+   UVM の `close` の後に写像は終わり、全ページが外れる。接続の終わりでは、プロセスの終了と同じく先にアドレス空間が
+   （UVM には mm が無いように見えて）終わり、その後でファイルが閉じる。これは RM のファイルを閉じる前に行う。
+
+### nvrm の中の入口（`uvm_nvrm.h`）
+
+- `nvrm_uvm_start()`：RM が GPU を起こした（`adapter_ready`）後、クライアントの提供を始める前に呼ぶ（`nv_uvm_init`、
+  UVM のモジュール初期化）。失敗しても RM と画面の提供は続け、`NVRM_UVM` は `NV_ERR_NOT_SUPPORTED` を返す。
+- `nvrm_uvm_stop()`：要求サーバーが終わった後、`rm_disable_adapter` の前に呼ぶ。
+- `nvrm_uvm_interrupt()`：割り込みスレッドが `rm_gpu_handle_mmu_faults` の後、`rm_isr` の前に呼ぶ。`nv_schedule_uvm_isr` からも呼ぶ。
+- 電源（`nv_uvm_suspend`／`resume`）と P2P（`nv_uvm_drain_P2P`／`resume_P2P`）は RM の経路が直接呼ぶ。
+
+### 無いもの・制限
+
+- **HMM と ATS**（クライアントの普通のメモリーを GPU が直接使う）：無い。`UVM_CAN_USE_MMU_NOTIFIERS` は 0。
+- **写像の一部だけの munmap、mremap、fork**：無い。写像は丸ごと終わる。
+- **procfs**（`/proc/driver/nvidia-uvm`）：無い。
+- `NVRM_UVM_POLL` は 1 要求で最大 1 秒待つ（接続のスレッドを長く止めない）。libnvrm が繰り返して長い待ちにする。
+- クライアントのメモリーを固定する（tools のバッファー）のは引数の場の中だけ。その外は `-EFAULT`。
+- 他の装置（P2P）のメモリーを CPU に写すこと（`vm_insert_page` に nvrm の物でないページ）は `-EINVAL` で失敗する。
+- 試験用ファイル（`UVM_TEST_*`）の写像も、ファイル位置＝番地の決まりに従う。
+- UVM の引数の `rmCtrlFd` は、上流でも RM のファイルの照合に使われていない（Bug 1624521 の TODO）。RM のオブジェクトは
+  `hClient` などのハンドルで引かれるので、ある接続の UVM が別の接続の RM クライアントのハンドルを名指しできるかは RM の
+  検査次第で、nvrm では未確認。
+- フォールトスレッドは接続ごとに 1 本で、アプリのスレッド上限（128）に数えられる。
+
+未確認：CUDA のクライアントが Nocturne に無く、実機の GPU でも UVM を動かしていない。確かめたのはビルド、未定義シンボルの照合、
+入口を残した試験リンク、ページャーの GPU 無しの試験（`pagertest`）、要求サーバーの偽 UVM 層での試験（`nvrm_servetest`、
+`nvrm_transport_hosttest`）だけ。
 
 ## 既知のリスク・不確かなこと
 

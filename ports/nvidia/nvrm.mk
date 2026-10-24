@@ -117,11 +117,18 @@ $(NVRM_OUT)/rm/g_nvid_string.o: $(NVRM_OUT)/rm/g_nvid_string.c
 # The os_*/nv_* callbacks RM expects (see ports/nvidia/README.md). They include both RM's
 # headers (nv.h, os-interface.h, ...) and Nocturne's (nocturne.h, <threads.h>), so they take
 # the RM flags plus the libc include path.
-NVRM_OS_SRC := ports/nvidia/os.c ports/nvidia/os_pci.c ports/nvidia/os_stubs.c ports/nvidia/rm_api.c \
-    ports/nvidia/nvlink_os.c ports/nvidia/spdm_stubs.c ports/nvidia/nvrm.c ports/nvidia/nvrm_serve.c
+NVRM_OS_SRC := ports/nvidia/os.c ports/nvidia/os_pci.c ports/nvidia/os_stubs.c ports/nvidia/os_caps.c \
+    ports/nvidia/os_acpi.c ports/nvidia/os_ioctl.c ports/nvidia/rm_api.c ports/nvidia/nvlink_os.c \
+    ports/nvidia/spdm_crypto.c ports/nvidia/nvrm.c ports/nvidia/nvrm_serve.c ports/nvidia/display.c
 NVRM_OS_OBJ := $(patsubst ports/nvidia/%.c,$(NVRM_OUT)/os/%.o,$(NVRM_OS_SRC))
 NVRM_OS_CFLAGS := $(filter-out -Wno-undef,$(NVRM_CFLAGS)) -Iports/nvidia -Iports/nvidia/include -Iuser/include -Icommon -DNVRM_NOCTURNE \
     -Wno-incompatible-pointer-types-discards-qualifiers
+# libspdm's cryptography backend: libspdm's headers and configuration, and BearSSL's.
+$(NVRM_OUT)/os/spdm_crypto.o: NVRM_OS_CFLAGS += -Ithird_party/bearssl/inc \
+    $(addprefix -I$(NVRM_DIR)/,$(NVRM_SPDM_INCLUDES)) $(addprefix -D,$(NVRM_SPDM_DEFINES))
+# nvrm's screen is NVKMS's KAPI client: KAPI's interface headers and those they include.
+$(NVRM_OUT)/os/display.o: NVRM_OS_CFLAGS += $(addprefix -I$(NVRM_VENDOR)/src/,nvidia-modeset/kapi/interface \
+    nvidia-modeset/interface common/unix/common/inc)
 $(NVRM_OUT)/os/%.o: ports/nvidia/%.c ports/nvidia/nvrm_os.h ports/nvidia/nvrm_serve.h
 	@mkdir -p $(dir $@)
 	@echo "  NVOS $<"
@@ -162,3 +169,9 @@ nvrm-undefined: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ)
 	echo "undefined symbols: $$(wc -l < $(NVRM_OUT)/undefined.txt)  ($(NVRM_OUT)/undefined.txt)"
 
 -include $(NVRM_OBJ:.o=.d) $(NVRM_OS_OBJ:.o=.d) $(NVRM_CLIENT_OBJ:.o=.d)
+
+# NVKMS (nvidia-modeset), linked into nvrm.
+include ports/nvidia/nvkms.mk
+
+# UVM (nvidia-uvm), linked into nvrm.
+include ports/nvidia/uvm.mk

@@ -104,6 +104,13 @@ NV_STATUS NV_API_CALL rm_ioctl(nvidia_stack_t *s, nv_state_t *nv, nv_file_privat
     }
     return return_status;
 }
+/* nv.c's part of a request (os_ioctl.c, its own test): every escape here is RM's. */
+bool nvrm_nv_ioctl(struct nvrm_gpu_attachments *attached, uint32_t escape, void *args, uint32_t size,
+                   NV_STATUS *status) {
+    (void)attached; (void)escape; (void)args; (void)size; (void)status;
+    return false;
+}
+void nvrm_nv_file_close(struct nvrm_gpu_attachments *attached) { CHECK(attached && !attached->count); }
 void NV_API_CALL rm_cleanup_file_private(nvidia_stack_t *s, nv_state_t *nv, nv_file_private_t *f) {
     (void)s; (void)nv;
     CHECK(os_get_current_process() == ((struct nvrm_file *)f)->principal);

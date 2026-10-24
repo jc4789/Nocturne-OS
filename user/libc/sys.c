@@ -366,6 +366,20 @@ n_handle n_pci_bar(n_handle pci, uint32_t bar) { return (n_handle)NC5(SYS_PCI_BA
 n_result n_pci_interrupts(n_handle pci, uint32_t count) { return NC5(SYS_PCI_INTERRUPTS, pci, count, 0, 0, 0); }
 n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms) { return NC5(SYS_PCI_INTERRUPT_TAKE, pci, timeout_ms, 0, 0, 0); }
 n_result n_pci_hold_screen(n_handle pci, bool hold) { return NC5(SYS_PCI_HOLD_SCREEN, pci, hold ? 1 : 0, 0, 0, 0); }
+n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc) {
+    return NC5(SYS_PCI_GIVE_SCREEN, pci, surface, desc, 0, 0);
+}
+n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns) {
+    return NC5(SYS_PCI_SCREEN_VBLANK, pci, count, timestamp_ns, 0, 0);
+}
+n_result n_pci_acpi_eval(n_handle pci, uint32_t node, const char *name, const struct n_acpi_value *args,
+                         uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size) {
+    struct n_acpi_eval e = {node, nargs, name, args, data, data_size};
+    return NC5(SYS_PCI_ACPI_EVAL, pci, &e, out, out_size, 0);
+}
+n_result n_pci_acpi_notify_take(n_handle pci, int64_t timeout_ms) {
+    return NC5(SYS_PCI_ACPI_NOTIFY_TAKE, pci, timeout_ms, 0, 0, 0);
+}
 n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags) { return (n_handle)NC5(SYS_DMA_CREATE, pci, bytes, flags, 0, 0); }
 n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size_t count) {
     return NC5(SYS_DMA_ADDRESSES, shared, first_page, out, count, 0);
@@ -379,6 +393,21 @@ n_handle n_shared_view_access(n_handle shared, size_t offset, size_t bytes, uint
 n_result n_shared_revoke(n_handle view) { return NC5(SYS_SHARED_REVOKE, view, 0, 0, 0, 0); }
 n_handle n_shared_compose(const struct n_shared_range *ranges, size_t count, uint32_t access) {
     return NC5(SYS_SHARED_COMPOSE, ranges, count, access, 0, 0);
+}
+n_handle n_pager_create(size_t bytes, n_handle *memory) {
+    return (n_handle)NC5(SYS_PAGER_CREATE, bytes, memory, 0, 0, 0);
+}
+n_result n_pager_take(n_handle pager, struct n_pager_fault *out, size_t max, int64_t timeout_ms) {
+    return NC5(SYS_PAGER_TAKE, pager, out, max, timeout_ms, 0);
+}
+n_result n_pager_supply(n_handle pager, const struct n_pager_supply *runs, size_t count) {
+    return NC5(SYS_PAGER_SUPPLY, pager, runs, count, 0, 0);
+}
+n_result n_pager_revoke(n_handle pager, uint64_t offset, uint64_t bytes, uint32_t access) {
+    return NC5(SYS_PAGER_REVOKE, pager, offset, bytes, access, 0);
+}
+n_result n_pager_fail(n_handle pager, uint64_t offset, uint64_t bytes) {
+    return NC5(SYS_PAGER_FAIL, pager, offset, bytes, 0, 0);
 }
 n_handle n_audio_open(void) { return (n_handle)NC5(SYS_AUDIO_OPEN, 0, 0, 0, 0, 0); }
 n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags) {

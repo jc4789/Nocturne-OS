@@ -87,3 +87,27 @@ void acpi_freeze(bool on);
 void acpi_links_save(void);
 void acpi_links_forget(void);
 bool acpi_reset(void);
+
+/* ---- a PCI function's part of the namespace (n_pci_acpi_eval, dev/pciuser.c) ----
+   A device node is uACPI's, opaque here. acpi_pci_node: the function's node, found from the host
+   bridge of its root bus (_BBN) down its bridges by _ADR; acpi_pci_host: that host bridge's. NULL
+   when the firmware describes none, or AML is off. acpi_node_child: the node's device child
+   number index in namespace order; NULL past the last. */
+struct pci_device;
+void *acpi_pci_node(const struct pci_device *d);
+void *acpi_pci_host(const struct pci_device *d);
+void *acpi_node_child(void *node, uint32_t index);
+/* Evaluates the object name (one name segment, directly under node: no search upwards) with
+   the arguments args[0..nargs) whose bytes lie in data, and writes the result to out as
+   struct n_acpi_value records (the first one is the result) followed by the strings' and
+   buffers' bytes. Returns the bytes written, or -N_ERR_NOT_FOUND (no such object), -N_ERR_INVALID
+   (a malformed argument or name), -N_ERR_TOO_LARGE (out_size is too small), -N_ERR_IO (the AML
+   failed). Threads that may block only. */
+struct n_acpi_value;
+int64_t acpi_node_eval(void *node, const char *name, const struct n_acpi_value *args, uint32_t nargs,
+                       const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size);
+/* Notify(node, value) calls fn(context, value) on the acpi thread until acpi_node_unwatch, which
+   returns once fn runs no more (never from fn itself). */
+struct acpi_watch;
+struct acpi_watch *acpi_node_watch(void *node, void (*fn)(void *context, uint64_t value), void *context);
+void acpi_node_unwatch(struct acpi_watch *w);

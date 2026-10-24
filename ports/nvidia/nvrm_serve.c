@@ -11,6 +11,7 @@
 #include "nocturne.h"
 #include "nvrm_protocol.h"
 #include "nvrm_serve.h"
+#include "uvm_nvrm.h"
 #include "nvtypes.h"
 #include "nvstatus.h"
 #include "nvos.h"
@@ -31,6 +32,7 @@ struct client {
     size_t arena_bytes;
     uint32_t principal;      /* authenticated HELLO sender; every message must match */
     void *file;               /* RM's state for this client */
+    struct nvrm_uvm_client *uvm;  /* its UVM state (NULL until its first NVRM_UVM) */
 };
 
 /* The request a thread is serving: os_memcpy_from_user / os_memcpy_to_user run on it. */
@@ -49,8 +51,32 @@ void *nvrm_user_translate(const void *user, size_t n) {
     return current->arena + off;
 }
 
+n_handle nvrm_user_view(const void *user, size_t n, size_t *offset) {
+    if (!nvrm_user_translate(user, n ? n : 1)) return -N_ERR_BAD_ADDRESS;
+    uint64_t off = (uint64_t)(uintptr_t)user - current->arena_address;
+    /* The arena is whole pages, so the page-rounded run stays inside it. */
+    uint64_t first = off & ~(uint64_t)(N_PAGE_SIZE - 1);
+    uint64_t end = (off + n + N_PAGE_SIZE - 1) & ~(uint64_t)(N_PAGE_SIZE - 1);
+    *offset = (size_t)(off - first);
+    return n_shared_view_access(current->arena_handle, (size_t)first, (size_t)(end - first), N_CACHE_DEFAULT,
+                                N_MEMORY_READ_WRITE);
+}
+
+bool nvrm_user_arena(uint64_t *address, uint64_t *bytes) {
+    if (!current || !current->arena) return false;
+    *address = current->arena_address;
+    *bytes = current->arena_bytes;
+    return true;
+}
+
 /* Frees everything the client still holds in RM, then the connection. */
 static void client_end(struct client *c) {
+    if (c->uvm) {
+        /* UVM's state refers to the client's RM state and arena: it goes first. */
+        current = c;
+        nvrm_uvm_client_end(c->uvm);
+        current = NULL;
+    }
     if (c->file) nvrm_rm_file_close(c->file);
     if (c->arena) n_memory_release(c->arena, c->arena_bytes);
     if (c->arena_handle >= 0) n_handle_close(c->arena_handle);
@@ -143,6 +169,16 @@ static bool request(struct client *c) {
     }
     packet->access = packet->rm_status = 0;
     if (attached >= 0) n_handle_close(attached);
+    if (c->file && packet->escape == NVRM_UVM) {
+        current = c;
+        n_handle uvm_attach = -1;
+        packet->status = (int32_t)nvrm_uvm_request(&c->uvm, c->principal, packet + 1, packet->size, &uvm_attach);
+        current = NULL;
+        /* The attached memory stays UVM's: it is sent, not closed. */
+        bool sent = reply(c, packet, packet->status < 0 ? -1 : uvm_attach);
+        free(packet);
+        return sent;
+    }
     if (!c->file || packet->escape >= NVRM_HELLO) {
         packet->status = -N_ERR_INVALID;
         goto send;

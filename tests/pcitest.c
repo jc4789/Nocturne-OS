@@ -216,6 +216,51 @@ static int find_vga(const struct n_pciinfo *list, int n) {
     return -1;
 }
 
+/* The claim's part of the ACPI namespace (n_pci_acpi_eval). The VGA sits on QEMU's root bus, so
+   its upstream node is the host bridge (PNP0A08 on q35, whose _PRT is a package of packages);
+   whether the VGA has a node of its own depends on QEMU's tables, and when it has one its _ADR
+   is its device and function. */
+static void acpi_cases(n_handle vga, const struct n_pciinfo *at) {
+    static uint64_t out[8192]; /* a root bus's _PRT has 128 routes of 5 values */
+    struct n_acpi_value *v = (struct n_acpi_value *)out;
+    n_result r = n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_HID", NULL, 0, NULL, 0, out, sizeof out);
+    bool integer_hid = r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER;
+    bool string_hid = r >= (n_result)sizeof *v && v[0].type == N_ACPI_STRING && v[0].length == 7 &&
+                      v[0].value + 7 <= (uint64_t)r && !memcmp((char *)out + v[0].value, "PNP0A0", 6);
+    CHECK((integer_hid && (v[0].value == 0x080AD041 || v[0].value == 0x030AD041)) || string_hid,
+          "the host bridge's _HID: %s", r < 0 ? n_result_text(r) : "not a PCI host bridge");
+    r = n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof out);
+    size_t values = r > 0 ? (size_t)r / sizeof *v : 0;
+    bool routes = values > 1 && v[0].type == N_ACPI_PACKAGE && v[0].length > 0 && v[0].value == 1 &&
+                  v[1].type == N_ACPI_PACKAGE && v[1].length == 4;
+    CHECK(routes, "the host bridge's _PRT is a package of 4-element packages: %s",
+          r < 0 ? n_result_text(r) : "another layout");
+    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof *v) == -N_ERR_TOO_LARGE,
+          "a result larger than the room is refused");
+    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "NONE", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_NOT_FOUND,
+          "a missing name");
+    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID &&
+              n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_SB_.PCI0", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+          "paths outside the claim's nodes are refused");
+    struct n_acpi_value too_many[8] = {{0}};
+    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", too_many, 8, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+          "more than 7 arguments");
+    struct n_acpi_value outside = {N_ACPI_BUFFER, 16, 0};
+    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", &outside, 1, "short", 5, out, sizeof out) == -N_ERR_INVALID,
+          "an argument past its data");
+    r = n_pci_acpi_eval(vga, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    if (r == -N_ERR_NOT_FOUND) {
+        CHECK(n_pci_acpi_eval(vga, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+              "no children without a node of its own");
+        CHECK(n_pci_acpi_notify_take(vga, 0) == -N_ERR_NOT_FOUND, "no notifications without a node");
+    } else {
+        CHECK(r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER &&
+                  v[0].value == ((uint64_t)at->dev << 16 | at->func),
+              "the VGA's own _ADR: %s", r < 0 ? n_result_text(r) : "another value");
+        CHECK(n_pci_acpi_notify_take(vga, 0) == -N_ERR_TIMEOUT, "no notification waiting");
+    }
+}
+
 static void screen_cases(const struct n_pciinfo *list, int n) {
     int at = find_vga(list, n);
     if (at < 0) {
@@ -276,6 +321,196 @@ static void screen_cases(const struct n_pciinfo *list, int n) {
     CHECK(n_pci_hold_screen(vga, false) == 0 && n_pci_hold_screen(vga, false) == 0, "and are released one by one");
     CHECK(n_pci_hold_screen(vga, false) == -N_ERR_INVALID, "a release without a hold");
     CHECK(n_pci_hold_screen(vga, true) == 0, "a hold the claim's end gives back");
+    acpi_cases(vga, &list[at]);
+    n_handle_close(vga);
+}
+
+/* The VGA as a display driver uses it to give the system its own scanout (n_pci_give_screen):
+   BAR 0 is its memory, the boot screen at its start, and BAR 2 has the Bochs display registers
+   (index i at 0x500 + 2i), whose Y offset is the row of that memory the display starts at. The
+   driver draws a second buffer past the boot screen, gives it to the system and shows it, then
+   DMA memory, then the boot screen again; last a surface its claim's end gives back. A mark of
+   pixels the desktop never draws tells where the system drew. linger_s: how long the second
+   buffer stays shown, its vertical blanks given at 60 Hz (pcitest screen=<s>, to look at it). */
+#define DISPI(i) (0x500 + 2 * (i))
+#define DISPI_VIRT_HEIGHT 7
+#define DISPI_Y_OFFSET 9
+#define MARK 0x00A1B2C3u
+static void mark(volatile uint32_t *p) {
+    for (int i = 0; i < 64; i++) p[i] = MARK;
+    __asm__ volatile("sfence" ::: "memory");
+}
+static int marks(const volatile uint32_t *p) {
+    int k = 0;
+    for (int i = 0; i < 64; i++) k += p[i] == MARK;
+    return k;
+}
+static n_result vblanks(n_handle vga, uint64_t *count, unsigned frames) {
+    n_result r = 0;
+    for (unsigned i = 0; i < frames && !r; i++) {
+        r = n_pci_screen_vblank(vga, ++*count, uptime_ms() * 1000000ull);
+        n_sleep_ms(16);
+    }
+    return r;
+}
+/* The display starts at row (when the Bochs registers are there). */
+static void show_row(volatile uint16_t *dispi, uint32_t row) {
+    if (dispi) dispi[DISPI(DISPI_Y_OFFSET) / 2] = (uint16_t)row;
+}
+
+static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n, unsigned linger_s) {
+    int at = find_vga(list, n);
+    if (at < 0) {
+        printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
+        failed++;
+        return;
+    }
+    n_handle vga = n_pci_claim(list[at].bus, list[at].dev, list[at].func);
+    CHECK(vga >= 0, "claim the VGA to give the screen: %s", n_result_text(vga));
+    if (vga < 0) return;
+    struct n_pci_function info;
+    if (n_pci_info(vga, &info) != 0 || info.framebuffer_bar != 0 || info.framebuffer_bpp != 32) {
+        CHECK(0, "the boot screen is a 32 bpp one in the VGA's BAR 0");
+        n_handle_close(vga);
+        return;
+    }
+    uint32_t pitch = info.framebuffer_pitch;
+    uint64_t size = info.bar[0].size, boot = info.framebuffer_address - info.bar[0].address;
+    uint64_t frame = (uint64_t)pitch * info.framebuffer_height, second = boot + frame;
+    struct n_scanout d = {info.framebuffer_width, info.framebuffer_height, pitch, N_SCANOUT_XRGB8888, boot}, bad;
+    n_handle bar = n_pci_bar(vga, 0);
+    n_handle surface = bar >= 0 ? n_shared_view(bar, 0, size, N_CACHE_WRITE_COMBINE) : bar;
+    void *whole = NULL;
+    if (surface >= 0) n_shared_map(surface, size, N_MEMORY_READ_WRITE, &whole);
+    CHECK(whole != NULL, "the driver maps all of the VGA's memory write-combined");
+    if (!whole) {
+        if (surface >= 0) n_handle_close(surface);
+        if (bar >= 0) n_handle_close(bar);
+        n_handle_close(vga);
+        return;
+    }
+    volatile uint32_t *gop = (volatile uint32_t *)((uint8_t *)whole + boot + 100ull * pitch) + 100;
+    volatile uint32_t *next = (volatile uint32_t *)((uint8_t *)whole + second + 100ull * pitch) + 100;
+    /* The Bochs registers, when their ID answers */
+    n_handle regs_bar = info.bar[2].size >= 4096 ? n_pci_bar(vga, 2) : -1;
+    void *regs_map = NULL;
+    if (regs_bar >= 0) n_shared_map(regs_bar, 4096, N_MEMORY_READ_WRITE, &regs_map);
+    volatile uint16_t *dispi = regs_map;
+    if (dispi && (dispi[DISPI(0) / 2] & 0xFFF0) != 0xB0C0) dispi = NULL;
+    uint32_t boot_row = (uint32_t)(boot / pitch), second_row = (uint32_t)(second / pitch);
+    if (dispi && second + frame <= size) {
+        dispi[DISPI(DISPI_VIRT_HEIGHT) / 2] = (uint16_t)(second_row + info.framebuffer_height);
+        if (dispi[DISPI(DISPI_VIRT_HEIGHT) / 2] < second_row + info.framebuffer_height) dispi = NULL;
+    } else dispi = NULL;
+    printf("pcitest: the second buffer is %s\n", dispi ? "shown through the Bochs registers" : "not shown");
+
+    /* refused */
+    CHECK(n_pci_screen_vblank(vga, 1, 0) == -N_ERR_DENIED, "no vertical blank before a surface is given");
+    CHECK(n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL) == -N_ERR_INVALID, "nothing to give back yet");
+    n_handle edu_bar = edu >= 0 ? n_pci_bar(edu, 0) : -1;
+    if (edu >= 0) {
+        CHECK(n_pci_give_screen(edu, edu_bar, &d) == -N_ERR_DENIED, "edu is no display function");
+        CHECK(n_pci_give_screen(vga, edu_bar, &d) == -N_ERR_DENIED, "another claim's BAR");
+    }
+    bad = d, bad.width++;
+    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "another width");
+    bad = d, bad.height--;
+    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "another height");
+    bad = d, bad.format = 99;
+    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "an unknown format");
+    bad = d, bad.pitch = d.width * 4 - 4;
+    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "a pitch shorter than a row");
+    bad = d, bad.offset = size - frame + 4;
+    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "a scanout past the end of the surface");
+    n_handle readonly = n_shared_view_access(surface, 0, size, N_CACHE_DEFAULT, N_MEMORY_READ);
+    CHECK(n_pci_give_screen(vga, readonly, &d) == -N_ERR_DENIED, "a surface the driver may not write");
+    size_t frame_pages = (size_t)((frame + 4095) & ~4095ull);
+    struct n_scanout at0 = d;
+    at0.offset = 0;
+    n_handle plain = n_shared_create(frame_pages);
+    CHECK(plain >= 0 && n_pci_give_screen(vga, plain, &at0) == -N_ERR_DENIED, "memory that is no device's");
+    n_handle dma = n_dma_create(vga, frame_pages, 0);
+    CHECK(dma >= 0 && n_pci_give_screen(vga, dma, &at0) == -N_ERR_DENIED, "write-back DMA memory");
+
+    /* the boot screen's own memory */
+    mark(gop);
+    n_result r = n_pci_give_screen(vga, surface, &d);
+    CHECK(r == 0, "the boot screen's memory as the driver's surface: %s", n_result_text(r));
+    n_sleep_ms(300);
+    CHECK(marks(gop) == 0, "all of the screen is drawn again: %d marks left", marks(gop));
+    uint64_t count = 0;
+    r = vblanks(vga, &count, 30);
+    CHECK(r == 0, "vertical blanks of the surface shown: %s", n_result_text(r));
+    CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, false) == 0, "the screen held and given back");
+    n_sleep_ms(300); /* the release draws all of the screen again: the marks below come after it */
+
+    /* a second buffer past it, which the display then shows */
+    if (second + frame <= size) {
+        struct n_scanout s2 = d;
+        s2.offset = second;
+        mark(gop);
+        mark(next);
+        r = n_pci_give_screen(vga, surface, &s2);
+        CHECK(r == 0, "a second buffer past the boot screen: %s", n_result_text(r));
+        show_row(dispi, second_row);
+        n_sleep_ms(300);
+        CHECK(marks(next) == 0 && marks(gop) == 64, "drawn into the second buffer only: %d %d marks", marks(next), marks(gop));
+        r = vblanks(vga, &count, 30 + linger_s * 60);
+        CHECK(r == 0, "vertical blanks of the second buffer: %s", n_result_text(r));
+    } else printf("FAIL: no room for a second buffer in %llu bytes\n", (unsigned long long)size), failed++;
+
+    /* DMA memory, which its write-combining view gives the type the system draws it with */
+    n_handle dma_wc = dma >= 0 ? n_shared_view(dma, 0, frame_pages, N_CACHE_WRITE_COMBINE) : dma;
+    mark(gop);
+    r = n_pci_give_screen(vga, dma_wc, &at0);
+    CHECK(r == 0, "DMA memory as the surface: %s", n_result_text(r));
+    n_sleep_ms(300);
+    void *dma_map = NULL;
+    if (dma_wc >= 0) n_shared_map(dma_wc, frame_pages, N_MEMORY_READ, &dma_map);
+    const volatile uint32_t *drawn = dma_map;
+    int lit = 0;
+    for (uint32_t x = 0; drawn && x < d.width; x += 16) lit += drawn[(size_t)(d.height / 2) * (pitch / 4) + x] != 0;
+    CHECK(lit > 0 && marks(gop) == 64, "the desktop is in the DMA memory, not the boot screen: %d %d", lit, marks(gop));
+    if (dma_map) n_memory_release(dma_map, frame_pages);
+    if (dma_wc >= 0) n_handle_close(dma_wc); /* the system keeps what it shows */
+    if (dma >= 0) n_handle_close(dma);
+    r = n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL);
+    CHECK(r == 0, "the boot screen back: %s", n_result_text(r));
+    show_row(dispi, boot_row);
+    n_sleep_ms(300);
+    CHECK(marks(gop) == 0, "the boot screen is drawn again: %d marks left", marks(gop));
+    CHECK(n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL) == -N_ERR_INVALID, "given back once");
+    CHECK(n_pci_screen_vblank(vga, ++count, 0) == -N_ERR_DENIED, "no vertical blanks of the boot screen");
+
+    /* the claim's end gives the screen back */
+    r = n_pci_give_screen(vga, surface, &d);
+    CHECK(r == 0, "a surface the claim's end gives back: %s", n_result_text(r));
+    n_sleep_ms(300);
+    mark(gop);
+    n_memory_release(whole, size);
+    if (regs_map) n_memory_release(regs_map, 4096);
+    if (regs_bar >= 0) n_handle_close(regs_bar);
+    if (plain >= 0) n_handle_close(plain);
+    if (readonly >= 0) n_handle_close(readonly);
+    if (edu_bar >= 0) n_handle_close(edu_bar);
+    n_handle_close(surface);
+    if (bar >= 0) n_handle_close(bar);
+    n_handle_close(vga);
+    vga = n_pci_claim(list[at].bus, list[at].dev, list[at].func);
+    CHECK(vga >= 0, "the VGA claimed again: %s", n_result_text(vga));
+    if (vga < 0) return;
+    bar = n_pci_bar(vga, 0);
+    size_t peek = (size_t)(((boot & 4095) + 101ull * pitch + 4095) & ~4095ull); /* the marked row */
+    n_handle view = bar >= 0 ? n_shared_view(bar, boot & ~4095ull, peek, N_CACHE_WRITE_COMBINE) : bar;
+    void *again = NULL;
+    if (view >= 0) n_shared_map(view, peek, N_MEMORY_READ, &again);
+    n_sleep_ms(300);
+    const volatile uint32_t *seen =
+        again ? (const volatile uint32_t *)((uint8_t *)again + (boot & 4095) + 100ull * pitch) + 100 : NULL;
+    CHECK(seen && marks(seen) == 0, "the claim's end drew the boot screen again: %d marks left", seen ? marks(seen) : -1);
+    if (again) n_memory_release(again, peek);
+    if (view >= 0) n_handle_close(view);
+    if (bar >= 0) n_handle_close(bar);
     n_handle_close(vga);
 }
 
@@ -524,6 +759,14 @@ int main(int argc,char **argv) {
         printf("pcitest fbhold: %d failed\n", failed);
         return failed != 0;
     }
+    /* pcitest screen=<seconds>: only the given scanout, its second buffer shown that long */
+    if(argc>1 && !strncmp(argv[1],"screen=",7)){
+        struct n_pciinfo list[128];
+        int n = pcilist(list, 128);
+        give_screen_cases(-1, list, n, (unsigned)strtoul(argv[1] + 7, NULL, 10));
+        printf("pcitest screen: %d failed\n", failed);
+        return failed != 0;
+    }
     struct n_pciinfo list[128];
     int n = pcilist(list, 128), at = -1;
     for (int i = 0; i < n; i++)
@@ -595,6 +838,7 @@ int main(int argc,char **argv) {
             break;
         }
     CHECK(n_pci_hold_screen(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
+    give_screen_cases(pci, list, n, 0);
     /* a function on bus 0 that is neither this device nor a bridge above it */
     for (int i = 0; i < n; i++)
         if (i != at && list[i].bus == e->bus && list[i].dev != e->dev && list[i].cls != 0x06) {

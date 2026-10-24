@@ -27,6 +27,8 @@
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
+_Static_assert(SYS_PAGER_FAIL < SYS_MAX, "every system call number is below SYS_MAX");
+_Static_assert(sizeof(struct n_pager_fault) == 16 && sizeof(struct n_pager_supply) == 32, "pager ABI");
 
 extern char cpu_brand[64];
 int pci_list(struct n_pciinfo *out, int max);
@@ -65,7 +67,13 @@ static bool user_access(const void *p, size_t n, bool write) {
             pte = vmm_get_pte(t->pml4, pg);
         }
         if (!(pte & PTE_U)) return false;
-        if (write && !(pte & PTE_W)) return false;
+        if (write && !(pte & PTE_W)) {
+            /* a pager's page may be given write access; it is looked at again after */
+            bool slept = false;
+            if (!(pte & PTE_SHARED) || !shared_fault(pg, true, &slept)) return false;
+            if (slept) pg = ALIGN_DOWN(a, PAGE_SIZE);
+            continue;
+        }
         pg += PAGE_SIZE;
     }
     return true;
@@ -280,8 +288,15 @@ static int64_t stop_tree(int pid, int include_self) {
  * DMA RAM has one memory type for all its mappings and the
  * direct map: write-back until the first uncached or write-combining view while nothing maps
  * it, then that type for good (x86 forbids one page with two types). */
+/* Paged memory (n_pager_create) has no pages of its own: the app that made it, its pager, binds
+ * each page to a frame of RAM it holds (n_pager_supply), with read or read/write access, and takes
+ * frames or write access away again (n_pager_revoke). A touch of a page without the access it
+ * needs waits while the pager is asked (n_pager_take). Its table has two leaves per 512 pages: the
+ * bound frames with their access bits, and the root objects those frames belong to, each bound
+ * page holding a reference of its own (a DMA root also a mapping reference: its type stays). */
 #define SHARED_LEAF (PAGE_SIZE/sizeof(uint64_t))
-enum {SHARED_RAM,SHARED_DEMAND,SHARED_RANGE,SHARED_VIEW,SHARED_COMPOSITE};
+enum {SHARED_RAM,SHARED_DEMAND,SHARED_RANGE,SHARED_VIEW,SHARED_COMPOSITE,SHARED_PAGED};
+struct pager;
 /* Physical views remain flattened. Revocation ancestry is independent of the
    backing, so creating a child never escapes an issuer's cancellation scope.
    References are released iteratively, not through an unbounded C call stack. */
@@ -303,6 +318,7 @@ struct shared_pages {
        source_bytes of them starting source_skip bytes into the first page, zeros elsewhere, read
        on first touch. NULL while its program is idle (program_map gives a start's again). */
     struct handle *source;uint64_t source_offset,source_bytes;size_t source_skip;
+    struct pager *pager; /* paged memory: the pager that supplies it (holds a reference) */
     struct object object;
     uint64_t pages[];
 };
@@ -421,17 +437,42 @@ static uint64_t *demand_slot(struct shared_pages *p,size_t index,bool create) {
     if(!*leaf && (!create || !(*leaf=pmm_alloc_zeroed())))return NULL;
     return (uint64_t *)phys_to_virt(*leaf)+index%SHARED_LEAF;
 }
+/* Paged memory: the entry of page index (frame | PAGED_BOUND | PAGED_WRITE, 0 when unbound) and,
+   in *source, the slot of the root object its frame belongs to; NULL when the leaves are not
+   there (made when create). BSP IRQ guard held. */
+#define PAGED_BOUND 1ull
+#define PAGED_WRITE 2ull
+static uint64_t *paged_slot(struct shared_pages *p,size_t index,bool create,struct object ***source) {
+    size_t group=2*(index/SHARED_LEAF);
+    for(size_t k=0;k<2;k++)
+        if(!p->pages[group+k] && (!create || !(p->pages[group+k]=pmm_alloc_zeroed())))return NULL;
+    *source=(struct object **)phys_to_virt(p->pages[group+1])+index%SHARED_LEAF;
+    return (uint64_t *)phys_to_virt(p->pages[group])+index%SHARED_LEAF;
+}
+static uint64_t paged_entry(struct shared_pages *p,size_t index) {
+    struct object **source;uint64_t *entry=paged_slot(p,index,false,&source);
+    return entry?*entry:0;
+}
+/* The PTE flags a mapping with `flags` gives page index of p: a paged page bound for reading only
+   is mapped without write access, as a read-only shared page n_memory_protect cannot change. */
+static uint64_t shared_page_flags(struct shared_pages *p,size_t index,uint64_t flags) {
+    if(p->kind!=SHARED_PAGED || (paged_entry(p,index)&PAGED_WRITE))return flags;
+    return (flags&~PTE_W)|PTE_SHARED_RO;
+}
 /* BSP-owned, called with interrupts disabled or from the fault handler. */
 static uint64_t shared_frame(struct shared_pages *p,size_t index,bool create) {
     uint8_t cache;p=shared_leaf(p,&index,&cache,NULL,NULL);
     if(p->kind==SHARED_RAM)return p->pages[index];
+    if(p->kind==SHARED_PAGED){uint64_t entry=paged_entry(p,index);return entry&PAGED_BOUND?entry&PTE_ADDR:0;}
     if(p->kind==SHARED_RANGE)return p->base+index*PAGE_SIZE;
     uint64_t *slot=demand_slot(p,index,create);
     if(slot && !*slot && create && (*slot=pmm_alloc_zeroed()))p->resident++;
     return slot?*slot:0;
 }
+static void paged_release(struct shared_pages *p);
 static void shared_release(struct object *o) {
     struct shared_pages *p=o->priv;
+    if(p->kind==SHARED_PAGED)paged_release(p); /* its bindings, leaves and pager */
     {
         bool keep=p->dma && (!pci_user_dma_unmap(p->claim,p->kind==SHARED_RAM?p->pages:NULL,p->base,p->count) ||
                              !pci_user_dma_reusable(p->claim)); /* the device may still write there */
@@ -584,6 +625,87 @@ static void device_pins_drop(const struct pci_claim *claim) {
     }
 }
 
+/* The screen drawn into a driver's surface (syscall.h). It counts as a mapping of the surface: its
+   pages keep their type while the screen is there, and a DMA object's type stays fixed. */
+int64_t shared_scanout_open(struct handle *surface,const struct pci_claim *claim,uint64_t offset,uint64_t bytes,
+                            struct shared_scanout *out) {
+    struct shared_pages *p=shared_of(surface);
+    if(!p)return -N_ERR_WRONG_KIND;
+    if(!surface->writable)return -N_ERR_DENIED;
+    if(shared_cancelled(p) || shared_device_gone(p,NULL))return -N_ERR_CLOSED;
+    struct shared_pages *root=shared_root(p);
+    bool bar=root->kind==SHARED_RANGE && !root->owned && !root->dma;
+    if(root->claim!=claim || (!bar && !root->dma))return -N_ERR_DENIED; /* another claim's, or no device's */
+    if(!bytes || offset>p->bytes || bytes>p->bytes-offset)return -N_ERR_INVALID;
+    uint8_t cache=bar?device_cache(N_CACHE_WRITE_COMBINE):root->cache;
+    if(bar?!root->wc_allowed:cache==N_CACHE_WRITE_BACK)return -N_ERR_DENIED;
+    size_t first=offset/PAGE_SIZE,pages=(offset+bytes-1)/PAGE_SIZE-first+1;
+    uint64_t *frames=kmalloc(pages*sizeof *frames);
+    if(!frames)return -N_ERR_NO_MEMORY;
+    int64_t error=0;
+    uint64_t irq=irq_save();
+    for(size_t i=0;i<pages;i++)frames[i]=shared_frame(p,first+i,false);
+    uint64_t start=frames[0],end=frames[pages-1]+PAGE_SIZE; /* a BAR's pages are one run */
+    if(!bar || device_pin(root->claim,start,end,cache,&error)){
+        if(root->dma)shared_dma_maps(p,true);
+        object_ref(surface->object);
+    }
+    irq_restore(irq);
+    if(error){kfree(frames);return error;}
+    *out=(struct shared_scanout){.object=surface->object,.frames=frames,.pages=pages,
+                                 .first_byte=offset%PAGE_SIZE,.type=cache_pte(cache)};
+    return 0;
+}
+void shared_scanout_close(struct shared_scanout *s) {
+    if(!s->object)return;
+    struct shared_pages *p=s->object->priv,*root=shared_root(p);
+    uint64_t irq=irq_save();
+    if(root->dma)shared_dma_maps(p,false);
+    else device_unpin(root->claim,s->frames[0],s->frames[s->pages-1]+PAGE_SIZE,device_cache(N_CACHE_WRITE_COMBINE));
+    irq_restore(irq);
+    kfree(s->frames);
+    object_unref(s->object);
+    *s=(struct shared_scanout){0};
+}
+
+/* The screen drawn into a display driver's surface, or the boot screen again (dev/pciuser.c). */
+static int64_t sys_pci_give_screen(int h,int surface,const struct n_scanout *udesc) {
+    struct n_scanout desc={0};
+    if(surface!=N_SCANOUT_BOOT && copy_from_user(&desc,udesc,sizeof desc))return -N_ERR_BAD_ADDRESS;
+    struct handle *pci=handle_get(h);
+    if(!pci)return -N_ERR_NO_HANDLE;
+    struct handle *s=surface==N_SCANOUT_BOOT?NULL:handle_get(surface);
+    int64_t r=surface!=N_SCANOUT_BOOT && !s?-N_ERR_NO_HANDLE:pci_user_give_screen(pci,s,&desc);
+    handle_close(s);handle_close(pci);
+    return r;
+}
+/* An ACPI object of the claimed function's part of the namespace (dev/pciuser.c). The arguments'
+   data and the result go through kernel copies of at most ACPI_DATA_MAX and ACPI_OUT_MAX bytes. */
+#define ACPI_ARGS_MAX 7
+#define ACPI_DATA_MAX (64u*1024)
+#define ACPI_OUT_MAX (1024u*1024)
+static int64_t sys_pci_acpi_eval(int h,const struct n_acpi_eval *ueval,void *uout,uint64_t out_size) {
+    struct n_acpi_eval e;
+    struct n_acpi_value args[ACPI_ARGS_MAX];
+    char name[5];
+    if(copy_from_user(&e,ueval,sizeof e))return -N_ERR_BAD_ADDRESS;
+    if(e.nargs>ACPI_ARGS_MAX || e.data_size>ACPI_DATA_MAX)return -N_ERR_INVALID;
+    int n=user_str(name,e.name,sizeof name);
+    if(n==-N_ERR_BAD_ADDRESS)return n;
+    if(n!=4)return -N_ERR_INVALID;
+    if(e.nargs && copy_from_user(args,e.args,e.nargs*sizeof *args))return -N_ERR_BAD_ADDRESS;
+    size_t room=(size_t)MIN(out_size,(uint64_t)ACPI_OUT_MAX);
+    if(room && !user_ok_w(uout,room))return -N_ERR_BAD_ADDRESS;
+    struct handle *pci=handle_get(h);
+    if(!pci)return -N_ERR_NO_HANDLE;
+    uint8_t *data=e.data_size?kmalloc(e.data_size):NULL,*out=room?kmalloc(room):NULL;
+    int64_t r=(e.data_size && !data) || (room && !out)?-N_ERR_NO_MEMORY:0;
+    if(!r && e.data_size && copy_from_user(data,e.data,e.data_size))r=-N_ERR_BAD_ADDRESS;
+    if(!r)r=pci_user_acpi_eval(pci,e.node,name,args,e.nargs,data,e.data_size,out,room);
+    if(r>0 && copy_to_user(uout,out,(size_t)r))r=-N_ERR_BAD_ADDRESS;
+    kfree(data);kfree(out);handle_close(pci);
+    return r;
+}
 /* A claimed function's memory BAR: device memory, uncached unless a view says otherwise. */
 static int64_t sys_pci_bar(int h,uint32_t bar) {
     struct handle *pci=handle_get(h);
@@ -679,6 +801,8 @@ static int64_t sys_shared_view(int h,size_t offset,size_t bytes,uint32_t cache,u
             cache>N_CACHE_UNCACHED || (maximum && maximum!=N_MEMORY_READ && maximum!=N_MEMORY_READ_WRITE))r=-N_ERR_INVALID;
     if(r<0){handle_close(f);return r;}
     struct shared_pages *root=shared_root(src);
+    /* paged memory is its pager's to hand out page by page: no views of it */
+    if(root->kind==SHARED_PAGED){handle_close(f);return -N_ERR_WRONG_KIND;}
     if(shared_cancelled(src) || shared_device_gone(src,NULL)){handle_close(f);return -N_ERR_CLOSED;}
     bool writable=f->writable;
     if(maximum==N_MEMORY_READ_WRITE && !writable){handle_close(f);return -N_ERR_DENIED;}
@@ -745,6 +869,7 @@ static int64_t sys_shared_compose(const struct n_shared_range *uranges,size_t co
         if(range.offset>src->bytes || range.bytes>src->bytes-range.offset){r=-N_ERR_INVALID;goto out;}
         if(access==N_MEMORY_READ_WRITE && !f->writable){r=-N_ERR_DENIED;goto out;}
         struct shared_pages *root=shared_root(src);
+        if(root->kind==SHARED_PAGED){r=-N_ERR_WRONG_KIND;goto out;}
         if(shared_cancelled(src) || shared_device_gone(src,NULL)){r=-N_ERR_CLOSED;goto out;}
         if(range.bytes>SIZE_MAX-bytes || root->dependency_count>SIZE_MAX-dependencies ||
            (src->scope && root->dependency_count==SIZE_MAX-dependencies)){r=-N_ERR_TOO_LARGE;goto out;}
@@ -814,6 +939,322 @@ static int64_t sys_shared_revoke(int h) {
     }
     handle_close(f);return 0;
 }
+/* ---- pagers (docs/nocturne-native-abi.md §7) ----
+ * A pager is the app that made paged memory: through its pager handle, which only it can use
+ * (no other app may hold or receive one), it answers the faults of every app mapping the memory.
+ * A thread touching a page that is unbound, or bound for reading when it writes, files a fault
+ * (one per page and access, which later touches join) and sleeps until the pager supplies the
+ * page, takes the fault as failed, or ends; it is woken at once when it is stopped. The pager
+ * takes faults in batches; a supply covers whole runs of pages and may bind pages nobody asked
+ * for yet. Bound pages need no pager at all: a later touch by any mapper maps the frame itself.
+ * Revocation unmaps a run everywhere (or takes its write access away) and shoots it down before
+ * the frames go. When the pager ends, bound pages stay and unbound ones are access violations;
+ * when the memory is gone (no handle, no mapping), the pager handle reports N_EVENT_CLOSED. */
+enum {PAGER_PENDING,PAGER_SUPPLIED,PAGER_FAILED};
+struct pager_fault {
+    struct pager_fault *next;
+    uint64_t id;            /* a number of its own, to find it again after a copy to the pager */
+    size_t page;
+    uint32_t access, app;   /* N_MEMORY_READ or _READ_WRITE; the app that touched it first */
+    size_t waiters;
+    uint8_t state;
+    bool queued;            /* not taken by the pager yet */
+};
+struct pager {
+    struct object object;
+    struct shared_pages *memory; /* NULL once it is released */
+    int creator;
+    bool ended;                  /* the pager handle closed */
+    struct pager_fault *faults;  /* in the order they came */
+    size_t queued;
+    uint64_t next_id;
+    struct wait_queue waiters, taker;
+};
+#define PAGER_BATCH 128
+static void pager_unlink(struct pager *g,struct pager_fault *f) {
+    struct pager_fault **link=&g->faults;
+    while(*link!=f)link=&(*link)->next;
+    *link=f->next;
+    if(f->queued)g->queued--;
+    kfree(f);
+}
+/* Faults of [first, first+count) that the memory now answers (supplied: their access is bound;
+   failed: all of them) leave the queue and wake their threads. BSP IRQ guard held. */
+static void pager_settle(struct pager *g,size_t first,size_t count,uint8_t state) {
+    bool any=false;
+    for(struct pager_fault *f=g->faults,*next;f;f=next){
+        next=f->next;
+        if(f->state!=PAGER_PENDING || f->page<first || f->page-first>=count)continue;
+        if(state==PAGER_SUPPLIED){
+            uint64_t entry=g->memory?paged_entry(g->memory,f->page):0;
+            if(!(entry&PAGED_BOUND) || (f->access==N_MEMORY_READ_WRITE && !(entry&PAGED_WRITE)))continue;
+        }
+        f->state=state;any=true;
+        if(f->queued){f->queued=false;g->queued--;}
+        if(!f->waiters)pager_unlink(g,f);
+    }
+    if(any){wq_wake_all(&g->waiters);object_notify(&g->object);}
+}
+/* The calling thread waits for the pager to answer page `page` of its memory with the access it
+   needs: true once it supplied something there (the caller looks again), false when the fault
+   failed, the pager ended or the thread is being stopped. BSP IRQ guard held; it is let go while
+   the thread sleeps. */
+static bool pager_wait(struct pager *g,size_t page,bool write) {
+    uint32_t access=write?N_MEMORY_READ_WRITE:N_MEMORY_READ;
+    if(g->ended || current_task->killed)return false;
+    struct pager_fault *f=g->faults,**tail=&g->faults;
+    for(;f;tail=&f->next,f=f->next)
+        if(f->page==page && f->state==PAGER_PENDING && f->access>=access)break;
+    if(!f){
+        if(!(f=kzalloc(sizeof *f)))return false;
+        *f=(struct pager_fault){.id=++g->next_id,.page=page,.access=access,.app=(uint32_t)task_process()->pid,
+                               .state=PAGER_PENDING,.queued=true};
+        *tail=f;g->queued++;
+        wq_wake_all(&g->taker);object_notify(&g->object);
+    }
+    f->waiters++;object_ref(&g->object);
+    while(f->state==PAGER_PENDING && !g->ended && !current_task->killed)wq_wait(&g->waiters);
+    bool supplied=f->state==PAGER_SUPPLIED;
+    if(!--f->waiters && (f->state!=PAGER_PENDING || g->ended || current_task->killed))pager_unlink(g,f);
+    object_unref(&g->object);
+    return supplied;
+}
+/* Every mapping of paged memory p, also one being made: its pages [first, first+count) lose their
+   frames (write_only: their write access), shot down before this returns. */
+static void paged_unmap(struct shared_pages *p,size_t first,size_t count,bool write_only) {
+    uint64_t offset=(uint64_t)first*PAGE_SIZE,bytes=(uint64_t)count*PAGE_SIZE;
+    for(struct task *t=task_list;t;t=t->all_next){
+        if(t->is_thread || !t->pml4 || t->pml4==kernel_pml4)continue;
+        for(struct shared_mapping *m=t->shared_mappings;m;m=m->next){
+            if(m->object!=&p->object)continue;
+            if(write_only)vmm_user_write_protect(t->pml4,m->va+offset,bytes);
+            else vmm_user_free(t->pml4,m->va+offset,bytes);
+        }
+    }
+    for(struct shared_mapping *m=shared_building;m;m=m->next){
+        if(m->object!=&p->object)continue;
+        if(write_only)vmm_user_write_protect(m->building_owner->pml4,m->va+offset,bytes);
+        else vmm_user_free(m->building_owner->pml4,m->va+offset,bytes);
+    }
+}
+/* Drops the references bound pages held on their sources, once nothing reaches the frames. */
+static void paged_drop(struct object **sources,size_t count) {
+    uint64_t irq=irq_save();
+    for(size_t i=0;i<count;i++){struct shared_pages *s=sources[i]->priv;if(s->dma){ASSERT(s->maps);s->maps--;}}
+    irq_restore(irq);
+    for(size_t i=0;i<count;i++)object_unref(sources[i]);
+}
+/* Unbinds [first, first+count) of p: unmapped everywhere first, then the frames are let go. */
+static void paged_unbind(struct shared_pages *p,size_t first,size_t count) {
+    while(count){
+        size_t n=MIN(count,(size_t)PAGER_BATCH),dropped=0;
+        struct object *sources[PAGER_BATCH];
+        uint64_t irq=irq_save();
+        for(size_t i=0;i<n;i++){
+            struct object **source;uint64_t *entry=paged_slot(p,first+i,false,&source);
+            if(!entry){i+=SHARED_LEAF-1-(first+i)%SHARED_LEAF;continue;} /* no leaves: nothing bound there */
+            if(!*entry)continue;
+            sources[dropped++]=*source;*entry=0;*source=NULL;
+        }
+        irq_restore(irq);
+        if(dropped){paged_unmap(p,first,n,false);paged_drop(sources,dropped);}
+        first+=n;count-=n;
+    }
+}
+/* The memory's last reference went (shared_release): no mapping is left to unmap. */
+static void paged_release(struct shared_pages *p) {
+    paged_unbind(p,0,p->count);
+    for(size_t i=0;i<2*((p->count+SHARED_LEAF-1)/SHARED_LEAF);i++)if(p->pages[i])pmm_free(p->pages[i]);
+    struct pager *g=p->pager;
+    uint64_t irq=irq_save();
+    g->memory=NULL;
+    for(struct pager_fault *f=g->faults;f;f=f->next)f->state=PAGER_FAILED;
+    while(g->faults && !g->faults->waiters)pager_unlink(g,g->faults);
+    wq_wake_all(&g->waiters);wq_wake_all(&g->taker);object_notify(&g->object);
+    irq_restore(irq);
+    object_unref(&g->object);
+}
+static uint32_t pager_ready(struct handle *h) {
+    struct pager *g=h->object->priv;
+    return (g->queued?N_EVENT_RECEIVABLE:0)|(g->memory?0:N_EVENT_CLOSED);
+}
+/* The pager's handle closed: what waits fails, and what comes later fails at once. */
+static void pager_close(struct handle *h) {
+    struct pager *g=h->object->priv;
+    uint64_t irq=irq_save();
+    g->ended=true;
+    for(struct pager_fault *f=g->faults,*next;f;f=next){
+        next=f->next;f->state=PAGER_FAILED;
+        if(!f->waiters)pager_unlink(g,f);
+    }
+    wq_wake_all(&g->waiters);
+    irq_restore(irq);
+}
+static void pager_release(struct object *o) {
+    struct pager *g=o->priv;
+    while(g->faults)pager_unlink(g,g->faults);
+    kfree(g);
+}
+static const struct object_ops pager_ops={.kind=N_KIND_PAGER,.ready=pager_ready,.close=pager_close,
+                                          .release=pager_release};
+/* The pager behind handle h, for its creator only (*error otherwise); *out holds the handle. */
+static struct pager *pager_get(int h,struct handle **out,int64_t *error) {
+    struct handle *f=handle_get(h);
+    if(!f){*error=-N_ERR_NO_HANDLE;return NULL;}
+    if(!handle_is(f,&pager_ops)){handle_close(f);*error=-N_ERR_WRONG_KIND;return NULL;}
+    struct pager *g=f->object->priv;
+    if(g->creator!=task_process()->pid){handle_close(f);*error=-N_ERR_DENIED;return NULL;}
+    *out=f;return g;
+}
+static int64_t sys_pager_create(size_t bytes,int32_t *umemory) {
+    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1))return -N_ERR_INVALID;
+    bytes=ALIGN_UP(bytes,PAGE_SIZE);
+    size_t count=bytes/PAGE_SIZE,groups=(count+SHARED_LEAF-1)/SHARED_LEAF;
+    struct pager *g=kzalloc(sizeof *g);
+    if(!g)return -N_ERR_NO_MEMORY;
+    object_init(&g->object,&pager_ops,g);
+    g->creator=task_process()->pid;
+    struct shared_pages *p=shared_new(bytes,SHARED_PAGED,2*groups);
+    if(!p){kfree(g);return -N_ERR_NO_MEMORY;}
+    p->count=count;p->pager=g;g->memory=p;object_ref(&g->object); /* the memory's reference */
+    struct handle *memory=NULL,*pager;
+    int64_t r=shared_open(p,true,&memory); /* on failure the memory goes, and with it the pager */
+    if(r<0)return r;
+    if(!(pager=handle_open(&g->object,true))){handle_close(memory);return -N_ERR_NO_MEMORY;}
+    int number=handle_install(memory);
+    if(number<0){handle_close(pager);return number;}
+    if(copy_to_user(umemory,&number,sizeof number)<0){handle_remove(number);handle_close(pager);return -N_ERR_BAD_ADDRESS;}
+    int result=handle_install(pager);
+    if(result<0)handle_remove(number);
+    return result;
+}
+static int64_t sys_pager_take(int h,struct n_pager_fault *uout,size_t max,int64_t timeout_ms) {
+    struct handle *f;int64_t r=0;
+    struct pager *g=pager_get(h,&f,&r);
+    if(!g)return r;
+    if(!max){handle_close(f);return -N_ERR_INVALID;}
+    struct n_pager_fault out[32];uint64_t ids[32];size_t k=0;
+    uint64_t irq=irq_save();
+    for(;;){
+        for(struct pager_fault *q=g->faults;q && k<MIN(max,ARRAY_SIZE(out));q=q->next){
+            if(!q->queued)continue;
+            out[k]=(struct n_pager_fault){.offset=(uint64_t)q->page*PAGE_SIZE,.access=q->access,.app=q->app};
+            ids[k++]=q->id;q->queued=false;g->queued--;
+        }
+        if(k){r=(int64_t)k;break;}
+        if(!g->memory){r=-N_ERR_CLOSED;break;}
+        if(current_task->killed){r=-N_ERR_STOPPED;break;}
+        if(!timeout_ms){r=-N_ERR_TIMEOUT;break;}
+        if(timeout_ms<0)wq_wait(&g->taker);
+        else if(!wq_wait_timeout(&g->taker,(uint64_t)timeout_ms) && !g->queued){r=-N_ERR_TIMEOUT;break;}
+    }
+    irq_restore(irq);
+    if(k && copy_to_user(uout,out,k*sizeof *out)<0){
+        /* the pager did not get them: they wait in the queue for its next take */
+        irq=irq_save();
+        for(struct pager_fault *q=g->faults;q;q=q->next)
+            for(size_t i=0;i<k;i++)if(q->id==ids[i] && q->state==PAGER_PENDING && !q->queued){q->queued=true;g->queued++;}
+        irq_restore(irq);
+        r=-N_ERR_BAD_ADDRESS;
+    }
+    handle_close(f);return r;
+}
+/* One run of n_pager_supply: [offset, offset+bytes) of the memory bound to the pages of source
+   from source_offset on. Pages of RAM only (write-back DMA RAM included), not paged or program
+   memory; read/write access needs a writable source. */
+static int64_t pager_supply_run(struct pager *g,const struct n_pager_supply *run) {
+    struct shared_pages *p=g->memory;
+    if(!p)return -N_ERR_CLOSED;
+    if(!run->bytes || (run->offset|run->bytes|run->source_offset)&(PAGE_SIZE-1) || run->offset>p->bytes ||
+       run->bytes>p->bytes-run->offset || (run->access!=N_MEMORY_READ && run->access!=N_MEMORY_READ_WRITE))
+        return -N_ERR_INVALID;
+    struct handle *sh=handle_get(run->source);
+    if(!sh)return -N_ERR_NO_HANDLE;
+    struct shared_pages *src=shared_of(sh);
+    int64_t r=0;
+    if(!src)r=-N_ERR_WRONG_KIND;
+    else if(run->source_offset>src->bytes || run->bytes>src->bytes-run->source_offset)r=-N_ERR_INVALID;
+    else if(run->access==N_MEMORY_READ_WRITE && !sh->writable)r=-N_ERR_DENIED;
+    else if(shared_cancelled(src) || shared_device_gone(src,NULL))r=-N_ERR_CLOSED;
+    size_t first=run->offset/PAGE_SIZE,count=run->bytes/PAGE_SIZE,from=run->source_offset/PAGE_SIZE;
+    while(r>=0 && count){
+        size_t n=MIN(count,(size_t)PAGER_BATCH),dropped=0;bool unmap=false,protect=false;
+        struct object *sources[PAGER_BATCH];
+        uint64_t irq=irq_save();
+        for(size_t i=0;i<n;i++){
+            size_t index=from+i;uint8_t cache;
+            struct shared_pages *leaf=shared_leaf(src,&index,&cache,NULL,NULL);
+            bool ram=leaf->kind==SHARED_RAM || (leaf->kind==SHARED_RANGE && leaf->owned) ||
+                     (leaf->kind==SHARED_DEMAND && !leaf->source);
+            if(!ram || cache!=N_CACHE_WRITE_BACK){r=-N_ERR_DENIED;n=i;break;}
+            uint64_t frame=shared_frame(leaf,index,true);
+            struct object **source;uint64_t *entry=paged_slot(p,first+i,true,&source);
+            if(!frame || !entry){r=-N_ERR_NO_MEMORY;n=i;break;}
+            uint64_t now=frame|PAGED_BOUND|(run->access==N_MEMORY_READ_WRITE?PAGED_WRITE:0);
+            if((*entry&PTE_ADDR)==frame && (*entry&PAGED_BOUND)){
+                protect|=(*entry&PAGED_WRITE) && !(now&PAGED_WRITE);
+                *entry=now;continue;
+            }
+            if(*entry){sources[dropped++]=*source;unmap=true;}
+            *entry=now;*source=&leaf->object;object_ref(&leaf->object);
+            if(leaf->dma)leaf->maps++;
+        }
+        irq_restore(irq);
+        /* a page bound elsewhere before is unmapped everywhere before its old frame goes */
+        if(unmap)paged_unmap(p,first,n,false);
+        else if(protect)paged_unmap(p,first,n,true);
+        if(dropped)paged_drop(sources,dropped);
+        irq=irq_save();pager_settle(g,first,n,PAGER_SUPPLIED);irq_restore(irq);
+        first+=n;from+=n;count-=n;
+    }
+    handle_close(sh);return r;
+}
+static int64_t sys_pager_supply(int h,const struct n_pager_supply *uruns,size_t count) {
+    struct handle *f;int64_t r=0;
+    struct pager *g=pager_get(h,&f,&r);
+    if(!g)return r;
+    if(!count)r=-N_ERR_INVALID;
+    for(size_t i=0;r>=0 && i<count;i++){
+        struct n_pager_supply run;
+        if(copy_from_user(&run,&uruns[i],sizeof run)<0){r=-N_ERR_BAD_ADDRESS;break;}
+        r=pager_supply_run(g,&run);
+        if(need_resched)schedule();
+    }
+    handle_close(f);return r<0?r:0;
+}
+/* access 0: the pages lose their frames; N_MEMORY_READ: their write access. */
+static int64_t sys_pager_revoke(int h,uint64_t offset,uint64_t bytes,uint32_t access) {
+    struct handle *f;int64_t r=0;
+    struct pager *g=pager_get(h,&f,&r);
+    if(!g)return r;
+    struct shared_pages *p=g->memory;
+    if(!p)r=-N_ERR_CLOSED;
+    else if(!bytes || (offset|bytes)&(PAGE_SIZE-1) || offset>p->bytes || bytes>p->bytes-offset ||
+            (access && access!=N_MEMORY_READ))r=-N_ERR_INVALID;
+    else if(!access)paged_unbind(p,offset/PAGE_SIZE,bytes/PAGE_SIZE);
+    else for(size_t first=offset/PAGE_SIZE,count=bytes/PAGE_SIZE;count;){
+        size_t n=MIN(count,(size_t)PAGER_BATCH);bool any=false;
+        uint64_t irq=irq_save();
+        for(size_t i=0;i<n;i++){
+            struct object **source;uint64_t *entry=paged_slot(p,first+i,false,&source);
+            if(entry && (*entry&PAGED_WRITE)){*entry&=~PAGED_WRITE;any=true;}
+        }
+        irq_restore(irq);
+        if(any)paged_unmap(p,first,n,true);
+        first+=n;count-=n;
+    }
+    handle_close(f);return r;
+}
+/* The faults of [offset, offset+bytes) fail: their threads see an access violation. */
+static int64_t sys_pager_fail(int h,uint64_t offset,uint64_t bytes) {
+    struct handle *f;int64_t r=0;
+    struct pager *g=pager_get(h,&f,&r);
+    if(!g)return r;
+    if(!bytes || (offset|bytes)&(PAGE_SIZE-1) || offset+bytes<offset)r=-N_ERR_INVALID;
+    else {uint64_t irq=irq_save();pager_settle(g,offset/PAGE_SIZE,bytes/PAGE_SIZE,PAGER_FAILED);irq_restore(irq);}
+    handle_close(f);return r;
+}
+
 /* Read-only ELF segments: every task running a program maps one set of frames
  * for them, so concurrent instances (a worker pool) hold one copy of their code
  * and constants, and a start of a program that is still or was recently running
@@ -1034,15 +1475,22 @@ void shared_revoke_claim(const struct pci_claim *c) {
 static bool shared_fault(uint64_t addr,bool write,bool *slept) {
     struct task *owner=task_process();
     if(!owner)return false;
-    int reserved=vmm_demand_fault(owner->pml4,addr,write); /* a private reserved page */
-    if(reserved>0)return true;
-    if(reserved<0){
-        kprintf("[memory] pid %d (%s): no frame for reserved page %p, %lu pages free\n",
-                owner->pid,owner->name,(void *)ALIGN_DOWN(addr,PAGE_SIZE),(unsigned long)pmm_free_pages());
-        report_memory_exhaustion(owner,PAGE_SIZE);
-        return false;
+    uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE),present=vmm_get_pte(owner->pml4,page);
+    if(present&PTE_P){
+        /* A sibling mapped it first, or a write to a page without write access, which only a
+           pager's page can be given (below); anything else stays a protection violation. */
+        if(!write || (present&PTE_W))return true;
+        if(!(present&PTE_SHARED))return false;
+    }else{
+        int reserved=vmm_demand_fault(owner->pml4,addr,write); /* a private reserved page */
+        if(reserved>0)return true;
+        if(reserved<0){
+            kprintf("[memory] pid %d (%s): no frame for reserved page %p, %lu pages free\n",
+                    owner->pid,owner->name,(void *)page,(unsigned long)pmm_free_pages());
+            report_memory_exhaustion(owner,PAGE_SIZE);
+            return false;
+        }
     }
-    uint64_t page=ALIGN_DOWN(addr,PAGE_SIZE);
 again:;
     uint64_t irq=irq_save();bool ok=false,starved=false;
     struct shared_pages *fill=NULL;struct handle *source=NULL;size_t at=0;
@@ -1052,6 +1500,20 @@ again:;
         if(shared_cancelled(p))break;
         size_t index=(page-m->va)/PAGE_SIZE;uint8_t cache;
         struct shared_pages *leaf=shared_leaf(p,&index,&cache,NULL,NULL);
+        if(leaf->kind==SHARED_PAGED){
+            if(write && !(m->flags&PTE_W))break;
+            uint64_t entry=paged_entry(leaf,index);
+            if((entry&PAGED_BOUND) && (!write || (entry&PAGED_WRITE))){
+                ok=vmm_map_page(owner->pml4,page,entry&PTE_ADDR,shared_page_flags(leaf,index,m->flags));
+                break;
+            }
+            /* The pager is asked; the mapping is looked up again once it answered. */
+            bool answered=pager_wait(leaf->pager,index,write);
+            irq_restore(irq);
+            if(!answered)return false;
+            if(slept)*slept=true;
+            goto again;
+        }
         if(leaf->kind==SHARED_RANGE && !leaf->owned && pci_user_revoked(leaf->claim)){
             /* The device's driver ended. One kernel page, all-ones at first, stands in for every
                register and aperture page: reads see a function gone from the bus, writes (a
@@ -1066,7 +1528,7 @@ again:;
         /* Claim loss removes the entire composite mapping. Its other RAM or
            live-device segments still refer to their own valid backing. */
         if((leaf->kind!=SHARED_DEMAND && !shared_device_gone(p,NULL)) || (write && !(m->flags&PTE_W)))break;
-        if(vmm_get_pte(owner->pml4,page)&PTE_P){ok=true;break;}
+        if(vmm_get_pte(owner->pml4,page)&PTE_P){ok=!write || (vmm_get_pte(owner->pml4,page)&PTE_W);break;}
         if(leaf->source && !shared_frame(leaf,index,false)){
             /* A program's page no task has read: the object and its opening stay while it is read. */
             fill=leaf;at=index;source=handle_ref(leaf->source);
@@ -1139,7 +1601,8 @@ static int64_t sys_shared_map(int h,size_t bytes,int access) {
         if(m->cancelled || current_task->killed){irq_restore(irq);break;}
         shared_leaf(p,&index,&cache,NULL,NULL);
         uint64_t frame=shared_frame(p,mapped,false);
-        bool ok=!frame || vmm_map_page(owner->pml4,va+mapped*PAGE_SIZE,frame,flags|cache_pte(cache));
+        bool ok=!frame || vmm_map_page(owner->pml4,va+mapped*PAGE_SIZE,frame,
+                                       shared_page_flags(p,mapped,flags)|cache_pte(cache));
         irq_restore(irq);if(!ok)break;
         if(need_resched)schedule();
     }
@@ -1897,10 +2360,13 @@ void syscall_dispatch(struct regs *r) {
         break;
     }
     case SYS_PCI_BAR: ret = sys_pci_bar((int)a,(uint32_t)b); break;
+    case SYS_PCI_GIVE_SCREEN: ret = sys_pci_give_screen((int)a,(int)b,(const struct n_scanout *)c); break;
+    case SYS_PCI_ACPI_EVAL: ret = sys_pci_acpi_eval((int)a,(const struct n_acpi_eval *)b,(void *)c,d); break;
     case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
     case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
     case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:
-    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: case SYS_PCI_HOLD_SCREEN: {
+    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: case SYS_PCI_HOLD_SCREEN: case SYS_PCI_SCREEN_VBLANK:
+    case SYS_PCI_ACPI_NOTIFY_TAKE: {
         struct handle *f = handle_get((int)a);
         if (!f) { ret = -N_ERR_NO_HANDLE; break; }
         if (r->rax == SYS_PCI_INFO) {
@@ -1911,6 +2377,8 @@ void syscall_dispatch(struct regs *r) {
         else if (r->rax == SYS_PCI_CONFIG_WRITE) ret = pci_user_config_write(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
         else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
         else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);
+        else if (r->rax == SYS_PCI_SCREEN_VBLANK) ret = pci_user_screen_vblank(f, b, c);
+        else if (r->rax == SYS_PCI_ACPI_NOTIFY_TAKE) ret = pci_user_acpi_notify_take(f, (int64_t)b);
         else ret = pci_user_interrupt_take(f,(int64_t)b);
         handle_close(f);
         break;
@@ -2149,6 +2617,11 @@ void syscall_dispatch(struct regs *r) {
     case SYS_AUDIO_STATUS: ret = sys_audio_status((int)a, (struct n_audio_status *)b); break;
     case SYS_AUDIO_VOLUME: ret = sys_audio_volume((int64_t)a); break;
     case SYS_RANDOM: ret = sys_random((void *)a, b); break;
+    case SYS_PAGER_CREATE: ret = sys_pager_create(a, (int32_t *)b); break;
+    case SYS_PAGER_TAKE: ret = sys_pager_take((int)a, (struct n_pager_fault *)b, c, (int64_t)d); break;
+    case SYS_PAGER_SUPPLY: ret = sys_pager_supply((int)a, (const struct n_pager_supply *)b, c); break;
+    case SYS_PAGER_REVOKE: ret = sys_pager_revoke((int)a, b, c, (uint32_t)d); break;
+    case SYS_PAGER_FAIL: ret = sys_pager_fail((int)a, b, c); break;
     default:
         if (r->rax >= SYS_WIN_CREATE && r->rax < SYS_NET_INFO) ret = wm_syscall((int)r->rax, a, b, c, d, e);
         else if (r->rax >= SYS_NET_INFO && r->rax < SYS_NET_LIMIT) ret = net_syscall((int)r->rax, a, b, c, d, e);

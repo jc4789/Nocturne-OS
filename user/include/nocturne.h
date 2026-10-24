@@ -129,8 +129,43 @@ n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms);
    and bus mastering) before CPU drawing resumes. A driver stuck while it holds is the user's
    to end: Ctrl+Alt+Esc stops its app, and the end of its claim releases the hold; so does a
    hold that lasts as long as the boot option fbhold=<s> says (no time by default).
-   N_ERR_NOT_FOUND: the boot screen is elsewhere. */
+   The driver whose surface the screen is drawn into (n_pci_give_screen) holds it the same way.
+   N_ERR_NOT_FOUND: the boot screen is elsewhere and the screen is not drawn into its surface. */
 n_result n_pci_hold_screen(n_handle pci, bool hold);
+/* A display function's driver (PCI class 03) that set up its own scanout gives the system that
+   surface: from the return on the desktop is drawn there, and never into the boot screen, until
+   the driver gives N_SCANOUT_BOOT, or its claim ends (crash included), which stops the function
+   first. Drawing then resumes in the boot screen's memory, but the display engine may not show it
+   any more. surface: a writable shared object made through this claim, its BAR (prefetchable;
+   drawn write-combined, so a view of it the driver maps must be write-combining too) or a DMA
+   object whose type is not write-back (a write-combining or uncached view sets it), or a view of
+   either; desc says where in it (offset, pitch) and how (N_SCANOUT_XRGB8888 or XRGB2101010).
+   Its width and height must be the screen's as the firmware set it (n_pci_info's framebuffer_width
+   and framebuffer_height on the function it is in); a change of size is not offered yet.
+   Returns once nothing is drawn into what was shown before; the new surface is drawn in full.
+   N_ERR_DENIED: not a display function, another claim's object, or a type the surface cannot have;
+   N_ERR_INVALID: another size, an unknown format, a range beyond the object; N_ERR_BUSY: another
+   claim's surface is shown. */
+n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc);
+/* The surface given had vertical blank number count at timestamp_ns (the driver's clock). While
+   blanks come, the desktop starts its frames at them instead of its own period; 100 ms without
+   one and the period paces again. N_ERR_DENIED: the screen is not drawn into this claim's surface. */
+n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns);
+/* The function's part of the ACPI namespace, as the firmware describes it: its device node
+   (N_ACPI_SELF), that node's device children (N_ACPI_CHILD(i), in namespace order), and the node
+   of the bridge it is below (N_ACPI_UPSTREAM; the host bridge's on a root bus). n_pci_acpi_eval
+   evaluates `name`, one name segment directly under that node ("_DSM", "_ADR"), with nargs
+   (at most 7) integer, string or buffer arguments whose bytes are in data (at most 64 KiB), and
+   writes the result to out: struct n_acpi_value records, the first one the result, then the
+   bytes of its strings and buffers; it returns how many bytes it wrote (at most 1 MiB).
+   N_ERR_NOT_FOUND: no such node or object; N_ERR_INVALID: a child number past the last (a
+   function without a node has no children), a malformed name or argument; N_ERR_TOO_LARGE: out is too small; N_ERR_IO: the AML failed;
+   N_ERR_UNSUPPORTED: the system runs without AML. n_pci_acpi_notify_take returns the next
+   Notify value of the function's node from its first call on (it waits like
+   n_pci_interrupt_take; 32 not taken are kept, the oldest give way). */
+n_result n_pci_acpi_eval(n_handle pci, uint32_t node, const char *name, const struct n_acpi_value *args,
+                         uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size);
+n_result n_pci_acpi_notify_take(n_handle pci, int64_t timeout_ms);
 /* Zeroed RAM that a claimed function may read and write by DMA: a shared object (N_DMA_*
    flags), held while any handle or mapping holds it. n_dma_addresses gives the bus address of
    each page from first_page (count of them; returns how many it wrote). */
@@ -149,6 +184,22 @@ n_handle n_shared_compose(const struct n_shared_range *ranges, size_t count, uin
 /* Only the app which issued a view may revoke it. Existing mappings and all
    derived views lose access; the underlying object and independent views remain alive. */
 n_result n_shared_revoke(n_handle view);
+/* Paged memory (docs/nocturne-native-abi.md §7): `bytes` of shared memory (in *memory, an
+   ordinary N_KIND_SHARED handle to map or to send) whose pages the creating app, its pager,
+   supplies through the returned N_KIND_PAGER handle, which no other app can use or receive.
+   A touch of a page without the access it needs waits until the pager answered it:
+   n_pager_take gives such faults (up to max; timeout_ms -1 waits, 0 polls: N_ERR_TIMEOUT;
+   N_ERR_CLOSED once the memory is gone), and the handle is N_EVENT_RECEIVABLE while some wait.
+   n_pager_supply binds runs of pages to RAM the pager holds (write-back; a DMA object's too),
+   which every mapper then reaches without asking again; n_pager_revoke takes the frames
+   (access 0) or the write access (N_MEMORY_READ) of a run away from every mapper at once;
+   n_pager_fail makes the waiting touches of a run access violations. When the pager handle
+   closes, bound pages stay and the others fail. Paged memory has no views. */
+n_handle n_pager_create(size_t bytes, n_handle *memory);
+n_result n_pager_take(n_handle pager, struct n_pager_fault *out, size_t max, int64_t timeout_ms);
+n_result n_pager_supply(n_handle pager, const struct n_pager_supply *runs, size_t count);
+n_result n_pager_revoke(n_handle pager, uint64_t offset, uint64_t bytes, uint32_t access);
+n_result n_pager_fail(n_handle pager, uint64_t offset, uint64_t bytes);
 /* Sound: each n_audio_open is a stream of N_AUDIO_RATE stereo frames (two int16_t, left first)
    of its own, mixed with the others and scaled by the master volume. A stream holds about
    170 ms; n_audio_submit takes what fits and returns the frames taken (with N_AUDIO_WAIT it
