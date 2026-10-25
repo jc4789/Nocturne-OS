@@ -166,7 +166,7 @@ typedef struct node {
     bool style_dirty, style_children_dirty;
     bool style_self_dirty; /* only this element's own match changed */
     uint8_t style_form_state; /* supervisor-published form pseudo snapshot; cascade reads only */
-    uint32_t style_subtree_work; /* flat-tree element count, refreshed before a full cascade */
+    uint32_t style_subtree_work; /* elements the next cascade restyles here, counted before it splits */
     /* Published only after layout joins; CSS workers never read mutable boxes
        or borrow this name list from a retired computed-style arena. */
     char *container_names;
@@ -566,7 +566,7 @@ int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text);
 void css_animation_free(node_t *n);
 void css_motion_tick(web_doc *d, uint64_t now);
 void css_box_change_report(web_doc *d); /* debug_js only */
-int64_t css_motion_deadline(web_doc *d, uint64_t now);
+int64_t css_motion_deadline(web_doc *d); /* absolute uptime_ms(), as web_deadline */
 void css_motion_doc_free(web_doc *d);
 bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
@@ -1183,7 +1183,7 @@ void doc_rescan(web_doc *d);
 void web_marquee_register(web_doc *d, node_t *node);
 void web_marquee_set(node_t *node, bool running);
 void web_marquee_tick(web_doc *d, uint64_t now);
-int64_t web_marquee_deadline(web_doc *d, uint64_t now);
+int64_t web_marquee_deadline(web_doc *d); /* absolute uptime_ms(), as web_deadline */
 bool web_marquee_box(const box_t *box);
 void doc_sync_tree(web_doc *d);
 node_t *doc_image_node_next(web_doc *d, node_t *previous);

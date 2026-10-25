@@ -152,7 +152,7 @@ void web_marquee_tick(web_doc *d,uint64_t now) {
         if(oldx!=n->marquee_x || oldy!=n->marquee_y){doc_paint_full(d);d->visual_revision++;}
     }
 }
-int64_t web_marquee_deadline(web_doc *d,uint64_t now) {
+int64_t web_marquee_deadline(web_doc *d) {
     if(!d || d->inert || d->native_cancelled)return -1;
     uint64_t best=UINT64_MAX;
     for(int i=0;i<d->marquees.n;i++) {
@@ -161,5 +161,5 @@ int64_t web_marquee_deadline(web_doc *d,uint64_t now) {
         uint64_t delay=interval(n),due=n->marquee_last>UINT64_MAX-delay?UINT64_MAX:n->marquee_last+delay;
         if(due<best)best=due;
     }
-    return best==UINT64_MAX?-1:best<=now?0:(int64_t)(best-now);
+    return best>(uint64_t)INT64_MAX?-1:(int64_t)best;
 }

@@ -828,10 +828,10 @@ static void selector_ancestor_hashes(struct selector *sel) {
 }
 /* The filter of a walk: its job's snapshot (or none) and its own counts. */
 struct ancestor_view { const struct ancestor_filter *base; const struct ancestor_counts *counts; };
-static bool ancestor_filter_rejects(const struct ancestor_view *v, const struct selector *sel) {
+static bool ancestor_filter_rejects(const struct ancestor_view *v, const uint32_t hashes[SELECTOR_ANCESTOR_HASHES]) {
     if (!v || !v->counts) return false;
-    for (int i = 0; i < SELECTOR_ANCESTOR_HASHES && sel->ancestor_hashes[i]; i++) {
-        uint32_t h = sel->ancestor_hashes[i];
+    for (int i = 0; i < SELECTOR_ANCESTOR_HASHES && hashes[i]; i++) {
+        uint32_t h = hashes[i];
         if (!ancestor_bit(v->base, v->counts, h & (ANCESTOR_FILTER_BITS - 1)) ||
             !ancestor_bit(v->base, v->counts, (h >> 11) & (ANCESTOR_FILTER_BITS - 1))) return true;
     }
@@ -2735,23 +2735,31 @@ static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int
 
 /* ---------------------------------------------------------------- the rule index */
 struct ient {
+    struct ient *next;
     const struct selector *sel;
     const struct rule *r;
     uint32_t order;
     uint32_t media; /* 0: unconditional; else its rule's @media is css_index.media[media - 1] */
-    struct ient *next;
+    /* The selector's, here: most candidates are rejected on these alone,
+       without reaching the selector. */
+    uint32_t ancestor_hashes[SELECTOR_ANCESTOR_HASHES];
+    uint8_t pseudo;
 };
 
 struct css_feature;
 struct bucket {
     const char *key;
+    uint32_t hash; /* hash_str(key): a lookup compares it before the name */
     union { struct ient *list; struct cascade_layer *layer; struct css_feature *feature; };
     struct bucket *next;
 };
 
+/* Grows to keep its chains about one bucket long: one sheet can name
+   thousands of classes, and every element looks each of its own up in every
+   sheet bound to its scope. */
 struct htab {
     struct bucket **v;
-    uint32_t cap;
+    uint32_t cap, count;
 };
 struct cascade_layer {
     struct cascade_layer *parent;
@@ -2897,19 +2905,32 @@ static uint32_t hash_str(const char *s) {
 }
 
 static void ht_init(arena_t *a, struct htab *t, uint32_t cap) {
-    t->cap = cap;
+    t->cap = cap; t->count = 0;
     t->v = ar_alloc(a, sizeof(struct bucket *) * cap);
+}
+static void ht_grow(arena_t *a, struct htab *t) {
+    uint32_t cap = t->cap * 2;
+    if (cap <= t->cap) return;
+    struct bucket **v = ar_alloc(a, sizeof *v * cap);
+    for (uint32_t i = 0; i < t->cap; i++)
+        for (struct bucket *b = t->v[i], *next; b; b = next) {
+            next = b->next;
+            b->next = v[b->hash & (cap - 1)];
+            v[b->hash & (cap - 1)] = b;
+        }
+    t->v = v; t->cap = cap;
 }
 
 static struct bucket *ht_bucket(arena_t *a, struct htab *t, const char *key, bool create) {
-    uint32_t h = hash_str(key) & (t->cap - 1);
-    for (struct bucket *b = t->v[h]; b; b = b->next)
-        if (!strcmp(b->key, key)) return b;
+    uint32_t hash = hash_str(key);
+    for (struct bucket *b = t->v[hash & (t->cap - 1)]; b; b = b->next)
+        if (b->hash == hash && !strcmp(b->key, key)) return b;
     if (!create) return NULL;
     struct bucket *b = ar_alloc(a, sizeof *b);
-    b->key = key;
-    b->next = t->v[h];
-    t->v[h] = b;
+    b->key = key; b->hash = hash;
+    b->next = t->v[hash & (t->cap - 1)];
+    t->v[hash & (t->cap - 1)] = b;
+    if (++t->count > t->cap) ht_grow(a, t);
     return b;
 }
 static struct ient **ht_slot(arena_t *a, struct htab *t, const char *key, bool create) {
@@ -3005,6 +3026,8 @@ static void index_rule(arena_t *a, struct css_index *x, const struct rule *r, co
     ie->r = r;
     ie->order = order;
     ie->media = media;
+    memcpy(ie->ancestor_hashes, s->ancestor_hashes, sizeof ie->ancestor_hashes);
+    ie->pseudo = s->pseudo;
     const struct compound *c = s->right;
     const char *id = NULL, *cls = NULL, *tag = NULL;
     for (int i = 0; s->pseudo != PE_SLOTTED && i < c->n; i++) {
@@ -3730,17 +3753,19 @@ void css_motion_tick(web_doc *d,uint64_t now) {
         slot=&s->next;
         if(!s->node || !s->running || now<s->last || now-s->last<16)continue;
         if(doc_node_root(s->node,true)!=d->root){css_motion_reset(s->node);continue;}
-        css_mark_dirty(d,s->node);d->need_style=d->dirty=true;
+        /* A sample changes the element's own values, never what any selector
+           matches: no sibling, ancestor or :has() subject restyles with it. */
+        mark_style_own(d,s->node);d->dirty=true;
     }
 }
-int64_t css_motion_deadline(web_doc *d,uint64_t now) {
+int64_t css_motion_deadline(web_doc *d) {
     if(!d || __atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE))return -1;
     uint64_t deadline=UINT64_MAX;
     for(struct css_motion_state *s=d->css_motions;s;s=s->next)if(s->node && s->running) {
         uint64_t due=s->last>UINT64_MAX-16?UINT64_MAX:s->last+16;
         if(due<deadline)deadline=due;
     }
-    return deadline==UINT64_MAX?-1:deadline<=now?0:(int64_t)(deadline-now);
+    return deadline>(uint64_t)INT64_MAX?-1:(int64_t)deadline;
 }
 int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text) {
     struct css_animation **slot = &n->animations;
@@ -3851,7 +3876,7 @@ static bool element_class_key(const struct element_keys *k, int i, uint32_t *has
 static const struct ient *ht_list(const struct htab *t, const char *key, uint32_t hash) {
     if (!t->cap) return NULL;
     for (const struct bucket *b = t->v[hash & (t->cap - 1)]; b; b = b->next)
-        if (!strcmp(b->key, key)) return b->list;
+        if (b->hash == hash && !strcmp(b->key, key)) return b->list;
     return NULL;
 }
 
@@ -3866,19 +3891,22 @@ static void collect(const struct ient *l, const struct element_keys *k, node_t *
     node_t *e = k->e, *root = k->root;
     web_doc *d = e->owner;
     struct css_scratch *scratch = css_scratch_get();
-    for (; l; l = l->next) {
-        if (k->service) {
-            if (!web_native_checkpoint(d)) return;
-            web_avmedia_checkpoint();
-        } else if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
+    /* A safepoint every 32 candidates: most cost a few loads each. */
+    for (unsigned n = 0; l; l = l->next, n++) {
+        if (n % 32 == 0) {
+            if (k->service) {
+                if (!web_native_checkpoint(d)) return;
+                web_avmedia_checkpoint();
+            } else if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
+        }
         tally->bucket[bucket]++;
         if (!binding->ua) {
             if (!scope && root && root->shadow_host) continue;
-            if (scope && l->sel->pseudo != PE_SLOTTED && root != scope && e != scope->shadow_host) continue;
+            if (scope && l->pseudo != PE_SLOTTED && root != scope && e != scope->shadow_host) continue;
         }
         if (!binding->media_ok[l->media]) continue;
-        if (ancestor_filter_rejects(&k->ancestors, l->sel)) { tally->filtered++; continue; }
-        if (!container_chain_ok(l->r->media,e,l->sel->pseudo==PE_BEFORE || l->sel->pseudo==PE_AFTER)) continue;
+        if (ancestor_filter_rejects(&k->ancestors, l->ancestor_hashes)) { tally->filtered++; continue; }
+        if (!container_chain_ok(l->r->media,e,l->pseudo==PE_BEFORE || l->pseudo==PE_AFTER)) continue;
         /* Only cascade rule matching reads the published form snapshot. Live
            matches()/querySelector() outside this call keep their normal API. */
         bool previous = scratch->form_snapshot;
@@ -3888,7 +3916,7 @@ static void collect(const struct ient *l, const struct element_keys *k, node_t *
         if (matches) {
             struct cascade_layer *layer=binding_layer(binding,l->r->layer);
             add_rule_decls(l->r, l->sel->spec, l->order + binding->order, !binding->ua,
-                           l->sel->pseudo == PE_SLOTTED ? PE_NONE : l->sel->pseudo, depth,layer);
+                           l->pseudo == PE_SLOTTED ? PE_NONE : l->pseudo, depth,layer);
         }
     }
 }
@@ -4928,7 +4956,7 @@ static const struct css_feature *index_feature(const struct css_index *x, int ta
     const struct htab *t = table == FEATURE_ID ? &x->feature_ids : table == FEATURE_CLASS ? &x->feature_classes : &x->feature_attrs;
     if (!t->cap) return NULL;
     for (const struct bucket *b = t->v[hash & (t->cap - 1)]; b; b = b->next)
-        if (!strncmp(b->key, name, length) && !b->key[length]) return b->feature;
+        if (b->hash == hash && !strncmp(b->key, name, length) && !b->key[length]) return b->feature;
     return NULL;
 }
 static void reach_named(web_doc *d, const struct css_scope *scope, int table, const char *name, size_t length,
@@ -5697,18 +5725,6 @@ descend:
             if (ch->type == N_ELEM) cascade_enqueue(c, ch, s);
             else ch->style = NULL;
         }
-    } else if (!css_worker() && children.n >= 8 && d->sty.ctx->parallel_safe) {
-        struct cascade_frontier f = {0};
-        c->frontier = &f;
-        for (int i = 0; i < children.n; i++) {
-            node_t *ch = children.v[i];
-            if (ch->type == N_ELEM) cascade_enqueue(c, ch, s);
-            else ch->style = NULL;
-        }
-        c->frontier = NULL;
-        struct cascade_batch batch = {*c, f.v, f.filters};
-        parallel_for_stage(PARALLEL_STYLE,f.n,cascade_worker,&batch,cascade_service,d);
-        free(f.v); free(f.filters);
     } else {
         for (int i = 0; i < children.n && !__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE); i++) {
             node_t *ch = children.v[i];
@@ -5722,15 +5738,24 @@ descend:
     c->full = inherited_full;
 }
 
-static uint32_t cascade_work_count(web_doc *d, node_t *root) {
+/* The elements a cascade from root restyles, at most: every element below a
+   restyled one, and in a partial cascade the marked ones along their paths.
+   Only those paths are walked, so a small update never costs a document-wide
+   pass. Before the accumulation an element's count is 1 exactly when it is
+   restyled, which is what its children inherit. */
+static uint32_t cascade_work_count(web_doc *d, node_t *root, bool full) {
     pvec nodes = {0}; pv_push(&nodes, root);
     /* Parent-first enumeration, followed by a reverse accumulation, avoids
-       recursive counting on deeply nested flex/DOM chains. This is only done
-       for full cascades; leaf updates never add another document-wide pass. */
+       recursive counting on deeply nested flex/DOM chains. */
     for (int i = 0; i < nodes.n; i++) {
         if (!web_native_checkpoint(d)) { pv_free(&nodes); return 0; }
-        node_t *n = nodes.v[i]; n->style_subtree_work = n->type == N_ELEM;
-        if (n->type == N_ELEM) doc_flat_children(n, &nodes);
+        node_t *n = nodes.v[i], *parent = i ? doc_flat_parent(n) : NULL;
+        n->style_subtree_work = 0;
+        if (n->type != N_ELEM) continue;
+        bool inherited = parent ? parent->style_subtree_work != 0 : full;
+        bool redo = inherited || n->style_dirty || n->style_self_dirty || !n->style;
+        n->style_subtree_work = redo;
+        if (redo || n->style_children_dirty) doc_flat_children(n, &nodes);
     }
     for (int i = nodes.n - 1; i > 0; i--) {
         node_t *n = nodes.v[i], *parent = doc_flat_parent(n);
@@ -5742,7 +5767,7 @@ static uint32_t cascade_work_count(web_doc *d, node_t *root) {
 }
 
 static void cascade_frontier_run(struct cascade *c, node_t *root) {
-    uint32_t total = cascade_work_count(c->d, root);
+    uint32_t total = cascade_work_count(c->d, root, c->full);
     if (__atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE)) return;
     if (total < 128 || !c->d->sty.ctx->parallel_safe) { cascade_node(c, root, NULL); return; }
     struct cascade_frontier f = {0};
@@ -5898,10 +5923,7 @@ void css_cascade(web_doc *d, int vw, int vh) {
     struct cascade c = {.d=d, .rem=d->html && d->html->style ? d->html->style->font_size : 16,
         .vw=vw, .vh=vh, .a=&d->smem, .full=full, .trap=d->smem.trap,
         .ancestor_counts=&ancestors, .ancestors_published=SIZE_MAX};
-    if (d->html) {
-        if (full) cascade_frontier_run(&c, d->html);
-        else cascade_node(&c, d->html, NULL);
-    }
+    if (d->html) cascade_frontier_run(&c, d->html);
     font_bindings_clear();
     sb_free(&c.vbuf);
     d->styled_w = vw;

@@ -749,6 +749,21 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
     out->kind = LK_LEN;
     return true;
 }
+/* A <number>: a number token, or a math function whose type is <number>.
+   calc(20 / 16) is the multiplier 1.25 wherever a number is accepted, never
+   1.25px. */
+static bool parse_number_value(const char *v, size_t n, struct cx *cx, float *out) {
+    trim(&v, &n);
+    const char *q = v;
+    if (parse_number(&q, v + n, out)) return q == v + n;
+    if (!n || !isalpha((unsigned char)v[0])) return false;
+    struct cexpr *x = calc_value(&q, v + n, cx);
+    cskip(&q, v + n);
+    bool number;
+    float pct;
+    return x && q == v + n && !(cx->supports_probe && cx->invalid) && calc_dimension(x, &number) && number &&
+           cfold(x, &number, out, &pct) && number && isfinite(*out);
+}
 
 /* ---------------------------------------------------------------- colours */
 static const struct {
@@ -2685,9 +2700,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         return true;
     }
     case PT_NUM: {
-        const char *q = v;
         float x;
-        if (!parse_number(&q, v + n, &x) || q != v + n || x < 0) return false;
+        if (!parse_number_value(v, n, cx, &x) || x < 0) return false;
         *(float *)field = x;
         return true;
     }
@@ -2696,9 +2710,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     case PT_OPACITY: {
         const char *q = v;
         float x;
-        if (!parse_number(&q, v + n, &x)) return false;
-        if (q < v + n && *q == '%') x /= 100, q++;
-        if (q != v + n) return false;
+        if (parse_number(&q, v + n, &x) && q + 1 == v + n && *q == '%') x /= 100;
+        else if (!parse_number_value(v, n, cx, &x)) return false;
         *(float *)field = x < 0 ? 0 : x > 1 ? 1 : x;
         return true;
     }
@@ -2710,7 +2723,9 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         }
         const char *q = v;
         float x;
-        if (!parse_number(&q, v + n, &x) || q != v + n) return false;
+        bool math = !parse_number(&q, v + n, &x) || q != v + n;
+        if (math && !parse_number_value(v, n, cx, &x)) return false;
+        if (math) x = roundf(x); /* a math function resolves to the nearest integer */
         if (cx->supports_probe && (x != floorf(x) || x > 2147483520.0f || x < -2147483648.0f)) return false;
         *(int *)field = (int)x;
         if (p->type == PT_ZINDEX) s->z_auto = false;
@@ -2727,9 +2742,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
             s->line_height.kind = LK_NORMAL;
             return true;
         }
-        const char *q = v;
         float x;
-        if (parse_number(&q, v + n, &x) && q == v + n) {
+        if (parse_number_value(v, n, cx, &x)) {
             if (x < 0) return false;
             s->line_height.kind = LK_NUMBER;
             s->line_height.px = x;

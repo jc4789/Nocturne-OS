@@ -2170,6 +2170,11 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
        not advertise RTL/bidi layout, which is not implemented yet. */
     else if (!strcmp(property, "direction")) snprintf(out, sizeof out, "ltr");
     else if (!strcmp(property, "font-size")) { px = st->font_size; is_px = true; }
+    /* CSSOM: normal, or the used value. */
+    else if (!strcmp(property, "line-height")) {
+        if (st->line_height.kind == LK_NORMAL) snprintf(out, sizeof out, "normal");
+        else { px = style_line_height(st); is_px = true; }
+    }
     else if (!strcmp(property, "font-family")) return JS_NewString(ctx,st->font_names?st->font_names:st->font_family==FONT_FAMILY_MONO?"monospace":st->font_family==FONT_FAMILY_SANS?"sans-serif":"serif");
     else if (!strcmp(property, "font-weight")) snprintf(out, sizeof out, "%u", st->font_weight);
     else if (!strcmp(property, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);

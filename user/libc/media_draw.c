@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <string.h>
 #include "display_abi.h"
+#include <parallel.h>
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
@@ -27,6 +28,31 @@ static uint32_t blend(uint32_t a,uint32_t b,unsigned weight){
     uint32_t ag=((((a>>8)&0x00ff00ffu)*inverse+((b>>8)&0x00ff00ffu)*weight)>>8)&0x00ff00ffu;
     return rb|(ag<<8);
 }
+/* A large picture is drawn in bands of rows on the parallel pool, a video
+ * frame every few milliseconds. Each band is the same draw clipped to its
+ * rows, and the sampling keeps the whole picture's transform, so the result
+ * does not depend on the split. */
+enum { DRAW_BAND_ROWS = 32 };
+struct draw_bands {
+    const canvas_t *c; uint8_t *cd; const uint32_t *pixels; const uint8_t *deep;
+    int sw, sh, x, y, w, h, top;
+};
+static void draw_band(size_t i, void *context) {
+    const struct draw_bands *j = context;
+    canvas_t band = *j->c;
+    int top = j->top + (int)i * DRAW_BAND_ROWS;
+    if (band.cy0 < top) band.cy0 = top;
+    if (band.cy1 > top + DRAW_BAND_ROWS) band.cy1 = top + DRAW_BAND_ROWS;
+    if (j->deep) nmedia_draw_deep(&band, j->cd, j->pixels, j->deep, j->sw, j->sh, j->x, j->y, j->w, j->h);
+    else nmedia_draw(&band, j->pixels, j->sw, j->sh, j->x, j->y, j->w, j->h);
+}
+static bool draw_in_bands(const canvas_t *c, uint8_t *cd, const uint32_t *pixels, const uint8_t *deep,
+                          int sw, int sh, int x, int y, int w, int h, int64_t x0, int64_t y0, int64_t x1, int64_t y1) {
+    if ((x1 - x0) * (y1 - y0) < 65536 || parallel_active()) return false;
+    struct draw_bands j = {c, cd, pixels, deep, sw, sh, x, y, w, h, (int)y0};
+    parallel_for_stage(PARALLEL_IMAGE_SCALE, (size_t)((y1 - y0 + DRAW_BAND_ROWS - 1) / DRAW_BAND_ROWS), draw_band, &j, NULL, NULL);
+    return true;
+}
 void nmedia_draw(canvas_t *c, const uint32_t *pixels, int sw, int sh, int x, int y, int w, int h) {
     if (!c || !c->px || !pixels || !nmedia_video_size(sw,sh,NULL,NULL) ||
         w <= 0 || h <= 0 || c->w <= 0 || c->h <= 0 || c->pitch < c->w ||
@@ -38,6 +64,7 @@ void nmedia_draw(canvas_t *c, const uint32_t *pixels, int sw, int sh, int x, int
     int64_t x0 = maximum(maximum(dx, c->cx0), 0), y0 = maximum(maximum(dy, c->cy0), 0);
     int64_t x1 = minimum(minimum(dx + dw, c->cx1), c->w), y1 = minimum(minimum(dy + dh, c->cy1), c->h);
     if(x0>=x1||y0>=y1)return;
+    if(draw_in_bands(c,NULL,pixels,NULL,sw,sh,x,y,w,h,x0,y0,x1,y1))return;
     if(dw==sw&&dh==sh){
         if(c->mask_clip){for(int64_t yy=y0;yy<y1;yy++) {
             struct gfx_clip_span span;if(!gfx_clip_row(c,(int)yy,(int)x0,(int)x1,&span))continue;
@@ -144,6 +171,7 @@ void nmedia_draw_deep(canvas_t *c,uint8_t *cd,const uint32_t *pixels,const uint8
     int64_t x0 = maximum(maximum(dx, c->cx0), 0), y0 = maximum(maximum(dy, c->cy0), 0);
     int64_t x1 = minimum(minimum(dx + dw, c->cx1), c->w), y1 = minimum(minimum(dy + dh, c->cy1), c->h);
     if(x0>=x1||y0>=y1)return;
+    if(draw_in_bands(c,cd,pixels,deep,sw,sh,x,y,w,h,x0,y0,x1,y1))return;
     static const unsigned shifts[3][2]={{16,4},{8,2},{0,0}};
     if(dw==sw&&dh==sh){
         for(int64_t yy=y0;yy<y1;yy++){

@@ -1169,9 +1169,9 @@ int64_t web_deadline(web_doc *d) {
     int64_t js = web_js_deadline(d), media = web_avmedia_deadline(d, now);
     int64_t deadline = js < 0 ? media : media < 0 ? js : MIN(js, media);
     if(render>=0 && (deadline<0 || render<deadline))deadline=render;
-    int64_t motion=css_motion_deadline(d,now);
+    int64_t motion=css_motion_deadline(d);
     if(motion>=0 && (deadline<0 || motion<deadline))deadline=motion;
-    int64_t marquee=web_marquee_deadline(d,now);
+    int64_t marquee=web_marquee_deadline(d);
     if(marquee>=0 && (deadline<0 || marquee<deadline))deadline=marquee;
     int64_t frames=web_frames_deadline(d);
     if(frames>=0 && (deadline<0 || frames<deadline))deadline=frames;
