@@ -131,7 +131,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C47 | 構成空間の保護は Command と BAR だけで足りる | 却下 → 修理済み | ABI 文書 §9 の一覧（BIST、Interrupt Line、PMCSR、DevCtl、LinkCtl／2、ReBAR、SR-IOV、ACS・ATS・PRI・PASID）。読んで一部を変えて書き戻すなら通る。ブリッジは claim できない |
 | C48 | IOMMU で DMA を隔離している | 却下 → 修理済み | AMD-Vi（`iommu_amd.c`）と VT-d（`iommu_intel.c`）のドライバー、共通層は `iommu.c`。claim した装置は専用のドメインに入り、その claim の DMA オブジェクト（作成から解放まで、解放はユニットの確認の後）とファームウェアの予約範囲（IVMD・RMRR）だけへ届く。割り込みは再マップ表で claim のベクターだけ。claim の終了で遮断。要求元 ID を他と共有する装置は `N_ERR_BUSY`。隔離は `N_PCI_ISOLATED` でアプリに見える。詳細は ABI 文書 §9 |
 | C49 | claim の時に BAR の大きさを測ってよい | 却下 → 修理済み | 測るとメモリデコードを切るので、起動時の画面がその BAR にあると壊れる。大きさは列挙時の値（`pci_bar_size`）を使う |
-| C50 | 起動時の画面を持つ GPU は `primary_vga` | 却下 → 修理済み | `primary_vga` は VBIOS を通す旧 VGA の画面を意味し、RM は x86emu のために `0xA0000` と option ROM を写そうとする（実機 3 回目で停止）。Nocturne は VGA を使わない。起動画面は `nv_get_screen_info` が返す線形フレームバッファーで、RM はそれを client-managed console として保ち、`RmDeterminePrimaryDevice` で主装置にもなる。`primary_vga` は常に偽、`console_device` はフレームバッファーの BAR があるとき真 |
+| C50 | 起動時の画面を持つ GPU は `primary_vga` | 却下 → 修理済み | `primary_vga` は VBIOS を通す旧 VGA の画面を意味し、RM は x86emu のために `0xA0000` と option ROM を写そうとする（実機 3 回目で停止）。Nocturne は VGA を使わない。起動画面は `nv_get_screen_info` が返す線形フレームバッファーで、RM はそれを client-managed console として保ち、`RmDeterminePrimaryDevice` で主装置にもなる。`primary_vga` は常に偽。`console_device` は移植側で設定していたが、C61 で RM 自身（`rm_init_dynamic_power_management`）が決めるように戻した |
 | C52 | RM の能力（`nv-caps`）は無くてよい | 却下 → 修理済み | `_sysCreateOs: RM Access Sys Cap creation failed: 0x56` は能力の根が無いための `NV_ERR_NOT_SUPPORTED`。`os_caps.c` が能力の木を持ち、ファイルの代わりに接続の権利で判定する |
 | C53 | RM が初期化すれば画面は GPU が出す | 却下 → 実装（実機未確認） | RM は表示エンジンを組まない（それは NVKMS の役）。nvrm に NVKMS を移植し（`nvkms.mk`、`nvkms_os.c`、KAPI の客 `display.c`）、`GPU started` の後にモード設定・VRAM の面・`n_pci_give_screen`・帰線の転送まで行う。カーネルは `fb.c` の出力先を切り替え、`wm.c` が帰線で描き始める。QEMU では NVIDIA が無いので、カーネル側の ABI だけを pcitest（VGA の BAR を面にする）で確かめた。2026-10-24 監査：フリップの完了の待ちが働いていなかった（C56）、デスクトップへ戻すフリップの失敗で画面が黒いまま残った（C57） |
 | C54 | ACPI（`_DSM`、`_ROM`、`_DOD`、`_DDC`、MUX、Notify）は非対応で返してよい | 却下 → 実装（実機未確認） | 実機の notebook・GPS・JT は `_DSM` を要る。カーネルの uACPI で claim の範囲（機能の装置・その子・上流のブリッジ）だけを評価する `n_pci_acpi_eval` と `n_pci_acpi_notify_take`（ABI 文書 §9）。`os_acpi.c` は nv-acpi.c の移植。claim の外（`_PSR`、電池、NPCF、NVIF／WMMX）は非対応のまま。2026-10-24 訂正：claim の範囲なら何でも評価できたのは誤り、通知のスレッドの止め方はデッドロックしえた（C59） |
@@ -141,7 +141,8 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C58 | pager ABI の取消しと `n_memory_protect` は供給したページにも効く | 却下 → 修理済み | 供給元の view を `n_shared_revoke` しても枠は結ばれたまま残り、`n_memory_protect(READ)` の後もページャーの経路で書けた。今は各ページが供給元を持ち、その取消し（祖先を含む）で全写像から外す（`paged_revoke`、composite は供給元にならない）。保護は写像ごと・ページごとに覚え、後の障害や再供給でも超えない。共有の写像への実行権は与えない（別の写像から書けるページを実行できたため）。pagertest に試験を追加。QEMU の結果は §7 |
 | C59 | ACPI の評価は claim の範囲なら何でもよく、通知のスレッドは RM の ACPI の初期化と終わりで開始・停止してよい | 却下 → 修理済み（実機未確認） | 範囲の中でも `_PS0`〜`_PS3`、`_ON_`、`_OFF`、`_RST`、`_EJ0`〜`_EJ4`、`_OSC`、`_INI`、`_REG`、`_PTS`、`_WAK` などシステムが装置と機械を動かす 28 の方法は、カーネルの電源管理と PCI の把握を裏から変える。今は `N_ERR_DENIED`（上流のブリッジは独自名もすべて）。通知のスレッドは `nv_acpi_methods_uninit`（RM の API と GPU の錠を持ったまま）で join していたので、`rm_acpi_notify` で錠を待つスレッドと互いに待ちえた。今は `nv_start_device` と同じく `rm_init_adapter` の後に開始し、`rm_request_dnotifier_state` を呼び、`rm_disable_adapter` の前に錠の外で止める。RM が扱わない値は渡さない（RM は表明で止まる）。pcitest に拒否の試験 |
 | C60 | 直接表示の間も、パニック画面はカーネルの出力先へ描けば見える | 却下 → 修理済み（実機未確認） | 直接表示の間、表示エンジンはアプリの絵を出していて、カーネルが止まると戻す者がいない。カーネルはデスクトップの面にしか描かないので、パニックは画面に出なかった。新しい ABI `n_pci_screen_image`／`_end`（ABI 文書 §9）で、nvrm は絵の BAR1 の写しを登録し、カーネルはパニック画面を登録された面すべてへも描く（`fb.c` の `fb_present_last`、`N_SCANOUT_XBGR8888`）。登録できない絵は作らない。確認：host 試験（登録できないとき・BAR1 のひと続きでないときに絵を作らない）、QEMU の pcitest（登録・終わり・拒否）、QEMU で NMI によるパニックを目視（VGA の第二のバッファーを XBGR8888 の画像として登録して表示、パニック画面がそこに赤と青の入れ替わった色で描かれ、デスクトップの面には元の色で描かれる。§7） |
-| C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る |
+| C61 | 動的電源管理は移植しなくても、mode が NEVER なら RM は電源管理の状態に触れない | 却下 → 修理済み（実機未確認） | 実機 4 回目、`RmInitAdapter` と GSP の起動は成功したが、NVKMS の読込みの直後に nvrm がページフォールトで落ちた（`rip=0x708784` は `portSyncMutexAcquire`、呼出し元 `0x46ef16` は `RmUpdateGc6ConsoleRefCount`、記号は同じ材料を `-s` 無しで再リンクして引いた）。NVKMS が画面を取るときの VT 切替え（`NV0080_CTRL_OS_UNIX_VT_SWITCH`、SAVE_VT_STATE）は、mode を見ずに `console_device` が真なら電源管理の錠を取る。錠を作る `rm_init_dynamic_power_management` を移植が呼んでおらず、一方で `os_pci.c` が `console_device` を真にしていたので、NULL の錠を取った。修理：`nvrm.c` で上流の probe／remove と同じ位置に `rm_init_dynamic_power_management`（`rm_init_private_state` と `rm_init_event_locks` の後）、`rm_enable_dynamic_power_management`（probe の最後、割り込みと `rm_init_adapter` の前）、`rm_cleanup_dynamic_power_management`（NVKMS と `rm_shutdown_adapter` の後、`rm_free_private_state` の前）を呼ぶ。`console_device` は RM が起動画面（`nv_get_screen_info`）から決める（`os_pci.c` の設定を外した）。`nv_dynamic_power_available` は偽なので mode は NEVER のままで、GPU を止めることは無い。確認：host 試験、全体ビルド、記号付きの再リンクの逆アセンブルで呼出しの順を確かめた。QEMU には NVIDIA の GPU が無く、この経路は通らない |
+| C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る。実機 4 回目：BME を入れてから nvrm が落ちて解放されるまで（`RmInitAdapter` の 5.1 秒を含む）、IOMMU の遮断の行は一つも無かった |
 
 ## 5. 担当と受け渡し
 
@@ -153,7 +154,8 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 6. 次の一手
 
-1. P10（ユーザー）：RTX 4070 の実機で起動し、システムログの nvrm（GSP 起動）、画面が NVKMS の面へ移るか
+1. P10（ユーザー）：RTX 4070 の実機で起動し（5 回目。4 回目は GSP の起動まで成功し、NVKMS の VT 切替えで
+   落ちた。C61 の修理で越えるか）、システムログの nvrm（GSP 起動）、画面が NVKMS の面へ移るか
    （`NVRM display:`・`wm:`・`fb:` の行、起動後に画面が動き続けるか、C53）と、ブラウザーの WebGL が
    Zink で動くか（失敗ならログの `ZINK:`／`nvkmd`／RM の状態名）を見る。全画面の直接表示では、
    フリップの完了が届くか（C56：`NVRM display:` に「the flip on head … has not completed」の行が
@@ -166,6 +168,20 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
+- 2026-10-24（5）：実機 4 回目（ユーザー、USB 起動、IOMMU 有効）。画面は固まり続けなくなった。USB の C: から
+  `build/host/store.exe`（管理者、読むだけの `list`・`get`・`check`）で System.log と nvrm.log を
+  `build/qa/realhw4/` へ取り出した（`check` は 0 problems）。結果：GSP の起動と `RmInitAdapter` が初めて成功した
+  （5136 ms、「GPU started: NVIDIA GeForce RTX 4070」、VBIOS 95.04.3e.c0.82）。続く NVKMS の読込みの直後、
+  VT 切替えの `RmUpdateGc6ConsoleRefCount` が NULL の電源管理の錠を取って nvrm が落ち、カーネルが claim を
+  解放してソフトウェア描画へ戻った（C61）。BME の後の IOMMU の遮断は今回は無し（C51）。
+  修理：動的電源管理の初期化・有効化・後始末を上流の位置で呼び、`console_device` を RM に決めさせる（C61）。
+  上流 kernel-open が呼ぶ RM の入口のうち移植が呼ばないものも洗い直した。残りは Tegra、NUMA、vGPU、
+  suspend、BAR の防火壁（GB100 系だけ）、GSP の客では何もしない `rm_isr_bh_unlocked`、NVML 向けの GPU 追加の通知など、
+  RTX 4070 の起動で RM が状態を求めないもの。
+  確認：host 試験（nvrm_dma_hosttest.py の全件）、全体ビルド（IMG・VHD・VHDX・ISO）、媒体の nvrm がビルドと
+  一致、記号付きの再リンク（`build/qa/realhw5/nvrm.sym`、strip すると媒体と同じ配置）の逆アセンブルで呼出しの順。
+  QEMU には NVIDIA の GPU が無く、nvrm はこの経路を通らないので QEMU では確かめていない。実機（5 回目）で NVKMS が
+  VT 切替えを越えて画面を GPU の面へ移すか（`NVRM display:`・`wm:` の行）を見る。
 - 2026-10-24（4）：8acc1589 と b13cfa79 の監査（実機を傷めうるもの、論理が誤っているもの）と修理。致命的 1 件：
   フリップの完了の待ちが NULL の関数に頼り、待っていなかった（C56）。重大 7 件：デスクトップへ戻すフリップの失敗で
   黒いまま（C57）、pager ABI の取消しの迂回と保護の迂回（C58）、ACPI の方法の無制限な評価と通知のスレッドの

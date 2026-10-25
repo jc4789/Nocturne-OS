@@ -374,9 +374,10 @@ NV_STATUS nvrm_pci_attach(void) {
     /* primary_vga means the legacy VGA console that RM reaches through the VBIOS (x86emu over
        0xA0000 and the option ROM). Nocturne never uses VGA: its boot screen is the linear
        framebuffer nv_get_screen_info reports, which RM preserves as a client-managed console and
-       which makes the GPU the primary device all the same (RmDeterminePrimaryDevice). */
+       which makes the GPU the primary device all the same (RmDeterminePrimaryDevice).
+       console_device is RM's own: rm_init_dynamic_power_management sets it from the same
+       screen, together with the power mutex that every use of it takes. */
     nv->primary_vga = NV_FALSE;
-    nv->console_device = g->framebuffer_bar != N_PCI_NONE;
 
     pci_apertures(g, nv);
     nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];

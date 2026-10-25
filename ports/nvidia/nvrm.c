@@ -6,7 +6,8 @@
  * (nvrm_serve.c) to other apps:
  *
  *   options (NVRM_REGISTRY_DWORDS) -> rm_init_rm -> n_pci_info / BAR0 -> rm_is_supported_device
- *   -> rm_init_private_state -> interrupts -> rm_init_adapter (GSP firmware boots here)
+ *   -> rm_init_private_state -> dynamic power management -> interrupts -> rm_init_adapter
+ *   (GSP firmware boots here)
  *   -> ACPI notifications (os_acpi.c) -> rm_get_device_name -> NVKMS (nvkms_os.c) and the
  *   screen (display.c) -> UVM (uvm_rm.c) -> nvrm_serve
  *
@@ -119,6 +120,7 @@ static const char *status_text(NV_STATUS s) {
 }
 
 static bool events_ready;   /* rm_init_event_locks ran on the control device */
+static bool power_ready;    /* rm_init_dynamic_power_management ran */
 
 /* While rm_init_adapter runs (GSP boot prints nothing when it goes well), a line every
    PROGRESS_MS tells a stuck start from a slow one, and says whether interrupts arrive. */
@@ -245,6 +247,14 @@ static bool bring_up(void) {
         return false;
     }
     events_ready = true;
+    /* Dynamic power management, as the original's probe (nv_init_dynamic_power_management):
+       RM creates the power mutex, sets the refcount to 1 and decides console_device from the
+       boot screen (nv_get_screen_info). NVKMS's VT switch takes that mutex whenever
+       console_device is set, whatever the mode. Nocturne offers no runtime D3
+       (nv_dynamic_power_available), so the mode is NEVER and whether the upstream port has
+       _PR3 changes nothing. */
+    rm_init_dynamic_power_management(sp, nv, NV_FALSE);
+    power_ready = true;
     /* The rest of the original's probe: the UUID, the per-device options, the firmware, and
        the exclusion lists (NVreg_ExcludeAllGpus, NVreg_ExcludedGpus), which keep the GPU from
        being started. */
@@ -254,6 +264,9 @@ static bool bring_up(void) {
         nvrm_log("NVRM: the per-device options are not valid: %s (0x%x)", status_text(st), (unsigned)st);
     rm_set_rm_firmware_requested(sp, nv);
     if (excluded(sp, nv)) return false;
+    /* The last step of the original's probe: with runtime D3 an unused GPU that drives no
+       console could now power off. With the mode NEVER it changes nothing. */
+    rm_enable_dynamic_power_management(sp, nv);
 
     if (!nvrm_irq_thread_start()) return false;
 
@@ -308,6 +321,10 @@ static void tear_down(void) {
     nvrm_timers_stop();
     nvrm_work_stop();
     if (d->sp) {
+        /* After NVKMS (whose VT switch takes the power mutex) and the adapter, before the
+           private state, as the original's remove. */
+        if (power_ready) rm_cleanup_dynamic_power_management(d->sp, &d->nv);
+        power_ready = false;
         rm_free_private_state(d->sp, &d->nv);
         if (events_ready) rm_destroy_event_locks(d->sp, &nvrm_ctl_state);
         events_ready = false;

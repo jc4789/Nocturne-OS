@@ -32,11 +32,17 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 
 起動手順（`nvrm.c`）：init が `N_KIND_PCI` をハンドル 3 で渡す → `n_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
 `NVRM_REGISTRY_DWORDS`（環境変数、任意）を `rm_parse_option_string` へ → `rm_init_rm` → `rm_is_supported_device`
-→ `rm_init_private_state` → `rm_init_event_locks` → `rm_set_rm_firmware_requested` → 割り込みスレッド
+→ `rm_init_private_state` → `rm_init_event_locks` → `rm_init_dynamic_power_management`
+→ `rm_set_rm_firmware_requested` → 除外の確かめ → `rm_enable_dynamic_power_management` → 割り込みスレッド
 → `rm_init_adapter`（ここで GSP が起動する）→ ACPI の Notify の受取り（`nvrm_acpi_notify_start`）→
 `rm_request_dnotifier_state` → `rm_get_device_name` をログへ → `nvrm_serve()`。
 `rm_init_adapter` が失敗しても、診断のためにサーバーは動かし続ける（ログに失敗を残す）。
 後始末（`tear_down`）は Notify の受取りを `rm_disable_adapter` より前に止める（上流の `nv_stop_device` と同じ順）。
+`rm_cleanup_dynamic_power_management` は NVKMS と `rm_shutdown_adapter` の後、`rm_free_private_state` の前（上流の remove と同じ順）。
+動的電源管理の三つは上流の probe／remove と同じ位置で呼ぶ。RM はここで電源管理の錠を作り、参照数を 1 にし、
+`console_device` を起動画面（`nv_get_screen_info`）から決める。NVKMS が画面を取るときの VT 切替え
+（`NV0080_CTRL_OS_UNIX_VT_SWITCH`）は、mode を問わず `console_device` が真ならこの錠を取るので、
+初期化を飛ばすと NULL の錠で nvrm が落ちる（実機 4 回目、LEDGER C61）。`console_device` は移植側では設定しない。
 RM は `nv_acpi_methods_init`／`_uninit` を `rm_init_adapter`／`rm_shutdown_adapter` の中で API ロックと GPU
 ロックを持ったまま呼び、`rm_acpi_notify` は同じロックを取るので、そこでスレッドを join するとデッドロックしうる。
 そのため受取りスレッドの開始と join は `nvrm.c` が RM のロックの外で行い、`nv_acpi_methods_init`／`_uninit` は
@@ -200,7 +206,8 @@ PCI claimは既定でDMA隔離を必須とする。管理者が`appdrivers-uniso
 `N_PCI_NEEDS_RECOVERY`がある場合、nvrmは未回復をログに残してRMの初期化へ進む。
 起動画面GPUのgeneric FLRやscanoutの再建を行ったという意味ではなく、実GPUの回復は別途受入が必要。
 - **仮想化**（vGPU、GRID、VFIO）、**cgroup**、**IMEX チャンネル**（複数ノードの NVLink 構成）。能力は `os_caps.c` が接続の権利で判定する（ファイルは無い）。
-- **電源管理**（ランタイムサスペンド、S0ix、動的電源）：未対応。`nv_revoke_gpu_mappings` は、fault 時復元を伴う一時失効を提供できないため、状態・既存写像を変えず `NV_ERR_NOT_SUPPORTED` を返す。永久取消で代用しない。`safe_to_mmap` は独立した新規写像の許可状態で、取消完了の報告とは混同しない。
+- **電源管理**（ランタイムサスペンド、S0ix、動的電源）：未対応。動的電源管理の初期化・有効化・後始末は上流の位置で呼ぶが、
+  `nv_dynamic_power_available` が偽なので mode は常に NEVER で、GPU を止めることは無い（上流のポートの `_PR3` も調べない）。`nv_revoke_gpu_mappings` は、fault 時復元を伴う一時失効を提供できないため、状態・既存写像を変えず `NV_ERR_NOT_SUPPORTED` を返す。永久取消で代用しない。`safe_to_mmap` は独立した新規写像の許可状態で、取消完了の報告とは混同しない。
 - **イベント**：`nv_post_event` はクライアント（`struct nvrm_file`）ごとのキューに積み、`nv_get_event`（`NV_ESC_RM_GET_EVENT_DATA`）で取り出す。プロトコルは要求・応答なのでクライアントがポーリングし、プッシュ通知は無い。`nv_get_file_private` は無し（記述子が無い）。
 - **ファイル**（`os_allocate_temporary_file` など）：ページアウト用。無い。
 
