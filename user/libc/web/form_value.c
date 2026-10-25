@@ -595,6 +595,7 @@ void web_select_attribute_changed(web_doc *d, node_t *node, const char *name, bo
             }
         }
         web_select_sync(d, node, true);
+        css_mark_form_state(d, node); /* checkedness, and :invalid's placeholder option */
     } else if (html_tag(node, T_option)) {
         if (!strcmp(name, "selected") && !node->selected_set) web_option_set_selected(d, node, present, false);
         else if (!strcmp(name, "disabled")) {

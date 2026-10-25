@@ -1315,6 +1315,12 @@ void web_avmedia_service(uint64_t now){
 }
 void web_avmedia_checkpoint(void){
     if(!streams||native_depth||service_running)return;
+    /* Rule matching and tree walks reach a safepoint every few hundred
+       nanoseconds, so reading the clock at each one cost more than the work
+       between them. Every 16th still reads it well inside the 1-5 ms supply
+       interval; a racing count only moves which safepoint reads it. */
+    static unsigned skipped;
+    if((++skipped&15u)!=0)return;
     web_avmedia_service(uptime_ms());
 }
 void web_avmedia_snapshot_begin(web_doc *d) {

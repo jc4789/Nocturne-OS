@@ -252,6 +252,13 @@ struct sheet {
     sheet_t *import_parent,*import_first,*import_last,*import_next;
     const struct css_rule_info *import_owner;
     const char *href; /* instance request URL for DevTools; NULL: inline */
+    /* The parsed AST every instance shares, the arena that owns it, its
+       identity across rescans (never reused, unlike its address), and its
+       rule index, built at its first cascade. */
+    sheet_t *ast;
+    arena_t *arena;
+    uint64_t serial;
+    struct css_index *index;
 };
 
 struct pctx {
@@ -2301,10 +2308,13 @@ void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_ru
 }
 
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
+    static uint64_t serials;
     struct pctx pc = {a, NULL, base_url, imports, 0, false, 0};
     pc.import_allowed=true;
     pc.sh = ar_alloc(a, sizeof(sheet_t));
     pc.sh->order = order;
+    pc.sh->ast = pc.sh; pc.sh->arena = a;
+    pc.sh->serial = __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED);
     size_t cn;
     char *c = strip_comments(a, css, n, &cn);
     pc.sh->cssom_source = c; pc.sh->cssom_length = cn;
@@ -2728,13 +2738,14 @@ struct ient {
     const struct selector *sel;
     const struct rule *r;
     uint32_t order;
-    bool ua;
+    uint32_t media; /* 0: unconditional; else its rule's @media is css_index.media[media - 1] */
     struct ient *next;
 };
 
+struct css_feature;
 struct bucket {
     const char *key;
-    union { struct ient *list; struct cascade_layer *layer; };
+    union { struct ient *list; struct cascade_layer *layer; struct css_feature *feature; };
     struct bucket *next;
 };
 
@@ -2753,26 +2764,33 @@ struct layer_sheet_map {
     struct layer_sheet_map *next;
 };
 
+/* One sheet AST's rules, by what an element must carry to match them. It does
+   not depend on the viewport: a binding evaluates the rules' @media. */
 struct css_index {
     struct htab ids, classes, tags;
     struct ient *univ;
-    const struct rule *source;
     struct font_face *fonts;
     struct opacity_keyframes *motions;
-    bool ua;
     uint32_t rules;
     unsigned form_features;
-    bool containers;
+    bool containers, siblings;
+    const struct mcond **media; /* the distinct @media of its rules */
+    uint32_t nmedia, media_cap;
     struct css_index *relational; /* subject-key index; never collected as style declarations */
     struct css_index *child_list_subjects; /* parent state can affect its outer siblings */
     struct css_index *child_list_parents; /* own state changed by a child-list mutation */
     struct css_index *child_list_siblings[4]; /* position, sibling combinator or sibling :has witness, by enum sibling_reach bit */
     bool relational_siblings;
-    struct css_index *next;
+    /* What changing a class, id, attribute or dynamic state can restyle */
+    struct htab feature_ids, feature_classes, feature_attrs;
+    struct css_feature *feature_states[CSS_STATES];
 };
+/* An index applied in one scope at one place of the cascade order. */
 struct css_binding {
     struct css_index *index;
+    const bool *media_ok; /* by ient.media, for this cascade's viewport */
     uint32_t order;
+    bool ua;
     struct css_binding *next;
     struct layer_sheet_map *layers;
 };
@@ -2782,9 +2800,23 @@ struct css_scope {
     struct css_scope *next;
     struct cascade_layer layers;
 };
+/* What a binding list was built from, one per sheet instance in cascade order:
+   a rescan that rebuilds the same list keeps the bindings. */
+struct sheet_signature {
+    uint64_t serial;
+    const node_t *scope;
+    const char *media;
+    int import_parent; /* its position in the list; -1: a root sheet */
+    const struct css_rule_info *import_owner;
+    bool ua;
+};
+struct index_media { const struct css_index *index; const bool *ok; struct index_media *next; };
 struct css_ctx {
     arena_t a;
-    struct css_index *indexes[256];
+    struct sheet_signature *sheets;
+    int nsheets;
+    bool complete; /* not cancelled while it was built */
+    struct index_media *media[64];
     struct css_scope *scopes;
     struct css_binding *ua;
     struct cascade_layer ua_layers;
@@ -2966,13 +2998,13 @@ static int layer_compare(struct cascade_layer *a,struct cascade_layer *b) {
     return x->order>y->order?1:-1;
 }
 
-static void index_rule(arena_t *a, struct css_index *x, const struct rule *r, const struct selector *s, uint32_t order, bool ua) {
+static void index_rule(arena_t *a, struct css_index *x, const struct rule *r, const struct selector *s, uint32_t order, uint32_t media) {
     if (s->pseudo == PE_OTHER) return;
     struct ient *ie = ar_alloc(a, sizeof *ie);
     ie->sel = s;
     ie->r = r;
     ie->order = order;
-    ie->ua = ua;
+    ie->media = media;
     const struct compound *c = s->right;
     const char *id = NULL, *cls = NULL, *tag = NULL;
     for (int i = 0; s->pseudo != PE_SLOTTED && i < c->n; i++) {
@@ -3093,7 +3125,7 @@ static unsigned index_child_list_subjects_inner(arena_t *a,struct css_index *ind
             ht_init(a,&(*target)->classes,32);
             ht_init(a,&(*target)->tags,16);
         }
-        index_rule(a,*target,NULL,subject,0,false);
+        index_rule(a,*target,NULL,subject,0,0);
         if(!sibling)break;
     }
     return sensitive;
@@ -3102,7 +3134,207 @@ static void index_child_list_subjects(arena_t *a,struct css_index *index,const s
     index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_OUTER);
 }
 
-static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
+/* What changing one class, id, attribute or dynamic state of an element can
+   restyle, from where selectors name it. A selector relates an element only to
+   its descendants and to its following siblings' subtrees (:has() looks the
+   other way and keeps its own invalidator), so the parent's subtree bounds
+   every reach. Which of those it is follows from the combinator right of the
+   compound that names the feature: a descendant or child combinator keeps the
+   subject inside the element's subtree (a sibling of a descendant is one too),
+   a sibling combinator moves it to the following siblings or their subtrees. */
+enum {
+    REACH_SELF = 1,        /* in a subject compound: the element itself */
+    REACH_DESCENDANTS = 2, /* descendants carrying a key */
+    REACH_SUBTREE = 4,     /* the same, but some subject carries no key: every descendant */
+    REACH_PARENT = 8,      /* in a complex or positional argument, or a keyless sibling subject */
+    REACH_SIBLINGS = 16,   /* following siblings carrying a key */
+    REACH_SIBLING_DESCENDANTS = 32, /* descendants of following siblings carrying a key */
+    REACH_KEYS_OVERFLOW = 64,       /* more keys than FEATURE_KEYS: a keyed reach takes its whole bound */
+};
+#define REACH_KEYED (REACH_DESCENDANTS | REACH_SIBLINGS | REACH_SIBLING_DESCENDANTS)
+/* An id, class, type or attribute name that a subject compound requires (SK_*);
+   a known type also keeps its tag, which is how match_compound tests it. */
+struct feature_key { const char *name; uint32_t hash; uint16_t tag; uint8_t kind; };
+/* Past this many keys a walk would cost as much as restyling the subtree. */
+#define FEATURE_KEYS 64
+struct css_feature { unsigned reach, nkeys, cap; struct feature_key *keys; };
+
+static bool feature_key_equal(const struct feature_key *a, const struct feature_key *b) {
+    return a->kind == b->kind && a->hash == b->hash && !strcmp(a->name, b->name);
+}
+static void feature_note(arena_t *a, struct css_feature **slot, unsigned reach, const struct feature_key *key) {
+    struct css_feature *f = *slot;
+    if (!f) f = *slot = ar_alloc(a, sizeof *f);
+    if ((reach & REACH_KEYED) && !key) reach = reach == REACH_DESCENDANTS ? REACH_SUBTREE : REACH_PARENT;
+    f->reach |= reach;
+    if (!(reach & REACH_KEYED) || (f->reach & REACH_KEYS_OVERFLOW)) return;
+    for (unsigned i = 0; i < f->nkeys; i++) if (feature_key_equal(&f->keys[i], key)) return;
+    if (f->nkeys == FEATURE_KEYS) { f->reach |= REACH_KEYS_OVERFLOW; return; }
+    if (f->nkeys == f->cap) {
+        unsigned cap = f->cap ? f->cap * 2 : 4;
+        struct feature_key *keys = ar_alloc(a, cap * sizeof *keys);
+        if (f->nkeys) memcpy(keys, f->keys, f->nkeys * sizeof *keys);
+        f->keys = keys; f->cap = cap;
+    }
+    f->keys[f->nkeys++] = *key;
+}
+static struct css_feature **feature_slot(arena_t *a, struct htab *t, const char *name) {
+    return &ht_bucket(a, t, name, true)->feature;
+}
+static bool subject_key(const struct compound *c, struct feature_key *key) {
+    static const uint8_t preference[] = {SK_ID, SK_CLASS, SK_TAG, SK_ATTR};
+    for (size_t p = 0; p < sizeof preference; p++)
+        for (int i = 0; i < c->n; i++)
+            if (c->s[i].kind == preference[p]) {
+                *key = (struct feature_key){c->s[i].name, hash_str(c->s[i].name), c->s[i].tag, preference[p]};
+                return true;
+            }
+    return false;
+}
+static void index_compound_features(arena_t *a, struct css_index *x, const struct compound *c, unsigned reach,
+                                    const struct feature_key *key) {
+    for (int i = 0; i < c->n; i++) {
+        const struct simple *s = &c->s[i];
+        struct css_feature **slot = NULL;
+        if (s->kind == SK_ID) slot = feature_slot(a, &x->feature_ids, s->name);
+        else if (s->kind == SK_CLASS) slot = feature_slot(a, &x->feature_classes, s->name);
+        else if (s->kind == SK_ATTR) slot = feature_slot(a, &x->feature_attrs, s->name);
+        else if (s->kind == SK_PC && s->pc == PC_HOVER) slot = &x->feature_states[CSS_STATE_HOVER];
+        else if (s->kind == SK_PC && s->pc == PC_ACTIVE) slot = &x->feature_states[CSS_STATE_ACTIVE];
+        else if (s->kind == SK_PC && (s->pc == PC_FOCUS || s->pc == PC_FOCUS_WITHIN)) slot = &x->feature_states[CSS_STATE_FOCUS];
+        if (slot) feature_note(a, slot, reach, key);
+        if (!s->args || (s->kind == SK_PC && s->pc == PC_HAS)) continue;
+        bool alternatives = s->kind == SK_PC && (s->pc == PC_NOT || s->pc == PC_IS);
+        for (int k = 0; k < s->args->n; k++) {
+            const struct compound *arg = s->args->v[k]->right;
+            /* A compound alternative names this same element. A complex one,
+               nth-child's "of S" or ::slotted() names others. */
+            if (alternatives && !arg->left) index_compound_features(a, x, arg, reach, key);
+            else for (const struct compound *part = arg; part; part = part->left)
+                index_compound_features(a, x, part, REACH_PARENT, NULL);
+        }
+    }
+}
+static void index_features(arena_t *a, struct css_index *x, const struct compound *right) {
+    struct feature_key key;
+    bool keyed = subject_key(right, &key);
+    unsigned reach = REACH_SELF;
+    for (const struct compound *c = right; c; c = c->left) {
+        index_compound_features(a, x, c, reach, keyed ? &key : NULL);
+        if (c->comb != '+' && c->comb != '~') reach = REACH_DESCENDANTS;
+        else if (reach & (REACH_SELF | REACH_SIBLINGS)) reach = REACH_SIBLINGS;
+        else reach = REACH_SIBLING_DESCENDANTS;
+    }
+}
+
+static uint32_t index_media(arena_t *a, struct css_index *x, const struct mcond *m) {
+    if (x->nmedia == x->media_cap) {
+        uint32_t cap = x->media_cap ? x->media_cap * 2 : 8;
+        if (cap <= x->media_cap) ar_alloc(a, SIZE_MAX);
+        const struct mcond **media = ar_alloc(a, (size_t)cap * sizeof *media);
+        if (x->nmedia) memcpy(media, x->media, x->nmedia * sizeof *media);
+        x->media = media; x->media_cap = cap;
+    }
+    x->media[x->nmedia++] = m;
+    return x->nmedia;
+}
+/* NULL when cancelled: a partial index is never published to the AST. */
+static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
+    arena_t *a = s->arena;
+    struct css_index *index = ar_alloc(a, sizeof *index);
+    index->fonts = s->fonts; index->motions = s->motions;
+    /* Small component sheets no longer allocate a document-sized hash
+       table, nor duplicate selector entries for every adoption. */
+    ht_init(a, &index->ids, 64);
+    ht_init(a, &index->classes, 128);
+    ht_init(a, &index->tags, 64);
+    ht_init(a, &index->feature_ids, 32);
+    ht_init(a, &index->feature_classes, 128);
+    ht_init(a, &index->feature_attrs, 32);
+    /* The rules of one @media block share its condition and are adjacent. */
+    const struct mcond *last = NULL; uint32_t media = 0;
+    for (struct rule *r = s->first; r; r = r->next, index->rules++) {
+        if (!web_native_checkpoint(d)) return NULL;
+        for(const struct mcond *m=r->media;m;m=m->up)if(m->container)index->containers=true;
+        for(int k=0;k<r->ndecls;k++)if(container_units_used(r->decls[k].value))index->containers=true;
+        if (!r->ndecls) continue;
+        if (r->media != last) { last = r->media; media = last ? index_media(a, index, last) : 0; }
+        for (int k = 0; k < r->sel->n; k++) {
+            for (const struct compound *part = r->sel->v[k]->right; part; part = part->left)
+                if (compound_has(part)) {
+                    if (!index->relational) {
+                        index->relational = ar_alloc(a, sizeof *index->relational);
+                        ht_init(a, &index->relational->ids, 16);
+                        ht_init(a, &index->relational->classes, 32);
+                        ht_init(a, &index->relational->tags, 16);
+                    }
+                    struct selector *subject = ar_alloc(a, sizeof *subject); subject->right = (struct compound *)part;
+                    index_rule(a, index->relational, NULL, subject, 0, 0);
+                    index->relational_siblings |= compound_has_siblings(part);
+                }
+            index->form_features |= selector_form_features(r->sel->v[k]->right);
+            if(selector_siblings(r->sel->v[k]->right)) {
+                index->siblings=true;
+                for(const struct compound *part=r->sel->v[k]->right;part;part=part->left)
+                    index_child_list_subjects(a,index,part);
+            }
+            for(const struct compound *part=r->sel->v[k]->right;part;part=part->left) {
+                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_PARENT);
+                index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_SIBLING);
+            }
+            index_rule(a, index, r, r->sel->v[k], index->rules, media);
+            index_features(a, index, r->sel->v[k]->right);
+        }
+    }
+    return index;
+}
+/* The rule index of a sheet's AST, shared by every instance of that AST and
+   kept across rescans for as long as the AST lives. */
+static struct css_index *sheet_index(web_doc *d, const sheet_t *s) {
+    sheet_t *ast = s->ast;
+    if (!ast->index) ast->index = index_sheet(d, ast);
+    return ast->index;
+}
+/* The index's @media for this cascade's viewport, evaluated once per index. */
+static const bool *index_media_ok(struct css_ctx *x, const struct css_index *index, int vw, int vh, bool scripting) {
+    static const bool unconditional = true;
+    if (!index->nmedia) return &unconditional;
+    unsigned slot = ((uintptr_t)index >> 4) & 63;
+    for (const struct index_media *m = x->media[slot]; m; m = m->next) if (m->index == index) return m->ok;
+    bool *ok = ar_alloc(&x->a, index->nmedia + 1);
+    ok[0] = true;
+    for (uint32_t i = 0; i < index->nmedia; i++) ok[i + 1] = media_chain_ok(index->media[i], vw, vh, scripting);
+    struct index_media *m = ar_alloc(&x->a, sizeof *m);
+    m->index = index; m->ok = ok; m->next = x->media[slot]; x->media[slot] = m;
+    return ok;
+}
+
+/* Sheets in cascade order: imports keep their parent's order key, so a stable
+   sort leaves them before it. */
+static bool sheets_sort(web_doc *d) {
+    pvec *sh = &d->sty.sheets;
+    for (int i = 1; i < sh->n; i++)
+        for (int j = i; j > 0 && ((sheet_t *)sh->v[j - 1])->order > ((sheet_t *)sh->v[j])->order; j--) {
+            if (!web_native_checkpoint(d)) return false;
+            void *t = sh->v[j];
+            sh->v[j] = sh->v[j - 1];
+            sh->v[j - 1] = t;
+        }
+    return true;
+}
+static int sheet_position(const pvec *sh, const sheet_t *s) {
+    for (int i = 0; s && i < sh->n; i++) if (sh->v[i] == s) return i;
+    return -1;
+}
+static struct sheet_signature sign_sheet(arena_t *a, const pvec *sh, int i) {
+    const sheet_t *s = sh->v[i];
+    const char *media = s->owner_media ? s->owner_media : "";
+    return (struct sheet_signature){s->ast->serial, s->scope, a ? ar_strdup(a, media) : media,
+                                    sheet_position(sh, s->import_parent), s->import_owner, s->ua};
+}
+
+/* The bindings of the document's sheets for one viewport. */
+static struct css_ctx *build_ctx(web_doc *d, int vw, int vh) {
     struct css_ctx *x = calloc(1, sizeof *x);
     if (!x) { ar_alloc(&d->smem, SIZE_MAX); return NULL; }
     x->parallel_safe = true;
@@ -3116,77 +3348,34 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
         quirks_sheet = css_parse_sheet(&ua_arena, q, strlen(q), "about:blank", -1, NULL);
         quirks_sheet->ua = true;
     }
-    /* sheets in cascade order */
     pvec *sh = &d->sty.sheets;
-    for (int i = 1; i < sh->n; i++)
-        for (int j = i; j > 0 && ((sheet_t *)sh->v[j - 1])->order > ((sheet_t *)sh->v[j])->order; j--) {
-            if (!web_native_checkpoint(d)) return x;
-            void *t = sh->v[j];
-            sh->v[j] = sh->v[j - 1];
-            sh->v[j - 1] = t;
-        }
+    if (!sheets_sort(d)) return x;
+    if (sh->n) x->sheets = ar_alloc(&x->a, (size_t)sh->n * sizeof *x->sheets);
+    for (int i = 0; i < sh->n; i++) x->sheets[i] = sign_sheet(&x->a, sh, i);
+    x->nsheets = sh->n;
     layers_build(d,x,vw,vh);
+    bool scripting = web_js_enabled(d);
     uint32_t order = 1;
     for (int i = -2; i < sh->n; i++) {
         sheet_t *s = i == -2 ? ua_sheet : i == -1 ? quirks_sheet : sh->v[i];
-        if (!sheet_media_ok(s,vw,vh,web_js_enabled(d))) continue;
+        if (!sheet_media_ok(s,vw,vh,scripting)) continue;
         if (i == -1 && !d->quirks) continue;
-        unsigned bucket = ((uintptr_t)s->first >> 4) & 255;
-        struct css_index *index = x->indexes[bucket];
-        while (index && (index->source != s->first || index->fonts != s->fonts || index->motions != s->motions || index->ua != s->ua)) index = index->next;
-        if (!index) {
-            index = ar_alloc(&x->a, sizeof *index);
-            index->source = s->first; index->fonts=s->fonts; index->motions=s->motions; index->ua = s->ua;
-            index->next = x->indexes[bucket]; x->indexes[bucket] = index;
-            /* Small component sheets no longer allocate a document-sized hash
-               table, nor duplicate selector entries for every adoption. */
-            ht_init(&x->a, &index->ids, 64);
-            ht_init(&x->a, &index->classes, 128);
-            ht_init(&x->a, &index->tags, 64);
-            /* Registry identities are published before workers start. Worker
-               font selection only reads this list and atomically marks demand. */
-            for(struct font_face *font=s->fonts;font;font=font->next)
-                for(struct font_source *source=font->sources;source;source=source->next)
-                    if(!doc_font_resource(d,source->url))x->parallel_safe=false;
-            for (struct rule *r = s->first; r; r = r->next, index->rules++) {
-                if (!web_native_checkpoint(d)) return x;
-                for(const struct mcond *m=r->media;m;m=m->up)if(m->container)index->containers=true;
-                for(int k=0;k<r->ndecls;k++)if(container_units_used(r->decls[k].value))index->containers=true;
-                if (!r->ndecls || !media_chain_ok(r->media, vw, vh, web_js_enabled(d))) continue;
-                for (int k = 0; k < r->sel->n; k++) {
-                    for (const struct compound *part = r->sel->v[k]->right; part; part = part->left)
-                        if (compound_has(part)) {
-                            if (!index->relational) {
-                                index->relational = ar_alloc(&x->a, sizeof *index->relational);
-                                ht_init(&x->a, &index->relational->ids, 16);
-                                ht_init(&x->a, &index->relational->classes, 32);
-                                ht_init(&x->a, &index->relational->tags, 16);
-                            }
-                            struct selector *subject = ar_alloc(&x->a, sizeof *subject); subject->right = (struct compound *)part;
-                            index_rule(&x->a, index->relational, NULL, subject, 0, false);
-                            index->relational_siblings |= compound_has_siblings(part);
-                        }
-                    index->form_features |= selector_form_features(r->sel->v[k]->right);
-                    if(selector_siblings(r->sel->v[k]->right)) {
-                        x->siblings=true;
-                        for(const struct compound *part=r->sel->v[k]->right;part;part=part->left)
-                            index_child_list_subjects(&x->a,index,part);
-                    }
-                    for(const struct compound *part=r->sel->v[k]->right;part;part=part->left) {
-                        index_child_list_subjects_inner(&x->a,index,part,true,SUBJECT_CHILD_PARENT);
-                        index_child_list_subjects_inner(&x->a,index,part,true,SUBJECT_CHILD_SIBLING);
-                    }
-                    index_rule(&x->a, index, r, r->sel->v[k], index->rules, s->ua);
-                    if(d->profile_enabled)d->profile.style_index_entries++;
-                }
-            }
-        }
+        struct css_index *index = sheet_index(d, s);
+        if (!index) return x;
+        /* Registry identities are published before workers start. Worker
+           font selection only reads this list and atomically marks demand. */
+        for(struct font_face *font=s->fonts;font;font=font->next)
+            for(struct font_source *source=font->sources;source;source=source->next)
+                if(!doc_font_resource(d,source->url))x->parallel_safe=false;
         x->form_features |= index->form_features;
         x->relational |= index->relational != NULL;
         x->relational_siblings |= index->relational_siblings;
+        x->siblings |= index->siblings;
         x->containers |= index->containers;
         struct css_binding *binding = ar_alloc(&x->a, sizeof *binding);
         binding->index = index; binding->order = order; order += index->rules;
+        binding->media_ok = index_media_ok(x, index, vw, vh, scripting);
+        binding->ua = s->ua;
         binding->layers=layer_sheet_find(x,s,false);
         if (s->ua) { binding->next = x->ua; x->ua = binding; continue; }
         node_t *root = s->scope ? s->scope : d->root;
@@ -3194,6 +3383,7 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
         if (scope->last) scope->last->next = binding; else scope->first = binding;
         scope->last = binding;
     }
+    x->complete = !__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE);
     return x;
 }
 
@@ -3268,6 +3458,7 @@ static node_t *font_selection_next(node_t *n,node_t *root) {
     return n && n!=root?container_next(n):NULL;
 }
 
+static void mark_style_own(web_doc *d, node_t *n);
 void css_refresh_font_selection(web_doc *d) {
     if(!d || d->need_style)return; /* A queued cascade already retries sources. */
     if(!d->sty.ctx || d->sty.index_dirty || d->resources_dirty ||
@@ -3301,7 +3492,7 @@ void css_refresh_font_selection(web_doc *d) {
         /* NULL -> NULL still marks the next source wanted, without recascading
            unchanged SVG snapshots or reshaping existing inline formatting. */
         if(changed) {
-            css_mark_dirty(d,n);
+            mark_style_own(d,n); /* its descendants check their own selection here */
             /* A partial cascade resets wanted flags, including font users
                outside its dirty subtree. Retry their sources after publication. */
             d->font_selection_dirty=true;
@@ -3444,7 +3635,7 @@ static void pres_hints(node_t *e, struct hints *h) {
     if (t == T_td || t == T_th) {
         if ((v = node_attr(e, "valign"))) hint(h, "vertical-align", "%s", v);
         if (node_attr(e, "nowrap")) hint(h, "white-space", "nowrap");
-        node_t *tab = node_ancestor(e, T_table);
+        node_t *tab = node_ancestor(e, T_table); /* hint_reaches_descendants() */
         if (tab) {
             if (html_len(node_attr(tab, "cellpadding"), b, sizeof b)) hint(h, "padding", "%s", b);
             if ((v = node_attr(tab, "border")) && atoi(v) > 0) hint(h, "border", "1px inset #888");
@@ -3493,6 +3684,11 @@ static void pres_hints(node_t *e, struct hints *h) {
     }
     if ((t == T_caption) && (v = node_attr(e, "valign")) && str_ieq(v, "bottom")) {
     }
+}
+/* The attributes of e whose hints above belong to its descendants: a table's
+   cellpadding and border pad and border its cells. */
+static bool hint_reaches_descendants(const node_t *e, const char *name) {
+    return !e->foreign && e->tag == T_table && (!strcmp(name, "cellpadding") || !strcmp(name, "border"));
 }
 
 /* ---------------------------------------------------------------- the cascade */
@@ -3663,7 +3859,7 @@ static const struct ient *ht_list(const struct htab *t, const char *key, uint32_
    candidates by index bucket (id, class, tag, universal) and how many of them
    the ancestor filter rejected. Style workers share those counters. */
 enum { COLLECT_ID, COLLECT_CLASS, COLLECT_TAG, COLLECT_UNIVERSAL };
-struct collect_tally { uint64_t bucket[4], filtered; };
+struct collect_tally { uint64_t bucket[4], filtered, indexes; };
 
 static void collect(const struct ient *l, const struct element_keys *k, node_t *scope, int depth, struct css_binding *binding,
                     struct collect_tally *tally, int bucket) {
@@ -3676,10 +3872,11 @@ static void collect(const struct ient *l, const struct element_keys *k, node_t *
             web_avmedia_checkpoint();
         } else if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
         tally->bucket[bucket]++;
-        if (!l->ua) {
+        if (!binding->ua) {
             if (!scope && root && root->shadow_host) continue;
             if (scope && l->sel->pseudo != PE_SLOTTED && root != scope && e != scope->shadow_host) continue;
         }
+        if (!binding->media_ok[l->media]) continue;
         if (ancestor_filter_rejects(&k->ancestors, l->sel)) { tally->filtered++; continue; }
         if (!container_chain_ok(l->r->media,e,l->sel->pseudo==PE_BEFORE || l->sel->pseudo==PE_AFTER)) continue;
         /* Only cascade rule matching reads the published form snapshot. Live
@@ -3690,7 +3887,7 @@ static void collect(const struct ient *l, const struct element_keys *k, node_t *
         scratch->form_snapshot = previous;
         if (matches) {
             struct cascade_layer *layer=binding_layer(binding,l->r->layer);
-            add_rule_decls(l->r, l->sel->spec, l->order + binding->order, !l->ua,
+            add_rule_decls(l->r, l->sel->spec, l->order + binding->order, !binding->ua,
                            l->sel->pseudo == PE_SLOTTED ? PE_NONE : l->sel->pseudo, depth,layer);
         }
     }
@@ -3702,6 +3899,7 @@ static void collect_index(struct css_binding *binding, const struct element_keys
     struct collect_tally tally = {0};
     for (; binding; binding = binding->next) {
         struct css_index *x = binding->index;
+        tally.indexes++;
         if (e->id) collect(ht_list(&x->ids, e->id, k->id_hash), k, scope, depth, binding, &tally, COLLECT_ID);
         for (int i = 0; i < e->nclasses; i++) {
             uint32_t hash;
@@ -3720,6 +3918,7 @@ static void collect_index(struct css_binding *binding, const struct element_keys
     }
     if (checks) __atomic_fetch_add(&d->profile.style_rule_checks, checks, __ATOMIC_RELAXED);
     if (tally.filtered) __atomic_fetch_add(&d->profile.style_rule_filtered, tally.filtered, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&d->profile.style_rule_indexes, tally.indexes, __ATOMIC_RELAXED);
 }
 
 static void collect_scope(node_t *root, const struct element_keys *k) {
@@ -4635,19 +4834,61 @@ static bool relational_node_candidate(node_t *node) {
     return relational_scope_candidate(node, root ? root->style_scope : NULL) ||
         (node->shadow_root && relational_scope_candidate(node, node->shadow_root->style_scope));
 }
-static void mark_relational_dirty(web_doc *d, node_t *node) {
+/* Whether it marked a subject. */
+static bool mark_relational_dirty(web_doc *d, node_t *node) {
     /* A descendant mutation can change ancestor :has(), and the following
        tree of a preceding sibling's :has(+ ...)/:has(~ ...). A dirty subject
        recascades its descendants for outer descendant combinators. Nonlocal
        outer +/-/~ selectors still use the existing sibling boundary below. */
+    bool marked = false;
     for (node_t *ancestor = node; ancestor && ancestor->type == N_ELEM; ancestor = ancestor->parent) {
         for (node_t *subject = ancestor; subject; subject = d->sty.ctx->relational_siblings ? prev_elem(subject) : NULL) {
             if (relational_node_candidate(subject)) {
                 node_t *boundary = d->sty.ctx->siblings && subject->parent && subject->parent->type == N_ELEM ? subject->parent : subject;
                 mark_style_subject(d, boundary);
+                marked = true;
             }
         }
     }
+    return marked;
+}
+/* --debug-js: marks whose reach the feature tables decided, and the others;
+   how many of the decided reached the boundary or a whole subtree, and the
+   names whose selectors sent them there most often. */
+#define STYLE_MARK_NAMES 6
+static struct {
+    uint64_t precise, boundary, parent, subtree;
+    struct { char name[40]; uint64_t count; } names[STYLE_MARK_NAMES];
+} style_marks;
+static void style_mark_name(const char *name, size_t length) {
+    int slot = 0;
+    for (int i = 0; i < STYLE_MARK_NAMES; i++) {
+        if (!strncmp(style_marks.names[i].name, name, length) && !style_marks.names[i].name[length]) { slot = i; goto found; }
+        if (style_marks.names[i].count < style_marks.names[slot].count) slot = i;
+    }
+    if (length >= sizeof style_marks.names[slot].name) length = sizeof style_marks.names[slot].name - 1;
+    memcpy(style_marks.names[slot].name, name, length); style_marks.names[slot].name[length] = 0;
+    style_marks.names[slot].count = 0;
+found:
+    style_marks.names[slot].count++;
+}
+/* Only n's own match changed; its descendants follow if its style does. */
+static void mark_style_self(web_doc *d, node_t *n) {
+    n->style_self_dirty = true; d->style_pending_dirty = true;
+    for (node_t *p = dirty_flat_parent(n); p; p = dirty_flat_parent(p)) p->style_children_dirty = true;
+}
+/* n's own computed values changed without any selector matching differently. */
+static void mark_style_own(web_doc *d, node_t *n) {
+    boxes_require_full(d);
+    d->need_style = true;
+    mark_style_self(d, n);
+}
+/* The boundary when it is not known what a change reaches: n's subtree, or
+   its parent's when some sheet has a sibling combinator. */
+static void mark_style_boundary(web_doc *d, node_t *n) {
+    node_t *parent = dirty_flat_parent(n);
+    if (d->sty.ctx->siblings && parent && parent->type == N_ELEM) n = parent;
+    mark_style_subject(d, n);
 }
 void css_mark_dirty(web_doc *d, node_t *n) {
     if (!d) return;
@@ -4657,33 +4898,206 @@ void css_mark_dirty(web_doc *d, node_t *n) {
     if (n->type != N_ELEM) n = dirty_flat_parent(n);
     if (!n) { d->style_full_dirty = true; return; }
     if (d->sty.ctx->relational) mark_relational_dirty(d, n);
-    node_t *parent = dirty_flat_parent(n);
-    if (d->sty.ctx->siblings && parent && parent->type == N_ELEM) n = parent;
-    mark_style_subject(d, n);
+    mark_style_boundary(d, n);
+    if (d->profile_enabled) style_marks.boundary++;
 }
+
+/* The union of what one change reaches, over every sheet that can match the
+   element: the UA sheet and its tree's sheets. */
+struct reach_set {
+    unsigned reach, nkeys;
+    struct feature_key keys[FEATURE_KEYS];
+    uint64_t names[16]; /* bit filter of the key names' hashes */
+};
+static void reach_feature(struct reach_set *r, const struct css_feature *f) {
+    if (!f) return;
+    r->reach |= f->reach;
+    for (unsigned i = 0; i < f->nkeys && !(r->reach & REACH_KEYS_OVERFLOW); i++) {
+        const struct feature_key *key = &f->keys[i];
+        bool seen = false;
+        for (unsigned j = 0; j < r->nkeys && !seen; j++) seen = feature_key_equal(&r->keys[j], key);
+        if (seen) continue;
+        if (r->nkeys == FEATURE_KEYS) { r->reach |= REACH_KEYS_OVERFLOW; break; }
+        r->keys[r->nkeys++] = *key;
+        r->names[key->hash >> 6 & 15] |= 1ull << (key->hash & 63);
+    }
+}
+enum { FEATURE_ID, FEATURE_CLASS, FEATURE_ATTR };
+static const struct css_feature *index_feature(const struct css_index *x, int table, const char *name, size_t length,
+                                               uint32_t hash) {
+    const struct htab *t = table == FEATURE_ID ? &x->feature_ids : table == FEATURE_CLASS ? &x->feature_classes : &x->feature_attrs;
+    if (!t->cap) return NULL;
+    for (const struct bucket *b = t->v[hash & (t->cap - 1)]; b; b = b->next)
+        if (!strncmp(b->key, name, length) && !b->key[length]) return b->feature;
+    return NULL;
+}
+static void reach_named(web_doc *d, const struct css_scope *scope, int table, const char *name, size_t length,
+                        struct reach_set *r) {
+    uint32_t hash = 2166136261u; /* hash_str() of the first length bytes */
+    for (size_t i = 0; i < length; i++) hash = (hash ^ (unsigned char)name[i]) * 16777619u;
+    unsigned before = r->reach;
+    for (const struct css_binding *b = d->sty.ctx->ua; b; b = b->next)
+        reach_feature(r, index_feature(b->index, table, name, length, hash));
+    for (const struct css_binding *b = scope ? scope->first : NULL; b; b = b->next)
+        reach_feature(r, index_feature(b->index, table, name, length, hash));
+    if (d->profile_enabled && (r->reach & ~before & (REACH_PARENT | REACH_SUBTREE))) style_mark_name(name, length);
+}
+static void reach_state(web_doc *d, const struct css_scope *scope, enum css_state state, struct reach_set *r) {
+    for (const struct css_binding *b = d->sty.ctx->ua; b; b = b->next) reach_feature(r, b->index->feature_states[state]);
+    for (const struct css_binding *b = scope ? scope->first : NULL; b; b = b->next)
+        reach_feature(r, b->index->feature_states[state]);
+}
+static bool reach_key(const struct reach_set *r, uint8_t kind, const char *name) {
+    uint32_t hash = hash_str(name);
+    if (!(r->names[hash >> 6 & 15] >> (hash & 63) & 1)) return false;
+    for (unsigned i = 0; i < r->nkeys; i++)
+        if (r->keys[i].kind == kind && r->keys[i].hash == hash && !strcmp(r->keys[i].name, name)) return true;
+    return false;
+}
+static bool reach_element(const node_t *e, const struct reach_set *r) {
+    if (e->id && reach_key(r, SK_ID, e->id)) return true;
+    for (int i = 0; i < e->nclasses; i++) if (reach_key(r, SK_CLASS, e->classes[i])) return true;
+    for (int i = 0; i < e->nattrs; i++) if (reach_key(r, SK_ATTR, e->attrs[i].name)) return true;
+    for (unsigned i = 0; i < r->nkeys; i++) {
+        const struct feature_key *key = &r->keys[i];
+        if (key->kind == SK_TAG && (key->tag ? e->tag == key->tag : !strcmp(e->name, key->name))) return true;
+    }
+    return false;
+}
+/* Restyle the elements below top that carry one of r's keys. */
+static void mark_keyed(web_doc *d, node_t *top, const struct reach_set *r) {
+    for (node_t *e = top->first; e;) {
+        if (e->type == N_ELEM && reach_element(e, r)) mark_style_self(d, e);
+        if (e->first) { e = e->first; continue; }
+        while (e != top && !e->next) e = e->parent;
+        if (e == top) break;
+        e = e->next;
+    }
+}
+/* Restyle what r reaches from the elements of a chain, the deepest first, up
+   to top (one element when they are the same). Their descendants are top's;
+   each has its own following siblings. */
+static void mark_reach(web_doc *d, node_t *deepest, node_t *top, const struct reach_set *r) {
+    unsigned siblings = r->reach & (REACH_SIBLINGS | REACH_SIBLING_DESCENDANTS);
+    bool parent = (r->reach & REACH_PARENT) || (siblings && (r->reach & REACH_KEYS_OVERFLOW));
+    bool subtree = r->reach & (REACH_SUBTREE | REACH_KEYS_OVERFLOW);
+    if (d->profile_enabled) { style_marks.parent += parent; style_marks.subtree += !parent && subtree; }
+    if (parent) { mark_style_boundary(d, top); return; }
+    if (r->reach & REACH_SELF)
+        for (node_t *p = deepest; p; p = p == top ? NULL : dirty_flat_parent(p)) mark_style_self(d, p);
+    if (subtree) mark_style_subject(d, top);
+    else if (r->reach & REACH_DESCENDANTS) mark_keyed(d, top, r);
+    if (siblings)
+        for (node_t *p = deepest; p; p = p == top ? NULL : dirty_flat_parent(p))
+            for (node_t *s = next_elem(p); s; s = next_elem(s)) {
+                if ((siblings & REACH_SIBLINGS) && reach_element(s, r)) mark_style_self(d, s);
+                if (siblings & REACH_SIBLING_DESCENDANTS) mark_keyed(d, s, r);
+            }
+}
+/* Whether the feature tables describe every selector that can match n: it is
+   in the document tree, neither a host nor slotted (other trees' :host() and
+   ::slotted() name it), and classes and ids compare exactly (no quirks). */
+static bool reach_known(web_doc *d, node_t *n) {
+    node_t *root = n->type == N_ELEM ? doc_node_root(n, false) : NULL;
+    return d->sty.ctx && !d->quirks && root && root->type == N_DOC && !n->foreign && !n->shadow_root && !n->assigned_slot;
+}
+
 /* :hover, :active, :focus and :focus-within hold for a target and its flat
-   ancestors, so a moved state changes only the part of each chain the other
-   does not share: restyle the top of each part (its subtree covers the rest of
-   the chain and every descendant or sibling selector). A target outside the
-   document has no known former chain, so that move restyles the document. */
-void css_mark_state_moved(web_doc *d, node_t *from, node_t *to) {
+   ancestor elements, so a moved state changes only the part of each chain
+   the other does not share, from the target up to that part's top. A target
+   outside the document has no known former chain, so that move restyles the
+   document. */
+static node_t *state_parent(node_t *n) {
+    node_t *p = dirty_flat_parent(n);
+    return p && p->type == N_ELEM ? p : NULL;
+}
+static void mark_state_part(web_doc *d, enum css_state state, node_t *deepest, node_t *top) {
+    if (!top) return;
+    for (node_t *p = deepest; p; p = p == top ? NULL : state_parent(p))
+        if (!reach_known(d, p)) { css_mark_dirty(d, top); return; }
+    struct reach_set r = {0};
+    reach_state(d, doc_node_root(top, false)->style_scope, state, &r);
+    bool relational = d->sty.ctx->relational && mark_relational_dirty(d, deepest);
+    if (!r.reach && !relational) return; /* no selector reads this state here */
+    boxes_require_full(d);
+    d->need_style = true;
+    if (d->profile_enabled && (r.reach & (REACH_PARENT | REACH_SUBTREE)))
+        style_mark_name(state == CSS_STATE_HOVER ? ":hover" : state == CSS_STATE_ACTIVE ? ":active" : ":focus", state == CSS_STATE_HOVER ? 6 : 7);
+    mark_reach(d, deepest, top, &r);
+    if (d->profile_enabled) style_marks.precise++;
+}
+void css_mark_state_moved(web_doc *d, enum css_state state, node_t *from, node_t *to) {
     if (!d) return;
     if ((from && doc_node_root(from, true) != d->root) || (to && doc_node_root(to, true) != d->root)) {
         d->need_style = d->style_full_dirty = true;
         return;
     }
     size_t from_depth = 0, to_depth = 0;
-    for (node_t *p = from; p; p = dirty_flat_parent(p)) from_depth++;
-    for (node_t *p = to; p; p = dirty_flat_parent(p)) to_depth++;
+    for (node_t *p = from; p; p = state_parent(p)) from_depth++;
+    for (node_t *p = to; p; p = state_parent(p)) to_depth++;
     node_t *a = from, *b = to, *from_top = NULL, *to_top = NULL;
-    for (; from_depth > to_depth; from_depth--) { from_top = a; a = dirty_flat_parent(a); }
-    for (; to_depth > from_depth; to_depth--) { to_top = b; b = dirty_flat_parent(b); }
+    for (; from_depth > to_depth; from_depth--) { from_top = a; a = state_parent(a); }
+    for (; to_depth > from_depth; to_depth--) { to_top = b; b = state_parent(b); }
     while (a != b) {
-        from_top = a; a = dirty_flat_parent(a);
-        to_top = b; b = dirty_flat_parent(b);
+        from_top = a; a = state_parent(a);
+        to_top = b; b = state_parent(b);
     }
-    if (from_top) css_mark_dirty(d, from_top);
-    if (to_top) css_mark_dirty(d, to_top);
+    mark_state_part(d, state, from, from_top);
+    mark_state_part(d, state, to, to_top);
+}
+
+/* Attributes the pseudo-class matcher (match_pc and the form state snapshot)
+   reads, of an element or of its ancestors: their changes keep the boundary. */
+static bool state_attribute(const char *name) {
+    static const char *const names[] = {
+        "checked", "contenteditable", "dir", "disabled", "form", "href", "lang", "list", "max", "maxlength", "min",
+        "minlength", "multiple", "name", "open", "pattern", "placeholder", "readonly", "required", "selected",
+        "slot", "step", "type", "value",
+    };
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(name, names[i])) return true;
+    return false;
+}
+static bool token_listed(const char *list, const char *token, size_t length) {
+    for (const char *p = list; p && *p;) {
+        while (is_space(*p)) p++;
+        const char *start = p;
+        while (*p && !is_space(*p)) p++;
+        if ((size_t)(p - start) == length && !memcmp(start, token, length)) return true;
+    }
+    return false;
+}
+/* The classes of one list missing from the other: only they changed. */
+static void reach_classes(web_doc *d, const struct css_scope *scope, const char *list, const char *other,
+                          struct reach_set *r) {
+    for (const char *p = list; p && *p;) {
+        while (is_space(*p)) p++;
+        const char *start = p;
+        while (*p && !is_space(*p)) p++;
+        if (p > start && !token_listed(other, start, (size_t)(p - start)))
+            reach_named(d, scope, FEATURE_CLASS, start, (size_t)(p - start), r);
+    }
+}
+void css_mark_attribute_dirty(web_doc *d, node_t *n, const struct css_attribute_change *change) {
+    if (!d) return;
+    if (!change || !reach_known(d, n) || state_attribute(change->name)) {
+        css_mark_dirty(d, n); return;
+    }
+    boxes_require_full(d);
+    d->need_style = true;
+    if (d->sty.ctx->relational) mark_relational_dirty(d, n);
+    const struct css_scope *scope = doc_node_root(n, false)->style_scope;
+    /* The element itself always: presentational hints, attr() and the style attribute. */
+    struct reach_set r = {.reach = hint_reaches_descendants(n, change->name) ? REACH_SUBTREE : REACH_SELF};
+    reach_named(d, scope, FEATURE_ATTR, change->name, strlen(change->name), &r);
+    if (!strcmp(change->name, "class")) {
+        reach_classes(d, scope, change->old_value, change->new_value, &r);
+        reach_classes(d, scope, change->new_value, change->old_value, &r);
+    } else if (!strcmp(change->name, "id")) {
+        if (change->old_value) reach_named(d, scope, FEATURE_ID, change->old_value, strlen(change->old_value), &r);
+        if (change->new_value) reach_named(d, scope, FEATURE_ID, change->new_value, strlen(change->new_value), &r);
+    }
+    mark_reach(d, n, n, &r);
+    if (d->profile_enabled) style_marks.precise++;
 }
 /* A control's value, checkedness or selection changed. The control restyles
    (its box shows the state); :valid/:invalid also aggregate into its form and
@@ -4893,6 +5307,104 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     return !memcmp(&x,&y,sizeof x);
 }
 
+static bool transforms_equal(const struct css_transform *x, const struct css_transform *y) {
+    for (; x && y; x = x->next, y = y->next)
+        if (x->kind != y->kind || !css_length_equal(&x->xy[0], &y->xy[0]) || !css_length_equal(&x->xy[1], &y->xy[1]) ||
+            memcmp(x->v, y->v, sizeof x->v) || memcmp(x->m, y->m, sizeof x->m)) return false;
+    return !x && !y;
+}
+static bool shadows_equal(const struct css_box_shadow *x, const struct css_box_shadow *y) {
+    for (; x && y; x = x->next, y = y->next)
+        if (x->x != y->x || x->y != y->y || x->blur != y->blur || x->spread != y->spread || x->color != y->color ||
+            x->inset != y->inset) return false;
+    return !x && !y;
+}
+static bool filters_equal(const struct css_filter *x, const struct css_filter *y) {
+    if (x == y) return true;
+    if (!x || !y || x->count != y->count || x->opacity != y->opacity) return false;
+    for (size_t i = 0; i < x->count; i++)
+        if (x->steps[i].value != y->steps[i].value || x->steps[i].percentage != y->steps[i].percentage) return false;
+    return true;
+}
+static bool gradients_equal(const struct gradient *x, const struct gradient *y) {
+    if (x == y) return true;
+    if (!x || !y || x->radial != y->radial || x->repeating != y->repeating || x->circle != y->circle ||
+        x->to_x != y->to_x || x->to_y != y->to_y || x->rsize != y->rsize || x->angle != y->angle || x->n != y->n ||
+        !css_length_equal(&x->at[0], &y->at[0]) || !css_length_equal(&x->at[1], &y->at[1])) return false;
+    for (int i = 0; i < x->n; i++)
+        if (x->col[i] != y->col[i] || !css_length_equal(&x->pos[i], &y->pos[i])) return false;
+    return true;
+}
+static bool vars_equal(const struct custom_prop *x, const struct custom_prop *y) {
+    /* An element without declarations of its own shares its parent's chain. */
+    for (; x != y; x = x->next, y = y->next)
+        if (!x || !y || !equal_string(x->name, y->name) || !equal_string(x->value, y->value)) return false;
+    return true;
+}
+/* Every computed value of a and b is the same, so b may be dropped for a,
+   which its element's descendants may borrow from. Pointed-to values are
+   compared by content; a pointer this does not know compares by address,
+   which can only report a difference. */
+static bool style_equal(const style_t *a, const style_t *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    const struct web_font_choice *fa = a->font_choices, *fb = b->font_choices;
+    for (; fa && fb; fa = fa->next, fb = fb->next)
+        if (fa->resource != fb->resource || fa->face != fb->face || fa->range_count != fb->range_count ||
+            (fa->range_count && memcmp(fa->ranges, fb->ranges, fa->range_count * sizeof *fa->ranges))) return false;
+    if (fa || fb) return false;
+    if (!equal_string(a->container_names, b->container_names) || !equal_string(a->font_names, b->font_names) ||
+        !equal_string(a->content, b->content) || !equal_string(a->list_style_string, b->list_style_string) ||
+        !equal_string(a->bg_image, b->bg_image) || !equal_string(a->mask_image, b->mask_image) ||
+        !equal_string(a->motion.name, b->motion.name) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
+        !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
+        !filters_equal(a->filter, b->filter) || !transforms_equal(a->transform, b->transform) ||
+        !transforms_equal(a->rotate, b->rotate) || !transforms_equal(a->scale, b->scale) ||
+        !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) ||
+        !equal_tracks(a->grid_cols, b->grid_cols) || !equal_tracks(a->grid_rows, b->grid_rows) ||
+        !equal_tracks(a->grid_auto_cols, b->grid_auto_cols) || !equal_tracks(a->grid_auto_rows, b->grid_auto_rows) ||
+        !equal_areas(a->grid_areas, b->grid_areas) || !style_equal(a->before, b->before) ||
+        !style_equal(a->after, b->after) || !style_equal(a->backdrop, b->backdrop) ||
+        !style_equal(a->placeholder, b->placeholder)) return false;
+    for (int i = 0; i < 4; i++) if (!equal_string(a->grid_place[i].name, b->grid_place[i].name)) return false;
+    style_t x = *a, y = *b;
+    len_t *xl[] = {&x.object_pos[0], &x.object_pos[1], &x.line_height, &x.svg_stroke_width, &x.width, &x.height,
+                   &x.min_width, &x.max_width, &x.min_height, &x.max_height, &x.text_indent, &x.flex_basis,
+                   &x.translate.xy[0], &x.translate.xy[1], &x.transform_origin[0], &x.transform_origin[1],
+                   &x.bg_pos[0], &x.bg_pos[1], &x.bg_size[0], &x.bg_size[1], &x.mask_pos[0], &x.mask_pos[1],
+                   &x.mask_size[0], &x.mask_size[1]};
+    len_t *yl[] = {&y.object_pos[0], &y.object_pos[1], &y.line_height, &y.svg_stroke_width, &y.width, &y.height,
+                   &y.min_width, &y.max_width, &y.min_height, &y.max_height, &y.text_indent, &y.flex_basis,
+                   &y.translate.xy[0], &y.translate.xy[1], &y.transform_origin[0], &y.transform_origin[1],
+                   &y.bg_pos[0], &y.bg_pos[1], &y.bg_size[0], &y.bg_size[1], &y.mask_pos[0], &y.mask_pos[1],
+                   &y.mask_size[0], &y.mask_size[1]};
+    for (size_t i = 0; i < sizeof xl / sizeof *xl; i++) {
+        if (!css_length_equal(xl[i], yl[i])) return false;
+        xl[i]->expr = yl[i]->expr = NULL;
+    }
+    for (int i = 0; i < 4; i++) {
+        len_t *xs[] = {&x.margin[i], &x.padding[i], &x.inset[i], &x.corner_radius[i].axis[0], &x.corner_radius[i].axis[1]};
+        len_t *ys[] = {&y.margin[i], &y.padding[i], &y.inset[i], &y.corner_radius[i].axis[0], &y.corner_radius[i].axis[1]};
+        for (size_t k = 0; k < sizeof xs / sizeof *xs; k++) {
+            if (!css_length_equal(xs[k], ys[k])) return false;
+            xs[k]->expr = ys[k]->expr = NULL;
+        }
+    }
+    x.font_choices = y.font_choices = NULL;
+    x.container_names = y.container_names = x.font_names = y.font_names = x.content = y.content = NULL;
+    x.list_style_string = y.list_style_string = x.bg_image = y.bg_image = x.mask_image = y.mask_image = NULL;
+    x.motion.name = y.motion.name = x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
+    x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL;
+    x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
+    x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
+    x.grid_cols = y.grid_cols = x.grid_rows = y.grid_rows = NULL;
+    x.grid_auto_cols = y.grid_auto_cols = x.grid_auto_rows = y.grid_auto_rows = NULL;
+    x.grid_areas = y.grid_areas = NULL;
+    for (int i = 0; i < 4; i++) x.grid_place[i].name = y.grid_place[i].name = NULL;
+    x.before = y.before = x.after = y.after = x.backdrop = y.backdrop = x.placeholder = y.placeholder = NULL;
+    x.bg_img = y.bg_img = x.mask_img = y.mask_img = 0; /* found from bg_image and mask_image after the cascade */
+    return !memcmp(&x, &y, sizeof x);
+}
 static bool style_box_compatible(node_t *e, const style_t *old, const style_t *next);
 /* debug_js only: names the element whose restyle forced a box rebuild. */
 void css_box_change_report(web_doc *d) {
@@ -4954,6 +5466,15 @@ static void retire_style(struct cascade *c, node_t *e) {
     c->a = &e->style_mem;
 }
 
+/* The recomputed style equals the retired one: keep the retired object, which
+   descendants' styles may borrow from, and retire the new one in its place. */
+static void keep_previous_style(node_t *e) {
+    arena_t mem = e->style_mem; e->style_mem = e->style_previous_mem; e->style_previous_mem = mem;
+    struct css_style_slot *slots = e->style_slots; e->style_slots = e->style_previous_slots; e->style_previous_slots = slots;
+    style_t *s = e->style; e->style = e->style_previous; e->style_previous = s;
+    e->style_previous_mem.trap = NULL;
+}
+
 static void cascade_node(struct cascade *c, node_t *e, const style_t *parent);
 /* Siblings queued together share one copy of their ancestor filter. */
 struct cascade_job { node_t *node; const style_t *parent; float rem; bool full; size_t ancestors; };
@@ -4963,7 +5484,7 @@ struct cascade_frontier {
 };
 struct cascade_batch { struct cascade parent; struct cascade_job *jobs; const struct ancestor_filter *filters; };
 static void cascade_enqueue(struct cascade *c, node_t *e, const style_t *parent) {
-    if (!c->full && !e->style_dirty && !e->style_children_dirty && e->style) return;
+    if (!c->full && !e->style_dirty && !e->style_self_dirty && !e->style_children_dirty && e->style) return;
     struct cascade_frontier *f = c->frontier;
     if (f->n == f->cap) {
         size_t capacity = f->cap ? f->cap * 2 : 32;
@@ -5031,9 +5552,12 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     web_doc *d = c->d;
     if (css_can_service()) { if (!web_native_checkpoint(d)) return; }
     else if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
-    bool redo = c->full || e->style_dirty || !e->style;
+    bool redo = c->full || e->style_dirty || e->style_self_dirty || !e->style;
     if (!redo && !e->style_children_dirty) return;
     bool inherited_full = c->full;
+    /* Only this element's own match changed: its descendants restyle when its
+       style does, since they inherit from it and borrow from its arena. */
+    bool self_only = redo && !c->full && !e->style_dirty && e->style;
     if (!redo) goto descend;
     retire_style(c, e);
     css_scratch_get()->arena=c->a;
@@ -5143,14 +5667,18 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     if (has_after) s->after = compute(c, e, s, PE_AFTER, false);
     s->before_generated=box_pseudo_generated(e,s,s->before);
     s->after_generated=box_pseudo_generated(e,s,s->after);
-    if (!style_box_compatible(e, e->style_previous, s)) {
+    if (self_only && !e->animation_base_style && style_equal(e->style_previous, s)) {
+        keep_previous_style(e);
+        redo = false;
+        if (d->profile_enabled) __atomic_fetch_add(&d->profile.style_kept, 1, __ATOMIC_RELAXED);
+    } else if (!style_box_compatible(e, e->style_previous, s)) {
         __atomic_store_n(&d->style_boxes_changed, true, __ATOMIC_RELAXED);
         if(e->style_previous)__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);
         if(d->profile_enabled && e->style_previous)__atomic_store_n(&d->box_change_node,e,__ATOMIC_RELAXED);
     }
     e->style_mem.trap = NULL;
 descend:
-    e->style_dirty = e->style_children_dirty = false;
+    e->style_dirty = e->style_children_dirty = e->style_self_dirty = false;
     s = e->style;
     if (s->display == D_NONE) {
         motion_hide_subtree(e);
@@ -5250,23 +5778,57 @@ static void cascade_frontier_run(struct cascade *c, node_t *root) {
 enum { FULL_BY_INDEX, FULL_BY_MARK, FULL_BY_FIRST, FULL_BY_UNMARKED };
 enum { INDEX_BY_SHEETS, INDEX_BY_ENVIRONMENT };
 static struct {
-    uint64_t cascades, full, full_by[4], ms, indexes, index_by[2], index_ms, elements, candidates, filtered, bucket[4];
+    uint64_t cascades, full, full_by[4], ms, indexes, index_by[2], index_ms, rescans[2], elements, kept, candidates, filtered,
+        bucket[4], lookups;
 } style_profile;
 int web_style_report(char *out, size_t size) {
     if (!style_profile.cascades) return 0;
-    int n = snprintf(out, size, "Native style profile: cascades %lu/%lu ms (full %lu: index %lu, marked %lu, first %lu, unmarked %lu), rule indexes %lu (sheets %lu, environment %lu)/%lu ms, elements %lu, rule candidates %lu (id %lu, class %lu, tag %lu, universal %lu), filtered by ancestors %lu (inclusive)",
+    int n = snprintf(out, size, "Native style profile: cascades %lu/%lu ms (full %lu: index %lu, marked %lu, first %lu, unmarked %lu), bindings %lu (sheets %lu, environment %lu)/%lu ms, rescans %lu changed/%lu same, elements %lu (kept %lu), marks %lu precise (parent %lu, subtree %lu)/%lu boundary, rule candidates %lu (id %lu, class %lu, tag %lu, universal %lu), filtered by ancestors %lu, bindings looked up %lu (inclusive)",
         (unsigned long)style_profile.cascades, (unsigned long)style_profile.ms, (unsigned long)style_profile.full,
         (unsigned long)style_profile.full_by[FULL_BY_INDEX], (unsigned long)style_profile.full_by[FULL_BY_MARK],
         (unsigned long)style_profile.full_by[FULL_BY_FIRST],
         (unsigned long)style_profile.full_by[FULL_BY_UNMARKED], (unsigned long)style_profile.indexes,
         (unsigned long)style_profile.index_by[INDEX_BY_SHEETS], (unsigned long)style_profile.index_by[INDEX_BY_ENVIRONMENT],
-        (unsigned long)style_profile.index_ms,
-        (unsigned long)style_profile.elements, (unsigned long)style_profile.candidates,
+        (unsigned long)style_profile.index_ms, (unsigned long)style_profile.rescans[0], (unsigned long)style_profile.rescans[1],
+        (unsigned long)style_profile.elements, (unsigned long)style_profile.kept,
+        (unsigned long)style_marks.precise, (unsigned long)style_marks.parent, (unsigned long)style_marks.subtree,
+        (unsigned long)style_marks.boundary, (unsigned long)style_profile.candidates,
         (unsigned long)style_profile.bucket[0], (unsigned long)style_profile.bucket[1],
         (unsigned long)style_profile.bucket[2], (unsigned long)style_profile.bucket[3],
-        (unsigned long)style_profile.filtered);
+        (unsigned long)style_profile.filtered, (unsigned long)style_profile.lookups);
+    const char *separator = "; wide ";
+    for (int i = 0; i < STYLE_MARK_NAMES && n >= 0 && (size_t)n < size; i++)
+        if (style_marks.names[i].count) {
+            n += snprintf(out + n, size - (size_t)n, "%s%s %lu", separator, style_marks.names[i].name,
+                          (unsigned long)style_marks.names[i].count);
+            separator = ", ";
+        }
     memset(&style_profile, 0, sizeof style_profile);
+    memset(&style_marks, 0, sizeof style_marks);
     return n;
+}
+
+/* A rescan rebuilds the sheet list from the tree; most rescans are for other
+   resources and rebuild the same list. The bindings and the styles computed
+   from them stay valid when it is the list they were built from: the same
+   ASTs, in the same scopes, media and import structure, in the same order. */
+void css_sheets_rescan(struct styling *st) {
+    if (st->ctx && (st->index_dirty || !st->ctx->complete)) { css_ctx_free(st->ctx); st->ctx = NULL; }
+    st->sheets.n = 0;
+}
+bool css_sheets_rescanned(web_doc *d) {
+    struct css_ctx *x = d->sty.ctx;
+    bool same = x && sheets_sort(d) && x->nsheets == d->sty.sheets.n;
+    for (int i = 0; same && i < x->nsheets; i++) {
+        struct sheet_signature now = sign_sheet(NULL, &d->sty.sheets, i);
+        const struct sheet_signature *was = &x->sheets[i];
+        same = now.serial == was->serial && now.scope == was->scope && now.ua == was->ua && !strcmp(now.media, was->media) &&
+               now.import_parent == was->import_parent && now.import_owner == was->import_owner;
+    }
+    if (d->profile_enabled) style_profile.rescans[same]++;
+    if (same) { d->sty.index_dirty = false; return true; }
+    css_ctx_free(x); d->sty.ctx = NULL; d->sty.index_dirty = true;
+    return false;
 }
 
 void css_cascade(web_doc *d, int vw, int vh) {
@@ -5304,12 +5866,12 @@ void css_cascade(web_doc *d, int vw, int vh) {
         index_by = !d->sty.ctx || d->sty.index_dirty ? INDEX_BY_SHEETS : INDEX_BY_ENVIRONMENT;
         uint64_t index_start = d->profile_enabled ? uptime_ms() : 0;
         css_ctx_free(d->sty.ctx); d->sty.ctx = NULL;
-        d->sty.ctx = build_index(d, vw, vh);
+        d->sty.ctx = build_ctx(d, vw, vh);
         d->sty.index_w = vw;
         d->sty.index_h = vh;
         d->sty.index_scripting = scripting;
         d->sty.index_quirks = d->quirks;
-        d->sty.index_dirty = false;
+        d->sty.index_dirty = !d->sty.ctx->complete;
         d->style_full_dirty = true;
         if (d->profile_enabled) {
             style_profile.indexes++; style_profile.index_by[index_by]++;
@@ -5350,8 +5912,10 @@ void css_cascade(web_doc *d, int vw, int vh) {
         if (full) style_profile.full_by[full_by]++;
         style_profile.ms += uptime_ms() - profile_start;
         style_profile.elements += d->profile.style_visits - profile_before.style_visits;
+        style_profile.kept += d->profile.style_kept - profile_before.style_kept;
         style_profile.candidates += d->profile.style_rule_checks - profile_before.style_rule_checks;
         style_profile.filtered += d->profile.style_rule_filtered - profile_before.style_rule_filtered;
+        style_profile.lookups += d->profile.style_rule_indexes - profile_before.style_rule_indexes;
         for (int i = 0; i < 4; i++)
             style_profile.bucket[i] += d->profile.style_rule_bucket[i] - profile_before.style_rule_bucket[i];
     }

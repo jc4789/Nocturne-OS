@@ -949,8 +949,12 @@ bool html_bridge_import(struct html_parser *p) {
     }
     /* Publish mutation/slot snapshots only after every native link is coherent.
        A root's children can occur later than its host in this binding forest. */
+    /* A fragment parser writes only its detached forest, unless a declarative
+       shadow root of its target lets it write into the target's tree. */
+    bool forest_only=p->fragment;
     for(struct binding *v = b->lex_first; v; v = v->lex_next) if(v->changed) {
         node_t *n=v->native;
+        if(forest_only && n->owner==p->native_root->owner && doc_node_root(n,true)!=p->native_root)forest_only=false;
         /* Publish policy at the same coherent boundary as parser mutations,
            before parser scripts run. No Fetch-time DOM synchronization. */
         if(n->type==N_ELEM&&!n->foreign&&n->tag==T_meta&&
@@ -972,7 +976,9 @@ bool html_bridge_import(struct html_parser *p) {
     b->importing = false;
     clear_import(b);
     if (details_changed || (b->has_details && adoption_count)) doc_details_parser_finish(p->native_root);
-    for(size_t i=0;i<changed.length;i++)doc_mutated(changed.items[i],NULL);
+    for(size_t i=0;i<changed.length;i++)
+        if(forest_only && changed.items[i]==p->native_root->owner)doc_fragment_parsed(changed.items[i],p->native_root);
+        else doc_mutated(changed.items[i],NULL);
     p->import_changed=true;
     if(!p->fragment)doc_sync_tree(p->d);
     free(adoptions);free(changed.items);

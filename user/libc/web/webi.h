@@ -164,6 +164,7 @@ typedef struct node {
     struct style *style_previous;
     struct node *style_retired_next;
     bool style_dirty, style_children_dirty;
+    bool style_self_dirty; /* only this element's own match changed */
     uint8_t style_form_state; /* supervisor-published form pseudo snapshot; cascade reads only */
     uint32_t style_subtree_work; /* flat-tree element count, refreshed before a full cascade */
     /* Published only after layout joins; CSS workers never read mutable boxes
@@ -515,7 +516,7 @@ struct css_rule_info {
 /* the document's styling state */
 struct styling {
     pvec sheets;   /* sheet_t*, in cascade order */
-    css_ctx *ctx;  /* rule index for the current viewport */
+    css_ctx *ctx;  /* the sheets' rule indexes bound for the current viewport */
     int index_w, index_h;
     bool index_dirty, index_scripting, index_quirks;
 };
@@ -544,8 +545,15 @@ bool css_containers_update(web_doc *d); /* supervisor, after layout; changed que
 bool css_container_names_valid(const char *s, size_t n);
 void css_mark_dirty(web_doc *d, node_t *n);
 void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool inserted);
-/* hover, active or focus moved from one element of d to another (either may be NULL) */
-void css_mark_state_moved(web_doc *d, node_t *from, node_t *to);
+/* The dynamic states css_mark_state_moved moves; :focus and :focus-within move together. */
+enum css_state { CSS_STATE_HOVER, CSS_STATE_ACTIVE, CSS_STATE_FOCUS, CSS_STATES };
+/* the state moved from one element of d to another (either may be NULL) */
+void css_mark_state_moved(web_doc *d, enum css_state state, node_t *from, node_t *to);
+/* One attribute of an element changed: its lowercase name and its old and new
+   values (NULL: absent). */
+struct css_attribute_change { const char *name, *old_value, *new_value; };
+/* restyle what selectors naming the attribute can reach; NULL change: unknown */
+void css_mark_attribute_dirty(web_doc *d, node_t *n, const struct css_attribute_change *change);
 /* a control's value, checkedness or selection changed */
 void css_mark_form_state(web_doc *d, node_t *control);
 void css_node_style_free(node_t *n);
@@ -564,6 +572,10 @@ bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
 bool css_media_evaluate(const char *query, int vw, int vh, bool scripting, char *out, size_t cap);
 void css_styling_free(struct styling *st);
+/* Around a rescan's rebuild of st->sheets: true when it rebuilt the list the
+   rule bindings came from, which then stay, with the styles computed from them. */
+void css_sheets_rescan(struct styling *st);
+bool css_sheets_rescanned(web_doc *d);
 /* parse a color; false if it is not one */
 bool css_color(const char *s, size_t n, uint32_t *out);
 
@@ -865,9 +877,11 @@ struct web_profile {
     uint64_t shadow_reassigns, shadow_visits;
     uint64_t script_scans, script_visits, script_ms, native_calls, native_ms, native_samples;
     uint64_t metadata_syncs, metadata_visits, metadata_ms;
-    uint64_t style_visits, style_rule_checks, style_index_entries, style_parallel_nodes;
+    uint64_t style_visits, style_rule_checks, style_parallel_nodes;
     uint64_t style_rule_filtered; /* candidates rejected by the ancestor filter */
+    uint64_t style_rule_indexes; /* rule indexes looked up, one per stylesheet binding */
     uint64_t style_rule_bucket[4]; /* candidates by index bucket: id, class, tag, universal */
+    uint64_t style_kept; /* restyled elements whose computed style came out unchanged */
 };
 struct web_doc {
     uint64_t paint_bounds_generation;
@@ -1164,6 +1178,7 @@ bool doc_option_selected(node_t *option);
 node_t *doc_node_clone(web_doc *d, node_t *node, bool deep);
 node_t *doc_node_clone_registry(web_doc *d, node_t *node, bool deep, int32_t fallback_registry, void *fallback_realm);
 void doc_mutated(web_doc *d, node_t *node);
+void doc_fragment_parsed(web_doc *d, node_t *forest);
 void doc_rescan(web_doc *d);
 void web_marquee_register(web_doc *d, node_t *node);
 void web_marquee_set(node_t *node, bool running);

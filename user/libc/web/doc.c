@@ -488,7 +488,12 @@ void doc_image_sync(web_doc *d, node_t *n) {
 }
 
 void doc_control_init(web_doc *d, node_t *n) {
-    if (n->tag == T_select) { web_select_sync(d, n, !n->control_ready); return; }
+    if (n->tag == T_select) {
+        int selected = n->selected;
+        web_select_sync(d, n, !n->control_ready);
+        if (n->selected != selected) css_mark_form_state(d, n); /* its options' :checked */
+        return;
+    }
     if (n->control_ready) return;
     n->control_ready = true;
     if (n->tag == T_input) {
@@ -987,7 +992,8 @@ void doc_rescan(web_doc *d) {
     d->resources_dirty = false;
     d->images_dirty = false;
     d->marquees.n=0;
-    css_styling_free(&d->sty);
+    uint64_t base_hash=sheet_hash(d->base,strlen(d->base));
+    css_sheets_rescan(&d->sty);
     ar_free(&d->cssmem);
     for(struct css_sheet_reuse *c=d->css_reuse;c;c=c->next)c->used=false;
     free_pending(d);
@@ -1040,10 +1046,15 @@ void doc_rescan(web_doc *d) {
         sheet_reuse_sweep(d,true);
         free_pending(d);
     }
+    /* Most rescans are for other resources and rebuild the same sheet list,
+       whose cascade stands. A new base URL resolves inline styles anew. */
+    bool sheets_same=!failed_arena && css_sheets_rescanned(d);
     if(!failed_arena)sheet_reuse_sweep(d,false);
     d->mem.trap = old_mem;
     d->cssmem.trap = old_css;
-    d->dirty = d->need_style = true;
+    d->dirty = true;
+    if(!sheets_same)d->need_style = true;
+    if(base_hash!=sheet_hash(d->base,strlen(d->base)))d->need_style=d->style_full_dirty=true;
     if(!failed_arena && !d->native_cancelled){d->metadata_revision=d->dom_revision;d->metadata_valid=true;}
     if (d->profile_enabled) d->profile.rescan_ms += uptime_ms() - profile_start;
 }
@@ -2174,7 +2185,7 @@ static void hover_target_set(web_doc *d,node_t *target) {
     node_t *old=d->hover_target;
     d->hover_target=target;
     if(d->live){
-        css_mark_state_moved(d,old,target);d->dirty=true;
+        css_mark_state_moved(d,CSS_STATE_HOVER,old,target);d->dirty=true;
         for(web_doc *p=d->frame_parent;p && p->live;p=p->frame_parent)p->dirty=true;
     }
 }
@@ -2215,7 +2226,7 @@ static void active_target_set(web_doc *d,node_t *target) {
     node_t *old=d->active_target;
     d->active_target=target;
     if(d->live){
-        css_mark_state_moved(d,old,target);d->dirty=true;
+        css_mark_state_moved(d,CSS_STATE_ACTIVE,old,target);d->dirty=true;
         for(web_doc *p=d->frame_parent;p && p->live;p=p->frame_parent)p->dirty=true;
     }
 }
@@ -2505,7 +2516,7 @@ void web_focus(web_doc *d, web_node *n) {
     d->focus = n;
     d->caret = 0;
     if (n) doc_control_caret(d, n);
-    css_mark_state_moved(d, old, n);
+    css_mark_state_moved(d, CSS_STATE_FOCUS, old, n);
     d->dirty = true;
 }
 

@@ -393,7 +393,8 @@ static void textarea_changed(node_t *n) {
         if (n->type == N_ELEM && !n->foreign && n->tag == T_textarea && !n->value_dirty) n->control_ready = false;
 }
 
-static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recascade, bool boxes,node_t *child_list,bool inserted) {
+static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recascade, bool boxes,node_t *child_list,bool inserted,
+                             const struct css_attribute_change *attribute) {
     if (!d) return;
     d->dom_revision++;
     /* Window の名前表はdocument-tree構造だけを追う。style/rAFやshadow内部は無効化しない。 */
@@ -414,9 +415,13 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
         textarea_changed(n); return;
     }
     d->dirty = true;
-    if(recascade){if(child_list)css_mark_child_list_dirty(d,n,child_list,inserted);else css_mark_dirty(d,n);}
+    if(recascade){
+        if(child_list)css_mark_child_list_dirty(d,n,child_list,inserted);
+        else if(attribute)css_mark_attribute_dirty(d,n,attribute);
+        else css_mark_dirty(d,n);
+    }
     if(boxes){d->need_boxes=true;d->layout_valid=false;}
-    if (resources) d->resources_dirty = d->style_full_dirty = true;
+    if (resources) d->resources_dirty = true; /* its rescan restyles everything if the sheets changed */
     if (recascade || boxes) {
         d->layout_valid = false;
         if (n && n->box && (boxes || n->box->kind==B_ATOMIC)) layout_invalidate(n->box);
@@ -432,12 +437,12 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
        must not discard every icon; removed/hidden entries are swept after
        boxes_build has stopped borrowing the old cache pointers. */
 }
-static void changed(web_doc *d,node_t *n,bool resources) {
-    changed_geometry(d,n,resources,true,false,NULL,false);
+static void changed(web_doc *d,node_t *n,bool resources,const struct css_attribute_change *attribute) {
+    changed_geometry(d,n,resources,true,false,NULL,false,attribute);
 }
 void doc_mutated(web_doc *d, node_t *n) {
     if (d && !n) { d->js_nodes_dirty = true; d->need_boxes = true; d->metadata_valid=false; }
-    changed(d, n, true);
+    changed(d, n, true, NULL);
     /* NULL denotes a parser's complete forest transaction. Ordinary control or
        CharacterData notifications cannot change assignment; structural/attribute
        mutations below identify the exact assignment-relevant boundary instead. */
@@ -473,6 +478,15 @@ static unsigned resource_subtree(node_t *root) {
       n = tree_next(n, root, true, false, descend);
     }
     return found;
+}
+/* A fragment parser builds a detached forest; inserting it notifies the tree
+   it joins at that boundary. Here only the forest changed: its wrappers, and
+   its images, which request while detached. */
+void doc_fragment_parsed(web_doc *d, node_t *forest) {
+    if (!d || !forest) return;
+    web_js_nodes_reparented(d, forest);
+    changed(d, forest, false, NULL);
+    if (resource_subtree(forest) & SUBTREE_IMAGES) d->images_dirty = d->dirty = true;
 }
 /* The attributes doc.c scan() reads to find an authored sheet, the base URL,
    a meta directive or an image button's image. Any other attribute of these
@@ -517,7 +531,7 @@ static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtr
     bool resources = parent->type==N_DOC || resource_ancestor(parent);
     unsigned kind = resources ? 0 : resource_subtree(subtree);
     resources = resources || (kind & SUBTREE_RESOURCES);
-    changed_geometry(d,parent,resources,true,false,subtree,inserted);
+    changed_geometry(d,parent,resources,true,false,subtree,inserted,NULL);
     if (d && !resources && (kind & SUBTREE_IMAGES) && doc_node_root(parent,true)==d->root)
         d->images_dirty = d->dirty = true;
     if (d && doc_node_root(parent,true)==d->root) boxes_note_child_list(d,parent,subtree);
@@ -774,6 +788,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
         return true;
     }
     if (n->nattrs < 0 || (found < 0 && n->nattrs == INT_MAX)) return false;
+    const char *old_value = found >= 0 ? n->attrs[found].value : NULL;
     int count = n->nattrs + (found < 0 ? 1 : value ? 0 : -1);
     if (count < 0 || (size_t)count > SIZE_MAX / sizeof(struct attr)) return false;
     doc_dom_budget(d);
@@ -864,7 +879,8 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     /* An ordinary class/style/ARIA attribute affects the cascade, not the set
        of authored sheets. Re-parsing every external CSS sheet here made geometry
        reads after classList updates needlessly rebuild all sheet snapshots. */
-    changed(d, n, resources);
+    struct css_attribute_change change = {low, old_value, value};
+    changed(d, n, resources, ordinary ? &change : NULL);
     if(!ns && (!strcmp(low,"id") || !strcmp(low,"name")) && doc_node_root(n,false)==d->root)
         web_js_window_names_changed(d);
     if(ordinary&&n->tag==T_link&&(!strcmp(low,"rel")||!strcmp(low,"href")))web_js_link_changed(d);
@@ -1366,7 +1382,7 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
         if(keep_style){d->need_style=was_need_style;rebuild_boxes=true;}
     }
     cssom_style_text_changed(n);
-    changed_geometry(d,n,resources,!keep_style,rebuild_boxes,NULL,false);
+    changed_geometry(d,n,resources,!keep_style,rebuild_boxes,NULL,false,NULL);
     return true;
 }
 

@@ -2845,7 +2845,7 @@ static void report_loop_profile(uint64_t now) {
     if (!debug_js) return;
     if (!loop_profile.since) { loop_profile.since = now; return; }
     if (now - loop_profile.since < 2000) return;
-    char message[512];
+    char message[1280];
     snprintf(message, sizeof message,
              "Browser loop profile: wall %lu ms, ticks %u/%lu ms/max %lu, host layout %u/%lu ms, draw %u/%lu ms, update %lu ms, net %lu ms, wait %lu ms, parallel jobs %lu (inclusive)",
              (unsigned long)(now-loop_profile.since), loop_profile.ticks,
