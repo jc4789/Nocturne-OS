@@ -65,6 +65,7 @@ enum {
     SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
     SYS_WIN_RECEIVE, /* (window, struct gui_event *out, max, timeout_ms): count, 0 on timeout */
     SYS_WIN_DIRECT,  /* (window, wanted): ask to be shown by the display driver directly (EV_DIRECT) */
+    SYS_WIN_FRAME,   /* (window): EV_FRAME at the display's next frame, presented or not (WIN_FRAME_EVENTS) */
     SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
@@ -509,12 +510,16 @@ struct gui_event {
 #define WIN_BUFFER_COUNT 2
 #define WIN_MAP_ACQUIRE 1
 /* EV_FRAME: key = completed index, x = reusable index; completion means all
-   compositor reads have joined, not hardware vblank or physical scanout. */
+   compositor reads have joined, not hardware vblank or physical scanout.
+   Every EV_FRAME has y = the display's frame period in µs: the next frame comes
+   about that long after this one. */
 /* The display's pace for a window presented by rectangles: after a frame of the
    screen took what the window presented, it gets EV_FRAME (key and x 0), one for
    any number of presents. Frames come at the display's vertical blanks (else its
    mode's refresh), so an app that draws on EV_FRAME draws once a frame at any
-   refresh rate. A window that is not shown gets it when it is shown again.
+   refresh rate. SYS_WIN_FRAME asks for the next one without presenting (an
+   animation that waits for the display before it decides to draw). A window that
+   is not shown gets it when it is shown again.
    (WIN_DEEP_COLOR, 64, is in display_abi.h.) */
 #define WIN_FRAME_EVENTS 128
 #define WIN_STATE_VISIBLE 1

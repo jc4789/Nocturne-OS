@@ -5,7 +5,7 @@
  * realm has no raster backend, so its 2D context is unavailable (null) and
  * its blob encoding rejects with NotSupportedError.
  *
- * WebGL contexts work in both realms (native Mesa softpipe). A placeholder
+ * WebGL contexts work in both realms (native Mesa contexts). A placeholder
  * sent to a Worker carries a frame link: shared memory whose header is
  * [serial, width, height, consumed] followed by straight 0xAARRGGBB rows.
  * The Worker presents a frame after rendering changed the drawing buffer,

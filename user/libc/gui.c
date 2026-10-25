@@ -101,6 +101,9 @@ n_result win_fullscreen(window_t *win,bool enabled) { return win&&!win->closed?_
 n_result win_direct(window_t *win, bool wanted) {
     return win && !win->closed ? __syscall(SYS_WIN_DIRECT, win->handle, wanted, 0, 0, 0) : -N_ERR_NO_HANDLE;
 }
+n_result win_frame(window_t *win) {
+    return win && !win->closed ? __syscall(SYS_WIN_FRAME, win->handle, 0, 0, 0, 0) : -N_ERR_NO_HANDLE;
+}
 
 /* One system call takes every queued event that fits, waiting up to timeout. */
 static n_result fetch(window_t *win, int timeout) {

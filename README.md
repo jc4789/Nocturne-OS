@@ -33,7 +33,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 - **デスクトップ**：カーネル内の合成ウィンドウマネージャー。影、二重バッファー、タスクバー、スタートメニュー、
   通知、クリップボード、夜空の壁紙。既定の解像度は 1920×1080。
 - **Web ブラウザー**：HTML の木構築に Lexbor、JavaScript に QuickJS を使い、DOM・CSS・レイアウト・描画・
-  Web API は Nocturne で実装しています。Worker、IndexedDB、WebSocket、WebGL（Mesa のソフトウェア描画）、
+  Web API は Nocturne で実装しています。Worker、IndexedDB、WebSocket、WebGL（Mesa。NVIDIA の GPU では GPU が描く）、
   WebAssembly、動画（FFmpeg、MSE）、開発者ツールがあります。
 - **ネットワーク**：自前の TCP/IP（TCP の接続と待受け、ウィンドウスケーリング、ループバック）、DHCP、DNS、
   HTTP/1.1・HTTP/2、BearSSL による TLS 1.2。
@@ -69,7 +69,9 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
   - USB：xHCI、USB 2.0 と SuperSpeed のハブ、HID のキーボード・マウス。
   - 入力：PS/2 のキーボードとホイールマウス、USB HID。
   - ネットワーク：Realtek RTL8125B（2.5GbE）、USB Ethernet（CDC ECM／NCM）。
-  - 画面：Limine が渡すフレームバッファー。
+  - 画面：Limine が渡すフレームバッファー。NVIDIA の GPU（確かめたのは RTX 4070）は nvrm（NVIDIA の RM 615.78.08 の
+    移植、[ports/nvidia](ports/nvidia/README.md)）がモード設定・垂直帰線・リフレッシュの変更を受け持ち、WebGL は Zink と NVK で
+    GPU が描きます。GSP のファームウェアは配布せず、ビルドする人が手元のディスクへ入れます。
   - そのほか：ACPI の表（電源断と再起動）、PCI と PCIe ECAM、MSI／MSI-X、IOMMU（AMD-Vi、VT-d）、PAT、
     CMOS 時計、シリアル、乱数。
 - **仮想マシンだけのもの（`kernel/src/vm/`）**：実機の処理とは分けてあり、カーネルは `vm/vm.h` の入口からだけ
@@ -256,7 +258,7 @@ IDE 0:0 に、*レガシー*ネットワークアダプター（DEC 21140 の模
 キーボード・マウス）で、デスクトップとブラウザーでの動画ページの表示まで確認しました。この確認は 1 台のディスクと
 ドライブ C: の形式になる前のもので、今の形式の実機ではまだ確かめていません。まだ初期段階です。
 - 手順書や対応機種の一覧はありません。
-- 音は出ません（HD Audio は未対応）。GPU のドライバーはなく、ファームウェアの画面モードを使います。
+- 音は出ません（HD Audio は未対応）。NVIDIA 以外の GPU にはドライバーがなく、ファームウェアの画面モードを使います。
 - ファイルは USB メモリーの C: に保存され、再起動しても残ります。イメージは約 1 GB ですが、最初の起動で
   C: が USB メモリーの最後まで広がるので、残りはすべて空きになります。
 
@@ -479,7 +481,8 @@ fetch -o C:\Users\User\Downloads\1mb.zip http://speedtest.tele2.net/1MB.zip
 - DOM、イベント、各種 Observer、Range・Selection、履歴、URL、Blob、FormData、Fetch・XHR、Streams、WebSocket。
 - 専用 Worker と SharedWorker（窓をまたいで共有）、MessageChannel、BroadcastChannel。
 - Cookie（SameSite、公開サフィックス一覧）、localStorage・sessionStorage、IndexedDB、OPFS。
-- Canvas 2D、OffscreenCanvas、WebGL・WebGL2（Mesa の GLSL コンパイラーと softpipe によるソフトウェア描画）。
+- Canvas 2D、OffscreenCanvas、WebGL・WebGL2（Mesa。NVIDIA の GPU では Zink と NVK で GPU が描き、それ以外は softpipe が
+  CPU で描きます）。
 - WebAssembly：WABT で検証し、wasm2c が出した C を OS の中の TCC でネイティブコードにします。x86-64 の JIT、
   インタープリター、JSPI、共有メモリーと Atomics、スレッドがあります。
 - `<video>`・`<audio>`（FFmpeg 9.0.2 の一部の復号器）、MSE、HLS・DASH、WebVTT 字幕、全画面、ピクチャーインピクチャー。
@@ -641,7 +644,8 @@ agent -r                                # 前回の続き
   マイク、ドライブやプリンターの共有はありません。RDP サーバーは暗号化しませんが、ホストの Hyper-V ソケットからしか
   届かず、ネットワークには出ません。
 - **音は出力だけで、AC'97 か拡張セッションだけです。** HD Audio、USB オーディオ、録音はありません。
-- **GPU のドライバーはありません。** 描画は CPU です（WebGL もソフトウェア描画）。
+- **GPU のドライバーは NVIDIA だけで、まだ試し始めた段階です。** デスクトップの合成は CPU です。NVIDIA 以外の機械では
+  WebGL もソフトウェア描画です。
 - **AI エージェントはモデルのコマンドを尋ねずに実行します。** VM の外には出ませんが、`C:\Users` のファイルを消すことはあります。
 - **ブラウザーは発展途上です。** 多くのサイトは表示できますが、動かない機能や遅いページがあります（[上](#web-ブラウザー)）。
 - **実機はまだ試し始めた段階です。** 確かめた機械は少なく、手順書もありません。
@@ -679,6 +683,8 @@ hyperv.ps1    Hyper-V の VM の作成
 - [TinyCC](https://bellard.org/tcc/) 0.9.28rc C コンパイラー（LGPL-2.1、ソースは `third_party/tinycc`）。
 - Mozilla の CA 証明書（[curl](https://curl.se/docs/caextract.html) 経由、MPL-2.0）。
 - スケジューラー「継」の選択核 kei_sched（MIT、`kernel/src/sys/kei.c`）。
+- NVIDIA の [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) 615.78.08 の RM と NVKMS
+  （MIT ほか、`third_party/nvidia-open/NOTICES`）。
 - RTL8125B ドライバー（`kernel/src/net/rtl8125.c`）のレジスターと初期化の手順は Realtek の FreeBSD 用ドライバー
   rtl_bsd_drv_v1102.01 に従っています。This product includes software developed by Bill Paul.
   （4 条項 BSD、全文はファイルの先頭）
@@ -690,7 +696,8 @@ hyperv.ps1    Hyper-V の VM の作成
   Nocturne の一部は FreeType チームの成果に基づきます。
 - [Brotli](https://github.com/google/brotli) 1.2.0（MIT、WOFF2 用）。
 - [FFmpeg](https://ffmpeg.org/) 9.0.2 の一部の復号器（LGPL-2.1 以降、GPL の部分は無効）。
-- [Mesa](https://mesa3d.org/) 26.3.0-devel の GLSL・NIR・softpipe（MIT ほか、`third_party/mesa/licenses`）。
+- [Mesa](https://mesa3d.org/) 26.3.0-devel の GLSL・NIR・softpipe・Zink・Vulkan の実行時・NVK（MIT ほか、
+  `third_party/mesa/licenses`）。
 - [WABT](https://github.com/WebAssembly/wabt) 1.0.42（Apache-2.0）。
 - [FormatJS](https://formatjs.github.io/)（MIT）、Unicode CLDR と Unicode のデータ（Unicode License V3）、
   ICU 由来の照合表、IANA のタイムゾーンデータベース。

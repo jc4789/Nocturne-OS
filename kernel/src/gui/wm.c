@@ -58,7 +58,7 @@ struct window {
     int front_index, pending_index;
     bool frame_ready;
     struct gui_event frame_event; /* durable mailbox, not a droppable input event */
-    bool frame_wanted; /* WIN_FRAME_EVENTS: presented since the last frame that showed the window */
+    bool frame_wanted; /* WIN_FRAME_EVENTS: presented or asked (SYS_WIN_FRAME) since the last frame that showed it */
     int flags;
     bool shown, minimized, maximized, dead,fullscreen;
     bool direct_wanted; /* win_direct: its own images shown by the display driver when it can be */
@@ -693,6 +693,7 @@ static void text_trunc(canvas_t *c, int x, int y, const char *s, int maxw, uint3
 }
 
 static void composite(void);
+static uint64_t frame_period(void);
 
 /* ---- apps / desktop ---- */
 struct app {
@@ -1727,6 +1728,7 @@ static void composite(void) {
     memcpy(list, damage, n * sizeof(struct rect));
     ndamage = 0;
     for (int i = 0; i < n; i++) composite_rect(list[i]);
+    int32_t period = (int32_t)frame_period(); /* EV_FRAME's y: when the next frame comes */
     /* Includes hidden/offscreen windows: no outstanding reads exist for those
        either. The new front stays immutable until the NEXT frame completes,
        since expose/move damage can reread it between client submissions. */
@@ -1734,13 +1736,13 @@ static void composite(void) {
         struct window *w = zorder[i];
         if (w->frame_wanted && visible(w)) { /* WIN_FRAME_EVENTS: this frame took its presents */
             w->frame_wanted = false;
-            push_event(w, &(struct gui_event){.type = EV_FRAME});
+            push_event(w, &(struct gui_event){.type = EV_FRAME, .y = period});
         }
         if (w->pending_index < 0) continue;
         w->front_index = w->pending_index;
         w->pending_index = -1;
         pending_frames--;
-        struct gui_event event = {.type=EV_FRAME, .key=w->front_index, .x=w->front_index ^ 1};
+        struct gui_event event = {.type=EV_FRAME, .key=w->front_index, .x=w->front_index ^ 1, .y=period};
         push_event(w, &event);
     }
     if (n) {
@@ -2261,6 +2263,13 @@ static uint64_t frame_period(void) {
     }
     return 1000000000ull / mhz;
 }
+/* Whether a shown window waits for a frame without damage to make it (SYS_WIN_FRAME). The windows
+   change only on this CPU, so a look with interrupts off holds until the wait. */
+static bool frames_asked(void) {
+    for (int i = 0; i < nwin; i++)
+        if (zorder[i]->frame_wanted && visible(zorder[i])) return true;
+    return false;
+}
 /* The next frame's earliest start, after one started at now (ms). */
 static void frame_started(uint64_t now) {
     uint64_t us = now * 1000, period = frame_period();
@@ -2274,7 +2283,7 @@ static void wm_thread(void *arg) {
         bool waited=false; uint64_t waiting=0;
         uint64_t fl = irq_save();
         uint64_t now = uptime_ms();
-        bool work = ndamage || pending_frames;
+        bool work = ndamage || pending_frames || frames_asked();
         if (in_head == in_tail && (!work || !frame_due(now))) {
             if (trace_active) { waited=true; waiting=rdtsc(); wt.waits++; }
             bool paced = work && vblank_paced(now);
@@ -2330,7 +2339,7 @@ static void wm_thread(void *arg) {
         direct_update();
         fl = irq_save();
         now = uptime_ms();
-        bool render = (ndamage || pending_frames) && frame_due(now);
+        bool render = (ndamage || pending_frames || frames_asked()) && frame_due(now);
         if (render) vblank_drawn = vblank_count;
         irq_restore(fl);
         if (trace_active && render) {
@@ -2748,6 +2757,15 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         direct_update();
         return 0;
     }
+    case SYS_WIN_FRAME: {
+        struct window *w = handle_window(handle);
+        if (!w) return -N_ERR_NO_HANDLE;
+        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (!(w->flags & WIN_FRAME_EVENTS)) return -N_ERR_INVALID;
+        w->frame_wanted = true; /* the compositor makes a frame for it (frames_asked) */
+        wake_compositor();
+        return 0;
+    }
     case SYS_WIN_PRESENTATION: {
         struct window *w=handle_window(handle);if(!w)return -N_ERR_NO_HANDLE;
         if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;if(b>1)return -N_ERR_INVALID;
@@ -2941,7 +2959,8 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         return result;
     }
     if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENTATION || num == SYS_WIN_PRESENT ||
-        num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE || num == SYS_WIN_DIRECT)
+        num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE || num == SYS_WIN_DIRECT ||
+        num == SYS_WIN_FRAME)
         handle = handle_get((int)a);
     wm_lock();
     int64_t result = wm_syscall_locked(num,a,b,c,d,e,handle);

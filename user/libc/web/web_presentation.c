@@ -320,8 +320,6 @@ int web_direct_present(web_direct *v,web_doc *d,int screen_width,int screen_heig
        !web_webgl_direct_present(v->gl,rect[0],rect[1],(unsigned)rect[2],(unsigned)rect[3],(unsigned)screen_width,(unsigned)screen_height))
         return -1;
     v->serial=serial;v->shown=true;memcpy(v->rect,rect,sizeof rect);
-    /* PRESENT returned at the display's vertical blank: animation frames follow it. */
-    for(web_doc *at=canvas->owner;at;at=at->frame_parent)web_js_rendering_now(at);
     return 1;
 }
 void web_direct_close(web_direct *v){

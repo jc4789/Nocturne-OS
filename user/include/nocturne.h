@@ -444,6 +444,10 @@ n_result win_fullscreen(window_t *win,bool enabled); /* resize delivered by EV_R
    EV_DIRECT (key 1) says when that starts and (key 0) when it ends; in between the window's own
    buffer is not shown. Without a display driver that can, it never starts. */
 n_result win_direct(window_t *win, bool wanted);
+/* A window opened with WIN_FRAME_EVENTS gets EV_FRAME at the display's next frame even if it presents
+   nothing: an animation waits for the display before it decides what to draw. One EV_FRAME answers the
+   request and the presents before it; a window that is not shown gets it when it is shown again. */
+n_result win_frame(window_t *win);
 /* wait up to timeout_ms (-1 = forever) for an event; returns 1 if *e was filled, 0 on timeout,
    negative once the window is gone. EV_RESIZE is handled (buffer reallocated) before being returned. */
 n_result win_event(window_t *win, struct gui_event *e, int timeout_ms);

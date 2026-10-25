@@ -28099,7 +28099,7 @@ static const char js_worker_runtime[] =
 " * realm has no raster backend, so its 2D context is unavailable (null) and\n"
 " * its blob encoding rejects with NotSupportedError.\n"
 " *\n"
-" * WebGL contexts work in both realms (native Mesa softpipe). A placeholder\n"
+" * WebGL contexts work in both realms (native Mesa contexts). A placeholder\n"
 " * sent to a Worker carries a frame link: shared memory whose header is\n"
 " * [serial, width, height, consumed] followed by straight 0xAARRGGBB rows.\n"
 " * The Worker presents a frame after rendering changed the drawing buffer,\n"

@@ -267,6 +267,20 @@ int64_t web_frames_deadline(web_doc *d) {
     }
     running=false;return result;
 }
+/* A document's frames share its window, so the display's frame is the opportunity of them all. */
+bool web_rendering_wanted(web_doc *d) {
+    if(!d || !d->live)return false;
+    if(web_js_rendering_wanted(d))return true;
+    for(struct web_frame *f=d->frames;f;f=web_frame_walk_next(d,f,true))
+        if(f->document && !f->detached && web_js_rendering_wanted(f->document))return true;
+    return false;
+}
+void web_rendering_now(web_doc *d, double period_ms) {
+    if(!d || !d->live)return;
+    web_js_rendering_now(d,period_ms);
+    for(struct web_frame *f=d->frames;f;f=web_frame_walk_next(d,f,true))
+        if(f->document && !f->detached)web_js_rendering_now(f->document,period_ms);
+}
 bool web_frames_busy(web_doc *d) {
     for(struct web_frame *f=d?d->frames:NULL;f;f=f->next)
         if(!f->detached && !f->failed && (f->request || (f->document && !web_js_complete(f->document))))return true;

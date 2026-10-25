@@ -32,7 +32,7 @@ general-purpose OS for daily use (see [Limits](#limits)).
 - **Desktop**: a compositing window manager in the kernel, with shadows, double buffering, a taskbar, a start menu,
   notifications, a clipboard and a night-sky wallpaper. The default resolution is 1920×1080.
 - **Web browser**: Lexbor builds the HTML tree and QuickJS runs JavaScript; the DOM, CSS, layout, painting and
-  Web APIs are Nocturne's own. It has Workers, IndexedDB, WebSocket, WebGL (Mesa software rendering),
+  Web APIs are Nocturne's own. It has Workers, IndexedDB, WebSocket, WebGL (Mesa; on an NVIDIA GPU the GPU draws),
   WebAssembly, video (FFmpeg, MSE) and developer tools.
 - **Networking**: its own TCP/IP stack (TCP connect and listen, window scaling, loopback), DHCP, DNS,
   HTTP/1.1 and HTTP/2, and TLS 1.2 through BearSSL.
@@ -71,6 +71,9 @@ general-purpose OS for daily use (see [Limits](#limits)).
   - Network: Intel e1000, DEC 21140/21143 (tulip), Hyper-V's synthetic adapter, Realtek RTL8125B (2.5GbE) and
     USB Ethernet (CDC ECM/NCM).
   - Display: the framebuffer Limine hands over. virtio-gpu (virgl) is experimental and off by default (`gpu-enable`).
+    On an NVIDIA GPU (tested: RTX 4070), nvrm (a port of NVIDIA's RM 615.78.08, [ports/nvidia](ports/nvidia/README.md))
+    sets modes, paces frames by the vertical blank and changes the refresh rate, and WebGL draws on the GPU with Zink and
+    NVK. The GSP firmware is not distributed; whoever builds puts it on their own disk.
   - Sound: Intel AC'97, and sound sent to the Enhanced Session.
   - Also: ACPI tables (power-off and reboot), PCI and PCIe ECAM, MSI/MSI-X, PAT, the CMOS clock, serial and entropy.
 - **GUI**: the window manager runs as a kernel thread. That keeps it simple and fast, but a bug in it brings the
@@ -257,7 +260,8 @@ and boot it. On a 12-thread AMD machine (booted from USB, RTL8125B wired LAN, US
 the desktop and showed a video page in the browser. That was before the single disk with drive C:, which has not
 been tried on real hardware yet. This is still early:
 - There is no step-by-step guide and no list of supported machines.
-- There is no sound (Intel HD Audio is not supported), and no GPU driver; the firmware's display mode is used.
+- There is no sound (Intel HD Audio is not supported). GPUs other than NVIDIA's have no driver; the firmware's display
+  mode is used.
 - Files are saved on the stick's C: and survive reboots. C: keeps the image's size (it does not grow to fill a
   larger stick), with about 2 GB free.
 
@@ -474,7 +478,8 @@ there are no tabs, you open more windows instead (`window.open` also makes a new
 - DOM, events, the observers, Range and Selection, history, URL, Blob, FormData, Fetch and XHR, Streams and WebSocket.
 - Dedicated Workers and SharedWorker (shared across windows), MessageChannel and BroadcastChannel.
 - Cookies (SameSite, the Public Suffix List), localStorage and sessionStorage, IndexedDB and OPFS.
-- Canvas 2D, OffscreenCanvas, WebGL and WebGL2 (Mesa's GLSL compiler and softpipe, rendering in software).
+- Canvas 2D, OffscreenCanvas, WebGL and WebGL2 (Mesa: on an NVIDIA GPU, Zink and NVK draw on the GPU; elsewhere
+  softpipe draws on the CPU).
 - WebAssembly: validated by WABT, with wasm2c's C output compiled to native code by TCC inside the OS. There is an
   x86-64 JIT, an interpreter, JSPI, shared memory and Atomics, and threads.
 - `<video>` and `<audio>` (a subset of FFmpeg 9.0.2's decoders), MSE, HLS and DASH, WebVTT captions, full screen
@@ -637,7 +642,8 @@ What Nocturne does not have, so nobody is surprised:
   or files on the clipboard, no microphone, drive or printer sharing. The RDP server uses no encryption; it is
   reachable only through a Hyper-V socket on the host, never over the network.
 - **Sound out only, AC'97 or the Enhanced Session only.** No Intel HD Audio, no USB audio, no recording.
-- **No GPU driver.** Drawing is done on the CPU (WebGL too).
+- **The only GPU driver is NVIDIA's, and it is new.** The desktop is composited on the CPU. Elsewhere WebGL draws in
+  software too.
 - **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files in `C:\Users`.
 - **The browser is a work in progress.** Many sites display, but some features don't work and some pages are slow (see [above](#the-web-browser)).
 - **Real hardware has only just been tried.** Few machines have been checked, and there is no guide yet.
@@ -676,6 +682,8 @@ parts of them out of date.
 - [TinyCC](https://bellard.org/tcc/) 0.9.28rc C compiler (LGPL-2.1, source in `third_party/tinycc`).
 - Mozilla's CA certificate bundle, via [curl](https://curl.se/docs/caextract.html) (MPL-2.0).
 - kei_sched, the selection core of the Kei scheduler (MIT, `kernel/src/sys/kei.c`).
+- The RM and NVKMS of NVIDIA's [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) 615.78.08
+  (MIT and others, `third_party/nvidia-open/NOTICES`).
 - The RTL8125B driver (`kernel/src/net/rtl8125.c`) follows the register layout and initialization sequence of
   Realtek's FreeBSD driver rtl_bsd_drv_v1102.01. This product includes software developed by Bill Paul.
   (4-clause BSD; the full notice is at the top of the file.)
@@ -687,7 +695,8 @@ parts of them out of date.
   Portions of Nocturne are based on the work of the FreeType Team.
 - [Brotli](https://github.com/google/brotli) 1.2.0 (MIT, for WOFF2).
 - A subset of [FFmpeg](https://ffmpeg.org/) 9.0.2's decoders (LGPL-2.1 or later; the GPL parts are disabled).
-- [Mesa](https://mesa3d.org/) 26.3.0-devel's GLSL, NIR and softpipe (MIT and others, `third_party/mesa/licenses`).
+- [Mesa](https://mesa3d.org/) 26.3.0-devel's GLSL, NIR, softpipe, Zink, Vulkan runtime and NVK (MIT and others,
+  `third_party/mesa/licenses`).
 - [WABT](https://github.com/WebAssembly/wabt) 1.0.42 (Apache-2.0).
 - [FormatJS](https://formatjs.github.io/) (MIT), Unicode CLDR and Unicode data (Unicode License V3), collation
   tables from ICU, and the IANA time zone database.

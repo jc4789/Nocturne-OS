@@ -155,6 +155,8 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C72 | GP の環の空きは USERD の GP_GET で数えられる | 却下 → 修理済み（実機 11 回目で確認） | 監査（2026-10-25）：Host が USERD を書き戻すかはチャネルの RAMFC の `USERD_WRITEBACK` で、RM が GSP の中で決める（CPU 側に呼出しは見えない）。dev_ram.ref（open-gpu-doc、GA100）は、書き戻しは止められるのでセマフォーで進みを追うよう勧めている。書き戻されなければ約 340 回目の flush で 10 秒待って装置を失う。修理：環の空きは実行文脈がフェンスで数える（flush ごとの GP の終わりを持ち、足りなければ古い flush のフェンスを待つ、`nvkmd_nocturne_ctx.c`）。`nnrm_chan_submit` は書いて鳴らすだけ。flush は環に入る大きさに分け、不完全な命令の連なりは切らない（上流の nouveau 版と同じ）。host 試験 `nvk_ctx`（偽の GPU は CPU が待つ間だけ flush を終え、GP_GET は書かない） |
 | C73 | NVK と Vulkan の実行時は、物体ごとに libc の遅延メンバーにしてよい | 却下 → 修理済み（実機 11 回目で確認） | 実機 10 回目、WebGL を使うページを開くたびにブラウザーが `rip=0` で落ちた（3 回、スタックの戻り番地 `0x152af0b`）。記号付きで同じ配置に再リンクして引くと `wsi_device_init` の中で、呼んだ `vk_tramp_GetPhysicalDeviceProperties2` が物理装置の入口の表の NULL へ跳んでいた。入口の表は実装を弱い参照で名指しし（上流の生成器、入れない入口は NULL）、弱い参照は遅延メンバーを引き込まない。物体はあるのにリンクされなかった実装が 51 個（`vk_common_GetPhysicalDeviceProperties2`・`CmdCopyBuffer`・`CreatePipelineLayout`・`CreateFramebuffer`・`CreateDescriptorUpdateTemplate` など、NVK の video・生成命令・host copy）。C70 で装置が作れるようになって初めてここまで来た。host 試験はソースを一つずつ組むので、製品のリンクの形を見ていなかった。修理：実行時・WSI・NVK を `ld -r` で一つの物体（`vulkan_nouveau.o`）にして一つの遅延メンバーにする（上流の共有ライブラリーと同じ丸ごとの単位）。`scripts/link_unit.py` は単位から出る弱い参照を他のメンバーが定義していればビルドを止める（実行時の物体を一つ外して試し、止まることを確かめた）。単位に入って初めて分かった MME の試験プログラム（`test_nvk_mme.c`、`main` を持つ）を NVK の一覧から外した。直した後のブラウザーで、物体があるのにリンクされない弱い参照は 0 個 |
 | C74 | アプリは自分の 16 ms の時計で描けば、どのリフレッシュでも表示に揃う | 却下 → 修理済み（実機 11 回目で確認） | 実機 10 回目のユーザーの観察：3D Cube は 60 Hz では 60 fps で安定、120・280 Hz では 55〜60 fps で揺れる。System.log では 120・280 Hz でも合成は垂直帰線で歩調を取っていた（「frames paced by the display driver's vertical blank」の後に「no vertical blank」の行が無い）。cube は 16 ms 眠っては描くだけで、表示の拍を受け取る道が無かった。60 Hz では提出が次の垂直帰線まで待たされて位相が揃い、偶然 60 に見える。120・280 Hz では眠りに合成の分の待ちが足されて 17・18 ms になる。修理：窓を `WIN_FRAME_EVENTS` で開くと、提出を取り込んだ合成の後に `EV_FRAME`（key と x は 0、何度提出しても一つ、表示されていない窓には表示された時）が届く（`abi.h`、`wm.c`）。`ui.c` はすべての窓をこれで開き、面が変わった後の分だけを `UI_EVENT_FRAME` にする。cube はその出来事で次の絵を描き、回転は経過時間で進める（Hz で回る速さが変わらない）。Go の ui は受けて捨てる。QEMU（モード 74.998 Hz、垂直帰線なし）で cube は約 75 fps、最小化と復元で再開、Space で形が変わる。ブラウザーの rAF はまだ 16 ms の時計（全画面の直接表示の間だけ表示に従う） |
+| C75 | ブラウザーの rAF は「描画の機会の後 16 ms」の自分の時計で回してよい | 却下 → 修理済み（QEMU で確認、実機未確認） | 実機 11 回目の WebGL City 54 fps（280 Hz）。`js.c` は描画の機会（rAF の呼出しと観測者）の後に次の機会を「今＋16 ms」に置いていたので、周期は 16 ms ＋ 呼出しの時間になり、表示の Hz には揃わない。QEMU（74.998 Hz、垂直帰線なし）の testufo.com/refreshrate は直す前 38〜42 fps で「Calculating Hz...」のまま Hz を測れなかった。修理：機会の持ち主を表示にする。WM に `SYS_WIN_FRAME`（描かなくても次のフレームで `EV_FRAME`）、`EV_FRAME` の y に表示の周期（µs）、ui に `'F'`（`ui_window_frame`、`UI_EVENT_FRAME` の a が周期 ms）。ブラウザーは rAF か汚れた観測者があれば次のフレームを頼み（`web_rendering_wanted`）、来たら `web_rendering_now` で機会を与える（`web_host.display_frames`）。機会は仕事が無くても一度で使い切り、文書の最初の機会も表示のフレーム。アイドル期間（requestIdleCallback）は次のフレームの見込み（最後＋周期、遅れや非表示なら今＋周期）で切る。観測者だけの別の 16 ms の時計（`observer_due`）は廃した。直接表示の present からの機会は外し、拍の出どころを一つにした。直した後の QEMU の testufo は 69〜74 fps で 74.967〜75.000 Hz を測った（`build/qa/raf-after/`）。最小化中は rAF が止まり、復元で再開。仕事が 1 周期（13.3 ms）を越えるフレームは 2 周期になるので、ここから先の fps は CPU の速さで決まる |
+| C76 | WebGL の GL_VERSION と SHADING_LANGUAGE_VERSION は固定の「Mesa softpipe」でよい | 却下 → 修理済み（QEMU で確認） | 実機 11 回目の写真：Unmasked Renderer は zink（RTX 4070）なのに、GL Version と Shading Language Version は「… (OpenGL ES 3.0 Mesa softpipe)」。`js_webgl.c` の固定の文字列で、Zink を足す前の名残。修理：隠した文字列は RENDERER（「Nocturne WebGL」）と同じく実装の名「Nocturne」にし、どのドライバーが描くかは `WEBGL_debug_renderer_info` だけが言う。QEMU の webglreport で WebGL 1・2 とも「WebGL 2.0 (OpenGL ES 3.0 Nocturne)」などを確認 |
 | C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る。実機 4 回目：BME を入れてから nvrm が落ちて解放されるまで（`RmInitAdapter` の 5.1 秒を含む）、IOMMU の遮断の行は一つも無かった |
 
 ## 5. 担当と受け渡し
@@ -168,13 +170,26 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 ## 6. 次の一手
 
 1. P10（ユーザー）：11 回目で Zink＋NVK が RTX 4070 で描いた（WebGL City 54 fps、3D Cube 280 Hz で 279 fps）。
-   次の実機では、全画面の WebGL が直接表示になるか（`wm:` の行、C56・C57・C66）、窓を閉じて開き直せるか、
-   長く動かしても止まらないか（GP の環とフェンス、C72）を見る。
+   次の実機では、WebGL City と testufo.com/refreshrate の fps が表示の Hz に近づくか（C75）、webglreport の
+   GL Version が「Nocturne」になったか（C76）、全画面の WebGL が直接表示になるか（`wm:` の行、C56・C57・C66）、
+   窓を閉じて開き直せるか、長く動かしても止まらないか（GP の環とフェンス、C72）を見る。
 2. 実機の結果で C15・C21〜C23・C25・C26・C28 を受理か却下へ。失敗した境界から直す。
 3. 性能（C9・C20・C25）：同じ WebGL を softpipe と Zink で比べる。全画面は直接表示（D11）になるか（ログの `wm:` の行）、窓の中の読み戻しとポーリングが重ければ直す。
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-25（11 回目の後）：11 回目の残りを直した（C75・C76）。copy boxes の警告は調べて直さない：Zink は一つの
+  画像への複写の矩形をバッチごとに数え、バッチが終わると数え直す。窓への読み戻しは毎フレーム完了を待つ
+  （バッチが空く）ので、100 を超えたのはページが一つのバッチで同じテクスチャーへ上げた回数で、警告は資源ごとに
+  一度だけ。QEMU（WHPX、4 コア、4096 MiB、1920×1080、`build/qa/raf-before/`・`raf-after/`）：testufo は直す前
+  38〜42 fps で Hz を測れず、直した後 69〜74 fps で 74.967〜75.000 Hz。`--debug-js` の輪の計測では 1 フレームの
+  仕事が約 9〜11 ms（tick 6〜8 ms）、待ちが約 5 ms で、13.3 ms の周期を越えたフレームが 2 周期になる。
+  webglreport の GL Version は WebGL 1・2 とも「Nocturne」（QEMU なので描画器は softpipe）、get.webgl.org の立方体、
+  最小化で止まり復元で再開、戻る、YouTube のホーム。前提の監査（サブ）で、仕事の無い機会を使い切らないと同じ
+  帰線で rAF が二度走ること、アイドル期間が 50 ms まで伸びること、観測者の 16 ms の時計が残ること、'F' の失敗で
+  頼みが残ることを見つけて直した。直した後の媒体（`raf-after2/`）：testufo 59→74 fps・74.997 Hz、get.webgl.org の
+  立方体、最小化と復元、reddit.com/r/codex のホイールで下と先頭、3D Cube 75 fps、serial.log に落ちた行なし。
 
 - 2026-10-25（11）：実機 11 回目（ユーザー、USB 起動、c31dddde の媒体、写真 3 枚と `build/qa/realhw11/`）。
   System.log に「MESA: info: Nocturne GL: drawing on the GPU with zink Vulkan 1.4(NVIDIA GeForce RTX 4070 (NVK AD10x)

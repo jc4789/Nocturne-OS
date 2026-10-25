@@ -8,7 +8,8 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 
 状態：RM、OS 層、クライアントと NVK の接続がある。2026-10-20 の再監査修理は
 `docs/nvidia/review-87dd1e2f-map.json` で責務と検証範囲を管理する。ホスト試験は native サービスを mock にするため、
-その成功から PCI、GPU DMA、キャッシュ、GSP 起動の成功を推論しない。**NVIDIA 実機は未確認。**
+その成功から PCI、GPU DMA、キャッシュ、GSP 起動の成功を推論しない。実機（RTX 4070）では 2026-10-25 に、
+モード設定（280 Hz まで）と Zink＋NVK による WebGL が動いた（台帳の実機 11 回目）。
 
 ## 構成
 

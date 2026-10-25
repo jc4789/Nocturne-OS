@@ -254,8 +254,11 @@ struct web_js_state {
     struct js_mutation_record *mutation_first,*mutation_last;
     bool mutation_job_pending;
     bool observers_active, observers_force, pointer_capture_pending;
-    uint64_t observer_due, observer_layout, observer_dom;
-    uint64_t rendering_due, next_timer_order;
+    uint64_t observer_layout, observer_dom;
+    /* The next rendering opportunity: our clock's (16 ms after the last), or with host.display_frames
+       the display's frame once it came (UINT64_MAX before); rendering_next is when that frame is
+       expected, rendering_period_ms apart (the display's, from web_js_rendering_now). */
+    uint64_t rendering_due, rendering_next, rendering_period_ms, next_timer_order;
     int observer_x, observer_y, observer_w, observer_h;
     uint32_t next_timer;
     unsigned pending_count;
@@ -470,10 +473,24 @@ bool web_js_video_present(web_doc *d, const struct web_video_patch *patch) {
     if (!d || !d->live || d->inert || !d->js || !d->js->host.video_present) return false;
     return d->js->host.video_present(d->js->host.opaque,d,patch);
 }
-void web_js_rendering_now(web_doc *d) {
-    /* The display took a frame and waited for its vertical blank: the next
-       rendering opportunity is now, so animation frames follow the display. */
-    if (d && d->js && !d->js->disabled) d->js->rendering_due = uptime_ms();
+void web_js_rendering_now(web_doc *d, double period_ms) {
+    /* The display showed a frame: the rendering opportunity is now, so animation
+       frames follow the display, and the next frame comes a period later. */
+    struct web_js_state *s = d ? d->js : NULL;
+    if (!s || s->disabled) return;
+    if (period_ms >= 1 && period_ms <= 1000) s->rendering_period_ms = (uint64_t)period_ms;
+    s->rendering_due = uptime_ms();
+    s->rendering_next = s->rendering_due + s->rendering_period_ms;
+}
+static bool observers_dirty(struct web_js_state *s);
+/* Animation frames or dirty rendering observers wait for a rendering opportunity. */
+static bool rendering_wanted(struct web_js_state *s) {
+    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].kind == 2) return true;
+    return observers_dirty(s);
+}
+bool web_js_rendering_wanted(web_doc *d) {
+    struct web_js_state *s = d ? d->js : NULL;
+    return s && !s->disabled && rendering_wanted(s);
 }
 static void report_allocation_failure(struct web_js_state *s) {
     struct js_alloc_diagnostics *d=&s->runtime_owner->allocation;
@@ -4271,7 +4288,6 @@ static JSValue native_observers(JSContext *ctx, JSValueConst this_val, int argc,
     struct web_js_state *s=state(ctx);
     s->observers_active=argc && JS_ToBool(ctx,argv[0])>0;
     s->observers_force=s->observers_active;
-    if(!s->observer_due)s->observer_due=uptime_ms();
     return JS_UNDEFINED;
 }
 static JSValue native_cookie_enabled(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -7559,8 +7575,20 @@ static bool run_observers(struct web_js_state *s,uint64_t now) {
     if(s->host.scroll)s->host.scroll(s->host.opaque,&s->observer_x,&s->observer_y);
     JSValue result=custom_element_hook(s,"observerFrame",0,NULL);
     if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
-    end_task(s);s->observer_due=uptime_ms()+16;s->observer_turn=false;
+    end_task(s);s->observer_turn=false;
     return true;
+}
+/* The opportunity is taken: the next is the display's next frame (web_js_rendering_now), else our
+   clock's, 16 ms on. */
+static void rendering_taken(struct web_js_state *s){
+    s->rendering_due=s->host.display_frames?UINT64_MAX:uptime_ms()+16;
+}
+/* When the next rendering opportunity is expected, for an idle period to end before it: our clock's,
+   else the display's next frame, or a period from now when that is late (or the window is not
+   shown and gets no frames). */
+static uint64_t rendering_expected(const struct web_js_state *s,uint64_t now){
+    if(!s->host.display_frames)return s->rendering_due;
+    return s->rendering_next>now?s->rendering_next:now+s->rendering_period_ms;
 }
 struct js_frame_callback {uint32_t id;unsigned index;uint64_t order;};
 static int frame_callback_order(const void *left,const void *right){
@@ -7572,7 +7600,12 @@ static bool run_rendering(struct web_js_state *s,uint64_t now){
     size_t count=0;
     for(unsigned i=0;i<s->timer_capacity;i++)
         if(s->timers[i].id && s->timers[i].kind==2 && s->timers[i].due<=now)count++;
-    if(!count && !observers_dirty(s))return false;
+    if(!count && !observers_dirty(s)){
+        /* The display's frame is used even with nothing to render: animation frames asked
+           after it wait for the next one, not run between frames. */
+        if(s->host.display_frames)s->rendering_due=UINT64_MAX;
+        return false;
+    }
     /* HTML update-the-rendering runs the current animation callback map before
        style/layout, ResizeObserver, and intersection observations. A snapshot
        prevents callbacks registered by a callback from joining this frame. */
@@ -7580,7 +7613,7 @@ static bool run_rendering(struct web_js_state *s,uint64_t now){
     if(count){
         if(count>SIZE_MAX/sizeof *frames)return false;
         frames=js_malloc(s->ctx,count*sizeof *frames);
-        if(!frames){exception(s);s->rendering_due=now+16;return true;}
+        if(!frames){exception(s);rendering_taken(s);return true;}
         size_t at=0;
         for(unsigned i=0;i<s->timer_capacity;i++){
             const struct js_timer *t=&s->timers[i];
@@ -7599,7 +7632,7 @@ static bool run_rendering(struct web_js_state *s,uint64_t now){
     }
     js_free(s->ctx,frames);
     if(!s->disabled && s->stream_generation==generation)run_observers(s,now);
-    s->rendering_due=uptime_ms()+16;
+    rendering_taken(s);
     return true;
 }
 static bool run_document_event(struct web_js_state *s) {
@@ -7688,7 +7721,7 @@ static bool idle_eligible(struct web_js_state *s, uint64_t now) {
         s->events || s->posted || s->media_width != d->width || s->media_height != d->height ||
         family->shadow_slots_pending || family->details_toggle_first || JS_IsJobPending(s->rt) ||
         web_worker_runnable(s->workers) || ready_script(s, &script)) return false;
-    if (observers_dirty(s) && s->observer_due <= now) return false;
+    if (observers_dirty(s) && s->rendering_due <= now) return false;
     int64_t atomics = web_atomics_deadline(s->ctx, now);
     if (atomics >= 0 && (uint64_t)atomics <= now) return false;
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->done || p->deadline <= now) return false;
@@ -7705,7 +7738,7 @@ static uint64_t idle_period_deadline(struct web_js_state *s, uint64_t now) {
        must not shrink every idle period of a playing page to nothing. */
     for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && timer_task_due(s, &s->timers[i]) < end) end = timer_task_due(s, &s->timers[i]);
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->deadline < end) end = p->deadline;
-    if (observers_dirty(s) && s->observer_due < end) end = s->observer_due;
+    if (rendering_wanted(s)) { uint64_t next = rendering_expected(s, now); if (next < end) end = next; }
     int64_t worker = web_worker_deadline(s->workers,now);
     if (worker >= 0 && (uint64_t)worker < end) end = (uint64_t)worker;
     int64_t atomics = web_atomics_deadline(s->ctx, now);
@@ -8103,6 +8136,9 @@ static JSValue load_browser_bindings(JSContext *ctx) {
 void web_js_start(web_doc *d, const struct web_host *host) {
     struct web_js_state *s = calloc(1, sizeof *s); if (!s) return;
     d->js = s; s->doc = d; s->stream_generation=1; if (host) s->host = *host;
+    /* The display's first frame, not the moment the document starts, is its first opportunity. */
+    if(s->host.display_frames)s->rendering_due=UINT64_MAX;
+    s->rendering_period_ms=16;
     d->profile_enabled=s->host.debug_js;
     if(s->host.debug_js)web_webgl_set_profile(true);
     s->runtime_owner=d->frame_parent && d->frame_parent->js?d->frame_parent->js->runtime_owner:s;

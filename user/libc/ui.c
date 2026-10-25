@@ -337,7 +337,7 @@ struct uiwin {
     float px, py;
     uint64_t now, redraw_at, caret_at;
     bool dirty, animating, caret_on, hold;
-    bool frame_wanted;       /* a surface changed since the last UI_EVENT_FRAME */
+    bool frame_wanted;       /* a surface changed, or the app asked ('F'), since the last UI_EVENT_FRAME */
     /* The focused field's text as the engine edits it: ahead of the app's views, so keys
        that come before the app has sent back the last value build on it, not on the view. */
     char *edit;
@@ -1802,7 +1802,7 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
     case EV_FRAME: /* also after pictures of widgets alone, which nobody waits for */
         if (w->frame_wanted) {
             w->frame_wanted = false;
-            emit(w, UI_EVENT_FRAME, NULL, 0, 0, 0, 0, NULL, 0);
+            emit(w, UI_EVENT_FRAME, NULL, 0, 0, e->y / 1000.0, 0, NULL, 0);
         }
         break;
     }
@@ -2219,6 +2219,14 @@ n_result ui_session_send(struct ui_session *s, const void *msg, size_t n) {
         if (w) win_free(s, w);
         return 0;
     }
+    case 'F': {
+        struct uiwin *w = win_of(s, rd_u32(&r));
+        if (r.bad || r.p != r.end) return -N_ERR_INVALID;
+        if (!w) return 0;
+        n_result asked = win_frame(w->win);
+        if (asked == 0) w->frame_wanted = true;
+        return asked;
+    }
     case 'M': {
         uint32_t id = rd_u32(&r);
         double size = rd_f64(&r);
@@ -2509,6 +2517,15 @@ void ui_window_close(struct ui_session *s, uint32_t window) {
     wr_u32(&w, window);
     if (!w.bad) ui_session_send(s, w.p, w.n);
     free(w.p);
+}
+
+n_result ui_window_frame(struct ui_session *s, uint32_t window) {
+    struct ui_bytes w = {0};
+    wr_u8(&w, 'F');
+    wr_u32(&w, window);
+    n_result asked = w.bad ? -N_ERR_NO_MEMORY : ui_session_send(s, w.p, w.n);
+    free(w.p);
+    return asked;
 }
 
 void ui_window_title(struct ui_session *s, uint32_t window, const char *title) {

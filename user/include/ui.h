@@ -54,6 +54,7 @@ extern const struct ui_theme ui_theme;
      'Q'                                                   the theme
      'S' u32 surface, u32 width, u32 height [u32 flags]    make or resize a surface (UI_SURFACE_DEEP)
      'P' u32 surface [u32 x, y, width, height]             its pixels (in that part) changed
+     'F' u32 window                                        UI_EVENT_FRAME at the next frame, changed or not
      'D' u32 surface                                       drop it
    A node is: u8 kind length, kind, u16 property count, u16 child count, the
    properties, the children. A property is: u8 name length, name, u8 type,
@@ -94,9 +95,11 @@ enum {
     UI_EVENT_DIRECT,     /* the window (node 0xFFFFFFFF) asked for win_direct: the display driver started (a = 1)
                             or stopped (a = 0) showing the app's own images instead of the window (EV_DIRECT) */
     UI_EVENT_FRAME,      /* the window (node 0xFFFFFFFF): a frame of the screen took what ui_surface_changed showed,
-                            one event for any number of changes. It comes at the display's pace (WIN_FRAME_EVENTS),
-                            so an animation that draws its next picture on it draws once a frame at any refresh
-                            rate; while the window is not shown it waits */
+                            or came after ui_window_frame; one event for any number of changes and requests;
+                            a = the display's frame period in ms (the next frame comes about that much later). It
+                            comes at the display's pace (WIN_FRAME_EVENTS), so an animation that draws its next
+                            picture on it draws once a frame at any refresh rate; while the window is not shown
+                            it waits */
 };
 /* A field holds its caret and selection itself (arrows, Home/End, Shift, Ctrl for words, Ctrl+A/C/X/V,
    clicks and drags); the keys it has no use for come as UI_EVENT_KEY. Some properties act when their
@@ -188,6 +191,9 @@ n_result ui_window(struct ui_session *s, uint32_t window, int width, int height,
                    int *out_width, int *out_height);
 void ui_window_close(struct ui_session *s, uint32_t window);
 void ui_window_title(struct ui_session *s, uint32_t window, const char *title);
+/* UI_EVENT_FRAME at the display's next frame even if nothing changes ('F'): an animation that waits for
+   the display before it decides what to draw (a browser's animation frames). 0 when it was asked. */
+n_result ui_window_frame(struct ui_session *s, uint32_t window);
 /* A surface of width x height pixels to draw into (NULL if it cannot be made);
    ui_surface_changed shows what was drawn, ui_surface_changed_rect only the part
    that changed (only that part is copied to the screen). */

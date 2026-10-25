@@ -1,5 +1,5 @@
-/* Real Canvas2D subset and the WebGL 1/2 attachment (native Mesa softpipe
- * contexts, js_webgl.c); other context types return null. Native storage is
+/* Real Canvas2D subset and the WebGL 1/2 attachment (native Mesa contexts,
+ * js_webgl.c); other context types return null. Native storage is
  * painted by web_paint. */
 const canvasBridge = (() => {
     'use strict';

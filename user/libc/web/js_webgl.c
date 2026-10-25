@@ -1,4 +1,4 @@
-/* WebGL 1 and WebGL 2 on Mesa's softpipe rasterizer (ports/mesa/nocturne_gl).
+/* WebGL 1 and WebGL 2 on Mesa (ports/mesa/nocturne_gl: Zink on the GPU, else softpipe).
  * The interfaces are native classes shared by the Window realm (canvas
  * elements) and Worker realms (OffscreenCanvas). OpenGL ES reads client
  * memory for vertex arrays without a buffer and for indices without an
@@ -4016,15 +4016,18 @@ static const struct parameter parameters[] = {
     PX(GL_MAX_COLOR_ATTACHMENTS, P_INT, X_WEBGL_draw_buffers), PX(GL_MAX_DRAW_BUFFERS, P_INT, X_WEBGL_draw_buffers),
 };
 
+/* The masked strings name the implementation, Nocturne, as RENDERER does; which driver draws
+   (Zink on the GPU, else softpipe) only WEBGL_debug_renderer_info tells. The ES versions are the
+   ones WebGL 1 and 2 are defined on. */
 static JSValue string_parameter(JSContext *ctx, struct webgl *gl, GLenum pname) {
     switch (pname) {
     case GL_VENDOR: return JS_NewString(ctx, "Nocturne");
     case GL_RENDERER: return JS_NewString(ctx, "Nocturne WebGL");
     case GL_VERSION:
-        return JS_NewString(ctx, gl->version == 2 ? "WebGL 2.0 (OpenGL ES 3.0 Mesa softpipe)" : "WebGL 1.0 (OpenGL ES 2.0 Mesa softpipe)");
+        return JS_NewString(ctx, gl->version == 2 ? "WebGL 2.0 (OpenGL ES 3.0 Nocturne)" : "WebGL 1.0 (OpenGL ES 2.0 Nocturne)");
     case GL_SHADING_LANGUAGE_VERSION:
-        return JS_NewString(ctx, gl->version == 2 ? "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Mesa softpipe)"
-                                                  : "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Mesa softpipe)");
+        return JS_NewString(ctx, gl->version == 2 ? "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Nocturne)"
+                                                  : "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Nocturne)");
     case WEBGL_UNMASKED_VENDOR: return JS_NewString(ctx, (const char *)glGetString(GL_VENDOR));
     case WEBGL_UNMASKED_RENDERER: return JS_NewString(ctx, (const char *)glGetString(GL_RENDERER));
     }

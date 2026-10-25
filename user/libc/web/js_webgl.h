@@ -1,5 +1,5 @@
 #pragma once
-/* WebGL 1/2 rendering contexts on Mesa softpipe (ports/mesa/nocturne_gl).
+/* WebGL 1/2 rendering contexts on Mesa (ports/mesa/nocturne_gl).
  * The classes are realm-neutral: the Window realm attaches a context to an
  * HTMLCanvasElement, Worker realms to an OffscreenCanvas. */
 #include "quickjs.h"

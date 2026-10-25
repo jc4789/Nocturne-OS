@@ -33,6 +33,9 @@ static web_doc *fullscreen_doc,*pip_doc;
    display shows the window again (EV_DIRECT key 0); direct_shown is the display's last word. */
 static web_direct *direct;
 static bool direct_wanted, direct_shown;
+/* The page's rendering opportunities are the display's frames (host.display_frames): frame_asked while
+   the window waits for the one asked of it (ui_window_frame, answered by UI_EVENT_FRAME). */
+static bool frame_asked;
 static web_node *pip_node;
 static window_t *pip_window;
 static uint64_t pip_revision;
@@ -1507,6 +1510,10 @@ static void take_engine_events(void) {
         case UI_EVENT_DIRECT:
             inbox_put((struct gui_event){.type = EV_DIRECT, .key = e.a ? 1 : 0});
             break;
+        case UI_EVENT_FRAME: /* only a time: safe while a script waits on the C stack */
+            frame_asked = false;
+            if (doc) web_rendering_now(doc, e.a);
+            break;
         default: break; /* the window's own size: the surface's comes as UI_EVENT_CANVAS */
         }
     }
@@ -1808,6 +1815,7 @@ static const struct web_host browser_host = {
     , .navigate_mode = host_navigate_mode
     , .storage = host_storage, .storage_events = true
     , .media_range = true
+    , .display_frames = true
 };
 
 static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
@@ -3011,6 +3019,8 @@ int main(int argc, char **argv) {
                 console_add("error", "Local storage flush failed; retrying later.");
             if (webstorage_pending(storage) && (timeout < 0 || timeout > 100)) timeout = 100;
         }
+        if (doc && w && !frame_asked && web_rendering_wanted(doc))
+            frame_asked = ui_window_frame(ui, WINDOW) == 0;
         int64_t deadline = web_deadline(doc); /* retired media children also wake a document-less window */
         if (deadline >= 0) {
             int due = deadline <= (int64_t)now ? 0 : (int)MIN(deadline - (int64_t)now, 0x7fffffff);

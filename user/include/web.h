@@ -36,9 +36,9 @@ void web_presentation_resize(web_doc *,int width,int height);
 typedef struct web_direct web_direct;
 web_direct *web_direct_open(web_doc *d, int screen_width, int screen_height);
 /* The canvas's newest frame to the display (screen_width x screen_height: the fullscreen window's size)
-   while it shows the window directly (shown: EV_DIRECT key 1 last): 1 shown, animation frames run now;
-   0 nothing new; -1 not shown (paint it through the window; always when !shown); -2 d no longer shows
-   this context directly. */
+   while it shows the window directly (shown: EV_DIRECT key 1 last): 1 shown; 0 nothing new; -1 not
+   shown (paint it through the window; always when !shown); -2 d no longer shows this context directly.
+   The window's frames (web_rendering_now) pace the animation frames in both cases. */
 int web_direct_present(web_direct *v, web_doc *d, int screen_width, int screen_height, bool shown);
 /* Gives the display's images back. Only once the display no longer shows them (EV_DIRECT key 0). */
 void web_direct_close(web_direct *v);
@@ -187,6 +187,9 @@ struct web_host {
     /* Native embedder-selected deadline; 0 keeps the uint32 representation
        maximum. Page code cannot reset it. */
     uint32_t js_task_budget_ms;
+    /* The embedder's display gives the rendering opportunities (web_rendering_now). Without it
+       animation frames and rendering observers run on the engine's own clock, 16 ms apart. */
+    bool display_frames;
     /* Optional native-only cancellation checkpoint. NEVER dispatch JS/DOM,
        layout, navigation or free a document here. Document paint/scroll is
        allowed ONLY after web_native_input_ready confirms a committed snapshot;
@@ -238,6 +241,13 @@ int64_t web_media_background_deadline(uint64_t now_ms);
 void web_avmedia_debug(bool enabled);
 /* -1: no deadline, otherwise an absolute uptime_ms() deadline. */
 int64_t web_deadline(web_doc *d);
+/* With host.display_frames, the rendering opportunities (HTML "update the rendering": animation
+   frames, then the rendering observers) of d and its frames come from the embedder's display:
+   while web_rendering_wanted, the embedder asks its window for the display's next frame
+   (ui_window_frame) and calls web_rendering_now when it comes (UI_EVENT_FRAME), with the display's
+   frame period: idle callbacks end before the frame after it. */
+bool web_rendering_wanted(web_doc *d);
+void web_rendering_now(web_doc *d, double period_ms);
 /* The event queue the browser's main loop waits on. Atomics.waitAsync waiters
  * report into it; the loop adds its window and transports with its own tokens
  * and hands every report it receives to web_wait_events. */
