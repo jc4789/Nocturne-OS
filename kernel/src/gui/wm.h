@@ -41,9 +41,6 @@ int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeo
    into the state the driver reads, unless a later wish is there already. */
 struct n_screen_mode;
 void wm_screen_mode(const struct n_screen_mode *mode, uint64_t serial);
-/* The boot screen is where the screen is drawn again (dev/pciuser.c): a Ctrl+Alt+Esc request to
-   the display driver for it (struct n_screen_state take_back) is over. */
-void wm_screen_given_back(void);
 
 /* Remote display: rectangle copies hold WM ownership only for the copy, never
    while encoding or sending a network packet. */
@@ -55,6 +52,7 @@ struct wm_rect {
 bool wm_remote_attach(int *w, int *h);
 void wm_remote_resize(int *w, int *h); /* the viewer's window changed size: same rules */
 void wm_remote_detach(void);
+bool wm_remote_viewing(void); /* a viewer has the desktop at its size; takes no lock */
 int wm_remote_damage(struct wm_rect *out, int max); /* takes the areas redrawn since the last call */
 bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h);
 int wm_cursor_shape(void);

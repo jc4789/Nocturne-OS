@@ -80,13 +80,17 @@ static uint8_t *back_deep, *wall_deep;
 static struct wait_queue wm_wq;
 static unsigned pending_frames;
 /* Without vertical blanks, a frame with damage starts at frame_next_us (µs of uptime) at the
-   earliest, and the one after it a frame_period_us later: frames start on the scheduler's
-   millisecond, the deadlines keep the cadence's fraction, so 120 Hz is 120 frames a second and not
-   one every 9 ms. A frame later than a period starts the count anew. */
-static uint64_t frame_period_us, frame_next_us;
+   earliest, and the one after it a frame period later: the refresh of the mode the screen shows
+   (frame_period), so the desktop draws no frame the monitor would not show. Frames start on the
+   scheduler's millisecond, the deadlines keep the period's fraction, so 59.95 Hz is 59.95 frames a
+   second and not one every 16 ms. A frame later than a period starts the count anew.
+   frame_mhz is the refresh paced at last. Compositor thread. */
+#define FALLBACK_REFRESH_MHZ 60000u /* a mode whose refresh nobody says */
+static uint64_t frame_next_us;
+static uint32_t frame_mhz;
 /* A display driver's vertical blanks (n_pci_screen_vblank, dev/pciuser.c) of the scanout the
    screen is drawn into: while they come, a frame with damage starts at the next blank, not after
-   frame_period_us; VBLANK_LOST_MS without one and the period paces frames again. vblank_count is
+   a frame period; VBLANK_LOST_MS without one and the period paces frames again. vblank_count is
    the driver's count of the last blank, vblank_drawn the one the last frame started at. BSP,
    changed with interrupts off. */
 #define VBLANK_LOST_MS 100
@@ -107,10 +111,9 @@ static struct window *direct_win;
 static int direct_shape = -1;
 static struct n_screen_state direct_state = {.serial = 1, .hot_x = DIRECT_HOT, .hot_y = DIRECT_HOT};
 static struct wait_queue direct_wq;
-/* Settings (struct desktop_settings): cadence, pointer speed with its
-   leftover quarter steps, and the deep-colour mode the compositor applies
-   between frames. */
-static uint32_t refresh_hz;
+/* Settings (struct desktop_settings): pointer speed with its leftover quarter steps, and smooth
+   gradients as the user wants them; the compositor applies them between frames while the scanout
+   shown takes them (fb_dither_able). */
 static int pointer_speed, pointer_rest_x, pointer_rest_y;
 static bool deep_wanted;
 static bool presenting_back;
@@ -478,31 +481,6 @@ int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeo
     return result;
 }
 
-/* Ctrl+Alt+Esc while a display driver's scanout is where the screen is drawn: that driver is asked
-   (take_back) to give the boot screen back and the display to its own console, the way out of a
-   display that shows nothing of the desktop. Asked once; cleared once the boot screen is back
-   (wm_screen_given_back). Under the WM lock. */
-static bool direct_take_back(void) {
-    if (!pci_user_screen_driven()) return false;
-    if (!direct_state.take_back) {
-        kprintf("wm: Ctrl+Alt+Esc: the display driver is asked to give the boot screen back\n");
-        direct_state.take_back = 1;
-        direct_state.serial++;
-        wq_wake_all(&direct_wq);
-    }
-    return true;
-}
-
-void wm_screen_given_back(void) {
-    wm_lock();
-    if (direct_state.take_back) {
-        direct_state.take_back = 0;
-        direct_state.serial++;
-        wq_wake_all(&direct_wq);
-    }
-    wm_unlock();
-}
-
 /* ---- window lifetime ---- */
 static void unmap_user(struct window *w) {
     if (!w->pml4) return;
@@ -868,10 +846,11 @@ static void free_deep(int w, int h) {
     back_deep = wall_deep = NULL;
 }
 
-/* Settings switched the 10 bpc simulation. Only from the compositor thread
-   between frames; windows keep their own planes, so only the desktop's change. */
+/* Smooth gradients (the 10 bpc simulation) on or off: the user switched them, or the scanout shown
+   took or stopped taking them. Only from the compositor thread between frames; windows keep their
+   own planes, so only the desktop's change. */
 static void set_deep_simulation(bool on) {
-    if (!fb_set_simulated(on)) { deep_wanted = fb.simulated; return; }
+    if (!fb_set_simulated(on)) return; /* the scanout changed meanwhile: the next frame looks again */
     free_deep(sw, sh);
     if (!alloc_deep(sw, sh, &back_deep, &wall_deep)) {
         kprintf("wm: no memory for deep colour, using 8 bpc\n");
@@ -1050,7 +1029,7 @@ static void draw_volume_panel(canvas_t *c) {
     gfx_fill_round(c, v.x, v.y, v.w, v.h, 10, RGB(70, 60, 120));
     gfx_fill_round(c, v.x + 1, v.y + 1, v.w - 2, v.h - 2, 9, RGB(22, 20, 44));
     gfx_text(c, v.x + 16, v.y + 12, "Volume", RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
-    const char *dev = audio_remote() ? "Remote desktop" : audio_card() ? audio_card() : "No sound device";
+    const char *dev = audio_output() ? audio_output() : "No sound device";
     gfx_text(c, v.x + v.w - 16 - gfx_text_width(dev, FONT_SMALL), v.y + 12, dev, RGB(150, 150, 190), TRANSPARENT,
              FONT_SMALL);
     gfx_fill_round(c, m.x, m.y, m.w, m.h, 8, mute ? RGB(90, 40, 60) : RGB(44, 38, 90));
@@ -1929,9 +1908,6 @@ static void handle_key(const struct key_event *k) {
     struct window *f = focused();
     if (k->pressed) {
         bool ctrl = k->mods & MOD_CTRL, alt = k->mods & MOD_ALT;
-        /* while an app's driver holds the screen: stop it, the screen comes back (dev/pciuser.c);
-           while a display driver's scanout shows it: ask that driver for the boot screen */
-        if (ctrl && alt && k->key == KEY_ESC && (pci_user_screen_take_back() || direct_take_back())) return;
         if (k->key == KEY_SUPER || (ctrl && k->key == KEY_ESC)) {
             set_menu(!menu_open);
             return;
@@ -2269,10 +2245,21 @@ static bool vblank_paced(uint64_t now) { return vblank_seen && now - vblank_at_m
 static bool frame_due(uint64_t now) {
     return vblank_paced(now) ? vblank_count != vblank_drawn : now * 1000 >= frame_next_us;
 }
+/* The frame period in µs: the refresh of the mode the screen shows, the display driver's while its
+   scanout is shown, else the firmware's (from the monitor's EDID), else FALLBACK_REFRESH_MHZ. */
+static uint64_t frame_period(void) {
+    uint32_t mhz = fb_boot_shown() ? fb.refresh_mhz : screen_shown_refresh_mhz();
+    if (!mhz) mhz = FALLBACK_REFRESH_MHZ;
+    if (mhz != frame_mhz) {
+        frame_mhz = mhz;
+        kprintf("wm: without vertical blanks, frames are paced at the mode's %u.%03u Hz\n", mhz / 1000, mhz % 1000);
+    }
+    return 1000000000ull / mhz;
+}
 /* The next frame's earliest start, after one started at now (ms). */
 static void frame_started(uint64_t now) {
-    uint64_t us = now * 1000;
-    frame_next_us = us - frame_next_us < frame_period_us ? frame_next_us + frame_period_us : us + frame_period_us;
+    uint64_t us = now * 1000, period = frame_period();
+    frame_next_us = us - frame_next_us < period ? frame_next_us + period : us + period;
 }
 
 /* ---- compositor thread ---- */
@@ -2301,8 +2288,8 @@ static void wm_thread(void *arg) {
                 kprintf("wm: frames paced by the display driver's vertical blank (count %lu at %lu ns)\n",
                         (unsigned long)first_count, (unsigned long)first_ns);
             else
-                kprintf("wm: no vertical blank for %u ms; frames paced at %u Hz (0=unpaced)\n", VBLANK_LOST_MS,
-                        (unsigned)refresh_hz);
+                kprintf("wm: no vertical blank for %u ms; frames are paced at the mode's refresh again\n",
+                        VBLANK_LOST_MS);
         }
         wm_lock();
         struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
@@ -2320,7 +2307,8 @@ static void wm_thread(void *arg) {
         }
 
         /* Nothing is presenting between frames: the planes can be replaced. */
-        if (deep_wanted != fb.simulated) set_deep_simulation(deep_wanted);
+        bool smooth = deep_wanted && fb_dither_able();
+        if (smooth != fb.simulated) set_deep_simulation(smooth);
 
         struct tm_parts tp;
         time_to_parts(time_now(), &tp);
@@ -2515,6 +2503,10 @@ void wm_remote_detach(void) {
     wm_unlock();
 }
 
+/* Whether a remote viewer has the desktop at its window's size now. Read without wm_lock, so a
+   caller holding another lock may ask. */
+bool wm_remote_viewing(void) { return __atomic_load_n(&remote_users, __ATOMIC_RELAXED) > 0; }
+
 bool wm_screen_resized(uint32_t w, uint32_t h) {
     if (!running) return true;
     wm_lock();
@@ -2549,25 +2541,13 @@ bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h) {
 
 int wm_cursor_shape(void) { return cursor_shape; }
 
-/* Frame period for a cadence, in µs (frame_next_us). */
-static uint64_t refresh_period(uint32_t hz) { return hz ? 1000000 / hz : 0; }
-
 void wm_init(void) {
     /* PCI has been enumerated. Optional offscreen GPU never changes the display
        or the RAM frame used by Enhanced Session/RDP. */
     gpu_init();
     sw = fb.width;
     sh = fb.height;
-    /* Limine's framebuffer ABI has no refresh rate/vblank signal. Cadence is
-       deployment policy, not an invented hardware rate: boot configuration
-       supplies wmrefresh=<Hz>. Zero/absent keeps the unpaced diagnostic path.
-       At most the scheduler's 1000 Hz. */
-    uint64_t hz;
-    if (cmdline_number("wmrefresh", &hz)) refresh_hz = hz > 1000 ? 1000 : (uint32_t)hz;
-    frame_period_us = refresh_period(refresh_hz);
     deep_wanted = fb.simulated;
-    kprintf("wm: configured frame rate %u Hz (0=unpaced); a display driver's vertical blanks pace frames "
-            "while they come\n", (unsigned)refresh_hz);
     size_t pages = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
     if (!bb || !wp) {
@@ -2826,26 +2806,17 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
             if (c == SCREEN_SETTINGS_SET) {
                 if (!user_ok(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
                 struct desktop_settings n = *ds;
-                if (n.refresh_hz > 1000 || n.pointer_speed < -2 || n.pointer_speed > 2 ||
-                    n.pointer_y > POINTER_Y_INVERT || (n.deep_simulation && !fb.native))
-                    return -N_ERR_INVALID;
-                refresh_hz = n.refresh_hz;
-                frame_period_us = refresh_period(refresh_hz);
+                if (n.pointer_speed < -2 || n.pointer_speed > 2 || n.smooth_gradients > 1) return -N_ERR_INVALID;
                 if (n.pointer_speed != pointer_speed) pointer_rest_x = pointer_rest_y = 0;
                 pointer_speed = n.pointer_speed;
-                input_set_pointer_y(n.pointer_y);
-                deep_wanted = n.deep_simulation != 0;
+                deep_wanted = n.smooth_gradients != 0;
                 wake_compositor();
             }
             if (!user_ok_w(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
             memset(ds, 0, sizeof *ds);
-            ds->refresh_hz = refresh_hz;
             ds->pointer_speed = (int8_t)pointer_speed;
-            ds->pointer_y = (uint8_t)input_pointer_y();
-            ds->deep_simulation = deep_wanted;
-            ds->pointer_y_detected = input_pointer_y_detected();
-            ds->deep_simulation_available = fb.native;
-            ds->native_bits_per_channel = fb.native_bpc;
+            ds->smooth_gradients = deep_wanted;
+            ds->smooth_gradients_available = fb_dither_able();
             return 0;
         }
         /* b == 0: the original struct screen_info; b == sizeof(struct

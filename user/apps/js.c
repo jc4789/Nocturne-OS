@@ -874,7 +874,7 @@ static JSValue h_ui_launch(JSContext *c, JSValueConst this, int argc, JSValueCon
     return JS_NewBool(ctx, r >= 0);
 }
 
-/* The desktop: screen size and depth, the compositor's settings, the volume. */
+/* The desktop: its size and the compositor's settings (struct desktop_settings). */
 static JSValue h_desktop(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
     struct desktop_settings s;
     if (__syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_GET, 0, 0) != 0) return JS_NULL;
@@ -883,33 +883,23 @@ static JSValue h_desktop(JSContext *c, JSValueConst this, int argc, JSValueConst
     struct n_sysinfo si;
     if (sysinfo(&si) == 0) sw = (int)si.fb_w, sh = (int)si.fb_h;
     else screen_size(&sw, &sh);
-    n_result vol = n_audio_volume();
     JS_SetPropertyStr(ctx, o, "screenWidth", JS_NewInt32(ctx, sw));
     JS_SetPropertyStr(ctx, o, "screenHeight", JS_NewInt32(ctx, sh));
-    JS_SetPropertyStr(ctx, o, "bitsPerChannel", JS_NewInt32(ctx, display_bits_per_channel()));
-    JS_SetPropertyStr(ctx, o, "nativeBitsPerChannel", JS_NewInt32(ctx, s.native_bits_per_channel));
-    JS_SetPropertyStr(ctx, o, "refreshRate", JS_NewInt32(ctx, (int32_t)s.refresh_hz));
     JS_SetPropertyStr(ctx, o, "pointerSpeed", JS_NewInt32(ctx, s.pointer_speed));
-    JS_SetPropertyStr(ctx, o, "pointerY", JS_NewInt32(ctx, s.pointer_y));
-    JS_SetPropertyStr(ctx, o, "pointerYDetected", JS_NewBool(ctx, s.pointer_y_detected));
-    JS_SetPropertyStr(ctx, o, "deepColour", JS_NewBool(ctx, s.deep_simulation));
-    JS_SetPropertyStr(ctx, o, "deepColourAvailable", JS_NewBool(ctx, s.deep_simulation_available));
-    JS_SetPropertyStr(ctx, o, "volume", vol < 0 ? JS_NULL : JS_NewInt32(ctx, (int32_t)vol));
+    JS_SetPropertyStr(ctx, o, "smoothGradients", JS_NewBool(ctx, s.smooth_gradients));
+    JS_SetPropertyStr(ctx, o, "smoothGradientsAvailable", JS_NewBool(ctx, s.smooth_gradients_available));
     return o;
 }
 
-/* (refresh, pointer speed, pointer y, deep colour): whether the desktop took them */
+/* (pointer speed, smooth gradients): whether the desktop took them */
 static JSValue h_desktop_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
     struct desktop_settings s;
     if (__syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_GET, 0, 0) != 0) return JS_FALSE;
-    int32_t refresh = 0, speed = 0, y = 0;
-    JS_ToInt32(ctx, &refresh, argv[0]);
-    JS_ToInt32(ctx, &speed, argv[1]);
-    JS_ToInt32(ctx, &y, argv[2]);
-    s.refresh_hz = (uint32_t)(refresh < 0 ? 0 : refresh);
+    int32_t speed = 0;
+    JS_ToInt32(ctx, &speed, argv[0]);
+    if (speed < -2 || speed > 2) return JS_FALSE;
     s.pointer_speed = (int8_t)speed;
-    s.pointer_y = (uint8_t)y;
-    s.deep_simulation = (uint8_t)JS_ToBool(ctx, argv[3]);
+    s.smooth_gradients = (uint8_t)JS_ToBool(ctx, argv[1]);
     return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_SET, 0, 0) == 0);
 }
 
@@ -935,10 +925,19 @@ static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValue
     JSValue o = JS_NewObject(ctx), modes = JS_NewArray(ctx);
     uint32_t count = s->offered.count < N_SCREEN_MODES_MAX ? s->offered.count : N_SCREEN_MODES_MAX;
     for (uint32_t i = 0; i < count; i++) JS_SetPropertyUint32(ctx, modes, i, screen_mode_value(&s->offered.modes[i]));
+    static const char *const sources[] = {
+        [SCREEN_SOURCE_FIRMWARE] = "firmware",
+        [SCREEN_SOURCE_DRIVER] = "driver",
+        [SCREEN_SOURCE_HANDED_BACK] = "handedBack",
+        [SCREEN_SOURCE_DRIVER_STOPPED] = "driverStopped",
+        [SCREEN_SOURCE_REMOTE] = "remote",
+    };
+    JS_SetPropertyStr(ctx, o, "source", JS_NewString(ctx, s->source < sizeof sources / sizeof *sources
+                                                              ? sources[s->source] : "firmware"));
     JS_SetPropertyStr(ctx, o, "monitor", JS_NewString(ctx, s->offered.monitor));
     JS_SetPropertyStr(ctx, o, "name", JS_NewString(ctx, s->offered.name));
     JS_SetPropertyStr(ctx, o, "modes", modes);
-    JS_SetPropertyStr(ctx, o, "shown", s->offered.done ? screen_mode_value(&s->offered.shown) : JS_NULL);
+    JS_SetPropertyStr(ctx, o, "shown", screen_mode_value(&s->offered.shown));
     JS_SetPropertyStr(ctx, o, "wanted", screen_mode_value(&s->wanted));
     JS_SetPropertyStr(ctx, o, "trialMs", JS_NewUint32(ctx, s->trial_ms));
     JS_SetPropertyStr(ctx, o, "refused", JS_NewBool(ctx, s->refused));
@@ -946,19 +945,26 @@ static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValue
     return o;
 }
 
-/* (how, monitor, width, height, refresh in mHz): SCREEN_MODE_SET; whether the system took it */
+/* (how: "try", "keep", "back" or "saved"; monitor, width, height, refresh in mHz): SCREEN_MODE_SET;
+   whether the system took it */
 static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    static const char *const hows[] = {
+        [SCREEN_MODE_TRY] = "try", [SCREEN_MODE_KEEP] = "keep", [SCREEN_MODE_BACK] = "back", [SCREEN_MODE_SAVED] = "saved",
+    };
     struct screen_mode_set s = {0};
-    uint32_t how = 0;
+    const char *how = JS_ToCString(ctx, argv[0]);
+    if (!how) return JS_EXCEPTION;
+    for (uint32_t i = SCREEN_MODE_TRY; i < sizeof hows / sizeof *hows; i++)
+        if (!strcmp(how, hows[i])) s.how = i;
+    JS_FreeCString(ctx, how);
+    if (!s.how) return JS_FALSE;
     const char *monitor = JS_ToCString(ctx, argv[1]);
     if (!monitor) return JS_EXCEPTION;
     snprintf(s.monitor, sizeof s.monitor, "%s", monitor);
     JS_FreeCString(ctx, monitor);
-    JS_ToUint32(ctx, &how, argv[0]);
     JS_ToUint32(ctx, &s.mode.width, argv[2]);
     JS_ToUint32(ctx, &s.mode.height, argv[3]);
     JS_ToUint32(ctx, &s.mode.refresh_mhz, argv[4]);
-    s.how = how;
     return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_MODE_SET, 0, 0) == 0);
 }
 
@@ -984,11 +990,28 @@ static JSValue h_system_info(JSContext *c, JSValueConst this, int argc, JSValueC
     return o;
 }
 
-static JSValue h_set_volume(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    int32_t v = 0;
-    JS_ToInt32(ctx, &v, argv[0]);
-    n_result r = n_audio_set_volume(v < 0 ? 0 : v > 100 ? 100 : v);
-    return r < 0 ? JS_NULL : JS_NewInt32(ctx, (int32_t)r);
+/* (volume, muted), each undefined to leave it as it is: the sound's way out (n_audio_output)
+   after, {device, volume, muted}, device null when nothing plays the sound; null on failure. */
+static JSValue h_sound(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    struct n_audio_output io = {0};
+    uint32_t set = 0;
+    if (argc > 0 && !JS_IsUndefined(argv[0])) {
+        int32_t v = 0;
+        JS_ToInt32(ctx, &v, argv[0]);
+        io.volume = v < 0 ? 0 : v > 100 ? 100 : v;
+        set |= N_AUDIO_SET_VOLUME;
+    }
+    if (argc > 1 && !JS_IsUndefined(argv[1])) {
+        io.muted = JS_ToBool(ctx, argv[1]) != 0;
+        set |= N_AUDIO_SET_MUTED;
+    }
+    if (n_audio_output(&io, set) < 0) return JS_NULL;
+    io.device[sizeof io.device - 1] = 0;
+    JSValue o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "device", io.device[0] ? JS_NewString(ctx, io.device) : JS_NULL);
+    JS_SetPropertyStr(ctx, o, "volume", JS_NewInt32(ctx, io.volume));
+    JS_SetPropertyStr(ctx, o, "muted", JS_NewBool(ctx, io.muted));
+    return o;
 }
 
 /* Hands the engine's events to js_ui.js, one at a time. */
@@ -1369,10 +1392,10 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("uiRequest", 1, h_ui_request),
     JS_CFUNC_DEF("uiLaunch", 2, h_ui_launch),
     JS_CFUNC_DEF("desktop", 0, h_desktop),
-    JS_CFUNC_DEF("desktopSet", 4, h_desktop_set),
+    JS_CFUNC_DEF("desktopSet", 2, h_desktop_set),
     JS_CFUNC_DEF("screenModes", 0, h_screen_modes),
     JS_CFUNC_DEF("screenModeSet", 5, h_screen_mode_set),
-    JS_CFUNC_DEF("setVolume", 1, h_set_volume),
+    JS_CFUNC_DEF("sound", 2, h_sound),
     JS_CFUNC_DEF("systemInfo", 0, h_system_info),
 };
 

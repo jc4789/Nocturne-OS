@@ -242,6 +242,7 @@ void audio_remote_detach(void) {
     irq_restore(f);
 }
 bool audio_remote(void) { return remote_users > 0; }
+const char *audio_output(void) { return remote_users ? "Remote desktop" : card_name; }
 
 static void set_gain(void) { gain = muted ? 0 : volume * volume * 65536 / 10000; }
 int audio_volume(void) { return volume; }

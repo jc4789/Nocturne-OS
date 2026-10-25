@@ -8,10 +8,14 @@
    state (wm_screen_mode, gui/wm.c). The Settings app lists the modes, tries one, keeps it or goes
    back (SYS_SCREEN_INFO, display_abi.h); a mode tried and not kept goes back by itself.
    screen_modes_offer: the driver's monitor, its modes and what it showed (a kernel copy);
-   count 0: it drives none any more. screen_modes_gone: the same, for a driver whose claim ended. */
+   count 0: it drives none any more, though it still runs (it may have given the screen back).
+   screen_modes_gone: the same, for a driver whose claim ended. */
 struct n_screen_modes;
 void screen_modes_offer(const struct n_screen_modes *m);
 void screen_modes_gone(void);
+/* The refresh (millihertz) of the mode the driver says its head shows; 0 while it says none. Any
+   thread, no lock (the compositor's frame period, gui/wm.c). */
+uint32_t screen_shown_refresh_mhz(void);
 /* SYS_SCREEN_INFO with op SCREEN_MODES_GET or SCREEN_MODE_SET: user is the app's struct of size
    bytes. Takes no WM lock of its own (it comes before the WM's). */
 int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op);

@@ -128,10 +128,11 @@ def system_payload(disk, scratch):
     return found
 
 
-def edit_boot_entry(disk, scratch, resolution=None, cmdline=""):
-    """Change the first entry of the limine.conf on the disk's EFI system partition: its resolution,
-    and words added to its kernel command line (a key=value word replaces the entry's own value for
-    that key). The other entries stay as they are."""
+def edit_boot_entry(disk, scratch, cmdline):
+    """Add words to the kernel command line of the first entry of the limine.conf on the disk's EFI
+    system partition (a key=value word replaces the entry's own value for that key). The other
+    entries stay as they are. The screen's size is the virtual monitor's (vm_display), never the
+    boot entry's."""
     part = esp(disk)
     conf = os.path.join(scratch, "limine.conf")
     mtools("mcopy", "-n", "-o", "-i", part, "::/boot/limine/limine.conf", mtools_name(conf))
@@ -139,10 +140,6 @@ def edit_boot_entry(disk, scratch, resolution=None, cmdline=""):
         config = f.read()
     first_entry = config.split("\n/", 2)[1]
     updated = first_entry
-    if resolution:
-        updated, count = re.subn(r"(?m)^    resolution: [^\n]+$", "    resolution: " + resolution, updated)
-        if count != 1:
-            sys.exit("the first boot entry must have exactly one resolution")
     if cmdline:
         def add(match):
             words = match.group(1).split()
@@ -437,10 +434,20 @@ def prepare_disk(a, tcp_port, web_ports):
         # The same bytes as a preserved baseline's boot image: the same payload.
         payload = a.baseline_payload or system_payload(DISK, scratch)
         dns_endpoint = "10.0.2.2:%d" % a.dns_port if getattr(a, "dns_port", None) else None
-        if a.resolution or dns_endpoint:
-            edit_boot_entry(DISK, scratch, a.resolution, "dns-server=" + dns_endpoint if dns_endpoint else "")
+        if dns_endpoint:
+            edit_boot_entry(DISK, scratch, "dns-server=" + dns_endpoint)
         print("test: C:\\Tests: " + put_tests(DISK, test_files(a, tcp_port, web_ports, scratch), scratch), flush=True)
     return image_hash, payload
+
+
+RESOLUTION = re.compile(r"([1-9][0-9]{0,4})x([1-9][0-9]{0,4})")
+
+
+def vm_display(device, resolution):
+    """QEMU's display device as a monitor whose EDID prefers resolution (widthxheight): the guest's
+    firmware sets that mode and the system takes it from the screen, as on a real monitor."""
+    width, height = RESOLUTION.fullmatch(resolution).groups()
+    return ["-vga", "none", "-device", "%s,xres=%s,yres=%s" % (device, width, height)]
 
 
 def run_vm(a, tcp_port, web_ports, processes):
@@ -450,7 +457,7 @@ def run_vm(a, tcp_port, web_ports, processes):
         os.remove(SERIAL)
     # The disk on AHCI, like a real machine's SATA; no snapshot: the volume is checked afterwards.
     cmd = [a.qemu, "-M", "pc", "-m", str(a.memory) + "M", "-smp", str(a.cpus), "-accel", a.accel,
-           "-display", "egl-headless" if a.gpu == "virgl" else "none", "-vga", "std", "-no-reboot",
+           "-display", "egl-headless" if a.gpu == "virgl" else "none", *vm_display("VGA", a.resolution), "-no-reboot",
            "-serial", "file:" + SERIAL,
            "-device", "ahci,id=ahci", "-drive", "id=boot,file=%s,format=raw,if=none" % DISK,
            "-device", "ide-hd,drive=boot,bus=ahci.0,bootindex=0",
@@ -500,12 +507,12 @@ def run_vm(a, tcp_port, web_ports, processes):
         time.sleep(0.5)
 
     log = open(SERIAL, "rb").read().decode("utf-8", "replace") if os.path.exists(SERIAL) else ""
-    video = re.search(r"video: (\d+)x(\d+), (\d+) bpp", log)
+    video = re.search(r"video: (\d+)x(\d+), \d+ bpp", log)
     actual_resolution = "x".join(video.groups()) if video else None
-    resolution_matched = not a.resolution or actual_resolution == a.resolution
+    resolution_matched = actual_resolution == a.resolution
     problems = []
     if not resolution_matched:
-        problems.append("requested video resolution differs from the actual guest boot mode")
+        problems.append("the guest's boot mode is not the virtual monitor's preferred resolution")
     if timed_out:
         problems.append("timed out after %d s (the VM did not power off)" % a.timeout)
     if q.returncode != 0:
@@ -587,7 +594,8 @@ def main():
     ap.add_argument("--memory", type=int, default=2048, help="QEMU RAM in MiB (default: 2048)")
     ap.add_argument("--cpus", type=int, default=4, help="QEMU CPU count (default: 4)")
     ap.add_argument("--accel", choices=("tcg", "whpx"), default="tcg", help="No silent accelerator fallback")
-    ap.add_argument("--resolution", help="Override only the copy's primary boot entry: widthxheightx32")
+    ap.add_argument("--resolution", default="1920x1080",
+                    help="The virtual monitor's preferred mode (its EDID), widthxheight (default 1920x1080)")
     ap.add_argument("--qemu", default=QEMU, help="QEMU executable (prefer the installed QEMU)")
     ap.add_argument("--gpu", choices=("none", "virgl"), default="none", help="Optional secondary virgl GPU; requires host GL")
     ap.add_argument("--boot-image", default=os.path.join(CORE_BUILD, "nocturne.img"), help="Disk to copy; its payload must match the current build")
@@ -600,8 +608,8 @@ def main():
         a.source_tree = os.path.abspath(a.source_tree)
         if not os.path.isfile(os.path.join(a.source_tree, "tests", "runtests.c")):
             ap.error("--source-tree must contain tests/runtests.c")
-    if a.resolution and not re.fullmatch(r"[1-9][0-9]{0,4}x[1-9][0-9]{0,4}x32", a.resolution):
-        ap.error("--resolution requires positive widthxheightx32")
+    if not RESOLUTION.fullmatch(a.resolution):
+        ap.error("--resolution requires positive widthxheight")
     if a.memory < 256:
         ap.error("--memory must be at least 256 MiB")
     if not 1 <= a.cpus <= 32:

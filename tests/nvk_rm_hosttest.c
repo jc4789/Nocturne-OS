@@ -177,8 +177,8 @@ static struct nnrm *space(void) {
 static void lifetime(void) {
    reset();struct nnrm *n=space();struct nnrm_chan *a=NULL,*b=NULL;
    unsigned before=allocs;
-   CHECK(nnrm_chan_create(n,0,&a)==NV_OK);unsigned successful_allocs=allocs-before,successful_maps=map_calls;
-   CHECK(nnrm_chan_create(n,0,&b)==NV_OK && local_allocs==1 && n->refs==3);
+   CHECK(nnrm_chan_create(n,0,&a,NULL)==NV_OK);unsigned successful_allocs=allocs-before,successful_maps=map_calls;
+   CHECK(nnrm_chan_create(n,0,&b,NULL)==NV_OK && local_allocs==1 && n->refs==3);
    void *map=n->posted_map;CHECK(map!=NULL);
    nnrm_close(n);CHECK(connections==1 && n->refs==2);
    nnrm_chan_destroy(a);CHECK(connections==1 && n->refs==1 && n->posted_map==map && posted_unmap==0);
@@ -186,34 +186,43 @@ static void lifetime(void) {
    CHECK(nnrm_chan_submit(b,&gp,1)==NV_OK);
    nnrm_chan_destroy(b);CHECK(connections==0 && posted_unmap>channel_free);
    for(unsigned failure=1;failure<=successful_allocs;failure++){
-      reset();n=space();fail_alloc=allocs+failure;
-      CHECK(nnrm_chan_create(n,0,&a)!=NV_OK && n->refs==1);
+      reset();n=space();fail_alloc=allocs+failure;const char *step=NULL;
+      CHECK(nnrm_chan_create(n,0,&a,&step)!=NV_OK && step && n->refs==1);
       nnrm_close(n);CHECK(connections==0);
    }
    for(unsigned failure=1;failure<=successful_maps;failure++){
-      reset();n=space();fail_map=failure;
-      CHECK(nnrm_chan_create(n,0,&a)!=NV_OK && n->refs==1);
+      reset();n=space();fail_map=failure;const char *step=NULL;
+      CHECK(nnrm_chan_create(n,0,&a,&step)!=NV_OK && step && n->refs==1);
       nnrm_close(n);CHECK(connections==0);
    }
    /* 共有対象が既に生きている場合も、別channelの途中失敗で解放しない。 */
-   reset();n=space();CHECK(nnrm_chan_create(n,0,&a)==NV_OK);
+   reset();n=space();CHECK(nnrm_chan_create(n,0,&a,NULL)==NV_OK);
    before=allocs;unsigned before_maps=map_calls;
-   CHECK(nnrm_chan_create(n,0,&b)==NV_OK);
+   CHECK(nnrm_chan_create(n,0,&b,NULL)==NV_OK);
    successful_allocs=allocs-before;successful_maps=map_calls-before_maps;
    nnrm_chan_destroy(b);nnrm_chan_destroy(a);nnrm_close(n);
    for(unsigned partial=0;partial<=1;partial++){
       for(unsigned failure=1;failure<=successful_allocs+successful_maps;failure++){
-         reset();n=space();CHECK(nnrm_chan_create(n,0,&a)==NV_OK);
+         reset();n=space();CHECK(nnrm_chan_create(n,0,&a,NULL)==NV_OK);
          unsigned live=object_count(n->rm);map=n->posted_map;partial_alloc=partial;
          if(failure<=successful_allocs)fail_alloc=allocs+failure;
          else fail_map=map_calls+failure-successful_allocs;
-         CHECK(nnrm_chan_create(n,0,&b)!=NV_OK && n->refs==2);
+         const char *step=NULL;
+         CHECK(nnrm_chan_create(n,0,&b,&step)!=NV_OK && step && n->refs==2);
          CHECK(object_count(n->rm)==live && n->posted_map==map && posted_unmap==0 && local_allocs==1);
          CHECK(nnrm_chan_submit(a,&gp,1)==NV_OK);
          nnrm_close(n);nnrm_chan_destroy(a);
          CHECK(connections==0 && posted_unmap>channel_free);
       }
    }
+   /* 失敗した段階の名前：RMの制御はその名前、作れない種類はその理由。 */
+   reset();n=space();failed_control=NVA06F_CTRL_CMD_GPFIFO_SCHEDULE;const char *step=NULL;
+   CHECK(nnrm_chan_create(n,0,&a,&step)==NV_ERR_INVALID_STATE && step && !strcmp(step,"NVA06F_CTRL_CMD_GPFIFO_SCHEDULE") && n->refs==1);
+   failed_control=0;step=NULL;
+   CHECK(nnrm_chan_create(n,NNRM_CHAN_VDEC,&a,&step)==NV_ERR_NOT_SUPPORTED && step && strstr(step,"video decode"));
+   step=NULL;n->copy_engine_type=NV2080_ENGINE_TYPE_NULL;
+   CHECK(nnrm_chan_create(n,NNRM_CHAN_COPY,&a,&step)==NV_ERR_NOT_SUPPORTED && step && strstr(step,"copy engine") && n->refs==1);
+   nnrm_close(n);CHECK(connections==0);
    reset();n=space();unsigned live=object_count(n->rm);
    fail_alloc=allocs+1;partial_alloc=true;
    CHECK(posted_map(n)==NV_ERR_NO_MEMORY && object_count(n->rm)==live && n->posted_map==NULL);

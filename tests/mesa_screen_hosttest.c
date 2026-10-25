@@ -1,6 +1,7 @@
 /* 実frontendのscreen選択を使う。GPU未readyからreadyへの遷移と旧screenを検査する。
    直接表示（ngl_scanout）の作成・提示・破棄と、GPUの無い文脈で作らないことも検査する。
-   GPUを使えない理由がMesaの記録（システムの記録）へ、変わったときだけ一行出ることも検査する。 */
+   GPUを使えない理由がMesaの記録（システムの記録）へ、変わったときだけ一行出ることも検査する。
+   Zinkが作成中に書いた理由の行は預かられ（mesa_log_hold）、要約の行の前へ、変わったときだけ書かれる。 */
 #include <stdarg.h>
 #include <stdio.h>
 #include "../ports/mesa/nocturne_gl.c"
@@ -26,19 +27,39 @@ int64_t nvrm_connect_ready_status(struct nvrm **out) {
     return *out ? 0 : daemon_present ? -N_ERR_NOT_READY : -N_ERR_NOT_FOUND;
 }
 const char *n_result_text(n_result r) { return r == -N_ERR_NOT_READY ? "not ready" : "?"; }
-static unsigned logs;
-static char logged[256];
+static unsigned logs, line_writes;
+static char logged[256], held[512], written[512], *zink_reason;
+static size_t held_length;
+static bool holding;
+/* 預かり中の行は記録されず、預かりの文字列へ一行ずつ足される（log.cでは「TAG: level: 本文」）。 */
 void mesa_log(enum mesa_log_level level, const char *tag, const char *format, ...) {
-    (void)level; (void)tag;
-    va_list va; va_start(va, format); vsnprintf(logged, sizeof logged, format, va); va_end(va);
-    logs++;
+    (void)level;
+    va_list va; va_start(va, format);
+    if (holding) {
+        held_length += snprintf(held + held_length, sizeof held - held_length, "%s: ", tag);
+        held_length += vsnprintf(held + held_length, sizeof held - held_length, format, va);
+        held_length += snprintf(held + held_length, sizeof held - held_length, "\n");
+    } else {
+        vsnprintf(logged, sizeof logged, format, va);
+        logs++;
+    }
+    va_end(va);
+}
+void mesa_log_hold(void) { CHECK(!holding); holding = true; held_length = 0; held[0] = 0; }
+bool mesa_log_holding(void) { return holding; }
+char *mesa_log_release(void) { CHECK(holding); holding = false; return held_length ? strdup(held) : NULL; }
+void mesa_log_write_lines(const char *lines) {
+    CHECK(!holding);
+    if (lines && *lines) { snprintf(written, sizeof written, "%s", lines); line_writes++; }
 }
 void nvrm_disconnect(struct nvrm *rm) { CHECK(rm == (struct nvrm *)&daemon_ready); closes++; }
 struct pipe_screen *softpipe_create_screen(struct sw_winsys *ws) {
     CHECK(ws == &mem_winsys); cpu_attempts++; return &software;
 }
 struct pipe_screen *zink_create_screen(struct sw_winsys *ws, const struct pipe_screen_config *config) {
-    CHECK(ws == &mem_winsys && config == NULL && daemon_ready); gpu_attempts++;
+    CHECK(ws == &mem_winsys && config == NULL && daemon_ready && holding); gpu_attempts++;
+    if (zink_reason)
+        mesa_loge("%s", zink_reason);
     return zink_available ? &hardware : NULL;
 }
 static void clear(struct pipe_context *pipe, struct pipe_resource *res, unsigned level,
@@ -164,17 +185,36 @@ int main(void) {
     daemon_ready = true;
     /* probe後のZink/NVK再検査でGPUが消えてもCPU screenを失わない。 */
     CHECK(get_screen() == first && gpu_attempts == 1 && closes == 1 && old.base.fscreen == first);
-    CHECK(logs == 2 && strstr(logged, "Zink did not start"));
+    CHECK(logs == 2 && strstr(logged, "Zink did not start") && strstr(logged, "it gave no reason"));
+    CHECK(line_writes == 0 && !holding);
+    /* 理由が出た：理由の行を先に、要約を後に一度だけ書く。 */
+    zink_reason = "the Vulkan loader has no vkEnumerateInstanceLayerProperties";
+    CHECK(get_screen() == first && gpu_attempts == 2 && closes == 2 && !holding);
+    CHECK(line_writes == 1 && !strcmp(written, "MESA: the Vulkan loader has no vkEnumerateInstanceLayerProperties\n"));
+    CHECK(logs == 3 && strstr(logged, "Zink did not start") && strstr(logged, "why is in the lines before"));
+    /* 同じ理由の再試行は文脈ごとに何も書かない。 */
+    CHECK(get_screen() == first && gpu_attempts == 3 && line_writes == 1 && logs == 3);
+    /* 理由が変われば、同じ失敗でも書き直す。 */
+    zink_reason = "ZINK: vkCreateDevice failed (VK_ERROR_INITIALIZATION_FAILED)";
+    CHECK(get_screen() == first && gpu_attempts == 4 && line_writes == 2 && logs == 4);
+    CHECK(strstr(written, "vkCreateDevice failed") && strstr(logged, "why is in the lines before"));
+    /* 理由が消えれば「理由なし」を書き直す。 */
+    zink_reason = NULL;
+    CHECK(get_screen() == first && gpu_attempts == 5 && line_writes == 2 && logs == 5);
+    CHECK(strstr(logged, "it gave no reason"));
+    /* 成功時にZinkが書いた行も、要約の前に一度だけ書く。 */
+    zink_reason = "NVK: a line Zink wrote while it started";
     zink_available = true;
     struct pipe_frontend_screen *later = get_screen();
-    CHECK(later && later != first && later->screen == &hardware && gpu_attempts == 2 && closes == 2);
-    CHECK(logs == 3 && strstr(logged, "drawing on the GPU with"));
+    CHECK(later && later != first && later->screen == &hardware && gpu_attempts == 6 && closes == 6);
+    CHECK(logs == 6 && strstr(logged, "drawing on the GPU with") && line_writes == 3 && strstr(written, "a line Zink wrote"));
     CHECK(first->screen == &software && old.base.fscreen == first);
     struct ngl_context newer = {.base = {.fscreen = later}, .on_gpu = true};
     CHECK(!ngl_has_major_performance_caveat(&newer));
     CHECK(ngl_has_major_performance_caveat(&old));
     unsigned before_probes = probes;
-    CHECK(get_screen() == later && gpu_attempts == 2 && cpu_attempts == 1 && probes == before_probes);
+    CHECK(get_screen() == later && gpu_attempts == 6 && cpu_attempts == 1 && probes == before_probes);
+    CHECK(logs == 6 && line_writes == 3);
     struct pipe_context pipe = {.clear_texture = clear, .texture_map = map, .texture_unmap = unmap};
     struct pipe_resource texture = {.width0 = 1, .height0 = 1};
     init_texture(&pipe, &texture, 0, old.on_gpu);

@@ -787,7 +787,9 @@ zink_get_physical_device_info(struct zink_screen *screen)
          %else:
          } else {
          %endif
-            debug_printf("ZINK: ${ext.name} required!\\n");
+            if (!screen->driver_name_is_inferred)
+               mesa_loge("ZINK: ${ext.name} required, but the device (Vulkan %u.%u) does not have it",
+                         VK_API_VERSION_MAJOR(screen->vk_version), VK_API_VERSION_MINOR(screen->vk_version));
             goto fail;
       %endif
          }

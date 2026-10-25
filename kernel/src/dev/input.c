@@ -101,8 +101,7 @@ void input_scancode(uint8_t sc) {
 /* ---- mouse ---- */
 static uint8_t packet[4];
 static int pidx;
-static bool flip_y, flip_detected; /* the axis in use; what detect_flip_y found */
-static int pointer_y_mode;          /* POINTER_Y_* from Settings */
+static bool flip_y; /* the Y axis comes upside down (detect_flip_y) */
 
 static void mouse_irq(struct regs *r) {
     (void)r;
@@ -239,8 +238,7 @@ void input_init(void) {
     }
     if (ps2_setup()) mouse_ok = true;
     pm_register(&ps2_pm);
-    flip_detected = mouse_ok && detect_flip_y();
-    flip_y = flip_detected;
+    flip_y = mouse_ok && detect_flip_y();
     irq_register(1, kbd_irq);
     irq_register(12, mouse_irq);
     pic_unmask(1);
@@ -270,11 +268,3 @@ void input_mouse(const struct mouse_event *e) {
 }
 
 void input_mouse_attach(void) { mouse_ok = true; }
-
-/* Settings: 0 follows detect_flip_y, 1 never inverts, 2 always inverts (POINTER_Y_*). */
-void input_set_pointer_y(int mode) {
-    pointer_y_mode = mode;
-    flip_y = mode == 2 || (mode == 0 && flip_detected);
-}
-int input_pointer_y(void) { return pointer_y_mode; }
-bool input_pointer_y_detected(void) { return flip_detected; }

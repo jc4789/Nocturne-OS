@@ -65,12 +65,3 @@ struct n_acpi_value;
 int64_t pci_user_acpi_eval(struct handle *h, uint32_t which, const char *name, const struct n_acpi_value *args,
                            uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size);
 int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms);
-/* The user's way out of a stuck driver that holds the screen (Ctrl+Alt+Esc, gui/wm.c and the
-   text console in init.c): its app is stopped and the claim's end gives the screen back. False
-   when no driver holds it, or its app is already being stopped. Only asks the screen watch thread
-   to stop it, so key handlers may call it from an interrupt. */
-bool pci_user_screen_take_back(void);
-/* Whether a display driver's scanout is where the screen is drawn (n_pci_give_screen): Ctrl+Alt+Esc
-   then asks that driver for the boot screen (gui/wm.c, struct n_screen_state take_back). Takes no
-   lock. */
-bool pci_user_screen_driven(void);

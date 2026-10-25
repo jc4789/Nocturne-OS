@@ -129,7 +129,10 @@ struct nnrm_gp {
    bool no_prefetch;
 };
 
-uint32_t nnrm_chan_create(struct nnrm *rm, uint32_t engines, struct nnrm_chan **out);
+/* A channel on the engines (NNRM_CHAN_*). On failure *failed_step (when failed_step is not
+ * NULL) names what failed, as nnrm_open_device does. */
+uint32_t nnrm_chan_create(struct nnrm *rm, uint32_t engines, struct nnrm_chan **out,
+                          const char **failed_step);
 void nnrm_chan_destroy(struct nnrm_chan *chan);
 
 /* Queue GP entries and ring the doorbell. Waits for ring space. The caller

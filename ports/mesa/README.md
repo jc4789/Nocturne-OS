@@ -42,7 +42,7 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/util/os_misc.c` | 物理メモリ量などを `sysinfo` で得る。 |
 | `src/util/memstream.c/.h` | メモリ上の FILE は無いので、一時文書を書き、flush／close で読み戻す。 |
 | `src/util/u_string.h` | `asprintf` 系は libc に無いので、Mesa 自身の Windows 用実装を使う。 |
-| `src/util/log.c` | 共有の一時フォルダーは無い。`MESA_LOG_FILE` だけを使う。机上から起動したアプリには stderr が無いので、既定の出力先にシステムの記録（`n_system_log_open`、`MESA_LOG=system` でも選べる）を足す。行は `MESA: warning: …` の形で、USB の C: では System.log に残る。 |
+| `src/util/log.c` | 共有の一時フォルダーは無い。`MESA_LOG_FILE` だけを使う。机上から起動したアプリには stderr が無いので、既定の出力先にシステムの記録（`n_system_log_open`、`MESA_LOG=system` でも選べる）を足す。行は `MESA: warning: …` の形で、USB の C: では System.log に残る。`mesa_log_hold`／`mesa_log_release` は、呼んだスレッドの行をその間だけ書かずに預かり（同じ形の文字列で返す）、`mesa_log_write_lines` が後でまとめて書く（Nocturne GL が Zink を起こす間に使う）。 |
 | `src/util/u_debug.h` | set-user-ID プログラムは無い。 |
 | `src/util/u_endian.h` | コンパイラーの `__BYTE_ORDER__` を使う。 |
 | `src/util/disk_cache.h`、`src/gallium/auxiliary/util/u_screen.c` | ファイル状態取得と DRM 記述子による screen 共有を外す。 |
@@ -60,8 +60,10 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/mesa/main/externalobjects.c` | 取り込んだハンドルは `n_handle_close` で閉じる。 |
 | `src/gallium/auxiliary/util/u_tests.c` | フェンスの記述子は無い。 |
 | `src/mesa/program/program_lexer.l` | 文字列だけを読むので `never-interactive`（`isatty` を使わない）。`generated/` の `lex.yy.c` も再生成済み。 |
-| `src/util/u_dl.c` | 共有ライブラリーは無い。`util_dl_open("vulkan")` は同じプログラムにリンクされた Vulkan ドライバー（NVK）を指し、`vk_icdGetInstanceProcAddr`／`vk_common_GetDeviceProcAddr`（弱参照）でローダーと同じ答え方をする。ドライバーが無ければ NULL。 |
-| `src/gallium/drivers/zink/zink_screen.c`、`zink_public.h` | `VK_LIBNAME` は `"vulkan"`。`unistd.h` を読まず、DRM の記述子を閉じない。DRM の記述子から screen を作る `zink_drm_create_screen` を外す（GL は `zink_create_screen` で作る）。 |
+| `src/util/u_dl.c` | 共有ライブラリーは無い。`util_dl_open("vulkan")` は同じプログラムにリンクされた Vulkan ドライバー（NVK）を指し、`vk_icdGetInstanceProcAddr`／`vk_common_GetDeviceProcAddr`（弱参照）でローダーと同じ答え方をする。ドライバーが無ければ NULL。ローダーの持つ関数はローダー役が答える：`vkGetInstanceProcAddr` は自分を返し、`vkEnumerateInstanceLayerProperties` は層が無い（0 個、VK_SUCCESS）と答える（ICD である NVK には無く、無いと Zink はインスタンスを作らない）。 |
+| `src/gallium/drivers/zink/zink_screen.c`、`zink_public.h` | `VK_LIBNAME` は `"vulkan"`。`unistd.h` を読まず、DRM の記述子を閉じない。DRM の記述子から screen を作る `zink_drm_create_screen` を外す（GL は `zink_create_screen` で作る）。インスタンスを作れなかったときは数を戻す（後の文脈で作り直し、理由もまた書く）。作れなかった論理装置は次の screen へ渡さない。物理装置が一つも無い、`VK_TIME_DOMAIN_DEVICE` が無い、cache の thread を作れない、を `mesa_loge` で書く（`debug_printf` はリリース版では消える）。 |
+| `src/gallium/drivers/zink/zink_instance.py`、`zink_device_info.py` | ローダーに大域の関数が無いことと、必須の拡張が無いこと（拡張の名前と装置の Vulkan の版）を `mesa_loge` で書く。 |
+| `src/vulkan/runtime/vk_log.c` | 記録が預かられている間（`mesa_log_holding`）は、リリース版でも `vk_error*()`／`vk_log*()` を `MESA: warning: 文書:行: 内容 (VK_ERROR_…)` の形で Mesa の記録へ出す（Vulkan のデバッグ記録が無くても、GPU を使えない理由が残る）。 |
 | `src/gallium/drivers/zink/zink_resource.c`、`zink_context.c`、`zink_fence.c/.h` | ファイル記述子が無いので、dma-buf／opaque-fd のメモリ共有と sync file のフェンス取込みを外す。 |
 | `src/gallium/include/frontend/winsys_handle.h`、`src/gallium/drivers/zink/zink_resource.c` | ハンドルの型 `WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT`（nvrm の表示用画像の番号）を足す。`resource_from_handle` はこの型の PIPE_BUFFER だけを受け、`VkImportMemoryNocturneScanoutInfoMESA` を付けて VRAM に取り込む（下位割当て・キャッシュに入れない）。 |
 
@@ -71,9 +73,10 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 作る。`nocturne_gl.c` は `nvrm_connect_ready_status` で nvrm の ready な GPU を探し、あれば
 `zink_create_screen` を試し、どちらかが駄目なら softpipe へ戻る。どうなったか（「drawing on the GPU with …」、
 GPU が使えない理由、「Zink did not start」）を、前に書いたものと変わったときだけ `Nocturne GL:` で始まる一行で
-Mesa の記録（システムの記録）へ書く。nvrm がどの GPU も出していない機械では何も書かない。Zink が始まらなかった
-理由は、その前の行の `ZINK:` と `NVK:`（nvkmd が GPU を使わなかった理由：止まった RM の制御・物体の名前と
-NV_STATUS、または chipset と class）に出る。GPU のときは描画用バッファーの消去を
+Mesa の記録（システムの記録）へ書く。nvrm がどの GPU も出していない機械では何も書かない。`zink_create_screen`
+の間は記録を預かり（`mesa_log_hold`）、Zink と NVK の書いた行（`ZINK:`、`NVK:`、`vk_error*()` の
+`文書:行: … (VK_ERROR_…)`）を、結果と行のどちらかが前と変わったときだけ、その一行の前にまとめて書く。
+同じ理由の再試行は文脈ごとに書かない。行が一つも無ければ「it gave no reason」と書く。GPU のときは描画用バッファーの消去を
 `clear_texture`（GPU 上、描画の後ろに積むだけ）で行い、softpipe では従来どおり直接書く。
 driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で提供する。
 
@@ -84,9 +87,9 @@ driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で�
 （`ports/nvidia/`）へ libnvrm でつなぐ。
 
 - `nvkmd_nocturne_rm.c`：RM の SDK の型を使う唯一の層（client／device／subdevice、メモリ、VA、
-  GPFIFO チャンネル、ドアベル）。他のファイルは `nnrm_*` だけを見る。`nnrm_open_device` は失敗した段階
-  （RM の制御・物体の名前など）を返し、`pdev`・`dev` がそれを Mesa の記録へ書く（`vk_error*` は Vulkan の
-  デバッグ記録が無いと何も出さないため）。BAR1 の大きさ（`NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`）は VRAM と同じく KiB。
+  GPFIFO チャンネル、ドアベル）。他のファイルは `nnrm_*` だけを見る。`nnrm_open_device` と `nnrm_chan_create` は失敗した段階
+  （RM の制御・物体の名前など）を返し、`pdev`・`dev`・`ctx` がそれを Mesa の記録へ書く（`ctx` は
+  `vk_errorf` で：Nocturne GL が記録を預かる間は出る）。BAR1 の大きさ（`NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`）は VRAM と同じく KiB。
 - `pdev`・`dev`・`mem`・`va`：NVK の物理・論理装置、メモリ（VRAM か sysmem、常に一貫）、
   VA は `util_vma_heap` で選び RM の仮想メモリへ対応付ける。
 - `ctx`：実行文脈ごとにチャンネル一つ、フェンス一つ（GART の 64 ビット値）、ホスト用の命令片
@@ -100,7 +103,7 @@ GPU が無い（`C:\Nocturne\System\nvrm` が動いていない）機械では�
 
 | 変更したファイル（NVK・Vulkan） | 内容 |
 |---|---|
-| `nvk_instance.c`、`nvk_physical_device.c/.h` | DRM の装置列挙ではなく `physical_devices.enumerate` で nvkmd の GPU を数える。ELF の build-id は無いので、版と NVK のビルド時刻の hash を driver identity にする。`NVX_binary_import` は libelf が要るので出さない。 |
+| `nvk_instance.c`、`nvk_physical_device.c/.h` | DRM の装置列挙ではなく `physical_devices.enumerate` で nvkmd の GPU を数える。ELF の build-id は無いので、版と NVK のビルド時刻の hash を driver identity にする。`NVX_binary_import` は libelf が要るので出さない。適合していない GPU を使わないとき、その名前と 3D class を書く（リリース版の上流は何も言わない）。 |
 | `nvkmd/nvkmd.c/.h`、`nvkmd_device_info.c/.h` | 装置情報の共通部分を DRM 版から分け、Nocturne の nvkmd を登録する。同期の型と payload の複製は backend が渡す。 |
 | `nvk_device.c`、`nvk_buffer.c`、`nvk_image.c`、`nvk_device_memory.c`、`nvk_descriptor_table.c` | DRM の syncobj と dma-buf を使わない（backend に無ければ外部メモリは非対応と答える）。`sys/mman.h` を読まない。 |
 | `nvk_device_memory.c`、`nvkmd/nvkmd.c/.h`、`nvkmd/nocturne/` | `VkImportMemoryNocturneScanoutInfoMESA`（`vk_internal_exts.h`）が付いた割当ては、nvrm の表示用画像を `nvrm_scanout_import` で自分の装置のメモリー物体として取り込む（ホストから見えるメモリー型には付けられない。ゼロ初期化しない）。解放は他のメモリーと同じ。 |

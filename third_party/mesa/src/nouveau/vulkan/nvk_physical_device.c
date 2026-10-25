@@ -20,6 +20,7 @@
 #include "util/detect_os.h"
 #include "util/disk_cache.h"
 #include "util/hex.h"
+#include "util/log.h"
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
 
@@ -1551,6 +1552,11 @@ nvk_create_physical_device(struct vk_instance *_instance,
        !debug_get_bool_option("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", false)) {
 #ifdef NDEBUG
       result = VK_ERROR_INCOMPATIBLE_DRIVER;
+#if DETECT_OS_NOCTURNE
+      /* Nothing else would say why nvrm's GPU was passed over: Zink only finds no device */
+      mesa_logw("NVK: %s (3D class 0x%x) is not a GPU NVK is conformant on: it is not used",
+                nvkmd->dev_info.device_name, nvkmd->dev_info.cls_eng3d);
+#endif
 #else
       result = vk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
                          "WARNING: NVK is not well-tested on %s, pass "

@@ -31,37 +31,76 @@
  * runs RM's interrupt handler for them, as the kernel interface does in its IRQ handler. RM
  * serialises itself with its own locks (the GPU lock and its spinlocks, which are mutexes
  * here); nothing in nvrm adds a lock around rm_isr.
+ *
+ * A message-signalled interrupt is an edge: one the system never delivers (an interrupt RM
+ * leaves pending while the GPU sends no new message for it) would leave RM waiting for good, GSP's
+ * answers and the display's vertical blanks with it. So a wait that reaches its time limit runs
+ * RM's handler too, which reads the GPU's interrupt status as polling does, and work it finds
+ * there is counted apart. A line says how many interrupts were delivered in IRQ_REPORT_MS, how
+ * many RM handled, how many of those it found at a time limit, and how many vertical blanks the
+ * screen got, whenever which of them move changes, so a stalled GSP or a display without
+ * vertical blanks can be told apart in nvrm's log.
  * ---------------------------------------------------------------------------------------- */
-#define IRQ_WAKE_MS 50        /* how often a waiting interrupt thread looks at the stop flag */
+#define IRQ_WAKE_MS 50        /* how long a wait for a vector lasts before RM's handler runs anyway */
 #define IRQ_POLL_MS 1         /* polling mode: how often the GPU's interrupt status is read */
+#define IRQ_REPORT_MS 5000    /* the period whose interrupt counts are compared */
 
 static thrd_t irq_thread_id;
 static bool irq_thread_running;
 static bool irq_stop;         /* atomic */
 static bool irq_polling;      /* no usable vector: the same thread runs rm_isr on a timer */
 
-static uint64_t irq_runs;     /* atomic: times rm_isr ran, for the bring-up progress lines */
+static uint64_t irq_delivered; /* atomic: vectors the system delivered */
+static uint64_t irq_handled;   /* runs of rm_isr that found an interrupt to serve */
+static uint64_t irq_unsignalled; /* those at a wait's time limit or a poll, without a delivery */
 
 /* nvidia_isr's order: RM copies the MMU faults it serves out of the shadow buffer, UVM's top
-   half takes the replayable faults and access counters, then RM's interrupt handler. */
-static void irq_run_rm(void) {
-    __atomic_add_fetch(&irq_runs, 1, __ATOMIC_RELAXED);
+   half takes the replayable faults and access counters, then RM's interrupt handler. True when
+   RM found an interrupt to serve. */
+static bool irq_run_rm(void) {
     NvU32 need_bottom_half = 0, rm_faults = 0;
-    nvrm_in_isr = true;
+    nvrm_isr_begin();
     rm_gpu_handle_mmu_faults(nvrm_dev.sp, &nvrm_dev.nv, &rm_faults);
     nvrm_uvm_interrupt();
     NvBool handled = rm_isr(nvrm_dev.sp, &nvrm_dev.nv, &need_bottom_half);
-    nvrm_in_isr = false;
+    nvrm_isr_end();
     if (handled && need_bottom_half) rm_isr_bh(nvrm_dev.sp, &nvrm_dev.nv);
+    return handled;
+}
+
+/* The counts of the last IRQ_REPORT_MS, the first time and whenever which of them move changes
+   (vertical blanks starting or stopping, interrupts found only at time limits), not every period
+   while a screen's vertical blanks keep counting. */
+static void irq_report(void) {
+    static uint64_t last[4];
+    static unsigned last_moving = ~0u;
+    uint64_t now[4] = { __atomic_load_n(&irq_delivered, __ATOMIC_RELAXED), irq_handled, irq_unsignalled,
+                        nvrm_display_vblanks() };
+    unsigned moving = 0;
+    for (unsigned i = 0; i < 4; i++)
+        if (now[i] != last[i]) moving |= 1u << i;
+    if (moving != last_moving)
+        nvrm_log("NVRM: in the last %d s, %llu interrupts delivered, %llu handled by RM, %llu of them found without "
+                 "a delivery, %llu vertical blanks of the screen%s (since the start %llu, %llu, %llu and %llu)",
+                 IRQ_REPORT_MS / 1000, (unsigned long long)(now[0] - last[0]), (unsigned long long)(now[1] - last[1]),
+                 (unsigned long long)(now[2] - last[2]), (unsigned long long)(now[3] - last[3]),
+                 irq_polling ? ", polling" : "", (unsigned long long)now[0], (unsigned long long)now[1],
+                 (unsigned long long)now[2], (unsigned long long)now[3]);
+    last_moving = moving;
+    memcpy(last, now, sizeof last);
 }
 
 static int irq_thread(void *unused) {
     (void)unused;
+    uint64_t report_at = nvrm_now_ns() + (uint64_t)IRQ_REPORT_MS * 1000000u;
     while (!__atomic_load_n(&irq_stop, __ATOMIC_ACQUIRE)) {
+        bool delivered = false;
         if (!irq_polling) {
             n_result r = n_pci_interrupt_take(nvrm_dev.pci, IRQ_WAKE_MS);
-            if (r == -N_ERR_TIMEOUT) continue;
-            if (r < 0) {
+            if (r >= 0) {
+                delivered = true;
+                __atomic_add_fetch(&irq_delivered, 1, __ATOMIC_RELAXED);
+            } else if (r != -N_ERR_TIMEOUT) {
                 /* The vector delivery broke: keep the GPU served by reading its interrupt
                    status instead of leaving RM without interrupts. */
                 nvrm_log("NVRM: interrupt wait failed (%s); polling the GPU's interrupt status", n_result_text(r));
@@ -71,7 +110,15 @@ static int irq_thread(void *unused) {
         } else {
             n_sleep_ms(IRQ_POLL_MS);
         }
-        irq_run_rm();
+        if (irq_run_rm()) {
+            irq_handled++;
+            if (!delivered) irq_unsignalled++;
+        }
+        uint64_t now = nvrm_now_ns();
+        if (now >= report_at) {
+            irq_report();
+            report_at = now + (uint64_t)IRQ_REPORT_MS * 1000000u;
+        }
     }
     return 0;
 }
@@ -137,9 +184,9 @@ static int progress_thread(void *start_ns) {
         timespec_get(&until, TIME_UTC);
         until.tv_sec += PROGRESS_MS / 1000;
         if (cnd_timedwait(&progress_wake, &progress_lock, &until) != thrd_timedout || progress_done) continue;
-        nvrm_log("NVRM: still initialising the GPU after %llu s (%llu interrupts handled%s)",
+        nvrm_log("NVRM: still initialising the GPU after %llu s (%llu interrupts delivered%s)",
                  (unsigned long long)((nvrm_now_ns() - start) / 1000000000ull),
-                 (unsigned long long)__atomic_load_n(&irq_runs, __ATOMIC_RELAXED),
+                 (unsigned long long)__atomic_load_n(&irq_delivered, __ATOMIC_RELAXED),
                  irq_polling ? ", polling" : "");
     }
     mtx_unlock(&progress_lock);

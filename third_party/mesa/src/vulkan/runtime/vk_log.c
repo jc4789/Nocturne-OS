@@ -111,11 +111,21 @@ __vk_log_impl(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
       }
    }
 
+#if DETECT_OS_NOCTURNE
+   /* While Nocturne GL holds Mesa's log to start a GPU screen (mesa_log_hold), what Vulkan says
+    * goes there too: there is no debug messenger then, and it is then that a driver's reason for
+    * not starting is wanted. */
+   const bool nocturne_held = mesa_log_holding();
+#else
+   const bool nocturne_held = false;
+#endif
+
 #if !MESA_DEBUG
-   if (unlikely(!instance) ||
-       (likely(!instance->enable_debug_logging) &&
-        likely(list_is_empty(&instance->debug_utils.callbacks)) &&
-        likely(list_is_empty(&instance->debug_report.callbacks))))
+   if (!nocturne_held &&
+       (unlikely(!instance) ||
+        (likely(!instance->enable_debug_logging) &&
+         likely(list_is_empty(&instance->debug_utils.callbacks)) &&
+         likely(list_is_empty(&instance->debug_report.callbacks)))))
       return;
 #endif
 
@@ -128,7 +138,7 @@ __vk_log_impl(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 
    char *message_idname = ralloc_asprintf(NULL, "%s:%d", file, line);
 
-   const bool do_log = MESA_VK_LOG ||
+   const bool do_log = MESA_VK_LOG || nocturne_held ||
                        (instance && instance->enable_debug_logging);
 
    if (do_log) {

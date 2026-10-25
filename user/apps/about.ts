@@ -39,8 +39,7 @@ function view(app: App): Child {
         rows.push(
             info("Processor", si.processors > 1 ? `${si.processor.trim()} × ${si.processors}` : si.processor.trim()),
             info("Memory", `${free.toLocaleString()} MiB free of ${total.toLocaleString()} MiB`),
-            info("Display", `${si.screenWidth} × ${si.screenHeight}, ${si.bitsPerChannel} bpc ` +
-                            `(${si.bitsPerChannel * 3}-bit colour)`),
+            info("Display", `${si.screenWidth} × ${si.screenHeight}`),
             info("Uptime", uptime(si.uptimeMs)),
             info("Tasks", `${si.tasks} running`));
     }

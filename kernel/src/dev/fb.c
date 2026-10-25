@@ -43,6 +43,31 @@ static void build_lut(uint32_t *lut, uint8_t *size, uint8_t shift, uint32_t bpp)
     for (unsigned v = 0; v < 1024; v++) lut[v] = (v * max + 511) / 1023 << shift;
 }
 
+/* The firmware's monitor (fb.monitor): its ids, and the refresh of the firmware's mode: the first
+   detailed timing of that size (the native one comes first), else the nominal rate nearest 60 Hz
+   of a standard or established timing of that size, as firmware sets its other modes. */
+static uint32_t from_60hz(uint32_t mhz) { return mhz > 60000 ? mhz - 60000 : 60000 - mhz; }
+
+static void fb_monitor(const uint8_t *e, size_t n) {
+    struct edid_ids id;
+    if (!edid_valid(e, n) || !edid_ids(e, n, &id)) return;
+    edid_monitor_id(&id, fb.monitor);
+    memcpy(fb.monitor_name, id.name, sizeof fb.monitor_name);
+    struct edid_mode modes[32];
+    unsigned count = edid_modes(e, modes, 32);
+    const struct edid_mode *best = NULL;
+    for (unsigned i = 0; i < count; i++) {
+        const struct edid_mode *m = &modes[i];
+        if (m->width != fb.width || m->height != fb.height) continue;
+        if (m->detailed) {
+            best = m;
+            break;
+        }
+        if (!best || from_60hz(m->refresh_mhz) < from_60hz(best->refresh_mhz)) best = m;
+    }
+    fb.refresh_mhz = best ? best->refresh_mhz : 0;
+}
+
 void fb_init(struct limine_framebuffer *f) {
     fb.addr = f->address;
     fb.phys = (uint64_t)f->address - hhdm_offset;
@@ -71,14 +96,17 @@ void fb_init(struct limine_framebuffer *f) {
     o->pitch = fb.pitch;
     o->bpp = fb.bpp;
     o->native = fb.native;
+    fb_monitor(f->edid, f->edid_size);
     fb_set_simulated(cmdline_has("fbsim10"));
 }
 
-/* Run the whole 10 bpc pipeline on an 8 bpc display (every QEMU/Hyper-V
-   firmware mode is 8 bpc) and dither it at scanout. Only the window manager
-   calls this after boot, between frames, and then reallocates its planes. */
+bool fb_dither_able(void) { return __atomic_load_n(&shown, __ATOMIC_ACQUIRE)->native; }
+
+/* Run the whole 10 bpc pipeline on an 8 bpc display and dither it at scanout (smooth gradients).
+   Only the window manager calls this after boot, between frames, and then reallocates its planes;
+   it turns it off when a scanout of another format is shown. */
 bool fb_set_simulated(bool on) {
-    if (on && !fb.native) return false;
+    if (on && !fb_dither_able()) return false;
     fb.simulated = on;
     fb.bpc = on ? 10 : fb.native_bpc;
     fb.deep = fb.bpc >= 10;
@@ -156,7 +184,7 @@ static void present_rows(size_t tile, void *context) {
    hold ends. Time never ends a hold: drawing while the driver still rebuilds is the very write
    the hold keeps out. A hold ends when the driver gives it back, or when its claim ends
    (dev/pciuser.c), which stops the device before it gives the holds back; that is also how a
-   driver stuck while holding is ended (pciuser.c: Ctrl+Alt+Esc, boot option fbhold=). Kernel code runs on the
+   driver stuck while holding is ended (pciuser.c, boot option fbhold=). Kernel code runs on the
    BSP, but a present runs with interrupts on and can be preempted half way (fbparallel tiles join
    before it returns): a hold, and a change of scanout, wait until no present is between its check
    and its end. The panic screen is drawn whatever is held, on the scanout shown and on what the
@@ -255,6 +283,8 @@ int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, siz
 }
 
 void fb_scanout_boot(void) { scanout_show(&scanouts[0]); }
+
+bool fb_boot_shown(void) { return __atomic_load_n(&shown, __ATOMIC_ACQUIRE) == &scanouts[0]; }
 
 void fb_screen_size(uint32_t *w, uint32_t *h) {
     const struct scanout *o = __atomic_load_n(&shown, __ATOMIC_ACQUIRE);

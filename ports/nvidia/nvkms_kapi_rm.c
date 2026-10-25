@@ -11,10 +11,17 @@
  * Nor does KAPI say when a flip has completed: its table has a getFlipPendingStatus entry that
  * nvKmsKapiGetFunctionsTable leaves NULL. Every commit that puts a surface on a layer names one
  * of the layer's two completion notifiers in KAPI's notifier surface (nvkms-kapi.c: the slot
- * after layerState[head][layer].currFlipNotifierIndex), which the display engine writes
- * "finished" when the flip has completed. KAPI never clears a slot before naming it again, so
- * the slot still holds the write of the flip two before; nvrm clears it before each such commit
- * and reads it afterwards.
+ * after layerState[head][layer].currFlipNotifierIndex). The display engine writes a window
+ * channel's completion notifier when it performs the flip, as "begun" with its time stamp
+ * (NV_DISP_NOTIFIER, clc37d.h), and nothing writes that slot again until a later commit names
+ * it: NVKMS's own flips are done once theirs reads "begun" (nvkms-headsurface.c,
+ * IsPreviousFlipDone), and where NVKMS stands in for the display engine it writes a client's
+ * notifier "begun" with the time stamp, "what the client would observe if their notifier was
+ * used in hardware" (HsUpdateClientNotifier). "Finished" is what the core channel's notifier of
+ * a mode set reaches (nvkms-evo3.c, nvEvoWaitForCompNotifierC3), never a window's. KAPI never
+ * clears a slot before naming it again, so the slot still holds the write of the flip two
+ * before; nvrm clears it to "not begun" before each such commit, and any other status read
+ * afterwards is that commit's flip performed.
  */
 #include "nvkms_os.h"
 
@@ -46,13 +53,21 @@ void nvrm_nvkms_flip_arm(struct NvKmsKapiDevice *device, uint32_t head, uint32_t
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
-bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer)
+bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer,
+                          struct nvrm_flip_seen *seen)
 {
+    if (seen) *seen = (struct nvrm_flip_seen){ 0 };
     if (!flip_notifiers(device, head, layer)) return false;
-    struct nvKmsParsedNotifier parsed = { 0 };
-    nvKmsParseNotifier(NVKMS_KAPI_NOTIFIER_INDEX(head, layer, device->layerState[head][layer].currFlipNotifierIndex),
-                       device->notifier.pLinearAddress, &parsed);
-    return parsed.status == NVKMS_NOTIFIER_STATUS_FINISHED;
+    NvU32 slot = device->layerState[head][layer].currFlipNotifierIndex;
+    struct nvKmsParsedNotifier parsed = { 0 }; /* a reserved status reads as "not begun" */
+    nvKmsParseNotifier(NVKMS_KAPI_NOTIFIER_INDEX(head, layer, slot), device->notifier.pLinearAddress, &parsed);
+    if (seen) {
+        seen->slot = slot;
+        seen->status = (uint32_t)parsed.status;
+        seen->time_ns = parsed.timeStamp;
+        seen->time_valid = parsed.timeStampValid;
+    }
+    return parsed.status != NVKMS_NOTIFIER_STATUS_NOT_BEGUN;
 }
 
 void nvrm_nvkms_flip_words(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer, uint32_t *slot,

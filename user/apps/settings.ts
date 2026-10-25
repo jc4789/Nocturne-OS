@@ -2,18 +2,18 @@
  * once and is kept in C:\Users\<name>\AppData\Settings\desktop.conf; at
  * startup init runs "js C:\Nocturne\System\settings.js --apply", which puts the
  * saved settings back before the desktop is used. Nothing here needs a
- * terminal or the boot command line. */
+ * terminal or the boot command line. Each page shows only what the system can
+ * do on this computer now, and says why when it cannot. */
 import { args, createFolder, exists, exit, getSetting, readText, resolvePath, writeText } from "nocturne";
 import {
-    button, caption, card, column, desktop, heading, listItem, row, run, scroll, segmented, slider, spacer, text,
-    theme, title, toggle, icon, type App, type Child, type DesktopSettings, type IconName, type ScreenMode,
-    type ScreenModeChoice, type ScreenModes,
+    button, caption, card, column, desktop, heading, listItem, row, run, scroll, segmented, slider, text, theme, title,
+    toggle, icon, type App, type Child, type DesktopSettings, type IconName, type ScreenMode, type ScreenModeChoice,
+    type ScreenModes, type ScreenSource, type SoundOutput,
 } from "nocturne/ui";
 
 /* The user's folder is the launch setting USERFOLDER ("C:\" without it, as libc's n_user_folder). */
 const FOLDER = resolvePath(`${getSetting("USERFOLDER") ?? "C:\\"}\\AppData\\Settings`);
 const PATH = FOLDER + "\\desktop.conf";
-const POINTER_Y_KEYS = ["auto", "normal", "invert"] as const;
 
 type Section = "display" | "mouse" | "sound";
 const SECTIONS: {id: Section; label: string; icon: IconName}[] = [
@@ -22,8 +22,10 @@ const SECTIONS: {id: Section; label: string; icon: IconName}[] = [
     {id: "sound", label: "Sound", icon: "sound"},
 ];
 
-/* modes: the user's display mode for each monitor ("mode.<monitor>=<width>x<height>@<mHz>"). */
-type Saved = {refresh?: number; pointerSpeed?: number; pointerY?: number; deepColour?: boolean; volume?: number;
+/* modes: the user's display mode for each monitor ("mode.<monitor>=<width>x<height>@<mHz>"). Keys
+   an older Settings wrote that the system no longer has (refresh, pointer_y) are left out;
+   deep_colour is what smooth_gradients was called. */
+type Saved = {pointerSpeed?: number; smoothGradients?: boolean; volume?: number; muted?: boolean;
               modes: Map<string, ScreenModeChoice>};
 
 /* ---- the saved file ---- */
@@ -31,30 +33,30 @@ function loadSaved(): Saved | null {
     let content: string;
     try { content = readText(PATH); } catch { return null; }
     const saved: Saved = {modes: new Map()};
+    let oldSmooth: boolean | undefined;
     for (const raw of content.split("\n")) {
         const line = raw.trim();
         const eq = line.indexOf("=");
         if (line.startsWith("#") || eq < 0) continue;
         const key = line.slice(0, eq), value = line.slice(eq + 1).trim(), n = Number.parseInt(value, 10);
         const mode = /^(\d{1,5})x(\d{1,5})@(\d{1,7})$/.exec(value);
-        if (key === "refresh" && n >= 0 && n <= 1000) saved.refresh = n;
-        else if (key === "pointer_speed" && n >= -2 && n <= 2) saved.pointerSpeed = n;
-        else if (key === "pointer_y" && POINTER_Y_KEYS.includes(value as typeof POINTER_Y_KEYS[number]))
-            saved.pointerY = POINTER_Y_KEYS.indexOf(value as typeof POINTER_Y_KEYS[number]);
-        else if (key === "deep_colour") saved.deepColour = value === "on";
+        if (key === "pointer_speed" && n >= -2 && n <= 2) saved.pointerSpeed = n;
+        else if (key === "smooth_gradients") saved.smoothGradients = value === "on";
+        else if (key === "deep_colour") oldSmooth = value === "on";
         else if (key === "volume" && n >= 0 && n <= 100) saved.volume = n;
+        else if (key === "muted") saved.muted = value === "on";
         else if (key.startsWith("mode.") && key.length > 5 && mode && Number(mode[1]) && Number(mode[2]) && Number(mode[3]))
             saved.modes.set(key.slice(5), {width: Number(mode[1]), height: Number(mode[2]),
                                            refreshMillihertz: Number(mode[3])});
     }
+    saved.smoothGradients ??= oldSmooth;
     return saved;
 }
 
-function save(s: DesktopSettings, volume: number | null, modes: Map<string, ScreenModeChoice>): string | null {
+function save(s: DesktopSettings, sound: SoundOutput | null, modes: Map<string, ScreenModeChoice>): string | null {
     let content = "# Nocturne desktop settings, written by Settings\n" +
-        `refresh=${s.refreshRate}\npointer_speed=${s.pointerSpeed}\npointer_y=${POINTER_Y_KEYS[s.pointerY % 3]}\n` +
-        `deep_colour=${s.deepColour ? "on" : "off"}\n`;
-    if (volume !== null) content += `volume=${volume}\n`;
+        `pointer_speed=${s.pointerSpeed}\nsmooth_gradients=${s.smoothGradients ? "on" : "off"}\n`;
+    if (sound) content += `volume=${sound.volume}\nmuted=${sound.muted ? "on" : "off"}\n`;
     for (const [monitor, m] of modes) content += `mode.${monitor}=${m.width}x${m.height}@${m.refreshMillihertz}\n`;
     try {
         if (!exists(FOLDER)) createFolder(FOLDER, {recursive: true});
@@ -65,20 +67,22 @@ function save(s: DesktopSettings, volume: number | null, modes: Map<string, Scre
     }
 }
 
-/* At startup: the saved settings over the system's own. A monitor's mode is put back whenever a
-   display driver drives that monitor, which may be later. */
+/* At startup: the saved settings over the system's own. Smooth gradients stay wished for while the
+   screen cannot take them, and come on when it can. A monitor's mode is put back whenever a display
+   driver drives that monitor, which may be later. The volume is put back even without a sound
+   device, for when one plays the sound (a Remote Desktop viewer). */
 function applySaved(): number {
     const now = desktop.get();
     if (!now) return 1;
     const saved = loadSaved();
     if (!saved) return 0;
     let ok = desktop.set({
-        refreshRate: saved.refresh ?? now.refreshRate,
         pointerSpeed: saved.pointerSpeed ?? now.pointerSpeed,
-        pointerY: saved.pointerY ?? now.pointerY,
-        deepColour: (saved.deepColour ?? now.deepColour) && now.deepColourAvailable,
+        smoothGradients: saved.smoothGradients ?? now.smoothGradients,
     });
-    if (saved.volume !== undefined) desktop.setVolume(saved.volume);
+    /* The volume first: setting it unmutes. */
+    if (saved.volume !== undefined) ok = desktop.setVolume(saved.volume) !== null && ok;
+    if (saved.muted !== undefined) ok = desktop.setMuted(saved.muted) !== null && ok;
     for (const [monitor, m] of saved.modes) ok = desktop.savedMode(monitor, m) && ok;
     return ok ? 0 : 1;
 }
@@ -86,13 +90,14 @@ function applySaved(): number {
 if (args[0] === "--apply") exit(applySaved());
 
 /* ---- the window ---- */
-let current = desktop.get();
+const current = desktop.get();
 if (!current) {
     console.error("settings: the desktop is not running");
     exit(1);
 }
 let settings: DesktopSettings = current;
 let screen: ScreenModes | null = desktop.modes();
+let sound: SoundOutput | null = desktop.sound();
 const savedModes = loadSaved()?.modes ?? new Map<string, ScreenModeChoice>();
 let section: Section = args[0] === "mouse" ? "mouse" : args[0] === "sound" ? "sound" : "display";
 let status = "", statusError = false;
@@ -100,28 +105,31 @@ let dragging = false;
 let tried: ScreenModeChoice | null = null; /* the mode on trial from this window */
 
 /* Apply, read back what the system took, save. */
-function change(next: Partial<DesktopSettings>) {
-    const wanted = {...settings, ...next};
-    if (!desktop.set(wanted)) {
+function change(next: Partial<Pick<DesktopSettings, "pointerSpeed" | "smoothGradients">>) {
+    const ok = desktop.set({...settings, ...next});
+    settings = desktop.get() ?? settings;
+    if (ok) store();
+    else {
         status = "The system did not accept that setting.";
         statusError = true;
-    } else {
-        store();
     }
-    settings = desktop.get() ?? settings;
 }
 
 function store() {
-    const error = save(settings, settings.volume, savedModes);
+    const error = save(settings, sound, savedModes);
     statusError = error !== null;
     status = error ? `Applied, but not saved: ${error}` : "Applied and saved. It stays this way after a restart.";
 }
 
 function setVolume(v: number, done: boolean) {
-    const now = desktop.setVolume(Math.max(0, Math.min(100, Math.round(v))));
-    if (now !== null) settings = {...settings, volume: now};
+    sound = desktop.setVolume(Math.max(0, Math.min(100, Math.round(v)))) ?? sound;
     dragging = !done;
     if (done) store();
+}
+
+function setMuted(on: boolean) {
+    sound = desktop.setMuted(on) ?? sound;
+    store();
 }
 
 /* ---- the monitor's modes ---- */
@@ -136,10 +144,14 @@ function rateName(m: ScreenModeChoice, modes: readonly ScreenMode[]): string {
                                   two(o.refreshMillihertz) === two(m.refreshMillihertz));
     return `${clash ? String(m.refreshMillihertz / 1000) : two(m.refreshMillihertz)} Hz`;
 }
-const modeName = (m: ScreenModeChoice, modes: readonly ScreenMode[]) => `${sizeName(m)} at ${rateName(m, modes)}`;
+/* The size, and the rate where it is known. */
+const modeName = (m: ScreenModeChoice, modes: readonly ScreenMode[]) =>
+    m.refreshMillihertz ? `${sizeName(m)} at ${rateName(m, modes)}` : sizeName(m);
 
 function tryMode(m: ScreenModeChoice) {
-    if (sameMode(m, screen?.wanted ?? null)) return;
+    /* While the driver shows its own mode, the one it shows already is no trial; after it handed the
+       screen back, any mode asks it to show one again. */
+    if (screen?.source === "driver" && sameMode(m, screen.wanted)) return;
     if (desktop.tryMode(m)) {
         tried = m;
         status = "";
@@ -194,26 +206,47 @@ function setting(name: string, about: Child, control: Child, below = false): Chi
     return card({gap: 14}, below ? [words, control] : row({gap: 16}, words, control));
 }
 
-function modesCard(): Child {
-    const s = screen;
-    if (!s || !s.modes.length)
-        return setting("Resolution and refresh rate",
-                       caption(`${settings.screenWidth} × ${settings.screenHeight}, set by the firmware when the ` +
-                               "computer starts. A display driver for this screen lists the monitor's other modes."),
-                       null, true);
-    const modes = s.modes;
-    const current = s.wanted ?? s.shown ?? modes.find(m => m.preferred) ?? modes[0];
+/* Why the screen has the size it has, when no list of modes can change it (or, for a driver that
+   handed the screen back, why its list is offered again). */
+const REASONS: Record<ScreenSource, string> = {
+    firmware: "No display driver is running, so the screen keeps the resolution the computer started with.",
+    driver: "The display driver does not see a monitor.",
+    handedBack: "The display driver handed the screen back, so it shows the resolution the computer started with.",
+    driverStopped: "The display driver stopped, so the screen is back at the resolution the computer started with.",
+    remote: "The size follows your Remote Desktop window.",
+};
+
+/* The screen: what it shows and what decides that; with a display driver's modes, the lists to
+   choose from and the trial of the one chosen. */
+function screenCard(): Child {
+    const s = screen, source: ScreenSource = s?.source ?? "firmware", modes = s?.modes ?? [];
+    const listed = source !== "remote" && modes.length > 0;
+    const shown = source === "remote" || !s?.shown ? `${settings.screenWidth} × ${settings.screenHeight}`
+                                                   : modeName(s.shown, modes);
+    const saved = s?.monitor ? savedModes.get(s.monitor) : undefined;
+    const why = source === "driver" && listed ? "The monitor's own preferred mode is marked recommended."
+              : source === "handedBack" && listed ? `${REASONS.handedBack} Pick a resolution to try again.`
+              : REASONS[source];
+    const words = column({gap: 4},
+        heading(s?.name || "Screen"),
+        text(shown),
+        caption(why),
+        !listed && saved && source !== "remote" &&
+            caption(`Saved for this monitor: ${modeName(saved, [])}, used when a display driver runs.`));
+    if (!listed || !s) return card({gap: 14}, words);
+
+    /* The mode marked: the one the driver is asked for while it shows its own, else the one shown. */
+    const preferred = modes.find(m => m.preferred);
+    const marked = source === "driver" ? s.wanted ?? s.shown : s.shown;
+    const at = (marked && modes.find(m => sameSize(m, marked))) ?? preferred ?? modes[0];
     const sizes: ScreenMode[] = [];
     for (const m of modes) if (!sizes.some(o => sameSize(o, m))) sizes.push(m);
     sizes.sort((a, b) => b.width * b.height - a.width * a.height || b.width - a.width);
-    const preferred = modes.find(m => m.preferred);
-    const rates = modes.filter(m => sameSize(m, current)).sort((a, b) => b.refreshMillihertz - a.refreshMillihertz);
+    const rates = modes.filter(m => sameSize(m, at)).sort((a, b) => b.refreshMillihertz - a.refreshMillihertz);
     const recommended = " (recommended)";
     const list = (items: Child[]) => scroll({maxHeight: 236, gap: 2}, items);
     return card({gap: 14},
-        column({gap: 4},
-               heading("Resolution and refresh rate"),
-               caption(`${s.name || s.monitor}. The monitor's own preferred mode is marked recommended.`)),
+        words,
         s.trialMs > 0 ? trialCard(s) : null,
         tried && !s.trialMs && s.refused &&
             caption(`The monitor could not show ${modeName(tried, modes)}; the mode before is back.`,
@@ -221,11 +254,11 @@ function modesCard(): Child {
         row({gap: 16, align: "start"},
             column({grow: 1, gap: 6}, caption("Resolution"),
                    list(sizes.map(m => listItem(sizeName(m) + (preferred && sameSize(m, preferred) ? recommended : ""),
-                                                sameSize(m, current), () => trySize(modes, m),
+                                                !!marked && sameSize(m, marked), () => trySize(modes, m),
                                                 {key: sizeName(m)})))),
             column({grow: 1, gap: 6}, caption("Refresh rate"),
                    list(rates.map(m => listItem(rateName(m, modes) + (m.preferred ? recommended : ""),
-                                                sameMode(m, current), () => tryMode(m),
+                                                sameMode(m, marked), () => tryMode(m),
                                                 {key: m.refreshMillihertz}))))));
 }
 
@@ -240,63 +273,36 @@ function trialCard(s: ScreenModes): Child {
             caption(`Going back in ${Math.ceil(s.trialMs / 1000)} s`)));
 }
 
-const FRAME_RATES = [30, 60, 75, 120, 144, 240, 0];
-const frameRateName = (hz: number) => hz ? `${hz} Hz` : "Unlimited";
-
 function displayPage(): Child {
     const s = settings;
-    const depth = s.deepColourAvailable
-        ? "Draws in 10 bits per channel, dithered for this 8 bpc screen: smoother gradients and 10-bit video."
-        : s.nativeBitsPerChannel >= 10 ? "This screen already shows 10 bits per channel."
-        : "Not available for this screen's pixel format.";
-    const about = "How often the desktop is redrawn when the screen gives no vertical blanks, as the firmware's " +
-                  "screen does not. A display driver's vertical blanks pace it at the monitor's refresh rate instead.";
     return [
-        modesCard(),
-        setting("10-bit colour", caption(depth),
-                toggle(s.deepColour, on => change({deepColour: on}), {disabled: !s.deepColourAvailable})),
-        setting("Desktop frame rate",
-                caption(FRAME_RATES.includes(s.refreshRate) ? about : `Now ${s.refreshRate} Hz. ${about}`),
-                segmented(FRAME_RATES.map(hz => ({label: frameRateName(hz), value: hz})), s.refreshRate,
-                          hz => change({refreshRate: hz})), true),
-        card({gap: 12},
-             heading("Screen"),
-             info("Size", `${s.screenWidth} × ${s.screenHeight}` +
-                          (screen?.shown ? ` at ${rateName(screen.shown, screen.modes)}` : "")),
-             info("Colour depth", `Screen ${s.nativeBitsPerChannel} bpc · desktop ${s.bitsPerChannel} bpc ` +
-                                  `(${s.bitsPerChannel * 3}-bit colour)`)),
+        screenCard(),
+        s.smoothGradientsAvailable &&
+            setting("Smooth gradients",
+                    caption("Shows gradients, photos and video with less banding. Uses more processor time."),
+                    toggle(s.smoothGradients, on => change({smoothGradients: on}))),
     ];
-}
-
-function info(name: string, value: string): Child {
-    return row({gap: 12, align: "start"}, text(name, {width: 110, colour: theme.textDim}), text(value, {grow: 1}));
 }
 
 function mousePage(): Child {
-    const s = settings;
-    return [
-        setting("Pointer speed", caption("How far the pointer moves for the same mouse movement."),
-                segmented([{label: "Slowest", value: -2}, {label: "Slow", value: -1}, {label: "Normal", value: 0},
-                           {label: "Fast", value: 1}, {label: "Fastest", value: 2}], s.pointerSpeed,
-                          v => change({pointerSpeed: v})), true),
-        setting("Up and down",
-                column({gap: 2},
-                       caption(s.pointerYDetected ? "Automatic: inverted, because this host reports it upside down."
-                                                  : "Automatic: as the mouse reports it."),
-                       caption("If the pointer moves the wrong way, choose Inverted.")),
-                segmented([{label: "Automatic", value: 0}, {label: "Normal", value: 1}, {label: "Inverted", value: 2}],
-                          s.pointerY, v => change({pointerY: v})), true),
-    ];
+    return setting("Pointer speed", caption("How far the pointer moves for the same mouse movement."),
+                   segmented([{label: "Slowest", value: -2}, {label: "Slow", value: -1}, {label: "Normal", value: 0},
+                              {label: "Fast", value: 1}, {label: "Fastest", value: 2}], settings.pointerSpeed,
+                             v => change({pointerSpeed: v})), true);
 }
 
+/* The same sound device as the taskbar's speaker names. */
 function soundPage(): Child {
-    const volume = settings.volume;
-    if (volume === null) return setting("Volume", caption("No sound device was found."), null, true);
-    return setting("Volume", caption("Drag or scroll the slider; the taskbar speaker does the same."),
-                   row({gap: 14},
-                       icon("sound", {size: 20}),
-                       slider(volume, 0, 100, setVolume, {grow: 1, wheelStep: 5}),
-                       text(`${volume}%`, {width: 44, textAlign: "end", weight: 1})), true);
+    const s = sound;
+    if (!s?.device) return card({gap: 4}, heading("No sound device"), caption("Nocturne cannot play sound on this computer."));
+    return [
+        setting("Volume", caption(`Playing through ${s.device}.`),
+                row({gap: 14},
+                    icon("sound", {size: 20}),
+                    slider(s.volume, 0, 100, setVolume, {grow: 1, wheelStep: 5}),
+                    text(`${s.volume}%`, {width: 44, textAlign: "end", weight: 1})), true),
+        setting("Mute", caption("Silences all sound. The volume stays as it is."), toggle(s.muted, setMuted)),
+    ];
 }
 
 function view(): Child {
@@ -328,15 +334,16 @@ const app: App = run({
     },
 });
 
-/* The taskbar speaker, a depth switch the compositor just made, the desktop's new size, or the
-   monitor's modes changing (a trial counting down or ending, a monitor plugged in). */
-const modesKey = (s: ScreenModes | null) => JSON.stringify(s);
+/* What changed elsewhere: the taskbar speaker, a sound device coming or going, smooth gradients
+   becoming available or not, the desktop's new size, the screen handed back, or the monitor's modes
+   changing (a trial counting down or ending, a monitor plugged in). */
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const poll = setInterval(() => {
     if (app.closed) { clearInterval(poll); return; }
     const now = desktop.get();
     if (!now) return;
-    const nextScreen = desktop.modes();
-    let changed = modesKey(nextScreen) !== modesKey(screen);
+    const nextScreen = desktop.modes(), nextSound = desktop.sound();
+    let changed = !same(nextScreen, screen);
     if (changed && screen?.trialMs && nextScreen && !nextScreen.trialMs && tried && !nextScreen.refused &&
         !sameMode(nextScreen.wanted, tried)) {
         status = "The mode was not kept; the one before is back.";
@@ -344,10 +351,12 @@ const poll = setInterval(() => {
         tried = null;
     }
     screen = nextScreen;
-    if ((now.volume !== settings.volume && !dragging) || now.bitsPerChannel !== settings.bitsPerChannel ||
-        now.screenWidth !== settings.screenWidth || now.screenHeight !== settings.screenHeight) {
-        settings = {...settings, bitsPerChannel: now.bitsPerChannel, screenWidth: now.screenWidth,
-                    screenHeight: now.screenHeight, volume: dragging ? settings.volume : now.volume};
+    if (!same(now, settings)) {
+        settings = now;
+        changed = true;
+    }
+    if (!dragging && !same(nextSound, sound)) {
+        sound = nextSound;
         changed = true;
     }
     if (changed) app.invalidate();

@@ -27,6 +27,13 @@ for name, prefix, extras in [
                      "-Ithird_party/nvidia-open/src/common/sdk/nvidia/inc"]),
     ("nvk_rm", ["-Iports/nvidia/include", "-Ithird_party/nvidia-open/src/common/sdk/nvidia/inc",
                 "-Ithird_party/nvidia-open/src/nvidia/arch/nvalloc/unix/include"], []),
+    # 製品のソースをそれぞれ一つの翻訳単位として（zink_instance.cはgenerate.pyの生成物、全体ビルドと同じもの）
+    ("zink_start", [], ["-DGALLIUM_ZINK", "-DMESA_VK_LOG=0", "-Ithird_party/mesa/src/gallium/drivers/zink",
+                         "-Ibuild/mesa/gen/src/gallium/drivers/zink", "-Ithird_party/mesa/src/vulkan/util",
+                         "-Ibuild/mesa/gen/src/vulkan/util", "third_party/mesa/src/util/u_dl.c",
+                         "third_party/mesa/src/util/log.c", "third_party/mesa/src/vulkan/runtime/vk_log.c",
+                         "build/mesa/gen/src/gallium/drivers/zink/zink_instance.c",
+                         "build/mesa/gen/src/vulkan/util/vk_enum_to_str.c", "third_party/mesa/src/util/ralloc.c"]),
 ]:
     exe = root / ("build/" + name.replace("_", "-") + "-hosttest.exe")
     result = subprocess.run([common[0], *prefix, *common[1:], "tests/" + name + "_hosttest.c", *extras, "-o", str(exe)], cwd=root, env=env)

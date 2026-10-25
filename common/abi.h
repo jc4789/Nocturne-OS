@@ -92,7 +92,7 @@ enum {
     SYS_EVENTS_CREATE, SYS_EVENTS_WATCH, SYS_EVENTS_UNWATCH, SYS_EVENTS_WATCH_ADDRESS,
     SYS_EVENTS_TIMER, SYS_EVENTS_WAIT,
     SYS_APP_OPEN, SYS_APP_ID, SYS_SYSTEM_LOG_OPEN,
-    SYS_AUDIO_OPEN, SYS_AUDIO_SUBMIT, SYS_AUDIO_STATUS, SYS_AUDIO_VOLUME,
+    SYS_AUDIO_OPEN, SYS_AUDIO_SUBMIT, SYS_AUDIO_STATUS, SYS_AUDIO_OUTPUT,
     SYS_RANDOM,
     /* (bytes, access): N_MEMORY_* access, N_MEMORY_LOW added for pages below 2 GiB */
     SYS_MEMORY_RESERVE, SYS_MEMORY_RELEASE, SYS_MEMORY_PROTECT,
@@ -377,12 +377,7 @@ struct n_screen_modes {
    While app is not 0 the driver draws the pointer: at pointer_x, pointer_y on the screen (where
    its hot spot goes) when pointer_shown, the image in pointer (rows of N_SCREEN_POINTER_SIZE
    pixels of 0xAARRGGBB, not premultiplied, transparent outside the shape) with its hot spot at
-   hot_x, hot_y; pointer_serial changes when the image does.
-   take_back is not 0 while the user asks for the boot screen back (Ctrl+Alt+Esc), the way out of
-   a display that shows nothing of the desktop: the driver gives it back (n_pci_give_screen with
-   N_SCANOUT_BOOT), shows its display engine's own console or the firmware's framebuffer again and
-   shows nothing of its own until it is started anew. The system clears it once the boot screen is
-   back. */
+   hot_x, hot_y; pointer_serial changes when the image does. */
 #define N_SCREEN_POINTER_SIZE 32u
 struct n_screen_state {
     uint64_t serial;
@@ -390,7 +385,7 @@ struct n_screen_state {
     uint32_t pointer_shown;
     int32_t pointer_x, pointer_y;
     uint32_t hot_x, hot_y;
-    uint32_t pointer_serial, take_back;
+    uint32_t pointer_serial, reserved;
     uint64_t mode_serial;
     struct n_screen_mode mode;
     uint32_t pointer[N_SCREEN_POINTER_SIZE * N_SCREEN_POINTER_SIZE];
@@ -469,6 +464,19 @@ struct n_audio_status {
 #define N_AUDIO_CLOCK_REMOTE 4u
 #define N_AUDIO_RATE 48000     /* n_audio_submit: frames of two int16_t, left first */
 #define N_AUDIO_WAIT 1u        /* n_audio_submit: wait for room instead of N_ERR_NOT_READY */
+
+/* n_audio_output: the sound's way out. With set's N_AUDIO_SET_VOLUME the master volume becomes
+   volume (0 to 100; it also unmutes), with N_AUDIO_SET_MUTED muting becomes muted (both: in that
+   order); then *io is filled with how things stand. device names what plays the sound for people
+   ("Remote desktop" while a remote viewer takes it, else the sound card), "" when nothing does:
+   the volume is kept for when something does, but nothing is heard. */
+#define N_AUDIO_SET_VOLUME 1u
+#define N_AUDIO_SET_MUTED 2u
+struct n_audio_output {
+    int32_t volume;  /* 0 to 100 */
+    uint32_t muted;  /* 0 or 1 */
+    char device[32];
+};
 
 /* ---- GUI ---- */
 enum {

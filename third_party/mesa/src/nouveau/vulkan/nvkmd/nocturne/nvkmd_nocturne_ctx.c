@@ -102,11 +102,12 @@ nvkmd_nocturne_create_exec_ctx(struct nvkmd_nocturne_dev *dev,
       (engines & (NVKMD_ENGINE_3D | NVKMD_ENGINE_COMPUTE |
                   NVKMD_ENGINE_2D | NVKMD_ENGINE_M2MF)) ? 0 : 4;
 
-   uint32_t st = nnrm_chan_create(dev->rm, engines, &ctx->chan);
+   const char *step;
+   uint32_t st = nnrm_chan_create(dev->rm, engines, &ctx->chan, &step);
    if (st != 0) {
       result = vk_errorf(log_obj, nnrm_vk_result(st, false),
-                         "Failed to create a GPU channel: %s",
-                         nnrm_status_name(st));
+                         "Failed to create a GPU channel for engines 0x%x: %s failed: %s (0x%x)",
+                         engines, step, nnrm_status_name(st), st);
       goto fail_ctx;
    }
 

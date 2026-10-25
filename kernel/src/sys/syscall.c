@@ -2401,11 +2401,23 @@ static int64_t sys_audio_flush(int h) {
     return r;
 }
 
-/* The master volume, 0 to 100; percent < 0 only reads it. */
-static int64_t sys_audio_volume(int64_t percent) {
-    if (percent > 100) return -N_ERR_INVALID;
-    if (percent >= 0) audio_set_volume((int)percent);
-    return audio_volume();
+/* The sound's way out (struct n_audio_output): the volume and muting set as set says, then all of
+   it read back. */
+static int64_t sys_audio_output(struct n_audio_output *uio, uint32_t set) {
+    struct n_audio_output io = {0};
+    if (set & ~(N_AUDIO_SET_VOLUME | N_AUDIO_SET_MUTED)) return -N_ERR_INVALID;
+    if (set && copy_from_user(&io, uio, sizeof io)) return -N_ERR_BAD_ADDRESS;
+    if (((set & N_AUDIO_SET_VOLUME) && (io.volume < 0 || io.volume > 100)) ||
+        ((set & N_AUDIO_SET_MUTED) && io.muted > 1))
+        return -N_ERR_INVALID;
+    if (set & N_AUDIO_SET_VOLUME) audio_set_volume(io.volume);
+    if (set & N_AUDIO_SET_MUTED) audio_set_muted(io.muted != 0);
+    memset(&io, 0, sizeof io);
+    io.volume = audio_volume();
+    io.muted = audio_muted();
+    const char *device = audio_output();
+    if (device) strlcpy(io.device, device, sizeof io.device);
+    return copy_to_user(uio, &io, sizeof io) ? -N_ERR_BAD_ADDRESS : 0;
 }
 
 /* Fills the buffer from the kernel's entropy pool in pieces, each copied out
@@ -2769,7 +2781,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_AUDIO_OPEN: ret = sys_audio_open(); break;
     case SYS_AUDIO_SUBMIT: ret = sys_audio_submit((int)a, (const void *)b, c, (uint32_t)d); break;
     case SYS_AUDIO_STATUS: ret = sys_audio_status((int)a, (struct n_audio_status *)b); break;
-    case SYS_AUDIO_VOLUME: ret = sys_audio_volume((int64_t)a); break;
+    case SYS_AUDIO_OUTPUT: ret = sys_audio_output((struct n_audio_output *)a, (uint32_t)b); break;
     case SYS_RANDOM: ret = sys_random((void *)a, b); break;
     case SYS_PAGER_CREATE: ret = sys_pager_create(a, (int32_t *)b); break;
     case SYS_PAGER_TAKE: ret = sys_pager_take((int)a, (struct n_pager_fault *)b, c, (int64_t)d); break;

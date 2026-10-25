@@ -528,6 +528,13 @@ static bool same_mode(const struct n_screen_mode *a, const struct n_screen_mode 
 static n_result modes_get(struct screen_modes *out) {
     return (n_result)__syscall(SYS_SCREEN_INFO, (long)out, sizeof *out, SCREEN_MODES_GET, 0, 0);
 }
+/* What decides the desktop's size as Settings hears it (SCREEN_SOURCE_*); UINT32_MAX unread. */
+static uint32_t screen_source(void) {
+    struct screen_modes *s = calloc(1, sizeof *s);
+    uint32_t source = s && modes_get(s) == 0 ? s->source : UINT32_MAX;
+    free(s);
+    return source;
+}
 static n_result mode_set(uint32_t how, const char *monitor, const struct n_screen_mode *m) {
     struct screen_mode_set s = {.how = how};
     if (monitor) snprintf(s.monitor, sizeof s.monitor, "%s", monitor);
@@ -586,6 +593,13 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     }
     struct n_screen_state st = {0};
     CHECK(n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "no screen state before modes are offered");
+    /* no driver running has offered modes (an earlier run's ended) */
+    n_result r = modes_get(seen);
+    CHECK(r == 0 && !seen->offered.count &&
+              (seen->source == SCREEN_SOURCE_FIRMWARE || seen->source == SCREEN_SOURCE_DRIVER_STOPPED) &&
+              seen->offered.shown.width == d->width && seen->offered.shown.height == d->height,
+          "without modes Settings sees the boot screen's mode: source %u, %ux%u", seen->source, seen->offered.shown.width,
+          seen->offered.shown.height);
     if (edu >= 0) CHECK(n_pci_screen_modes(edu, offer) == -N_ERR_DENIED, "edu offers no modes");
     offer->count = N_SCREEN_MODES_MAX + 1;
     CHECK(n_pci_screen_modes(vga, offer) == -N_ERR_INVALID, "more modes than N_SCREEN_MODES_MAX");
@@ -595,7 +609,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     offer->modes[3] = small;
 
     /* the monitor's preferred mode first */
-    n_result r = n_pci_screen_modes(vga, offer);
+    r = n_pci_screen_modes(vga, offer);
     CHECK(r == 0, "the VGA offers its monitor's modes: %s", n_result_text(r));
     if (r) {
         free(offer), free(seen);
@@ -610,8 +624,9 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(n_pci_screen_state(vga, st.serial, &st, 100) == -N_ERR_TIMEOUT, "a mode shown as wanted changes nothing");
     r = modes_get(seen);
     CHECK(r == 0 && seen->offered.count == 4 && !strcmp(seen->offered.monitor, "pcitest-vga") &&
-              same_mode(&seen->offered.shown, &native) && same_mode(&seen->wanted, &native) && !seen->trial_ms && !seen->refused,
-          "Settings sees the monitor, its modes and the one shown: %s", n_result_text(r));
+              same_mode(&seen->offered.shown, &native) && same_mode(&seen->wanted, &native) && !seen->trial_ms && !seen->refused &&
+              seen->source == SCREEN_SOURCE_DRIVER,
+          "Settings sees the monitor, its modes and the one the driver shows: %s", n_result_text(r));
     CHECK(mode_set(SCREEN_MODE_KEEP, NULL, NULL) == -N_ERR_NOT_FOUND && mode_set(SCREEN_MODE_BACK, NULL, NULL) == -N_ERR_NOT_FOUND,
           "nothing on trial to keep or go back from");
     struct n_screen_mode odd = {800, 600, 60000, 0};
@@ -690,30 +705,42 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     r = n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL);
     CHECK(r == 0 && desktop_width((int)native.width) && n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED,
           "the boot screen back at its size: %s", n_result_text(r));
+    r = modes_get(seen);
+    CHECK(r == 0 && seen->source == SCREEN_SOURCE_HANDED_BACK && !seen->offered.count &&
+              seen->offered.shown.width == native.width && seen->offered.shown.height == native.height,
+          "Settings hears the screen given back by a driver that runs on: source %u", seen->source);
+
+    /* offered again with the boot screen shown, as a driver that gave the screen back and still
+       follows the wishes: Settings lists the modes, and a mode tried asks for the driver's screen */
+    offer->count = 4;
+    offer->done = 0;
+    offer->shown = (struct n_screen_mode){0};
+    CHECK(n_pci_screen_modes(vga, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && modes_get(seen) == 0 &&
+              seen->source == SCREEN_SOURCE_HANDED_BACK && seen->offered.count == 4 &&
+              seen->offered.shown.width == native.width && seen->offered.shown.height == native.height,
+          "modes offered with the boot screen shown: listed, the boot screen's mode shown (source %u)", seen->source);
+    r = mode_set(SCREEN_MODE_TRY, NULL, &small);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small),
+          "a mode tried with the boot screen shown is wanted: %s", n_result_text(r));
+    r = mode_show(vga, surface, d, dispi, offer, &st, false);
+    CHECK(r == 0 && desktop_width(1024) && screen_source() == SCREEN_SOURCE_DRIVER,
+          "the driver shows its screen again: %s", n_result_text(r));
+    r = mode_set(SCREEN_MODE_BACK, NULL, NULL);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "back from that trial: %s", n_result_text(r));
+    mode_show(vga, surface, d, dispi, offer, &st, false);
+    offer->count = 0;
+    CHECK(n_pci_screen_modes(vga, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0,
+          "withdrawn again");
+    bochs_mode(dispi, native.width, native.height, d->pitch, (uint32_t)(d->offset / d->pitch));
+    r = n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL);
+    CHECK(r == 0 && desktop_width((int)native.width) && n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED,
+          "the boot screen back again: %s", n_result_text(r));
     n_sleep_ms(300);
     free(offer), free(seen);
 }
 
-/* Ctrl+Alt+Esc while the screen is drawn into the driver's surface asks the driver for the boot
-   screen (struct n_screen_state take_back); the boot screen back ends the request. */
-static void escape_cases(n_handle vga, n_handle surface, const struct n_scanout *d, unsigned seconds) {
-    struct n_screen_state st;
-    n_result r = n_pci_screen_state(vga, 0, &st, 0);
-    CHECK(r == 0 && !st.take_back, "the boot screen is not asked for before the user does: %s", n_result_text(r));
-    printf("pcitest: press Ctrl+Alt+Esc within %u s\n", seconds);
-    for (uint64_t end = uptime_ms() + seconds * 1000ull; r == 0 && !st.take_back && uptime_ms() < end;)
-        if ((r = n_pci_screen_state(vga, st.serial, &st, 200)) == -N_ERR_TIMEOUT) r = 0;
-    CHECK(r == 0 && st.take_back, "Ctrl+Alt+Esc asks the driver for the boot screen: %s", n_result_text(r));
-    r = n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL);
-    CHECK(r == 0, "the boot screen given back: %s", n_result_text(r));
-    r = n_pci_give_screen(vga, surface, d);
-    if (!r) r = n_pci_screen_state(vga, 0, &st, 0);
-    CHECK(r == 0 && !st.take_back, "the request is over once the boot screen was back: %s", n_result_text(r));
-}
-
-/* linger_s: how long the second buffer is shown; escape_s: how long the user has for Ctrl+Alt+Esc
-   (0: that case is not run). */
-static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n, unsigned linger_s, unsigned escape_s) {
+/* linger_s: how long the second buffer is shown. */
+static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n, unsigned linger_s) {
     int at = find_vga(list, n);
     if (at < 0) {
         printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
@@ -806,7 +833,6 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(r == 0, "vertical blanks of the surface shown: %s", n_result_text(r));
     CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, false) == 0, "the screen held and given back");
     n_sleep_ms(300); /* the release draws all of the screen again: the marks below come after it */
-    if (escape_s) escape_cases(vga, surface, &d, escape_s);
 
     /* a second buffer past it, which the display then shows */
     if (second + frame <= size) {
@@ -878,6 +904,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     const volatile uint32_t *seen =
         again ? (const volatile uint32_t *)((uint8_t *)again + (boot & 4095) + 100ull * pitch) + 100 : NULL;
     CHECK(seen && marks(seen) == 0, "the claim's end drew the boot screen again: %d marks left", seen ? marks(seen) : -1);
+    CHECK(screen_source() == SCREEN_SOURCE_DRIVER_STOPPED, "Settings hears that the driver which offered modes ended");
     if (again) n_memory_release(again, peek);
     if (view >= 0) n_handle_close(view);
     if (bar >= 0) n_handle_close(bar);
@@ -1133,18 +1160,8 @@ int main(int argc,char **argv) {
     if(argc>1 && !strncmp(argv[1],"screen=",7)){
         struct n_pciinfo list[128];
         int n = pcilist(list, 128);
-        give_screen_cases(-1, list, n, (unsigned)strtoul(argv[1] + 7, NULL, 10), 0);
+        give_screen_cases(-1, list, n, (unsigned)strtoul(argv[1] + 7, NULL, 10));
         printf("pcitest screen: %d failed\n", failed);
-        return failed != 0;
-    }
-    /* pcitest escape=<seconds>: the given scanout, with that long to press Ctrl+Alt+Esc */
-    if(argc>1 && !strncmp(argv[1],"escape=",7)){
-        struct n_pciinfo list[128];
-        int n = pcilist(list, 128);
-        unsigned seconds = (unsigned)strtoul(argv[1] + 7, NULL, 10);
-        if (seconds) give_screen_cases(-1, list, n, 0, seconds);
-        else { printf("FAIL: escape=<seconds> needs a number above 0\n"); failed++; }
-        printf("pcitest escape: %d failed\n", failed);
         return failed != 0;
     }
     struct n_pciinfo list[128];
@@ -1219,7 +1236,7 @@ int main(int argc,char **argv) {
         }
     acpi_refused_cases(pci, e);
     CHECK(n_pci_hold_screen(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
-    give_screen_cases(pci, list, n, 0, 0);
+    give_screen_cases(pci, list, n, 0);
     /* a function on bus 0 that is neither this device nor a bridge above it */
     for (int i = 0; i < n; i++)
         if (i != at && list[i].bus == e->bus && list[i].dev != e->dev && list[i].cls != 0x06) {

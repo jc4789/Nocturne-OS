@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include "gfx.h"
 #include "display_abi.h"
+#include "edid.h"
 
 struct fb_info {
     uint8_t *addr;
@@ -13,13 +14,20 @@ struct fb_info {
     uint8_t bpc;    /* the desktop's depth: 8, or 10 for 2:10:10:10 or while simulated */
     uint8_t native_bpc; /* smallest channel depth of the scanout itself */
     bool deep;      /* bpc >= 10: the compositor keeps a deep plane for this display */
-    bool simulated; /* Settings: the 10 bpc pipeline, shown dithered on an 8 bpc scanout */
-    bool native;    /* 32bpp xRGB: direct copy */
+    bool simulated; /* Settings (smooth gradients): the 10 bpc pipeline, shown dithered on an 8 bpc scanout */
+    bool native;    /* the firmware's framebuffer is 32bpp xRGB: direct copy */
+    /* The monitor the firmware's mode is shown on, from the EDID the firmware read from it
+       (monitor "" without one), and that mode's refresh where a timing of it names that size
+       (0: not known). */
+    char monitor[EDID_MONITOR_ID_SIZE], monitor_name[14];
+    uint32_t refresh_mhz;
 };
 extern struct fb_info fb;
 struct limine_framebuffer;
 void fb_init(struct limine_framebuffer *f);
-bool fb_set_simulated(bool on); /* false: the scanout is not 8 bpc xRGB */
+bool fb_set_simulated(bool on); /* false: the scanout shown is not 8 bpc xRGB (fb_dither_able) */
+/* Whether the scanout shown is 8 bpc xRGB, the one the 10 bpc pipeline is dithered onto. */
+bool fb_dither_able(void);
 /* Copy a rectangle of a full-screen 32bpp xRGB buffer to the screen. deep is
    that buffer's deep plane (display_abi.h) or NULL for 8-bit content. */
 void fb_present(const uint32_t *src, int src_pitch, const uint8_t *deep, int deep_pitch,
@@ -49,6 +57,7 @@ int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, siz
                         const struct n_scanout *d);
 void fb_scanout_boot(void);
 void fb_screen_size(uint32_t *w, uint32_t *h);
+bool fb_boot_shown(void); /* the firmware's framebuffer is the scanout shown (no driver's is) */
 /* What the display engine may show in the scanout's place (an app's image shown directly,
    n_pci_screen_image, dev/pciuser.c, the only caller, one call at a time): fb_scanout_also maps
    the pages as fb_scanout_take would, but nothing is drawn there except the panic screen.

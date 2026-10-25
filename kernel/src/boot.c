@@ -101,6 +101,13 @@ void kmain(void) {
     kprintf("video: %ux%u, %u bpp, %u bpc (R%u@%u G%u@%u B%u@%u)%s, pitch %u\n", fb.width, fb.height,
             fb.bpp, fb.bpc, fb.rsize, fb.rshift, fb.gsize, fb.gshift, fb.bsize, fb.bshift,
             fb.simulated ? " simulated by fbsim10" : "", fb.pitch);
+    if (!fb.monitor[0]) kprintf("video: the firmware passed no EDID of the monitor\n");
+    else if (fb.refresh_mhz)
+        kprintf("video: monitor %s%s%s, at %u.%03u Hz\n", fb.monitor, fb.monitor_name[0] ? ", " : "",
+                fb.monitor_name, fb.refresh_mhz / 1000, fb.refresh_mhz % 1000);
+    else
+        kprintf("video: monitor %s%s%s; none of its timings is %ux%u\n", fb.monitor, fb.monitor_name[0] ? ", " : "",
+                fb.monitor_name, fb.width, fb.height);
     for (uint64_t i = 0; i < mm->entry_count; i++) {
         struct limine_memmap_entry *e = mm->entries[i];
         serial_write("", 0);

@@ -250,42 +250,45 @@ export function launch(path: string, argument?: string): boolean;
 
 /** The desktop's settings, as the Settings app shows them. */
 export interface DesktopSettings {
-    /** The desktop's size: the monitor's mode (or the firmware's screen without a display driver). */
+    /** The desktop's size: the monitor's mode (ScreenModes), or a remote viewer's window. */
     readonly screenWidth: number;
     readonly screenHeight: number;
-    /** What the desktop draws in now: 8, or 10 with 10-bit colour. */
-    readonly bitsPerChannel: number;
-    /** What the screen itself takes. */
-    readonly nativeBitsPerChannel: number;
-    /** The desktop's redraws per second while the screen gives no vertical blanks (the firmware's
-        screen); 0 is as fast as possible. A display driver's vertical blanks pace the desktop at
-        the monitor's refresh rate instead (ScreenModes). */
-    refreshRate: number;
     /** -2 (slowest) to 2 (fastest). */
     pointerSpeed: number;
-    /** 0 automatic, 1 normal, 2 inverted. */
-    pointerY: number;
-    /** The host reports the mouse upside down (what automatic follows). */
-    readonly pointerYDetected: boolean;
-    /** 10-bit colour, dithered for an 8 bpc screen. */
-    deepColour: boolean;
-    readonly deepColourAvailable: boolean;
-    /** 0 to 100, or null without a sound device. */
-    readonly volume: number | null;
+    /** The desktop drawn with more shades than the screen has and dithered onto it: less banding
+        in gradients, photos and video, for some processor time. The user's wish; in effect while
+        smoothGradientsAvailable. */
+    smoothGradients: boolean;
+    /** The screen shown now takes smooth gradients (it has 8 bits per colour channel). */
+    readonly smoothGradientsAvailable: boolean;
+}
+
+/** The sound's way out. */
+export interface SoundOutput {
+    /** What plays the sound ("Remote desktop", or the sound card's name); null when nothing does:
+        the volume is kept, but nothing is heard. */
+    readonly device: string | null;
+    /** 0 to 100. */
+    readonly volume: number;
+    readonly muted: boolean;
 }
 
 export const desktop: {
     /** null when the desktop is not running. */
     get(): DesktopSettings | null;
-    /** Applies the four changeable settings; false when the desktop refused them. */
-    set(settings: Pick<DesktopSettings, "refreshRate" | "pointerSpeed" | "pointerY" | "deepColour">): boolean;
-    /** Sets the volume (0 to 100) and returns what it is now, or null without a sound device. */
-    setVolume(volume: number): number | null;
+    /** Applies the changeable settings; false when the desktop refused them. */
+    set(settings: Pick<DesktopSettings, "pointerSpeed" | "smoothGradients">): boolean;
+    /** What plays the sound, the volume and muting; null when the system will not say. */
+    sound(): SoundOutput | null;
+    /** Sets the volume (0 to 100; it also unmutes) and returns how the sound stands then. */
+    setVolume(volume: number): SoundOutput | null;
+    /** Mutes or unmutes, keeping the volume, and returns how the sound stands then. */
+    setMuted(muted: boolean): SoundOutput | null;
     /** The monitor's modes; null when the desktop is not running. */
     modes(): ScreenModes | null;
     /** Shows mode (one of modes().modes) on trial: it goes back to the mode before unless
-        keepMode() comes within 15 seconds (backMode(): at once). False when there is no display
-        driver or the monitor has no such mode. */
+        keepMode() comes within 15 seconds (backMode(): at once). False when no display driver
+        offers modes or the monitor has no such mode. */
     tryMode(mode: ScreenModeChoice): boolean;
     /** Keeps the mode on trial as the user's choice for this monitor until a restart. */
     keepMode(): boolean;
@@ -310,15 +313,27 @@ export interface ScreenMode extends ScreenModeChoice {
     readonly preferred: boolean;
 }
 
+/** What decides the desktop's size:
+    - "firmware": the mode the computer started with; no display driver has run.
+    - "driver": a display driver's mode (no modes: it finds no monitor).
+    - "handedBack": the mode the computer started with again, while the display driver still runs:
+      it gave the screen back. While it offers modes, trying one asks it to show that one again.
+    - "driverStopped": the mode the computer started with again; the display driver ended.
+    - "remote": a Remote Desktop window. */
+export type ScreenSource = "firmware" | "driver" | "handedBack" | "driverStopped" | "remote";
+
 /** The monitor and its modes, as the display driver offers them. */
 export interface ScreenModes {
-    /** The monitor, told apart by its EDID's maker, product and serial number ("" without one). */
+    readonly source: ScreenSource;
+    /** The monitor, told apart by its EDID's maker, product and serial number ("" without one).
+        What the system knows it by, not a name for people. */
     readonly monitor: string;
     /** The monitor's own name ("" when its EDID gives none). */
     readonly name: string;
-    /** Empty without a display driver: the screen keeps the mode the firmware set. */
+    /** Empty while no display driver offers modes: the screen keeps the mode it has. */
     readonly modes: readonly ScreenMode[];
-    /** The mode the monitor shows, as the driver last said; null before it said. */
+    /** The mode the screen shows: the driver's as it last said, or the one the computer started
+        with (its refresh 0 when the monitor does not say it); null while unknown. */
     readonly shown: ScreenMode | null;
     /** The mode the system asks the driver to show; null while it asks for none. */
     readonly wanted: ScreenMode | null;

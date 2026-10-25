@@ -59,8 +59,11 @@ void nvrm_log_raw(const char *text, size_t length);
  * Per-thread context
  * ---------------------------------------------------------------------------------------- */
 
-/* Set by the interrupt thread: os_is_isr() is true while it runs RM. */
+/* Set by the interrupt thread (nvrm_isr_begin and nvrm_isr_end, os.c): os_is_isr() is true while
+ * it runs RM's interrupt handler, and os_get_cpu_number() says the CPU that run began on. */
 extern thread_local bool nvrm_in_isr;
+void nvrm_isr_begin(void);
+void nvrm_isr_end(void);
 
 /* Whether RM sees the running request as an administrator's (os_is_administrator,
  * os_check_access). nvrm_rm_ioctl sets it to the client's own right for the length of one request

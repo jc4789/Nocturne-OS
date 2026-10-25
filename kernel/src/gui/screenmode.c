@@ -7,7 +7,13 @@
  * that size (n_pci_give_screen; the desktop follows it, wm_screen_resized), and says what it showed:
  * a wish it could not show is refused, and the next best one comes instead.
  *
- * Under lock: everything below. The trial's end is watched by a kernel thread of its own.
+ * A driver may give the screen back while it runs (a mode its display did not show): the
+ * firmware's mode is shown again, and while its modes stay offered a mode tried asks it
+ * to show that one again. What decides the desktop's size, as the Settings app is told it (struct
+ * screen_modes source), tells that apart from a driver that ended.
+ *
+ * Under lock: everything below but shown_mhz. The trial's end is watched by a kernel thread of its
+ * own.
  */
 #include "gui/screenmode.h"
 #include "gui/wm.h"
@@ -24,6 +30,10 @@
 
 static struct mutex lock;
 static struct n_screen_modes offered;  /* count 0: no driver offers modes */
+/* The driver that offered modes last (dev/pciuser.c): none yet, still running (whether or not its
+   modes are still offered), or ended (screen_modes_gone). */
+static enum { DRIVER_NONE, DRIVER_RUNNING, DRIVER_ENDED } driver;
+static uint32_t shown_mhz;             /* atomic: the refresh of the mode the driver says it shows */
 static struct n_screen_mode wanted;    /* the last wish (all 0: none) */
 static uint64_t wish_serial;           /* its number (struct n_screen_state mode_serial) */
 static struct n_screen_mode refused[REFUSED_MAX];
@@ -181,6 +191,9 @@ static void trial_watch(void *arg) {
 
 void screen_modes_offer(const struct n_screen_modes *m) {
     mutex_lock(&lock);
+    /* What its head shows: kept while the driver offers modes and says no other. */
+    if (!m->count) __atomic_store_n(&shown_mhz, 0, __ATOMIC_RELAXED);
+    else if (m->shown.width) __atomic_store_n(&shown_mhz, m->shown.refresh_mhz, __ATOMIC_RELAXED);
     if (!m->count) {
         if (offered.count) kprintf("screen: the display driver drives no monitor any more\n");
         offered.count = 0;
@@ -191,6 +204,7 @@ void screen_modes_offer(const struct n_screen_modes *m) {
         publish();
         return;
     }
+    driver = DRIVER_RUNNING;
     bool new_monitor = !offered.count || strncmp(offered.monitor, m->monitor, sizeof offered.monitor);
     offered = *m;
     offered.monitor[sizeof offered.monitor - 1] = 0;
@@ -233,7 +247,26 @@ void screen_modes_offer(const struct n_screen_modes *m) {
 
 void screen_modes_gone(void) {
     static const struct n_screen_modes none;
+    mutex_lock(&lock);
+    driver = DRIVER_ENDED;
+    mutex_unlock(&lock);
     screen_modes_offer(&none);
+}
+
+uint32_t screen_shown_refresh_mhz(void) { return __atomic_load_n(&shown_mhz, __ATOMIC_RELAXED); }
+
+/* What the Settings app is shown without a driver's modes, or while the firmware's mode is shown:
+   the firmware's monitor and mode (the scanout shown, its refresh unknown when it is a driver's). */
+static void firmware_part(struct n_screen_modes *m, bool boot) {
+    if (!m->count) {
+        memset(m, 0, sizeof *m);
+        memcpy(m->monitor, fb.monitor, sizeof fb.monitor);
+        memcpy(m->name, fb.monitor_name, sizeof fb.monitor_name);
+    }
+    if (!boot && m->count) return;
+    uint32_t w, h;
+    fb_screen_size(&w, &h);
+    m->shown = (struct n_screen_mode){w, h, boot ? fb.refresh_mhz : 0, 0};
 }
 
 int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
@@ -242,13 +275,20 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
         struct screen_modes *out = kmalloc(sizeof *out);
         if (!out) return -N_ERR_NO_MEMORY;
         memset(out, 0, sizeof *out);
+        bool remote = wm_remote_viewing(), boot = fb_boot_shown();
         mutex_lock(&lock);
         out->offered = offered;
         out->wanted = wanted;
         uint64_t now = uptime_ms();
         out->trial_ms = trial_on ? (uint32_t)(trial_until > now ? trial_until - now : 0) : 0;
         out->refused = refused_last;
+        out->source = remote  ? SCREEN_SOURCE_REMOTE
+                      : !boot ? SCREEN_SOURCE_DRIVER
+                      : driver == DRIVER_RUNNING ? SCREEN_SOURCE_HANDED_BACK
+                      : driver == DRIVER_ENDED   ? SCREEN_SOURCE_DRIVER_STOPPED
+                                                 : SCREEN_SOURCE_FIRMWARE;
         mutex_unlock(&lock);
+        firmware_part(&out->offered, boot);
         int64_t r = copy_to_user(user, out, sizeof *out);
         kfree(out);
         return r;

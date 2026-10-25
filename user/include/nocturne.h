@@ -128,9 +128,9 @@ n_result n_pci_interrupt_take(n_handle pci, int64_t timeout_ms);
    the claim) resumes framebuffer drawing, not necessarily GPU scanout. It does not guarantee
    recovery after a driver crash or reset. No timeout ever draws over a hold: that is the
    very race it prevents. The end of the claim stops the function (its BAR mappings, interrupts
-   and bus mastering) before CPU drawing resumes. A driver stuck while it holds is the user's
-   to end: Ctrl+Alt+Esc stops its app, and the end of its claim releases the hold; so does a
-   hold that lasts as long as the boot option fbhold=<s> says (no time by default).
+   and bus mastering) before CPU drawing resumes. A hold that lasts as long as the boot option
+   fbhold=<s> says (no time by default) stops the driver's app, and the end of its claim releases
+   the hold.
    The driver whose surface the screen is drawn into (n_pci_give_screen) holds it the same way.
    N_ERR_NOT_FOUND: the boot screen is elsewhere and the screen is not drawn into its surface. */
 n_result n_pci_hold_screen(n_handle pci, bool hold);
@@ -256,8 +256,9 @@ n_handle n_audio_open(void); /* N_ERR_BUSY when every stream is taken */
 n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags);
 n_result n_audio_status(n_handle a, struct n_audio_status *out);
 n_result n_audio_flush(n_handle a);
-n_result n_audio_volume(void);            /* the master volume, 0 to 100 */
-n_result n_audio_set_volume(int percent); /* 0 to 100; also unmutes */
+/* The master volume and muting as set says (N_AUDIO_SET_VOLUME, N_AUDIO_SET_MUTED; 0 only reads),
+   then *io filled with them and what plays the sound (struct n_audio_output, abi.h). */
+n_result n_audio_output(struct n_audio_output *io, uint32_t set);
 /* Event queues: level-triggered; a ready handle is reported by every wait. */
 n_handle n_events_create(void);
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token);

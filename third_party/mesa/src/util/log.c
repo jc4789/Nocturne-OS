@@ -446,6 +446,10 @@ logger_windbg(enum mesa_log_level level,
 
 #if DETECT_OS_NOCTURNE
 
+/* A line as the system log takes it: "TAG: level: message\n" */
+#define LOGGER_SYSTEM_AFFIXES \
+   (LOGGER_VASNPRINTF_AFFIX_TAG | LOGGER_VASNPRINTF_AFFIX_LEVEL | LOGGER_VASNPRINTF_AFFIX_NEWLINE)
+
 static void
 logger_system(enum mesa_log_level level,
               const char *tag,
@@ -456,17 +460,79 @@ logger_system(enum mesa_log_level level,
       return;
 
    char local_msg[1024];
-   char *msg = logger_vasnprintf(local_msg, sizeof(local_msg),
-         LOGGER_VASNPRINTF_AFFIX_TAG |
-         LOGGER_VASNPRINTF_AFFIX_LEVEL |
-         LOGGER_VASNPRINTF_AFFIX_NEWLINE,
-         level, tag, format, va);
+   char *msg = logger_vasnprintf(local_msg, sizeof(local_msg), LOGGER_SYSTEM_AFFIXES,
+                                 level, tag, format, va);
 
    /* the system log keeps what it is sent as is, the newline included */
    n_channel_send(mesa_log_system, msg, strlen(msg), -1);
 
    if (msg != local_msg)
       free(msg);
+}
+
+/* Whether this thread holds its lines (mesa_log_hold), and the lines it holds */
+static thread_local bool mesa_log_held;
+static thread_local char *mesa_log_held_lines;
+static thread_local size_t mesa_log_held_length;
+
+void
+mesa_log_hold(void)
+{
+   mesa_log_held = true;
+}
+
+bool
+mesa_log_holding(void)
+{
+   return mesa_log_held;
+}
+
+char *
+mesa_log_release(void)
+{
+   char *lines = mesa_log_held_lines;
+   mesa_log_held = false;
+   mesa_log_held_lines = NULL;
+   mesa_log_held_length = 0;
+   return lines;
+}
+
+/* Keeps a line of the holding thread; false if it could not, and the line is written now */
+static bool
+logger_hold(enum mesa_log_level level,
+            const char *tag,
+            const char *format,
+            va_list va)
+{
+   char local_msg[1024];
+   char *msg = logger_vasnprintf(local_msg, sizeof(local_msg), LOGGER_SYSTEM_AFFIXES,
+                                 level, tag, format, va);
+   size_t length = strlen(msg);
+   char *lines = realloc(mesa_log_held_lines, mesa_log_held_length + length + 1);
+   if (lines) {
+      memcpy(lines + mesa_log_held_length, msg, length + 1);
+      mesa_log_held_lines = lines;
+      mesa_log_held_length += length;
+   }
+
+   if (msg != local_msg)
+      free(msg);
+   return lines != NULL;
+}
+
+void
+mesa_log_write_lines(const char *lines)
+{
+   mesa_log_init();
+   if (!lines || !*lines)
+      return;
+
+   if (mesa_log_control & MESA_LOG_CONTROL_FILE) {
+      fputs(lines, mesa_log_file);
+      fflush(mesa_log_file);
+   }
+   if ((mesa_log_control & MESA_LOG_CONTROL_SYSTEM) && mesa_log_system >= 0)
+      n_channel_send(mesa_log_system, lines, strlen(lines), -1);
 }
 
 #endif /* DETECT_OS_NOCTURNE */
@@ -529,6 +595,17 @@ mesa_log_v(enum mesa_log_level level, const char *tag, const char *format,
 
    if (level > mesa_max_log_level)
       return;
+
+#if DETECT_OS_NOCTURNE
+   if (mesa_log_held) {
+      va_list copy;
+      va_copy(copy, va);
+      bool held = logger_hold(level, tag, format, copy);
+      va_end(copy);
+      if (held)
+         return;
+   }
+#endif
 
    for (uint32_t i = 0; i < ARRAY_SIZE(loggers); i++) {
       if (mesa_log_control & loggers[i].bit) {

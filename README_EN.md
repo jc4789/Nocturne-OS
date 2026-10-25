@@ -77,18 +77,19 @@ general-purpose OS for daily use (see [Limits](#limits)).
   whole system down.
   - Window pixels are memory shared with the app, and only changed areas are redrawn. Compositing and presenting
     to the screen are also split across the APs.
-  - Double-buffered windows with a frame-completion event (`EV_FRAME`), and a configurable compositing period
-    (120 Hz by default, changed in Settings).
+  - Double-buffered windows with a frame-completion event (`EV_FRAME`). The compositing period is the refresh rate
+    of the screen's mode (the display driver's vertical blanks, else the rate the monitor's EDID gives, else 60 Hz).
   - 8 bpc and 10 bpc colour: when the firmware's display is 10 bpc (2:10:10:10), the compositor keeps a 10-bit deep
     plane and windows can draw 10-bit pixels with `WIN_DEEP_COLOR`. On an 8 bpc display the wallpaper and 10-bit
-    video are ordered-dithered to 8 bits, so gradients do not band. Turning on "10-bit colour" in Settings runs the
+    video are ordered-dithered to 8 bits, so gradients do not band. Turning on "Smooth gradients" in Settings runs the
     10 bpc path on an 8 bpc display too, dithered just before display (it switches without a restart).
   - Shadows, rounded title bars, move, resize, maximize, minimize and full screen.
   - A taskbar (start button, window buttons, volume, date and time), a start menu, notifications and a clipboard
     of up to 1 MiB.
   - Kernel text uses GNU Unifont Japanese 18.0.01 bitmaps (57,086 glyphs, 8×16 half-width and 16×16 full-width).
 - **Settings**: the Settings app (the gear on the desktop, Settings in the start menu) changes the display
-  (10-bit colour, refresh rate), the mouse (pointer speed, vertical direction) and the volume with the mouse alone.
+  (resolution and refresh rate with a display driver, smooth gradients), the mouse (pointer speed) and the sound
+  (volume and mute) with the mouse alone.
   Changes apply at once and are saved in `AppData\Settings\desktop.conf` in the user's folder, so they survive a restart. No terminal opens at startup, and
   nothing in everyday use needs one.
 - **Hyper-V**: VMBus and the synthetic devices, heartbeat, shutdown and restart from Hyper-V Manager, time sync,
@@ -229,14 +230,13 @@ To create a Gen 2 VM by hand, turn Secure Boot off, attach `build\nocturne.vhdx`
 **Tips for VMConnect**
 - In the basic console, click inside the window to capture the mouse. **Ctrl+Alt+Left Arrow** releases it.
 - The Windows key only reaches the VM in full-screen mode. Use **Ctrl+Esc** to open the start menu instead.
-- The boot menu has a 1024×768 entry and a text-console-only entry in case 1920×1080 isn't available. Without
-  1920×1080, Limine picks a mode the firmware offers.
+- The boot configuration does not set the screen's size. Limine picks the mode the monitor's EDID prefers, and
+  without an EDID picks from the modes the firmware offers (on Hyper-V, those follow the VM's video settings). In an enhanced session the size
+  follows the window. The boot menu also has a text-console-only entry.
 - The kernel log goes to COM1. Any named-pipe client, such as PuTTY (Serial, `\\.\pipe\nocturne-com1`), shows it.
   `scripts\hv-serial.ps1` copies it to a file.
 - **Mouse moving up when you move down?** On Gen 1, Hyper-V on Windows 11 hosts reports the emulated PS/2 mouse's
-  vertical axis backwards. Nocturne detects Hyper-V (and the host build) and flips the axis itself. If it guesses
-  wrong, open Settings, choose Mouse and set "Up and down" to Normal (or Inverted). It applies at once and stays
-  that way after a restart.
+  vertical axis backwards. Nocturne detects Hyper-V (and the host build) and flips the axis itself.
 
 **Development scripts** (`scripts\`, elevated):
 

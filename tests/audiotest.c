@@ -99,6 +99,18 @@ static int run_quiet(const char *const *args, uint32_t argc) {
     return st;
 }
 
+/* The master volume (n_audio_output): as it is, or set to percent; the error when that fails. */
+static long volume(void) {
+    struct n_audio_output o;
+    n_result r = n_audio_output(&o, 0);
+    return r < 0 ? (long)r : (long)o.volume;
+}
+static long set_volume(int percent) {
+    struct n_audio_output o = {.volume = percent};
+    n_result r = n_audio_output(&o, N_AUDIO_SET_VOLUME);
+    return r < 0 ? (long)r : (long)o.volume;
+}
+
 /* submit all of frames, waiting for room */
 static bool submit_all(n_handle a, const int16_t *frames, size_t count) {
     while (count) {
@@ -163,25 +175,43 @@ int main(void) {
         if (as[i] >= 0) n_handle_close(as[i]);
     CHECK(uptime_ms() - t0 < 400, "closing eight streams took %lu ms", (unsigned long)(uptime_ms() - t0));
 
-    /* the master volume */
-    n_result vol = n_audio_volume();
-    CHECK(vol == 80, "the volume starts at %ld", (long)vol);
-    CHECK(n_audio_set_volume(35) == 35 && n_audio_volume() == 35, "volume after setting 35: %ld", (long)n_audio_volume());
-    CHECK(n_audio_set_volume(250) == -N_ERR_INVALID && n_audio_volume() == 35, "setting 250: %ld",
-          (long)n_audio_volume());
-    CHECK(n_audio_set_volume(-1) == -N_ERR_INVALID, "setting -1");
-    n_audio_set_volume(100);
+    /* the master volume and muting, and what plays the sound (the card this test records) */
+    struct n_audio_output out = {0};
+    CHECK(n_audio_output(&out, 0) == 0 && out.volume == 80 && !out.muted, "the volume starts at %d%s", (int)out.volume,
+          out.muted ? ", muted" : "");
+    CHECK(out.device[0] && memchr(out.device, 0, sizeof out.device), "no sound device is named");
+    CHECK(set_volume(35) == 35 && volume() == 35, "volume after setting 35: %ld", volume());
+    out.volume = 250;
+    CHECK(n_audio_output(&out, N_AUDIO_SET_VOLUME) == -N_ERR_INVALID && volume() == 35, "setting 250: %ld", volume());
+    out.volume = -1;
+    CHECK(n_audio_output(&out, N_AUDIO_SET_VOLUME) == -N_ERR_INVALID, "setting -1");
+    CHECK(n_audio_output(&out, 4) == -N_ERR_INVALID, "a flag n_audio_output does not know");
+    out.muted = 1;
+    CHECK(n_audio_output(&out, N_AUDIO_SET_MUTED) == 0 && out.muted && out.volume == 35, "muting: %d%s",
+          (int)out.volume, out.muted ? ", muted" : "");
+    out.volume = 40;
+    CHECK(n_audio_output(&out, N_AUDIO_SET_VOLUME) == 0 && !out.muted && out.volume == 40,
+          "setting the volume does not unmute: %d%s", (int)out.volume, out.muted ? ", muted" : "");
+    out.volume = 50;
+    out.muted = 1;
+    CHECK(n_audio_output(&out, N_AUDIO_SET_VOLUME | N_AUDIO_SET_MUTED) == 0 && out.muted && out.volume == 50,
+          "the volume and then muting: %d%s", (int)out.volume, out.muted ? ", muted" : "");
+    out.muted = 2;
+    CHECK(n_audio_output(&out, N_AUDIO_SET_MUTED) == -N_ERR_INVALID, "muted 2");
+    out.muted = 0;
+    CHECK(n_audio_output(&out, N_AUDIO_SET_MUTED) == 0 && !out.muted && out.volume == 50, "unmuting");
+    set_volume(100);
     const char *vargs[] = {VOLUME, "-30"};
-    CHECK(run_quiet(vargs, 2) == 0 && n_audio_volume() == 70, "volume -30: %ld", (long)n_audio_volume());
+    CHECK(run_quiet(vargs, 2) == 0 && volume() == 70, "volume -30: %ld", volume());
 
     /* a melody, at volume 0 so that the recording stays as described above */
-    n_audio_set_volume(0);
+    set_volume(0);
     const char *margs[] = {BEEP, "-l", "50", "C4", "E4", "G4", "C5:100", "R", "Bb3"};
     t0 = uptime_ms();
     CHECK(run_quiet(margs, 9) == 0, "beep with a melody failed");
     took = uptime_ms() - t0;
     CHECK(took >= 330 && took <= 700, "a 350 ms melody took %lu ms", (unsigned long)took);
-    n_audio_set_volume(80);
+    set_volume(80);
 
     /* play, in every format it knows */
     static const struct {

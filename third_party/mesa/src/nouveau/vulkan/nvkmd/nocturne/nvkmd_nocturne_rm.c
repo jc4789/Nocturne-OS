@@ -236,7 +236,7 @@ nnrm_gpu_unavailable(uint32_t status)
 
 /* ------------------------------------------------------------------ open */
 
-/* Names the step nnrm_open_device stopped at and returns its status */
+/* Names the step nnrm_open_device or nnrm_chan_create stopped at and returns its status */
 static uint32_t
 failed_at(const char **step, const char *what, uint32_t st)
 {
@@ -1170,27 +1170,27 @@ posted_map(struct nnrm *n)
 
 static uint32_t
 chan_setup(struct nnrm *n, struct nnrm_chan *c, uint32_t engines, bool gr,
-           uint32_t engine_type)
+           uint32_t engine_type, const char **step)
 {
    uint32_t st = usermode_map(n);
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "the doorbell page (VOLTA_USERMODE_A or HOPPER_USERMODE_A, mapped)", st);
 
    st = posted_map(n);
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "the posted-write flush page (NV01_MEMORY_LOCAL_USER, mapped)", st);
 
    st = buffer_create(n, &c->gpfifo, (uint64_t)c->entries * NVC36F_GP_ENTRY__SIZE, true, 0);
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "the GP FIFO ring (NV01_MEMORY_SYSTEM, GPU and CPU mapped)", st);
    st = buffer_create(n, &c->notifier,
                       sizeof(NvNotification) * NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1,
                       false, 0);
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "the error notifier (NV01_MEMORY_SYSTEM, mapped)", st);
    st = buffer_create(n, &c->userd, NNRM_PAGE_SIZE, false, 0);
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "USERD (NV01_MEMORY_SYSTEM, mapped)", st);
 
    /* No channel group and no VA space handle: RM makes a group of one and the
     * channel runs in the device's address space */
@@ -1204,21 +1204,21 @@ chan_setup(struct nnrm *n, struct nnrm_chan *c, uint32_t engines, bool gr,
    p.userdOffset[0] = 0;
    st = rm_alloc(n, n->device, &c->channel, n->info.cls_gpfifo, &p, sizeof(p));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "the GPFIFO channel (NV_CHANNEL_ALLOC_PARAMS)", st);
 
    if (gr) {
       if ((engines & NNRM_CHAN_3D) && n->info.cls_eng3d != 0 &&
           (st = gr_object(n, c, n->info.cls_eng3d)) != NV_OK)
-         return st;
+         return failed_at(step, "the 3D engine object", st);
       if ((engines & NNRM_CHAN_COMPUTE) && n->info.cls_compute != 0 &&
           (st = gr_object(n, c, n->info.cls_compute)) != NV_OK)
-         return st;
+         return failed_at(step, "the compute engine object", st);
       if ((engines & NNRM_CHAN_M2MF) && n->info.cls_m2mf != 0 &&
           (st = gr_object(n, c, n->info.cls_m2mf)) != NV_OK)
-         return st;
+         return failed_at(step, "the M2MF engine object", st);
       if ((engines & NNRM_CHAN_2D) && n->info.cls_eng2d != 0 &&
           (st = gr_object(n, c, n->info.cls_eng2d)) != NV_OK)
-         return st;
+         return failed_at(step, "the 2D engine object", st);
    }
 
    if ((engines & NNRM_CHAN_COPY) && n->info.cls_copy != 0) {
@@ -1231,7 +1231,7 @@ chan_setup(struct nnrm *n, struct nnrm_chan *c, uint32_t engines, bool gr,
          ce.engineType = n->copy_engine_type;
       st = engine_object(n, c, n->info.cls_copy, &ce, sizeof(ce));
       if (st != NV_OK)
-         return st;
+         return failed_at(step, "the copy engine object", st);
    }
 
    NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sched;
@@ -1239,51 +1239,55 @@ chan_setup(struct nnrm *n, struct nnrm_chan *c, uint32_t engines, bool gr,
    sched.bEnable = NV_TRUE;
    st = rm_control(n, c->channel, NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sched, sizeof(sched));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NVA06F_CTRL_CMD_GPFIFO_SCHEDULE", st);
 
    NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS token;
    memset(&token, 0, sizeof(token));
    st = rm_control(n, c->channel, NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
                    &token, sizeof(token));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN", st);
    c->token = token.workSubmitToken;
    return NV_OK;
 }
 
 uint32_t
-nnrm_chan_create(struct nnrm *n, uint32_t engines, struct nnrm_chan **out)
+nnrm_chan_create(struct nnrm *n, uint32_t engines, struct nnrm_chan **out,
+                 const char **failed_step)
 {
+   const char *unused_step;
+   const char **step = failed_step ? failed_step : &unused_step;
+   *step = NULL;
    const bool gr = engines & (NNRM_CHAN_3D | NNRM_CHAN_COMPUTE | NNRM_CHAN_2D | NNRM_CHAN_M2MF);
    const bool copy_only = (engines & NNRM_CHAN_COPY) && !gr;
 
    if (engines & NNRM_CHAN_VDEC)
-      return NV_ERR_NOT_SUPPORTED;
+      return failed_at(step, "a video decode channel (not wired up)", NV_ERR_NOT_SUPPORTED);
    if (n->info.cls_gpfifo == 0)
-      return NV_ERR_NOT_SUPPORTED;
+      return failed_at(step, "a GPFIFO class (RM lists none)", NV_ERR_NOT_SUPPORTED);
 
    uint32_t engine_type = NV2080_ENGINE_TYPE_GRAPHICS;
    if (copy_only) {
       if (n->copy_engine_type == NV2080_ENGINE_TYPE_NULL)
-         return NV_ERR_NOT_SUPPORTED;
+         return failed_at(step, "a copy engine for a copy channel (RM lists none)", NV_ERR_NOT_SUPPORTED);
       engine_type = n->copy_engine_type;
    }
 
    struct nnrm_chan *c = calloc(1, sizeof(*c));
    if (c == NULL)
-      return NV_ERR_NO_MEMORY;
+      return failed_at(step, "memory for the channel", NV_ERR_NO_MEMORY);
    mtx_lock(&n->usermode_lock);
    if (n->refs == SIZE_MAX) {
       mtx_unlock(&n->usermode_lock);
       free(c);
-      return NV_ERR_INSUFFICIENT_RESOURCES;
+      return failed_at(step, "a reference to the device", NV_ERR_INSUFFICIENT_RESOURCES);
    }
    n->refs++;
    mtx_unlock(&n->usermode_lock);
    c->rm = n;
    c->entries = NNRM_CHAN_GP_ENTRIES;
 
-   uint32_t st = chan_setup(n, c, engines, gr, engine_type);
+   uint32_t st = chan_setup(n, c, engines, gr, engine_type, step);
    if (st != NV_OK) {
       nnrm_chan_destroy(c);
       return st;

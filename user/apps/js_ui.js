@@ -365,15 +365,17 @@ internal.ui = Object.freeze({
     /* The desktop's own settings (what Settings changes). */
     desktop: Object.freeze({
         get: () => host.desktop(),
-        set: s => host.desktopSet(s.refreshRate | 0, s.pointerSpeed | 0, s.pointerY | 0, !!s.deepColour),
-        setVolume: volume => host.setVolume(Math.round(Number(volume))),
-        /* The monitor's modes (struct screen_modes, display_abi.h): SCREEN_MODE_TRY 1, KEEP 2,
-           BACK 3, SAVED 4. */
+        set: s => host.desktopSet(s.pointerSpeed | 0, !!s.smoothGradients),
+        /* The sound's way out (n_audio_output): what plays it, the master volume and muting. */
+        sound: () => host.sound(),
+        setVolume: volume => host.sound(Math.round(Number(volume))),
+        setMuted: muted => host.sound(undefined, !!muted),
+        /* The monitor's modes (struct screen_modes, display_abi.h). */
         modes: () => host.screenModes(),
-        tryMode: m => host.screenModeSet(1, '', m.width >>> 0, m.height >>> 0, m.refreshMillihertz >>> 0),
-        keepMode: () => host.screenModeSet(2, '', 0, 0, 0),
-        backMode: () => host.screenModeSet(3, '', 0, 0, 0),
-        savedMode: (monitor, m) => host.screenModeSet(4, String(monitor), m.width >>> 0, m.height >>> 0,
+        tryMode: m => host.screenModeSet('try', '', m.width >>> 0, m.height >>> 0, m.refreshMillihertz >>> 0),
+        keepMode: () => host.screenModeSet('keep', '', 0, 0, 0),
+        backMode: () => host.screenModeSet('back', '', 0, 0, 0),
+        savedMode: (monitor, m) => host.screenModeSet('saved', String(monitor), m.width >>> 0, m.height >>> 0,
                                                       m.refreshMillihertz >>> 0),
     }),
 });

@@ -186,7 +186,8 @@ def main():
     ap.add_argument('--guest-file', action='append', default=[], help='明示したconsole入力を隔離コピーのC:\\Testsへ置く（サイトfixture用ではない）')
     ap.add_argument('--guest-executable', action='append', default=[], help='クロスコンパイルしたELFを隔離コピーのC:\\Testsへ置く（通常の配布媒体は変更しない）')
     ap.add_argument('--cmdline', default='')
-    ap.add_argument('--resolution', help='隔離bootの通常entryだけに渡す幅x高さx32。元boot設定は変更しない')
+    ap.add_argument('--resolution', default='1920x1080',
+                    help='仮想モニターのEDIDが推す解像度（幅x高さ）。ゲストのファームウェアとシステムはそこから画面の大きさを得る')
     ap.add_argument('--seconds', type=float, default=60)
     ap.add_argument('--ready-marker', help='この実guest serial文字列の到達後から観察時間と入力時刻を計る')
     ap.add_argument('--startup-seconds', type=float, default=600, help='ready-marker待ちの起動期限。サイトの容量制限ではない')
@@ -227,10 +228,8 @@ def main():
         ap.error('不正なラベル、CPU数またはRAMです')
     if not 1 <= a.seconds <= 3600 or any(x in a.cmdline for x in '\r\n\0'):
         ap.error('不正な実行時間またはboot引数です')
-    if a.resolution:
-        dimensions = re.fullmatch(r'([1-9][0-9]*)x([1-9][0-9]*)x32', a.resolution)
-        if not dimensions or any(int(x) > 0x7fffffff for x in dimensions.groups()):
-            ap.error('解像度は正の32bit寸法による 幅x高さx32 です')
+    if not TEST.RESOLUTION.fullmatch(a.resolution):
+        ap.error('解像度は正の 幅x高さ です')
     if not 1 <= a.startup_seconds <= 3600 or (a.ready_marker and any(x in a.ready_marker for x in '\r\n\0')):
         ap.error('不正な起動期限またはready-markerです')
     if not 1 <= a.screen_interval <= 3600:
@@ -327,8 +326,8 @@ def main():
         # The copy's kernel and programs are the current build's, every run.
         hashes = TEST.system_payload(str(boot), scratch)
         if not reuse_boot:
-            if a.cmdline or a.resolution:
-                TEST.edit_boot_entry(str(boot), scratch, a.resolution, a.cmdline)
+            if a.cmdline:
+                TEST.edit_boot_entry(str(boot), scratch, a.cmdline)
             stamp.write_text(wanted, encoding='utf-8')
         print('C:\\Tests:', TEST.put_tests(str(boot), files, scratch), flush=True)
     with socket.socket() as s:
@@ -336,7 +335,9 @@ def main():
         port = s.getsockname()[1]
     serial = here / 'serial.log'
     args = [a.qemu, '-M', 'pc', '-m', str(a.memory)+'M', '-smp', str(a.cpus), '-accel', a.accel,
-            '-display', 'egl-headless' if a.gl else 'none', '-vga', a.vga, '-no-reboot',
+            '-display', 'egl-headless' if a.gl else 'none',
+            *(['-vga', 'vmware'] if a.vga == 'vmware' else  # vmware-svga gives the guest no EDID
+              TEST.vm_display({'std': 'VGA', 'virtio': 'virtio-vga'}[a.vga], a.resolution)), '-no-reboot',
             '-serial', 'file:'+str(serial), '-monitor', f'tcp:127.0.0.1:{port},server,nowait',
             '-device', 'ahci,id=ahci', '-drive', f'id=boot,file={boot},format=raw,if=none,snapshot=on',
             '-device', 'ide-hd,drive=boot,bus=ahci.0,bootindex=0',

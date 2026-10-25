@@ -1835,8 +1835,11 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
          return;
       }
 
-      if (!pdev_count)
+      if (!pdev_count) {
+         if (!screen->driver_name_is_inferred)
+            mesa_loge("ZINK: vkEnumeratePhysicalDevices lists no device");
          return;
+      }
 
       pdevs = malloc(sizeof(*pdevs) * pdev_count);
       if (!pdevs) {
@@ -1882,8 +1885,11 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
             mesa_loge("ZINK: vkEnumeratePhysicalDevices failed (%s)", vk_Result_to_str(result));
          return;
       }
-      if (!pdev_count)
+      if (!pdev_count) {
+         if (!screen->driver_name_is_inferred)
+            mesa_loge("ZINK: vkEnumeratePhysicalDevices lists no device");
          return;
+      }
       screen->pdev = pdev;
    }
    VKSCR(GetPhysicalDeviceProperties)(screen->pdev, &screen->info.props);
@@ -2110,6 +2116,9 @@ check_have_device_time(struct zink_screen *screen)
       }
    }
 
+   if (!screen->driver_name_is_inferred)
+      mesa_loge("ZINK: none of the device's %u calibrateable time domains is VK_TIME_DOMAIN_DEVICE",
+                num_domains);
    return false;
 }
 
@@ -2866,8 +2875,12 @@ get_device(struct zink_screen *screen, VkDeviceCreateInfo *dci)
    }
 
    VkResult result = VKSCR(CreateDevice)(screen->pdev, dci, NULL, &dev);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
       mesa_loge("ZINK: vkCreateDevice failed (%s)", vk_Result_to_str(result));
+      /* A device that was not made is not one to hand to the next screen: that one tries again */
+      simple_mtx_unlock(&device_lock);
+      return NULL;
+   }
 
    struct zink_device *zdev = malloc(sizeof(struct zink_device));
    zdev->refcount = 1;
@@ -3517,9 +3530,17 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       instance = zink_create_instance(screen, &instance_info);
    }
    if (!instance) {
+#if DETECT_OS_NOCTURNE
+      /* Nocturne GL tries again at a later context (nvrm's GPU can become ready later), and
+       * each try has to make the instance, and say why it cannot, again: no count is kept for
+       * an instance that was not made.
+       */
+      instance_refcount--;
+#else
       /* We don't decrement instance_refcount here. This prevents us from trying
        * to create another instance on subsequent calls.
        */
+#endif
       simple_mtx_unlock(&instance_lock);
       goto fail;
    }
@@ -3571,7 +3592,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    if (!zink_get_physical_device_info(screen)) {
       if (!screen->driver_name_is_inferred)
-         debug_printf("ZINK: failed to detect features\n");
+         mesa_loge("ZINK: failed to detect features");
       goto fail;
    }
 
@@ -3658,7 +3679,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    disable_features(screen);
 
    struct zink_device *zdev = zink_create_logical_device(screen);
-   if (!zdev->dev)
+   if (!zdev)
       goto fail;
    screen->dev = zdev->dev;
    screen->queue_lock = &zdev->queue_lock;
@@ -3785,8 +3806,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       goto fail;
    }
    if (!util_queue_init(&screen->cache_get_thread, "zcfq", 8, 4,
-                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen))
+                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen)) {
+      if (!screen->driver_name_is_inferred)
+         mesa_loge("zink: Failed to create cache get queue.");
       goto fail;
+   }
    populate_format_props(screen);
 
    slab_create_parent(&screen->transfer_pool, sizeof(struct zink_transfer), 16);

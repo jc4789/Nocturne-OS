@@ -154,26 +154,37 @@ static struct pipe_frontend_screen *get_screen(void) {
          * own snapshot, and failure here keeps existing CPU contexts alive. */
         /* Why, an n_result or ZINK_FAILED, goes to Mesa's log (the system log) when it is not
            the one told before, not at every context; where nvrm serves no NVIDIA GPU, softpipe
-           draws without a word. */
+           draws without a word. What Zink and the Vulkan driver say while the screen starts is
+           held (mesa_log_hold) and written before it, likewise only when it changed. */
         enum { ZINK_FAILED = 1 };
         static int64_t told = -N_ERR_NOT_FOUND;
+        static char *told_lines;
         struct nvrm *ready;
         int64_t why = nvrm_connect_ready_status(&ready);
+        char *lines = NULL;
         if (ready) {
             nvrm_disconnect(ready);
+            mesa_log_hold();
             gpu_fscreen = frontend_screen(zink_create_screen(&mem_winsys, NULL));
+            lines = mesa_log_release();
             why = gpu_fscreen ? 0 : ZINK_FAILED;
         }
-        if (why != told) {
+        if (why != told || !lines != !told_lines || (lines && strcmp(lines, told_lines))) {
+            mesa_log_write_lines(lines);
             if (!why)
                 mesa_logi("Nocturne GL: drawing on the GPU with %s", gpu_fscreen->screen->get_name(gpu_fscreen->screen));
-            else if (why == ZINK_FAILED) /* Zink and NVK say why in the lines before */
-                mesa_logw("Nocturne GL: nvrm's GPU is ready, but Zink did not start on it: drawing with softpipe");
+            else if (why == ZINK_FAILED)
+                mesa_logw("Nocturne GL: nvrm's GPU is ready, but Zink did not start on it (%s): drawing with softpipe",
+                          lines ? "why is in the lines before" : "it gave no reason");
             else if (why == -N_ERR_NOT_FOUND)
                 mesa_logw("Nocturne GL: nvrm serves no NVIDIA GPU any more: drawing with softpipe");
             else
                 mesa_logw("Nocturne GL: nvrm's GPU cannot be used (%s): drawing with softpipe", n_result_text(why));
             told = why;
+            free(told_lines);
+            told_lines = lines;
+        } else {
+            free(lines);
         }
     }
 #endif

@@ -25,8 +25,10 @@
 #define MESA_LOG_H
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 
+#include "util/detect_os.h"
 #include "util/macros.h"
 
 #ifdef __cplusplus
@@ -72,6 +74,26 @@ _mesa_log_direct(const char *string);
 
 void
 mesa_log_if_debug(enum mesa_log_level level, const char *outputString);
+
+#if DETECT_OS_NOCTURNE
+/* Nocturne: from mesa_log_hold() to mesa_log_release(), the lines the calling thread logs are
+ * kept instead of written (other threads write theirs). mesa_log_release() returns them as the
+ * system log takes them, "TAG: level: message\n" each, or NULL when there were none; the caller
+ * frees them. mesa_log_write_lines() writes such lines later. Nocturne GL holds what Zink and the
+ * Vulkan driver say while it starts a GPU screen, which it tries again at every new context
+ * until one starts, and writes the reasons only when they are not the ones written before. */
+void
+mesa_log_hold(void);
+
+char *
+mesa_log_release(void);
+
+bool
+mesa_log_holding(void);
+
+void
+mesa_log_write_lines(const char *lines);
+#endif
 
 #define mesa_loge(fmt, ...) mesa_log(MESA_LOG_ERROR, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__)
 #define mesa_logw(fmt, ...) mesa_log(MESA_LOG_WARN, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__)

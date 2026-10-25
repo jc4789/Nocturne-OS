@@ -28,7 +28,9 @@
 #include "nocturne.h"
 
 /* After nvrm_nvkms_start returned true. Returns true when the system draws into nvrm's
-   surface; false (with the reason in the log) leaves the boot screen alone. */
+   surface, or when the screen was handed back at once (a flip not performed) with the display's
+   modes still offered: the system's next wish takes the display again. False (with the reason in
+   the log) leaves the boot screen alone. */
 bool nvrm_display_start(void);
 
 /* Gives the system the boot screen back, lets NVKMS restore what the firmware showed, and
@@ -46,6 +48,10 @@ n_result nvrm_display_scanout(void *file, uint32_t principal, void *args, uint32
 /* The connection whose RM state is file ended: its images are taken off the screen and freed.
    Before its RM state is freed. */
 void nvrm_display_connection_end(void *file);
+
+/* The vertical blanks of the head nvrm lit that went to the system, counted from the first (0
+   before any): for nvrm.c's interrupt lines. Any thread. */
+uint64_t nvrm_display_vblanks(void);
 
 /* os_pci.c: the bus address that a kernel mapping RM made (os_map_kernel_space) shows at
    address. False when address is in none of them. */

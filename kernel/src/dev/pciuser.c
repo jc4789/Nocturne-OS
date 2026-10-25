@@ -121,18 +121,15 @@ static int screen_bar(const struct pci_device *d) {
 /* ---- a driver that holds the screen (n_pci_hold_screen, dev/fb.c) ----
    Only the function the boot screen lies in can hold it, so one claim at most does. Its hold
    ends when the driver gives it back or when the claim ends; claim_release stops the function
-   first, so drawing never resumes while the driver can still reach the device. A driver stuck
-   while it holds is ended the same way: the user's Ctrl+Alt+Esc (gui/wm.c on the desktop,
-   init.c on the text console) stops the driver's app, and its claim's end gives the screen back;
-   so does a hold that lasts as long as boot option fbhold=<seconds> says. No time ends a hold by
-   itself: RM's waits follow one another without a bound a limit could be checked against, and
-   stopping a driver that is only slow loses its GPU, so only the user, who sees the screen,
-   decides that it is stuck. The screen watch thread does the stopping, so a key handler running
-   in an interrupt only asks for it. */
+   first, so drawing never resumes while the driver can still reach the device. A hold that lasts
+   as long as boot option fbhold=<seconds> says is ended the same way: the screen watch thread
+   stops the driver's app, and its claim's end gives the screen back. No time ends a hold by
+   default: RM's waits follow one another without a bound a limit could be checked against, and
+   stopping a driver that is only slow loses its GPU. */
 static struct pci_claim *screen_holder; /* BSP, interrupts off */
 static int screen_holder_app;
 static uint64_t screen_held_since, screen_hold_limit_ms;
-static bool screen_holder_stopped, screen_watch_started, screen_take_back;
+static bool screen_holder_stopped, screen_watch_started;
 static struct wait_queue screen_watch_wq;
 
 /* Stops the app whose driver holds the screen, once a hold: false when none does. */
@@ -149,17 +146,7 @@ static bool screen_holder_stop(const char *why) {
     return true;
 }
 
-bool pci_user_screen_take_back(void) {
-    uint64_t irq = irq_save();
-    bool asked = screen_holder && !screen_holder_stopped;
-    if (asked) {
-        screen_take_back = true;
-        wq_wake_all(&screen_watch_wq);
-    }
-    irq_restore(irq);
-    return asked;
-}
-
+/* Started with the first hold, only when fbhold= sets a limit. */
 static void screen_watch(void *arg) {
     (void)arg;
     char limit[64];
@@ -167,18 +154,13 @@ static void screen_watch(void *arg) {
               (unsigned long)(screen_hold_limit_ms / 1000));
     for (;;) {
         uint64_t irq = irq_save();
-        const char *why = NULL;
-        bool holding = screen_holder && !screen_holder_stopped;
+        bool holding = screen_holder && !screen_holder_stopped, over = false;
         uint64_t held = holding ? uptime_ms() - screen_held_since : 0;
-        if (!holding) screen_take_back = false;
-        if (screen_take_back) {
-            screen_take_back = false;
-            why = "Ctrl+Alt+Esc takes the screen back from its driver";
-        } else if (!holding || !screen_hold_limit_ms) wq_wait(&screen_watch_wq);
+        if (!holding) wq_wait(&screen_watch_wq);
         else if (held < screen_hold_limit_ms) wq_wait_timeout(&screen_watch_wq, screen_hold_limit_ms - held);
-        else why = limit;
+        else over = true;
         irq_restore(irq);
-        if (why) screen_holder_stop(why);
+        if (over) screen_holder_stop(limit);
     }
 }
 
@@ -186,14 +168,13 @@ static void screen_hold_begin(struct pci_claim *c) {
     if (!screen_watch_started) {
         screen_watch_started = true;
         uint64_t seconds;
-        if (cmdline_number("fbhold", &seconds) && seconds)
+        if (cmdline_number("fbhold", &seconds) && seconds) {
             screen_hold_limit_ms = seconds > UINT64_MAX / 1000 ? UINT64_MAX : seconds * 1000;
-        kthread_create("screen hold", screen_watch, NULL);
+            kthread_create("screen hold", screen_watch, NULL);
+        }
     }
-    /* Said while the screen still shows it: a screen that stops changing next tells why, and
-       the way out. */
-    kprintf("pci: %02x:%02x.%u: app %d holds the screen while its driver starts or stops the device; "
-            "Ctrl+Alt+Esc stops the driver and takes the screen back\n",
+    /* Said while the screen still shows it: a screen that stops changing next tells why. */
+    kprintf("pci: %02x:%02x.%u: app %d holds the screen while its driver starts or stops the device\n",
             c->d->bus, c->d->dev, c->d->func, task_process()->pid);
     uint64_t irq = irq_save();
     screen_holder = c;
@@ -231,12 +212,13 @@ static void screen_release(void) {
    One claim at a time shows its surface (screen_owner) and offers modes (screen_modes_from); it
    gives the boot screen back itself, or its claim's end does once the function is stopped. Then
    the boot screen's memory is drawn into again, at its size, though the display engine may no
-   longer show it: the driver that left reprogrammed it and nothing sets it back. The user's
-   Ctrl+Alt+Esc asks the owner to give it back (gui/wm.c, struct n_screen_state take_back), the
-   way out of a display that shows nothing of the desktop. */
+   longer show it: the driver that left reprogrammed it and nothing sets it back. */
 static struct mutex screen_lock; /* the screen's claims, screen_surface and screen_direct change under it */
 static struct pci_claim *screen_owner;
 static struct pci_claim *screen_modes_from;
+/* The claim that offered modes last, until it ends: its driver may withdraw them and run on (it
+   drives no monitor, or gave the screen back); its end is the driver's (screen_modes_gone). */
+static struct pci_claim *screen_modes_last;
 static struct shared_scanout screen_surface;
 /* The scanout shown has N_SCANOUT_DIRECT: its driver shows the windows the window manager lets it
    show directly (gui/wm.c, n_pci_screen_state). */
@@ -283,12 +265,7 @@ static bool screen_give_back(struct pci_claim *c) {
     __atomic_store_n(&screen_owner, NULL, __ATOMIC_RELEASE);
     screen_direct = false;
     wm_screen_resized(fb.width, fb.height);
-    wm_screen_given_back();
     return true;
-}
-
-bool pci_user_screen_driven(void) {
-    return __atomic_load_n(&screen_owner, __ATOMIC_ACQUIRE) != NULL;
 }
 
 /* A driver that is done with its device stops it and then switches bus mastering off: that is
@@ -343,8 +320,8 @@ static void claim_release(struct object *o) {
     c->acpi_watch = NULL;
     mutex_lock(&screen_lock);
     bool given_back = screen_give_back(c);
-    if (screen_modes_from == c) {
-        screen_modes_from = NULL;
+    if (screen_modes_last == c) { /* screen_modes_from is c or none */
+        screen_modes_from = screen_modes_last = NULL;
         screen_modes_gone();
     }
     mutex_unlock(&screen_lock);
@@ -763,6 +740,7 @@ int64_t pci_user_screen_modes(struct handle *h, const struct n_screen_modes *m) 
     if ((screen_owner && screen_owner != c) || (screen_modes_from && screen_modes_from != c)) r = -N_ERR_BUSY;
     else {
         screen_modes_from = m->count ? c : NULL;
+        if (m->count) screen_modes_last = c;
         screen_modes_offer(m);
     }
     mutex_unlock(&screen_lock);

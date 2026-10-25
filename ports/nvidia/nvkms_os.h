@@ -61,14 +61,24 @@ bool nvrm_nvkms_memory_handle(const struct NvKmsKapiDevice *device, const struct
 
 /* The completion of a flip that puts a surface on a head's layer (nvkms_kapi_rm.c), which KAPI's
  * table does not tell (its getFlipPendingStatus is NULL). nvrm_nvkms_flip_arm goes right before
- * the commit: it clears the completion notifier that commit names. nvrm_nvkms_flip_done is true
- * once the display engine has written that notifier, after a commit that succeeded; a commit
- * that failed or put no surface on the layer names none. Both on the thread that commits.
+ * the commit: it clears the completion notifier that commit names to "not begun".
+ * nvrm_nvkms_flip_done is true once the display engine has performed that commit's flip, which
+ * it tells by writing the notifier "begun" with its time stamp (a window's notifier stays so;
+ * "finished" is a core notifier's), after a commit that succeeded; a commit that failed or put no
+ * surface on the layer names none. seen, when not NULL, gets what the notifier holds. Both on the
+ * thread that commits.
  * nvrm_nvkms_flip_words, for the log when a flip is not seen to complete: the slot the last
  * commit named (0 or 1) and the raw words of both of the layer's notifiers, word 0 holding the
  * status (NVKMS's nvKmsParseNotifier reads them so), words 2 and 3 the time stamp. */
+struct nvrm_flip_seen {
+    uint32_t slot;                   /* the notifier the last commit named (0 or 1) */
+    uint32_t status;                 /* NVKMS's enum nvKmsNotifierStatus: 0 not begun, 1 begun, 2 finished */
+    uint64_t time_ns;                /* the display engine's time stamp of the write, when time_valid */
+    bool time_valid;
+};
 void nvrm_nvkms_flip_arm(struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer);
-bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer);
+bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer,
+                          struct nvrm_flip_seen *seen);
 void nvrm_nvkms_flip_words(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer, uint32_t *slot,
                            uint32_t words[2][4]);
 

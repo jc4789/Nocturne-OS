@@ -48,6 +48,9 @@ const char *audio_card(void); /* NULL without one */
 void audio_remote_attach(void);
 void audio_remote_detach(void);
 bool audio_remote(void); /* a remote client is playing the sound */
+/* What plays the sound, named for people: "Remote desktop" while a remote client does, else the
+   sound card; NULL when nothing does (the volume then changes nothing that is heard). */
+const char *audio_output(void);
 
 /* The master volume, 0-100 (setting it also unmutes), and mute. */
 int audio_volume(void);

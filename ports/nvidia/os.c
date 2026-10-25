@@ -48,6 +48,7 @@ NvBool os_imex_channel_is_supported = NV_FALSE;
 /* nvidia_caps_root: os_caps.c */
 
 thread_local bool nvrm_in_isr = false;
+static thread_local uint32_t isr_cpu; /* while nvrm_in_isr: the CPU the run of RM's handler began on */
 thread_local bool nvrm_thread_admin = true;
 thread_local uint32_t nvrm_thread_process;
 
@@ -389,7 +390,24 @@ NvU32 NV_API_CALL os_get_cpu_count(void) {
     return 1;
 }
 
-NvU32 NV_API_CALL os_get_cpu_number(void) { return cpu_index(); }
+/* RM's thread state keeps the node of a lock-free interrupt handler in a slot of the CPU it began
+   on, and frees it by the CPU number again (thread_state.c, threadStateInitISRLockless and
+   threadStateFreeISRLockless, which asserts the two are equal). A kernel's interrupt handler
+   stays on its CPU; nvrm's interrupt thread can move to another between any two instructions.
+   So while it runs RM's handler (nvrm_isr_begin to nvrm_isr_end) RM is told the CPU the run began
+   on. No other thread uses that slot meanwhile: only RM's interrupt entry points fill those slots
+   (unix_intr.c: rm_isr, through osIsr and osInterruptPending, and rm_gpu_handle_mmu_faults), only
+   the interrupt thread calls them (nvrm.c, irq_run_rm), one after the other, and a lookup from any
+   other thread that lands on the slot matches the node's thread before it takes it
+   (threadStateGetCurrent). */
+NvU32 NV_API_CALL os_get_cpu_number(void) { return nvrm_in_isr ? isr_cpu : cpu_index(); }
+
+void nvrm_isr_begin(void) {
+    isr_cpu = cpu_index();
+    nvrm_in_isr = true;
+}
+
+void nvrm_isr_end(void) { nvrm_in_isr = false; }
 
 /* RM's cpu.c reads CR4 to learn whether the OS saves SSE and AVX state (OSFXSR, bit 9, and
    OSXSAVE, bit 18). Its own nv_rdcr.c does that with "mov %cr4", which a program cannot run

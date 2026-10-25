@@ -26,38 +26,47 @@ struct screen_format {
    them across restarts is the Settings app's job (its saved file). */
 #define SCREEN_SETTINGS_GET 1
 #define SCREEN_SETTINGS_SET 2
-enum { POINTER_Y_AUTO, POINTER_Y_NORMAL, POINTER_Y_INVERT };
 struct desktop_settings {
-    /* The desktop's own frame cadence while the display gives no vertical blanks (the firmware's
-       framebuffer has none; a display driver's vertical blanks pace the frames instead). Not the
-       monitor's refresh rate, which is the mode's (struct screen_modes). 0 draws as soon as
-       anything changes. */
-    uint32_t refresh_hz;
-    int8_t pointer_speed;    /* -2 (slowest) .. 2 (fastest), 0 as delivered */
-    uint8_t pointer_y;       /* POINTER_Y_* for a PS/2 mouse */
-    uint8_t deep_simulation; /* run the 10 bpc pipeline, dithered, on an 8 bpc display */
-    /* read only: what the system found */
-    uint8_t pointer_y_detected;        /* POINTER_Y_AUTO inverts the Y axis (Hyper-V on Windows 11) */
-    uint8_t deep_simulation_available; /* the display is 8 bpc 32-bit xRGB */
-    uint8_t native_bits_per_channel;   /* the display's own depth */
-    uint8_t reserved[6];
+    int8_t pointer_speed; /* -2 (slowest) .. 2 (fastest), 0 as delivered */
+    /* The desktop drawn with 10 bits per channel and dithered onto a screen of 8 (less banding in
+       gradients, photos and video, for some processor time). The user's wish: it is in effect
+       while the screen shown takes it (smooth_gradients_available). */
+    uint8_t smooth_gradients;
+    /* read only: the screen shown is 8 bits per channel xRGB, the one the dither is made for */
+    uint8_t smooth_gradients_available;
+    uint8_t reserved[5];
 };
 
 /* The monitor's mode (resolution and refresh rate), read and changed by the Settings app:
    SYS_SCREEN_INFO with its third argument SCREEN_MODES_GET and its second sizeof(struct
    screen_modes), or SCREEN_MODE_SET and sizeof(struct screen_mode_set). The modes are the display
    driver's (n_pci_screen_modes, abi.h); the system chooses among them: a mode on trial, else the
-   user's choice for that monitor, else the monitor's preferred mode. Without a display driver
-   there are none (count 0): the screen keeps the firmware's mode, and SCREEN_MODE_SET's TRY,
-   KEEP and BACK say N_ERR_NOT_FOUND. */
+   user's choice for that monitor, else the monitor's preferred mode. Without a display driver's
+   modes (count 0) the screen keeps the mode it has, offered then says which (the monitor and its
+   name from the EDID the firmware read, "" without one; shown the mode of the screen shown), and
+   SCREEN_MODE_SET's TRY, KEEP and BACK say N_ERR_NOT_FOUND. While the firmware's framebuffer is
+   shown, shown is the firmware's mode whether or not modes are offered, its refresh 0 where no
+   timing of the EDID names that size. source says what decides the desktop's size. */
 #define SCREEN_MODES_GET 3
 #define SCREEN_MODE_SET 4
 #define SCREEN_MODE_TRIAL_MS 15000u /* a mode tried and not kept goes back after this */
+enum {
+    SCREEN_SOURCE_FIRMWARE,       /* the firmware's mode: no display driver has run */
+    SCREEN_SOURCE_DRIVER,         /* a display driver's mode (count 0: it finds no monitor) */
+    /* The firmware's mode again while the display driver still runs: it gave the screen back
+       (a mode its display was not seen to show), or has not shown its own yet.
+       While its modes are offered (count), a mode tried asks it to show that one again. */
+    SCREEN_SOURCE_HANDED_BACK,
+    SCREEN_SOURCE_DRIVER_STOPPED, /* the firmware's mode again: the display driver ended */
+    SCREEN_SOURCE_REMOTE,         /* a remote viewer's window (Remote Desktop) */
+};
 struct screen_modes {
     struct n_screen_modes offered; /* the driver's monitor, the modes and the one it shows */
     struct n_screen_mode wanted;   /* the one the system asks it to show */
     uint32_t trial_ms;             /* the mode on trial goes back after this; 0: none is on trial */
     uint32_t refused;              /* the mode tried last could not be shown: the one before is back */
+    uint32_t source;               /* SCREEN_SOURCE_* */
+    uint32_t reserved;
 };
 /* TRY: mode (one offered, as listed) is shown on trial, and goes back to the mode before it
    unless KEEP comes within SCREEN_MODE_TRIAL_MS (BACK: at once). Another TRY during a trial

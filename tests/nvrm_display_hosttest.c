@@ -11,7 +11,10 @@
    directly (one flip waiting at a time), the pointer as the cursor over them, the desktop shown
    again when the system says so, images freed off the screen (DESTROY, the connection's end,
    stop), the system's hold on each image for its panic screen (none made without it) and
-   IMPORT's ownership and RM sharing. No GPU, NVKMS, QEMU or real hardware runs.
+   IMPORT's ownership and RM sharing; and the screen handed back (a flip not performed) with the
+   modes still offered, taken again for the system's next wish, a wish not
+   shown said back once and never tried again by nvrm itself, the modes withdrawn only as nvrm
+   stops. No GPU, NVKMS, QEMU or real hardware runs.
    Run with tests/nvrm_display_hosttest.py (the flags come from ports/nvidia/nvrm.mk). */
 #include <stdarg.h>
 #include <stdio.h>
@@ -57,6 +60,15 @@ static bool never(const char *word) {
         if (f == calls || f[-1] == ' ') { printf("  unexpected: %s\n  calls: %s\n", word, calls); return false; }
     return true;
 }
+/* How many times word appears in calls. */
+static unsigned times(const char *word) {
+    char needle[80];
+    snprintf(needle, sizeof needle, "%s ", word);
+    unsigned n = 0;
+    for (const char *f = strstr(calls, needle); f; f = strstr(f + 1, needle))
+        if (f == calls || f[-1] == ' ') n++;
+    return n;
+}
 
 static char logs[65536];
 void nvrm_log(const char *fmt, ...) {
@@ -67,6 +79,12 @@ void nvrm_log(const char *fmt, ...) {
     va_end(ap);
     n = strlen(logs);
     if (n + 1 < sizeof logs) { logs[n] = '\n'; logs[n + 1] = 0; }
+}
+/* How many times text was logged. */
+static unsigned logged(const char *text) {
+    unsigned n = 0;
+    for (const char *f = strstr(logs, text); f; f = strstr(f + 1, text)) n++;
+    return n;
 }
 
 /* ---------------------------------------------------------------- the machine */
@@ -165,6 +183,8 @@ static unsigned panic_images(void) {
     for (unsigned i = 0; i < PANIC_IMAGES; i++) n += panic_held[i];
     return n;
 }
+static struct n_screen_state screen;
+/* The boot screen back: the system lets go of the images (pciuser.c screen_give_back). */
 n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc) {
     (void)pci;
     if (surface == N_SCANOUT_BOOT) {
@@ -203,7 +223,6 @@ n_result n_pci_screen_image_end(n_handle pci, n_result image) {
    stops the state thread, so the test runs state_thread() once per change. A refusal stops it the
    second time in a row: a refusal seen once the thread is stopping is the end of a hand_back and
    not logged, so the first one must not stop it. */
-static struct n_screen_state screen;
 static n_result screen_result;
 static unsigned screen_refusals;
 n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms) {
@@ -422,9 +441,12 @@ static unsigned pending_polls;   /* polls before the flip in progress completes 
 static unsigned commit_failures; /* commits NVKMS refuses next */
 /* The flip whose completion notifier display.c cleared for the next commit. KAPI names a notifier
    in every commit that puts a surface on a layer, a mode set's that lights the head too
-   (nvkms-kapi.c), and the display engine writes it when the flip completes (nvkms-hw-flip.c);
+   (nvkms-kapi.c), and the display engine writes it "begun" with its time stamp when it performs
+   the flip (nvkms-hw-flip.c; a window's notifier never reads "finished", nvkms-headsurface.c);
    flip_pending_forever is a display engine whose write is never seen. (0a1d812a's fake wrote it
-   only for a layer that showed a surface before the commit, which NVKMS's source does not say.) */
+   only for a layer that showed a surface before the commit, which NVKMS's source does not say.
+   Until the 8th run on real hardware the fake only said "done", and display.c waited for
+   "finished", which a window's notifier never reads: every mode set handed the screen back.) */
 static int armed_head = -1;
 static bool armed_notified;      /* the armed flip's notifier is written */
 static bool armed_polled;        /* its completion has been asked about */
@@ -470,7 +492,8 @@ static struct NvKmsKapiDevice *k_allocate_device(const struct NvKmsKapiAllocateD
     return (struct NvKmsKapiDevice *)&dev_obj;
 }
 static void k_free_device(struct NvKmsKapiDevice *d) { (void)d; called("freeDevice"); }
-static NvBool k_grab(struct NvKmsKapiDevice *d) { (void)d; called("grabOwnership"); return NV_TRUE; }
+static bool grab_fails; /* another NVKMS client owns the display */
+static NvBool k_grab(struct NvKmsKapiDevice *d) { (void)d; called("grabOwnership"); return !grab_fails; }
 static void k_release(struct NvKmsKapiDevice *d) { (void)d; called("releaseOwnership"); }
 static NvBool k_interest(const struct NvKmsKapiDevice *d, const NvU32 mask) {
     (void)d;
@@ -499,6 +522,9 @@ static NvBool k_resources(struct NvKmsKapiDevice *d, struct NvKmsKapiDeviceResou
         1ull << NvKmsSurfaceMemoryFormatX8R8G8B8 | 1ull << NvKmsSurfaceMemoryFormatX8B8G8R8;
     info->vtFbBaseAddress = GOP_BUS;
     info->vtFbSize = (NvU64)GOP_PITCH * H;
+    /* Turing and later: the heads have an output LUT (nvkms-evo3.c, FillLUTCaps), so KAPI sends the
+       mode set's olutFpNormScale to NVKMS. */
+    info->lutCaps.olut.supported = NV_TRUE;
     return NV_TRUE;
 }
 static NvBool k_displays(struct NvKmsKapiDevice *d, NvU32 *n, NvKmsKapiDisplay *handles) {
@@ -648,18 +674,22 @@ void nvrm_nvkms_flip_arm(struct NvKmsKapiDevice *d, uint32_t head, uint32_t laye
     armed_head = (int)head;
     armed_polled = false;
 }
-/* The words of the layer's two notifiers, for the log of a flip not seen: still "not begun". */
+/* The words of the layer's two notifiers, for the log of a flip not seen: as nvKmsResetNotifier
+   leaves them, "not begun" with the invalid time stamp 1 (nvkms-sync.c), as the 8th run on real
+   hardware showed for the slot no commit named. */
 void nvrm_nvkms_flip_words(const struct NvKmsKapiDevice *d, uint32_t head, uint32_t layer, uint32_t *slot,
                            uint32_t words[2][4]) {
     CHECK(d == (const struct NvKmsKapiDevice *)&dev_obj && layer == NVKMS_KAPI_LAYER_PRIMARY_IDX);
     called("flipWords-%u", (unsigned)head);
     *slot = 1;
     for (unsigned i = 0; i < 2; i++) {
-        words[i][0] = words[i][1] = 0;
-        words[i][2] = words[i][3] = 0xffffffffu;
+        words[i][0] = words[i][1] = words[i][3] = 0;
+        words[i][2] = 1;
     }
 }
-bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *d, uint32_t head, uint32_t layer) {
+/* The display engine's time stamp of a flip: the GPU's timer, which RM set to the system's time. */
+#define FLIP_STAMP_NS 0x18e1aa5b68bd73a0ull /* the 8th run's: 2026-10-25 04:10:36.246 UTC */
+bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *d, uint32_t head, uint32_t layer, struct nvrm_flip_seen *seen) {
     CHECK(d == (const struct NvKmsKapiDevice *)&dev_obj && layer == NVKMS_KAPI_LAYER_PRIMARY_IDX);
     /* A flip that never completes is polled every millisecond: record its first poll only. */
     bool never_done = flip_pending_forever || !armed_notified;
@@ -667,6 +697,12 @@ bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *d, uint32_t head, uint32
     armed_polled = true;
     bool pending = never_done || pending_polls;
     if (pending_polls) pending_polls--;
+    *seen = (struct nvrm_flip_seen){ .slot = 1 };
+    if (!pending) {
+        seen->status = 1; /* NVKMS_NOTIFIER_STATUS_BEGUN (nvkms_os.h) */
+        seen->time_ns = FLIP_STAMP_NS;
+        seen->time_valid = true;
+    }
     return !pending;
 }
 static struct NvKmsKapiVblankIntrCallback *k_vblank_on(struct NvKmsKapiDevice *d, const NvU32 head,
@@ -683,6 +719,15 @@ static void k_vblank_off(struct NvKmsKapiDevice *d, const NvU32 head, struct NvK
     vblank_proc = NULL;
 }
 static void k_console_disabled(struct NvKmsKapiDevice *d) { (void)d; called("framebufferConsoleDisabled"); }
+/* The CRC32s of what the head shows: NVKMS reads them only for an active head it owns. */
+static NvBool k_crc(struct NvKmsKapiDevice *d, NvU32 head, struct NvKmsKapiCrcs *crc) {
+    CHECK(d == (struct NvKmsKapiDevice *)&dev_obj);
+    called("getCRC32-%u", (unsigned)head);
+    crc->compositorCrc32 = (struct NvKmsKapiDpyCRC32){ .value = 0x12345678u, .supported = NV_TRUE };
+    crc->rasterGeneratorCrc32 = (struct NvKmsKapiDpyCRC32){ .value = 0x9abcdef0u, .supported = NV_TRUE };
+    crc->outputCrc32 = (struct NvKmsKapiDpyCRC32){ .supported = NV_FALSE };
+    return NV_TRUE;
+}
 
 NvBool nvKmsKapiGetFunctionsTable(struct NvKmsKapiFunctionsTable *t) {
     if (strcmp(t->versionString, NV_VERSION_STRING) != 0) return NV_FALSE;
@@ -708,6 +753,7 @@ NvBool nvKmsKapiGetFunctionsTable(struct NvKmsKapiFunctionsTable *t) {
     t->registerVblankIntrCallback = k_vblank_on;
     t->unregisterVblankIntrCallback = k_vblank_off;
     t->framebufferConsoleDisabled = k_console_disabled;
+    t->getCRC32 = k_crc;
     return NV_TRUE;
 }
 
@@ -751,7 +797,7 @@ static void reset(void) {
     memset(&panic_desc, 0, sizeof panic_desc);
     given_surface = -1;
     memset(&given_desc, 0, sizeof given_desc);
-    flip_pending_forever = apply_check_fails = alloc_fails = mapping_not_bar = false;
+    flip_pending_forever = apply_check_fails = alloc_fails = mapping_not_bar = grab_fails = false;
     rm_boot_mask = 0x2;
     rm_boot_fails = false;
     vblank_calls = 0;
@@ -849,6 +895,9 @@ static void bring_up_and_tear_down(void) {
     CHECK(h->modeSetConfig.bActive && h->modeSetConfig.numDisplays == 1 && h->modeSetConfig.displays[0] == 0x2);
     CHECK(h->modeSetConfig.mode.timings.hVisible == W && h->modeSetConfig.mode.timings.refreshRate == 120000);
     CHECK(h->flags.activeChanged && h->flags.displaysChanged && h->flags.modeChanged);
+    /* The output LUT's normalisation scale is 1.0: 0 makes the head send black (6th and 7th runs
+       on real hardware, lit and dark). */
+    CHECK(h->modeSetConfig.olutFpNormScale == NVKMS_OLUT_FP_NORM_SCALE_DEFAULT);
     const struct NvKmsKapiLayerRequestedConfig *p = &h->layerRequestedConfig[0];
     CHECK(p->config.surface == SURF(1) && p->flags.surfaceChanged);
     CHECK(p->config.srcWidth == W && p->config.srcHeight == H && p->config.dstWidth == W && p->config.dstHeight == H);
@@ -865,11 +914,19 @@ static void bring_up_and_tear_down(void) {
     CHECK(strstr(logs, "display 0x00000002: DP-2, heads 0x6, connected, DEL1202 TEST MON, lit by the firmware"));
     CHECK(strstr(logs, "monitor DEL1202-00c0ffee (TEST MON): 4 modes offered to the system, preferred 1920x1080 at 120.000 Hz"));
     CHECK(strstr(logs, "the desktop is shown on display 0x00000002 (head 1) at 1920x1080 at 120.000 Hz"));
+    /* The mode set's flip, performed when its notifier reads "begun" (the display engine never
+       writes a window's "finished"), logged with the GPU's time stamp; the head read back after. */
+    CHECK(strstr(logs, "the flip on head 1 was performed: the primary layer's completion notifier 1 reads begun, "
+                       "written at the GPU's time 1792901436.246160288 s, "));
+    CHECK(in_order("flipPending-1 registerVblank-1 getCRC32-1 modes-shown"));
+    CHECK(strstr(logs, "head 1 after the mode set: display 0x00000002 at 1920x1080 at 120.000 Hz, output LUT scale "
+                       "0xffffffff in each mode set, 0 vertical blanks; CRC32 compositor 12345678, raster generator "
+                       "9abcdef0, output none"));
 
     /* Vertical blanks go to the system, counted, with NVKMS's timestamp. */
     CHECK(vblank_proc != NULL);
     if (vblank_proc) { vblank_proc(0, 123456789); vblank_proc(0, 0); }
-    CHECK(vblank_calls == 2 && vblank_count == 2 && vblank_ts == clock_ns);
+    CHECK(vblank_calls == 2 && vblank_count == 2 && vblank_ts == clock_ns && nvrm_display_vblanks() == 2);
 
     calls[0] = 0;
     nvrm_display_stop();
@@ -877,6 +934,7 @@ static void bring_up_and_tear_down(void) {
        released; the cursor and the surface (its view first) freed after. */
     CHECK(in_order("join join modes-withdrawn give-boot unregisterVblank-1 releaseOwnership destroySurface unmapMemory "
                    "freeMemory close101 destroySurface unmapMemory freeMemory declareEventInterest-0 freeDevice"));
+    CHECK(never("getCRC32-1"));
     CHECK(!scr.direct && !scr.state_running && mem_freed == 2 && surf_destroyed == 2 && !scr.desk.surface);
     CHECK(modes_seen.count == 0 && screen.mode.width == 0 && !offered.count);
     /* After the boot screen is back, a late blank is not passed on. */
@@ -1033,24 +1091,7 @@ static void nothing_given_on_failure(void) {
     CHECK(in_order("apply-check close101 destroySurface unmapMemory freeMemory modes-shown releaseOwnership freeDevice"));
     CHECK(mem_freed == mem_used && surf_destroyed == surf_used && strstr(logs, "no mode the system asked for could be shown"));
 
-    /* Flips never complete: the mode set's flip is awaited FLIP_TIMEOUT_MS, then the screen is
-       handed back (the boot screen to the system, the display to NVKMS's console) and start
-       fails, the notifier's words logged. 0a1d812a expected the surface to be given at once
-       instead, as if a mode set that lights the head named no notifier; NVKMS's source names
-       one, and on real hardware the screen then stayed dark with nothing handed back. */
-    reset();
-    flip_pending_forever = true;
-    uint64_t before = clock_ns;
-    CHECK(!nvrm_display_start());
-    CHECK(clock_ns - before >= (uint64_t)FLIP_TIMEOUT_MS * 1000000u);
-    CHECK(in_order("give-surface-direct flipArm-1 apply-commit flipPending-1 flipWords-1 modes-withdrawn give-boot "
-                   "releaseOwnership destroySurface unmapMemory freeMemory close101 destroySurface unmapMemory "
-                   "freeMemory declareEventInterest-0 freeDevice"));
-    CHECK(never("registerVblank-1") && never("thread") && never("modes-shown"));
-    CHECK(strstr(logs, "the flip on head 1 has not completed 3000 ms after its commit") &&
-          strstr(logs, "nvrm's surface is not seen on the display; the boot screen goes back to the system") &&
-          strstr(logs, "the display was handed back; the screen stays with the firmware's framebuffer"));
-    CHECK(given_surface == N_SCANOUT_BOOT && !scr.owner && mem_freed == mem_used && surf_destroyed == surf_used);
+    /* Flips never seen to complete at the start: screen_handed_back_at_start. */
 
     /* The system refuses the surface: nothing to give back, the console restored. */
     reset();
@@ -1138,6 +1179,9 @@ static void monitors_come_and_go(void) {
     CHECK(in_order("unregisterVblank-0 apply-check apply-commit modes-withdrawn") && never("registerVblank-0"));
     CHECK(never("give-boot") && never("destroySurface") && never("modes-shown"));
     CHECK(last_request.headsMask == 0x1 && head_cfg(0)->modeSetConfig.numDisplays == 0);
+    /* KAPI sends the output LUT's scale for a head turned off too: 1.0 there as well. */
+    CHECK(!head_cfg(0)->modeSetConfig.bActive &&
+          head_cfg(0)->modeSetConfig.olutFpNormScale == NVKMS_OLUT_FP_NORM_SCALE_DEFAULT);
     CHECK(scr.display == 0 && !scr.head_on && !scr.target && scr.given && screen.mode.width == 0);
 
     /* The firmware's monitor comes back: its preferred mode again, on head 1, at its size. */
@@ -1173,8 +1217,9 @@ static void monitors_come_and_go(void) {
     CHECK(scr.head_on && scr.head == 0 && scr.display == 0x2 && !scr.flipping && strstr(logs, "turning the head off failed"));
 
     /* 0x4 again while flips are never seen to complete: the mode set's flip is awaited
-       FLIP_TIMEOUT_MS, then the screen is handed back: the modes withdrawn, the boot screen the
-       system's, the display NVKMS's console's, every surface freed. */
+       FLIP_TIMEOUT_MS, then the screen is handed back: the boot screen the system's, the display
+       NVKMS's console's, every surface freed. 0x4's modes stay offered; the wish is said back as
+       not shown, once, and the system, with no other mode of 0x4's left, asks for none. */
     displays[1].connected = false;
     displays[2].connected = true;
     flip_pending_forever = true;
@@ -1182,23 +1227,33 @@ static void monitors_come_and_go(void) {
     uint64_t before = clock_ns;
     rescan();
     CHECK(in_order("unregisterVblank-0 apply-commit modes-offered apply-check give-surface-direct flipArm-0 apply-commit "
-                   "flipPending-0 flipWords-0 modes-withdrawn give-boot releaseOwnership"));
-    CHECK(never("registerVblank-0") && never("modes-shown") && clock_ns - before >= (uint64_t)FLIP_TIMEOUT_MS * 1000000u);
+                   "flipPending-0 flipWords-0 give-boot releaseOwnership modes-shown"));
+    CHECK(never("registerVblank-0") && never("modes-withdrawn") && times("modes-shown") == 1 && never("grabOwnership") &&
+          clock_ns - before >= (uint64_t)FLIP_TIMEOUT_MS * 1000000u);
     CHECK(!scr.owner && !scr.head_on && !scr.display && !scr.flipping && !scr.direct && !scr.desk.surface &&
-          given_surface == N_SCANOUT_BOOT && modes_seen.count == 0 && mem_freed == mem_used && surf_destroyed == surf_used);
-    CHECK(strstr(logs, "the flip on head 0 has not completed 3000 ms after its commit"));
+          given_surface == N_SCANOUT_BOOT && mem_freed == mem_used && surf_destroyed == surf_used);
+    CHECK(modes_seen.count == 1 && offered.count == 1 && scr.target == 0x4 && refused_count == 1 &&
+          refused_modes[0].width == 3840 && screen.mode.width == 0);
+    CHECK(strstr(logs, "the display engine has not performed the flip on head 0 3000 ms after its commit"));
     flip_pending_forever = false;
-    /* Monitors coming and going are not followed after that. */
+    /* Monitors coming and going are still followed: 0x4 goes, 0x2 comes back on head 0, and its
+       modes offered anew bring the system's wish, which takes the display again. */
     displays[1].connected = true;
+    displays[2].connected = false;
     calls[0] = 0;
     rescan();
-    CHECK(!calls[0]);
+    CHECK(in_order("modes-offered grabOwnership allocateMemory mapMemory createSurface allocateMemory mapMemory "
+                   "view-desk createSurface apply-check give-surface-direct flipArm-0 apply-commit flipPending-0 "
+                   "registerVblank-0 modes-shown"));
+    CHECK(scr.owner && scr.head_on && scr.head == 0 && scr.display == 0x2 && scr.direct && given_desc.width == W &&
+          modes_seen.shown.refresh_mhz == 120000 && modes_seen.done == screen.mode_serial);
 
+    /* Only stop withdraws the modes. */
     calls[0] = 0;
     nvrm_display_stop();
-    CHECK(in_order("declareEventInterest-0 freeDevice") && never("releaseOwnership") && never("give-boot") &&
-          never("modes-withdrawn"));
-    CHECK(mem_freed == mem_used && surf_destroyed == surf_used);
+    CHECK(in_order("join join modes-withdrawn give-boot unregisterVblank-0 releaseOwnership declareEventInterest-0 "
+                   "freeDevice"));
+    CHECK(mem_freed == mem_used && surf_destroyed == surf_used && modes_seen.count == 0 && !offered.count);
 }
 
 /* ---------------------------------------------------------------- direct scanout */
@@ -1357,6 +1412,9 @@ static void direct_scanout(void) {
                    "freeMemory"));
     CHECK(head_cfg(1)->layerRequestedConfig[0].config.surface == SURF(1) && !scr.shown && !scr.leaving &&
           !scr.images && panic_images() == 0);
+    /* Flips of apps' images are not logged frame by frame: only the mode set's, whose notifier
+       status ("begun") the later ones repeat. */
+    CHECK(logged("was performed") == 1);
 
     /* IMPORT: only the image's app; NVKMS's memory shared with the client named for DUP_OBJECT,
        duplicated by the app's own RM file, the share revoked at once. */
@@ -1452,12 +1510,13 @@ static void direct_scanout(void) {
     mapping_not_bar = false;
 
     /* stop: the threads first, the remaining images, the cursor and the desktop's surface after
-       ownership is released. Giving the boot screen back let go of the images' views already. */
+       ownership is released. Giving the boot screen back let go of the images' views already, so
+       the system is not asked to again. */
     calls[0] = 0;
     nvrm_display_stop();
     CHECK(in_order("join join modes-withdrawn give-boot unregisterVblank-1 releaseOwnership destroySurface unmapMemory "
                    "freeMemory close101 destroySurface unmapMemory freeMemory freeDevice"));
-    CHECK(in_order("give-boot panic-image-end unmapMemory destroySurface freeMemory") && panic_images() == 0);
+    CHECK(in_order("give-boot unmapMemory destroySurface freeMemory") && never("panic-image-end") && panic_images() == 0);
     CHECK(mem_freed == mem_used && surf_destroyed == surf_used && !scr.images);
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_NOT_SUPPORTED);
 }
@@ -1499,8 +1558,9 @@ static void direct_scanout_and_displays(void) {
 }
 
 /* A flip whose completion is never seen: the next flip waits FLIP_TIMEOUT_MS for it, then the
-   screen is handed back: the modes withdrawn, the boot screen the system's again, the display
-   NVKMS's console's, apps' images not shown any more. Images made before can still be freed.
+   screen is handed back: the boot screen the system's again, the display NVKMS's console's, apps'
+   images not shown any more, the modes still offered. Images made before can still be freed. The
+   system's next wish takes the display again, and apps' images are shown again.
    (0a1d812a stopped awaiting flips instead and kept the display, which stayed dark.) */
 static void flips_not_seen(void) {
     reset();
@@ -1514,68 +1574,202 @@ static void flips_not_seen(void) {
     calls[0] = 0;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, b) == NV_ERR_INVALID_STATE);
     CHECK(clock_ns - before >= (uint64_t)FLIP_TIMEOUT_MS * 1000000u);
-    CHECK(in_order("flipPending-1 flipWords-1 modes-withdrawn give-boot unregisterVblank-1 releaseOwnership "
+    CHECK(in_order("flipPending-1 flipWords-1 give-boot unregisterVblank-1 releaseOwnership "
                    "destroySurface unmapMemory freeMemory close101 destroySurface unmapMemory freeMemory"));
-    CHECK(never("flipArm-1") && never("apply-commit"));
+    CHECK(never("flipArm-1") && never("apply-commit") && never("modes-withdrawn"));
     CHECK(!scr.owner && !scr.head_on && !scr.flipping && !scr.shown && !scr.leaving && !scr.direct && !scr.desk.surface);
-    CHECK(given_surface == N_SCANOUT_BOOT && panic_images() == 0 && modes_seen.count == 0);
-    CHECK(strstr(logs, "the flip on head 1 has not completed 3000 ms after its commit") &&
-          strstr(logs, "the primary layer's completion notifier 1, of words 00000000 00000000 ffffffff ffffffff and "
-                       "00000000 00000000 ffffffff ffffffff"));
+    CHECK(given_surface == N_SCANOUT_BOOT && panic_images() == 0 && modes_seen.count == 4 && offered.count == 4);
+    CHECK(strstr(logs, "the display engine has not performed the flip on head 1 3000 ms after its commit") &&
+          strstr(logs, "the primary layer's completion notifier 1, of words 00000000 00000000 00000001 00000000 and "
+                       "00000000 00000000 00000001 00000000, does not read begun"));
+    /* What the head showed, read back before it was handed back. */
+    CHECK(in_order("flipWords-1 getCRC32-1 give-boot") &&
+          strstr(logs, "head 1 as the screen is handed back: display 0x00000002 at 1920x1080 at 120.000 Hz"));
     CHECK(strstr(logs, "nvrm's surface is not seen on the display; the boot screen goes back to the system and the "
                        "display to NVKMS's console"));
+    /* An app's flip is no wish of the system's: nothing is said back. */
+    CHECK(never("modes-shown") && refused_count == 0);
     flip_pending_forever = false;
 
-    /* Apps' requests are refused then, but DESTROY: nothing reaches NVKMS but the frees. */
+    /* Apps' requests are refused then, but DESTROY: nothing reaches NVKMS but the frees, and the
+       system, which let go of the images as the boot screen came back, is not asked again. */
     calls[0] = 0;
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, b) == NV_ERR_NOT_SUPPORTED);
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_CREATE, 0) == NV_ERR_NOT_SUPPORTED);
     struct nvrm_scanout_request imp = { .op = NVRM_SCANOUT_IMPORT, .image = a, .client = 0xc100, .parent = 0xc101 };
     CHECK(scanout(APP_FILE, APP, &imp) == NV_ERR_NOT_SUPPORTED && never("rm-share"));
     CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_DESTROY, a) == NV_OK && image_count() == 1);
-    CHECK(in_order("panic-image-end unmapMemory destroySurface freeMemory") && never("apply-commit") &&
+    CHECK(in_order("unmapMemory destroySurface freeMemory") && never("panic-image-end") && never("apply-commit") &&
           never("flipPending-1"));
-    /* Nor are the system's state and monitors coming and going followed. */
+    /* Monitors coming and going with the same modes ask for nothing. */
+    calls[0] = 0;
+    rescan();
+    CHECK(!calls[0]);
+
+    /* The system's next wish (the user's mode in Settings) takes the display again: ownership, the
+       cursor, a surface of the mode's size given with N_SCANOUT_DIRECT, the mode set, its flip;
+       the image left held again for the panic screen, then the mode said back as shown. */
     system_wants(2560, 1440, 144000);
     screen_says(0, true, 100, 50);
+    calls[0] = 0;
     follow_screen();
-    rescan();
-    CHECK(never("apply-check") && never("apply-commit") && never("modes-offered") && never("allocateMemory"));
+    CHECK(in_order("grabOwnership allocateMemory mapMemory createSurface allocateMemory mapMemory view-desk createSurface "
+                   "apply-check give-surface-direct flipArm-1 apply-commit flipPending-1 registerVblank-1 getCRC32-1 "
+                   "view-image panic-image close50 modes-shown"));
+    CHECK(scr.owner && scr.head_on && scr.direct && scr.desk.width == 2560 && given_desc.width == 2560 &&
+          given_desc.format == (N_SCANOUT_XRGB8888 | N_SCANOUT_DIRECT) && panic_images() == 1);
+    CHECK(modes_seen.done == screen.mode_serial && modes_seen.shown.width == 2560 && refused_count == 0);
+    CHECK(strstr(logs, "display ownership taken again for the system's wish"));
+    /* Apps' images are shown again, and made again at the desktop's new size. */
+    screen_says(APP, true, 100, 50);
+    calls[0] = 0;
+    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, b) == NV_OK && scr.shown && scr.shown->number == b);
+    CHECK(in_order("flipArm-1 apply-commit"));
+    struct nvrm_scanout_request r = { .op = NVRM_SCANOUT_CREATE };
+    CHECK(scanout(APP_FILE, APP, &r) == NV_OK && r.width == 2560 && panic_images() == 2);
+
+    /* Only stop withdraws the modes. */
     calls[0] = 0;
     nvrm_display_stop();
-    CHECK(in_order("join join destroySurface freeMemory declareEventInterest-0 freeDevice") &&
-          never("releaseOwnership") && never("give-boot"));
-    CHECK(mem_freed == mem_used && surf_destroyed == surf_used && !scr.images);
+    CHECK(in_order("join join modes-withdrawn give-boot unregisterVblank-1 releaseOwnership declareEventInterest-0 "
+                   "freeDevice"));
+    CHECK(mem_freed == mem_used && surf_destroyed == surf_used && !scr.images && modes_seen.count == 0);
 }
 
-/* Ctrl+Alt+Esc: the system's state asks for the boot screen back (take_back). The screen is
-   handed back at once, without waiting for the flip in progress: the escape from a display that
-   shows nothing. */
-static void boot_screen_asked_back(void) {
+/* Flips never seen to complete from the start: the first mode set's flip is awaited
+   FLIP_TIMEOUT_MS, then the screen is handed back (the boot screen to the system, the display to
+   NVKMS's console), the notifier's words logged; the wish is said back as not shown, and the
+   system's next best is tried once (the display taken again). Its flip not seen either, the
+   screen stays handed back and the system is not told, or it would ask for each of its modes in
+   turn, each dark for FLIP_TIMEOUT_MS. nvrm runs on with the modes offered. 0a1d812a expected
+   the surface to be given at once instead, as if a mode set that lights the head named no
+   notifier; NVKMS's source names one, and on real hardware the screen then stayed dark with
+   nothing handed back. */
+static void screen_handed_back_at_start(void) {
+    reset();
+    flip_pending_forever = true;
+    uint64_t before = clock_ns;
+    CHECK(nvrm_display_start());
+    CHECK(clock_ns - before >= 2ull * FLIP_TIMEOUT_MS * 1000000u);
+    CHECK(in_order("give-surface-direct flipArm-1 apply-commit flipPending-1 flipWords-1 give-boot releaseOwnership "
+                   "destroySurface unmapMemory freeMemory close101 destroySurface unmapMemory freeMemory modes-shown "
+                   "grabOwnership give-surface-direct flipArm-1 apply-commit flipWords-1 give-boot releaseOwnership "
+                   "thread thread"));
+    CHECK(never("registerVblank-1") && never("modes-withdrawn") && times("modes-shown") == 1 &&
+          times("grabOwnership") == 2 && times("flipWords-1") == 2);
+    CHECK(refused_count == 1 && refused_modes[0].refresh_mhz == 120000 && screen.mode.width == W &&
+          screen.mode.refresh_mhz == 60000 && modes_seen.count == 4 && offered.count == 4);
+    CHECK(strstr(logs, "the display engine has not performed the flip on head 1 3000 ms after its commit") &&
+          strstr(logs, "nvrm's surface is not seen on the display; the boot screen goes back to the system") &&
+          logged("the screen stays handed back: the system is not told that 1920x1080 at 60.000 Hz was not shown") == 1 &&
+          strstr(logs, "the screen stays with the firmware's framebuffer for now; display 0x00000002's modes stay offered"));
+    CHECK(given_surface == N_SCANOUT_BOOT && !scr.owner && !scr.direct && scr.state_running && scr.thread_running &&
+          mem_freed == mem_used && surf_destroyed == surf_used);
+    /* Nothing is tried again by nvrm itself: not on a state that changes nothing, nor on monitor
+       events with the same modes. */
+    screen.serial++;
+    calls[0] = 0;
+    follow_screen();
+    rescan();
+    CHECK(!calls[0]);
+    /* The user's next mode, with flips seen again: shown, said back. */
+    flip_pending_forever = false;
+    system_wants(2560, 1440, 144000);
+    calls[0] = 0;
+    follow_screen();
+    CHECK(in_order("grabOwnership apply-check give-surface-direct flipArm-1 apply-commit flipPending-1 registerVblank-1 "
+                   "modes-shown"));
+    CHECK(scr.owner && scr.head_on && modes_seen.shown.width == 2560 && modes_seen.done == screen.mode_serial);
+    calls[0] = 0;
+    nvrm_display_stop();
+    CHECK(in_order("join join modes-withdrawn give-boot unregisterVblank-1 releaseOwnership freeDevice") &&
+          mem_freed == mem_used && surf_destroyed == surf_used);
+
+    /* Handed back with no state thread: nothing would take the display again, so start fails. */
+    reset();
+    flip_pending_forever = true;
+    thread_fails = true;
+    CHECK(!nvrm_display_start());
+    CHECK(in_order("give-boot releaseOwnership modes-shown grabOwnership give-boot releaseOwnership thread-fails "
+                   "modes-withdrawn declareEventInterest-0 freeDevice"));
+    CHECK(strstr(logs, "without the state thread no wish of the system's would take it again") &&
+          mem_freed == mem_used && surf_destroyed == surf_used);
+}
+
+/* After the screen is handed back: a wish whose flip is not seen either is said back once, the
+   system's next best is tried once, and then nothing more until a mode set's flip is performed;
+   the same wish is never tried again by nvrm itself; another NVKMS client that owns the display
+   keeps it. */
+static void screen_taken_again(void) {
     reset();
     CHECK(nvrm_display_start());
-    uint32_t a = create_image(APP_FILE, APP);
-    screen_pointer_image(1);
-    screen_says(APP, true, 100, 50);
-    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, a) == NV_OK && scr.shown && scr.flipping);
-    screen.take_back = 1;
-    screen.serial++;
+    mtx_lock(&scr.head_lock);
+    hand_back(NULL); /* as for a flip not performed, with nothing said back */
+    mtx_unlock(&scr.head_lock);
+    CHECK(!scr.owner && modes_seen.count == 4);
+
+    /* The user tries 2560x1440 while the display engine performs no flip: taken again, handed
+       back after FLIP_TIMEOUT_MS, said back once; the system refuses it and asks for its next
+       best (the preferred mode), which is taken again, handed back too, and not said back. */
+    flip_pending_forever = true;
+    system_wants(2560, 1440, 144000);
     calls[0] = 0;
     uint64_t before = clock_ns;
     follow_screen();
-    CHECK(in_order("modes-withdrawn give-boot unregisterVblank-1 releaseOwnership destroySurface unmapMemory freeMemory "
-                   "close101 destroySurface unmapMemory freeMemory"));
-    CHECK(never("apply-commit") && never("flipPending-1") && clock_ns == before);
-    CHECK(!scr.owner && !scr.head_on && !scr.shown && !scr.direct && given_surface == N_SCANOUT_BOOT);
-    CHECK(strstr(logs, "the user asks for the boot screen back (Ctrl+Alt+Esc); the boot screen goes back to the system"));
-    /* Said again before the system clears it: nothing more. */
+    CHECK(clock_ns - before >= 2ull * FLIP_TIMEOUT_MS * 1000000u && clock_ns - before < 3ull * FLIP_TIMEOUT_MS * 1000000u);
+    CHECK(in_order("grabOwnership apply-commit flipWords-1 give-boot releaseOwnership modes-shown grabOwnership "
+                   "apply-commit flipWords-1 give-boot releaseOwnership"));
+    CHECK(times("grabOwnership") == 2 && times("modes-shown") == 1 && times("flipWords-1") == 2 && never("modes-withdrawn"));
+    CHECK(refused_count == 1 && refused_modes[0].width == 2560 && screen.mode.width == W &&
+          screen.mode.refresh_mhz == 120000 && !scr.owner && !scr.desk.surface && modes_seen.count == 4);
+    CHECK(logged("display ownership taken again for the system's wish") == 2 &&
+          logged("the screen stays handed back: the system is not told that 1920x1080 at 120.000 Hz was not shown") == 1);
+    /* Not tried again by nvrm itself. */
+    screen.serial++;
+    calls[0] = 0;
+    follow_screen();
+    rescan();
+    CHECK(!calls[0]);
+
+    /* The user's next mode, with flips seen: shown, said back. */
+    flip_pending_forever = false;
+    system_wants(W, H, 60000);
+    calls[0] = 0;
+    follow_screen();
+    CHECK(in_order("grabOwnership apply-commit flipPending-1 registerVblank-1 modes-shown") && times("modes-shown") == 1);
+    CHECK(scr.owner && scr.head_on && modes_seen.shown.refresh_mhz == 60000 && !scr.unshown_said);
+
+    /* A performed flip since: a mode the display engine does not flip to is said back once again,
+       and the system's next best (the preferred mode, not refused before) tried once. */
+    flip_pending_forever = true;
+    system_wants(1280, 720, 144000);
+    calls[0] = 0;
+    follow_screen();
+    CHECK(in_order("apply-commit flipWords-1 give-boot releaseOwnership modes-shown grabOwnership apply-commit "
+                   "flipWords-1 give-boot releaseOwnership"));
+    CHECK(times("modes-shown") == 1 && times("grabOwnership") == 1 && refused_count == 2 &&
+          refused_modes[1].width == 1280 && screen.mode.refresh_mhz == 120000 && !scr.owner);
+    flip_pending_forever = false;
+
+    /* Another NVKMS client owns the display: the wish is not followed, nothing is said back, and
+       it is not tried again by itself. */
+    grab_fails = true;
+    system_wants(W, H, 60000);
+    calls[0] = 0;
+    follow_screen();
+    CHECK(times("grabOwnership") == 1 && never("apply-check") && never("modes-shown") && !scr.owner &&
+          strstr(logs, "another NVKMS client owns the display; the system's wish is not followed"));
+    grab_fails = false;
     screen.serial++;
     calls[0] = 0;
     follow_screen();
     CHECK(!calls[0]);
-    CHECK(scanout_op(APP_FILE, APP, NVRM_SCANOUT_PRESENT, a) == NV_ERR_NOT_SUPPORTED);
+
+    calls[0] = 0;
     nvrm_display_stop();
-    CHECK(never("releaseOwnership") && never("give-boot") && mem_freed == mem_used && surf_destroyed == surf_used);
+    CHECK(in_order("join join modes-withdrawn declareEventInterest-0 freeDevice") && never("give-boot") &&
+          never("releaseOwnership"));
+    CHECK(mem_freed == mem_used && surf_destroyed == surf_used && modes_seen.count == 0);
 }
 
 static void no_direct_scanout(void) {
@@ -1649,7 +1843,8 @@ int main(void) {
     direct_scanout();
     direct_scanout_and_displays();
     flips_not_seen();
-    boot_screen_asked_back();
+    screen_handed_back_at_start();
+    screen_taken_again();
     no_direct_scanout();
     reset();
     if (failures) {
