@@ -122,12 +122,15 @@ struct web_navigation_timing {
 #define WEB_WINDOW_VISIBLE 1u
 #define WEB_WINDOW_FOCUSED 2u
 /* A bounded, native video-layer update from the last published document scene.
-   The host validates identity/viewport before touching its canvas. */
+   The host validates identity/viewport before touching its canvas, then has
+   draw put the patch's w x h pixels at dst (rows pitch pixels apart), straight
+   into the surface it shows. */
 struct web_video_patch {
     canvas_t canvas;
     int scroll_x, scroll_y;
-    int x, y, w, h, pitch;
-    const uint32_t *pixels;
+    int x, y, w, h;
+    void (*draw)(void *context, uint32_t *dst, int pitch);
+    void *context;
 };
 struct web_host {
     void *opaque;

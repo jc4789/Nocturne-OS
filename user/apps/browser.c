@@ -1363,20 +1363,16 @@ static bool host_video_present(void *opaque, web_doc *document, const struct web
        document, canvas, viewport, scroll and native-overlay checks below
        reject an obsolete surface without re-entering DOM or layout here. */
     if (!view.px || !patch || document != doc || quit || native_wait || pending_navigation ||
-        sel_node || devtools_overlay_visible() || !patch->pixels || patch->w <= 0 || patch->h <= 0 ||
-        patch->pitch < patch->w ||
+        sel_node || devtools_overlay_visible() || !patch->draw || patch->w <= 0 || patch->h <= 0 ||
         patch->canvas.px != view.px || patch->canvas.w != view.w ||
         patch->canvas.h != view.h || patch->canvas.pitch != view.pitch ||
         patch->scroll_x != scroll_x || patch->scroll_y != scroll_y ||
         patch->x < 0 || patch->y < 0 || patch->x > page_w() || patch->y > page_h() ||
         patch->w > page_w() - patch->x || patch->h > page_h() - patch->y ||
         view.pitch < view.w || view.h <= 0 ||
-        (size_t)patch->pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)patch->h ||
         (size_t)view.pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)view.h) return false;
     uint64_t start=debug_js?n_clock_uptime_ms():0;
-    for (int row = 0; row < patch->h; row++)
-        memcpy(view.px + (size_t)(patch->y + row) * view.pitch + patch->x,
-               patch->pixels + (size_t)row * patch->pitch, (size_t)patch->w * sizeof(uint32_t));
+    patch->draw(patch->context, view.px + (size_t)patch->y * view.pitch + patch->x, view.pitch);
     __sync_synchronize();
     ui_surface_changed_rect(ui,VIEW,patch->x,patch->y,patch->w,patch->h);
     if(debug_js){loop_profile.video_patches++;loop_profile.video_present_ms+=n_clock_uptime_ms()-start;}
@@ -2880,7 +2876,7 @@ static void report_loop_profile(uint64_t now) {
         "Browser console profile: rect draw %u/%lu ms, rect present %lu ms (no author page paint)",
         consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL,0,message);}
     if(partial||patches){snprintf(message,sizeof message,
-        "Browser damage profile: partial draw %u/%lu ms, partial present %lu ms, video patch %u/%lu ms (copy/present only; scale/overlay belongs to media supply)",
+        "Browser damage profile: partial draw %u/%lu ms, partial present %lu ms, video patch %u/%lu ms (banded compose into the view and present)",
         partial,(unsigned long)partial_ms,(unsigned long)partial_update,patches,(unsigned long)video_ms);host_console(NULL,0,message);}
     static uint64_t reported_batches[PARALLEL_STAGE_COUNT];
     for (int stage = 1; stage < PARALLEL_STAGE_COUNT; stage++) {

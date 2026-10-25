@@ -12,6 +12,7 @@
 #include "web_presentation.h"
 #include "../media_http_private.h"
 #include "nocturne.h"
+#include <parallel.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1203,6 +1204,28 @@ static void pump(struct web_avmedia *s,uint64_t now,uint64_t until,bool cooperat
        its stop reason until the ordinary document tick or teardown point. */
     if(!cooperative&&s->transition_pending)transition(s,s->transition_pending,s->generation);
 }
+/* A frame is composed where the host shows it, in bands of rows on the
+ * parallel pool: each band is cleared, gets its rows of the scaled picture
+ * and then of the committed overlay while they are still in cache. */
+enum { SNAPSHOT_BAND_ROWS = 32 };
+struct snapshot_frame { const struct web_avmedia *s; uint32_t *dst; int pitch; };
+static void snapshot_band(size_t band,void *context){
+    const struct snapshot_frame *f=context;const struct web_avmedia *s=f->s;
+    int row0=(int)band*SNAPSHOT_BAND_ROWS,row1=row0+SNAPSHOT_BAND_ROWS<s->snapshot.h?row0+SNAPSHOT_BAND_ROWS:s->snapshot.h;
+    canvas_t rows;gfx_init(&rows,f->dst,s->snapshot.w,s->snapshot.h,f->pitch);rows.cy0=row0;rows.cy1=row1;
+    gfx_fill(&rows,0,row0,rows.w,row1-row0,RGB(0,0,0));
+    nmedia_draw(&rows,s->pixels,s->width,s->height,
+                s->snapshot.video_x-s->snapshot.x,s->snapshot.video_y-s->snapshot.y,
+                s->snapshot.video_w,s->snapshot.video_h);
+    for(int row=row0;row<row1;row++){
+        size_t at=(size_t)row*(size_t)s->snapshot.w;
+        web_video_snapshot_overlay(f->dst+(size_t)row*(size_t)f->pitch,s->snapshot.committed+at,s->snapshot.black+at,s->snapshot.opaque+at,(size_t)s->snapshot.w);
+    }
+}
+static void snapshot_draw(void *context,uint32_t *dst,int pitch){
+    struct snapshot_frame *f=context;f->dst=dst;f->pitch=pitch;
+    parallel_for_stage(PARALLEL_IMAGE_SCALE,((size_t)f->s->snapshot.h+SNAPSHOT_BAND_ROWS-1)/SNAPSHOT_BAND_ROWS,snapshot_band,f,NULL,NULL);
+}
 /* This path uses only native stream pixels and an immutable resolved suffix.
  * The host performs its own current-window guard before touching UI memory. */
 static void snapshot_publish(struct web_avmedia *s) {
@@ -1217,17 +1240,11 @@ static void snapshot_publish(struct web_avmedia *s) {
         if(unpublished&&s->doc&&s->doc->live)doc_paint_damage(s->doc,s->node);
         return;
     }
-    canvas_t patch;
-    gfx_init(&patch,s->snapshot.output,s->snapshot.w,s->snapshot.h,s->snapshot.w);
-    gfx_fill(&patch,0,0,patch.w,patch.h,RGB(0,0,0));
-    nmedia_draw(&patch,s->pixels,s->width,s->height,
-                s->snapshot.video_x-s->snapshot.x,s->snapshot.video_y-s->snapshot.y,
-                s->snapshot.video_w,s->snapshot.video_h);
-    web_video_snapshot_overlay(s->snapshot.output,s->snapshot.committed,s->snapshot.black,s->snapshot.opaque,s->snapshot.count);
+    struct snapshot_frame frame={.s=s};
     struct web_video_patch update={.canvas=s->snapshot.target,
         .scroll_x=s->snapshot.scroll_x,.scroll_y=s->snapshot.scroll_y,
         .x=s->snapshot.x,.y=s->snapshot.y,.w=s->snapshot.w,.h=s->snapshot.h,
-        .pitch=s->snapshot.w,.pixels=s->snapshot.output};
+        .draw=snapshot_draw,.context=&frame};
     if(web_js_video_present(s->doc,&update)) {
         s->snapshot.delivered=s->presented_frames;s->window_frames++;
     } else {snapshot_clear(s);doc_paint_damage(s->doc,s->node);}
