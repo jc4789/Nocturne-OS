@@ -34,6 +34,12 @@
    ((NVKMD_NOCTURNE_HOST_SLOT_B / 4 - RELEASE_DW - MAX_SUBCHANNELS * SET_OBJECT_DW) / \
     ACQUIRE_DW)
 
+/* GP entries the ring holds unconsumed (one stays free so that GPPut ==
+ * GPGet means "empty"), and the client's share of one flush (its two host
+ * pushes take the rest) */
+#define GP_RING_ENTRIES (NNRM_CHAN_GP_ENTRIES - 1)
+#define MAX_PUSHES (GP_RING_ENTRIES - 2)
+
 static_assert(NVKMD_ENGINE_COPY == NNRM_CHAN_COPY, "nvkmd and nnrm engine bits differ");
 static_assert(NVKMD_ENGINE_2D == NNRM_CHAN_2D, "nvkmd and nnrm engine bits differ");
 static_assert(NVKMD_ENGINE_3D == NNRM_CHAN_3D, "nvkmd and nnrm engine bits differ");
@@ -218,6 +224,10 @@ nvkmd_nocturne_exec_ctx_wait(struct nvkmd_ctx *_ctx,
 }
 
 static VkResult
+nvkmd_nocturne_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+                              struct vk_object_base *log_obj);
+
+static VkResult
 nvkmd_nocturne_exec_ctx_exec(struct nvkmd_ctx *_ctx,
                              struct vk_object_base *log_obj,
                              uint32_t exec_count,
@@ -226,6 +236,21 @@ nvkmd_nocturne_exec_ctx_exec(struct nvkmd_ctx *_ctx,
    struct nvkmd_nocturne_exec_ctx *ctx = nvkmd_nocturne_exec_ctx(_ctx);
 
    for (uint32_t i = 0; i < exec_count; i++) {
+      /* A push ending in an incomplete method goes in one flush with the
+       * pushes that complete it */
+      uint32_t incomplete_count = 0;
+      for (uint32_t j = i; j < exec_count && execs[j].incomplete; j++)
+         incomplete_count++;
+      assert(incomplete_count < exec_count - i && incomplete_count < MAX_PUSHES);
+
+      /* A flush has to fit on the ring */
+      if (util_dynarray_num_elements(&ctx->gps, struct nnrm_gp) +
+          incomplete_count >= MAX_PUSHES) {
+         VkResult result = nvkmd_nocturne_exec_ctx_flush(&ctx->base, log_obj);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+
       /* This is the hardware limit on all current GPUs */
       assert((execs[i].addr % 4) == 0 && (execs[i].size_B % 4) == 0);
       assert(execs[i].size_B < (1u << 23));
@@ -301,6 +326,29 @@ push_release(struct nv_push *p, uint8_t subc, uint64_t addr, uint64_t value)
                     NVDEF(NVC36F, SEM_EXECUTE, PAYLOAD_SIZE, 64BIT));
 }
 
+/* Room on the ring for `count` more GP entries.  The GPU is done with a
+ * flush's entries once the fence passes it.  Host's GP_GET in USERD is no
+ * measure: Host writes USERD back only when RM chose so for the channel, and
+ * dev_ram.ref recommends following a channel by its semaphores. */
+static VkResult
+wait_for_gp_room(struct nvkmd_nocturne_exec_ctx *ctx, uint32_t count)
+{
+   assert(count <= GP_RING_ENTRIES);
+   if (ctx->gp_put + count <= GP_RING_ENTRIES)
+      return VK_SUCCESS;
+
+   /* The oldest flush still in a slot whose entries end late enough; the
+    * newest one's end at ctx->gp_put always is */
+   const uint64_t need = ctx->gp_put + count - GP_RING_ENTRIES;
+   uint64_t seqno = ctx->seqno >= NVKMD_NOCTURNE_HOST_SLOTS ?
+                    ctx->seqno - NVKMD_NOCTURNE_HOST_SLOTS + 1 : 1;
+   while (ctx->gp_end[seqno % NVKMD_NOCTURNE_HOST_SLOTS] < need)
+      seqno++;
+   assert(seqno <= ctx->seqno);
+
+   return nvkmd_nocturne_fence_wait(ctx->fence, seqno, UINT64_MAX);
+}
+
 static VkResult
 nvkmd_nocturne_exec_ctx_flush(struct nvkmd_ctx *_ctx,
                               struct vk_object_base *log_obj)
@@ -328,9 +376,18 @@ nvkmd_nocturne_exec_ctx_flush(struct nvkmd_ctx *_ctx,
    }
 
    /* The slot's previous flush has to be done with it */
-   const uint32_t slot = ctx->host_slot;
-   result = nvkmd_nocturne_fence_wait(ctx->fence, ctx->host_slot_seqno[slot],
-                                      UINT64_MAX);
+   const uint64_t seqno = ctx->seqno + 1;
+   const uint32_t slot = seqno % NVKMD_NOCTURNE_HOST_SLOTS;
+   if (seqno > NVKMD_NOCTURNE_HOST_SLOTS) {
+      result = nvkmd_nocturne_fence_wait(ctx->fence,
+                                         seqno - NVKMD_NOCTURNE_HOST_SLOTS,
+                                         UINT64_MAX);
+      if (result != VK_SUCCESS)
+         return vk_error(log_obj, result);
+   }
+
+   const uint32_t total = gp_count + 2;
+   result = wait_for_gp_room(ctx, total);
    if (result != VK_SUCCESS)
       return vk_error(log_obj, result);
 
@@ -349,11 +406,9 @@ nvkmd_nocturne_exec_ctx_flush(struct nvkmd_ctx *_ctx,
       push_acquire(p, ctx->host_subc, waits[i].fence->addr, waits[i].seqno);
    const uint32_t pre_dw = nv_push_dw_count(p);
 
-   const uint64_t seqno = ctx->seqno + 1;
    push_release(p, ctx->host_subc, ctx->fence->addr, seqno);
    const uint32_t post_dw = nv_push_dw_count(p) - pre_dw;
 
-   const uint32_t total = gp_count + 2;
    struct nnrm_gp *gps = malloc(total * sizeof(*gps));
    if (gps == NULL)
       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -377,8 +432,8 @@ nvkmd_nocturne_exec_ctx_flush(struct nvkmd_ctx *_ctx,
 
    ctx->seqno = seqno;
    ctx->objects_bound = true;
-   ctx->host_slot_seqno[slot] = seqno;
-   ctx->host_slot = (slot + 1) % NVKMD_NOCTURNE_HOST_SLOTS;
+   ctx->gp_put += n;
+   ctx->gp_end[slot] = ctx->gp_put;
 
    result = VK_SUCCESS;
    util_dynarray_foreach(&ctx->signals, struct vk_sync_signal, s) {

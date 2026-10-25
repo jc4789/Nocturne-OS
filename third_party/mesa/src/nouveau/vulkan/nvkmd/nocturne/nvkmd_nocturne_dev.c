@@ -30,15 +30,10 @@ nvkmd_nocturne_create_dev(struct nvkmd_pdev *_pdev,
                        nnrm_status_name(st));
    }
 
-   uint64_t va_start, va_end;
-   nnrm_va_range(dev->rm, &va_start, &va_end);
-   assert(va_start <= NVKMD_NOCTURNE_HEAP_START);
-   assert(NVKMD_NOCTURNE_REPLAY_HEAP_END <= va_end);
-
    dev->base.ops = &nvkmd_nocturne_dev_ops;
    dev->base.pdev = &pdev->base;
    dev->base.va_start = 0;
-   dev->base.va_end = va_end;
+   dev->base.va_end = NVKMD_NOCTURNE_REPLAY_HEAP_END;
 
    list_inithead(&dev->base.mems);
    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);

@@ -72,8 +72,10 @@ uint64_t nnrm_vram_used(struct nnrm *rm);
 /* The GPU's global timer in nanoseconds */
 uint64_t nnrm_gpu_timestamp(struct nnrm *rm);
 
-/* The usable GPU address range [*start, *end) for this address space */
-void nnrm_va_range(struct nnrm *rm, uint64_t *start, uint64_t *end);
+/* NVK's part of every nnrm's GPU address space, [NNRM_VA_START, NNRM_VA_END):
+ * above RM's [4 GiB, 8 GiB) (see nvkmd_nocturne_rm.c) */
+#define NNRM_VA_START (1ull << 33)
+#define NNRM_VA_END   (3ull << 37)
 
 /* ---- physical memory ---- */
 
@@ -135,9 +137,12 @@ uint32_t nnrm_chan_create(struct nnrm *rm, uint32_t engines, struct nnrm_chan **
                           const char **failed_step);
 void nnrm_chan_destroy(struct nnrm_chan *chan);
 
-/* Queue GP entries and ring the doorbell. Waits for ring space. The caller
- * serialises submissions and destruction of the same channel. Different
- * channels retain the shared address-space BAR1 read target independently. */
+/* Queue GP entries and ring the doorbell.  The caller keeps the ring from
+ * overflowing: at most NNRM_CHAN_GP_ENTRIES - 1 entries the GPU is not known to
+ * be done with (it knows by its semaphores; Host's GP_GET in USERD is written
+ * back only when RM chose so).  The caller serialises submissions and
+ * destruction of the same channel. Different channels retain the shared
+ * address-space BAR1 read target independently. */
 uint32_t nnrm_chan_submit(struct nnrm_chan *chan, const struct nnrm_gp *gps, uint32_t count);
 
 /* true once the channel has hit an error (RM reset it) or /bin/nvrm has gone */

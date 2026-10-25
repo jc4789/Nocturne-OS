@@ -24,7 +24,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
-#include <time.h>
 
 #include "nvkmd_nocturne_rm.h"
 
@@ -65,27 +64,32 @@
 
 #include "vulkan/vulkan_core.h"
 
-/* The GPU address space of one nnrm, all below 1 << 40 because host semaphore
- * addresses (SEM_ADDR_HI) and the GPFIFO base have 40 bits on Volta..Ada:
+/* The GPU address space of one nnrm, the device's own.  Our part of it, all
+ * at fixed addresses below 1 << 40 because host semaphore addresses
+ * (SEM_ADDR_HI) and the GPFIFO base have 40 bits on Volta..Ada:
  *
- *   [NNRM_VA_START, NNRM_VA_END)          NVK's heaps (nnrm_va_range)
+ *   [NNRM_VA_START, NNRM_VA_END)          NVK's heaps (nvkmd_nocturne.h)
  *   [NNRM_INTERNAL_VA, NNRM_INTERNAL_END) the channels' own buffers
- *   [NNRM_RM_VA_START, NNRM_RM_VA_LIMIT]  RM's internal mappings (context
- *                                         buffers), kept there by the device's
- *                                         RESTRICT_RESERVED_VALIMITS
  *
- * Every client range is allocated at a fixed address, so RM never picks one. */
-#define NNRM_VA_START      (1ull << 20)
-#define NNRM_VA_END        (3ull << 37)
+ * RM's part is [4 GiB, 8 GiB), the range NVIDIA's own user-mode drivers leave
+ * to it ("CUDA apps allocate VA in bottom 4GB and also above 8GB" at
+ * SPLIT_VAS_SERVER_RM_MANAGED_VA_START).  With GSP firmware, GSP-RM maps
+ * into [4 GiB, 4.5 GiB), which the CPU's RM reserves in every address space
+ * (gvaspaceReserveSplitVaSpace); the CPU's RM maps the channels' context
+ * buffers itself, first fit from 4 GiB upwards (dmaAllocMapping_GM107, with
+ * bDmaEnforce32BitPointer).  NVK's heap hands out addresses from its top
+ * down, so the two grow apart; were RM to pass 8 GiB, a fixed allocation of
+ * ours would fail with NV_ERR_NO_MEMORY, never overlap.
+ *
+ * The device cannot fence RM into a range of our choosing:
+ * NV_DEVICE_ALLOCATION_FLAGS_RESTRICT_RESERVED_VALIMITS reaches GSP-RM without
+ * its limits (a firmware client's device RPC, NV_RM_RPC_ALLOC_SHARE_DEVICE,
+ * carries only the flags), and GSP-RM refuses it with NV_ERR_INVALID_ARGUMENT. */
 #define NNRM_INTERNAL_VA   NNRM_VA_END
 #define NNRM_INTERNAL_END  (1ull << 39)
 #define NNRM_INTERNAL_STEP (1ull << 20)
-#define NNRM_RM_VA_START   (1ull << 39)
-#define NNRM_RM_VA_LIMIT   ((1ull << 40) - 1)
 
 #define NNRM_OWNER 0x4e4f4354u /* 'NOCT': a tag RM keeps with the allocation */
-
-#define NNRM_RING_WAIT_NS 10000000000ull
 
 /* ------------------------------------------------------------------ session */
 
@@ -245,15 +249,46 @@ failed_at(const char **step, const char *what, uint32_t st)
 }
 
 static uint32_t
-class_with_low_byte(const struct nnrm *n, uint32_t low)
+class_with_low_byte(const uint32_t *classes, uint32_t count, uint32_t low)
 {
    /* the highest class of this kind, as Mesa's DRM winsys picks them */
    uint32_t best = 0;
-   for (uint32_t i = 0; i < n->class_count; i++) {
-      if ((n->classes[i] & 0xff) == low && n->classes[i] > best)
-         best = n->classes[i];
+   for (uint32_t i = 0; i < count; i++) {
+      if ((classes[i] & 0xff) == low && classes[i] > best)
+         best = classes[i];
    }
    return best;
+}
+
+/* The classes of one engine (NV2080_ENGINE_TYPE_*).  An engine's class is
+ * picked from its own list: the device's list also has classes of no engine
+ * (the MIG session classes, AMPERE_SMC_*_SESSION), whose low bytes meet the
+ * engines' (0xc640 against M2MF's 0x40). */
+static uint32_t
+engine_classes(struct nnrm *n, uint32_t engine_type,
+               uint32_t classes[NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE], uint32_t *count)
+{
+   nvrm_lock(n->rm);
+
+   /* RM writes the list through a pointer in the parameters: it has to be in
+    * libnvrm's arena */
+   uint32_t *list = nvrm_scratch(n->rm, NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE * sizeof(uint32_t));
+   NV2080_CTRL_GPU_GET_ENGINE_CLASSLIST_PARAMS p;
+   memset(&p, 0, sizeof(p));
+   p.engineType = engine_type;
+   p.numClasses = NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE;
+   p.classList = NV_PTR_TO_NvP64(list);
+   uint32_t st = list == NULL ? NV_ERR_INSUFFICIENT_RESOURCES
+                              : rm_control(n, n->subdevice, NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST,
+                                           &p, sizeof(p));
+   if (st == NV_OK) {
+      *count = p.numClasses < NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE
+                  ? p.numClasses : NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE;
+      memcpy(classes, list, *count * sizeof(uint32_t));
+   }
+
+   nvrm_unlock(n->rm);
+   return st;
 }
 
 static bool
@@ -377,16 +412,12 @@ query_gpu(struct nnrm *n, const char **step)
    if (st != NV_OK)
       return failed_at(step, "NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2", st);
 
-   /* A GPU address space of our own ("share with myself"), with RM's internal
-    * mappings fenced into their own range so NVK's fixed addresses never meet
-    * them. */
+   /* A GPU address space of our own ("share with myself"), as UVM and NVKMS
+    * make theirs; RM's part of it is described above NNRM_INTERNAL_VA */
    NV0080_ALLOC_PARAMETERS dev;
    memset(&dev, 0, sizeof(dev));
    dev.deviceId = idinfo.deviceInstance;
    dev.hClientShare = n->client;
-   dev.flags = NV_DEVICE_ALLOCATION_FLAGS_RESTRICT_RESERVED_VALIMITS;
-   dev.vaStartInternal = NNRM_RM_VA_START;
-   dev.vaLimitInternal = NNRM_RM_VA_LIMIT;
    st = rm_alloc(n, n->client, &n->device, NV01_DEVICE_0, &dev, sizeof(dev));
    if (st != NV_OK)
       return failed_at(step, "NV01_DEVICE_0", st);
@@ -423,13 +454,18 @@ query_gpu(struct nnrm *n, const char **step)
                        ? cl.numClasses : NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE;
    memcpy(n->classes, cl.classList, n->class_count * sizeof(uint32_t));
 
-   n->info.cls_copy = (uint16_t)class_with_low_byte(n, 0xb5);
-   n->info.cls_eng2d = (uint16_t)class_with_low_byte(n, 0x2d);
-   n->info.cls_eng3d = (uint16_t)class_with_low_byte(n, 0x97);
-   n->info.cls_m2mf = (uint16_t)(class_with_low_byte(n, 0x40) ? class_with_low_byte(n, 0x40)
-                                                              : class_with_low_byte(n, 0x39));
-   n->info.cls_compute = (uint16_t)class_with_low_byte(n, 0xc0);
-   n->info.cls_gpfifo = (uint16_t)class_with_low_byte(n, 0x6f);
+   n->info.cls_gpfifo = (uint16_t)class_with_low_byte(n->classes, n->class_count, 0x6f);
+
+   uint32_t engine[NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE], count;
+   st = engine_classes(n, NV2080_ENGINE_TYPE_GRAPHICS, engine, &count);
+   if (st != NV_OK)
+      return failed_at(step, "NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST (graphics)", st);
+   n->info.cls_eng2d = (uint16_t)class_with_low_byte(engine, count, 0x2d);
+   n->info.cls_eng3d = (uint16_t)class_with_low_byte(engine, count, 0x97);
+   n->info.cls_m2mf = (uint16_t)(class_with_low_byte(engine, count, 0x40)
+                                    ? class_with_low_byte(engine, count, 0x40)
+                                    : class_with_low_byte(engine, count, 0x39));
+   n->info.cls_compute = (uint16_t)class_with_low_byte(engine, count, 0xc0);
    /* Video decode would be a channel on the NVDEC engine; not wired up yet */
    n->info.cls_vdec = 0;
 
@@ -457,6 +493,15 @@ query_gpu(struct nnrm *n, const char **step)
             break;
          }
       }
+   }
+
+   /* Every copy engine runs the same class (RM lists it once for them all) */
+   n->info.cls_copy = 0;
+   if (n->copy_engine_type != NV2080_ENGINE_TYPE_NULL) {
+      st = engine_classes(n, n->copy_engine_type, engine, &count);
+      if (st != NV_OK)
+         return failed_at(step, "NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST (copy)", st);
+      n->info.cls_copy = (uint16_t)class_with_low_byte(engine, count, 0xb5);
    }
 
    /* The copy engine that runs alongside graphics, for the copy object of a
@@ -653,14 +698,6 @@ nnrm_gpu_timestamp(struct nnrm *n)
    if (rm_control(n, n->subdevice, NV2080_CTRL_CMD_TIMER_GET_TIME, &t, sizeof(t)) != NV_OK)
       return 0;
    return t.time_nsec;
-}
-
-void
-nnrm_va_range(struct nnrm *n, uint64_t *start, uint64_t *end)
-{
-   (void)n;
-   *start = NNRM_VA_START;
-   *end = NNRM_VA_END;
 }
 
 /* ------------------------------------------------------------------ memory */
@@ -1126,14 +1163,6 @@ engine_object(struct nnrm *n, struct nnrm_chan *c, uint32_t cls, void *params, u
    return st;
 }
 
-static uint64_t
-nnrm_now_ns(void)
-{
-   struct timespec ts;
-   timespec_get(&ts, TIME_MONOTONIC);
-   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
 /* Graphics engine objects take NV_GR_ALLOCATION_PARAMETERS (RM forwards them
  * to GSP as they are, so they are passed zeroed rather than left out) */
 static uint32_t
@@ -1330,47 +1359,29 @@ nnrm_chan_submit(struct nnrm_chan *c, const struct nnrm_gp *gps, uint32_t count)
       (volatile uint32_t *)(c->rm->usermode_map + NVC361_NOTIFY_CHANNEL_PENDING);
    const uint32_t mask = c->entries - 1;
 
-   uint32_t i = 0;
-   while (i < count) {
-      /* One entry stays free so that GPPut == GPGet always means "empty" */
-      uint32_t get = userd->GPGet & mask;
-      uint32_t space = (get - c->put - 1) & mask;
+   /* One entry stays free so that GPPut == GPGet always means "empty" */
+   if (count >= c->entries)
+      return NV_ERR_INVALID_ARGUMENT;
 
-      if (space == 0) {
-         if (nnrm_chan_has_error(c))
-            return NV_ERR_RESET_REQUIRED;
-
-         const uint64_t deadline = nnrm_now_ns() + NNRM_RING_WAIT_NS;
-         while ((((userd->GPGet & mask) - c->put - 1) & mask) == 0) {
-            if (nnrm_chan_has_error(c))
-               return NV_ERR_RESET_REQUIRED;
-            if (nnrm_now_ns() > deadline)
-               return NV_ERR_TIMEOUT;
-            thrd_yield();
-         }
-         continue;
-      }
-
-      for (; space > 0 && i < count; space--, i++) {
-         const struct nnrm_gp *gp = &gps[i];
-         ring[c->put * 2 + 0] = DRF_NUM(C36F, _GP_ENTRY0, _GET, (uint32_t)gp->addr >> 2);
-         ring[c->put * 2 + 1] = DRF_NUM(C36F, _GP_ENTRY1, _GET_HI, (uint32_t)(gp->addr >> 32)) |
-                                DRF_NUM(C36F, _GP_ENTRY1, _LENGTH, gp->size_B / 4) |
-                                (gp->no_prefetch ? DRF_DEF(C36F, _GP_ENTRY1, _SYNC, _WAIT)
-                                                 : DRF_DEF(C36F, _GP_ENTRY1, _SYNC, _PROCEED));
-         c->put = (c->put + 1) & mask;
-      }
-
-      /* CPU ordering alone does not drain WC/UC PCI posted writes.  Order
-       * the caller's VRAM stores, complete a read from this device's live
-       * BAR1 allocation, then publish sysmem GPPut and ring the doorbell. */
-      atomic_thread_fence(memory_order_seq_cst);
-      (void)*(const volatile uint32_t *)c->rm->posted_map;
-      atomic_thread_fence(memory_order_seq_cst);
-      userd->GPPut = c->put;
-      atomic_thread_fence(memory_order_seq_cst);
-      *doorbell = c->token;
+   for (uint32_t i = 0; i < count; i++) {
+      const struct nnrm_gp *gp = &gps[i];
+      ring[c->put * 2 + 0] = DRF_NUM(C36F, _GP_ENTRY0, _GET, (uint32_t)gp->addr >> 2);
+      ring[c->put * 2 + 1] = DRF_NUM(C36F, _GP_ENTRY1, _GET_HI, (uint32_t)(gp->addr >> 32)) |
+                             DRF_NUM(C36F, _GP_ENTRY1, _LENGTH, gp->size_B / 4) |
+                             (gp->no_prefetch ? DRF_DEF(C36F, _GP_ENTRY1, _SYNC, _WAIT)
+                                              : DRF_DEF(C36F, _GP_ENTRY1, _SYNC, _PROCEED));
+      c->put = (c->put + 1) & mask;
    }
+
+   /* CPU ordering alone does not drain WC/UC PCI posted writes.  Order
+    * the caller's VRAM stores, complete a read from this device's live
+    * BAR1 allocation, then publish sysmem GPPut and ring the doorbell. */
+   atomic_thread_fence(memory_order_seq_cst);
+   (void)*(const volatile uint32_t *)c->rm->posted_map;
+   atomic_thread_fence(memory_order_seq_cst);
+   userd->GPPut = c->put;
+   atomic_thread_fence(memory_order_seq_cst);
+   *doorbell = c->token;
 
    return NV_OK;
 }

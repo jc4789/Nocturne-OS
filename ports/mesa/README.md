@@ -90,10 +90,16 @@ driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で�
   GPFIFO チャンネル、ドアベル）。他のファイルは `nnrm_*` だけを見る。`nnrm_open_device` と `nnrm_chan_create` は失敗した段階
   （RM の制御・物体の名前など）を返し、`pdev`・`dev`・`ctx` がそれを Mesa の記録へ書く（`ctx` は
   `vk_errorf` で：Nocturne GL が記録を預かる間は出る）。BAR1 の大きさ（`NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`）は VRAM と同じく KiB。
+  装置は旗なしで確保する（GSP 構成では `RESTRICT_RESERVED_VALIMITS` の範囲が GSP へ届かず断られる）。
+  グラフィックスとコピーのクラスはそのエンジンの一覧（`NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST`）から選ぶ
+  （装置の一覧には下位バイトが重なる MIG のクラスがある）。
 - `pdev`・`dev`・`mem`・`va`：NVK の物理・論理装置、メモリ（VRAM か sysmem、常に一貫）、
-  VA は `util_vma_heap` で選び RM の仮想メモリへ対応付ける。
+  VA は `util_vma_heap` で選び RM の仮想メモリへ対応付ける。GPU の番地は 8 GiB（`NNRM_VA_START`）から：
+  その下の [4 GiB, 8 GiB) は RM の場所（GSP-RM の範囲と、CPU 側 RM が写すチャネルの文脈バッファー）。
 - `ctx`：実行文脈ごとにチャンネル一つ、フェンス一つ（GART の 64 ビット値）、ホスト用の命令片
-  64 枠。待ちは GPU のセマフォ取得、完了はリリースで書く。束縛（bind）は CPU で同期的に行う。
+  64 枠。待ちは GPU のセマフォ取得、完了はリリースで書く。GP の環の空きはフェンスで数える
+  （USERD の GP_GET は RM が書き戻しを選んだときしか動かない）。flush は環に入る大きさに分ける。
+  束縛（bind）は CPU で同期的に行う。
 - `sync`：Nocturne 独自の vk_sync（二値と timeline、GPU 待ち・CPU 待ち）。fd は無い。
 
 Rust の 3 crate（NAK、nil、nvk_rs）と std は `rustc` の staticlib `libnvk_mesa_rs.a` 一つにまとめる。

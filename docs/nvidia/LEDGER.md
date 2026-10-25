@@ -74,7 +74,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目（2026-10-25、2 回起動）は nvrm の面への移行・モード設定・垂直帰線による歩調まで誤りの行なく進んだが、主モニター（Acer X27U Z1、QD-OLED、DP）は暗いまま戻らなかった。原因は不明。モードは起動画面と同じ 1920×1080 59.940 Hz で、設定アプリでは変えられなかった（C65 で修理）。7 回目（2026-10-25、2 回起動）は 2560×1440 59.951 Hz が誤りの行なく点いたことになっているが、どのモニターも暗いままで、何も変わらなかった。0a1d812a（C62）が点けるモード設定の完了を待たなくしたことが原因と仮定して監査し、C62 の却下が誤りと分かった（C66 で修理）。8 回目は未実施 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目（2026-10-25、2 回起動）は nvrm の面への移行・モード設定・垂直帰線による歩調まで誤りの行なく進んだが、主モニター（Acer X27U Z1、QD-OLED、DP）は暗いまま戻らなかった。原因は不明。モードは起動画面と同じ 1920×1080 59.940 Hz で、設定アプリでは変えられなかった（C65 で修理）。7 回目（2026-10-25、2 回起動）は 2560×1440 59.951 Hz が誤りの行なく点いたことになっているが、どのモニターも暗いままで、何も変わらなかった。0a1d812a（C62）が点けるモード設定の完了を待たなくしたことが原因と仮定して監査し、C62 の却下が誤りと分かった（C66 で修理）。8 回目は点けるモード設定の 3 秒後に「has not completed」で起動画面へ返った。待っていた通知は BEGUN と時刻で、完了の判定が誤っていた（C67 で修理）。暗い画面の第一候補として出力 LUT の倍率 0 も直した（C68）。9 回目（2026-10-25）は X27U Z1 に 2560×1440 59.951 Hz が映り、設定アプリの試用と保持で 120.000 Hz になった（C65・C67・C68 を確認、C69 の表明も出なかった）。WebGL の Zink は NVK の装置の確保が GSP に断られて softpipe のまま（C70 で修理、同じ回にその先の C71・C72 も修理）。10 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -147,9 +147,12 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C64 | `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE` は MiB | 却下 → 修理済み | RM は KiB で返す（`mem_mgr_gm107.c` は BAR1 の VA 範囲の長さを 1024 で割る）。`nvkmd_nocturne_rm.c` は 1024×1024 を掛けていて、NVK の BAR の大きさが 1024 倍になっていた。RTX 4070 は Resizable BAR で BAR1 が VRAM より大きく、NVK は BAR を VRAM 以上なら別のヒープにしないので、実機では害が出なかったと見られる |
 | C65 | nvrm が点けるモードは起動画面と同じ大きさでよく、利用者がモードを選ぶ経路は要らない | 却下 → 修理済み（実機未確認） | 実機 6 回目、nvrm は起動画面の大きさの 1920×1080 から 59.940 Hz を選んだ（X27U Z1 の推奨は 2560×1440 59.951 Hz、31 モード）。カーネルはデスクトップを起動時の大きさに固定し、設定アプリの「Resolution」は何もしなかった。モードを決めるのは OS と利用者、列挙・検証・適用はドライバー（Windows-driver-samples で役割の境界を確かめた）。修理：カーネルにモニターのモードの持ち主（`kernel/src/gui/screenmode.c`）。ドライバーは見えるモードを出し（`n_pci_screen_modes`、推奨に `N_SCREEN_MODE_PREFERRED`）、システムは、そのモニターに保存された利用者の選択、無ければ推奨のモードを望む（`n_pci_screen_state` の `mode_serial`・`mode`）。ドライバーは点けて結果を返し（`done`・`shown`）、点かなかったモードは断られて次の候補が来る。設定アプリの試用（`SCREEN_MODE_SET`）は 15 秒で前のモードへ戻り、保持すればそのモニターの選択として保存される。デスクトップはスキャンアウトの大きさへ追従する（`wm_screen_resized`、`fb.c` はスキャンアウトごとの大きさ）。`display.c` は望まれたモードの大きさの面を作り、NVKMS の検査 → 面の受け渡し → commit → 古い面の解放の順で、commit が失敗すれば前の面（無ければ起動画面）へ戻す。確認：host 試験（偽の EDID と 8 モード、推奨、起動時の利用者の選択、失敗時に何も渡さない、モニターの出入り、直接表示）、QEMU の pcitest（Bochs VGA に 4 モード：推奨、試用が 15 秒で戻る、すぐ戻す、保持、取下げと再提示、他のモニターの選択、点かなかったモードの拒否）と、デスクトップが 1024×768 へ変わって戻ること、設定アプリの試用のカードを目視。実機で 2560×1440 が点くか、6 回目の暗い画面の原因は未確認 |
 | C66 | 面が表示に見えなくても、直接表示をやめれば利用者はデスクトップを見られる | 却下 → 修理済み（実機未確認） | 実機 6・7 回目はモニターが暗いまま戻らず、利用者に戻る手段が無かった（C65 の監査の残り「最初のモードが暗いときの逃げ道が無い」）。修理：`display.c` の `hand_back` が「表示を返す」唯一の持ち主になった。順序は、望まれたモードの取下げ、起動画面へ戻す（`n_pci_give_screen` の `N_SCANOUT_BOOT`）、垂直帰線を止める、NVKMS の持ち主を手放す（NVKMS は自分のコンソールを復元する）、head の状態を戻す、直接表示と面の解放。点けるモード設定を含め、待ったフリップが 3 秒で完了しなければ、完了通知の生の語（状態と時刻）、通知の番号、commit にかかった時間を書いて返す（`nvrm_nvkms_flip_words`）。以後 nvrm は自分の面を出さない（PRESENT・CREATE・IMPORT は `NV_ERR_NOT_SUPPORTED`、モードの追従と再走査もしない）。通知は完了を示すのにモニターに何も映らないときは、利用者が Ctrl+Alt+Esc を押す。カーネルは画面を描かせているドライバーへ起動画面を求め（`struct n_screen_state` の `take_back`、ABI 文書 §9、`wm.c`）、nvrm の状態スレッドはそれを見て `hand_back` する。起動画面が戻れば求めは終わる（`pciuser.c` の `screen_give_back` → `wm_screen_given_back`）。ドライバーが画面を保持していれば従来どおりアプリを止め、どちらでもなければメニューを出す。確認：§7 の 2026-10-25（8）。実機で 3 秒の待ちの後に起動画面かコンソールが見えるか、通知の語の値は未確認 |
-| C67 | 層の完了通知は、表示エンジンがフリップを終えると「finished」になる | 却下 → 修理済み（実機未確認） | 実機 8 回目：点けるモード設定の 3 秒後に「has not completed」、待っていた枠 1 の語は `40000000 00000000 68bd73a0 18e1aa5b`。語 0 の 31:30 が 1 で BEGUN、語 2・3 は表示エンジンが書いた時刻（`nvKmsResetNotifier` の初期値は語 2＝1・語 3＝0 で、枠 0 はそのまま）。window チャンネルの完了通知は、フリップを実行すると NOT_BEGUN から BEGUN に変わり、そこで止まる。NVKMS 自身もそれで完了と判定する（`nvkms-headsurface.c` の `IsPreviousFlipDone`、`HsUpdateClientNotifier`）。FINISHED まで進むのは core チャンネルのモード設定の通知だけ（`nvkms-evo3.c` の `nvEvoWaitForCompNotifierC3`）。`nvrm_nvkms_flip_done` は FINISHED を待っていたので、済んだフリップを毎回「見えない」として起動画面へ返していた（5・8 回目）。修理：commit の前に NOT_BEGUN へ消した枠が NOT_BEGUN 以外なら、そのフリップは実行済み（`nvkms_kapi_rm.c`）。モード設定の後の最初のフリップと、状態が変わったときだけ、状態と時刻を一行書く。host 試験の偽の KAPI を実機の語（初期値と 8 回目の時刻）に合わせた。C56・C62・C66 の「完了」はこの意味に読み替える |
-| C68 | モード設定の要求は、触れない項目を 0 にしておけば NVKMS の規定値になる | 却下 → 修理済み（実機未確認） | 出力 LUT を持つ装置（Turing 以降、Ada を含む。`nvkms-evo3.c` の `FillLUTCaps`）では、KAPI はモード設定のたびに `headModeSetConfig->olutFpNormScale` を無条件に送る（`nvkms-kapi.c` 3381〜3399 行）。NVKMS は HDR でなければその値のまま `HEAD_SET_OLUT_FP_NORM_SCALE` へ書く（`nvSetupOutputLUT5`、`EvoSetOutputLutC5`）。`display.c` の `head_request` は memset の 0 のまま送っていた。規定値は `NVKMS_OLUT_FP_NORM_SCALE_DEFAULT`（0xffffffff、約 1.0）で、NVKMS が自分のコンソールを戻すときはこれを使う（hand_back の後は映った 5 回目と合う）。0 では全画素が黒へ縮み、信号はあるのに暗い（6・7 回目の症状の第一候補。ハードウェアの文書では未確認）。修理：`head_request` で規定値を入れる（head を消す要求も通る）。モード設定の後と表示を返すときに、head の状態（モード、倍率、垂直帰線の数、KAPI `getCRC32` の合成後・ラスター・出力の CRC）を一行書く。host 試験 |
-| C69 | RM の CPU 番号は、いま走っている CPU を返せばよい（C18 の補い） | 却下 → 修理済み（実機未確認） | 実機 7・8 回目に `pThreadNode->cpuNum == osGetCurrentProcessorNumber() @ thread_state.c:962`。`threadStateInitISRLockless` は開始時の CPU の枠に節を入れ、`threadStateFreeISRLockless` は終わりの CPU と同じことを表明する。カーネルの割込み処理は CPU を移らないが、nvrm の割込みスレッドは移りうる。修理：`irq_run_rm` の間（`nvrm_isr_begin`／`_end`、`os.c`）は `os_get_cpu_number` が開始時の番号を返す。その枠を埋めるのは割込みスレッド一本だけで、他のスレッドは節のスレッドを照合してから使う。あわせて、割込みの待ちが 50 ms で時間切れになっても `rm_isr` を走らせ（MSI の端を一度失っても RM が止まらない）、5 秒ごとの届いた割込み・RM が処理した数・届かずに見つかった数・垂直帰線の数を、どれが動いているかが変わったときだけ書く（`nvrm.c`） |
+| C67 | 層の完了通知は、表示エンジンがフリップを終えると「finished」になる | 却下 → 修理済み（実機 9 回目で確認） | 実機 8 回目：点けるモード設定の 3 秒後に「has not completed」、待っていた枠 1 の語は `40000000 00000000 68bd73a0 18e1aa5b`。語 0 の 31:30 が 1 で BEGUN、語 2・3 は表示エンジンが書いた時刻（`nvKmsResetNotifier` の初期値は語 2＝1・語 3＝0 で、枠 0 はそのまま）。window チャンネルの完了通知は、フリップを実行すると NOT_BEGUN から BEGUN に変わり、そこで止まる。NVKMS 自身もそれで完了と判定する（`nvkms-headsurface.c` の `IsPreviousFlipDone`、`HsUpdateClientNotifier`）。FINISHED まで進むのは core チャンネルのモード設定の通知だけ（`nvkms-evo3.c` の `nvEvoWaitForCompNotifierC3`）。`nvrm_nvkms_flip_done` は FINISHED を待っていたので、済んだフリップを毎回「見えない」として起動画面へ返していた（5・8 回目）。修理：commit の前に NOT_BEGUN へ消した枠が NOT_BEGUN 以外なら、そのフリップは実行済み（`nvkms_kapi_rm.c`）。モード設定の後の最初のフリップと、状態が変わったときだけ、状態と時刻を一行書く。host 試験の偽の KAPI を実機の語（初期値と 8 回目の時刻）に合わせた。C56・C62・C66 の「完了」はこの意味に読み替える |
+| C68 | モード設定の要求は、触れない項目を 0 にしておけば NVKMS の規定値になる | 却下 → 修理済み（実機 9 回目で確認） | 出力 LUT を持つ装置（Turing 以降、Ada を含む。`nvkms-evo3.c` の `FillLUTCaps`）では、KAPI はモード設定のたびに `headModeSetConfig->olutFpNormScale` を無条件に送る（`nvkms-kapi.c` 3381〜3399 行）。NVKMS は HDR でなければその値のまま `HEAD_SET_OLUT_FP_NORM_SCALE` へ書く（`nvSetupOutputLUT5`、`EvoSetOutputLutC5`）。`display.c` の `head_request` は memset の 0 のまま送っていた。規定値は `NVKMS_OLUT_FP_NORM_SCALE_DEFAULT`（0xffffffff、約 1.0）で、NVKMS が自分のコンソールを戻すときはこれを使う（hand_back の後は映った 5 回目と合う）。0 では全画素が黒へ縮み、信号はあるのに暗い（6・7 回目の症状の第一候補。ハードウェアの文書では未確認）。修理：`head_request` で規定値を入れる（head を消す要求も通る）。モード設定の後と表示を返すときに、head の状態（モード、倍率、垂直帰線の数、KAPI `getCRC32` の合成後・ラスター・出力の CRC）を一行書く。host 試験 |
+| C69 | RM の CPU 番号は、いま走っている CPU を返せばよい（C18 の補い） | 却下 → 修理済み（実機 9 回目で確認） | 実機 7・8 回目に `pThreadNode->cpuNum == osGetCurrentProcessorNumber() @ thread_state.c:962`。`threadStateInitISRLockless` は開始時の CPU の枠に節を入れ、`threadStateFreeISRLockless` は終わりの CPU と同じことを表明する。カーネルの割込み処理は CPU を移らないが、nvrm の割込みスレッドは移りうる。修理：`irq_run_rm` の間（`nvrm_isr_begin`／`_end`、`os.c`）は `os_get_cpu_number` が開始時の番号を返す。その枠を埋めるのは割込みスレッド一本だけで、他のスレッドは節のスレッドを照合してから使う。あわせて、割込みの待ちが 50 ms で時間切れになっても `rm_isr` を走らせ（MSI の端を一度失っても RM が止まらない）、5 秒ごとの届いた割込み・RM が処理した数・届かずに見つかった数・垂直帰線の数を、どれが動いているかが変わったときだけ書く（`nvrm.c`） |
+| C70 | NVK の装置は `NV_DEVICE_ALLOCATION_FLAGS_RESTRICT_RESERVED_VALIMITS` で RM の VA を決めた範囲へ閉じ込められ、NVK のヒープは [1 MiB, 256 GiB) でよい | 却下 → 修理済み（実機未確認） | 実機 9 回目、Zink を起こすたびに `rpcRmApiAlloc_GSP: GspRmAlloc failed … hClass=0x00000080 … status=0x0000001f` と `NVK: … NV01_DEVICE_0 failed: NV_ERR_INVALID_ARGUMENT`（120 Hz への変更とは無関係。8 回目も同じ場所で落ちていたが理由が出ていなかった）。GSP 構成の CPU 側 RM は装置を GSP にも作らせ、その RPC（`NV_RM_RPC_ALLOC_SHARE_DEVICE_FWCLIENT`）は旗を送るが範囲を送らない。GSP の `deviceConstruct` は旗があって範囲が 0 なら断る。旗を外すだけでは足りない：GSP 構成では各 VA 空間の [4 GiB, 4.5 GiB) が GSP-RM の範囲で（`gvaspaceReserveSplitVaSpace`）、CPU 側 RM はチャネルの文脈バッファーを 4 GiB から上の最初の空きへ写す（`dmaAllocMapping_GM107`）。RM の注釈どおり RM の場所は [4 GiB, 8 GiB)（CUDA の約束）。修理：装置は旗なし（UVM・NVKMS と同じ）、NVK のヒープは 8 GiB から（`NNRM_VA_START`、`nvkmd_nocturne_rm.h`）。host 試験の偽の RM に GSP の規則（装置の旗、GSP の範囲、文脈バッファーの写像）を入れた。直す前の `nvkmd_nocturne_rm.c` はこの偽物で NV01_DEVICE_0 から失敗し、実機の症状を再現した |
+| C71 | エンジンのクラスは装置のクラス一覧から下位バイトで選べる | 却下 → 修理済み（実機未確認） | 監査（2026-10-25）：`NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2` はエンジンを持たない MIG のクラス（`AMPERE_SMC_CONFIG_SESSION` 0xc639、`AMPERE_SMC_MONITOR_SESSION` 0xc640）も含み、M2MF の 0x40 で選ぶと 0xc640 を拾う。M2MF の物体を頼むチャネルは作れず、NVK の `cls_m2mf` も誤る。修理：グラフィックスとコピーのクラスは、そのエンジンの一覧（`NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST`、CPU 側 RM の表で答える。一覧は引数の中のポインターで書かれるので libnvrm の引数の領域に置く）から選ぶ。GPFIFO と USERMODE は装置の一覧のまま。host 試験（偽の RM はチャネルの下にエンジンのクラスしか作らせない） |
+| C72 | GP の環の空きは USERD の GP_GET で数えられる | 却下 → 修理済み（実機未確認） | 監査（2026-10-25）：Host が USERD を書き戻すかはチャネルの RAMFC の `USERD_WRITEBACK` で、RM が GSP の中で決める（CPU 側に呼出しは見えない）。dev_ram.ref（open-gpu-doc、GA100）は、書き戻しは止められるのでセマフォーで進みを追うよう勧めている。書き戻されなければ約 340 回目の flush で 10 秒待って装置を失う。修理：環の空きは実行文脈がフェンスで数える（flush ごとの GP の終わりを持ち、足りなければ古い flush のフェンスを待つ、`nvkmd_nocturne_ctx.c`）。`nnrm_chan_submit` は書いて鳴らすだけ。flush は環に入る大きさに分け、不完全な命令の連なりは切らない（上流の nouveau 版と同じ）。host 試験 `nvk_ctx`（偽の GPU は CPU が待つ間だけ flush を終え、GP_GET は書かない） |
 | C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る。実機 4 回目：BME を入れてから nvrm が落ちて解放されるまで（`RmInitAdapter` の 5.1 秒を含む）、IOMMU の遮断の行は一つも無かった |
 
 ## 5. 担当と受け渡し
@@ -162,21 +165,13 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 6. 次の一手
 
-1. P10（ユーザー）：RTX 4070 の実機で起動し（8 回目。6・7 回目は nvrm の面へ移ったことになっているが、
-   モニターは暗いままだった）、まず次を見る（C62・C66）。
-   - 暗くなったとき、モニターの表示（OSD）が「信号なし」か、信号はあって黒いだけか。
-   - 約 3 秒の後に起動画面か NVKMS のコンソールが戻るか。戻れば nvrm.log の `NVRM display:` に
-     「the flip on head … has not completed … ms after its commit」の行があり、その「completion notifier」の
-     番号と語（1 語目が状態、3・4 語目が時刻。0 のままなら表示エンジンは書いていない）を記録する。
-   - 戻らず暗いままなら Ctrl+Alt+Esc を押し、起動画面が戻るか。System.log の `wm: Ctrl+Alt+Esc` の行と、
-     nvrm.log の「the user asks for the boot screen back」を見る。
-   - 1 回目のように映していたモニターが「is disconnected」になるか（DP のリンクが落ちたか）。
-   以下は 6 回目からの項目：nvrm が出したモードとシステムが望んだモード（System.log の `screen:` の行：
-   「monitor …, N modes」「the monitor shows: …」、または「the display driver could not show …」）、
-   `NVRM display:` の「the desktop is shown on display … at …」、モニターが 2560×1440 の信号を受けて映るかを見る（C65）。
-   映れば設定アプリの Display で別のモード（280 Hz など）を試し、15 秒の試用・保持・戻るを見る。
-   ブラウザーの WebGL が Zink で動くか（System.log の `MESA:` の行：「Nocturne GL: drawing on the GPU with …」なら GPU、
-   そうでなければ同じ行の理由と、その前の `ZINK:`・`NVK:` の行、C63）を見る。全画面の直接表示では、
+1. P10（ユーザー）：RTX 4070 の実機で起動し（10 回目。9 回目で表示は映り、120 Hz にもできた）、まず
+   ブラウザーの WebGL（get.webgl.org）が Zink で動くかを見る（C70〜C72）。System.log の `MESA:` の行が
+   「Nocturne GL: drawing on the GPU with …」なら GPU。そうでなければ同じ行の理由と、その前の `ZINK:`・`NVK:` の行
+   （NVK は止まった段階の名前と NV_STATUS を書く、C63）と、nvrm.log の `rpcRmApiAlloc_GSP`・`rpcRmApiControl_GSP` の行を見る。
+   装置の確保を越えた先（チャネル、エンジンの物体、メモリーの写像、投入）は実機で初めて通る。立方体が回り続けるか
+   （止まれば GP の環かフェンス、C72）、窓を閉じて開き直せるかも見る。
+   表示は 9 回目と同じく、モードの変更（設定アプリの試用・保持・戻る）で誤りの行が無いかを見る。全画面の直接表示では、
    フリップの完了が届くか（C56：`NVRM display:` に「the flip on head … has not completed」の行が
    出ないか。出れば表示を起動画面へ返す、C66）と、
    全画面の窓を閉じた後にデスクトップへ戻るか（C57）を見る。ACPI の拒否（C59）で RM が要る方法を
@@ -186,6 +181,21 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-25（9）：実機 9 回目（ユーザー、USB 起動、6e912418 の作業ツリー）。ユーザーの観察：設定アプリで 60 Hz から
+  120 Hz に変えた後に ZINK と `rpcRmApiAlloc_GSP` の誤りが出た。`build/qa/realhw9/`（USB の独自のファイルシステムから
+  管理者の PowerShell と store.exe で取り出した）：X27U Z1（DP-1）に 2560×1440 59.951 Hz、試用と保持で 120.000 Hz
+  （「the user keeps 2560x1440 at 120.000 Hz」、垂直帰線による歩調、CRC の行あり）。その後、ブラウザーが GL を
+  起こすたびに `GspRmAlloc failed … hClass=0x00000080 … status=0x0000001f` と
+  「NVK: GPU 01:00.0: NV01_DEVICE_0 failed: NV_ERR_INVALID_ARGUMENT」「ZINK: vkEnumeratePhysicalDevices failed」
+  「Nocturne GL: … drawing with softpipe」（5 回）。120 Hz との順序は偶然で、原因は NVK の装置の確保の旗（C70）。
+  直す前の `nvkmd_nocturne_rm.c` を新しい host 試験で走らせると同じ NV01_DEVICE_0 で止まった。装置より先の経路は
+  実機で一度も通っていないので、監査（サブエージェント、模型とコードの場所だけを渡した）で、チャネル・メモリー・写像・
+  特権・投入の順序を調べ、止まりうる二つを同じ回に直した（C71、C72）。確認：host 試験 5 つ（nvk_sync、nvk_ctx、
+  mesa_screen、nvk_rm、zink_start）0 件失敗、全体ビルド（img・vhd・vhdx・iso）、起動ディスクの browser と nvrm が
+  `build/programs` と同じ sha256、QEMU（WHPX、4 コア、4096 MiB、1920×1080、AHCI、NVIDIA 無し）で机上、ブラウザーの
+  about:home、get.webgl.org の WebGL の立方体が softpipe で回る（1 秒後の画像と比べて回転を確かめた）、戻る、ホイールで
+  下端と先頭、3D Cube 62 fps を目視（`build/qa/zink10/`）。実機の Zink（装置の確保より先の経路）は 10 回目で確かめる。
 
 - 2026-10-25（8）：実機 7 回目（ユーザー、USB 起動、2 回）。ユーザーの観察：C65 の修理の後も何も変わらず、
   モニターは暗いまま。`build/qa/realhw7/` の System.log と nvrm.log：1 回目は X27U Z1（DP-1、0x800）が

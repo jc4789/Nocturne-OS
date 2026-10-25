@@ -101,12 +101,12 @@ NVKMD_DECL_SUBCLASS(pdev, nocturne);
 
 /* ---- dev ---- */
 
-/* NVK's part of the GPU address space (see nvkmd_nocturne_rm.c for the rest):
- * normal allocations below 1 << 38, capture/replay above */
-#define NVKMD_NOCTURNE_HEAP_START ((uint64_t)1 << 20)
+/* NVK's part of the GPU address space (NNRM_VA_START..NNRM_VA_END): normal
+ * allocations below 1 << 38, capture/replay above */
+#define NVKMD_NOCTURNE_HEAP_START ((uint64_t)NNRM_VA_START)
 #define NVKMD_NOCTURNE_HEAP_END ((uint64_t)1 << 38)
 #define NVKMD_NOCTURNE_REPLAY_HEAP_START NVKMD_NOCTURNE_HEAP_END
-#define NVKMD_NOCTURNE_REPLAY_HEAP_END ((uint64_t)3 << 37)
+#define NVKMD_NOCTURNE_REPLAY_HEAP_END ((uint64_t)NNRM_VA_END)
 
 struct nvkmd_nocturne_dev {
    struct nvkmd_dev base;
@@ -175,7 +175,8 @@ VkResult nvkmd_nocturne_alloc_va(struct nvkmd_dev *dev,
 
 /* The host commands a flush adds around the client's pushes (semaphore
  * acquires, the fence release, the first flush's SET_OBJECTs) go into slots
- * of a ring; a slot is reused once the fence passes the flush that used it. */
+ * of a ring: flush seqno uses slot seqno % NVKMD_NOCTURNE_HOST_SLOTS, free
+ * again once the fence passes the flush NVKMD_NOCTURNE_HOST_SLOTS before. */
 #define NVKMD_NOCTURNE_HOST_SLOT_B 4096
 #define NVKMD_NOCTURNE_HOST_SLOTS 64
 
@@ -197,8 +198,11 @@ struct nvkmd_nocturne_exec_ctx {
    uint64_t seqno; /* last seqno submitted */
 
    struct nvkmd_mem *host_mem;
-   uint32_t host_slot;
-   uint64_t host_slot_seqno[NVKMD_NOCTURNE_HOST_SLOTS];
+
+   /* GP entries submitted, and where those of the flushes still in a host
+    * slot end: flush seqno's at gp_end[seqno % NVKMD_NOCTURNE_HOST_SLOTS] */
+   uint64_t gp_put;
+   uint64_t gp_end[NVKMD_NOCTURNE_HOST_SLOTS];
 
    /* the next flush: GPU waits, pushes, signals */
    struct util_dynarray waits;   /* struct nvkmd_nocturne_wait */
