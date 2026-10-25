@@ -1,0 +1,6 @@
+interface:
+  display_name: "作業の模型"
+  short_description: "目的・形・今の説明・原因のありか・次の一手を外に書き、長い作業で筋を保つ進め方"
+  default_prompt: "$mokei に従い、作業の模型を書いてから進めてください。"
+policy:
+  allow_implicit_invocation: true
