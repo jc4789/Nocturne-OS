@@ -17,6 +17,7 @@ struct libc_thread {
     void *slots[N_TLS_SLOTS];
     void **tss;      /* C11 tss values, grown on demand (threads.c) */
     size_t tss_cap;
+    void *malloc_cache; /* this thread's small free blocks (malloc.c) */
 };
 static unsigned char main_thread_area[sizeof(struct libc_thread) * 2] __attribute__((aligned(64)));
 static unsigned tls_initialized;
@@ -164,7 +165,13 @@ n_result thread_create_sized(void (*fn)(void *), void *arg, size_t stack_bytes) 
 n_result thread_create(void (*fn)(void *), void *arg) { return thread_create_sized(fn, arg, 0); }
 n_result thread_join(int tid) { return SC1(SYS_THREAD_JOIN, tid); }
 n_result thread_detach(int tid) { return SC1(SYS_THREAD_DETACH, tid); }
-_Noreturn void thread_exit(void) { SC0(SYS_THREAD_EXIT); for (;;) {} }
+void __malloc_thread_exit(void);
+_Noreturn void thread_exit(void) { __malloc_thread_exit(); SC0(SYS_THREAD_EXIT); for (;;) {} }
+/* The allocator's per-thread slot; NULL before this thread has TLS. */
+void **__libc_malloc_cache(void) {
+    struct libc_thread *t = libc_thread_current();
+    return t ? &t->malloc_cache : NULL;
+}
 int thread_id(void) {
     struct libc_thread *t = libc_thread_current();
     return t ? t->tid : (int)SC0(SYS_THREAD_ID);

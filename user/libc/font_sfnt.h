@@ -10,19 +10,28 @@ static int16_t sf_i16(const unsigned char *p) { return (int16_t)sf_u16(p); }
 static uint32_t sf_u32(const unsigned char *p) { return (uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3]; }
 static uint32_t sf_le32(const unsigned char *p) { return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24; }
 static bool sf_has(struct sf_span s,size_t at,size_t n) { return at<=s.n && n<=s.n-at; }
-static bool sf_table(struct sf_span file,const char *tag,struct sf_span *out) {
-    unsigned count=sf_u16(file.p+4); bool found=false;
+/* The single record of tag among the count records after the 12-byte header;
+ * the caller bounds the offset and length against the file it holds. */
+static bool sf_record(const unsigned char *file,unsigned count,const char *tag,uint32_t *at,uint32_t *n) {
+    bool found=false;
     for(unsigned i=0;i<count;i++) {
-        const unsigned char *r=file.p+12+16*i;
+        const unsigned char *r=file+12+16*i;
         if(memcmp(r,tag,4)) continue;
         if(found) return false;
-        uint32_t at=sf_u32(r+8), n=sf_u32(r+12);
-        if(!at || at>INT_MAX || n>INT_MAX || !sf_has(file,at,n) || n>(size_t)INT_MAX-at) return false;
-        *out=(struct sf_span){file.p+at,n};found=true;
+        *at=sf_u32(r+8);*n=sf_u32(r+12);found=true;
     }
     return found;
 }
-static bool sf_cmap(struct sf_span map,unsigned glyphs) {
+static bool sf_table(struct sf_span file,const char *tag,struct sf_span *out) {
+    uint32_t at,n;
+    if(!sf_record(file.p,sf_u16(file.p+4),tag,&at,&n) ||
+       !at || at>INT_MAX || n>INT_MAX || !sf_has(file,at,n) || n>(size_t)INT_MAX-at) return false;
+    *out=(struct sf_span){file.p+at,n};
+    return true;
+}
+/* Validates the Unicode subtable the renderer uses (the last platform 0 or
+ * 3/1, 3/10 record) and, when asked, returns where it starts. */
+static bool sf_cmap(struct sf_span map,unsigned glyphs,const unsigned char **subtable) {
     if(!sf_has(map,0,4) || sf_u16(map.p)!=0) return false;
     unsigned count=sf_u16(map.p+2); size_t chosen=0;
     if(!sf_has(map,4,(size_t)count*8)) return false;
@@ -75,7 +84,28 @@ static bool sf_cmap(struct sf_span map,unsigned glyphs) {
             previous=end;
         }
     }
+    if(subtable)*subtable=s.p;
     return true;
+}
+/* The glyph of cp in a subtable sf_cmap accepted. In format 4 idDelta also
+ * applies to a nonzero glyphIdArray entry. */
+static unsigned sf_cmap_glyph(const unsigned char *p,uint32_t cp) {
+    unsigned format=sf_u16(p);
+    if(format==0)return cp<256?p[6+cp]:0;
+    if(format==6){unsigned first=sf_u16(p+6),n=sf_u16(p+8);return cp>=first && cp-first<n?sf_u16(p+10+2*(cp-first)):0;}
+    if(format==4) {
+        if(cp>65535)return 0;unsigned n=sf_u16(p+6)/2,lo=0,hi=n;
+        while(lo<hi){unsigned mid=lo+(hi-lo)/2;if(cp>sf_u16(p+14+2*mid))lo=mid+1;else hi=mid;}
+        if(lo==n)return 0;unsigned start=sf_u16(p+16+2*n+2*lo);if(cp<start)return 0;
+        unsigned offset=16+6*n+2*lo,range=sf_u16(p+offset);int delta=sf_i16(p+16+4*n+2*lo);
+        if(!range)return (uint16_t)(cp+delta);
+        unsigned g=sf_u16(p+offset+range+2*(cp-start));return g?(uint16_t)(g+delta):0;
+    }
+    unsigned lo=0,hi=sf_u32(p+12);
+    while(lo<hi){unsigned mid=lo+(hi-lo)/2;const unsigned char *r=p+16+(size_t)mid*12;
+        unsigned first=sf_u32(r),last=sf_u32(r+4);if(cp<first)hi=mid;else if(cp>last)lo=mid+1;
+        else return sf_u32(r+8)+(format==12?cp-first:0);}
+    return 0;
 }
 static uint32_t sf_glyph_at(struct sf_span loca,unsigned g,bool wide) {
     return wide ? sf_u32(loca.p+4*g) : (uint32_t)sf_u16(loca.p+2*g)*2;
@@ -136,7 +166,7 @@ static bool font_sfnt_valid(const void *data,size_t bytes) {
     unsigned glyphs=sf_u16(maxp.p+4), metrics=sf_u16(hhea.p+34), format=sf_u16(head.p+50);
     if(!glyphs || !metrics || metrics>glyphs || format>1 ||
        !sf_has(hmtx,0,(size_t)metrics*4+(size_t)(glyphs-metrics)*2)||
-       !sf_has(loca,0,(size_t)(glyphs+1)*(format?4:2))||!sf_cmap(cmap,glyphs))return false;
+       !sf_has(loca,0,(size_t)(glyphs+1)*(format?4:2))||!sf_cmap(cmap,glyphs,NULL))return false;
     uint32_t previous=0;
     for(unsigned g=0;g<=glyphs;g++) {
         uint32_t end=sf_glyph_at(loca,g,format!=0);if(end<previous || end>glyf.n)return false;

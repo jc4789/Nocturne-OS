@@ -174,6 +174,22 @@ static float corners_coverage(float px,float py,float x,float y,float w,float h,
     }
     return cover;
 }
+/* Distances from the left, top, right and bottom edges past which
+   corners_coverage() is exactly 1 inside the box (both the circular SDF and
+   the elliptical path clamp there), and a row's coverage depends on x alone. */
+static void radii_reach(const struct border_radii *r,float reach[4]) {
+    float corner[4];for(int i=0;i<4;i++)corner[i]=fmaxf(r->x[i],r->y[i]);
+    reach[0]=fmaxf(corner[0],corner[3])+2;reach[1]=fmaxf(corner[0],corner[1])+2;
+    reach[2]=fmaxf(corner[1],corner[2])+2;reach[3]=fmaxf(corner[2],corner[3])+2;
+}
+/* The pixels [*first, *last) of a row whose centres lie between `from` and
+   `to` (row-relative): past both side reaches, where a row's coverage
+   depends on y alone. Empty (first = last = -1) when there are none. */
+static void radii_middle(float from,float to,int width,int *first,int *last) {
+    float a=ceilf(from-.5f),b=floorf(to-.5f)+1;
+    *first=(int)fmaxf(0,fminf((float)width,a));*last=(int)fmaxf(0,fminf((float)width,b));
+    if(*first>=*last)*first=*last=-1;
+}
 struct radius_cache {
     float x,y,w,h;struct border_radii radii;
     int left,top,width,height;bool clipped;
@@ -214,24 +230,25 @@ static bool radius_cache_prepare(web_doc *doc,struct radius_cache **slot,float x
         !(next->alpha=malloc(pixels))||!(next->opaque=calloc((size_t)next->height,sizeof *next->opaque)))){web_radius_cache_free(&next);return false;}
     if(doc->profile_enabled){paint_profile.radius_builds++;paint_profile.radius_pixels+=pixels;}
     /* Rows clear of every corner and of the top/bottom anti-aliased edge have
-       coverage that depends on x alone (both the circular SDF and the
-       elliptical path): compute one such row and copy it. */
-    float top_reach=fmaxf(fmaxf(radii.x[0],radii.y[0]),fmaxf(radii.x[1],radii.y[1]))+2;
-    float bottom_reach=fmaxf(fmaxf(radii.x[2],radii.y[2]),fmaxf(radii.x[3],radii.y[3]))+2;
+       coverage that depends on x alone: compute one such row and copy it. */
+    float reach[4];radii_reach(&radii,reach);
     int middle=-1;
     for(int py=0;py<next->height;py++) {
         if(!(py&31)&&!web_native_checkpoint(doc)){web_radius_cache_free(&next);return false;}
         float center=next->top+py+.5f;
-        bool plain=center-y>=top_reach&&y+h-center>=bottom_reach;
+        bool plain=center-y>=reach[1]&&y+h-center>=reach[3];
         if(plain&&middle>=0&&next->alpha){
             memcpy(next->alpha+(size_t)py*next->width,next->alpha+(size_t)middle*next->width,(size_t)next->width);
             next->opaque[py]=next->opaque[middle];continue;
         }
         if(plain)middle=py;
         int first=-1,last=0;
+        int mid0,mid1;radii_middle(x+reach[0]-next->left,x+w-reach[2]-next->left,next->width,&mid0,&mid1);
+        uint8_t *row=next->alpha+(size_t)py*next->width;
         for(int px=0;px<next->width;px++) {
             uint8_t alpha=(uint8_t)(255*corners_coverage(next->left+px+.5f,next->top+py+.5f,x,y,w,h,&radii)+.5f);
-            next->alpha[(size_t)py*next->width+px]=alpha;
+            if(px==mid0){memset(row+mid0,alpha,(size_t)(mid1-mid0));if(alpha==255){if(first<0)first=mid0;last=mid1;}px=mid1-1;continue;}
+            row[px]=alpha;
             if(alpha==255){if(first<0)first=px;last=px+1;}
         }
         if(next->opaque)next->opaque[py]=(struct gfx_mask_span){first<0?0:first,last};
@@ -364,22 +381,46 @@ struct shadow_blur_job {
     const uint8_t *source;
     uint8_t *target;
     const float *kernel;
+    const uint8_t *column_same; /* vertical pass: source column x equals column x-1 */
     int width, height, radius;
-    bool vertical;
 };
+/* One line of the separable Gaussian, `step` bytes between its samples.
+   A rounded-rect mask is mostly runs of one value: where both windows are
+   whole and every sample of [i-1-radius, i+radius] is equal, the sum at i is
+   the same sum of the same products as at i-1, so it is copied. */
+static void shadow_blur_line(const uint8_t *s,uint8_t *t,size_t step,int limit,const float *kernel,int radius) {
+    int run=0; /* consecutive j ending at i+radius with s[j]==s[j-1] */
+    for(int j=1;j<radius&&j<limit;j++)run=s[j*step]==s[(j-1)*step]?run+1:0;
+    for(int i=0;i<limit;i++) {
+        int head=i+radius;
+        run=head<limit&&head>0&&s[head*step]==s[(head-1)*step]?run+1:0;
+        if(i>radius&&head<limit&&run>2*radius){t[i*step]=t[(i-1)*step];continue;}
+        float sum=0;int first=MAX(-radius,-i),last=MIN(radius,limit-i-1);
+        for(int k=first;k<=last;k++)sum+=s[(size_t)(i+k)*step]*kernel[k+radius];
+        t[i*step]=(uint8_t)fminf(255,floorf(sum+.5f));
+    }
+}
 static void shadow_blur_rows(size_t tile, void *opaque) {
     const struct shadow_blur_job *job = opaque;
     int y0 = (int)tile * 32, y1 = MIN(y0 + 32, job->height);
-    for (int y = y0; y < y1; y++) for (int x = 0; x < job->width; x++) {
-        float sum = 0; int position = job->vertical ? y : x, limit = job->vertical ? job->height : job->width;
-        int first = MAX(-job->radius, -position), last = MIN(job->radius, limit - position - 1);
-        for (int k = first; k <= last; k++) {
-            size_t at = job->vertical ? (size_t)(y+k)*job->width+x : (size_t)y*job->width+x+k;
-            sum += job->source[at] * job->kernel[k + job->radius];
-        }
-        job->target[(size_t)y*job->width+x] = (uint8_t)fminf(255, floorf(sum + .5f));
+    size_t width = (size_t)job->width;
+    for (int y = y0; y < y1; y++) {
+        const uint8_t *s = job->source + y*width; uint8_t *t = job->target + y*width;
+        if (y > y0 && !memcmp(s, s - width, width)) memcpy(t, t - width, width);
+        else shadow_blur_line(s, t, 1, job->width, job->kernel, job->radius);
     }
     parallel_record_work(PARALLEL_RASTER, (uint64_t)job->width * (y1-y0));
+}
+static void shadow_blur_columns(size_t tile, void *opaque) {
+    const struct shadow_blur_job *job = opaque;
+    int x0 = (int)tile * 32, x1 = MIN(x0 + 32, job->width);
+    size_t width = (size_t)job->width;
+    for (int x = x0; x < x1; x++) {
+        if (x > x0 && job->column_same[x])
+            for (uint8_t *t = job->target + x, *end = t + (size_t)job->height*width; t < end; t += width) t[0] = t[-1];
+        else shadow_blur_line(job->source + x, job->target + x, width, job->height, job->kernel, job->radius);
+    }
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)job->height * (x1-x0));
 }
 static void shadow_service(void *opaque) { web_native_checkpoint(opaque); }
 static bool shadow_mask_build(web_doc *doc, struct shadow_cache *cache, struct shadow_mask *mask) {
@@ -415,33 +456,50 @@ static bool shadow_mask_build(web_doc *doc, struct shadow_cache *cache, struct s
     size_t pixels = (size_t)mask->width * mask->height;
     mask->alpha = calloc(pixels, 1); if (!mask->alpha) return false;
     float sx = x - mask->left, sy = y - mask->top;
+    float reach[4]; radii_reach(&radii, reach);
+    int middle = -1; size_t pitch = (size_t)mask->width;
     for (int py = 0; py < mask->height; py++) {
         if (!(py & 31) && !web_native_checkpoint(doc)) return false;
         float fy = py + .5f;
         if (fy < sy-.5f || fy > sy+h+.5f) continue;
+        uint8_t *row = mask->alpha + (size_t)py*pitch;
+        bool plain = fy-sy >= reach[1] && sy+h-fy >= reach[3]; /* coverage depends on x alone */
+        if (plain && middle >= 0) { memcpy(row, mask->alpha + (size_t)middle*pitch, pitch); continue; }
+        if (plain) middle = py;
         int first = (int)fmaxf(0,fminf(mask->width,floorf(sx)));
         int last = (int)fmaxf(0,fminf(mask->width,ceilf(sx+w)));
-        for (int px = first; px < last; px++)
-            mask->alpha[(size_t)py*mask->width+px] = (uint8_t)(corners_coverage(px+.5f,fy,sx,sy,w,h,&radii)*255+.5f);
+        int mid0, mid1; radii_middle(sx+reach[0], sx+w-reach[2], mask->width, &mid0, &mid1);
+        for (int px = first; px < last; px++) {
+            uint8_t alpha = (uint8_t)(corners_coverage(px+.5f,fy,sx,sy,w,h,&radii)*255+.5f);
+            if (px == mid0) { memset(row+mid0, alpha, (size_t)(mid1-mid0)); px = mid1-1; continue; }
+            row[px] = alpha;
+        }
     }
     if (shadow->blur <= 0) return true;
     int extent = (int)halo; size_t kernel_count = (size_t)extent*2+1;
     if (kernel_count > SIZE_MAX / sizeof(float)) return false;
     float *kernel = malloc(kernel_count*sizeof *kernel); uint8_t *temporary = malloc(pixels);
-    if (!kernel || !temporary) { free(kernel); free(temporary); return false; }
+    uint8_t *column_same = malloc(pitch);
+    if (!kernel || !temporary || !column_same) { free(kernel); free(temporary); free(column_same); return false; }
     double sigma = shadow->blur / 2.0, inverse = -.5 / (sigma*sigma), sum = 0;
     for (int i = -extent; i <= extent; i++) { kernel[i+extent] = (float)exp((double)i*i*inverse); sum += kernel[i+extent]; }
     float normalize = (float)(1/sum); for (size_t i = 0; i < kernel_count; i++) kernel[i] *= normalize;
-    struct shadow_blur_job job = {mask->alpha,temporary,kernel,mask->width,mask->height,extent,false};
-    size_t rows = ((size_t)mask->height+31)/32;
-    parallel_for_stage(PARALLEL_RASTER, rows, shadow_blur_rows, &job, shadow_service, doc);
+    struct shadow_blur_job job = {mask->alpha,temporary,kernel,column_same,mask->width,mask->height,extent};
+    parallel_for_stage(PARALLEL_RASTER, ((size_t)mask->height+31)/32, shadow_blur_rows, &job, shadow_service, doc);
     bool success = !__atomic_load_n(&doc->native_cancelled,__ATOMIC_ACQUIRE);
     if (success) {
-        job.source = temporary; job.target = mask->alpha; job.vertical = true;
-        parallel_for_stage(PARALLEL_RASTER, rows, shadow_blur_rows, &job, shadow_service, doc);
+        /* Columns clear of the corners are equal after the horizontal pass;
+           the vertical pass blurs one of each run and copies it. */
+        memset(column_same, 1, pitch); column_same[0] = 0;
+        for (int py = 0; py < mask->height; py++) {
+            const uint8_t *row = temporary + (size_t)py*pitch;
+            for (size_t px = 1; px < pitch; px++) if (row[px] != row[px-1]) column_same[px] = 0;
+        }
+        job.source = temporary; job.target = mask->alpha;
+        parallel_for_stage(PARALLEL_RASTER, (pitch+31)/32, shadow_blur_columns, &job, shadow_service, doc);
         success = !__atomic_load_n(&doc->native_cancelled,__ATOMIC_ACQUIRE);
     }
-    free(kernel); free(temporary); return success;
+    free(kernel); free(temporary); free(column_same); return success;
 }
 static bool shadow_cache_prepare_radii(web_doc *doc, struct shadow_cache **slot, const style_t *style,
                                  float x, float y, float w, float h, const float *borders,struct border_radii radii) {
@@ -496,17 +554,31 @@ static void paint_shadows(struct pctx *P,const struct shadow_cache *cache,float 
         double right=inset?ceil((double)bx+bw):mx+mask->width,bottom=inset?ceil((double)by+bh):my+mask->height;
         int x0=(int)fmax(canvas->cx0,fmin(canvas->cx1,left)),y0=(int)fmax(canvas->cy0,fmin(canvas->cy1,top));
         int x1=(int)fmax(canvas->cx0,fmin(canvas->cx1,right)),y1=(int)fmax(canvas->cy0,fmin(canvas->cy1,bottom));
+        /* The box's coverage is exactly 0 half a pixel outside it and exactly
+           1 past its corners' reach inside it; only the band between needs
+           corners_coverage(). */
+        float reach[4];radii_reach(&radii,reach);
+        float out_x0=bx-.5f,out_x1=bx+bw+.5f,in_x0=bx+reach[0],in_x1=bx+bw-reach[2];
         /* Masks, allocation, Gaussian work and cancellation are completed in
            preflight. Do not introduce a new halfway-cancelled canvas write:
            ordinary (non-alpha-group) paint has no viewport rollback buffer. */
         for(int py=y0;py<y1;py++) {
+            float fy=py+.5f;
+            bool row_out=fy<=by-.5f||fy>=by+bh+.5f,row_in=fy>=by+reach[1]&&fy<=by+bh-reach[3];
+            const uint8_t *row=mask->alpha&&py>=my&&py-my<mask->height?mask->alpha+(size_t)(py-my)*mask->width:NULL;
+            /* An outer shadow is hidden wherever the box covers fully. */
+            int hidden0=-1,hidden1=-1;
+            if(!inset&&row_in)radii_middle(in_x0,in_x1,x1,&hidden0,&hidden1);
             for(int px=x0;px<x1;px++) {
-                float cover=corners_coverage(px+.5f,py+.5f,bx,by,bw,bh,&radii);
-                if(!inset)cover=1-cover;if(cover<=0)continue;
-                unsigned alpha=0;
-                if(mask->alpha&&px>=mx&&py>=my&&px-mx<mask->width&&py-my<mask->height)
-                    alpha=mask->alpha[(size_t)(py-my)*mask->width+(size_t)(px-mx)];
+                if(hidden0>=0&&px>=hidden0&&px<hidden1){px=hidden1-1;continue;}
+                unsigned alpha=row&&px>=mx&&px-mx<mask->width?row[(size_t)(px-mx)]:0;
                 if(inset)alpha=255-alpha;
+                if(!alpha)continue;
+                float fx=px+.5f,cover;
+                if(row_out||fx<=out_x0||fx>=out_x1)cover=0;
+                else if(row_in&&fx>=in_x0&&fx<=in_x1)cover=1;
+                else cover=corners_coverage(fx,fy,bx,by,bw,bh,&radii);
+                if(!inset)cover=1-cover;if(cover<=0)continue;
                 uint32_t color=with_alpha(shadow->color,cover*(float)alpha*(1.0f/255));
                 if(color>>24)gfx_blend_pixel(canvas,px,py,color);
             }
@@ -869,7 +941,18 @@ static void paint_corner_border(struct pctx *P,float x,float y,float w,float h,c
     canvas_t *c=P->c;
     int x0=(int)fmax(c->cx0,fmin(c->cx1,floor((double)x))),y0=(int)fmax(c->cy0,fmin(c->cy1,floor((double)y)));
     int x1=(int)fmax(c->cx0,fmin(c->cx1,ceil((double)x+w))),y1=(int)fmax(c->cy0,fmin(c->cy1,ceil((double)y+h)));
-    for(int py=y0;py<y1;py++)for(int px=x0;px<x1;px++) {
+    /* Where the inner shape covers fully the border has no coverage; it is
+       convex, so that is one run per row, which is skipped. */
+    int64_t inner_x=inner?lround((double)inner->left+((double)(x+widths[3])-inner->x)):0;
+    int64_t inner_y=inner?lround((double)inner->top+((double)(y+widths[0])-inner->y)):0;
+    for(int py=y0;py<y1;py++) {
+      int64_t skip0=0,skip1=0;
+      if(inner){
+          int64_t row=py-inner_y;
+          if(inner->opaque&&row>=0&&row<inner->height){skip0=inner_x+inner->opaque[row].x0;skip1=inner_x+inner->opaque[row].x1;}
+      } else if(py+.5f>=y+widths[0]&&py+.5f<y+h-widths[2]){skip0=(int64_t)ceilf(x+widths[3]-.5f);skip1=(int64_t)ceilf(x+w-widths[1]-.5f);}
+      for(int px=x0;px<x1;px++) {
+        if(px>=skip0&&px<skip1){px=(int)skip1-1;continue;}
         unsigned outside=radius_alpha(outer,px,py,x,y);if(!outside)continue;
         unsigned inside=inner?radius_alpha(inner,px,py,x+widths[3],y+widths[0]):
             (px+.5f>=x+widths[3]&&px+.5f<x+w-widths[1]&&py+.5f>=y+widths[0]&&py+.5f<y+h-widths[2]?255:0);
@@ -877,6 +960,7 @@ static void paint_corner_border(struct pctx *P,float x,float y,float w,float h,c
         float distance[4]={py+.5f-y,x+w-px-.5f,y+h-py-.5f,px+.5f-x};int side=-1;
         for(int i=0;i<4;i++)if(widths[i]>0&&(side<0||distance[i]*widths[side]<distance[side]*widths[i]))side=i;
         if(side>=0)gfx_blend_pixel(c,px,py,with_alpha(colors[side],cover));
+      }
     }
 }
 static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y, float w, float h, const float *bw,
@@ -2364,14 +2448,23 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     /* Only real alpha groups need a paint transaction. Its extent is the
        already clipped viewport, never the unbounded document or CSS sizes.
        Existing build/restyle aggregation also covers native opacity samples. */
+    /* The copy lives on the document between paints: a viewport-sized buffer
+       is a mapping of its own, and taking and returning one every frame cost
+       a reservation, cold pages and a TLB shootdown each time. */
     uint32_t *frame_saved = NULL;
     int fx = c->cx0, fy = c->cy0, fw = c->cx1 - fx, fh = c->cy1 - fy;
     if (d->root_box && d->root_box->paint_alpha && fw > 0 && fh > 0) {
+        size_t pixels = (size_t)fw * (size_t)fh;
         if (!c->px || fx < 0 || fy < 0 || c->cx1 > c->w || c->cy1 > c->h || c->pitch < c->w ||
             (size_t)fw > SIZE_MAX / sizeof *frame_saved / (size_t)fh ||
-            (size_t)c->pitch > SIZE_MAX / sizeof *frame_saved / (size_t)c->h ||
-            !(frame_saved = malloc(sizeof *frame_saved * (size_t)fw * (size_t)fh))) P.failed = true;
-        else for (int row = 0; row < fh; row++)
+            (size_t)c->pitch > SIZE_MAX / sizeof *frame_saved / (size_t)c->h) P.failed = true;
+        else if (d->paint_rollback_pixels < pixels) {
+            free(d->paint_rollback);
+            d->paint_rollback = malloc(sizeof *frame_saved * pixels);
+            d->paint_rollback_pixels = d->paint_rollback ? pixels : 0;
+        }
+        if (!P.failed && !(frame_saved = d->paint_rollback)) P.failed = true;
+        else if (!P.failed) for (int row = 0; row < fh; row++)
             memcpy(frame_saved + (size_t)row * fw, c->px + (size_t)(fy + row) * c->pitch + fx, sizeof *frame_saved * (size_t)fw);
     }
     int from;
@@ -2388,7 +2481,6 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     if (P.failed && frame_saved)
         for (int row = 0; row < fh; row++) memcpy(c->px + (size_t)(fy + row) * c->pitch + fx,
             frame_saved + (size_t)row * fw, sizeof *frame_saved * (size_t)fw);
-    free(frame_saved);
     if (P.failed && !d->paint_effect_failure_reported) {
         d->paint_effect_failure_reported = true;
         web_js_console(d, 1, "Native filter/opacity composition stopped; no unfiltered replacement was drawn.");
@@ -2419,6 +2511,10 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
 }
 
+void web_paint_free(web_doc *d) {
+    if(!d)return;
+    free(d->paint_rollback);d->paint_rollback=NULL;d->paint_rollback_pixels=0;
+}
 void web_hit_index_free(web_doc *d) {
     if(!d||!d->hit_index)return;
     free(d->hit_index->items);free(d->hit_index->branches);free(d->hit_index->regions);free(d->hit_index);d->hit_index=NULL;

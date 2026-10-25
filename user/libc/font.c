@@ -213,17 +213,99 @@ static font_t *open_bundled_stream(const char *name) {
     return f;
 }
 
-/* 絵文字の最終候補。開くのは絵文字に出会ってからだけ。 */
-static font_t *emoji_face(void) {
-    static font_t *cache;
-    static bool tried;
-    if (!tried) {
-        if(font_probe_depth){font_probe_failed=true;return NULL;}
-        tried = true;
-        cache = open_bundled_stream("NotoColorEmoji-Regular.ttf");
-    }
-    return cache;
+/* 欠字を補う同梱の面。字を探す道は一つで数十 MB の面をいくつも通るので、
+   面はまず cmap だけで知り、その字を持つときに初めてファイル全体を読む。
+   cmap を読めない・検査に通らない面は、従来どおり開いてから字を尋ねる。 */
+struct bundled_face {
+    const char *name;
+    bool stream;            /* カラーの面：FreeType がファイルから表を読む */
+    uint8_t fallback;       /* 本文の主な面として使うときの欠字の補い方 */
+    bool merged_metrics;
+    bool probed, opened;
+    unsigned char *cmap;    /* 面を開くまでの cmap 表（NULL＝分からない） */
+    size_t subtable;        /* cmap の中で使う Unicode の小表の位置 */
+    font_t *face;
+};
+
+static bool read_at(FILE *fp, long at, void *buffer, size_t n) {
+    return !fseek(fp, at, SEEK_SET) && fread(buffer, 1, n, fp) == n;
 }
+
+/* 表の目録・maxp の字形数（cmap の検査に要る）・cmap だけを読む。 */
+static unsigned char *read_cmap(FILE *fp, size_t *subtable) {
+    unsigned char head[12], maxp[6];
+    long size = fseek(fp, 0, SEEK_END) ? -1 : ftell(fp);
+    if (size <= 0 || !read_at(fp, 0, head, sizeof head) ||
+        (sf_u32(head) != 0x00010000u && sf_u32(head) != 0x4f54544fu)) return NULL;
+    struct sf_span file = {NULL, (size_t)size}; /* 範囲の検査だけに使う */
+    unsigned count = sf_u16(head + 4);
+    size_t directory = 12 + (size_t)count * 16;
+    unsigned char *records = sf_has(file, 0, directory) ? malloc(directory) : NULL;
+    uint32_t cmap_at, cmap_n, maxp_at, maxp_n;
+    bool found = records && read_at(fp, 0, records, directory) &&
+                 sf_record(records, count, "cmap", &cmap_at, &cmap_n) &&
+                 sf_record(records, count, "maxp", &maxp_at, &maxp_n);
+    free(records);
+    if (!found || !cmap_n || !sf_has(file, cmap_at, cmap_n) || maxp_n < sizeof maxp ||
+        !sf_has(file, maxp_at, sizeof maxp) || !read_at(fp, maxp_at, maxp, sizeof maxp)) return NULL;
+    unsigned char *cmap = malloc(cmap_n);
+    const unsigned char *chosen;
+    if (cmap && read_at(fp, cmap_at, cmap, cmap_n) &&
+        sf_cmap((struct sf_span){cmap, cmap_n}, sf_u16(maxp + 4), &chosen)) {
+        *subtable = (size_t)(chosen - cmap);
+        return cmap;
+    }
+    free(cmap);
+    return NULL;
+}
+
+static font_t *bundled_face_open(struct bundled_face *b) {
+    if (!b->opened) {
+        if(font_probe_depth){font_probe_failed=true;return NULL;}
+        b->opened = true;
+        b->face = b->stream ? open_bundled_stream(b->name) : open_bundled(b->name);
+        if (b->face) {
+            b->face->fallback = b->fallback;
+            b->face->merged_metrics = b->merged_metrics;
+        }
+        free(b->cmap);
+        b->cmap = NULL;
+    }
+    return b->face;
+}
+
+/* 面がその字を持ちうるか。開くまでは cmap だけで答える。 */
+static bool bundled_face_maps(struct bundled_face *b, uint32_t cp) {
+    if (b->opened) return b->face != NULL;
+    if (!b->probed) {
+        if(font_probe_depth){font_probe_failed=true;return false;}
+        b->probed = true;
+        char path[1024];
+        FILE *fp = bundled_path(b->name, path, sizeof path) ? fopen(path, "rb") : NULL;
+        if (fp) {
+            b->cmap = read_cmap(fp, &b->subtable);
+            fclose(fp);
+        }
+    }
+    return !b->cmap || sf_cmap_glyph(b->cmap + b->subtable, cp);
+}
+
+/* 指定された実験的統合版の Regular 四ファイルだけ。style ごとの再読込や
+   合成 italic はしない（bold は noto_bold が同じ face から合成する）。Historical も必要な字形に出会うまで開かない。 */
+static struct bundled_face noto[4] = {
+    {"NotoSansLiving-Regular.ttf", .fallback = FALLBACK_SANS, .merged_metrics = true},
+    {"NotoSansHistorical-Regular.ttf", .fallback = FALLBACK_SANS, .merged_metrics = true},
+    {"NotoSerifLiving-Regular.ttf", .fallback = FALLBACK_SERIF, .merged_metrics = true},
+    {"NotoSerifHistorical-Regular.ttf", .fallback = FALLBACK_SERIF, .merged_metrics = true},
+};
+static struct bundled_face shared_cjk[3] = {
+    {"MapleMono-NF-CN-Regular.ttf"}, {"PlangothicP2-Regular.ttf"}, {"PlangothicP1-Regular.ttf"},
+};
+/* 本文用の日本語 Regular 二つだけ。UI/mono はこの候補を呼ばない。
+   CFF OTF を元の bytes のまま一度だけ読み、各 style で共有する。 */
+static struct bundled_face family_cjk[2] = {{"NotoSansCJKjp-Regular.otf"}, {"NotoSerifCJKjp-Regular.otf"}};
+/* 絵文字の最終候補。開くのは絵文字に出会ってからだけ。 */
+static struct bundled_face emoji = {"NotoColorEmoji-Regular.ttf", .stream = true};
 
 font_t *font_ui(int style) {
     static font_t *cache[4];
@@ -241,26 +323,7 @@ font_t *font_ui(int style) {
     return cache[style];
 }
 
-/* 指定された実験的統合版の Regular 四ファイルだけ。style ごとの再読込や
-   合成 italic はしない（bold は noto_bold が同じ face から合成する）。Historical も必要な字形に出会うまで開かない。 */
-static font_t *noto_face(int which) {
-    static font_t *cache[4];
-    static bool tried[4];
-    static const char *names[4] = {
-        "NotoSansLiving-Regular.ttf", "NotoSansHistorical-Regular.ttf",
-        "NotoSerifLiving-Regular.ttf", "NotoSerifHistorical-Regular.ttf"
-    };
-    if (!tried[which]) {
-        if(font_probe_depth){font_probe_failed=true;return NULL;}
-        tried[which] = true;
-        cache[which] = open_bundled(names[which]);
-        if (cache[which]) {
-            cache[which]->fallback = which < 2 ? FALLBACK_SANS : FALLBACK_SERIF;
-            cache[which]->merged_metrics = true;
-        }
-    }
-    return cache[which];
-}
+static font_t *noto_face(int which) { return bundled_face_open(&noto[which]); }
 
 /* The bundled families have one Regular file each. Bold is the same outlines
    made heavier by a 24th of an em (strokes and advances), as a face of its
@@ -300,26 +363,9 @@ font_t *font_family(int family, int style) {
 
 static int glyph_of(font_t *f, uint32_t cp) {
     if(f->outline)return (int)FT_Get_Char_Index(f->outline,cp);
-    if(f->web_face) {
-        /* Use the validated mapping. In format 4 idDelta also applies to a
-         * nonzero glyphIdArray entry (the bundled stb path omits that case). */
-        const unsigned char *p=f->data+f->info.index_map;unsigned format=sf_u16(p);
-        if(format==0)return cp<256?p[6+cp]:0;
-        if(format==6){unsigned first=sf_u16(p+6),n=sf_u16(p+8);return cp>=first && cp-first<n?sf_u16(p+10+2*(cp-first)):0;}
-        if(format==4) {
-            if(cp>65535)return 0;unsigned n=sf_u16(p+6)/2,lo=0,hi=n;
-            while(lo<hi){unsigned mid=lo+(hi-lo)/2;if(cp>sf_u16(p+14+2*mid))lo=mid+1;else hi=mid;}
-            if(lo==n)return 0;unsigned start=sf_u16(p+16+2*n+2*lo);if(cp<start)return 0;
-            unsigned offset=16+6*n+2*lo,range=sf_u16(p+offset);int delta=sf_i16(p+16+4*n+2*lo);
-            if(!range)return (uint16_t)(cp+delta);
-            unsigned g=sf_u16(p+offset+range+2*(cp-start));return g?(uint16_t)(g+delta):0;
-        }
-        unsigned lo=0,hi=sf_u32(p+12);
-        while(lo<hi){unsigned mid=lo+(hi-lo)/2;const unsigned char *r=p+16+(size_t)mid*12;
-            unsigned first=sf_u32(r),last=sf_u32(r+4);if(cp<first)hi=mid;else if(cp>last)lo=mid+1;
-            else return (int)(sf_u32(r+8)+(format==12?cp-first:0));}
-        return 0;
-    }
+    /* Use the validated mapping (the bundled stb path omits format 4's idDelta
+     * on a nonzero glyphIdArray entry). */
+    if(f->web_face)return (int)sf_cmap_glyph(f->data+f->info.index_map,cp);
     if (cp < 0x250) {
         if(font_probe_depth && f->lo_glyph[cp]==0xFFFF){font_probe_failed=true;return 0;}
         if (f->lo_glyph[cp] == 0xFFFF) f->lo_glyph[cp] = (uint16_t)stbtt_FindGlyphIndex(&f->info, (int)cp);
@@ -328,40 +374,15 @@ static int glyph_of(font_t *f, uint32_t cp) {
     return stbtt_FindGlyphIndex(&f->info, (int)cp);
 }
 
-static font_t *shared_cjk(int which) {
-    static font_t *cache[3];
-    static bool tried[3];
-    static const char *names[3] = {
-        "MapleMono-NF-CN-Regular.ttf", "PlangothicP2-Regular.ttf", "PlangothicP1-Regular.ttf"
-    };
-    if (!tried[which]) {
-        if(font_probe_depth){font_probe_failed=true;return NULL;}
-        tried[which] = true;
-        cache[which] = open_bundled(names[which]);
-    }
-    return cache[which];
-}
-
-/* 本文用の日本語 Regular 二つだけ。UI/mono はこの候補を呼ばない。
-   CFF OTF を元の bytes のまま一度だけ読み、各 style で共有する。 */
-static font_t *family_cjk(bool serif) {
-    static font_t *cache[2];
-    static bool tried[2];
-    static const char *names[2] = {"NotoSansCJKjp-Regular.otf", "NotoSerifCJKjp-Regular.otf"};
-    int which = serif ? 1 : 0;
-    if (!tried[which]) {
-        if(font_probe_depth){font_probe_failed=true;return NULL;}
-        tried[which] = true;
-        cache[which] = open_bundled(names[which]);
-    }
-    return cache[which];
-}
-
 static font_t *try_glyph(font_t *f, uint32_t cp, int *glyph) {
     int g = f ? glyph_of(f, cp) : 0;
     if (!g) return NULL;
     *glyph = g;
     return f;
+}
+
+static font_t *try_bundled(struct bundled_face *b, uint32_t cp, int *glyph) {
+    return bundled_face_maps(b, cp) ? try_glyph(bundled_face_open(b), cp, glyph) : NULL;
 }
 
 /* 仮名・漢字・ハングルの代表的ブロックでは CJK 候補を先に試す。
@@ -389,23 +410,23 @@ static font_t *fallback_face(font_t *f, uint32_t cp, int *glyph) {
         font_t *face;
         /* Emoji_Presentation の主な面は絵文字書体を先に、他は最後の候補にする。 */
         bool emoji_first = cp >= 0x1f000 && cp <= 0x1faff;
-        if (emoji_first && (face = try_glyph(emoji_face(), cp, glyph))) return face;
+        if (emoji_first && (face = try_bundled(&emoji, cp, glyph))) return face;
         bool cjk_first = f->fallback == FALLBACK_UI || cjk_codepoint(cp);
         if (cjk_first) {
             if (f->fallback != FALLBACK_UI &&
-                (face = try_glyph(family_cjk(f->fallback == FALLBACK_SERIF), cp, glyph))) return face;
+                (face = try_bundled(&family_cjk[f->fallback == FALLBACK_SERIF], cp, glyph))) return face;
             for (int i = 0; i < 3; i++)
-                if ((face = try_glyph(shared_cjk(i), cp, glyph))) return face;
+                if ((face = try_bundled(&shared_cjk[i], cp, glyph))) return face;
         }
         int first = f->fallback == FALLBACK_SERIF ? 2 : 0;
         for (int i = 0; i < 4; i++) {
-            font_t *candidate = noto_face((first + i) & 3);
-            if (candidate != f && (face = try_glyph(candidate, cp, glyph))) return face;
+            struct bundled_face *candidate = &noto[(first + i) & 3];
+            if (candidate->face != f && (face = try_bundled(candidate, cp, glyph))) return face;
         }
         if (!cjk_first)
             for (int i = 0; i < 3; i++)
-                if ((face = try_glyph(shared_cjk(i), cp, glyph))) return face;
-        if (!emoji_first && (face = try_glyph(emoji_face(), cp, glyph))) return face;
+                if ((face = try_bundled(&shared_cjk[i], cp, glyph))) return face;
+        if (!emoji_first && (face = try_bundled(&emoji, cp, glyph))) return face;
     }
     return f;
 }
@@ -491,11 +512,8 @@ static bool default_ignorable(uint32_t cp) {
 /* VS16 asks for the emoji presentation of the preceding character (UTS #51);
    measurement and paint make the same choice from the same lookahead. */
 static font_t *present_face(font_t *f, uint32_t cp, uint32_t next, int *glyph) {
-    if (next == 0xfe0f) {
-        font_t *e = emoji_face();
-        int g = e ? glyph_of(e, cp) : 0;
-        if (g) { *glyph = g; return e; }
-    }
+    font_t *e;
+    if (next == 0xfe0f && (e = try_bundled(&emoji, cp, glyph))) return e;
     return glyph_face(f, cp, glyph);
 }
 

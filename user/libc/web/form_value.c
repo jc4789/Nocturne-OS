@@ -569,7 +569,8 @@ void web_option_set_selected(web_doc *d, node_t *option, bool selected, bool dir
     if (select && selected && !node_attr(select, "multiple"))
         for (node_t *o = web_select_next_option(select, NULL); o; o = web_select_next_option(select, o)) if (o != option) o->checked = false;
     if (select) web_select_sync(d, select, true);
-    d->dirty = d->need_style = true;
+    css_mark_form_state(d, select ? select : option);
+    d->dirty = true;
 }
 void web_select_set_index(web_doc *d, node_t *select, int index) {
     if (!html_tag(select, T_select)) return;
@@ -581,7 +582,8 @@ void web_select_set_index(web_doc *d, node_t *select, int index) {
     }
     select->selected = index >= 0 && index < i ? index : -1;
     select->selected_set = true;
-    d->dirty = d->need_style = true;
+    css_mark_form_state(d, select);
+    d->dirty = true;
 }
 void web_select_attribute_changed(web_doc *d, node_t *node, const char *name, bool present) {
     if (html_tag(node, T_select) && (!strcmp(name, "multiple") || !strcmp(name, "size"))) {

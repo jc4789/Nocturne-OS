@@ -202,6 +202,7 @@ static bool sheet_instance_imports(web_doc *d, struct sheet_walk *f, sheet_t *as
     arena_t *arena=d->live?&d->cssmem:&d->mem;
     f->sheet=css_sheet_instance(arena,ast,order,scope);
     if(media && *media)css_sheet_media(f->sheet,ar_strdup(arena,media));
+    if(!css_sheet_import_urls(ast))return true; /* no @import: rescans re-instance every sheet, so skip its rule walk */
     for(struct css_rule_info *r=css_sheet_rules(ast,NULL);r;r=r->next)if(r->import_url) {
         struct css_import *im=calloc(1,sizeof *im);
         if(!im)return false;
@@ -424,6 +425,16 @@ static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int
 }
 static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1,true); }
 
+/* Element creation links each <img>/<input> into its allocation's image list,
+ * a subset of owned_nodes: the iterator below runs on every script tick and
+ * must not visit every node of a large document to find a few images. */
+void doc_image_node_owned(node_t *n) {
+    if (n->type != N_ELEM || (n->tag != T_img && n->tag != T_input)) return;
+    web_doc *allocation = n->allocation_doc;
+    n->owned_image_next = allocation->owned_images;
+    allocation->owned_images = n;
+}
+
 /* Allocation lists keep their lifetime owner even after DOM adoption. The
  * family contains at most 64 auxiliary documents (doc_inert's existing cap).
  * Resource users must enumerate logical owners, not only d's own arena.
@@ -432,13 +443,12 @@ node_t *doc_image_node_next(web_doc *d, node_t *previous) {
     if (!d || d->inert) return NULL;
     web_doc *family = d->dom_family ? d->dom_family : d;
     web_doc *allocation = previous ? previous->allocation_doc : family;
-    node_t *n = previous ? previous->owned_next : allocation->owned_nodes;
+    node_t *n = previous ? previous->owned_image_next : allocation->owned_images;
     while (allocation) {
-        for (; n; n = n->owned_next)
-            if (n->owner == d && n->type == N_ELEM && !n->foreign &&
-                (n->tag == T_img || n->tag == T_input)) return n;
+        for (; n; n = n->owned_image_next)
+            if (n->owner == d && !n->foreign) return n;
         allocation = allocation == family ? family->dom_docs : allocation->dom_next;
-        n = allocation ? allocation->owned_nodes : NULL;
+        n = allocation ? allocation->owned_images : NULL;
     }
     return NULL;
 }
@@ -1295,6 +1305,7 @@ void web_free(web_doc *d) {
     /* Adopted DOM nodes may be allocation-owned by a helper document. Retire
        all published box/scope borrows before freeing that family of owners. */
     boxes_discard(d);
+    web_paint_free(d);
     layout_cache_free(d);
     css_styles_release(d);
     css_styling_free(&d->sty);
@@ -1560,6 +1571,7 @@ int web_layout(web_doc *d, int width, int height) {
     /* debug_js only: why a slow layout ran (cascade scope, box path, passes). */
     uint64_t slow_start=d->profile_enabled?uptime_ms():0,slow_cascade=0,slow_boxes=0;
     unsigned slow_full=0,slow_cascades=0,slow_rebuilds=0,slow_locals=0,slow_restyles=0;
+    struct web_profile slow_profile=d->profile;
 reflow:
     if (d->need_style || d->styled_w != width || d->styled_h != height || !d->root_box) {
         uint64_t phase=d->profile_enabled?uptime_ms():0;
@@ -1651,9 +1663,13 @@ reflow:
     d->layout_revision++;
 geometry_committed:
     if(d->profile_enabled && uptime_ms()-slow_start>=250){
-        char line[320];uint64_t total=uptime_ms()-slow_start;
-        snprintf(line,sizeof line,"Slow layout: %lu ms (cascade %lu ms in %u passes, full %u; boxes %lu ms: restyle %u, local %u, rebuild %u; geometry %lu ms; container passes %u)",
-            (unsigned long)total,(unsigned long)slow_cascade,slow_cascades,slow_full,(unsigned long)slow_boxes,
+        char line[400];uint64_t total=uptime_ms()-slow_start;
+        const struct web_profile *p=&d->profile;
+        snprintf(line,sizeof line,"Slow layout: %lu ms (cascade %lu ms in %u passes, full %u: %lu elements, %lu rule candidates, %lu filtered; boxes %lu ms: restyle %u, local %u, rebuild %u; geometry %lu ms; container passes %u)",
+            (unsigned long)total,(unsigned long)slow_cascade,slow_cascades,slow_full,
+            (unsigned long)(p->style_visits-slow_profile.style_visits),
+            (unsigned long)(p->style_rule_checks-slow_profile.style_rule_checks),
+            (unsigned long)(p->style_rule_filtered-slow_profile.style_rule_filtered),(unsigned long)slow_boxes,
             slow_restyles,slow_locals,slow_rebuilds,(unsigned long)(total-slow_cascade-slow_boxes),container_pass);
         web_js_console(d,1,line);
     }
@@ -2155,9 +2171,10 @@ int web_anchor_y(web_doc *d, const char *fragment) {
 
 static void hover_target_set(web_doc *d,node_t *target) {
     if(d->hover_target==target)return;
+    node_t *old=d->hover_target;
     d->hover_target=target;
     if(d->live){
-        d->dirty=d->need_style=true;
+        css_mark_state_moved(d,old,target);d->dirty=true;
         for(web_doc *p=d->frame_parent;p && p->live;p=p->frame_parent)p->dirty=true;
     }
 }
@@ -2195,9 +2212,10 @@ void doc_hover_update(web_doc *d,node_t *target) {
 
 static void active_target_set(web_doc *d,node_t *target) {
     if(d->active_target==target)return;
+    node_t *old=d->active_target;
     d->active_target=target;
     if(d->live){
-        d->dirty=d->need_style=true;
+        css_mark_state_moved(d,old,target);d->dirty=true;
         for(web_doc *p=d->frame_parent;p && p->live;p=p->frame_parent)p->dirty=true;
     }
 }
@@ -2483,10 +2501,12 @@ void web_focus(web_doc *d, web_node *n) {
         n->selection_start = n->selection_end = doc_utf16_length(web_input_edit_text(n));
         n->selection_direction = 0; n->selection_set = true;
     }
+    node_t *old = d->focus;
     d->focus = n;
     d->caret = 0;
     if (n) doc_control_caret(d, n);
-    d->dirty = d->need_style = true;
+    css_mark_state_moved(d, old, n);
+    d->dirty = true;
 }
 
 web_node *web_focused(web_doc *d) {
@@ -2735,7 +2755,11 @@ bool doc_form_reset(web_doc *d, node_t *form) {
 }
 
 static void uncheck_radios(web_doc *d, node_t *scope, node_t *keep) {
-    if (scope != keep && web_radio_same_group(d, scope, keep)) { doc_control_init(d, scope); scope->checked = false; }
+    if (scope != keep && web_radio_same_group(d, scope, keep)) {
+        doc_control_init(d, scope);
+        if (scope->checked) css_mark_form_state(d, scope);
+        scope->checked = false;
+    }
     for (node_t *c = scope->first; c; c = c->next) uncheck_radios(d, c, keep);
 }
 
@@ -2751,7 +2775,8 @@ void doc_control_checked(web_doc *d, node_t *n, bool checked) {
         }
     }
     n->checked = checked;
-    d->dirty = d->need_style = true;
+    css_mark_form_state(d, n);
+    d->dirty = true;
 }
 
 void web_toggle(web_doc *d, web_node *n) {

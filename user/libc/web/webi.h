@@ -230,6 +230,7 @@ typedef struct node {
     struct web_canvas *canvas; /* independent bounded bitmap; allocation_doc owns it */
     bool image_initialized, image_invalidated, image_has_source;
     struct node *owned_next; /* document-owned allocation list, including detached nodes */
+    struct node *owned_image_next; /* the same allocation's <img>/<input> elements (doc_image_node_next) */
     bool control_ready, script_started;
     bool script_parse_eligible; /* fragment script closed before EOF; explicit runScripts only */
     const char *script_text_snapshot; /* admitted source, allocation_doc arena; never a DOM property */
@@ -532,6 +533,7 @@ sheet_t *css_sheet_instance(arena_t *a, const sheet_t *source, double order, nod
 void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_rule_info *owner);
 void css_sheet_media(sheet_t *sheet, const char *media);
 struct css_rule_info *css_sheet_rules(sheet_t *sheet, uint32_t *length);
+uint32_t css_sheet_import_urls(const sheet_t *sheet); /* how many of its rules are @import with a URL */
 bool css_sheet_single_rule(sheet_t *sheet, const char *source, size_t length);
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
@@ -542,6 +544,10 @@ bool css_containers_update(web_doc *d); /* supervisor, after layout; changed que
 bool css_container_names_valid(const char *s, size_t n);
 void css_mark_dirty(web_doc *d, node_t *n);
 void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool inserted);
+/* hover, active or focus moved from one element of d to another (either may be NULL) */
+void css_mark_state_moved(web_doc *d, node_t *from, node_t *to);
+/* a control's value, checkedness or selection changed */
+void css_mark_form_state(web_doc *d, node_t *control);
 void css_node_style_free(node_t *n);
 void css_style_doc_free(web_doc *d);
 void css_node_style_unpublish(node_t *n);
@@ -798,6 +804,7 @@ bool box_viewport_fixed(const box_t *b); /* actual layout CB, not merely positio
 void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]); /* x/y/w/h of padding CB in its content coordinates */
 void web_paint_debug_node_free(node_t *node);
 void web_hit_index_free(web_doc *d);
+void web_paint_free(web_doc *d); /* paint-owned buffers kept between paints */
 void doc_paint_damage(web_doc *d, node_t *node);
 void doc_paint_full(web_doc *d); /* unclassified visual change, including frame composites */
 bool box_element_scrollable(const box_t *b);
@@ -859,6 +866,8 @@ struct web_profile {
     uint64_t script_scans, script_visits, script_ms, native_calls, native_ms, native_samples;
     uint64_t metadata_syncs, metadata_visits, metadata_ms;
     uint64_t style_visits, style_rule_checks, style_index_entries, style_parallel_nodes;
+    uint64_t style_rule_filtered; /* candidates rejected by the ancestor filter */
+    uint64_t style_rule_bucket[4]; /* candidates by index bucket: id, class, tag, universal */
 };
 struct web_doc {
     uint64_t paint_bounds_generation;
@@ -912,6 +921,7 @@ struct web_doc {
     struct layout_text_cache *layout_text_cache; /* owned, generation-keyed measurements */
     arena_t cssmem; /* authored sheets: replaced on a DOM stylesheet mutation */
     node_t *owned_nodes;
+    node_t *owned_images; /* the <img>/<input> elements of owned_nodes, linked by owned_image_next */
     node_t *parser_form_nodes;
     size_t control_bytes;
     size_t canvas_bytes;
@@ -922,6 +932,8 @@ struct web_doc {
     bool metadata_valid;
     uint64_t layout_revision;
     struct web_hit_index *hit_index; /* paint-order spatial index, no DOM ownership */
+    uint32_t *paint_rollback; /* an alpha-group paint's copy of the committed pixels, kept for the next paint */
+    size_t paint_rollback_pixels;
     uint64_t paint_order_layout;
     uint64_t paint_order_visual; /* fractional scroll/translation invalidates shadow mask alignment */
     bool paint_shadow_crop;
@@ -1160,6 +1172,7 @@ int64_t web_marquee_deadline(web_doc *d, uint64_t now);
 bool web_marquee_box(const box_t *box);
 void doc_sync_tree(web_doc *d);
 node_t *doc_image_node_next(web_doc *d, node_t *previous);
+void doc_image_node_owned(node_t *n); /* at element creation, once its tag is known */
 void doc_image_sync(web_doc *d, node_t *n);
 struct cached_css *doc_css_request_next(web_doc *d, size_t *cursor);
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n);

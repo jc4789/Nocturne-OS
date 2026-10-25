@@ -34,6 +34,9 @@ struct task {
     struct task *process;     /* shared VM / handles owner */
     uint64_t user_stack, user_stack_size;
     uint64_t wait_phys, wait_seq; /* address wait: physical key, FIFO order */
+    uint8_t address_park;     /* APで寝るaddress待ちの段階（sched.cのPARK_*、address_lockの下） */
+    bool address_woken;       /* 寝たaddress待ちが起こされた：再開でsyscallを0で終える */
+    struct task *park_next;   /* APで寝るaddress待ちの一覧（到着順） */
     unsigned trap_cpu;
     uint64_t tls_base;
     uint64_t clock_page;
@@ -69,6 +72,8 @@ struct task {
     struct kei_task kei;      /* 継の会計。APのキューにいる間はそのキューの排他下 */
     bool kei_tracked;
     bool bsp_borrow;          /* APのキューからBSPが借りてring3を走らせている */
+    uint64_t prof_stamp[3];   /* prof：BSPへ回した時刻・BSPが受けた時刻・APへ渡した時刻（TSC） */
+    uint32_t prof_number;     /* prof：回した syscall の番号 */
 };
 
 static inline struct task *sched_current(void) {
@@ -105,7 +110,7 @@ NORETURN void sched_ap_loop(void);
 void sched_ap_interrupt(struct regs *r);
 void sched_quiesce_space(uint64_t pml4); /* 0=shared kernel変更、他は該当user space */
 bool sched_runner_idle(unsigned cpu);    /* BSP: そのAPにuser taskが無い（kernel jobに使える） */
-struct sched_stats { uint64_t handoffs, local_switches, dispatch_retires, stop_retires, steals, balances, kicks, borrows; };
+struct sched_stats { uint64_t handoffs, local_switches, dispatch_retires, stop_retires, steals, balances, kicks, borrows, parks; };
 void sched_get_stats(struct sched_stats *out);
 /* stack_bytes 0 is THREAD_STACK_DEFAULT; others are rounded up to whole pages. */
 #define THREAD_STACK_DEFAULT (256 * 1024)
@@ -116,7 +121,6 @@ int task_thread_detach(int tid);
 /* wide: compare the 8-byte word at address (wasm memory.atomic.wait64). */
 int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms);
 int task_wake_address(volatile uint32_t *address, unsigned count);
-bool address_ap_syscall(struct regs *r); /* AP: waiterのいないwake、値不一致のwaitをその場で完了 */
 /* Asynchronous address waiters. A watch joins the same physical-address FIFO
  * as blocked tasks; a notify that selects it moves its token to the queue's
  * pollable ready list. Removing reports 1 while still waiting, 2 after it was

@@ -67,10 +67,15 @@ struct compound {
     bool universal; /* share the existing padding before the pointer */
     struct compound *left;
 };
+/* Up to four ids, classes or type names that some ancestor of the subject
+   must carry (from compounds joined to it through a descendant or child
+   combinator), hashed by ancestor_feature_hash; 0 ends the list. */
+#define SELECTOR_ANCESTOR_HASHES 4
 struct selector {
     struct compound *right;
     uint32_t spec;
     uint8_t pseudo;
+    uint32_t ancestor_hashes[SELECTOR_ANCESTOR_HASHES];
 };
 struct sellist {
     struct selector **v;
@@ -237,6 +242,7 @@ struct sheet {
     const char *owner_media;
     struct css_rule_info *cssom_first, *cssom_last;
     uint32_t cssom_count;
+    uint32_t import_urls; /* rules above with an import_url: a rescan skips the walk when 0 */
     const char *cssom_source;
     size_t cssom_length;
     struct css_layer_event *layers_first,*layers_last;
@@ -742,6 +748,89 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
     return cp;
 }
 
+/* ---------------------------------------------------------------- the ancestor filter
+   A Bloom filter over the ids, classes and type names of an element's
+   ancestors. A selector whose ancestor compounds require a feature that is
+   absent cannot match, and is rejected without walking the ancestor chain.
+   The cascade builds it along the flat tree: a superset of every chain that
+   selector_parent() follows (a slotted element's flat ancestors include its
+   DOM parent, the host), so it never rejects a selector that can match.
+   A walk counts each element's features in on the way down and out on the
+   way up; a queued subtree job gets a bit snapshot of its ancestors, and
+   counts only what lies below its root. A saturated count stays set. */
+#define ANCESTOR_FILTER_BITS 2048
+struct ancestor_filter { uint64_t bits[ANCESTOR_FILTER_BITS / 64]; };
+struct ancestor_counts { uint8_t count[ANCESTOR_FILTER_BITS]; };
+
+static uint32_t ancestor_feature_hash(char kind, const char *name, size_t n) {
+    uint32_t h = (2166136261u ^ (unsigned char)kind) * 16777619u;
+    for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)name[i]) * 16777619u;
+    return h ? h : 1;
+}
+static uint32_t ancestor_tag_hash(uint16_t tag) {
+    char id[2] = {(char)(tag & 255), (char)(tag >> 8)};
+    return ancestor_feature_hash('=', id, 2);
+}
+static void ancestor_count(struct ancestor_counts *counts, uint32_t h, int delta) {
+    unsigned at[2] = {h & (ANCESTOR_FILTER_BITS - 1), (h >> 11) & (ANCESTOR_FILTER_BITS - 1)};
+    for (int i = 0; i < 2; i++) {
+        uint8_t *count = &counts->count[at[i]];
+        if (*count != UINT8_MAX) *count = (uint8_t)(*count + delta);
+    }
+}
+/* delta +1 before styling e's flat children, -1 after them. */
+static void ancestor_counts_apply(struct ancestor_counts *counts, const node_t *e, int delta) {
+    if (!counts || e->type != N_ELEM) return;
+    if (e->name) ancestor_count(counts, ancestor_feature_hash('<', e->name, strlen(e->name)), delta);
+    if (e->tag) ancestor_count(counts, ancestor_tag_hash(e->tag), delta);
+    if (e->id) ancestor_count(counts, ancestor_feature_hash('#', e->id, strlen(e->id)), delta);
+    for (int i = 0; i < e->nclasses; i++)
+        ancestor_count(counts, ancestor_feature_hash('.', e->classes[i], strlen(e->classes[i])), delta);
+}
+static void ancestor_snapshot(struct ancestor_filter *out, const struct ancestor_filter *base, const struct ancestor_counts *counts) {
+    if (base) *out = *base; else memset(out, 0, sizeof *out);
+    for (unsigned i = 0; counts && i < ANCESTOR_FILTER_BITS; i++)
+        if (counts->count[i]) out->bits[i / 64] |= 1ull << (i % 64);
+}
+static bool ancestor_bit(const struct ancestor_filter *base, const struct ancestor_counts *counts, unsigned at) {
+    return (base && (base->bits[at / 64] >> (at % 64) & 1)) || counts->count[at];
+}
+/* Hashes exactly what match_compound() compares: ids and classes by their
+   exact names, a type by its tag number or, for an unknown type, its name.
+   A compound left of ' ' or '>' is an ancestor of the subject (siblings share
+   ancestors); one left of '+' or '~' is a sibling and adds nothing, nor do
+   the arguments of :is()/:not()/:has(). */
+static void selector_ancestor_hashes(struct selector *sel) {
+    if (sel->pseudo == PE_SLOTTED) return; /* its left compounds match the slot's ancestors */
+    int n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (const struct compound *c = sel->right; c && c->left && n < SELECTOR_ANCESTOR_HASHES; c = c->left) {
+            if (c->comb != ' ' && c->comb != '>') continue;
+            const struct compound *a = c->left;
+            for (int i = 0; i < a->n && n < SELECTOR_ANCESTOR_HASHES; i++) {
+                const struct simple *x = &a->s[i];
+                uint32_t h = 0;
+                if (pass == 0 && (x->kind == SK_ID || x->kind == SK_CLASS))
+                    h = ancestor_feature_hash(x->kind == SK_ID ? '#' : '.', x->name, strlen(x->name));
+                else if (pass == 1 && x->kind == SK_TAG)
+                    h = x->tag ? ancestor_tag_hash(x->tag) : ancestor_feature_hash('<', x->name, strlen(x->name));
+                if (h) sel->ancestor_hashes[n++] = h;
+            }
+        }
+    }
+}
+/* The filter of a walk: its job's snapshot (or none) and its own counts. */
+struct ancestor_view { const struct ancestor_filter *base; const struct ancestor_counts *counts; };
+static bool ancestor_filter_rejects(const struct ancestor_view *v, const struct selector *sel) {
+    if (!v || !v->counts) return false;
+    for (int i = 0; i < SELECTOR_ANCESTOR_HASHES && sel->ancestor_hashes[i]; i++) {
+        uint32_t h = sel->ancestor_hashes[i];
+        if (!ancestor_bit(v->base, v->counts, h & (ANCESTOR_FILTER_BITS - 1)) ||
+            !ancestor_bit(v->base, v->counts, (h >> 11) & (ANCESTOR_FILTER_BITS - 1))) return true;
+    }
+    return false;
+}
+
 static struct selector *parse_complex(struct pctx *pc, const char *s, const char *e) {
     struct selector *sel = ar_alloc(pc->a, sizeof *sel);
     struct compound *cur = NULL;
@@ -770,6 +859,7 @@ static struct selector *parse_complex(struct pctx *pc, const char *s, const char
     }
     if (pending && pending != ' ') return NULL;
     sel->right = cur;
+    selector_ancestor_hashes(sel);
     return sel;
 }
 
@@ -2068,7 +2158,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                     if(ok)layer_event(pc,import_layer,import_condition,info);
                     char abs[2048];
                     if (ok && url_resolve(pc->base, sb_cstr(&u), abs, sizeof abs)) {
-                        if (info) info->import_url = ar_strdup(pc->a, abs);
+                        if (info) { info->import_url = ar_strdup(pc->a, abs); pc->sh->import_urls++; }
                         if (pc->imports) {
                             struct css_import *im = malloc(sizeof *im);
                             im->url = strdup(abs);
@@ -2176,6 +2266,7 @@ static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n
 
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root) { if (sheet) sheet->scope = shadow_root; }
 void css_sheet_media(sheet_t *sheet, const char *media) { if (sheet) sheet->owner_media = media; }
+uint32_t css_sheet_import_urls(const sheet_t *sheet) { return sheet ? sheet->import_urls : 0; }
 struct css_rule_info *css_sheet_rules(sheet_t *sheet, uint32_t *length) {
     if (length) *length = sheet ? sheet->cssom_count : 0;
     return sheet ? sheet->cssom_first : NULL;
@@ -3527,55 +3618,113 @@ static void add_rule_decls(const struct rule *r, uint32_t spec, uint32_t order, 
     }
 }
 
-static void collect(const struct ient *l, node_t *e, node_t *scope, struct css_binding *binding) {
-    node_t *root = doc_node_root(e, false);
+/* What collect() looks up for the element being styled, hashed once per
+   element rather than once per stylesheet binding. */
+#define ELEMENT_KEY_CLASSES 32
+struct element_keys {
+    node_t *e, *root;
+    uint32_t id_hash, name_hash;
+    int nclasses; /* hashed: the first ELEMENT_KEY_CLASSES of e->classes */
+    uint32_t class_hash[ELEMENT_KEY_CLASSES];
+    uint32_t class_repeat; /* bit i: classes[i] repeats an earlier class */
+    struct ancestor_view ancestors;
+    bool service; /* this thread runs the native checkpoints */
+};
+static void element_keys_init(struct element_keys *k, node_t *e, struct ancestor_view ancestors) {
+    k->e = e; k->root = doc_node_root(e, false); k->ancestors = ancestors;
+    k->id_hash = e->id ? hash_str(e->id) : 0;
+    k->name_hash = hash_str(e->name);
+    k->nclasses = e->nclasses < ELEMENT_KEY_CLASSES ? e->nclasses : ELEMENT_KEY_CLASSES;
+    k->class_repeat = 0;
+    for (int i = 0; i < k->nclasses; i++) {
+        k->class_hash[i] = hash_str(e->classes[i]);
+        for (int j = 0; j < i; j++)
+            if (k->class_hash[j] == k->class_hash[i] && !strcmp(e->classes[i], e->classes[j])) {
+                k->class_repeat |= 1u << i; break;
+            }
+    }
+    k->service = css_can_service();
+}
+/* false: classes[i] repeats an earlier class, whose rules are collected once. */
+static bool element_class_key(const struct element_keys *k, int i, uint32_t *hash) {
+    const node_t *e = k->e;
+    if (i < k->nclasses) { *hash = k->class_hash[i]; return !(k->class_repeat >> i & 1); }
+    for (int j = 0; j < i; j++) if (!strcmp(e->classes[i], e->classes[j])) return false;
+    *hash = hash_str(e->classes[i]); return true;
+}
+static const struct ient *ht_list(const struct htab *t, const char *key, uint32_t hash) {
+    if (!t->cap) return NULL;
+    for (const struct bucket *b = t->v[hash & (t->cap - 1)]; b; b = b->next)
+        if (!strcmp(b->key, key)) return b->list;
+    return NULL;
+}
+
+/* --debug-js counts for one element, added to the document's profile once:
+   candidates by index bucket (id, class, tag, universal) and how many of them
+   the ancestor filter rejected. Style workers share those counters. */
+enum { COLLECT_ID, COLLECT_CLASS, COLLECT_TAG, COLLECT_UNIVERSAL };
+struct collect_tally { uint64_t bucket[4], filtered; };
+
+static void collect(const struct ient *l, const struct element_keys *k, node_t *scope, int depth, struct css_binding *binding,
+                    struct collect_tally *tally, int bucket) {
+    node_t *e = k->e, *root = k->root;
+    web_doc *d = e->owner;
+    struct css_scratch *scratch = css_scratch_get();
     for (; l; l = l->next) {
-        if (css_worker() && __atomic_load_n(&e->owner->native_cancelled, __ATOMIC_ACQUIRE)) return;
-        if (css_can_service() && !web_native_checkpoint(e->owner)) return;
-        if (css_can_service()) web_avmedia_checkpoint();
-        if(e->owner->profile_enabled)__atomic_fetch_add(&e->owner->profile.style_rule_checks, 1, __ATOMIC_RELAXED);
+        if (k->service) {
+            if (!web_native_checkpoint(d)) return;
+            web_avmedia_checkpoint();
+        } else if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
+        tally->bucket[bucket]++;
         if (!l->ua) {
             if (!scope && root && root->shadow_host) continue;
             if (scope && l->sel->pseudo != PE_SLOTTED && root != scope && e != scope->shadow_host) continue;
         }
+        if (ancestor_filter_rejects(&k->ancestors, l->sel)) { tally->filtered++; continue; }
         if (!container_chain_ok(l->r->media,e,l->sel->pseudo==PE_BEFORE || l->sel->pseudo==PE_AFTER)) continue;
         /* Only cascade rule matching reads the published form snapshot. Live
            matches()/querySelector() outside this call keep their normal API. */
-        bool previous = css_scratch_get()->form_snapshot;
-        css_scratch_get()->form_snapshot = true;
+        bool previous = scratch->form_snapshot;
+        scratch->form_snapshot = true;
         bool matches = match_from(l->sel->right, e, scope);
-        css_scratch_get()->form_snapshot = previous;
+        scratch->form_snapshot = previous;
         if (matches) {
             struct cascade_layer *layer=binding_layer(binding,l->r->layer);
             add_rule_decls(l->r, l->sel->spec, l->order + binding->order, !l->ua,
-                           l->sel->pseudo == PE_SLOTTED ? PE_NONE : l->sel->pseudo, scope_depth(scope),layer);
+                           l->sel->pseudo == PE_SLOTTED ? PE_NONE : l->sel->pseudo, depth,layer);
         }
     }
 }
 
-static void collect_index(struct css_binding *binding, node_t *e, node_t *scope) {
+static void collect_index(struct css_binding *binding, const struct element_keys *k, node_t *scope) {
+    const node_t *e = k->e;
+    int depth = scope_depth(scope);
+    struct collect_tally tally = {0};
     for (; binding; binding = binding->next) {
         struct css_index *x = binding->index;
-        if (e->id) {
-            struct ient **l = ht_slot(NULL, &x->ids, e->id, false);
-            if (l) collect(*l, e, scope, binding);
-        }
+        if (e->id) collect(ht_list(&x->ids, e->id, k->id_hash), k, scope, depth, binding, &tally, COLLECT_ID);
         for (int i = 0; i < e->nclasses; i++) {
-            bool duplicate = false;
-            for (int j = 0; j < i; j++) if (!strcmp(e->classes[i], e->classes[j])) duplicate = true;
-            if (duplicate) continue;
-            struct ient **l = ht_slot(NULL, &x->classes, e->classes[i], false);
-            if (l) collect(*l, e, scope, binding);
+            uint32_t hash;
+            if (element_class_key(k, i, &hash))
+                collect(ht_list(&x->classes, e->classes[i], hash), k, scope, depth, binding, &tally, COLLECT_CLASS);
         }
-        struct ient **l = ht_slot(NULL, &x->tags, e->name, false);
-        if (l) collect(*l, e, scope, binding);
-        collect(x->univ, e, scope, binding);
+        collect(ht_list(&x->tags, e->name, k->name_hash), k, scope, depth, binding, &tally, COLLECT_TAG);
+        collect(x->univ, k, scope, depth, binding, &tally, COLLECT_UNIVERSAL);
     }
+    web_doc *d = e->owner;
+    if (!d->profile_enabled) return;
+    uint64_t checks = 0;
+    for (int i = 0; i < 4; i++) {
+        checks += tally.bucket[i];
+        if (tally.bucket[i]) __atomic_fetch_add(&d->profile.style_rule_bucket[i], tally.bucket[i], __ATOMIC_RELAXED);
+    }
+    if (checks) __atomic_fetch_add(&d->profile.style_rule_checks, checks, __ATOMIC_RELAXED);
+    if (tally.filtered) __atomic_fetch_add(&d->profile.style_rule_filtered, tally.filtered, __ATOMIC_RELAXED);
 }
 
-static void collect_scope(node_t *root, node_t *e) {
+static void collect_scope(node_t *root, const struct element_keys *k) {
     if (root && root->style_scope)
-        collect_index(root->style_scope->first, e, root->shadow_host ? root : NULL);
+        collect_index(root->style_scope->first, k, root->shadow_host ? root : NULL);
 }
 
 static int cmp_dent(const void *a, const void *b) {
@@ -3877,6 +4026,12 @@ struct cascade {
     bool full;
     jmp_buf *trap;
     struct cascade_frontier *frontier;
+    /* The ancestor filter of the element being styled (its job's snapshot
+       plus this walk's counts), and the index of a snapshot of it in
+       frontier->filters for its queued children (SIZE_MAX: not taken yet). */
+    const struct ancestor_filter *ancestor_base;
+    struct ancestor_counts *ancestor_counts;
+    size_t ancestors_published;
 };
 
 struct css_rollback {const struct dent *from;bool origin;};
@@ -4506,6 +4661,46 @@ void css_mark_dirty(web_doc *d, node_t *n) {
     if (d->sty.ctx->siblings && parent && parent->type == N_ELEM) n = parent;
     mark_style_subject(d, n);
 }
+/* :hover, :active, :focus and :focus-within hold for a target and its flat
+   ancestors, so a moved state changes only the part of each chain the other
+   does not share: restyle the top of each part (its subtree covers the rest of
+   the chain and every descendant or sibling selector). A target outside the
+   document has no known former chain, so that move restyles the document. */
+void css_mark_state_moved(web_doc *d, node_t *from, node_t *to) {
+    if (!d) return;
+    if ((from && doc_node_root(from, true) != d->root) || (to && doc_node_root(to, true) != d->root)) {
+        d->need_style = d->style_full_dirty = true;
+        return;
+    }
+    size_t from_depth = 0, to_depth = 0;
+    for (node_t *p = from; p; p = dirty_flat_parent(p)) from_depth++;
+    for (node_t *p = to; p; p = dirty_flat_parent(p)) to_depth++;
+    node_t *a = from, *b = to, *from_top = NULL, *to_top = NULL;
+    for (; from_depth > to_depth; from_depth--) { from_top = a; a = dirty_flat_parent(a); }
+    for (; to_depth > from_depth; to_depth--) { to_top = b; b = dirty_flat_parent(b); }
+    while (a != b) {
+        from_top = a; a = dirty_flat_parent(a);
+        to_top = b; b = dirty_flat_parent(b);
+    }
+    if (from_top) css_mark_dirty(d, from_top);
+    if (to_top) css_mark_dirty(d, to_top);
+}
+/* A control's value, checkedness or selection changed. The control restyles
+   (its box shows the state); :valid/:invalid also aggregate into its form and
+   fieldsets, and a radio's validity follows its whole group. */
+void css_mark_form_state(web_doc *d, node_t *control) {
+    if (!d || !control) return;
+    css_mark_dirty(d, control);
+    if (!d->sty.ctx || !(d->sty.ctx->form_features & WEB_STYLE_FORM_VALIDITY)) return;
+    if (control->tag == T_input && !control->foreign && web_input_type(control) == WEB_INPUT_RADIO) {
+        d->style_full_dirty = true;
+        return;
+    }
+    node_t *form = web_form_owner(d, control);
+    if (form) css_mark_dirty(d, form);
+    for (node_t *p = control->parent; p; p = p->parent)
+        if (p->type == N_ELEM && !p->foreign && p->tag == T_fieldset) css_mark_dirty(d, p);
+}
 static bool child_list_contains(node_t *subtree,node_t *node) {
     for(;node;node=node->parent?node->parent:node->shadow_host)if(node==subtree)return true;
     return false;
@@ -4760,9 +4955,13 @@ static void retire_style(struct cascade *c, node_t *e) {
 }
 
 static void cascade_node(struct cascade *c, node_t *e, const style_t *parent);
-struct cascade_job { node_t *node; const style_t *parent; float rem; bool full; };
-struct cascade_frontier { struct cascade_job *v; size_t n, cap; };
-struct cascade_batch { struct cascade parent; struct cascade_job *jobs; };
+/* Siblings queued together share one copy of their ancestor filter. */
+struct cascade_job { node_t *node; const style_t *parent; float rem; bool full; size_t ancestors; };
+struct cascade_frontier {
+    struct cascade_job *v; size_t n, cap;
+    struct ancestor_filter *filters; size_t filter_count, filter_cap;
+};
+struct cascade_batch { struct cascade parent; struct cascade_job *jobs; const struct ancestor_filter *filters; };
 static void cascade_enqueue(struct cascade *c, node_t *e, const style_t *parent) {
     if (!c->full && !e->style_dirty && !e->style_children_dirty && e->style) return;
     struct cascade_frontier *f = c->frontier;
@@ -4773,7 +4972,18 @@ static void cascade_enqueue(struct cascade *c, node_t *e, const style_t *parent)
         if (!v) ar_alloc(c->a, SIZE_MAX);
         f->v = v; f->cap = capacity;
     }
-    f->v[f->n++] = (struct cascade_job){e, parent, c->rem, c->full};
+    if (c->ancestors_published == SIZE_MAX) {
+        if (f->filter_count == f->filter_cap) {
+            size_t capacity = f->filter_cap ? f->filter_cap * 2 : 8;
+            if (capacity < f->filter_cap || capacity > SIZE_MAX / sizeof *f->filters) ar_alloc(c->a, SIZE_MAX);
+            struct ancestor_filter *v = realloc(f->filters, capacity * sizeof *v);
+            if (!v) ar_alloc(c->a, SIZE_MAX);
+            f->filters = v; f->filter_cap = capacity;
+        }
+        ancestor_snapshot(&f->filters[f->filter_count], c->ancestor_base, c->ancestor_counts);
+        c->ancestors_published = f->filter_count++;
+    }
+    f->v[f->n++] = (struct cascade_job){e, parent, c->rem, c->full, c->ancestors_published};
 }
 static void cascade_worker(size_t i, void *context) {
     struct cascade_batch *batch = context;
@@ -4784,6 +4994,9 @@ static void cascade_worker(size_t i, void *context) {
     void *previous = thread_local_get(2); thread_local_set(2, &scratch);
     struct cascade c = batch->parent; c.vbuf = (sbuf){0};
     c.rem = job->rem; c.full = job->full; c.frontier = NULL;
+    struct ancestor_counts counts = {0};
+    c.ancestor_base = &batch->filters[job->ancestors]; c.ancestor_counts = &counts;
+    c.ancestors_published = SIZE_MAX;
     jmp_buf trap; c.trap = &trap;
     if (setjmp(trap)) __atomic_store_n(&c.d->native_cancelled, true, __ATOMIC_RELEASE);
     else {
@@ -4797,6 +5010,18 @@ static void cascade_worker(size_t i, void *context) {
 static void cascade_service(void *context) {
     web_doc *d = context;
     web_native_checkpoint(d); web_avmedia_checkpoint();
+}
+
+/* The rules matching e, as declarations. Not inlined: its keys stay out of
+   the frames of the recursive tree walk on the helpers' smaller stacks. */
+static __attribute__((noinline)) void cascade_collect(struct cascade *c, node_t *e) {
+    struct element_keys keys;
+    element_keys_init(&keys, e, (struct ancestor_view){c->ancestor_base, c->ancestor_counts});
+    collect_index(c->d->sty.ctx->ua, &keys, NULL);
+    collect_scope(keys.root, &keys);
+    if (e->shadow_root) collect_scope(e->shadow_root, &keys); /* :host */
+    for (node_t *slot = e->assigned_slot; slot; slot = slot->assigned_slot)
+        collect_scope(doc_node_root(slot, false), &keys); /* ::slotted */
 }
 
 static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
@@ -4817,13 +5042,8 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         __atomic_fetch_add(&d->profile.style_visits, 1, __ATOMIC_RELAXED);
         if (css_worker() && parallel_worker_index()) __atomic_fetch_add(&d->profile.style_parallel_nodes, 1, __ATOMIC_RELAXED);
     }
-    struct css_ctx *x = d->sty.ctx;
     ndents = 0;
-    collect_index(x->ua, e, NULL);
-    collect_scope(doc_node_root(e, false), e);
-    if (e->shadow_root) collect_scope(e->shadow_root, e); /* :host */
-    for (node_t *slot = e->assigned_slot; slot; slot = slot->assigned_slot)
-        collect_scope(doc_node_root(slot, false), e); /* ::slotted */
+    cascade_collect(c, e);
     if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
     /* presentational hints and the style attribute */
     struct hints h = {.n = 0, .a = c->a};
@@ -4940,6 +5160,9 @@ descend:
     c->full = redo;
     pvec children = {0};
     doc_flat_children(e, &children);
+    size_t above_published = c->ancestors_published;
+    ancestor_counts_apply(c->ancestor_counts, e, 1);
+    c->ancestors_published = SIZE_MAX;
     if (c->frontier) {
         for (int i = 0; i < children.n; i++) {
             node_t *ch = children.v[i];
@@ -4955,9 +5178,9 @@ descend:
             else ch->style = NULL;
         }
         c->frontier = NULL;
-        struct cascade_batch batch = {*c, f.v};
+        struct cascade_batch batch = {*c, f.v, f.filters};
         parallel_for_stage(PARALLEL_STYLE,f.n,cascade_worker,&batch,cascade_service,d);
-        free(f.v);
+        free(f.v); free(f.filters);
     } else {
         for (int i = 0; i < children.n && !__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE); i++) {
             node_t *ch = children.v[i];
@@ -4965,6 +5188,8 @@ descend:
             else ch->style = NULL;
         }
     }
+    ancestor_counts_apply(c->ancestor_counts, e, -1);
+    c->ancestors_published = above_published;
     pv_free(&children);
     c->full = inherited_full;
 }
@@ -5007,16 +5232,46 @@ static void cascade_frontier_run(struct cascade *c, node_t *root) {
         if (f.v[largest].node->style_subtree_work <= target) break;
         struct cascade_job job = f.v[largest]; f.v[largest] = f.v[--f.n];
         c->rem = job.rem; c->full = job.full;
+        /* A copy: enqueueing the branch's children may move f.filters. The
+           walk's counts are balanced, so they are empty between branches. */
+        struct ancestor_filter base = f.filters[job.ancestors];
+        c->ancestor_base = &base; c->ancestors_published = SIZE_MAX;
         cascade_node(c, job.node, job.parent);
     }
-    c->frontier = NULL;
-    struct cascade_batch batch = {*c, f.v};
+    c->frontier = NULL; c->ancestor_base = NULL;
+    struct cascade_batch batch = {*c, f.v, f.filters};
     if (!__atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE))
         parallel_for_stage(PARALLEL_STYLE,f.n,cascade_worker,&batch,cascade_service,c->d);
-    free(f.v);
+    free(f.v); free(f.filters);
+}
+
+/* --debug-js: cascades between web_style_report() calls (main thread only). */
+/* Why a cascade restyled the whole document, and why its rule index was rebuilt. */
+enum { FULL_BY_INDEX, FULL_BY_MARK, FULL_BY_FIRST, FULL_BY_UNMARKED };
+enum { INDEX_BY_SHEETS, INDEX_BY_ENVIRONMENT };
+static struct {
+    uint64_t cascades, full, full_by[4], ms, indexes, index_by[2], index_ms, elements, candidates, filtered, bucket[4];
+} style_profile;
+int web_style_report(char *out, size_t size) {
+    if (!style_profile.cascades) return 0;
+    int n = snprintf(out, size, "Native style profile: cascades %lu/%lu ms (full %lu: index %lu, marked %lu, first %lu, unmarked %lu), rule indexes %lu (sheets %lu, environment %lu)/%lu ms, elements %lu, rule candidates %lu (id %lu, class %lu, tag %lu, universal %lu), filtered by ancestors %lu (inclusive)",
+        (unsigned long)style_profile.cascades, (unsigned long)style_profile.ms, (unsigned long)style_profile.full,
+        (unsigned long)style_profile.full_by[FULL_BY_INDEX], (unsigned long)style_profile.full_by[FULL_BY_MARK],
+        (unsigned long)style_profile.full_by[FULL_BY_FIRST],
+        (unsigned long)style_profile.full_by[FULL_BY_UNMARKED], (unsigned long)style_profile.indexes,
+        (unsigned long)style_profile.index_by[INDEX_BY_SHEETS], (unsigned long)style_profile.index_by[INDEX_BY_ENVIRONMENT],
+        (unsigned long)style_profile.index_ms,
+        (unsigned long)style_profile.elements, (unsigned long)style_profile.candidates,
+        (unsigned long)style_profile.bucket[0], (unsigned long)style_profile.bucket[1],
+        (unsigned long)style_profile.bucket[2], (unsigned long)style_profile.bucket[3],
+        (unsigned long)style_profile.filtered);
+    memset(&style_profile, 0, sizeof style_profile);
+    return n;
 }
 
 void css_cascade(web_doc *d, int vw, int vh) {
+    uint64_t profile_start = d->profile_enabled ? uptime_ms() : 0;
+    struct web_profile profile_before = d->profile;
     /* Publish pool ownership before spawning disjoint subtree jobs. */
     if (!d->style_pool) {
         d->style_pool = calloc(1, sizeof *d->style_pool);
@@ -5042,8 +5297,12 @@ void css_cascade(web_doc *d, int vw, int vh) {
        Those changes still recompute every real selector and computed style.
        Resource/CSSOM replacement unpublishes ctx before releasing its AST;
        new sheets mark index_dirty at their publication boundary. */
+    bool marked_full = d->style_full_dirty;
+    int index_by = -1;
     if (!d->sty.ctx || d->sty.index_dirty || d->sty.index_w != vw || d->sty.index_h != vh ||
         d->sty.index_scripting != scripting || d->sty.index_quirks != d->quirks) {
+        index_by = !d->sty.ctx || d->sty.index_dirty ? INDEX_BY_SHEETS : INDEX_BY_ENVIRONMENT;
+        uint64_t index_start = d->profile_enabled ? uptime_ms() : 0;
         css_ctx_free(d->sty.ctx); d->sty.ctx = NULL;
         d->sty.ctx = build_index(d, vw, vh);
         d->sty.index_w = vw;
@@ -5052,21 +5311,31 @@ void css_cascade(web_doc *d, int vw, int vh) {
         d->sty.index_quirks = d->quirks;
         d->sty.index_dirty = false;
         d->style_full_dirty = true;
+        if (d->profile_enabled) {
+            style_profile.indexes++; style_profile.index_by[index_by]++;
+            style_profile.index_ms += uptime_ms() - index_start;
+        }
     }
+    /* Decided before the form snapshot: its lazy control initialization marks
+       those controls, which must join this cascade, not turn it partial. */
+    bool full = d->style_full_dirty || !d->style_pending_dirty || !d->html || !d->html->style;
+    int full_by = index_by >= 0 ? FULL_BY_INDEX : marked_full ? FULL_BY_MARK :
+                  !d->html || !d->html->style ? FULL_BY_FIRST : FULL_BY_UNMARKED;
     if (!web_form_style_snapshot(d, d->sty.ctx->form_features)) {
         __atomic_store_n(&d->native_cancelled, true, __ATOMIC_RELEASE);
         return;
     }
     if (!setbits) { setbits = malloc((size_t)css_prop_count()); if(!setbits)ar_alloc(&d->smem,SIZE_MAX); }
-    bool full = d->style_full_dirty || !d->style_pending_dirty || !d->html || !d->html->style;
     if(full)boxes_require_full(d);
     if(full && (d->need_boxes || !d->root_box) && d->root)
         clear_styles(d->root); /* retire styles of nodes no longer in the flat tree */
     d->style_boxes_changed = false;
     d->style_existing_boxes_changed = false;
     d->box_change_node = NULL;
+    struct ancestor_counts ancestors = {0};
     struct cascade c = {.d=d, .rem=d->html && d->html->style ? d->html->style->font_size : 16,
-        .vw=vw, .vh=vh, .a=&d->smem, .full=full, .trap=d->smem.trap};
+        .vw=vw, .vh=vh, .a=&d->smem, .full=full, .trap=d->smem.trap,
+        .ancestor_counts=&ancestors, .ancestors_published=SIZE_MAX};
     if (d->html) {
         if (full) cascade_frontier_run(&c, d->html);
         else cascade_node(&c, d->html, NULL);
@@ -5076,6 +5345,16 @@ void css_cascade(web_doc *d, int vw, int vh) {
     d->styled_w = vw;
     d->styled_h = vh;
     d->style_full_dirty = d->style_pending_dirty = false;
+    if (d->profile_enabled) {
+        style_profile.cascades++; style_profile.full += full;
+        if (full) style_profile.full_by[full_by]++;
+        style_profile.ms += uptime_ms() - profile_start;
+        style_profile.elements += d->profile.style_visits - profile_before.style_visits;
+        style_profile.candidates += d->profile.style_rule_checks - profile_before.style_rule_checks;
+        style_profile.filtered += d->profile.style_rule_filtered - profile_before.style_rule_filtered;
+        for (int i = 0; i < 4; i++)
+            style_profile.bucket[i] += d->profile.style_rule_bucket[i] - profile_before.style_rule_bucket[i];
+    }
 }
 
 /* ---------------------------------------------------------------- DevTools */

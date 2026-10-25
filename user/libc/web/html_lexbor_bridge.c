@@ -210,6 +210,7 @@ static node_t *new_native(struct html_parser *p, lxb_dom_node_t *lex, web_doc *o
         n->name = native_lower(&d->mem, name, len);
         n->raw_name = ar_strndup(&d->mem, (const char *)name, len);
         n->tag = (uint16_t)tag_lookup(n->name, len);
+        doc_image_node_owned(n);
         n->namespace_id = lex->ns == LXB_NS_SVG ? NS_SVG : lex->ns == LXB_NS_MATH ? NS_MATHML :
                           lex->ns == LXB_NS_HTML ? NS_HTML : NS_NONE;
         n->foreign = n->namespace_id != NS_HTML;

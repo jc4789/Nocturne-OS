@@ -474,6 +474,22 @@ static unsigned resource_subtree(node_t *root) {
     }
     return found;
 }
+/* The attributes doc.c scan() reads to find an authored sheet, the base URL,
+   a meta directive or an image button's image. Any other attribute of these
+   elements (class, ARIA, data-*, an inline style, a control's value) changes
+   the cascade, not the set of sheets, and must not re-parse all of them. */
+static bool resource_attribute(const node_t *n, const char *name) {
+    if (n->foreign) return false;
+    switch (n->tag) {
+    case T_base: return !strcmp(name, "href");
+    case T_link: return !strcmp(name, "href") || !strcmp(name, "rel") || !strcmp(name, "type") ||
+                        !strcmp(name, "media") || !strcmp(name, "disabled");
+    case T_style: return !strcmp(name, "type") || !strcmp(name, "media");
+    case T_meta: return !strcmp(name, "name") || !strcmp(name, "content") || !strcmp(name, "http-equiv");
+    case T_input: return !strcmp(name, "type") || !strcmp(name, "src");
+    default: return false;
+    }
+}
 static bool resource_ancestor(node_t *n) {
     for (; n; n = n->parent) if (!n->foreign && n->type == N_ELEM &&
         (n->tag == T_style || n->tag == T_title || n->tag == T_textarea || n->tag == T_select)) return true;
@@ -595,6 +611,7 @@ node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text
             n->name = lower_name;
         }
         n->raw_name = ar_strdup(&d->mem, name);
+        doc_image_node_owned(n);
     } else if (type == N_DOCTYPE) {
         n->name = ar_strdup(&d->mem, name ? name : "html");
     } else if (type == N_TEXT || type == N_COMMENT || type == N_PI) {
@@ -744,8 +761,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
         ((html_image && (!strcmp(low, "src") || !strcmp(low, "srcset") || !strcmp(low, "sizes"))) ||
          (n->tag == T_source && n->parent && !n->parent->foreign && n->parent->tag == T_picture &&
           (!strcmp(low, "srcset") || !strcmp(low, "sizes") || !strcmp(low, "media") || !strcmp(low, "type"))));
-    bool resources = n->tag == T_base || n->tag == T_link || n->tag == T_style ||
-                     (n->tag == T_img && !html_image) || n->tag == T_input || n->tag == T_meta;
+    bool resources = (n->tag == T_img && !html_image) || resource_attribute(n, low);
     /* Keep JS attribute/CE reactions in native_dom, but an identical ordinary
        attribute has no new style to cascade and needs no arena allocation. */
     if (!resources && !image_candidate && !identity && found >= 0 && value && !strcmp(n->attrs[found].value, value)) {
@@ -1406,7 +1422,8 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
     doc_control_caret(d, n);
     allocation->control_bytes = next + capacity;
     doc_dom_budget(d);
-    d->dirty = d->need_style = true;
+    css_mark_form_state(d, n);
+    d->dirty = true;
     if(n->box)layout_invalidate(n->box);
     return true;
 }

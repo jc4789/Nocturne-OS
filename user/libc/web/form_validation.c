@@ -507,7 +507,8 @@ bool web_control_set_custom_validity(web_doc *d, node_t *n, const char *text, si
         const char *copy = ar_strndup(&allocation->mem, text, length);
         allocation->mem.trap = old; n->custom_validity = copy; n->custom_validity_length = length;
     }
-    d->dirty = d->need_style = true; return true;
+    css_mark_form_state(d, n);
+    d->dirty = true; return true;
 }
 const char *web_control_validation_message(web_doc *d, node_t *n) {
     if (!web_control_will_validate(n)) return "";

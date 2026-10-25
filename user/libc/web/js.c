@@ -2385,7 +2385,8 @@ static JSValue animation_dom(struct web_js_state *s, node_t *n, bool read, int a
         if (changed == -1) result = oom(ctx);
         else if (changed) {
             web_doc *d = n->owner ? n->owner : s->doc;
-            d->need_style = d->dirty = true;
+            css_mark_dirty(d, n);
+            d->dirty = true;
         }
     }
     sb_free(&text); return result;

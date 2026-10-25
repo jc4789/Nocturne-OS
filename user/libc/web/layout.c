@@ -4413,9 +4413,10 @@ static void layout_profile_report(web_doc *d, box_t *root, uint64_t cycles[5], u
     uint64_t total = cycles[0] + cycles[1] + cycles[2] + cycles[3] + cycles[4];
     if (!total) return;
     char line[600], name[200];
-    snprintf(line, sizeof line, "Layout phases %llu ms: intrinsic %llu%%, flow %llu%%, abspos %llu%%, relative %llu%%, scroll %llu%%",
+    snprintf(line, sizeof line, "Layout phases %llu ms: intrinsic %llu%%, flow %llu%%, abspos %llu%% (%d boxes), relative %llu%%, scroll %llu%%",
         (unsigned long long)elapsed_ms, (unsigned long long)(cycles[0] * 100 / total), (unsigned long long)(cycles[1] * 100 / total),
-        (unsigned long long)(cycles[2] * 100 / total), (unsigned long long)(cycles[3] * 100 / total), (unsigned long long)(cycles[4] * 100 / total));
+        (unsigned long long)(cycles[2] * 100 / total), d->abs_boxes.n, (unsigned long long)(cycles[3] * 100 / total),
+        (unsigned long long)(cycles[4] * 100 / total));
     web_js_console(d, 1, line);
     /* Follow the child holding most of the parent's inclusive cost; print where
        the cost stops concentrating and the boxes laid out most often. */
@@ -4439,7 +4440,8 @@ static void layout_profile_report(web_doc *d, box_t *root, uint64_t cycles[5], u
             const box_t *a = d->abs_boxes.v[i];
             if (a->profile_cycles && (!top || a->profile_cycles > top->profile_cycles)) top = a;
         }
-        if (!top || top->profile_cycles * 20 < total) break;
+        /* When placement dominates, name its top boxes even if each is small. */
+        if (!top || (top->profile_cycles * 20 < total && cycles[2] * 2 < total)) break;
         layout_profile_describe(top, name, sizeof name);
         snprintf(line, sizeof line, "Layout hot abspos: %s, calls %u, inclusive %llu%%", name, top->profile_calls,
             (unsigned long long)(top->profile_cycles * 100 / total));
@@ -4495,14 +4497,22 @@ void layout_doc(web_doc *d, int width, int height) {
     layout_inner(root, NULL, 0, 0, VH);
     LAYOUT_PHASE(1);
     if (d->native_cancelled) goto finished;
-    for (int i = 0; i < d->abs_boxes.n; i++) layout_abs(d->abs_boxes.v[i]);
+    for (int i = 0; i < d->abs_boxes.n; i++) {
+        box_t *a = d->abs_boxes.v[i];
+        if (!d->profile_enabled) { layout_abs(a); continue; }
+        /* The whole placement (sizing, containing block, static position), not
+           only its inner layout: the hot-abspos report ranks by this. */
+        uint64_t start = __builtin_ia32_rdtsc(), inner = a->profile_cycles;
+        layout_abs(a);
+        a->profile_cycles = inner + (__builtin_ia32_rdtsc() - start);
+    }
     LAYOUT_PHASE(2);
     relative_offsets(root);
     LAYOUT_PHASE(3);
     if (d->native_cancelled) goto finished;
     scroll_areas(root);
     LAYOUT_PHASE(4);
-    if (d->profile_enabled && uptime_ms() - profile_start >= 500) layout_profile_report(d, root, phase_cycles, uptime_ms() - profile_start);
+    if (d->profile_enabled && uptime_ms() - profile_start >= 250) layout_profile_report(d, root, phase_cycles, uptime_ms() - profile_start);
     if (d->native_cancelled) goto finished;
     float h = fmaxf_(root->h, max_bottom(root, 0));
     /* The containing-block overflow union already includes escaping absolute

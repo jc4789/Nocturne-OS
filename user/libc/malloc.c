@@ -387,10 +387,82 @@ static void *realloc_locked(void *p, size_t n) {
     return q;
 }
 
+/* Each thread keeps small freed blocks of each 16-byte class and hands them
+   back to its own small requests without the lock. One lock shared by every
+   CPU's frees and mallocs serialized parallel work on it (and its contended
+   waits on the BSP). A cached block stays a used block to the heap, so it
+   neither coalesces nor counts as free; a class holds at most a few KiB, and
+   thread_exit returns the thread's cache. Any thread may free any block. */
+#ifndef MALLOCTRIM_MODEL
+struct malloc_cache {
+    void *head[SMALL_BINS];
+    uint16_t count[SMALL_BINS];
+};
+void **__libc_malloc_cache(void);
+static unsigned cache_limit(size_t size) {
+    size_t n = 8192 / size;
+    return n < 4 ? 4 : n > 64 ? 64 : (unsigned)n;
+}
+static struct malloc_cache *cache_get(bool create) {
+    void **slot = __libc_malloc_cache();
+    if (!slot) return NULL;
+    if (!*slot && create) {
+        heap_lock();
+        struct malloc_cache *c = malloc_locked(sizeof *c);
+        heap_unlock();
+        if (c) memset(c, 0, sizeof *c);
+        *slot = c;
+    }
+    return *slot;
+}
+static void *cache_take(size_t need) {
+    struct malloc_cache *c = cache_get(false);
+    unsigned k = (unsigned)(need / 16u);
+    void *p = c ? c->head[k] : NULL;
+    if (p) { c->head[k] = *(void **)p; c->count[k]--; }
+    return p;
+}
+/* A block of size below SMALL_LIMIT; a full class first returns half. */
+static bool cache_put(void *p, size_t size) {
+    struct malloc_cache *c = cache_get(true);
+    if (!c) return false;
+    unsigned k = (unsigned)(size / 16u);
+    if (c->count[k] >= cache_limit(size)) {
+        heap_lock();
+        for (unsigned i = c->count[k] / 2; i; i--) {
+            void *q = c->head[k];
+            c->head[k] = *(void **)q; c->count[k]--;
+            free_locked(q);
+        }
+        heap_unlock();
+    }
+    *(void **)p = c->head[k]; c->head[k] = p; c->count[k]++;
+    return true;
+}
+void __malloc_thread_exit(void) {
+    void **slot = __libc_malloc_cache();
+    struct malloc_cache *c = slot ? *slot : NULL;
+    if (!c) return;
+    *slot = NULL;
+    heap_lock();
+    for (unsigned k = 0; k < SMALL_BINS; k++)
+        while (c->head[k]) { void *q = c->head[k]; c->head[k] = *(void **)q; free_locked(q); }
+    free_locked(c);
+    heap_unlock();
+}
+#else
+static void *cache_take(size_t need) { (void)need; return NULL; }
+static bool cache_put(void *p, size_t size) { (void)p; (void)size; return false; }
+#endif
+
 void *malloc(size_t n) {
     if (n >= MAP_MIN) return map_alloc(n);
+    size_t need = (n + HDR + 15) & ~(size_t)15;
+    if (need < MIN_BLK) need = MIN_BLK;
+    void *p = need < SMALL_LIMIT ? cache_take(need) : NULL;
+    if (p) return p;
     heap_lock();
-    void *p = malloc_locked(n);
+    p = malloc_locked(n);
     heap_unlock();
     return p;
 }
@@ -398,7 +470,7 @@ void free(void *p) {
     if (!p) return;
     blk *b = (blk *)((char *)p - HDR);
     if (b->size & MAPPED) map_free(b);
-    else {
+    else if (bsize(b) >= SMALL_LIMIT || !cache_put(p, bsize(b))) {
         heap_lock();
         free_locked(p);
         heap_unlock();
