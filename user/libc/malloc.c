@@ -3,9 +3,10 @@
    marker is a used block of size 0, so blocks never coalesce across regions.
    A free tail goes back to the system page by page, and a region that becomes
    wholly free goes back at once (except the newest, kept warm for reuse).
-   Large blocks get a region of their own: freeing one returns its pages at
-   once, and a growing large buffer never leaves a hole that only smaller
-   requests could reuse. */
+   Large blocks get a region of their own: freeing one returns its pages,
+   beyond a few regions kept for the next large request (map_free), and a
+   growing large buffer never leaves a hole that only smaller requests could
+   reuse. */
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -268,24 +269,80 @@ static void free_locked(void *p) {
     if (!trim(b)) fl_push((fblk *)b);
 }
 
-/* Large blocks need no lock: the region is the block. Pages come zeroed. */
-static void *map_alloc(size_t n) {
+/* Freed large regions kept for the next large request. A block allocated and
+   freed over and over (a video frame, a network or decode buffer) otherwise
+   costs, every time, a reservation, a page fault for each 64 KiB first
+   written and a release with its TLB shootdown, all in the kernel. A request
+   takes the smallest kept region that holds it with at most a quarter to
+   spare. At most MAP_KEEP regions are kept, of at most MAP_KEEP_MIN bytes or
+   a quarter of the large blocks in use, whichever is more; a free beyond that
+   gives the oldest back first. */
+#define MAP_KEEP     4
+#define MAP_KEEP_MIN (8u * 1024 * 1024)
+struct map_kept { char *region; size_t size; };
+static struct map_kept map_kept[MAP_KEEP]; /* oldest first; under the heap lock */
+static unsigned map_kept_count;
+static size_t map_kept_bytes;
+
+static void map_kept_remove(unsigned i) {
+    map_kept_bytes -= map_kept[i].size;
+    map_kept_count--;
+    memmove(&map_kept[i], &map_kept[i + 1], (map_kept_count - i) * sizeof *map_kept);
+}
+static char *map_take(size_t total, size_t *size) {
+    heap_lock();
+    unsigned best = MAP_KEEP;
+    for (unsigned i = 0; i < map_kept_count; i++)
+        if (map_kept[i].size >= total && map_kept[i].size - total <= total / 4 &&
+            (best == MAP_KEEP || map_kept[i].size < map_kept[best].size)) best = i;
+    char *region = NULL;
+    if (best < MAP_KEEP) {
+        region = map_kept[best].region;
+        *size = map_kept[best].size;
+        map_kept_remove(best);
+    }
+    heap_unlock();
+    return region;
+}
+
+/* Large blocks take the heap lock only for the kept regions: the region is
+   the block. With zero, its bytes are zero (fresh pages come zeroed). */
+static void *map_alloc(size_t n, bool zero) {
     if (n > ((size_t)1 << 40)) return NULL;
-    size_t total = (n + HDR + PAGE - 1) & ~(size_t)(PAGE - 1);
-    void *region;
-    if (n_memory_reserve(total, N_MEMORY_READ_WRITE, &region) < 0) return NULL;
-    blk *b = region;
-    b->size = total | MAPPED | USED;
+    size_t total = (n + HDR + PAGE - 1) & ~(size_t)(PAGE - 1), size = total;
+    char *region = map_take(total, &size);
+    if (region) {
+        if (zero) memset(region + HDR, 0, n);
+    } else {
+        void *fresh;
+        if (n_memory_reserve(total, N_MEMORY_READ_WRITE, &fresh) < 0) return NULL;
+        region = fresh;
+    }
+    blk *b = (blk *)region;
+    b->size = size | MAPPED | USED;
     b->prev = 0;
-    __atomic_add_fetch(&mapped_total, total, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&mapped_total, size, __ATOMIC_RELAXED);
     return (char *)b + HDR;
 }
 /* An aligned_alloc block starts inside its region; the others at its start. */
 static char *map_region(blk *b) { return (char *)b - b->prev; }
 static void map_free(blk *b) {
+    char *region = map_region(b);
     size_t total = bsize(b);
-    __atomic_sub_fetch(&mapped_total, total, __ATOMIC_RELAXED);
-    n_memory_release(map_region(b), total);
+    size_t live = __atomic_sub_fetch(&mapped_total, total, __ATOMIC_RELAXED);
+    size_t limit = live / 4 > MAP_KEEP_MIN ? live / 4 : MAP_KEEP_MIN;
+    if (total > limit) { n_memory_release(region, total); return; }
+    struct map_kept out[MAP_KEEP];
+    unsigned released = 0;
+    heap_lock();
+    while (map_kept_count == MAP_KEEP || map_kept_bytes + total > limit) {
+        out[released++] = map_kept[0];
+        map_kept_remove(0);
+    }
+    map_kept[map_kept_count++] = (struct map_kept){region, total};
+    map_kept_bytes += total;
+    heap_unlock();
+    for (unsigned i = 0; i < released; i++) n_memory_release(out[i].region, out[i].size);
 }
 
 /* A region whose block's bytes start at a multiple of align. The whole pages
@@ -344,7 +401,7 @@ static void *aligned_locked(size_t align, size_t n) {
 void *calloc(size_t n, size_t m) {
     size_t t = n * m;
     if (m && t / m != n) return NULL;
-    if (t >= MAP_MIN) return map_alloc(t);
+    if (t >= MAP_MIN) return map_alloc(t, true);
     void *p = malloc(t);
     if (p) memset(p, 0, t);
     return p;
@@ -456,7 +513,7 @@ static bool cache_put(void *p, size_t size) { (void)p; (void)size; return false;
 #endif
 
 void *malloc(size_t n) {
-    if (n >= MAP_MIN) return map_alloc(n);
+    if (n >= MAP_MIN) return map_alloc(n, false);
     size_t need = (n + HDR + 15) & ~(size_t)15;
     if (need < MIN_BLK) need = MIN_BLK;
     void *p = need < SMALL_LIMIT ? cache_take(need) : NULL;
@@ -490,7 +547,7 @@ void *aligned_alloc(size_t align, size_t n) {
 void malloc_usage(size_t *heap, size_t *used) {
     size_t mapped = __atomic_load_n(&mapped_total, __ATOMIC_RELAXED);
     heap_lock();
-    if (heap) *heap = heap_total + mapped;
+    if (heap) *heap = heap_total + mapped + map_kept_bytes;
     if (used) *used = heap_used + mapped;
     heap_unlock();
 }

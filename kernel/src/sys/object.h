@@ -7,7 +7,9 @@
    places at once (the tables of the apps it was handed to, a message that carries it), each
    place holding a reference of its own.
 
-   All of this state is BSP-owned and changed under the BSP IRQ guard (irq_save). */
+   All of this state is BSP-owned and changed under the BSP IRQ guard (irq_save). AP syscalls
+   only read it (handle_ap_peek); the BSP frees a handle, an object or a table only after
+   ap_read_synchronize. */
 #pragma once
 #include "kernel.h"
 #include "sys/sched.h"
@@ -83,6 +85,9 @@ void object_wait_end(struct object_wait *wait);
    handle_peek a borrowed pointer valid only inside the caller's BSP IRQ guard. */
 struct handle *handle_get(int index);
 struct handle *handle_peek(int index);
+/* The same on an AP, inside an AP read section (arch/smp.h) and without a reference: the handle
+   and its object stay allocated until ap_read_end, but the BSP may change them meanwhile. */
+struct handle *handle_ap_peek(int index);
 /* Puts h in the table: its number, or an error (then h is closed). Consumes the reference. */
 int handle_install(struct handle *h);
 /* The same with the caller's guard held; the reference is consumed only on success. */

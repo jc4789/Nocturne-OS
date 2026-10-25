@@ -36,6 +36,8 @@ struct task {
     uint64_t wait_phys, wait_seq; /* address wait: physical key, FIFO order */
     uint8_t address_park;     /* APで寝るaddress待ちの段階（sched.cのPARK_*、address_lockの下） */
     bool address_woken;       /* 寝たaddress待ちが起こされた：再開でsyscallを0で終える */
+    bool address_timed_out;   /* その起こしは期限切れ（BSPの拍）：時間切れで終える */
+    uint64_t park_deadline;   /* 有限の寝るaddress待ちの期限（uptime_ms）。0は無期限 */
     struct task *park_next;   /* APで寝るaddress待ちの一覧（到着順） */
     unsigned trap_cpu;
     uint64_t tls_base;

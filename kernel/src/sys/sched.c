@@ -112,6 +112,8 @@ static enum address_ap address_ap_syscall(struct regs *r);
 static unsigned address_park_settle(struct task *t);
 static struct task *address_park_pull(void);
 static void address_transit_wait(void);
+static void address_park_expire(uint64_t now);
+static uint64_t address_park_next(void);
 
 static void q_lock(struct cpu_queue *q) {
     while (__atomic_exchange_n(&q->lock, 1, __ATOMIC_ACQUIRE))
@@ -358,6 +360,7 @@ static void runner_return_irq(struct regs *r) {
        send a fresh IPI rather than disappear behind the consumed doorbell. */
     (void)__atomic_exchange_n(&runner_return_pending, 0, __ATOMIC_ACQ_REL);
     net_ap_notify_bsp();
+    vmm_ap_stock_fill();
     if (collect_runner()) need_resched = true;
     /* Do not schedule inside a kernel IRQ: existing kernel continuations are
        non-preemptive. User return and idle's HLT return are safe switch points. */
@@ -448,14 +451,9 @@ void sched_ap_interrupt(struct regs *r) {
         return;
     }
     bool dispatch = vector < 32 || vector == 0x80, park = false;
-    /* Read-only identity queries need no BSP kernel continuation. */
-    if (vector == 0x80 && (r->rax == SYS_CPU_INDEX || r->rax == SYS_THREAD_ID ||
-                          r->rax == SYS_APP_SELF || r->rax == SYS_UPTIME)) {
-        r->rax = r->rax == SYS_CPU_INDEX ? cpu : r->rax == SYS_THREAD_ID ? current_task->pid :
-                 r->rax == SYS_APP_SELF ? task_process()->pid : uptime_ms();
-        dispatch = false;
-    }
-    else if (vector==0x80 && net_ap_syscall(r)) dispatch=false;
+    /* What needs no BSP kernel continuation is served here (syscall_ap, the address waits). */
+    if (vector==0x80 && syscall_ap(r)) dispatch=false;
+    else if (vector==14 && vmm_ap_demand_fault(read_cr2(), r->error)) dispatch=false;
     else if (vector==0x80) switch (address_ap_syscall(r)) {
         case ADDRESS_AP_PARK: park = true; /* fall through */
         case ADDRESS_AP_DONE: dispatch = false; break;
@@ -481,9 +479,9 @@ void sched_ap_interrupt(struct regs *r) {
     context_switch(&t->ksp, runner_idle_sp[cpu]);
     if (reason == RET_PARK) {
         /* 起こされた待ちは0で終わる。起こされずにBSPへ戻った待ちはBSPがやり直す。 */
-        if (t->address_woken) r->rax = 0;
+        if (t->address_woken) r->rax = t->address_timed_out ? (uint64_t)(int64_t)-N_ERR_TIMEOUT : 0;
         dispatch = !t->address_woken;
-        t->address_woken = false;
+        t->address_woken = t->address_timed_out = false;
     }
     /* APのキューから再開した（同じAPとは限らない）：launchが状態を整えた。 */
     if (cpu_is_runner()) return;
@@ -760,6 +758,7 @@ void sched_tick(void) {
             sched_make_ready(t);
         }
     }
+    address_park_expire(now);
     bsp_preempt_check();
 }
 
@@ -781,7 +780,7 @@ void sched_clock_resume(void) {
 }
 
 uint64_t sched_next_wake(void) {
-    uint64_t next = UINT64_MAX;
+    uint64_t next = address_park_next();
     for (struct task *t = task_list; t; t = t->all_next)
         if (t->state == TASK_BLOCKED && t->wake_at && t->wake_at < next) next = t->wake_at;
     return next;
@@ -1041,9 +1040,9 @@ static inline unsigned address_bucket_index(uint64_t phys) {
 }
 static inline uint32_t *address_bucket(uint64_t phys) { return &address_waiters[address_bucket_index(phys)]; }
 
-/* An infinite wait issued on an AP parks there: the task leaves its queue
+/* A wait issued on an AP that may block parks there: the task leaves its queue
    (kei SLEEP) without visiting the BSP, and a waker on any CPU hands it to an
-   AP queue again. The BSP's blocked list and the watches stay BSP-owned; a
+   AP queue again; the BSP's tick does the same at a finite wait's deadline. The BSP's blocked list and the watches stay BSP-owned; a
    bucket counting any of them is woken on the BSP, which wakes parked tasks
    too, in the one enrollment order. address_lock guards the parked list and
    its counts. Never take a queue lock while holding it: ap_retired takes the
@@ -1054,6 +1053,7 @@ static uint32_t address_lock;
 static struct task *address_parked, **address_parked_tail = &address_parked;
 static uint32_t address_parked_count[ADDRESS_BUCKETS];
 static uint32_t address_transit;
+static uint32_t address_timed_parks; /* parked tasks with a deadline */
 
 static void address_lock_take(void) {
     while (__atomic_exchange_n(&address_lock, 1, __ATOMIC_ACQUIRE))
@@ -1071,6 +1071,10 @@ static void address_park_unlink(struct task **link) {
     address_parked_count[b]--;
     __atomic_sub_fetch(&address_waiters[b], 1, __ATOMIC_RELEASE);
     t->wait_phys = 0;
+    if (t->park_deadline) {
+        t->park_deadline = 0;
+        __atomic_sub_fetch(&address_timed_parks, 1, __ATOMIC_RELAXED);
+    }
 }
 static struct task **address_park_link(struct task *t) {
     struct task **pp = &address_parked;
@@ -1145,6 +1149,31 @@ static struct task *address_park_pull(void) {
     address_lock_drop();
     return pulled;
 }
+/* BSP tick: parked waits past their deadline are woken, to end in a timeout. */
+static void address_park_expire(uint64_t now) {
+    if (!__atomic_load_n(&address_timed_parks, __ATOMIC_RELAXED)) return;
+    struct task *placing = NULL;
+    address_lock_take();
+    for (struct task **pp = &address_parked; *pp;) {
+        struct task *t = *pp;
+        if (!t->park_deadline || now < t->park_deadline) { pp = &t->park_next; continue; }
+        address_park_unlink(pp);
+        t->address_timed_out = true;
+        address_park_wake(t, &placing);
+    }
+    address_lock_drop();
+    address_park_place(placing);
+}
+/* The earliest of those deadlines, for a stopped tick (sched_next_wake). */
+static uint64_t address_park_next(void) {
+    uint64_t next = UINT64_MAX;
+    if (!__atomic_load_n(&address_timed_parks, __ATOMIC_RELAXED)) return next;
+    address_lock_take();
+    for (struct task *t = address_parked; t; t = t->park_next)
+        if (t->park_deadline && t->park_deadline < next) next = t->park_deadline;
+    address_lock_drop();
+    return next;
+}
 static void address_transit_wait(void) {
     uint64_t since = rdtsc(), spins = 0;
     while (__atomic_load_n(&address_transit, __ATOMIC_ACQUIRE)) {
@@ -1194,9 +1223,9 @@ static void address_watch_unlink(struct address_watch **link) {
 }
 
 /* AP: a wake whose key has no waiter, or only parked ones, completes here;
-   so does a wait whose value already differs or that may not block. An
-   infinite wait enrolls in the parked list and the caller retires the task
-   as RET_PARK. Everything else is the BSP's. The PTE is read before the key:
+   so does a wait whose value already differs or that may not block. A wait
+   that may block enrolls in the parked list (with its deadline, if finite)
+   and the caller retires the task as RET_PARK. Everything else is the BSP's. The PTE is read before the key:
    a present user page cannot be revoked while this CPU holds uaccess. */
 static enum address_ap address_ap_syscall(struct regs *r) {
     uint64_t a = r->rdi;
@@ -1236,9 +1265,9 @@ static enum address_ap address_ap_syscall(struct regs *r) {
     if ((pte & (PTE_P | PTE_U)) != (PTE_P | PTE_U) || !phys) { vmm_ap_uaccess_end(); return ADDRESS_AP_BSP; }
     uint64_t expected = wide ? r->rsi : (uint32_t)r->rsi;
     unsigned timeout = (unsigned)r->rdx, b = address_bucket_index(phys);
-    /* Only an infinite wait parks: a timeout needs the BSP's clock. Enrolled
-       (counted) before the value is read, as task_wait_address. */
-    bool park = timeout == UINT32_MAX;
+    /* A wait that may block parks; a finite one with its deadline, which the BSP's tick keeps
+       (address_park_expire). Enrolled (counted) before the value is read, as task_wait_address. */
+    bool park = timeout != 0;
     if (park) {
         address_lock_take();
         __atomic_add_fetch(&address_waiters[b], 1, __ATOMIC_SEQ_CST);
@@ -1249,8 +1278,12 @@ static enum address_ap address_ap_syscall(struct regs *r) {
         address_parked_count[b]++;
         t->wait_phys = phys;
         t->wait_seq = __atomic_add_fetch(&address_seq, 1, __ATOMIC_SEQ_CST);
+        if (timeout != UINT32_MAX) {
+            t->park_deadline = uptime_ms() + timeout;
+            __atomic_add_fetch(&address_timed_parks, 1, __ATOMIC_RELAXED);
+        }
         t->address_park = PARK_ENROLLED;
-        t->address_woken = false;
+        t->address_woken = t->address_timed_out = false;
         t->park_next = NULL;
         *address_parked_tail = t;
         address_parked_tail = &t->park_next;
@@ -1261,8 +1294,8 @@ static enum address_ap address_ap_syscall(struct regs *r) {
     vmm_ap_uaccess_end();
     if (current != expected) { r->rax = (uint64_t)(int64_t)-N_ERR_NOT_READY; return ADDRESS_AP_DONE; }
     if (park) return ADDRESS_AP_PARK;
-    if (!timeout) { r->rax = (uint64_t)(int64_t)-N_ERR_TIMEOUT; return ADDRESS_AP_DONE; }
-    return ADDRESS_AP_BSP;
+    r->rax = (uint64_t)(int64_t)-N_ERR_TIMEOUT; /* a zero timeout */
+    return ADDRESS_AP_DONE;
 }
 
 /* BSP: the oldest waiters of the key first, whether blocked here, parked on

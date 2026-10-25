@@ -284,6 +284,16 @@ int64_t message_channel_receive(struct handle *h, void *ubuf, size_t cap, bool w
     }
 }
 
+bool message_channel_receive_ap(struct handle *h, bool wait, int64_t *result) {
+    struct message_link *l = message_link(h);
+    int side = message_side(h);
+    if (__atomic_load_n(&l->head[side], __ATOMIC_ACQUIRE)) return false;
+    if (!__atomic_load_n(&l->open[!side], __ATOMIC_ACQUIRE)) *result = -N_ERR_CLOSED;
+    else if (wait) return false;
+    else *result = -N_ERR_NOT_READY;
+    return true;
+}
+
 static uint32_t message_ready(struct handle *h) {
     struct message_link *l = message_link(h);
     int side = message_side(h), peer = !side;

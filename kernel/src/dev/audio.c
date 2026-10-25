@@ -3,6 +3,7 @@
 #include "sys/syscall.h"
 #include "arch/cpu.h"
 #include "mm/heap.h"
+#include "mm/vmm.h"
 #include "sys/sched.h"
 #include "sys/object.h"
 #include "abi.h"
@@ -26,12 +27,32 @@ struct stream {
     unsigned issued_head,issued_count;
     uint32_t device_pending;
     bool clock_error;
+    /* Odd while a writer changes what status_of reports, so that an AP reads it between two
+       equal even values (audio_stream_status_ap). Every writer runs on the BSP with interrupts
+       off, so writers never nest. */
+    uint32_t status_seq;
     struct object object; /* an app's stream: what its handle reaches */
 };
+
+static void status_begin(struct stream *s) {
+    __atomic_store_n(&s->status_seq, s->status_seq + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+static void status_end(struct stream *s) {
+    __atomic_store_n(&s->status_seq, s->status_seq + 1, __ATOMIC_RELEASE);
+}
 static uint64_t card_submitted,card_consumed;
 
 /* the last slot is the system's own stream, which no app owns */
 static struct stream *streams[MAX_STREAMS + 1];
+
+/* The same around a change to every stream at once (the mixer, the card's progress). */
+static void streams_status_begin(void) {
+    for (int i = 0; i <= MAX_STREAMS; i++) if (streams[i]) status_begin(streams[i]);
+}
+static void streams_status_end(void) {
+    for (int i = 0; i <= MAX_STREAMS; i++) if (streams[i]) status_end(streams[i]);
+}
 static struct wait_queue audio_wq; /* writers waiting for room, closers waiting to drain */
 static int volume = 80;            /* percent */
 static bool muted;
@@ -127,6 +148,7 @@ static bool mix(int16_t *out, int frames,bool card) {
     if(card&&(uint64_t)frames>UINT64_MAX-card_submitted){irq_restore(f);return false;}
     bool any = false,error = false;
     if (out) memset(out, 0, (size_t)frames * AUDIO_FRAME);
+    streams_status_begin();
     for (int i = 0; i <= MAX_STREAMS; i++) {
         struct stream *s = streams[i];
         if (!s) continue;
@@ -169,6 +191,7 @@ static bool mix(int16_t *out, int frames,bool card) {
         }
         s->tail += (uint32_t)n * AUDIO_FRAME;
     }
+    streams_status_end();
     if(card&&any)card_submitted+=(uint32_t)frames;
     if (any||error) streams_changed();
     irq_restore(f);
@@ -180,6 +203,7 @@ void audio_card_played(uint64_t ordinal){
     uint64_t f=irq_save();ordinal=MIN(ordinal,card_submitted);
     if(ordinal>card_consumed){
         card_consumed=ordinal;
+        streams_status_begin();
         for(unsigned i=0;i<=MAX_STREAMS;i++){
             struct stream *s=streams[i];if(!s)continue;
             if(s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued)){s->clock_error=true;continue;}
@@ -193,6 +217,7 @@ void audio_card_played(uint64_t ordinal){
                 s->issued_head=(at+1)&31;s->issued_count--;
             }
         }
+        streams_status_end();
         streams_changed();
     }
     irq_restore(f);
@@ -371,8 +396,12 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
         memcpy(s->ring + at, p + done, first);
         memcpy(s->ring, p + done + first, c - first);
         __sync_synchronize();
+        uint64_t fl = irq_save();
+        status_begin(s);
         s->head += c;
         s->committed_bytes+=c;
+        status_end(s);
+        irq_restore(fl);
         trace_commit(s, c);
         done += c;
     }
@@ -380,28 +409,56 @@ int64_t audio_stream_submit(struct handle *h, const void *frames, size_t count, 
 }
 
 /* How far ahead of the sink the stream is, and how much of it was played. */
-int audio_stream_status(struct handle *h, struct n_audio_status *user_out) {
-    struct stream *s = stream_of(h);
-    if (stream_broken(s)) return -N_ERR_IO;
-    uint64_t fl = irq_save();
+static struct n_audio_status status_of(const struct stream *s) {
     uint32_t software=(s->head-s->tail)/AUDIO_FRAME;
     uint32_t hardware=remote_users?0:s->device_pending;
     uint64_t committed=s->committed_bytes/AUDIO_FRAME;
     uint64_t remaining=(uint64_t)software+hardware;
-    struct n_audio_status status={.queued_frames=software,.device_pending_frames=hardware,
+    return (struct n_audio_status){.queued_frames=software,.device_pending_frames=hardware,
         .played_frames=committed>=remaining?committed-remaining:0,.committed_frames=committed,
         .generation=s->generation,.flags=remote_users?N_AUDIO_CLOCK_ESTIMATED|N_AUDIO_CLOCK_REMOTE:card_fill?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED};
+}
+
+int audio_stream_status(struct handle *h, struct n_audio_status *user_out) {
+    struct stream *s = stream_of(h);
+    if (stream_broken(s)) return -N_ERR_IO;
+    uint64_t fl = irq_save();
+    struct n_audio_status status = status_of(s);
     bool ok = user_ok_w(user_out, sizeof status);
     if (ok) memcpy(user_out, &status, sizeof status);
     irq_restore(fl);
     return ok ? 0 : -N_ERR_BAD_ADDRESS;
 }
 
+bool audio_stream_status_ap(struct handle *h, struct n_audio_status *user_out, int64_t *result) {
+    if (!handle_is(h, &stream_ops)) return false;
+    struct stream *s = stream_of(h);
+    struct n_audio_status status;
+    bool broken;
+    for (int tries = 0;; tries++) {
+        if (tries == 8) return false; /* the mixer kept changing it: the BSP reads it in order */
+        uint32_t seq = __atomic_load_n(&s->status_seq, __ATOMIC_ACQUIRE);
+        if (seq & 1) { __builtin_ia32_pause(); continue; }
+        broken = stream_broken(s);
+        status = status_of(s);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&s->status_seq, __ATOMIC_RELAXED) == seq) break;
+    }
+    if (broken) { *result = -N_ERR_IO; return true; }
+    if (!vmm_ap_user_begin(user_out, sizeof status, true)) return false;
+    memcpy(user_out, &status, sizeof status);
+    vmm_ap_uaccess_end();
+    *result = 0;
+    return true;
+}
+
 int audio_stream_flush(struct handle *h) {
     struct stream *s = stream_of(h);
     uint64_t fl = irq_save();
+    status_begin(s);
     s->tail = s->head;
     s->committed_bytes=0;s->issued_head=s->issued_count=0;s->device_pending=0;s->generation++;s->clock_error=false;
+    status_end(s);
     if (audio_trace_active) for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i] == s) trace.stream[i].flushes++;
     streams_changed();

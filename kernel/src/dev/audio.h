@@ -21,6 +21,9 @@ int audio_stream_open(struct handle **out); /* N_ERR_BUSY when every stream is t
 bool audio_stream_is(struct handle *h);
 int64_t audio_stream_submit(struct handle *h, const void *user_frames, size_t count, bool wait); /* frames taken */
 int audio_stream_status(struct handle *h, struct n_audio_status *user_out);
+/* The same on an AP inside an AP read section, for any handle h: true with *result when served
+   there, false when the BSP must (not a stream, the mixer kept changing it, out not mapped). */
+bool audio_stream_status_ap(struct handle *h, struct n_audio_status *user_out, int64_t *result);
 /* Drop this stream's not-yet-mixed PCM and retire its old clock generation.
  * Already mixed card/remote samples cannot be unmixed here, but they never
  * become the new generation's played samples. Ordinary close drains DMA too. */

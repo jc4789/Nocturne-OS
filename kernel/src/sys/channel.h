@@ -13,6 +13,10 @@ int64_t message_channel_send(struct handle *h, const void *udata, size_t n, stru
 int64_t message_channel_post(struct handle *h, const void *data, size_t n, uint64_t sender_app);
 int64_t message_channel_receive(struct handle *h, void *ubuf, size_t cap, bool wait, bool peek,
                                 bool discard, struct handle **attached, uint64_t *sender_app);
+/* The same on an AP inside an AP read section, for a message channel end with nothing queued:
+   true with *result (N_ERR_CLOSED, or N_ERR_NOT_READY without wait), false when the BSP must take
+   a message or wait for one. */
+bool message_channel_receive_ap(struct handle *h, bool wait, int64_t *result);
 
 /* Named rendezvous: the listener holds its key until its handle closes. */
 int channel_listen(const char *key, size_t length, struct handle **listener);

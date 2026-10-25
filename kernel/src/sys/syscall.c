@@ -22,6 +22,7 @@
 #include "dev/pciuser.h"
 #include "arch/pat.h"
 #include "gui/wm.h"
+#include "net/net.h"
 #include "dev/pm.h"
 #include "abi.h"
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
@@ -224,8 +225,9 @@ static int64_t sys_sysinfo(struct n_sysinfo *si) {
     if (!user_ok_w(si, sizeof *si)) return -N_ERR_BAD_ADDRESS;
     memset(si, 0, sizeof *si);
     si->total_mem = pmm_total_pages() * PAGE_SIZE;
-    /* What an app can have: idle programs give their frames to one that asks (frames_free). */
-    si->free_mem = (pmm_free_pages() + programs_idle()) * PAGE_SIZE;
+    /* What an app can have: idle programs give their frames to one that asks (frames_free), and
+       the frames set aside for the APs' first touches are no one's yet. */
+    si->free_mem = (pmm_free_pages() + programs_idle() + vmm_ap_stock_pages()) * PAGE_SIZE;
     si->heap_used = heap_used_bytes();
     si->uptime_ms = uptime_ms();
     uint64_t flags = irq_save();
@@ -2492,6 +2494,48 @@ static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, int64_t 
     r = events_wait(queue, uout, max, timeout_ms);
     handle_close(queue);
     return r;
+}
+
+/* sys_channel_receive's checks, in its order, before a message channel end's AP poll. */
+static bool channel_receive_ap(struct regs *r, struct handle *h, bool credentials, int64_t *result) {
+    void *uoutput = (void *)r->r8;
+    int flags = (int)r->r10;
+    if (flags & ~(N_CHANNEL_WAIT | N_CHANNEL_PEEK | N_CHANNEL_DISCARD) ||
+        ((flags & N_CHANNEL_PEEK) && (flags & N_CHANNEL_DISCARD)) || (credentials && !uoutput)) return false;
+    if (uoutput) {
+        if (!vmm_ap_user_begin(uoutput, credentials ? sizeof(struct n_channel_message) : sizeof(int32_t), true))
+            return false;
+        vmm_ap_uaccess_end();
+    }
+    return message_channel_is(h) && message_channel_receive_ap(h, flags & N_CHANNEL_WAIT, result);
+}
+
+bool syscall_ap(struct regs *r) {
+    int64_t result;
+    switch (r->rax) {
+    case SYS_CPU_INDEX: result = cpu_current_index(); break;
+    case SYS_THREAD_ID: result = current_task->pid; break;
+    case SYS_APP_SELF: result = task_process()->pid; break;
+    case SYS_UPTIME: result = (int64_t)uptime_ms(); break;
+    case SYS_TIME: result = time_now(); break;
+    case SYS_TCP_SEND: case SYS_TCP_SEND_UNTIL: case SYS_TCP_RECV: return net_ap_syscall(r);
+    case SYS_AUDIO_STATUS: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM: case SYS_WIN_RECEIVE:
+    case SYS_WIN_STATE: {
+        if (current_task->killed) return false; /* the BSP ends the process */
+        ap_read_begin();
+        struct handle *h = handle_ap_peek((int)r->rdi);
+        bool served = r->rax == SYS_AUDIO_STATUS ? audio_stream_status_ap(h, (struct n_audio_status *)r->rsi, &result)
+                    : r->rax == SYS_WIN_RECEIVE ? wm_receive_ap(h, (size_t)r->rdx, (int64_t)r->r10, &result)
+                    : r->rax == SYS_WIN_STATE ? wm_state_ap(h, &result)
+                    : channel_receive_ap(r, h, r->rax == SYS_CHANNEL_RECEIVE_FROM, &result);
+        ap_read_end();
+        if (!served) return false;
+        break;
+    }
+    default: return false;
+    }
+    r->rax = (uint64_t)result;
+    return true;
 }
 
 void syscall_dispatch(struct regs *r) {

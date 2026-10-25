@@ -244,11 +244,11 @@ static void marquee_motion_and_hit(void) {
         web_hit_test(d,(int)moved+5,(int)y+5,&hit)&&hit.kind==WEB_HIT_LINK&&hit.node==target&&
         hit.href&&!strcmp(hit.href,"http://semantics.test/destination"));
     check("marquee previous position not stale target",web_node_at(d,(int)before+35,(int)y+5)!=target);
-    check("marquee next native deadline",web_marquee_deadline(d,now+10)==10);
+    check("marquee next native deadline",web_marquee_deadline(d)==(int64_t)(now+20));
     web_marquee_set(moving,false);d->paint_dirty=false;
     web_marquee_tick(d,now+1000);
     check("marquee stop freezes native visual geometry",fabsf(box_visual_x(child_box)-moved)<0.01f&&!d->paint_dirty);
-    check("marquee stop removes ticking deadline",web_marquee_deadline(d,now+1000)==-1);
+    check("marquee stop removes ticking deadline",web_marquee_deadline(d)==-1);
     paint(d);
     check("marquee stopped child stays painted and hittable",pixel_is((int)moved+5,(int)y+5,0xff0000)&&
         web_node_at(d,(int)moved+5,(int)y+5)==target);

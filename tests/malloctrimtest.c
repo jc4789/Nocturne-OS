@@ -256,7 +256,20 @@ int main(void) {
     unsigned char *kept=realloc(big,3u*MIB);check(kept==big && big[0]==0x5a,"large shrink keeps the block in place");
     check(heap_bytes()+4u*MIB<=high,"large shrink returns the pages it no longer needs");
     errno=EIO;free(big);check(errno==EIO,"large free preserves errno");
-    check(resident()+7u*MIB<=taken,"large free returns all its pages");
+    /* A freed large region is kept for the next large request (map_free in
+       malloc.c), so this free returns no pages of its own any more; the
+       former "large free returns all its pages" now holds beyond the kept
+       bound, checked below with blocks larger than it. */
+    check(resident()+5u*MIB<=taken,"large shrink and free keep at most the freed block");
+    unsigned char *reused_big=malloc(3u*MIB);
+    check(reused_big==big && resident()+5u*MIB<=taken,"a large request reuses the kept region without new pages");
+    free(reused_big);
+    unsigned char *large[3];
+    for(int i=0;i<3;i++){large[i]=malloc(8u*MIB);if(large[i])memset(large[i],0x3c,8u*MIB);}
+    check(large[0]&&large[1]&&large[2],"three large blocks");
+    uint64_t three=resident();
+    for(int i=0;i<3;i++)free(large[i]);
+    check(resident()+16u*MIB<=three,"large frees beyond the kept bound return their pages");
     check(bytes_intact(anchor,128,0x71),"large-block traffic leaves small blocks intact");
 
 #ifdef MALLOCTRIM_MODEL

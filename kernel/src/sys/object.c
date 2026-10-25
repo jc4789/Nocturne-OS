@@ -1,6 +1,7 @@
 /* Kernel objects, handles, waits on objects and the apps' handle tables (sys/object.h). */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/smp.h"
 #include "mm/heap.h"
 #include "sys/object.h"
 #include "sys/events.h"
@@ -57,6 +58,9 @@ void handle_close(struct handle *h) {
     if (last) events_handle_closed(h);
     irq_restore(flags);
     if (!last) return;
+    /* No table holds h any more; an AP syscall that found it there before may still read it
+       and its object (handle_ap_peek) until its section ends. */
+    ap_read_synchronize();
     /* A last close may sleep (an audio stream plays out what it has): the reference this
        caller held, not a guard, keeps the detached handle alive meanwhile. */
     struct object *o = h->object;
@@ -120,9 +124,14 @@ int handle_table_reserve(struct task *owner, size_t minimum) {
     struct handle **table = kzalloc(capacity * sizeof *table);
     if (!table) return -N_ERR_NO_MEMORY;
     memcpy(table, owner->handles, owner->handle_capacity * sizeof *table);
-    if (owner->handles != owner->initial_handles) kfree(owner->handles);
-    owner->handles = table;
-    owner->handle_capacity = capacity;
+    struct handle **old = owner->handles;
+    /* handle_ap_peek reads the capacity first: a larger one comes with the larger table */
+    __atomic_store_n(&owner->handles, table, __ATOMIC_RELEASE);
+    __atomic_store_n(&owner->handle_capacity, capacity, __ATOMIC_RELEASE);
+    if (old != owner->initial_handles) {
+        ap_read_synchronize();
+        kfree(old);
+    }
     return 0;
 }
 
@@ -137,7 +146,7 @@ int handle_table_find(struct task *owner) {
 int handle_table_add(struct task *owner, struct handle *h) {
     int index = handle_table_find(owner);
     if (index < 0) return index;
-    owner->handles[index] = h;
+    __atomic_store_n(&owner->handles[index], h, __ATOMIC_RELEASE); /* handle_ap_peek */
     owner->handle_hint = (size_t)index + 1;
     return index;
 }
@@ -146,6 +155,14 @@ struct handle *handle_peek(int index) {
     struct task *owner = task_process();
     if (index < 0 || (size_t)index >= owner->handle_capacity) return NULL;
     return owner->handles[index];
+}
+
+struct handle *handle_ap_peek(int index) {
+    struct task *owner = task_process();
+    size_t capacity = __atomic_load_n(&owner->handle_capacity, __ATOMIC_ACQUIRE);
+    if (index < 0 || (size_t)index >= capacity) return NULL;
+    struct handle **table = __atomic_load_n(&owner->handles, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&table[index], __ATOMIC_ACQUIRE);
 }
 
 struct handle *handle_get(int index) {
@@ -170,7 +187,7 @@ struct handle *handle_take_locked(int index) {
     struct handle *h = handle_peek(index);
     if (!h) return NULL;
     struct task *owner = task_process();
-    owner->handles[index] = NULL;
+    __atomic_store_n(&owner->handles[index], NULL, __ATOMIC_RELAXED); /* handle_ap_peek */
     if ((size_t)index < owner->handle_hint) owner->handle_hint = (size_t)index;
     object_notify(h->object);
     return h;

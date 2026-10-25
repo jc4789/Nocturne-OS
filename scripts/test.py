@@ -5,7 +5,7 @@ The built disk (build/nocturne.img, `make qemu-image`) is one GPT disk: the EFI 
 (FAT: Limine and the kernel) and drive C:. The test copies it to build/test.img, checks that the
 copy's kernel and system programs are the current build's, and puts tests/ and an autorun.sh in
 C:\\Tests with build/host/store.exe. The copy is the VM's only disk, on AHCI and without a
-snapshot. init runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
+snapshot, 4 GiB larger than the image: C: grows into that on its first start. init runs C:\\Tests\\autorun.sh at boot: it compiles tests/runtests.c with the in-OS tcc
 and runs it, then powers off. Results come back over the serial port. Afterwards the host checks
 the volume the OS just wrote to with `store check`, and deletes the copy (it is kept only when the
 check finds problems, for looking into them). For the TCP tests the host also runs a small server
@@ -437,7 +437,28 @@ def prepare_disk(a, tcp_port, web_ports):
         if dns_endpoint:
             edit_boot_entry(DISK, scratch, "dns-server=" + dns_endpoint)
         print("test: C:\\Tests: " + put_tests(DISK, test_files(a, tcp_port, web_ports, scratch), scratch), flush=True)
+    write_to_larger_disk(DISK, os.path.getsize(DISK) + TEST_ROOM)
     return image_hash, payload
+
+
+# The image carries little room beyond what is put on it (scripts/mkimage.sh): like an image written
+# to a larger disk, the copy gets this much more, and C: grows to the end of it on its first start.
+# The tests' compiled programs and files go there.
+TEST_ROOM = 4 << 30
+
+
+def write_to_larger_disk(path, size):
+    """path's file to size bytes, the new end sparse where the host can (NTFS) so it takes no room"""
+    with open(path, "r+b") as f:
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+            FSCTL_SET_SPARSE = 0x900C4
+            returned = wintypes.DWORD()
+            ctypes.windll.kernel32.DeviceIoControl(wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno())), FSCTL_SET_SPARSE,
+                                                   None, 0, None, 0, ctypes.byref(returned), None)
+        f.truncate(size)
 
 
 RESOLUTION = re.compile(r"([1-9][0-9]{0,4})x([1-9][0-9]{0,4})")

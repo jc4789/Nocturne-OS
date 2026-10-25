@@ -19,6 +19,8 @@
 
 #define PROF_SLOTS (1u << 16)
 #define PROF_SYSCALLS 512
+/* Faults that retire to the BSP are trips too: number PROF_FAULT + vector. */
+#define PROF_FAULT (PROF_SYSCALLS - 32)
 /* The window is "prof_ms=<n>" on the command line, 10 s by default; a short
    window prints shorter lists, so a stall of a few hundred ms can be told
    from its neighbours without flooding the serial line. */
@@ -150,11 +152,11 @@ void prof_tick(const struct regs *r, bool idle) {
 void prof_ap_retire(struct task *t, uint64_t vector, uint64_t number) {
     t->prof_stamp[0] = 0;
     if (!enabled) return;
-    if (vector != 0x80) {
+    if (vector != 0x80 && vector >= 32) {
         __atomic_add_fetch(&quantum_retire, 1, __ATOMIC_RELAXED);
         return;
     }
-    t->prof_number = number < PROF_SYSCALLS ? (uint32_t)number : PROF_SYSCALLS - 1;
+    t->prof_number = vector < 32 ? PROF_FAULT + (uint32_t)vector : number < PROF_FAULT ? (uint32_t)number : PROF_FAULT - 1;
     __atomic_add_fetch(&syscall_retire[t->prof_number], 1, __ATOMIC_RELAXED);
     t->prof_stamp[1] = t->prof_stamp[2] = 0;
     t->prof_stamp[0] = rdtsc();
@@ -271,11 +273,13 @@ static void dump(void) {
     for (unsigned i = 0; i < PROF_SYSCALLS; i++) {
         uint32_t c = __atomic_exchange_n(&syscall_retire[i], 0, __ATOMIC_RELAXED), n = number_trips[i];
         if (c >= period_ms / 100) { /* 10 a second */
+            const char *what = i < PROF_FAULT ? "syscall" : "fault";
+            unsigned number = i < PROF_FAULT ? i : i - PROF_FAULT;
             if (n)
-                kprintf("prof: syscall %u retired to BSP %u times, avg us to BSP %llu, on BSP %llu, back %llu\n", i, c,
-                        (unsigned long long)(number_us[i][0] / n), (unsigned long long)(number_us[i][1] / n),
-                        (unsigned long long)(number_us[i][2] / n));
-            else kprintf("prof: syscall %u retired to BSP %u times\n", i, c);
+                kprintf("prof: %s %u retired to BSP %u times, avg us to BSP %llu, on BSP %llu, back %llu\n", what,
+                        number, c, (unsigned long long)(number_us[i][0] / n),
+                        (unsigned long long)(number_us[i][1] / n), (unsigned long long)(number_us[i][2] / n));
+            else kprintf("prof: %s %u retired to BSP %u times\n", what, number, c);
         }
         number_trips[i] = 0;
         number_us[i][0] = number_us[i][1] = number_us[i][2] = 0;
@@ -296,8 +300,10 @@ static void dump(void) {
         int pid = (int)((best->key - 1) >> 9);
         bool thread = false;
         const char *name = task_name(pid, &thread);
-        kprintf("prof: trips pid %d %s%s syscall %u: %u, avg us to BSP %llu, on BSP %llu, back %llu, waited %llu ms\n",
-                pid, name, thread ? " (thread)" : "", (best->key - 1) & (PROF_SYSCALLS - 1), best->count,
+        uint32_t number = (best->key - 1) & (PROF_SYSCALLS - 1);
+        kprintf("prof: trips pid %d %s%s %s %u: %u, avg us to BSP %llu, on BSP %llu, back %llu, waited %llu ms\n",
+                pid, name, thread ? " (thread)" : "", number < PROF_FAULT ? "syscall" : "fault",
+                number < PROF_FAULT ? number : number - PROF_FAULT, best->count,
                 (unsigned long long)(best->cycles[0] / us_cycles / best->count),
                 (unsigned long long)(best->cycles[1] / us_cycles / best->count),
                 (unsigned long long)(best->cycles[2] / us_cycles / best->count),
@@ -320,6 +326,13 @@ static void dump(void) {
     vmm_tlb_stats(&sd, &ipi);
     kprintf("prof: TLB shootdowns %llu, IPIs %llu\n", (unsigned long long)(sd - last_sd), (unsigned long long)(ipi - last_ipi));
     last_sd = sd; last_ipi = ipi;
+    static uint64_t last_touches, last_touch_cycles;
+    uint64_t touches, touch_cycles;
+    vmm_ap_touch_stats(&touches, &touch_cycles);
+    if (touches != last_touches)
+        kprintf("prof: first touches served on APs %llu, avg us %llu\n", (unsigned long long)(touches - last_touches),
+                (unsigned long long)((touch_cycles - last_touch_cycles) / (touches - last_touches) / us_cycles));
+    last_touches = touches; last_touch_cycles = touch_cycles;
     static struct sched_stats last_kei;
     struct sched_stats k;
     sched_get_stats(&k);

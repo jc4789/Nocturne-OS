@@ -2849,7 +2849,9 @@ static int tcc_write_elf_file(TCCState *s1, const char *filename, int phnum,
         ret = tcc_output_elf(s1, f, phnum, phdr);
     else
         ret = tcc_output_binary(s1, f);
-    fclose(f);
+    /* a program cut short (no room on the disk) is no program: say so rather than succeed */
+    if ((ferror(f) | fclose(f)) && ret == 0)
+        ret = tcc_error_noabort("could not write '%s'", filename);
 
     return ret;
 }

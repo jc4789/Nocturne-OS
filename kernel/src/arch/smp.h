@@ -33,6 +33,10 @@ typedef void (*cpu_job_fn)(size_t index, void *context);
 /* 全APはuser実行と独立計算jobを交替で処理。共有kernel/driver/allocatorはBSP専用。
    例外はnet_ap_syscallの最大64KiB TCP ring copy。allocator/wait queue/NICには触れず、
    netのBSP gateとsocket io_ownerで寿命/単一所有を保ち、CPU別doorbellで制御を返す。
+   もう一つはsyscall_apの読むだけの問い合わせ（音の位置、空の待ち行列、窓の状態）。AP読み取り区間
+   （ap_read_begin）の中で取っ手と対象を読み、BSPは解放の前にap_read_synchronizeで待つ。
+   三つ目は予約ページの初回の接触（vmm_ap_demand_fault）。BSPがAPごとに取り置いたframeで
+   予約の葉を比較交換で埋める。取り置きが減ればcpu_bsp_wakeでBSPに足させる。
    user runnerはCPU別mailboxでring3のみ実行し、kernel処理前にBSPへ退避する。
    context と参照先は共有された高位 kernel mapping で、join まで有効であること。
    callback は非重複領域だけを更新し、割当・I/O・syscall・待機・schedule・再入は禁止。
@@ -57,7 +61,15 @@ bool cpu_runner_ready_at(unsigned index);
 void cpu_runner_started(void); /* AP固定idle stack初期化後のready publication */
 void cpu_runner_wake(void);
 void cpu_runner_wake_at(unsigned index);
-void cpu_bsp_wake(void); /* AP: a published retire ACK is ready for collection */
+void cpu_bsp_wake(void); /* AP: the BSP has something to collect (a retired task, frames wanted) */
+/* AP read sections. An AP syscall (syscall_ap) may read BSP-owned kernel objects in place,
+   without a trip through the BSP, between ap_read_begin and ap_read_end: interrupts off, no
+   waiting, no allocation, no writes to them. Before the BSP frees memory such a reader can reach
+   (a handle, its object, a handle table), it calls ap_read_synchronize, which returns once every
+   section open at the call has ended. */
+void ap_read_begin(void);
+void ap_read_end(void);
+void ap_read_synchronize(void);
 bool cpu_tlb_online(void);           /* BSP: any AP can hold TLB entries */
 bool cpu_tlb_ipi(unsigned index);    /* BSP: false when that AP is not running */
 bool cpu_worker_poll(void); /* AP idle stack only: execute a published bounded job */

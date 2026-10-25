@@ -22454,6 +22454,18 @@ typedef struct JSFunctionDef {
     JSVarDef *vars;
     int var_size; /* allocated size for vars[] */
     int var_count;
+#ifdef CONFIG_NOCTURNE
+    /* vars[] by name (var_index_update): bucket heads, and for each variable
+       the next lower-numbered one in its bucket */
+    int *var_index;
+    int *var_index_next;
+    int var_index_bits;
+    int var_index_count;    /* variables in the index */
+    int var_index_capacity; /* entries of var_index_next */
+    BOOL var_index_with;    /* a 'with' variable: scope walks emit its tests */
+    BOOL scope_links_final; /* js_create_function recomputed the scope links */
+    int scope_linked_vars;  /* var_count when it did; later ones are unlinked */
+#endif
     JSVarDef *args;
     int arg_size; /* allocated size for args[] */
     int arg_count; /* number of arguments */
@@ -24435,6 +24447,114 @@ static __exception int emit_push_const(JSParseState *s, JSValueConst val,
     return 0;
 }
 
+#ifdef CONFIG_NOCTURNE
+/* Nocturne: a function's variables by name. The top-level function of a
+   bundled script declares thousands, and resolving each identifier walked
+   them all (find_var, and the scope chains of resolve_scope_var), so that
+   compiling such a script took time quadratic in its size. The index answers
+   what those walks answer: the highest-numbered variable of a name at one
+   scope level. Small functions keep walking. */
+#define VAR_INDEX_MIN 32
+
+static void var_index_free(JSContext *ctx, JSFunctionDef *fd)
+{
+    js_free_rt(ctx->rt, fd->var_index);
+    js_free_rt(ctx->rt, fd->var_index_next);
+    fd->var_index = fd->var_index_next = NULL;
+    fd->var_index_count = fd->var_index_capacity = 0;
+}
+
+static uint32_t var_index_bucket(JSAtom name, int bits)
+{
+    return (uint32_t)(name * 0x9E3779B1u) >> (32 - bits);
+}
+
+/* Brings the index up to var_count. FALSE for a small function, or without
+   memory: the caller then walks the variables, as upstream does. The
+   allocations do not throw, so a failure leaves no exception behind. */
+static BOOL var_index_update(JSContext *ctx, JSFunctionDef *fd)
+{
+    int i, bits;
+    if (fd->var_count < VAR_INDEX_MIN)
+        return FALSE;
+    if (fd->var_index_count == fd->var_count)
+        return TRUE;
+    if (fd->var_count > fd->var_index_capacity) {
+        /* buckets for twice as many variables, so chains stay short */
+        int capacity = max_int(fd->var_count, fd->var_index_capacity * 2);
+        int *next, *heads;
+        for (bits = 6; (1 << bits) < capacity * 2; bits++)
+            continue;
+        next = js_realloc_rt(ctx->rt, fd->var_index_next, sizeof(int) * capacity);
+        if (!next)
+            return FALSE;
+        fd->var_index_next = next;
+        heads = js_realloc_rt(ctx->rt, fd->var_index, sizeof(int) << bits);
+        if (!heads)
+            return FALSE;
+        fd->var_index = heads;
+        fd->var_index_capacity = capacity;
+        fd->var_index_bits = bits;
+        memset(heads, 0xff, sizeof(int) << bits);
+        fd->var_index_count = 0;
+    }
+    for (i = fd->var_index_count; i < fd->var_count; i++) {
+        JSAtom name = fd->vars[i].var_name;
+        uint32_t bucket = var_index_bucket(name, fd->var_index_bits);
+        fd->var_index_next[i] = fd->var_index[bucket];
+        fd->var_index[bucket] = i;
+        if (name == JS_ATOM__with_)
+            fd->var_index_with = TRUE;
+    }
+    fd->var_index_count = fd->var_count;
+    return TRUE;
+}
+
+/* The highest-numbered variable below limit named name at scope level
+   level, or -1. A bucket lists its variables from the highest number down. */
+static int var_index_find(JSFunctionDef *fd, JSAtom name, int level, int limit)
+{
+    int i;
+    for (i = fd->var_index[var_index_bucket(name, fd->var_index_bits)]; i >= 0;
+         i = fd->var_index_next[i]) {
+        if (i < limit && fd->vars[i].var_name == name &&
+            fd->vars[i].scope_level == level)
+            return i;
+    }
+    return -1;
+}
+
+/* Whether resolve_scope_var may look fd's scope chains up in the index: their
+   links are final, and no 'with' or eval variable needs the walk's tests. */
+static BOOL scope_chain_indexed(JSContext *ctx, JSFunctionDef *fd)
+{
+    return fd->scope_links_final && !fd->has_eval_call &&
+        var_index_update(ctx, fd) && !fd->var_index_with;
+}
+
+/* The walk of a scope chain over the links js_create_function recomputed: a
+   scope's own variables from the newest, then, from scope 2 up, its parent's
+   chain; the argument scope's chain ends at ARG_SCOPE_END, the others at -1.
+   Returns the variable or -1, and in *end what the walk stopped at (the
+   variable when found). */
+static int scope_chain_find(JSFunctionDef *fd, JSAtom name, int scope, int *end)
+{
+    for (;;) {
+        int idx = var_index_find(fd, name, scope, fd->scope_linked_vars);
+        if (idx >= 0) {
+            *end = idx;
+            return idx;
+        }
+        if (scope < 2) {
+            *end = (scope == ARG_SCOPE_INDEX && fd->has_parameter_expressions) ?
+                ARG_SCOPE_END : -1;
+            return -1;
+        }
+        scope = fd->scopes[scope].parent;
+    }
+}
+#endif
+
 /* return the variable index or -1 if not found,
    add ARGUMENT_VAR_OFFSET for argument variables */
 static int find_arg(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
@@ -24450,6 +24570,12 @@ static int find_arg(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
 static int find_var(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
 {
     int i;
+#ifdef CONFIG_NOCTURNE
+    if (var_index_update(ctx, fd)) {
+        i = var_index_find(fd, name, 0, fd->var_count);
+        return i >= 0 ? i : find_arg(ctx, fd, name);
+    }
+#endif
     for(i = fd->var_count; i-- > 0;) {
         if (fd->vars[i].var_name == name && fd->vars[i].scope_level == 0)
             return i;
@@ -32666,6 +32792,9 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
         JS_FreeAtom(ctx, fd->vars[i].var_name);
     }
     js_free(ctx, fd->vars);
+#ifdef CONFIG_NOCTURNE
+    var_index_free(ctx, fd);
+#endif
     for(i = 0; i < fd->arg_count; i++) {
         JS_FreeAtom(ctx, fd->args[i].var_name);
     }
@@ -33412,6 +33541,18 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
 
     /* resolve local scoped variables */
     var_idx = -1;
+#ifdef CONFIG_NOCTURNE
+    if (scope_chain_indexed(ctx, s)) {
+        var_idx = scope_chain_find(s, var_name, scope_level, &idx);
+        if (var_idx >= 0 && (op == OP_scope_put_var || op == OP_scope_make_ref) &&
+            s->vars[var_idx].is_const) {
+            dbuf_putc(bc, OP_throw_error);
+            dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+            dbuf_putc(bc, JS_THROW_VAR_RO);
+            goto done;
+        }
+    } else
+#endif
     for (idx = s->scopes[scope_level].first; idx >= 0;) {
         vd = &s->vars[idx];
         if (vd->var_name == var_name) {
@@ -33583,6 +33724,18 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
     for (fd = s; fd->parent;) {
         scope_level = fd->parent_scope_level;
         fd = fd->parent;
+#ifdef CONFIG_NOCTURNE
+        if (scope_chain_indexed(ctx, fd)) {
+            var_idx = scope_chain_find(fd, var_name, scope_level, &idx);
+            if (var_idx >= 0 && (op == OP_scope_put_var || op == OP_scope_make_ref) &&
+                fd->vars[var_idx].is_const) {
+                dbuf_putc(bc, OP_throw_error);
+                dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+                dbuf_putc(bc, JS_THROW_VAR_RO);
+                goto done;
+            }
+        } else
+#endif
         for (idx = fd->scopes[scope_level].first; idx >= 0;) {
             vd = &fd->vars[idx];
             if (vd->var_name == var_name) {
@@ -36570,6 +36723,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
             vd->scope_next = fd->scopes[scope].first;
         }
     }
+#ifdef CONFIG_NOCTURNE
+    fd->scope_links_final = TRUE;
+    fd->scope_linked_vars = fd->var_count;
+#endif
 
     /* if the function contains an eval call, the closure variables
        are used to compile the eval and they must be ordered by scope,
@@ -36613,6 +36770,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 
     if (resolve_variables(ctx, fd))
         goto fail;
+#ifdef CONFIG_NOCTURNE
+    /* the children resolved theirs before: no lookup reaches fd again */
+    var_index_free(ctx, fd);
+#endif
 
 #if defined(DUMP_BYTECODE) && (DUMP_BYTECODE & 2)
     if (!fd->strip_debug) {

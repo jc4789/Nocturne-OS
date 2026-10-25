@@ -579,6 +579,36 @@ static void win_release(struct object *o) { kfree(o->priv); }
 static const struct object_ops win_ops = {
     .kind = N_KIND_WINDOW, .ready = win_ready, .close = win_close, .release = win_release};
 
+/* What WIN_STATE answers, on the BSP and on an AP (wm_state_ap): the window's own flags, and
+   whether it is the one update_focus last gave the focus to (focused() whenever the WM is between
+   changes) and the one shown directly. No other window is read. */
+static int64_t win_state_of(struct window *w) {
+    bool shown = !__atomic_load_n(&w->dead, __ATOMIC_ACQUIRE) && __atomic_load_n(&w->shown, __ATOMIC_RELAXED) &&
+                 !__atomic_load_n(&w->minimized, __ATOMIC_RELAXED);
+    return (shown ? WIN_STATE_VISIBLE : 0) | (__atomic_load_n(&last_focus, __ATOMIC_RELAXED) == w ? WIN_STATE_FOCUSED : 0) |
+           (__atomic_load_n(&w->fullscreen, __ATOMIC_RELAXED) ? WIN_STATE_FULLSCREEN : 0) |
+           (__atomic_load_n(&direct_win, __ATOMIC_RELAXED) == w ? WIN_STATE_DIRECT : 0);
+}
+
+bool wm_state_ap(struct handle *h, int64_t *result) {
+    if (!handle_is(h, &win_ops)) return false;
+    struct window *w = h->object->priv;
+    if (w->pml4 != current_task->pml4) return false; /* the BSP refuses it */
+    *result = win_state_of(w);
+    return true;
+}
+
+bool wm_receive_ap(struct handle *h, size_t max, int64_t timeout_ms, int64_t *result) {
+    if (!handle_is(h, &win_ops) || max == 0 || max > SIZE_MAX / sizeof(struct gui_event)) return false;
+    struct window *w = h->object->priv;
+    if (__atomic_load_n(&w->ev_count, __ATOMIC_ACQUIRE) || __atomic_load_n(&w->frame_ready, __ATOMIC_ACQUIRE))
+        return false;
+    if (__atomic_load_n(&w->dead, __ATOMIC_ACQUIRE)) *result = -N_ERR_CLOSED;
+    else if (timeout_ms != 0) return false;
+    else *result = 0;
+    return true;
+}
+
 static bool alloc_buffer(struct window *w, int cw, int ch) {
     w->deep = (w->flags & WIN_DEEP_COLOR) != 0; /* kept on 8 bpc: the depth can change */
     size_t pixels = (size_t)cw * ch;
@@ -2745,8 +2775,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct window *w=handle_window(handle);
         if(!w)return -N_ERR_NO_HANDLE;
         if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;
-        return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0) | (w->fullscreen?WIN_STATE_FULLSCREEN:0) |
-               (direct_win==w?WIN_STATE_DIRECT:0);
+        return win_state_of(w);
     }
     case SYS_WIN_DIRECT: {
         struct window *w = handle_window(handle);

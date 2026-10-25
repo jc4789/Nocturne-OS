@@ -1873,21 +1873,6 @@ static struct tcb *user_tcb(int h) {
     return t && t->state!=T_FREE && t->user_open && t->pid==task_process()->pid?t:NULL;
 }
 
-/* No stack growth or demand allocation on an AP. Other threads of the space
-   keep running, so a true result also holds off VMM revocation of this space
-   (vmm_ap_uaccess_begin) until the caller's copy ends with
-   vmm_ap_uaccess_end; a revocation already under way makes this false. */
-static bool ap_user_mapped(const void *pointer, size_t length, bool write) {
-    uint64_t address = (uint64_t)pointer;
-    if (address >= USER_TOP || length > USER_TOP-address) return false;
-    if (!vmm_ap_uaccess_begin()) return false;
-    for (uint64_t at=ALIGN_DOWN(address,PAGE_SIZE); at<address+length; at+=PAGE_SIZE) {
-        uint64_t pte = vmm_get_pte(current_task->pml4, at);
-        if ((pte & (PTE_P|PTE_U)) != (PTE_P|PTE_U) || (write && !(pte&PTE_W))) { vmm_ap_uaccess_end(); return false; }
-    }
-    return true;
-}
-
 /* Each AP owns only its own CPU-indexed counters. The DPL3 interrupt gate
    enters with IRQs disabled; this bounded path neither enables them nor
    waits/yields, and runner retirement/preemption happens after it returns.
@@ -1938,7 +1923,7 @@ bool net_ap_syscall(struct regs *regs) {
         }
         uint32_t n = (uint32_t)MIN(MIN(wanted, (size_t)65536), t->tx_capacity-t->tx_len);
         if (!n) { if(nonblock)result=-N_ERR_NOT_READY;else {ND_FALLBACK(cpu,ND_TX_FULL);handled=false;} goto release_socket; }
-        if (!ap_user_mapped((void *)regs->rsi,n,false)) { ND_FALLBACK(cpu,ND_TX_MAP);handled=false; goto release_socket; }
+        if (!vmm_ap_user_begin((void *)regs->rsi,n,false)) { ND_FALLBACK(cpu,ND_TX_MAP);handled=false; goto release_socket; }
         tcp_ring_write(t->tx,t->tx_capacity,t->tx_head+t->tx_len,(void *)regs->rsi,n);
         vmm_ap_uaccess_end();
         t->tx_len+=n;
@@ -1958,7 +1943,7 @@ bool net_ap_syscall(struct regs *regs) {
             goto release_socket;
         }
         uint32_t n = (uint32_t)MIN(MIN(wanted,(size_t)65536),t->rx_len);
-        if (!ap_user_mapped((void *)regs->rsi,n,true)) { ND_FALLBACK(cpu,ND_RX_MAP);handled=false; goto release_socket; }
+        if (!vmm_ap_user_begin((void *)regs->rsi,n,true)) { ND_FALLBACK(cpu,ND_RX_MAP);handled=false; goto release_socket; }
         tcp_ring_read((void *)regs->rsi,t->rx,t->rx_capacity,t->rx_head,n);
         vmm_ap_uaccess_end();
         t->rx_head=(t->rx_head+n)%t->rx_capacity;

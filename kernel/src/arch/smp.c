@@ -117,6 +117,31 @@ void cpu_bsp_wake(void) {
     if (!lapic_send_ipi(bsp_apic_id, VEC_USER_RETURN))
         __asm__ volatile("ud2" : : : "memory");
 }
+/* AP read sections (smp.h): a CPU's count is odd while it reads. Each AP
+   writes only its own; ap_read_synchronize reads them all. */
+static struct { uint64_t seq; } __attribute__((aligned(64))) ap_reading[CPU_MAX_COUNT];
+
+void ap_read_begin(void) {
+    uint64_t *seq = &ap_reading[cpu_current_index()].seq;
+    __atomic_store_n(seq, *seq + 1, __ATOMIC_RELAXED);
+    /* Dekker with ap_read_synchronize: either the BSP sees this section open
+       and waits, or this AP sees the pointer the BSP took away before it. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+void ap_read_end(void) {
+    uint64_t *seq = &ap_reading[cpu_current_index()].seq;
+    __atomic_store_n(seq, *seq + 1, __ATOMIC_RELEASE);
+}
+void ap_read_synchronize(void) {
+    cpu_require_bsp();
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    for (unsigned i = 1; i < slots; i++) {
+        uint64_t seq = __atomic_load_n(&ap_reading[i].seq, __ATOMIC_ACQUIRE);
+        if (!(seq & 1)) continue;
+        while (__atomic_load_n(&ap_reading[i].seq, __ATOMIC_ACQUIRE) == seq) pause();
+    }
+}
+
 bool cpu_tlb_online(void) { return slots > 1; }
 bool cpu_tlb_ipi(unsigned i) {
     /* A failed AP halts with IRQs off and never touches memory again. */
