@@ -176,11 +176,11 @@ static float corners_coverage(float px,float py,float x,float y,float w,float h,
 }
 /* Distances from the left, top, right and bottom edges past which
    corners_coverage() is exactly 1 inside the box (both the circular SDF and
-   the elliptical path clamp there), and a row's coverage depends on x alone. */
+   the elliptical path clamp there), and a row's coverage depends on x alone.
+   A corner reaches across by its x radius and down by its y radius. */
 static void radii_reach(const struct border_radii *r,float reach[4]) {
-    float corner[4];for(int i=0;i<4;i++)corner[i]=fmaxf(r->x[i],r->y[i]);
-    reach[0]=fmaxf(corner[0],corner[3])+2;reach[1]=fmaxf(corner[0],corner[1])+2;
-    reach[2]=fmaxf(corner[1],corner[2])+2;reach[3]=fmaxf(corner[2],corner[3])+2;
+    reach[0]=fmaxf(r->x[0],r->x[3])+2;reach[1]=fmaxf(r->y[0],r->y[1])+2;
+    reach[2]=fmaxf(r->x[1],r->x[2])+2;reach[3]=fmaxf(r->y[2],r->y[3])+2;
 }
 /* The pixels [*first, *last) of a row whose centres lie between `from` and
    `to` (row-relative): past both side reaches, where a row's coverage
@@ -190,76 +190,135 @@ static void radii_middle(float from,float to,int width,int *first,int *last) {
     *first=(int)fmaxf(0,fminf((float)width,a));*last=(int)fmaxf(0,fminf((float)width,b));
     if(*first>=*last)*first=*last=-1;
 }
+/* Rounded-box coverage masks. A mask depends on the shape alone: its size, its radii and its
+   offset from the pixel grid. Shapes are shared, so like boxes (a grid of thumbnails) build one
+   mask, and a box that moves by whole pixels, scrolls or is laid out again keeps its own. A mask
+   keeps only the rows that differ: those across the corners, and one for the middle, where
+   coverage depends on x alone (gfx_mask_clip's repeated rows). That bounds it by the radii, not
+   by the box, so it covers the whole box and no view cuts it. It is built when a paint first
+   draws through it. */
+struct radius_key { float fx,fy,w,h;struct border_radii radii; };
+struct radius_shape {
+    struct radius_shape *next;
+    struct radius_key key;
+    uint32_t hash,refs;          /* refs: the caches holding it, under radius_shapes' lock */
+    int width,height;            /* pixels covered, from floor(x), floor(y) */
+    int repeat_at,repeat_extra;  /* as gfx_mask_clip's */
+    size_t rows;                 /* stored; 0 past RADIUS_MASK_MAX: painted without the mask */
+    struct gfx_mask_span *mask;  /* NULL until built: each stored row's all-255 run, then its
+                                    width alpha bytes (radius_shape_alpha) */
+};
 struct radius_cache {
     float x,y,w,h;struct border_radii radii;
-    int left,top,width,height;bool clipped;
-    int view_x,view_y,view_w,view_h;
-    uint8_t *alpha;
-    struct gfx_mask_span *opaque;
+    int left,top;                /* the mask's first pixel: floor(x), floor(y) */
+    struct radius_shape *shape;
 };
-void web_radius_cache_free(struct radius_cache **slot){struct radius_cache *cache=*slot;*slot=NULL;if(cache){free(cache->alpha);free(cache->opaque);free(cache);}}
+#define RADIUS_MASK_MAX (64u<<20)
+/* Every document's shapes. Caches take them while paint order is prepared and release them there
+   and in layout's workers (fragments trimmed), so the table has a lock. */
+static struct { uint32_t lock,cap,count; struct radius_shape **v; } radius_shapes;
+static void radius_shapes_lock(void){while(__atomic_exchange_n(&radius_shapes.lock,1,__ATOMIC_ACQUIRE))__asm__ volatile("pause");}
+static void radius_shapes_unlock(void){__atomic_store_n(&radius_shapes.lock,0,__ATOMIC_RELEASE);}
+static uint32_t radius_key_hash(const struct radius_key *key) {
+    const unsigned char *p=(const unsigned char *)key;uint32_t hash=2166136261u;
+    for(size_t i=0;i<sizeof *key;i++)hash=(hash^p[i])*16777619u;
+    return hash;
+}
+/* A table twice the size; without the memory the chains just grow longer. Under the lock. */
+static void radius_shapes_grow(void) {
+    uint32_t cap=radius_shapes.cap?radius_shapes.cap*2:256;
+    struct radius_shape **v=calloc(cap,sizeof *v);if(!v)return;
+    for(uint32_t i=0;i<radius_shapes.cap;i++)
+        for(struct radius_shape *s=radius_shapes.v[i],*next;s;s=next){next=s->next;s->next=v[s->hash&(cap-1)];v[s->hash&(cap-1)]=s;}
+    free(radius_shapes.v);radius_shapes.v=v;radius_shapes.cap=cap;
+}
+static struct radius_shape *radius_shape_take(const struct radius_key *key) {
+    uint32_t hash=radius_key_hash(key);
+    radius_shapes_lock();
+    struct radius_shape *s=NULL;
+    if(radius_shapes.cap)
+        for(s=radius_shapes.v[hash&(radius_shapes.cap-1)];s;s=s->next)if(s->hash==hash&&!memcmp(&s->key,key,sizeof *key))break;
+    if(!s&&(s=calloc(1,sizeof *s))) {
+        if(radius_shapes.count>=radius_shapes.cap)radius_shapes_grow();
+        if(!radius_shapes.cap){radius_shapes_unlock();free(s);return NULL;}
+        s->key=*key;s->hash=hash;
+        double width=ceil((double)key->fx+key->w),height=ceil((double)key->fy+key->h);
+        s->width=width<INT_MAX?(int)width:INT_MAX;s->height=height<INT_MAX?(int)height:INT_MAX;
+        /* Rows whose centre lies past both the top and the bottom reach: x alone decides their coverage. */
+        float reach[4];radii_reach(&key->radii,reach);
+        double plain0=fmax(0,ceil((double)reach[1]+key->fy-.5)),plain1=fmin(s->height,floor((double)key->fy+key->h-.5-reach[3])+1);
+        if(plain1-plain0>=2){s->repeat_at=(int)plain0;s->repeat_extra=(int)(plain1-plain0)-1;}
+        s->rows=(size_t)s->height-(size_t)s->repeat_extra;
+        if(!s->width||!s->rows||(size_t)s->width>RADIUS_MASK_MAX/s->rows)s->rows=0;
+        s->next=radius_shapes.v[hash&(radius_shapes.cap-1)];radius_shapes.v[hash&(radius_shapes.cap-1)]=s;radius_shapes.count++;
+    }
+    if(s)s->refs++;
+    radius_shapes_unlock();
+    return s;
+}
+static void radius_shape_release(struct radius_shape *s) {
+    if(!s)return;
+    radius_shapes_lock();
+    if(--s->refs){radius_shapes_unlock();return;}
+    struct radius_shape **at=&radius_shapes.v[s->hash&(radius_shapes.cap-1)];
+    while(*at!=s)at=&(*at)->next;
+    *at=s->next;radius_shapes.count--;
+    radius_shapes_unlock();
+    free(s->mask);free(s);
+}
+static const uint8_t *radius_shape_alpha(const struct radius_shape *s){return (const uint8_t *)(s->mask+s->rows);}
+/* The shape's mask, built on first use: NULL without the memory or past RADIUS_MASK_MAX. A mask
+   is published whole, so two threads painting at once at worst build it twice. */
+static const struct radius_shape *radius_shape_mask(struct radius_shape *s,bool profile) {
+    if(!s||!s->rows)return NULL;
+    if(__atomic_load_n(&s->mask,__ATOMIC_ACQUIRE))return s;
+    const struct radius_key *k=&s->key;
+    struct gfx_mask_span *mask=malloc(s->rows*(sizeof *mask+(size_t)s->width));
+    if(!mask)return NULL;
+    uint8_t *alpha=(uint8_t *)(mask+s->rows);
+    float reach[4];radii_reach(&k->radii,reach);
+    int mid0,mid1;radii_middle(k->fx+reach[0],k->fx+k->w-reach[2],s->width,&mid0,&mid1);
+    for(size_t i=0;i<s->rows;i++) {
+        int py=(int)i<=s->repeat_at?(int)i:(int)i+s->repeat_extra;
+        int first=-1,last=0;
+        uint8_t *row=alpha+i*(size_t)s->width;
+        for(int px=0;px<s->width;px++) {
+            uint8_t a=(uint8_t)(255*corners_coverage(px+.5f,py+.5f,k->fx,k->fy,k->w,k->h,&k->radii)+.5f);
+            if(px==mid0){memset(row+mid0,a,(size_t)(mid1-mid0));if(a==255){if(first<0)first=mid0;last=mid1;}px=mid1-1;continue;}
+            row[px]=a;
+            if(a==255){if(first<0)first=px;last=px+1;}
+        }
+        mask[i]=(struct gfx_mask_span){first<0?0:first,last};
+    }
+    struct gfx_mask_span *none=NULL;
+    if(!__atomic_compare_exchange_n(&s->mask,&none,mask,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))free(mask);
+    else if(profile){paint_profile.radius_builds++;paint_profile.radius_pixels+=(uint64_t)s->width*s->rows;}
+    return s;
+}
+void web_radius_cache_free(struct radius_cache **slot){struct radius_cache *cache=*slot;*slot=NULL;if(cache){radius_shape_release(cache->shape);free(cache);}}
 static bool radius_cache_prepare(web_doc *doc,struct radius_cache **slot,float x,float y,float w,float h,struct border_radii radii) {
     if(!radii_any(&radii)||w<=0||h<=0){web_radius_cache_free(slot);return true;}
-    if(!web_native_checkpoint(doc))return false; /* empty/offscreen slices still cancel before publication */
-    struct radius_cache *old=*slot;
-    if(old&&old->x==x&&old->y==y&&old->w==w&&old->h==h&&!memcmp(&old->radii,&radii,sizeof radii)&&
-        (!old->clipped||(old->view_x==doc->view_x&&old->view_y==doc->view_y&&old->view_w==doc->width&&old->view_h==doc->height))){doc->paint_shadow_crop|=old->clipped;return true;}
-    double vx1=(double)doc->view_x+doc->width,vy1=(double)doc->view_y+doc->height;
-    double left=fmin(vx1,fmax(floor((double)x),doc->view_x)),top=fmin(vy1,fmax(floor((double)y),doc->view_y));
-    double right=fmax(doc->view_x,fmin(ceil((double)x+w),vx1)),bottom=fmax(doc->view_y,fmin(ceil((double)y+h),vy1));
+    if(!web_native_checkpoint(doc))return false;
+    double left=floor((double)x),top=floor((double)y);
     if(!isfinite(left)||!isfinite(top)||left<INT_MIN||top<INT_MIN||left>INT_MAX||top>INT_MAX)return false;
-    double width=fmax(0,right-left),height=fmax(0,bottom-top);
-    if(width>INT_MAX||height>INT_MAX||(height>0&&(size_t)width>SIZE_MAX/(size_t)height))return false;
-    bool clipped=left!=floor((double)x)||top!=floor((double)y)||right!=ceil((double)x+w)||bottom!=ceil((double)y+h);
-    /* Coverage depends only on the pixel offset from the box, so an unclipped
-       mask moved by whole pixels (content shifted by layout) is the same mask. */
-    if(old&&!old->clipped&&!clipped&&old->w==w&&old->h==h&&!memcmp(&old->radii,&radii,sizeof radii)&&
-       x-floorf(x)==old->x-floorf(old->x)&&y-floorf(y)==old->y-floorf(old->y)&&
-       old->width==(int)width&&old->height==(int)height){
-        old->x=x;old->y=y;old->left=(int)left;old->top=(int)top;
-        old->view_x=doc->view_x;old->view_y=doc->view_y;old->view_w=doc->width;old->view_h=doc->height;
-        if(doc->profile_enabled)paint_profile.radius_moves++;
-        return true;
-    }
-    struct radius_cache *next=calloc(1,sizeof *next);if(!next)return false;
-    next->x=x;next->y=y;next->w=w;next->h=h;next->radii=radii;next->left=(int)left;next->top=(int)top;next->width=(int)width;next->height=(int)height;
-    next->clipped=clipped;
-    next->view_x=doc->view_x;next->view_y=doc->view_y;next->view_w=doc->width;next->view_h=doc->height;
-    size_t pixels=(size_t)next->width*next->height;
-    if(pixels&&((size_t)next->height>SIZE_MAX/sizeof *next->opaque||
-        !(next->alpha=malloc(pixels))||!(next->opaque=calloc((size_t)next->height,sizeof *next->opaque)))){web_radius_cache_free(&next);return false;}
-    if(doc->profile_enabled){paint_profile.radius_builds++;paint_profile.radius_pixels+=pixels;}
-    /* Rows clear of every corner and of the top/bottom anti-aliased edge have
-       coverage that depends on x alone: compute one such row and copy it. */
-    float reach[4];radii_reach(&radii,reach);
-    int middle=-1;
-    for(int py=0;py<next->height;py++) {
-        if(!(py&31)&&!web_native_checkpoint(doc)){web_radius_cache_free(&next);return false;}
-        float center=next->top+py+.5f;
-        bool plain=center-y>=reach[1]&&y+h-center>=reach[3];
-        if(plain&&middle>=0&&next->alpha){
-            memcpy(next->alpha+(size_t)py*next->width,next->alpha+(size_t)middle*next->width,(size_t)next->width);
-            next->opaque[py]=next->opaque[middle];continue;
-        }
-        if(plain)middle=py;
-        int first=-1,last=0;
-        int mid0,mid1;radii_middle(x+reach[0]-next->left,x+w-reach[2]-next->left,next->width,&mid0,&mid1);
-        uint8_t *row=next->alpha+(size_t)py*next->width;
-        for(int px=0;px<next->width;px++) {
-            uint8_t alpha=(uint8_t)(255*corners_coverage(next->left+px+.5f,next->top+py+.5f,x,y,w,h,&radii)+.5f);
-            if(px==mid0){memset(row+mid0,alpha,(size_t)(mid1-mid0));if(alpha==255){if(first<0)first=mid0;last=mid1;}px=mid1-1;continue;}
-            row[px]=alpha;
-            if(alpha==255){if(first<0)first=px;last=px+1;}
-        }
-        if(next->opaque)next->opaque[py]=(struct gfx_mask_span){first<0?0:first,last};
-    }
-    doc->paint_shadow_crop|=next->clipped;web_radius_cache_free(slot);*slot=next;return true;
+    struct radius_key key={(float)((double)x-left),(float)((double)y-top),w,h,radii};
+    struct radius_cache *cache=*slot;
+    if(!cache||!cache->shape||memcmp(&cache->shape->key,&key,sizeof key)) {
+        struct radius_shape *shape=radius_shape_take(&key);if(!shape)return false;
+        if(!cache&&!(cache=calloc(1,sizeof *cache))){radius_shape_release(shape);return false;}
+        radius_shape_release(cache->shape);cache->shape=shape;
+    } else if((cache->left!=(int)left||cache->top!=(int)top)&&doc->profile_enabled)paint_profile.radius_moves++;
+    cache->x=x;cache->y=y;cache->w=w;cache->h=h;cache->radii=radii;cache->left=(int)left;cache->top=(int)top;
+    *slot=cache;return true;
 }
 static bool radius_clip_push(struct pctx *P,const struct radius_cache *cache,struct gfx_mask_clip *clip,float x,float y) {
     if(!cache)return false;
+    const struct radius_shape *s=radius_shape_mask(cache->shape,P->d->profile_enabled);
+    if(!s){P->failed=cache->shape->rows!=0;return false;} /* without memory; an oversized shape goes unclipped */
     double left=cache->left+((double)x-cache->x),top=cache->top+((double)y-cache->y);
     if(!isfinite(left)||!isfinite(top)||left<INT_MIN||top<INT_MIN||left>INT_MAX||top>INT_MAX){P->failed=true;return false;}
-    *clip=(struct gfx_mask_clip){.next=P->c->mask_clip,.alpha=cache->alpha,.x=(int)lround(left),.y=(int)lround(top),.w=cache->width,.h=cache->height,.pitch=cache->width,.opaque=cache->opaque};
+    *clip=(struct gfx_mask_clip){.next=P->c->mask_clip,.alpha=radius_shape_alpha(s),.x=(int)lround(left),.y=(int)lround(top),.w=s->width,.h=s->height,
+                                 .pitch=s->width,.opaque=s->mask,.repeat_at=s->repeat_at,.repeat_extra=s->repeat_extra};
     P->c->mask_clip=clip;
     web_avmedia_snapshot_blend_region(P->c,clip->x,clip->y,clip->w,clip->h);
     return true;
@@ -932,29 +991,38 @@ static void fill_gradient(canvas_t *c, float x, float y, float w, float h, float
     raster_draw(c,x,y,w,h,raster_gradient,&geometry);
 }
 
-static unsigned radius_alpha(const struct radius_cache *cache,int x,int y,float shape_x,float shape_y) {
-    int64_t px=(int64_t)x-(int64_t)lround((double)cache->left+((double)shape_x-cache->x)),py=(int64_t)y-(int64_t)lround((double)cache->top+((double)shape_y-cache->y));
-    return px>=0&&py>=0&&px<cache->width&&py<cache->height&&cache->alpha?cache->alpha[(size_t)py*cache->width+(size_t)px]:0;
+/* Where a paint at x,y puts the first pixel of the cache's mask. */
+static void radius_origin(const struct radius_cache *cache,float x,float y,int64_t *left,int64_t *top) {
+    *left=lround((double)cache->left+((double)x-cache->x));*top=lround((double)cache->top+((double)y-cache->y));
+}
+static unsigned radius_alpha(const struct radius_shape *s,int64_t x,int64_t y) {
+    if(x<0||y<0||x>=s->width||y>=s->height)return 0;
+    return radius_shape_alpha(s)[(size_t)gfx_mask_stored_row(s->repeat_at,s->repeat_extra,(int)y)*(size_t)s->width+(size_t)x];
 }
 static void paint_corner_border(struct pctx *P,float x,float y,float w,float h,const float *widths,const uint32_t *colors,
-                                const struct radius_cache *outer,const struct radius_cache *inner) {
+                                const struct radius_cache *outer_cache,const struct radius_cache *inner_cache) {
     canvas_t *c=P->c;
+    /* A shape past RADIUS_MASK_MAX has no mask: its border is painted square. */
+    const struct radius_shape *outer=radius_shape_mask(outer_cache->shape,P->d->profile_enabled);
+    const struct radius_shape *inner=inner_cache?radius_shape_mask(inner_cache->shape,P->d->profile_enabled):NULL;
+    if((!outer&&outer_cache->shape->rows)||(inner_cache&&!inner&&inner_cache->shape->rows)){P->failed=true;return;}
     int x0=(int)fmax(c->cx0,fmin(c->cx1,floor((double)x))),y0=(int)fmax(c->cy0,fmin(c->cy1,floor((double)y)));
     int x1=(int)fmax(c->cx0,fmin(c->cx1,ceil((double)x+w))),y1=(int)fmax(c->cy0,fmin(c->cy1,ceil((double)y+h)));
+    int64_t outer_x=0,outer_y=0,inner_x=0,inner_y=0;
+    if(outer)radius_origin(outer_cache,x,y,&outer_x,&outer_y);
+    if(inner)radius_origin(inner_cache,x+widths[3],y+widths[0],&inner_x,&inner_y);
     /* Where the inner shape covers fully the border has no coverage; it is
        convex, so that is one run per row, which is skipped. */
-    int64_t inner_x=inner?lround((double)inner->left+((double)(x+widths[3])-inner->x)):0;
-    int64_t inner_y=inner?lround((double)inner->top+((double)(y+widths[0])-inner->y)):0;
     for(int py=y0;py<y1;py++) {
       int64_t skip0=0,skip1=0;
       if(inner){
           int64_t row=py-inner_y;
-          if(inner->opaque&&row>=0&&row<inner->height){skip0=inner_x+inner->opaque[row].x0;skip1=inner_x+inner->opaque[row].x1;}
+          if(row>=0&&row<inner->height){const struct gfx_mask_span *run=&inner->mask[gfx_mask_stored_row(inner->repeat_at,inner->repeat_extra,(int)row)];skip0=inner_x+run->x0;skip1=inner_x+run->x1;}
       } else if(py+.5f>=y+widths[0]&&py+.5f<y+h-widths[2]){skip0=(int64_t)ceilf(x+widths[3]-.5f);skip1=(int64_t)ceilf(x+w-widths[1]-.5f);}
       for(int px=x0;px<x1;px++) {
         if(px>=skip0&&px<skip1){px=(int)skip1-1;continue;}
-        unsigned outside=radius_alpha(outer,px,py,x,y);if(!outside)continue;
-        unsigned inside=inner?radius_alpha(inner,px,py,x+widths[3],y+widths[0]):
+        unsigned outside=outer?radius_alpha(outer,px-outer_x,py-outer_y):255;if(!outside)continue;
+        unsigned inside=inner?radius_alpha(inner,px-inner_x,py-inner_y):
             (px+.5f>=x+widths[3]&&px+.5f<x+w-widths[1]&&py+.5f>=y+widths[0]&&py+.5f<y+h-widths[2]?255:0);
         float cover=outside*(255-inside)*(1.f/(255*255));if(cover<=0)continue;
         float distance[4]={py+.5f-y,x+w-px-.5f,y+h-py-.5f,px+.5f-x};int side=-1;
@@ -1778,7 +1846,7 @@ static bool prepare_paint_order(web_doc *d){
        d->paint_order_visual==d->visual_revision&&(!d->paint_shadow_crop||
        (d->paint_shadow_view_x==d->view_x&&d->paint_shadow_view_y==d->view_y&&
         d->paint_shadow_view_w==d->width&&d->paint_shadow_view_h==d->height)))return true;
-    /* Viewport-cropped radius/shadow masks are cut to the whole view rect: a
+    /* Viewport-cropped shadow masks are cut to the whole view rect: a
        viewport resize that leaves layout unchanged must still recut them. */
     d->paint_order_valid=false;
     d->paint_shadow_crop=false;

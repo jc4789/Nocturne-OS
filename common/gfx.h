@@ -14,7 +14,14 @@ struct gfx_mask_clip {
     const uint8_t *alpha;
     int x,y,w,h,pitch;
     const struct gfx_mask_span *opaque; /* optional per-row proof, same owner as alpha */
+    /* Rows repeat_at..repeat_at+repeat_extra are one stored row (a shape's middle, alike all
+       the way down), and the rows after them are stored repeat_extra rows earlier. 0: none. */
+    int repeat_at,repeat_extra;
 };
+/* The stored row (of alpha and opaque) of a mask's row y. */
+static inline int gfx_mask_stored_row(int repeat_at,int repeat_extra,int y) {
+    return y<=repeat_at?y:y<=repeat_at+repeat_extra?repeat_at:y-repeat_extra;
+}
 typedef struct {
     uint32_t *px;
     int w, h, pitch;                 /* pitch in pixels */

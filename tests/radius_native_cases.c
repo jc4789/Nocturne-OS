@@ -5,6 +5,22 @@ static void check(bool value,const char *name){checks++;if(!value){failed++;prin
 static uint32_t pixels[256*160];
 static uint32_t pixel(int x,int y){return pixels[y*256+x]&0xffffffu;}
 static void reset(canvas_t *canvas){gfx_init(canvas,pixels,256,160,256);gfx_fill(canvas,0,0,256,160,0xffffffffu);}
+/* The descriptor radius_clip_push gives a paint at the cache's own position. */
+static struct gfx_mask_clip shape_clip(const struct radius_cache *cache){
+    const struct radius_shape *s=radius_shape_mask(cache->shape,false);
+    if(!s)return (struct gfx_mask_clip){0};
+    return (struct gfx_mask_clip){.alpha=radius_shape_alpha(s),.x=cache->left,.y=cache->top,.w=s->width,.h=s->height,.pitch=s->width,
+                                  .opaque=s->mask,.repeat_at=s->repeat_at,.repeat_extra=s->repeat_extra};
+}
+/* Every pixel of a box tall enough to repeat rows reads the coverage of its own pixel. */
+static bool exact_shape(web_doc *doc,struct radius_cache **cache,canvas_t *canvas,float x,float y,float w,float h,struct border_radii radii){
+    if(!radius_cache_prepare(doc,cache,x,y,w,h,radii))return false;
+    struct gfx_mask_clip mask=shape_clip(*cache);reset(canvas);canvas->mask_clip=&mask;
+    bool exact=mask.repeat_extra>0;
+    for(int yy=(int)floorf(y);exact&&yy<(int)ceilf(y+h)+1;yy++)for(int xx=(int)floorf(x);xx<(int)ceilf(x+w)+1;xx++)
+        exact&=gfx_clip_alpha(canvas,xx,yy)==(uint8_t)(255*corners_coverage(xx+.5f,yy+.5f,x,y,w,h,&radii)+.5f);
+    canvas->mask_clip=NULL;return exact;
+}
 static int mask_performance(void){
     const int width=1920,height=1080,frames=8;size_t count=(size_t)width*height;
     uint32_t *slow=calloc(count,sizeof *slow),*fast=calloc(count,sizeof *fast),*source=malloc(count*sizeof *source);
@@ -13,10 +29,10 @@ static int mask_performance(void){
     style_t style={.border_radius=4};web_doc doc={.width=width,.height=height};struct radius_cache *cache=NULL;
     check(radius_cache_prepare(&doc,&cache,0,0,width,height,used_radii(&style,width,height)),"actual 1080p retained mask");
     if(!cache){free(slow);free(fast);free(source);return 1;}
-    struct gfx_mask_clip masks[4];for(int i=0;i<4;i++)masks[i]=(struct gfx_mask_clip){.alpha=cache->alpha,.x=cache->left,.y=cache->top,.w=cache->width,.h=cache->height,.pitch=cache->width,.next=i?&masks[i-1]:NULL};
+    struct gfx_mask_clip masks[4];for(int i=0;i<4;i++){masks[i]=shape_clip(cache);masks[i].opaque=NULL;masks[i].next=i?&masks[i-1]:NULL;}
     image_t image={.w=width,.h=height,.px=source};canvas_t canvas;gfx_init(&canvas,slow,width,height,width);canvas.mask_clip=&masks[3];
     clock_t start=clock();for(int i=0;i<frames;i++){gfx_fill(&canvas,0,0,width,height,0xffffffffu);image_draw(&canvas,&image,0,0);}clock_t old=clock();
-    for(int i=0;i<4;i++)masks[i].opaque=cache->opaque;
+    for(int i=0;i<4;i++)masks[i].opaque=shape_clip(cache).opaque;
     gfx_init(&canvas,fast,width,height,width);canvas.mask_clip=&masks[3];
     for(int i=0;i<frames;i++){gfx_fill(&canvas,0,0,width,height,0xffffffffu);image_draw(&canvas,&image,0,0);}clock_t optimized=clock();
     check(!memcmp(slow,fast,count*sizeof *slow),"all 1080p pixels match generic chain reference after repeated frames");
@@ -69,8 +85,9 @@ int main(int argc,char **argv){
     web_doc doc={.width=256,.height=160};struct radius_cache *cache=NULL;canvas_t canvas;reset(&canvas);
     check(radius_cache_prepare(&doc,&cache,50,50,80,40,radii),"retained real A8 geometry construction");
     struct radius_cache *retained=cache;check(radius_cache_prepare(&doc,&cache,50,50,80,40,radii)&&cache==retained,"unchanged radius cache identity");
-    struct gfx_mask_clip mask={.alpha=cache->alpha,.x=cache->left,.y=cache->top,.w=cache->width,.h=cache->height,.pitch=cache->width,.opaque=cache->opaque};canvas.mask_clip=&mask;
-    bool proof=cache->opaque!=NULL;for(int yy=0;proof&&yy<cache->height;yy++)for(int xx=cache->opaque[yy].x0;xx<cache->opaque[yy].x1;xx++)proof&=cache->alpha[(size_t)yy*cache->width+xx]==255;
+    struct gfx_mask_clip mask=shape_clip(cache);canvas.mask_clip=&mask;
+    const struct radius_shape *shape=cache->shape;
+    bool proof=mask.opaque!=NULL;for(size_t yy=0;proof&&yy<shape->rows;yy++)for(int xx=mask.opaque[yy].x0;xx<mask.opaque[yy].x1;xx++)proof&=mask.alpha[yy*(size_t)mask.pitch+xx]==255;
     check(proof,"retained row spans prove every bypassed alpha is actually 255");
     gfx_fill(&canvas,50,50,80,40,0xffff0000u);check(pixel(50,50)==0xffffff&&pixel(90,70)==0xff0000,"opaque fill respects ellipse mask");
     uint32_t source_pixels[80*40];for(unsigned i=0;i<80*40;i++)source_pixels[i]=0xff0000ffu;
@@ -80,14 +97,22 @@ int main(int argc,char **argv){
     check(pixel(50,50)==0xffffff&&pixel(90,70)==0x0000ff,"actual decoded-image direct-row path cannot bypass retained mask");
     uint32_t reference_pixels[256*160];mask.opaque=NULL;reset(&canvas);canvas.mask_clip=&mask;
     gfx_fill_blend(&canvas,50,50,80,40,0x802233aau);image_draw(&canvas,&bitmap,50,50);memcpy(reference_pixels,pixels,sizeof pixels);
-    mask.opaque=cache->opaque;reset(&canvas);canvas.mask_clip=&mask;
+    mask.opaque=shape->mask;reset(&canvas);canvas.mask_clip=&mask;
     gfx_fill_blend(&canvas,50,50,80,40,0x802233aau);image_draw(&canvas,&bitmap,50,50);
     check(!memcmp(reference_pixels,pixels,sizeof pixels),"opaque fill/image span path exactly matches generic A8 corner blending");
     uint8_t zero[1]={0};struct gfx_mask_clip parent={.alpha=zero,.x=90,.y=70,.w=1,.h=1,.pitch=1};mask.next=&parent;
     gfx_fill_blend(&canvas,90,70,1,1,0xff00ff00u);check(pixel(90,70)==0x0000ff,"nested immutable mask intersections do not escape parent");
     gfx_noclip(&canvas);check(!canvas.mask_clip,"noclip clears borrowed descriptors");
-    check(radius_cache_prepare(&doc,&cache,50,50,80,1000000,radii)&&cache->clipped&&cache->height<=160,"large author geometry allocates visible mask bytes only");
-    doc.view_y=100000;check(radius_cache_prepare(&doc,&cache,50,50,80,1000000,radii),"scroll builds newly exposed rounded slice");
+    check(radius_cache_prepare(&doc,&cache,50,50,80,1000000,radii)&&shape_clip(cache).alpha&&cache->shape->height==1000000&&cache->shape->rows<=2*(20+2)+2,
+          "a tall box stores its corner rows and one middle row");
+    struct border_radii round={.x={12,12,12,12},.y={12,12,12,12}};
+    check(exact_shape(&doc,&cache,&canvas,50.75f,40.25f,80,110,round),"circular corners through the repeated middle rows are the shape's own coverage");
+    check(exact_shape(&doc,&cache,&canvas,50.25f,50.5f,80,100,radii),"elliptical corners through the repeated middle rows are the shape's own coverage");
+    struct radius_cache *alike=NULL;
+    check(radius_cache_prepare(&doc,&alike,170.25f,20.5f,80,100,radii)&&alike->shape==cache->shape,"like boxes share one shape");
+    shape=cache->shape;check(radius_cache_prepare(&doc,&cache,51.25f,52.5f,80,100,radii)&&cache->shape==shape&&cache->left==51,"a box moved by whole pixels keeps its mask");
+    web_radius_cache_free(&alike);check(cache->shape==shape&&shape_clip(cache).alpha,"a shape outlives a cache that let it go");
+    check(radius_cache_prepare(&doc,&cache,50,50,80,40,radii),"back to the first shape");
     retained=cache;fail_allocate=1;check(!radius_cache_prepare(&doc,&cache,50,50,81,40,radii)&&cache==retained,"allocation failure preserves old published mask");fail_allocate=0;
     cancelled=true;doc.native_cancelled=false;check(!radius_cache_prepare(&doc,&cache,50,50,81,40,radii)&&cache==retained,"cancel releases new mask without replacing old one");cancelled=false;doc.native_cancelled=false;
     web_radius_cache_free(&cache);check(!cache,"radius cache explicit owner retirement");

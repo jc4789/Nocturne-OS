@@ -46,7 +46,8 @@ uint8_t gfx_clip_alpha(const canvas_t *c,int x,int y) {
     for(const struct gfx_mask_clip *mask=c->mask_clip;mask;mask=mask->next) {
         int64_t dx=(int64_t)x-mask->x,dy=(int64_t)y-mask->y;
         if(dx<0||dy<0||dx>=mask->w||dy>=mask->h||!mask->alpha)return 0;
-        alpha=(alpha*mask->alpha[(size_t)dy*mask->pitch+(size_t)dx]+127)/255;
+        int row=gfx_mask_stored_row(mask->repeat_at,mask->repeat_extra,(int)dy);
+        alpha=(alpha*mask->alpha[(size_t)row*mask->pitch+(size_t)dx]+127)/255;
         if(!alpha)return 0;
     }
     return (uint8_t)alpha;
@@ -61,7 +62,7 @@ int gfx_clip_row(const canvas_t *c,int y,int x0,int x1,struct gfx_clip_span *out
         if(left<mask->x)left=mask->x;
         int64_t end=(int64_t)mask->x+mask->w;if(right>end)right=end;
         if(mask->opaque) {
-            const struct gfx_mask_span *span=&mask->opaque[row];
+            const struct gfx_mask_span *span=&mask->opaque[gfx_mask_stored_row(mask->repeat_at,mask->repeat_extra,(int)row)];
             int64_t a=(int64_t)mask->x+span->x0,b=(int64_t)mask->x+span->x1;
             if(solid_left<a)solid_left=a;if(solid_right>b)solid_right=b;
         }else solid=0; /* unknown arbitrary masks retain exact pixel fallback */
