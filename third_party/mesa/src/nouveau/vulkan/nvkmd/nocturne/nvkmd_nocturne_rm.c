@@ -236,6 +236,14 @@ nnrm_gpu_unavailable(uint32_t status)
 
 /* ------------------------------------------------------------------ open */
 
+/* Names the step nnrm_open_device stopped at and returns its status */
+static uint32_t
+failed_at(const char **step, const char *what, uint32_t st)
+{
+   *step = what;
+   return st;
+}
+
 static uint32_t
 class_with_low_byte(const struct nnrm *n, uint32_t low)
 {
@@ -267,15 +275,15 @@ popcount32(uint32_t v)
 /* The shader configuration NVK sizes its shader memory from: it has to be
  * complete, a partial count would under-size it. */
 static uint32_t
-query_gr(struct nnrm *n)
+query_gr(struct nnrm *n, const char **step)
 {
    NV2080_CTRL_GR_GET_GPC_MASK_PARAMS gpc = {0};
    uint32_t st = rm_control(n, n->subdevice, NV2080_CTRL_CMD_GR_GET_GPC_MASK,
                             &gpc, sizeof(gpc));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NV2080_CTRL_CMD_GR_GET_GPC_MASK", st);
    if (gpc.gpcMask == 0)
-      return NV_ERR_INVALID_STATE;
+      return failed_at(step, "NV2080_CTRL_CMD_GR_GET_GPC_MASK (no GPC)", NV_ERR_INVALID_STATE);
 
    uint32_t tpcs = 0;
    for (uint32_t id = 0; id < 32; id++) {
@@ -286,11 +294,11 @@ query_gr(struct nnrm *n)
       st = rm_control(n, n->subdevice, NV2080_CTRL_CMD_GR_GET_TPC_MASK,
                       &tpc, sizeof(tpc));
       if (st != NV_OK)
-         return st;
+         return failed_at(step, "NV2080_CTRL_CMD_GR_GET_TPC_MASK", st);
       tpcs += popcount32(tpc.tpcMask);
    }
    if (tpcs == 0)
-      return NV_ERR_INVALID_STATE;
+      return failed_at(step, "NV2080_CTRL_CMD_GR_GET_TPC_MASK (no TPC)", NV_ERR_INVALID_STATE);
 
    n->info.gpc_count = (uint8_t)popcount32(gpc.gpcMask);
    n->info.tpc_count = (uint16_t)tpcs;
@@ -307,8 +315,9 @@ query_fb(struct nnrm *n)
    if (rm_control(n, n->subdevice, NV2080_CTRL_CMD_FB_GET_INFO_V2, &fb, sizeof(fb)) != NV_OK)
       return;
 
+   /* RM gives both in KiB */
    n->info.vram_size_B = (uint64_t)fb.fbInfoList[0].data * 1024;
-   n->info.bar_size_B = (uint64_t)fb.fbInfoList[1].data * 1024 * 1024;
+   n->info.bar_size_B = (uint64_t)fb.fbInfoList[1].data * 1024;
 }
 
 static uint32_t
@@ -343,12 +352,12 @@ probed_gpu(struct nvrm *rm, uint32_t client, uint32_t target, uint32_t *gpu_id)
 }
 
 static uint32_t
-query_gpu(struct nnrm *n)
+query_gpu(struct nnrm *n, const char **step)
 {
    uint32_t id;
    uint32_t st = probed_gpu(n->rm, n->client, n->info.pci_target, &id);
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "the probed GPU of this PCI function (NV0000_CTRL_CMD_GPU_GET_PROBED_IDS)", st);
    n->gpu_id = id;
 
    /* A GPU has to be attached to the client before a device can use it */
@@ -359,14 +368,14 @@ query_gpu(struct nnrm *n)
    attach.failedId = NV0000_CTRL_GPU_INVALID_ID;
    st = rm_control(n, n->client, NV0000_CTRL_CMD_GPU_ATTACH_IDS, &attach, sizeof(attach));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NV0000_CTRL_CMD_GPU_ATTACH_IDS", st);
 
    NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS idinfo;
    memset(&idinfo, 0, sizeof(idinfo));
    idinfo.gpuId = id;
    st = rm_control(n, n->client, NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, &idinfo, sizeof(idinfo));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2", st);
 
    /* A GPU address space of our own ("share with myself"), with RM's internal
     * mappings fenced into their own range so NVK's fixed addresses never meet
@@ -380,14 +389,14 @@ query_gpu(struct nnrm *n)
    dev.vaLimitInternal = NNRM_RM_VA_LIMIT;
    st = rm_alloc(n, n->client, &n->device, NV01_DEVICE_0, &dev, sizeof(dev));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NV01_DEVICE_0", st);
 
    NV2080_ALLOC_PARAMETERS sub;
    memset(&sub, 0, sizeof(sub));
    sub.subDeviceId = idinfo.subDeviceInstance;
    st = rm_alloc(n, n->device, &n->subdevice, NV20_SUBDEVICE_0, &sub, sizeof(sub));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NV20_SUBDEVICE_0", st);
 
    NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS bus;
    memset(&bus, 0, sizeof(bus));
@@ -402,14 +411,14 @@ query_gpu(struct nnrm *n)
    memset(&arch, 0, sizeof(arch));
    st = rm_control(n, n->subdevice, NV2080_CTRL_CMD_MC_GET_ARCH_INFO, &arch, sizeof(arch));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NV2080_CTRL_CMD_MC_GET_ARCH_INFO", st);
    n->info.chipset = (uint16_t)(arch.architecture + arch.implementation);
 
    NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS cl;
    memset(&cl, 0, sizeof(cl));
    st = rm_control(n, n->device, NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2, &cl, sizeof(cl));
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2", st);
    n->class_count = cl.numClasses < NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE
                        ? cl.numClasses : NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE;
    memcpy(n->classes, cl.classList, n->class_count * sizeof(uint32_t));
@@ -461,7 +470,7 @@ query_gpu(struct nnrm *n)
                   &partner, sizeof(partner)) == NV_OK && partner.numPartners > 0)
       n->grce_engine_type = partner.partnerList[0];
 
-   st = query_gr(n);
+   st = query_gr(n, step);
    if (st != NV_OK)
       return st;
    query_fb(n);
@@ -544,18 +553,22 @@ fail:
 }
 
 uint32_t
-nnrm_open_device(uint32_t target, struct nnrm **out, struct nnrm_gpu_info *info)
+nnrm_open_device(uint32_t target, struct nnrm **out, struct nnrm_gpu_info *info,
+                 const char **failed_step)
 {
    *out = NULL;
+   const char *unused_step;
+   const char **step = failed_step ? failed_step : &unused_step;
+   *step = NULL;
    struct nvrm *rm = NULL;
    uint32_t st = connect_device(target, &rm);
    if (st != NV_OK)
-      return st;
+      return failed_at(step, "the connection to nvrm", st);
 
    struct nnrm *n = calloc(1, sizeof(*n));
    if (n == NULL) {
       nvrm_disconnect(rm);
-      return NV_ERR_NO_MEMORY;
+      return failed_at(step, "memory for the device", NV_ERR_NO_MEMORY);
    }
    n->rm = rm;
    n->refs = 1;
@@ -566,12 +579,15 @@ nnrm_open_device(uint32_t target, struct nnrm **out, struct nnrm_gpu_info *info)
    if (lock_status != thrd_success) {
       free(n);
       nvrm_disconnect(rm);
-      return lock_status == thrd_nomem ? NV_ERR_NO_MEMORY : NV_ERR_OPERATING_SYSTEM;
+      return failed_at(step, "a lock for the device",
+                       lock_status == thrd_nomem ? NV_ERR_NO_MEMORY : NV_ERR_OPERATING_SYSTEM);
    }
 
    st = nvrm_alloc(rm, 0, 0, &n->client, NV01_ROOT_CLIENT, NULL, 0);
-   if (st == NV_OK)
-      st = query_gpu(n);
+   if (st != NV_OK)
+      failed_at(step, "NV01_ROOT_CLIENT", st);
+   else
+      st = query_gpu(n, step);
 
    if (st != NV_OK) {
       nnrm_close(n);

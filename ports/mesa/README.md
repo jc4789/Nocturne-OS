@@ -42,7 +42,7 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/util/os_misc.c` | 物理メモリ量などを `sysinfo` で得る。 |
 | `src/util/memstream.c/.h` | メモリ上の FILE は無いので、一時文書を書き、flush／close で読み戻す。 |
 | `src/util/u_string.h` | `asprintf` 系は libc に無いので、Mesa 自身の Windows 用実装を使う。 |
-| `src/util/log.c` | 共有の一時フォルダーは無い。`MESA_LOG_FILE` だけを使う。 |
+| `src/util/log.c` | 共有の一時フォルダーは無い。`MESA_LOG_FILE` だけを使う。机上から起動したアプリには stderr が無いので、既定の出力先にシステムの記録（`n_system_log_open`、`MESA_LOG=system` でも選べる）を足す。行は `MESA: warning: …` の形で、USB の C: では System.log に残る。 |
 | `src/util/u_debug.h` | set-user-ID プログラムは無い。 |
 | `src/util/u_endian.h` | コンパイラーの `__BYTE_ORDER__` を使う。 |
 | `src/util/disk_cache.h`、`src/gallium/auxiliary/util/u_screen.c` | ファイル状態取得と DRM 記述子による screen 共有を外す。 |
@@ -68,8 +68,12 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 ## Zink（GPU での WebGL）
 
 `zink.mk` が `src/gallium/drivers/zink`（クローンの同じコミットから、`ci/` を除いて取り込み）を
-作る。`nocturne_gl.c` は最初に `zink_create_screen` を試し、Vulkan ドライバーが GPU を見つけ
-なければ（ログ一行を出して）softpipe へ戻る。GPU のときは描画用バッファーの消去を
+作る。`nocturne_gl.c` は `nvrm_connect_ready_status` で nvrm の ready な GPU を探し、あれば
+`zink_create_screen` を試し、どちらかが駄目なら softpipe へ戻る。どうなったか（「drawing on the GPU with …」、
+GPU が使えない理由、「Zink did not start」）を、前に書いたものと変わったときだけ `Nocturne GL:` で始まる一行で
+Mesa の記録（システムの記録）へ書く。nvrm がどの GPU も出していない機械では何も書かない。Zink が始まらなかった
+理由は、その前の行の `ZINK:` と `NVK:`（nvkmd が GPU を使わなかった理由：止まった RM の制御・物体の名前と
+NV_STATUS、または chipset と class）に出る。GPU のときは描画用バッファーの消去を
 `clear_texture`（GPU 上、描画の後ろに積むだけ）で行い、softpipe では従来どおり直接書く。
 driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で提供する。
 
@@ -80,7 +84,9 @@ driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で�
 （`ports/nvidia/`）へ libnvrm でつなぐ。
 
 - `nvkmd_nocturne_rm.c`：RM の SDK の型を使う唯一の層（client／device／subdevice、メモリ、VA、
-  GPFIFO チャンネル、ドアベル）。他のファイルは `nnrm_*` だけを見る。
+  GPFIFO チャンネル、ドアベル）。他のファイルは `nnrm_*` だけを見る。`nnrm_open_device` は失敗した段階
+  （RM の制御・物体の名前など）を返し、`pdev`・`dev` がそれを Mesa の記録へ書く（`vk_error*` は Vulkan の
+  デバッグ記録が無いと何も出さないため）。BAR1 の大きさ（`NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE`）は VRAM と同じく KiB。
 - `pdev`・`dev`・`mem`・`va`：NVK の物理・論理装置、メモリ（VRAM か sysmem、常に一貫）、
   VA は `util_vma_heap` で選び RM の仮想メモリへ対応付ける。
 - `ctx`：実行文脈ごとにチャンネル一つ、フェンス一つ（GART の 64 ビット値）、ホスト用の命令片

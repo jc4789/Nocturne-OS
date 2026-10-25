@@ -23,6 +23,7 @@ __attribute__((used)) static void *(*const vulkan_driver)(void *, const char *) 
 #endif
 #include "state_tracker/st_context.h"
 #include "util/format/u_format.h"
+#include "util/log.h"
 #include "util/u_atomic.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
@@ -151,10 +152,28 @@ static struct pipe_frontend_screen *get_screen(void) {
          * Probe for an explicitly ready adapter before constructing Zink;
          * the helper also searches past unready GPUs. Vulkan revalidates its
          * own snapshot, and failure here keeps existing CPU contexts alive. */
-        struct nvrm *ready = nvrm_connect_ready();
+        /* Why, an n_result or ZINK_FAILED, goes to Mesa's log (the system log) when it is not
+           the one told before, not at every context; where nvrm serves no NVIDIA GPU, softpipe
+           draws without a word. */
+        enum { ZINK_FAILED = 1 };
+        static int64_t told = -N_ERR_NOT_FOUND;
+        struct nvrm *ready;
+        int64_t why = nvrm_connect_ready_status(&ready);
         if (ready) {
             nvrm_disconnect(ready);
             gpu_fscreen = frontend_screen(zink_create_screen(&mem_winsys, NULL));
+            why = gpu_fscreen ? 0 : ZINK_FAILED;
+        }
+        if (why != told) {
+            if (!why)
+                mesa_logi("Nocturne GL: drawing on the GPU with %s", gpu_fscreen->screen->get_name(gpu_fscreen->screen));
+            else if (why == ZINK_FAILED) /* Zink and NVK say why in the lines before */
+                mesa_logw("Nocturne GL: nvrm's GPU is ready, but Zink did not start on it: drawing with softpipe");
+            else if (why == -N_ERR_NOT_FOUND)
+                mesa_logw("Nocturne GL: nvrm serves no NVIDIA GPU any more: drawing with softpipe");
+            else
+                mesa_logw("Nocturne GL: nvrm's GPU cannot be used (%s): drawing with softpipe", n_result_text(why));
+            told = why;
         }
     }
 #endif

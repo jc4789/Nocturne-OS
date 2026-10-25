@@ -15,6 +15,11 @@ struct nvrm;
 struct nvrm *nvrm_connect(void); /* NULL when no driver runs */
 /* First adapter explicitly reported ready; diagnostic-only daemons are skipped. */
 struct nvrm *nvrm_connect_ready(void);
+/* nvrm_connect_ready that says why there is none: 0 with *out set; -N_ERR_NOT_FOUND when nvrm
+   serves no NVIDIA GPU; otherwise why the first GPU nvrm serves could not be used:
+   -N_ERR_NOT_READY when it answered but is not ready, or the failure to reach it
+   (nvrm_connect_device_status). */
+int64_t nvrm_connect_ready_status(struct nvrm **out);
 /* Select a domain-zero PCI function, encoded by N_PCI_TARGET(bus, dev, func). */
 struct nvrm *nvrm_connect_device(uint32_t pci_target);
 /* 0 with *out set; otherwise a negative native N_ERR_* result. In particular,

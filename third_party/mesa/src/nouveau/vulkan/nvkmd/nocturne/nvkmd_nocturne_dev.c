@@ -3,6 +3,7 @@
  */
 #include "nvkmd_nocturne.h"
 
+#include "util/log.h"
 #include "util/u_memory.h"
 #include "vk_log.h"
 
@@ -18,9 +19,12 @@ nvkmd_nocturne_create_dev(struct nvkmd_pdev *_pdev,
       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    /* A device has an RM client (and so a GPU address space) of its own */
-   uint32_t st = nnrm_open_device(pdev->pci_target, &dev->rm, NULL);
+   const char *step;
+   uint32_t st = nnrm_open_device(pdev->pci_target, &dev->rm, NULL, &step);
    if (st != 0) {
       FREE(dev);
+      /* In Mesa's log too: vk_errorf is silent unless Vulkan debug logging is on */
+      mesa_logw("NVK: the device's RM client: %s failed: %s (0x%x)", step, nnrm_status_name(st), st);
       return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
                        "Failed to open the GPU through nvrm: %s",
                        nnrm_status_name(st));

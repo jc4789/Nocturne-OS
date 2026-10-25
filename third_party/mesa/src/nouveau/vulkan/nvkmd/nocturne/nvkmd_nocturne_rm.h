@@ -59,8 +59,11 @@ struct nnrm_gpu_info {
  * empty list. */
 uint32_t nnrm_enumerate_gpus(uint32_t **targets, uint32_t *count);
 /* Open the exact PCI function retained by a physical device. A new RM client
- * and address space are created; info may be NULL. */
-uint32_t nnrm_open_device(uint32_t pci_target, struct nnrm **out, struct nnrm_gpu_info *info);
+ * and address space are created; info may be NULL. On failure *failed_step
+ * (when failed_step is not NULL) names what failed: an RM object or control,
+ * or what else it was. */
+uint32_t nnrm_open_device(uint32_t pci_target, struct nnrm **out, struct nnrm_gpu_info *info,
+                          const char **failed_step);
 /* Release the owner's reference; channels keep the address space alive. */
 void nnrm_close(struct nnrm *rm);
 

@@ -136,7 +136,7 @@ static void enumeration(void) {
    uint32_t preserved=ids[1];
    absent_target=ids[0];
    struct nnrm *missing=NULL;
-   CHECK(nnrm_open_device(ids[0],&missing,NULL)==NV_ERR_OBJECT_NOT_FOUND && missing==NULL && connections==0);
+   CHECK(nnrm_open_device(ids[0],&missing,NULL,NULL)==NV_ERR_OBJECT_NOT_FOUND && missing==NULL && connections==0);
    uint32_t *later=NULL,later_count=0;
    CHECK(nnrm_enumerate_gpus(&later,&later_count)==NV_OK && later_count==1 && later[0]==preserved);
    CHECK(ids[1]==preserved);free(later);free(ids);
@@ -145,8 +145,8 @@ static void enumeration(void) {
    reset();unready_target=N_PCI_TARGET(1,1,0);
    CHECK(nnrm_enumerate_gpus(&ids,&count)==NV_OK && count==1 && ids[0]==preserved && allocs==1 && connections==0);
    free(ids);
-   struct nnrm *unready=NULL;
-   CHECK(nnrm_open_device(unready_target,&unready,NULL)==NV_ERR_OBJECT_NOT_FOUND && unready==NULL && connections==0);
+   struct nnrm *unready=NULL;const char *step=NULL;
+   CHECK(nnrm_open_device(unready_target,&unready,NULL,&step)==NV_ERR_OBJECT_NOT_FOUND && step && !strcmp(step,"the connection to nvrm") && unready==NULL && connections==0);
    reset();failed_control=NV0000_CTRL_CMD_GPU_GET_PCI_INFO;control_status=NV_ERR_NO_MEMORY;
    CHECK(nnrm_enumerate_gpus(&ids,&count)==NV_ERR_NO_MEMORY && ids==NULL && count==0 && connections==0);
    reset();failed_control=NV0000_CTRL_CMD_GPU_GET_PROBED_IDS;

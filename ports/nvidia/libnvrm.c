@@ -92,35 +92,58 @@ bool nvrm_device_ready(const struct nvrm *rm) {
     return rm && (rm->hello_capabilities & ready) == ready;
 }
 
-static struct nvrm *connect_any(bool ready_only) {
+/* The first NVIDIA GPU's connection, the first ready one's when ready_only: 0 with *out set, or why
+   there is none (nvrm.h, nvrm_connect_ready_status). */
+static int64_t connect_any(bool ready_only, struct nvrm **out) {
+    *out = NULL;
     /* pcilist fills the supplied capacity. Grow until the complete snapshot fits,
        rather than truncating the set of GPUs to a driver-specific constant. */
     struct n_pciinfo *list = NULL;
     size_t capacity = 1;
     n_result count;
     for (;;) {
-        if (capacity > INT_MAX || capacity > SIZE_MAX / sizeof *list) { free(list); return NULL; }
+        if (capacity > INT_MAX || capacity > SIZE_MAX / sizeof *list) { free(list); return -N_ERR_NO_MEMORY; }
         struct n_pciinfo *grown = realloc(list, capacity * sizeof *list);
-        if (!grown) { free(list); return NULL; }
+        if (!grown) { free(list); return -N_ERR_NO_MEMORY; }
         list = grown;
         count = pcilist(list, (int)capacity);
-        if (count < 0) { free(list); return NULL; }
+        if (count < 0) { free(list); return count; }
         if ((size_t)count < capacity) break;
-        if (capacity > INT_MAX / 2) { free(list); return NULL; }
+        if (capacity > INT_MAX / 2) { free(list); return -N_ERR_NO_MEMORY; }
         capacity *= 2;
     }
-    struct nvrm *rm = NULL;
-    for (n_result i = 0; i < count && !rm; i++) {
+    int64_t why = -N_ERR_NOT_FOUND;
+    for (n_result i = 0; i < count && !*out; i++) {
         if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif)) continue;
-        rm = nvrm_connect_device(N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func));
-        if (rm && ready_only && !nvrm_device_ready(rm)) { nvrm_disconnect(rm); rm = NULL; }
+        struct nvrm *rm;
+        int64_t result = nvrm_connect_device_status(N_PCI_TARGET(list[i].bus, list[i].dev, list[i].func), &rm);
+        if (result >= 0 && ready_only && !nvrm_device_ready(rm)) {
+            nvrm_disconnect(rm);
+            result = -N_ERR_NOT_READY;
+        }
+        if (result >= 0) *out = rm;
+        else if (why == -N_ERR_NOT_FOUND) why = result;
     }
     free(list);
+    return *out ? 0 : why;
+}
+
+struct nvrm *nvrm_connect(void) {
+    struct nvrm *rm;
+    connect_any(false, &rm);
     return rm;
 }
 
-struct nvrm *nvrm_connect(void) { return connect_any(false); }
-struct nvrm *nvrm_connect_ready(void) { return connect_any(true); }
+struct nvrm *nvrm_connect_ready(void) {
+    struct nvrm *rm;
+    connect_any(true, &rm);
+    return rm;
+}
+
+int64_t nvrm_connect_ready_status(struct nvrm **out) {
+    if (!out) return -N_ERR_INVALID;
+    return connect_any(true, out);
+}
 
 static void mappings_release(struct mapping **list) {
     while (*list) {

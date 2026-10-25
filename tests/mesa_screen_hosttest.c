@@ -1,12 +1,15 @@
 /* 実frontendのscreen選択を使う。GPU未readyからreadyへの遷移と旧screenを検査する。
-   直接表示（ngl_scanout）の作成・提示・破棄と、GPUの無い文脈で作らないことも検査する。 */
+   直接表示（ngl_scanout）の作成・提示・破棄と、GPUの無い文脈で作らないことも検査する。
+   GPUを使えない理由がMesaの記録（システムの記録）へ、変わったときだけ一行出ることも検査する。 */
+#include <stdarg.h>
 #include <stdio.h>
 #include "../ports/mesa/nocturne_gl.c"
 
 static unsigned failures, gpu_attempts, cpu_attempts, gpu_clears, cpu_maps, probes, closes;
 static bool daemon_present, daemon_ready, zink_available;
 static struct pipe_screen software = {.caps = {.accelerated = 0}};
-static struct pipe_screen hardware = {.caps = {.accelerated = 1}};
+static const char *hardware_name(struct pipe_screen *screen) { (void)screen; return "zink"; }
+static struct pipe_screen hardware = {.caps = {.accelerated = 1}, .get_name = hardware_name};
 #define CHECK(x) do { if (!(x)) { printf("失敗 %d: %s\n", __LINE__, #x); failures++; } } while (0)
 
 int mtx_lock(mtx_t *m) { (void)m; return thrd_success; }
@@ -17,6 +20,18 @@ void util_call_once_data_slow(once_flag *flag, util_call_once_data_func func, co
 }
 struct nvrm *nvrm_connect_ready(void) {
     probes++; return daemon_present && daemon_ready ? (struct nvrm *)&daemon_ready : NULL;
+}
+int64_t nvrm_connect_ready_status(struct nvrm **out) {
+    *out = nvrm_connect_ready();
+    return *out ? 0 : daemon_present ? -N_ERR_NOT_READY : -N_ERR_NOT_FOUND;
+}
+const char *n_result_text(n_result r) { return r == -N_ERR_NOT_READY ? "not ready" : "?"; }
+static unsigned logs;
+static char logged[256];
+void mesa_log(enum mesa_log_level level, const char *tag, const char *format, ...) {
+    (void)level; (void)tag;
+    va_list va; va_start(va, format); vsnprintf(logged, sizeof logged, format, va); va_end(va);
+    logs++;
 }
 void nvrm_disconnect(struct nvrm *rm) { CHECK(rm == (struct nvrm *)&daemon_ready); closes++; }
 struct pipe_screen *softpipe_create_screen(struct sw_winsys *ws) {
@@ -139,16 +154,21 @@ int main(void) {
     struct pipe_frontend_screen *first = get_screen();
     CHECK(first && first->screen == &software && cpu_attempts == 1 && gpu_attempts == 0);
     CHECK(get_screen() == first && gpu_attempts == 0 && cpu_attempts == 1);
+    CHECK(logs == 0); /* NVIDIAのGPUが無い機械では何も書かない。 */
     struct ngl_context old = {.base = {.fscreen = first}, .on_gpu = false};
     CHECK(ngl_has_major_performance_caveat(&old));
     daemon_present = true; /* 接続可能な診断daemonだけではGPUに昇格しない。 */
     CHECK(get_screen() == first && gpu_attempts == 0 && cpu_attempts == 1);
+    CHECK(logs == 1 && strstr(logged, "cannot be used (not ready)"));
+    CHECK(get_screen() == first && logs == 1); /* 同じ理由は文脈ごとに繰り返さない。 */
     daemon_ready = true;
     /* probe後のZink/NVK再検査でGPUが消えてもCPU screenを失わない。 */
     CHECK(get_screen() == first && gpu_attempts == 1 && closes == 1 && old.base.fscreen == first);
+    CHECK(logs == 2 && strstr(logged, "Zink did not start"));
     zink_available = true;
     struct pipe_frontend_screen *later = get_screen();
     CHECK(later && later != first && later->screen == &hardware && gpu_attempts == 2 && closes == 2);
+    CHECK(logs == 3 && strstr(logged, "drawing on the GPU with"));
     CHECK(first->screen == &software && old.base.fscreen == first);
     struct ngl_context newer = {.base = {.fscreen = later}, .on_gpu = true};
     CHECK(!ngl_has_major_performance_caveat(&newer));

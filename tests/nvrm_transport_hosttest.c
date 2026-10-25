@@ -349,6 +349,19 @@ int main(void) {
     connection = nvrm_connect_ready();
     CHECK(connection && nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.0400"));
     nvrm_disconnect(connection);
+    connection = NULL;
+    CHECK(nvrm_connect_ready_status(&connection) == 0 && connection && !strcmp(connected_name, "nocturne.nvidia.rm.0400"));
+    nvrm_disconnect(connection);
+    /* Why there is none: the first GPU's reason, not the last one's. */
+    fixture_adapter_ready = false;
+    CHECK(nvrm_connect_ready_status(&connection) == -N_ERR_NOT_READY && !connection);
+    fixture_adapter_ready = true;
+    connect_result = -N_ERR_NOT_FOUND;
+    CHECK(nvrm_connect_ready_status(&connection) == -N_ERR_NOT_FOUND && !connection && !nvrm_connect_ready());
+    connect_result = -N_ERR_DENIED;
+    CHECK(nvrm_connect_ready_status(&connection) == -N_ERR_DENIED && !connection);
+    connect_result = 12;
+    CHECK(nvrm_connect_ready_status(NULL) == -N_ERR_INVALID);
     multi_gpu_ready = false;
     CHECK(!nvrm_connect_device((uint32_t)UINT16_MAX + 1));
     CHECK(nvrm_pci_is_gpu(0x10de, 0x03, 0x02, 0x00));

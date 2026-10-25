@@ -53,6 +53,9 @@ NVK は生の PCI 件数を GPU 数にせず、HELLO で adapter 初期化成功
 装置ごとに `nocturne.nvidia.rm.<N_PCI_TARGETの4桁16進数>` を公開する。
 `nvrm_connect_device()` は指定装置へ、従来の `nvrm_connect()` は動的 PCI 列挙から最初に接続可能な装置へつなぐ。
 描画側の `nvrm_connect_ready()` は診断専用の未初期化装置を飛ばし、後続の ready 装置も探す。旧 HELLO の echo を ready と誤認しない。
+`nvrm_connect_ready_status()` は同じ探索で、使える装置が無い理由も返す（nvrm がどの GPU も出していない `N_ERR_NOT_FOUND`、
+最初の GPU が答えたが ready でない `N_ERR_NOT_READY`、または最初の GPU へつなげなかった理由）。Mesa の GL はこれで
+softpipe へ後退した理由をシステムの記録へ書く。
 従来名 `nocturne.nvidia.rm` は一つの daemon だけが既存アプリ用 alias として公開する。
 Protocol1 の48byte header と field offset は維持し、通常応答で未使用だった hello 用領域へ
 RM 戻り値と map access を格納する。旧バイナリーにも RM 関数失敗を負の status で通知する。
@@ -311,13 +314,20 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
 6. 面：pitch を NVKMS の pitch の整列に揃えた pitch linear の X8R8G8B8 を、`allocateMemory`（vidmem、SCANOUT、
    noDisplayCaching）で取り、`mapMemory`（KERNEL）→ `createSurface`。
 7. GOP の画面を面へ行ごとに写す（読めなければ黒）。
-8. `applyModeSetConfig`（commit=FALSE で検査 → TRUE で確定）→ 最大 3 秒フリップの完了を待つ。KAPI の関数表の
+8. `applyModeSetConfig`（commit=FALSE で検査 → TRUE で確定）。head を点けるモード設定はフリップの完了を待たない
+   （下の規則。NVKMS のモード設定は表示エンジンが済ませてから戻る）。
+   フリップの完了：KAPI の関数表の
    `getFlipPendingStatus` は `nvKmsKapiGetFunctionsTable` が埋めない（NULL。nvidia-drm は `FLIP_OCCURRED` のイベントを待つ）。
    そこで `nvkms_kapi_rm.c` が KAPI の通知面を読む：層に面を載せる commit ごとに KAPI はその層の二つの完了通知の片方
    （`layerState[head][layer].currFlipNotifierIndex` の次）を名指し、表示エンジンがフリップの完了でそこへ「完了」を書く。
    KAPI は名指す前に通知を消さないので、二つ前のフリップの書込みが残っている。`nvrm_nvkms_flip_arm` が commit の直前に
    その通知を「未開始」へ戻し、`nvrm_nvkms_flip_done` が commit の後で読む（`nvKmsResetNotifier`／`nvKmsParseNotifier`）。
-   失敗した commit は何もフリップしないので待たない。
+   表示エンジンが通知を書くのは、commit の**前に**点いていた head の、面を出していた層だけ（nvidia-drm も
+   `old_crtc_state->active && old_plane_state->fb` のときだけフリップのイベントを数える）。だから待つのは点いている
+   head の面の差し替えだけで、head を点けるモード設定、面を外す commit（失った head）、失敗した commit は待たない。
+   実機 5 回目は最初のモード設定でこの通知を待ち、書かれない通知を 3 秒待って失敗とし、表示の持ち主を手放した
+   （NVKMS が起動画面を復元し、両方のモニターに同じ画面が出た）。待ったフリップが 3 秒で完了しなければ、
+   以後のフリップは待たず、直接表示もやめる（`scr.flips_unseen`。フリップのたびに 3 秒止まらないように）。
 9. カーソル：表示エンジンが 32×32 の A8R8G8B8（非 premultiplied のアルファ）のカーソルと、主層の X8B8G8R8 を扱えれば、
    pitch linear の vidmem（pitch は NVKMS の 32×32 の最小の 256）を取り、写して `createSurface` する。直接表示（下）で
    アプリの絵の上にポインターを出すのに使う。
@@ -370,7 +380,9 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
   client がそのファイルのものかを確かめる（`rmclientValidate`）。
 - **PRESENT**：最新の画面の状態を読み、そのアプリが直接表示されていなければ `NV_ERR_INVALID_STATE`。前のフリップの完了を
   待ってから、head の表示・モードはそのままで主層の面を替えるフリップ（commit のみの `applyModeSetConfig`）をする。待つのは
-  一つ前のフリップだけで、GPU の描画の完了は待たない（アプリが描画を待ってから PRESENT する）。
+  一つ前のフリップだけで、GPU の描画の完了は待たない（アプリが描画を待ってから PRESENT する）。フリップの完了が一度でも
+  3 秒見えなかった後（`scr.flips_unseen`）は、CREATE と PRESENT を `NV_ERR_NOT_SUPPORTED` で断り、出ていた絵からは
+  デスクトップの面へ戻す。アプリは窓を通して描き、デスクトップがそれを合成する。
 - **カーソル**：絵を出している間は、システムのポインター（状態の 32×32 の画素、位置、hot spot）をカーソルの面へ写し、
   モードの画素に直した位置でカーソル層に出す。デスクトップの面にはポインターが描かれているのでカーソルは消す。
 - **状態スレッド**：`n_pci_screen_state` で変化を待ち、出しているアプリがもう直接表示されないならデスクトップの面へ戻し、
@@ -383,11 +395,13 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 - 排他：head を変えるもの（作業スレッド、状態スレッド、要求のスレッド）は `scr.head_lock` で順に行う。
 
 試験：`python tests/nvrm_display_hosttest.py`（偽の KAPI・RM・ハンドルで、立ち上げと後始末の順序、モードの選択、失敗時に
-画面を渡さないこと、抜き差し（フリップの完了が見えないまま点いた head）、直接表示（作成とパニック画面の登録、登録を断られた
-ときと BAR1 のひと続きでないときに絵を作らないこと、許可の有無と PRESENT、一つ前の
+画面を渡さないこと、抜き差し（同じ head の点け直しでフリップの完了が見えないまま点いた head）、直接表示（作成とパニック画面の
+登録、登録を断られたときと BAR1 のひと続きでないときに絵を作らないこと、許可の有無と PRESENT、一つ前の
 フリップ待ち、commit の直前の完了通知の消去、失敗した commit の後は待たないこと、カーソル、デスクトップへの戻り、戻すフリップの
 失敗からの回復、DESTROY・接続の終わり・stop の順序、IMPORT の持ち主と共有→DUP→取消、直接表示が無いとき、状態スレッドが
-無く `N_SCANOUT_DIRECT` 無しで渡し直せないとき）を確かめ、製品の `display.c` を対象の設定でも構文検査する。
+無く `N_SCANOUT_DIRECT` 無しで渡し直せないとき、フリップの完了が見えなかった後に待たず直接表示を断ること）を確かめ、
+製品の `display.c` を対象の設定でも構文検査する。偽の KAPI は実機の規則（通知を書くのは commit の前に面を出していた
+点いた head の層だけ）で通知を書く。
 `tests/nvrm_servetest.c` は `NVRM_SCANOUT` が接続の RM ファイルと principal 付きで届くことと、
 接続の絵が RM ファイルより先に終わることを確かめる（Nocturne 上で動く）。
 

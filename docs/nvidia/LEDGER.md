@@ -74,7 +74,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は未実施 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -142,6 +142,9 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C59 | ACPI の評価は claim の範囲なら何でもよく、通知のスレッドは RM の ACPI の初期化と終わりで開始・停止してよい | 却下 → 修理済み（実機未確認） | 範囲の中でも `_PS0`〜`_PS3`、`_ON_`、`_OFF`、`_RST`、`_EJ0`〜`_EJ4`、`_OSC`、`_INI`、`_REG`、`_PTS`、`_WAK` などシステムが装置と機械を動かす 28 の方法は、カーネルの電源管理と PCI の把握を裏から変える。今は `N_ERR_DENIED`（上流のブリッジは独自名もすべて）。通知のスレッドは `nv_acpi_methods_uninit`（RM の API と GPU の錠を持ったまま）で join していたので、`rm_acpi_notify` で錠を待つスレッドと互いに待ちえた。今は `nv_start_device` と同じく `rm_init_adapter` の後に開始し、`rm_request_dnotifier_state` を呼び、`rm_disable_adapter` の前に錠の外で止める。RM が扱わない値は渡さない（RM は表明で止まる）。pcitest に拒否の試験 |
 | C60 | 直接表示の間も、パニック画面はカーネルの出力先へ描けば見える | 却下 → 修理済み（実機未確認） | 直接表示の間、表示エンジンはアプリの絵を出していて、カーネルが止まると戻す者がいない。カーネルはデスクトップの面にしか描かないので、パニックは画面に出なかった。新しい ABI `n_pci_screen_image`／`_end`（ABI 文書 §9）で、nvrm は絵の BAR1 の写しを登録し、カーネルはパニック画面を登録された面すべてへも描く（`fb.c` の `fb_present_last`、`N_SCANOUT_XBGR8888`）。登録できない絵は作らない。確認：host 試験（登録できないとき・BAR1 のひと続きでないときに絵を作らない）、QEMU の pcitest（登録・終わり・拒否）、QEMU で NMI によるパニックを目視（VGA の第二のバッファーを XBGR8888 の画像として登録して表示、パニック画面がそこに赤と青の入れ替わった色で描かれ、デスクトップの面には元の色で描かれる。§7） |
 | C61 | 動的電源管理は移植しなくても、mode が NEVER なら RM は電源管理の状態に触れない | 却下 → 修理済み（実機未確認） | 実機 4 回目、`RmInitAdapter` と GSP の起動は成功したが、NVKMS の読込みの直後に nvrm がページフォールトで落ちた（`rip=0x708784` は `portSyncMutexAcquire`、呼出し元 `0x46ef16` は `RmUpdateGc6ConsoleRefCount`、記号は同じ材料を `-s` 無しで再リンクして引いた）。NVKMS が画面を取るときの VT 切替え（`NV0080_CTRL_OS_UNIX_VT_SWITCH`、SAVE_VT_STATE）は、mode を見ずに `console_device` が真なら電源管理の錠を取る。錠を作る `rm_init_dynamic_power_management` を移植が呼んでおらず、一方で `os_pci.c` が `console_device` を真にしていたので、NULL の錠を取った。修理：`nvrm.c` で上流の probe／remove と同じ位置に `rm_init_dynamic_power_management`（`rm_init_private_state` と `rm_init_event_locks` の後）、`rm_enable_dynamic_power_management`（probe の最後、割り込みと `rm_init_adapter` の前）、`rm_cleanup_dynamic_power_management`（NVKMS と `rm_shutdown_adapter` の後、`rm_free_private_state` の前）を呼ぶ。`console_device` は RM が起動画面（`nv_get_screen_info`）から決める（`os_pci.c` の設定を外した）。`nv_dynamic_power_available` は偽なので mode は NEVER のままで、GPU を止めることは無い。確認：host 試験、全体ビルド、記号付きの再リンクの逆アセンブルで呼出しの順を確かめた。QEMU には NVIDIA の GPU が無く、この経路は通らない |
+| C62 | head を点けるモード設定も、層の完了通知でフリップの完了を待てる | 却下 → 修理済み（実機未確認） | 実機 5 回目、最初のモード設定の後に「the flip on head 0 has not completed after 3000 ms」、続いて「the mode set did not complete」と表示の持ち主の解放。NVKMS が起動画面を復元し、二台のモニター（HP の DP と Acer の HDMI）に同じ画面が出た。表示エンジンが層の完了通知を書くのは、commit の前に点いていた head の、面を出していた層だけ（nvidia-drm も `old_crtc_state->active && old_plane_state->fb` のときだけフリップのイベントを数える）。点けるモード設定には書かれない通知を待っていた。NVKMS のモード設定は同期で、戻った時点で済んでいる。修理：`display.c` は点いている head の面の差し替えだけを待ち、点けるモード設定・面を外す commit（失った head）・失敗した commit は待たない。待ったフリップが 3 秒で完了しなければ、以後はフリップを待たず直接表示もやめる（`scr.flips_unseen`、CREATE と PRESENT は `NV_ERR_NOT_SUPPORTED`、出ていた絵からはデスクトップへ）。host 試験の偽の KAPI に実機の規則を入れた（直す前の `display.c` はこの偽物で `nvrm_display_start` から失敗し、実機の症状を再現した） |
+| C63 | Mesa・Zink・NVK が GPU を使わなかった理由はログで分かる | 却下 → 修理済み（実機未確認） | 実機 5 回目、nvrm は「serving clients」まで進んだが、WebGL は「Mesa softpipe」で、System.log に Mesa の行が一つも無かった。机上から起動したアプリには stderr が無く、Mesa の既定の出力先は stderr だけ。`vk_error*` は Vulkan のデバッグ記録が無いと何も出さず、nvkmd の拒否は無言、`nocturne_gl.c` の「ログ一行」は実際には無かった。修理：Mesa の記録の出力先にシステムの記録を足す（`util/log.c`、`MESA_LOG=system`）。`nocturne_gl.c` は GPU で描くか・使えない理由（`nvrm_connect_ready_status` の結果）・Zink が始まらなかったことを、変わったときだけ一行書く。nvkmd は `nnrm_open_device` が止まった段階（RM の制御・物体の名前）と NV_STATUS、または chipset と class を書く。host 試験（mesa_screen、nvk_rm、nvrm_transport） |
+| C64 | `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE` は MiB | 却下 → 修理済み | RM は KiB で返す（`mem_mgr_gm107.c` は BAR1 の VA 範囲の長さを 1024 で割る）。`nvkmd_nocturne_rm.c` は 1024×1024 を掛けていて、NVK の BAR の大きさが 1024 倍になっていた。RTX 4070 は Resizable BAR で BAR1 が VRAM より大きく、NVK は BAR を VRAM 以上なら別のヒープにしないので、実機では害が出なかったと見られる |
 | C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る。実機 4 回目：BME を入れてから nvrm が落ちて解放されるまで（`RmInitAdapter` の 5.1 秒を含む）、IOMMU の遮断の行は一つも無かった |
 
 ## 5. 担当と受け渡し
@@ -154,12 +157,13 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 6. 次の一手
 
-1. P10（ユーザー）：RTX 4070 の実機で起動し（5 回目。4 回目は GSP の起動まで成功し、NVKMS の VT 切替えで
-   落ちた。C61 の修理で越えるか）、システムログの nvrm（GSP 起動）、画面が NVKMS の面へ移るか
-   （`NVRM display:`・`wm:`・`fb:` の行、起動後に画面が動き続けるか、C53）と、ブラウザーの WebGL が
-   Zink で動くか（失敗ならログの `ZINK:`／`nvkmd`／RM の状態名）を見る。全画面の直接表示では、
+1. P10（ユーザー）：RTX 4070 の実機で起動し（6 回目。5 回目は nvrm が落ちずに動いたが、最初のモード設定で
+   表示を手放し、WebGL は softpipe だった）、画面が NVKMS の面へ移るか（`NVRM display:` に「the mode set did not
+   complete」が出ず、`fb:` で画面を持ち続け、二台目のモニターが起動画面の写しにならない、C62）と、
+   ブラウザーの WebGL が Zink で動くか（System.log の `MESA:` の行：「Nocturne GL: drawing on the GPU with …」なら GPU、
+   そうでなければ同じ行の理由と、その前の `ZINK:`・`NVK:` の行、C63）を見る。全画面の直接表示では、
    フリップの完了が届くか（C56：`NVRM display:` に「the flip on head … has not completed」の行が
-   出ないか）と、
+   出ないか。出れば以後は直接表示をやめる）と、
    全画面の窓を閉じた後にデスクトップへ戻るか（C57）を見る。ACPI の拒否（C59）で RM が要る方法を
    断っていないか（`NVRM: ACPI` の行と `N_ERR_DENIED`）も見る。
 2. 実機の結果で C15・C21〜C23・C25・C26・C28 を受理か却下へ。失敗した境界から直す。
@@ -168,6 +172,24 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
+- 2026-10-24（6）：実機 5 回目（ユーザー、USB 起動）。ユーザーの観察：二台目のモニターに主モニターと同じ画面が出た、
+  WebGL は「Mesa softpipe」、3D Cube はいつもの 63 fps。USB の C: から `build/host/store.exe` で System.log と
+  nvrm.log を `build/qa/realhw5/` へ取り出した。結果：C61 の修理で nvrm は落ちず、NVKMS の読込み、ディスプレイの
+  列挙（HP X27q の DP が起動時に点灯、Acer KG271U の HDMI が接続）、1920×1080 59.940 Hz の面の確保まで進み、
+  UVM の開始と「serving clients on nocturne.nvidia.rm.0100」に至った。しかし最初のモード設定の後で書かれない
+  フリップの完了通知を 3 秒待ち、表示の持ち主を手放した（C62）。二台のモニターの同じ画面は、NVKMS が持ち主の解放で
+  起動画面を復元した結果と見られる。WebGL が softpipe だった理由は、Mesa・Zink・NVK の行が System.log に一つも
+  無く分からなかった（C63）。3D Cube は CPU で描く（`gfx_triangle`、16 ms の歩調）アプリで、GPU とは関係なく
+  63 fps のまま。その後の「handle 3 is not a PCI right (kind 8)」は二つ目の nvrm（PCI の権利なしで起動されたもの）で、
+  一つ目には影響しない。
+  修理：C62（点いている head の面の差し替えだけを待つ、見えなかったら以後は待たず直接表示をやめる）、C63（Mesa の
+  記録をシステムの記録へ、GL・nvkmd が GPU を使わなかった理由を書く、libnvrm の `nvrm_connect_ready_status`）、
+  C64（BAR1 の大きさの単位）。
+  確認：host 試験（nvrm_display_hosttest、nvk_sync_hosttest.py の 3 本、nvrm_dma_hosttest.py の全件）。全体ビルド
+  （IMG・VHD・VHDX・ISO）は成功し、媒体の nvrm・browser・browserjsworker はビルドの成果物と一致した。QEMU（WHPX、
+  4 コア、4096 MiB、AHCI）でデスクトップまで起動し、ブラウザーで get.webgl.org を開いて「Your browser supports
+  WebGL」と回る立方体（softpipe）を見た。NVIDIA の GPU が無いので serial.log に `MESA:` の行は無い（nvrm が GPU を
+  出さないときは無言の設計どおり）。QEMU には NVIDIA の GPU が無く、C62・C63 の実機の経路は QEMU では通らない。
 - 2026-10-24（5）：実機 4 回目（ユーザー、USB 起動、IOMMU 有効）。画面は固まり続けなくなった。USB の C: から
   `build/host/store.exe`（管理者、読むだけの `list`・`get`・`check`）で System.log と nvrm.log を
   `build/qa/realhw4/` へ取り出した（`check` は 0 problems）。結果：GSP の起動と `RmInitAdapter` が初めて成功した

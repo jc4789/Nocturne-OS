@@ -66,7 +66,7 @@
 #include "nvrm_protocol.h"
 
 #define LOG "NVRM display: "
-#define FLIP_TIMEOUT_MS 3000         /* a committed mode set whose flip has not completed by then failed */
+#define FLIP_TIMEOUT_MS 3000         /* a committed flip that has not completed by then failed */
 #define DEFAULT_REFRESH 60000u       /* RRx1k, when the monitor names no preferred mode */
 #define PAGE_BYTES 4096u
 #define STATE_WAIT_MS 1000           /* the state thread looks at its stop flag at least this often */
@@ -129,7 +129,9 @@ static struct {
     bool flipping;                   /* the last commit that put a surface on a primary layer (flip_head's) has
                                         not been seen to complete */
     uint32_t flip_head;
-    bool lost;                       /* a flip back to the desktop failed: the head may show no surface (NVKMS
+    bool flips_unseen;               /* a flip was not seen to complete in FLIP_TIMEOUT_MS: no flip is awaited
+                                        any more, and apps are not shown directly */
+    bool lost;                      /* a flip back to the desktop failed: the head may show no surface (NVKMS
                                         took a freed image off it) until a flip puts one on it again */
 
     bool sync_ready;                 /* lock, wake and head_lock are initialised */
@@ -616,10 +618,13 @@ static void head_request(uint32_t head, NvKmsKapiDisplay display, const struct N
     primary->flags.dstWHChanged = NV_TRUE;
 }
 
-/* Commits the request. flip is the head whose primary layer it puts a surface on, -1 none: that
-   flip's completion is awaited by flip_completed (nvkms_kapi_rm.c reads the completion notifier
-   KAPI names in the commit, since KAPI's table does not say). */
+/* Commits the request. flip is the head whose primary layer it puts a surface on, -1 none or
+   none to await: that flip's completion is awaited by flip_completed (nvkms_kapi_rm.c reads the
+   completion notifier KAPI names in the commit, since KAPI's table does not say). The display
+   engine writes that notifier only for a layer that showed a surface on an active head before the
+   commit (nvidia-drm counts its flip events so too), so flip is -1 for any other. */
 static bool commit(int flip) {
+    if (scr.flips_unseen) flip = -1;
     if (flip >= 0) nvrm_nvkms_flip_arm(scr.device, (uint32_t)flip, NVKMS_KAPI_LAYER_PRIMARY_IDX);
     memset(&reply, 0, sizeof reply);
     if (!kapi.applyModeSetConfig(scr.device, &request, &reply, NV_TRUE) ||
@@ -646,14 +651,19 @@ static bool apply(const char *what, int flip) {
     return true;
 }
 
-/* The last commit that put a surface on a primary layer has completed. One whose flip does not
-   complete in FLIP_TIMEOUT_MS stays awaited. */
+/* The last commit that put a surface on a primary layer has completed. One whose flip is not
+   seen to complete in FLIP_TIMEOUT_MS ends the waiting for good: each later flip would hold the
+   head that long. What a flip takes off the head is still not freed while it is scanned out, as
+   NVKMS takes a surface off the heads before it destroys it. */
 static bool flip_completed(void) {
     if (!scr.flipping) return true;
     uint64_t until = nvrm_now_ns() + (uint64_t)FLIP_TIMEOUT_MS * 1000000u;
     while (!nvrm_nvkms_flip_done(scr.device, scr.flip_head, NVKMS_KAPI_LAYER_PRIMARY_IDX)) {
         if (nvrm_now_ns() >= until) {
-            nvrm_log(LOG "the flip on head %u has not completed after %d ms", (unsigned)scr.flip_head, FLIP_TIMEOUT_MS);
+            nvrm_log(LOG "the flip on head %u has not completed after %d ms; flips are not awaited any more, and "
+                     "apps are not shown directly", (unsigned)scr.flip_head, FLIP_TIMEOUT_MS);
+            scr.flipping = false;
+            scr.flips_unseen = true;
             return false;
         }
         n_sleep_ms(1);
@@ -664,12 +674,16 @@ static bool flip_completed(void) {
 
 /* display shows the desktop's surface in mode on head, without the cursor; the head nvrm used
    before is turned off when it is another one. False when the mode set failed (scr.head_on
-   tells whether the head is lit) or its flip has not completed. */
+   tells whether the head is lit) or its flip has not completed. A mode set that lights the head
+   has no flip to await: no surface was shown on it before (commit), and NVKMS returns from a mode
+   set once the display engine has done it. */
 static bool show_on(NvKmsKapiDisplay display, uint32_t head, const struct NvKmsKapiDisplayMode *mode) {
+    bool layer_shown = scr.head_on && scr.head == head && !scr.lost;
     memset(&request, 0, sizeof request);
     if (scr.head_on && scr.head != head) head_request(scr.head, 0, NULL);
     head_request(head, display, mode);
-    if (!apply("the mode set", (int)head)) return false;
+    if (!apply("the mode set", layer_shown ? (int)head : -1)) return false;
+    if (!layer_shown) scr.flipping = false;
     scr.head_on = true;
     scr.head = head;
     scr.display = display;
@@ -756,7 +770,8 @@ static bool show(struct image *image, const struct n_screen_state *st) {
         c->dstY = (NvS16)y;
         c->flags.dstXYChanged = NV_TRUE;
     }
-    if (!commit(surface_changed ? (int)scr.head : -1)) {
+    /* A lost head may show no surface: that flip writes no notifier, and nothing left on it is read. */
+    if (!commit(surface_changed && !scr.lost ? (int)scr.head : -1)) {
         nvrm_log(LOG "the flip to %s on head %u failed (flip result %d)", image ? "an app's image" : "the desktop",
                  (unsigned)scr.head, (int)reply.flipResult);
         return false;
@@ -1065,7 +1080,12 @@ n_result nvrm_display_scanout(void *file, uint32_t principal, void *args, uint32
     struct image *image = r->op == NVRM_SCANOUT_CREATE ? NULL : image_find(r->image);
     if (r->op != NVRM_SCANOUT_CREATE && (!image || image->app != principal))
         r->status = NV_ERR_INVALID_OBJECT_HANDLE; /* another app's image is not told apart from none */
-    else if (r->op == NVRM_SCANOUT_CREATE)
+    else if (scr.flips_unseen && (r->op == NVRM_SCANOUT_CREATE || r->op == NVRM_SCANOUT_PRESENT)) {
+        /* Flips are not awaited (flip_completed): the app draws through its window again, which the
+           desktop shows, not the app's last image. */
+        if (scr.shown && scr.shown->app == principal) show(NULL, NULL);
+        r->status = NV_ERR_NOT_SUPPORTED;
+    } else if (r->op == NVRM_SCANOUT_CREATE)
         r->status = image_create(principal, file, r);
     else if (r->op == NVRM_SCANOUT_DESTROY) {
         image_free(image);
@@ -1255,7 +1275,7 @@ void nvrm_display_stop(void) {
     scr.head_on = false;
     scr.display = 0;
     scr.shown = scr.leaving = NULL;  /* nothing of nvrm's is shown any more */
-    scr.flipping = scr.lost = false;
+    scr.flipping = scr.lost = scr.flips_unseen = false;
     scr.cursor_on = false;
     while (scr.images) image_free(scr.images);
     cursor_destroy();

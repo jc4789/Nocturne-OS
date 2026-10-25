@@ -5,6 +5,7 @@
 
 #include "nvkmd/nvkmd_device_info.h"
 #include "util/cache_ops.h"
+#include "util/log.h"
 #include "util/u_memory.h"
 #include "vk_log.h"
 
@@ -14,12 +15,19 @@
 /* RM drives Turing and later (the GSP generations) */
 #define NVKMD_NOCTURNE_MIN_CHIPSET 0x160
 
+/* Why a GPU nvrm serves is not one NVK uses goes to Mesa's log (the system
+ * log): vk_error*() say nothing unless Vulkan debug logging is on, and Zink
+ * says only that it found no GPU. */
+
 VkResult
 nvkmd_nocturne_enumerate_gpus(struct vk_object_base *log_obj,
                              uint32_t **gpu_ids, uint32_t *count)
 {
    uint32_t st = nnrm_enumerate_gpus(gpu_ids, count);
-   return st == 0 ? VK_SUCCESS : vk_errorf(log_obj, nnrm_vk_result(st, false),
+   if (st == 0)
+      return VK_SUCCESS;
+   mesa_logw("NVK: cannot list the GPUs nvrm serves: %s (0x%x)", nnrm_status_name(st), st);
+   return vk_errorf(log_obj, nnrm_vk_result(st, false),
       "Failed to enumerate RM-probed GPUs: %s", nnrm_status_name(st));
 }
 
@@ -96,10 +104,11 @@ nvkmd_nocturne_try_create_pdev(uint32_t pci_target,
 {
    struct nnrm *rm;
    struct nnrm_gpu_info gpu;
-   uint32_t st = nnrm_open_device(pci_target, &rm, &gpu);
+   const char *step;
+   uint32_t st = nnrm_open_device(pci_target, &rm, &gpu, &step);
    if (st != 0) {
-      if (debug_flags & NVK_DEBUG_VM)
-         fprintf(stderr, "nvk: PCI target %x: %s\n", pci_target, nnrm_status_name(st));
+      mesa_logw("NVK: GPU %02x:%02x.%x: %s failed: %s (0x%x)", pci_target >> 8,
+                (pci_target >> 3) & 0x1f, pci_target & 0x7, step, nnrm_status_name(st), st);
       /* A snapshot member can disappear before it is opened. Do not turn
        * host OOM or a failing RM command into an absent/unsupported GPU. */
       if (nnrm_gpu_unavailable(st))
@@ -109,6 +118,10 @@ nvkmd_nocturne_try_create_pdev(uint32_t pci_target,
 
    if (gpu.chipset < NVKMD_NOCTURNE_MIN_CHIPSET || gpu.cls_gpfifo == 0 ||
        gpu.cls_eng3d == 0 || gpu.cls_compute == 0) {
+      mesa_logw("NVK: GPU %02x:%02x.%x is not used: chipset 0x%x, GPFIFO class 0x%x, 3D class 0x%x, "
+                "compute class 0x%x (Turing, 0x%x, or later with all three is needed)", pci_target >> 8,
+                (pci_target >> 3) & 0x1f, pci_target & 0x7, gpu.chipset, gpu.cls_gpfifo, gpu.cls_eng3d,
+                gpu.cls_compute, NVKMD_NOCTURNE_MIN_CHIPSET);
       nnrm_close(rm);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }

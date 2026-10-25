@@ -44,12 +44,17 @@
 #include <windows.h>
 #endif
 
+#if DETECT_OS_NOCTURNE
+#include <nocturne.h>
+#endif
+
 enum mesa_log_control {
    MESA_LOG_CONTROL_NULL = 1 << 0,
    MESA_LOG_CONTROL_FILE = 1 << 1,
    MESA_LOG_CONTROL_SYSLOG = 1 << 2,
    MESA_LOG_CONTROL_ANDROID = 1 << 3,
    MESA_LOG_CONTROL_WINDBG = 1 << 4,
+   MESA_LOG_CONTROL_SYSTEM = 1 << 5,
    MESA_LOG_CONTROL_LOGGER_MASK = 0xff,
 
    MESA_LOG_CONTROL_WAIT = 1 << 8,
@@ -68,6 +73,7 @@ static const struct debug_control mesa_log_control_options[] = {
    { "syslog", MESA_LOG_CONTROL_SYSLOG },
    { "android", MESA_LOG_CONTROL_ANDROID },
    { "windbg", MESA_LOG_CONTROL_WINDBG },
+   { "system", MESA_LOG_CONTROL_SYSTEM },
    /* flags */
    { "wait", MESA_LOG_CONTROL_WAIT },
    { NULL, 0 },
@@ -101,6 +107,9 @@ level_from_str(const char *str)
 
 static uint32_t mesa_log_control;
 static FILE *mesa_log_file;
+#if DETECT_OS_NOCTURNE
+static n_handle mesa_log_system = -1;
+#endif
 static enum mesa_log_level mesa_max_log_level;
 static int mesa_log_file_affixes;
 
@@ -128,6 +137,12 @@ mesa_log_init_once(void)
       /* stderr from windows applications without console is not usually
        * visible, so communicate with the debugger instead */
       mesa_log_control |= MESA_LOG_CONTROL_WINDBG;
+#endif
+
+#if DETECT_OS_NOCTURNE
+      /* an app the desktop starts has no stderr: the system log is where
+       * its messages can be read */
+      mesa_log_control |= MESA_LOG_CONTROL_SYSTEM;
 #endif
    }
 
@@ -175,6 +190,11 @@ mesa_log_init_once(void)
 #if DETECT_OS_POSIX
    if (mesa_log_control & MESA_LOG_CONTROL_SYSLOG)
       openlog(util_get_process_name(), LOG_NDELAY | LOG_PID, LOG_USER);
+#endif
+
+#if DETECT_OS_NOCTURNE
+   if (mesa_log_control & MESA_LOG_CONTROL_SYSTEM)
+      mesa_log_system = n_system_log_open();
 #endif
 }
 
@@ -424,6 +444,33 @@ logger_windbg(enum mesa_log_level level,
 
 #endif /* DETECT_OS_WINDOWS */
 
+#if DETECT_OS_NOCTURNE
+
+static void
+logger_system(enum mesa_log_level level,
+              const char *tag,
+              const char *format,
+              va_list va)
+{
+   if (mesa_log_system < 0)
+      return;
+
+   char local_msg[1024];
+   char *msg = logger_vasnprintf(local_msg, sizeof(local_msg),
+         LOGGER_VASNPRINTF_AFFIX_TAG |
+         LOGGER_VASNPRINTF_AFFIX_LEVEL |
+         LOGGER_VASNPRINTF_AFFIX_NEWLINE,
+         level, tag, format, va);
+
+   /* the system log keeps what it is sent as is, the newline included */
+   n_channel_send(mesa_log_system, msg, strlen(msg), -1);
+
+   if (msg != local_msg)
+      free(msg);
+}
+
+#endif /* DETECT_OS_NOCTURNE */
+
 /* This is for use with debug functions that take a FILE, such as
  * nir_print_shader, although switching to nir_log_shader* is preferred.
  */
@@ -464,6 +511,9 @@ mesa_log_v(enum mesa_log_level level, const char *tag, const char *format,
 #endif
 #if DETECT_OS_WINDOWS
       { MESA_LOG_CONTROL_WINDBG, logger_windbg },
+#endif
+#if DETECT_OS_NOCTURNE
+      { MESA_LOG_CONTROL_SYSTEM, logger_system },
 #endif
    };
 
