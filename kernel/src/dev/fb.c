@@ -15,8 +15,10 @@ struct fb_info fb;
    A scanout is memory the display engine shows, in one pixel format. At boot it is the
    firmware's framebuffer (fb.addr); a display driver in an app that set up its own scanout gives
    the system that surface instead (n_pci_give_screen, dev/pciuser.c), and from then on nothing
-   is written to the firmware's until the driver gives it back or its claim ends. The desktop
-   keeps its size and depth: only where its pixels go, and how they are packed, change.
+   is written to the firmware's until the driver gives it back or its claim ends. A driver's
+   scanout has the size of the mode it shows, which need not be the firmware's: each scanout
+   keeps its own, presents are clipped to the one shown, and the desktop follows it
+   (wm_screen_resized).
    Any Limine/GOP bit-mask format: a 10-bit channel value -> that channel's bits at their
    position, rounded to the channel's own depth (1..16 bits). 8-bit content enters widened by bit
    replication, so 8 bpc XRGB8888 maps every value to itself and 10 bpc 2:10:10:10 shows 255 as
@@ -25,7 +27,7 @@ struct scanout {
     uint8_t *addr;  /* the first row */
     void *map;      /* a driver's surface: the kernel mapping addr lies in (vunmap), else NULL */
     size_t pages;
-    uint32_t pitch, bpp;
+    uint32_t width, height, pitch, bpp;
     bool native;    /* 32bpp xRGB8888: rows are copied */
     struct scanout *next; /* fb_scanout_also's list */
     uint32_t lut_r[1024], lut_g[1024], lut_b[1024];
@@ -64,6 +66,8 @@ void fb_init(struct limine_framebuffer *f) {
                 fb.rsize == 8 && fb.gsize == 8 && fb.bsize == 8;
     fb.native_bpc = fb.bpc;
     o->addr = fb.addr;
+    o->width = fb.width;
+    o->height = fb.height;
     o->pitch = fb.pitch;
     o->bpp = fb.bpp;
     o->native = fb.native;
@@ -204,7 +208,10 @@ static void scanout_show(struct scanout *o) {
 }
 
 int64_t fb_scanout_check(const struct n_scanout *d, uint64_t *bytes) {
-    if (!fb.addr || d->width != fb.width || d->height != fb.height) return -N_ERR_INVALID;
+    /* Any size a mode has (a display engine's sizes are 16 bits); whether the desktop's planes fit in
+       memory at it is the window manager's to say (wm_screen_resized). */
+    if (!fb.addr || !d->width || !d->height || d->width > UINT16_MAX || d->height > UINT16_MAX)
+        return -N_ERR_INVALID;
     uint32_t format = d->format & N_SCANOUT_FORMAT_MASK;
     if (d->format & ~(N_SCANOUT_FORMAT_MASK | N_SCANOUT_DIRECT)) return -N_ERR_INVALID;
     if (format != N_SCANOUT_XRGB8888 && format != N_SCANOUT_XRGB2101010 && format != N_SCANOUT_XBGR8888)
@@ -230,6 +237,8 @@ static int64_t scanout_map(struct scanout *o, const uint64_t *frames, size_t pag
     o->map = map;
     o->pages = pages;
     o->addr = (uint8_t *)map + first_byte;
+    o->width = d->width;
+    o->height = d->height;
     o->pitch = d->pitch;
     o->bpp = 32;
     o->native = format == N_SCANOUT_XRGB8888;
@@ -246,6 +255,12 @@ int64_t fb_scanout_take(const uint64_t *frames, size_t pages, uint64_t type, siz
 }
 
 void fb_scanout_boot(void) { scanout_show(&scanouts[0]); }
+
+void fb_screen_size(uint32_t *w, uint32_t *h) {
+    const struct scanout *o = __atomic_load_n(&shown, __ATOMIC_ACQUIRE);
+    *w = o->width;
+    *h = o->height;
+}
 
 /* ---- what the display engine may show in the scanout's place ----
    A driver that shows an app's window directly (N_SCANOUT_DIRECT, gui/wm.c) flips the display
@@ -282,13 +297,27 @@ void fb_scanout_also_end(struct scanout *o) {
     kfree(o);
 }
 
+/* What lies outside the w x h at the top left of o goes black (0 in every format it may have): a
+   scanout larger than the panic screen shows nothing of the desktop around it. */
+static void blank_around(const struct scanout *o, int w, int h) {
+    uint32_t bytes = o->bpp / 8;
+    for (uint32_t y = 0; y < o->height; y++) {
+        uint32_t from = y < (uint32_t)h ? MIN((uint32_t)w, o->width) : 0;
+        if (from < o->width) memset(o->addr + (uint64_t)y * o->pitch + (uint64_t)from * bytes, 0,
+                                    (size_t)(o->width - from) * bytes);
+    }
+}
+
 void fb_present_last(const uint32_t *src, int src_pitch, int w, int h) {
     fb_present(src, src_pitch, NULL, 0, 0, 0, w, h);
     if (!src || !fb.addr || src_pitch <= 0 || w <= 0 || h <= 0) return;
     __atomic_add_fetch(&presenting, 1, __ATOMIC_SEQ_CST);
+    blank_around(__atomic_load_n(&shown, __ATOMIC_SEQ_CST), w, h);
     for (struct scanout *o = __atomic_load_n(&alsos, __ATOMIC_ACQUIRE); o;
-         o = __atomic_load_n(&o->next, __ATOMIC_ACQUIRE))
+         o = __atomic_load_n(&o->next, __ATOMIC_ACQUIRE)) {
         present_area(o, src, src_pitch, NULL, 0, 0, 0, w, h);
+        blank_around(o, w, h);
+    }
     __atomic_sub_fetch(&presenting, 1, __ATOMIC_RELEASE);
 }
 
@@ -309,10 +338,10 @@ static void present_area(const struct scanout *out, const uint32_t *src, int src
     int64_t right=(int64_t)x+w, bottom=(int64_t)y+h;
     if (x<0) x=0;
     if (y<0) y=0;
-    if (right>(int64_t)fb.width) right=fb.width;
+    if (right>(int64_t)out->width) right=out->width;
     if (right>src_pitch) right=src_pitch;
     if (deep && right>deep_pitch) right=deep_pitch;
-    if (bottom>(int64_t)fb.height) bottom=fb.height;
+    if (bottom>(int64_t)out->height) bottom=out->height;
     if (right<=x || bottom<=y) return;
     w=(int)(right-x); h=(int)(bottom-y);
     /* User mappings are intentionally not accessible to kernel-only AP workers.

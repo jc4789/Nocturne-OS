@@ -12,6 +12,7 @@
 #include "arch/cpu.h"
 #include "arch/smp.h"
 #include "gui/wm.h"
+#include "gui/screenmode.h"
 #include "dev/fb.h"
 #include "dev/gpu.h"
 #include "dev/fbcon.h"
@@ -78,10 +79,14 @@ static canvas_t back, wall;
 static uint8_t *back_deep, *wall_deep;
 static struct wait_queue wm_wq;
 static unsigned pending_frames;
-static uint64_t frame_period_ms, frame_started_ms;
+/* Without vertical blanks, a frame with damage starts at frame_next_us (µs of uptime) at the
+   earliest, and the one after it a frame_period_us later: frames start on the scheduler's
+   millisecond, the deadlines keep the cadence's fraction, so 120 Hz is 120 frames a second and not
+   one every 9 ms. A frame later than a period starts the count anew. */
+static uint64_t frame_period_us, frame_next_us;
 /* A display driver's vertical blanks (n_pci_screen_vblank, dev/pciuser.c) of the scanout the
    screen is drawn into: while they come, a frame with damage starts at the next blank, not after
-   frame_period_ms; VBLANK_LOST_MS without one and the period paces frames again. vblank_count is
+   frame_period_us; VBLANK_LOST_MS without one and the period paces frames again. vblank_count is
    the driver's count of the last blank, vblank_drawn the one the last frame started at. BSP,
    changed with interrupts off. */
 #define VBLANK_LOST_MS 100
@@ -93,8 +98,9 @@ static bool vblank_seen, vblank_waiting, vblank_pacing;
    over it (the moon menu, the volume panel, a toast, a resize outline) or sent to a remote viewer.
    It then draws the pointer itself. The desktop is still composited into the driver's surface
    meanwhile, so it is current the moment the driver shows it again. direct_state is what the
-   driver reads; its serial changes with every change of it, the pointer's moves included while a
-   window is shown. Under the WM lock. */
+   driver reads, with the mode the system wants it to show (gui/screenmode.c); its serial changes
+   with every change of it, the pointer's moves included while a window is shown. Under the WM
+   lock. */
 #define DIRECT_HOT 8 /* desktop_draw_cursor draws every shape in a box from (x-8, y-8) */
 static bool direct_able;
 static struct window *direct_win;
@@ -433,6 +439,17 @@ void wm_screen_direct(bool able) {
         kprintf("wm: %s\n", able ? "the display driver can show fullscreen windows directly"
                                   : "fullscreen windows are composited into the desktop again");
         direct_update();
+    }
+    wm_unlock();
+}
+
+void wm_screen_mode(const struct n_screen_mode *mode, uint64_t serial) {
+    wm_lock();
+    if (serial > direct_state.mode_serial) {
+        direct_state.mode = *mode;
+        direct_state.mode_serial = serial;
+        direct_state.serial++;
+        wq_wake_all(&direct_wq);
     }
     wm_unlock();
 }
@@ -2224,7 +2241,12 @@ void wm_vblank(uint64_t count, uint64_t timestamp_ns) {
 static bool vblank_paced(uint64_t now) { return vblank_seen && now - vblank_at_ms < VBLANK_LOST_MS; }
 /* Whether a frame with damage may start at now. Interrupts off. */
 static bool frame_due(uint64_t now) {
-    return vblank_paced(now) ? vblank_count != vblank_drawn : now - frame_started_ms >= frame_period_ms;
+    return vblank_paced(now) ? vblank_count != vblank_drawn : now * 1000 >= frame_next_us;
+}
+/* The next frame's earliest start, after one started at now (ms). */
+static void frame_started(uint64_t now) {
+    uint64_t us = now * 1000;
+    frame_next_us = us - frame_next_us < frame_period_us ? frame_next_us + frame_period_us : us + frame_period_us;
 }
 
 /* ---- compositor thread ---- */
@@ -2240,7 +2262,7 @@ static void wm_thread(void *arg) {
             bool paced = work && vblank_paced(now);
             vblank_waiting = paced; /* the next blank wakes the thread */
             wq_wait_timeout(&wm_wq, !work ? 250 : paced ? VBLANK_LOST_MS - (now - vblank_at_ms)
-                                                        : frame_period_ms - (now - frame_started_ms));
+                                                        : (frame_next_us - now * 1000 + 999) / 1000);
             vblank_waiting = false;
             if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
         }
@@ -2253,8 +2275,8 @@ static void wm_thread(void *arg) {
                 kprintf("wm: frames paced by the display driver's vertical blank (count %lu at %lu ns)\n",
                         (unsigned long)first_count, (unsigned long)first_ns);
             else
-                kprintf("wm: no vertical blank for %u ms; frames paced by the %lu ms frame period\n", VBLANK_LOST_MS,
-                        (unsigned long)frame_period_ms);
+                kprintf("wm: no vertical blank for %u ms; frames paced at %u Hz (0=unpaced)\n", VBLANK_LOST_MS,
+                        (unsigned)refresh_hz);
         }
         wm_lock();
         struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
@@ -2297,7 +2319,7 @@ static void wm_thread(void *arg) {
             for (int i=0;i<ndamage;i++) frame.area+=(uint64_t)damage[i].w*damage[i].h;
         }
         if (render) {
-            frame_started_ms = now;
+            frame_started(now);
             composite();
         }
         trace_frame_end(&frame);
@@ -2353,9 +2375,9 @@ char *wm_clipboard_snapshot(size_t *len) {
 
 /* ---- remote display ---- */
 
-/* Change the size of the desktop. The framebuffer keeps its own size (fb_present clips), so a
-   remote viewer can have a desktop of the size its window has. Only call this from a kernel
-   thread: the compositor must not be in the middle of a frame. */
+/* Change the size of the desktop: to the scanout's when a display driver shows another mode
+   (wm_screen_resized), or to a remote viewer's window's (the scanout keeps its own size;
+   fb_present clips to it). Not from the compositor: it must not be in the middle of a frame. */
 static bool set_screen_size(int w, int h) {
     cpu_require_bsp();
     if (w == sw && h == sh) return true;
@@ -2457,12 +2479,25 @@ void wm_repaint(void) {
 }
 
 void wm_remote_detach(void) {
+    uint32_t w, h;
+    fb_screen_size(&w, &h);
     wm_lock();
     if (remote_users > 0) remote_users--;
-    if (!remote_users) set_screen_size((int)fb.width, (int)fb.height);
+    if (!remote_users) set_screen_size((int)w, (int)h);
     damage_all();
     wake_compositor();
     wm_unlock();
+}
+
+bool wm_screen_resized(uint32_t w, uint32_t h) {
+    if (!running) return true;
+    wm_lock();
+    bool ok = remote_users || set_screen_size((int)w, (int)h);
+    if (!ok) kprintf("wm: no memory for a %ux%u desktop; it keeps its size\n", w, h);
+    damage_all();
+    wake_compositor();
+    wm_unlock();
+    return ok;
 }
 
 int wm_remote_damage(struct wm_rect *out, int max) {
@@ -2488,8 +2523,8 @@ bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h) {
 
 int wm_cursor_shape(void) { return cursor_shape; }
 
-/* Frame period for a cadence, rounded UP to the scheduler's millisecond. */
-static uint64_t refresh_period(uint32_t hz) { return hz ? 1000 / hz + (1000 % hz != 0) : 0; }
+/* Frame period for a cadence, in µs (frame_next_us). */
+static uint64_t refresh_period(uint32_t hz) { return hz ? 1000000 / hz : 0; }
 
 void wm_init(void) {
     /* PCI has been enumerated. Optional offscreen GPU never changes the display
@@ -2500,13 +2535,13 @@ void wm_init(void) {
     /* Limine's framebuffer ABI has no refresh rate/vblank signal. Cadence is
        deployment policy, not an invented hardware rate: boot configuration
        supplies wmrefresh=<Hz>. Zero/absent keeps the unpaced diagnostic path.
-       Round UP to the scheduler's millisecond resolution, never exceed it. */
+       At most the scheduler's 1000 Hz. */
     uint64_t hz;
     if (cmdline_number("wmrefresh", &hz)) refresh_hz = hz > 1000 ? 1000 : (uint32_t)hz;
-    frame_period_ms = refresh_period(refresh_hz);
+    frame_period_us = refresh_period(refresh_hz);
     deep_wanted = fb.simulated;
-    kprintf("wm: configured frame period %lu ms (0=unpaced); a display driver's vertical blanks pace frames "
-            "while they come\n", frame_period_ms);
+    kprintf("wm: configured frame rate %u Hz (0=unpaced); a display driver's vertical blanks pace frames "
+            "while they come\n", (unsigned)refresh_hz);
     size_t pages = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
     if (!bb || !wp) {
@@ -2769,7 +2804,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
                     n.pointer_y > POINTER_Y_INVERT || (n.deep_simulation && !fb.native))
                     return -N_ERR_INVALID;
                 refresh_hz = n.refresh_hz;
-                frame_period_ms = refresh_period(refresh_hz);
+                frame_period_us = refresh_period(refresh_hz);
                 if (n.pointer_speed != pointer_speed) pointer_rest_x = pointer_rest_y = 0;
                 pointer_speed = n.pointer_speed;
                 input_set_pointer_y(n.pointer_y);
@@ -2890,6 +2925,9 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
 
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     if (num == SYS_GUI_LAUNCH) return wm_syscall_locked(num,a,b,c,d,e,NULL);
+    /* The monitor's mode: its own lock, which comes before the WM's (it tells the driver through
+       wm_screen_mode). */
+    if (num == SYS_SCREEN_INFO && (c == SCREEN_MODES_GET || c == SCREEN_MODE_SET)) return screen_modes_syscall((void *)a, b, c);
     struct handle *handle = NULL;
     if (num == SYS_WIN_RECEIVE) {
         /* Waits without the WM lock; the handle's reference keeps the window's memory. */

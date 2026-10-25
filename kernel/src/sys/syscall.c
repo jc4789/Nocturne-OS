@@ -27,7 +27,7 @@
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
-_Static_assert(SYS_PCI_SCREEN_IMAGE_END < SYS_MAX, "every system call number is below SYS_MAX");
+_Static_assert(SYS_PCI_SCREEN_MODES < SYS_MAX, "every system call number is below SYS_MAX");
 _Static_assert(sizeof(struct n_pager_fault) == 16 && sizeof(struct n_pager_supply) == 32, "pager ABI");
 
 extern char cpu_brand[64];
@@ -709,6 +709,17 @@ static int64_t sys_pci_screen_state(int h,uint64_t seen,struct n_screen_state *u
     handle_close(pci);
     if((r==0||r==-N_ERR_TIMEOUT)&&copy_to_user(uout,st,sizeof *st))r=-N_ERR_BAD_ADDRESS;
     kfree(st);
+    return r;
+}
+/* A display driver's monitor and the modes it can show there (dev/pciuser.c, gui/screenmode.c). */
+static int64_t sys_pci_screen_modes(int h,const struct n_screen_modes *um) {
+    struct n_screen_modes *m=kmalloc(sizeof *m);
+    if(!m)return -N_ERR_NO_MEMORY;
+    int64_t r=copy_from_user(m,um,sizeof *m)?-N_ERR_BAD_ADDRESS:0;
+    struct handle *pci=r?NULL:handle_get(h);
+    if(!r)r=pci?pci_user_screen_modes(pci,m):-N_ERR_NO_HANDLE;
+    handle_close(pci);
+    kfree(m);
     return r;
 }
 /* An ACPI object of the claimed function's part of the namespace (dev/pciuser.c). The arguments'
@@ -2503,6 +2514,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_PCI_ACPI_EVAL: ret = sys_pci_acpi_eval((int)a,(const struct n_acpi_eval *)b,(void *)c,d); break;
     case SYS_PCI_SCREEN_STATE: ret = sys_pci_screen_state((int)a,b,(struct n_screen_state *)c,(int64_t)d); break;
     case SYS_PCI_SCREEN_IMAGE: ret = sys_pci_screen_image((int)a,(int)b,(const struct n_scanout *)c); break;
+    case SYS_PCI_SCREEN_MODES: ret = sys_pci_screen_modes((int)a,(const struct n_screen_modes *)b); break;
     case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
     case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
     case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:

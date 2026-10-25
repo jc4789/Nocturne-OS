@@ -913,6 +913,55 @@ static JSValue h_desktop_set(JSContext *c, JSValueConst this, int argc, JSValueC
     return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_SETTINGS_SET, 0, 0) == 0);
 }
 
+/* The monitor's modes (struct screen_modes): what the display driver offers, the one shown, the
+   one the system asks for and the trial. */
+static JSValue screen_mode_value(const struct n_screen_mode *m) {
+    if (!m->width) return JS_NULL;
+    JSValue o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "width", JS_NewUint32(ctx, m->width));
+    JS_SetPropertyStr(ctx, o, "height", JS_NewUint32(ctx, m->height));
+    JS_SetPropertyStr(ctx, o, "refreshMillihertz", JS_NewUint32(ctx, m->refresh_mhz));
+    JS_SetPropertyStr(ctx, o, "preferred", JS_NewBool(ctx, m->flags & N_SCREEN_MODE_PREFERRED));
+    return o;
+}
+static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    struct screen_modes *s = malloc(sizeof *s);
+    if (!s) return JS_NULL;
+    if (__syscall(SYS_SCREEN_INFO, (long)s, sizeof *s, SCREEN_MODES_GET, 0, 0) != 0) {
+        free(s);
+        return JS_NULL;
+    }
+    s->offered.monitor[sizeof s->offered.monitor - 1] = s->offered.name[sizeof s->offered.name - 1] = 0;
+    JSValue o = JS_NewObject(ctx), modes = JS_NewArray(ctx);
+    uint32_t count = s->offered.count < N_SCREEN_MODES_MAX ? s->offered.count : N_SCREEN_MODES_MAX;
+    for (uint32_t i = 0; i < count; i++) JS_SetPropertyUint32(ctx, modes, i, screen_mode_value(&s->offered.modes[i]));
+    JS_SetPropertyStr(ctx, o, "monitor", JS_NewString(ctx, s->offered.monitor));
+    JS_SetPropertyStr(ctx, o, "name", JS_NewString(ctx, s->offered.name));
+    JS_SetPropertyStr(ctx, o, "modes", modes);
+    JS_SetPropertyStr(ctx, o, "shown", s->offered.done ? screen_mode_value(&s->offered.shown) : JS_NULL);
+    JS_SetPropertyStr(ctx, o, "wanted", screen_mode_value(&s->wanted));
+    JS_SetPropertyStr(ctx, o, "trialMs", JS_NewUint32(ctx, s->trial_ms));
+    JS_SetPropertyStr(ctx, o, "refused", JS_NewBool(ctx, s->refused));
+    free(s);
+    return o;
+}
+
+/* (how, monitor, width, height, refresh in mHz): SCREEN_MODE_SET; whether the system took it */
+static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    struct screen_mode_set s = {0};
+    uint32_t how = 0;
+    const char *monitor = JS_ToCString(ctx, argv[1]);
+    if (!monitor) return JS_EXCEPTION;
+    snprintf(s.monitor, sizeof s.monitor, "%s", monitor);
+    JS_FreeCString(ctx, monitor);
+    JS_ToUint32(ctx, &how, argv[0]);
+    JS_ToUint32(ctx, &s.mode.width, argv[2]);
+    JS_ToUint32(ctx, &s.mode.height, argv[3]);
+    JS_ToUint32(ctx, &s.mode.refresh_mhz, argv[4]);
+    s.how = how;
+    return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_MODE_SET, 0, 0) == 0);
+}
+
 /* The computer: processor, memory, uptime, running tasks. */
 static JSValue h_system_info(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
     struct n_sysinfo si;
@@ -1321,6 +1370,8 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("uiLaunch", 2, h_ui_launch),
     JS_CFUNC_DEF("desktop", 0, h_desktop),
     JS_CFUNC_DEF("desktopSet", 4, h_desktop_set),
+    JS_CFUNC_DEF("screenModes", 0, h_screen_modes),
+    JS_CFUNC_DEF("screenModeSet", 5, h_screen_mode_set),
     JS_CFUNC_DEF("setVolume", 1, h_set_volume),
     JS_CFUNC_DEF("systemInfo", 0, h_system_info),
 };

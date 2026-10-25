@@ -461,8 +461,11 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     view を作るとその型に決まる）、あるいはそれらの view。`struct n_scanout` の `offset` から
     `pitch × height` バイトが面に収まり、`format` は `N_SCANOUT_XRGB8888`、
     `N_SCANOUT_XRGB2101010`、`N_SCANOUT_XBGR8888`（赤が下位のバイト、NVIDIA の X8B8G8R8）の
-    どれか、幅と高さは起動時の画面と同じでなければ `N_ERR_INVALID`
-    （大きさの変更は今後の拡張：デスクトップの寸法と全バッファーの作り直しが要る）。
+    どれか。幅と高さは表示エンジンが出すモードのもの（ドライバーがモードを出した後はシステムが
+    選んだモード、`struct n_screen_state` の `mode`。各 65535 まで）で、デスクトップはその大きさに
+    なり、全画面・最大化の窓も従う。同じ面を別の大きさで渡し直しても同じく大きさが変わる。起動時の
+    画面へ戻すとその大きさで描く。0 や 65535 超・未知の形式・面に収まらない範囲は `N_ERR_INVALID`、
+    その大きさのデスクトップがメモリーに収まらなければ `N_ERR_NO_MEMORY`（画面はそのまま）。
     受け付けるとカーネルは面をカーネル空間へ同じ型で写し、そのページの型を固定する
     （1 ページ 1 型。ドライバー自身の書込み結合の写像とは衝突しない。非キャッシュの写像とは
     どちらか後の方が `N_ERR_DENIED`）。進行中の描画が終わるのを待ってから出力先を切り替え、
@@ -474,6 +477,29 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     書込みを止め、パニック画面はその時の出力先と、`n_pci_screen_image`（下）で登録された面の
     すべてへ描く。スリープと休止は、claim のある間
     始まらない（dev/pm.c）ので、ドライバーの面が表示中に起きることはない。
+  - モニターのモード（解像度とリフレッシュレート）：選ぶのはシステムと利用者、列挙・検証・設定は
+    ドライバー。`n_pci_screen_modes(pci, modes)` で表示機能のドライバーが、駆動するモニター
+    （`struct n_screen_modes` の `monitor`：EDID の製造者・製品・製造番号から作る識別子、`name`：
+    EDID のモニター名）と、そこで出せるモード（最大 `N_SCREEN_MODES_MAX`。EDID の推奨モードに
+    `N_SCREEN_MODE_PREFERRED`）を知らせる。システム（gui/screenmode.c）は、試行中のモード、無ければ
+    利用者がそのモニターに選んだモード、無ければモニターの推奨モード、無ければ推奨の大きさで最も
+    近いリフレッシュ、無ければ 60 Hz に近い最大の大きさを選び、`struct n_screen_state` の
+    `mode` と `mode_serial`（望むたびに進む。同じモードでも）でドライバーへ伝える。ドライバーは
+    それを出し（その大きさで `n_pci_give_screen`）、`done` に `mode_serial`、`shown` に出せたモードを
+    入れて知らせ直す。望まれたものと違えば、システムはそのモニターでそのモードを二度と望まず、
+    別のものを選ぶ。`done` 0（開始時、モニターの変化・接続時）では選び直す。`count` 0（または claim
+    の終わり）でモニターを駆動しなくなる。表示機能でなければ `N_ERR_DENIED`、件数・0 の大きさや
+    リフレッシュ・65535 超は `N_ERR_INVALID`、ほかの claim の面が表示中かモードを出していれば
+    `N_ERR_BUSY`。
+  - 設定アプリは `SYS_SCREEN_INFO` の第3引数 `SCREEN_MODES_GET`（`struct screen_modes`：モニター、
+    モード、表示中と望まれたモード、試行の残り時間、直前の試行を出せなかったか）と
+    `SCREEN_MODE_SET`（`struct screen_mode_set`）を使う（display_abi.h）。`SCREEN_MODE_TRY` は
+    一覧のモードを試行として出し、`SCREEN_MODE_TRIAL_MS`（15 秒）以内に `SCREEN_MODE_KEEP` が
+    無ければ前のモードへ戻る（`SCREEN_MODE_BACK` は即座に）。試行中の別の `TRY` は戻り先を
+    保つ。`KEEP` は再起動までそのモニターの利用者の選択にする。`SCREEN_MODE_SAVED` は設定アプリが
+    起動時に保存ファイルから戻すもの（そのモニターが駆動され、そのモードを出すときに使う）。
+    ドライバーが無ければモードは 0 件で、画面はファームウェアのモードのまま（`TRY`・`KEEP`・
+    `BACK` は `N_ERR_NOT_FOUND`）。
   - `n_pci_screen_vblank(pci, count, timestamp_ns)`：渡した面の垂直帰線を一つ知らせる
     （`count` はドライバーの帰線番号、`timestamp_ns` はドライバーの時計）。届いている間、
     デスクトップは自分の周期ではなく帰線ごとに 1 枚を描き始める。100 ms 届かなければ周期へ
@@ -486,24 +512,26 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     無い間だけ許される。許可の出入りは窓へ `EV_DIRECT`（key 1 許可、0 取消し）、今の状態は
     `win_state` の `WIN_STATE_DIRECT`。取り消された窓へは描き直しの損傷も送るので、
     窓は自分の通常の面へ描き直す。
-  - `n_pci_screen_state(pci, seen, out, timeout_ms)`：直接表示を受け持つドライバーが、
-    許可された窓（`struct n_screen_state` の `app`。無ければ 0）と、その間ドライバーが
+  - `n_pci_screen_state(pci, seen, out, timeout_ms)`：画面をこの claim の面へ描かせているか、
+    モードを出したドライバーが、出すべきモード（`mode`、`mode_serial`。上）と、直接表示を受け持つ
+    なら許可された窓（`struct n_screen_state` の `app`。無ければ 0）と、その間ドライバーが
     描くポインター（位置・表示の有無・32×32 の ARGB 画像とその要点、画像が変わると
     `pointer_serial` が進む）を読む。`serial` が `seen` と同じ間は `timeout_ms` まで待つ
-    （0 は待たない。`N_ERR_TIMEOUT` でも今の状態を書く）。画面がこの claim の面でない、
-    または `N_SCANOUT_DIRECT` で渡していなければ `N_ERR_DENIED`。claim の終わりと起動時の
+    （0 は待たない。`N_ERR_TIMEOUT` でも今の状態を書く）。画面がこの claim の面でなく、
+    モードも出していなければ `N_ERR_DENIED`。claim の終わりと起動時の
     画面への返却で直接表示は終わり、許可も取り消す。
   - `n_pci_screen_image(pci, surface, desc)`／`n_pci_screen_image_end(pci, image)`：直接表示を
     受け持つドライバーが、渡した面の代わりに表示エンジンへ出すことのある面（アプリの絵）を
     登録する。カーネルが止まると、表示エンジンは最後にフリップされた面を出し続け、渡した面へ
     戻すドライバーはもう動かない。そのためパニック画面は、渡した面と登録された面のすべてへ
     描く。システムがそこへ描くのはこの時だけ。`surface` と `desc` は `n_pci_give_screen` と
-    同じ条件（`format` に `N_SCANOUT_DIRECT` は付けない）で、カーネルは同じく型を固定して
+    同じ条件（`format` に `N_SCANOUT_DIRECT` は付けない。大きさは面自身のもので、表示エンジンが
+    モードの大きさへ拡大縮小してよい。パニック画面はその大きさで描く）で、カーネルは同じく型を固定して
     写す。正の番号を返し、`n_pci_screen_image_end` にその番号を渡すと登録を外す（ドライバーは
     面の memory を解放する前に外す）。`N_SCANOUT_DIRECT` 無しで渡し直すこと、起動時の画面への
     返却、claim の終わりで、登録はすべて外れる。画面がこの claim の `N_SCANOUT_DIRECT` の面で
-    ない、またはオブジェクトが `n_pci_give_screen` の受け付けないものなら `N_ERR_DENIED`、大きさ・
-    形式・範囲が違えば、または外す番号が無ければ `N_ERR_INVALID`。登録できない絵は表示エンジンへ
+    ない、またはオブジェクトが `n_pci_give_screen` の受け付けないものなら `N_ERR_DENIED`、0 や
+    65535 超の大きさ・未知の形式・面に収まらない範囲、または外す番号が無ければ `N_ERR_INVALID`。登録できない絵は表示エンジンへ
     出さないこと（パニック画面が見えなくなる）。
   - `n_pci_acpi_eval(pci, node, name, args, nargs, data, data_size, out, out_size)`：claim した
     機能に属する ACPI の名前を一つ評価する（カーネルの AML 解釈器で）。`node` は

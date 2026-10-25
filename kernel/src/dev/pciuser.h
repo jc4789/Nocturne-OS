@@ -42,10 +42,14 @@ int64_t pci_user_hold_screen(struct handle *h, bool hold);
 struct n_scanout;
 int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const struct n_scanout *desc);
 int64_t pci_user_screen_vblank(struct handle *h, uint64_t count, uint64_t timestamp_ns);
-/* n_pci_screen_state: for the claim whose N_SCANOUT_DIRECT scanout the screen is drawn into
-   (gui/wm.c keeps the state). */
+/* n_pci_screen_state: for the claim whose scanout the screen is drawn into or whose monitor's
+   modes the system has (gui/wm.c keeps the state). n_pci_screen_modes: a display function's
+   monitor and the modes its driver can show there, and what it showed (m: a kernel copy), for
+   the system to choose from (gui/screenmode.c); count 0 withdraws them. */
 struct n_screen_state;
+struct n_screen_modes;
 int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
+int64_t pci_user_screen_modes(struct handle *h, const struct n_screen_modes *m);
 /* n_pci_screen_image: for that claim, a surface (as n_pci_give_screen's, without N_SCANOUT_DIRECT)
    the display engine may show in its scanout's place, which the panic screen is drawn into too;
    returns its number. n_pci_screen_image_end: that one no longer. The scanout's end, or a scanout

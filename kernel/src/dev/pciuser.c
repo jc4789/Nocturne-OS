@@ -23,6 +23,7 @@
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pciuser.h"
+#include "gui/screenmode.h"
 #include "gui/wm.h"
 #include "mm/heap.h"
 #include "sys/proc.h"
@@ -224,13 +225,16 @@ static void screen_release(void) {
 }
 
 /* ---- a display driver's own scanout (n_pci_give_screen, dev/fb.c) ----
-   A display function's driver that set up a scanout of the screen's size gives the system that
-   surface, and the desktop is drawn there instead of the boot screen. One claim at a time shows
-   its surface (screen_owner); it gives the boot screen back itself, or its claim's end does once
-   the function is stopped. Then the boot screen's memory is drawn into again, though the display
-   engine may no longer show it: the driver that left reprogrammed it and nothing sets it back. */
-static struct mutex screen_lock; /* screen_owner, screen_surface and screen_direct change under it */
+   A display function's driver offers the modes of its monitor (n_pci_screen_modes; the system
+   chooses one, gui/screenmode.c), sets the one chosen up with a scanout of its size and gives the
+   system that surface: the desktop takes its size and is drawn there instead of the boot screen.
+   One claim at a time shows its surface (screen_owner) and offers modes (screen_modes_from); it
+   gives the boot screen back itself, or its claim's end does once the function is stopped. Then
+   the boot screen's memory is drawn into again, at its size, though the display engine may no
+   longer show it: the driver that left reprogrammed it and nothing sets it back. */
+static struct mutex screen_lock; /* the screen's claims, screen_surface and screen_direct change under it */
 static struct pci_claim *screen_owner;
+static struct pci_claim *screen_modes_from;
 static struct shared_scanout screen_surface;
 /* The scanout shown has N_SCANOUT_DIRECT: its driver shows the windows the window manager lets it
    show directly (gui/wm.c, n_pci_screen_state). */
@@ -267,7 +271,8 @@ static void screen_images_end(void) {
     }
 }
 
-/* The boot screen again, when c shows its surface: true when it did. screen_lock held. */
+/* The boot screen again, when c shows its surface, and the desktop at its size: true when it did.
+   screen_lock held. */
 static bool screen_give_back(struct pci_claim *c) {
     if (screen_owner != c) return false;
     screen_images_end();
@@ -275,6 +280,7 @@ static bool screen_give_back(struct pci_claim *c) {
     shared_scanout_close(&screen_surface);
     __atomic_store_n(&screen_owner, NULL, __ATOMIC_RELEASE);
     screen_direct = false;
+    wm_screen_resized(fb.width, fb.height);
     return true;
 }
 
@@ -330,6 +336,10 @@ static void claim_release(struct object *o) {
     c->acpi_watch = NULL;
     mutex_lock(&screen_lock);
     bool given_back = screen_give_back(c);
+    if (screen_modes_from == c) {
+        screen_modes_from = NULL;
+        screen_modes_gone();
+    }
     mutex_unlock(&screen_lock);
     if (given_back) {
         wm_screen_direct(false);
@@ -676,9 +686,17 @@ int64_t pci_user_give_screen(struct handle *h, struct handle *surface, const str
     } else {
         uint64_t bytes = 0;
         struct shared_scanout s = {0};
+        uint32_t was_w, was_h;
+        fb_screen_size(&was_w, &was_h);
         r = fb_scanout_check(desc, &bytes);
         if (!r) r = shared_scanout_open(surface, c, desc->offset, bytes, &s);
-        if (!r) r = fb_scanout_take(s.frames, s.pages, s.type, s.first_byte, desc);
+        /* The desktop takes the scanout's size first: where its planes do not fit in memory, the
+           screen stays as it is. */
+        if (!r && !wm_screen_resized(desc->width, desc->height)) r = -N_ERR_NO_MEMORY;
+        if (!r) {
+            r = fb_scanout_take(s.frames, s.pages, s.type, s.first_byte, desc);
+            if (r) wm_screen_resized(was_w, was_h);
+        }
         if (r) shared_scanout_close(&s);
         else {
             shared_scanout_close(&screen_surface); /* the surface shown before, no longer mapped */
@@ -718,10 +736,30 @@ int64_t pci_user_screen_state(struct handle *h, uint64_t seen, struct n_screen_s
     struct pci_claim *c = claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     mutex_lock(&screen_lock);
-    bool ours = screen_owner == c && screen_direct;
+    bool ours = screen_owner == c || screen_modes_from == c;
     mutex_unlock(&screen_lock);
     if (!ours) return -N_ERR_DENIED;
     return wm_screen_state(seen, out, timeout_ms);
+}
+
+int64_t pci_user_screen_modes(struct handle *h, const struct n_screen_modes *m) {
+    struct pci_claim *c = claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
+    if (c->d->cls != 0x03) return -N_ERR_DENIED;
+    if (m->count > N_SCREEN_MODES_MAX) return -N_ERR_INVALID;
+    for (uint32_t i = 0; i < m->count; i++)
+        if (!m->modes[i].width || !m->modes[i].height || m->modes[i].width > UINT16_MAX ||
+            m->modes[i].height > UINT16_MAX || !m->modes[i].refresh_mhz)
+            return -N_ERR_INVALID;
+    int64_t r = 0;
+    mutex_lock(&screen_lock);
+    if ((screen_owner && screen_owner != c) || (screen_modes_from && screen_modes_from != c)) r = -N_ERR_BUSY;
+    else {
+        screen_modes_from = m->count ? c : NULL;
+        screen_modes_offer(m);
+    }
+    mutex_unlock(&screen_lock);
+    return r;
 }
 
 int64_t pci_user_screen_image(struct handle *h, struct handle *surface, const struct n_scanout *desc) {

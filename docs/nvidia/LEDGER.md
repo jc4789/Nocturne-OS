@@ -74,7 +74,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目は未実施 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目（2026-10-25、2 回起動）は nvrm の面への移行・モード設定・垂直帰線による歩調まで誤りの行なく進んだが、主モニター（Acer X27U Z1、QD-OLED、DP）は暗いまま戻らなかった。原因は不明。モードは起動画面と同じ 1920×1080 59.940 Hz で、設定アプリでは変えられなかった（C65 で修理）。7 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -145,6 +145,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C62 | head を点けるモード設定も、層の完了通知でフリップの完了を待てる | 却下 → 修理済み（実機未確認） | 実機 5 回目、最初のモード設定の後に「the flip on head 0 has not completed after 3000 ms」、続いて「the mode set did not complete」と表示の持ち主の解放。NVKMS が起動画面を復元し、二台のモニター（HP の DP と Acer の HDMI）に同じ画面が出た。表示エンジンが層の完了通知を書くのは、commit の前に点いていた head の、面を出していた層だけ（nvidia-drm も `old_crtc_state->active && old_plane_state->fb` のときだけフリップのイベントを数える）。点けるモード設定には書かれない通知を待っていた。NVKMS のモード設定は同期で、戻った時点で済んでいる。修理：`display.c` は点いている head の面の差し替えだけを待ち、点けるモード設定・面を外す commit（失った head）・失敗した commit は待たない。待ったフリップが 3 秒で完了しなければ、以後はフリップを待たず直接表示もやめる（`scr.flips_unseen`、CREATE と PRESENT は `NV_ERR_NOT_SUPPORTED`、出ていた絵からはデスクトップへ）。host 試験の偽の KAPI に実機の規則を入れた（直す前の `display.c` はこの偽物で `nvrm_display_start` から失敗し、実機の症状を再現した） |
 | C63 | Mesa・Zink・NVK が GPU を使わなかった理由はログで分かる | 却下 → 修理済み（実機未確認） | 実機 5 回目、nvrm は「serving clients」まで進んだが、WebGL は「Mesa softpipe」で、System.log に Mesa の行が一つも無かった。机上から起動したアプリには stderr が無く、Mesa の既定の出力先は stderr だけ。`vk_error*` は Vulkan のデバッグ記録が無いと何も出さず、nvkmd の拒否は無言、`nocturne_gl.c` の「ログ一行」は実際には無かった。修理：Mesa の記録の出力先にシステムの記録を足す（`util/log.c`、`MESA_LOG=system`）。`nocturne_gl.c` は GPU で描くか・使えない理由（`nvrm_connect_ready_status` の結果）・Zink が始まらなかったことを、変わったときだけ一行書く。nvkmd は `nnrm_open_device` が止まった段階（RM の制御・物体の名前）と NV_STATUS、または chipset と class を書く。host 試験（mesa_screen、nvk_rm、nvrm_transport） |
 | C64 | `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE` は MiB | 却下 → 修理済み | RM は KiB で返す（`mem_mgr_gm107.c` は BAR1 の VA 範囲の長さを 1024 で割る）。`nvkmd_nocturne_rm.c` は 1024×1024 を掛けていて、NVK の BAR の大きさが 1024 倍になっていた。RTX 4070 は Resizable BAR で BAR1 が VRAM より大きく、NVK は BAR を VRAM 以上なら別のヒープにしないので、実機では害が出なかったと見られる |
+| C65 | nvrm が点けるモードは起動画面と同じ大きさでよく、利用者がモードを選ぶ経路は要らない | 却下 → 修理済み（実機未確認） | 実機 6 回目、nvrm は起動画面の大きさの 1920×1080 から 59.940 Hz を選んだ（X27U Z1 の推奨は 2560×1440 59.951 Hz、31 モード）。カーネルはデスクトップを起動時の大きさに固定し、設定アプリの「Resolution」は何もしなかった。モードを決めるのは OS と利用者、列挙・検証・適用はドライバー（Windows-driver-samples で役割の境界を確かめた）。修理：カーネルにモニターのモードの持ち主（`kernel/src/gui/screenmode.c`）。ドライバーは見えるモードを出し（`n_pci_screen_modes`、推奨に `N_SCREEN_MODE_PREFERRED`）、システムは、そのモニターに保存された利用者の選択、無ければ推奨のモードを望む（`n_pci_screen_state` の `mode_serial`・`mode`）。ドライバーは点けて結果を返し（`done`・`shown`）、点かなかったモードは断られて次の候補が来る。設定アプリの試用（`SCREEN_MODE_SET`）は 15 秒で前のモードへ戻り、保持すればそのモニターの選択として保存される。デスクトップはスキャンアウトの大きさへ追従する（`wm_screen_resized`、`fb.c` はスキャンアウトごとの大きさ）。`display.c` は望まれたモードの大きさの面を作り、NVKMS の検査 → 面の受け渡し → commit → 古い面の解放の順で、commit が失敗すれば前の面（無ければ起動画面）へ戻す。確認：host 試験（偽の EDID と 8 モード、推奨、起動時の利用者の選択、失敗時に何も渡さない、モニターの出入り、直接表示）、QEMU の pcitest（Bochs VGA に 4 モード：推奨、試用が 15 秒で戻る、すぐ戻す、保持、取下げと再提示、他のモニターの選択、点かなかったモードの拒否）と、デスクトップが 1024×768 へ変わって戻ること、設定アプリの試用のカードを目視。実機で 2560×1440 が点くか、6 回目の暗い画面の原因は未確認 |
 | C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る。実機 4 回目：BME を入れてから nvrm が落ちて解放されるまで（`RmInitAdapter` の 5.1 秒を含む）、IOMMU の遮断の行は一つも無かった |
 
 ## 5. 担当と受け渡し
@@ -157,8 +158,12 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 6. 次の一手
 
-1. P10（ユーザー）：RTX 4070 の実機で起動し（6 回目。5 回目は nvrm が落ちずに動いたが、最初のモード設定で
-   表示を手放し、WebGL は softpipe だった）、画面が NVKMS の面へ移るか（`NVRM display:` に「the mode set did not
+1. P10（ユーザー）：RTX 4070 の実機で起動し（7 回目。6 回目は nvrm の面へ移ったが、X27U Z1 は 1920×1080
+   59.940 Hz で暗いままだった）、nvrm が出したモードとシステムが望んだモード（System.log の `screen:` の行：
+   「monitor …, N modes」「the monitor shows: …」、または「the display driver could not show …」）、
+   `NVRM display:` の「the desktop is shown on display … at …」、モニターが 2560×1440 の信号を受けて映るかを見る（C65）。
+   映れば設定アプリの Display で別のモード（280 Hz など）を試し、15 秒の試用・保持・戻るを見る。
+   画面が NVKMS の面へ移るか（`NVRM display:` に「the mode set did not
    complete」が出ず、`fb:` で画面を持ち続け、二台目のモニターが起動画面の写しにならない、C62）と、
    ブラウザーの WebGL が Zink で動くか（System.log の `MESA:` の行：「Nocturne GL: drawing on the GPU with …」なら GPU、
    そうでなければ同じ行の理由と、その前の `ZINK:`・`NVK:` の行、C63）を見る。全画面の直接表示では、
@@ -171,6 +176,35 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-25（7）：実機 6 回目（ユーザー、USB 起動、2 回）。ユーザーの観察：主モニター（Acer X27U Z1、QD-OLED、
+  DP、2560×1440 280 Hz、VRR 48〜280 Hz、Windows では 10 ビット）は暗くなったまま戻らなかった。2 回とも
+  選ばれたモードは 1920×1080 59.94 Hz。`build/qa/realhw6/` の System.log と nvrm.log：GSP の起動、NVKMS の
+  読込み、7 コネクターの列挙（HDMI の Acer KG271U X、DP の HP X27q、DP-1 の X27U Z1 がファームウェアで点灯）、
+  「mode 1920x1080 at 59.940 Hz (31 modes, 6 of 1920x1080; preferred 2560x1440 at 59.951 Hz)」、面の確保、
+  「the desktop is drawn into nvrm's surface, shown on display 0x00000800」、「serving clients」、垂直帰線による
+  歩調まで、誤りの行は一つも無かった。暗い原因はログからは分からない（DP のリンク、VRR、10 ビット、OLED の
+  モニター側の都合の仮説はどれも未確認）。
+  修理（C65）：モードを決めるのはカーネルと利用者、ドライバーは列挙・検証・適用。カーネルのモードの持ち主
+  （`screenmode.c`）、ABI（`n_pci_screen_modes`、`n_pci_screen_state` の `mode_serial`・`mode`、
+  `SCREEN_MODES_GET`・`SCREEN_MODE_SET`）、デスクトップの大きさの追従、`display.c` の望まれたモードの表示、
+  設定アプリの解像度とリフレッシュレートの一覧・15 秒の試用・モニターごとの保存。既定はモニターの推奨
+  （X27U Z1 なら 2560×1440 59.951 Hz）で、280 Hz は設定アプリで選ぶ。合わせて、ファームウェアの画面の
+  合成の歩調が ms への切り上げで 120 Hz が約 111 Hz になっていたのを直し（周期の端数を次の開始時刻へ持ち越す）、
+  設定アプリの「Desktop frame rate」の説明をモニターのリフレッシュレートと分けた。
+  調べもの：Windows-driver-samples（MS-PL、読むだけ、コードは使っていない）と NVKMS で役割の境界を確かめた
+  （WDDM の KMDOD・IddCx は OS がモードを選び、ドライバーは列挙・検証・適用。NVKMS も候補と可否だけで、
+  自分で選ぶのは所有者がいないときのコンソール復元だけ）。KAPI の preferredMode は EDID の DTD1 だけを指し、
+  DisplayID・CTA の推奨は見ない。カーネルの描画・表示・窓管理の監査の残り：消灯・DPMS・OLED の焼付き対策が
+  無い、一台のモニターだけ、HDR・10 ビットの面が無い、DPI の倍率が無い、合成は表示中の面へ直接書く（テアリング）、
+  GPU の合成は virtio だけ、CURSOR_MOVE が使われない、直接表示中の SCREEN_GRAB、最初のモードが暗いときの
+  逃げ道が無い（試用は利用者が試したモードだけ）、OS DEV INFO に EDID・DisplayID・DP・CTA-861 の仕様書が無い。
+  確認：host 試験（nvrm_display_hosttest）、全体ビルド（IMG・VHD・VHDX・ISO）。QEMU（WHPX、4 コア、4096 MiB、
+  1920×1080、AHCI、`-vga std`・`-device edu`）で `pcitest` 0 failed・`pcitest screen` 0 failed、デスクトップが
+  1024×768 になって戻ること、設定アプリの試用のカード（残り秒・Keep・Go back）とモードの一覧を目視。
+  合成の歩調：`wmtrace` で 3D Cube（約 62 fps）を出したまま設定アプリで 30 Hz にし、20.004 秒で 600 フレーム
+  （ms への切り上げでは 34 ms で約 588）。120 Hz へ戻し、ブラウザーで get.webgl.org の回る立方体を見た。
+  実機では未確認。
 
 - 2026-10-24（6）：実機 5 回目（ユーザー、USB 起動）。ユーザーの観察：二台目のモニターに主モニターと同じ画面が出た、
   WebGL は「Mesa softpipe」、3D Cube はいつもの 63 fps。USB の C: から `build/host/store.exe` で System.log と

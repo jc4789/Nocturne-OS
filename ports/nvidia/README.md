@@ -291,15 +291,17 @@ nvrm の中の入口（`nvkms_os.h`）：`nvrm_nvkms_start()` を `rm_init_adapt
 
 ## 画面（nvidia-drm に当たるもの）
 
-`display.c` が NVKMS の KAPI の唯一のクライアントになり、起動時に GOP が点けていたモニターを GPU 側で設定し直して、
-カーネルの画面（WM が描く面）を GOP の面から VRAM の走査面へ移す。nvidia-drm の DRM の構造（drm_device、crtc、
+`display.c` が NVKMS の KAPI の唯一のクライアントになり、起動時に GOP が点けていたモニターのモードをシステムへ知らせ、
+システムが選んだモード（モニターの推奨モード、または設定アプリで利用者が選んだもの）を GPU 側で設定して、
+カーネルの画面（WM が描く面）を GOP の面からそのモードの大きさの VRAM の走査面へ移す。モードを選ぶのはシステムと利用者で、
+ドライバーは列挙・検証・設定だけをする（`docs/nocturne-native-abi.md` §9 の「モニターのモード」）。nvidia-drm の DRM の構造（drm_device、crtc、
 plane、connector のオブジェクトや atomic の状態）は真似ず、KMS の論理だけを移した。入口は `display.h` の
 `nvrm_display_start()`／`nvrm_display_stop()` で、`nvrm.c` が `nvrm_nvkms_start()` の成功後と `nvrm_nvkms_stop()` の前に呼ぶ。
 失敗しても RM の提供は続け、画面は渡さない（GOP のまま）。理由は `NVRM display:` の行でログに出る。
 
 ### 立ち上げ（`nvrm_display_start`）
 
-1. 起動画面が NVIDIA の BAR に無い（`framebuffer_bar` が無い）か、32 bpp でなければ、NVKMS に触らずにやめる。
+1. 起動画面が NVIDIA の BAR に無い（`framebuffer_bar` が無い）なら、NVKMS に触らずにやめる。
 2. `nvKmsKapiGetFunctionsTable` → `allocateDevice`（`nvrm_dev.nv.gpu_id`、MIG 無し、イベントは `kapi_event`）→
    `grabOwnership` → `declareEventInterest`（DPY_CHANGED と DYNAMIC_DPY_CONNECTED）→ `getDeviceResourcesInfo`。
    NVKMS がコンソールの面（RM の予約コンソールメモリー）を取り込めたかもログに出す。
@@ -308,13 +310,23 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
 4. `getDisplays` → 各ディスプレイの `getConnectorInfo`／`getStaticDisplayInfo`／`getDynamicDisplayInfo`。全部をログに出し
    （コネクター、head、接続、EDID の製造者・製品・名前、起動時に点いていたか）、起動ディスプレイのうち繋がっている最初のもの
    （無ければ繋がっている最初のもの）を選ぶ。head はそのディスプレイの `headMask` の最下位ビット。
-5. モード：`getDisplayMode` で列挙し、起動画面と同じ幅・高さで、interlaced／doubleScan・無効なものを除く。モニターの好む
-   モードのリフレッシュ（無ければ 60 Hz）に近い順、同じ近さなら高い方を先にして、先頭から `validateDisplayMode` で確かめる。
-   一つも通らなければ渡さない。
-6. 面：pitch を NVKMS の pitch の整列に揃えた pitch linear の X8R8G8B8 を、`allocateMemory`（vidmem、SCANOUT、
-   noDisplayCaching）で取り、`mapMemory`（KERNEL）→ `createSurface`。
-7. GOP の画面を面へ行ごとに写す（読めなければ黒）。
-8. `applyModeSetConfig`（commit=FALSE で検査 → TRUE で確定）。head を点けるモード設定はフリップの完了を待たない
+5. カーソル：表示エンジンが 32×32 の A8R8G8B8（非 premultiplied のアルファ）のカーソルと、主層の X8B8G8R8 を扱えれば、
+   pitch linear の vidmem（pitch は NVKMS の 32×32 の最小の 256）を取り、写して `createSurface` する。直接表示（下）で
+   アプリの絵の上にポインターを出すのに使う。作れなければ直接表示は無し（合成のみ）。
+6. モードの提示：`getDisplayMode` で列挙し、有効で、interlaced／doubleScan でなく、表示エンジンの面の最大
+   （`maxWidthInPixels`／`maxHeightInPixels`）に収まるものを、同じ幅・高さ・リフレッシュは一度だけ、EDID の推奨モードに
+   `N_SCREEN_MODE_PREFERRED` を付けて、`n_pci_screen_modes` でシステムへ出す。モニターの識別子は EDID の製造者・製品・
+   製造番号（例 `ACR0A2B-12345678`）、名前は EDID のモニター名。出せるモードが無ければ渡さない。
+7. システムが望むモード（`n_pci_screen_state` の `mode`、`mode_serial`）をすぐ読み、出す（`mode_follow_now`。望みが変わり
+   続ける間 4 回まで）。`validateDisplayMode` で確かめ、大きさが今の面と違えば、その大きさの面を作る：pitch を NVKMS の
+   pitch の整列に揃えた pitch linear の X8R8G8B8 を `allocateMemory`（vidmem、SCANOUT、noDisplayCaching）→
+   `mapMemory`（KERNEL）→ view → `createSurface`。最初の面が起動画面と同じ大きさで 32 bpp なら GOP の画面を行ごとに写し、
+   それ以外は黒。リフレッシュだけの変更は同じ面のままモード設定だけをする。
+8. `applyModeSetConfig`（commit=FALSE で検査 → 新しい面を `n_pci_give_screen` で渡す → TRUE で確定 → 前の面を解放）。
+   システムは head がそのモードを出す時には新しい大きさで描いている。確定に失敗すれば head は前のものを出し続け、
+   前の面を渡し直す（面がまだ無ければ起動画面を返す）。どの失敗でも解放した memory へシステムが描くことはない。
+   出したモード（出せなければ head が出しているもの）を `done`＝`mode_serial` で知らせ直す。望まれたものと違えば、
+   システムはそのモードを拒否として覚え、次の候補を望む。head を点けるモード設定はフリップの完了を待たない
    （下の規則。NVKMS のモード設定は表示エンジンが済ませてから戻る）。
    フリップの完了：KAPI の関数表の
    `getFlipPendingStatus` は `nvKmsKapiGetFunctionsTable` が埋めない（NULL。nvidia-drm は `FLIP_OCCURRED` のイベントを待つ）。
@@ -328,12 +340,14 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
    実機 5 回目は最初のモード設定でこの通知を待ち、書かれない通知を 3 秒待って失敗とし、表示の持ち主を手放した
    （NVKMS が起動画面を復元し、両方のモニターに同じ画面が出た）。待ったフリップが 3 秒で完了しなければ、
    以後のフリップは待たず、直接表示もやめる（`scr.flips_unseen`。フリップのたびに 3 秒止まらないように）。
-9. カーソル：表示エンジンが 32×32 の A8R8G8B8（非 premultiplied のアルファ）のカーソルと、主層の X8B8G8R8 を扱えれば、
-   pitch linear の vidmem（pitch は NVKMS の 32×32 の最小の 256）を取り、写して `createSurface` する。直接表示（下）で
-   アプリの絵の上にポインターを出すのに使う。
-10. `n_pci_give_screen(view, {幅, 高さ, pitch, XRGB8888 | N_SCANOUT_DIRECT, offset})`。カーソルが作れないか、システムが
+9. 渡すのは `n_pci_give_screen(view, {幅, 高さ, pitch, XRGB8888 | N_SCANOUT_DIRECT, offset})`。カーソルが無いか、システムが
    `N_SCANOUT_DIRECT` を断れば、カーソルを解放して `N_SCANOUT_DIRECT` 無しで渡し直す（直接表示は無し、合成のみ）。
-11. 直接表示ありなら画面の状態を追う状態スレッドを起動 → `registerVblankIntrCallback` → 抜き差しを追う作業スレッドを起動する。
+   head を点けたら `registerVblankIntrCallback`。
+10. 画面の状態を追う状態スレッド（システムが望むモードと直接表示。常に起動）→ 抜き差しを追う作業スレッドを起動する。
+   状態スレッドが起動できなければ、モードはそのまま、直接表示もやめる。
+
+設定アプリの「Resolution and refresh rate」で選んだモードは試行として出し、15 秒以内に Keep を押さなければ前のモードへ戻る。
+Keep したモードはモニターごとに `desktop.conf` に保存し、次の起動でも推奨モードの代わりに使う。
 
 BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の一部を写したもの。`os_pci.c` が写像ごとに bus 番地を
 覚えておき、`nvrm_kernel_mapping_phys()`（`os_pci.c` の末尾）が写像の番地から bus 番地を返す。面の先頭と末尾がともに同じ写像の
@@ -343,16 +357,17 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 垂直同期：NVKMS が head の vblank ごとに（nvkms の lock の下で）呼ぶコールバックで、渡している間だけ回数を進めて
 `n_pci_screen_vblank(回数, 時刻)` を呼ぶ。重い処理はしない。時刻は NVKMS の値（無ければ `nvrm_now_ns`）。
 
-抜き差し：イベントは作業スレッドへ起こすだけ。表示中のディスプレイが抜けたら vblank を外して head を止めるが、カーネルの
-画面は渡したままにする（WM はそのまま面へ描き続ける）。別のディスプレイが繋がったら同じ手順で選び直し、同じ大きさのモードが
-無ければ好むモードで拡大して出す。
+抜き差し：イベントは作業スレッドへ起こすだけ。表示中のディスプレイが繋がったままなら、モードの一覧が変わったときだけ
+出し直す（出しているモードが残っていればそのまま）。抜けたら vblank を外して head を止めるが、カーネルの画面は渡したままに
+する（WM はそのまま面へ描き続ける）。次に繋がっているディスプレイのモードを出し、システムが望むモード（そのモニターの
+推奨か利用者の選択）をその大きさの面で出す。どれも繋がっていなければモードを取り下げる（モード 0 件）。
 
 ### 後始末（`nvrm_display_stop`）
 
-直接表示の要求を止め、状態スレッドと作業スレッドを止める → `n_pci_give_screen(N_SCANOUT_BOOT)`（カーネルは GOP の面へ
-戻る）→ vblank を外す → view を閉じる → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で起動画面を復元する。
+直接表示の要求を止め、状態スレッドと作業スレッドを止める → モードを取り下げる（`n_pci_screen_modes` の 0 件）→
+`n_pci_give_screen(N_SCANOUT_BOOT)`（カーネルは GOP の面へ戻り、その大きさで描く）→ vblank を外す → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で起動画面を復元する。
 コンソールの面が無いか復元に失敗したときは RM 側の復元に任せる）→ 残っているアプリの絵とカーソルを解放 →
-面の `destroySurface` → `unmapMemory` → `freeMemory` → `declareEventInterest(0)` → `freeDevice`。その後 `nvrm.c` が
+面の view を閉じて `destroySurface` → `unmapMemory` → `freeMemory` → `declareEventInterest(0)` → `freeDevice`。その後 `nvrm.c` が
 `nvrm_nvkms_stop()` を呼ぶ。
 
 上流の nvidia-drm は fbdev を使うとき `framebufferConsoleDisabled` を呼んで起動コンソールを捨てる。nvrm は終了時に起動画面へ
@@ -365,7 +380,8 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 `NVRM_SCANOUT`、クライアント側は libnvrm の `nvrm_scanout_create`／`_destroy`／`_present`／`_import`。サーバーは
 `nvrm_serve.c` が接続の RM ファイルと認証済みの principal を付けて `display.c` の `nvrm_display_scanout` へ渡す。
 
-- **CREATE**：画面の大きさ・pitch の X8B8G8R8（pitch linear、vidmem、SCANOUT）を KAPI で取り、`createSurface`。他のアプリが
+- **CREATE**：その時のデスクトップの大きさ・pitch の X8B8G8R8（pitch linear、vidmem、SCANOUT）を KAPI で取り、`createSurface`。
+  後でモードの大きさが変わっても、絵は自分の大きさのまま、表示エンジンがモードの大きさへ拡大縮小して出す。他のアプリが
   使った VRAM の中身が見えないよう、黒で埋めてから返す。番号・幅・高さ・pitch・バイト数を返す。絵は接続とアプリのもの。
   さらに、RM が写した BAR1 の範囲の view を `n_pci_screen_image`（`N_SCANOUT_XBGR8888`）でカーネルに登録する。カーネルが
   止まると、表示エンジンは最後にフリップした絵を出し続け、デスクトップへ戻すフリップをする者はもういない。カーネルは
@@ -385,8 +401,8 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
   デスクトップの面へ戻す。アプリは窓を通して描き、デスクトップがそれを合成する。
 - **カーソル**：絵を出している間は、システムのポインター（状態の 32×32 の画素、位置、hot spot）をカーソルの面へ写し、
   モードの画素に直した位置でカーソル層に出す。デスクトップの面にはポインターが描かれているのでカーソルは消す。
-- **状態スレッド**：`n_pci_screen_state` で変化を待ち、出しているアプリがもう直接表示されないならデスクトップの面へ戻し、
-  そのままならカーソルを動かす。
+- **状態スレッド**：`n_pci_screen_state` で変化を待ち、システムが新しいモードを望めばそれを出し（上の 7〜8）、
+  出しているアプリがもう直接表示されないならデスクトップの面へ戻し、そのままならカーソルを動かす。
 - **DESTROY**・接続の終わり・stop：出ている絵はデスクトップへ戻すフリップの完了を、一つ前に出ていた絵はそのフリップの完了を
   待ってから `destroySurface`／`freeMemory` する。デスクトップへ戻すフリップが失敗したときは、NVKMS が面の破棄で絵を head
   から外す（head には面が無くなる）ので、絵を解放した直後と、以後の画面の状態の変化ごとに、デスクトップへ戻すフリップを
@@ -394,7 +410,10 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 - 抜き差しのモード設定はデスクトップの面を出す。head が無ければ PRESENT は断る。
 - 排他：head を変えるもの（作業スレッド、状態スレッド、要求のスレッド）は `scr.head_lock` で順に行う。
 
-試験：`python tests/nvrm_display_hosttest.py`（偽の KAPI・RM・ハンドルで、立ち上げと後始末の順序、モードの選択、失敗時に
+試験：`python tests/nvrm_display_hosttest.py`（偽の KAPI・RM・ハンドルと、gui/screenmode.c の選び方を真似た偽のシステムで、
+立ち上げと後始末の順序、システムへ出すモード（有効・順次走査・面の最大以内・一度ずつ・推奨の印・EDID によるモニターの識別）、
+システムが望むモードを出すこと（大きさの変更は新しい面を検査と確定の間に渡し、前の面は後で解放。リフレッシュだけなら同じ面）、
+出せないモードを知らせて拒否されること、確定の失敗で前の面へ戻すこと、利用者の選択から始めること、失敗時に
 画面を渡さないこと、抜き差し（同じ head の点け直しでフリップの完了が見えないまま点いた head）、直接表示（作成とパニック画面の
 登録、登録を断られたときと BAR1 のひと続きでないときに絵を作らないこと、許可の有無と PRESENT、一つ前の
 フリップ待ち、commit の直前の完了通知の消去、失敗した commit の後は待たないこと、カーソル、デスクトップへの戻り、戻すフリップの

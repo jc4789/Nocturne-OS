@@ -369,6 +369,9 @@ n_result n_pci_hold_screen(n_handle pci, bool hold) { return NC5(SYS_PCI_HOLD_SC
 n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc) {
     return NC5(SYS_PCI_GIVE_SCREEN, pci, surface, desc, 0, 0);
 }
+n_result n_pci_screen_modes(n_handle pci, const struct n_screen_modes *modes) {
+    return NC5(SYS_PCI_SCREEN_MODES, pci, modes, 0, 0, 0);
+}
 n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns) {
     return NC5(SYS_PCI_SCREEN_VBLANK, pci, count, timestamp_ns, 0, 0);
 }

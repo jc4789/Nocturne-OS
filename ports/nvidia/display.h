@@ -2,9 +2,11 @@
  *
  * On Linux nvidia-drm is the client of NVKMS's kernel API (KAPI) that sets modes and turns the
  * GPU's display engine into the console's and the desktop's output. In nvrm the same job is
- * this file's, without DRM: display.c is KAPI's only client. It sets the mode the firmware
- * (GOP) had on the display the firmware lit, scans out a surface in video memory, and gives that
- * surface to the system (n_pci_give_screen), which draws the desktop into it from then on.
+ * this file's, without DRM: display.c is KAPI's only client. It offers the system the modes of
+ * the display the firmware lit (n_pci_screen_modes), sets the one the system asks for (the
+ * monitor's preferred mode until the user chooses another), scans out a surface of its size in
+ * video memory, and gives that surface to the system (n_pci_give_screen), which draws the
+ * desktop into it from then on.
  * While the system lets an app's fullscreen window be shown directly, the app's own images
  * (NVRM_SCANOUT, include/nvrm_protocol.h) are flipped onto the screen instead, with the pointer
  * as the display engine's cursor over them.

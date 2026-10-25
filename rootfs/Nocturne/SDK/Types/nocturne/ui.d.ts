@@ -250,13 +250,16 @@ export function launch(path: string, argument?: string): boolean;
 
 /** The desktop's settings, as the Settings app shows them. */
 export interface DesktopSettings {
+    /** The desktop's size: the monitor's mode (or the firmware's screen without a display driver). */
     readonly screenWidth: number;
     readonly screenHeight: number;
     /** What the desktop draws in now: 8, or 10 with 10-bit colour. */
     readonly bitsPerChannel: number;
     /** What the screen itself takes. */
     readonly nativeBitsPerChannel: number;
-    /** Redraws per second; 0 is as fast as possible. */
+    /** The desktop's redraws per second while the screen gives no vertical blanks (the firmware's
+        screen); 0 is as fast as possible. A display driver's vertical blanks pace the desktop at
+        the monitor's refresh rate instead (ScreenModes). */
     refreshRate: number;
     /** -2 (slowest) to 2 (fastest). */
     pointerSpeed: number;
@@ -278,7 +281,52 @@ export const desktop: {
     set(settings: Pick<DesktopSettings, "refreshRate" | "pointerSpeed" | "pointerY" | "deepColour">): boolean;
     /** Sets the volume (0 to 100) and returns what it is now, or null without a sound device. */
     setVolume(volume: number): number | null;
+    /** The monitor's modes; null when the desktop is not running. */
+    modes(): ScreenModes | null;
+    /** Shows mode (one of modes().modes) on trial: it goes back to the mode before unless
+        keepMode() comes within 15 seconds (backMode(): at once). False when there is no display
+        driver or the monitor has no such mode. */
+    tryMode(mode: ScreenModeChoice): boolean;
+    /** Keeps the mode on trial as the user's choice for this monitor until a restart. */
+    keepMode(): boolean;
+    /** Goes back to the mode before the trial now. */
+    backMode(): boolean;
+    /** The user's choice for the monitor named monitor (ScreenModes.monitor), shown whenever that
+        monitor is driven and offers it (what Settings puts back at startup). */
+    savedMode(monitor: string, mode: ScreenModeChoice): boolean;
 };
+
+/** A resolution and refresh rate. */
+export interface ScreenModeChoice {
+    readonly width: number;
+    readonly height: number;
+    /** Refreshes per second times 1000: 59940 is 59.94 Hz. */
+    readonly refreshMillihertz: number;
+}
+
+/** A mode the display driver can show on the monitor. */
+export interface ScreenMode extends ScreenModeChoice {
+    /** The monitor's own preferred mode (its EDID's). */
+    readonly preferred: boolean;
+}
+
+/** The monitor and its modes, as the display driver offers them. */
+export interface ScreenModes {
+    /** The monitor, told apart by its EDID's maker, product and serial number ("" without one). */
+    readonly monitor: string;
+    /** The monitor's own name ("" when its EDID gives none). */
+    readonly name: string;
+    /** Empty without a display driver: the screen keeps the mode the firmware set. */
+    readonly modes: readonly ScreenMode[];
+    /** The mode the monitor shows, as the driver last said; null before it said. */
+    readonly shown: ScreenMode | null;
+    /** The mode the system asks the driver to show; null while it asks for none. */
+    readonly wanted: ScreenMode | null;
+    /** Milliseconds until the mode on trial goes back; 0 when none is on trial. */
+    readonly trialMs: number;
+    /** The mode tried last could not be shown, and the one before is back. */
+    readonly refused: boolean;
+}
 
 /** The computer, as About shows it. */
 export interface SystemInfo {

@@ -367,5 +367,13 @@ internal.ui = Object.freeze({
         get: () => host.desktop(),
         set: s => host.desktopSet(s.refreshRate | 0, s.pointerSpeed | 0, s.pointerY | 0, !!s.deepColour),
         setVolume: volume => host.setVolume(Math.round(Number(volume))),
+        /* The monitor's modes (struct screen_modes, display_abi.h): SCREEN_MODE_TRY 1, KEEP 2,
+           BACK 3, SAVED 4. */
+        modes: () => host.screenModes(),
+        tryMode: m => host.screenModeSet(1, '', m.width >>> 0, m.height >>> 0, m.refreshMillihertz >>> 0),
+        keepMode: () => host.screenModeSet(2, '', 0, 0, 0),
+        backMode: () => host.screenModeSet(3, '', 0, 0, 0),
+        savedMode: (monitor, m) => host.screenModeSet(4, String(monitor), m.width >>> 0, m.height >>> 0,
+                                                      m.refreshMillihertz >>> 0),
     }),
 });

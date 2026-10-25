@@ -123,11 +123,15 @@ enum {
     /* A claimed function's part of the ACPI namespace (docs/nocturne-native-abi.md §9) */
     SYS_PCI_ACPI_EVAL,     /* (pci, const struct n_acpi_eval *, out, out_size): bytes written */
     SYS_PCI_ACPI_NOTIFY_TAKE, /* (pci, timeout_ms): the next Notify value of the function's node */
-    /* A display driver that shows windows directly (N_SCANOUT_DIRECT) follows the screen */
+    /* A display driver follows the screen: the mode it is to show, and with N_SCANOUT_DIRECT the
+       window it shows directly */
     SYS_PCI_SCREEN_STATE,  /* (pci, seen serial, struct n_screen_state *out, timeout_ms) */
     /* What such a driver may show in its scanout's place, which the panic screen is drawn into too */
     SYS_PCI_SCREEN_IMAGE,     /* (pci, surface, const struct n_scanout *): the image's number */
     SYS_PCI_SCREEN_IMAGE_END, /* (pci, number) */
+    /* A display driver's monitor: the modes it can show and the one it shows (the system says
+       which it wants in struct n_screen_state) */
+    SYS_PCI_SCREEN_MODES,     /* (pci, const struct n_screen_modes *) */
     SYS_MAX = 208          /* above every number (what syscallfuzz tries) */
 };
 
@@ -321,8 +325,8 @@ struct n_pci_function {
 #define N_CACHE_UNCACHED 3u
 
 /* n_pci_give_screen: where in a surface the display engine reads the screen from. width and
-   height are the screen's as it is (the desktop keeps its size while it runs), pitch is the bytes
-   from one row to the next, offset the first row's place in the surface. */
+   height are the size the desktop is drawn at (the mode's the driver shows; the desktop takes
+   it), pitch is the bytes from one row to the next, offset the first row's place in the surface. */
 #define N_SCANOUT_XRGB8888 1u    /* 32 bits: x8 r8 g8 b8, blue in the lowest byte */
 #define N_SCANOUT_XRGB2101010 2u /* 32 bits: x2 r10 g10 b10, blue in the lowest bits */
 #define N_SCANOUT_XBGR8888 3u    /* 32 bits: x8 b8 g8 r8, red in the lowest byte */
@@ -336,13 +340,44 @@ struct n_scanout {
     uint64_t offset;
 };
 
-/* n_pci_screen_state: what the screen should show, for a driver whose scanout has N_SCANOUT_DIRECT.
-   serial changes with every change of what follows and is never 0. app is the app (n_app_self's
-   number) whose fullscreen window the system lets show its own images directly, 0 when the
-   desktop is shown. While app is not 0 the driver draws the pointer: at pointer_x, pointer_y on
-   the screen (where its hot spot goes) when pointer_shown, the image in pointer (rows of
-   N_SCREEN_POINTER_SIZE pixels of 0xAARRGGBB, not premultiplied, transparent outside the shape)
-   with its hot spot at hot_x, hot_y; pointer_serial changes when the image does. */
+/* A display mode: the visible pixels and the vertical refresh in millihertz (59940 is 59.94 Hz).
+   N_SCREEN_MODE_PREFERRED marks the monitor's own preferred timing (its EDID's). */
+#define N_SCREEN_MODE_PREFERRED 1u
+struct n_screen_mode {
+    uint32_t width, height;
+    uint32_t refresh_mhz;
+    uint32_t flags;
+};
+/* n_pci_screen_modes: the monitor a display driver drives and what it can show there. The system
+   chooses the mode (struct n_screen_state's mode); the driver says what it showed, each time it
+   acted on one. monitor tells monitors apart (the same text for the same monitor every time:
+   the EDID's maker, product and serial number), name is the monitor's for people (may be empty);
+   both end with a zero. modes are the progressive modes the driver checked it can show, count of
+   them, no two alike (width, height, refresh). shown is the mode the driver shows now, all zero
+   when it shows none; done is the n_screen_state mode_serial it acted on last (0: none yet). */
+#define N_SCREEN_MODES_MAX 128u
+struct n_screen_modes {
+    char monitor[32];
+    char name[32];
+    uint64_t done;
+    struct n_screen_mode shown;
+    uint32_t count, reserved;
+    struct n_screen_mode modes[N_SCREEN_MODES_MAX];
+};
+
+/* n_pci_screen_state: what the screen should show, for the driver whose scanout the screen is
+   drawn into or whose monitor's modes the system has. serial changes with every change of what
+   follows and is never 0.
+   mode is the mode the system wants the driver to show (one of the modes it gave, all zero while
+   it wants none); mode_serial changes with every wish, even for the same mode again (a monitor
+   offered anew). The driver shows it at that size (n_pci_give_screen) and gives n_pci_screen_modes
+   with done = mode_serial and what it shows then.
+   For a driver whose scanout has N_SCANOUT_DIRECT: app is the app (n_app_self's number) whose
+   fullscreen window the system lets show its own images directly, 0 when the desktop is shown.
+   While app is not 0 the driver draws the pointer: at pointer_x, pointer_y on the screen (where
+   its hot spot goes) when pointer_shown, the image in pointer (rows of N_SCREEN_POINTER_SIZE
+   pixels of 0xAARRGGBB, not premultiplied, transparent outside the shape) with its hot spot at
+   hot_x, hot_y; pointer_serial changes when the image does. */
 #define N_SCREEN_POINTER_SIZE 32u
 struct n_screen_state {
     uint64_t serial;
@@ -351,6 +386,8 @@ struct n_screen_state {
     int32_t pointer_x, pointer_y;
     uint32_t hot_x, hot_y;
     uint32_t pointer_serial, reserved;
+    uint64_t mode_serial;
+    struct n_screen_mode mode;
     uint32_t pointer[N_SCREEN_POINTER_SIZE * N_SCREEN_POINTER_SIZE];
 };
 

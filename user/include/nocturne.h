@@ -143,33 +143,50 @@ n_result n_pci_hold_screen(n_handle pci, bool hold);
    object whose type is not write-back (a write-combining or uncached view sets it), or a view of
    either; desc says where in it (offset, pitch) and how (N_SCANOUT_XRGB8888, XRGB2101010 or
    XBGR8888).
-   Its width and height must be the screen's as the firmware set it (n_pci_info's framebuffer_width
-   and framebuffer_height on the function it is in); a change of size is not offered yet.
+   Its width and height are the mode's the display engine shows (the one the system chose, struct
+   n_screen_state's mode, once the driver offered modes; up to 65535 each): the desktop takes that
+   size, and windows fullscreen or maximized follow it. Giving the same surface again at another
+   size changes the desktop's size the same way; the boot screen given back is drawn at its own.
    Returns once nothing is drawn into what was shown before; the new surface is drawn in full.
    N_ERR_DENIED: not a display function, another claim's object, or a type the surface cannot have;
-   N_ERR_INVALID: another size, an unknown format, a range beyond the object; N_ERR_BUSY: another
-   claim's surface is shown. */
+   N_ERR_INVALID: a size of 0 or above 65535, an unknown format, a range beyond the object;
+   N_ERR_NO_MEMORY: the desktop does not fit in memory at that size (the screen stays as it was);
+   N_ERR_BUSY: another claim's surface is shown. */
 n_result n_pci_give_screen(n_handle pci, n_handle surface, const struct n_scanout *desc);
+/* A display function's driver tells the system the monitor it drives and the modes it can show
+   there (struct n_screen_modes): the system chooses the one shown (a mode on trial in Settings,
+   else the user's choice for that monitor, else the monitor's preferred mode, else the largest
+   near 60 Hz) and says so in struct n_screen_state's mode, which n_pci_screen_state reads. The
+   driver shows that mode (n_pci_give_screen at its size) and gives the modes again with done set
+   to the state's mode_serial and the mode it shows: when that is not the mode wanted, the system
+   never asks for that one again on this monitor and chooses another. Given with done 0 (when the
+   driver starts, or the monitor changed or was plugged in), the system chooses anew, even the
+   same mode again. count 0: the driver drives no monitor any more (and its claim's end does the
+   same). N_ERR_DENIED: not a display function; N_ERR_INVALID: more than N_SCREEN_MODES_MAX modes,
+   or a mode with a size or refresh of 0, or a size above 65535; N_ERR_BUSY: another claim's
+   surface is shown or its modes offered. */
+n_result n_pci_screen_modes(n_handle pci, const struct n_screen_modes *modes);
 /* The surface given had vertical blank number count at timestamp_ns (the driver's clock). While
    blanks come, the desktop starts its frames at them instead of its own period; 100 ms without
    one and the period paces again. N_ERR_DENIED: the screen is not drawn into this claim's surface. */
 n_result n_pci_screen_vblank(n_handle pci, uint64_t count, uint64_t timestamp_ns);
-/* For a driver whose scanout has N_SCANOUT_DIRECT: waits up to timeout_ms (-1: no limit) while the
-   screen's state is still the one numbered seen (0 never is), then writes it to out (struct
-   n_screen_state says what the driver shows and draws while an app's window is shown directly).
+/* For the driver whose surface the screen is drawn into or whose modes the system has: waits up
+   to timeout_ms (-1: no limit) while the screen's state is still the one numbered seen (0 never
+   is), then writes it to out (struct n_screen_state says the mode to show, and with
+   N_SCANOUT_DIRECT what the driver shows and draws while an app's window is shown directly).
    N_ERR_TIMEOUT: out is the state numbered seen. N_ERR_DENIED: the screen is not drawn into this
-   claim's surface or it has no N_SCANOUT_DIRECT. */
+   claim's surface and it offered no modes. */
 n_result n_pci_screen_state(n_handle pci, uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
 /* For that driver: a surface its display engine may show in its scanout's place (an app's image
    shown directly), given as n_pci_give_screen's surface is (format without N_SCANOUT_DIRECT;
-   N_SCANOUT_XBGR8888 too). The system never draws there but once: its panic screen, which goes to
-   the scanout and to every such surface, as the engine keeps showing what it was flipped to last
-   and no driver runs any more. Returns the surface's number (positive); n_pci_screen_image_end
-   with it lets go before the driver frees the memory. A scanout without N_SCANOUT_DIRECT, the
-   boot screen given back, or the claim's end lets go of them all. N_ERR_DENIED: the screen is not
-   drawn into this claim's N_SCANOUT_DIRECT scanout, or the object is not one n_pci_give_screen
-   takes; N_ERR_INVALID: another size, an unknown format, a range beyond the object, or (end) no
-   such number. */
+   N_SCANOUT_XBGR8888 too), of its own size (the engine may scale it to the mode's). The system
+   never draws there but once: its panic screen, which goes to the scanout and to every such
+   surface at its size, as the engine keeps showing what it was flipped to last and no driver runs
+   any more. Returns the surface's number (positive); n_pci_screen_image_end with it lets go before
+   the driver frees the memory. A scanout without N_SCANOUT_DIRECT, the boot screen given back, or
+   the claim's end lets go of them all. N_ERR_DENIED: the screen is not drawn into this claim's
+   N_SCANOUT_DIRECT scanout, or the object is not one n_pci_give_screen takes; N_ERR_INVALID: a size
+   of 0 or above 65535, an unknown format, a range beyond the object, or (end) no such number. */
 n_result n_pci_screen_image(n_handle pci, n_handle surface, const struct n_scanout *desc);
 n_result n_pci_screen_image_end(n_handle pci, n_result image);
 /* The function's part of the ACPI namespace, as the firmware describes it: its device node

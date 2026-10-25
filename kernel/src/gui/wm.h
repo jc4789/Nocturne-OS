@@ -5,6 +5,11 @@
 void wm_init(void);           /* start the compositor thread */
 bool wm_running(void);
 void wm_screen_size(uint32_t *w, uint32_t *h); /* the desktop's size, which a remote viewer may have changed */
+/* The scanout the screen is drawn into is about to be, or now is, w x h (dev/pciuser.c: a display
+   driver's mode): the desktop takes that size, its fullscreen and maximised windows are told
+   (EV_RESIZE), unless remote viewers have it at theirs (it takes the scanout's when the last one
+   leaves). False when the desktop's planes do not fit in memory at that size: it keeps its own. */
+bool wm_screen_resized(uint32_t w, uint32_t h);
 
 /* UTF-8 clipboard metadata or a caller-owned snapshot (release with kfree).
    Never lend mutable storage across BSP timer preemption. */
@@ -26,12 +31,16 @@ void wm_repaint(void); /* the screen lost what was on it (after sleep): draw all
    a frame waits for the blank. */
 void wm_vblank(uint64_t count, uint64_t timestamp_ns);
 /* Direct scanout (dev/pciuser.c): whether the display driver whose scanout the screen is drawn
-   into can show a window's own images (N_SCANOUT_DIRECT), and what it should show: waits up to
+   into can show a window's own images (N_SCANOUT_DIRECT), and what the screen should show: waits up to
    timeout_ms (-1: no limit) while the state is still numbered seen, then copies it to *out (kernel
    memory). N_ERR_TIMEOUT with *out the unchanged state; N_ERR_STOPPED when the caller is stopped. */
 struct n_screen_state;
 void wm_screen_direct(bool able);
 int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeout_ms);
+/* The mode the system wants the display driver to show (gui/screenmode.c), wish number serial:
+   into the state the driver reads, unless a later wish is there already. */
+struct n_screen_mode;
+void wm_screen_mode(const struct n_screen_mode *mode, uint64_t serial);
 
 /* Remote display: rectangle copies hold WM ownership only for the copy, never
    while encoding or sending a network packet. */

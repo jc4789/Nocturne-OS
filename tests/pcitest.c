@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <limits.h>
 #include "nocturne.h"
+#include "display.h"
 
 static int failed;
 #define CHECK(c, ...)                                                                                                  \
@@ -380,7 +381,8 @@ static void screen_cases(const struct n_pciinfo *list, int n) {
    BAR 0 is its memory, the boot screen at its start, and BAR 2 has the Bochs display registers
    (index i at 0x500 + 2i), whose Y offset is the row of that memory the display starts at. The
    driver draws a second buffer past the boot screen, gives it to the system and shows it, then
-   DMA memory, then the boot screen again; last a surface its claim's end gives back. A mark of
+   DMA memory, then the boot screen again, then windows shown directly and the monitor's modes;
+   last a surface its claim's end gives back. A mark of
    pixels the desktop never draws tells where the system drew. linger_s: how long the second
    buffer stays shown, its vertical blanks given at 60 Hz (pcitest screen=<s>, to look at it). */
 #define DISPI(i) (0x500 + 2 * (i))
@@ -447,8 +449,8 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
           n_result_text(r));
     bad = image, bad.format |= N_SCANOUT_DIRECT;
     CHECK(n_pci_screen_image(vga, surface, &bad) == -N_ERR_INVALID, "an image is no scanout of its own");
-    bad = image, bad.width++;
-    CHECK(n_pci_screen_image(vga, surface, &bad) == -N_ERR_INVALID, "an image of another width");
+    bad = image, bad.width = 0;
+    CHECK(n_pci_screen_image(vga, surface, &bad) == -N_ERR_INVALID, "an image of no width");
     bad = image, bad.format = 99;
     CHECK(n_pci_screen_image(vga, surface, &bad) == -N_ERR_INVALID, "an image of an unknown format");
     if (edu_bar >= 0)
@@ -497,6 +499,199 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
     CHECK(r == 0 && n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED && n_pci_screen_image_end(vga, one) == -N_ERR_INVALID,
           "the boot screen back ends direct showing and its images");
     n_sleep_ms(300);
+}
+
+/* The monitor's modes (n_pci_screen_modes): the driver offers what it can show, the system wants
+   the monitor's preferred mode, the Settings app tries another (SCREEN_MODE_SET), which goes back
+   by itself unless it is kept, and a mode the driver could not show is refused. The driver shows
+   each mode wanted: the Bochs registers (when they answer) set to its size, the rows as long as
+   the boot screen's, and its surface given at that size, which the desktop takes. linger_s: the
+   smaller mode stays shown until its trial ends (15 s) anyway; pcitest screen=<s> says so. */
+#define DISPI_XRES 1
+#define DISPI_YRES 2
+#define DISPI_BPP 3
+#define DISPI_ENABLE 4
+#define DISPI_VIRT_WIDTH 6
+static void bochs_mode(volatile uint16_t *dispi, uint32_t width, uint32_t height, uint32_t pitch, uint32_t row) {
+    if (!dispi) return;
+    dispi[DISPI(DISPI_ENABLE) / 2] = 0;
+    dispi[DISPI(DISPI_XRES) / 2] = (uint16_t)width;
+    dispi[DISPI(DISPI_YRES) / 2] = (uint16_t)height;
+    dispi[DISPI(DISPI_BPP) / 2] = 32;
+    dispi[DISPI(DISPI_ENABLE) / 2] = 0x01 | 0x40 | 0x80; /* on, linear framebuffer, memory kept */
+    dispi[DISPI(DISPI_VIRT_WIDTH) / 2] = (uint16_t)(pitch / 4);
+    show_row(dispi, row);
+}
+static bool same_mode(const struct n_screen_mode *a, const struct n_screen_mode *b) {
+    return a->width == b->width && a->height == b->height && a->refresh_mhz == b->refresh_mhz;
+}
+static n_result modes_get(struct screen_modes *out) {
+    return (n_result)__syscall(SYS_SCREEN_INFO, (long)out, sizeof *out, SCREEN_MODES_GET, 0, 0);
+}
+static n_result mode_set(uint32_t how, const char *monitor, const struct n_screen_mode *m) {
+    struct screen_mode_set s = {.how = how};
+    if (monitor) snprintf(s.monitor, sizeof s.monitor, "%s", monitor);
+    if (m) s.mode = *m;
+    return (n_result)__syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_MODE_SET, 0, 0);
+}
+/* The next wish (a mode_serial after *serial) within ms. */
+static bool mode_wanted(n_handle vga, struct n_screen_state *st, uint64_t *serial, int64_t ms) {
+    for (uint64_t end = uptime_ms() + (uint64_t)ms; st->mode_serial <= *serial && uptime_ms() < end;)
+        if (n_pci_screen_state(vga, st->serial, st, 200) == -N_ERR_DENIED) return false;
+    if (st->mode_serial <= *serial) return false;
+    *serial = st->mode_serial;
+    return true;
+}
+/* As a driver does: shows the mode wanted (or, could_not, says it still shows offer->shown). */
+static n_result mode_show(n_handle vga, n_handle surface, const struct n_scanout *d, volatile uint16_t *dispi,
+                          struct n_screen_modes *offer, const struct n_screen_state *st, bool could_not) {
+    n_result r = 0;
+    if (!could_not) {
+        struct n_scanout s = *d;
+        s.width = st->mode.width, s.height = st->mode.height;
+        bochs_mode(dispi, s.width, s.height, d->pitch, (uint32_t)(d->offset / d->pitch));
+        r = n_pci_give_screen(vga, surface, &s);
+        if (!r) offer->shown = st->mode;
+    }
+    offer->done = st->mode_serial;
+    n_result told = n_pci_screen_modes(vga, offer);
+    return r ? r : told;
+}
+static bool desktop_width(int width) {
+    int w = 0, h = 0;
+    for (uint64_t end = uptime_ms() + 1000; (screen_size(&w, &h) < 0 || w != width) && uptime_ms() < end;) n_sleep_ms(20);
+    return w == width;
+}
+static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struct n_scanout *d, volatile uint16_t *dispi,
+                       unsigned linger_s) {
+    struct n_screen_modes *offer = calloc(1, sizeof *offer);
+    struct screen_modes *seen = calloc(1, sizeof *seen);
+    if (!offer || !seen) {
+        CHECK(0, "memory for the modes");
+        free(offer), free(seen);
+        return;
+    }
+    const struct n_screen_mode native = {d->width, d->height, 60000, N_SCREEN_MODE_PREFERRED};
+    const struct n_screen_mode wide = {1280, 720, 60000, 0}, small = {1024, 768, 75000, 0};
+    const struct n_screen_mode others[] = {wide, {1024, 768, 60000, 0}, small};
+    snprintf(offer->monitor, sizeof offer->monitor, "pcitest-vga");
+    snprintf(offer->name, sizeof offer->name, "QEMU VGA");
+    offer->modes[offer->count++] = native;
+    for (unsigned i = 0; i < sizeof others / sizeof *others; i++)
+        if (others[i].width != native.width || others[i].height != native.height) offer->modes[offer->count++] = others[i];
+    if (offer->count != 4) {
+        CHECK(0, "a boot screen that is not 1280x720 or 1024x768 (%ux%u)", d->width, d->height);
+        free(offer), free(seen);
+        return;
+    }
+    struct n_screen_state st = {0};
+    CHECK(n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "no screen state before modes are offered");
+    if (edu >= 0) CHECK(n_pci_screen_modes(edu, offer) == -N_ERR_DENIED, "edu offers no modes");
+    offer->count = N_SCREEN_MODES_MAX + 1;
+    CHECK(n_pci_screen_modes(vga, offer) == -N_ERR_INVALID, "more modes than N_SCREEN_MODES_MAX");
+    offer->count = 4;
+    offer->modes[3].refresh_mhz = 0;
+    CHECK(n_pci_screen_modes(vga, offer) == -N_ERR_INVALID, "a mode without a refresh rate");
+    offer->modes[3] = small;
+
+    /* the monitor's preferred mode first */
+    n_result r = n_pci_screen_modes(vga, offer);
+    CHECK(r == 0, "the VGA offers its monitor's modes: %s", n_result_text(r));
+    if (r) {
+        free(offer), free(seen);
+        return;
+    }
+    uint64_t serial = 0;
+    r = n_pci_screen_state(vga, 0, &st, 0);
+    CHECK(r == 0 && same_mode(&st.mode, &native) && mode_wanted(vga, &st, &serial, 0),
+          "the system wants the monitor's preferred mode: %ux%u at %u mHz", st.mode.width, st.mode.height, st.mode.refresh_mhz);
+    r = mode_show(vga, surface, d, dispi, offer, &st, false);
+    CHECK(r == 0, "the preferred mode shown: %s", n_result_text(r));
+    CHECK(n_pci_screen_state(vga, st.serial, &st, 100) == -N_ERR_TIMEOUT, "a mode shown as wanted changes nothing");
+    r = modes_get(seen);
+    CHECK(r == 0 && seen->offered.count == 4 && !strcmp(seen->offered.monitor, "pcitest-vga") &&
+              same_mode(&seen->offered.shown, &native) && same_mode(&seen->wanted, &native) && !seen->trial_ms && !seen->refused,
+          "Settings sees the monitor, its modes and the one shown: %s", n_result_text(r));
+    CHECK(mode_set(SCREEN_MODE_KEEP, NULL, NULL) == -N_ERR_NOT_FOUND && mode_set(SCREEN_MODE_BACK, NULL, NULL) == -N_ERR_NOT_FOUND,
+          "nothing on trial to keep or go back from");
+    struct n_screen_mode odd = {800, 600, 60000, 0};
+    CHECK(mode_set(SCREEN_MODE_TRY, NULL, &odd) == -N_ERR_INVALID, "a mode the monitor was not offered");
+
+    /* a mode tried and not kept goes back by itself */
+    r = mode_set(SCREEN_MODE_TRY, NULL, &small);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small), "a mode on trial is wanted: %s",
+          n_result_text(r));
+    r = mode_show(vga, surface, d, dispi, offer, &st, false);
+    CHECK(r == 0 && desktop_width(1024), "the mode tried shown, and the desktop takes its size: %s", n_result_text(r));
+    r = modes_get(seen);
+    CHECK(r == 0 && seen->trial_ms > 0 && seen->trial_ms <= SCREEN_MODE_TRIAL_MS, "Settings sees the trial: %u ms left",
+          seen->trial_ms);
+    if (linger_s) printf("pcitest: the desktop is 1024x768 until its trial ends\n");
+    uint64_t t0 = uptime_ms();
+    CHECK(mode_wanted(vga, &st, &serial, SCREEN_MODE_TRIAL_MS + 3000) && same_mode(&st.mode, &native) &&
+              uptime_ms() - t0 >= SCREEN_MODE_TRIAL_MS - 2000,
+          "the trial not kept goes back after %u ms: %ux%u", (unsigned)(uptime_ms() - t0), st.mode.width, st.mode.height);
+    r = mode_show(vga, surface, d, dispi, offer, &st, false);
+    CHECK(r == 0 && desktop_width((int)native.width), "the mode before shown again: %s", n_result_text(r));
+
+    /* back at once; then kept, the user's choice for this monitor */
+    r = mode_set(SCREEN_MODE_TRY, NULL, &wide);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &wide), "another mode on trial: %s", n_result_text(r));
+    mode_show(vga, surface, d, dispi, offer, &st, false);
+    r = mode_set(SCREEN_MODE_BACK, NULL, NULL);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native), "going back at once: %s", n_result_text(r));
+    mode_show(vga, surface, d, dispi, offer, &st, false);
+    r = mode_set(SCREEN_MODE_TRY, NULL, &small);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "tried again: %s", n_result_text(r));
+    mode_show(vga, surface, d, dispi, offer, &st, false);
+    r = mode_set(SCREEN_MODE_KEEP, NULL, NULL);
+    CHECK(r == 0 && n_pci_screen_state(vga, st.serial, &st, 100) == -N_ERR_TIMEOUT && modes_get(seen) == 0 && !seen->trial_ms,
+          "kept: the trial ends and the mode stays: %s", n_result_text(r));
+    offer->count = 0;
+    CHECK(n_pci_screen_modes(vga, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0,
+          "the modes withdrawn: no mode is wanted");
+    offer->count = 4;
+    offer->done = 0;
+    CHECK(n_pci_screen_modes(vga, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small),
+          "offered again, the monitor shows the mode kept: %ux%u", st.mode.width, st.mode.height);
+    mode_show(vga, surface, d, dispi, offer, &st, false);
+    r = mode_set(SCREEN_MODE_SAVED, "pcitest-vga", &native);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native),
+          "a saved choice for this monitor is shown: %s", n_result_text(r));
+    mode_show(vga, surface, d, dispi, offer, &st, false);
+    CHECK(mode_set(SCREEN_MODE_SAVED, "another monitor", &wide) == 0 && n_pci_screen_state(vga, st.serial, &st, 100) == -N_ERR_TIMEOUT,
+          "a choice for another monitor changes nothing here");
+
+    /* a mode the driver could not show */
+    r = mode_set(SCREEN_MODE_TRY, NULL, &wide);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "tried: %s", n_result_text(r));
+    mode_show(vga, surface, d, dispi, offer, &st, true);
+    CHECK(mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native) && modes_get(seen) == 0 && seen->refused && !seen->trial_ms,
+          "a mode on trial the driver could not show: the one before comes back, and Settings hears it");
+    mode_show(vga, surface, d, dispi, offer, &st, false);
+    offer->done = 0;
+    CHECK(n_pci_screen_modes(vga, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native),
+          "offered again: the mode shown stays wanted");
+    offer->shown = (struct n_screen_mode){0}; /* the driver shows nothing */
+    mode_show(vga, surface, d, dispi, offer, &st, true);
+    const struct n_screen_mode next = {1024, 768, 60000, 0}; /* 1280x720 was refused above */
+    CHECK(mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &next),
+          "the choice it could not show: the largest mode not refused, nearest 60 Hz, instead: %ux%u at %u mHz", st.mode.width,
+          st.mode.height, st.mode.refresh_mhz);
+    r = mode_show(vga, surface, d, dispi, offer, &st, false);
+    CHECK(r == 0 && desktop_width(1024), "shown: %s", n_result_text(r));
+
+    /* withdrawn, and the boot screen back at its size */
+    offer->count = 0;
+    CHECK(n_pci_screen_modes(vga, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0 &&
+              modes_get(seen) == 0 && seen->offered.count == 0,
+          "withdrawn: no modes and none wanted");
+    bochs_mode(dispi, native.width, native.height, d->pitch, (uint32_t)(d->offset / d->pitch));
+    r = n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL);
+    CHECK(r == 0 && desktop_width((int)native.width) && n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED,
+          "the boot screen back at its size: %s", n_result_text(r));
+    n_sleep_ms(300);
+    free(offer), free(seen);
 }
 
 static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n, unsigned linger_s) {
@@ -554,10 +749,10 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
         CHECK(n_pci_give_screen(vga, edu_bar, &d) == -N_ERR_DENIED, "another claim's BAR");
         CHECK(n_pci_screen_image(edu, edu_bar, &d) == -N_ERR_DENIED, "edu shows no images");
     }
-    bad = d, bad.width++;
-    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "another width");
-    bad = d, bad.height--;
-    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "another height");
+    bad = d, bad.width = 0;
+    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "no width");
+    bad = d, bad.height = 65536;
+    CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "a height no display engine has");
     bad = d, bad.format = 99;
     CHECK(n_pci_give_screen(vga, surface, &bad) == -N_ERR_INVALID, "an unknown format");
     bad = d, bad.format |= 0x200;
@@ -581,7 +776,9 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     n_result r = n_pci_give_screen(vga, surface, &d);
     CHECK(r == 0, "the boot screen's memory as the driver's surface: %s", n_result_text(r));
     struct n_screen_state st;
-    CHECK(n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "no screen state without N_SCANOUT_DIRECT");
+    r = n_pci_screen_state(vga, 0, &st, 0);
+    CHECK(r == 0 && st.app == 0 && st.mode.width == 0, "without N_SCANOUT_DIRECT or modes offered, the state shows no window and wants no mode: %s",
+          n_result_text(r));
     CHECK(n_pci_screen_image(vga, surface, &d) == -N_ERR_DENIED, "no image without N_SCANOUT_DIRECT");
     n_sleep_ms(300);
     CHECK(marks(gop) == 0, "all of the screen is drawn again: %d marks left", marks(gop));
@@ -630,6 +827,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(n_pci_screen_vblank(vga, ++count, 0) == -N_ERR_DENIED, "no vertical blanks of the boot screen");
     CHECK(n_pci_screen_state(vga, 0, &st, 0) == -N_ERR_DENIED, "no screen state of the boot screen");
     direct_cases(vga, surface, &d, edu_bar, second + frame <= size ? second : 0, dispi, linger_s);
+    mode_cases(vga, edu, surface, &d, dispi, linger_s);
 
     /* the claim's end gives the screen back, and ends its images */
     struct n_scanout direct = d;
