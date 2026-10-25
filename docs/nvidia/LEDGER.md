@@ -74,7 +74,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目（2026-10-25、2 回起動）は nvrm の面への移行・モード設定・垂直帰線による歩調まで誤りの行なく進んだが、主モニター（Acer X27U Z1、QD-OLED、DP）は暗いまま戻らなかった。原因は不明。モードは起動画面と同じ 1920×1080 59.940 Hz で、設定アプリでは変えられなかった（C65 で修理）。7 回目（2026-10-25、2 回起動）は 2560×1440 59.951 Hz が誤りの行なく点いたことになっているが、どのモニターも暗いままで、何も変わらなかった。0a1d812a（C62）が点けるモード設定の完了を待たなくしたことが原因と仮定して監査し、C62 の却下が誤りと分かった（C66 で修理）。8 回目は点けるモード設定の 3 秒後に「has not completed」で起動画面へ返った。待っていた通知は BEGUN と時刻で、完了の判定が誤っていた（C67 で修理）。暗い画面の第一候補として出力 LUT の倍率 0 も直した（C68）。9 回目（2026-10-25）は X27U Z1 に 2560×1440 59.951 Hz が映り、設定アプリの試用と保持で 120.000 Hz になった（C65・C67・C68 を確認、C69 の表明も出なかった）。WebGL の Zink は NVK の装置の確保が GSP に断られて softpipe のまま（C70 で修理、同じ回にその先の C71・C72 も修理）。10 回目は未実施 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目（2026-10-25、2 回起動）は nvrm の面への移行・モード設定・垂直帰線による歩調まで誤りの行なく進んだが、主モニター（Acer X27U Z1、QD-OLED、DP）は暗いまま戻らなかった。原因は不明。モードは起動画面と同じ 1920×1080 59.940 Hz で、設定アプリでは変えられなかった（C65 で修理）。7 回目（2026-10-25、2 回起動）は 2560×1440 59.951 Hz が誤りの行なく点いたことになっているが、どのモニターも暗いままで、何も変わらなかった。0a1d812a（C62）が点けるモード設定の完了を待たなくしたことが原因と仮定して監査し、C62 の却下が誤りと分かった（C66 で修理）。8 回目は点けるモード設定の 3 秒後に「has not completed」で起動画面へ返った。待っていた通知は BEGUN と時刻で、完了の判定が誤っていた（C67 で修理）。暗い画面の第一候補として出力 LUT の倍率 0 も直した（C68）。9 回目（2026-10-25）は X27U Z1 に 2560×1440 59.951 Hz が映り、設定アプリの試用と保持で 120.000 Hz になった（C65・C67・C68 を確認、C69 の表明も出なかった）。WebGL の Zink は NVK の装置の確保が GSP に断られて softpipe のまま（C70 で修理、同じ回にその先の C71・C72 も修理）。10 回目（2026-10-25）は `rpcRmApi*_GSP` の誤りが消え、装置が作れるようになった先で、WebGL を使うページを開くたびにブラウザーが NULL の入口へ跳んで落ちた（C73 で修理）。11 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -153,6 +153,8 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C70 | NVK の装置は `NV_DEVICE_ALLOCATION_FLAGS_RESTRICT_RESERVED_VALIMITS` で RM の VA を決めた範囲へ閉じ込められ、NVK のヒープは [1 MiB, 256 GiB) でよい | 却下 → 修理済み（実機未確認） | 実機 9 回目、Zink を起こすたびに `rpcRmApiAlloc_GSP: GspRmAlloc failed … hClass=0x00000080 … status=0x0000001f` と `NVK: … NV01_DEVICE_0 failed: NV_ERR_INVALID_ARGUMENT`（120 Hz への変更とは無関係。8 回目も同じ場所で落ちていたが理由が出ていなかった）。GSP 構成の CPU 側 RM は装置を GSP にも作らせ、その RPC（`NV_RM_RPC_ALLOC_SHARE_DEVICE_FWCLIENT`）は旗を送るが範囲を送らない。GSP の `deviceConstruct` は旗があって範囲が 0 なら断る。旗を外すだけでは足りない：GSP 構成では各 VA 空間の [4 GiB, 4.5 GiB) が GSP-RM の範囲で（`gvaspaceReserveSplitVaSpace`）、CPU 側 RM はチャネルの文脈バッファーを 4 GiB から上の最初の空きへ写す（`dmaAllocMapping_GM107`）。RM の注釈どおり RM の場所は [4 GiB, 8 GiB)（CUDA の約束）。修理：装置は旗なし（UVM・NVKMS と同じ）、NVK のヒープは 8 GiB から（`NNRM_VA_START`、`nvkmd_nocturne_rm.h`）。host 試験の偽の RM に GSP の規則（装置の旗、GSP の範囲、文脈バッファーの写像）を入れた。直す前の `nvkmd_nocturne_rm.c` はこの偽物で NV01_DEVICE_0 から失敗し、実機の症状を再現した |
 | C71 | エンジンのクラスは装置のクラス一覧から下位バイトで選べる | 却下 → 修理済み（実機未確認） | 監査（2026-10-25）：`NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2` はエンジンを持たない MIG のクラス（`AMPERE_SMC_CONFIG_SESSION` 0xc639、`AMPERE_SMC_MONITOR_SESSION` 0xc640）も含み、M2MF の 0x40 で選ぶと 0xc640 を拾う。M2MF の物体を頼むチャネルは作れず、NVK の `cls_m2mf` も誤る。修理：グラフィックスとコピーのクラスは、そのエンジンの一覧（`NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST`、CPU 側 RM の表で答える。一覧は引数の中のポインターで書かれるので libnvrm の引数の領域に置く）から選ぶ。GPFIFO と USERMODE は装置の一覧のまま。host 試験（偽の RM はチャネルの下にエンジンのクラスしか作らせない） |
 | C72 | GP の環の空きは USERD の GP_GET で数えられる | 却下 → 修理済み（実機未確認） | 監査（2026-10-25）：Host が USERD を書き戻すかはチャネルの RAMFC の `USERD_WRITEBACK` で、RM が GSP の中で決める（CPU 側に呼出しは見えない）。dev_ram.ref（open-gpu-doc、GA100）は、書き戻しは止められるのでセマフォーで進みを追うよう勧めている。書き戻されなければ約 340 回目の flush で 10 秒待って装置を失う。修理：環の空きは実行文脈がフェンスで数える（flush ごとの GP の終わりを持ち、足りなければ古い flush のフェンスを待つ、`nvkmd_nocturne_ctx.c`）。`nnrm_chan_submit` は書いて鳴らすだけ。flush は環に入る大きさに分け、不完全な命令の連なりは切らない（上流の nouveau 版と同じ）。host 試験 `nvk_ctx`（偽の GPU は CPU が待つ間だけ flush を終え、GP_GET は書かない） |
+| C73 | NVK と Vulkan の実行時は、物体ごとに libc の遅延メンバーにしてよい | 却下 → 修理済み（実機未確認） | 実機 10 回目、WebGL を使うページを開くたびにブラウザーが `rip=0` で落ちた（3 回、スタックの戻り番地 `0x152af0b`）。記号付きで同じ配置に再リンクして引くと `wsi_device_init` の中で、呼んだ `vk_tramp_GetPhysicalDeviceProperties2` が物理装置の入口の表の NULL へ跳んでいた。入口の表は実装を弱い参照で名指しし（上流の生成器、入れない入口は NULL）、弱い参照は遅延メンバーを引き込まない。物体はあるのにリンクされなかった実装が 51 個（`vk_common_GetPhysicalDeviceProperties2`・`CmdCopyBuffer`・`CreatePipelineLayout`・`CreateFramebuffer`・`CreateDescriptorUpdateTemplate` など、NVK の video・生成命令・host copy）。C70 で装置が作れるようになって初めてここまで来た。host 試験はソースを一つずつ組むので、製品のリンクの形を見ていなかった。修理：実行時・WSI・NVK を `ld -r` で一つの物体（`vulkan_nouveau.o`）にして一つの遅延メンバーにする（上流の共有ライブラリーと同じ丸ごとの単位）。`scripts/link_unit.py` は単位から出る弱い参照を他のメンバーが定義していればビルドを止める（実行時の物体を一つ外して試し、止まることを確かめた）。単位に入って初めて分かった MME の試験プログラム（`test_nvk_mme.c`、`main` を持つ）を NVK の一覧から外した。直した後のブラウザーで、物体があるのにリンクされない弱い参照は 0 個 |
+| C74 | アプリは自分の 16 ms の時計で描けば、どのリフレッシュでも表示に揃う | 却下 → 修理済み（実機未確認） | 実機 10 回目のユーザーの観察：3D Cube は 60 Hz では 60 fps で安定、120・280 Hz では 55〜60 fps で揺れる。System.log では 120・280 Hz でも合成は垂直帰線で歩調を取っていた（「frames paced by the display driver's vertical blank」の後に「no vertical blank」の行が無い）。cube は 16 ms 眠っては描くだけで、表示の拍を受け取る道が無かった。60 Hz では提出が次の垂直帰線まで待たされて位相が揃い、偶然 60 に見える。120・280 Hz では眠りに合成の分の待ちが足されて 17・18 ms になる。修理：窓を `WIN_FRAME_EVENTS` で開くと、提出を取り込んだ合成の後に `EV_FRAME`（key と x は 0、何度提出しても一つ、表示されていない窓には表示された時）が届く（`abi.h`、`wm.c`）。`ui.c` はすべての窓をこれで開き、面が変わった後の分だけを `UI_EVENT_FRAME` にする。cube はその出来事で次の絵を描き、回転は経過時間で進める（Hz で回る速さが変わらない）。Go の ui は受けて捨てる。QEMU（モード 74.998 Hz、垂直帰線なし）で cube は約 75 fps、最小化と復元で再開、Space で形が変わる。ブラウザーの rAF はまだ 16 ms の時計（全画面の直接表示の間だけ表示に従う） |
 | C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る。実機 4 回目：BME を入れてから nvrm が落ちて解放されるまで（`RmInitAdapter` の 5.1 秒を含む）、IOMMU の遮断の行は一つも無かった |
 
 ## 5. 担当と受け渡し
@@ -165,13 +167,15 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 6. 次の一手
 
-1. P10（ユーザー）：RTX 4070 の実機で起動し（10 回目。9 回目で表示は映り、120 Hz にもできた）、まず
-   ブラウザーの WebGL（get.webgl.org）が Zink で動くかを見る（C70〜C72）。System.log の `MESA:` の行が
-   「Nocturne GL: drawing on the GPU with …」なら GPU。そうでなければ同じ行の理由と、その前の `ZINK:`・`NVK:` の行
+1. P10（ユーザー）：RTX 4070 の実機で起動し（11 回目。10 回目で 280 Hz にもでき、装置の確保は通った）、まず
+   ブラウザーで get.webgl.org を開き、落ちずに立方体が回るか（C73）と、Zink で動くかを見る（C70〜C72）。
+   System.log の `MESA:` の行が「Nocturne GL: drawing on the GPU with …」なら GPU。そうでなければ同じ行の理由と、その前の `ZINK:`・`NVK:` の行
    （NVK は止まった段階の名前と NV_STATUS を書く、C63）と、nvrm.log の `rpcRmApiAlloc_GSP`・`rpcRmApiControl_GSP` の行を見る。
    装置の確保を越えた先（チャネル、エンジンの物体、メモリーの写像、投入）は実機で初めて通る。立方体が回り続けるか
    （止まれば GP の環かフェンス、C72）、窓を閉じて開き直せるかも見る。
-   表示は 9 回目と同じく、モードの変更（設定アプリの試用・保持・戻る）で誤りの行が無いかを見る。全画面の直接表示では、
+   3D Cube を 60・120・280 Hz で開き、fps が表示の Hz（描くのが間に合わなければその整数分の一）に揃って
+   揺れないかを見る（C74）。
+   表示は 9・10 回目と同じく、モードの変更（設定アプリの試用・保持・戻る）で誤りの行が無いかを見る。全画面の直接表示では、
    フリップの完了が届くか（C56：`NVRM display:` に「the flip on head … has not completed」の行が
    出ないか。出れば表示を起動画面へ返す、C66）と、
    全画面の窓を閉じた後にデスクトップへ戻るか（C57）を見る。ACPI の拒否（C59）で RM が要る方法を
@@ -181,6 +185,19 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-25（10）：実機 10 回目（ユーザー、USB 起動、5af24747 の作業ツリー）。ユーザーの観察：WebGL を使うサイトを
+  開くとブラウザーが落ちる。3D Cube は 60 Hz では 60 fps で安定、120・280 Hz では 55〜60 fps で揺れる。
+  `build/qa/realhw10/`（9 回目と同じく管理者の PowerShell と store.exe で取り出した）：X27U Z1 に 2560×1440
+  59.951 Hz、設定アプリで 280.000 Hz・120.000 Hz・59.951 Hz の試用・保持・戻るに誤りの行は無く、どの Hz でも合成は
+  垂直帰線で歩調を取っていた。`rpcRmApi*_GSP` の誤りは消えた（C70）。ブラウザーは `MESA:`・`ZINK:`・`NVK:` の行を
+  一つも書かずに 3 回 `rip=0` で落ちた。同じ配置で記号付きに再リンクして戻り番地を引き、入口の表の NULL と分かった
+  （C73）。fps は表示の拍がアプリへ届いていなかった（C74）。確認：host 試験 5 つ（nvk_sync、nvk_ctx、mesa_screen、
+  nvk_rm、zink_start）0 件失敗、全体ビルド（img・vhd・vhdx・iso）、起動ディスクの browser・browserjsworker・cube が
+  `build/programs` と同じ sha256、QEMU（WHPX、4 コア、4096 MiB、1920×1080、AHCI、NVIDIA 無し）で机上、3D Cube
+  約 75 fps（モード 74.998 Hz）、最小化と復元、ブラウザーの get.webgl.org の立方体が softpipe で落ちずに回る
+  （1 秒の差で回転を確かめた）、戻る、ホイールで下端と先頭を目視（`build/qa/zink11/`）。実機の Zink と、実機の
+  120・280 Hz での fps は 11 回目で確かめる。
 
 - 2026-10-25（9）：実機 9 回目（ユーザー、USB 起動、6e912418 の作業ツリー）。ユーザーの観察：設定アプリで 60 Hz から
   120 Hz に変えた後に ZINK と `rpcRmApiAlloc_GSP` の誤りが出た。`build/qa/realhw9/`（USB の独自のファイルシステムから

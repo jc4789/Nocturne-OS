@@ -215,8 +215,9 @@ VK_SRC := $(addprefix $(VK)/util/,vk_alloc.c vk_format.c vk_util.c) \
 
 # NVK with the nvkmd/nocturne backend in place of nvkmd/nouveau, and its helper libraries:
 # the class push helpers, MME, nil's format table and NAK's C (NIR passes). nvk_cubin.c (ELF cubin
-# import for VK_NVX_binary_import) needs libelf and is left out with that extension. nvkcl.cpp is
-# NVK's OpenCL kernels as NIR builders, pregenerated with mesa_clc (ports/mesa/README.md).
+# import for VK_NVX_binary_import) needs libelf and is left out with that extension, and
+# test_nvk_mme.c is meson's MME test program, not part of the driver. nvkcl.cpp is NVK's OpenCL
+# kernels as NIR builders, pregenerated with mesa_clc (ports/mesa/README.md).
 NV_CLASSES := $(shell $(PY) ports/mesa/generate.py nv-classes)
 NVK_SRC := $(NOUVEAU)/headers/nv_push.c $(patsubst %,$(NV_GEN)/headers/nv_push_%.c,$(NV_CLASSES)) \
     $(addprefix $(NOUVEAU)/mme/,mme_fermi.c mme_fermi_builder.c mme_fermi_sim.c mme_sim.c mme_tu104.c \
@@ -227,7 +228,7 @@ NVK_SRC := $(NOUVEAU)/headers/nv_push.c $(patsubst %,$(NV_GEN)/headers/nv_push_%
     nak_nir_lower_non_uniform_ldcx.c nak_nir_lower_scan_reduce.c nak_nir_lower_shared_atomics.c \
     nak_nir_lower_tex.c nak_nir_lower_vtg_io.c nak_nir_mark_lcssa_invariants.c \
     nak_nir_rematerialize_load_const.c) $(NV_GEN)/compiler/nak_nir_algebraic.c \
-    $(filter-out %/nvk_cubin.c,$(wildcard $(NVK_VK)/*.c)) $(NVK_VK)/layers/nvk_app_workarounds.c \
+    $(filter-out %/nvk_cubin.c %/test_nvk_mme.c,$(wildcard $(NVK_VK)/*.c)) $(NVK_VK)/layers/nvk_app_workarounds.c \
     $(NVK_VK)/nvkmd/nvkmd.c $(NVK_VK)/nvkmd/nvkmd_device_info.c $(wildcard $(NVK_VK)/nvkmd/nocturne/*.c) \
     $(NVK_VK_GEN)/nvk_entrypoints.c $(NVK_VK_GEN)/nvk_drirc.c $(MESA_PREGEN)/src/nouveau/vulkan/nvkcl.cpp \
     $(COMPILER_RS_GEN)/bindings.c $(COMPILER_RS)/rust_helpers.c $(NVK_VK_GEN)/nvk_inline_wrappers.c
@@ -247,9 +248,19 @@ $(filter-out $(COMPILER_RS_GEN)/bindings.c $(NVK_VK_GEN)/nvk_inline_wrappers.c,\
     $(filter $(MESA_GEN)/%,$(VK_SRC) $(NVK_SRC))): $(MESA_GEN_STAMP)
 	@:
 
-# Everything a program that uses NVK links: the C objects (lazy members of the libc link) and the
-# Rust archive.
-NVK_OBJ := $(NVK_C_OBJ) $(NVK_RS_LIB)
+# The runtime, WSI and NVK are one unit, linked whole as upstream's shared driver is: the dispatch
+# tables name every entrypoint weakly, and a weak reference does not pull a lazy member of the libc
+# link in (scripts/link_unit.py). The unit itself is one lazy member, so only a program that draws
+# with OpenGL links it.
+NVK_UNIT := $(BUILD)/mesa/vulkan_nouveau.o
+$(NVK_UNIT): $(NVK_C_OBJ) ports/mesa/nvk.mk scripts/link_unit.py
+	@echo "  LD   $@"
+	@$(file >$@.members,$(NVK_C_OBJ))
+	@$(file >$@.others,$(filter-out $(NVK_UNIT),$(LIBC_LINK)))
+	@$(PY) scripts/link_unit.py $@ $@.members $@.others $(NM) $(LD) -m elf_x86_64
+
+# Everything a program that uses NVK links: the unit and the Rust archive.
+NVK_OBJ := $(NVK_UNIT) $(NVK_RS_LIB)
 
 .PHONY: nvk
 nvk: $(NVK_OBJ) $(NVK_RS_LIB) $(ZINK_OBJ)

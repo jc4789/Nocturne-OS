@@ -104,7 +104,12 @@ driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で�
 
 Rust の 3 crate（NAK、nil、nvk_rs）と std は `rustc` の staticlib `libnvk_mesa_rs.a` 一つにまとめる。
 NVK・Zink・libnvrm・Rust は libc の遅延メンバーで、`nocturne_gl.c` の強い参照により GL を使う
-プログラムにだけ入る。SDK の `libc.a`（`scripts/mksdk.sh`）には Rust の .a の各メンバーを展開して入れる。
+プログラムにだけ入る。Vulkan の実行時・WSI・NVK は `ld -r` で一つの物体 `vulkan_nouveau.o` にして、
+一つのメンバーとして入れる（上流の共有ライブラリーと同じ、丸ごとの単位）。入口の表は実装を弱い参照で
+名指しし、弱い参照は遅延メンバーを引き込まない。物体ごとのメンバーだった間は、名前で呼ぶ者の無い実装
+（`vk_common_GetPhysicalDeviceProperties2`、`vk_common_CmdCopyBuffer` など 51 個）がリンクされず、表の項が
+NULL のまま実機で呼ばれた。`scripts/link_unit.py` は単位を作るとき、単位から出る弱い参照を他のメンバーが
+定義していればビルドを止める。SDK の `libc.a`（`scripts/mksdk.sh`）には Rust の .a の各メンバーを展開して入れる。
 GPU が無い（`C:\Nocturne\System\nvrm` が動いていない）機械では、チャンネル接続がすぐ失敗し、Zink は softpipe へ戻る。
 
 | 変更したファイル（NVK・Vulkan） | 内容 |

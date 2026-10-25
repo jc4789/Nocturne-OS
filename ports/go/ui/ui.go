@@ -692,6 +692,8 @@ const (
 	eventPointer
 	eventWheel
 	eventFocus
+	eventDirect
+	eventFrame
 )
 
 // Key is a key press that no focused text field took.
@@ -945,7 +947,7 @@ func (a *App) render() {
 func (a *App) event(r *reader) {
 	view, typ, index, mods, flags := r.u32(), r.u32(), r.u32(), r.u32(), r.u32()
 	x, y, text := r.f64(), r.f64(), r.str()
-	if r.bad {
+	if r.bad || typ == eventFrame { // the display's pace: this library draws when a view changes
 		return
 	}
 	var w *Widget

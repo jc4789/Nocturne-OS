@@ -1,6 +1,8 @@
 /* Spinning shaded solids. Space (or the button) switches shape, mouse drag spins. The
    header and the hint are widgets of the interface engine (libc/ui.c); the solid is
-   drawn in a surface that fills the resizable window. Escape closes. */
+   drawn in a surface that fills the resizable window. Escape closes.
+   A picture is drawn each time the screen took the last one (UI_EVENT_FRAME), so once a
+   frame of the display at any refresh rate, and the solid turns by the time that passed. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +128,59 @@ static void show(struct ui_session *s, int fps) {
     ui_send(s, &m);
 }
 
+/* The solid turned by ax and ay, drawn into c (W x H). */
+static void paint(canvas_t *c, int W, int H, double ax, double ay) {
+    const struct ui_theme *th = &ui_theme;
+    gfx_fill(c, 0, 0, W, H, th->background);
+    ui_round_gradient(c, 0, 0, W, H, th->radius, th->sidebar, th->surfaceActive);
+    double sc = MIN(W, H) * 0.27;
+    vec3 tv[64];
+    int px[64], py[64];
+    for (int i = 0; i < nvert; i++) {
+        tv[i] = rot(verts[i], ax, ay);
+        double z = tv[i].z + 5;
+        px[i] = W / 2 + (int)(tv[i].x * sc * 4 / z);
+        py[i] = H / 2 - (int)(tv[i].y * sc * 4 / z);
+    }
+    /* shadow */
+    for (int r = 0; r < 6; r++) {
+        float sw = 2 * (float)sc - r * 12, sh = 14 - r * 2;
+        ui_round_fill(c, (float)W / 2 - sw / 2, (float)H - 30 + r, sw, sh, sh / 2, ARGB(26, 0, 0, 0));
+    }
+    struct drawface df[64];
+    for (int f = 0; f < nface; f++) {
+        double z = 0;
+        for (int k = 0; k < face_n[f]; k++) z += tv[faces[f][k]].z;
+        df[f].depth = z / face_n[f];
+        df[f].idx = f;
+    }
+    qsort(df, nface, sizeof df[0], cmpf);
+    vec3 light = {-0.4, 0.6, -0.7};
+    double ll = sqrt(light.x * light.x + light.y * light.y + light.z * light.z);
+    for (int i = 0; i < nface; i++) {
+        int f = df[i].idx;
+        vec3 a = tv[faces[f][0]], b = tv[faces[f][1]], cc = tv[faces[f][2]];
+        vec3 u = {b.x - a.x, b.y - a.y, b.z - a.z}, v = {cc.x - a.x, cc.y - a.y, cc.z - a.z};
+        vec3 n = {u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x};
+        double nl = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (nl == 0) continue;
+        int i0 = faces[f][0], i1 = faces[f][1], i2 = faces[f][2];
+        double d = fabs(n.x * light.x + n.y * light.y + n.z * light.z) / (nl * ll);
+        int shade = (int)(70 + 185 * d);
+        uint32_t col = gfx_mix(RGB(10, 8, 30), face_col[f], shade);
+        gfx_triangle(c, px[i0], py[i0], px[i1], py[i1], px[i2], py[i2], col);
+        if (face_n[f] == 4) {
+            int i3 = faces[f][3];
+            gfx_triangle(c, px[i0], py[i0], px[i2], py[i2], px[i3], py[i3], col);
+        }
+        uint32_t edge = gfx_mix(col, RGB(255, 255, 255), 90);
+        for (int k = 0; k < face_n[f]; k++) {
+            int p0 = faces[f][k], p1 = faces[f][(k + 1) % face_n[f]];
+            ui_line(c, (float)px[p0], (float)py[p0], (float)px[p1], (float)py[p1], 1.2f, edge);
+        }
+    }
+}
+
 int main(void) {
     struct ui_session *s = ui_session_new();
     int ww, wh;
@@ -135,135 +190,85 @@ int main(void) {
     canvas_t *c = ui_surface(s, VIEW, W, H, 0);
     if (!c) return 1;
     build();
-    double ax = 0.5, ay = 0.3, vx = 0.011, vy = 0.017;
-    bool drag = false;
+    /* the spin in radians a millisecond; a drag turns by the pointer's moves and leaves the
+       last one spinning, a move taken as one 16 ms step */
+    double ax = 0.5, ay = 0.3, vx = 0.011 / 16, vy = 0.017 / 16;
+    bool drag = false, draw = true, quit = false;
     int lmx = 0, lmy = 0;
-    uint64_t frames = 0, t0 = n_clock_uptime_ms();
+    uint64_t frames = 0, t0 = n_clock_uptime_ms(), drawn = t0;
     int fps = 0;
     show(s, fps);
-    for (;;) {
-        uint64_t frame_start = n_clock_uptime_ms();
-        const struct ui_theme *th = &ui_theme;
-        gfx_fill(c, 0, 0, W, H, th->background);
-        ui_round_gradient(c, 0, 0, W, H, th->radius, th->sidebar, th->surfaceActive);
-        double sc = MIN(W, H) * 0.27;
-        vec3 tv[64];
-        int px[64], py[64];
-        for (int i = 0; i < nvert; i++) {
-            tv[i] = rot(verts[i], ax, ay);
-            double z = tv[i].z + 5;
-            px[i] = W / 2 + (int)(tv[i].x * sc * 4 / z);
-            py[i] = H / 2 - (int)(tv[i].y * sc * 4 / z);
-        }
-        /* shadow */
-        for (int r = 0; r < 6; r++) {
-            float sw = 2 * (float)sc - r * 12, sh = 14 - r * 2;
-            ui_round_fill(c, (float)W / 2 - sw / 2, (float)H - 30 + r, sw, sh, sh / 2, ARGB(26, 0, 0, 0));
-        }
-        struct drawface df[64];
-        for (int f = 0; f < nface; f++) {
-            double z = 0;
-            for (int k = 0; k < face_n[f]; k++) z += tv[faces[f][k]].z;
-            df[f].depth = z / face_n[f];
-            df[f].idx = f;
-        }
-        qsort(df, nface, sizeof df[0], cmpf);
-        vec3 light = {-0.4, 0.6, -0.7};
-        double ll = sqrt(light.x * light.x + light.y * light.y + light.z * light.z);
-        for (int i = 0; i < nface; i++) {
-            int f = df[i].idx;
-            vec3 a = tv[faces[f][0]], b = tv[faces[f][1]], cc = tv[faces[f][2]];
-            vec3 u = {b.x - a.x, b.y - a.y, b.z - a.z}, v = {cc.x - a.x, cc.y - a.y, cc.z - a.z};
-            vec3 n = {u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x};
-            double nl = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-            if (nl == 0) continue;
-            int i0 = faces[f][0], i1 = faces[f][1], i2 = faces[f][2];
-            double d = fabs(n.x * light.x + n.y * light.y + n.z * light.z) / (nl * ll);
-            int shade = (int)(70 + 185 * d);
-            uint32_t col = gfx_mix(RGB(10, 8, 30), face_col[f], shade);
-            gfx_triangle(c, px[i0], py[i0], px[i1], py[i1], px[i2], py[i2], col);
-            if (face_n[f] == 4) {
-                int i3 = faces[f][3];
-                gfx_triangle(c, px[i0], py[i0], px[i2], py[i2], px[i3], py[i3], col);
+    while (!quit) {
+        if (draw) {
+            draw = false;
+            uint64_t now = n_clock_uptime_ms();
+            if (!drag) {
+                ax += vx * (double)(now - drawn);
+                ay += vy * (double)(now - drawn);
             }
-            uint32_t edge = gfx_mix(col, RGB(255, 255, 255), 90);
-            for (int k = 0; k < face_n[f]; k++) {
-                int p0 = faces[f][k], p1 = faces[f][(k + 1) % face_n[f]];
-                ui_line(c, (float)px[p0], (float)py[p0], (float)px[p1], (float)py[p1], 1.2f, edge);
+            drawn = now;
+            paint(c, W, H, ax, ay);
+            ui_surface_changed(s, VIEW);
+            frames++;
+            if (now - t0 >= 1000) {
+                bool same = (int)frames == fps;
+                fps = (int)frames;
+                frames = 0;
+                t0 = now;
+                if (!same) show(s, fps); /* the frame rate is a widget; send it only when it changed */
             }
         }
-        ui_surface_changed(s, VIEW);
-        frames++;
-        if (n_clock_uptime_ms() - t0 >= 1000) {
-            bool same = (int)frames == fps;
-            fps = (int)frames;
-            frames = 0;
-            t0 = n_clock_uptime_ms();
-            if (!same) show(s, fps); /* the frame rate is a widget; send it only when it changed */
-        }
-        if (!drag) {
-            ax += vx;
-            ay += vy;
-        }
-        int spent = (int)(n_clock_uptime_ms() - frame_start);
-        int wait = MAX(1, 16 - spent);
-        uint64_t until = n_clock_uptime_ms() + wait;
-        bool quit = false;
-        for (;;) {
-            int64_t left = (int64_t)(until - n_clock_uptime_ms());
-            ui_session_wait(s, left > 0 ? (int)left : 0);
-            struct ui_event e;
-            char text[16];
-            while (ui_next_event(s, &e, text, sizeof text)) {
-                bool next = false;
-                switch (e.type) {
-                case UI_EVENT_CLOSE:
-                    quit = true;
-                    break;
-                case UI_EVENT_KEY:
-                    if (e.flags & UI_UP) break;
-                    if (!strcmp(e.text, "Escape")) quit = true;
-                    else if (e.a == ' ') next = true;
-                    break;
-                case UI_EVENT_CLICK:
-                    if (e.node == next_shape) next = true;
-                    break;
-                case UI_EVENT_CANVAS:
-                    W = MAX(1, (int)e.a);
-                    H = MAX(1, (int)e.b);
-                    c = ui_surface(s, VIEW, W, H, 0);
-                    if (!c) quit = true;
-                    break;
-                case UI_EVENT_POINTER:
-                    if (e.flags & UI_DOWN) {
-                        drag = true;
-                        lmx = (int)e.a;
-                        lmy = (int)e.b;
-                    } else if (e.flags & UI_UP) {
-                        drag = false;
-                    } else if (drag) {
-                        vy = ((int)e.a - lmx) * 0.01;
-                        vx = ((int)e.b - lmy) * -0.01;
-                        ay += vy;
-                        ax += vx;
-                        lmx = (int)e.a;
-                        lmy = (int)e.b;
-                    }
-                    break;
-                }
-                if (next) {
-                    shape = (shape + 1) % 4;
-                    build();
-                    show(s, fps); /* the name of the shape */
-                }
-            }
-            if (quit || !ui_session_open(s)) {
+        ui_session_wait(s, -1);
+        struct ui_event e;
+        char text[16];
+        while (ui_next_event(s, &e, text, sizeof text)) {
+            bool next = false;
+            switch (e.type) {
+            case UI_EVENT_FRAME:
+                draw = true;
+                break;
+            case UI_EVENT_CLOSE:
                 quit = true;
                 break;
+            case UI_EVENT_KEY:
+                if (e.flags & UI_UP) break;
+                if (!strcmp(e.text, "Escape")) quit = true;
+                else if (e.a == ' ') next = true;
+                break;
+            case UI_EVENT_CLICK:
+                if (e.node == next_shape) next = true;
+                break;
+            case UI_EVENT_CANVAS:
+                W = MAX(1, (int)e.a);
+                H = MAX(1, (int)e.b);
+                c = ui_surface(s, VIEW, W, H, 0);
+                if (!c) quit = true;
+                draw = true; /* the new surface is shown once drawn */
+                break;
+            case UI_EVENT_POINTER:
+                if (e.flags & UI_DOWN) {
+                    drag = true;
+                    lmx = (int)e.a;
+                    lmy = (int)e.b;
+                } else if (e.flags & UI_UP) {
+                    drag = false;
+                } else if (drag) {
+                    ay += ((int)e.a - lmx) * 0.01;
+                    ax += ((int)e.b - lmy) * -0.01;
+                    vy = ((int)e.a - lmx) * 0.01 / 16;
+                    vx = ((int)e.b - lmy) * -0.01 / 16;
+                    lmx = (int)e.a;
+                    lmy = (int)e.b;
+                }
+                break;
             }
-            if (n_clock_uptime_ms() >= until) break;
+            if (next) {
+                shape = (shape + 1) % 4;
+                build();
+                show(s, fps); /* the name of the shape */
+            }
         }
-        if (quit) break;
+        if (!ui_session_open(s)) quit = true;
     }
     ui_session_free(s);
     return 0;

@@ -93,6 +93,10 @@ enum {
                             keyboard; for the window (node 0xFFFFFFFF): the window did */
     UI_EVENT_DIRECT,     /* the window (node 0xFFFFFFFF) asked for win_direct: the display driver started (a = 1)
                             or stopped (a = 0) showing the app's own images instead of the window (EV_DIRECT) */
+    UI_EVENT_FRAME,      /* the window (node 0xFFFFFFFF): a frame of the screen took what ui_surface_changed showed,
+                            one event for any number of changes. It comes at the display's pace (WIN_FRAME_EVENTS),
+                            so an animation that draws its next picture on it draws once a frame at any refresh
+                            rate; while the window is not shown it waits */
 };
 /* A field holds its caret and selection itself (arrows, Home/End, Shift, Ctrl for words, Ctrl+A/C/X/V,
    clicks and drags); the keys it has no use for come as UI_EVENT_KEY. Some properties act when their

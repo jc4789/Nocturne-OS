@@ -510,6 +510,13 @@ struct gui_event {
 #define WIN_MAP_ACQUIRE 1
 /* EV_FRAME: key = completed index, x = reusable index; completion means all
    compositor reads have joined, not hardware vblank or physical scanout. */
+/* The display's pace for a window presented by rectangles: after a frame of the
+   screen took what the window presented, it gets EV_FRAME (key and x 0), one for
+   any number of presents. Frames come at the display's vertical blanks (else its
+   mode's refresh), so an app that draws on EV_FRAME draws once a frame at any
+   refresh rate. A window that is not shown gets it when it is shown again.
+   (WIN_DEEP_COLOR, 64, is in display_abi.h.) */
+#define WIN_FRAME_EVENTS 128
 #define WIN_STATE_VISIBLE 1
 #define WIN_STATE_FOCUSED 2
 #define WIN_STATE_FULLSCREEN 4

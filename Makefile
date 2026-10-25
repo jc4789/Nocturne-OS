@@ -3,6 +3,7 @@
 CC   := clang
 LD   := ld.lld
 AR   := llvm-ar
+NM   := llvm-nm
 NASM := nasm
 PY   := python
 
@@ -277,6 +278,9 @@ LIBC_RSP := $(BUILD)/libc-objects.list
 # Windowsのコマンド長上限を超えないよう、lldとSDKに同じobject一覧を渡す。
 $(LIBC_RSP): $(LIBC_LINK) Makefile
 	@$(file >$@,$(LIBC_LINK))
+
+# A unit's check (scripts/link_unit.py) reads the symbols of every other member.
+$(NVK_UNIT): | $(filter-out $(NVK_UNIT),$(LIBC_LINK))
 
 $(PROGRAMS)/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)

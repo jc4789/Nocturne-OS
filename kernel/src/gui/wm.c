@@ -58,6 +58,7 @@ struct window {
     int front_index, pending_index;
     bool frame_ready;
     struct gui_event frame_event; /* durable mailbox, not a droppable input event */
+    bool frame_wanted; /* WIN_FRAME_EVENTS: presented since the last frame that showed the window */
     int flags;
     bool shown, minimized, maximized, dead,fullscreen;
     bool direct_wanted; /* win_direct: its own images shown by the display driver when it can be */
@@ -1731,6 +1732,10 @@ static void composite(void) {
        since expose/move damage can reread it between client submissions. */
     for (int i = 0; i < nwin; i++) {
         struct window *w = zorder[i];
+        if (w->frame_wanted && visible(w)) { /* WIN_FRAME_EVENTS: this frame took its presents */
+            w->frame_wanted = false;
+            push_event(w, &(struct gui_event){.type = EV_FRAME});
+        }
         if (w->pending_index < 0) continue;
         w->front_index = w->pending_index;
         w->pending_index = -1;
@@ -2783,6 +2788,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         for (int row = y0; row < y1; row++)
             memcpy(w->buf + (size_t)row * w->cw + x0,
                    w->user_buf + (size_t)row * w->cw + x0, (size_t)(x1 - x0) * 4);
+        if (w->flags & WIN_FRAME_EVENTS) w->frame_wanted = true;
         if (!w->shown) show_if_needed(w);
         else if (visible(w)) damage_rect(client_x(w) + x, client_y(w) + y, MIN(rw, w->cw - x), MIN(rh, w->ch - y));
         wake_compositor();

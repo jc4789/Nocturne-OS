@@ -337,6 +337,7 @@ struct uiwin {
     float px, py;
     uint64_t now, redraw_at, caret_at;
     bool dirty, animating, caret_on, hold;
+    bool frame_wanted;       /* a surface changed since the last UI_EVENT_FRAME */
     /* The focused field's text as the engine edits it: ahead of the app's views, so keys
        that come before the app has sent back the last value build on it, not on the view. */
     char *edit;
@@ -1798,6 +1799,12 @@ static void win_input(struct uiwin *w, const struct gui_event *e) {
             w->dirty = true;
         }
         break;
+    case EV_FRAME: /* also after pictures of widgets alone, which nobody waits for */
+        if (w->frame_wanted) {
+            w->frame_wanted = false;
+            emit(w, UI_EVENT_FRAME, NULL, 0, 0, 0, 0, NULL, 0);
+        }
+        break;
     }
 }
 
@@ -2055,7 +2062,8 @@ static void open_window(struct ui_session *s, uint32_t id, uint32_t width, uint3
     else {
         memcpy(name, title.p, title.n);
         name[title.n] = 0;
-        result = win_open((int)width, (int)height, name, (int)(flags & UI_WINDOW_FLAGS), &w->win);
+        /* frame events come only after presents; they answer surface changes (UI_EVENT_FRAME) */
+        result = win_open((int)width, (int)height, name, (int)(flags & UI_WINDOW_FLAGS) | WIN_FRAME_EVENTS, &w->win);
         if (result < 0) { free(w); w = NULL; }
     }
     free(name);
@@ -2260,7 +2268,9 @@ n_result ui_session_send(struct ui_session *s, const void *msg, size_t n) {
                 struct uiwin *w = s->wins[i];
                 for (uint32_t j = 0; j < w->n; j++) {
                     const struct node *n = &w->nodes[j];
-                    if (n->kind != K_SURFACE || n->surface != id || show_surface(w, n, sf, rect)) continue;
+                    if (n->kind != K_SURFACE || n->surface != id) continue;
+                    w->frame_wanted = true;
+                    if (show_surface(w, n, sf, rect)) continue;
                     /* the next picture paints the part that changed */
                     float x0 = n->x + (float)rect[0], y0 = n->y + (float)rect[1];
                     float x1 = n->x + fminf((float)rect[0] + (float)rect[2], n->w);
