@@ -51,9 +51,9 @@ void nvrm_nvkms_suspend(void);
 void nvrm_nvkms_resume(void);
 
 /* The RM client of a KAPI device and the RM handle of memory KAPI allocated on it
- * (nvkms_kapi_rm.c), for duplicating the memory into another RM client: what nvidia-drm does
- * through a file descriptor (KAPI's exportMemory), which nvrm does not have. False when either
- * has no RM object. */
+ * (nvkms_kapi_rm.c), for duplicating the memory into another RM client: KAPI's own way, its
+ * exportMemory, gives a file descriptor, which nvrm does not have. False when either has no RM
+ * object. */
 struct NvKmsKapiDevice;
 struct NvKmsKapiMemory;
 bool nvrm_nvkms_memory_handle(const struct NvKmsKapiDevice *device, const struct NvKmsKapiMemory *memory,
@@ -63,8 +63,13 @@ bool nvrm_nvkms_memory_handle(const struct NvKmsKapiDevice *device, const struct
  * table does not tell (its getFlipPendingStatus is NULL). nvrm_nvkms_flip_arm goes right before
  * the commit: it clears the completion notifier that commit names. nvrm_nvkms_flip_done is true
  * once the display engine has written that notifier, after a commit that succeeded; a commit
- * that failed or put no surface on the layer names none. Both on the thread that commits. */
+ * that failed or put no surface on the layer names none. Both on the thread that commits.
+ * nvrm_nvkms_flip_words, for the log when a flip is not seen to complete: the slot the last
+ * commit named (0 or 1) and the raw words of both of the layer's notifiers, word 0 holding the
+ * status (NVKMS's nvKmsParseNotifier reads them so), words 2 and 3 the time stamp. */
 void nvrm_nvkms_flip_arm(struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer);
 bool nvrm_nvkms_flip_done(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer);
+void nvrm_nvkms_flip_words(const struct NvKmsKapiDevice *device, uint32_t head, uint32_t layer, uint32_t *slot,
+                           uint32_t words[2][4]);
 
 #endif

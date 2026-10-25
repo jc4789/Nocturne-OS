@@ -694,7 +694,26 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     free(offer), free(seen);
 }
 
-static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n, unsigned linger_s) {
+/* Ctrl+Alt+Esc while the screen is drawn into the driver's surface asks the driver for the boot
+   screen (struct n_screen_state take_back); the boot screen back ends the request. */
+static void escape_cases(n_handle vga, n_handle surface, const struct n_scanout *d, unsigned seconds) {
+    struct n_screen_state st;
+    n_result r = n_pci_screen_state(vga, 0, &st, 0);
+    CHECK(r == 0 && !st.take_back, "the boot screen is not asked for before the user does: %s", n_result_text(r));
+    printf("pcitest: press Ctrl+Alt+Esc within %u s\n", seconds);
+    for (uint64_t end = uptime_ms() + seconds * 1000ull; r == 0 && !st.take_back && uptime_ms() < end;)
+        if ((r = n_pci_screen_state(vga, st.serial, &st, 200)) == -N_ERR_TIMEOUT) r = 0;
+    CHECK(r == 0 && st.take_back, "Ctrl+Alt+Esc asks the driver for the boot screen: %s", n_result_text(r));
+    r = n_pci_give_screen(vga, N_SCANOUT_BOOT, NULL);
+    CHECK(r == 0, "the boot screen given back: %s", n_result_text(r));
+    r = n_pci_give_screen(vga, surface, d);
+    if (!r) r = n_pci_screen_state(vga, 0, &st, 0);
+    CHECK(r == 0 && !st.take_back, "the request is over once the boot screen was back: %s", n_result_text(r));
+}
+
+/* linger_s: how long the second buffer is shown; escape_s: how long the user has for Ctrl+Alt+Esc
+   (0: that case is not run). */
+static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n, unsigned linger_s, unsigned escape_s) {
     int at = find_vga(list, n);
     if (at < 0) {
         printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
@@ -787,6 +806,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(r == 0, "vertical blanks of the surface shown: %s", n_result_text(r));
     CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, false) == 0, "the screen held and given back");
     n_sleep_ms(300); /* the release draws all of the screen again: the marks below come after it */
+    if (escape_s) escape_cases(vga, surface, &d, escape_s);
 
     /* a second buffer past it, which the display then shows */
     if (second + frame <= size) {
@@ -1113,8 +1133,18 @@ int main(int argc,char **argv) {
     if(argc>1 && !strncmp(argv[1],"screen=",7)){
         struct n_pciinfo list[128];
         int n = pcilist(list, 128);
-        give_screen_cases(-1, list, n, (unsigned)strtoul(argv[1] + 7, NULL, 10));
+        give_screen_cases(-1, list, n, (unsigned)strtoul(argv[1] + 7, NULL, 10), 0);
         printf("pcitest screen: %d failed\n", failed);
+        return failed != 0;
+    }
+    /* pcitest escape=<seconds>: the given scanout, with that long to press Ctrl+Alt+Esc */
+    if(argc>1 && !strncmp(argv[1],"escape=",7)){
+        struct n_pciinfo list[128];
+        int n = pcilist(list, 128);
+        unsigned seconds = (unsigned)strtoul(argv[1] + 7, NULL, 10);
+        if (seconds) give_screen_cases(-1, list, n, 0, seconds);
+        else { printf("FAIL: escape=<seconds> needs a number above 0\n"); failed++; }
+        printf("pcitest escape: %d failed\n", failed);
         return failed != 0;
     }
     struct n_pciinfo list[128];
@@ -1189,7 +1219,7 @@ int main(int argc,char **argv) {
         }
     acpi_refused_cases(pci, e);
     CHECK(n_pci_hold_screen(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
-    give_screen_cases(pci, list, n, 0);
+    give_screen_cases(pci, list, n, 0, 0);
     /* a function on bus 0 that is neither this device nor a bridge above it */
     for (int i = 0; i < n; i++)
         if (i != at && list[i].bus == e->bus && list[i].dev != e->dev && list[i].cls != 0x06) {

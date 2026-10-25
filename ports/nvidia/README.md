@@ -326,20 +326,24 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
    システムは head がそのモードを出す時には新しい大きさで描いている。確定に失敗すれば head は前のものを出し続け、
    前の面を渡し直す（面がまだ無ければ起動画面を返す）。どの失敗でも解放した memory へシステムが描くことはない。
    出したモード（出せなければ head が出しているもの）を `done`＝`mode_serial` で知らせ直す。望まれたものと違えば、
-   システムはそのモードを拒否として覚え、次の候補を望む。head を点けるモード設定はフリップの完了を待たない
-   （下の規則。NVKMS のモード設定は表示エンジンが済ませてから戻る）。
-   フリップの完了：KAPI の関数表の
-   `getFlipPendingStatus` は `nvKmsKapiGetFunctionsTable` が埋めない（NULL。nvidia-drm は `FLIP_OCCURRED` のイベントを待つ）。
+   システムはそのモードを拒否として覚え、次の候補を望む。モード設定も、デスクトップの面を主層へ載せるフリップとして
+   その完了を待つ（下）。
+   フリップの完了：KAPI の関数表の `getFlipPendingStatus` は `nvKmsKapiGetFunctionsTable` が埋めない（NULL）。
    そこで `nvkms_kapi_rm.c` が KAPI の通知面を読む：層に面を載せる commit ごとに KAPI はその層の二つの完了通知の片方
    （`layerState[head][layer].currFlipNotifierIndex` の次）を名指し、表示エンジンがフリップの完了でそこへ「完了」を書く。
    KAPI は名指す前に通知を消さないので、二つ前のフリップの書込みが残っている。`nvrm_nvkms_flip_arm` が commit の直前に
    その通知を「未開始」へ戻し、`nvrm_nvkms_flip_done` が commit の後で読む（`nvKmsResetNotifier`／`nvKmsParseNotifier`）。
-   表示エンジンが通知を書くのは、commit の**前に**点いていた head の、面を出していた層だけ（nvidia-drm も
-   `old_crtc_state->active && old_plane_state->fb` のときだけフリップのイベントを数える）。だから待つのは点いている
-   head の面の差し替えだけで、head を点けるモード設定、面を外す commit（失った head）、失敗した commit は待たない。
-   実機 5 回目は最初のモード設定でこの通知を待ち、書かれない通知を 3 秒待って失敗とし、表示の持ち主を手放した
-   （NVKMS が起動画面を復元し、両方のモニターに同じ画面が出た）。待ったフリップが 3 秒で完了しなければ、
-   以後のフリップは待たず、直接表示もやめる（`scr.flips_unseen`。フリップのたびに 3 秒止まらないように）。
+   KAPI は面を載せる commit なら、head を点けるモード設定でも通知を名指す（`nvkms-kapi.c` がフリップの要求を作るとき、
+   `surfaceChanged` かモード設定なら通知を指定し、面があれば通知の番号を進める。NVKMS は `nvkms-hw-flip.c` の
+   `nvAssignCompletionNotifierEvoHwState` で表示エンジンに書かせる）。だから待つのは面を載せるすべての commit
+   （モード設定、面の差し替え、失った head へデスクトップを戻すフリップ）で、面を外す commit と失敗した commit は待たない。
+   待ったフリップが 3 秒（`FLIP_TIMEOUT_MS`）で完了しなければ、表示エンジンが nvrm の面を出していない（何も出ていない
+   かもしれない）とみなし、画面を手放す（下の「手放す」）。その前に、最後の commit が名指した通知の番号と、二つの通知の
+   生の 4 語（語 0 が状態、語 2・3 が時刻）と、commit に NVKMS がかかった時間をログに出す（`nvrm_nvkms_flip_words`）。
+   語が「未開始」（0 と時刻の無効値）のままなら表示エンジンは書いておらず、「完了」なら nvrm の読み方の誤り。
+   0a1d812a は「点けるモード設定では通知が書かれない」としてこの待ちを外し、待てなかったフリップの後も画面を渡したままに
+   した。その根拠は NVKMS のソースと合わず（上）、実機 6・7 回目はモニターが暗いまま戻らなかった（5 回目は待ちが失敗し、
+   手放して起動画面が出ていた）。この待ちと手放しを戻した。
 9. 渡すのは `n_pci_give_screen(view, {幅, 高さ, pitch, XRGB8888 | N_SCANOUT_DIRECT, offset})`。カーソルが無いか、システムが
    `N_SCANOUT_DIRECT` を断れば、カーソルを解放して `N_SCANOUT_DIRECT` 無しで渡し直す（直接表示は無し、合成のみ）。
    head を点けたら `registerVblankIntrCallback`。
@@ -362,16 +366,25 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
 する（WM はそのまま面へ描き続ける）。次に繋がっているディスプレイのモードを出し、システムが望むモード（そのモニターの
 推奨か利用者の選択）をその大きさの面で出す。どれも繋がっていなければモードを取り下げる（モード 0 件）。
 
+### 手放す（`hand_back`）
+
+モードを取り下げる（`n_pci_screen_modes` の 0 件）→ `n_pci_give_screen(N_SCANOUT_BOOT)`（カーネルは GOP の面へ戻り、
+その大きさで描く）→ vblank を外す → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で起動画面を復元する。
+コンソールの面が無いか復元に失敗したときは RM 側の復元に任せる）→ 直接表示をやめてカーソルを解放 → デスクトップの面を
+解放 → 状態スレッドを終える。以後 nvrm は再び起動するまで画面に触らない（抜き差しも追わない）。次の三つで起きる：
+
+- 後始末（`nvrm_display_stop`）。
+- 待ったフリップが 3 秒で完了しない（上の 8）。起動中なら `nvrm_display_start` は失敗し、画面は GOP のまま。
+- 利用者が Ctrl+Alt+Esc を押した。ドライバーが画面を保持していない間に nvrm の面が画面なら、WM が画面の状態の
+  `take_back` を 1 にし、状態スレッドが手放す。モニターが暗いままでも、キーボードだけで起動画面へ戻れる。カーネルは
+  起動画面が戻ったとき `take_back` を 0 に戻す。
+
 ### 後始末（`nvrm_display_stop`）
 
-直接表示の要求を止め、状態スレッドと作業スレッドを止める → モードを取り下げる（`n_pci_screen_modes` の 0 件）→
-`n_pci_give_screen(N_SCANOUT_BOOT)`（カーネルは GOP の面へ戻り、その大きさで描く）→ vblank を外す → `releaseOwnership`（NVKMS が `nvEvoRestoreConsole` で起動画面を復元する。
-コンソールの面が無いか復元に失敗したときは RM 側の復元に任せる）→ 残っているアプリの絵とカーソルを解放 →
-面の view を閉じて `destroySurface` → `unmapMemory` → `freeMemory` → `declareEventInterest(0)` → `freeDevice`。その後 `nvrm.c` が
-`nvrm_nvkms_stop()` を呼ぶ。
+直接表示の要求を止め、状態スレッドと作業スレッドを止める → 手放す（上）→ 残っているアプリの絵を解放 →
+`declareEventInterest(0)` → `freeDevice`。その後 `nvrm.c` が `nvrm_nvkms_stop()` を呼ぶ。
 
-上流の nvidia-drm は fbdev を使うとき `framebufferConsoleDisabled` を呼んで起動コンソールを捨てる。nvrm は終了時に起動画面へ
-戻すので呼ばない。
+nvrm は終了時に起動画面へ戻すので、起動コンソールを捨てる `framebufferConsoleDisabled` は呼ばない。
 
 ### 直接表示（`NVRM_SCANOUT`）
 
@@ -396,9 +409,9 @@ BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の�
   client がそのファイルのものかを確かめる（`rmclientValidate`）。
 - **PRESENT**：最新の画面の状態を読み、そのアプリが直接表示されていなければ `NV_ERR_INVALID_STATE`。前のフリップの完了を
   待ってから、head の表示・モードはそのままで主層の面を替えるフリップ（commit のみの `applyModeSetConfig`）をする。待つのは
-  一つ前のフリップだけで、GPU の描画の完了は待たない（アプリが描画を待ってから PRESENT する）。フリップの完了が一度でも
-  3 秒見えなかった後（`scr.flips_unseen`）は、CREATE と PRESENT を `NV_ERR_NOT_SUPPORTED` で断り、出ていた絵からは
-  デスクトップの面へ戻す。アプリは窓を通して描き、デスクトップがそれを合成する。
+  一つ前のフリップだけで、GPU の描画の完了は待たない（アプリが描画を待ってから PRESENT する）。フリップの完了が 3 秒
+  見えなければ画面を手放す（上の「手放す」）。以後 CREATE・PRESENT・IMPORT は `NV_ERR_NOT_SUPPORTED`（直接表示は無い）で、
+  アプリは窓を通して描き、起動画面へ戻ったデスクトップがそれを合成する。
 - **カーソル**：絵を出している間は、システムのポインター（状態の 32×32 の画素、位置、hot spot）をカーソルの面へ写し、
   モードの画素に直した位置でカーソル層に出す。デスクトップの面にはポインターが描かれているのでカーソルは消す。
 - **状態スレッド**：`n_pci_screen_state` で変化を待ち、システムが新しいモードを望めばそれを出し（上の 7〜8）、

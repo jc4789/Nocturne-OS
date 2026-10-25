@@ -70,3 +70,7 @@ int64_t pci_user_acpi_notify_take(struct handle *h, int64_t timeout_ms);
    when no driver holds it, or its app is already being stopped. Only asks the screen watch thread
    to stop it, so key handlers may call it from an interrupt. */
 bool pci_user_screen_take_back(void);
+/* Whether a display driver's scanout is where the screen is drawn (n_pci_give_screen): Ctrl+Alt+Esc
+   then asks that driver for the boot screen (gui/wm.c, struct n_screen_state take_back). Takes no
+   lock. */
+bool pci_user_screen_driven(void);

@@ -74,7 +74,7 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
 | P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
 | P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
-| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目（2026-10-25、2 回起動）は nvrm の面への移行・モード設定・垂直帰線による歩調まで誤りの行なく進んだが、主モニター（Acer X27U Z1、QD-OLED、DP）は暗いまま戻らなかった。原因は不明。モードは起動画面と同じ 1920×1080 59.940 Hz で、設定アプリでは変えられなかった（C65 で修理）。7 回目は未実施 |
+| P10 | 実機確認（ユーザー） | ユーザー | 進行中：1 回目（2026-10-20、RTX 4070）は rm_init_rm の中で `mov %cr4` の GPF（C35）。2 回目は rm_init_adapter まで進み、BAR0 の二重写像の表明（C36）と上流ポートが見つからない（C37）の後、ログが止まった。どちらも修理済み。3 回目（2026-10-24、IOMMU 有効、USB 起動）は `RmInitX86Emu` が `0xA0000` を写せず停止（C50 で修理）。4 回目は GSP の起動と `RmInitAdapter` が成功し、NVKMS の VT 切替えで nvrm が落ちた（C61 で修理）。5 回目は nvrm が落ちずにクライアントを受け付けたが、最初のモード設定で書かれない完了通知を待って表示を手放し（C62 で修理）、WebGL は softpipe のまま理由がログに無かった（C63 で記録を足した）。6 回目（2026-10-25、2 回起動）は nvrm の面への移行・モード設定・垂直帰線による歩調まで誤りの行なく進んだが、主モニター（Acer X27U Z1、QD-OLED、DP）は暗いまま戻らなかった。原因は不明。モードは起動画面と同じ 1920×1080 59.940 Hz で、設定アプリでは変えられなかった（C65 で修理）。7 回目（2026-10-25、2 回起動）は 2560×1440 59.951 Hz が誤りの行なく点いたことになっているが、どのモニターも暗いままで、何も変わらなかった。0a1d812a（C62）が点けるモード設定の完了を待たなくしたことが原因と仮定して監査し、C62 の却下が誤りと分かった（C66 で修理）。8 回目は未実施 |
 
 ## 4. 主張の表
 
@@ -142,10 +142,11 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C59 | ACPI の評価は claim の範囲なら何でもよく、通知のスレッドは RM の ACPI の初期化と終わりで開始・停止してよい | 却下 → 修理済み（実機未確認） | 範囲の中でも `_PS0`〜`_PS3`、`_ON_`、`_OFF`、`_RST`、`_EJ0`〜`_EJ4`、`_OSC`、`_INI`、`_REG`、`_PTS`、`_WAK` などシステムが装置と機械を動かす 28 の方法は、カーネルの電源管理と PCI の把握を裏から変える。今は `N_ERR_DENIED`（上流のブリッジは独自名もすべて）。通知のスレッドは `nv_acpi_methods_uninit`（RM の API と GPU の錠を持ったまま）で join していたので、`rm_acpi_notify` で錠を待つスレッドと互いに待ちえた。今は `nv_start_device` と同じく `rm_init_adapter` の後に開始し、`rm_request_dnotifier_state` を呼び、`rm_disable_adapter` の前に錠の外で止める。RM が扱わない値は渡さない（RM は表明で止まる）。pcitest に拒否の試験 |
 | C60 | 直接表示の間も、パニック画面はカーネルの出力先へ描けば見える | 却下 → 修理済み（実機未確認） | 直接表示の間、表示エンジンはアプリの絵を出していて、カーネルが止まると戻す者がいない。カーネルはデスクトップの面にしか描かないので、パニックは画面に出なかった。新しい ABI `n_pci_screen_image`／`_end`（ABI 文書 §9）で、nvrm は絵の BAR1 の写しを登録し、カーネルはパニック画面を登録された面すべてへも描く（`fb.c` の `fb_present_last`、`N_SCANOUT_XBGR8888`）。登録できない絵は作らない。確認：host 試験（登録できないとき・BAR1 のひと続きでないときに絵を作らない）、QEMU の pcitest（登録・終わり・拒否）、QEMU で NMI によるパニックを目視（VGA の第二のバッファーを XBGR8888 の画像として登録して表示、パニック画面がそこに赤と青の入れ替わった色で描かれ、デスクトップの面には元の色で描かれる。§7） |
 | C61 | 動的電源管理は移植しなくても、mode が NEVER なら RM は電源管理の状態に触れない | 却下 → 修理済み（実機未確認） | 実機 4 回目、`RmInitAdapter` と GSP の起動は成功したが、NVKMS の読込みの直後に nvrm がページフォールトで落ちた（`rip=0x708784` は `portSyncMutexAcquire`、呼出し元 `0x46ef16` は `RmUpdateGc6ConsoleRefCount`、記号は同じ材料を `-s` 無しで再リンクして引いた）。NVKMS が画面を取るときの VT 切替え（`NV0080_CTRL_OS_UNIX_VT_SWITCH`、SAVE_VT_STATE）は、mode を見ずに `console_device` が真なら電源管理の錠を取る。錠を作る `rm_init_dynamic_power_management` を移植が呼んでおらず、一方で `os_pci.c` が `console_device` を真にしていたので、NULL の錠を取った。修理：`nvrm.c` で上流の probe／remove と同じ位置に `rm_init_dynamic_power_management`（`rm_init_private_state` と `rm_init_event_locks` の後）、`rm_enable_dynamic_power_management`（probe の最後、割り込みと `rm_init_adapter` の前）、`rm_cleanup_dynamic_power_management`（NVKMS と `rm_shutdown_adapter` の後、`rm_free_private_state` の前）を呼ぶ。`console_device` は RM が起動画面（`nv_get_screen_info`）から決める（`os_pci.c` の設定を外した）。`nv_dynamic_power_available` は偽なので mode は NEVER のままで、GPU を止めることは無い。確認：host 試験、全体ビルド、記号付きの再リンクの逆アセンブルで呼出しの順を確かめた。QEMU には NVIDIA の GPU が無く、この経路は通らない |
-| C62 | head を点けるモード設定も、層の完了通知でフリップの完了を待てる | 却下 → 修理済み（実機未確認） | 実機 5 回目、最初のモード設定の後に「the flip on head 0 has not completed after 3000 ms」、続いて「the mode set did not complete」と表示の持ち主の解放。NVKMS が起動画面を復元し、二台のモニター（HP の DP と Acer の HDMI）に同じ画面が出た。表示エンジンが層の完了通知を書くのは、commit の前に点いていた head の、面を出していた層だけ（nvidia-drm も `old_crtc_state->active && old_plane_state->fb` のときだけフリップのイベントを数える）。点けるモード設定には書かれない通知を待っていた。NVKMS のモード設定は同期で、戻った時点で済んでいる。修理：`display.c` は点いている head の面の差し替えだけを待ち、点けるモード設定・面を外す commit（失った head）・失敗した commit は待たない。待ったフリップが 3 秒で完了しなければ、以後はフリップを待たず直接表示もやめる（`scr.flips_unseen`、CREATE と PRESENT は `NV_ERR_NOT_SUPPORTED`、出ていた絵からはデスクトップへ）。host 試験の偽の KAPI に実機の規則を入れた（直す前の `display.c` はこの偽物で `nvrm_display_start` から失敗し、実機の症状を再現した） |
+| C62 | head を点けるモード設定も、層の完了通知でフリップの完了を待てる | 受理（0a1d812a の却下は誤り、C66 で待つ形へ戻した） | 監査（2026-10-25）：KAPI は面を層へ置くすべての commit に完了通知を名指す（`nvkms-kapi.c` の 3050〜3052 行は `surfaceChanged` か `bFromKmsSetMode` のとき `completionNotifier.specified`、3200〜3238 行で通知の面と番号を入れる。NVKMS は `nvkms-hw-flip.c` から `nvAssignCompletionNotifierEvoHwState` で表示エンジンへ渡す）。点けるモード設定も例外ではなく、3 秒で書かれなければ、その面は表示エンジンに届いていない。下の却下の根拠の一つは nvidia-drm（Linux のドライバー）で、参照は禁止（AGENTS.md）。0a1d812a は待たないことで、見えない画面を成功として扱い、5 回目のように起動画面へ戻る道を無くした（6・7 回目の暗いまま）。以下は当時の却下の記録：実機 5 回目、最初のモード設定の後に「the flip on head 0 has not completed after 3000 ms」、続いて「the mode set did not complete」と表示の持ち主の解放。NVKMS が起動画面を復元し、二台のモニター（HP の DP と Acer の HDMI）に同じ画面が出た。表示エンジンが層の完了通知を書くのは、commit の前に点いていた head の、面を出していた層だけ（nvidia-drm も `old_crtc_state->active && old_plane_state->fb` のときだけフリップのイベントを数える）。点けるモード設定には書かれない通知を待っていた。NVKMS のモード設定は同期で、戻った時点で済んでいる。修理：`display.c` は点いている head の面の差し替えだけを待ち、点けるモード設定・面を外す commit（失った head）・失敗した commit は待たない。待ったフリップが 3 秒で完了しなければ、以後はフリップを待たず直接表示もやめる（`scr.flips_unseen`、CREATE と PRESENT は `NV_ERR_NOT_SUPPORTED`、出ていた絵からはデスクトップへ）。host 試験の偽の KAPI に実機の規則を入れた（直す前の `display.c` はこの偽物で `nvrm_display_start` から失敗し、実機の症状を再現した） |
 | C63 | Mesa・Zink・NVK が GPU を使わなかった理由はログで分かる | 却下 → 修理済み（実機未確認） | 実機 5 回目、nvrm は「serving clients」まで進んだが、WebGL は「Mesa softpipe」で、System.log に Mesa の行が一つも無かった。机上から起動したアプリには stderr が無く、Mesa の既定の出力先は stderr だけ。`vk_error*` は Vulkan のデバッグ記録が無いと何も出さず、nvkmd の拒否は無言、`nocturne_gl.c` の「ログ一行」は実際には無かった。修理：Mesa の記録の出力先にシステムの記録を足す（`util/log.c`、`MESA_LOG=system`）。`nocturne_gl.c` は GPU で描くか・使えない理由（`nvrm_connect_ready_status` の結果）・Zink が始まらなかったことを、変わったときだけ一行書く。nvkmd は `nnrm_open_device` が止まった段階（RM の制御・物体の名前）と NV_STATUS、または chipset と class を書く。host 試験（mesa_screen、nvk_rm、nvrm_transport） |
 | C64 | `NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE` は MiB | 却下 → 修理済み | RM は KiB で返す（`mem_mgr_gm107.c` は BAR1 の VA 範囲の長さを 1024 で割る）。`nvkmd_nocturne_rm.c` は 1024×1024 を掛けていて、NVK の BAR の大きさが 1024 倍になっていた。RTX 4070 は Resizable BAR で BAR1 が VRAM より大きく、NVK は BAR を VRAM 以上なら別のヒープにしないので、実機では害が出なかったと見られる |
 | C65 | nvrm が点けるモードは起動画面と同じ大きさでよく、利用者がモードを選ぶ経路は要らない | 却下 → 修理済み（実機未確認） | 実機 6 回目、nvrm は起動画面の大きさの 1920×1080 から 59.940 Hz を選んだ（X27U Z1 の推奨は 2560×1440 59.951 Hz、31 モード）。カーネルはデスクトップを起動時の大きさに固定し、設定アプリの「Resolution」は何もしなかった。モードを決めるのは OS と利用者、列挙・検証・適用はドライバー（Windows-driver-samples で役割の境界を確かめた）。修理：カーネルにモニターのモードの持ち主（`kernel/src/gui/screenmode.c`）。ドライバーは見えるモードを出し（`n_pci_screen_modes`、推奨に `N_SCREEN_MODE_PREFERRED`）、システムは、そのモニターに保存された利用者の選択、無ければ推奨のモードを望む（`n_pci_screen_state` の `mode_serial`・`mode`）。ドライバーは点けて結果を返し（`done`・`shown`）、点かなかったモードは断られて次の候補が来る。設定アプリの試用（`SCREEN_MODE_SET`）は 15 秒で前のモードへ戻り、保持すればそのモニターの選択として保存される。デスクトップはスキャンアウトの大きさへ追従する（`wm_screen_resized`、`fb.c` はスキャンアウトごとの大きさ）。`display.c` は望まれたモードの大きさの面を作り、NVKMS の検査 → 面の受け渡し → commit → 古い面の解放の順で、commit が失敗すれば前の面（無ければ起動画面）へ戻す。確認：host 試験（偽の EDID と 8 モード、推奨、起動時の利用者の選択、失敗時に何も渡さない、モニターの出入り、直接表示）、QEMU の pcitest（Bochs VGA に 4 モード：推奨、試用が 15 秒で戻る、すぐ戻す、保持、取下げと再提示、他のモニターの選択、点かなかったモードの拒否）と、デスクトップが 1024×768 へ変わって戻ること、設定アプリの試用のカードを目視。実機で 2560×1440 が点くか、6 回目の暗い画面の原因は未確認 |
+| C66 | 面が表示に見えなくても、直接表示をやめれば利用者はデスクトップを見られる | 却下 → 修理済み（実機未確認） | 実機 6・7 回目はモニターが暗いまま戻らず、利用者に戻る手段が無かった（C65 の監査の残り「最初のモードが暗いときの逃げ道が無い」）。修理：`display.c` の `hand_back` が「表示を返す」唯一の持ち主になった。順序は、望まれたモードの取下げ、起動画面へ戻す（`n_pci_give_screen` の `N_SCANOUT_BOOT`）、垂直帰線を止める、NVKMS の持ち主を手放す（NVKMS は自分のコンソールを復元する）、head の状態を戻す、直接表示と面の解放。点けるモード設定を含め、待ったフリップが 3 秒で完了しなければ、完了通知の生の語（状態と時刻）、通知の番号、commit にかかった時間を書いて返す（`nvrm_nvkms_flip_words`）。以後 nvrm は自分の面を出さない（PRESENT・CREATE・IMPORT は `NV_ERR_NOT_SUPPORTED`、モードの追従と再走査もしない）。通知は完了を示すのにモニターに何も映らないときは、利用者が Ctrl+Alt+Esc を押す。カーネルは画面を描かせているドライバーへ起動画面を求め（`struct n_screen_state` の `take_back`、ABI 文書 §9、`wm.c`）、nvrm の状態スレッドはそれを見て `hand_back` する。起動画面が戻れば求めは終わる（`pciuser.c` の `screen_give_back` → `wm_screen_given_back`）。ドライバーが画面を保持していれば従来どおりアプリを止め、どちらでもなければメニューを出す。確認：§7 の 2026-10-25（8）。実機で 3 秒の待ちの後に起動画面かコンソールが見えるか、通知の語の値は未確認 |
 | C51 | claim の後の GPU の DMA は全部 RM のもの | 未確定（観測のみ） | 実機 3 回目、BME を入れた後に `0x2365440` から 32 バイト刻みの書込みと `0x235b000` の読みが IOMMU で遮断された（domain 2、RM の失敗の後も続いた）。RM の DMA オブジェクトではない。UEFI の GOP などが前に設定したエンジンの残りと推測。IOMMU が無ければこの物理メモリに書かれていた。RM が初期化の中でエンジンをリセットした後に止まるかを 4 回目で見る。実機 4 回目：BME を入れてから nvrm が落ちて解放されるまで（`RmInitAdapter` の 5.1 秒を含む）、IOMMU の遮断の行は一つも無かった |
 
 ## 5. 担当と受け渡し
@@ -158,17 +159,23 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 6. 次の一手
 
-1. P10（ユーザー）：RTX 4070 の実機で起動し（7 回目。6 回目は nvrm の面へ移ったが、X27U Z1 は 1920×1080
-   59.940 Hz で暗いままだった）、nvrm が出したモードとシステムが望んだモード（System.log の `screen:` の行：
+1. P10（ユーザー）：RTX 4070 の実機で起動し（8 回目。6・7 回目は nvrm の面へ移ったことになっているが、
+   モニターは暗いままだった）、まず次を見る（C62・C66）。
+   - 暗くなったとき、モニターの表示（OSD）が「信号なし」か、信号はあって黒いだけか。
+   - 約 3 秒の後に起動画面か NVKMS のコンソールが戻るか。戻れば nvrm.log の `NVRM display:` に
+     「the flip on head … has not completed … ms after its commit」の行があり、その「completion notifier」の
+     番号と語（1 語目が状態、3・4 語目が時刻。0 のままなら表示エンジンは書いていない）を記録する。
+   - 戻らず暗いままなら Ctrl+Alt+Esc を押し、起動画面が戻るか。System.log の `wm: Ctrl+Alt+Esc` の行と、
+     nvrm.log の「the user asks for the boot screen back」を見る。
+   - 1 回目のように映していたモニターが「is disconnected」になるか（DP のリンクが落ちたか）。
+   以下は 6 回目からの項目：nvrm が出したモードとシステムが望んだモード（System.log の `screen:` の行：
    「monitor …, N modes」「the monitor shows: …」、または「the display driver could not show …」）、
    `NVRM display:` の「the desktop is shown on display … at …」、モニターが 2560×1440 の信号を受けて映るかを見る（C65）。
    映れば設定アプリの Display で別のモード（280 Hz など）を試し、15 秒の試用・保持・戻るを見る。
-   画面が NVKMS の面へ移るか（`NVRM display:` に「the mode set did not
-   complete」が出ず、`fb:` で画面を持ち続け、二台目のモニターが起動画面の写しにならない、C62）と、
    ブラウザーの WebGL が Zink で動くか（System.log の `MESA:` の行：「Nocturne GL: drawing on the GPU with …」なら GPU、
    そうでなければ同じ行の理由と、その前の `ZINK:`・`NVK:` の行、C63）を見る。全画面の直接表示では、
    フリップの完了が届くか（C56：`NVRM display:` に「the flip on head … has not completed」の行が
-   出ないか。出れば以後は直接表示をやめる）と、
+   出ないか。出れば表示を起動画面へ返す、C66）と、
    全画面の窓を閉じた後にデスクトップへ戻るか（C57）を見る。ACPI の拒否（C59）で RM が要る方法を
    断っていないか（`NVRM: ACPI` の行と `N_ERR_DENIED`）も見る。
 2. 実機の結果で C15・C21〜C23・C25・C26・C28 を受理か却下へ。失敗した境界から直す。
@@ -177,6 +184,35 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 7. 記録（新しい順）
 
+- 2026-10-25（8）：実機 7 回目（ユーザー、USB 起動、2 回）。ユーザーの観察：C65 の修理の後も何も変わらず、
+  モニターは暗いまま。`build/qa/realhw7/` の System.log と nvrm.log：1 回目は X27U Z1（DP-1、0x800）が
+  ファームウェアで点灯し、「30 modes offered」「the desktop is shown on display 0x00000800 (head 0) at 2560x1440
+  at 59.951 Hz」まで誤りの行は無かった。UVM の開始の後に「display 0x00000800 is disconnected」となり、KG271U X
+  （HDMI-3、0x100）へ移って同じ 2560×1440 59.951 Hz を点けた。RM の起動中に
+  `pThreadNode->cpuNum == osGetCurrentProcessorNumber() @ thread_state.c:962` の表明が一度出た（表示とは別の件、
+  未調査）。2 回目は HP X27q（DP-2、0x200）で 2560×1440 が点いたことになり、UVM の開始の後は何も無い。
+  ユーザーの指示で、0a1d812a が nvrm と CPU 描画の両方をモニターへつなぎ直せなくしたと仮定して監査した
+  （サブエージェント、0a1d812a の差分と KAPI・NVKMS の該当箇所）。結果：C62 の却下は誤りだった。KAPI は
+  点けるモード設定にも完了通知を名指し、NVKMS はそれを表示エンジンへ渡す。0a1d812a は書かれない通知を
+  待たなくなったのではなく、表示エンジンに届いていない面を「点いた」として扱うようになった。5 回目は 3 秒の
+  待ちの後に持ち主を手放し、NVKMS の復元した起動画面が見えた。6・7 回目はその道が無く、暗いまま残った。
+  修理（C66）：点けるモード設定のフリップも再び待つ。3 秒で完了しなければ通知の生の語を書き、`hand_back` で
+  表示を起動画面と NVKMS のコンソールへ返す（以後 nvrm は自分の面を出さない）。完了したのに映らないときは、
+  利用者が Ctrl+Alt+Esc で返させる（ABI の `take_back`、`wm.c`、`pciuser.c`）。
+  残り：通知が完了を示しても映らない場合の原因（DP のリンク、出力の設定、BAR1 への書込みの見え方）は未確定。
+  1 回目の切断は、点けたモードを X27U Z1 が受けられずにリンクが落ちたとも読める。
+  確認：host 試験（nvrm_display_hosttest：点けるモード設定の通知が来なければ返す、Ctrl+Alt+Esc で返す、
+  返した後は CREATE・PRESENT・IMPORT を断る。nvk_sync_hosttest.py の 3 本、nvrm_dma_hosttest.py の全件）。
+  `tests/pci_hosttest.c` は今回の前から `pci.c` の API と合わずビルドできない（`pci_resume` の引数、
+  `struct pci_reset` の `issued`、`FLR_READY_MS`）。全体ビルド（IMG・VHD・VHDX・ISO）、試験媒体の
+  カーネルとシステムのプログラムがビルドと一致、SDK の `abi.h` に `take_back`。QEMU（WHPX、4 コア、4096 MiB、
+  1920×1080、AHCI の snapshot、`-vga std`・`-device edu`、`appdrivers=any appdrivers-unisolated`）で
+  `pcitest` 0 failed、`pcitest escape=90` 0 failed（HMP の `sendkey ctrl-alt-esc` で System.log に
+  「wm: Ctrl+Alt+Esc: the display driver is asked to give the boot screen back」、take_back が立ち、起動画面へ
+  返した後の受け渡しでは消える。押した前後の画面はデスクトップのままでメニューは開かない）。ドライバーが
+  画面を描かせていないときの Ctrl+Alt+Esc はメニューを開き、Esc で閉じた。マウスの二度押しで設定アプリの
+  Display を開いた（ファームウェアの 1920×1080）。panic・ASSERT の行は無い。画像は `build/qa/escape/`。
+  QEMU には NVIDIA の GPU が無く、C66 の nvrm 側の経路は host 試験だけ。
 - 2026-10-25（7）：実機 6 回目（ユーザー、USB 起動、2 回）。ユーザーの観察：主モニター（Acer X27U Z1、QD-OLED、
   DP、2560×1440 280 Hz、VRR 48〜280 Hz、Windows では 10 ビット）は暗くなったまま戻らなかった。2 回とも
   選ばれたモードは 1920×1080 59.94 Hz。`build/qa/realhw6/` の System.log と nvrm.log：GSP の起動、NVKMS の

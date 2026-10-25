@@ -41,6 +41,9 @@ int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeo
    into the state the driver reads, unless a later wish is there already. */
 struct n_screen_mode;
 void wm_screen_mode(const struct n_screen_mode *mode, uint64_t serial);
+/* The boot screen is where the screen is drawn again (dev/pciuser.c): a Ctrl+Alt+Esc request to
+   the display driver for it (struct n_screen_state take_back) is over. */
+void wm_screen_given_back(void);
 
 /* Remote display: rectangle copies hold WM ownership only for the copy, never
    while encoding or sending a network packet. */

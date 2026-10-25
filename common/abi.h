@@ -377,7 +377,12 @@ struct n_screen_modes {
    While app is not 0 the driver draws the pointer: at pointer_x, pointer_y on the screen (where
    its hot spot goes) when pointer_shown, the image in pointer (rows of N_SCREEN_POINTER_SIZE
    pixels of 0xAARRGGBB, not premultiplied, transparent outside the shape) with its hot spot at
-   hot_x, hot_y; pointer_serial changes when the image does. */
+   hot_x, hot_y; pointer_serial changes when the image does.
+   take_back is not 0 while the user asks for the boot screen back (Ctrl+Alt+Esc), the way out of
+   a display that shows nothing of the desktop: the driver gives it back (n_pci_give_screen with
+   N_SCANOUT_BOOT), shows its display engine's own console or the firmware's framebuffer again and
+   shows nothing of its own until it is started anew. The system clears it once the boot screen is
+   back. */
 #define N_SCREEN_POINTER_SIZE 32u
 struct n_screen_state {
     uint64_t serial;
@@ -385,7 +390,7 @@ struct n_screen_state {
     uint32_t pointer_shown;
     int32_t pointer_x, pointer_y;
     uint32_t hot_x, hot_y;
-    uint32_t pointer_serial, reserved;
+    uint32_t pointer_serial, take_back;
     uint64_t mode_serial;
     struct n_screen_mode mode;
     uint32_t pointer[N_SCREEN_POINTER_SIZE * N_SCREEN_POINTER_SIZE];

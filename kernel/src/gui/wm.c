@@ -478,6 +478,31 @@ int64_t wm_screen_state(uint64_t seen, struct n_screen_state *out, int64_t timeo
     return result;
 }
 
+/* Ctrl+Alt+Esc while a display driver's scanout is where the screen is drawn: that driver is asked
+   (take_back) to give the boot screen back and the display to its own console, the way out of a
+   display that shows nothing of the desktop. Asked once; cleared once the boot screen is back
+   (wm_screen_given_back). Under the WM lock. */
+static bool direct_take_back(void) {
+    if (!pci_user_screen_driven()) return false;
+    if (!direct_state.take_back) {
+        kprintf("wm: Ctrl+Alt+Esc: the display driver is asked to give the boot screen back\n");
+        direct_state.take_back = 1;
+        direct_state.serial++;
+        wq_wake_all(&direct_wq);
+    }
+    return true;
+}
+
+void wm_screen_given_back(void) {
+    wm_lock();
+    if (direct_state.take_back) {
+        direct_state.take_back = 0;
+        direct_state.serial++;
+        wq_wake_all(&direct_wq);
+    }
+    wm_unlock();
+}
+
 /* ---- window lifetime ---- */
 static void unmap_user(struct window *w) {
     if (!w->pml4) return;
@@ -1904,8 +1929,9 @@ static void handle_key(const struct key_event *k) {
     struct window *f = focused();
     if (k->pressed) {
         bool ctrl = k->mods & MOD_CTRL, alt = k->mods & MOD_ALT;
-        /* while an app's driver holds the screen: stop it, the screen comes back (dev/pciuser.c) */
-        if (ctrl && alt && k->key == KEY_ESC && pci_user_screen_take_back()) return;
+        /* while an app's driver holds the screen: stop it, the screen comes back (dev/pciuser.c);
+           while a display driver's scanout shows it: ask that driver for the boot screen */
+        if (ctrl && alt && k->key == KEY_ESC && (pci_user_screen_take_back() || direct_take_back())) return;
         if (k->key == KEY_SUPER || (ctrl && k->key == KEY_ESC)) {
             set_menu(!menu_open);
             return;

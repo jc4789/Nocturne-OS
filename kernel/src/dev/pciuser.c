@@ -231,7 +231,9 @@ static void screen_release(void) {
    One claim at a time shows its surface (screen_owner) and offers modes (screen_modes_from); it
    gives the boot screen back itself, or its claim's end does once the function is stopped. Then
    the boot screen's memory is drawn into again, at its size, though the display engine may no
-   longer show it: the driver that left reprogrammed it and nothing sets it back. */
+   longer show it: the driver that left reprogrammed it and nothing sets it back. The user's
+   Ctrl+Alt+Esc asks the owner to give it back (gui/wm.c, struct n_screen_state take_back), the
+   way out of a display that shows nothing of the desktop. */
 static struct mutex screen_lock; /* the screen's claims, screen_surface and screen_direct change under it */
 static struct pci_claim *screen_owner;
 static struct pci_claim *screen_modes_from;
@@ -281,7 +283,12 @@ static bool screen_give_back(struct pci_claim *c) {
     __atomic_store_n(&screen_owner, NULL, __ATOMIC_RELEASE);
     screen_direct = false;
     wm_screen_resized(fb.width, fb.height);
+    wm_screen_given_back();
     return true;
+}
+
+bool pci_user_screen_driven(void) {
+    return __atomic_load_n(&screen_owner, __ATOMIC_ACQUIRE) != NULL;
 }
 
 /* A driver that is done with its device stops it and then switches bus mastering off: that is

@@ -1,5 +1,5 @@
-/* nvrm's screen (display.h): NVKMS's kernel API (KAPI) used for what nvidia-drm does with it on
- * Linux when it takes the console over, without DRM's objects around it.
+/* nvrm's screen (display.h): the display taken over from the firmware's framebuffer through
+ * NVKMS's kernel API (KAPI), and the system's desktop shown on it.
  *
  *   allocateDevice -> grabOwnership -> declareEventInterest -> getDeviceResourcesInfo
  *   -> RM's boot displays (the ones the firmware lit) -> getDisplays, each display's connector,
@@ -39,10 +39,13 @@
  * system has kept drawing into, and the cursor goes. An image is off the screen, and its last
  * flip away from it complete, before it is freed.
  *
- * nvrm_display_stop undoes it in the opposite order: the modes withdrawn and the boot screen
- * back to the system, then releaseOwnership, with which NVKMS shows the firmware's framebuffer
- * console again (nvkms-console-restore.c), then the images, the cursor, the surface and the
- * device.
+ * hand_back undoes the display's part in the opposite order: the modes withdrawn and the boot
+ * screen back to the system, then releaseOwnership, with which NVKMS shows the firmware's
+ * framebuffer console again (nvkms-console-restore.c). nvrm_display_stop does it, and so does a
+ * running nvrm whose flip is not seen to complete (the display engine may not show what nvrm
+ * gives it) or whose user asks for the boot screen back (Ctrl+Alt+Esc, n_screen_state's
+ * take_back): the screen is then the firmware's again, not a dark display. nvrm_display_stop
+ * frees the images, the cursor, the surface and the device after it.
  *
  * Threads: KAPI's event callback runs on NVKMS's work thread and only wakes this file's
  * display thread, which does the KAPI calls of a reconnection (they take NVKMS's lock). The
@@ -153,9 +156,8 @@ static struct {
     bool flipping;                   /* the last commit that put a surface on a primary layer (flip_head's) has
                                         not been seen to complete */
     uint32_t flip_head;
-    bool flips_unseen;               /* a flip was not seen to complete in FLIP_TIMEOUT_MS: no flip is awaited
-                                        any more, and apps are not shown directly */
-    bool lost;                      /* a flip back to the desktop failed: the head may show no surface (NVKMS
+    uint64_t flip_commit_ns;         /* how long NVKMS took over that commit */
+    bool lost;                    /* a flip back to the desktop failed: the head may show no surface (NVKMS
                                         took a freed image off it) until a flip puts one on it again */
 
     bool sync_ready;                 /* lock, wake and head_lock are initialised */
@@ -710,21 +712,23 @@ static void head_request(uint32_t head, NvKmsKapiDisplay display, const struct N
     primary->flags.dstWHChanged = NV_TRUE;
 }
 
-/* Commits the request. flip is the head whose primary layer it puts a surface on, -1 none or
-   none to await: that flip's completion is awaited by flip_completed (nvkms_kapi_rm.c reads the
-   completion notifier KAPI names in the commit, since KAPI's table does not say). The display
-   engine writes that notifier only for a layer that showed a surface on an active head before the
-   commit (nvidia-drm counts its flip events so too), so flip is -1 for any other. */
+/* Commits the request. flip is the head whose primary layer it puts a surface on, -1 none: that
+   flip's completion is awaited by flip_completed (nvkms_kapi_rm.c reads the completion notifier
+   KAPI names in the commit, since KAPI's table does not say). KAPI names one in every commit that
+   puts a surface on a layer, a mode set's too (nvkms-kapi.c, as it builds the flip request), and
+   NVKMS has the display engine write it (nvkms-hw-flip.c, nvAssignCompletionNotifierEvoHwState),
+   whether or not the layer showed a surface before. */
 static bool commit(int flip) {
-    if (scr.flips_unseen) flip = -1;
     if (flip >= 0) nvrm_nvkms_flip_arm(scr.device, (uint32_t)flip, NVKMS_KAPI_LAYER_PRIMARY_IDX);
     memset(&reply, 0, sizeof reply);
+    uint64_t start = nvrm_now_ns();
     if (!kapi.applyModeSetConfig(scr.device, &request, &reply, NV_TRUE) ||
         reply.flipResult != NV_KMS_FLIP_RESULT_SUCCESS)
         return false; /* nothing flipped: no notifier is written */
     if (flip >= 0) {
         scr.flipping = true;
         scr.flip_head = (uint32_t)flip;
+        scr.flip_commit_ns = nvrm_now_ns() - start;
     }
     return true;
 }
@@ -747,19 +751,29 @@ static bool apply(const char *what, int flip) {
     return true;
 }
 
+static void hand_back(const char *why);
+
 /* The last commit that put a surface on a primary layer has completed. One whose flip is not
-   seen to complete in FLIP_TIMEOUT_MS ends the waiting for good: each later flip would hold the
-   head that long. What a flip takes off the head is still not freed while it is scanned out, as
-   NVKMS takes a surface off the heads before it destroys it. */
+   seen to complete in FLIP_TIMEOUT_MS may have left the display showing nothing of nvrm's, or
+   nothing at all: the screen is handed back (hand_back), so the firmware's framebuffer console
+   NVKMS restores shows the boot screen the system draws again. The notifier's words are logged
+   first, to tell a display engine that did not write it from one whose write is not seen. What a
+   flip takes off the head is not freed while it is scanned out, as NVKMS takes a surface off the
+   heads before it destroys it. */
 static bool flip_completed(void) {
     if (!scr.flipping) return true;
     uint64_t until = nvrm_now_ns() + (uint64_t)FLIP_TIMEOUT_MS * 1000000u;
     while (!nvrm_nvkms_flip_done(scr.device, scr.flip_head, NVKMS_KAPI_LAYER_PRIMARY_IDX)) {
         if (nvrm_now_ns() >= until) {
-            nvrm_log(LOG "the flip on head %u has not completed after %d ms; flips are not awaited any more, and "
-                     "apps are not shown directly", (unsigned)scr.flip_head, FLIP_TIMEOUT_MS);
+            uint32_t slot = 0, words[2][4] = { { 0 } };
+            nvrm_nvkms_flip_words(scr.device, scr.flip_head, NVKMS_KAPI_LAYER_PRIMARY_IDX, &slot, words);
+            nvrm_log(LOG "the flip on head %u has not completed %d ms after its commit, which took NVKMS %llu ms; "
+                     "the primary layer's completion notifier %u, of words %08x %08x %08x %08x and %08x %08x %08x "
+                     "%08x", (unsigned)scr.flip_head, FLIP_TIMEOUT_MS,
+                     (unsigned long long)(scr.flip_commit_ns / 1000000u), (unsigned)slot, words[0][0], words[0][1],
+                     words[0][2], words[0][3], words[1][0], words[1][1], words[1][2], words[1][3]);
             scr.flipping = false;
-            scr.flips_unseen = true;
+            hand_back("nvrm's surface is not seen on the display");
             return false;
         }
         n_sleep_ms(1);
@@ -777,18 +791,15 @@ static void mode_request(NvKmsKapiDisplay display, uint32_t head, const struct N
     head_request(head, display, mode, d);
 }
 
-/* The mode set mode_request made and NVKMS checked, committed. *lit tells whether the commit went
-   through; false is returned too when its flip has not completed. A mode set that lights the
-   head has no flip to await: no surface was shown on it before (commit), and NVKMS returns from
-   a mode set once the display engine has done it. */
+/* The mode set mode_request made and NVKMS checked, committed, with its flip of the desktop's
+   surface onto the head's primary layer awaited. *lit tells whether the commit went through;
+   false is returned too when its flip has not completed (the screen is handed back then). */
 static bool mode_set(NvKmsKapiDisplay display, uint32_t head, const struct NvKmsKapiDisplayMode *mode, bool *lit) {
-    bool layer_shown = scr.head_on && scr.head == head && !scr.lost;
-    *lit = commit(layer_shown ? (int)head : -1);
+    *lit = commit((int)head);
     if (!*lit) {
         nvrm_log(LOG "the mode set failed (flip result %d)", (int)reply.flipResult);
         return false;
     }
-    if (!layer_shown) scr.flipping = false;
     scr.head_on = true;
     scr.head = head;
     scr.display = display;
@@ -878,8 +889,7 @@ static bool show(struct image *image, const struct n_screen_state *st) {
         c->dstY = (NvS16)y;
         c->flags.dstXYChanged = NV_TRUE;
     }
-    /* A lost head may show no surface: that flip writes no notifier, and nothing left on it is read. */
-    if (!commit(surface_changed && !scr.lost ? (int)scr.head : -1)) {
+    if (!commit(surface_changed ? (int)scr.head : -1)) {
         nvrm_log(LOG "the flip to %s on head %u failed (flip result %d)", image ? "an app's image" : "the desktop",
                  (unsigned)scr.head, (int)reply.flipResult);
         return false;
@@ -904,7 +914,7 @@ static bool show(struct image *image, const struct n_screen_state *st) {
    surface is destroyed, which leaves the head without a surface: scr.lost, and the desktop is
    flipped back once the image is gone (recover). */
 static void take_off(struct image *image) {
-    if (image == scr.shown && !show(NULL, NULL)) {
+    if (image == scr.shown && !show(NULL, NULL) && scr.head_on) { /* not after hand_back: nothing is shown */
         nvrm_log(LOG "image %u is still shown; NVKMS takes it off the head as it is freed", (unsigned)image->number);
         scr.lost = true;
     }
@@ -989,11 +999,44 @@ static void give_boot(void) {
     if (r < 0) nvrm_log(LOG "the system does not take the boot screen back: %s", n_result_text(r));
 }
 
+/* The screen back to the system and the display to NVKMS's console, for good: the modes
+   withdrawn (the system chooses none for a display nvrm no longer shows), the boot screen drawn
+   again, then releaseOwnership, with which NVKMS shows its console surface (the firmware's
+   framebuffer) on the boot displays again (nvkms.c RestoreConsole), or hands the display back to
+   RM without one. Apps' images are not shown any more, and the desktop's surface is freed; the
+   state thread ends, and nothing is followed until nvrm starts again. why, when not NULL, is
+   logged first. Under head_lock, or by the main thread while no other thread runs. */
+static void hand_back(const char *why) {
+    if (why) nvrm_log(LOG "%s; the boot screen goes back to the system and the display to NVKMS's console", why);
+    if (offered.count) {
+        memset(&offer, 0, sizeof offer);
+        n_result r = n_pci_screen_modes(nvrm_dev.pci, &offer);
+        if (r < 0) nvrm_log(LOG "the system keeps the display's modes: %s", n_result_text(r));
+    }
+    memset(&offered, 0, sizeof offered);
+    give_boot();
+    vblank_off();
+    if (scr.owner) {
+        kapi.releaseOwnership(scr.device);
+        nvrm_log(LOG "display ownership released; NVKMS restores the boot screen");
+        scr.owner = false;
+    }
+    scr.head_on = false;
+    scr.display = scr.target = 0;
+    scr.shown = scr.leaving = NULL; /* nothing of nvrm's is shown any more */
+    scr.flipping = scr.lost = false;
+    scr.cursor_on = false;
+    direct_off();
+    desk_free(&scr.desk);
+    __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
+}
+
 /* km, one of kmodes, shown on the offered display with a surface of its size for the desktop: a
    new one when the size changes, given to the system between NVKMS's check of the mode set and
    its commit, so the desktop is drawn at that size by the time the head shows it. True when the
    head shows km. When the commit fails, the head shows what it showed before, and the system
-   draws into what it drew into before (the boot screen, when nvrm had no surface yet). */
+   draws into what it drew into before (the boot screen, when nvrm had no surface yet); when its
+   flip is not seen to complete, the screen has been handed back (flip_completed). */
 static bool mode_show(const struct NvKmsKapiDisplayMode *km) {
     NvKmsKapiDisplay display = scr.target;
     uint32_t head = scr.target_head, width = km->timings.hVisible, height = km->timings.vVisible;
@@ -1034,10 +1077,8 @@ static bool mode_show(const struct NvKmsKapiDisplayMode *km) {
         nvrm_log(LOG "display 0x%08x %s", (unsigned)display, scr.head_on ? "shows what it showed before" : "stays dark");
         return false;
     }
-    if (resize) desk_free(&was);
-    /* Lit without its flip seen: the next flip waits for this one again (settle). */
-    if (!flipped)
-        nvrm_log(LOG "display 0x%08x is lit, though its first flip has not been seen to complete", (unsigned)display);
+    if (resize) desk_free(&was); /* hand_back frees the new one */
+    if (!flipped) return false;
     if (!scr.vblank || scr.vblank_head != head) {
         vblank_off();
         vblank_on(head);
@@ -1072,7 +1113,7 @@ static bool modes_offer(bool anew) {
    display, and what the head shows then said back (done), so a mode it could not show is
    refused and the system's next best one comes. The system numbers its wishes upwards; a state
    read before the last wish followed (the state thread's, while mode_follow_now followed a
-   newer one) is not followed back. */
+   newer one) is not followed back, nor anything after hand_back (no modes are offered then). */
 static void mode_follow(const struct n_screen_state *st) {
     if (st->mode_serial <= scr.mode_serial) return;
     scr.mode_serial = st->mode_serial;
@@ -1082,7 +1123,8 @@ static void mode_follow(const struct n_screen_state *st) {
         nvrm_log(LOG "display 0x%08x has no mode %ux%u at %u.%03u Hz", (unsigned)scr.target, (unsigned)st->mode.width,
                  (unsigned)st->mode.height, (unsigned)(st->mode.refresh_mhz / 1000),
                  (unsigned)(st->mode.refresh_mhz % 1000));
-    else mode_show(&kmodes[i]);
+    else if (!mode_show(&kmodes[i]) && !scr.owner)
+        return; /* handed back: the modes are withdrawn */
     offer.done = st->mode_serial;
     if (scr.head_on && scr.display == scr.target && __atomic_load_n(&scr.given, __ATOMIC_ACQUIRE))
         offer.shown = mode_of(&scr.mode);
@@ -1095,7 +1137,7 @@ static void mode_follow(const struct n_screen_state *st) {
 /* The mode the system asks for, read at once and followed until it no longer changes
    (MODE_TRIES at most): after modes are offered anew, without waiting for the state thread. */
 static void mode_follow_now(void) {
-    for (int i = 0; i < MODE_TRIES; i++) {
+    for (int i = 0; i < MODE_TRIES && scr.owner; i++) {
         if (n_pci_screen_state(nvrm_dev.pci, 0, &state_now, 0) < 0 || state_now.mode_serial <= scr.mode_serial) return;
         mode_follow(&state_now);
     }
@@ -1115,8 +1157,9 @@ static void kapi_event(const struct NvKmsKapiEvent *event) {
 /* The offered display still there: its modes again, offered when they changed (another EDID).
    Gone: its head turned off, and the next display's modes offered (none when no display is
    connected). The surface stays the system's throughout; a display lit again shows the desktop
-   until the app shown directly presents its next image. Under head_lock. */
+   until the app shown directly presents its next image. Nothing after hand_back. Under head_lock. */
 static void rescan(void) {
+    if (!scr.owner) return;
     if (scr.target) {
         memset(&dyn, 0, sizeof dyn);
         dyn.handle = scr.target;
@@ -1176,6 +1219,7 @@ static int state_thread(void *unused) {
         if (r == -N_ERR_TIMEOUT) continue;
         if (r < 0) {
             /* Not while nvrm neither shows its surface nor offers modes; looked at again later. */
+            if (__atomic_load_n(&scr.state_stop, __ATOMIC_ACQUIRE)) break; /* handed back */
             if (!refused) nvrm_log(LOG "the system does not say what the screen shows: %s", n_result_text(r));
             refused = true;
             n_sleep_ms(STATE_WAIT_MS);
@@ -1184,8 +1228,12 @@ static int state_thread(void *unused) {
         refused = false;
         seen = state_followed.serial;
         mtx_lock(&scr.head_lock);
-        mode_follow(&state_followed);
-        follow(&state_followed);
+        if (state_followed.take_back) {
+            if (scr.owner) hand_back("the user asks for the boot screen back (Ctrl+Alt+Esc)");
+        } else {
+            mode_follow(&state_followed);
+            follow(&state_followed);
+        }
         mtx_unlock(&scr.head_lock);
     }
     return 0;
@@ -1342,12 +1390,7 @@ n_result nvrm_display_scanout(void *file, uint32_t principal, void *args, uint32
         r->status = NV_ERR_NOT_SUPPORTED; /* images made before direct scanout ended can still be freed */
     else if (r->op != NVRM_SCANOUT_CREATE && (!image || image->app != principal))
         r->status = NV_ERR_INVALID_OBJECT_HANDLE; /* another app's image is not told apart from none */
-    else if (scr.flips_unseen && (r->op == NVRM_SCANOUT_CREATE || r->op == NVRM_SCANOUT_PRESENT)) {
-        /* Flips are not awaited (flip_completed): the app draws through its window again, which the
-           desktop shows, not the app's last image. */
-        if (scr.shown && scr.shown->app == principal) show(NULL, NULL);
-        r->status = NV_ERR_NOT_SUPPORTED;
-    } else if (r->op == NVRM_SCANOUT_CREATE)
+    else if (r->op == NVRM_SCANOUT_CREATE)
         r->status = image_create(principal, file, r);
     else if (r->op == NVRM_SCANOUT_DESTROY) {
         image_free(image);
@@ -1436,6 +1479,10 @@ bool nvrm_display_start(void) {
     if (!offer.count) { why = "the display has no mode NVKMS can show"; goto fail; }
     /* The system asks for its first mode at once: the monitor's preferred one, or the user's. */
     mode_follow_now();
+    if (!scr.owner) {
+        why = "the display was handed back";
+        goto fail;
+    }
     if (!__atomic_load_n(&scr.given, __ATOMIC_ACQUIRE) || !scr.head_on) {
         why = "no mode the system asked for could be shown";
         goto fail;
@@ -1483,32 +1530,9 @@ void nvrm_display_stop(void) {
         thrd_join(scr.thread, NULL);
         scr.thread_running = false;
     }
-    /* The system chooses no mode for a display nvrm no longer shows. */
-    if (offered.count) {
-        memset(&offer, 0, sizeof offer);
-        n_result r = n_pci_screen_modes(nvrm_dev.pci, &offer);
-        if (r < 0) nvrm_log(LOG "the system keeps the display's modes: %s", n_result_text(r));
-    }
-    memset(&offered, 0, sizeof offered);
-    give_boot();
-    vblank_off();
-    if (scr.owner) {
-        /* NVKMS shows its console surface (the firmware's framebuffer) on the boot displays
-           again (nvkms.c RestoreConsole); without one it hands the display back to RM. */
-        kapi.releaseOwnership(scr.device);
-        nvrm_log(LOG "display ownership released; NVKMS restores the boot screen");
-        scr.owner = false;
-    }
-    scr.head_on = false;
-    scr.display = scr.target = 0;
+    hand_back(NULL);
     scr.mode_serial = 0;
-    scr.shown = scr.leaving = NULL;  /* nothing of nvrm's is shown any more */
-    scr.flipping = scr.lost = scr.flips_unseen = false;
-    scr.cursor_on = false;
     while (scr.images) image_free(scr.images);
-    cursor_destroy();
-    scr.direct = false;
-    desk_free(&scr.desk);
     if (scr.events) kapi.declareEventInterest(scr.device, 0);
     scr.events = false;
     if (scr.device) kapi.freeDevice(scr.device);
