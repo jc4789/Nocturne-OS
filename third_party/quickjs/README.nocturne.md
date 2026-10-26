@@ -56,3 +56,16 @@ TypeErrorを返す。input以外はsetterなし、全accessorは非enumerable/co
 RegExpから作成realmへの所有参照には既存の `JS_DupContext`/`JS_FreeContext`
 方式とGC markを使い、context解放時に保持subjectを解放する。補助回帰は
 `tests/js_regexp_legacy_cases.js`。実Baiduの表示・操作受入れとは区別する。
+
+## 関数の元の文の共有
+
+上流は関数ごとに自分の元の文（`Function.prototype.toString` 用）を
+`js_strndup` で写すため、n 段に入れ子になった関数は同じ文を n 回持つ。
+実 YouTube の 10.8 MB の bundle では、別スレッドの翻訳の大半がこの写しと、
+それを bytecode に何重にも書く memcpy だった。
+
+構文解析の入力を、最初に元の文を残す関数が出た時に一度だけ参照数付きの
+`JSFunctionSource` へ写し、各関数はその中の位置と長さを持つ。bytecode には
+同じ文を一度だけ書き、後の関数は番号で指す（`BC_VERSION` 6）。読み戻しは
+番号ごとに一つの写しを作る。toString の結果、行番号、strip の扱いは変えない。
+関数が一つでも生きていれば入力全体が残るが、その量は入力一つ分を超えない。

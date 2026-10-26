@@ -711,6 +711,15 @@ typedef enum JSFunctionKindEnum {
     JS_FUNC_ASYNC_GENERATOR = (JS_FUNC_GENERATOR | JS_FUNC_ASYNC),
 } JSFunctionKindEnum;
 
+/* The text of a script or of eval code. Every function parsed from it keeps
+   its source (for Function.prototype.toString) as a range of this one copy,
+   so that functions nested n deep do not hold the text n times. */
+typedef struct JSFunctionSource {
+    int ref_count;
+    int len;
+    char text[]; /* len bytes and a NUL */
+} JSFunctionSource;
+
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
     uint8_t js_mode;
@@ -745,10 +754,11 @@ typedef struct JSFunctionBytecode {
     struct {
         /* debug info, move to separate structure to save memory? */
         JSAtom filename;
-        int source_len; 
+        int source_start; /* in source->text */
+        int source_len;
         int pc2line_len;
         uint8_t *pc2line_buf;
-        char *source;
+        JSFunctionSource *source;
     } debug;
 } JSFunctionBytecode;
 
@@ -7147,8 +7157,10 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     if (b->has_debug) {
         js_func_size += sizeof(*b) - offsetof(JSFunctionBytecode, debug);
         if (b->debug.source) {
-            memory_used_count++;
-            js_func_size += b->debug.source_len + 1;
+            /* each function counts its share of the text it was parsed from */
+            double refs = b->debug.source->ref_count;
+            hp->memory_used_count += 1 / refs;
+            hp->js_func_size += (sizeof(*b->debug.source) + b->debug.source->len + 1) / refs;
         }
         if (b->debug.pc2line_len) {
             memory_used_count++;
@@ -22535,7 +22547,8 @@ typedef struct JSFunctionDef {
     GetLineColCache *get_line_col_cache; /* XXX: could remove to save memory */
     DynBuf pc2line;
 
-    char *source;  /* raw source, utf-8 encoded */
+    JSFunctionSource *source; /* raw source, utf-8 encoded */
+    int source_start;
     int source_len;
 
     JSModuleDef *module; /* != NULL when parsing a module */
@@ -22581,6 +22594,7 @@ typedef struct JSParseState {
     BOOL allow_html_comments;
     BOOL ext_json; /* JSON parsing: true if accepting JSON superset */
     GetLineColCache get_line_col_cache;
+    JSFunctionSource *source; /* the input, once a function keeps its source */
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -22620,6 +22634,40 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #endif
 
 static __exception int next_token(JSParseState *s);
+
+static void function_source_free(JSRuntime *rt, JSFunctionSource *source)
+{
+    if (source && --source->ref_count == 0)
+        js_free_rt(rt, source);
+}
+
+/* Keeps the text from ptr to end as fd's source: a range of the input, which
+   is copied the first time one of its functions keeps its source. */
+static int js_parse_keep_source(JSParseState *s, JSFunctionDef *fd,
+                                const uint8_t *ptr, const uint8_t *end)
+{
+    if (!s->source) {
+        size_t len = s->buf_end - s->buf_start;
+        if (len > INT32_MAX - sizeof(*s->source) - 1) {
+            JS_ThrowOutOfMemory(s->ctx);
+            return -1;
+        }
+        s->source = js_malloc(s->ctx, sizeof(*s->source) + len + 1);
+        if (!s->source)
+            return -1;
+        s->source->ref_count = 1;
+        s->source->len = len;
+        memcpy(s->source->text, s->buf_start, len);
+        s->source->text[len] = '\0';
+    }
+    if (!fd->source) {
+        fd->source = s->source;
+        s->source->ref_count++;
+    }
+    fd->source_start = ptr - s->buf_start;
+    fd->source_len = end - ptr;
+    return 0;
+}
 
 static void free_token(JSParseState *s, JSToken *token)
 {
@@ -26229,11 +26277,7 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
 
     /* store the class source code in the constructor. */
     if (!fd->strip_source) {
-        js_free(ctx, ctor_fd->source);
-        ctor_fd->source_len = s->buf_ptr - class_start_ptr;
-        ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr,
-                                     ctor_fd->source_len);
-        if (!ctor_fd->source)
+        if (js_parse_keep_source(s, ctor_fd, class_start_ptr, s->buf_ptr))
             goto fail;
     }
 
@@ -32817,7 +32861,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     JS_FreeAtom(ctx, fd->filename);
     dbuf_free(&fd->pc2line);
 
-    js_free(ctx, fd->source);
+    function_source_free(ctx->rt, fd->source);
 
     if (fd->parent) {
         /* remove in parent list */
@@ -33287,7 +33331,8 @@ static __maybe_unused void js_dump_function_bytecode(JSContext *ctx, JSFunctionB
                    NULL, b->var_count,
                    b->closure_var, b->closure_var_count,
                    b->cpool, b->cpool_count,
-                   b->has_debug ? b->debug.source : NULL,
+                   b->has_debug && b->debug.source ?
+                   b->debug.source->text + b->debug.source_start : NULL,
                    NULL, b);
 #if defined(DUMP_BYTECODE) && (DUMP_BYTECODE & 32)
     if (b->has_debug)
@@ -36762,7 +36807,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         dump_byte_code(ctx, 1, fd->byte_code.buf, fd->byte_code.size,
                        NULL, fd->args, fd->arg_count, fd->vars, fd->var_count,
                        fd->closure_var, fd->closure_var_count,
-                       fd->cpool, fd->cpool_count, fd->source,
+                       fd->cpool, fd->cpool_count,
+                       fd->source ? fd->source->text + fd->source_start : NULL,
                        fd->label_slots, NULL);
         printf("\n");
     }
@@ -36781,7 +36827,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         dump_byte_code(ctx, 2, fd->byte_code.buf, fd->byte_code.size,
                        NULL, fd->args, fd->arg_count, fd->vars, fd->var_count,
                        fd->closure_var, fd->closure_var_count,
-                       fd->cpool, fd->cpool_count, fd->source,
+                       fd->cpool, fd->cpool_count,
+                       fd->source ? fd->source->text + fd->source_start : NULL,
                        fd->label_slots, NULL);
         printf("\n");
     }
@@ -36893,6 +36940,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
             b->debug.pc2line_buf = fd->pc2line.buf;
         b->debug.pc2line_len = fd->pc2line.size;
         b->debug.source = fd->source;
+        b->debug.source_start = fd->source_start;
         b->debug.source_len = fd->source_len;
     }
     if (fd->scopes != fd->def_scope_array)
@@ -36988,7 +37036,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     if (b->has_debug) {
         JS_FreeAtomRT(rt, b->debug.filename);
         js_free_rt(rt, b->debug.pc2line_buf);
-        js_free_rt(rt, b->debug.source);
+        function_source_free(rt, b->debug.source);
     }
 
     remove_gc_object(&b->header);
@@ -37574,9 +37622,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 /* save the function source code */
                 /* the end of the function source code is after the last
                    token of the function source stored into s->last_ptr */
-                fd->source_len = s->last_ptr - ptr;
-                fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
-                if (!fd->source)
+                if (js_parse_keep_source(s, fd, ptr, s->last_ptr))
                     goto fail;
             }
             goto done;
@@ -37601,9 +37647,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     }
     if (!fd->strip_source) {
         /* save the function source code */
-        fd->source_len = s->buf_ptr - ptr;
-        fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
-        if (!fd->source)
+        if (js_parse_keep_source(s, fd, ptr, s->buf_ptr))
             goto fail;
     }
 
@@ -37940,6 +37984,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     fail:
         free_token(s, &s->token);
         js_free_function_def(ctx, fd);
+        function_source_free(ctx->rt, s->source);
         goto fail1;
     }
 
@@ -37948,6 +37993,8 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
 
     /* create the function object and all the enclosed functions */
     fun_obj = js_create_function(ctx, fd);
+    /* the functions hold the source they keep */
+    function_source_free(ctx->rt, s->source);
     if (JS_IsException(fun_obj))
         goto fail1;
     /* Could add a flag to avoid resolution if necessary */
@@ -38188,7 +38235,7 @@ typedef enum BCTagEnum {
     BC_TAG_OBJECT_REFERENCE,
 } BCTagEnum;
 
-#define BC_VERSION 5
+#define BC_VERSION 6
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -38207,6 +38254,10 @@ typedef struct BCWriterState {
     int sab_tab_size;
     /* list of referenced objects (used if allow_reference = TRUE) */
     JSObjectList object_list;
+    /* the function source texts written so far */
+    JSFunctionSource **source_tab;
+    int source_tab_len;
+    int source_tab_size;
 } BCWriterState;
 
 #ifdef DUMP_READ_OBJECT
@@ -38509,6 +38560,36 @@ static int JS_WriteBigInt(BCWriterState *s, JSValueConst obj)
 
 static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
 
+/* Which text a function's source is in: 0 for none, n for the nth text
+   written before, or one more than those, followed by the text. Then the
+   function's range in it. The functions of a script share one text, which is
+   written once. */
+static int JS_WriteFunctionSource(BCWriterState *s, JSFunctionBytecode *b)
+{
+    JSFunctionSource *source = b->debug.source;
+    int i;
+
+    if (!source) {
+        bc_put_leb128(s, 0);
+        return 0;
+    }
+    for(i = 0; i < s->source_tab_len && s->source_tab[i] != source; i++)
+        continue;
+    bc_put_leb128(s, i + 1);
+    if (i == s->source_tab_len) {
+        if (js_resize_array(s->ctx, (void **)&s->source_tab,
+                            sizeof(s->source_tab[0]),
+                            &s->source_tab_size, s->source_tab_len + 1))
+            return -1;
+        s->source_tab[s->source_tab_len++] = source;
+        bc_put_leb128(s, source->len);
+        dbuf_put(&s->dbuf, (uint8_t *)source->text, source->len);
+    }
+    bc_put_leb128(s, b->debug.source_start);
+    bc_put_leb128(s, b->debug.source_len);
+    return 0;
+}
+
 static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
 {
     JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
@@ -38581,12 +38662,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_put_atom(s, b->debug.filename);
         bc_put_leb128(s, b->debug.pc2line_len);
         dbuf_put(&s->dbuf, b->debug.pc2line_buf, b->debug.pc2line_len);
-        if (b->debug.source) {
-            bc_put_leb128(s, b->debug.source_len);
-            dbuf_put(&s->dbuf, (uint8_t *)b->debug.source, b->debug.source_len);
-        } else {
-            bc_put_leb128(s, 0);
-        }
+        if (JS_WriteFunctionSource(s, b))
+            goto fail;
     }
 
     for(i = 0; i < b->cpool_count; i++) {
@@ -39018,6 +39095,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
     js_object_list_end(ctx, &s->object_list);
     js_free(ctx, s->atom_to_idx);
     js_free(ctx, s->idx_to_atom);
+    js_free(ctx, s->source_tab);
     *psize = s->dbuf.size;
     if (psab_tab)
         *psab_tab = s->sab_tab;
@@ -39028,6 +39106,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
     js_object_list_end(ctx, &s->object_list);
     js_free(ctx, s->atom_to_idx);
     js_free(ctx, s->idx_to_atom);
+    js_free(ctx, s->source_tab);
     dbuf_free(&s->dbuf);
     *psize = 0;
     if (psab_tab)
@@ -39058,6 +39137,10 @@ typedef struct BCReaderState {
     JSObject **objects;
     int objects_count;
     int objects_size;
+    /* the function source texts read so far */
+    JSFunctionSource **source_tab;
+    int source_tab_len;
+    int source_tab_size;
 
 #ifdef DUMP_READ_OBJECT
     const uint8_t *ptr_last;
@@ -39427,6 +39510,54 @@ static int BC_add_object_ref(BCReaderState *s, JSValueConst obj)
     return BC_add_object_ref1(s, JS_VALUE_GET_OBJ(obj));
 }
 
+/* As JS_WriteFunctionSource wrote it. */
+static int JS_ReadFunctionSource(BCReaderState *s, JSFunctionBytecode *b)
+{
+    JSFunctionSource *source;
+    int idx, len;
+
+    if (bc_get_leb128_int(s, &idx))
+        return -1;
+    if (idx == 0)
+        return 0;
+    if (idx < 0 || idx > s->source_tab_len + 1) {
+        JS_ThrowSyntaxError(s->ctx, "invalid source index (%d)", idx);
+        return s->error_state = -1;
+    }
+    if (idx == s->source_tab_len + 1) {
+        if (bc_get_leb128_int(s, &len))
+            return -1;
+        if (len < 0 || len > s->buf_end - s->ptr)
+            return bc_read_error_end(s);
+        if (js_resize_array(s->ctx, (void **)&s->source_tab,
+                            sizeof(s->source_tab[0]),
+                            &s->source_tab_size, s->source_tab_len + 1))
+            return s->error_state = -1;
+        source = js_malloc(s->ctx, sizeof(*source) + len + 1);
+        if (!source)
+            return s->error_state = -1;
+        source->ref_count = 1; /* the reader's */
+        source->len = len;
+        memcpy(source->text, s->ptr, len);
+        source->text[len] = '\0';
+        s->ptr += len;
+        s->source_tab[s->source_tab_len++] = source;
+        bc_read_trace(s, "source: %d bytes\n", len);
+    }
+    source = s->source_tab[idx - 1];
+    source->ref_count++;
+    b->debug.source = source;
+    if (bc_get_leb128_int(s, &b->debug.source_start) ||
+        bc_get_leb128_int(s, &b->debug.source_len))
+        return -1;
+    if (b->debug.source_start < 0 || b->debug.source_len < 0 ||
+        b->debug.source_start > source->len - b->debug.source_len) {
+        JS_ThrowSyntaxError(s->ctx, "invalid source range");
+        return s->error_state = -1;
+    }
+    return 0;
+}
+
 static JSValue JS_ReadFunctionTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -39599,16 +39730,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
             if (bc_get_buf(s, b->debug.pc2line_buf, b->debug.pc2line_len))
                 goto fail;
         }
-        if (bc_get_leb128_int(s, &b->debug.source_len))
+        if (JS_ReadFunctionSource(s, b))
             goto fail;
-        if (b->debug.source_len) {
-            bc_read_trace(s, "source: %d bytes\n", b->source_len);
-            b->debug.source = js_mallocz(ctx, b->debug.source_len);
-            if (!b->debug.source)
-                goto fail;
-            if (bc_get_buf(s, (uint8_t *)b->debug.source, b->debug.source_len))
-                goto fail;
-        }
         bc_read_trace(s, "}\n");
     }
     if (b->cpool_count != 0) {
@@ -40158,6 +40281,9 @@ static void bc_reader_free(BCReaderState *s)
         js_free(s->ctx, s->idx_to_atom);
     }
     js_free(s->ctx, s->objects);
+    for(i = 0; i < s->source_tab_len; i++)
+        function_source_free(s->ctx->rt, s->source_tab[i]);
+    js_free(s->ctx, s->source_tab);
 }
 
 JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
@@ -42097,7 +42223,8 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
     if (js_class_has_bytecode(p->class_id)) {
         JSFunctionBytecode *b = p->u.func.function_bytecode;
         if (b->has_debug && b->debug.source) {
-            return JS_NewStringLen(ctx, b->debug.source, b->debug.source_len);
+            return JS_NewStringLen(ctx, b->debug.source->text + b->debug.source_start,
+                                   b->debug.source_len);
         }
         func_kind = b->func_kind;
     }
