@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: after-compaction-on-track
+expected_outcome: |
+  ユーザーが 35 分前に話し、目的と次の一手がはっきりしている 3 回目の圧縮から再開した場面では、止まらずに、要約が示す今の段階（実装は済み、QEMU の残りの回帰・LEDGER・コミット）へ進み、古い模型を今に合わせる。模型には目的を測る物差し（120／280 Hz の cube の fps、WebGL のサイトで落ちないこと）が書かれる。
+context:
+  scaffold_script: place-files.sh
