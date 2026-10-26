@@ -8,6 +8,15 @@
 static JSValue native_decode_utf8(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)self;return web_js_decode_utf8(ctx,argc,argv,web_js_prepare_bytes);
 }
+static JSValue native_encode_utf8(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_encode_utf8(ctx,argc,argv,web_js_prepare_bytes);
+}
+static JSValue native_encode_utf8_into(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_encode_utf8_into(ctx,argc,argv);
+}
+static JSValue native_concat_utf8(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_concat_utf8(ctx,argc,argv,web_js_prepare_bytes);
+}
 
 struct data_url_checkpoint { JSContext *ctx; int (*poll)(JSContext *); };
 static bool data_url_checkpoint(void *opaque) {
@@ -42,6 +51,11 @@ done:
 }
 
 void web_js_encoding_init(JSContext *ctx, JSValue host) {
-    static const JSCFunctionListEntry functions[]={JS_CFUNC_DEF("decodeUTF8",5,native_decode_utf8)};
+    static const JSCFunctionListEntry functions[]={
+        JS_CFUNC_DEF("decodeUTF8",5,native_decode_utf8),
+        JS_CFUNC_DEF("encodeUTF8",1,native_encode_utf8),
+        JS_CFUNC_DEF("encodeUTF8Into",4,native_encode_utf8_into),
+        JS_CFUNC_DEF("concatUTF8",1,native_concat_utf8)
+    };
     JS_SetPropertyFunctionList(ctx,host,functions,sizeof functions/sizeof *functions);
 }

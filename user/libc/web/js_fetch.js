@@ -40,7 +40,7 @@ const fetchBridge = (() => {
         bodySlots.set(object,body);
     }
     const promiseConstructor=Object.freeze({[Symbol.species]:NativePromise});
-    const U8=Uint8Array, AB=ArrayBuffer, isView=ArrayBuffer.isView;
+    const U8=Uint8Array, AB=ArrayBuffer, isView=ArrayBuffer.isView, taSet=Uint8Array.prototype.set;
     const getter=(proto,key)=>Object.getOwnPropertyDescriptor(proto,key).get;
     const abLength=getter(AB.prototype,'byteLength'), ta=Object.getPrototypeOf(U8.prototype);
     const taBuffer=getter(ta,'buffer'), taOffset=getter(ta,'byteOffset'), taLength=getter(ta,'byteLength');
@@ -208,7 +208,7 @@ const fetchBridge = (() => {
             length=apply(typed?taLength:dvLength,input,[]);
         }
         const size=apply(abLength,buffer,[]),source=new U8(buffer,offset,length===undefined?size:length);
-        const n=apply(taLength,source,[]),result=new U8(n);for(let i=0;i<n;i++)result[i]=source[i];
+        const n=apply(taLength,source,[]),result=new U8(n);apply(taSet,result,[source]);
         return apply(taBuffer,result,[]);
     }
     function isBuffer(input){if(isView(input))return true;try{apply(abLength,input,[]);return true;}catch(_){return false;}}

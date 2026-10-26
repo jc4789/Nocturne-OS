@@ -6,15 +6,15 @@ const blobBridge = (() => {
     const slots=new WeakMap(), files=new WeakMap(), readers=new WeakMap();
     const apply=Reflect.apply, define=Object.defineProperty, create=Object.create;
     const get=WeakMap.prototype.get, put=WeakMap.prototype.set;
-    const U8=Uint8Array, AB=ArrayBuffer, P=Promise, Encoder=TextEncoder, Decoder=TextDecoder,ProgressEventType=ProgressEvent;
-    const encode=Encoder.prototype.encode, decode=Decoder.prototype.decode;
+    const U8=Uint8Array, AB=ArrayBuffer, P=Promise, Decoder=TextDecoder,ProgressEventType=ProgressEvent;
+    const decode=Decoder.prototype.decode;
     const getter=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get;
     const ta=Object.getPrototypeOf(U8.prototype), length=getter(ta,'byteLength');
     const buffer=getter(ta,'buffer'),offset=getter(ta,'byteOffset'),tag=getter(ta,Symbol.toStringTag);
     const abLength=getter(AB.prototype,'byteLength'),isView=AB.isView;
     const dvBuffer=getter(DataView.prototype,'buffer'),dvOffset=getter(DataView.prototype,'byteOffset');
     const dvLength=getter(DataView.prototype,'byteLength'),set=U8.prototype.set;
-    const str=String, wellFormed=String.prototype.toWellFormed, dateNow=Date.now,fromCode=String.fromCharCode,push=Array.prototype.push;
+    const str=String, wellFormed=String.prototype.toWellFormed, concat=host.concatUTF8, subarray=U8.prototype.subarray, dateNow=Date.now,fromCode=String.fromCharCode,push=Array.prototype.push;
     // The engine's real ArrayBuffer constructor uses an INT32_MAX byte length,
     // not an arbitrary per-Blob quota. Backing allocation remains authoritative.
     const LIMIT=0x7fffffff, token={};
@@ -35,24 +35,25 @@ const blobBridge = (() => {
     function parts(values,options){
         if(values===null||(typeof values!=='object'&&typeof values!=='function'))throw new TypeError('Expected BlobPart sequence');
         const method=values[Symbol.iterator];if(typeof method!=='function')throw new TypeError('Blob parts must be iterable');
-        const chunks=[];let total=0;
+        /* 文字列はそのまま、バイト列は次の iterator 呼出しでの変更/transfer より前に snapshot を取り、
+           最後に UTF-8 への変換と連結を一度に native で行う。Blob の bytes は変更されない。 */
+        const chunks=[];
         for(const part of {[Symbol.iterator]:()=>apply(method,values,[])}){
-            let chunk,existing=apply(get,slots,[part]);
-            if(existing)chunk=existing.bytes;
-            else if(isView(part))chunk=view(part);
-            else {
-                let binary=false;
-                try{apply(abLength,part,[]);binary=true;}catch(_){}
-                if(binary)chunk=view(part);
-                else {let text=apply(wellFormed,string(part),[]);if(options.endings==='native')text=text.replace(/\r\n|\r/g,'\n');chunk=apply(encode,new Encoder(),[text]);}
+            let chunk=part;
+            if(typeof part!=='string'){
+                const existing=apply(get,slots,[part]);
+                if(existing)chunk=existing.bytes;
+                else if(isView(part))chunk=copy(view(part));
+                else {
+                    let binary=false;
+                    try{apply(abLength,part,[]);binary=true;}catch(_){}
+                    chunk=binary?copy(view(part)):string(part);
+                }
             }
-            const n=apply(length,chunk,[]);
-            if(n>LIMIT-total)throw new RangeError('Blob byte length is not representable by ArrayBuffer');
-            /* 入力iteratorの次の呼出しによる変更/transferより前にsnapshotを取る。 */
-            apply(push,chunks,[copy(chunk)]);total+=n;
+            if(typeof chunk==='string'&&options.endings==='native')chunk=chunk.replace(/\r\n|\r/g,'\n');
+            apply(push,chunks,[chunk]);
         }
-        const bytes=new U8(total);let at=0;
-        for(let i=0;i<chunks.length;i++){const chunk=chunks[i];apply(set,bytes,[chunk,at]);at+=apply(length,chunk,[]);}return bytes;
+        return new U8(concat(chunks));
     }
     function options(value){
         const o=dictionary(value),e=o.endings,endings=e===undefined?'transparent':string(e);
@@ -79,8 +80,7 @@ const blobBridge = (() => {
         slice(start=0,end=undefined,contentType=''){
             const s=state(this),n=apply(length,s.bytes,[]),a=integer(start),b=end===undefined?n:integer(end),type=mime(contentType);
             const first=a<0?Math.max(n+a,0):Math.min(a,n),last=b<0?Math.max(n+b,0):Math.min(b,n);
-            const count=Math.max(last-first,0),bytes=new U8(count);
-            for(let i=0;i<count;i++)bytes[i]=s.bytes[first+i];return make(bytes,type);
+            return make(apply(subarray,s.bytes,[first,Math.max(last,first)]),type);
         }
         arrayBuffer(){return read(this,'arrayBuffer');}
         bytes(){return read(this,'bytes');}

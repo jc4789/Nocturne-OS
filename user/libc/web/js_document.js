@@ -66,11 +66,11 @@
             return implementation;
         }});
         for(const key of ['documentElement','head','body','doctype','activeElement','title','URL','documentURI','referrer','baseURI','contentType','characterSet','compatMode']){
-            const descriptor={configurable:true,enumerable:true,get(){brand(this);return dom('get',this,key);}};
+            const descriptor={configurable:true,enumerable:true,get(){brand(this);return domGet(this,key);}};
             if(key==='title')descriptor.set=function(value){brand(this);dom('set',this,key,string(value));};
             Object.defineProperty(Document.prototype,key,descriptor);
         }
-        for(const key of ['charset','inputEncoding'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return dom('get',this,'characterSet');}});
+        for(const key of ['charset','inputEncoding'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return domGet(this,'characterSet');}});
         for(const key of ['defaultView','location','currentScript'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return this!==document?null:key==='defaultView'?globalThis:key==='location'?location:host.current();}});
         Object.defineProperty(Document.prototype,'readyState',{configurable:true,get(){brand(this);return this===document?host.ready():'complete';}});
         function treeCollection(owner,key,query){

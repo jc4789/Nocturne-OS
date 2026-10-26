@@ -44,7 +44,7 @@ const streamBridge=(()=>{
         return new ReadableStream({type:'bytes',pull(controller){
             try{check();const count=Math.min(65536,source.length-at);
                 if(!count){controller.close();return;}
-                const chunk=new U8(count);for(let i=0;i<count;i++)chunk[i]=source[at+i];
+                const chunk=new U8(count);apply(set,chunk,[new U8(apply(buffer,source,[]),at,count)]);
                 at+=count;controller.enqueue(chunk);if(at===source.length){source=null;controller.close();}
             }catch(e){source=null;controller.error(e);}
         },cancel(){source=null;}},{highWaterMark:0});

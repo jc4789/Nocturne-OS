@@ -50,7 +50,7 @@
                     let selectionStart=get(this,'start'),selectionEnd=get(this,'end');
                     if (arguments.length===1) { start=selectionStart;end=selectionEnd; }
                     if (start>end) throw new DOMException('The start endpoint exceeds the end endpoint','IndexSizeError');
-                    const value=dom('get',this,'value');
+                    const value=domGet(this,'value');
                     start=Math.min(start,value.length);end=Math.min(end,value.length);
                     /* JS slicing preserves half-surrogate boundaries exactly.
                        The value setter stores the result in the native control. */

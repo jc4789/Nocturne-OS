@@ -5,6 +5,8 @@
     const domOperations=host.domOperations || Object.fromEntries(
         ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
+    // Reading never runs custom element reactions: getters go to the native operation directly.
+    const domGet=domOperations.get;
     function validateInsertion(parent,child,before) {
         if(!rawDom.isNode(null,parent) || !rawDom.isNode(null,child) ||
             before!=null && !rawDom.isNode(null,before))throw new TypeError('Node arguments are required');
@@ -13,12 +15,11 @@
             status===2?'NotFoundError':'HierarchyRequestError');
     }
     let customElementsReady = false;
-    function dom(...args) {
-        const op = args[0];
+    function dom(op, ...args) {
         const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'replace' || op === 'replaceAll' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
-            (op === 'attrNS' && args.length > 4) ||
-            ((op === 'attr' || op === 'style') && args.length > 3);
-        return mutation && customElementsReady && customElementsBridge.active() ? customElementsBridge.reactions(() => rawDom(...args)) : rawDom(...args);
+            (op === 'attrNS' && args.length > 3) ||
+            ((op === 'attr' || op === 'style') && args.length > 2);
+        return mutation && customElementsReady && customElementsBridge.active() ? customElementsBridge.reactions(() => domOperations[op](...args)) : domOperations[op](...args);
     }
     // IDL reflection always addresses the null namespace; getAttribute remains
     // a qualified-name lookup and may find an explicitly namespaced attribute.
@@ -385,21 +386,21 @@
     }
     class Node extends EventTarget {
         constructor() { super(); throw new TypeError('Use document.createElement/createTextNode'); }
-        get nodeType() { return dom('get',this,'nodeType'); }
-        get nodeName() { return dom('get',this,'nodeName'); }
-        get nodeValue() { return dom('get',this,'nodeValue'); }
+        get nodeType() { return domGet(this,'nodeType'); }
+        get nodeName() { return domGet(this,'nodeName'); }
+        get nodeValue() { return domGet(this,'nodeValue'); }
         set nodeValue(v) { dom('set',this,'nodeValue',v == null ? '' : String(v)); }
-        get parentNode() { return dom('get',this,'parentNode'); }
+        get parentNode() { return domGet(this,'parentNode'); }
         get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
-        get firstChild() { return dom('get',this,'firstChild'); }
-        get lastChild() { return dom('get',this,'lastChild'); }
-        get nextSibling() { return dom('get',this,'nextSibling'); }
-        get previousSibling() { return dom('get',this,'previousSibling'); }
+        get firstChild() { return domGet(this,'firstChild'); }
+        get lastChild() { return domGet(this,'lastChild'); }
+        get nextSibling() { return domGet(this,'nextSibling'); }
+        get previousSibling() { return domGet(this,'previousSibling'); }
         get childNodes() { return collectionBridge.children(this,false); }
-        get ownerDocument() { return dom('get',this,'ownerDocument'); }
-        get baseURI() { return dom('get',this,'baseURI'); }
-        get isConnected() { return dom('get',this,'isConnected'); }
-        get textContent() { return dom('get',this,'textContent'); }
+        get ownerDocument() { return domGet(this,'ownerDocument'); }
+        get baseURI() { return domGet(this,'baseURI'); }
+        get isConnected() { return domGet(this,'isConnected'); }
+        get textContent() { return domGet(this,'textContent'); }
         set textContent(v) { dom('set',this,'textContent',v == null ? '' : String(v)); }
         appendChild(child) { validateInsertion(this,child,null);dom('insert',this,child,null); return child; }
         insertBefore(child,before) { if(arguments.length<2)throw new TypeError('Two insertion arguments are required');validateInsertion(this,child,before);dom('insert',this,child,before==null?null:before); return child; }
@@ -484,8 +485,8 @@
         after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),next); } }
         replaceWith(...nodes) { replaceChildNode(this,nodes); }
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
-        get localName() { return dom('get',this,'localName'); }
-        get namespaceURI() { return dom('get',this,'namespaceURI'); }
+        get localName() { return domGet(this,'localName'); }
+        get namespaceURI() { return domGet(this,'namespaceURI'); }
         get id() { return reflectedAttr(this,'id') || ''; }
         set id(v) { reflectedAttr(this,'id',String(v)); }
         get className() { return reflectedAttr(this,'class') || ''; }
@@ -497,10 +498,10 @@
         removeAttribute(name) { dom('attr',this,String(name),null); }
         hasAttribute(name) { return this.getAttribute(name) !== null; }
         toggleAttribute(name,force) { let on=this.hasAttribute(name); on=force===undefined?!on:!!force; if(on)this.setAttribute(name,'');else this.removeAttribute(name); return on; }
-        getAttributeNames() { return dom('get',this,'attributeNames'); }
-        get innerHTML() { return dom('get',this,'innerHTML'); }
+        getAttributeNames() { return domGet(this,'attributeNames'); }
+        get innerHTML() { return domGet(this,'innerHTML'); }
         set innerHTML(v) { dom('set',this,'innerHTML',String(v)); }
-        get outerHTML() { return dom('get',this,'outerHTML'); }
+        get outerHTML() { return domGet(this,'outerHTML'); }
         set outerHTML(value) {
             if(rawDom.get(this,'nodeType')!==1)throw new TypeError('Element receiver required');
             const markup=value===null?'':elementURL.string(value);
@@ -544,13 +545,13 @@
         get offsetTop() { return dom('geometry',this,'offsetTop'); }
         get offsetWidth() { return dom('geometry',this,'offsetWidth'); }
         get offsetHeight() { return dom('geometry',this,'offsetHeight'); }
-        get value() { return dom('get',this,'value'); }
+        get value() { return domGet(this,'value'); }
         set value(v) { dom('set',this,'value',String(v)); }
-        get checked() { return dom('get',this,'checked'); }
+        get checked() { return domGet(this,'checked'); }
         set checked(v) { dom('set',this,'checked',!!v); }
-        get selectedIndex() { return dom('get',this,'selectedIndex'); }
+        get selectedIndex() { return domGet(this,'selectedIndex'); }
         set selectedIndex(v) { dom('set',this,'selectedIndex',Number(v)); }
-        get selected() { return dom('get',this,'selected'); }
+        get selected() { return domGet(this,'selected'); }
         set selected(v) { dom('set',this,'selected',!!v); }
         get disabled() { return reflectedAttr(this,'disabled')!==null; }
         set disabled(v) { reflectedAttr(this,'disabled',v?'':null); }
@@ -572,29 +573,29 @@
     Object.defineProperty(HTMLUnknownElement.prototype,Symbol.toStringTag,{value:'HTMLUnknownElement',configurable:true});
     class HTMLTemplateElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLTemplateElement);}
-        get content(){return dom('get',this,'templateContent');}
+        get content(){return domGet(this,'templateContent');}
     }
     class HTMLImageElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLImageElement);}
-        get width() { return dom('get',this,'imageWidth'); }
+        get width() { return domGet(this,'imageWidth'); }
         set width(v) { dom('set',this,'imageWidth',v); }
-        get height() { return dom('get',this,'imageHeight'); }
+        get height() { return domGet(this,'imageHeight'); }
         set height(v) { dom('set',this,'imageHeight',v); }
-        get naturalWidth() { return dom('get',this,'imageNaturalWidth'); }
-        get naturalHeight() { return dom('get',this,'imageNaturalHeight'); }
-        get complete() { return dom('get',this,'imageComplete'); }
-        get currentSrc() { return dom('get',this,'imageCurrentSrc'); }
+        get naturalWidth() { return domGet(this,'imageNaturalWidth'); }
+        get naturalHeight() { return domGet(this,'imageNaturalHeight'); }
+        get complete() { return domGet(this,'imageComplete'); }
+        get currentSrc() { return domGet(this,'imageCurrentSrc'); }
         get src() {
-            dom('get',this,'imageBrand'); const value=reflectedAttr(this,'src');
+            domGet(this,'imageBrand'); const value=reflectedAttr(this,'src');
             if(value===null)return '';try{return new URL(value,this.baseURI).href;}catch(_){return value;}
         }
-        set src(v) { dom('get',this,'imageBrand');reflectedAttr(this,'src',String(v)); }
-        get alt() { dom('get',this,'imageBrand');return reflectedAttr(this,'alt')||''; }
-        set alt(v) { dom('get',this,'imageBrand');reflectedAttr(this,'alt',String(v)); }
-        get srcset() { dom('get',this,'imageBrand');return reflectedAttr(this,'srcset')||''; }
-        set srcset(v) { dom('get',this,'imageBrand');reflectedAttr(this,'srcset',String(v)); }
-        get sizes() { dom('get',this,'imageBrand');return reflectedAttr(this,'sizes')||''; }
-        set sizes(v) { dom('get',this,'imageBrand');reflectedAttr(this,'sizes',String(v)); }
+        set src(v) { domGet(this,'imageBrand');reflectedAttr(this,'src',String(v)); }
+        get alt() { domGet(this,'imageBrand');return reflectedAttr(this,'alt')||''; }
+        set alt(v) { domGet(this,'imageBrand');reflectedAttr(this,'alt',String(v)); }
+        get srcset() { domGet(this,'imageBrand');return reflectedAttr(this,'srcset')||''; }
+        set srcset(v) { domGet(this,'imageBrand');reflectedAttr(this,'srcset',String(v)); }
+        get sizes() { domGet(this,'imageBrand');return reflectedAttr(this,'sizes')||''; }
+        set sizes(v) { domGet(this,'imageBrand');reflectedAttr(this,'sizes',String(v)); }
         decode() { return Promise.resolve().then(()=>dom('imageDecode',this)); }
     }
     function Image() {
@@ -606,7 +607,7 @@
     Object.defineProperty(Image,'prototype',{value:HTMLImageElement.prototype,writable:false});
     class HTMLInputElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLInputElement);}
-        get form(){return dom('get',this,'form:input');}
+        get form(){return domGet(this,'form:input');}
         get defaultValue(){return reflectedAttr(this,'value')||'';}
         set defaultValue(v){reflectedAttr(this,'value',String(v));}
         get defaultChecked(){return reflectedAttr(this,'checked')!==null;}
@@ -614,33 +615,33 @@
     }
     class HTMLButtonElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLButtonElement);}
-        get form(){return dom('get',this,'form:button');}
+        get form(){return domGet(this,'form:button');}
     }
     class HTMLSelectElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLSelectElement);}
-        get form(){return dom('get',this,'form:select');}
+        get form(){return domGet(this,'form:select');}
     }
     class HTMLTextAreaElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLTextAreaElement);}
-        get form(){return dom('get',this,'form:textarea');}
+        get form(){return domGet(this,'form:textarea');}
         get defaultValue(){return this.textContent||'';}
         set defaultValue(v){this.textContent=v==null?'':String(v);}
     }
     class HTMLFieldSetElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLFieldSetElement);}
-        get form(){return dom('get',this,'form:fieldset');}
+        get form(){return domGet(this,'form:fieldset');}
     }
     class HTMLObjectElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLObjectElement);}
-        get form(){return dom('get',this,'form:object');}
+        get form(){return domGet(this,'form:object');}
     }
     class HTMLOutputElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLOutputElement);}
-        get form(){return dom('get',this,'form:output');}
+        get form(){return domGet(this,'form:output');}
     }
     class HTMLOptionElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLOptionElement);}
-        get form(){return dom('get',this,'form:option');}
+        get form(){return domGet(this,'form:option');}
         get defaultSelected(){return reflectedAttr(this,'selected')!==null;}
         set defaultSelected(v){reflectedAttr(this,'selected',v?'':null);}
     }
@@ -671,7 +672,7 @@
             if(!arguments.length)throw new TypeError('Script type required');
             type=elementURL.string(type);return type==='classic'||type==='module'||type==='importmap';
         }
-        get async(){htmlElementBrand(this,'script');return !!dom('get',this,'async');}
+        get async(){htmlElementBrand(this,'script');return !!domGet(this,'async');}
         set async(v){htmlElementBrand(this,'script');dom('set',this,'async',!!v);}
         get defer(){htmlElementBrand(this,'script');return reflectedAttr(this,'defer')!==null;}
         set defer(v){htmlElementBrand(this,'script');reflectedAttr(this,'defer',v?'':null);}
@@ -847,9 +848,9 @@
         }
     }
     class DocumentType extends Node {
-        get name(){return dom('get',this,'doctypeName');}
-        get publicId(){return dom('get',this,'publicId');}
-        get systemId(){return dom('get',this,'systemId');}
+        get name(){return domGet(this,'doctypeName');}
+        get publicId(){return domGet(this,'publicId');}
+        get systemId(){return domGet(this,'systemId');}
     }
     function copyElementMembers(proto, names) {
         for (const name of names) Object.defineProperty(proto, name, Object.getOwnPropertyDescriptor(Element.prototype, name));
@@ -869,12 +870,12 @@
     Object.setPrototypeOf(document,HTMLDocument.prototype);
     /* Configurable: these move to Document.prototype at the end of bootstrap. */
     Object.defineProperties(document, {
-        documentElement:{configurable:true,get(){return dom('get',document,'documentElement');}},
-        head:{configurable:true,get(){return dom('get',document,'head');}}, body:{configurable:true,get(){return dom('get',document,'body');}},
-        title:{configurable:true,get(){return dom('get',document,'title');},set(v){dom('set',document,'title',String(v));}},
+        documentElement:{configurable:true,get(){return domGet(document,'documentElement');}},
+        head:{configurable:true,get(){return domGet(document,'head');}}, body:{configurable:true,get(){return domGet(document,'body');}},
+        title:{configurable:true,get(){return domGet(document,'title');},set(v){dom('set',document,'title',String(v));}},
         URL:{configurable:true,get(){return host.url();}}, documentURI:{configurable:true,get(){return host.url();}},
-        baseURI:{configurable:true,get(){return dom('get',document,'baseURI');}},
-        readyState:{configurable:true,get(){return host.ready();}}, activeElement:{configurable:true,get(){return dom('get',document,'activeElement');}},
+        baseURI:{configurable:true,get(){return domGet(document,'baseURI');}},
+        readyState:{configurable:true,get(){return host.ready();}}, activeElement:{configurable:true,get(){return domGet(document,'activeElement');}},
         defaultView:{configurable:true,value:globalThis}, currentScript:{configurable:true,get(){return host.current();}}
     });
     document.getElementById=id=>dom('id',document,String(id));

@@ -4,9 +4,9 @@
     const apply = Reflect.apply, U8 = Uint8Array, isView = ArrayBuffer.isView;
     const wmGet = WeakMap.prototype.get, wmSet = WeakMap.prototype.set;
     const wsHas = WeakSet.prototype.has, wsAdd = WeakSet.prototype.add;
-    const str = String, charCodeAt = String.prototype.charCodeAt, fromCP = String.fromCodePoint;
+    const str = String, fromCP = String.fromCodePoint;
     const push = Array.prototype.push, join = Array.prototype.join;
-    const nativeDecode = host.decodeUTF8;
+    const nativeDecode = host.decodeUTF8, nativeEncode = host.encodeUTF8, nativeEncodeInto = host.encodeUTF8Into;
     const assign = Object.assign, regexTest = RegExp.prototype.test;
     const utf8Label = /^[\t\n\f\r ]*(?:utf-8|utf8|unicode-1-1-utf-8|unicode11utf8|unicode20utf8|x-unicode20utf8)[\t\n\f\r ]*$/i;
     const getter = (proto, name) => Object.getOwnPropertyDescriptor(proto, name).get;
@@ -20,7 +20,6 @@
     const dvBuffer = getter(DataView.prototype, 'buffer'), dvOffset = getter(DataView.prototype, 'byteOffset');
     const dvLength = getter(DataView.prototype, 'byteLength');
     const state = value => apply(wmGet, slots, [value]);
-    const code = (s, i) => apply(charCodeAt, s, [i]);
     const text = value => { if (typeof value === 'symbol') throw new TypeError('Expected a string'); return str(value); };
     const dictionary = value => {
         if (value == null) return {};
@@ -47,37 +46,12 @@
         const view = new U8(buffer, offset, length === undefined ? size : length);
         return shared && !writable ? new U8(view) : view;
     };
-    function encodeString(s, destination, capacity) {
-        let read = 0, written = 0;
-        while (read < s.length) {
-            let cp = code(s, read), count = 1;
-            if (cp >= 0xd800 && cp <= 0xdbff) {
-                const lo = code(s, read + 1);
-                if (lo >= 0xdc00 && lo <= 0xdfff) { cp = 0x10000 + ((cp - 0xd800) << 10) + lo - 0xdc00; count = 2; }
-                else cp = 0xfffd;
-            } else if (cp >= 0xdc00 && cp <= 0xdfff) cp = 0xfffd;
-            const n = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
-            if (written + n > capacity) break;
-            if (destination) {
-                if (n === 1) destination[written] = cp;
-                else {
-                    destination[written] = (n === 2 ? 0xc0 : n === 3 ? 0xe0 : 0xf0) | (cp >> (6 * (n - 1)));
-                    for (let j = 1; j < n; j++) destination[written + j] = 0x80 | (cp >> (6 * (n - j - 1))) & 63;
-                }
-            }
-            written += n; read += count;
-        }
-        return {read, written};
-    }
     class TextEncoder {
         constructor() { apply(wsAdd, encoders, [this]); }
         get encoding() { encoderBrand(this); return 'utf-8'; }
         encode(input = '') {
             encoderBrand(this);
-            const s = text(input), length = encodeString(s, null, Infinity).written;
-            const output = new U8(length);
-            encodeString(s, output, length);
-            return output;
+            return new U8(nativeEncode(text(input)));
         }
         encodeInto(input, destination) {
             encoderBrand(this);
@@ -85,7 +59,7 @@
             const s = text(input);
             if (apply(tag, destination, []) !== 'Uint8Array') throw new TypeError('Expected Uint8Array');
             const output = bytes(destination, true);
-            return encodeString(s, output, apply(taLength, output, []));
+            return nativeEncodeInto(s, apply(taBuffer, output, []), apply(taOffset, output, []), apply(taLength, output, []));
         }
     }
     class TextDecoder {
