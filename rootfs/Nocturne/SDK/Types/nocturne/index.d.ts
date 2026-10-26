@@ -5,8 +5,8 @@
  *     import { readText, writeText } from "nocturne";
  *
  * Scripts run by js can always import "nocturne". These declarations live in
- * C:\Nocturne\SDK\Types\nocturne, and TypeScript (tsgo) finds them through the
- * type root C:\Nocturne\SDK\Types: "js file.ts" passes it to tsgo, and a
+ * C:\Nocturne\SDK\Types\nocturne, and TypeScript (tsc) finds them through the
+ * type root C:\Nocturne\SDK\Types: "js file.ts" passes it to tsc, and a
  * project made by "js --init" names it in tsconfig.json:
  *
  *     "typeRoots": ["C:\\Nocturne\\SDK\\Types"], "types": ["nocturne"]

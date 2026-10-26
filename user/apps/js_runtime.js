@@ -311,8 +311,8 @@ function notFound(spec, base, why) {
     e.code = 'MODULE_NOT_FOUND';
     return e;
 }
-/* js file.ts runs what tsgo wrote under tsOut, a folder of the temporary folder,
-   at the source's own path below the root inside it: packages, and files tsgo
+/* js file.ts runs what tsc wrote under tsOut, a folder of the temporary folder,
+   at the source's own path below the root inside it: packages, and files tsc
    did not write, are found beside the source. C: is the only drive. */
 const driveRoot = 'C:\\';
 const tsOut = join(host.tempFolder(), 'js-ts');
@@ -482,7 +482,7 @@ internal.fillMeta = (meta, path, main) => {
     };
 };
 
-/* ---- TypeScript: js file.ts type-checks and compiles with tsgo, then runs ---- */
+/* ---- TypeScript: js file.ts type-checks and compiles with tsc, then runs ---- */
 // The type root that holds the declarations of "nocturne" and "nocturne/ui" (its folder nocturne).
 const typeRoot = 'C:\\Nocturne\\SDK\\Types';
 internal.compileTypeScript = path => {
@@ -492,13 +492,13 @@ internal.compileTypeScript = path => {
         '--sourceMap', 'false', '--declaration', 'false'];
     if (kindOf(join(typeRoot, 'nocturne')) === 2) args.push('--typeRoots', typeRoot, '--types', 'nocturne');
     if (host.isTerminal(2)) args.push('--pretty');
-    const status = host.run('tsgo', args);
+    const status = host.run('tsc', args);
     if (status !== 0) host.exit(status < 0 ? 1 : status);
     const js = path.replace(/\.([cm]?)ts$/, (_, m) => `.${m}js`);
     return join(tsOut, js.slice(driveRoot.length));
 };
 
-/* ---- js --init: a TypeScript project for tsgo and js ---- */
+/* ---- js --init: a TypeScript project for tsc and js ---- */
 internal.init = folder => {
     const at = host.complete(folder ?? '.');
     createFolder(at, {recursive: true});
@@ -525,7 +525,7 @@ internal.init = folder => {
         host.writeFile(full, text, false);
         host.write(1, `created  ${full}\n`);
     }
-    host.write(1, `\nBuild with tsgo and run the result:\n  cd ${at}\n  tsgo\n  js dist\\main.js\n` +
+    host.write(1, `\nBuild with tsc and run the result:\n  cd ${at}\n  tsc\n  js dist\\main.js\n` +
         `Or type-check and run one file at once: js src\\main.ts\n`);
 };
 

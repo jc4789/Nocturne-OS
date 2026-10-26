@@ -107,10 +107,6 @@ FT_OBJ := $(patsubst %.c,$(BUILD)/font/%.o,$(FT_C) $(BROTLI_C))
 FTFLAGS := $(filter-out -W%,$(UCFLAGS)) -w -Iports/freetype -Ithird_party/brotli/c/include \
            -DFT2_BUILD_LIBRARY -DFT_CONFIG_OPTIONS_H='"nocturne-ftoption.h"' \
            -DFT_CONFIG_MODULES_H='"nocturne-ftmodule.h"' -DBROTLI_BUILD_PORTABLE
-$(BUILD)/font/%.o: %.c ports/freetype/nocturne-ftoption.h ports/freetype/nocturne-ftmodule.h
-	@mkdir -p $(dir $@)
-	@echo "  FONT $<"
-	@$(CC) $(FTFLAGS) -c $< -o $@
 $(BUILD)/u/user/libc/third_party_ttf.o: UCFLAGS += $(filter -Iports/freetype -DFT%,$(FTFLAGS))
 .PHONY: font-decoders
 font-decoders: $(FT_OBJ) $(BUILD)/u/user/libc/font.o $(BUILD)/u/user/libc/third_party_ttf.o
@@ -118,6 +114,10 @@ FONT_VENDOR_INPUTS := $(wildcard third_party/freetype/src/*/*.c third_party/free
     third_party/freetype/src/*/*/*.c third_party/freetype/src/*/*/*.h \
     third_party/freetype/include/freetype/*.h third_party/freetype/include/freetype/*/*.h \
     third_party/brotli/c/common/*.h third_party/brotli/c/dec/*.h third_party/brotli/c/include/brotli/*.h)
+$(BUILD)/font/%.o: %.c ports/freetype/nocturne-ftoption.h ports/freetype/nocturne-ftmodule.h $(FONT_VENDOR_INPUTS)
+	@mkdir -p $(dir $@)
+	@echo "  FONT $<"
+	@$(CC) $(FTFLAGS) -c $< -o $@
 $(BUILD)/font-container-native.exe: tests/font_container_native.c tests/font_container_native_host.h user/libc/font.c user/libc/font_sfnt.h user/libc/third_party_ttf.c third_party/img/stb_truetype.h $(FT_C) $(BROTLI_C) $(FONT_VENDOR_INPUTS) ports/freetype/nocturne-ftoption.h ports/freetype/nocturne-ftmodule.h
 	@$(CC) -O2 -std=gnu11 -w -D_SSIZE_T_DEFINED=1 -idirafter user/include -Icommon -Ithird_party/img -Ithird_party/freetype/include \
 	    -Iports/freetype -Ithird_party/brotli/c/include -DFT2_BUILD_LIBRARY -include tests/font_container_native_host.h \
@@ -335,10 +335,10 @@ $(PROGRAMS)/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LIBC_RSP
 
 # Go programs (ports/go/README.md), built when GO names a Go toolchain with the
 # Nocturne port: make GO=/path/to/go/bin/go.exe. Without GO, a toolchain in
-# tools/go (a copy or a link) is used; likewise TSGO and tools/typescript-go.
+# tools/go (a copy or a link) is used; likewise TYPESCRIPT and tools/TypeScript.
 # Desktop apps are written in Go and TypeScript, so a full system needs both.
 GO ?= $(if $(wildcard tools/go/bin/go.exe),$(CURDIR)/tools/go/bin/go.exe)
-TSGO ?= $(if $(wildcard tools/typescript-go/go.mod),$(CURDIR)/tools/typescript-go)
+TYPESCRIPT ?= $(if $(wildcard tools/TypeScript/tsc/go.mod),tools/TypeScript)
 ifneq ($(GO),)
 # the MSYS2 shell may not have the Windows folders Go keeps its cache in
 GOCACHE ?= $(CURDIR)/$(BUILD)/go-cache
@@ -353,30 +353,53 @@ $(GO_BINS): $(PROGRAMS)/%: ports/go/apps/%/main.go $(wildcard ports/go/ui/*.go) 
 $(LICENSES)/go/LICENSE:
 	@mkdir -p $(dir $@)
 	@cp "$$("$(GO)" env GOROOT)/LICENSE" $@
-# TSGO: the TypeScript-Go source (ports/tsgo/nocturne.patch applied) -> tsgo
-ifneq ($(TSGO),)
-GO_FILES += $(PROGRAMS)/tsgo $(LICENSES)/typescript-go/LICENSE
-$(PROGRAMS)/tsgo: ports/tsgo/nocturne.patch ports/go/nocturne.patch
+# TYPESCRIPT: Microsoft's TypeScript repository (a path below this folder, the
+# clone left at its commit) -> tsc, TypeScript's compiler written in Go (tsc/).
+# ports/typescript/nocturne.patch is applied to copies of the files it touches
+# under $(BUILD)/typescript and given to Go as an overlay; the clone is not changed.
+ifneq ($(TYPESCRIPT),)
+TS_SRC := $(TYPESCRIPT)/tsc/go.mod $(TYPESCRIPT)/tsc/go.sum $(shell find $(TYPESCRIPT)/tsc/cmd/tsc \
+          $(TYPESCRIPT)/tsc/internal -type f ! -name '*_test.go' ! -path '*/testdata/*')
+TS_PATCHED := $(shell sed -n 's|^+++ b/||p' ports/typescript/nocturne.patch)
+TS_OVERLAY := $(BUILD)/typescript/overlay.json
+$(TS_OVERLAY): ports/typescript/nocturne.patch $(wildcard $(addprefix $(TYPESCRIPT)/,$(TS_PATCHED)))
+	@rm -rf $(BUILD)/typescript/src
+	@for f in $(TS_PATCHED); do mkdir -p $(BUILD)/typescript/src/$$(dirname $$f); \
+	  if [ -f $(TYPESCRIPT)/$$f ]; then cp $(TYPESCRIPT)/$$f $(BUILD)/typescript/src/$$f; fi; done
+	@patch -s -p1 -d $(BUILD)/typescript/src < $<
+	@{ printf '{"Replace":{'; sep=; for f in $(TS_PATCHED); do \
+	  printf '%s"%s":"%s"' "$$sep" "$$(cygpath -m "$(CURDIR)/$(TYPESCRIPT)/$$f")" "$$(cygpath -m "$(CURDIR)/$(BUILD)/typescript/src/$$f")"; \
+	  sep=,; done; printf '}}\n'; } > $@
+GO_FILES += $(PROGRAMS)/tsc $(LICENSES)/typescript/LICENSE.txt
+$(PROGRAMS)/tsc: $(TS_SRC) $(TS_OVERLAY) ports/go/nocturne.patch
 	@mkdir -p $(dir $@)
 	@echo "  GO   $@"
-	@cd "$(TSGO)" && GOOS=nocturne GOARCH=amd64 CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" ./cmd/tsgo
-$(LICENSES)/typescript-go/LICENSE:
-	@mkdir -p $(dir $@)
-	@cp "$(TSGO)/LICENSE" "$(TSGO)/NOTICE.txt" $(dir $@)
+	@cd $(TYPESCRIPT)/tsc && GOOS=nocturne GOARCH=amd64 CGO_ENABLED=0 "$(GO)" build -trimpath \
+	    -overlay "$(CURDIR)/$(TS_OVERLAY)" -o "$(CURDIR)/$@" ./cmd/tsc
+# TypeScript's licence and notice, and beside them those of the modules linked into tsc
+# (go version -m lists them; the module cache escapes capitals as !c)
+$(LICENSES)/typescript/LICENSE.txt: $(TYPESCRIPT)/LICENSE.txt $(TYPESCRIPT)/NOTICE.txt $(PROGRAMS)/tsc
+	@rm -rf $(dir $@) && mkdir -p $(dir $@)
+	@cp $(TYPESCRIPT)/LICENSE.txt $(TYPESCRIPT)/NOTICE.txt $(dir $@)
+	@cache=$$(cygpath -u "$$("$(GO)" env GOMODCACHE)"); "$(GO)" version -m $(PROGRAMS)/tsc | \
+	  while read kind path version sum; do [ "$$kind" = dep ] || continue; \
+	    from="$$cache/$$(echo $$path | sed 's/[A-Z]/!\L&/g')@$$version"; mkdir -p $(dir $@)$$path; \
+	    for f in "$$from"/LICENSE* "$$from"/NOTICE* "$$from"/COPYING*; do [ ! -f "$$f" ] || cp "$$f" $(dir $@)$$path/; done; \
+	    ls $(dir $@)$$path | grep -q . || { echo "no licence for $$path" >&2; exit 1; }; done
 # The desktop apps written in TypeScript (user/apps/*.ts, the toolkit in
 # "nocturne/ui") are type-checked and compiled on the build host, so starting
-# one does not wait for tsgo: user/apps/settings.ts -> C:\Nocturne\System\settings.js,
+# one does not wait for tsc: user/apps/settings.ts -> C:\Nocturne\System\settings.js,
 # run as "js C:\Nocturne\System\settings.js".
 TS_APPS := $(notdir $(basename $(wildcard user/apps/*.ts)))
 TS_BINS := $(addprefix $(PROGRAMS)/,$(addsuffix .js,$(TS_APPS)))
 GO_FILES += $(TS_BINS)
-$(BUILD)/host/tsgo.exe: ports/tsgo/nocturne.patch
+$(BUILD)/host/tsc.exe: $(TS_SRC)
 	@mkdir -p $(dir $@)
 	@echo "  GO   $@"
-	@cd "$(TSGO)" && GOOS= GOARCH= CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" ./cmd/tsgo
-$(BUILD)/apps-ts.stamp: $(BUILD)/host/tsgo.exe user/apps/tsconfig.json $(wildcard user/apps/*.ts) $(wildcard rootfs/Nocturne/SDK/Types/nocturne/*.d.ts)
-	@echo "  TSGO user/apps"
-	@$(BUILD)/host/tsgo.exe -p user/apps/tsconfig.json --pretty false
+	@cd $(TYPESCRIPT)/tsc && GOOS= GOARCH= CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" ./cmd/tsc
+$(BUILD)/apps-ts.stamp: $(BUILD)/host/tsc.exe user/apps/tsconfig.json $(wildcard user/apps/*.ts) $(wildcard rootfs/Nocturne/SDK/Types/nocturne/*.d.ts)
+	@echo "  TSC  user/apps"
+	@$(BUILD)/host/tsc.exe -p user/apps/tsconfig.json --pretty false
 	@touch $@
 $(TS_BINS): $(PROGRAMS)/%.js: $(BUILD)/apps-ts.stamp
 	@mkdir -p $(dir $@)

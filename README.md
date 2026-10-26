@@ -38,7 +38,7 @@ Nocturne 独自のネイティブ API（文書・フォルダー・チャンネ�
 - **ネットワーク**：自前の TCP/IP（TCP の接続と待受け、ウィンドウスケーリング、ループバック）、DHCP、DNS、
   HTTP/1.1・HTTP/2、BearSSL による TLS 1.2。
 - **開発**：OS の中で C をコンパイルする TinyCC、JavaScript・TypeScript の実行環境 `js`、
-  TypeScript 7 のコンパイラー `tsgo`、Go の移植（`GOOS=nocturne`）、ホストからの C++20。
+  TypeScript のコンパイラー `tsc`、Go の移植（`GOOS=nocturne`）、ホストからの C++20。
 - **AI エージェント**：`agent` が HTTPS で LLM につながり、コマンドの実行、C の作成とコンパイル、
   画面の確認までを OS の中で行います。
 - **Hyper-V**：第 2 世代 VM の合成デバイス、統合サービス、拡張セッション（RDP サーバー）。
@@ -148,7 +148,7 @@ POSIX のヘッダー（`unistd.h`、`fcntl.h`、`sys/*.h`）は意図して用�
   ps kill free dmesg lspci clear true false reboot poweroff neofetch fortune moonsay screenshot`
 - **ネットワーク**：`ifconfig`、`ping`、`host`（DNS）、`fetch`（HTTP・HTTPS）。
 - **音**：`beep`（音と旋律）、`play`（WAV）、`volume`。どれもデスクトップからもできることで、スクリプト用です。
-- **開発**：`tcc`、`js`、`tsgo`、`wasm2c`、`cppdemo`。プログラムは `C:\Nocturne\System`（コマンド）と `C:\Programs`
+- **開発**：`tcc`、`js`、`tsc`、`wasm2c`、`cppdemo`。プログラムは `C:\Nocturne\System`（コマンド）と `C:\Programs`
   （デスクトップのアプリ）にあり、C・JavaScript・TypeScript のソースは `C:\Nocturne\SDK\Source\Apps` にあります。
 - **AI**：`agent`（[AI エージェント](#ai-エージェント)）。
 - **デスクトップのアプリ**：端末、ファイル、Web ブラウザー、テキストエディター、ペイント、電卓、時計、
@@ -293,11 +293,12 @@ python -X utf8 scripts/build.py -j 8 cxx                    # Makefile の任意
 - `host\store.exe`：ホストで C: を作り、読み書きし、検査する道具（`store list`、`get`、`put`、`check` など）。
 
 **追加の部品**（無くても OS はビルドできます。ただし電卓は Go、設定と「Nocturne について」は TypeScript で
-書かれているので、揃ったデスクトップには両方が要ります。`tools/go` と `tools/typescript-go` に置けば自動で使います）：
+書かれているので、揃ったデスクトップには両方が要ります。`tools/go` と `tools/TypeScript` に置けば自動で使います）：
 - **Go**（[ports/go](ports/go/README.md)）：Go 1.27.2 に `ports/go/nocturne.patch` を当ててビルドし、
   `make GO=<Go のソース>/bin/go.exe` とすると `ports/go/apps/*` が `C:\Nocturne\System`（電卓は `C:\Programs\Calculator`）に入ります。
-- **TypeScript-Go**（[ports/tsgo](ports/tsgo/README.md)）：さらに `TSGO=<TypeScript-Go のソース>` を付けると
-  `C:\Nocturne\System\tsgo` が入ります。`js file.ts` は tsgo を使います。
+- **TypeScript**（[ports/typescript](ports/typescript/README.md)）：Microsoft の TypeScript のリポジトリー
+  （`tools/TypeScript`、または `TYPESCRIPT=<このフォルダーの下のパス>`）から `C:\Nocturne\System\tsc` が入ります。
+  `js file.ts` は tsc を使います。
 - **virgl**（[ports/virgl](ports/virgl/README.md)）：ホストの QEMU で virtio-gpu を試すときだけ使います（`QEMU_GPU=virgl`）。
 
 ## 試験
@@ -556,14 +557,14 @@ Nocturne の API の上で動きます。ゴルーチンは複数の CPU で動�
 
 ### JavaScript と TypeScript
 
-`js` は端末で JavaScript と TypeScript を動かす実行環境（QuickJS）、`tsgo` は TypeScript 7 の
-公式コンパイラーです（[ports/tsgo](ports/tsgo/README.md)）。
+`js` は端末で JavaScript と TypeScript を動かす実行環境（QuickJS）、`tsc` は TypeScript の
+コンパイラーです（[ports/typescript](ports/typescript/README.md)）。
 
 ```
 js hello.js                 # ES モジュール、CommonJS、JSON
-js app.ts one two           # tsgo で型検査とコンパイルをしてから実行（引数は nocturne.args）
+js app.ts one two           # tsc で型検査とコンパイルをしてから実行（引数は nocturne.args）
 js --init myapp             # package.json、tsconfig.json、src/main.ts を作る
-cd myapp && tsgo && js dist/main.js
+cd myapp && tsc && js dist/main.js
 js -e 'console.log(1 + 2)'  # -p は結果を表示、js - は入力から、js だけで対話プロンプト
 ```
 
@@ -581,7 +582,7 @@ js -e 'console.log(1 + 2)'  # -p は結果を表示、js - は入力から、js 
   ブラウザーと同じ実装です。`fetch` はアプリ内のスレッドで通信し、待つ間も他の処理が進みます。
 - **型**：`nocturne` の型定義は `C:\Nocturne\SDK\Types\nocturne` にあり、`js file.ts` と `js --init` の
   `tsconfig.json` はそこを使います。`js file.ts` は `--strict` で検査し、型の誤りがあれば実行しません
-  （出力は一時フォルダーの `js-ts`、パッケージは元の場所から探します）。TypeScript には `tsgo` を入れたビルドが必要です。
+  （出力は一時フォルダーの `js-ts`、パッケージは元の場所から探します）。TypeScript には `tsc` を入れたビルドが必要です。
 - **終了**：捕まえられなかった例外と処理されなかった Promise の拒否はスタックを表示して状態 1、
   終わらないトップレベルの `await` は状態 13。対話プロンプトでは表示だけして続けます。
 
@@ -664,7 +665,7 @@ kernel/src/   arch/（GDT、IDT、APIC、SMP、FPU、PAT、P ステート、Hype
 user/         libc/（web/ はブラウザーのエンジン）、include/、apps/（アプリ、ブラウザーの補助処理、js の .js）
 rootfs/       C: へ入れるファイル（Nocturne\ はシステムの文書・フォント・型定義、Users\ は見本のファイル）
 host/         ホストの道具（store：C: の作成・読み書き・検査、limine：2 GiB を超えるディスクへの Limine の導入の補い）
-ports/        Nocturne への移植の設定と差分（tcc、go、rust、tsgo、lexbor、freetype、ffmpeg、mesa、nvidia、wabt、virgl）
+ports/        Nocturne への移植の設定と差分（tcc、go、rust、typescript、lexbor、freetype、ffmpeg、mesa、nvidia、wabt、virgl）
 third_party/  取り込んだソース（下のクレジット）
 scripts/      起動ディスク（mkimage.sh、layout.py）と SDK（mksdk.sh）の作成、test.py、qtest.py、setkey.py、hv-*.ps1
 tests/        OS の中の試験（runtests.c とそれがコンパイルするプログラム）、ホストの検査、試験用の素材
@@ -694,7 +695,7 @@ hyperv.ps1    Hyper-V の VM の作成
 - [Lexbor](https://lexbor.com/) 3.1.0（Apache-2.0）。
 - [FreeType](https://freetype.org/) 2.14.3。FreeType Project License（FTL）を選び、代替の GPLv2 は使いません。
   Nocturne の一部は FreeType チームの成果に基づきます。
-- [Brotli](https://github.com/google/brotli) 1.2.0（MIT、WOFF2 用）。
+- [Brotli](https://github.com/google/brotli) 1.2.1（MIT、WOFF2 用）。
 - [FFmpeg](https://ffmpeg.org/) 9.0.2 の一部の復号器（LGPL-2.1 以降、GPL の部分は無効）。
 - [Mesa](https://mesa3d.org/) 26.3.0-devel の GLSL・NIR・softpipe・Zink・Vulkan の実行時・NVK（MIT ほか、
   `third_party/mesa/licenses`）。
@@ -710,7 +711,7 @@ hyperv.ps1    Hyper-V の VM の作成
 **開発**
 - libc++ 18.1.8（Apache-2.0 with LLVM Exceptions、ビルド時に llvm-project から取り出します）。
 - [Go](https://go.dev/) 1.27.2（BSD-3-Clause、`GO=` を指定したときだけ）。
-- [TypeScript](https://github.com/microsoft/typescript) 7.0.2 Apache-2.0
+- [TypeScript](https://github.com/microsoft/typescript) 7.1.0-dev（Apache-2.0、`tools/TypeScript` か `TYPESCRIPT=` があるときだけ）。
 - ビルド時だけ使う Python のモジュール Mako、MarkupSafe、PyYAML（`third_party/python-build`、イメージには入りません）。
 
 **フォント**（どれも SIL Open Font License 1.1。ライセンスは `rootfs/Nocturne/Fonts`）

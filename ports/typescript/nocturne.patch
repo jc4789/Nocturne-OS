@@ -1,0 +1,86 @@
+diff -ruN a/tsc/cmd/tsc/api.go b/tsc/cmd/tsc/api.go
+--- a/tsc/cmd/tsc/api.go
++++ b/tsc/cmd/tsc/api.go
+@@ -7,7 +7,6 @@
+ 	"os"
+ 	"os/signal"
+ 	"strings"
+-	"syscall"
+ 
+ 	"github.com/microsoft/TypeScript/tsc/internal/api"
+ 	"github.com/microsoft/TypeScript/tsc/internal/bundled"
+@@ -77,7 +76,7 @@
+ 
+ 	s := api.NewStdioServer(options)
+ 
+-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
++	ctx, stop := signal.NotifyContext(context.Background(), stopSignals...)
+ 	defer stop()
+ 
+ 	if err := s.Run(ctx); err != nil {
+diff -ruN a/tsc/cmd/tsc/lsp.go b/tsc/cmd/tsc/lsp.go
+--- a/tsc/cmd/tsc/lsp.go
++++ b/tsc/cmd/tsc/lsp.go
+@@ -7,7 +7,6 @@
+ 	"os"
+ 	"os/exec"
+ 	"os/signal"
+-	"syscall"
+ 	"time"
+ 
+ 	"github.com/microsoft/TypeScript/tsc/internal/bundled"
+@@ -47,7 +46,7 @@
+ 	typingsLocation := osvfs.GetGlobalTypingsCacheLocation()
+ 	cwd := tspath.RootedDirectoryPathFromAbsolute(core.Must(os.Getwd()))
+ 
+-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
++	ctx, stop := signal.NotifyContext(context.Background(), stopSignals...)
+ 	defer stop()
+ 
+ 	s := lsp.NewServer(&lsp.ServerOptions{
+diff -ruN a/tsc/cmd/tsc/main.go b/tsc/cmd/tsc/main.go
+--- a/tsc/cmd/tsc/main.go
++++ b/tsc/cmd/tsc/main.go
+@@ -4,7 +4,6 @@
+ 	"context"
+ 	"os"
+ 	"os/signal"
+-	"syscall"
+ 
+ 	"github.com/microsoft/TypeScript/tsc/internal/core"
+ 	"github.com/microsoft/TypeScript/tsc/internal/execute"
+@@ -26,7 +25,7 @@
+ 			return runAPI(args[1:])
+ 		}
+ 	}
+-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
++	ctx, stop := signal.NotifyContext(context.Background(), stopSignals...)
+ 	defer stop()
+ 	result := execute.CommandLine(ctx, newSystem(), args, nil)
+ 	return int(result.Status)
+diff -ruN a/tsc/cmd/tsc/stopsignals.go b/tsc/cmd/tsc/stopsignals.go
+--- a/tsc/cmd/tsc/stopsignals.go
++++ b/tsc/cmd/tsc/stopsignals.go
+@@ -0,0 +1,11 @@
++//go:build !nocturne
++
++package main
++
++import (
++	"os"
++	"syscall"
++)
++
++// stopSignals end a compilation or server early.
++var stopSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
+diff -ruN a/tsc/cmd/tsc/stopsignals_nocturne.go b/tsc/cmd/tsc/stopsignals_nocturne.go
+--- a/tsc/cmd/tsc/stopsignals_nocturne.go
++++ b/tsc/cmd/tsc/stopsignals_nocturne.go
+@@ -0,0 +1,7 @@
++package main
++
++import "os"
++
++// stopSignals end a compilation or server early. Nocturne stops an app
++// outright (AppStop) and delivers no termination signal.
++var stopSignals = []os.Signal{os.Interrupt}

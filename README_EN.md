@@ -36,8 +36,8 @@ general-purpose OS for daily use (see [Limits](#limits)).
   WebAssembly, video (FFmpeg, MSE) and developer tools.
 - **Networking**: its own TCP/IP stack (TCP connect and listen, window scaling, loopback), DHCP, DNS,
   HTTP/1.1 and HTTP/2, and TLS 1.2 through BearSSL.
-- **Development**: TinyCC compiles C inside the OS; `js` runs JavaScript and TypeScript; `tsgo` is the
-  TypeScript 7 compiler; Go is ported (`GOOS=nocturne`); C++20 is cross-compiled from the host.
+- **Development**: TinyCC compiles C inside the OS; `js` runs JavaScript and TypeScript; `tsc` is the
+  TypeScript compiler; Go is ported (`GOOS=nocturne`); C++20 is cross-compiled from the host.
 - **AI agent**: `agent` connects to an LLM over HTTPS and, inside the OS, runs commands, writes and compiles C,
   and looks at the screen to check the result.
 - **Hyper-V**: the synthetic devices of a Generation 2 VM, the integration services and the Enhanced Session
@@ -150,7 +150,7 @@ An ISO C library (`stdio`, `stdlib`, `string`, `math`, `time`, `threads` and so 
 - **Network**: `ifconfig`, `ping`, `host` (DNS) and `fetch` (HTTP and HTTPS).
 - **Sound**: `beep` (tones and melodies), `play` (WAV) and `volume`, for scripts; everything they do can also be
   done from the desktop.
-- **Development**: `tcc`, `js`, `tsgo`, `wasm2c`, `cppdemo`. Programs live in `C:\Nocturne\System` (commands) and
+- **Development**: `tcc`, `js`, `tsc`, `wasm2c`, `cppdemo`. Programs live in `C:\Nocturne\System` (commands) and
   `C:\Programs` (desktop apps); the C, JavaScript and TypeScript sources are in `C:\Nocturne\SDK\Source\Apps`.
 - **AI**: `agent` (see [The AI agent](#the-ai-agent)).
 - **Desktop apps**: Terminal, Files, Web Browser, Text Editor, Paint, Calculator, Clock, System Monitor, Piano,
@@ -294,11 +294,11 @@ Outputs in `build\`:
 - `host\store.exe`: the host tool that makes, reads, writes and checks C: (`store list`, `get`, `put`, `check` and more).
 
 **Optional components** (the OS builds without them, but the calculator is written in Go and Settings and About in
-TypeScript, so a complete desktop needs both; toolchains in `tools/go` and `tools/typescript-go` are used automatically):
+TypeScript, so a complete desktop needs both; toolchains in `tools/go` and `tools/TypeScript` are used automatically):
 - **Go** ([ports/go](ports/go/README.md)): build Go 1.27.2 with `ports/go/nocturne.patch` applied, then
   `make GO=<Go source>/bin/go.exe` puts `ports/go/apps/*` into `C:\Nocturne\System` (the calculator into `C:\Programs\Calculator`).
-- **TypeScript-Go** ([ports/tsgo](ports/tsgo/README.md)): add `TSGO=<TypeScript-Go source>` to get `C:\Nocturne\System\tsgo`.
-  `js file.ts` uses it.
+- **TypeScript** ([ports/typescript](ports/typescript/README.md)): Microsoft's TypeScript repository (`tools/TypeScript`,
+  or `TYPESCRIPT=<a path below this folder>`) gives `C:\Nocturne\System\tsc`. `js file.ts` uses it.
 - **virgl** ([ports/virgl](ports/virgl/README.md)): only for trying virtio-gpu in the host's QEMU (`QEMU_GPU=virgl`).
 
 ## Tests
@@ -554,14 +554,14 @@ desktop app goes in `C:\Programs\<App>`).
 
 ### JavaScript and TypeScript
 
-`js` is a JavaScript and TypeScript runtime for the terminal (QuickJS), and `tsgo` is the official TypeScript 7
-compiler ([ports/tsgo](ports/tsgo/README.md)).
+`js` is a JavaScript and TypeScript runtime for the terminal (QuickJS), and `tsc` is the TypeScript
+compiler ([ports/typescript](ports/typescript/README.md)).
 
 ```
 js hello.js                 # ES modules, CommonJS, JSON
-js app.ts one two           # type-check and compile with tsgo, then run (arguments in nocturne.args)
+js app.ts one two           # type-check and compile with tsc, then run (arguments in nocturne.args)
 js --init myapp             # create package.json, tsconfig.json and src/main.ts
-cd myapp && tsgo && js dist/main.js
+cd myapp && tsc && js dist/main.js
 js -e 'console.log(1 + 2)'  # -p prints the result, js - reads input, js alone starts a prompt
 ```
 
@@ -579,7 +579,7 @@ js -e 'console.log(1 + 2)'  # -p prints the result, js - reads input, js alone s
   thread inside the app, so other work goes on while it waits.
 - **Types**: the `nocturne` type definitions are in `C:\Nocturne\SDK\Types\nocturne`; `js file.ts` and the
   `tsconfig.json` from `js --init` use them. `js file.ts` checks with `--strict` and does not run code with type
-  errors (output goes to `js-ts` in the temporary folder; packages are looked up from the source's location). TypeScript needs a build that includes `tsgo`.
+  errors (output goes to `js-ts` in the temporary folder; packages are looked up from the source's location). TypeScript needs a build that includes `tsc`.
 - **Exit**: an uncaught exception or unhandled Promise rejection prints its stack and exits with status 1; a
   top-level `await` that never finishes exits with 13. The prompt only prints them and carries on.
 
@@ -662,7 +662,7 @@ kernel/src/   arch/ (GDT, IDT, APIC, SMP, FPU, PAT, P-states, Hyper-V detection)
 user/         libc/ (web/ is the browser engine), include/, apps/ (apps, browser helper processes, js's .js files)
 rootfs/       files put on C: (Nocturne\: the system's documents, fonts and type definitions; Users\: samples)
 host/         host tools (store: makes, reads, writes and checks C:; limine: lets Limine's installer handle disks over 2 GiB)
-ports/        build settings and patches for ported code (tcc, go, rust, tsgo, lexbor, freetype, ffmpeg, mesa, nvidia, wabt, virgl)
+ports/        build settings and patches for ported code (tcc, go, rust, typescript, lexbor, freetype, ffmpeg, mesa, nvidia, wabt, virgl)
 third_party/  vendored sources (see Credits)
 scripts/      boot disk (mkimage.sh, layout.py) and SDK (mksdk.sh) builders, test.py, qtest.py, setkey.py, hv-*.ps1
 tests/        the in-OS test suite (runtests.c and the programs it compiles), host-side checks, test material
@@ -693,7 +693,7 @@ parts of them out of date.
 - [Lexbor](https://lexbor.com/) 3.1.0 (Apache-2.0).
 - [FreeType](https://freetype.org/) 2.14.3, under the FreeType Project License (FTL), not the alternative GPLv2.
   Portions of Nocturne are based on the work of the FreeType Team.
-- [Brotli](https://github.com/google/brotli) 1.2.0 (MIT, for WOFF2).
+- [Brotli](https://github.com/google/brotli) 1.2.1 (MIT, for WOFF2).
 - A subset of [FFmpeg](https://ffmpeg.org/) 9.0.2's decoders (LGPL-2.1 or later; the GPL parts are disabled).
 - [Mesa](https://mesa3d.org/) 26.3.0-devel's GLSL, NIR, softpipe, Zink, Vulkan runtime and NVK (MIT and others,
   `third_party/mesa/licenses`).
@@ -710,7 +710,7 @@ parts of them out of date.
 **Development**
 - libc++ 18.1.8 (Apache-2.0 with LLVM Exceptions, extracted from llvm-project at build time).
 - [Go](https://go.dev/) 1.27.2 (BSD-3-Clause, only when built with `GO=`).
-- [TypeScript](https://github.com/microsoft/typescript) 7.0.2  Apache-2.0
+- [TypeScript](https://github.com/microsoft/typescript) 7.1.0-dev (Apache-2.0, only with `tools/TypeScript` or `TYPESCRIPT=`).
 - Build-time Python modules Mako, MarkupSafe and PyYAML (`third_party/python-build`, not in the image).
 
 **Fonts** (all under the SIL Open Font License 1.1; licenses in `rootfs/Nocturne/Fonts`)

@@ -1,9 +1,9 @@
 /* js: runs JavaScript and TypeScript in the terminal (QuickJS).
  *
  *   js FILE [ARGS]     ES module, CommonJS or JSON; .ts/.mts/.cts are type-checked
- *                      and compiled with tsgo first
+ *                      and compiled with tsc first
  *   js -e CODE, -p CODE, js - (input), js (interactive prompt)
- *   js --init [FOLDER] a TypeScript project for tsgo and js
+ *   js --init [FOLDER] a TypeScript project for tsc and js
  *
  * The runtime is JavaScript (js_runtime.js, js_console.js, js_web.js and the
  * browser's DOMException, Encoding, URL and Web Crypto); this file gives it the
@@ -1406,10 +1406,10 @@ static void usage(FILE *f) {
           "       js -p CODE [ARGUMENTS]    run code and print the result\n"
           "       js - [ARGUMENTS]          run the code from the input\n"
           "       js                        interactive prompt (or the input when it is not a terminal)\n"
-          "       js --init [FOLDER]        start a TypeScript project for tsgo and js\n"
+          "       js --init [FOLDER]        start a TypeScript project for tsc and js\n"
           "       js --version\n"
           "Files are ES modules, CommonJS or JSON. A .ts, .mts or .cts file is type-checked\n"
-          "and compiled with tsgo, then run. Programs import the system from \"nocturne\".\n", f);
+          "and compiled with tsc, then run. Programs import the system from \"nocturne\".\n", f);
 }
 
 int main(int argc, char **argv) {
