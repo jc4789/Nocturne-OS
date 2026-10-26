@@ -169,6 +169,17 @@ enum kei_error kei_set_bonus(struct kei_rq *q, struct kei_task *t, uint64_t bonu
     if (t->state == KEI_READY) fix(q, t->pos, q->count);
     return KEI_OK;
 }
+enum kei_error kei_yield(struct kei_rq *q) {
+    if (!q || !q->current) return KEI_BAD;
+    if (!q->count) return KEI_OK;
+    /* decideの交替条件 key_of(current) > key_of(waiting) + retention を満たす最小の位置。
+       譲った主体の先行分だけを捨て、待つ主体の順位と参照時計は変えない。 */
+    struct kei_task *t = q->current;
+    kei_key behind = key_of(q->heap[0]) + q->retention_v + 1 + (kei_key)t->bonus_v;
+    if (behind > vlimit) return KEI_RANGE;
+    if ((kei_key)t->v < behind) t->v = (kei_vtime)behind;
+    return KEI_OK;
+}
 static uint64_t next_crossing(const struct kei_task *current, kei_key target) {
     kei_key needed = target - key_of(current) + 1;
     if (needed <= 0) return 0;

@@ -1555,7 +1555,8 @@ static bool run_http(struct job *j) {
 struct websocket {
     struct job *j;
     net_stream *stream;
-    volatile uint32_t engine, channel, done, stopping;
+    mtx_t engine; /* zeroed: unlocked */
+    volatile uint32_t channel, done, stopping;
     bool close_sent, failed;
     br_hmac_drbg_context mask_random;
     unsigned char *in, *message;
@@ -1584,7 +1585,7 @@ static bool ws_write_locked(struct websocket *ws, const unsigned char *p, size_t
         long sent = ns_try_write(ws->stream, p, n);
         if (sent == -2) {
             if (__atomic_load_n(&ws->stopping, __ATOMIC_ACQUIRE)) return false;
-            ns_engine_unlock(&ws->engine); n_sleep_ms(1); ns_engine_lock(&ws->engine);
+            mtx_unlock(&ws->engine); n_sleep_ms(1); mtx_lock(&ws->engine);
             continue;
         }
         if (sent <= 0) return false;
@@ -1592,7 +1593,7 @@ static bool ws_write_locked(struct websocket *ws, const unsigned char *p, size_t
     }
     while (ns_try_write(ws->stream, NULL, 0) == -2) { /* drain buffered records */
         if (__atomic_load_n(&ws->stopping, __ATOMIC_ACQUIRE)) return false;
-        ns_engine_unlock(&ws->engine); n_sleep_ms(1); ns_engine_lock(&ws->engine);
+        mtx_unlock(&ws->engine); n_sleep_ms(1); mtx_lock(&ws->engine);
     }
     return true;
 }
@@ -1621,9 +1622,9 @@ static bool ws_fail(struct websocket *ws, const char *why) {
 }
 /* Deliver records without the engine lock: the browser may be slow to read. */
 static bool ws_deliver(struct websocket *ws, uint32_t magic, uint32_t code, const void *data, size_t n) {
-    ns_engine_unlock(&ws->engine);
+    mtx_unlock(&ws->engine);
     bool ok = ws_record(ws, magic, code, data, n);
-    ns_engine_lock(&ws->engine);
+    mtx_lock(&ws->engine);
     return ok;
 }
 /* Parse complete server frames from ws->in. 1 continue, 0 closed, -1 failed. */
@@ -1699,7 +1700,7 @@ static int ws_frames(struct websocket *ws) {
 }
 static void ws_reader(void *opaque) {
     struct websocket *ws = opaque;
-    ns_engine_lock(&ws->engine);
+    mtx_lock(&ws->engine);
     int state = ws->in_len ? ws_frames(ws) : 1; /* bytes that followed the handshake */
     while (state == 1 && !__atomic_load_n(&ws->stopping, __ATOMIC_ACQUIRE)) {
         if (ws->in_cap - ws->in_len < 16384 && !ws_grow(&ws->in, &ws->in_cap, ws->in_len + 16384)) {
@@ -1715,7 +1716,7 @@ static void ws_reader(void *opaque) {
         ws->in_len += (size_t)got;
         state = ws_frames(ws);
     }
-    ns_engine_unlock(&ws->engine);
+    mtx_unlock(&ws->engine);
     __atomic_store_n(&ws->done, 1, __ATOMIC_RELEASE);
 }
 /* Opening handshake (RFC 6455 4.1). The browser supplied only a validated
@@ -1851,7 +1852,7 @@ static bool run_websocket(struct job *j) {
                 size_t n = (size_t)record.length;
                 unsigned char *data = malloc(n + 2);
                 if (!data || !read_all(j, data + 2, n)) { free(data); break; }
-                ns_engine_lock(&ws->engine);
+                mtx_lock(&ws->engine);
                 bool sent = true;
                 if (record.magic == WEBNET_SOCKET_MESSAGE) {
                     if (!ws->close_sent) sent = ws_frame_locked(ws, record.code == WEBNET_SOCKET_TEXT ? 1 : 2, data + 2, n);
@@ -1860,7 +1861,7 @@ static bool run_websocket(struct job *j) {
                     data[0] = (unsigned char)(record.code >> 8); data[1] = (unsigned char)record.code;
                     sent = record.code ? ws_frame_locked(ws, 8, data, n + 2) : ws_frame_locked(ws, 8, NULL, 0);
                 }
-                ns_engine_unlock(&ws->engine);
+                mtx_unlock(&ws->engine);
                 free(data);
                 if (!sent) { ws_fail(ws, "WebSocket send failed"); break; }
             }

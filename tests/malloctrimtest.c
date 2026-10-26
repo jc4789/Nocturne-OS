@@ -157,6 +157,24 @@ static int realloc_split_boundaries(void) {
     }
     return 1;
 }
+/* A shrink gives back the tail it no longer needs, as a free block before its live neighbor. */
+static int realloc_shrink_split(void) {
+    unsigned char *small=malloc(256),*tail=malloc(64);
+    check(small && tail && tail==small+span(256),"shrink allocations are laid out contiguously");
+    if(!small || !tail || tail!=small+span(256)){free(small);free(tail);return 0;}
+    mark_bytes(small,64,0x3c);mark_bytes(tail,64,0x4d);
+    unsigned char *shrunk=realloc(small,64);
+    check(shrunk==small && bytes_intact(shrunk,64,0x3c),"a shrink stays in place with its bytes");
+    if(!shrunk){free(small);free(tail);return 0;}
+    blk *b=(blk *)(shrunk-HDR),*r=next_blk(b);
+    check(bsize(b)==span(64) && !(r->size&USED) && r->prev==span(64) && bsize(r)==span(256)-span(64) &&
+          next_blk(r)==(blk *)(tail-HDR) && next_blk(r)->prev==bsize(r),"the freed tail has exact size and consistent boundary tags");
+    unsigned char *reused=malloc(span(256)-span(64)-HDR);
+    check(reused==(unsigned char *)r+HDR,"the freed tail is on the free list");
+    check(bytes_intact(shrunk,64,0x3c) && bytes_intact(tail,64,0x4d),"reusing the freed tail preserves both neighbors");
+    free(reused);free(shrunk);free(tail);
+    return 1;
+}
 #endif
 
 /* A request that leaves exactly 2 KiB of its fresh region free: the region is
@@ -171,6 +189,7 @@ int main(void) {
     if(!adjacent_realloc())return 1;
 #ifdef MALLOCTRIM_MODEL
     if(!realloc_split_boundaries())return 1;
+    if(!realloc_shrink_split())return 1;
 #endif
 
     /* The newest region keeps one growth quantum warm and returns the rest. */

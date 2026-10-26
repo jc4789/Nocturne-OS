@@ -12,6 +12,8 @@
 #define VIEW_W 1024
 #define VIEW_H 768
 #define CASE_MS 30000u
+/* sha256 NULL: a test named on the command line (--run), served unchanged from the checkout;
+   its hash is printed for the record and any number of cases may report. */
 struct original { const char *path, *sha256; size_t bytes; unsigned tests; };
 static const struct original originals[] = {
     {"/css/cssom-view/elementFromPoint-negative-z-index-inline-overflow-clip.html",
@@ -106,13 +108,13 @@ static const char reference_observer[] =
 
 static bool unchanged(const struct original *o,const struct webnet_response *r) {
     if(!o)return true;
-    if(r->status!=200 || (r->error&&*r->error) || r->body_len!=o->bytes || !r->body)return false;
+    if(r->status!=200 || (r->error&&*r->error) || (o->sha256&&r->body_len!=o->bytes) || !r->body)return false;
     br_sha256_context context; unsigned char digest[32];char hex[65];
     static const char digits[]="0123456789abcdef";
     br_sha256_init(&context);br_sha256_update(&context,r->body,r->body_len);br_sha256_out(&context,digest);
     for(unsigned i=0;i<32;i++){hex[2*i]=digits[digest[i]>>4];hex[2*i+1]=digits[digest[i]&15];}hex[64]=0;
     printf("WPT 原本 %s %zu bytes SHA256 %s\n",o->path,r->body_len,hex);
-    return !strcmp(hex,o->sha256);
+    return !o->sha256||!strcmp(hex,o->sha256);
 }
 static bool copy_response(struct web_response *out,const struct webnet_response *in) {
     memset(out,0,sizeof *out);out->status=in->status;out->event=in->event;out->uploaded=in->uploaded;
@@ -284,8 +286,8 @@ static bool run_case(const char *base,const struct original *original,unsigned *
         n_sleep_ms(1);
     }
     *results+=r.result_count;*failed+=r.failed;
-    ok=r.complete&&r.observer_ready&&r.harness_status==0&&r.result_count==original->tests&&
-        !r.failed&&!r.infrastructure;
+    ok=r.complete&&r.observer_ready&&r.harness_status==0&&
+        (original->sha256?r.result_count==original->tests:r.result_count>0)&&!r.failed&&!r.infrastructure;
 end:
     printf("WPT 終了 %s 完了 %d harness %d ケース %u 失敗 %u 実行基盤失敗 %u elapsed %lu ms %s\n",
         original->path,r.complete,r.harness_status,r.result_count,r.failed,r.infrastructure,
@@ -348,6 +350,17 @@ static int reference_case(const char *base) {
     free(test);free(reference);return infrastructure||mismatches?1:0;
 }
 int main(int argc,char **argv) {
+    unsigned results=0,failed=0,page_failures=0;
+    /* --run <origin> <test path>...: any testharness page of the checkout, unchanged. */
+    if(argc>1&&!strcmp(argv[1],"--run")) {
+        if(argc<4){printf("使用方法: wptperformancetest --run <WPT checkout の HTTP origin> <試験の道>...\n");return 2;}
+        for(int i=3;i<argc;i++) {
+            struct original listed={argv[i],NULL,0,0};
+            if(!run_case(argv[2],&listed,&results,&failed))page_failures++;
+        }
+        printf("WPT %d ページ %u ケース %u 失敗 %u ページ失敗\n",argc-3,results,failed,page_failures);
+        return page_failures?1:0;
+    }
     bool compat=argc>1&&!strcmp(argv[1],"--compat");
     bool module=argc>1&&!strcmp(argv[1],"--modulepreload");
     bool geometry=argc>1&&!strcmp(argv[1],"--observer-geometry");
@@ -362,7 +375,6 @@ int main(int argc,char **argv) {
     if(argc>(mode?3:2)){printf("使用方法: wptperformancetest [--compat|--modulepreload|--observer-geometry|--observer-inline|--flex-invalid|--radius|--radius-computed|--layers|--layers-failed|--text-overflow-ref] [WPT checkout の HTTP origin]\n");return 2;}
     const char *base=argc>(mode?2:1)?argv[mode?2:1]:"http://10.0.2.2:8766/";
     if(ellipsis)return reference_case(base);
-    unsigned results=0,failed=0,page_failures=0;
     unsigned start=layers_failed?20:layers?18:radius_computed?16:radius?14:flex?12:geometry||inline_rect?9:module?8:compat?5:0;
     unsigned count=layers_failed?2:layers?4:radius_computed?1:radius?3:flex||inline_rect?1:geometry?2:module?1:compat?4:3;
     for(unsigned i=start;i<start+count;i++)if(!run_case(base,&originals[i],&results,&failed))page_failures++;

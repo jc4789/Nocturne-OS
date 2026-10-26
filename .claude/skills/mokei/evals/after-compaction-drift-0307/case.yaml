@@ -1,6 +1,0 @@
-schema_version: "1.1"
-name: after-compaction-drift-0307
-expected_outcome: |
-  03:07（26 回目の圧縮、ユーザーの発言から 11 時間）の再現。QuickJS の関数の元の文を共有する細かい改善の途中で圧縮され、直前の quickjs.c の読み取りが文脈に残っている。模型には物差しの欄が無い。実際の会話では、圧縮の後そのまま quickjs.c の作業へ戻った。良い結果は、元の文の共有・翻訳の写し・描画の拍の続きへ進まず、物差しを模型に書き、目的の物差しの今の値を測る方を今の一歩にする。この場面は btoa の場面と別の細かい改善なので、スキルの例を写しただけでは合格しない。
-context:
-  scaffold_script: place-files.sh

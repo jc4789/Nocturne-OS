@@ -111,6 +111,12 @@ int proc_app_result(struct handle *h, uint64_t timeout_ms, int *status) {
     return 0;
 }
 
+bool proc_app_result_ap(struct handle *h, int64_t timeout_ms, int64_t *result) {
+    if (!proc_app_is(h) || timeout_ms != 0 || __atomic_load_n(&app_record(h)->ended, __ATOMIC_ACQUIRE)) return false;
+    *result = -N_ERR_NOT_READY;
+    return true;
+}
+
 /* A new handle on a running app, by the identifier the app list shows. An app
    the kernel started (proc_spawn_simple) gets its record here. */
 int proc_app_open(int pid, struct handle **out) {

@@ -6,6 +6,7 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <threads.h>
 #include "bearssl.h"
 #include "http.h"
 #include "nocturne.h"
@@ -43,11 +44,9 @@ struct tls_session {
     br_ssl_session_parameters parameters;
 };
 static struct tls_session sessions[16];
-static unsigned session_lock;
-static void session_enter(void) {
-    while (__atomic_exchange_n(&session_lock,1,__ATOMIC_ACQUIRE)) yield();
-}
-static void session_leave(void) { __atomic_store_n(&session_lock,0,__ATOMIC_RELEASE); }
+static mtx_t session_lock;
+static void session_enter(void) { mtx_lock(&session_lock); }
+static void session_leave(void) { mtx_unlock(&session_lock); }
 static char *session_key(const char *host,uint16_t port,bool http,const char *partition) {
     size_t h=strlen(host),p=partition?strlen(partition):0;
     if(h>65536 || p>65536-h) return NULL; /* a cache budget, never a request limit */
@@ -440,23 +439,17 @@ long ns_try_read(net_stream *s,void *buf,size_t n) {
     }
     return -2;
 }
-void ns_engine_lock(volatile uint32_t *lock) {
-    while(__atomic_exchange_n(lock,1,__ATOMIC_ACQUIRE))wait_on_address(lock,1,UINT_MAX);
-}
-void ns_engine_unlock(volatile uint32_t *lock) {
-    __atomic_store_n(lock,0,__ATOMIC_RELEASE);wake_address(lock,1);
-}
 /* ns_try_read that sleeps up to timeout_ms for the first transport bytes. A
    timeout is pending (-2), not an error: the TLS engine stays usable. The
    optional engine lock is held by the caller and released only while the
    transport sleeps: received bytes land in the engine's receive half, which
    the send operations of another thread never touch. */
-long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,volatile uint32_t *lock) {
+long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,mtx_t *lock) {
     if(io_cancelled(s))return -1;
     if(!s->tls) {
-        if(lock)ns_engine_unlock(lock);
+        if(lock)mtx_unlock(lock);
         n_result got=tcp_recv(s->sock,buf,n,timeout_ms);
-        if(lock)ns_engine_lock(lock);
+        if(lock)mtx_lock(lock);
         if(got==-N_ERR_NOT_READY||got==-N_ERR_TIMEOUT)return -2;
         if(got<0){errno=(int)-got;snprintf(s->err,sizeof s->err,"%s",n_result_text(got));return -1;}
         return got;
@@ -467,9 +460,9 @@ long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,volatile uint3
         unsigned state=br_ssl_engine_current_state(&s->cc.eng);
         if(!(state&BR_SSL_RECVREC)||(state&BR_SSL_SENDREC))return -2;
         size_t size;unsigned char *p=br_ssl_engine_recvrec_buf(&s->cc.eng,&size);
-        if(lock)ns_engine_unlock(lock);
+        if(lock)mtx_unlock(lock);
         n_result received=tcp_recv(s->sock,p,size,timeout_ms);
-        if(lock)ns_engine_lock(lock);
+        if(lock)mtx_lock(lock);
         if(received==-N_ERR_NOT_READY||received==-N_ERR_TIMEOUT)return -2;
         if(received<=0) {
             snprintf(s->err,sizeof s->err,"TLS transport: %s",n_result_text(transport_failed(s,received)));return -1;

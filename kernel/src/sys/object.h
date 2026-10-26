@@ -16,17 +16,21 @@
 
 struct object;
 struct handle;
-struct object_waiter;
 struct event_watch;
 
-/* One wait for many objects: the waiter registers with each object it waits for, checks its
-   condition, and sleeps on wq unless generation moved on meanwhile. Any change to a registered
-   object moves generation on and wakes the waiter, which then checks again. */
+/* One wait for many objects (an event queue's): it stays registered with each object it watches.
+   Any change to one moves generation on and wakes whoever sleeps on wq or is parked on an AP on
+   generation's word (sched.c's address park), and they check again. */
 struct object_wait {
     struct wait_queue wq;
     uint64_t generation;
-    struct object_waiter *entries;
-    int error;
+};
+
+/* One registration of a wait with one object, embedded in whatever keeps it (a watch, a queue).
+   It holds no reference: its keeper unlinks it before the object can go. */
+struct object_waiter {
+    struct object_waiter *next, **prev;
+    struct object_wait *wait;
 };
 
 struct object_ops {
@@ -36,7 +40,8 @@ struct object_ops {
        the object is not a byte stream. */
     int64_t (*read)(struct handle *h, void *buf, size_t n, bool user, bool wait);
     int64_t (*write)(struct handle *h, const void *buf, size_t n, bool user);
-    /* The N_EVENT_* conditions true for h now; BSP IRQ guard held. NULL: never any. */
+    /* The N_EVENT_* conditions true for h now; BSP IRQ guard held, or an AP read section
+       (arch/smp.h), so it only reads: no lock, wait, allocation or write. NULL: never any. */
     uint32_t (*ready)(struct handle *h);
     /* The handle's last reference is gone (it may sleep: an audio stream plays out). */
     void (*close)(struct handle *h);
@@ -73,13 +78,12 @@ static inline int handle_kind(const struct handle *h) { return h->object->ops->k
 static inline bool handle_is(const struct handle *h, const struct object_ops *ops) {
     return h && h->object->ops == ops;
 }
-uint32_t handle_ready(struct handle *h); /* BSP IRQ guard held */
+uint32_t handle_ready(struct handle *h); /* as ops->ready */
 
-/* Waiting: a registration holds the object (not a handle), so a sibling closing the last handle
-   still wakes the waiter, which then finds it closed. */
+/* Waiting, on the BSP: a change to o notifies every wait registered with it. */
 void object_notify(struct object *o);
-void object_wait_add(struct object_wait *wait, struct object *o);
-void object_wait_end(struct object_wait *wait);
+void object_waiter_link(struct object_waiter *w, struct object_wait *wait, struct object *o);
+void object_waiter_unlink(struct object_waiter *w);
 
 /* The calling app's handle table. handle_get returns a reference (NULL: no such handle);
    handle_peek a borrowed pointer valid only inside the caller's BSP IRQ guard. */

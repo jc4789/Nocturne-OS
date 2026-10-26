@@ -1,7 +1,6 @@
 /* QuickJS runtime memory: the allocator shared by documents and workers. */
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 #include "js_memory.h"
 
 /* Alignment and accounting include the allocation header, not an invented
@@ -39,15 +38,11 @@ static void *qrealloc(JSMallocState *s, void *p, size_t n) {
     size_t old = h->size, total = n + sizeof *h;
     if (n > old && (s->malloc_size > s->malloc_limit || n - old > s->malloc_limit - s->malloc_size)) { allocation_failed(s,total,true);return NULL; }
     if (n == old) return p;
-    /* Nocturne's realloc intentionally keeps the entire adjacent free block
-       when growing in place, and retains capacity when shrinking. QuickJS
-       frequently resizes many small tables: using that policy here makes
-       their physical footprint diverge from the runtime's exact quota.
-       Fit each engine allocation to its requested size without changing the
-       OS allocator or ABI. Accounting stays exact without a per-page quota. */
-    union alloc_header *next = malloc(total);
+    /* realloc grows a block in place when its neighbour is free and gives back the tail a
+       shrink frees, so the footprint follows the exact size the quota counts; a block that
+       cannot grow where it is moves once. */
+    union alloc_header *next = realloc(h, total);
     if (!next) { allocation_failed(s,total,false);return NULL; }
-    memcpy(next + 1, p, old < n ? old : n); free(h);
     next->size = n; s->malloc_size = s->malloc_size - old + n;
     allocation_peak(s);
     return next + 1;

@@ -79,6 +79,9 @@ enum kei_error kei_sleep(struct kei_rq *q, struct kei_task *t);
 enum kei_error kei_destroy(struct kei_rq *q, struct kei_task *t);
 enum kei_error kei_migrate(struct kei_rq *src, struct kei_rq *dst, struct kei_task *t);
 enum kei_error kei_set_bonus(struct kei_rq *q, struct kei_task *t, uint64_t bonus_v);
+/* 現実行が順番を譲る：待つ主体があれば、その先頭より継続幅を超えて後ろへ仮想実行量を
+   進め、次のdecideで替わるようにする。待つ主体が無ければ何もしない。 */
+enum kei_error kei_yield(struct kei_rq *q);
 
 /* decideは文脈を変更しない。commitまで同一排他区間、途中イベント時は再判断。 */
 struct kei_decision kei_decide(const struct kei_rq *q);

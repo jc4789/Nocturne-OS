@@ -30,3 +30,6 @@ void proc_app_ended(struct object *app, int status); /* BSP IRQ guard held */
 int proc_app_pid(struct handle *h); /* 0 once it has ended */
 int proc_app_id(struct handle *h);  /* its identifier, also after its end */
 int proc_app_result(struct handle *h, uint64_t timeout_ms, int *status); /* UINT64_MAX: no limit */
+/* The same in an AP read section (syscall_ap) for a poll of an app still running: true with
+   -N_ERR_NOT_READY. An ended app (its status) and a wait are the BSP's (false). */
+bool proc_app_result_ap(struct handle *h, int64_t timeout_ms, int64_t *result);

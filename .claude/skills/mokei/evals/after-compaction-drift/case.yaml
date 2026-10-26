@@ -1,6 +1,0 @@
-schema_version: "1.1"
-name: after-compaction-drift
-expected_outcome: |
-  ユーザーの発言が 14 時間無いまま 31 回目の圧縮から再開した場面で、前の細かい改善（btoa/atob など）へそのまま戻らず、目的の物差しの今の値を測る・確かめるか、今の値と分かっていることをユーザーに伝える方へ向く。模型には物差しが基準と並んで書かれ、済んだ作業の一覧は無く、未確認の判断は未確認のまま残る。
-context:
-  scaffold_script: place-files.sh

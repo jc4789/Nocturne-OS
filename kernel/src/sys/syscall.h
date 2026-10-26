@@ -5,9 +5,11 @@ struct task;
 void syscall_dispatch(struct regs *r);
 /* An app's syscall on an AP (sched_ap_interrupt), served there when it changes no BSP state:
    identity and clock queries, network copies of mapped memory, polls that find nothing to take
-   or only read a seqcount, and a window's state (AP read sections, arch/smp.h). false: the BSP
-   serves it. */
-bool syscall_ap(struct regs *r);
+   or only read a seqcount, a window's state (AP read sections, arch/smp.h), and the waits that
+   sleep parked on an AP (sched.c's address park): the BSP serves it, or it is done (r->rax holds
+   the result), or the task parks. */
+enum ap_syscall { AP_SYSCALL_BSP, AP_SYSCALL_DONE, AP_SYSCALL_PARK };
+enum ap_syscall syscall_ap(struct regs *r);
 bool user_ok(const void *p, size_t n);   /* the process may read it */
 bool user_ok_w(void *p, size_t n);       /* the process may write it */
 /* Copies between the kernel and the calling app's memory: -N_ERR_BAD_ADDRESS where the app may not. */

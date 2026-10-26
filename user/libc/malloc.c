@@ -414,10 +414,23 @@ static void *realloc_locked(void *p, size_t n) {
         return NULL;
     }
     blk *b = (blk *)((char *)p - HDR);
-    size_t have = bsize(b) - HDR;
-    if (have >= n) return p;
-    blk *nx = next_blk(b);
     size_t need = (n + HDR + 15) & ~(size_t)15;
+    if (need < MIN_BLK) need = MIN_BLK;
+    if (bsize(b) >= need) {
+        /* A shrink gives back the tail it no longer needs, as a free block of its own. */
+        size_t rest = bsize(b) - need;
+        if (rest >= MIN_BLK) {
+            b->size = need | USED;
+            blk *r = next_blk(b);
+            r->size = rest | USED;
+            r->prev = need;
+            next_blk(r)->prev = rest;
+            free_locked((char *)r + HDR);
+        }
+        return p;
+    }
+    size_t have = bsize(b) - HDR;
+    blk *nx = next_blk(b);
     if (!(nx->size & USED) && bsize(b) + bsize(nx) >= need) {
         size_t total = bsize(b) + bsize(nx), rest = total - need;
         fl_remove((fblk *)nx);

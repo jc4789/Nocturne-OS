@@ -1,16 +1,17 @@
 /* HTTP/2 and HPACK, implemented from RFC 9113 and RFC 7541, without OS code.
-   One connection mutex serializes the TLS engine. It is never held during a
-   blocking receive or an application callback. Callers pump bounded frame
-   work, so multiple native request tasks share one wire connection. */
+   One connection mutex serializes the TLS engine. It is never held during an
+   application callback, nor while the reader sleeps in the transport. Callers
+   pump bounded frame work, so multiple native request tasks share one wire
+   connection; while they wait, one of them reads for all (await). */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
 #include <limits.h>
+#include <threads.h>
+#include <time.h>
 #include "http2.h"
 extern uint64_t uptime_ms(void);
-extern void yield(void);
-extern void n_sleep_ms(uint64_t);
 
 /* Each stream may buffer as much as one HTTP/1.1 connection's TCP receive
    storage, so multiplexing never narrows a transfer below the separate
@@ -65,7 +66,13 @@ struct hpack_decoder {
 struct h2_starter { struct h2_starter *next; };
 struct http2_connection {
     net_stream *wire;
-    uint32_t lock,next_id,active,max_streams,max_frame,initial_window;
+    mtx_t lock; /* zeroed: unlocked */
+    /* Waiters sleep on changed until the reader has pumped what arrived or a stream went away;
+       reading: the reader sleeps in the transport, so the others leave it alone. */
+    cnd_t changed; /* zeroed: nobody waits */
+    bool reading;
+    uint64_t received; /* bytes read from the wire so far */
+    uint32_t next_id,active,max_streams,max_frame,initial_window;
     int64_t send_window;
     bool dead,goaway,settings;
     uint32_t continuation;
@@ -90,10 +97,8 @@ struct http2_connection {
     struct hpack_decoder decoder;
     struct h2_starter *start_first,*start_last;
 };
-static void enter(struct http2_connection *c) {
-    while(__atomic_exchange_n(&c->lock,1,__ATOMIC_ACQUIRE))yield();
-}
-static void leave(struct http2_connection *c){__atomic_store_n(&c->lock,0,__ATOMIC_RELEASE);}
+static void enter(struct http2_connection *c){mtx_lock(&c->lock);}
+static void leave(struct http2_connection *c){mtx_unlock(&c->lock);}
 static uint32_t be32(const unsigned char *p){return (uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3];}
 static void put32(unsigned char *p,uint32_t n){p[0]=n>>24;p[1]=n>>16;p[2]=n>>8;p[3]=n;}
 static void stream_fail(struct http2_stream *s,int error,const char *message) {
@@ -101,6 +106,7 @@ static void stream_fail(struct http2_stream *s,int error,const char *message) {
 }
 static void fail(struct http2_connection *c,int error,const char *message) {
     c->dead=true;for(struct http2_stream *s=c->streams;s;s=s->next)if(!s->ended)stream_fail(s,error,message);
+    cnd_broadcast(&c->changed);
 }
 static struct h2_output *packet(unsigned type,unsigned flags,uint32_t id,const void *data,size_t n) {
     struct h2_output *o=malloc(sizeof *o+9+n);
@@ -174,6 +180,8 @@ static void drain(struct http2_connection *c) {
         struct h2_output *o=c->output;size_t count=o->len-o->at;if(count>budget)count=budget;
         long n=ns_try_write(c->wire,o->bytes+o->at,count);
         if(n==-2)return;if(n<=0){fail(c,errno?errno:ECONNRESET,ns_error(c->wire));return;}
+        /* A starter waiting for output space looks again. */
+        if(c->header_waiters)cnd_broadcast(&c->changed);
         struct http2_stream *s=find_stream(c,o->stream);
         if(s){s->accepted+=(size_t)n;
             if(s->result)s->result->request_bytes_sent+=(size_t)n;}
@@ -248,23 +256,19 @@ static const struct huff_code huffman[257]={
  {0xfffec,20},{0xfffff3,24},{0xfffed,20},{0x1fffe6,21},{0x3fffe9,22},{0x1fffe7,21},{0x1fffe8,21},{0x7ffff3,23},{0x3fffea,22},{0x3fffeb,22},{0x1ffffee,25},{0x1ffffef,25},{0xfffff4,24},{0xfffff5,24},{0x3ffffea,26},{0x7ffff4,23},
  {0x3ffffeb,26},{0x7ffffe6,27},{0x3ffffec,26},{0x3ffffed,26},{0x7ffffe7,27},{0x7ffffe8,27},{0x7ffffe9,27},{0x7ffffea,27},{0x7ffffeb,27},{0xffffffe,28},{0x7ffffec,27},{0x7ffffed,27},{0x7ffffee,27},{0x7ffffef,27},{0x7fffff0,27},{0x3ffffee,26},{0x3fffffff,30}};
 struct huff_node{uint16_t child[2];int16_t symbol;};
-static struct huff_node huff_tree[514];static uint32_t huff_ready;
-static void huff_init(void) {
-    if(__atomic_load_n(&huff_ready,__ATOMIC_ACQUIRE)==2)return;
-    uint32_t expected=0;
-    if(__atomic_compare_exchange_n(&huff_ready,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
-        unsigned used=1;for(unsigned i=0;i<514;i++)huff_tree[i].symbol=-1;
-        for(unsigned symbol=0;symbol<257;symbol++) {
-            unsigned at=0;for(int bit=huffman[symbol].bits-1;bit>=0;bit--) {
-                unsigned b=(huffman[symbol].code>>bit)&1;
-                if(!huff_tree[at].child[b])huff_tree[at].child[b]=used++;
-                at=huff_tree[at].child[b];
-            }
-            huff_tree[at].symbol=(int16_t)symbol;
+static struct huff_node huff_tree[514];static once_flag huff_once;
+static void huff_build(void) {
+    unsigned used=1;for(unsigned i=0;i<514;i++)huff_tree[i].symbol=-1;
+    for(unsigned symbol=0;symbol<257;symbol++) {
+        unsigned at=0;for(int bit=huffman[symbol].bits-1;bit>=0;bit--) {
+            unsigned b=(huffman[symbol].code>>bit)&1;
+            if(!huff_tree[at].child[b])huff_tree[at].child[b]=used++;
+            at=huff_tree[at].child[b];
         }
-        __atomic_store_n(&huff_ready,2,__ATOMIC_RELEASE);
-    }else while(__atomic_load_n(&huff_ready,__ATOMIC_ACQUIRE)!=2)yield();
+        huff_tree[at].symbol=(int16_t)symbol;
+    }
 }
+static void huff_init(void){call_once(&huff_once,huff_build);}
 static void table_evict(struct hpack_entry **table,size_t *size,size_t max,size_t needed) {
     while(*table&&*size+needed>max) {
         struct hpack_entry **p=table;while((*p)->next)p=&(*p)->next;
@@ -641,9 +645,17 @@ static void dispatch(struct http2_connection *c) {
 compression:fail(c,EPROTO,"invalid HTTP/2 HPACK block");return;
 protocol:fail(c,EPROTO,"invalid HTTP/2 frame or stream state");
 }
-/* Caller holds c->lock. Read at most 256 KiB / 32 frames per turn. Outgoing
-   request bodies get one frame each per turn and respect both peer windows. */
-static void pump(struct http2_connection *c) {
+/* The pump's transport read. The first read of the reader's pump may sleep for the peer's next
+   bytes, the lock released meanwhile (ns_read_wait): the others then only send. */
+static long wire_read(struct http2_connection *c,void *p,size_t n,int *wait_ms) {
+    if(!*wait_ms)return ns_try_read(c->wire,p,n);
+    c->reading=true;long got=ns_read_wait(c->wire,p,n,*wait_ms,&c->lock);c->reading=false;
+    *wait_ms=0;return got;
+}
+/* Caller holds c->lock. Read at most 256 KiB / 32 frames per turn, waiting up to wait_ms for
+   the first bytes. Outgoing request bodies get one frame each per turn and respect both peer
+   windows. */
+static void pump(struct http2_connection *c,int wait_ms) {
     if(c->dead)return;
     drain(c);
     /* Rotate the first eligible stream on every turn. A nearly full queue
@@ -678,23 +690,42 @@ next_stream:
            control reserve for reader credits/cancellation, and backpressure
            TCP input until pending output makes progress. */
         if(c->output_bytes>H2_OUTPUT_MAX-H2_CONTROL_RESERVE/2){drain(c);return;}
+        if(c->reading){drain(c);return;} /* the reader's pump reads */
         if(c->frame_header_at<9) {
-            long n=ns_try_read(c->wire,c->frame_header+c->frame_header_at,9-c->frame_header_at);
+            long n=wire_read(c,c->frame_header+c->frame_header_at,9-c->frame_header_at,&wait_ms);
             if(n==-2){drain(c);return;}if(n<=0){fail(c,n==0?ECONNRESET:errno,n==0?"HTTP/2 connection closed":ns_error(c->wire));return;}
-            c->frame_header_at+=(size_t)n;bytes+=(size_t)n;if(c->frame_header_at<9)continue;
+            c->frame_header_at+=(size_t)n;bytes+=(size_t)n;c->received+=(size_t)n;if(c->frame_header_at<9)continue;
             c->frame_len=(size_t)c->frame_header[0]<<16|(size_t)c->frame_header[1]<<8|c->frame_header[2];
             if(c->frame_len>16384){fail(c,EPROTO,"HTTP/2 frame exceeds advertised maximum");return;}
             /* Zero-length frames (empty HEADERS/DATA) still get a base pointer: dispatch does pointer arithmetic on it. */
             if(!c->frame){c->frame=malloc(16384);if(!c->frame){fail(c,ENOMEM,"HTTP/2 frame allocation failed");return;}}
         }
         if(c->frame_at<c->frame_len) {
-            long n=ns_try_read(c->wire,c->frame+c->frame_at,c->frame_len-c->frame_at);
+            long n=wire_read(c,c->frame+c->frame_at,c->frame_len-c->frame_at,&wait_ms);
             if(n==-2){drain(c);return;}if(n<=0){fail(c,n==0?ECONNRESET:errno,"HTTP/2 frame cut short");return;}
-            c->frame_at+=(size_t)n;bytes+=(size_t)n;if(c->frame_at<c->frame_len)continue;
+            c->frame_at+=(size_t)n;bytes+=(size_t)n;c->received+=(size_t)n;if(c->frame_at<c->frame_len)continue;
         }
         dispatch(c);frames++;c->frame_header_at=c->frame_at=c->frame_len=0;
     }
     drain(c);
+}
+/* Waits, the lock held, until the connection moves on or a slice has passed (cancellation and
+   timeouts are checked between slices). The first waiter to find no reader becomes it: it sleeps
+   in the transport for the peer's next bytes, pumps them and wakes the others, which then look at
+   their streams again and one of them reads next. */
+#define H2_WAIT_SLICE_MS 20
+static void await(struct http2_connection *c) {
+    if(c->dead)return;
+    long slice=H2_WAIT_SLICE_MS;
+    if(!c->reading) {
+        uint64_t received=c->received,since=uptime_ms();
+        pump(c,H2_WAIT_SLICE_MS);cnd_broadcast(&c->changed);
+        if(c->received!=received||c->dead||uptime_ms()!=since)return;
+        slice=1; /* the transport could not be waited on (TLS records to send first): a nap */
+    }
+    struct timespec until;timespec_get(&until,TIME_UTC);
+    until.tv_nsec+=slice*1000000L;if(until.tv_nsec>=1000000000L){until.tv_sec++;until.tv_nsec-=1000000000L;}
+    cnd_timedwait(&c->changed,&c->lock,&until);
 }
 struct http2_connection *http2_new(net_stream *wire) {
     struct http2_connection *c=calloc(1,sizeof *c);if(!c)return NULL;
@@ -730,6 +761,7 @@ static void start_remove(struct http2_connection *c,struct h2_starter *waiter) {
     struct h2_starter **at=&c->start_first,*previous=NULL;
     while(*at&&*at!=waiter){previous=*at;at=&(*at)->next;}
     if(*at)*at=waiter->next;if(c->start_last==waiter)c->start_last=previous;
+    cnd_broadcast(&c->changed); /* the next starter may have its turn */
 }
 struct http2_stream *http2_start(struct http2_connection *c,const struct http_req *rq,
     const struct url_owned *url,const char *head,const struct http_stream_hooks *hooks,
@@ -781,12 +813,13 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
         if(needs_space&&!waiting){c->header_waiters++;waiting=true;}
         if(!needs_space&&waiting){c->header_waiters--;waiting=false;}
         if(turn&&capacity&&space)break;
-        pump(c);leave(c);
+        pump(c,0);leave(c);
         bool cancelled=hooks&&hooks->cancelled&&hooks->cancelled(rq->ctx);
+        enter(c);
         if(cancelled||uptime_ms()-s->progress>=s->timeout) {
-            enter(c);if(waiting)c->header_waiters--;start_remove(c,&waiter);leave(c);errno=cancelled?ECANCELED:ETIMEDOUT;goto invalid;
+            if(waiting)c->header_waiters--;start_remove(c,&waiter);leave(c);errno=cancelled?ECANCELED:ETIMEDOUT;goto invalid;
         }
-        n_sleep_ms(1);enter(c);
+        await(c);
     }
     if(waiting)c->header_waiters--;
     start_remove(c,&waiter);
@@ -814,7 +847,7 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
         bool ok=frame(c,at?9:1,flags,s->id,b.p+at,n);
         if(!ok)break;at+=n;
     }
-    pump(c);leave(c);free(b.p);free(list.p);free(authority);return s;
+    pump(c,0);leave(c);free(b.p);free(list.p);free(authority);return s;
 invalid:free(s);free(b.p);free(list.p);free(authority);snprintf(error,capacity,"cannot open HTTP/2 stream");if(!errno)errno=ENOMEM;return NULL;
 }
 static bool check(struct http2_stream *s,bool cancelled) {
@@ -828,7 +861,7 @@ long http2_read(struct http2_stream *s,void *out,size_t n) {
     struct http2_connection *c=s->connection;
     for(;;) {
         bool cancelled=s->hooks&&s->hooks->cancelled&&s->hooks->cancelled(s->request->ctx);
-        enter(c);check(s,cancelled);pump(c);size_t sent=s->sent;leave(c);
+        enter(c);check(s,cancelled);pump(c,0);size_t sent=s->sent;leave(c);
         if(s->hooks&&s->hooks->upload&&s->reported!=sent) {
             s->reported=sent;if(s->hooks->upload(s->request->ctx,sent,s->request->body_len)<0) {
                 enter(c);cancel_output(c,s,true);stream_fail(s,ECANCELED,"upload cancelled");leave(c);
@@ -847,8 +880,7 @@ long http2_read(struct http2_stream *s,void *out,size_t n) {
             stream_credit(s,(uint32_t)count);leave(c);return (long)count;
         }
         if(s->ended){leave(c);return 0;}
-        leave(c);
-        n_sleep_ms(1);
+        await(c);leave(c);
     }
 }
 int http2_finish(struct http2_stream *s,bool consumed,const struct http_stream_hooks *hooks) {
@@ -856,10 +888,12 @@ int http2_finish(struct http2_stream *s,bool consumed,const struct http_stream_h
     if(!consumed){enter(c);cancel_output(c,s,!s->ended);leave(c);return 0;}
     for(;;) {
         bool cancelled=hooks&&hooks->cancelled&&hooks->cancelled(s->request->ctx);
-        enter(c);check(s,cancelled);pump(c);
+        enter(c);check(s,cancelled);pump(c,0);
         if(s->first){reset(c,s->id,1);stream_fail(s,EPROTO,"unexpected HTTP/2 response body");}
-        bool done=s->ended||s->error;int error=s->error;leave(c);
-        if(done){if(error){errno=error;return -1;}return 0;}n_sleep_ms(1);
+        bool done=s->ended||s->error;int error=s->error;
+        if(!done)await(c);
+        leave(c);
+        if(done){if(error){errno=error;return -1;}return 0;}
     }
 }
 const char *http2_error(struct http2_stream *s){return s->message;}
@@ -867,7 +901,7 @@ void http2_release(struct http2_stream *s) {
     if(!s)return;struct http2_connection *c=s->connection;enter(c);
     cancel_output(c,s,!s->ended&&!s->error);
     struct http2_stream **p=&c->streams;while(*p&&*p!=s)p=&(*p)->next;
-    if(*p){*p=s->next;c->active--;}leave(c);
+    if(*p){*p=s->next;c->active--;cnd_broadcast(&c->changed);}leave(c);
     struct h2_data *d=s->first;while(d){struct h2_data *next=d->next;free(d);d=next;}
     free(s->headers);free(s);
 }

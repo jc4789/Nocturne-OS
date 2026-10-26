@@ -6,14 +6,6 @@
 #include "sys/object.h"
 #include "sys/events.h"
 
-/* One waiter registered with one object: listed both in the wait and in the object. */
-struct object_waiter {
-    struct object_waiter *wait_next, *object_next;
-    struct object_waiter **object_prev;
-    struct object_wait *wait;
-    struct object *object;
-};
-
 void object_init(struct object *o, const struct object_ops *ops, void *priv) {
     *o = (struct object){.ops = ops, .priv = priv};
 }
@@ -55,12 +47,14 @@ void handle_close(struct handle *h) {
     uint64_t flags = irq_save();
     ASSERT(h->refs > 0);
     bool last = --h->refs == 0;
-    if (last) events_handle_closed(h);
+    struct event_watch *ended = last ? events_handle_closed(h) : NULL;
     irq_restore(flags);
     if (!last) return;
     /* No table holds h any more; an AP syscall that found it there before may still read it
-       and its object (handle_ap_peek) until its section ends. */
+       and its object (handle_ap_peek) until its section ends, and an AP wait the watches that
+       ended with it. */
     ap_read_synchronize();
+    events_watches_free(ended);
     /* A last close may sleep (an audio stream plays out what it has): the reference this
        caller held, not a guard, keeps the detached handle alive meanwhile. */
     struct object *o = h->object;
@@ -76,38 +70,29 @@ uint32_t handle_ready(struct handle *h) {
 void object_notify(struct object *o) {
     if (!o) return;
     uint64_t flags = irq_save();
-    for (struct object_waiter *w = o->waiters; w; w = w->object_next) {
-        w->wait->generation++;
+    for (struct object_waiter *w = o->waiters; w; w = w->next) {
+        /* the new generation before the parked count is read: a waiter parking on an AP counts
+           itself before it reads the generation again */
+        __atomic_add_fetch(&w->wait->generation, 1, __ATOMIC_SEQ_CST);
         wq_wake_all(&w->wait->wq);
+        address_park_wake_word(&w->wait->generation);
     }
     irq_restore(flags);
 }
 
-void object_wait_add(struct object_wait *wait, struct object *o) {
-    if (wait->error || !o) return;
-    struct object_waiter *w = kmalloc(sizeof *w);
-    if (!w) { wait->error = -N_ERR_NO_MEMORY; return; }
+void object_waiter_link(struct object_waiter *w, struct object_wait *wait, struct object *o) {
     uint64_t flags = irq_save();
-    o->refs++;
-    *w = (struct object_waiter){.wait_next = wait->entries, .object_next = o->waiters,
-                                .object_prev = &o->waiters, .wait = wait, .object = o};
-    if (w->object_next) w->object_next->object_prev = &w->object_next;
+    *w = (struct object_waiter){.next = o->waiters, .prev = &o->waiters, .wait = wait};
+    if (w->next) w->next->prev = &w->next;
     o->waiters = w;
-    wait->entries = w;
     irq_restore(flags);
 }
 
-void object_wait_end(struct object_wait *wait) {
-    while (wait->entries) {
-        uint64_t flags = irq_save();
-        struct object_waiter *w = wait->entries;
-        wait->entries = w->wait_next;
-        *w->object_prev = w->object_next;
-        if (w->object_next) w->object_next->object_prev = w->object_prev;
-        irq_restore(flags);
-        object_unref(w->object);
-        kfree(w);
-    }
+void object_waiter_unlink(struct object_waiter *w) {
+    uint64_t flags = irq_save();
+    *w->prev = w->next;
+    if (w->next) w->next->prev = w->prev;
+    irq_restore(flags);
 }
 
 /* ---- handle tables ---- */

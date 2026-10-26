@@ -33,7 +33,7 @@ typedef void (*cpu_job_fn)(size_t index, void *context);
 /* 全APはuser実行と独立計算jobを交替で処理。共有kernel/driver/allocatorはBSP専用。
    例外はnet_ap_syscallの最大64KiB TCP ring copy。allocator/wait queue/NICには触れず、
    netのBSP gateとsocket io_ownerで寿命/単一所有を保ち、CPU別doorbellで制御を返す。
-   もう一つはsyscall_apの読むだけの問い合わせ（音の位置、空の待ち行列、窓の状態）。AP読み取り区間
+   もう一つはsyscall_apの読むだけの問い合わせ（音の位置、空の待ち行列、窓の状態、事象待ち、走っているアプリの結果）と、APで寝る待ち（何も無い事象待ちと眠りはaddress parkで寝る）。AP読み取り区間
    （ap_read_begin）の中で取っ手と対象を読み、BSPは解放の前にap_read_synchronizeで待つ。
    三つ目は予約ページの初回の接触（vmm_ap_demand_fault）。BSPがAPごとに取り置いたframeで
    予約の葉を比較交換で埋める。取り置きが減ればcpu_bsp_wakeでBSPに足させる。
@@ -64,7 +64,10 @@ void cpu_runner_wake_at(unsigned index);
 void cpu_bsp_wake(void); /* AP: the BSP has something to collect (a retired task, frames wanted) */
 /* AP read sections. An AP syscall (syscall_ap) may read BSP-owned kernel objects in place,
    without a trip through the BSP, between ap_read_begin and ap_read_end: interrupts off, no
-   waiting, no allocation, no writes to them. Before the BSP frees memory such a reader can reach
+   waiting, no allocation, no writes to them. The one exception is an event wait that finds
+   nothing: it enrolls its own task in the address park there (address_lock, a short spin, never
+   a sleep), so that the queue it parks on cannot be released before the enrollment, and the
+   release then wakes it (events.c). Before the BSP frees memory such a reader can reach
    (a handle, its object, a handle table), it calls ap_read_synchronize, which returns once every
    section open at the call has ended. */
 void ap_read_begin(void);

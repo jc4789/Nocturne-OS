@@ -6,11 +6,11 @@
 #include <ctype.h>
 #include <limits.h>
 #include <errno.h>
+#include <threads.h>
 #include "../include/http.h"
 #include "http2.h"
 #include "browser_identity.h"
 extern uint64_t uptime_ms(void);
-extern void yield(void);
 extern void n_sleep_ms(uint64_t);
 
 /* The pool is process-local. It never coalesces certificate names or origins.
@@ -37,11 +37,11 @@ struct pooled_connection {
 #define POOL_OPEN_PER_KEY 6u
 #define POOL_MAX 32u
 static struct pooled_connection *pool;
-static uint32_t pool_lock;
+static mtx_t pool_lock;
 static unsigned pool_count;
 static uint64_t connection_identity;
-static void pool_enter(void){while(__atomic_exchange_n(&pool_lock,1,__ATOMIC_ACQUIRE))yield();}
-static void pool_leave(void){__atomic_store_n(&pool_lock,0,__ATOMIC_RELEASE);}
+static void pool_enter(void){mtx_lock(&pool_lock);}
+static void pool_leave(void){mtx_unlock(&pool_lock);}
 static void pool_destroy(struct pooled_connection *p) {
     http2_free(p->h2);ns_abort(p->stream);free(p->host);free(p->key);free(p);
 }

@@ -35,24 +35,27 @@ const blobBridge = (() => {
     function parts(values,options){
         if(values===null||(typeof values!=='object'&&typeof values!=='function'))throw new TypeError('Expected BlobPart sequence');
         const method=values[Symbol.iterator];if(typeof method!=='function')throw new TypeError('Blob parts must be iterable');
-        /* 文字列はそのまま、バイト列は次の iterator 呼出しでの変更/transfer より前に snapshot を取り、
-           最後に UTF-8 への変換と連結を一度に native で行う。Blob の bytes は変更されない。 */
+        /* WebIDL は列全体を先に変換し（iterator と ToString はページのコードを走らせうる）、
+           process blob parts がその後で各 buffer source の bytes を写す。写しは連結の native が
+           UTF-8 への変換と一緒に一度だけ行う。切り離された・範囲外の view は空。
+           Blob の bytes は変更されないので、Blob の部品はそのまま読む。 */
         const chunks=[];
         for(const part of {[Symbol.iterator]:()=>apply(method,values,[])}){
             let chunk=part;
             if(typeof part!=='string'){
                 const existing=apply(get,slots,[part]);
                 if(existing)chunk=existing.bytes;
-                else if(isView(part))chunk=copy(view(part));
+                else if(isView(part))chunk=apply(tag,part,[])!==undefined?part:view(part);
                 else {
                     let binary=false;
                     try{apply(abLength,part,[]);binary=true;}catch(_){}
-                    chunk=binary?copy(view(part)):string(part);
+                    chunk=binary?new U8(part):string(part);
                 }
             }
             if(typeof chunk==='string'&&options.endings==='native')chunk=chunk.replace(/\r\n|\r/g,'\n');
             apply(push,chunks,[chunk]);
         }
+        for(let i=0;i<chunks.length;i++)if(typeof chunks[i]!=='string'&&!apply(length,chunks[i],[]))chunks[i]='';
         return new U8(concat(chunks));
     }
     function options(value){
@@ -60,7 +63,9 @@ const blobBridge = (() => {
         if(endings!=='transparent'&&endings!=='native')throw new TypeError('Invalid line ending mode');
         const t=o.type;return {endings,type:t===undefined?'':mime(t)};
     }
-    function make(bytes,type){if(apply(length,bytes,[])>LIMIT)throw new RangeError('Blob byte length is not representable by ArrayBuffer');const result=create(Blob.prototype);apply(put,slots,[result,{bytes:copy(bytes),type}]);return result;}
+    /* make は bytes を引き取る：以後だれも変えない。slice は元の Blob の bytes を共有し、
+       持ち主の分からない bytes（fromBytes・restore）は写してから渡す。 */
+    function make(bytes,type){if(apply(length,bytes,[])>LIMIT)throw new RangeError('Blob byte length is not representable by ArrayBuffer');const result=create(Blob.prototype);apply(put,slots,[result,{bytes,type}]);return result;}
     function base64(bytes){
         const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',n=apply(length,bytes,[]);let out='';
         for(let i=0;i<n;i+=3){const a=bytes[i],b=i+1<n?bytes[i+1]:0,c=i+2<n?bytes[i+2]:0;
@@ -69,8 +74,9 @@ const blobBridge = (() => {
     function integer(v){const n=+v;return Number.isNaN(n)||n===0?0:Number.isFinite(n)?Math.trunc(n):n;}
     function read(blob,kind){
         return new P((resolve,reject)=>{try{
-            const bytes=copy(state(blob).bytes);
-            resolve(kind==='text'?apply(decode,new Decoder(),[bytes]):kind==='bytes'?bytes:apply(buffer,bytes,[]));
+            const bytes=state(blob).bytes;
+            if(kind==='text')return resolve(apply(decode,new Decoder(),[bytes]));
+            const result=copy(bytes);resolve(kind==='bytes'?result:apply(buffer,result,[]));
         }catch(e){reject(e);}});
     }
     class Blob {
@@ -157,8 +163,8 @@ const blobBridge = (() => {
     Object.assign(globalThis,{Blob,File,FileReader});
     return {brand:value=>apply(get,slots,[value])!==undefined,readerBrand:value=>apply(get,readers,[value])!==undefined,
         bytes:value=>apply(buffer,copy(state(value).bytes),[]),type:value=>state(value).type,
-        fromBytes:(bytes,type)=>make(view(bytes),mime(type)),
+        fromBytes:(bytes,type)=>make(copy(view(bytes)),mime(type)),
         nativeFile(data){const bits=create(null),options=create(null);options.type=data[1];options.lastModified=data[3];bits[Symbol.iterator]=()=>{let done=false;const iterator=create(null);iterator.next=()=>done?{done:true}:(done=true,{done:false,value:data[0]});return iterator;};const file=new File(bits,data[2],options);apply(get,files,[file]).relativePath=data[4]||'';return file;},
         snapshot(value){const s=state(value),f=apply(get,files,[value]);return [apply(buffer,copy(s.bytes),[]),s.type,f?f.name:null,f?f.lastModified:0,f?f.relativePath||'':''];},
-        restore(data){if(data[2]===null)return make(view(data[0]),data[1]);const file=new File([data[0]],data[2],{type:data[1],lastModified:data[3]});apply(get,files,[file]).relativePath=data[4]||'';return file;}};
+        restore(data){if(data[2]===null)return make(copy(view(data[0])),data[1]);const file=new File([data[0]],data[2],{type:data[1],lastModified:data[3]});apply(get,files,[file]).relativePath=data[4]||'';return file;}};
 })();

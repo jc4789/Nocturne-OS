@@ -2489,6 +2489,7 @@ static int64_t sys_events_unwatch(int q, uint64_t token) {
 
 static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, int64_t timeout_ms) {
     int64_t r;
+    timeout_ms = events_wait_resume(timeout_ms); /* before anything can end the call */
     struct handle *queue = handle_get_as(q, events_is, &r);
     if (!queue) return r;
     r = events_wait(queue, uout, max, timeout_ms);
@@ -2510,7 +2511,7 @@ static bool channel_receive_ap(struct regs *r, struct handle *h, bool credential
     return message_channel_is(h) && message_channel_receive_ap(h, flags & N_CHANNEL_WAIT, result);
 }
 
-bool syscall_ap(struct regs *r) {
+enum ap_syscall syscall_ap(struct regs *r) {
     int64_t result;
     switch (r->rax) {
     case SYS_CPU_INDEX: result = cpu_current_index(); break;
@@ -2518,24 +2519,33 @@ bool syscall_ap(struct regs *r) {
     case SYS_APP_SELF: result = task_process()->pid; break;
     case SYS_UPTIME: result = (int64_t)uptime_ms(); break;
     case SYS_TIME: result = time_now(); break;
-    case SYS_TCP_SEND: case SYS_TCP_SEND_UNTIL: case SYS_TCP_RECV: return net_ap_syscall(r);
+    case SYS_SLEEP: return sleep_ap(r->rdi);
+    case SYS_TCP_SEND: case SYS_TCP_SEND_UNTIL: case SYS_TCP_RECV:
+        return net_ap_syscall(r) ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
     case SYS_AUDIO_STATUS: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM: case SYS_WIN_RECEIVE:
-    case SYS_WIN_STATE: {
-        if (current_task->killed) return false; /* the BSP ends the process */
+    case SYS_WIN_STATE: case SYS_EVENTS_WAIT: case SYS_APP_RESULT: {
+        if (current_task->killed) return AP_SYSCALL_BSP; /* the BSP ends the process */
         ap_read_begin();
         struct handle *h = handle_ap_peek((int)r->rdi);
-        bool served = r->rax == SYS_AUDIO_STATUS ? audio_stream_status_ap(h, (struct n_audio_status *)r->rsi, &result)
-                    : r->rax == SYS_WIN_RECEIVE ? wm_receive_ap(h, (size_t)r->rdx, (int64_t)r->r10, &result)
-                    : r->rax == SYS_WIN_STATE ? wm_state_ap(h, &result)
-                    : channel_receive_ap(r, h, r->rax == SYS_CHANNEL_RECEIVE_FROM, &result);
+        enum ap_syscall served;
+        if (r->rax == SYS_EVENTS_WAIT)
+            served = events_wait_ap(h, (struct n_event *)r->rsi, (size_t)r->rdx, (int64_t)r->r10, &result);
+        else {
+            bool done = r->rax == SYS_AUDIO_STATUS ? audio_stream_status_ap(h, (struct n_audio_status *)r->rsi, &result)
+                      : r->rax == SYS_WIN_RECEIVE ? wm_receive_ap(h, (size_t)r->rdx, (int64_t)r->r10, &result)
+                      : r->rax == SYS_WIN_STATE ? wm_state_ap(h, &result)
+                      : r->rax == SYS_APP_RESULT ? proc_app_result_ap(h, (int64_t)r->rsi, &result)
+                      : channel_receive_ap(r, h, r->rax == SYS_CHANNEL_RECEIVE_FROM, &result);
+            served = done ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
+        }
         ap_read_end();
-        if (!served) return false;
+        if (served != AP_SYSCALL_DONE) return served;
         break;
     }
-    default: return false;
+    default: return AP_SYSCALL_BSP;
     }
     r->rax = (uint64_t)result;
-    return true;
+    return AP_SYSCALL_DONE;
 }
 
 void syscall_dispatch(struct regs *r) {
@@ -2550,7 +2560,7 @@ void syscall_dispatch(struct regs *r) {
     switch (r->rax) {
     case SYS_EXIT: task_exit_app((int)a);
     case SYS_AUDIO_FLUSH: ret = sys_audio_flush((int)a); break;
-    case SYS_SLEEP: sleep_ms(a); ret = 0; break;
+    case SYS_SLEEP: sleep_resume(a); ret = 0; break;
     case SYS_UPTIME: ret = uptime_ms(); break;
     case SYS_TIME: ret = time_now(); break;
     case SYS_SHARED_CREATE: ret = sys_shared_create(a,false); break;
