@@ -27,9 +27,12 @@ MACHINE = ("<task-notification", "<side-sessions-event", "<ci-monitor-event", "<
            "Another Claude session sent a message")
 EDITS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 NOTES = Path(".claude") / "oboegaki.md"
-# 編集の後につながりを出す言語。Python は codegraph がメソッドを名前だけでつなぎ
-# （subprocess.run がよその run に付く）、頼るファイルの数が当てにならないので外す
-CODE = {".c", ".h", ".cc", ".cpp", ".hpp", ".js", ".mjs", ".ts", ".rs", ".go"}
+# 編集の後につながりを出す言語：Nocturne を書く C・C++・JavaScript・TypeScript・
+# Rust・Go。今ある拡張子だけでなく、それぞれの言語の拡張子を全部入れる。Python は
+# codegraph がメソッドを名前だけでつなぎ（subprocess.run がよその run に付く）、
+# 頼るファイルの数が当てにならないので外す
+CODE = {".c", ".h", ".inc", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
+        ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".rs", ".go"}
 SURE = 0.8  # これより確からしさの低いつながり（名前だけで推したもの）は出さない
 
 

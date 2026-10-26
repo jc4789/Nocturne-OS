@@ -10,7 +10,7 @@ Nocturne OS'S NATIVE ABI MUST NOT BE BYPASSED.
 
 <!-- 直す人へ：この文書は毎回の会話の初めに全部読まれる。毎回要ることだけを置き、手順や一部のコードだけに要ることはスキル（.claude/skills と .agents/skills の両方）へ置く。事実はコードで確かめてから書き、古くなった記述は見つけた人がその場で直す。 -->
 
-Nocturne は C で書いた、GUI が先の独自の OS。対象は実機で、試験の実機はユーザーの PC（Ryzen 5 7600X、RAM 32 GB、RTX 4070 12 GB（AD104）、Resizable BAR 有効）。QEMU と Hyper-V は試験の道具で、VM で通ることは実機で動く証拠にならない。
+Nocturne は GUI が先の独自の OS で、カーネルと C ライブラリーは C で書いている。対象は実機で、試験の実機はユーザーの PC（Ryzen 5 7600X、RAM 32 GB、RTX 4070 12 GB（AD104）、Resizable BAR 有効）。QEMU と Hyper-V は試験の道具で、VM で通ることは実機で動く証拠にならない。
 
 ## 言葉
 
@@ -39,6 +39,12 @@ Nocturne は C で書いた、GUI が先の独自の OS。対象は実機で、�
 - **サイト専用の処理を製品に入れない。** ホスト名・URL での分岐、特定サイトの DOM やスクリプトを狙った特例、UA の偽装、注入した HTML・CSS・JS で「直った」画面を作らない。直すのは仕様と共通の境界で、サイト名は試験と文書にだけ置く。報告でも主語は我々のブラウザーの欠陥にし、サイト名は「再現は◯◯」と添える。
 - **VM の処理は実機の処理と分ける。** QEMU・Hyper-V だけの処理は一か所の入口の後ろに置き、共通コードに hypervisor の判定やエミュレーターの装置を直接書かない。VM の測定値で実機の既定を決めない。Hyper-V 第 2 世代と拡張セッションは製品の要件。
 - **UNIX ではない。** POSIX・Linux の API を足さず、移植するプログラムを Nocturne のネイティブ API へ書き換える。逆に、ネイティブの API・スレッド・SMP・スケジューラーは Nocturne の形で直してよい。
+- **言語は C だけではない。** アプリと移植は、仕事に合う言語で書ける。どの言語の標準ライブラリーも Nocturne のネイティブ API の上に載せてあり、POSIX を通らない。
+  - C++20（libc++ 付き）：`user/apps/*.cpp`
+  - TypeScript・JavaScript：QuickJS で動く。窓は `nocturne/ui`（型は `rootfs/Nocturne/SDK/Types/nocturne`）。`user/apps/*.ts` はホストの tsc で `C:\Nocturne\System\<名前>.js` になる
+  - Go（`GOOS=nocturne`）：`ports/go/apps/<名前>/main.go`、窓は `ports/go/ui`。`tools/go` があると作られる
+  - Rust（`x86_64-unknown-nocturne`）：`ports/rust/apps/<名前>/main.rs`。`tools/rust/sysroot` があると作られる
+  - ゲストの中でも clang・clang++（`ports/llvm`）、tcc、tsc で作れる。tcc だけを前提にしない
 - **GUI が先。** 機能には窓・設定の画面・クリックでの入口を作る。システムの内部をコマンドラインで組まず、ユーザーにコマンドを打たせない。
 - **ディスクは一台。** 起動の区画と C: が同じ媒体にある（`C:\Nocturne` が OS、`C:\Programs\<アプリ>`、`C:\Users\<名前>`）。二台目のデータディスク、`/data`、`/bin`、PATH を持ち込まない。
 - **生成物は生成元から。** 生成されたファイルを手で直さず、生成元と依存を直して作り直す。
@@ -60,7 +66,6 @@ Nocturne は C で書いた、GUI が先の独自の OS。対象は実機で、�
 - 全体ビルドは、要るとき・役に立つときはいつでもしてよい（2026-10-23 ユーザー確認）。ビルドを避けるために古い記述や不完全な修理を残さない。A/B の比較のために stash や revert で作業木を戻さず、疑わしい `.c` を一つずつ差し替えて比べる。
 - 試験の媒体に、今のソースから作った kernel と C: の中身が入っていることを確かめる。ソースを戻しても、作った媒体は戻らない。
 - Hyper-V の VM と実機での試験はユーザーの担当。VM の起動・停止・設定・使用中の媒体に触れない。
-- ゲストには clang・clang++（`ports/llvm`）もある。tcc だけを前提にしない。
 
 ## 変更とディスクの扱い
 
