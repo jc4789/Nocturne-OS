@@ -2559,6 +2559,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     const style_t *par = cx->parent ? cx->parent : &initial;
     if (ident_is(v, n, "inherit")) {
         copy_prop(p, s, par);
+        if (!p->inherited) s->explicit_inherit = true;
         return true;
     }
     if (ident_is(v, n, "initial")) {
@@ -3492,7 +3493,20 @@ void css_style_init(style_t *s, const style_t *parent) {
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &initial);
     s->before = s->after = s->backdrop = s->placeholder = NULL;
-    s->before_generated = s->after_generated = false;
+    s->before_generated = s->after_generated = s->explicit_inherit = false;
+}
+
+/* The inverse split of css_style_init: what it copies comes from from, what
+   it resets stays s's own. */
+void css_style_adopt_inherited(style_t *s, const style_t *from) {
+    style_t own = *s;
+    css_style_init(s, from);
+    for (int i = 0; i < NPROPS; i++)
+        if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &own);
+    s->border_radius = own.border_radius;
+    s->before = own.before; s->after = own.after; s->backdrop = own.backdrop; s->placeholder = own.placeholder;
+    s->before_generated = own.before_generated; s->after_generated = own.after_generated;
+    s->explicit_inherit = own.explicit_inherit;
 }
 
 void css_style_finish(style_t *s, const style_t *parent, bool root) {

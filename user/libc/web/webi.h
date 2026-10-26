@@ -32,6 +32,7 @@ void *ar_alloc(arena_t *a, size_t n); /* zeroed, 8-byte aligned */
 char *ar_strndup(arena_t *a, const char *s, size_t n);
 char *ar_strdup(arena_t *a, const char *s);
 void ar_free(arena_t *a);
+void ar_adopt(arena_t *into, arena_t *from);
 
 typedef struct sbuf {
     char *p;
@@ -159,12 +160,16 @@ typedef struct node {
     struct style *style;
     arena_t style_mem; /* lazy variable tail; fixed styles live in document slabs */
     arena_t style_previous_mem;
+    /* An adopted style's inherited values, which the children's styles
+       borrow, when they are not in style_mem or an ancestor's memory. */
+    arena_t style_inherit_mem;
     struct css_style_slot *style_slots, *style_previous_slots;
     struct css_declarations *style_declarations; /* immutable inline declaration snapshot */
     struct style *style_previous;
     struct node *style_retired_next;
     bool style_dirty, style_children_dirty;
     bool style_self_dirty; /* only this element's own match changed */
+    uint8_t style_mark_source; /* --debug-js: what set style_dirty */
     uint8_t style_form_state; /* supervisor-published form pseudo snapshot; cascade reads only */
     uint32_t style_subtree_work; /* elements the next cascade restyles here, counted before it splits */
     /* Published only after layout joins; CSS workers never read mutable boxes
@@ -486,6 +491,7 @@ typedef struct style {
     uint8_t caption_bottom;
     bool z_auto;
     bool before_generated, after_generated; /* computed pseudo bodies need not generate boxes */
+    bool explicit_inherit; /* some property that is not inherited took its parent's value */
     struct custom_prop *vars;
     struct style *before, *after, *backdrop, *placeholder;
 } style_t;
@@ -612,6 +618,9 @@ bool css_valid_declaration(const char *property, size_t pn, const char *value, s
 bool css_supports_condition(const char *condition, size_t n, bool implied_parens);
 /* start a style: inherited properties from the parent, the others initial */
 void css_style_init(style_t *s, const style_t *parent);
+/* s takes from's inherited values (what css_style_init copies from a parent)
+   and keeps its own others */
+void css_style_adopt_inherited(style_t *s, const style_t *from);
 /* computed-value fixups after all declarations: currentColor, blockification, border widths */
 void css_style_finish(style_t *s, const style_t *parent, bool root);
 /* unescape a CSS string or identifier body (backslash escapes) */
@@ -887,6 +896,8 @@ struct web_profile {
     uint64_t style_rule_indexes; /* rule indexes looked up, one per stylesheet binding */
     uint64_t style_rule_bucket[4]; /* candidates by index bucket: id, class, tag, universal */
     uint64_t style_kept; /* restyled elements whose computed style came out unchanged */
+    uint64_t style_adopted; /* restyled elements whose children kept their styles */
+    uint64_t style_redo[10]; /* restyled elements by why (css.c REDO_*) */
 };
 struct web_doc {
     uint64_t paint_bounds_generation;

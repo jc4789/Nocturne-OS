@@ -69,6 +69,18 @@ void ar_free(arena_t *a) {
     a->allocated = 0;
 }
 
+/* into takes from's chunks, to be freed with its own; from is left empty. */
+void ar_adopt(arena_t *into, arena_t *from) {
+    if (!from->head) return;
+    struct achunk *tail = from->head;
+    while (tail->next) tail = tail->next;
+    tail->next = into->head;
+    into->head = from->head;
+    into->allocated += from->allocated;
+    from->head = NULL;
+    from->allocated = 0;
+}
+
 /* ---------------------------------------------------------------- buffers */
 static void sb_grow(sbuf *b, size_t need) {
     if (b->n == SIZE_MAX || need > SIZE_MAX - b->n - 1) abort();

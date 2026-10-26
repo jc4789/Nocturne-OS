@@ -1227,10 +1227,18 @@ static bool match_has(const struct sellist *list, node_t *subject, const struct 
         const struct compound *right = list->v[i]->right, *first = right;
         while (first->left && first->left->left) first = first->left;
         bool siblings = first->comb == '+' || first->comb == '~';
+        /* One compound after a combinator other than a descendant one selects
+           the children, the next sibling or the following siblings alone. */
+        bool level = first == right && first->comb != ' ';
         node_t *root = siblings ? subject->parent : subject;
         node_t *node = siblings ? next_elem(subject) : subject->first;
         for (; node;) {
             if (node->type == N_ELEM && match_from_bound(right, node, &relative)) return true;
+            if (level) {
+                if (first->comb == '+') break;
+                node = node->next;
+                continue;
+            }
             if (node->first) node = node->first;
             else {
                 while (node && node != root && !node->next) node = node->parent;
@@ -2734,10 +2742,14 @@ static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int
 }
 
 /* ---------------------------------------------------------------- the rule index */
+struct has_subject;
 struct ient {
     struct ient *next;
     const struct selector *sel;
-    const struct rule *r;
+    union {
+        const struct rule *r;
+        const struct has_subject *has; /* in a relational index */
+    };
     uint32_t order;
     uint32_t media; /* 0: unconditional; else its rule's @media is css_index.media[media - 1] */
     /* The selector's, here: most candidates are rejected on these alone,
@@ -2784,7 +2796,7 @@ struct css_index {
     bool containers, siblings;
     const struct mcond **media; /* the distinct @media of its rules */
     uint32_t nmedia, media_cap;
-    struct css_index *relational; /* subject-key index; never collected as style declarations */
+    struct css_index *relational; /* :has() subjects (ient.has) by their compounds' keys */
     struct css_index *child_list_subjects; /* parent state can affect its outer siblings */
     struct css_index *child_list_parents; /* own state changed by a child-list mutation */
     struct css_index *child_list_siblings[4]; /* position, sibling combinator or sibling :has witness, by enum sibling_reach bit */
@@ -3019,8 +3031,9 @@ static int layer_compare(struct cascade_layer *a,struct cascade_layer *b) {
     return x->order>y->order?1:-1;
 }
 
-static void index_rule(arena_t *a, struct css_index *x, const struct rule *r, const struct selector *s, uint32_t order, uint32_t media) {
-    if (s->pseudo == PE_OTHER) return;
+static struct ient *index_rule(arena_t *a, struct css_index *x, const struct rule *r, const struct selector *s, uint32_t order,
+                               uint32_t media) {
+    if (s->pseudo == PE_OTHER) return NULL;
     struct ient *ie = ar_alloc(a, sizeof *ie);
     ie->sel = s;
     ie->r = r;
@@ -3041,6 +3054,7 @@ static void index_rule(arena_t *a, struct css_index *x, const struct rule *r, co
                              : &x->univ;
     ie->next = *slot;
     *slot = ie;
+    return ie;
 }
 
 static sheet_t *ua_sheet, *quirks_sheet;
@@ -3070,16 +3084,6 @@ static bool selector_siblings(const struct compound *compound) {
     return false;
 }
 
-static bool compound_has(const struct compound *c) {
-    for (int i = 0; i < c->n; i++) {
-        const struct simple *s = &c->s[i];
-        if (s->kind == SK_PC && s->pc == PC_HAS) return true;
-        for (int k = 0; s->args && k < s->args->n; k++)
-            for (const struct compound *part = s->args->v[k]->right; part; part = part->left)
-                if (compound_has(part)) return true;
-    }
-    return false;
-}
 static bool compound_has_siblings(const struct compound *c) {
     for (int i = 0; i < c->n; i++) {
         const struct simple *s = &c->s[i];
@@ -3094,7 +3098,7 @@ static bool compound_has_siblings(const struct compound *c) {
     }
     return false;
 }
-enum subject_dependency { SUBJECT_RELATIONAL, SUBJECT_CHILD_OUTER, SUBJECT_CHILD_PARENT, SUBJECT_CHILD_SIBLING };
+enum subject_dependency { SUBJECT_CHILD_OUTER, SUBJECT_CHILD_PARENT, SUBJECT_CHILD_SIBLING };
 /* Which siblings of an inserted element can change a positional subject's
    match: the nearest following/preceding element (and nearest one of the
    inserted element's type), or every following/preceding element. */
@@ -3160,7 +3164,7 @@ static void index_child_list_subjects(arena_t *a,struct css_index *index,const s
 /* What changing one class, id, attribute or dynamic state of an element can
    restyle, from where selectors name it. A selector relates an element only to
    its descendants and to its following siblings' subtrees (:has() looks the
-   other way and keeps its own invalidator), so the parent's subtree bounds
+   other way: its subjects are indexed apart), so the parent's subtree bounds
    every reach. Which of those it is follows from the combinator right of the
    compound that names the feature: a descendant or child combinator keeps the
    subject inside the element's subtree (a sibling of a descendant is one too),
@@ -3214,27 +3218,84 @@ static bool subject_key(const struct compound *c, struct feature_key *key) {
             }
     return false;
 }
-static void index_compound_features(arena_t *a, struct css_index *x, const struct compound *c, unsigned reach,
-                                    const struct feature_key *key) {
+/* The dynamic state a pseudo-class reads, or -1. */
+static int pseudo_state(const struct simple *s) {
+    if (s->kind != SK_PC) return -1;
+    if (s->pc == PC_HOVER) return CSS_STATE_HOVER;
+    if (s->pc == PC_ACTIVE) return CSS_STATE_ACTIVE;
+    if (s->pc == PC_FOCUS || s->pc == PC_FOCUS_WITHIN) return CSS_STATE_FOCUS;
+    return -1;
+}
+static bool anchor_compound(const struct compound *c) { return c->n == 1 && c->s[0].kind == SK_ANCHOR; }
+/* Whether matching a selector counts siblings: a positional or :empty
+   pseudo-class, or a sibling combinator between two of its compounds. */
+static bool selector_structural(const struct compound *right) {
+    for (const struct compound *c = right; c && !anchor_compound(c); c = c->left) {
+        if (c->left && !anchor_compound(c->left) && (c->comb == '+' || c->comb == '~')) return true;
+        for (int i = 0; i < c->n; i++) {
+            const struct simple *s = &c->s[i];
+            if (s->kind == SK_PC && (s->pc <= PC_NTH_LAST_OF_TYPE || s->pc == PC_EMPTY)) return true;
+            if (s->args && !(s->kind == SK_PC && s->pc == PC_HAS))
+                for (int k = 0; k < s->args->n; k++) if (selector_structural(s->args->v[k]->right)) return true;
+        }
+    }
+    return false;
+}
+/* One :has() that a compound tests, indexed by that compound's keys. What its
+   arguments name decides which mutations can change its match; where the
+   compound sits, what a changed match restyles. */
+struct has_subject {
+    const struct sellist *args;
+    struct css_feature *reach; /* from the compound's element, as for a feature there */
+    bool siblings;  /* an argument starts with + or ~: the subject precedes what changed */
+    bool children;  /* every argument is one compound after >: only the parent of what changed */
+    bool structure; /* an argument counts siblings: any child-list change below can change it */
+};
+static void index_has(arena_t *a, struct css_index *x, const struct compound *subject, const struct sellist *args,
+                      unsigned reach, const struct feature_key *key) {
+    if (!x->relational) {
+        x->relational = ar_alloc(a, sizeof *x->relational);
+        ht_init(a, &x->relational->ids, 16);
+        ht_init(a, &x->relational->classes, 32);
+        ht_init(a, &x->relational->tags, 16);
+    }
+    struct has_subject *h = ar_alloc(a, sizeof *h);
+    h->args = args; h->children = true;
+    feature_note(a, &h->reach, reach, key);
+    for (int k = 0; k < args->n; k++) {
+        const struct compound *right = args->v[k]->right, *first = right;
+        while (first->left && first->left->left) first = first->left;
+        h->siblings |= first->comb == '+' || first->comb == '~';
+        h->children &= first == right && first->comb == '>';
+        h->structure |= selector_structural(right);
+    }
+    struct selector *selector = ar_alloc(a, sizeof *selector); selector->right = (struct compound *)subject;
+    struct ient *entry = index_rule(a, x->relational, NULL, selector, 0, 0);
+    if (entry) entry->has = h;
+    x->relational_siblings |= h->siblings;
+}
+/* subject: the compound whose keys the element c names must carry. */
+static void index_compound_features(arena_t *a, struct css_index *x, const struct compound *subject, const struct compound *c,
+                                    unsigned reach, const struct feature_key *key) {
     for (int i = 0; i < c->n; i++) {
         const struct simple *s = &c->s[i];
         struct css_feature **slot = NULL;
+        int state = pseudo_state(s);
         if (s->kind == SK_ID) slot = feature_slot(a, &x->feature_ids, s->name);
         else if (s->kind == SK_CLASS) slot = feature_slot(a, &x->feature_classes, s->name);
         else if (s->kind == SK_ATTR) slot = feature_slot(a, &x->feature_attrs, s->name);
-        else if (s->kind == SK_PC && s->pc == PC_HOVER) slot = &x->feature_states[CSS_STATE_HOVER];
-        else if (s->kind == SK_PC && s->pc == PC_ACTIVE) slot = &x->feature_states[CSS_STATE_ACTIVE];
-        else if (s->kind == SK_PC && (s->pc == PC_FOCUS || s->pc == PC_FOCUS_WITHIN)) slot = &x->feature_states[CSS_STATE_FOCUS];
+        else if (state >= 0) slot = &x->feature_states[state];
         if (slot) feature_note(a, slot, reach, key);
-        if (!s->args || (s->kind == SK_PC && s->pc == PC_HAS)) continue;
+        if (s->kind == SK_PC && s->pc == PC_HAS) { index_has(a, x, subject, s->args, reach, key); continue; }
+        if (!s->args) continue;
         bool alternatives = s->kind == SK_PC && (s->pc == PC_NOT || s->pc == PC_IS);
         for (int k = 0; k < s->args->n; k++) {
             const struct compound *arg = s->args->v[k]->right;
             /* A compound alternative names this same element. A complex one,
                nth-child's "of S" or ::slotted() names others. */
-            if (alternatives && !arg->left) index_compound_features(a, x, arg, reach, key);
+            if (alternatives && !arg->left) index_compound_features(a, x, subject, arg, reach, key);
             else for (const struct compound *part = arg; part; part = part->left)
-                index_compound_features(a, x, part, REACH_PARENT, NULL);
+                index_compound_features(a, x, part, part, REACH_PARENT, NULL);
         }
     }
 }
@@ -3243,7 +3304,7 @@ static void index_features(arena_t *a, struct css_index *x, const struct compoun
     bool keyed = subject_key(right, &key);
     unsigned reach = REACH_SELF;
     for (const struct compound *c = right; c; c = c->left) {
-        index_compound_features(a, x, c, reach, keyed ? &key : NULL);
+        index_compound_features(a, x, c, c, reach, keyed ? &key : NULL);
         if (c->comb != '+' && c->comb != '~') reach = REACH_DESCENDANTS;
         else if (reach & (REACH_SELF | REACH_SIBLINGS)) reach = REACH_SIBLINGS;
         else reach = REACH_SIBLING_DESCENDANTS;
@@ -3283,18 +3344,6 @@ static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
         if (!r->ndecls) continue;
         if (r->media != last) { last = r->media; media = last ? index_media(a, index, last) : 0; }
         for (int k = 0; k < r->sel->n; k++) {
-            for (const struct compound *part = r->sel->v[k]->right; part; part = part->left)
-                if (compound_has(part)) {
-                    if (!index->relational) {
-                        index->relational = ar_alloc(a, sizeof *index->relational);
-                        ht_init(a, &index->relational->ids, 16);
-                        ht_init(a, &index->relational->classes, 32);
-                        ht_init(a, &index->relational->tags, 16);
-                    }
-                    struct selector *subject = ar_alloc(a, sizeof *subject); subject->right = (struct compound *)part;
-                    index_rule(a, index->relational, NULL, subject, 0, 0);
-                    index->relational_siblings |= compound_has_siblings(part);
-                }
             index->form_features |= selector_form_features(r->sel->v[k]->right);
             if(selector_siblings(r->sel->v[k]->right)) {
                 index->siblings=true;
@@ -4244,6 +4293,12 @@ static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const
     sb_free(&work->output); ar_free(&work->arena); free(work); a->trap=outer;
 }
 
+/* Why an element restyles: the whole cascade, it has no style yet, it is in a
+   marked subtree, an ancestor's inherited values changed, or its own match. */
+/* What marked a subtree for restyle (node_t.style_mark_source). */
+enum { MARK_BOUNDARY, MARK_REACH, MARK_INSERTED, MARK_POSITION, MARK_RELATIONAL, MARK_PARENT_STATE, MARK_SOURCES };
+enum { REDO_CASCADE, REDO_NEW, REDO_INHERITED, REDO_SELF, REDO_MARKED, REDO_WHYS = REDO_MARKED + MARK_SOURCES };
+_Static_assert(REDO_WHYS == sizeof ((struct web_profile *)0)->style_redo / sizeof (uint64_t), "one counter per REDO_*");
 struct cascade {
     web_doc *d;
     float rem;
@@ -4251,6 +4306,7 @@ struct cascade {
     sbuf vbuf;
     arena_t *a;
     bool full;
+    uint8_t why; /* --debug-js, while full: why the elements below restyle (REDO_*) */
     jmp_buf *trap;
     struct cascade_frontier *frontier;
     /* The ancestor filter of the element being styled (its job's snapshot
@@ -4741,7 +4797,7 @@ static void motion_hide_subtree(node_t *n) {
 void css_node_style_free(node_t *n) {
     if (!n) return;
     css_motion_reset(n);
-    ar_free(&n->style_mem); ar_free(&n->style_previous_mem);
+    ar_free(&n->style_mem); ar_free(&n->style_previous_mem); ar_free(&n->style_inherit_mem);
     style_slots_free(&n->style_slots); style_slots_free(&n->style_previous_slots);
     declarations_free(&n->style_declarations);
     n->style = n->animation_base_style = n->style_previous = NULL;
@@ -4794,8 +4850,8 @@ static node_t *dirty_flat_parent(node_t *n) {
         doc_node_root(p,false)->shadow_host)return NULL;
     return p;
 }
-static void mark_style_subject(web_doc *d, node_t *n) {
-    n->style_dirty = true; d->style_pending_dirty = true;
+static void mark_style_subject(web_doc *d, node_t *n, uint8_t source) {
+    n->style_dirty = true; d->style_pending_dirty = true; n->style_mark_source = source;
     for (node_t *p = dirty_flat_parent(n); p; p = dirty_flat_parent(p)) p->style_children_dirty = true;
 }
 static bool relational_candidate(const struct compound *compound, node_t *node) {
@@ -4808,6 +4864,7 @@ static bool relational_candidate(const struct compound *compound, node_t *node) 
         if (s->kind == SK_TAG && (s->tag ? node->tag != s->tag : strcmp(node->name, s->name))) return false;
         if (s->kind == SK_ID && (!node->id || strcmp(node->id, s->name))) return false;
         if (s->kind == SK_CLASS && !node_has_class(node, s->name)) return false;
+        if (s->kind == SK_ATTR && !node_attr(node, s->name)) return false;
         /* Positive logical alternatives still require one alternative's stable
            subject keys. Never evaluate its dynamic pseudo or left ancestors;
            :not()/:has() cannot safely impose those keys on this subject. */
@@ -4819,22 +4876,28 @@ static bool relational_candidate(const struct compound *compound, node_t *node) 
     }
     return true;
 }
-static bool relational_bucket_candidate(const struct ient *list, node_t *node) {
-    for (; list; list = list->next) if (relational_candidate(list->sel->right, node)) return true;
+/* Calls visit with each entry of a subject index whose compound node's stable
+   keys can select, until it returns true; whether one did. */
+typedef bool subject_visit(void *context, const struct ient *entry, node_t *node);
+static bool visit_subjects(struct ient *const *list, node_t *node, subject_visit *visit, void *context) {
+    for (const struct ient *e = list ? *list : NULL; e; e = e->next)
+        if (relational_candidate(e->sel->right, node) && visit(context, e, node)) return true;
     return false;
 }
-static bool index_subject_candidate(struct css_index *index,node_t *node) {
+static bool index_subjects(struct css_index *index, node_t *node, subject_visit *visit, void *context) {
     if (!index) return false;
-    if (node->id) {
-        struct ient **list = ht_slot(NULL, &index->ids, node->id, false);
-        if (list && relational_bucket_candidate(*list, node)) return true;
-    }
-    for (int i = 0; i < node->nclasses; i++) {
-        struct ient **list = ht_slot(NULL, &index->classes, node->classes[i], false);
-        if (list && relational_bucket_candidate(*list, node)) return true;
-    }
-    struct ient **list = ht_slot(NULL, &index->tags, node->name, false);
-    return (list && relational_bucket_candidate(*list, node)) || relational_bucket_candidate(index->univ, node);
+    if (node->id && visit_subjects(ht_slot(NULL, &index->ids, node->id, false), node, visit, context)) return true;
+    for (int i = 0; i < node->nclasses; i++)
+        if (visit_subjects(ht_slot(NULL, &index->classes, node->classes[i], false), node, visit, context)) return true;
+    return visit_subjects(ht_slot(NULL, &index->tags, node->name, false), node, visit, context) ||
+        visit_subjects(&index->univ, node, visit, context);
+}
+static bool subject_found(void *context, const struct ient *entry, node_t *node) {
+    (void)context; (void)entry; (void)node;
+    return true;
+}
+static bool index_subject_candidate(struct css_index *index,node_t *node) {
+    return index_subjects(index, node, subject_found, NULL);
 }
 /* enum sibling_reach bits for which this element is a positional subject. */
 static unsigned sibling_bindings_reach(node_t *node,struct css_binding *bindings,unsigned wanted) {
@@ -4849,36 +4912,10 @@ static bool subject_bindings_candidate(node_t *node,struct css_binding *bindings
     if (dependency == SUBJECT_CHILD_SIBLING) return sibling_bindings_reach(node, bindings, 15) != 0;
     for (struct css_binding *binding = bindings; binding; binding = binding->next) {
         struct css_index *index = dependency==SUBJECT_CHILD_OUTER?binding->index->child_list_subjects:
-            dependency==SUBJECT_CHILD_PARENT?binding->index->child_list_parents:binding->index->relational;
+            binding->index->child_list_parents;
         if (index_subject_candidate(index, node)) return true;
     }
     return false;
-}
-static bool relational_scope_candidate(node_t *node,struct css_scope *scope) {
-    return subject_bindings_candidate(node,scope?scope->first:NULL,SUBJECT_RELATIONAL);
-}
-static bool relational_node_candidate(node_t *node) {
-    node_t *root = doc_node_root(node, false);
-    return relational_scope_candidate(node, root ? root->style_scope : NULL) ||
-        (node->shadow_root && relational_scope_candidate(node, node->shadow_root->style_scope));
-}
-/* Whether it marked a subject. */
-static bool mark_relational_dirty(web_doc *d, node_t *node) {
-    /* A descendant mutation can change ancestor :has(), and the following
-       tree of a preceding sibling's :has(+ ...)/:has(~ ...). A dirty subject
-       recascades its descendants for outer descendant combinators. Nonlocal
-       outer +/-/~ selectors still use the existing sibling boundary below. */
-    bool marked = false;
-    for (node_t *ancestor = node; ancestor && ancestor->type == N_ELEM; ancestor = ancestor->parent) {
-        for (node_t *subject = ancestor; subject; subject = d->sty.ctx->relational_siblings ? prev_elem(subject) : NULL) {
-            if (relational_node_candidate(subject)) {
-                node_t *boundary = d->sty.ctx->siblings && subject->parent && subject->parent->type == N_ELEM ? subject->parent : subject;
-                mark_style_subject(d, boundary);
-                marked = true;
-            }
-        }
-    }
-    return marked;
 }
 /* --debug-js: marks whose reach the feature tables decided, and the others;
    how many of the decided reached the boundary or a whole subtree, and the
@@ -4915,17 +4952,7 @@ static void mark_style_own(web_doc *d, node_t *n) {
 static void mark_style_boundary(web_doc *d, node_t *n) {
     node_t *parent = dirty_flat_parent(n);
     if (d->sty.ctx->siblings && parent && parent->type == N_ELEM) n = parent;
-    mark_style_subject(d, n);
-}
-void css_mark_dirty(web_doc *d, node_t *n) {
-    if (!d) return;
-    d->need_style = true;
-    if (!n || !d->sty.ctx) { d->style_full_dirty = true; return; }
-    if (n->type != N_ELEM) n = dirty_flat_parent(n);
-    if (!n) { d->style_full_dirty = true; return; }
-    if (d->sty.ctx->relational) mark_relational_dirty(d, n);
-    mark_style_boundary(d, n);
-    if (d->profile_enabled) style_marks.boundary++;
+    mark_style_subject(d, n, MARK_BOUNDARY);
 }
 
 /* The union of what one change reaches, over every sheet that can match the
@@ -5003,7 +5030,7 @@ static void mark_keyed(web_doc *d, node_t *top, const struct reach_set *r) {
 /* Restyle what r reaches from the elements of a chain, the deepest first, up
    to top (one element when they are the same). Their descendants are top's;
    each has its own following siblings. */
-static void mark_reach(web_doc *d, node_t *deepest, node_t *top, const struct reach_set *r) {
+static void mark_reach(web_doc *d, node_t *deepest, node_t *top, const struct reach_set *r, uint8_t source) {
     unsigned siblings = r->reach & (REACH_SIBLINGS | REACH_SIBLING_DESCENDANTS);
     bool parent = (r->reach & REACH_PARENT) || (siblings && (r->reach & REACH_KEYS_OVERFLOW));
     bool subtree = r->reach & (REACH_SUBTREE | REACH_KEYS_OVERFLOW);
@@ -5011,7 +5038,7 @@ static void mark_reach(web_doc *d, node_t *deepest, node_t *top, const struct re
     if (parent) { mark_style_boundary(d, top); return; }
     if (r->reach & REACH_SELF)
         for (node_t *p = deepest; p; p = p == top ? NULL : dirty_flat_parent(p)) mark_style_self(d, p);
-    if (subtree) mark_style_subject(d, top);
+    if (subtree) mark_style_subject(d, top, source);
     else if (r->reach & REACH_DESCENDANTS) mark_keyed(d, top, r);
     if (siblings)
         for (node_t *p = deepest; p; p = p == top ? NULL : dirty_flat_parent(p))
@@ -5026,6 +5053,182 @@ static void mark_reach(web_doc *d, node_t *deepest, node_t *top, const struct re
 static bool reach_known(web_doc *d, node_t *n) {
     node_t *root = n->type == N_ELEM ? doc_node_root(n, false) : NULL;
     return d->sty.ctx && !d->quirks && root && root->type == N_DOC && !n->foreign && !n->shadow_root && !n->assigned_slot;
+}
+
+static bool token_listed(const char *list, const char *token, size_t length) {
+    for (const char *p = list; p && *p;) {
+        while (is_space(*p)) p++;
+        const char *start = p;
+        while (*p && !is_space(*p)) p++;
+        if ((size_t)(p - start) == length && !memcmp(start, token, length)) return true;
+    }
+    return false;
+}
+/* What changed for :has(): an element's attribute or dynamic state, or an
+   inserted or removed subtree. */
+struct has_change {
+    node_t *node;   /* the changed element, or the subtree's root */
+    node_t *parent; /* the one element an argument after > can see it from, if there is one */
+    const struct css_attribute_change *attribute;
+    enum css_state state; /* when it is neither an attribute nor a subtree */
+    bool subtree;
+};
+/* Which elements a compound names a changed attribute, class or id of: 1 its
+   own, 2 another's (a complex argument of its pseudo-classes names others). */
+static unsigned compound_names(const struct compound *c, const struct css_attribute_change *change) {
+    bool classes = !strcmp(change->name, "class"), id = !strcmp(change->name, "id");
+    unsigned named = 0;
+    for (int i = 0; i < c->n; i++) {
+        const struct simple *s = &c->s[i];
+        if (s->kind == SK_ATTR && !strcmp(s->name, change->name)) named |= 1;
+        if (s->kind == SK_CLASS && classes) {
+            size_t length = strlen(s->name);
+            if (token_listed(change->old_value, s->name, length) != token_listed(change->new_value, s->name, length)) named |= 1;
+        }
+        if (s->kind == SK_ID && id && ((change->old_value && !strcmp(change->old_value, s->name)) ||
+                                        (change->new_value && !strcmp(change->new_value, s->name)))) named |= 1;
+        if (!s->args || (s->kind == SK_PC && s->pc == PC_HAS)) continue;
+        bool alternatives = s->kind == SK_PC && (s->pc == PC_NOT || s->pc == PC_IS);
+        for (int k = 0; k < s->args->n; k++) {
+            const struct compound *arg = s->args->v[k]->right;
+            for (const struct compound *part = arg; part; part = part->left) {
+                unsigned inner = compound_names(part, change);
+                named |= alternatives && !arg->left ? inner : inner ? 2 : 0;
+            }
+        }
+    }
+    return named;
+}
+static bool compound_names_state(const struct compound *c, enum css_state state) {
+    for (int i = 0; i < c->n; i++) {
+        const struct simple *s = &c->s[i];
+        if (pseudo_state(s) == (int)state) return true;
+        if (s->args && !(s->kind == SK_PC && s->pc == PC_HAS))
+            for (int k = 0; k < s->args->n; k++)
+                for (const struct compound *part = s->args->v[k]->right; part; part = part->left)
+                    if (compound_names_state(part, state)) return true;
+    }
+    return false;
+}
+/* Whether e can match c whatever changed: the changed attribute (its classes
+   or id) is not tested, and no element of an inserted or removed subtree is
+   hovered, active or focused (moving one of those restyles its boundary). */
+static bool compound_could_match(const struct compound *c, node_t *e, const struct has_change *change) {
+    const char *skip = change->attribute ? change->attribute->name : "";
+    for (int i = 0; i < c->n; i++) {
+        const struct simple *s = &c->s[i];
+        switch (s->kind) {
+        case SK_TAG: if (s->tag ? e->tag != s->tag : strcmp(e->name, s->name)) return false; break;
+        case SK_ID: if (strcmp(skip, "id") && (!e->id || strcmp(e->id, s->name))) return false; break;
+        case SK_CLASS: if (strcmp(skip, "class") && !node_has_class(e, s->name)) return false; break;
+        case SK_ATTR: if (strcmp(skip, s->name) && !match_attr(s, e)) return false; break;
+        case SK_PC:
+            if (s->pc == PC_NEVER || (change->subtree && pseudo_state(s) >= 0)) return false;
+            if (s->pc == PC_IS && s->args) {
+                bool any = false;
+                for (int k = 0; k < s->args->n && !any; k++) any = compound_could_match(s->args->v[k]->right, e, change);
+                if (!any) return false;
+            }
+            break;
+        default: break;
+        }
+    }
+    return true;
+}
+static bool argument_selects(const struct has_subject *h, node_t *e, const struct has_change *change) {
+    for (int k = 0; k < h->args->n; k++)
+        for (const struct compound *c = h->args->v[k]->right; c && !anchor_compound(c); c = c->left) {
+            unsigned named = change->subtree ? 1 : change->attribute ? compound_names(c, change->attribute) :
+                compound_names_state(c, change->state) ? 2 : 0;
+            if ((named & 2) || ((named & 1) && compound_could_match(c, e, change))) return true;
+        }
+    return false;
+}
+/* Whether a change can alter what h's arguments match: an inserted or removed
+   element one of their compounds can select (anything, when they count
+   siblings), or a changed attribute or state of an element one names. */
+static bool has_changed(const struct has_subject *h, const struct has_change *change) {
+    if (!change) return true;
+    if (!change->subtree) return argument_selects(h, change->node, change);
+    if (h->structure) return true;
+    node_t *top = change->node;
+    for (node_t *e = top;;) {
+        if (e->type == N_ELEM && argument_selects(h, e, change)) return true;
+        if (h->children) return false; /* only the root is a child of the parent */
+        if (e->first) { e = e->first; continue; }
+        while (e != top && !e->next) e = e->parent;
+        if (e == top) return false;
+        e = e->next;
+    }
+}
+/* One change's walk over the :has() subjects it can concern. */
+struct relational_walk {
+    web_doc *d;
+    const struct has_change *change;
+    bool sibling; /* the subject precedes the ancestor being walked */
+    bool marked;
+    node_t *top;  /* the highest ancestor subject whose match reaches below itself */
+    struct reach_set below;
+    struct { const struct has_subject *h; bool changed; } seen[16];
+    unsigned nseen;
+};
+static bool relational_visit(void *context, const struct ient *entry, node_t *subject) {
+    struct relational_walk *w = context;
+    const struct has_subject *h = entry->has;
+    const struct has_change *change = w->change;
+    if (w->sibling ? !h->siblings : h->children && change && change->parent && subject != change->parent) return false;
+    unsigned i = 0;
+    while (i < w->nseen && w->seen[i].h != h) i++;
+    bool changed = i < w->nseen ? w->seen[i].changed : has_changed(h, change);
+    if (i == w->nseen && i < sizeof w->seen / sizeof *w->seen) { w->seen[i].h = h; w->seen[i].changed = changed; w->nseen++; }
+    if (!changed) return false;
+    w->marked = true;
+    const struct css_feature *f = h->reach;
+    unsigned beside = REACH_SIBLINGS | REACH_SIBLING_DESCENDANTS;
+    if (f->reach & REACH_SELF) mark_style_self(w->d, subject);
+    else if (w->sibling || (f->reach & beside)) {
+        /* Everything a preceding sibling reaches, or an ancestor's own following siblings. */
+        struct reach_set r = {0};
+        reach_feature(&r, f);
+        mark_reach(w->d, subject, subject, &r, MARK_RELATIONAL);
+    } else {
+        /* Below an ancestor: the highest one's subtree holds the others'. */
+        reach_feature(&w->below, f);
+        w->top = subject;
+    }
+    return false;
+}
+static void relational_scope(struct relational_walk *w, const struct css_scope *scope, node_t *subject) {
+    for (const struct css_binding *b = scope ? scope->first : NULL; b; b = b->next)
+        index_subjects(b->index->relational, subject, relational_visit, w);
+}
+/* Restyle what the :has() subjects a change can concern reach, and whether
+   there were any: the change's ancestors (from its parent, or for a child
+   list the parent itself) and, for arguments after + or ~, their preceding
+   siblings. A changed element's own :has() does not look at itself. */
+static bool mark_relational_dirty(web_doc *d, node_t *node, const struct has_change *change) {
+    struct relational_walk w = {.d = d, .change = change};
+    node_t *changed = change && !change->subtree ? change->node : NULL, *root = doc_node_root(node, false);
+    const struct css_scope *scope = root ? root->style_scope : NULL;
+    for (node_t *ancestor = node; ancestor && ancestor->type == N_ELEM; ancestor = ancestor->parent)
+        for (node_t *subject = ancestor; subject; subject = d->sty.ctx->relational_siblings ? prev_elem(subject) : NULL) {
+            if (subject == changed) continue;
+            w.sibling = subject != ancestor;
+            relational_scope(&w, scope, subject);
+            if (subject->shadow_root) relational_scope(&w, subject->shadow_root->style_scope, subject);
+        }
+    if (w.top) mark_reach(d, w.top, w.top, &w.below, MARK_RELATIONAL);
+    return w.marked;
+}
+void css_mark_dirty(web_doc *d, node_t *n) {
+    if (!d) return;
+    d->need_style = true;
+    if (!n || !d->sty.ctx) { d->style_full_dirty = true; return; }
+    if (n->type != N_ELEM) n = dirty_flat_parent(n);
+    if (!n) { d->style_full_dirty = true; return; }
+    if (d->sty.ctx->relational) mark_relational_dirty(d, n, NULL);
+    mark_style_boundary(d, n);
+    if (d->profile_enabled) style_marks.boundary++;
 }
 
 /* :hover, :active, :focus and :focus-within hold for a target and its flat
@@ -5043,12 +5246,13 @@ static void mark_state_part(web_doc *d, enum css_state state, node_t *deepest, n
         if (!reach_known(d, p)) { css_mark_dirty(d, top); return; }
     struct reach_set r = {0};
     reach_state(d, doc_node_root(top, false)->style_scope, state, &r);
-    bool relational = d->sty.ctx->relational && mark_relational_dirty(d, deepest);
+    bool relational = d->sty.ctx->relational &&
+        mark_relational_dirty(d, deepest, &(struct has_change){.node = deepest, .state = state});
     if (!r.reach && !relational) return; /* no selector reads this state here */
     d->need_style = true;
     if (d->profile_enabled && (r.reach & (REACH_PARENT | REACH_SUBTREE)))
         style_mark_name(state == CSS_STATE_HOVER ? ":hover" : state == CSS_STATE_ACTIVE ? ":active" : ":focus", state == CSS_STATE_HOVER ? 6 : 7);
-    mark_reach(d, deepest, top, &r);
+    mark_reach(d, deepest, top, &r, MARK_REACH);
     if (d->profile_enabled) style_marks.precise++;
 }
 void css_mark_state_moved(web_doc *d, enum css_state state, node_t *from, node_t *to) {
@@ -5082,15 +5286,6 @@ static bool state_attribute(const char *name) {
     for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(name, names[i])) return true;
     return false;
 }
-static bool token_listed(const char *list, const char *token, size_t length) {
-    for (const char *p = list; p && *p;) {
-        while (is_space(*p)) p++;
-        const char *start = p;
-        while (*p && !is_space(*p)) p++;
-        if ((size_t)(p - start) == length && !memcmp(start, token, length)) return true;
-    }
-    return false;
-}
 /* The classes of one list missing from the other: only they changed. */
 static void reach_classes(web_doc *d, const struct css_scope *scope, const char *list, const char *other,
                           struct reach_set *r) {
@@ -5108,7 +5303,8 @@ void css_mark_attribute_dirty(web_doc *d, node_t *n, const struct css_attribute_
         css_mark_dirty(d, n); return;
     }
     d->need_style = true;
-    if (d->sty.ctx->relational) mark_relational_dirty(d, n);
+    if (d->sty.ctx->relational)
+        mark_relational_dirty(d, n, &(struct has_change){.node = n, .parent = n->parent, .attribute = change});
     const struct css_scope *scope = doc_node_root(n, false)->style_scope;
     /* The element itself always: presentational hints, attr() and the style attribute. */
     struct reach_set r = {.reach = hint_reaches_descendants(n, change->name) ? REACH_SUBTREE : REACH_SELF};
@@ -5120,7 +5316,7 @@ void css_mark_attribute_dirty(web_doc *d, node_t *n, const struct css_attribute_
         if (change->old_value) reach_named(d, scope, FEATURE_ID, change->old_value, strlen(change->old_value), &r);
         if (change->new_value) reach_named(d, scope, FEATURE_ID, change->new_value, strlen(change->new_value), &r);
     }
-    mark_reach(d, n, n, &r);
+    mark_reach(d, n, n, &r, MARK_REACH);
     if (d->profile_enabled) style_marks.precise++;
 }
 /* A control's value, checkedness or selection changed. The control restyles
@@ -5164,7 +5360,9 @@ void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool in
         css_mark_dirty(d,parent);return;
     }
     d->need_style=true;
-    if(d->sty.ctx->relational)mark_relational_dirty(d,parent);
+    /* Quirks classes and ids compare without case: what an argument names is not known exactly. */
+    if(d->sty.ctx->relational)
+        mark_relational_dirty(d,parent,d->quirks?NULL:&(struct has_change){.node=subtree,.parent=parent,.subtree=true});
     struct css_scope *scope=root?root->style_scope:NULL;
     bool outer_state=d->sty.ctx->siblings &&
         (subject_bindings_candidate(parent,scope?scope->first:NULL,SUBJECT_CHILD_OUTER) ||
@@ -5175,7 +5373,7 @@ void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool in
        subject_bindings_candidate(parent,d->sty.ctx->ua,SUBJECT_CHILD_PARENT)) {
         /* Parent state can affect even descendants with no inherited changes
            (for example .parent:empty + .next .child). Keep that full boundary. */
-        mark_style_subject(d,boundary&&boundary->type==N_ELEM?boundary:parent);return;
+        mark_style_subject(d,boundary&&boundary->type==N_ELEM?boundary:parent,MARK_PARENT_STATE);return;
     }
     /* Insertion does not itself change a parent's inherited/custom values.
        Publish the ancestor dirty path without turning it into a full subtree
@@ -5183,14 +5381,14 @@ void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool in
        removal must not recascade the detached former child. */
     d->style_pending_dirty=true;
     for(node_t *p=parent;p;p=dirty_flat_parent(p))p->style_children_dirty=true;
-    if(subtree->parent==parent && subtree->type==N_ELEM)mark_style_subject(d,subtree);
+    if(subtree->parent==parent && subtree->type==N_ELEM)mark_style_subject(d,subtree,MARK_INSERTED);
     struct css_binding *authored=scope?scope->first:NULL,*ua=d->sty.ctx->ua;
     if(!inserted || subtree->parent!=parent) {
         /* Removal and reordering lost the former position: any positional
            subject among the remaining children may have changed. */
         for(node_t *child=parent->first;child;child=child->next)if(child->type==N_ELEM &&
             (sibling_bindings_reach(child,authored,15) || sibling_bindings_reach(child,ua,15)))
-            mark_style_subject(d,child);
+            mark_style_subject(d,child,MARK_POSITION);
         return;
     }
     /* Positional pseudo-classes and sibling combinators count elements only. */
@@ -5206,13 +5404,13 @@ void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool in
         bool near=child==next || child==next_type;
         unsigned wanted=near?SIBLING_NEXT|SIBLING_FOLLOWING:SIBLING_FOLLOWING;
         if(sibling_bindings_reach(child,authored,wanted) || sibling_bindings_reach(child,ua,wanted))
-            mark_style_subject(d,child);
+            mark_style_subject(d,child,MARK_POSITION);
     }
     for(node_t *child=prev;child;child=prev_elem(child)) {
         bool near=child==prev || child==prev_type;
         unsigned wanted=near?SIBLING_PREVIOUS|SIBLING_PRECEDING:SIBLING_PRECEDING;
         if(sibling_bindings_reach(child,authored,wanted) || sibling_bindings_reach(child,ua,wanted))
-            mark_style_subject(d,child);
+            mark_style_subject(d,child,MARK_POSITION);
     }
 }
 
@@ -5499,9 +5697,31 @@ static void keep_previous_style(node_t *e) {
     e->style_previous_mem.trap = NULL;
 }
 
+/* Only e's own values changed, not what its children inherit (the template
+   css_style_init makes from it, and the display their blockification reads):
+   the new style takes the retired one's inherited values, which the children's
+   styles borrow, so the children keep their styles. When those values were the
+   retired style's own, its memory becomes e's inherit arena; otherwise they
+   are already there or an ancestor's. Not inlined: the templates stay off the
+   recursive walk's frames. */
+static __attribute__((noinline)) bool adopt_inherited(node_t *e) {
+    const style_t *was = e->style_previous;
+    style_t *s = e->style;
+    if (s->display != was->display) return false;
+    style_t from_was, from_new;
+    css_style_init(&from_was, was); css_style_init(&from_new, s);
+    if (!style_equal(&from_was, &from_new)) return false;
+    css_style_adopt_inherited(s, was);
+    if (!e->style_inherit_mem.head) {
+        e->style_inherit_mem = e->style_previous_mem; e->style_inherit_mem.trap = NULL;
+        memset(&e->style_previous_mem, 0, sizeof e->style_previous_mem);
+    }
+    return true;
+}
+
 static void cascade_node(struct cascade *c, node_t *e, const style_t *parent);
 /* Siblings queued together share one copy of their ancestor filter. */
-struct cascade_job { node_t *node; const style_t *parent; float rem; bool full; size_t ancestors; };
+struct cascade_job { node_t *node; const style_t *parent; float rem; bool full; uint8_t why; size_t ancestors; };
 struct cascade_frontier {
     struct cascade_job *v; size_t n, cap;
     struct ancestor_filter *filters; size_t filter_count, filter_cap;
@@ -5528,7 +5748,7 @@ static void cascade_enqueue(struct cascade *c, node_t *e, const style_t *parent)
         ancestor_snapshot(&f->filters[f->filter_count], c->ancestor_base, c->ancestor_counts);
         c->ancestors_published = f->filter_count++;
     }
-    f->v[f->n++] = (struct cascade_job){e, parent, c->rem, c->full, c->ancestors_published};
+    f->v[f->n++] = (struct cascade_job){e, parent, c->rem, c->full, c->why, c->ancestors_published};
 }
 static void cascade_worker(size_t i, void *context) {
     struct cascade_batch *batch = context;
@@ -5538,7 +5758,7 @@ static void cascade_worker(size_t i, void *context) {
     struct css_scratch scratch = {.worker=true};
     void *previous = thread_local_get(2); thread_local_set(2, &scratch);
     struct cascade c = batch->parent; c.vbuf = (sbuf){0};
-    c.rem = job->rem; c.full = job->full; c.frontier = NULL;
+    c.rem = job->rem; c.full = job->full; c.why = job->why; c.frontier = NULL;
     struct ancestor_counts counts = {0};
     c.ancestor_base = &batch->filters[job->ancestors]; c.ancestor_counts = &counts;
     c.ancestors_published = SIZE_MAX;
@@ -5579,13 +5799,17 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     bool redo = c->full || e->style_dirty || e->style_self_dirty || !e->style;
     if (!redo && !e->style_children_dirty) return;
     bool inherited_full = c->full;
-    /* Only this element's own match changed: its descendants restyle when its
-       style does, since they inherit from it and borrow from its arena. */
+    /* Only this element's own match changed: its descendants restyle when what
+       they inherit from it does, since they borrow those values from it. */
     bool self_only = redo && !c->full && !e->style_dirty && e->style;
+    bool children_redo = redo, adopted = false;
+    uint8_t inherited_why = c->why, why = c->full ? c->why : !e->style ? REDO_NEW :
+        e->style_dirty ? REDO_MARKED + e->style_mark_source : REDO_SELF;
     if (!redo) goto descend;
     retire_style(c, e);
     css_scratch_get()->arena=c->a;
     if(d->profile_enabled) {
+        __atomic_fetch_add(&d->profile.style_redo[why], 1, __ATOMIC_RELAXED);
         parallel_record_work(PARALLEL_STYLE, 1);
         __atomic_fetch_add(&d->profile.style_visits, 1, __ATOMIC_RELAXED);
         if (css_worker() && parallel_worker_index()) __atomic_fetch_add(&d->profile.style_parallel_nodes, 1, __ATOMIC_RELAXED);
@@ -5693,14 +5917,24 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     s->after_generated=box_pseudo_generated(e,s,s->after);
     if (self_only && !e->animation_base_style && style_equal(e->style_previous, s)) {
         keep_previous_style(e);
-        redo = false;
+        children_redo = false;
         if (d->profile_enabled) __atomic_fetch_add(&d->profile.style_kept, 1, __ATOMIC_RELAXED);
-    } else if (!style_box_compatible(e, e->style_previous, s)) {
-        __atomic_store_n(&d->style_boxes_changed, true, __ATOMIC_RELAXED);
-        /* This worker alone writes e; the publication after the join reads
-           box_regen from the retired list, and the release clears it. */
-        if(e->style_previous){e->box_regen=true;__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);}
-        if(d->profile_enabled && e->style_previous)__atomic_store_n(&d->box_change_node,e,__ATOMIC_RELAXED);
+    } else {
+        if (!style_box_compatible(e, e->style_previous, s)) {
+            __atomic_store_n(&d->style_boxes_changed, true, __ATOMIC_RELAXED);
+            /* This worker alone writes e; the publication after the join reads
+               box_regen from the retired list, and the release clears it. */
+            if(e->style_previous){e->box_regen=true;__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);}
+            if(d->profile_enabled && e->style_previous)__atomic_store_n(&d->box_change_node,e,__ATOMIC_RELAXED);
+        }
+        if (self_only && !e->animation_base_style && adopt_inherited(e)) {
+            children_redo = false; adopted = true;
+            if (d->profile_enabled) __atomic_fetch_add(&d->profile.style_adopted, 1, __ATOMIC_RELAXED);
+        } else {
+            /* The children restyle from the new values; what they borrowed
+               retires with the old style. */
+            ar_adopt(&e->style_previous_mem, &e->style_inherit_mem);
+        }
     }
     e->style_mem.trap = NULL;
 descend:
@@ -5711,9 +5945,16 @@ descend:
         clear_styles(e);
         return;
     }
-    c->full = redo;
+    c->full = children_redo;
+    c->why = why == REDO_SELF ? REDO_INHERITED : why;
     pvec children = {0};
     doc_flat_children(e, &children);
+    /* A child that took a value it does not inherit from e reads e's own. */
+    if (adopted)
+        for (int i = 0; i < children.n; i++) {
+            node_t *ch = children.v[i];
+            if (ch->type == N_ELEM && ch->style && ch->style->explicit_inherit) ch->style_self_dirty = true;
+        }
     size_t above_published = c->ancestors_published;
     ancestor_counts_apply(c->ancestor_counts, e, 1);
     c->ancestors_published = SIZE_MAX;
@@ -5733,7 +5974,7 @@ descend:
     ancestor_counts_apply(c->ancestor_counts, e, -1);
     c->ancestors_published = above_published;
     pv_free(&children);
-    c->full = inherited_full;
+    c->full = inherited_full; c->why = inherited_why;
 }
 
 /* The elements a cascade from root restyles, at most: every element below a
@@ -5782,7 +6023,7 @@ static void cascade_frontier_run(struct cascade *c, node_t *root) {
             if (f.v[i].node->style_subtree_work > f.v[largest].node->style_subtree_work) largest = i;
         if (f.v[largest].node->style_subtree_work <= target) break;
         struct cascade_job job = f.v[largest]; f.v[largest] = f.v[--f.n];
-        c->rem = job.rem; c->full = job.full;
+        c->rem = job.rem; c->full = job.full; c->why = job.why;
         /* A copy: enqueueing the branch's children may move f.filters. The
            walk's counts are balanced, so they are empty between branches. */
         struct ancestor_filter base = f.filters[job.ancestors];
@@ -5801,19 +6042,25 @@ static void cascade_frontier_run(struct cascade *c, node_t *root) {
 enum { FULL_BY_INDEX, FULL_BY_MARK, FULL_BY_FIRST, FULL_BY_UNMARKED };
 enum { INDEX_BY_SHEETS, INDEX_BY_ENVIRONMENT };
 static struct {
-    uint64_t cascades, full, full_by[4], ms, indexes, index_by[2], index_ms, rescans[2], elements, kept, candidates, filtered,
+    uint64_t cascades, full, full_by[4], ms, indexes, index_by[2], index_ms, rescans[2], elements, redo[REDO_WHYS], kept, adopted, candidates, filtered,
         bucket[4], lookups;
 } style_profile;
 int web_style_report(char *out, size_t size) {
     if (!style_profile.cascades) return 0;
-    int n = snprintf(out, size, "Native style profile: cascades %lu/%lu ms (full %lu: index %lu, marked %lu, first %lu, unmarked %lu), bindings %lu (sheets %lu, environment %lu)/%lu ms, rescans %lu changed/%lu same, elements %lu (kept %lu), marks %lu precise (parent %lu, subtree %lu)/%lu boundary, rule candidates %lu (id %lu, class %lu, tag %lu, universal %lu), filtered by ancestors %lu, bindings looked up %lu (inclusive)",
+    int n = snprintf(out, size, "Native style profile: cascades %lu/%lu ms (full %lu: index %lu, marked %lu, first %lu, unmarked %lu), bindings %lu (sheets %lu, environment %lu)/%lu ms, rescans %lu changed/%lu same, elements %lu (whole %lu, new %lu, inherited %lu, own %lu, marked: boundary %lu, reach %lu, inserted %lu, position %lu, relational %lu, parent state %lu; kept %lu, adopted %lu), marks %lu precise (parent %lu, subtree %lu)/%lu boundary, rule candidates %lu (id %lu, class %lu, tag %lu, universal %lu), filtered by ancestors %lu, bindings looked up %lu (inclusive)",
         (unsigned long)style_profile.cascades, (unsigned long)style_profile.ms, (unsigned long)style_profile.full,
         (unsigned long)style_profile.full_by[FULL_BY_INDEX], (unsigned long)style_profile.full_by[FULL_BY_MARK],
         (unsigned long)style_profile.full_by[FULL_BY_FIRST],
         (unsigned long)style_profile.full_by[FULL_BY_UNMARKED], (unsigned long)style_profile.indexes,
         (unsigned long)style_profile.index_by[INDEX_BY_SHEETS], (unsigned long)style_profile.index_by[INDEX_BY_ENVIRONMENT],
         (unsigned long)style_profile.index_ms, (unsigned long)style_profile.rescans[0], (unsigned long)style_profile.rescans[1],
-        (unsigned long)style_profile.elements, (unsigned long)style_profile.kept,
+        (unsigned long)style_profile.elements, (unsigned long)style_profile.redo[REDO_CASCADE],
+        (unsigned long)style_profile.redo[REDO_NEW], (unsigned long)style_profile.redo[REDO_INHERITED],
+        (unsigned long)style_profile.redo[REDO_SELF], (unsigned long)style_profile.redo[REDO_MARKED + MARK_BOUNDARY],
+        (unsigned long)style_profile.redo[REDO_MARKED + MARK_REACH], (unsigned long)style_profile.redo[REDO_MARKED + MARK_INSERTED],
+        (unsigned long)style_profile.redo[REDO_MARKED + MARK_POSITION], (unsigned long)style_profile.redo[REDO_MARKED + MARK_RELATIONAL],
+        (unsigned long)style_profile.redo[REDO_MARKED + MARK_PARENT_STATE],
+        (unsigned long)style_profile.kept, (unsigned long)style_profile.adopted,
         (unsigned long)style_marks.precise, (unsigned long)style_marks.parent, (unsigned long)style_marks.subtree,
         (unsigned long)style_marks.boundary, (unsigned long)style_profile.candidates,
         (unsigned long)style_profile.bucket[0], (unsigned long)style_profile.bucket[1],
@@ -5922,7 +6169,7 @@ void css_cascade(web_doc *d, int vw, int vh) {
     d->box_change_node = NULL;
     struct ancestor_counts ancestors = {0};
     struct cascade c = {.d=d, .rem=d->html && d->html->style ? d->html->style->font_size : 16,
-        .vw=vw, .vh=vh, .a=&d->smem, .full=full, .trap=d->smem.trap,
+        .vw=vw, .vh=vh, .a=&d->smem, .full=full, .why=REDO_CASCADE, .trap=d->smem.trap,
         .ancestor_counts=&ancestors, .ancestors_published=SIZE_MAX};
     if (d->html) cascade_frontier_run(&c, d->html);
     font_bindings_clear();
@@ -5936,6 +6183,8 @@ void css_cascade(web_doc *d, int vw, int vh) {
         style_profile.ms += uptime_ms() - profile_start;
         style_profile.elements += d->profile.style_visits - profile_before.style_visits;
         style_profile.kept += d->profile.style_kept - profile_before.style_kept;
+        style_profile.adopted += d->profile.style_adopted - profile_before.style_adopted;
+        for (int i = 0; i < REDO_WHYS; i++) style_profile.redo[i] += d->profile.style_redo[i] - profile_before.style_redo[i];
         style_profile.candidates += d->profile.style_rule_checks - profile_before.style_rule_checks;
         style_profile.filtered += d->profile.style_rule_filtered - profile_before.style_rule_filtered;
         style_profile.lookups += d->profile.style_rule_indexes - profile_before.style_rule_indexes;

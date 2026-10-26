@@ -284,6 +284,27 @@ static void font_shorthand_cases(void) {
         free(set);ar_free(&arena);
     }
 }
+/* A restyle that changes only values the children do not inherit leaves the
+   children's borrowed inherited values valid: the new style takes them over. */
+static void inherited_split_cases(void) {
+    arena_t arena={0};style_t parent,was,now;css_style_init(&parent,NULL);parent.color=0xFF102030u;
+    css_style_init(&was,&parent);was.font_names=ar_strdup(&arena,"serif");was.bg_color=0xFF0000FFu;was.display=D_BLOCK;
+    now=was;now.font_names=ar_strdup(&arena,"serif");now.bg_color=0xFF00FF00u;
+    css_style_adopt_inherited(&now,&was);
+    check(now.font_names==was.font_names,"an adopted style borrows the retired style's inherited values");
+    check(now.bg_color==0xFF00FF00u && now.display==D_BLOCK && now.color==0xFF102030u,"an adopted style keeps its own values");
+    const struct propdef *border=css_prop_lookup("border-top-color",16),*color=css_prop_lookup("color",5);
+    uint8_t *set=calloc((size_t)css_prop_count(),1);
+    style_t child;css_style_init(&child,&now);
+    struct cx cx={.a=&arena,.s=&child,.parent=&now,.set=set,.em=16,.rem=16,.vw=1920,.vh=1080};
+    css_apply(color,"inherit",7,&cx);
+    check(!child.explicit_inherit,"inheriting an inherited property reads only what css_style_init copies");
+    css_apply(border,"inherit",7,&cx);
+    check(child.explicit_inherit,"inheriting a property that is not inherited reads the parent's own value");
+    style_t grandchild;css_style_init(&grandchild,&child);
+    check(!grandchild.explicit_inherit,"the mark belongs to the style that read its parent");
+    free(set);ar_free(&arena);
+}
 static void text_overflow_cases(void) {
     static const struct {const char *value;bool valid;uint8_t computed;} cases[]={
         {"clip",true,TO_CLIP},{"ellipsis",true,TO_ELLIPSIS},{"ELLIPSIS",true,TO_ELLIPSIS},
@@ -436,6 +457,6 @@ int main(int argc, char **argv) {
     if(argc>1 && !strcmp(argv[1],"fonts"))font_sources_native();
     else
     if (argc>1 && !strcmp(argv[1],"second")) { pseudo_generations(); cancelled_tail(); allocation_failures(); }
-    else { fixed_styles(); adopted_style(); declaration_cache(); }
+    else { fixed_styles(); adopted_style(); declaration_cache(); inherited_split_cases(); }
     printf("cssperformance: %d checks, %d failures\n", checks, failed); return failed ? 1 : 0;
 }

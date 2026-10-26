@@ -296,7 +296,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--boundaries")) return boundaries();
     const char *html = "<!doctype html><html><head><style>"
         ".subject{color:red}.subject:has(>.witness){color:blue}"
-        ".sibling:has(+.following .flag){background-color:lime}"
+        ".sibling:has(+.following .flag){background-color:lime}:has(>.icon){color:lime}"
         "@supports selector(:has(>.witness)){.conditional{height:23px}}"
         "</style></head><body><main id='main'>"
         "<div id='a' class='subject x conditional'><span id='w' class='witness a'></span>"
@@ -341,6 +341,23 @@ int main(int argc, char **argv) {
     check(a->style->color == 0xff0000ffu && a->box && a->box->h == 23, "has selector and supports actual cascade");
     check(s->style->bg_color == 0xff00ff00u, "sibling descendant cascade");
     style_t *untouched = unrelated->style;
+    /* A change no argument names, or one only its parent can see, restyles no other subject. */
+    node_t *nest = id(doc, "nest"), *deep = id(doc, "deep");
+    check(nest && deep, "nested targets"); if (!nest || !deep) { web_free(doc); return 1; }
+    style_t *held = a->style, *held_main = main->style;
+    node_t *noise = element(doc, nest, "span", "noise"); web_layout(doc, 1000, 600);
+    check(noise && noise->style && a->style == held && main->style == held_main,
+          "insertion no argument names keeps has subjects");
+    doc_node_attr(doc, deep, "class", "b c"); web_layout(doc, 1000, 600);
+    check(a->style == held && main->style == held_main, "class change no argument names keeps has subjects");
+    node_t *icon = element(doc, nest, "i", "icon"); web_layout(doc, 1000, 600);
+    check(icon && nest->style->color == 0xff00ff00u && a->style == held && main->style == held_main,
+          "keyless child argument restyles the parent alone");
+    if (icon) doc_node_remove(doc, icon);
+    web_layout(doc, 1000, 600);
+    check(nest->style->color == 0xff0000ffu && a->style == held, "removed child witness restyles the parent alone");
+    if (noise) doc_node_remove(doc, noise);
+    doc_node_attr(doc, deep, "class", "b"); web_layout(doc, 1000, 600);
     doc_node_attr(doc, w, "class", "a"); web_layout(doc, 1000, 600);
     check(a->style->color == 0xffff0000u, "attribute removal invalidates old ancestor match");
     check(unrelated->style == untouched, "unrelated subtree styles retained on descendant attribute mutation");
