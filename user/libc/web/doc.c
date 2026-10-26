@@ -1593,15 +1593,16 @@ reflow:
         if (d->root) register_bg(d, d->root);
         if (!d->root_box || d->style_boxes_changed || d->need_boxes) {
             bool local=false;
-            if(d->root_box && !d->style_existing_boxes_changed){
+            if(d->root_box){
                 boxes_restyle(d); /* refresh existing arena borrows before branch publication */
                 local=boxes_rebuild_local(d);
             }
             if(local)slow_locals++;else slow_rebuilds++;
             if(d->profile_enabled && !local){
-                char line[160];
-                snprintf(line,sizeof line,"Box rebuild flags: root %d, style %d, existing %d, dom %d",
-                    !!d->root_box,d->style_boxes_changed,d->style_existing_boxes_changed,d->need_boxes);
+                char line[200];
+                snprintf(line,sizeof line,"Box rebuild flags: root %d, style %d, existing %d, dom %d, because %s",
+                    !!d->root_box,d->style_boxes_changed,d->style_existing_boxes_changed,d->need_boxes,
+                    d->box_full_reason?d->box_full_reason:"no box tree");
                 web_js_console(d,1,line);
                 css_box_change_report(d);
             }
@@ -1626,10 +1627,14 @@ reflow:
     } else if(d->need_boxes) {
         /* Computed styles remain owned by smem. Only text boxes/anonymous
            styles borrow bmem, so old box ownership can be reclaimed safely. */
-        boxes_discard(d);
-        d->bmem.trap=d->smem.trap;
-        boxes_build(d,&d->bmem);
-        d->bmem.trap=NULL;
+        if(d->root_box && boxes_rebuild_local(d))slow_locals++;
+        else{
+            boxes_discard(d);
+            d->bmem.trap=d->smem.trap;
+            boxes_build(d,&d->bmem);
+            d->bmem.trap=NULL;
+            slow_rebuilds++;
+        }
         if (d->native_cancelled) goto cancelled;
         d->need_boxes=false;
     }

@@ -42,16 +42,18 @@ for signature in ("static uint32_t with_alpha(", "static uint32_t control_text_c
     start = paint.index(signature)
     production += paint[start:paint.index("\n}", start) + 2] + "\n"
 box = (root / "user/libc/web/box.c").read_text(encoding="utf-8")
-for signature in ("static int atomic_kind(", "bool box_pseudo_generated("):
+def box_function(signature):
     start = box.index(signature)
-    production += box[start:box.index("\n}", start) + 2] + "\n"
-start = box.index("struct local_box_subject {")
-production += box[start:box.index("\n", start)+1]
-for signature in ("static bool local_plain_length(", "static bool local_plain_style(",
-                  "static bool local_plain_subtree(", "static struct local_box_subject *local_subject(",
-                  "static bool local_plain_parent("):
-    start = box.index(signature)
-    production += box[start:box.index("\n}", start) + 2] + "\n"
+    first = box[start:box.index("\n", start)]
+    return (first if first.endswith("}") else box[start:box.index("\n}", start) + 2]) + "\n"
+# The decisions of a local box publication: where a regenerated box goes in
+# its parent's fixup, and which list a changed item renumbers.
+for signature in ("static int atomic_kind(", "bool box_pseudo_generated(", "bool box_block_level(",
+                  "static bool preserves_space(", "static bool ws_only(", "static bool table_part(",
+                  "static bool real_inline(", "static bool local_same_place(", "static bool inline_content(",
+                  "static bool local_collapses(", "static bool is_list(", "static bool listish(",
+                  "static bool list_numbered(", "static node_t *local_list_scope("):
+    production += box_function(signature)
 dom = (root / "user/libc/web/dom.c").read_text(encoding="utf-8")
 for signature in ("node_t *doc_shadow_parent(", "node_t *doc_node_root("):
     start = dom.index(signature)
@@ -60,7 +62,7 @@ document = (root / "user/libc/web/doc.c").read_text(encoding="utf-8")
 start = document.index("static bool committed_geometry_current(")
 production += document[start:document.index("\n}", start) + 2] + "\n"
 native = out / "native.c"
-native.write_text(production + "\nbool web_native_checkpoint(web_doc *d){(void)d;return true;}\nvoid web_avmedia_checkpoint(void){}\n" + cases,
+native.write_text(production + "\nbool web_native_checkpoint(web_doc *d){(void)d;return true;}\nvoid web_avmedia_checkpoint(void){}\nint display_bits_per_channel(void){return 8;}\n" + cases,
                   encoding="utf-8")
 cc = root / "tools/msys64/ucrt64/bin/clang.exe"
 abi = out / "host-abi"
@@ -69,12 +71,16 @@ abi.mkdir(exist_ok=True)
                                encoding="utf-8")
 http = (root / "user/libc/http.c").read_text(encoding="utf-8")
 urls = out / "url.c"
-urls.write_text(http[:http.index("enum http_url_result http_origin_owned_n(")], encoding="utf-8")
+# URL parsing only: the connection pool between the includes and url_parse
+# needs the network and HTTP/2 layers.
+urls.write_text(http[:http.index("/* The pool is process-local.")] +
+                http[http.index("bool url_parse(const char *s"):http.index("enum http_url_result http_origin_owned_n(")],
+                encoding="utf-8")
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH", ""))
 exe = out / "native.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include", "-Icommon",
-           "-Iuser/libc/web", "-Itests", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c",
+           "-Iuser/libc", "-Iuser/libc/web", "-Itests", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c",
            "user/libc/web/util.c", "user/libc/web/html.c", str(urls), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)] + (["local-boxes"] if "--local-boxes" in sys.argv else ["placeholder"] if "--placeholder" in sys.argv else ["text-overflow"] if "--text-overflow" in sys.argv else ["font-shorthand"] if "--font-shorthand" in sys.argv else ["flex"] if "--flex" in sys.argv else ["media-calc"] if "--media-calc" in sys.argv else ["fonts"] if "--fonts" in sys.argv else ["second"] if "--second" in sys.argv else []), cwd=root, env=env, check=True, timeout=30)

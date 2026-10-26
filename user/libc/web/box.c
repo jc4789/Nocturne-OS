@@ -15,6 +15,7 @@ struct bctx {
     web_doc *d;
     arena_t *a;
     node_t *top;
+    uint32_t epoch;
 };
 
 static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
@@ -26,6 +27,7 @@ static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
         (kind != B_INLINE && css_transform_general(st)));
     x->baseline = -1;
     x->colspan = x->rowspan = 1;
+    x->epoch = b->epoch;
     return x;
 }
 
@@ -879,7 +881,9 @@ static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
     x->floated = st->float_ != FL_NONE;
     x->abspos = st->position == POS_ABSOLUTE || st->position == POS_FIXED;
     if(st->content_visibility!=CV_VISIBLE && x->kind!=B_INLINE)x->is_bfc=true;
-    if (!n->box) n->box = x;
+    /* Every node is generated once per publication. A moved node may still
+       name its former box, which its former parent retires afterwards. */
+    n->box = x; n->anchor_block = NULL;
     append(pb, x);
 }
 
@@ -887,6 +891,12 @@ static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
 static bool table_part(const box_t *c) {
     return !c->floated && !c->abspos &&
            (c->kind == B_ROW_GROUP || c->kind == B_ROW || c->kind == B_CELL || c->kind == B_CAPTION);
+}
+
+/* Collapsed white space between blocks generates no box; its text node must
+   not keep naming one. */
+static void drop(box_t *c) {
+    if (c->node && c->node->box == c) c->node->box = NULL;
 }
 
 /* detach the children of x into a list */
@@ -904,6 +914,7 @@ static void fix_rows(struct bctx *b, box_t *g) { /* a row group: everything must
             append(g, c);
             row = NULL;
         } else if (ws_only(c) && !row) {
+            drop(c);
         } else {
             if (!row) {
                 row = nbox(b, B_ROW, NULL, anon_style(b, g->st, D_TABLE_ROW));
@@ -925,6 +936,7 @@ static void fix_cells(struct bctx *b, box_t *r) { /* a row: everything must be i
             append(r, c);
             cell = NULL;
         } else if (ws_only(c) && !cell) {
+            drop(c);
         } else {
             if (!cell) {
                 cell = nbox(b, B_CELL, NULL, anon_style(b, r->st, D_TABLE_CELL));
@@ -946,6 +958,7 @@ static void fix_table(struct bctx *b, box_t *t) {
             append(t, c);
             group = NULL;
         } else if (ws_only(c) && !group) {
+            drop(c);
         } else {
             if (!group) {
                 group = nbox(b, B_ROW_GROUP, NULL, anon_style(b, t->st, D_TABLE_ROW_GROUP));
@@ -1020,6 +1033,7 @@ static void fixup(struct bctx *b, box_t *x) {
                     for (box_t *r = run, *rn; r; r = rn) {
                         rn = r->next;
                         if (!ws_only(r)) append(x, r);
+                        else drop(r);
                     }
                 }
                 run = run_last = NULL;
@@ -1062,177 +1076,490 @@ static void unpublish_boxes(box_t *b) {
     arena_t *branch=b->branch_mem;
     if(branch){ar_free(branch);free(branch);} /* b itself belonged to this last-released arena */
 }
-void boxes_changes_clear(web_doc *d){if(d){d->box_changes.n=0;d->box_changes_full=false;}}
-void boxes_require_full(web_doc *d){if(d){d->box_changes.n=0;d->box_changes_full=true;}}
-void boxes_note_child_list(web_doc *d,node_t *parent,node_t *subtree){
-    if(!d || !d->root_box || d->box_changes_full)return;
-    if(d->style_full_dirty || d->resources_dirty || !parent || !subtree || parent->owner!=d ||
-       parent->type!=N_ELEM || subtree->type!=N_ELEM || parent->foreign || parent->shadow_root ||
-       parent->assigned_slot || parent->tag==T_slot || !parent->box){boxes_require_full(d);return;}
+/* ------------------------------------------------------- local publication */
+/* A whole build regenerates every box and so drops every layout cache.
+   Between builds, mutations record the nodes they touched (boxes_note_*),
+   box-changing restyles mark box_regen, and the next publication regenerates
+   only those parts, in two shapes:
+   - a splice regenerates the changed children of one container and keeps
+     the others with their layout, where the container's own fixup would
+     place the new children without anonymous wrappers;
+   - a region regenerates one element's box subtree, where the new box takes
+     the old one's place in its parent's fixup.
+   A shape that does not hold escalates to the next enclosing one; the root
+   element, the top layer and slot reassignment rebuild everything. gen gives
+   every generated node its new box and every retired box clears the nodes
+   still naming it, so the order of the units decides only the work done. */
+static void changes_forget(web_doc *d) {
     pvec *p=&d->box_changes;
-    if(p->n>INT_MAX-2){boxes_require_full(d);return;}
+    for(int i=0;i+1<p->n;i+=2)if(!p->v[i+1])((node_t *)p->v[i])->box_regen=false;
+    p->n=0;
+}
+void boxes_changes_clear(web_doc *d){if(d){changes_forget(d);d->box_changes_full=false;d->box_full_reason=NULL;}}
+void boxes_require_full(web_doc *d,const char *reason){
+    if(!d)return;
+    changes_forget(d);
+    if(!d->box_changes_full)d->box_full_reason=reason;
+    d->box_changes_full=true;
+}
+static bool changes_push(web_doc *d,node_t *a,node_t *b){
+    if(!d->root_box || d->box_changes_full)return false;
+    pvec *p=&d->box_changes;
+    if(p->n>INT_MAX-2){boxes_require_full(d,"change records");return false;}
     if(p->n+2>p->cap){
         int capacity=p->cap && p->cap<=INT_MAX/2?p->cap*2: p->cap?INT_MAX:16;
-        if((size_t)capacity>SIZE_MAX/sizeof *p->v){boxes_require_full(d);return;}
-        void **values=realloc(p->v,(size_t)capacity*sizeof *p->v);
-        if(!values){boxes_require_full(d);return;}
+        void **values=(size_t)capacity>SIZE_MAX/sizeof *p->v?NULL:realloc(p->v,(size_t)capacity*sizeof *p->v);
+        if(!values){boxes_require_full(d,"change records");return false;}
         p->v=values;p->cap=capacity;
     }
-    p->v[p->n++]=parent;p->v[p->n++]=subtree;
-}
-static bool local_plain_length(const len_t *length){
-    return (length->kind==LK_AUTO || length->kind==LK_NONE || length->kind==LK_LEN) &&
-        !length->expr && !length->pct;
-}
-static bool local_plain_style(const style_t *s){
-    if(!s || s->before_generated || s->after_generated || s->backdrop || s->container_type ||
-       s->container_names || s->content || s->content_visibility!=CV_VISIBLE || s->float_!=FL_NONE)return false;
-    if(!local_plain_length(&s->width)||!local_plain_length(&s->height)||
-       !local_plain_length(&s->min_width)||!local_plain_length(&s->max_width)||
-       !local_plain_length(&s->min_height)||!local_plain_length(&s->max_height))return false;
-    for(unsigned i=0;i<4;i++)if(!local_plain_length(&s->margin[i])||!local_plain_length(&s->padding[i])||
-        !local_plain_length(&s->inset[i]))return false;
+    p->v[p->n++]=a;p->v[p->n++]=b;
     return true;
 }
-static bool local_plain_subtree(web_doc *d,node_t *root){
-    size_t visited=0;
-    for(node_t *n=root;n;){
-        if(!(++visited&63)){if(!web_native_checkpoint(d))return false;web_avmedia_checkpoint();}
-        if(n->owner!=d || n->box || n->shadow_root || n->assigned_slot || n->foreign)return false;
-        if(n->type==N_ELEM){
-            if(atomic_kind(n) || n->tag==T_li || n->tag==T_ol || n->tag==T_ul || n->tag==T_details ||
-               !local_plain_style(n->style) ||
-               (n->style->display!=D_BLOCK && n->style->display!=D_FLOW_ROOT && n->style->display!=D_INLINE &&
-                n->style->display!=D_INLINE_BLOCK) ||
-               (n!=root && n->style->position!=POS_STATIC))return false;
-        }else if(n->type!=N_TEXT && n->type!=N_COMMENT)return false;
+static node_t *foreign_root(node_t *n){
+    node_t *root=NULL;
+    for(;n;n=n->parent)if(n->foreign && (!n->parent || !n->parent->foreign))root=n;
+    return root;
+}
+void boxes_note_foreign(web_doc *d,node_t *n){
+    node_t *root=d?foreign_root(n):NULL;
+    if(!root)return;
+    d->need_boxes=true;d->layout_valid=false;
+    if(root->tag!=T_svg){boxes_require_full(d,"foreign content");return;}
+    /* No descendant of an outermost <svg> generates a box: its atomic box owns
+       a snapshot serialized from them, which the publication refreshes. One
+       without that box may be a sprite sheet that <use> reaches from others. */
+    box_t *b=root->box;
+    if(b && b->node==root && b->kind==B_ATOMIC && b->atomic==AT_SVG){root->svg_snapshot_dirty=true;layout_invalidate(b);}
+    else d->svg_snapshots_dirty=true;
+}
+void boxes_note_child_list(web_doc *d,node_t *parent,node_t *subtree){
+    if(!d || !d->root_box || d->box_changes_full)return;
+    if(!parent || !subtree){boxes_require_full(d,"child list");return;}
+    if(foreign_root(parent)){boxes_note_foreign(d,parent);return;}
+    changes_push(d,parent,subtree);
+}
+void boxes_note_regen(web_doc *d,node_t *n){
+    if(!d || !n || !d->root_box || d->box_changes_full || n->box_regen)return;
+    if(foreign_root(n)){boxes_note_foreign(d,n);return;}
+    if(changes_push(d,n,NULL))n->box_regen=true;
+}
+
+/* --debug-js: box publications between web_box_report() calls (main thread only). */
+#define BOX_WHOLE_REASONS 6
+static struct {
+    uint64_t locals, splices, regions, escalations, whole;
+    struct { const char *reason; uint64_t count; } reasons[BOX_WHOLE_REASONS];
+} box_profile;
+static void box_profile_whole(const char *reason) {
+    box_profile.whole++;
+    int slot=0;
+    for(int i=0;i<BOX_WHOLE_REASONS;i++){
+        if(box_profile.reasons[i].reason && !strcmp(box_profile.reasons[i].reason,reason)){slot=i;goto found;}
+        if(box_profile.reasons[i].count<box_profile.reasons[slot].count)slot=i;
+    }
+    box_profile.reasons[slot].reason=reason;box_profile.reasons[slot].count=0;
+found:
+    box_profile.reasons[slot].count++;
+}
+int web_box_report(char *out,size_t size) {
+    if(!box_profile.locals && !box_profile.whole)return 0;
+    int n=snprintf(out,size,"Native box profile: local publications %lu (splices %lu, regions %lu, escalations %lu), whole builds %lu",
+        (unsigned long)box_profile.locals,(unsigned long)box_profile.splices,(unsigned long)box_profile.regions,
+        (unsigned long)box_profile.escalations,(unsigned long)box_profile.whole);
+    const char *separator=" by ";
+    for(int i=0;i<BOX_WHOLE_REASONS && n>=0 && (size_t)n<size;i++)
+        if(box_profile.reasons[i].count){
+            n+=snprintf(out+n,size-(size_t)n,"%s%s %lu",separator,box_profile.reasons[i].reason,
+                (unsigned long)box_profile.reasons[i].count);
+            separator=", ";
+        }
+    memset(&box_profile,0,sizeof box_profile);
+    return n;
+}
+
+/* The snapshot of every boxed <svg> marked dirty, or of all after a change
+   no single snapshot owns. The same cache entry keeps its raster unless the
+   serialized source changed. */
+static void refresh_svgs(web_doc *d) {
+    bool all=__atomic_exchange_n(&d->svg_snapshots_dirty,false,__ATOMIC_RELAXED);
+    for (int i = 0; i < d->svgs.n; i++) {
+        struct svg_cache *cache = d->svgs.v[i];
+        node_t *n = cache->node;
+        box_t *b = n ? n->box : NULL;
+        if (!b || b->node != n || b->atomic != AT_SVG || b->svg != cache) continue;
+        if (!all && !n->svg_snapshot_dirty) continue;
+        b->svg = doc_svg(d, n, b->st->color);
+    }
+}
+/* After a local publication: entries no published box owns any more. */
+static void sweep_svgs(web_doc *d) {
+    int retained=0;
+    for(int i=0;i<d->svgs.n;i++){
+        struct svg_cache *cache=d->svgs.v[i];
+        node_t *n=cache->node;
+        box_t *b=n?n->box:NULL;
+        if(b && b->node==n && b->kind==B_ATOMIC && b->atomic==AT_SVG && b->svg==cache)d->svgs.v[retained++]=cache;
+        else{
+            if(cache->img)image_free(cache->img);
+            free(cache->src);
+            free(cache);
+        }
+    }
+    d->svgs.n=retained;
+}
+
+struct local {
+    web_doc *d;
+    uint32_t epoch;
+    jmp_buf *trap;
+    arena_t *staging; /* the arena gen is filling; a trapped allocation frees it */
+    pvec flat, all, gone;
+    unsigned changed, splices, regions, escalations;
+    const char *full; /* why every box must be rebuilt instead */
+};
+enum local_step { STEP_DONE, STEP_SPLICE, STEP_REGION, STEP_FULL };
+enum { UNIT_REGION, UNIT_SPLICE }; /* a region first: a splice of the same node then finds it current */
+struct local_unit { node_t *node; unsigned depth, kind; };
+struct local_units { struct local_unit *v; size_t n, cap; };
+
+static bool wrapped_display(int display) {
+    return display == D_INLINE_TABLE || display == D_INLINE_FLEX || display == D_INLINE_GRID;
+}
+static bool local_connected(web_doc *d,node_t *n){return n && doc_node_root(n,true)==d->root;}
+static node_t *local_flat_parent(node_t *n){return n->shadow_host?n->shadow_host:doc_flat_parent(n);}
+static arena_t *local_stage(struct local *L){
+    arena_t *a=calloc(1,sizeof *a);
+    if(!a)return NULL;
+    a->chunk_size=4096;a->trap=L->trap;L->staging=a;
+    return a;
+}
+/* Boxes gen staged that the tree does not take: the nodes now naming them
+   are cleared, then the one arena they were built in is freed. */
+static void local_discard(box_t *first,arena_t *arena){
+    for(box_t *x=first,*next;x;x=next){next=x->next;x->branch_mem=NULL;unpublish_boxes(x);}
+    ar_free(arena);free(arena);
+}
+static void local_discard_box(box_t *x){
+    arena_t *arena=x->branch_mem;
+    x->next=NULL;local_discard(x,arena);
+}
+/* A changed box and everything above it: layout, stacking lists, borrows. */
+static void local_dirty(box_t *b){
+    layout_invalidate(b);
+    for(;b;b=b->parent){b->paint_layers_valid=false;pv_free(&b->paint_layers);b->style_sync_dirty=true;}
+}
+/* The parent's fixup sorts a child only by these, so two boxes that agree
+   take the same place, inside the same anonymous wrapper. */
+static bool local_same_place(const box_t *old,const box_t *box){
+    if(box_block_level(old)!=box_block_level(box) || old->floated!=box->floated || old->abspos!=box->abspos ||
+       table_part(old)!=table_part(box))return false;
+    int parent=old->parent->kind;
+    return !(table_part(old) || parent==B_TABLE || parent==B_ROW_GROUP || parent==B_ROW) || old->kind==box->kind;
+}
+/* What a block container's fixup wraps in an anonymous block. */
+static bool inline_content(const box_t *container,const box_t *c){
+    if(box_block_level(c) || ((container->kind==B_FLEX || container->kind==B_GRID) && c->abspos))return false;
+    return real_inline(c);
+}
+/* Text of white space alone, which collapses away between blocks. */
+static bool local_collapses(const node_t *n,const style_t *st){
+    if(preserves_space(st))return false;
+    for(size_t i=0;i<n->textlen;i++)if(!is_space((unsigned char)n->text[i]))return false;
+    return true;
+}
+
+static bool is_list(const node_t *n){
+    return n->type==N_ELEM && !n->foreign && (n->tag==T_ol || n->tag==T_ul || n->tag==T_menu);
+}
+static bool listish(const node_t *n){
+    if(n->type!=N_ELEM)return false;
+    const box_t *b=n->box && n->box->node==n?n->box:NULL;
+    return (!n->foreign && n->tag==T_li) || (n->style && n->style->display==D_LIST_ITEM) ||
+        (n->style_previous && n->style_previous->display==D_LIST_ITEM) || (b && b->st->display==D_LIST_ITEM);
+}
+/* Whether its marker is a number. A removed item has no computed style left;
+   its retiring box still names the last one. */
+static bool list_numbered(const node_t *n){
+    const style_t *s=n->style?n->style: n->box && n->box->node==n?n->box->st:NULL;
+    if(!s)return false;
+    int ls=s->list_style;
+    return ls!=LS_NONE && ls!=LS_DISC && ls!=LS_CIRCLE && ls!=LS_SQUARE && ls!=LS_STRING;
+}
+/* Markers count the items of their owning list (list_owner). Adding,
+   removing or re-displaying an item owned outside the changed subtree
+   renumbers that list, when any of its markers is a number. */
+static node_t *local_list_scope(node_t *parent,node_t *subtree){
+    bool escapes=false,numbered=false;
+    for(node_t *n=subtree;n;){
+        if(listish(n)){
+            bool owned=false;
+            for(node_t *a=n;a && a!=subtree;){a=a->parent;if(a && is_list(a)){owned=true;break;}}
+            if(!owned){escapes=true;numbered=numbered || list_numbered(n);}
+        }
         if(n->first){n=n->first;continue;}
-        while(n!=root&&!n->next)n=n->parent;
-        if(n==root)break;n=n->next;
+        while(n!=subtree && !n->next)n=n->parent;
+        if(n==subtree)break;
+        n=n->next;
     }
-    return true;
+    if(!escapes)return NULL;
+    node_t *owner=parent;
+    for(node_t *a=parent;a;a=a->parent)if(is_list(a)){owner=a;break;}
+    for(node_t *n=owner->first;n && !numbered;){
+        if(listish(n))numbered=list_numbered(n);
+        if(n->first && !is_list(n)){n=n->first;continue;}
+        while(n!=owner && !n->next)n=n->parent;
+        if(n==owner)break;
+        n=n->next;
+    }
+    return numbered?owner:NULL;
 }
-struct local_box_subject {node_t *node,*change_parent;bool recorded,parent_checked,parent_safe,parent_committed;};
-static struct local_box_subject *local_subject(struct local_box_subject *subjects,size_t mask,node_t *node){
-    size_t slot=((uintptr_t)node>>4)*2654435761u&mask;
-    while(subjects[slot].node&&subjects[slot].node!=node)slot=(slot+1)&mask;
-    subjects[slot].node=node;return &subjects[slot];
+
+/* The nearest flat ancestor-or-self whose own box a region can replace;
+   STEP_DONE where nothing renders (display:none, unslotted, detached). */
+static enum local_step local_resolve(struct local *L,node_t *n,node_t **out){
+    if(!local_connected(L->d,n))return STEP_DONE;
+    for(node_t *a=n;a;a=local_flat_parent(a)){
+        if(a->type!=N_ELEM)continue;
+        if(a->style && a->style->display==D_NONE)return STEP_DONE;
+        if(a->box && a->box->node==a){*out=a;return STEP_REGION;}
+    }
+    return STEP_DONE;
 }
-static bool local_plain_parent(web_doc *d,node_t *n,struct local_box_subject *subjects,size_t mask){
-    box_t *p=n?n->box:NULL;
-    if(!p || p->node!=n || p->kind!=B_BLOCK || p->inline_ctx || !p->layout_post_valid ||
-       !local_plain_style(n->style) || n->shadow_root || n->assigned_slot ||
-       n->style->overflow!=OV_VISIBLE || n->style->filter || css_translation_active(n->style) ||
-       doc_node_root(n,false)!=d->root)return false;
-    /* In-flow intrinsic sizing of a flex/grid/table/inline ancestor is outside
-       this independent formatting boundary. Keep its ordinary full rebuild. */
-    for(box_t *a=p->parent;a;a=a->parent)if(a->kind!=B_BLOCK || a->inline_ctx)return false;
-    size_t visited=0;
-    for(box_t *c=p->first;c;c=c->next){
-        if(!(++visited&63)){if(!web_native_checkpoint(d))return false;web_avmedia_checkpoint();}
-        if(c->anon || !c->node)return false;
-        if(c->node->parent!=n){
-            struct local_box_subject *subject=local_subject(subjects,mask,c->node);
-            if(c->node->parent || !subject->recorded || subject->change_parent!=n)return false;
+
+static enum local_step local_region(struct local *L,node_t *r,node_t **next){
+    web_doc *d=L->d;
+    box_t *old=r->box;
+    if(!local_connected(d,r))return STEP_DONE;
+    if(!old || old->node!=r){*next=r;return STEP_REGION;}
+    if(old->epoch==L->epoch)return STEP_DONE;
+    if(r==d->html || !old->parent){L->full="root element";return STEP_FULL;}
+    if(web_dialog_count(d) && web_dialog_is_modal(d,r)){L->full="top layer";return STEP_FULL;}
+    arena_t *arena=local_stage(L);
+    if(!arena){L->full="memory";return STEP_FULL;}
+    box_t holder={.st=old->parent->st};
+    struct bctx b={.d=d,.a=arena,.epoch=L->epoch};
+    gen(&b,&holder,r,NULL);
+    arena->trap=NULL;L->staging=NULL;
+    box_t *box=holder.first;
+    if(d->native_cancelled){local_discard(box,arena);L->full="cancelled";return STEP_FULL;}
+    if(!box || box->next || !local_same_place(old,box)){
+        /* Its parent's fixup would place it differently: splice it there.
+           The old box stays linked for that splice to retire. */
+        local_discard(box,arena);
+        r->box=NULL;r->anchor_block=NULL;
+        if(!(*next=local_flat_parent(r))){L->full="no flat parent";return STEP_FULL;}
+        return STEP_SPLICE;
+    }
+    box->branch_mem=arena;
+    box_t *parent=old->parent,*prev=NULL;
+    for(box_t *x=parent->first;x && x!=old;x=x->next)prev=x;
+    box->parent=parent;box->next=old->next;
+    if(prev)prev->next=box;else parent->first=box;
+    if(parent->last==old)parent->last=box;
+    local_dirty(box);
+    unpublish_boxes(old);
+    L->changed++;L->regions++;
+    return STEP_DONE;
+}
+
+static enum local_step local_splice(struct local *L,node_t *p,node_t **next){
+    web_doc *d=L->d;
+    if(!local_connected(d,p))return STEP_DONE;
+    if(p->type!=N_ELEM){
+        if(!p->shadow_host){L->full="document children";return STEP_FULL;}
+        p=p->shadow_host; /* a shadow root's children are its host's flat children */
+    }
+    box_t *c=p->box;
+    const style_t *ps=p->style;
+    if(!c || c->node!=p || !ps){*next=p;return STEP_REGION;}
+    if(c->epoch==L->epoch)return STEP_DONE;
+    if(c->kind==B_ATOMIC && wrapped_display(c->st->display)){
+        if(!c->first || c->first!=c->last || c->first->node!=p){*next=p;return STEP_REGION;}
+        c=c->first; /* inline-flex/grid/table: the children belong to the inner box */
+    }
+    /* A replaced element renders its children itself, not as boxes. */
+    if(c->kind==B_ATOMIC && c->atomic!=AT_INLINE_BLOCK){local_dirty(c);L->changed++;return STEP_DONE;}
+    if(ps->content_visibility==CV_HIDDEN)return STEP_DONE;
+    if((!p->foreign && (p->tag==T_details || p->tag==T_frameset)) ||
+       !(c->kind==B_BLOCK || c->kind==B_CELL || c->kind==B_CAPTION || c->kind==B_FLEX || c->kind==B_GRID ||
+         c->kind==B_INLINE || c->kind==B_ATOMIC)){*next=p;return STEP_REGION;}
+    /* Its own generated boxes stay first (::before, an inside marker) and
+       last (::after); an anonymous wrapper means the fixup must run again. */
+    int phase=0;
+    for(box_t *x=c->first;x;x=x->next){
+        bool own=x->node==p,after=own && ps->after && x->st==ps->after;
+        if(x->anon || !x->node || (own && !after && phase) || (!own && phase==2)){*next=p;return STEP_REGION;}
+        phase=after?2:own?phase:1;
+    }
+    bool flexgrid=c->kind==B_FLEX || c->kind==B_GRID,inline_box=c->kind==B_INLINE;
+    enum { MODE_EMPTY, MODE_INLINE, MODE_BLOCK } mode=flexgrid?MODE_BLOCK:inline_box?MODE_INLINE:
+        !c->first?MODE_EMPTY:c->inline_ctx?MODE_INLINE:MODE_BLOCK;
+    pvec *all=&L->all,*flat=&L->flat;
+    all->n=flat->n=L->gone.n=0;
+    for(box_t *x=c->first;x && x->node==p && !(ps->after && x->st==ps->after);x=x->next)pv_push(all,x);
+    doc_flat_children(p,flat);
+    bool failed=false;
+    for(int i=0;i<flat->n && !failed;i++){
+        node_t *x=flat->v[i];
+        if(!(i&63)){
+            if(!web_native_checkpoint(d)){failed=true;L->full="cancelled";break;}
+            web_avmedia_checkpoint();
         }
+        if(x->type!=N_ELEM && x->type!=N_TEXT)continue;
+        box_t *k=x->box;
+        if(k && k->parent==c && k->node==x && (!x->box_regen || k->epoch==L->epoch)){k->local_kept=true;pv_push(all,k);continue;}
+        if(x->type==N_ELEM && web_dialog_count(d) && web_dialog_is_modal(d,x))continue; /* its box is in the top layer */
+        if(x->type==N_TEXT && mode==MODE_BLOCK && local_collapses(x,c->st))continue;
+        arena_t *arena=local_stage(L);
+        if(!arena){failed=true;L->full="memory";break;}
+        box_t holder={.st=c->st};
+        struct bctx b={.d=d,.a=arena,.epoch=L->epoch};
+        gen(&b,&holder,x,c->st);
+        arena->trap=NULL;L->staging=NULL;
+        box_t *y=holder.first;
+        if(d->native_cancelled){local_discard(y,arena);failed=true;L->full="cancelled";break;}
+        if(!y){ar_free(arena);free(arena);continue;}
+        if(y->next){local_discard(y,arena);failed=true;break;} /* display:contents: one arena, several owners */
+        if(mode==MODE_BLOCK && ws_only(y)){local_discard(y,arena);continue;}
+        y->branch_mem=arena;
+        pv_push(all,y);
     }
+    for(box_t *x=c->first;x;x=x->next)if(x->node==p && ps->after && x->st==ps->after)pv_push(all,x);
+    /* Valid only where the container's fixup would decide what it decided
+       before: no new anonymous wrapper and no white space it would keep. */
+    bool any_block=false,any_inline=false,any_ws=false,any_table=false;
+    for(int i=0;i<all->n && !failed;i++){
+        box_t *x=all->v[i];
+        if(box_block_level(x))any_block=true;
+        else if(inline_content(c,x))any_inline=true;
+        any_ws=any_ws || ws_only(x);
+        any_table=any_table || table_part(x);
+    }
+    bool inline_ctx=c->inline_ctx;
+    if(failed || any_table)failed=true;
+    else if(inline_box)failed=any_block;
+    else if(flexgrid)failed=any_inline || any_ws;
+    else if(any_block){failed=mode==MODE_INLINE || any_inline;inline_ctx=false;}
+    else{failed=mode==MODE_BLOCK;inline_ctx=all->n>0;}
+    if(failed){
+        for(int i=0;i<all->n;i++){
+            box_t *x=all->v[i];
+            if(x->local_kept)x->local_kept=false;
+            else if(x->node!=p)local_discard_box(x);
+        }
+        if(L->full)return STEP_FULL;
+        *next=p;return STEP_REGION;
+    }
+    if(any_block && any_ws && !flexgrid && !inline_box){ /* only new boxes of a container that was empty */
+        int kept=0;
+        for(int i=0;i<all->n;i++){box_t *x=all->v[i];if(ws_only(x))local_discard_box(x);else all->v[kept++]=x;}
+        all->n=kept;
+    }
+    for(box_t *x=c->first;x;x=x->next)if(x->node!=p && !x->local_kept)pv_push(&L->gone,x);
+    c->first=c->last=NULL;
+    for(int i=0;i<all->n;i++){box_t *x=all->v[i];x->local_kept=false;append(c,x);}
+    if(!flexgrid && !inline_box)c->inline_ctx=inline_ctx;
+    for(int i=0;i<L->gone.n;i++)unpublish_boxes(L->gone.v[i]);
+    local_dirty(c);
+    L->changed++;L->splices++;
+    return STEP_DONE;
+}
+
+/* One unit and the enclosing ones it escalates to, strictly upward. */
+static bool local_unit(struct local *L,node_t *node,unsigned kind){
+    for(unsigned steps=0;steps<65536;steps++){
+        node_t *next=NULL;
+        enum local_step s=kind==UNIT_SPLICE?local_splice(L,node,&next):local_region(L,node,&next);
+        if(s==STEP_DONE)return true;
+        if(s==STEP_FULL)return false;
+        L->escalations++;
+        if(s==STEP_SPLICE){node=next;kind=UNIT_SPLICE;continue;}
+        if(local_resolve(L,next,&node)==STEP_DONE)return true;
+        kind=UNIT_REGION;
+    }
+    L->full="escalation";
+    return false;
+}
+static bool local_add(struct local_units *u,node_t *node,unsigned kind){
+    if(u->n==u->cap){
+        size_t cap=u->cap?u->cap*2:16;
+        struct local_unit *v=cap>SIZE_MAX/sizeof *v?NULL:realloc(u->v,cap*sizeof *v);
+        if(!v)return false;
+        u->v=v;u->cap=cap;
+    }
+    unsigned depth=0;
+    for(node_t *n=node;n;n=n->parent?n->parent:n->shadow_host)depth++;
+    u->v[u->n++]=(struct local_unit){node,depth,kind};
     return true;
 }
-struct local_box_change {node_t *node;box_t *parent,*old,*replacement;arena_t *arena;};
+/* A child-list record (a, its changed child b) or a node a whose own box
+   changes (b NULL), as the unit that regenerates it. */
+static bool local_request(struct local *L,struct local_units *u,node_t *a,node_t *b){
+    web_doc *d=L->d;
+    if(!local_connected(d,a))return true;
+    if(b){
+        if(a->type==N_DOC){L->full="document children";return false;}
+        node_t *list=local_list_scope(a,b);
+        if(!(list?local_add(u,list,UNIT_REGION):local_add(u,a,UNIT_SPLICE)))L->full="memory";
+        return !L->full;
+    }
+    if(a==d->html){L->full="root element";return false;}
+    if(web_dialog_count(d) && web_dialog_is_modal(d,a)){L->full="top layer";return false;}
+    node_t *list=a->type==N_ELEM && a->parent && listish(a)?local_list_scope(a->parent,a):NULL,*p;
+    bool added=list?local_add(u,list,UNIT_REGION):
+        a->type==N_ELEM && a->box && a->box->node==a?local_add(u,a,UNIT_REGION):
+        !(p=local_flat_parent(a)) || local_add(u,p,UNIT_SPLICE);
+    if(!added)L->full="memory";
+    return added;
+}
 static void restyle_boxes(box_t *b,bool inherited_borrow);
+static int local_unit_order(const void *a,const void *b){
+    const struct local_unit *x=a,*y=b;
+    if(x->depth!=y->depth)return x->depth<y->depth?-1:1;
+    if(x->kind!=y->kind)return x->kind<y->kind?-1:1;
+    uintptr_t m=(uintptr_t)x->node,n=(uintptr_t)y->node;
+    return m<n?-1:m>n;
+}
 bool boxes_rebuild_local(web_doc *d){
-    if(!d || d->box_changes_full || !d->box_changes.n || !d->root_box ||
-       !d->root_box->layout_post_valid || d->style_existing_boxes_changed)return false;
-    size_t count=(size_t)d->box_changes.n/2;
-    struct local_box_change *changes=calloc(count,sizeof *changes);if(!changes)return false;
-    size_t capacity=16;
-    if(count>SIZE_MAX/4){free(changes);return false;}
-    while(capacity<count*4){if(capacity>SIZE_MAX/2){free(changes);return false;}capacity*=2;}
-    if(capacity>SIZE_MAX/sizeof(struct local_box_subject)){free(changes);return false;}
-    struct local_box_subject *subjects=calloc(capacity,sizeof *subjects);
-    if(!subjects){free(changes);return false;}
-    bool safe=true;
-    for(size_t i=0;i<count;i++){
-        if(!web_native_checkpoint(d)){safe=false;break;}
-        node_t *node=d->box_changes.v[2*i+1];
-        if(!node){safe=false;break;}
-        struct local_box_subject *subject=local_subject(subjects,capacity-1,node);
-        if(subject->recorded){safe=false;break;}
-        subject->recorded=true;subject->change_parent=d->box_changes.v[2*i];
-    }
-    for(size_t i=0;i<count&&safe;i++){
-        if(!web_native_checkpoint(d)){safe=false;break;}
-        if(!(i&63))web_avmedia_checkpoint();
-        node_t *parent=d->box_changes.v[2*i],*n=d->box_changes.v[2*i+1];
-        if(!parent || !n || n->owner!=d){safe=false;break;}
-        struct local_box_subject *parent_subject=local_subject(subjects,capacity-1,parent);
-        if(parent_subject->recorded){safe=false;break;}
-        if(!parent_subject->parent_checked){
-            parent_subject->parent_checked=true;
-            parent_subject->parent_safe=local_plain_parent(d,parent,subjects,capacity-1);
-        }
-        if(!parent_subject->parent_safe){safe=false;break;}
-        struct local_box_change *change=&changes[i];change->node=n;change->parent=parent->box;
-        if(n->parent==parent){
-            style_t *s=n->style;
-            if(!s || (s->position!=POS_ABSOLUTE && s->position!=POS_FIXED) ||
-               (s->display!=D_BLOCK && s->display!=D_FLOW_ROOT) ||
-               s->inset[0].kind!=LK_LEN || s->inset[3].kind!=LK_LEN || !local_plain_subtree(d,n))safe=false;
-        }else{
-            box_t *old=n->box;
-            if(n->parent || !old || old->node!=n || old->parent!=change->parent ||
-               old->kind!=B_BLOCK || !old->abspos || !local_plain_style(old->st))safe=false;
-            else change->old=old;
+    if(!d || d->box_changes_full || !d->root_box)return false;
+    struct local *L=calloc(1,sizeof *L);
+    if(!L){d->box_full_reason="memory";return false;}
+    L->d=d;
+    if(!++d->box_epoch)d->box_epoch=1;
+    L->epoch=d->box_epoch;
+    struct local_units u={0};
+    bool ok=true;
+    for(int i=0;ok && i+1<d->box_changes.n;i+=2)ok=local_request(L,&u,d->box_changes.v[i],d->box_changes.v[i+1]);
+    for(node_t *e=d->style_retired_first;ok && e;e=e->style_retired_next)if(e->box_regen)ok=local_request(L,&u,e,NULL);
+    if(ok){
+        qsort(u.v,u.n,sizeof *u.v,local_unit_order);
+        jmp_buf trap;
+        L->trap=&trap;
+        if(setjmp(trap)){
+            /* Nodes may name boxes of the trapped arena: the whole rebuild
+               that follows clears every node of the document first. */
+            if(L->staging){ar_free(L->staging);free(L->staging);L->staging=NULL;}
+            L->full="memory";ok=false;
+        }else for(size_t i=0;ok && i<u.n;i++){
+            if(i && u.v[i].node==u.v[i-1].node && u.v[i].kind==u.v[i-1].kind)continue;
+            ok=local_unit(L,u.v[i].node,u.v[i].kind);
         }
     }
-    if(!safe){free(subjects);free(changes);return false;}
-    /* Stage new independent branches before changing the published topology.
-       A failed allocation discards only fresh borrows and falls back to the
-       existing full build, whose normal trap/cancellation path remains owner. */
-    jmp_buf trap;
-    if(setjmp(trap)){safe=false;goto staged;}
-    for(size_t i=0;i<count;i++)if(!changes[i].old){
-        struct local_box_change *change=&changes[i];
-        change->arena=calloc(1,sizeof *change->arena);if(!change->arena){safe=false;break;}
-        change->arena->chunk_size=4096;change->arena->trap=&trap;
-        struct bctx context={.d=d,.a=change->arena};box_t holder={.st=change->parent->st};
-        gen(&context,&holder,change->node,change->parent->st);
-        change->replacement=holder.first;change->arena->trap=NULL;
-        if(d->native_cancelled || !change->replacement || change->replacement->next){safe=false;break;}
-    }
-    if(safe&&!web_native_checkpoint(d))safe=false;
-staged:
-    if(!safe){
-        for(size_t i=0;i<count;i++)if(changes[i].arena){
-            if(changes[i].replacement)unpublish_boxes(changes[i].replacement);
-            else {changes[i].node->box=NULL;changes[i].node->anchor_block=NULL;clear_boxes(changes[i].node);}
-            ar_free(changes[i].arena);free(changes[i].arena);
+    if(ok){
+        if(L->changed){
+            web_hit_index_free(d);d->paint_order_valid=false;d->abs_boxes.n=0;d->visual_revision++;d->style_revision++;
+            restyle_boxes(d->root_box,false); /* one dirty-path join also recomputes ancestor paint_alpha */
+            sweep_svgs(d);
         }
-        free(subjects);free(changes);return false;
-    }
-    web_hit_index_free(d);d->paint_order_valid=false;d->abs_boxes.n=0;d->visual_revision++;d->style_revision++;
-    for(size_t i=0;i<count;i++)if(!changes[i].old){
-        changes[i].replacement->branch_mem=changes[i].arena;changes[i].arena=NULL;
-        changes[i].replacement->parent=changes[i].parent;
-    }
-    /* Merge the current direct DOM child order once per parent. Repeated
-       predecessor searches for every append/removal turn a legitimate large
-       batch into quadratic work even though generation itself is local. */
-    for(size_t i=0;i<count;i++){
-        box_t *parent=changes[i].parent;node_t *node=parent->node;
-        struct local_box_subject *subject=local_subject(subjects,capacity-1,node);
-        if(subject->parent_committed)continue;subject->parent_committed=true;
-        parent->first=parent->last=NULL;
-        for(node_t *n=node->first;n;n=n->next)if(n->box&&n->box->parent==parent)append(parent,n->box);
-        layout_invalidate(parent);
-        for(box_t *p=parent;p;p=p->parent){
-            if(!p->style_sync_dirty){p->paint_layers_valid=false;pv_free(&p->paint_layers);}
-            p->style_sync_dirty=true;
+        refresh_svgs(d);
+        if(d->profile_enabled){
+            box_profile.locals++;box_profile.splices+=L->splices;box_profile.regions+=L->regions;
+            box_profile.escalations+=L->escalations;
         }
-    }
-    for(size_t i=0;i<count;i++)if(changes[i].old)unpublish_boxes(changes[i].old);
-    restyle_boxes(d->root_box,false); /* one dirty-path join also recomputes ancestor paint_alpha */
-    free(subjects);free(changes);boxes_changes_clear(d);return true;
+        boxes_changes_clear(d);
+    }else d->box_full_reason=L->full?L->full:"local publication";
+    pv_free(&L->flat);pv_free(&L->all);pv_free(&L->gone);free(u.v);free(L);
+    return ok;
 }
 void boxes_discard(web_doc *d) {
     if(!d)return;
@@ -1244,7 +1571,7 @@ void boxes_discard(web_doc *d) {
     if(d->root)clear_boxes(d->root); /* also clears an unpublished failed rebuild */
     for(int i=0;i<web_dialog_count(d);i++)web_dialog_set_backdrop(d,web_dialog_at(d,i),NULL);
     ar_free(&d->bmem);
-    pv_free(&d->box_changes);d->box_changes_full=false;
+    changes_forget(d);pv_free(&d->box_changes);d->box_changes_full=false; /* the reason stays for the build */
 }
 
 static style_t *replacement_style(node_t *n, style_t *old) {
@@ -1261,9 +1588,6 @@ static style_t *replacement_style(node_t *n, style_t *old) {
 static node_t *box_style_node(box_t *b) {
     for (; b; b=b->parent) if(b->node)return b->node;
     return NULL;
-}
-static bool wrapped_display(int display) {
-    return display == D_INLINE_TABLE || display == D_INLINE_FLEX || display == D_INLINE_GRID;
 }
 static bool restyle_derived(box_t *b, style_t *old) {
     node_t *n=b->node;
@@ -1340,15 +1664,7 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
 }
 void boxes_restyle(web_doc *d) {
     restyle_boxes(d->root_box,false);
-    bool all=__atomic_exchange_n(&d->svg_snapshots_dirty,false,__ATOMIC_RELAXED);
-    for (int i = 0; i < d->svgs.n; i++) {
-        struct svg_cache *cache = d->svgs.v[i];
-        node_t *n = cache->node;
-        box_t *b = n ? n->box : NULL;
-        if (!b || b->node != n || b->atomic != AT_SVG || b->svg != cache) continue;
-        if (!all && !n->svg_snapshot_dirty) continue;
-        b->svg = doc_svg(d, n, b->st->color); /* same cache entry; raster dropped only on new source */
-    }
+    refresh_svgs(d);
     /* Geometry reuse does not mean hit/paint reuse: opacity, visibility and
        pointer-events can change with a native effect and no DOM revision. */
     d->visual_revision++;d->style_revision++;d->paint_order_valid=false;
@@ -1369,6 +1685,7 @@ bool boxes_update_text(web_doc *d, node_t *n) {
 }
 void boxes_build(web_doc *d, arena_t *a) {
     struct bctx b = {.d=d, .a=a};
+    if (d->profile_enabled) box_profile_whole(d->box_full_reason ? d->box_full_reason : "no box tree");
     for (int i = 0; i < d->svgs.n; i++) ((struct svg_cache *)d->svgs.v[i])->used = false;
     d->svg_snapshots_dirty = false; /* every boxed <svg> below is serialized afresh */
     if (d->root) clear_boxes(d->root);

@@ -2872,6 +2872,7 @@ static void report_loop_profile(uint64_t now) {
     if (web_wait_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if (web_paint_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if (web_style_report(message, sizeof message) > 0) host_console(NULL, 0, message);
+    if (web_box_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if(consoles){snprintf(message,sizeof message,
         "Browser console profile: rect draw %u/%lu ms, rect present %lu ms (no author page paint)",
         consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL,0,message);}

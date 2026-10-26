@@ -4768,7 +4768,7 @@ void css_styles_release(web_doc *d) {
         /* A cancelled worker may have retired this arena but not published a
            replacement. Never retain its old style or stack-local OOM target. */
         if(n->style==n->style_previous)n->style=NULL;
-        n->style_mem.trap=NULL;
+        n->style_mem.trap=NULL;n->box_regen=false;
         ar_free(&n->style_previous_mem); n->style_previous = NULL; n->style_retired_next = NULL;
         style_slots_free(&n->style_previous_slots);
         n = next;
@@ -4907,7 +4907,6 @@ static void mark_style_self(web_doc *d, node_t *n) {
 }
 /* n's own computed values changed without any selector matching differently. */
 static void mark_style_own(web_doc *d, node_t *n) {
-    boxes_require_full(d);
     d->need_style = true;
     mark_style_self(d, n);
 }
@@ -4920,7 +4919,6 @@ static void mark_style_boundary(web_doc *d, node_t *n) {
 }
 void css_mark_dirty(web_doc *d, node_t *n) {
     if (!d) return;
-    boxes_require_full(d);
     d->need_style = true;
     if (!n || !d->sty.ctx) { d->style_full_dirty = true; return; }
     if (n->type != N_ELEM) n = dirty_flat_parent(n);
@@ -5047,7 +5045,6 @@ static void mark_state_part(web_doc *d, enum css_state state, node_t *deepest, n
     reach_state(d, doc_node_root(top, false)->style_scope, state, &r);
     bool relational = d->sty.ctx->relational && mark_relational_dirty(d, deepest);
     if (!r.reach && !relational) return; /* no selector reads this state here */
-    boxes_require_full(d);
     d->need_style = true;
     if (d->profile_enabled && (r.reach & (REACH_PARENT | REACH_SUBTREE)))
         style_mark_name(state == CSS_STATE_HOVER ? ":hover" : state == CSS_STATE_ACTIVE ? ":active" : ":focus", state == CSS_STATE_HOVER ? 6 : 7);
@@ -5110,7 +5107,6 @@ void css_mark_attribute_dirty(web_doc *d, node_t *n, const struct css_attribute_
     if (!change || !reach_known(d, n) || state_attribute(change->name)) {
         css_mark_dirty(d, n); return;
     }
-    boxes_require_full(d);
     d->need_style = true;
     if (d->sty.ctx->relational) mark_relational_dirty(d, n);
     const struct css_scope *scope = doc_node_root(n, false)->style_scope;
@@ -5701,7 +5697,9 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         if (d->profile_enabled) __atomic_fetch_add(&d->profile.style_kept, 1, __ATOMIC_RELAXED);
     } else if (!style_box_compatible(e, e->style_previous, s)) {
         __atomic_store_n(&d->style_boxes_changed, true, __ATOMIC_RELAXED);
-        if(e->style_previous)__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);
+        /* This worker alone writes e; the publication after the join reads
+           box_regen from the retired list, and the release clears it. */
+        if(e->style_previous){e->box_regen=true;__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);}
         if(d->profile_enabled && e->style_previous)__atomic_store_n(&d->box_change_node,e,__ATOMIC_RELAXED);
     }
     e->style_mem.trap = NULL;
@@ -5913,8 +5911,11 @@ void css_cascade(web_doc *d, int vw, int vh) {
         return;
     }
     if (!setbits) { setbits = malloc((size_t)css_prop_count()); if(!setbits)ar_alloc(&d->smem,SIZE_MAX); }
-    if(full)boxes_require_full(d);
-    if(full && (d->need_boxes || !d->root_box) && d->root)
+    /* Nodes leave the flat tree only by slot reassignment, which rebuilds
+       every box. Otherwise boxes still borrow the styles they name, and the
+       element styles this full cascade replaces retire through style_previous
+       for the local publication to follow. */
+    if(full && (d->need_boxes || !d->root_box) && d->root && (!d->root_box || d->box_changes_full))
         clear_styles(d->root); /* retire styles of nodes no longer in the flat tree */
     d->style_boxes_changed = false;
     d->style_existing_boxes_changed = false;

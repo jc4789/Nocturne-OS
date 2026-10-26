@@ -180,6 +180,7 @@ typedef struct node {
     struct css_motion_state *css_motion; /* document-owned native CSS playback, not a style-arena borrow */
     struct box *box;          /* the element's first box */
     struct box *anchor_block; /* inline elements: the block holding its first line */
+    bool box_regen; /* its own box must be generated again (restyle or box-only HTML semantics) */
     float anchor_dy;
     /* Persistent CSSOM element scroll position; box/layout arenas are rebuilt.
        Only the element's principal box consumes these offsets. */
@@ -642,7 +643,9 @@ typedef struct box {
     node_t *node; /* NULL for anonymous boxes */
     style_t *st;
     struct box *parent, *first, *last, *next;
-    arena_t *branch_mem; /* only a locally generated independent out-of-flow root owns this arena */
+    arena_t *branch_mem; /* a locally generated subtree root owns the arena its subtree was built in */
+    uint32_t epoch; /* the local publication that generated it (0: a whole build) */
+    bool local_kept; /* transient: a splice keeps this child */
     /* text boxes: the white-space-processed text */
     const char *text;
     size_t len;
@@ -774,7 +777,9 @@ node_t *doc_active_target(web_doc *document); /* validates live native press and
 void boxes_build(web_doc *d, arena_t *a);
 void boxes_restyle(web_doc *d);
 void boxes_note_child_list(web_doc *d,node_t *parent,node_t *subtree);
-void boxes_require_full(web_doc *d); /* records non-structural topology uncertainty, without forcing geometry */
+void boxes_note_regen(web_doc *d,node_t *n); /* n's own box changes without a style change */
+void boxes_note_foreign(web_doc *d,node_t *n); /* a change inside foreign (SVG/MathML) content */
+void boxes_require_full(web_doc *d,const char *reason); /* records non-structural topology uncertainty, without forcing geometry */
 bool boxes_rebuild_local(web_doc *d);
 void boxes_changes_clear(web_doc *d);
 bool box_pseudo_generated(node_t *node, const style_t *origin, const style_t *pseudo);
@@ -999,15 +1004,17 @@ struct web_doc {
     pvec svgs;        /* struct svg_cache* */
     box_t *root_box;
     pvec abs_boxes;   /* absolutely positioned boxes, painted last */
-    pvec box_changes; /* parent/subtree pairs retained until coherent box publication */
+    pvec box_changes; /* parent/subtree pairs, or node/NULL to regenerate a node, until box publication */
     bool box_changes_full;
+    const char *box_full_reason; /* debug_js only: why the next publication rebuilds every box */
+    uint32_t box_epoch; /* the current local publication: boxes it generated are already current */
     int width, height, doc_h, doc_w;
     int styled_w, styled_h; /* viewport the cascade ran for */
     bool need_style, need_boxes, layout_valid;
     bool style_full_dirty, style_pending_dirty;
     bool font_selection_dirty; /* coalesced failed-font completion; no metrics changed yet */
     bool style_boxes_changed;
-    bool style_existing_boxes_changed; /* new nodes alone can be generated in independent branch arenas */
+    bool style_existing_boxes_changed; /* debug_js only: some restyled element marked box_regen */
     float container_rem; /* immutable root font size of the layout snapshot */
     node_t *style_retired_first;
     node_t *focus;

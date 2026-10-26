@@ -262,6 +262,8 @@ int web_wait_report(char *out, size_t size);
 int web_paint_report(char *out, size_t size);
 /* Debug summary of style cascades since the previous report; 0 when none. */
 int web_style_report(char *out, size_t size);
+/* Debug summary of box publications (local and whole) since the previous report; 0 when none. */
+int web_box_report(char *out, size_t size);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
 bool web_dirty(web_doc *d); /* consumes the legacy layout/paint notification */
 bool web_paint_dirty(web_doc *d); /* consumes a paint-only media notification */

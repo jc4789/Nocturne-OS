@@ -188,6 +188,7 @@ static void shadow_assignment_changed(node_t *root) {
     if (!d || !root->shadow_host || !d->live || d->inert || doc_node_root(root->shadow_host, true) != d->root) return;
     d->need_style = d->style_full_dirty = d->need_boxes = true;
     d->layout_valid = false;
+    boxes_require_full(d, "slot assignment");
 }
 void doc_shadow_dirty(node_t *root) {
     if (!root || !root->shadow_host) return;
@@ -420,13 +421,15 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
         else if(attribute)css_mark_attribute_dirty(d,n,attribute);
         else css_mark_dirty(d,n);
     }
-    if(boxes){d->need_boxes=true;d->layout_valid=false;}
+    /* A text box regenerates in its parent; an element's changed children
+       were recorded where they moved. */
+    if(boxes){d->need_boxes=true;d->layout_valid=false;if(n && n->type==N_TEXT)boxes_note_regen(d,n);}
     if (resources) d->resources_dirty = true; /* its rescan restyles everything if the sheets changed */
     if (recascade || boxes) {
         d->layout_valid = false;
         if (n && n->box && (boxes || n->box->kind==B_ATOMIC)) layout_invalidate(n->box);
     }
-    for(node_t *p=n;p;p=p->parent)if(p->foreign){d->need_boxes=true;break;}
+    boxes_note_foreign(d,n);
     d->find_node = NULL;
     d->find_run = NULL;
     web_dialog_sync(d);
@@ -441,7 +444,7 @@ static void changed(web_doc *d,node_t *n,bool resources,const struct css_attribu
     changed_geometry(d,n,resources,true,false,NULL,false,attribute);
 }
 void doc_mutated(web_doc *d, node_t *n) {
-    if (d && !n) { d->js_nodes_dirty = true; d->need_boxes = true; d->metadata_valid=false; }
+    if (d && !n) { d->js_nodes_dirty = true; d->need_boxes = true; d->metadata_valid=false; boxes_require_full(d, "parser forest"); }
     changed(d, n, true, NULL);
     /* NULL denotes a parser's complete forest transaction. Ordinary control or
        CharacterData notifications cannot change assignment; structural/attribute
@@ -895,7 +898,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
          (n->tag == T_input && !strcmp(low,"type")) ||
          (n->tag == T_audio && !strcmp(low,"controls")));
     if (semantic_boxes && doc_node_root(n, true) == d->root) {
-        d->need_boxes=true; d->layout_valid=false;
+        d->need_boxes=true; d->layout_valid=false; boxes_note_regen(d,n);
     }
     /* Candidate changes retain image requests (including detached images) but
        cannot add/remove authored stylesheets. Attribute selectors and attr()

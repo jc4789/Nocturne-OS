@@ -67,6 +67,7 @@ node_t *web_dialog_leave(web_doc *d, node_t *n) {
     memmove(s->stack + i, s->stack + i + 1, (size_t)(s->count - i - 1) * sizeof *s->stack);
     s->count--;
     d->dirty = d->need_style = true; d->layout_valid = false;
+    boxes_require_full(d, "top layer"); /* its box and backdrop leave the root */
     return previous;
 }
 void web_dialog_sync(web_doc *d) {
@@ -100,6 +101,7 @@ bool web_dialog_enter(web_doc *d, node_t *n) {
     if (!valid(d, n) || d->inert || index_of(d, n) >= 0 || !reserve_dialog(d->dialogs)) return false;
     d->dialogs->stack[d->dialogs->count++] = (struct dialog_entry){.node=n, .previous=d->focus};
     d->dirty = d->need_style = true; d->layout_valid = false;
+    boxes_require_full(d, "top layer"); /* its box and backdrop join the root */
     return true;
 }
 void web_dialog_free(web_doc *d) { if (d) { web_presentation_free(d);if (d->dialogs) free(d->dialogs->stack); free(d->dialogs); d->dialogs = NULL; } }
