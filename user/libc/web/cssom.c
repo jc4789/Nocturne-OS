@@ -13,6 +13,13 @@ static int parse(web_doc *d, struct cssom_sheet *s, const char *text, size_t len
     s->ast = css_parse_sheet_serviced(d,&s->arena, s->source, length, s->base, 0, NULL);
     s->arena.trap = NULL; return CSSOM_OK;
 }
+/* The sheet takes over a parse made beside it, whose arena moves into it by value. */
+static void adopt_parse(struct cssom_sheet *s, struct cssom_sheet *parsed) {
+    discard_parse(s); s->arena = parsed->arena; s->ast = parsed->ast;
+    css_sheet_arena_moved(s->ast, &s->arena);
+    s->source = parsed->source; s->base = parsed->base; s->length = parsed->length;
+    memset(parsed, 0, sizeof *parsed);
+}
 static void invalidate(web_doc *d) {
     css_styling_free(&d->sty);
     d->resources_dirty = d->dirty = d->need_style = true;
@@ -67,8 +74,7 @@ int cssom_replace_sync(struct cssom_sheet *s, const char *text, size_t length) {
     if (count > UINT32_MAX - s->next_rule_id) { discard_parse(&fresh); return CSSOM_OOM; }
     for (struct css_rule_info *r = css_sheet_rules(fresh.ast, NULL); r; r = r->next) r->id = ++s->next_rule_id;
     cssom_changed(s); /* unpublish borrowed AST pointers before releasing */
-    discard_parse(s); s->arena = fresh.arena; s->ast = fresh.ast;
-    s->source = fresh.source; s->base = fresh.base; s->length = fresh.length;
+    adopt_parse(s, &fresh);
     return CSSOM_OK;
 }
 static bool active(web_doc *d, node_t *n) {
@@ -255,11 +261,9 @@ static int replace(struct cssom_sheet *s, const char *text, size_t length, uint3
         /* Unpublish all index/wrapper pointers before freeing the old AST.
            The next native layout/task scan builds from the new real AST. */
         cssom_changed(s);
-        discard_parse(s); s->arena=candidate->arena; s->ast=candidate->ast;
-        s->source=candidate->source; s->base=candidate->base; s->length=candidate->length;
+        adopt_parse(s,candidate);
         if (insertion) s->next_rule_id++;
         if (removed) { removed->next=s->removed;s->removed=removed;removed=NULL; }
-        memset(candidate,0,sizeof *candidate);
     }
     if(removed){free((void*)removed->text);free((void*)removed->selector);free(removed);}
     discard_parse(candidate); free(candidate); return error;

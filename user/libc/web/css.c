@@ -2280,6 +2280,7 @@ static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n
 }
 
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root) { if (sheet) sheet->scope = shadow_root; }
+void css_sheet_arena_moved(sheet_t *sheet, arena_t *arena) { if (sheet) sheet->ast->arena = arena; }
 void css_sheet_media(sheet_t *sheet, const char *media) { if (sheet) sheet->owner_media = media; }
 uint32_t css_sheet_import_urls(const sheet_t *sheet) { return sheet ? sheet->import_urls : 0; }
 struct css_rule_info *css_sheet_rules(sheet_t *sheet, uint32_t *length) {

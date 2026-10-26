@@ -537,6 +537,9 @@ struct css_import {
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
 sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
+/* The arena the sheet was parsed into now lives at another address: the AST's
+   rule index is built later in its owning arena, which it names by address. */
+void css_sheet_arena_moved(sheet_t *sheet, arena_t *arena);
 sheet_t *css_sheet_instance(arena_t *a, const sheet_t *source, double order, node_t *scope);
 void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_rule_info *owner);
 void css_sheet_media(sheet_t *sheet, const char *media);
