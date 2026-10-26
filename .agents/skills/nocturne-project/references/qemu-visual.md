@@ -9,9 +9,9 @@
 HMPでは既存monitorで次のcommandを送れる。
 
 ```text
-screendump build/nocturne-platform/<run>/before.ppm
+screendump "D:/.../build/qa/<run>/before.png" -f png
 sendkey pgdn
-screendump build/nocturne-platform/<run>/after.ppm
+screendump "D:/.../build/qa/<run>/after.png" -f png
 ```
 
 これは複数commandの例であって、単一画面ごとに工具呼出し／新process／再起動を要求するものではない。利用中の接続で各commandの完了を確認する。入力後の描画は現在のframeで確認し、機械的な固定sleepだけでreadyと断定しない。
