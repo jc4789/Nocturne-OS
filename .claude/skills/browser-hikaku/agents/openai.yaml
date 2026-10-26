@@ -1,0 +1,6 @@
+interface:
+  display_name: "ブラウザーを比べて確かめる"
+  short_description: "複数の実サイトを動いているブラウザーの参照画像と照合し、違いはブラウザー全体の欠陥として扱う確かめ方"
+  default_prompt: "$browser-hikaku に従い、複数の実サイトを参照画像と照合して確かめてください。"
+policy:
+  allow_implicit_invocation: true
