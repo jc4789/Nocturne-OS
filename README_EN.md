@@ -710,7 +710,7 @@ parts of them out of date.
 **Development**
 - libc++ 18.1.8 (Apache-2.0 with LLVM Exceptions, extracted from llvm-project at build time).
 - [Go](https://go.dev/) 1.27.2 (BSD-3-Clause, only when built with `GO=`).
-- [TypeScript-Go](https://github.com/microsoft/typescript-go) 7.0.2 (Apache-2.0, only when built with `TSGO=`).
+- [TypeScript](https://github.com/microsoft/typescript) 7.0.2  Apache-2.0
 - Build-time Python modules Mako, MarkupSafe and PyYAML (`third_party/python-build`, not in the image).
 
 **Fonts** (all under the SIL Open Font License 1.1; licenses in `rootfs/Nocturne/Fonts`)
