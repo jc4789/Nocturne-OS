@@ -22,6 +22,7 @@ typedef int64_t n_result;
 /* malloc's heap: bytes in its n_memory regions, and bytes in allocated blocks. */
 void malloc_usage(size_t *heap, size_t *used);
 uint64_t uptime_ms(void);
+uint64_t uptime_us(void); /* the same clock in microseconds, for timing short work */
 /* Native memory (docs/nocturne-native-abi.md §7): zero-filled pages with
  * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access; reserve also takes
  * N_MEMORY_LOW added to the access, for pages below 2 GiB. reserve puts the

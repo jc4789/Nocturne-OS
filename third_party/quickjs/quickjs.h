@@ -1079,6 +1079,10 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
 
 /* only exported for os.Worker() */
 JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
+/* Nocturne: for a sampling profiler, called from the interrupt handler. */
+const void *JS_GetRunningFunction(JSRuntime *rt);
+int JS_DescribeFunction(JSContext *ctx, const void *function, char *name, int name_size,
+                        char *filename, int filename_size);
 /* only exported for os.Worker() */
 JSValue JS_LoadModule(JSContext *ctx, const char *basename,
                       const char *filename);

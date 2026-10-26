@@ -79,19 +79,22 @@ static uint64_t user_rdtsc(void) {
     return (uint64_t)hi << 32 | lo;
 }
 n_result clock_info(struct n_clockinfo *info) { return SC1(SYS_CLOCK_INFO, info); }
-static uint64_t clock_publish(uint64_t ms) {
-    uint64_t previous = __atomic_load_n(&clock_last, __ATOMIC_RELAXED);
-    while (ms > previous && !__atomic_compare_exchange_n(&clock_last, &previous, ms, false,
-                                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-    return ms < previous ? previous : ms;
+/* Each clock never goes back, whichever thread reads it. */
+static uint64_t clock_publish(uint64_t *last, uint64_t value) {
+    uint64_t previous = __atomic_load_n(last, __ATOMIC_RELAXED);
+    while (value > previous && !__atomic_compare_exchange_n(last, &previous, value, false,
+                                                           __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    return value < previous ? previous : value;
 }
-uint64_t uptime_ms(void) {
+/* Microseconds since boot from the Hyper-V reference page or the TSC, without
+   a system call; false when only the kernel can tell. */
+static bool user_clock_us(uint64_t *us) {
     if (__atomic_load_n(&clock_initialized, __ATOMIC_ACQUIRE) != 2) {
         unsigned expected = 0;
-        if (__atomic_compare_exchange_n(&clock_initialized, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            if (clock_info(&user_clock) < 0) memset(&user_clock, 0, sizeof user_clock);
-            __atomic_store_n(&clock_initialized, 2, __ATOMIC_RELEASE);
-        } else return clock_publish((uint64_t)SC0(SYS_UPTIME));
+        if (!__atomic_compare_exchange_n(&clock_initialized, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return false;
+        if (clock_info(&user_clock) < 0) memset(&user_clock, 0, sizeof user_clock);
+        __atomic_store_n(&clock_initialized, 2, __ATOMIC_RELEASE);
     }
     if ((user_clock.flags & N_CLOCK_HV_REFERENCE) && user_clock.reference_page) {
         const struct n_reference_tsc *p = (const struct n_reference_tsc *)(uintptr_t)user_clock.reference_page;
@@ -105,16 +108,29 @@ uint64_t uptime_ms(void) {
             if (sequence != __atomic_load_n(&p->sequence, __ATOMIC_ACQUIRE)) continue;
             uint64_t reference = (uint64_t)(((__uint128_t)tsc * scale) >> 64) + offset;
             if (reference < user_clock.reference_sample_100ns) break;
-            return clock_publish(user_clock.uptime_ms + (reference - user_clock.reference_sample_100ns) / 10000);
+            *us = user_clock.uptime_ms * 1000 + (reference - user_clock.reference_sample_100ns) / 10;
+            return true;
         }
-        return clock_publish((uint64_t)SC0(SYS_UPTIME));
+        return false;
     }
-    if (!(user_clock.flags & N_CLOCK_USER_TSC) || user_clock.tsc_hz < 1000000)
-        return clock_publish((uint64_t)SC0(SYS_UPTIME));
+    if (!(user_clock.flags & N_CLOCK_USER_TSC) || user_clock.tsc_hz < 1000000) return false;
     uint64_t now = user_rdtsc();
-    if (now < user_clock.tsc_sample) return clock_publish((uint64_t)SC0(SYS_UPTIME));
-    uint64_t ms = user_clock.uptime_ms + (now - user_clock.tsc_sample) / (user_clock.tsc_hz / 1000);
-    return clock_publish(ms);
+    if (now < user_clock.tsc_sample) return false;
+    /* Whole seconds first: the cycle count times a million leaves 64 bits
+       after an hour or so. */
+    uint64_t cycles = now - user_clock.tsc_sample;
+    *us = user_clock.uptime_ms * 1000 + cycles / user_clock.tsc_hz * 1000000 +
+          cycles % user_clock.tsc_hz * 1000000 / user_clock.tsc_hz;
+    return true;
+}
+uint64_t uptime_ms(void) {
+    uint64_t us;
+    return clock_publish(&clock_last, user_clock_us(&us) ? us / 1000 : (uint64_t)SC0(SYS_UPTIME));
+}
+uint64_t uptime_us(void) {
+    static uint64_t last;
+    uint64_t us;
+    return clock_publish(&last, user_clock_us(&us) ? us : (uint64_t)SC0(SYS_UPTIME) * 1000);
 }
 
 /* ELF TLS (x86-64 variant II): the linked image ends at the FS control

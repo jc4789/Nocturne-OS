@@ -31498,6 +31498,45 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
 
 /* return JS_ATOM_NULL if the name cannot be found. Only works with
    not striped bytecode functions. */
+/* For a sampling profiler: the bytecode function the interpreter is running,
+   as an identity that holds while that function lives, or NULL. */
+const void *JS_GetRunningFunction(JSRuntime *rt)
+{
+    JSStackFrame *sf = rt->current_stack_frame;
+    JSObject *p;
+    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id))
+        return NULL;
+    return p->u.func.function_bytecode;
+}
+
+/* The name of a function JS_GetRunningFunction returned and the script it was
+   defined in, into the buffers; the line it starts on, 0 when unknown. Runs
+   no JavaScript. */
+/* The atom's text in the buffer, empty for no atom: JS_AtomGetStr hands back an
+   ASCII atom's own text instead of filling the buffer. */
+static void atom_text(JSContext *ctx, char *buf, int buf_size, JSAtom atom)
+{
+    const char *text;
+    if (buf_size <= 0)
+        return;
+    text = atom == JS_ATOM_NULL ? "" : JS_AtomGetStr(ctx, buf, buf_size, atom);
+    if (text != buf)
+        snprintf(buf, buf_size, "%s", text);
+}
+
+int JS_DescribeFunction(JSContext *ctx, const void *function, char *name, int name_size,
+                        char *filename, int filename_size)
+{
+    JSFunctionBytecode *b = (JSFunctionBytecode *)function;
+    int col_num;
+    atom_text(ctx, name, name_size, b->func_name);
+    atom_text(ctx, filename, filename_size, b->has_debug ? b->debug.filename : JS_ATOM_NULL);
+    return find_line_num(ctx, b, -1, &col_num);
+}
+
 JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
 {
     JSStackFrame *sf;

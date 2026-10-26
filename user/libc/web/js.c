@@ -23,6 +23,7 @@
 #include "js_canvas.h"
 #include "js_memory.h"
 #include "js_compile.h"
+#include "js_profile.h"
 #include "avmedia.h"
 #include "form_value.h"
 #include "form_validation.h"
@@ -248,6 +249,7 @@ struct web_js_state {
     unsigned profile_dom_depth;
     uint32_t profile_dom_sampling;
     struct { uint64_t calls, ms, samples; } profile_dom_ops[DOM_OPCODE_COUNT];
+    struct js_profile *js_profile; /* the runtime owner's, for --debug-js */
     struct js_storage_profile storage_profile;
     bool ce_hooks_active, range_hooks_active, face_hooks_active;
     struct js_mutation_registration *mutation_registrations;
@@ -373,6 +375,13 @@ static struct web_js_state *profile_task(struct web_js_state *s) {
 }
 static void log_text(struct web_js_state *s, int level, const char *msg) {
     if (s->host.console) s->host.console(s->host.opaque, level, msg ? msg : "JavaScript error");
+}
+static void log_profile_line(void *opaque, const char *line) { log_text(opaque, 0, line); }
+/* The runtime's JavaScript time by function, once a second of it has gathered. */
+static void js_time_report(struct web_js_state *s) {
+    struct web_js_state *owner = s->runtime_owner ? s->runtime_owner : s;
+    if (s->host.debug_js && js_profile_ms(owner->js_profile) >= 1000)
+        js_profile_report(owner->js_profile, log_profile_line, s);
 }
 static void wasm_profile_report(struct web_js_state *s) {
     if(!s->host.debug_js)return;
@@ -624,6 +633,10 @@ static void exception(struct web_js_state *s) {
 }
 static int interrupt(JSRuntime *rt, void *opaque) {
     struct web_js_state *s = opaque;
+    if (s->host.debug_js) {
+        struct web_js_state *owner = s->runtime_owner ? s->runtime_owner : s;
+        js_profile_sample(&owner->js_profile, rt, owner->ctx);
+    }
     if(s->runtime_owner && s->runtime_owner->runtime_active)s=s->runtime_owner->runtime_active;
     if (s->disabled) return 1;
     if (s->running && !s->starting && s->host.script_checkpoint &&
@@ -681,7 +694,10 @@ static void begin_task(struct web_js_state *s) {
     if (!s->running) {
         /* A nested child-realm call must not move the shared stack guard past
            the parent's active C/JS frames. Refresh only at an outer boundary. */
-        if (!s->runtime_owner || !s->runtime_owner->runtime_active) JS_UpdateStackTop(s->rt);
+        if (!s->runtime_owner || !s->runtime_owner->runtime_active) {
+            JS_UpdateStackTop(s->rt);
+            if (s->host.debug_js) js_profile_start((s->runtime_owner ? s->runtime_owner : s)->js_profile);
+        }
         s->task_deadline = uptime_ms() + s->task_budget_ms;
         if(s->runtime_owner){
             s->runtime_previous=s->runtime_owner->runtime_active;
@@ -824,7 +840,7 @@ static void end_task(struct web_js_state *s) {
         }
         if (s->doc->resources_dirty || s->doc->images_dirty) doc_rescan(s->doc);
     }
-    if (s->running==1) {web_js_wasm_collect(s->ctx);wasm_profile_report(s);}
+    if (s->running==1) {web_js_wasm_collect(s->ctx);wasm_profile_report(s);js_time_report(s);}
     if (s->running) s->running--;
     if(!s->running && s->runtime_owner){s->runtime_owner->runtime_active=s->runtime_previous;s->runtime_previous=NULL;}
 }
@@ -8381,5 +8397,6 @@ void web_js_free(web_doc *d) {
         JS_FreeContext(s->ctx);
     }
     if (s->rt && s->runtime_owner==s) JS_FreeRuntime(s->rt);
+    js_profile_free(s->js_profile);
     free(s);
 }

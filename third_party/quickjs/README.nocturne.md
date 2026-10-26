@@ -69,3 +69,11 @@ RegExpから作成realmへの所有参照には既存の `JS_DupContext`/`JS_Fre
 同じ文を一度だけ書き、後の関数は番号で指す（`BC_VERSION` 6）。読み戻しは
 番号ごとに一つの写しを作る。toString の結果、行番号、strip の扱いは変えない。
 関数が一つでも生きていれば入力全体が残るが、その量は入力一つ分を超えない。
+
+## 標本取りの問い合わせ
+
+`--debug-js` の JavaScript の時間計測（`user/libc/web/js_profile.c`）のため、
+割り込みの handler から呼べる二つの関数を足した。`JS_GetRunningFunction` は
+いま走っている bytecode 関数を、その関数が生きている間だけ通用する識別子として
+返す。`JS_DescribeFunction` はその名前、定義された script、始まる行を返し、
+JavaScript を一切走らせない。解釈器の動きは変えない。

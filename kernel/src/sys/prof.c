@@ -7,7 +7,9 @@
    number, because each one is a migration through the BSP, and their round
    trips are timed by leg. A user sample also records the word on top of the
    user stack: for a leaf function such as memcpy that pushed nothing, it is
-   the return address, so the host can name the caller. */
+   the return address, so the host can name the caller. User addresses are
+   counted per 64-byte line: an interpreter's time is spread over thousands of
+   instructions, each too rare to reach the printed list on its own. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
@@ -139,7 +141,7 @@ void prof_tick(const struct regs *r, bool idle) {
     struct task *t = current_task;
     if ((r->cs & 3) == 3 && t) {
         __atomic_add_fetch(&cpu_user[cpu], 1, __ATOMIC_RELAXED);
-        record(r->rip, t->pid);
+        record(r->rip & ~0x3full, t->pid);
         record_pair(r->rip, user_stack_top(r, t, cpu), t->pid);
     } else if (idle || !t) {
         __atomic_add_fetch(&cpu_idle[cpu], 1, __ATOMIC_RELAXED);
