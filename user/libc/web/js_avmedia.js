@@ -235,9 +235,11 @@ const avmediaBridge = (() => {
             finish().catch(e=>{if(current(this,s,generation,url)&&seekIntent===s.seekIntent&&e.name!=='AbortError'&&!s.error){s.error=new MediaError(3,String(e));event(this,'error');}});
         }
         get volume(){return get(this).volume;}
-        set volume(value){const s=get(this),v=Number(value);if(!Number.isFinite(v)||v<0||v>1)throw new DOMException('Invalid volume','IndexSizeError');s.volume=v;native('volume',this,v,s.muted);event(this,'volumechange');}
+        /* HTML: volume is a WebIDL double; a change queues a media element
+           task, so a volumechange listener that sets it again cannot recurse. */
+        set volume(value){const s=get(this),v=Number(value);if(!Number.isFinite(v))throw new TypeError('Volume is not a finite number');if(v<0||v>1)throw new DOMException('Invalid volume','IndexSizeError');if(v===s.volume)return;s.volume=v;native('volume',this,v,s.muted);setTimeout(()=>event(this,'volumechange'),0);}
         get muted(){return get(this).muted;}
-        set muted(value){const s=get(this);s.muted=!!value;native('volume',this,s.volume,s.muted);event(this,'volumechange');}
+        set muted(value){const s=get(this),m=!!value;if(m===s.muted)return;s.muted=m;native('volume',this,s.volume,m);setTimeout(()=>event(this,'volumechange'),0);}
         get defaultMuted(){brand(this);return this.hasAttribute('muted');}
         set defaultMuted(v){brand(this);this.toggleAttribute('muted',!!v);}
         get preload(){brand(this);const v=(this.getAttribute('preload')||'metadata').toLowerCase();return v==='none'||v==='auto'?v:'metadata';}

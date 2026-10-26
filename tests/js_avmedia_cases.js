@@ -27,6 +27,17 @@ async function runAvmediaCases() {
     check(cancelled&&loadstartPause.paused,'loadstart reentrant pause cancels play');
     loadstartPause.onloadstart=null;release(loadstartPause);
 
+    /* WPT event_volumechange, volumechange-ratechange-queue-task, volume_nonfinite. */
+    for(const bad of [NaN,Infinity,-Infinity]){let type=false;try{new Audio().volume=bad;}catch(e){type=e instanceof TypeError;}check(type,'non-finite volume TypeError');}
+    const quiet=new Audio();let changes=0;quiet.onvolumechange=()=>changes++;
+    quiet.volume=quiet.volume;quiet.muted=quiet.muted;
+    quiet.muted=true;check(changes===0,'volumechange is not dispatched synchronously');
+    await Promise.resolve();check(changes===0,'volumechange is a task, not a microtask');
+    quiet.volume=0.5;quiet.muted=false;quiet.volume=1;
+    await delay(30);check(changes===4,'one volumechange per change, none for the same value');
+    const echo=new Audio();let echoes=0;echo.onvolumechange=()=>{echoes++;echo.volume=echo.volume;echo.muted=echo.muted;};
+    echo.volume=0.25;await delay(30);check(echoes===1,'listener writing the same volume does not refire');
+
     const reentrant=video('h264.mp4');let metadata=0,loaded=0,wrong=0;
     let done;const replacementReady=new Promise(resolve=>done=resolve);
     reentrant.onloadedmetadata=()=>{metadata++;if(reentrant.currentSrc===fixture('h264.mp4')){reentrant.src=fixture('mjpeg.avi');reentrant.load();}};
