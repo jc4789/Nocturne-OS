@@ -79,6 +79,9 @@ struct pctx {
 /* debug_js only: where top-level paint time goes between profile reports. */
 static struct { uint64_t paints, order_ms, frames_ms, walk_ms, probe_ms, total_ms, groups, group_pixels,
     order_builds, layer_builds, radius_builds, radius_pixels, radius_moves; } paint_profile;
+/* debug_js only: how restyles' paint damage was decided between profile reports. */
+static struct { uint64_t commits, boxes, lost_layout, lost_unbounded, lost_room, lost_ink,
+    taken_partial, taken_full, taken_none, taken_stale; } damage_profile;
 
 static bool positioned(const box_t *b) {
     if (!b->st || b->kind == B_INLINE || b->kind == B_TEXT) return false;
@@ -1139,7 +1142,14 @@ static image_t *scaled_image(struct web_image *im, int w, int h,
                              const canvas_t *canvas, int x, int y, int box_w, int box_h) {
     if (w <= 0 || h <= 0 || !im->img) return NULL;
     if (im->img->w == w && im->img->h == h) return im->img;
-    if (im->scaled && im->scaled->w == w && im->scaled->h == h) return im->scaled;
+    const size_t kept = sizeof im->scaled / sizeof *im->scaled;
+    for (size_t i = 0; i < kept; i++) {
+        image_t *s = im->scaled[i];
+        if (!s || s->w != w || s->h != h) continue;
+        memmove(im->scaled + 1, im->scaled, i * sizeof *im->scaled);
+        im->scaled[0] = s;
+        return s;
+    }
     if(web_avmedia_snapshot_is_probe()){
         /* An uncached image outside the committed video span must not disable
            that surface. Probes neither allocate nor replace shared caches;
@@ -1148,9 +1158,12 @@ static image_t *scaled_image(struct web_image *im, int w, int h,
         return NULL;
     }
     if ((long)w * h > IMAGE_MAX_PIXELS) return NULL;
-    if (im->scaled) image_free(im->scaled);
-    im->scaled = im->svg ? image_decode_svg(im->svg, im->svg_n, w, h) : image_scale(im->img, w, h);
-    return im->scaled;
+    image_t *made = im->svg ? image_decode_svg(im->svg, im->svg_n, w, h) : image_scale(im->img, w, h);
+    if (!made) return NULL;
+    image_free(im->scaled[kept - 1]);
+    memmove(im->scaled + 1, im->scaled, (kept - 1) * sizeof *im->scaled);
+    im->scaled[0] = made;
+    return made;
 }
 
 static void text_in(struct pctx *P, const style_t *st, float x, float y, float h, const char *s, uint32_t col) {
@@ -2470,7 +2483,14 @@ int web_paint_report(char *out, size_t size) {
         (unsigned long)(paint_profile.radius_pixels/1000),(unsigned long)paint_profile.radius_moves,
         (unsigned long)paint_profile.frames_ms,(unsigned long)paint_profile.walk_ms,(unsigned long)paint_profile.probe_ms,
         (unsigned long)paint_profile.groups,(unsigned long)(paint_profile.group_pixels/1000));
+    if(n>=0&&(size_t)n<size)n+=snprintf(out+n,size-(size_t)n,
+        "; restyle damage: %lu commits of %lu boxes, whole after layout %lu, unbounded %lu, too many %lu, ink %lu; taken partial %lu, whole %lu, none recorded %lu, stale %lu",
+        (unsigned long)damage_profile.commits,(unsigned long)damage_profile.boxes,(unsigned long)damage_profile.lost_layout,
+        (unsigned long)damage_profile.lost_unbounded,(unsigned long)damage_profile.lost_room,(unsigned long)damage_profile.lost_ink,
+        (unsigned long)damage_profile.taken_partial,(unsigned long)damage_profile.taken_full,
+        (unsigned long)damage_profile.taken_none,(unsigned long)damage_profile.taken_stale);
     memset(&paint_profile,0,sizeof paint_profile);
+    memset(&damage_profile,0,sizeof damage_profile);
     return n;
 }
 static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y);
@@ -2587,6 +2607,12 @@ void web_hit_index_free(web_doc *d) {
     if(!d||!d->hit_index)return;
     free(d->hit_index->items);free(d->hit_index->branches);free(d->hit_index->regions);free(d->hit_index);d->hit_index=NULL;
 }
+/* Unites a document rectangle (left, top, right, bottom) with the next paint's damage. */
+static void damage_add(web_doc *d,const float rect[4]){
+    if(!d->paint_damage_valid){memcpy(d->paint_damage,rect,sizeof d->paint_damage);d->paint_damage_valid=true;return;}
+    d->paint_damage[0]=fminf(d->paint_damage[0],rect[0]);d->paint_damage[1]=fminf(d->paint_damage[1],rect[1]);
+    d->paint_damage[2]=fmaxf(d->paint_damage[2],rect[2]);d->paint_damage[3]=fmaxf(d->paint_damage[3],rect[3]);
+}
 void doc_paint_damage(web_doc *d,node_t *node){
     if(!d)return;
     /* An unclassified notification already pending cannot be downgraded to
@@ -2600,15 +2626,106 @@ void doc_paint_damage(web_doc *d,node_t *node){
     float bottom=y+box->h+box->p[0]+box->p[2]+box->b[0]+box->b[2]+4;
     float ink[4]={x,y,right,bottom};
     if(box->st)shadow_ink_bounds(box->st,x+2,y+2,right-x-4,bottom-y-4,ink);
-    x=ink[0];y=ink[1];right=ink[2];bottom=ink[3];
-    if(!isfinite(x)||!isfinite(y)||!isfinite(right)||!isfinite(bottom)){d->paint_damage_full=true;return;}
-    if(!d->paint_damage_valid){d->paint_damage[0]=x;d->paint_damage[1]=y;d->paint_damage[2]=right;d->paint_damage[3]=bottom;d->paint_damage_valid=true;}
-    else{d->paint_damage[0]=fminf(d->paint_damage[0],x);d->paint_damage[1]=fminf(d->paint_damage[1],y);
-        d->paint_damage[2]=fmaxf(d->paint_damage[2],right);d->paint_damage[3]=fmaxf(d->paint_damage[3],bottom);}
+    if(!isfinite(ink[0])||!isfinite(ink[1])||!isfinite(ink[2])||!isfinite(ink[3])){d->paint_damage_full=true;return;}
+    damage_add(d,ink);
+}
+
+/* The box whose subtree paints what a restyle of n changes, NULL when nothing of n is painted;
+   *known is false when no one box bounds it: the canvas takes html's and body's backgrounds,
+   the top layer paints apart from the tree, and an SVG element outside a boxed outermost <svg>
+   may be drawn by any <use>. Inside one, the outermost <svg>'s snapshot paints it, as any
+   element without boxes of its own (display: contents, an <option>, a <col>) is painted by its
+   nearest boxed ancestor, an inline by its block's runs, and whatever a filter above spreads
+   or remaps, by the filtered ancestor. */
+static box_t *restyle_box(web_doc *d,node_t *n,bool *known){
+    *known=true;
+    if(n==d->html||n==d->body){*known=false;return NULL;}
+    if(!n->box&&(!n->style||n->style->display==D_NONE))return NULL;
+    node_t *e=n;
+    if(n->foreign&&!n->box){
+        while(e->parent&&e->parent->type==N_ELEM&&e->parent->foreign)e=e->parent;
+        if(e->tag!=T_svg||!e->box||e->box->atomic!=AT_SVG){*known=false;return NULL;}
+    }
+    while(e&&!e->box)e=doc_flat_parent(e);
+    box_t *b=e&&e->owner==d?e->box:NULL;
+    while(b&&(b->kind==B_INLINE||b->kind==B_TEXT||b->kind==B_BR))b=b->parent;
+    for(box_t *a=b;a;a=a->parent){
+        if(web_dialog_layer_box(d,a)){*known=false;return NULL;}
+        if(a!=b&&a->st&&a->st->filter)b=a;
+    }
+    return b;
+}
+/* What b's subtree paints, in document space through the transforms above it; an empty
+   rectangle when it paints nothing. False when that cannot be bounded. */
+static bool restyle_box_ink(web_doc *d,box_t *b,float rect[4]){
+    canvas_t scratch={0};
+    struct pctx P={0};
+    P.d=d;P.c=&scratch;P.mode=M_BOUNDS;P.top_root=b;
+    P.bounds_generation=__atomic_add_fetch(&d->paint_bounds_generation,1,__ATOMIC_RELAXED);
+    uint32_t memo=box_visual_memo_begin();
+    paint_box(&P,b,true);
+    box_visual_memo_end(memo);
+    if(P.failed)return false;
+    if(!P.bounds_valid){rect[0]=rect[1]=INFINITY;rect[2]=rect[3]=-INFINITY;return true;}
+    /* the subtree's own transform is in its bounds; its antialiased edges reach a pixel out */
+    double r[4]={P.bounds[0]-2,P.bounds[1]-2,P.bounds[2]-P.bounds[0]+4,P.bounds[3]-P.bounds[1]+4};
+    box_transform_rect(b->parent,r);
+    for(int i=0;i<4;i++)if(!isfinite(r[i]))return false;
+    rect[0]=(float)r[0];rect[1]=(float)r[1];rect[2]=(float)(r[0]+r[2]);rect[3]=(float)(r[1]+r[3]);
+    return true;
+}
+void doc_restyle_damage_lost(web_doc *d){
+    if(d->profile_enabled&&!d->restyle_damage_lost)damage_profile.lost_layout++;
+    d->restyle_damage_n=0;d->restyle_damage_lost=false;
+    d->paint_damage_full=true;
+}
+void doc_restyle_damage_begin(web_doc *d){
+    if(d->restyle_damage_lost)return;
+    /* A sprite sheet's element reached by <use> re-serializes every snapshot. */
+    if(d->svg_snapshots_dirty){d->restyle_damage_lost=true;if(d->profile_enabled)damage_profile.lost_unbounded++;return;}
+    const size_t room=sizeof d->restyle_damage/sizeof *d->restyle_damage;
+    for(node_t *n=d->style_retired_first;n;n=n->style_retired_next){
+        if(!css_restyled(n))continue;
+        bool known;box_t *b=restyle_box(d,n,&known);
+        if(!known){d->restyle_damage_lost=true;if(d->profile_enabled)damage_profile.lost_unbounded++;return;}
+        if(!b)continue;
+        /* A box met again keeps what it painted before its first restyle. */
+        bool seen=false;
+        for(size_t i=0;i<d->restyle_damage_n&&!seen;i++)seen=d->restyle_damage[i].box==b;
+        if(seen)continue;
+        if(d->restyle_damage_n==room){d->restyle_damage_lost=true;if(d->profile_enabled)damage_profile.lost_room++;return;}
+        struct restyle_damage *r=&d->restyle_damage[d->restyle_damage_n];
+        if(!restyle_box_ink(d,b,r->rect)){d->restyle_damage_lost=true;if(d->profile_enabled)damage_profile.lost_ink++;return;}
+        r->box=b;d->restyle_damage_n++;
+    }
+}
+void doc_restyle_damage_commit(web_doc *d){
+    bool lost=d->restyle_damage_lost;
+    float now[sizeof d->restyle_damage/sizeof *d->restyle_damage][4];
+    for(size_t i=0;i<d->restyle_damage_n&&!lost;i++)lost=!restyle_box_ink(d,d->restyle_damage[i].box,now[i]);
+    if(lost){
+        if(d->profile_enabled&&!d->restyle_damage_lost)damage_profile.lost_ink++;
+        d->restyle_damage_lost=true;doc_restyle_damage_lost(d);return;
+    }
+    if(d->profile_enabled){damage_profile.commits++;damage_profile.boxes+=d->restyle_damage_n;}
+    /* An unclassified notification already pending stays whole. */
+    if(d->paint_dirty&&!d->paint_damage_valid)d->paint_damage_full=true;
+    if(!d->paint_damage_valid){
+        d->paint_damage[0]=d->paint_damage[1]=INFINITY;d->paint_damage[2]=d->paint_damage[3]=-INFINITY;
+        d->paint_damage_valid=true;
+    }
+    for(size_t i=0;i<d->restyle_damage_n;i++){damage_add(d,d->restyle_damage[i].rect);damage_add(d,now[i]);}
+    d->restyle_damage_n=0;
 }
 bool web_take_paint_damage(web_doc *d,int *x,int *y,int *w,int *h){
     if(!d)return false;
     bool valid=d->paint_damage_valid&&!d->paint_damage_full&&d->layout_valid&&!d->need_style&&!d->need_boxes;
+    if(d->profile_enabled){
+        if(valid)damage_profile.taken_partial++;
+        else if(d->paint_damage_full)damage_profile.taken_full++;
+        else if(!d->paint_damage_valid)damage_profile.taken_none++;
+        else damage_profile.taken_stale++;
+    }
     if(valid){
         double vw=MAX(d->width,0),vh=MAX(d->height,0);
         double left=fmin(vw,fmax(0,floor(d->paint_damage[0])-d->view_x)),top=fmin(vh,fmax(0,floor(d->paint_damage[1])-d->view_y));

@@ -571,6 +571,7 @@ void css_node_style_free(node_t *n);
 void css_style_doc_free(web_doc *d);
 void css_node_style_unpublish(node_t *n);
 void css_styles_release(web_doc *d);
+bool css_restyled(const node_t *n);
 bool css_style_layout_equal(const style_t *a, const style_t *b);
 const struct custom_prop *css_custom_property(const style_t *s, const char *name); /* computed --name, or NULL */
 int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text);
@@ -838,6 +839,12 @@ void web_hit_index_free(web_doc *d);
 void web_paint_free(web_doc *d); /* paint-owned buffers kept between paints */
 void doc_paint_damage(web_doc *d, node_t *node);
 void doc_paint_full(web_doc *d); /* unclassified visual change, including frame composites */
+/* A cascade's paint damage. _begin records what the restyled elements paint while their boxes
+   still borrow the retired styles; _commit adds what they paint now once the geometry was kept;
+   _lost makes the next paint whole (new boxes or layout, or no box bounds the change). */
+void doc_restyle_damage_begin(web_doc *d);
+void doc_restyle_damage_commit(web_doc *d);
+void doc_restyle_damage_lost(web_doc *d);
 bool box_element_scrollable(const box_t *b);
 void box_scroll_clamp(box_t *b);
 
@@ -881,7 +888,9 @@ uint32_t doc_canvas_bg(web_doc *d, int *from); /* 1: from <html>, 2: from <body>
 struct web_image {
     char *url;
     image_t *img;
-    image_t *scaled; /* cache of the last drawn size */
+    /* The last sizes drawn, the most recent first: a page may draw one image at two sizes
+       (a blurred backdrop behind the picture itself) on every paint. */
+    image_t *scaled[2];
     char *svg;       /* SVG source, rasterized again at the size it is drawn at */
     size_t svg_n;
     bool done, failed;
@@ -984,9 +993,15 @@ struct web_doc {
     bool svg_snapshots_dirty; /* a restyled SVG element has no boxed outermost <svg>; <use> may reference it */
     float paint_damage[4];
     bool paint_damage_valid, paint_damage_full;
+    /* Between a cascade and its publication: the boxes whose styles changed and what they
+       painted before. More than these is repainted whole. */
+    struct restyle_damage { box_t *box; float rect[4]; } restyle_damage[32];
+    uint8_t restyle_damage_n;
+    bool restyle_damage_lost;
     struct html_parser *parser;
     struct web_js_state *js;
     bool live, dirty, paint_dirty, resources_dirty, images_dirty;
+    bool restyle_dirty; /* dirty, but only marked elements' own computed values (CSS animation samples) */
     bool initial_render_done;
     uint64_t initial_render_deadline; /* paint fallback only: never cancels resources */
     double render_head_order; /* root-sheet order after the scanned head */

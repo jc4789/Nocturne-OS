@@ -65,6 +65,7 @@ static struct {
     uint64_t partial_ms, partial_update_ms, video_present_ms, console_ms, console_update_ms;
     unsigned ticks, layouts, draws;
     unsigned partial_draws, video_patches, console_draws;
+    unsigned partial_empty, partial_whole; /* damage off the page, or not a known rectangle */
 } loop_profile;
 /* Browser pages need more time than small custom web_live hosts. The native
    command line can select a finite limit, never an unlimited watchdog. */
@@ -542,8 +543,11 @@ static void redraw(void) {
 static void redraw_damage(void){
     int x,y,width,height;
     if(direct_frame()){if(doc)(void)web_take_paint_damage(doc,&x,&y,&width,&height);return;}
-    if(!doc||!view.px||need_paint||sel_node||devtools_overlay_visible()||!web_take_paint_damage(doc,&x,&y,&width,&height)){redraw();return;}
-    if(width<=0||height<=0)return;
+    if(!doc||!view.px||need_paint||sel_node||devtools_overlay_visible()||!web_take_paint_damage(doc,&x,&y,&width,&height)){
+        if(debug_js)loop_profile.partial_whole++;
+        redraw();return;
+    }
+    if(width<=0||height<=0){if(debug_js)loop_profile.partial_empty++;return;}
     uint64_t start=debug_js?n_clock_uptime_ms():0;
     canvas_t original=view;
     gfx_clip(&view,x,y,width,height);
@@ -974,7 +978,8 @@ static void set_title(void) {
 static void flush_dom_layout(void) {
     if (!doc || native_wait || web_script_running(doc)) return;
     if(sel_node && web_node_inert(doc,sel_node))sel_node=NULL;
-    if (web_dirty(doc)) need_layout = true;
+    /* Animation samples wait for the document's rendering turn, which bounds their repaint. */
+    if (!web_restyle_only(doc) && web_dirty(doc)) need_layout = true;
     if (need_layout) {
         relayout();
         set_title();
@@ -2832,9 +2837,14 @@ static void document_step(uint64_t now) {
     /* The rendering waits for the frame that shows the last picture: the tasks before it change
        the page, the frame lays it out and paints it once. */
     if (!picture_pending) {
+        bool restyle_only = web_restyle_only(doc) && !need_layout;
         bool dirty = web_dirty(doc);
         bool media_paint = web_paint_dirty(doc);
-        if (dirty || need_layout) {
+        if (restyle_only) {
+            /* Animation samples: the layout bounds what they repaint, often nothing on screen. */
+            relayout();
+            redraw_damage();
+        } else if (dirty || need_layout) {
             relayout();
             set_title();
             redraw();
@@ -2870,6 +2880,7 @@ static void report_loop_profile(uint64_t now) {
              (unsigned long)loop_profile.update_ms, (unsigned long)loop_profile.net_ms,
              (unsigned long)loop_profile.wait_ms, (unsigned long)parallel_jobs());
     unsigned partial=loop_profile.partial_draws,patches=loop_profile.video_patches;
+    unsigned partial_empty=loop_profile.partial_empty,partial_whole=loop_profile.partial_whole;
     unsigned consoles=loop_profile.console_draws;
     uint64_t console_ms=loop_profile.console_ms,console_update=loop_profile.console_update_ms;
     uint64_t partial_ms=loop_profile.partial_ms,partial_update=loop_profile.partial_update_ms,video_ms=loop_profile.video_present_ms;
@@ -2892,12 +2903,13 @@ static void report_loop_profile(uint64_t now) {
     if (web_paint_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if (web_style_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if (web_box_report(message, sizeof message) > 0) host_console(NULL, 0, message);
+    if (web_tick_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if(consoles){snprintf(message,sizeof message,
         "Browser console profile: rect draw %u/%lu ms, rect present %lu ms (no author page paint)",
         consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL,0,message);}
-    if(partial||patches){snprintf(message,sizeof message,
-        "Browser damage profile: partial draw %u/%lu ms, partial present %lu ms, video patch %u/%lu ms (banded compose into the view and present)",
-        partial,(unsigned long)partial_ms,(unsigned long)partial_update,patches,(unsigned long)video_ms);host_console(NULL,0,message);}
+    if(partial||patches||partial_empty||partial_whole){snprintf(message,sizeof message,
+        "Browser damage profile: partial draw %u/%lu ms, partial present %lu ms, off the page %u, drawn whole %u, video patch %u/%lu ms (banded compose into the view and present)",
+        partial,(unsigned long)partial_ms,(unsigned long)partial_update,partial_empty,partial_whole,patches,(unsigned long)video_ms);host_console(NULL,0,message);}
     static uint64_t reported_batches[PARALLEL_STAGE_COUNT];
     for (int stage = 1; stage < PARALLEL_STAGE_COUNT; stage++) {
         struct parallel_stats s;

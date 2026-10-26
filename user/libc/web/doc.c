@@ -1126,14 +1126,36 @@ int64_t web_media_background_deadline(uint64_t now) {
     int64_t media = web_avmedia_background_deadline(now), worker = web_worker_background_deadline(now);
     return media < 0 ? worker : worker < 0 ? media : MIN(media,worker);
 }
+/* --debug-js: which step of the turns since the last web_tick_report() left the document to lay
+   out again (main thread only). A step is named when the flag was clear before it and set after. */
+enum { TICK_RENDER, TICK_RESCAN, TICK_MEDIA, TICK_MOTION, TICK_MARQUEE, TICK_SCRIPT, TICK_FRAMES, TICK_STEPS };
+static struct { uint64_t turns, dirty[TICK_STEPS], style[TICK_STEPS]; } tick_profile;
+static void tick_step(const web_doc *d, int step, bool dirty, bool style) {
+    if (!d->profile_enabled) return;
+    if (!dirty && d->dirty) tick_profile.dirty[step]++;
+    if (!style && d->need_style) tick_profile.style[step]++;
+}
+int web_tick_report(char *out, size_t size) {
+    if (!tick_profile.turns) return 0;
+    static const char *const names[TICK_STEPS] = {"first render", "rescan", "media", "CSS motion", "marquee", "script", "frames"};
+    int n = snprintf(out, size, "Document tick profile: turns %lu; dirtied (layout and paint)/restyle by",
+                     (unsigned long)tick_profile.turns);
+    for (int i = 0; i < TICK_STEPS && n >= 0 && (size_t)n < size; i++)
+        n += snprintf(out + n, size - (size_t)n, "%s %s %lu/%lu", i ? "," : "", names[i],
+                      (unsigned long)tick_profile.dirty[i], (unsigned long)tick_profile.style[i]);
+    memset(&tick_profile, 0, sizeof tick_profile);
+    return n;
+}
+#define TICK_STEP(d, step, call) do { bool dirty_ = (d)->dirty, style_ = (d)->need_style; call; tick_step(d, step, dirty_, style_); } while (0)
 void web_tick(web_doc *d, uint64_t now) {
     web_media_background(now);
     if (!d || !d->live) return;
+    if (d->profile_enabled) tick_profile.turns++;
     if(!d->initial_render_done && d->initial_render_deadline && now >= d->initial_render_deadline) {
         /* A hidden frame may never paint. Its fallback is a one-shot wake,
            not a perpetual full-page damage source on every subsequent tick. */
         d->initial_render_deadline=0;
-        doc_paint_full(d);
+        TICK_STEP(d, TICK_RENDER, doc_paint_full(d));
     }
     /* A native-only cancellation preserves author queues, not partial boxes.
        Rebuild outside every author/media/animation task before any callback
@@ -1143,26 +1165,26 @@ void web_tick(web_doc *d, uint64_t now) {
         web_layout(d,MAX(1,d->width),MAX(1,d->height));
         if(d->native_recovery_pending || d->native_cancelled || !d->layout_valid)return;
     }
-    doc_rescan(d);
+    TICK_STEP(d, TICK_RESCAN, doc_rescan(d));
     if(d->native_cancelled)return;
-    web_avmedia_tick(d, now);
+    TICK_STEP(d, TICK_MEDIA, web_avmedia_tick(d, now));
     if(d->native_cancelled)return;
-    css_motion_tick(d,now);
+    TICK_STEP(d, TICK_MOTION, css_motion_tick(d,now));
     if(d->native_cancelled)return;
-    web_marquee_tick(d,now);
+    TICK_STEP(d, TICK_MARQUEE, web_marquee_tick(d,now));
     if(d->native_cancelled)return;
-    web_js_tick(d, now);
+    TICK_STEP(d, TICK_SCRIPT, web_js_tick(d, now));
     if(d->native_cancelled)return;
-    doc_rescan(d);
+    TICK_STEP(d, TICK_RESCAN, doc_rescan(d));
     if(d->native_cancelled)return;
     /* The child can complete while author JS runs. Refill before GUI paint,
        not one complete browser turn later. Both calls retain their native
        2 ms / 8 packet bounds; there are exactly two opportunities per tick. */
-    web_avmedia_tick(d, uptime_ms());
+    TICK_STEP(d, TICK_MEDIA, web_avmedia_tick(d, uptime_ms()));
     if(d->native_cancelled)return;
-    web_js_frames_sync(d);
+    TICK_STEP(d, TICK_FRAMES, web_js_frames_sync(d));
     if(d->native_cancelled)return;
-    web_frames_tick(d,now);
+    TICK_STEP(d, TICK_FRAMES, web_frames_tick(d,now));
 }
 n_handle web_wait_queue(void) { return web_atomics_queue(); }
 void web_wait_events(const struct n_event *events, size_t count) { web_atomics_events(events, count); }
@@ -1211,10 +1233,11 @@ void web_response_free(struct web_response *r) {
 }
 bool web_dirty(web_doc *d) {
     if (!d) return false;
-    bool dirty = d->dirty;
-    d->dirty = false;
+    bool dirty = d->dirty || d->restyle_dirty;
+    d->dirty = d->restyle_dirty = false;
     return dirty;
 }
+bool web_restyle_only(const web_doc *d) { return d && d->restyle_dirty && !d->dirty; }
 bool web_paint_dirty(web_doc *d) {
     if (!d) return false;
     bool dirty = d->paint_dirty;
@@ -1380,7 +1403,7 @@ void web_free(web_doc *d) {
     for (int i = 0; i < d->images.n; i++) {
         struct web_image *im = d->images.v[i];
         if (im->img) image_free(im->img);
-        if (im->scaled) image_free(im->scaled);
+        for (size_t k = 0; k < sizeof im->scaled / sizeof *im->scaled; k++) image_free(im->scaled[k]);
         free(im->svg);
         free(im->url);
         free(im);
@@ -1600,6 +1623,7 @@ reflow:
         if (d->native_cancelled) goto cancelled;
         if (d->root) register_bg(d, d->root);
         if (!d->root_box || d->style_boxes_changed || d->need_boxes) {
+            doc_restyle_damage_lost(d);
             bool local=false;
             if(d->root_box){
                 boxes_restyle(d); /* refresh existing arena borrows before branch publication */
@@ -1624,6 +1648,7 @@ reflow:
         } else {
             /* Topology is unchanged. Update computed-style borrows before
                reclaiming old element arenas; dirty boxes drive local layout. */
+            doc_restyle_damage_begin(d);
             boxes_restyle(d);
             css_styles_release(d);
             slow_restyles++;
@@ -1635,6 +1660,7 @@ reflow:
     } else if(d->need_boxes) {
         /* Computed styles remain owned by smem. Only text boxes/anonymous
            styles borrow bmem, so old box ownership can be reclaimed safely. */
+        doc_restyle_damage_lost(d);
         if(d->root_box && boxes_rebuild_local(d))slow_locals++;
         else{
             boxes_discard(d);
@@ -1665,8 +1691,11 @@ reflow:
        In particular, first-use font initialization can disable that inner
        cache even though the completed post pass and final font epoch remain
        the document's committed geometry. */
-    if (committed_geometry_current(d,width,height,font_metrics_generation()))
+    if (committed_geometry_current(d,width,height,font_metrics_generation())) {
+        doc_restyle_damage_commit(d);
         goto geometry_committed;
+    }
+    doc_restyle_damage_lost(d);
     d->width = width;
     d->height = height;
     layout_doc(d, width, height);
@@ -1711,6 +1740,7 @@ geometry_committed:
 cancelled:
     /* Never paint/hit-test a half-built tree or label it a valid layout. */
     d->bmem.trap = NULL;
+    doc_restyle_damage_lost(d);
     boxes_discard(d);
     css_node_style_unpublish(d->root);
     css_styles_release(d);

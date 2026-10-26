@@ -2861,16 +2861,20 @@ static bool container_units_used(const char *s) {
     return false;
 }
 
+/* A slot in a shadow tree whose flat children are the host's light children assigned to it,
+   which are not its descendants. */
+static bool flat_slot(node_t *n) {
+    return n->type==N_ELEM && !n->foreign && n->tag==T_slot && n->slot_assigned_first &&
+           doc_node_root(n,false)->shadow_host;
+}
 static node_t *container_first(node_t *n) {
     if(n->shadow_root)n=n->shadow_root;
-    if(n->type==N_ELEM && !n->foreign && n->tag==T_slot && n->slot_assigned_first &&
-       doc_node_root(n,false)->shadow_host)return n->slot_assigned_first;
+    if(flat_slot(n))return n->slot_assigned_first;
     return n->first;
 }
 static node_t *container_next(node_t *n) {
     node_t *p=doc_flat_parent(n);
-    if(p && p->type==N_ELEM && !p->foreign && p->tag==T_slot && p->slot_assigned_first &&
-       doc_node_root(p,false)->shadow_host)return n->assigned_next;
+    if(p && flat_slot(p))return n->assigned_next;
     return n->next;
 }
 
@@ -3783,6 +3787,7 @@ struct css_motion_state {
     uint64_t last;
     double elapsed;
     bool paused, running;
+    bool requested; /* marked for a sample; the cascade takes it, not the clock */
 };
 static void css_motion_reset(node_t *n) {
     if(n && n->css_motion){n->css_motion->node=NULL;n->css_motion->running=false;n->css_motion=NULL;}
@@ -3801,17 +3806,18 @@ void css_motion_tick(web_doc *d,uint64_t now) {
         struct css_motion_state *s=*slot;
         if(!s->node){*slot=s->next;free(s->name);free(s);continue;}
         slot=&s->next;
-        if(!s->node || !s->running || now<s->last || now-s->last<16)continue;
+        if(!s->node || !s->running || s->requested || now<s->last || now-s->last<16)continue;
         if(doc_node_root(s->node,true)!=d->root){css_motion_reset(s->node);continue;}
         /* A sample changes the element's own values, never what any selector
-           matches: no sibling, ancestor or :has() subject restyles with it. */
-        mark_style_own(d,s->node);d->dirty=true;
+           matches: no sibling, ancestor or :has() subject restyles with it.
+           Nor the layout: what it repaints is bounded when its style publishes. */
+        mark_style_own(d,s->node);d->restyle_dirty=true;s->requested=true;
     }
 }
 int64_t css_motion_deadline(web_doc *d) {
     if(!d || __atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE))return -1;
     uint64_t deadline=UINT64_MAX;
-    for(struct css_motion_state *s=d->css_motions;s;s=s->next)if(s->node && s->running) {
+    for(struct css_motion_state *s=d->css_motions;s;s=s->next)if(s->node && s->running && !s->requested) {
         uint64_t due=s->last>UINT64_MAX-16?UINT64_MAX:s->last+16;
         if(due<deadline)deadline=due;
     }
@@ -4724,7 +4730,7 @@ static bool motion_sample(struct cascade *c,node_t *n,const style_t *base,const 
     struct css_motion_state *state=motion_state(c,n,spec->name);if(!state)return false;
     uint64_t now=c->d->css_motion_now;
     if(!state->paused && now>=state->last)state->elapsed+=(double)(now-state->last);
-    state->last=now;state->paused=spec->paused;
+    state->last=now;state->paused=spec->paused;state->requested=false;
     double local=state->elapsed-spec->delay;
     double ad=spec->duration==0 || spec->iterations==0?0:(double)spec->duration*spec->iterations;
     state->running=!spec->paused && state->elapsed<(double)spec->delay+ad;
@@ -4781,6 +4787,8 @@ static bool motion_sample(struct cascade *c,node_t *n,const style_t *base,const 
     return out->has_opacity || out->transform;
 }
 
+/* What a display: none element hides is its flat subtree: also the light children its slots
+   take from a host above it, which are not its descendants. */
 static void clear_styles(node_t *n) {
     n->animation_base_style = NULL;
     if (n->shadow_root) clear_styles(n->shadow_root);
@@ -4788,11 +4796,17 @@ static void clear_styles(node_t *n) {
         c->style = NULL;
         clear_styles(c);
     }
+    if (flat_slot(n))
+        for (node_t *c = n->slot_assigned_first; c; c = c->assigned_next) {
+            c->style = NULL;
+            clear_styles(c);
+        }
 }
 static void motion_hide_subtree(node_t *n) {
     css_motion_reset(n);
     if(n->shadow_root)motion_hide_subtree(n->shadow_root);
     for(node_t *ch=n->first;ch;ch=ch->next)motion_hide_subtree(ch);
+    if(flat_slot(n))for(node_t *ch=n->slot_assigned_first;ch;ch=ch->assigned_next)motion_hide_subtree(ch);
 }
 
 void css_node_style_free(node_t *n) {
@@ -4831,6 +4845,12 @@ void css_styles_release(web_doc *d) {
         n = next;
     }
 }
+static bool style_equal(const style_t *a, const style_t *b);
+/* Between a cascade and css_styles_release: whether n's computed values differ from the
+   retired ones its boxes still borrow. A kept style retires the equal new one. */
+bool css_restyled(const node_t *n) {
+    return n->style_previous && !style_equal(n->style_previous, n->style);
+}
 
 /* A mutation's sibling set is the conservative local boundary for +/-/~ and
    nth/empty selectors. Descendants are restyled because inheritance and
@@ -4847,8 +4867,7 @@ static node_t *dirty_flat_parent(node_t *n) {
     if(!p)return NULL;
     if(p->shadow_root)return n->assigned_slot;
     if(p->shadow_host)return p->shadow_host;
-    if(p->type==N_ELEM && !p->foreign && p->tag==T_slot && p->slot_assigned_first &&
-        doc_node_root(p,false)->shadow_host)return NULL;
+    if(flat_slot(p))return NULL;
     return p;
 }
 static void mark_style_subject(web_doc *d, node_t *n, uint8_t source) {
@@ -6178,6 +6197,24 @@ void css_cascade(web_doc *d, int vw, int vh) {
     d->styled_w = vw;
     d->styled_h = vh;
     d->style_full_dirty = d->style_pending_dirty = false;
+    /* --debug-js: a motion marked for a sample that this cascade did not reach (every 5 s). */
+    static uint64_t unreached_told;
+    if (d->profile_enabled && (!unreached_told || uptime_ms() - unreached_told >= 5000))
+        for (struct css_motion_state *s = d->css_motions; s; s = s->next) {
+            if (!s->node || !s->requested) continue;
+            node_t *a = s->node, *p = dirty_flat_parent(a);
+            while (p && p->style_children_dirty) { a = p; p = dirty_flat_parent(p); }
+            pvec kids = {0}; bool listed = false;
+            if (p) { doc_flat_children(p, &kids); for (int i = 0; i < kids.n; i++) if (kids.v[i] == a) listed = true; pv_free(&kids); }
+            char line[320]; const char *pc = p ? node_attr(p, "class") : NULL, *ac = node_attr(a, "class");
+            snprintf(line, sizeof line, "Unreached CSS motion %s on %s: stops below %s.%.30s (style %d, display %d, shadow %d, slot %d) at %s.%.30s (parent %d, assigned %d, listed %d, dirty %d/%d)",
+                s->name, s->node->name ? s->node->name : "?", p && p->name ? p->name : "-", pc ? pc : "",
+                p && p->style ? 1 : 0, p && p->style ? p->style->display : -1, p && p->shadow_root ? 1 : 0,
+                p && p->type == N_ELEM && !p->foreign && p->tag == T_slot, a->name ? a->name : "?", ac ? ac : "",
+                a->parent == p, a->assigned_slot != NULL, listed, a->style_children_dirty, a->style_self_dirty);
+            web_js_console(d, 1, line); unreached_told = uptime_ms();
+            break;
+        }
     if (d->profile_enabled) {
         style_profile.cascades++; style_profile.full += full;
         if (full) style_profile.full_by[full_by]++;
