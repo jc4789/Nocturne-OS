@@ -18,6 +18,25 @@
         "https://html.spec.whatwg.org/multipage/parsing.html",
         "https://html.spec.whatwg.org/multipage/scripting.html#the-template-element"
       ]
+    },
+    {
+      "name": "Current URL Standard hosts and UTS #46 validity, 2026-10-26",
+      "files": [
+        "source/lexbor/url/url.c",
+        "source/lexbor/unicode/idna.c",
+        "source/lexbor/unicode/idna.h",
+        "source/lexbor/unicode/idna_validity_res.h"
+      ],
+      "purpose": "ASCII domains (including xn-- labels) are only lowercased, also after percent-decoding; host/hostname setters keep a host the override parse set even when the port after it fails, and keep the old host when none was set; an IPv4 number stays a number only if every code point is a digit, also past an overflowing prefix (ends-in-a-number checker); UTS #46 CheckBidi, CheckJoiners (virama context) and the leading-combining-mark rule.",
+      "default_behavior": "Non-ASCII domains still go through Lexbor's IDNA with the same flags; CheckBidi/CheckJoiners only apply when the caller passes them. A ZWNJ outside a virama is not yet checked against Joining_Type.",
+      "generated": "source/lexbor/unicode/idna_validity_res.h by scripts/unicode_idna.py from third_party/unicode/18.0.0/UnicodeData.txt",
+      "specifications": [
+        "https://url.spec.whatwg.org/#concept-domain-to-ascii",
+        "https://url.spec.whatwg.org/#host-state",
+        "https://www.unicode.org/reports/tr46/#Validity_Criteria",
+        "https://www.rfc-editor.org/rfc/rfc5892#appendix-A",
+        "https://www.rfc-editor.org/rfc/rfc5893#section-2"
+      ]
     }
   ]
 }

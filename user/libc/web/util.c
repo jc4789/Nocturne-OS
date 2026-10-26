@@ -311,20 +311,6 @@ bool url_resolve(const char *base,const char *rel,char *out,size_t n) {
 }
 bool web_resolve_url(const char *base,const char *rel,char *out,size_t n){return url_resolve(base,rel,out,n);}
 
-void url_encode_form(sbuf *b, const char *s) {
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '*' ||
-            *p == '-' || *p == '.' || *p == '_')
-            sb_putc(b, (char)*p);
-        else if (*p == ' ') sb_putc(b, '+');
-        else {
-            char hx[4];
-            snprintf(hx, sizeof hx, "%%%02X", *p);
-            sb_puts(b, hx);
-        }
-    }
-}
-
 /* ------------------------------------------------------- Fetch data URLs */
 /* Check at native page-sized work boundaries, not once per byte/syscall.
  * This is a scheduling quantum, never a limit on accepted input. */
@@ -342,7 +328,7 @@ static bool data_token(unsigned char c) {
         (c && strchr("!#$%&'*+-.^_`|~",c)!=NULL);
 }
 static bool data_quoted(unsigned char c) { return c=='\t'||(c>=0x20&&c!=0x7f); }
-static int data_hex_digit(unsigned char c) {
+int web_hex_digit(unsigned char c) {
     return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1;
 }
 static int data_base64_digit(unsigned char c) {
@@ -435,7 +421,7 @@ int web_data_url_process(const char *url,struct web_data_url *out,bool (*checkpo
     size_t n=0;
     for(const char *p=comma+1;p<end;p++){
         if(!data_step(&work)){result=-2;goto failed;}int hi,lo;
-        if(*p=='%'&&end-p>=3&&(hi=data_hex_digit((unsigned char)p[1]))>=0&&(lo=data_hex_digit((unsigned char)p[2]))>=0){out->body[n++]=(unsigned char)((hi<<4)|lo);p+=2;}
+        if(*p=='%'&&end-p>=3&&(hi=web_hex_digit((unsigned char)p[1]))>=0&&(lo=web_hex_digit((unsigned char)p[2]))>=0){out->body[n++]=(unsigned char)((hi<<4)|lo);p+=2;}
         else out->body[n++]=(unsigned char)*p;
     }
     if(base64){

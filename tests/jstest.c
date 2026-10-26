@@ -656,6 +656,7 @@ static void test_platform(void) {
     external_case("js_css_supports_cases.js", ";mark('api-done');", BASE);
     external_case("js_svg_dom_cases.js", ";check('svg-dom-count',runSVGDOMCases()>=30);mark('api-done');", BASE);
     external_case("js_url_cases.js", ";for(const f of __urlTestResults.failures)console.log('FAIL url '+f.name+' '+f.error);check('url-count',__urlTestResults.total===32);mark('api-done');", BASE);
+    external_case("js_url_wpt_cases.js", ";const r=runURLWPTCases();for(const f of r.failures)console.log('FAIL url-wpt '+f);console.log('URL WPT API checks '+r.total);check('url-wpt',r.total===1262&&r.failures.length===0);mark('api-done');", BASE);
     external_case("js_crypto_cases.js", ";runCryptoCases().then(n=>{check('crypto-count',n>100);mark('api-done');},e=>{console.log('FAIL crypto '+e);mark('api-done');});", "https://fixture.test/dir/index.html");
     external_case("js_crypto_cases.js", ";runCryptoCases().then(n=>{check('insecure-crypto-count',n>30);mark('api-done');},e=>{console.log('FAIL crypto '+e);mark('api-done');});", BASE);
     external_case("js_clone_cases.js", ";mark('api-done');", BASE);

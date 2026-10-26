@@ -6,6 +6,7 @@
 #include "form_validation.h"
 #include "form_direction.h"
 #include "form_file.h"
+#include "web_url.h"
 #include "frame.h"
 
 #define DAY_MS 86400000.0
@@ -953,7 +954,7 @@ static void submission_pair(struct form_encoding *encoding, const char *name, co
         sb_puts(body, "\"\r\n\r\n"); sb_puts(body, text); sb_puts(body, "\r\n");
     } else {
         if (body->n) sb_putc(body, '&');
-        url_encode_form(body, name); sb_putc(body, '='); url_encode_form(body, text);
+        url_encode_form(body, name, normalized_name.n); sb_putc(body, '='); url_encode_form(body, text, normalized_value.n);
     }
     sb_free(&normalized_name); sb_free(&normalized_value);
 }

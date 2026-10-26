@@ -1040,6 +1040,7 @@
     let historyEvent;
     /* @include js_encoding.js */
     /* @include js_url.js */
+    Object.defineProperty(globalThis,'webkitURL',{value:URL,writable:true,configurable:true}); // [LegacyWindowAlias]
     fetchBridge.initialize();
     /* @include js_streams.js */
     fetchBridge.initializeStreams(streamBridge);

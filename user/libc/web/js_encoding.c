@@ -46,22 +46,8 @@ static size_t decode_utf8(const uint8_t *bytes, size_t length, bool fatal,
     return written;
 }
 
-JSValue web_js_decode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
-                           void (*prepare)(JSContext *, size_t)) {
-    uint64_t offset,length;
-    if(argc<5)return JS_ThrowTypeError(ctx,"UTF-8 decode requires a buffer view");
-    /* Convert before borrowing data: even private calls must not retain a
-       native pointer across an observable conversion or detached buffer. */
-    if(JS_ToIndex(ctx,&offset,argv[1])<0||JS_ToIndex(ctx,&length,argv[2])<0)return JS_EXCEPTION;
-    bool fatal=JS_ToBool(ctx,argv[3])>0,ignore_bom=JS_ToBool(ctx,argv[4])>0;
-    size_t size=0;
-    uint8_t *data=JS_GetArrayBuffer(ctx,&size,argv[0]);
-    if(!data&&JS_HasException(ctx))return JS_EXCEPTION;
-    if(offset>size||length>size-(size_t)offset)return JS_ThrowRangeError(ctx,"UTF-8 view exceeds its buffer");
-    if(length>(size_t)INT_MAX/3u)return JS_ThrowRangeError(ctx,"UTF-8 input is too large");
-    const uint8_t *bytes=data?data+(size_t)offset:(const uint8_t *)"";
-    size_t len=(size_t)length;
-    if(!ignore_bom&&len>=3&&bytes[0]==0xef&&bytes[1]==0xbb&&bytes[2]==0xbf){bytes+=3;len-=3;}
+static JSValue utf8_text(JSContext *ctx, const uint8_t *bytes, size_t len, bool fatal,
+                         void (*prepare)(JSContext *, size_t)) {
     bool malformed=false;
     size_t written=decode_utf8(bytes,len,fatal,NULL,&malformed);
     if(written==SIZE_MAX)return JS_ThrowTypeError(ctx,"Invalid UTF-8");
@@ -79,10 +65,33 @@ JSValue web_js_decode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
     js_free(ctx,output);
     return result;
 }
+
+JSValue web_js_decode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
+                           void (*prepare)(JSContext *, size_t)) {
+    uint64_t offset,length;
+    if(argc<5)return JS_ThrowTypeError(ctx,"UTF-8 decode requires a buffer view");
+    /* Convert before borrowing data: even private calls must not retain a
+       native pointer across an observable conversion or detached buffer. */
+    if(JS_ToIndex(ctx,&offset,argv[1])<0||JS_ToIndex(ctx,&length,argv[2])<0)return JS_EXCEPTION;
+    bool fatal=JS_ToBool(ctx,argv[3])>0,ignore_bom=JS_ToBool(ctx,argv[4])>0;
+    size_t size=0;
+    uint8_t *data=JS_GetArrayBuffer(ctx,&size,argv[0]);
+    if(!data&&JS_HasException(ctx))return JS_EXCEPTION;
+    if(offset>size||length>size-(size_t)offset)return JS_ThrowRangeError(ctx,"UTF-8 view exceeds its buffer");
+    if(length>(size_t)INT_MAX/3u)return JS_ThrowRangeError(ctx,"UTF-8 input is too large");
+    const uint8_t *bytes=data?data+(size_t)offset:(const uint8_t *)"";
+    size_t len=(size_t)length;
+    if(!ignore_bom&&len>=3&&bytes[0]==0xef&&bytes[1]==0xbb&&bytes[2]==0xbf){bytes+=3;len-=3;}
+    return utf8_text(ctx,bytes,len,fatal,prepare);
+}
+JSValue web_js_utf8_text(JSContext *ctx, const uint8_t *bytes, size_t length) {
+    if(length>(size_t)INT_MAX/3u)return JS_ThrowRangeError(ctx,"UTF-8 input is too large");
+    return utf8_text(ctx,bytes,length,false,NULL);
+}
 /* QuickJS writes a lone surrogate in its three-byte form ED A0..BF xx, the
    length of U+FFFD's: the Encoding Standard's scalar values come from
    replacing those in place. ED never occurs as a continuation byte. */
-static void replace_lone_surrogates(uint8_t *bytes, size_t length) {
+void web_utf8_replace_lone_surrogates(uint8_t *bytes, size_t length) {
     for (uint8_t *p=memchr(bytes,0xed,length);p;p=memchr(p,0xed,length-(size_t)(p-bytes))) {
         if(p[1]>=0xa0){p[0]=0xef;p[1]=0xbf;p[2]=0xbd;}
         p+=3;
@@ -102,7 +111,7 @@ JSValue web_js_encode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
     if(JS_IsException(buffer))return buffer;
     size_t size=0;
     uint8_t *bytes=JS_GetArrayBuffer(ctx,&size,buffer);
-    if(bytes&&size)replace_lone_surrogates(bytes,size);
+    if(bytes&&size)web_utf8_replace_lone_surrogates(bytes,size);
     return buffer;
 }
 
@@ -132,7 +141,7 @@ JSValue web_js_encode_utf8_into(JSContext *ctx, int argc, JSValueConst *argv) {
     }
     if(written){
         memcpy(data+(size_t)offset,text,written);
-        replace_lone_surrogates(data+(size_t)offset,written);
+        web_utf8_replace_lone_surrogates(data+(size_t)offset,written);
     }
     JS_FreeCString(ctx,text);
     JSValue result=JS_NewObject(ctx);
@@ -193,7 +202,7 @@ JSValue web_js_concat_utf8(JSContext *ctx, int argc, JSValueConst *argv,
         const struct concat_part *part=&parts[i];
         if(!part->length)continue;
         memcpy(out+at,part->text?(const uint8_t *)part->text:part->bytes,part->length);
-        if(part->text)replace_lone_surrogates(out+at,part->length);
+        if(part->text)web_utf8_replace_lone_surrogates(out+at,part->length);
         at+=part->length;
     }
 done:

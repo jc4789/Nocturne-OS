@@ -1,43 +1,20 @@
 """Unicode 18.0.0 の原 UCD から libc の <wctype.h> の分類と単純大文字小文字変換の表を生成する。"""
-from hashlib import sha256
-from pathlib import Path
-import argparse
+import ucd
 
-ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "third_party/unicode/18.0.0"
-OUTPUT = ROOT / "user/libc/wctype_data.h"
+OUTPUT = ucd.ROOT / "user/libc/wctype_data.h"
 SOURCES = ("UnicodeData.txt", "PropList.txt", "DerivedCoreProperties.txt")
 # 1 符号点 1 バイトの分類ビット。print は graph と blank から導く（wctype.c）。
 BITS = {name: 1 << index for index, name in enumerate((
     "ALPHA", "UPPER", "LOWER", "SPACE", "BLANK", "CNTRL", "PUNCT", "GRAPH"))}
-LIMIT = 0x110000
-
-
-def records(name):
-    for line in (DATA / name).read_text(encoding="utf-8").splitlines():
-        body = line.split("#", 1)[0].strip()
-        if not body:
-            continue
-        fields = [part.strip() for part in body.split(";")]
-        ends = fields[0].split("..")
-        yield int(ends[0], 16), int(ends[-1], 16), fields[1:]
+LIMIT = ucd.LIMIT
 
 
 def unicode_data():
-    """一般カテゴリーと単純大文字・小文字の写像。First/Last の組は範囲。"""
+    """一般カテゴリーと単純大文字・小文字の写像。"""
     category = ["Cn"] * LIMIT
     upper, lower = {}, {}
-    first = None
-    for line in (DATA / "UnicodeData.txt").read_text(encoding="utf-8").splitlines():
-        fields = line.split(";")
-        cp, name, gc = int(fields[0], 16), fields[1], fields[2]
-        if name.endswith(", First>"):
-            first = cp
-            continue
-        start = first if name.endswith(", Last>") else cp
-        first = None
-        for c in range(start, cp + 1):
-            category[c] = gc
+    for cp, fields in ucd.unicode_data():
+        category[cp] = fields[2]
         if fields[12]:
             upper[cp] = int(fields[12], 16)
         if fields[13]:
@@ -47,7 +24,7 @@ def unicode_data():
 
 def property_set(name, wanted):
     members = set()
-    for first, last, fields in records(name):
+    for first, last, fields in ucd.records(name):
         if fields[0] == wanted:
             members.update(range(first, last + 1))
     return members
@@ -134,22 +111,6 @@ def check(classes):
             raise ValueError(f"U+{cp:04X} の分類が <ctype.h> と一致しない")
 
 
-def two_level(classes):
-    """各ブロックを一度だけ持つ二段の表。大きさが最小になるブロック長を選ぶ。"""
-    best = None
-    for shift in range(4, 12):
-        size = 1 << shift
-        blocks, index = {}, []
-        for start in range(0, LIMIT, size):
-            block = bytes(classes[start:start + size])
-            index.append(blocks.setdefault(block, len(blocks)))
-        index_bytes = 1 if len(blocks) <= 256 else 2
-        total = len(index) * index_bytes + len(blocks) * size
-        if best is None or total < best[0]:
-            best = (total, shift, list(blocks), index, index_bytes)
-    return best[1:]
-
-
 def case_runs(mapping):
     """写像を (先頭, 個数, 間隔, 差) の連なりにまとめる。間隔 2 は大小が交互に並ぶ区画。"""
     runs = []
@@ -174,30 +135,21 @@ def case_runs(mapping):
     return runs
 
 
-def emit_bytes(lines, values, per_line=24):
-    for start in range(0, len(values), per_line):
-        lines.append("    " + ", ".join(str(v) for v in values[start:start + per_line]) + ",")
-
-
 def generate():
     classes, upper_map, lower_map = classify()
-    shift, blocks, index, index_bytes = two_level(classes)
-    lines = ["/* 正規生成物: python -X utf8 scripts/unicode_wctype.py",
-             " * Unicode 18.0.0 の <wctype.h> の分類（UTS #18 付録 C）と単純大文字小文字変換。",
-             " * Copyright © 1991-2026 Unicode, Inc. / UNICODE LICENSE V3。",
-             " * 許可条件は third_party/unicode/LICENSE を参照。"]
-    for name in SOURCES:
-        lines.append(f" * {name} SHA256 {sha256((DATA / name).read_bytes()).hexdigest()}")
-    lines.extend([" */", "#ifndef NOCTURNE_WCTYPE_DATA_H", "#define NOCTURNE_WCTYPE_DATA_H",
-                  "#define WCTYPE_UNICODE_VERSION \"18.0.0\"", "enum wctype_bit {"])
+    shift, blocks, index, index_bytes = ucd.two_level(classes)
+    lines = ucd.header("unicode_wctype.py",
+                       f"Unicode {ucd.VERSION} の <wctype.h> の分類（UTS #18 付録 C）と単純大文字小文字変換。",
+                       SOURCES, "NOCTURNE_WCTYPE_DATA_H")
+    lines.extend([f"#define WCTYPE_UNICODE_VERSION \"{ucd.VERSION}\"", "enum wctype_bit {"])
     for name, value in BITS.items():
         lines.append(f"    WC_{name} = {value},")
     lines.extend(["};", f"#define WCTYPE_SHIFT {shift}",
                   f"static const uint{8 * index_bytes}_t wctype_index[{len(index)}] = {{"])
-    emit_bytes(lines, index)
+    ucd.emit_bytes(lines, index)
     lines.append("};")
     lines.append(f"static const uint8_t wctype_blocks[{len(blocks) << shift}] = {{")
-    emit_bytes(lines, [value for block in blocks for value in block])
+    ucd.emit_bytes(lines, [value for block in blocks for value in block])
     lines.append("};")
     lines.append("struct wctype_case_run { uint32_t first; uint16_t count; uint8_t step; int32_t delta; };")
     for name, mapping in (("upper", upper_map), ("lower", lower_map)):
@@ -209,19 +161,5 @@ def generate():
     return "\n".join(lines)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="生成済み表との一致だけを確認")
-    args = parser.parse_args()
-    generated = generate()
-    if args.check:
-        if OUTPUT.read_text(encoding="utf-8") != generated:
-            raise SystemExit("wctype 表が原UCDと一致しません")
-        print("Unicode 18.0.0 wctype 表: 原UCDと一致")
-    else:
-        OUTPUT.write_text(generated, encoding="utf-8", newline="\n")
-        print(f"Unicode 18.0.0 wctype 表を正規生成: {OUTPUT.relative_to(ROOT)}")
-
-
 if __name__ == "__main__":
-    main()
+    ucd.main(__doc__, generate, OUTPUT, "wctype 表")

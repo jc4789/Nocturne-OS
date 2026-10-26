@@ -10,7 +10,10 @@
     "html",
     "css",
     "selectors",
-    "encoding"
+    "encoding",
+    "url",
+    "unicode",
+    "punycode"
   ],
   "files": [
     {
@@ -1686,6 +1689,22 @@
       "sha256": "ee42ea055e23bc9b416d6e2d1821ba0236b1dc4c145c1ebd74199c94060da09f"
     },
     {
+      "path": "source/lexbor/punycode/base.h",
+      "sha256": "b238c3cc8203bb70f6752209a9c9ec4bb85498d0824ce6e9e2d2b936f6203768"
+    },
+    {
+      "path": "source/lexbor/punycode/config.cmake",
+      "sha256": "e057fb3d5a0c179420b0b0352c984eb1fb678f8119a128df719d63e58f2e91d1"
+    },
+    {
+      "path": "source/lexbor/punycode/punycode.c",
+      "sha256": "0550de6f822e0187725f3f645a462d95ae21869525c6ce485dcef512d13f1fe4"
+    },
+    {
+      "path": "source/lexbor/punycode/punycode.h",
+      "sha256": "55db0c1326c76a5b2d97a8633b81e2713ffcb42970ca9b8b79dfc2b3493408ca"
+    },
+    {
       "path": "source/lexbor/selectors/base.h",
       "sha256": "3ac324d43ca6bff77375f07b120d5aa3c360f8eabff265332f4b9182fe41deec"
     },
@@ -1724,6 +1743,50 @@
     {
       "path": "source/lexbor/tag/tag.h",
       "sha256": "8ef9fc411108470e69ba207993c12899c0e6dac7e78ab6b6e3579c5e2c4890bc"
+    },
+    {
+      "path": "source/lexbor/unicode/base.h",
+      "sha256": "2a9b07254275d057060bc04ca7a89b6c15ca323c3ee83ea5e1fc9fe55260cc60"
+    },
+    {
+      "path": "source/lexbor/unicode/config.cmake",
+      "sha256": "ef6089fc67f55a63a2010f8015d38a3fa813d41601d786245f1364f3a02464e8"
+    },
+    {
+      "path": "source/lexbor/unicode/idna.c",
+      "sha256": "2ce9af5405c3c30e058669b967ea48afd8f1e3796848ca28227180315042f225"
+    },
+    {
+      "path": "source/lexbor/unicode/idna.h",
+      "sha256": "d4d318e0bf26eee7ecb91edab53f93eaead72bfbb3a2fbbf3728134c165fa0dd"
+    },
+    {
+      "path": "source/lexbor/unicode/res.h",
+      "sha256": "776d822d254a056643cf7f5160ca5a5da31301be741737cc1ab2de7aaa87d31d"
+    },
+    {
+      "path": "source/lexbor/unicode/unicode.c",
+      "sha256": "e0fc06b500bae6954a31d46363c98244843cf23959eb39a5961b63b76ec53fcf"
+    },
+    {
+      "path": "source/lexbor/unicode/unicode.h",
+      "sha256": "52ef3618c6d2c369bcf3073962e018eee24338b4dff6f1186bdcef05ff0bae46"
+    },
+    {
+      "path": "source/lexbor/url/base.h",
+      "sha256": "b47a2014bb9cf39a4504b2589460e485ae09fc782f61088eb8bf8b36f94491fb"
+    },
+    {
+      "path": "source/lexbor/url/config.cmake",
+      "sha256": "5566875bbfbdea7c39f86dec4a787d74d12414c2dd3b890ed3406bc46a853fba"
+    },
+    {
+      "path": "source/lexbor/url/url.c",
+      "sha256": "fa5ec910cd18240ee2419a1886580ec90179144a8206accd9774ebfef3fe74d4"
+    },
+    {
+      "path": "source/lexbor/url/url.h",
+      "sha256": "fc11c8c2fc789a165c2baade5097379354cc53b8ec85a1aadd899607e21a0872"
     }
   ]
 }

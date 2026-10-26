@@ -224,17 +224,19 @@ $(BUILD)/u/%.o: %.c
 	@$(CC) $(UCFLAGS) -c $< -o $@
 
 # The checked-in copy permits in-OS linking without Python; regenerate on host edits.
-user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json
+user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
-$(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
 # 原UCD／generator変更時に表を正規再生成。guest内linkは保全された表を使う。
-user/libc/web/unicode_grapheme_data.h: scripts/unicode_grapheme.py third_party/unicode/18.0.0/GraphemeBreakProperty.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt third_party/unicode/18.0.0/emoji-data.txt
+user/libc/web/unicode_grapheme_data.h: scripts/unicode_grapheme.py scripts/ucd.py third_party/unicode/18.0.0/GraphemeBreakProperty.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt third_party/unicode/18.0.0/emoji-data.txt
 	@$(PY) scripts/unicode_grapheme.py
 $(BUILD)/u/user/libc/web/layout.o: user/libc/web/unicode_grapheme_data.h
-user/libc/wctype_data.h: scripts/unicode_wctype.py third_party/unicode/18.0.0/UnicodeData.txt third_party/unicode/18.0.0/PropList.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt
+user/libc/wctype_data.h: scripts/unicode_wctype.py scripts/ucd.py third_party/unicode/18.0.0/UnicodeData.txt third_party/unicode/18.0.0/PropList.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt
 	@$(PY) scripts/unicode_wctype.py
 $(BUILD)/u/user/libc/wctype.o: user/libc/wctype_data.h
+third_party/lexbor/source/lexbor/unicode/idna_validity_res.h: scripts/unicode_idna.py scripts/ucd.py third_party/unicode/18.0.0/UnicodeData.txt
+	@$(PY) scripts/unicode_idna.py
+$(BUILD)/lexbor/third_party/lexbor/source/lexbor/unicode/idna.o: third_party/lexbor/source/lexbor/unicode/idna_validity_res.h
 user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_atob.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h

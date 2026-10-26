@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../libc/web/js_encoding.h"
+#include "../libc/web/js_url.h"
 #include "../libc/web/js_crypto.h"
 #include "../libc/web/js_memory.h"
 
@@ -1453,6 +1454,7 @@ int main(int argc, char **argv) {
     internal = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, host, host_functions, sizeof host_functions / sizeof *host_functions);
     web_js_encoding_init_isolated(ctx, host);
+    web_js_url_init(ctx, host);
     web_js_crypto_init(ctx, host);
     JSValue args = JS_NewArray(ctx);
     for (uint32_t n = 0; i < argc; i++, n++) JS_SetPropertyUint32(ctx, args, n, JS_NewString(ctx, argv[i]));

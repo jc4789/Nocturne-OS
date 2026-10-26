@@ -215,9 +215,17 @@ third_party/lexbor/source/lexbor/ns/base.h
 third_party/lexbor/source/lexbor/ns/const.h
 third_party/lexbor/source/lexbor/ns/ns.h
 third_party/lexbor/source/lexbor/ns/res.h
+third_party/lexbor/source/lexbor/punycode/base.h
+third_party/lexbor/source/lexbor/punycode/punycode.h
 third_party/lexbor/source/lexbor/selectors/base.h
 third_party/lexbor/source/lexbor/selectors/selectors.h
 third_party/lexbor/source/lexbor/tag/base.h
 third_party/lexbor/source/lexbor/tag/const.h
 third_party/lexbor/source/lexbor/tag/res.h
 third_party/lexbor/source/lexbor/tag/tag.h
+third_party/lexbor/source/lexbor/unicode/base.h
+third_party/lexbor/source/lexbor/unicode/idna.h
+third_party/lexbor/source/lexbor/unicode/res.h
+third_party/lexbor/source/lexbor/unicode/unicode.h
+third_party/lexbor/source/lexbor/url/base.h
+third_party/lexbor/source/lexbor/url/url.h

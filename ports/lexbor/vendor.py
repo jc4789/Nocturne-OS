@@ -8,7 +8,8 @@ import subprocess
 import sys
 
 REVISION = "f4cbbcd91359a0ec9499e3ce7e263de629482d61"
-MODULES = ("core", "dom", "ns", "tag", "html", "css", "selectors", "encoding")
+MODULES = ("core", "dom", "ns", "tag", "html", "css", "selectors", "encoding", "url", "unicode",
+           "punycode")
 
 
 def output(args):
@@ -32,15 +33,24 @@ def main():
                         "-g", "config.cmake"]).splitlines()
         entries.extend(Path(path).relative_to(source).as_posix() for path in paths)
 
+    # A file that differs from an upstream it was already imported from carries
+    # a local integration change (NOCTURNE_PATCHES.json): keep it.
+    previous = {}
+    if (destination / "UPSTREAM.json").exists():
+        record = json.loads((destination / "UPSTREAM.json").read_text(encoding="utf-8"))
+        previous = {file["path"]: file["sha256"] for file in record["files"]}
     manifest = []
     for entry in sorted(entries):
         src, dst = source / entry, destination / entry
         data = src.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
         if dst.exists() and dst.read_bytes() != data:
-            raise SystemExit(f"refusing to replace locally modified file: {entry}")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
-        manifest.append({"path": entry, "sha256": hashlib.sha256(data).hexdigest()})
+            if previous.get(entry) != digest:
+                raise SystemExit(f"refusing to replace locally modified file: {entry}")
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+        manifest.append({"path": entry, "sha256": digest})
     record = {"upstream": "https://github.com/lexbor/lexbor", "revision": REVISION,
               "version": "3.1.0", "modules": MODULES, "files": manifest}
     (destination / "UPSTREAM.json").write_text(
@@ -56,7 +66,7 @@ def main():
     lines.extend("LXB_HEADERS += " + path for path in headers)
     (destination / "sources.mk").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     (destination / "headers.list").write_text("\n".join(headers) + "\n", encoding="utf-8", newline="\n")
-    print(f"vendored {len(manifest)} unmodified files from {REVISION}")
+    print(f"vendored {len(manifest)} files from {REVISION}")
 
 
 if __name__ == "__main__":

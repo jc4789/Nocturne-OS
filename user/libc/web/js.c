@@ -31,6 +31,7 @@
 #include "elements.h"
 #include "js_crypto.h"
 #include "js_encoding.h"
+#include "js_url.h"
 #include "js_atomics.h"
 #include "js_opfs.h"
 #include "inspect_private.h"
@@ -8297,6 +8298,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     web_js_navigator_init(s->ctx,api);
     web_js_crypto_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);
+    web_js_url_init(s->ctx, api);
     web_atomics_host_init(s->ctx, api);
     web_opfs_host_init(s->ctx, api, opfs_storage_url);
     web_js_wasm_host_init(s->ctx, api);
@@ -8341,9 +8343,9 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     /* A script-disabled sandbox realm stays active for its same-origin
        embedder; its own scripts are refused by sandbox_flags, not by
        retiring the realm. */
-    char limits[192];
-    snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms",
-             JS_STACK_LIMIT/1024u,s->task_budget_ms);
+    char limits[224];
+    snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms; realm setup %llu ms",
+             JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)(uptime_ms()-initialized));
     log_text(s,0,limits);return;
 failed:
     s->starting = false;

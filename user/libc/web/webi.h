@@ -58,6 +58,7 @@ static inline int lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 bool str_ieq(const char *a, const char *b);
 bool strn_ieq(const char *a, const char *b, size_t n); /* a has length n, b is NUL-terminated */
 int utf8_put(char *out, uint32_t cp);                 /* returns bytes written (1..4) */
+int web_hex_digit(unsigned char c);                   /* an ASCII hex digit's value, else -1 */
 
 /* ---------------------------------------------------------------- DOM */
 #define WEB_TAGS(X)                                                                                     \
@@ -1267,7 +1268,6 @@ void web_js_selection_changed(web_doc *d, node_t *node);
 
 /* URL helpers (util.c) */
 bool url_resolve(const char *base, const char *rel, char *out, size_t n);
-void url_encode_form(sbuf *b, const char *s); /* application/x-www-form-urlencoded */
 /* Fetch's data URL processor. Input is a serialized URL; outputs are malloc
  * owned, binary body is length-delimited (and also NUL terminated). Return 1
  * on success, 0 for malformed input, -1 for allocation/size failure, -2 when

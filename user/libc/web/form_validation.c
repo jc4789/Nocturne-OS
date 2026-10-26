@@ -10,7 +10,7 @@
 #include "quickjs.h"
 #include "js_memory.h"
 #include "libregexp.h"
-#include "js_form_url.inc"
+#include "web_url.h"
 #include <limits.h>
 
 #define VALIDATION_REGEX_CACHE 16
@@ -18,7 +18,6 @@
    pathological regexes from permanently blocking the native GUI, matching
    the browser's author-task watchdog rather than imposing a byte quota. */
 #define VALIDATION_MATCH_MS 15000u
-#define VALIDATION_URL_STARTUP_MS VALIDATION_MATCH_MS
 
 struct validation_pattern {
     char *text;
@@ -29,10 +28,8 @@ struct validation_pattern {
 struct validation_state {
     JSRuntime *rt;
     JSContext *ctx;
-    JSContext *url_ctx;
-    JSValue url_check;
+    struct web_url_parser *url;
     uint64_t deadline, serial;
-    bool url_ready;
     struct validation_pattern patterns[VALIDATION_REGEX_CACHE];
 };
 
@@ -144,12 +141,11 @@ static int validation_interrupt(JSRuntime *rt, void *opaque) {
 }
 static struct validation_state *validation_state(web_doc *d) {
     /* Inert/template documents share a lifetime owner and need no separate
-       pure parser realm. This also bounds a family's aggregate regex/URL heap. */
+       pure regex realm. This also bounds a family's aggregate regex heap. */
     if (d->dom_family) d = d->dom_family;
     if (d->form_validation_state) return d->form_validation_state;
     struct validation_state *s = calloc(1, sizeof *s);
     if (!s) return NULL;
-    s->url_check = JS_UNDEFINED;
     s->rt = web_js_new_runtime(NULL);
     if (!s->rt) { free(s); return NULL; }
     JS_SetMemoryLimit(s->rt, SIZE_MAX);
@@ -168,113 +164,14 @@ void web_form_validation_free(web_doc *d) {
         free(s->patterns[i].text);
         lre_realloc(s->ctx, s->patterns[i].bytecode, 0);
     }
-    if (s->url_ctx) {
-        JS_FreeValue(s->url_ctx, s->url_check);
-        JS_FreeContext(s->url_ctx);
-    }
+    web_url_parser_free(s->url);
     JS_FreeContext(s->ctx); JS_FreeRuntime(s->rt); free(s);
 }
 
-static JSValue url_encode(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
-    (void)self;
-    size_t len = 0;
-    const char *text = argc ? JS_ToCStringLen(ctx, &len, argv[0]) : "";
-    if (!text) return JS_EXCEPTION;
-    JSValue result = JS_NewArrayBufferCopy(ctx, (const uint8_t *)text, len);
-    if (argc) JS_FreeCString(ctx, text);
-    return result;
-}
-static JSValue url_decode(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
-    (void)self;
-    size_t len = 0;
-    uint8_t *bytes = argc ? JS_GetArrayBuffer(ctx, &len, argv[0]) : NULL;
-    if (argc && !bytes) return JS_EXCEPTION;
-    if (len > (SIZE_MAX - 1) / 3) return JS_ThrowRangeError(ctx, "UTF-8 decode allocation length is not representable");
-    char *out = malloc(len * 3 + 1);
-    if (!out) return JS_ThrowOutOfMemory(ctx);
-    size_t written = 0;
-    uint32_t codepoint = 0;
-    unsigned needed = 0, seen = 0, low = 0x80, high = 0xbf;
-    /* WHATWG UTF-8 replacement decoding, including reconsumption after an
-       invalid continuation. JS_NewStringLen alone accepts surrogate UTF-8
-       and is therefore not a standards-compliant TextDecoder. */
-    for (size_t i = 0; i < len; i++) {
-        unsigned byte = bytes[i];
-        if (!needed) {
-            if (byte <= 0x7f) { out[written++] = (char)byte; continue; }
-            if (byte >= 0xc2 && byte <= 0xdf) { needed = 1; codepoint = byte & 31; continue; }
-            if (byte >= 0xe0 && byte <= 0xef) {
-                needed = 2; codepoint = byte & 15;
-                if (byte == 0xe0) low = 0xa0;
-                if (byte == 0xed) high = 0x9f;
-                continue;
-            }
-            if (byte >= 0xf0 && byte <= 0xf4) {
-                needed = 3; codepoint = byte & 7;
-                if (byte == 0xf0) low = 0x90;
-                if (byte == 0xf4) high = 0x8f;
-                continue;
-            }
-            written += (size_t)utf8_put(out + written, 0xfffd); continue;
-        }
-        if (byte < low || byte > high) {
-            needed = seen = 0; low = 0x80; high = 0xbf; codepoint = 0;
-            written += (size_t)utf8_put(out + written, 0xfffd); i--; continue;
-        }
-        low = 0x80; high = 0xbf; codepoint = (codepoint << 6) | (byte & 63);
-        if (++seen == needed) {
-            written += (size_t)utf8_put(out + written, codepoint);
-            needed = seen = 0; codepoint = 0;
-        }
-    }
-    if (needed) written += (size_t)utf8_put(out + written, 0xfffd);
-    JSValue result = JS_NewStringLen(ctx, out, written);
-    free(out); return result;
-}
-/* This private realm loads the same WHATWG URL/IDNA implementation used by
-   window.URL. It has no host, network, DOM, filesystem or author callbacks. */
-static bool url_prepare(struct validation_state *s) {
-    if (s->url_ready) return true;
-    JS_UpdateStackTop(s->rt);
-    s->deadline = uptime_ms() + VALIDATION_URL_STARTUP_MS;
-    /* Build transactionally in a fresh context. Timeout/OOM can leave bundle
-       globals partly installed; retry must never reuse those partial roots.
-       Both contexts share one OS-allocated runtime, and regex cache ownership is
-       unaffected by a failed URL initialization. */
-    JSContext *ctx = JS_NewContext(s->rt);
-    if (!ctx) { JS_RunGC(s->rt); return false; }
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue encoder = JS_NewCFunction(ctx, url_encode, "encode", 1);
-    int encoded = JS_IsException(encoder) ? -1 : JS_SetPropertyStr(ctx, global, "__formEncode", encoder);
-    JSValue decoder = encoded < 0 ? JS_EXCEPTION : JS_NewCFunction(ctx, url_decode, "decode", 1);
-    int decoded = JS_IsException(decoder) ? -1 : JS_SetPropertyStr(ctx, global, "__formDecode", decoder);
-    JS_FreeValue(ctx, global);
-    if (decoded < 0) goto failed;
-    JSValue result = JS_Eval(ctx, js_form_url, sizeof js_form_url - 1, "Nocturne form URL", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(result)) goto failed;
-    JS_FreeValue(ctx, result);
-    static const char check[] = "(function(value){try{new URL(value);return true;}catch(e){if(e instanceof TypeError)return false;throw e;}})";
-    JSValue checker = JS_Eval(ctx, check, sizeof check - 1, "Nocturne form URL check", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(checker)) goto failed;
-    s->url_ctx = ctx; s->url_check = checker;
-    s->url_ready = true;
-    return true;
-failed: {
-    JSValue error = JS_GetException(ctx); JS_FreeValue(ctx, error);
-    JS_FreeContext(ctx); JS_RunGC(s->rt); return false;
-    }
-}
 static bool absolute_url_valid(web_doc *d, const char *text) {
     struct validation_state *s = validation_state(d);
-    if (!s || !url_prepare(s)) return false;
-    JS_UpdateStackTop(s->rt); s->deadline = uptime_ms() + VALIDATION_MATCH_MS;
-    JSContext *ctx = s->url_ctx;
-    JSValue arg = JS_NewString(ctx, text);
-    if (JS_IsException(arg)) { JSValue error = JS_GetException(ctx); JS_FreeValue(ctx, error); return false; }
-    JSValue result = JS_Call(ctx, s->url_check, JS_UNDEFINED, 1, &arg);
-    JS_FreeValue(ctx, arg);
-    if (JS_IsException(result)) { JSValue error = JS_GetException(ctx); JS_FreeValue(ctx, error); return false; }
-    bool valid = JS_ToBool(ctx, result) > 0; JS_FreeValue(ctx, result); return valid;
+    if (s && !s->url) s->url = web_url_parser_new();
+    return s && s->url && web_url_valid(s->url, text, strlen(text));
 }
 static struct validation_pattern *pattern_compile(struct validation_state *s, const char *pattern) {
     struct validation_pattern *entry = &s->patterns[0];
@@ -619,8 +516,8 @@ bool web_form_style_snapshot(web_doc *d, unsigned features) {
         n->style_form_state = (uint8_t)state;
     }
     /* Aggregate the already-computed invalid controls once. Re-evaluating a
-       form on every matching rule used to re-enter its shared QuickJS regex/URL
-       validation realm and repeatedly resynchronize selects. Neither is safe
+       form on every matching rule used to re-enter its shared QuickJS regex
+       realm and URL parser and repeatedly resynchronize selects. Neither is safe
        on APs. Fieldset aggregation stays in its ordinary DOM tree. */
     if (features & WEB_STYLE_FORM_VALIDITY) for (int i = 0; ok && i < controls.n; i++) {
         if (!web_native_checkpoint(d)) { ok = false; break; }

@@ -9,6 +9,12 @@ void web_js_encoding_init_isolated(JSContext *ctx, JSValue host);
    charges the realm before the result string is allocated. */
 JSValue web_js_decode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
                            void (*prepare)(JSContext *, size_t));
+/* A string from UTF-8 as the Encoding Standard decodes it without a BOM check:
+   each invalid sequence becomes U+FFFD. */
+JSValue web_js_utf8_text(JSContext *ctx, const uint8_t *bytes, size_t length);
+/* QuickJS's UTF-8 of a string keeps a lone surrogate in its three-byte form;
+   this makes the UTF-8 of the scalar values (a USVString's), in place. */
+void web_utf8_replace_lone_surrogates(uint8_t *bytes, size_t length);
 /* host.encodeUTF8(string): an ArrayBuffer of the string's scalar values in
    UTF-8, each lone surrogate as U+FFFD; prepare as for decoding. */
 JSValue web_js_encode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
