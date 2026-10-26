@@ -16,7 +16,7 @@
     shutdown, time sync) - plus the Enhanced Session: VMConnect talks RDP to Nocturne over a
     Hyper-V socket, so the desktop takes the size of the window. For a Gen 2 VM this script:
       * writes the disk (above) and attaches it on SCSI 0:0 as the first boot device,
-      * creates the VM with static memory, one CPU, no checkpoints, Secure Boot off (the boot loader
+      * creates the VM with static memory (-MemoryMB, 4096), four CPUs (-Cpus), no checkpoints, Secure Boot off (the boot loader
         is not signed) and a synthetic network adapter on the "Default Switch" for NAT internet access,
       * selects the Hyper-V socket transport for the Enhanced Session and turns Enhanced Session Mode
         on for the host if it is off,
@@ -42,7 +42,7 @@
     .\hyperv.ps1 -Remove         # delete the VM; its disk, with the user's files, stays
 .EXAMPLE
     .\hyperv.ps1 -Iso            # boot the live system build\nocturne.iso on the virtual DVD drive instead of the disk
-                                 # (its C: is in memory and its changes go with it: 2048 MB unless -MemoryMB)
+                                 # (its C: is in memory and its changes go with it)
 .EXAMPLE
     .\hyperv.ps1 -Update -ApiKeyFile C:\keys\llm.txt   # also store an API key for `agent`
 .EXAMPLE
@@ -51,7 +51,10 @@
 param(
     [string]$Name = "Nocturne",
     [ValidateSet(1, 2)][int]$Generation = 2,
-    [int]$MemoryMB = 512,
+    # What the browser needs for today's sites, and the CPUs its parallel work spreads over: with one
+    # CPU and 512 MB a video page runs out of memory and per-frame WebGL runs at a third of its speed.
+    [int]$MemoryMB = 4096,
+    [ValidateRange(1, 240)][int]$Cpus = 4,
     [switch]$Update,
     [switch]$Remove,
     [switch]$Iso,
@@ -65,8 +68,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# the ISO's C: is held in memory, all of it, next to the system
-if ($Iso -and -not $PSBoundParameters.ContainsKey("MemoryMB")) { $MemoryMB = 2048 }
 $Root = $PSScriptRoot
 $VmDir = Join-Path $Root "hyperv"
 $Img = Join-Path $Root "build\nocturne.img"
@@ -257,10 +258,10 @@ elseif ($existing) {
 else {
     Write-Disk
     Copy-Iso
-    Say "creating Generation $Generation VM '$Name' ($MemoryMB MB)"
+    Say "creating Generation $Generation VM '$Name' ($MemoryMB MB, $Cpus CPUs)"
     $vm = New-VM -Name $Name -Generation $Generation -MemoryStartupBytes ($MemoryMB * 1MB) -VHDPath $Disk -Path $VmDir
     Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
-    Set-VMProcessor -VM $vm -Count 1
+    Set-VMProcessor -VM $vm -Count ([Math]::Min($Cpus, [Environment]::ProcessorCount))
     Get-VMNetworkAdapter -VM $vm | Remove-VMNetworkAdapter
     Add-Nic $vm
     try { Set-VM -VM $vm -AutomaticCheckpointsEnabled $false -CheckpointType Disabled } catch { }

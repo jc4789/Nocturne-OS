@@ -42,18 +42,21 @@
 | C15 | 4ddd7914 | UTF-8 の符号化と Blob の組み立てを native に、DOM の読み取りの回り道を省く | 未確認 |
 | C16 | 894423c6 | URL と URLSearchParams を Lexbor の native 解析器に | 未確認 |
 | C17 | d0737a57 | btoa/atob を native に、bindings の翻訳を翻訳スレッドへ、Intl の遅延 | 未確認 |
-| U1 | 未コミット | AP で YIELD・SLEEP・EVENTS_WAIT（世代の語で park）・APP_RESULT を済ませる | 欠陥あり（K1〜K4）・修理中 |
-| U2 | 未コミット | realloc の縮みで尾を返す、QuickJS の qrealloc を realloc に | 未確認 |
-| U3 | 未コミット | http/http2/tls の錠を mtx_t に、HTTP/2 の待ちを条件変数に | 未確認（HTTP/2 の待ちは未ビルド） |
+| U1 | 6d503047 ほか（ユーザーの「slop」のコミット） | AP で YIELD・SLEEP・EVENTS_WAIT（世代の語で park）・APP_RESULT を済ませる | K1〜K4 の修理ごとコミット済み。QEMU 4 CPU で組は動く。Hyper-V は未確認 |
+| U2 | 同上 | realloc の縮みで尾を返す、QuickJS の qrealloc を realloc に | コミット済み・未確認 |
+| U3 | 同上 | http/http2/tls の錠を mtx_t に、HTTP/2 の待ちを条件変数に | コミット済み・未確認 |
 
 ## 3. 退行（ユーザーの報告、2026-10-26、Hyper-V、03:40 の媒体）
 
+ユーザーが見た VM は、03:40:29 に `hyperv.ps1` の既定で作り直されたもので、**一 CPU・512 MiB 固定**だった（Get-VM を読むだけで確かめた。VMMS の記録で古い VM は 00:01 に削除、VmSwitch の記録で新しい VM は 03:40:31〜03:46:43 に動いた。既定は 10-05 の 47194194 から 512 MB・一 CPU）。古い VM の CPU と記憶の量は記録に無く、未確認（前の会話の写真では 4 vCPU）。
+下の QEMU の比べ（WHPX、1920×1080、`snapshot=on`、同じ手順）は、どれも基準 b2f5b721 と HEAD（00954ae2）の今日のビルドの媒体。
+
 | # | 欠陥（ブラウザーの層） | 再現 | 原因 | 状態 |
 |---|---|---|---|---|
-| R1 | 見出しの字体と大きさが変わり、場所を取る | YouTube の動画の題名 | 未確定 | 調査中 |
-| R2 | 頁の部品の一部が組み上がらず、画像の取得が「Response exceeds available receive memory」「Worker response ended early」で失敗 | Reddit の左の案内欄 | 未確定 | 調査中 |
-| R3 | 毎コマ描く WebGL が 7 fps から 2 fps | webglsamples.org の city | 未確定 | 調査中 |
-| R4 | 全体的に遅い | — | 未確定 | 調査中 |
+| R1 | 見出しの字体と大きさが変わり、場所を取る | YouTube の動画の題名 | 4 CPU・4 GiB では基準も HEAD も太字の Roboto 一行（HEAD は窓を最大化しない回も同じ）。記憶の不足で Web フォントの取得が落ちたときの代替の字体と見るのが一番（推測。512 MiB では頁が出る前に落ちて確かめられない） | 版の差は QEMU で見えない |
+| R2 | 頁の部品の一部が組み上がらず、画像の取得が「Response exceeds available receive memory」「Worker response ended early」で失敗 | Reddit の左の案内欄 | 文言は空きの記憶が受け取りの倍に足りないときの守り（`user/libc/webnet.c`）。一 CPU・512 MiB では基準も HEAD も YouTube の動画の頁でブラウザーが約 340 MB を取り、頁が尽きて segfault で落ちる。4 GiB では両方とも左の案内欄が出る | 版の差ではなく VM の記憶の量。記憶が尽きたときに落ちる欠陥は残る（K5） |
+| R3 | 毎コマ描く WebGL が 7 fps から 2 fps | webglsamples.org の city | 一 CPU・4 GiB で基準も HEAD も 2 fps、4 CPU・4 GiB で基準 6〜7・HEAD 7 fps | 版の差ではなく VM の CPU の数 |
+| R4 | 全体的に遅い | — | 一 CPU の VM（R3 と同じ） | 版の差は未測定。性能の改善は続ける |
 
 ## 4. 既知の欠陥
 
@@ -63,6 +66,11 @@
 | K2 | 閉じられた待ち行列の語で AP の待ちが park したまま起きない | 監査 | 修理：解放のときに語を起こす（未ビルド） |
 | K3 | BSP の経路が取っ手で失敗すると wait_until が残り、次の待ちの期限を狂わせる | 監査 | 修理：BSP の入口で先に消費（未ビルド） |
 | K4 | 空間の停止で BSP へ戻った眠りが、はじめから寝直す | 監査 | 修理：期限を wait_until に持つ（未ビルド） |
+| K5 | 記憶が尽きると、予約済みの頁の後払いに枠が無く、ブラウザーと映像の Worker が segfault で落ちる | QEMU 一 CPU・512 MiB、基準も HEAD も（serial.log の `[memory] … 0 pages free`） | 未修理 |
+| K6 | 頁を移っても記憶が戻らない（7 サイトの後、ブラウザー 125→480〜580 MB、カーネルのヒープ 36→200 MB） | QEMU 4 CPU・4 GiB、基準も HEAD も | 未修理 |
+| K7 | 動画が 40〜80 秒で「問題が発生しました」になる | QEMU 4 CPU、基準も HEAD も（再現は YouTube の vuYLCMyzFD4。clh5LrNDj-o は 60 秒進んだ） | 未修理 |
+| K8 | 頁がほぼ黒く、画像と本文が出ない | QEMU 4 CPU、基準も HEAD も（再現は anthropic.com/claude-opus-5-5） | 未修理 |
+| K9 | 右の段が出ない | QEMU 4 CPU、基準も HEAD も（再現は news.yahoo.co.jp） | 未修理 |
 
 ## 5. 受入表（browser-hikaku の組）
 
@@ -84,7 +92,17 @@ Floorp の性能記録（10/26 04:16、74.5 秒の範囲）は頁を開いた後
 
 ## 6. 測定
 
-（同じ条件の前後と Floorp を並べる。まだ無い。）
+同じ条件の前後と Floorp を並べる。QEMU は WHPX・1920×1080・`snapshot=on`、媒体は今日ビルドの基準 b2f5b721 と HEAD。画像は `build/qa/hikaku/20261026-*`。
+
+| 測るもの | 条件 | 基準 b2f5b721 | HEAD | Floorp（実機） |
+|---|---|---|---|---|
+| city の fps（頁の数え） | 4 CPU・4 GiB、起動して最初に開く | 6（一度 7） | 7 | 未測定 |
+| 同 | 4 CPU・4 GiB、組の 7 サイトの後 | 6 | 6 | — |
+| 同 | 1 CPU・4 GiB、最初に開く | 2 | 2 | — |
+| 使用中の記憶（System Monitor） | 4 CPU・4 GiB、起動直後 | 約 245 MiB（ブラウザー 125 MB） | 約 245 MiB（ブラウザー 128 MB） | — |
+| 同 | 組の 7 サイトの後 | 821 MiB（ブラウザー 484 MB、カーネルのヒープ 226 MB） | 892 MiB（ブラウザー 578 MB、ヒープ 202 MB） | — |
+| YouTube の動画の頁 | 1 CPU・512 MiB | 落ちる（ブラウザー約 340 MB で枠が尽きる） | 落ちる（同じ） | — |
+
 
 ## 7. 決定
 

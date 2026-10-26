@@ -187,12 +187,12 @@ powershell -ExecutionPolicy Bypass -File build.ps1 run
 Hyper-V を有効にした Windows で、このフォルダーから**管理者の** PowerShell で一度だけ実行します。
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File hyperv.ps1 -MemoryMB 4096
+powershell -ExecutionPolicy Bypass -File hyperv.ps1
 ```
 
 `Nocturne` という名前の**第 2 世代** VM を作り、起動して VMConnect を開きます。設定は次のとおりです。
-- 静的メモリー（既定は 512 MB）と 1 CPU。メモリーは `-MemoryMB` で変えられます（開発の試験は 4096 MiB で
-  行っています）。CPU 数は Hyper-V マネージャーで増やせ、カーネルは増やした CPU を使います。
+- 静的メモリー（既定は 4096 MB）と 4 CPU（ホストの論理 CPU より多くはしない）。`-MemoryMB` と `-Cpus` で変えられます。
+  一 CPU・512 MB では、動画の頁でブラウザーの記憶が尽き、毎コマ描く WebGL が三分の一の速さになります。
 - セキュアブートは無効（ブートローダーは署名されていません）。チェックポイントなし。
 - ディスクは 1 台（`hyperv\<名前>.vhdx`、SCSI 0:0）で、その VM 専用です。最初は `build\nocturne.img` を写した
   可変長 VHDX（イメージと同じ大きさ）で、起動部分と[ドライブ C:](#ドライブ-c-と保存) が入っています。
@@ -214,7 +214,7 @@ RDP サーバーにつながり、デスクトップは選んだ大きさにな�
 |---|---|
 | `hyperv.ps1 -Update` | VM を止め、新しくビルドしたシステム（起動部分、`C:\Nocturne`、付属アプリのフォルダー）を VM のディスクへ入れて起動し直します。ユーザーのファイルと、ユーザーが `C:\Programs` に入れたアプリは残ります。書換えには `hyperv\` に、ディスクが使っている分の 2 倍の空きが要ります。古い版の VM のデータディスク（`<名前>-data.vhdx`）は外し、ホストに残します。 |
 | `hyperv.ps1 -Generation 1` | 第 1 世代の VM を作ります（下記）。 |
-| `hyperv.ps1 -Iso` | ディスクの代わりにライブ ISO（`build\nocturne.iso`）を DVD ドライブから起動します。C: はメモリー上にあり、変更は電源を切ると消えます。`-MemoryMB` を指定しなければ 2048 MB にし、既存の VM に `-Update -Iso` とすると、起動メモリーが足りなければ引き上げます。 |
+| `hyperv.ps1 -Iso` | ディスクの代わりにライブ ISO（`build\nocturne.iso`）を DVD ドライブから起動します。C: はメモリー上にあり、変更は電源を切ると消えます。既存の VM に `-Update -Iso` とすると、起動メモリーが `-MemoryMB`（既定 4096 MB）より少なければ引き上げます。 |
 | `hyperv.ps1 -Remove` | VM を削除します。ディスクはユーザーのファイルごと残り、同じ名前で作り直した VM がまた使います。`-DeleteDisk` を付けるとディスクも消します。 |
 | `hyperv.ps1 -NoStart` | VM を作るだけで起動しません。 |
 | `hyperv.ps1 -NoNetwork` | ネットワークアダプターなしで作ります。 |
