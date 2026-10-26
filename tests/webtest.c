@@ -44,6 +44,27 @@ static void y_is(const char *name, const char *html, int want) {
     web_free(d);
 }
 
+static node_t *node_id(web_doc *d, const char *value) {
+    for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
+        const char *name = node_attr(n, "id");
+        if (name && !strcmp(name, value) && doc_node_connected(n)) return n;
+    }
+    return NULL;
+}
+
+/* the same with the viewport scrolled to view_y and the scroll container #s, if any, to scroll_y */
+static void scrolled_y_is(const char *name, const char *html, int view_y, int scroll_y, int want) {
+    printf("WEB-STAGE %s\n",name);fflush(stdout);
+    total++;
+    web_doc *d = load(html);
+    web_viewport_position(d, 0, view_y);
+    node_t *s = node_id(d, "s");
+    if (s) s->scroll_y = scroll_y;
+    int y = web_anchor_y(d, "t");
+    if (y < want - 1 || y > want + 1) fail(name, "#t at y=%d, expected %d", y, want);
+    web_free(d);
+}
+
 /* ---------------------------------------------------------------- layout */
 static void test_layout(void) {
     y_is("block", "<body style=margin:0><div style=height:100px></div><div id=t></div>", 100);
@@ -75,6 +96,42 @@ static void test_layout(void) {
     y_is("grid-areas",
          "<body style=margin:0><div style=\"display:grid;grid-template-areas:'a b' 'c c';grid-template-rows:50px 10px\">"
          "<div id=t style=grid-area:c></div><div style=grid-area:a></div></div>", 50);
+    y_is("grid-scroller-spans-fr", /* a scroll container spanning a 1fr row has no content minimum */
+         "<body style=margin:0><div style='display:grid;height:200px;grid-template-rows:1fr auto;"
+         "grid-template-columns:1fr 50px'><div style='grid-row:1/3;grid-column:2;overflow:auto;height:100%'>"
+         "<div style=height:1000px></div></div><div style='grid-row:2;grid-column:1;height:20px'></div>"
+         "<div id=t style='grid-row:1;grid-column:1;align-self:end;height:10px'></div></div>", 170);
+    y_is("grid-min-content-track", /* a min-content track keeps its item's min-content width */
+         "<body style=margin:0><div style='display:grid;width:100px;grid-template-columns:min-content minmax(0,auto);"
+         "font-size:0;line-height:0'><div><span style='display:inline-block;width:60px;height:10px'></span></div><div>"
+         "<span style='display:inline-block;width:25px;height:10px'></span><span style='display:inline-block;width:25px;height:10px'></span>"
+         "<span style='display:inline-block;width:25px;height:10px'></span><span style='display:inline-block;width:25px;height:10px'></span>"
+         "</div></div><div id=t></div>", 40);
+    y_is("grid-min-height-zero", /* min-height: 0 lets an item's row shrink below its content */
+         "<body style=margin:0><div style='display:grid;height:100px;grid-template-rows:1fr 1fr'>"
+         "<div style=min-height:0><div style=height:400px></div></div><div id=t></div></div>", 50);
+    /* position: sticky follows the viewport or its scroll container, within its containing block */
+    const char *sticky = "<body style=margin:0><div style=height:100px></div>"
+        "<div id=t style='position:sticky;top:10px;height:20px'></div><div style=height:2000px></div>";
+    scrolled_y_is("sticky-in-flow", sticky, 0, 0, 100);
+    scrolled_y_is("sticky-viewport", sticky, 500, 0, 510);
+    scrolled_y_is("sticky-containing-block",
+         "<body style=margin:0><div style=height:300px><div id=t style='position:sticky;top:0;height:50px'></div></div>"
+         "<div style=height:2000px></div>", 400, 0, 250);
+    scrolled_y_is("sticky-bottom",
+         "<body style=margin:0><div style=height:2000px></div><div id=t style='position:sticky;bottom:0;height:20px'></div>",
+         0, 0, 580);
+    scrolled_y_is("sticky-scroller",
+         "<body style=margin:0><div style=height:40px></div><div id=s style='overflow:auto;height:200px'>"
+         "<div style=height:50px></div><div id=t style='position:sticky;top:5px;height:20px'></div>"
+         "<div style=height:1000px></div></div>", 0, 300, 45);
+    scrolled_y_is("sticky-table-header",
+         "<body style=margin:0><table style=border-spacing:0><thead><tr><th id=t style='position:sticky;top:0;padding:0'>h"
+         "</th></tr></thead><tbody><tr><td style='height:1000px;padding:0'>b</td></tr></tbody></table>"
+         "<div style=height:2000px></div>", 300, 0, 300);
+    y_is("relative-inline-flex", /* the wrapper and its inner flex box are one element, offset once */
+         "<body style=margin:0><span style='display:inline-flex;vertical-align:top;position:relative;top:30px'>"
+         "<div id=t style=height:10px></div></span>", 30);
     y_is("table-rows",
          "<body style=margin:0><table style=border-spacing:0><tr><td style='height:50px;padding:0'>a<tr><td id=t>b</table>", 50);
     y_is("table-caption-bottom",

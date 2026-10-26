@@ -654,6 +654,7 @@ struct clamp_trace {
 typedef struct box {
     uint8_t kind, atomic;
     bool anon, inline_ctx, is_bfc, abspos, floated, is_marker;
+    bool wrapped_inner; /* an inline-level flex/grid/table's inner box: its parent, the node's box, is the outer one */
     node_t *node; /* NULL for anonymous boxes */
     style_t *st;
     struct box *parent, *first, *last, *next;
@@ -684,6 +685,8 @@ typedef struct box {
     float paint_bounds[4]; /* document-space conservative subtree bounds, one paint only */
     uint32_t visual_memo_x, visual_memo_y; /* box_visual_memo generation of the memoized coordinate below */
     float visual_x, visual_y;
+    uint32_t sticky_memo;   /* the same for the position: sticky offset below */
+    float sticky_dx, sticky_dy;
     bool paint_bounds_valid;
     bool paint_alpha; /* existing build/restyle traversal aggregates real subtree alpha effects */
     pvec paint_layers; /* stable stacking order; owned until box retirement */

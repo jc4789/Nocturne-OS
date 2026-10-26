@@ -535,9 +535,7 @@ bool box_filter_containing_block(const box_t *b) {
     const box_t *effect = b;
     /* wrapped() paints an element's effect on the outer box once, but the
        inner box owns its real padding/border containing-block geometry. */
-    if (b && (b->kind == B_FLEX || b->kind == B_GRID || b->kind == B_TABLE) &&
-        b->parent && b->parent->kind == B_ATOMIC && b->parent->atomic == AT_INLINE_BLOCK &&
-        b->node && b->node == b->parent->node) effect = b->parent;
+    if (b && b->wrapped_inner && b->parent) effect = b->parent;
     return effect && effect->st && b->kind != B_TEXT && b->kind != B_BR &&
         ((effect->kind!=B_INLINE&&css_translation_active(effect->st))||(effect->st->filter&&
          !(b->node&&b->node->owner&&b->node==b->node->owner->html)));
@@ -595,42 +593,117 @@ float box_visual_y(const box_t *b) {
     __atomic_store_n(&memo->visual_memo_y, generation, __ATOMIC_RELEASE);
     return y;
 }
-static float box_visual_x_compute(const box_t *b) {
-    double x = box_abs_x(b);
-    for(const box_t *a=b;a;a=a->parent){x+=box_translation_axis(a,0,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM);if(box_viewport_fixed(a))break;}
+/* position: sticky (css-position-3 §3.4). The box shifts to keep its border box inside its
+   nearest scrollport, inset by its own insets, as far as its margin box stays inside its
+   containing block. The shift follows scrolling, so like a scroll container's it is visual
+   only: layout and box_abs keep the box in flow, and a wrapped element's inner box moves with
+   the outer one, which its node names. */
+static bool box_sticky(const box_t *b) {
+    return b->st && b->st->position == POS_STICKY && b->node && b->node->box == b &&
+           b->kind != B_INLINE && b->kind != B_TEXT;
+}
+static void sticky_offset(const box_t *s, float shift[2]);
+
+/* b's visual coordinate on one axis (0: x, 1: y), with its sticky ancestors' shifts but not its own */
+static double visual_unstuck(const box_t *b, unsigned axis) {
+    double v = axis ? box_abs_y(b) : box_abs_x(b);
+    for(const box_t *a=b;a;a=a->parent){v+=box_translation_axis(a,axis,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM);if(box_viewport_fixed(a))break;}
     if(b->node && b->node->owner && b->node->owner->marquees.n)
         for(const box_t *a=b;a;a=a->parent){
-            if(a!=b&&web_marquee_box(a))x+=a->node->marquee_x;
+            if(a!=b&&web_marquee_box(a))v+=axis?a->node->marquee_y:a->node->marquee_x;
             if(box_viewport_fixed(a))break;
         }
     for (const box_t *c = b; c; c = c->cb) {
-        if (c != b && c->node && c->node->scroll_x != 0 && box_element_scrollable(c)) x -= c->node->scroll_x;
+        if (c != b) {
+            double scroll = c->node ? axis ? c->node->scroll_y : c->node->scroll_x : 0;
+            if (scroll != 0 && box_element_scrollable(c)) v -= scroll;
+            if (box_sticky(c)) { float shift[2]; sticky_offset(c, shift); v += shift[axis]; }
+        }
         if (box_viewport_fixed(c)) {
             /* Visual coordinates are document coordinates. Layout keeps the
                fixed containing block in viewport coordinates, so publish the
                real viewport offset once, also for every fixed descendant. */
-            if (c->node && c->node->owner) x += c->node->owner->view_x;
+            if (c->node && c->node->owner) v += axis ? c->node->owner->view_y : c->node->owner->view_x;
             break;
         }
     }
+    return v;
+}
+
+static void sticky_offset(const box_t *s, float shift[2]) {
+    uint32_t generation = __atomic_load_n(&visual_memo_generation, __ATOMIC_ACQUIRE);
+    box_t *memo = (box_t *)s;
+    if (generation && __atomic_load_n(&memo->sticky_memo, __ATOMIC_ACQUIRE) == generation) {
+        shift[0] = memo->sticky_dx; shift[1] = memo->sticky_dy;
+        return;
+    }
+    /* the scrollport: the nearest scroll container on the containing-block chain, else the viewport */
+    const box_t *sc = NULL;
+    for (const box_t *c = s->cb; c && !sc; c = c->cb) {
+        if (box_element_scrollable(c)) sc = c;
+        else if (box_viewport_fixed(c)) break;
+    }
+    const web_doc *d = s->node->owner;
+    double port[4];
+    if (sc) {
+        port[0] = box_visual_x(sc) - sc->p[3]; port[1] = box_visual_y(sc) - sc->p[0];
+        port[2] = sc->w + sc->p[1] + sc->p[3]; port[3] = sc->h + sc->p[0] + sc->p[2];
+    } else {
+        port[0] = d ? d->view_x : 0; port[1] = d ? d->view_y : 0;
+        port[2] = d ? d->width : 0; port[3] = d ? d->height : 0;
+    }
+    /* the content box of its containing block: a table part's is its table's, and a scroll
+       container's is its scrollable area, which moves with the scroll */
+    const box_t *cb = s->cb;
+    if (s->kind == B_CELL || s->kind == B_ROW || s->kind == B_ROW_GROUP)
+        for (const box_t *t = cb; t; t = t->cb)
+            if (t->kind == B_TABLE) { cb = t; break; }
+    double area[4] = {0};
+    if (cb && cb == sc) {
+        area[0] = port[0] + sc->p[3] - sc->node->scroll_x; area[1] = port[1] + sc->p[0] - sc->node->scroll_y;
+        area[2] = fmaxf_(sc->w, sc->scroll_w - sc->p[1] - sc->p[3]);
+        area[3] = fmaxf_(sc->h, sc->scroll_h - sc->p[0] - sc->p[2]);
+    } else if (cb) {
+        area[0] = box_visual_x(cb); area[1] = box_visual_y(cb) + cb->content_dy; area[2] = cb->w; area[3] = cb->h;
+    }
+    /* its border box where it would be */
+    bool row = s->kind == B_ROW || s->kind == B_ROW_GROUP;
+    double x = visual_unstuck(s, 0), y = visual_unstuck(s, 1);
+    double lo[2] = {row ? x : x - s->p[3] - s->b[3], row ? y : y - s->p[0] - s->b[0]};
+    double hi[2] = {lo[0] + (row ? s->w : s->w + s->p[1] + s->p[3] + s->b[1] + s->b[3]),
+                    lo[1] + (row ? s->h : s->h + s->p[0] + s->p[2] + s->b[0] + s->b[2])};
+    for (unsigned axis = 0; axis < 2; axis++) {
+        /* inset and m are top, right, bottom, left: the start side is the top or the left */
+        const len_t *start = &s->st->inset[axis ? 0 : 3], *end = &s->st->inset[axis ? 2 : 1];
+        double size = port[axis + 2], v = 0;
+        double back = cb ? lo[axis] - s->m[axis ? 0 : 3] - area[axis] : INF;
+        double forth = cb ? area[axis] + area[axis + 2] - hi[axis] - s->m[axis ? 2 : 1] : INF;
+        if (!len_auto(end)) {
+            double edge = port[axis] + size - len_resolve(end, (float)size);
+            if (hi[axis] > edge) v = -fmin(hi[axis] - edge, fmax(0, back));
+        }
+        /* the start side wins when the scrollport is too small for both */
+        if (!len_auto(start)) {
+            double edge = port[axis] + len_resolve(start, (float)size);
+            if (lo[axis] < edge) v = fmin(edge - lo[axis], fmax(0, forth));
+        }
+        shift[axis] = isfinite(v) ? (float)v : 0;
+    }
+    if (generation) {
+        memo->sticky_dx = shift[0]; memo->sticky_dy = shift[1];
+        __atomic_store_n(&memo->sticky_memo, generation, __ATOMIC_RELEASE);
+    }
+}
+
+static float box_visual_x_compute(const box_t *b) {
+    double x = visual_unstuck(b, 0);
+    if (box_sticky(b)) { float shift[2]; sticky_offset(b, shift); x += shift[0]; }
     return (float)x;
 }
 
 static float box_visual_y_compute(const box_t *b) {
-    double y = box_abs_y(b);
-    for(const box_t *a=b;a;a=a->parent){y+=box_translation_axis(a,1,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM);if(box_viewport_fixed(a))break;}
-    if(b->node && b->node->owner && b->node->owner->marquees.n)
-        for(const box_t *a=b;a;a=a->parent){
-            if(a!=b&&web_marquee_box(a))y+=a->node->marquee_y;
-            if(box_viewport_fixed(a))break;
-        }
-    for (const box_t *c = b; c; c = c->cb) {
-        if (c != b && c->node && c->node->scroll_y != 0 && box_element_scrollable(c)) y -= c->node->scroll_y;
-        if (box_viewport_fixed(c)) {
-            if (c->node && c->node->owner) y += c->node->owner->view_y;
-            break;
-        }
-    }
+    double y = visual_unstuck(b, 1);
+    if (box_sticky(b)) { float shift[2]; sticky_offset(b, shift); y += shift[1]; }
     return (float)y;
 }
 
@@ -4211,7 +4284,8 @@ static void relative_offsets(box_t *b) {
        descendant offsets depend only on the unchanged inner dimensions. */
     if (b->parent) {
         b->rel_dx = b->rel_dy = 0;
-        if (b->st && b->st->position == POS_RELATIVE && b->kind != B_INLINE && b->kind != B_TEXT) {
+        /* a wrapped element moves once, with its outer box */
+        if (b->st && b->st->position == POS_RELATIVE && b->kind != B_INLINE && b->kind != B_TEXT && !b->wrapped_inner) {
             const len_t *in = b->st->inset;
             float cw = b->cb ? b->cb->w : VW, ch = b->cb ? b->cb->h : VH;
             if (!len_auto(&in[3])) b->rel_dx = len_resolve(&in[3], cw);

@@ -776,6 +776,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     box_t *w = nbox(b, B_ATOMIC, n, ws);
     w->atomic = AT_INLINE_BLOCK;
     box_t *in = nbox(b, inner_kind, n, is);
+    in->wrapped_inner = true;
     children(b, in, n, is);
     fixup(b, in);
     append(w, in);
