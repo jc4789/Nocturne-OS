@@ -8,3 +8,5 @@ hyperv/
 *.jspace/
 local/
 !third_party/nvidia-open/src/nvidia/src/kernel/virtualization/hypervisor/hyperv/
+
+.codegraph/

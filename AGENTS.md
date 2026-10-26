@@ -72,5 +72,6 @@ Nocturne は C で書いた、GUI が先の独自の OS。対象は実機で、�
 
 - **上流のソース：** `D:\Programes\cloned repos`（llvm-project、mesa、go、cpython、quickjs／quickjs-ng、lexbor、ffmpeg、open-gpu-kernel-modules と nvidia-driver 615.78.08、open-gpu-doc、uACPI、wpt など）。ダウンロードする前にここを見る。取り出し方は、`ports/<名前>/README.md` があればそれに従う（llvm-project は `git archive` で取り出すだけで変えない。Go は複製へパッチを当てる）。
 - **仕様書：** `D:\Programes\OS DEV INFO`（PCIe 4.0〜6.0、PCI 3.0、NVMe 1.4c／2.4、AHCI 1.3.1、xHCI、USB 1.1〜3.2・HID・大容量記憶・CDC／NCM・USB Audio 2.0／4.0、VT-d、AMD IOMMU、AMD BKDG、TCP の RFC 9293 など）。ハードウェアとプロトコルの動作は、記憶でなくここで照らす。
+- **コードのつながり：** codegraph の手元の索引（`codegraph explore "<問い>"`・`callers`・`impact`、MCP の `codegraph_explore`。設定は `codegraph.json`、third_party は外してある）。どこを読むかを探すのに使い、編集する所は原文を読む。番号で引くシステム呼出し（`common/abi.h` の `SYS_*`）と登録の表からの呼出しは索引に出ない。
 - **NVIDIA ドライバー：** 作業台帳は `docs/nvidia/LEDGER.md`。始める前と区切りごとに読み、状態・主張・決定を更新する。
 - **PATH に無い道具：** ダウンロードする前に、リポジトリの `tools/`（msys64、llvm、rust、TypeScript、limine など）と `C:\`、`C:\Program Files`、`C:\Program Files (x86)`、`C:\Users\cesta\AppData\Local` を探す。

@@ -5,6 +5,8 @@
 - 会話の記録：このフックが事象から書く（<作業場>.jsonl）。ユーザーの原文、模型のすべての版、
   編集したファイル、圧縮。圧縮や再開の後に、要約とは別に、起きたことを見せる。
 - コードの覚え書き：.claude/oboegaki.md。ファイルに結び付き、そのファイルに触れた時にここが出す。
+- コードのつながり：codegraph の索引（.codegraph/）。編集した関数を呼ぶ所と、そのファイルに頼るファイルを、
+  編集の直後にここが出す。
 
 ここは見せるだけで、止めない。使い方は .claude/skills/mokei/SKILL.md にある。
 """
@@ -13,6 +15,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -24,6 +27,10 @@ MACHINE = ("<task-notification", "<side-sessions-event", "<ci-monitor-event", "<
            "Another Claude session sent a message")
 EDITS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 NOTES = Path(".claude") / "oboegaki.md"
+# 編集の後につながりを出す言語。Python は codegraph がメソッドを名前だけでつなぎ
+# （subprocess.run がよその run に付く）、頼るファイルの数が当てにならないので外す
+CODE = {".c", ".h", ".cc", ".cpp", ".hpp", ".js", ".mjs", ".ts", ".rs", ".go"}
+SURE = 0.8  # これより確からしさの低いつながり（名前だけで推したもの）は出さない
 
 
 def now():
@@ -167,6 +174,123 @@ def notes(root):
         if targets:
             found.append(Note(title.strip(), targets, checked, commit, "\n".join(body).strip()))
     return found
+
+
+class Graph:
+    """codegraph の索引を、その CLI で引く。索引か CLI が無ければ何も返さない。"""
+
+    def __init__(self, root):
+        self.root = root
+        self.exe = shutil.which("codegraph") if (root / ".codegraph").is_dir() else None
+
+    def run(self, *args):
+        if not self.exe:
+            return None
+        try:
+            done = subprocess.run([self.exe, *args], cwd=self.root, capture_output=True, timeout=5,
+                                  env=dict(os.environ, DO_NOT_TRACK="1", NO_COLOR="1"))
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return done.stdout.decode("utf-8", "replace") if done.returncode == 0 else None
+
+    def file(self, rel):
+        """そのファイルに頼るファイルの一行と、記号の（名前, 種類, 始まりの行）。"""
+        text = self.run("node", "-f", rel, "--symbols-only")
+        if not text or "symbols" not in text.split("\n", 1)[0]:
+            return None, []
+        users = re.search(r"used by (\d+) files?: (.*)$", text.split("\n", 1)[0])
+        symbols = [(m.group(1), m.group(2), int(m.group(3)))
+                   for m in re.finditer(r"^- `(.+?)` \((\w+)\).*:(\d+)\s*$", text, re.M)]
+        return (int(users.group(1)), users.group(2)) if users else (0, ""), symbols
+
+    def callers(self, name, rel, limit=60):
+        """確かなつながりで呼ぶ所の [(ファイル, 行, 関数)] と、引いた数が上限に届いたか。"""
+        try:
+            found = json.loads(self.run("callers", name, "-f", rel, "--json", "-l", str(limit)) or "")
+        except ValueError:
+            return None
+        rows, more = [], False
+        for definition in found.get("definitions", []):
+            if definition["definition"].get("filePath") != rel:
+                continue
+            more |= definition.get("total", 0) > limit
+            sure = {edge["source"]: edge.get("line") for edge in definition.get("edges", [])
+                    if (edge.get("metadata") or {}).get("confidence", 0) >= SURE}
+            rows += [(caller["filePath"], sure[caller["id"]] or caller.get("startLine"), caller["name"])
+                     for caller in definition.get("callers", []) if caller["id"] in sure]
+        return rows, more
+
+
+def edited_spans(text, tool, args):
+    """編集した所の行の範囲（1 始まり）。編集より前の行は、編集の前後で同じ。"""
+    pieces = [args] if tool == "Edit" else args.get("edits") or [] if tool == "MultiEdit" else []
+    spans = []
+    for piece in pieces:
+        new, old = piece.get("new_string") or "", piece.get("old_string") or ""
+        at = text.find(new) if new else -1  # 消しただけの所は、今のファイルに無い
+        if at >= 0:
+            start = text.count("\n", 0, at) + 1
+            spans.append((start, start + max(new.count("\n"), old.count("\n"))))
+    return spans
+
+
+def touched(symbols, spans):
+    """編集した所を含む記号と、編集した所で始まる記号のうちの関数。始まりの行で選ぶ。"""
+    found = []
+    for start, end in spans:
+        before = [symbol for symbol in symbols if symbol[2] <= start]
+        inside = [symbol for symbol in symbols if start < symbol[2] <= end]
+        for symbol in ([max(before, key=lambda s: s[2])] if before else []) + inside:
+            if symbol[1] in ("function", "method") and symbol not in found:
+                found.append(symbol)
+    return found
+
+
+def connections(ws, rel, tool, args, shown, segment):
+    if os.path.splitext(rel)[1].lower() not in CODE:
+        return None
+    graph = Graph(ws.root)
+    users, symbols = graph.file(rel)
+    if users is None:
+        return None
+    try:
+        text = (ws.root / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = text.split("\n")
+
+    def agrees(symbol):  # 索引の言う行に、今もその名前がある
+        return 0 < symbol[2] <= len(lines) and symbol[0] in lines[symbol[2] - 1]
+
+    spans = edited_spans(text, tool, args)
+    edited = touched(symbols, spans)
+    # 編集より前で始まる記号の行が今のファイルと合わなければ、索引が古い。一度だけ同期して引き直す
+    if edited and edited[0][2] <= spans[0][0] and not agrees(edited[0]):
+        graph.run("sync", "-q")
+        users, symbols = graph.file(rel)
+        edited = [symbol for symbol in touched(symbols, spans) if agrees(symbol)]
+    out = []
+    if shown.get(f"つながり:{rel}") != segment:
+        shown[f"つながり:{rel}"] = segment
+        count, names = users or (0, "")
+        out.append(f"- このファイルに頼るファイル {count}：{names}" if count
+                   else "- 索引では、このファイルに頼るファイルは無い")
+    for name, _, line in edited[:3]:
+        if shown.get(f"つながり:{rel}#{name}") == segment:
+            continue
+        shown[f"つながり:{rel}#{name}"] = segment
+        found = graph.callers(name, rel)
+        if found is None:
+            continue
+        rows, more = found
+        where = "、".join(f"{path}:{at}（{caller}）" for path, at, caller in rows[:8])
+        rest = f"、ほか {len(rows) - 8}" if len(rows) > 8 else ""
+        out.append(f"- `{name}`（:{line}）を呼ぶ所 {len(rows)}{'以上' if more else ''}：{where}{rest}" if rows
+                   else f"- `{name}`（:{line}）：索引では呼ぶ所なし")
+    if not out:
+        return None
+    return (f"コードのつながり（codegraph の索引。{rel} を編集したので出す。"
+            "番号で引くシステム呼出しや、登録の表から呼ばれる関数のつながりは索引に出ない）：\n" + "\n".join(out))
 
 
 def headline(text):
@@ -330,23 +454,26 @@ def on_tool(ws, data):
     rel = ws.relative(path)
     if not rel:
         return None
-    if data.get("tool_name") in EDITS:
+    tool = data.get("tool_name")
+    if tool in EDITS:
         ws.record("edit", path=rel)
-    hits = [note for note in notes(ws.root) if note.matches(rel)]
-    if not hits:
-        return None
     state = ws.state()
     segment = state.get("compactions", 0)
     shown = state.setdefault("shown", {}).setdefault(data.get("agent_id") or "main", {})
-    fresh = [note for note in hits if shown.get(note.title) != segment]
-    if not fresh:
-        return None
-    for note in fresh:
-        shown[note.title] = segment
-    ws.save(state)
-    body = "\n\n".join(f"## {note.title}\n（{note.freshness(ws.root)}）\n{note.body}" for note in fresh)
-    return (f"コードの覚え書き（{NOTES.as_posix()}。{rel} に触れたので出す。"
-            f"今のコードと照らして使い、違っていたらその場で直すか消す）：\n\n{body}")
+    parts = []
+    fresh = [note for note in notes(ws.root) if note.matches(rel) and shown.get(note.title) != segment]
+    if fresh:
+        for note in fresh:
+            shown[note.title] = segment
+        body = "\n\n".join(f"## {note.title}\n（{note.freshness(ws.root)}）\n{note.body}" for note in fresh)
+        parts.append(f"コードの覚え書き（{NOTES.as_posix()}。{rel} に触れたので出す。"
+                     f"今のコードと照らして使い、違っていたらその場で直すか消す）：\n\n{body}")
+    if tool in EDITS:
+        parts.append(connections(ws, rel, tool, args, shown, segment))
+    parts = [part for part in parts if part]
+    if parts:
+        ws.save(state)
+    return "\n\n".join(parts) or None
 
 
 def main():

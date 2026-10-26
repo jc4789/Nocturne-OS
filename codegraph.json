@@ -1,0 +1,7 @@
+{
+  "exclude": ["third_party/", "C:/"],
+  "deprioritize": ["tests/", "scripts/"],
+  "extensions": {
+    ".h": "c"
+  }
+}
