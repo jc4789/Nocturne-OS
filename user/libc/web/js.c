@@ -22,6 +22,7 @@
 #include "js_script_safety.h"
 #include "js_canvas.h"
 #include "js_memory.h"
+#include "js_compile.h"
 #include "avmedia.h"
 #include "form_value.h"
 #include "form_validation.h"
@@ -44,17 +45,15 @@
 #include "js_bootstrap.inc"
 
 /* Runtime storage grows on demand. There is no arbitrary per-page heap quota. */
-/* Real Polymer/CE construction uses over 100 finite nested frames. Keep a
-   guard well below Nocturne's 8 MiB demand-paged user stack, not unlimited. */
-#define JS_STACK_LIMIT (1024u * 1024u)
 #define JS_BODY_LIMIT WEBNET_BODY_LIMIT
 #define JS_SOURCE_LIMIT WEBNET_SCRIPT_BODY_LIMIT /* native wire length representation; allocation remains lazy */
 /* Executable data URLs carry source, not an HTTP request target. Keep them
    within the source/heap bounds without truncating their module identity. */
 #define JS_DATA_URL_LIMIT ((size_t)UINT32_MAX)
 /* Execution, microtasks and synchronous DOM/layout share one watchdog. Source
-   preparation through COMPILE_ONLY has a separate, cumulative task allowance:
-   live YouTube's finite 10.8 MB compilation takes over 10 seconds under QEMU.
+   preparation through COMPILE_ONLY on the document's thread has a separate,
+   cumulative task allowance, which is not limited: a large page's bundle is
+   finite work (fetched classic scripts compile on js_compile's threads).
    Neither nested callbacks nor repeated compilations reset either allowance.
    JavaScript eval()/Function() remain inside the execution budget. */
 #define JS_COMPILE_MS UINT32_MAX
@@ -86,6 +85,7 @@ struct js_script {
     bool external, parser_released;
     JSValue evaluation;
     uint64_t request, stream_generation;
+    struct js_compile *compile; /* a fetched classic script's bytecode, compiled elsewhere */
     struct js_script *next;
 };
 enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT, P_POLICY_REPORT, P_MODULE };
@@ -289,8 +289,10 @@ struct web_js_state {
 };
 static JSClassID node_class,history_class;
 /* This cache contains only bytecode compiled from the checked-in browser
-   bindings. Never read page/network bytecode through JS_ReadObject. It avoids
-   recompiling the platform implementation for every document in the process. */
+   bindings. It avoids recompiling the platform implementation for every
+   document in the process. JS_ReadObject reads only bytecode this process
+   wrote in memory, here and in js_compile, never bytes from a page, the
+   network or storage. */
 static uint8_t *bindings_bytecode;
 static size_t bindings_bytecode_len;
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic);
@@ -793,7 +795,7 @@ static void end_task(struct web_js_state *s) {
                 snprintf(message,sizeof message,"JavaScript stopped: the task exceeded its %u ms execution budget.",s->task_budget_ms);
             else
                 snprintf(message,sizeof message,"JavaScript stopped: the task exceeded its %u second execution budget.",s->task_budget_ms/1000u);
-            log_text(s, 2, s->compile_timed_out ? "JavaScript stopped: source preparation exceeded its 30 second task budget." :
+            log_text(s, 2, s->compile_timed_out ? "JavaScript stopped while its source was being prepared." :
                      s->starting ? "Browser API initialization exceeded its 10 second startup budget." : message);
             s->timed_out = false;
         }
@@ -6103,6 +6105,11 @@ static bool prepared_script_text(struct web_js_state *s,node_t *node,sbuf *text)
     sb_free(text);sb_put(text,bytes,length);
     JS_FreeCString(s->ctx,bytes);JS_FreeValue(s->ctx,approved);return true;
 }
+static void script_free(struct web_js_state *s,struct js_script *script){
+    js_compile_drop(script->compile);
+    JS_FreeValue(s->ctx,script->evaluation);js_free(s->ctx,script->url);js_free(s->ctx,script->base);
+    js_free(s->ctx,script->source);js_free(s->ctx,script);
+}
 static void discard_prepared_script(struct web_js_state *s,struct js_script *script){
     /* Preparation can invoke a Trusted Types policy or a microtask before the
        script enters s->scripts. Unpublish its request before host cancellation
@@ -6114,8 +6121,7 @@ static void discard_prepared_script(struct web_js_state *s,struct js_script *scr
         if(!p->done)release_pending_request(s,p);
         pending_free(s,p);
     }
-    JS_FreeValue(s->ctx,script->evaluation);js_free(s->ctx,script->url);js_free(s->ctx,script->base);
-    js_free(s->ctx,script->source);js_free(s->ctx,script);
+    script_free(s,script);
 }
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic) {
     if (n->script_started) return NULL;
@@ -6420,12 +6426,32 @@ static void sync_parser_body_handlers(struct web_js_state *s) {
     else { s->handler_body = body; JS_FreeValue(s->ctx, result); }
     JS_FreeValue(s->ctx, argument);
 }
+/* A fetched classic script compiles on a compiler thread while the document
+   goes on; ready_script runs it once that finishes. */
+static void compile_elsewhere(struct web_js_state *s, struct js_script *script) {
+    char *origin = NULL;
+    if ((s->doc->sandbox_flags & SB_ORIGIN) || http_origin_owned(web_effective_url(s->doc), &origin) != HTTP_URL_TUPLE) origin = NULL;
+    script->compile = js_compile_start(script->source, script->len, script->url, origin);
+    free(origin);
+}
+/* The script's function from its compiler; JS_UNINITIALIZED when it has none
+   and compile_source makes it here. */
+static JSValue compiled_elsewhere(struct web_js_state *s, struct js_script *script, struct js_compile_stats *stats) {
+    struct js_compile *job = script->compile;
+    if (!job) return JS_UNINITIALIZED;
+    script->compile = NULL;
+    if (interrupt(s->rt, s)) { js_compile_drop(job); return JS_ThrowInternalError(s->ctx, "JavaScript execution was stopped"); }
+    return js_compile_take(s->ctx, job, stats);
+}
 static void run_script(struct web_js_state *s, struct js_script *script) {
     if(script->stream_generation!=s->stream_generation){script->executed=script->parser_released=script->notified=true;return;}
     if (script->executed || !script->ready) return;
     if(s->doc->sandbox_flags&SB_SCRIPTS){script->executed=script->parser_released=true;return;}
     script->executed = true;
-    if (s->disabled || script->failed || !script->source) { script->parser_released=true; if (!s->disabled) { script_event(s, script->node, true); script->notified = true; } return; }
+    if (s->disabled || script->failed || !script->source) {
+        js_compile_drop(script->compile); script->compile = NULL;
+        script->parser_released=true; if (!s->disabled) { script_event(s, script->node, true); script->notified = true; } return;
+    }
     s->doc->encoding_certain=true;
     begin_named_task(s,script->module?"module script":"classic script",script->request);
     sync_parser_body_handlers(s);
@@ -6436,21 +6462,26 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
     if(guard_writes)s->ignore_destructive_writes_counter++;
     uint64_t source_start = s->host.debug_js?uptime_ms():0, compiled_at = source_start;
     JSValue result;bool compilation_failed=false;
+    struct js_compile_stats elsewhere={0};
     if (script->module) {
         struct js_module *m = cache_module(s, script->url, script->source, script->len, script->base);
         s->module_entry_url = script->url;
         result = m ? JS_LoadModule(s->ctx, s->doc->base, script->url) : JS_EXCEPTION;
         s->module_entry_url = NULL;
     } else {
-        result = compile_source(s, script->source, script->len, script->url, JS_EVAL_TYPE_GLOBAL);
+        result = compiled_elsewhere(s, script, &elsewhere);
+        if (JS_IsUninitialized(result)) result = compile_source(s, script->source, script->len, script->url, JS_EVAL_TYPE_GLOBAL);
         compiled_at = s->host.debug_js?uptime_ms():0;
         compilation_failed=JS_IsException(result);
         if (!JS_IsException(result)) result = JS_EvalFunction(s->ctx, result);
     }
-    if (s->host.debug_js&&(s->timed_out || uptime_ms() - source_start >= 250)) {
-        char message[192];
-        snprintf(message, sizeof message, "Script task profile: %lu bytes, compile %lu ms, execute %lu ms, layout %lu ms in %u reads%s",
-                 (unsigned long)script->len, (unsigned long)(compiled_at - source_start),
+    if (s->host.debug_js&&(s->timed_out || uptime_ms() - source_start >= 250 || elsewhere.compile_ms >= 250)) {
+        char message[256], compiler[96] = "";
+        if (elsewhere.bytes)
+            snprintf(compiler, sizeof compiler, " (%lu bytes of bytecode, %s %lu ms elsewhere)", (unsigned long)elsewhere.bytes,
+                     elsewhere.remembered ? "remembered in" : "compiled in", (unsigned long)elsewhere.compile_ms);
+        snprintf(message, sizeof message, "Script task profile: %lu bytes, compile %lu ms%s, execute %lu ms, layout %lu ms in %u reads%s",
+                 (unsigned long)script->len, (unsigned long)(compiled_at - source_start), compiler,
                  (unsigned long)(uptime_ms() - compiled_at), (unsigned long)s->task_layout_ms, s->task_layout_flushes,compilation_failed?", compilation failed":"");
         log_text(s, 0, message);
     }
@@ -6548,8 +6579,7 @@ static void prune_stream_scripts(struct web_js_state *s) {
     while(*link){struct js_script *script=*link;
         if(script->stream_generation==s->stream_generation){s->last_script=script;link=&script->next;continue;}
         *link=script->next;
-        JS_FreeValue(s->ctx,script->evaluation);js_free(s->ctx,script->url);js_free(s->ctx,script->base);
-        js_free(s->ctx,script->source);js_free(s->ctx,script);
+        script_free(s,script);
     }
 }
 bool web_js_encoding_restart(web_doc *document){
@@ -6563,9 +6593,7 @@ bool web_js_encoding_restart(web_doc *document){
         if(p->kind!=P_SCRIPT&&p->kind!=P_MODULE){link=&p->next;continue;}
         *link=p->next;release_pending_request(s,p);pending_free(s,p);
     }
-    while(s->scripts){struct js_script *p=s->scripts;s->scripts=p->next;
-        JS_FreeValue(s->ctx,p->evaluation);js_free(s->ctx,p->url);js_free(s->ctx,p->base);js_free(s->ctx,p->source);js_free(s->ctx,p);
-    }
+    while(s->scripts){struct js_script *p=s->scripts;s->scripts=p->next;script_free(s,p);}
     while(s->modules){struct js_module *m=s->modules;s->modules=m->next;
         JS_FreeValue(s->ctx,m->compiled);JS_FreeValue(s->ctx,m->error);js_free(s->ctx,m->url);js_free(s->ctx,m->base);js_free(s->ctx,m->source);js_free(s->ctx,m);
     }
@@ -6924,6 +6952,7 @@ static bool process_pending(struct web_js_state *s) {
                             js_free(s->ctx, *slot); *slot = final;
                         } else { script->failed = true; exception(s); }
                     }
+                    if (!script->failed && !script->module) compile_elsewhere(s, script);
                 }
                 prepare_module_script(s, script);
             }
@@ -7551,6 +7580,7 @@ static bool unfinished_scripts(struct web_js_state *s) {
 static bool ready_script(struct web_js_state *s, struct js_script **out) {
     for (struct js_script *p = s->scripts; p; p = p->next) {
         if (p->stream_generation!=s->stream_generation || p->executed || !p->ready) continue;
+        if (p->compile && !js_compile_done(p->compile)) continue;
         if (p == s->blocker) { if (parser_script_ready(s,p)) { *out = p; return true; } continue; }
         if (p->asynchronous) { *out = p; return true; }
         if (p->dynamic && !p->deferred) {
@@ -8028,6 +8058,9 @@ int64_t web_js_deadline(web_doc *d) {
             if(storage_due<deadline)deadline=storage_due;
         }
         struct js_script *ready; if (ready_script(s, &ready)) return (int64_t)now;
+        for (struct js_script *p = s->scripts; p; p = p->next)
+            if (p->compile && !p->executed && !js_compile_done(p->compile) && !js_compile_watch(p->compile, web_wait_queue()))
+                return (int64_t)now;
         for (unsigned i = 0; i < s->timer_capacity; i++)if(s->timers[i].id){
             uint64_t due=timer_task_due(s,&s->timers[i]);
             if(due<deadline)deadline=due;
@@ -8329,7 +8362,7 @@ void web_js_free(web_doc *d) {
         while(s->policy_violations){struct js_policy_violation *e=s->policy_violations;s->policy_violations=e->next;JS_FreeValue(s->ctx,e->init);js_free(s->ctx,e);}
         JS_SetDynamicCodeCheck(s->ctx,NULL,NULL);
         while (s->pending) { struct js_pending *p = s->pending; s->pending = p->next; release_pending_request(s, p); pending_free(s, p); }
-        while (s->scripts) { struct js_script *p = s->scripts; s->scripts = p->next; JS_FreeValue(s->ctx, p->evaluation); js_free(s->ctx, p->url); js_free(s->ctx, p->base); js_free(s->ctx, p->source); js_free(s->ctx, p); }
+        while (s->scripts) { struct js_script *p = s->scripts; s->scripts = p->next; script_free(s, p); }
         free_modulepreloads(s);
         while (s->modules) { struct js_module *m = s->modules; s->modules = m->next; JS_FreeValue(s->ctx, m->compiled); JS_FreeValue(s->ctx, m->error); js_free(s->ctx, m->url); js_free(s->ctx, m->base); js_free(s->ctx, m->source); js_free(s->ctx, m); }
         while(s->rejections){struct js_rejection *p=s->rejections;s->rejections=p->next;

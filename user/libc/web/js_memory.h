@@ -2,6 +2,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "quickjs.h"
+/* The stack guard of every runtime that runs or compiles a realm's scripts.
+   Real Polymer/CE construction uses over 100 finite nested frames. Keep a
+   guard well below Nocturne's 8 MiB demand-paged user stack, not unlimited. */
+#define JS_STACK_LIMIT (1024u * 1024u)
 /* What the accounting allocator records about a runtime's heap. */
 struct js_alloc_diagnostics { size_t current, peak, requested, used, limit; unsigned failures, reported; bool quota; };
 /* A runtime whose every allocation is counted at its exact size, so the
