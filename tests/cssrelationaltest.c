@@ -167,6 +167,18 @@ static int layer_dynamic(void) {
         "shared replacement invalidates both scopes without leaking one layer order into the other");
     web_free(d);printf("cssrelational-layer-dynamic: %d checks, %d failed\n",checks,failed);return failed!=0;
 }
+/* A locally published branch is laid out by the ordinary layout, so its
+   geometry is what complete box generation gives the same node. */
+static bool local_as_complete(web_doc *doc,node_t *n){
+    if(!n||!n->box||!n->box->branch_mem)return false;
+    box_t local=*n->box;
+    doc_mutated(doc,NULL);web_layout(doc,1000,600);
+    box_t *b=n->box;
+    bool same=b&&!b->branch_mem&&b->x==local.x&&b->y==local.y&&b->w==local.w&&b->h==local.h;
+    if(!same)printf("local %g,%g %gx%g complete %g,%g %gx%g\n",local.x,local.y,local.w,local.h,
+        b?b->x:-1,b?b->y:-1,b?b->w:-1,b?b->h:-1);
+    return same;
+}
 static int child_list_dirty(bool locality_only) {
     sbuf html={0};sb_puts(&html,"<!doctype html><style>"
         ".left+.right{color:blue}#box>i:first-child{color:red}#box>i+i{color:blue}"
@@ -226,14 +238,14 @@ static int child_list_dirty(bool locality_only) {
     node_t *unsafe=element(doc,NULL,"span",NULL);
     if(unsafe)doc_node_attr(doc,unsafe,"style","position:absolute;left:10px;width:20px;height:10px");
     if(unsafe)doc_node_move(doc,doc->body,unsafe,NULL);web_layout(doc,1000,600);
-    check(unsafe&&unsafe->box&&!unsafe->box->branch_mem&&unsafe->box->w==20,
-          "auto static-position inset falls back to ordinary complete box generation");
+    check(unsafe&&local_as_complete(doc,unsafe)&&unsafe->box->w==20,
+          "auto static-position inset publishes locally where complete box generation places it");
     if(unsafe)doc_node_remove(doc,unsafe);web_layout(doc,1000,600);
     node_t *percent=element(doc,NULL,"span",NULL);
     if(percent)doc_node_attr(doc,percent,"style","position:absolute;left:10px;top:10px;width:50%;height:10px");
     if(percent)doc_node_move(doc,doc->body,percent,NULL);web_layout(doc,1000,600);
-    check(percent&&percent->box&&!percent->box->branch_mem&&percent->box->w==500,
-          "percentage-dependent branch retains initial-containing-block layout fallback");
+    check(percent&&local_as_complete(doc,percent)&&percent->box->w==500,
+          "percentage-dependent branch resolves against the initial containing block as complete generation does");
     if(percent)doc_node_remove(doc,percent);web_layout(doc,1000,600);
     node_t *batch[32]={0};root_held=doc->root_box;extent_before=doc->doc_h;
     for(unsigned i=0;i<32;i++){

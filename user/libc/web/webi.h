@@ -712,6 +712,7 @@ typedef struct box {
     bool stretch_height_dependent;
     float cached_width, cached_cbh, cached_usedh;
     float cached_height, cached_baseline, cached_last_baseline, cached_content_dy;
+    float cached_end_margin; /* what its last children's margins collapse into its bottom margin */
     uint64_t cached_font_generation;
     float cached_padding[4], cached_border[4];
     /* tables */

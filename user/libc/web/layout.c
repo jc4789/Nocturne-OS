@@ -1922,6 +1922,7 @@ static void layout_blocks(box_t *b, struct bfc *f, float ox, float oy, float cbh
     b->last_baseline = last_bl;
     if (collapses_bottom(b)) {
         b->m[2] = mcollapse(b->m[2], pend);
+        b->cached_end_margin = pend;
         b->h = cursor;
     } else b->h = cursor + (pend > 0 ? pend : 0);
     /* a block whose first child's margin was hoisted keeps the combined margin */
@@ -3848,6 +3849,8 @@ static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float
         !memcmp(b->cached_padding, b->p, sizeof b->p) &&
         !memcmp(b->cached_border, b->b, sizeof b->b)) {
         b->h = b->cached_height;
+        /* resolve_edges just reset the bottom margin to its own */
+        b->m[2] = mcollapse(b->m[2], b->cached_end_margin);
         b->baseline = b->cached_baseline;
         b->last_baseline = b->cached_last_baseline;
         b->content_dy = b->cached_content_dy;
@@ -3903,6 +3906,7 @@ static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float
     if (split_inline || (b->anon && !b->node && b->kind == B_BLOCK && b->inline_ctx && usedh < 0 && b != D->root_box))
         child_cbh = cbh;
     b->baseline = b->last_baseline = -1;
+    b->cached_end_margin = 0;
     b->nruns = b->ndecos = 0;
     b->nlines = 0; b->lines = NULL; b->clamp_truncated = false;
     if (clamping) {
