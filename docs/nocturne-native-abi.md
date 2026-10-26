@@ -1,10 +1,11 @@
 # Nocturne ネイティブABI（UNIX型ABIの置き換え）
 
-Nocturneは独自OSであり、UNIX／POSIX／Linuxではない。現行の `common/abi.h` は、
+Nocturneは独自OSであり、UNIX／POSIX／Linuxではない。以前の `common/abi.h` は、
 整数fdへの汎用 `read`／`write`／`lseek`／`fcntl`／`dup2`／`poll`、`open` フラグ、
 `chdir`／`getcwd`、`spawn`＋`waitpid`／`kill`、`pipe`、`sbrk`／`mmap`、
-`ENOENT` 型のエラー名という、UNIXの骨格を持っている。名前を変えても骨格が同じなら
-UNIXのままなので、この文書は**骨格そのもの**をNocturne独自の方式へ置き換える仕様を定める。
+`ENOENT` 型のエラー名という、UNIXの骨格を持っていた。名前を変えても骨格が同じなら
+UNIXのままなので、この文書は**骨格そのもの**をNocturne独自の方式へ置き換えた仕様を定める
+（旧ABIは §10 の段階5で削除済み）。
 
 ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`、`time.h`、
 `threads.h`、`fenv.h`、`setjmp.h`、`errno.h` の `EDOM`／`ERANGE`／`EILSEQ`）は

@@ -38,8 +38,8 @@ Nocturne は GUI が先の独自の OS で、カーネルと C ライブラリ�
 - **最後までつなぐ。** 呼ばれても何もしない関数、固定値を返す関数、API の名前だけ、例外を消すだけの実装は対応ではない。解析・DOM・イベント・描画・寿命まで製品へつなぐ。
 - **サイト専用の処理を製品に入れない。** ホスト名・URL での分岐、特定サイトの DOM やスクリプトを狙った特例、UA の偽装、注入した HTML・CSS・JS で「直った」画面を作らない。直すのは仕様と共通の境界で、サイト名は試験と文書にだけ置く。報告でも主語は我々のブラウザーの欠陥にし、サイト名は「再現は◯◯」と添える。
 - **VM の処理は実機の処理と分ける。** QEMU・Hyper-V だけの処理は一か所の入口の後ろに置き、共通コードに hypervisor の判定やエミュレーターの装置を直接書かない。VM の測定値で実機の既定を決めない。Hyper-V 第 2 世代と拡張セッションは製品の要件。
-- **UNIX ではない。** POSIX・Linux の API を足さず、移植するプログラムを Nocturne のネイティブ API へ書き換える。逆に、ネイティブの API・スレッド・SMP・スケジューラーは Nocturne の形で直してよい。
-- **言語は C だけではない。** アプリと移植は、仕事に合う言語で書ける。どの言語の標準ライブラリーも Nocturne のネイティブ API の上に載せてあり、POSIX を通らない。
+- **UNIX ではない。** POSIX・Linux の API を足さず、移植するプログラムを Nocturne のネイティブ ABI（`common/abi.h`・`common/display_abi.h`・`common/gpu_abi.h`。仕様は `docs/nocturne-native-abi.md`）へ書き換える。ABI を迂回せず、足りなければ ABI の側を Nocturne の形で直す。スレッド・SMP・スケジューラーも同じ。
+- **言語は C だけではない。** アプリと移植は、仕事に合う言語で書ける。どの言語の標準ライブラリーも Nocturne のネイティブ ABI の上に載せてあり、POSIX を通らない。
   - C++20（libc++ 付き）：`user/apps/*.cpp`
   - TypeScript・JavaScript：QuickJS で動く。窓は `nocturne/ui`（型は `rootfs/Nocturne/SDK/Types/nocturne`）。`user/apps/*.ts` はホストの tsc で `C:\Nocturne\System\<名前>.js` になる
   - Go（`GOOS=nocturne`）：`ports/go/apps/<名前>/main.go`、窓は `ports/go/ui`。`tools/go` があると作られる
