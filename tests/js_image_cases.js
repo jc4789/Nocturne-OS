@@ -35,6 +35,9 @@ async function runImageCases() {
     equal(fresh.currentSrc,base+'one.svg');equal(fresh.complete,true);
     fresh.removeAttribute('width');fresh.removeAttribute('height');equal(fresh.width,2);equal(fresh.height,3);
     fresh.alt='native alt';equal(fresh.getAttribute('alt'),'native alt');
+    const cors=new Image();equal(cors.crossOrigin,null);cors.crossOrigin='';equal(cors.crossOrigin,'anonymous');
+    cors.crossOrigin='USE-CREDENTIALS';equal(cors.crossOrigin,'use-credentials');equal(cors.getAttribute('crossorigin'),'USE-CREDENTIALS');
+    cors.crossOrigin='unknown';equal(cors.crossOrigin,'anonymous');cors.crossOrigin=null;equal(cors.hasAttribute('crossorigin'),false);
     const replacing=load(fresh,base+'slow.svg');equal(fresh.complete,false);
     equal(fresh.naturalWidth,2);equal(fresh.currentSrc,base+'one.svg');
     await replacing;equal(fresh.naturalWidth,4);equal(fresh.naturalHeight,6);equal(calls,2);

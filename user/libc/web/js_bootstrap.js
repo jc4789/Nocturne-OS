@@ -596,6 +596,12 @@
         set srcset(v) { domGet(this,'imageBrand');reflectedAttr(this,'srcset',String(v)); }
         get sizes() { domGet(this,'imageBrand');return reflectedAttr(this,'sizes')||''; }
         set sizes(v) { domGet(this,'imageBrand');reflectedAttr(this,'sizes',String(v)); }
+        // A CORS settings attribute: the native request is a CORS one when it is present.
+        get crossOrigin() {
+            domGet(this,'imageBrand');const v=reflectedAttr(this,'crossorigin');
+            return v===null?null:v.toLowerCase()==='use-credentials'?'use-credentials':'anonymous';
+        }
+        set crossOrigin(v) { domGet(this,'imageBrand');reflectedAttr(this,'crossorigin',v==null?null:String(v)); }
         decode() { return Promise.resolve().then(()=>dom('imageDecode',this)); }
     }
     function Image() {
