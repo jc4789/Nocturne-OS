@@ -2551,7 +2551,8 @@ static JSValue attribute_native_changed(struct web_js_state *s, node_t *n, const
         if (JS_IsException(notified)) return notified;
         JS_FreeValue(ctx, notified);
     }
-    if (html_image(n) && (!strcmp(name, "src") || !strcmp(name, "srcset") || !strcmp(name, "sizes"))) {
+    if (html_image(n) && (!strcmp(name, "src") || !strcmp(name, "srcset") || !strcmp(name, "sizes") ||
+                          !strcmp(name, "crossorigin"))) {
         n->image_invalidated = true; image_pin(s, n);
     }
     if (n->tag == T_input && !strcmp(name, "src")) {
@@ -7011,7 +7012,11 @@ static bool process_pending(struct web_js_state *s) {
                carries an image (a placeholder icon) is decoded and shown, and
                only a transport failure or undecodable body is an error. */
             bool body=!p->aborted && !p->response.error[0] && p->response.body_len;
-            web_image_loaded(s->doc, p->image, body ? p->response.body : NULL, body ? p->response.body_len : 0);
+            /* Fetch's response tainting decides whether a canvas may read it:
+               a no-cors image that left the document's origin is opaque. */
+            int transport=fetch_transport_flags(web_response_headers(&p->response));
+            bool clean=transport>=0 && !(transport & NJW_LOADED_OPAQUE);
+            web_image_loaded(s->doc, p->image, body ? p->response.body : NULL, body ? p->response.body_len : 0, clean);
         } else if (!s->disabled && p->kind == P_FETCH) {
             ran_task = true;
             begin_task(s);
@@ -7179,10 +7184,17 @@ static void request_images(struct web_js_state *s) {
         if (!web_image_wanted(s->doc, i)) continue;
         const char *url = web_image_url(s->doc, i); if (!url) continue;
         struct js_pending *p = pending_new(s, P_IMAGE, url);
-        if (!p) { JSValue e = JS_GetException(s->ctx); JS_FreeValue(s->ctx, e); web_image_loaded(s->doc, i, NULL, 0); s->doc->dirty = true; continue; }
+        if (!p) { JSValue e = JS_GetException(s->ctx); JS_FreeValue(s->ctx, e); web_image_loaded(s->doc, i, NULL, 0, false); s->doc->dirty = true; continue; }
         p->image = i;
-        ((struct web_image *)s->doc->images.v[i])->loading_id=p->id;
-        send_request(s, p, WEB_RESOURCE_IMAGE, "GET", NULL, NULL, 0);
+        struct web_image *image = s->doc->images.v[i];
+        image->loading_id=p->id;
+        if (image->cors == WEB_IMAGE_NO_CORS) send_request(s, p, WEB_RESOURCE_IMAGE, "GET", NULL, NULL, 0);
+        else {
+            /* A crossorigin image is a CORS request, as fonts are: the host
+               fails a cross-origin response that its server did not share. */
+            p->credentials = image->cors == WEB_IMAGE_USE_CREDENTIALS ? WEBNET_CREDENTIALS_INCLUDE : WEBNET_CREDENTIALS_SAME_ORIGIN;
+            send_request(s, p, WEB_RESOURCE_FETCH, "GET", NULL, NULL, 0);
+        }
     }
 }
 static bool styles_busy(struct web_js_state *s) { return pending_kind(s, P_CSS) || web_pending_stylesheet(s->doc); }

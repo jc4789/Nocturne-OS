@@ -887,7 +887,11 @@ struct web_image {
     bool done, failed;
     uint64_t loading_id; /* The owning transport request, not a global resource-count gate. */
     bool image_upgrade; /* Part of request identity: imageset must not share an upgraded image. */
+    uint8_t cors;       /* Part of request identity: WEB_IMAGE_NO_CORS or a CORS credentials mode. */
+    bool origin_clean;  /* The response is CORS-same-origin: a canvas or WebGL may read its pixels. */
 };
+/* An image request's CORS settings (the crossorigin attribute's state). */
+enum { WEB_IMAGE_NO_CORS, WEB_IMAGE_ANONYMOUS, WEB_IMAGE_USE_CREDENTIALS };
 
 /* Monotonic diagnostic counters, sampled at task boundaries. No timing limit
    or DOM semantics depend on these values. Times can overlap (inclusive). */

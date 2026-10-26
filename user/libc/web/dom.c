@@ -775,7 +775,8 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     if (found < 0 && !value) return true;
     bool html_image = !n->foreign && n->tag == T_img;
     bool image_candidate = !ns && !n->foreign && !strcmp(name, low) &&
-        ((html_image && (!strcmp(low, "src") || !strcmp(low, "srcset") || !strcmp(low, "sizes"))) ||
+        ((html_image && (!strcmp(low, "src") || !strcmp(low, "srcset") || !strcmp(low, "sizes") ||
+                         !strcmp(low, "crossorigin"))) ||
          (n->tag == T_source && n->parent && !n->parent->foreign && n->parent->tag == T_picture &&
           (!strcmp(low, "srcset") || !strcmp(low, "sizes") || !strcmp(low, "media") || !strcmp(low, "type"))));
     bool resources = (n->tag == T_img && !html_image) || resource_attribute(n, low);

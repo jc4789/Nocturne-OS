@@ -162,7 +162,7 @@ static uint32_t over(uint32_t d,uint32_t s) {
     unsigned b=((s&255)*sa+(d&255)*old+alpha/2)/alpha;
     return (alpha<<24)|(r<<16)|(g<<8)|b;
 }
-/* The same usable bitmap and conservative origin provenance serve drawImage
+/* The same usable bitmap and its response's origin provenance serve drawImage
    and ImageBitmap snapshots. Status 2 means an ordinary image is still loading;
    drawImage does nothing, while createImageBitmap rejects its unusable source. */
 static int canvas_source(JSContext *ctx,node_t *source,const uint32_t **pixels,unsigned *w,unsigned *h,bool *tainted) {
@@ -182,7 +182,7 @@ static int canvas_source(JSContext *ctx,node_t *source,const uint32_t **pixels,u
     if(im->failed||!im->img||!im->img->px||im->img->w<=0||im->img->h<=0)return 1;
     *w=(unsigned)im->img->w;*h=(unsigned)im->img->h;
     if((uint64_t)(*w)*(*h)>IMAGE_MAX_PIXELS){JS_ThrowRangeError(ctx,"Image bitmap limit");return -1;}
-    *pixels=im->img->px;*tainted=!im->url||strncasecmp(im->url,"data:",5)!=0;return 0;
+    *pixels=im->img->px;*tainted=!im->origin_clean;return 0;
 }
 static JSValue canvas_export(JSContext *ctx,node_t *n,struct web_canvas *c,bool data_url) {
     if (c && c->tainted) return JS_FALSE; /* JS throws SecurityError synchronously. */

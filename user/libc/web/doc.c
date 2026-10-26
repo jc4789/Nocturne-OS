@@ -381,15 +381,15 @@ static char *doc_absolute_url(const char *base,const char *relative) {
     if(web_resolve_url_owned(base,relative,&url)==1)return url;
     free(url);return NULL;
 }
-static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred,bool image_upgrade) {
+static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred,bool image_upgrade,int cors) {
     if (preferred >= 0 && preferred < d->images.n) {
         struct web_image *im=d->images.v[preferred];
-        if(im->image_upgrade==image_upgrade && !strcmp(im->url,abs))return preferred;
+        if(im->image_upgrade==image_upgrade && im->cors==cors && !strcmp(im->url,abs))return preferred;
     }
     int failed_match = -1;
     for (int i = 0; i < d->images.n; i++) {
         struct web_image *im = d->images.v[i];
-        if (im->image_upgrade!=image_upgrade || strcmp(im->url, abs)) continue;
+        if (im->image_upgrade!=image_upgrade || im->cors!=cors || strcmp(im->url, abs)) continue;
         if (!im->done || !im->failed) return i;
         if (failed_match < 0) failed_match = i;
     }
@@ -399,6 +399,7 @@ static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int prefer
     if (!im) return -1;
     im->url = strdup(abs);
     im->image_upgrade = image_upgrade;
+    im->cors = (uint8_t)cors;
     if (!im->url) { free(im); return -1; }
     if (d->images.n == d->images.cap) {
         int cap = d->images.cap ? d->images.cap > INT_MAX/2 ? INT_MAX : d->images.cap * 2 : 16;
@@ -412,18 +413,23 @@ static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int prefer
     if (!strncasecmp(abs, "data:", 5)) {
         size_t n;
         char *data = data_url(d,abs,&n,NULL);
-        web_image_loaded(d, idx, data, n);
+        web_image_loaded(d, idx, data, n, true); /* a data: response is basic */
         free(data);
     }
     return idx;
 }
-static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred,bool image_upgrade) {
+static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred,bool image_upgrade,int cors) {
     if(!rel || !*rel)return -1;
     while(is_space((unsigned char)*rel))rel++;
     char *abs=doc_absolute_url(d->base,rel);if(!abs)return -1;
-    int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade);free(abs);return result;
+    int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade,cors);free(abs);return result;
 }
-static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1,true); }
+static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1,true,WEB_IMAGE_NO_CORS); }
+/* The crossorigin attribute's state: missing is no CORS, an invalid value anonymous. */
+static int image_cors(node_t *n) {
+    const char *v = node_attr(n, "crossorigin");
+    return !v ? WEB_IMAGE_NO_CORS : str_ieq(v, "use-credentials") ? WEB_IMAGE_USE_CREDENTIALS : WEB_IMAGE_ANONYMOUS;
+}
 
 /* Element creation links each <img>/<input> into its allocation's image list,
  * a subset of owned_nodes: the iterator below runs on every script tick and
@@ -470,10 +476,11 @@ void doc_image_sync(web_doc *d, node_t *n) {
     bool has_source = src != NULL || ss != NULL;
     /* Keep responsive/CORS images outside this ordinary-image upgrade path.
        In particular, URL deduplication must not promote a blocked imageset. */
-    bool image_upgrade=!ss && !node_attr(n,"crossorigin") &&
+    int cors = image_cors(n);
+    bool image_upgrade=!ss && cors==WEB_IMAGE_NO_CORS &&
         !(n->parent && !n->parent->foreign && n->parent->tag==T_picture);
     int requested = add_image_request(d, src, n->image_invalidated,
-        n->image_initialized && !n->image_invalidated ? n->image_request : -1,image_upgrade);
+        n->image_initialized && !n->image_invalidated ? n->image_request : -1,image_upgrade,cors);
     free(pick);
     if (!n->image_initialized || n->image_invalidated || requested != n->image_request || has_source != n->image_has_source) {
         n->image_initialized = true; n->image_invalidated = false;
@@ -1451,11 +1458,12 @@ bool web_image_wanted(web_doc *d, int i) {
 }
 
 static void image_decode_service(void *context) { web_native_checkpoint(context); }
-void web_image_loaded(web_doc *d, int i, const void *data, size_t n) {
+void web_image_loaded(web_doc *d, int i, const void *data, size_t n, bool origin_clean) {
     if (i < 0 || i >= d->images.n) return;
     struct web_image *im = d->images.v[i];
     if (im->done) return;
     im->done = true;
+    im->origin_clean = origin_clean;
     if (data && n) {
         if (image_is_svg(data, n)) {
             im->img = image_decode_svg(data, n, 0, 0);

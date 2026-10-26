@@ -1951,7 +1951,7 @@ static void finish_navigation(void) {
     relayout();
     if (image) {
         for (int i = 0; i < web_image_count(doc); i++)
-            if (!strcmp(web_image_url(doc, i), image)) web_image_loaded(doc, i, f->body, f->body_len);
+            if (!strcmp(web_image_url(doc, i), image)) web_image_loaded(doc, i, f->body, f->body_len, true); /* the document itself */
         relayout();
     }
     web_response_free(f); free(f);

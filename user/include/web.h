@@ -5,7 +5,7 @@
      while ((u = web_pending_stylesheet(d))) web_stylesheet_loaded(d, css_or_NULL, len);
      web_layout(d, width, height);              -> paint it
      for each i < web_image_count(d) with web_image_wanted(d, i):
-         web_image_loaded(d, i, bytes_or_NULL, n); web_layout(...) again now and then
+         web_image_loaded(d, i, bytes_or_NULL, n, origin_clean); web_layout(...) again now and then
    Coordinates passed to and returned by these functions are document coordinates: (0, 0) is the
    top-left of the page, before scrolling. */
 #pragma once
@@ -354,7 +354,9 @@ void web_stylesheet_loaded(web_doc *d, const char *css, size_t n); /* css NULL: 
 int web_image_count(web_doc *d);
 const char *web_image_url(web_doc *d, int i);
 bool web_image_wanted(web_doc *d, int i); /* not loaded or failed yet */
-void web_image_loaded(web_doc *d, int i, const void *data, size_t n); /* data NULL: it failed */
+/* data NULL: it failed. origin_clean: the response was CORS-same-origin (Fetch's response
+   tainting was not opaque), so a canvas or WebGL may read its pixels. */
+void web_image_loaded(web_doc *d, int i, const void *data, size_t n, bool origin_clean);
 
 /* ---- layout and painting ---- */
 /* lay the page out for a viewport; returns the document height */

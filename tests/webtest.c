@@ -535,7 +535,7 @@ static void test_replaced_flow(void) {
             fail(cases[i].name, "image count %d, expected %d", web_image_count(d), 1);
             web_free(d); continue;
         }
-        web_image_loaded(d, 0, blue_png, sizeof blue_png);
+        web_image_loaded(d, 0, blue_png, sizeof blue_png, true);
         web_layout(d, VW, VH);
         web_node *image = web_node_at(d, 1, 1);
         int x = 0, y = 0, w = 0, h = 0;
@@ -554,7 +554,7 @@ static void test_replaced_flow(void) {
     web_doc *d = load("<!doctype html><body style=margin:0><div style='font-size:0;line-height:0'>"
         "<picture style=display:contents><img src=i.png style='display:inline-block;width:60px;height:0'></picture>"
         "</div><div id=t></div>");
-    web_image_loaded(d, 0, blue_png, sizeof blue_png);
+    web_image_loaded(d, 0, blue_png, sizeof blue_png, true);
     web_layout(d, VW, VH);
     total++;
     if (web_anchor_y(d, "t") != 0) fail("image-explicit-zero", "flow height %d, expected %d", web_anchor_y(d, "t"), 0);
@@ -599,7 +599,7 @@ static void test_float_percent_heights(void) {
             fail(cases[i].name, "image count %d, expected %d", web_image_count(d), cases[i].image_count);
             web_free(d); continue;
         }
-        if (cases[i].image_count) web_image_loaded(d, 0, blue_png, sizeof blue_png);
+        if (cases[i].image_count) web_image_loaded(d, 0, blue_png, sizeof blue_png, true);
         web_layout(d, VW, VH);
         web_node *target = web_node_at(d, 1, cases[i].probe_y);
         int x = 0, y = 0, w = 0, h = 0;
@@ -649,7 +649,7 @@ static void test_text(void) {
     if (web_image_count(d) != 1 || !web_image_wanted(d, 0)) fail("image-wanted", "%d images", web_image_count(d), 0);
     else {
         str_is("image-url", web_image_url(d, 0), "http://h.test/dir/i.png");
-        web_image_loaded(d, 0, blue_png, sizeof blue_png);
+        web_image_loaded(d, 0, blue_png, sizeof blue_png, true);
         web_layout(d, VW, VH);
         total++;
         if (web_anchor_y(d, "t") != 75) fail("image-size", "#t at %d, expected %d", web_anchor_y(d, "t"), 75);

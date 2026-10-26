@@ -38,6 +38,11 @@ struct job {
     size_t cookie_len, cookie_cap;
     bool hop_cookies, redirect_cross_site;
     bool cors_tainted, origin_tainted, redirected, opaque_tainted;
+    /* An element's no-cors subresource (an image, a stylesheet) that left the
+       request origin: its response tainting is opaque. The browser still uses
+       the bytes, unlike fetch()'s opaque response, but they are not
+       CORS-same-origin (a canvas or WebGL may not read them). */
+    bool resource_opaque;
     bool stream_headers_sent, stream_final, upload_finished;
     size_t cookie_start;
     const char *hop_method;
@@ -1202,7 +1207,7 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
         size_t reason_len = strlen(reason);
         char start[32], end[320];
         int a = snprintf(start, sizeof start, "HTTP/1.1 %d ", r->status);
-        int b = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s\r\n", j->cors_tainted, j->redirected,j->opaque_tainted?" opaque=1":"");
+        int b = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s\r\n", j->cors_tainted, j->redirected,j->opaque_tainted||j->resource_opaque?" opaque=1":"");
         if (b >= 0 && (size_t)b < sizeof end && j->debug_request_measured) {
             int c = snprintf(end + b, sizeof end - (size_t)b,
                 "HTTP/Nocturne-Request bytes=%lu ctl=%lu nonascii=%lu cookie=%u content_length=%u\r\n",
@@ -1384,6 +1389,7 @@ static bool run_http(struct job *j) {
            when a redirect returns to the original document's origin. */
         if (cors_kind(j) && cross) j->cors_tainted = true;
         if(no_cors(j) && cross)j->opaque_tainted=true;
+        if(j->wire.kind==WEBNET_RESOURCE && cross)j->resource_opaque=true;
         const char *method = drop_body ? "GET" : j->method;
         /* Redirects can remove authorization/body fields; rederive the preflight names. */
         if (!validate_headers(j)) return false;
