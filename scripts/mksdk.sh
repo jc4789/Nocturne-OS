@@ -4,7 +4,9 @@
 #   Include              libc, Nocturne, BearSSL, QuickJS and libnvrm headers (+ stdint.h, limits.h)
 #   Lib\tcc\include      TinyCC's own headers (stdarg.h, stddef.h, float.h, ...)
 #   Lib\tcc              libtcc1.a (compiler runtime), runmain.o (for tcc -run)
-#   Lib                  crt1.o crti.o crtn.o libc.a (libc + gfx + BearSSL), libwasm-rt.a,
+#   Lib                  crt1.o crti.o crtn.o libc.a (every member programs are linked from:
+#                        libc, gfx, BearSSL, the web engine, Mesa, the C++ runtime and, with
+#                        llvmpipe, LLVM's JIT), libwasm-rt.a,
 #                        user.ld (the program layout clang's driver links with)
 #   Source\Apps          sources of the system's programs (API examples)
 #   Source\libc          the private libc headers those sources include by their place
@@ -103,16 +105,15 @@ for o in "${objects[@]}"; do
     case "$o" in
         *crt0.asm.o) crt0=$o; continue ;;
         *.a)
-            # a static library made by another compiler (NVK's Rust archive): its members join
-            # libc.a one by one, so TinyCC pulls only the ones a program needs
-            archive=$(realpath -e -- "$o")
-            rm -rf "$W/ar" && mkdir -p "$W/ar"
-            (cd "$W/ar" && ar x "$archive")
-            for m in "$W/ar"/*; do
-                i=$((i + 1))
-                strip_obj "$m" "$W/$dest/libc_$i.o"
-            done
-            rm -rf "$W/ar"
+            # a static library made by another compiler (NVK's Rust archive, LLVM's JIT, the C++
+            # runtime): its members join libc.a one by one, so TinyCC pulls only the ones a program
+            # needs. The archive is stripped whole and taken apart in a folder of its own, since
+            # members of different archives may share a name.
+            i=$((i + 1))
+            mkdir -p "$W/$dest/a$i"
+            strip_obj "$(realpath -e -- "$o")" "$W/a$i.a"
+            (cd "$W/$dest/a$i" && ar x "../../a$i.a")
+            rm -f "$W/a$i.a"
             continue ;;
     esac
     n=$(basename "$o" .o)
@@ -130,7 +131,9 @@ nasm -f elf64 "$W/empty.asm" -o "$S/Lib/crti.o"
 cp "$S/Lib/crti.o" "$S/Lib/crtn.o"
 cp user/user.ld "$S/Lib/user.ld"
 
-(cd "$W/libc" && ar rcs ../libc.a *.o)
+# q, not r: the archives' members keep their own names, and r would let one replace another. The
+# members are many more than a Windows command line holds: ar reads their names from a file.
+(cd "$W/libc" && shopt -s nullglob && printf '%s\n' *.o a*/* > ../members.lst && ar qcs ../libc.a @../members.lst)
 mv "$W/libc.a" "$S/Lib/libc.a"
 (cd "$W/wasmrt" && ar rcs ../libwasm-rt.a *.o)
 mv "$W/libwasm-rt.a" "$S/Lib/libwasm-rt.a"

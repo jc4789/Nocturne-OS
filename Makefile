@@ -282,16 +282,14 @@ CXX_RUNTIME_LINK := $(if $(LLVMPIPE),$(LLVM_RUNTIMES)/Lib/libc++.a $(LLVM_RUNTIM
 # that draws with OpenGL pulls them in.
 LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) \
     $(CXX_RUNTIME_LINK) $(MESA_OBJ) $(ZINK_OBJ) $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
-# Programs are linked from the libc's members and, with llvmpipe, LLVM's libraries; the SDK's
-# libc.a is made from the members alone (SDK_RSP).
+# Programs are linked from the libc's members and, with llvmpipe, LLVM's libraries. The SDK's
+# libc.a is made from the same list: a program linked inside Nocturne reaches llvmpipe through
+# the same members and needs what they need.
 LIBC_RSP := $(BUILD)/libc-objects.list
-SDK_RSP := $(BUILD)/sdk-objects.list
 
 # Windowsのコマンド長上限を超えないよう、lldとSDKにobject一覧をファイルで渡す。
 $(LIBC_RSP): $(LIBC_LINK) $(LLVM_JIT_LIBS) Makefile
 	@$(file >$@,$(LIBC_LINK) $(LLVM_JIT_LIBS))
-$(SDK_RSP): $(LIBC_LINK) Makefile
-	@$(file >$@,$(LIBC_LINK))
 
 # A unit's check (scripts/link_unit.py) reads the symbols of every other member.
 $(NVK_UNIT): | $(filter-out $(NVK_UNIT),$(LIBC_LINK))
@@ -490,14 +488,14 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
 
 # the SDK: headers and libraries for compiling inside Nocturne (C:\Nocturne\SDK)
-$(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(SDK_RSP) $(TCCRT_OBJ) scripts/mksdk.sh \
+$(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) $(TCCRT_OBJ) scripts/mksdk.sh \
 		$(shell find user/include ports/tcc/include third_party/bearssl/inc ports/nvidia/include $(TCC_DIR)/include -name '*.h') \
 		third_party/quickjs/quickjs.h $(shell find user/libc -name '*.h' -o -name '*.inc' -o -name '*.js') \
 		$(LXB_HEADERS) ports/lexbor/include/memory.h third_party/lexbor/headers.list \
 		common/abi.h common/gfx.h common/gpu_abi.h common/display_abi.h user/user.ld \
 		$(wildcard user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts) $(LLVM_SDK_FILES)
 	@echo "  SDK"
-	@bash scripts/mksdk.sh $(SDK) $(if $(LLVM_SDK),--llvm $(LLVM_SDK)) $(BUILD)/u/user/libc/crt0.asm.o @$(SDK_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
+	@bash scripts/mksdk.sh $(SDK) $(if $(LLVM_SDK),--llvm $(LLVM_SDK)) $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images

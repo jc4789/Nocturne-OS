@@ -1952,6 +1952,21 @@ static void tcc_add_linker_symbols(TCCState *s1)
     /* XXX should be .sdata+0x800, not .data+0x800 */
     set_global_sym(s1, "__global_pointer$", data_section, 0x800);
 #endif
+#if CONFIG_TCC_NOCTURNE
+    /* The unwinder of Nocturne's C++ runtime finds a program's frames by these, as its
+       linker script (user/user.ld) defines them; a static program has no .eh_frame_hdr */
+    {
+        static const char *const ends[] = {"__eh_frame_start", "__eh_frame_end"};
+        static const char *const hdr[] = {"__eh_frame_hdr_start", "__eh_frame_hdr_end"};
+        for (i = 0; i < 2; i++) {
+            if (eh_frame_section && (eh_frame_section->sh_flags & SHF_ALLOC))
+                set_global_sym(s1, ends[i], eh_frame_section, i ? -1 : 0);
+            else
+                set_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0, SHN_ABS, ends[i]);
+            set_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0, SHN_ABS, hdr[i]);
+        }
+    }
+#endif
     /* horrible new standard ldscript defines */
     add_init_array_defines(s1, ".preinit_array");
     add_init_array_defines(s1, ".init_array");
