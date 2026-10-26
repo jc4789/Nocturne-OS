@@ -8160,8 +8160,21 @@ void web_visibility_event(web_doc *d) {
     struct web_event e={.type="visibilitychange",.bubbles=true};
     web_js_dispatch(d,d->root,&e);
 }
-static JSValue load_browser_bindings(JSContext *ctx) {
+static struct js_compile *bindings_job;
+void web_js_prepare(void) {
+    if (!bindings_bytecode && !bindings_job)
+        bindings_job = js_compile_platform(js_bootstrap, sizeof js_bootstrap - 1, "nocturne:browser-bindings");
+}
+/* Where a realm's setup went: waiting for the compiler, reading (or, without
+   one, compiling) the bytecode, and running it. */
+struct bindings_profile { uint64_t wait_ms, read_ms, run_ms; };
+static JSValue load_browser_bindings(JSContext *ctx, struct bindings_profile *profile) {
     JSValue code;
+    uint64_t start = uptime_ms();
+    web_js_prepare();
+    if (bindings_job) { bindings_bytecode = js_compile_take_bytes(bindings_job, &bindings_bytecode_len); bindings_job = NULL; }
+    uint64_t ready = uptime_ms();
+    profile->wait_ms = ready - start;
     if (bindings_bytecode) {
         code = JS_ReadObject(ctx, bindings_bytecode, bindings_bytecode_len, JS_READ_OBJ_BYTECODE);
     } else {
@@ -8187,7 +8200,11 @@ static JSValue load_browser_bindings(JSContext *ctx) {
             }
         }
     }
-    return JS_IsException(code) ? code : JS_EvalFunction(ctx, code);
+    uint64_t read = uptime_ms();
+    profile->read_ms = read - ready;
+    JSValue result = JS_IsException(code) ? code : JS_EvalFunction(ctx, code);
+    profile->run_ms = uptime_ms() - read;
+    return result;
 }
 void web_js_start(web_doc *d, const struct web_host *host) {
     struct web_js_state *s = calloc(1, sizeof *s); if (!s) return;
@@ -8313,7 +8330,8 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
        under QEMU. Keep startup bounded separately from the page task watchdog. */
     s->starting = true; begin_task(s);
     if(!s->runtime_previous)s->task_deadline = uptime_ms() + JS_STARTUP_MS;
-    s->hooks = load_browser_bindings(s->ctx);
+    struct bindings_profile bindings = {0};
+    s->hooks = load_browser_bindings(s->ctx, &bindings);
     if (JS_IsException(s->hooks)) { exception(s); s->hooks = JS_UNDEFINED; end_task(s); goto failed; }
     JS_SetDynamicCodeCheck(s->ctx,trusted_code_check,s);
     if (web_atomics_isolation(s->ctx, d->cross_origin_isolated) < 0) { exception(s); end_task(s); goto failed; }
@@ -8343,9 +8361,11 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     /* A script-disabled sandbox realm stays active for its same-origin
        embedder; its own scripts are refused by sandbox_flags, not by
        retiring the realm. */
-    char limits[224];
-    snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms; realm setup %llu ms",
-             JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)(uptime_ms()-initialized));
+    char limits[288];
+    snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms; "
+             "realm setup %llu ms (bindings: compiler wait %llu, read %llu, run %llu)",
+             JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)(uptime_ms()-initialized),
+             (unsigned long long)bindings.wait_ms,(unsigned long long)bindings.read_ms,(unsigned long long)bindings.run_ms);
     log_text(s,0,limits);return;
 failed:
     s->starting = false;

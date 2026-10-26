@@ -36,7 +36,7 @@ struct js_compile {
     struct js_compile_stats stats;
     volatile uint32_t done;
     unsigned refs;            /* the document's and the compiler's */
-    bool dropped, watched;
+    bool dropped, watched, platform;
     n_handle queue;
     uint64_t token;
 };
@@ -95,7 +95,10 @@ static void keep(struct js_bytecode *code) {
 /* The bytecode written into plain memory: the runtime's allocator counts its
    own heap and must not be freed into from other threads. */
 static struct js_bytecode *compile(JSContext *ctx, const struct js_compile *job) {
+    JSRuntime *rt = JS_GetRuntime(ctx); int strip = JS_GetStripInfo(rt);
+    if (job->platform) JS_SetStripInfo(rt, strip | JS_STRIP_SOURCE);
     JSValue fn = JS_Eval(ctx, job->source, job->len, job->url, JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    JS_SetStripInfo(rt, strip);
     if (JS_IsException(fn)) { JS_FreeValue(ctx, JS_GetException(ctx)); return NULL; }
     size_t size = 0;
     uint8_t *bytes = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
@@ -159,9 +162,9 @@ static void start_compilers(void) {
     }
 }
 
-struct js_compile *js_compile_start(const char *source, size_t len, const char *url, const char *origin) {
+static struct js_compile *queue_job(const char *source, size_t len, const char *url, const char *origin, bool platform) {
     call_once(&started, start_compilers);
-    if (!compilers || !source || !url || len < JS_COMPILE_MIN_BYTES) return NULL;
+    if (!compilers || !source || !url) return NULL;
     struct js_compile *job = calloc(1, sizeof *job);
     if (!job) return NULL;
     job->source = malloc(len + 1);
@@ -174,11 +177,18 @@ struct js_compile *js_compile_start(const char *source, size_t len, const char *
     memcpy(job->source, source, len); job->source[len] = 0; /* QuickJS reads to a NUL */
     job->len = len;
     job->refs = 2;
+    job->platform = platform;
     mtx_lock(&lock);
     *queue_tail = job; queue_tail = &job->next;
     cnd_signal(&queued);
     mtx_unlock(&lock);
     return job;
+}
+struct js_compile *js_compile_start(const char *source, size_t len, const char *url, const char *origin) {
+    return len < JS_COMPILE_MIN_BYTES ? NULL : queue_job(source, len, url, origin, false);
+}
+struct js_compile *js_compile_platform(const char *source, size_t len, const char *name) {
+    return queue_job(source, len, name, NULL, true);
 }
 bool js_compile_done(const struct js_compile *job) {
     return __atomic_load_n(&job->done, __ATOMIC_ACQUIRE) != 0;
@@ -204,6 +214,15 @@ JSValue js_compile_take(JSContext *ctx, struct js_compile *job, struct js_compil
     if (stats) *stats = job->stats;
     end(job);
     return fn;
+}
+uint8_t *js_compile_take_bytes(struct js_compile *job, size_t *size) {
+    while (!js_compile_done(job)) wait_on_address(&job->done, 0, UINT32_MAX);
+    /* A platform job has no origin, so its bytecode was never kept: the job
+       holds it alone and hands the bytes over without a copy. */
+    uint8_t *bytes = NULL;
+    if (job->code) { bytes = job->code->bytes; *size = job->code->size; job->code->bytes = NULL; }
+    end(job);
+    return bytes;
 }
 void js_compile_drop(struct js_compile *job) {
     if (job) end(job);

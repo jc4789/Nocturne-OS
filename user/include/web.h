@@ -231,6 +231,10 @@ bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
 void web_history_event(web_doc *d, const char *old_url, bool popstate);
 void web_visibility_event(web_doc *d);
+/* Optional, once at startup: compiles the platform's script bindings on another
+   CPU while the host opens its window and fetches the first page, so that the
+   first document with script does not compile them on its own thread. */
+void web_js_prepare(void);
 web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
                   const struct web_host *host);
 web_doc *web_live_response(const char *html,size_t len,const char *url,const char *charset,

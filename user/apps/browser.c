@@ -2960,6 +2960,7 @@ int main(int argc, char **argv) {
         free(console_startup);
         return 2;
     }
+    web_js_prepare(); /* while the window opens and the first page is fetched */
     int sw = 1024, sh = 768;
     screen_size(&sw, &sh);
     web_avmedia_debug(debug_js);

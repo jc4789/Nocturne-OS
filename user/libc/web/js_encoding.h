@@ -26,6 +26,13 @@ JSValue web_js_encode_utf8_into(JSContext *ctx, int argc, JSValueConst *argv);
    string (encoded as encodeUTF8 does) or a byte view; prepare as for decoding. */
 JSValue web_js_concat_utf8(JSContext *ctx, int argc, JSValueConst *argv,
                            void (*prepare)(JSContext *, size_t));
+/* host.btoa(string) / host.atob(string): HTML's base64 of a binary string and
+   its forgiving-base64 decode, or null where HTML throws InvalidCharacterError
+   (a code unit above U+00FF; invalid base64); prepare as for decoding. */
+JSValue web_js_btoa(JSContext *ctx, int argc, JSValueConst *argv,
+                    void (*prepare)(JSContext *, size_t));
+JSValue web_js_atob(JSContext *ctx, int argc, JSValueConst *argv,
+                    void (*prepare)(JSContext *, size_t));
 /* Shared private Fetch data URL conversion; caller supplies its realm-safe
  * native cancellation hook. Never interpret an isolated realm's opaque as a
  * document state. */

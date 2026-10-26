@@ -27,6 +27,10 @@ struct js_compile_stats {
    NULL when no compiler takes it (a small script among them): the caller
    compiles it itself. */
 struct js_compile *js_compile_start(const char *source, size_t len, const char *url, const char *origin);
+/* Starts compiling the browser's own checked-in source as name, at any size,
+   with its source text stripped: Function.prototype.toString gives its
+   functions NativeFunction syntax. NULL as for js_compile_start. */
+struct js_compile *js_compile_platform(const char *source, size_t len, const char *name);
 bool js_compile_done(const struct js_compile *job);
 /* Ends a wait on queue when job finishes. False when that cannot be arranged:
    the job finished first, or the queue refused the watch. */
@@ -36,5 +40,9 @@ bool js_compile_watch(struct js_compile *job, n_handle queue);
    source itself so that the error belongs to its own realm. stats may be
    NULL. Ends job. */
 JSValue js_compile_take(JSContext *ctx, struct js_compile *job, struct js_compile_stats *stats);
+/* A platform job's bytecode itself, for the caller to read into each of its
+   realms and free; waits as js_compile_take does. NULL when compiling failed.
+   Ends job. */
+uint8_t *js_compile_take_bytes(struct js_compile *job, size_t *size);
 /* Ends job without its result. */
 void js_compile_drop(struct js_compile *job);

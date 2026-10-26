@@ -1574,6 +1574,7 @@ const struct propdef *css_prop_lookup(const char *name, size_t n) {
 int css_prop_count(void) { return NPROPS; }
 const char *css_prop_name(int index,bool *longhand) {
     if(index<0||index>=NPROPS)return NULL;
+    props_init();
     if(longhand)*longhand=props[index].type!=PT_SHORT;
     return props[index].name;
 }

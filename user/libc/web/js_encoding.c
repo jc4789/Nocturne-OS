@@ -1,5 +1,6 @@
 #include "js_encoding.h"
 #include "webi.h"
+#include "png.h"
 #include <limits.h>
 
 /* Validate WHATWG scalar UTF-8 before using QuickJS's string constructor:
@@ -214,6 +215,69 @@ done:
     return result;
 }
 
+/* A binary string's code units up to U+00FF are one UTF-8 byte below 0x80
+   and two (lead C2 or C3) above it; any other lead is a larger code unit. */
+JSValue web_js_btoa(JSContext *ctx, int argc, JSValueConst *argv,
+                    void (*prepare)(JSContext *, size_t)) {
+    if(argc<1||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"btoa requires a string");
+    size_t length=0;
+    const char *text=JS_ToCStringLen(ctx,&length,argv[0]);
+    if(!text)return JS_EXCEPTION;
+    uint8_t *bytes=js_malloc(ctx,length?length:1);
+    if(!bytes){JS_FreeCString(ctx,text);return JS_EXCEPTION;}
+    size_t n=0;bool binary=true;
+    for(size_t i=0;i<length&&binary;i++){
+        unsigned c=(unsigned char)text[i];
+        if(c<0x80)bytes[n++]=(uint8_t)c;
+        else if((c==0xc2||c==0xc3)&&i+1<length)bytes[n++]=(uint8_t)(((c&3)<<6)|((unsigned char)text[++i]&0x3f));
+        else binary=false;
+    }
+    JS_FreeCString(ctx,text);
+    if(!binary){js_free(ctx,bytes);return JS_NULL;}
+    size_t encoded=0;
+    char *out=base64_encode(bytes,n,&encoded);
+    js_free(ctx,bytes);
+    if(!out)return JS_ThrowOutOfMemory(ctx);
+    if(prepare)prepare(ctx,encoded);
+    JSValue result=JS_NewStringLen(ctx,out,encoded);
+    free(out);
+    return result;
+}
+
+JSValue web_js_atob(JSContext *ctx, int argc, JSValueConst *argv,
+                    void (*prepare)(JSContext *, size_t)) {
+    if(argc<1||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"atob requires a string");
+    size_t length=0;
+    const char *text=JS_ToCStringLen(ctx,&length,argv[0]);
+    if(!text)return JS_EXCEPTION;
+    /* The decoded bytes are at most 3/4 of the input; room for each as two
+       UTF-8 bytes. */
+    uint8_t *bytes=js_malloc(ctx,length+length/2u+8u);
+    if(!bytes){JS_FreeCString(ctx,text);return JS_EXCEPTION;}
+    memcpy(bytes,text,length);
+    JS_FreeCString(ctx,text);
+    size_t n=length,high=0;
+    /* A non-ASCII code unit is never a base64 digit, so its UTF-8 bytes fail. */
+    if(web_base64_decode(bytes,&n,NULL,NULL)!=1){js_free(ctx,bytes);return JS_NULL;}
+    for(size_t i=0;i<n;i++)high+=bytes[i]>>7;
+    /* Each byte is one code unit; widen those above 0x7F, from the end. */
+    for(size_t from=n,to=n+high;from<to;){
+        uint8_t b=bytes[--from];
+        if(b<0x80)bytes[--to]=b;
+        else{bytes[--to]=(uint8_t)(0x80|(b&0x3f));bytes[--to]=(uint8_t)(0xc0|(b>>6));}
+    }
+    if(prepare)prepare(ctx,n+high);
+    JSValue result=JS_NewStringLen(ctx,(const char *)bytes,n+high);
+    js_free(ctx,bytes);
+    return result;
+}
+
+static JSValue isolated_btoa(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_btoa(ctx,argc,argv,NULL);
+}
+static JSValue isolated_atob(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_atob(ctx,argc,argv,NULL);
+}
 static JSValue isolated_decode_utf8(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)self;return web_js_decode_utf8(ctx,argc,argv,NULL);
 }
@@ -232,7 +296,9 @@ void web_js_encoding_init_isolated(JSContext *ctx, JSValue host) {
         JS_CFUNC_DEF("decodeUTF8",5,isolated_decode_utf8),
         JS_CFUNC_DEF("encodeUTF8",1,isolated_encode_utf8),
         JS_CFUNC_DEF("encodeUTF8Into",4,isolated_encode_utf8_into),
-        JS_CFUNC_DEF("concatUTF8",1,isolated_concat_utf8)
+        JS_CFUNC_DEF("concatUTF8",1,isolated_concat_utf8),
+        JS_CFUNC_DEF("btoa",1,isolated_btoa),
+        JS_CFUNC_DEF("atob",1,isolated_atob)
     };
     JS_SetPropertyFunctionList(ctx,host,functions,sizeof functions/sizeof *functions);
 }

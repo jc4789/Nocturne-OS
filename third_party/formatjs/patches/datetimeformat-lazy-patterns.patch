@@ -1,0 +1,132 @@
+Nocturne patch to @formatjs/intl-datetimeformat 7.8.1, applied by
+scripts/build_intl.py to a staged copy; the vendored file stays as published.
+
+The first DateTimeFormat of a realm parses every format of its calendar
+(760 for English Gregorian, with 2,995 range patterns) although the format
+matchers read only the fields of each skeleton. parseDateTimeSkeleton now
+keeps those fields eager and processes a format's pattern, 12-hour pattern
+and range patterns the first time one of them is read, as ordinary data
+properties from then on. In the host QuickJS harness the first construction
+went from 95 ms to 18 ms, and 1,861 option sets in en, ja, en-GB and
+ja-JP-u-ca-japanese gave identical resolvedOptions, format, formatToParts,
+formatRange and formatRangeToParts results.
+
+--- a/source/@formatjs/intl-datetimeformat/polyfill-force.js
++++ b/source/@formatjs/intl-datetimeformat/polyfill-force.js
+@@ -1715,46 +1715,96 @@
+ 	}
+ 	return [withoutPeriod.trim(), pattern12];
+ }
+-function parseDateTimeSkeleton(skeleton, rawPattern = skeleton, rangePatterns, intervalFormatFallback) {
+-	const result = Object.assign(Object.create(null), {
+-		pattern: "",
+-		pattern12: "",
+-		skeleton,
+-		rawPattern,
+-		rangePatterns: Object.create(null),
+-		rangePatterns12: Object.create(null)
+-	});
++/**
++* Nocturne: a calendar's hundreds of formats are parsed together, and the
++* format matchers read only the fields of their skeletons. The pattern, the
++* 12-hour pattern and the range patterns of a format are processed the first
++* time one of them is read, then kept as ordinary data properties.
++*/
++const lazyFormats = /* @__PURE__ */ new WeakMap();
++function lazyFormatPatterns(format) {
++	const state = lazyFormats.get(format);
++	if (!state.patterns) {
++		const fields = Object.create(null);
++		state.patterns = processDateTimePattern(state.rawPattern, fields);
++		patternFields.set(format, fields);
++	}
++	return state.patterns;
++}
++function lazyFormatRanges(format) {
++	const state = lazyFormats.get(format);
++	if (state.ranges) return state.ranges;
++	const { rangePatterns, intervalFormatFallback } = state;
++	const ranges = state.ranges = [Object.create(null), Object.create(null)];
+ 	if (rangePatterns) for (const k in rangePatterns) {
+ 		const key = skeletonTokenToTable2(k);
+ 		const rawPattern = rangePatterns[k];
+ 		const intervalResult = Object.assign(Object.create(null), { patternParts: [] });
+ 		const [pattern, pattern12] = processDateTimePattern(rawPattern, intervalResult);
+-		result.rangePatterns[key] = {
++		ranges[0][key] = {
+ 			...intervalResult,
+ 			patternParts: splitRangePattern(pattern)
+ 		};
+-		result.rangePatterns12[key] = {
++		ranges[1][key] = {
+ 			...intervalResult,
+ 			patternParts: splitRangePattern(pattern12)
+ 		};
+ 	}
+ 	if (intervalFormatFallback) {
+ 		const patternParts = splitFallbackRangePattern(intervalFormatFallback);
+-		result.rangePatterns.default = { patternParts };
+-		result.rangePatterns12.default = { patternParts };
++		ranges[0].default = { patternParts };
++		ranges[1].default = { patternParts };
+ 	}
+-	replaceDateTimeTokens(skeleton, result);
+-	const fields = Object.create(null);
+-	const [pattern, pattern12] = processDateTimePattern(rawPattern, fields);
+-	patternFields.set(result, fields);
+-	result.pattern = pattern;
+-	result.pattern12 = pattern12;
++	const pattern = lazyFormatPatterns(format)[0];
+ 	const yearFields = ["{relatedYear}", "{yearName}"].filter((field) => pattern.includes(field));
+-	if (yearFields.length) for (const patterns of [result.rangePatterns, result.rangePatterns12]) for (const field of Object.keys(patterns)) {
++	if (yearFields.length) for (const patterns of ranges) for (const field of Object.keys(patterns)) {
+ 		if (field === "default") continue;
+ 		const range = patterns[field].patternParts.map((part) => part.pattern).join("");
+ 		if (yearFields.some((yearField) => !range.includes(yearField))) delete patterns[field];
+ 	}
++	return ranges;
++}
++function lazyFormatProperty(name, compute) {
++	const settle = (format, value) => Object.defineProperty(format, name, {
++		value,
++		writable: true,
++		enumerable: true,
++		configurable: true
++	});
++	return {
++		get() {
++			const value = compute(this);
++			settle(this, value);
++			return value;
++		},
++		set(value) {
++			settle(this, value);
++		},
++		enumerable: true,
++		configurable: true
++	};
++}
++const lazyFormatPattern = {
++	pattern: lazyFormatProperty("pattern", (format) => lazyFormatPatterns(format)[0]),
++	pattern12: lazyFormatProperty("pattern12", (format) => lazyFormatPatterns(format)[1])
++};
++const lazyFormatRange = {
++	rangePatterns: lazyFormatProperty("rangePatterns", (format) => lazyFormatRanges(format)[0]),
++	rangePatterns12: lazyFormatProperty("rangePatterns12", (format) => lazyFormatRanges(format)[1])
++};
++function parseDateTimeSkeleton(skeleton, rawPattern = skeleton, rangePatterns, intervalFormatFallback) {
++	const result = Object.defineProperties(Object.create(null), lazyFormatPattern);
++	result.skeleton = skeleton;
++	result.rawPattern = rawPattern;
++	Object.defineProperties(result, lazyFormatRange);
++	lazyFormats.set(result, {
++		rawPattern,
++		rangePatterns,
++		intervalFormatFallback,
++		patterns: null,
++		ranges: null
++	});
++	replaceDateTimeTokens(skeleton, result);
+ 	return result;
+ }
+ function splitFallbackRangePattern(pattern) {

@@ -9,7 +9,17 @@ Unicode/CLDR and IANA notices are retained alongside them.
 The browser uses the generated `user/libc/web/js_intl.js`. It does not use Node,
 host locale facilities, a POSIX layer, or any new Nocturne system call.
 To regenerate, provide the host esbuild 0.28.2 executable to
-`python scripts/build_intl.py --esbuild /path/to/esbuild`.
+`python scripts/build_intl.py --esbuild /path/to/esbuild`; `--check` compares
+the result with the checked-in bundle instead of writing it. The script checks
+the vendored files against `manifest.json`, copies them to `build/nocturne-intl`
+and applies `patches/*.patch` there in name order, so the vendored files stay as
+published and each Nocturne change is a reviewable diff with its reason.
+
+`patches/datetimeformat-lazy-patterns.patch` defers parsing a format's pattern,
+12-hour pattern and range patterns until one of them is read. The first
+DateTimeFormat of a realm otherwise parses every format of its calendar
+(760 English Gregorian formats with 2,995 range patterns) although the format
+matchers read only skeleton fields; the patch header records the comparison.
 
 The bundle provides getCanonicalLocales, Locale, PluralRules, NumberFormat,
 DateTimeFormat, RelativeTimeFormat, ListFormat and DisplayNames, with English and

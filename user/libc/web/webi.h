@@ -1276,3 +1276,7 @@ struct web_data_url { unsigned char *body; size_t length; char *mime; };
 int web_data_url_process(const char *url, struct web_data_url *out,
                          bool (*checkpoint)(void *), void *opaque);
 void web_data_url_free(struct web_data_url *data);
+/* Infra's forgiving-base64 decode of data[0..*length), in place; *length
+ * becomes the decoded length. Return 1, 0 for invalid input, -2 when the
+ * optional checkpoint cancels. Shared by data URLs and atob(). */
+int web_base64_decode(uint8_t *data, size_t *length, bool (*checkpoint)(void *), void *opaque);

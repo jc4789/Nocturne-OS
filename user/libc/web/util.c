@@ -424,14 +424,17 @@ int web_data_url_process(const char *url,struct web_data_url *out,bool (*checkpo
         if(*p=='%'&&end-p>=3&&(hi=web_hex_digit((unsigned char)p[1]))>=0&&(lo=web_hex_digit((unsigned char)p[2]))>=0){out->body[n++]=(unsigned char)((hi<<4)|lo);p+=2;}
         else out->body[n++]=(unsigned char)*p;
     }
-    if(base64){
-        size_t count=0;for(size_t i=0;i<n;i++){if(!data_step(&work)){result=-2;goto failed;}if(!data_ascii_space(out->body[i]))out->body[count++]=out->body[i];}n=count;
-        if(n%4==0&&n&&out->body[n-1]=='='){n--;if(n&&out->body[n-1]=='=')n--;}
-        if(n%4==1){result=0;goto failed;}
-        unsigned bits=0,buffer=0;count=0;
-        for(size_t i=0;i<n;i++){if(!data_step(&work)){result=-2;goto failed;}int digit=data_base64_digit(out->body[i]);if(digit<0){result=0;goto failed;}buffer=(buffer<<6)|(unsigned)digit;bits+=6;if(bits>=8){bits-=8;out->body[count++]=(unsigned char)(buffer>>bits);}}n=count;
-    }
+    if(base64&&(result=web_base64_decode((uint8_t *)out->body,&n,work.check,work.opaque))!=1)goto failed;
     out->body[n]=0;out->length=n;return 1;
 failed:
     web_data_url_free(out);return result;
+}
+int web_base64_decode(uint8_t *data,size_t *length,bool (*check)(void *),void *opaque) {
+    struct data_work work={check,opaque,0};size_t n=*length,count=0;
+    for(size_t i=0;i<n;i++){if(!data_step(&work))return -2;if(!data_ascii_space(data[i]))data[count++]=data[i];}n=count;
+    if(n%4==0&&n&&data[n-1]=='='){n--;if(n&&data[n-1]=='=')n--;}
+    if(n%4==1)return 0;
+    unsigned bits=0,buffer=0;count=0;
+    for(size_t i=0;i<n;i++){if(!data_step(&work))return -2;int digit=data_base64_digit(data[i]);if(digit<0)return 0;buffer=(buffer<<6)|(unsigned)digit;bits+=6;if(bits>=8){bits-=8;data[count++]=(uint8_t)(buffer>>bits);buffer&=(1u<<bits)-1;}}
+    *length=count;return 1;
 }

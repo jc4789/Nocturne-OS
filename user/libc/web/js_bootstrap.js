@@ -916,7 +916,16 @@
     };
     function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
     const styleToken={},styleRecords=new WeakMap(),cssPropertyMetadata=host.cssProperties();
-    const computedLonghands=cssPropertyMetadata.filter(p=>p[1]).map(p=>p[0]).sort((a,b)=>a.startsWith('-')!==b.startsWith('-')?(a.startsWith('-')?1:-1):a<b?-1:a>b?1:0);
+    /* CSSOM lists computed longhands in code-unit order with prefixed names
+       last; the native table is already in code-unit order. Built on first
+       enumeration, not in every realm's bootstrap. */
+    let computedLonghands=null;
+    function longhandNames(){
+        if(computedLonghands)return computedLonghands;
+        const names=[],prefixed=[];
+        for(const [name,longhand] of cssPropertyMetadata)if(longhand)(name[0]==='-'?prefixed:names).push(name);
+        return computedLonghands=names.concat(prefixed);
+    }
     function styleRecord(value){const record=styleRecords.get(value);if(!record)throw new TypeError('Invalid CSSStyleDeclaration receiver');return record;}
     function styleProperty(name){name=String(name);return name.startsWith('--')?name:name.toLowerCase();}
     function styleNames(value){
@@ -924,7 +933,7 @@
         if(!record.computed)return (reflectedAttr(record.node,'style')||'').split(';').filter(x=>x.includes(':')).map(x=>x.split(':')[0].trim());
         const custom=host.cssProperties(record.node,record.pseudo);if(custom===null)return [];
         const names=[],seen=new Set();for(const [name,valid] of custom){if(seen.has(name))continue;seen.add(name);if(valid)names.push(name);}
-        return computedLonghands.concat(names);
+        return longhandNames().concat(names);
     }
     function styleRead(value,name){const record=styleRecord(value);return record.computed?
         dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
