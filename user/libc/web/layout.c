@@ -2838,6 +2838,7 @@ struct gitem {
     box_t *b;
     int r0, r1, c0, c1;  /* rows [r0, r1) and columns [c0, c1); r0/c0 -1 while auto */
     float mn, mx, h;    /* column contributions (margin box) and the laid-out margin-box height */
+    float cmin, rmin;   /* the column and row minimum contributions (gr_minimum) */
 };
 
 struct gtr {
@@ -2851,6 +2852,24 @@ struct grid {
     struct gitem *it;
     struct gtr *row, *col;
 };
+
+/* An item's minimum contribution to the tracks [s0, s1) of one axis (css-grid-2 §6.6). content is
+   its min-content contribution, which a definite preferred size keeps. Otherwise the used minimum
+   size decides: lo (-1 for none) plus ext, the axis' padding, border and margins. An auto minimum is
+   content-based only for an item that is no scroll container and spans an auto-minimum track, but no
+   flexible track when it spans several: a sidebar spanning a 1fr row scrolls inside it. */
+static float gr_minimum(const box_t *c, const struct gtr *tr, int s0, int s1, const len_t *size, const len_t *min,
+                        float lo, float content, float ext) {
+    if ((size->kind == LK_LEN || size->kind == LK_EXPR) && !len_has_pct(size)) return content;
+    if (!len_auto(min)) return (lo > 0 ? lo : 0) + ext;
+    if (c->st->overflow != OV_VISIBLE && c->st->overflow != OV_CLIP) return ext;
+    bool auto_min = false, flex = false;
+    for (int k = s0; k < s1; k++) {
+        auto_min |= tr[k].t.min_kind == GT_AUTO;
+        flex |= tr[k].t.max_kind == GT_FR;
+    }
+    return auto_min && (s1 - s0 == 1 || !flex) ? content : ext;
+}
 
 /* an area edge: the first line of name (or of name-start), or the line after it for an end edge */
 static int gr_area_line(const struct gareas *a, const char *name, bool col, bool end) {
@@ -3121,6 +3140,16 @@ static void gr_setup(struct grid *g, box_t *b, float cw) {
 
 static bool gr_intrinsic_kind(int k) { return k == GT_AUTO || k == GT_MIN || k == GT_MAX; }
 
+/* What a track's auto minimum takes from an item (css-grid-2 §12.5): its minimum contribution lo,
+   or, while the grid is sized under a min-/max-content constraint, its min-content contribution mn
+   limited by a fixed maximum and floored by lo. Min-content and max-content minimums take mn and
+   the max-content contribution themselves. */
+static float gr_auto_minimum(const struct gtrack *t, float mn, float lo, bool constrained, float pct) {
+    if (!constrained) return lo;
+    if (t->max_kind == GT_LEN || t->max_kind == GT_FIT) mn = fminf_(mn, len_resolve(&t->max, pct < 0 ? 0 : pct));
+    return fmaxf_(mn, lo);
+}
+
 /* size the tracks of one axis. avail: the definite space, or -1 (then sized for max-content, or
    min-content when min is set). pct: the base for percentages, or -1. */
 static void gr_size(struct gtr *tr, int nt, float gap, struct gitem *it, int n, bool col, float avail, bool min,
@@ -3139,15 +3168,17 @@ static void gr_size(struct gtr *tr, int nt, float gap, struct gitem *it, int n, 
         if (t->collapsed) t->base = t->limit = 0;
     }
     /* contributions of items spanning one track, then of spanning items by increasing span */
+    bool constrained = avail < 0;
     int maxspan = 1;
     for (int i = 0; i < n; i++) {
         int s0 = col ? it[i].c0 : it[i].r0, s1 = col ? it[i].c1 : it[i].r1;
-        float mn = col ? it[i].mn : it[i].h, mx = col ? it[i].mx : it[i].h;
+        float mn = col ? it[i].mn : it[i].h, mx = col ? it[i].mx : it[i].h, lo = col ? it[i].cmin : it[i].rmin;
         if (s1 - s0 > maxspan) maxspan = s1 - s0;
         if (s1 - s0 != 1) continue;
         struct gtr *t = &tr[s0];
         if (t->collapsed) continue;
-        if (t->t.min_kind == GT_AUTO || t->t.min_kind == GT_MIN) t->base = fmaxf_(t->base, mn);
+        if (t->t.min_kind == GT_AUTO) t->base = fmaxf_(t->base, gr_auto_minimum(&t->t, mn, lo, constrained, pct));
+        else if (t->t.min_kind == GT_MIN) t->base = fmaxf_(t->base, mn);
         else if (t->t.min_kind == GT_MAX) t->base = fmaxf_(t->base, mx);
         switch (t->t.max_kind) {
         case GT_AUTO: case GT_MAX: t->limit = fmaxf_(t->limit, mx); break;
@@ -3162,28 +3193,40 @@ static void gr_size(struct gtr *tr, int nt, float gap, struct gitem *it, int n, 
         for (int i = 0; i < n; i++) {
             int s0 = col ? it[i].c0 : it[i].r0, s1 = col ? it[i].c1 : it[i].r1;
             if (s1 - s0 != span) continue;
-            float mn = col ? it[i].mn : it[i].h, mx = col ? it[i].mx : it[i].h;
+            float mn = col ? it[i].mn : it[i].h, mx = col ? it[i].mx : it[i].h, lo = col ? it[i].cmin : it[i].rmin;
+            /* intrinsic minimums take the minimum contribution (the min-content one under a constraint) */
+            float need = constrained ? fmaxf_(mn, lo) : lo;
             float sb = gap * (float)(span - 1), sl = sb;
-            int nflex = 0, nint = 0, nlim = 0;
+            int nflex = 0, nint = 0, ncontent = 0, nlim = 0;
             for (int k = s0; k < s1; k++) {
                 sb += tr[k].base;
                 sl += tr[k].limit;
                 nflex += tr[k].flex;
                 nint += gr_intrinsic_kind(tr[k].t.min_kind) && !tr[k].flex;
+                ncontent += (tr[k].t.min_kind == GT_MIN || tr[k].t.min_kind == GT_MAX) && !tr[k].flex;
                 nlim += !tr[k].flex && tr[k].t.max_kind != GT_LEN;
             }
             if (nflex) { /* grow the flexible tracks */
                 for (int k = s0; k < s1; k++)
                     if (tr[k].flex) tr[k].fmax = fmaxf_(tr[k].fmax, (mx - sl) / (float)nflex + tr[k].base);
-                if (mn > sb)
+                if (need > sb)
                     for (int k = s0; k < s1; k++)
-                        if (tr[k].flex && tr[k].t.min_kind != GT_LEN) tr[k].base += (mn - sb) / (float)nflex;
+                        if (tr[k].flex && tr[k].t.min_kind != GT_LEN) tr[k].base += (need - sb) / (float)nflex;
                 continue;
             }
-            if (mn > sb && nint)
+            if (need > sb && nint)
                 for (int k = s0; k < s1; k++)
                     if (gr_intrinsic_kind(tr[k].t.min_kind)) {
-                        tr[k].base += (mn - sb) / (float)nint;
+                        tr[k].base += (need - sb) / (float)nint;
+                        if (tr[k].limit < tr[k].base) tr[k].limit = tr[k].base;
+                    }
+            /* then min-content and max-content minimums take the min-content contribution */
+            sb = gap * (float)(span - 1);
+            for (int k = s0; k < s1; k++) sb += tr[k].base;
+            if (mn > sb && ncontent)
+                for (int k = s0; k < s1; k++)
+                    if (tr[k].t.min_kind == GT_MIN || tr[k].t.min_kind == GT_MAX) {
+                        tr[k].base += (mn - sb) / (float)ncontent;
                         if (tr[k].limit < tr[k].base) tr[k].limit = tr[k].base;
                     }
             sl = gap * (float)(span - 1);
@@ -3282,12 +3325,11 @@ static float gr_positions(struct gtr *tr, int nt, float gap, float start, float 
 static void gr_contributions(struct grid *g) {
     for (int i = 0; i < g->n; i++) {
         if (!layout_checkpoint()) return;
-        box_t *c = g->it[i].b;
-        outer_intrinsic(c, &g->it[i].mn, &g->it[i].mx);
-        /* scroll containers have no content-based minimum */
-        if (c->st->overflow != OV_VISIBLE && !(c->st->width.kind == LK_LEN && !len_has_pct(&c->st->width)) &&
-            spec_w(c, &c->st->min_width, -1) < 0)
-            g->it[i].mn = hext(c) + c->m[1] + c->m[3];
+        struct gitem *t = &g->it[i];
+        box_t *c = t->b;
+        outer_intrinsic(c, &t->mn, &t->mx);
+        t->cmin = gr_minimum(c, g->col, t->c0, t->c1, &c->st->width, &c->st->min_width,
+                             spec_w(c, &c->st->min_width, -1), t->mn, hext(c) + c->m[1] + c->m[3]);
     }
 }
 
@@ -3367,6 +3409,8 @@ static void layout_grid(box_t *b, float defh) {
         if(!laid_out && !(c->kind==B_ATOMIC && c->atomic!=AT_INLINE_BLOCK))
             layout_inner(c,NULL,0,0,-1);
         g.it[i].h=c->h+vext(c)+c->m[0]+c->m[2];
+        g.it[i].rmin=gr_minimum(c,g.row,g.it[i].r0,g.it[i].r1,&c->st->height,&c->st->min_height,
+                                spec_h(c,&c->st->min_height,-1),g.it[i].h,vext(c)+c->m[0]+c->m[2]);
     }
     /* rows */
     gr_size(g.row, g.nr, st->gap_row, g.it, g.n, false, defh, false, defh);
