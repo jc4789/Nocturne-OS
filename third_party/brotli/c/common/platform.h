@@ -26,9 +26,7 @@
 
 #include <string.h>  /* IWYU pragma: export memcmp, memcpy, memset */
 #include <stdlib.h>  /* IWYU pragma: export exit, free, malloc */
-#if !defined(__STDC_HOSTED__) || __STDC_HOSTED__
 #include <sys/types.h>  /* should include endian.h for us */
-#endif /* Nocturne (freestanding): byte order comes from the compiler's macros */
 
 #include <brotli/port.h>  /* IWYU pragma: export */
 #include <brotli/types.h>  /* IWYU pragma: export */
