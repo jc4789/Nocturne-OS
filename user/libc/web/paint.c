@@ -2539,9 +2539,9 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     uint32_t bg = doc_canvas_bg(d, &from);
     P.canvas_bg = bg;
     P.canvas_group = d->html && d->html->style && (d->html->style->filter || d->html->style->opacity < 1);
-    /* a translucent canvas background is drawn over white */
+    /* a translucent canvas background is drawn over white, an opaque one alone */
     if (!P.failed) {
-        gfx_fill(c, x, y, w, h, RGB(255, 255, 255));
+        if (P.canvas_group || bg >> 24 != 255) gfx_fill(c, x, y, w, h, RGB(255, 255, 255));
         if (!P.canvas_group) gfx_fill_blend(c, x, y, w, h, bg);
     }
     P.canvas_bg_from = (uint32_t)from;

@@ -34,8 +34,11 @@ static web_doc *fullscreen_doc,*pip_doc;
 static web_direct *direct;
 static bool direct_wanted, direct_shown;
 /* The page's rendering opportunities are the display's frames (host.display_frames): frame_asked while
-   the window waits for the one asked of it (ui_window_frame, answered by UI_EVENT_FRAME). */
-static bool frame_asked;
+   the window waits for the one asked of it (ui_window_frame, answered by UI_EVENT_FRAME).
+   picture_pending from a picture of the page to the frame that shows it: the next picture of the
+   document waits for that frame, so that the page changes at most once a frame however many tasks
+   change it in between. */
+static bool frame_asked, picture_pending;
 static web_node *pip_node;
 static window_t *pip_window;
 static uint64_t pip_revision;
@@ -514,6 +517,11 @@ static bool direct_frame(void) {
     return shown >= 0;
 }
 
+/* After a picture of the page is sent: the frame that shows it is asked for. */
+static void picture_sent(void) {
+    if (!frame_asked) frame_asked = ui_window_frame(ui, WINDOW) == 0;
+    picture_pending = frame_asked;
+}
 static void redraw(void) {
     if(doc){int x,y,width,height;(void)web_take_paint_damage(doc,&x,&y,&width,&height);}
     if (!view.px) { need_paint = false; show_chrome(); return; }
@@ -522,6 +530,7 @@ static void redraw(void) {
     draw();
     uint64_t drawn = debug_js ? n_clock_uptime_ms() : 0;
     ui_surface_changed(ui, VIEW);
+    picture_sent();
     show_chrome();
     if (debug_js) {
         loop_profile.draw_ms += drawn - start;
@@ -541,6 +550,7 @@ static void redraw_damage(void){
     draw_page();view=original;
     uint64_t drawn=debug_js?n_clock_uptime_ms():0;
     ui_surface_changed_rect(ui,VIEW,x,y,width,height);
+    picture_sent();
     if(debug_js){loop_profile.partial_draws++;loop_profile.partial_ms+=drawn-start;
         loop_profile.partial_update_ms+=n_clock_uptime_ms()-drawn;}
 }
@@ -916,6 +926,27 @@ static char *image_page(const char *url) {
 }
 
 /* ---------------------------------------------------------------- navigation */
+static int anchor(const char *url) {
+    const char *h = strchr(url, '#');
+    if (!h || !doc) return -1;
+    /* Native fragment selection owns decoding. Pass the full fragment once:
+       neither a fixed scratch truncation nor a second percent-decode may
+       select a different element. */
+    return web_anchor_y(doc, h + 1);
+}
+
+/* A new document's position (its fragment's, or where history left it) is taken by the first
+   layout that reaches it, whichever path laid the page out. */
+static void initial_scroll(void) {
+    if (!initial_scroll_pending) return;
+    if (initial_scroll_anchor) {
+        int y = anchor(cur_url);
+        if (y >= 0) { scroll_to(y); initial_scroll_pending = false; }
+    } else if (max_scroll() >= initial_scroll_y && max_scroll_x() >= initial_scroll_x) {
+        scroll_to_xy(initial_scroll_x,initial_scroll_y); initial_scroll_pending = false;
+    }
+}
+
 static void relayout(void) {
     if (!doc) return;
     uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
@@ -924,6 +955,7 @@ static void relayout(void) {
     if (debug_js) { loop_profile.layout_ms += n_clock_uptime_ms() - start; loop_profile.layouts++; }
     clamp_scroll();
     need_layout = false;
+    initial_scroll();
     devtools_refresh(false);
 }
 
@@ -1014,15 +1046,6 @@ static void history_scroll_save(void) {
 static bool same_doc(const char *a, const char *b) {
     size_t la = strcspn(a, "#"), lb = strcspn(b, "#");
     return la == lb && !strncmp(a, b, la);
-}
-
-static int anchor(const char *url) {
-    const char *h = strchr(url, '#');
-    if (!h || !doc) return -1;
-    /* Native fragment selection owns decoding. Pass the full fragment once:
-       neither a fixed scratch truncation nor a second percent-decode may
-       select a different element. */
-    return web_anchor_y(doc, h + 1);
 }
 
 enum { NAV_PUSH, NAV_RELOAD, NAV_HISTORY, NAV_REPLACE };
@@ -1507,7 +1530,7 @@ static void take_engine_events(void) {
             inbox_put((struct gui_event){.type = EV_DIRECT, .key = e.a ? 1 : 0});
             break;
         case UI_EVENT_FRAME: /* only a time: safe while a script waits on the C stack */
-            frame_asked = false;
+            frame_asked = picture_pending = false;
             if (doc) web_rendering_now(doc, e.a);
             break;
         default: break; /* the window's own size: the surface's comes as UI_EVENT_CANVAS */
@@ -2806,22 +2829,18 @@ static void document_step(uint64_t now) {
         loop_profile.ticks++;
     }
     if (quit) return;
-    bool dirty = web_dirty(doc);
-    bool media_paint = web_paint_dirty(doc);
-    if (dirty || need_layout) {
-        relayout();
-        if (initial_scroll_pending) {
-            if (initial_scroll_anchor) {
-                int y = anchor(cur_url);
-                if (y >= 0) { scroll_to(y); initial_scroll_pending = false; }
-            } else if (max_scroll() >= initial_scroll_y && max_scroll_x() >= initial_scroll_x) {
-                scroll_to_xy(initial_scroll_x,initial_scroll_y); initial_scroll_pending = false;
-            }
-        }
-        set_title();
-        redraw();
-    } else if (need_paint) redraw();
-    else if(media_paint)redraw_damage();
+    /* The rendering waits for the frame that shows the last picture: the tasks before it change
+       the page, the frame lays it out and paints it once. */
+    if (!picture_pending) {
+        bool dirty = web_dirty(doc);
+        bool media_paint = web_paint_dirty(doc);
+        if (dirty || need_layout) {
+            relayout();
+            set_title();
+            redraw();
+        } else if (need_paint) redraw();
+        else if(media_paint)redraw_damage();
+    }
     redraw_console();
     flush_dom_layout();
     if (!refresh_seen && !loading) {
