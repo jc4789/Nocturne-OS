@@ -71,7 +71,7 @@ static void setup(void){
     doc.live=true;doc.frame_parent=NULL;seeking=oom=false;accept=true;
 }
 static bool prepare(canvas_t *probe){
-    web_avmedia_snapshot_begin(&doc);snapshot_candidate=&s;
+    web_avmedia_snapshot_begin(&doc,&target);snapshot_candidate=&s;
     int x=-1,y=-1;bool r=web_avmedia_snapshot_prepare(&doc,&target,probe,&x,&y,5,7);
     if(r)check(x==2&&y==3&&probe->w==2&&probe->h==2,"resolved clip coordinates");
     return r;
@@ -111,11 +111,11 @@ int main(void){
     s.width++;snapshot_publish(&s);check(published==n,"source size mismatch rejected");s.width--;
     doc.live=false;snapshot_publish(&s);check(published==n,"retired document rejected");doc.live=true;
     accept=false;snapshot_publish(&s);check(published==n&&!s.snapshot.valid,"host rejection disarms without publication");
-    setup();canvas_t probe;web_avmedia_snapshot_begin(&doc);snapshot_candidate=&s;web_avmedia_snapshot_reject();int x,y;
+    setup();canvas_t probe;web_avmedia_snapshot_begin(&doc,&target);snapshot_candidate=&s;web_avmedia_snapshot_reject();int x,y;
     check(!web_avmedia_snapshot_prepare(&doc,&target,&probe,&x,&y,0,0),"unsafe group/frame structure rejected");web_avmedia_snapshot_finish();
-    setup();web_avmedia_snapshot_begin(&doc);snapshot_candidate=&s;s.snapshot.w=262145;
+    setup();web_avmedia_snapshot_begin(&doc,&target);snapshot_candidate=&s;s.snapshot.w=262145;
     check(!web_avmedia_snapshot_prepare(&doc,&target,&probe,&x,&y,0,0),"snapshot pixel cap fallback");web_avmedia_snapshot_finish();
-    setup();web_avmedia_snapshot_begin(&doc);snapshot_candidate=&s;oom=true;
+    setup();web_avmedia_snapshot_begin(&doc,&target);snapshot_candidate=&s;oom=true;
     check(!web_avmedia_snapshot_prepare(&doc,&target,&probe,&x,&y,0,0)&&!s.snapshot.valid,"allocation failure stays ordinary paint");web_avmedia_snapshot_finish();
     setup();check(prepare(&probe),"alpha snapshot prepare");
     web_avmedia_snapshot_probe(1);gfx_fill(&probe,0,0,2,2,RGB(40,40,40));

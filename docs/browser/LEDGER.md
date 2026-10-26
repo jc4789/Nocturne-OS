@@ -62,15 +62,24 @@
 
 | # | 欠陥 | 根拠 | 状態 |
 |---|---|---|---|
-| K1 | task_wake_address が address_lock を持ったまま object_notify を呼び、同じ錠を取りに行く（BSP が固まる） | 監査（2026-10-26） | 修理：通知を錠の外へ（未ビルド） |
-| K2 | 閉じられた待ち行列の語で AP の待ちが park したまま起きない | 監査 | 修理：解放のときに語を起こす（未ビルド） |
-| K3 | BSP の経路が取っ手で失敗すると wait_until が残り、次の待ちの期限を狂わせる | 監査 | 修理：BSP の入口で先に消費（未ビルド） |
-| K4 | 空間の停止で BSP へ戻った眠りが、はじめから寝直す | 監査 | 修理：期限を wait_until に持つ（未ビルド） |
+| K1 | task_wake_address が address_lock を持ったまま object_notify を呼び、同じ錠を取りに行く（BSP が固まる） | 監査（2026-10-26） | 修理：通知を錠の外へ（U1 と一緒にコミット済み。QEMU 4 CPU で組は動く。Hyper-V・実機は未確認） |
+| K2 | 閉じられた待ち行列の語で AP の待ちが park したまま起きない | 監査 | 修理：解放のときに語を起こす（同上） |
+| K3 | BSP の経路が取っ手で失敗すると wait_until が残り、次の待ちの期限を狂わせる | 監査 | 修理：BSP の入口で先に消費（同上） |
+| K4 | 空間の停止で BSP へ戻った眠りが、はじめから寝直す | 監査 | 修理：期限を wait_until に持つ（同上） |
 | K5 | 記憶が尽きると、予約済みの頁の後払いに枠が無く、ブラウザーと映像の Worker が segfault で落ちる | QEMU 一 CPU・512 MiB、基準も HEAD も（serial.log の `[memory] … 0 pages free`） | 未修理 |
 | K6 | 頁を移っても記憶が戻らない（7 サイトの後、ブラウザー 125→480〜580 MB、カーネルのヒープ 36→200 MB） | QEMU 4 CPU・4 GiB、基準も HEAD も | 未修理 |
-| K7 | 動画が 40〜80 秒で「問題が発生しました」になる | QEMU 4 CPU、基準も HEAD も（再現は YouTube の vuYLCMyzFD4。clh5LrNDj-o は 60 秒進んだ） | 未修理 |
-| K8 | 頁がほぼ黒く、画像と本文が出ない | QEMU 4 CPU、基準も HEAD も（再現は anthropic.com/claude-opus-5-5） | 未修理 |
-| K9 | 右の段が出ない | QEMU 4 CPU、基準も HEAD も（再現は news.yahoo.co.jp） | 未修理 |
+| K7 | 動画が 40〜80 秒で「問題が発生しました」になる | QEMU 4 CPU、基準も HEAD も（再現は YouTube の vuYLCMyzFD4。clh5LrNDj-o は 60 秒進んだ） | 層は媒体の再生ではなく、頁の証明（attestation）の JS。2026-10-26 に F12 で読むだけの fetch の記録で見た：SABR の応答の UMP の STREAM_PROTECTION_STATUS（部の番号 58）が本編では始めから 2（保留）、約 40 秒で 3（要求）になり、以後は媒体の無い 107〜160 バイトの応答だけが返る。広告は 2 の後 1（可）になる。要求の本文には証明の札（StreamerContext の 2、92 バイト、先頭 0x32）が入っている。札は作られているが、配信側が受け入れない。BotGuard の実行のどこで我々の JS・DOM が違うかは未特定。MSE の再生はその間、遅れも飢えも無く進んでいた |
+| K8 | 頁がほぼ黒く、画像と本文が出ない | QEMU 4 CPU、基準も HEAD も（再現は anthropic.com/claude-opus-5-5） | 一部：img の crossOrigin の IDL が無く WebGL の texImage2D が SecurityError だった（4001607f）。残り：SVG の text・textPath・clipPath・filter（nanosvg に無い）で大きな題が出ない、HTML の clip-path が無く畳んだ検索欄が見える、案内のボタンが線の引かれた箱になる（原因未特定） |
+| K9 | 右の段が出ない | QEMU 4 CPU、基準も HEAD も（再現は news.yahoo.co.jp） | 修理：position: sticky が無かった（f2b3755b）。QEMU で右の段が出た |
+| K10 | 格子の 1fr 行が scroll container の中身の高さまで伸び、見出しが画面の外へ出る | QEMU（再現は animate.style） | 修理：css-grid-2 §6.6 の最小の寄与（80b46118） |
+| K11 | 幅の float の最後の桁で、収まる字が「comm…」と省かれる | QEMU、基準も（再現は GitHub のファイルの一覧） | 修理：LAYOUT_FIT_SLOP（95bb56b1） |
+| K12 | display:none の下の slot に割り当てた子の CSS 動画が止まらず、毎コマ全体を描く | QEMU（再現は Reddit の静かな頁、2 秒に約 70 回・1660 ms） | 修理：e5cce4a3 で 0 回 |
+| K13 | 子の文書（iframe）の描き直しが、親の頁の全体の描画になる。隠れた枠・箱の無い枠でも | QEMU 4 CPU、--debug-js（再現は Reddit を 16 頁送った後の静かな間、2 秒に 70〜81 回の全描画） | 修理：枠の箱のインクだけを損傷にし、見えない枠は何もしない。枠の面の準備は描く範囲（clip）に絞る（変形の祖先があれば絞らない）。同じ条件で 0 回 |
+| K14 | 止まった動画・画面の外の動画が、毎拍 doc_paint_damage を出し続ける | 同上、K13 の後（2 秒に 122〜134 回の部分描画、各約 11 ms） | 修理：写しを消すと配った枚の数が 0 に戻り「未公開」が永久に真だった。写しの外の数（damaged_frames）で同じ枚の要求を一度にした。同じ条件で 0 回、待ち 1935 ms/2 s |
+| K15 | 変形（transform）の面の写しが、その範囲の動画の継ぎ当てを拒む。F12 を押すと変形の面の描画中に落ちる | QEMU（再現は Reddit）。落ちたのは並列の写しに F12 を扱う区切りの処理を渡した版 | 修理：拒むのは動画が私的な面へ描かれたときだけ（snapshot_canvas）。写しは二つの段（被覆・標本）を並列にし、区切りの処理は段の間で一度だけ。再生中の動画での継ぎ当ては未確認 |
+| K16 | --debug-js の描画の記録が、毎描画で全節点を 3 回辿る（標本の約 35%） | QEMU、prof の標本 | 修理：媒体の登録から辿る。これより前の --debug-js の数はこの分だけ重い |
+| K17 | 音量を変えると volumechange が同期で出て、受け手が同じ値を書き戻すと際限なく呼び返す。有限でない値が IndexSizeError | WPT event_volumechange・volume_nonfinite・volumechange-ratechange-queue-task | 修理（4fe6e4cf） |
+| K18 | 自前の試験の失敗 7 組：web/fonts（U+1F0A1 の代替が Plangothic の字形でない 4 件）、web/engine（filter-shadow-fixed-cb・deferred-float-definite-percent）、web/javascript（no-os-exposure、image-lazy-candidate・image-queue-*、mime-rejection-reported、modulepreload、performance）、web/shadow-dom-render、web/message-channels、web/import-maps、web/tcp-capacity-recovery | QEMU 4 CPU、この会話の 4001607f〜の各回で同じ組（test-web-grid・grid2・sticky・frame5） | 基準 b2f5b721 で同じかは未確認。image-lazy-candidate は 9184615e（10/12）で data-original の推測を外したときから試験が古い |
 
 ## 5. 受入表（browser-hikaku の組）
 

@@ -9,17 +9,10 @@ void web_paint_debug(bool enabled) { paint_debug_enabled=enabled; }
 void web_paint_debug_node_free(node_t *n) {
     if(n){free(n->paint_diagnostic);n->paint_diagnostic=NULL;}
 }
+/* Every paint visits these three times: walking all owned nodes made the
+   diagnostic itself the largest cost of a long page's paints. */
 static node_t *paint_debug_media_next(web_doc *d,node_t *previous) {
-    web_doc *family=d->dom_family?d->dom_family:d;
-    web_doc *allocation=previous?previous->allocation_doc:family;
-    node_t *n=previous?previous->owned_next:allocation->owned_nodes;
-    while(allocation) {
-        for(;n;n=n->owned_next)
-            if(n->owner==d && n->type==N_ELEM && !n->foreign && (n->tag==T_video || n->tag==T_audio))return n;
-        allocation=allocation==family?family->dom_docs:allocation->dom_next;
-        n=allocation?allocation->owned_nodes:NULL;
-    }
-    return NULL;
+    return web_avmedia_node_next(d,previous);
 }
 static void paint_debug_begin(web_doc *d) {
     static uint64_t serial;

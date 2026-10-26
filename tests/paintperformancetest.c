@@ -281,7 +281,7 @@ static int scroll_inputs(void){
     if(d){
         /* Use the real frame viewport preparation, not fabricated dimensions
            or a standalone child without its browsing-context ownership. */
-        web_frames_prepare_paint(d);web_frames_finish_paint(d);
+        web_frames_prepare_paint(d,NULL);web_frames_finish_paint(d);
         node_t *frame=by_id(d->root,"frame"),*frameouter=by_id(d->root,"frameouter");
         struct web_frame *f=web_frame_find(d,frame);web_doc *child=f?f->document:NULL;
         node_t *fc=child?by_id(child->root,"fc"):NULL,*fl=child?by_id(child->root,"fl"):NULL;
@@ -330,7 +330,7 @@ static int scroll_inputs(void){
     d=scroll_input_document(borrowed,&host);
     check(d!=NULL,"sibling allocation-owner pending lifetime document");
     if(d){
-        web_frames_prepare_paint(d);web_frames_finish_paint(d);
+        web_frames_prepare_paint(d,NULL);web_frames_finish_paint(d);
         /* web_frames_free reverses discovery into frame-list order. Allocate
            in its first sibling and queue in the later sibling, exercising the
            unsafe allocation-owner-first direction without fabricating nodes. */

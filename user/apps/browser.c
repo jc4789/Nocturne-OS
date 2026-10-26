@@ -62,7 +62,7 @@ static bool net_log, log_console;
 /* Debug-only inclusive phase totals, with no page data or per-frame logging. */
 static struct {
     uint64_t since, tick_ms, tick_max_ms, layout_ms, draw_ms, update_ms, net_ms, wait_ms;
-    uint64_t partial_ms, partial_update_ms, video_present_ms, console_ms, console_update_ms;
+    uint64_t partial_ms, partial_update_ms, video_present_ms, console_ms, console_update_ms, partial_pixels;
     unsigned ticks, layouts, draws;
     unsigned partial_draws, video_patches, console_draws;
     unsigned partial_empty, partial_whole; /* damage off the page, or not a known rectangle */
@@ -555,7 +555,7 @@ static void redraw_damage(void){
     uint64_t drawn=debug_js?n_clock_uptime_ms():0;
     ui_surface_changed_rect(ui,VIEW,x,y,width,height);
     picture_sent();
-    if(debug_js){loop_profile.partial_draws++;loop_profile.partial_ms+=drawn-start;
+    if(debug_js){loop_profile.partial_draws++;loop_profile.partial_ms+=drawn-start;loop_profile.partial_pixels+=(uint64_t)width*(uint64_t)height;
         loop_profile.partial_update_ms+=n_clock_uptime_ms()-drawn;}
 }
 
@@ -2884,6 +2884,7 @@ static void report_loop_profile(uint64_t now) {
     unsigned consoles=loop_profile.console_draws;
     uint64_t console_ms=loop_profile.console_ms,console_update=loop_profile.console_update_ms;
     uint64_t partial_ms=loop_profile.partial_ms,partial_update=loop_profile.partial_update_ms,video_ms=loop_profile.video_present_ms;
+    uint64_t partial_pixels=loop_profile.partial_pixels;
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
     host_console(NULL, 0, message);
@@ -2908,8 +2909,8 @@ static void report_loop_profile(uint64_t now) {
         "Browser console profile: rect draw %u/%lu ms, rect present %lu ms (no author page paint)",
         consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL,0,message);}
     if(partial||patches||partial_empty||partial_whole){snprintf(message,sizeof message,
-        "Browser damage profile: partial draw %u/%lu ms, partial present %lu ms, off the page %u, drawn whole %u, video patch %u/%lu ms (banded compose into the view and present)",
-        partial,(unsigned long)partial_ms,(unsigned long)partial_update,partial_empty,partial_whole,patches,(unsigned long)video_ms);host_console(NULL,0,message);}
+        "Browser damage profile: partial draw %u/%lu ms over %lu kpx, partial present %lu ms, off the page %u, drawn whole %u, video patch %u/%lu ms (banded compose into the view and present)",
+        partial,(unsigned long)partial_ms,(unsigned long)(partial_pixels/1000),(unsigned long)partial_update,partial_empty,partial_whole,patches,(unsigned long)video_ms);host_console(NULL,0,message);}
     static uint64_t reported_batches[PARALLEL_STAGE_COUNT];
     for (int stage = 1; stage < PARALLEL_STAGE_COUNT; stage++) {
         struct parallel_stats s;

@@ -234,6 +234,20 @@ bool web_frame_same_origin(web_doc *a,web_doc *b) {
     bool same=xr==HTTP_URL_TUPLE && yr==HTTP_URL_TUPLE && !strcmp(x,y);
     free(x);free(y);return same;
 }
+/* Whether the frame element's box shows its document's pixels at all. */
+static bool frame_box_shown(const box_t *b) {
+    return b && b->st && !b->st->visibility && b->st->content_visibility!=CV_HIDDEN &&
+        isfinite(b->w) && isfinite(b->h) && b->w>=0.5f && b->h>=0.5f &&
+        (double)b->w<=(double)INT_MAX-1 && (double)b->h<=(double)INT_MAX-1;
+}
+/* A child's pixels reach its owner only through the frame element's box: an
+   unrendered, hidden or empty frame damages nothing. Stale owner layout cannot
+   tell which box that is, so doc_paint_damage repaints the owner whole. */
+static void frame_owner_damage(struct web_frame *f) {
+    web_doc *o=f->owner;
+    if(o->layout_valid && !o->need_style && !o->need_boxes && !frame_box_shown(f->element?f->element->box:NULL))return;
+    doc_paint_damage(o,f->element);
+}
 void web_frames_tick(web_doc *d,uint64_t now) {
     static bool running;if(running || !d)return;running=true;
     struct web_frame *f=d->frames;bool entering=true;
@@ -246,7 +260,7 @@ void web_frames_tick(web_doc *d,uint64_t now) {
         child=f->document;
         if(child && !f->detached) {
             if(web_dirty(child))f->owner->dirty=true;
-            if(web_paint_dirty(child))doc_paint_full(f->owner);
+            if(web_paint_dirty(child))frame_owner_damage(f);
         }
         if(child && !f->detached && !f->request && !f->notified && web_js_complete(child)) {
             f->notified=true;
@@ -338,15 +352,12 @@ void web_frames_commit_viewports(web_doc *d) {
        Descendant layouts are still flushed iteratively by their own owners. */
     for(struct web_frame *f=d?d->frames:NULL;f;f=f->next)frame_viewport_commit(f);
 }
-static bool frame_surface_prepare(struct web_frame *f) {
+static bool frame_surface_prepare(struct web_frame *f,const double clip[4]) {
     box_t *b=f->element?f->element->box:NULL;
     /* An old publication must not be overwritten by gfx_init (or reused after
        the element becomes unrendered). Ownership is independent of the crop. */
     free(f->paint.px);memset(&f->paint,0,sizeof f->paint);f->paint_visible=false;
-    if(!frame_viewport_commit(f) || !b || !b->st ||
-       b->st->visibility || b->st->content_visibility==CV_HIDDEN ||
-       !isfinite(b->w) || !isfinite(b->h) || b->w<0.5f || b->h<0.5f ||
-       (double)b->w>(double)INT_MAX-1 || (double)b->h>(double)INT_MAX-1)return false;
+    if(!frame_viewport_commit(f) || !frame_box_shown(b))return false;
     int w=f->viewport_w,h=f->viewport_h;
     web_layout(f->document,w,h);
     web_doc *owner=f->owner;struct web_frame *container=owner->frame_container;
@@ -357,8 +368,18 @@ static bool frame_surface_prepare(struct web_frame *f) {
         right=left+container->paint.w;bottom=top+container->paint.h;
     }
     double x=box_visual_x(b),y=(double)box_visual_y(b)+b->content_dy;
-    bool fixed=false;
-    for(box_t *a=b;a;a=a->parent)if(a->st && a->st->position==POS_FIXED){fixed=true;break;}
+    bool fixed=false,transformed=false;
+    for(box_t *a=b;a;a=a->parent){
+        if(a->st && a->st->position==POS_FIXED)fixed=true;
+        if(box_transformed(a))transformed=true;
+    }
+    /* A top-level frame paints only the part of the root this paint covers; a
+       nested frame inherits that through its container's crop. The clip is in
+       root space, which a transform above the frame does not share. */
+    if(!container && clip && !transformed) {
+        left=fmax(left,clip[0]);top=fmax(top,clip[1]);
+        right=fmin(right,clip[2]);bottom=fmin(bottom,clip[3]);
+    }
     /* Nested overflow clips are real paint bounds, not a document-size quota.
        Viewport-fixed descendants follow the same escape as native paint. */
     if(!fixed)for(box_t *a=b->parent;a;a=a->parent)if(a->st && a->kind!=B_INLINE &&
@@ -378,13 +399,13 @@ static bool frame_surface_prepare(struct web_frame *f) {
     f->paint_x=ox;f->paint_y=oy;f->paint.w=cw;f->paint.h=ch;f->paint.pitch=cw;
     f->paint_visible=true;return true;
 }
-void web_frames_prepare_paint(web_doc *d) {
+void web_frames_prepare_paint(web_doc *d,const double clip[4]) {
     /* Layout flows top-down, then published pixels bottom-up. Each child
      * paint blits already completed children; browsing-context depth consumes
      * heap surfaces, never another C paint/layout call stack. */
     struct web_frame *f=d?d->frames:NULL;bool entering=true;
     while(f) {
-        if(entering && frame_surface_prepare(f) && f->document->frames){f=f->document->frames;continue;}
+        if(entering && frame_surface_prepare(f,clip) && f->document->frames){f=f->document->frames;continue;}
         if(f->paint_visible && f->paint.w && f->paint.h && f->document && !f->detached) {
             int w=f->paint.w,h=f->paint.h;uint32_t *pixels=malloc((size_t)w*h*4);
             if(pixels){gfx_init(&f->paint,pixels,w,h,w);f->paint_failed=false;

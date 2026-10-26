@@ -14,3 +14,18 @@
 対象: README.md, README_EN.md
 確かめた: 2026-10-26 67bc115e
 README の「開発」の道具の行と ports の一覧は tcc だけを挙げ、LLVM が無い。今は ports/llvm（LLVM 23.1.3 の clang・clang++・ld.lld と libc++。作り方は ports/llvm/README.md）があり、tools/llvm/nocturne があればディスクの C: に入る。tests/runtests.c にも clang の群（clang -O2、clang++ -std=c++23 -O2）がある。ゲストで試験や計測の道具を組むとき、tcc だけを前提にしない。
+
+## 描画の中断点は窓の画布に描くことがある
+対象: user/libc/web/paint.c, user/apps/browser.c, user/libc/web/js.c
+確かめた: 2026-10-26 95bb56b1
+web_native_checkpoint は host_script_checkpoint（browser.c）を呼び、F12 などをその場で処理して draw_console() で窓の画布 view に描く。描画の途中で呼ばれるので、parallel_for_stage の service に checkpoint を渡してよいのは、仕事の帯が私的な緩衝だけに書く段（影のぼかし、変形の面の被覆）だけ。窓の画布に書く段（raster_draw の帯、変形の面の再標本）は service なしで合流させる。2026-10-26、再標本の段に service を渡したら、Reddit で F12 を押した直後に browser が gfx_fill で落ちた。
+
+## 動画の継ぎ当ての枚数は二つある
+対象: user/libc/web/avmedia.c
+確かめた: 2026-10-26 95bb56b1
+snapshot.delivered は写し（snapshot）の中にあり、snapshot_clear で 0 に戻る。描き直しを頼んだ枚は写しの外の damaged_frames が持つ。写しが無いときの doc_paint_damage は damaged_frames と presented_frames を比べて一度だけ出す。delivered で比べると、止まった動画・画面外の動画が毎拍損傷を出し、静かな頁が 60 Hz で部分描画を続けた（2026-10-26、Reddit で再現）。
+
+## 子の枠の描画の通知は枠の箱へ
+対象: user/libc/web/frame.c, user/libc/web/paint.c
+確かめた: 2026-10-26 95bb56b1
+子の文書の paint_dirty は web_frames_tick で親へ上がる。親では枠の要素の箱（B_ATOMIC の AT_PLACEHOLDER）だけを doc_paint_damage にし、箱が無い・visibility が hidden・大きさ 0 の枠は何もしない（frame_box_shown は面の用意と同じ判定）。web_frames_prepare_paint は根の描画の切り抜き（文書の座標）を受け、上の段の枠はそこだけを描く。入れ子の枠は親の枠の切り抜きを継ぐ。変形の下の枠には切り抜きを当てない（文書の座標と合わない）。

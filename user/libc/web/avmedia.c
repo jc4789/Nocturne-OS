@@ -124,6 +124,9 @@ struct web_avmedia {
         bool valid;
     } snapshot;
     uint64_t window_frames;
+    /* The presented frame ordinary paint was last asked to show. It outlives
+       the snapshot, whose clearing must not re-request the same frame. */
+    uint64_t damaged_frames;
     /* Why the last paint left no window-published surface (diagnostics only). */
     const char *snapshot_why;int snapshot_why_line;
     /* Debug transition records contain no URL, error text, or packet data. */
@@ -175,6 +178,7 @@ static void transition(struct web_avmedia *s,const char *reason,uint32_t target)
 }
 static struct web_avmedia *snapshot_candidate;
 static web_doc *snapshot_document;
+static const canvas_t *snapshot_canvas;
 static unsigned snapshot_phase;
 static bool snapshot_rejected;
 static const char *snapshot_why;static int snapshot_why_line;
@@ -260,7 +264,7 @@ static void unload(struct web_avmedia *s) {
     s->performance_frames=s->performance_work_ms=s->performance_measurement_id=0;
     memset(&s->performance_audio,0,sizeof s->performance_audio);
     s->presented_frames=s->audio_frames=s->audio_silence_frames=s->profile_at=0;s->presented_ms=s->audio_end_ms=-1;s->audio_end_frame=0;s->audio_written=s->profile_ended=false;
-    s->window_frames=0;
+    s->window_frames=s->damaged_frames=0;
     s->profile_pumps=s->profile_services=s->profile_pump_ms=s->profile_pump_at=s->profile_pump_gap=0;
 }
 static int64_t current(struct web_avmedia *s, uint64_t now) {
@@ -427,6 +431,8 @@ static void picture_committed(struct web_avmedia *s,const struct nmedia_output *
     if(size_changed){if(s->node&&s->node->box)layout_invalidate(s->node->box);s->doc->layout_valid=false;s->doc->dirty=true;s->snapshot.valid=false;}
     else if(!s->snapshot.valid||s->generation!=s->snapshot.generation)doc_paint_damage(s->doc,s->node);
     s->presented_frames++;s->presented_ms=o->pts_ms;
+    /* Layout or damage above already asked ordinary paint for this frame. */
+    if(!s->snapshot.valid||s->generation!=s->snapshot.generation)s->damaged_frames=s->presented_frames;
 }
 /* Both isolated transports can exchange a complete taken VIDEO owner before
  * successor dispatch. AUDIO and the in-process decoder still borrow spans. */
@@ -1237,7 +1243,7 @@ static void snapshot_publish(struct web_avmedia *s) {
        !s->pixels || s->generation!=s->snapshot.generation ||
        s->width!=s->snapshot.source_w || s->height!=s->snapshot.source_h ||
        !unpublished){
-        if(unpublished&&s->doc&&s->doc->live)doc_paint_damage(s->doc,s->node);
+        if(s->damaged_frames!=s->presented_frames&&s->doc&&s->doc->live){s->damaged_frames=s->presented_frames;doc_paint_damage(s->doc,s->node);}
         return;
     }
     struct snapshot_frame frame={.s=s};
@@ -1246,8 +1252,8 @@ static void snapshot_publish(struct web_avmedia *s) {
         .x=s->snapshot.x,.y=s->snapshot.y,.w=s->snapshot.w,.h=s->snapshot.h,
         .draw=snapshot_draw,.context=&frame};
     if(web_js_video_present(s->doc,&update)) {
-        s->snapshot.delivered=s->presented_frames;s->window_frames++;
-    } else {snapshot_clear(s);doc_paint_damage(s->doc,s->node);}
+        s->snapshot.delivered=s->damaged_frames=s->presented_frames;s->window_frames++;
+    } else {snapshot_clear(s);s->damaged_frames=s->presented_frames;doc_paint_damage(s->doc,s->node);}
 }
 static void timing_profile(struct web_avmedia *s,uint64_t now){
     if((!s->playing&&(!s->ended||s->profile_ended))||(s->playing&&now-s->profile_at<2000))return;
@@ -1346,8 +1352,8 @@ void web_avmedia_checkpoint(void){
     if((++skipped&15u)!=0)return;
     web_avmedia_service(uptime_ms());
 }
-void web_avmedia_snapshot_begin(web_doc *d) {
-    web_avmedia_enter();snapshot_document=d;snapshot_candidate=NULL;
+void web_avmedia_snapshot_begin(web_doc *d,const canvas_t *c) {
+    web_avmedia_enter();snapshot_document=d;snapshot_canvas=c;snapshot_candidate=NULL;
     snapshot_phase=0;snapshot_rejected=false;snapshot_why=NULL;snapshot_why_line=0;snapshot_blend=false;
     nmedia_ff_free(snapshot_regions);snapshot_regions=NULL;snapshot_region_count=snapshot_region_capacity=0;
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d)s->snapshot.valid=false;
@@ -1432,7 +1438,7 @@ void web_avmedia_snapshot_finish(void) {
     struct web_avmedia *s=snapshot_candidate;
     if(s && snapshot_phase==2 && !snapshot_rejected &&
        web_video_snapshot_mask(s->snapshot.black,s->snapshot.output,s->snapshot.committed,s->snapshot.opaque,s->snapshot.count,snapshot_blend)) {
-        s->snapshot.valid=true;s->snapshot.delivered=s->presented_frames;
+        s->snapshot.valid=true;s->snapshot.delivered=s->damaged_frames=s->presented_frames;
     }
     const char *why=s&&s->snapshot.valid?NULL:snapshot_rejected?snapshot_why:!s?"no candidate":snapshot_phase!=2?"no probe":"mask";
     /* Only one usable surface is retained per painted document. Hidden or
@@ -1441,7 +1447,7 @@ void web_avmedia_snapshot_finish(void) {
         if(p->playing){p->snapshot_why=why;p->snapshot_why_line=snapshot_rejected?snapshot_why_line:0;}
         if(p!=s || !p->snapshot.valid)snapshot_clear(p);
     }
-    snapshot_candidate=NULL;snapshot_document=NULL;snapshot_phase=0;web_avmedia_leave();
+    snapshot_candidate=NULL;snapshot_document=NULL;snapshot_canvas=NULL;snapshot_phase=0;web_avmedia_leave();
     nmedia_ff_free(snapshot_regions);snapshot_regions=NULL;snapshot_region_count=snapshot_region_capacity=0;
 }
 void web_avmedia_background(uint64_t now){nmedia_worker_background(now);nmedia_mse_worker_background(now);}
@@ -1573,6 +1579,7 @@ bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h)
     int strip=controls?MIN(h,32):0;
     if(snapshot_document && !snapshot_phase && s && s->playing && s->pixels && n->tag==T_video) {
         if(d!=snapshot_document || snapshot_candidate)snapshot_reject_as("second video",0);
+        else if(c!=snapshot_canvas)snapshot_reject_as("private surface",0);
         else {
             snapshot_candidate=s;
             s->snapshot.x=(int)x0;s->snapshot.y=(int)y0;s->snapshot.w=(int)(x1-x0);s->snapshot.h=(int)(y1-y0);
@@ -1596,6 +1603,12 @@ bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h)
         }
     }
     c->cx0=ox0;c->cy0=oy0;c->cx1=ox1;c->cy1=oy1;return true;
+}
+node_t *web_avmedia_node_next(web_doc *d,node_t *previous){
+    struct web_avmedia *s=streams;
+    if(previous){while(s&&s->node!=previous)s=s->next;if(s)s=s->next;}
+    for(;s;s=s->next)if(s->node&&s->node->owner==d)return s->node;
+    return NULL;
 }
 bool web_avmedia_size(node_t *n,int *w,int *h){
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->node==n&&(s->decoder||s->worker||s->mse_active||(s->url_input&&s->ready))){

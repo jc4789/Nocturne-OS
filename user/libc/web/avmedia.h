@@ -26,6 +26,9 @@ void web_avmedia_background(uint64_t now_ms);
 int64_t web_avmedia_background_deadline(uint64_t now_ms);
 bool web_avmedia_paint(web_doc *doc, node_t *node, canvas_t *canvas, int x, int y, int w, int h);
 bool web_avmedia_size(node_t *node, int *width, int *height);
+/* The next media element owned by d that has native media state, after
+ * previous (NULL starts); diagnostics read the registry, not every node. */
+node_t *web_avmedia_node_next(web_doc *d, node_t *previous);
 bool web_avmedia_pip_ready(web_doc *,node_t *);
 bool web_avmedia_pip_paint(web_doc *,node_t *,canvas_t *);
 /* Called only within ordinary top-document paint. Probes are clipped to the
@@ -33,7 +36,10 @@ bool web_avmedia_pip_paint(web_doc *,node_t *,canvas_t *);
  * follows that actual canvas span; 13 bytes/pixel are charged to the existing
  * media allocator. Invalid geometry, overflow or allocation failure uses
  * ordinary paint, without an independent fixed pixel ceiling. */
-void web_avmedia_snapshot_begin(web_doc *doc);
+/* canvas is the window surface the document paints; a video painted into any
+ * other surface (a transform's private raster) is not on screen where its
+ * box is, so it cannot be patched there. */
+void web_avmedia_snapshot_begin(web_doc *doc,const canvas_t *canvas);
 void web_avmedia_snapshot_reject(void);
 /* Bounded-effect layers reject only their actual clipped screen extent.
  * Probe coordinates are translated to the committed candidate surface. */

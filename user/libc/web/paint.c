@@ -2058,6 +2058,92 @@ static bool transformed_inner_bounds(struct pctx *P, box_t *b, bool layer_root, 
     for (int i = 0; i < 4; i++) out[i] = Q.bounds[i];
     return true;
 }
+struct transformed_job {
+    uint32_t *black;
+    const uint32_t *white;
+    canvas_t *canvas;
+    int sw, sh, dx, dy, dw, dh;
+    float ox, oy;
+    double sx0, sy0, inv[6];
+};
+/* Coverage is what the white pass shows through: the black result becomes
+   premultiplied ARGB, its colour clamped to the recovered alpha. */
+static void transformed_coverage(size_t tile, void *context) {
+    const struct transformed_job *j = context;
+    size_t first = tile * 32 * (size_t)j->sw, end = MIN((tile + 1) * 32, (size_t)j->sh) * (size_t)j->sw;
+    for (size_t i = first; i < end; i++) {
+        uint32_t k = j->black[i], w = j->white[i];
+        int alpha = 0;
+        for (int shift = 0; shift < 24; shift += 8) alpha += 255 - ((int)((w >> shift) & 255) - (int)((k >> shift) & 255));
+        alpha = (alpha + 1) / 3; if (alpha < 0) alpha = 0; if (alpha > 255) alpha = 255;
+        uint32_t r = (k >> 16) & 255, g = (k >> 8) & 255, bl = k & 255;
+        if (r > (uint32_t)alpha) r = (uint32_t)alpha; if (g > (uint32_t)alpha) g = (uint32_t)alpha; if (bl > (uint32_t)alpha) bl = (uint32_t)alpha;
+        j->black[i] = (uint32_t)alpha << 24 | r << 16 | g << 8 | bl;
+    }
+    parallel_record_work(PARALLEL_RASTER, end - first);
+}
+/* Bilinear samples of the premultiplied surface, composited over the opaque
+   destination through the canvas's mask clip. */
+static void transformed_resample(size_t tile, void *context) {
+    const struct transformed_job *j = context;
+    const canvas_t *c = j->canvas;
+    const double *inv = j->inv;
+    int sw = j->sw, sh = j->sh, last = MIN((int)(tile + 1) * 32, j->dh);
+    for (int row_index = (int)tile * 32; row_index < last; row_index++) {
+        int py = j->dy + row_index, first = 0, end = j->dw, opaque0 = j->dx, opaque1 = j->dx + j->dw;
+        if (c->mask_clip) {
+            /* Only the span's antialiased ends need the per-pixel mask. */
+            struct gfx_clip_span span;
+            if (!gfx_clip_row(c, py, j->dx, j->dx + j->dw, &span)) continue;
+            first = span.x0 - j->dx; end = span.x1 - j->dx; opaque0 = span.opaque0; opaque1 = span.opaque1;
+        }
+        double X = j->dx + first + 0.5 - j->ox, Y = py + 0.5 - j->oy;
+        double u = inv[0] * X + inv[2] * Y + inv[4] - j->sx0 - 0.5, v = inv[1] * X + inv[3] * Y + inv[5] - j->sy0 - 0.5;
+        uint32_t *row = c->px + (size_t)py * c->pitch;
+        for (int i = first; i < end; i++, u += inv[0], v += inv[1]) {
+            if (!(u > -1 && v > -1 && u < sw && v < sh)) continue;
+            int x0 = (int)(u + 1) - 1, y0 = (int)(v + 1) - 1; /* floor: both exceed -1 */
+            uint32_t fx = (uint32_t)((u - x0) * 256), fy = (uint32_t)((v - y0) * 256);
+            uint32_t lanes[4] = {0, 0, 0, 0};
+            if (x0 >= 0 && y0 >= 0 && x0 + 1 < sw && y0 + 1 < sh) {
+                const uint32_t *s = j->black + (size_t)y0 * sw + x0;
+                uint32_t w00 = (256 - fx) * (256 - fy), w10 = fx * (256 - fy), w01 = (256 - fx) * fy, w11 = fx * fy;
+                for (int lane = 0, shift = 0; lane < 4; lane++, shift += 8)
+                    lanes[lane] = ((s[0] >> shift) & 255) * w00 + ((s[1] >> shift) & 255) * w10 +
+                                  ((s[sw] >> shift) & 255) * w01 + ((s[sw + 1] >> shift) & 255) * w11;
+            } else for (int corner = 0; corner < 4; corner++) {
+                int sx = x0 + (corner & 1), sy = y0 + (corner >> 1);
+                if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) continue;
+                uint32_t weight = ((corner & 1) ? fx : 256 - fx) * ((corner >> 1) ? fy : 256 - fy);
+                uint32_t s = j->black[(size_t)sy * sw + sx];
+                for (int lane = 0; lane < 4; lane++) lanes[lane] += ((s >> (lane * 8)) & 255) * weight;
+            }
+            uint32_t a = (lanes[3] + 32768) >> 16;
+            if (!a) continue;
+            int px = j->dx + i;
+            uint32_t mask = px >= opaque0 && px < opaque1 ? 255 : gfx_clip_alpha(c, px, py);
+            if (!mask) continue;
+            uint32_t d = row[px], out = 0xFF000000u;
+            for (int lane = 0; lane < 3; lane++) {
+                uint32_t sv = (lanes[lane] + 32768) >> 16, dv = (d >> (lane * 8)) & 255;
+                uint32_t value = (sv * 255 + dv * (255 - a) + 127) / 255; /* premultiplied source over opaque dest */
+                if (mask < 255) value = (value * mask + dv * (255 - mask) + 127) / 255;
+                out |= (value > 255 ? 255 : value) << (lane * 8);
+            }
+            row[px] = out;
+        }
+    }
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)j->dw * (uint64_t)MAX(0, last - (int)tile * 32));
+}
+/* Small surfaces (icons, a rotated glyph) cost less than a dispatch. The
+   checkpoint may draw browser chrome into the window canvas, so only a step
+   writing private buffers is serviced; one writing the canvas joins as a
+   raster primitive does. */
+static void transformed_run(web_doc *d, parallel_fn fn, int rows, size_t pixels, struct transformed_job *j) {
+    size_t tiles = ((size_t)rows + 31) / 32;
+    if (rows < 64 || pixels < 65536) { for (size_t t = 0; t < tiles; t++) fn(t, j); return; }
+    parallel_for_stage(PARALLEL_RASTER, tiles, fn, j, d ? shadow_service : NULL, d);
+}
 /* Paint into two opaque scratch canvases (over black and over white). The
    shared 2D library blends onto opaque destinations only; the difference of
    the two results recovers exact coverage, and the black result is already
@@ -2092,7 +2178,9 @@ static void paint_transformed_surface(struct pctx *P, box_t *b, bool layer_root,
     size_t count = (size_t)sw * (size_t)sh;
     uint32_t *black = malloc(count * sizeof *black), *white = malloc(count * sizeof *white);
     if (!black || !white) { free(black); free(white); P->failed = true; return; }
-    web_avmedia_snapshot_reject_region(c, dx, dy, dw, dh);
+    /* Deterministic resampling: the video probes repaint it exactly, so it
+       neither hides nor rejects a video layer it overlaps. A video inside it
+       paints into the private surface, which the snapshot refuses. */
     if (P->d->profile_enabled) { paint_profile.groups++; paint_profile.group_pixels += count; }
     for (int pass = 0; pass < 2 && !P->failed; pass++) {
         canvas_t surface;
@@ -2106,49 +2194,15 @@ static void paint_transformed_surface(struct pctx *P, box_t *b, bool layer_root,
         if (Q.failed) P->failed = true;
     }
     if (P->failed) { free(black); free(white); return; }
-    for (size_t i = 0; i < count; i++) {
-        uint32_t k = black[i], w = white[i];
-        int alpha = 0;
-        for (int shift = 0; shift < 24; shift += 8) alpha += 255 - ((int)((w >> shift) & 255) - (int)((k >> shift) & 255));
-        alpha = (alpha + 1) / 3; if (alpha < 0) alpha = 0; if (alpha > 255) alpha = 255;
-        uint32_t r = (k >> 16) & 255, g = (k >> 8) & 255, bl = k & 255;
-        if (r > (uint32_t)alpha) r = (uint32_t)alpha; if (g > (uint32_t)alpha) g = (uint32_t)alpha; if (bl > (uint32_t)alpha) bl = (uint32_t)alpha;
-        black[i] = (uint32_t)alpha << 24 | r << 16 | g << 8 | bl;
-    }
-    free(white);
-    for (int j = 0; j < dh && !P->failed; j++) {
-        if (!(j & 63) && !web_native_checkpoint(P->d)) { P->failed = true; break; }
-        int py = dy + j;
-        double X = dx + 0.5 - P->ox, Y = py + 0.5 - P->oy;
-        double u = inv[0] * X + inv[2] * Y + inv[4] - sx0 - 0.5, v = inv[1] * X + inv[3] * Y + inv[5] - sy0 - 0.5;
-        uint32_t *row = c->px + (size_t)py * c->pitch;
-        for (int i = 0; i < dw; i++, u += inv[0], v += inv[1]) {
-            if (!(u > -1 && v > -1 && u < sw && v < sh)) continue;
-            int x0 = (int)floor(u), y0 = (int)floor(v);
-            uint32_t fx = (uint32_t)((u - x0) * 256), fy = (uint32_t)((v - y0) * 256);
-            uint32_t lanes[4] = {0, 0, 0, 0};
-            for (int corner = 0; corner < 4; corner++) {
-                int sx = x0 + (corner & 1), sy = y0 + (corner >> 1);
-                if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) continue;
-                uint32_t weight = ((corner & 1) ? fx : 256 - fx) * ((corner >> 1) ? fy : 256 - fy);
-                uint32_t s = black[(size_t)sy * sw + sx];
-                for (int lane = 0; lane < 4; lane++) lanes[lane] += ((s >> (lane * 8)) & 255) * weight;
-            }
-            uint32_t a = (lanes[3] + 32768) >> 16;
-            if (!a) continue;
-            int px = dx + i;
-            uint32_t mask = c->mask_clip ? gfx_clip_alpha(c, px, py) : 255;
-            if (!mask) continue;
-            uint32_t d = row[px], out = 0xFF000000u;
-            for (int lane = 0; lane < 3; lane++) {
-                uint32_t sv = (lanes[lane] + 32768) >> 16, dv = (d >> (lane * 8)) & 255;
-                uint32_t value = (sv * 255 + dv * (255 - a) + 127) / 255; /* premultiplied source over opaque dest */
-                if (mask < 255) value = (value * mask + dv * (255 - mask) + 127) / 255;
-                out |= (value > 255 ? 255 : value) << (lane * 8);
-            }
-            row[px] = out;
-        }
-    }
+    /* Both steps write disjoint 32-row bands: coverage per surface row, then
+       the destination rows the inverse matrix samples it into. Every band of
+       a step completes, so a cancellation never leaves half a resampled box. */
+    struct transformed_job j = {black, white, c, sw, sh, dx, dy, dw, dh, P->ox, P->oy, sx0, sy0, {0}};
+    memcpy(j.inv, inv, sizeof j.inv);
+    transformed_run(P->d, transformed_coverage, sh, count, &j);
+    free(white); j.white = NULL;
+    if (!web_native_checkpoint(P->d)) { P->failed = true; free(black); return; }
+    transformed_run(NULL, transformed_resample, dh, (size_t)dw * (size_t)dh, &j);
     free(black);
 }
 static void paint_transformed(struct pctx *P, box_t *b, bool layer_root) {
@@ -2521,11 +2575,15 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     d->initial_render_done=true;
     paint_debug_begin(d);
     d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
-    bool snapshot_root=!d->frame_parent;
-    if(snapshot_root){web_frames_prepare_paint(d);web_avmedia_snapshot_begin(d);}
-    if(profile){uint64_t now=uptime_ms();paint_profile.frames_ms+=now-mark;mark=now;}
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     gfx_clip(c, x, y, w, h);
+    bool snapshot_root=!d->frame_parent;
+    if(snapshot_root){
+        /* A damage repaint redraws only the frames' pixels inside its clip. */
+        double clip[4]={(double)doc_x+c->cx0-x,(double)doc_y+c->cy0-y,(double)doc_x+c->cx1-x,(double)doc_y+c->cy1-y};
+        web_frames_prepare_paint(d,clip);web_avmedia_snapshot_begin(d,c);
+    }
+    if(profile){uint64_t now=uptime_ms();paint_profile.frames_ms+=now-mark;mark=now;}
     struct pctx P = {0};
     P.d = d;
     P.c = c;
@@ -2626,7 +2684,11 @@ void doc_paint_damage(web_doc *d,node_t *node){
     float bottom=y+box->h+box->p[0]+box->p[2]+box->b[0]+box->b[2]+4;
     float ink[4]={x,y,right,bottom};
     if(box->st)shadow_ink_bounds(box->st,x+2,y+2,right-x-4,bottom-y-4,ink);
-    if(!isfinite(ink[0])||!isfinite(ink[1])||!isfinite(ink[2])||!isfinite(ink[3])){d->paint_damage_full=true;return;}
+    /* The box's own transform and those above it move what it paints. */
+    double r[4]={ink[0],ink[1],(double)ink[2]-ink[0],(double)ink[3]-ink[1]};
+    box_transform_rect(box,r);
+    for(int i=0;i<4;i++)if(!isfinite(r[i])){d->paint_damage_full=true;return;}
+    ink[0]=(float)r[0];ink[1]=(float)r[1];ink[2]=(float)(r[0]+r[2]);ink[3]=(float)(r[1]+r[3]);
     damage_add(d,ink);
 }
 

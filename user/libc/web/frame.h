@@ -29,7 +29,9 @@ struct web_frame *web_frame_walk_next(web_doc *root,struct web_frame *frame,bool
 node_t *web_frame_dom_next(node_t *root,node_t *node);
 /* 1 ancestor match, 0 distinct, -1 allocation failure. */
 int web_frame_ancestor_url(web_doc *parent,const char *url);
-void web_frames_prepare_paint(web_doc *root);
+/* clip (left, top, right, bottom in root document space) is the part the
+   paint covers; NULL means the root viewport. */
+void web_frames_prepare_paint(web_doc *root,const double clip[4]);
 void web_frames_commit_viewports(web_doc *document); /* committed parent content boxes, independent of paint */
 void web_frames_finish_paint(web_doc *root);
 struct web_frame *web_frame_find(web_doc *document, node_t *element);

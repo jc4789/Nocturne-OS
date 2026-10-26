@@ -89,7 +89,7 @@ int main(void){
     ticks=0;web_frames_tick(&root,0);check(ticks==DEPTH,"deep tick once per live child, no recursive descent");
     check(web_frames_deadline(&root)==17,"deep deadline native minimum");resources=0;web_frames_loaded(&root,9,NULL);check(resources==DEPTH,"deep resource completion reaches every child once");
     root.address_frame=leaf->element;check(web_frame_address(&root)==leaf->document->url&&!strcmp(root.url,"https://example.test/top"),"deep child address keeps root URL independent");
-    web_frames_prepare_paint(&root);check(layouts==DEPTH&&paints==DEPTH&&max_depth==1,"postorder paint removes child C recursion");
+    web_frames_prepare_paint(&root,NULL);check(layouts==DEPTH&&paints==DEPTH&&max_depth==1,"postorder paint removes child C recursion");
     check(root.frames->paint.px&&root.frames->paint.px[0]==0xff123456,"deep final composite preserved");
     check(!leaf->paint.px,"consumed child surfaces released before top publication");
     web_frames_finish_paint(&root);check(!root.frames->paint.px,"paint completion releases native surfaces");
