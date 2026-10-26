@@ -1783,7 +1783,7 @@ static bool prepare_text_overflow(web_doc *d,box_t *b) {
         if(!enabled||line->end_run<=line->first_run)continue;
         float edge=line->right+scroll,extent=line->left;
         for(int i=line->first_run;i<line->end_run;i++)extent=fmaxf(extent,b->runs[i].x+b->runs[i].w);
-        if(extent<=edge)continue;
+        if(extent<=edge+LAYOUT_FIT_SLOP)continue;
         float cut=edge-marker,x=line->left;
         int last=line->first_run-1,bytes=0;float width=0;
         for(int i=line->first_run;i<line->end_run;i++) {

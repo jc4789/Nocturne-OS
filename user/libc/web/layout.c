@@ -1679,13 +1679,13 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
         /* commit the chunk cs..i */
         float trim = it->space_end ? it->sw : 0;
         float avail = L.right - L.left;
-        if (line_w > 0 && line_w + chunk_w - trim > avail + 0.01f) {
+        if (line_w > 0 && line_w + chunk_w - trim > avail + LAYOUT_FIT_SLOP) {
             finish_line(&L, ls, cs, false);
             ls = cs;
             line_w = 0;
             avail = L.right - L.left;
         }
-        if (line_w == 0 && chunk_w - trim > avail + 0.01f) {
+        if (line_w == 0 && chunk_w - trim > avail + LAYOUT_FIT_SLOP) {
             /* move below floats if they are what makes it too narrow */
             float y = L.y;
             while (L.right - L.left < chunk_w - trim && L.f) {
@@ -1697,7 +1697,7 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
             }
             avail = L.right - L.left;
             int st_ws = iv.v[cs].kind == IT_TEXT ? iv.v[cs].st->white_space : WS_PRE;
-            if (chunk_w - trim > avail + 0.01f && cs == i && it->kind == IT_TEXT && st_ws != WS_NOWRAP && st_ws != WS_PRE &&
+            if (chunk_w - trim > avail + LAYOUT_FIT_SLOP && cs == i && it->kind == IT_TEXT && st_ws != WS_NOWRAP && st_ws != WS_PRE &&
                 avail > 0) {
                 if (split_word(&L, i, avail)) {
                     it = &iv.v[i];

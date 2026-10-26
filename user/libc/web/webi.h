@@ -803,6 +803,9 @@ void boxes_changes_clear(web_doc *d);
 bool box_pseudo_generated(node_t *node, const style_t *origin, const style_t *pseudo);
 bool boxes_update_text(web_doc *d, node_t *n);
 void boxes_discard(web_doc *d); /* unpublish node/top-layer borrowers, then bmem */
+/* Widths are float sums of advances, and the same content summed in another order (a line,
+   an intrinsic width) may differ in the last bits: content within this much of a width fits it. */
+#define LAYOUT_FIT_SLOP 0.01f
 void layout_doc(web_doc *d, int width, int height);
 void layout_cache_free(web_doc *d);
 void layout_clamp_trace_report(web_doc *d);
