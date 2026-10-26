@@ -143,6 +143,8 @@ float log2f(float x);
 float exp2f(float x);
 double nan(const char *tag);
 float nanf(const char *tag);
+double nextafter(double x, double y);
+float nextafterf(float x, float y);
 double fma(double x, double y, double z);
 float fmaf(float x, float y, float z);
 double nearbyint(double x);

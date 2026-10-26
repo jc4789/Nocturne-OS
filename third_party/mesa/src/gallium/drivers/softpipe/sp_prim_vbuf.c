@@ -46,7 +46,7 @@
 #include "util/u_prim.h"
 #if DETECT_OS_NOCTURNE
 #include "c11/threads.h"
-#include "nocturne.h"
+#include "util/u_cpu_detect.h"
 #include "sp_quad_pipe.h"
 #include "sp_tex_sample.h"
 #include "sp_tile_cache.h"
@@ -947,8 +947,7 @@ raster_threads_stop(struct softpipe_vbuf_render *cvbr);
 static void
 raster_threads_start(struct softpipe_vbuf_render *cvbr)
 {
-   struct n_cpuinfo cpu = {0};
-   unsigned count = cpu_info(&cpu) >= 0 && cpu.online_cpus ? cpu.online_cpus : 1;
+   unsigned count = util_get_cpu_caps()->nr_cpus;
    unsigned started = 0, i;
 
    cvbr->band_count = 1;

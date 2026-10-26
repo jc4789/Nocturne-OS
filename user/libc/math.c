@@ -1092,6 +1092,28 @@ float exp2f(float x) { return (float)exp2((double)x); }
 double nan(const char *tag) { (void)tag; return __builtin_nan(""); }
 float nanf(const char *tag) { (void)tag; return __builtin_nanf(""); }
 
+/* The representable value after x in the direction of y: one step of the bit pattern, which
+ * orders the values of one sign by magnitude. From zero the step is the smallest subnormal with
+ * y's sign; past the largest finite value it is the infinity. */
+double nextafter(double x, double y) {
+    if (isnan(x) || isnan(y)) return x + y;
+    if (x == y) return y;
+    if (x == 0) return copysign(u2d(1), y);
+    uint64_t u = d2u(x);
+    return u2d((x < y) == (x > 0) ? u + 1 : u - 1);
+}
+float nextafterf(float x, float y) {
+    if (isnan(x) || isnan(y)) return x + y;
+    if (x == y) return y;
+    union { float f; uint32_t u; } v = {x};
+    if (x == 0) {
+        v.u = 1;
+        return copysignf(v.f, y);
+    }
+    v.u = (x < y) == (x > 0) ? v.u + 1 : v.u - 1;
+    return v.f;
+}
+
 /* x*y+z with one rounding of the sum: the product is split exactly
  * (Veltkamp/Dekker) and the low parts are added after the high sum's error
  * is recovered (Knuth TwoSum). Overflow and non-finite inputs fall back to

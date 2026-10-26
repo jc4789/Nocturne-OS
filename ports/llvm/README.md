@@ -37,6 +37,9 @@ make                                   # tools/llvm/nocturne があれば C: に
 - `build.py nocturne` は host の clang で LLVM を Nocturne 向けにクロスビルドし（CMake の
   toolchain は `ports/llvm/cmake/nocturne.cmake`、プラットフォームは `cmake/Platform/Nocturne.cmake`）、
   C:\Nocturne に入る形で `tools/llvm/nocturne` に置きます。`tools/` は git の管理外です。
+  同じビルドで JIT の静的ライブラリー（`LLVMMCJIT` とそれが頼る物、`tools/llvm/build-nocturne/lib`）も
+  作ります。Mesa の llvmpipe がシェーダーを実行時に機械語にするのに使います（`ports/mesa/llvmpipe.mk`。
+  これが無ければ Mesa は softpipe だけで作られます）。
 - Makefile への組み込みは `ports/llvm/llvm.mk` です。`tools/llvm/nocturne` が無ければ何も
   作らないので、通常の `make` は変わりません。
 
@@ -102,7 +105,8 @@ C++ の例外は使えます（`-fexceptions` は C++ の既定です）。libc+
 | メモリー（`Memory.inc`） | `n_memory_reserve`/`n_memory_protect`/`n_memory_release`。ページは書き込みか実行のどちらか一方。 |
 | スレッド（`Threading.inc`） | Nocturne のネイティブのスレッド（`thread_create`）。名前、優先度、CPU の指定は無い。CPU 数は `cpu_info`。 |
 | シグナル（`Signals.inc`） | Nocturne にシグナルは無い。障害のアプリはシステムが終わらせて場所を報告し、Ctrl+C はアプリを終わらせるだけ。LLVM が諦めるとき（`report_fatal_error`）に消す文書はここで消す。読まれなくなったチャンネルへの書き込みは `EX_IOERR` で終わる。 |
-| 動的ライブラリー、COM、監視（`DynamicLibrary.inc`、`COM.inc`、`Watchdog.inc`） | 無い。プログラムは全部まとめてリンクされる。 |
+| 動的ライブラリー（`DynamicLibrary.inc`） | 走っているアプリに読み込むライブラリーは無い。プログラム自身（`File` が null）は開けて、Windows のようにハンドルの集まりを返す。JIT は記号を探す前にそれを開く。見つかるのは `DynamicLibrary::AddSymbol`（`LLVMAddSymbol`）で足した記号と C のストリームだけ（llvmpipe は `lp_bld_init.c` で、生成したコードが呼ぶ C の関数を足す）。 |
+| COM、監視（`COM.inc`、`Watchdog.inc`） | 無い。プログラムは全部まとめてリンクされる。 |
 | エラー | errno の値は ABI の `N_ERR_*`（正の数）。`std::error_code` に対応付け、文言は `n_result_text`。 |
 | 標準出力・エラー（`raw_ostream.cpp`、`ErrorHandling.cpp`） | 端末なら出力をためずに書く。メモリー不足の報告は C ライブラリーのバッファーの無い `stderr` で、確保せずに書く。 |
 

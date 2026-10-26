@@ -1,5 +1,6 @@
 /* Nocturne's OpenGL ES frontend: Mesa's state tracker on Zink over the Vulkan
- * driver linked into the program (NVK) when it finds a GPU, otherwise on the
+ * driver linked into the program (NVK) when it finds a GPU, otherwise on the CPU:
+ * llvmpipe when the program has LLVM's JIT (ports/mesa/llvmpipe.mk), else the
  * softpipe rasterizer. Screens live for the process; each context owns a drawable
  * whose color and depth/stencil textures it allocates on demand. */
 #include "nocturne_gl.h"
@@ -10,6 +11,9 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "softpipe/sp_public.h"
+#ifdef GALLIUM_LLVMPIPE
+#include "llvmpipe/lp_public.h"
+#endif
 #ifdef GALLIUM_ZINK
 #include "frontend/winsys_handle.h"
 #include "zink/zink_public.h"
@@ -51,6 +55,13 @@ char *os_read_file(const char *filename, size_t *size) {
     }
     if (data) n_memory_release(data, length);
     return copy;
+}
+
+/* A new folder, 0, or -1 when it cannot be made (it may already be there); Nocturne has no use for
+   the permissions in mode. llvmpipe's GALLIVM_DEBUG=symbols writes each shader's NIR into one. */
+int os_mkdir(const char *pathname, int mode) {
+    (void)mode;
+    return n_folder_create(pathname) < 0 ? -1 : 0;
 }
 
 /* Shader capture (MESA_SHADER_CAPTURE_PATH) writes each program to a new
@@ -144,6 +155,18 @@ static struct pipe_frontend_screen *frontend_screen(struct pipe_screen *screen) 
     return fs;
 }
 
+/* The screen of the contexts the GPU does not draw: llvmpipe compiles their shaders to machine code
+   and draws with every CPU; softpipe, which interprets them, draws where llvmpipe is not linked in
+   or does not start. */
+static struct pipe_screen *cpu_screen(void) {
+#ifdef GALLIUM_LLVMPIPE
+    struct pipe_screen *screen = llvmpipe_create_screen(&mem_winsys);
+    if (screen) return screen;
+    mesa_logw("Nocturne GL: llvmpipe did not start: drawing with softpipe");
+#endif
+    return softpipe_create_screen(&mem_winsys);
+}
+
 static struct pipe_frontend_screen *get_screen(void) {
     simple_mtx_lock(&screen_lock);
 #ifdef GALLIUM_ZINK
@@ -153,7 +176,7 @@ static struct pipe_frontend_screen *get_screen(void) {
          * the helper also searches past unready GPUs. Vulkan revalidates its
          * own snapshot, and failure here keeps existing CPU contexts alive. */
         /* Why, an n_result or ZINK_FAILED, goes to Mesa's log (the system log) when it is not
-           the one told before, not at every context; where nvrm serves no NVIDIA GPU, softpipe
+           the one told before, not at every context; where nvrm serves no NVIDIA GPU, the CPU
            draws without a word. What Zink and the Vulkan driver say while the screen starts is
            held (mesa_log_hold) and written before it, likewise only when it changed. */
         enum { ZINK_FAILED = 1 };
@@ -174,12 +197,12 @@ static struct pipe_frontend_screen *get_screen(void) {
             if (!why)
                 mesa_logi("Nocturne GL: drawing on the GPU with %s", gpu_fscreen->screen->get_name(gpu_fscreen->screen));
             else if (why == ZINK_FAILED)
-                mesa_logw("Nocturne GL: nvrm's GPU is ready, but Zink did not start on it (%s): drawing with softpipe",
+                mesa_logw("Nocturne GL: nvrm's GPU is ready, but Zink did not start on it (%s): drawing on the CPU",
                           lines ? "why is in the lines before" : "it gave no reason");
             else if (why == -N_ERR_NOT_FOUND)
-                mesa_logw("Nocturne GL: nvrm serves no NVIDIA GPU any more: drawing with softpipe");
+                mesa_logw("Nocturne GL: nvrm serves no NVIDIA GPU any more: drawing on the CPU");
             else
-                mesa_logw("Nocturne GL: nvrm's GPU cannot be used (%s): drawing with softpipe", n_result_text(why));
+                mesa_logw("Nocturne GL: nvrm's GPU cannot be used (%s): drawing on the CPU", n_result_text(why));
             told = why;
             free(told_lines);
             told_lines = lines;
@@ -189,7 +212,7 @@ static struct pipe_frontend_screen *get_screen(void) {
     }
 #endif
     if (!gpu_fscreen && !cpu_fscreen)
-        cpu_fscreen = frontend_screen(softpipe_create_screen(&mem_winsys));
+        cpu_fscreen = frontend_screen(cpu_screen());
     struct pipe_frontend_screen *fs = gpu_fscreen ? gpu_fscreen : cpu_fscreen;
     simple_mtx_unlock(&screen_lock);
     return fs;
@@ -253,7 +276,7 @@ static bool drawable_validate(struct st_context *st, struct pipe_frontend_drawab
             c->textures[a] = screen->resource_create(screen, &templ);
             if (!c->textures[a]) return false;
             /* A new buffer is defined before anything can see it: the driver gives no content, and
-               softpipe's zeros are wrong for depth. Color (0,0,0,0), depth 1, stencil 0. */
+               the CPU drivers' zeros are wrong for depth. Color (0,0,0,0), depth 1, stencil 0. */
             init_texture(st->pipe, c->textures[a], a == ST_ATTACHMENT_DEPTH_STENCIL ? 0x00ffffff : 0, c->on_gpu);
         }
         pipe_resource_reference(&out[i], c->textures[a]);
@@ -446,7 +469,7 @@ static void clear_texture(struct pipe_context *pipe, struct pipe_resource *textu
 }
 
 /* The initial content of a drawing buffer made by drawable_validate: queued on the GPU, written
-   directly by the CPU for softpipe. Nothing is pending on a resource that was just created, so
+   directly by the CPU otherwise. Nothing is pending on a resource that was just created, so
    neither waits. */
 static void init_texture(struct pipe_context *pipe, struct pipe_resource *texture, uint32_t value, bool on_gpu) {
     if (on_gpu) clear_texture(pipe, texture, value);

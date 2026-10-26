@@ -1,11 +1,15 @@
 # Mesa (MIT): the GLSL/NIR compiler, the OpenGL ES 3 state tracker and the
-# Gallium softpipe rasterizer, used by WebGL. No LLVM, GLX/EGL, DRM or
-# platform window systems. Source lists follow Mesa's meson.build files for
-# a softpipe-only build; ports/mesa/README.md records the local changes.
+# Gallium rasterizers, used by WebGL: llvmpipe when the LLVM port is built
+# (llvmpipe.mk), softpipe always. No GLX/EGL, DRM or platform window systems.
+# Source lists follow Mesa's meson.build files; ports/mesa/README.md records
+# the local changes.
 MESA := third_party/mesa
 MESA_GEN := $(BUILD)/mesa/gen
 MESA_PREGEN := ports/mesa/generated
 MESA_GEN_STAMP := $(BUILD)/mesa/gen.stamp
+# The flags every Mesa object is compiled with, rewritten below only when they change.
+MESA_FLAGS_RECORD := $(BUILD)/mesa/flags
+include ports/mesa/llvmpipe.mk
 
 MESA_UTIL_SRC := $(addprefix $(MESA)/src/util/,bitscan.c blob.c build_id.c cnd_monotonic.c \
     thread_sched.c crc32.c dag.c double.c fast_idiv_by_const.c float8.c futex.c half_float.c hash_table.c \
@@ -55,8 +59,9 @@ MESA_GALLIUM_SRC := $(addprefix $(MESA)/src/gallium/auxiliary/,\
     $(wildcard $(MESA)/src/gallium/auxiliary/draw/*.c $(MESA)/src/gallium/auxiliary/tgsi/*.c) \
     $(wildcard $(MESA)/src/gallium/auxiliary/driver_trace/*.c $(MESA)/src/gallium/auxiliary/tessellator/*.cpp) \
     $(wildcard $(MESA)/src/gallium/drivers/softpipe/*.c)
-MESA_GALLIUM_SRC := $(filter-out %/draw_llvm.c %/draw_llvm_sample.c %/draw_pt_fetch_shade_pipeline_llvm.c \
-    %/draw_vs_llvm.c %/draw_gs_llvm.c %/draw_tess_llvm.c,$(MESA_GALLIUM_SRC))
+# draw's LLVM parts are llvmpipe's (llvmpipe.mk).
+MESA_GALLIUM_SRC := $(filter-out %/draw_llvm.c %/draw_pt_fetch_shade_pipeline_llvm.c %/draw_vs_llvm.c,\
+    $(MESA_GALLIUM_SRC))
 
 # Code made by the build (ports/mesa/generate.py) and by bison/flex (checked in).
 MESA_GEN_SRC := $(addprefix $(MESA_GEN)/src/,util/format_srgb.c util/format/u_format_table.c \
@@ -72,11 +77,11 @@ MESA_PREGEN_SRC := $(addprefix $(MESA_PREGEN)/src/,compiler/glsl/glsl_parser.cpp
     compiler/glsl/glcpp/glcpp-parse.c compiler/glsl/glcpp/glcpp-lex.c mesa/program/program_parse.tab.c \
     mesa/program/lex.yy.c)
 
-# Nocturne's own frontend: a softpipe screen on a memory winsys and GL contexts.
+# Nocturne's own frontend: a CPU screen (llvmpipe or softpipe) on a memory winsys and GL contexts.
 MESA_PORT_SRC := ports/mesa/nocturne_gl.c
 
 MESA_SRC := $(MESA_UTIL_SRC) $(MESA_COMPILER_SRC) $(MESA_GL_SRC) $(MESA_GALLIUM_SRC) $(MESA_GEN_SRC) \
-    $(MESA_PREGEN_SRC) $(MESA_PORT_SRC)
+    $(MESA_PREGEN_SRC) $(MESA_PORT_SRC) $(LLVMPIPE_SRC)
 MESA_OBJ := $(patsubst %,$(BUILD)/mesa/o/%.o,$(MESA_SRC))
 
 MESA_DIRS := include src src/mesa src/mesa/main src/mesa/glapi src/mesa/glapi/glapi src/mesa/glapi/glapi/gen \
@@ -84,7 +89,8 @@ MESA_DIRS := include src src/mesa src/mesa/main src/mesa/glapi src/mesa/glapi/gl
     src/gallium/winsys src/compiler src/compiler/glsl src/compiler/glsl/glcpp src/compiler/nir \
     src/compiler/spirv src/util src/util/format src/mesa/program src/gallium/auxiliary/util
 MESA_INC := $(addprefix -I$(MESA)/,$(MESA_DIRS)) $(addprefix -I$(MESA_GEN)/,$(filter-out include,$(MESA_DIRS))) \
-    $(addprefix -I$(MESA_PREGEN)/,src/compiler/glsl src/compiler/glsl/glcpp src/mesa src/mesa/program) -Iports/mesa
+    $(addprefix -I$(MESA_PREGEN)/,src/compiler/glsl src/compiler/glsl/glcpp src/mesa src/mesa/program) -Iports/mesa \
+    $(LLVMPIPE_INC)
 MESA_DEFS := -DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=1 -DHAVE_SOFTPIPE -DHAVE_SWRAST \
     -DGALLIUM_SOFTPIPE -DGLAPI_EXPORT_PROTO_ENTRY_POINTS=0 -DUSE_LIBGLVND=0 -DMESA_DEBUG=0 -DNDEBUG \
     -DHAVE___BUILTIN_BSWAP32 -DHAVE___BUILTIN_BSWAP64 -DHAVE___BUILTIN_CLZ -DHAVE___BUILTIN_CLZLL \
@@ -97,7 +103,8 @@ MESA_DEFS := -DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=1 -DHAVE_SO
     -DHAVE_FUNC_ATTRIBUTE_RETURNS_NONNULL -DHAVE_FUNC_ATTRIBUTE_ALIAS -DHAVE_FUNC_ATTRIBUTE_NORETURN \
     -DHAVE_FUNC_ATTRIBUTE_OPTIMIZE -DHAVE_FUNC_ATTRIBUTE_COLD -DHAVE_FUNC_ATTRIBUTE_VISIBILITY \
     -DHAVE_UINT128 -DUSE_GCC_ATOMIC_BUILTINS -DHAVE_STRUCT_TIMESPEC -DHAVE_THRD_CREATE -DHAVE_TIMESPEC_GET -DHAVE_QSORT_S=1 -DNO_REGEX \
-    -DDRAW_LLVM_AVAILABLE=0 -DAMD_LLVM_AVAILABLE=0 -DGALLIVM_USE_ORCJIT=0 -DHAVE_RENDERDOC_INTEGRATION=0 \
+    -DDRAW_LLVM_AVAILABLE=$(if $(LLVMPIPE),1,0) $(LLVMPIPE_DEFS) -DAMD_LLVM_AVAILABLE=0 -DGALLIVM_USE_ORCJIT=0 \
+    -DHAVE_RENDERDOC_INTEGRATION=0 \
     -DTHREAD_SANITIZER=0 -DPACKAGE_VERSION=\"26.3.0-devel\" -DPACKAGE_BUGREPORT=\"\" -DWITH_XMLCONFIG=0 \
     -DXXH_FORCE_ALIGN_CHECK=0 -DXXH_FORCE_MEMORY_ACCESS=0 -DYY_NO_UNISTD_H -DMAPI_MODE_SHARED_GLAPI \
     -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 \
@@ -109,11 +116,16 @@ MESA_CFLAGS := $(MESA_COMMON) -std=gnu11 -Iuser/include -Icommon
 MESA_CXXFLAGS := $(MESA_COMMON) -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -Iuser/include/c++ \
     -I$(BUILD)/cxx/upstream/libcxx/include -idirafter user/include -Icommon
 
+ifneq ($(file <$(MESA_FLAGS_RECORD)),$(MESA_CFLAGS) | $(MESA_CXXFLAGS))
+$(shell mkdir -p $(dir $(MESA_FLAGS_RECORD)))
+$(file >$(MESA_FLAGS_RECORD),$(MESA_CFLAGS) | $(MESA_CXXFLAGS))
+endif
+
 # The WebGL binding calls the public GLES entry points and Mesa's pixel
 # format helpers; its constant tables come from the same Khronos headers.
 WEBGL_OBJ := $(BUILD)/u/user/libc/web/js_webgl.o
 $(WEBGL_OBJ): UCFLAGS += $(MESA_DEFS) -I$(MESA)/include -I$(MESA)/src -Iports/mesa
-$(WEBGL_OBJ): user/libc/web/js_webgl_constants.inc
+$(WEBGL_OBJ): user/libc/web/js_webgl_constants.inc $(MESA_FLAGS_RECORD)
 user/libc/web/js_webgl_constants.inc: user/libc/web/js_webgl_constants.py $(MESA)/include/GLES2/gl2.h $(MESA)/include/GLES3/gl3.h
 	@$(PY) user/libc/web/js_webgl_constants.py
 	@touch $@
@@ -127,11 +139,11 @@ $(MESA_GEN_STAMP): $(MESA_GEN_INPUTS)
 $(filter $(MESA_GEN)/%,$(MESA_GEN_SRC)): $(MESA_GEN_STAMP)
 	@:
 
-$(BUILD)/mesa/o/%.c.o: %.c | $(MESA_GEN_STAMP)
+$(BUILD)/mesa/o/%.c.o: %.c $(MESA_FLAGS_RECORD) | $(MESA_GEN_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "  MESA $<"
 	@$(CC) $(MESA_CFLAGS) -c $< -o $@
-$(BUILD)/mesa/o/%.cpp.o: %.cpp $(BUILD)/cxx/libc++.a | $(MESA_GEN_STAMP)
+$(BUILD)/mesa/o/%.cpp.o: %.cpp $(BUILD)/cxx/libc++.a $(MESA_FLAGS_RECORD) | $(MESA_GEN_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "  MESA $<"
 	@$(CC) $(MESA_CXXFLAGS) -x c++ -c $< -o $@

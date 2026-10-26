@@ -1,7 +1,7 @@
 #pragma once
-/* Nocturne's OpenGL ES frontend on Mesa: Zink on the GPU (NVK), else softpipe
- * (nocturne_gl.c). A context owns its own drawing buffer, in video memory on
- * the GPU and in RAM for softpipe; the caller draws with the ordinary gl* entry
+/* Nocturne's OpenGL ES frontend on Mesa: Zink on the GPU (NVK), else llvmpipe
+ * or softpipe on the CPU (nocturne_gl.c). A context owns its own drawing buffer,
+ * in video memory on the GPU and in RAM on the CPU; the caller draws with the ordinary gl* entry
  * points while the context is current and copies the result out with
  * ngl_read_drawing_buffer. Every function runs on the calling thread. */
 #include <stdbool.h>

@@ -2590,6 +2590,37 @@ index 1ec34826..92155d59 100644
  
  namespace llvm {
  class raw_pwrite_stream;
+diff --git a/llvm/include/llvm/ExecutionEngine/Orc/TargetProcess/LibraryScanner.h b/llvm/include/llvm/ExecutionEngine/Orc/TargetProcess/LibraryScanner.h
+index dff65994..44b264cb 100644
+--- a/llvm/include/llvm/ExecutionEngine/Orc/TargetProcess/LibraryScanner.h
++++ b/llvm/include/llvm/ExecutionEngine/Orc/TargetProcess/LibraryScanner.h
+@@ -44,7 +44,7 @@ public:
+     Seen.clear();
+     if (isRealPathCache) {
+       RealPathCache.clear();
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__nocturne__) // Nocturne has no links
+       ReadlinkCache.clear();
+       LstatCache.clear();
+ #endif
+@@ -100,7 +100,7 @@ private:
+   StringSet<> Seen;
+   StringMap<PathInfo> RealPathCache;
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__nocturne__) // Nocturne has no links
+   StringMap<std::string> ReadlinkCache;
+   StringMap<mode_t> LstatCache;
+ 
+@@ -151,7 +151,7 @@ public:
+   std::optional<std::string> resolve(StringRef Path, std::error_code &ec) {
+     return realpathCached(Path, ec);
+   }
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__nocturne__) // Nocturne has no links
+   mode_t lstatCached(StringRef Path);
+   std::optional<std::string> readlinkCached(StringRef Path);
+ #endif
 diff --git a/llvm/include/llvm/Support/ExitCodes.h b/llvm/include/llvm/Support/ExitCodes.h
 index 4eb5dedc..89c259f4 100644
 --- a/llvm/include/llvm/Support/ExitCodes.h
@@ -2840,6 +2871,101 @@ index 0786c4b9..44079107 100644
  using namespace llvm;
  using namespace llvm::support::endian;
  using namespace llvm::sys::fs;
+diff --git a/llvm/lib/ExecutionEngine/Orc/Shared/SimpleRemoteEPCUtils.cpp b/llvm/lib/ExecutionEngine/Orc/Shared/SimpleRemoteEPCUtils.cpp
+index a8bf26d7..1ba35a3a 100644
+--- a/llvm/lib/ExecutionEngine/Orc/Shared/SimpleRemoteEPCUtils.cpp
++++ b/llvm/lib/ExecutionEngine/Orc/Shared/SimpleRemoteEPCUtils.cpp
+@@ -15,12 +15,14 @@
+ #include "llvm/Config/llvm-config.h" // for LLVM_ENABLE_THREADS
+ #include "llvm/Support/Endian.h"
+ 
+-#if !defined(_MSC_VER) && !defined(__MINGW32__)
++#if defined(__nocturne__)
++#include <errno.h>
++#elif !defined(_MSC_VER) && !defined(__MINGW32__)
+ #include <unistd.h>
+ #else
+ #include <io.h>
+ #endif
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__nocturne__)
+ #include <sys/socket.h>
+ #endif
+ 
+@@ -52,7 +54,12 @@ SimpleRemoteEPCTransport::~SimpleRemoteEPCTransport() = default;
+ Expected<std::unique_ptr<FDSimpleRemoteEPCTransport>>
+ FDSimpleRemoteEPCTransport::Create(SimpleRemoteEPCTransportClient &C, int InFD,
+                                    int OutFD) {
+-#if LLVM_ENABLE_THREADS
++#if defined(__nocturne__)
++  // A Nocturne program has no file descriptors to carry the messages.
++  return make_error<StringError>("FD-based SimpleRemoteEPC transport needs "
++                                 "file descriptors, which Nocturne has none of",
++                                 inconvertibleErrorCode());
++#elif LLVM_ENABLE_THREADS
+   if (InFD == -1)
+     return make_error<StringError>("Invalid input file descriptor " +
+                                        Twine(InFD),
+@@ -111,6 +118,20 @@ Error FDSimpleRemoteEPCTransport::sendMessage(SimpleRemoteEPCOpcode OpC,
+   return Error::success();
+ }
+ 
++#if defined(__nocturne__)
++// Create refuses on Nocturne, so no transport exists for these to serve.
++void FDSimpleRemoteEPCTransport::disconnect() { Disconnected = true; }
++
++Error FDSimpleRemoteEPCTransport::readBytes(char *Dst, size_t Size,
++                                            bool *IsEOF) {
++  return make_error<StringError>("Nocturne has no file descriptors",
++                                 inconvertibleErrorCode());
++}
++
++int FDSimpleRemoteEPCTransport::writeBytes(const char *Src, size_t Size) {
++  return ENOSYS;
++}
++#else
+ void FDSimpleRemoteEPCTransport::disconnect() {
+   if (Disconnected)
+     return; // Return if already disconnected.
+@@ -196,6 +217,7 @@ int FDSimpleRemoteEPCTransport::writeBytes(const char *Src, size_t Size) {
+   }
+   return 0;
+ }
++#endif // __nocturne__
+ 
+ void FDSimpleRemoteEPCTransport::listenLoop() {
+   Error Err = Error::success();
+diff --git a/llvm/lib/ExecutionEngine/Orc/TargetProcess/LibraryScanner.cpp b/llvm/lib/ExecutionEngine/Orc/TargetProcess/LibraryScanner.cpp
+index cf662afe..6a9f594f 100644
+--- a/llvm/lib/ExecutionEngine/Orc/TargetProcess/LibraryScanner.cpp
++++ b/llvm/lib/ExecutionEngine/Orc/TargetProcess/LibraryScanner.cpp
+@@ -243,6 +243,8 @@ bool DylibPathValidator::isSharedLibrary(StringRef Path) const {
+ #else
+       (MagicCode == file_magic::elf_shared_object);
+ #endif
++#elif defined(__nocturne__)
++      false; // a Nocturne program is one image: there are no shared libraries
+ #else
+ #error "Unsupported platform."
+ #endif
+@@ -418,7 +420,7 @@ DylibResolverImpl::resolve(StringRef LibStem, bool VariateLibStem) const {
+   return std::nullopt;
+ }
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__nocturne__) // Nocturne has no links
+ mode_t PathResolver::lstatCached(StringRef Path) {
+   // If already cached - retun cached result
+   if (auto Cache = LibPathCache->read_lstat(Path))
+@@ -542,7 +544,7 @@ std::optional<std::string> PathResolver::realpathCached(StringRef Path,
+ 
+   StringRef Separator(sys::path::get_separator());
+   SmallString<256> Resolved(Separator);
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__nocturne__) // Nocturne has no links
+   SmallVector<StringRef, 16> Components;
+ 
+   if (isRelative) {
 diff --git a/llvm/lib/LTO/ThinLTOCodeGenerator.cpp b/llvm/lib/LTO/ThinLTOCodeGenerator.cpp
 index 2ad2f97b..05b529ec 100644
 --- a/llvm/lib/LTO/ThinLTOCodeGenerator.cpp
@@ -3186,10 +3312,10 @@ index 00000000..ec7532a2
 +} // namespace llvm
 diff --git a/llvm/lib/Support/Nocturne/DynamicLibrary.inc b/llvm/lib/Support/Nocturne/DynamicLibrary.inc
 new file mode 100644
-index 00000000..24e04297
+index 00000000..2a45726d
 --- /dev/null
 +++ b/llvm/lib/Support/Nocturne/DynamicLibrary.inc
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,48 @@
 +//===- Nocturne/DynamicLibrary.inc - Nocturne DynamicLibrary ---*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -3213,6 +3339,11 @@ index 00000000..24e04297
 +}
 +
 +void *DynamicLibrary::HandleSet::DLOpen(const char *File, std::string *Err) {
++  // The program itself (File is null) opens, as the set of handles like on
++  // Windows: the JIT asks for it before it looks a symbol up. Its own symbols
++  // are found only when they were added.
++  if (!File)
++    return &getGlobals().OpenedHandles;
 +  if (Err)
 +    *Err = "Nocturne loads no libraries into a running app";
 +  return &Invalid;

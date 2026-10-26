@@ -57,6 +57,9 @@ def jobs():
         (spirv + '/vtn_generator_ids.h', [spirv + '/vtn_generator_ids_h.py', spirv + '/spir-v.xml', '@OUT'], False),
         ('src/gallium/auxiliary/draw_nir_lower_opcodes.c', ['src/gallium/auxiliary/draw/draw_nir_lower_opcodes.py',
                                                             '-p', nir], True),
+        # gallivm (llvmpipe, ports/mesa/llvmpipe.mk)
+        ('src/gallium/auxiliary/lp_bld_nir_no_integer_algebraic.c',
+         ['src/gallium/auxiliary/gallivm/lp_bld_nir_no_integer_algebraic.py', '-p', nir], True),
         ('src/gallium/auxiliary/u_tracepoints.c', ['src/gallium/auxiliary/util/u_tracepoints.py',
                                                    '-p', 'src/util/perf/', '-C', '@OUT'], False),
         ('src/gallium/auxiliary/u_tracepoints.h', ['src/gallium/auxiliary/util/u_tracepoints.py',

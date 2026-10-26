@@ -1,9 +1,10 @@
 # Mesa（WebGL／WebGL2のソフトウェア描画）
 
-ブラウザーのWebGL／WebGL2は、Mesaの GLSL／NIR コンパイラー、OpenGL ES 3 の
-state tracker、Gallium softpipe ラスタライザーで描く。LLVM、GLX／EGL、DRM、
-窓システムは含めない。ブラウザー側の接続は `nocturne_gl.c`／`nocturne_gl.h` と
-`user/libc/web/js_webgl.c`。
+ブラウザーのWebGL／WebGL2は、Mesaの GLSL／NIR コンパイラーと OpenGL ES 3 の
+state tracker で、GPU（Zink と NVK）か CPU で描く。CPU では Gallium の llvmpipe（シェーダーを
+LLVM の JIT で機械語にし、CPU の数のスレッドでタイルを塗る）、LLVM が無いビルドでは softpipe
+（TGSI を解釈する）。GLX／EGL、DRM、窓システムは含めない。ブラウザー側の接続は
+`nocturne_gl.c`／`nocturne_gl.h` と `user/libc/web/js_webgl.c`。
 
 ## 出所
 
@@ -11,7 +12,7 @@ state tracker、Gallium softpipe ラスタライザーで描く。LLVM、GLX／E
   （`VERSION` は `26.3.0-devel`）。
 - ライセンス：MIT（`third_party/mesa/docs/license.rst`、`third_party/mesa/licenses/`）。
 - 取り込み先：`third_party/mesa`。ビルドは `ports/mesa/mesa.mk`（Mesa の meson.build の
-  softpipe 構成に沿ったソース一覧）。
+  softpipe 構成に沿ったソース一覧）と、llvmpipe・gallivm の `ports/mesa/llvmpipe.mk`。
 
 ## 生成物
 
@@ -49,7 +50,11 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/util/u_qsort.cpp`、`src/util/texcompress_astc_luts.cpp/.h` | libc++ にスレッド支援が無いので、Mesa 自身のロックを使う。 |
 | `src/gallium/drivers/softpipe/sp_tex_sample.c/.h` | 圧縮・深度以外の色テクスチャーは、32×32タイルを丸ごとfloat変換する16項目のタイルキャッシュを通さず、資源の記憶から1texelずつ読む（mipmap／繰返しでキャッシュが入れ替わり続け、描画時間の大半を占めていた）。 |
 | `src/gallium/drivers/softpipe/sp_tile_cache.c/.h` | 描画先タイルを64画素から32画素にし、タイルキャッシュを50項目から4096項目（横64×縦64タイル＝2048×2048画素まで衝突なし）へ広げる（1080pの全画面canvasでは、50項目だと描画中にタイルの書戻しと再読込みが繰り返されていた）。タイルは初めて触れたときだけ確保する。 |
-| `src/gallium/drivers/softpipe/sp_prim_vbuf.c`、`sp_setup.c/.h`、`sp_context.h`、`sp_state_derived.c`、`sp_tile_cache.c/.h` | 三角形の描画をCPUの数（最大8）のスレッドへ分ける。各スレッドは draw の全三角形を辿り、32画素のタイル行のうち自分の行だけを塗る（画素ごとの描画順は保たれ、同じタイルを二つのスレッドが触らない。自分の行に掛からない三角形は設定前に捨てる）。呼出し側以外のスレッドは、文脈の影の写し・quad段・TGSI機械・サンプラーを自分用に持つ。起動・完了の待ちは短く回転してから条件変数で眠る。統計／遮蔽クエリー、層描画、image／buffer書込み、タイルキャッシュ経由のテクスチャー、64×64タイルを超える描画先は従来どおり一つのスレッドで描く。頂点バッファーを64KiB／4096索引へ広げ、draw の分割回数を減らす。 |
+| `src/gallium/drivers/softpipe/sp_prim_vbuf.c`、`sp_setup.c/.h`、`sp_context.h`、`sp_state_derived.c`、`sp_tile_cache.c/.h` | 三角形の描画をCPUの数（`util_get_cpu_caps`、最大8）のスレッドへ分ける。各スレッドは draw の全三角形を辿り、32画素のタイル行のうち自分の行だけを塗る（画素ごとの描画順は保たれ、同じタイルを二つのスレッドが触らない。自分の行に掛からない三角形は設定前に捨てる）。呼出し側以外のスレッドは、文脈の影の写し・quad段・TGSI機械・サンプラーを自分用に持つ。起動・完了の待ちは短く回転してから条件変数で眠る。統計／遮蔽クエリー、層描画、image／buffer書込み、タイルキャッシュ経由のテクスチャー、64×64タイルを超える描画先は従来どおり一つのスレッドで描く。頂点バッファーを64KiB／4096索引へ広げ、draw の分割回数を減らす。 |
+| `src/util/u_cpu_detect.c` | CPU の数は `cpu_info` の `scheduler_cpus`（アプリのスレッドを走らせる CPU）。llvmpipe の描画スレッドと softpipe の帯の数はここから決まる。 |
+| `src/gallium/auxiliary/gallivm/lp_bld_init.c` | 生成したコードが呼ぶ C の関数（`memcpy` などと `floorf` などの数学、compiler-rt の `__truncsfhf2` などと128ビットの除算）を `LLVMAddSymbol` で JIT に教える。Nocturne のプログラムは自分の記号を名前で引けない。 |
+| `src/gallium/auxiliary/gallivm/lp_bld_misc.cpp` | JIT を作れなかったとき、無い JIT をキャッシュの設定に使わない（上流の欠陥。理由を返して戻る）。 |
+| `src/gallium/auxiliary/gallivm/lp_bld_debug.h`、`src/gallium/drivers/llvmpipe/lp_context.c` | シェーダーを書き出すフォルダーは利用者の一時フォルダー（`n_temp_folder`）。`sys/stat.h` を読まず、文脈の作り直しを知らせる文書（`LP_CONTEXT_RESET_FILE`）は使わない。 |
 | `src/gallium/drivers/softpipe/sp_texture.c` | 新しいテクスチャー領域を必ずゼロ初期化する（他ページの解放済みメモリを Web 内容から見せない）。 |
 | `src/gallium/auxiliary/driver_trace/tr_dump.c` | `access()` の代わりに、トリガー文書が ISO `fopen("r+b")` で開けるかで判定し、ISO `remove` で消す。 |
 | `src/gallium/auxiliary/rtasm/rtasm_execmem.c/.h`、`rtasm_x86sse.c` | 頂点変換の x86 コード生成は `n_memory_reserve` の書込み可ページへ書き、`x86_get_func` で `n_memory_protect` により実行専用へ封印する（書込みと実行を同時に許さない）。 |
@@ -67,17 +72,35 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/gallium/drivers/zink/zink_resource.c`、`zink_context.c`、`zink_fence.c/.h` | ファイル記述子が無いので、dma-buf／opaque-fd のメモリ共有と sync file のフェンス取込みを外す。 |
 | `src/gallium/include/frontend/winsys_handle.h`、`src/gallium/drivers/zink/zink_resource.c` | ハンドルの型 `WINSYS_HANDLE_TYPE_NOCTURNE_SCANOUT`（nvrm の表示用画像の番号）を足す。`resource_from_handle` はこの型の PIPE_BUFFER だけを受け、`VkImportMemoryNocturneScanoutInfoMESA` を付けて VRAM に取り込む（下位割当て・キャッシュに入れない）。 |
 
+## llvmpipe（CPU での WebGL）
+
+`llvmpipe.mk` は、Nocturne 向けの LLVM の JIT の庫（`tools/llvm/build-nocturne/lib/libLLVMMCJIT.a`、
+`ports/llvm/build.py nocturne` が作る）があるときだけ、`src/gallium/drivers/llvmpipe` と
+`src/gallium/auxiliary/gallivm`（クローンの同じコミットから取り込み）を作る。無ければ何も足さず、CPU は
+softpipe で描く。`nocturne_gl.c` の `cpu_screen` が llvmpipe を作り、作れなければ softpipe にする。
+
+- draw の LLVM の経路（`DRAW_LLVM_AVAILABLE`）は draw の構造の形を変えるので、Mesa の全部を同じ値で
+  作る。`build/mesa/flags` がコンパイルの旗を覚え、変わったら Mesa を全部作り直す。
+- gallivm の C++（`lp_bld_misc.cpp`、`lp_bld_debug.cpp`）は LLVM 23 の C++ の API を使うので、
+  移植の clang++（`--target=x86_64-unknown-nocturne --sysroot=tools/llvm/sysroot`）で作る。残りの
+  Mesa は LLVM の C の API だけを読む。
+- 一つのプログラムに C++ の実行時は一つ：LLVM があれば全プログラムが libc++ 23（libc++abi を含む）と
+  libunwind（`tools/llvm/runtimes/Lib`）を使う。LLVM の庫と compiler-rt の builtins はプログラムの
+  結合（`build/libc-objects.list`）だけに入れ、SDK の `libc.a` には入れない。
+- 生成したコードは書き込みと実行を同時に許さないページに置かれ（LLVM の `Memory.inc`）、AVX まで
+  使う（カーネルは YMM を XSAVE で保つ。AVX-512 の状態は保たないので、LLVM は XCR0 を見て使わない）。
+
 ## Zink（GPU での WebGL）
 
 `zink.mk` が `src/gallium/drivers/zink`（クローンの同じコミットから、`ci/` を除いて取り込み）を
 作る。`nocturne_gl.c` は `nvrm_connect_ready_status` で nvrm の ready な GPU を探し、あれば
-`zink_create_screen` を試し、どちらかが駄目なら softpipe へ戻る。どうなったか（「drawing on the GPU with …」、
+`zink_create_screen` を試し、どちらかが駄目なら CPU（llvmpipe、無ければ softpipe）へ戻る。どうなったか（「drawing on the GPU with …」、
 GPU が使えない理由、「Zink did not start」）を、前に書いたものと変わったときだけ `Nocturne GL:` で始まる一行で
 Mesa の記録（システムの記録）へ書く。nvrm がどの GPU も出していない機械では何も書かない。`zink_create_screen`
 の間は記録を預かり（`mesa_log_hold`）、Zink と NVK の書いた行（`ZINK:`、`NVK:`、`vk_error*()` の
 `文書:行: … (VK_ERROR_…)`）を、結果と行のどちらかが前と変わったときだけ、その一行の前にまとめて書く。
 同じ理由の再試行は文脈ごとに書かない。行が一つも無ければ「it gave no reason」と書く。GPU のときは描画用バッファーの消去を
-`clear_texture`（GPU 上、描画の後ろに積むだけ）で行い、softpipe では従来どおり直接書く。
+`clear_texture`（GPU 上、描画の後ろに積むだけ）で行い、CPU では従来どおり直接書く。
 driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で提供する。
 
 ## NVK（NVIDIA の Vulkan、Turing 以降）
@@ -110,7 +133,7 @@ NVK・Zink・libnvrm・Rust は libc の遅延メンバーで、`nocturne_gl.c` 
 （`vk_common_GetPhysicalDeviceProperties2`、`vk_common_CmdCopyBuffer` など 51 個）がリンクされず、表の項が
 NULL のまま実機で呼ばれた。`scripts/link_unit.py` は単位を作るとき、単位から出る弱い参照を他のメンバーが
 定義していればビルドを止める。SDK の `libc.a`（`scripts/mksdk.sh`）には Rust の .a の各メンバーを展開して入れる。
-GPU が無い（`C:\Nocturne\System\nvrm` が動いていない）機械では、チャンネル接続がすぐ失敗し、Zink は softpipe へ戻る。
+GPU が無い（`C:\Nocturne\System\nvrm` が動いていない）機械では、チャンネル接続がすぐ失敗し、CPU で描く。
 
 | 変更したファイル（NVK・Vulkan） | 内容 |
 |---|---|
@@ -133,7 +156,7 @@ GPU が無い（`C:\Nocturne\System\nvrm` が動いていない）機械では�
 
 1. ブラウザー（`user/apps/browser.c`）は、ページが全画面の canvas だけのとき（`web_direct_open`：
    上に dialog が無い、canvas の箱が自分では何も塗らない、object-fit した絵が箱に収まる、GPU で描き
-   alpha が無いか乗算済み）に限り `win_direct` を求める。GPU の無い softpipe の文脈は求めない。
+   alpha が無いか乗算済み）に限り `win_direct` を求める。CPU で描く文脈は求めない。
 2. 系が `EV_DIRECT`（key 1）を送ると、各フレームを `ngl_scanout_present` で出す。`nocturne_gl.c` は
    `nvrm_scanout_create` で画面の大きさの画像を三枚取り、Zink の `resource_from_handle` で buffer として
    取り込む。描画バッファーを（大きさが違えば線形に拡大縮小してから）`image_copy_buffer` で画像の

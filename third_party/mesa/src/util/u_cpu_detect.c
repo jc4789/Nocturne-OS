@@ -81,6 +81,10 @@
 #include <cpu-features.h>
 #endif
 
+#if DETECT_OS_NOCTURNE
+#include "nocturne.h"
+#endif
+
 #if DETECT_OS_WINDOWS
 #include <windows.h>
 #if DETECT_CC_MSVC
@@ -784,6 +788,16 @@ _util_cpu_detect_once(void)
       SYSTEM_INFO system_info;
       GetSystemInfo(&system_info);
       available_cpus = MAX2(1, system_info.dwNumberOfProcessors);
+   }
+#elif DETECT_OS_NOCTURNE
+   {
+      /* The CPUs that run a program's threads: CPU 0 and the APs that also
+       * run user tasks (the rest only run the kernel's jobs). */
+      struct n_cpuinfo info = {0};
+      if (cpu_info(&info) >= 0) {
+         available_cpus = info.scheduler_cpus;
+         total_cpus = MAX2(info.detected_cpus, info.online_cpus);
+      }
    }
 #elif DETECT_OS_POSIX
 #  if defined(HAS_SCHED_GETAFFINITY)

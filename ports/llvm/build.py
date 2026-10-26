@@ -8,7 +8,8 @@
             重ねる。先に make と host が要る。
   nocturne  host の clang で、Nocturne で動く clang・lld など（一つのプログラム llvm）を作る。
             tools/llvm/nocturne の System に llvm を、SDK に SDK へ加わる物（clang のヘッダーと
-            builtins、C++ の実行時ライブラリー）を置く（ports/llvm/llvm.mk）。先に runtimes が要る。
+            builtins、C++ の実行時ライブラリー）を置く（ports/llvm/llvm.mk）。プログラムに結合する
+            LLVM のライブラリー（llvmpipe の JIT の MCJIT）も build-nocturne/lib に作る。先に runtimes が要る。
 """
 import argparse
 import os
@@ -39,6 +40,9 @@ RUNTIMES_SPACE = 4 << 30
 # gives each name its launcher.
 NOCTURNE_TOOLS = ('clang', 'lld', 'llvm-ar', 'llvm-nm', 'llvm-objcopy', 'llvm-objdump',
                   'llvm-readobj', 'llvm-size', 'llvm-symbolizer', 'llvm-cxxfilt')
+# The libraries of LLVM that are not in a tool but that programs are linked against: MCJIT, which
+# llvmpipe compiles WebGL's shaders with (ports/mesa/llvmpipe.mk links them from build-nocturne/lib).
+NOCTURNE_LIBRARIES = ('LLVMMCJIT',)
 # What goes into C:\Nocturne: the program in System, its part of the SDK in SDK.
 DIST = LLVM / 'nocturne'
 # Room for the build tree of clang and lld for Nocturne and what it makes.
@@ -264,7 +268,7 @@ def build_nocturne():
         '-DLLVM_PARALLEL_LINK_JOBS=2',
     ] + version_args(), check=True, env=env)
     subprocess.run([ninja, '-C', str(build), '-j', jobs(), 'llvm-driver',
-                    'clang-resource-headers'], check=True, env=env)
+                    'clang-resource-headers', *NOCTURNE_LIBRARIES], check=True, env=env)
 
     # scripts/mksdk.sh --llvm adds SDK to C:\Nocturne\SDK: the C++ runtimes as
     # the runtimes stage installed them, and clang's headers and builtins in

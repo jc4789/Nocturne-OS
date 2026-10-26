@@ -266,19 +266,31 @@ WASM_RT_OBJ := $(patsubst %.c,$(BUILD)/u/%.o,$(WASM_RT_SRC))
 WASM_RT_INPUTS := $(wildcard third_party/wabt/wasm2c/* ports/wabt/include/*.h)
 CXX_RUNTIME_OBJ := $(addprefix $(BUILD)/cxx/libcxx/,algorithm.o hash.o memory.o string.o vector.o verbose_abort.o)
 WASM_BRIDGE := $(BUILD)/u/user/libc/web/js_wasm.cpp.o
-WASM_LINK := $(WASM_BRIDGE) $(BUILD)/u/user/libc/cxxabi.cpp.o $(WABT_OBJ) $(WASM2C_OBJ) $(CXX_RUNTIME_OBJ) $(BUILD)/tcc/libtcc.o $(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o
+WASM_LINK := $(WASM_BRIDGE) $(WABT_OBJ) $(WASM2C_OBJ) $(BUILD)/tcc/libtcc.o $(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o
 # nvrm: NVIDIA's RM as a driver app (ports/nvidia/README.md). init starts it only when an
 # NVIDIA display function is present, so other machines just carry the file.
 include ports/nvidia/nvrm.mk
 include ports/mesa/mesa.mk
+# The C++ runtime of every program. LLVM's libraries, which llvmpipe compiles shaders with
+# (ports/mesa/llvmpipe.mk), are built against the LLVM port's libc++ 23 with its libc++abi and
+# libunwind, so when they are linked every program has that runtime; otherwise the libc++ 18
+# subset of scripts/build_cxx.py with Nocturne's own ABI (user/libc/cxxabi.cpp). A program never
+# has both: the C++ compiled here with libc++ 18's headers uses only what libc++ 23 still provides.
+CXX_RUNTIME_LINK := $(if $(LLVMPIPE),$(LLVM_RUNTIMES)/Lib/libc++.a $(LLVM_RUNTIMES)/Lib/libunwind.a,\
+    $(BUILD)/u/user/libc/cxxabi.cpp.o $(CXX_RUNTIME_OBJ))
 # Zink and NVK (with its Rust archive and libnvrm) are lazy members like the rest: only a program
 # that draws with OpenGL pulls them in.
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) $(MESA_OBJ) \
-    $(ZINK_OBJ) $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) \
+    $(CXX_RUNTIME_LINK) $(MESA_OBJ) $(ZINK_OBJ) $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
+# Programs are linked from the libc's members and, with llvmpipe, LLVM's libraries; the SDK's
+# libc.a is made from the members alone (SDK_RSP).
 LIBC_RSP := $(BUILD)/libc-objects.list
+SDK_RSP := $(BUILD)/sdk-objects.list
 
-# Windowsのコマンド長上限を超えないよう、lldとSDKに同じobject一覧を渡す。
-$(LIBC_RSP): $(LIBC_LINK) Makefile
+# Windowsのコマンド長上限を超えないよう、lldとSDKにobject一覧をファイルで渡す。
+$(LIBC_RSP): $(LIBC_LINK) $(LLVM_JIT_LIBS) Makefile
+	@$(file >$@,$(LIBC_LINK) $(LLVM_JIT_LIBS))
+$(SDK_RSP): $(LIBC_LINK) Makefile
 	@$(file >$@,$(LIBC_LINK))
 
 # A unit's check (scripts/link_unit.py) reads the symbols of every other member.
@@ -431,10 +443,11 @@ $(BUILD)/u/%.cpp.o: %.cpp $(BUILD)/cxx/libc++.a $(CXX_HEADERS)
 	@echo "  CXX  $<"
 	@$(PY) scripts/build_cxx.py compile $< -o $@
 
-$(CPP_BINS): $(PROGRAMS)/%: $(BUILD)/u/user/apps/%.cpp.o $(BUILD)/u/user/libc/cxxabi.cpp.o $(BUILD)/cxx/libc++.a $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/user.ld user/cxx.ld
+# The C++ runtime is among the libc's members (CXX_RUNTIME_LINK).
+$(CPP_BINS): $(PROGRAMS)/%: $(BUILD)/u/user/apps/%.cpp.o $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/user.ld user/cxx.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD++ $@"
-	@$(LD) $(patsubst user/user.ld,user/cxx.ld,$(ULDFLAGS)) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< $(BUILD)/u/user/libc/cxxabi.cpp.o $(BUILD)/cxx/libc++.a --start-lib @$(LIBC_RSP) --end-lib -o $@
+	@$(LD) $(patsubst user/user.ld,user/cxx.ld,$(ULDFLAGS)) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 # ---------------------------------------------------------------- TinyCC (the in-OS C compiler)
 TCC_DIR   := third_party/tinycc
@@ -477,14 +490,14 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
 
 # the SDK: headers and libraries for compiling inside Nocturne (C:\Nocturne\SDK)
-$(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) $(TCCRT_OBJ) scripts/mksdk.sh \
+$(BUILD)/sdk.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(SDK_RSP) $(TCCRT_OBJ) scripts/mksdk.sh \
 		$(shell find user/include ports/tcc/include third_party/bearssl/inc ports/nvidia/include $(TCC_DIR)/include -name '*.h') \
 		third_party/quickjs/quickjs.h $(shell find user/libc -name '*.h' -o -name '*.inc' -o -name '*.js') \
 		$(LXB_HEADERS) ports/lexbor/include/memory.h third_party/lexbor/headers.list \
 		common/abi.h common/gfx.h common/gpu_abi.h common/display_abi.h user/user.ld \
 		$(wildcard user/apps/*.c user/apps/*.h user/apps/*.js user/apps/*.ts) $(LLVM_SDK_FILES)
 	@echo "  SDK"
-	@bash scripts/mksdk.sh $(SDK) $(if $(LLVM_SDK),--llvm $(LLVM_SDK)) $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
+	@bash scripts/mksdk.sh $(SDK) $(if $(LLVM_SDK),--llvm $(LLVM_SDK)) $(BUILD)/u/user/libc/crt0.asm.o @$(SDK_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images
