@@ -284,7 +284,9 @@ static float text_width_uncached(const style_t *st, const wfont *f, const char *
             if (s[i] == ' ') w += st->word_spacing;
         }
     }
-    return w;
+    /* Negative spacing may close a run up but never gives it a negative advance:
+       a collapsed space between inline-blocks under letter-spacing: -0.4em is 0 wide. */
+    return w < 0 ? 0 : w;
 }
 
 float style_text_width(const style_t *st, const char *s, size_t n) {
@@ -1268,13 +1270,18 @@ static void build_items(box_t *parent, struct ibuild *s) {
             it->st = c->st;
             it->link = s->link;
             it->shift = s->shift + va_shift(c->st);
-            it->brk = c->st->white_space != WS_NOWRAP && c->st->white_space != WS_PRE;
-            /* a break is also allowed before it */
-            if (s->v->n >= 2) {
-                struct item *pv = &s->v->v[s->v->n - 2];
-                if (pv->kind == IT_TEXT || pv->kind == IT_ATOMIC || pv->kind == IT_CLOSE) {
-                    if (parent->st->white_space != WS_NOWRAP && parent->st->white_space != WS_PRE) pv->brk = true;
-                }
+            /* CSS Text 3 §5.1: a soft wrap opportunity before and after an atomic inline,
+               allowed by the white-space of the nearest common ancestor of the atomic and its
+               neighbour. Its own white-space only governs its contents. */
+            it->brk = parent->st->white_space != WS_NOWRAP && parent->st->white_space != WS_PRE;
+            /* Before it: after the item ahead of the inline boxes it is the first content of,
+               so their start edges move to the next line with it. */
+            size_t at = s->v->n - 1;
+            box_t *ancestor = parent;
+            while (at > 0 && s->v->v[at - 1].kind == IT_OPEN) { at--; ancestor = s->v->v[at].box->parent; }
+            if (at > 0 && ancestor && ancestor->st->white_space != WS_NOWRAP && ancestor->st->white_space != WS_PRE) {
+                struct item *pv = &s->v->v[at - 1];
+                if (pv->kind == IT_TEXT || pv->kind == IT_ATOMIC || pv->kind == IT_CLOSE) pv->brk = true;
             }
             s->last_space = false;
         }
@@ -1361,7 +1368,16 @@ static void item_vext(struct item *it, float *above, float *below) {
     if (it->kind == IT_ATOMIC) {
         box_t *c = it->box;
         float h = c->h + vext(c) + c->m[0] + c->m[2];
-        float bl = c->last_baseline >= 0 && c->st->overflow == OV_VISIBLE
+        /* css-align-3 §9.1: only a block container that is a scroll container
+           keeps the legacy block-end margin edge; inline-flex, inline-grid and
+           inline-table use their content baseline whatever their overflow, and
+           HTML button layout derives a button's baseline from its contents. */
+        uint8_t display = c->st->display;
+        bool button = c->node && !c->node->foreign && c->node->tag == T_button;
+        bool legacy_end = (c->st->overflow == OV_HIDDEN || c->st->overflow == OV_SCROLL ||
+                           c->st->overflow == OV_AUTO) && !button &&
+                          display != D_INLINE_FLEX && display != D_INLINE_GRID && display != D_INLINE_TABLE;
+        float bl = c->last_baseline >= 0 && !legacy_end
                        ? c->m[0] + c->b[0] + c->p[0] + c->last_baseline
                        : h;
         if (c->atomic == AT_CHECKBOX || c->atomic == AT_RADIO || c->atomic == AT_INPUT ||
@@ -4055,8 +4071,17 @@ static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float
         layout_current()->clamp_depth--;
     }
     if (b->kind != B_TABLE) {
+        float content = b->h;
         if (sh >= 0) b->h = sh;
         if (!split_inline) b->h = clamp_h(b, b->h, cbh);
+        /* HTML rendering §15.5.3: a button's anonymous content box (not a flex or grid
+           button's) is centred vertically when it does not overflow the button. */
+        if (b->node && !b->anon && !b->node->foreign && b->node->tag == T_button) {
+            float dy = b->kind != B_FLEX && b->kind != B_GRID && b->h > content ? (b->h - content) / 2 : 0;
+            if (b->baseline >= 0) b->baseline += dy;
+            if (b->last_baseline >= 0) b->last_baseline += dy;
+            b->content_dy = dy;
+        }
     }
     if (b->clamp_trace) b->clamp_trace->post_h = b->h;
     if (root) bfc_free(&own);
