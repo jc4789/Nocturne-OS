@@ -23,7 +23,7 @@ for sig in ("void web_avmedia_enter(","void web_avmedia_leave("):
     funcs+=function(source,sig)
 at=source.index("enum { SNAPSHOT_BAND_ROWS")
 funcs+=source[at:source.index("static void snapshot_band(",at)]
-for sig in ("static void snapshot_band(","static void snapshot_draw(","static void snapshot_clear(","static void snapshot_publish(","void web_avmedia_snapshot_begin(","void web_avmedia_snapshot_reject(","bool web_avmedia_snapshot_prepare(","void web_avmedia_snapshot_probe(","void web_avmedia_snapshot_finish("):
+for sig in ("static void snapshot_band(","static void snapshot_draw(","static void snapshot_clear(","static bool snapshot_publishable(","static void snapshot_publish(","void web_avmedia_snapshot_begin(","void web_avmedia_snapshot_reject(","bool web_avmedia_snapshot_prepare(","static size_t snapshot_band_row(","void web_avmedia_snapshot_probe(","void web_avmedia_snapshot_finish("):
     funcs+=function(source,sig)
 drawfunc="".join(function(draw,s) for s in ("static int64_t centre_position(","static uint32_t blend(","void nmedia_draw("))
 gfxfunc="".join(function(gfx,s) for s in ("uint8_t gfx_clip_alpha(","int gfx_clip_row(","void gfx_init(","void gfx_noclip(","void gfx_pixel(","void gfx_fill("))

@@ -38,8 +38,11 @@ bool web_avmedia_pip_paint(web_doc *,node_t *,canvas_t *);
  * ordinary paint, without an independent fixed pixel ceiling. */
 /* canvas is the window surface the document paints; a video painted into any
  * other surface (a transform's private raster) is not on screen where its
- * box is, so it cannot be patched there. */
-void web_avmedia_snapshot_begin(web_doc *doc,const canvas_t *canvas);
+ * box is, so it cannot be patched there. Its clip is what this paint draws;
+ * x, y, w, h are the document's viewport on it. A surface armed by an earlier
+ * paint stays armed where this one does not draw, and a paint that draws a
+ * band of it updates that band. */
+void web_avmedia_snapshot_begin(web_doc *doc,const canvas_t *canvas,int x,int y,int w,int h);
 void web_avmedia_snapshot_reject(void);
 /* Bounded-effect layers reject only their actual clipped screen extent.
  * Probe coordinates are translated to the committed candidate surface. */

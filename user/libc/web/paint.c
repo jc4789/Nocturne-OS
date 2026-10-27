@@ -3006,7 +3006,7 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     if(snapshot_root){
         /* A damage repaint redraws only the frames' pixels inside its clip. */
         double clip[4]={(double)doc_x+c->cx0-x,(double)doc_y+c->cy0-y,(double)doc_x+c->cx1-x,(double)doc_y+c->cy1-y};
-        web_frames_prepare_paint(d,clip);web_avmedia_snapshot_begin(d,c);
+        web_frames_prepare_paint(d,clip);web_avmedia_snapshot_begin(d,c,x,y,w,h);
     }
     if(profile){uint64_t now=uptime_ms();paint_profile.frames_ms+=now-mark;mark=now;}
     struct pctx P = {0};

@@ -118,10 +118,15 @@ struct web_avmedia {
         uint32_t *committed,*black,*output;
         size_t count;
         int x,y,w,h,video_x,video_y,video_w,video_h,source_w,source_h;
+        /* What the current paint draws of it: all of a new surface, or the
+           damaged band of one kept from an earlier paint. */
+        int band_x,band_y,band_w,band_h;
         int scroll_x,scroll_y;
         uint32_t generation;
         uint64_t delivered;
         bool valid;
+        /* Cut by the damage alone: the rest of the video waits for a paint of its box. */
+        bool partial;
     } snapshot;
     uint64_t window_frames;
     /* The presented frame ordinary paint was last asked to show. It outlives
@@ -150,8 +155,9 @@ static void video_counts(struct web_avmedia *s,uint64_t *decoded,uint64_t *dropp
     *decoded=s?s->video_frames:0;*dropped=s?s->dropped_video_frames:0;
     if(s&&s->mse_active){uint64_t native_decoded,native_dropped;nmedia_mse_worker_video_stats(s->mse_worker,&native_decoded,&native_dropped);*decoded=native_decoded;*dropped+=native_dropped;}
 }
+/* Play, pause, reset and stop are rare and say why the timing lines stopped:
+   traced with or without --debug-js. */
 static void transition(struct web_avmedia *s,const char *reason,uint32_t target){
-    if(!debug_transitions)return;
     if(s->transition_pending){const char *pending=s->transition_pending;s->transition_pending=NULL;transition(s,pending,s->generation);}
     unsigned flags=(s->playing?1u:0u)|(s->ended?2u:0u)|(s->starved?4u:0u)|(s->error[0]?8u:0u)|((unsigned)s->ready<<4)|(s->mse_active?256u:0u)|(s->url_input?512u:0u);
     if(s->transition_reason==reason&&s->transition_generation==s->generation&&s->transition_target==target&&s->transition_flags==flags)return;
@@ -160,7 +166,7 @@ static void transition(struct web_avmedia *s,const char *reason,uint32_t target)
     snprintf(message,sizeof message,"Native media transition: reason %s, generation %u->%u, input %s, playing %u/ready %d/starved %u/ended %u/error %u, clock %lld ms, presented %llu/decoded %llu/drop %llu, pending %d/ahead %d; wall %llu ms",
         reason,s->generation,target,s->mse_active?"MSE":s->url_input?"Range":"buffer",s->playing,s->ready,s->starved,s->ended,s->error[0]!=0,(long long)current(s,now),
         (unsigned long long)s->presented_frames,(unsigned long long)s->video_frames,(unsigned long long)s->dropped_video_frames,s->pending.kind,s->ahead.kind,(unsigned long long)now);
-    web_js_console(s->doc,0,message);
+    web_js_trace(s->doc,message);
     if(!strcmp(reason,"native-error-stop")&&s->error[0]){
         /* This field contains only native codec/transport/sink diagnostics:
            authors' URL/MIME/error strings are never copied into it. Keep a
@@ -183,6 +189,8 @@ static unsigned snapshot_phase;
 static bool snapshot_rejected;
 static const char *snapshot_why;static int snapshot_why_line;
 static bool snapshot_blend; /* linear compositing (group opacity, rounded clip) crosses the candidate */
+/* The canvas clip this paint draws (the damage within the viewport) and the viewport itself. */
+static int64_t snapshot_damage[4],snapshot_view[4];
 static void snapshot_reject_as(const char *why,int line){
     if(!snapshot_rejected){snapshot_why=why;snapshot_why_line=line;}
     snapshot_rejected=true;
@@ -322,7 +330,11 @@ static int audio_fill_gap(struct web_avmedia *s,uint32_t queued){
         if(s->base_ms>INT64_MAX/(SOUND_RATE/1000)||s->base_ms<INT64_MIN/(SOUND_RATE/1000)){strlcpy(s->error,"native audio base time overflow",sizeof s->error);return -1;}
         s->audio_end_frame=s->base_ms*(SOUND_RATE/1000);
     }
-    if(target<=s->audio_end_frame)return 0;
+    /* PTS arrive in whole milliseconds, so the next packet of a continuous
+       stream lands up to one ms off where the last one ended (AAC's 1024
+       frames are 21.33 ms). That is the timestamp's resolution, not a gap:
+       filling it put a click of silence into every third packet. */
+    if(target<=s->audio_end_frame+SOUND_RATE/1000)return 0;
     if(s->audio_end_frame<0&&target>INT64_MAX+s->audio_end_frame){strlcpy(s->error,"native audio gap overflow",sizeof s->error);return -1;}
     if(queued>=WEB_AUDIO_TARGET)return 2;
     size_t frames=(size_t)MIN(MIN((int64_t)ceil((target-s->audio_end_frame)/s->rate),(int64_t)(WEB_AUDIO_TARGET-queued)),4096);
@@ -632,7 +644,7 @@ static bool mse_prepare_pump(struct web_avmedia *s,uint64_t until,bool cooperati
         }
     }
     s->mse_preparing=false;
-    if(cooperative){if(debug_transitions)s->transition_pending="mse-resume-prepared";}
+    if(cooperative)s->transition_pending="mse-resume-prepared";
     else if(!initial)transition(s,"mse-resume-prepared",s->generation);
     return true;
 }
@@ -1205,7 +1217,7 @@ static void pump(struct web_avmedia *s,uint64_t now,uint64_t until,bool cooperat
     if(s->audio_clock_failed)audio_failed(s,now);
     if(debug_transitions)s->profile_pump_ms+=uptime_ms()-start;
     if(playing&&!s->playing)clear_ahead(s);
-    if(debug_transitions&&((playing&&!s->playing)||(preparing&&!s->mse_preparing&&s->error[0])))s->transition_pending=s->error[0]?"native-error-stop":s->ended?"native-eos-stop":"native-stop";
+    if((playing&&!s->playing)||(preparing&&!s->mse_preparing&&s->error[0]))s->transition_pending=s->error[0]?"native-error-stop":s->ended?"native-eos-stop":"native-stop";
     /* Interrupt service never calls logging/JS/embedder callbacks. Preserve
        its stop reason until the ordinary document tick or teardown point. */
     if(!cooperative&&s->transition_pending)transition(s,s->transition_pending,s->generation);
@@ -1234,15 +1246,18 @@ static void snapshot_draw(void *context,uint32_t *dst,int pitch){
 }
 /* This path uses only native stream pixels and an immutable resolved suffix.
  * The host performs its own current-window guard before touching UI memory. */
+/* The current picture can go to the armed surface without paint. */
+static bool snapshot_publishable(struct web_avmedia *s) {
+    return s->snapshot.valid && s->doc && s->doc->live && s->playing &&
+       !s->mse_seeking && !s->range_resume && !nmedia_worker_seeking(s->worker) &&
+       s->pixels && s->generation==s->snapshot.generation &&
+       s->width==s->snapshot.source_w && s->height==s->snapshot.source_h;
+}
 static void snapshot_publish(struct web_avmedia *s) {
     bool unpublished=s->snapshot.delivered!=s->presented_frames;
     if(s->snapshot.valid&&(!s->doc||!s->doc->live||!s->node||!s->node->owner||
        (s->node->owner!=s->doc&&s->node->owner->dom_family!=s->doc)||!doc_node_connected(s->node))){snapshot_clear(s);return;}
-    if(!s->snapshot.valid || !s->doc || !s->doc->live || !s->playing ||
-       s->mse_seeking || s->range_resume || nmedia_worker_seeking(s->worker) ||
-       !s->pixels || s->generation!=s->snapshot.generation ||
-       s->width!=s->snapshot.source_w || s->height!=s->snapshot.source_h ||
-       !unpublished){
+    if(!snapshot_publishable(s) || !unpublished){
         if(s->damaged_frames!=s->presented_frames&&s->doc&&s->doc->live){s->damaged_frames=s->presented_frames;doc_paint_damage(s->doc,s->node);}
         return;
     }
@@ -1271,17 +1286,17 @@ static void timing_profile(struct web_avmedia *s,uint64_t now){
         s->pending.kind,(long long)s->pending.pts_ms,s->ahead_count,(long long)(s->ahead.kind?s->ahead.pts_ms:-1),s->starved,s->ended,s->snapshot_why?s->snapshot_why:"-",s->snapshot_why_line);
     /* queued includes only this stream's measured DMA contribution, not other
        streams' samples. Remote flags retain server-estimate semantics. */
-    web_js_console(s->doc,0,message);
+    web_js_trace(s->doc,message);
     if(debug_transitions){
         snprintf(message,sizeof message,"Native audio sink: generation %u, software %u/device %u frames, consumed %llu/committed %llu, clock-flags %u, rate %.3f/pitch %u",
             status.generation,status.queued_frames,status.device_pending_frames,(unsigned long long)status.played_frames,(unsigned long long)status.committed_frames,status.flags,s->rate,s->preserve_pitch);
-        web_js_console(s->doc,0,message);
+        web_js_trace(s->doc,message);
         struct nmedia_worker_stats stats;nmedia_worker_snapshot(s->worker,&stats);
         snprintf(message,sizeof message,"Native media supply: generation %u, pumps %llu/cooperative %llu/time %llu ms/max-gap %llu ms; Range IPC requests %llu/responses %llu/request-time %llu/max %llu ms, tx %llu/rx %llu bytes, handoffs %llu/header-waits %llu, receiving %zu/%zu bytes/header %zu/waiting %u; video %dx%d",
             s->generation,(unsigned long long)s->profile_pumps,(unsigned long long)s->profile_services,(unsigned long long)s->profile_pump_ms,(unsigned long long)s->profile_pump_gap,
             (unsigned long long)stats.requests,(unsigned long long)stats.responses,(unsigned long long)stats.request_ms,(unsigned long long)stats.max_request_ms,(unsigned long long)stats.tx_bytes,(unsigned long long)stats.rx_bytes,
             (unsigned long long)stats.handoffs,(unsigned long long)stats.header_waits,stats.payload_bytes,stats.payload_total,stats.header_bytes,stats.waiting,s->width,s->height);
-        web_js_console(s->doc,0,message);s->profile_pumps=s->profile_services=s->profile_pump_ms=s->profile_pump_gap=0;
+        web_js_trace(s->doc,message);s->profile_pumps=s->profile_services=s->profile_pump_ms=s->profile_pump_gap=0;
     }
 }
 void web_avmedia_tick(web_doc *d,uint64_t now){
@@ -1352,11 +1367,16 @@ void web_avmedia_checkpoint(void){
     if((++skipped&15u)!=0)return;
     web_avmedia_service(uptime_ms());
 }
-void web_avmedia_snapshot_begin(web_doc *d,const canvas_t *c) {
+void web_avmedia_snapshot_begin(web_doc *d,const canvas_t *c,int x,int y,int w,int h) {
     web_avmedia_enter();snapshot_document=d;snapshot_canvas=c;snapshot_candidate=NULL;
     snapshot_phase=0;snapshot_rejected=false;snapshot_why=NULL;snapshot_why_line=0;snapshot_blend=false;
     nmedia_ff_free(snapshot_regions);snapshot_regions=NULL;snapshot_region_count=snapshot_region_capacity=0;
-    for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d)s->snapshot.valid=false;
+    /* A surface kept from an earlier paint stays armed: service cannot publish
+       while this paint holds the media lock, and the paint below either
+       redraws its band, finds it where it was or retires it. */
+    snapshot_damage[0]=c->cx0;snapshot_damage[1]=c->cy0;snapshot_damage[2]=c->cx1;snapshot_damage[3]=c->cy1;
+    snapshot_view[0]=MAX(x,0);snapshot_view[1]=MAX(y,0);
+    snapshot_view[2]=MIN((int64_t)x+w,c->w);snapshot_view[3]=MIN((int64_t)y+h,c->h);
 }
 void web_avmedia_layout_begin(web_doc *d){
     /* Layout mutates boxes, not the previously committed screen. The raster
@@ -1375,8 +1395,9 @@ static void snapshot_region_note(const canvas_t *c,int x,int y,int w,int h,int l
     if(r.x0>=r.x1||r.y0>=r.y1)return;
     if(snapshot_phase){
         if(!snapshot_candidate){snapshot_reject_as("paint",line);return;}
-        r.x0+=snapshot_candidate->snapshot.x;r.x1+=snapshot_candidate->snapshot.x;
-        r.y0+=snapshot_candidate->snapshot.y;r.y1+=snapshot_candidate->snapshot.y;
+        /* The probe canvas begins at the band this paint draws. */
+        r.x0+=snapshot_candidate->snapshot.band_x;r.x1+=snapshot_candidate->snapshot.band_x;
+        r.y0+=snapshot_candidate->snapshot.band_y;r.y1+=snapshot_candidate->snapshot.band_y;
     }
     if(snapshot_candidate){
         if(snapshot_region_intersects(&r,snapshot_candidate)){if(edge)snapshot_blend=true;else snapshot_reject_as("paint",line);}
@@ -1404,46 +1425,78 @@ bool web_avmedia_snapshot_prepare(web_doc *d,canvas_t *c,canvas_t *probe,
     struct web_avmedia *s=snapshot_candidate;
     if(!d || d!=snapshot_document || snapshot_rejected || !s || !d->live || d->frame_parent ||
        !c || !c->px || !probe || !x || !y)return false;
-    size_t count,bytes;
-    if(!web_video_snapshot_extent(c->w,c->h,c->pitch,
-                                 s->snapshot.x,s->snapshot.y,s->snapshot.w,s->snapshot.h,
-                                 &count,&bytes))return false;
-    /* Only this actual visible span is reserved. Allocation/heap failures keep
-       ordinary paint as the fallback, with no new memory/decoder allowance. */
-    if(count!=s->snapshot.count) {
-        uint8_t *storage=nmedia_ff_realloc(s->snapshot.storage,bytes);
-        if(!storage)return false;
-        s->snapshot.storage=storage;s->snapshot.count=count;
+    if(s->snapshot.valid&&(s->snapshot.scroll_x!=scroll_x||s->snapshot.scroll_y!=scroll_y)){
+        /* The kept surface belongs to another scroll position: only the band is current. */
+        s->snapshot.valid=false;s->snapshot.partial=true;
+        s->snapshot.x=s->snapshot.band_x;s->snapshot.y=s->snapshot.band_y;
+        s->snapshot.w=s->snapshot.band_w;s->snapshot.h=s->snapshot.band_h;
     }
-    s->snapshot.committed=(uint32_t*)s->snapshot.storage;
-    s->snapshot.black=s->snapshot.committed+count;
-    s->snapshot.output=s->snapshot.black+count;
-    s->snapshot.opaque=(uint8_t*)(s->snapshot.output+count);
-    for(int row=0;row<s->snapshot.h;row++)
-        memcpy(s->snapshot.committed+(size_t)row*s->snapshot.w,
-               c->px+(size_t)(s->snapshot.y+row)*c->pitch+s->snapshot.x,(size_t)s->snapshot.w*4);
+    if(!s->snapshot.valid){
+        size_t count,bytes;
+        if(!web_video_snapshot_extent(c->w,c->h,c->pitch,
+                                     s->snapshot.x,s->snapshot.y,s->snapshot.w,s->snapshot.h,
+                                     &count,&bytes))return false;
+        /* Only this actual visible span is reserved. Allocation/heap failures keep
+           ordinary paint as the fallback, with no new memory/decoder allowance. */
+        if(count!=s->snapshot.count) {
+            uint8_t *storage=nmedia_ff_realloc(s->snapshot.storage,bytes);
+            if(!storage)return false;
+            s->snapshot.storage=storage;s->snapshot.count=count;
+        }
+        s->snapshot.committed=(uint32_t*)s->snapshot.storage;
+        s->snapshot.black=s->snapshot.committed+count;
+        s->snapshot.output=s->snapshot.black+count;
+        s->snapshot.opaque=(uint8_t*)(s->snapshot.output+count);
+    }
+    size_t band=(size_t)(s->snapshot.band_y-s->snapshot.y)*(size_t)s->snapshot.w+(size_t)(s->snapshot.band_x-s->snapshot.x);
+    for(int row=0;row<s->snapshot.band_h;row++)
+        memcpy(s->snapshot.committed+band+(size_t)row*s->snapshot.w,
+               c->px+(size_t)(s->snapshot.band_y+row)*c->pitch+s->snapshot.band_x,(size_t)s->snapshot.band_w*4);
     s->snapshot.target=*c;s->snapshot.scroll_x=scroll_x;s->snapshot.scroll_y=scroll_y;
     s->snapshot.generation=s->generation;
     s->snapshot.source_w=s->width;s->snapshot.source_h=s->height;
-    gfx_init(probe,s->snapshot.output,s->snapshot.w,s->snapshot.h,s->snapshot.w);
-    *x=s->snapshot.x;*y=s->snapshot.y;return true;
+    gfx_init(probe,s->snapshot.output+band,s->snapshot.band_w,s->snapshot.band_h,s->snapshot.w);
+    *x=s->snapshot.band_x;*y=s->snapshot.band_y;return true;
+}
+static size_t snapshot_band_row(const struct web_avmedia *s,int row){
+    return (size_t)(s->snapshot.band_y-s->snapshot.y+row)*(size_t)s->snapshot.w+(size_t)(s->snapshot.band_x-s->snapshot.x);
 }
 void web_avmedia_snapshot_probe(unsigned phase) {
-    if(phase==2 && snapshot_candidate)
-        memcpy(snapshot_candidate->snapshot.black,snapshot_candidate->snapshot.output,snapshot_candidate->snapshot.count*4);
+    struct web_avmedia *s=snapshot_candidate;
+    if(phase==2 && s)for(int row=0;row<s->snapshot.band_h;row++){
+        size_t at=snapshot_band_row(s,row);
+        memcpy(s->snapshot.black+at,s->snapshot.output+at,(size_t)s->snapshot.band_w*4);
+    }
     snapshot_phase=phase;
 }
 bool web_avmedia_snapshot_is_probe(void) {return snapshot_phase!=0;}
 void web_avmedia_snapshot_finish(void) {
     struct web_avmedia *s=snapshot_candidate;
-    if(s && snapshot_phase==2 && !snapshot_rejected &&
-       web_video_snapshot_mask(s->snapshot.black,s->snapshot.output,s->snapshot.committed,s->snapshot.opaque,s->snapshot.count,snapshot_blend)) {
-        s->snapshot.valid=true;s->snapshot.delivered=s->damaged_frames=s->presented_frames;
+    bool armed=s && snapshot_phase==2 && !snapshot_rejected;
+    for(int row=0;armed&&row<s->snapshot.band_h;row++){
+        size_t at=snapshot_band_row(s,row);
+        armed=web_video_snapshot_mask(s->snapshot.black+at,s->snapshot.output+at,s->snapshot.committed+at,
+                                      s->snapshot.opaque+at,(size_t)s->snapshot.band_w,snapshot_blend);
     }
-    const char *why=s&&s->snapshot.valid?NULL:snapshot_rejected?snapshot_why:!s?"no candidate":snapshot_phase!=2?"no probe":"mask";
+    /* A new surface cut by the damage covers part of the video: publishing into
+       it would tear the picture at the band's edge. The next paint takes the box. */
+    bool partial=s&&s->snapshot.partial;
+    if(partial){s->snapshot.partial=false;if(armed)doc_paint_damage(snapshot_document,s->node);}
+    if(s&&armed&&!partial){
+        /* A new surface shows the frame this paint drew everywhere. A kept one
+           shows it only in the band; until the next publication brings the
+           rest to it, delivered still names the frame the rest shows. */
+        if(!s->snapshot.valid)s->snapshot.delivered=s->damaged_frames=s->presented_frames;
+        s->snapshot.valid=true;
+    }else if(s)s->snapshot.valid=false;
+    const char *why=s&&s->snapshot.valid?NULL:snapshot_rejected?snapshot_why:!s?"no candidate":snapshot_phase!=2?"no probe":partial?"partial":"mask";
     /* Only one usable surface is retained per painted document. Hidden or
-     * rejected videos must not accumulate native compositor reservations. */
+     * rejected videos must not accumulate native compositor reservations.
+     * A surface this paint did not reach is still on screen as it was. */
     for(struct web_avmedia *p=streams;p;p=p->next)if(p->doc==snapshot_document){
+        bool reached=p->snapshot.x<snapshot_damage[2]&&(int64_t)p->snapshot.x+p->snapshot.w>snapshot_damage[0]&&
+                     p->snapshot.y<snapshot_damage[3]&&(int64_t)p->snapshot.y+p->snapshot.h>snapshot_damage[1];
+        if(p!=s&&p->snapshot.valid&&!reached&&!(s&&s->snapshot.valid))continue;
         if(p->playing){p->snapshot_why=why;p->snapshot_why_line=snapshot_rejected?snapshot_why_line:0;}
         if(p!=s || !p->snapshot.valid)snapshot_clear(p);
     }
@@ -1455,6 +1508,8 @@ int64_t web_avmedia_background_deadline(uint64_t now){int64_t a=nmedia_worker_de
 int64_t web_avmedia_deadline(web_doc *d,uint64_t now){
     int64_t next=-1;
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d&&(s->playing||s->range_waiting)){
+        /* A paint redrew a band of the kept surface with a newer picture than the rest. */
+        if(snapshot_publishable(s)&&s->snapshot.delivered!=s->presented_frames)return (int64_t)now;
         if(s->mse_active&&nmedia_mse_worker_running(s->mse_worker)&&
            !nmedia_mse_worker_needs_service(s->mse_worker)&&!s->pending.kind&&!s->ahead.kind&&
            !s->mse_preparing&&!s->mse_seeking)continue;
@@ -1582,8 +1637,24 @@ bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h)
         else if(c!=snapshot_canvas)snapshot_reject_as("private surface",0);
         else {
             snapshot_candidate=s;
-            s->snapshot.x=(int)x0;s->snapshot.y=(int)y0;s->snapshot.w=(int)(x1-x0);s->snapshot.h=(int)(y1-y0);
-            s->snapshot.video_x=x;s->snapshot.video_y=y;s->snapshot.video_w=w;s->snapshot.video_h=h-strip;
+            /* A damage paint across the kept surface redraws its band only: the
+               rest keeps its overlay and its frames. Cutting the surface to the
+               band instead left the other rows on an old frame, one frame torn
+               in strips wherever a moving overlay's damage crossed it. */
+            bool keep=s->snapshot.valid&&s->snapshot.generation==s->generation&&
+                s->snapshot.source_w==s->width&&s->snapshot.source_h==s->height&&
+                s->snapshot.target.px==c->px&&s->snapshot.target.w==c->w&&s->snapshot.target.h==c->h&&s->snapshot.target.pitch==c->pitch&&
+                s->snapshot.video_x==x&&s->snapshot.video_y==y&&s->snapshot.video_w==w&&s->snapshot.video_h==h-strip&&
+                x0>=s->snapshot.x&&y0>=s->snapshot.y&&x1<=(int64_t)s->snapshot.x+s->snapshot.w&&y1<=(int64_t)s->snapshot.y+s->snapshot.h;
+            s->snapshot.band_x=(int)x0;s->snapshot.band_y=(int)y0;s->snapshot.band_w=(int)(x1-x0);s->snapshot.band_h=(int)(y1-y0);
+            if(!keep){
+                s->snapshot.valid=false;
+                s->snapshot.x=(int)x0;s->snapshot.y=(int)y0;s->snapshot.w=(int)(x1-x0);s->snapshot.h=(int)(y1-y0);
+                s->snapshot.video_x=x;s->snapshot.video_y=y;s->snapshot.video_w=w;s->snapshot.video_h=h-strip;
+                /* Narrowed by the damage, not by the viewport or a clipping ancestor. */
+                s->snapshot.partial=MAX((int64_t)x,snapshot_view[0])<snapshot_damage[0]||MAX((int64_t)y,snapshot_view[1])<snapshot_damage[1]||
+                    MIN((int64_t)x+w,snapshot_view[2])>snapshot_damage[2]||MIN((int64_t)y+h,snapshot_view[3])>snapshot_damage[3];
+            }
             for(size_t i=0;i<snapshot_region_count;i++)if(snapshot_region_intersects(&snapshot_regions[i],s)){
                 if(snapshot_regions[i].edge){snapshot_blend=true;continue;}
                 snapshot_reject_as("paint below",snapshot_regions[i].line);break;

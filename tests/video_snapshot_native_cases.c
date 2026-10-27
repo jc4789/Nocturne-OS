@@ -68,10 +68,11 @@ static void setup(void){
     gfx_init(&target,ui,8,8,8);for(int i=0;i<64;i++)ui[i]=0xffaabbcc;
     s.snapshot.x=2;s.snapshot.y=3;s.snapshot.w=s.snapshot.h=2;
     s.snapshot.video_x=2;s.snapshot.video_y=3;s.snapshot.video_w=s.snapshot.video_h=2;
+    s.snapshot.band_x=2;s.snapshot.band_y=3;s.snapshot.band_w=s.snapshot.band_h=2;
     doc.live=true;doc.frame_parent=NULL;seeking=oom=false;accept=true;
 }
 static bool prepare(canvas_t *probe){
-    web_avmedia_snapshot_begin(&doc,&target);snapshot_candidate=&s;
+    web_avmedia_snapshot_begin(&doc,&target,0,0,8,8);snapshot_candidate=&s;
     int x=-1,y=-1;bool r=web_avmedia_snapshot_prepare(&doc,&target,probe,&x,&y,5,7);
     if(r)check(x==2&&y==3&&probe->w==2&&probe->h==2,"resolved clip coordinates");
     return r;
@@ -111,17 +112,37 @@ int main(void){
     s.width++;snapshot_publish(&s);check(published==n,"source size mismatch rejected");s.width--;
     doc.live=false;snapshot_publish(&s);check(published==n,"retired document rejected");doc.live=true;
     accept=false;snapshot_publish(&s);check(published==n&&!s.snapshot.valid,"host rejection disarms without publication");
-    setup();canvas_t probe;web_avmedia_snapshot_begin(&doc,&target);snapshot_candidate=&s;web_avmedia_snapshot_reject();int x,y;
+    setup();canvas_t probe;web_avmedia_snapshot_begin(&doc,&target,0,0,8,8);snapshot_candidate=&s;web_avmedia_snapshot_reject();int x,y;
     check(!web_avmedia_snapshot_prepare(&doc,&target,&probe,&x,&y,0,0),"unsafe group/frame structure rejected");web_avmedia_snapshot_finish();
-    setup();web_avmedia_snapshot_begin(&doc,&target);snapshot_candidate=&s;s.snapshot.w=262145;
+    setup();web_avmedia_snapshot_begin(&doc,&target,0,0,8,8);snapshot_candidate=&s;s.snapshot.w=262145;
     check(!web_avmedia_snapshot_prepare(&doc,&target,&probe,&x,&y,0,0),"snapshot pixel cap fallback");web_avmedia_snapshot_finish();
-    setup();web_avmedia_snapshot_begin(&doc,&target);snapshot_candidate=&s;oom=true;
+    setup();web_avmedia_snapshot_begin(&doc,&target,0,0,8,8);snapshot_candidate=&s;oom=true;
     check(!web_avmedia_snapshot_prepare(&doc,&target,&probe,&x,&y,0,0)&&!s.snapshot.valid,"allocation failure stays ordinary paint");web_avmedia_snapshot_finish();
     setup();check(prepare(&probe),"alpha snapshot prepare");
     web_avmedia_snapshot_probe(1);gfx_fill(&probe,0,0,2,2,RGB(40,40,40));
     web_avmedia_snapshot_probe(2);gfx_fill(&probe,0,0,2,2,RGB(180,180,180));web_avmedia_snapshot_finish();
     check(!s.snapshot.valid&&native_depth==0,"translucent capture cannot arm snapshot");
     snapshot_clear(&s);check(!s.snapshot.storage&&!s.snapshot.valid,"unload releases snapshot ownership");
+    {   /* A later paint whose damage crosses the top row of the armed surface. */
+        setup();commit_identity();ui[4*8+2]=ui[4*8+3]=0xff445566;
+        s.presented_frames++;int before=published;
+        s.snapshot.band_x=2;s.snapshot.band_y=3;s.snapshot.band_w=2;s.snapshot.band_h=1;
+        canvas_t probe;web_avmedia_snapshot_begin(&doc,&target,0,0,8,8);snapshot_candidate=&s;
+        int x=-1,y=-1;check(web_avmedia_snapshot_prepare(&doc,&target,&probe,&x,&y,5,7),"kept surface prepares its band");
+        check(x==2&&y==3&&probe.w==2&&probe.h==1&&probe.pitch==2,"probe canvas is the band within the kept surface");
+        check(s.snapshot.committed[2]!=0xff445566,"rows outside the band keep their committed overlay");
+        web_avmedia_snapshot_probe(1);gfx_fill(&probe,0,0,2,1,RGB(0,0,0));
+        web_avmedia_snapshot_probe(2);gfx_fill(&probe,0,0,2,1,RGB(255,255,255));web_avmedia_snapshot_finish();
+        check(s.snapshot.valid&&s.snapshot.w==2&&s.snapshot.h==2,"band repaint keeps the whole surface armed");
+        check(s.snapshot.delivered!=s.presented_frames,"the rest of the surface still waits for the new frame");
+        check(snapshot_publishable(&s),"kept surface publishable");
+        snapshot_publish(&s);check(published==before+1&&s.snapshot.delivered==s.presented_frames,"next publication brings the whole surface to one frame");
+    }
+    {   /* A new surface the damage cut short of the video's box. */
+        setup();s.snapshot.partial=true;int before=damaged;commit_identity();
+        check(!s.snapshot.valid&&damaged==before+1&&!s.snapshot.partial,"partial surface is not armed and asks for the whole box");
+        s.presented_frames++;int n=published;snapshot_publish(&s);check(published==n,"partial surface never published");
+    }
     {   /* Three bands of a letterboxed frame, into a destination wider than the patch. */
         enum {W=3,H=70,PITCH=5};static uint32_t committed[W*H],black[W*H],dst[PITCH*H];static uint8_t opaque[W*H];
         setup();s.snapshot.committed=committed;s.snapshot.black=black;s.snapshot.opaque=opaque;
