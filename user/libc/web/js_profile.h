@@ -4,7 +4,8 @@
  * for the function then running, so a function's time includes the native
  * calls it makes. The time between tasks is not counted: a task starts the
  * clock again. Functions are told apart by their bytecode, named when first
- * seen. */
+ * seen, and reported by their place in the source (name, line and column):
+ * the copies of one function in several realms are one entry. */
 #pragma once
 #include <stdint.h>
 #include "quickjs.h"

@@ -102,5 +102,6 @@ RegExpから作成realmへの所有参照には既存の `JS_DupContext`/`JS_Fre
 `--debug-js` の JavaScript の時間計測（`user/libc/web/js_profile.c`）のため、
 割り込みの handler から呼べる二つの関数を足した。`JS_GetRunningFunction` は
 いま走っている bytecode 関数を、その関数が生きている間だけ通用する識別子として
-返す。`JS_DescribeFunction` はその名前、定義された script、始まる行を返し、
-JavaScript を一切走らせない。解釈器の動きは変えない。
+返す。`JS_DescribeFunction` はその名前、定義された script、始まる行と桁を返し、
+JavaScript を一切走らせない。桁は、一行に詰めた（minify した）script の関数を
+見分けるため。解釈器の動きは変えない。

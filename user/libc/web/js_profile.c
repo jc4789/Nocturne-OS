@@ -11,7 +11,7 @@
 struct js_profile_function {
     const void *function; /* its bytecode; NULL for an empty slot */
     uint64_t us;
-    char *name;           /* "name line" */
+    char *name;           /* "name line:column" */
     char *script;
 };
 
@@ -48,8 +48,8 @@ static struct js_profile_function *find(struct js_profile *p, const void *functi
     struct js_profile_function *f = &p->slots[at];
     if (f->function) return f;
     char name[64], script[256], label[96];
-    int line = JS_DescribeFunction(ctx, function, name, sizeof name, script, sizeof script);
-    snprintf(label, sizeof label, "%s %d", *name ? name : "(anonymous)", line);
+    int column = 0, line = JS_DescribeFunction(ctx, function, name, sizeof name, script, sizeof script, &column);
+    snprintf(label, sizeof label, "%s %d:%d", *name ? name : "(anonymous)", line, column);
     f->name = strdup(label);
     f->script = strdup(script);
     if (!f->name || !f->script) { free(f->name); free(f->script); f->name = f->script = NULL; return NULL; }
@@ -81,6 +81,29 @@ static int by_time(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
+static int by_place(const void *a, const void *b) {
+    const struct js_profile_function *x = a, *y = b;
+    int order = strcmp(x->script, y->script);
+    return order ? order : strcmp(x->name, y->name);
+}
+
+/* Each realm reads its own copy of the bindings' bytecode, so one function of
+   the source is one entry per realm: join the entries of one place in the
+   source, or a page with many frames hides where the time goes. */
+static size_t merge_places(struct js_profile_function *slots, size_t n) {
+    qsort(slots, n, sizeof *slots, by_place);
+    size_t kept = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (kept && !by_place(&slots[kept - 1], &slots[i])) {
+            slots[kept - 1].us += slots[i].us;
+            free(slots[i].name); free(slots[i].script);
+            continue;
+        }
+        slots[kept++] = slots[i];
+    }
+    return kept;
+}
+
 void js_profile_report(struct js_profile *profile, void (*log)(void *opaque, const char *line), void *opaque) {
     struct js_profile *p = profile;
     if (!p || !p->total_us) return;
@@ -89,6 +112,7 @@ void js_profile_report(struct js_profile *profile, void (*log)(void *opaque, con
        emptied below in any case. */
     size_t n = 0;
     for (size_t i = 0; i < p->capacity; i++) if (p->slots[i].function) p->slots[n++] = p->slots[i];
+    n = merge_places(p->slots, n);
     qsort(p->slots, n, sizeof *p->slots, by_time);
     double total = (double)p->total_us;
     snprintf(line, sizeof line, "JavaScript profile: %lu ms in %lu functions; the functions with the most time:",

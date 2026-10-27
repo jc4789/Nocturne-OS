@@ -31573,8 +31573,9 @@ const void *JS_GetRunningFunction(JSRuntime *rt)
 }
 
 /* The name of a function JS_GetRunningFunction returned and the script it was
-   defined in, into the buffers; the line it starts on, 0 when unknown. Runs
-   no JavaScript. */
+   defined in, into the buffers; the line it starts on, 0 when unknown, and its
+   column in *column (0 when unknown), which tells apart the functions of a
+   minified script's one line. Runs no JavaScript. */
 /* The atom's text in the buffer, empty for no atom: JS_AtomGetStr hands back an
    ASCII atom's own text instead of filling the buffer. */
 static void atom_text(JSContext *ctx, char *buf, int buf_size, JSAtom atom)
@@ -31588,13 +31589,16 @@ static void atom_text(JSContext *ctx, char *buf, int buf_size, JSAtom atom)
 }
 
 int JS_DescribeFunction(JSContext *ctx, const void *function, char *name, int name_size,
-                        char *filename, int filename_size)
+                        char *filename, int filename_size, int *column)
 {
     JSFunctionBytecode *b = (JSFunctionBytecode *)function;
-    int col_num;
+    int col_num = 0, line_num;
     atom_text(ctx, name, name_size, b->func_name);
     atom_text(ctx, filename, filename_size, b->has_debug ? b->debug.filename : JS_ATOM_NULL);
-    return find_line_num(ctx, b, -1, &col_num);
+    line_num = find_line_num(ctx, b, -1, &col_num);
+    if (column)
+        *column = line_num ? col_num : 0;
+    return line_num;
 }
 
 JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
