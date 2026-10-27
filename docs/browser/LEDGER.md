@@ -68,7 +68,7 @@
 | K4 | 空間の停止で BSP へ戻った眠りが、はじめから寝直す | 監査 | 修理：期限を wait_until に持つ（同上） |
 | K5 | 記憶が尽きると、予約済みの頁の後払いに枠が無く、ブラウザーと映像の Worker が segfault で落ちる | QEMU 一 CPU・512 MiB、基準も HEAD も（serial.log の `[memory] … 0 pages free`） | 未修理 |
 | K6 | 頁を移っても記憶が戻らない（7 サイトの後、ブラウザー 125→480〜580 MB、カーネルのヒープ 36→200 MB） | QEMU 4 CPU・4 GiB、基準も HEAD も | 未修理 |
-| K7 | 動画が 40〜80 秒で「問題が発生しました」になる | QEMU 4 CPU、基準も HEAD も（再現は YouTube の vuYLCMyzFD4。clh5LrNDj-o は 60 秒進んだ） | 層は媒体の再生ではなく、頁の証明（attestation）の JS。2026-10-26 に F12 で読むだけの fetch の記録で見た：SABR の応答の UMP の STREAM_PROTECTION_STATUS（部の番号 58）が本編では始めから 2（保留）、約 40 秒で 3（要求）になり、以後は媒体の無い 107〜160 バイトの応答だけが返る。広告は 2 の後 1（可）になる。要求の本文には証明の札（StreamerContext の 2、92 バイト、先頭 0x32）が入っている。札は作られているが、配信側が受け入れない。BotGuard の実行のどこで我々の JS・DOM が違うかは未特定。MSE の再生はその間、遅れも飢えも無く進んでいた |
+| K7 | 動画が 40〜80 秒で「問題が発生しました」になる | QEMU 4 CPU、基準も HEAD も（再現は YouTube の vuYLCMyzFD4。clh5LrNDj-o は 60 秒進んだ） | 層は媒体の再生ではなく、頁の証明（attestation）の JS。2026-10-26 に F12 で読むだけの fetch の記録で見た：SABR の応答の UMP の STREAM_PROTECTION_STATUS（部の番号 58）が本編では始めから 2（保留）、約 40 秒で 3（要求）になり、以後は媒体の無い 107〜160 バイトの応答だけが返る。広告は 2 の後 1（可）になる。要求の本文には証明の札（StreamerContext の 2、92 バイト、先頭 0x32）が入っている。札は作られているが、配信側が受け入れない。BotGuard の実行のどこで我々の JS・DOM が違うかは未特定。MSE の再生はその間、遅れも飢えも無く進んでいた。2026-10-27 夜（`--net-body videoplayback` で SABR の本文を解いた、`build/qa/hikaku/m1027/fix-yt2`）：最初の二回の要求は BotGuard の前で 10 バイトの仮の札（先頭 0x22）、GenerateIT（@24.5、応答は Chromium と同じ形 `["<札>",43200,100]`）の後の @26.6 からは BotGuard が作った 81 バイトの札（先頭 0x32）が毎回同じに付く。それでも状態は 2 のまま、媒体の時計 43.8 秒で 3（`0803100a`）になり止まる（fix-yt1 では 46.9 秒）。停止の前に頁の JS の例外も Promise の拒否も無い。player は状態 2 を受けるたびに札を作り直す作り（base.js の `spsumpreject`）。VISITOR_DATA・DATASYNC_ID は Chromium と同じ形。見込み：BotGuard が集める我々の環境の値で札が信用されない。候補は K36・K37。未確定 |
 | K8 | 頁がほぼ黒く、画像と本文が出ない | QEMU 4 CPU、基準も HEAD も（再現は anthropic.com/claude-opus-5-5） | 一部：img の crossOrigin の IDL が無く WebGL の texImage2D が SecurityError だった（4001607f）。残り：SVG の text・textPath・clipPath・filter（nanosvg に無い）で大きな題が出ない、HTML の clip-path が無く畳んだ検索欄が見える、案内のボタンが線の引かれた箱になる（原因未特定） |
 | K9 | 右の段が出ない | QEMU 4 CPU、基準も HEAD も（再現は news.yahoo.co.jp） | 修理：position: sticky が無かった（f2b3755b）。QEMU で右の段が出た |
 | K10 | 格子の 1fr 行が scroll container の中身の高さまで伸び、見出しが画面の外へ出る | QEMU（再現は animate.style） | 修理：css-grid-2 §6.6 の最小の寄与（80b46118） |
@@ -94,6 +94,11 @@
 | K30 | getComputedStyle の background-image・background-position・background-size が "" を返す（css_computed_longhand が PT_BG_IMAGE・PT_BG_POS・PT_BG_SIZE を書かない） | F12 で読むだけ（同上の窓） | 未修理 |
 | K31 | SVG の logo が黒く塗られる（再現は百度百科の上の logo と 秒懂百科 の logo） | sweep3・sweep1 とも。SVG の `<style>` と class の fill を nanosvg が読まない見込み（推測、未確かめ） | 未着手 |
 | K32 | 弾幕の文字が重なって流れる（再現は Bilibili の動画） | sweep3・sweep1 とも | 未着手（層も未特定） |
+| K33 | 部分描画で、動画の写しの矩形が損傷の帯に縮み、帯の外が古い一枚のまま残って映像が帯状にずれる（再現は Bilibili の弾幕の下） | head-88a17463 の媒体の連写 30 枚で 6 枚以上（`m1027/head-bili2`）、ユーザーの QEMU の画像 | 修理：残した写しは帯だけ描き直し、損傷で切れた新しい写しは有効にせず箱全体の描き直しを頼む（avmedia.c）。同じ条件の連写で 0/30（`m1027/fix-bili4`）。ホストの試験 44 件。CN の頁と実機は未確認 |
+| K34 | 音の PTS がミリ秒の整数で、AAC の 21.33 ms ごとの 1 ms 未満のずれを「隙間」として無音で埋め、ぶつぶつ鳴る（再現は Bilibili） | silence が 1 秒に約 300 フレーム（head-bili1） | 修理：1 ms（48 フレーム）以内は隙間と見ない。fix-bili4 で silence は合計 84〜211 フレーム。YouTube はまだ 1 秒に約 30 フレーム（1 ms を超える隙間、未調査） |
+| K35 | console が log・warn・error・info・debug・assert だけ（WHATWG Console の count・countReset・group・groupCollapsed・groupEnd・time・timeLog・timeEnd・table・trace・dir・dirxml・clear と %s・%d・%f・%o・%c の書式、名前空間の形が無い）。頁の script が `console.time` などで TypeError になりうる | コードを読んだ。WPT `console/` | 修理：`js_console.js` を窓と Worker で共有。node で形と出力、QEMU の F12 で count・group・table・time・assert を確かめた |
+| K36 | 頁から見える例外の stack に、我々の JS で書いた束縛の内部の枠（`nocturne:browser-bindings:14320:57`、`validateInsertion` など）が行と桁ごと出る。どのエンジンでも組込みの関数は位置の無い native の枠になる | F12（fix-yt2）：`Object.getOwnPropertyDescriptor(Navigator.prototype,"plugins").get.call({})` の stack | 未修理。組込みの関数の文字列化は `[native code]` の形で正しい |
+| K37 | Notification・navigator.permissions・navigator.mediaDevices・navigator.maxTouchPoints が無く、plugins・mimeTypes が 0（Chromium は 5・2、Firefox も持つ） | F12 で Chromium と同じ式（fix-yt2、組込みのブラウザー） | 未修理 |
 
 ## 5. 受入表（browser-hikaku の組）
 
@@ -127,6 +132,17 @@ Floorp の性能記録（10/26 04:16、74.5 秒の範囲）は頁を開いた後
 | 使用中の記憶（System Monitor） | 4 CPU・4 GiB、起動直後 | 約 245 MiB（ブラウザー 125 MB） | 約 245 MiB（ブラウザー 128 MB） | — |
 | 同 | 組の 7 サイトの後 | 821 MiB（ブラウザー 484 MB、カーネルのヒープ 226 MB） | 892 MiB（ブラウザー 578 MB、ヒープ 202 MB） | — |
 | YouTube の動画の頁 | 1 CPU・512 MiB | 落ちる（ブラウザー約 340 MB で枠が尽きる） | 落ちる（同じ） | — |
+
+媒体の再生（2026-10-27 夜。QEMU WHPX・4 CPU・4 GiB・2560×1440、F12 を開いたまま、`--log-console`。基準は HEAD 88a17463 の媒体 `m1027/head-88a17463.img`、修理は作業木の媒体。画像と serial は `build/qa/hikaku/m1027/`）：
+
+| 測るもの | 再現 | 基準 88a17463 | 修理 | 参照 |
+|---|---|---|---|---|
+| 弾幕の下の映像の裂け（連写 30 枚） | Bilibili /en/ の動画 | 6 枚以上（head-bili2） | 0 枚（fix-bili4） | Floorp（ユーザーの CN の頁の画像）は裂けなし |
+| silence（音の隙間を埋めた無音） | 同上 | 1 秒に約 300 フレーム（head-bili1） | 合計 84〜211 フレーム（fix-bili4） | — |
+| presented の増え方 | 同上 | 約 30/s | 約 30/s | — |
+| 再生が止まる媒体の時計 | YouTube vuYLCMyzFD4 | 40〜80 秒（K7） | 46.9 秒（fix-yt1）、43.8 秒（fix-yt2） | Chromium（組込みのブラウザー）は止まらない |
+
+Bilibili /en/ は、ログインしていないと再生 60 秒で動画を止めてログインの窓を出す（Chromium でも同じ。我々の log の `author-pause`）。前の「190 秒の止まり」はこれだった。以後の Bilibili は CN の頁（BV1cgYQ6PE8c）で確かめる。
 
 
 ## 7. 決定
