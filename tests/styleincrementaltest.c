@@ -36,6 +36,10 @@ static struct cssom_sheet *sheet(web_doc *d,const char *text) {
     return s;
 }
 static bool near(float a,float b) { return fabsf(a-b)<0.1f; }
+/* A CSSOM rule's text is its own text_len bytes of the sheet's source. */
+static bool rule_starts(const struct css_rule_info *r,const char *text) {
+    size_t n=strlen(text);return r && r->text_len>=n && !memcmp(r->text,text,n);
+}
 
 static void incremental(void) {
     web_doc *d=load();check(d!=NULL,"document");if(!d)return;
@@ -116,9 +120,10 @@ static void scopes(void) {
     uint64_t entries=d->profile.style_index_entries-first_entries;
     uint64_t matched=d->profile.style_rule_checks-first_checks;
     uint64_t visited=d->profile.style_visits-first_visits;
-    /* Counters are monotonic: load() has already indexed UA rules. Compare
-       the two actual stylesheet generations, not a generation with a total. */
-    check(entries==first_generation_entries,"96 adoptions index the AST once");
+    /* Counters are monotonic: load() has already indexed UA rules. The index
+       lives on the shared AST: the first generation builds it, and the 95 later
+       adoptions bind it without indexing again. */
+    check(first_generation_entries>0&&entries==0,"96 adoptions index the AST once");
     check(visited && matched/visited<20,"matching visits own scope, not all adoption buckets");
     check(inside[95]->style && near(inside[95]->style->width.px,51),"last root own scope rule");
     check(hosts[95]->style && near(hosts[95]->style->padding[3].px,3),"host rule retained");
@@ -315,14 +320,14 @@ static void cssom_container_roundtrip(void) {
         "@unrecognized{.kept{height:999px}}");
     uint32_t count=0;struct css_rule_info *r=s?css_sheet_rules(s->ast,&count):NULL;
     check(r && count==2 && r->type==0 && r->next && r->next->type==0 &&
-        strstr(r->text,"@container") && strstr(r->next->text,"@layer") && !strstr(s->source,"@import"),
+        rule_starts(r,"@container") && rule_starts(r->next,"@layer") && !strstr(s->source,"@import"),
         "constructed import removal preserves recognized type-zero grouping rules");
     if(!s){web_free(d);return;}
     const char *temporary=".temporary{height:1px}";
     check(cssom_insert(s,temporary,strlen(temporary),0)==CSSOM_OK,
         "CSSOM insertion preserves container group source");
     int deleted=cssom_delete(s,0);r=css_sheet_rules(s->ast,&count);
-    check(deleted==CSSOM_OK && count==2 && r && strstr(r->text,"@container"),
+    check(deleted==CSSOM_OK && count==2 && rule_starts(r,"@container"),
         "CSSOM deletion preserves container group source");
     check(cssom_adopt(d->root,&s,1)==CSSOM_OK,"adopt edited container group sheet");
     node_t *parent=element(d,"div",d->body,NULL);
@@ -357,7 +362,7 @@ static void container_queries(void) {
     if(!s){web_free(d);return;}
     unsigned groups=0;
     for(struct css_rule_info *r=css_sheet_rules(s->ast,NULL);r;r=r->next)
-        if(r->type==0 && !strncmp(r->text,"@container",10))groups++;
+        if(r->type==0 && rule_starts(r,"@container"))groups++;
     check(groups==13,"replaceSync retains all standalone container groups in CSSOM");
     node_t *size=element(d,"div",d->body,NULL);
     doc_node_attr(d,size,"style","container-type:size;width:1500px;height:200px");

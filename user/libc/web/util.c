@@ -38,8 +38,15 @@ void *ar_alloc(arena_t *a, size_t n) {
         a->allocated += cap;
         c->used = 0;
         c->cap = cap;
-        c->next = a->head;
-        a->head = c;
+        if (cap == n && a->head) {
+            /* An allocation that fills its own chunk goes behind the head:
+               the head's room stays for the allocations that follow. */
+            c->next = a->head->next;
+            a->head->next = c;
+        } else {
+            c->next = a->head;
+            a->head = c;
+        }
     }
     void *p = c->data + c->used;
     c->used += n;

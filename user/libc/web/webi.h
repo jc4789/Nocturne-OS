@@ -510,15 +510,18 @@ struct cached_css {
     sheet_t *ast;
 };
 typedef struct css_ctx css_ctx;
-/* Parser-owned CSSOM metadata points at the SAME native cascade AST. */
+/* An @import rule's resolved URL (NULL: not fetched) and media query text. */
+struct css_rule_import { const char *url, *media; };
+/* Parser-owned CSSOM metadata points at the SAME native cascade AST. One
+   per top-level rule, so a sheet of fifty thousand rules keeps it small. */
 struct css_rule_info {
     struct css_rule_info *next;
-    const char *text, *selector, *import_url;
-    const void *import_layer;
-    const char *import_media;
-    uint32_t type, id;
-    uint8_t layer_kind; /* 1 statement, 2 block; not a CSSRule.type surrogate */
+    /* text: the rule's text_len bytes in its sheet's source, not terminated */
+    const char *text, *selector;
+    const struct css_rule_import *import; /* @import only */
     void *native_rule;
+    uint32_t text_len, type, id;
+    uint8_t layer_kind; /* 1 statement, 2 block; not a CSSRule.type surrogate */
 };
 
 /* the document's styling state */
@@ -916,6 +919,7 @@ struct web_profile {
     uint64_t script_scans, script_visits, script_ms, native_calls, native_ms, native_samples;
     uint64_t metadata_syncs, metadata_visits, metadata_ms;
     uint64_t style_visits, style_rule_checks, style_parallel_nodes;
+    uint64_t style_index_entries; /* selectors indexed: once per sheet AST, not per instance */
     uint64_t style_rule_filtered; /* candidates rejected by the ancestor filter */
     uint64_t style_rule_indexes; /* rule indexes looked up, one per stylesheet binding */
     uint64_t style_rule_bucket[4]; /* candidates by index bucket: id, class, tag, universal */

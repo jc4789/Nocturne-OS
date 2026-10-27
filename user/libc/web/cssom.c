@@ -65,7 +65,7 @@ int cssom_replace_sync(struct cssom_sheet *s, const char *text, size_t length) {
     if(imports) {
         sbuf source = {0};
         for (struct css_rule_info *r = css_sheet_rules(fresh.ast, NULL); r; r = r->next)
-            if (r->type != 3) { sb_puts(&source, r->text); sb_putc(&source, '\n'); }
+            if (r->type != 3) { sb_put(&source, r->text, r->text_len); sb_putc(&source, '\n'); }
         discard_parse(&fresh); memset(&fresh, 0, sizeof fresh);
         error = parse(s->document,&fresh, sb_cstr(&source), source.n, s->base); sb_free(&source);
         if (error) { discard_parse(&fresh); return error; }
@@ -221,7 +221,7 @@ static int replace(struct cssom_sheet *s, const char *text, size_t length, uint3
         removed=calloc(1,sizeof *removed);
         if (!removed) { free(candidate);return CSSOM_OOM; }
         removed->id=r->id;removed->type=r->type;removed->layer_kind=r->layer_kind;
-        removed->text=strdup(r->text);removed->selector=r->selector ? strdup(r->selector) : NULL;
+        removed->text=strndup(r->text,r->text_len);removed->text_len=r->text_len;removed->selector=r->selector ? strdup(r->selector) : NULL;
         if (!removed->text || (r->selector&&!removed->selector)) { free((void*)removed->text);free((void*)removed->selector);free(removed);free(candidate);return CSSOM_OOM; }
     }
     if (insertion) {
@@ -245,7 +245,7 @@ static int replace(struct cssom_sheet *s, const char *text, size_t length, uint3
             (layer_statement&&!append_text(&source,&used,&cap,";",1)) || !append_text(&source,&used,&cap,"\n",1))) { error=CSSOM_OOM; break; }
         if (!r) break;
         if (!insertion && at==index) continue;
-        if (!append_text(&source,&used,&cap,r->text,strlen(r->text)) ||
+        if (!append_text(&source,&used,&cap,r->text,r->text_len) ||
             (r->layer_kind==1&&!append_text(&source,&used,&cap,";",1)) || !append_text(&source,&used,&cap,"\n",1)) { error=CSSOM_OOM; break; }
     }
     if (!error) error=parse(s->document,candidate,source ? source : "",used,s->base);

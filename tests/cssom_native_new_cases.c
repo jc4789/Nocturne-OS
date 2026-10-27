@@ -51,7 +51,7 @@ int main(void){
     style.owner=&d;cssom_style_lifecycle(&style);text.text="@import 'child.css';@media screen{.inside{width:2px}}.after{width:3px}";text.textlen=strlen(text.text);d.dom_revision++;
     struct cssom_sheet*imports=cssom_style_sheet(&d,&style,&error);
     CHECK(imports&&count(imports)==3&&rule(imports,0)->type==3&&rule(imports,1)->type==4&&rule(imports,2)->type==1);
-    CHECK(rule(imports,0)->import_url&&!strcmp(rule(imports,0)->import_url,"https://cssom.test/child.css"));
+    CHECK(rule(imports,0)->import&&rule(imports,0)->import->url&&!strcmp(rule(imports,0)->import->url,"https://cssom.test/child.css"));
     add_sheet_ast(&d,imports->source,imports->length,imports->base,4,"screen",NULL,imports->ast);
     CHECK(d.pending_css.n==1&&!strcmp(((struct pending*)d.pending_css.v[0])->url,"https://cssom.test/child.css")&&d.sty.sheets.n==1);
     CHECK(((sheet_t*)d.sty.sheets.v[0])->owner_media&&!strcmp(((sheet_t*)d.sty.sheets.v[0])->owner_media,"screen"));

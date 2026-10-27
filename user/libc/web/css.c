@@ -56,30 +56,33 @@ struct simple {
     uint8_t kind, op, pc;
     bool icase;
     uint16_t tag;
-    const char *name, *value;
-    int a, b;
+    const char *name;
+    union {
+        const char *value; /* [attr] and :lang() */
+        struct { int a, b; }; /* :nth-*(An+B) */
+    };
     struct sellist *args;
 };
 struct compound {
-    struct simple *s;
+    struct compound *left;
     int n;
     char comb; /* how it relates to the compound on its left: ' ', '>', '+', '~' */
-    bool universal; /* share the existing padding before the pointer */
-    struct compound *left;
+    bool universal; /* share the existing padding before the array */
+    struct simple s[];
 };
 /* Up to four ids, classes or type names that some ancestor of the subject
    must carry (from compounds joined to it through a descendant or child
-   combinator), hashed by ancestor_feature_hash; 0 ends the list. */
+   combinator), hashed by ancestor_feature_hash; 0 ends the list. Only an
+   index entry keeps them: the selectors inside :is() and :has() never use them. */
 #define SELECTOR_ANCESTOR_HASHES 4
 struct selector {
     struct compound *right;
     uint32_t spec;
     uint8_t pseudo;
-    uint32_t ancestor_hashes[SELECTOR_ANCESTOR_HASHES];
 };
 struct sellist {
-    struct selector **v;
     int n;
+    struct selector *v[];
 };
 
 struct decl {
@@ -534,19 +537,25 @@ static const struct {
 
 /* one compound selector; *ps advanced past it. pseudo receives a pseudo-element. */
 static struct sellist *parse_relative_list(struct pctx *pc, const char *s, const char *e);
+/* The growing lists of a selector start on the stack and reach the arena
+   only at their final length, in the array that ends their compound or list:
+   an arena keeps every capacity it ever gave. The stack parts stay small,
+   since :is() and :has() nest these frames; a longer list grows in the arena. */
+static void *selector_list_grow(struct pctx *pc, const void *list, size_t n, size_t *capacity, size_t size) {
+    if (*capacity > INT_MAX / 2 || *capacity > SIZE_MAX / (2 * size)) ar_alloc(pc->a, SIZE_MAX);
+    *capacity *= 2;
+    void *next = ar_alloc(pc->a, *capacity * size);
+    memcpy(next, list, n * size);
+    return next;
+}
 static struct compound *parse_compound(struct pctx *pc, const char **ps, const char *e, uint32_t *spec, uint8_t *pseudo) {
-    size_t capacity = 4;
-    struct simple *tmp = ar_alloc(pc->a, capacity * sizeof *tmp);
+    struct simple local[4], *tmp = local;
+    size_t capacity = sizeof local / sizeof *local;
     int n = 0;
     const char *s = *ps;
     bool type_seen = false, universal = false;
     while (s < e) {
-        if ((size_t)n == capacity) {
-            if (capacity > INT_MAX / 2 || capacity > SIZE_MAX / (2 * sizeof *tmp)) ar_alloc(pc->a, SIZE_MAX);
-            capacity *= 2;
-            struct simple *next = ar_alloc(pc->a, capacity * sizeof *next);
-            memcpy(next, tmp, (size_t)n * sizeof *next); tmp = next;
-        }
+        if ((size_t)n == capacity) tmp = selector_list_grow(pc, tmp, (size_t)n, &capacity, sizeof *tmp);
         char c = *s;
         struct simple *x = &tmp[n];
         memset(x, 0, sizeof *x);
@@ -748,10 +757,10 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
     }
     if (s == *ps) return NULL;
     *ps = s;
-    struct compound *cp = ar_alloc(pc->a, sizeof *cp);
+    struct compound *cp = ar_alloc(pc->a, sizeof *cp + (size_t)n * sizeof *tmp);
     cp->n = n;
     cp->universal = universal;
-    cp->s = tmp;
+    memcpy(cp->s, tmp, (size_t)n * sizeof *tmp);
     return cp;
 }
 
@@ -807,7 +816,7 @@ static bool ancestor_bit(const struct ancestor_filter *base, const struct ancest
    A compound left of ' ' or '>' is an ancestor of the subject (siblings share
    ancestors); one left of '+' or '~' is a sibling and adds nothing, nor do
    the arguments of :is()/:not()/:has(). */
-static void selector_ancestor_hashes(struct selector *sel) {
+static void selector_ancestor_hashes(const struct selector *sel, uint32_t hashes[SELECTOR_ANCESTOR_HASHES]) {
     if (sel->pseudo == PE_SLOTTED) return; /* its left compounds match the slot's ancestors */
     int n = 0;
     for (int pass = 0; pass < 2; pass++) {
@@ -821,7 +830,7 @@ static void selector_ancestor_hashes(struct selector *sel) {
                     h = ancestor_feature_hash(x->kind == SK_ID ? '#' : '.', x->name, strlen(x->name));
                 else if (pass == 1 && x->kind == SK_TAG)
                     h = x->tag ? ancestor_tag_hash(x->tag) : ancestor_feature_hash('<', x->name, strlen(x->name));
-                if (h) sel->ancestor_hashes[n++] = h;
+                if (h) hashes[n++] = h;
             }
         }
     }
@@ -866,7 +875,6 @@ static struct selector *parse_complex(struct pctx *pc, const char *s, const char
     }
     if (pending && pending != ' ') return NULL;
     sel->right = cur;
-    selector_ancestor_hashes(sel);
     return sel;
 }
 
@@ -876,27 +884,22 @@ static struct sellist *parse_sellist(struct pctx *pc, const char *s, const char 
         trim_r(s, &last);
         if (last == s || last[-1] == ',') return NULL;
     }
-    size_t capacity = 8;
-    struct selector **tmp = ar_alloc(pc->a, capacity * sizeof *tmp);
+    struct selector *local[8], **tmp = local;
+    size_t capacity = sizeof local / sizeof *local;
     int n = 0;
     while (s < e) {
         const char *c = scan_to(s, e, ",");
         struct selector *x = parse_complex(pc, s, c);
         if (x) {
-            if ((size_t)n == capacity) {
-                if (capacity > INT_MAX / 2 || capacity > SIZE_MAX / (2 * sizeof *tmp)) ar_alloc(pc->a, SIZE_MAX);
-                capacity *= 2;
-                struct selector **next = ar_alloc(pc->a, capacity * sizeof *next);
-                memcpy(next, tmp, (size_t)n * sizeof *next); tmp = next;
-            }
+            if ((size_t)n == capacity) tmp = selector_list_grow(pc, tmp, (size_t)n, &capacity, sizeof *tmp);
             tmp[n++] = x;
         } else if (!forgiving) return NULL;
         s = c < e ? c + 1 : e;
     }
     if (!n && !forgiving) return NULL;
-    struct sellist *l = ar_alloc(pc->a, sizeof *l);
+    struct sellist *l = ar_alloc(pc->a, sizeof *l + (size_t)n * sizeof *tmp);
     l->n = n;
-    l->v = tmp;
+    memcpy(l->v, tmp, (size_t)n * sizeof *tmp);
     return l;
 }
 
@@ -905,8 +908,8 @@ static struct sellist *parse_sellist(struct pctx *pc, const char *s, const char 
 static struct sellist *parse_relative_list(struct pctx *pc, const char *s, const char *e) {
     const char *last = e; trim_r(s, &last);
     if (s == last || last[-1] == ',') return NULL;
-    size_t capacity = 8; int n = 0;
-    struct selector **v = ar_alloc(pc->a, capacity * sizeof *v);
+    struct selector *local[8], **v = local;
+    size_t capacity = sizeof local / sizeof *local; int n = 0;
     while (s < e) {
         const char *end = scan_to(s, e, ","), *p = skip_ws(s, end);
         char combinator = ' ';
@@ -915,19 +918,14 @@ static struct sellist *parse_relative_list(struct pctx *pc, const char *s, const
         if (!selector || selector->pseudo) return NULL;
         struct compound *first = selector->right;
         while (first->left) first = first->left;
-        struct compound *anchor = ar_alloc(pc->a, sizeof *anchor);
-        anchor->n = 1; anchor->s = ar_alloc(pc->a, sizeof *anchor->s);
-        anchor->s->kind = SK_ANCHOR;
+        struct compound *anchor = ar_alloc(pc->a, sizeof *anchor + sizeof *anchor->s);
+        anchor->n = 1; anchor->s[0].kind = SK_ANCHOR;
         first->left = anchor; first->comb = combinator;
-        if ((size_t)n == capacity) {
-            if (capacity > INT_MAX / 2 || capacity > SIZE_MAX / (2 * sizeof *v)) ar_alloc(pc->a, SIZE_MAX);
-            capacity *= 2;
-            struct selector **next = ar_alloc(pc->a, capacity * sizeof *next);
-            memcpy(next, v, (size_t)n * sizeof *next); v = next;
-        }
+        if ((size_t)n == capacity) v = selector_list_grow(pc, v, (size_t)n, &capacity, sizeof *v);
         v[n++] = selector; s = end < e ? end + 1 : e;
     }
-    struct sellist *list = ar_alloc(pc->a, sizeof *list); list->v = v; list->n = n;
+    struct sellist *list = ar_alloc(pc->a, sizeof *list + (size_t)n * sizeof *v);
+    memcpy(list->v, v, (size_t)n * sizeof *v); list->n = n;
     return list;
 }
 
@@ -1901,12 +1899,13 @@ static struct css_rule_info *cssom_record(struct pctx *pc, uint32_t type, const 
        They still need source metadata: replaceSync and CSSOM edits rebuild
        the native AST from this list, not from its already-flattened rules. */
     if (pc->rule_depth != 1) return NULL;
-    if (pc->sh->cssom_count == UINT32_MAX) {
+    if (pc->sh->cssom_count == UINT32_MAX || (size_t)(e - s) > UINT32_MAX) {
         if (pc->a->trap) longjmp(*pc->a->trap, 1);
         abort();
     }
     struct css_rule_info *info = ar_alloc(pc->a, sizeof *info);
-    info->type = type; info->text = ar_strndup(pc->a, s, (size_t)(e - s));
+    /* The comment-free source lives as long as the sheet: no copy of the rule. */
+    info->type = type; info->text = s; info->text_len = (uint32_t)(e - s);
     if (pc->sh->cssom_last) pc->sh->cssom_last->next = info;
     else pc->sh->cssom_first = info;
     pc->sh->cssom_last = info; pc->sh->cssom_count++; return info;
@@ -2168,12 +2167,13 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                         }
                         ok&=supported;rest=close<qe?skip_ws(close+1,qe):qe;
                     }
-                    if(info){info->import_layer=import_layer;info->import_media=rest<qe?ar_strndup(pc->a,rest,(size_t)(qe-rest)):NULL;}
+                    struct css_rule_import *record=info?ar_alloc(pc->a,sizeof *record):NULL;
+                    if(record){record->media=rest<qe?ar_strndup(pc->a,rest,(size_t)(qe-rest)):NULL;info->import=record;}
                     const struct mcond *import_condition=rest<qe?parse_condition(pc,rest,qe,media,false):media;
                     if(ok)layer_event(pc,import_layer,import_condition,info);
                     char abs[2048];
                     if (ok && url_resolve(pc->base, sb_cstr(&u), abs, sizeof abs)) {
-                        if (info) { info->import_url = ar_strdup(pc->a, abs); pc->sh->import_urls++; }
+                        if (record) { record->url = ar_strdup(pc->a, abs); pc->sh->import_urls++; }
                         if (pc->imports) {
                             struct css_import *im = malloc(sizeof *im);
                             im->url = strdup(abs);
@@ -2752,11 +2752,13 @@ struct ient {
         const struct has_subject *has; /* in a relational index */
     };
     uint32_t order;
-    uint32_t media; /* 0: unconditional; else its rule's @media is css_index.media[media - 1] */
+    /* 0: unconditional; else its rule's @media is css_index.media[media - 1].
+       A sheet within the source budget has far fewer than 2^24 @media. */
+    uint32_t media : 24;
+    uint32_t pseudo : 8;
     /* The selector's, here: most candidates are rejected on these alone,
        without reaching the selector. */
     uint32_t ancestor_hashes[SELECTOR_ANCESTOR_HASHES];
-    uint8_t pseudo;
 };
 
 struct css_feature;
@@ -2991,7 +2993,7 @@ static struct cascade_layer *layer_resolve(struct css_ctx *x,struct layer_sheet_
 static bool sheet_media_ok(const sheet_t *sheet,int vw,int vh,bool scripting) {
     for(;sheet;sheet=sheet->import_parent) {
         if(sheet->owner_media && *sheet->owner_media&&!css_media_evaluate(sheet->owner_media,vw,vh,scripting,NULL,0))return false;
-        const char *media=sheet->import_owner?sheet->import_owner->import_media:NULL;
+        const char *media=sheet->import_owner&&sheet->import_owner->import?sheet->import_owner->import->media:NULL;
         if(media&&*media&&!css_media_evaluate(media,vw,vh,scripting,NULL,0))return false;
     }
     return true;
@@ -3044,7 +3046,7 @@ static struct ient *index_rule(arena_t *a, struct css_index *x, const struct rul
     ie->r = r;
     ie->order = order;
     ie->media = media;
-    memcpy(ie->ancestor_hashes, s->ancestor_hashes, sizeof ie->ancestor_hashes);
+    selector_ancestor_hashes(s, ie->ancestor_hashes);
     ie->pseudo = s->pseudo;
     const struct compound *c = s->right;
     const char *id = NULL, *cls = NULL, *tag = NULL;
@@ -3317,6 +3319,7 @@ static void index_features(arena_t *a, struct css_index *x, const struct compoun
 }
 
 static uint32_t index_media(arena_t *a, struct css_index *x, const struct mcond *m) {
+    if (x->nmedia >= (1u << 24) - 1) ar_alloc(a, SIZE_MAX); /* ient.media's width */
     if (x->nmedia == x->media_cap) {
         uint32_t cap = x->media_cap ? x->media_cap * 2 : 8;
         if (cap <= x->media_cap) ar_alloc(a, SIZE_MAX);
@@ -3361,6 +3364,7 @@ static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
             }
             index_rule(a, index, r, r->sel->v[k], index->rules, media);
             index_features(a, index, r->sel->v[k]->right);
+            if (d->profile_enabled) d->profile.style_index_entries++;
         }
     }
     return index;

@@ -128,7 +128,7 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
         if (JS_DefinePropertyValueStr(ctx,result,"id",JS_NewInt64(ctx,r->id),JS_PROP_C_W_E)<0 ||
             JS_DefinePropertyValueStr(ctx,result,"type",JS_NewInt64(ctx,r->type),JS_PROP_C_W_E)<0 ||
             JS_DefinePropertyValueStr(ctx,result,"attached",JS_NewBool(ctx,attached),JS_PROP_C_W_E)<0 ||
-            JS_DefinePropertyValueStr(ctx,result,"text",JS_NewString(ctx,r->text),JS_PROP_C_W_E)<0 ||
+            JS_DefinePropertyValueStr(ctx,result,"text",JS_NewStringLen(ctx,r->text,r->text_len),JS_PROP_C_W_E)<0 ||
             JS_DefinePropertyValueStr(ctx,result,"selector",JS_NewString(ctx,r->selector ? r->selector : ""),JS_PROP_C_W_E)<0) {
             JS_FreeValue(ctx,result);result=JS_EXCEPTION;
         }

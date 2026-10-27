@@ -203,10 +203,10 @@ static bool sheet_instance_imports(web_doc *d, struct sheet_walk *f, sheet_t *as
     f->sheet=css_sheet_instance(arena,ast,order,scope);
     if(media && *media)css_sheet_media(f->sheet,ar_strdup(arena,media));
     if(!css_sheet_import_urls(ast))return true; /* no @import: rescans re-instance every sheet, so skip its rule walk */
-    for(struct css_rule_info *r=css_sheet_rules(ast,NULL);r;r=r->next)if(r->import_url) {
+    for(struct css_rule_info *r=css_sheet_rules(ast,NULL);r;r=r->next)if(r->import&&r->import->url) {
         struct css_import *im=calloc(1,sizeof *im);
         if(!im)return false;
-        im->url=strdup(r->import_url);im->order=order;im->owner=r;
+        im->url=strdup(r->import->url);im->order=order;im->owner=r;
         if(!im->url || !sheet_push(&f->imports,im)){free(im->url);free(im);return false;}
     }
     return true;
