@@ -49,7 +49,7 @@ static void parsing(void) {
     check("multiple animations rejected",!supports("animation","a 1s, b 2s"));
     check("multiple names rejected",!supports("animation-name","a,b"));
     check("steps not falsely supported",!supports("animation-timing-function","steps(3,end)"));
-    check("translation supported without falsely supporting rotation",supports("transform","translateX(10px)")&&!supports("transform","rotate(10deg)"));
+    check("translation and rotation supported, a length angle rejected",supports("transform","translateX(10px)")&&supports("transform","rotate(10deg)")&&!supports("transform","rotate(10px)"));
 }
 static void sampling(void) {
     web_doc *d=load("html,body{margin:0}@keyframes fade{to{opacity:.8}}"
@@ -96,7 +96,7 @@ static void sampling(void) {
     check("later longhand overrides shorthand",opacity(longhand,.25));
     check("delay backwards fill does not apply step-start",opacity(delay_step,0));
     check("delay reverse backwards fill uses directed endpoint",opacity(delay_reverse,1));
-    check("native subset has no paused wake",css_motion_deadline(d,uptime_ms())==-1);
+    check("native subset has no paused wake",css_motion_deadline(d)==-1);
     check("underlying style retained separately",a && a->animation_base_style && near(a->animation_base_style->opacity,.2));
     check("WAAPI native effect accepted",css_animation_set(a,PE_NONE,1,"opacity:.65;")==1);
     restyle(d,a);check("WAAPI priority above CSS animation",opacity(a,.65));
@@ -118,12 +118,12 @@ static void lifecycle(void) {
     d->style_full_dirty=d->need_style=d->need_boxes=true;layout(d);
     check("full style rebuild retains playback",a->css_motion==identity && opacity(a,.25));
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both");layout(d);
-    check("resume schedules native frame",css_motion_deadline(d,uptime_ms())>=0);
+    check("resume schedules native frame",css_motion_deadline(d)>=0);
     n_sleep_ms(35);css_motion_tick(d,uptime_ms());layout(d);
     check("resume advances actual native time",a->style->opacity>.27f && a->style->opacity<.6f);
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both paused");layout(d);float paused=a->style->opacity;
     n_sleep_ms(20);restyle(d,a);check("pause retains accumulated elapsed",near(a->style->opacity,paused));
-    check("pause removes deadline",css_motion_deadline(d,uptime_ms())==-1);
+    check("pause removes deadline",css_motion_deadline(d)==-1);
     doc_node_attr(d,a,"style","opacity:.4;animation:none");layout(d);
     check("none cancels identity",a->css_motion==NULL && opacity(a,.4));
     doc_node_attr(d,a,"style","animation:fade 1s linear both paused");layout(d);
@@ -137,10 +137,10 @@ static void lifecycle(void) {
     doc_node_attr(d,a,"style","animation:fade 40ms linear forwards");layout(d);
     n_sleep_ms(65);css_motion_tick(d,uptime_ms());layout(d);
     check("short animation completes",opacity(a,1));
-    check("completed animation has no wake",css_motion_deadline(d,uptime_ms())==-1);
+    check("completed animation has no wake",css_motion_deadline(d)==-1);
     doc_node_attr(d,a,"style","opacity:.4;animation:fade 0s linear");layout(d);
     check("zero duration without fill restores underlying",opacity(a,.4));
-    d->native_cancelled=true;check("cancel suppresses native wake",css_motion_deadline(d,uptime_ms())==-1);
+    d->native_cancelled=true;check("cancel suppresses native wake",css_motion_deadline(d)==-1);
     d->native_cancelled=false;web_free(d);
 }
 static void cssom_scope(void) {
@@ -202,7 +202,7 @@ static void computed_style(void) {
         "t('delay',s.animationDelay==='-0.5s');t('iterations',s.animationIterationCount==='3');"
         "t('direction',s.animationDirection==='alternate');t('fill',s.animationFillMode==='both');"
         "t('paused',s.animationPlayState==='paused');t('easing',s.animationTimingFunction==='linear');"
-        "t('opacity',Math.abs(Number(s.opacity)-.25)<.006);t('transform',s.transform==='none'&&CSS.supports('transform','translateX(1px)')&&!CSS.supports('transform','rotate(1deg)'));})()";
+        "t('opacity',Math.abs(Number(s.opacity)-.25)<.006);t('transform',s.transform==='none'&&CSS.supports('transform','translateX(1px)')&&CSS.supports('transform','rotate(1deg)')&&!CSS.supports('transform','rotate(1px)'));})()";
     check("computedStyle evaluation",web_console_eval(d,script,strlen(script)));
     check("computedStyle ten authored assertions",js_checks==10);
     web_free(d);

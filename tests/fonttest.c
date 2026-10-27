@@ -93,7 +93,14 @@ int main(void) {
                   font_has(f,0x0db0) && font_has(f,0x10300) && font_has(f,0x20bb7), "living/historical/CJK glyphs resolve");
             check(!font_has(f,0x10ffff), "unassigned glyph is not invented");
             outline[style] = raster(f,"Noto Maple Wi",24);
-            if (symbols) check(raster(f,"\xf0\x9f\x82\xa1",24) == raster(symbols,"\xf0\x9f\x82\xa1",24), "fallback is actual Plangothic raster");
+            if (symbols) {
+                /* A synthetic bold fills in its missing glyphs with an emboldened face too;
+                   Mono's real bold file keeps its column grid, so its fallback is not widened. */
+                bool same = raster(f,"\xf0\x9f\x82\xa1",24) == raster(symbols,"\xf0\x9f\x82\xa1",24);
+                if (family != FONT_FAMILY_MONO && (style & FONT_BOLD))
+                    check(!same && font_advance(f,24,0x1f0a1) > font_advance(symbols,24,0x1f0a1), "bold fallback is emboldened Plangothic");
+                else check(same, "fallback is actual Plangothic raster");
+            }
         }
         family_hash[family] = outline[0];
         if (family < 2 && cjk[family])

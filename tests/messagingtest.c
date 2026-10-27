@@ -8,9 +8,12 @@ int main(void) {
     char *lifecycle=script_page("let turns=0,loaded=false;const loop=new MessageChannel();loop.port2.onmessage=()=>{if(++turns<100)loop.port1.postMessage(0);};loop.port1.postMessage(0);"
         "addEventListener('load',()=>{loaded=true;check('posted-does-not-starve-load',turns<100);mark('posted-load');});");
     if(lifecycle&&open_case(lifecycle,false)) {test_check("posted-lifecycle",pump("posted-load",5000));close_case();}free(lifecycle);
+    /* No small queue limit refuses a post; a message that cannot be cloned
+       fails before its transfer list is detached (HTML structured transfer). */
     char *quota=script_page("const buffer=new ArrayBuffer(8);let queued=0;try{for(;queued<4096;queued++)postMessage(0,'*');}catch(e){}"
-        "check('posted-native-quota',queued===4096);let rejected=false;try{postMessage(buffer,'*',[buffer]);}catch(e){rejected=e instanceof RangeError;}"
-        "check('posted-quota-retains-transfer',rejected&&buffer.byteLength===8);mark('posted-quota');");
+        "check('posted-native-quota',queued===4096);let rejected=false;try{postMessage({buffer,s:Symbol()},'*',[buffer]);}"
+        "catch(e){rejected=e instanceof DOMException&&e.name==='DataCloneError';}"
+        "check('posted-failed-clone-retains-transfer',rejected&&buffer.byteLength===8);mark('posted-quota');");
     if(quota&&open_case(quota,false)) {test_check("posted-quota-completion",pump("posted-quota",10000));close_case();}free(quota);
     char *page=script_page("postMessage('must-not-run','*');const c=new MessageChannel();c.port2.onmessage=()=>mark('old-port-fired');c.port1.postMessage(1);mark('posted-ready');");
     if(page && open_case(page,false)) {

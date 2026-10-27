@@ -81,7 +81,8 @@ async function runHTMLElementCases() {
     }
     rejects(()=>link.sizes.supports('any'),'sizes-no-vocabulary');equal(link.blocking.supports('render'),false,'blocking-not-falsely-supported');
     equal(link.relList.supports('stylesheet'),true,'native-stylesheet-supported');
-    for(const unsupported of ['preload','modulepreload','icon','preconnect','dns-prefetch','manifest'])equal(link.relList.supports(unsupported),false,'unsupported-'+unsupported);
+    equal(link.relList.supports('modulepreload'),true,'native-modulepreload-supported');
+    for(const unsupported of ['preload','icon','preconnect','dns-prefetch','manifest'])equal(link.relList.supports(unsupported),false,'unsupported-'+unsupported);
     ok(typeof Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype,'sheet').get==='function','native-link-sheet-getter');
     ok(typeof Object.getOwnPropertyDescriptor(HTMLStyleElement.prototype,'sheet').get==='function','native-style-sheet-getter');
     const nativeStyle=document.createElement('style');nativeStyle.textContent='.native-sheet-probe{color:rgb(17,31,47)}';document.head.appendChild(nativeStyle);

@@ -1,4 +1,6 @@
-/* Real Nocturne global-TCB pressure, cooperative wait/kill and webfetch recovery.
+/* Real Nocturne TCB growth, cooperative wait/kill and webfetch recovery.
+   The TCB table grows; what still waits is a connect whose peer never
+   answers (no guest at .250 on the runner's isolated slirp subnet).
    Uses scripts/test.py's TCP server and HTTP fixture; no POSIX socket layer. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,7 +9,8 @@
 #include "webnet.h"
 
 #define HOST 0x0a000202
-#define CAPACITY 16 /* finite native TCB budget, not the file-descriptor table */
+#define SILENT 0x0a0002fa /* no guest answers ARP at .250 */
+#define HELD 40 /* past the TCB table's first 16 slots, twice grown */
 static int checks, failed, tcp_port, web_port;
 static webnet *net;
 struct result { int calls, status; char error[160]; bool body_ok; };
@@ -22,12 +25,13 @@ static void completed(webnet *n, uint64_t id, uint64_t generation, const struct 
     const char expected[] = "export const value = 42;\n";
     out->body_ok = r->body_len == sizeof expected - 1 && r->body && !memcmp(r->body, expected, sizeof expected - 1);
 }
-static uint64_t request(struct result *r, uint64_t generation) {
-    char url[256]; snprintf(url, sizeof url, "http://10.0.2.2:%d/api/module", web_port);
+static uint64_t request_at(struct result *r, uint64_t generation, const char *host) {
+    char url[256]; snprintf(url, sizeof url, "http://%s:%d/api/module", host, web_port);
     struct webnet_request q = {.kind=WEBNET_MODULE, .generation=generation, .url=url,
         .origin=url, .method="GET", .credentials=WEBNET_CREDENTIALS_OMIT};
     return webnet_submit(net, &q, completed, r);
 }
+static uint64_t request(struct result *r, uint64_t generation) { return request_at(r, generation, "10.0.2.2"); }
 static void pump(unsigned ms) {
     uint64_t until = uptime_ms() + ms;
     do { webnet_pump(net, uptime_ms()); n_sleep_ms(5); } while (uptime_ms() < until);
@@ -45,6 +49,7 @@ static int child_wait(n_handle app, int *status, unsigned ms) {
     if (got == -N_ERR_NOT_READY) { n_app_stop(app, 0); n_app_result(app, -1, status); return 0; }
     return got == 0;
 }
+/* path is complete: the native ABI launches no relative path. */
 static n_handle waiter(const char *path) {
     char port[16]; snprintf(port, sizeof port, "%d", tcp_port);
     const char *args[] = {path, "--wait", port};
@@ -63,10 +68,12 @@ static bool waiter_blocked(n_handle app) {
 }
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--wait")) {
-        n_result s = tcp_connect(HOST, (uint16_t)atoi(argv[2]), 5000);
-        if (s < 0) { printf("FAIL tcp capacity waiter: %s\n", n_result_text(s)); return 1; }
-        tcp_close((n_handle)s); return 0;
+        n_result s = tcp_connect(SILENT, (uint16_t)atoi(argv[2]), 5000);
+        if (s >= 0) { tcp_close((n_handle)s); return 0; }
+        return s == -N_ERR_TIMEOUT ? 2 : 1;
     }
+    char program[4096]; /* argv[0] is as it was typed; an app is launched by its complete path */
+    if (n_path_complete(argv[0], program, sizeof program) >= 0) argv[0] = program;
     FILE *f = fopen("C:\\Tests\\tcpport", "r"); char line[64] = "";
     if (f) { fgets(line, sizeof line, f); fclose(f); }
     tcp_port = atoi(line);
@@ -74,74 +81,66 @@ int main(int argc, char **argv) {
     if (f) { fgets(line, sizeof line, f); fclose(f); web_port = atoi(line); }
     if (!tcp_port || !web_port || !net_wait_up(5000)) { puts("FAIL tcp capacity fixture/configuration missing"); return 1; }
     struct n_netinfo ni;
-    if (net_info(&ni) == 0 && ni.ip[0] == 10 && ni.ip[1] == 0 && ni.ip[2] == 2 &&
-        ni.mask[0] == 255 && ni.mask[1] == 255 && ni.mask[2] == 255 && ni.mask[3] == 0) {
-        /* The runner's isolated slirp subnet has no guest at .250. Probe before
-           any TCB saturation, so a fresh ARP miss must honor the same budget. */
+    bool isolated = net_info(&ni) == 0 && ni.ip[0] == 10 && ni.ip[1] == 0 && ni.ip[2] == 2 &&
+        ni.mask[0] == 255 && ni.mask[1] == 255 && ni.mask[2] == 255 && ni.mask[3] == 0;
+    if (isolated) {
+        /* A fresh ARP miss honors the connect's own deadline. */
         uint64_t before = uptime_ms();
-        n_result s = tcp_connect(0x0a0002fa, (uint16_t)tcp_port, 150);
+        n_result s = tcp_connect(SILENT, (uint16_t)tcp_port, 150);
         uint64_t elapsed = uptime_ms() - before;
         printf("TCP-CAPACITY-ARP elapsed=%lu result=%s\n", (unsigned long)elapsed, s < 0 ? n_result_text(s) : "connected");
         check(s < 0 && s != -N_ERR_NO_MEMORY && elapsed < 1000 && (s != -N_ERR_TIMEOUT || elapsed >= 100),
             "fresh isolated-subnet ARP lookup honors 150ms connect budget");
         if (s >= 0) tcp_close((n_handle)s);
-    } else puts("SKIP tcp capacity isolated-subnet ARP probe outside runner network");
+    } else puts("SKIP tcp capacity isolated-subnet probes outside runner network");
     net = webnet_create();
     if (!net) { puts("FAIL tcp capacity worker allocation"); return 1; }
-    int held[CAPACITY]; bool filled = true;
-    for (int i = 0; i < CAPACITY; i++) held[i] = -1;
-    /* 先行worker試験のFIN待ちは既存kernelの20秒の生存期間を持つ。
-       準備段階だけその解放を待つ。満杯後の150ms期限の検査は変えない。 */
-    for (int i = 0; i < CAPACITY; i++) {
+    int held[HELD]; bool filled = true;
+    for (int i = 0; i < HELD; i++) held[i] = -1;
+    /* 先行worker試験のFIN待ちは既存kernelの20秒の生存期間を持つ。準備段階だけ長く待つ。 */
+    for (int i = 0; i < HELD; i++) {
         held[i] = tcp_connect(HOST, (uint16_t)tcp_port, 25000);
         if (held[i] < 0) { filled = false; break; }
     }
-    check(filled, "all finite active slots held without file descriptors");
+    check(filled, "live connections grow the TCB table past its first slots");
     if (filled) {
         uint64_t before = uptime_ms(); n_result extra = tcp_connect(HOST, (uint16_t)tcp_port, 150);
         uint64_t elapsed = uptime_ms() - before;
-        check(extra == -N_ERR_TIMEOUT && elapsed >= 100 && elapsed < 1000, "full pool waits within original deadline, not an immediate N_ERR_NO_MEMORY");
+        check(extra >= 0 && elapsed < 150, "a further connection needs no free slot to wait for");
         if (extra >= 0) tcp_close((n_handle)extra);
+    }
+    if (isolated) {
         struct result cancelled[2] = {0};
-        check(request(&cancelled[0], 100) && request(&cancelled[1], 100), "two worker requests queued under TCB pressure");
-        pump(200); before = uptime_ms(); webnet_cancel_generation(net, 100);
+        check(request_at(&cancelled[0], 100, "10.0.2.250") && request_at(&cancelled[1], 100, "10.0.2.250"),
+            "two worker requests wait on a peer that never answers");
+        pump(200);
+        check(webnet_busy(net) && !cancelled[0].calls && !cancelled[1].calls, "unanswered worker requests are still in flight");
+        uint64_t before = uptime_ms(); webnet_cancel_generation(net, 100);
         check(!webnet_busy(net) && uptime_ms() - before < 2000 && !cancelled[0].calls && !cancelled[1].calls,
-            "cancellation wakes killed capacity waiters and reaps both workers");
+            "cancellation wakes the waiting workers and reaps both");
         n_handle app = waiter(argv[0]);
         int status = -1;
-        check(app >= 0, "launch cooperative capacity waiter");
-        if (app >= 0) {
-            n_sleep_ms(200);
-            bool running = n_app_result(app, 0, &status) == -N_ERR_NOT_READY;
-            check(running, "waiter remains blocked while all slots are active");
-            tcp_close(held[0]); held[0] = -1;
-            if (running) check(child_wait(app, &status, 5500) == 1 && status == 0, "FIN/TIME_WAIT release wakes waiting connection");
-            else check(false, "capacity waiter survived until release");
-            n_handle_close(app);
-        }
-        held[0] = tcp_connect(HOST, (uint16_t)tcp_port, 5000);
-        check(held[0] >= 0, "closing waiter slot is reclaimed only after protocol lifetime");
-        app = waiter(argv[0]); status = -1;
+        check(app >= 0, "launch cooperative connect waiter");
         if (app >= 0) {
             n_sleep_ms(200);
             bool running = n_app_result(app, 0, &status) == -N_ERR_NOT_READY;
             bool blocked = running && waiter_blocked(app);
-            check(blocked, "stop target is a still-running native blocked capacity waiter");
+            check(blocked, "stop target is a still-running native blocked connect waiter");
             if (running) {
                 before = uptime_ms();
                 n_result stopped = n_app_stop(app, 0);
-                check(stopped >= 0, "native stop accepts the blocked capacity waiter");
+                check(stopped >= 0, "native stop accepts the blocked connect waiter");
                 int reaped = child_wait(app, &status, 1500);
                 /* A stopped app reports the kernel's kill code, 130. */
                 check(blocked && stopped >= 0 && reaped == 1 && status == 130 && uptime_ms() - before < 1500,
-                    "stopped global-capacity waiter exits 130 promptly without a TCB");
-            } else check(false, "capacity stop target did not exit before cancellation");
+                    "stopped connect waiter exits 130 promptly");
+            } else check(false, "connect waiter did not exit before its stop");
             n_handle_close(app);
-        } else check(false, "launch stopped capacity waiter");
+        }
     }
-    for (int i = 0; i < CAPACITY; i++) if (held[i] >= 0) tcp_close(held[i]);
-    /* More than the global budget: small module responses force repeated closes
-       through the actual two-worker transport, with no sleep between batches. */
+    for (int i = 0; i < HELD; i++) if (held[i] >= 0) tcp_close(held[i]);
+    /* Small module responses force repeated closes through the actual
+       two-worker transport, with no sleep between batches. */
     for (int batch = 0; batch < 24; batch++) {
         struct result out[2] = {0}; uint64_t generation = 200 + (uint64_t)batch;
         bool submitted = request(&out[0], generation) && request(&out[1], generation);

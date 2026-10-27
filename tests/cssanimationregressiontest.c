@@ -101,7 +101,7 @@ static void lifecycle(void) {
     d->style_full_dirty=d->need_style=d->need_boxes=true;layout(d);
     check("full style rebuild retains playback",a->css_motion==identity && opacity(a,.25));
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both");layout(d);
-    check("resume schedules native frame",css_motion_deadline(d,uptime_ms())>=0);
+    check("resume schedules native frame",css_motion_deadline(d)>=0);
     n_sleep_ms(35);css_motion_tick(d,uptime_ms());layout(d);
     check("resume advances actual native time",a->style->opacity>.27f && a->style->opacity<.6f);
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both paused");layout(d);
@@ -169,21 +169,21 @@ static void cssom_scope(void) {
 static bool checkpoint(void *opaque){(void)opaque;return true;}
 static void console(void *opaque,int level,const char *message) {
     (void)opaque;(void)level;
-    if(!strcmp(message,"CSSREG PASS unsupported-transform"))js_checks++;
-    else if(!strcmp(message,"CSSREG FAIL unsupported-transform")){js_checks++;js_failures++;printf("%s\n",message);}
+    if(!strcmp(message,"CSSREG PASS initial-transform"))js_checks++;
+    else if(!strcmp(message,"CSSREG FAIL initial-transform")){js_checks++;js_failures++;printf("%s\n",message);}
 }
-static void unsupported_transform(void) {
+static void initial_transform(void) {
     const char *html="<!doctype html><html><body><div id=t></div></body></html>";
     struct web_host host={.console=console,.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://css-animation.test/","utf-8",&host);
     if(!d){js_checks++;js_failures++;return;}
     for(int i=0;i<8;i++)web_tick(d,uptime_ms());layout(d);
-    const char *script="console.log('CSSREG '+(getComputedStyle(document.getElementById('t')).transform===''&&!CSS.supports('transform','translateX(1px)')?'PASS ':'FAIL ')+'unsupported-transform')";
+    const char *script="console.log('CSSREG '+(getComputedStyle(document.getElementById('t')).transform==='none'&&CSS.supports('transform','translateX(1px)')&&!CSS.supports('transform','translateX(1deg)')?'PASS ':'FAIL ')+'initial-transform')";
     if(!web_console_eval(d,script,strlen(script)) || js_checks!=1){js_checks=1;js_failures++;}
     web_free(d);
 }
 int main(void) {
-    sampling();lifecycle();cssom_scope();unsupported_transform();
+    sampling();lifecycle();cssom_scope();initial_transform();
     printf("cssanimationregression: %d checks, %d failures (JS %d/%d)\n",checks+js_checks,failures+js_failures,js_checks,js_failures);
     return failures || js_failures?1:0;
 }

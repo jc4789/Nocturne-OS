@@ -423,7 +423,7 @@ static void test_filter_groups(void) {
     for(size_t i=0;i<sizeof cb_cases/sizeof *cb_cases;i++) {
         char html[1536];const char *tag=cb_cases[i].shadow?"x-filter":"div";
         snprintf(html,sizeof html,"<!doctype html><body style='margin:0;font-size:0;line-height:0'><div style=height:20px></div>"
-            "<%s style='margin-left:30px;padding:10px;border:5px solid transparent;width:100px;height:60px;filter:%s'>%s"
+            "<%s style='display:block;margin-left:30px;padding:10px;border:5px solid transparent;width:100px;height:60px;filter:%s'>%s"
             "<a href=/effect style='position:%s;left:5px;top:5px;width:10px;height:20px;background:blue'></a>%s</%s>",
             tag,cb_cases[i].filter,cb_cases[i].shadow?"<template shadowrootmode=open>":"",cb_cases[i].position,
             cb_cases[i].shadow?"</template>":"",tag);
@@ -631,9 +631,14 @@ static void test_float_percent_heights(void) {
             "<img src=i.png style='float:left;width:60px;height:100%'>", 1, 0, 80, 80, 1},
         {"inline-float-definite-percent", "height:80px",
             "<span><img src=i.png style='float:left;width:60px;height:100%'></span>", 1, 0, 80, 80, 1},
+        /* CSS 2.1 §9.5: a float that fits beside the line's content goes on
+           that line's top; one that does not is deferred below the line. */
         {"deferred-float-definite-percent", "height:80px",
-            "<span style='display:inline-block;width:1px;height:5px;vertical-align:top'></span>"
+            "<span style='display:inline-block;width:50px;height:5px;vertical-align:top'></span>"
             "<img src=i.png style='float:left;width:60px;height:100%'>", 1, 5, 80, 85, 6},
+        {"float-beside-line-definite-percent", "height:80px",
+            "<span style='display:inline-block;width:1px;height:5px;vertical-align:top'></span>"
+            "<img src=i.png style='float:left;width:60px;height:100%'>", 1, 0, 80, 80, 1},
         {"split-inline-float-percent", "height:80px",
             "<div style='float:left;width:60px;height:100%'>"
             "<span style='height:200px;min-height:300px;max-height:400px'><div style='width:100%;height:100%'>"

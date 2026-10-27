@@ -100,9 +100,13 @@ static void cancellation(void) {
     stop_native=true;checkpoints=0;web_layout(d,800,600);
     check(checkpoints>0&&d->native_cancelled,"native scan/cascade observes host stop");
     check(!d->layout_valid && !d->root_box,"partial layout is unpublished");
+    /* With no author task interrupted, the next layout rebuilds the discarded
+       one: still unpublished while the host stops it, complete once it does not. */
     int calls=checkpoints;web_layout(d,800,600);
-    check(checkpoints==calls,"stopped layout is not retried");
-    stop_native=false;web_free(d);
+    check(checkpoints>calls && d->native_cancelled && !d->layout_valid && !d->root_box,"a retry the host still stops stays unpublished");
+    stop_native=false;web_layout(d,800,600);
+    check(!d->native_cancelled && d->layout_valid && d->root_box,"stopped layout is rebuilt once the host allows it");
+    web_free(d);
 }
 static void layout_cancellation(bool grid) {
     web_doc *d=load();check(d!=NULL,"flex cancellation document");if(!d)return;

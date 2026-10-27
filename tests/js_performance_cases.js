@@ -106,7 +106,7 @@ async function runPerformanceCases() {
     performance.clearMarks();performance.clearMeasures();eq('全消去',performance.getEntries().length,0);
 
     const types=PerformanceObserver.supportedEntryTypes;
-    eq('UserTimingだけ広告',types.join(','),'mark,measure');eq('SameObject型配列',types,PerformanceObserver.supportedEntryTypes);
+    eq('実装する型だけ広告',types.join(','),'mark,measure,resource');eq('SameObject型配列',types,PerformanceObserver.supportedEntryTypes);
     ok('型配列凍結',Object.isFrozen(types));
     throws('callback必須',TypeError,()=>new PerformanceObserver());
     const invalid=new PerformanceObserver(()=>{});
@@ -154,7 +154,7 @@ async function runPerformanceCases() {
     await tick();eq('buffered通知',bufferedBatches[0][0],stored);
     const next=performance.mark('next');await tick();eq('bufferedの新規通知',bufferedBatches[1][0],next);
     buffered.observe({type:'mark',buffered:true});await tick();eq('再buffer取得',bufferedBatches[2].length,2);buffered.disconnect();
-    let unsupported=0;const unavailable=new PerformanceObserver(()=>unsupported++);unavailable.observe({type:'resource',buffered:true});
+    let unsupported=0;const unavailable=new PerformanceObserver(()=>unsupported++);unavailable.observe({type:'no-such-entry-type',buffered:true});
     performance.mark('real-mark');await tick();eq('未実装type無通知',unsupported,0);unavailable.disconnect();
     let replaced=[];const replace=new PerformanceObserver(list=>replaced.push(...list.getEntries()));
     replace.observe({entryTypes:['mark']});replace.observe({entryTypes:['measure']});
@@ -218,7 +218,7 @@ async function runPerformanceBoundaryCases() {
     await tick();eq('空observerで他observer停止しない',observed.length,2);eq('通知の時間順',observed[0],low);
     taken.disconnect();untouched.disconnect();
     let countEmpty=0;const empty=new PerformanceObserver(list=>countEmpty+=list.getEntries().length);
-    empty.observe({entryTypes:['mark']});empty.observe({entryTypes:[]});empty.observe({entryTypes:['resource']});
+    empty.observe({entryTypes:['mark']});empty.observe({entryTypes:[]});empty.observe({entryTypes:['no-such-entry-type']});
     performance.mark('after-empty-options');await tick();eq('空type登録は既存登録非破壊',countEmpty,1);empty.disconnect();clean();
 
     const log=[];const name={toString(){log.push('name');return 'accessor-mark';}};
