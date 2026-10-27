@@ -296,12 +296,39 @@ struct shadow_cache;
 void web_shadow_cache_free(struct shadow_cache **);
 struct radius_cache;
 void web_radius_cache_free(struct radius_cache **);
+struct clip_cache;
+void web_clip_cache_free(struct clip_cache **);
 struct css_filter {
     size_t count;
     float opacity; /* product of used, range-clamped steps; not the computed list */
     struct css_filter_step steps[];
 };
 bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d);
+/* clip-path (css-masking-1 §5.1, css-shapes-1 §3): a basic shape in a reference box, the reference
+   box alone, or a reference to an SVG <clipPath>. rect() and xywh() compute to inset(). */
+enum { CLIP_SHAPE_BOX, CLIP_SHAPE_INSET, CLIP_SHAPE_CIRCLE, CLIP_SHAPE_ELLIPSE, CLIP_SHAPE_POLYGON,
+       CLIP_SHAPE_PATH, CLIP_SHAPE_URL };
+enum { CLIP_BOX_BORDER, CLIP_BOX_PADDING, CLIP_BOX_CONTENT, CLIP_BOX_MARGIN, CLIP_BOX_FILL,
+       CLIP_BOX_STROKE, CLIP_BOX_VIEW };
+enum { CLIP_EXTENT_LENGTH, CLIP_EXTENT_CLOSEST, CLIP_EXTENT_FARTHEST };
+struct css_clip_path {
+    uint8_t shape, box;          /* CLIP_SHAPE_*, CLIP_BOX_* */
+    bool evenodd;               /* POLYGON, PATH: the fill rule */
+    uint8_t extent[2];           /* CIRCLE: [0]; ELLIPSE: x, y (CLIP_EXTENT_*) */
+    len_t radius[2];             /* CLIP_EXTENT_LENGTH radii */
+    len_t at[2];                 /* CIRCLE, ELLIPSE: the centre */
+    len_t inset[4];              /* INSET: top right bottom left */
+    uint8_t inset_percent;       /* bit i: inset[i] serializes as a percentage even when zero */
+    struct css_corner_radius corner[4]; /* INSET round: TL TR BR BL; zero without round */
+    float round;                 /* POLYGON: the corner rounding, px */
+    const char *text;            /* PATH: the path data; URL: the reference, unescaped */
+    size_t points;               /* POLYGON */
+    len_t point[][2];
+};
+bool css_clip_path_serialize(const struct css_clip_path *clip, sbuf *out, web_doc *d);
+/* clip (css-masking-1 §6.1): rect() offsets from the border box's top left; auto edges are its edges */
+struct css_clip_rect { bool rect; uint8_t auto_edges; float edge[4]; };
+bool css_clip_rect_serialize(const struct css_clip_rect *clip, sbuf *out);
 static inline bool len_auto(const len_t *l) { return l->kind == LK_AUTO; }
 static inline bool len_none(const len_t *l) { return l->kind == LK_NONE; }
 static inline bool len_has_pct(const len_t *l) { return l->kind == LK_EXPR || (l->kind == LK_LEN && l->pct != 0); }
@@ -464,6 +491,8 @@ typedef struct style {
     float border_spacing;
     float opacity;
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
+    const struct css_clip_path *clip_path; /* NULL: none; computed-arena value */
+    struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
     const struct css_transform *rotate, *scale; /* individual properties; NULL = none */
@@ -602,6 +631,10 @@ const char *css_prop_name(int index,bool *longhand); /* actual native table, lex
 int css_prop_index(const struct propdef *p);
 bool css_prop_is_font(const struct propdef *p); /* font-size or the font shorthand */
 bool css_prop_is_motion(const struct propdef *p);
+/* CSSOM computed value of a longhand the table stores whole (keyword, length, pixels, number,
+   integer): 1 with the text in out; 2 for a colour, resolved into *color; -1 out of memory;
+   0 for any other property, whose value has its own serializer or none. */
+int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32_t *color, web_doc *d);
 /* the values a declaration is resolved against */
 struct cx {
     style_t *s;
@@ -697,6 +730,7 @@ typedef struct box {
     bool paint_layers_valid;
     struct shadow_cache *shadow_cache; /* geometry-only Gaussian masks; box lifetime */
     struct radius_cache *radius_clip[3]; /* border, padding, replaced-content clip masks */
+    struct clip_cache *clip_cache; /* clip-path's shape coverage; box lifetime */
     bool style_sync_dirty; /* retirement join: this subtree has changed style borrows */
     /* inline formatting results (block containers with inline content) */
     struct run *runs;
@@ -763,6 +797,10 @@ struct svg_cache {
     bool used; /* reachable from the box tree currently being rebuilt */
 };
 struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color);
+/* The shapes of the <clipPath> that ref names in n's document, as nanosvg markup filled opaque by
+   their clip-rule: clipPathUnits="objectBoundingBox" maps the unit square onto box (x y w h),
+   userSpaceOnUse puts the origin at its corner. False when ref names no <clipPath>. */
+bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out);
 bool box_block_level(const box_t *b);
 
 struct run {

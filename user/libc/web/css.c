@@ -5516,6 +5516,7 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
         if(!css_length_equal(&xa[group][i],&ya[group][i]))return false;xa[group][i].expr=ya[group][i].expr=NULL;
     }
     x.filter=y.filter=NULL; /* effect amounts are paint-only arena borrows */
+    x.clip_path=y.clip_path=NULL;memset(&x.clip,0,sizeof x.clip);memset(&y.clip,0,sizeof y.clip); /* clipping paints only */
     /* same_translation() decided every geometric effect of the transform
        properties; their values and arena addresses are paint state. */
     x.transform=y.transform=NULL;memset(&x.translate,0,sizeof x.translate);memset(&y.translate,0,sizeof y.translate);
@@ -5572,6 +5573,20 @@ static bool filters_equal(const struct css_filter *x, const struct css_filter *y
         if (x->steps[i].value != y->steps[i].value || x->steps[i].percentage != y->steps[i].percentage) return false;
     return true;
 }
+static bool clip_paths_equal(const struct css_clip_path *x, const struct css_clip_path *y) {
+    if (x == y) return true;
+    if (!x || !y || x->shape != y->shape || x->box != y->box || x->evenodd != y->evenodd || x->round != y->round ||
+        x->inset_percent != y->inset_percent || x->points != y->points || memcmp(x->extent, y->extent, sizeof x->extent) ||
+        !equal_string(x->text, y->text)) return false;
+    for (int i = 0; i < 2; i++)
+        if (!css_length_equal(&x->radius[i], &y->radius[i]) || !css_length_equal(&x->at[i], &y->at[i])) return false;
+    for (int i = 0; i < 4; i++)
+        if (!css_length_equal(&x->inset[i], &y->inset[i]) || !css_length_equal(&x->corner[i].axis[0], &y->corner[i].axis[0]) ||
+            !css_length_equal(&x->corner[i].axis[1], &y->corner[i].axis[1])) return false;
+    for (size_t i = 0; i < x->points; i++)
+        if (!css_length_equal(&x->point[i][0], &y->point[i][0]) || !css_length_equal(&x->point[i][1], &y->point[i][1])) return false;
+    return true;
+}
 static bool gradients_equal(const struct gradient *x, const struct gradient *y) {
     if (x == y) return true;
     if (!x || !y || x->radial != y->radial || x->repeating != y->repeating || x->circle != y->circle ||
@@ -5604,7 +5619,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !equal_string(a->bg_image, b->bg_image) || !equal_string(a->mask_image, b->mask_image) ||
         !equal_string(a->motion.name, b->motion.name) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
-        !filters_equal(a->filter, b->filter) || !transforms_equal(a->transform, b->transform) ||
+        !filters_equal(a->filter, b->filter) || !clip_paths_equal(a->clip_path, b->clip_path) ||
+        !transforms_equal(a->transform, b->transform) ||
         !transforms_equal(a->rotate, b->rotate) || !transforms_equal(a->scale, b->scale) ||
         !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) ||
         !equal_tracks(a->grid_cols, b->grid_cols) || !equal_tracks(a->grid_rows, b->grid_rows) ||
@@ -5640,7 +5656,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.container_names = y.container_names = x.font_names = y.font_names = x.content = y.content = NULL;
     x.list_style_string = y.list_style_string = x.bg_image = y.bg_image = x.mask_image = y.mask_image = NULL;
     x.motion.name = y.motion.name = x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
-    x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL;
+    x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
     x.grid_cols = y.grid_cols = x.grid_rows = y.grid_rows = NULL;

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include "image.h"
 #include "stb_image.h"
 #include "jebp.h"
@@ -101,6 +102,44 @@ image_t *image_decode_svg(const char *svg, size_t n, int w, int h) {
 }
 
 bool image_is_svg(const void *data, size_t n) { return data && looks_like_svg(data, n); }
+
+bool image_svg_coverage(const char *data, size_t n, size_t max_pixels, uint8_t **alpha, int *left, int *top, int *w, int *h) {
+    *alpha = NULL; *left = *top = *w = *h = 0;
+    char *text = malloc(n + 1); /* nanosvg parses in place */
+    if (!text) return false;
+    memcpy(text, data, n);
+    text[n] = 0;
+    NSVGimage *svg = nsvgParse(text, "px", 96);
+    free(text);
+    if (!svg) return false;
+    double x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+    for (NSVGshape *s = svg->shapes; s; s = s->next) {
+        if (!(s->flags & NSVG_FLAGS_VISIBLE) || s->fill.type == NSVG_PAINT_NONE) continue;
+        x0 = fmin(x0, s->bounds[0]); y0 = fmin(y0, s->bounds[1]);
+        x1 = fmax(x1, s->bounds[2]); y1 = fmax(y1, s->bounds[3]);
+    }
+    bool ok = true;
+    x0 = floor(x0); y0 = floor(y0); x1 = ceil(x1); y1 = ceil(y1);
+    if (x1 > x0 && y1 > y0 && x0 > -(1 << 28) && y0 > -(1 << 28) && x1 < (1 << 28) && y1 < (1 << 28) &&
+        (x1 - x0) * (y1 - y0) > (double)max_pixels) {
+        *left = (int)x0; *top = (int)y0; *w = (int)(x1 - x0); *h = (int)(y1 - y0);
+    } else if (x1 > x0 && y1 > y0 && x0 > -(1 << 28) && y0 > -(1 << 28) && x1 < (1 << 28) && y1 < (1 << 28)) {
+        int pw = (int)(x1 - x0), ph = (int)(y1 - y0);
+        size_t pixels = (size_t)pw * (size_t)ph;
+        uint8_t *rgba = calloc(pixels, 4), *coverage = malloc(pixels);
+        NSVGrasterizer *r = rgba && coverage ? nsvgCreateRasterizer() : NULL;
+        if (r) {
+            nsvgRasterize(r, svg, (float)-x0, (float)-y0, 1, rgba, pw, ph, pw * 4);
+            for (size_t i = 0; i < pixels; i++) coverage[i] = rgba[i * 4 + 3];
+            *alpha = coverage; coverage = NULL;
+            *left = (int)x0; *top = (int)y0; *w = pw; *h = ph;
+        } else ok = false;
+        if (r) nsvgDeleteRasterizer(r);
+        free(rgba); free(coverage);
+    }
+    nsvgDelete(svg);
+    return ok;
+}
 
 static uint16_t image_le16(const uint8_t *p) { return p[0] | (uint16_t)p[1] << 8; }
 static uint32_t image_le32(const uint8_t *p) {

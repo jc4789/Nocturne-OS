@@ -2149,9 +2149,11 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
         sbuf text={0};if(!css_radius_serialize(st,radius_corner,&text,d)){sb_free(&text);return JS_ThrowInternalError(ctx,"CSS radius serialization failed");}
         JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;
     }
-    if (!strcmp(property,"filter") || !strcmp(property,"box-shadow")) {
+    if (!strcmp(property,"filter") || !strcmp(property,"box-shadow") || !strcmp(property,"clip-path") || !strcmp(property,"clip")) {
         sbuf text={0};
         bool serialized = !strcmp(property,"filter") ? css_filter_serialize(st->filter,&text,d) :
+            !strcmp(property,"clip-path") ? css_clip_path_serialize(st->clip_path,&text,d) :
+            !strcmp(property,"clip") ? css_clip_rect_serialize(&st->clip,&text) :
             css_shadow_serialize(st->box_shadow,&text,d);
         if (!serialized) {
             sb_free(&text);return JS_ThrowInternalError(ctx,"CSS effect serialization failed");
@@ -2296,6 +2298,15 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     }
     if (is_color) computed_color_text(out,sizeof out,color);
     if (is_px) snprintf(out, sizeof out, "%gpx", (double)px);
+    if (!is_color && !is_px && !out[0]) {
+        /* Every other longhand the property table stores whole. */
+        sbuf text={0};
+        int kind=css_computed_longhand(st,property,&text,&color,d);
+        if(kind<0){sb_free(&text);return oom(ctx);}
+        if(kind==2)computed_color_text(out,sizeof out,color);
+        else if(kind==1){JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;}
+        sb_free(&text);
+    }
     return JS_NewString(ctx, out);
 }
 /* Private samples live in the animation cascade origin, never inline style.

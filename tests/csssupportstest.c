@@ -127,8 +127,8 @@ static void test_length_serialization(void) {
         {{.kind=LK_AUTO},"auto"},{{.kind=LK_NONE},"none"},{{.kind=LK_NORMAL},"normal"},
         {{.kind=LK_NUMBER,.px=2.5f},"2.5"},{{.kind=LK_LEN},"0px"},
         {{.kind=LK_LEN,.px=12.5f},"12.5px"},{{.kind=LK_LEN,.pct=25},"25%"},
-        {{.kind=LK_LEN,.px=-3,.pct=20},"calc(-3px + 20%)"},
-        {{.kind=LK_LEN,.px=3,.pct=-20},"calc(3px - 20%)"}
+        {{.kind=LK_LEN,.px=-3,.pct=20},"calc(20% - 3px)"},
+        {{.kind=LK_LEN,.px=3,.pct=-20},"calc(-20% + 3px)"}
     };
     for(size_t i=0;i<sizeof cases/sizeof *cases;i++) {
         sbuf out={0};check("length kind serialized",css_length_serialize(&cases[i].value,&out,NULL),true);

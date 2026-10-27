@@ -636,6 +636,52 @@ struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color) {
     return c;
 }
 
+bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out) {
+    web_doc *d = n ? n->owner : NULL;
+    const char *fragment = ref ? strchr(ref, '#') : NULL;
+    if (!d || !fragment || !fragment[1]) return false;
+    if (fragment != ref) { /* this document's own URL with a fragment names one of its elements */
+        size_t prefix = (size_t)(fragment - ref), own = d->url ? strcspn(d->url, "#") : 0;
+        if (!d->url || prefix != own || memcmp(ref, d->url, prefix)) return false;
+    }
+    node_t *scope = doc_node_root(n, false);
+    node_t *clip = scope ? find_id(scope, fragment + 1) : NULL;
+    if (!clip || !clip->foreign || strcmp(clip->name, "clippath")) return false;
+    const char *units = node_attr(clip, "clipPathUnits");
+    bool bbox = units && !strcmp(units, "objectBoundingBox");
+    char head[320];
+    snprintf(head, sizeof head, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%.9g\" height=\"%.9g\"><g transform=\"matrix(%.9g 0 0 %.9g %.9g %.9g)",
+             (double)box[2], (double)box[3], bbox ? (double)box[2] : 1.0, bbox ? (double)box[3] : 1.0, (double)box[0], (double)box[1]);
+    sb_puts(out, head);
+    char css_transform[160];
+    const char *own = svg_css_transform(clip, css_transform) ? css_transform : node_attr(clip, "transform");
+    if (own) { sb_putc(out, ' '); xml_escape(out, own, strlen(own), true); }
+    sb_puts(out, "\">");
+    const char *clip_rule = node_attr(clip, "clip-rule");
+    static const char *const shapes[] = {"rect", "circle", "ellipse", "polygon", "polyline", "path", NULL};
+    static const char *const geometry[] = {"x", "y", "width", "height", "rx", "ry", "cx", "cy", "r", "points", "d", NULL};
+    for (node_t *c = clip->first; c; c = c->next) {
+        if (c->type != N_ELEM || !c->foreign || (c->style && (c->style->display == D_NONE || c->style->visibility))) continue;
+        int shape = 0;
+        while (shapes[shape] && strcmp(c->name, shapes[shape])) shape++;
+        if (!shapes[shape]) continue; /* <text> and <use> do not clip yet */
+        sb_putc(out, '<'); sb_puts(out, shapes[shape]);
+        for (int i = 0; geometry[i]; i++) {
+            const char *v = node_attr(c, geometry[i]);
+            if (!v) continue;
+            sb_putc(out, ' '); sb_puts(out, geometry[i]); sb_puts(out, "=\""); xml_escape(out, v, strlen(v), true); sb_putc(out, '"');
+        }
+        const char *transform = svg_css_transform(c, css_transform) ? css_transform : node_attr(c, "transform");
+        if (transform) { sb_puts(out, " transform=\""); xml_escape(out, transform, strlen(transform), true); sb_putc(out, '"'); }
+        const char *rule = node_attr(c, "clip-rule");
+        if (!rule) rule = clip_rule;
+        sb_puts(out, rule && !strcmp(rule, "evenodd") ? " fill=\"#000\" stroke=\"none\" fill-rule=\"evenodd\"/>" :
+                                                        " fill=\"#000\" stroke=\"none\"/>");
+    }
+    sb_puts(out, "</g></svg>");
+    return true;
+}
+
 /* ---------------------------------------------------------------- generation */
 static int atomic_kind(node_t *n) {
     const char *t;
@@ -766,7 +812,8 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     ws->height.kind = LK_AUTO;
     style_t *is = ar_alloc(b->a, sizeof *is);
     *is = *st;
-    is->filter = NULL; is->opacity = 1; /* the element's outer group composites once */
+    is->filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
+    is->clip_path = NULL; memset(&is->clip, 0, sizeof is->clip);
     is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);
     is->display = inner_kind == B_TABLE ? D_TABLE : inner_kind == B_GRID ? D_GRID : D_FLEX;
     for (int i = 0; i < 4; i++) {
@@ -1066,6 +1113,7 @@ static void unpublish_boxes(box_t *b) {
     pv_free(&b->paint_layers);
     web_shadow_cache_free(&b->shadow_cache);
     for(int i=0;i<3;i++)web_radius_cache_free(&b->radius_clip[i]);
+    web_clip_cache_free(&b->clip_cache);
     for (int i = 0; i < b->ndecos; i++) {
         web_shadow_cache_free(&b->decos[i].shadow_cache);
         for(int j=0;j<2;j++)web_radius_cache_free(&b->decos[i].radius_clip[j]);
@@ -1614,7 +1662,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
         next.width.kind=next.height.kind=LK_AUTO;
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
-        next.filter=NULL; next.opacity=1;
+        next.filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
         next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);
         for (int i=0;i<4;i++) {
             next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;

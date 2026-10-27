@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include "webi.h"
 #include "inspect_private.h"
+#include "svg_geometry.h"
 
 /* ---------------------------------------------------------------- small parsing helpers */
 static void trim(const char **s, size_t *n) {
@@ -586,8 +587,9 @@ static bool length_coefficients(sbuf *out, float px, float pct, bool number) {
     if (number) return pct == 0 && length_number(out, px, "");
     if (pct == 0) return length_number(out, px, "px");
     if (px == 0) return length_number(out, pct, "%");
-    return length_append(out, "calc(", 5) && length_number(out, px, "px") &&
-        length_append(out, pct < 0 ? " - " : " + ", 3) && length_number(out, fabsf(pct), "%") &&
+    /* css-values-4 §10.13 sorts a sum's terms: the percentage before the dimensions. */
+    return length_append(out, "calc(", 5) && length_number(out, pct, "%") &&
+        length_append(out, px < 0 ? " - " : " + ", 3) && length_number(out, fabsf(px), "px") &&
         length_append(out, ")", 1);
 }
 struct length_frame { const struct cexpr *node; unsigned phase; };
@@ -1110,6 +1112,16 @@ bool css_shadow_specified(const char *value, size_t size, sbuf *out) {
     if(!success){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}
     return success;
 }
+/* A <border-radius> value of four corners (TL TR BR BL) per axis, in its shortest form. */
+static bool radius_lengths_serialize(const len_t lengths[2][4],sbuf *out,web_doc *doc) {
+    bool ok=true,equal=true;for(int i=0;i<4;i++)equal&=css_length_equal(&lengths[0][i],&lengths[1][i]);
+    for(int axis=0;axis<(equal?1:2)&&ok;axis++) {
+        int count=4;if(css_length_equal(&lengths[axis][1],&lengths[axis][3])){count=3;if(css_length_equal(&lengths[axis][0],&lengths[axis][2])){count=2;if(css_length_equal(&lengths[axis][0],&lengths[axis][1]))count=1;}}
+        if(axis)ok=length_append(out," / ",3);
+        for(int i=0;i<count&&ok;i++)ok=(!i||length_append(out," ",1))&&css_length_serialize(&lengths[axis][i],out,doc);
+    }
+    return ok;
+}
 bool css_radius_serialize(const style_t *style,int corner,sbuf *out,web_doc *doc) {
     size_t original=out->n;bool ok=true;len_t lengths[2][4];
     for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++) {
@@ -1119,15 +1131,88 @@ bool css_radius_serialize(const style_t *style,int corner,sbuf *out,web_doc *doc
     if(corner>=0&&corner<4) {
         ok=css_length_serialize(&lengths[0][corner],out,doc);
         if(ok&&!css_length_equal(&lengths[0][corner],&lengths[1][corner]))ok=length_append(out," ",1)&&css_length_serialize(&lengths[1][corner],out,doc);
-    } else {
-        bool equal=true;for(int i=0;i<4;i++)equal&=css_length_equal(&lengths[0][i],&lengths[1][i]);
-        for(int axis=0;axis<(equal?1:2)&&ok;axis++) {
-            int count=4;if(css_length_equal(&lengths[axis][1],&lengths[axis][3])){count=3;if(css_length_equal(&lengths[axis][0],&lengths[axis][2])){count=2;if(css_length_equal(&lengths[axis][0],&lengths[axis][1]))count=1;}}
-            if(axis)ok=length_append(out," / ",3);
-            for(int i=0;i<count&&ok;i++)ok=(!i||length_append(out," ",1))&&css_length_serialize(&lengths[axis][i],out,doc);
-        }
-    }
+    } else ok=radius_lengths_serialize(lengths,out,doc);
     if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}return ok;
+}
+/* A CSS string's contents (CSSOM §6.6.2 "serialize a string"), without the quotes */
+static bool string_escaped(sbuf *out,const char *s) {
+    for(;*s;s++) {
+        unsigned char c=(unsigned char)*s;char escape[16];
+        if(c<0x20||c==0x7f){int n=snprintf(escape,sizeof escape,"\\%x ",c);if(!length_append(out,escape,(size_t)n))return false;}
+        else if(c=='"'||c=='\\'){escape[0]='\\';escape[1]=(char)c;if(!length_append(out,escape,2))return false;}
+        else if(!length_append(out,(const char *)s,1))return false;
+    }
+    return true;
+}
+static bool clip_side_zero_percent(const struct css_clip_path *c,int side) {
+    const len_t *l=&c->inset[side];
+    return l->kind==LK_LEN&&l->px==0&&l->pct==0&&(c->inset_percent>>side&1);
+}
+static bool clip_sides_equal(const struct css_clip_path *c,int a,int b) {
+    return css_length_equal(&c->inset[a],&c->inset[b])&&clip_side_zero_percent(c,a)==clip_side_zero_percent(c,b);
+}
+static const char *const clip_boxes[]={"border-box","padding-box","content-box","margin-box","fill-box","stroke-box","view-box"};
+bool css_clip_path_serialize(const struct css_clip_path *c,sbuf *out,web_doc *d) {
+    size_t original=out->n;bool ok=true;
+    if(!c)ok=length_append(out,"none",4);
+    else switch(c->shape) {
+    case CLIP_SHAPE_URL: ok=length_append(out,"url(\"",5)&&string_escaped(out,c->text)&&length_append(out,"\")",2);break;
+    case CLIP_SHAPE_BOX: ok=length_append(out,clip_boxes[c->box],strlen(clip_boxes[c->box]));break;
+    case CLIP_SHAPE_INSET: {
+        int count=4;
+        if(clip_sides_equal(c,1,3)){count=3;if(clip_sides_equal(c,0,2)){count=2;if(clip_sides_equal(c,0,1))count=1;}}
+        ok=length_append(out,"inset(",6);
+        for(int i=0;i<count&&ok;i++)ok=(!i||length_append(out," ",1))&&(clip_side_zero_percent(c,i)?length_append(out,"0%",2):css_length_serialize(&c->inset[i],out,d));
+        len_t lengths[2][4];bool round=false;
+        for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++){const len_t *r=&c->corner[i].axis[axis];lengths[axis][i]=*r;round|=r->kind!=LK_LEN||r->px!=0||r->pct!=0;}
+        if(ok&&round)ok=length_append(out," round ",7)&&radius_lengths_serialize(lengths,out,d);
+        ok=ok&&length_append(out,")",1);
+        break;
+    }
+    case CLIP_SHAPE_CIRCLE: case CLIP_SHAPE_ELLIPSE: {
+        int radii=c->shape==CLIP_SHAPE_CIRCLE?1:2;bool closest=true;
+        ok=radii==1?length_append(out,"circle(",7):length_append(out,"ellipse(",8);
+        for(int i=0;i<radii;i++)closest&=c->extent[i]==CLIP_EXTENT_CLOSEST;
+        for(int i=0;i<radii&&ok&&!closest;i++)
+            ok=(!i||length_append(out," ",1))&&(c->extent[i]==CLIP_EXTENT_CLOSEST?length_append(out,"closest-side",12):
+               c->extent[i]==CLIP_EXTENT_FARTHEST?length_append(out,"farthest-side",13):css_length_serialize(&c->radius[i],out,d));
+        ok=ok&&(closest||length_append(out," ",1))&&length_append(out,"at ",3)&&css_length_serialize(&c->at[0],out,d)&&
+           length_append(out," ",1)&&css_length_serialize(&c->at[1],out,d)&&length_append(out,")",1);
+        break;
+    }
+    case CLIP_SHAPE_POLYGON:
+        ok=length_append(out,"polygon(",8)&&(!c->evenodd||length_append(out,"evenodd",7));
+        if(ok&&c->round>0)ok=(!c->evenodd||length_append(out," ",1))&&length_append(out,"round ",6)&&length_number(out,c->round,"px");
+        if(ok&&(c->evenodd||c->round>0))ok=length_append(out,", ",2);
+        for(size_t i=0;i<c->points&&ok;i++) {
+            if(!(i&63)&&d&&!web_native_checkpoint(d)){ok=false;break;}
+            ok=(!i||length_append(out,", ",2))&&css_length_serialize(&c->point[i][0],out,d)&&length_append(out," ",1)&&
+               css_length_serialize(&c->point[i][1],out,d);
+        }
+        ok=ok&&length_append(out,")",1);
+        break;
+    case CLIP_SHAPE_PATH:
+        ok=length_append(out,"path(",5)&&(!c->evenodd||length_append(out,"evenodd, ",9))&&length_append(out,"\"",1)&&
+           string_escaped(out,c->text)&&length_append(out,"\")",2);
+        break;
+    default: ok=false;
+    }
+    /* A shape's default box is border-box (css-masking-1 §5.1): the shortest form leaves it out. */
+    if(ok&&c&&c->shape!=CLIP_SHAPE_BOX&&c->shape!=CLIP_SHAPE_URL&&c->box!=CLIP_BOX_BORDER)
+        ok=length_append(out," ",1)&&length_append(out,clip_boxes[c->box],strlen(clip_boxes[c->box]));
+    if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}
+    return ok;
+}
+bool css_clip_rect_serialize(const struct css_clip_rect *clip,sbuf *out) {
+    size_t original=out->n;bool ok=true;
+    if(!clip->rect)ok=length_append(out,"auto",4);
+    else {
+        ok=length_append(out,"rect(",5);
+        for(int i=0;i<4&&ok;i++)ok=(!i||length_append(out,", ",2))&&(clip->auto_edges>>i&1?length_append(out,"auto",4):length_number(out,clip->edge[i],"px"));
+        ok=ok&&length_append(out,")",1);
+    }
+    if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}
+    return ok;
 }
 bool css_radius_specified(const char *property,const char *value,size_t size,sbuf *out) {
     if(!css_valid_declaration(property,strlen(property),value,size))return false;
@@ -1168,7 +1253,7 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING, PT_TRANSFORM, PT_TRANSLATE,
-       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN };
+       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_CLIP_PATH, PT_CLIP };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -1238,18 +1323,18 @@ static const struct kw kw_acontent[] = {{"normal", AC_NORMAL}, {"stretch", AC_ST
     {"flex-start", AC_FLEX_START}, {"flex-end", AC_FLEX_END}, {"center", AC_CENTER},
     {"space-between", AC_BETWEEN}, {"space-around", AC_AROUND}, {"space-evenly", AC_EVENLY},
     {"start", AC_START}, {"end", AC_END}, {0}};
-static const struct kw kw_justify[] = {{"flex-start", JC_START}, {"start", JC_START}, {"left", JC_START},
-                                       {"normal", JC_START}, {"stretch", JC_START}, {"flex-end", JC_END},
+static const struct kw kw_justify[] = {{"normal", JC_START}, {"flex-start", JC_START}, {"start", JC_START},
+                                       {"left", JC_START}, {"stretch", JC_START}, {"flex-end", JC_END},
                                        {"end", JC_END}, {"right", JC_END}, {"center", JC_CENTER},
                                        {"space-between", JC_BETWEEN}, {"space-around", JC_AROUND},
                                        {"space-evenly", JC_EVENLY}, {"safe center", JC_CENTER}, {0}};
-static const struct kw kw_align[] = {{"stretch", AI_STRETCH}, {"normal", AI_STRETCH}, {"flex-start", AI_START},
+static const struct kw kw_align[] = {{"normal", AI_STRETCH}, {"stretch", AI_STRETCH}, {"flex-start", AI_START},
                                      {"start", AI_START}, {"self-start", AI_START}, {"flex-end", AI_END},
                                      {"end", AI_END}, {"self-end", AI_END}, {"center", AI_CENTER},
                                      {"safe center", AI_CENTER}, {"baseline", AI_BASELINE},
                                      {"first baseline", AI_BASELINE}, {"last baseline", AI_BASELINE},
                                      {"auto", 255}, {0}};
-static const struct kw kw_jalign[] = {{"stretch", AI_STRETCH}, {"normal", AI_STRETCH}, {"legacy", AI_STRETCH},
+static const struct kw kw_jalign[] = {{"normal", AI_STRETCH}, {"stretch", AI_STRETCH}, {"legacy", AI_STRETCH},
                                       {"start", AI_START}, {"self-start", AI_START}, {"flex-start", AI_START},
                                       {"left", AI_START}, {"end", AI_END}, {"self-end", AI_END},
                                       {"flex-end", AI_END}, {"right", AI_END}, {"center", AI_CENTER},
@@ -1267,7 +1352,7 @@ static const struct kw kw_bstyle[] = {{"none", BS_NONE}, {"hidden", BS_HIDDEN}, 
                                       {"groove", BS_GROOVE}, {"ridge", BS_RIDGE}, {"inset", BS_INSET},
                                       {"outset", BS_OUTSET}, {0}};
 static const struct kw kw_bwidth[] = {{"thin", 1}, {"medium", 3}, {"thick", 5}, {0}};
-static const struct kw kw_ostyle[] = {{"auto", BS_SOLID}, {"none", BS_NONE}, {"solid", BS_SOLID}, {"dashed", BS_DASHED},
+static const struct kw kw_ostyle[] = {{"none", BS_NONE}, {"solid", BS_SOLID}, {"auto", BS_SOLID}, {"dashed", BS_DASHED},
                                       {"dotted", BS_DOTTED}, {"double", BS_DOUBLE}, {"groove", BS_GROOVE},
                                       {"ridge", BS_RIDGE}, {"inset", BS_INSET}, {"outset", BS_OUTSET}, {0}};
 static const struct kw kw_normal0[] = {{"normal", 0}, {0}};
@@ -1353,6 +1438,8 @@ static struct propdef props[] = {
     {"fill", PT_SVG_PAINT, 0, true, O(svg_fill), NULL, 0},
     {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0},
     {"filter", PT_FILTER, 0, false, O(filter), NULL, 0},
+    {"clip", PT_CLIP, 0, false, O(clip), NULL, 0},
+    {"clip-path", PT_CLIP_PATH, 0, false, O(clip_path), NULL, 0},
     {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0},
     SH("font", SH_FONT),
     SH("all", SH_ALL),
@@ -1586,6 +1673,41 @@ bool css_prop_is_motion(const struct propdef *p) {
     return p && (!strcmp(p->name,"animation") || !strncmp(p->name,"animation-",10));
 }
 bool css_prop_inherited(const struct propdef *p) { return p && p->inherited; }
+int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32_t *color, web_doc *d) {
+    const struct propdef *p = css_prop_lookup(name, strlen(name));
+    if (!p) return 0;
+    const void *field = (const char *)st + p->off;
+    char text[32];
+    switch (p->type) {
+    case PT_KW: case PT_OVERFLOW: case PT_VALIGN: {
+        if (p->type == PT_VALIGN && st->vertical_align == VA_LEN) return length_number(out, st->vertical_align_px, "px") ? 1 : -1;
+        /* Each table names a stored value's canonical keyword first. */
+        uint8_t v = *(const uint8_t *)field;
+        for (const struct kw *k = p->kws; k && k->name; k++)
+            if (k->v == v) { sb_puts(out, k->name); return 1; }
+        return 0;
+    }
+    case PT_LEN:
+        return css_length_serialize((const len_t *)field, out, d) ? 1 : -1;
+    case PT_PX: {
+        if (p->size != sizeof(float)) return 0;
+        float v = *(const float *)field;
+        if (p->kws == kw_normal0 && v == 0) { sb_puts(out, "normal"); return 1; }
+        return length_number(out, v, "px") ? 1 : -1;
+    }
+    case PT_NUM: case PT_OPACITY:
+        snprintf(text, sizeof text, "%g", (double)*(const float *)field); sb_puts(out, text); return 1;
+    case PT_INT:
+        if (p->size != sizeof(int32_t)) return 0;
+        snprintf(text, sizeof text, "%d", (int)*(const int32_t *)field); sb_puts(out, text); return 1;
+    case PT_COLOR: {
+        uint32_t c = *(const uint32_t *)field;
+        *color = c == COLOR_CURRENT ? st->color : c;
+        return 2;
+    }
+    }
+    return 0;
+}
 
 /* ---------------------------------------------------------------- longhand values */
 static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {
@@ -1885,6 +2007,235 @@ static bool parse_bg_size(const char *s, size_t n, struct cx *cx, len_t *size, u
         *kind = size[0].kind == LK_AUTO && size[1].kind == LK_AUTO ? BSZ_AUTO : BSZ_LEN;
     }
     return true;
+}
+
+/* ---------------------------------------------------------------- clip-path and clip */
+/* A <border-radius> value: one to four horizontal radii and, after a /, one to four vertical ones,
+   expanded to each axis's four corners (TL TR BR BL). */
+static bool parse_radius_list(const char *v, size_t n, struct cx *cx, len_t lengths[2][4]) {
+    const char *axes[3];size_t sizes[3];int count=split_checked(v,n,axes,sizes,3,'/',cx);
+    if(count<1||count>2||!sizes[0]||(count==2&&!sizes[1]))return false;
+    const char *consumed=axes[count-1]+sizes[count-1];while(consumed<v+n&&is_space((unsigned char)*consumed))consumed++;
+    if(consumed!=v+n)return false;
+    static const int pick[5][4]={{0},{0,0,0,0},{0,1,0,1},{0,1,2,1},{0,1,2,3}};
+    for(int axis=0;axis<count;axis++) {
+        const char *tokens[5];size_t lengths_n[5];int k=split_checked(axes[axis],sizes[axis],tokens,lengths_n,5,' ',cx);
+        if(k<1||k>4)return false;
+        len_t values[4];for(int i=0;i<k;i++)if(!parse_len(tokens[i],lengths_n[i],cx,&values[i],LF_LENGTH))return false;
+        for(int i=0;i<4;i++)lengths[axis][i]=values[pick[k][i]];
+    }
+    if(count==1)memcpy(lengths[1],lengths[0],sizeof lengths[0]);
+    return true;
+}
+static const struct kw kw_clip_box[]={{"border-box",CLIP_BOX_BORDER},{"padding-box",CLIP_BOX_PADDING},
+    {"content-box",CLIP_BOX_CONTENT},{"margin-box",CLIP_BOX_MARGIN},{"fill-box",CLIP_BOX_FILL},
+    {"stroke-box",CLIP_BOX_STROKE},{"view-box",CLIP_BOX_VIEW},{0}};
+/* name(arguments): the arguments, NULL for any other token */
+static const char *function_args(const char *v,size_t n,const char *name,size_t *size) {
+    size_t k=strlen(name);
+    if(n<k+2||!strn_ieq(v,name,k)||v[k]!='('||v[n-1]!=')')return NULL;
+    *size=n-k-2;return v+k+1;
+}
+/* The end of the comma-separated item at s: the next top-level comma, or end. */
+static const char *item_end(const char *s,const char *end) {
+    int depth=0;char quote=0;
+    for(;s<end;s++) {
+        char c=*s;
+        if(quote){if(c=='\\'&&s+1<end)s++;else if(c==quote)quote=0;}
+        else if(c=='"'||c=='\'')quote=c;
+        else if(c=='(')depth++;
+        else if(c==')')depth--;
+        else if(c==','&&depth<=0)break;
+    }
+    return s;
+}
+static bool ends_percent(const char *t,size_t n){return n&&t[n-1]=='%';}
+/* 100% - a - b: inset()'s far edge for rect()'s and xywh()'s (css-shapes-1 §3.2). */
+static void clip_far_edge(struct cx *cx,const len_t *a,const len_t *b,len_t *out) {
+    if(a->kind==LK_LEN&&(!b||b->kind==LK_LEN)) {
+        *out=(len_t){.kind=LK_LEN,.px=-a->px-(b?b->px:0),.pct=100-a->pct-(b?b->pct:0)};return;
+    }
+    struct cexpr *x=ar_alloc(cx->a,sizeof *x);*x=(struct cexpr){.op='v',.pct=100};
+    const len_t *terms[2]={a,b};
+    for(int i=0;i<2&&terms[i];i++) {
+        struct cexpr *term=terms[i]->expr;
+        if(terms[i]->kind!=LK_EXPR){term=ar_alloc(cx->a,sizeof *term);*term=(struct cexpr){.op='v',.px=terms[i]->px,.pct=terms[i]->pct};}
+        struct cexpr *difference=ar_alloc(cx->a,sizeof *difference);*difference=(struct cexpr){.op='-',.a=x,.b=term};x=difference;
+    }
+    *out=(len_t){.kind=LK_EXPR,.expr=x};
+}
+/* [round <'border-radius'>]? closing a rectangle function: the corners (zero without it), and in
+   *before how much of the arguments precedes it */
+static bool parse_clip_round(const char *v,size_t n,struct cx *cx,struct css_clip_path *c,size_t *before) {
+    const char *t[16];size_t tl[16];int k=split_checked(v,n,t,tl,16,' ',cx);
+    *before=n;
+    for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++)c->corner[i].axis[axis]=(len_t){.kind=LK_LEN};
+    for(int i=0;i<k;i++)if(ident_is(t[i],tl[i],"round")) {
+        *before=(size_t)(t[i]-v);
+        const char *radii=t[i]+tl[i];len_t lengths[2][4];
+        if(!parse_radius_list(radii,(size_t)(v+n-radii),cx,lengths))return false;
+        for(int corner=0;corner<4;corner++)for(int axis=0;axis<2;axis++)c->corner[corner].axis[axis]=lengths[axis][corner];
+        break;
+    }
+    return true;
+}
+static bool parse_clip_sides(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
+    const char *t[5];size_t tl[5];int k=split_checked(v,n,t,tl,5,' ',cx);
+    if(k<1||k>4)return false;
+    static const int pick[5][4]={{0},{0,0,0,0},{0,1,0,1},{0,1,2,1},{0,1,2,3}};
+    len_t values[4];unsigned percent=0;
+    for(int i=0;i<k;i++) {
+        if(!parse_len(t[i],tl[i],cx,&values[i],LF_NEG|LF_LENGTH))return false;
+        if(ends_percent(t[i],tl[i]))percent|=1u<<i;
+    }
+    for(int i=0;i<4;i++){c->inset[i]=values[pick[k][i]];if(percent>>pick[k][i]&1)c->inset_percent|=(uint8_t)(1u<<i);}
+    return true;
+}
+/* xywh(x y w h): inset(y, 100% - x - w, 100% - y - h, x) */
+static bool parse_clip_xywh(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
+    const char *t[5];size_t tl[5];
+    if(split_checked(v,n,t,tl,5,' ',cx)!=4)return false;
+    len_t x[4];
+    for(int i=0;i<4;i++)if(!parse_len(t[i],tl[i],cx,&x[i],(i<2?LF_NEG:0)|LF_LENGTH))return false;
+    c->inset[0]=x[1];c->inset[3]=x[0];
+    clip_far_edge(cx,&x[0],&x[2],&c->inset[1]);clip_far_edge(cx,&x[1],&x[3],&c->inset[2]);
+    c->inset_percent=(uint8_t)(1u<<1|1u<<2|(ends_percent(t[1],tl[1])?1u:0)|(ends_percent(t[0],tl[0])?1u<<3:0));
+    return true;
+}
+/* rect(top right bottom left), auto edges the reference box's: inset(top, 100% - right, 100% - bottom, left) */
+static bool parse_clip_rect_shape(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
+    const char *t[5];size_t tl[5];
+    if(split_checked(v,n,t,tl,5,' ',cx)!=4)return false;
+    len_t edge[4];unsigned percent=1u<<1|1u<<2;
+    for(int i=0;i<4;i++) {
+        if(ident_is(t[i],tl[i],"auto")){edge[i]=(len_t){.kind=LK_LEN,.pct=i==1||i==2?100:0};percent|=1u<<i;}
+        else if(!parse_len(t[i],tl[i],cx,&edge[i],LF_NEG|LF_LENGTH))return false;
+        else if(ends_percent(t[i],tl[i]))percent|=1u<<i;
+    }
+    c->inset[0]=edge[0];c->inset[3]=edge[3];
+    clip_far_edge(cx,&edge[1],NULL,&c->inset[1]);clip_far_edge(cx,&edge[2],NULL,&c->inset[2]);
+    c->inset_percent=(uint8_t)percent;
+    return true;
+}
+/* circle( <radial-size>? [at <position>]? ), ellipse( [<radial-size>{2}]? [at <position>]? ) */
+static bool parse_clip_radial(const char *v,size_t n,struct cx *cx,struct css_clip_path *c,int radii) {
+    const char *t[8];size_t tl[8];int k=split_checked(v,n,t,tl,8,' ',cx);
+    if(k==8)return false;
+    int at=k;for(int i=0;i<k;i++)if(ident_is(t[i],tl[i],"at")){at=i;break;}
+    if(at&&at!=radii)return false;
+    c->extent[0]=c->extent[1]=CLIP_EXTENT_CLOSEST;
+    for(int i=0;i<at;i++) {
+        if(ident_is(t[i],tl[i],"closest-side"))c->extent[i]=CLIP_EXTENT_CLOSEST;
+        else if(ident_is(t[i],tl[i],"farthest-side"))c->extent[i]=CLIP_EXTENT_FARTHEST;
+        else if(parse_len(t[i],tl[i],cx,&c->radius[i],LF_LENGTH))c->extent[i]=CLIP_EXTENT_LENGTH;
+        else return false;
+    }
+    c->at[0]=c->at[1]=(len_t){.kind=LK_LEN,.pct=50};
+    if(at==k)return true;
+    if(at+1==k)return false;
+    const char *position=t[at+1];size_t size=(size_t)(v+n-position);trim(&position,&size);
+    return !memchr(position,',',size)&&parse_bg_pos(position,size,cx,c->at);
+}
+/* polygon( [<fill-rule> || round <length>]?, [<length-percentage> <length-percentage>]# ) */
+static bool parse_clip_polygon(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
+    const char *end=v+n,*first=item_end(v,end);
+    size_t items=1;for(const char *q=first;q<end;q=item_end(q+1,end))items++;
+    const char *t[5];size_t tl[5];int k=split_checked(v,(size_t)(first-v),t,tl,5,' ',cx);
+    bool evenodd=false;float round=0;
+    if(k>0&&(ident_is(t[0],tl[0],"nonzero")||ident_is(t[0],tl[0],"evenodd")||ident_is(t[0],tl[0],"round"))) {
+        int i=0;
+        if(!ident_is(t[0],tl[0],"round")){evenodd=ident_is(t[0],tl[0],"evenodd");i=1;}
+        if(i<k) {
+            len_t r;
+            if(!ident_is(t[i],tl[i],"round")||i+1>=k||!parse_len(t[i+1],tl[i+1],cx,&r,LF_LENGTH|LF_NOPCT)||r.kind!=LK_LEN)return false;
+            round=r.px;i+=2;
+        }
+        if(i!=k||first==end)return false;
+        v=first+1;items--;
+    }
+    if(items>(SIZE_MAX-sizeof(struct css_clip_path))/sizeof(len_t[2]))return false;
+    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c+items*sizeof c->point[0]);
+    memset(c,0,sizeof *c);
+    c->shape=CLIP_SHAPE_POLYGON;c->evenodd=evenodd;c->round=round;c->points=items;
+    for(size_t i=0;i<items;i++) {
+        const char *e=item_end(v,end),*xy[3];size_t xyn[3];
+        if(split_checked(v,(size_t)(e-v),xy,xyn,3,' ',cx)!=2||!parse_len(xy[0],xyn[0],cx,&c->point[i][0],LF_NEG|LF_LENGTH)||
+           !parse_len(xy[1],xyn[1],cx,&c->point[i][1],LF_NEG|LF_LENGTH))return false;
+        if(!(i&63)&&!cx->supports_probe&&cx->node&&!web_native_checkpoint(cx->node->owner))return false;
+        v=e+1;
+    }
+    *out=c;return true;
+}
+/* path( [<fill-rule>,]? <string> ), the string SVG path data */
+static bool parse_clip_path_data(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
+    const char *end=v+n,*e=item_end(v,end);bool evenodd=false;
+    if(e!=end) {
+        const char *rule=v;size_t size=(size_t)(e-v);trim(&rule,&size);
+        if(ident_is(rule,size,"evenodd"))evenodd=true;
+        else if(!ident_is(rule,size,"nonzero"))return false;
+        v=e+1;
+        if(item_end(v,end)!=end)return false;
+    }
+    size_t size=(size_t)(end-v);trim(&v,&size);
+    if(size<2||(v[0]!='"'&&v[0]!='\'')||v[size-1]!=v[0])return false;
+    sbuf data={0};css_unescape(&data,v+1,size-2);
+    bool valid=data.p&&svg_path_data_valid(data.p);
+    const char *text=valid?ar_strndup(cx->a,data.p,data.n):NULL;
+    sb_free(&data);
+    if(!valid)return false;
+    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);
+    c->shape=CLIP_SHAPE_PATH;c->evenodd=evenodd;c->text=text;*out=c;return true;
+}
+static bool parse_clip_shape(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
+    size_t size,before;const char *args;
+    if((args=function_args(v,n,"polygon",&size)))return parse_clip_polygon(args,size,cx,out);
+    if((args=function_args(v,n,"path",&size)))return parse_clip_path_data(args,size,cx,out);
+    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);*out=c;
+    if((args=function_args(v,n,"circle",&size))){c->shape=CLIP_SHAPE_CIRCLE;return parse_clip_radial(args,size,cx,c,1);}
+    if((args=function_args(v,n,"ellipse",&size))){c->shape=CLIP_SHAPE_ELLIPSE;return parse_clip_radial(args,size,cx,c,2);}
+    c->shape=CLIP_SHAPE_INSET;
+    if((args=function_args(v,n,"inset",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_sides(args,before,cx,c);
+    if((args=function_args(v,n,"xywh",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_xywh(args,before,cx,c);
+    if((args=function_args(v,n,"rect",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_rect_shape(args,before,cx,c);
+    return false;
+}
+/* clip-path: none | <url> | [<basic-shape> || <geometry-box>] */
+static bool parse_clip_path(const char *v,size_t n,struct cx *cx,const struct css_clip_path **out) {
+    trim(&v,&n);
+    if(ident_is(v,n,"none")){*out=NULL;return true;}
+    const char *t[3];size_t tl[3];int k=split_checked(v,n,t,tl,3,' ',cx);
+    if(k<1||k>2)return false;
+    if(k==1&&n>=5&&strn_ieq(v,"url(",4)&&v[n-1]==')') {
+        const char *ref=parse_url(v,n,cx->a);if(!ref)return false;
+        struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);
+        c->shape=CLIP_SHAPE_URL;c->text=ref;*out=c;return true;
+    }
+    struct css_clip_path *shape=NULL;uint8_t box=CLIP_BOX_BORDER;bool box_given=false;
+    for(int i=0;i<k;i++) {
+        if(kw_find(kw_clip_box,t[i],tl[i],&box)){if(box_given)return false;box_given=true;continue;}
+        if(shape||!parse_clip_shape(t[i],tl[i],cx,&shape))return false;
+    }
+    if(!shape){shape=ar_alloc(cx->a,sizeof *shape);memset(shape,0,sizeof *shape);shape->shape=CLIP_SHAPE_BOX;}
+    shape->box=box;*out=shape;return true;
+}
+/* clip: auto | rect(<top>, <right>, <bottom>, <left>), each a length or auto; CSS 2.1's spaces still parse */
+static bool parse_clip_rect(const char *v,size_t n,struct cx *cx,struct css_clip_rect *out) {
+    trim(&v,&n);
+    struct css_clip_rect r;memset(&r,0,sizeof r);
+    if(ident_is(v,n,"auto")){*out=r;return true;}
+    size_t size;const char *args=function_args(v,n,"rect",&size);
+    if(!args)return false;
+    const char *t[5];size_t tl[5];int k=split_checked(args,size,t,tl,5,',',cx);
+    if(k==1)k=split_checked(args,size,t,tl,5,' ',cx);
+    if(k!=4)return false;
+    r.rect=true;
+    for(int i=0;i<4;i++) {
+        if(ident_is(t[i],tl[i],"auto")){r.auto_edges|=(uint8_t)(1u<<i);continue;}
+        len_t edge;
+        if(!parse_len(t[i],tl[i],cx,&edge,LF_NEG|LF_LENGTH|LF_NOPCT)||edge.kind!=LK_LEN)return false;
+        r.edge[i]=edge.px;
+    }
+    *out=r;return true;
 }
 
 static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
@@ -2708,6 +3059,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         return true;
     }
     case PT_FILTER: return parse_filter(v, n, cx, &s->filter);
+    case PT_CLIP_PATH: return parse_clip_path(v, n, cx, &s->clip_path);
+    case PT_CLIP: return parse_clip_rect(v, n, cx, &s->clip);
     case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
     case PT_OPACITY: {
         const char *q = v;
@@ -3117,19 +3470,8 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_BORDER_RADIUS: {
         static const char *const names[]={"border-top-left-radius","border-top-right-radius","border-bottom-right-radius","border-bottom-left-radius"};
         if(global){bool ok=true;for(int i=0;i<4;i++)ok&=set_long(names[i],v,n,cx);return ok;}
-        const char *axes[3];size_t sizes[3];int count=split_checked(v,n,axes,sizes,3,'/',cx);
-        if(count<1||count>2||!sizes[0]||(count==2&&!sizes[1]))return false;
-        const char *consumed=axes[count-1]+sizes[count-1];while(consumed<v+n&&is_space((unsigned char)*consumed))consumed++;
-        if(consumed!=v+n)return false;
         len_t lengths[2][4];
-        static const int pick[5][4]={{0},{0,0,0,0},{0,1,0,1},{0,1,2,1},{0,1,2,3}};
-        for(int axis=0;axis<count;axis++) {
-            const char *tokens[5];size_t lengths_n[5];int k=split_checked(axes[axis],sizes[axis],tokens,lengths_n,5,' ',cx);
-            if(k<1||k>4)return false;
-            len_t values[4];for(int i=0;i<k;i++)if(!parse_len(tokens[i],lengths_n[i],cx,&values[i],LF_LENGTH))return false;
-            for(int i=0;i<4;i++)lengths[axis][i]=values[pick[k][i]];
-        }
-        if(count==1)memcpy(lengths[1],lengths[0],sizeof lengths[0]);
+        if(!parse_radius_list(v,n,cx,lengths))return false;
         for(int i=0;i<4;i++) {
             const struct propdef *corner=css_prop_lookup(names[i],strlen(names[i]));int index=css_prop_index(corner);
             if(cx->set[index])continue;
