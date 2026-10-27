@@ -1,14 +1,15 @@
-"""長い作業の作業場を保つフック（SessionStart・UserPromptSubmit・PostToolUse）。
+"""長い作業の作業場を保つフック（SessionStart・UserPromptSubmit・PostToolUse・Stop）。
 
-作業場は、書く人で三つに分ける。
+作業場は、書く人で分ける。
 - 模型：本人が書く（.claude/mokei/<作業場>.md）。今、頭に置く判断。
 - 会話の記録：このフックが事象から書く（<作業場>.jsonl）。ユーザーの原文、模型のすべての版、
-  編集したファイル、圧縮。圧縮や再開の後に、要約とは別に、起きたことを見せる。
+  編集したファイル、計測（serial.log・撮影・試験を動かしたこと）、圧縮、自分の報告。
+  圧縮や再開の後に、要約とは別に、起きたことを見せる。
 - コードの覚え書き：.claude/oboegaki.md。ファイルに結び付き、そのファイルに触れた時にここが出す。
-- コードのつながり：codegraph の索引（.codegraph/）。編集した関数を呼ぶ所と、そのファイルに頼るファイルを、
-  編集の直後にここが出す。
+- コードのつながり：codegraph の索引（.codegraph/）。編集した関数を呼ぶ所を、編集の直後に一度だけ出す。
 
-ここは見せるだけで、止めない。使い方は .claude/skills/mokei/SKILL.md にある。
+ここは見せるだけで、作業を止めない。止めるのは一つだけ：ユーザーへの返事に日本語が無いとき。
+使い方は .claude/skills/mokei/SKILL.md にある。失敗は .claude/mokei/errors.log に残し、会話には出さない。
 """
 import datetime
 import fnmatch
@@ -18,22 +19,27 @@ import re
 import shutil
 import subprocess
 import sys
+import traceback
 from collections import Counter
 from pathlib import Path
 
 # アプリや道具やほかの担当が会話へ送る知らせ。ユーザーの発言ではない。
 MACHINE = ("<task-notification", "<side-sessions-event", "<ci-monitor-event", "<system-reminder",
-           "<local-command", "<command-name>", "[SYSTEM NOTIFICATION",
-           "Another Claude session sent a message")
+           "<local-command", "<command-name>", "[SYSTEM NOTIFICATION", "<agent-message",
+           "[Subagent hand-back]", "Another Claude session sent a message",
+           "This session is being continued from a previous conversation", "[Artifact comment")
 EDITS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+SHELLS = {"Bash", "PowerShell"}
+# シェルの命令にこれがあれば、物差しを測った（ログを読んだ・撮った・試験を回した）と数える
+MEASURE = ("serial.log", "serial-", "screendump", "platform_qa", "scripts/test.py", "qtest.py",
+           "hikaku", "qemu-system", "hv-serial", "hv-boot", "System.log", "browser log")
 NOTES = Path(".claude") / "oboegaki.md"
-# 編集の後につながりを出す言語：Nocturne を書く C・C++・JavaScript・TypeScript・
-# Rust・Go。今ある拡張子だけでなく、それぞれの言語の拡張子を全部入れる。Python は
-# codegraph がメソッドを名前だけでつなぎ（subprocess.run がよその run に付く）、
-# 頼るファイルの数が当てにならないので外す
 CODE = {".c", ".h", ".inc", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
         ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".rs", ".go"}
 SURE = 0.8  # これより確からしさの低いつながり（名前だけで推したもの）は出さない
+QUIET = datetime.timedelta(hours=2)  # ユーザーのいない時間がこれを越えるごとに、節目の報告を促す
+MANY_EDITS = 40  # 模型を書かずにこれだけ編集したら、模型を今に合わせるよう促す
+JA = re.compile(r"[぀-ヿ一-鿿]")
 
 
 def now():
@@ -48,12 +54,18 @@ def since(when):
     if not when:
         return "不明"
     minutes = int((now() - when).total_seconds() // 60)
+    if minutes >= 48 * 60:
+        return f"{minutes // 1440} 日 {minutes % 1440 // 60} 時間"
     return f"{minutes // 60} 時間 {minutes % 60} 分" if minutes >= 60 else f"{minutes} 分"
 
 
 def shorten(text, limit):
     text = text.strip()
     return text if len(text) <= limit else text[:limit] + f"…（残り {len(text) - limit} 字）"
+
+
+def one_line(text, limit):
+    return shorten(" ".join(text.split()), limit)
 
 
 def git(root, *args):
@@ -131,6 +143,14 @@ class Workspace:
             return ""
 
 
+def last_time(events, kind):
+    return max((event["t"] for event in events if event["k"] == kind), default=None)
+
+
+def count_after(events, kind, when):
+    return sum(1 for event in events if event["k"] == kind and (when is None or event["t"] > when))
+
+
 class Note:
     """コードの覚え書き一つ。対象はリポジトリからの道（glob、末尾の / は下全部）。"""
 
@@ -206,7 +226,7 @@ class Graph:
                    for m in re.finditer(r"^- `(.+?)` \((\w+)\).*:(\d+)\s*$", text, re.M)]
         return (int(users.group(1)), users.group(2)) if users else (0, ""), symbols
 
-    def callers(self, name, rel, limit=60):
+    def callers(self, name, rel, limit=40):
         """確かなつながりで呼ぶ所の [(ファイル, 行, 関数)] と、引いた数が上限に届いたか。"""
         try:
             found = json.loads(self.run("callers", name, "-f", rel, "--json", "-l", str(limit)) or "")
@@ -249,7 +269,8 @@ def touched(symbols, spans):
     return found
 
 
-def connections(ws, rel, tool, args, shown, segment):
+def connections(ws, rel, tool, args, shown):
+    """編集した関数を呼ぶ所。一つの会話で、ファイルごと・関数ごとに一度だけ。"""
     if os.path.splitext(rel)[1].lower() not in CODE:
         return None
     graph = Graph(ws.root)
@@ -267,33 +288,31 @@ def connections(ws, rel, tool, args, shown, segment):
 
     spans = edited_spans(text, tool, args)
     edited = touched(symbols, spans)
-    # 編集より前で始まる記号の行が今のファイルと合わなければ、索引が古い。一度だけ同期して引き直す
     if edited and edited[0][2] <= spans[0][0] and not agrees(edited[0]):
         graph.run("sync", "-q")
         users, symbols = graph.file(rel)
         edited = [symbol for symbol in touched(symbols, spans) if agrees(symbol)]
     out = []
-    if shown.get(f"つながり:{rel}") != segment:
-        shown[f"つながり:{rel}"] = segment
+    if not shown.get(f"つながり:{rel}"):
+        shown[f"つながり:{rel}"] = True
         count, names = users or (0, "")
-        out.append(f"- このファイルに頼るファイル {count}：{names}" if count
-                   else "- 索引では、このファイルに頼るファイルは無い")
-    for name, _, line in edited[:3]:
-        if shown.get(f"つながり:{rel}#{name}") == segment:
+        if count:
+            out.append(f"- {rel} に頼るファイル {count}：{one_line(names, 200)}")
+    for name, _, line in edited[:2]:
+        if shown.get(f"つながり:{rel}#{name}"):
             continue
-        shown[f"つながり:{rel}#{name}"] = segment
+        shown[f"つながり:{rel}#{name}"] = True
         found = graph.callers(name, rel)
-        if found is None:
+        if not found or not found[0]:
             continue
         rows, more = found
-        where = "、".join(f"{path}:{at}（{caller}）" for path, at, caller in rows[:8])
-        rest = f"、ほか {len(rows) - 8}" if len(rows) > 8 else ""
-        out.append(f"- `{name}`（:{line}）を呼ぶ所 {len(rows)}{'以上' if more else ''}：{where}{rest}" if rows
-                   else f"- `{name}`（:{line}）：索引では呼ぶ所なし")
+        where = "、".join(f"{path}:{at}（{caller}）" for path, at, caller in rows[:6])
+        rest = f"、ほか {len(rows) - 6}" if len(rows) > 6 else ""
+        out.append(f"- `{name}`（:{line}）を呼ぶ所 {len(rows)}{'以上' if more else ''}：{where}{rest}")
     if not out:
         return None
-    return (f"コードのつながり（codegraph の索引。{rel} を編集したので出す。"
-            "番号で引くシステム呼出しや、登録の表から呼ばれる関数のつながりは索引に出ない）：\n" + "\n".join(out))
+    return ("コードのつながり（codegraph の索引。番号で引くシステム呼出しや登録の表からの呼出しは出ない）：\n"
+            + "\n".join(out))
 
 
 def headline(text):
@@ -316,43 +335,56 @@ def first_line(text):
     return ""
 
 
-def user_words(events, budget=5000):
-    said = [f"[{clock(event['t'])}] {shorten(event['text'], 1500)}" for event in events if event["k"] == "user"]
+def user_words(events, budget=4000):
+    """ユーザーの原文。短い発言（訂正・指示）は全部そのまま、長いものは頭だけ。
+    予算を越えたら途中を一行ずつの頭に縮め、最初の発言と最近の発言は残す。"""
+    said = [(event["t"], event["text"].strip()) for event in events if event["k"] == "user"]
     if not said:
         return "# ユーザーの原文\n（記録なし。この会話はフックの記録より前に始まった）"
-    used, recent = len(said[0]), []
-    for item in reversed(said[1:]):
-        if used + len(item) > budget:
+    full = [f"[{clock(when)}] {text if len(text) <= 400 else shorten(text, 600)}" for when, text in said]
+    used, keep = len(full[0]), {0}
+    for index in range(len(full) - 1, 0, -1):
+        if used + len(full[index]) > budget:
             break
-        recent.append(item)
-        used += len(item)
-    skipped = len(said) - 1 - len(recent)
-    middle = [f"（途中の {skipped} 件は記録にある）"] if skipped else []
-    return "# ユーザーの原文（古い順）\n" + "\n".join(said[:1] + middle + recent[::-1])
+        keep.add(index)
+        used += len(full[index])
+    rows, stubs = [], 0
+    for index, line in enumerate(full):
+        if index in keep:
+            rows.append(line)
+        elif stubs < 20:
+            stubs += 1
+            rows.append(f"[{clock(said[index][0])}]（{len(said[index][1])} 字）{one_line(said[index][1], 80)}")
+        elif rows and not rows[-1].startswith("（ほか"):
+            rows.append("（ほか 0 件は記録にある）")
+    hidden = len(full) - len(keep) - stubs
+    if hidden > 0:
+        rows = [row if not row.startswith("（ほか") else f"（ほか {hidden} 件は記録にある）" for row in rows]
+    return "# ユーザーの原文（古い順。[ ] は時刻）\n" + "\n".join(rows)
 
 
 def model_now(ws):
     text = ws.model_text()
     if not text:
         return f"# 模型\nまだ無い：{ws.model}"
-    return f"# 模型（{ws.model}）\n{shorten(text, 3000)}"
+    return f"# 模型（{ws.model}）\n{shorten(text, 2500)}"
 
 
-def versions(events, limit=14):
+def versions(events, limit=10):
     rows = []
     for event in events:
         line = headline(event["text"]) if event["k"] == "model" else None
         if line and (not rows or rows[-1][1] != line):
             rows.append((event["t"], line))
     if len(rows) < 2:
-        return None
+        return None, max(len(rows) - 1, 0)
     lines = [f"- {clock(when)} {line}" for when, line in rows]
     if len(lines) > limit:
         lines = lines[:1] + [f"- （途中の {len(lines) - limit} 版は記録にある）"] + lines[-(limit - 1):]
-    return "# 模型の版の流れ（「説明」の一行目）\n" + "\n".join(lines)
+    return "# 模型の版の流れ（「説明」の一行目）\n" + "\n".join(lines), len(rows) - 1
 
 
-def edits(events, hours=12):
+def edits(events, hours=8):
     by_hour = {}
     for event in events:
         if event["k"] == "edit":
@@ -370,10 +402,19 @@ def edits(events, hours=12):
     return "# 編集の流れ\n" + "\n".join(lines)
 
 
+def reports(events, limit=3):
+    """自分がユーザーへ書いた最後の報告（Stop の記録）。圧縮の後に、何を伝えたかを思い出す。"""
+    rows = [event for event in events if event["k"] == "stop"][-limit:]
+    if not rows:
+        return None
+    return "# 自分の最後の報告（頭だけ）\n" + "\n".join(f"- {clock(event['t'])} {one_line(event['text'], 240)}"
+                                                 for event in rows)
+
+
 def repository(ws, start):
     lines = []
     if start:
-        log = git(ws.root, "log", f"--since={start.isoformat()}", "-n", "15",
+        log = git(ws.root, "log", f"--since={start.isoformat()}", "-n", "10",
                   "--date=format-local:%m-%d %H:%M", "--format=%h %ad %s")
         if log and log.strip():
             lines.append("この会話の始まり以後のコミット（新しい順。並行する会話のものも含む）：")
@@ -394,22 +435,26 @@ def repository(ws, start):
 
 def reground(ws, state, source):
     events = ws.events()
-    last_user = max((event["t"] for event in events if event["k"] == "user"), default=None)
-    # フックより前に始まった会話では、最初の記録の時刻の方が早い
+    last_user = last_time(events, "user")
+    last_measure = last_time(events, "measure")
     starts = [datetime.datetime.fromisoformat(state["start"])] if state.get("start") else []
     start = min(starts + [event["t"] for event in events[:1]], default=None)
+    flow, swaps = versions(events)
     head = (f"区切り（{ {'compact': '圧縮', 'fork': '分岐'}.get(source, '再開') }。"
-            f"この会話の圧縮 {state.get('compactions', 0)} 回、"
-            f"ユーザーの最後の発言から {since(last_user)}）。要約は直前の作業を一番詳しく残す。"
-            f"下はフックが事象から書いた記録（{ws.log.name}）で、起きたことはこちらにある。")
-    parts = [head, user_words(events), model_now(ws), versions(events), edits(events), repository(ws, start)]
+            f"この会話の圧縮 {state.get('compactions', 0)} 回、ユーザーの最後の発言から {since(last_user)}、"
+            f"最後に測って（ログ・撮影・試験）から {since(last_measure) if last_measure else '一度も無い'}、"
+            f"その間の編集 {count_after(events, 'edit', last_measure)} 件、説明の入れ替わり {swaps} 回）。\n"
+            "要約は直前の作業を一番詳しく残す。下はフックが事象から書いた記録で、起きたことはこちらにある。"
+            "次の一手へ進む前に、ユーザーの原文と自分の流れ（版・編集）を並べ、同じ方向を向いているかを見る。"
+            "向いていなければ、なぜそうなったかが今の説明の一番になる。")
+    parts = [head, user_words(events), reports(events), model_now(ws), flow, edits(events), repository(ws, start)]
     return "\n\n".join(part for part in parts if part)
 
 
 def opening(ws):
     lines = [f"作業の模型の置き場所：{ws.model}",
-             "長い作業・境界の設計・原因の調査では、mokei スキルに従ってここへ書く。"
-             f"会話の記録（ユーザーの原文・模型の版・編集）はフックが {ws.log.name} に書き、圧縮や再開の後に見せる。"]
+             "長い作業・性能・境界の設計・原因の調査では、mokei スキルに従ってここへ書く。"
+             f"記録（ユーザーの原文・模型の版・編集・計測・報告）はフックが {ws.log.name} に書き、圧縮や再開の後に見せる。"]
     others = []
     for path in ws.folder.glob("*.md"):
         if path != ws.model:
@@ -418,12 +463,38 @@ def opening(ws):
                 others.append((path.stat().st_mtime, path, first_line(text)))
     if others:
         lines.append("この作業場の最近の模型（前の会話。続きの作業なら開く。中の事実は今のリポジトリと照らす）：")
-        for mtime, path, line in sorted(others, reverse=True)[:5]:
+        for mtime, path, line in sorted(others, reverse=True)[:3]:
             lines.append(f"- {clock(datetime.datetime.fromtimestamp(mtime))} {line}（{path.name}）")
     count = len(notes(ws.root))
     if count:
         lines.append(f"コードの覚え書き {count} 件（{NOTES.as_posix()}）は、対象のファイルに触れた時に出る。")
     return "\n".join(lines)
+
+
+def milestone(ws, events, state):
+    """ユーザーのいない時間が長いとき、模型を書かずに編集が重なったとき、一度だけ促す。"""
+    out = []
+    last_user = last_time(events, "user")
+    nudges = [event for event in events if event["k"] == "nudge"]
+    if last_user and now() - last_user >= QUIET:
+        recent = [event["t"] for event in nudges if event.get("why") == "quiet" and event["t"] > last_user]
+        if not recent or now() - max(recent) >= QUIET:
+            last_measure = last_time(events, "measure")
+            out.append(f"節目（ユーザーの最後の発言から {since(last_user)}、その間の編集 {count_after(events, 'edit', last_user)} 件、"
+                       f"最後に測ってから {since(last_measure) if last_measure else '一度も無い'}）。"
+                       "目的の一行と物差しの今の値を並べ、短い報告を一度書く（何を測り、何が動き、次に何をするか）。"
+                       "物差しが動いていなければ、同じ方向の次の一手へ進まずに止まる。"
+                       "自分が起動したもの（QEMU・ビルド・サブエージェント）を確かめる。")
+            ws.record("nudge", why="quiet")
+    last_model = last_time(events, "model")
+    unmodeled = count_after(events, "edit", last_model)
+    if unmodeled and unmodeled % MANY_EDITS == 0:
+        marks = [event["t"] for event in nudges if event.get("why") == "model"]
+        if not last_model or not marks or max(marks) < last_time(events, "edit"):
+            out.append(f"模型を最後に書いてから編集 {unmodeled} 件。説明や次の一手が変わったなら、模型を今に合わせる"
+                       f"（{ws.model.name}）。変わっていないなら何もしない。")
+            ws.record("nudge", why="model")
+    return "\n".join(out) or None
 
 
 def on_start(ws, data):
@@ -447,47 +518,94 @@ def on_prompt(ws, data):
 
 
 def on_tool(ws, data):
+    tool = data.get("tool_name")
     args = data.get("tool_input") or {}
+    if tool in SHELLS:
+        command = args.get("command") or ""
+        if any(mark in command for mark in MEASURE):
+            ws.record("measure", text=one_line(command, 120))
+        return None
     path = args.get("file_path") or args.get("notebook_path")
     if not path:
         return None
-    if data.get("tool_name") in EDITS and ws.is_model(path):
+    if tool in EDITS and ws.is_model(path):
         ws.record("model", text=ws.model_text())
         return None
     rel = ws.relative(path)
     if not rel:
         return None
-    tool = data.get("tool_name")
     if tool in EDITS:
         ws.record("edit", path=rel)
     state = ws.state()
     segment = state.get("compactions", 0)
     shown = state.setdefault("shown", {}).setdefault(data.get("agent_id") or "main", {})
     parts = []
-    fresh = [note for note in notes(ws.root) if note.matches(rel) and shown.get(note.title) != segment]
-    if fresh:
-        for note in fresh:
-            shown[note.title] = segment
-        body = "\n\n".join(f"## {note.title}\n（{note.freshness(ws.root)}）\n{note.body}" for note in fresh)
+    full, brief = [], []
+    for note in notes(ws.root):
+        if not note.matches(rel):
+            continue
+        seen = shown.get(note.title)
+        if seen is None:
+            full.append(note)
+        elif seen != segment:
+            brief.append(note)
+        shown[note.title] = segment
+    if full:
+        body = "\n\n".join(f"## {note.title}\n（{note.freshness(ws.root)}）\n{note.body}" for note in full)
         parts.append(f"コードの覚え書き（{NOTES.as_posix()}。{rel} に触れたので出す。"
                      f"今のコードと照らして使い、違っていたらその場で直すか消す）：\n\n{body}")
+    if brief:
+        parts.append("この会話で前に見せた覚え書きが " + rel + " に結び付いている："
+                     + "、".join(f"「{note.title}」" for note in brief) + f"（本文は {NOTES.as_posix()}）")
     if tool in EDITS:
-        parts.append(connections(ws, rel, tool, args, shown, segment))
+        parts.append(connections(ws, rel, tool, args, shown))
+        parts.append(milestone(ws, ws.events(), state))
     parts = [part for part in parts if part]
-    if parts:
-        ws.save(state)
+    ws.save(state)
     return "\n\n".join(parts) or None
+
+
+def on_stop(ws, data):
+    """返事の記録と、言葉の確認。日本語の無い返事だけは書き直させる。"""
+    text = (data.get("last_assistant_message") or "").strip()
+    if not text:
+        return None
+    ws.record("stop", text=one_line(text, 400))
+    if data.get("stop_hook_active"):
+        return None
+    prose = re.sub(r"```.*?```", " ", text, flags=re.S)
+    prose = re.sub(r"`[^`\n]*`", " ", prose)
+    prose = re.sub(r"\S*[/\\:.]\S*", " ", prose)  # パス・URL・識別子
+    latin = len(re.findall(r"[A-Za-z]", prose))
+    japanese = len(JA.findall(prose))
+    if latin >= 80 and japanese < latin * 0.1:
+        return {"decision": "block",
+                "reason": "最後の返事に日本語がほとんど無い。ユーザーに見える文はすべて日本語で書く"
+                          "（識別子・パス・コマンドはそのまま）。同じ内容を日本語で書き直して終える。"}
+    return None
 
 
 def main():
     data = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
     event = data.get("hook_event_name")
-    handler = {"SessionStart": on_start, "UserPromptSubmit": on_prompt, "PostToolUse": on_tool}.get(event)
+    handler = {"SessionStart": on_start, "UserPromptSubmit": on_prompt,
+               "PostToolUse": on_tool, "Stop": on_stop}.get(event)
     if not handler:
         return
-    text = handler(Workspace(data), data)
-    if text:
-        sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+    ws = Workspace(data)
+    try:
+        out = handler(ws, data)
+    except Exception:
+        with open(ws.folder / "errors.log", "a", encoding="utf-8") as log:
+            log.write(f"{now().isoformat(timespec='seconds')} {event}\n{traceback.format_exc()}\n")
+        return
+    if isinstance(out, dict):
+        payload = out
+    elif out:
+        payload = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": out}}
+    else:
+        return
+    sys.stdout.buffer.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
 
 main()

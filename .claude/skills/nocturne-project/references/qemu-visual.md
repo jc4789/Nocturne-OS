@@ -1,34 +1,11 @@
-# QEMU画面確認の現場手順
+# QEMU の起動・撮影・操作
 
-## まず今の画面を取得する
+## 一台を窓付きで起動する（標準）
 
-既に起動している作業用QEMUを確認し、利用可能なUI screenshotまたは既存monitor接続で、対象全画面の撮影を一括で要求する。その結果を画像ツールでまとめて開いて目視する。撮影目的でOSを再ビルドしたり、各VMの長い観察期間の終了を順番に待ったりしない。
+ユーザーの指示（2026-10-16・2026-10-27）：QEMU は同時に一台。`C:\Program Files\qemu` を WHPX で使い、コマンドラインから直接操作する。4 コア、4096 MiB、2560×1440。
 
-ネイティブUIツールを使う場合は、対象windowを実際のsnapshotから選び、そのツールの現行APIを読み込む。スクリーンショットのためにwindowを前面化する必要がないツールなら、不要な切替を避ける。
-
-HMPでは既存monitorで次のcommandを送れる。
-
-```text
-screendump "D:/.../build/qa/<run>/before.png" -f png
-sendkey pgdn
-screendump "D:/.../build/qa/<run>/after.png" -f png
-```
-
-これは複数commandの例であって、単一画面ごとに工具呼出し／新process／再起動を要求するものではない。利用中の接続で各commandの完了を確認する。入力後の描画は現在のframeで確認し、機械的な固定sleepだけでreadyと断定しない。
-
-- QMPを使える場合は既存QMPの`screendump`を使ってよい。QMPとHMPのcommand形式を混同しない。
-- HMP新規接続時は初期の`(qemu) `promptを読み切ってからcommandを送る。古いpromptを撮影完了と誤認しない。
-- monitorの既存所有者を確認する。同じTCP monitorへ競合接続しない。既存ハーネスが接続を持つ場合はその接続の撮影機能、またはネイティブUI screenshotを使う。撮影の標準手順としてハーネス／QEMUを強制終了しない。
-- HMPの相対保存先はQEMUのcwd基準。絶対pathを使う場合は空白を正しく引用する。画像ファイルの取得完了を確認してから開く。
-- 複数VMの独立接続では撮影要求と画像の読込みをbatch化できる。一つの接続に互いのcommand応答を混在させない。
-- PPMは対応する画像viewerで直に開くか、可逆のPNG形式変換をすぐ行う。crop、合成、加工した画像だけで実画面の受入をしない。全画面の原本を残す。
-
-## 一台のQEMUをコマンドラインで直接操作する（標準）
-
-ユーザー指示（2026-10-16）：QEMUは同時に一台だけ。`C:\Program Files\qemu`をWHPXで使い、Python一発スクリプトではなくコマンドラインから直接操作する。
-
-1. 既存のQEMU processがないか確認する。あればそれを使い、二台目を起動しない。
-2. 窓付きで起動する。ディスクは一台だけ（ESPとC:を持つGPTの`build/nocturne.img`）。二台目のdataディスクは存在しない。`snapshot=on`ならビルド成果物を汚さないので、毎回コピーしない。
+1. 動いている QEMU が無いかを見る。あればそれを使い、二台目を起動しない。撮影のために再ビルド・再起動しない。
+2. 起動する。ディスクは一台（ESP と C: を持つ GPT の `build/nocturne.img`）。`snapshot=on` なら媒体を汚さないので、毎回写さなくてよい。
 
    ```text
    "C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -vga none -device VGA,xres=2560,yres=1440,vgamem_mb=32
@@ -39,59 +16,59 @@ screendump "D:/.../build/qa/<run>/after.png" -f png
      -netdev user,id=qa -device e1000,netdev=qa
    ```
 
-   画面の大きさは起動設定ではなく、仮想モニターのEDID（`xres`・`yres`）が決める。ゲストのファームウェアとLimineがその推奨モードを選び、カーネルが`video: monitor … at … Hz`と記録する。`-vga std`だけではEDIDの推奨がQEMUの既定の大きさになる。
+   画面の大きさは起動設定ではなく仮想モニターの EDID（`xres`・`yres`）が決める。ファームウェアと Limine がその推奨モードを選び、カーネルが `video: monitor … at … Hz` と記録する。`-vga std` だけでは EDID の推奨が QEMU の既定の大きさになる。
 
-3. HMPへ一行ずつ送る（PowerShellの`TcpClient`やncなど、接続を保持して送るだけの小さな手段でよい）。
+3. HMP へ一行ずつ送る（PowerShell の `TcpClient` など、接続を保持して送る小さな手段でよい）。新規接続では初期の `(qemu) ` prompt を読み切ってから送る。
 
    ```text
    screendump "D:/.../shots/now.png" -f png
    sendkey ctrl-l
+   sendkey pgdn
    mouse_move 400 300
    mouse_button 1
    mouse_button 0
+   info registers -a
    ```
 
-4. 保存したPNGをその場で自分で開いて見る。操作→撮影→目視を短く繰り返し、固定秒数の観察期間を設けない。
+4. 保存した PNG をその場で自分で開いて見る。操作→撮影→目視を短く繰り返し、固定秒数の観察期間を設けない。
 
-- **ディスクは標準でAHCIに接続する**（上記の`-device ahci`＋`ide-hd,bus=ahci.0`。実機のSATAと同じ経路）。カーネルはAHCI・NVMe・旧IDE（ATA）のどれからでもC:を読む。起動はserial.logの`store: C: "Nocturne" on sata0`で確かめる。数秒で起動しなければ異常として原因を扱う。
-- **NVMeで試すときはUEFIで起動する。** QEMUのSeaBIOSはNVMeディスクを起動できない（`could not read the boot disk`）。`-drive if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/share/edk2-x86_64-code.fd`と、`edk2-i386-vars.fd`の書込み用コピーを2台目のpflashに付け、`-device nvme,serial=nocturne,drive=boot,bootindex=0`にする。
-- HMPの`screendump`の保存先は**スラッシュ区切りの絶対path**にする（`"D:/.../now.png"`）。バックスラッシュのpathは黙って保存されない。
-- `C:\Tests\autorun.sh`があれば、initがそれを実行し、終わると電源断する（`scripts/test.py`・`platform_qa.py`のコピーだけに置く）。通常の`build/nocturne.img`にはないので、対話確認ではデスクトップのまま操作できる。
-- `snapshot=on`ではゲスト内の変更は残らず、ブラウザーprofileは毎回初回訪問者になる。サイトのA/B表示差もありうるので、参照画像と構成要素を照合して判断する。
-- **電源断・再起動をまたぐ保存の確認**は、`snapshot=on`ではなく使い捨てのqcow2 overlayで行う：`qemu-img create -f qcow2 -b "<絶対path>/build/nocturne.img" -F raw build/qa/persist.qcow2`（`tools\msys64\ucrt64\bin\qemu-img.exe`）。ゲストで書いた直後にHMPの`quit`で電源を切り、同じoverlayで再起動して確かめる。nocturne.imgを作り直したらoverlayも作り直し、終わったら消す。
-- WHPXでは`system_reset`後にVMが`paused (prelaunch)`のまま止まり、`cont`でも戻らない。再起動は`quit`してから起動し直す。
-- 終了はHMPの`quit`。この作業で起動したQEMUだけを止める。
+## 落とし穴
 
-## このcheckoutの既存ハーネス
+- **AHCI に接続する**（上の `-device ahci` と `ide-hd,bus=ahci.0`。実機の SATA と同じ経路）。起動は serial の `store: C: "Nocturne" on sata0` で確かめ、数秒で出なければ異常として原因を扱う。
+- **NVMe で試すときは UEFI で起動する。** SeaBIOS は NVMe を起動できない。`-drive if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/share/edk2-x86_64-code.fd` と `edk2-i386-vars.fd` の書込み用の写しを二つ目の pflash に付け、`-device nvme,serial=nocturne,drive=boot,bootindex=0`。
+- `screendump` の保存先は**スラッシュ区切りの絶対 path**。バックスラッシュの path は黙って保存されない。
+- 同じ TCP monitor へ競合して接続しない。既存のハーネス（platform_qa）が接続を持つなら、その撮影機能を使う。撮影のためにハーネスや QEMU を強制終了しない。
+- `C:\Tests\autorun.sh` があれば init がそれを走らせ、終わると電源を切る（test.py・platform_qa の写しにだけ置く）。通常の `build/nocturne.img` には無いので、デスクトップのまま操作できる。
+- `snapshot=on` ではブラウザーの profile は毎回初回訪問者になる。サイトの A/B の違いもありうるので、参照画像の部品と照合して判定する。
+- **再起動をまたぐ保存の確認**は使い捨ての qcow2 overlay で：`qemu-img create -f qcow2 -b "<絶対path>/build/nocturne.img" -F raw build/qa/persist.qcow2`（`tools\msys64\ucrt64\bin\qemu-img.exe`）。書いた直後に HMP の `quit` で切り、同じ overlay で起動し直す。nocturne.img を作り直したら overlay も作り直す。
+- WHPX では `system_reset` の後に `paused (prelaunch)` のまま止まり、`cont` でも戻らない。再起動は `quit` してから起動し直す。
+- ゲストが固まって見えたら `info registers -a` で CPU0 の RIP と RBP の鎖（`x /2gx <rbp>`）を取り、`build/kernel.elf` を llvm-symbolizer に引く（呼出しは BSP が受け持つので、CPU0 を先に見る）。
+- 終了は HMP の `quit`。この作業で起動した QEMU だけを止める。
 
-`scripts/platform_qa.py`は隔離した起動ディスクのコピー（AHCI、`snapshot=on`）、QEMU条件、撮影・キー入力の補助。**Pythonハーネスを使うこと自体は必須ではない。** 起動が必要な場合だけ現行引数を確認する。例：
+## platform_qa.py を使うとき
 
 ```text
-python -X utf8 scripts/platform_qa.py --label <unique-run> --url <requested-url> --accel whpx --memory 4096 --resolution 2560x1440 --seconds <observation-period>
+python -X utf8 scripts/platform_qa.py --label <一意の名> --accel whpx --memory 4096 --cpus 4 --resolution 2560x1440 --url <URL> --seconds <秒>
 ```
 
-既存runは`build/nocturne-platform/<label>/metadata.json`にPID、起動引数、monitor、image identityがある。記録のPIDだけで操作せず、現在のprocessと専用image/command lineの一致を確認する。ユーザーの既存VMを終了しない。
-
-2026-10-10時点の具体的な罠：
-
-- `--ready-marker`待機中は通常の定期撮影に入らない。markerが来ないまま画面を見ずに待ち続けない。初回はmarkerなしの現画面取得か、独立した即時撮影機能を選ぶ。
-- `--defer-screen-png`はPNG化を終了まで保留する。終了前にPPMを開く経路がないなら、目視優先の作業では選ばない。
-- `--guest-file observer.js`は隔離コピーのC:の`C:\Tests`へ置かれ、OSからの絶対pathは **`C:\Tests\observer.js`**。ブラウザー引数は`--console-file C:\Tests\observer.js`。
-- startup console入力はconsoleを開いてfocusする。PgDnはconsole履歴送りになり得る。実画面でconsoleを閉じ、ページへfocusしてからscrollする。
-- `--scroll-pages`を指定しただけでは合格にならない。前後画像、本文の移動、必要に応じてread-only scroll位置を自分で確認する。
-
-ハーネスの現行実装が変わっていればソースを必要範囲だけ確認する。この参考を根拠に存在しないAPIや引数を想像しない。
+- 既定は tcg・2048 MiB・1920×1080・60 秒・画面の間隔 30 秒。`--accel whpx` を忘れると遅い回になる。
+- `--command "<ゲストのコマンド>"`（複数可）、`--key <QEMU のキー>`、`--timed-key 秒:キー`、`--cmdline prof`（カーネルの標本）、`--guest-file <path>`（写しの `C:\Tests\<名>` へ置く。ブラウザーには `--console-file C:\Tests\<名>`）、`--expect`・`--reject`（serial の文字列で判定）、`--stop-when-expected`。
+- 出力は `build/nocturne-platform/<label>/`（serial.log、画面、`metadata.json` に PID・引数・monitor・媒体の識別）。記録の PID だけで操作せず、今の process と一致するかを見る。
+- `--ready-marker` 待ちの間は定期撮影に入らない。marker が来ないまま画面を見ずに待ち続けない。`--defer-screen-png` は PNG 化を終了まで保留するので、目視を先にする作業では使わない。
+- `--scroll-pages` を指定しただけでは合格にならない。前後の画像と本文の移動を自分で確かめる。startup の console 入力は console を開いて focus するので、PgDn は console の履歴送りになりうる。
+- 引数が変わっていればソース（`scripts/platform_qa.py` の `add_argument`）を見る。無い引数を想像しない。
 
 ## 目視記録の最小形
 
 ```text
 サイト／操作：
-実URL・run・image identity：
+実URL・run・媒体の版：
 見た画像（絶対path）：
 実際に見えた本文と配置：
-native操作と前後の変化：
+操作と前後の変化：
+console・serial の行（要点）：
 合格／失敗／未確認：
 次の製品修正／未実施の境界：
 ```
 
-HTTP 200、DOMContentLoaded、serial PASS、scrollYだけを「見た本文と配置」の代わりに書かない。参考hostブラウザーとNocturneを区別する。表示変化が読み込みの進行なのかscrollなのかも切り分ける。
+HTTP 200、DOMContentLoaded、serial の PASS、scrollY だけを「見た本文と配置」の代わりに書かない。表示の変化が読み込みの進行なのかスクロールなのかも切り分ける。

@@ -6,7 +6,7 @@
           {
             "type": "command",
             "shell": "bash",
-            "command": "python -I \"$CLAUDE_PROJECT_DIR/.claude/hooks/mokei.py\"",
+            "command": "python -I \"${CLAUDE_PROJECT_DIR}/.claude/hooks/mokei.py\"",
             "timeout": 10
           }
         ]
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "shell": "bash",
-            "command": "python -I \"$CLAUDE_PROJECT_DIR/.claude/hooks/mokei.py\"",
+            "command": "python -I \"${CLAUDE_PROJECT_DIR}/.claude/hooks/mokei.py\"",
             "timeout": 10
           }
         ]
@@ -26,12 +26,24 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
             "shell": "bash",
-            "command": "python -I \"$CLAUDE_PROJECT_DIR/.claude/hooks/mokei.py\"",
+            "command": "python -I \"${CLAUDE_PROJECT_DIR}/.claude/hooks/mokei.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "python -I \"${CLAUDE_PROJECT_DIR}/.claude/hooks/mokei.py\"",
             "timeout": 10
           }
         ]

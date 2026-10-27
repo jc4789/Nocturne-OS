@@ -1,77 +1,60 @@
 ---
 name: nocturne-project
-description: Nocturne OSの実装・不具合修正・検証を行う際のプロジェクト手順。特にブラウザーやGUI変更では、実QEMU画面の一括撮影と自分自身による目視・操作・スクロール確認を先行させ、表示不具合を修正する。一般的な別プロジェクト作業には適用しない。
+description: Nocturne OS の実物を動かして確かめる手順。QEMU の起動と HMP での撮影・キー・マウス、serial.log と F12 の console の読み方（行の一覧は references/logs.md）、ビルドと媒体、scripts/test.py と platform_qa.py の使い方。Nocturne のカーネル・GUI・ブラウザー・ドライバーのどれを直すときも、ビルドする前、QEMU を起動するとき、ログを読むとき、画面を撮るとき、「直った」「速くなった」「退行ではない」と書く前に必ず使う。性能・かくつき・落ちるコマ・固まる・白い画面の報告を受けたときは、推測の前にこのスキルでログを読む。実機と Hyper-V はユーザーの担当。
 ---
 
-# Nocturne：実製品を見て直す
+# Nocturne：実物を動かして確かめる
 
-## 適用と不変条件
+## 置き場所
 
-- ユーザーへの応答・作業説明・報告・コミットメッセージは日本語のみ。
-- GUI-firstのC製OS。UNIX/POSIX互換OSへの再設計やforkをしない。ファイルはディスク一台のC:だけ（`C:\Nocturne`は保護されたOS、`C:\Programs\<アプリ>`、`C:\Users\<名前>`）。`\`と`/`のどちらも受け付け、名前は大文字小文字を区別しない。`/bin`・`/data`・PATH・二台目のディスクを持ち込まない。
-- 既存実装・テスト・ユーザー変更を消して成功扱いにしない。変更範囲を限定し、既存の動作を保全する。
-- 原則の実行条件は`C:/Program Files/qemu`、WHPX、4コア（`-smp 4`）、4096MiB、2560×1440（2026-10-27 ユーザーの指示）。ユーザーの今回の指定が優先。Hyper-V Gen2/Enhanced Sessionの実行はユーザー担当。
-- **QEMUは同時に一台だけ。** 全体ビルドは必要なとき・役に立つときはいつでもしてよい。A/B比較のために`git stash`・revertで作業木を戻さない。疑わしい`.c`を一つずつ差し替えて比べる。
-- **QEMUはコマンドラインから直接操作する。** 窓付き`qemu-system-x86_64.exe -accel whpx`のHMP monitorへscreendump・sendkey・mouseを送り、その場で見る。固定秒数のPython一発スクリプトやcomputer-use撮影で代用しない。手順は[references/qemu-visual.md](references/qemu-visual.md)。
-- **ディスクはAHCIに接続する**（`-device ahci,id=ahci -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on -device ide-hd,drive=boot,bus=ahci.0,bootindex=0`）。一台のディスクにESPとC:があり、数秒で起動する。遅ければ待たずに異常として原因を扱う。
-- **文脈の劣化（context rot）と目的のずれ（context drift）に注意する。** 直前の訂正を忘れる、禁止された手段へ戻る、同じ失敗を繰り返す、推測を事実扱いする兆候が出たら、区切りで止め、差分・未完了・次の一手を短く記録して引き継ぐ。
-- 計画だけ、コードレビューだけ、スキル編集だけの依頼では、勝手にOS実装やVM試験を始めない。以前停止された作業は別の依頼だけでは再開しない。
-- J-spaceはユーザーの指定に従う。記録・再読・担当報告を実装と実画面確認の代わりにしない。指定された粒度の運用が実製品の確認を遅らせているなら、必要な記録を簡潔にして本作業へ戻る。
+- QEMU：`C:/Program Files/qemu/qemu-system-x86_64.exe`（WHPX）。同梱の `tools/msys64/ucrt64/bin/qemu-img.exe`。
+- ビルド：`python -X utf8 scripts/build.py -j 8 [目標]`。`all`（img・vhd・vhdx・iso）、`qemu-image`（img だけ。試験の繰り返しはこれ）、`kernel`、`user`。出力は `build/nocturne.img`、`build/kernel.elf`、`build/programs/`。
+- 媒体の中身：`scripts/layout.py` が `build/c.list` を書き、`build/host/store.exe fill` が C: に詰める。ソースを戻しても媒体は戻らないので、試験の媒体が今のソースから作られたかを先に確かめる（test.py は kernel と programs の sha256 を照合する）。
+- ログの行の一覧と取り方：[references/logs.md](references/logs.md)。QEMU の起動・HMP・落とし穴：[references/qemu-visual.md](references/qemu-visual.md)。
 
-## ブラウザー／GUI作業の最初の到達点
+## 進め方
 
-**実サイト観察 → 原因をソースで追う → 製品コードを直す → 同じ実サイトを目視・操作で再確認 → 必要な回帰試験。**
+1. **ログを先に読む。** 不具合の報告（遅い、かくつく、固まる、白い、落ちる）を受けたら、推測の前に serial.log と F12 の console の行を読む。動画なら `Native media timing` の `drop`・`starved`、描画なら `Browser loop profile`・`Browser damage profile`、カーネルなら `prof:` と `[memory]`。行の意味は logs.md。
+2. **基準を取る。** 変更前の媒体で、同じ組・同じ条件（2560×1440、F12 を開いたまま、QEMU は一台、計測の旗なし）の画面とログを残す。基準が無ければ退行かどうかは判定できないと書く。
+3. 原因を我々のコードで追う（codegraph で読む所を絞り、原文を読む）。直す。
+4. **同じ条件で再確認。** 変更後の媒体で同じ組を撮り、同じ行を並べる。ブラウザーの照合と速さの比べ方は `browser-hikaku` スキル。
+5. 要る回帰試験だけ走らせる（下の「試験」）。合格は、その試験が通る範囲の証拠にしかならない。
 
-ブラウザーの確かめ方（どのサイトの組を開くか、参照画像との照合、速さの比べ方、違いをブラウザー全体の欠陥として書くこと）は、`browser-hikaku` スキルに従う。
+計測の旗（`--debug-js`）は原因を探す回に使う。製品の速さは旗なし（または `--log-console` だけ）の回で測る。計測を足したら、その道具自身の費用も測る。
 
-1. 基本の組（参照フォルダーの `TEST SITES.txt` の全部）と、指定された全サイト・画面、必要な操作を小さな受入表にする。一つのサイトだけで終えない。
-2. 現在の実Nocturneブラウザーで対象を開く。既に対象QEMUが起動していればそれを使い、撮影のために再ビルド・再起動しない。現在のimageがsourceと違う場合は基準画面として区別し、修正後に一致したimageで確認する。
-3. **複数の対象画面を一回の撮影バッチで取得し、同じ観察区間で全画像を自分で開いて見る。** ある画面の終了・全タイムアウトを待ってから次の撮影を始めない。**QEMUは同時に一台だけ**。複数対象は同じVM内のタブ／窓で並べる。
-4. 空白、重なり、見切れ、文字化け、画像破損、入力不能、スクロール不能など、目に見える失敗を一つ選び、次の製品修正につなげる。正常に見える場合も、指定された操作と実内容を確かめる。
+## QEMU を一台、窓付きで起動する
 
-新規機能で事前buildが必要な場合でも、その必要最小限のbuild後にまず実画面を確認する。大規模なfixture・WPT・syntax試験の完走を、最初の実画面を見るための条件にしない。
+```text
+"C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -vga none -device VGA,xres=2560,yres=1440,vgamem_mb=32
+  -serial file:<run>/serial.log -monitor tcp:127.0.0.1:45454,server,nowait
+  -device ahci,id=ahci -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on
+  -device ide-hd,drive=boot,bus=ahci.0,bootindex=0 -netdev user,id=qa -device e1000,netdev=qa
+```
 
-## 撮影は自分の検証のため
+- 起動する前に、動いている QEMU が無いかを見る。あればそれを使い、二台目を起動しない。自分が起動したものは終わりに HMP の `quit` で止める。
+- 起動は `serial.log` の `store: C: "…" on sata0` で確かめる。数秒で出なければ待たずに異常として扱う。
+- HMP（TCP 45454）へ一行ずつ送る：`screendump "D:/…/now.png" -f png`（スラッシュ区切りの絶対 path）、`sendkey ctrl-l`、`mouse_move 400 300`、`mouse_button 1`／`0`。撮った PNG は自分で開いて見る。
+- `snapshot=on` なので媒体は汚れず、ゲストの変更も残らない。再起動をまたぐ保存の確認だけ qcow2 の overlay（qemu-visual.md）。
+- ブラウザーに旗を付けるには、ゲストの Terminal で `browser --debug-js <URL>` を打つか、`platform_qa.py --command` を使う。
 
-- **画像を保存した、ユーザーに貼った、担当が見た、画像hashが違う、というだけでは未検証。主担当自身が実画像を見て判断する。** ユーザーへの画像提示は必要なときだけでよい。
-- 撮影はPythonハーネス限定ではない。利用可能なネイティブUI操作、QEMU monitorのHMP/QMP、既存の接続・撮影機能から、今表示されている画面を最短で取得できる方法を選ぶ。UIツールはその現行APIを読んで使う。
-- 「今QEMUを撮れ」と言われたら、記録整理・別の検査・説明を中断し、起動中の対象QEMUをまとめて撮影して自分で確認する。将来の自動撮影を起動しただけでは応じたことにならない。
-- boot中・読み込み中も現在の画面を確認できる。author JSの完了やready markerを撮影の必須条件にしない。PNG変換をVM終了まで保留して目視を遅らせない。
-- **壊れた画面を「正常」と言わない。** 参照画像（ユーザー提供・hostブラウザー）の構成要素（段組み、サイドバー、関連一覧、チャンネル情報、画像等）を列挙し、一つずつ照合してから判定する。一つでも欠ければ失敗。2026-10-16、YouTube動画ページで関連動画列とチャンネル情報が欠けた一列表示を「正常」と誤報した。
-- 正しいURL・実ページ本文・viewportを画像で確認する。Chrome等のhostブラウザーは比較用には使えるが、Nocturneの受入証拠へ置き換えない。
-- 2560×1440のguest displayとブラウザーviewportは別。必要なら窓を最大化する。ブラウザーの撮影は必ずF12のconsoleを開いたまま行い、consoleの行も読む（2026-10-27 ユーザーの硬い規則）。小さい窓の横切れだけでparser不具合と断定しない。
-- 見た結果をサイトごとに短く記録する：画像パス、実URL、表示上の問題、試した操作、合格／失敗／未確認、次に直す境界。証拠は最終source/imageと対応させる。
+## 試験
 
-QEMUの具体的な接続・撮影時だけ[references/qemu-visual.md](references/qemu-visual.md)を読む。
+- `python -X utf8 scripts/test.py [--quick] [--no-net] [--accel whpx] [群|群/名]`：`build/nocturne.img` を `build/test.img` へ写して窓なしで起動し、`C:\Tests\autorun.sh` から `tests/runtests.c` を tcc で組んで走らせる。群と名は `runtests.c` の `tests[]`（113 群 221 件。例 `web`、`web/fonts`、`web/engine`、`web/javascript`）。既定は tcg・2048 MiB・4 CPU・1920×1080・1200 秒。結果は `build/test-serial.log`・`build/test-metadata.json`、別に残すなら `--output-dir build/<新しい名>`。
+- `python -X utf8 scripts/platform_qa.py --label <名> --accel whpx --memory 4096 --resolution 2560x1440 --url <URL> --seconds <秒>`：ラベル専用の写しを snapshot=on で一台起動し、`--command`（ゲストのコマンド）・`--key`・`--timed-key 秒:キー`・`--cmdline prof`（カーネルの標本）・`--expect`・`--reject` で操作と判定。`build/nocturne-platform/<label>/` に serial と画面が残る。既定は tcg・2048 MiB・1920×1080。
+- `tests/check_*.py` はホストの検査で、各自 `python tests/check_<名>.py`。まとめる runner は無い。
+- 同じ試験を繰り返さない。再実行は、製品を直した、試験の不備を直した、別の条件で切り分ける、のどれかを言えるときだけ。期待値を弱める・skip を足す・製品の経路を迂回して合格を作らない。
 
-## 操作とスクロールの受入
+## 撮影と操作の受入
 
-- keyboard/mouseの対象を実ページへ合わせる。console、アドレス欄、入力欄にPgDnを送ってページ送り成功としない。
-- クリックは実マウスで行い、直前に位置・hover・実際のtargetを確かめる。古い対象をそのまま再クリックしない。JSの`.click()`やDOM操作だけで実GUI入力の合格にしない。
-- 通常のUIのトップレベルのアドレス欄は一本。診断用の子URL・遷移元の情報を、二本目の常設アドレス欄や「From」表示にしない。
-- 実際のPageDown／wheel／scrollbar操作の前後をまとめて撮影し、自分で見比べる。本文の続きが出ること、意図した方向へ動くこと、入力後にUIが応答することを確認する。
-- 下方向だけでなく戻りも確認する。長いページなら複数区間で空白化、切れた描画、固定要素の誤配置を見つける。
-- read-onlyのscroll位置や寸法ログは補助証拠。JavaScript注入で移動したことだけ、キーを送ったことだけ、画像が変わったことだけでは実スクロールを証明しない。
-- 必要な検索・リンク・フォーム等も実製品の経路で操作する。サイトのchallenge、認証要求、HTTPエラーは見た状態として記録し、回避・成功偽装しない。
+- 画像は主担当が自分で開いて見る。保存した・サブエージェントが見た・hash が違う、では未検証。
+- 壊れた画面を「正常」と言わない。参照（ユーザーの画像・ホストのブラウザー）の部品を一つずつ照合する（2026-10-16、関連動画の列とチャンネル情報が欠けた画面を正常と誤報）。
+- ブラウザーの撮影は F12 の console を開いたまま行い、console の行も読む（2026-10-27 ユーザーの硬い規則）。2560×1440 の画面とブラウザーの表示域は別で、要れば窓を最大化する。
+- スクロールは実際の PgDn・wheel・scrollbar で、前後を撮って見比べる。下だけでなく戻りも。console・アドレス欄・入力欄に PgDn を送って頁送りの合格にしない。
+- クリックは実マウスで、直前に位置と対象を確かめる。JS の `.click()` や DOM 操作だけで GUI 入力の合格にしない。
+- 起動中・読み込み中でも今の画面は撮れる。ready marker や author JS の完了を撮影の条件にしない。
+- サイトの challenge・認証要求・HTTP エラーは見た状態として記録し、回避や成功の偽装をしない。
+- 見た結果はサイトごとに短く残す：画像の絶対 path、実 URL、媒体の版、見えた本文と配置、操作と前後の変化、合格／失敗／未確認、次に直す境界。
 
-## 検査で実装修正を置き換えない
+## 証拠の範囲
 
-- 未変更の同じ検査を反復しない。再試験は、製品修正・image更新・関連条件変更・新しい仮説のどれを確かめるか明記できる場合に行う。
-- fixture、host mock、syntax-only、build成功、delegateのPASSは、それぞれの範囲の証拠だけ。実サイト表示、実操作、scroll、回帰なし、Hyper-V成功をそこから推測しない。
-- 機能試験が通っても画面が白い／重なる／操作不能なら、その不具合を優先して直す。「あとでサイトを見る」で試験だけを増やさない。
-- 一時的なデバッグ注入はread-only・最小限にし、実サイトのDOM/CSSを差し替えて正しく見せない。一般機能の迂回や制限解除で当該サイトだけ通す変更を避ける。
-- 必要な標準・parser試験も実行するが、実サイトの目視を先延ばしする理由にしない。既存回帰試験を削除・期待値を弱めて成功扱いにしない。
-
-## 担当分担・終了・停止
-
-- 担当エージェントはユーザーの許可または適用指示の範囲内で使い、指定どおり全コンテキスト、共通契約、所有ファイル、停止条件を渡す。主担当は実際の差分と製品結果を自分で受け入れる。
-- 完了前に指定された全サイト／操作の受入表を読む。失敗・未確認を残したまま全面成功、無回帰、完了と書かない。未実施と限界を明示する。
-- 「停止」では実装・新試験・追加撮影を止め、担当とこの作業所有と確認できるbuild/test/VMを停止する。他のVMやユーザーdataには触れない。
-- 作業ログを求められたら、保存source、変更一覧、最終build、試験の失敗を含む結果、実際に見た画面、未確認の操作、未完了項目、停止したprocessを記録する。仕上げの再検証やJ-spaceのship処理を理由に作業を続けない。
-- この事例の原記録は`docs/html-parser-20261010-stop.md`。必要時だけ読み、そこにある未完了を既に解決済みと扱わない。
-
-## この環境のCLI
-
-ファイルの作成・編集には通常の編集ツール（`apply_patch`など）を使う。Pythonスクリプトや`python -c`を編集ツールの代わりにして本文を書き込まない。既存のビルド・テストスクリプトを実行することとは区別する。
-
-PowerShellはランチャーとしてのみ使用。ファイル発見は`rg --files`、内容検索は`rg`、表示は`cat`、path filterは`rg -g`、連結は`&&`/`||`。PowerShell固有cmdlet・alias・pipelineへ置き換えない。日本語のログやscript処理はUTF-8を明示する。
+静的な確認、ビルド、試験の PASS、QEMU での実サイトの表示、実際の GUI 操作、性能の比較、Hyper-V・実機は別々に書き、一つの成功を他へ流用しない。fixture・host mock・サブエージェントの PASS はその範囲の証拠だけ。機能試験が通っても画面が白い・重なる・操作できないなら、その不具合を先に直す。
