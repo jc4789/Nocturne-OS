@@ -1380,10 +1380,10 @@ static int test_run(uint64_t mib, uint64_t seed, long steps) {
 /* ---- the catalog's test: its tree alone against a model of its keys ---- */
 
 /* A tree of many leaves and branches, shaped by turns of growth, of removal mostly in its low keys
-   (first children leave their branches) and of growth again (keys below a branch's first key):
-   random puts of values of many sizes, deletes and commits. Every so often the walk checks the
-   order of every node and every key is looked up. The volume test keeps its tree to a few
-   leaves. */
+   (first children leave their branches), of growth again (keys below a branch's first key) and of
+   thinning everywhere with runs of keys (small branches join their neighbours): random puts of
+   values of many sizes, deletes and commits. Every so often the walk checks the order of every
+   node and every key is looked up. The volume test keeps its tree to a few leaves. */
 static int walk_count(void *ctx, const struct item *it) {
     (void)it;
     ++*(uint64_t *)ctx;
@@ -1410,19 +1410,24 @@ static int tree_test(uint64_t seed, long steps) {
         return 1;
     }
     for (long step = 0; step < steps; step++) {
-        long turn = step / ROUND % 3;
+        long turn = step / ROUND % 4;
         uint32_t n = (uint32_t)below(turn == 1 && below(4) ? KEYS / 4 : KEYS);
-        bool remove = below(10) < (turn == 1 ? 8u : 2u);
+        bool remove = below(10) < (turn == 1 ? 8u : turn == 3 ? 7u : 2u);
+        /* the thinning turn also takes runs of keys: whole leaves go, then branches join */
+        uint32_t run = turn == 3 && remove && !below(20) ? 1 + (uint32_t)below(KEYS / 50) : 1;
         tree_key(key, n);
         int r;
         if (remove) {
-            r = catalog_delete(v, key, sizeof key);
-            if ((r >= 0) != (size[n] != 0)) {
-                fprintf(stderr, "store: tree test (seed %llu, step %ld): deleting key %u gives %s\n",
-                        (unsigned long long)seed, step, n, error_name(r));
-                return 1;
+            for (uint32_t k = n; k < n + run && k < KEYS; k++) {
+                tree_key(key, k);
+                r = catalog_delete(v, key, sizeof key);
+                if ((r >= 0) != (size[k] != 0)) {
+                    fprintf(stderr, "store: tree test (seed %llu, step %ld): deleting key %u gives %s\n",
+                            (unsigned long long)seed, step, k, error_name(r));
+                    return 1;
+                }
+                size[k] = 0;
             }
-            size[n] = 0;
         } else {
             uint16_t len = (uint16_t)(1 + below(STORE_VALUE_MAX / 2));
             for (uint16_t i = 0; i < len; i++) value[i] = (uint8_t)(n + i);

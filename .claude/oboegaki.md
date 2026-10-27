@@ -47,8 +47,8 @@ css_rule_info の text はシートの元の文（注釈を除いた写し）の
 
 ## 目録の枝の最初の鍵は何も区切らない
 対象: kernel/src/fs/catalog.c, common/store_format.h, host/store/store.c
-確かめた: 2026-10-26 304be1a1
-枝の item 0 の鍵は、最初の子が外れた後や、それより小さい鍵が最初の子に入った後には、その子の鍵より上にも、二番目の鍵より上にもなる。枝を探す・調べる処理（child_index、walk）は item 0 の鍵を比べない。枝の鍵を使う処理を足すときも item 1 から見る。目録を変えたら `store tree-test <seed> 200000` を幾つかの種で通す（`store test` は木を数枚の葉に保つので、枝の崩れを出さない）。
+確かめた: 2026-10-26 304be1a1 の次（併合の直し）
+枝の item 0 の鍵は、最初の子が外れた後や、それより小さい鍵が最初の子に入った後には、その子の鍵より上にも、二番目の鍵より上にもなる。枝を探す・調べる処理（child_index、walk）は item 0 の鍵を比べない。枝の鍵を使う処理を足すときも item 1 から見る。item 0 が二番目以降へ移る所（catalog_delete の枝の併合）では、その鍵の代わりに親の区切りの鍵を使う（右の枝の item 0 をそのまま写すと、その子の鍵を見失う。range の手元の試験で再現した）。目録を変えたら `store tree-test <seed> 200000` を幾つかの種で通す（`store test` は木を数枚の葉に保つので、枝の崩れを出さない。tree-test の四つ目の手番が範囲で消して枝を併合させる）。
 
 ## 呼出しは BSP が受け持つ。長い核の処理は全部の app を止める
 対象: kernel/src/sys/sched.c, kernel/src/arch/idt.c, kernel/src/sys/syscall.c

@@ -485,7 +485,12 @@ int catalog_delete(struct volume *v, const uint8_t *key, size_t klen) {
         struct cblock *ob = node_read(v, c.address, c.generation, &error);
         if (!ob) break; /* left as it is: still a valid tree */
         struct store_node *o = node(ob);
-        if (used(o) + used(n) - HEADER > STORE_BLOCK || o->level != n->level) {
+        /* a branch's first key bounds nothing: the right one's first child joins the left one under
+           the parent's key for the right one, which is below every key under it */
+        uint8_t *bound = item(parent, left + 1);
+        size_t first = klen_of(item(left == p.at[d - 1] ? o : n, 0));
+        size_t grown = n->level && klen_of(bound) > first ? klen_of(bound) - first : 0;
+        if (used(o) + used(n) - HEADER + grown > STORE_BLOCK || o->level != n->level) {
             cache_put(v, ob);
             break;
         }
@@ -505,8 +510,8 @@ int catalog_delete(struct volume *v, const uint8_t *key, size_t klen) {
         lb = q.b[d];
         struct store_node *l = node(lb), *rn = node(rb);
         for (unsigned i = 0; i < rn->count; i++) {
-            uint8_t *it = item(rn, i);
-            put_item(l, l->count, key_of(it), klen_of(it), value_of(it), vlen_of(it));
+            uint8_t *it = item(rn, i), *key = i || !rn->level ? it : bound;
+            put_item(l, l->count, key_of(key), klen_of(key), value_of(it), vlen_of(it));
         }
         remove_item(parent, left + 1);
         if (rb == ob && (ob->address & TEMP_ADDRESS)) cache_discard(v, ob);
