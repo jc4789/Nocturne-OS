@@ -336,11 +336,12 @@
         }catch(error){return workerFetchBridge.reject(error);}
     }
     /* @include js_performance.js */
+    /* @include js_console.js */
     Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Response,AbortSignal,AbortController,fetch,
         setTimeout:(fn,ms,...args)=>timer(fn,ms,args,false),setInterval:(fn,ms,...args)=>timer(fn,ms,args,true),
         clearTimeout:clearTimer,clearInterval:clearTimer,
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},
-        console:Object.fromEntries(['log','warn','error','info','debug'].map(k=>[k,(...args)=>host.send(7,0,{message:args.map(String).join(' '),filename:address})])),
+        console:consoleNamespace((level,values)=>host.send(7,0,{message:values.map(String).join(' '),filename:address}),()=>host.now()),
         addEventListener:target.addEventListener.bind(target),removeEventListener:target.removeEventListener.bind(target),dispatchEvent:target.dispatchEvent.bind(target)});
     // No DOM image sources here; context loss events are timer tasks.
     offscreenCanvasBridge.bindWebGL(undefined,fn=>timer(fn,0,[],false));

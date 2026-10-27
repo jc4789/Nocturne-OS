@@ -1004,8 +1004,8 @@
     const location={assign(url){host.navigate(String(url),0);},replace(url){host.navigate(String(url),2);},reload(){host.navigate(host.url(),1);},toString(){return this.href;}};
     Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(htmlSafetyBridge.navigationInput(v));}}});
     document.location=location;
-    const console={};for(const [i,name]of ['log','warn','error','info','debug'].entries())console[name]=(...args)=>host.log(i===2?2:i===1?1:0,...args);
-    console.assert=(yes,...args)=>{if(!yes)console.error('Assertion failed:',...args);};
+    /* @include js_console.js */
+    const console=consoleNamespace((level,values)=>host.log(level,...values),()=>host.now());
     const timer=(kind,fn,ms,args)=>{const callback=typeof fn==='function'?fn:new Function(String(fn));return host.timer(kind,kind===2?callback:function(){return apply(callback,this,args);},Number(ms)||0,[]);};
     function setTimeout(fn,ms,...args){return timer(0,fn,ms,args);}function setInterval(fn,ms,...args){return timer(1,fn,ms,args);}
     function clearTimeout(id){host.clear(Number(id));}function clearInterval(id){host.clear(Number(id));}
@@ -1244,8 +1244,10 @@
         }
         for(const key of Object.getOwnPropertyNames(globalThis)){
             const d=Object.getOwnPropertyDescriptor(globalThis,key);
-            /* Namespaces (console, CSS, ...) are plain objects of operations. */
-            if(d.value&&typeof d.value==='object'&&Object.getPrototypeOf(d.value)===Object.prototype){members(d.value);continue;}
+            /* Namespaces (console, CSS, ...) are plain objects of operations;
+               a WebIDL namespace sits on an empty object over Object.prototype. */
+            const namespaceProto=d.value&&typeof d.value==='object'&&Object.getPrototypeOf(d.value);
+            if(namespaceProto&&(namespaceProto===Object.prototype||Object.getPrototypeOf(namespaceProto)===Object.prototype&&!Reflect.ownKeys(namespaceProto).length)){members(d.value);continue;}
             if(typeof d.value!=='function')continue;
             const c=d.value;
             if(c.name!==key&&globalThis[c.name]!==c)rename(c,key);else named.set(c,c.name);
