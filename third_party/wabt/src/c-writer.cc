@@ -283,6 +283,7 @@ class CWriter {
   static constexpr char MangleType(Type);
   static constexpr char MangleField(ModuleFieldType);
   static std::string MangleTypes(const TypeVector&);
+  static std::string MultiMember(const TypeVector&, Index);
   static std::string Mangle(std::string_view name, bool double_underscores);
   static std::string MangleName(std::string_view);
   static std::string MangleModuleName(std::string_view);
@@ -722,6 +723,14 @@ std::string CWriter::MangleTypes(const TypeVector& types) {
     result += MangleType(type);
   }
   return result;
+}
+
+/* The selector of value i in a value of these types: none for a single value,
+   else the wasm_multi_* member DeclareStruct names. */
+// static
+std::string CWriter::MultiMember(const TypeVector& types, Index i) {
+  if (types.size() <= 1) return {};
+  return "." + std::string(1, MangleType(types.at(i))) + std::to_string(i);
 }
 
 /* The C symbol for an export from this module. */
@@ -3539,11 +3548,9 @@ void CWriter::WriteHostAdapter(const Func& func, Index index) {
         ");", Newline(), "if (host_status) wasm_rt_trap((wasm_rt_trap_t)host_status);", Newline());
   if (decl.GetNumResults()) {
     Write(decl.sig.result_types, " result;", Newline());
-    for (Index i = 0; i < decl.GetNumResults(); ++i) {
-      std::string dest = "result";
-      if (decl.GetNumResults() > 1) dest += "." + std::string(1, MangleType(decl.GetResultType(i))) + std::to_string(i);
-      WriteHostUnpack(decl.GetResultType(i), dest, "r[" + std::to_string(i) + "]");
-    }
+    for (Index i = 0; i < decl.GetNumResults(); ++i)
+      WriteHostUnpack(decl.GetResultType(i), "result" + MultiMember(decl.sig.result_types, i),
+                      "r[" + std::to_string(i) + "]");
     Write("return result;", Newline());
   }
   Write(CloseBrace(), Newline());
@@ -3559,18 +3566,14 @@ void CWriter::WriteHostAdapter(const Func& func, Index index) {
         "wasm_host_ref* slots[] = {&owner_ref");
   size_t roots = 1;
   for (Index i = 0; i < decl.GetNumParams(); ++i) if (decl.GetParamType(i).IsRef()) {
-    Write(", &params");
-    if (decl.GetNumParams() > 1) Write(".", MangleType(decl.GetParamType(i)), i);
+    Write(", &params", MultiMember(decl.sig.param_types, i));
     ++roots;
   }
   Write("};", Newline(), "wasm_host_roots roots = {*instance->root_head, slots, ", roots, "};", Newline(),
         "*instance->root_head = &roots;", Newline());
   if (decl.GetNumResults()) Write(decl.sig.result_types, " result = ");
   Write(GlobalName(ModuleFieldType::Func, func.name), "(instance");
-  for (Index i = 0; i < decl.GetNumParams(); ++i) {
-    Write(", params");
-    if (decl.GetNumParams() > 1) Write(".", MangleType(decl.GetParamType(i)), i);
-  }
+  for (Index i = 0; i < decl.GetNumParams(); ++i) Write(", params", MultiMember(decl.sig.param_types, i));
   Write(");", Newline());
   if (decl.GetNumResults()) Write("memcpy(tail_call_stack, &result, sizeof(result));", Newline());
   Write("*instance->root_head = roots.previous;", Newline(),
@@ -3626,11 +3629,8 @@ void CWriter::WriteHostModule() {
     Write(GlobalName(ModuleFieldType::Func, func->name), "(instance");
     for (Index j = 0; j < decl.GetNumParams(); ++j) Write(", a", j);
     Write(");", Newline());
-    for (Index j = 0; j < decl.GetNumResults(); ++j) {
-      std::string src = "result";
-      if (decl.GetNumResults() > 1) src += "." + std::string(1, MangleType(decl.GetResultType(j))) + std::to_string(j);
-      WriteHostPack(decl.GetResultType(j), "r[" + std::to_string(j) + "]", src);
-    }
+    for (Index j = 0; j < decl.GetNumResults(); ++j)
+      WriteHostPack(decl.GetResultType(j), "r[" + std::to_string(j) + "]", "result" + MultiMember(decl.sig.result_types, j));
     Write("break;", Newline(), CloseBrace(), Newline());
   }
   Write("default: TRAP(UNREACHABLE);", Newline(), CloseBrace(), Newline(), CloseBrace(), Newline());

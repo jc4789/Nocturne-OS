@@ -6,8 +6,18 @@
 #include <stdio.h>
 #include <string.h>
 
+/* TinyCC's x86-64 code generator calls out for conversions between unsigned
+   64-bit integers and floating point (gen_cvt_itof1 and gen_cvt_ftoi1 in
+   tccgen.c). With -nostdlib no libtcc1 is linked: the host's compiler does the
+   conversion. wasm2c range-checks before every float-to-integer cast. */
+static float u64_to_f32(unsigned long long value) { return (float)value; }
+static double u64_to_f64(unsigned long long value) { return (double)value; }
+static unsigned long long f32_to_u64(float value) { return (unsigned long long)value; }
+static unsigned long long f64_to_u64(double value) { return (unsigned long long)value; }
+
 int wasm_rt_add_tcc_symbols(TCCState *compiler) {
-#define BIND(name) do { if (tcc_add_symbol(compiler, #name, (const void *)(name)) < 0) return -1; } while (0)
+#define BIND_AS(symbol, function) do { if (tcc_add_symbol(compiler, symbol, (const void *)(function)) < 0) return -1; } while (0)
+#define BIND(name) BIND_AS(#name, name)
     BIND(wasm_rt_init);
     BIND(wasm_rt_is_initialized);
     BIND(wasm_rt_free);
@@ -36,7 +46,10 @@ int wasm_rt_add_tcc_symbols(TCCState *compiler) {
     BIND(copysign); BIND(nearbyint); BIND(nearbyintf);
     BIND(fmin); BIND(fminf); BIND(fmax); BIND(fmaxf);
     BIND(setjmp); BIND(longjmp);
+    BIND_AS("__floatundisf", u64_to_f32); BIND_AS("__floatundidf", u64_to_f64);
+    BIND_AS("__fixunssfdi", f32_to_u64); BIND_AS("__fixunsdfdi", f64_to_u64);
 #undef BIND
+#undef BIND_AS
     return 0;
 }
 

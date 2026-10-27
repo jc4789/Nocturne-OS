@@ -18,6 +18,7 @@ uint64_t uptime_ms(void);
 }
 #include "libtcc.h"
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -635,6 +636,22 @@ static std::shared_ptr<NativeModule> compile_native(JSContext *ctx, State *s,
         NativeCompile::diagnostic, NativeCompile::poll, &work);
     if (compiled == -2) { JS_ThrowOutOfMemory(ctx); return {}; }
     ok = compiled == 0;
+    // TCC names a line of the generated C ("<string>:N: error: ..."): carry that
+    // line in the fallback reason, since the source is gone once this returns.
+    unsigned long line = 0;
+    if (!ok && sscanf(work.error.c_str(), "<string>:%lu:", &line) == 1 && line) {
+      size_t at = 0;
+      for (unsigned long n = 1; n < line && at != std::string::npos; ++n) {
+        at = text.find('\n', at);
+        if (at != std::string::npos) ++at;
+      }
+      if (at != std::string::npos) {
+        size_t end = text.find('\n', at);
+        std::string code = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        if (code.size() > 240) code.resize(240);
+        work.error += " (in: " + code + ")";
+      }
+    }
     if (ok) {
       native->invoke = reinterpret_cast<wasm_host_invoke>(tcc_get_symbol(native->compiler, "wasm_host_invoke_entry"));
       ok = native->invoke != nullptr;

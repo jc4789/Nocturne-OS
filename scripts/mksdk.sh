@@ -138,6 +138,11 @@ mv "$W/libc.a" "$S/Lib/libc.a"
 (cd "$W/wasmrt" && ar rcs ../libwasm-rt.a *.o)
 mv "$W/libwasm-rt.a" "$S/Lib/libwasm-rt.a"
 mv "$W/rt/runmain.o" "$S/Lib/tcc/runmain.o"
+# With LLVM, libc.a carries clang's compiler runtime (LLVM's members need it), and TinyCC's runtime
+# defines some of the same helpers: the sized __atomic_* calls and the unsigned 64-bit conversions.
+# TinyCC's definitions are weak, so a program that pulls a member of each gets libc's where both
+# define a name, and TinyCC's own everywhere else.
+for o in "$W/rt"/*.o; do objcopy --weaken "$o"; done
 (cd "$W/rt" && ar rcs ../libtcc1.a *.o)
 mv "$W/libtcc1.a" "$S/Lib/tcc/libtcc1.a"
 rm -rf "$W"

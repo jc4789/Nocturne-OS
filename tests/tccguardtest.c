@@ -315,7 +315,24 @@ static void coroutine_boundaries(void) {
     tcc_delete(parent.compiler);
     wasm_rt_set_poll(previous.callback, previous.opaque, NULL);
 }
+/* Unsigned 64-bit <-> float conversions are calls TinyCC's code generator
+   makes into the runtime, which a -nostdlib memory build gets from the host.
+   2^63 + 2048 is exact in a double and rounds to 2^63 in a float. */
+static void unsigned_conversions(void) {
+    const char conversions[] =
+        "int answer(void){volatile unsigned long long u=9223372036854777856ull;"
+        "volatile double d=u;volatile float f=u;"
+        "volatile unsigned long long db=d,fb=f;"
+        "return (d==9223372036854777856.0)|(db==u)<<1|(f==9223372036854775808.0f)<<2"
+        "|(fb==9223372036854775808ull)<<3;}" DISPATCH_SOURCE;
+    TCCState *compiler = NULL;
+    int status = wasm_rt_compile_tcc(&compiler, conversions, NULL, NULL, NULL);
+    check(status == 0 && compiler && execute_answer(compiler, 15),
+          "unsigned 64-bit and floating point conversions");
+    tcc_delete(compiler);
+}
 int main(void) {
+    unsigned_conversions();
     entry_cancellation();
     allocation_failures();
     function_cancellation();
