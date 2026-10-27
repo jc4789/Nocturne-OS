@@ -45,6 +45,7 @@ static const struct asset assets[] = {
     {"/dir/long-headers.mjs", "export const completeHeaders = 42;", 0},
     {"/dir/api/post", "Nocturne request body", 0},
     {"/dir/api/slow", "{\"late\":true}", 60000},
+    {"/dir/queued-wanted.svg", "<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/>", 1000},
 };
 
 struct queued {
@@ -565,18 +566,23 @@ static void test_image_invalidation(void) {
     test_check("image-invalidation-ready",pump("image-invalidation-ready",3000));
     web_layout(fixture.doc,VW,VH);
     test_check("image-attribute-initial-layout",web_anchor_y(fixture.doc,"sentinel")==20);
+    /* HTML §3.2.6.6: no behaviour derives from data-* attributes, so
+       data-original is no image candidate; src and a picture's source are. */
     const char *change="document.getElementById('image').setAttribute('data-original','two.svg');"
+        "document.getElementById('image').setAttribute('src','three.svg');"
         "document.getElementById('source').setAttribute('srcset','picture-two.svg 1x');";
     test_check("image-candidate-mutation-eval",web_console_eval(fixture.doc,change,strlen(change)));
     web_layout(fixture.doc,VW,VH);
     test_check("image-candidate-preserves-attribute-selector",web_anchor_y(fixture.doc,"sentinel")==40);
-    bool image_url=false,picture_url=false;
+    bool image_url=false,data_url=false,picture_url=false;
     for(int i=0;i<web_image_count(fixture.doc);i++) {
         const char *url=web_image_url(fixture.doc,i);
-        image_url|=url && strstr(url,"/two.svg")!=NULL;
+        image_url|=url && strstr(url,"/three.svg")!=NULL;
+        data_url|=url && (strstr(url,"/one.svg") || strstr(url,"/two.svg"));
         picture_url|=url && strstr(url,"/picture-two.svg")!=NULL;
     }
-    test_check("image-lazy-candidate-updated",image_url);
+    test_check("image-src-candidate-updated",image_url);
+    test_check("image-data-attribute-not-a-candidate",!data_url);
     test_check("image-picture-source-updated",picture_url);
     for(int i=0;i<30;i++){step(&fixture);n_sleep_ms(1);}
     int previous_requests=fixture.requests;
@@ -589,9 +595,10 @@ static void test_image_invalidation(void) {
     test_check("image-invalidation-no-js-errors",fixture.errors==0);
     close_case();
 
-    /* Fetch is not a load blocker, but an unqueued wanted image still is.
-       Exercise a full JS queue without the harness's 1ms pump hiding a
-       deadline that incorrectly wakes forever instead of waiting for Fetch. */
+    /* Fetch is not a load blocker, but an image in flight still is. Neither
+       waits for the other: the transport owns the connection queue, so the
+       image goes out beside eight held fetches. Exercise the held state
+       without the harness's 1ms pump hiding a deadline that wakes forever. */
     const char *full=START "</head><body><script>"
         "addEventListener('load',()=>mark('image-queue-load'));"
         "document.addEventListener('DOMContentLoaded',()=>mark('image-queue-dom-ready'));"
@@ -600,16 +607,12 @@ static void test_image_invalidation(void) {
         "</script></body>";
     if (!open_case(full,false)) return;
     test_check("image-queue-dom-ready",pump("image-queue-dom-ready",3000));
-    test_check("image-queue-eight-fetch-requests",fixture.fetch_requests==8 && fixture.requests==8);
-    test_check("image-queue-eight-held-requests",queued_count(&fixture)==8 && fixture.completions==0);
-    bool wanted=false,queued_image=false;
-    for(int i=0;i<web_image_count(fixture.doc);i++) {
-        const char *url=web_image_url(fixture.doc,i);
-        if(url && strstr(url,"/queued-wanted.svg") && web_image_wanted(fixture.doc,i))wanted=true;
-    }
-    for(int i=0;i<SLOTS;i++)if(fixture.queue[i].used && fixture.queue[i].kind==WEB_RESOURCE_IMAGE)queued_image=true;
-    test_check("image-queue-detached-image-wanted",wanted);
-    test_check("image-queue-image-not-dispatched",!queued_image);
+    test_check("image-queue-beside-held-fetches",fixture.fetch_requests==8 && fixture.requests==9 &&
+        queued_count(&fixture)==9 && fixture.completions==0);
+    bool queued_image=false;
+    for(int i=0;i<SLOTS;i++)if(fixture.queue[i].used && fixture.queue[i].kind==WEB_RESOURCE_IMAGE &&
+        strstr(fixture.queue[i].url,"/queued-wanted.svg"))queued_image=true;
+    test_check("image-queue-detached-image-dispatched",queued_image);
     int future=0;
     for(int i=0;i<16;i++) {
         step(&fixture);web_layout(fixture.doc,VW,VH);
@@ -617,9 +620,9 @@ static void test_image_invalidation(void) {
         if(i>=8 && deadline>(int64_t)now)future++;
         n_sleep_ms(1);
     }
-    test_check("image-queue-full-deadline-waits",future==8);
-    test_check("image-queue-load-still-blocked",!has_mark(&fixture,"image-queue-load"));
-    test_check("image-queue-no-extra-requests",fixture.requests==8 && queued_count(&fixture)==8);
+    test_check("image-queue-held-deadline-waits",future==8);
+    test_check("image-queue-image-blocks-load",!has_mark(&fixture,"image-queue-load"));
+    test_check("image-queue-load-after-image",pump("image-queue-load",3000) && fixture.requests==9 && queued_count(&fixture)==8);
     test_check("image-queue-no-js-errors",fixture.errors==0 && fixture.js_failures==0);
     close_case();
     test_check("image-queue-close-cancels-held-fetch",queued_count(&fixture)==0 && fixture.cancellations==8);
@@ -710,7 +713,7 @@ static void test_language(void) {
         "check('math-boundaries',Math.log1p(-1)===-Infinity&&Number.isNaN(Math.log1p(-2))&&Math.expm1(-Infinity)===-1&&Math.expm1(Infinity)===Infinity&&Math.acosh(1)===0&&Number.isNaN(Math.acosh(0))&&Math.atanh(1)===Infinity&&Math.atanh(-1)===-Infinity&&Object.is(Math.asinh(-0),-0));"
         "check('math-small',Math.abs(Math.log1p(1e-12)-(1e-12-5e-25))<1e-25&&Math.abs(Math.expm1(1e-12)-(1e-12+5e-25))<1e-25);"
         "check('math-inverses',Math.abs(Math.asinh(Math.sinh(.5))-.5)<1e-12&&Math.abs(Math.acosh(Math.cosh(1.2))-1.2)<1e-12&&Math.abs(Math.atanh(Math.tanh(.25))-.25)<1e-12);"
-        "check('no-os-exposure',typeof std==='undefined'&&typeof os==='undefined'&&typeof Atomics==='undefined'&&typeof SharedArrayBuffer==='undefined');"
+        "check('no-os-exposure',typeof std==='undefined'&&typeof os==='undefined'&&typeof Atomics==='object'&&typeof SharedArrayBuffer==='undefined'&&crossOriginIsolated===false);"
         "try{function recurse(){return recurse()+1;}recurse();check('stack-limit',false);}catch(e){check('stack-limit',true);}mark('language-done');";
     char *page = script_page(source);
     test_check("language-page-allocation", page != NULL);
