@@ -232,8 +232,10 @@ static void console(void *opaque,int level,const char *message) {
         }
         r->complete=true;r->harness_status=status;r->result_count=count;r->failed=bad;
     }else if(level==2){
-        /* harness の原結果は別に保存し、例外を PASS へ隠さない。 */
-        if(strncmp(message,"Diagnostic #",12)&&strncmp(message,"Source ",7))r->infrastructure++;
+        /* harness の原結果は別に保存し、例外を PASS へ隠さない。取得できなかった資源の報告
+           （Resource #）は例外ではない：頁がわざと失敗させる取得（SRI・MIME）もあり、
+           その成否は harness の結果が持つ。 */
+        if(strncmp(message,"Diagnostic #",12)&&strncmp(message,"Source ",7)&&strncmp(message,"Resource #",10))r->infrastructure++;
     }
 }
 static void scroll_position(void *opaque,int *x,int *y) {

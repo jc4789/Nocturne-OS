@@ -5,8 +5,9 @@
 #include "webi.h"
 
 /* New boundary only: one layout_doc measures and then re-enters a flex/grid
- * item. Old successful clamp groups are not run here. min-height:1px makes
- * the item a definite-height consumer even when the stretch size is equal. */
+ * item. Old successful clamp groups are not run here. min-height:1% makes
+ * the item a definite-height consumer, so it is re-laid even when the stretch
+ * size is equal (an absolute min-height is clamped by the caller and is not). */
 static int checks, failures;
 static void check(const char *name, bool pass) {
     checks++;
@@ -32,7 +33,7 @@ static web_doc *load(const char *outer, const char *constraint, bool overflow) {
     char html[2304];
     snprintf(html, sizeof html,
         "<style>html,body{margin:0;font:16px/20px sans-serif}"
-        "#outer{width:180px;%s}#wrap{width:180px;min-height:1px}"
+        "#outer{width:180px;%s}#wrap{width:180px;min-height:1%}"
         "#preview{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:6;"
         "overflow:hidden;%s}"
         "#preview p{all:revert;display:inline!important;font-size:inherit;font-weight:inherit;"
@@ -78,7 +79,7 @@ static void reentry(const char *outer, const char *constraint, float final_h, bo
 static void nested(void) {
     const char *html =
         "<style>html,body{margin:0;font:16px/20px sans-serif}"
-        "#outer{display:flex;width:180px}#wrap{width:180px;min-height:1px}"
+        "#outer{display:flex;width:180px}#wrap{width:180px;min-height:1%}"
         "#preview,#inner{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden}"
         "#preview{-webkit-line-clamp:3}#inner{-webkit-line-clamp:2}"
         "p{margin:0;padding:0}#following{height:10px}</style>"
@@ -112,7 +113,7 @@ static void independent_jobs(void) {
     char html[4096];
     size_t used = (size_t)snprintf(html, sizeof html,
         "<style>html,body{margin:0;font:16px/20px sans-serif}"
-        "#outer{display:flex;width:1440px}.wrap{width:180px;min-height:1px;flex:none}"
+        "#outer{display:flex;width:1440px}.wrap{width:180px;min-height:1%;flex:none}"
         ".preview{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;"
         "overflow:hidden}p{margin:0;padding:0}</style><div id=outer>");
     for (int i = 0; i < 8; i++) used += (size_t)snprintf(html + used, sizeof html - used,

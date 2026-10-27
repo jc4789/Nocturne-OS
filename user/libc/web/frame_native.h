@@ -118,7 +118,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     if(!sandbox_supported(f->pending_sandbox_flags) ||
        (f->pending_sandbox_flags && srcdoc && !f->navigation && !web_sandbox_document_allowed(f,"about:srcdoc",true))) {
         web_frame_retire(f);f->failed=true;f->detached=false;
-        log_text(s,1,"Sandboxed frame blocked: unsupported opaque/script-disabled/srcdoc policy");return;
+        log_text(s,1,"Sandboxed frame blocked: unsupported opaque/srcdoc policy");return;
     }
     if(!f->document || f->detached) {
         if(!web_frame_initial_create(f,&s->host)){

@@ -1,5 +1,6 @@
-/* Real web_live/frame transport lifecycle for the deliberately bounded
- * foreign-origin, allow-same-origin + allow-scripts sandbox implementation. */
+/* Real web_live/frame transport lifecycle for the deliberately bounded sandbox
+ * implementation: foreign-origin allow-same-origin + allow-scripts documents,
+ * and script-disabled allow-same-origin documents. */
 #include <nocturne.h>
 #include <web.h>
 #include <stdio.h>
@@ -103,7 +104,7 @@ int main(void){
     check("empty-policy-opaque-blocked",!sandbox_supported(sandbox_parse("",known,sizeof known)));
     flags=sandbox_parse("ALLOW-SAME-ORIGIN\tallow-scripts\nallow-scripts unknown-private-token",known,sizeof known);
     check("ascii-token-case-and-dedup",sandbox_supported(flags)&&!strcmp(known,"allow-same-origin allow-scripts"));
-    check("missing-scripts-blocked",!sandbox_supported(sandbox_parse("allow-same-origin",known,sizeof known)));
+    check("script-disabled-same-origin-supported",sandbox_supported(sandbox_parse("allow-same-origin",known,sizeof known)));
     check("missing-same-origin-blocked",!sandbox_supported(sandbox_parse("allow-scripts",known,sizeof known)));
     check("unactivated-top-grant-outside-subset",!sandbox_supported(sandbox_parse("allow-same-origin allow-scripts allow-top-navigation",known,sizeof known)));
     char overlong[4100];memset(overlong,' ',4097);strcpy(overlong+4097,"x");check("overlong-policy-fail-closed",!sandbox_supported(sandbox_parse(overlong,known,sizeof known)));
@@ -115,7 +116,7 @@ int main(void){
     check("initial-blank-scripts-disabled",safe&&safe->document&&(safe->document->sandbox_flags&SB_SCRIPTS)&&!safe->document->js);
     check("initial-blank-console-disabled",safe&&safe->document&&!web_console_eval(safe->document,"1",1));
     eval(top,"function ck(n,v){console.log((v?'OK ':'FAIL ')+n);}function denied(f){try{f();return false;}catch(e){return /SecurityError/.test(e.name+' '+e.message);}}const f=document.querySelector('#safe');ck('initial-contentdocument-not-exported',f.contentDocument===null);ck('initial-Function-not-exported',denied(()=>f.contentWindow.Function));ck('initial-eval-not-exported',denied(()=>f.contentWindow.eval));ck('initial-opener-null',f.contentWindow.opener===null);document.domain='root.test';ck('nosandbox-domain-same-host-preserved',document.domain==='root.test');");
-    check("opaque-profile-no-network",!pending("/opaque"));check("script-disabled-profile-no-network",!pending("/noscripts"));
+    check("opaque-profile-no-network",!pending("/opaque"));check("script-disabled-profile-requested",pending("/noscripts"));
     check("srcdoc-profile-fail-closed",frame("srcdoc")&&frame("srcdoc")->failed&&!frame("srcdoc")->document);
     check("authored-blank-profile-fail-closed",frame("blank")&&frame("blank")->failed&&!frame("blank")->document);
     check("plain-response-delivered",deliver("/plain",NULL,NULL,"<!doctype html><script>console.log('OK nosandbox-author-script');</script>"));
@@ -125,10 +126,14 @@ int main(void){
     check("same-origin-active-script-still-disabled",frame("same")&&frame("same")->document&&(frame("same")->document->sandbox_flags&SB_SCRIPTS));
     check("redirect-response-delivered",deliver("/redirect","https://root.test/redirected",NULL,"<script>console.log('FAIL redirect-author-ran');</script>"));
     check("same-origin-redirect-fail-closed",frame("redirect")&&frame("redirect")->failed&&(frame("redirect")->document->sandbox_flags&SB_SCRIPTS));
-    check("csp-response-delivered",deliver("/csp","https://foreign.test/csp","Content-Security-Policy: default-src 'self'; sandbox allow-scripts allow-same-origin\r\n","<script>console.log('FAIL csp-author-ran');</script>"));
-    check("csp-sandbox-fail-closed",frame("csp")&&frame("csp")->failed);
-    check("csp-comma-response-delivered",deliver("/cspcomma","https://foreign.test/cspcomma","Content-Security-Policy: default-src 'self', sandbox allow-scripts allow-same-origin\r\n","<script>console.log('FAIL cspcomma-author-ran');</script>"));
-    check("csp-comma-sandbox-fail-closed",frame("cspcomma")&&frame("cspcomma")->failed);
+    check("script-disabled-response-delivered",deliver("/noscripts",NULL,NULL,"<script>console.log('FAIL noscripts-author-ran');</script>"));
+    /* its Window realm stays for the same-origin embedder; its own script must not run (logged above) */
+    check("script-disabled-document-scripts-disabled",frame("noscripts")&&frame("noscripts")->document&&!frame("noscripts")->failed&&(frame("noscripts")->document->sandbox_flags&SB_SCRIPTS));
+    /* the response's CSP sandbox joins the frame's flags: it only restricts further */
+    check("csp-response-delivered",deliver("/csp","https://foreign.test/csp","Content-Security-Policy: default-src 'self'; sandbox allow-same-origin\r\n","<script>console.log('FAIL csp-author-ran');</script>"));
+    check("csp-sandbox-union-disables-scripts",frame("csp")&&frame("csp")->document&&!frame("csp")->failed&&(frame("csp")->document->sandbox_flags&SB_SCRIPTS));
+    check("csp-comma-response-delivered",deliver("/cspcomma","https://foreign.test/cspcomma","Content-Security-Policy: default-src 'self', sandbox\r\n","<script>console.log('FAIL cspcomma-author-ran');</script>"));
+    check("csp-comma-opaque-sandbox-fail-closed",frame("cspcomma")&&frame("cspcomma")->failed);
     check("nested-response-delivered",deliver("/nested",NULL,NULL,"<!doctype html><form id='form'><button>submit</button></form>"));
     check("ancestor-response-delivered",deliver("/ancestor",NULL,NULL,"<script>console.log('FAIL ancestor-author-ran');</script>"));
     check("own-fetch-response-delivered",deliver("/api",NULL,NULL,"ok"));

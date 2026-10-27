@@ -242,7 +242,7 @@ static const struct test tests[] = {
     {"canvascontextprobe", "debug-only-native-context", "tcc -IC:\\Tests -o .\\canvascontextprobetest C:\\Tests\\canvascontextprobetest.c && .\\canvascontextprobetest", 0,
      {"canvascontextprobe: 22 checks, 0 failed"}, "FAIL", 120, false, true},
     {"sandboxprofile", "generation-bound-native-policy", "tcc -IC:\\Tests -o .\\sandboxprofiletest C:\\Tests\\sandboxprofiletest.c && .\\sandboxprofiletest", 0,
-     {"sandboxprofiletest: 92 checks, 0 failed"}, "FAIL", 120, false, true},
+     {"sandboxprofiletest: 94 checks, 0 failed"}, "FAIL", 120, false, true},
     {"browserdeferred", "hover-fifo-boundaries", "tcc -IC:\\Tests -o .\\browserdeferredtest C:\\Tests\\browserdeferredtest.c && .\\browserdeferredtest", 0,
      {"browserdeferred: 27 checks, 0 failed"}, "FAIL", 120, false, true},
     {"canvasgradient", "native-linear-radial-rgba", "tcc -IC:\\Tests -o .\\canvasgradienttest C:\\Tests\\canvasgradienttest.c && .\\canvasgradienttest", 0,
@@ -504,8 +504,24 @@ static void drain(n_handle channel, struct capture *c) {
     }
 }
 
-/* The tests' current folder: <TEMP>\runtests, made by main. */
-static char work_folder[4096];
+/* <TEMP>\runtests, made by main, and the current folder of the test that runs: a new one in it,
+   removed after the test. A test's compiled program is tens of MiB, and hundreds of them left
+   behind fill C:. */
+static char runs_folder[4096], work_folder[4096];
+
+/* folder and everything in it */
+static void remove_tree(const char *path) {
+    struct n_entry *e = NULL;
+    n_result count = n_folder_entries(path, &e);
+    for (n_result i = 0; i < count; i++) {
+        char child[4096];
+        if (n_path_join(path, e[i].name, child, sizeof child) < 0) continue;
+        if (e[i].kind == N_KIND_FOLDER) remove_tree(child);
+        else n_entry_remove(child);
+    }
+    free(e);
+    n_entry_remove(path);
+}
 
 /* Runs "sh -c cmd" in work_folder with a closed stdin and stdout/stderr on one channel that is drained while it runs.
    Returns 1 when it ended (*status set), 0 when it overran timeout_ms and was stopped, -1 when it could not start. */
@@ -576,7 +592,14 @@ static void run(const struct test *t) {
     uint64_t t0 = uptime_ms();
     int timeout = (t->timeout_s ? t->timeout_s : 15) * 1000, st = 0;
     struct capture cap = {0};
+    remove_tree(work_folder); /* left by a run that was stopped */
+    if (n_folder_create(work_folder) < 0) {
+        result("FAIL", t, "cannot make its folder");
+        nfail++;
+        return;
+    }
     int r = run_shell(t->cmd, timeout, &cap, &st);
+    remove_tree(work_folder);
     char why[256];
     if (r < 0) {
         result("FAIL", t, "cannot start sh");
@@ -642,8 +665,9 @@ int main(int argc, char **argv) {
             only[nonly++] = argv[i];
         }
     }
-    n_result made = n_path_join(n_temp_folder(), "runtests", work_folder, sizeof work_folder);
-    if (made >= 0 && (made = n_folder_create(work_folder)) == -N_ERR_EXISTS) made = 0;
+    n_result made = n_path_join(n_temp_folder(), "runtests", runs_folder, sizeof runs_folder);
+    if (made >= 0 && (made = n_folder_create(runs_folder)) == -N_ERR_EXISTS) made = 0;
+    if (made >= 0) made = n_path_join(runs_folder, "test", work_folder, sizeof work_folder);
     if (made < 0) {
         printf("TESTS ERROR no folder to run the tests in: %s\n", n_result_text(made));
         free(only);

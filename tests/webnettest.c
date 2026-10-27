@@ -1268,7 +1268,10 @@ static void pacing_tests(void){
     }
     check(!webnet_busy(net)&&stream.bytes==1048576&&stream.headers==1&&stream.ends==1&&!stream.failed,
           "real streamed byte credit preserves every pattern byte through pause resume and END");
-    check(maximum>1,"one native pump drains multiple ready 4KiB stream frames without per-frame sleep");
+    /* 止めている間に先読みした枠は一つの塊にまとめて渡す（STREAM_READ_AHEAD）。
+       一回の汲み出しで渡す塊の数ではなく、4KiB の枠より少ない塊と汲み出しで終わることを見る */
+    check(stream.chunks*4096u<stream.bytes&&pumps*4096u<stream.bytes,
+          "native pumps drain ready 4KiB stream frames as gathered chunks without per-frame sleep");
     printf("network-pacing: bytes=%lu chunks=%u pumps=%u max-chunks-per-pump=%u drain-ms=%lu\n",
         (unsigned long)stream.bytes,stream.chunks,pumps,maximum,(unsigned long)(uptime_ms()-begin));
     webnet_cancel_generation(net,114);webnet_cancel_generation(net,115);
