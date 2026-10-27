@@ -88,6 +88,7 @@ struct js_script {
     JSValue evaluation;
     uint64_t request, stream_generation;
     struct js_compile *compile; /* a fetched classic script's bytecode, compiled elsewhere */
+    struct js_module *graph; /* a module script's root, held until the script is freed */
     struct js_script *next;
 };
 enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT, P_POLICY_REPORT, P_MODULE };
@@ -119,7 +120,17 @@ struct js_pending {
 struct js_module {
     char *url, *base, *source; size_t len; JSValue compiled, error;
     uint64_t request; size_t users; bool fetching, fetch_failed, linked, resolving;
+    /* What its source imports, requested before it is linked (HTML: fetch the
+       descendants of a module script); each holds a user. graph_settled: no
+       module it reaches is still fetching. */
+    struct js_module **children; uint32_t child_count;
+    int credentials; bool descendants, graph_settled; uint64_t visit;
     struct js_module *next;
+};
+/* An import() waiting for its module graph to be fetched. */
+struct js_import {
+    JSValue resolve, reject, attributes; char *basename, *specifier;
+    struct js_module *graph; struct js_import *next;
 };
 struct js_preload {
     node_t *node; char *href; struct js_module *module;
@@ -205,6 +216,9 @@ struct web_js_state {
     struct js_socket *sockets;
     bool socket_turn;
     struct js_module *modules;
+    struct js_import *imports;
+    uint64_t module_visit;
+    unsigned module_sync_logged;
     struct js_preload *preloads[256];
     bool preload_scan_valid;
     const char *module_entry_url;
@@ -5939,7 +5953,7 @@ static void set_import_meta(JSContext *ctx, JSValueConst module, const char *url
 static struct js_module *cache_module(struct web_js_state *s, const char *url, const char *source, size_t len, const char *base) {
     for (struct js_module *m = s->modules; m; m = m->next) if (!m->fetch_failed&&!strcmp(m->url, url)) return m;
     struct js_module *m = js_mallocz(s->ctx, sizeof *m); if (!m) return NULL;
-    m->compiled = m->error = JS_UNDEFINED;
+    m->compiled = m->error = JS_UNDEFINED; m->credentials = 1;
     m->url = js_strdup(s->ctx, url); m->base = js_strdup(s->ctx, base ? base : url); m->source = js_strndup(s->ctx, source ? source : "", len);
     if (!m->url || !m->base || !m->source) { js_free(s->ctx, m->url); js_free(s->ctx, m->base); js_free(s->ctx, m->source); js_free(s->ctx, m); return NULL; }
     m->len = len; m->next = s->modules; s->modules = m; return m;
@@ -5950,14 +5964,25 @@ static struct js_module *find_module(struct web_js_state *s,const char *url) {
     for(struct js_module *m=s->modules;m;m=m->next)if(!m->fetch_failed&&!strcmp(m->url,url))return m;
     return NULL;
 }
+/* Its children are not released: see release_module_user, or every record
+   of the realm is freed together. */
+static void module_free(struct web_js_state *s,struct js_module *m) {
+    JS_FreeValue(s->ctx,m->compiled);JS_FreeValue(s->ctx,m->error);js_free(s->ctx,m->children);
+    js_free(s->ctx,m->url);js_free(s->ctx,m->base);js_free(s->ctx,m->source);js_free(s->ctx,m);
+}
+/* A record is freed alone only when it failed and nothing uses it. A module
+   failed after it was received (a stopped or replaced stream) can have
+   children: it releases them once it is out of the list, so a cycle back to
+   it finds it gone. */
 static void release_module_user(struct web_js_state *s,struct js_module *m) {
     if(!m)return;
     if(m->users)m->users--;
     if(!m->fetch_failed||m->users)return;
     struct js_module **link=&s->modules;while(*link&&*link!=m)link=&(*link)->next;
     if(!*link)return;
-    *link=m->next;JS_FreeValue(s->ctx,m->compiled);JS_FreeValue(s->ctx,m->error);
-    js_free(s->ctx,m->url);js_free(s->ctx,m->base);js_free(s->ctx,m->source);js_free(s->ctx,m);
+    *link=m->next;
+    for(uint32_t i=0;i<m->child_count;i++)release_module_user(s,m->children[i]);
+    module_free(s,m);
 }
 static bool module_integrity(struct web_js_state *s,const char *metadata,const char *bytes,size_t length) {
     if(!metadata || !*metadata)return true;
@@ -6001,17 +6026,86 @@ static struct js_module *request_module(struct web_js_state *s,const char *url,i
     m=cache_module(s,url,"",0,url);if(!m)return NULL;
     struct js_pending *p=pending_new(s,P_MODULE,url);
     if(!p){m->fetch_failed=true;return m;}
-    p->module=m;m->users++;p->credentials=credentials;
+    p->module=m;m->users++;p->credentials=m->credentials=credentials;
     p->integrity=integrity&&*integrity?js_strdup(s->ctx,integrity):NULL;
     m->request=p->id;m->fetching=true;
     if(integrity&&*integrity&&!p->integrity)pending_error(p,"Module integrity metadata allocation failed");
     else send_request(s,p,WEB_RESOURCE_MODULE,"GET",NULL,NULL,0);
     return m;
 }
+/* Requests what a fetched module imports, with its own fetch options. A
+   specifier that does not resolve, or a source that does not parse, is
+   linking's error to report; a local data:/blob: module needs no fetch. */
+static void module_descendants(struct web_js_state *s,struct js_module *m) {
+    if(m->descendants || m->fetching || m->fetch_failed || !JS_IsUndefined(m->error))return;
+    if(JS_IsUndefined(m->compiled)){
+        JSValue compiled=compile_source(s,m->source?m->source:"",m->len,m->url,
+            JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_MODULE_PARSE_ONLY);
+        if(JS_IsException(compiled)){m->error=JS_GetException(s->ctx);return;}
+        set_import_meta(s->ctx,compiled,m->base);m->compiled=compiled;
+    }
+    m->descendants=true;
+    JSModuleDef *def=JS_VALUE_GET_PTR(m->compiled);
+    int count=JS_GetModuleRequestCount(def);
+    if(count<=0)return;
+    struct js_module **children=js_malloc(s->ctx,(size_t)count*sizeof *children);
+    if(!children){JS_FreeValue(s->ctx,JS_GetException(s->ctx));return;} /* linking loads them itself */
+    uint32_t n=0;
+    for(int i=0;i<count;i++){
+        JSAtom atom=JS_GetModuleRequestName(s->ctx,def,i);
+        const char *specifier=atom==JS_ATOM_NULL?NULL:JS_AtomToCString(s->ctx,atom);
+        JS_FreeAtom(s->ctx,atom);
+        char *url=specifier?normalize_module(s->ctx,m->url,specifier,s):NULL;
+        JS_FreeCString(s->ctx,specifier);
+        if(!url){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
+        struct js_module *child=strncasecmp(url,"data:",5)&&strncasecmp(url,"blob:",5)&&permitted_script_url(s,url)?
+            request_module(s,url,m->credentials,NULL):NULL;
+        js_free(s->ctx,url);
+        if(child){child->users++;children[n++]=child;}
+        else if(JS_HasException(s->ctx))JS_FreeValue(s->ctx,JS_GetException(s->ctx)); /* no memory: linking loads it */
+    }
+    m->children=children;m->child_count=n;
+}
+/* Walks the graph from root, requesting the descendants of every fetched
+   module, and says whether none of it is still fetching. A failed branch is
+   settled too: linking then reports it instead of fetching it again. */
+static bool module_graph_settled(struct web_js_state *s,struct js_module *root) {
+    if(!root || root->graph_settled)return true;
+    uint64_t visit=++s->module_visit;
+    struct js_module *local[64],**seen=local;size_t n=0,capacity=sizeof local/sizeof *local;
+    bool pending=false,complete=true,tasked=false;
+    seen[n++]=root;root->visit=visit;
+    for(size_t i=0;i<n;i++){
+        struct js_module *m=seen[i];
+        if(m->graph_settled)continue;
+        if(m->fetching){pending=true;continue;}
+        /* Parsing and resolving specifiers run in a task; walking does not. */
+        if(!m->descendants&&!tasked){begin_task(s);tasked=true;}
+        module_descendants(s,m);
+        for(uint32_t k=0;k<m->child_count;k++){
+            struct js_module *child=m->children[k];
+            if(child->visit==visit)continue;
+            if(n==capacity){
+                struct js_module **grown=js_malloc(s->ctx,2*capacity*sizeof *grown);
+                if(!grown){JS_FreeValue(s->ctx,JS_GetException(s->ctx));complete=false;break;}
+                memcpy(grown,seen,n*sizeof *seen);if(seen!=local)js_free(s->ctx,seen);
+                seen=grown;capacity*=2;
+            }
+            child->visit=visit;seen[n++]=child;
+        }
+        if(!complete)break;
+    }
+    /* Everything a settled walk reached is settled: later walks stop there. */
+    if(complete&&!pending)for(size_t i=0;i<n;i++)seen[i]->graph_settled=true;
+    if(seen!=local)js_free(s->ctx,seen);
+    if(tasked)end_task(s);
+    return !complete || !pending; /* without memory to walk, linking loads what is missing */
+}
 static bool module_script_source(struct web_js_state *s,struct js_script *script,struct js_module *m) {
-    if(!m || m->fetching)return false;
+    if(!m || m->fetching || !module_graph_settled(s,m))return false;
     script->ready=true;script->failed=m->fetch_failed;
     if(!script->failed){
+        js_free(s->ctx,script->source);
         script->source=js_strndup(s->ctx,m->source?m->source:"",m->len);script->len=m->len;
         js_free(s->ctx,script->base);script->base=js_strdup(s->ctx,m->base);
         if(!script->source||!script->base)script->failed=true;
@@ -6039,8 +6133,11 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
     if (!module_context_current(s,document_root)) { JS_ThrowTypeError(ctx,"Module browsing context is inactive"); return NULL; }
     if (interrupt(s->rt, s)) { JS_ThrowInternalError(ctx, "JavaScript execution was stopped"); return NULL; }
     if (!permitted_script_url(s, url)) { JS_ThrowReferenceError(ctx, "Module URL is not permitted"); return NULL; }
-    struct js_module *m = NULL;
-    m=find_module(s,url);
+    struct js_module *m=find_module(s,url);
+    if(!m){
+        /* A fetched graph holds its failed modules: report them, never fetch again. */
+        for(struct js_module *r=s->modules;r;r=r->next)if(r->users&&!strcmp(r->url,url)){m=r;break;}
+    }
     if(m && m->fetching){
         struct js_pending *pending=NULL;
         for(struct js_pending *p=s->pending;p;p=p->next)if(p->kind==P_MODULE&&p->module==m){pending=p;break;}
@@ -6070,6 +6167,14 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
     } else if (!m) {
         if (s->doc->frame_parent && !s->host.sync_request) {
             JS_ThrowTypeError(ctx, "Child module synchronous loading requires an origin-aware host"); return NULL;
+        }
+        /* Scripts and import() fetch their graphs first; what still arrives
+           here waits for the network on the main thread. */
+        if (s->host.debug_js && s->module_sync_logged < 16) {
+            char safe[640], message[700]; s->module_sync_logged++;
+            diagnostic_url(url, safe, sizeof safe);
+            snprintf(message, sizeof message, "Module loaded synchronously, outside a fetched graph: %s", safe);
+            log_text(s, 0, message);
         }
         /* URL storage is deliberately large. Keep responses and diagnostic
            copies off the native stack, especially in recursive module graphs. */
@@ -6145,6 +6250,62 @@ static void prepare_module_script(struct web_js_state *s, struct js_script *scri
     if (!m || !load_module(s->ctx, script->url, s)) { script->failed = true; exception(s); }
     end_task(s);
 }
+static void import_free(struct web_js_state *s,struct js_import *p) {
+    JS_FreeValue(s->ctx,p->resolve);JS_FreeValue(s->ctx,p->reject);JS_FreeValue(s->ctx,p->attributes);
+    js_free(s->ctx,p->basename);js_free(s->ctx,p->specifier);release_module_user(s,p->graph);js_free(s->ctx,p);
+}
+static void imports_free(struct web_js_state *s) {
+    while(s->imports){struct js_import *p=s->imports;s->imports=p->next;import_free(s,p);}
+}
+/* import() (HTML HostLoadImportedModule): its graph is fetched like a module
+   script's, without the main thread waiting for the network; a graph already
+   in the module map links and evaluates at once. */
+static int import_module(JSContext *ctx,const char *basename,const char *specifier,
+                         JSValueConst *resolving_funcs,JSValueConst attributes,void *opaque) {
+    (void)opaque;
+    struct web_js_state *s=state(ctx);
+    if(!module_context_current(s,s->doc->root)){JS_ThrowTypeError(ctx,"Module browsing context is inactive");return -1;}
+    char *url=normalize_module(ctx,basename,specifier,s);
+    if(!url)return -1;
+    struct js_module *m=strncasecmp(url,"data:",5)&&strncasecmp(url,"blob:",5)&&permitted_script_url(s,url)?
+        request_module(s,url,1,NULL):NULL;
+    js_free(ctx,url);
+    struct js_import *p=m&&!module_graph_settled(s,m)?js_mallocz(ctx,sizeof *p):NULL;
+    if(p){
+        p->basename=js_strdup(ctx,basename);p->specifier=js_strdup(ctx,specifier);
+        p->resolve=p->reject=p->attributes=JS_UNDEFINED;
+        if(!p->basename||!p->specifier){js_free(ctx,p->basename);js_free(ctx,p->specifier);js_free(ctx,p);p=NULL;}
+    }
+    if(!p){
+        if(JS_HasException(ctx))return -1;
+        /* Settled, local, refused or without memory: the loader decides now. */
+        JS_LoadModuleResolving(ctx,basename,specifier,resolving_funcs,attributes);return 0;
+    }
+    p->resolve=JS_DupValue(ctx,resolving_funcs[0]);p->reject=JS_DupValue(ctx,resolving_funcs[1]);
+    p->attributes=JS_DupValue(ctx,attributes);p->graph=m;m->users++;
+    struct js_import **link=&s->imports;while(*link)link=&(*link)->next;
+    *link=p;return 0;
+}
+/* The import() calls whose graphs are now fetched link and evaluate, each in
+   its own task and in the order they were made. */
+static bool module_imports_advance(struct web_js_state *s) {
+    bool ran=false;
+    for(struct js_import **link=&s->imports;*link;){
+        struct js_import *p=*link;
+        if(!s->disabled&&!module_graph_settled(s,p->graph)){link=&p->next;continue;}
+        *link=p->next;
+        if(!s->disabled){
+            ran=true;
+            begin_named_task(s,"module import",p->graph->request);
+            JSValueConst funcs[2]={p->resolve,p->reject};
+            JS_LoadModuleResolving(s->ctx,p->basename,p->specifier,funcs,p->attributes);
+            end_task(s);
+        }
+        import_free(s,p);
+        link=&s->imports; /* the evaluated module may have imported again */
+    }
+    return ran;
+}
 static bool script_type(node_t *n, bool *module) {
     const char *type = node_attr(n, "type"); *module = type && str_ieq(type, "module");
     if (*module) return true;
@@ -6174,7 +6335,7 @@ static bool prepared_script_text(struct web_js_state *s,node_t *node,sbuf *text)
     JS_FreeCString(s->ctx,bytes);JS_FreeValue(s->ctx,approved);return true;
 }
 static void script_free(struct web_js_state *s,struct js_script *script){
-    js_compile_drop(script->compile);
+    js_compile_drop(script->compile);release_module_user(s,script->graph);
     JS_FreeValue(s->ctx,script->evaluation);js_free(s->ctx,script->url);js_free(s->ctx,script->base);
     js_free(s->ctx,script->source);js_free(s->ctx,script);
 }
@@ -6262,7 +6423,7 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
                 const char *cors=node_attr(n,"crossorigin");
                 struct js_module *m=request_module(s,script->url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(n,"integrity"));
                 if(!m)script->ready=script->failed=true;
-                else {script->request=m->request;module_script_source(s,script,m);}
+                else {script->request=m->request;script->graph=m;m->users++;module_script_source(s,script,m);}
             }else{
                 struct js_pending *p = pending_new(s, P_SCRIPT, script->url);
                 if (!p) script->ready = script->failed = true;
@@ -6297,6 +6458,17 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
         discard_prepared_script(s,script);
         if(!stale){if (JS_HasException(s->ctx)) exception(s);script_event(s,n,true);}
         return NULL;
+    }
+    if (module && !script->external && script->source && !script->failed) {
+        /* An inline module script waits for its imports like a fetched one. */
+        struct js_module *m = cache_module(s, script->url, script->source, script->len, script->base);
+        if (!m) { script->failed = true; if (JS_HasException(s->ctx)) exception(s); }
+        else {
+            const char *cors = node_attr(n, "crossorigin");
+            m->credentials = cors && str_ieq(cors, "use-credentials") ? 2 : 1;
+            script->graph = m; m->users++; script->ready = false;
+            module_script_source(s, script, m);
+        }
     }
     prepare_module_script(s, script);
     if(s->stream_generation!=generation){discard_prepared_script(s,script);return NULL;}
@@ -6662,9 +6834,8 @@ bool web_js_encoding_restart(web_doc *document){
         *link=p->next;release_pending_request(s,p);pending_free(s,p);
     }
     while(s->scripts){struct js_script *p=s->scripts;s->scripts=p->next;script_free(s,p);}
-    while(s->modules){struct js_module *m=s->modules;s->modules=m->next;
-        JS_FreeValue(s->ctx,m->compiled);JS_FreeValue(s->ctx,m->error);js_free(s->ctx,m->url);js_free(s->ctx,m->base);js_free(s->ctx,m->source);js_free(s->ctx,m);
-    }
+    imports_free(s);
+    while(s->modules){struct js_module *m=s->modules;s->modules=m->next;module_free(s,m);}
     s->last_script=s->blocker=NULL;s->script_count=0;
     return true;
 }
@@ -6782,7 +6953,8 @@ static void diagnostic_resource(struct web_js_state *s, struct js_pending *p, co
     snprintf(message,sizeof message,"Resource #%lu %s: HTTP %d, %lu bytes, MIME %s, elapsed %lu ms, %s; %s",
         (unsigned long)p->id,kind,p->response.status,(unsigned long)p->response.body_len,mime,
         (unsigned long)(uptime_ms()-started),reason,url);
-    log_text(s,p->kind==P_SCRIPT?2:1,message);
+    /* A script that cannot run is an error, classic or module alike. */
+    log_text(s,p->kind==P_SCRIPT||p->kind==P_MODULE?2:1,message);
 }
 /* net_log: "headers" when a streamed response's status arrives, "done" when a
    request ends with the bytes it delivered. */
@@ -6970,10 +7142,11 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
     uint64_t now = uptime_ms();
-    bool ran_task = false;
+    bool ran_task = false, imports_waiting = false;
     while (*link) {
         struct js_pending *p = *link;
         if(document_resource_kind(p->kind) && p->stream_generation!=s->stream_generation){
+            imports_waiting|=p->kind==P_MODULE; /* its module failed with the old stream */
             *link=p->next;pending_free(s,p);continue;
         }
         if (!p->done && now >= p->deadline) { if (s->host.cancel) s->host.cancel(s->host.opaque, p->id); pending_error(p, "Resource request exceeded its deadline"); }
@@ -6993,36 +7166,29 @@ static bool process_pending(struct web_js_state *s) {
         else if(p->kind==P_MODULE){
             begin_named_task(s,"module preload preparation",p->id);
             module_received(s,p);
+            /* A script is ready once its whole graph is fetched; the graph
+               may have waited on this module or now asks for its imports. */
             for(struct js_script *script=s->scripts;script;script=script->next)
-                if(script->module&&!script->ready&&script->request==p->id&&script->stream_generation==s->stream_generation){
-                    module_script_source(s,script,p->module);prepare_module_script(s,script);
-                }
+                if(script->module&&!script->ready&&script->graph&&script->stream_generation==s->stream_generation&&
+                   module_script_source(s,script,script->graph))prepare_module_script(s,script);
             end_task(s);
+            imports_waiting=true;
         }
         else if (p->kind == P_SCRIPT) {
+            /* A classic script: module scripts and their MIME check belong to
+               the P_MODULE requests of the module map (module_received). */
             struct js_script *script = p->script;
             if (script) {
-                bool local = !strncasecmp(p->url, "file://", 7);
-                if (ok && script->module && !local && !javascript_mime(web_response_headers(&p->response))) {
-                    diagnostic_resource(s,p,"module response is not a JavaScript MIME type"); ok = false;
-                }
                 script->ready = true; script->failed = !ok;
                 if (ok) {
                     script->source = p->response.body; p->response.body = NULL; script->len = p->response.body_len;
                     if (web_response_url(&p->response)[0]) {
-                        /* Module-map identity stays the requested URL. The
-                           redirect URL is only the relative-import/meta base. */
-                        char *final;
-                        if (script->module) { begin_task(s); final = module_url(s, "moduleURL", web_response_url(&p->response), script->url); end_task(s); }
-                        else final = js_strdup(s->ctx, web_response_url(&p->response));
-                        if (final) {
-                            char **slot = script->module ? &script->base : &script->url;
-                            js_free(s->ctx, *slot); *slot = final;
-                        } else { script->failed = true; exception(s); }
+                        char *final = js_strdup(s->ctx, web_response_url(&p->response));
+                        if (final) { js_free(s->ctx, script->url); script->url = final; }
+                        else { script->failed = true; exception(s); }
                     }
-                    if (!script->failed && !script->module) compile_elsewhere(s, script);
+                    if (!script->failed) compile_elsewhere(s, script);
                 }
-                prepare_module_script(s, script);
             }
         } else if (p->kind == P_WORKER && !s->disabled) {
             if (!strncasecmp(p->url,"blob:",5) && !p->response.body && !p->response.error[0]) {
@@ -7107,6 +7273,7 @@ static bool process_pending(struct web_js_state *s) {
         }
         pending_free(s, p);
     }
+    if(imports_waiting&&module_imports_advance(s))ran_task=true;
     return ran_task;
 }
 
@@ -8379,6 +8546,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_SetMemoryLimit(s->rt, s->heap_limit); JS_SetMaxStackSize(s->rt, JS_STACK_LIMIT);
         JS_SetInterruptHandler(s->rt, interrupt, s); JS_SetCanBlock(s->rt, false);
         JS_SetModuleLoaderFunc(s->rt, normalize_module, load_module, s);
+        JS_SetModuleImportFunc(s->rt, import_module);
         JS_SetHostPromiseRejectionTracker(s->rt, promise_rejection, s);
         JS_SetHostJobFilter(s->rt, browser_job_allowed, NULL);
         web_atomics_runtime_init(s->rt);
@@ -8539,7 +8707,8 @@ void web_js_free(web_doc *d) {
         while (s->pending) { struct js_pending *p = s->pending; s->pending = p->next; release_pending_request(s, p); pending_free(s, p); }
         while (s->scripts) { struct js_script *p = s->scripts; s->scripts = p->next; script_free(s, p); }
         free_modulepreloads(s);
-        while (s->modules) { struct js_module *m = s->modules; s->modules = m->next; JS_FreeValue(s->ctx, m->compiled); JS_FreeValue(s->ctx, m->error); js_free(s->ctx, m->url); js_free(s->ctx, m->base); js_free(s->ctx, m->source); js_free(s->ctx, m); }
+        imports_free(s);
+        while (s->modules) { struct js_module *m = s->modules; s->modules = m->next; module_free(s, m); }
         while(s->rejections){struct js_rejection *p=s->rejections;s->rejections=p->next;
             JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
         s->last_rejection=NULL;

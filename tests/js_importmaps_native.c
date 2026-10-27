@@ -23,19 +23,31 @@ static const struct asset map_assets[] = {
     {"/map/mime.mjs", "export const value='must not run';", 0},
     {"/map/cors.mjs", "export const value='must not run';", 0},
 };
-static bool map_sync_load(void *opaque, const char *url, int kind, struct web_response *response) {
+/* One response for a map asset, whichever host path fetched it: a module graph
+   arrives through request(), a load outside a fetched graph through sync_load. */
+static bool map_response(const char *url, struct web_response *response) {
     const struct asset *asset = NULL;
     const char *path = strstr(url, "://"); path = path ? strchr(path + 3, '/') : url;
     for (size_t i = 0; path && i < sizeof map_assets / sizeof *map_assets; i++)
         if (!strcmp(path, map_assets[i].path)) { asset = &map_assets[i]; break; }
-    if (!asset) return sync_load(opaque, url, kind, response);
-    struct fixture *f = opaque; f->sync_loads++;
-    if (!f->doc || !web_script_running(f->doc) || kind != WEB_RESOURCE_MODULE) f->outside_running++;
+    if (!asset) return false;
     memset(response, 0, sizeof *response); response->status = 200;
     snprintf(response->url, sizeof response->url, "%s", !strcmp(path, "/redirect/start.mjs") ? "http://fixture.test/redirect/final/main.mjs" : url);
     snprintf(response->headers, sizeof response->headers, "Content-Type: %s\r\n", !strcmp(path, "/map/mime.mjs") ? "text/plain" : "text/javascript");
     if (!strcmp(path, "/map/cors.mjs")) snprintf(response->error, sizeof response->error, "Fixture host refused module CORS");
     response->body = strdup(asset->body); response->body_len = strlen(response->body ? response->body : "");
+    return true;
+}
+static void map_respond(const struct queued *q, struct web_response *r) {
+    struct web_response mapped;
+    if (!map_response(q->url, &mapped)) return;
+    web_response_free(r); *r = mapped;
+}
+static bool map_sync_load(void *opaque, const char *url, int kind, struct web_response *response) {
+    struct fixture *f = opaque;
+    if (!map_response(url, response)) return sync_load(opaque, url, kind, response);
+    f->sync_loads++;
+    if (!f->doc || !web_script_running(f->doc) || kind != WEB_RESOURCE_MODULE) f->outside_running++;
     return response->body != NULL;
 }
 static bool map_request(void *opaque, const struct web_request *r) {
@@ -48,7 +60,7 @@ static bool map_request(void *opaque, const struct web_request *r) {
     return true;
 }
 static bool map_open(const char *html, bool expected_errors) {
-    memset(&fixture, 0, sizeof fixture); fixture.expected_errors = expected_errors;
+    memset(&fixture, 0, sizeof fixture); fixture.expected_errors = expected_errors; fixture.respond = map_respond;
     struct web_host host = {.opaque=&fixture, .request=map_request, .cancel=cancel, .sync_load=map_sync_load, .console=receive_log};
     fixture.doc = web_live(html, strlen(html), BASE, "utf-8", &host);
     test_check("import-map-document", fixture.doc != NULL); return fixture.doc != NULL;
@@ -68,7 +80,9 @@ static void regression(const char *file) {
     test_check("import-map-case-allocation", text != NULL); if (!text) { fclose(fp); return; }
     size_t read = fread(text, 1, (size_t)len, fp); fclose(fp); text[read] = 0; strcat(text, tail);
     char *page = script_page(text); free(text); test_check("import-map-page-allocation", page != NULL);
-    if (page) source_case(page, "import-map-cases-done", 0); free(page);
+    /* The refused /map/mime.mjs and /map/cors.mjs are reported in the console,
+       like any module that cannot run, besides rejecting their import(). */
+    if (page) source_case(page, "import-map-cases-done", 2); free(page);
 }
 int main(int argc, char **argv) {
     regression(argc > 1 ? argv[1] : "C:\\Tests\\js_importmaps_cases.js");
@@ -111,7 +125,9 @@ int main(int argc, char **argv) {
         "<script type='module'>import {value} from 'snapshot';import {value as relative} from './value.mjs';"
         "check('map-base-captured',value==='snapshot'&&relative==='snapshot');check('inline-meta-base',import.meta.url==='http://fixture.test/map/snapshot/');mark('snapshot-done');</script>"
         "<script>document.querySelector('base').href='/other/';</script></head><body></body>", "snapshot-done", 0);
-    source_case(START "<script type='importmap'>{\"imports\":{\"./main.mjs\":\"./missing.mjs\"}}</script>"
+    /* The shared main.mjs ends by checking that its top-level await resumed after DOMContentLoaded. */
+    source_case(START "<script>document.addEventListener('DOMContentLoaded',()=>{globalThis.domContentObserved=true;});</script>"
+        "<script type='importmap'>{\"imports\":{\"./main.mjs\":\"./missing.mjs\"}}</script>"
         "<script type='module' src='main.mjs'></script></head><body><div id=future></div></body>", "module-top-level-await", 0);
     source_case(START "<script type='importmap'>{\"imports\":{\"redirect\":\"/redirect/start.mjs\"}}</script><script>"
         "Promise.all([import('redirect'),import('/redirect/start.mjs')]).then(([a,b])=>{check('redirect-module-identity',a===b);"

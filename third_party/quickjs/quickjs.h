@@ -1023,6 +1023,21 @@ void JS_SetModuleLoaderFunc2(JSRuntime *rt,
 JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
 JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
 JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
+/* Nocturne: the specifiers a parsed module requests, in source order, so a
+   host can fetch the module graph before it resolves it. The atom is the
+   caller's to free. */
+int JS_GetModuleRequestCount(JSModuleDef *m);
+JSAtom JS_GetModuleRequestName(JSContext *ctx, JSModuleDef *m, int index);
+/* Nocturne: import() hands its module to the host, which fetches the graph
+   and later finishes the import with JS_LoadModuleResolving; the host keeps
+   its own references to resolving_funcs and attributes. A negative return
+   rejects the import with the pending exception. Without this hook, import()
+   loads synchronously through the module loader. */
+typedef int JSModuleImportFunc(JSContext *ctx, const char *basename, const char *specifier,
+                               JSValueConst *resolving_funcs, JSValueConst attributes, void *opaque);
+void JS_SetModuleImportFunc(JSRuntime *rt, JSModuleImportFunc *module_import);
+void JS_LoadModuleResolving(JSContext *ctx, const char *basename, const char *specifier,
+                            JSValueConst *resolving_funcs, JSValueConst attributes);
 
 /* JS Job support */
 

@@ -390,6 +390,7 @@ struct JSRuntime {
         JSModuleLoaderFunc2 *module_loader_func2;
     } u;
     JSModuleCheckSupportedImportAttributes *module_check_attrs;
+    JSModuleImportFunc *module_import; /* Nocturne: asynchronous import() */
     void *module_loader_opaque;
     /* timestamp for internal use in module evaluation */
     int64_t module_async_evaluation_next_timestamp;
@@ -574,6 +575,7 @@ struct JSContext {
     int interrupt_counter;
 
     struct list_head loaded_modules; /* list of JSModuleDef.link */
+    int module_resolve_depth; /* Nocturne: js_resolve_module() calls in progress */
 
     /* if NULL, RegExp compilation is not supported */
     JSValue (*compile_regexp)(JSContext *ctx, JSValueConst pattern,
@@ -30573,6 +30575,23 @@ void JS_SetModuleLoaderFunc2(JSRuntime *rt,
     rt->module_loader_opaque = opaque;
 }
 
+void JS_SetModuleImportFunc(JSRuntime *rt, JSModuleImportFunc *module_import)
+{
+    rt->module_import = module_import;
+}
+
+int JS_GetModuleRequestCount(JSModuleDef *m)
+{
+    return m->req_module_entries_count;
+}
+
+JSAtom JS_GetModuleRequestName(JSContext *ctx, JSModuleDef *m, int index)
+{
+    if (index < 0 || index >= m->req_module_entries_count)
+        return JS_ATOM_NULL;
+    return JS_DupAtom(ctx, m->req_module_entries[index].module_name);
+}
+
 /* default module filename normalizer */
 static char *js_default_module_normalize_name(JSContext *ctx,
                                               const char *base_name,
@@ -31169,9 +31188,41 @@ JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
 }
 
 /* Load all the required modules for module 'm' */
+/* Nocturne: a module parsed apart from its resolution (MODULE_PARSE_ONLY)
+   stays in loaded_modules when a resolution through it fails, and the next
+   import finds it by name without resolving it again. Mark every module the
+   failure left without a resolved request unresolved, with no requests found,
+   so the next import resolves it anew instead of linking a missing module. */
+static void js_unresolve_broken_modules(JSContext *ctx)
+{
+    struct list_head *el;
+    BOOL changed;
+    int i;
+
+    do {
+        changed = FALSE;
+        list_for_each(el, &ctx->loaded_modules) {
+            JSModuleDef *m = list_entry(el, JSModuleDef, link);
+            if (!m->resolved)
+                continue;
+            for(i = 0; i < m->req_module_entries_count; i++) {
+                JSModuleDef *m1 = m->req_module_entries[i].module;
+                if (!m1 || !m1->resolved)
+                    break;
+            }
+            if (i == m->req_module_entries_count)
+                continue;
+            m->resolved = FALSE;
+            for(i = 0; i < m->req_module_entries_count; i++)
+                m->req_module_entries[i].module = NULL;
+            changed = TRUE;
+        }
+    } while (changed);
+}
+
 static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
 {
-    int i;
+    int i, ret = 0;
     JSModuleDef *m1;
 
     if (m->resolved)
@@ -31183,21 +31234,30 @@ static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
     }
 #endif
     m->resolved = TRUE;
+    ctx->module_resolve_depth++;
     /* resolve each requested module */
     for(i = 0; i < m->req_module_entries_count; i++) {
         JSReqModuleEntry *rme = &m->req_module_entries[i];
         m1 = js_host_resolve_imported_module_atom(ctx, m->module_name,
                                                   rme->module_name,
                                                   rme->attributes);
-        if (!m1)
-            return -1;
+        if (!m1) {
+            ret = -1;
+            break;
+        }
         rme->module = m1;
         /* already done in js_host_resolve_imported_module() except if
            the module was loaded with JS_EvalBinary() */
-        if (js_resolve_module(ctx, m1) < 0)
-            return -1;
+        if (js_resolve_module(ctx, m1) < 0) {
+            ret = -1;
+            break;
+        }
     }
-    return 0;
+    /* Only once the outermost resolution has failed: before, the modules
+       still being resolved have requests not looked at yet. */
+    if (--ctx->module_resolve_depth == 0 && ret < 0)
+        js_unresolve_broken_modules(ctx);
+    return ret;
 }
 
 /* Create the <eval> function associated with the module */
@@ -31702,6 +31762,12 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     JS_FreeValue(ctx, evaluate_promise);
 }
 
+void JS_LoadModuleResolving(JSContext *ctx, const char *basename, const char *specifier,
+                            JSValueConst *resolving_funcs, JSValueConst attributes)
+{
+    JS_LoadModuleInternal(ctx, basename, specifier, resolving_funcs, attributes);
+}
+
 /* Return a promise or an exception in case of memory error. Used by
    os.Worker() */
 JSValue JS_LoadModule(JSContext *ctx, const char *basename,
@@ -31741,6 +31807,15 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     if (!filename)
         goto exception;
 
+    if (ctx->rt->module_import) {
+        int r = ctx->rt->module_import(ctx, basename, filename, resolving_funcs,
+                                       attributes, ctx->rt->module_loader_opaque);
+        JS_FreeCString(ctx, filename);
+        if (r < 0)
+            goto exception;
+        JS_FreeCString(ctx, basename);
+        return JS_UNDEFINED;
+    }
     JS_LoadModuleInternal(ctx, basename, filename,
                           resolving_funcs, attributes);
     JS_FreeCString(ctx, filename);

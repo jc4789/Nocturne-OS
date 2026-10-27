@@ -38,6 +38,7 @@ static const struct asset assets[] = {
     {"/dir/preload-child.mjs", "export const value=42;", 1000},
     {"/dir/mime.mjs", "import {value} from './mimedep.mjs';check('mime-import',value===42);mark('mime-module');", 0},
     {"/dir/mimedep.mjs", "export const value=42;", 0},
+    {"/dir/broken-parent.mjs", "import {value} from './missing-dependency.mjs';export {value};", 0},
     {"/dir/order-one.js", "globalThis.dynamicOrder.push(1);", 15},
     {"/dir/order-two.js", "globalThis.dynamicOrder.push(2);", 0},
     {"/dir/api/json", "{\"ok\":true,\"value\":42}", 0},
@@ -73,6 +74,9 @@ struct fixture {
     bool expected_errors, retirement_errors;
     int retirement_interrupts, retirement_unexpected;
     const char *module_mime_headers;
+    /* A supplemental suite serving its own resources replaces the response
+       deliver() built, on the same asynchronous path as every other request. */
+    void (*respond)(const struct queued *q, struct web_response *r);
     struct { char *url; void *data; size_t len; uint64_t entry; bool manual; } history[16];
     int history_pos, history_length, history_delta;
     uint64_t history_serial;
@@ -341,6 +345,7 @@ static void deliver(struct fixture *f) {
             snprintf(r.headers,sizeof r.headers,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Fixture: yes\r\nX-Body-Present: %d\r\nX-Body-Bytes: %lu\r\n\r\n",
                 q.body_present?1:0,(unsigned long)q.body_len);
         }
+        if (f->respond) f->respond(&q, &r);
         if (q.no_cors) {
             /* This in-memory transport serves same-origin responses. Like the
                production HTTP host, affirm filtering through the private
@@ -744,7 +749,7 @@ static void test_script_mime(void) {
             fixture.module_mime_headers=headers;
             test_check("mime-module-accepted",pump("mime-module",4000));
             require_marks((const char *const[]){"mime-classic","mime-import","mime-module"},3);
-            test_check("mime-import-loader",fixture.sync_loads==1);
+            test_check("mime-import-fetched-with-graph",fixture.sync_loads==0); /* not by the synchronous loader */
             test_check("mime-no-errors",fixture.errors==0);
             close_case();
         }
@@ -782,6 +787,21 @@ static void test_script_mime(void) {
             close_case();
         }
     }
+}
+/* A graph whose dependency failed fails again for every later importer:
+   two scripts and two import() calls link the same parsed parent. */
+static void test_failed_module_graph(void) {
+    if (!open_case(START "<script type=module onerror=\"mark('failed-graph-first-script')\">import './broken-parent.mjs';</script>"
+                   "<script type=module onerror=\"mark('failed-graph-second-script')\">import './broken-parent.mjs';</script>"
+                   "<script>addEventListener('load',()=>import('./broken-parent.mjs').then(()=>check('failed-graph-import',false),"
+                   "first=>import('./broken-parent.mjs').then(()=>check('failed-graph-import',false),"
+                   "again=>{check('failed-graph-import',first instanceof Error&&again instanceof Error);mark('failed-graph-done');})));</script>"
+                   "</head><body>native</body>", true)) return;
+    test_check("failed-graph-imports-rejected", pump("failed-graph-done", 6000));
+    require_marks((const char *const[]){"failed-graph-first-script","failed-graph-second-script"},2);
+    test_check("failed-graph-checks", fixture.js_failures == 0);
+    test_check("failed-graph-fetched-with-graph", fixture.sync_loads == 0);
+    close_case();
 }
 
 static void test_dom_and_scripts(void) {
@@ -859,7 +879,7 @@ static void test_dom_and_scripts(void) {
     int y = web_anchor_y(fixture.doc, "target"), sentinel = web_anchor_y(fixture.doc, "sentinel");
     test_check("native-layout-after-js", y >= 0 && sentinel - y == 37);
     test_check("host-completions-copy-only", fixture.completions >= 7 && fixture.outside_running == 0);
-    test_check("sync-module-loader-used", fixture.sync_loads >= 3);
+    test_check("module-graphs-fetched-without-sync-loader", fixture.sync_loads == 0);
     test_check("dom-no-exceptions", fixture.errors == 0);
     close_case();
     const char *late=START "</head><body><p id=previous>old</p><script>"
@@ -1400,7 +1420,7 @@ static void test_modulepreload(void) {
         test_check("preload-native-graph-completed",pump("preload-graph-done",6000));
         test_check("preload-graph-no-errors",fixture.errors==0&&fixture.js_failures==0);
         test_check("preload-graph-no-duplicate-fetch",fixture.preload_requests==2&&fixture.sync_loads==0);
-        test_check("preload-graph-needed-request-joined",fixture.preload_joins==1);
+        test_check("preload-graph-reused-without-native-join",fixture.preload_joins==0);
         test_check("preload-join-no-author-callback",fixture.outside_running==0);
         close_case();
     }
@@ -1570,6 +1590,7 @@ int main(int argc, char **argv) {
     RUN("xml-serialization", test_xml_serialization);
     RUN("dom", test_dom_and_scripts);
     RUN("mime", test_script_mime);
+    RUN("failed-module-graph", test_failed_module_graph);
     RUN("events", test_events_and_forms);
     RUN("selection-native", test_native_selection);
     RUN("timers", test_timers_and_promises);

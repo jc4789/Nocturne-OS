@@ -32,6 +32,33 @@ CSSOM `PutForwards=cssText` を実装するために利用した。
 後の依存解決エラー、URL／redirect base、文書破棄時の参照解放はブラウザー側が扱う。
 関連する限定回帰は `tests/jstest.c` の `modulepreload` 条件群。
 
+## モジュールの依存の一覧と非同期の import()
+
+上流の module loader は同期の関数で、`import()` も依存の解決もその場で取得を
+待つ。ブラウザーでは主スレッドがネットワークを一つずつ待ち、依存の多い頁の
+読み込みが直列になっていた。HTML の fetch the descendants of a module script
+のとおり、ブラウザーが解決の前にグラフを並べて取得できるよう、三つを足した。
+
+- `JS_GetModuleRequestCount`・`JS_GetModuleRequestName`：構文解析しただけの
+  module が求める指定子を、元の順で返す（atom は呼ぶ側が解放する）。
+- `JS_SetModuleImportFunc`：`import()` の job が module を host へ渡す。host は
+  resolving functions を自分で保持し、グラフがそろってから
+  `JS_LoadModuleResolving`（上流の `JS_LoadModuleInternal` と同じ）で終える。
+  hook が無ければ上流どおり同期で読む。
+
+評価・循環・エラーの扱いは上流のまま変えない。解決の失敗の後始末だけを足した。
+
+構文解析しただけの module は、作った時に `loaded_modules` に名前で載る。上流の
+`js_resolve_module` は依存を探す前に `resolved` を立て、失敗しても戻さない。
+上流では依存は compile の中で解決され、失敗した module は compile の失敗で消える
+ので困らないが、構文解析と解決を分けると、失敗の道の上の module が「解決済み、
+依存は NULL」のまま残り、次の import が名前で見つけて NULL を link して落ちる。
+一番外の `js_resolve_module` が失敗したときに、解決済みの印を持つのに依存が NULL か
+未解決の module を（それに届くものも）未解決へ戻し、依存の参照を消す
+（`js_unresolve_broken_modules`）。外の解決が進んでいる間は、まだ見ていない依存が
+NULL なので戻さない。戻した module は上流の `js_free_modules` が一覧から外し、
+次の import は host の loader から同じ module を受け取って解決し直す。
+
 ## RegExp の旧式静的キャプチャー
 
 実 Baidu の公開 ESL loader が `extReg.test(source)` の直後に
