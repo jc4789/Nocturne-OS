@@ -131,7 +131,8 @@ static inline int store_layout_has(const struct store_layout *l, uint64_t block)
    items growing down from the end of the block. An item is its key length and value length
    (uint16_t each), the key, then the value. A branch's values are struct store_child: the child
    holds the keys from its item's key up to the next item's (the first item's child, every key
-   below the second's). */
+   below the second's). A branch's first key bounds nothing and is not in key order with the
+   others: it can be above keys of its child and above the second key. */
 struct store_node {
     struct store_head head;
     uint16_t level; /* 0: a leaf */

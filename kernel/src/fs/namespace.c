@@ -345,6 +345,9 @@ int ns_extent(struct volume *v, uint64_t doc, uint64_t index, struct ns_extent *
     if (r < 0 && r != -N_ERR_NOT_FOUND) return r;
     uint64_t end = UINT64_MAX;
     if (r >= 0) end = be64(it.key + 9);
+    /* an extent at index that the search for its last one did not find: the catalog contradicts
+       itself, and a hole of no blocks would have its reader go round for ever */
+    if (end <= index) return -N_ERR_IO;
     *out = (struct ns_extent){.index = index, .count = end - index};
     return 0;
 }

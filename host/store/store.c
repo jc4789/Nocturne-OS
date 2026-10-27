@@ -21,6 +21,8 @@
                                              every content block against its check
      store test <MiB> [seed] [steps]         random changes, crashes, cut-short commits and damaged
                                              superblocks against a model of what the volume holds
+     store tree-test <seed> [steps]          the catalog alone, grown to many leaves and branches,
+                                             against a model of its keys
 
    <image> is a disk with a GPT (the volume is its Nocturne partition) or a bare volume: an image
    file, or on Windows a disk itself, \\.\PhysicalDriveN (as an administrator), such as the USB
@@ -1375,6 +1377,100 @@ static int test_run(uint64_t mib, uint64_t seed, long steps) {
     return 0;
 }
 
+/* ---- the catalog's test: its tree alone against a model of its keys ---- */
+
+/* A tree of many leaves and branches, shaped by turns of growth, of removal mostly in its low keys
+   (first children leave their branches) and of growth again (keys below a branch's first key):
+   random puts of values of many sizes, deletes and commits. Every so often the walk checks the
+   order of every node and every key is looked up. The volume test keeps its tree to a few
+   leaves. */
+static int walk_count(void *ctx, const struct item *it) {
+    (void)it;
+    ++*(uint64_t *)ctx;
+    return 0;
+}
+
+static void tree_key(uint8_t *key, uint32_t n) {
+    memset(key, 0, 17);
+    key[8] = STORE_KEY_EXTENT;
+    for (int i = 0; i < 4; i++) key[13 + i] = (uint8_t)(n >> (24 - 8 * i));
+}
+
+static int tree_test(uint64_t seed, long steps) {
+    enum { KEYS = 20000, ROUND = 20000 };
+    random_state = seed * 0x9e3779b97f4a7c15ULL + 1;
+    struct memory mem = {.data = calloc(1, 512u << 20), .fail_after = -1};
+    struct store_device dev = {.blocks = (512u << 20) / STORE_BLOCK, .read = memory_read, .write = memory_write, .priv = &mem};
+    uint16_t *size = calloc(KEYS, sizeof *size); /* each key's value length; 0: not there */
+    uint8_t id[16], key[17], value[STORE_VALUE_MAX], got[STORE_VALUE_MAX];
+    random_bytes(id, sizeof id);
+    struct volume *v;
+    if (!mem.data || !size || volume_format(&dev, "tree", id, &v) < 0) {
+        fprintf(stderr, "store: the tree test cannot start\n");
+        return 1;
+    }
+    for (long step = 0; step < steps; step++) {
+        long turn = step / ROUND % 3;
+        uint32_t n = (uint32_t)below(turn == 1 && below(4) ? KEYS / 4 : KEYS);
+        bool remove = below(10) < (turn == 1 ? 8u : 2u);
+        tree_key(key, n);
+        int r;
+        if (remove) {
+            r = catalog_delete(v, key, sizeof key);
+            if ((r >= 0) != (size[n] != 0)) {
+                fprintf(stderr, "store: tree test (seed %llu, step %ld): deleting key %u gives %s\n",
+                        (unsigned long long)seed, step, n, error_name(r));
+                return 1;
+            }
+            size[n] = 0;
+        } else {
+            uint16_t len = (uint16_t)(1 + below(STORE_VALUE_MAX / 2));
+            for (uint16_t i = 0; i < len; i++) value[i] = (uint8_t)(n + i);
+            if ((r = catalog_put(v, key, sizeof key, value, len)) < 0) {
+                fprintf(stderr, "store: tree test (seed %llu, step %ld): putting key %u gives %s\n",
+                        (unsigned long long)seed, step, n, error_name(r));
+                return 1;
+            }
+            size[n] = len;
+        }
+        if (below(500) == 0 && volume_commit(v) < 0) {
+            fprintf(stderr, "store: tree test (seed %llu, step %ld): the commit fails\n", (unsigned long long)seed, step);
+            return 1;
+        }
+        if (step % 1000 != 999 && step + 1 != steps) continue;
+        uint64_t items = 0, want = 0;
+        const struct catalog_visit visit = {.item = walk_count};
+        if ((r = catalog_walk(v, &visit, &items)) < 0) {
+            fprintf(stderr, "store: tree test (seed %llu, step %ld): the walk gives %s\n", (unsigned long long)seed,
+                    step, error_name(r));
+            return 1;
+        }
+        for (uint32_t k = 0; k < KEYS; k++) {
+            if (!size[k]) continue;
+            want++;
+            tree_key(key, k);
+            r = catalog_get(v, key, sizeof key, got, sizeof got);
+            bool same = r == size[k];
+            for (int i = 0; same && i < r; i++) same = got[i] == (uint8_t)(k + i);
+            if (!same) {
+                fprintf(stderr, "store: tree test (seed %llu, step %ld): key %u is %s\n", (unsigned long long)seed,
+                        step, k, r < 0 ? "not found" : "wrong");
+                return 1;
+            }
+        }
+        if (items != want) {
+            fprintf(stderr, "store: tree test (seed %llu, step %ld): the walk meets %llu keys of %llu\n",
+                    (unsigned long long)seed, step, (unsigned long long)items, (unsigned long long)want);
+            return 1;
+        }
+    }
+    printf("tree test passed (seed %llu, %ld steps)\n", (unsigned long long)seed, steps);
+    volume_free(v);
+    free(size);
+    free(mem.data);
+    return 0;
+}
+
 /* ---- commands ---- */
 
 static int usage(void) {
@@ -1388,7 +1484,8 @@ static int usage(void) {
                     "       store list <image> <C:\\path>\n"
                     "       store get <image> <C:\\path> <host file>\n"
                     "       store check <image>\n"
-                    "       store test <MiB> [seed] [steps]\n");
+                    "       store test <MiB> [seed] [steps]\n"
+                    "       store tree-test <seed> [steps]\n");
     return 2;
 }
 
@@ -1457,6 +1554,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "test"))
         return test_run(strtoull(argv[2], NULL, 0), argc > 3 ? strtoull(argv[3], NULL, 0) : 1,
                         argc > 4 ? strtol(argv[4], NULL, 0) : 20000);
+    if (!strcmp(cmd, "tree-test")) return tree_test(strtoull(argv[2], NULL, 0), argc > 3 ? strtol(argv[3], NULL, 0) : 100000);
     if (!strcmp(cmd, "disk"))
         return argc == 5 ? disk_make(argv[2], strtoull(argv[3], NULL, 0), strtoull(argv[4], NULL, 0)) : usage();
     if (!strcmp(cmd, "esp")) return argc == 3 ? esp_show(argv[2]) : usage();

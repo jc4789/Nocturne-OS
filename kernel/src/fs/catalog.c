@@ -39,11 +39,19 @@ static unsigned search(struct store_node *n, const uint8_t *key, size_t klen, bo
     return lo;
 }
 
-/* the child of a branch whose keys hold key */
+/* the child of a branch whose keys hold key: the last item from the second on whose key is not above
+   key, else the first. The first item's key bounds nothing (common/store_format.h): when its child
+   leaves, the next one's key takes its place, and keys below it then go into that child, so it can
+   be above keys of its own child and above the second item's key once that child splits. */
 static unsigned child_index(struct store_node *n, const uint8_t *key, size_t klen) {
-    bool exact;
-    unsigned i = search(n, key, klen, &exact);
-    return exact ? i : i ? i - 1 : 0;
+    unsigned lo = 1, hi = n->count;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) / 2;
+        uint8_t *it = item(n, mid);
+        if (compare(key_of(it), klen_of(it), key, klen) <= 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo - 1;
 }
 
 static struct store_child child_of(struct store_node *n, unsigned i) {
@@ -552,9 +560,11 @@ static int walk(struct volume *v, uint64_t address, uint64_t generation, int lev
     if (r >= 0 && visit->node && !(address & TEMP_ADDRESS)) r = visit->node(ctx, address, n->level);
     for (unsigned i = 0; i < n->count && r >= 0; i++) {
         uint8_t *it = item(n, i);
-        if ((i && compare(key_of(item(n, i - 1)), klen_of(item(n, i - 1)), key_of(it), klen_of(it)) >= 0) ||
-            ((i || !n->level) && lo && compare(key_of(it), klen_of(it), lo, lolen) < 0) ||
-            (hi && compare(key_of(it), klen_of(it), hi, hilen) >= 0)) {
+        /* a branch's first key bounds nothing: it is not checked, nor its second against it */
+        unsigned first = n->level ? 1u : 0u;
+        if (i >= first && ((i > first && compare(key_of(item(n, i - 1)), klen_of(item(n, i - 1)), key_of(it), klen_of(it)) >= 0) ||
+                           (lo && compare(key_of(it), klen_of(it), lo, lolen) < 0) ||
+                           (hi && compare(key_of(it), klen_of(it), hi, hilen) >= 0))) {
             kprintf("store: catalog node %lu is out of order\n", (unsigned long)address);
             r = -N_ERR_IO;
             break;
