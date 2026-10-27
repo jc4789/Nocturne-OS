@@ -88,7 +88,12 @@
 | K24 | AP で片付かない呼出しは BSP が一つずつ受け持つ。大きなファイルの読み込みや核の長い処理の間、他の app の呼出しが全部待つ | K22 の調べ（sched_ap_interrupt → isr_dispatch_remote） | 設計の天井。未着手（ブラウザーの Worker が一 CPU 分しか使わないという前の観測と関係しうるが、未確かめ） |
 | K25 | 長い試験の一回りで C: が満ち（1342971 塊のうち 1337719）、試験の実行ファイルを書けずに 43 件が落ちる。交互に通るのは、書けなかった上書きが前の版を放すから | test-k25（store check は 0 problems）。試験の実行ファイルは一つ約 90 MB で、runner が一つも消さなかった（51 種で満ちる） | 修理：runner は試験ごとに新しいフォルダーで走らせ、終われば消す。test-k26（全組）で書けない失敗は 0、巻は 909 MB のまま |
 | K26 | 自前の試験の期待値が設計より古い：sandboxprofile（10-16 の ff78d7d5 で script を止めた same-origin の枠と CSP の sandbox の合わせを実装した後も、拒む前提）、lineclampreentry（10-17 の 0c1c1cca で絶対の min-height は引き伸ばしで配置し直さない設計にした後も、1px で再配置を期待） | test-k25 | 試験を今の設計に合わせた（CSP の sandbox は合わせて script を止める場合と、空の sandbox で不透明な起点を拒む場合を見る）。intersection-observer/inline-client-rect の 2 件は、既定の serif（Noto Serif、空白 0.26 em）で空白が 4.16 px になり、offsetLeft の丸めから作る期待と合わない。基準 b2f5b721 も同じ字体と同じ送りの計算（コードで比べた。走らせてはいない）。networkpacing/pause-fairness-batch（10-15 04:48 の 14dbdaab）は、同じ日の 75597598 で止めている間の先読みを一つの塊にまとめる設計にした後も、一回の汲み出しで二つ以上の塊を期待していた。4KiB の枠より少ない塊と汲み出しで終わることを見るように直した。test-k27 で三つとも通る（sandboxprofile は検査が 94 になり、runner の期待の数を合わせた） |
-| K27 | Web Audio API が一つも無い（AudioContext・OfflineAudioContext・節点・AudioParam）。指紋の script が OfflineAudioContext の無い道で callback(null) を受けて自分の xor で TypeError になり、約 3 秒ごとに 2.5 秒の timer をやり直し続け、主スレッドが止まる（再現は Bilibili の動画の頁。Floorp では同じ script が 45 秒で二回・計 36 ms）。音を Web Audio で作る頁は無音（再現は musewonder.win） | clip7 の serial（372〜387 s に五回の Timer task 2.5 s と TypeError、stack の桁 1:96896・1:90429）、Floorp の記録 | 未着手 |
+| K27 | Web Audio API が一つも無い（AudioContext・OfflineAudioContext・節点・AudioParam）。指紋の script が OfflineAudioContext の無い道で callback(null) を受けて自分の xor で TypeError になり、約 3 秒ごとに 2.5 秒の timer をやり直し続け、主スレッドが止まる（再現は Bilibili の動画の頁。Floorp では同じ script が 45 秒で二回・計 36 ms）。音を Web Audio で作る頁は無音（再現は musewonder.win） | clip7 の serial（372〜387 s に五回の Timer task 2.5 s と TypeError、stack の桁 1:96896・1:90429）、Floorp の記録 | 修理：Web Audio を入れた（501b0ffd）。一回の重さの中身だった canvas の toDataURL の無圧縮の PNG は DEFLATE の圧縮器で直した（215d0d6c）。QEMU で SDK の後の browser error 0、250 ms を超える timer 0。musewonder.win の音が出るかは未確認 |
+| K28 | スクロール中にブラウザーが落ちる（css_transform_general、毎回同じ番地。再現は Bilibili の動画の頁） | 一時の診断（release の直前に、箱の st が放す arena の中を指す箱を数えた）で、shadow DOM の中で同じ親へ入れ直した要素の箱 | 修理（dad77052）：箱を持つ要素が style_previous 無しに装いを作り直したら作り直しを求める。同じ形の借り手（display:contents の下の箱、modal の ::backdrop の箱）もコードを読んで直した。直す前の三つの媒体は 3/3 で落ち、直した媒体は下へ 7 頁・上へ 7 頁送れた（QEMU、一回） |
+| K29 | CSS の背景が一層だけ：background-image・-position・-size・-repeat の comma の列を受けない（repeat は列ごと捨てる）。gradient は size・position・repeat を無視して箱全体を塗る。background-origin・background-clip が無い | 2026-10-27 の写真の回（sweep3）で、ログインの窓の背景の絵が並んで敷かれる（再現は Bilibili。宣言は `background-image:url(c),url(u);background-position:0 100%,100% 100%;background-repeat:no-repeat,no-repeat;background-size:14%`）。sweep1 も同じ | 未修理 |
+| K30 | getComputedStyle の background-image・background-position・background-size が "" を返す（css_computed_longhand が PT_BG_IMAGE・PT_BG_POS・PT_BG_SIZE を書かない） | F12 で読むだけ（同上の窓） | 未修理 |
+| K31 | SVG の logo が黒く塗られる（再現は百度百科の上の logo と 秒懂百科 の logo） | sweep3・sweep1 とも。SVG の `<style>` と class の fill を nanosvg が読まない見込み（推測、未確かめ） | 未着手 |
+| K32 | 弾幕の文字が重なって流れる（再現は Bilibili の動画） | sweep3・sweep1 とも | 未着手（層も未特定） |
 
 ## 5. 受入表（browser-hikaku の組）
 
@@ -107,6 +112,8 @@
 | webglsamples.org の city | 毎コマ描く WebGL の街 | fps（頁の数え） |
 
 Floorp の性能記録（10/26 04:16、74.5 秒の範囲）は頁を開いた後の範囲が中心で、読み込みの節目はほとんど範囲の外。範囲内の CPU は anthropic 2.7 秒、reddit 2.0 秒、bilibili 0.21 秒、youtube 0.18 秒、baidu 0.17 秒、yahoo 0.10 秒、github 0.09 秒（実機）。読み込みの時間の比べには撮り直しが要る。
+
+写真の回 2026-10-27（dad77052 の媒体、QEMU 4 CPU・4 GiB、`build/qa/hikaku/wa/sweep3`、並べた画像は `wa/cmp3`。前の回は `20261026-sweep1`、10-26 21 時台の媒体）：8 サイトとも上・下・戻りで落ちない。sweep1 に無かった違いは見つからない。前からの違いは K8（Anthropic の大きな題）・K29（Bilibili のログインの窓）・K31（百度百科の logo）・K32（弾幕）。Yahoo の右欄の広告の枠が空なのは参照の Floorp が広告を止めているため、数えない。musewonder.win は始めの画面（題・星・Start・説明。上下の黒い帯は Chrome でも同じ）と遊びの画面（順位・進みの帯・残りの帯・中の場面）が参照と合う。音は未確認。
 
 ## 6. 測定
 
