@@ -187,16 +187,11 @@ static int canvas_source(JSContext *ctx,node_t *source,const uint32_t **pixels,u
 static JSValue canvas_export(JSContext *ctx,node_t *n,struct web_canvas *c,bool data_url) {
     if (c && c->tainted) return JS_FALSE; /* JS throws SecurityError synchronously. */
     if (!c || !c->w || !c->h || !c->pixels) return data_url?JS_NewString(ctx,"data:,"):JS_NULL;
-    size_t png_size=png_encode_rgba_bound((int)c->w,(int)c->h);
-    size_t url_size=0,reserve=png_size;
-    if (data_url) {
-        if (png_size>SIZE_MAX-2 || (png_size+2)/3>(SIZE_MAX-23)/4) return JS_NewString(ctx,"data:,");
-        url_size=22+((png_size+2)/3)*4;
-        if (url_size+1>SIZE_MAX-reserve) return JS_NewString(ctx,"data:,");
-        reserve+=url_size+1;
-    }
+    /* The PNG's bound is held while it is made; the URL's text follows its actual,
+       compressed size. */
+    size_t reserve=png_encode_rgba_bound((int)c->w,(int)c->h);
     web_doc *d=allocation_doc(n);
-    if (!png_size || !canvas_room(d,reserve))
+    if (!reserve || !canvas_room(d,reserve))
         return data_url?JS_NewString(ctx,"data:,"):JS_NULL;
     d->canvas_bytes+=reserve;
     uint8_t *png=NULL; size_t size=0; JSValue out;
@@ -204,7 +199,10 @@ static JSValue canvas_export(JSContext *ctx,node_t *n,struct web_canvas *c,bool 
         out=data_url?JS_NewString(ctx,"data:,"):JS_NULL;
     else if (!data_url) out=JS_NewArrayBufferCopy(ctx,png,size);
     else {
-        char *url=malloc(url_size+1);
+        /* size is at most the bound, whose IDAT fits 32 bits: no overflow */
+        size_t url_size=22+((size+2)/3)*4;
+        char *url=canvas_room(d,url_size+1)?malloc(url_size+1):NULL;
+        if (url) { d->canvas_bytes+=url_size+1; reserve+=url_size+1; }
         if (!url) out=JS_NewString(ctx,"data:,");
         else {
             static const char alphabet[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

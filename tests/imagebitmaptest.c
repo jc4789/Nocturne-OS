@@ -112,6 +112,8 @@ static void native_lifetimes(void){
     token=create_native(ctx,&cancelled,1,data,normal,shape);
     check("cancelled snapshot rejects before borrowing",JS_IsException(token)&&exception_named(ctx,"InternalError"));JS_FreeValue(ctx,token);
     uint32_t *large=calloc(128u*128u,sizeof *large);uint8_t *png=NULL;size_t png_size=0;
+    /* Noise: the encoder compresses, and only a source of 16 KiB or more goes to the decode helper. */
+    for(uint32_t i=0,v=2463534242u;large&&i<128u*128u;i++){v^=v<<13;v^=v>>17;v^=v<<5;large[i]=v;}
     bool encoded=large&&png_encode_rgba(large,128,128,128,&png,&png_size)==0&&png_size>=16384;free(large);
     struct web_host host={.script_checkpoint=checkpoint,.js_task_budget_ms=5000};
     web_doc *decode_doc=web_live("<!doctype html>",15,"https://bitmap-cancel.test/","utf-8",&host);

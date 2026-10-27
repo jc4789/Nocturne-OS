@@ -4,11 +4,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* encode 0xAARRGGBB pixels (stride in pixels) as an RGB PNG; *out is malloc'd. 0 or -1 */
+/* encode 0xAARRGGBB pixels (stride in pixels) as an RGB PNG with 96 dpi metadata;
+   *out is malloc'd. 0 or -1 */
 int png_encode(const uint32_t *px, int w, int h, int stride, uint8_t **out, size_t *outlen);
-/* Straight-alpha RGBA PNG with 96 dpi metadata. The bound is exact: one
- * allocation, stored DEFLATE, and no separate image/compressor scratch.
- * A zero bound means invalid dimensions or a PNG chunk size overflow. */
+/* The same as a straight-alpha RGBA PNG. The bound is the most bytes the PNG can take
+ * (its pixels stored uncompressed); the encoder also holds its compressor's fixed
+ * tables and three rows. A zero bound means invalid dimensions or a PNG chunk size
+ * overflow. */
 size_t png_encode_rgba_bound(int w, int h);
 int png_encode_rgba(const uint32_t *px, int w, int h, int stride, uint8_t **out, size_t *outlen);
 /* shrink by an integer factor with box filtering; returns a malloc'd w/f x h/f image */
