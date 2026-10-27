@@ -11,10 +11,10 @@ enum web_sandbox_flag {
     SB_CUSTOM_PROTOCOLS=1u<<14, SB_UNSUPPORTED=1u<<15
 };
 #define SB_ALL ((1u<<15)-1)
-static bool sandbox_space(unsigned char c) {
+static inline bool sandbox_space(unsigned char c) {
     return c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\f';
 }
-static bool sandbox_word_equal(const char *p,size_t n,const char *word) {
+static inline bool sandbox_word_equal(const char *p,size_t n,const char *word) {
     size_t i=0;
     for(;i<n && word[i];i++) {
         unsigned char c=(unsigned char)p[i];if(c>='A' && c<='Z')c+=32;
@@ -24,7 +24,7 @@ static bool sandbox_word_equal(const char *p,size_t n,const char *word) {
 }
 /* Known allow words only; unknown author text is never copied to diagnostics.
  * Overlong directives fail closed rather than silently dropping restrictions. */
-static uint32_t sandbox_parse(const char *value,char *known,size_t capacity) {
+static inline uint32_t sandbox_parse(const char *value,char *known,size_t capacity) {
     static const struct {const char *word;uint32_t clear;} words[]={
         {"allow-downloads",SB_DOWNLOADS},{"allow-forms",SB_FORMS},
         {"allow-modals",SB_MODALS},{"allow-orientation-lock",SB_ORIENTATION},
@@ -63,7 +63,7 @@ static uint32_t sandbox_parse(const char *value,char *known,size_t capacity) {
 /* Supported profiles keep the document's origin: either scripts are allowed
  * (cross-origin documents only), or scripts are disabled and the realm is
  * reachable only by its same-origin embedder. Opaque origins fail closed. */
-static bool sandbox_supported(uint32_t flags) {
+static inline bool sandbox_supported(uint32_t flags) {
     return !(flags&(SB_ORIGIN|SB_UNSUPPORTED));
 }
 #endif

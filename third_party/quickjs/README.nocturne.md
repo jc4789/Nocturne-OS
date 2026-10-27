@@ -59,6 +59,14 @@ CSSOM `PutForwards=cssText` を実装するために利用した。
 NULL なので戻さない。戻した module は上流の `js_free_modules` が一覧から外し、
 次の import は host の loader から同じ module を受け取って解決し直す。
 
+## 初めて使う時に作る属性
+
+`JS_DefineLazyProperty` は上流の `JS_PROP_AUTOINIT`（組み込みの prototype や
+module の名前空間を、初めて触れた時に作る仕組み）に、host の作る値を足したもの。
+属性は最初からデータの属性として見え、読む・記述子を取る・書くのどれかで初めて
+host の関数が値を作る。ブラウザーは Web Audio の interface をこれで置き、使わない
+realm では読み込まない。上流の三種の autoinit と、属性の位置と値の扱いは変えない。
+
 ## RegExp の旧式静的キャプチャー
 
 実 Baidu の公開 ESL loader が `extReg.test(source)` の直後に

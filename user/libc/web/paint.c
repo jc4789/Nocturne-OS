@@ -29,6 +29,7 @@ struct hit_primitive {
     node_t *target, *node;
     size_t order;
     int kind;
+    uint8_t pseudo; /* PE_BEFORE/PE_AFTER: the target's generated box, else PE_NONE */
     box_t *box;
     const struct radius_cache *radius;
     float radius_x,radius_y;
@@ -60,6 +61,7 @@ struct pctx {
     struct web_hit *hit;
     bool hit_any;
     node_t *target;
+    uint8_t target_pseudo;
     box_t *top_root;
     uint32_t canvas_bg_from; /* 1: html's background was used for the canvas, 2: body's */
     uint32_t canvas_bg;
@@ -74,7 +76,10 @@ struct pctx {
     float hit_shape_x,hit_shape_y;
     const struct gfx_mask_clip *viewport_mask;
     const box_t *untransformed; /* this box's own used transform is being applied by the caller */
+    struct hit_stack *stack; /* doc_elements_at: every target the exact walk reaches, bottom first */
 };
+struct hit_entry { node_t *node; uint8_t pseudo; };
+struct hit_stack { struct hit_entry *items; size_t count, capacity; bool failed; };
 #include "paint_media_debug.h"
 /* debug_js only: where top-level paint time goes between profile reports. */
 static struct { uint64_t paints, order_ms, frames_ms, walk_ms, probe_ms, total_ms, groups, group_pixels,
@@ -1803,11 +1808,30 @@ static bool hit_style(const style_t *st) {
     return st && !st->visibility && !st->pointer_events;
 }
 
-static bool hit_target(struct pctx *P,node_t *target) {
+/* A generated box carries its element as node and the pseudo-element's style. */
+static uint8_t hit_pseudo(const node_t *target,const style_t *st){
+    const style_t *own=target&&st?target->style:NULL;
+    if(!own)return PE_NONE;
+    return st==own->before?PE_BEFORE:st==own->after?PE_AFTER:PE_NONE;
+}
+static bool hit_stack_push(struct hit_stack *stack,node_t *target,uint8_t pseudo){
+    if(!target)return true;
+    if(stack->count&&stack->items[stack->count-1].node==target&&stack->items[stack->count-1].pseudo==pseudo)return true;
+    if(stack->count==stack->capacity){
+        size_t capacity=stack->capacity?stack->capacity*2:32;
+        void *items=capacity>SIZE_MAX/sizeof *stack->items?NULL:realloc(stack->items,capacity*sizeof *stack->items);
+        if(!items){stack->failed=true;return false;}
+        stack->items=items;stack->capacity=capacity;
+    }
+    stack->items[stack->count++]=(struct hit_entry){target,pseudo};
+    return true;
+}
+static bool hit_target(struct pctx *P,node_t *target,uint8_t pseudo) {
     box_t *box=target?target->box:NULL;
     const struct radius_cache *radius=P->hit_radius?P->hit_radius:box?box->radius_clip[0]:NULL;
     if(!P->index_build&&radius&&corners_coverage(P->hx,P->hy,P->hit_shape_x,P->hit_shape_y,radius->w,radius->h,&radius->radii)<.5f)return false;
-    P->target=target;
+    P->target=target;P->target_pseudo=pseudo;
+    if(P->stack&&!hit_stack_push(P->stack,target,pseudo)){P->failed=true;return false;}
     P->hit_any=false;
     memset(P->hit,0,sizeof *P->hit);
     if (P->index_build && !P->failed) {
@@ -1820,7 +1844,7 @@ static bool hit_target(struct pctx *P,node_t *target) {
             index->items = items; index->capacity = capacity;
         }
         struct hit_primitive *item = &index->items[index->count];
-        *item = (struct hit_primitive){.target=target,.order=index->count,.kind=WEB_HIT_NONE};
+        *item = (struct hit_primitive){.target=target,.order=index->count,.kind=WEB_HIT_NONE,.pseudo=pseudo};
         item->box=box;item->radius=radius;item->radius_x=P->hit_shape_x;item->radius_y=P->hit_shape_y;
         memcpy(item->rect,P->hit_rect,sizeof item->rect);
         index->count++;
@@ -1828,9 +1852,9 @@ static bool hit_target(struct pctx *P,node_t *target) {
     }
     return !P->failed;
 }
-static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
-    if (n) {if(!hit_target(P,n))return;}
-    else if (link && P->index_build) hit_target(P,P->target);
+static void set_hit(struct pctx *P, int kind, node_t *n, const style_t *st, node_t *link) {
+    if (n) {if(!hit_target(P,n,hit_pseudo(n,st)))return;}
+    else if (link && P->index_build) hit_target(P,P->target,P->target_pseudo);
     P->hit_any = true;
     P->hit->kind = kind;
     P->hit->node = n;
@@ -1852,10 +1876,14 @@ static void set_disclosure_hit(struct pctx *P, node_t *details) {
     /* The action belongs to details, but the event target stays the summary
        (or its actual child), not a renderer-invented summary DOM node. */
     node_t *target = P->target;
-    set_hit(P, WEB_HIT_DETAILS, details, NULL);
-    P->target = target;
-    if (P->index_build && P->index_build->count)
+    uint8_t pseudo = P->target_pseudo;
+    set_hit(P, WEB_HIT_DETAILS, details, NULL, NULL);
+    P->target = target; P->target_pseudo = pseudo;
+    if (P->stack && P->stack->count) P->stack->items[P->stack->count-1] = (struct hit_entry){target, pseudo};
+    if (P->index_build && P->index_build->count) {
         P->index_build->items[P->index_build->count-1].target = target;
+        P->index_build->items[P->index_build->count-1].pseudo = pseudo;
+    }
 }
 
 static void finish_disclosure_hit(struct pctx *P) {
@@ -2190,7 +2218,7 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
         if (P->mode == M_BOUNDS) { bounds_decoration(P,st,bx + d->x, by + d->y, d->w, d->h); continue; }
         if (P->mode == M_HIT) {
             P->hit_radius=d->radius_clip[0];
-            if (hit_style(st) && d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) hit_target(P,d->node);
+            if (hit_style(st) && d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) hit_target(P,d->node,hit_pseudo(d->node,st));
             P->hit_radius=NULL;
             continue;
         }
@@ -2213,7 +2241,7 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
                 if (!hit_style(a->st)) continue;
                 float ax = box_visual_x(a) - a->p[3] - a->b[3], ay = cy(a) - a->p[0] - a->b[0];
                 if (inside(P, ax, ay, a->w + a->p[1] + a->p[3] + a->b[1] + a->b[3], a->h + a->p[0] + a->p[2] + a->b[0] + a->b[2]))
-                    set_hit(P, control_hit(a), a->node, r->link);
+                    set_hit(P, control_hit(a), a->node, a->st, r->link);
             }
             continue;
         }
@@ -2223,8 +2251,11 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
             float asc, desc;
             wf_metrics(&f, &asc, &desc);
             if (inside(P, bx + r->x, by + r->y - asc, r->w, asc + desc)) {
-                if (r->node) hit_target(P,r->node->type == N_ELEM ? r->node : doc_flat_parent(r->node));
-                if (r->link) set_hit(P, WEB_HIT_NONE, NULL, r->link);
+                if (r->node) {
+                    if (r->node->type == N_ELEM) hit_target(P,r->node,hit_pseudo(r->node,r->st));
+                    else hit_target(P,doc_flat_parent(r->node),PE_NONE);
+                }
+                if (r->link) set_hit(P, WEB_HIT_NONE, NULL, NULL, r->link);
             }
             continue;
         }
@@ -2447,7 +2478,7 @@ static void paint_transformed(struct pctx *P, box_t *b, bool layer_root) {
     double m[6];
     if (!box_transform_matrix(b, m)) {
         struct pctx Q = *P; Q.untransformed = b; paint_box(&Q, b, layer_root);
-        P->target = Q.target; P->hit_any = Q.hit_any; P->bounds_valid = Q.bounds_valid;
+        P->target = Q.target; P->target_pseudo = Q.target_pseudo; P->hit_any = Q.hit_any; P->bounds_valid = Q.bounds_valid;
         memcpy(P->bounds, Q.bounds, sizeof P->bounds); P->bounds_work = Q.bounds_work;
         if (Q.failed) P->failed = true;
         return;
@@ -2554,16 +2585,20 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         bounds_decoration(P,st,bx,by,bw,bh);
         if (b->marker || b->marker_shape) bounds_rect(P, bx - st->font_size * 2, by, st->font_size * 2, bh);
     }
+    /* A table row or row group is painted in its cells (CSS 2.1 17.5.1) and is not a
+       target itself: a point between cells is the table's. */
     if (P->mode == M_HIT && hit_style(st) && b->node &&
-        b->kind != B_TEXT && inside(P, bx, by, bw, bh))
-        hit_target(P,b->node->type == N_ELEM ? b->node : doc_flat_parent(b->node));
+        b->kind != B_TEXT && b->kind != B_ROW && b->kind != B_ROW_GROUP && inside(P, bx, by, bw, bh)) {
+        if (b->node->type == N_ELEM) hit_target(P,b->node,hit_pseudo(b->node,st));
+        else hit_target(P,doc_flat_parent(b->node),PE_NONE);
+    }
     if (P->mode == M_HIT && hit_style(st) && b->node && !b->node->foreign &&
         b->kind != B_TEXT && (inside(P, bx, by, bw, bh) ||
         ((b->marker || b->marker_shape) && inside(P, bx - st->font_size * 2, by, st->font_size * 2, bh)))) {
         node_t *details = b->node->tag == T_summary ? doc_details_activation(b->node) :
                           b->anon && b->node->tag == T_details && !doc_details_summary(b->node) ? b->node : NULL;
         if (details) {
-            hit_target(P,b->node);
+            hit_target(P,b->node,PE_NONE);
             set_disclosure_hit(P, details);
         }
     }
@@ -2571,7 +2606,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
        inside(P,bx-st->font_size*2,by,st->font_size*2,bh)){
         node_t *details=b->node->tag==T_summary?doc_details_activation(b->node):
             b->anon&&b->node->tag==T_details&&!doc_details_summary(b->node)?b->node:NULL;
-        if(details){hit_target(P,b->node);set_disclosure_hit(P,details);}
+        if(details){hit_target(P,b->node,PE_NONE);set_disclosure_hit(P,details);}
     }
     bool clip = (web_marquee_box(b) || b->clamp_truncated || st->overflow != OV_VISIBLE) && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
     /* Off-screen contexts can still contain viewport-fixed descendants. */
@@ -2619,7 +2654,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         } else if (P->mode == M_HIT && hit_style(st) && st->content_visibility!=CV_HIDDEN &&
                    (b->kind == B_ATOMIC || (b->node&&b->node->tag==T_button)) && inside(P, bx, by, bw, bh)) {
             int k = control_hit(b);
-            if (k != WEB_HIT_NONE) set_hit(P, k, b->node, NULL);
+            if (k != WEB_HIT_NONE) set_hit(P, k, b->node, st, NULL);
         }
     } else if ((b->kind == B_ROW || b->kind == B_ROW_GROUP) && P->mode == M_PAINT && visible && (st->bg_color >> 24)) {
         float z[4] = {0, 0, 0, 0};
@@ -2753,7 +2788,8 @@ static void walk(struct pctx *P) {
     float ox=P->ox,oy=P->oy,hx=P->hx,hy=P->hy;
     node_t *fullscreen=P->d->fullscreen_element;
     if(fullscreen&&fullscreen->box){
-        if(P->mode==M_HIT){memset(P->hit,0,sizeof *P->hit);P->hit_any=false;}
+        /* The top layer covers the viewport: nothing under it stays a target. */
+        if(P->mode==M_HIT){memset(P->hit,0,sizeof *P->hit);P->hit_any=false;if(P->stack)P->stack->count=0;}
         else if(P->mode==M_PAINT)gfx_fill(P->c,P->vx0,P->vy0,P->vx1-P->vx0,P->vy1-P->vy0,RGB(0,0,0));
         P->top_root=fullscreen->box;paint_box(P,fullscreen->box,true);
     }
@@ -2762,7 +2798,8 @@ static void walk(struct pctx *P) {
         if(P->mode==M_HIT) {
             if(n!=web_dialog_top(P->d))continue;
             memset(P->hit,0,sizeof *P->hit); P->hit_any=false;
-            hit_target(P,hit_style(n->style)?n:NULL);
+            if(P->stack)P->stack->count=0;
+            hit_target(P,hit_style(n->style)?n:NULL,PE_NONE);
         }
         box_t *layers[2]={web_dialog_backdrop(P->d,n),n->box};
         for(int j=0;j<2;j++) {
@@ -3254,6 +3291,84 @@ node_t *doc_element_at(web_doc *d,int x,int y) {
     }
     if(hit && hit->type!=N_ELEM)hit=doc_flat_parent(hit);
     return hit;
+}
+
+struct hit_found { const struct hit_primitive **items; size_t count, capacity; bool failed; };
+static void hit_collect(const struct web_hit_index *index,size_t id,float x,float y,struct hit_found *found){
+    const struct hit_branch *branch=&index->branches[id];
+    if(found->failed||!hit_rect_contains(branch->rect,x,y))return;
+    if(branch->left==SIZE_MAX){
+        for(size_t i=branch->first;i<branch->first+branch->count;i++){
+            const struct hit_primitive *item=&index->items[i];
+            if(!hit_rect_contains(item->rect,x,y)||!hit_corner_contains(item,x,y))continue;
+            if(found->count==found->capacity){
+                size_t capacity=found->capacity?found->capacity*2:32;
+                void *items=realloc(found->items,capacity*sizeof *found->items);
+                if(!items){found->failed=true;return;}
+                found->items=items;found->capacity=capacity;
+            }
+            found->items[found->count++]=item;
+        }
+        return;
+    }
+    hit_collect(index,branch->left,x,y,found);hit_collect(index,branch->right,x,y,found);
+}
+static int hit_order_compare(const void *a,const void *b){
+    size_t x=(*(const struct hit_primitive *const *)a)->order,y=(*(const struct hit_primitive *const *)b)->order;
+    return x<y?-1:x>y;
+}
+static int hit_entry_compare(const void *a,const void *b){
+    const struct hit_entry *x=a,*y=b;
+    if(x->node!=y->node)return (uintptr_t)x->node<(uintptr_t)y->node?-1:1;
+    return (x->pseudo>y->pseudo)-(x->pseudo<y->pseudo);
+}
+bool doc_elements_at(web_doc *d,int x,int y,node_t ***elements,size_t *count){
+    *elements=NULL;*count=0;
+    if(!d||d->native_cancelled||d->native_recovery_pending||d->native_recovery_active||!d->root_box)return true;
+    struct hit_stack stack={0};
+    struct pctx P={0};struct web_hit hit={0};canvas_t dummy={0};
+    dummy.cx0=dummy.cy0=-1000000000;dummy.cx1=dummy.cy1=1000000000;
+    P.d=d;P.c=&dummy;P.mode=M_HIT;P.hx=(float)x;P.hy=(float)y;P.hit=&hit;
+    /* The index holds every primitive the walk would reach, in the walk's order. */
+    bool indexed=hit_index_lookup(&P);
+    if(indexed&&!P.failed&&d->hit_index&&d->hit_index->count){
+        struct hit_found found={0};
+        hit_collect(d->hit_index,0,P.hx,P.hy,&found);
+        if(found.failed){free(found.items);return false;}
+        if(found.count)qsort(found.items,found.count,sizeof *found.items,hit_order_compare);
+        for(size_t i=0;i<found.count&&!stack.failed;i++)hit_stack_push(&stack,found.items[i]->target,found.items[i]->pseudo);
+        free(found.items);
+    } else if(!indexed){P.stack=&stack;walk(&P);}
+    if(stack.failed){free(stack.items);return false;}
+    if(P.failed){free(stack.items);return true;}
+    /* Topmost first. Each element once, and each of its generated boxes once listed
+       as the element: a positioned ::before can put its element both above and
+       below another. Text runs count as their element; inert nodes are left out. */
+    for(size_t i=0,j=stack.count;i+1<j;i++,j--){struct hit_entry swap=stack.items[i];stack.items[i]=stack.items[j-1];stack.items[j-1]=swap;}
+    size_t kept=0;
+    for(size_t i=0;i<stack.count;i++){
+        struct hit_entry e=stack.items[i];
+        if(e.node&&e.node->type!=N_ELEM){e.node=doc_flat_parent(e.node);e.pseudo=PE_NONE;}
+        if(!e.node||e.node->owner!=d||web_dialog_inert(d,e.node))continue;
+        stack.items[kept++]=e;
+    }
+    if(!kept){free(stack.items);return true;}
+    struct hit_entry *sorted=malloc(kept*sizeof *sorted);
+    bool *taken=calloc(kept,sizeof *taken);
+    node_t **out=malloc(kept*sizeof *out);
+    if(!sorted||!taken||!out){free(sorted);free(taken);free(out);free(stack.items);return false;}
+    memcpy(sorted,stack.items,kept*sizeof *sorted);
+    qsort(sorted,kept,sizeof *sorted,hit_entry_compare);
+    size_t unique=0;
+    for(size_t i=0;i<kept;i++){
+        struct hit_entry *at=bsearch(&stack.items[i],sorted,kept,sizeof *sorted,hit_entry_compare);
+        while(at>sorted&&!hit_entry_compare(at-1,&stack.items[i]))at--;
+        if(taken[at-sorted])continue;
+        taken[at-sorted]=true;out[unique++]=stack.items[i].node;
+    }
+    free(sorted);free(taken);free(stack.items);
+    *elements=out;*count=unique;
+    return true;
 }
 
 web_node *web_link_activation_anchor(web_doc *d, web_node *target) {

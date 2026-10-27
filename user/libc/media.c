@@ -54,6 +54,10 @@ struct nmedia {
     struct nmedia_audio_observation audio_observation;
     uint64_t audio_decode_work;
     int16_t samples[4096 * 2];
+    bool audio_native;    /* nmedia_set_audio_native: frames as decoded, no mix or resampling */
+    float *native;        /* their samples, one plane per channel */
+    size_t native_capacity;
+    const float *native_planes[8];
     uint64_t phase, step;
     int frame_audio, source_rate;
     AVChannelLayout mix_layout;
@@ -300,12 +304,32 @@ bool nmedia_packets_compatible(const nmedia *m,const AVFormatContext *source){
            (p->extradata_size&&memcmp(p->extradata,q->extradata,(size_t)p->extradata_size)))return false;
     }return true;
 }
-static int32_t audio_sample(AVFrame *f, int index, int channel) {
-    enum AVSampleFormat fmt = (enum AVSampleFormat)f->format;
-    bool planar = av_sample_fmt_is_planar(fmt);
-    int bytes = av_get_bytes_per_sample(fmt), count = f->ch_layout.nb_channels;
+static const uint8_t *audio_sample_at(AVFrame *f, int index, int channel, enum AVSampleFormat *fmt) {
+    *fmt = (enum AVSampleFormat)f->format;
+    bool planar = av_sample_fmt_is_planar(*fmt);
+    int bytes = av_get_bytes_per_sample(*fmt), count = f->ch_layout.nb_channels;
     const uint8_t *p = planar ? f->extended_data[channel] + (size_t)index * bytes : f->extended_data[0] + ((size_t)index * count + channel) * bytes;
-    fmt = av_get_packed_sample_fmt(fmt);
+    *fmt = av_get_packed_sample_fmt(*fmt);
+    return p;
+}
+/* The sample as it was decoded, integers scaled to [-1, 1). */
+static double audio_sample_float(AVFrame *f, int index, int channel) {
+    enum AVSampleFormat fmt;
+    const uint8_t *p = audio_sample_at(f, index, channel, &fmt);
+    int16_t s16; int32_t s32; int64_t s64; float flt; double dbl;
+    switch (fmt) {
+    case AV_SAMPLE_FMT_U8: return ((int)*p - 128) / 128.0;
+    case AV_SAMPLE_FMT_S16: memcpy(&s16, p, 2); return s16 / 32768.0;
+    case AV_SAMPLE_FMT_S32: memcpy(&s32, p, 4); return s32 / 2147483648.0;
+    case AV_SAMPLE_FMT_S64: memcpy(&s64, p, 8); return (double)s64 / 9223372036854775808.0;
+    case AV_SAMPLE_FMT_FLT: memcpy(&flt, p, 4); return flt;
+    case AV_SAMPLE_FMT_DBL: memcpy(&dbl, p, 8); return dbl;
+    default: return 0;
+    }
+}
+static int32_t audio_sample(AVFrame *f, int index, int channel) {
+    enum AVSampleFormat fmt;
+    const uint8_t *p = audio_sample_at(f, index, channel, &fmt);
     int16_t s16; int32_t s32; int64_t s64; float flt; double dbl;
     switch (fmt) {
     case AV_SAMPLE_FMT_U8: return ((int32_t)*p - 128) * 256;
@@ -365,6 +389,27 @@ static int audio_mix(nmedia *m, const AVChannelLayout *layout) {
 static uint64_t video_work_add(uint64_t,uint64_t);
 static uint64_t video_work_elapsed(uint64_t);
 static uint64_t video_measurement_next(void);
+/* nmedia_set_audio_native: the frame as float planes at its own rate and channels. */
+static int audio_native_output(nmedia *m, struct nmedia_output *o) {
+    AVFrame *f = m->frame;
+    int channels = f->ch_layout.nb_channels;
+    size_t need = (size_t)channels * (size_t)f->nb_samples;
+    if (need > m->native_capacity) {
+        float *grown = nmedia_ff_malloc(need * sizeof *grown);
+        if (!grown) return fail(m, "decoded audio allocation", AVERROR(ENOMEM));
+        nmedia_ff_free(m->native); m->native = grown; m->native_capacity = need;
+    }
+    for (int ch = 0; ch < channels; ch++) {
+        float *plane = m->native + (size_t)ch * (size_t)f->nb_samples;
+        for (int i = 0; i < f->nb_samples; i++) plane[i] = (float)audio_sample_float(f, i, ch);
+        m->native_planes[ch] = plane;
+    }
+    o->kind = NMEDIA_AUDIO; o->frames = (size_t)f->nb_samples;
+    o->native_planes = m->native_planes; o->native_channels = channels; o->native_rate = f->sample_rate;
+    o->pts_ms = m->audio_pts; o->duration_ms = (int64_t)f->nb_samples * 1000 / f->sample_rate;
+    av_frame_unref(f);
+    return NMEDIA_AUDIO;
+}
 static int audio_output(nmedia *m, struct nmedia_output *o) {
     AVFrame *f = m->frame;
     uint32_t codec=m->audio->codec_id==AV_CODEC_ID_OPUS?NMEDIA_ACODEC_OPUS:m->audio->codec_id==AV_CODEC_ID_VORBIS?NMEDIA_ACODEC_VORBIS:
@@ -680,7 +725,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                 AVFrame *f = m->frame;
                 if (f->sample_rate < 1000 || f->sample_rate > 384000 || f->ch_layout.nb_channels < 1 || f->ch_layout.nb_channels > 8 || f->nb_samples <= 0 || f->nb_samples > 65536 || av_get_bytes_per_sample((enum AVSampleFormat)f->format) <= 0)
                     return fail(m, "audio frame limits", AVERROR(EINVAL));
-                uint64_t mix_start=uptime_ms();int mix_result=audio_mix(m,&f->ch_layout);
+                uint64_t mix_start=uptime_ms();int mix_result=m->audio_native?0:audio_mix(m,&f->ch_layout);
                 m->audio_decode_work=video_work_add(m->audio_decode_work,video_work_elapsed(mix_start));
                 if(mix_result<0)return NMEDIA_ERROR;
                 AVStream *s = m->format->streams[m->audio_index];
@@ -690,6 +735,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                 if (m->source_rate != f->sample_rate) m->phase = 0;
                 m->source_rate = f->sample_rate; m->step = ((uint64_t)f->sample_rate << 32) / SOUND_RATE;
                 if (m->audio_seek_ms >= 0 && m->audio_clock <= m->audio_seek_ms) { m->audio_decode_work=0;av_frame_unref(f); continue; }
+                if (m->audio_native) { m->audio_seek_ms = -1; m->audio_decode_work = 0; return audio_native_output(m, o); }
                 /* -1 means no seek. Negative pre-roll PTS must not turn that
                  * sentinel into a second trim (Opus -7ms -> lost 288 frames). */
                 if (m->audio_seek_ms >= 0 && m->audio_seek_ms > m->audio_pts) m->phase = (uint64_t)(m->audio_seek_ms - m->audio_pts) * f->sample_rate / 1000 << 32;
@@ -812,6 +858,7 @@ void nmedia_close(nmedia *m) {
     if (m->packet_release) m->packet_release(m->packet_owner);
     if (m->document >= 0) n_handle_close(m->document);
     nmedia_http_close(m->http);
-    nmedia_ff_free(m->bytes); nmedia_ff_free(m->pixels); nmedia_ff_free(m->deep_pixels); nmedia_ff_free(m);
+    nmedia_ff_free(m->bytes); nmedia_ff_free(m->pixels); nmedia_ff_free(m->deep_pixels); nmedia_ff_free(m->native); nmedia_ff_free(m);
 }
 void nmedia_set_deep(nmedia *m, bool deep) { if (m) m->deep = deep; }
+void nmedia_set_audio_native(nmedia *m, bool native) { if (m) m->audio_native = native; }

@@ -34,7 +34,7 @@ const semanticElementsBridge = (() => {
     reflect(HTMLDataElement,'data','value');
     reflect(HTMLDetailsElement,'details','name');boolean(HTMLDetailsElement,'details','open');
     boolean(HTMLOListElement,'ol','reversed');integer(HTMLOListElement,'ol','start',1);reflect(HTMLOListElement,'ol','type');
-    integer(HTMLLIElement,'li','value',0);
+    integer(HTMLLIElement,'li','value',0);reflect(HTMLLIElement,'li','type');
     const toggleValues=new WeakMap();
     class ToggleEvent extends Event {
         constructor(type,init={}){

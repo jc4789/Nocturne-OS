@@ -801,6 +801,18 @@ JSValue JS_NewSymbol(JSContext *ctx, const char *description, JS_BOOL is_global)
 
 JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto, JSClassID class_id);
 JSValue JS_NewObjectClass(JSContext *ctx, int class_id);
+/* Nocturne: a data property whose value init makes when the property is first
+   read, described or written (an interface the realm builds on first use). init
+   runs with the object's properties mid-update: it must not add or delete
+   properties of obj. The JSLazyProperty must outlive the property. FALSE when
+   obj already has prop. */
+typedef JSValue JSLazyPropertyFunc(JSContext *ctx, JSAtom prop, void *opaque);
+typedef struct JSLazyProperty {
+    JSLazyPropertyFunc *init;
+    void *opaque;
+} JSLazyProperty;
+int JS_DefineLazyProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
+                          const JSLazyProperty *lazy, int flags);
 JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto);
 JSValue JS_NewObject(JSContext *ctx);
 

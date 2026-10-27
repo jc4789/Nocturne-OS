@@ -202,6 +202,66 @@ const htmlElementsBridge = (() => {
         if(value!=null && typeof value!=='boolean' && typeof value!=='number' && typeof value!=='string')value=string(value);
         reflectedAttr(this,'hidden',typeof value==='string' && lower(value)==='until-found'?'until-found':value?'':null);
     }});
+    /* HTMLElement's own reflected attributes. name, type, src and the like belong to
+       the interfaces that define them: here they would be setters on every element,
+       a custom element's own fields among them. */
+    for(const [property,attribute] of [['title','title'],['lang','lang'],['accessKey','accesskey']])
+        define(HTMLElement.prototype,property,{configurable:true,enumerable:true,
+            get(){htmlBrand(this);return reflectedAttr(this,attribute)||'';},
+            set(value){htmlBrand(this);reflectedAttr(this,attribute,string(value));}});
+    // Limited to only known values (ltr, rtl, auto), ASCII case-insensitively.
+    define(HTMLElement.prototype,'dir',{configurable:true,enumerable:true,get(){
+        htmlBrand(this);const value=lower(reflectedAttr(this,'dir')||'');
+        return value==='ltr'||value==='rtl'||value==='auto'?value:'';
+    },set(value){htmlBrand(this);reflectedAttr(this,'dir',string(value));}});
+    define(HTMLElement.prototype,'inert',{configurable:true,enumerable:true,
+        get(){htmlBrand(this);return reflectedAttr(this,'inert')!==null;},
+        set(value){htmlBrand(this);reflectedAttr(this,'inert',value?'':null);}});
+    function htmlNamed(node,name){
+        return !!node && rawDom.get(node,'nodeType')===1 && rawDom.get(node,'namespaceURI')==='http://www.w3.org/1999/xhtml' &&
+            rawDom.get(node,'localName')===name;
+    }
+    // A summary is its details' summary when it is that details' first summary child.
+    function detailsSummary(node){
+        const parent=rawDom.get(node,'parentNode');
+        if(!htmlNamed(parent,'details'))return false;
+        for(let child=rawDom.get(parent,'firstChild');child;child=rawDom.get(child,'nextSibling'))
+            if(htmlNamed(child,'summary'))return child===node;
+        return false;
+    }
+    // Reflects tabindex as a long whose default is 0 for the elements that are focusable by
+    // default, -1 otherwise.
+    const focusableByDefault=new Set(['a','area','button','frame','iframe','input','object','select','textarea']);
+    define(HTMLElement.prototype,'tabIndex',{configurable:true,enumerable:true,get(){
+        htmlBrand(this);
+        const value=reflectedAttr(this,'tabindex'),match=value===null?null:/^[\t\n\f\r ]*([+-]?\d+)/.exec(value);
+        const parsed=match?Number(match[1]):NaN;
+        if(parsed>=-2147483648 && parsed<=2147483647)return parsed|0;
+        const name=rawDom.get(this,'localName');
+        return focusableByDefault.has(name) || (name==='summary' && detailsSummary(this))?0:-1;
+    },set(value){htmlBrand(this);reflectedAttr(this,'tabindex',string(value>>0));}});
+    // The translation mode: yes or the empty string enable it, no disables it, and any other
+    // value (or none) takes the parent element's mode; the root's is enabled.
+    define(HTMLElement.prototype,'translate',{configurable:true,enumerable:true,get(){
+        htmlBrand(this);
+        for(let node=this;node && rawDom.get(node,'nodeType')===1;node=rawDom.get(node,'parentNode')){
+            const value=rawDom.attrNS(node,null,'translate');
+            if(value===null)continue;
+            const mode=lower(value);
+            if(mode==='yes'||mode==='')return true;
+            if(mode==='no')return false;
+        }
+        return true;
+    },set(value){htmlBrand(this);reflectedAttr(this,'translate',value?'yes':'no');}});
+    // true and false are the attribute's states; otherwise an img, or an a with an href, is
+    // draggable by default.
+    define(HTMLElement.prototype,'draggable',{configurable:true,enumerable:true,get(){
+        htmlBrand(this);const value=lower(reflectedAttr(this,'draggable')||'');
+        if(value==='true')return true;
+        if(value==='false')return false;
+        const name=rawDom.get(this,'localName');
+        return name==='img' || (name==='a' && reflectedAttr(this,'href')!==null);
+    },set(value){htmlBrand(this);reflectedAttr(this,'draggable',value?'true':'false');}});
     function revealHidden(ancestors,owner){
         // Native flat-tree snapshot is captured before any author callback.
         // Use the real attribute mutation bridge, including CE/MO reactions.
@@ -412,6 +472,7 @@ const htmlElementsBridge = (() => {
         get(){htmlElementBrand(this,'link');return reflectedAttr(this,'disabled')!==null;},
         set(value){htmlElementBrand(this,'link');reflectedAttr(this,'disabled',value?'':null);}});
     for(const [C,tag] of [[HTMLAnchorElement,'a'],[HTMLAreaElement,'area']])tokenAttribute(C,tag,'relList','rel',[]);
+    reflect(HTMLFormElement,'form','rel');tokenAttribute(HTMLFormElement,'form','relList','rel',[]);
     reflect(HTMLStyleElement,'style','media');reflect(HTMLStyleElement,'style','type');
     tokenAttribute(HTMLStyleElement,'style','blocking','blocking',[]);
     // Native stylesheet disabled state is installed by js_stylesheets.js.
@@ -489,6 +550,9 @@ const htmlElementsBridge = (() => {
         return areas;
     }});
     reflectURL(HTMLEmbedElement,'src');
+    for(const property of ['name','type'])reflectInterface(HTMLObjectElement,property);
+    for(const property of ['name','type'])reflectInterface(HTMLAnchorElement,property);
+    reflectInterface(HTMLImageElement,'name');
     for(const property of ['type','width','height','align','name'])reflectInterface(HTMLEmbedElement,property);
     for(const property of ['name','value','type','valueType'])reflectInterface(HTMLParamElement,property);
     reflectInterface(HTMLFontElement,'color','color',true);reflectInterface(HTMLFontElement,'face');reflectInterface(HTMLFontElement,'size');

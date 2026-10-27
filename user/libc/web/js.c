@@ -39,6 +39,7 @@
 #include "js_worker.h"
 #include "js_wasm.h"
 #include "js_webgl.h"
+#include "js_webaudio.h"
 #include "js_navigator_native.h"
 #include "js_worker_wire.h"
 #include "frame.h"
@@ -203,6 +204,7 @@ struct web_js_state {
     struct js_frame_proxy *frame_proxies; /* only the runtime owner holds these */
     struct js_history_receiver *history_receiver;
     JSValue hooks, dispatch, response, reject, node_protos[NP_COUNT];
+    JSValue webaudio; /* js_webaudio.js's interfaces, once the realm touched one */
     struct js_node_ref *nodes;
     struct js_node_ref *node_buckets[JS_NODE_BUCKETS];
     bool node_cache_syncing, node_cache_failed;
@@ -214,7 +216,7 @@ struct web_js_state {
     web_workers *workers;
     bool worker_turn;
     struct js_socket *sockets;
-    bool socket_turn;
+    bool socket_turn, webaudio_turn;
     struct js_module *modules;
     struct js_import *imports;
     uint64_t module_visit;
@@ -305,8 +307,9 @@ struct web_js_state {
     bool parsing_done, parsing_cancelled, domcontent_sent, load_sent, disabled, timed_out, task_timed_out, parser_write, starting, scripts_prune_needed;
 };
 static JSClassID node_class,history_class;
-/* The browser's own checked-in programs: the bindings every realm runs, and
-   the locale program a realm runs when it first needs Intl. Each is compiled
+/* The browser's own checked-in programs: the bindings every realm runs, the
+   locale program a realm runs when it first needs Intl, and the Web Audio
+   program a realm runs when it first touches one of its interfaces. Each is compiled
    once per process, on a compiler thread when there is one, and its bytecode
    kept here. JS_ReadObject reads only bytecode this process wrote in memory,
    here and in js_compile, never bytes from a page, the network or storage. */
@@ -317,6 +320,7 @@ struct platform_program {
 };
 static struct platform_program bindings_program = {.source=js_bootstrap, .len=sizeof js_bootstrap - 1, .name="nocturne:browser-bindings"};
 static struct platform_program locale_program = {.source=js_locale, .len=sizeof js_locale - 1, .name="nocturne:locale"};
+static struct platform_program webaudio_program = {.source=js_webaudio, .len=sizeof js_webaudio - 1, .name="nocturne:webaudio"};
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic);
 static void dynamic_scripts(struct web_js_state *s, node_t *n);
 static void dynamic_inserted(struct web_js_state *s,node_t *parent,
@@ -338,6 +342,18 @@ static void request_styles(struct web_js_state *s);
 static bool parser_script_ready(struct web_js_state *s, struct js_script *script);
 static void document_stream_reset(struct web_js_state *s);
 static void pending_free(struct web_js_state *s, struct js_pending *p);
+/* A point query's hit as scope (a Document or ShadowRoot) may see it: the host at each
+   shadow boundary outside scope, never a node in a closed root through a Document. */
+static node_t *point_retarget(node_t *scope, node_t *hit) {
+    while (hit) {
+        node_t *root = doc_node_root(hit, false);
+        if (!root || !root->shadow_host) break; /* slotted light DOM */
+        for (node_t *ancestor = scope; ancestor; ancestor = doc_shadow_parent(ancestor))
+            if (ancestor == root) return hit;
+        hit = root->shadow_host;
+    }
+    return hit;
+}
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode);
 static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv);
 static bool frame_string_replace(char **slot, const char *text);
@@ -3256,34 +3272,45 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
 
     } break;
-    case DOM_elementFromPoint: {
+    case DOM_elementFromPoint: case DOM_elementsFromPoint: {
+        /* CSSOM View: the coordinates are WebIDL doubles, so a non-finite one throws. */
         double x, y;
+        bool many = opcode == DOM_elementsFromPoint;
         struct web_js_state *owner=NULL;
         if (!n || (n->type != N_DOC && !(n->type == N_FRAGMENT && n->shadow_host)))
             result = JS_ThrowTypeError(ctx, "Document or ShadowRoot receiver required");
         else if (argc < 4) result = JS_ThrowTypeError(ctx, "Two coordinates required");
-        else if (JS_ToFloat64(ctx, &x, argv[2]) || JS_ToFloat64(ctx, &y, argv[3]))
-            result = JS_EXCEPTION;
-        else if (!(owner=geometry_owner(s,d)) || !isfinite(x) || !isfinite(y) ||
-                 x < 0 || y < 0 || x >= d->width || y >= d->height) result = JS_NULL;
+        else if (JS_ToFloat64(ctx, &x, argv[2])) result = JS_EXCEPTION;
+        else if (!isfinite(x)) result = JS_ThrowTypeError(ctx, "The x coordinate is not a finite number");
+        else if (JS_ToFloat64(ctx, &y, argv[3])) result = JS_EXCEPTION;
+        else if (!isfinite(y)) result = JS_ThrowTypeError(ctx, "The y coordinate is not a finite number");
+        else if (!(owner=geometry_owner(s,d)) || x < 0 || y < 0 || x >= d->width || y >= d->height)
+            result = many ? JS_NewArray(ctx) : JS_NULL;
         else {
             flush_layout(owner);
             viewport_scroll_position(owner,&d->view_x,&d->view_y);
             int64_t px = (int64_t)x + d->view_x, py = (int64_t)y + d->view_y;
-            node_t *hit = px < INT32_MIN || px > INT32_MAX || py < INT32_MIN || py > INT32_MAX ? NULL :
-                          doc_element_at(d, (int)px, (int)py);
-            /* Return the host at each shadow boundary outside this scope,
-               never expose a closed root through a Document query. */
-            while (hit) {
-                node_t *scope = doc_node_root(hit, false);
-                if (!scope || !scope->shadow_host) break; /* slotted light DOM */
-                bool within = false;
-                for (node_t *ancestor = n; ancestor; ancestor = doc_shadow_parent(ancestor))
-                    if (ancestor == scope) { within = true; break; }
-                if (within) break;
-                hit = scope->shadow_host;
+            bool reachable = px >= INT32_MIN && px <= INT32_MAX && py >= INT32_MIN && py <= INT32_MAX;
+            if (!many) { result = wrap(s, point_retarget(n, reachable ? doc_element_at(d, (int)px, (int)py) : NULL)); break; }
+            node_t **hits = NULL; size_t count = 0;
+            if (reachable && !doc_elements_at(d, (int)px, (int)py, &hits, &count)) { result = oom(ctx); break; }
+            /* Each hit retargeted as elementFromPoint's, then the root element last. Hits in a row
+               on one element are one entry: a shadow tree's nodes under their host, a ::before
+               over its element. Apart, the element is listed again (a box between it and its
+               ::before). */
+            size_t kept = 0;
+            for (size_t i = 0; i < count; i++) {
+                node_t *hit = point_retarget(n, hits[i]);
+                if (hit && !(kept && hits[kept-1] == hit)) hits[kept++] = hit;
             }
-            result = wrap(s, hit);
+            result = JS_NewArray(ctx);
+            for (size_t i = 0; !JS_IsException(result) && i <= kept; i++) {
+                node_t *hit = i < kept ? hits[i] : kept && hits[kept-1] == d->html ? NULL : d->html;
+                if (!hit) continue;
+                JSValue object = wrap(s, hit);
+                if (JS_IsException(object) || JS_SetPropertyUint32(ctx, result, (uint32_t)i, object) < 0) { JS_FreeValue(ctx, result); result = JS_EXCEPTION; }
+            }
+            free(hits);
         }
 
     } break;
@@ -7514,6 +7541,15 @@ static bool run_atomics_waiters(struct web_js_state *s, uint64_t now) {
     end_task(s);
     return settled > 0;
 }
+/* What a Web Audio renderer posted (an ended source, a state reached, a rendering
+   complete) and decodeAudioData's work and completions. */
+static bool run_webaudio(struct web_js_state *s) {
+    if (s->disabled || !web_audio_ready(s->ctx)) return false;
+    begin_named_task(s,"Web Audio",0);
+    if (web_audio_run(s->ctx) < 0) exception(s);
+    end_task(s);
+    return true;
+}
 static bool run_posted_task(struct web_js_state *s) {
     struct js_posted_task *p = s->posted; if (!p) return false;
     s->posted = p->next; if (!s->posted) s->last_posted = NULL;
@@ -8006,6 +8042,7 @@ static bool idle_eligible(struct web_js_state *s, uint64_t now) {
     if (observers_dirty(s) && s->rendering_due <= now) return false;
     int64_t atomics = web_atomics_deadline(s->ctx, now);
     if (atomics >= 0 && (uint64_t)atomics <= now) return false;
+    if (web_audio_ready(s->ctx)) return false;
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->done || p->deadline <= now) return false;
     for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && timer_task_due(s, &s->timers[i]) <= now) return false;
     for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return false;
@@ -8025,6 +8062,8 @@ static uint64_t idle_period_deadline(struct web_js_state *s, uint64_t now) {
     if (worker >= 0 && (uint64_t)worker < end) end = (uint64_t)worker;
     int64_t atomics = web_atomics_deadline(s->ctx, now);
     if (atomics >= 0 && (uint64_t)atomics < end) end = (uint64_t)atomics;
+    int64_t audio = web_audio_deadline(s->ctx, now);
+    if (audio >= 0 && (uint64_t)audio < end) end = (uint64_t)audio;
     return end;
 }
 static bool run_idle_period(struct web_js_state *s, uint64_t now) {
@@ -8128,6 +8167,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
     s->indexed_db_turn=!ran;
     if(!ran){ran=!s->disabled&&s->storage_event_turn&&storage_run_event(s,now);s->storage_event_turn=!ran;}
     if(!ran){ran=!s->disabled&&s->socket_turn&&run_socket_event(s);s->socket_turn=!ran;}
+    if(!ran){ran=s->webaudio_turn&&run_webaudio(s);s->webaudio_turn=!ran;}
     /* Messages are ordinary JS tasks, with the same watchdog/checkpoint as
        events and timers. Alternate ready workers with other sources. */
     if (!ran && !s->disabled && s->worker_turn && web_worker_runnable(s->workers)) {
@@ -8244,6 +8284,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
         else if (run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
         else if (run_atomics_waiters(s, now)) { s->posted_turn = true; s->observer_turn = true; ran = true; }
         else if (run_socket_event(s)) ran = true;
+        else if (run_webaudio(s)) ran = true;
         else if (JS_IsJobPending(s->rt)||s->rejections||s->handled_rejections||s->rejection_oom) { begin_task(s); end_task(s); ran = true; }
         else if (web_worker_runnable(s->workers)) {
             begin_named_task(s,"Worker message",0); ran = web_worker_run_one(s->workers);
@@ -8265,7 +8306,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
 }
 /* --debug-js: which source set each document's script deadline (main thread only). */
 enum { JD_NONE, JD_NOW, JD_WORKER, JD_ATOMICS, JD_RESOURCE, JD_OBSERVERS, JD_STORAGE, JD_INDEXED_DB, JD_TIMER,
-       JD_ANIMATION_FRAME, JD_IDLE_TIMEOUT, JD_IDLE_PERIOD, JD_REASONS };
+       JD_ANIMATION_FRAME, JD_IDLE_TIMEOUT, JD_IDLE_PERIOD, JD_WEB_AUDIO, JD_REASONS };
 static uint64_t js_deadline_profile[JD_REASONS], js_deadline_soon[JD_REASONS], js_deadline_frame_soon[JD_REASONS];
 #define DUE_NOW() do { *why = JD_NOW; return (int64_t)now; } while (0)
 #define EARLIER(due, reason) do { uint64_t due_ = (due); if (due_ < deadline) { deadline = due_; *why = (reason); } } while (0)
@@ -8299,6 +8340,8 @@ static int64_t js_deadline(web_doc *d, int *why) {
         for (struct js_socket *p = s->sockets; p; p = p->next) if (p->events) DUE_NOW();
         for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) DUE_NOW();
         if (JS_IsJobPending(s->rt)) DUE_NOW();
+        int64_t audio_deadline = web_audio_deadline(s->ctx, now);
+        if (audio_deadline >= 0) EARLIER((uint64_t)audio_deadline, JD_WEB_AUDIO);
         if (observers_dirty(s)) EARLIER(s->rendering_due, JD_OBSERVERS);
         if (s->storage_origin && storage_listening(s) && (s->storage_subscribed[0]||s->storage_subscribed[1])) EARLIER(s->storage_poll_due, JD_STORAGE);
         if(s->indexed_db_failed&&s->indexed_db_pending)DUE_NOW();
@@ -8348,7 +8391,7 @@ int64_t web_js_deadline(web_doc *d) {
 }
 int web_js_deadline_report(char *out, size_t size) {
     static const char *const names[JD_REASONS] = {"none", "now", "Worker", "Atomics", "resource", "observers",
-        "storage event", "IndexedDB", "timer", "animation frame", "idle timeout", "idle period"};
+        "storage event", "IndexedDB", "timer", "animation frame", "idle timeout", "idle period", "Web Audio"};
     int n = snprintf(out, size, "Script deadline profile (all/within 16 ms/of those in frames):");
     for (int i = 0; i < JD_REASONS && n >= 0 && (size_t)n < size; i++)
         n += snprintf(out + n, size - (size_t)n, "%s %s %lu/%lu/%lu", i ? "," : "", names[i],
@@ -8448,6 +8491,7 @@ static void platform_prepare(struct platform_program *p) {
 void web_js_prepare(void) {
     platform_prepare(&bindings_program);
     platform_prepare(&locale_program);
+    platform_prepare(&webaudio_program);
 }
 /* Where running a platform program went: waiting for the compiler, reading
    (or, without one, compiling) the bytecode, and running it. */
@@ -8507,6 +8551,38 @@ static JSValue native_locale(JSContext *ctx, JSValueConst this_val, int argc, JS
     }
     return fn;
 }
+/* js_webaudio.js's interfaces in this realm: the program runs, with host.webaudio
+   and the event bridge, the first time the page touches one of them. */
+static JSValue webaudio_interface(JSContext *ctx, JSAtom name, void *opaque) {
+    (void)opaque;
+    struct web_js_state *s = state(ctx);
+    if (!s) return JS_UNDEFINED;
+    if (JS_IsUndefined(s->webaudio)) {
+        size_t before = s->runtime_owner->allocation.current;
+        JSValue bridge = JS_GetPropertyStr(ctx, s->hooks, "webaudioBridge");
+        if (JS_IsException(bridge)) return bridge;
+        JSValue api = JS_GetPropertyStr(ctx, bridge, "host");
+        if (JS_IsException(api)) { JS_FreeValue(ctx, bridge); return api; }
+        web_js_webaudio_init(ctx, api);
+        JS_FreeValue(ctx, api);
+        struct bindings_profile profile = {0};
+        JSValue fn = platform_run(ctx, &webaudio_program, &profile);
+        JSValue exports = JS_IsException(fn) ? fn : JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&bridge);
+        JS_FreeValue(ctx, fn); JS_FreeValue(ctx, bridge);
+        if (JS_IsException(exports)) return exports;
+        s->webaudio = exports;
+        if (s->host.debug_js) {
+            size_t after = s->runtime_owner->allocation.current;
+            char message[160];
+            snprintf(message, sizeof message, "Web Audio program: compiler wait %llu, read %llu, run %llu ms; heap +%zu KiB",
+                     (unsigned long long)profile.wait_ms, (unsigned long long)profile.read_ms, (unsigned long long)profile.run_ms,
+                     (after > before ? after - before : 0) / 1024);
+            log_text(s, 0, message);
+        }
+    }
+    return JS_GetProperty(ctx, s->webaudio, name);
+}
+static const JSLazyProperty webaudio_lazy = {webaudio_interface, NULL};
 void web_js_start(web_doc *d, const struct web_host *host) {
     struct web_js_state *s = calloc(1, sizeof *s); if (!s) return;
     d->js = s; s->doc = d; s->stream_generation=1; if (host) s->host = *host;
@@ -8535,7 +8611,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         timing_record(s, JS_RESPONSE_END, navigation->response_end_ms);
     timing_record(s, JS_DOM_LOADING, initialized);
     s->observer_turn = true;
-    s->hooks = s->dispatch = s->response = s->reject = JS_UNDEFINED;
+    s->hooks = s->dispatch = s->response = s->reject = s->webaudio = JS_UNDEFINED;
     for (int i = 0; i < NP_COUNT; i++) s->node_protos[i] = JS_UNDEFINED;
     /* Grow on demand through the real OS allocator. An invented page quota
        must not turn available memory into a JavaScript compatibility failure. */
@@ -8660,6 +8736,10 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
         }
     node_cache_release(s);
     if (prototype_failed) { exception(s); end_task(s); goto failed; }
+    JSValue window = JS_GetGlobalObject(s->ctx);
+    bool audio = web_audio_install(s->ctx, window, &webaudio_lazy);
+    JS_FreeValue(s->ctx, window);
+    if (!audio) { exception(s); end_task(s); goto failed; }
     storage_subscribe_document(s);
     end_task(s); s->starting = false;
     /* A script-disabled sandbox realm stays active for its same-origin
@@ -8721,6 +8801,8 @@ void web_js_free(web_doc *d) {
         for (int i = 0; i < NP_COUNT; i++) JS_FreeValue(s->ctx, s->node_protos[i]);
         web_atomics_release(s->ctx);
         web_opfs_release(s->ctx);
+        web_audio_realm_free(s->ctx);
+        JS_FreeValue(s->ctx, s->webaudio);
         JS_SetContextOpaque(s->ctx,NULL); /* queued host jobs must reject retired realms */
         JS_FreeContext(s->ctx);
     }

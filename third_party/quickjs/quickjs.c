@@ -524,6 +524,7 @@ typedef enum {
     JS_AUTOINIT_ID_PROTOTYPE,
     JS_AUTOINIT_ID_MODULE_NS,
     JS_AUTOINIT_ID_PROP,
+    JS_AUTOINIT_ID_HOST, /* JS_DefineLazyProperty */
 } JSAutoInitIDEnum;
 
 /* must be large enough to have a negligible runtime cost and small
@@ -8446,10 +8447,17 @@ int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
 /* return the value associated to the autoinit property or an exception */
 typedef JSValue JSAutoInitFunc(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque);
 
+static JSValue js_host_autoinit(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque)
+{
+    const JSLazyProperty *lazy = opaque;
+    return lazy->init(ctx, atom, lazy->opaque);
+}
+
 static JSAutoInitFunc *js_autoinit_func_table[] = {
     js_instantiate_prototype, /* JS_AUTOINIT_ID_PROTOTYPE */
     js_module_ns_autoinit, /* JS_AUTOINIT_ID_MODULE_NS */
     JS_InstantiateFunctionListItem2, /* JS_AUTOINIT_ID_PROP */
+    js_host_autoinit, /* JS_AUTOINIT_ID_HOST */
 };
 
 /* warning: 'prs' is reallocated after it */
@@ -10936,6 +10944,22 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
     }
 
     return JS_CreateProperty(ctx, p, prop, val, getter, setter, flags);
+}
+
+static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,
+                                     JSAtom prop, JSAutoInitIDEnum id,
+                                     void *opaque, int flags);
+
+int JS_DefineLazyProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop,
+                          const JSLazyProperty *lazy, int flags)
+{
+    JSProperty *pr;
+    if (JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT)
+        return FALSE;
+    if (find_own_property(&pr, JS_VALUE_GET_OBJ(this_obj), prop))
+        return FALSE;
+    return JS_DefineAutoInitProperty(ctx, this_obj, prop, JS_AUTOINIT_ID_HOST,
+                                     (void *)lazy, flags);
 }
 
 static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,

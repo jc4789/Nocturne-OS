@@ -108,6 +108,10 @@
             brand(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
             return rawDom.elementFromPoint(this,x,y);
         };
+        Document.prototype.elementsFromPoint=function(x,y){
+            brand(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
+            return rawDom.elementsFromPoint(this,x,y);
+        };
         Document.prototype.getElementsByName=function(name){brand(this);if(!arguments.length)throw new TypeError('Missing name');const query='[name="'+CSS.escape(string(name))+'"]';return collectionBridge.domLive(this,()=>dom('query',this,query,false));};
         function create(receiver,name,options,foreign){
             brand(receiver);name=string(name);

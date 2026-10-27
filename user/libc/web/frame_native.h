@@ -11,6 +11,7 @@ static void frame_retire_document(web_doc *d) {
     struct web_js_state *s=d?d->js:NULL;if(!s)return;
     s->disabled=true;
     web_js_wasm_cancel(s->ctx);
+    web_audio_realm_end(s->ctx);
     storage_release_document(s);
     web_presentation_free(d);
     release_document_tasks(s);

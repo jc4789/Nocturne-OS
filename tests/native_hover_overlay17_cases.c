@@ -6,8 +6,8 @@ static void walk(struct pctx *P){
        order. Selection/reset and final activation are unchanged product C. */
     for(unsigned i=0;i<walk_count;i++){
         node_t *n=walk_nodes[i];if(!hit_style(n->style))continue;
-        hit_target(P,n);
-        if(node_attr(n,"href"))set_hit(P,WEB_HIT_NONE,NULL,n);
+        hit_target(P,n,PE_NONE);
+        if(node_attr(n,"href"))set_hit(P,WEB_HIT_NONE,NULL,NULL,n);
         if(legend && n->tag==T_details)set_disclosure_hit(P,n);
     }
 }
@@ -58,7 +58,7 @@ int main(void){
     sibling.style=&auto_style;auto_style.opacity=0;
     check(!web_hit_test(&top,1,1,&hit)&&!hit.href,"transparent auto overlay still hit-tests");
     sibling.parent=&a;check(web_hit_test(&top,1,1,&hit)&&hit.node==&a,"ordinary descendant resolves its true ancestor link");sibling.parent=&parent;
-    struct web_hit pending={.kind=WEB_HIT_LINK,.node=&a,.href=href.value};struct pctx P={.hit=&pending,.target=&a,.hit_any=true};hit_target(&P,&sibling);
+    struct web_hit pending={.kind=WEB_HIT_LINK,.node=&a,.href=href.value};struct pctx P={.hit=&pending,.target=&a,.hit_any=true};hit_target(&P,&sibling,PE_NONE);
     check(P.target==&sibling&&!P.hit_any&&!pending.href&&pending.kind==WEB_HIT_NONE,"every native target update clears stale action state");
     node_t details={.type=N_ELEM,.tag=T_details,.owner=&top,.parent=&root,.style=&auto_style};walk_nodes[0]=&details;walk_count=1;legend=false;
     check(!web_hit_test(&top,1,1,&hit)&&hit.kind==WEB_HIT_NONE,"default details body is not an invented legend hit");

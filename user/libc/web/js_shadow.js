@@ -29,6 +29,10 @@ const shadowBridge = (() => {
             shadow(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
             return rawDom.elementFromPoint(this,x,y);
         }
+        elementsFromPoint(x,y){
+            shadow(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
+            return rawDom.elementsFromPoint(this,x,y);
+        }
     }
     class HTMLSlotElement extends HTMLElement {
         constructor(){return customElementsBridge.construct(new.target,HTMLSlotElement);}

@@ -278,6 +278,23 @@ const formControlBridge = (() => {
         get() { brand(this); return rawDom.get(this, dimension === 'width' ? 'inputWidth' : 'inputHeight'); },
         set(value) { brand(this); reflect(this, dimension, '' + (numeric(value) >>> 0)); }});
     enumeration(HTMLTextAreaElement, 'textarea', 'wrap', 'wrap', ['soft','hard'], 'soft');
+    for (const [C, tag] of [[HTMLInputElement,'input'],[HTMLButtonElement,'button'],[HTMLSelectElement,'select'],
+        [HTMLTextAreaElement,'textarea'],[HTMLFieldSetElement,'fieldset'],[HTMLOutputElement,'output']]) reflectedString(C, tag, 'name');
+    for (const [C, tag] of [[HTMLInputElement,'input'],[HTMLTextAreaElement,'textarea']]) reflectedString(C, tag, 'placeholder');
+    for (const [C, tag] of [[HTMLTextAreaElement,'textarea'],[HTMLFieldSetElement,'fieldset'],[HTMLOutputElement,'output']]) readonly(C, tag, 'type', () => tag);
+    define(HTMLInputElement.prototype, 'src', {configurable:true, enumerable:true,
+        get() { return elementURL.attribute(this, 'input', 'src', false); },
+        set(value) { brand(this); reflect(this, 'src', elementURL.scalar(value)); }});
+    // A submit button reports "submit"; otherwise the keyword of its state, the Auto
+    // state (a button wired to a command, or in a select) being "button".
+    define(HTMLButtonElement.prototype, 'type', {configurable:true, enumerable:true,
+        get() {
+            htmlElementBrand(this, 'button');
+            if (dom('validation', this, 'submitButton')) return 'submit';
+            const value = (reflect(this, 'type') || '').replace(/[A-Z]/g, letter => string.fromCharCode(letter.charCodeAt(0) + 32));
+            return value === 'reset' ? 'reset' : 'button';
+        },
+        set(value) { htmlElementBrand(this, 'button'); reflect(this, 'type', text(value)); }});
     // WHATWG autofill processing: IDL exposes valid, ASCII-normalized tokens,
     // not arbitrary attribute text. Native search history separately enforces
     // its opt-in/privacy policy; reflecting a credential token never saves it.

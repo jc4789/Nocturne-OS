@@ -829,6 +829,12 @@ struct deco {
 };
 
 node_t *doc_element_at(web_doc *d,int x,int y); /* hit retargeted to this Document's frame boundary */
+/* Every hit-test target at (x, y) in this Document, topmost first, each element once and
+   each of its ::before/::after boxes once as the element (CSSOM View's elementsFromPoint
+   before shadow retargeting). Child frames are not entered:
+   their element is the target. *elements is NULL when nothing is hit; the caller frees it.
+   false only when memory ran out. */
+bool doc_elements_at(web_doc *d,int x,int y,node_t ***elements,size_t *count);
 void doc_hover_update(web_doc *document,node_t *target); /* native-only CSS state; no JS dispatch */
 void doc_active_cancel(web_doc *document); /* retire/free only this context subtree */
 node_t *doc_active_target(web_doc *document); /* validates live native press and embedding generation */

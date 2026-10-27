@@ -54,3 +54,23 @@ css_rule_info の text はシートの元の文（注釈を除いた写し）の
 対象: kernel/src/sys/sched.c, kernel/src/arch/idt.c, kernel/src/sys/syscall.c
 確かめた: 2026-10-26 304be1a1
 user の thread は AP で走るが、AP で片付かない呼出しは BSP へ回り（sched_ap_interrupt → isr_dispatch_remote → syscall_dispatch）、BSP が一つずつ行う。ファイルの読み込み（大きなプログラムの起動）や核の中の回り続けは、その間の他の app の呼出しを全部待たせる。ゲストが止まって見えたら、QEMU の HMP で `info registers -a` を取り、CPU0 の RIP と RBP の鎖（x /2gx）を build/kernel.elf で llvm-symbolizer に引く。
+
+## 外部の ArrayBuffer の free_func は二度呼ばれる
+対象: third_party/quickjs/quickjs.c, user/libc/web/js_webaudio.c, user/libc/web/*.c
+確かめた: 2026-10-27 215d0d6c
+JS_NewArrayBuffer で作った外部の buffer を JS_DetachArrayBuffer で切り離すと、その場で free_func(rt, opaque, data) が呼ばれ、後で ArrayBuffer の finalizer がもう一度 free_func を呼ぶ（data は NULL）。opaque に参照を持たせる free_func は、data が NULL の時に何もしない。2026-10-27、AudioBuffer の channel の free_func が二度参照を落とし、acquire-the-content の試験で解放後の読み出しになった。
+
+## AUTOINIT の大域は閉包を作る時に実体になる
+対象: third_party/quickjs/quickjs.c, user/libc/web/js.c, user/libc/web/js_webaudio.c
+確かめた: 2026-10-27 215d0d6c
+JS_DefineLazyProperty（Nocturne の追加）で定義した大域の名前は、その名前を参照する関数の閉包を作る時（js_closure_global_var）に初めの関数が呼ばれ、実体になる。名前を書いた関数を作るだけで Web Audio の program が走るので、「触れた時に読む」は「その名前を含む関数が作られた時に読む」の意味。初めの関数（JS_AutoInitProperty）は、その property 自身を書き換えてはいけない。
+
+## wasm2c の CWriter::Write(char) は数を書く
+対象: third_party/wabt/src/c-writer.cc
+確かめた: 2026-10-27 215d0d6c
+CWriter の Write には char の重ね書きが無く、Write('.') や Write(MangleType(t)) は Write(uint64_t) へ落ちて「46」のような数を書く。一文字は std::string(1, c) にして渡す。2026-10-27、多値の結果の member 名（.i0）を組む所で起き、生成した C が「cannot convert 'struct wasm_multi_ii'」で TCC に通らず、231 KB の module が解釈器へ落ちていた（再現は Bilibili の動画の頁）。
+
+## 生成の箱は元の要素を node に持ち、style で見分ける
+対象: user/libc/web/box.c, user/libc/web/paint.c, user/libc/web/layout.c
+確かめた: 2026-10-27 215d0d6c
+::before・::after の箱（pseudo_box）は node に元の要素、st にその pseudo の style を持つ。中の text の run も node は元の要素で、st は pseudo の style。箱・run・deco が要素自身のものか生成のものかは、st が node->style->before／after と同じかで分かる（paint.c の hit_pseudo）。restyle は replacement_style で before／after も新しい style へ付け替えるので、この等しさは保たれる。node だけで重複を除くと、要素と、その ::before が一つにまとまる。

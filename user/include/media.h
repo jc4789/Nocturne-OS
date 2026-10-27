@@ -49,6 +49,11 @@ struct nmedia_output {
        holding the top 8 bits. Otherwise NULL, and such sources are ordered-
        dithered to 8 bits; 8-bit sources are converted exactly as before. */
     const uint8_t *deep;
+    /* With nmedia_set_audio_native, audio comes as decoded instead of samples:
+       frames of native_channels float planes at native_rate (valid until the
+       next step). */
+    const float *const *native_planes;
+    int native_channels, native_rate;
 };
 nmedia *nmedia_open(const char *path, char *error, size_t error_size);
 /* Anonymous HTTP(S), bounded synchronous Range cache. Large resources require
@@ -76,6 +81,9 @@ void nmedia_close(nmedia *media);
    bits through nmedia_draw_deep and dithers where the pixel lands on an 8 bpc
    display, or keeps them on a 10 bpc one. */
 void nmedia_set_deep(nmedia *media, bool deep);
+/* Deliver audio as it was decoded, with no mixing to stereo and no resampling
+   to SOUND_RATE (output native_planes): what decodeAudioData keeps. */
+void nmedia_set_audio_native(nmedia *media, bool native);
 bool nmedia_audio_extension(const char *name);
 /* Returns "maybe", "probably", or ""; never claims an unbuilt codec/MSE/DRM. */
 const char *nmedia_can_play_type(const char *type);

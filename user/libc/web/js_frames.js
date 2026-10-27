@@ -74,8 +74,12 @@
                 setPrototypeOf(){return false;},preventExtensions(){return false;}
             });proxy=access('proxySet',token,proxy);proxies.set(token,proxy);return proxy;
         }
-        for(const proto of [HTMLIFrameElement.prototype,HTMLFrameElement.prototype]){
+        for(const [proto,tag] of [[HTMLIFrameElement.prototype,'iframe'],[HTMLFrameElement.prototype,'frame']]){
             Object.defineProperties(proto,{
+                src:{configurable:true,enumerable:true,get(){return elementURL.attribute(this,tag,'src',false);},
+                    set(value){htmlElementBrand(this,tag);reflectedAttr(this,'src',elementURL.scalar(value));}},
+                name:{configurable:true,enumerable:true,get(){htmlElementBrand(this,tag);return reflectedAttr(this,'name')||'';},
+                    set(value){htmlElementBrand(this,tag);reflectedAttr(this,'name',elementURL.string(value));}},
                 contentWindow:{configurable:true,get(){return windowProxy(access('window',this));}},
                 contentDocument:{configurable:true,get(){return access('document',this);}},
                 srcdoc:{configurable:true,get(){return reflectedAttr(this,'srcdoc')||'';},set(value){reflectedAttr(this,'srcdoc',String(value));}},

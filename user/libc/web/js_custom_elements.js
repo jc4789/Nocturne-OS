@@ -223,8 +223,12 @@ const customElementsBridge = (() => {
                 const element = invokeConstructor(d), s = states.get(element);
                 if (!s || s.definition !== d || get(element,'nodeType') !== 1 || get(element,'namespaceURI') !== HTML)
                     throw new TypeError('Constructor did not create an HTMLElement');
-                if (get(element,'localName') !== name || get(element,'parentNode') || children(element).length || get(element,'attributeNames').length || get(element,'ownerDocument')!==document)
-                    throw fail('Custom element constructor changed its name, parent, children or attributes');
+                // DOM's create an element, the synchronous constructor's checks in order.
+                if (get(element,'attributeNames').length) throw fail('The custom element constructor gave the result attributes');
+                if (children(element).length) throw fail('The custom element constructor gave the result children');
+                if (get(element,'parentNode')) throw fail('The custom element constructor gave the result a parent');
+                if (get(element,'ownerDocument')!==document) throw fail('The custom element constructor\'s result belongs to another document');
+                if (get(element,'localName') !== name) throw fail('The custom element constructor\'s result has another local name');
                 if(get(element,'ownerDocument')!==owner)rawDom.adopt(owner,element);
                 return element;
             } catch (e) {
