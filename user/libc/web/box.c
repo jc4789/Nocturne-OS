@@ -1675,11 +1675,15 @@ static bool restyle_derived(box_t *b, style_t *old) {
 static void restyle_boxes(box_t *b,bool inherited_borrow) {
     if (!b||(!inherited_borrow&&!b->style_sync_dirty)) return;
     b->paint_layers_valid=false; /* paint-only effects can change stacking without new geometry */
-    bool own_borrow=b->node&&b->node->style_previous;
+    bool own_borrow=(b->node&&b->node->style_previous)||b->style_sync_subtree;
     style_t *old = b->st;
     if (restyle_derived(b,old)) {
         /* The stable derived-style slot also updates existing run borrows. */
+    } else if ((b->st=replacement_style(box_style_node(b),old)) != old) {
+        /* a node's style, or the one an anonymous ::backdrop box borrows */
+        if (!css_style_layout_equal(old,b->st)) layout_invalidate(b);
     } else if (b->anon && b->parent) {
+        /* the box arena's own anonymous style, inherited from the parent box's */
         int display = old->display;
         style_t next;
         css_style_init(&next, b->parent->st);
@@ -1690,9 +1694,6 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
         }
         if (!css_style_layout_equal(old,&next)) layout_invalidate(b);
         *old = next;
-    } else {
-        b->st=replacement_style(box_style_node(b),old);
-        if (b->st != old && !css_style_layout_equal(old,b->st)) layout_invalidate(b);
     }
     /* An unchanged element may keep cached geometry even when its new style
        has exactly the same values. Cached paint runs/decorations still borrow
@@ -1709,7 +1710,7 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
     b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
         (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || box_transformed(b));
     for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }
-    b->style_sync_dirty=false;
+    b->style_sync_dirty=b->style_sync_subtree=false;
 }
 void boxes_restyle(web_doc *d) {
     restyle_boxes(d->root_box,false);

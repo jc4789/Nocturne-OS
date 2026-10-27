@@ -5713,10 +5713,26 @@ static bool style_box_compatible(node_t *e, const style_t *old, const style_t *n
         old->display==D_FLEX||old->display==D_INLINE_FLEX||old->display==D_GRID||old->display==D_INLINE_GRID;
 }
 
+/* The boxes that borrow e's computed style, for the supervisor's join to refresh: e's own
+   box and its subtree, reached down the path marked dirty. A display:contents element has
+   no box; its text and ::before/::after boxes are below its nearest boxed flat ancestor's,
+   which the join then refreshes whole. A modal dialog's ::backdrop box is the root's child. */
+static void mark_style_borrowers(web_doc *d, node_t *e) {
+    box_t *b = e->box;
+    if (!b && e->style && e->style->display == D_CONTENTS) {
+        node_t *a = doc_flat_parent(e);
+        while (a && !a->box && a->style && a->style->display == D_CONTENTS) a = doc_flat_parent(a);
+        if ((b = a ? a->box : NULL)) __atomic_store_n(&b->style_sync_subtree, true, __ATOMIC_RELAXED);
+    }
+    for (; b; b = b->parent) __atomic_store_n(&b->style_sync_dirty, true, __ATOMIC_RELAXED);
+    if (e->style && e->style->backdrop)
+        for (b = web_dialog_backdrop(d, e); b; b = b->parent) __atomic_store_n(&b->style_sync_dirty, true, __ATOMIC_RELAXED);
+}
+
 static void retire_style(struct cascade *c, node_t *e) {
     /* Boxes are stable during the parallel cascade; only monotone dirty
        publication happens here. The supervisor refreshes borrows after join. */
-    for(box_t *b=e->box;b;b=b->parent)__atomic_store_n(&b->style_sync_dirty,true,__ATOMIC_RELAXED);
+    mark_style_borrowers(c->d, e);
     e->style_previous = e->style; e->style_previous_mem = e->style_mem;
     e->style_previous_slots = e->style_slots; e->style_slots = NULL;
     memset(&e->style_mem, 0, sizeof e->style_mem);
@@ -5963,9 +5979,12 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         if (!style_box_compatible(e, e->style_previous, s)) {
             __atomic_store_n(&d->style_boxes_changed, true, __ATOMIC_RELAXED);
             /* This worker alone writes e; the publication after the join reads
-               box_regen from the retired list, and the release clears it. */
-            if(e->style_previous){e->box_regen=true;__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);}
-            if(d->profile_enabled && e->style_previous)__atomic_store_n(&d->box_change_node,e,__ATOMIC_RELAXED);
+               box_regen from the retired list, and the release clears it. A moved
+               element has no previous style (its removal unpublished it), but its
+               box, still in the tree, borrows the arena that retires now. */
+            bool boxed = e->style_previous || e->box;
+            if(boxed){e->box_regen=true;__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);}
+            if(d->profile_enabled && boxed)__atomic_store_n(&d->box_change_node,e,__ATOMIC_RELAXED);
         }
         if (self_only && !e->animation_base_style && adopt_inherited(e)) {
             children_redo = false; adopted = true;

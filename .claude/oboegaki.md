@@ -74,3 +74,11 @@ CWriter の Write には char の重ね書きが無く、Write('.') や Write(Ma
 対象: user/libc/web/box.c, user/libc/web/paint.c, user/libc/web/layout.c
 確かめた: 2026-10-27 215d0d6c
 ::before・::after の箱（pseudo_box）は node に元の要素、st にその pseudo の style を持つ。中の text の run も node は元の要素で、st は pseudo の style。箱・run・deco が要素自身のものか生成のものかは、st が node->style->before／after と同じかで分かる（paint.c の hit_pseudo）。restyle は replacement_style で before／after も新しい style へ付け替えるので、この等しさは保たれる。node だけで重複を除くと、要素と、その ::before が一つにまとまる。
+
+## 箱の st が借りる装いは、release の前に付け替えるか作り直す
+対象: user/libc/web/css.c, user/libc/web/box.c, user/libc/web/doc.c, user/libc/web/dom.c
+確かめた: 2026-10-27 501b0ffd
+箱・run・deco の st は節の装いの arena を借りる。cascade の retire_style が古い装いを style_previous へ移し、doc.c の公開が boxes_restyle（restyle_boxes が replacement_style で新しい装いへ付け替える）と局所の作り直しの後に css_styles_release で古い arena を放す。restyle_boxes は style_sync_dirty の道だけを降りるので、借りる箱に印が届かないと解放後の読み出しになる。
+- 節を外す（dom.c の doc_node_remove）と css_node_style_unpublish が style を NULL にし、arena は残す。同じ親へ入れ直す（並べ替え）と、cascade は style_previous の無いまま新しい装いを作り、古い arena は retire で放される。箱は local_splice が「box_regen でなければ残す」ので、box_regen を立てないと古い st のまま残る。2026-10-27、これでスクロール中に css_transform_general が落ちた（再現は Bilibili の頁の、shadow DOM の中の並べ替え）。
+- display:contents の要素は箱を持たず、その文字・::before・::after の箱が装いを借りる。modal の dialog の ::backdrop の箱は root の子で anon。どちらも mark_style_borrowers が印を付ける。
+- 確かめ方：release の直前に全部の箱で replacement_style(box_style_node(b),b->st)!=b->st を探すと付け替え漏れが、st!=node->style（node->box==b）を探すと作り直し漏れが見える。

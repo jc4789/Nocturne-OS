@@ -732,6 +732,7 @@ typedef struct box {
     struct radius_cache *radius_clip[3]; /* border, padding, replaced-content clip masks */
     struct clip_cache *clip_cache; /* clip-path's shape coverage; box lifetime */
     bool style_sync_dirty; /* retirement join: this subtree has changed style borrows */
+    bool style_sync_subtree; /* and every box below may borrow one: a display:contents element generated them */
     /* inline formatting results (block containers with inline content) */
     struct run *runs;
     int nruns;
