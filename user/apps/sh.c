@@ -6,8 +6,7 @@
 #include <errno.h>
 #include "nocturne.h"
 
-#define MAX_LINE 1024
-#define MAX_ARGS 64
+#define MAX_LINE 1024 /* a line typed at the prompt; scripts and "sh -c" have no such limit */
 #define MAX_HIST 64
 #define WELCOME  "C:\\Nocturne\\Welcome.txt" /* shown when the shell starts at a terminal */
 
@@ -291,11 +290,19 @@ struct token {
     bool quoted;
 };
 
-static int tokenize(const char *s, struct token *toks, int max) {
-    int n = 0;
-    while (n < max - 1) {
+/* The tokens of a line, however many it has, ending with T_END; NULL without memory. */
+static struct token *tokenize(const char *s, int *count) {
+    int n = 0, cap = 16;
+    struct token *toks = malloc(sizeof *toks * (size_t)cap);
+    if (!toks) return NULL;
+    for (;;) {
         while (*s == ' ' || *s == '\t') s++;
         if (!*s || *s == '#') break;
+        if (n + 1 >= cap) {
+            struct token *more = realloc(toks, sizeof *toks * (size_t)(cap *= 2));
+            if (!more) goto failed;
+            toks = more;
+        }
         struct token *t = &toks[n++];
         t->text = NULL;
         t->quoted = false;
@@ -309,35 +316,40 @@ static int tokenize(const char *s, struct token *toks, int max) {
         if (*s == '&') { t->type = T_AMP; s++; continue; }
         if (*s == ';') { t->type = T_SEMI; s++; continue; }
         t->type = T_WORD;
-        char buf[MAX_LINE];
-        int bl = 0;
+        char *buf = malloc(strlen(s) + 1); /* a word is never longer than the rest of its line */
+        if (!buf) goto failed;
+        size_t bl = 0;
         while (*s && !strchr(" \t|<>&;", *s)) {
             if (*s == '"' || *s == '\'') {
                 char q = *s++;
                 t->quoted = true;
                 while (*s && *s != q) {
                     if (q == '"' && *s == '$' && s[1] == '?') {
-                        if (bl < MAX_LINE - 1) buf[bl++] = '\x01'; /* $?, expanded at run time */
+                        buf[bl++] = '\x01'; /* $?, expanded at run time */
                         s += 2;
                         continue;
                     }
-                    if (bl < MAX_LINE - 1) buf[bl++] = *s;
-                    s++;
+                    buf[bl++] = *s++;
                 }
                 if (*s) s++;
             } else if (*s == '$' && s[1] == '?') {
-                if (bl < MAX_LINE - 1) buf[bl++] = '\x01'; /* $?, expanded at run time */
+                buf[bl++] = '\x01'; /* $?, expanded at run time */
                 s += 2;
             } else {
-                if (bl < MAX_LINE - 1) buf[bl++] = *s;
-                s++;
+                buf[bl++] = *s++;
             }
         }
         buf[bl] = 0;
-        t->text = strdup(buf);
+        t->text = buf;
     }
     toks[n].type = T_END;
-    return n;
+    toks[n].text = NULL;
+    *count = n;
+    return toks;
+failed:
+    for (int i = 0; i < n; i++) free(toks[i].text);
+    free(toks);
+    return NULL;
 }
 
 /* glob matching with * and ?, letter case aside as names compare */
@@ -356,35 +368,64 @@ static bool match(const char *p, const char *s) {
 
 static int cmp_str(const void *a, const void *b) { return strcmp(*(char **)a, *(char **)b); }
 
-static int expand_glob(const char *pat, char **argv, int argc, int max) {
-    if (!strpbrk(pat, "*?")) {
-        argv[argc++] = strdup(pat);
-        return argc;
+/* One command of a pipeline: argv holds argc words, then NULL. */
+struct cmd {
+    char **argv;
+    int argc, cap;
+    char *in, *out, *err;
+    bool append;
+};
+
+/* Add a word (malloc'd, or NULL without memory) to the command's arguments, as many as it has. */
+static bool add_arg(struct cmd *c, char *word) {
+    if (word && c->argc + 1 >= c->cap) {
+        int cap = c->cap ? c->cap * 2 : 8;
+        char **more = realloc(c->argv, sizeof *more * (size_t)cap);
+        if (more) c->argv = more, c->cap = cap;
+        else free(word), word = NULL;
     }
+    if (!word) {
+        fprintf(stderr, "sh: %s\n", n_result_text(-N_ERR_NO_MEMORY));
+        return false;
+    }
+    c->argv[c->argc++] = word;
+    c->argv[c->argc] = NULL;
+    return true;
+}
+
+/* The word, or the names it matches with * and ?, sorted. */
+static bool expand_glob(const char *pat, struct cmd *c) {
+    if (!strpbrk(pat, "*?")) return add_arg(c, strdup(pat));
     /* the folder as typed, with its separator: it starts every match */
-    char dir[MAX_LINE] = "";
     const char *file = pat, *sep = last_separator(pat);
-    if (sep) {
-        memcpy(dir, pat, sep - pat + 1);
-        dir[sep - pat + 1] = 0;
-        file = sep + 1;
-    }
-    int start = argc;
+    size_t dl = sep ? (size_t)(sep - pat + 1) : 0;
+    char *dir = malloc(dl + 1);
+    if (!dir) return add_arg(c, NULL);
+    memcpy(dir, pat, dl);
+    dir[dl] = 0;
+    if (sep) file = sep + 1;
+    int start = c->argc;
+    bool ok = true;
     char path[4096];
     struct n_entry *ents;
     n_result count = complete_name(dir, path, sizeof path) ? n_folder_entries(path, &ents) : -1;
     if (count >= 0) {
-        for (int i = 0; i < (int)count && argc < max; i++) {
+        for (int i = 0; ok && i < (int)count; i++) {
             if (!match(file, ents[i].name)) continue;
-            char full[MAX_LINE + sizeof ents[i].name];
-            snprintf(full, sizeof full, "%s%s", dir, ents[i].name);
-            argv[argc++] = strdup(full);
+            char *full = malloc(dl + strlen(ents[i].name) + 1);
+            if (full) {
+                memcpy(full, dir, dl);
+                strcpy(full + dl, ents[i].name);
+            }
+            ok = add_arg(c, full);
         }
         free(ents);
     }
-    if (argc == start) argv[argc++] = strdup(pat);
-    else qsort(argv + start, argc - start, sizeof(char *), cmp_str);
-    return argc;
+    free(dir);
+    if (!ok) return false;
+    if (c->argc == start) return add_arg(c, strdup(pat));
+    qsort(c->argv + start, c->argc - start, sizeof(char *), cmp_str);
+    return true;
 }
 
 /* ---- builtins ---- */
@@ -437,12 +478,6 @@ static bool builtin(int argc, char **argv, int *status) {
 }
 
 /* ---- execution ---- */
-struct cmd {
-    char *argv[MAX_ARGS];
-    int argc;
-    char *in, *out, *err;
-    bool append;
-};
 
 static void close_handle(n_handle *h) {
     if (*h >= 0) n_handle_close(*h);
@@ -636,47 +671,79 @@ static int run_pipeline(struct cmd *cmds, int n, bool background) {
 }
 
 static void free_cmds(struct cmd *cmds, int n) {
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
         for (int j = 0; j < cmds[i].argc; j++) free(cmds[i].argv[j]);
+        free(cmds[i].argv);
+    }
 }
 
 /* positional parameters of a script or "sh -c": $0..$9, $#, $@ and $* */
 static int pargc = 1;
 static char **pargv = (char *[]){"sh", NULL};
 
-/* Substitute positional parameters before tokenizing (not inside single quotes).
-   Unquoted values are split into words by the tokenizer. */
-static const char *expand_params(const char *line, char *out, size_t n) {
-    if (!strchr(line, '$')) return line;
-    size_t o = 0;
+/* A string that grows as it is written; failed once memory ran out. */
+struct text {
+    char *p;
+    size_t n, cap;
+    bool failed;
+};
+
+static void put_text(struct text *t, const char *s, size_t n) {
+    if (t->failed) return;
+    if (t->n + n + 1 > t->cap) {
+        size_t cap = (t->n + n + 1) * 2;
+        char *more = realloc(t->p, cap);
+        if (!more) {
+            t->failed = true;
+            return;
+        }
+        t->p = more;
+        t->cap = cap;
+    }
+    memcpy(t->p + t->n, s, n);
+    t->p[t->n += n] = 0;
+}
+
+/* The line with its positional parameters substituted (not inside single quotes), malloc'd;
+   NULL without memory. Unquoted values are split into words by the tokenizer. */
+static char *expand_params(const char *line) {
+    struct text out = {0};
     bool sq = false, dq = false;
-    for (const char *s = line; *s && o + 1 < n; s++) {
+    put_text(&out, "", 0);
+    for (const char *s = line; *s; s++) {
         if (*s == '\'' && !dq) sq = !sq;
         else if (*s == '"' && !sq) dq = !dq;
         if (*s != '$' || sq || !(isdigit((unsigned char)s[1]) || s[1] == '#' || s[1] == '@' || s[1] == '*')) {
-            out[o++] = *s;
+            put_text(&out, s, 1);
             continue;
         }
         s++;
         if (isdigit((unsigned char)*s)) {
             int k = *s - '0';
-            if (k < pargc) o += (size_t)snprintf(out + o, n - o, "%s", pargv[k]);
+            if (k < pargc) put_text(&out, pargv[k], strlen(pargv[k]));
         } else if (*s == '#') {
-            o += (size_t)snprintf(out + o, n - o, "%d", pargc - 1);
+            char num[16];
+            put_text(&out, num, (size_t)snprintf(num, sizeof num, "%d", pargc - 1));
         } else {
-            for (int k = 1; k < pargc; k++) o += (size_t)snprintf(out + o, n - o, "%s%s", k > 1 ? " " : "", pargv[k]);
+            for (int k = 1; k < pargc; k++) {
+                if (k > 1) put_text(&out, " ", 1);
+                put_text(&out, pargv[k], strlen(pargv[k]));
+            }
         }
-        if (o >= n) o = n - 1;
     }
-    out[o] = 0;
-    return out;
+    if (out.failed) free(out.p);
+    return out.failed ? NULL : out.p;
 }
 
 static int execute(const char *raw) {
-    static struct token toks[256];
-    static char expanded[MAX_LINE];
-    const char *line = expand_params(raw, expanded, sizeof expanded);
-    int nt = tokenize(line, toks, 256);
+    char *line = expand_params(raw);
+    int nt = 0;
+    struct token *toks = line ? tokenize(line, &nt) : NULL;
+    free(line);
+    if (!toks) {
+        fprintf(stderr, "sh: %s\n", n_result_text(-N_ERR_NO_MEMORY));
+        return 1;
+    }
     int pos = 0;
     int status = last_status;
     int skip_mode = 0; /* 0 run, T_AND / T_OR conditions */
@@ -686,19 +753,25 @@ static int execute(const char *raw) {
         memset(cmds, 0, sizeof cmds);
         bool bg = false;
         int sep = T_END;
-        bool syntax_err = false;
+        bool syntax_err = false, failed = false;
         while (pos < nt) {
             struct token *t = &toks[pos];
             struct cmd *c = &cmds[nc];
             if (t->type == T_WORD) {
-                char word[MAX_LINE];
-                int wl = 0;
-                for (const char *q = t->text; *q && wl < MAX_LINE - 12; q++) {
-                    if (*q == '\x01') wl += snprintf(word + wl, sizeof word - wl, "%d", status);
-                    else word[wl++] = *q;
+                struct text word = {0};
+                put_text(&word, "", 0);
+                for (const char *q = t->text; *q; q++) {
+                    if (*q != '\x01') {
+                        put_text(&word, q, 1);
+                        continue;
+                    }
+                    char num[16];
+                    put_text(&word, num, (size_t)snprintf(num, sizeof num, "%d", status));
                 }
-                word[wl] = 0;
-                c->argc = expand_glob(word, c->argv, c->argc, MAX_ARGS - 1);
+                if (word.failed) add_arg(c, NULL);
+                failed = word.failed || !expand_glob(word.p, c);
+                free(word.p);
+                if (failed) break;
                 pos++;
             } else if (t->type == T_LT || t->type == T_GT || t->type == T_GTGT || t->type == T_2GT) {
                 if (pos + 1 >= nt || toks[pos + 1].type != T_WORD) {
@@ -728,10 +801,10 @@ static int execute(const char *raw) {
             }
         }
         nc++;
-        if (syntax_err) {
-            fprintf(stderr, "sh: syntax error\n");
+        if (syntax_err || failed) {
+            if (syntax_err) fprintf(stderr, "sh: syntax error\n");
             free_cmds(cmds, nc);
-            status = 2;
+            status = syntax_err ? 2 : 1;
             break;
         }
         bool run = skip_mode == 0 || (skip_mode == T_AND && status == 0) || (skip_mode == T_OR && status != 0);
@@ -740,9 +813,11 @@ static int execute(const char *raw) {
         skip_mode = (sep == T_AND || sep == T_OR) ? sep : 0;
     }
     for (int i = 0; i < nt; i++) free(toks[i].text);
+    free(toks);
     return status;
 }
 
+/* A script's lines are as long as they are written: one is never run in pieces. */
 static int run_script(const char *name) {
     char path[4096];
     FILE *f = complete_name(name, path, sizeof path) ? fopen(path, "r") : NULL;
@@ -750,10 +825,22 @@ static int run_script(const char *name) {
         fprintf(stderr, "sh: %s: %s\n", name, n_result_text(-errno));
         return 127;
     }
-    char line[MAX_LINE];
-    while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "\r\n")] = 0;
-        last_status = execute(line);
+    for (int c = 0; c != EOF;) {
+        struct text line = {0};
+        put_text(&line, "", 0);
+        while ((c = getc(f)) != EOF && c != '\n') {
+            char ch = (char)c;
+            put_text(&line, &ch, 1);
+        }
+        if (line.failed) {
+            fprintf(stderr, "sh: %s: %s\n", name, n_result_text(-N_ERR_NO_MEMORY));
+            last_status = 1;
+        } else if (c != EOF || line.n) {
+            line.p[strcspn(line.p, "\r")] = 0;
+            last_status = execute(line.p);
+        }
+        free(line.p);
+        if (line.failed) break;
     }
     fclose(f);
     return last_status;
