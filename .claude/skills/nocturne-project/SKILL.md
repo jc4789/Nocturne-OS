@@ -10,7 +10,7 @@ description: Nocturne OSの実装・不具合修正・検証を行う際のプ�
 - ユーザーへの応答・作業説明・報告・コミットメッセージは日本語のみ。
 - GUI-firstのC製OS。UNIX/POSIX互換OSへの再設計やforkをしない。ファイルはディスク一台のC:だけ（`C:\Nocturne`は保護されたOS、`C:\Programs\<アプリ>`、`C:\Users\<名前>`）。`\`と`/`のどちらも受け付け、名前は大文字小文字を区別しない。`/bin`・`/data`・PATH・二台目のディスクを持ち込まない。
 - 既存実装・テスト・ユーザー変更を消して成功扱いにしない。変更範囲を限定し、既存の動作を保全する。
-- 原則の実行条件は`C:/Program Files/qemu`、WHPX、4コア（`-smp 4`）、4096MiB、1920×1080。ユーザーの今回の指定が優先。Hyper-V Gen2/Enhanced Sessionの実行はユーザー担当。
+- 原則の実行条件は`C:/Program Files/qemu`、WHPX、4コア（`-smp 4`）、4096MiB、2560×1440（2026-10-27 ユーザーの指示）。ユーザーの今回の指定が優先。Hyper-V Gen2/Enhanced Sessionの実行はユーザー担当。
 - **QEMUは同時に一台だけ。** 全体ビルドは必要なとき・役に立つときはいつでもしてよい。A/B比較のために`git stash`・revertで作業木を戻さない。疑わしい`.c`を一つずつ差し替えて比べる。
 - **QEMUはコマンドラインから直接操作する。** 窓付き`qemu-system-x86_64.exe -accel whpx`のHMP monitorへscreendump・sendkey・mouseを送り、その場で見る。固定秒数のPython一発スクリプトやcomputer-use撮影で代用しない。手順は[references/qemu-visual.md](references/qemu-visual.md)。
 - **ディスクはAHCIに接続する**（`-device ahci,id=ahci -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on -device ide-hd,drive=boot,bus=ahci.0,bootindex=0`）。一台のディスクにESPとC:があり、数秒で起動する。遅ければ待たずに異常として原因を扱う。
@@ -39,7 +39,7 @@ description: Nocturne OSの実装・不具合修正・検証を行う際のプ�
 - boot中・読み込み中も現在の画面を確認できる。author JSの完了やready markerを撮影の必須条件にしない。PNG変換をVM終了まで保留して目視を遅らせない。
 - **壊れた画面を「正常」と言わない。** 参照画像（ユーザー提供・hostブラウザー）の構成要素（段組み、サイドバー、関連一覧、チャンネル情報、画像等）を列挙し、一つずつ照合してから判定する。一つでも欠ければ失敗。2026-10-16、YouTube動画ページで関連動画列とチャンネル情報が欠けた一列表示を「正常」と誤報した。
 - 正しいURL・実ページ本文・viewportを画像で確認する。Chrome等のhostブラウザーは比較用には使えるが、Nocturneの受入証拠へ置き換えない。
-- 1920×1080のguest displayとブラウザーviewportは別。必要なら窓を最大化し、consoleを閉じて実ページを見る。小さい窓の横切れだけでparser不具合と断定しない。
+- 2560×1440のguest displayとブラウザーviewportは別。必要なら窓を最大化する。ブラウザーの撮影は必ずF12のconsoleを開いたまま行い、consoleの行も読む（2026-10-27 ユーザーの硬い規則）。小さい窓の横切れだけでparser不具合と断定しない。
 - 見た結果をサイトごとに短く記録する：画像パス、実URL、表示上の問題、試した操作、合格／失敗／未確認、次に直す境界。証拠は最終source/imageと対応させる。
 
 QEMUの具体的な接続・撮影時だけ[references/qemu-visual.md](references/qemu-visual.md)を読む。

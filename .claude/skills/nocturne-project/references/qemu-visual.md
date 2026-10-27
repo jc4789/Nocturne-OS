@@ -31,7 +31,7 @@ screendump "D:/.../build/qa/<run>/after.png" -f png
 2. 窓付きで起動する。ディスクは一台だけ（ESPとC:を持つGPTの`build/nocturne.img`）。二台目のdataディスクは存在しない。`snapshot=on`ならビルド成果物を汚さないので、毎回コピーしない。
 
    ```text
-   "C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -vga none -device VGA,xres=1920,yres=1080
+   "C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -vga none -device VGA,xres=2560,yres=1440,vgamem_mb=32
      -serial file:<run>/serial.log -monitor tcp:127.0.0.1:45454,server,nowait
      -device ahci,id=ahci
      -drive id=boot,file=build/nocturne.img,format=raw,if=none,snapshot=on
@@ -67,7 +67,7 @@ screendump "D:/.../build/qa/<run>/after.png" -f png
 `scripts/platform_qa.py`は隔離した起動ディスクのコピー（AHCI、`snapshot=on`）、QEMU条件、撮影・キー入力の補助。**Pythonハーネスを使うこと自体は必須ではない。** 起動が必要な場合だけ現行引数を確認する。例：
 
 ```text
-python -X utf8 scripts/platform_qa.py --label <unique-run> --url <requested-url> --accel whpx --memory 4096 --resolution 1920x1080 --seconds <observation-period>
+python -X utf8 scripts/platform_qa.py --label <unique-run> --url <requested-url> --accel whpx --memory 4096 --resolution 2560x1440 --seconds <observation-period>
 ```
 
 既存runは`build/nocturne-platform/<label>/metadata.json`にPID、起動引数、monitor、image identityがある。記録のPIDだけで操作せず、現在のprocessと専用image/command lineの一致を確認する。ユーザーの既存VMを終了しない。
