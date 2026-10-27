@@ -1322,6 +1322,10 @@ const char *web_effective_url(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);
 void web_js_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *e);
 int64_t web_js_deadline(web_doc *d);
+/* The bytes the document's own JavaScript runtime holds; 0 for a frame sharing its owner's. */
+size_t web_js_heap_bytes(web_doc *d);
+/* --debug-js: QuickJS's census of that runtime's heap (walks every object). */
+int web_js_heap_census(web_doc *d, char *out, size_t size);
 bool web_js_running(web_doc *d);
 bool web_js_enabled(web_doc *d);
 bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *e);

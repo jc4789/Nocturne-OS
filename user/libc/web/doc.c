@@ -1129,7 +1129,9 @@ int64_t web_media_background_deadline(uint64_t now) {
 /* --debug-js: which step of the turns since the last web_tick_report() left the document to lay
    out again (main thread only). A step is named when the flag was clear before it and set after. */
 enum { TICK_RENDER, TICK_RESCAN, TICK_MEDIA, TICK_MOTION, TICK_MARQUEE, TICK_SCRIPT, TICK_FRAMES, TICK_STEPS };
-static struct { uint64_t turns, dirty[TICK_STEPS], style[TICK_STEPS]; } tick_profile;
+/* Which source set each web_deadline(): what wakes an otherwise idle window. */
+enum { DUE_NONE, DUE_BACKGROUND, DUE_RENDER, DUE_SCRIPT, DUE_MEDIA, DUE_MOTION, DUE_MARQUEE, DUE_FRAMES, DUE_SOURCES };
+static struct { uint64_t turns, dirty[TICK_STEPS], style[TICK_STEPS], due[DUE_SOURCES]; } tick_profile;
 static void tick_step(const web_doc *d, int step, bool dirty, bool style) {
     if (!d->profile_enabled) return;
     if (!dirty && d->dirty) tick_profile.dirty[step]++;
@@ -1143,7 +1145,51 @@ int web_tick_report(char *out, size_t size) {
     for (int i = 0; i < TICK_STEPS && n >= 0 && (size_t)n < size; i++)
         n += snprintf(out + n, size - (size_t)n, "%s %s %lu/%lu", i ? "," : "", names[i],
                       (unsigned long)tick_profile.dirty[i], (unsigned long)tick_profile.style[i]);
+    static const char *const due_names[DUE_SOURCES] = {"none", "background", "first render", "script", "media", "CSS motion", "marquee", "frames"};
+    for (int i = 0; i < DUE_SOURCES && n >= 0 && (size_t)n < size; i++)
+        n += snprintf(out + n, size - (size_t)n, "%s %s %lu", i ? "," : "; deadlines from", due_names[i],
+                      (unsigned long)tick_profile.due[i]);
     memset(&tick_profile, 0, sizeof tick_profile);
+    return n;
+}
+/* --debug-js: what the document and its frames hold now, by owner. A cached sheet or a
+   runtime that frames share is counted once, by the document that owns it. */
+struct memory_tally { size_t dom, styles, boxes, layout, sheets, css_source, css_ast, images, canvas, js, largest_js; int docs, image_count; web_doc *largest; };
+static void memory_tally_doc(web_doc *d, struct memory_tally *t) {
+    t->docs++;
+    t->dom += d->mem.allocated; t->styles += d->smem.allocated; t->boxes += d->bmem.allocated;
+    t->layout += d->lmem.allocated; t->sheets += d->cssmem.allocated;
+    for (int i = 0; i < d->css_cache.n; i++) {
+        struct cached_css *c = d->css_cache.v[i];
+        t->css_source += c->n; t->css_ast += c->ast_mem.allocated;
+    }
+    for (int i = 0; i < d->images.n; i++) {
+        const struct web_image *im = d->images.v[i];
+        const image_t *shown[3] = {im->img, im->scaled[0], im->scaled[1]};
+        for (int k = 0; k < 3; k++) if (shown[k]) t->images += (size_t)shown[k]->w * (size_t)shown[k]->h * 4;
+        t->images += im->svg_n; t->image_count++;
+    }
+    t->canvas += d->canvas_bytes;
+    size_t js = web_js_heap_bytes(d);
+    t->js += js;
+    if (js > t->largest_js) { t->largest_js = js; t->largest = d; }
+}
+int web_memory_report(web_doc *d, char *out, size_t size) {
+    if (!d || !d->live) return 0;
+    struct memory_tally t = {0};
+    memory_tally_doc(d, &t);
+    for (struct web_frame *f = d->frames; f; f = web_frame_walk_next(d, f, true))
+        if (f->document && !f->detached) memory_tally_doc(f->document, &t);
+    int n = snprintf(out, size, "Document memory (KiB, %d documents): DOM and sheets %zu, computed styles %zu, boxes %zu, layout %zu, "
+                     "authored sheets %zu, fetched CSS %zu source/%zu parsed, images %zu (%d), canvases %zu, JavaScript %zu",
+                     t.docs, t.dom / 1024, t.styles / 1024, t.boxes / 1024, t.layout / 1024, t.sheets / 1024,
+                     t.css_source / 1024, t.css_ast / 1024, t.images / 1024, t.image_count, t.canvas / 1024, t.js / 1024);
+    /* The largest runtime's own census, on the next line. */
+    if (t.largest && n >= 0 && (size_t)n + 1 < size) {
+        out[n++] = '\n';
+        int census = web_js_heap_census(t.largest, out + n, size - (size_t)n);
+        if (census > 0) n += census; else out[--n] = 0;
+    }
     return n;
 }
 #define TICK_STEP(d, step, call) do { bool dirty_ = (d)->dirty, style_ = (d)->need_style; call; tick_step(d, step, dirty_, style_); } while (0)
@@ -1193,18 +1239,15 @@ int64_t web_deadline(web_doc *d) {
     uint64_t now = uptime_ms();
     int64_t background = web_media_background_deadline(now);
     if (!d || !d->live) return background;
-    int64_t render = !d->initial_render_done && now < d->initial_render_deadline ?
-        (int64_t)d->initial_render_deadline : -1;
-    int64_t js = web_js_deadline(d), media = web_avmedia_deadline(d, now);
-    int64_t deadline = js < 0 ? media : media < 0 ? js : MIN(js, media);
-    if(render>=0 && (deadline<0 || render<deadline))deadline=render;
-    int64_t motion=css_motion_deadline(d);
-    if(motion>=0 && (deadline<0 || motion<deadline))deadline=motion;
-    int64_t marquee=web_marquee_deadline(d);
-    if(marquee>=0 && (deadline<0 || marquee<deadline))deadline=marquee;
-    int64_t frames=web_frames_deadline(d);
-    if(frames>=0 && (deadline<0 || frames<deadline))deadline=frames;
-    return deadline < 0 ? background : background < 0 ? deadline : MIN(deadline, background);
+    const int64_t sources[DUE_SOURCES] = {-1, background,
+        !d->initial_render_done && now < d->initial_render_deadline ? (int64_t)d->initial_render_deadline : -1,
+        web_js_deadline(d), web_avmedia_deadline(d, now), css_motion_deadline(d), web_marquee_deadline(d),
+        web_frames_deadline(d)};
+    int64_t deadline = -1; int from = DUE_NONE;
+    for (int i = DUE_BACKGROUND; i < DUE_SOURCES; i++)
+        if (sources[i] >= 0 && (deadline < 0 || sources[i] < deadline)) { deadline = sources[i]; from = i; }
+    if (d->profile_enabled) tick_profile.due[from]++;
+    return deadline;
 }
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *r) {
     if (d && d->live) {web_js_loaded(d, id, r);web_frames_loaded(d,id,r);}

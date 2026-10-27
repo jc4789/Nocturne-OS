@@ -8096,68 +8096,121 @@ void web_js_tick(web_doc *d, uint64_t now) {
         if (!run_idle_timeout(s, idle_now)) run_idle_period(s, idle_now);
     }
 }
-int64_t web_js_deadline(web_doc *d) {
+/* --debug-js: which source set each document's script deadline (main thread only). */
+enum { JD_NONE, JD_NOW, JD_WORKER, JD_ATOMICS, JD_RESOURCE, JD_OBSERVERS, JD_STORAGE, JD_INDEXED_DB, JD_TIMER,
+       JD_ANIMATION_FRAME, JD_IDLE_TIMEOUT, JD_IDLE_PERIOD, JD_REASONS };
+static uint64_t js_deadline_profile[JD_REASONS], js_deadline_soon[JD_REASONS], js_deadline_frame_soon[JD_REASONS];
+#define DUE_NOW() do { *why = JD_NOW; return (int64_t)now; } while (0)
+#define EARLIER(due, reason) do { uint64_t due_ = (due); if (due_ < deadline) { deadline = due_; *why = (reason); } } while (0)
+static int64_t js_deadline(web_doc *d, int *why) {
     struct web_js_state *s = d ? d->js : NULL; if (!s) return -1;
     uint64_t deadline = UINT64_MAX, now = uptime_ms();
-    if (d->scroll_input_first || d->scroll_viewport_pending) return (int64_t)now;
+    if (d->scroll_input_first || d->scroll_viewport_pending) DUE_NOW();
     int64_t worker_deadline = web_worker_deadline(s->workers,now);
-    if (worker_deadline >= 0) deadline = (uint64_t)worker_deadline;
+    if (worker_deadline >= 0) EARLIER((uint64_t)worker_deadline, JD_WORKER);
     int64_t atomics_deadline = web_atomics_deadline(s->ctx, now);
-    if (atomics_deadline >= 0 && (uint64_t)atomics_deadline < deadline) deadline = (uint64_t)atomics_deadline;
-    if (!s->parsing_done && !s->document_waiting && (!s->blocker || s->blocker->executed || s->disabled)) return (int64_t)now;
+    if (atomics_deadline >= 0) EARLIER((uint64_t)atomics_deadline, JD_ATOMICS);
+    if (!s->parsing_done && !s->document_waiting && (!s->blocker || s->blocker->executed || s->disabled)) DUE_NOW();
     for (struct js_pending *p = s->pending; p; p = p->next) {
-        if (p->done) return (int64_t)now;
-        if (p->deadline < deadline) deadline = p->deadline;
+        if (p->done) DUE_NOW();
+        EARLIER(p->deadline, JD_RESOURCE);
     }
     /* Dirty registration and wanted, unqueued images are work, even after the
        final idle/console task. Do not spin while the bounded queue is full. */
-    if (d->resources_dirty || d->images_dirty) return (int64_t)now;
+    if (d->resources_dirty || d->images_dirty) DUE_NOW();
     for(struct web_font_resource *f=d->fonts;f;f=f->next)
-        if(f->wanted && !f->done && !f->loading)return (int64_t)now;
+        if(f->wanted && !f->done && !f->loading)DUE_NOW();
     for (int i = 0; i < web_image_count(d); i++) {
         if (!web_image_wanted(d, i)) continue;
-        return (int64_t)now;
+        DUE_NOW();
     }
     if (!s->disabled) {
-        if ((d->dom_family ? d->dom_family : d)->shadow_slots_pending) return (int64_t)now;
-        if ((d->dom_family ? d->dom_family : d)->details_toggle_first) return (int64_t)now;
-        if (s->media_width != d->width || s->media_height != d->height) return (int64_t)now;
-        if (s->events || s->posted || s->rejections || s->handled_rejections || s->rejection_oom) return (int64_t)now;
-        for (struct js_socket *p = s->sockets; p; p = p->next) if (p->events) return (int64_t)now;
-        for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return (int64_t)now;
-        if (JS_IsJobPending(s->rt)) return (int64_t)now;
-        if (observers_dirty(s) && s->rendering_due < deadline) deadline=s->rendering_due;
-        if (s->storage_origin && (s->storage_subscribed[0]||s->storage_subscribed[1]) && s->storage_poll_due<deadline) deadline=s->storage_poll_due;
-        if(s->indexed_db_failed&&s->indexed_db_pending)return (int64_t)now;
-        if(web_presentation_event_peek(d))return (int64_t)now;
+        if ((d->dom_family ? d->dom_family : d)->shadow_slots_pending) DUE_NOW();
+        if ((d->dom_family ? d->dom_family : d)->details_toggle_first) DUE_NOW();
+        if (s->media_width != d->width || s->media_height != d->height) DUE_NOW();
+        if (s->events || s->posted || s->rejections || s->handled_rejections || s->rejection_oom) DUE_NOW();
+        for (struct js_socket *p = s->sockets; p; p = p->next) if (p->events) DUE_NOW();
+        for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) DUE_NOW();
+        if (JS_IsJobPending(s->rt)) DUE_NOW();
+        if (observers_dirty(s)) EARLIER(s->rendering_due, JD_OBSERVERS);
+        if (s->storage_origin && storage_listening(s) && (s->storage_subscribed[0]||s->storage_subscribed[1])) EARLIER(s->storage_poll_due, JD_STORAGE);
+        if(s->indexed_db_failed&&s->indexed_db_pending)DUE_NOW();
+        if(web_presentation_event_peek(d))DUE_NOW();
         if(s->indexed_db&&webidb_async_pending(s->indexed_db)){
             webidb_async_pump(s->indexed_db);
-            if(webidb_async_ready(s->indexed_db))return (int64_t)now;
+            if(webidb_async_ready(s->indexed_db))DUE_NOW();
             uint64_t storage_due=now+8;
-            if(storage_due<deadline)deadline=storage_due;
+            EARLIER(storage_due, JD_INDEXED_DB);
         }
-        struct js_script *ready; if (ready_script(s, &ready)) return (int64_t)now;
+        struct js_script *ready; if (ready_script(s, &ready)) DUE_NOW();
         for (struct js_script *p = s->scripts; p; p = p->next)
             if (p->compile && !p->executed && !js_compile_done(p->compile) && !js_compile_watch(p->compile, web_wait_queue()))
-                return (int64_t)now;
+                DUE_NOW();
         for (unsigned i = 0; i < s->timer_capacity; i++)if(s->timers[i].id){
-            uint64_t due=timer_task_due(s,&s->timers[i]);
-            if(due<deadline)deadline=due;
+            EARLIER(timer_task_due(s,&s->timers[i]), s->timers[i].kind == 2 ? JD_ANIMATION_FRAME : JD_TIMER);
         }
-        for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->parser_released && !p->notified) return (int64_t)now;
-        uint64_t idle_due = idle_timeout_due(s); if (idle_due < deadline) deadline = idle_due;
+        for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->parser_released && !p->notified) DUE_NOW();
+        EARLIER(idle_timeout_due(s), JD_IDLE_TIMEOUT);
         if (s->idle_count && idle_eligible(s, now)) {
             uint64_t idle_wake = now;
             if (now < s->idle_period_end && (s->idle_period_stopped || !s->idle_runnable || s->idle_period_callbacks >= JS_IDLE_PERIOD_CALLBACKS))
                 idle_wake = s->idle_period_end;
-            if (idle_wake < deadline) deadline = idle_wake;
+            EARLIER(idle_wake, JD_IDLE_PERIOD);
         }
     }
     /* Author lifecycle dispatch is permanently stopped with this realm. Native
        parsing/resources above remain runnable; do not advertise an impossible
        DOMContentLoaded/load task as immediate work forever after a watchdog. */
-    if (!s->disabled && s->parsing_done && !s->parsing_cancelled && ((!s->domcontent_sent && !unfinished_deferred(s)) || (s->domcontent_sent && !s->load_sent && !unfinished_scripts(s) && !styles_busy(s) && !images_wanted(d) && !pending_kind(s, P_IMAGE) && !pending_kind(s, P_SCRIPT) && !pending_kind(s,P_FRAME) && !web_frames_busy(d)))) return (int64_t)now;
+    if (!s->disabled && s->parsing_done && !s->parsing_cancelled && ((!s->domcontent_sent && !unfinished_deferred(s)) || (s->domcontent_sent && !s->load_sent && !unfinished_scripts(s) && !styles_busy(s) && !images_wanted(d) && !pending_kind(s, P_IMAGE) && !pending_kind(s, P_SCRIPT) && !pending_kind(s,P_FRAME) && !web_frames_busy(d)))) DUE_NOW();
     return deadline == UINT64_MAX ? -1 : (int64_t)deadline;
+}
+#undef DUE_NOW
+#undef EARLIER
+int64_t web_js_deadline(web_doc *d) {
+    int why = JD_NOW;
+    int64_t due = js_deadline(d, &why);
+    if (d && d->profile_enabled) {
+        int reason = due < 0 ? JD_NONE : why;
+        js_deadline_profile[reason]++;
+        if (due >= 0 && (uint64_t)due < uptime_ms() + 16) {
+            js_deadline_soon[reason]++;
+            if (d->frame_parent) js_deadline_frame_soon[reason]++;
+        }
+    }
+    return due;
+}
+int web_js_deadline_report(char *out, size_t size) {
+    static const char *const names[JD_REASONS] = {"none", "now", "Worker", "Atomics", "resource", "observers",
+        "storage event", "IndexedDB", "timer", "animation frame", "idle timeout", "idle period"};
+    int n = snprintf(out, size, "Script deadline profile (all/within 16 ms/of those in frames):");
+    for (int i = 0; i < JD_REASONS && n >= 0 && (size_t)n < size; i++)
+        n += snprintf(out + n, size - (size_t)n, "%s %s %lu/%lu/%lu", i ? "," : "", names[i],
+                      (unsigned long)js_deadline_profile[i], (unsigned long)js_deadline_soon[i],
+                      (unsigned long)js_deadline_frame_soon[i]);
+    memset(js_deadline_profile, 0, sizeof js_deadline_profile);
+    memset(js_deadline_soon, 0, sizeof js_deadline_soon);
+    memset(js_deadline_frame_soon, 0, sizeof js_deadline_frame_soon);
+    return n;
+}
+size_t web_js_heap_bytes(web_doc *d) {
+    struct web_js_state *s = d ? d->js : NULL;
+    return s && s->runtime_owner == s ? s->allocation.current : 0;
+}
+int web_js_heap_census(web_doc *d, char *out, size_t size) {
+    struct web_js_state *s = d ? d->js : NULL;
+    if (!s || s->runtime_owner != s || !s->rt) return 0;
+    /* Read only: a debug build must not collect cycles a release build would keep. */
+    JSMemoryUsage u; JS_ComputeMemoryUsage(s->rt, &u);
+    return snprintf(out, size, "JavaScript heap census (KiB) of %.80s: malloc %lld in %lld blocks, used %lld; objects %lld/%lld, "
+                    "properties %lld, shapes %lld/%lld, strings %lld/%lld, atoms %lld/%lld, functions %lld/%lld (code %lld, lines %lld), "
+                    "arrays %lld (fast %lld, %lld elements); bytecode read so far %lld/%lld",
+                    web_effective_url(d), (long long)u.malloc_size / 1024, (long long)u.malloc_count, (long long)u.memory_used_size / 1024,
+                    (long long)u.obj_count, (long long)u.obj_size / 1024, (long long)u.prop_size / 1024,
+                    (long long)u.shape_count, (long long)u.shape_size / 1024, (long long)u.str_count, (long long)u.str_size / 1024,
+                    (long long)u.atom_count, (long long)u.atom_size / 1024, (long long)u.js_func_count, (long long)u.js_func_size / 1024,
+                    (long long)u.js_func_code_size / 1024, (long long)u.js_func_pc2line_size / 1024, (long long)u.array_count,
+                    (long long)u.fast_array_count, (long long)u.fast_array_elements, (long long)u.binary_object_count,
+                    (long long)u.binary_object_size / 1024);
 }
 bool web_js_running(web_doc *d) { return d && d->js && d->js->running; }
 bool web_console_eval(web_doc *d,const char *source,size_t length) {

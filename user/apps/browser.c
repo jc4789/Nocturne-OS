@@ -66,7 +66,9 @@ static struct {
     unsigned ticks, layouts, draws;
     unsigned partial_draws, video_patches, console_draws;
     unsigned partial_empty, partial_whole; /* damage off the page, or not a known rectangle */
+    unsigned waits[6], engine_waits, woken; /* which source set each wait's timeout; waits an event ended */
 } loop_profile;
+enum { WAIT_NONE, WAIT_NET, WAIT_STORAGE, WAIT_DOCUMENT, WAIT_NOW, WAIT_REFRESH };
 /* Browser pages need more time than small custom web_live hosts. The native
    command line can select a finite limit, never an unlimited watchdog. */
 static uint32_t js_task_budget_ms = WEB_JS_TASK_DEFAULT_MS;
@@ -1558,7 +1560,7 @@ static int browser_event(struct gui_event *event, int timeout) {
         if(!window_watched)window_watched=n_events_watch(queue,w->handle,N_EVENT_RECEIVABLE,UINT64_C(0x42)<<56)>=0;
         int wait=window_watched||(timeout>=0&&timeout<10)?timeout:10;
         int engine=ui_session_timeout(ui); /* the caret, animations, a picture to finish */
-        if(engine>=0&&(wait<0||engine<wait))wait=engine;
+        if(engine>=0&&(wait<0||engine<wait)){wait=engine;if(debug_js)loop_profile.engine_waits++;}
         struct n_event events[64];
         int ready=webnet_wait(network,queue,wait,events,64);
         if(ready<0)return -1;
@@ -2885,6 +2887,7 @@ static void report_loop_profile(uint64_t now) {
     uint64_t console_ms=loop_profile.console_ms,console_update=loop_profile.console_update_ms;
     uint64_t partial_ms=loop_profile.partial_ms,partial_update=loop_profile.partial_update_ms,video_ms=loop_profile.video_present_ms;
     uint64_t partial_pixels=loop_profile.partial_pixels;
+    unsigned waits[6],engine_waits=loop_profile.engine_waits,woken=loop_profile.woken;memcpy(waits,loop_profile.waits,sizeof waits);
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
     host_console(NULL, 0, message);
@@ -2899,12 +2902,19 @@ static void report_loop_profile(uint64_t now) {
         snprintf(message, sizeof message, "Browser memory: process %lu KiB, malloc heap %lu KiB, in use %lu KiB",
                  process_kb, (unsigned long)(heap / 1024), (unsigned long)(used / 1024));
         host_console(NULL, 0, message);
+        if (web_memory_report(doc, message, sizeof message) > 0) host_console(NULL, 0, message);
     }
+    snprintf(message, sizeof message,
+             "Browser wait profile: timeout from none %u, network %u, storage %u, document %u, now %u, refresh %u; shortened by the window engine %u; ended by an event %u",
+             waits[WAIT_NONE], waits[WAIT_NET], waits[WAIT_STORAGE], waits[WAIT_DOCUMENT], waits[WAIT_NOW], waits[WAIT_REFRESH],
+             engine_waits, woken);
+    host_console(NULL, 0, message);
     if (web_wait_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if (web_paint_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if (web_style_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if (web_box_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if (web_tick_report(message, sizeof message) > 0) host_console(NULL, 0, message);
+    if (web_js_deadline_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if(consoles){snprintf(message,sizeof message,
         "Browser console profile: rect draw %u/%lu ms, rect present %lu ms (no author page paint)",
         consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL,0,message);}
@@ -3043,23 +3053,23 @@ int main(int argc, char **argv) {
             flush_dom_layout();native_scroll_queue();handle_deferred_input();
             continue;
         }
-        int timeout = webnet_timeout(network, now);
+        int timeout = webnet_timeout(network, now), source = timeout < 0 ? WAIT_NONE : WAIT_NET;
         if (webstorage_pending(storage)) {
             struct web_storage_result result;
             if (webstorage_flush(storage, false, &result) != WEB_STORAGE_OK)
                 console_add("error", "Local storage flush failed; retrying later.");
-            if (webstorage_pending(storage) && (timeout < 0 || timeout > 100)) timeout = 100;
+            if (webstorage_pending(storage) && (timeout < 0 || timeout > 100)) { timeout = 100; source = WAIT_STORAGE; }
         }
         if (doc && w && !frame_asked && web_rendering_wanted(doc))
             frame_asked = ui_window_frame(ui, WINDOW) == 0;
         int64_t deadline = web_deadline(doc); /* retired media children also wake a document-less window */
         if (deadline >= 0) {
             int due = deadline <= (int64_t)now ? 0 : (int)MIN(deadline - (int64_t)now, 0x7fffffff);
-            if (timeout < 0 || due < timeout) timeout = due;
+            if (timeout < 0 || due < timeout) { timeout = due; source = WAIT_DOCUMENT; }
         }
-        if (navigation_ready || pending_navigation || scroll_event_pending || (history_queue_count && !loading)) timeout = 0;
+        if (navigation_ready || pending_navigation || scroll_event_pending || (history_queue_count && !loading)) { timeout = 0; source = WAIT_NOW; }
         if(console_startup_pending()&&doc&&!loading){int due=now>=console_due?0:(int)MIN(console_due-now,0x7fffffff);
-            if(timeout<0||due<timeout)timeout=due;}
+            if(timeout<0||due<timeout){timeout=due;source=WAIT_NOW;}}
         if (refresh_at) {
             uint64_t now = n_clock_uptime_ms();
             if (now >= refresh_at) {
@@ -3068,11 +3078,11 @@ int main(int argc, char **argv) {
                 continue;
             }
             int due = (int)MIN(refresh_at - now, 0x7fffffff);
-            if (timeout < 0 || due < timeout) timeout = due;
+            if (timeout < 0 || due < timeout) { timeout = due; source = WAIT_REFRESH; }
         }
         uint64_t wait_start = debug_js ? n_clock_uptime_ms() : 0;
         int r = browser_event(&e, timeout);
-        if (debug_js) loop_profile.wait_ms += n_clock_uptime_ms() - wait_start;
+        if (debug_js) { loop_profile.wait_ms += n_clock_uptime_ms() - wait_start; loop_profile.waits[source]++; loop_profile.woken += r > 0; }
         if (r < 0) break;
         if (r > 0) {
             handle(&e);
