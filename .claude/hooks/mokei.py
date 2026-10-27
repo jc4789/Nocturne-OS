@@ -32,7 +32,7 @@ EDITS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 SHELLS = {"Bash", "PowerShell"}
 # シェルの命令にこれがあれば、物差しを測った（ログを読んだ・撮った・試験を回した）と数える
 MEASURE = ("serial.log", "serial-", "screendump", "platform_qa", "scripts/test.py", "qtest.py",
-           "hikaku", "qemu-system", "hv-serial", "hv-boot", "System.log", "browser log")
+           "hikaku", "qemu-system", "hv-serial", "hv-boot", "System.log", "browser log", "browser trace")
 NOTES = Path(".claude") / "oboegaki.md"
 CODE = {".c", ".h", ".inc", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
         ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".rs", ".go"}

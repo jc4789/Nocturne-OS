@@ -10,7 +10,7 @@
    document's lifetime; a document change resets every cached handle. */
 #include "web_inspect.h"
 
-enum { DT_ELEMENTS, DT_CONSOLE, DT_NETWORK, DT_NTABS };
+enum { DT_ELEMENTS, DT_CONSOLE, DT_NETWORK, DT_TRACE, DT_NTABS };
 enum { DT_STYLES, DT_COMPUTED, DT_LAYOUT, DT_NSUB };
 #define DT_TABH 24
 #define DT_ROWH 16
@@ -572,7 +572,7 @@ static void dt_net_select(int index) {
 }
 
 /* ---------------------------------------------------------------- drawing */
-static const char *const dt_tab_names[DT_NTABS] = {"Elements", "Console", "Network"};
+static const char *const dt_tab_names[DT_NTABS] = {"Elements", "Console", "Network", "Trace"};
 static const char *const dt_sub_names[DT_NSUB] = {"Styles", "Computed", "Layout"};
 static int dt_tab_x(int tab) {
     int x = 36;
@@ -636,7 +636,8 @@ static void dt_draw_tabs(canvas_t *c, int top) {
         size_t total = 0; for (int i = 0; i < dt_net_n; i++) total += dt_net[i].size;
         char size[32]; dt_format_size(size, sizeof size, total);
         snprintf(hint, sizeof hint, "%d requests   %s transferred   Ctrl+K: clear", dt_net_n, size);
-    } else snprintf(hint, sizeof hint, "%d messages", console_n);
+    } else if (dt_tab == DT_TRACE) snprintf(hint, sizeof hint, "%d trace lines", console_trace.n);
+    else snprintf(hint, sizeof hint, "%d messages", console_page.n);
     int hw = gfx_text_width(hint, FONT_SMALL), hx = view.w - hw - 12;
     if (hx > dt_tab_x(DT_NTABS)) gfx_text(c, hx, top + 4, hint, dt_palette[C_DIM], TRANSPARENT, FONT_SMALL);
 }
@@ -857,7 +858,8 @@ static void devtools_shortcut(uint32_t key) {
 }
 static void devtools_clear(void) {
     if (dt_tab == DT_NETWORK) dt_net_clear();
-    else { console_n = console_skip = 0; console_dirty = true; }
+    else if (dt_tab == DT_TRACE) { console_trace.n = console_trace.skip = 0; console_dirty = true; }
+    else { console_page.n = console_page.skip = 0; console_dirty = true; }
 }
 static void dt_toggle(int row) {
     if (row < 0 || row >= dt_tree.n || !(dt_tree.v[row].flags & DT_EXPANDABLE)) return;
@@ -909,7 +911,7 @@ static void devtools_key(const struct gui_event *e) {
 /* Scrolls whichever DevTools list is under the pointer. Cache-only. */
 static void devtools_wheel(int x, int y, int wheel) {
     (void)y;
-    if (dt_tab == DT_CONSOLE) { console_scroll(-wheel * 3); return; }
+    if (dt_tab == DT_CONSOLE || dt_tab == DT_TRACE) { console_scroll(dt_tab == DT_TRACE ? &console_trace : &console_page, -wheel * 3); return; }
     if (dt_tab == DT_ELEMENTS) { struct dt_lines *l = x < dt_split() ? &dt_tree : &dt_side; l->top = MAX(0, l->top - wheel * 3); }
     else if (x < dt_net_list_w()) dt_net_top = MAX(0, dt_net_top - wheel * 3);
     else dt_detail.top = MAX(0, dt_detail.top - wheel * 3);

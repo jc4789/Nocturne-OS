@@ -1075,6 +1075,18 @@ typedef int JSAtomicsWaitAsyncFunc(JSContext *ctx, void *opaque, void *address,
                                    uint32_t expected, double timeout_ms,
                                    JSValueConst resolve);
 void JS_SetAtomicsWaitAsyncFunc(JSRuntime *rt, JSAtomicsWaitAsyncFunc *func, void *opaque);
+/* A throw that a script's own try/catch (or an awaiting async function) is
+   about to catch: script never sees it again unless it rethrows. 'exception'
+   is borrowed and the hook must not run script, since the interpreter is
+   unwinding. JS_DescribeException writes an Error's name, message and first
+   stack frame (or a primitive's value) from data properties, allocating nothing.
+   The same hook sees every promise rejection ('rejected' true), handled or not:
+   an async function's throw and a rejection a later .catch() swallows reach no
+   try/catch, so they would show up nowhere else. */
+typedef void JSCaughtExceptionHook(JSContext *ctx, JSValueConst exception,
+                                   JS_BOOL rejected, void *opaque);
+void JS_SetCaughtExceptionHook(JSRuntime *rt, JSCaughtExceptionHook *hook, void *opaque);
+int JS_DescribeException(JSContext *ctx, JSValueConst exception, char *buf, int size);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

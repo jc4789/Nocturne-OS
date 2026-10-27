@@ -210,6 +210,10 @@ struct web_host {
        and URL, its status and type, and its completed size and time. URLs keep
        their query, so only a host that keeps its log local opts in. */
     bool net_log;
+    /* With net_log, a request whose URL contains this text also logs its whole
+       request body and the first 2 KiB of its response body, in hex. NULL or
+       empty logs no bodies. */
+    const char *net_body;
     /* WebSocket transport (RFC 6455); all optional, NULL means unavailable.
        url is ws:/wss:, protocols a comma-separated offer or NULL, origin the
        serialized initiating-realm origin. Events arrive via web_socket_event

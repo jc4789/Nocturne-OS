@@ -4116,7 +4116,7 @@ static void replaced_trace_report_box(web_doc *d, box_t *b) {
     char message[1280];
     snprintf(message, sizeof message, "Native replaced size trace: #%u image=%d natural=%u/%u used=%.3f/%.3f",
         trace, image, (unsigned)im->img->w, (unsigned)im->img->h, b->w, b->h);
-    web_js_console(d, 0, message);
+    web_js_trace(d, message);
     unsigned depth = 0;
     for (box_t *a = b; a && depth < 10; a = a->parent, depth++) {
         const style_t *s = a->st;
@@ -4140,7 +4140,7 @@ static void replaced_trace_report_box(web_doc *d, box_t *b) {
             a->p[0], a->p[1], a->p[2], a->p[3], a->layout_cache_valid,
             a->cached_width, a->cached_cbh, a->cached_usedh,
             a->cb ? (int)a->cb->kind : -1, a->cb ? a->cb->h : -1);
-        web_js_console(d, 0, message);
+        web_js_trace(d, message);
     }
 }
 static void clamp_trace_report_box(web_doc *d, box_t *b, bool replaced_pending) {
@@ -4168,7 +4168,7 @@ static void clamp_trace_report_box(web_doc *d, box_t *b, bool replaced_pending) 
             (unsigned)t->last_kind, t->last_anon, t->last_y, t->line_bottom, t->cb_reached,
             p ? (int)p->kind : -1, p ? p->h : -1,
             b->y + b->h + b->p[2] + b->b[2], b->next ? b->next->y : -1);
-        web_js_console(d, 0, message);
+        web_js_trace(d, message);
     }
     for (box_t *c = b->first; c && (d->clamp_trace_reported < 4 ||
             (replaced_pending && d->replaced_trace_reported < 2)); c = c->next)

@@ -115,6 +115,7 @@ struct js_pending {
     bool timing_allowed, timing_exposed;
     char net_type[96]; /* Content-Type */
     unsigned char net_preview[64]; unsigned net_preview_len; /* net_log only: body's first bytes */
+    bool net_body; unsigned net_body_logged; /* host.net_body matched: response bytes logged so far */
     struct web_response response;
     struct js_pending *next;
 };
@@ -221,6 +222,9 @@ struct web_js_state {
     struct js_import *imports;
     uint64_t module_visit;
     unsigned module_sync_logged;
+    /* Throws the page's own try/catch swallowed, traced once per distinct description. */
+    uint32_t caught_seen[256];
+    unsigned caught_logged;
     struct js_preload *preloads[256];
     bool preload_scan_valid;
     const char *module_entry_url;
@@ -412,7 +416,7 @@ static struct web_js_state *profile_task(struct web_js_state *s) {
 static void log_text(struct web_js_state *s, int level, const char *msg) {
     if (s->host.console) s->host.console(s->host.opaque, level, msg ? msg : "JavaScript error");
 }
-static void log_profile_line(void *opaque, const char *line) { log_text(opaque, 0, line); }
+static void log_profile_line(void *opaque, const char *line) { log_text(opaque, WEB_CONSOLE_TRACE, line); }
 /* The runtime's JavaScript time by function, once a second of it has gathered. */
 static void js_time_report(struct web_js_state *s) {
     struct web_js_state *owner = s->runtime_owner ? s->runtime_owner : s;
@@ -443,22 +447,22 @@ static void wasm_profile_report(struct web_js_state *s) {
         (unsigned long)current.compiled_modules,(unsigned long)current.compiled_bytes,
         (unsigned long)current.instances,(unsigned long)current.calls,
         (unsigned long)current.traps,(unsigned long)current.live_wrappers);
-    log_text(s,0,message);
+    log_text(s,WEB_CONSOLE_TRACE,message);
     snprintf(message,sizeof message,"WebAssembly wasm2c/TCC: native modules %lu, native calls %lu, interpreter fallbacks %lu",
         (unsigned long)current.native_modules,(unsigned long)current.native_calls,
         (unsigned long)current.native_fallbacks);
-    log_text(s,0,message);
+    log_text(s,WEB_CONSOLE_TRACE,message);
     if(fallback_changed){
         const char *reason=web_js_wasm_native_fallback(s->ctx);
         if(reason && *reason)log_text(s,1,reason);
     }
     snprintf(message,sizeof message,"WebAssembly time: descriptor compile %lu ms, shared images %lu ms/%lu bytes",
         (unsigned long)current.compile_ms,(unsigned long)current.image_ms,(unsigned long)current.image_bytes);
-    log_text(s,0,message);
+    log_text(s,WEB_CONSOLE_TRACE,message);
     snprintf(message,sizeof message,"WebAssembly JSPI: suspensions %lu, resumptions %lu, pending %lu",
         (unsigned long)current.jspi_suspensions,(unsigned long)current.jspi_resumptions,
         (unsigned long)current.jspi_pending);
-    log_text(s,0,message);
+    log_text(s,WEB_CONSOLE_TRACE,message);
 }
 static void storage_profile_report(struct web_js_state *s) {
     if(!s->host.debug_js)return;
@@ -476,12 +480,12 @@ static void storage_profile_report(struct web_js_state *s) {
              (unsigned long)p->calls[1][0],(unsigned long)p->calls[1][1],(unsigned long)p->calls[1][2],
              (unsigned long)p->calls[1][3],(unsigned long)p->calls[1][4],(unsigned long)p->calls[1][5],(unsigned long)p->calls[1][6],
              (unsigned long)p->inclusive_ms,(unsigned long)p->backend_calls,(unsigned long)p->backend_ms,(unsigned long)p->set_bytes);
-    log_text(s,0,message);
+    log_text(s,WEB_CONSOLE_TRACE,message);
     snprintf(message,sizeof message,
              "Task storage publication profile: %lu attempts/%lu ms, %lu serialized snapshot bytes; cookie %lu calls/%lu ms (inclusive, not covered by native_dom profile)",
              (unsigned long)p->saves,(unsigned long)p->save_ms,(unsigned long)p->snapshot_bytes,
              (unsigned long)p->cookie_calls,(unsigned long)p->cookie_ms);
-    log_text(s,0,message);
+    log_text(s,WEB_CONSOLE_TRACE,message);
 }
 void web_js_prepare_bytes(JSContext *ctx, size_t bytes) {
     struct web_js_state *s=state(ctx);
@@ -499,7 +503,7 @@ void web_js_prepare_bytes(JSContext *ctx, size_t bytes) {
         char message[160];snprintf(message,sizeof message,
             "JavaScript pressure GC: reclaimed %lu bytes before %lu-byte host allocation",
             (unsigned long)(before-after),(unsigned long)bytes);
-        log_text(s,0,message);
+        log_text(s,WEB_CONSOLE_TRACE,message);
     }
 }
 void web_js_console(web_doc *d, int level, const char *message) {
@@ -546,12 +550,12 @@ static void report_allocation_failure(struct web_js_state *s) {
         char message[256];
         snprintf(message,sizeof message,"JavaScript allocation failure: %s; requested %lu, charged %lu, limit %lu, peak %lu bytes",
             d->quota?"runtime quota":"Nocturne allocator",(unsigned long)d->requested,(unsigned long)d->used,(unsigned long)d->limit,(unsigned long)d->peak);
-        d->reported=d->failures;log_text(s,0,message);
+        d->reported=d->failures;log_text(s,WEB_CONSOLE_WARN,message);
         JSMemoryUsage usage; JS_ComputeMemoryUsage(s->rt, &usage);
         snprintf(message,sizeof message,"JavaScript heap: %ld allocations; %ld objects, %ld properties; strings %ld, functions %ld, bytecode %ld bytes",
             (long)usage.malloc_count,(long)usage.obj_count,(long)usage.prop_count,
             (long)usage.str_size,(long)usage.js_func_size,(long)usage.js_func_code_size);
-        log_text(s,0,message);
+        log_text(s,WEB_CONSOLE_TRACE,message);
     }
 }
 /* Read engine-owned stack data without running an author getter while reporting
@@ -871,7 +875,7 @@ static void end_task(struct web_js_state *s) {
                     snprintf(message,sizeof message,"Task DOM operation profile: %s calls %lu, sampled-native-estimate %lu ms, samples %lu",
                         dom_opcode_names[best],(unsigned long)s->profile_dom_ops[best].calls,
                         (unsigned long)s->profile_dom_ops[best].ms,(unsigned long)s->profile_dom_ops[best].samples);
-                    log_text(s,0,message);
+                    log_text(s,WEB_CONSOLE_TRACE,message);
                 }
             }
         }
@@ -880,6 +884,30 @@ static void end_task(struct web_js_state *s) {
     if (s->running==1) {web_js_wasm_collect(s->ctx);wasm_profile_report(s);js_time_report(s);}
     if (s->running) s->running--;
     if(!s->running && s->runtime_owner){s->runtime_owner->runtime_active=s->runtime_previous;s->runtime_previous=NULL;}
+}
+/* A throw the page's own try/catch swallows, or a promise rejection a later
+   handler swallows: a missing API or a failed probe the page works around
+   shows up nowhere else. Each distinct description is traced once per
+   document, so a probe in a loop costs one line. Nothing here may run
+   script: the interpreter is unwinding to the catch. */
+static void caught_exception(JSContext *ctx, JSValueConst exception, JS_BOOL rejected, void *opaque) {
+    (void)opaque;
+    struct web_js_state *s = state(ctx);
+    enum { SEEN = sizeof s->caught_seen / sizeof *s->caught_seen };
+    if (!s || !s->host.console || s->caught_logged >= SEEN * 3 / 4) return;
+    char text[800];
+    if (!JS_DescribeException(ctx, exception, text, sizeof text)) return;
+    uint32_t hash = rejected ? 2166136261u ^ 1u : 2166136261u;
+    for (const unsigned char *c = (const unsigned char *)text; *c; c++) hash = (hash ^ *c) * 16777619u;
+    if (!hash) hash = 1;
+    unsigned at = hash % SEEN;
+    while (s->caught_seen[at] && s->caught_seen[at] != hash) at = (at + 1) % SEEN;
+    if (s->caught_seen[at]) return;
+    s->caught_seen[at] = hash;
+    char message[860];
+    snprintf(message, sizeof message, "JavaScript %s%s: %s", rejected ? "promise rejected" : "caught exception",
+             ++s->caught_logged == SEEN * 3 / 4 ? " (last distinct one traced)" : "", text);
+    log_text(s, WEB_CONSOLE_TRACE, message);
 }
 static JS_BOOL browser_job_allowed(JSContext *ctx, void *opaque) {
     struct web_js_state *s = state(ctx);
@@ -4153,7 +4181,7 @@ static JSValue native_canvas(JSContext *ctx, JSValueConst this_val, int argc, JS
                     char message[320];snprintf(message,sizeof message,
                         "Canvas context request: type=%s frame=%d connected=%d origin=%.160s",
                         known[i],s->doc->frame_parent!=NULL,connected(s,node),parsed==HTTP_URL_TUPLE?origin:"null");
-                    log_text(s,0,message);free(origin);
+                    log_text(s,WEB_CONSOLE_TRACE,message);free(origin);
                 }
                 break;
             }
@@ -4206,7 +4234,7 @@ static JSValue native_image_bitmap(JSContext *ctx,JSValueConst this_val,int argc
             if(web_image_bitmap_dimensions(result,&w,&h)) {
                 static const char *const names[]={"Blob","ImageData","HTMLCanvasElement","HTMLImageElement","ImageBitmap"};
                 char message[128];snprintf(message,sizeof message,"ImageBitmap decoded: source=%s width=%u height=%u",names[index],w,h);
-                s->image_bitmap_seen|=1u<<index;log_text(s,0,message);
+                s->image_bitmap_seen|=1u<<index;log_text(s,WEB_CONSOLE_TRACE,message);
             }
         }
     }
@@ -5278,6 +5306,21 @@ static void release_pending_request(struct web_js_state *s, struct js_pending *p
     if (p->keepalive && s->host.release_request) s->host.release_request(s->host.opaque, p->id);
     else if (s->host.cancel) s->host.cancel(s->host.opaque, p->id);
 }
+/* net_body: bytes in hex, 512 to a line, so a protocol body (a protobuf or
+   UMP request, a short control response) can be decoded from the log. */
+static void net_log_bytes(struct web_js_state *s, struct js_pending *p, const char *what,
+                          const void *data, size_t len, size_t offset) {
+    const unsigned char *bytes = data;
+    for (size_t at = 0; bytes && at < len; at += 512) {
+        size_t n = MIN(len - at, (size_t)512);
+        char message[1200];
+        size_t used = (size_t)snprintf(message, sizeof message, "Net #%lu %s %zu-%zu:", (unsigned long)p->id,
+                                       what, offset + at, offset + at + n);
+        for (size_t i = 0; i < n && used + 3 < sizeof message; i++)
+            used += (size_t)snprintf(message + used, sizeof message - used, "%02x", bytes[at + i]);
+        log_text(s, WEB_CONSOLE_TRACE, message);
+    }
+}
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
     if(s->disabled){pending_error(p,"Browsing context is inactive");return false;}
@@ -5317,7 +5360,9 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         snprintf(message, sizeof message, "Net #%lu %s %s%s, body %lu bytes%s: %.1500s", (unsigned long)p->id,
                  pending_kind_name(p), method ? method : "GET", p->streaming ? " streamed" : "",
                  (unsigned long)len, ok ? "" : ", rejected by the browser", p->url);
-        log_text(s, 0, message);
+        log_text(s,WEB_CONSOLE_TRACE, message);
+        p->net_body = s->host.net_body && *s->host.net_body && strstr(p->url, s->host.net_body);
+        if (p->net_body) net_log_bytes(s, p, "request body", body, len, 0);
     }
     return ok;
 }
@@ -6202,7 +6247,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
             char safe[640], message[700]; s->module_sync_logged++;
             diagnostic_url(url, safe, sizeof safe);
             snprintf(message, sizeof message, "Module loaded synchronously, outside a fetched graph: %s", safe);
-            log_text(s, 0, message);
+            log_text(s,WEB_CONSOLE_TRACE, message);
         }
         /* URL storage is deliberately large. Keep responses and diagnostic
            copies off the native stack, especially in recursive module graphs. */
@@ -6239,7 +6284,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         if(waited>=2000 && s->resource_failures<64){
             char safe[640],message[832];diagnostic_url(web_response_url(r)[0]?web_response_url(r):url,safe,sizeof safe);
             snprintf(message,sizeof message,"Module load: HTTP %d, %lu bytes, native wait %lu ms; %s",r->status,(unsigned long)r->body_len,(unsigned long)waited,safe);
-            log_text(s,0,message);
+            log_text(s,WEB_CONSOLE_TRACE,message);
         }
         char *final = web_response_url(r)[0] ? module_url(s, "moduleURL", web_response_url(r), url) : js_strdup(ctx, url);
         web_js_prepare_bytes(ctx, r->body_len + 1);
@@ -6751,7 +6796,7 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
         snprintf(message, sizeof message, "Script task profile: %lu bytes, compile %lu ms%s, execute %lu ms, layout %lu ms in %u reads%s",
                  (unsigned long)script->len, (unsigned long)(compiled_at - source_start), compiler,
                  (unsigned long)(uptime_ms() - compiled_at), (unsigned long)s->task_layout_ms, s->task_layout_flushes,compilation_failed?", compilation failed":"");
-        log_text(s, 0, message);
+        log_text(s,WEB_CONSOLE_TRACE, message);
     }
     if (JS_IsException(result)) { exception(s); script->failed = true; }
     else if (script->module && JS_IsObject(result)) script->evaluation = result;
@@ -7077,7 +7122,7 @@ static void net_log_response(struct web_js_state *s, struct js_pending *p, const
              pending_kind_name(p),phase,p->response.status?p->response.status:p->streamed_status,(unsigned long)bytes,(unsigned long)(uptime_ms()-started),
              (int)MIN(type_len,(size_t)96),type?type:"",p->aborted?", aborted":p->response.error[0]?", failed: ":"",
              !p->aborted&&p->response.error[0]?p->response.error:"",hex);
-    log_text(s,0,message);
+    log_text(s,WEB_CONSOLE_TRACE,message);
 }
 static int fetch_transport_flags(const char *headers) {
     /* The HTTP host writes this non-field line; server header fields cannot
@@ -7119,6 +7164,11 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
         if (s->host.net_log && p->net_preview_len < sizeof p->net_preview && p->response.body) {
             size_t n = MIN(p->response.body_len, sizeof p->net_preview - p->net_preview_len);
             memcpy(p->net_preview + p->net_preview_len, p->response.body, n); p->net_preview_len += (unsigned)n;
+        }
+        if (p->net_body && p->net_body_logged < 2048 && p->response.body) {
+            size_t n = MIN(p->response.body_len, (size_t)(2048 - p->net_body_logged));
+            net_log_bytes(s, p, "response body", p->response.body, n, p->net_body_logged);
+            p->net_body_logged += (unsigned)n;
         }
         value = JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body, p->response.body_len, fetch_body_free, NULL, false);
         if (!JS_IsException(value)) p->response.body = NULL;
@@ -7190,6 +7240,7 @@ static bool process_pending(struct web_js_state *s) {
             diagnostic_resource(s,p,p->aborted?"aborted":p->response.error[0]?p->response.error:"unsuccessful HTTP response");
         if (!p->aborted && !s->disabled) { begin_named_task(s,"resource timing",p->id); resource_timing(s,p,p->response.body_len); end_task(s); }
         if (s->host.net_log) net_log_response(s,p,"done",p->response.body_len);
+        if (p->net_body) net_log_bytes(s, p, "response body", p->response.body, MIN(p->response.body_len, (size_t)2048), 0);
         if(p->kind==P_FRAME)frame_response(s,p,ok);
         else if(p->kind==P_MODULE){
             begin_named_task(s,"module preload preparation",p->id);
@@ -7501,7 +7552,7 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
                  "Timer task profile: id %u, total %lu ms (callback-inclusive %lu ms, microtasks-inclusive %lu ms, layout %lu ms in %u flushes, DOM revisions %lu)",
                  timer_id, (unsigned long)elapsed, (unsigned long)js_ms,
                  (unsigned long)s->task_microtask_ms, (unsigned long)layout_ms, flushes, (unsigned long)dom_rev);
-        log_text(s, 0, message);
+        log_text(s,WEB_CONSOLE_TRACE, message);
         const struct web_profile *p = &s->doc->profile;
         snprintf(message, sizeof message,
                  "Timer native profile: calls %lu/%lu ms, inserts %lu, indices %lu visits/%lu ms, scripts %lu scans/%lu visits/%lu ms, resources %lu scans/%lu ms (native time sampled estimate, ~1/64, %lu samples; other times inclusive)",
@@ -7511,13 +7562,13 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
                  (unsigned long)(p->script_visits-before.script_visits), (unsigned long)(p->script_ms-before.script_ms),
                  (unsigned long)(p->rescans-before.rescans), (unsigned long)(p->rescan_ms-before.rescan_ms),
                  (unsigned long)(p->native_samples-before.native_samples));
-        log_text(s, 0, message);
+        log_text(s,WEB_CONSOLE_TRACE, message);
         snprintf(message, sizeof message,
                  "Timer metadata profile: %lu syncs/%lu visits/%lu ms (inclusive)",
                  (unsigned long)(s->doc->profile.metadata_syncs-before.metadata_syncs),
                  (unsigned long)(s->doc->profile.metadata_visits-before.metadata_visits),
                  (unsigned long)(s->doc->profile.metadata_ms-before.metadata_ms));
-        log_text(s, 0, message);
+        log_text(s,WEB_CONSOLE_TRACE, message);
     }
     return true;
 }
@@ -7573,13 +7624,13 @@ static bool run_posted_task(struct web_js_state *s) {
                  (unsigned long)(s->doc->profile.rescans-before.rescans),
                  (unsigned long)(s->doc->profile.rescan_ms-before.rescan_ms),
                  (unsigned long)(s->doc->profile.native_samples-before.native_samples));
-        log_text(s, 0, message);
+        log_text(s,WEB_CONSOLE_TRACE, message);
         snprintf(message, sizeof message,
                  "Posted metadata profile: %lu syncs/%lu visits/%lu ms (inclusive)",
                  (unsigned long)(s->doc->profile.metadata_syncs-before.metadata_syncs),
                  (unsigned long)(s->doc->profile.metadata_visits-before.metadata_visits),
                  (unsigned long)(s->doc->profile.metadata_ms-before.metadata_ms));
-        log_text(s, 0, message);
+        log_text(s,WEB_CONSOLE_TRACE, message);
     }
     return true;
 }
@@ -8548,7 +8599,7 @@ static JSValue native_locale(JSContext *ctx, JSValueConst this_val, int argc, JS
         snprintf(message, sizeof message, "Locale program: compiler wait %llu, read %llu ms; heap +%zu KiB",
                  (unsigned long long)profile.wait_ms, (unsigned long long)profile.read_ms,
                  (after > before ? after - before : 0) / 1024);
-        log_text(s, 0, message);
+        log_text(s,WEB_CONSOLE_TRACE, message);
     }
     return fn;
 }
@@ -8578,7 +8629,7 @@ static JSValue webaudio_interface(JSContext *ctx, JSAtom name, void *opaque) {
             snprintf(message, sizeof message, "Web Audio program: compiler wait %llu, read %llu, run %llu ms; heap +%zu KiB",
                      (unsigned long long)profile.wait_ms, (unsigned long long)profile.read_ms, (unsigned long long)profile.run_ms,
                      (after > before ? after - before : 0) / 1024);
-            log_text(s, 0, message);
+            log_text(s,WEB_CONSOLE_TRACE, message);
         }
     }
     return JS_GetProperty(ctx, s->webaudio, name);
@@ -8626,6 +8677,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_SetModuleImportFunc(s->rt, import_module);
         JS_SetHostPromiseRejectionTracker(s->rt, promise_rejection, s);
         JS_SetHostJobFilter(s->rt, browser_job_allowed, NULL);
+        JS_SetCaughtExceptionHook(s->rt, caught_exception, NULL);
         web_atomics_runtime_init(s->rt);
     }else s->heap_limit=s->runtime_owner->heap_limit;
     s->ctx = JS_NewContext(s->rt); if (!s->ctx) goto failed;
@@ -8752,7 +8804,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
              JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)(uptime_ms()-initialized),
              (unsigned long long)bindings.wait_ms,(unsigned long long)bindings.read_ms,(unsigned long long)bindings.run_ms,
              (s->runtime_owner->allocation.current>heap_before?s->runtime_owner->allocation.current-heap_before:0)/1024);
-    log_text(s,0,limits);return;
+    log_text(s,WEB_CONSOLE_TRACE,limits);return;
 failed:
     s->starting = false;
     log_text(s, 2, "Could not initialize JavaScript; the document remains usable without scripting");

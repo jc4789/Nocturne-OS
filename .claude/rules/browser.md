@@ -16,9 +16,10 @@ paths:
 
 ## ログを先に読む
 
-- 口は二つ：ホストの serial.log（QEMU の `-serial file:`）と、ゲストの F12 の console。同じ `console_add`（browser.c）から出る。serial へ出るのは `--log-console` か `--debug-js` のときだけ。GUI からは旗を付けられない：ゲストの Terminal で `browser --debug-js <URL>`、`C:\Tests\autorun.sh`、または `scripts/platform_qa.py --url`。
-- 行の形は `[browser log @秒.ミリ秒] 本文`（`warn`・`error` も同じ形）。秒はゲストの起動からの時間。カーネルの行には時刻が無い。
-- 動画のかくつき・落ちるコマ・音：`Native media timing:` の `decoded N/drop M`、`presented`、`queued`、`starved`。再生中は 2 秒ごとに出る。旗なしでも F12 には出る。
+- 口は二つ：ホストの serial.log（QEMU の `-serial file:`）と、ゲストの F12。F12 の Console の札は頁の行、Trace の札はブラウザー自身の計測（`WEB_CONSOLE_TRACE`）。どちらも `console_add`（browser.c）から出る。serial へ出るのは `--log-console` か `--debug-js` のときだけ。GUI からは旗を付けられない：ゲストの Terminal で `browser --debug-js <URL>`、`C:\Tests\autorun.sh`、または `scripts/platform_qa.py --url`。
+- 行の形は `[browser log @秒.ミリ秒] 本文`（`warn`・`error` も同じ形）。計測の行は `[browser trace @…]`。秒はゲストの起動からの時間。カーネルの行には時刻が無い。
+- 動画のかくつき・落ちるコマ・音：`Native media timing:` の `decoded N/drop M`、`presented`、`queued`、`starved`、`silence`。再生中は 2 秒ごとに出る。旗なしでも F12 の Trace の札には出る。
+- 頁が try/catch で握りつぶした例外は `JavaScript caught exception:`、Promise の拒否は `JavaScript promise rejected:`（どちらも Trace の札）。欠けた API を探す入口。
 - 描画と待ち（`--debug-js`、2 秒ごと）：`Browser loop profile:`（wall・ticks・draw・wait）、`Browser damage profile:`（部分描画）、`Native paint profile:`（walk・video probe）、`Document tick profile:`、`Script deadline profile:`。fps を直接出す行は無い。全面の `draw` と部分の `partial draw` の回数を wall で割る。
 - JS の重い関数：`JavaScript profile:`（標本の JS 時間が 1000 ms たまるごと）。`JavaScript heap census` は heap 全体を歩くので計測を歪める。通信は `Net #N …`。
 - 全部の行の意味・出る条件・取り方は `nocturne-project` スキルの `references/logs.md`。
@@ -27,7 +28,7 @@ paths:
 
 - `--debug-js` は原因を探す旗で、製品の速さを歪める（2026-10-27、heap の歩きが主スレッドの半分を使っていた）。製品の速さは旗なしの回で測る。
 - 変更前の基準を先に取る：同じ媒体の版、`browser-hikaku` の組の全部、2560×1440、F12 を開いたまま、QEMU は一台。
-- 計測の道具を足したら、その道具自身の費用を測る。計測の行は頁の console と分ける。
+- 計測の道具を足したら、その道具自身の費用を測る。計測の行は `web_js_trace`・`WEB_CONSOLE_TRACE` で出し、頁の console（level 0〜2）へ混ぜない。
 - 「速くなった」は同じ条件の実時間と fps が動いたときだけ。内部の数が減っただけでは言わない。
 
 ## 触るときの約束

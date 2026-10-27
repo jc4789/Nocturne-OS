@@ -1,21 +1,23 @@
 # ログの読み方：serial.log と F12 の console
 
-確かめた: 2026-10-27 `e7728bf8`（`user/apps/browser.c`、`user/libc/web/{avmedia,js,js_profile,paint,css,box,doc}.c`、`kernel/src/{boot.c,sys/prof.c,fs/store.c}`）。行の形が違ったら、その場でこの表を直す。
+確かめた: 2026-10-27 `88a17463` と未コミットの計測の分離（`user/apps/browser.c`、`user/libc/web/{avmedia,js,js_profile,paint,css,box,doc}.c`、`kernel/src/{boot.c,sys/prof.c,fs/store.c}`）。行の形が違ったら、その場でこの表を直す。
 
 ## どこに出るか
 
 | 口 | 場所 | 出る条件 |
 |---|---|---|
 | ホストの serial.log | 手で起動した QEMU の `-serial file:<path>`。`scripts/platform_qa.py` → `build/nocturne-platform/<label>/serial.log`。`scripts/test.py` → `build/test-serial.log`。`scripts/qtest.py` → `build/serial.log` | カーネルの行は常に。ブラウザーの行は `--log-console` か `--debug-js` のときだけ |
-| ゲストの F12 の console | ブラウザーの窓（F12 で開閉） | `console_add`（browser.c）が受けた行の全部。旗は要らない |
+| ゲストの F12 の Console の札 | ブラウザーの窓（F12 で開閉） | 頁の `console.*`、例外、ブラウザー自身の warn・error。旗は要らない |
+| ゲストの F12 の Trace の札 | 同じ窓の Console の右の右（Ctrl+] で回る） | ブラウザー自身の計測（`WEB_CONSOLE_TRACE`）：profile 群、`Net #`、媒体の timing、捕まった例外。旗は要らない（出る行の多くは旗が決める） |
 | ゲストの system log | `C:\Users\<名前>\AppData\Nocturne\System.log`（前回の起動の分は `System-previous.log`。`kernel/src/sys/stream.c`） | serial と同じ内容。ゲストの Files から読める |
 
 ブラウザーの旗は GUI からは付けられない。付け方は三つ：ゲストの Terminal で `browser --debug-js <URL>`、`C:\Tests\autorun.sh`（test.py・platform_qa の写しの C: にだけ置く）、`scripts/platform_qa.py --label <名> --command "<ゲストのコマンド>"`。
 
 | 旗 | 効き |
 |---|---|
-| `--log-console` | console の行を serial へも書く。費用は行の送出だけ |
+| `--log-console` | Console と Trace の両方の行を serial へも書く。費用は行の送出だけ |
 | `--net-log` | `Net #N …` の行 |
+| `--net-body <URL の一部>` | `--net-log` に加え、その文字列を含む URL の要求の本文の全部と応答の頭 2 KiB を 16 進で（`Net #N request body a-b:`・`response body a-b:`、512 バイトずつ） |
 | `--debug-js` | `debug_js = net_log = log_console = true`。2 秒ごとの profile 群、`JavaScript profile`、heap の census、媒体の transition・sink・supply 行が加わる。**製品の速さを歪める**（heap の census は heap 全体を歩く） |
 | `--js-console` | F12 を開いた状態で始める |
 | `--console-file <path>` | 3 秒後にそのファイルを console へ流し込む（platform_qa の `--guest-file` は `C:\Tests\<名>`） |
@@ -25,9 +27,9 @@
 
 ## 行の形
 
-- ブラウザー：`[browser log @秒.ミリ秒] 本文`。水準は `log`・`warn`・`error`。1900 字を越える本文は `[browser log+ @…]` の行に続く。秒はゲストの起動からの uptime で、F12 の console の `@秒` と同じ時計。
+- ブラウザー：`[browser log @秒.ミリ秒] 本文`。水準は `log`・`warn`・`error`（頁の console と F12 の Console の札）と `trace`（ブラウザー自身の計測、F12 の Trace の札）。1900 字を越える本文は `[browser log+ @…]` の行に続く。秒はゲストの起動からの uptime で、F12 の `@秒` と同じ時計。
 - カーネル：接頭辞だけで時刻が無い（`memory:`、`video:`、`store:`、`prof:`、`[memory]`）。
-- 頁の console.log も同じ `[browser log @…]` に混ざる。計測の行は接頭辞（`Browser …`・`Native …`・`Document …`・`Script …`・`JavaScript …`・`Net #`）で選ぶ。
+- 計測の行は全部 `[browser trace @…]`。頁の行（`[browser log|warn|error @…]`）と grep で分けられる：`grep -a "\[browser trace" serial.log`、頁だけなら `grep -a "\[browser \(log\|warn\|error\)"`。2026-10-27 までの serial.log では計測の行も `[browser log @…]` だった。
 
 ## ブラウザーの計測の行
 
@@ -55,11 +57,14 @@ fps を直接出す行は無い。一組（wall ≈ 2000 ms）の `draw` の回�
 - `JavaScript profile: T ms in N functions; the functions with the most time:` と、続く字下げの行 `  割合 ms 関数名 script`。標本の JS 時間が 1000 ms たまるごと（`--debug-js`）。
 - `Net #id <種> <METHOD> <URL>, body N bytes…`（要求）と `Net #id <種> <段階>: HTTP <code>, N bytes, T ms, <type>…`（応答）。`--net-log`。
 - `JavaScript stopped: the task exceeded its N second execution budget.`
+- `JavaScript caught exception: <name>: <message> at <関数> (<script>:<行>:<列>)`：頁の try/catch（と await の中の例外）が握りつぶした throw。旗は要らない。同じ説明は文書ごとに一度、192 種まで（最後の一つに「last distinct one traced」）。欠けた API や機能の探りの失敗は、ここにしか出ない（QuickJS の `JS_SetCaughtExceptionHook`、js.c の `caught_exception`）。
+- `JavaScript promise rejected: <理由の説明>`：Promise の拒否のすべて（後で `.catch` が受けるものも）。async 関数の throw と Promise の連なりの失敗はここに出る。上と同じ表で数える。
 
 ## 動画と音（avmedia.c）
 
 - `Native media timing: generation G, input MSE|Range|buffer, clock C ms, presented P at T ms, decoded D/drop X, window-published W; audio open|closed, queued Q frames, written/silence …, end/played-estimate … ms, pending …/ahead …, starved S/ended E, window-unpublished <理由>@<行>`
-  - 再生中は 2 秒ごと、止まったら一度。**旗は要らない**（F12 には常に。serial へは `--log-console`）。
+  - 再生中は 2 秒ごと、止まったら一度。**旗は要らない**（F12 の Trace の札には常に。serial へは `--log-console`）。
+  - `written/silence`：音の出口へ書いたフレーム数のうち、PTS の隙間を埋めた無音の数。連続した音なら silence はほとんど増えない（2026-10-27 まで、ミリ秒の PTS の丸めを隙間と見て 1 秒に約 300 フレームの無音を挟んでいた）。
   - かくつきは `drop` の増え方と `starved`。`presented` が `decoded` よりずっと少なければ、解読は追い付いて提示が追い付いていない。`window-unpublished` は窓へ直接出せなかった理由と avmedia.c の行番号。
 - `Native media transition: reason …, generation a->b, …`、`Native audio sink: …`、`Native media supply: …`：`--debug-js` のときだけ。
 

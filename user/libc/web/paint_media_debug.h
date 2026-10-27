@@ -67,20 +67,20 @@ static void paint_debug_finish(web_doc *d) {
         snprintf(text,sizeof text,"Native media paint geometry: id=%llu nodes=%zu tag=%u connected=%u box=%u reached=%u rect=%d,%d,%d,%d clip=%d,%d,%d,%d",
             (unsigned long long)p->id,count,n->tag,connected,b!=NULL,p->reached,
             p->rect[0],p->rect[1],p->rect[2],p->rect[3],p->clip[0],p->clip[1],p->clip[2],p->clip[3]);
-        web_js_console(d,0,text);
+        web_js_trace(d,text);
         size_t depth=0;
         for(box_t *a=b;a;a=a->parent,depth++) {
             style_t *s=a->st;
             snprintf(text,sizeof text,"Native media paint ancestor: id=%llu depth=%zu tag=%u kind=%u xy=%.2f,%.2f wh=%.2f,%.2f padding=%.2f,%.2f,%.2f,%.2f display=%u position=%u overflow=%u visibility=%u opacity=%.3f z=%d/%u",
                 (unsigned long long)p->id,depth,a->node?a->node->tag:0,a->kind,box_visual_x(a),box_visual_y(a),a->w,a->h,
                 a->p[0],a->p[1],a->p[2],a->p[3],s?s->display:0,s?s->position:0,s?s->overflow:0,s?s->visibility:0,s?s->opacity:1,s?s->z_index:0,s?s->z_auto:0);
-            web_js_console(d,0,text);
+            web_js_trace(d,text);
             if(s){
                 snprintf(text,sizeof text,"Native media paint sizing: id=%llu depth=%zu height=%u/%.2f/%.2f min=%u/%.2f/%.2f max=%u/%.2f/%.2f top=%u/%.2f/%.2f bottom=%u/%.2f/%.2f boxsizing=%u",
                     (unsigned long long)p->id,depth,s->height.kind,s->height.px,s->height.pct,
                     s->min_height.kind,s->min_height.px,s->min_height.pct,s->max_height.kind,s->max_height.px,s->max_height.pct,
                     s->inset[0].kind,s->inset[0].px,s->inset[0].pct,s->inset[2].kind,s->inset[2].px,s->inset[2].pct,s->box_sizing);
-                web_js_console(d,0,text);
+                web_js_trace(d,text);
             }
         }
         if(!b && connected) {
@@ -88,7 +88,7 @@ static void paint_debug_finish(web_doc *d) {
             for(node_t *a=n;a;a=doc_flat_parent(a),depth++) {
                 snprintf(text,sizeof text,"Native media paint unboxed ancestor: id=%llu depth=%zu tag=%u style=%u display=%u visibility=%u",
                     (unsigned long long)p->id,depth,a->tag,a->style!=NULL,a->style?a->style->display:0,a->style?a->style->visibility:0);
-                web_js_console(d,0,text);
+                web_js_trace(d,text);
             }
         }
     }

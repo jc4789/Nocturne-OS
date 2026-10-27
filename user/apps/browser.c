@@ -57,8 +57,10 @@ static bool window_state_known;
 static unsigned window_previous_state;
 static bool debug_js;
 /* --net-log: requests in the console; --log-console: the console in the system log.
-   --debug-js turns both on. */
+   --debug-js turns both on. --net-body <text>: --net-log plus the bodies of
+   requests whose URL contains text. */
 static bool net_log, log_console;
+static const char *net_body;
 /* Debug-only inclusive phase totals, with no page data or per-frame logging. */
 static struct {
     uint64_t since, tick_ms, tick_max_ms, layout_ms, draw_ms, update_ms, net_ms, wait_ms;
@@ -96,8 +98,13 @@ static struct web_response navigation_response;
 _Static_assert(WEB_RESPONSE_HEADERS_MAX >= WEBNET_RESPONSE_HEADERS_MAX, "Browser must retain complete native response headers");
 
 #define CONSOLE_LINE 1024
-static char (*console_lines)[CONSOLE_LINE];
-static int console_n, console_capacity, console_skip;
+/* The page's console, and the engine's own measurement (WEB_CONSOLE_TRACE:
+   profiles, requests, media timing) in a panel of its own, so that a trace
+   every two seconds never buries what the page itself reported. */
+struct console_log { char (*lines)[CONSOLE_LINE]; int n, capacity, skip; };
+static struct console_log console_page, console_trace;
+/* Traces arrive for as long as a page plays: the panel keeps the newer half of a long session. */
+#define CONSOLE_TRACE_MAX 8192
 static unsigned long console_sequence;
 static bool console_open, console_dirty;
 static char *console_input, *console_startup;
@@ -112,20 +119,19 @@ static bool console_startup_pending(void) {
 
 static int console_h(void);
 static int console_visible(void) { return MAX(1, (console_h() - 50) / 16); } /* below the DevTools tab bar (24) and the heading (26) */
-static void console_scroll(int delta) {
-    int64_t desired = (int64_t)console_skip + delta;
-    console_skip = (int)MAX(0, MIN(desired, MAX(console_n - console_visible(), 0)));
+static void console_scroll(struct console_log *log, int delta) {
+    int64_t desired = (int64_t)log->skip + delta;
+    log->skip = (int)MAX(0, MIN(desired, MAX(log->n - console_visible(), 0)));
     console_dirty = true;
 }
-static bool console_copy_log(void) {
-    if ((size_t)console_n > SIZE_MAX / (CONSOLE_LINE + 1)) return false;
-    size_t capacity = (size_t)console_n * (CONSOLE_LINE + 1) + 1, used = 0;
+static bool console_copy_log(const struct console_log *log) {
+    if ((size_t)log->n > SIZE_MAX / (CONSOLE_LINE + 1)) return false;
+    size_t capacity = (size_t)log->n * (CONSOLE_LINE + 1) + 1, used = 0;
     char *text = malloc(capacity);
     if (!text) return false;
-    for (int i = 0; i < console_n; i++) {
-        int index = i;
-        size_t n = strlen(console_lines[index]);
-        memcpy(text + used, console_lines[index], n); used += n;
+    for (int i = 0; i < log->n; i++) {
+        size_t n = strlen(log->lines[i]);
+        memcpy(text + used, log->lines[i], n); used += n;
         text[used++] = '\n';
     }
     int result=clipboard_set(text, used); free(text);
@@ -420,20 +426,22 @@ static void draw_console(void) {
         int top = page_h(), h = console_h();
         devtools_draw(c, top, h);
         console_dirty = false;
-        if (dt_tab != DT_CONSOLE) return;
+        if (dt_tab != DT_CONSOLE && dt_tab != DT_TRACE) return;
+        struct console_log *log = dt_tab == DT_TRACE ? &console_trace : &console_page;
         top += DT_TABH; h -= DT_TABH;
         gfx_fill(c, 0, top, view.w, h, DT_BG);
         char heading[192];
-        snprintf(heading, sizeof heading, "JavaScript console  [PgUp/PgDn: history] [Ctrl+Shift+C: copy log] [Ctrl+K: clear]  %d/%d%s",
-                 console_n - console_skip, console_n, console_skip ? " (paused)" : "");
+        snprintf(heading, sizeof heading, "%s  [PgUp/PgDn: history] [Ctrl+Shift+C: copy log] [Ctrl+K: clear]  %d/%d%s",
+                 log == &console_trace ? "Engine trace: profiles, requests, media timing" : "JavaScript console",
+                 log->n - log->skip, log->n, log->skip ? " (paused)" : "");
         gfx_text(c, 8, top + 4, heading, ui_theme.textDim, TRANSPARENT, FONT_SMALL);
         canvas_t clip = *c;
         gfx_clip(&clip, 4, top + 24, view.w - 8, h - 24);
-        console_skip = MIN(console_skip, MAX(console_n - console_visible(), 0));
-        int count = MIN(console_visible(), console_n - console_skip);
+        log->skip = MIN(log->skip, MAX(log->n - console_visible(), 0));
+        int count = MIN(console_visible(), log->n - log->skip);
         for (int i = 0; i < count; i++) {
-            int n = console_n - console_skip - count + i;
-            gfx_text(&clip, 8, top + 25 + i * 16, console_lines[n], ui_theme.text, TRANSPARENT, FONT_SMALL);
+            int n = log->n - log->skip - count + i;
+            gfx_text(&clip, 8, top + 25 + i * 16, log->lines[n], ui_theme.text, TRANSPARENT, FONT_SMALL);
         }
     }
     console_dirty = false;
@@ -464,6 +472,12 @@ static void console_system_log(const char *level, const char *message) {
 static void console_add(const char *level, const char *message) {
     const char *p = message ? message : "";
     if (log_console) console_system_log(level, p);
+    struct console_log *log = level && !strcmp(level, "trace") ? &console_trace : &console_page;
+    if (log == &console_trace && log->n >= CONSOLE_TRACE_MAX) {
+        int drop = log->n / 2;
+        memmove(log->lines, log->lines + drop, (size_t)(log->n - drop) * sizeof *log->lines);
+        log->n -= drop; log->skip = MAX(0, log->skip - drop);
+    }
     uint64_t now = n_clock_uptime_ms();
     unsigned long sequence = ++console_sequence;
     int glyph = w ? MAX(gfx_text_width("M", FONT_SMALL), 1) : 8;
@@ -477,19 +491,19 @@ static void console_add(const char *level, const char *message) {
             if (offset + part < n)
                 while (part && ((unsigned char)p[offset + part] & 0xc0) == 0x80) part--;
             if (!part && offset < n) part = MIN(n - offset, 4);
-            if (console_n == console_capacity) {
-                if (console_n == INT_MAX) return;
-                int capacity = console_capacity ? (console_capacity > INT_MAX / 2 ? INT_MAX : console_capacity * 2) : 64;
-                if ((size_t)capacity > SIZE_MAX / sizeof *console_lines) return;
-                void *grown = realloc(console_lines, (size_t)capacity * sizeof *console_lines);
+            if (log->n == log->capacity) {
+                if (log->n == INT_MAX) return;
+                int capacity = log->capacity ? (log->capacity > INT_MAX / 2 ? INT_MAX : log->capacity * 2) : 64;
+                if ((size_t)capacity > SIZE_MAX / sizeof *log->lines) return;
+                void *grown = realloc(log->lines, (size_t)capacity * sizeof *log->lines);
                 if (!grown) return; /* Keep existing log; host serial logging remains available. */
-                console_lines = grown; console_capacity = capacity;
+                log->lines = grown; log->capacity = capacity;
             }
-            snprintf(console_lines[console_n], CONSOLE_LINE, "[%s] #%lu @%lu.%03lu%s %.*s",
+            snprintf(log->lines[log->n], CONSOLE_LINE, "[%s] #%lu @%lu.%03lu%s %.*s",
                      level ? level : "log", sequence, (unsigned long)(now / 1000),
                      (unsigned long)(now % 1000), offset ? " +" : "", (int)part, p + offset);
-            console_n++;
-            if (console_skip && console_skip < INT_MAX) console_skip = MIN(console_skip + 1, MAX(console_n - console_visible(), 0));
+            log->n++;
+            if (log->skip && log->skip < INT_MAX) log->skip = MIN(log->skip + 1, MAX(log->n - console_visible(), 0));
             offset += part;
         } while (offset < n);
         console_dirty = true;
@@ -1338,8 +1352,9 @@ static void host_navigate_form(void *opaque, const char *url, const void *body, 
 
 static void host_console(void *opaque, int level, const char *message) {
     (void)opaque;
-    console_add(level >= 2 ? "error" : level == 1 ? "warn" : "log", message);
-    if (debug_js) fprintf(stderr, "[web-js:%s] %s\n", level >= 2 ? "error" : level == 1 ? "warn" : "log", message);
+    const char *name = level == WEB_CONSOLE_TRACE ? "trace" : level >= WEB_CONSOLE_ERROR ? "error" : level == WEB_CONSOLE_WARN ? "warn" : "log";
+    console_add(name, message);
+    if (debug_js) fprintf(stderr, "[web-js:%s] %s\n", name, message);
 }
 
 static void host_scroll(void *opaque, int *x, int *y) {
@@ -1917,6 +1932,7 @@ static void finish_navigation(void) {
     struct web_host document_host = browser_host;
     document_host.debug_js = debug_js;
     document_host.net_log = net_log;
+    document_host.net_body = net_body;
     document_host.navigation_timing = navigation_timing;
     document_host.js_task_budget_ms = js_task_budget_ms;
     web_doc *nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), &document_host);
@@ -2349,24 +2365,25 @@ static void find_close(void) {
 
 /* Keys for the DevTools panel while the console has the keyboard; the line itself is the field's. */
 static void console_key(const struct gui_event *e) {
-    if(dt_tab!=DT_CONSOLE){devtools_key(e);return;}
+    if(dt_tab!=DT_CONSOLE&&dt_tab!=DT_TRACE){devtools_key(e);return;}
+    struct console_log *log=dt_tab==DT_TRACE?&console_trace:&console_page;
     uint32_t k=e->key;bool ctrl=e->mods&NMOD_CTRL;
     if(ctrl&&k>='A'&&k<='Z')k+=32;
-    if(ctrl&&(k=='['||k==']')){devtools_set_tab(k==']'?DT_NETWORK:DT_ELEMENTS);return;}
-    if(k==NKEY_PGUP){console_scroll(console_visible());return;}
-    if(k==NKEY_PGDN){console_scroll(-console_visible());return;}
-    if(ctrl&&k==NKEY_HOME){console_scroll(INT_MAX);return;}
-    if(ctrl&&k==NKEY_END){console_scroll(-INT_MAX);return;}
+    if(ctrl&&(k=='['||k==']')){devtools_set_tab((dt_tab+(k==']'?1:DT_NTABS-1))%DT_NTABS);return;}
+    if(k==NKEY_PGUP){console_scroll(log,console_visible());return;}
+    if(k==NKEY_PGDN){console_scroll(log,-console_visible());return;}
+    if(ctrl&&k==NKEY_HOME){console_scroll(log,INT_MAX);return;}
+    if(ctrl&&k==NKEY_END){console_scroll(log,-INT_MAX);return;}
     if(ctrl&&k=='c'&&(e->mods&NMOD_SHIFT)){
-        bool copied=console_copy_log();console_skip=0;
-        console_add(copied?"log":"error",copied?"Retained console log copied to Nocturne clipboard.":"Console log copy failed.");return;
+        bool copied=console_copy_log(log);log->skip=0;
+        console_add(!copied?"error":log==&console_trace?"trace":"log",copied?"Retained console log copied to Nocturne clipboard.":"Console log copy failed.");return;
     }
 }
 
 static void console_eval(void) {
     size_t length=strlen(console_input);
     if(!length)return;
-    console_skip=0;
+    console_page.skip=0;
     console_add("input",console_input);
     if(!web_console_eval(doc,console_input,length))console_add("error","Console execution failed or the page runtime is unavailable.");
     console_input[0]=0;
@@ -2425,7 +2442,7 @@ static void key(const struct gui_event *e) {
     }
     /* Ctrl+Shift+C copies the console log while typing in the console. */
     if (ctrl && (e->mods & NMOD_SHIFT) && (k == 'i' || k == 'j' ||
-        (k == 'c' && !(console_open && focus == F_CONSOLE && dt_tab == DT_CONSOLE)))) {
+        (k == 'c' && !(console_open && focus == F_CONSOLE && (dt_tab == DT_CONSOLE || dt_tab == DT_TRACE))))) {
         devtools_shortcut(k);
         return;
     }
@@ -2890,7 +2907,7 @@ static void report_loop_profile(uint64_t now) {
     unsigned waits[6],engine_waits=loop_profile.engine_waits,woken=loop_profile.woken;memcpy(waits,loop_profile.waits,sizeof waits);
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
-    host_console(NULL, 0, message);
+    host_console(NULL, WEB_CONSOLE_TRACE, message);
     {
         /* Private pages of this process, against what malloc holds and uses:
            the difference between process and heap is mapped memory. */
@@ -2901,26 +2918,26 @@ static void report_loop_profile(uint64_t now) {
         malloc_usage(&heap, &used);
         snprintf(message, sizeof message, "Browser memory: process %lu KiB, malloc heap %lu KiB, in use %lu KiB",
                  process_kb, (unsigned long)(heap / 1024), (unsigned long)(used / 1024));
-        host_console(NULL, 0, message);
-        if (web_memory_report(doc, message, sizeof message) > 0) host_console(NULL, 0, message);
+        host_console(NULL, WEB_CONSOLE_TRACE, message);
+        if (web_memory_report(doc, message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
     }
     snprintf(message, sizeof message,
              "Browser wait profile: timeout from none %u, network %u, storage %u, document %u, now %u, refresh %u; shortened by the window engine %u; ended by an event %u",
              waits[WAIT_NONE], waits[WAIT_NET], waits[WAIT_STORAGE], waits[WAIT_DOCUMENT], waits[WAIT_NOW], waits[WAIT_REFRESH],
              engine_waits, woken);
-    host_console(NULL, 0, message);
-    if (web_wait_report(message, sizeof message) > 0) host_console(NULL, 0, message);
-    if (web_paint_report(message, sizeof message) > 0) host_console(NULL, 0, message);
-    if (web_style_report(message, sizeof message) > 0) host_console(NULL, 0, message);
-    if (web_box_report(message, sizeof message) > 0) host_console(NULL, 0, message);
-    if (web_tick_report(message, sizeof message) > 0) host_console(NULL, 0, message);
-    if (web_js_deadline_report(message, sizeof message) > 0) host_console(NULL, 0, message);
+    host_console(NULL, WEB_CONSOLE_TRACE, message);
+    if (web_wait_report(message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
+    if (web_paint_report(message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
+    if (web_style_report(message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
+    if (web_box_report(message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
+    if (web_tick_report(message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
+    if (web_js_deadline_report(message, sizeof message) > 0) host_console(NULL, WEB_CONSOLE_TRACE, message);
     if(consoles){snprintf(message,sizeof message,
         "Browser console profile: rect draw %u/%lu ms, rect present %lu ms (no author page paint)",
-        consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL,0,message);}
+        consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL, WEB_CONSOLE_TRACE,message);}
     if(partial||patches||partial_empty||partial_whole){snprintf(message,sizeof message,
         "Browser damage profile: partial draw %u/%lu ms over %lu kpx, partial present %lu ms, off the page %u, drawn whole %u, video patch %u/%lu ms (banded compose into the view and present)",
-        partial,(unsigned long)partial_ms,(unsigned long)(partial_pixels/1000),(unsigned long)partial_update,partial_empty,partial_whole,patches,(unsigned long)video_ms);host_console(NULL,0,message);}
+        partial,(unsigned long)partial_ms,(unsigned long)(partial_pixels/1000),(unsigned long)partial_update,partial_empty,partial_whole,patches,(unsigned long)video_ms);host_console(NULL, WEB_CONSOLE_TRACE,message);}
     static uint64_t reported_batches[PARALLEL_STAGE_COUNT];
     for (int stage = 1; stage < PARALLEL_STAGE_COUNT; stage++) {
         struct parallel_stats s;
@@ -2932,7 +2949,7 @@ static void report_loop_profile(uint64_t now) {
             (unsigned long)s.items,(unsigned long)s.helper_items,(unsigned long)s.work,(unsigned long)s.helper_work,
             (unsigned long)s.wall_ms,(unsigned long)s.worker_ms,(unsigned long)s.helper_ms,
             (unsigned long)s.sampled_cpu_mask,(unsigned long)s.sampled_helper_cpu_mask);
-        host_console(NULL,0,message);
+        host_console(NULL, WEB_CONSOLE_TRACE,message);
     }
 }
 
@@ -2943,6 +2960,7 @@ int main(int argc, char **argv) {
     while (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-') {
         if (!strcmp(argv[1], "--debug-js")) { debug_js = net_log = log_console = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--net-log")) { net_log = true; argc--; argv++; }
+        else if (!strcmp(argv[1], "--net-body") && argc > 2) { net_log = true; net_body = argv[2]; argc -= 2; argv += 2; }
         else if (!strcmp(argv[1], "--log-console")) { log_console = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--maximized")) { start_maximized = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--console-file-each-document")) { console_each_document = true; argc--; argv++; }
@@ -3100,7 +3118,7 @@ int main(int argc, char **argv) {
     free(current_text.p); free(navigation_text.p); free(pending_text.p); free(address_text.p); free(refresh_text.p);
     free(focus_value); free(find_text.p);
     for (int i = 0; i < nhist; i++) hist_discard(i);
-    free(hist); free(console_lines); free(sel_labels); free(evq); free(console_input); free(console_startup);
+    free(hist); free(console_page.lines); free(console_trace.lines); free(sel_labels); free(evq); free(console_input); free(console_startup);
     while (history_queue) { struct browser_history_task *next=history_queue->next; free(history_queue); history_queue=next; }
     ui_session_free(ui); free(chrome_sent); free(inbox);
     return 0;

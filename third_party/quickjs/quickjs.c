@@ -381,6 +381,8 @@ struct JSRuntime {
     void *host_job_filter_opaque;
     JSAtomicsWaitAsyncFunc *atomics_wait_async;
     void *atomics_wait_async_opaque;
+    JSCaughtExceptionHook *caught_exception_hook;
+    void *caught_exception_opaque;
 #endif
 
     JSModuleNormalizeFunc *module_normalize_func;
@@ -2386,6 +2388,12 @@ void JS_SetAtomicsWaitAsyncFunc(JSRuntime *rt, JSAtomicsWaitAsyncFunc *func, voi
 {
     rt->atomics_wait_async = func;
     rt->atomics_wait_async_opaque = opaque;
+}
+
+void JS_SetCaughtExceptionHook(JSRuntime *rt, JSCaughtExceptionHook *hook, void *opaque)
+{
+    rt->caught_exception_hook = hook;
+    rt->caught_exception_opaque = opaque;
 }
 
 int JS_EnqueueJobForCallback(JSContext *ctx, JSValueConst callback,
@@ -6373,6 +6381,104 @@ static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
     *ppr = NULL;
     return NULL;
 }
+
+#ifdef CONFIG_NOCTURNE
+/* A flat string data property of the object or its prototypes: no getter,
+   proxy or conversion runs. */
+static JSString *describe_string_property(JSObject *p, JSAtom atom)
+{
+    for (int depth = 0; p && depth < 8; depth++) {
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        if (p->class_id == JS_CLASS_PROXY)
+            return NULL;
+        prs = find_own_property(&pr, p, atom);
+        if (prs) {
+            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
+                JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_STRING)
+                return NULL;
+            return JS_VALUE_GET_STRING(pr->u.value);
+        }
+        p = p->shape->proto;
+    }
+    return NULL;
+}
+
+/* Up to 'max' characters of str from 'from' to the first newline, as UTF-8,
+   without allocating: the caller may hold an exception in flight. */
+static void describe_append(char *buf, int size, int *at, const char *prefix,
+                            JSString *str, uint32_t from, uint32_t max)
+{
+    for (; *prefix && *at < size - 1; prefix++) buf[(*at)++] = *prefix;
+    for (uint32_t i = from; str && i < str->len && i - from < max; i++) {
+        uint32_t c = str->is_wide_char ? str->u.str16[i] : str->u.str8[i];
+        char u[4];
+        int n;
+        if (c == '\n')
+            break;
+        if (c < 0x80) { u[0] = (char)c; n = 1; }
+        else if (c < 0x800) { u[0] = (char)(0xc0 | c >> 6); u[1] = (char)(0x80 | (c & 63)); n = 2; }
+        else if (c >= 0xd800 && c < 0xe000) { u[0] = '?'; n = 1; }
+        else { u[0] = (char)(0xe0 | c >> 12); u[1] = (char)(0x80 | ((c >> 6) & 63)); u[2] = (char)(0x80 | (c & 63)); n = 3; }
+        if (*at + n > size - 1)
+            break;
+        memcpy(buf + *at, u, n);
+        *at += n;
+    }
+    buf[*at] = 0;
+}
+
+int JS_DescribeException(JSContext *ctx, JSValueConst exception, char *buf, int size)
+{
+    int at = 0;
+    (void)ctx;
+    if (size <= 0)
+        return 0;
+    buf[0] = 0;
+    switch (JS_VALUE_GET_TAG(exception)) {
+    case JS_TAG_OBJECT: {
+        JSObject *p = JS_VALUE_GET_OBJ(exception);
+        JSString *name = describe_string_property(p, JS_ATOM_name);
+        JSString *message = describe_string_property(p, JS_ATOM_message);
+        JSString *stack = describe_string_property(p, JS_ATOM_stack);
+        describe_append(buf, size, &at, p->class_id == JS_CLASS_ERROR ? "" : "object ", name, 0, 64);
+        describe_append(buf, size, &at, name && message ? ": " : "", message, 0, 400);
+        /* The first frame: the stack's lines begin "    at ". */
+        uint32_t frame = 0;
+        while (stack && frame < stack->len &&
+               ((stack->is_wide_char ? stack->u.str16[frame] : stack->u.str8[frame]) == ' ' ||
+                (stack->is_wide_char ? stack->u.str16[frame] : stack->u.str8[frame]) == '\n'))
+            frame++;
+        if (stack && frame < stack->len)
+            describe_append(buf, size, &at, " ", stack, frame, 300);
+        break;
+    }
+    case JS_TAG_STRING:
+        describe_append(buf, size, &at, "string \"", JS_VALUE_GET_STRING(exception), 0, 400);
+        describe_append(buf, size, &at, "\"", NULL, 0, 0);
+        break;
+    case JS_TAG_INT:
+        at = snprintf(buf, size, "number %d", JS_VALUE_GET_INT(exception));
+        break;
+    case JS_TAG_FLOAT64:
+        at = snprintf(buf, size, "number %g", JS_VALUE_GET_FLOAT64(exception));
+        break;
+    case JS_TAG_UNDEFINED:
+        at = snprintf(buf, size, "undefined");
+        break;
+    case JS_TAG_NULL:
+        at = snprintf(buf, size, "null");
+        break;
+    case JS_TAG_BOOL:
+        at = snprintf(buf, size, "boolean %s", JS_VALUE_GET_BOOL(exception) ? "true" : "false");
+        break;
+    default:
+        at = snprintf(buf, size, "value of tag %d", JS_VALUE_GET_TAG(exception));
+        break;
+    }
+    return at < 0 ? 0 : MIN(at, size - 1);
+}
+#endif
 
 /* indicate that the object may be part of a function prototype cycle */
 static void set_cycle_flag(JSContext *ctx, JSValueConst obj)
@@ -21133,6 +21239,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                     JS_IteratorClose(ctx, sp[-1], TRUE);
                 } else {
+#ifdef CONFIG_NOCTURNE
+                    if (unlikely(rt->caught_exception_hook))
+                        rt->caught_exception_hook(ctx, rt->current_exception, FALSE,
+                                                  rt->caught_exception_opaque);
+#endif
                     *sp++ = rt->current_exception;
                     rt->current_exception = JS_UNINITIALIZED;
                     pc = b->byte_code_buf + pos;
@@ -54619,6 +54730,10 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         return; /* should never happen */
     set_value(ctx, &s->promise_result, JS_DupValue(ctx, value));
     s->promise_state = JS_PROMISE_FULFILLED + is_reject;
+#ifdef CONFIG_NOCTURNE
+    if (is_reject && unlikely(ctx->rt->caught_exception_hook))
+        ctx->rt->caught_exception_hook(ctx, value, TRUE, ctx->rt->caught_exception_opaque);
+#endif
 #ifdef DUMP_PROMISE
     printf("fulfill_or_reject_promise: is_reject=%d\n", is_reject);
 #endif
