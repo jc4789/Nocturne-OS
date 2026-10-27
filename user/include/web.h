@@ -132,6 +132,10 @@ struct web_video_patch {
     void (*draw)(void *context, uint32_t *dst, int pitch);
     void *context;
 };
+/* What a console line is: the page's log, warn and error, or the engine's own
+   measurement (profiles, network and media traces). A host shows traces apart
+   from the page's console, so that they never bury the page's messages. */
+enum { WEB_CONSOLE_LOG, WEB_CONSOLE_WARN, WEB_CONSOLE_ERROR, WEB_CONSOLE_TRACE };
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
@@ -155,6 +159,7 @@ struct web_host {
        The host must copy transient data before returning to the JS task. */
     void (*navigate_form)(void *opaque, const char *url, const void *body,
                           size_t length, const char *content_type, const char *target);
+    /* level is a WEB_CONSOLE_* value. */
     void (*console)(void *opaque, int level, const char *message);
     void (*scroll)(void *opaque, int *x, int *y);
     void (*scroll_to)(void *opaque, int x, int y);

@@ -506,6 +506,7 @@ void web_js_console(web_doc *d, int level, const char *message) {
     /* Native resource/layout failures remain observable after scripting stops. */
     if (d && d->js) log_text(d->js, level, message);
 }
+void web_js_trace(web_doc *d, const char *message) { web_js_console(d, WEB_CONSOLE_TRACE, message); }
 bool web_js_auxiliary_link(web_doc *d,const char *url) {
     /* The native click path has applied sandbox and opener policy. This GET
        uses the host's real new-window spawn, with no opener or initiator URL.

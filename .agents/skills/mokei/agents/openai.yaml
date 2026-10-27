@@ -1,6 +1,0 @@
-interface:
-  display_name: "作業の模型"
-  short_description: "本人の模型・フックが書く会話の記録・ファイルに結び付いた覚え書き・編集の直後に出るコードのつながりで、長い作業の判断の材料を目の前に保つ作業場"
-  default_prompt: "$mokei に従い、作業の模型を書いてから進めてください。"
-policy:
-  allow_implicit_invocation: true

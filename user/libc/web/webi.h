@@ -719,6 +719,10 @@ typedef struct box {
     float inline_cb_left, inline_cb_top, inline_cb_right, inline_cb_bottom;
     uint64_t paint_bounds_generation;
     float paint_bounds[4]; /* document-space conservative subtree bounds, one paint only */
+    float flow_ink[4]; /* paint.c flow_ink: what its own paint recursion draws, relative to its visual position */
+    uint64_t flow_ink_layout; /* the layout_revision it was measured at */
+    bool flow_ink_valid; /* cleared on the restyle path, with paint_layers_valid */
+    bool flow_ink_layers; /* a layer below may paint with a stacking context instead */
     uint32_t visual_memo_x, visual_memo_y; /* box_visual_memo generation of the memoized coordinate below */
     float visual_x, visual_y;
     uint32_t sticky_memo;   /* the same for the position: sticky offset below */
@@ -1299,6 +1303,8 @@ void web_js_parser_inserted(web_doc *d);
 bool web_js_shadow_allowed(web_doc *d, node_t *host);
 void web_js_parser_remove(web_doc *d, node_t *node);
 void web_js_console(web_doc *d, int level, const char *message);
+/* The engine's own measurement (WEB_CONSOLE_TRACE): kept out of the page's console. */
+void web_js_trace(web_doc *d, const char *message);
 /* Native trusted link activation only; not exposed as a script popup API. */
 bool web_js_auxiliary_link(web_doc *d,const char *url);
 bool web_js_video_present(web_doc *d,const struct web_video_patch *patch);

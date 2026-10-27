@@ -1184,8 +1184,15 @@ int web_memory_report(web_doc *d, char *out, size_t size) {
                      "authored sheets %zu, fetched CSS %zu source/%zu parsed, images %zu (%d), canvases %zu, JavaScript %zu",
                      t.docs, t.dom / 1024, t.styles / 1024, t.boxes / 1024, t.layout / 1024, t.sheets / 1024,
                      t.css_source / 1024, t.css_ast / 1024, t.images / 1024, t.image_count, t.canvas / 1024, t.js / 1024);
-    /* The largest runtime's own census, on the next line. */
-    if (t.largest && n >= 0 && (size_t)n + 1 < size) {
+    /* The largest runtime's own census, on the next line. It walks the whole heap, as long
+       as a busy frame on a large page, so the profile it is part of would mostly measure it:
+       only when that heap grew or shrank by an eighth, or every 30 s. */
+    static size_t census_bytes; static uint64_t census_at;
+    uint64_t now = uptime_ms();
+    bool census = t.largest_js > census_bytes + census_bytes / 8 || t.largest_js + t.largest_js / 8 < census_bytes ||
+                  now - census_at >= 30000;
+    if (t.largest && census && n >= 0 && (size_t)n + 1 < size) {
+        census_bytes = t.largest_js; census_at = now;
         out[n++] = '\n';
         int census = web_js_heap_census(t.largest, out + n, size - (size_t)n);
         if (census > 0) n += census; else out[--n] = 0;

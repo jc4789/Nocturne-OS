@@ -1295,7 +1295,7 @@ static void local_discard_box(box_t *x){
 /* A changed box and everything above it: layout, stacking lists, borrows. */
 static void local_dirty(box_t *b){
     layout_invalidate(b);
-    for(;b;b=b->parent){b->paint_layers_valid=false;pv_free(&b->paint_layers);b->style_sync_dirty=true;}
+    for(;b;b=b->parent){b->paint_layers_valid=b->flow_ink_valid=false;pv_free(&b->paint_layers);b->style_sync_dirty=true;}
 }
 /* The parent's fixup sorts a child only by these, so two boxes that agree
    take the same place, inside the same anonymous wrapper. */
@@ -1674,7 +1674,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
 }
 static void restyle_boxes(box_t *b,bool inherited_borrow) {
     if (!b||(!inherited_borrow&&!b->style_sync_dirty)) return;
-    b->paint_layers_valid=false; /* paint-only effects can change stacking without new geometry */
+    b->paint_layers_valid=b->flow_ink_valid=false; /* paint-only effects can change stacking and ink without new geometry */
     bool own_borrow=(b->node&&b->node->style_previous)||b->style_sync_subtree;
     style_t *old = b->st;
     if (restyle_derived(b,old)) {

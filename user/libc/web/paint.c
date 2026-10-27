@@ -2167,6 +2167,133 @@ static void bounds_decoration(struct pctx *P,const style_t *style,float x,float 
     float rect[4]={x,y,x+w,y+h};shadow_ink_bounds(style,x,y,w,h,rect);
     bounds_rect(P,rect[0],rect[1],rect[2]-rect[0],rect[3]-rect[1]);
 }
+/* A text run's ink around its baseline, with bx/by its block's content origin: glyph
+   overhang and decorations pass the advance by up to a font size. Up and down, its face's
+   extents and a pixel; tall (a fallback face taller than the style's own) adds half a font
+   size, for a test that costs nothing per pixel when it is loose. */
+struct run_metrics { const style_t *st; float asc, desc; };
+static void run_ink(const struct run *r,float bx,float by,struct run_metrics *m,bool tall,float rect[4]) {
+    if(m->st!=r->st){wfont f=style_font(r->st);wf_metrics(&f,&m->asc,&m->desc);m->st=r->st;}
+    float fs=r->st->font_size,slack=tall?fmaxf(1,fs*.5f):1;
+    rect[0]=bx+r->x-fs;rect[1]=by+r->y-m->asc-slack;
+    rect[2]=bx+r->x+r->w+fs;rect[3]=by+r->y+m->desc+slack;
+}
+/* An outside list marker's ink (paint_marker): left of the content box on its baseline. */
+static void marker_ink(const box_t *b,float rect[4]) {
+    const style_t *st=b->st;float fs=st->font_size,x=box_visual_x(b),y=cy(b);
+    wfont f=style_font(st);float asc,desc;wf_metrics(&f,&asc,&desc);
+    float base=y+(b->baseline>=0?b->baseline:(style_line_height(st)-asc-desc)/2+asc);
+    float w=b->marker?wf_width(&f,b->marker,strlen(b->marker)):fs*.85f+fmaxf(2,fs*.18f);
+    float slack=fmaxf(2,fs*.5f),bx=x-b->p[3]-b->b[3],by=y-b->content_dy-b->p[0]-b->b[0];
+    rect[0]=fminf(x-w,bx-fs*2)-slack;rect[1]=fminf(base-asc,by)-slack;
+    rect[2]=x+slack;rect[3]=fmaxf(base+desc,by+b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2])+slack;
+}
+/* b clips what its own paint recursion draws to its padding box: an overflow, marquee or
+   line-clamp box. The viewport takes the root's and body's propagated overflow instead. */
+static bool overflow_clips(const web_doc *d,const box_t *b) {
+    return (web_marquee_box(b)||b->clamp_truncated||b->st->overflow!=OV_VISIBLE)&&
+           b->kind!=B_INLINE&&b->parent&&!doc_viewport_overflow_box(d,b);
+}
+
+/* ---------------------------------------------------------------- normal-flow ink */
+/* What paint_box draws for b and for the descendants its own recursion reaches (layers
+   paint with their stacking context), relative to b's visual position. Nothing inside
+   moves on its own: a translated, sticky or fixed box is a layer, and a scroll container
+   or marquee holds what scrolls inside it to its padding box. So scrolling, sticky shifts
+   and translations above b move it whole, and it stays true until the next layout, or a
+   restyle on b's path (box.c restyle_boxes). Empty: no area; unbounded: infinite.
+   flow_ink_layers: a layer below was left to the stacking contexts, or may be. */
+struct ink_walk { web_doc *d; unsigned work; bool failed; struct run_metrics metrics; };
+static const float *flow_ink(struct ink_walk *W,box_t *b);
+static void ink_union(float r[4],const float a[4]) {
+    if(!(a[2]>a[0]&&a[3]>a[1]))return;
+    r[0]=fminf(r[0],a[0]);r[1]=fminf(r[1],a[1]);r[2]=fmaxf(r[2],a[2]);r[3]=fmaxf(r[3],a[3]);
+}
+static void ink_unbounded(float r[4]){r[0]=r[1]=-INFINITY;r[2]=r[3]=INFINITY;}
+static void flow_ink_child(struct ink_walk *W,box_t *c,float r[4],bool *layers) {
+    if(c->clamp_hidden){*layers|=c->first!=NULL;return;}
+    if(paint_box_layer(c)){*layers=true;return;}
+    if(c->kind==B_TEXT||c->kind==B_BR)return;
+    if(c->kind==B_INLINE){ink_unbounded(r);*layers=true;return;} /* paints its scoped runs: never apart from its block */
+    const float *k=flow_ink(W,c);
+    if(!k)return;
+    *layers|=c->flow_ink_layers;
+    float x=box_visual_x(c),y=box_visual_y(c);
+    if(!isfinite(x)||!isfinite(y)){ink_unbounded(r);return;}
+    float a[4]={x+k[0],y+k[1],x+k[2],y+k[3]};ink_union(r,a);
+}
+/* inline_children: the atomic inlines, floats and blocks inside an inline formatting context */
+static void flow_ink_inline(struct ink_walk *W,box_t *b,float r[4],bool *layers) {
+    for(box_t *c=b->first;c&&!W->failed;c=c->next) {
+        if(c->kind==B_INLINE&&!c->clamp_hidden&&!paint_box_layer(c))flow_ink_inline(W,c,r,layers);
+        else flow_ink_child(W,c,r,layers);
+    }
+}
+static const float *flow_ink(struct ink_walk *W,box_t *b) {
+    web_doc *d=W->d;
+    if(b->flow_ink_valid&&b->flow_ink_layout==d->layout_revision)return b->flow_ink;
+    if(!(++W->work&63)&&!web_native_checkpoint(d))W->failed=true;
+    if(W->failed)return NULL;
+    float r[4]={INFINITY,INFINITY,-INFINITY,-INFINITY};
+    float x=box_visual_x(b),y=box_visual_y(b);
+    const style_t *st=b->st;
+    bool layers=b->first!=NULL; /* what it does not paint may hold any */
+    if(!b->clamp_hidden&&st&&st->display!=D_NONE) {
+        if(b->kind!=B_INLINE&&b->kind!=B_TEXT&&b->kind!=B_BR) {
+            float bx=x-b->p[3]-b->b[3],by=y-b->p[0]-b->b[0];
+            float bw=b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],bh=b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
+            float a[4]={bx,by,bx+bw,by+bh};shadow_ink_bounds(st,bx,by,bw,bh,a);ink_union(r,a);
+            if(b->marker||b->marker_shape){marker_ink(b,a);ink_union(r,a);}
+        }
+        if(!(b->kind==B_ATOMIC&&b->atomic!=AT_INLINE_BLOCK)&&st->content_visibility!=CV_HIDDEN&&!overflow_clips(d,b)) {
+            layers=false;
+            if(b->kind==B_INLINE){ink_unbounded(r);layers=true;}
+            else if(b->inline_ctx) {
+                /* paint_runs: a marquee or scroll container would move these, but it clips them */
+                float rx=x,ry=cy(b),a[4];
+                for(int i=0;i<b->ndecos;i++) {
+                    const struct deco *e=&b->decos[i];
+                    a[0]=rx+e->x;a[1]=ry+e->y;a[2]=a[0]+e->w;a[3]=a[1]+e->h;
+                    shadow_ink_bounds(e->st,a[0],a[1],e->w,e->h,a);ink_union(r,a);
+                }
+                for(int i=0;i<b->nruns;i++)
+                    if(!b->runs[i].atomic){run_ink(&b->runs[i],rx,ry,&W->metrics,true,a);ink_union(r,a);}
+                flow_ink_inline(W,b,r,&layers);
+            } else for(box_t *c=b->first;c&&!W->failed;c=c->next)flow_ink_child(W,c,r,&layers);
+        }
+    }
+    if(W->failed)return NULL;
+    if(!isfinite(x)||!isfinite(y))ink_unbounded(r);
+    else if(r[2]>r[0]&&r[3]>r[1]){r[0]-=x;r[1]-=y;r[2]-=x;r[3]-=y;}
+    memcpy(b->flow_ink,r,sizeof r);b->flow_ink_layers=layers;
+    b->flow_ink_layout=d->layout_revision;b->flow_ink_valid=true;
+    return b->flow_ink;
+}
+/* Painting: nothing b's own paint_box call draws reaches the canvas clip. A box that
+   shows is painted without measuring; the rest measure once per layout, and a partial
+   repaint, a video probe or a scrolled page then skips them whole. A stacking context
+   (context) also paints its own layers, so only one without any is skipped. */
+static bool ink_outside(struct pctx *P,box_t *b,bool context) {
+    if(P->mode!=M_PAINT||!b->st||b->kind==B_INLINE||b->kind==B_TEXT||b->kind==B_BR||
+       (b->node&&b->node==P->d->html))return false; /* the html box may paint the whole canvas */
+    const canvas_t *c=P->c;
+    float x=box_visual_x(b),y=box_visual_y(b);
+    float left=P->ox+x-b->p[3]-b->b[3],top=P->oy+y-b->p[0]-b->b[0];
+    float right=left+b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],bottom=top+b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
+    if(!(right<=c->cx0||left>=c->cx1||bottom<=c->cy0||top>=c->cy1))return false;
+    struct ink_walk W={.d=P->d};
+    const float *k=flow_ink(&W,b);
+    if(W.failed){P->failed=true;return true;}
+    if(context&&b->flow_ink_layers)return false;
+    if(!(k[2]>k[0]&&k[3]>k[1]))return true; /* paints nothing */
+    const float slack=2; /* antialiased edges, rounded clips */
+    return P->ox+x+k[2]+slack<=c->cx0||P->ox+x+k[0]-slack>=c->cx1||
+           P->oy+y+k[3]+slack<=c->cy0||P->oy+y+k[1]-slack>=c->cy1;
+}
+/* A layer: a general transform or a filter moves or spreads its ink. */
+static bool layer_outside(struct pctx *P,box_t *l) {
+    return !box_transformed(l)&&!l->st->filter&&ink_outside(P,l,stacking_context(l));
+}
 /* The outline is drawn over the content, outside the border box by outline-offset. */
 static void paint_outline(canvas_t *c,const style_t *st,float x,float y,float w,float h) {
     float ow=st->outline_width;
@@ -2191,7 +2318,7 @@ static void inline_children(struct pctx *P, box_t *b, bool floats) {
             continue;
         }
         if (c->kind == B_TEXT || c->kind == B_BR) continue;
-        if (c->floated == floats) paint_box(P, c, false);
+        if (c->floated == floats && !ink_outside(P, c, false)) paint_box(P, c, false);
     }
 }
 
@@ -2202,6 +2329,7 @@ static struct line_fragment *overflow_line(box_t *b,int run) {
 }
 static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
     float bx = box_visual_x(b), by = cy(b);
+    struct run_metrics metrics = {0};
     if(web_marquee_box(b)){bx+=b->node->marquee_x;by+=b->node->marquee_y;}
     if (box_element_scrollable(b)) {
         bx -= (float)b->node->scroll_x;
@@ -2261,11 +2389,8 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
         }
         if (P->mode == M_BOUNDS) {
             if (r->st->visibility) continue;
-            wfont f = style_font(r->st); float asc, desc;
-            wf_metrics(&f, &asc, &desc);
-            /* Include glyph overhang/decoration coverage, not only advance. */
-            bounds_rect(P, bx + r->x - r->st->font_size, by + r->y - asc - 1,
-                r->w + 2 * r->st->font_size, asc + desc + 2);
+            float ink[4]; run_ink(r, bx, by, &metrics, false, ink);
+            bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]);
         } else {
             struct line_fragment *line=overflow_line(b,i);
             if(line && i>line->ellipsis_run)continue;
@@ -2583,7 +2708,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         bounds_rect(P, P->vx0 - P->ox, P->vy0 - P->oy, P->vx1 - P->vx0, P->vy1 - P->vy0);
     if (P->mode == M_BOUNDS && !st->visibility && b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR) {
         bounds_decoration(P,st,bx,by,bw,bh);
-        if (b->marker || b->marker_shape) bounds_rect(P, bx - st->font_size * 2, by, st->font_size * 2, bh);
+        if (b->marker || b->marker_shape) { float ink[4]; marker_ink(b, ink); bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]); }
     }
     /* A table row or row group is painted in its cells (CSS 2.1 17.5.1) and is not a
        target itself: a point between cells is the table's. */
@@ -2608,7 +2733,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             b->anon&&b->node->tag==T_details&&!doc_details_summary(b->node)?b->node:NULL;
         if(details){hit_target(P,b->node,PE_NONE);set_disclosure_hit(P,details);}
     }
-    bool clip = (web_marquee_box(b) || b->clamp_truncated || st->overflow != OV_VISIBLE) && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
+    bool clip = overflow_clips(P->d, b);
     /* Off-screen contexts can still contain viewport-fixed descendants. */
     if (P->mode != M_BOUNDS && clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) {
         if (clipped) clip_pop(c, clip_saved, clip_prior);
@@ -2699,10 +2824,11 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         if (b->inline_paint_source) paint_runs(P, b->inline_paint_source, b);
         inline_children(P, b, false);
     } else if (contents) {
+        /* a layer child returns at once: it paints with the layers */
         for (box_t *ch = b->first; ch; ch = ch->next)
-            if (ch->floated == false) paint_box(P, ch, false);
+            if (ch->floated == false && (paint_box_layer(ch) || !ink_outside(P, ch, false))) paint_box(P, ch, false);
         for (box_t *ch = b->first; ch; ch = ch->next)
-            if (ch->floated) paint_box(P, ch, false);
+            if (ch->floated && (paint_box_layer(ch) || !ink_outside(P, ch, false))) paint_box(P, ch, false);
     }
     for (; layer < layers.n; layer++) paint_stacked_layer(P, layers.v[layer]);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
@@ -2774,7 +2900,8 @@ static void paint_stacked_layer(struct pctx *P, box_t *l) {
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     const struct gfx_mask_clip *previous=c->mask_clip;c->mask_clip=P->viewport_mask;
     c->cx0 = P->vx0, c->cy0 = P->vy0, c->cx1 = P->vx1, c->cy1 = P->vy1;
-    stacked_ancestor_clips(P,l,l->parent,l->st->position!=POS_ABSOLUTE&&l->st->position!=POS_FIXED,box_viewport_fixed(l),false);
+    if (!layer_outside(P, l))
+        stacked_ancestor_clips(P,l,l->parent,l->st->position!=POS_ABSOLUTE&&l->st->position!=POS_FIXED,box_viewport_fixed(l),false);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
     c->mask_clip=previous;
 }
