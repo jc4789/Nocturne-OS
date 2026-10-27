@@ -265,8 +265,8 @@ static int storage_event_poll(struct storage_area *a,struct storage_source *p,co
     n_handle readers=storage_readers_open(a);uint8_t row[48];
     bool ok=readers>=0 && storage_io_at(readers,p->reader,row,48,false) && storage_u64(row)==p->token;
     if(readers>=0)n_handle_close(readers);if(!ok)return WEB_STORAGE_IO;
-    uint64_t epoch=storage_u64(row+24),cursor=storage_u64(row+32);
-    if(epoch!=h->epoch){epoch=h->epoch;cursor=STORAGE_CONTROL_BYTES;}
+    uint64_t epoch=storage_u64(row+24),cursor=storage_u64(row+32),stored=cursor;
+    if(epoch!=h->epoch){epoch=h->epoch;cursor=STORAGE_CONTROL_BYTES;stored=UINT64_MAX;}
     if(r->operation==WEB_STORAGE_ACK){
         if(r->cursor<cursor || r->cursor>h->end)return WEB_STORAGE_IO;
         return storage_reader_update(a,p->reader,p->token,epoch,r->cursor,false)?WEB_STORAGE_OK:WEB_STORAGE_IO;
@@ -280,6 +280,8 @@ static int storage_event_poll(struct storage_area *a,struct storage_source *p,co
         }
         free(record);cursor=next;
     }
+    /* An idle poll leaves the reader row as it found it: no write, no second open. */
+    if(cursor==stored)return WEB_STORAGE_OK;
     return storage_reader_update(a,p->reader,p->token,epoch,cursor,false)?WEB_STORAGE_OK:WEB_STORAGE_IO;
 }
 /* Session storage belongs to one top-level window, but its other live realms

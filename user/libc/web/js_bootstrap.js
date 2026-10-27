@@ -144,7 +144,11 @@
             ctrlKey:false, shiftKey:false, altKey:false, metaKey:false, repeat:false};
             o=o==null?{}:Object(o);for(const key of Object.keys(defaults))this[key]=o[key]===undefined?defaults[key]:o[key]; }
     }
-    function inputListenerChange(target,entry,delta) {
+    /* The native side counts the listeners it acts on: non-passive wheel
+     * listeners hold scrolling for the page, and only a Window with a storage
+     * listener polls the shared storage for other windows' changes. */
+    function nativeListenerChange(target,entry,delta) {
+        if(entry.type==='storage'){if(target===inputWindow)host.storageListener(delta);return;}
         if(entry.type!=='wheel' || entry.passive)return;
         if(target===inputWindow)host.inputListener(null,delta);
         else if(rawDom.isNode(null,target))host.inputListener(target,delta);
@@ -157,7 +161,7 @@
     function removeListener(target, entry) {
         if (entry.removed) return;
         entry.removed = true;
-        inputListenerChange(target,entry,-1);
+        nativeListenerChange(target,entry,-1);
         const a = listenerMap.get(target), i = a ? a.indexOf(entry) : -1;
         if (i >= 0) {
             a.splice(i, 1);
@@ -201,7 +205,7 @@
             const passive=o.passive;
             const x = {type, callback, capture:!!o.capture, once:!!o.once,
                 passive:passive===undefined?defaultPassive(this,type):!!passive, removed:false, signal:null, abort:null};
-            inputListenerChange(this,x,1);
+            nativeListenerChange(this,x,1);
             a.push(x);
             if (o.signal) {
                 x.signal = o.signal; x.abort = () => removeListener(this, x);
@@ -248,7 +252,7 @@
                     if(fn.call(target,event.message,event.filename,event.lineno,event.colno,event.error)===true)event.preventDefault();
                 }else if(fn.call(target,event)===false)event.preventDefault();
             }};
-        inputListenerChange(target,r.entry,1);
+        nativeListenerChange(target,r.entry,1);
         a.push(r.entry);
     }
     function handlerRecord(target,type) {
@@ -1069,9 +1073,41 @@
     /* @include js_wasm.js */
     fetchBridge.initializeBlobs(blobBridge);
     /* @include js_screen.js */
-    /* @include js_intl.js */
-    /* @include js_segmenter.js */
-    /* @include js_collator.js */
+    /* ECMA-402 and its CLDR and ICU tables (js_locale.js) take megabytes of heap
+       in every realm. A realm builds them when it first reads Intl or calls a
+       method they replace; until then those are an accessor and stubs that
+       build them. A value a page stored over a stub stays the page's. */
+    {
+        const targets=[[Date.prototype,'toLocaleString'],[Date.prototype,'toLocaleDateString'],
+            [Date.prototype,'toLocaleTimeString'],[Number.prototype,'toLocaleString'],
+            [BigInt.prototype,'toLocaleString'],[String.prototype,'localeCompare']];
+        const builtins=targets.map(([o,k])=>o[k]), built=builtins.slice(), stubs=[];
+        let building=false;
+        function build(){
+            if(building)return;building=true;
+            const kept=targets.map(([o,k],i)=>{const d=Reflect.getOwnPropertyDescriptor(o,k);return d&&d.value===stubs[i]?null:d;});
+            const intl=Reflect.getOwnPropertyDescriptor(globalThis,'Intl');
+            if(intl&&intl.get===intlGet)Reflect.deleteProperty(globalThis,'Intl');
+            try{host.locale()(host);}
+            finally{
+                targets.forEach(([o,k],i)=>{
+                    const d=Reflect.getOwnPropertyDescriptor(o,k);
+                    if(d&&typeof d.value==='function'&&d.value!==stubs[i])built[i]=d.value;
+                    if(kept[i])Reflect.defineProperty(o,k,kept[i]);
+                    else if(d&&d.value===stubs[i])Reflect.defineProperty(o,k,{value:built[i],writable:true,enumerable:false,configurable:true});
+                });
+            }
+        }
+        targets.forEach(([o,k],i)=>{
+            const stub={[k](...args){build();return apply(built[i],this,args);}}[k];
+            Object.defineProperty(stub,'length',{value:builtins[i]?builtins[i].length:0,configurable:true});
+            stubs[i]=stub;
+            Object.defineProperty(o,k,{value:stub,writable:true,enumerable:false,configurable:true});
+        });
+        function intlGet(){build();return globalThis.Intl;}
+        function intlSet(value){build();Reflect.defineProperty(globalThis,'Intl',{value,writable:true,enumerable:false,configurable:true});}
+        Object.defineProperty(globalThis,'Intl',{get:intlGet,set:intlSet,enumerable:false,configurable:true});
+    }
     /* @include js_crypto.js */
     /* @include js_formdata.js */
     fetchBridge.initializeFormData(formDataBridge);

@@ -273,7 +273,7 @@ struct web_js_state {
     bool document_open,document_waiting;
     unsigned dynamic_markup_counter;
     unsigned ignore_destructive_writes_counter;
-    uint64_t storage_source, storage_poll_due;
+    uint64_t storage_source, storage_poll_due, storage_listeners;
     char *storage_origin;
     webidb_async *indexed_db;
     struct js_idb_pending *indexed_db_pending;
@@ -291,13 +291,18 @@ struct web_js_state {
     bool parsing_done, parsing_cancelled, domcontent_sent, load_sent, disabled, timed_out, task_timed_out, parser_write, starting, scripts_prune_needed;
 };
 static JSClassID node_class,history_class;
-/* This cache contains only bytecode compiled from the checked-in browser
-   bindings. It avoids recompiling the platform implementation for every
-   document in the process. JS_ReadObject reads only bytecode this process
-   wrote in memory, here and in js_compile, never bytes from a page, the
-   network or storage. */
-static uint8_t *bindings_bytecode;
-static size_t bindings_bytecode_len;
+/* The browser's own checked-in programs: the bindings every realm runs, and
+   the locale program a realm runs when it first needs Intl. Each is compiled
+   once per process, on a compiler thread when there is one, and its bytecode
+   kept here. JS_ReadObject reads only bytecode this process wrote in memory,
+   here and in js_compile, never bytes from a page, the network or storage. */
+struct platform_program {
+    const char *source; size_t len; const char *name;
+    struct js_compile *job;
+    uint8_t *bytecode; size_t bytecode_len;
+};
+static struct platform_program bindings_program = {.source=js_bootstrap, .len=sizeof js_bootstrap - 1, .name="nocturne:browser-bindings"};
+static struct platform_program locale_program = {.source=js_locale, .len=sizeof js_locale - 1, .name="nocturne:locale"};
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic);
 static void dynamic_scripts(struct web_js_state *s, node_t *n);
 static void dynamic_inserted(struct web_js_state *s,node_t *parent,
@@ -4350,6 +4355,12 @@ static JSValue native_cookie(JSContext *ctx, JSValueConst this_val, int argc, JS
     JSValue result=native_cookie_impl(ctx,this_val,argc,argv);
     p->cookie_ms+=uptime_ms()-start;return result;
 }
+/* A realm is a source of the shared storage events only while its Window has
+ * a storage listener. A reader that never polls holds back every checkpoint
+ * and fills its session queue, so a realm without one is no reader at all. */
+static bool storage_listening(struct web_js_state *s) {
+    return s->host.storage_events && s->host.storage && s->storage_source && s->storage_listeners;
+}
 /* Returns [status, result]. DOMException creation belongs to the private JS
  * binding, not a replaceable public constructor. Never accepts an origin/path
  * from page code; even after argument conversion the current native URL wins. */
@@ -4368,7 +4379,7 @@ static JSValue native_storage_impl(JSContext *ctx, JSValueConst this_val, int ar
     if(kind<WEB_STORAGE_LOCAL || kind>WEB_STORAGE_SESSION || op<WEB_STORAGE_LENGTH || op>WEB_STORAGE_CHECK)
         return JS_ThrowTypeError(ctx,"Invalid Storage operation");
     struct web_storage_request request={.kind=kind,.operation=op,.index=index,
-        .source=s->host.storage_events?s->storage_source:0,.url=s->doc->url};
+        .source=storage_listening(s)?s->storage_source:0,.url=s->doc->url};
     const char *key=NULL,*value=NULL;
     if (op==WEB_STORAGE_GET || op==WEB_STORAGE_SET || op==WEB_STORAGE_REMOVE) {
         if (argc<3) return JS_ThrowTypeError(ctx,"Storage key required");
@@ -4453,11 +4464,39 @@ static void storage_release_document(struct web_js_state *s) {
         struct web_storage_request request={.operation=WEB_STORAGE_RELEASE,.source=s->storage_source};
         struct web_storage_result out={0};s->host.storage(s->host.opaque,NULL,&request,&out);webstorage_result_free(&out);
     }
-    free(s->storage_origin);s->storage_origin=NULL;s->storage_source=0;
+    free(s->storage_origin);s->storage_origin=NULL;s->storage_source=0;s->storage_listeners=0;
     s->storage_subscribed[0]=s->storage_subscribed[1]=false;
 }
+/* The first listener reads from the current end of each area this realm
+ * opened: changes made before it existed are not its events. */
+static void storage_listen(struct web_js_state *s) {
+    if(!storage_listening(s) || !s->storage_origin)return;
+    for(int kind=0;kind<2;kind++)if(s->storage_subscribed[kind]){
+        struct web_storage_request request={.kind=kind,.operation=WEB_STORAGE_SUBSCRIBE,.source=s->storage_source};
+        struct web_storage_result out={0};s->host.storage(s->host.opaque,s->storage_origin,&request,&out);webstorage_result_free(&out);
+    }
+    s->storage_poll_due=uptime_ms()+100;
+}
+static void storage_unlisten(struct web_js_state *s) {
+    if(!s->host.storage_events || !s->host.storage || !s->storage_source)return;
+    struct web_storage_request request={.operation=WEB_STORAGE_RELEASE,.source=s->storage_source};
+    struct web_storage_result out={0};s->host.storage(s->host.opaque,NULL,&request,&out);webstorage_result_free(&out);
+}
+static JSValue native_storage_listener(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    (void)this_val;struct web_js_state *s=state(ctx);int32_t delta=0;
+    if(argc<1 || JS_ToInt32(ctx,&delta,argv[0])<0)return JS_EXCEPTION;
+    if(delta!=1 && delta!=-1)return JS_ThrowTypeError(ctx,"Invalid storage listener change");
+    if(delta<0){
+        if(!s->storage_listeners)return JS_ThrowInternalError(ctx,"Storage listener count underflow");
+        if(!--s->storage_listeners)storage_unlisten(s);
+        return JS_UNDEFINED;
+    }
+    if(s->storage_listeners==UINT64_MAX)return JS_ThrowOutOfMemory(ctx);
+    if(!s->storage_listeners++)storage_listen(s);
+    return JS_UNDEFINED;
+}
 static bool storage_run_event(struct web_js_state *s,uint64_t now) {
-    if(!s->storage_origin || (!s->storage_subscribed[0]&&!s->storage_subscribed[1]) || now<s->storage_poll_due)return false;
+    if(!s->storage_origin || !storage_listening(s) || (!s->storage_subscribed[0]&&!s->storage_subscribed[1]) || now<s->storage_poll_due)return false;
     s->storage_poll_due=now+100;
     for(int step=0;step<2;step++){
         int kind=(s->storage_event_kind+step)%2;
@@ -8183,23 +8222,25 @@ void web_visibility_event(web_doc *d) {
     struct web_event e={.type="visibilitychange",.bubbles=true};
     web_js_dispatch(d,d->root,&e);
 }
-static struct js_compile *bindings_job;
-void web_js_prepare(void) {
-    if (!bindings_bytecode && !bindings_job)
-        bindings_job = js_compile_platform(js_bootstrap, sizeof js_bootstrap - 1, "nocturne:browser-bindings");
+static void platform_prepare(struct platform_program *p) {
+    if (!p->bytecode && !p->job) p->job = js_compile_platform(p->source, p->len, p->name);
 }
-/* Where a realm's setup went: waiting for the compiler, reading (or, without
-   one, compiling) the bytecode, and running it. */
+void web_js_prepare(void) {
+    platform_prepare(&bindings_program);
+    platform_prepare(&locale_program);
+}
+/* Where running a platform program went: waiting for the compiler, reading
+   (or, without one, compiling) the bytecode, and running it. */
 struct bindings_profile { uint64_t wait_ms, read_ms, run_ms; };
-static JSValue load_browser_bindings(JSContext *ctx, struct bindings_profile *profile) {
+static JSValue platform_run(JSContext *ctx, struct platform_program *p, struct bindings_profile *profile) {
     JSValue code;
     uint64_t start = uptime_ms();
-    web_js_prepare();
-    if (bindings_job) { bindings_bytecode = js_compile_take_bytes(bindings_job, &bindings_bytecode_len); bindings_job = NULL; }
+    platform_prepare(p);
+    if (p->job) { p->bytecode = js_compile_take_bytes(p->job, &p->bytecode_len); p->job = NULL; }
     uint64_t ready = uptime_ms();
     profile->wait_ms = ready - start;
-    if (bindings_bytecode) {
-        code = JS_ReadObject(ctx, bindings_bytecode, bindings_bytecode_len, JS_READ_OBJ_BYTECODE);
+    if (p->bytecode) {
+        code = JS_ReadObject(ctx, p->bytecode, p->bytecode_len, JS_READ_OBJ_BYTECODE);
     } else {
         /* Platform interfaces are built-in function objects: ECMA-262
            Function.prototype.toString must give NativeFunction syntax, never
@@ -8207,15 +8248,14 @@ static JSValue load_browser_bindings(JSContext *ctx, struct bindings_profile *pr
            author scripts compile afterwards with their source retained. */
         JSRuntime *rt = JS_GetRuntime(ctx); int strip = JS_GetStripInfo(rt);
         JS_SetStripInfo(rt, strip | JS_STRIP_SOURCE);
-        code = JS_Eval(ctx, js_bootstrap, sizeof js_bootstrap - 1, "nocturne:browser-bindings",
-                       JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        code = JS_Eval(ctx, p->source, p->len, p->name, JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
         JS_SetStripInfo(rt, strip);
         if (!JS_IsException(code)) {
             size_t size = 0;
             uint8_t *bytes = JS_WriteObject(ctx, &size, code, JS_WRITE_OBJ_BYTECODE);
             if (bytes) {
                 uint8_t *copy = malloc(size);
-                if (copy) { memcpy(copy, bytes, size); bindings_bytecode = copy; bindings_bytecode_len = size; }
+                if (copy) { memcpy(copy, bytes, size); p->bytecode = copy; p->bytecode_len = size; }
                 js_free(ctx, bytes);
             } else {
                 /* Caching is optional; the compiled code remains usable. */
@@ -8228,6 +8268,24 @@ static JSValue load_browser_bindings(JSContext *ctx, struct bindings_profile *pr
     JSValue result = JS_IsException(code) ? code : JS_EvalFunction(ctx, code);
     profile->run_ms = uptime_ms() - read;
     return result;
+}
+/* js_locale.js's function in this realm; the bindings call it once, on the
+   realm's first use of Intl or of a method it replaces. */
+static JSValue native_locale(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    struct web_js_state *s = state(ctx);
+    size_t before = s->runtime_owner->allocation.current;
+    struct bindings_profile profile = {0};
+    JSValue fn = platform_run(ctx, &locale_program, &profile);
+    if (s->host.debug_js) {
+        size_t after = s->runtime_owner->allocation.current;
+        char message[160];
+        snprintf(message, sizeof message, "Locale program: compiler wait %llu, read %llu ms; heap +%zu KiB",
+                 (unsigned long long)profile.wait_ms, (unsigned long long)profile.read_ms,
+                 (after > before ? after - before : 0) / 1024);
+        log_text(s, 0, message);
+    }
+    return fn;
 }
 void web_js_start(web_doc *d, const struct web_host *host) {
     struct web_js_state *s = calloc(1, sizeof *s); if (!s) return;
@@ -8244,6 +8302,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     s->task_budget_ms = budget ? budget : WEB_JS_TASK_DEFAULT_MS;
     s->media_width = d->width; s->media_height = d->height;
     uint64_t initialized = uptime_ms();
+    size_t heap_before = s->runtime_owner->allocation.current;
     const struct web_navigation_timing *navigation = &s->host.navigation_timing;
     /* Embedders with no navigation observations explicitly use document init.
        Reject future epochs instead of underflowing performance.now()/rAF. */
@@ -8283,7 +8342,8 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("dom", 2, native_dom), JS_CFUNC_DEF("log", 1, native_log),
         JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),
         JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
-        JS_CFUNC_DEF("inputListener",2,native_input_listener),
+        JS_CFUNC_DEF("inputListener",2,native_input_listener),JS_CFUNC_DEF("storageListener",1,native_storage_listener),
+        JS_CFUNC_DEF("locale",0,native_locale),
         JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
         JS_CFUNC_DEF("svgGeometry",2,native_svg_geometry),
         JS_CFUNC_DEF("mutationObserve",4,native_mutation_control),
@@ -8354,7 +8414,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     s->starting = true; begin_task(s);
     if(!s->runtime_previous)s->task_deadline = uptime_ms() + JS_STARTUP_MS;
     struct bindings_profile bindings = {0};
-    s->hooks = load_browser_bindings(s->ctx, &bindings);
+    s->hooks = platform_run(s->ctx, &bindings_program, &bindings);
     if (JS_IsException(s->hooks)) { exception(s); s->hooks = JS_UNDEFINED; end_task(s); goto failed; }
     JS_SetDynamicCodeCheck(s->ctx,trusted_code_check,s);
     if (web_atomics_isolation(s->ctx, d->cross_origin_isolated) < 0) { exception(s); end_task(s); goto failed; }
@@ -8384,11 +8444,12 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     /* A script-disabled sandbox realm stays active for its same-origin
        embedder; its own scripts are refused by sandbox_flags, not by
        retiring the realm. */
-    char limits[288];
+    char limits[320];
     snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms; "
-             "realm setup %llu ms (bindings: compiler wait %llu, read %llu, run %llu)",
+             "realm setup %llu ms (bindings: compiler wait %llu, read %llu, run %llu), heap +%zu KiB",
              JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)(uptime_ms()-initialized),
-             (unsigned long long)bindings.wait_ms,(unsigned long long)bindings.read_ms,(unsigned long long)bindings.run_ms);
+             (unsigned long long)bindings.wait_ms,(unsigned long long)bindings.read_ms,(unsigned long long)bindings.run_ms,
+             (s->runtime_owner->allocation.current>heap_before?s->runtime_owner->allocation.current-heap_before:0)/1024);
     log_text(s,0,limits);return;
 failed:
     s->starting = false;

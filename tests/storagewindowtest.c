@@ -88,6 +88,11 @@ int main(int argc,char **argv){
     const char *unused_page="<!doctype html><p>Storage is not accessed</p>";
     int before=host_calls;web_doc *unused=web_live(unused_page,strlen(unused_page),"https://storage-unused.test/","utf-8",&unused_host);
     pump(unused,NULL,NULL,120);check(unused&&host_calls==before,"unused-storage-has-no-backend-io-or-poll");web_free(unused);
+    const char *quiet_page="<!doctype html><script>localStorage.quiet='1';const f=()=>{};addEventListener('storage',f);removeEventListener('storage',f);</script>"
+        "<p>Storage without a storage listener</p>";
+    before=host_calls;web_doc *quiet=web_live(quiet_page,strlen(quiet_page),"https://storage-quiet.test/","utf-8",&unused_host);
+    pump(quiet,NULL,NULL,250);int loaded=host_calls;pump(quiet,NULL,NULL,350);
+    check(quiet&&loaded>before&&host_calls==loaded,"storage-without-listener-has-no-poll");web_free(quiet);
     web_doc *da=document(a,"a"),*db=document(b,"b");check(da&&db,"live-window-documents");pump(da,db,NULL,250);check(ready==2,"both-author-listeners-ready");
     const char *first="localStorage.k='old';localStorage.k='old';localStorage.removeItem('absent');";
     check(web_console_eval(da,first,strlen(first)),"first-author-update");
