@@ -989,13 +989,16 @@ static bool form_control(const node_t *e) {
 
 static bool read_write(const node_t *e) {
     if (e->tag == T_input || e->tag == T_textarea) return web_control_read_write(e);
+    const node_t *top = e;
     for (const node_t *n = e; n; n = n->parent) {
+        top = n;
         const char *editable = node_attr(n, "contenteditable");
         if (!editable) continue;
         if (!*editable || str_ieq(editable, "true") || str_ieq(editable, "plaintext-only")) return true;
         if (str_ieq(editable, "false")) return false;
     }
-    return false;
+    /* In design mode the document element is an editing host (HTML, "editing host"). */
+    return e->owner && e->owner->design_mode && top->type == N_DOC && top == e->owner->root;
 }
 
 static bool icase_eq(const char *a, const char *b, bool icase) { return icase ? str_ieq(a, b) : !strcmp(a, b); }

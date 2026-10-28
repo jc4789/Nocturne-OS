@@ -2652,7 +2652,9 @@ static node_t *focus_area(web_doc *d, node_t *n) {
                      ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls")) ||
                      (n->tag == T_summary && doc_details_summary(n->parent)==n) ||
                      (n->tag == T_details && !doc_details_summary(n)) ||
-                     node_attr(n, "tabindex") || (editable && !str_ieq(editable, "false"));
+                     node_attr(n, "tabindex") || (editable && !str_ieq(editable, "false")) ||
+                     /* Editing hosts are focusable areas; in design mode the document element is one. */
+                     (d->design_mode && n->parent == d->root && !n->foreign);
     return focusable ? n : NULL;
 }
 node_t *web_focus_candidate(web_doc *d, node_t *n) { return focus_area(d,n); }
@@ -2755,6 +2757,59 @@ static bool readonly(node_t *n) {
 
 #include "control_edit.h"
 
+/* The keys go to an editing host: the document is in design mode, or its focus
+   is in an element whose contenteditable state is true or plaintext-only, below
+   no false state (HTML, "editing host", "editable"). js_document_commands.js
+   holds the definitions; this is the native reader's copy of the same walk. */
+static bool editing_focus(web_doc *d) {
+    if (!d || !d->live || d->inert) return false;
+    if (d->design_mode) return true;
+    for (node_t *n = d->focus; n && n->owner == d; n = n->parent) {
+        if (n->type != N_ELEM) continue;
+        const char *editable = node_attr(n, "contenteditable");
+        if (!editable) continue;
+        if (!*editable || str_ieq(editable, "true") || str_ieq(editable, "plaintext-only")) return true;
+        if (str_ieq(editable, "false")) return false;
+    }
+    return false;
+}
+/* An editing key, as the editing layer's action: an Input Events inputType, or a
+   caret move (extend with Shift). The editing layer fires beforeinput and input
+   and takes the action through the command execCommand runs. */
+static int editing_key(web_doc *d, const struct gui_event *e) {
+    uint32_t k = e->key;
+    bool shift = (e->mods & NMOD_SHIFT) != 0, ctrl = (e->mods & NMOD_CTRL) != 0;
+    const char *action = NULL;
+    char enc[5]; size_t length = 0; bool text = false;
+    if (e->mods & NMOD_ALT) return 0;
+    if (ctrl) {
+        uint32_t c = k >= 'A' && k <= 'Z' ? k + ('a' - 'A') : k;
+        if (c == 'a') action = "selectAll";
+        else if (c == 'z') action = shift ? "historyRedo" : "historyUndo";
+        else if (c == 'y') action = "historyRedo";
+        else if (c == 'b') action = "formatBold";
+        else if (c == 'i') action = "formatItalic";
+        else if (c == 'u') action = "formatUnderline";
+        else return 0;
+    } else switch (k) {
+    case NKEY_BACKSPACE: action = "deleteContentBackward"; break;
+    case NKEY_DELETE: action = "deleteContentForward"; break;
+    case NKEY_ENTER: action = shift ? "insertLineBreak" : "insertParagraph"; break;
+    case NKEY_LEFT: action = "caretBackward"; break;
+    case NKEY_RIGHT: action = "caretForward"; break;
+    case NKEY_HOME: action = "caretLineStart"; break;
+    case NKEY_END: action = "caretLineEnd"; break;
+    default:
+        if (k < 32 || (k >= 0x100 && k < 0x200) || k > 0x10FFFF || (k >= 0xd800 && k <= 0xdfff)) return 0;
+        length = (size_t)utf8_put(enc, k); enc[length] = 0; text = true;
+        action = "insertText";
+    }
+    int handled = web_js_editing_action(d, action, shift, text ? enc : NULL, length);
+    /* The keys that edit stay with the editing host even when it took nothing:
+       Backspace must not go back in history from an editor. */
+    if (!handled && (text || k == NKEY_BACKSPACE || k == NKEY_DELETE || k == NKEY_ENTER)) return 1;
+    return handled;
+}
 static int web_key_local(web_doc *d, const struct gui_event *e) {
     if(!d||!e||!d->live||d->inert)return 0;
     node_t *n = d->focus;
@@ -2762,7 +2817,7 @@ static int web_key_local(web_doc *d, const struct gui_event *e) {
     bool range_step=n&&n->owner==d&&n->type==N_ELEM&&!n->foreign&&n->tag==T_input&&
         web_input_type(n)==WEB_INPUT_RANGE&&(e->key==NKEY_UP||e->key==NKEY_DOWN)&&
         doc_node_root(n,true)==d->root&&!web_control_disabled(n)&&!web_dialog_inert(d,n);
-    if (!control_edit_target(d,n,false)&&!range_step) return 0;
+    if (!control_edit_target(d,n,false)&&!range_step) return editing_focus(d) ? editing_key(d,e) : 0;
     doc_control_init(d, n);
     if (!n->value && !doc_node_value(d, n, "", 0)) return 0;
     const char *v = web_input_edit_text(n);
@@ -2887,15 +2942,40 @@ static node_t *form_of(web_doc *d, node_t *n) {
     return node_ancestor(n, T_form);
 }
 
-int web_key(web_doc *d,const struct gui_event *event) {
-    web_doc *root=d;
+/* The document the keys go to: the focused frame's, through nested frames. */
+static web_doc *key_document(web_doc *d) {
     while(d && d->live && !d->inert && web_frame_element(d->focus)) {
         struct web_frame *f=web_frame_find(d,d->focus);if(!f || !f->document || f->detached)break;
         d=f->document;
     }
+    return d;
+}
+static void key_document_changed(web_doc *root,web_doc *d) {
+    for(web_doc *p=d;p && p!=root;p=p->frame_parent)if(p->frame_parent)p->frame_parent->dirty=true;
+}
+int web_key(web_doc *d,const struct gui_event *event) {
+    web_doc *root=d;
+    d=key_document(d);
     int result=web_key_local(d,event);
-    if(result)for(web_doc *p=d;p && p!=root;p=p->frame_parent)if(p->frame_parent)p->frame_parent->dirty=true;
+    if(result)key_document_changed(root,d);
     return result;
+}
+bool web_editing_target(web_doc *top) {
+    web_doc *d=key_document(top);
+    return d && !control_edit_target(d,d->focus,false) && editing_focus(d);
+}
+int web_editing_edit(web_doc *top,const char *input_type,const char *data,size_t length) {
+    web_doc *d=key_document(top);
+    if(!input_type||!d||control_edit_target(d,d->focus,false)||!editing_focus(d))return 0;
+    if(data&&length&&!control_edit_utf8(data,length))return 0;
+    int result=web_js_editing_action(d,input_type,false,data,data?length:0);
+    if(result)key_document_changed(top,d);
+    return result;
+}
+char *web_selection_text(web_doc *top,size_t *length) {
+    if(length)*length=0;
+    web_doc *d=key_document(top);
+    return d?web_js_selection_text(d,length):NULL;
 }
 web_node *web_form_owner(web_doc *d, web_node *control) { return form_of(d, control); }
 bool web_take_validation_report(web_doc *d, web_node **control, const char **message, size_t *length) {

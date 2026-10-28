@@ -2884,19 +2884,30 @@ static void console_eval(void) {
 /* These are native user commands. Page scripts receive the ordinary editing
    events, not permission to read the system clipboard outside a user key. */
 static bool page_clipboard_key(web_node *target, const struct gui_event *e) {
-    if (!tab->doc || !target || !(e->mods & NMOD_CTRL) || (e->mods & NMOD_ALT)) return false;
+    if (!tab->doc || !(e->mods & NMOD_CTRL) || (e->mods & NMOD_ALT)) return false;
     uint32_t key = e->key;
     if (key >= 'A' && key <= 'Z') key += 'a' - 'A';
+    /* A text control has its own selection; otherwise the document's selection,
+       and an editing host takes the cut and the paste. */
+    bool editing = web_editing_target(tab->doc);
     if (key == 'c' || key == 'x') {
         size_t length = 0;
-        char *selected = web_control_selected_text(tab->doc,target,&length);
-        if (!selected) return false;
-        if (length && clipboard_set(selected,length) >= 0 && key == 'x')
-            web_control_edit(tab->doc,target,"deleteByCut",NULL,0);
+        char *selected = target ? web_control_selected_text(tab->doc,target,&length) : NULL;
+        if (selected) {
+            if (length && clipboard_set(selected,length) >= 0 && key == 'x')
+                web_control_edit(tab->doc,target,"deleteByCut",NULL,0);
+            free(selected);
+            return true;
+        }
+        selected = web_selection_text(tab->doc,&length);
+        if (!selected) return editing;
+        if (length && clipboard_set(selected,length) >= 0 && key == 'x' && editing)
+            web_editing_edit(tab->doc,"deleteByCut",NULL,0);
         free(selected);
         return true;
     }
     if (key == 'v') {
+        if (!target && !editing) return false;
         char dummy = 0;
         int capacity = clipboard_get(&dummy,0);
         if (capacity <= 0) return true;
@@ -2906,7 +2917,8 @@ static bool page_clipboard_key(web_node *target, const struct gui_event *e) {
         /* A concurrent clipboard replacement must not paste a truncated value. */
         if (length > 0 && length <= capacity && !memchr(text,0,(size_t)length)) {
             text[length] = 0;
-            web_control_edit(tab->doc,target,"insertFromPaste",text,(size_t)length);
+            if (!target || !web_control_edit(tab->doc,target,"insertFromPaste",text,(size_t)length))
+                if (editing) web_editing_edit(tab->doc,"insertFromPaste",text,(size_t)length);
         }
         free(text);
         return true;
@@ -3040,7 +3052,7 @@ static void key(const struct gui_event *e) {
             action.kind==WEB_HIT_CHECKBOX || action.kind==WEB_HIT_RADIO || action.kind==WEB_HIT_FILE ||
             (k==NKEY_ENTER && action.kind==WEB_HIT_LINK))) {page_click(target,0,0,true,e->mods);return;}
     }
-    if (tab->doc && web_focused(tab->doc)) {
+    if (tab->doc && (web_focused(tab->doc) || web_editing_target(tab->doc))) {
         if (k == NKEY_ESC) {
             page_focus(NULL);
             return;

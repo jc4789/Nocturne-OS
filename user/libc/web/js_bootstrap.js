@@ -1150,10 +1150,10 @@
     /* @include js_mutations.js */
     /* @include js_selection.js */
     /* @include js_document.js */
-    /* @include js_document_commands.js */
     /* @include js_frames.js */
     /* @include js_range.js */
     /* @include js_document_selection.js */
+    /* @include js_document_commands.js */
     /* @include js_traversal.js */
     /* @include js_xpath.js */
     /* @include js_svg.js */
@@ -1320,6 +1320,9 @@
         documentOpenReset:resetDocumentEvents,
         parserBodyHandlers,
         documentCommandEvent:documentCommandBridge.event,
+        editingAction:(...args)=>documentCommandBridge.userAction(...args),
+        editingFocus:(...args)=>documentCommandBridge.focused(...args),
+        selectionText:()=>documentCommandBridge.selectionText(),
         frameMethodOriginal:frameBridge.methodOriginal,
         frameWindowProxy:frameBridge.windowProxy,
         windowMessageMethod:messagingBridge.postMessage,
