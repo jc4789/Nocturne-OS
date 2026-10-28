@@ -771,9 +771,11 @@ struct css_anim_ctx {
     arena_t *a;
     web_doc *d;
 };
-/* value text (var() already substituted) parsed into a copy of the base; set: the longhands
-   it set (css_prop_count bytes, may be NULL) */
-bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const char *v, size_t n,
+/* value text (var() already substituted) parsed into a copy of the base; computed: the text is
+   this layer's own (css_anim_interpolate, css_anim_compose), whose values may lie outside what a
+   style sheet's parse clamps until the final value; set: the longhands it set (css_prop_count
+   bytes, may be NULL) */
+bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const char *v, size_t n, bool computed,
                     style_t *out, uint8_t *set);
 /* CSS Values 4 §3: longhand p's value a·(1-t) + b·t as computed-value text (t may lie outside
    [0, 1]); false: the pair does not interpolate and the caller falls back to discrete */
@@ -828,6 +830,8 @@ struct cx {
     float cq_width, cq_height;
     bool cq_width_set, cq_height_set;
     bool absolute_lengths; /* relative lengths and percentages fail (Geometry's matrix strings) */
+    bool computed_text;    /* the value is computed-value text the animation layer wrote (css_anim_parse):
+                              what a style sheet's parse clamps (rgb()'s components) keeps its value */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -854,10 +858,11 @@ uint32_t css_color_argb(const struct css_color *c);        /* the used value: ga
 struct css_color_interpolation css_color_default_interpolation(const struct css_color *a, const struct css_color *b);
 struct css_color css_color_interpolate(const struct css_color *a, const struct css_color *b, double p,
                                        const struct css_color_interpolation *m);
-/* a computed value between two that may depend on currentcolor: color-mix() of the two at p (0..1) */
-const struct css_color_value *css_color_mix_value(arena_t *a, const struct css_color_computed *from,
-                                                  const struct css_color_computed *to, double p,
-                                                  const struct css_color_interpolation *m);
+/* CSS Values 4, 3.3: b added to a (accumulation alike), premultiplied in m's space; alpha clamps */
+struct css_color css_color_add(const struct css_color *a, const struct css_color *b, const struct css_color_interpolation *m);
+/* the animation layer's computed-value text (cx.computed_text reads it back exactly) */
+bool css_color_animation_text(const struct css_color *c, sbuf *out);
+bool css_color_computed_equal(const struct css_color_computed *a, const struct css_color_computed *b);
 /* the used colour of a computed one, currentcolor being current */
 void css_color_resolve(const struct css_color_computed *v, const struct css_color *current, struct css_color *out);
 /* CSS Color 4, 16: a computed or used colour; html: as HTML's canvas serializes (#rrggbb when it can) */
@@ -869,6 +874,10 @@ bool css_color_parse_used(const char *s, size_t n, const style_t *(*element)(voi
                           struct css_color *out);
 /* CSSOM: the specified value's serialization; false (out unchanged) when s is not a <color> */
 bool css_color_specified(const char *s, size_t n, sbuf *out);
+/* a computed colour held as its 8-bit field argb (COLOR_CURRENT: currentcolor, current the 8-bit
+   colour out->color gives it meanwhile) and, when 8 bits cannot hold it, its exact value or
+   expression v (a style's slot, a shadow's colour) */
+void css_color_held(uint32_t argb, const struct css_color_value *v, uint32_t current, struct css_color_computed *out);
 /* a style's computed colour and its CSSOM resolved value (the used colour) */
 void css_style_color(const style_t *st, enum css_color_slot k, struct css_color_computed *out);
 bool css_style_color_text(const style_t *st, enum css_color_slot k, sbuf *out);

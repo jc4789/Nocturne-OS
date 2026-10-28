@@ -4181,28 +4181,35 @@ static void anim_number(sbuf *b, double v) {
 }
 static void anim_unit(sbuf *b, double v, const char *unit) { anim_number(b, v); sb_puts(b, unit); }
 static double anim_clamp(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
-static uint32_t anim_color_of(const style_t *st, uint32_t c) { return c == COLOR_CURRENT ? st->color : c; }
-static void anim_rgba(sbuf *b, double r, double g, double bl, double a) {
-    a = anim_clamp(a, 0, 1);
-    char text[112];
-    unsigned R = (unsigned)lround(anim_clamp(r, 0, 255)), G = (unsigned)lround(anim_clamp(g, 0, 255)),
-        B = (unsigned)lround(anim_clamp(bl, 0, 255));
-    if (a >= 1) snprintf(text, sizeof text, "rgb(%u, %u, %u)", R, G, B);
-    else snprintf(text, sizeof text, "rgba(%u, %u, %u, %.6g)", R, G, B, a);
-    sb_puts(b, text);
+/* the combinations: interpolation, addition, accumulation */
+enum { MIX, ADD, ACCUMULATE };
+/* <color>: computed values of color.c's type (exact, or an expression of currentcolor) */
+static void anim_shadow_color(const style_t *st, const struct css_box_shadow *s, struct css_color_computed *out) {
+    css_color_held(s->color, s->color_value, st->color, out);
 }
-static void anim_color_text(sbuf *b, uint32_t c) {
-    anim_rgba(b, (c >> 16) & 255, (c >> 8) & 255, c & 255, (double)(c >> 24) / 255);
+/* the used value a computed colour names: currentcolor is the style's color (CSS Color 4 §13) */
+static struct css_color anim_color_used(const style_t *st, const struct css_color_computed *v) {
+    if (!v->current) return v->color;
+    struct css_color_computed current;
+    css_style_color(st, CSS_SLOT_COLOR, &current);
+    struct css_color out;
+    css_color_resolve(v, &current.color, &out);
+    return out;
 }
-/* CSS Color 4 §12: legacy sRGB colours combine premultiplied by alpha */
-static void anim_color(sbuf *b, uint32_t x, uint32_t y, double ka, double kb) {
-    double ax = (double)(x >> 24) / 255, ay = (double)(y >> 24) / 255, a = ax * ka + ay * kb, c[3];
-    for (int i = 0; i < 3; i++) {
-        int shift = 16 - 8 * i;
-        c[i] = (double)((x >> shift) & 255) * ax * ka + (double)((y >> shift) & 255) * ay * kb;
-    }
-    if (!(a > 0)) { anim_rgba(b, 0, 0, 0, 0); return; }
-    anim_rgba(b, c[0] / a, c[1] / a, c[2] / a, a > 1 ? 1 : a);
+/* currentcolor and expressions of it as written, for the cascade to resolve against the element */
+static bool anim_color_text(sbuf *b, const struct css_color_computed *v) {
+    return v->current ? css_color_value_specified(v->current, b) : css_color_animation_text(&v->color, b);
+}
+/* x interpolated to y at p (MIX: CSS Color 4 §13, in the space §13.2 gives the two), or y added to
+   x (ADD and ACCUMULATE alike: CSS Values 4 §3.3); x's and y's currentcolor are their styles' */
+static bool anim_color(sbuf *b, const style_t *sx, const struct css_color_computed *x, const style_t *sy,
+                       const struct css_color_computed *y, double p, int mode) {
+    /* between one expression of currentcolor the value stays it, resolved after the cascade */
+    if (mode == MIX && x->current && css_color_computed_equal(x, y)) return anim_color_text(b, x);
+    struct css_color u = anim_color_used(sx, x), v = anim_color_used(sy, y);
+    struct css_color_interpolation m = css_color_default_interpolation(&u, &v);
+    struct css_color r = mode == MIX ? css_color_interpolate(&u, &v, p, &m) : css_color_add(&u, &v, &m);
+    return css_color_animation_text(&r, b);
 }
 static bool anim_is_length(const len_t *l) { return l->kind == LK_LEN || l->kind == LK_EXPR; }
 /* ka·x + kb·y of two <length-percentage>s; a keyword (auto, none, normal) combines only with
@@ -4233,7 +4240,6 @@ static bool anim_len(sbuf *b, const len_t *x, const len_t *y, double ka, double 
 }
 
 /* -------- transform lists (CSS Transforms 1 §9, CSS Transforms 2 §16) */
-enum { MIX, ADD, ACCUMULATE };
 static bool tf_axis(const struct css_transform *t, double axis[3]) {
     double x = t->v[0], y = t->v[1], z = t->v[2], length = sqrt(x * x + y * y + z * z);
     if (!(length > 0) || !isfinite(length)) return false;
@@ -4407,18 +4413,41 @@ static bool tf_equal(const struct css_transform *a, const struct css_transform *
 }
 
 /* -------- shadow and filter lists */
-static bool anim_shadow_item(sbuf *b, const style_t *st, const struct css_box_shadow *s, const struct css_box_shadow *e,
-                             double ka, double kb) {
+/* one shadow's computed value: its colour first, then the four lengths (and inset) */
+static void anim_shadow_lengths(sbuf *b, double x, double y, double blur, double spread, bool inset) {
+    anim_unit(b, x, "px "); anim_unit(b, y, "px ");
+    anim_unit(b, anim_clamp(blur, 0, INFINITY), "px ");
+    anim_unit(b, spread, "px");
+    if (inset) sb_puts(b, " inset");
+}
+static void anim_shadow_text(sbuf *b, const style_t *st, const struct css_box_shadow *s) {
+    struct css_color_computed c;
+    anim_shadow_color(st, s, &c);
+    anim_color_text(b, &c); sb_putc(b, ' ');
+    anim_shadow_lengths(b, s->x, s->y, s->blur, s->spread, s->inset);
+}
+static void anim_shadow_list_text(sbuf *b, const style_t *st) {
+    if (!st->box_shadow) { sb_puts(b, "none"); return; }
+    for (const struct css_box_shadow *s = st->box_shadow; s; s = s->next) {
+        if (s != st->box_shadow) sb_puts(b, ", ");
+        anim_shadow_text(b, st, s);
+    }
+}
+/* a pair of shadows component by component (Web Animations 1, A: interpolation, and accumulation
+   with each component accumulated); the shorter list pads with transparent shadows of no length */
+static bool anim_shadow_item(sbuf *b, const style_t *sa, const struct css_box_shadow *s, const style_t *sv,
+                             const struct css_box_shadow *e, double ka, double kb, int mode) {
     struct css_box_shadow zs = {0}, ze = {0};
     if (!s) { zs.inset = e->inset; s = &zs; }
     if (!e) { ze.inset = s->inset; e = &ze; }
     if (s->inset != e->inset) return false;
-    uint32_t cs = s == &zs ? 0 : anim_color_of(st, s->color), ce = e == &ze ? 0 : anim_color_of(st, e->color);
-    anim_color(b, cs, ce, ka, kb); sb_putc(b, ' ');
-    anim_unit(b, s->x * ka + e->x * kb, "px "); anim_unit(b, s->y * ka + e->y * kb, "px ");
-    anim_unit(b, anim_clamp(s->blur * ka + e->blur * kb, 0, INFINITY), "px ");
-    anim_unit(b, s->spread * ka + e->spread * kb, "px");
-    if (s->inset) sb_puts(b, " inset");
+    struct css_color_computed cs, ce;
+    anim_shadow_color(sa, s, &cs);
+    anim_shadow_color(sv, e, &ce);
+    if (!anim_color(b, sa, &cs, sv, &ce, kb, mode)) return false;
+    sb_putc(b, ' ');
+    anim_shadow_lengths(b, s->x * ka + e->x * kb, s->y * ka + e->y * kb, s->blur * ka + e->blur * kb,
+                        s->spread * ka + e->spread * kb, s->inset);
     return true;
 }
 static bool anim_shadows(sbuf *b, const style_t *sa, const style_t *sv, double ka, double kb, int mode) {
@@ -4426,19 +4455,20 @@ static bool anim_shadows(sbuf *b, const style_t *sa, const style_t *sv, double k
     if (!x && !y) { sb_puts(b, "none"); return true; }
     bool first = true;
     if (mode == ADD) {
+        /* addition is the concatenation of the lists */
         for (const struct css_box_shadow *s = x; s; s = s->next, first = false) {
             if (!first) sb_puts(b, ", ");
-            anim_shadow_item(b, sa, s, s, 1, 0);
+            anim_shadow_text(b, sa, s);
         }
         for (const struct css_box_shadow *s = y; s; s = s->next, first = false) {
             if (!first) sb_puts(b, ", ");
-            anim_shadow_item(b, sv, s, s, 1, 0);
+            anim_shadow_text(b, sv, s);
         }
         return true;
     }
     for (; x || y; x = x ? x->next : NULL, y = y ? y->next : NULL, first = false) {
         if (!first) sb_puts(b, ", ");
-        if (!anim_shadow_item(b, sa, x, y, ka, kb)) return false;
+        if (!anim_shadow_item(b, sa, x, sv, y, ka, kb, mode)) return false;
     }
     return true;
 }
@@ -4515,12 +4545,15 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         else if (st->line_height.kind == LK_NUMBER) anim_number(out, st->line_height.px);
         else anim_unit(out, st->line_height.px, "px");
         break;
-    case PT_COLOR: anim_color_text(out, anim_color_of(st, *(const uint32_t *)field)); break;
-    case PT_SVG_PAINT: {
-        const struct svg_paint *paint = (const struct svg_paint *)field;
-        if (paint->kind == SVG_PAINT_NONE) sb_puts(out, "none");
-        else if (paint->kind == SVG_PAINT_COLOR) anim_color_text(out, anim_color_of(st, paint->color));
-        else return false;
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT && ((const struct svg_paint *)field)->kind != SVG_PAINT_COLOR) {
+            if (((const struct svg_paint *)field)->kind != SVG_PAINT_NONE) return false;
+            sb_puts(out, "none");
+            break;
+        }
+        struct css_color_computed c;
+        css_style_color(st, color_slot(p), &c);
+        ok = anim_color_text(out, &c);
         break;
     }
     case PT_FONT_FAMILY: if (!st->font_names) return false; sb_puts(out, st->font_names); break;
@@ -4558,7 +4591,7 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         break;
     }
     case PT_FILTER: ok = css_filter_serialize(st->filter, out, d); break;
-    case PT_BOX_SHADOW: ok = css_shadow_serialize(st->box_shadow, out, d); break;
+    case PT_BOX_SHADOW: anim_shadow_list_text(out, st); break;
     case PT_RADIUS: ok = anim_pair_text(out, ((const struct css_corner_radius *)field)->axis, d); break;
     case PT_BG_POS: case PT_TRANSFORM_ORIGIN: ok = anim_pair_text(out, (const len_t *)field, d); break;
     case PT_BG_SIZE: case PT_MASK_SIZE: {
@@ -4644,9 +4677,14 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         css_length_equal(&a->translate.xy[1], &b->translate.xy[1]);
     case PT_BOX_SHADOW: {
         const struct css_box_shadow *x = a->box_shadow, *y = b->box_shadow;
-        for (; x && y; x = x->next, y = y->next)
-            if (x->x != y->x || x->y != y->y || x->blur != y->blur || x->spread != y->spread || x->inset != y->inset ||
-                anim_color_of(a, x->color) != anim_color_of(b, y->color)) return false;
+        for (; x && y; x = x->next, y = y->next) {
+            if (x->x != y->x || x->y != y->y || x->blur != y->blur || x->spread != y->spread || x->inset != y->inset)
+                return false;
+            struct css_color_computed u, v;
+            anim_shadow_color(a, x, &u);
+            anim_shadow_color(b, y, &v);
+            if (!css_color_computed_equal(&u, &v)) return false;
+        }
         return !x && !y;
     }
     case PT_FILTER: {
@@ -4654,11 +4692,16 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         if (!x || !y) return x == y;
         return x->count == y->count && !memcmp(x->steps, y->steps, x->count * sizeof *x->steps);
     }
-    case PT_COLOR: return anim_color_of(a, *(const uint32_t *)fa) == anim_color_of(b, *(const uint32_t *)fb);
-    case PT_SVG_PAINT: {
-        const struct svg_paint *x = (const struct svg_paint *)fa, *y = (const struct svg_paint *)fb;
-        return x->kind == y->kind && (x->kind != SVG_PAINT_COLOR || anim_color_of(a, x->color) == anim_color_of(b, y->color)) &&
-            same_text(x->ref, y->ref);
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT) {
+            const struct svg_paint *x = (const struct svg_paint *)fa, *y = (const struct svg_paint *)fb;
+            if (x->kind != y->kind || !same_text(x->ref, y->ref)) return false;
+            if (x->kind != SVG_PAINT_COLOR) return true;
+        }
+        struct css_color_computed x, y;
+        css_style_color(a, color_slot(p), &x);
+        css_style_color(b, color_slot(p), &y);
+        return css_color_computed_equal(&x, &y);
     }
     case PT_VALIGN: return a->vertical_align == b->vertical_align && (a->vertical_align != VA_LEN || a->vertical_align_px == b->vertical_align_px);
     case PT_ZINDEX: return a->z_auto == b->z_auto && (a->z_auto || a->z_index == b->z_index);
@@ -4688,7 +4731,8 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
     return !memcmp(fa, fb, p->size);
 }
 
-bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const char *v, size_t n, style_t *out, uint8_t *set) {
+bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const char *v, size_t n, bool computed,
+                    style_t *out, uint8_t *set) {
     if (!p || !v) return false;
     *out = *c->base;
     uint8_t local[NPROPS];
@@ -4696,7 +4740,7 @@ bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const
     memset(set, 0, NPROPS);
     const style_t *parent = c->parent;
     struct cx cx = {.s = out, .parent = parent, .node = c->node, .em = parent ? parent->font_size : 16, .rem = c->rem,
-                    .vw = c->vw, .vh = c->vh, .a = c->a, .set = set, .font_pass = true};
+                    .vw = c->vw, .vh = c->vh, .a = c->a, .set = set, .font_pass = true, .computed_text = computed};
     /* font-size first, against the parent's, as the cascade does; then the rest against it */
     if (css_prop_is_early(p) && !css_apply(p, v, n, &cx)) return false;
     cx.font_pass = false;
@@ -4752,14 +4796,13 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
         if (a->vertical_align != VA_LEN || b->vertical_align != VA_LEN) return false;
         anim_unit(out, a->vertical_align_px * ka + b->vertical_align_px * kb, "px");
         return true;
-    case PT_COLOR:
-        anim_color(out, anim_color_of(a, *(const uint32_t *)fa), anim_color_of(b, *(const uint32_t *)fb), ka, kb);
-        return true;
-    case PT_SVG_PAINT: {
-        const struct svg_paint *x = (const struct svg_paint *)fa, *y = (const struct svg_paint *)fb;
-        if (x->kind != SVG_PAINT_COLOR || y->kind != SVG_PAINT_COLOR) return false;
-        anim_color(out, anim_color_of(a, x->color), anim_color_of(b, y->color), ka, kb);
-        return true;
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT && (((const struct svg_paint *)fa)->kind != SVG_PAINT_COLOR ||
+                                        ((const struct svg_paint *)fb)->kind != SVG_PAINT_COLOR)) return false;
+        struct css_color_computed x, y;
+        css_style_color(a, color_slot(p), &x);
+        css_style_color(b, color_slot(p), &y);
+        return anim_color(out, a, &x, b, &y, kb, mode);
     }
     case PT_RADIUS: {
         const len_t *x = ((const struct css_corner_radius *)fa)->axis, *y = ((const struct css_corner_radius *)fb)->axis;
