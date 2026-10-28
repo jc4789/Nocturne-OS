@@ -407,7 +407,11 @@
             if(s.cancelable && !s.passive)s.defaultPrevented=true;
         }
     }
-    function handlerRecord(target,type) {
+    // HTML event handler attribute change steps: a value CSP blocks (script
+    // attribute) leaves the handler as it was. Attributes the parser or a
+    // clone set are checked when their record is first made.
+    function handlerAllowed(element,text){return host.safety('cspInline',element,'script attribute',text);}
+    function handlerRecord(target,type,checked) {
         if(!handlerTarget(target,type))return null;
         const original=target;target=handlerOwner(target,type);
         if(!target)return null;
@@ -417,7 +421,8 @@
         let r=map.get(type);
         if(!r) {
             const source=target===globalThis && bodyWindowTypes.has(type)?rawDom.get(document,'body'):target;
-            const text=source && (source instanceof HTMLElement || svgHandlerTarget(source))?reflectedAttr(source,'on'+type):null;
+            let text=checked===2?null:source && (source instanceof HTMLElement || svgHandlerTarget(source))?reflectedAttr(source,'on'+type):null;
+            if(text!==null && !checked && !handlerAllowed(source,text))text=null;
             r={value:null,text,compiled:text===null,entry:null};map.set(type,r);
             if(text!==null)activateHandler(target,type,r);
         }
@@ -437,13 +442,13 @@
         }
         return r.value;
     }
-    function setHandler(target,type,value,text) {
+    function setHandler(target,type,value,text,checked) {
         if(!handlerTarget(target,type))throw new TypeError('Illegal event handler receiver');
         const owner=handlerOwner(target,type);
         if(!owner)return;
         if(owner!==target && owner!==globalThis)return host.windowHandler('set',target,type,value,text);
         target=owner;
-        const r=handlerRecord(target,type);if(!r)throw new TypeError('Illegal event handler receiver');
+        const r=handlerRecord(target,type,checked);if(!r)throw new TypeError('Illegal event handler receiver');
         // [LegacyTreatNonObjectAsNull]: any object is kept, callable or not; anything else is null.
         const object=value!==null && (typeof value==='object' || typeof value==='function');
         r.value=object?value:null;r.text=text;r.compiled=text===null;
@@ -462,7 +467,7 @@
         if(!map)handlerMap.set(globalThis,map=new Map());
         for(const type of bodyWindowTypes) {
             const text=reflectedAttr(body,'on'+type);
-            if(text===null)continue;
+            if(text===null || !handlerAllowed(body,text))continue;
             let r=map.get(type);
             if(!r)map.set(type,r={value:null,text:null,compiled:true,entry:null});
             r.value=null;r.text=text;r.compiled=false;r.port=undefined;
@@ -471,7 +476,15 @@
     }
     function handlerAttribute(target,name,value) {
         const type=String(name).toLowerCase().slice(2);
-        if(handlerTarget(target,type))setHandler(target,type,null,value);
+        if(!handlerTarget(target,type))return;
+        if(value!==null && !handlerAllowed(target,value)){
+            // Blocked: the handler keeps its value; a record made now must
+            // not take the attribute's new text either.
+            const owner=handlerOwner(target,type);
+            if(owner===target || owner===globalThis)handlerRecord(owner,type,2);
+            return;
+        }
+        setHandler(target,type,null,value,1);
     }
     function installHandlers(target,types) {
         for(const type of types)Object.defineProperty(target,'on'+type,{
@@ -1678,7 +1691,7 @@
         safetyDynamicCode:htmlSafetyBridge.dynamicCode,
         safetyMutation:htmlSafetyBridge.mutation,
         safetyInput:htmlSafetyBridge.compliantInput,
-        safetyViolation(init){return dispatch(document,htmlSafetyBridge.violationEvent(init));},
+        safetyViolation(init,target){return dispatch(target||document,htmlSafetyBridge.violationEvent(init));},
         hover,
         customElementBefore(...args){
             const reactionArgs=args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')!==2?['remove',args[2]]:args;

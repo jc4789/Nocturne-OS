@@ -844,6 +844,16 @@ static void attribute_cache(web_doc *d, node_t *n) {
     }
 }
 
+/* HTML's style attribute: when it is set, CSP's inline check ("style
+   attribute") decides whether its value applies; webi.h's csp_style_attribute
+   keeps the answer for the cascade and CSSOM. A CSSOM write (state 3) is
+   applied unchecked. */
+void doc_style_attribute_changed(web_doc *d, node_t *n, const char *value) {
+    if (!d || !value) { n->csp_style_attribute = 0; return; }
+    if (n->csp_style_attribute == 3) { n->csp_style_attribute = 1; return; }
+    n->csp_style_attribute = !d->html_policy || web_js_csp_style_allowed(d, n, true, value, strlen(value)) ? 1 : 2;
+}
+
 /* A parser's attribute list for an element it just created, under the
    caller's arena trap: the list becomes the element's, with its id and classes. */
 void doc_attrs_initial(web_doc *d, node_t *n, struct attr *attrs, int count) {
@@ -852,6 +862,8 @@ void doc_attrs_initial(web_doc *d, node_t *n, struct attr *attrs, int count) {
     attribute_cache(d, &temp);
     doc_attrs_publish(n, attrs, count);
     n->id = temp.id; n->classes = temp.classes; n->nclasses = temp.nclasses;
+    const char *style = d->html_policy ? node_attr(n, "style") : NULL;
+    if (style) doc_style_attribute_changed(d, n, style);
 }
 
 /* The element array remains the renderer/parser's canonical data. An Attr
@@ -987,6 +999,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     n->classes = temp.classes;
     n->nclasses = temp.nclasses;
     d->mem.trap = old;
+    if (!ns && !strcmp(low, "style")) doc_style_attribute_changed(d, n, value);
     bool ordinary = !ns && !n->foreign && !strcmp(name, low);
     if(!ns&&!n->foreign&&n->tag==T_meta&&(!strcmp(low,"name")||!strcmp(low,"content")))doc_referrer_meta(d,n);
     if(!ns&&!n->foreign&&n->tag==T_base&&!strcmp(low,"href")&&doc_node_root(n,false)==d->root&&
@@ -1644,16 +1657,21 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
 static bool clone_attributes(web_doc *d, node_t *copy, const node_t *source) {
     if (!source->nattrs) return true;
     if (source->nattrs < 0 || (size_t)source->nattrs > SIZE_MAX / sizeof(struct attr)) return false;
+    /* A clone's style attribute keeps its source's CSP answer (what it was
+       checked, or CSSOM wrote, as); one never checked is checked now. */
+    uint8_t style_state = source->csp_style_attribute == 3 ? 1 : source->csp_style_attribute;
     if (!source->foreign) switch (source->tag) {
     case T_input: case T_select: case T_option: case T_details:
     case T_img: case T_source:
         /* Keep native value/selection/toggle and detached-image side effects
            on their existing, independently tested setter path. */
+        if (style_state) copy->csp_style_attribute = 3;
         for (int i = 0; i < source->nattrs; i++) {
             const struct attr *a = &source->attrs[i];
             if (!doc_attr_set_ns(d, copy, a->namespace_uri, a->prefix,
                     a->local ? a->local : a->raw, a->value)) return false;
         }
+        if (style_state) copy->csp_style_attribute = node_attr(copy, "style") ? style_state : 0;
         return true;
     default: break;
     }
@@ -1684,6 +1702,9 @@ static bool clone_attributes(web_doc *d, node_t *copy, const node_t *source) {
     copy->classes = ready.classes;
     copy->nclasses = ready.nclasses;
     d->mem.trap = old;
+    const char *style = node_attr(copy, "style");
+    if (style && style_state) copy->csp_style_attribute = style_state;
+    else if (style) { copy->csp_style_attribute = 0; doc_style_attribute_changed(d, copy, style); }
     return true;
 }
 

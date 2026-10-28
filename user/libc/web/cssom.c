@@ -620,6 +620,9 @@ struct cssom_sheet *cssom_style_sheet(web_doc *d, node_t *n, int *error) {
         if(!text){*error=CSSOM_OOM;goto fail_input;}
         memcpy(text,input.text,length);text[length]=0;
     }else if (!owner_text(n,&text,&length)) { *error = CSSOM_OOM; goto fail_input; }
+    /* HTML "update a style block": a style element whose text CSP blocks
+       has no associated CSS style sheet. */
+    if (!link && !doc_style_csp_allowed(d,n,text,length)) { free(text); *error = CSSOM_INACTIVE; goto fail_input; }
     struct cssom_sheet *s = calloc(1,sizeof *s);
     if (!s) { free(text); *error = CSSOM_OOM;goto fail_input; }
     s->origin_clean=true; s->document=d;
