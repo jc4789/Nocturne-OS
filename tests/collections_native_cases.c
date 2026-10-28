@@ -12,9 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "quickjs.h"
+#include "user/libc/web/js_webidl.h"
 
-/* The engine's Atomics.wait and its clock; the cases never wait. */
+/* The engine's Atomics.wait and its clock (and js_webidl.c's); the cases never wait. */
 uint64_t n_clock_uptime_ms(void) { return 0; }
+uint64_t uptime_ms(void) { return 0; }
 n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned ms) { (void)address; (void)expected; (void)ms; return -N_ERR_TIMEOUT; }
 n_result wake_address(volatile uint32_t *address, unsigned count) { (void)address; (void)count; return 0; }
 
@@ -260,6 +262,8 @@ int main(int argc, char **argv) {
     };
     JS_SetPropertyFunctionList(ctx, tree, functions, sizeof functions / sizeof *functions);
     if (collections_native_init(ctx, host) < 0) { report_exception(ctx); return 1; }
+    /* The product's Web IDL layer gives the interfaces their shape, value iterators among them. */
+    web_js_webidl_init(ctx, host);
     JS_SetPropertyStr(ctx, global, "T", tree);
     JS_SetPropertyStr(ctx, global, "__host", host);
     JS_FreeValue(ctx, global);
@@ -268,7 +272,7 @@ int main(int argc, char **argv) {
     char *collections = read_file(argv[1]);
     static const char head[] = "(function(host){'use strict';const rawDom={get:T.get,attrNS:T.attrNS};"
                                "function reflectedAttr(node,name){return rawDom.attrNS(node,null,name);}\n";
-    static const char tail[] = "\n;globalThis.collectionBridge=collectionBridge;})(__host);";
+    static const char tail[] = "\n;globalThis.collectionBridge=collectionBridge;host.webidl('Window');})(__host);";
     size_t length = strlen(head) + strlen(collections) + strlen(tail) + 1;
     char *source = malloc(length);
     snprintf(source, length, "%s%s%s", head, collections, tail);

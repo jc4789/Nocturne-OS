@@ -12,11 +12,8 @@ const collectionBridge = (() => {
     class NodeList {
         constructor(){throw new TypeError('Illegal NodeList constructor');}
         item(i){return nativeItem(this,NODE_LIST,arguments.length,i);}
-        forEach(callback,thisArg){if(typeof callback!=='function')throw new TypeError('Expected callback');const n=this.length;for(let i=0;i<n;i++){const node=nativeItem(this,NODE_LIST,1,i);if(node!==null)callback.call(thisArg,node,i,this);}}
-        *keys(){for(let i=0;i<this.length;i++)yield i;}
-        *values(){for(let i=0;i<this.length;i++)yield this[i];}
-        *entries(){for(let i=0;i<this.length;i++)yield [i,this[i]];}
-        [Symbol.iterator](){return this.values();}
+        /* forEach, keys, values, entries and @@iterator are a value iterator's: js_webidl.c gives
+           the %Array.prototype% functions. */
     }
     class HTMLCollection {
         constructor(){throw new TypeError('Illegal HTMLCollection constructor');}

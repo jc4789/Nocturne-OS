@@ -27,7 +27,7 @@ with log.open('w', encoding='utf-8') as stream:
     command = [str(cc), '-std=gnu11', '-O1', '-fwrapv', '-funsigned-char', '-DCONFIG_NOCTURNE',
                '-DCONFIG_VERSION="Nocturne-test"', '-I' + str(shim), '-I.', '-Ithird_party/quickjs',
                '-Icommon', '-idirafter', 'user/include',
-               str(root / 'tests/collections_native_cases.c'), *map(str, engine), '-lm', '-o', str(exe)]
+               str(root / 'tests/collections_native_cases.c'), str(root / 'user/libc/web/js_webidl.c'), *map(str, engine), '-lm', '-o', str(exe)]
     subprocess.run(command, cwd=root, env=env, stdout=stream, stderr=subprocess.STDOUT, check=True)
     result = subprocess.run([str(exe), 'user/libc/web/js_collections.js', 'tests/collections_native_cases.js'],
                             cwd=root, env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=60)

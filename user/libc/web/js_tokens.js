@@ -70,11 +70,8 @@ const tokenListBridge = (() => {
         set value(value){const s=slot(this);value=string(value);reflectedAttr(s.node,s.attribute,value);}
         toString(){return text(slot(this));}
     }
-    // Web IDL value iterables use the actual generic Array functions. Their
-    // indexed reads are live, and forEach fixes length before invoking callbacks.
-    for(const key of ['keys','values','entries','forEach'])define(DOMTokenList.prototype,key,
-        {value:Array.prototype[key],writable:true,enumerable:true,configurable:true});
-    define(DOMTokenList.prototype,Symbol.iterator,{value:Array.prototype.values,writable:true,configurable:true});
+    // keys, values, entries, forEach and @@iterator are a value iterator's: js_webidl.c gives the
+    // %Array.prototype% functions, whose indexed reads are live.
     define(DOMTokenList.prototype,Symbol.toStringTag,{value:'DOMTokenList',configurable:true});
     for(const key of ['length','item','contains','add','remove','toggle','replace','supports','value','toString']){
         const d=descriptor(DOMTokenList.prototype,key);d.enumerable=true;define(DOMTokenList.prototype,key,d);
