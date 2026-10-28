@@ -201,15 +201,19 @@ static void request_framing(const char *method, const void *body, size_t length,
     http_resp_free(&r);
 }
 
-static void encoded(const unsigned char *gzip, size_t n, bool chunked, bool cb, bool ok, const char *body) {
+static void coded(const char *coding, const unsigned char *data, size_t n, bool chunked, bool cb, bool ok,
+                  const char *body) {
     char *wire = malloc(n + 256);
-    int h = snprintf(wire, n + 256, "HTTP/1.1 200 OK\r\nContent-Encoding: GZip\r\n%s\r\n",
+    int h = snprintf(wire, n + 256, "HTTP/1.1 200 OK\r\nContent-Encoding: %s\r\n%s\r\n", coding,
                      chunked ? "Transfer-Encoding: chunked\r\n" : "");
     if (chunked) h += snprintf(wire + h, n + 256 - (size_t)h, "%zx;test=value\r\n", n);
-    memcpy(wire + h, gzip, n); size_t size = (size_t)h + n;
+    memcpy(wire + h, data, n); size_t size = (size_t)h + n;
     if (chunked) { memcpy(wire + size, "\r\n0\r\n\r\n", 7); size += 7; }
     response(wire, size, chunked ? 3 : 0, false, cb, ok, body);
     free(wire);
+}
+static void encoded(const unsigned char *gzip, size_t n, bool chunked, bool cb, bool ok, const char *body) {
+    coded("GZip", gzip, n, chunked, cb, ok, body);
 }
 
 static const unsigned char gzip_sample[] = {
@@ -221,6 +225,23 @@ static const unsigned char gzip_optional[] = {
     0x1f,0x8b,0x08,0x1e,0x00,0x00,0x00,0x00,0x02,0xff,0x03,0x00,0x61,0x62,0x63,0x6e,0x61,0x6d,0x65,0x00,0x63,0x6f,0x6d,0x6d,
     0x65,0x6e,0x74,0x00,0xf4,0x6e,0xf3,0xcb,0x4f,0x2e,0x29,0x2d,0xca,0x4b,0x55,0x48,0x49,0x4d,0xce,0x4f,0x49,0x4d,0x51,0x28,
     0x4a,0x2d,0x2e,0xc8,0xcf,0x2b,0x4e,0xe5,0x02,0x00,0x4a,0x54,0x0d,0xd9,0x1a,0x00,0x00,0x00,
+};
+
+/* The same text as a zlib stream (bare DEFLATE is its middle: both are "deflate"), as one
+   uncompressed br meta-block (RFC 7932 9.2: WBITS 16, MLEN 26, ISUNCOMPRESSED, then an empty
+   last meta-block), and that br stream gzipped ("br, gzip": the last coding listed is undone first). */
+static const unsigned char zlib_sample[] = {
+    0x78,0xda,0xf3,0xcb,0x4f,0x2e,0x29,0x2d,0xca,0x4b,0x55,0x48,0x49,0x4d,0xce,0x4f,0x49,0x4d,0x51,0x28,
+    0x4a,0x2d,0x2e,0xc8,0xcf,0x2b,0x4e,0xe5,0x02,0x00,0x87,0x7e,0x09,0xd0,
+};
+static const unsigned char br_sample[] = {
+    0x90,0x01,0x10,'N','o','c','t','u','r','n','e',' ','d','e','c','o','d','e','d',' ',
+    'r','e','s','p','o','n','s','e','\n',0x03,
+};
+static const unsigned char gzip_br_sample[] = {
+    0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x02,0xff,0x9b,0xc0,0x28,0xe0,0x97,0x9f,0x5c,0x52,0x5a,0x94,
+    0x97,0xaa,0x90,0x92,0x9a,0x9c,0x9f,0x92,0x9a,0xa2,0x50,0x94,0x5a,0x5c,0x90,0x9f,0x57,0x9c,0xca,0xc5,
+    0x0c,0x00,0x8f,0xaf,0x92,0xfe,0x1e,0x00,0x00,0x00,
 };
 
 /* Run-length encoded gzip member expanding to 16 MiB + 1 byte. */
@@ -249,10 +270,6 @@ int main(void) {
     sent_request_len = 0;
     CHECK(http_request(&missing, &missing_response) < 0 && missing_response.error[0] && !sent_request_len);
     http_resp_free(&missing_response);
-    /* Reserved DEFLATE block: neither a NULL nor a stale stb reason is usable. */
-    extern int http_inflate(char *, int, const char *, int, int *);
-    const char reserved_block[9] = {7}; char inflated[128]; int consumed = 0;
-    CHECK(http_inflate(inflated, sizeof inflated, reserved_block, sizeof reserved_block, &consumed) == -1);
     char *header_wire=malloc(20000);size_t h=(size_t)sprintf(header_wire,"HTTP/1.1 200 OK\r\nX-Padding: ");
     memset(header_wire+h,'p',6000);h+=6000;memcpy(header_wire+h,"\r\nSet-Cookie: long=",19);h+=19;
     memset(header_wire+h,'v',2400);h+=2400;memcpy(header_wire+h,"\r\nContent-Length: 0\r\n\r\n",23);h+=23;
@@ -261,8 +278,6 @@ int main(void) {
     CHECK(http_request(&header_request,&header_response)==0);CHECK(cookie_header_len==2417);http_resp_free(&header_response);
     header_result=-1;CHECK(http_request(&header_request,&header_response)<0);http_resp_free(&header_response);header_result=0;
     free(header_wire);
-    CHECK(http_inflate(inflated, 1, (const char *)gzip_sample + 10, sizeof gzip_sample - 10, &consumed) == -2);
-    CHECK(http_inflate(inflated, sizeof inflated, reserved_block, sizeof reserved_block, &consumed) == -1);
     /* A YouTube response put Transfer-Encoding after more than 4 KiB of fields. */
     char large[8192]; size_t used = (size_t)snprintf(large, sizeof large, "HTTP/1.1 200 OK\r\n");
     for (int i = 0; i < 90; i++) used += (size_t)snprintf(large + used, sizeof large - used,
@@ -284,7 +299,11 @@ int main(void) {
     text_response("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n", false, NULL);
     text_response("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhell", false, NULL);
     text_response("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n", false, NULL);
-    text_response("HTTP/1.1 200 OK\r\nContent-Encoding: br\r\n\r\n", false, NULL);
+    /* No coded bytes at all (an empty redirect body) is an empty body; bytes that are not br fail. */
+    text_response("HTTP/1.1 200 OK\r\nContent-Encoding: br\r\n\r\n", true, NULL);
+    text_response("HTTP/1.1 200 OK\r\nContent-Encoding: br\r\n\r\nnot br", false, NULL);
+    /* A coding this client does not know leaves the bytes to the caller (Fetch). */
+    text_response("HTTP/1.1 200 OK\r\nContent-Encoding: compress\r\n\r\nhello", true, "hello");
     const char bad_header[]="HTTP/1.1 200 OK\r\nSet-Cookie: x=abc\0hidden\r\n\r\n";
     response(bad_header,sizeof bad_header-1,1,false,false,false,NULL);
     const char *plain = "HTTP/1.1 200 OK\r\n\r\nhello";
@@ -295,6 +314,16 @@ int main(void) {
     encoded(gzip_sample, sizeof gzip_sample, false, false, true, payload);
     encoded(gzip_sample, sizeof gzip_sample, true, true, true, payload);
     encoded(gzip_optional, sizeof gzip_optional, false, false, true, payload);
+    coded("deflate", zlib_sample, sizeof zlib_sample, false, false, true, payload);
+    coded("Deflate", zlib_sample + 2, sizeof zlib_sample - 6, true, true, true, payload);
+    coded("br", br_sample, sizeof br_sample, true, false, true, payload);
+    coded("br", br_sample, sizeof br_sample, false, true, true, payload);
+    coded("br, gzip", gzip_br_sample, sizeof gzip_br_sample, true, false, true, payload);
+    coded("deflate", zlib_sample, sizeof zlib_sample - 1, false, false, false, NULL);
+    coded("br", br_sample, sizeof br_sample - 1, false, false, false, NULL);
+    /* A reserved DEFLATE block type (BFINAL 1, BTYPE 11) is a decoding error. */
+    static const unsigned char reserved_block[9] = {7};
+    coded("deflate", reserved_block, sizeof reserved_block, false, false, false, NULL);
     encoded(gzip_sample, sizeof gzip_sample - 1, false, false, false, NULL);
     unsigned char changed[256];
     memcpy(changed, gzip_sample, sizeof gzip_sample);

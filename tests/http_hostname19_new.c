@@ -51,7 +51,7 @@ void ns_close(net_stream*s){(void)s;closes++;}
 void ns_set_timeout(net_stream*s,int t){(void)s;(void)t;}
 #define HTTP_MOCK_HAS_TIMEOUT
 #include "http_mock_lifecycle.h"
-int http_inflate(char*a,int b,const char*c,int d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+void *http_br_create(void){return NULL;}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
 #define CHECK(label,condition) do{checks++;if(!(condition)){failed++;printf("FAIL %s\n",label);}}while(0)
 static void reset(void){sent_length=opens=closes=0;sent[0]=opened_host[0]=0;open_failure=send_failure=false;fail_malloc=0;}
 static void hostname(char *out,size_t length){size_t at=0;while(at<length){size_t n=length-at;if(n>63)n=63;memset(out+at,'a',n);at+=n;if(at<length)out[at++]='.';}out[length]=0;}

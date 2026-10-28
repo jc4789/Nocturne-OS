@@ -1004,11 +1004,12 @@ static bool prepare_outgoing(struct job *j, const char *current, const char *met
     if(!append_referrer(j,current))return false;
     if (!append_fetch_metadata(j, current)) return false;
     /* Fetch's network layer owns content-coding negotiation, after author
-       headers have been classified for CORS. Advertise only our real decoder;
-       byte ranges must keep their representation offsets (Fetch step 19). */
+       headers have been classified for CORS. Advertise only the codings
+       http_coding.h decodes; byte ranges must keep their representation
+       offsets (Fetch step 19). */
     if (!field_exists(j->headers,"Accept-Encoding") &&
         !header_text(j,&j->outgoing,field_exists(j->headers,"Range") ?
-            "Accept-Encoding: identity\r\n" : "Accept-Encoding: gzip\r\n")) return false;
+            "Accept-Encoding: identity\r\n" : "Accept-Encoding: gzip, deflate, br\r\n")) return false;
     j->hop_cookies = j->wire.credentials == WEBNET_CREDENTIALS_INCLUDE ||
         (j->wire.credentials == WEBNET_CREDENTIALS_SAME_ORIGIN && !cross && !j->cors_tainted);
     if (j->hop_cookies) {

@@ -32,7 +32,7 @@ long ns_read(net_stream *s,void *b,size_t n){size_t left=sizeof response-1-s->re
 void ns_set_timeout(net_stream *s,int t){(void)s;(void)t;}
 const char *ns_error(net_stream *s){(void)s;return "";}
 void ns_close(net_stream *s){(void)s;}
-int http_inflate(char *o,int c,const char *i,int n,int *used){(void)o;(void)c;(void)i;(void)n;(void)used;return -1;}
+void *http_br_create(void){return NULL;}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
 #define HTTP_MOCK_HAS_TIMEOUT
 #include "http_mock_lifecycle.h"
 #define CHECK(name,ok) do{checks++;if(!(ok)){failed++;printf("FAIL %s\n",name);}}while(0)

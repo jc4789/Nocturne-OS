@@ -19,7 +19,7 @@ out.write_text(part('struct header_buffer', 'static bool read_all') +
 for name in ['user/apps/webfetch.c', 'user/libc/webnet.c', 'user/libc/web/js.c',
              'user/include/webnet_wire.h', str(out), 'tests/http_request_headers_hosttest.c']:
     print(name, 'SHA256', hashlib.sha256(Path(name).read_bytes()).hexdigest(), flush=True)
-exe = 'build/goal-20261009/http-request-headers-host.exe'
-subprocess.run(['tools/msys64/ucrt64/bin/clang.exe', '-O2', '-idirafter', 'user/include',
+exe = str(Path('build/goal-20261009/http-request-headers-host.exe').resolve())
+subprocess.run([str(Path('tools/msys64/ucrt64/bin/clang.exe').resolve()), '-O2', '-idirafter', 'user/include', '-idirafter', 'common',
                 'tests/http_request_headers_hosttest.c', '-o', exe], check=True)
 subprocess.run([exe, *sys.argv[1:]], check=True)

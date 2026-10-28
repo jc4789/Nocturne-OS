@@ -51,7 +51,7 @@ static int content_coding(void) {
         .document="https://request.test/",.origin="https://request.test",.headers=""};
     CHECK(validate_headers(&j)&&(!j.non_simple||!j.non_simple[0]));
     CHECK(prepare_outgoing(&j,"https://request.test/","GET",false)&&
-        strstr(j.outgoing.p,"Accept-Encoding: gzip\r\n")&&!strstr(j.outgoing.p,"deflate")&&!strstr(j.outgoing.p," br"));
+        strstr(j.outgoing.p,"Accept-Encoding: gzip, deflate, br\r\n")&&!strstr(j.outgoing.p,"zstd"));
     close_job(&j);
     j.headers="rAnGe: bytes=1-2\r\n";
     CHECK(prepare_outgoing(&j,"https://request.test/","GET",false)&&

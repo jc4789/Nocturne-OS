@@ -30,9 +30,8 @@ long ns_read(net_stream *s,void *p,size_t n) {
 const char *ns_error(net_stream *s){(void)s;return "test IO";}
 void ns_close(net_stream *s){(void)s;}
 #include "http_mock_lifecycle.h"
-int http_inflate(char *o,int cap,const char *p,int n,int *consumed) {
-    (void)o;(void)cap;(void)p;(void)n;(void)consumed;return -1;
-}
+void *http_br_create(void){return NULL;}
+int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
 int main(void) {
     char *input=malloc(HTTP_URL_MAX+1), *out=malloc(HTTP_URL_MAX), *expected=malloc(HTTP_URL_MAX);
     struct url *parsed=malloc(sizeof *parsed);

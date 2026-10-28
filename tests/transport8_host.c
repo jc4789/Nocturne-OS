@@ -47,4 +47,4 @@ uint64_t ns_bytes_sent(net_stream *s){return s->sent;}
 void ns_abort(net_stream *s){if(s){closesocket(s->socket);free(s);}}
 void ns_close(net_stream *s){ns_abort(s);}
 void ns_sessions_clear(void){}
-int http_inflate(char *out,int cap,const char *in,int length,int *consumed){(void)out;(void)cap;(void)in;(void)length;(void)consumed;return -1;}
+void *http_br_create(void){return NULL;}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}

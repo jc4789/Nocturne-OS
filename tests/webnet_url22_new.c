@@ -56,7 +56,7 @@ void ns_set_timeout(net_stream *s,int t){(void)s;(void)t;}
 #define HTTP_MOCK_HAS_TIMEOUT
 #define HTTP_MOCK_NO_ISOLATION
 #include "http_mock_lifecycle.h"
-int http_inflate(char *o,int c,const char *i,int n,int *used){(void)o;(void)c;(void)i;(void)n;(void)used;return -1;}
+void *http_br_create(void){return NULL;}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
 static char *initial,*creator,*location,*expected;
 static unsigned requests,callbacks,checks,failed;
 static int mode;

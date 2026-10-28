@@ -39,7 +39,7 @@ long ns_read(net_stream*a,void*b,size_t c){(void)a;(void)b;(void)c;return -1;}
 const char *ns_error(net_stream*a){(void)a;return "unused stream";}
 void ns_close(net_stream*a){(void)a;}
 void ns_set_timeout(net_stream*a,int b){(void)a;(void)b;}
-int http_inflate(char*a,int b,const char*c,int d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+void *http_br_create(void){return NULL;}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
 #define HTTP_MOCK_HAS_TIMEOUT
 #define HTTP_MOCK_NO_ISOLATION
 #include "http_mock_lifecycle.h"

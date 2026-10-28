@@ -1,21 +1,46 @@
-/* Resumable RFC 1951/1952 decoder for HTTP callbacks. Input is never retained:
- * only the bit reservoir, Huffman tables and the 32 KiB distance window survive
- * a read. Output goes through the HTTP sink (and its cancellation/backpressure).
+/* The content codings of an HTTP response (RFC 9110 §8.4), undone while the body
+ * arrives: gzip (RFC 1952, members one after another), deflate (RFC 1950's zlib
+ * wrapper, or a bare RFC 1951 stream as some servers send it) and br (RFC 7932,
+ * through the brotli decoder libc carries for WOFF2). The sink holds them in the
+ * order they are undone, the last one the server applied first; each passes its
+ * output to the next and the last one to the HTTP sink (and its cancellation and
+ * backpressure). Input is never retained: gzip and deflate keep only the bit
+ * reservoir, Huffman tables and the 32 KiB distance window.
  */
 enum { G_HEADER, G_EXTRA_LEN, G_EXTRA, G_NAME, G_COMMENT, G_HCRC,
        G_BLOCK, G_STORED_LEN, G_STORED, G_DYNAMIC, G_CODE_LENGTHS,
        G_LENGTHS, G_REPEAT, G_SYMBOL, G_LENGTH_EXTRA, G_DISTANCE,
-       G_DISTANCE_EXTRA, G_TRAILER_CRC, G_TRAILER_SIZE };
+       G_DISTANCE_EXTRA, G_TRAILER_CRC, G_TRAILER_SIZE,
+       G_ZLIB_HEADER, G_ADLER, G_END };
+/* What wraps the DEFLATE data. A deflate coding is W_ZLIB_OR_RAW until its first
+   two bytes show whether they are a zlib header. */
+enum { W_GZIP, W_ZLIB_OR_RAW, W_ZLIB, W_RAW };
+enum { CODING_GZIP, CODING_DEFLATE, CODING_BR };
 struct gzip_huffman { uint16_t count[16], symbol[288]; };
 struct http_gzip {
-    uint64_t bits; unsigned nbits,phase,header_pos,flags,extra,index;
+    uint64_t bits; unsigned nbits,phase,header_pos,flags,extra,index,wrap;
     unsigned hlit,hdist,hclen,repeat,repeat_bits,repeat_value,length,distance;
-    bool final,invalid; uint32_t crc,header_crc,size,members,crc_table[256];
+    bool final,invalid; uint32_t crc,header_crc,size,members,adler_a,adler_b,crc_table[256];
     uint8_t lengths[320],code_lengths[19],window[32768],output[16384];
-    size_t window_at,window_used,output_used;
+    size_t window_at,window_used,output_used,next;
     struct gzip_huffman lit,dist,code;
     const unsigned char *input; size_t remaining;
 };
+#define HTTP_BR_OUTPUT 16384u
+struct http_coding {
+    unsigned kind;
+    bool fed;                     /* a byte reached it: a coded body of no bytes is empty */
+    bool done;                    /* br: the stream ended */
+    struct http_gzip *gzip;       /* gzip and deflate */
+    void *br;                     /* br: the decoder (third_party_brotli.c) */
+    unsigned char *output;        /* br: HTTP_BR_OUTPUT bytes */
+};
+/* Private adapter to libc's brotli decoder (third_party_brotli.c): 1 when the
+   stream ended, 0 when it took every input byte or filled *room, -1 invalid. */
+extern void *http_br_create(void);
+extern int http_br_decode(void *state,const unsigned char **in,size_t *in_n,unsigned char **out,size_t *room);
+extern void http_br_free(void *state);
+static bool coding_put(struct sink *sink,size_t stage,const char *data,size_t n);
 static uint32_t gzip_update(struct http_gzip *g,uint32_t crc,unsigned byte){
     return (crc>>8)^g->crc_table[(crc^byte)&255];
 }
@@ -53,23 +78,32 @@ static int gzip_symbol(struct http_gzip *g,const struct gzip_huffman *h,unsigned
 }
 static bool gzip_flush(struct http_gzip *g,struct sink *sink){
     if(!g->output_used)return true;
-    bool ok=sink_plain_put(sink,(const char *)g->output,g->output_used);g->output_used=0;return ok;
+    bool ok=coding_put(sink,g->next,(const char *)g->output,g->output_used);g->output_used=0;return ok;
 }
 static bool gzip_emit(struct http_gzip *g,struct sink *sink,unsigned byte){
     g->window[g->window_at++&32767]=(uint8_t)byte;if(g->window_used<32768)g->window_used++;
     g->output[g->output_used++]=(uint8_t)byte;g->crc=gzip_update(g,g->crc,byte);g->size++;
+    if(g->wrap==W_ZLIB){g->adler_a=(g->adler_a+byte)%65521u;g->adler_b=(g->adler_b+g->adler_a)%65521u;}
     return g->output_used<sizeof g->output||gzip_flush(g,sink);
+}
+static void gzip_start_data(struct http_gzip *g){
+    g->phase=G_BLOCK;g->crc=0xffffffffu;g->size=0;g->window_at=g->window_used=0;g->adler_a=1;g->adler_b=0;
 }
 static void gzip_after_extra(struct http_gzip *g){
     if(g->flags&8){g->flags&=~8u;g->phase=G_NAME;}
     else if(g->flags&16){g->flags&=~16u;g->phase=G_COMMENT;}
     else if(g->flags&2){g->flags&=~2u;g->phase=G_HCRC;}
-    else {g->phase=G_BLOCK;g->crc=0xffffffffu;g->size=0;g->window_at=g->window_used=0;}
+    else gzip_start_data(g);
 }
-static struct http_gzip *gzip_create(void){
+/* What follows the final DEFLATE block. */
+static unsigned gzip_after_data(const struct http_gzip *g){
+    return g->wrap==W_GZIP?G_TRAILER_CRC:g->wrap==W_ZLIB?G_ADLER:G_END;
+}
+/* wrap is W_GZIP or W_ZLIB_OR_RAW; the output goes to stage next. */
+static struct http_gzip *gzip_create(unsigned wrap,size_t next){
     struct http_gzip *g=calloc(1,sizeof *g);if(!g)return NULL;
     for(unsigned i=0;i<256;i++){uint32_t c=i;for(unsigned j=0;j<8;j++)c=(c>>1)^(0xedb88320u&(0u-(c&1)));g->crc_table[i]=c;}
-    g->header_crc=0xffffffffu;return g;
+    g->header_crc=0xffffffffu;g->wrap=wrap;g->next=next;g->phase=wrap==W_GZIP?G_HEADER:G_ZLIB_HEADER;return g;
 }
 static bool gzip_feed(struct http_gzip *g,struct sink *sink,const char *input,size_t n,bool finish){
     static const uint8_t code_order[19]={16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
@@ -101,6 +135,14 @@ static bool gzip_feed(struct http_gzip *g,struct sink *sink,const char *input,si
             if(!gzip_bits(g,16))goto wait;
             if(gzip_take(g,16)!=((~g->header_crc)&65535))goto invalid;
             gzip_after_extra(g);break;
+        case G_ZLIB_HEADER:
+            /* RFC 1950: CM 8, a window of at most 32 KiB, FCHECK, no preset dictionary.
+               Anything else is a bare DEFLATE stream that starts with these bytes. */
+            if(!gzip_bits(g,16))goto wait;
+            v=(unsigned)(g->bits&65535);
+            if((v&15)==8&&(v&255)>>4<=7&&!(((v&255)*256+(v>>8))%31)&&!(v&0x2000)){gzip_take(g,16);g->wrap=W_ZLIB;}
+            else g->wrap=W_RAW;
+            gzip_start_data(g);break;
         case G_BLOCK:
             if(!gzip_bits(g,3))goto wait;
             v=gzip_take(g,3);g->final=(v&1)!=0;v>>=1;
@@ -116,7 +158,7 @@ static bool gzip_feed(struct http_gzip *g,struct sink *sink,const char *input,si
             v=gzip_take(g,32);if((v&65535)!=((~v>>16)&65535))goto invalid;
             g->length=v&65535;g->phase=G_STORED;break;
         case G_STORED:
-            if(!g->length){g->phase=g->final?G_TRAILER_CRC:G_BLOCK;break;}
+            if(!g->length){g->phase=g->final?gzip_after_data(g):G_BLOCK;break;}
             if(!gzip_bits(g,8))goto wait;
             if(!gzip_emit(g,sink,gzip_take(g,8)))return false;g->length--;break;
         case G_DYNAMIC:
@@ -144,7 +186,7 @@ static bool gzip_feed(struct http_gzip *g,struct sink *sink,const char *input,si
         case G_SYMBOL:
             decoded=gzip_symbol(g,&g->lit,&v);if(!decoded)goto wait;if(decoded<0)goto invalid;
             if(v<256){if(!gzip_emit(g,sink,v))return false;}
-            else if(v==256){g->phase=g->final?G_TRAILER_CRC:G_BLOCK;if(g->final)gzip_take(g,g->nbits%8);}
+            else if(v==256){g->phase=g->final?gzip_after_data(g):G_BLOCK;if(g->final)gzip_take(g,g->nbits%8);}
             else {if(v>285)goto invalid;v-=257;g->length=length_base[v];g->extra=length_extra[v];g->phase=G_LENGTH_EXTRA;}
             break;
         case G_LENGTH_EXTRA:
@@ -165,13 +207,109 @@ static bool gzip_feed(struct http_gzip *g,struct sink *sink,const char *input,si
             if(!gzip_bits(g,32))goto wait;
             if(gzip_take(g,32)!=g->size)goto invalid;
             g->members++;g->phase=G_HEADER;g->header_pos=0;g->header_crc=0xffffffffu;break;
+        case G_ADLER:
+            if(!gzip_bits(g,32))goto wait;
+            v=gzip_take(g,32); /* most significant byte first */
+            if(((v>>24)|((v>>8)&0xff00u)|((v<<8)&0xff0000u)|(v<<24))!=(g->adler_b<<16|g->adler_a))goto invalid;
+            g->phase=G_END;break;
+        case G_END: /* one zlib or bare stream: nothing may follow it */
+            if(g->nbits||g->remaining)goto invalid;
+            goto wait;
         default:goto invalid;
         }
     }
 wait:
     if(!gzip_flush(g,sink))return false;
-    if(finish&&!(g->members&&g->phase==G_HEADER&&!g->header_pos&&!g->nbits))goto invalid;
+    if(finish&&!(g->wrap==W_GZIP?g->members&&g->phase==G_HEADER&&!g->header_pos&&!g->nbits:g->phase==G_END))goto invalid;
     return true;
 invalid:
-    g->invalid=true;snprintf(sink->rs->error,sizeof sink->rs->error,"invalid or truncated gzip response");return false;
+    g->invalid=true;
+    snprintf(sink->rs->error,sizeof sink->rs->error,"invalid or truncated %s response",g->wrap==W_GZIP?"gzip":"deflate");
+    return false;
+}
+static bool br_feed(struct http_coding *c,struct sink *sink,size_t next,const char *input,size_t n,bool finish){
+    static const unsigned char none;
+    const unsigned char *in=input?(const unsigned char *)input:&none;
+    for(;;){
+        if(c->done){if(n)goto invalid;break;}
+        unsigned char *out=c->output;size_t room=HTTP_BR_OUTPUT;
+        int result=http_br_decode(c->br,&in,&n,&out,&room);
+        if(out>c->output&&!coding_put(sink,next,(const char *)c->output,(size_t)(out-c->output)))return false;
+        if(result<0)goto invalid;
+        if(result>0)c->done=true;
+        else if(room)break; /* every byte taken: the rest comes with the next read */
+    }
+    if(finish&&!c->done)goto invalid;
+    return true;
+invalid:
+    snprintf(sink->rs->error,sizeof sink->rs->error,"invalid or truncated br response");return false;
+}
+static bool coding_put(struct sink *sink,size_t stage,const char *data,size_t n){
+    if(stage==sink->codings)return sink_plain_put(sink,data,n);
+    struct http_coding *c=&sink->coding[stage];
+    if(n)c->fed=true;
+    return c->kind==CODING_BR?br_feed(c,sink,stage+1,data,n,false):gzip_feed(c->gzip,sink,data,n,false);
+}
+/* The body ended: each coding that got a byte must have ended too. Stage by
+   stage, so what one still holds reaches the next before that one is asked. */
+static bool coding_finish(struct sink *sink){
+    for(size_t i=0;i<sink->codings;i++){
+        struct http_coding *c=&sink->coding[i];
+        if(!c->fed)continue;
+        if(!(c->kind==CODING_BR?br_feed(c,sink,i+1,NULL,0,true):gzip_feed(c->gzip,sink,NULL,0,true)))return false;
+    }
+    return true;
+}
+static bool coding_tchar(unsigned char c){
+    return (c>='0'&&c<='9')||(c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c&&strchr("!#$%&'*+-.^_`|~",c));
+}
+/* CODING_*, -1 for identity (no coding), -2 for one this decoder does not have. */
+static int coding_kind(const char *p,size_t n){
+    if((n==4&&!strncasecmp(p,"gzip",4))||(n==6&&!strncasecmp(p,"x-gzip",6)))return CODING_GZIP;
+    if(n==7&&!strncasecmp(p,"deflate",7))return CODING_DEFLATE;
+    if(n==2&&!strncasecmp(p,"br",2))return CODING_BR;
+    if(n==8&&!strncasecmp(p,"identity",8))return -1;
+    return -2;
+}
+static void coding_free(struct sink *sink){
+    for(size_t i=0;i<sink->codings;i++){
+        struct http_coding *c=&sink->coding[i];
+        free(c->gzip);if(c->br)http_br_free(c->br);free(c->output);
+    }
+    free(sink->coding);sink->coding=NULL;sink->codings=0;
+}
+/* value: every Content-Encoding field's list, in order and joined by commas
+   (RFC 9110 §5.3, §8.4); empty elements are ignored. Fetch's "handle content
+   codings" leaves the bytes as they are when a coding is not supported or the
+   list does not parse, so that is 0, as is a list naming only identity. 1: the
+   decoders are in sink->coding, the last applied first. -1: out of memory
+   (coding_free releases what was made). */
+static int coding_create(struct sink *sink,const char *value){
+    size_t count=0;
+    for(int pass=0;pass<2;pass++){
+        size_t at=count;
+        for(const char *p=value;;p++){
+            while(*p==' '||*p=='\t')p++;
+            const char *start=p;while(*p&&*p!=',')p++;
+            const char *end=p;while(end>start&&(end[-1]==' '||end[-1]=='\t'))end--;
+            if(end>start){
+                for(const char *c=start;c<end;c++)if(!coding_tchar((unsigned char)*c))return 0;
+                int kind=coding_kind(start,(size_t)(end-start));
+                if(kind==-2)return 0;
+                if(kind>=0){if(pass)sink->coding[--at].kind=(unsigned)kind;else count++;}
+            }
+            if(!*p)break;
+        }
+        if(!pass){
+            if(!count)return 0;
+            if(!(sink->coding=calloc(count,sizeof *sink->coding)))return -1;
+            sink->codings=count;
+        }
+    }
+    for(size_t i=0;i<count;i++){
+        struct http_coding *c=&sink->coding[i];
+        if(c->kind==CODING_BR){if(!(c->br=http_br_create())||!(c->output=malloc(HTTP_BR_OUTPUT)))return -1;}
+        else if(!(c->gzip=gzip_create(c->kind==CODING_GZIP?W_GZIP:W_ZLIB_OR_RAW,i+1)))return -1;
+    }
+    return 1;
 }

@@ -76,9 +76,9 @@ long ns_read(net_stream *s,void *out,size_t n) {
 const char *ns_error(net_stream *s){(void)s;return "";}
 void ns_close(net_stream *s){(void)s;closed++;}
 #include "http_mock_lifecycle.h"
-int http_inflate(char *out,int cap,const char *in,int len,int *used) {
-    (void)out;(void)cap;(void)in;(void)len;(void)used;inflated++;return -1;
-}
+/* A br decoder made here would mean a coded media body was decoded: media asks for identity. */
+void *http_br_create(void){inflated++;return NULL;}
+int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
 static void clean(nmedia_http *r) {
     nmedia_http_close(r);struct nmedia_alloc_stats a;nmedia_alloc_snapshot(&a);
     CHECK(a.current==0&&a.blocks==0);CHECK(opened==closed);

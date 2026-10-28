@@ -39,7 +39,7 @@ long ns_read(net_stream*s,void*data,size_t n){const char *response="HTTP/1.1 200
 const char *ns_error(net_stream*s){(void)s;return "fixture stream error";}
 void ns_close(net_stream*s){(void)s;closes++;}
 void ns_set_timeout(net_stream*s,int timeout){(void)s;(void)timeout;}
-int http_inflate(char*out,int cap,const char*in,int n,int*consumed){(void)out;(void)cap;(void)in;(void)n;(void)consumed;return -1;}
+void *http_br_create(void){return NULL;}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){(void)s;(void)in;(void)n;(void)out;(void)room;return -1;}void http_br_free(void *s){(void)s;}
 #define HTTP_MOCK_HAS_TIMEOUT
 #include "http_mock_lifecycle.h"
 #define CHECK(name,test) do{checks++;if(!(test)){failed++;printf("FAIL %s\n",name);}}while(0)

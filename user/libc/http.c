@@ -382,7 +382,8 @@ struct sink {
     size_t cap;
     bool aborted;
     size_t limit; /* encoded/decoded bound, or zero for legacy uncompressed streaming */
-    struct http_gzip *gzip;
+    struct http_coding *coding; /* the content codings to undo, the last applied first */
+    size_t codings;
 };
 
 static bool sink_plain_put(struct sink *k, const char *data, size_t n) {
@@ -424,9 +425,9 @@ static bool sink_plain_put(struct sink *k, const char *data, size_t n) {
     k->rs->body[k->rs->body_len] = 0;
     return true;
 }
-#include "http_gzip.h"
+#include "http_coding.h"
 static bool sink_put(struct sink *k,const char *data,size_t n){
-    return k->gzip?gzip_feed(k->gzip,k,data,n,false):sink_plain_put(k,data,n);
+    return coding_put(k,0,data,n);
 }
 
 /* copy exactly n bytes (or until the end of stream when n == SIZE_MAX) to the sink */
@@ -509,91 +510,19 @@ static bool body_size(const char *p, int base, size_t *out, bool chunk) {
     return true;
 }
 
-#define HTTP_GZIP_LIMIT ((size_t)UINT32_MAX)
-/* Private adapter to the existing image codec's bounded DEFLATE implementation. */
-extern int http_inflate(char *out, int cap, const char *in, int len, int *consumed);
+#define HTTP_DECODED_LIMIT ((size_t)UINT32_MAX)
 
-static uint32_t gzip_crc(const unsigned char *p, size_t n) {
-    uint32_t c = 0xffffffffu;
-    while (n--) {
-        c ^= *p++;
-        for (int b = 0; b < 8; b++) c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
-    }
-    return ~c;
-}
-
-static uint32_t le32(const unsigned char *p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
-
-/* Validate each gzip member, including optional headers, checksum and size.
-   Concatenated members are permitted; unrelated trailing bytes are not. */
-static bool gunzip_body(struct http_resp *rs, size_t limit) {
-    const unsigned char *in = (const unsigned char *)rs->body;
-    size_t pos = 0, used = 0, cap = limit < 65536 ? limit : 65536;
-    char *out = malloc(cap + 1);
-    if (!out) { snprintf(rs->error, sizeof rs->error, "out of memory"); return false; }
-    do {
-        size_t start = pos, n = rs->body_len;
-        if (n - pos < 18 || in[pos] != 0x1f || in[pos+1] != 0x8b || in[pos+2] != 8 || (in[pos+3] & 0xe0)) goto invalid;
-        unsigned flags = in[pos+3];
-        pos += 10;
-        if (flags & 4) {
-            if (n - pos < 2) goto invalid;
-            size_t extra = (size_t)in[pos] | (size_t)in[pos+1] << 8;
-            pos += 2;
-            if (extra > n - pos) goto invalid;
-            pos += extra;
-        }
-        for (unsigned flag = 8; flag <= 16; flag <<= 1) {
-            if (!(flags & flag)) continue;
-            while (pos < n && in[pos]) pos++;
-            if (pos == n) goto invalid;
-            pos++;
-        }
-        if (flags & 2) {
-            if (n - pos < 2 || (gzip_crc(in + start, pos - start) & 0xffff) !=
-                ((unsigned)in[pos] | (unsigned)in[pos+1] << 8)) goto invalid;
-            pos += 2;
-        }
-        if (n - pos < 8) goto invalid;
-        int took = 0, got;
-        for (;;) {
-            size_t available = cap - used, encoded = n - pos;
-            got = http_inflate(out + used, available > INT_MAX ? INT_MAX : (int)available,
-                (const char *)in + pos, encoded > INT_MAX ? INT_MAX : (int)encoded, &took);
-            if (got != -2) break;
-            if (cap - used >= (size_t)INT_MAX) {
-                snprintf(rs->error, sizeof rs->error, "gzip member length cannot be represented by the inflater API");
-                free(out); return false;
-            }
-            if (cap == limit) {
-                if (!(limit % (1024u * 1024u)))
-                    snprintf(rs->error, sizeof rs->error, "gzip response exceeds %lu MiB", (unsigned long)(limit / (1024u * 1024u)));
-                else snprintf(rs->error, sizeof rs->error, "gzip response exceeds %lu bytes", (unsigned long)limit);
-                free(out); return false;
-            }
-            cap = cap * 2 < limit ? cap * 2 : limit;
-            char *larger = realloc(out, cap + 1);
-            if (!larger) { snprintf(rs->error, sizeof rs->error, "out of memory"); free(out); return false; }
-            out = larger;
-        }
-        if (got < 0 || took <= 0 || (size_t)took > n - pos - 8) goto invalid;
-        pos += (size_t)took;
-        if (le32(in + pos) != gzip_crc((const unsigned char *)out + used, (size_t)got) ||
-            le32(in + pos + 4) != (uint32_t)got) goto invalid;
-        used += (size_t)got;
-        pos += 8;
-    } while (pos < rs->body_len);
-    out[used] = 0;
-    free(rs->body);
-    rs->body = out;
-    rs->body_len = used;
-    return true;
-invalid:
-    snprintf(rs->error, sizeof rs->error, "invalid or truncated gzip response");
-    free(out);
-    return false;
+/* A body read whole before its codings are undone: the coded bytes in rs->body
+   become the decoded ones, or none reach the caller when a coding is bad. */
+static bool decode_whole(struct sink *k, const struct http_req *buffered, size_t limit) {
+    char *coded = k->rs->body;
+    size_t coded_len = k->rs->body_len;
+    k->rs->body = NULL;
+    k->rs->body_len = 0;
+    struct sink d = {buffered, k->rs, 0, false, limit, k->coding, k->codings};
+    bool ok = coding_put(&d, 0, coded, coded_len) && coding_finish(&d);
+    free(coded);
+    return ok;
 }
 
 struct http_scratch {
@@ -782,8 +711,10 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         }
     }
     size_t hl = 0, headers_cap = sizeof rs->headers, length = 0;
-    bool chunked = false, have_length = false, gzip = false, have_encoding = false;
+    bool chunked = false, have_length = false;
     bool connection_close=false,connection_keepalive=false;
+    char *encoding = NULL; /* every Content-Encoding field's value, joined by commas */
+    size_t encoding_len = 0;
     const char *header_error = NULL;
     for (;;) {
         if (!rd_line(r, &line)) { header_error = r->line_oom ? "out of memory reading response header" : "incomplete response headers"; break; }
@@ -825,10 +756,15 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
             length = parsed;
             have_length = true;
         } else if ((v = header_value(line, "Content-Encoding"))) {
-            if (have_encoding || (strcasecmp(v, "gzip") && strcasecmp(v, "identity")))
-                header_error = "unsupported or invalid Content-Encoding";
-            gzip = !strcasecmp(v, "gzip");
-            have_encoding = true;
+            size_t vl = strlen(v);
+            char *joined = realloc(encoding, encoding_len + vl + 2);
+            if (!joined) header_error = "out of memory receiving response headers";
+            else {
+                encoding = joined;
+                if (encoding_len) encoding[encoding_len++] = ',';
+                memcpy(encoding + encoding_len, v, vl + 1);
+                encoding_len += vl;
+            }
         } else if ((v = header_value(line,"Connection"))) {
             connection_close|=has_token(v,"close");connection_keepalive|=has_token(v,"keep-alive");
         }
@@ -838,7 +774,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     if (header_error) {
         snprintf(rs->error, sizeof rs->error, "%s", header_error);
         free(rs->headers_full); rs->headers_full = NULL; rs->headers[0] = 0;
-        errno=EPROTO;rd_free(r); return -1;
+        free(encoding);errno=EPROTO;rd_free(r); return -1;
     }
     rs->headers_len = hl;
     if (rs->headers_full) rs->headers[0] = 0;
@@ -849,17 +785,29 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         if (decision) {
             if (decision < 0 && !rs->error[0]) snprintf(rs->error, sizeof rs->error, "response headers rejected");
             if(decision<0)errno=ECANCELED;
-            rd_free(r); return decision < 0 ? -1 : 0;
+            free(encoding);rd_free(r); return decision < 0 ? -1 : 0;
         }
     }
 
     struct http_req buffered = *rq;
     buffered.on_body = NULL;
     bool no_body = !strcmp(method, "HEAD") || status == 204 || status == 304;
-    size_t decoded_limit = body_limit ? body_limit : HTTP_GZIP_LIMIT;
-    bool stream_gzip=gzip&&hooks&&rq->on_body&&!no_body;
-    struct sink k = {gzip&&!stream_gzip ? &buffered : rq, rs, 0, false, gzip ? decoded_limit : body_limit,NULL};
-    if(stream_gzip){k.gzip=gzip_create();if(!k.gzip){errno=ENOMEM;snprintf(rs->error,sizeof rs->error,"out of memory decoding gzip");rd_free(r);return -1;}}
+    size_t decoded_limit = body_limit ? body_limit : HTTP_DECODED_LIMIT;
+    struct sink k = {rq, rs, 0, false, body_limit, NULL, 0};
+    int coded = encoding && !no_body ? coding_create(&k, encoding) : 0;
+    free(encoding);
+    if (coded < 0) {
+        coding_free(&k);errno=ENOMEM;snprintf(rs->error,sizeof rs->error,"out of memory decoding the response");
+        rd_free(r);return -1;
+    }
+    /* With hooks the caller takes the body as it is decoded. Without them a coded
+       body is read whole and decoded before on_body sees a byte, so a bad
+       checksum or an overlong body delivers nothing. */
+    bool whole = coded && !(hooks && rq->on_body);
+    struct http_coding *codings = k.coding;
+    size_t coding_count = k.codings;
+    if (coded) k.limit = decoded_limit;
+    if (whole) { k.rq = &buffered; k.coding = NULL; k.codings = 0; }
     bool body_ok;
     if (no_body) {
         body_ok = true;
@@ -883,22 +831,23 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     } else {
         body_ok = copy_body(r, &k, (size_t)-1);
     }
-    if(body_ok&&stream_gzip)body_ok=gzip_feed(k.gzip,&k,NULL,0,true);
+    if(body_ok&&coded&&!whole)body_ok=coding_finish(&k);
     if(body_ok&&work->h2&&http2_finish(work->h2,true,hooks)<0) {
         body_ok=false;snprintf(rs->error,sizeof rs->error,"%s",http2_error(work->h2));
     }
-    free(k.gzip);k.gzip=NULL;
-    if (body_ok && gzip && !stream_gzip && !no_body) {
-        body_ok = gunzip_body(rs, decoded_limit);
+    k.coding = codings; k.codings = coding_count;
+    if (body_ok && whole) {
+        body_ok = decode_whole(&k, &buffered, decoded_limit);
         if (body_ok && rq->on_body) {
             char *body = rs->body;
             size_t len = rs->body_len;
             rs->body = NULL; rs->body_len = 0;
             k.rq = rq;
-            body_ok = sink_put(&k, body, len);
+            body_ok = sink_plain_put(&k, body, len);
             free(body);
         }
     }
+    coding_free(&k);
     if (!rs->body && !rq->on_body) {
         rs->body = calloc(1, 1);
     }

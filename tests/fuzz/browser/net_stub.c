@@ -33,7 +33,7 @@ long ns_read(net_stream *s, void *b, size_t n) {
     memcpy(b, stub_in + stub_at, n); stub_at += n; return (long)n;
 }
 long ns_try_read(net_stream *s, void *b, size_t n) { return ns_read(s, b, n); }
-long ns_read_wait(net_stream *s, void *b, size_t n, int t, volatile uint32_t *l) { return ns_read(s, b, n); }
+long ns_read_wait(net_stream *s, void *b, size_t n, int t, mtx_t *l) { (void)t; (void)l; return ns_read(s, b, n); }
 long ns_try_write(net_stream *s, const void *b, size_t n) { return (long)n; }
 void ns_engine_lock(volatile uint32_t *l) {}
 void ns_engine_unlock(volatile uint32_t *l) {}
