@@ -53,12 +53,25 @@
     }
     class CSSStyleRule extends CSSRule {
         get selectorText() { const r = ruleInfo(this); return r.info ? r.info.selector : ''; }
+        // CSSOM: parse the value as a group of selectors; on failure nothing changes.
+        set selectorText(value) {
+            const state = apply(get, ruleOwners, [this]);
+            if (!state) throw new TypeErr('CSSRule receiver required');
+            operation(state.sheet, 'selector', state.id, string(value));
+        }
+    }
+    class CSSNamespaceRule extends CSSRule {
+        get namespaceURI() { const r = ruleInfo(this); return r.info && r.info.namespace !== null ? r.info.namespace : ''; }
+        get prefix() { const r = ruleInfo(this); return r.info && r.info.prefix !== null ? r.info.prefix : ''; }
     }
     function ruleAt(sheet, idx) {
         const info = operation(sheet, 'rule', idx); if (!info) return null;
         const state = owner(sheet);
         let rule = apply(mapGet, state.rules, [info.id]);
-        if (!rule) { rule = info.type === 1 ? new CSSStyleRule(token, sheet, info.id) : new CSSRule(token, sheet, info.id); apply(mapSet, state.rules, [info.id, rule]); }
+        if (!rule) {
+            const Kind = info.type === 1 ? CSSStyleRule : info.type === 10 ? CSSNamespaceRule : CSSRule;
+            rule = new Kind(token, sheet, info.id); apply(mapSet, state.rules, [info.id, rule]);
+        }
         return rule;
     }
     function listSheet(list) {
@@ -251,7 +264,7 @@
         get() { htmlElementBrand(this, 'style'); return rawDom.styleDisabled(this); },
         set(value) { htmlElementBrand(this, 'style'); rawDom.styleDisabled(this, !!value); }
     });
-    for (const C of [StyleSheet, CSSStyleSheet, CSSRule, CSSStyleRule, CSSRuleList, StyleSheetList]) {
+    for (const C of [StyleSheet, CSSStyleSheet, CSSRule, CSSStyleRule, CSSNamespaceRule, CSSRuleList, StyleSheetList]) {
         define(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });
         for (const name of Object.getOwnPropertyNames(C.prototype)) {
             if (name !== 'constructor') define(C.prototype, name, { ...Object.getOwnPropertyDescriptor(C.prototype, name), enumerable: true });
@@ -260,5 +273,5 @@
     for(const [name,value] of Object.entries({STYLE_RULE:1,IMPORT_RULE:3,MEDIA_RULE:4,FONT_FACE_RULE:5,PAGE_RULE:6,KEYFRAMES_RULE:7,NAMESPACE_RULE:10,SUPPORTS_RULE:12})) {
         define(CSSRule,name,{value,enumerable:true});define(CSSRule.prototype,name,{value,enumerable:true});
     }
-    Object.assign(globalThis, { StyleSheet, CSSStyleSheet, CSSRule, CSSStyleRule, CSSRuleList, StyleSheetList });
+    Object.assign(globalThis, { StyleSheet, CSSStyleSheet, CSSRule, CSSStyleRule, CSSNamespaceRule, CSSRuleList, StyleSheetList });
 })();

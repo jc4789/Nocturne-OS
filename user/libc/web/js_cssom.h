@@ -11,7 +11,7 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
     bool adoption = !strcmp(operation,"adopt");
     if (!adoption && argc>3 && JS_ToUint32(ctx,&id,argv[3])<0) goto out;
     if (argc>4 && JS_ToUint32(ctx,&index,argv[4])<0) goto out;
-    if (!strcmp(operation,"insert") || !strcmp(operation,"replace")) {
+    if (!strcmp(operation,"insert") || !strcmp(operation,"replace") || !strcmp(operation,"selector")) {
         if (argc<6) { result=JS_ThrowTypeError(ctx,"insertRule requires rule and index");goto out; }
         text=JS_ToCStringLen(ctx,&length,argv[5]);if(!text)goto out;
     }
@@ -86,7 +86,7 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
         result=error==CSSOM_OOM ? oom(ctx) : JS_NewBool(ctx,current==sheet&&sheet->associated);goto out;
     }
     if ((!strcmp(operation,"length")||!strcmp(operation,"rule")||!strcmp(operation,"ruleId")||
-         !strcmp(operation,"insert")||!strcmp(operation,"delete"))&&!sheet->origin_clean) {
+         !strcmp(operation,"insert")||!strcmp(operation,"delete")||!strcmp(operation,"selector"))&&!sheet->origin_clean) {
         result=JS_NewInt32(ctx,-CSSOM_SECURITY);goto out;
     }
     if (!strcmp(operation,"length")) { uint32_t count;css_sheet_rules(sheet->ast,&count);result=JS_NewInt64(ctx,count);goto out; }
@@ -117,6 +117,10 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
         int error=!strcmp(operation,"insert") ? cssom_insert(sheet,text,length,index) : cssom_delete(sheet,index);
         result=error==CSSOM_OOM ? oom(ctx) : JS_NewInt64(ctx,error ? -(int64_t)error : index);goto out;
     }
+    if (!strcmp(operation,"selector")) {
+        int error=cssom_rule_selector(sheet,index,text,length); /* index: the rule's id */
+        result=error==CSSOM_OOM?oom(ctx):JS_NewInt32(ctx,-error);goto out;
+    }
     if (!strcmp(operation,"rule") || !strcmp(operation,"ruleId")) {
         struct css_rule_info *r=css_sheet_rules(sheet->ast,NULL);
         if (!strcmp(operation,"rule")) { for(uint32_t i=0;r&&i<index;i++)r=r->next; }
@@ -124,14 +128,31 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
         bool attached=r!=NULL;
         if(!r&&!strcmp(operation,"ruleId")){r=sheet->removed;while(r&&r->id!=index)r=r->next;}
         if (!r) { result=JS_NULL;goto out; }
-        result=JS_NewObjectProto(ctx,JS_NULL);if(JS_IsException(result))goto out;
-        if (JS_DefinePropertyValueStr(ctx,result,"id",JS_NewInt64(ctx,r->id),JS_PROP_C_W_E)<0 ||
+        /* CSSOM reads the rule's serialization; a removed rule kept it when it left */
+        sbuf rule_text={0},selector={0};
+        if(attached){css_rule_text_serialize(r,&rule_text);if(r->type==1)css_rule_selector_serialize(r,&selector);}
+        else{sb_put(&rule_text,r->text,r->text_len);if(r->selector)sb_puts(&selector,r->selector);}
+        JSValue prefix=JS_NULL,uri=JS_NULL;
+        if(r->type==10) {
+            arena_t scratch={0};jmp_buf trap;scratch.trap=&trap;const char *p,*u;
+            if(!setjmp(trap)&&css_namespace_rule(&scratch,r->text,r->text_len,&p,&u)){
+                prefix=p?JS_NewString(ctx,p):JS_NULL;uri=JS_NewString(ctx,u?u:"");
+            }
+            ar_free(&scratch);
+        }
+        result=JS_NewObjectProto(ctx,JS_NULL);
+        if (JS_IsException(result) ||
+            JS_DefinePropertyValueStr(ctx,result,"id",JS_NewInt64(ctx,r->id),JS_PROP_C_W_E)<0 ||
             JS_DefinePropertyValueStr(ctx,result,"type",JS_NewInt64(ctx,r->type),JS_PROP_C_W_E)<0 ||
             JS_DefinePropertyValueStr(ctx,result,"attached",JS_NewBool(ctx,attached),JS_PROP_C_W_E)<0 ||
-            JS_DefinePropertyValueStr(ctx,result,"text",JS_NewStringLen(ctx,r->text,r->text_len),JS_PROP_C_W_E)<0 ||
-            JS_DefinePropertyValueStr(ctx,result,"selector",JS_NewString(ctx,r->selector ? r->selector : ""),JS_PROP_C_W_E)<0) {
-            JS_FreeValue(ctx,result);result=JS_EXCEPTION;
+            JS_DefinePropertyValueStr(ctx,result,"text",JS_NewStringLen(ctx,rule_text.p?rule_text.p:"",rule_text.n),JS_PROP_C_W_E)<0 ||
+            JS_DefinePropertyValueStr(ctx,result,"selector",JS_NewStringLen(ctx,selector.p?selector.p:"",selector.n),JS_PROP_C_W_E)<0 ||
+            JS_DefinePropertyValueStr(ctx,result,"prefix",JS_DupValue(ctx,prefix),JS_PROP_C_W_E)<0 ||
+            JS_DefinePropertyValueStr(ctx,result,"namespace",JS_DupValue(ctx,uri),JS_PROP_C_W_E)<0) {
+            if(!JS_IsException(result))JS_FreeValue(ctx,result);
+            result=JS_EXCEPTION;
         }
+        JS_FreeValue(ctx,prefix);JS_FreeValue(ctx,uri);sb_free(&rule_text);sb_free(&selector);
     } else result=JS_ThrowTypeError(ctx,"Unknown native CSSOM operation");
 out:
     JS_FreeCString(ctx,text);JS_FreeCString(ctx,operation);return result;

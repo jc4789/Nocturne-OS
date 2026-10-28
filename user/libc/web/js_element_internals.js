@@ -13,9 +13,34 @@ const elementInternalsBridge=(()=>{
         return n;
     }
     function pack(value){return formDataBridge.faceValue(value);}
+    // HTML: a custom element's states set. The Set keeps setlike's order and live
+    // iteration; the native element keeps the same names for :state().
+    const SetImpl=Set,setAdd=Set.prototype.add,setDelete=Set.prototype.delete,setHas=Set.prototype.has,setClear=Set.prototype.clear;
+    const setSize=Object.getOwnPropertyDescriptor(Set.prototype,'size').get,setValues=Set.prototype.values,setEntries=Set.prototype.entries,setForEach=Set.prototype.forEach;
+    const stateSets=new WeakMap(),stateNodes=new WeakMap();
+    function states(value){const s=call(weakGet,stateSets,[value]);if(!s)throw new TypeErr('Illegal CustomStateSet receiver');return s;}
+    class CustomStateSet{
+        constructor(key,node){if(key!==token)throw new TypeErr('Illegal constructor');call(weakSet,stateSets,[this,new SetImpl()]);call(weakSet,stateNodes,[this,node]);}
+        get size(){return call(setSize,states(this),[]);}
+        has(value){const s=states(this);return call(setHas,s,[text(value)]);}
+        add(value){const s=states(this);value=text(value);if(!call(setHas,s,[value])){rawDom.face(call(weakGet,stateNodes,[this]),'state','add',value);call(setAdd,s,[value]);}return this;}
+        delete(value){const s=states(this);value=text(value);if(!call(setHas,s,[value]))return false;rawDom.face(call(weakGet,stateNodes,[this]),'state','delete',value);return call(setDelete,s,[value]);}
+        clear(){const s=states(this);if(call(setSize,s,[])){rawDom.face(call(weakGet,stateNodes,[this]),'state','clear');call(setClear,s,[]);}}
+        entries(){return call(setEntries,states(this),[]);}
+        values(){return call(setValues,states(this),[]);}
+        forEach(callback,thisArg=undefined){
+            const s=states(this),set=this;if(typeof callback!=='function')throw new TypeErr('CustomStateSet.forEach requires a callback');
+            call(setForEach,s,[value=>{call(callback,thisArg,[value,value,set]);}]);
+        }
+    }
+    define(CustomStateSet.prototype,'keys',{value:CustomStateSet.prototype.values,writable:true,configurable:true});
+    define(CustomStateSet.prototype,Symbol.iterator,{value:CustomStateSet.prototype.values,writable:true,configurable:true});
+    define(CustomStateSet.prototype,Symbol.toStringTag,{value:'CustomStateSet',configurable:true});
+    const stateLists=new WeakMap();
     class ElementInternals{
         constructor(key,node){if(key!==token)throw new TypeErr('Illegal ElementInternals constructor');call(weakSet,owners,[this,node]);}
         get shadowRoot(){return rawDom.get(owner(this),'shadowRoot');}
+        get states(){const n=owner(this);let set=call(weakGet,stateLists,[n]);if(!set){set=new CustomStateSet(token,n);call(weakSet,stateLists,[n,set]);}return set;}
         get form(){return rawDom.face(owner(this,true),'form');}
         get willValidate(){return rawDom.validation(owner(this,true),'will');}
         get validity(){return formValidationBridge.validity(owner(this,true));}
@@ -50,5 +75,6 @@ const elementInternalsBridge=(()=>{
         const object=new ElementInternals(token,this);call(weakSet,attached,[this,object]);return object;
     }});
     define(globalThis,'ElementInternals',{value:ElementInternals,writable:true,configurable:true});
-    return {ElementInternals};
+    define(globalThis,'CustomStateSet',{value:CustomStateSet,writable:true,configurable:true});
+    return {ElementInternals,CustomStateSet};
 })();

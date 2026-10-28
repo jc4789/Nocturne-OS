@@ -29,6 +29,7 @@ struct cssom_sheet *cssom_style_sheet(web_doc *d, node_t *owner, int *error);
 struct cssom_sheet *cssom_style_find(node_t *owner, uint32_t id);
 int cssom_insert(struct cssom_sheet *sheet, const char *text, size_t length, uint32_t index);
 int cssom_delete(struct cssom_sheet *sheet, uint32_t index);
+int cssom_rule_selector(struct cssom_sheet *sheet, uint32_t id, const char *selector, size_t length);
 struct cssom_sheet *cssom_construct(web_doc *d, int *error);
 int cssom_replace_sync(struct cssom_sheet *sheet, const char *text, size_t length);
 int cssom_adopt(node_t *root, struct cssom_sheet **sheets, uint32_t count);

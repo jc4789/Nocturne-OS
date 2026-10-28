@@ -34,9 +34,9 @@ void web_face_value_free(struct web_face_value *v) {
     free(v);
 }
 static bool face_size(size_t message, struct web_face_value *value,
-                      struct web_face_value *state, size_t *out) {
+                      struct web_face_value *state, size_t states, size_t *out) {
     size_t size = sizeof(struct web_face_state), parts[] = {message,
-        value ? value->allocation : 0, state && state != value ? state->allocation : 0};
+        value ? value->allocation : 0, state && state != value ? state->allocation : 0, states};
     for (unsigned i = 0; i < sizeof parts / sizeof *parts; i++) {
         if (parts[i] > SIZE_MAX - size) return false;
         size += parts[i];
@@ -72,7 +72,7 @@ bool web_face_set_value(web_doc *d, node_t *n, struct web_face_value *value, str
         (state && state != value && state->refs == UINT_MAX)) return false;
     size_t size;
     if ((f->message && f->message_length == SIZE_MAX) ||
-        !face_size(f->message ? f->message_length + 1 : 0, value, state, &size)) return false;
+        !face_size(f->message ? f->message_length + 1 : 0, value, state, f->custom_states_length, &size)) return false;
     if (!face_charge(d, n, size)) return false;
     if (value) value->refs++;
     if (state) state->refs++;
@@ -87,7 +87,7 @@ bool web_face_set_validity(web_doc *d, node_t *n, uint32_t flags, const char *me
     if (!flags) length = 0;
     if (length == SIZE_MAX || (length && !message)) return false;
     size_t size;
-    if (!face_size(length ? length + 1 : 0, f->value, f->state, &size)) return false;
+    if (!face_size(length ? length + 1 : 0, f->value, f->state, f->custom_states_length, &size)) return false;
     char *copy = length ? malloc(length + 1) : NULL;
     if (length && !copy) return false;
     if (length) { memcpy(copy, message, length); copy[length] = 0; }
@@ -102,7 +102,43 @@ void web_face_release(node_t *n) {
     web_doc *a = n->allocation_doc ? n->allocation_doc : n->owner;
     if (a && a->control_bytes >= f->allocation) a->control_bytes -= f->allocation;
     web_face_value_free(f->value); web_face_value_free(f->state);
-    free(f->message); free(f); n->internals = NULL; n->face_associated = false;
+    free(f->message); free(f->custom_states); free(f); n->internals = NULL; n->face_associated = false;
+}
+bool web_custom_state_has(const node_t *n, const char *name) {
+    const struct web_face_state *f = n ? n->internals : NULL;
+    if (!f || !f->custom_states) return false;
+    for (const char *p = f->custom_states, *e = p + f->custom_states_length; p < e; p += strlen(p) + 1)
+        if (!strcmp(p, name)) return true;
+    return false;
+}
+bool web_custom_state_change(web_doc *d, node_t *n, char op, const char *name, size_t length) {
+    struct web_face_state *f = n ? n->internals : NULL;
+    if (!d || !f) return false;
+    /* A name holding NUL never matches :state(<ident>); only the CustomStateSet keeps it. */
+    if (op != 'c' && (!name || memchr(name, 0, length))) return true;
+    size_t old = f->custom_states_length, next = old, at = old;
+    if (op == 'c') next = 0;
+    else {
+        for (const char *p = f->custom_states, *e = p ? p + old : NULL; p && p < e; p += strlen(p) + 1)
+            if (strlen(p) == length && !memcmp(p, name, length)) { at = (size_t)(p - f->custom_states); break; }
+        if (op == 'a' ? at < old : at == old) return true; /* already in, or not in */
+        if (op == 'a' && length >= SIZE_MAX - old) return false;
+        next = op == 'a' ? old + length + 1 : old - length - 1;
+    }
+    if (op == 'a') {
+        char *grown = realloc(f->custom_states, next);
+        if (!grown) return false;
+        f->custom_states = grown;
+    }
+    size_t size;
+    if (!face_size(f->message ? f->message_length + 1 : 0, f->value, f->state, next, &size) ||
+        !face_charge(d, n, size)) return false;
+    if (op == 'c') { free(f->custom_states); f->custom_states = NULL; }
+    else if (op == 'a') { memcpy(f->custom_states + old, name, length); f->custom_states[old + length] = 0; }
+    else memmove(f->custom_states + at, f->custom_states + at + length + 1, old - at - length - 1);
+    f->custom_states_length = next; f->allocation = size;
+    css_mark_dirty(d, n);
+    return true;
 }
 node_t *web_face_validation_anchor(node_t *n) {
     node_t *anchor=n && n->face_associated && n->internals ? n->internals->anchor : NULL;
