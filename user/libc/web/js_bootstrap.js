@@ -541,10 +541,19 @@
                 dom('remove',this);
             });
         }
-        querySelector(selector) { return dom('query',this,String(selector),true); }
-        querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
-        matches(selector) { return dom('matches',this,String(selector)); }
-        closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
+        querySelector(selector) { return selectorQuery(this,selector,true); }
+        querySelectorAll(selector) { return list(selectorQuery(this,selector,false)); }
+        matches(selector) { return selectorMatches(this,String(selector),this); }
+        closest(selector) {
+            // DOM: parse once, then the inclusive ancestor elements, with this as :scope
+            selector=String(selector);
+            for(let n=this;n;){
+                if(selectorMatches(n,selector,this))return n;
+                const parent=domGet(n,'parentNode');
+                n=parent&&domGet(parent,'nodeType')===1?parent:null;
+            }
+            return null;
+        }
         getElementsByTagName(name) { name=String(name);return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,name)); }
         getElementsByTagNameNS(namespace,localName) {
             if(arguments.length<2)throw new TypeError('Namespace and local name are required');
@@ -564,6 +573,30 @@
         set style(value) { inlineStyle(this).cssText=value; }
         get dataset() { const n=this;return new Proxy({}, {get(_,k){return reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()));},set(_,k,v){reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()),v);return true;}}); }
     }
+    // DOM "scope-match a selectors string" and "match a selector": an invalid
+    // selector is a "SyntaxError" DOMException.
+    function invalidSelector(selector) { return domExceptionBridge.create('SyntaxError', "'"+selector+"' is not a valid selector"); }
+    function selectorQuery(node, selector, first) {
+        selector=String(selector);
+        const result=dom('query',node,selector,first);
+        if(result===false)throw invalidSelector(selector);
+        return result;
+    }
+    function selectorMatches(node, selector, scope) {
+        const result=dom('matches',node,selector,scope);
+        if(result===null)throw invalidSelector(selector);
+        return result;
+    }
+    // HTML FocusOptions (WebIDL dictionary, members in lexicographic order):
+    // focusVisible, or undefined when absent; preventScroll is read and kept
+    // for the conversion's observable getters.
+    function focusOptionsVisible(options) {
+        if (options === undefined || options === null) return undefined;
+        if (typeof options !== 'object' && typeof options !== 'function') throw new TypeError('FocusOptions must be an object');
+        const visible = options.focusVisible;
+        void options.preventScroll;
+        return visible === undefined ? undefined : !!visible;
+    }
     class HTMLElement extends Element {
         constructor() { return customElementsBridge.construct(new.target); }
         get offsetParent() { return dom('geometry',this,'offsetParent'); }
@@ -581,7 +614,7 @@
         set selected(v) { dom('set',this,'selected',!!v); }
         get disabled() { return reflectedAttr(this,'disabled')!==null; }
         set disabled(v) { reflectedAttr(this,'disabled',v?'':null); }
-        focus() { dom('focus',this); }
+        focus(options = undefined) { dom('focus',this,focusOptionsVisible(options)); }
         blur() { dom('blur',this); }
         click() { host.click(this); }
     }

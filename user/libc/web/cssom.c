@@ -206,7 +206,17 @@ struct cssom_sheet *cssom_style_sheet(web_doc *d, node_t *n, int *error) {
 fail_input:
     free(input.url);free(input.owned_text);return NULL;
 }
-static int replace(struct cssom_sheet *s, const char *text, size_t length, uint32_t index, bool insertion) {
+/* the sheet's rules rebuilt with one inserted at index (RULE_INSERT, text a single
+   rule), the one at index removed (RULE_DELETE), or the one at index's text set
+   (RULE_SET, text one style rule from css_rule_with_selector); rules keep their ids */
+enum { RULE_INSERT, RULE_DELETE, RULE_SET };
+static char *dup_serialized(const struct css_rule_info *r, bool selector) {
+    sbuf b = {0};
+    if (selector) css_rule_selector_serialize(r, &b); else css_rule_text_serialize(r, &b);
+    return sb_cstr(&b);
+}
+static int replace(struct cssom_sheet *s, const char *text, size_t length, uint32_t index, int mode) {
+    bool insertion = mode == RULE_INSERT;
     uint32_t count; css_sheet_rules(s->ast,&count);
     if (index > count || (!insertion && index == count)) return CSSOM_INDEX;
     if (insertion && (count == UINT32_MAX || s->next_rule_id == UINT32_MAX)) return CSSOM_OOM;
@@ -215,14 +225,16 @@ static int replace(struct cssom_sheet *s, const char *text, size_t length, uint3
     int error = CSSOM_OK;
     bool layer_statement=false;
     struct css_rule_info *removed=NULL;
-    if (!insertion) {
+    if (mode == RULE_DELETE) {
+        /* A removed rule keeps what CSSOM reads of it: its serialization. */
         struct css_rule_info *r=css_sheet_rules(s->ast,NULL);
         for(uint32_t i=0;i<index;i++)r=r->next;
         removed=calloc(1,sizeof *removed);
         if (!removed) { free(candidate);return CSSOM_OOM; }
         removed->id=r->id;removed->type=r->type;removed->layer_kind=r->layer_kind;
-        removed->text=strndup(r->text,r->text_len);removed->text_len=r->text_len;removed->selector=r->selector ? strdup(r->selector) : NULL;
-        if (!removed->text || (r->selector&&!removed->selector)) { free((void*)removed->text);free((void*)removed->selector);free(removed);free(candidate);return CSSOM_OOM; }
+        char *serialized=dup_serialized(r,false);
+        removed->text=serialized;removed->text_len=(uint32_t)strlen(serialized);
+        removed->selector=r->type==1 ? dup_serialized(r,true) : NULL;
     }
     if (insertion) {
         error=parse(s->document,candidate,text,length,s->base);
@@ -241,22 +253,22 @@ static int replace(struct cssom_sheet *s, const char *text, size_t length, uint3
     char *source=NULL; size_t used=0,cap=0; uint32_t at=0;
     struct css_rule_info *old=css_sheet_rules(s->ast,NULL);
     for (struct css_rule_info *r=old;;r=r?r->next:NULL,at++) {
-        if (insertion && at==index && (!append_text(&source,&used,&cap,text,length) ||
+        if (mode!=RULE_DELETE && at==index && (!append_text(&source,&used,&cap,text,length) ||
             (layer_statement&&!append_text(&source,&used,&cap,";",1)) || !append_text(&source,&used,&cap,"\n",1))) { error=CSSOM_OOM; break; }
         if (!r) break;
-        if (!insertion && at==index) continue;
+        if (mode!=RULE_INSERT && at==index) continue;
         if (!append_text(&source,&used,&cap,r->text,r->text_len) ||
             (r->layer_kind==1&&!append_text(&source,&used,&cap,";",1)) || !append_text(&source,&used,&cap,"\n",1)) { error=CSSOM_OOM; break; }
     }
     if (!error) error=parse(s->document,candidate,source ? source : "",used,s->base);
     free(source);
     uint32_t fresh_count; css_sheet_rules(candidate->ast,&fresh_count);
-    if (!error && fresh_count != count + (insertion ? 1u : (uint32_t)-1)) error=CSSOM_SYNTAX;
+    if (!error && fresh_count != count + (mode==RULE_INSERT ? 1u : mode==RULE_DELETE ? (uint32_t)-1 : 0u)) error=CSSOM_SYNTAX;
     if (!error) {
         struct css_rule_info *prior=old; uint32_t i=0;
         for (struct css_rule_info *r=css_sheet_rules(candidate->ast,NULL);r;r=r->next,i++) {
             if (insertion && i==index) r->id=s->next_rule_id+1;
-            else { if (!insertion && i==index) prior=prior->next; r->id=prior->id; prior=prior->next; }
+            else { if (mode==RULE_DELETE && i==index) prior=prior->next; r->id=prior->id; prior=prior->next; }
         }
         /* Unpublish all index/wrapper pointers before freeing the old AST.
            The next native layout/task scan builds from the new real AST. */
@@ -268,8 +280,31 @@ static int replace(struct cssom_sheet *s, const char *text, size_t length, uint3
     if(removed){free((void*)removed->text);free((void*)removed->selector);free(removed);}
     discard_parse(candidate); free(candidate); return error;
 }
-int cssom_insert(struct cssom_sheet *s,const char *text,size_t length,uint32_t index) { return s ? replace(s,text,length,index,true) : CSSOM_INACTIVE; }
-int cssom_delete(struct cssom_sheet *s,uint32_t index) { return s ? replace(s,NULL,0,index,false) : CSSOM_INACTIVE; }
+int cssom_insert(struct cssom_sheet *s,const char *text,size_t length,uint32_t index) { return s ? replace(s,text,length,index,RULE_INSERT) : CSSOM_INACTIVE; }
+int cssom_delete(struct cssom_sheet *s,uint32_t index) { return s ? replace(s,NULL,0,index,RULE_DELETE) : CSSOM_INACTIVE; }
+/* CSSStyleRule.selectorText's setter on the rule with id (the sheet's or a removed
+   one): the selectors parse in the sheet's namespaces, or nothing changes */
+int cssom_rule_selector(struct cssom_sheet *s, uint32_t id, const char *selector, size_t length) {
+    if (!s) return CSSOM_INACTIVE;
+    uint32_t index=0; struct css_rule_info *r=css_sheet_rules(s->ast,NULL);
+    for (;r&&r->id!=id;r=r->next) index++;
+    struct css_rule_info *removed=s->removed;
+    while (!r && removed && removed->id!=id) removed=removed->next;
+    char *names=NULL; size_t text_length=0;
+    char *text=css_rule_with_selector(r ? s->ast : NULL, r ? r : removed, selector, length, &text_length, &names);
+    if (!text) { free(names); return CSSOM_OK; }
+    int error=CSSOM_OK;
+    if (r) error=replace(s,text,text_length,index,RULE_SET);
+    else if (text_length > UINT32_MAX) error=CSSOM_OOM;
+    else {
+        free((void*)removed->text); free((void*)removed->selector);
+        removed->text=text; removed->text_len=(uint32_t)text_length; removed->selector=names;
+        return CSSOM_OK;
+    }
+    free(text); free(names);
+    /* the rebuilt sheet parses the same rules; SYNTAX here cannot come from the author */
+    return error==CSSOM_SYNTAX ? CSSOM_OK : error;
+}
 void cssom_style_text_changed(node_t *n) {
     for (;n;n=n->parent) if (!n->foreign && n->type==N_ELEM && n->tag==T_style && n->cssom_current) {
         n->cssom_current->disabled=cssom_owner_disabled(n);n->cssom_current->associated=false; n->cssom_current=NULL;

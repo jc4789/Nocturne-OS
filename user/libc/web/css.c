@@ -43,26 +43,45 @@ static bool css_can_service(void) { return !css_worker() || parallel_worker_inde
 #define setbits (css_scratch_get()->properties)
 
 /* ---------------------------------------------------------------- data structures */
-enum { SK_TAG, SK_ID, SK_CLASS, SK_ATTR, SK_PC, SK_SLOTTED, SK_ANCHOR };
+/* SK_NS: the namespace a compound's element must be in (a written prefix, or a
+   stylesheet's default namespace), first in its compound and before its SK_TAG.
+   SK_PE: a pseudo-element where it was written, for serialization; matching
+   reads only its selector's pseudo. */
+enum { SK_TAG, SK_ID, SK_CLASS, SK_ATTR, SK_PC, SK_SLOTTED, SK_ANCHOR, SK_NS, SK_PE };
 _Static_assert(PE_PLACEHOLDER != PE_SLOTTED, "pseudo-element overlaps assigned-element selector marker");
 enum { AO_EXISTS, AO_EQ, AO_INCL, AO_DASH, AO_PREFIX, AO_SUFFIX, AO_SUBSTR };
 enum { PC_FIRST_CHILD, PC_LAST_CHILD, PC_ONLY_CHILD, PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_FIRST_OF_TYPE,
        PC_LAST_OF_TYPE, PC_ONLY_OF_TYPE, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE, PC_NOT, PC_IS, PC_NEVER,
        PC_ALWAYS, PC_LINK, PC_CHECKED, PC_DISABLED, PC_ENABLED, PC_ROOT, PC_EMPTY, PC_REQUIRED, PC_OPTIONAL,
        PC_LANG, PC_PLACEHOLDER_SHOWN, PC_READ_WRITE, PC_READ_ONLY, PC_OPEN, PC_HOST, PC_FOCUS, PC_FOCUS_WITHIN, PC_HOVER, PC_ACTIVE,
-       PC_VALID, PC_INVALID, PC_IN_RANGE, PC_OUT_OF_RANGE, PC_INDETERMINATE, PC_MODAL,PC_FULLSCREEN, PC_HAS, PC_SCOPE };
+       PC_VALID, PC_INVALID, PC_IN_RANGE, PC_OUT_OF_RANGE, PC_INDETERMINATE, PC_MODAL,PC_FULLSCREEN, PC_HAS, PC_SCOPE,
+       PC_FOCUS_VISIBLE, PC_HEADING, PC_STATE, PC_DIR, PC_HOST_CONTEXT };
+/* A namespace written in a selector: none (an attribute in no namespace; a type
+   in the default namespace, or in any when there is none), *|, | or prefix|. */
+enum { NSK_DEFAULT, NSK_ANY, NSK_NONE, NSK_URI };
+struct sel_qname {
+    const char *raw;    /* SK_TAG, SK_ATTR: the local name as written */
+    const char *prefix; /* NSK_URI: the prefix as written */
+    const char *uri;    /* NSK_URI: the namespace (NULL: no namespace) */
+    uint8_t ns;         /* NSK_* */
+    bool implicit;      /* SK_NS: the stylesheet's default namespace, written as nothing */
+};
 
 struct sellist;
 struct simple {
     uint8_t kind, op, pc;
-    bool icase;
-    uint16_t tag;
-    const char *name;
+    uint8_t flag;       /* SK_ATTR: the case modifier as written, 0, 'i' or 's' */
+    bool icase;         /* SK_ATTR: 'i' */
+    bool html_list;     /* SK_ATTR: a name whose values HTML compares ASCII case-insensitively */
+    uint16_t tag;       /* SK_TAG: the HTML tag ID; :heading(): the levels 1 to 9 it lists, as bits */
+    const char *name;   /* SK_TAG, SK_ATTR: ASCII-lowercased; SK_PC, SK_PE: the serialized name */
     union {
-        const char *value; /* [attr] and :lang() */
+        const char *value; /* [attr], :lang() (each range: 'i' or 's', text, NUL; NUL), :dir(), :state(),
+                              ::part() (names, NUL each; NUL), other pseudo-element arguments */
         struct { int a, b; }; /* :nth-*(An+B) */
     };
     struct sellist *args;
+    const struct sel_qname *q; /* SK_NS; SK_TAG, SK_ATTR when written in another case or with a namespace */
 };
 struct compound {
     struct compound *left;
@@ -81,10 +100,16 @@ struct selector {
     uint32_t spec;
     uint8_t pseudo;
 };
+/* A forgiving list keeps its invalid items' text (trimmed), serialized as written
+   before the valid item at `at`; matching never reads them. */
+struct sel_raw { int at; const char *text; };
 struct sellist {
-    int n;
+    int n, nraw;
+    const struct sel_raw *raw;
     struct selector *v[];
 };
+/* @namespace: a stylesheet's declared prefixes (NULL prefix: the default) */
+struct css_namespace { const char *prefix, *uri; struct css_namespace *next; };
 
 struct decl {
     const struct propdef *p; /* NULL: a custom property */
@@ -276,6 +301,7 @@ struct sheet {
     sheet_t *import_parent,*import_first,*import_last,*import_next;
     const struct css_rule_info *import_owner;
     const char *href; /* instance request URL for DevTools; NULL: inline */
+    struct css_namespace *namespaces; /* @namespace, in source order; the parse's own */
     /* The parsed AST every instance shares, the arena that owns it, its
        identity across rescans (never reused, unlike its address), and its
        rule index, built at its first cascade. */
@@ -291,11 +317,12 @@ struct pctx {
     const char *base;
     pvec *imports;
     int nimports;
-    bool supports_probe; /* reject accepted-but-unimplemented selector fallbacks */
     unsigned rule_depth;
-    bool in_has;
     struct css_layer_decl *layer;
-    bool import_allowed;
+    bool import_allowed, namespace_allowed;
+    /* the selector being parsed: a forgiving list kept an invalid item; it
+       holds syntax this engine accepts but never matches */
+    bool forgiven, unsupported;
 };
 
 /* ---------------------------------------------------------------- scanning */
@@ -486,37 +513,12 @@ static const char *read_ident(arena_t *a, const char **ps, const char *e, bool l
     return ar_strndup(a, buf, n);
 }
 
-/* ---------------------------------------------------------------- selectors */
-static struct sellist *parse_sellist(struct pctx *pc, const char *s, const char *e, bool forgiving);
-
-static bool parse_anb(const char *s, const char *e, int *a, int *b) {
-    char buf[64];
-    size_t n = 0;
-    for (; s < e && n < sizeof buf - 1; s++)
-        if (!is_space((unsigned char)*s)) buf[n++] = (char)lower((unsigned char)*s);
-    buf[n] = 0;
-    if (!strcmp(buf, "odd")) return *a = 2, *b = 1, true;
-    if (!strcmp(buf, "even")) return *a = 2, *b = 0, true;
-    const char *p = buf;
-    char *np = strchr(buf, 'n');
-    if (np) {
-        if (p == np) *a = 1;
-        else if (np - p == 1 && *p == '-') *a = -1;
-        else if (np - p == 1 && *p == '+') *a = 1;
-        else {
-            char *end;
-            *a = (int)strtol(p, &end, 10);
-            if (end != np) return false;
-        }
-        p = np + 1;
-        if (!*p) return *b = 0, true;
-        if (*p != '+' && *p != '-') return false;
-    } else *a = 0;
-    char *end;
-    *b = (int)strtol(p, &end, 10);
-    return *end == 0 && end != p;
-}
-
+/* ---------------------------------------------------------------- selectors
+   Selectors 4 over CSS Syntax 3 tokens. A selector's text is tokenized where it
+   is parsed: comments drop out, CR and FF are newlines, NUL is U+FFFD. The tree
+   keeps what CSSOM's "serialize a selector" reads (names as written, namespace
+   prefixes, each pseudo-element where it was written, the text of a forgiving
+   list's invalid items) beside what matching reads. */
 static uint32_t spec_add(uint32_t x, uint32_t y) {
     uint32_t a = (x >> 20) + (y >> 20), b = ((x >> 10) & 1023) + ((y >> 10) & 1023), c = (x & 1023) + (y & 1023);
     if (a > 1023) a = 1023;
@@ -535,29 +537,6 @@ static uint32_t sellist_max_spec(const struct sellist *l) {
     return m;
 }
 
-static const struct {
-    const char *name;
-    uint8_t pc;
-} simple_pcs[] = {
-    {"first-child", PC_FIRST_CHILD}, {"last-child", PC_LAST_CHILD}, {"only-child", PC_ONLY_CHILD},
-    {"first-of-type", PC_FIRST_OF_TYPE}, {"last-of-type", PC_LAST_OF_TYPE}, {"only-of-type", PC_ONLY_OF_TYPE},
-    {"link", PC_LINK}, {"any-link", PC_LINK}, {"checked", PC_CHECKED}, {"disabled", PC_DISABLED},
-    {"enabled", PC_ENABLED}, {"root", PC_ROOT}, {"scope", PC_SCOPE}, {"empty", PC_EMPTY},
-    {"required", PC_REQUIRED}, {"optional", PC_OPTIONAL}, {"placeholder-shown", PC_PLACEHOLDER_SHOWN},
-    {"read-write", PC_READ_WRITE}, {"read-only", PC_READ_ONLY}, {"open", PC_OPEN}, {"defined", PC_ALWAYS},
-    {"visited", PC_NEVER}, {"hover", PC_HOVER}, {"active", PC_ACTIVE}, {"focus", PC_FOCUS},
-    {"focus-within", PC_FOCUS_WITHIN}, {"focus-visible", PC_NEVER}, {"target", PC_NEVER}, {"target-within", PC_NEVER},
-    {"indeterminate", PC_INDETERMINATE}, {"invalid", PC_INVALID}, {"valid", PC_VALID}, {"user-invalid", PC_NEVER},
-    {"user-valid", PC_NEVER}, {"default", PC_NEVER}, {"fullscreen", PC_FULLSCREEN}, {"modal", PC_MODAL},
-    {"popover-open", PC_NEVER}, {"autofill", PC_NEVER}, {"in-range", PC_IN_RANGE}, {"out-of-range", PC_OUT_OF_RANGE},
-    {"playing", PC_NEVER}, {"paused", PC_NEVER}, {"current", PC_NEVER}, {"past", PC_NEVER}, {"future", PC_NEVER},
-    {"first", PC_NEVER}, {"left", PC_NEVER}, {"right", PC_NEVER}, {"blank", PC_NEVER}, {"local-link", PC_NEVER},
-    {"host", PC_HOST}, {"state", PC_NEVER}, {"picture-in-picture", PC_NEVER}, {"-webkit-autofill", PC_NEVER},
-    {"-moz-focusring", PC_NEVER}, {"-moz-ui-invalid", PC_NEVER},
-};
-
-/* one compound selector; *ps advanced past it. pseudo receives a pseudo-element. */
-static struct sellist *parse_relative_list(struct pctx *pc, const char *s, const char *e);
 /* The growing lists of a selector start on the stack and reach the arena
    only at their final length, in the array that ends their compound or list:
    an arena keeps every capacity it ever gave. The stack parts stay small,
@@ -569,220 +548,1290 @@ static void *selector_list_grow(struct pctx *pc, const void *list, size_t n, siz
     memcpy(next, list, n * size);
     return next;
 }
-static struct compound *parse_compound(struct pctx *pc, const char **ps, const char *e, uint32_t *spec, uint8_t *pseudo) {
+
+/* ---- CSS Syntax tokens */
+enum { ST_EOF, ST_WS, ST_IDENT, ST_FUNCTION, ST_AT, ST_HASH, ST_STRING, ST_BAD_STRING, ST_URL, ST_BAD_URL,
+       ST_DELIM, ST_NUMBER, ST_PERCENT, ST_DIMENSION, ST_CDO, ST_CDC, ST_COLON, ST_SEMICOLON, ST_COMMA,
+       ST_LBRACKET, ST_RBRACKET, ST_LPAREN, ST_RPAREN, ST_LBRACE, ST_RBRACE };
+struct stok {
+    uint8_t type;
+    bool id;           /* hash: its type flag is "id" */
+    bool integer;      /* number, dimension: its type flag is "integer" */
+    bool sign;         /* number, dimension: written with + or - */
+    uint32_t delim;
+    double number;
+    const char *s, *e;   /* the token's text */
+    const char *vs, *ve; /* ident, function, at-keyword, hash: the name; string: between the quotes;
+                            dimension: the unit */
+};
+static bool st_newline(unsigned char c) { return c == '\n' || c == '\r' || c == '\f'; }
+static bool st_digit(unsigned char c) { return c >= '0' && c <= '9'; }
+/* NUL is U+FFFD, a non-ASCII code point */
+static bool st_ident_start(unsigned char c) { return ((c | 32) >= 'a' && (c | 32) <= 'z') || c == '_' || c >= 0x80 || !c; }
+static bool st_ident_char(unsigned char c) { return st_ident_start(c) || st_digit(c) || c == '-'; }
+static int st_hex(unsigned char c) {
+    return c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1;
+}
+static bool st_escape(const char *p, const char *e) {
+    return p < e && *p == '\\' && !(p + 1 < e && st_newline((unsigned char)p[1]));
+}
+/* past an escape whose backslash is just before p */
+static const char *st_escape_end(const char *p, const char *e) {
+    if (p >= e) return p;
+    if (st_hex((unsigned char)*p) >= 0) {
+        for (int k = 0; k < 6 && p < e && st_hex((unsigned char)*p) >= 0; k++) p++;
+        if (p < e && is_space((unsigned char)*p)) p += *p == '\r' && p + 1 < e && p[1] == '\n' ? 2 : 1;
+        return p;
+    }
+    p++;
+    while (p < e && ((unsigned char)*p & 0xC0) == 0x80) p++;
+    return p;
+}
+static bool st_starts_ident(const char *p, const char *e) {
+    if (p >= e) return false;
+    if (*p == '-') return p + 1 < e && (st_ident_start((unsigned char)p[1]) || p[1] == '-' || st_escape(p + 1, e));
+    if (*p == '\\') return st_escape(p, e);
+    return st_ident_start((unsigned char)*p);
+}
+static bool st_starts_number(const char *p, const char *e) {
+    if (p < e && (*p == '+' || *p == '-')) p++;
+    if (p < e && st_digit((unsigned char)*p)) return true;
+    return p + 1 < e && *p == '.' && st_digit((unsigned char)p[1]);
+}
+static const char *st_ident_end(const char *p, const char *e) {
+    while (p < e) {
+        if (st_ident_char((unsigned char)*p)) p++;
+        else if (st_escape(p, e)) p = st_escape_end(p + 1, e);
+        else break;
+    }
+    return p;
+}
+/* The next code point of a name or a string, escapes resolved (a string's
+   escaped newline is its caller's); NUL, an invalid escape and a broken
+   UTF-8 sequence are U+FFFD. */
+static uint32_t st_cp(const char **ps, const char *e) {
+    const unsigned char *p = (const unsigned char *)*ps;
+    uint32_t cp;
+    if (*p == '\\') {
+        p++;
+        if ((const char *)p >= e) { *ps = (const char *)p; return 0xFFFD; }
+        if (st_hex(*p) >= 0) {
+            cp = 0;
+            for (int k = 0; k < 6 && (const char *)p < e && st_hex(*p) >= 0; k++) cp = cp * 16 + (uint32_t)st_hex(*p++);
+            if ((const char *)p < e && is_space(*p)) p += *p == '\r' && (const char *)p + 1 < e && p[1] == '\n' ? 2 : 1;
+            if (!cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+            *ps = (const char *)p;
+            return cp;
+        }
+    }
+    cp = *p++;
+    if (cp >= 0x80) {
+        unsigned more = cp >= 0xF0 ? 3 : cp >= 0xE0 ? 2 : cp >= 0xC0 ? 1 : 0;
+        if (!more) cp = 0xFFFD;
+        else {
+            cp &= 0x3Fu >> more;
+            for (; more && (const char *)p < e && (*p & 0xC0) == 0x80; more--) cp = cp << 6 | (*p++ & 0x3Fu);
+            if (more) cp = 0xFFFD;
+        }
+    } else if (!cp) cp = 0xFFFD;
+    *ps = (const char *)p;
+    return cp;
+}
+static size_t st_decode(const char *s, const char *e, bool string, bool lowercase, char *out) {
+    size_t n = 0;
+    while (s < e) {
+        if (string && *s == '\\' && (s + 1 == e || st_newline((unsigned char)s[1]))) {
+            s += s + 1 == e ? 1 : 2 + (s[1] == '\r' && s + 2 < e && s[2] == '\n');
+            continue;
+        }
+        uint32_t cp = st_cp(&s, e);
+        if (lowercase && cp < 128) cp = (uint32_t)lower((int)cp);
+        char u[4];
+        int k = utf8_put(u, cp);
+        if (out) memcpy(out + n, u, (size_t)k);
+        n += (size_t)k;
+    }
+    return n;
+}
+/* a name's (or, string, a string's) value in the arena */
+static char *st_text(arena_t *a, const char *s, const char *e, bool string, bool lowercase) {
+    bool plain = true;
+    for (const char *p = s; p < e && plain; p++) plain = *p != '\\' && *p && !(lowercase && *p >= 'A' && *p <= 'Z');
+    if (plain) return ar_strndup(a, s, (size_t)(e - s));
+    size_t n = st_decode(s, e, string, lowercase, NULL);
+    char *out = ar_alloc(a, n + 1);
+    st_decode(s, e, string, lowercase, out);
+    out[n] = 0;
+    return out;
+}
+/* whether a name is the ASCII lowercase literal, ASCII case-insensitively */
+static bool st_is(const char *s, const char *e, const char *literal) {
+    while (s < e) {
+        if (!*literal) return false;
+        uint32_t cp = st_cp(&s, e);
+        if (cp >= 128 || lower((int)cp) != (unsigned char)*literal++) return false;
+    }
+    return !*literal;
+}
+static void st_numeric(const char **ps, const char *e, struct stok *t) {
+    const char *p = *ps;
+    double sign = 1, v = 0;
+    t->integer = true;
+    if (*p == '+' || *p == '-') { t->sign = true; if (*p == '-') sign = -1; p++; }
+    while (p < e && st_digit((unsigned char)*p)) v = v * 10 + (*p++ - '0');
+    if (p + 1 < e && *p == '.' && st_digit((unsigned char)p[1])) {
+        t->integer = false;
+        p++;
+        for (double f = 0.1; p < e && st_digit((unsigned char)*p); f /= 10) v += (*p++ - '0') * f;
+    }
+    if (p < e && (*p | 32) == 'e') {
+        const char *q = p + 1;
+        int es = 1, x = 0;
+        if (q < e && (*q == '+' || *q == '-')) { if (*q == '-') es = -1; q++; }
+        if (q < e && st_digit((unsigned char)*q)) {
+            t->integer = false;
+            for (; q < e && st_digit((unsigned char)*q); q++) if (x < 100000) x = x * 10 + (*q - '0');
+            v *= pow(10, es * x);
+            p = q;
+        }
+    }
+    t->number = sign * v;
+    if (st_starts_ident(p, e)) { t->type = ST_DIMENSION; t->vs = p; p = t->ve = st_ident_end(p, e); }
+    else if (p < e && *p == '%') { t->type = ST_PERCENT; p++; }
+    else t->type = ST_NUMBER;
+    *ps = p;
+}
+static void st_identlike(const char **ps, const char *e, struct stok *t) {
+    const char *p = *ps;
+    t->vs = p;
+    p = t->ve = st_ident_end(p, e);
+    t->type = ST_IDENT;
+    if (p < e && *p == '(') {
+        p++;
+        t->type = ST_FUNCTION;
+        if (st_is(t->vs, t->ve, "url")) {
+            const char *q = p;
+            while (q < e && is_space((unsigned char)*q)) q++;
+            if (!(q < e && (*q == '"' || *q == '\''))) {
+                t->type = ST_URL;
+                for (p = q; p < e && *p != ')';) {
+                    unsigned char c = (unsigned char)*p;
+                    if (is_space(c)) {
+                        const char *w = p;
+                        while (w < e && is_space((unsigned char)*w)) w++;
+                        p = w;
+                        if (w < e && *w != ')') t->type = ST_BAD_URL;
+                        continue;
+                    }
+                    if (c == '"' || c == '\'' || c == '(' || c == 0x7F || c == 0x0B || (c < 0x20 && c != '\t' && !st_newline(c)) ||
+                        (c == '\\' && !st_escape(p, e))) t->type = ST_BAD_URL;
+                    p = c == '\\' && st_escape(p, e) ? st_escape_end(p + 1, e) : p + 1;
+                }
+                if (p < e) p++;
+            }
+        }
+    }
+    *ps = p;
+}
+/* CSS Syntax "consume a token" from *ps, comments skipped */
+static void st_next(const char **ps, const char *e, struct stok *t) {
+    const char *p = *ps;
+    while (p + 1 < e && p[0] == '/' && p[1] == '*') {
+        const char *q = p + 2;
+        while (q + 1 < e && !(q[0] == '*' && q[1] == '/')) q++;
+        p = q + 1 < e ? q + 2 : e;
+    }
+    memset(t, 0, sizeof *t);
+    t->s = p;
+    if (p >= e) { t->type = ST_EOF; t->e = p; *ps = p; return; }
+    unsigned char c = (unsigned char)*p;
+    switch (c) {
+    case ' ': case '\t': case '\n': case '\r': case '\f':
+        while (p < e && is_space((unsigned char)*p)) p++;
+        t->type = ST_WS;
+        break;
+    case '"': case '\'':
+        t->type = ST_STRING;
+        t->vs = ++p;
+        while (p < e && (unsigned char)*p != c) {
+            if (st_newline((unsigned char)*p)) { t->type = ST_BAD_STRING; break; }
+            if (*p == '\\' && p + 1 < e) {
+                if (st_newline((unsigned char)p[1])) p += 2 + (p[1] == '\r' && p + 2 < e && p[2] == '\n');
+                else p = st_escape_end(p + 1, e);
+            } else p++;
+        }
+        t->ve = p;
+        if (t->type == ST_STRING && p < e) p++;
+        break;
+    case '#':
+        if (p + 1 < e && (st_ident_char((unsigned char)p[1]) || st_escape(p + 1, e))) {
+            t->type = ST_HASH;
+            t->id = st_starts_ident(p + 1, e);
+            t->vs = p + 1;
+            p = t->ve = st_ident_end(p + 1, e);
+        } else { t->type = ST_DELIM; t->delim = c; p++; }
+        break;
+    case '(': t->type = ST_LPAREN; p++; break;
+    case ')': t->type = ST_RPAREN; p++; break;
+    case '[': t->type = ST_LBRACKET; p++; break;
+    case ']': t->type = ST_RBRACKET; p++; break;
+    case '{': t->type = ST_LBRACE; p++; break;
+    case '}': t->type = ST_RBRACE; p++; break;
+    case ',': t->type = ST_COMMA; p++; break;
+    case ':': t->type = ST_COLON; p++; break;
+    case ';': t->type = ST_SEMICOLON; p++; break;
+    case '+': case '.':
+        if (st_starts_number(p, e)) st_numeric(&p, e, t);
+        else { t->type = ST_DELIM; t->delim = c; p++; }
+        break;
+    case '-':
+        if (st_starts_number(p, e)) st_numeric(&p, e, t);
+        else if (p + 2 < e && p[1] == '-' && p[2] == '>') { t->type = ST_CDC; p += 3; }
+        else if (st_starts_ident(p, e)) st_identlike(&p, e, t);
+        else { t->type = ST_DELIM; t->delim = c; p++; }
+        break;
+    case '<':
+        if (e - p >= 4 && !memcmp(p, "<!--", 4)) { t->type = ST_CDO; p += 4; }
+        else { t->type = ST_DELIM; t->delim = c; p++; }
+        break;
+    case '@':
+        if (st_starts_ident(p + 1, e)) { t->type = ST_AT; t->vs = p + 1; p = t->ve = st_ident_end(p + 1, e); }
+        else { t->type = ST_DELIM; t->delim = c; p++; }
+        break;
+    case '\\':
+        if (st_escape(p, e)) st_identlike(&p, e, t);
+        else { t->type = ST_DELIM; t->delim = c; p++; }
+        break;
+    default:
+        if (st_digit(c)) st_numeric(&p, e, t);
+        else if (st_ident_start(c)) st_identlike(&p, e, t);
+        else { t->type = ST_DELIM; t->delim = c; p++; }
+    }
+    t->e = p;
+    *ps = p;
+}
+/* Where the component values from p stop: at the first `close` (or, comma,
+   the first comma) outside every block they open, or at e, which closes what
+   is still open. *bad: they hold a bad string or URL, or a closer that closes
+   nothing open (the tokens <any-value> excludes). */
+static const char *st_scan(struct pctx *pc, const char *p, const char *e, int close, bool comma, bool *bad) {
+    char local[32], *stack = local;
+    size_t depth = 0, capacity = sizeof local;
+    struct stok t;
+    for (;;) {
+        st_next(&p, e, &t);
+        switch (t.type) {
+        case ST_EOF: return e;
+        case ST_FUNCTION: case ST_LPAREN: case ST_LBRACKET: case ST_LBRACE:
+            if (depth == capacity) stack = selector_list_grow(pc, stack, depth, &capacity, 1);
+            stack[depth++] = t.type == ST_LBRACKET ? ']' : t.type == ST_LBRACE ? '}' : ')';
+            break;
+        case ST_RPAREN: case ST_RBRACKET: case ST_RBRACE: {
+            char c = t.type == ST_RPAREN ? ')' : t.type == ST_RBRACKET ? ']' : '}';
+            if (depth && stack[depth - 1] == c) depth--;
+            else if (!depth && c == close) return t.s;
+            else if (bad) *bad = true;
+            break;
+        }
+        case ST_COMMA: if (comma && !depth) return t.s; break;
+        case ST_BAD_STRING: case ST_BAD_URL: if (bad) *bad = true; break;
+        default: break;
+        }
+    }
+}
+
+/* ---- CSSOM serialization */
+static void ser_code_point(sbuf *b, uint32_t cp) {
+    char t[16];
+    snprintf(t, sizeof t, "\\%x ", (unsigned)cp);
+    sb_puts(b, t);
+}
+/* CSSOM "serialize an identifier" of a decoded name */
+static void ser_ident(sbuf *b, const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    if (p[0] == '-' && !p[1]) { sb_puts(b, "\\-"); return; }
+    for (size_t i = 0; p[i]; i++) {
+        unsigned char c = p[i];
+        if (c >= 0x80) sb_putc(b, (char)c);
+        else if ((c >= 1 && c <= 0x1F) || c == 0x7F) ser_code_point(b, c);
+        else if (st_digit(c) && (i == 0 || (i == 1 && p[0] == '-'))) ser_code_point(b, c);
+        else if (c == '-' || c == '_' || st_digit(c) || ((c | 32) >= 'a' && (c | 32) <= 'z')) sb_putc(b, (char)c);
+        else { sb_putc(b, '\\'); sb_putc(b, (char)c); }
+    }
+}
+/* CSSOM "serialize a string" */
+static void ser_string(sbuf *b, const char *s) {
+    sb_putc(b, '"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if ((*p >= 1 && *p <= 0x1F) || *p == 0x7F) ser_code_point(b, *p);
+        else {
+            if (*p == '"' || *p == '\\') sb_putc(b, '\\');
+            sb_putc(b, (char)*p);
+        }
+    }
+    sb_putc(b, '"');
+}
+static void ser_int(sbuf *b, long long v) {
+    char t[24];
+    snprintf(t, sizeof t, "%lld", v);
+    sb_puts(b, t);
+}
+/* CSS Syntax "serialize <an+b>" */
+static void ser_anb(sbuf *b, int a, int c) {
+    if (!a) { ser_int(b, c); return; }
+    if (a == -1) sb_putc(b, '-');
+    else if (a != 1) ser_int(b, a);
+    sb_putc(b, 'n');
+    if (c > 0) sb_putc(b, '+');
+    if (c) ser_int(b, c);
+}
+/* a list of NUL-terminated names ending in an empty one */
+static void ser_names(sbuf *b, const char *list, const char *separator) {
+    for (const char *p = list; p && *p; p += strlen(p) + 1) {
+        if (p != list) sb_puts(b, separator);
+        ser_ident(b, p);
+    }
+}
+static void ser_list(sbuf *b, const struct sellist *l);
+static void ser_simple(sbuf *b, const struct simple *s) {
+    static const char *const matchers[] = {"", "=", "~=", "|=", "^=", "$=", "*="};
+    switch (s->kind) {
+    case SK_ID: sb_putc(b, '#'); ser_ident(b, s->name); break;
+    case SK_CLASS: sb_putc(b, '.'); ser_ident(b, s->name); break;
+    case SK_ATTR:
+        sb_putc(b, '[');
+        if (s->q && s->q->ns == NSK_ANY) sb_puts(b, "*|");
+        else if (s->q && s->q->ns == NSK_URI) { ser_ident(b, s->q->prefix); sb_putc(b, '|'); }
+        ser_ident(b, s->q ? s->q->raw : s->name);
+        if (s->op != AO_EXISTS) { sb_puts(b, matchers[s->op]); ser_string(b, s->value); }
+        if (s->flag) { sb_putc(b, ' '); sb_putc(b, (char)s->flag); }
+        sb_putc(b, ']');
+        break;
+    case SK_SLOTTED: sb_puts(b, "::slotted("); ser_list(b, s->args); sb_putc(b, ')'); break;
+    case SK_PE:
+        sb_puts(b, "::");
+        ser_ident(b, s->name); /* a ::-webkit-* name is any identifier */
+        if (s->flag) {
+            sb_putc(b, '(');
+            if (s->op) ser_names(b, s->value, " ");
+            else if (s->args) ser_list(b, s->args);
+            else sb_puts(b, s->value);
+            sb_putc(b, ')');
+        }
+        break;
+    case SK_PC:
+        sb_putc(b, ':');
+        sb_puts(b, s->name);
+        if (!s->flag) break;
+        sb_putc(b, '(');
+        switch (s->pc) {
+        case PC_NTH_CHILD: case PC_NTH_LAST_CHILD: case PC_NTH_OF_TYPE: case PC_NTH_LAST_OF_TYPE:
+            ser_anb(b, s->a, s->b);
+            if (s->args) { sb_puts(b, " of "); ser_list(b, s->args); }
+            break;
+        case PC_LANG:
+            for (const char *p = s->value; *p; p += strlen(p) + 1) {
+                if (p != s->value) sb_puts(b, ", ");
+                if (*p == 's') ser_string(b, p + 1); else ser_ident(b, p + 1);
+            }
+            break;
+        case PC_DIR: case PC_STATE: ser_ident(b, s->value); break;
+        case PC_HEADING: sb_puts(b, s->value); break;
+        default:
+            if (s->args) ser_list(b, s->args);
+            else ser_names(b, s->value, ", ");
+        }
+        sb_putc(b, ')');
+        break;
+    default: break;
+    }
+}
+static void ser_compound(sbuf *b, const struct compound *c) {
+    int i = 0;
+    bool written = false;
+    if (c->n && c->s[0].kind == SK_ANCHOR) return;
+    if (i < c->n && c->s[i].kind == SK_NS) {
+        const struct sel_qname *q = c->s[i++].q;
+        if (!q->implicit) {
+            if (q->ns == NSK_ANY) sb_putc(b, '*');
+            else if (q->ns == NSK_URI) ser_ident(b, q->prefix);
+            sb_putc(b, '|');
+            if (!(i < c->n && c->s[i].kind == SK_TAG)) sb_putc(b, '*');
+            written = true;
+        }
+    }
+    if (i < c->n && c->s[i].kind == SK_TAG) {
+        ser_ident(b, c->s[i].q ? c->s[i].q->raw : c->s[i].name);
+        i++;
+        written = true;
+    }
+    if (!written && i == c->n) sb_putc(b, '*'); /* only a universal selector */
+    for (; i < c->n; i++) ser_simple(b, &c->s[i]);
+}
+static void ser_chain(sbuf *b, const struct compound *c) {
+    if (c->left) {
+        ser_chain(b, c->left);
+        bool anchor = c->left->n == 1 && c->left->s[0].kind == SK_ANCHOR;
+        if (anchor) { if (c->comb != ' ') { sb_putc(b, c->comb); sb_putc(b, ' '); } }
+        else if (c->comb == ' ') sb_putc(b, ' ');
+        else { sb_putc(b, ' '); sb_putc(b, c->comb); sb_putc(b, ' '); }
+    }
+    ser_compound(b, c);
+}
+/* CSSOM "serialize a group of selectors"; a forgiving list's invalid items as written */
+static void ser_list(sbuf *b, const struct sellist *l) {
+    int r = 0, k = 0;
+    for (int i = 0; l && i <= l->n; i++) {
+        for (; r < l->nraw && l->raw[r].at == i; r++) {
+            if (k++) sb_puts(b, ", ");
+            sb_puts(b, l->raw[r].text);
+        }
+        if (i < l->n) {
+            if (k++) sb_puts(b, ", ");
+            ser_chain(b, l->v[i]->right);
+        }
+    }
+}
+
+/* ---- the grammar */
+enum {
+    SPF_NO_PSEUDO_ELEMENT = 1, /* the arguments of :is() :where() :not() :has() :nth-child(of) */
+    SPF_COMPOUND = 2,          /* :host() :host-context() ::slotted(): one compound selector */
+    SPF_IN_HAS = 4,            /* inside :has(): no :has() */
+    SPF_AFTER_PART = 8,        /* behind ::part(): no pseudo-class of tree structure */
+    SPF_AFTER_ELEMENT = 16,    /* behind another pseudo-element: user action pseudo-classes only */
+    SPF_AFTER_SLOTTED = 32,    /* behind ::slotted(): no pseudo-class */
+    SPF_PSEUDO_CLASSES = 64,   /* a logical pseudo-class behind a pseudo-element: pseudo-classes only */
+    SPF_RELATIVE = 128,        /* a relative selector, :has()'s */
+};
+#define SPF_BEHIND (SPF_AFTER_PART | SPF_AFTER_ELEMENT | SPF_AFTER_SLOTTED)
+struct selp { struct pctx *pc; const char *p, *e; };
+static void sp_peek(const struct selp *x, struct stok *t) { const char *p = x->p; st_next(&p, x->e, t); }
+static void sp_take(struct selp *x, struct stok *t) { st_next(&x->p, x->e, t); }
+static void sp_ws(struct selp *x) {
+    for (;;) {
+        struct stok t;
+        const char *p = x->p;
+        st_next(&p, x->e, &t);
+        if (t.type != ST_WS) return;
+        x->p = p;
+    }
+}
+static bool sp_end(struct selp *x) { struct stok t; sp_ws(x); sp_peek(x, &t); return t.type == ST_EOF; }
+/* a function's arguments: [x->p, *end), and x past its ')' */
+static struct selp sp_arguments(struct selp *x, bool *bad) {
+    struct selp a = {x->pc, x->p, NULL};
+    a.e = st_scan(x->pc, x->p, x->e, ')', false, bad);
+    x->p = a.e < x->e ? a.e + 1 : x->e;
+    return a;
+}
+static int sp_clamp(double v) { return v >= INT_MAX ? INT_MAX : v <= INT_MIN ? INT_MIN : (int)v; }
+
+enum { PCF_ACTION = 1, PCF_TREE = 2, PCF_UNSUPPORTED = 4 };
+/* Selectors 4, HTML and Shadow DOM pseudo-classes without arguments. PC_NEVER:
+   a state this user agent never enters (it has no history, autofill, WebVTT
+   time or view transition), or, PCF_UNSUPPORTED, one it does not track yet. */
+static const struct { const char *name; uint8_t pc, flags; } simple_pcs[] = {
+    {"active", PC_ACTIVE, PCF_ACTION}, {"active-view-transition", PC_NEVER, 0}, {"any-link", PC_LINK, 0},
+    {"autofill", PC_NEVER, 0}, {"buffering", PC_NEVER, PCF_UNSUPPORTED}, {"checked", PC_CHECKED, 0},
+    {"current", PC_NEVER, 0}, {"default", PC_NEVER, PCF_UNSUPPORTED}, {"defined", PC_ALWAYS, PCF_UNSUPPORTED},
+    {"disabled", PC_DISABLED, 0}, {"empty", PC_EMPTY, PCF_TREE}, {"enabled", PC_ENABLED, 0},
+    {"first-child", PC_FIRST_CHILD, PCF_TREE}, {"first-of-type", PC_FIRST_OF_TYPE, PCF_TREE},
+    {"focus", PC_FOCUS, PCF_ACTION}, {"focus-visible", PC_FOCUS_VISIBLE, PCF_ACTION},
+    {"focus-within", PC_FOCUS_WITHIN, PCF_ACTION}, {"fullscreen", PC_FULLSCREEN, 0}, {"future", PC_NEVER, 0},
+    {"heading", PC_HEADING, 0}, {"host", PC_HOST, PCF_TREE}, {"hover", PC_HOVER, PCF_ACTION},
+    {"in-range", PC_IN_RANGE, 0}, {"indeterminate", PC_INDETERMINATE, 0}, {"invalid", PC_INVALID, 0},
+    {"last-child", PC_LAST_CHILD, PCF_TREE}, {"last-of-type", PC_LAST_OF_TYPE, PCF_TREE}, {"link", PC_LINK, 0},
+    {"local-link", PC_NEVER, PCF_UNSUPPORTED}, {"modal", PC_MODAL, 0}, {"muted", PC_NEVER, PCF_UNSUPPORTED},
+    {"only-child", PC_ONLY_CHILD, PCF_TREE}, {"only-of-type", PC_ONLY_OF_TYPE, PCF_TREE}, {"open", PC_OPEN, 0},
+    {"optional", PC_OPTIONAL, 0}, {"out-of-range", PC_OUT_OF_RANGE, 0}, {"past", PC_NEVER, 0},
+    {"paused", PC_NEVER, PCF_UNSUPPORTED}, {"picture-in-picture", PC_NEVER, 0},
+    {"placeholder-shown", PC_PLACEHOLDER_SHOWN, 0}, {"playing", PC_NEVER, PCF_UNSUPPORTED},
+    {"popover-open", PC_NEVER, 0}, {"read-only", PC_READ_ONLY, 0}, {"read-write", PC_READ_WRITE, 0},
+    {"required", PC_REQUIRED, 0}, {"root", PC_ROOT, PCF_TREE}, {"scope", PC_SCOPE, PCF_TREE},
+    {"seeking", PC_NEVER, PCF_UNSUPPORTED}, {"stalled", PC_NEVER, PCF_UNSUPPORTED},
+    {"target", PC_NEVER, PCF_UNSUPPORTED}, {"target-within", PC_NEVER, PCF_UNSUPPORTED},
+    {"user-invalid", PC_NEVER, PCF_UNSUPPORTED}, {"user-valid", PC_NEVER, PCF_UNSUPPORTED}, {"valid", PC_VALID, 0},
+    {"visited", PC_NEVER, 0}, {"volume-locked", PC_NEVER, PCF_UNSUPPORTED}, {"-webkit-autofill", PC_NEVER, 0},
+};
+/* Pseudo-elements without arguments. PEF_TREE: tree-abiding, so ::slotted()
+   may precede it. PE_OTHER: parsed, never generated. */
+enum { PEF_TREE = 1 };
+static const struct { const char *name; uint8_t pe, flags; } pseudo_elements[] = {
+    {"after", PE_AFTER, PEF_TREE}, {"backdrop", PE_BACKDROP, 0}, {"before", PE_BEFORE, PEF_TREE},
+    {"checkmark", PE_OTHER, PEF_TREE}, {"column", PE_OTHER, 0}, {"cue", PE_OTHER, 0}, {"cue-region", PE_OTHER, 0},
+    {"details-content", PE_OTHER, PEF_TREE}, {"file-selector-button", PE_OTHER, PEF_TREE},
+    {"first-letter", PE_OTHER, 0}, {"first-line", PE_OTHER, 0}, {"grammar-error", PE_OTHER, 0},
+    {"marker", PE_OTHER, PEF_TREE}, {"picker-icon", PE_OTHER, PEF_TREE}, {"placeholder", PE_PLACEHOLDER, PEF_TREE},
+    {"scroll-marker", PE_OTHER, PEF_TREE}, {"scroll-marker-group", PE_OTHER, 0}, {"search-text", PE_OTHER, 0},
+    {"selection", PE_OTHER, 0}, {"spelling-error", PE_OTHER, 0}, {"target-text", PE_OTHER, 0},
+    {"view-transition", PE_OTHER, 0},
+};
+/* HTML: attribute selectors compare these attributes' values ASCII
+   case-insensitively on HTML elements in HTML documents. */
+static bool html_case_insensitive_attribute(const char *name) {
+    static const char *const names[] = {"accept", "accept-charset", "align", "alink", "axis", "bgcolor", "charset",
+        "checked", "clear", "codetype", "color", "compact", "declare", "defer", "dir", "direction", "disabled",
+        "enctype", "face", "frame", "hreflang", "http-equiv", "lang", "language", "link", "media", "method",
+        "multiple", "nohref", "noresize", "noshade", "nowrap", "readonly", "rel", "rev", "rules", "scope",
+        "scrolling", "selected", "shape", "target", "text", "type", "valign", "valuetype", "vlink"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(names[i], name)) return true;
+    return false;
+}
+
+static struct sellist *sp_list(struct pctx *pc, const char *s, const char *e, unsigned flags, bool forgiving);
+static struct sellist *sp_compound_list(struct pctx *pc, struct selp *args, unsigned flags, bool forgiving);
+
+/* A namespace prefix written in a stylesheet: the namespace its @namespace
+   declares (NULL: the empty one, no namespace); false when none declares it.
+   A DOM query declares none. */
+static bool sp_namespace(struct pctx *pc, const char *prefix, const char **uri) {
+    const struct css_namespace *found = NULL;
+    for (const struct css_namespace *n = pc->sh ? pc->sh->namespaces : NULL; n; n = n->next)
+        if (prefix ? n->prefix && !strcmp(n->prefix, prefix) : !n->prefix) found = n; /* the last declaration wins */
+    if (!found) return false;
+    *uri = found->uri && *found->uri ? found->uri : NULL;
+    return true;
+}
+static struct sel_qname *sp_qname(struct pctx *pc, uint8_t ns, const char *prefix, const char *raw) {
+    struct sel_qname *q = ar_alloc(pc->a, sizeof *q);
+    memset(q, 0, sizeof *q);
+    q->ns = ns;
+    q->prefix = prefix;
+    q->raw = raw;
+    if (ns == NSK_URI && !sp_namespace(pc, prefix, &q->uri)) return NULL;
+    return q;
+}
+/* <ns-prefix>? at x: NSK_* (*prefix for NSK_URI), x past its '|', or -1: none.
+   An ident or '*' is a prefix only when a '|' and a name or '*' follow it. */
+static int sp_prefix(struct selp *x, struct pctx *pc, const char **prefix, bool attribute) {
+    struct selp y = *x;
+    struct stok t, bar, after;
+    sp_take(&y, &t);
+    if (t.type == ST_DELIM && t.delim == '|') {
+        sp_peek(&y, &after);
+        if (after.type == ST_IDENT || (!attribute && after.type == ST_DELIM && after.delim == '*')) { *x = y; return NSK_NONE; }
+        return -1;
+    }
+    if (t.type != ST_IDENT && !(t.type == ST_DELIM && t.delim == '*')) return -1;
+    sp_take(&y, &bar);
+    if (bar.type != ST_DELIM || bar.delim != '|') return -1;
+    sp_peek(&y, &after);
+    if (!(after.type == ST_IDENT || (!attribute && after.type == ST_DELIM && after.delim == '*'))) return -1;
+    *x = y;
+    if (t.type == ST_DELIM) return NSK_ANY;
+    *prefix = st_text(pc->a, t.vs, t.ve, false, false);
+    return NSK_URI;
+}
+/* [ <wq-name> ] or [ <wq-name> <attr-matcher> <string|ident> <i|s>? ], s the '[' */
+static bool sp_attribute(struct selp *x, struct simple *s) {
+    struct pctx *pc = x->pc;
+    bool bad = false;
+    struct selp a = {pc, x->p, st_scan(pc, x->p, x->e, ']', false, &bad)};
+    x->p = a.e < x->e ? a.e + 1 : x->e;
+    if (bad) return false;
+    struct stok t;
+    const char *prefix = NULL;
+    sp_ws(&a);
+    int ns = sp_prefix(&a, pc, &prefix, true);
+    sp_take(&a, &t);
+    if (t.type != ST_IDENT) return false;
+    s->kind = SK_ATTR;
+    char *raw = st_text(pc->a, t.vs, t.ve, false, false);
+    s->name = st_text(pc->a, t.vs, t.ve, false, true);
+    if (ns == NSK_NONE) ns = -1; /* no namespace, as with no prefix */
+    if (ns >= 0 || strcmp(raw, s->name)) {
+        struct sel_qname *q = sp_qname(pc, ns >= 0 ? (uint8_t)ns : NSK_DEFAULT, prefix, raw);
+        if (!q) return false;
+        s->q = q;
+    }
+    s->html_list = html_case_insensitive_attribute(s->name);
+    sp_ws(&a);
+    sp_take(&a, &t);
+    if (t.type == ST_EOF) { s->op = AO_EXISTS; return true; }
+    if (t.type != ST_DELIM) return false;
+    static const char matchers[] = "~|^$*";
+    if (t.delim == '=') s->op = AO_EQ;
+    else {
+        const char *m = t.delim < 128 ? strchr(matchers, (int)t.delim) : NULL;
+        struct stok eq;
+        if (!m || !t.delim) return false;
+        sp_take(&a, &eq);
+        if (eq.type != ST_DELIM || eq.delim != '=') return false;
+        s->op = (uint8_t)(AO_INCL + (m - matchers));
+    }
+    sp_ws(&a);
+    sp_take(&a, &t);
+    if (t.type == ST_IDENT) s->value = st_text(pc->a, t.vs, t.ve, false, false);
+    else if (t.type == ST_STRING) s->value = st_text(pc->a, t.vs, t.ve, true, false);
+    else return false;
+    sp_ws(&a);
+    sp_take(&a, &t);
+    if (t.type == ST_IDENT) {
+        if (st_is(t.vs, t.ve, "i")) s->flag = 'i', s->icase = true;
+        else if (st_is(t.vs, t.ve, "s")) s->flag = 's';
+        else return false;
+        sp_ws(&a);
+        sp_take(&a, &t);
+    }
+    return t.type == ST_EOF;
+}
+
+/* CSS Syntax 3 "parse <an+b>" over x up to an `of` (then *of) or its end. */
+static bool sp_anb(struct selp *x, int *pa, int *pb, bool *of) {
+    struct pctx *pc = x->pc;
+    struct stok t;
+    double a = 0, b = 0;
+    const char *rest = NULL; /* what follows the n of an ident or a dimension's unit */
+    *of = false;
+    sp_ws(x);
+    sp_take(x, &t);
+    if (t.type == ST_NUMBER && t.integer) b = t.number;
+    else if (t.type == ST_DIMENSION && t.integer) {
+        const char *unit = st_text(pc->a, t.vs, t.ve, false, true);
+        if (*unit != 'n') return false;
+        a = t.number;
+        rest = unit + 1;
+    } else if (t.type == ST_IDENT || (t.type == ST_DELIM && t.delim == '+')) {
+        bool plus = t.type == ST_DELIM;
+        if (plus) { sp_take(x, &t); if (t.type != ST_IDENT) return false; }
+        const char *name = st_text(pc->a, t.vs, t.ve, false, true);
+        if (!plus && !strcmp(name, "odd")) a = 2, b = 1;
+        else if (!plus && !strcmp(name, "even")) a = 2;
+        else if (!plus && name[0] == '-' && name[1] == 'n') a = -1, rest = name + 2;
+        else if (name[0] == 'n') a = 1, rest = name + 1;
+        else return false;
+    } else return false;
+    if (rest) {
+        if (!*rest) {
+            struct selp y = *x;
+            sp_ws(&y);
+            sp_peek(&y, &t);
+            if (t.type == ST_NUMBER && t.integer && t.sign) { sp_take(&y, &t); b = t.number; *x = y; }
+            else if (t.type == ST_DELIM && (t.delim == '+' || t.delim == '-')) {
+                double sign = t.delim == '-' ? -1 : 1;
+                sp_take(&y, &t);
+                sp_ws(&y);
+                sp_take(&y, &t);
+                if (t.type != ST_NUMBER || !t.integer || t.sign) return false;
+                b = sign * t.number;
+                *x = y;
+            }
+        } else if (rest[0] == '-' && !rest[1]) {
+            sp_ws(x);
+            sp_take(x, &t);
+            if (t.type != ST_NUMBER || !t.integer || t.sign) return false;
+            b = -t.number;
+        } else if (rest[0] == '-' && st_digit((unsigned char)rest[1])) {
+            for (const char *p = rest + 1; *p; p++) {
+                if (!st_digit((unsigned char)*p)) return false;
+                if (b < 1e10) b = b * 10 + (*p - '0');
+            }
+            b = -b;
+        } else return false;
+    }
+    sp_ws(x);
+    sp_peek(x, &t);
+    if (t.type == ST_IDENT && st_is(t.vs, t.ve, "of")) { sp_take(x, &t); *of = true; }
+    else if (t.type != ST_EOF) return false;
+    *pa = sp_clamp(a);
+    *pb = sp_clamp(b);
+    return true;
+}
+/* one <ident> and nothing else: its value, or NULL */
+static const char *sp_one_ident(struct selp *x, bool lowercase) {
+    struct stok t;
+    sp_ws(x);
+    sp_take(x, &t);
+    if (t.type != ST_IDENT || !sp_end(x)) return NULL;
+    return st_text(x->pc->a, t.vs, t.ve, false, lowercase);
+}
+/* <ident>#: NUL-terminated names ending in an empty one, or NULL */
+static char *sp_idents(struct selp *x, bool comma) {
+    sbuf b = {0};
+    struct stok t;
+    char *out = NULL;
+    for (bool first = true;; first = false) {
+        sp_ws(x);
+        sp_take(x, &t);
+        if (t.type == ST_EOF && !first && !comma) break;
+        if (t.type != ST_IDENT) goto done;
+        char *name = st_text(x->pc->a, t.vs, t.ve, false, false);
+        sb_put(&b, name, strlen(name) + 1);
+        sp_ws(x);
+        sp_peek(x, &t);
+        if (t.type == ST_EOF) break;
+        if (comma) { if (t.type != ST_COMMA) goto done; sp_take(x, &t); }
+    }
+    sb_putc(&b, 0);
+    out = ar_alloc(x->pc->a, b.n);
+    memcpy(out, b.p, b.n);
+done:
+    sb_free(&b);
+    return out;
+}
+/* <ident>: the single-colon names that are pseudo-elements */
+static bool sp_legacy_element(const struct stok *t) {
+    return t->type == ST_IDENT && (st_is(t->vs, t->ve, "before") || st_is(t->vs, t->ve, "after") ||
+                                   st_is(t->vs, t->ve, "first-line") || st_is(t->vs, t->ve, "first-letter"));
+}
+/* A pseudo-class whose name (or function) is t, x past it. flags: the context's
+   restrictions, with the pseudo-element it follows. */
+static bool sp_pseudo_class(struct selp *x, struct simple *s, const struct stok *t, uint32_t *spec, unsigned flags) {
+    struct pctx *pc = x->pc;
+    s->kind = SK_PC;
+    if (t->type == ST_IDENT) {
+        size_t k = 0;
+        while (k < sizeof simple_pcs / sizeof *simple_pcs && !st_is(t->vs, t->ve, simple_pcs[k].name)) k++;
+        if (k == sizeof simple_pcs / sizeof *simple_pcs) return false;
+        unsigned f = simple_pcs[k].flags;
+        if ((flags & (SPF_AFTER_ELEMENT | SPF_AFTER_SLOTTED)) && !(f & PCF_ACTION)) return false;
+        if ((flags & SPF_AFTER_SLOTTED) || ((flags & SPF_AFTER_PART) && (f & PCF_TREE))) return false;
+        if (f & PCF_UNSUPPORTED) pc->unsupported = true;
+        s->pc = simple_pcs[k].pc;
+        s->name = simple_pcs[k].name;
+        if (s->pc == PC_HEADING) s->tag = 0x3FE; /* every level */
+        *spec = spec_add(*spec, SPEC_B);
+        return true;
+    }
+    bool bad = false;
+    struct selp args = sp_arguments(x, &bad);
+    if (bad) return false;
+    s->flag = 1;
+    const char *vs = t->vs, *ve = t->ve;
+    unsigned behind = flags & (SPF_BEHIND | SPF_PSEUDO_CLASSES);
+    if (flags & SPF_AFTER_SLOTTED) return false;
+    static const char *const logical[] = {"is", "where", "not", "-webkit-any", "-moz-any"};
+    for (size_t k = 0; k < sizeof logical / sizeof *logical; k++) {
+        if (!st_is(vs, ve, logical[k])) continue;
+        /* Behind a pseudo-element, its arguments are compounds of the pseudo-classes allowed there. */
+        unsigned inner = (flags & (SPF_COMPOUND | SPF_IN_HAS | SPF_BEHIND | SPF_PSEUDO_CLASSES)) | SPF_NO_PSEUDO_ELEMENT;
+        if (behind) inner |= SPF_COMPOUND | SPF_PSEUDO_CLASSES;
+        s->args = sp_list(pc, args.p, args.e, inner, k < 2);
+        if (!s->args) return false;
+        s->pc = k == 2 ? PC_NOT : PC_IS;
+        s->name = logical[k];
+        if (k != 1) *spec = spec_add(*spec, sellist_max_spec(s->args));
+        return true;
+    }
+    if (st_is(vs, ve, "has")) {
+        if (flags & (SPF_IN_HAS | SPF_BEHIND)) return false;
+        s->args = sp_list(pc, args.p, args.e, SPF_IN_HAS | SPF_NO_PSEUDO_ELEMENT | SPF_RELATIVE, false);
+        if (!s->args) return false;
+        s->pc = PC_HAS;
+        s->name = "has";
+        *spec = spec_add(*spec, sellist_max_spec(s->args));
+        return true;
+    }
+    static const char *const nth[] = {"nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type"};
+    static const uint8_t nthpc[] = {PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE};
+    for (int k = 0; k < 4; k++) {
+        if (!st_is(vs, ve, nth[k])) continue;
+        if (flags & SPF_BEHIND) return false;
+        bool of;
+        if (!sp_anb(&args, &s->a, &s->b, &of)) return false;
+        if (of) {
+            if (k >= 2) return false;
+            s->args = sp_list(pc, args.p, args.e, (flags & (SPF_IN_HAS | SPF_COMPOUND)) | SPF_NO_PSEUDO_ELEMENT, false);
+            if (!s->args) return false;
+        }
+        s->pc = nthpc[k];
+        s->name = nth[k];
+        *spec = spec_add(*spec, spec_add(SPEC_B, sellist_max_spec(s->args)));
+        return true;
+    }
+    *spec = spec_add(*spec, SPEC_B);
+    if (st_is(vs, ve, "lang")) {
+        if (flags & SPF_AFTER_ELEMENT) return false;
+        sbuf b = {0};
+        bool ok = true;
+        for (;;) {
+            struct stok u;
+            sp_ws(&args);
+            sp_take(&args, &u);
+            if (u.type != ST_IDENT && u.type != ST_STRING) { ok = false; break; }
+            char *range = st_text(pc->a, u.vs, u.ve, u.type == ST_STRING, false);
+            sb_putc(&b, u.type == ST_STRING ? 's' : 'i');
+            sb_put(&b, range, strlen(range) + 1);
+            sp_ws(&args);
+            sp_take(&args, &u);
+            if (u.type == ST_EOF) break;
+            if (u.type != ST_COMMA) { ok = false; break; }
+        }
+        if (ok) {
+            sb_putc(&b, 0);
+            char *list = ar_alloc(pc->a, b.n);
+            memcpy(list, b.p, b.n);
+            s->value = list;
+        }
+        sb_free(&b);
+        s->pc = PC_LANG;
+        s->name = "lang";
+        return ok;
+    }
+    if (st_is(vs, ve, "dir")) {
+        if (flags & SPF_AFTER_ELEMENT) return false;
+        s->pc = PC_DIR;
+        s->name = "dir";
+        return (s->value = sp_one_ident(&args, true)) != NULL;
+    }
+    if (st_is(vs, ve, "state")) {
+        if (flags & SPF_AFTER_ELEMENT) return false;
+        s->pc = PC_STATE;
+        s->name = "state";
+        return (s->value = sp_one_ident(&args, false)) != NULL;
+    }
+    if (st_is(vs, ve, "host") || st_is(vs, ve, "host-context")) {
+        if (flags & SPF_BEHIND) return false;
+        bool context = !st_is(vs, ve, "host");
+        s->args = sp_compound_list(pc, &args, SPF_COMPOUND | SPF_NO_PSEUDO_ELEMENT, false);
+        if (!s->args) return false;
+        s->pc = context ? PC_HOST_CONTEXT : PC_HOST;
+        s->name = context ? "host-context" : "host";
+        *spec = spec_add(*spec, sellist_max_spec(s->args));
+        return true;
+    }
+    if (st_is(vs, ve, "heading")) {
+        /* <integer>#: the levels it lists; only 1 to 9 can match */
+        sbuf b = {0};
+        bool ok = true;
+        for (;;) {
+            struct stok u;
+            sp_ws(&args);
+            sp_take(&args, &u);
+            if (u.type != ST_NUMBER || !u.integer) { ok = false; break; }
+            int level = sp_clamp(u.number);
+            if (b.n) sb_puts(&b, ", ");
+            ser_int(&b, level);
+            if (level >= 1 && level <= 9) s->tag |= (uint16_t)(1u << level);
+            sp_ws(&args);
+            sp_take(&args, &u);
+            if (u.type == ST_EOF) break;
+            if (u.type != ST_COMMA) { ok = false; break; }
+        }
+        if (ok) s->value = ar_strndup(pc->a, sb_cstr(&b), b.n);
+        sb_free(&b);
+        s->pc = PC_HEADING;
+        s->name = "heading";
+        return ok;
+    }
+    if (st_is(vs, ve, "active-view-transition-type")) {
+        s->pc = PC_NEVER;
+        s->name = "active-view-transition-type";
+        return (s->value = sp_idents(&args, true)) != NULL;
+    }
+    return false;
+}
+/* A pseudo-element whose name (or function) is u, x past it; *behind: what the
+   pseudo-classes and pseudo-elements after it may be. */
+static bool sp_pseudo_element(struct selp *x, struct simple *s, const struct stok *u, struct selector *sel,
+                              unsigned flags, unsigned *behind, uint8_t *last) {
+    struct pctx *pc = x->pc;
+    if (flags & SPF_NO_PSEUDO_ELEMENT) return false;
+    const char *vs = u->vs, *ve = u->ve;
+    uint8_t pe = PE_OTHER, pflags = 0;
+    bool part = false, slotted = false;
+    s->kind = SK_PE;
+    if (u->type == ST_IDENT) {
+        size_t k = 0;
+        while (k < sizeof pseudo_elements / sizeof *pseudo_elements && !st_is(vs, ve, pseudo_elements[k].name)) k++;
+        if (k < sizeof pseudo_elements / sizeof *pseudo_elements) {
+            s->name = pseudo_elements[k].name;
+            pe = pseudo_elements[k].pe;
+            pflags = pseudo_elements[k].flags;
+        } else {
+            /* Selectors 4 compatibility: any ::-webkit-* name is valid and never matches. */
+            char *name = st_text(pc->a, vs, ve, false, true);
+            if (strncmp(name, "-webkit-", 8) || !name[8]) return false;
+            s->name = name;
+        }
+    } else if (u->type == ST_FUNCTION) {
+        bool bad = false;
+        struct selp args = sp_arguments(x, &bad);
+        if (bad) return false;
+        s->flag = 1;
+        if (st_is(vs, ve, "slotted")) {
+            s->kind = SK_SLOTTED;
+            s->args = sp_compound_list(pc, &args, SPF_COMPOUND | SPF_NO_PSEUDO_ELEMENT, false);
+            if (!s->args) return false;
+            slotted = true;
+            pe = PE_SLOTTED;
+            sel->spec = spec_add(sel->spec, sellist_max_spec(s->args));
+        } else if (st_is(vs, ve, "part")) {
+            s->name = "part";
+            s->op = 1;
+            part = true;
+            if (!(s->value = sp_idents(&args, false))) return false;
+        } else if (st_is(vs, ve, "highlight") || st_is(vs, ve, "picker")) {
+            s->name = st_is(vs, ve, "picker") ? "picker" : "highlight";
+            const char *name = sp_one_ident(&args, false);
+            if (!name) return false;
+            sbuf b = {0};
+            ser_ident(&b, name);
+            s->value = ar_strndup(pc->a, sb_cstr(&b), b.n);
+            sb_free(&b);
+        } else if (st_is(vs, ve, "cue")) {
+            s->name = "cue";
+            s->args = sp_list(pc, args.p, args.e, SPF_NO_PSEUDO_ELEMENT, false);
+            if (!s->args) return false;
+        } else {
+            /* <pt-name-selector>: * or a name, then .classes; ::scroll-button(* | name) */
+            static const char *const named[] = {"view-transition-group", "view-transition-image-pair",
+                                                "view-transition-old", "view-transition-new", "scroll-button"};
+            size_t k = 0;
+            while (k < sizeof named / sizeof *named && !st_is(vs, ve, named[k])) k++;
+            if (k == sizeof named / sizeof *named) return false;
+            s->name = named[k];
+            sbuf b = {0};
+            struct stok t;
+            sp_ws(&args);
+            sp_take(&args, &t);
+            bool ok = t.type == ST_IDENT || (t.type == ST_DELIM && t.delim == '*');
+            if (ok && t.type == ST_IDENT) ser_ident(&b, st_text(pc->a, t.vs, t.ve, false, false));
+            else if (ok) sb_putc(&b, '*');
+            for (sp_peek(&args, &t); ok && k < 4 && t.type == ST_DELIM && t.delim == '.'; sp_peek(&args, &t)) {
+                sp_take(&args, &t);
+                sp_take(&args, &t);
+                if (t.type != ST_IDENT) { ok = false; break; }
+                sb_putc(&b, '.');
+                ser_ident(&b, st_text(pc->a, t.vs, t.ve, false, false));
+            }
+            ok = ok && sp_end(&args);
+            s->value = ar_strndup(pc->a, sb_cstr(&b), b.n);
+            sb_free(&b);
+            if (!ok) return false;
+        }
+    } else return false;
+    /* what may follow which pseudo-element: anything but ::part() and ::slotted()
+       follows ::part(); tree-abiding ones follow ::slotted(); ::marker follows
+       ::before and ::after */
+    if (*behind & SPF_AFTER_PART) { if (part || slotted) return false; }
+    else if (*behind & SPF_AFTER_SLOTTED) { if (!(pflags & PEF_TREE)) return false; }
+    else if (*behind) { if (!(*last == PE_BEFORE || *last == PE_AFTER) || !s->name || strcmp(s->name, "marker")) return false; }
+    s->pc = pe;
+    *behind = part ? SPF_AFTER_PART : slotted ? SPF_AFTER_SLOTTED : SPF_AFTER_ELEMENT;
+    *last = pe;
+    /* The cascade generates one pseudo-element of an element; a chain of them never matches. */
+    sel->pseudo = sel->pseudo || part ? PE_OTHER : pe;
+    if (sel->pseudo == PE_OTHER) pc->unsupported = true;
+    sel->spec = spec_add(sel->spec, SPEC_C);
+    return true;
+}
+/* <type-selector> at a compound's start into *s: 1 parsed, 0 none, -1 invalid */
+static int sp_type(struct selp *x, struct simple *tmp, int *n, bool *universal, uint32_t *spec) {
+    struct pctx *pc = x->pc;
+    const char *prefix = NULL;
+    int ns = sp_prefix(x, pc, &prefix, false);
+    struct stok t;
+    sp_peek(x, &t);
+    bool star = t.type == ST_DELIM && t.delim == '*';
+    if (!star && t.type != ST_IDENT) return ns < 0 ? 0 : -1;
+    sp_take(x, &t);
+    const char *uri = NULL;
+    bool implicit = ns < 0 && sp_namespace(pc, NULL, &uri);
+    /* Without a default namespace, *| is what nothing written means. */
+    if (ns == NSK_ANY && !sp_namespace(pc, NULL, &uri)) ns = -1;
+    if (ns >= 0 || implicit) {
+        struct sel_qname *q = sp_qname(pc, implicit ? NSK_URI : (uint8_t)ns, prefix, NULL);
+        if (!q) return -1;
+        if (implicit) { q->uri = uri; q->implicit = true; }
+        struct simple *s = &tmp[(*n)++];
+        memset(s, 0, sizeof *s);
+        s->kind = SK_NS;
+        s->q = q;
+    }
+    if (star) { *universal = true; return 1; }
+    struct simple *s = &tmp[(*n)++];
+    memset(s, 0, sizeof *s);
+    s->kind = SK_TAG;
+    s->name = st_text(pc->a, t.vs, t.ve, false, true);
+    char *raw = st_text(pc->a, t.vs, t.ve, false, false);
+    if (strcmp(raw, s->name)) {
+        struct sel_qname *q = ar_alloc(pc->a, sizeof *q);
+        memset(q, 0, sizeof *q);
+        q->raw = raw;
+        s->q = q;
+    }
+    s->tag = (uint16_t)tag_lookup(s->name, strlen(s->name));
+    *spec = spec_add(*spec, SPEC_C);
+    return 1;
+}
+/* one <compound-selector> with its pseudo-elements at x, or NULL */
+static struct compound *sp_compound(struct selp *x, struct selector *sel, unsigned flags) {
+    struct pctx *pc = x->pc;
     struct simple local[4], *tmp = local;
     size_t capacity = sizeof local / sizeof *local;
     int n = 0;
-    const char *s = *ps;
-    bool type_seen = false, universal = false;
-    while (s < e) {
-        if ((size_t)n == capacity) tmp = selector_list_grow(pc, tmp, (size_t)n, &capacity, sizeof *tmp);
-        char c = *s;
-        struct simple *x = &tmp[n];
-        memset(x, 0, sizeof *x);
-        if (*pseudo && c != ':') return NULL; /* nothing may follow a pseudo-element but pseudo-classes */
-        if (c == '*') {
-            if (pc->supports_probe && (type_seen || n)) return NULL;
-            type_seen = true;
-            universal = true;
-            s++;
-            if (s < e && *s == '|') return NULL;
-            continue;
-        }
-        if (ident_char((unsigned char)c) || c == '\\') {
-            if (pc->supports_probe && (type_seen || isdigit((unsigned char)c) ||
-                (c == '-' && s + 1 < e && isdigit((unsigned char)s[1])))) return NULL;
-            type_seen = true;
-            if (n) return NULL;
-            const char *name = read_ident(pc->a, &s, e, true);
-            if (!name || (s < e && *s == '|')) return NULL;
-            x->kind = SK_TAG;
-            x->name = name;
-            x->tag = (uint16_t)tag_lookup(name, strlen(name));
-            *spec = spec_add(*spec, SPEC_C);
-            n++;
-            continue;
-        }
-        if (c == '#' || c == '.') {
-            s++;
-            if (pc->supports_probe && s < e && (isdigit((unsigned char)*s) ||
-                (*s == '-' && s + 1 < e && isdigit((unsigned char)s[1])))) return NULL;
-            const char *name = read_ident(pc->a, &s, e, false);
-            if (!name) return NULL;
-            x->kind = c == '#' ? SK_ID : SK_CLASS;
-            x->name = name;
-            *spec = spec_add(*spec, c == '#' ? SPEC_A : SPEC_B);
-            n++;
-            continue;
-        }
-        if (c == '[') {
-            const char *close = scan_to(s + 1, e, "]");
-            if (close >= e) return NULL;
-            const char *p = skip_ws(s + 1, close);
-            const char *name = read_ident(pc->a, &p, close, true);
-            if (!name) return NULL;
-            x->kind = SK_ATTR;
-            x->name = name;
-            p = skip_ws(p, close);
-            if (p < close) {
-                static const char ops[] = "=~|^$*";
-                const char *o = strchr(ops, *p);
-                if (!o || !*p) return NULL;
-                if (*p == '=') x->op = AO_EQ, p++;
-                else {
-                    if (p + 1 >= close || p[1] != '=') return NULL;
-                    x->op = (uint8_t)(AO_INCL + (o - ops - 1));
-                    p += 2;
-                }
-                p = skip_ws(p, close);
-                if (p < close && (*p == '"' || *p == '\'')) {
-                    char q = *p++;
-                    const char *vs = p;
-                    while (p < close && *p != q) p += *p == '\\' ? 2 : 1;
-                    sbuf b = {0};
-                    css_unescape(&b, vs, (size_t)(p - vs));
-                    x->value = ar_strndup(pc->a, b.p ? b.p : "", b.n);
-                    sb_free(&b);
-                    if (p < close) p++;
-                } else {
-                    x->value = read_ident(pc->a, &p, close, false);
-                    if (!x->value) {
-                        /* bare numbers like [colspan=2] */
-                        const char *vs = p;
-                        while (p < close && !is_space((unsigned char)*p)) p++;
-                        if (p == vs) return NULL;
-                        x->value = ar_strndup(pc->a, vs, (size_t)(p - vs));
-                    }
-                }
-                p = skip_ws(p, close);
-                if (p < close && (*p | 32) == 'i') x->icase = true, p++;
-                else if (p < close && (*p | 32) == 's') p++;
-                if (skip_ws(p, close) != close) return NULL;
-            }
-            if (!strcmp(name, "type")) x->icase = true;
-            *spec = spec_add(*spec, SPEC_B);
-            s = close + 1;
-            n++;
-            continue;
-        }
-        if (c == ':') {
-            bool elem = s + 1 < e && s[1] == ':';
-            s += elem ? 2 : 1;
-            const char *name = read_ident(pc->a, &s, e, true);
-            if (!name) return NULL;
-            const char *args = NULL, *args_end = NULL;
-            if (s < e && *s == '(') {
-                args = s + 1;
-                args_end = scan_to(args, e, ")");
-                if (args_end >= e) return NULL;
-                s = args_end + 1;
-            }
-            if (elem || (!args && (!strcmp(name, "before") || !strcmp(name, "after") ||
-                                   !strcmp(name, "first-line") || !strcmp(name, "first-letter")))) {
-                if (pc->in_has) return NULL; /* no :has-allowed pseudo-elements are defined */
-                if (*pseudo) return NULL;
-                if (!strcmp(name, "slotted") && args) {
-                    x->args = parse_sellist(pc, args, args_end, false);
-                    if (!x->args || x->args->n != 1 || x->args->v[0]->pseudo || x->args->v[0]->right->left) return NULL;
-                    x->kind = SK_SLOTTED;
-                    *pseudo = PE_SLOTTED;
-                    *spec = spec_add(*spec, spec_add(SPEC_C, sellist_max_spec(x->args)));
-                    n++;
-                    continue;
-                }
-                if (!strcmp(name, "before")) *pseudo = PE_BEFORE;
-                else if (!strcmp(name, "after")) *pseudo = PE_AFTER;
-                else if (!strcmp(name, "backdrop")) *pseudo = PE_BACKDROP;
-                else if (!strcmp(name, "placeholder")) {
-                    if (args) return NULL;
-                    *pseudo = PE_PLACEHOLDER;
-                }
-                else if (!strncmp(name, "-webkit-", 8) || !strncmp(name, "-moz-", 5) || !strncmp(name, "-ms-", 4))
-                    return NULL;
-                else if (pc->supports_probe) return NULL;
-                else *pseudo = PE_OTHER;
-                *spec = spec_add(*spec, SPEC_C);
-                continue;
-            }
-            x->kind = SK_PC;
-            if (args) {
-                if (!strcmp(name, "not") || !strcmp(name, "is") || !strcmp(name, "where") ||
-                    !strcmp(name, "matches") || !strcmp(name, "-webkit-any") || !strcmp(name, "-moz-any") ||
-                    !strcmp(name, "any")) {
-                    bool forgiving = !pc->supports_probe && strcmp(name, "not") != 0;
-                    x->args = parse_sellist(pc, args, args_end, forgiving);
-                    if (!x->args) return NULL;
-                    x->pc = !strcmp(name, "not") ? PC_NOT : PC_IS;
-                    if (strcmp(name, "where")) *spec = spec_add(*spec, sellist_max_spec(x->args));
-                } else if (!strcmp(name, "has")) {
-                    if (pc->in_has) return NULL;
-                    pc->in_has = true;
-                    x->args = parse_relative_list(pc, args, args_end);
-                    pc->in_has = false;
-                    if (!x->args) return NULL;
-                    x->pc = PC_HAS;
-                    *spec = spec_add(*spec, sellist_max_spec(x->args));
-                } else if (!strncmp(name, "nth-", 4)) {
-                    if (pc->supports_probe && args_end - args >= 64) return NULL;
-                    static const char *const nth[] = {"nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type"};
-                    static const uint8_t nthpc[] = {PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE};
-                    int k = 0;
-                    while (k < 4 && strcmp(name, nth[k])) k++;
-                    if (k == 4) return NULL;
-                    x->pc = nthpc[k];
-                    const char *ae = args_end;
-                    for (const char *q = args; q + 3 < ae; q++) /* "An+B of S": the S is ignored */
-                        if (is_space((unsigned char)q[0]) && strn_ieq(q + 1, "of", 2) && is_space((unsigned char)q[3])) {
-                            if (pc->supports_probe) return NULL;
-                            ae = q;
-                            break;
-                        }
-                    if (!parse_anb(args, ae, &x->a, &x->b)) return NULL;
-                    *spec = spec_add(*spec, SPEC_B);
-                } else if (!strcmp(name, "lang")) {
-                    const char *p = skip_ws(args, args_end);
-                    const char *ve = args_end;
-                    trim_r(p, &ve);
-                    if (p < ve && (*p == '"' || *p == '\'')) p++, ve--;
-                    x->pc = PC_LANG;
-                    x->value = ar_strndup(pc->a, p, (size_t)(ve > p ? ve - p : 0));
-                    *spec = spec_add(*spec, SPEC_B);
-                } else if (!strcmp(name, "dir")) {
-                    if (pc->supports_probe) return NULL;
-                    const char *p = skip_ws(args, args_end);
-                    x->pc = strn_ieq(p, "ltr", 3) ? PC_ALWAYS : PC_NEVER;
-                    *spec = spec_add(*spec, SPEC_B);
-                } else if (!strcmp(name, "host")) {
-                    x->args = parse_sellist(pc, args, args_end, false);
-                    if (!x->args || x->args->n != 1 || x->args->v[0]->pseudo || x->args->v[0]->right->left) return NULL;
-                    x->pc = PC_HOST;
-                    *spec = spec_add(*spec, spec_add(SPEC_B, sellist_max_spec(x->args)));
-                } else if (!strcmp(name, "host-context") || !strcmp(name, "state") ||
-                           !strcmp(name, "active-view-transition-type")) {
-                    if (pc->supports_probe) return NULL;
-                    x->pc = PC_NEVER;
-                } else return NULL;
-                n++;
-                continue;
-            }
-            size_t k = 0;
-            while (k < sizeof simple_pcs / sizeof *simple_pcs && strcmp(simple_pcs[k].name, name)) k++;
-            if (k == sizeof simple_pcs / sizeof *simple_pcs) return NULL;
-            x->pc = simple_pcs[k].pc;
-            if (pc->supports_probe && (x->pc == PC_NEVER || x->pc == PC_ALWAYS)) return NULL;
-            *spec = spec_add(*spec, SPEC_B);
-            n++;
-            continue;
-        }
-        break;
+    bool universal = false;
+    unsigned behind = 0; /* SPF_AFTER_*: the pseudo-element the rest belongs to */
+    uint8_t last = PE_NONE;
+    if (!(flags & SPF_PSEUDO_CLASSES)) {
+        if (capacity - (size_t)n < 2) tmp = selector_list_grow(pc, tmp, (size_t)n, &capacity, sizeof *tmp);
+        if (sp_type(x, tmp, &n, &universal, &sel->spec) < 0) return NULL;
     }
-    if (s == *ps) return NULL;
-    *ps = s;
-    struct compound *cp = ar_alloc(pc->a, sizeof *cp + (size_t)n * sizeof *tmp);
-    cp->n = n;
-    cp->universal = universal;
-    memcpy(cp->s, tmp, (size_t)n * sizeof *tmp);
-    return cp;
+    for (;;) {
+        struct stok t;
+        sp_peek(x, &t);
+        if ((size_t)n == capacity) tmp = selector_list_grow(pc, tmp, (size_t)n, &capacity, sizeof *tmp);
+        struct simple *s = &tmp[n];
+        memset(s, 0, sizeof *s);
+        if (t.type == ST_HASH || t.type == ST_LBRACKET || (t.type == ST_DELIM && t.delim == '.')) {
+            if (behind || (flags & SPF_PSEUDO_CLASSES)) return NULL;
+            sp_take(x, &t);
+            if (t.type == ST_HASH) {
+                if (!t.id) return NULL;
+                s->kind = SK_ID;
+                s->name = st_text(pc->a, t.vs, t.ve, false, false);
+                sel->spec = spec_add(sel->spec, SPEC_A);
+            } else if (t.type == ST_LBRACKET) {
+                if (!sp_attribute(x, s)) return NULL;
+                sel->spec = spec_add(sel->spec, SPEC_B);
+            } else {
+                sp_take(x, &t);
+                if (t.type != ST_IDENT) return NULL;
+                s->kind = SK_CLASS;
+                s->name = st_text(pc->a, t.vs, t.ve, false, false);
+                sel->spec = spec_add(sel->spec, SPEC_B);
+            }
+            n++;
+            continue;
+        }
+        if (t.type != ST_COLON) break;
+        sp_take(x, &t);
+        struct stok u;
+        sp_take(x, &u);
+        bool element = u.type == ST_COLON;
+        if (element) sp_take(x, &u);
+        else element = sp_legacy_element(&u);
+        if (element) {
+            if (!sp_pseudo_element(x, s, &u, sel, flags, &behind, &last)) return NULL;
+        } else {
+            if (u.type != ST_IDENT && u.type != ST_FUNCTION) return NULL;
+            if (!sp_pseudo_class(x, s, &u, &sel->spec, flags | behind)) return NULL;
+        }
+        n++;
+    }
+    if (!n && !universal) return NULL;
+    struct compound *c = ar_alloc(pc->a, sizeof *c + (size_t)n * sizeof *tmp);
+    c->left = NULL;
+    c->comb = 0;
+    c->n = n;
+    c->universal = universal;
+    memcpy(c->s, tmp, (size_t)n * sizeof *tmp);
+    return c;
+}
+/* one <complex-selector> (relative: <relative-selector>) filling x, or NULL */
+static struct selector *sp_complex(struct selp *x, unsigned flags) {
+    struct pctx *pc = x->pc;
+    struct selector *sel = ar_alloc(pc->a, sizeof *sel);
+    memset(sel, 0, sizeof *sel);
+    struct compound *cur = NULL;
+    char comb = ' ';
+    struct stok t;
+    sp_ws(x);
+    if (flags & SPF_RELATIVE) {
+        /* an internal, zero-specificity anchor; not :scope, which still means the query's root */
+        sp_peek(x, &t);
+        if (t.type == ST_DELIM && (t.delim == '>' || t.delim == '+' || t.delim == '~')) {
+            comb = (char)t.delim;
+            sp_take(x, &t);
+            sp_ws(x);
+        }
+        cur = ar_alloc(pc->a, sizeof *cur + sizeof *cur->s);
+        memset(cur, 0, sizeof *cur + sizeof *cur->s);
+        cur->n = 1;
+        cur->s[0].kind = SK_ANCHOR;
+    }
+    for (;;) {
+        struct compound *c = sp_compound(x, sel, flags & ~SPF_RELATIVE);
+        if (!c) return NULL;
+        c->left = cur;
+        c->comb = cur ? comb : 0;
+        cur = c;
+        sp_peek(x, &t);
+        bool ws = t.type == ST_WS;
+        if (ws) { sp_take(x, &t); sp_peek(x, &t); }
+        if (t.type == ST_EOF) break;
+        if (t.type == ST_DELIM && (t.delim == '>' || t.delim == '+' || t.delim == '~')) {
+            comb = (char)t.delim;
+            sp_take(x, &t);
+            sp_ws(x);
+        } else if (ws) comb = ' ';
+        else return NULL;
+        /* a pseudo-element ends its selector; a compound context has no combinator */
+        if (sel->pseudo || (flags & SPF_COMPOUND)) return NULL;
+    }
+    sel->right = cur;
+    return sel;
+}
+/* A selector list over [s, e): non-forgiving, the first invalid item fails it;
+   forgiving, an invalid item is kept as its text, unless it holds a token
+   <any-value> excludes. */
+static struct sellist *sp_list(struct pctx *pc, const char *s, const char *e, unsigned flags, bool forgiving) {
+    struct selector *local[8], **v = local;
+    struct sel_raw rlocal[4], *raw = rlocal;
+    size_t capacity = sizeof local / sizeof *local, rcapacity = sizeof rlocal / sizeof *rlocal;
+    int n = 0, nraw = 0;
+    for (const char *p = s;;) {
+        bool bad = false;
+        const char *stop = st_scan(pc, p, e, 0, true, &bad);
+        struct selp x = {pc, p, stop};
+        struct selector *sel = bad ? NULL : sp_complex(&x, flags);
+        if (sel && !sp_end(&x)) sel = NULL;
+        if (sel) {
+            if ((size_t)n == capacity) v = selector_list_grow(pc, v, (size_t)n, &capacity, sizeof *v);
+            v[n++] = sel;
+        } else {
+            if (!forgiving || bad) return NULL;
+            const char *ts = skip_ws(p, stop), *te = stop;
+            trim_r(ts, &te);
+            if ((size_t)nraw == rcapacity) raw = selector_list_grow(pc, raw, (size_t)nraw, &rcapacity, sizeof *raw);
+            raw[nraw].at = n;
+            raw[nraw++].text = ar_strndup(pc->a, ts, (size_t)(te - ts));
+            pc->forgiven = true;
+        }
+        if (stop >= e) break;
+        p = stop + 1;
+    }
+    struct sellist *l = ar_alloc(pc->a, sizeof *l + (size_t)n * sizeof *v);
+    l->n = n;
+    l->nraw = nraw;
+    l->raw = NULL;
+    if (nraw) {
+        struct sel_raw *kept = ar_alloc(pc->a, (size_t)nraw * sizeof *kept);
+        memcpy(kept, raw, (size_t)nraw * sizeof *kept);
+        l->raw = kept;
+    }
+    memcpy(l->v, v, (size_t)n * sizeof *v);
+    return l;
+}
+/* a <compound-selector> argument (:host(), :host-context(), ::slotted()) as a one-item list */
+static struct sellist *sp_compound_list(struct pctx *pc, struct selp *args, unsigned flags, bool forgiving) {
+    struct sellist *l = sp_list(pc, args->p, args->e, flags, forgiving);
+    return l && l->n == 1 && !l->nraw ? l : NULL;
+}
+
+/* A style rule's <selector-list>, a DOM query's or a selectorText's: the whole
+   text, else NULL. pc->sh supplies the declared namespaces (none: a query). */
+static struct sellist *selector_list_parse(struct pctx *pc, const char *s, const char *e) {
+    pc->forgiven = pc->unsupported = false;
+    return sp_list(pc, s, e, 0, false);
+}
+/* @supports selector(<complex-selector>): it parses, without a forgiven item,
+   and this engine matches all of it. */
+static bool selector_supported(arena_t *a, const char *s, const char *e) {
+    struct pctx pc = {.a = a};
+    bool bad = false;
+    if (st_scan(&pc, s, e, 0, true, &bad) != e || bad) return false;
+    struct selp x = {&pc, s, e};
+    struct selector *sel = sp_complex(&x, 0);
+    return sel && sp_end(&x) && !pc.forgiven && !pc.unsupported;
+}
+/* CSS Namespaces: an @namespace prelude [s, e), `<namespace-prefix>? [<string> | <url>]`:
+   its prefix (NULL: the default namespace) and URI */
+static bool namespace_prelude(arena_t *a, const char *s, const char *e, const char **prefix, const char **uri) {
+    struct pctx pc = {.a = a};
+    struct selp x = {&pc, s, e};
+    struct stok t;
+    *prefix = *uri = NULL;
+    sp_ws(&x);
+    sp_take(&x, &t);
+    if (t.type == ST_IDENT) {
+        *prefix = st_text(a, t.vs, t.ve, false, false);
+        sp_ws(&x);
+        sp_take(&x, &t);
+    }
+    if (t.type == ST_STRING) *uri = st_text(a, t.vs, t.ve, true, false);
+    else if (t.type == ST_URL) {
+        const char *vs = t.ve + 1, *ve = t.e;
+        if (ve > vs && ve[-1] == ')') ve--;
+        vs = skip_ws(vs, ve);
+        trim_r(vs, &ve);
+        *uri = st_text(a, vs, ve, false, false);
+    } else if (t.type == ST_FUNCTION && st_is(t.vs, t.ve, "url")) {
+        struct stok u;
+        sp_ws(&x);
+        sp_take(&x, &u);
+        if (u.type != ST_STRING) return false;
+        *uri = st_text(a, u.vs, u.ve, true, false);
+        sp_ws(&x);
+        sp_take(&x, &u);
+        if (u.type != ST_RPAREN) return false;
+    } else return false;
+    return sp_end(&x);
+}
+bool css_namespace_rule(arena_t *a, const char *text, size_t length, const char **prefix, const char **uri) {
+    const char *s = text, *e = text + length;
+    s = skip_ws(s, e);
+    if (e - s < 10 || !strn_ieq(s, "@namespace", 10)) return false;
+    s += 10;
+    while (e > s && (is_space((unsigned char)e[-1]) || e[-1] == ';')) e--;
+    return namespace_prelude(a, s, e, prefix, uri);
+}
+/* CSSOM "serialize a group of selectors" of a parsed style rule */
+void css_rule_selector_serialize(const struct css_rule_info *info, sbuf *out) {
+    const struct rule *r = info ? info->native_rule : NULL;
+    if (r && r->sel) ser_list(out, r->sel);
+}
+/* where a style rule's text has its block (the parser's own scan) */
+static const char *rule_block(const char *text, size_t length) {
+    const char *s = skip_ws(text, text + length);
+    return scan_to(s, text + length, "{;}");
+}
+/* CSSOM "serialize a CSS rule": a style rule's selectors as serialized, then its
+   block as written; an @namespace rule from its prefix and URI; any other rule
+   as written */
+void css_rule_text_serialize(const struct css_rule_info *info, sbuf *out) {
+    if (info->type == 1 && info->native_rule) {
+        const char *block = rule_block(info->text, info->text_len);
+        css_rule_selector_serialize(info, out);
+        sb_putc(out, ' ');
+        sb_put(out, block, (size_t)(info->text + info->text_len - block));
+        return;
+    }
+    if (info->type == 10) {
+        arena_t a = {0};
+        jmp_buf trap;
+        a.trap = &trap;
+        const char *prefix, *uri;
+        if (!setjmp(trap) && css_namespace_rule(&a, info->text, info->text_len, &prefix, &uri)) {
+            sb_puts(out, "@namespace ");
+            if (prefix) { ser_ident(out, prefix); sb_putc(out, ' '); }
+            sb_puts(out, "url(");
+            ser_string(out, uri ? uri : "");
+            sb_puts(out, ");");
+            ar_free(&a);
+            return;
+        }
+        ar_free(&a);
+    }
+    sb_put(out, info->text, info->text_len);
+}
+/* CSSOM selectorText's setter: the style rule's text with the selectors parsed
+   from [selector, +length) in the namespaces of sheet (NULL: a removed rule's,
+   none), serialized, and its block as it was; NULL when they do not parse.
+   *selector_out gets the serialized selectors alone. Both are malloc'd. */
+char *css_rule_with_selector(const sheet_t *sheet, const struct css_rule_info *info, const char *selector,
+                             size_t length, size_t *out_length, char **selector_out) {
+    *selector_out = NULL;
+    if (!info || info->type != 1) return NULL;
+    arena_t a = {0};
+    jmp_buf trap;
+    a.trap = &trap;
+    if (setjmp(trap)) { ar_free(&a); return NULL; } /* the parse's scratch ran out */
+    struct pctx pc = {.a = &a, .sh = (sheet_t *)sheet};
+    struct sellist *l = selector_list_parse(&pc, selector, selector + length);
+    if (!l) { ar_free(&a); return NULL; }
+    sbuf names = {0}, b = {0};
+    ser_list(&names, l);
+    ar_free(&a);
+    const char *block = rule_block(info->text, info->text_len);
+    sb_put(&b, names.p ? names.p : "", names.n);
+    sb_putc(&b, ' ');
+    sb_put(&b, block, (size_t)(info->text + info->text_len - block));
+    *out_length = b.n;
+    *selector_out = sb_cstr(&names);
+    return sb_cstr(&b);
 }
 
 /* ---------------------------------------------------------------- the ancestor filter
@@ -849,8 +1898,8 @@ static void selector_ancestor_hashes(const struct selector *sel, uint32_t hashes
                 uint32_t h = 0;
                 if (pass == 0 && (x->kind == SK_ID || x->kind == SK_CLASS))
                     h = ancestor_feature_hash(x->kind == SK_ID ? '#' : '.', x->name, strlen(x->name));
-                else if (pass == 1 && x->kind == SK_TAG)
-                    h = x->tag ? ancestor_tag_hash(x->tag) : ancestor_feature_hash('<', x->name, strlen(x->name));
+                else if (pass == 1 && x->kind == SK_TAG) /* a name written with uppercase matches others by name */
+                    h = x->tag && !x->q ? ancestor_tag_hash(x->tag) : ancestor_feature_hash('<', x->name, strlen(x->name));
                 if (h) hashes[n++] = h;
             }
         }
@@ -866,88 +1915,6 @@ static bool ancestor_filter_rejects(const struct ancestor_view *v, const uint32_
             !ancestor_bit(v->base, v->counts, (h >> 11) & (ANCESTOR_FILTER_BITS - 1))) return true;
     }
     return false;
-}
-
-static struct selector *parse_complex(struct pctx *pc, const char *s, const char *e) {
-    struct selector *sel = ar_alloc(pc->a, sizeof *sel);
-    struct compound *cur = NULL;
-    char pending = 0;
-    s = skip_ws(s, e);
-    trim_r(s, &e);
-    if (s >= e) return NULL;
-    while (s < e) {
-        if (is_space((unsigned char)*s)) {
-            s = skip_ws(s, e);
-            if (cur && !pending) pending = ' ';
-            continue;
-        }
-        if (*s == '>' || *s == '+' || *s == '~') {
-            if (!cur || (pending && pending != ' ')) return NULL;
-            pending = *s++;
-            continue;
-        }
-        if (sel->pseudo || (cur && !pending)) return NULL;
-        struct compound *c = parse_compound(pc, &s, e, &sel->spec, &sel->pseudo);
-        if (!c) return NULL;
-        c->left = cur;
-        c->comb = cur ? (pending ? pending : ' ') : 0;
-        cur = c;
-        pending = 0;
-    }
-    if (pending && pending != ' ') return NULL;
-    sel->right = cur;
-    return sel;
-}
-
-static struct sellist *parse_sellist(struct pctx *pc, const char *s, const char *e, bool forgiving) {
-    if (!forgiving) {
-        const char *last = e;
-        trim_r(s, &last);
-        if (last == s || last[-1] == ',') return NULL;
-    }
-    struct selector *local[8], **tmp = local;
-    size_t capacity = sizeof local / sizeof *local;
-    int n = 0;
-    while (s < e) {
-        const char *c = scan_to(s, e, ",");
-        struct selector *x = parse_complex(pc, s, c);
-        if (x) {
-            if ((size_t)n == capacity) tmp = selector_list_grow(pc, tmp, (size_t)n, &capacity, sizeof *tmp);
-            tmp[n++] = x;
-        } else if (!forgiving) return NULL;
-        s = c < e ? c + 1 : e;
-    }
-    if (!n && !forgiving) return NULL;
-    struct sellist *l = ar_alloc(pc->a, sizeof *l + (size_t)n * sizeof *tmp);
-    l->n = n;
-    memcpy(l->v, tmp, (size_t)n * sizeof *tmp);
-    return l;
-}
-
-/* Relative selectors retain an internal, zero-specificity anchor. It is not
-   :scope: a nested :scope still refers to the API's scoping root. */
-static struct sellist *parse_relative_list(struct pctx *pc, const char *s, const char *e) {
-    const char *last = e; trim_r(s, &last);
-    if (s == last || last[-1] == ',') return NULL;
-    struct selector *local[8], **v = local;
-    size_t capacity = sizeof local / sizeof *local; int n = 0;
-    while (s < e) {
-        const char *end = scan_to(s, e, ","), *p = skip_ws(s, end);
-        char combinator = ' ';
-        if (p < end && strchr(">+~", *p)) combinator = *p++;
-        struct selector *selector = parse_complex(pc, p, end);
-        if (!selector || selector->pseudo) return NULL;
-        struct compound *first = selector->right;
-        while (first->left) first = first->left;
-        struct compound *anchor = ar_alloc(pc->a, sizeof *anchor + sizeof *anchor->s);
-        anchor->n = 1; anchor->s[0].kind = SK_ANCHOR;
-        first->left = anchor; first->comb = combinator;
-        if ((size_t)n == capacity) v = selector_list_grow(pc, v, (size_t)n, &capacity, sizeof *v);
-        v[n++] = selector; s = end < e ? end + 1 : e;
-    }
-    struct sellist *list = ar_alloc(pc->a, sizeof *list + (size_t)n * sizeof *v);
-    memcpy(list->v, v, (size_t)n * sizeof *v); list->n = n;
-    return list;
 }
 
 /* ---------------------------------------------------------------- matching */
@@ -976,9 +1943,10 @@ static node_t *next_elem(node_t *e) {
     return NULL;
 }
 
-static bool nth(int a, int b, int idx) {
-    if (a == 0) return idx == b;
-    int d = idx - b;
+/* An+B: whether idx is A*n+B for some n >= 0 (idx and B as written, A clamped) */
+static bool nth(int a, int b, long long idx) {
+    long long d = idx - b;
+    if (!a) return !d;
     return d / a >= 0 && d % a == 0;
 }
 
@@ -999,14 +1967,14 @@ static bool read_write(const node_t *e) {
 }
 
 static bool icase_eq(const char *a, const char *b, bool icase) { return icase ? str_ieq(a, b) : !strcmp(a, b); }
+static bool icase_eqn(const char *a, const char *b, size_t n, bool icase) { return icase ? strn_ieq(a, b, n) : !strncmp(a, b, n); }
 
-static bool match_attr(const struct simple *x, const node_t *e) {
-    const char *v = node_attr(e, x->name);
-    if (!v) return false;
+/* an attribute's local name (attributes the parser made have none apart) */
+static const char *attr_local(const struct attr *a) { return a->local ? a->local : a->raw ? a->raw : a->name; }
+static bool attr_value_match(const struct simple *x, const char *v, bool ic) {
     if (x->op == AO_EXISTS) return true;
     const char *w = x->value;
     size_t vl = strlen(v), wl = strlen(w);
-    bool ic = x->icase;
     switch (x->op) {
     case AO_EQ: return icase_eq(v, w, ic);
     case AO_INCL:
@@ -1015,20 +1983,110 @@ static bool match_attr(const struct simple *x, const node_t *e) {
             while (is_space((unsigned char)*p)) p++;
             const char *st = p;
             while (*p && !is_space((unsigned char)*p)) p++;
-            if ((size_t)(p - st) == wl && (ic ? strn_ieq(st, w, wl) : !strncmp(st, w, wl))) return true;
+            if ((size_t)(p - st) == wl && icase_eqn(st, w, wl, ic)) return true;
         }
         return false;
-    case AO_DASH:
-        return (ic ? strn_ieq(v, w, wl > vl ? vl : wl) && vl >= wl : !strncmp(v, w, wl)) && (v[wl] == 0 || v[wl] == '-');
-    case AO_PREFIX: return wl && vl >= wl && (ic ? !strncasecmp(v, w, wl) : !strncmp(v, w, wl));
-    case AO_SUFFIX: return wl && vl >= wl && (ic ? !strncasecmp(v + vl - wl, w, wl) : !strcmp(v + vl - wl, w));
+    case AO_DASH: return vl >= wl && icase_eqn(v, w, wl, ic) && (v[wl] == 0 || v[wl] == '-');
+    case AO_PREFIX: return wl && vl >= wl && icase_eqn(v, w, wl, ic);
+    case AO_SUFFIX: return wl && vl >= wl && icase_eqn(v + vl - wl, w, wl, ic);
     case AO_SUBSTR:
         if (!wl) return false;
-        for (size_t i = 0; i + wl <= vl; i++)
-            if (ic ? !strncasecmp(v + i, w, wl) : !strncmp(v + i, w, wl)) return true;
+        for (size_t i = 0; i + wl <= vl; i++) if (icase_eqn(v + i, w, wl, ic)) return true;
         return false;
     }
     return false;
+}
+/* Selectors 4 attribute selectors. The name is the selector's local name, ASCII
+   lowercased on an HTML element in an HTML document; its namespace is the one
+   written (none: no namespace). A value compares ASCII case-insensitively with
+   the i flag, or, with no flag, for HTML's listed attributes of an HTML element
+   in an HTML document. */
+static bool match_attr(const struct simple *x, const node_t *e) {
+    bool html = doc_html_names(e);
+    const char *name = html || !x->q || !x->q->raw ? x->name : x->q->raw;
+    uint8_t ns = x->q ? x->q->ns : NSK_DEFAULT;
+    for (int i = 0; i < e->nattrs; i++) {
+        const struct attr *a = &e->attrs[i];
+        if (strcmp(attr_local(a), name)) {
+            /* HTML: a non-HTML element's attribute in an HTML document matches a
+               lowercased selector name ASCII case-insensitively (viewBox) */
+            if (html || !e->owner || e->owner->xml || !str_ieq(attr_local(a), name)) continue;
+        }
+        if (ns == NSK_DEFAULT ? a->namespace_uri != NULL :
+            ns == NSK_URI ? (x->q->uri ? !a->namespace_uri || strcmp(a->namespace_uri, x->q->uri) : a->namespace_uri != NULL) :
+            false) continue;
+        bool ic = x->flag == 'i' || (!x->flag && x->html_list && html && !a->namespace_uri);
+        if (attr_value_match(x, a->value ? a->value : "", ic)) return true;
+    }
+    return false;
+}
+/* the value of e's attribute local in namespace ns (NULL: none) */
+static const char *attr_value_ns(const node_t *e, const char *ns, const char *local) {
+    for (int i = 0; i < e->nattrs; i++) {
+        const struct attr *a = &e->attrs[i];
+        if (!strcmp(attr_local(a), local) && (ns ? a->namespace_uri && !strcmp(a->namespace_uri, ns) : !a->namespace_uri))
+            return a->value ? a->value : "";
+    }
+    return NULL;
+}
+/* RFC 4647 extended filtering of a language tag by a range, ASCII case-insensitively */
+static bool lang_extended_match(const char *tag, const char *range) {
+    const char *t = tag, *r = range;
+    size_t tl = strcspn(t, "-"), rl = strcspn(r, "-");
+    if (!*range || (!(rl == 1 && *r == '*') && (tl != rl || !strn_ieq(t, r, rl)))) return false;
+    if (!tl && !(rl == 1 && *r == '*')) return false;
+    t += tl; r += rl;
+    while (*r) {
+        r++;
+        rl = strcspn(r, "-");
+        if (rl == 1 && *r == '*') { r += rl; continue; }
+        for (;;) {
+            if (!*t) return false;
+            t++;
+            tl = strcspn(t, "-");
+            if (tl == rl && strn_ieq(t, r, rl)) { t += tl; break; }
+            if (tl == 1) return false; /* a singleton ends the subtags a range may skip */
+            t += tl;
+        }
+        r += rl;
+    }
+    return true;
+}
+/* HTML "the language" of an element: xml:lang, then lang on HTML elements and
+   other content languages, inherited; NULL: unknown */
+static const char *element_language(node_t *e) {
+    for (node_t *p = e; p; p = doc_shadow_parent(p)) {
+        if (p->type != N_ELEM) continue;
+        const char *l = attr_value_ns(p, WEB_NS_XML, "lang");
+        if (!l) l = attr_value_ns(p, NULL, "lang");
+        if (l) return l;
+    }
+    return NULL;
+}
+/* HTML "get an element's computed heading level", 0 for no heading */
+static int heading_level(node_t *e) {
+    if (e->foreign || e->tag < T_h1 || e->tag > T_h6) return 0;
+    int level = e->tag - T_h1 + 1;
+    for (node_t *p = e; p && level < 9;) {
+        if (p->type == N_ELEM && !p->foreign) {
+            const char *offset = attr_value_ns(p, NULL, "headingoffset");
+            if (offset) {
+                const char *s = offset;
+                while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\f' || *s == '\r') s++;
+                if (*s == '+') s++;
+                if (st_digit((unsigned char)*s)) {
+                    long long v = 0;
+                    while (st_digit((unsigned char)*s) && v < 100) v = v * 10 + (*s++ - '0');
+                    level = v >= 9 ? 9 : level + (int)v > 9 ? 9 : level + (int)v;
+                }
+            }
+            if (attr_value_ns(p, NULL, "headingreset")) break;
+        }
+        node_t *parent = p->parent;
+        p = parent && parent->type == N_FRAGMENT && parent->shadow_host ? parent->shadow_host : parent;
+        if (p && p->type != N_ELEM) break;
+    }
+    return level > 9 ? 9 : level;
 }
 
 static bool css_hovered(node_t *e) {
@@ -1041,25 +2099,132 @@ static bool css_active(node_t *e) {
     for(node_t *p=doc_active_target(e?e->owner:NULL);p;p=doc_flat_parent(p))if(p==e)return true;
     return false;
 }
+/* ---- HTML directionality (:dir()) */
+#include "unicode_bidi_data.h"
+/* UAX #9 bidirectional type, as far as directionality reads it: 1 L, 2 R or AL, 0 any other */
+static int bidi_strong(uint32_t cp) {
+    size_t lo = 0, hi = sizeof unicode_bidi_strong / sizeof *unicode_bidi_strong;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cp < unicode_bidi_strong[mid].first) hi = mid;
+        else if (cp > unicode_bidi_strong[mid].last) lo = mid + 1;
+        else return unicode_bidi_strong[mid].type;
+    }
+    return 0;
+}
+/* the first strong type in UTF-8 text, 0 for none */
+static int text_strong(const char *s, size_t n) {
+    for (const unsigned char *p = (const unsigned char *)s, *e = p + n; p < e;) {
+        uint32_t cp = *p++;
+        if (cp >= 0x80) {
+            unsigned more = cp >= 0xF0 ? 3 : cp >= 0xE0 ? 2 : cp >= 0xC0 ? 1 : 0;
+            cp &= 0x3Fu >> more;
+            for (; more && p < e && (*p & 0xC0) == 0x80; more--) cp = cp << 6 | (*p++ & 0x3Fu);
+            if (more) continue;
+        }
+        int strong = bidi_strong(cp);
+        if (strong) return strong;
+    }
+    return 0;
+}
+/* the dir attribute's state: 'l', 'r', 'a', or 0 (Undefined) */
+static int dir_state(const node_t *e) {
+    const char *v = !e->foreign ? attr_value_ns(e, NULL, "dir") : NULL;
+    return !v ? 0 : str_ieq(v, "ltr") ? 'l' : str_ieq(v, "rtl") ? 'r' : str_ieq(v, "auto") ? 'a' : 0;
+}
+static int element_direction(node_t *e);
+static bool shadow_slot(const node_t *e) {
+    if (e->foreign || e->tag != T_slot) return false;
+    node_t *root = doc_node_root((node_t *)e, false);
+    return root && root->shadow_host;
+}
+/* HTML "contained text auto directionality": 1 ltr, 2 rtl, 0 null */
+static int contained_text_direction(node_t *element, bool exclude_root) {
+    if (exclude_root && !element->foreign && (element->tag == T_bdi || element->tag == T_script ||
+        element->tag == T_style || element->tag == T_textarea || dir_state(element))) return 0;
+    for (node_t *n = element->first; n;) {
+        bool skip = false;
+        if (n->type == N_ELEM) {
+            skip = !n->foreign && (n->tag == T_bdi || n->tag == T_script || n->tag == T_style ||
+                                   n->tag == T_textarea || dir_state(n));
+            if (!skip && shadow_slot(n)) return element_direction(doc_node_root(n, false)->shadow_host);
+        } else if (n->type == N_TEXT) {
+            int strong = text_strong(n->text, n->textlen);
+            if (strong) return strong;
+        }
+        if (!skip && n->first) { n = n->first; continue; }
+        while (n != element && !n->next) n = n->parent;
+        if (n == element) break;
+        n = n->next;
+    }
+    return 0;
+}
+/* HTML "auto directionality" */
+static int auto_direction(node_t *e) {
+    if (!e->foreign && (e->tag == T_textarea || (e->tag == T_input && web_input_type(e) <= WEB_INPUT_HIDDEN) ||
+        (e->tag == T_input && (web_input_type(e) == WEB_INPUT_SUBMIT || web_input_type(e) == WEB_INPUT_RESET ||
+                               web_input_type(e) == WEB_INPUT_BUTTON)))) {
+        const char *value = web_input_edit_text(e);
+        if (text_strong(value, strlen(value)) == 2) return 2;
+        return *value ? 1 : 0;
+    }
+    if (shadow_slot(e) && e->slot_assigned_first) {
+        for (node_t *c = e->slot_assigned_first; c; c = c->assigned_next) {
+            int direction = c->type == N_TEXT ? text_strong(c->text, c->textlen) :
+                            c->type == N_ELEM ? contained_text_direction(c, true) : 0;
+            if (direction) return direction;
+        }
+        return 0;
+    }
+    return contained_text_direction(e, false);
+}
+/* HTML "the directionality" of an element: 1 ltr, 2 rtl */
+static int element_direction(node_t *e) {
+    for (int depth = 0; e && e->type == N_ELEM && depth < 100000; depth++) {
+        switch (dir_state(e)) {
+        case 'l': return 1;
+        case 'r': return 2;
+        case 'a': { int direction = auto_direction(e); return direction ? direction : 1; }
+        }
+        if (!e->foreign && e->tag == T_bdi) { int direction = auto_direction(e); return direction ? direction : 1; }
+        if (!e->foreign && e->tag == T_input && web_input_type(e) == WEB_INPUT_TEL) return 1;
+        node_t *parent = e->parent;
+        e = parent && parent->type == N_FRAGMENT && parent->shadow_host ? parent->shadow_host : parent;
+    }
+    return 1;
+}
+/* two elements of one type: one namespace and local name */
+static bool same_type(const node_t *a, const node_t *b) {
+    if (a->tag && a->tag == b->tag && a->namespace_id == b->namespace_id && a->namespace_id != NS_OTHER) return true;
+    return a->namespace_id == b->namespace_id && !strcmp(a->local_name ? a->local_name : a->name, b->local_name ? b->local_name : b->name) &&
+           (a->namespace_id != NS_OTHER || !strcmp(doc_element_namespace(a), doc_element_namespace(b)));
+}
 static bool match_pc(const struct simple *x, node_t *e, const struct selector_match *context) {
     node_t *scope = context->shadow;
     switch (x->pc) {
     case PC_FIRST_CHILD: return !prev_elem(e);
     case PC_LAST_CHILD: return !next_elem(e);
     case PC_ONLY_CHILD: return !prev_elem(e) && !next_elem(e);
-    case PC_NTH_CHILD: return nth(x->a, x->b, e->elem_index);
+    case PC_NTH_CHILD:
+        if (!x->args) return nth(x->a, x->b, e->elem_index);
+        /* fall through: :nth-child(An+B of S) counts the siblings S matches */
     case PC_NTH_LAST_CHILD: {
-        int k = 1;
-        for (node_t *s = next_elem(e); s; s = next_elem(s)) k++;
+        if (x->args && !match_list_bound(x->args, e, context)) return false;
+        long long k = 1;
+        bool before = x->pc == PC_NTH_CHILD;
+        for (node_t *s = before ? prev_elem(e) : next_elem(e); s; s = before ? prev_elem(s) : next_elem(s))
+            if (!x->args || match_list_bound(x->args, s, context)) k++;
         return nth(x->a, x->b, k);
     }
     case PC_FIRST_OF_TYPE: case PC_LAST_OF_TYPE: case PC_ONLY_OF_TYPE: case PC_NTH_OF_TYPE:
     case PC_NTH_LAST_OF_TYPE: {
-        int before = 1, after = 1;
-        for (node_t *s = prev_elem(e); s; s = prev_elem(s))
-            if (!strcmp(s->name, e->name)) before++;
-        for (node_t *s = next_elem(e); s; s = next_elem(s))
-            if (!strcmp(s->name, e->name)) after++;
+        long long before = 1, after = 1;
+        if (x->pc != PC_LAST_OF_TYPE && x->pc != PC_NTH_LAST_OF_TYPE)
+            for (node_t *s = prev_elem(e); s; s = prev_elem(s))
+                if (same_type(s, e)) before++;
+        if (x->pc != PC_FIRST_OF_TYPE && x->pc != PC_NTH_OF_TYPE)
+            for (node_t *s = next_elem(e); s; s = next_elem(s))
+                if (same_type(s, e)) after++;
         switch (x->pc) {
         case PC_FIRST_OF_TYPE: return before == 1;
         case PC_LAST_OF_TYPE: return after == 1;
@@ -1076,6 +2241,21 @@ static bool match_pc(const struct simple *x, node_t *e, const struct selector_ma
         struct selector_match host = *context; host.shadow = NULL;
         return scope && scope->shadow_host == e && (!x->args || match_list_bound(x->args, e, &host));
     }
+    case PC_HOST_CONTEXT: {
+        /* the host, if it or a shadow-including ancestor matches the compound */
+        if (!scope || scope->shadow_host != e) return false;
+        struct selector_match host = *context; host.shadow = NULL;
+        for (node_t *p = e; p && p->type == N_ELEM;) {
+            if (match_list_bound(x->args, p, &host)) return true;
+            node_t *parent = p->parent;
+            p = parent && parent->type == N_FRAGMENT && parent->shadow_host ? parent->shadow_host : parent;
+        }
+        return false;
+    }
+    case PC_DIR: return element_direction(e) == (str_ieq(x->value, "rtl") ? 2 : str_ieq(x->value, "ltr") ? 1 : 0);
+    case PC_HEADING: { int level = heading_level(e); return level && (x->tag >> level & 1); }
+    case PC_STATE: return web_custom_state_has(e, x->value);
+    case PC_FOCUS_VISIBLE: return e->owner && e->owner->focus == e && e->owner->focus_visible;
     case PC_FOCUS:
         if (!e->owner) return false;
         for (node_t *f = e->owner->focus; f;) {
@@ -1126,16 +2306,13 @@ static bool match_pc(const struct simple *x, node_t *e, const struct selector_ma
         int range = web_control_in_range(e->owner, e);
         return range >= 0 && (x->pc == PC_IN_RANGE ? range == 1 : range == 0);
     }
-    case PC_LANG:
-        for (node_t *p = e; p; p = doc_shadow_parent(p)) {
-            if (p->type != N_ELEM) continue;
-            const char *l = node_attr(p, "lang");
-            if (l) {
-                size_t k = strlen(x->value);
-                return !strncasecmp(l, x->value, k) && (l[k] == 0 || l[k] == '-');
-            }
-        }
+    case PC_LANG: {
+        const char *language = element_language(e);
+        if (!language || !*language) return false;
+        for (const char *range = x->value; *range; range += strlen(range) + 1)
+            if (lang_extended_match(language, range + 1)) return true;
         return false;
+    }
     case PC_PLACEHOLDER_SHOWN:
         if (css_scratch_get()->form_snapshot) return (e->style_form_state & WEB_STYLE_PLACEHOLDER) != 0;
         return !e->foreign && (e->tag == T_input || e->tag == T_textarea) &&
@@ -1152,9 +2329,16 @@ static bool match_pc(const struct simple *x, node_t *e, const struct selector_ma
 static bool match_compound(const struct compound *c, node_t *e, const struct selector_match *context) {
     node_t *scope = context->shadow;
     if (scope && e == scope->shadow_host) {
-        if (!c->n || c->universal) return false; /* '*' cannot select a featureless host */
-        for (int i = 0; i < c->n; i++)
-            if (c->s[i].kind != SK_PC || c->s[i].pc != PC_HOST) return false;
+        /* a featureless host: only :host, :host() and :host-context() select it */
+        bool host = false;
+        if (c->universal) return false;
+        for (int i = 0; i < c->n; i++) {
+            const struct simple *x = &c->s[i];
+            if (x->kind == SK_PE || (x->kind == SK_NS && x->q->implicit)) continue;
+            if (x->kind != SK_PC || (x->pc != PC_HOST && x->pc != PC_HOST_CONTEXT)) return false;
+            host = true;
+        }
+        if (!host) return false;
     }
     for (int i = 0; i < c->n; i++) {
         const struct simple *x = &c->s[i];
@@ -1162,9 +2346,21 @@ static bool match_compound(const struct compound *c, node_t *e, const struct sel
         case SK_ANCHOR:
             if (e != context->anchor) return false;
             break;
-        case SK_TAG:
-            if (x->tag ? e->tag != x->tag : strcmp(e->name, x->name)) return false;
+        case SK_NS: {
+            /* the namespace a prefix or the default names (NULL: no namespace) */
+            const struct sel_qname *q = x->q;
+            if (q->ns == NSK_ANY || (q->implicit && scope && e == scope->shadow_host)) break;
+            const char *ns = doc_element_namespace(e);
+            if (q->ns == NSK_NONE || !q->uri ? ns != NULL : !ns || strcmp(ns, q->uri)) return false;
             break;
+        }
+        case SK_TAG:
+            /* HTML: an HTML element in an HTML document compares the lowercased
+               name; any other element its local name as written */
+            if (doc_html_names(e)) { if (x->tag ? e->tag != x->tag : strcmp(e->local_name ? e->local_name : e->name, x->name)) return false; }
+            else if (strcmp(e->local_name ? e->local_name : e->name, x->q && x->q->raw ? x->q->raw : x->name)) return false;
+            break;
+        case SK_PE: break; /* its selector's pseudo is the generated box */
         case SK_ID:
             if (!e->id || strcmp(e->id, x->name)) return false;
             break;
@@ -1285,43 +2481,9 @@ static void select_walk(node_t *scope, const struct sellist *sel, pvec *out) {
     }
 }
 
-/* DOM "parse a selector" from a string (querySelector, matches, closest): CSS Syntax drops
-   comments while tokenizing, so they go before the selector grammar sees the text. A comment
-   between two code points of one name (".a", a comment, "b") separates two tokens that the text
-   would join into one, and a selector never has two such tokens side by side, so that is a
-   failure. Strings and escapes keep their contents. */
-static struct sellist *parse_selector_string(struct pctx *p, const char *selector) {
-    size_t n = strlen(selector), k = 0;
-    char *text = ar_alloc(p->a, n + 1);
-    for (size_t i = 0; i < n;) {
-        char c = selector[i];
-        if (c == '/' && i + 1 < n && selector[i + 1] == '*') {
-            i += 2;
-            while (i < n && !(selector[i] == '*' && i + 1 < n && selector[i + 1] == '/')) i++;
-            i = i < n ? i + 2 : n;
-            if (k && i < n && (ident_char((unsigned char)text[k - 1]) || text[k - 1] == '\\') &&
-                (ident_char((unsigned char)selector[i]) || selector[i] == '\\')) return NULL;
-            continue;
-        }
-        if (c == '\\' && i + 1 < n) { text[k++] = selector[i++]; text[k++] = selector[i++]; continue; }
-        if (c == '"' || c == '\'') {
-            text[k++] = selector[i++];
-            while (i < n && selector[i] != c) {
-                if (selector[i] == '\\' && i + 1 < n) text[k++] = selector[i++];
-                text[k++] = selector[i++];
-            }
-            if (i < n) text[k++] = selector[i++];
-            continue;
-        }
-        text[k++] = selector[i++];
-    }
-    while (k && is_space((unsigned char)text[k - 1])) k--;
-    text[k] = 0;
-    if (!k || text[k - 1] == ',') return NULL;
-    return parse_sellist(p, text, text + k, false);
-}
-
-bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out) {
+/* DOM "parse a selector" (querySelector, matches, closest): a selector list
+   in no stylesheet, so a namespace prefix is undeclared there. */
+bool css_select_n(web_doc *d, node_t *scope, const char *selector, size_t length, pvec *out) {
     (void)d;
     if (!selector || !scope) return false;
     arena_t *arena = calloc(1, sizeof *arena);
@@ -1330,15 +2492,18 @@ bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out) {
     arena->trap = &trap;
     if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
     struct pctx p = {.a = arena};
-    struct sellist *sel = parse_selector_string(&p, selector);
+    struct sellist *sel = selector_list_parse(&p, selector, selector + length);
     if (sel) select_walk(scope, sel, out);
     bool valid = sel != NULL;
     ar_free(arena);
     free(arena);
     return valid;
 }
+bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out) {
+    return selector && css_select_n(d, scope, selector, strlen(selector), out);
+}
 
-bool css_matches(node_t *node, const char *selector, bool *valid) {
+bool css_matches_n(node_t *node, node_t *scope, const char *selector, size_t length, bool *valid) {
     if (valid) *valid = false;
     if (!node || node->type != N_ELEM || !selector) return false;
     arena_t *arena = calloc(1, sizeof *arena);
@@ -1347,13 +2512,17 @@ bool css_matches(node_t *node, const char *selector, bool *valid) {
     arena->trap = &trap;
     if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
     struct pctx p = {.a = arena};
-    struct sellist *sel = parse_selector_string(&p, selector);
+    struct sellist *sel = selector_list_parse(&p, selector, selector + length);
     if (valid) *valid = sel != NULL;
-    const struct selector_match context = {.reference = node};
+    const struct selector_match context = {.reference = scope ? scope : node};
     bool matched = sel && match_list_bound(sel, node, &context);
     ar_free(arena);
     free(arena);
     return matched;
+}
+bool css_matches(node_t *node, const char *selector, bool *valid) {
+    if (valid) *valid = false;
+    return selector && css_matches_n(node, NULL, selector, strlen(selector), valid);
 }
 
 /* ---------------------------------------------------------------- feature queries
@@ -1565,10 +2734,7 @@ static struct supports_result supports_expr(arena_t *a, const char *s, const cha
                 if (end == f->e) { result = bad; goto done; }
                 f->next = end + 1;
                 bool yes = false;
-                if (!strcmp(name, "selector")) {
-                    struct pctx pc = {.a = a, .supports_probe = true};
-                    yes = supports_delim(p + 1, end, ",") == end && parse_complex(&pc, p + 1, end) != NULL;
-                }
+                if (!strcmp(name, "selector")) yes = selector_supported(a, p + 1, end);
                 result = (struct supports_result){true, yes}; goto done;
             }
             const char *end = supports_delim(p + 1, f->e, ")");
@@ -1932,7 +3098,7 @@ static void parse_style_rule(struct pctx *pc, const char *ps, const char *pe, co
     trim_r(ps, &pe);
     if (parent) sel_text = nest_selector(pc, ps, pe, parent);
     else sel_text = ar_strndup(pc->a, ps, (size_t)(pe - ps));
-    struct sellist *sl = parse_sellist(pc, sel_text, sel_text + strlen(sel_text), false);
+    struct sellist *sl = selector_list_parse(pc, sel_text, sel_text + strlen(sel_text));
     if (!sl) return;
     struct rule *r = ar_alloc(pc->a, sizeof *r);
     r->sel = sl;
@@ -2446,7 +3612,19 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                 if(layer && !layer_statement(pc,qs,qe,media)) {
                     s=p<e?p+1:e;continue;
                 }
-                struct css_rule_info *info = (p<e||layer) && (type || known_group) ? cssom_record(pc, type, s, p<e?p+1:e) : NULL;
+                if (type == 10) {
+                    /* CSS Namespaces: before every rule but @charset, @import and @layer statements */
+                    const char *prefix, *uri;
+                    if (pc->rule_depth != 1 || !pc->namespace_allowed || !namespace_prelude(pc->a, qs, qe, &prefix, &uri)) {
+                        s = p < e ? p + 1 : e;
+                        continue;
+                    }
+                    struct css_namespace *declared = ar_alloc(pc->a, sizeof *declared), **at = &pc->sh->namespaces;
+                    declared->prefix = prefix; declared->uri = uri; declared->next = NULL;
+                    while (*at) at = &(*at)->next;
+                    *at = declared;
+                }
+                struct css_rule_info *info = (p<e||layer||type==10) && (type || known_group) ? cssom_record(pc, type, s, p<e?p+1:e) : NULL;
                 if(info&&layer)info->layer_kind=1;
                 if(pc->rule_depth==1 && type==10)pc->import_allowed=false;
                 if (name && !strcmp(name, "import")) {
@@ -2515,7 +3693,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
             if(type || known_group) {
                 struct css_rule_info *info=cssom_record(pc, type, s, be < e ? be + 1 : e);
                 if(info&&block_layer)info->layer_kind=2;
-                if(pc->rule_depth==1)pc->import_allowed=false;
+                if(pc->rule_depth==1)pc->import_allowed=pc->namespace_allowed=false;
             }
             if (name) {
                 if (!strcmp(name, "font-face")) parse_font_face(pc,p+1,be,media);
@@ -2549,7 +3727,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
         parse_style_rule(pc, s, p, p + 1, be, media, NULL);
         struct rule *native = before ? before->next : pc->sh->first;
         if (native) {
-            if(pc->rule_depth==1)pc->import_allowed=false;
+            if(pc->rule_depth==1)pc->import_allowed=pc->namespace_allowed=false;
             struct css_rule_info *info = cssom_record(pc, 1, s, be < e ? be + 1 : e);
             if (info) { info->native_rule = native; info->selector = native->selector_text; }
         }
@@ -2558,9 +3736,12 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
     pc->rule_depth--;
 }
 
-/* comments out, <!-- --> out */
+/* comments out, <!-- --> out; CSS Syntax preprocessing turns NUL into U+FFFD */
 static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n) {
-    char *o = ar_alloc(a, n + 1);
+    size_t nuls = 0;
+    for (size_t i = 0; i < n; i++) nuls += !css[i];
+    if (nuls > (SIZE_MAX - 1 - n) / 2) ar_alloc(a, SIZE_MAX);
+    char *o = ar_alloc(a, n + 2 * nuls + 1);
     size_t k = 0;
     for (size_t i = 0; i < n;) {
         char c = css[i];
@@ -2574,7 +3755,8 @@ static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n
         if (c == '"' || c == '\'') {
             o[k++] = css[i++];
             while (i < n && css[i] != c && css[i] != '\n') {
-                if (css[i] == '\\' && i + 1 < n) o[k++] = css[i++];
+                if (css[i] == '\\' && i + 1 < n && css[i + 1]) o[k++] = css[i++];
+                if (!css[i]) { memcpy(o + k, "\xEF\xBF\xBD", 3); k += 3; i++; continue; }
                 o[k++] = css[i++];
             }
             if (i < n) o[k++] = css[i++];
@@ -2590,7 +3772,8 @@ static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n
             o[k++] = ' ';
             continue;
         }
-        o[k++] = c ? c : ' ';
+        if (c) o[k++] = c;
+        else { memcpy(o + k, "\xEF\xBF\xBD", 3); k += 3; }
         i++;
     }
     o[k] = 0;
@@ -2637,8 +3820,7 @@ void css_sheet_import_context(sheet_t *sheet,sheet_t *parent,const struct css_ru
 
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
     static uint64_t serials;
-    struct pctx pc = {a, NULL, base_url, imports, 0, false, 0};
-    pc.import_allowed=true;
+    struct pctx pc = {.a = a, .base = base_url, .imports = imports, .import_allowed = true, .namespace_allowed = true};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
     pc.sh->order = order;
     pc.sh->ast = pc.sh; pc.sh->arena = a;
@@ -3563,7 +4745,7 @@ static int pseudo_state(const struct simple *s) {
     if (s->kind != SK_PC) return -1;
     if (s->pc == PC_HOVER) return CSS_STATE_HOVER;
     if (s->pc == PC_ACTIVE) return CSS_STATE_ACTIVE;
-    if (s->pc == PC_FOCUS || s->pc == PC_FOCUS_WITHIN) return CSS_STATE_FOCUS;
+    if (s->pc == PC_FOCUS || s->pc == PC_FOCUS_WITHIN || s->pc == PC_FOCUS_VISIBLE) return CSS_STATE_FOCUS;
     return -1;
 }
 static bool anchor_compound(const struct compound *c) { return c->n == 1 && c->s[0].kind == SK_ANCHOR; }
@@ -5367,7 +6549,11 @@ static bool relational_candidate(const struct compound *compound, node_t *node) 
         if (s->kind == SK_TAG && (s->tag ? node->tag != s->tag : strcmp(node->name, s->name))) return false;
         if (s->kind == SK_ID && (!node->id || strcmp(node->id, s->name))) return false;
         if (s->kind == SK_CLASS && !node_has_class(node, s->name)) return false;
-        if (s->kind == SK_ATTR && !node_attr(node, s->name)) return false;
+        if (s->kind == SK_ATTR) {
+            struct simple present = *s;
+            present.op = AO_EXISTS;
+            if (!match_attr(&present, node)) return false;
+        }
         /* Positive logical alternatives still require one alternative's stable
            subject keys. Never evaluate its dynamic pseudo or left ancestors;
            :not()/:has() cannot safely impose those keys on this subject. */
@@ -5787,9 +6973,9 @@ void css_mark_state_moved(web_doc *d, enum css_state state, node_t *from, node_t
    reads, of an element or of its ancestors: their changes keep the boundary. */
 static bool state_attribute(const char *name) {
     static const char *const names[] = {
-        "checked", "contenteditable", "dir", "disabled", "form", "href", "lang", "list", "max", "maxlength", "min",
-        "minlength", "multiple", "name", "open", "pattern", "placeholder", "readonly", "required", "selected",
-        "slot", "step", "type", "value",
+        "checked", "contenteditable", "dir", "disabled", "form", "headingoffset", "headingreset", "href", "lang",
+        "list", "max", "maxlength", "min", "minlength", "multiple", "name", "open", "pattern", "placeholder",
+        "readonly", "required", "selected", "slot", "step", "type", "value", "xml:lang",
     };
     for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(name, names[i])) return true;
     return false;
@@ -5817,6 +7003,9 @@ void css_mark_attribute_dirty(web_doc *d, node_t *n, const struct css_attribute_
     /* The element itself always: presentational hints, attr() and the style attribute. */
     struct reach_set r = {.reach = hint_reaches_descendants(n, change->name) ? REACH_SUBTREE : REACH_SELF};
     reach_named(d, scope, FEATURE_ATTR, change->name, strlen(change->name), &r);
+    /* a selector names a namespaced attribute by its local name */
+    const char *colon = strchr(change->name, ':');
+    if (colon) reach_named(d, scope, FEATURE_ATTR, colon + 1, strlen(colon + 1), &r);
     if (!strcmp(change->name, "class")) {
         reach_classes(d, scope, change->old_value, change->new_value, &r);
         reach_classes(d, scope, change->new_value, change->old_value, &r);

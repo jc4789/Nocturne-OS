@@ -29,7 +29,7 @@
 | `tests/`、`docs/` | 試験、仕様・台帳・日付入りの報告 | — |
 | `build/`、`tools/`、`hyperv/`、`local/`、`.codegraph/`（無視） | 出力、同梱の道具、Hyper-V のディスク、GSP の firmware、codegraph の索引 | — |
 
-生成物（手で直さず生成元を直す）：`web/js_bootstrap.inc` ← `js_*.js`＋`js_embed.py`、`js_worker_runtime.inc` ← `js_worker_embed.py`（どちらも `user/libc/web/` にある）、`web/webidl_data.inc` ← `third_party/webref/idl`＋`scripts/build_webidl.py`、`js_intl.js`・`js_segmenter.js`・`js_collator.js` ← `scripts/build_*.py`、`unicode_grapheme_data.h`・`wctype_data.h` ← `scripts/unicode_*.py`、`common/unifont.bin` ← `scripts/unifont2bin.py`。
+生成物（手で直さず生成元を直す）：`web/js_bootstrap.inc` ← `js_*.js`＋`js_embed.py`、`js_worker_runtime.inc` ← `js_worker_embed.py`（どちらも `user/libc/web/` にある）、`web/webidl_data.inc` ← `third_party/webref/idl`＋`scripts/build_webidl.py`、`js_intl.js`・`js_segmenter.js`・`js_collator.js` ← `scripts/build_*.py`、`unicode_grapheme_data.h`・`wctype_data.h`・`web/unicode_bidi_data.h`（`:dir()` の強い双方向の型）← `scripts/unicode_*.py`、`common/unifont.bin` ← `scripts/unifont2bin.py`。
 
 ## 境界
 

@@ -689,6 +689,8 @@ bool css_containers_update(web_doc *d); /* supervisor, after layout; changed que
 bool css_container_names_valid(const char *s, size_t n);
 void css_mark_dirty(web_doc *d, node_t *n);
 void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool inserted);
+/* The latest user input a document received: no input yet, a key or a pointer press. */
+enum web_modality { WEB_MODALITY_NONE, WEB_MODALITY_KEYBOARD, WEB_MODALITY_POINTER };
 /* The dynamic states css_mark_state_moved moves; :focus and :focus-within move together. */
 enum css_state { CSS_STATE_HOVER, CSS_STATE_ACTIVE, CSS_STATE_FOCUS, CSS_STATES };
 /* the state moved from one element of d to another (either may be NULL) */
@@ -1377,6 +1379,11 @@ struct web_doc {
     float container_rem; /* immutable root font size of the layout snapshot */
     node_t *style_retired_first;
     node_t *focus;
+    /* Selectors 4 :focus-visible: whether focus shows its indicator, from the
+       latest user input (enum web_modality) and a focus() call's FocusOptions
+       focusVisible (0 absent, 1 false, 2 true) */
+    bool focus_visible;
+    uint8_t focus_modality, focus_visible_request;
     node_t *hover_target; /* native pointer target, not an author-set property */
     web_doc *hover_leaf;  /* top document's last hovered child context; arenas remain owned */
     node_t *active_target; /* native primary-button press, independent of hover/events */
@@ -1592,6 +1599,21 @@ bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation);
 bool web_js_stylesheet_event(web_doc *d, node_t *n, bool failed);
 bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out);
 bool css_matches(node_t *node, const char *selector, bool *valid);
+/* HTML :state(): whether a custom element's states set holds the name */
+bool web_custom_state_has(const node_t *n, const char *name);
+/* the same over a selector that may hold NUL (U+FFFD to CSS) */
+bool css_select_n(web_doc *d, node_t *scope, const char *selector, size_t length, pvec *out);
+bool css_matches_n(node_t *node, node_t *scope, const char *selector, size_t length, bool *valid); /* scope NULL: node */
+/* CSSOM: a style rule's selectorText; an @namespace rule's prefix (NULL: none) and URI */
+void css_rule_selector_serialize(const struct css_rule_info *info, sbuf *out);
+bool css_namespace_rule(arena_t *a, const char *text, size_t length, const char **prefix, const char **uri);
+/* CSSOM "serialize a CSS rule" (a style rule's selectors and an @namespace rule from
+   their parse; other rules as written) */
+void css_rule_text_serialize(const struct css_rule_info *info, sbuf *out);
+/* selectorText's setter: the rule's new text, or NULL when the selectors do not
+   parse in sheet's namespaces; *selector gets them serialized (both malloc'd) */
+char *css_rule_with_selector(const sheet_t *sheet, const struct css_rule_info *info, const char *selector,
+                             size_t length, size_t *out_length, char **selector_out);
 void web_js_start(web_doc *d, const struct web_host *host);
 bool web_js_parser_candidate(web_doc *d, const char *name, const char *is);
 node_t *web_js_parser_element(web_doc *d, node_t *node, const char *is, bool finish);

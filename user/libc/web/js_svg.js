@@ -67,7 +67,7 @@ const svgBridge = (() => {
         }
         get ownerSVGElement(){return rawDom.get(this,'svgOwner');}
         get viewportElement(){return rawDom.get(this,'svgViewport');}
-        focus(){brand(this);dom('focus',this);}
+        focus(options=undefined){brand(this);dom('focus',this,focusOptionsVisible(options));}
         blur(){brand(this);const d=rawDom.get(this,'ownerDocument');if(rawDom.get(d,'activeElement')===this)dom('focus',null);}
     }
     function root(node){return rawDom.get(node,'localName')==='svg';}

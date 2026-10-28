@@ -1389,8 +1389,15 @@ bool web_paint_dirty(web_doc *d) {
     return dirty;
 }
 bool web_script_running(web_doc *d) { return d && d->live && web_js_running(d); }
+static void focus_keyboard_input(web_doc *d, const struct web_event *e);
 bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
     if(!d||!d->live)return true;
+    if(e&&e->type&&!e->synthetic) {
+        /* the latest user input, for :focus-visible */
+        web_doc *input=target&&target->owner?target->owner:d;
+        if(!strcmp(e->type,"keydown"))focus_keyboard_input(input,e);
+        else if(!strcmp(e->type,"mousedown")||!strcmp(e->type,"pointerdown"))input->focus_modality=WEB_MODALITY_POINTER;
+    }
     /* WHATWG image-button activation: capture the selected point in the
        displayed image before click listeners can replace layout or reparent
        it. Only an uncanceled explicit coordinate selection updates it;
@@ -2696,6 +2703,23 @@ static node_t *focus_delegate(web_doc *d, node_t *parent) {
     return target ? target : focus_descendants(d, parent, false);
 }
 
+/* Selectors 4 :focus-visible heuristics: an element that takes keyboard input
+   (a text-entry control or an editing host) always shows focus; another one
+   does unless a pointer press was the latest user input. A focus() call's
+   focusVisible decides it instead. */
+static bool focus_shows_indicator(web_doc *d, node_t *n) {
+    if (d->focus_visible_request) return d->focus_visible_request == 2;
+    if (n->type == N_ELEM && !n->foreign) {
+        if (n->tag == T_textarea) return true;
+        if (n->tag == T_input) {
+            enum web_input_kind type = web_input_type(n);
+            if (type <= WEB_INPUT_PASSWORD || (type >= WEB_INPUT_DATE && type <= WEB_INPUT_NUMBER)) return true;
+        }
+        const char *editable = node_attr(n, "contenteditable");
+        if (editable && !str_ieq(editable, "false")) return true;
+    }
+    return d->focus_modality != WEB_MODALITY_POINTER;
+}
 void web_focus(web_doc *d, web_node *n) {
     if (!d) return;
     if(n && n->owner && n->owner!=d && n->owner->frame_parent){
@@ -2725,11 +2749,23 @@ void web_focus(web_doc *d, web_node *n) {
         n->selection_direction = 0; n->selection_set = true;
     }
     node_t *old = d->focus;
+    bool was_visible = d->focus_visible;
     d->focus = n;
     d->caret = 0;
+    d->focus_visible = n && focus_shows_indicator(d, n);
     if (n) doc_control_caret(d, n);
     css_mark_state_moved(d, CSS_STATE_FOCUS, old, n);
+    if (n && old == n && was_visible != d->focus_visible) css_mark_dirty(d, n);
     d->dirty = true;
+}
+/* Selectors 4 :focus-visible after a key press: the focused element shows its
+   indicator from then on, though the key moved no focus. */
+static void focus_keyboard_input(web_doc *d, const struct web_event *e) {
+    static const char *const modifiers[] = {"Alt", "AltGraph", "CapsLock", "Control", "Fn", "Meta", "NumLock", "Shift"};
+    if (e->ctrl || e->alt) return; /* a shortcut, not keyboard navigation or typing */
+    for (size_t i = 0; e->key && i < sizeof modifiers / sizeof *modifiers; i++) if (!strcmp(e->key, modifiers[i])) return;
+    d->focus_modality = WEB_MODALITY_KEYBOARD;
+    if (d->focus && !d->focus_visible) { d->focus_visible = true; css_mark_dirty(d, d->focus); }
 }
 
 web_node *web_focused(web_doc *d) {

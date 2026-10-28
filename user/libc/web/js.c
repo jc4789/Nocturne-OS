@@ -2819,6 +2819,15 @@ static JSValue face_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst *
     else if(!n->internals)result=JS_ThrowTypeError(ctx,"Custom element definition metadata required");
     else if(!strcmp(op,"attach")){
         if(n->internals->attached)result=JS_ThrowTypeError(ctx,"Internals already attached");else n->internals->attached=true;
+    }else if(!strcmp(op,"state")){
+        /* CustomStateSet: the states set's native copy, for :state() */
+        const char *change=argc>3?JS_ToCString(ctx,argv[3]):NULL,*name=NULL;size_t length=0;
+        if(!change)result=JS_EXCEPTION;
+        else if(strcmp(change,"clear")&&(argc<5||!(name=JS_ToCStringLen(ctx,&length,argv[4]))))result=JS_EXCEPTION;
+        else if(!web_custom_state_change(d,n,!strcmp(change,"add")?'a':!strcmp(change,"delete")?'d':'c',name,length))
+            result=JS_ThrowRangeError(ctx,"Native custom state allocation/size failure");
+        if(name)JS_FreeCString(ctx,name);
+        if(change)JS_FreeCString(ctx,change);
     }else if(!n->face_associated)result=JS_ThrowTypeError(ctx,"Form-associated custom element required");
     else if(!strcmp(op,"form"))result=wrap(s,web_form_owner(d,n));
     else if(!strcmp(op,"message"))result=JS_NewStringLen(ctx,n->internals->message?n->internals->message:"",n->internals->message_length);
@@ -3135,6 +3144,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     struct js_mutation_snapshot observed=opcode==DOM_set?(struct js_mutation_snapshot){0}:mutation_before(s,opcode,n,argc,argv);
     JSValue result = JS_UNDEFINED;
     const char *p = NULL;
+    size_t plen = 0;
     node_t *attribute_target = NULL;
     struct js_inserted_roots inserted={0};
     uint64_t insertion_generation=s->stream_generation;
@@ -3159,7 +3169,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     }}
     switch(opcode){
     case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry:
-        if(argc<3 || !(p=JS_ToCString(ctx,argv[2]))){result=JS_EXCEPTION;goto dom_complete;}
+        if(argc<3 || !(p=JS_ToCStringLen(ctx,&plen,argv[2]))){result=JS_EXCEPTION;goto dom_complete;}
         break;
     default:break;
     }
@@ -3468,7 +3478,14 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             }
             n = NULL;
         }
-        if (permitted) web_js_focus_control(d,n);
+        if (permitted) {
+            /* FocusOptions' focusVisible: 0 absent, 1 false, 2 true */
+            uint8_t request = opcode == DOM_focus && argc > 3 && !JS_IsUndefined(argv[3]) ? (JS_ToBool(ctx, argv[3]) > 0 ? 2 : 1) : 0;
+            web_doc *target = n && n->owner ? n->owner : d;
+            d->focus_visible_request = target->focus_visible_request = request;
+            web_js_focus_control(d,n);
+            d->focus_visible_request = target->focus_visible_request = 0;
+        }
         d->dirty = true;
 
     } break;
@@ -3838,13 +3855,17 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     } break;
     case DOM_query: {
         pvec found = {0};
-        if (!css_select(d, n, p, &found)) result = JS_ThrowSyntaxError(ctx, "Invalid CSS selector");
+        /* false: the selector is invalid; the caller throws its DOMException */
+        if (!css_select_n(d, n, p, plen, &found)) result = JS_FALSE;
         else if (argc > 3 && JS_ToBool(ctx, argv[3]) > 0) result = wrap(s, found.n ? found.v[0] : NULL);
         else { result = JS_NewArray(ctx); for (int i = 0; i < found.n; ++i) if (JS_SetPropertyUint32(ctx, result, i, wrap(s, found.v[i])) < 0) { JS_FreeValue(ctx, result); result = JS_EXCEPTION; break; } }
         pv_free(&found);
 
     } break;
-    case DOM_matches: { bool valid; bool matches = css_matches(n, p, &valid); result = valid ? JS_NewBool(ctx, matches) : JS_ThrowSyntaxError(ctx, "Invalid CSS selector");
+    case DOM_matches: {
+        /* argv[3]: the scoping root (closest() keeps the element it was called on); null: invalid */
+        node_t *scope = argc > 3 ? unwrap(ctx, argv[3]) : NULL;
+        bool valid; bool matches = css_matches_n(n, scope, p, plen, &valid); result = valid ? JS_NewBool(ctx, matches) : JS_NULL;
     } break;
     case DOM_style: case DOM_stylePriority: {result = style_access(s, n, p, argc > 3, argc > 3 ? argv[3] : JS_UNDEFINED, argc > 4 ? argv[4] : JS_UNDEFINED, opcode == DOM_stylePriority);
     } break;
