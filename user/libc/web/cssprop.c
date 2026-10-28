@@ -534,14 +534,15 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
-       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME };
+       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
+       PT_RULE_INSET };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
-       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE, SH_OFFSET };
+       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE, SH_OFFSET, SH_GAP_RULE };
 
 struct propdef {
     const char *name;
@@ -556,8 +557,15 @@ struct propdef {
 /* Web Animations 1 §5.3 animation types that differ from a value type's default */
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 /* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
-   offset). A group holds only properties that are not inherited. */
-enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET };
+   offset, gap_rules). A group holds only properties that are not inherited. */
+enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE };
+/* the gap decoration shorthands (css-gaps-1): propdef flags hold what one sets (GS_*) and on which
+   axes (GS_COLUMN, GS_ROW) */
+enum { GS_RULE, GS_COLOR, GS_STYLE, GS_WIDTH, GS_BREAK, GS_ITEMS, GS_INSET_START, GS_INSET_END, GS_INSET_CAP,
+       GS_INSET_JUNCTION, GS_INSET };
+#define GS_COLUMN 0x10
+#define GS_ROW 0x20
+#define GS_BOTH (GS_COLUMN | GS_ROW)
 
 static const struct kw kw_position[] = {{"static", POS_STATIC}, {"relative", POS_RELATIVE}, {"absolute", POS_ABSOLUTE},
                                         {"fixed", POS_FIXED}, {"sticky", POS_STICKY}, {"-webkit-sticky", POS_STICKY}, {0}};
@@ -647,6 +655,12 @@ static const struct kw kw_ostyle[] = {{"none", BS_NONE}, {"solid", BS_SOLID}, {"
                                       {"dotted", BS_DOTTED}, {"double", BS_DOUBLE}, {"groove", BS_GROOVE},
                                       {"ridge", BS_RIDGE}, {"inset", BS_INSET}, {"outset", BS_OUTSET}, {0}};
 static const struct kw kw_normal0[] = {{"normal", 0}, {0}};
+static const struct kw kw_rule_break[] = {{"none", CSS_RULE_BREAK_NONE}, {"normal", CSS_RULE_BREAK_NORMAL},
+                                          {"intersection", CSS_RULE_BREAK_INTERSECTION}, {0}};
+static const struct kw kw_rule_items[] = {{"all", CSS_RULE_ITEMS_ALL}, {"around", CSS_RULE_ITEMS_AROUND},
+                                          {"between", CSS_RULE_ITEMS_BETWEEN}, {"normal", CSS_RULE_ITEMS_NORMAL}, {0}};
+static const struct kw kw_rule_overlap[] = {{"row-over-column", CSS_RULE_ROW_OVER_COLUMN},
+                                            {"column-over-row", CSS_RULE_COLUMN_OVER_ROW}, {0}};
 static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}, {"super", VA_SUPER},
                                       {"top", VA_TOP}, {"middle", VA_MIDDLE}, {"bottom", VA_BOTTOM},
                                       {"text-top", VA_TEXT_TOP}, {"text-bottom", VA_TEXT_BOTTOM}, {0}};
@@ -654,6 +668,8 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 #define O(f) G_STYLE, (uint16_t)offsetof(style_t, f), (uint16_t)sizeof(((style_t *)0)->f)
 #define OG(g, T, f) g, (uint16_t)offsetof(T, f), (uint16_t)sizeof(((T *)0)->f) /* a field of group g, a T */
 #define SH(name, id) {name, PT_SHORT, 0, false, G_STYLE, 0, 0, NULL, id, AN_NONE}
+#define SH_GAP(name, flags) {name, PT_SHORT, flags, false, G_STYLE, 0, 0, NULL, SH_GAP_RULE, AN_NONE}
+#define OGAP(f) OG(G_GAP_RULE, struct css_gap_rules, f)
 
 /* sorted by name at first use */
 static struct propdef props[] = {
@@ -722,6 +738,50 @@ static struct propdef props[] = {
     {"color", PT_COLOR, 0, true, O(color), NULL, 0, AN_TYPE},
     {"color-scheme", PT_COLOR_SCHEME, 0, true, O(color_scheme), NULL, 0, AN_DISCRETE},
     {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0, AN_TYPE},
+    /* CSS Gap Decorations 1. flags: a list's enum css_gap_rule_kind, a shorthand's GS_* */
+    SH_GAP("column-rule", GS_RULE | GS_COLUMN),
+    SH_GAP("row-rule", GS_RULE | GS_ROW),
+    SH_GAP("rule", GS_RULE | GS_BOTH),
+    {"column-rule-color", PT_RULE_LIST, CSS_GAP_COLOR, false, OGAP(axis[0].list[CSS_GAP_COLOR]), NULL, 0, AN_TYPE},
+    {"column-rule-style", PT_RULE_LIST, CSS_GAP_STYLE, false, OGAP(axis[0].list[CSS_GAP_STYLE]), NULL, 0, AN_DISCRETE},
+    {"column-rule-width", PT_RULE_LIST, CSS_GAP_WIDTH, false, OGAP(axis[0].list[CSS_GAP_WIDTH]), NULL, 0, AN_TYPE},
+    {"row-rule-color", PT_RULE_LIST, CSS_GAP_COLOR, false, OGAP(axis[1].list[CSS_GAP_COLOR]), NULL, 0, AN_TYPE},
+    {"row-rule-style", PT_RULE_LIST, CSS_GAP_STYLE, false, OGAP(axis[1].list[CSS_GAP_STYLE]), NULL, 0, AN_DISCRETE},
+    {"row-rule-width", PT_RULE_LIST, CSS_GAP_WIDTH, false, OGAP(axis[1].list[CSS_GAP_WIDTH]), NULL, 0, AN_TYPE},
+    SH_GAP("rule-color", GS_COLOR | GS_BOTH),
+    SH_GAP("rule-style", GS_STYLE | GS_BOTH),
+    SH_GAP("rule-width", GS_WIDTH | GS_BOTH),
+    {"column-rule-break", PT_KW, 0, false, OGAP(axis[0].rule_break), kw_rule_break, 0, AN_TYPE},
+    {"row-rule-break", PT_KW, 0, false, OGAP(axis[1].rule_break), kw_rule_break, 0, AN_TYPE},
+    SH_GAP("rule-break", GS_BREAK | GS_BOTH),
+    {"column-rule-visibility-items", PT_KW, 0, false, OGAP(axis[0].visibility), kw_rule_items, 0, AN_TYPE},
+    {"row-rule-visibility-items", PT_KW, 0, false, OGAP(axis[1].visibility), kw_rule_items, 0, AN_TYPE},
+    SH_GAP("rule-visibility-items", GS_ITEMS | GS_BOTH),
+    {"rule-overlap", PT_KW, 0, false, OGAP(overlap), kw_rule_overlap, 0, AN_TYPE},
+    {"column-rule-inset-cap-start", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_CAP_START]), NULL, 0, AN_TYPE},
+    {"column-rule-inset-cap-end", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_CAP_END]), NULL, 0, AN_TYPE},
+    {"column-rule-inset-junction-start", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_JUNCTION_START]), NULL, 0,
+     AN_TYPE},
+    {"column-rule-inset-junction-end", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_JUNCTION_END]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-cap-start", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_CAP_START]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-cap-end", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_CAP_END]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-junction-start", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_JUNCTION_START]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-junction-end", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_JUNCTION_END]), NULL, 0, AN_TYPE},
+    SH_GAP("column-rule-inset-start", GS_INSET_START | GS_COLUMN),
+    SH_GAP("column-rule-inset-end", GS_INSET_END | GS_COLUMN),
+    SH_GAP("row-rule-inset-start", GS_INSET_START | GS_ROW),
+    SH_GAP("row-rule-inset-end", GS_INSET_END | GS_ROW),
+    SH_GAP("rule-inset-start", GS_INSET_START | GS_BOTH),
+    SH_GAP("rule-inset-end", GS_INSET_END | GS_BOTH),
+    SH_GAP("column-rule-inset-cap", GS_INSET_CAP | GS_COLUMN),
+    SH_GAP("column-rule-inset-junction", GS_INSET_JUNCTION | GS_COLUMN),
+    SH_GAP("row-rule-inset-cap", GS_INSET_CAP | GS_ROW),
+    SH_GAP("row-rule-inset-junction", GS_INSET_JUNCTION | GS_ROW),
+    SH_GAP("rule-inset-cap", GS_INSET_CAP | GS_BOTH),
+    SH_GAP("rule-inset-junction", GS_INSET_JUNCTION | GS_BOTH),
+    SH_GAP("column-rule-inset", GS_INSET | GS_COLUMN),
+    SH_GAP("row-rule-inset", GS_INSET | GS_ROW),
+    SH_GAP("rule-inset", GS_INSET | GS_BOTH),
     {"content", PT_CONTENT, 0, false, O(content), NULL, 0, AN_TYPE},
     {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0, AN_DISPLAY},
     SH("container", SH_CONTAINER),
@@ -926,7 +986,7 @@ static void init_initial(void) {
     s->align_self = 255;
     s->justify_self = 255;
     s->z_auto = true;
-    /* the groups (float_shape, offset) stay NULL: their initial records */
+    /* the groups (float_shape, offset, gap_rules) stay NULL: their initial records */
 }
 
 static void props_init(void) {
@@ -1003,12 +1063,17 @@ static const void *group_of(const style_t *s, uint8_t g) {
     switch (g) {
     case G_FLOAT_SHAPE: return css_style_float_shape(s);
     case G_OFFSET: return css_style_offset(s);
+    case G_GAP_RULE: return css_style_gap_rules(s);
     }
     return s;
 }
-static size_t group_size(uint8_t g) { return g == G_FLOAT_SHAPE ? sizeof(struct css_float_shape) : sizeof(struct css_offset); }
+static size_t group_size(uint8_t g) {
+    return g == G_FLOAT_SHAPE ? sizeof(struct css_float_shape) : g == G_OFFSET ? sizeof(struct css_offset) :
+                                sizeof(struct css_gap_rules);
+}
 static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
-    return g == G_FLOAT_SHAPE ? a->float_shape == b->float_shape : a->offset == b->offset;
+    return g == G_FLOAT_SHAPE ? a->float_shape == b->float_shape : g == G_OFFSET ? a->offset == b->offset :
+                                a->gap_rules == b->gap_rules;
 }
 /* s's group g becomes a copy of value in a, for the caller to finish writing: the group s held may
    be another style's too (box.c's copies of a style, the animation layer's copy of its base) */
@@ -1017,18 +1082,24 @@ static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
     void *copy = ar_alloc(a, size);
     memcpy(copy, value, size);
     if (g == G_FLOAT_SHAPE) s->float_shape = copy;
-    else s->offset = copy;
+    else if (g == G_OFFSET) s->offset = copy;
+    else s->gap_rules = copy;
     return copy;
 }
 /* every group of src, as copying each of their (uninherited) properties would */
 static void groups_copy(style_t *dst, const style_t *src) {
     dst->float_shape = src->float_shape;
     dst->offset = src->offset;
+    dst->gap_rules = src->gap_rules;
 }
 /* the property's field in s */
 static const void *field_of(const style_t *s, const struct propdef *p) {
     return (const char *)group_of(s, p->group) + p->off;
 }
+/* the gap decorations' values (below): the computed value getComputedStyle reads, longhand or
+   shorthand (1; -1 out of memory), and a declared value's specified serialization */
+static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d);
+static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
@@ -1060,8 +1131,10 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
     case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
     case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE:
         return css_computed_value(st, p, out, d) ? 1 : -1;
+    case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
     case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
         if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
+        if (p->sh == SH_GAP_RULE) return gap_computed(st, p, out, d);
         return 0;
     }
     return 0;
@@ -1077,6 +1150,7 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
         ident_is(v, n, "revert-layer")) return false;
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
+    if (p->group == G_GAP_RULE || (p->type == PT_SHORT && p->sh == SH_GAP_RULE)) return gap_specified(p, v, n, out);
     if (p->type == PT_SHAPE || p->group != G_STYLE || (p->type == PT_SHORT && p->sh == SH_OFFSET))
         return css_shape_specified(p->name, v, n, out);
     if (p->type != PT_COLOR_SCHEME) {
@@ -1113,6 +1187,553 @@ static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {
             return true;
         }
     return false;
+}
+static const char *kw_name(const struct kw *k, uint8_t v) {
+    for (; k->name; k++) if (k->v == v) return k->name;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- gap decorations (css-gaps-1) */
+static void anim_unit(sbuf *b, double v, const char *unit);
+static struct css_color anim_color_used(const style_t *st, const struct css_color_computed *v);
+static bool anim_color_text(sbuf *b, const struct css_color_computed *v);
+
+/* §4.1-4.3 and §3: currentcolor, none, medium; insets 0; normal; row-over-column */
+static const struct css_rule_item rule_initial_item = {0, 0, 1};
+static const union css_rule_value rule_initial_values[3] = {
+    {.color = {COLOR_CURRENT, NULL}}, {.style = BS_NONE}, {.width = 3}};
+#define RULE_INITIAL_AXIS {                                                                                          \
+    .list = {{&rule_initial_item, &rule_initial_values[CSS_GAP_COLOR], 1, 1},                                     \
+             {&rule_initial_item, &rule_initial_values[CSS_GAP_STYLE], 1, 1},                                     \
+             {&rule_initial_item, &rule_initial_values[CSS_GAP_WIDTH], 1, 1}},                                    \
+    .inset = {{{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}}, \
+    .rule_break = CSS_RULE_BREAK_NORMAL, .visibility = CSS_RULE_ITEMS_NORMAL}
+const struct css_gap_rules css_gap_rules_initial = {.axis = {RULE_INITIAL_AXIS, RULE_INITIAL_AXIS},
+                                                    .overlap = CSS_RULE_ROW_OVER_COLUMN};
+
+static bool rule_value_equal(int kind, const union css_rule_value *a, const union css_rule_value *b) {
+    if (kind == CSS_GAP_COLOR) return a->color.argb == b->color.argb && css_color_value_equal(a->color.exact, b->color.exact);
+    return kind == CSS_GAP_STYLE ? a->style == b->style : a->width == b->width;
+}
+static bool rule_items_equal(const struct css_rule_list *a, const struct css_rule_list *b) {
+    if (a->nitems != b->nitems || a->nvalues != b->nvalues) return false;
+    for (uint32_t i = 0; i < a->nitems; i++)
+        if (a->items[i].repeat != b->items[i].repeat || a->items[i].count != b->items[i].count) return false;
+    return true;
+}
+static bool rule_list_equal(int kind, const struct css_rule_list *a, const struct css_rule_list *b) {
+    if (!rule_items_equal(a, b)) return false;
+    for (uint32_t i = 0; i < a->nvalues; i++) if (!rule_value_equal(kind, &a->values[i], &b->values[i])) return false;
+    return true;
+}
+static bool rule_inset_equal(const struct css_rule_inset *a, const struct css_rule_inset *b) {
+    return a->join == b->join && (a->join || css_length_equal(&a->length, &b->length));
+}
+/* what the segments' geometry takes from one axis (layout.c): everything but colour and style */
+static bool rule_axis_layout_equal(const struct css_gap_axis *a, const struct css_gap_axis *b) {
+    if (a->rule_break != b->rule_break || a->visibility != b->visibility ||
+        !rule_list_equal(CSS_GAP_WIDTH, &a->list[CSS_GAP_WIDTH], &b->list[CSS_GAP_WIDTH])) return false;
+    for (int i = 0; i < 4; i++) if (!rule_inset_equal(&a->inset[i], &b->inset[i])) return false;
+    return true;
+}
+bool css_gap_rules_equal(const struct css_gap_rules *a, const struct css_gap_rules *b) {
+    if (a == b) return true;
+    if (!a) a = &css_gap_rules_initial;
+    if (!b) b = &css_gap_rules_initial;
+    if (a->overlap != b->overlap) return false;
+    for (int x = 0; x < 2; x++)
+        if (!rule_axis_layout_equal(&a->axis[x], &b->axis[x]) ||
+            !rule_list_equal(CSS_GAP_COLOR, &a->axis[x].list[CSS_GAP_COLOR], &b->axis[x].list[CSS_GAP_COLOR]) ||
+            !rule_list_equal(CSS_GAP_STYLE, &a->axis[x].list[CSS_GAP_STYLE], &b->axis[x].list[CSS_GAP_STYLE])) return false;
+    return true;
+}
+/* a container records its segments only while its style holds the group (layout.c) */
+bool css_gap_rules_layout_equal(const struct css_gap_rules *a, const struct css_gap_rules *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    return rule_axis_layout_equal(&a->axis[0], &b->axis[0]) && rule_axis_layout_equal(&a->axis[1], &b->axis[1]);
+}
+
+/* how many values item it stands for once written out (an auto repeater's own values once) */
+static uint64_t rule_item_span(const struct css_rule_item *it) {
+    return it->repeat == 0 ? 1 : it->repeat == CSS_RULE_AUTO ? it->count : (uint64_t)it->repeat * it->count;
+}
+/* value k of items [from, to) with their integer repeaters written out */
+static union css_rule_value rule_expanded_at(const struct css_rule_list *l, uint32_t from, uint32_t to, uint64_t k) {
+    for (uint32_t i = from; i < to; i++) {
+        const struct css_rule_item *it = &l->items[i];
+        uint64_t span = rule_item_span(it);
+        if (k < span) return l->values[it->first + (uint32_t)(k % it->count)];
+        k -= span;
+    }
+    return l->values[l->nvalues - 1];
+}
+/* §4.6 "assign gap decoration values to a list of gaps" for gap index of count */
+union css_rule_value css_rule_value_at(const struct css_rule_list *l, uint32_t index, uint32_t count) {
+    uint32_t a = l->nitems;
+    for (uint32_t i = 0; i < l->nitems; i++) if (l->items[i].repeat == CSS_RULE_AUTO) { a = i; break; }
+    uint64_t leading = 0, trailing = 0;
+    for (uint32_t i = 0; i < a; i++) leading += rule_item_span(&l->items[i]);
+    if (a == l->nitems) return rule_expanded_at(l, 0, a, leading ? index % leading : 0);
+    for (uint32_t i = a + 1; i < l->nitems; i++) trailing += rule_item_span(&l->items[i]);
+    if (index < leading) return rule_expanded_at(l, 0, a, index);
+    /* the trailing gaps are the last trailing count, without the leading ones */
+    uint64_t first_trailing = count > trailing ? count - trailing : 0;
+    if (first_trailing < leading) first_trailing = leading;
+    if (index >= first_trailing) return rule_expanded_at(l, a + 1, l->nitems, index - first_trailing);
+    const struct css_rule_item *it = &l->items[a];
+    return l->values[it->first + (uint32_t)((index - leading) % it->count)];
+}
+
+/* the parts of a comma-separated list, each trimmed; -1 for an empty part or an unbalanced bracket */
+static int rule_parts(const char *v, size_t n, struct cx *cx, const char ***tok, size_t **len) {
+    size_t count = 1;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = v[i];
+        if (quote) { if (c == '\\') i++; else if (c == quote) quote = 0; }
+        else if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') depth++;
+        else if (c == ')') { if (!depth) return -1; depth--; }
+        else if (c == ',' && !depth) count++;
+    }
+    if (depth || quote || count > INT32_MAX) return -1;
+    const char **t = ar_alloc(cx->a, count * sizeof *t);
+    size_t *l = ar_alloc(cx->a, count * sizeof *l), k = 0, start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        char c = i < n ? v[i] : ',';
+        if (i < n && quote) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+        if (i < n && (c == '"' || c == '\'')) { quote = c; continue; }
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == ',' && !depth) {
+            const char *s = v + start;
+            size_t m = (i < n ? i : n) - start;
+            trim(&s, &m);
+            if (!m) return -1;
+            t[k] = s; l[k++] = m;
+            start = i + 1;
+        }
+    }
+    *tok = t; *len = l;
+    return (int)k;
+}
+/* repeat( <count> , <values> ): the two arguments' text, when s is that whole function */
+static bool rule_repeat(const char *s, size_t n, const char **count, size_t *count_n, const char **values, size_t *values_n) {
+    if (n < 8 || !strn_ieq(s, "repeat(", 7)) return false;
+    const char *p = s + 7, *end = s + n, *comma = NULL;
+    int depth = 0;
+    for (; p < end; p++) {
+        if (*p == '(') depth++;
+        else if (*p == ')') { if (!depth) break; depth--; }
+        else if (*p == ',' && !depth && !comma) comma = p;
+    }
+    if (p != end - 1) return false; /* its closing bracket ends the part */
+    if (!comma) comma = p;
+    *count = s + 7; *count_n = (size_t)(comma - (s + 7));
+    *values = comma < p ? comma + 1 : p; *values_n = (size_t)(p - *values);
+    return true;
+}
+/* <integer [1,∞]> (a math function rounds to one) or auto */
+static bool rule_repeat_count(const char *s, size_t n, struct cx *cx, uint32_t *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    if (ident_is(s, n, "auto")) { *out = CSS_RULE_AUTO; return true; }
+    size_t i = s[0] == '+' ? 1 : 0;
+    if (i < n && isdigit((unsigned char)s[i])) {
+        uint64_t v = 0;
+        for (; i < n; i++) {
+            if (!isdigit((unsigned char)s[i])) return false;
+            if (v < INT32_MAX) v = v * 10 + (uint64_t)(s[i] - '0');
+        }
+        if (v < 1) return false;
+        *out = v > INT32_MAX ? INT32_MAX : (uint32_t)v; /* integers beyond the range clamp */
+        return true;
+    }
+    float x;
+    if (!isalpha((unsigned char)s[0]) || !parse_number_value(s, n, cx, &x)) return false;
+    x = roundf(x);
+    if (!(x >= 1)) return false;
+    *out = x > (float)INT32_MAX ? INT32_MAX : (uint32_t)x;
+    return true;
+}
+/* §4.3: a <line-width> as a border width snaps (css-values-4 "snap as a border width") */
+static float rule_snap(float w) { return w > 0 && w < 1 ? 1 : floorf(w); }
+static bool rule_width(const char *s, size_t n, struct cx *cx, float *out) {
+    uint8_t k;
+    if (kw_find(kw_bwidth, s, n, &k)) { *out = k; return true; }
+    len_t l;
+    if (!parse_len(s, n, cx, &l, LF_NOPCT | LF_LENGTH) || (l.kind != LK_LEN && l.kind != LK_EXPR)) return false;
+    float px = len_resolve(&l, 0);
+    if (!isfinite(px) || px != len_resolve(&l, 100)) return false; /* a <length>: no percentage inside */
+    *out = rule_snap(px < 0 ? 0 : px); /* a math function clamps to the range */
+    return true;
+}
+/* one value of a list of kind */
+static bool rule_value(int kind, const char *s, size_t n, struct cx *cx, union css_rule_value *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    if (kind == CSS_GAP_STYLE) return kw_find(kw_bstyle, s, n, &out->style);
+    if (kind == CSS_GAP_WIDTH) return rule_width(s, n, cx, &out->width);
+    return css_color_value_compute(s, n, cx, NULL, &out->color.argb, &out->color.exact);
+}
+static void rule_spec_word(sbuf *spec, const char *s, size_t n) {
+    if (!isalpha((unsigned char)s[0])) { shadow_specified_length(spec, s, n); return; }
+    for (size_t i = 0; i < n; i++) sb_putc(spec, (char)lower((unsigned char)s[i]));
+}
+/* §4.4 <gap-rule> = <line-width> || <line-style> || <color>, by list kind; the specified value
+   leaves out what is initial and orders the rest as the grammar does */
+static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_value v[3], sbuf *spec) {
+    const char *t[4];
+    size_t tl[4];
+    int k = split(s, n, t, tl, 4, ' ');
+    if (k < 1 || k > 3 || t[k - 1] + tl[k - 1] != s + n) return false;
+    int at[3] = {-1, -1, -1};
+    v[CSS_GAP_COLOR] = rule_initial_values[CSS_GAP_COLOR];
+    v[CSS_GAP_STYLE] = rule_initial_values[CSS_GAP_STYLE];
+    v[CSS_GAP_WIDTH] = rule_initial_values[CSS_GAP_WIDTH];
+    static const int order[3] = {CSS_GAP_STYLE, CSS_GAP_COLOR, CSS_GAP_WIDTH};
+    for (int i = 0; i < k; i++) {
+        int found = -1;
+        for (int j = 0; j < 3 && found < 0; j++)
+            if (at[order[j]] < 0 && rule_value(order[j], t[i], tl[i], cx, &v[order[j]])) found = order[j];
+        if (found < 0) return false;
+        at[found] = i;
+    }
+    if (!spec) return true;
+    size_t begin = spec->n;
+    int w = at[CSS_GAP_WIDTH], st = at[CSS_GAP_STYLE], c = at[CSS_GAP_COLOR];
+    if (w >= 0 && !ident_is(t[w], tl[w], "medium")) rule_spec_word(spec, t[w], tl[w]);
+    if (st >= 0 && !ident_is(t[st], tl[st], "none")) {
+        if (spec->n > begin) sb_putc(spec, ' ');
+        rule_spec_word(spec, t[st], tl[st]);
+    }
+    if (c >= 0) {
+        sbuf color = {0};
+        if (css_color_specified(t[c], tl[c], &color) && !ident_is(color.p, color.n, "currentcolor")) {
+            if (spec->n > begin) sb_putc(spec, ' ');
+            sb_put(spec, color.p, color.n);
+        }
+        sb_free(&color);
+    }
+    if (spec->n == begin) sb_puts(spec, "medium");
+    return true;
+}
+/* §4.1-4.5: a list of kind's values (kind RULE_GAP: the shorthand's <gap-rule-list>, into the three
+   lists at once, with its specified value in spec) with at most one auto repeater */
+enum { RULE_GAP = 3 };
+static bool rule_lists(int kind, const char *v, size_t n, struct cx *cx, struct css_rule_list out[3], sbuf *spec) {
+    const char **part;
+    size_t *part_n;
+    int parts = rule_parts(v, n, cx, &part, &part_n);
+    if (parts < 1) return false;
+    struct css_rule_item *items = ar_alloc(cx->a, (size_t)parts * sizeof *items);
+    const char ***text = ar_alloc(cx->a, (size_t)parts * sizeof *text);
+    size_t **text_n = ar_alloc(cx->a, (size_t)parts * sizeof *text_n);
+    uint64_t total = 0;
+    bool repeat_auto = false;
+    for (int i = 0; i < parts; i++) {
+        const char *count, *values;
+        size_t count_n, values_n;
+        if (rule_repeat(part[i], part_n[i], &count, &count_n, &values, &values_n)) {
+            uint32_t times;
+            if (!rule_repeat_count(count, count_n, cx, &times)) return false;
+            if (times == CSS_RULE_AUTO) { if (repeat_auto) return false; repeat_auto = true; }
+            int inner = rule_parts(values, values_n, cx, &text[i], &text_n[i]);
+            if (inner < 1) return false;
+            items[i] = (struct css_rule_item){times, (uint32_t)total, (uint32_t)inner};
+            total += (uint64_t)inner;
+        } else {
+            text[i] = &part[i]; text_n[i] = &part_n[i];
+            items[i] = (struct css_rule_item){0, (uint32_t)total, 1};
+            total++;
+        }
+        if (total > UINT32_MAX) return false;
+    }
+    int first = kind == RULE_GAP ? 0 : kind, last = kind == RULE_GAP ? 2 : kind;
+    union css_rule_value *values[3] = {NULL, NULL, NULL};
+    for (int l = first; l <= last; l++) values[l] = ar_alloc(cx->a, (size_t)total * sizeof *values[l]);
+    for (int i = 0; i < parts; i++) {
+        const struct css_rule_item *it = &items[i];
+        if (spec) {
+            if (i) sb_puts(spec, ", ");
+            if (it->repeat == CSS_RULE_AUTO) sb_puts(spec, "repeat(auto, ");
+            else if (it->repeat) { char number[16]; snprintf(number, sizeof number, "repeat(%u, ", it->repeat); sb_puts(spec, number); }
+        }
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (spec && j) sb_puts(spec, ", ");
+            if (kind == RULE_GAP) {
+                union css_rule_value triple[3];
+                if (!gap_rule(text[i][j], text_n[i][j], cx, triple, spec)) return false;
+                for (int l = 0; l < 3; l++) values[l][it->first + j] = triple[l];
+            } else if (!rule_value(kind, text[i][j], text_n[i][j], cx, &values[kind][it->first + j])) return false;
+        }
+        if (spec && it->repeat) sb_putc(spec, ')');
+    }
+    for (int l = first; l <= last; l++) out[l] = (struct css_rule_list){items, values[l], (uint32_t)parts, (uint32_t)total};
+    return true;
+}
+/* <inset-value> (§3.3) */
+static bool rule_inset(const char *s, size_t n, struct cx *cx, struct css_rule_inset *out, sbuf *spec) {
+    trim(&s, &n);
+    if (ident_is(s, n, "overlap-join")) {
+        *out = (struct css_rule_inset){{.kind = LK_LEN}, true};
+        if (spec) sb_puts(spec, "overlap-join");
+        return true;
+    }
+    len_t l;
+    if (!parse_len(s, n, cx, &l, LF_NEG | LF_LENGTH) || (l.kind != LK_LEN && l.kind != LK_EXPR)) return false;
+    *out = (struct css_rule_inset){l, false};
+    if (spec) shadow_specified_length(spec, s, n);
+    return true;
+}
+/* the longhand names each GS_* sets on one axis, after its column- or row- */
+static const char *const gap_longhand_names[GS_INSET + 1][4] = {
+    [GS_RULE] = {"-rule-width", "-rule-style", "-rule-color"},
+    [GS_COLOR] = {"-rule-color"}, [GS_STYLE] = {"-rule-style"}, [GS_WIDTH] = {"-rule-width"},
+    [GS_BREAK] = {"-rule-break"}, [GS_ITEMS] = {"-rule-visibility-items"},
+    [GS_INSET_START] = {"-rule-inset-cap-start", "-rule-inset-junction-start"},
+    [GS_INSET_END] = {"-rule-inset-cap-end", "-rule-inset-junction-end"},
+    [GS_INSET_CAP] = {"-rule-inset-cap-start", "-rule-inset-cap-end"},
+    [GS_INSET_JUNCTION] = {"-rule-inset-junction-start", "-rule-inset-junction-end"},
+    [GS_INSET] = {"-rule-inset-cap-start", "-rule-inset-cap-end", "-rule-inset-junction-start", "-rule-inset-junction-end"},
+};
+static const struct propdef *find_prop(const char *name, size_t n);
+static const struct propdef *gap_longhand(int what, int axis, int i) {
+    const char *suffix = gap_longhand_names[what][i];
+    if (!suffix) return NULL;
+    char name[64];
+    snprintf(name, sizeof name, "%s%s", axis ? "row" : "column", suffix);
+    return find_prop(name, strlen(name));
+}
+/* the inset shorthands' values (§3.3.1-3.3.3) into inset in the longhands' order, each value's
+   specified text in spec (when given) */
+static bool rule_insets(int what, const char *v, size_t n, struct cx *cx, struct css_rule_inset inset[4], sbuf spec[4]) {
+    const char *half[3], *t[3];
+    size_t half_n[3], tn[3];
+    trim(&v, &n);
+    int halves = what == GS_INSET ? split(v, n, half, half_n, 3, '/') : 1;
+    if (what != GS_INSET) { half[0] = v; half_n[0] = n; }
+    if (halves < 1 || halves > 2 || half[halves - 1] + half_n[halves - 1] != v + n) return false;
+    int slot[2][2] = {{CSS_RULE_CAP_START, CSS_RULE_CAP_END}, {CSS_RULE_JUNCTION_START, CSS_RULE_JUNCTION_END}};
+    if (what == GS_INSET_JUNCTION) slot[0][0] = CSS_RULE_JUNCTION_START, slot[0][1] = CSS_RULE_JUNCTION_END;
+    int most = what == GS_INSET_START || what == GS_INSET_END ? 1 : 2;
+    for (int h = 0; h < halves; h++) {
+        if (!half_n[h]) return false;
+        int k = split(half[h], half_n[h], t, tn, 3, ' ');
+        if (k < 1 || k > most || t[k - 1] + tn[k - 1] != half[h] + half_n[h]) return false;
+        if (what == GS_INSET_START || what == GS_INSET_END) {
+            int a = what == GS_INSET_START ? CSS_RULE_CAP_START : CSS_RULE_CAP_END;
+            int b = what == GS_INSET_START ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END;
+            if (!rule_inset(t[0], tn[0], cx, &inset[a], spec ? &spec[a] : NULL)) return false;
+            inset[b] = inset[a];
+            if (spec) sb_put(&spec[b], spec[a].p, spec[a].n);
+            return true;
+        }
+        int a = slot[h][0], b = slot[h][1];
+        if (!rule_inset(t[0], tn[0], cx, &inset[a], spec ? &spec[a] : NULL) ||
+            !rule_inset(t[k - 1], tn[k - 1], cx, &inset[b], spec ? &spec[b] : NULL)) return false;
+    }
+    if (halves == 1 && what == GS_INSET) { /* the junction values are the cap ones */
+        inset[CSS_RULE_JUNCTION_START] = inset[CSS_RULE_CAP_START];
+        inset[CSS_RULE_JUNCTION_END] = inset[CSS_RULE_CAP_END];
+        if (spec) {
+            sb_put(&spec[CSS_RULE_JUNCTION_START], spec[CSS_RULE_CAP_START].p, spec[CSS_RULE_CAP_START].n);
+            sb_put(&spec[CSS_RULE_JUNCTION_END], spec[CSS_RULE_CAP_END].p, spec[CSS_RULE_CAP_END].n);
+        }
+    }
+    return true;
+}
+/* a gap decoration shorthand's value (what: GS_*) into one axis' values */
+static bool gap_shorthand_parse(int what, const char *v, size_t n, struct cx *cx, struct css_gap_axis *out, sbuf *spec,
+                                sbuf inset_spec[4]) {
+    switch (what) {
+    case GS_RULE: return rule_lists(RULE_GAP, v, n, cx, out->list, spec);
+    case GS_COLOR: return rule_lists(CSS_GAP_COLOR, v, n, cx, out->list, NULL);
+    case GS_STYLE: return rule_lists(CSS_GAP_STYLE, v, n, cx, out->list, NULL);
+    case GS_WIDTH: return rule_lists(CSS_GAP_WIDTH, v, n, cx, out->list, NULL);
+    case GS_BREAK: return kw_find(kw_rule_break, v, n, &out->rule_break);
+    case GS_ITEMS: return kw_find(kw_rule_items, v, n, &out->visibility);
+    }
+    return rule_insets(what, v, n, cx, out->inset, inset_spec);
+}
+/* a shorthand: the longhands no more important declaration set, written into one copy of the group */
+static bool set_long(const char *name, const char *v, size_t n, struct cx *cx);
+static bool gap_shorthand_apply(const struct propdef *p, const char *v, size_t n, bool global, struct cx *cx) {
+    int what = p->flags & 15;
+    if (global) {
+        for (int axis = 0; axis < 2; axis++)
+            if (p->flags & (axis ? GS_ROW : GS_COLUMN))
+                for (int i = 0; i < 4; i++) {
+                    const struct propdef *q = gap_longhand(what, axis, i);
+                    if (q) set_long(q->name, v, n, cx);
+                }
+        return true;
+    }
+    struct css_gap_axis parsed = css_gap_rules_initial.axis[0];
+    if (!gap_shorthand_parse(what, v, n, cx, &parsed, NULL, NULL)) return false;
+    if (cx->font_pass) return true;
+    struct css_gap_rules own = *css_style_gap_rules(cx->s);
+    bool written = false;
+    for (int axis = 0; axis < 2; axis++) {
+        if (!(p->flags & (axis ? GS_ROW : GS_COLUMN))) continue;
+        size_t base = offsetof(struct css_gap_rules, axis) + (size_t)axis * sizeof(struct css_gap_axis);
+        for (int i = 0; i < 4; i++) {
+            const struct propdef *q = gap_longhand(what, axis, i);
+            if (!q) continue;
+            int at = css_prop_index(q);
+            if (cx->set[at]) continue;
+            memcpy((char *)&own + q->off, (const char *)&parsed + (q->off - base), q->size);
+            cx->set[at] = 1;
+            written = true;
+        }
+    }
+    if (written) group_write(cx->s, G_GAP_RULE, &own, cx->a);
+    return true;
+}
+
+/* ---- serialization */
+static void rule_value_text(const style_t *st, int kind, const union css_rule_value *v, bool resolved, sbuf *out) {
+    if (kind == CSS_GAP_STYLE) { sb_puts(out, kw_name(kw_bstyle, v->style)); return; }
+    if (kind == CSS_GAP_WIDTH) { anim_unit(out, v->width, "px"); return; }
+    struct css_color_computed c;
+    css_color_held(v->color.argb, v->color.exact, st->color, &c);
+    if (!resolved) { anim_color_text(out, &c); return; }
+    struct css_color used = anim_color_used(st, &c);
+    css_color_serialize(&used, false, out);
+}
+static void rule_repeat_open(const struct css_rule_item *it, sbuf *out) {
+    if (it->repeat == CSS_RULE_AUTO) sb_puts(out, "repeat(auto, ");
+    else { char number[24]; snprintf(number, sizeof number, "repeat(%u, ", it->repeat); sb_puts(out, number); }
+}
+/* a list's computed value; resolved: currentcolor as the used colour (getComputedStyle), else as
+   the animation layer reads it back */
+static void rule_list_text(const style_t *st, int kind, const struct css_rule_list *l, bool resolved, sbuf *out) {
+    for (uint32_t i = 0; i < l->nitems; i++) {
+        const struct css_rule_item *it = &l->items[i];
+        if (i) sb_puts(out, ", ");
+        if (it->repeat) rule_repeat_open(it, out);
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (j) sb_puts(out, ", ");
+            rule_value_text(st, kind, &l->values[it->first + j], resolved, out);
+        }
+        if (it->repeat) sb_putc(out, ')');
+    }
+}
+static bool rule_inset_text(const struct css_rule_inset *v, sbuf *out, web_doc *d) {
+    if (v->join) { sb_puts(out, "overlap-join"); return true; }
+    return css_length_serialize(&v->length, out, d);
+}
+/* §4.8: column-rule and row-rule from their longhands when they are repeater aligned (false: they
+   serialize as the empty string) */
+static bool rule_triple_text(const style_t *st, const struct css_gap_axis *x, sbuf *out) {
+    const struct css_rule_list *w = &x->list[CSS_GAP_WIDTH], *s = &x->list[CSS_GAP_STYLE], *c = &x->list[CSS_GAP_COLOR];
+    if (w->nitems != s->nitems || w->nitems != c->nitems) return false;
+    for (uint32_t i = 0; i < w->nitems; i++)
+        if (w->items[i].repeat != s->items[i].repeat || w->items[i].repeat != c->items[i].repeat ||
+            w->items[i].count != s->items[i].count || w->items[i].count != c->items[i].count) return false;
+    for (uint32_t i = 0; i < w->nitems; i++) {
+        const struct css_rule_item *it = &w->items[i];
+        if (i) sb_puts(out, ", ");
+        if (it->repeat) rule_repeat_open(it, out);
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (j) sb_puts(out, ", ");
+            rule_value_text(st, CSS_GAP_WIDTH, &w->values[w->items[i].first + j], true, out);
+            sb_putc(out, ' ');
+            rule_value_text(st, CSS_GAP_STYLE, &s->values[s->items[i].first + j], true, out);
+            sb_putc(out, ' ');
+            rule_value_text(st, CSS_GAP_COLOR, &c->values[c->items[i].first + j], true, out);
+        }
+        if (it->repeat) sb_putc(out, ')');
+    }
+    return true;
+}
+/* a shorthand's value on one axis: false when its longhands have no common value */
+static bool gap_axis_text(const style_t *st, int what, const struct css_gap_axis *x, sbuf *out, web_doc *d) {
+    const struct css_rule_inset *in = x->inset;
+    switch (what) {
+    case GS_RULE: return rule_triple_text(st, x, out);
+    case GS_COLOR: rule_list_text(st, CSS_GAP_COLOR, &x->list[CSS_GAP_COLOR], true, out); return true;
+    case GS_STYLE: rule_list_text(st, CSS_GAP_STYLE, &x->list[CSS_GAP_STYLE], true, out); return true;
+    case GS_WIDTH: rule_list_text(st, CSS_GAP_WIDTH, &x->list[CSS_GAP_WIDTH], true, out); return true;
+    case GS_BREAK: sb_puts(out, kw_name(kw_rule_break, x->rule_break)); return true;
+    case GS_ITEMS: sb_puts(out, kw_name(kw_rule_items, x->visibility)); return true;
+    case GS_INSET_START: case GS_INSET_END: {
+        int a = what == GS_INSET_START ? CSS_RULE_CAP_START : CSS_RULE_CAP_END;
+        int b = what == GS_INSET_START ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END;
+        return rule_inset_equal(&in[a], &in[b]) && rule_inset_text(&in[a], out, d);
+    }
+    case GS_INSET_CAP: case GS_INSET_JUNCTION: {
+        int a = what == GS_INSET_CAP ? CSS_RULE_CAP_START : CSS_RULE_JUNCTION_START;
+        if (!rule_inset_text(&in[a], out, d)) return false;
+        if (rule_inset_equal(&in[a], &in[a + 1])) return true;
+        sb_putc(out, ' ');
+        return rule_inset_text(&in[a + 1], out, d);
+    }
+    }
+    /* <'column-rule-inset-cap'> [ / <'column-rule-inset-junction'> ]?: one value when the four agree */
+    bool same = true;
+    for (int i = 1; i < 4; i++) same &= rule_inset_equal(&in[0], &in[i]);
+    if (same) return rule_inset_text(&in[0], out, d);
+    return rule_inset_text(&in[0], out, d) && (sb_putc(out, ' '), rule_inset_text(&in[1], out, d)) &&
+           (sb_puts(out, " / "), rule_inset_text(&in[2], out, d)) && (sb_putc(out, ' '), rule_inset_text(&in[3], out, d));
+}
+static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
+    const struct css_gap_rules *g = css_style_gap_rules(st);
+    size_t begin = out->n;
+    if (p->type == PT_RULE_LIST) { rule_list_text(st, p->flags, (const struct css_rule_list *)field_of(st, p), true, out); return 1; }
+    if (p->type == PT_RULE_INSET) return rule_inset_text((const struct css_rule_inset *)field_of(st, p), out, d) ? 1 : -1;
+    int what = p->flags & 15;
+    bool column = p->flags & GS_COLUMN, row = p->flags & GS_ROW, ok = true;
+    if (column) ok = gap_axis_text(st, what, &g->axis[0], out, d);
+    if (ok && row) {
+        if (!column) ok = gap_axis_text(st, what, &g->axis[1], out, d);
+        else { /* the bidirectional shorthands: both axes' values, when they agree */
+            sbuf other = {0};
+            ok = gap_axis_text(st, what, &g->axis[1], &other, d) && other.n == out->n - begin &&
+                 !memcmp(other.p, out->p + begin, other.n);
+            sb_free(&other);
+        }
+    }
+    if (!ok) { out->n = begin; sb_cstr(out); }
+    return 1;
+}
+/* CSSOM: a declared value's specified serialization; false leaves the authored text */
+static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    int what = p->type == PT_SHORT ? p->flags & 15 : -1;
+    if (p->type != PT_RULE_INSET && what != GS_RULE && what < GS_INSET_START) return false;
+    if (memchr(v, '\\', n)) return false;
+    for (size_t i = 0; i + 4 <= n; i++) if (strn_ieq(v + i, "var(", 4)) return false;
+    arena_t arena = {.chunk_size = 4096};
+    jmp_buf trap;
+    arena.trap = &trap;
+    size_t begin = out->n;
+    volatile bool ok = false;
+    sbuf spec[4] = {{0}};
+    if (!setjmp(trap)) {
+        struct cx cx = {.em = 16, .rem = 16, .vw = 800, .vh = 600, .a = &arena};
+        struct css_gap_axis parsed = css_gap_rules_initial.axis[0];
+        if (p->type == PT_RULE_INSET) ok = rule_inset(v, n, &cx, &parsed.inset[0], out);
+        else if (what == GS_RULE) ok = rule_lists(RULE_GAP, v, n, &cx, parsed.list, out);
+        else if ((ok = gap_shorthand_parse(what, v, n, &cx, &parsed, NULL, spec))) {
+            /* the shortest form of the specified values, as the computed ones' */
+            int a = what == GS_INSET_JUNCTION ? CSS_RULE_JUNCTION_START : what == GS_INSET_END ? CSS_RULE_CAP_END : 0;
+            int count = what == GS_INSET ? 4 : what == GS_INSET_START || what == GS_INSET_END ? 1 : 2;
+            bool same = true;
+            for (int i = 1; i < count; i++)
+                same &= spec[a + i].n == spec[a].n && !memcmp(spec[a + i].p, spec[a].p, spec[a].n);
+            for (int i = 0; i < (same ? 1 : count); i++) {
+                if (i) sb_puts(out, i == 2 ? " / " : " ");
+                sb_put(out, spec[a + i].p, spec[a + i].n);
+            }
+        }
+    }
+    for (int i = 0; i < 4; i++) sb_free(&spec[i]);
+    ar_free(&arena);
+    if (!ok) out->n = begin;
+    sb_cstr(out);
+    return ok;
 }
 
 static bool parse_display(const char *s, size_t n, uint8_t *out, struct cx *cx) {
@@ -2456,7 +3077,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     }
     if (p->group == G_STYLE) return apply_value(p, v, n, cx, (char *)s + p->off);
     /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
-    union { struct css_float_shape float_shape; struct css_offset offset; } own;
+    union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules; } own;
     memcpy(&own, group_of(s, p->group), group_size(p->group));
     if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
     group_write(s, p->group, &own, cx->a);
@@ -2627,6 +3248,13 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     case PT_FILTER: return parse_filter(v, n, cx, &s->filter);
     case PT_SHAPE: return css_shape_parse(p->flags, v, n, cx, (const struct css_shape **)field, NULL);
     case PT_OFFSET: return css_offset_parse(p->flags, v, n, cx, field, NULL);
+    case PT_RULE_LIST: {
+        struct css_rule_list lists[3];
+        if (!rule_lists(p->flags, v, n, cx, lists, NULL)) return false;
+        *(struct css_rule_list *)field = lists[p->flags];
+        return true;
+    }
+    case PT_RULE_INSET: return rule_inset(v, n, cx, (struct css_rule_inset *)field, NULL);
     case PT_CLIP: return parse_clip_rect(v, n, cx, &s->clip);
     case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
     case PT_OPACITY: {
@@ -3110,6 +3738,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         }
         return set_border(v, n, cx, sides, ns);
     }
+    case SH_GAP_RULE: return gap_shorthand_apply(p, v, n, global, cx);
     case SH_OFFSET: {
         static const char *const names[] = {"offset-position", "offset-path", "offset-distance", "offset-rotate", "offset-anchor"};
         if (global) { for (unsigned i = 0; i < 5; i++) set_long(names[i], v, n, cx); return true; }
@@ -4144,6 +4773,9 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         }
         break;
     }
+    /* gap decorations: currentcolor stays itself, for the cascade to resolve against the element */
+    case PT_RULE_LIST: rule_list_text(st, p->flags, (const struct css_rule_list *)field, false, out); break;
+    case PT_RULE_INSET: ok = rule_inset_text((const struct css_rule_inset *)field, out, d); break;
 
     default: return false;
     }
@@ -4211,6 +4843,8 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         return x->kind == y->kind && x->n == y->n && same_text(x->name, y->name);
     }
     case PT_SHAPE: return css_shape_equal(*(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb);
+    case PT_RULE_LIST: return rule_list_equal(p->flags, (const struct css_rule_list *)fa, (const struct css_rule_list *)fb);
+    case PT_RULE_INSET: return rule_inset_equal((const struct css_rule_inset *)fa, (const struct css_rule_inset *)fb);
     case PT_OFFSET:
         if (p->flags == CSS_OFFSET_ROTATE) return !memcmp(fa, fb, sizeof(struct css_offset_rotate));
         return css_length_equal(&((const len_t *)fa)[0], &((const len_t *)fb)[0]) &&
@@ -4252,6 +4886,111 @@ bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const s
         if (hides_a != hides_b) return hides_a;
     }
     return t >= .5;
+}
+
+/* -------- gap decoration lists (css-gaps-1 §4.7) */
+/* a walk through items [from, to) of a list with their integer repeaters written out, round and
+   round (an auto repeater's values once a round) */
+struct rule_walk {
+    const struct css_rule_list *l;
+    uint32_t from, to, item, j;
+    uint64_t round;
+};
+static void rule_walk_start(struct rule_walk *w, const struct css_rule_list *l, uint32_t from, uint32_t to) {
+    *w = (struct rule_walk){l, from, to, from, 0, 0};
+}
+static const union css_rule_value *rule_walk_next(struct rule_walk *w) {
+    const struct css_rule_item *it = &w->l->items[w->item];
+    const union css_rule_value *v = &w->l->values[it->first + w->j];
+    if (++w->j < it->count) return v;
+    w->j = 0;
+    uint64_t rounds = it->repeat && it->repeat != CSS_RULE_AUTO ? it->repeat : 1;
+    if (++w->round < rounds) return v;
+    w->round = 0;
+    if (++w->item == w->to) w->item = w->from;
+    return v;
+}
+static uint64_t rule_span(const struct css_rule_list *l, uint32_t from, uint32_t to) {
+    uint64_t n = 0;
+    for (uint32_t i = from; i < to; i++) {
+        uint64_t span = rule_item_span(&l->items[i]);
+        if (n > UINT64_MAX - span) return UINT64_MAX;
+        n += span;
+    }
+    return n;
+}
+static uint32_t rule_auto_item(const struct css_rule_list *l) {
+    for (uint32_t i = 0; i < l->nitems; i++) if (l->items[i].repeat == CSS_RULE_AUTO) return i;
+    return l->nitems;
+}
+/* the repeatable list's length (Web Animations 1 §5.3): the lowest common multiple; 0 past 64 bits */
+static uint64_t rule_lcm(uint64_t a, uint64_t b) {
+    if (!a || !b) return 0;
+    uint64_t x = a, y = b;
+    while (y) { uint64_t r = x % y; x = y; y = r; }
+    a /= x;
+    return a > UINT64_MAX / b ? 0 : a * b;
+}
+static bool rule_value_combine(int kind, const style_t *a, const union css_rule_value *x, const style_t *b,
+                               const union css_rule_value *y, double ka, double kb, int mode, sbuf *out) {
+    if (kind == CSS_GAP_WIDTH) { anim_unit(out, anim_clamp(x->width * ka + y->width * kb, 0, INFINITY), "px"); return true; }
+    struct css_color_computed u, v;
+    css_color_held(x->color.argb, x->color.exact, a->color, &u);
+    css_color_held(y->color.argb, y->color.exact, b->color, &v);
+    return anim_color(out, a, &u, b, &v, kb, mode);
+}
+/* n values of the two walks against each other, each after a comma unless *first; the text grows
+   only while memory allows, and stops when the document is cancelled */
+static bool rule_walks_combine(const struct css_anim_ctx *c, int kind, const style_t *a, struct rule_walk *wx,
+                               const style_t *b, struct rule_walk *wy, uint64_t n, double ka, double kb, int mode,
+                               bool *first, sbuf *out) {
+    sbuf one = {0};
+    bool ok = true;
+    for (uint64_t k = 0; k < n && ok; k++) {
+        if (!(k & 1023) && c->d && __atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE)) { ok = false; break; }
+        one.n = 0;
+        ok = rule_value_combine(kind, a, rule_walk_next(wx), b, rule_walk_next(wy), ka, kb, mode, &one) &&
+             (*first || length_append(out, ", ", 2)) && length_append(out, one.p, one.n);
+        *first = false;
+    }
+    sb_free(&one);
+    return ok;
+}
+/* §4.7: integer repeaters written out, then the repeatable list's items against each other; with
+   an auto repeater in both, the leading and trailing values pairwise (their lengths must match)
+   and the auto repeaters' values as a repeatable list. Otherwise false: discrete. */
+static bool rule_lists_combine(const struct css_anim_ctx *c, int kind, const style_t *a, const struct css_rule_list *x,
+                               const style_t *b, const struct css_rule_list *y, double ka, double kb, int mode, sbuf *out) {
+    uint32_t ax = rule_auto_item(x), ay = rule_auto_item(y);
+    bool repeat_auto = ax < x->nitems;
+    if (repeat_auto != (ay < y->nitems)) return false;
+    struct rule_walk wx, wy;
+    bool first = true;
+    if (!repeat_auto) {
+        uint64_t n = rule_lcm(rule_span(x, 0, x->nitems), rule_span(y, 0, y->nitems));
+        if (!n) return false;
+        rule_walk_start(&wx, x, 0, x->nitems);
+        rule_walk_start(&wy, y, 0, y->nitems);
+        return rule_walks_combine(c, kind, a, &wx, b, &wy, n, ka, kb, mode, &first, out);
+    }
+    uint64_t leading = rule_span(x, 0, ax), trailing = rule_span(x, ax + 1, x->nitems);
+    if (leading != rule_span(y, 0, ay) || trailing != rule_span(y, ay + 1, y->nitems)) return false;
+    if (leading) {
+        rule_walk_start(&wx, x, 0, ax);
+        rule_walk_start(&wy, y, 0, ay);
+        if (!rule_walks_combine(c, kind, a, &wx, b, &wy, leading, ka, kb, mode, &first, out)) return false;
+    }
+    uint64_t n = rule_lcm(x->items[ax].count, y->items[ay].count);
+    bool inner = true;
+    if (!n || !length_append(out, first ? "repeat(auto, " : ", repeat(auto, ", first ? 13 : 15)) return false;
+    rule_walk_start(&wx, x, ax, ax + 1);
+    rule_walk_start(&wy, y, ay, ay + 1);
+    if (!rule_walks_combine(c, kind, a, &wx, b, &wy, n, ka, kb, mode, &inner, out) || !length_append(out, ")", 1)) return false;
+    first = false;
+    if (!trailing) return true;
+    rule_walk_start(&wx, x, ax + 1, x->nitems);
+    rule_walk_start(&wy, y, ay + 1, y->nitems);
+    return rule_walks_combine(c, kind, a, &wx, b, &wy, trailing, ka, kb, mode, &first, out);
 }
 
 /* ka·a + kb·b for each value type (mode MIX), or b added / accumulated onto a */
@@ -4350,6 +5089,18 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
         return css_shape_combine(p->flags, *(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb,
                                  kb, mode != MIX, out, d);
     case PT_OFFSET: return css_offset_combine(p->flags, fa, fb, kb, mode != MIX, out, d);
+    case PT_RULE_LIST:
+        return rule_lists_combine(c, p->flags, a, (const struct css_rule_list *)fa, b, (const struct css_rule_list *)fb, ka,
+                                  kb, mode, out);
+    case PT_RULE_INSET: { /* <length-percentage> | overlap-join: the keyword only with itself */
+        const struct css_rule_inset *x = (const struct css_rule_inset *)fa, *y = (const struct css_rule_inset *)fb;
+        if (x->join || y->join) {
+            if (mode != MIX || !x->join || !y->join) return false;
+            sb_puts(out, "overlap-join");
+            return true;
+        }
+        return anim_len(out, &x->length, &y->length, ka, kb, LF_NEG, d);
+    }
     case PT_CLIP:
         if (!a->clip.rect || !b->clip.rect || a->clip.auto_edges != b->clip.auto_edges) return false;
         sb_puts(out, "rect(");

@@ -1,8 +1,10 @@
-/* The shape values' owner (shape.c) through the property table (cssprop.c) on the host:
-   one request per line of the file argv[1], one answer per line written to argv[2].
+/* The shape values' owner (shape.c) and the gap decorations' values through the property table
+   (cssprop.c) on the host: one request per line of the file argv[1], one answer per line written
+   to argv[2].
      S<TAB>property<TAB>value          whether the declaration is valid, and its CSSOM specified
                                        value (the text as written when the owner keeps it)
      C<TAB>property<TAB>font<TAB>value the computed value on an element whose font-size is font px
+                                       (font: px, or px;colour for the element's color as well)
      I<TAB>property<TAB>font<TAB>from<TAB>to<TAB>progress
                                        the animated value at progress, by the property's animation
                                        type (a pair that does not interpolate is discrete)
@@ -37,17 +39,27 @@ static bool specified(char *rest, sbuf *out) {
     sb_put(out, value, n);
     return true;
 }
-/* an element with font-size font, its parent's the same */
+/* an element with font-size font (and the colour after a ';'), its parent's the same */
 struct site { style_t parent, base; arena_t arena; jmp_buf trap; struct css_anim_ctx ctx; };
-static void site_init(struct site *s, float font) {
+static void site_init(struct site *s) {
     memset(s, 0, sizeof *s);
+    s->arena.trap = &s->trap;
+}
+static void site_style(struct site *s, const char *font) {
+    char *end;
+    float size = strtof(font, &end);
     css_style_init(&s->parent, NULL);
-    s->parent.font_size = font;
+    s->parent.font_size = size;
+    if (*end == ';') { /* inherited by the element */
+        uint8_t set[css_prop_count()];
+        memset(set, 0, sizeof set);
+        struct cx cx = {.s = &s->parent, .em = size, .rem = 16, .vw = 800, .vh = 600, .a = &s->arena, .set = set};
+        css_apply(css_prop_lookup("color", 5), end + 1, strlen(end + 1), &cx);
+    }
     css_style_finish(&s->parent, NULL, true);
     css_style_init(&s->base, &s->parent);
-    s->base.font_size = font;
+    s->base.font_size = size;
     css_style_finish(&s->base, &s->parent, false);
-    s->arena.trap = &s->trap;
     s->ctx = (struct css_anim_ctx){.base = &s->base, .parent = &s->parent, .rem = 16, .vw = 800, .vh = 600, .a = &s->arena};
 }
 static bool parse(struct site *s, const struct propdef *p, const char *v, style_t *out) {
@@ -58,9 +70,10 @@ static bool computed(char *rest, sbuf *out) {
     const struct propdef *p = css_prop_lookup(property, strlen(property));
     if (!p) return false;
     struct site s;
-    site_init(&s, (float)strtod(font, NULL));
+    site_init(&s);
     bool ok = false;
     if (!setjmp(s.trap)) {
+        site_style(&s, font);
         style_t x;
         ok = parse(&s, p, value, &x) && css_computed_longhand(&x, property, out, NULL) == 1;
     }
@@ -96,14 +109,15 @@ static bool keyframe(struct site *s, const struct propdef *q, const style_t *und
 }
 /* property's value at t from from to to (each first composited onto under unless op is NULL), as
    getComputedStyle reads it; a shorthand animates each of its longhands */
-static bool animate(const char *property, float font, const char *under, const char *from_op, const char *from,
+static bool animate(const char *property, const char *font, const char *under, const char *from_op, const char *from,
                     const char *to_op, const char *to, double t, sbuf *out) {
     const struct propdef *p = css_prop_lookup(property, strlen(property));
     if (!p) return false;
     struct site s;
-    site_init(&s, font);
+    site_init(&s);
     bool ok = false;
     if (!setjmp(s.trap)) {
+        site_style(&s, font);
         style_t u, a, b, r = s.base;
         ok = (!under || parse(&s, p, under, &u)) && parse(&s, p, from, &a) && parse(&s, p, to, &b);
         uint8_t set[css_prop_count()];
@@ -122,12 +136,12 @@ static bool animate(const char *property, float font, const char *under, const c
 }
 static bool interpolate(char *rest, sbuf *out) {
     const char *property = field(&rest), *font = field(&rest), *from = field(&rest), *to = field(&rest);
-    return animate(property, (float)strtod(font, NULL), NULL, NULL, from, NULL, to, strtod(rest, NULL), out);
+    return animate(property, font, NULL, NULL, from, NULL, to, strtod(rest, NULL), out);
 }
 static bool composite(char *rest, sbuf *out) {
     const char *property = field(&rest), *font = field(&rest), *under = field(&rest), *from_op = field(&rest),
                *from = field(&rest), *to_op = field(&rest), *to = field(&rest);
-    return animate(property, (float)strtod(font, NULL), under, from_op, from, to_op, to, strtod(rest, NULL), out);
+    return animate(property, font, under, from_op, from, to_op, to, strtod(rest, NULL), out);
 }
 int main(int argc, char **argv) {
     static char line[1 << 16];

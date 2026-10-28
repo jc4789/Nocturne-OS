@@ -2334,6 +2334,61 @@ static void flow_ink_inline(struct ink_walk *W,box_t *b,float r[4],bool *layers)
         else flow_ink_child(W,c,r,layers);
     }
 }
+/* ---------------------------------------------------------------- gap decorations (css-gaps-1) */
+/* Segment s of b's gap decorations (layout.c) as the rectangle it paints, relative to b's content
+   box before scrolling, with the style and width §4.6 gives its gap; false when it paints nothing. */
+static bool gap_segment_rect(const box_t *b, const struct gap_segment *s, float r[4], uint8_t *style) {
+    const struct css_gap_axis *a = &css_style_gap_rules(b->st)->axis[s->axis];
+    uint32_t count = b->gap_decorations->gaps[s->axis];
+    *style = css_rule_value_at(&a->list[CSS_GAP_STYLE], s->gap, count).style;
+    float w = css_rule_value_at(&a->list[CSS_GAP_WIDTH], s->gap, count).width;
+    if (*style == BS_NONE || *style == BS_HIDDEN || !(w > 0) || !(s->e > s->s)) return false;
+    /* a column gap's line runs down its centre, a row gap's across */
+    if (s->axis == 0) { r[0] = s->centre - w / 2; r[1] = s->s; r[2] = s->centre + w / 2; r[3] = s->e; }
+    else { r[0] = s->s; r[1] = s->centre - w / 2; r[2] = s->e; r[3] = s->centre + w / 2; }
+    return true;
+}
+/* where b's content scrolls to: its decorations scroll with its items (§3) */
+static void gap_scroll(const box_t *b, float *x, float *y) {
+    if (b->node && box_element_scrollable(b)) { *x -= (float)b->node->scroll_x; *y -= (float)b->node->scroll_y; }
+}
+/* §3: painted just above the container's border, each gap's line in its gap's colour and style as
+   a border's side; rule-overlap (§3.5) puts one axis' lines over the other's */
+static void paint_gap_decorations(struct pctx *P, const box_t *b, float x, float y) {
+    const struct gap_decorations *g = b->gap_decorations;
+    if (!g || !g->n) return;
+    const style_t *st = b->st;
+    const struct css_gap_rules *rules = css_style_gap_rules(st);
+    gap_scroll(b, &x, &y);
+    int under = rules->overlap == CSS_RULE_ROW_OVER_COLUMN ? 0 : 1;
+    for (int pass = 0; pass < 2; pass++) {
+        int axis = pass ? !under : under;
+        const struct css_rule_list *colors = &rules->axis[axis].list[CSS_GAP_COLOR];
+        for (uint32_t i = 0; i < g->n; i++) {
+            const struct gap_segment *s = &g->seg[i];
+            float r[4];
+            uint8_t style;
+            if (s->axis != axis || !gap_segment_rect(b, s, r, &style)) continue;
+            union css_rule_value c = css_rule_value_at(colors, s->gap, g->gaps[axis]);
+            uint32_t col = c.color.exact ? css_color_value_argb(c.color.exact, st->color) :
+                           c.color.argb == COLOR_CURRENT ? st->color : c.color.argb;
+            if (!(col >> 24)) continue;
+            edge(P->c, style, axis ? 0 : 3, x + r[0], y + r[1], r[2] - r[0], r[3] - r[1], col);
+        }
+    }
+}
+/* the rectangles they paint, relative to (x, y), b's content box */
+static void gap_decorations_ink(const box_t *b, float x, float y, float rect[4]) {
+    const struct gap_decorations *g = b->gap_decorations;
+    if (!g) return;
+    for (uint32_t i = 0; i < g->n; i++) {
+        float r[4];
+        uint8_t style;
+        if (!gap_segment_rect(b, &g->seg[i], r, &style)) continue;
+        float a[4] = {x + r[0], y + r[1], x + r[2], y + r[3]};
+        ink_union(rect, a);
+    }
+}
 static const float *flow_ink(struct ink_walk *W,box_t *b) {
     web_doc *d=W->d;
     if(b->flow_ink_valid&&b->flow_ink_layout==d->layout_revision)return b->flow_ink;
@@ -2365,6 +2420,7 @@ static const float *flow_ink(struct ink_walk *W,box_t *b) {
                     if(!b->runs[i].atomic){run_ink(&b->runs[i],rx,ry,&W->metrics,true,a);ink_union(r,a);}
                 flow_ink_inline(W,b,r,&layers);
             } else for(box_t *c=b->first;c&&!W->failed;c=c->next)flow_ink_child(W,c,r,&layers);
+            gap_decorations_ink(b,x,y,r);
         }
     }
     if(W->failed)return NULL;
@@ -2817,6 +2873,12 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         bounds_rect(P, P->vx0 - P->ox, P->vy0 - P->oy, P->vx1 - P->vx0, P->vy1 - P->vy0);
     if (P->mode == M_BOUNDS && !st->visibility && b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR) {
         bounds_decoration(P,st,bx,by,bw,bh);
+        if (b->gap_decorations) {
+            float gx = x, gy = y, ink[4] = {INFINITY, INFINITY, -INFINITY, -INFINITY};
+            gap_scroll(b, &gx, &gy);
+            gap_decorations_ink(b, gx, gy, ink);
+            bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]);
+        }
         if (b->marker || b->marker_shape) { float ink[4]; marker_ink(b, ink); bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]); }
     }
     /* A table row or row group is painted in its cells (CSS 2.1 17.5.1) and is not a
@@ -2921,6 +2983,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             if(corners_coverage(P->hx,P->hy,bx+b->b[3],by+b->b[0],bw-b->b[1]-b->b[3],bh-b->b[0]-b->b[2],&radii)<.5f)contents=false;
         }
     }
+    if (P->mode == M_PAINT && visible && b->gap_decorations) paint_gap_decorations(P, b, P->ox + x, P->oy + y);
     int layer = 0;
     for (; layer < layers.n && layer_z(layers.v[layer]) < 0; layer++)
         paint_stacked_layer(P, layers.v[layer]);

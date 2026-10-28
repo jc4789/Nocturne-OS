@@ -2895,6 +2895,195 @@ static bool layout_children_parallel(box_t **boxes,int n,float cbh) {
     return true;
 }
 
+/* ---------------------------------------------------------------- gap decorations (css-gaps-1 §3) */
+/* Grid and flex layout describe their gaps here, and one algorithm turns them into the segments
+   paint.c draws (box_t's gap_decorations): §3.1.2's segments, §3.4's visibility, §3.3's insets. A
+   gap runs along its axis (0: a column gap, 1: a row gap) from its start bound to its end bound,
+   between lo and hi across it, in the container's content box (coordinates grow rightwards and
+   downwards). Its cells lie between its bounds: bound k ends cell k - 1 at end_at and starts cell k
+   at start_at, so a gap of n cells has n + 1 bounds, the first and the last at its edges. */
+struct gd_bound {
+    float end_at, start_at;
+    float width;            /* the crossing gap width (§3.3): the junction's size, 0 at a container edge */
+    uint32_t cross, ncross; /* the gaps abutting or crossing it here: gd.cross[cross, cross + ncross) */
+    bool flanked;           /* items on opposing sides span every crossing gap here (§3.1.2) */
+};
+enum { GD_CROSSED = 1, GD_BEFORE = 2, GD_AFTER = 4 }; /* a cell: an item crosses the gap; the areas beside hold items */
+struct gd_gap {
+    float lo, hi;
+    size_t cell, bound, ncell; /* gd.cell[cell, cell + ncell), gd.bound[bound, bound + ncell + 1) */
+    size_t run, nrun;          /* its runs of painted cells: gd.run[run, run + nrun) */
+    uint32_t order;            /* its place among its axis' gaps, the index §4.6 assigns values by */
+    uint8_t axis;
+};
+struct gd_run { size_t k0, k1; }; /* cells k0 to k1: a segment before its insets */
+struct gd {
+    struct gd_gap *gap;
+    uint8_t *cell;
+    struct gd_bound *bound;
+    uint32_t *cross;
+    struct gd_run *run;
+    size_t ngap, ncell, nbound, ncross, nrun;
+    size_t capgap, capcell, capbound, capcross, caprun;
+    uint32_t count[2];                /* the gaps of each axis */
+    uint8_t rule_break[2], visibility[2]; /* the used values, which depend on the container's type */
+};
+static void gd_free(struct gd *g) {
+    free(g->gap); free(g->cell); free(g->bound); free(g->cross); free(g->run);
+}
+static bool gd_room(void **p, size_t *cap, size_t need, size_t size) {
+    if (need <= *cap) return true;
+    size_t c = *cap ? *cap : 16;
+    while (c < need) {
+        if (c > SIZE_MAX / 2 / size) return false;
+        c *= 2;
+    }
+    void *q = realloc(*p, c * size);
+    if (!q) return false;
+    *p = q;
+    *cap = c;
+    return true;
+}
+#define GD_ROOM(g, field, cap, need) gd_room((void **)&(g)->field, &(g)->cap, (need), sizeof *(g)->field)
+/* a gap of ncell (>= 1) cells, whose zeroed cells and bounds the caller fills before adding the next
+   gap; NULL out of memory */
+static struct gd_gap *gd_gap_add(struct gd *g, uint8_t axis, float lo, float hi, size_t ncell) {
+    if (ncell >= SIZE_MAX / 2 || !GD_ROOM(g, gap, capgap, g->ngap + 1) || !GD_ROOM(g, cell, capcell, g->ncell + ncell) ||
+        !GD_ROOM(g, bound, capbound, g->nbound + ncell + 1)) return NULL;
+    struct gd_gap *x = &g->gap[g->ngap++];
+    *x = (struct gd_gap){.lo = lo, .hi = hi, .cell = g->ncell, .bound = g->nbound, .ncell = ncell,
+                         .order = g->count[axis]++, .axis = axis};
+    memset(g->cell + g->ncell, 0, ncell);
+    memset(g->bound + g->nbound, 0, (ncell + 1) * sizeof *g->bound);
+    g->ncell += ncell;
+    g->nbound += ncell + 1;
+    return x;
+}
+/* gap y crosses or abuts bound b of the gap being filled (each bound's gaps added together) */
+static bool gd_cross(struct gd *g, struct gd_bound *b, size_t y) {
+    if (!GD_ROOM(g, cross, capcross, g->ncross + 1)) return false;
+    if (!b->ncross) b->cross = (uint32_t)g->ncross;
+    g->cross[g->ncross++] = (uint32_t)y;
+    b->ncross++;
+    return true;
+}
+static bool gd_shown(uint8_t cell, uint8_t visibility) {
+    if (visibility == CSS_RULE_ITEMS_AROUND) return cell & (GD_BEFORE | GD_AFTER);
+    if (visibility == CSS_RULE_ITEMS_BETWEEN) return (cell & (GD_BEFORE | GD_AFTER)) == (GD_BEFORE | GD_AFTER);
+    return true;
+}
+/* §3.1.2 "determine gap decoration segments" for every gap, as runs of cells. none: one segment
+   from one end of the gap to the other; normal: each stretch no item crosses; intersection: also
+   broken at each junction not flanked by spanning items. A cell §3.4 does not paint ends a run. */
+static bool gd_runs(struct gd *g) {
+    for (size_t i = 0; i < g->ngap; i++) {
+        struct gd_gap *x = &g->gap[i];
+        const uint8_t *cell = g->cell + x->cell;
+        const struct gd_bound *bound = g->bound + x->bound;
+        uint8_t brk = g->rule_break[x->axis], vis = g->visibility[x->axis];
+        x->run = g->nrun;
+        x->nrun = 0;
+        for (size_t k = 0; k < x->ncell; k++) {
+            if (!(k & 1023) && !layout_checkpoint()) return false;
+            if (!gd_shown(cell[k], vis) || (brk != CSS_RULE_BREAK_NONE && (cell[k] & GD_CROSSED))) continue;
+            size_t k1 = k;
+            while (k1 + 1 < x->ncell && gd_shown(cell[k1 + 1], vis) &&
+                   (brk == CSS_RULE_BREAK_NONE ||
+                    (!(cell[k1 + 1] & GD_CROSSED) && (brk != CSS_RULE_BREAK_INTERSECTION || bound[k1 + 1].flanked))))
+                k1++;
+            if (!GD_ROOM(g, run, caprun, g->nrun + 1)) return false;
+            g->run[g->nrun++] = (struct gd_run){k, k1};
+            x->nrun++;
+            k = k1;
+        }
+    }
+    return true;
+}
+/* whether a segment of gap y, before its insets, reaches into [lo, hi] along y */
+static bool gd_present(const struct gd *g, size_t y, float lo, float hi) {
+    const struct gd_gap *x = &g->gap[y];
+    const struct gd_bound *bound = g->bound + x->bound;
+    size_t a = 0, b = x->nrun;
+    while (a < b) { /* the first whose end reaches lo */
+        size_t m = a + (b - a) / 2;
+        if (bound[g->run[x->run + m].k1 + 1].end_at < lo) a = m + 1;
+        else b = m;
+    }
+    return a < x->nrun && bound[g->run[x->run + a].k0].start_at <= hi;
+}
+/* §3.3: how far the endpoint a run makes at bound k of gap x moves into the run (start: the run's
+   start). It is a junction segment endpoint when another segment is present at the junction: the
+   gap's own next one (neighbour) or a crossing gap's. overlap-join reaches into the junction by
+   half its size and half the crossing gap's rule width. */
+static float gd_inset(const struct gd *g, const struct css_gap_rules *rules, const struct gd_gap *x, size_t k, bool start,
+                      bool neighbour) {
+    const struct gd_bound *b = &g->bound[x->bound + k];
+    bool junction = neighbour;
+    for (uint32_t i = 0; i < b->ncross && !junction; i++) junction = gd_present(g, g->cross[b->cross + i], x->lo, x->hi);
+    const struct css_rule_inset *in =
+        &rules->axis[x->axis].inset[junction ? start ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END :
+                                    start ? CSS_RULE_CAP_START : CSS_RULE_CAP_END];
+    if (!in->join) return len_resolve(&in->length, b->width);
+    if (!junction) return 0;
+    const struct css_rule_list *widths = &rules->axis[!x->axis].list[CSS_GAP_WIDTH];
+    float rule = 0;
+    for (uint32_t i = 0; i < b->ncross; i++) {
+        const struct gd_gap *y = &g->gap[g->cross[b->cross + i]];
+        rule = fmaxf_(rule, css_rule_value_at(widths, y->order, g->count[y->axis]).width);
+    }
+    return -(b->width / 2 + rule / 2);
+}
+/* the segments of the gaps g holds, into b's layout memory; g is freed */
+static void gd_finish(box_t *b, struct gd *g) {
+    const struct css_gap_rules *rules = css_style_gap_rules(b->st);
+    struct gap_segment *seg = NULL;
+    size_t n = 0;
+    bool ok = gd_runs(g) && (!g->nrun || (seg = malloc(g->nrun * sizeof *seg)));
+    for (size_t i = 0; ok && i < g->ngap; i++) {
+        const struct gd_gap *x = &g->gap[i];
+        const struct gd_bound *bound = g->bound + x->bound;
+        size_t first = n;
+        for (size_t t = 0; t < x->nrun; t++) {
+            const struct gd_run *r = &g->run[x->run + t];
+            bool before = t > 0 && g->run[x->run + t - 1].k1 + 1 == r->k0;
+            bool after = t + 1 < x->nrun && g->run[x->run + t + 1].k0 == r->k1 + 1;
+            /* positive start insets move towards the end, positive end insets towards the start */
+            float s = bound[r->k0].start_at + gd_inset(g, rules, x, r->k0, true, before);
+            float e = bound[r->k1 + 1].end_at - gd_inset(g, rules, x, r->k1 + 1, false, after);
+            if (!(e > s)) continue;
+            if (n > first && s <= seg[n - 1].e) { /* overlapping segments of one gap paint as one */
+                if (s < seg[n - 1].s) seg[n - 1].s = s;
+                if (e > seg[n - 1].e) seg[n - 1].e = e;
+                continue;
+            }
+            seg[n++] = (struct gap_segment){s, e, (x->lo + x->hi) / 2, x->order, x->axis};
+        }
+    }
+    uint32_t count[2] = {g->count[0], g->count[1]};
+    gd_free(g);
+    if (!ok) {
+        free(seg);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    /* the layout memory's trap would leave seg behind */
+    jmp_buf trap, *previous = b->layout_mem.trap;
+    b->layout_mem.trap = &trap;
+    if (setjmp(trap)) {
+        b->layout_mem.trap = previous;
+        free(seg);
+        ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    struct gap_decorations *out = ar_alloc(&b->layout_mem, sizeof *out);
+    struct gap_segment *kept = n ? ar_alloc(&b->layout_mem, n * sizeof *kept) : NULL;
+    b->layout_mem.trap = previous;
+    if (n) memcpy(kept, seg, n * sizeof *kept);
+    free(seg);
+    *out = (struct gap_decorations){kept, (uint32_t)n, {count[0], count[1]}};
+    b->gap_decorations = out;
+}
+
 /* ---------------------------------------------------------------- flexbox */
 struct fitem {
     box_t *b;
@@ -2906,6 +3095,7 @@ struct fitem {
 struct fline {
     int first, end;
     float cross, ascent, descent;
+    float origin; /* where its cross extent starts (flex_cross_lines) */
 };
 
 /* CSS Flexbox 9.7: clamped items leave the flexible pool, and their unused
@@ -3010,6 +3200,7 @@ static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
     for (int l = 0; l < count; l++) {
         struct fline *line = &lines[l];
         float origin = flip ? available - cursor - line->cross : cursor;
+        line->origin = origin;
         for (int i = line->first; i < line->end; i++) {
             if (!layout_checkpoint()) break;
             layout_media_checkpoint();
@@ -3054,6 +3245,125 @@ static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
     }
     if (!column) b->h = available;
     b->baseline = b->last_baseline = first_bl;
+}
+
+/* css-gaps-1 §2 in a flex container: a gap between adjacent items of a line runs across the line,
+   a gap between adjacent lines from one edge of the container to the other. Values are assigned
+   in placement order, the items' gaps on through the lines (§4.6); normal breaks behave as none,
+   and the visibility properties do not apply. */
+struct gd_span { float lo, hi; uint32_t gap; };
+static int gd_span_order(const void *a, const void *b) {
+    float x = ((const struct gd_span *)a)->lo, y = ((const struct gd_span *)b)->lo;
+    return x < y ? -1 : x > y;
+}
+/* an item's margin box along the main axis */
+static void flex_main_range(const box_t *c, bool column, float *lo, float *hi) {
+    *lo = column ? c->y - c->p[0] - c->b[0] - c->m[0] : c->x - c->p[3] - c->b[3] - c->m[3];
+    *hi = *lo + (column ? c->h + vext(c) + c->m[0] + c->m[2] : c->w + hext(c) + c->m[1] + c->m[3]);
+}
+static size_t flex_line_gaps(const struct fline *line) {
+    return line->end - line->first > 1 ? (size_t)(line->end - line->first - 1) : 0;
+}
+static void flex_gap_decorations(box_t *b, const struct fitem *it, const struct fline *lines, int count, bool column,
+                                 bool reverse) {
+    const struct css_gap_rules *rules = b->st->gap_rules;
+    if (!rules || count <= 0) return;
+    struct gd g = {0};
+    for (int a = 0; a < 2; a++) {
+        g.rule_break[a] = rules->axis[a].rule_break == CSS_RULE_BREAK_NORMAL ? CSS_RULE_BREAK_NONE : rules->axis[a].rule_break;
+        g.visibility[a] = CSS_RULE_ITEMS_ALL;
+    }
+    bool flip = b->st->flex_wrap == FW_WRAP_REVERSE;
+    uint8_t item_axis = column ? 1 : 0;
+    float main_size = column ? b->h : b->w;
+    size_t items_gaps = 0;
+    for (int l = 0; l < count; l++) items_gaps += flex_line_gaps(&lines[l]);
+    /* the gutters between lines, across: line l + 1 follows line l, before it when wrap-reverse */
+    float (*gutter)[2] = count > 1 ? malloc((size_t)(count - 1) * sizeof *gutter) : NULL;
+    /* the items' gaps along the main axis (spans, by gap) and two lines' of them sorted (pair) */
+    struct gd_span *spans = items_gaps ? malloc(items_gaps * sizeof *spans) : NULL;
+    struct gd_span *pair = items_gaps ? malloc(items_gaps * sizeof *pair) : NULL;
+    bool ok = (count < 2 || gutter) && (!items_gaps || (spans && pair));
+    for (int l = 0; ok && l + 1 < count; l++) {
+        float e0 = lines[l].origin, e1 = e0 + lines[l].cross, f0 = lines[l + 1].origin, f1 = f0 + lines[l + 1].cross;
+        float lo = flip ? f1 : e1, hi = flip ? e0 : f0;
+        if (hi < lo) lo = hi = (lo + hi) / 2;
+        gutter[l][0] = lo;
+        gutter[l][1] = hi;
+    }
+    /* the gaps between items, line by line in placement order (gap ids 0 .. items_gaps - 1) */
+    for (int l = 0; ok && l < count; l++) {
+        const struct fline *line = &lines[l];
+        /* the gaps between lines on the line's near (top or left) and far side */
+        int near = flip ? (l + 1 < count ? l : -1) : l - 1, far = flip ? l - 1 : (l + 1 < count ? l : -1);
+        for (int i = line->first; ok && i + 1 < line->end; i++) {
+            if (!(i & 1023) && !layout_checkpoint()) { ok = false; break; }
+            float a0, a1, b0, b1;
+            flex_main_range(it[i].b, column, &a0, &a1);
+            flex_main_range(it[i + 1].b, column, &b0, &b1);
+            float lo = reverse ? b1 : a1, hi = reverse ? a0 : b0;
+            if (hi < lo) lo = hi = (lo + hi) / 2;
+            struct gd_gap *x = gd_gap_add(&g, item_axis, lo, hi, 1);
+            if (!x) { ok = false; break; }
+            g.cell[x->cell] = GD_BEFORE | GD_AFTER;
+            struct gd_bound *bound = g.bound + x->bound;
+            bound[0].start_at = line->origin;
+            bound[1].end_at = line->origin + line->cross;
+            /* where a gap between lines abuts it, its bound is a junction as wide as that gap */
+            if (near >= 0) {
+                bound[0].width = gutter[near][1] - gutter[near][0];
+                ok = gd_cross(&g, &bound[0], items_gaps + (size_t)near);
+            }
+            if (ok && far >= 0) {
+                bound[1].width = gutter[far][1] - gutter[far][0];
+                ok = gd_cross(&g, &bound[1], items_gaps + (size_t)far);
+            }
+            spans[g.ngap - 1] = (struct gd_span){lo, hi, (uint32_t)(g.ngap - 1)};
+        }
+    }
+    /* the gaps between lines (ids from items_gaps): the items' gaps of the lines on either side abut
+       it, those that overlap or touch making one junction */
+    size_t first = 0;
+    for (int l = 0; ok && l + 1 < count; l++) {
+        size_t here = flex_line_gaps(&lines[l]), ns = here + flex_line_gaps(&lines[l + 1]);
+        if (ns) {
+            memcpy(pair, spans + first, ns * sizeof *pair);
+            qsort(pair, ns, sizeof *pair, gd_span_order);
+        }
+        first += here;
+        size_t junctions = 0;
+        for (size_t i = 0; i < ns; junctions++) {
+            float hi = pair[i].hi;
+            for (i++; i < ns && pair[i].lo <= hi; i++) hi = fmaxf_(hi, pair[i].hi);
+        }
+        struct gd_gap *x = gd_gap_add(&g, (uint8_t)!item_axis, gutter[l][0], gutter[l][1], junctions + 1);
+        if (!x) { ok = false; break; }
+        memset(g.cell + x->cell, GD_BEFORE | GD_AFTER, junctions + 1);
+        struct gd_bound *bound = g.bound + x->bound;
+        bound[0].start_at = 0;
+        bound[junctions + 1].end_at = main_size;
+        for (size_t i = 0, j = 1; ok && i < ns; j++) {
+            struct gd_bound *at = &bound[j];
+            float hi = pair[i].hi;
+            at->end_at = pair[i].lo;
+            ok = gd_cross(&g, at, pair[i].gap);
+            for (i++; ok && i < ns && pair[i].lo <= hi; i++) {
+                hi = fmaxf_(hi, pair[i].hi);
+                ok = gd_cross(&g, at, pair[i].gap);
+            }
+            at->start_at = hi;
+            at->width = hi - at->end_at;
+        }
+    }
+    free(gutter);
+    free(spans);
+    free(pair);
+    if (!ok) {
+        gd_free(&g);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    gd_finish(b, &g);
 }
 
 static void layout_flex(box_t *b, float defh) {
@@ -3177,6 +3487,7 @@ static void layout_flex(box_t *b, float defh) {
         }
         b->h = defh >= 0 ? defh : content_height;
         flex_cross_lines(b, it, lines, line_count, true, single, defh, gap_cross);
+        flex_gap_decorations(b, it, lines, line_count, true, reverse);
         free(lines); free(it);
         return;
     }
@@ -3286,6 +3597,7 @@ static void layout_flex(box_t *b, float defh) {
         i0 = i1;
     }
     flex_cross_lines(b, it, lines, line_count, false, single, defh, gap_cross);
+    flex_gap_decorations(b, it, lines, line_count, false, reverse);
     free(lines); free(it);
 }
 
@@ -3810,6 +4122,98 @@ static void grid_intrinsic(box_t *b, float *mn, float *mx) {
     gr_free(&g);
 }
 
+/* css-gaps-1 §2 in a grid: the gutters between adjacent tracks that are not collapsed (§4.6 counts
+   a run of collapsed gutters as one gap), each running along all the tracks of the other axis with
+   a junction at every gutter crossing it. Which areas hold items comes from the placed items. */
+static void grid_gap_decorations(box_t *b, const struct grid *gr) {
+    const struct css_gap_rules *rules = b->st->gap_rules;
+    if (!rules) return;
+    struct gd g = {0};
+    for (int a = 0; a < 2; a++) {
+        g.rule_break[a] = rules->axis[a].rule_break;
+        g.visibility[a] = rules->axis[a].visibility == CSS_RULE_ITEMS_NORMAL ? CSS_RULE_ITEMS_ALL : rules->axis[a].visibility;
+    }
+    /* the tracks that are not collapsed (rows, then columns), and each track's index among them */
+    size_t nr = (size_t)(gr->nr > 0 ? gr->nr : 0), nc = (size_t)(gr->nc > 0 ? gr->nc : 0);
+    int *track = malloc((nr + nc) * 2 * sizeof *track + 1);
+    if (!track) { ar_alloc(layout_scratch(), SIZE_MAX); return; }
+    int *rows = track, *cols = track + nr, *row_at = track + nr + nc, *col_at = row_at + nr;
+    size_t vr = 0, vc = 0;
+    for (size_t i = 0; i < nr; i++) { row_at[i] = gr->row[i].collapsed ? -1 : (int)vr; if (!gr->row[i].collapsed) rows[vr++] = (int)i; }
+    for (size_t i = 0; i < nc; i++) { col_at[i] = gr->col[i].collapsed ? -1 : (int)vc; if (!gr->col[i].collapsed) cols[vc++] = (int)i; }
+    if (!vr || !vc || (vr < 2 && vc < 2)) { free(track); return; }
+    /* the item (index + 1) each area holds; an area two items share is the first one's */
+    uint32_t *area = vr > SIZE_MAX / sizeof *area / vc ? NULL : calloc(vr * vc, sizeof *area);
+    bool ok = area != NULL;
+    for (int i = 0; ok && i < gr->n; i++) {
+        if (!(i & 255) && !layout_checkpoint()) { ok = false; break; }
+        const struct gitem *t = &gr->it[i];
+        for (int r = t->r0; r < t->r1 && r < (int)nr; r++) {
+            if (r < 0 || row_at[r] < 0) continue;
+            for (int c = t->c0; c < t->c1 && c < (int)nc; c++)
+                if (c >= 0 && col_at[c] >= 0 && !area[(size_t)row_at[r] * vc + (size_t)col_at[c]])
+                    area[(size_t)row_at[r] * vc + (size_t)col_at[c]] = (uint32_t)i + 1;
+        }
+    }
+#define AREA(r, c) area[(size_t)(r) * vc + (size_t)(c)]
+    size_t column_gaps = vc - 1;
+    /* column gaps (ids 0 .. vc - 2), along the rows; the row gaps (ids from vc - 1) cross them */
+    for (size_t k = 0; ok && k + 1 < vc; k++) {
+        const struct gtr *left = &gr->col[cols[k]], *right = &gr->col[cols[k + 1]];
+        struct gd_gap *x = gd_gap_add(&g, 0, left->pos + left->size, right->pos, vr);
+        if (!x) { ok = false; break; }
+        uint8_t *cell = g.cell + x->cell;
+        struct gd_bound *bound = g.bound + x->bound;
+        for (size_t j = 0; j < vr; j++) {
+            uint32_t l = AREA(j, k), r = AREA(j, k + 1);
+            cell[j] = (l && l == r ? GD_CROSSED : 0) | (l ? GD_BEFORE : 0) | (r ? GD_AFTER : 0);
+        }
+        bound[0].start_at = gr->row[rows[0]].pos;
+        bound[vr].end_at = gr->row[rows[vr - 1]].pos + gr->row[rows[vr - 1]].size;
+        for (size_t j = 1; ok && j < vr; j++) {
+            const struct gtr *above = &gr->row[rows[j - 1]];
+            bound[j].end_at = above->pos + above->size;
+            bound[j].start_at = gr->row[rows[j]].pos;
+            bound[j].width = fmaxf_(0, bound[j].start_at - bound[j].end_at);
+            uint32_t l0 = AREA(j - 1, k), l1 = AREA(j, k), r0 = AREA(j - 1, k + 1), r1 = AREA(j, k + 1);
+            bound[j].flanked = l0 && l0 == l1 && r0 && r0 == r1;
+            ok = gd_cross(&g, &bound[j], column_gaps + j - 1);
+        }
+    }
+    /* row gaps, along the columns; the column gaps cross them */
+    for (size_t j = 0; ok && j + 1 < vr; j++) {
+        const struct gtr *above = &gr->row[rows[j]], *below = &gr->row[rows[j + 1]];
+        struct gd_gap *x = gd_gap_add(&g, 1, above->pos + above->size, below->pos, vc);
+        if (!x) { ok = false; break; }
+        uint8_t *cell = g.cell + x->cell;
+        struct gd_bound *bound = g.bound + x->bound;
+        for (size_t k = 0; k < vc; k++) {
+            uint32_t a = AREA(j, k), c = AREA(j + 1, k);
+            cell[k] = (a && a == c ? GD_CROSSED : 0) | (a ? GD_BEFORE : 0) | (c ? GD_AFTER : 0);
+        }
+        bound[0].start_at = gr->col[cols[0]].pos;
+        bound[vc].end_at = gr->col[cols[vc - 1]].pos + gr->col[cols[vc - 1]].size;
+        for (size_t k = 1; ok && k < vc; k++) {
+            const struct gtr *left = &gr->col[cols[k - 1]];
+            bound[k].end_at = left->pos + left->size;
+            bound[k].start_at = gr->col[cols[k]].pos;
+            bound[k].width = fmaxf_(0, bound[k].start_at - bound[k].end_at);
+            uint32_t a0 = AREA(j, k - 1), a1 = AREA(j, k), c0 = AREA(j + 1, k - 1), c1 = AREA(j + 1, k);
+            bound[k].flanked = a0 && a0 == a1 && c0 && c0 == c1;
+            ok = gd_cross(&g, &bound[k], k - 1);
+        }
+    }
+#undef AREA
+    free(area);
+    free(track);
+    if (!ok) {
+        gd_free(&g);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    gd_finish(b, &g);
+}
+
 static void layout_grid(box_t *b, float defh) {
     const style_t *st = b->st;
     float cw = b->w;
@@ -3917,6 +4321,7 @@ static void layout_grid(box_t *b, float defh) {
     }
     b->h = defh >= 0 ? defh : rows_h;
     b->baseline = b->last_baseline = first_bl;
+    grid_gap_decorations(b, &g);
     gr_free(&g);
 }
 
@@ -4370,6 +4775,7 @@ static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float
     }
     ar_free(&b->layout_mem);
     b->decos=NULL;b->ndecos=0; /* including early-return frameset layout */
+    b->gap_decorations = NULL;
     b->layout_mem.chunk_size = 4096;
     b->layout_mem.trap = layout_scratch()->trap;
     b->clamp_trace = NULL;
