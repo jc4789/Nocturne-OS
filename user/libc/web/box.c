@@ -24,7 +24,8 @@ static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
     x->node = n;
     x->st = st;
     x->paint_alpha = kind != B_TEXT && kind != B_BR && st && (st->opacity * (st->filter ? st->filter->opacity : 1) < 1 ||
-        (kind != B_INLINE && css_transform_general(st)));
+        (kind != B_INLINE && (css_transform_general(st) || css_style_mask_border(st)->source.url ||
+                              css_style_mask_border(st)->source.gradient)));
     x->baseline = -1;
     x->colspan = x->rowspan = 1;
     x->epoch = b->epoch;
@@ -829,6 +830,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     ws->has_grad = false;
     ws->gradient = NULL;
     ws->box_shadow = NULL; /* background decorations belong to the inner border box */
+    ws->border_image = NULL; ws->border_image_img = 0;
     ws->border_radius=0;memset(ws->corner_radius,0,sizeof ws->corner_radius);
     ws->width.kind = LK_AUTO;
     ws->height.kind = LK_AUTO;
@@ -837,6 +839,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     is->filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
     is->clip_path = NULL; memset(&is->clip, 0, sizeof is->clip);
     is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);is->offset=NULL;
+    is->mask_border = NULL; is->mask_border_img = 0; /* masked with the outer group */
     is->display = inner_kind == B_TABLE ? D_TABLE : inner_kind == B_GRID ? D_GRID : D_FLEX;
     for (int i = 0; i < 4; i++) {
         is->margin[i].kind = LK_LEN;
@@ -1682,13 +1685,14 @@ static bool restyle_derived(box_t *b, style_t *old) {
             next.padding[i].kind=LK_LEN; next.padding[i].px=next.padding[i].pct=0;
         }
         next.bg_color=0; next.color_current&=(uint16_t)~(1u<<CSS_SLOT_BACKGROUND); next.bg_image=NULL; next.has_grad=false; next.gradient=NULL;
-        next.box_shadow=NULL;
+        next.box_shadow=NULL; next.border_image=NULL; next.border_image_img=0;
         next.border_radius=0;memset(next.corner_radius,0,sizeof next.corner_radius);
         next.width.kind=next.height.kind=LK_AUTO;
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
         next.filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
         next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);next.offset=NULL;
+        next.mask_border=NULL; next.mask_border_img=0;
         for (int i=0;i<4;i++) {
             next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;
         }
@@ -1733,7 +1737,8 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
         deco->st=replacement_style(deco->node?deco->node:fallback,deco->st);
     }
     b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
-        (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || box_transformed(b));
+        (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || box_transformed(b) ||
+         (b->kind != B_INLINE && (css_style_mask_border(b->st)->source.url || css_style_mask_border(b->st)->source.gradient)));
     for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }
     b->style_sync_dirty=b->style_sync_subtree=false;
 }

@@ -635,6 +635,66 @@ bool css_gap_rules_equal(const struct css_gap_rules *a, const struct css_gap_rul
 bool css_gap_rules_layout_equal(const struct css_gap_rules *a, const struct css_gap_rules *b);
 /* §4.6: the value list l gives gap index of count gaps */
 union css_rule_value css_rule_value_at(const struct css_rule_list *l, uint32_t index, uint32_t count);
+/* CSS Backgrounds 3 §2-3, CSS Backgrounds 4 §2-3 and Compositing 1 §9.1: the layered background
+   properties a style holds as one group (style_t's background): background-attachment, -clip,
+   -origin and -blend-mode, and background-position-x and -y. Each is a list of one value per layer
+   as computed, not repeated to the number of layers (css-backgrounds-3 §2.2): layer i uses item
+   i mod n (css_bg_keyword, css_bg_offset_used). */
+enum css_bg_list { CSS_BG_ATTACHMENT, CSS_BG_CLIP, CSS_BG_ORIGIN, CSS_BG_BLEND, CSS_BG_LISTS };
+enum { CSS_BG_SCROLL, CSS_BG_FIXED, CSS_BG_LOCAL };
+/* origin and clip: a <visual-box> (CSS_BOX_BORDER, _PADDING, _CONTENT); clip also border-area ||
+   text (css-backgrounds-4 §2.1), these bits */
+#define CSS_BG_CLIP_AREA 0x10
+#define CSS_BG_CLIP_TEXT 0x20
+/* <blend-mode> (Compositing 1 §10) */
+enum { CSS_BLEND_NORMAL, CSS_BLEND_MULTIPLY, CSS_BLEND_SCREEN, CSS_BLEND_OVERLAY, CSS_BLEND_DARKEN, CSS_BLEND_LIGHTEN,
+       CSS_BLEND_COLOR_DODGE, CSS_BLEND_COLOR_BURN, CSS_BLEND_HARD_LIGHT, CSS_BLEND_SOFT_LIGHT, CSS_BLEND_DIFFERENCE,
+       CSS_BLEND_EXCLUSION, CSS_BLEND_HUE, CSS_BLEND_SATURATION, CSS_BLEND_COLOR, CSS_BLEND_LUMINOSITY };
+struct css_bg_keywords { const uint8_t *v; uint32_t n; };
+/* an item of background-position-x or -y (css-backgrounds-4 §3.2): the offset from the start side
+   (left, top: a right or bottom offset is stored as its complement), or from the side a logical
+   keyword names (x-start, x-end, y-start, y-end), which keeps its keyword */
+enum { CSS_BG_EDGE_START, CSS_BG_EDGE_LOGICAL_START, CSS_BG_EDGE_LOGICAL_END };
+struct css_bg_offset {
+    len_t offset;
+    uint8_t edge;
+    bool percent; /* a zero offset is 0% (a keyword or a percentage gave it), not 0px */
+};
+struct css_bg_offsets { const struct css_bg_offset *v; uint32_t n; };
+struct css_background {
+    struct css_bg_keywords list[CSS_BG_LISTS];
+    struct css_bg_offsets position[2]; /* background-position-x, background-position-y */
+};
+extern const struct css_background css_background_initial;
+bool css_background_equal(const struct css_background *a, const struct css_background *b);
+static inline uint8_t css_bg_keyword(const struct css_background *bg, enum css_bg_list list, uint32_t layer) {
+    return bg->list[list].v[layer % bg->list[list].n];
+}
+/* layer's position along axis (0 x, 1 y): its offset in px from the left or top, range being the
+   positioning area less the image (what a percentage is of; horizontal-tb, ltr: x-start is left,
+   y-start top) */
+float css_bg_offset_px(const struct css_background *bg, int axis, uint32_t layer, float range);
+/* CSS Backgrounds 3 §6 (border-image-*) and CSS Masking 1 §8 (mask-border-*): one record type for
+   both groups (style_t's border_image and mask_border), whose initial values differ. */
+enum { CSS_BI_STRETCH, CSS_BI_REPEAT, CSS_BI_ROUND, CSS_BI_SPACE };
+/* a side of a slice (number: image pixels; length: a percentage of the image), of a width (number:
+   a multiple of the border width; length: a length-percentage of the border image area; auto: the
+   slice's natural size) or of an outset (number: border widths; length) */
+enum { CSS_BI_NUMBER, CSS_BI_LENGTH, CSS_BI_AUTO };
+struct css_bi_side { len_t length; float number; uint8_t kind; };
+struct css_bi_source { const char *url; const struct gradient *gradient; }; /* both NULL: none */
+struct css_bi_slice { struct css_bi_side side[4]; bool fill; };
+enum { CSS_MASK_BORDER_ALPHA, CSS_MASK_BORDER_LUMINANCE };
+struct css_border_image {
+    struct css_bi_source source;
+    struct css_bi_slice slice;               /* top right bottom left */
+    struct css_bi_side width[4], outset[4];  /* top right bottom left */
+    uint8_t repeat[2];                       /* CSS_BI_*: horizontal, vertical */
+    uint8_t mode;                            /* mask-border-mode: CSS_MASK_BORDER_* */
+};
+extern const struct css_border_image css_border_image_initial, css_mask_border_initial;
+/* mask: the records are mask-border's, whose NULL is its initial values */
+bool css_border_image_equal(const struct css_border_image *a, const struct css_border_image *b, bool mask);
 /* the gap decoration segments a container's layout found (layout.c), in its content box: each
    runs along its axis from s to e, centred across it on centre; gap is its place in §4.6's order */
 struct gap_segment { float s, e, centre; uint32_t gap; uint8_t axis; };
@@ -882,6 +942,8 @@ typedef struct style {
     const struct css_offset *offset;           /* Motion Path */
     const struct css_gap_rules *gap_rules;     /* gap decorations */
     const struct css_anchor *anchor;           /* Anchor Positioning */
+    const struct css_background *background;   /* the layered background lists */
+    const struct css_border_image *border_image, *mask_border;
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -894,9 +956,12 @@ typedef struct style {
     const char *list_style_string;
     const char *bg_image; /* url() of background-image (absolute, or relative to the document) */
     int bg_img;           /* its index in the document's images + 1, or 0 (set after the cascade) */
+    /* border-image-source's and mask-border-source's url() the same way (set after the cascade) */
+    int border_image_img, mask_border_img;
+    uint16_t bg_layers;   /* the layers background-image gives (css-backgrounds-3 §2.2), at least 1 */
+    uint16_t bg_layer;    /* which of them bg_image or the gradient is (the one painted) */
     uint8_t bg_repeat;    /* BR_* */
     uint8_t bg_size_kind; /* BSZ_* */
-    len_t bg_pos[2];      /* x, y: px + pct% of (area - image) */
     len_t bg_size[2];     /* BSZ_LEN: width, height (LK_AUTO: from the other and the ratio) */
     const char *mask_image; /* mask-image: the background colour shows through this image's alpha */
     int mask_img;
@@ -928,6 +993,15 @@ static inline const struct css_gap_rules *css_style_gap_rules(const style_t *s) 
 }
 static inline const struct css_anchor *css_style_anchor(const style_t *s) {
     return s->anchor ? s->anchor : &css_anchor_initial;
+}
+static inline const struct css_background *css_style_background(const style_t *s) {
+    return s->background ? s->background : &css_background_initial;
+}
+static inline const struct css_border_image *css_style_border_image(const style_t *s) {
+    return s->border_image ? s->border_image : &css_border_image_initial;
+}
+static inline const struct css_border_image *css_style_mask_border(const style_t *s) {
+    return s->mask_border ? s->mask_border : &css_mask_border_initial;
 }
 
 /* ---------------------------------------------------------------- stylesheets */

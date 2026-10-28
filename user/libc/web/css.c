@@ -7987,6 +7987,10 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     /* a gap decoration's segments are layout's (layout.c records them); colour and style paint only */
     if(!css_gap_rules_layout_equal(x.gap_rules,y.gap_rules))return false;
     x.gap_rules=y.gap_rules=NULL;
+    /* the background layers, border-image and mask-border paint only (an outset is ink overflow) */
+    x.background=y.background=NULL;x.border_image=y.border_image=x.mask_border=y.mask_border=NULL;
+    x.border_image_img=y.border_image_img=x.mask_border_img=y.mask_border_img=0;
+    x.bg_layers=y.bg_layers=x.bg_layer=y.bg_layer=0;
     /* same_translation() decided every geometric effect of the transform
        properties; their values and arena addresses are paint state. */
     x.transform=y.transform=NULL;memset(&x.translate,0,sizeof x.translate);memset(&y.translate,0,sizeof y.translate);
@@ -8020,7 +8024,6 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.opacity=y.opacity=x.svg_fill_opacity=y.svg_fill_opacity=x.svg_stroke_opacity=y.svg_stroke_opacity=x.svg_stop_opacity=y.svg_stop_opacity=0;
     memset(x.grad,0,sizeof x.grad);memset(y.grad,0,sizeof y.grad);x.has_grad=y.has_grad=false;
     x.bg_repeat=y.bg_repeat=x.bg_size_kind=y.bg_size_kind=x.mask_repeat=y.mask_repeat=x.mask_size_kind=y.mask_size_kind=0;
-    memset(x.bg_pos,0,sizeof x.bg_pos);memset(y.bg_pos,0,sizeof y.bg_pos);
     memset(x.bg_size,0,sizeof x.bg_size);memset(y.bg_size,0,sizeof y.bg_size);
     memset(x.mask_pos,0,sizeof x.mask_pos);memset(y.mask_pos,0,sizeof y.mask_pos);
     memset(x.mask_size,0,sizeof x.mask_size);memset(y.mask_size,0,sizeof y.mask_size);
@@ -8082,6 +8085,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !filters_equal(a->filter, b->filter) || !css_shape_equal(a->clip_path, b->clip_path) ||
         !css_float_shape_equal(a->float_shape, b->float_shape) || !css_offset_equal(a->offset, b->offset) ||
         !css_gap_rules_equal(a->gap_rules, b->gap_rules) || !css_anchor_equal(a->anchor, b->anchor) || !position_options_equal(a, b) ||
+        !css_background_equal(a->background, b->background) || !css_border_image_equal(a->border_image, b->border_image, false) ||
+        !css_border_image_equal(a->mask_border, b->mask_border, true) ||
         !transforms_equal(a->transform, b->transform) ||
         !transforms_equal(a->rotate, b->rotate) || !transforms_equal(a->scale, b->scale) ||
         !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) ||
@@ -8096,12 +8101,12 @@ static bool style_equal(const style_t *a, const style_t *b) {
     len_t *xl[] = {&x.object_pos[0], &x.object_pos[1], &x.line_height, &x.svg_stroke_width, &x.width, &x.height,
                    &x.min_width, &x.max_width, &x.min_height, &x.max_height, &x.text_indent, &x.flex_basis,
                    &x.translate.xy[0], &x.translate.xy[1], &x.transform_origin[0], &x.transform_origin[1],
-                   &x.bg_pos[0], &x.bg_pos[1], &x.bg_size[0], &x.bg_size[1], &x.mask_pos[0], &x.mask_pos[1],
+                   &x.bg_size[0], &x.bg_size[1], &x.mask_pos[0], &x.mask_pos[1],
                    &x.mask_size[0], &x.mask_size[1]};
     len_t *yl[] = {&y.object_pos[0], &y.object_pos[1], &y.line_height, &y.svg_stroke_width, &y.width, &y.height,
                    &y.min_width, &y.max_width, &y.min_height, &y.max_height, &y.text_indent, &y.flex_basis,
                    &y.translate.xy[0], &y.translate.xy[1], &y.transform_origin[0], &y.transform_origin[1],
-                   &y.bg_pos[0], &y.bg_pos[1], &y.bg_size[0], &y.bg_size[1], &y.mask_pos[0], &y.mask_pos[1],
+                   &y.bg_size[0], &y.bg_size[1], &y.mask_pos[0], &y.mask_pos[1],
                    &y.mask_size[0], &y.mask_size[1]};
     for (size_t i = 0; i < sizeof xl / sizeof *xl; i++) {
         if (!css_length_equal(xl[i], yl[i])) return false;
@@ -8122,6 +8127,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
     x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; x.anchor = y.anchor = NULL; /* the groups compared above */
+    x.background = y.background = NULL; x.border_image = y.border_image = x.mask_border = y.mask_border = NULL;
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
     x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;
@@ -8131,6 +8137,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     for (int i = 0; i < 4; i++) x.grid_place[i].name = y.grid_place[i].name = NULL;
     x.before = y.before = x.after = y.after = x.backdrop = y.backdrop = x.placeholder = y.placeholder = NULL;
     x.bg_img = y.bg_img = x.mask_img = y.mask_img = 0; /* found from bg_image and mask_image after the cascade */
+    x.border_image_img = y.border_image_img = x.mask_border_img = y.mask_border_img = 0; /* and from the sources */
     return !memcmp(&x, &y, sizeof x);
 }
 static bool style_box_compatible(node_t *e, const style_t *old, const style_t *next);

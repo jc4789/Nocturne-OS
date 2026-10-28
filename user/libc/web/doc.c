@@ -1867,6 +1867,15 @@ static void bg_images(web_doc *d, style_t *st) {
         int i = add_image(d, st->mask_image, true);
         st->mask_img = i >= 0 ? i + 1 : 0;
     }
+    /* border-image-source and mask-border-source: the same images, fetched and decoded once */
+    if (st && st->border_image && st->border_image->source.url && !st->border_image_img) {
+        int i = add_image(d, st->border_image->source.url, true);
+        st->border_image_img = i >= 0 ? i + 1 : 0;
+    }
+    if (st && st->mask_border && st->mask_border->source.url && !st->mask_border_img) {
+        int i = add_image(d, st->mask_border->source.url, true);
+        st->mask_border_img = i >= 0 ? i + 1 : 0;
+    }
 }
 
 static void register_bg(web_doc *d, node_t *n) {

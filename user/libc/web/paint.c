@@ -86,6 +86,8 @@ struct pctx {
        background (first paint), and something contentful (first contentful
        paint): text, an image, a canvas bitmap, a video frame, an input's value. */
     bool painted, contentful;
+    /* background-clip: text's walk (bg_text): the text alone, white, into a coverage mask */
+    bool text_mask;
     /* The latest target's hit point in its own untransformed space and, for a text run, the
        run and the point's advance from its start: the topmost hit's text position. */
     float hit_local_x, hit_local_y, hit_run_dx;
@@ -104,7 +106,7 @@ static struct { uint64_t commits, boxes, lost_layout, lost_unbounded, lost_room,
 
 /* What a paint walk drew, for Paint Timing; only a real paint counts. */
 static void paint_drew(struct pctx *P, bool contentful) {
-    if (P->mode != M_PAINT) return;
+    if (P->mode != M_PAINT || P->text_mask) return;
     P->painted = true;
     if (contentful) P->contentful = true;
 }
@@ -123,9 +125,14 @@ static bool positioned(const box_t *b) {
            (b->parent->kind == B_FLEX || b->parent->kind == B_GRID);
 }
 
+/* css-masking-1 §8.1: a mask-border-source other than none */
+static bool mask_border_set(const style_t *st) {
+    const struct css_border_image *m = css_style_mask_border(st);
+    return m->source.url || m->source.gradient;
+}
 static bool stacking_context(const box_t *b) {
     if (!b->st || b->kind == B_TEXT || b->kind == B_BR) return false;
-    if (b->st->filter || b->st->opacity < 1 ||
+    if (b->st->filter || b->st->opacity < 1 || mask_border_set(b->st) ||
         (b->kind!=B_INLINE&&css_translation_active(b->st))) return true;
     if (b->kind == B_INLINE) return false;
     /* Opacity groups are atomic even in normal flow. Fixed/sticky boxes also
@@ -1012,8 +1019,8 @@ static void mask_draw(canvas_t *c, const image_t *img, int x, int y, uint32_t co
         }
 }
 
-/* an image layer (background-image, or mask-image tinted with col) over the padding box, clipped
-   to the border box */
+static void draw_tiles(canvas_t *c, const image_t *img, float px, float py, int TW, int TH, bool rx, bool ry, uint32_t col);
+/* mask-image tinted with col over the padding box, clipped to the border box */
 static void paint_layer(struct pctx *P, int img_idx, uint8_t size_kind, const len_t *size, const len_t *pos,
                         uint8_t repeat, uint32_t col, float x, float y, float w, float h, const float *bw) {
     web_doc *d = P->d;
@@ -1057,28 +1064,10 @@ static void paint_layer(struct pctx *P, int img_idx, uint8_t size_kind, const le
     gfx_clip(c, X0, Y0, (int)roundf(x + w) - X0, (int)roundf(y + h) - Y0);
     bool rx = repeat == BR_REPEAT || repeat == BR_REPEAT_X;
     bool ry = repeat == BR_REPEAT || repeat == BR_REPEAT_Y;
-    int x0 = (int)roundf(px), y0 = (int)roundf(py);
-    int x1 = x0 + TW, y1 = y0 + TH;
-    if (rx) {
-        while (x0 > c->cx0) x0 -= TW;
-        x1 = c->cx1;
-    }
-    if (ry) {
-        while (y0 > c->cy0) y0 -= TH;
-        y1 = c->cy1;
-    }
-    /* skip tiles above the clip */
-    if (ry && y0 + TH <= c->cy0) y0 += (c->cy0 - y0) / TH * TH;
-    if (rx && x0 + TW <= c->cx0) x0 += (c->cx0 - x0) / TW * TW;
-    for (int ty = y0; ty < y1 && ty < c->cy1; ty += TH)
-        for (int tx = x0; tx < x1 && tx < c->cx1; tx += TW) {
-            if (col) mask_draw(c, img, tx, ty, col);
-            else image_draw(c, img, tx, ty);
-        }
+    draw_tiles(c, img, px, py, TW, TH, rx, ry, col);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
 }
 
-/* background and borders of a border box */
 /* ---------------------------------------------------------------- gradients */
 #define NOPOS (-1e30f)
 struct gstops {
@@ -1141,18 +1130,13 @@ static uint32_t stops_at(const struct gstops *s, float t) {
     return s->col[s->n - 1];
 }
 
-static void fill_gradient_serial(canvas_t *c, float x, float y, float w, float h, float r, const struct gradient *g, uint32_t cur) {
-    if (w <= 0 || h <= 0) return;
-    if (r > w / 2) r = w / 2;
-    if (r > h / 2) r = h / 2;
-    bool round = r >= 0.5f;
-    int X0 = round ? (int)floorf(x) : (int)roundf(x), Y0 = round ? (int)floorf(y) : (int)roundf(y);
-    int X1 = round ? (int)ceilf(x + w) : (int)roundf(x + w), Y1 = round ? (int)ceilf(y + h) : (int)roundf(y + h);
-    if (Y0 < c->cy0) Y0 = c->cy0;
-    if (Y1 > c->cy1) Y1 = c->cy1;
-    if (X0 < c->cx0) X0 = c->cx0;
-    if (X1 > c->cx1) X1 = c->cx1;
-    if (X0 >= X1 || Y0 >= Y1) return;
+/* A gradient laid over the rectangle x, y, w, h: where each point falls along it. */
+struct gradient_sampler {
+    const struct gradient *g;
+    float cx, cy, dx, dy, len, rx, ry;
+    struct gstops stops;
+};
+static void gradient_setup(struct gradient_sampler *s, const struct gradient *g, uint32_t cur, float x, float y, float w, float h) {
     float cx = x + w / 2, cy = y + h / 2, dx = 0, dy = 0, len, rx = 1, ry = 1;
     if (!g->radial) {
         if (g->to_x || g->to_y) { /* to a corner: the 50% line joins the other two corners */
@@ -1188,24 +1172,42 @@ static void fill_gradient_serial(canvas_t *c, float x, float y, float w, float h
         if (ry < 1e-3f) ry = 1e-3f;
         len = rx;
     }
-    struct gstops S;
-    resolve_stops(g, cur, len, &S);
+    s->g = g;
+    s->cx = cx; s->cy = cy; s->dx = dx; s->dy = dy; s->len = len; s->rx = rx; s->ry = ry;
+    resolve_stops(g, cur, len, &s->stops);
+}
+static float gradient_t(const struct gradient_sampler *s, float fx, float fy) {
+    if (!s->g->radial) return ((fx - s->cx) * s->dx + (fy - s->cy) * s->dy) / s->len + 0.5f;
+    float ex = (fx - s->cx) / s->rx, ey = (fy - s->cy) / s->ry;
+    return sqrtf(ex * ex + ey * ey);
+}
+static uint32_t gradient_at(const struct gradient_sampler *s, float fx, float fy) { return stops_at(&s->stops, gradient_t(s, fx, fy)); }
+
+static void fill_gradient_serial(canvas_t *c, float x, float y, float w, float h, float r, const struct gradient *g, uint32_t cur) {
+    if (w <= 0 || h <= 0) return;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    bool round = r >= 0.5f;
+    int X0 = round ? (int)floorf(x) : (int)roundf(x), Y0 = round ? (int)floorf(y) : (int)roundf(y);
+    int X1 = round ? (int)ceilf(x + w) : (int)roundf(x + w), Y1 = round ? (int)ceilf(y + h) : (int)roundf(y + h);
+    if (Y0 < c->cy0) Y0 = c->cy0;
+    if (Y1 > c->cy1) Y1 = c->cy1;
+    if (X0 < c->cx0) X0 = c->cx0;
+    if (X1 > c->cx1) X1 = c->cx1;
+    if (X0 >= X1 || Y0 >= Y1) return;
+    struct gradient_sampler G;
+    gradient_setup(&G, g, cur, x, y, w, h);
     for (int py = Y0; py < Y1; py++) {
         float fy = (float)py + 0.5f;
         bool corner_row = round && (fy < y + r || fy > y + h - r);
-        if (!g->radial && fabsf(dx) < 1e-6f && !corner_row) { /* vertical: one colour per row */
-            uint32_t col = stops_at(&S, ((fy - cy) * dy) / len + 0.5f);
+        if (!g->radial && fabsf(G.dx) < 1e-6f && !corner_row) { /* vertical: one colour per row */
+            uint32_t col = stops_at(&G.stops, ((fy - G.cy) * G.dy) / G.len + 0.5f);
             gfx_fill_blend(c, X0, py, X1 - X0, 1, col);
             continue;
         }
         for (int px = X0; px < X1; px++) {
-            float fx = (float)px + 0.5f, t;
-            if (!g->radial) t = ((fx - cx) * dx + (fy - cy) * dy) / len + 0.5f;
-            else {
-                float ex = (fx - cx) / rx, ey = (fy - cy) / ry;
-                t = sqrtf(ex * ex + ey * ey);
-            }
-            uint32_t col = stops_at(&S, t);
+            float fx = (float)px + 0.5f;
+            uint32_t col = gradient_at(&G, fx, fy);
             if (corner_row && (fx < x + r || fx > x + w - r)) {
                 float cov = coverage(sdf_rrect(fx, fy, x, y, w, h, r));
                 if (cov <= 0) continue;
@@ -1266,37 +1268,774 @@ static void paint_corner_border(struct pctx *P,float x,float y,float w,float h,c
       }
     }
 }
+/* ---------------------------------------------------------------- backgrounds
+   css-backgrounds-3 §3, css-backgrounds-4 §2-§3 and Compositing 1 §9-§10: a box's background colour
+   and its painted image layer, each in its background-clip, the layer over its background-origin
+   (or the viewport, or the scrolled contents: background-attachment), blended with the colour by
+   background-blend-mode. */
+static void paint_box(struct pctx *P, box_t *b, bool layer_root);
+static void inline_children(struct pctx *P, box_t *b, bool floats);
+static void paint_runs(struct pctx *P, box_t *b, box_t *scope);
+static void paint_run_text(struct pctx *P, const struct run *r, float bx, float by);
+static bool ink_outside(struct pctx *P, box_t *b, bool context);
+
+/* What a background is the background of: a box (its own contents are what a text clip reads), or
+   an inline box's fragment (the deco) among its block's runs; with its used padding. */
+struct bg_target {
+    box_t *box;
+    box_t *block;
+    const struct deco *deco;
+    float pad[4];
+    bool content_mask; /* the radius masks hold a content-box one (radius_clip[2]) */
+};
+/* any layer's background-clip is content-box: the box keeps a content-box radius mask */
+static bool bg_content_clip(const style_t *st) {
+    const struct css_bg_keywords *l = &css_style_background(st)->list[CSS_BG_CLIP];
+    for (uint32_t i = 0; i < l->n; i++)
+        if (l->v[i] == CSS_BOX_CONTENT) return true;
+    return false;
+}
+/* B(Cb, Cs) of one colour channel, 0..1 (Compositing 1 §10.2) */
+static float blend_hard_light(float b, float s) { return s <= .5f ? b * 2 * s : b + (2 * s - 1) - b * (2 * s - 1); }
+static float blend_channel(int mode, float b, float s) {
+    switch (mode) {
+    case CSS_BLEND_MULTIPLY: return b * s;
+    case CSS_BLEND_SCREEN: return b + s - b * s;
+    case CSS_BLEND_OVERLAY: return blend_hard_light(s, b);
+    case CSS_BLEND_DARKEN: return fminf(b, s);
+    case CSS_BLEND_LIGHTEN: return fmaxf(b, s);
+    case CSS_BLEND_COLOR_DODGE: return b <= 0 ? 0 : s >= 1 ? 1 : fminf(1, b / (1 - s));
+    case CSS_BLEND_COLOR_BURN: return b >= 1 ? 1 : s <= 0 ? 0 : 1 - fminf(1, (1 - b) / s);
+    case CSS_BLEND_HARD_LIGHT: return blend_hard_light(b, s);
+    case CSS_BLEND_SOFT_LIGHT: {
+        if (s <= .5f) return b - (1 - 2 * s) * b * (1 - b);
+        float d = b <= .25f ? ((16 * b - 12) * b + 4) * b : sqrtf(b);
+        return b + (2 * s - 1) * (d - b);
+    }
+    case CSS_BLEND_DIFFERENCE: return fabsf(b - s);
+    case CSS_BLEND_EXCLUSION: return b + s - 2 * b * s;
+    }
+    return s;
+}
+/* the non-separable modes' helpers (§10.3) */
+static float blend_lum(const float c[3]) { return .3f * c[0] + .59f * c[1] + .11f * c[2]; }
+static void blend_clip_color(float c[3]) {
+    float l = blend_lum(c), n = fminf(c[0], fminf(c[1], c[2])), x = fmaxf(c[0], fmaxf(c[1], c[2]));
+    if (n < 0 && l - n > 1e-9f) for (int i = 0; i < 3; i++) c[i] = l + (c[i] - l) * l / (l - n);
+    if (x > 1 && x - l > 1e-9f) for (int i = 0; i < 3; i++) c[i] = l + (c[i] - l) * (1 - l) / (x - l);
+}
+static void blend_set_lum(float c[3], float l) {
+    float d = l - blend_lum(c);
+    for (int i = 0; i < 3; i++) c[i] += d;
+    blend_clip_color(c);
+}
+static float blend_sat(const float c[3]) { return fmaxf(c[0], fmaxf(c[1], c[2])) - fminf(c[0], fminf(c[1], c[2])); }
+static void blend_set_sat(float c[3], float s) {
+    int lo = 0, hi = 0;
+    for (int i = 1; i < 3; i++) {
+        if (c[i] < c[lo]) lo = i;
+        if (c[i] >= c[hi]) hi = i;
+    }
+    if (lo == hi) hi = (lo + 1) % 3;
+    int mid = 3 - lo - hi;
+    if (c[hi] > c[lo]) {
+        c[mid] = (c[mid] - c[lo]) * s / (c[hi] - c[lo]);
+        c[hi] = s;
+    } else c[mid] = c[hi] = 0;
+    c[lo] = 0;
+}
+static void blend_rgb(int mode, const float b[3], const float s[3], float out[3]) {
+    float t[3];
+    switch (mode) {
+    case CSS_BLEND_HUE: memcpy(t, s, sizeof t); blend_set_sat(t, blend_sat(b)); blend_set_lum(t, blend_lum(b)); break;
+    case CSS_BLEND_SATURATION: memcpy(t, b, sizeof t); blend_set_sat(t, blend_sat(s)); blend_set_lum(t, blend_lum(b)); break;
+    case CSS_BLEND_COLOR: memcpy(t, s, sizeof t); blend_set_lum(t, blend_lum(b)); break;
+    case CSS_BLEND_LUMINOSITY: memcpy(t, b, sizeof t); blend_set_lum(t, blend_lum(s)); break;
+    default: for (int i = 0; i < 3; i++) t[i] = blend_channel(mode, b[i], s[i]);
+    }
+    memcpy(out, t, sizeof t);
+}
+/* A source pixel s (straight alpha) over the element's isolated background below it, the colour cb
+   with coverage ab (Compositing 1 §5.2, §9.1): Cs' = (1 - ab)·Cs + ab·B(Cb, Cs), which drawn
+   source-over with s's alpha composes the group onto the canvas. */
+static uint32_t blend_pixel(int mode, uint32_t s, uint32_t cb, float ab) {
+    if (ab <= 0 || !(s >> 24)) return s;
+    float S[3], B[3], O[3];
+    for (int i = 0; i < 3; i++) {
+        S[i] = (float)((s >> (16 - 8 * i)) & 255) / 255;
+        B[i] = (float)((cb >> (16 - 8 * i)) & 255) / 255;
+    }
+    blend_rgb(mode, B, S, O);
+    uint32_t r = s & 0xFF000000u;
+    for (int i = 0; i < 3; i++) {
+        float v = (1 - ab) * S[i] + ab * O[i];
+        v = v < 0 ? 0 : v > 1 ? 1 : v;
+        r |= (uint32_t)(v * 255 + .5f) << (16 - 8 * i);
+    }
+    return r;
+}
+
+/* What a background tile or a border image part samples: a decoded image's pixels, or a gradient
+   laid over the image's rectangle (0, 0, w, h) (css-images-3 §2.4: a gradient has no natural size). */
+struct paint_source { const image_t *img; struct gradient_sampler gradient; float w, h; };
+/* The source's colour at (x, y) in its own pixels, from inside the rectangle clamp (x0, y0, x1, y1)
+   only (a border image part does not bleed into its neighbours): an image's bilinearly, with
+   straight alpha. */
+static uint32_t source_at(const struct paint_source *s, float x, float y, const float clamp[4]) {
+    if (!s->img) return gradient_at(&s->gradient, x, y);
+    const image_t *im = s->img;
+    int lx = (int)fmaxf(0, floorf(clamp[0])), ly = (int)fmaxf(0, floorf(clamp[1]));
+    int hx = (int)fminf((float)im->w, ceilf(clamp[2])) - 1, hy = (int)fminf((float)im->h, ceilf(clamp[3])) - 1;
+    if (hx < lx || hy < ly) return 0;
+    float fx = x - .5f, fy = y - .5f, x0 = floorf(fx), y0 = floorf(fy), ax = fx - x0, ay = fy - y0;
+    int xs[2] = {(int)x0, (int)x0 + 1}, ys[2] = {(int)y0, (int)y0 + 1};
+    for (int i = 0; i < 2; i++) {
+        xs[i] = xs[i] < lx ? lx : xs[i] > hx ? hx : xs[i];
+        ys[i] = ys[i] < ly ? ly : ys[i] > hy ? hy : ys[i];
+    }
+    float weight[4] = {(1 - ax) * (1 - ay), ax * (1 - ay), (1 - ax) * ay, ax * ay}, a = 0, c[3] = {0, 0, 0};
+    for (int k = 0; k < 4; k++) {
+        uint32_t p = im->px[(size_t)ys[k >> 1] * im->w + xs[k & 1]];
+        float pa = weight[k] * (float)(p >> 24);
+        a += pa;
+        for (int i = 0; i < 3; i++) c[i] += pa * (float)((p >> (16 - 8 * i)) & 255);
+    }
+    if (a < .5f) return 0;
+    uint32_t r = (uint32_t)(a + .5f) << 24;
+    for (int i = 0; i < 3; i++) {
+        float v = c[i] / a;
+        r |= (uint32_t)(v > 255 ? 255 : v + .5f) << (16 - 8 * i);
+    }
+    return r;
+}
+
+/* The state of one background's painting. */
+struct bg_paint {
+    struct pctx *P;
+    const style_t *st;
+    const struct bg_target *T;
+    struct radius_cache *const *rounded; /* border, padding (and content) masks, or NULL */
+    float rect[3][4];                    /* the border, padding and content boxes on the canvas */
+    float r;                             /* the uniform radius, without a mask */
+    bool skip_color;                     /* the root's colour (and gradient) went to the canvas */
+    uint8_t color_clip;                  /* the final layer's background-clip */
+    uint32_t *text;                      /* text clip: the text's coverage over text_rect */
+    int text_rect[4];
+    bool text_tried;
+};
+/* One clip of a background's colour or layer: the rectangle and radius masks of its box, and for
+   border-area and text the pixels before it, mixed back by the coverage after. */
+struct bg_clip {
+    int saved_rect[4];
+    const struct gfx_mask_clip *prior;
+    struct gfx_mask_clip mask;
+    uint32_t *saved;
+    int x, y, w, h;
+    uint8_t clip;
+};
+static uint8_t bg_clip_box(uint8_t clip) {
+    if (clip & (CSS_BG_CLIP_AREA | CSS_BG_CLIP_TEXT)) return CSS_BOX_BORDER;
+    return clip <= CSS_BOX_CONTENT ? clip : CSS_BOX_BORDER;
+}
+/* The text that b and its in-flow (and floated) descendants paint, with the walk's own pctx (Q):
+   paint_box's contents without the background, borders, outlines, markers or replaced content. */
+static void text_mask_contents(struct pctx *Q, box_t *b) {
+    if (!b->st || (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) || b->st->content_visibility == CV_HIDDEN) return;
+    if (b->inline_ctx) {
+        inline_children(Q, b, true);
+        paint_runs(Q, b, NULL);
+        inline_children(Q, b, false);
+        return;
+    }
+    for (int floated = 0; floated < 2; floated++)
+        for (box_t *ch = b->first; ch && !Q->failed; ch = ch->next)
+            if (ch->floated == (bool)floated && !paint_box_layer(ch) && !ink_outside(Q, ch, false)) paint_box(Q, ch, false);
+}
+/* an inline box's fragment: the runs of its block that are its text, within it */
+static void text_mask_runs(struct pctx *Q, box_t *b, const struct deco *deco) {
+    float bx, by;
+    layout_runs_origin(b, true, &bx, &by);
+    for (int i = 0; i < b->nruns; i++) {
+        const struct run *r = &b->runs[i];
+        if (r->atomic || !r->node || r->paint_owner != deco->paint_owner) continue;
+        float top, bottom;
+        layout_run_extent(r, &top, &bottom);
+        if (r->x + r->w <= deco->x || r->x >= deco->x + deco->w || bottom <= deco->y || top >= deco->y + deco->h) continue;
+        node_t *n = r->node;
+        while (n && n != deco->node) n = doc_flat_parent(n);
+        if (n) paint_run_text(Q, r, bx, by);
+    }
+}
+/* css-backgrounds-4 §2.1 text: the coverage of the text the target paints, over the canvas clip as
+   it is (the border box's), drawn white on black by a walk of its contents. */
+static bool bg_text(struct bg_paint *G) {
+    if (G->text || G->text_tried) return G->text != NULL;
+    G->text_tried = true;
+    struct pctx *P = G->P;
+    canvas_t *c = P->c;
+    int x = c->cx0, y = c->cy0, w = c->cx1 - c->cx0, h = c->cy1 - c->cy0;
+    if (w <= 0 || h <= 0) return false;
+    if ((size_t)w > SIZE_MAX / sizeof *G->text / (size_t)h || !(G->text = malloc(sizeof *G->text * (size_t)w * (size_t)h))) {
+        P->failed = true;
+        return false;
+    }
+    for (size_t i = 0; i < (size_t)w * (size_t)h; i++) G->text[i] = 0xFF000000u;
+    G->text_rect[0] = x; G->text_rect[1] = y; G->text_rect[2] = w; G->text_rect[3] = h;
+    canvas_t mask;
+    gfx_init(&mask, G->text, w, h, w);
+    struct pctx Q = *P;
+    Q.c = &mask;
+    Q.ox -= (float)x; Q.oy -= (float)y;
+    Q.vx0 -= x; Q.vx1 -= x; Q.vy0 -= y; Q.vy1 -= y;
+    Q.viewport_mask = NULL;
+    Q.text_mask = true;
+    if (G->T->box) text_mask_contents(&Q, G->T->box);
+    else if (G->T->deco && G->T->block) text_mask_runs(&Q, G->T->block, G->T->deco);
+    if (Q.failed) {
+        P->failed = true;
+        free(G->text);
+        G->text = NULL;
+        return false;
+    }
+    return true;
+}
+static unsigned bg_text_at(const struct bg_paint *G, int x, int y) {
+    if (!G->text) return 0;
+    int64_t dx = (int64_t)x - G->text_rect[0], dy = (int64_t)y - G->text_rect[1];
+    if (dx < 0 || dy < 0 || dx >= G->text_rect[2] || dy >= G->text_rect[3]) return 0;
+    uint32_t p = G->text[(size_t)dy * (size_t)G->text_rect[2] + (size_t)dx];
+    return (((p >> 16) & 255) + ((p >> 8) & 255) + (p & 255)) / 3;
+}
+/* the padding box's coverage of pixel (x, y): its radius mask, or the rectangle */
+static unsigned bg_padding_at(const struct bg_paint *G, int x, int y) {
+    const float *p = G->rect[CSS_BOX_PADDING];
+    const struct radius_cache *cache = G->rounded ? G->rounded[1] : NULL;
+    const struct radius_shape *s = cache ? radius_shape_mask(cache->shape, G->P->d->profile_enabled) : NULL;
+    if (s) {
+        int64_t left, top;
+        radius_origin(cache, p[0], p[1], &left, &top);
+        return radius_alpha(s, x - left, y - top);
+    }
+    float fx = (float)x + .5f, fy = (float)y + .5f;
+    return fx >= p[0] && fx < p[0] + p[2] && fy >= p[1] && fy < p[1] + p[3] ? 255 : 0;
+}
+/* how much of pixel (x, y) the special clips (border-area, text) keep, 0..255 */
+static unsigned bg_clip_coverage(const struct bg_paint *G, uint8_t clip, int x, int y) {
+    unsigned a = 255;
+    if (clip & CSS_BG_CLIP_TEXT) a = bg_text_at(G, x, y);
+    if (a && (clip & CSS_BG_CLIP_AREA)) a = a * (255 - bg_padding_at(G, x, y)) / 255;
+    return a;
+}
+/* The clip of a colour or a layer: true when it shows anything. rect: the border box's rectangle
+   too (a colour in the border box is shaped by fill_rrect or the radius mask alone). bg_clip_end
+   always follows. */
+static bool bg_clip_begin(struct bg_paint *G, uint8_t clip, bool rect, struct bg_clip *s) {
+    struct pctx *P = G->P;
+    canvas_t *c = P->c;
+    s->saved_rect[0] = c->cx0; s->saved_rect[1] = c->cy0; s->saved_rect[2] = c->cx1; s->saved_rect[3] = c->cy1;
+    s->prior = c->mask_clip;
+    s->saved = NULL;
+    s->clip = clip;
+    uint8_t box = bg_clip_box(clip);
+    bool special = clip & (CSS_BG_CLIP_AREA | CSS_BG_CLIP_TEXT);
+    const float *b = G->rect[box];
+    if (b[2] <= 0 || b[3] <= 0) return false;
+    if (rect || special || box != CSS_BOX_BORDER) {
+        /* rounded edges, so a box at a fractional position shows no sliver of a neighbouring tile */
+        int X0 = (int)roundf(b[0]), Y0 = (int)roundf(b[1]);
+        gfx_clip(c, X0, Y0, (int)roundf(b[0] + b[2]) - X0, (int)roundf(b[1] + b[3]) - Y0);
+    }
+    if (G->rounded && box == CSS_BOX_PADDING) radius_clip_push(P, G->rounded[1], &s->mask, b[0], b[1]);
+    else if (G->rounded && box == CSS_BOX_CONTENT && G->T->content_mask && G->rounded[2])
+        radius_clip_push(P, G->rounded[2], &s->mask, P->ox + G->rounded[2]->x, P->oy + G->rounded[2]->y);
+    if (P->failed || c->cx0 >= c->cx1 || c->cy0 >= c->cy1) return false;
+    if (!special) return true;
+    if ((clip & CSS_BG_CLIP_TEXT) && !bg_text(G)) return false;
+    s->x = c->cx0; s->y = c->cy0; s->w = c->cx1 - c->cx0; s->h = c->cy1 - c->cy0;
+    if ((size_t)s->w > SIZE_MAX / sizeof *s->saved / (size_t)s->h ||
+        !(s->saved = malloc(sizeof *s->saved * (size_t)s->w * (size_t)s->h))) {
+        P->failed = true;
+        return false;
+    }
+    for (int j = 0; j < s->h; j++)
+        memcpy(s->saved + (size_t)j * s->w, c->px + (size_t)(s->y + j) * c->pitch + s->x, sizeof *s->saved * (size_t)s->w);
+    /* each pixel is mixed with what was under it by a coverage of its own */
+    web_avmedia_snapshot_reject_region(c, s->x, s->y, s->w, s->h);
+    return true;
+}
+static void bg_clip_end(struct bg_paint *G, struct bg_clip *s) {
+    canvas_t *c = G->P->c;
+    if (s->saved) {
+        for (int j = 0; j < s->h; j++) {
+            uint32_t *row = c->px + (size_t)(s->y + j) * c->pitch + s->x, *old = s->saved + (size_t)j * s->w;
+            if (G->P->failed) { memcpy(row, old, sizeof *row * (size_t)s->w); continue; }
+            for (int i = 0; i < s->w; i++) {
+                unsigned a = bg_clip_coverage(G, s->clip, s->x + i, s->y + j);
+                row[i] = a >= 255 ? row[i] : a ? gfx_mix(old[i], row[i], (int)a) : old[i];
+            }
+        }
+        free(s->saved);
+        s->saved = NULL;
+    }
+    c->cx0 = s->saved_rect[0]; c->cy0 = s->saved_rect[1]; c->cx1 = s->saved_rect[2]; c->cy1 = s->saved_rect[3];
+    c->mask_clip = s->prior;
+}
+/* the background colour under a layer's pixel (x, y), for its blend: the colour's coverage there */
+static float bg_backdrop(const struct bg_paint *G, int x, int y) {
+    uint32_t col = G->st->bg_color;
+    if (G->skip_color || !(col >> 24)) return 0;
+    const float *b = G->rect[bg_clip_box(G->color_clip)];
+    float fx = (float)x + .5f, fy = (float)y + .5f;
+    if (!(fx >= b[0] && fx < b[0] + b[2] && fy >= b[1] && fy < b[1] + b[3])) return 0;
+    return (float)(col >> 24) / 255 * (float)bg_clip_coverage(G, G->color_clip, x, y) / 255;
+}
+/* the colour, in the final layer's clip (css-backgrounds-3 §3.2) */
+static void paint_bg_color(struct bg_paint *G) {
+    uint32_t col = G->st->bg_color;
+    if (G->skip_color || !(col >> 24)) return;
+    struct pctx *P = G->P;
+    canvas_t *c = P->c;
+    struct bg_clip s;
+    if (bg_clip_begin(G, G->color_clip, false, &s)) {
+        const float *b = G->rect[0];
+        if (bg_clip_box(G->color_clip) == CSS_BOX_BORDER) {
+            if (G->rounded && G->rounded[0])
+                gfx_fill_blend(c, (int)floorf(b[0]), (int)floorf(b[1]), (int)ceilf(b[0] + b[2]) - (int)floorf(b[0]),
+                               (int)ceilf(b[1] + b[3]) - (int)floorf(b[1]), col);
+            else fill_rrect(c, b[0], b[1], b[2], b[3], G->r, col, col);
+        } else gfx_fill_blend(c, c->cx0, c->cy0, c->cx1 - c->cx0, c->cy1 - c->cy0, col);
+    }
+    bg_clip_end(G, &s);
+}
+/* background-size (css-backgrounds-3 §3.9): the tile's size in the positioning area aw by ah, of
+   an image of natural size iw by ih, or (iw 0) of a gradient, which has none */
+static void bg_tile_size(uint8_t kind, const len_t *size, float iw, float ih, float aw, float ah, float *tw, float *th) {
+    bool natural = iw > 0 && ih > 0;
+    *tw = natural ? iw : aw;
+    *th = natural ? ih : ah;
+    switch (kind) {
+    case BSZ_COVER: case BSZ_CONTAIN:
+        if (natural) {
+            float sx = aw / iw, sy = ah / ih, s = kind == BSZ_COVER ? fmaxf(sx, sy) : fminf(sx, sy);
+            *tw = iw * s;
+            *th = ih * s;
+        }
+        break;
+    case BSZ_LEN: {
+        bool wa = len_auto(&size[0]), ha = len_auto(&size[1]);
+        if (!wa) *tw = len_resolve(&size[0], aw);
+        if (!ha) *th = len_resolve(&size[1], ah);
+        if (natural && wa && !ha) *tw = *th * iw / ih;
+        else if (natural && ha && !wa) *th = *tw * ih / iw;
+        break;
+    }
+    }
+}
+/* image's tiles over the clip, the first at px, py */
+static void draw_tiles(canvas_t *c, const image_t *img, float px, float py, int TW, int TH, bool rx, bool ry, uint32_t col) {
+    int x0 = (int)roundf(px), y0 = (int)roundf(py);
+    int x1 = x0 + TW, y1 = y0 + TH;
+    if (rx) {
+        if (x0 > c->cx0) x0 -= (int)(((int64_t)x0 - c->cx0 + TW - 1) / TW) * TW;
+        x1 = c->cx1;
+    }
+    if (ry) {
+        if (y0 > c->cy0) y0 -= (int)(((int64_t)y0 - c->cy0 + TH - 1) / TH) * TH;
+        y1 = c->cy1;
+    }
+    /* skip tiles above the clip */
+    if (ry && y0 + TH <= c->cy0) y0 += (c->cy0 - y0) / TH * TH;
+    if (rx && x0 + TW <= c->cx0) x0 += (c->cx0 - x0) / TW * TW;
+    for (int ty = y0; ty < y1 && ty < c->cy1; ty += TH)
+        for (int tx = x0; tx < x1 && tx < c->cx1; tx += TW) {
+            if (col) mask_draw(c, img, tx, ty, col);
+            else image_draw(c, img, tx, ty);
+        }
+}
+/* g drawn over an image of its own, w by h, straight alpha as decoded images are */
+static image_t *gradient_image(const struct gradient *g, uint32_t cur, int w, int h) {
+    if (w < 1 || h < 1 || (int64_t)w * h > IMAGE_MAX_PIXELS) return NULL;
+    image_t *img = malloc(sizeof *img);
+    if (!img) return NULL;
+    if (!(img->px = malloc(sizeof *img->px * (size_t)w * (size_t)h))) { free(img); return NULL; }
+    img->w = w;
+    img->h = h;
+    struct gradient_sampler s;
+    gradient_setup(&s, g, cur, 0, 0, (float)w, (float)h);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) img->px[(size_t)y * w + x] = gradient_at(&s, (float)x + .5f, (float)y + .5f);
+    return img;
+}
+/* a gradient layer's tiles over the clip, the first at px, py: drawn in place, or once into a tile
+   image when there are many small ones */
+static void gradient_tiles(struct pctx *P, const struct gradient *g, uint32_t cur, float px, float py, float tw, float th,
+                           bool rx, bool ry, float r) {
+    canvas_t *c = P->c;
+    float x0 = px, y0 = py;
+    double nx = 1, ny = 1;
+    if (rx) { x0 = px + floorf(((float)c->cx0 - px) / tw) * tw; nx = ceil(((double)c->cx1 - x0) / tw); }
+    if (ry) { y0 = py + floorf(((float)c->cy0 - py) / th) * th; ny = ceil(((double)c->cy1 - y0) / th); }
+    if (!(nx >= 1) || !(ny >= 1)) return;
+    if (nx * ny > 16) {
+        int TW = (int)fmaxf(1, roundf(tw)), TH = (int)fmaxf(1, roundf(th));
+        if ((int64_t)TW * TH <= (1 << 20)) {
+            image_t *img = gradient_image(g, cur, TW, TH);
+            if (!img) { P->failed = true; return; }
+            draw_tiles(c, img, px, py, TW, TH, rx, ry, 0);
+            image_free(img);
+            return;
+        }
+    }
+    for (double j = 0; j < ny; j++) {
+        if (!web_native_checkpoint(P->d)) { P->failed = true; return; }
+        for (double i = 0; i < nx; i++) fill_gradient(c, x0 + (float)i * tw, y0 + (float)j * th, tw, th, r, g, cur);
+    }
+}
+/* a blended layer (background-blend-mode not normal): each pixel of the clip from its tile */
+static void blend_tiles(struct bg_paint *G, const image_t *img, const struct gradient_sampler *gs, float px, float py,
+                        float tw, float th, bool rx, bool ry, int mode) {
+    struct pctx *P = G->P;
+    canvas_t *c = P->c;
+    uint32_t cb = G->st->bg_color;
+    for (int y = c->cy0; y < c->cy1; y++) {
+        if (!((y - c->cy0) & 63) && !web_native_checkpoint(P->d)) { P->failed = true; return; }
+        float v = (float)y + .5f - py;
+        if (ry) v -= floorf(v / th) * th;
+        else if (v < 0 || v >= th) continue;
+        for (int x = c->cx0; x < c->cx1; x++) {
+            float u = (float)x + .5f - px;
+            if (rx) u -= floorf(u / tw) * tw;
+            else if (u < 0 || u >= tw) continue;
+            uint32_t s;
+            if (img) {
+                int ix = (int)u, iy = (int)v;
+                s = img->px[(size_t)(iy < img->h ? iy : img->h - 1) * img->w + (ix < img->w ? ix : img->w - 1)];
+            } else s = gradient_at(gs, u, v);
+            if (s >> 24) gfx_blend_pixel(c, x, y, blend_pixel(mode, s, cb, bg_backdrop(G, x, y)));
+        }
+    }
+}
+/* the painted image layer, st->bg_layer of the background-image list */
+static void paint_bg_image(struct bg_paint *G) {
+    struct pctx *P = G->P;
+    web_doc *d = P->d;
+    const style_t *st = G->st;
+    canvas_t *c = P->c;
+    const struct css_background *bg = css_style_background(st);
+    uint32_t layer = st->bg_layer;
+    struct web_image *im = NULL;
+    const struct gradient *g = NULL;
+    if (st->bg_img) {
+        int idx = st->bg_img - 1;
+        if (idx < 0 || idx >= d->images.n) return;
+        im = d->images.v[idx];
+        if (!im->img || im->img->w < 1 || im->img->h < 1) return;
+    } else if (st->has_grad && st->gradient && !G->skip_color) g = st->gradient;
+    else return;
+    /* §3.7-§3.8: the positioning area */
+    uint8_t attachment = css_bg_keyword(bg, CSS_BG_ATTACHMENT, layer), origin = css_bg_keyword(bg, CSS_BG_ORIGIN, layer);
+    if (origin > CSS_BOX_CONTENT) origin = CSS_BOX_PADDING;
+    float A[4];
+    if (attachment == CSS_BG_FIXED) {
+        A[0] = P->ox + (float)d->view_x; A[1] = P->oy + (float)d->view_y; A[2] = (float)d->width; A[3] = (float)d->height;
+    } else {
+        memcpy(A, G->rect[origin], sizeof A);
+        box_t *b = G->T->box;
+        if (attachment == CSS_BG_LOCAL && b && box_element_scrollable(b)) {
+            /* the scrolling area in place of the padding box, scrolled with the contents */
+            A[0] -= (float)b->node->scroll_x;
+            A[1] -= (float)b->node->scroll_y;
+            A[2] += fmaxf(0, b->scroll_w - G->rect[CSS_BOX_PADDING][2]);
+            A[3] += fmaxf(0, b->scroll_h - G->rect[CSS_BOX_PADDING][3]);
+        }
+    }
+    if (!(A[2] > 0) || !(A[3] > 0)) return;
+    float tw, th;
+    bg_tile_size(st->bg_size_kind, st->bg_size, im ? (float)im->img->w : 0, im ? (float)im->img->h : 0, A[2], A[3], &tw, &th);
+    int TW = 0, TH = 0;
+    if (im) {
+        TW = (int)roundf(tw);
+        TH = (int)roundf(th);
+        if (TW < 1 || TH < 1) return;
+        tw = (float)TW;
+        th = (float)TH;
+    } else if (!(tw > 0) || !(th > 0) || !isfinite(tw) || !isfinite(th)) return;
+    float px = A[0] + css_bg_offset_px(bg, 0, layer, A[2] - tw), py = A[1] + css_bg_offset_px(bg, 1, layer, A[3] - th);
+    bool rx = st->bg_repeat == BR_REPEAT || st->bg_repeat == BR_REPEAT_X;
+    bool ry = st->bg_repeat == BR_REPEAT || st->bg_repeat == BR_REPEAT_Y;
+    int mode = css_bg_keyword(bg, CSS_BG_BLEND, layer);
+    uint8_t clip = css_bg_keyword(bg, CSS_BG_CLIP, layer);
+    struct bg_clip s;
+    if (bg_clip_begin(G, clip, true, &s)) {
+        if (im) {
+            image_t *img = scaled_image(im, TW, TH, c, c->cx0, c->cy0, c->cx1 - c->cx0, c->cy1 - c->cy0);
+            if (img) {
+                paint_drew(P, true);
+                if (mode == CSS_BLEND_NORMAL) draw_tiles(c, img, px, py, TW, TH, rx, ry, 0);
+                else blend_tiles(G, img, NULL, roundf(px), roundf(py), tw, th, rx, ry, mode);
+            }
+        } else if (mode == CSS_BLEND_NORMAL) {
+            /* one tile the size of the border box keeps the uniform radius's antialiased edge */
+            const float *b = G->rect[0];
+            bool whole = bg_clip_box(clip) == CSS_BOX_BORDER && px == b[0] && py == b[1] && tw == b[2] && th == b[3];
+            gradient_tiles(P, g, st->color, px, py, tw, th, rx, ry, whole && !(G->rounded && G->rounded[0]) ? G->r : 0);
+        } else {
+            struct gradient_sampler gs;
+            gradient_setup(&gs, g, st->color, 0, 0, tw, th);
+            blend_tiles(G, NULL, &gs, px, py, tw, th, rx, ry, mode);
+        }
+    }
+    bg_clip_end(G, &s);
+}
+/* a box's (or fragment's) background: x, y, w, h its border box on the canvas, bw its border widths */
+static void paint_background(struct pctx *P, const style_t *st, const struct bg_target *T, float x, float y, float w,
+                             float h, const float *bw, bool skip_bg, struct radius_cache *const *rounded, float r) {
+    bool gradient = st->has_grad && st->gradient && !skip_bg;
+    if (!st->bg_img && !gradient && (skip_bg || !(st->bg_color >> 24))) return;
+    if (!skip_bg && ((st->bg_color >> 24) || gradient)) paint_drew(P, false);
+    const struct css_background *bg = css_style_background(st);
+    struct bg_paint G = {.P = P, .st = st, .T = T, .rounded = rounded, .r = r, .skip_color = skip_bg,
+                         .color_clip = css_bg_keyword(bg, CSS_BG_CLIP, st->bg_layers ? st->bg_layers - 1u : 0u)};
+    float *b = G.rect[0], *p = G.rect[1], *k = G.rect[2];
+    b[0] = x; b[1] = y; b[2] = w; b[3] = h;
+    p[0] = x + bw[3]; p[1] = y + bw[0]; p[2] = fmaxf(0, w - bw[1] - bw[3]); p[3] = fmaxf(0, h - bw[0] - bw[2]);
+    k[0] = p[0] + T->pad[3]; k[1] = p[1] + T->pad[0];
+    k[2] = fmaxf(0, p[2] - T->pad[1] - T->pad[3]); k[3] = fmaxf(0, p[3] - T->pad[0] - T->pad[2]);
+    paint_bg_color(&G);
+    if (!P->failed) paint_bg_image(&G);
+    free(G.text);
+}
+
+/* ---------------------------------------------------------------- nine-slice images
+   css-backgrounds-3 §6 (border-image) and css-masking-1 §8 (mask-border): an image sliced in nine,
+   each part scaled and tiled into its region of the border image area. One plan and one drawer
+   serve both: border-image draws onto the canvas, mask-border into a mask. */
+/* A part: the source rectangle (image pixels), its region of the area, the tile's size, the first
+   tile's position and the gap after each tile (space). */
+struct nine_part { float sx, sy, sw, sh, x, y, w, h, tw, th, ox, oy, gx, gy; };
+/* §6.6 steps 2-3 along one axis of a part's region (from start, size), its tile t: the tile's
+   size, the first tile and the gap; false when no tile fits (space) */
+static bool nine_slice_axis(uint8_t repeat, float start, float size, float *t, float *first, float *gap) {
+    *first = start;
+    *gap = 0;
+    switch (repeat) {
+    case CSS_BI_STRETCH: *t = size; return true;
+    case CSS_BI_ROUND: {
+        float n = roundf(size / *t);
+        *t = size / (n < 1 ? 1 : n);
+        return true;
+    }
+    case CSS_BI_REPEAT: *first = start + (size - *t) / 2; return true;
+    case CSS_BI_SPACE: {
+        float n = floorf(size / *t);
+        if (n < 1) return false;
+        *gap = (size - n * *t) / (n + 1);
+        *first = start + *gap;
+        return true;
+    }
+    }
+    return true;
+}
+/* §6.6: the parts of an image iw by ih sliced at slice (top right bottom left, image pixels) into
+   the area (x, y, w, h) with the border image widths width, repeat rh across and rv down; out[4]
+   is the middle region even when it is not drawn. The bits of the parts that draw (the middle
+   only with fill). */
+static unsigned nine_slice_plan(float iw, float ih, const float slice[4], const float area[4], const float width[4],
+                                uint8_t rh, uint8_t rv, bool fill, struct nine_part out[9]) {
+    float s[4], W[4];
+    for (int i = 0; i < 4; i++) {
+        float dim = (i & 1) ? iw : ih;
+        s[i] = slice[i] < 0 || !(slice[i] == slice[i]) ? 0 : slice[i] > dim ? dim : slice[i];
+        W[i] = width[i] > 0 && isfinite(width[i]) ? width[i] : 0;
+    }
+    float aw = area[2] > 0 ? area[2] : 0, ah = area[3] > 0 ? area[3] : 0;
+    /* §6.3: widths that overlap are reduced in proportion until they do not */
+    float f = 1;
+    if (W[1] + W[3] > 0) f = fminf(f, aw / (W[1] + W[3]));
+    if (W[0] + W[2] > 0) f = fminf(f, ah / (W[0] + W[2]));
+    if (f < 1) for (int i = 0; i < 4; i++) W[i] *= f;
+    float rx[3] = {area[0], area[0] + W[3], area[0] + aw - W[1]}, rw[3] = {W[3], aw - W[3] - W[1], W[1]};
+    float ry[3] = {area[1], area[1] + W[0], area[1] + ah - W[2]}, rhh[3] = {W[0], ah - W[0] - W[2], W[2]};
+    float sx[3] = {0, s[3], iw - s[1]}, sw[3] = {s[3], iw - s[3] - s[1], s[1]};
+    float sy[3] = {0, s[0], ih - s[2]}, sh[3] = {s[0], ih - s[0] - s[2], s[2]};
+    /* §6.6 step 1: the edges scale in proportion to their border image widths; the middle as the
+       top (else the bottom) across and the left (else the right) down */
+    float scale[4];
+    for (int i = 0; i < 4; i++) scale[i] = s[i] > 0 ? W[i] / s[i] : 0;
+    float across = scale[0] > 0 && isfinite(scale[0]) ? scale[0] : scale[2] > 0 && isfinite(scale[2]) ? scale[2] : 1;
+    float down = scale[3] > 0 && isfinite(scale[3]) ? scale[3] : scale[1] > 0 && isfinite(scale[1]) ? scale[1] : 1;
+    unsigned parts = 0;
+    for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 3; col++) {
+            int i = row * 3 + col;
+            struct nine_part *p = &out[i];
+            p->x = rx[col]; p->w = rw[col]; p->y = ry[row]; p->h = rhh[row];
+            p->sx = sx[col]; p->sw = sw[col]; p->sy = sy[row]; p->sh = sh[row];
+            p->tw = col != 1 ? p->w : p->sw * (row == 0 ? scale[0] : row == 2 ? scale[2] : across);
+            p->th = row != 1 ? p->h : p->sh * (col == 0 ? scale[3] : col == 2 ? scale[1] : down);
+            p->ox = p->x; p->oy = p->y; p->gx = p->gy = 0;
+            bool shown = p->w > 0 && p->h > 0 && p->sw > 0 && p->sh > 0 && p->tw > 0 && p->th > 0 &&
+                         isfinite(p->tw) && isfinite(p->th) && (i != 4 || fill);
+            if (shown && col == 1) shown = nine_slice_axis(rh, p->x, p->w, &p->tw, &p->ox, &p->gx);
+            if (shown && row == 1) shown = nine_slice_axis(rv, p->y, p->h, &p->th, &p->oy, &p->gy);
+            if (shown && p->tw > 0 && p->th > 0) parts |= 1u << i;
+        }
+    return parts;
+}
+/* A nine-slice image ready to draw: its source, plan and parts. */
+struct nine_slice { struct paint_source src; struct nine_part part[9]; unsigned parts; bool fill; uint8_t mode; };
+/* the outsets of a border image whose border widths are bw (§6.5) */
+static void border_image_outsets(const struct css_border_image *bi, const float *bw, float out[4]) {
+    for (int i = 0; i < 4; i++) {
+        const struct css_bi_side *o = &bi->outset[i];
+        float v = o->kind == CSS_BI_NUMBER ? o->number * bw[i] : o->kind == CSS_BI_LENGTH ? len_resolve(&o->length, 0) : 0;
+        out[i] = v > 0 && isfinite(v) ? v : 0;
+    }
+}
+/* bi's source, slices, widths and plan over the border box x, y, w, h with border widths bw;
+   image: the document's image of its source url (style_t's border_image_img or mask_border_img).
+   false when its source shows nothing: none, or an image not (yet) decoded. */
+static bool nine_slice_prepare(web_doc *d, const struct css_border_image *bi, int image, uint32_t cur, float x, float y,
+                               float w, float h, const float *bw, struct nine_slice *N) {
+    float o[4];
+    border_image_outsets(bi, bw, o);
+    float area[4] = {x - o[3], y - o[0], w + o[1] + o[3], h + o[0] + o[2]};
+    if (!(area[2] > 0) || !(area[3] > 0)) return false;
+    memset(N, 0, sizeof *N);
+    float iw, ih;
+    bool natural = false;
+    if (bi->source.url) {
+        int idx = image - 1;
+        if (idx < 0 || idx >= d->images.n) return false;
+        const struct web_image *im = d->images.v[idx];
+        if (!im->img || im->img->w < 1 || im->img->h < 1) return false;
+        N->src.img = im->img;
+        iw = (float)im->img->w;
+        ih = (float)im->img->h;
+        natural = true;
+    } else if (bi->source.gradient) {
+        /* sized by the default sizing algorithm: the border image area */
+        iw = area[2];
+        ih = area[3];
+        gradient_setup(&N->src.gradient, bi->source.gradient, cur, 0, 0, iw, ih);
+    } else return false;
+    N->src.w = iw;
+    N->src.h = ih;
+    float slice[4], width[4];
+    for (int i = 0; i < 4; i++) {
+        const struct css_bi_side *s = &bi->slice.side[i];
+        float dim = (i & 1) ? iw : ih;
+        slice[i] = s->kind == CSS_BI_NUMBER ? s->number : s->length.pct / 100 * dim;
+        if (!(slice[i] > 0)) slice[i] = 0;
+        if (slice[i] > dim) slice[i] = dim;
+    }
+    for (int i = 0; i < 4; i++) {
+        const struct css_bi_side *s = &bi->width[i];
+        if (s->kind == CSS_BI_NUMBER) width[i] = s->number * bw[i];
+        else if (s->kind == CSS_BI_LENGTH) width[i] = len_resolve(&s->length, (i & 1) ? area[2] : area[3]);
+        else width[i] = natural ? slice[i] : bw[i]; /* auto: the slice's natural size */
+    }
+    N->fill = bi->slice.fill;
+    N->mode = bi->mode;
+    N->parts = nine_slice_plan(iw, ih, slice, area, width, bi->repeat[0], bi->repeat[1], N->fill, N->part);
+    return true;
+}
+/* Draw the parts into the pixels (x0, y0)-(x1, y1), each through put. false when cancelled. */
+static bool nine_slice_draw(web_doc *d, const struct nine_slice *N, int x0, int y0, int x1, int y1,
+                            void (*put)(void *, int, int, uint32_t), void *context) {
+    for (int i = 0; i < 9; i++) {
+        if (!(N->parts & (1u << i))) continue;
+        const struct nine_part *p = &N->part[i];
+        float clamp[4] = {p->sx, p->sy, p->sx + p->sw, p->sy + p->sh};
+        int px0 = (int)fmaxf((float)x0, ceilf(p->x - .5f)), px1 = (int)fminf((float)x1, ceilf(p->x + p->w - .5f));
+        int py0 = (int)fmaxf((float)y0, ceilf(p->y - .5f)), py1 = (int)fminf((float)y1, ceilf(p->y + p->h - .5f));
+        float period_x = p->tw + p->gx, period_y = p->th + p->gy;
+        for (int py = py0; py < py1; py++) {
+            if (!((py - py0) & 63) && !web_native_checkpoint(d)) return false;
+            float v = (float)py + .5f - p->oy;
+            v -= floorf(v / period_y) * period_y;
+            if (v >= p->th) continue;
+            float sy = p->sy + v * p->sh / p->th;
+            for (int px = px0; px < px1; px++) {
+                float u = (float)px + .5f - p->ox;
+                u -= floorf(u / period_x) * period_x;
+                if (u >= p->tw) continue;
+                uint32_t col = source_at(&N->src, p->sx + u * p->sw / p->tw, sy, clamp);
+                if (col >> 24) put(context, px, py, col);
+            }
+        }
+    }
+    return true;
+}
+static void nine_put_canvas(void *context, int x, int y, uint32_t col) { gfx_blend_pixel(context, x, y, col); }
+/* border-image (§6): drawn in place of the border styles when its source shows */
+static bool paint_border_image(struct pctx *P, const style_t *st, float x, float y, float w, float h, const float *bw) {
+    const struct css_border_image *bi = css_style_border_image(st);
+    struct nine_slice N;
+    if ((!bi->source.url && !bi->source.gradient) ||
+        !nine_slice_prepare(P->d, bi, st->border_image_img, st->color, x, y, w, h, bw, &N)) return false;
+    canvas_t *c = P->c;
+    if (!N.parts) return true;
+    paint_drew(P, false);
+    if (!nine_slice_draw(P->d, &N, c->cx0, c->cy0, c->cx1, c->cy1, nine_put_canvas, c)) P->failed = true;
+    return true;
+}
+/* mask-border (css-masking-1 §8): a mask over the pixels (x, y, w, h); the middle part is opaque
+   white unless fill draws it, the rest of the area and beyond it masks out */
+struct nine_mask { uint8_t *alpha; int x, y, w; uint8_t mode; };
+static void nine_put_mask(void *context, int x, int y, uint32_t col) {
+    struct nine_mask *m = context;
+    unsigned a = col >> 24;
+    if (m->mode == CSS_MASK_BORDER_LUMINANCE) /* §8.2: the luminance, by Compositing's coefficients */
+        a = a * (unsigned)(.2125f * (float)((col >> 16) & 255) + .7154f * (float)((col >> 8) & 255) + .0721f * (float)(col & 255) + .5f) / 255;
+    m->alpha[(size_t)(y - m->y) * (size_t)m->w + (size_t)(x - m->x)] = (uint8_t)a;
+}
+static uint8_t *mask_border_alpha(struct pctx *P, const struct nine_slice *N, int x, int y, int w, int h) {
+    uint8_t *alpha = calloc((size_t)w, (size_t)h);
+    if (!alpha) { P->failed = true; return NULL; }
+    if (!N->fill) {
+        const struct nine_part *m = &N->part[4];
+        int mx0 = (int)fmaxf((float)x, ceilf(m->x - .5f)), mx1 = (int)fminf((float)(x + w), ceilf(m->x + m->w - .5f));
+        int my0 = (int)fmaxf((float)y, ceilf(m->y - .5f)), my1 = (int)fminf((float)(y + h), ceilf(m->y + m->h - .5f));
+        for (int j = my0; j < my1; j++) memset(alpha + (size_t)(j - y) * w + (mx0 - x), 255, mx1 > mx0 ? (size_t)(mx1 - mx0) : 0);
+    }
+    struct nine_mask m = {alpha, x, y, w, N->mode};
+    if (!nine_slice_draw(P->d, N, x, y, x + w, y + h, nine_put_mask, &m)) { P->failed = true; free(alpha); return NULL; }
+    return alpha;
+}
+
+/* background and borders of a border box (x, y, w, h on the canvas), of what T says */
 static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y, float w, float h, const float *bw,
-                            bool skip_bg, bool open_l, bool open_r, const struct shadow_cache *shadows,struct radius_cache *const *rounded) {
+                            bool skip_bg, bool open_l, bool open_r, const struct shadow_cache *shadows,struct radius_cache *const *rounded,
+                            const struct bg_target *T) {
+    if (P->text_mask) return; /* a text clip's walk (bg_text) draws the text alone */
     canvas_t *c = P->c;
     /* Culling the primitive, not the subtree: visible-overflow and fixed
      * descendants must still be walked, and offscreen resources stay wanted. */
     paint_shadows(P,shadows,x,y,false);
     if(P->failed)return;
-    if (x >= c->cx1 || y >= c->cy1 || x + w <= c->cx0 || y + h <= c->cy0) return;
+    /* a border image reaches past the border box by its outsets */
+    float o[4] = {0, 0, 0, 0};
+    const struct css_border_image *bi = css_style_border_image(st);
+    if (bi->source.url || bi->source.gradient) border_image_outsets(bi, bw, o);
+    if (x - o[3] >= c->cx1 || y - o[0] >= c->cy1 || x + w + o[1] <= c->cx0 || y + h + o[2] <= c->cy0) return;
+    bool shown = !(x >= c->cx1 || y >= c->cy1 || x + w <= c->cx0 || y + h <= c->cy0);
     float r = used_radius(st, w, h);
     const struct gfx_mask_clip *previous=c->mask_clip;struct gfx_mask_clip boundary;
-    if(rounded)radius_clip_push(P,rounded[0],&boundary,x,y);
+    if(rounded&&shown)radius_clip_push(P,rounded[0],&boundary,x,y);
     if (st->mask_img) { /* an icon: the background colour through the mask, nothing else */
         uint32_t col = st->has_grad ? st->grad[0] : st->bg_color;
-        if (!skip_bg && (col >> 24))
+        if (shown && !skip_bg && (col >> 24))
             paint_layer(P, st->mask_img, st->mask_size_kind, st->mask_size, st->mask_pos, st->mask_repeat, col, x, y, w,
                         h, bw);
         c->mask_clip=previous;return;
     }
-    if (!skip_bg) {
-        if ((st->bg_color >> 24) || (st->has_grad && st->gradient)) paint_drew(P, false);
-        if (st->bg_color >> 24) {
-            if(rounded&&rounded[0])gfx_fill_blend(c,(int)floorf(x),(int)floorf(y),(int)ceilf(x+w)-(int)floorf(x),(int)ceilf(y+h)-(int)floorf(y),st->bg_color);
-            else fill_rrect(c, x, y, w, h, r, st->bg_color, st->bg_color);
-        }
-        if (st->has_grad && st->gradient) fill_gradient(c, x, y, w, h, rounded&&rounded[0]?0:r, st->gradient, st->color);
-    }
-    if (st->bg_img)
-        paint_layer(P, st->bg_img, st->bg_size_kind, st->bg_size, st->bg_pos, st->bg_repeat, 0, x, y, w, h, bw);
+    if (shown) paint_background(P, st, T, x, y, w, h, bw, skip_bg, rounded, r);
     c->mask_clip=previous;
+    if(P->failed)return;
     paint_shadows(P,shadows,x,y,true);
     if(P->failed)return;
+    if (paint_border_image(P, st, x, y, w, h, bw) || !shown) return;
     const uint32_t *bc = st->border_color;
     bool any = false;
     for (int i = 0; i < 4; i++)
@@ -1355,14 +2094,14 @@ static void paint_run_text(struct pctx *P, const struct run *r, float bx, float 
     float asc, desc;
     wf_metrics(&f, &asc, &desc);
     if (base - asc > P->c->cy1 || base + desc < P->c->cy0) return;
-    if (r->highlight && r->highlight_first < r->highlight_end) {
+    if (r->highlight && r->highlight_first < r->highlight_end && !P->text_mask) {
         /* Only the matched bytes of the run, measured as the line placed them. */
         float x0 = layout_run_x(r, (size_t)r->highlight_first), x1 = layout_run_x(r, (size_t)r->highlight_end);
         gfx_fill_blend(P->c, (int)(x + x0), (int)(base - asc), (int)ceilf(x1 - x0), (int)ceilf(asc + desc), RGB(255, 213, 0));
     }
     /* Text is contentful even in a transparent colour (Paint Timing). */
     if (r->n > 0) paint_drew(P, contentful_text(r->s, (size_t)r->n));
-    uint32_t col = st->color;
+    uint32_t col = P->text_mask ? 0xFFFFFFFFu : st->color; /* a text clip's coverage, whatever its colour */
     draw_text(P, st, x, base, r->s, r->n, col);
     if (st->text_decoration) {
         float th = st->font_size / 14;
@@ -2205,6 +2944,8 @@ static bool prepare_paint_tree(web_doc *d,box_t *b){
         struct border_radii content=inset_radii(radii,edges,b->w,b->h);
         if(b->kind==B_ATOMIC&&b->atomic!=AT_INLINE_BLOCK) {
             if(!radius_cache_prepare(d,&b->radius_clip[2],x,cy(b),b->w,b->h,content))return false;
+        } else if(bg_content_clip(b->st)) { /* background-clip: content-box */
+            if(!radius_cache_prepare(d,&b->radius_clip[2],x,y,b->w,b->h,content))return false;
         } else web_radius_cache_free(&b->radius_clip[2]);
         if(!clip_cache_prepare(d,b))return false;
     }
@@ -2266,6 +3007,12 @@ static void shadow_ink_bounds(const style_t *style,float x,float y,float w,float
         float extent=fmaxf(style->outline_offset+style->outline_width,0)+1;
         rect[0]=fminf(rect[0],x-extent);rect[1]=fminf(rect[1],y-extent);
         rect[2]=fmaxf(rect[2],x+w+extent);rect[3]=fmaxf(rect[3],y+h+extent);
+    }
+    const struct css_border_image *image=css_style_border_image(style);
+    if(image->source.url||image->source.gradient) { /* css-backgrounds-3 §6.5 */
+        float o[4];border_image_outsets(image,style->border_width,o);
+        rect[0]=fminf(rect[0],x-o[3]-1);rect[1]=fminf(rect[1],y-o[0]-1);
+        rect[2]=fmaxf(rect[2],x+w+o[1]+1);rect[3]=fmaxf(rect[3],y+h+o[2]+1);
     }
 }
 static void bounds_decoration(struct pctx *P,const style_t *style,float x,float y,float w,float h) {
@@ -2513,7 +3260,12 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
         if (!d->first) bw[3] = 0;
         if (!d->last) bw[1] = 0;
         float x = P->ox + bx + d->x, y = P->oy + by + d->y;
-        paint_bg_border(P, st, x, y, d->w, d->h, bw, false, !d->first, !d->last,d->shadow_cache,d->radius_clip);
+        /* an inline box's padding percentages are of its block's width */
+        struct bg_target T = {.block = b, .deco = d};
+        for (int k = 0; k < 4; k++) T.pad[k] = fmaxf(0, len_resolve(&st->padding[k], b->w));
+        if (!d->first) T.pad[3] = 0;
+        if (!d->last) T.pad[1] = 0;
+        paint_bg_border(P, st, x, y, d->w, d->h, bw, false, !d->first, !d->last,d->shadow_cache,d->radius_clip,&T);
     }
     for (int i = scope ? scope->inline_run_first : 0; i >= 0 && i < b->nruns;
          i = scope ? b->runs[i].paint_next : i + 1) {
@@ -2576,7 +3328,7 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
         paint_run_text(P,&marker,bx,by);
     }
     /* inline box outlines, over the text like block outlines */
-    if (P->mode == M_PAINT)
+    if (P->mode == M_PAINT && !P->text_mask)
         for (int i = scope ? scope->inline_deco_first : 0; i >= 0 && i < b->ndecos;
              i = scope ? b->decos[i].paint_next : i + 1) {
             struct deco *d = &b->decos[i];
@@ -2912,10 +3664,15 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         if (clipped) clip_pop(c, clip_saved, clip_prior);
         release_layers(&layers,layers_borrowed); return;
     }
-    /* group opacity: paint, then blend the result with what was there */
+    /* group opacity and mask-border (css-masking-1 §8): paint, then mix the result with what was
+       there, by the opacity and the mask. A mask whose image is not decoded masks nothing (§8.1). */
     uint32_t *saved = NULL;
     int gx = 0, gy = 0, gw = 0, gh = 0;
-    if (P->mode == M_PAINT && group_opacity < 1 && b->kind != B_TEXT) {
+    struct nine_slice mask_slice;
+    bool masked = P->mode == M_PAINT && !P->text_mask && b->kind != B_TEXT && b->kind != B_INLINE && b->kind != B_BR &&
+                  mask_border_set(st) && nine_slice_prepare(P->d, css_style_mask_border(st), st->mask_border_img, st->color,
+                                                            P->ox + bx, P->oy + by, bw, bh, b->b, &mask_slice);
+    if (P->mode == M_PAINT && (group_opacity < 1 || masked) && b->kind != B_TEXT) {
         struct pctx measure = *P; measure.mode = M_BOUNDS; measure.bounds_valid = false;
         paint_box(&measure, b, true);
         if (measure.failed) { P->failed = true; if (clipped) clip_pop(c, clip_saved, clip_prior); release_layers(&layers,layers_borrowed); return; }
@@ -2928,7 +3685,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
                 gx = (int)left; gy = (int)top; gw = (int)(right - left); gh = (int)(bottom - top);
                 /* Group opacity mixes each pixel with what was under it, and
                    nothing else; other filter functions mix neighbours. */
-                if(st->filter)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
+                if(st->filter||masked)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
                 else web_avmedia_snapshot_blend_region(c,gx,gy,gw,gh);
                 if(P->d->profile_enabled){paint_profile.groups++;paint_profile.group_pixels+=(uint64_t)gw*(uint64_t)gh;}
                 if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
@@ -2948,7 +3705,8 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         if (P->mode == M_PAINT && visible) {
             bool skip_bg = (P->canvas_bg_from == 1 && b->node == P->d->html && b->node) ||
                            (P->canvas_bg_from == 2 && b->node == P->d->body && b->node);
-            paint_bg_border(P, st, P->ox + bx, P->oy + by, bw, bh, b->b, skip_bg, false, false,b->shadow_cache,b->radius_clip);
+            paint_bg_border(P, st, P->ox + bx, P->oy + by, bw, bh, b->b, skip_bg, false, false,b->shadow_cache,b->radius_clip,
+                            &(struct bg_target){.box = b, .pad = {b->p[0], b->p[1], b->p[2], b->p[3]}, .content_mask = true});
         } else if (P->mode == M_HIT && hit_style(st) && st->content_visibility!=CV_HIDDEN &&
                    (b->kind == B_ATOMIC || (b->node&&b->node->tag==T_button)) && inside(P, bx, by, bw, bh)) {
             int k = control_hit(b);
@@ -2956,10 +3714,11 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         }
     } else if ((b->kind == B_ROW || b->kind == B_ROW_GROUP) && P->mode == M_PAINT && visible && (st->bg_color >> 24)) {
         float z[4] = {0, 0, 0, 0};
-        paint_bg_border(P, st, P->ox + x, P->oy + y, b->w, b->h, z, false, false, false,b->shadow_cache,b->radius_clip);
+        paint_bg_border(P, st, P->ox + x, P->oy + y, b->w, b->h, z, false, false, false,b->shadow_cache,b->radius_clip,
+                        &(struct bg_target){.box = b, .content_mask = true});
     }
     if (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) {
-        if (P->mode == M_PAINT && visible && st->content_visibility!=CV_HIDDEN) {
+        if (P->mode == M_PAINT && visible && !P->text_mask && st->content_visibility!=CV_HIDDEN) {
             const struct gfx_mask_clip *prior=c->mask_clip;struct gfx_mask_clip replacement;
             radius_clip_push(P,b->radius_clip[2],&replacement,P->ox+x,P->oy+cy(b));paint_replaced(P, b);c->mask_clip=prior;
         }
@@ -2967,7 +3726,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     }
     if(st->content_visibility==CV_HIDDEN)goto done;
     if (b->marker || b->marker_shape) {
-        if (P->mode == M_PAINT) paint_marker(P, b);
+        if (P->mode == M_PAINT && !P->text_mask) paint_marker(P, b);
     }
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     const struct gfx_mask_clip *previous_mask=c->mask_clip;struct gfx_mask_clip overflow_mask;
@@ -2985,7 +3744,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             if(corners_coverage(P->hx,P->hy,bx+b->b[3],by+b->b[0],bw-b->b[1]-b->b[3],bh-b->b[0]-b->b[2],&radii)<.5f)contents=false;
         }
     }
-    if (P->mode == M_PAINT && visible && b->gap_decorations) paint_gap_decorations(P, b, P->ox + x, P->oy + y);
+    if (P->mode == M_PAINT && visible && !P->text_mask && b->gap_decorations) paint_gap_decorations(P, b, P->ox + x, P->oy + y);
     int layer = 0;
     for (; layer < layers.n && layer_z(layers.v[layer]) < 0; layer++)
         paint_stacked_layer(P, layers.v[layer]);
@@ -3009,17 +3768,22 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     c->mask_clip=previous_mask;
 done:
     release_layers(&layers,layers_borrowed);
-    if (P->mode == M_PAINT && visible && st->outline_width > 0 && b->kind != B_INLINE && b->kind != B_TEXT &&
+    if (P->mode == M_PAINT && visible && !P->text_mask && st->outline_width > 0 && b->kind != B_INLINE && b->kind != B_TEXT &&
         b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP)
         paint_outline(c, st, P->ox + bx, P->oy + by, bw, bh);
     if (clipped) clip_pop(c, clip_saved, clip_prior);
     if (saved) {
         int a = (int)(group_opacity * 255 + 0.5f);
+        uint8_t *mask = masked && !P->failed ? mask_border_alpha(P, &mask_slice, gx, gy, gw, gh) : NULL;
         for (int j = 0; !P->failed && j < gh; j++) {
             if (!(j & 63) && !web_native_checkpoint(P->d)) { P->failed = true; break; }
             uint32_t *row = c->px + (size_t)(gy + j) * c->pitch + gx, *old = saved + (size_t)j * gw;
-            for (int i = 0; i < gw; i++) row[i] = gfx_mix(old[i], row[i], a);
+            if (mask) {
+                const uint8_t *m = mask + (size_t)j * gw;
+                for (int i = 0; i < gw; i++) row[i] = gfx_mix(old[i], row[i], (a * m[i] + 127) / 255);
+            } else for (int i = 0; i < gw; i++) row[i] = gfx_mix(old[i], row[i], a);
         }
+        free(mask);
         if (P->failed)
             for (int j = 0; j < gh; j++) memcpy(c->px + (size_t)(gy + j) * c->pitch + gx,
                 saved + (size_t)j * gw, sizeof *saved * (size_t)gw);
