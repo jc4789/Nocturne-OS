@@ -10,7 +10,10 @@
      opened <slot> <id>     the browser started (its app identifier)
      failed <slot> <error>  it could not start
      ended <slot> <status>  it ended without being told to (a crash or its own exit)
-   Each browser runs in C:\Tests\profiles\slot<slot> as its user folder, made new at each open. */
+   Each browser runs in C:\Tests\profiles\slot<slot> as its user folder, made new at each open,
+   and with --wpt-automation, a test tool of the browser's: WPT's testdriver
+   (tests/wpt/testdriver-vendor.js) may then drive its own input. This is the only program that
+   gives the browser that option. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,12 +78,13 @@ static void open_slot(int slot, char **words, int count) {
     snprintf(user_setting, sizeof user_setting, "USERFOLDER=%s", user);
     snprintf(temp_setting, sizeof temp_setting, "TEMP=%s", temp);
     const char *settings[] = {user_setting, temp_setting};
-    const char *args[MAX_WORDS + 1];
+    const char *args[MAX_WORDS + 2];
     args[0] = "browser";
-    for (int i = 0; i < count; i++) args[i + 1] = words[i];
+    args[1] = "--wpt-automation";
+    for (int i = 0; i < count; i++) args[i + 2] = words[i];
     int32_t handles[] = {-1, -1, -1};
     struct n_launch launch = {.arguments = args, .settings = settings, .handles = handles,
-                              .argument_count = (uint32_t)count + 1, .setting_count = 2, .handle_count = 3};
+                              .argument_count = (uint32_t)count + 2, .setting_count = 2, .handle_count = 3};
     n_handle app = n_app_launch(N_FOLDER_PROGRAMS "\\Browser\\browser", &launch);
     if (app < 0) {
         say("failed %d %s\n", slot, n_result_text(app));
