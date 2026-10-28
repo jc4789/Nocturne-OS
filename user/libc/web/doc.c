@@ -808,8 +808,8 @@ void doc_dom_budget(web_doc *d) {
 web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url) {
     return doc_inert_ex(family, html, n, url, false);
 }
-web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *url, bool allow_shadow) {
-    if (!family || n == SIZE_MAX || (n && !html)) return NULL;
+web_doc *doc_inert_new(web_doc *family, const char *url) {
+    if (!family) return NULL;
     int referrer_policy=family->referrer_policy;
     family = family->dom_family ? family->dom_family : family;
     web_doc *d = calloc(1, sizeof *d);
@@ -822,17 +822,46 @@ web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *u
     family->dom_family = family;
     d->dom_next = family->dom_docs; family->dom_docs = d;
     doc_dom_budget(d);
-    web_doc *previous = d->dom_next;
-    d->root = html_parse_string(d, html ? html : "", n, allow_shadow);
-    if (!d->root) {
-        /* No wrappers have escaped: discard every nested template document too. */
-        while (family->dom_docs != previous) {
-            web_doc *bad = family->dom_docs;
-            family->dom_docs = bad->dom_next; bad->dom_next = NULL;
-            web_free(bad);
-        }
-        return NULL;
+    return d;
+}
+void doc_inert_discard(web_doc *d) {
+    web_doc *family = d->dom_family, *previous = d->dom_next;
+    /* No wrappers have escaped: discard every nested template document too. */
+    while (family->dom_docs != previous) {
+        web_doc *bad = family->dom_docs;
+        family->dom_docs = bad->dom_next; bad->dom_next = NULL;
+        web_free(bad);
     }
+}
+web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *url, bool allow_shadow) {
+    if (!family || n == SIZE_MAX || (n && !html)) return NULL;
+    web_doc *d = doc_inert_new(family, url);
+    if (!d) return NULL;
+    d->root = html_parse_string(d, html ? html : "", n, allow_shadow);
+    if (!d->root) { doc_inert_discard(d); return NULL; }
+    d->resources_dirty = true;
+    return d;
+}
+/* XMLHttpRequest "set a document response", HTML: the received bytes in the
+   final encoding label, else the prescan's, else UTF-8, parsed with scripting
+   and declarative shadow roots disabled. */
+web_doc *doc_inert_bytes(web_doc *family, const char *bytes, size_t n, const char *label,
+                         const char *url, const char *content_type) {
+    if (!family || (n && !bytes)) return NULL;
+    char encoding[64];
+    if (!label || !html_encoding_label(label, strlen(label), encoding, sizeof encoding))
+        label = html_prescan_label(bytes, n, encoding, sizeof encoding) ? encoding : "UTF-8";
+    else label = encoding;
+    web_doc *d = doc_inert_new(family, url);
+    if (!d) return NULL;
+    d->content_type = strdup(content_type && *content_type ? content_type : "text/html");
+    struct html_parser *p = d->content_type ? html_begin(d, bytes ? bytes : "", n, label, false) : NULL;
+    if (!p) { doc_inert_discard(d); return NULL; }
+    html_declarative_shadow_set(p, false);
+    node_t *ignored; int result;
+    do result = html_resume(p, &ignored); while (result == HTML_PARSE_YIELD);
+    html_finish(p);
+    if (result < 0 || !d->root) { doc_inert_discard(d); return NULL; }
     d->resources_dirty = true;
     return d;
 }
@@ -974,7 +1003,9 @@ void doc_sync_tree(web_doc *d) {
         profile->metadata_visits++;
         if (n->type == N_ELEM) { html = n; break; }
     }
-    for (node_t *n = html ? html->first : NULL; n; n = n->next) {
+    /* HTML "the html element" is the document element only when it is an HTML
+       html element; head and body are its children (an XML document's root may be anything). */
+    for (node_t *n = html && !html->foreign && html->tag == T_html ? html->first : NULL; n; n = n->next) {
         profile->metadata_visits++;
         if (!head && !n->foreign && n->tag == T_head) head = n;
         if (!body && !n->foreign && (n->tag == T_body || n->tag == T_frameset)) body = n;
@@ -995,21 +1026,10 @@ void doc_sync_tree(web_doc *d) {
 void doc_rescan(web_doc *d) {
     if (d && d->native_cancelled) return;
     if (d && d->inert && d->resources_dirty) {
-        d->resources_dirty = false; d->html = d->head = d->body = NULL;
-        snprintf(d->base, sizeof d->base, "%s", d->url);
-        for (node_t *n = d->root ? d->root->first : NULL; n; n = n->next)
-            if (n->type == N_ELEM) { d->html = n; break; }
-        for (node_t *n = d->html ? d->html->first : NULL; n; n = n->next) {
-            if (!d->head && n->tag == T_head) d->head = n;
-            if (!d->body && (n->tag == T_body || n->tag == T_frameset)) d->body = n;
-        }
-        for (node_t *n = d->head ? d->head->first : NULL; n; n = n->next)
-            if (n->tag == T_base && node_attr(n, "href")) {
-                char *url=doc_absolute_url(d->url,node_attr(n,"href"));
-                if(url)snprintf(d->base,sizeof d->base,"%s",url);
-                free(url);
-                break;
-            }
+        /* The same html/head/body and frozen base URL steps as a live
+           document's metadata (an XML document's root may be any element). */
+        d->resources_dirty = false; d->metadata_valid = false;
+        doc_sync_tree(d);
         return; /* no authored CSS, image/meta fetch or live resource scan */
     }
     if (!d || !d->live || (!d->resources_dirty && !d->images_dirty)) return;
@@ -1575,6 +1595,7 @@ void web_free(web_doc *d) {
     free(d->find_text);
     free((void *)d->inherited_url);
     free(d->referrer);
+    free(d->content_type);
     free(d);
 }
 

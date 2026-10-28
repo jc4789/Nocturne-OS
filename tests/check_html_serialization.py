@@ -33,6 +33,7 @@ typedef struct node node_t;
 struct attr {const char *name,*raw,*value,*namespace_uri,*prefix,*local;node_t *node;};
 struct node {web_doc *owner;int type,namespace_id,tag,nattrs;size_t textlen,public_id_len,system_id_len;
     const char *name,*raw_name,*custom_is,*public_id,*system_id;char *text;struct attr *attrs;
+    const char *prefix,*local_name,*namespace_uri;bool cdata;
     node_t *first,*next,*parent,*template_content,*shadow_root;
     bool doctype_identifiers_sized,shadow_serializable,shadow_closed,shadow_delegates_focus,shadow_clonable,shadow_manual;
     int custom_registry_id;
@@ -56,9 +57,10 @@ buffer = between(util, "static void sb_grow(", "int utf8_put(")
 buffer += between(util, "char *sb_cstr(", "void pv_push(")
 compare = between(util, "bool str_ieq(", "bool strn_ieq(")
 name_validation = between(dom, "static bool xml_name_start(", "void doc_create_diagnostic(")
+namespaces = between(dom, "const char *doc_element_namespace(", "/* DOM \"create an element\"'s names")
 cases = (root / "tests/html_serialization_host_cases.c").read_text(encoding="utf-8")
 generated = out / "serializer.c"
-generated.write_text(prefix+tags+types+statuses+buffer+compare+name_validation+
+generated.write_text(prefix+tags+types+statuses+buffer+compare+name_validation+namespaces+
                      source.replace('#include "html_serialize.h"', '')+cases, encoding="utf-8")
 cc = root / "tools/msys64/ucrt64/bin/clang.exe"
 env = dict(os.environ, PATH=str(cc.parent)+os.pathsep+os.environ.get("PATH", ""))

@@ -20,6 +20,7 @@
 #include "html_lexbor.h"
 #include "html_policy.h"
 #include "html_encoding.h"
+#include "xml.h"
 #include "js_script_safety.h"
 #include "js_canvas.h"
 #include "js_memory.h"
@@ -160,7 +161,8 @@ enum { NP_NODE, NP_DOCUMENT, NP_ELEMENT, NP_HTML, NP_TEXT, NP_COMMENT, NP_FRAGME
        NP_AVMEDIA, NP_AUDIO, NP_VIDEO, NP_LABEL, NP_DATALIST, NP_PROGRESS, NP_METER, NP_HEADING, NP_PICTURE, NP_SOURCE, NP_MENU, NP_DIALOG, NP_DIV, NP_TRACK, NP_FRAME, NP_SVGGRAPHICS, NP_SVGPATH,
        NP_BODY, NP_HTMLROOT, NP_PARAGRAPH, NP_SPAN, NP_BR, NP_HR, NP_PRE, NP_QUOTE, NP_MOD,
        NP_UL, NP_DL, NP_DIRECTORY, NP_LEGEND, NP_OPTGROUP, NP_MAP, NP_EMBED, NP_PARAM, NP_FONT, NP_FRAMESET, NP_MARQUEE,
-       NP_TABLE, NP_CAPTION, NP_TABLESECTION, NP_TABLEROW, NP_TABLECELL, NP_TABLECOL, NP_SVGG, NP_COUNT };
+       NP_TABLE, NP_CAPTION, NP_TABLESECTION, NP_TABLEROW, NP_TABLECELL, NP_TABLECOL, NP_SVGG,
+       NP_XMLDOCUMENT, NP_PLAINDOCUMENT, NP_CDATA, NP_COUNT };
 struct js_storage_profile {
     uint64_t calls[2][7], inclusive_ms, backend_calls, backend_ms, set_bytes;
     uint64_t saves, save_ms, snapshot_bytes, cookie_calls, cookie_ms;
@@ -992,7 +994,9 @@ static bool unknown_html_interface(const node_t *n) {
     return false;
 }
 static int node_prototype_kind(const node_t *n) {
-    int kind = n->type == N_DOC ? NP_DOCUMENT : n->type == N_ELEM ?
+    /* An XML document implements Document, or XMLDocument when createDocument made it. */
+    int kind = n->type == N_DOC ? (n->owner && n->owner->xml_interface ? NP_XMLDOCUMENT :
+                                   n->owner && n->owner->xml ? NP_PLAINDOCUMENT : NP_DOCUMENT) : n->type == N_ELEM ?
                (n->namespace_id == NS_SVG ? (!strcmp(n->raw_name, "svg") ? NP_SVGSVG :
                 !strcmp(n->raw_name,"path") ? NP_SVGPATH : !strcmp(n->raw_name,"g") ? NP_SVGG :
                 (!strcmp(n->raw_name,"rect")||!strcmp(n->raw_name,"circle")||
@@ -1000,7 +1004,7 @@ static int node_prototype_kind(const node_t *n) {
                  !strcmp(n->raw_name,"polygon")||!strcmp(n->raw_name,"text")||!strcmp(n->raw_name,"image")||
                  !strcmp(n->raw_name,"use")||!strcmp(n->raw_name,"foreignObject")) ? NP_SVGGRAPHICS : NP_SVG) :
                 n->foreign ? NP_ELEMENT : n->tag == T_iframe ? NP_IFRAME : NP_HTML) :
-               n->type == N_TEXT ? NP_TEXT : n->type == N_COMMENT ? NP_COMMENT : n->type == N_DOCTYPE ? NP_DOCTYPE : n->type == N_PI ? NP_PI : n->type == N_ATTR ? NP_ATTR : n->shadow_host ? NP_SHADOW : NP_FRAGMENT;
+               n->type == N_TEXT ? (n->cdata ? NP_CDATA : NP_TEXT) : n->type == N_COMMENT ? NP_COMMENT : n->type == N_DOCTYPE ? NP_DOCTYPE : n->type == N_PI ? NP_PI : n->type == N_ATTR ? NP_ATTR : n->shadow_host ? NP_SHADOW : NP_FRAGMENT;
     if (n->type == N_ELEM && !n->foreign) switch (n->tag) {
         case T_frame: kind = NP_FRAME; break;
         case T_img: kind = NP_IMAGE; break;
@@ -1478,7 +1482,8 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
         if(status==HTTP_URL_OOM)return oom(ctx);
         JSValue value=JS_NewString(ctx,status==HTTP_URL_TUPLE?origin:"null");free(origin);return value;
     }
-    if (!strcmp(p, "contentType")) return JS_NewString(ctx, "text/html");
+    if (!strcmp(p, "contentType")) return JS_NewString(ctx, d->content_type ? d->content_type : "text/html");
+    if (!strcmp(p, "htmlDocument")) return JS_NewBool(ctx, !d->xml); /* DOM "HTML document", node document of n */
     if (!strcmp(p, "characterSet")) return JS_NewString(ctx, d->encoding[0] ? d->encoding : "UTF-8");
     if (!strcmp(p, "compatMode")) return JS_NewString(ctx, d->quirks ? "BackCompat" : "CSS1Compat");
     if (!strcmp(p, "doctype")) { for (node_t *c = d->root->first; c; c = c->next) if (c->type == N_DOCTYPE) return wrap(s, c); return JS_NULL; }
@@ -1521,17 +1526,21 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
         if (!strcmp(p, "attrValue") || !strcmp(p, "nodeValue") || !strcmp(p, "textContent")) return JS_NewString(ctx, a->value);
         if (!strcmp(p, "attrOwner")) return wrap(s, n->attr_owner);
     }
-    if (!strcmp(p, "nodeType")) return JS_NewInt32(ctx, n->type == N_DOC ? 9 : n->type == N_ELEM ? 1 : n->type == N_TEXT ? 3 : n->type == N_COMMENT ? 8 : n->type == N_DOCTYPE ? 10 : n->type == N_PI ? 7 : n->type == N_ATTR ? 2 : 11);
+    if (!strcmp(p, "nodeType")) return JS_NewInt32(ctx, n->type == N_DOC ? 9 : n->type == N_ELEM ? 1 : n->type == N_TEXT ? (n->cdata ? 4 : 3) : n->type == N_COMMENT ? 8 : n->type == N_DOCTYPE ? 10 : n->type == N_PI ? 7 : n->type == N_ATTR ? 2 : 11);
     if (!strcmp(p, "nodeName")) {
-        if (n->type != N_ELEM) return JS_NewString(ctx, n->type == N_DOC ? "#document" : n->type == N_TEXT ? "#text" : n->type == N_COMMENT ? "#comment" : n->type == N_DOCTYPE || n->type == N_PI ? n->name : "#document-fragment");
-        char name[256]; snprintf(name, sizeof name, "%s", n->foreign ? n->raw_name : n->name);
-        if (!n->foreign) for (char *q = name; *q; ++q) *q = (char)toupper((unsigned char)*q);
-        return JS_NewString(ctx, name);
+        if (n->type != N_ELEM) return JS_NewString(ctx, n->type == N_DOC ? "#document" : n->type == N_TEXT ? (n->cdata ? "#cdata-section" : "#text") : n->type == N_COMMENT ? "#comment" : n->type == N_DOCTYPE || n->type == N_PI ? n->name : "#document-fragment");
+        /* DOM tagName: the qualified name, HTML-uppercased for an HTML-namespace
+           element whose node document is an HTML document. */
+        const char *qualified = n->raw_name ? n->raw_name : n->name;
+        if (n->namespace_id != NS_HTML || d->xml) return JS_NewString(ctx, qualified);
+        size_t length = strlen(qualified); char *upper = malloc(length + 1);
+        if (!upper) return oom(ctx);
+        for (size_t i = 0; i <= length; i++) upper[i] = (char)toupper((unsigned char)qualified[i]);
+        JSValue value = JS_NewStringLen(ctx, upper, length); free(upper); return value;
     }
-    if (!strcmp(p, "localName")) return n->type == N_ELEM ? JS_NewString(ctx, n->foreign ? n->raw_name : n->name) : JS_NULL;
-    if (!strcmp(p, "namespaceURI")) return n->type != N_ELEM || n->namespace_id == NS_NONE ? JS_NULL : JS_NewString(ctx,
-        n->namespace_id == NS_SVG ? "http://www.w3.org/2000/svg" :
-        n->namespace_id == NS_MATHML ? "http://www.w3.org/1998/Math/MathML" : "http://www.w3.org/1999/xhtml");
+    if (!strcmp(p, "localName")) return n->type == N_ELEM ? JS_NewString(ctx, n->local_name ? n->local_name : n->foreign ? n->raw_name : n->name) : JS_NULL;
+    if (!strcmp(p, "namespaceURI")) return n->type == N_ELEM ? str_or_null(ctx, doc_element_namespace(n)) : JS_NULL;
+    if (!strcmp(p, "prefix")) return n->type == N_ELEM ? str_or_null(ctx, n->prefix) : JS_NULL;
     if (!strcmp(p, "piTarget")) return n->type == N_PI ? JS_NewString(ctx, n->name) : JS_ThrowTypeError(ctx, "ProcessingInstruction receiver required");
     if (!strcmp(p, "nodeValue")) return n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI ? JS_NewStringLen(ctx, n->text ? n->text : "", n->textlen) : JS_NULL;
     if (!strcmp(p, "parentNode")) return wrap(s, n->parent);
@@ -1667,6 +1676,15 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
         if(n->type!=N_ELEM || n->foreign || n->tag!=T_marquee)return JS_ThrowTypeError(ctx,"HTMLMarqueeElement receiver required");
         int running=JS_ToBool(ctx,value);if(running<0)return JS_EXCEPTION;
         web_marquee_set(n,running);return JS_UNDEFINED;
+    }
+    if (!strcmp(p, "elementPrefix")) {
+        /* The custom element constructor's result of DOM "create an element". */
+        if (n->type != N_ELEM) return JS_ThrowTypeError(ctx, "Element receiver required");
+        const char *prefix = JS_IsNull(value) ? NULL : JS_ToCString(ctx, value);
+        if (!JS_IsNull(value) && !prefix) return JS_EXCEPTION;
+        bool ok = doc_element_prefix_set(n, prefix);
+        if (prefix) JS_FreeCString(ctx, prefix);
+        return ok ? JS_UNDEFINED : oom(ctx);
     }
     if (d->resources_dirty && !strcmp(p, "title")) doc_rescan(d);
     if (!strcmp(p, "imageWidth") || !strcmp(p, "imageHeight")) {
@@ -3259,6 +3277,24 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
 
     } break;
     case DOM_parseDocument: {
+        if (argc > 2 && JS_IsObject(argv[2])) {
+            /* rawDom.parseDocument(null, bytes, charset, url, contentType): the
+               HTML document response of XMLHttpRequest, from received bytes. */
+            size_t length = 0; const uint8_t *bytes = JS_GetArrayBuffer(ctx, &length, argv[2]);
+            if (!bytes && JS_HasException(ctx)) { result = JS_EXCEPTION; break; }
+            const char *charset = argc > 3 && JS_IsString(argv[3]) ? JS_ToCString(ctx, argv[3]) : NULL;
+            const char *url = argc > 4 && JS_IsString(argv[4]) ? JS_ToCString(ctx, argv[4]) : NULL;
+            const char *type = argc > 5 && JS_IsString(argv[5]) ? JS_ToCString(ctx, argv[5]) : NULL;
+            if ((argc > 3 && JS_IsString(argv[3]) && !charset) || (argc > 4 && JS_IsString(argv[4]) && !url) ||
+                (argc > 5 && JS_IsString(argv[5]) && !type)) result = JS_EXCEPTION;
+            else {
+                web_doc *made = doc_inert_bytes(s->doc, bytes ? (const char *)bytes : "", bytes ? length : 0,
+                                                charset, url ? url : s->doc->url, type);
+                result = made ? wrap(s, made->root) : oom(ctx);
+            }
+            JS_FreeCString(ctx, charset); JS_FreeCString(ctx, url); JS_FreeCString(ctx, type);
+            break;
+        }
         size_t len; const char *html = argc > 2 ? JS_ToCStringLen(ctx, &len, argv[2]) : NULL;
         bool blank = argc > 3 && !JS_IsObject(argv[3]) && JS_ToBool(ctx, argv[3]) > 0;
         bool allow_shadow=false;
@@ -3326,22 +3362,29 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
 
     } break;
     case DOM_create: {
+        /* rawDom.create(owner, nodeType, name, data[, namespace, prefix]): an
+           element's namespace is a string, null (none) or true (SVG), else
+           HTML; the caller has validated and extracted the names. */
         int32_t type; if (argc < 5 || JS_ToInt32(ctx, &type, argv[2])) result = JS_EXCEPTION;
         else {
-            bool namespace_none = type == 1 && argc > 5 && JS_IsNull(argv[5]);
+            bool namespaced = type == 1 && argc > 5 && (JS_IsNull(argv[5]) || JS_IsString(argv[5]) ||
+                                                        (JS_IsBool(argv[5]) && JS_ToBool(ctx, argv[5]) > 0));
+            const char *ns = namespaced && JS_IsString(argv[5]) ? JS_ToCString(ctx, argv[5]) : NULL;
+            const char *prefix = namespaced && argc > 6 && JS_IsString(argv[6]) ? JS_ToCString(ctx, argv[6]) : NULL;
             size_t name_len, len;
             const char *name = JS_ToCStringLen(ctx, &name_len, argv[3]); const char *text = JS_ToCStringLen(ctx, &len, argv[4]);
-            if (!name || !text) result = JS_EXCEPTION;
-            else if (type == 1 && (!*name || (!namespace_none && strpbrk(name, "<> \t\r\n/")))) result = JS_ThrowTypeError(ctx, "Invalid element name");
+            if (!name || !text || (namespaced && JS_IsString(argv[5]) && !ns) ||
+                (namespaced && argc > 6 && JS_IsString(argv[6]) && !prefix)) result = JS_EXCEPTION;
+            else if (type == 1 && (!*name || strpbrk(name, " \t\n\f\r/>"))) result = JS_ThrowTypeError(ctx, "Invalid element name");
             else if (type == 7 && !doc_pi_target_valid(name, name_len)) result = JS_ThrowTypeError(ctx, "Invalid processing instruction target");
             else {
                 bool invalid_pi_data = false;
                 if (type == 7) for (size_t i = 1; i < len; i++) if (text[i - 1] == '?' && text[i] == '>') { invalid_pi_data = true; break; }
-                int native_type = type == 1 ? N_ELEM : type == 3 ? N_TEXT : type == 8 ? N_COMMENT : type == 7 ? N_PI : N_FRAGMENT;
-                node_t *made = invalid_pi_data ? NULL : doc_node_create(d, native_type,
-                    native_type == N_ELEM || native_type == N_PI ? name : NULL, text, len);
-                if (made && namespace_none) { made->foreign = true; made->namespace_id = NS_NONE; }
-                else if (made && argc > 5 && JS_ToBool(ctx, argv[5]) > 0) { made->foreign = true; made->namespace_id = NS_SVG; }
+                int native_type = type == 1 ? N_ELEM : type == 3 || type == 4 ? N_TEXT : type == 8 ? N_COMMENT : type == 7 ? N_PI : N_FRAGMENT;
+                node_t *made = invalid_pi_data ? NULL : namespaced ?
+                    doc_element_create(d, JS_IsBool(argv[5]) ? WEB_NS_SVG : ns, prefix, name) :
+                    doc_node_create(d, native_type, native_type == N_ELEM || native_type == N_PI ? name : NULL, text, len);
+                if (made && type == 4) made->cdata = true;
                 /* The namespace must be known before establishing HTML-only
                    template contents. SVG <template> has ordinary children. */
                 if (made && made->type == N_ELEM && !made->foreign && made->tag == T_template && !doc_template_content(d, made)) {
@@ -3353,8 +3396,84 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                     made->js_force_async_set = true; made->js_force_async = true;
                 }
             }
-            JS_FreeCString(ctx, name); JS_FreeCString(ctx, text);
+            JS_FreeCString(ctx, name); JS_FreeCString(ctx, text); JS_FreeCString(ctx, ns); JS_FreeCString(ctx, prefix);
         }
+
+    } break;
+    case DOM_documentCreate: {
+        /* rawDom.documentCreate(null, contentType, xmlDocumentInterface): an
+           empty XML document (DOM createDocument, new Document()). */
+        const char *type = argc > 2 ? JS_ToCString(ctx, argv[2]) : NULL;
+        if (!type) result = JS_EXCEPTION;
+        else {
+            web_doc *made = xml_document_new(s->doc, "about:blank", type, argc > 3 && JS_ToBool(ctx, argv[3]) > 0);
+            result = made ? wrap(s, made->root) : oom(ctx);
+        }
+        JS_FreeCString(ctx, type);
+
+    } break;
+    case DOM_parseXML: {
+        /* rawDom.parseXML(null, input, contentType, errorDocument[, charset, url]):
+           DOMParser gives a string and a parsererror document on error; XHR
+           gives the received bytes (an ArrayBuffer) and gets null on error. */
+        bool string = argc > 2 && JS_IsString(argv[2]);
+        size_t length = 0; char *input = NULL; const uint8_t *bytes = NULL;
+        if (string) {
+            const char *text = JS_ToCStringLen(ctx, &length, argv[2]);
+            if (text && (input = malloc(length + 1))) {
+                memcpy(input, text, length + 1);
+                web_utf8_replace_lone_surrogates((uint8_t *)input, length);
+            }
+            JS_FreeCString(ctx, text);
+            if (!input) { result = text ? oom(ctx) : JS_EXCEPTION; break; }
+        } else if (argc > 2) {
+            bytes = JS_GetArrayBuffer(ctx, &length, argv[2]);
+            if (!bytes && JS_HasException(ctx)) { result = JS_EXCEPTION; break; }
+            if (!bytes) { bytes = (const uint8_t *)""; length = 0; }
+        }
+        const char *type = argc > 3 ? JS_ToCString(ctx, argv[3]) : NULL;
+        const char *charset = argc > 5 && JS_IsString(argv[5]) ? JS_ToCString(ctx, argv[5]) : NULL;
+        const char *url = argc > 6 && JS_IsString(argv[6]) ? JS_ToCString(ctx, argv[6]) : NULL;
+        if (!type || (argc > 5 && JS_IsString(argv[5]) && !charset) || (argc > 6 && JS_IsString(argv[6]) && !url)) result = JS_EXCEPTION;
+        else {
+            enum xml_parse_result parsed;
+            web_doc *made = xml_document_parse(s->doc, s->doc, string ? input : (const char *)bytes, length, string,
+                charset, url ? url : s->doc->url, type, argc > 4 && JS_ToBool(ctx, argv[4]) > 0, &parsed);
+            result = made ? wrap(s, made->root) : parsed == XML_PARSE_MALFORMED ? JS_NULL :
+                parsed == XML_PARSE_CANCELLED ? JS_ThrowInternalError(ctx, "XML parsing interrupted") : oom(ctx);
+        }
+        free(input); JS_FreeCString(ctx, type); JS_FreeCString(ctx, charset); JS_FreeCString(ctx, url);
+
+    } break;
+    case DOM_namespaceLookup: {
+        /* rawDom.namespaceLookup(node, value, prefixLookup): DOM "locate a
+           namespace" for a prefix (null: the default) or "locate a namespace
+           prefix" for a namespace. */
+        bool present = argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]);
+        const char *value = present ? JS_ToCString(ctx, argv[2]) : NULL;
+        if (!n) result = JS_ThrowTypeError(ctx, "Node receiver required");
+        else if (present && !value) result = JS_EXCEPTION;
+        else result = str_or_null(ctx, argc > 3 && JS_ToBool(ctx, argv[3]) > 0 ? doc_locate_prefix(n, value) : doc_locate_namespace(n, value));
+        JS_FreeCString(ctx, value);
+
+    } break;
+    case DOM_tagQuery: {
+        /* rawDom.tagQuery(root, qualifiedName) or (root, namespace, localName, true). */
+        bool namespaced = argc > 4 && JS_ToBool(ctx, argv[4]) > 0;
+        bool ns_present = namespaced && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]);
+        const char *ns = ns_present ? JS_ToCString(ctx, argv[2]) : NULL;
+        const char *name = argc > (namespaced ? 3 : 2) ? JS_ToCString(ctx, argv[namespaced ? 3 : 2]) : NULL;
+        if (!n || (n->type != N_ELEM && n->type != N_DOC && n->type != N_FRAGMENT)) result = JS_ThrowTypeError(ctx, "Element or Document receiver required");
+        else if (!name || (ns_present && !ns)) result = JS_EXCEPTION;
+        else {
+            pvec found = {0};
+            doc_elements_named(n, namespaced, ns && *ns ? ns : NULL, name, &found);
+            result = JS_NewArray(ctx);
+            for (int i = 0; i < found.n && !JS_IsException(result); ++i)
+                if (JS_SetPropertyUint32(ctx, result, i, wrap(s, found.v[i])) < 0) { JS_FreeValue(ctx, result); result = JS_EXCEPTION; }
+            pv_free(&found);
+        }
+        JS_FreeCString(ctx, ns); JS_FreeCString(ctx, name);
 
     } break;
     case DOM_elementFromPoint: case DOM_elementsFromPoint: {
@@ -3769,7 +3888,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 old_attribute_present = true;
             } else if (index < 0) {
                 created_attribute_name = strdup(p);
-                if (created_attribute_name && !n->foreign) for (char *q = created_attribute_name; *q; q++) *q = (char)lower((unsigned char)*q);
+                if (created_attribute_name && doc_html_names(n)) for (char *q = created_attribute_name; *q; q++) *q = (char)lower((unsigned char)*q);
                 attribute_target = n; attribute_name = created_attribute_name;
             }
             const char *v = JS_IsNull(argv[3]) ? NULL : JS_ToCString(ctx, argv[3]);

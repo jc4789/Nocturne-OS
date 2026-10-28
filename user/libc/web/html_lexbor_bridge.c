@@ -209,6 +209,7 @@ static node_t *new_native(struct html_parser *p, lxb_dom_node_t *lex, web_doc *o
         name = lxb_dom_element_qualified_name(lxb_dom_interface_element(lex), &len);
         n->name = native_lower(&d->mem, name, len);
         n->raw_name = ar_strndup(&d->mem, (const char *)name, len);
+        n->local_name = n->raw_name; /* the HTML parser never gives a prefix */
         n->tag = (uint16_t)tag_lookup(n->name, len);
         doc_image_node_owned(n);
         n->namespace_id = lex->ns == LXB_NS_SVG ? NS_SVG : lex->ns == LXB_NS_MATH ? NS_MATHML :
@@ -991,11 +992,10 @@ static lxb_dom_node_t *new_lex(struct html_parser *p, node_t *n) {
     lxb_dom_document_t *d = &p->document->dom_document;
     switch (n->type) {
     case N_ELEM: {
-        const char *name = n->raw_name ? n->raw_name : n->name;
-        const char *ns = n->namespace_id == NS_NONE ? NULL : n->namespace_id == NS_SVG ? "http://www.w3.org/2000/svg" :
-            n->namespace_id == NS_MATHML ? "http://www.w3.org/1998/Math/MathML" : "http://www.w3.org/1999/xhtml";
+        const char *name = n->local_name ? n->local_name : n->raw_name ? n->raw_name : n->name;
+        const char *ns = doc_element_namespace(n);
         return lxb_dom_interface_node(lxb_dom_element_create(d, (const lxb_char_t *)name, strlen(name),
-            (const lxb_char_t *)ns, ns ? strlen(ns) : 0, NULL, 0,
+            (const lxb_char_t *)ns, ns ? strlen(ns) : 0, (const lxb_char_t *)n->prefix, n->prefix ? strlen(n->prefix) : 0,
             (const lxb_char_t *)n->custom_is, n->custom_is ? strlen(n->custom_is) : 0, false));
     }
     case N_TEXT:

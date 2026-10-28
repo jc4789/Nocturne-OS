@@ -9,9 +9,18 @@ static bool serializes_as_void(const node_t *n) {
     case T_img: case T_input: case T_link: case T_meta: case T_source:
     case T_track: case T_wbr: case T_frame: case T_keygen: case T_param:
         return true;
-    default:
-        return n->name && (!strcmp(n->name, "basefont") || !strcmp(n->name, "bgsound"));
+    default: {
+        const char *local = n->local_name ? n->local_name : n->name;
+        return local && (!strcmp(local, "basefont") || !strcmp(local, "bgsound"));
     }
+    }
+}
+/* HTML "serializing HTML fragments": an HTML, SVG or MathML element's tag is
+   its local name, any other element's its qualified name. */
+static const char *html_tag_name(const node_t *n) {
+    if (n->namespace_id == NS_HTML || n->namespace_id == NS_SVG || n->namespace_id == NS_MATHML)
+        return n->local_name ? n->local_name : n->name;
+    return n->raw_name ? n->raw_name : n->name;
 }
 
 static bool literal_text(const node_t *n) {
@@ -91,7 +100,7 @@ static void serialize_node(const node_t *node, sbuf *out,const struct serializat
     } else if (node->type == N_DOCTYPE) {
         sb_puts(out, "<!DOCTYPE "); sb_puts(out, node->name); sb_putc(out, '>');
     } else if (node->type == N_ELEM) {
-        const char *name = node->namespace_id == NS_HTML ? node->name : node->raw_name ? node->raw_name : node->name;
+        const char *name = html_tag_name(node);
         sb_putc(out, '<'); sb_puts(out, name);
         if(node->custom_is && !node_attr(node,"is")){
             sb_puts(out," is=\"");escaped(out,node->custom_is,strlen(node->custom_is),true);sb_putc(out,'"');
@@ -199,14 +208,6 @@ static bool xml_escape(struct xml_serialization *x,const char *text,size_t lengt
     }
     return xml_write(x,text+start,length-start);
 }
-static const char *xml_node_namespace(const node_t *n) {
-    switch(n->namespace_id){
-    case NS_HTML:return "http://www.w3.org/1999/xhtml";
-    case NS_SVG:return "http://www.w3.org/2000/svg";
-    case NS_MATHML:return "http://www.w3.org/1998/Math/MathML";
-    default:return NULL;
-    }
-}
 static bool xml_prefix_equal(const struct xml_binding *b,const char *p,size_t length) {
     return b->length==length&&!memcmp(b->prefix,p,length);
 }
@@ -258,13 +259,11 @@ static bool xml_name(struct xml_serialization *x,const char *name) {
     return !x->strict || (name&&!strchr(name,':')&&doc_pi_target_valid(name,strlen(name))) || xml_invalid(x);
 }
 static bool xml_element(struct xml_serialization *x,struct xml_frame *f) {
-    const node_t *n=f->node;const char *uri=xml_node_namespace(n),*local_default=NULL;
-    f->local=n->namespace_id==NS_HTML?n->name:n->raw_name?n->raw_name:n->name;
-    f->prefix=NULL;f->prefix_length=0;
-    if(n->namespace_id!=NS_HTML&&uri&&f->local){
-        const char *colon=strchr(f->local,':');
-        if(colon){f->prefix=f->local;f->prefix_length=(size_t)(colon-f->local);f->local=colon+1;}
-    }
+    const node_t *n=f->node;const char *uri=doc_element_namespace(n),*local_default=NULL;
+    /* The element's own prefix is only the preferred one ("retrieving a
+       preferred prefix string"); its local name never splits. */
+    f->local=n->local_name?n->local_name:n->name;
+    f->prefix=n->prefix;f->prefix_length=n->prefix?strlen(n->prefix):0;
     if(!xml_name(x,f->local))return false;
     for(int i=0;i<n->nattrs;i++){
         if((i&127)==0&&!xml_checkpoint(x))return false;
@@ -278,7 +277,9 @@ static bool xml_element(struct xml_serialization *x,struct xml_frame *f) {
     bool ignore_default=false,declare_default=false;
     struct xml_binding *candidate=NULL;
     if(xml_equal(uri,f->inherited)){
-        f->prefix=NULL;f->prefix_length=0;ignore_default=local_default!=NULL;
+        /* The XML namespace keeps its xml: prefix even when inherited. */
+        bool xml=xml_equal(uri,XML_NS);
+        f->prefix=xml?"xml":NULL;f->prefix_length=xml?3:0;ignore_default=local_default!=NULL;
     }else{
         /* An explicitly matching default declaration wins over an inherited
            alias when this node did not have a prefix. */
@@ -343,7 +344,17 @@ static bool xml_element(struct xml_serialization *x,struct xml_frame *f) {
 static bool xml_data_node(struct xml_serialization *x,const node_t *n) {
     const char *text=n->text?n->text:"";size_t length=n->textlen;
     switch(n->type){
-    case N_TEXT:return xml_escape(x,text,length,false);
+    case N_TEXT:
+        if(n->cdata){
+            /* A CDATASection keeps its section syntax (the round trip of the
+               XML parser); well-formed output cannot hold "]]>" inside one. */
+            if(x->strict){
+                if(!xml_chars(text,length))return xml_invalid(x);
+                for(size_t i=2;i<length;i++)if(text[i-2]==']'&&text[i-1]==']'&&text[i]=='>')return xml_invalid(x);
+            }
+            return xml_literal(x,"<![CDATA[")&&xml_write(x,text,length)&&xml_literal(x,"]]>");
+        }
+        return xml_escape(x,text,length,false);
     case N_ATTR:return true;
     case N_COMMENT:
         if(x->strict&&(!xml_chars(text,length)||(length&&text[length-1]=='-')))return xml_invalid(x);

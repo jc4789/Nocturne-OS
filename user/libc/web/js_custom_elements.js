@@ -203,7 +203,8 @@ const customElementsBridge = (() => {
         if(d.formAssociated && d.localName===d.name)faceElements.add(element);
         return element;
     }
-    function create(name, options, preserveCase=false,owner=document) {
+    // DOM "create an element" for the HTML namespace; prefix null is none.
+    function create(name, options, preserveCase=false,owner=document,prefix=null) {
         name = string(name); if (!preserveCase) name = lower(name);
         if(get(owner,'nodeType')!==9)throw new TypeError('Document receiver required');
         let value=registryFor(owner),is=null;
@@ -211,7 +212,7 @@ const customElementsBridge = (() => {
             value=registryOption(options.customElementRegistry,value);
             const optionIs=options.is;if(optionIs!==undefined)is=string(optionIs);
         }
-        const make=()=>{const element=rawDom.create(owner,1,name,'');setRegistry(element,value);
+        const make=()=>{const element=prefix===null?rawDom.create(owner,1,name,''):rawDom.create(owner,1,name,'',HTML,prefix);setRegistry(element,value);
             if(is!==null)rawDom.customData(element,'is',is);return element;};
         const table=value===null?null:registryState(value).definitions;
         const candidate=table && (table.get(name)||is!==null && table.get(is));
@@ -230,6 +231,7 @@ const customElementsBridge = (() => {
                 if (get(element,'ownerDocument')!==document) throw fail('The custom element constructor\'s result belongs to another document');
                 if (get(element,'localName') !== name) throw fail('The custom element constructor\'s result has another local name');
                 if(get(element,'ownerDocument')!==owner)rawDom.adopt(owner,element);
+                if(prefix!==null)rawDom.set(element,'elementPrefix',prefix);
                 return element;
             } catch (e) {
                 report(e);
