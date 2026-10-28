@@ -693,6 +693,16 @@ def fatal(cps):
     return (0, utf8(cps[:cps.index(None)])) if None in cps else (1, utf8(cps))
 
 
+def calls(label, steps, flags=1, what=""):
+    """TextDecoder's decode() calls on one instance: (stream, bytes, status, text) each."""
+    data, want = b"", b""
+    for stream, given, status, text in steps:
+        data += bytes([0 if stream else 1]) + struct.pack("<I", len(given)) + given
+        out = text.encode("utf-8")
+        want += struct.pack("<bI", status, len(out)) + out
+    ask("T", label, data, (1, want), flags=flags, what=what)
+
+
 rng = random.Random(1028)
 
 # Labels.
@@ -719,6 +729,28 @@ for name in NAMES:
     for start in range(0, len(scalars), 16384):
         part = scalars[start:start + 16384]
         ask("S", name, struct.pack(f"<{len(part)}I", *part), ("S", part, values), what=f"scalars {start}")
+
+# TextDecoder's decode(): an error in a streaming call throws with do not flush still set, so
+# the next call keeps the decoder. ISO-2022-JP's state outlives the error; the other decoders
+# clear theirs before it (WPT encoding/textdecoder-mistakes.any.js "fatal stream: *").
+calls("ISO-2022-JP", [(False, b"\x7e", 1, "~"), (True, b"\x1b\x28\x4a\xff", 0, ""),
+                      (False, b"\x7e", 1, "‾")], what="fatal stream: Roman outlives the error")
+calls("ISO-2022-JP", [(False, b"\x42", 1, "B"), (True, b"\x1b\x28\x49\xff", 0, ""),
+                      (False, b"\x42", 1, "ﾂ")], what="fatal stream: Katakana outlives the error")
+calls("ISO-2022-JP", [(False, b"\x1b\x28\x4a\xff", 0, ""), (False, b"\x7e", 1, "~")],
+      what="fatal flush: the next call is a new instance")
+calls("UTF-8", [(True, b"\xc0", 0, ""), (True, b"\xff", 0, ""), (False, b"", 1, "")],
+      what="fatal stream: two errors, then a clean end")
+calls("UTF-8", [(True, b"\xfd\xef", 0, ""), (False, b"", 1, "")],
+      what="fatal stream: the bytes after the error are not kept")
+calls("UTF-8", [(True, b"\xe0", 1, ""), (True, b"\x41", 0, ""), (True, b"\xc3", 1, ""),
+                (False, b"\xa9", 1, "é")], what="fatal stream: no bound outlives the error")
+calls("UTF-16LE", [(True, b"\x00", 1, ""), (False, b"", 0, ""), (False, b"", 1, "")],
+      what="fatal stream: a lone byte at the end")
+calls("UTF-8", [(True, b"\xef\xbb\xbf\x41\xff", 0, "A"), (False, b"\xef\xbb\xbf", 1, "﻿")],
+      flags=3, what="fatal stream: BOM seen outlives the error")
+calls("Shift_JIS", [(True, b"\x81", 1, ""), (True, b"\x7f", 0, ""), (False, b"\x41", 1, "A")],
+      what="fatal stream: no lead outlives the error")
 
 # Decoders.
 MULTI = ["UTF-8", "UTF-16BE", "UTF-16LE", "gb18030", "Big5", "EUC-JP", "ISO-2022-JP", "Shift_JIS", "EUC-KR"]

@@ -91,10 +91,10 @@
             if (fresh && !stream && s.name === 'UTF-8')
                 return nativeDecode(buffer, offset, length, s.fatal, s.ignoreBOM);
             if (!s.decoder) s.decoder = nativeDecoder(s.name, s.fatal, s.ignoreBOM);
-            // A fatal error throws and the instance starts afresh: the bytes
-            // after the error are not kept for a later call.
-            try { return nativeTextDecode(s.decoder, buffer, offset, length, stream); }
-            catch (error) { s.streaming = false; throw error; }
+            // A fatal error throws with do not flush as this call set it: after a
+            // streaming call the decoder keeps its state (ISO-2022-JP's) and whether
+            // a BOM was seen; the bytes after the error are not kept.
+            return nativeTextDecode(s.decoder, buffer, offset, length, stream);
         }
     }
     for (const [Type, name] of [[TextEncoder, 'TextEncoder'], [TextDecoder, 'TextDecoder']]) {

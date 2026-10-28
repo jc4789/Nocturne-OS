@@ -177,7 +177,11 @@ int web_decoder_run(struct web_decoder *d, const uint8_t *bytes, size_t length, 
         result = run(d, d->held + bom, d->held_length - bom, false, out);
     }
     if (result == 1) result = run(d, bytes, length, last, out);
-    if (last || result != 1) decoder_start(d);
+    if (last || result < 0) decoder_start(d);
+    /* Every decoder of the standard clears its state before it returns error except
+       ISO-2022-JP's, whose state and output state stay; Lexbor's fatal mode can return
+       before clearing, so the others restart here. */
+    else if (!result && d->encoding != LXB_ENCODING_ISO_2022_JP) handler_start(d);
     return result;
 }
 
