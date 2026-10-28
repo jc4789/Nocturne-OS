@@ -112,7 +112,7 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
     }
 }
 static void frame_sync(struct web_js_state *s,node_t *n) {
-    if(!web_frame_element(n) || !connected(s,n) || n->owner!=s->doc)return;
+    if(!web_frame_element(n) || !connected(s,n) || n->owner!=s->doc || n->frame_connection_pending)return;
     struct web_frame *f=web_frame_ensure(s->doc,n);
     if(!f){if(!s->doc->frame_allocation_reported){s->doc->frame_allocation_reported=true;log_text(s,2,"Frame metadata allocation failed");}return;}
     const char *name=node_attr(n,"name");if(!name)name="";
@@ -282,7 +282,7 @@ static web_doc *frame_window_document(node_t *token) {
             if(f->window_token==token && !f->detached && doc_node_connected(f->element))return f->document;
         return NULL;
     }
-    if(!doc_node_connected(token))return NULL;
+    if(!doc_node_connected(token) || token->frame_connection_pending)return NULL;
     struct web_frame *f=web_frame_find(token->owner,token);
     return f && !f->detached?f->document:NULL;
 }

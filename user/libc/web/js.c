@@ -1275,6 +1275,7 @@ static bool inserted_roots_capture(struct web_js_state *s,node_t *node,struct js
            !((candidate->tag==T_script && !candidate->script_started) ||
              (!candidate->foreign && candidate->tag==T_meta && !candidate->html_policy_processed) ||
              web_frame_element(candidate)))continue;
+        if(web_frame_element(candidate))candidate->frame_connection_pending=true;
         if(roots->count==roots->capacity){
             size_t maximum=SIZE_MAX/sizeof *roots->nodes;
             if(roots->capacity==maximum){JS_ThrowOutOfMemory(s->ctx);return false;}
@@ -1290,6 +1291,8 @@ static bool inserted_roots_capture(struct web_js_state *s,node_t *node,struct js
     return true;
 }
 static void inserted_roots_release(struct web_js_state *s,struct js_inserted_roots *roots) {
+    /* A failed or abandoned insertion runs no post-connection steps; its frames are reconciled later. */
+    for(size_t i=0;i<roots->count;i++)roots->nodes[i]->frame_connection_pending=false;
     if(roots->nodes&&roots->nodes!=roots->local)js_free(s->ctx,roots->nodes);
 }
 static bool equal_nodes(const node_t *a, const node_t *b) {
@@ -7200,6 +7203,7 @@ void web_js_window_names_changed(web_doc *d) {
     if(d && d->js)d->js->window_named_revision++;
 }
 static void dynamic_prepare_node(struct web_js_state *s,node_t *n,uint64_t generation,bool synchronous) {
+    n->frame_connection_pending=false;
     if(s->stream_generation!=generation || s->disabled || !connected(s,n))return;
     if(n->type==N_ELEM && n->tag==T_script && !n->script_started){
         struct js_script *script=queue_script(s,n,true);

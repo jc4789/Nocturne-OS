@@ -255,6 +255,9 @@ typedef struct node {
     struct node *owned_next; /* document-owned allocation list, including detached nodes */
     struct node *owned_image_next; /* the same allocation's <img>/<input> elements (doc_image_node_next) */
     bool control_ready, script_started;
+    /* An inserted frame element waiting for its HTML post-connection steps: until they run (after
+       every node of the insertion is in place, in tree order with scripts) it has no child navigable. */
+    bool frame_connection_pending;
     bool script_parse_eligible; /* fragment script closed before EOF; explicit runScripts only */
     const char *script_text_snapshot; /* admitted source, allocation_doc arena; never a DOM property */
     size_t script_text_snapshot_len;
