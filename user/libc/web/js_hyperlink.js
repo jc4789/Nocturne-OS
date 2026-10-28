@@ -25,19 +25,25 @@
         }
         return result;
     }
+    // HTML's encoding-parse relative to the element's node document: its base
+    // URL, and its character encoding for the query (characterSet is the
+    // node document's).
     function parse(el,attribute){
-        try { return new URLImpl(attribute,rawDom.get(el,'baseURI')); }
-        catch(error){if(error instanceof TypeErrorImpl)return null;throw error;}
+        return urlBridge.encodingParse(attribute,rawDom.get(el,'baseURI'),rawDom.get(el,'characterSet'));
     }
     function parsedHref(el){const value=reflectedAttr(el,'href');return value===null?null:parse(el,value);}
+    // encoding-parse-and-serialize: the serialization, or null for failure.
+    function serialize(el,value){const url=parse(el,value);return url?call(urlGet.href,url,[]):null;}
+    // A URL-reflecting attribute's value as its IDL attribute returns it.
+    function resolve(el,value){const href=serialize(el,value);return href===null?scalar(value):href;}
     function attribute(el,tag,name,emptyDocument){
         htmlElementBrand(el,tag);
         const value=reflectedAttr(el,name);
         if(emptyDocument && (value===null || value===''))return rawDom.get(rawDom.get(el,'ownerDocument'),'URL');
         if(value===null)return '';
-        const url=parse(el,value);return url?call(urlGet.href,url,[]):scalar(value);
+        return resolve(el,value);
     }
-    elementURL={string,scalar,attribute};
+    elementURL={string,scalar,attribute,serialize,resolve};
     const empty={origin:'',protocol:':',username:'',password:'',host:'',hostname:'',port:'',pathname:'',search:'',hash:''};
     for(const [C,tag] of [[HTMLAnchorElement,'a'],[HTMLAreaElement,'area']]){
         define(C.prototype,'href',{configurable:true,enumerable:true,

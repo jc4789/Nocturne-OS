@@ -4,7 +4,7 @@
    pretend to succeed. Document responses use the native HTML and XML parsers. */
 {
     const states = new WeakMap(), uploadStates = new WeakMap(), progressStates = new WeakMap();
-    const NativeURL = globalThis.URL, Decoder = globalThis.TextDecoder;
+    const textDecoder = host.textDecoder, textDecode = host.textDecode;
     const nativeThen = Promise.prototype.then, nativeApply = Reflect.apply;
     const defineProperty=Object.defineProperty, promiseConstructor=Object.freeze({[Symbol.species]:Promise});
     const create=Object.create, assign=Object.assign, NativeNumber=Number;
@@ -13,7 +13,7 @@
     const typedBuffer=Object.getOwnPropertyDescriptor(typedPrototype,'buffer').get;
     const typedLength=Object.getOwnPropertyDescriptor(typedPrototype,'byteLength').get;
     const typedSet=U8.prototype.set;
-    const decode=Decoder.prototype.decode, split=String.prototype.split;
+    const split=String.prototype.split;
     const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, weakHas=WeakMap.prototype.has;
     for(const map of [states,uploadStates,progressStates]) {
         defineProperty(map,'get',{value:key=>nativeApply(weakGet,map,[key])});
@@ -212,12 +212,16 @@
             emergencyError(x,s,epoch);
         }
     }
+    // The text response's decoder: decode, a BOM over the charset's encoding
+    // (UTF-8 when the label names none, replacement too); JSON's UTF-8 decode.
+    function responseDecoder(s,label) {
+        return s.type==='json'?textDecoder('UTF-8',false,false):textDecoder(label,false,true,true);
+    }
+    const decodeBytes=(decoder,bytes,stream)=>textDecode(decoder,bytes,0,bytes?nativeApply(bufferLength,bytes,[]):0,stream);
     function textResponse(s) {
         const charset=mime=>{const m=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(mime);return m?(m[1]??m[2]):null;};
-        const encoding=charset(s.mime)??charset(s.responseHeaders?nativeApply(headerGet,s.responseHeaders,['content-type'])||'':'')??'utf-8';
-        let decoder;
-        try{decoder=new Decoder(s.type==='json'?'utf-8':encoding);}catch(_){decoder=new Decoder('utf-8');}
-        return nativeApply(decode,decoder,[s.bytes]);
+        const encoding=charset(s.mime)??charset(s.responseHeaders?nativeApply(headerGet,s.responseHeaders,['content-type'])||'':'')??'UTF-8';
+        return decodeBytes(responseDecoder(s,encoding),s.bytes,false);
     }
     function completed(x,s,epoch,response) {
         if(!current(s,epoch))return;
@@ -266,14 +270,13 @@
     function prepareDecoder(s) {
         if(!s.decoder&&s.type!=='arraybuffer'&&s.type!=='blob'&&s.type!=='document'){
             const charset=mime=>{const m=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(mime);return m?(m[1]??m[2]):null;};
-            const encoding=s.type==='json'?'utf-8':charset(s.mime)??charset(nativeApply(headerGet,s.responseHeaders,['content-type'])||'')??'utf-8';
-            try{s.decoder=new Decoder(encoding);}catch(_){s.decoder=new Decoder('utf-8');}
+            s.decoder=responseDecoder(s,charset(s.mime)??charset(nativeApply(headerGet,s.responseHeaders,['content-type'])||'')??'UTF-8');
         }
     }
     function receivedChunk(x,s,epoch,bytes) {
         prepareDecoder(s);
         const count=nativeApply(bufferLength,bytes,[]);s.loaded+=count;
-        if(s.decoder)s.text+=nativeApply(decode,s.decoder,[bytes,{stream:true}]);
+        if(s.decoder)s.text+=decodeBytes(s.decoder,bytes,true);
         if(!s.decoder||s.keep)s.chunks.push(bytes);
         s.ready=3;
         const now=host.now();
@@ -284,7 +287,7 @@
     function receivedEnd(x,s,epoch,reason) {
         if(reason!==undefined){networkFailure(x,s,epoch,reason);return;}
         prepareDecoder(s);
-        if(s.decoder)s.text+=nativeApply(decode,s.decoder,[]);
+        if(s.decoder)s.text+=decodeBytes(s.decoder,null,false);
         if(!s.decoder||s.keep) {
             const bytes=new U8(s.loaded);let at=0;
             for(const chunk of s.chunks){const input=new U8(chunk);nativeApply(typedSet,bytes,[input,at]);at+=nativeApply(typedLength,input,[]);}
@@ -325,7 +328,9 @@
             const upper=method.toUpperCase();
             if(['CONNECT','TRACE','TRACK'].includes(upper))fail('SecurityError','Forbidden HTTP method');
             if(['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper))method=upper;
-            let parsed;try{parsed=new NativeURL(url,document.baseURI);}catch(_){fail('SyntaxError','Invalid request URL');}
+            // encoding-parse relative to the document: its encoding for the query.
+            const parsed=urlBridge.encodingParse(url,rawDom.get(document,'baseURI'),rawDom.get(document,'characterSet'));
+            if(parsed===null)fail('SyntaxError','Invalid request URL');
             if(!async)fail('NotSupportedError','Synchronous XMLHttpRequest is not supported');
             if(username!==null || password!==null || parsed.username || parsed.password)fail('NotSupportedError','URL credentials are not supported');
             cancel(s);s.epoch++;s.sent=false;s.method=method;s.url=parsed.href;s.headers=new Map();clearResponse(s);

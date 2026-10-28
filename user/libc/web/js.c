@@ -20,6 +20,7 @@
 #include "html_lexbor.h"
 #include "html_policy.h"
 #include "html_encoding.h"
+#include "web_encoding.h"
 #include "xml.h"
 #include "js_script_safety.h"
 #include "js_canvas.h"

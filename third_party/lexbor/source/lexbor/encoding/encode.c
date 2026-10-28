@@ -385,11 +385,50 @@ lxb_encoding_encode_euc_kr(lxb_encoding_encode_t *ctx, const lxb_codepoint_t **c
     return LXB_STATUS_OK;
 }
 
+/*
+ * Nocturne: the code points of GB18030-2022's Private Use changes that the
+ * gb18030 (and GBK) encoder maps through its side table to two bytes.
+ * https://encoding.spec.whatwg.org/#gb18030-encoder
+ */
+static const struct {
+    lxb_codepoint_t cp;
+    lxb_char_t      bytes[2];
+}
+lxb_encoding_gb18030_pua[] = {
+    {0xE78D, {0xA6, 0xD9}}, {0xE78E, {0xA6, 0xDA}}, {0xE78F, {0xA6, 0xDB}},
+    {0xE790, {0xA6, 0xDC}}, {0xE791, {0xA6, 0xDD}}, {0xE792, {0xA6, 0xDE}},
+    {0xE793, {0xA6, 0xDF}}, {0xE794, {0xA6, 0xEC}}, {0xE795, {0xA6, 0xED}},
+    {0xE796, {0xA6, 0xF3}}, {0xE81E, {0xFE, 0x59}}, {0xE826, {0xFE, 0x61}},
+    {0xE82B, {0xFE, 0x66}}, {0xE82C, {0xFE, 0x67}}, {0xE832, {0xFE, 0x6D}},
+    {0xE843, {0xFE, 0x7E}}, {0xE854, {0xFE, 0x90}}, {0xE864, {0xFE, 0xA0}}
+};
+
+lxb_inline const lxb_char_t *
+lxb_encoding_encode_gb18030_pua(lxb_codepoint_t cp)
+{
+    size_t i;
+
+    if ((unsigned) (cp - 0xE78D) > (0xE864 - 0xE78D)) {
+        return NULL;
+    }
+
+    for (i = 0; i < sizeof(lxb_encoding_gb18030_pua)
+                    / sizeof(lxb_encoding_gb18030_pua[0]); i++)
+    {
+        if (lxb_encoding_gb18030_pua[i].cp == cp) {
+            return lxb_encoding_gb18030_pua[i].bytes;
+        }
+    }
+
+    return NULL;
+}
+
 lxb_status_t
 lxb_encoding_encode_gbk(lxb_encoding_encode_t *ctx, const lxb_codepoint_t **cps,
                         const lxb_codepoint_t *end)
 {
     uint16_t index;
+    const lxb_char_t *pua;
     lxb_codepoint_t cp;
 
     for (; *cps < end; (*cps)++) {
@@ -407,6 +446,18 @@ lxb_encoding_encode_gbk(lxb_encoding_encode_t *ctx, const lxb_codepoint_t **cps,
 
         if (cp == 0x20AC) {
             LXB_ENCODING_ENCODE_APPEND(ctx, 0x80);
+            continue;
+        }
+
+        pua = lxb_encoding_encode_gb18030_pua(cp);
+        if (pua != NULL) {
+            if ((ctx->buffer_used + 2) > ctx->buffer_length) {
+                return LXB_STATUS_SMALL_BUFFER;
+            }
+
+            ctx->buffer_out[ ctx->buffer_used++ ] = pua[0];
+            ctx->buffer_out[ ctx->buffer_used++ ] = pua[1];
+
             continue;
         }
 
@@ -1028,6 +1079,7 @@ lxb_encoding_encode_gb18030(lxb_encoding_encode_t *ctx, const lxb_codepoint_t **
                             const lxb_codepoint_t *end)
 {
     uint32_t index;
+    const lxb_char_t *pua;
     lxb_codepoint_t cp;
 
     for (; *cps < end; (*cps)++) {
@@ -1040,6 +1092,18 @@ lxb_encoding_encode_gb18030(lxb_encoding_encode_t *ctx, const lxb_codepoint_t **
 
         if (cp == 0xE5E5) {
             LXB_ENCODING_ENCODE_ERROR(ctx);
+            continue;
+        }
+
+        pua = lxb_encoding_encode_gb18030_pua(cp);
+        if (pua != NULL) {
+            if ((ctx->buffer_used + 2) > ctx->buffer_length) {
+                return LXB_STATUS_SMALL_BUFFER;
+            }
+
+            ctx->buffer_out[ ctx->buffer_used++ ] = pua[0];
+            ctx->buffer_out[ ctx->buffer_used++ ] = pua[1];
+
             continue;
         }
 
@@ -1365,6 +1429,7 @@ lxb_encoding_encode_gbk_single(lxb_encoding_encode_t *ctx, lxb_char_t **data,
                                const lxb_char_t *end, lxb_codepoint_t cp)
 {
     uint16_t index;
+    const lxb_char_t *pua;
 
     if (cp < 0x80) {
         if (*data >= end) {
@@ -1388,6 +1453,18 @@ lxb_encoding_encode_gbk_single(lxb_encoding_encode_t *ctx, lxb_char_t **data,
         *(*data)++ = 0x80;
 
         return 1;
+    }
+
+    pua = lxb_encoding_encode_gb18030_pua(cp);
+    if (pua != NULL) {
+        if ((*data + 2) > end) {
+            return LXB_ENCODING_ENCODE_SMALL_BUFFER;
+        }
+
+        *(*data)++ = pua[0];
+        *(*data)++ = pua[1];
+
+        return 2;
     }
 
     index = lxb_encoding_multi_gb18030_index(cp);
@@ -1531,6 +1608,11 @@ begin:
             break;
 
         case LXB_ENCODING_ENCODE_2022_JP_JIS0208:
+            /* Nocturne: back in ASCII these are an error, not bytes. */
+            if (cp == 0x000E || cp == 0x000F || cp == 0x001B) {
+                goto failed;
+            }
+
             if (cp < 0x80) {
                 if ((*data + 4) > end) {
                     goto small_buffer;
@@ -1637,6 +1719,43 @@ lxb_encoding_encode_iso_2022_jp_eof_single(lxb_encoding_encode_t *ctx,
     }
 
     return 0;
+}
+
+int8_t
+lxb_encoding_encode_or_fail_single(lxb_encoding_encode_t *ctx, lxb_char_t **data,
+                                   const lxb_char_t *end, lxb_codepoint_t cp,
+                                   lxb_codepoint_t *error)
+{
+    int8_t size;
+
+    size = ctx->encoding_data->encode_single(ctx, data, end, cp);
+    if (size != LXB_ENCODING_ENCODE_ERROR) {
+        return size;
+    }
+
+    *error = cp;
+
+    if (ctx->encoding_data->encoding != LXB_ENCODING_ISO_2022_JP) {
+        return size;
+    }
+
+    if (cp == 0x000E || cp == 0x000F || cp == 0x001B) {
+        *error = LXB_ENCODING_REPLACEMENT_CODEPOINT;
+    }
+
+    /* In jis0208 the encoder returns to ASCII and fails there. */
+    if (ctx->state == LXB_ENCODING_ENCODE_2022_JP_JIS0208) {
+        if ((*data + 3) > end) {
+            return LXB_ENCODING_ENCODE_SMALL_BUFFER;
+        }
+
+        memcpy(*data, "\x1B\x28\x42", 3);
+        *data = *data + 3;
+
+        ctx->state = LXB_ENCODING_ENCODE_2022_JP_ASCII;
+    }
+
+    return size;
 }
 
 int8_t
@@ -1968,6 +2087,7 @@ lxb_encoding_encode_gb18030_single(lxb_encoding_encode_t *ctx, lxb_char_t **data
                                    const lxb_char_t *end, lxb_codepoint_t cp)
 {
     uint32_t index;
+    const lxb_char_t *pua;
 
     if (cp < 0x80) {
         if (*data >= end) {
@@ -1981,6 +2101,18 @@ lxb_encoding_encode_gb18030_single(lxb_encoding_encode_t *ctx, lxb_char_t **data
 
     if (cp == 0xE5E5) {
         return LXB_ENCODING_ENCODE_ERROR;
+    }
+
+    pua = lxb_encoding_encode_gb18030_pua(cp);
+    if (pua != NULL) {
+        if ((*data + 2) > end) {
+            return LXB_ENCODING_ENCODE_SMALL_BUFFER;
+        }
+
+        *(*data)++ = pua[0];
+        *(*data)++ = pua[1];
+
+        return 2;
     }
 
     index = lxb_encoding_multi_gb18030_index(cp);

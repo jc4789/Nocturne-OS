@@ -116,7 +116,7 @@ const textTrackBridge = (() => {
         constructor(){return customElementsBridge.construct(new.target,HTMLTrackElement);}
         get kind(){elementBrand(this);const v=(this.getAttribute('kind')||'subtitles').toLowerCase();return KINDS.includes(v)?v:'metadata';}
         set kind(v){elementBrand(this);this.setAttribute('kind',string(v));}
-        get src(){elementBrand(this);const v=this.getAttribute('src');return v?new URL(v,this.baseURI).href:'';}
+        get src(){elementBrand(this);const v=this.getAttribute('src');return v?elementURL.resolve(this,v):'';}
         set src(v){elementBrand(this);this.setAttribute('src',string(v));}
         get srclang(){elementBrand(this);return this.getAttribute('srclang')||'';}
         set srclang(v){elementBrand(this);this.setAttribute('srclang',string(v));}
@@ -191,7 +191,7 @@ const textTrackBridge = (() => {
             if(s.owner!==o){if(s.owner)removeTrack(s.owner,t);s.owner=o;o.items.push(t);o.bytes+=s.bytes;o.cueCount+=s.items.length;queue(o.list,'addtrack',{track:t});}
             const kind=(element.getAttribute('kind')||'subtitles').toLowerCase();s.kind=KINDS.includes(kind)?kind:'metadata';s.label=element.getAttribute('label')||'';s.language=element.getAttribute('srclang')||'';s.id=element.id;
             if(!s.explicitMode&&element.hasAttribute('default')&&!o.items.some(x=>x!==t&&track(x).mode==='showing'&&['captions','subtitles'].includes(track(x).kind)))s.mode='showing';
-            const raw=element.getAttribute('src');let url='',urlError=null;try{if(raw)url=new URL(raw,element.baseURI).href;}catch(e){urlError=e;}
+            const raw=element.getAttribute('src');let url='',urlError=null;if(raw){url=elementURL.serialize(element,raw);if(url===null){url='';urlError=new TypeError('Invalid track URL');}}
             const signature=generation(o.node)+'|'+o.node.crossOrigin+'|'+(urlError?'invalid:'+raw:url);
             if(s.signature!==null&&s.signature!==signature){abortTrack(s);clearCues(s);s.ready=0;}
             if(urlError){if(s.signature!==signature){s.signature=signature;s.ready=3;s.error=urlError;queue(element,'error');}}

@@ -94,26 +94,43 @@ const streamBridge=(()=>{
         return (object,transform)=>apply(wmSet,transforms,[object,{__proto__:null,
             readable:apply(transformReadable,transform,[]),writable:apply(transformWritable,transform,[])}]);
     }
+    // TextEncoderCommon and TextDecoderCommon are prototype attributes over each
+    // stream's slot (its interface, and a TextDecoderStream's decoder).
+    const textStreams=new WeakMap();
+    const textStream=(value,Type)=>{const s=apply(wmGet,textStreams,[value]);if(!s||s.type!==Type)throw new TypeError('Illegal invocation');return s;};
+    const encodingOf=getter(decoder.prototype,'encoding'),fatalOf=getter(decoder.prototype,'fatal'),ignoreBOMOf=getter(decoder.prototype,'ignoreBOM');
+    const codeUnit=String.prototype.charCodeAt,sliceText=String.prototype.slice;
     class TextEncoderStream {
         constructor(){let pending='';const enc=new encoder();
+            // A leading surrogate at a chunk's end waits for the next chunk.
             const transform=new TransformStream({transform(chunk,c){
-                let text=pending+String(chunk);pending='';
-                if(text.length&&/[\uD800-\uDBFF]/.test(text[text.length-1])){pending=text[text.length-1];text=text.slice(0,-1);}
+                let text=pending+`${chunk}`;pending='';
+                const last=text.length?apply(codeUnit,text,[text.length-1]):0;
+                if(last>=0xd800&&last<=0xdbff){pending=apply(sliceText,text,[-1]);text=apply(sliceText,text,[0,-1]);}
                 if(text)c.enqueue(apply(encode,enc,[text]));
             },flush(c){if(pending)c.enqueue(apply(encode,enc,[pending]));}});
+            apply(wmSet,textStreams,[this,{__proto__:null,type:TextEncoderStream}]);
             textEncoderTransform(this,transform);
         }
-        get encoding(){return 'utf-8';}
+        get encoding(){textStream(this,TextEncoderStream);return 'utf-8';}
     }
     const textEncoderTransform=genericTransformStream(TextEncoderStream);
     class TextDecoderStream {
         constructor(label='utf-8',options={}){const dec=new decoder(label,options);
-            const transform=new TransformStream({transform(chunk,c){const text=apply(decode,dec,[chunk,{stream:true}]);if(text)c.enqueue(text);},flush(c){const text=apply(decode,dec,[]);if(text)c.enqueue(text);}});
-            for(const key of ['encoding','fatal','ignoreBOM'])Object.defineProperty(this,key,{value:dec[key],enumerable:true});
+            // A chunk is an AllowSharedBufferSource; undefined is not one.
+            const transform=new TransformStream({transform(chunk,c){if(chunk===undefined)throw new TypeError('Expected a BufferSource');const text=apply(decode,dec,[chunk,{stream:true}]);if(text)c.enqueue(text);},flush(c){const text=apply(decode,dec,[]);if(text)c.enqueue(text);}});
+            apply(wmSet,textStreams,[this,{__proto__:null,type:TextDecoderStream,decoder:dec}]);
             textDecoderTransform(this,transform);
         }
+        get encoding(){return apply(encodingOf,textStream(this,TextDecoderStream).decoder,[]);}
+        get fatal(){return apply(fatalOf,textStream(this,TextDecoderStream).decoder,[]);}
+        get ignoreBOM(){return apply(ignoreBOMOf,textStream(this,TextDecoderStream).decoder,[]);}
     }
     const textDecoderTransform=genericTransformStream(TextDecoderStream);
+    for(const Type of [TextEncoderStream,TextDecoderStream]){
+        define(Type.prototype,Symbol.toStringTag,{value:Type.name,configurable:true});
+        for(const key of ['encoding','fatal','ignoreBOM'])if(Object.getOwnPropertyDescriptor(Type.prototype,key))define(Type.prototype,key,{enumerable:true});
+    }
     /* The Compression Standard's CompressionStream and DecompressionStream. The
        compression context is native (js_compression.h); the transform is set up
        as Streams' "set up" does it, with no transformer or strategy object a page
