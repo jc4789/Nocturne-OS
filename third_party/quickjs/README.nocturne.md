@@ -138,3 +138,31 @@ JS で書いた組み込み（quickjs-ng の方式）にしないのは、その
 確かめ方は `python -X utf8 tests/check_test262.py built-ins/Array/fromAsync`
 （WPT の同梱の test262 を host の同じ QuickJS で走らせる）。class の番号は
 `JS_CLASS_ASYNC_FROM_SYNC_ITERATOR` の次に一つ増えた。
+
+## host の exotic な class（Web IDL の legacy platform object）
+
+DOM の集まり（NodeList・HTMLCollection とその派生、`user/libc/web/js_collections_native.h`）は
+`JSClassExoticMethods` の class で、Web IDL の legacy platform object の内部の手順を native で
+答える。上流の exotic の口のままでは足りない三点だけを `CONFIG_NOCTURNE` の下に足した。
+
+- `JS_AtomKeyKind`（quickjs.h）：property key が配列の添字（0〜2^32−2、`*pindex` に入る）か、
+  ほかの文字列か、symbol（private name を含む）か。JavaScript を走らせない。上流の
+  `JS_AtomIsArrayIndex` と `JS_AtomGetKind` は static で、host から添字と名前を分けられない。
+- `JS_ThrowTypeErrorOrFalseStr`：拒んだ [[Set]]・[[DefineOwnProperty]] の結果。`flags` に
+  `JS_PROP_THROW` があるか、`JS_PROP_THROW_STRICT` で走っている code が strict なら TypeError
+  （−1）、そうでなければ FALSE。上流の `JS_ThrowTypeErrorOrFalse` が static なため。
+- `JS_GetOwnPropertyNamesInternal`：host の `get_own_property_names` の鍵（添字、次に名前）を
+  普通の文字列の鍵と symbol より前に並べ、普通の own property でもある鍵は一度だけ（その
+  property として）出す。Web IDL の [[OwnPropertyKeys]] の順。上流は host の鍵を普通の
+  property の後ろに付け、重ねも除かない。host の鍵と列挙できるかの問い合わせは
+  JavaScript を走らせて object の shape を変えうるので、普通の property を数える前に
+  済ませる（`js_exotic_own_keys`）。
+
+ほかに `get_own_property_names` を持つ exotic な class は Proxy だけで、Proxy の shape には
+普通の property が無いので、順も呼ぶ時機も変わらない。集まりの [[DefineOwnProperty]] が普通の
+定義へ戻すのは上流の `JS_PROP_NO_EXOTIC` で、これは変えていない。確かめ方は
+`python -X utf8 tests/check_collections_native.py`（集まりの WPT の期待）。`tests/check_test262.py`
+は `CONFIG_NOCTURNE` なしで組むので、この変更を test262 に通すには `CONFIG_NOCTURNE` で組んだ回が
+要る（2026-10-28 に一度、built-ins/Proxy・Reflect/ownKeys・Object の keys・getOwnPropertyNames・
+getOwnPropertySymbols・entries・values・assign・getOwnPropertyDescriptors、
+language/statements/for-in、JSON/stringify の 1398 件を流し、上流の形と同じく全部合格）。

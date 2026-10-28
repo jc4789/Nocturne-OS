@@ -159,9 +159,10 @@ static struct js_mutation_snapshot mutation_before(struct web_js_state *s,int op
         struct js_mutation_record *e=mutation_record(s,MO_CHILD,n,NULL,NULL,NULL);
         for(node_t *child=n->first;child;child=child->next){mutation_removed(s,&c,child,true);if(e)pv_push(&e->removed,child);}
         if(e)mutation_snapshot_add(&c,e);
-    }else if(opcode==DOM_insert||opcode==DOM_replace){
-        if(!incoming||(opcode==DOM_insert&&incoming==old))return c;
-        c.mode=opcode==DOM_insert?1:2;c.target=n;
+    }else if(opcode==DOM_insert||opcode==DOM_move||opcode==DOM_replace){
+        /* a move queues what removal and insertion would: oldParent's record, then newParent's */
+        if(!incoming||(opcode!=DOM_replace&&incoming==old))return c;
+        c.mode=opcode==DOM_replace?2:1;c.target=n;
         bool fragment=incoming->type==N_FRAGMENT;
         if(fragment){for(node_t *child=incoming->first;child;child=child->next)pv_push(&c.nodes,child);
             for(int i=0;i<c.nodes.n;i++)mutation_removed(s,&c,c.nodes.v[i],true);

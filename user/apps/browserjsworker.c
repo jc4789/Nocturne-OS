@@ -604,6 +604,11 @@ static void rejection_track(JSContext *ctx,JSValueConst promise,JSValueConst rea
 static void drain(struct worker *w){for(unsigned i=0;i<256&&!w->closed&&JS_IsJobPending(w->rt);i++){JSContext *ctx=NULL;int n=JS_ExecutePendingJob(w->rt,&ctx);port_capture_cancel(w);if(n<0){exception(w);break;}if(!n)break;}}
 static void jobs(struct worker *w){
     drain(w);
+    /* HTML "perform a microtask checkpoint" empties the queue before it notifies about rejected
+       promises: a handler a later microtask attaches still counts. A drain that stopped at its
+       bound, so output can flush, leaves the rest to the main loop, which comes back here while
+       a job is pending. */
+    if(!w->closed&&JS_IsJobPending(w->rt))return;
     if(rejection_oom&&!w->closed){rejection_oom=false;JSValue error=JS_NewString(w->ctx,"Unhandled rejection tracking allocation failed");JSValue r=hook(w,"report",1,&error);JS_FreeValue(w->ctx,error);if(JS_IsException(r))JS_FreeValue(w->ctx,JS_GetException(w->ctx));JS_FreeValue(w->ctx,r);}
     /* Unpublish the batch before author listeners run; their rejections queue anew. */
     struct rejection *batch=rejections;rejections=NULL;rejection_tail=&rejections;

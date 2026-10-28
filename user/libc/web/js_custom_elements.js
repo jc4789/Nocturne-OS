@@ -256,6 +256,19 @@ const customElementsBridge = (() => {
             if (s && s.state === 'custom') callback(element, 'disconnectedCallback');
         }
     }
+    /* HTML "enqueue a custom element callback reaction" for connectedMoveCallback: without one,
+       disconnectedCallback then connectedCallback, as one callback */
+    function movedCallback(element) {
+        const s = states.get(element), d = s && s.state === 'custom' && s.definition;
+        if (!d) return;
+        if (d.callbacks.connectedMoveCallback) { enqueue(element, {callback:d.callbacks.connectedMoveCallback, args:[]}); return; }
+        const disconnectedCallback = d.callbacks.disconnectedCallback, connectedCallback = d.callbacks.connectedCallback;
+        if (!disconnectedCallback && !connectedCallback) return;
+        enqueue(element, {callback() {
+            if (disconnectedCallback) apply(disconnectedCallback, this, []);
+            if (connectedCallback) apply(connectedCallback, this, []);
+        }, args:[]});
+    }
     function attributeChanged(element, name, oldValue, newValue, namespace=null) {
         const s = states.get(element);
         if (s && s.state === 'custom')
@@ -279,6 +292,7 @@ const customElementsBridge = (() => {
             return {op,nodes,was:nodes.map(connected),old:value,oldWas:connected(value),same:key===value,
                 adopted:nodes.map(node=>({elements:elements(node),oldDocument:get(node,'ownerDocument')}))};
         }
+        if (op === 'move') return key ? {op,node:key} : null;
         if (op === 'remove') return {op,node,was:connected(node),parent:get(node,'parentNode')};
         if(op==='replaceAll')return {op:'children',node,nodes:children(node),was:connected(node)};
         if (op === 'clone' || op === 'import') return {op};
@@ -307,6 +321,8 @@ const customElementsBridge = (() => {
             for(const node of token.nodes)inserted(node);
         } else if(token.op==='adopt'){
             removed(token.node,token.was);adopted(token);
+        } else if (token.op === 'move') {
+            if (connected(token.node)) for (const element of elements(token.node)) movedCallback(element);
         } else if (token.op === 'remove') {
             if (token.parent && get(token.node,'parentNode') !== token.parent) removed(token.node,token.was);
         } else if (token.op === 'clone' || token.op === 'import') upgradeTree(result);

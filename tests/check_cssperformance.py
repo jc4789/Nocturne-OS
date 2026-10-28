@@ -92,10 +92,26 @@ urls.write_text(http[:http.index("/* The pool is process-local.")] +
                 http[http.index("bool url_parse(const char *s"):http.index("enum http_url_result http_origin_owned_n(")],
                 encoding="utf-8")
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH", ""))
+# url() resolution is web_url.c's, on Lexbor's URL parser, as in the guest (tests/check_url_resolve.py
+# builds it the same way); its objects are kept between runs
+modules = ("core", "encoding", "punycode", "unicode", "url")
+lexbor = [line.split("+=")[1].strip()
+          for line in (root / "third_party/lexbor/sources.mk").read_text("utf-8").splitlines()
+          if "+=" in line and line.startswith("LXB_VENDOR_C") and any(f"/lexbor/{m}/" in line for m in modules)]
+lexbor_flags = ["-DLEXBOR_STATIC", "-Ithird_party/lexbor/source", "-Iports/lexbor/include"]
+objects = out / "url-objects"
+objects.mkdir(exist_ok=True)
+url_objects = []
+for source in ["user/libc/web/web_url.c", "user/libc/web/web_encoding.c", "ports/lexbor/memory.c", *lexbor]:
+    obj = objects / (source.replace("/", "_") + ".o")
+    if not obj.exists() or obj.stat().st_mtime < (root / source).stat().st_mtime:
+        subprocess.run([str(cc), "-std=gnu11", "-O1", "-w", *lexbor_flags, "-I" + str(abi), "-Iuser/include", "-Icommon",
+                        "-Iuser/libc", "-Iuser/libc/web", "-c", source, "-o", str(obj)], cwd=root, env=env, check=True)
+    url_objects.append(str(obj))
 exe = out / "native.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include", "-Icommon",
-           "-Iuser/libc", "-Iuser/libc/web", "-Itests", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c","user/libc/web/color.c",
-           "user/libc/web/util.c", "user/libc/web/html.c", str(urls), "-o", str(exe)]
+           "-Iuser/libc", "-Iuser/libc/web", "-Itests", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c",
+           "user/libc/web/util.c", "user/libc/web/html.c", str(urls), *url_objects, "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)] + (["local-boxes"] if "--local-boxes" in sys.argv else ["placeholder"] if "--placeholder" in sys.argv else ["text-overflow"] if "--text-overflow" in sys.argv else ["font-shorthand"] if "--font-shorthand" in sys.argv else ["flex"] if "--flex" in sys.argv else ["media-calc"] if "--media-calc" in sys.argv else ["fonts"] if "--fonts" in sys.argv else ["second"] if "--second" in sys.argv else []), cwd=root, env=env, check=True, timeout=30)

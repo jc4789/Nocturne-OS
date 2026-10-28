@@ -68,7 +68,7 @@ url = out / "url.c"
 url.write_text(url_source(http),encoding="utf-8")
 command = [str(cc), "-std=gnu11", "-O2", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-Wno-incompatible-library-redeclaration", "-I"+str(abi), "-Iuser/include", "-Icommon", "-Iuser/libc", "-Iuser/libc/web",
-           "-Ithird_party/quickjs", str(source), str(gfx_source),str(support),"user/libc/web/cssprop.c","user/libc/web/color.c","user/libc/web/util.c","user/libc/web/html.c",str(url), "-o", str(exe)]
+           "-Ithird_party/quickjs", str(source), str(gfx_source),str(support),"user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c","user/libc/web/util.c","user/libc/web/html.c",str(url), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 if "--parser" not in sys.argv and "--radius-parser" not in sys.argv:
     subprocess.run([str(exe)] + [x for x in ("--mask-performance","--image-association") if x in sys.argv], cwd=root, env=env, check=True, timeout=60)
@@ -114,6 +114,6 @@ printf("boxshadow-parser: %d checks, %d failures\\n",checks,failed);return faile
     url = out / "url.c"
     url.write_text(url_source(http),encoding="utf-8")
     exe = out / "parser.exe"
-    command = command[:command.index(str(out / "native.c"))] + [str(source),"user/libc/web/cssprop.c","user/libc/web/color.c","user/libc/web/util.c","user/libc/web/html.c",str(url),"-o",str(exe)]
+    command = command[:command.index(str(out / "native.c"))] + [str(source),"user/libc/web/cssprop.c", "user/libc/web/shape.c","user/libc/web/color.c","user/libc/web/util.c","user/libc/web/html.c",str(url),"-o",str(exe)]
     subprocess.run(command,cwd=root,env=env,check=True)
     subprocess.run([str(exe)],cwd=root,env=env,check=True,timeout=60)

@@ -112,6 +112,20 @@
             if(key==='title')descriptor.set=function(value){brand(this);dom('set',this,key,string(value));};
             Object.defineProperty(Document.prototype,key,descriptor);
         }
+        /* CSSOM View "scrollingElement": in quirks mode the body element unless it is potentially
+           scrollable (then null), otherwise the root element. The body is potentially scrollable
+           when it has a box and both it and its parent have an overflow-x or overflow-y other than
+           visible or clip (clip on the parent counts as hidden here). */
+        const scrolls=(node,clip)=>{const x=dom('computed',node,'overflow-x',null),y=dom('computed',node,'overflow-y',null);
+            const open=v=>v==='visible'||(!clip&&v==='clip');return !open(x)||!open(y);};
+        Object.defineProperty(Document.prototype,'scrollingElement',{configurable:true,enumerable:true,get(){brand(this);
+            const root=domGet(this,'documentElement');
+            if(domGet(this,'compatMode')!=='BackCompat')return root;
+            const body=domGet(this,'body'),parent=body&&rawDom.get(body,'parentNode');
+            if(!body)return null;
+            const boxed=dom('computed',body,'display',null)!=='none'&&(!parent||rawDom.get(parent,'nodeType')!==1||dom('computed',parent,'display',null)!=='none');
+            return boxed&&parent&&rawDom.get(parent,'nodeType')===1&&scrolls(parent,true)&&scrolls(body,false)?null:body;
+        }});
         for(const key of ['charset','inputEncoding'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return domGet(this,'characterSet');}});
         for(const key of ['defaultView','location','currentScript'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return this!==document?null:key==='defaultView'?globalThis:key==='location'?location:host.current();}});
         Object.defineProperty(Document.prototype,'readyState',{configurable:true,get(){brand(this);return this===document?host.ready():'complete';}});
@@ -206,7 +220,12 @@
             visibilityState:{configurable:true,enumerable:true,get(){brand(this);return this===document && host.visible()?'visible':'hidden';}}
         });
         Document.prototype.createEvent=function(...args){brand(this);return apply(createEvent,this,args);};
-        for(const method of ['write','writeln'])Document.prototype[method]=function(){brand(this);throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');};
+        // HTML "document write steps": an XML document has no input stream.
+        for(const method of ['write','writeln'])Document.prototype[method]=function(){
+            brand(this);
+            if(!rawDom.get(this,'htmlDocument'))throw new DOMException('An XML document cannot be written to','InvalidStateError');
+            throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');
+        };
         Object.assign(globalThis,{DOMParser,XMLSerializer,DOMImplementation,XMLDocument});
         return {brand,xmlDocumentPrototype:XMLDocument.prototype};
     })();

@@ -398,7 +398,7 @@ static web_doc *open_case_url_budget(const char *html, bool expected_errors, con
     if(case_real_network)host.resume_request=resume_request;
     fixture.history_length = 1; fixture.history_serial = 1;
     fixture.history[0].url = strdup(url); fixture.history[0].entry = 1;
-    fixture.doc = web_live_response(html, strlen(html), url, "utf-8",case_response_headers,&host);
+    fixture.doc = web_live_response(html, strlen(html), url, "utf-8",case_response_headers,NULL,&host);
     test_check("web-live-allocation", fixture.doc != NULL);
     return fixture.doc;
 }

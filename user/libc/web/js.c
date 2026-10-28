@@ -810,14 +810,14 @@ bool web_native_checkpoint(web_doc *d) {
            author task. Only an active author stack or parser must be retired;
            a completed document keeps its queued scripts and resource jobs. */
         bool abort_author=s->running || (s->runtime_owner && s->runtime_owner->runtime_active &&
-            s->runtime_owner->runtime_active->running) || d->parser || !s->parsing_done || s->parsing_cancelled;
+            s->runtime_owner->runtime_active->running) || doc_parser_current(d) || !s->parsing_done || s->parsing_cancelled;
         if(abort_author)s->disabled=true;
         if(abort_author && s->runtime_owner && s->runtime_owner->runtime_active)s->runtime_owner->runtime_active->disabled=true;
         __atomic_store_n(&d->native_cancelled,true,__ATOMIC_RELEASE);
         if(first){
             char message[160];
             snprintf(message,sizeof message,"Native processing cancelled: layout depth %u, author depth %d, parser %s; %s, coherent view recovery pending.",
-                d->native_layout_depth,s->running,d->parser?"active":"complete",abort_author?"scripts stopped":"author tasks preserved");
+                d->native_layout_depth,s->running,doc_parser_current(d)?"active":"complete",abort_author?"scripts stopped":"author tasks preserved");
             log_text(s,1,message);
         }
         return false;
@@ -2350,10 +2350,9 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
         sbuf text={0};if(!css_radius_serialize(st,radius_corner,&text,d)){sb_free(&text);return JS_ThrowInternalError(ctx,"CSS radius serialization failed");}
         JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;
     }
-    if (!strcmp(property,"filter") || !strcmp(property,"box-shadow") || !strcmp(property,"clip-path") || !strcmp(property,"clip")) {
+    if (!strcmp(property,"filter") || !strcmp(property,"box-shadow") || !strcmp(property,"clip")) {
         sbuf text={0};
         bool serialized = !strcmp(property,"filter") ? css_filter_serialize(st->filter,&text,d) :
-            !strcmp(property,"clip-path") ? css_clip_path_serialize(st->clip_path,&text,d) :
             !strcmp(property,"clip") ? css_clip_rect_serialize(&st->clip,&text) :
             css_shadow_serialize(st->box_shadow,&text,d);
         if (!serialized) {
@@ -2990,7 +2989,7 @@ static bool dom_custom_subtree(node_t *node, bool scoped_only) {
 static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,int argc,JSValueConst *argv) {
     node_t *incoming=argc>2?node_opaque(argv[2]):NULL,*old=argc>3?node_opaque(argv[3]):NULL;
     if(s->face_hooks_active)return true; /* form/id/fieldset changes affect FACE */
-    bool structure=opcode==DOM_insert||opcode==DOM_replace||opcode==DOM_replaceAll||opcode==DOM_remove||opcode==DOM_adopt;
+    bool structure=opcode==DOM_insert||opcode==DOM_move||opcode==DOM_replace||opcode==DOM_replaceAll||opcode==DOM_remove||opcode==DOM_adopt;
     if(s->range_hooks_active&&structure)return true;
     if(opcode==DOM_set&&argc>2&&JS_IsString(argv[2])){
         const char *key=JS_ToCString(s->ctx,argv[2]);
@@ -3113,17 +3112,22 @@ static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double r
     rect[2]=out.first_seen?r[2]-r[0]:0;rect[3]=out.first_seen?r[3]-r[1]:0;
     return true;
 }
+/* Before any native DOM work on d (the operations here and the DOM collections'
+   revision check): a sandboxed actor borrows no other document's authority. */
+static bool dom_authority_denied(struct web_js_state *s, web_doc *d) {
+    return !s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
+       (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d));
+}
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
     if (argc < 2) return JS_ThrowTypeError(ctx, "DOM operation requires a receiver");
     node_t *n = unwrap(ctx, argv[1]);
     if (!n && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) { return JS_EXCEPTION; }
     if (n && n->owner) d = n->owner;
-    if(!s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
-       (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d)))
+    if(dom_authority_denied(s,d))
         return history_security_error(ctx,"Sandbox denied borrowed document authority");
     doc_dom_budget(d);
-    bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
+    bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_move || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
                     opcode == DOM_attrSetNode || opcode == DOM_attrRemoveNode ||
                     ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_attrNS && argc > 4);
     bool synchronous_hooks=mutation&&(s->ce_hooks_active||s->range_hooks_active)&&dom_synchronous_hooks(s,opcode,n,argc,argv);
@@ -3155,7 +3159,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -3291,6 +3295,13 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         node_t *before = argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) ? unwrap(ctx, argv[3]) : NULL;
         if (!n || !child || (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) && !before)) result = JS_ThrowTypeError(ctx, "Node arguments are required");
         else result = JS_NewInt32(ctx, doc_node_insert_validity(n, child, before));
+
+    } break;
+    case DOM_moveStatus: {
+        node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
+        node_t *before = argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) ? unwrap(ctx, argv[3]) : NULL;
+        if (!child || (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) && !before)) result = JS_ThrowTypeError(ctx, "Node arguments are required");
+        else result = JS_NewInt32(ctx, doc_node_move_validity(n, child, before));
 
     } break;
     case DOM_replacementStatus: {
@@ -3680,6 +3691,13 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
 
     } break;
+    case DOM_move: {
+        /* DOM "move": no insertion steps, so nothing here prepares a script or connects a frame */
+        node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL, *before = argc > 3 ? unwrap(ctx, argv[3]) : NULL;
+        if (!child || doc_node_move_validity(n, child, before)) result = JS_ThrowTypeError(ctx, "HierarchyRequestError");
+        else result = doc_node_move_preserving(d, n, child, before) ? JS_UNDEFINED : oom(ctx);
+
+    } break;
     case DOM_replace: {
         node_t *child=argc>2?unwrap(ctx,argv[2]):NULL,*old=argc>3?unwrap(ctx,argv[3]):NULL;
         if(!n || !child || !old)result=JS_ThrowTypeError(ctx,"Node arguments are required");
@@ -3997,6 +4015,7 @@ static bool same_origin_urls(const char *a, const char *b, bool *allocation_fail
 }
 #include "js_html_safety_host.h"
 #include "js_pi_native.h"
+#include "js_collections_native.h"
 static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
     if (!strncasecmp(url, "https://", 8) || !strncasecmp(url, "http://", 7)) {
         struct url_owned parsed = {0};
@@ -4795,8 +4814,17 @@ static JSValue native_ready(JSContext *ctx, JSValueConst this_val, int argc, JSV
     return JS_NewString(ctx, s->parsing_cancelled ? "loading" : s->load_sent ? "complete" : s->parsing_done ? "interactive" : "loading");
 }
 static JSValue native_current(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return wrap(state(ctx), state(ctx)->current_script); }
+/* HTML "document open steps", "document write steps" and close(): an XML
+   document has no input stream, before any other check. */
+static JSValue xml_stream_error(struct web_js_state *s) {
+    JSValue message=JS_NewString(s->ctx,"An XML document has no input stream to open, write or close");
+    JSValue error=custom_element_hook(s,"invalidStateError",1,&message);JS_FreeValue(s->ctx,message);
+    return JS_IsException(error)?error:JS_Throw(s->ctx,error);
+}
 static JSValue native_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
+    /* The Trusted Types check (js_html_safety.js) came first. */
+    if (s->doc->xml) return xml_stream_error(s);
     if (s->dynamic_markup_counter) {
         JSValue message=JS_NewString(ctx,"A custom element constructor cannot write to its parser document");
         JSValue error=custom_element_hook(s,"invalidStateError",1,&message);JS_FreeValue(ctx,message);
@@ -6568,6 +6596,9 @@ static void discard_prepared_script(struct web_js_state *s,struct js_script *scr
 }
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic) {
     if (n->script_started) return NULL;
+    /* Only HTMLScriptElement and SVGScriptElement are prepared: an element
+       named script in another namespace (MathML, an XML vocabulary) is not. */
+    if (n->namespace_id != NS_HTML && n->namespace_id != NS_SVG) return NULL;
     uint64_t generation=s->stream_generation;
     bool fragment = n->script_parse_eligible;
     if(s->doc->sandbox_flags&SB_SCRIPTS){n->script_started=true;return NULL;}
@@ -6987,8 +7018,8 @@ bool web_js_native_recover(web_doc *d) {
         __atomic_store_n(&d->native_cancelled,false,__ATOMIC_RELEASE);
         return true;
     }
-    bool aborted_parser=d->parser || !s->parsing_done || s->parsing_cancelled;
-    if(d->parser){html_finish(d->parser);d->parser=NULL;}
+    bool aborted_parser=doc_parser_current(d) || !s->parsing_done || s->parsing_cancelled;
+    doc_parser_stop(d);
     s->blocker=NULL;s->parser_write=false;s->document_waiting=false;
     if(aborted_parser){
         s->parsing_done=s->parsing_cancelled=true;
@@ -8576,34 +8607,39 @@ void web_js_tick(web_doc *d, uint64_t now) {
     if (s->blocker && (s->blocker->executed || s->disabled)) s->blocker = NULL;
     /* A tick executes at most one JavaScript task plus its microtask checkpoint.
        Parsing and native completions may progress without invoking callbacks. */
-    if (!s->parsing_done && !s->blocker && d->parser) {
+    /* The HTML parser or an XML document's XML parser (doc.c): at a script's
+       end tag either returns HTML_PARSE_SCRIPT, and this task's microtask
+       checkpoint precedes "prepare the script element". */
+    if (!s->parsing_done && !s->blocker && doc_parser_current(d)) {
         node_t *created_before = d->owned_nodes;
         for (int step = 0; step < 32 && !s->blocker; step++) {
             node_t *node = NULL;
-            struct html_parser *parser=d->parser;
+            const void *parser=doc_parser_current(d);
             uint64_t generation=s->stream_generation;
             begin_task(s);
-            int result = html_resume(parser, &node);
-            if (d->parser==parser && s->stream_generation==generation && result >= 0) sync_parser_body_handlers(s);
+            int result = doc_parser_resume(d, &node);
+            if (doc_parser_current(d)==parser && s->stream_generation==generation && result >= 0) sync_parser_body_handlers(s);
             end_task(s);
             /* Parser reactions and the stack-empty microtask checkpoint can
                replace this Document's stream without replacing its identity. */
-            if(d->parser!=parser || s->stream_generation!=generation)break;
+            if(doc_parser_current(d)!=parser || s->stream_generation!=generation)break;
             /* Script/EOF boundaries can import a byte-identical forest. Only
                real parser changes publish resources; errors stay conservative. */
-            if (result < 0 || html_import_changed(parser)) d->dirty = d->resources_dirty = true;
+            if (result < 0 || doc_parser_changed(d)) d->dirty = d->resources_dirty = true;
             if(result==HTML_PARSE_INPUT_WAIT){s->document_waiting=true;break;}
             if(result==HTML_PARSE_YIELD)break;
             if (result==HTML_PARSE_DONE || result==HTML_PARSE_FAILED || result==HTML_PARSE_CANCELLED) {
-                if (result==HTML_PARSE_FAILED) log_text(s, 2, "HTML parsing stopped at the document's memory limit");
-                html_finish(d->parser); d->parser = NULL;
+                if (result==HTML_PARSE_FAILED)
+                    log_text(s, 2, d->xml ? "XML parsing stopped at the document's memory limit" :
+                                            "HTML parsing stopped at the document's memory limit");
+                doc_parser_stop(d);
                 s->parsing_cancelled=result==HTML_PARSE_CANCELLED;
                 if(!s->parsing_cancelled)timing_record(s, JS_DOM_INTERACTIVE, uptime_ms());
                 s->parsing_done = true; break;
             }
             if (result==HTML_PARSE_SCRIPT && node && node->tag == T_script) {
                 struct js_script *script = queue_script(s, node, false);
-                if(d->parser!=parser || s->stream_generation!=generation)break;
+                if(doc_parser_current(d)!=parser || s->stream_generation!=generation)break;
                 if (script && !script->deferred && !script->asynchronous) s->blocker = script;
             }
         }
@@ -9158,6 +9194,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     web_js_wasm_host_init(s->ctx, api);
     web_js_webgl_init(s->ctx, api, webgl_source);
     web_js_collator_init(s->ctx, api);
+    if (collections_native_init(s->ctx, api) < 0) { JS_FreeValue(s->ctx, api); goto failed; }
     JS_SetPropertyStr(s->ctx, api, "debugCanvasProbe", JS_NewBool(s->ctx,s->host.debug_js));
     JS_SetPropertyStr(s->ctx, api, "document", wrap(s, d->root));
     JSValue global = JS_GetGlobalObject(s->ctx);

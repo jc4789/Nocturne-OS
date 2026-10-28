@@ -93,16 +93,12 @@ struct web_keyframes *web_keyframes_build(const struct web_keyframe *frames, uin
     }
     return k;
 }
-static bool same_easing(const struct css_easing *a, const struct css_easing *b) {
-    return a->kind == b->kind && a->x1 == b->x1 && a->y1 == b->y1 && a->x2 == b->x2 && a->y2 == b->y2 &&
-        a->steps == b->steps && a->position == b->position;
-}
 static bool keyframes_same(const struct web_keyframes *k, const struct web_keyframe *frames, uint32_t count) {
     if (!k || k->count != count) return false;
     for (uint32_t i = 0; i < count; i++) {
         const struct web_keyframe *a = &k->v[i], *b = &frames[i];
         if (!(a->offset == b->offset || (!resolved(a->offset) && !resolved(b->offset))) ||
-            a->composite != b->composite || !same_easing(&a->easing, &b->easing)) return false;
+            a->composite != b->composite || !css_easing_same(&a->easing, &b->easing)) return false;
         uint32_t j = 0;
         for (uint32_t n = 0; n < b->count; n++) {
             if (!b->values[n].p || !b->values[n].text) continue;
@@ -753,6 +749,72 @@ static void timing_from_list(struct web_animation *a, const style_t *st, uint32_
     if (!(a->overrides & WA_OVERRIDE_COMPOSITE)) a->effect->composite = css_motion_item(st, ML_COMPOSITION, i).k;
     if (memcmp(&old, t, sizeof old)) update_finished(a, false, false);
 }
+/* CSS Animations 2 §3.2 step 3: the rule's keyframes with the initial and final keyframes, which
+   take the element's computed value of each animated property no keyframe at 0% (100%) sets, the
+   animation's timing function and its composite (not the neutral value and linear easing of Web
+   Animations' property-specific keyframes, §5.4.4). */
+static void implicit_frame(const struct css_anim_ctx *ctx, struct web_keyframe *frames, uint32_t *n, double offset,
+                           const uint8_t *animated, const struct css_easing *easing, uint8_t composite) {
+    int nprops = css_prop_count();
+    uint8_t present[nprops], set[nprops];
+    memset(present, 0, sizeof present);
+    struct web_keyframe *k = NULL;
+    for (uint32_t i = 0; i < *n; i++) {
+        struct web_keyframe *f = &frames[i];
+        if (f->offset != offset) continue;
+        for (uint32_t j = 0; j < f->count; j++) {
+            if (!f->values[j].p) continue;
+            css_prop_longhands(f->values[j].p, set);
+            for (int p = 0; p < nprops; p++) present[p] |= set[p];
+        }
+        /* the keyframe at this offset with the default timing function and composite */
+        if (!k && css_easing_same(&f->easing, easing) && (f->composite == WA_COMPOSITE_AUTO || f->composite == composite)) k = f;
+    }
+    uint32_t missing = 0;
+    for (int p = 0; p < nprops; p++) missing += animated[p] && !present[p];
+    if (!missing) return;
+    if (!k) {
+        /* a new initial keyframe is prepended, a new final keyframe appended */
+        if (offset == 0) { memmove(frames + 1, frames, *n * sizeof *frames); k = frames; }
+        else k = &frames[*n];
+        (*n)++;
+        *k = (struct web_keyframe){.offset = offset, .easing = *easing, .composite = composite};
+    }
+    struct web_keyframe_value *values = ar_alloc(ctx->a, (k->count + missing) * sizeof *values);
+    if (k->count) memcpy(values, k->values, k->count * sizeof *values);
+    k->values = values;
+    sbuf text = {0};
+    for (int p = 0; p < nprops; p++) {
+        if (!animated[p] || present[p]) continue;
+        const struct propdef *d = css_prop_at(p);
+        text.n = 0;
+        if (!css_computed_value(ctx->base, d, &text, ctx->d)) continue; /* it keeps the neutral keyframe */
+        k->values[k->count++] = (struct web_keyframe_value){.p = d, .text = ar_strdup(ctx->a, sb_cstr(&text))};
+    }
+    sb_free(&text);
+}
+/* the declared keyframes completed, in ctx.a; declared itself when nothing is added */
+static const struct web_keyframe *animation_frames(const struct css_anim_ctx *ctx, const struct web_keyframe *declared,
+                                                   uint32_t *n, const struct css_easing *easing, uint8_t composite) {
+    int nprops = css_prop_count();
+    uint8_t animated[nprops], set[nprops];
+    memset(animated, 0, sizeof animated);
+    for (uint32_t i = 0; i < *n; i++)
+        for (uint32_t j = 0; j < declared[i].count; j++) {
+            if (!declared[i].values[j].p) continue;
+            css_prop_longhands(declared[i].values[j].p, set);
+            for (int p = 0; p < nprops; p++)
+                if (set[p] && css_prop_animation(css_prop_at(p)) != CSS_ANIM_NONE) animated[p] = 1;
+        }
+    bool any = false;
+    for (int p = 0; p < nprops && !any; p++) any = animated[p];
+    if (!any || !ctx->base) return declared;
+    struct web_keyframe *frames = ar_alloc(ctx->a, (*n + 2) * sizeof *frames);
+    if (*n) memcpy(frames, declared, *n * sizeof *frames);
+    implicit_frame(ctx, frames, n, 0, animated, easing, composite);
+    implicit_frame(ctx, frames, n, 1, animated, easing, composite);
+    return frames;
+}
 /* CSS Animations 2 §3: the CSSAnimation objects of an element and its animation-* lists */
 void web_motion_animations(struct web_motion_site *site) {
     node_t *n = site->ctx.node;
@@ -775,6 +837,7 @@ void web_motion_animations(struct web_motion_site *site) {
         uint32_t nframes = 0;
         const struct web_keyframe *frames = site->keyframes(site->arg, name, &easing, &nframes);
         if (!frames) continue; /* no @keyframes rule: no animation */
+        frames = animation_frames(&site->ctx, frames, &nframes, &easing, css_motion_item(st, ML_COMPOSITION, i).k);
         struct web_animation *a = NULL;
         for (size_t j = nold; j-- > 0;)
             if (!used[j] && !strcmp(old[j]->name, name)) { a = old[j]; used[j] = true; break; }
