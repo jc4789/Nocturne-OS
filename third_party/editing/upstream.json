@@ -1,0 +1,18 @@
+{
+  "name": "web-platform-tests editing/include/implementation.js",
+  "repository": "https://github.com/web-platform-tests/wpt",
+  "commit": "cd1d8aa5bfebc15d1af2af230c7ff95f9e582a4c",
+  "fileCommit": "7c62c38c357771c69a3a09124d1b076e35b55f0c",
+  "path": "editing/include/implementation.js",
+  "license": "BSD-3-Clause",
+  "files": {
+    "implementation.js": {
+      "upstream": "0e9721527b1323d7c39512bedc52ad22f3c0493678471df44585a1defea59cfc",
+      "local": "ebf7b1b4417b0bf4d8300ebe7c3a3c1dea01f9592959e305dc3b21bafa40d0f5"
+    },
+    "LICENSE.md": {
+      "upstream": "5fac07febb0e2a97fb0d7b0def149ec08b642e1ba4b9c345283ab1cbd2af6570",
+      "local": "5fac07febb0e2a97fb0d7b0def149ec08b642e1ba4b9c345283ab1cbd2af6570"
+    }
+  }
+}

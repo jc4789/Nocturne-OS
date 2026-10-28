@@ -241,7 +241,8 @@ $(BUILD)/u/%.o: %.c
 	@$(CC) $(UCFLAGS) -c $< -o $@
 
 # The checked-in copy permits in-OS linking without Python; regenerate on host edits.
-user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json
+user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json \
+                                third_party/editing/implementation.js third_party/editing/upstream.json
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
 # The Web IDL table the binding layer shapes interfaces by, from the specifications' IDL.

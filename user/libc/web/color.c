@@ -292,6 +292,7 @@ struct pctx {
     unsigned nodes;
     const char *const *keys; /* relative colour channel keywords (4, the last is alpha), or NULL */
     bool in_math;
+    bool unclamped; /* the animation layer's computed-value text (cx.computed_text): rgb() keeps its range */
 };
 static void *p_alloc(struct pctx *P, size_t n) { return ar_alloc(P->a, n); }
 static struct cm *m_new(struct pctx *P, uint8_t op, unsigned n) {
@@ -1090,7 +1091,8 @@ static bool chan_context_free(const struct chan *c) {
 /* evaluate a function's channels into an absolute colour: origin (converted into the
    function's space) gives the keywords; NULL: absolute syntax */
 static struct css_color convert_carry(const struct css_color *c, uint8_t space);
-static struct css_color fn_evaluate(const struct css_color_value *v, const struct css_color *origin, const struct cx *cx) {
+static struct css_color fn_evaluate(const struct css_color_value *v, const struct css_color *origin, const struct cx *cx,
+                                    bool unclamped) {
     struct css_color out = {{0, 0, 0}, 1, v->space, 0, false};
     double keys[4] = {0, 0, 0, 0};
     uint8_t key_none = 0;
@@ -1125,7 +1127,9 @@ static struct css_color fn_evaluate(const struct css_color_value *v, const struc
             else out.c[i] = 0;
             continue;
         }
-        double value = chan_component(v->fn, v->space, i, c->type, chan_raw(c, keys, cx), origin != NULL);
+        /* rgb()'s components clamp only where they are parsed from a style sheet */
+        double value = chan_component(v->fn, v->space, i, c->type, chan_raw(c, keys, cx),
+                                      origin != NULL || (unclamped && v->fn == F_RGB));
         if (i == 3) out.alpha = value;
         else out.c[i] = value;
     }
@@ -1212,7 +1216,7 @@ done:
         for (int c = 0; c < 4; c++)
             free &= chan_context_free(&out->ch[c]) && (fn <= F_HWB || out->ch[c].kind != CH_MATH);
         if (free) {
-            struct css_color color = fn_evaluate(out, NULL, NULL);
+            struct css_color color = fn_evaluate(out, NULL, NULL, P->unclamped);
             memset(out, 0, sizeof *out);
             out->kind = CV_ABS;
             out->color = color;
@@ -1381,13 +1385,13 @@ static bool cv_parse(struct pctx *P, const struct tok *t, struct css_color_value
     return ok;
 }
 
-static bool color_parse(arena_t *a, const char *s, size_t n, struct css_color_value *out) {
+static bool color_parse(arena_t *a, const char *s, size_t n, bool unclamped, struct css_color_value *out) {
     struct tok t[2];
     struct lex l = {s, s + n};
     lx_next(&l, &t[0]);
     lx_next(&l, &t[1]);
     if (t[0].kind == TK_EOF || t[1].kind != TK_EOF) return false;
-    struct pctx P = {.a = a};
+    struct pctx P = {.a = a, .unclamped = unclamped};
     return cv_parse(&P, &t[0], out);
 }
 
@@ -1788,51 +1792,64 @@ struct css_color_interpolation css_color_default_interpolation(const struct css_
     if (a->legacy && b->legacy) { m.space = CSS_SPACE_SRGB; m.legacy = true; }
     return m;
 }
-static struct css_color interpolate(const struct css_color *a, const struct css_color *b, double p,
-                                    const struct css_color_interpolation *m) {
+/* steps 1-7 for a and b into *x and *y (the hue fixup of 6 only when fixup): true when they are
+   premultiplied; *h the hue's index, or -1 */
+static bool combine_prepare(const struct css_color *a, const struct css_color *b, const struct css_color_interpolation *m,
+                            bool fixup, struct css_color *x, struct css_color *y, int *h) {
     uint8_t space = m->space;
     /* 1-4: convert into the interpolation space, carrying missing components forward */
-    struct css_color x = convert_carry(a, space), y = convert_carry(b, space);
+    *x = convert_carry(a, space);
+    *y = convert_carry(b, space);
     /* 5: a component missing in only one colour takes the other's value */
     for (int i = 0; i < 4; i++) {
         uint8_t bit = i == 3 ? CSS_COLOR_NONE_ALPHA : (uint8_t)(1u << i);
-        double *xv = i == 3 ? &x.alpha : &x.c[i], *yv = i == 3 ? &y.alpha : &y.c[i];
-        if ((x.none & bit) && !(y.none & bit)) { *xv = *yv; x.none &= (uint8_t)~bit; }
-        else if ((y.none & bit) && !(x.none & bit)) { *yv = *xv; y.none &= (uint8_t)~bit; }
+        double *xv = i == 3 ? &x->alpha : &x->c[i], *yv = i == 3 ? &y->alpha : &y->c[i];
+        if ((x->none & bit) && !(y->none & bit)) { *xv = *yv; x->none &= (uint8_t)~bit; }
+        else if ((y->none & bit) && !(x->none & bit)) { *yv = *xv; y->none &= (uint8_t)~bit; }
     }
     /* 6: hue fixup */
-    int h = space_hue(space);
-    if (h >= 0 && !(x.none & 1u << h)) {
-        double t1 = hue_normal(x.c[h]), t2 = hue_normal(y.c[h]), d = t2 - t1;
+    *h = space_hue(space);
+    if (fixup && *h >= 0 && !(x->none & 1u << *h)) {
+        double t1 = hue_normal(x->c[*h]), t2 = hue_normal(y->c[*h]), d = t2 - t1;
         switch (m->hue) {
         case CSS_HUE_SHORTER: if (d > 180) t1 += 360; else if (d < -180) t2 += 360; break;
         case CSS_HUE_LONGER: if (0 < d && d < 180) t1 += 360; else if (-180 < d && d <= 0) t2 += 360; break;
         case CSS_HUE_INCREASING: if (d < 0) t2 += 360; break;
         case CSS_HUE_DECREASING: if (0 < d) t1 += 360; break;
         }
-        x.c[h] = t1;
-        y.c[h] = t2;
+        x->c[*h] = t1;
+        y->c[*h] = t2;
     }
     /* 7: premultiply (not the hue) unless alpha is missing */
-    bool premultiply = !(x.none & CSS_COLOR_NONE_ALPHA);
+    bool premultiply = !(x->none & CSS_COLOR_NONE_ALPHA);
     if (premultiply)
         for (int i = 0; i < 3; i++) {
-            if (i == h || (x.none & 1u << i)) continue;
-            x.c[i] *= x.alpha;
-            y.c[i] *= y.alpha;
+            if (i == *h || (x->none & 1u << i)) continue;
+            x->c[i] *= x->alpha;
+            y->c[i] *= y->alpha;
         }
+    return premultiply;
+}
+/* 9: undo premultiplication of the combined r, its alpha clamped first */
+static void combine_finish(struct css_color *r, bool premultiply, int h) {
+    if (r->alpha < 0) r->alpha = 0;
+    if (r->alpha > 1) r->alpha = 1;
+    if (premultiply && r->alpha != 0)
+        for (int i = 0; i < 3; i++)
+            if (i != h && !(r->none & 1u << i)) r->c[i] /= r->alpha;
+    if (h >= 0 && !(r->none & 1u << h)) r->c[h] = hue_normal(r->c[h]);
+}
+static struct css_color interpolate(const struct css_color *a, const struct css_color *b, double p,
+                                    const struct css_color_interpolation *m) {
+    struct css_color x, y;
+    int h;
+    bool premultiply = combine_prepare(a, b, m, true, &x, &y, &h);
     /* 8: linear interpolation */
-    struct css_color r = {{0, 0, 0}, 0, space, (uint8_t)(x.none & y.none), m->legacy};
+    struct css_color r = {{0, 0, 0}, 0, m->space, (uint8_t)(x.none & y.none), m->legacy};
     for (int i = 0; i < 3; i++)
         if (!(r.none & 1u << i)) r.c[i] = x.c[i] + (y.c[i] - x.c[i]) * p;
     if (!(r.none & CSS_COLOR_NONE_ALPHA)) r.alpha = x.alpha + (y.alpha - x.alpha) * p;
-    if (r.alpha < 0) r.alpha = 0;
-    if (r.alpha > 1) r.alpha = 1;
-    /* 9: undo premultiplication */
-    if (premultiply && r.alpha != 0)
-        for (int i = 0; i < 3; i++)
-            if (i != h && !(r.none & 1u << i)) r.c[i] /= r.alpha;
-    if (h >= 0 && !(r.none & 1u << h)) r.c[h] = hue_normal(r.c[h]);
+    combine_finish(&r, premultiply, h);
     if (m->legacy) {
         /* legacy sRGB results stay in the legacy 8-bit gamut */
         for (int i = 0; i < 3; i++) r.c[i] = r.c[i] < 0 ? 0 : r.c[i] > 1 ? 1 : r.c[i];
@@ -1848,6 +1865,21 @@ struct css_color css_color_interpolate(const struct css_color *a, const struct c
                    r.space == CSS_SPACE_OKLAB || r.space == CSS_SPACE_OKLCH ? 1 : 0;
     if (max_l) r.c[0] = r.c[0] < 0 ? 0 : r.c[0] > max_l ? max_l : r.c[0];
     if ((r.space == CSS_SPACE_LCH || r.space == CSS_SPACE_OKLCH) && r.c[1] < 0) r.c[1] = 0;
+    return r;
+}
+/* addition, which accumulation is too (CSS Values 4, 3.3): the steps of interpolation with the two
+   premultiplied colours summed in place of 8; alpha clamps, the components stay where the sum puts
+   them until the final value (CSS Values 4, 3.1: the cascade's parse clamps a legacy colour, the
+   used value maps the rest into the gamut) */
+struct css_color css_color_add(const struct css_color *a, const struct css_color *b, const struct css_color_interpolation *m) {
+    struct css_color x, y;
+    int h;
+    bool premultiply = combine_prepare(a, b, m, false, &x, &y, &h);
+    struct css_color r = {{0, 0, 0}, 0, m->space, (uint8_t)(x.none & y.none), m->legacy};
+    for (int i = 0; i < 3; i++)
+        if (!(r.none & 1u << i)) r.c[i] = x.c[i] + y.c[i];
+    if (!(r.none & CSS_COLOR_NONE_ALPHA)) r.alpha = x.alpha + y.alpha;
+    combine_finish(&r, premultiply, h);
     return r;
 }
 /* one colour of a color-mix(): its value, its percentage (NAN: omitted) and, while it
@@ -2012,7 +2044,7 @@ static bool cv_compute(const struct css_color_value *v, const struct cenv *E, st
         struct css_color origin;
         const struct css_color_value *t = NULL;
         if (v->origin && !cv_compute(v->origin, E, &origin, &t)) return false;
-        if (!t) { *out = fn_evaluate(v, v->origin ? &origin : NULL, E->cx); return true; }
+        if (!t) { *out = fn_evaluate(v, v->origin ? &origin : NULL, E->cx, E->cx && E->cx->computed_text); return true; }
         if (!E->a) return false;
         struct pctx P = {.a = E->a};
         struct css_color_value *n = ar_alloc(E->a, sizeof *n);
@@ -2313,19 +2345,20 @@ static uint32_t *slot_field(style_t *s, int k) {
     default: return &s->border_color[k - CSS_SLOT_BORDER_TOP];
     }
 }
-void css_style_color(const style_t *st, enum css_color_slot k, struct css_color_computed *out) {
-    const struct css_color_value *v = slot_get(st, k);
+void css_color_held(uint32_t argb, const struct css_color_value *v, uint32_t current, struct css_color_computed *out) {
     out->current = NULL;
-    /* code that writes a style's 8-bit colour directly (a UA default) overrides the slot */
-    if (v && v->kind == CV_ABS && v->argb == *slot_field((style_t *)st, k)) { out->color = v->color; return; }
+    /* code that writes the 8-bit colour directly (a UA default) overrides the exact one */
+    if (v && v->kind == CV_ABS && v->argb == argb) { out->color = v->color; return; }
     if (v && v->kind != CV_ABS) {
         out->current = v;
-        out->color = css_color_from_argb(*slot_field((style_t *)st, k));
+        out->color = css_color_from_argb(argb);
         return;
     }
-    uint32_t c = *slot_field((style_t *)st, k);
-    if (c == COLOR_CURRENT) { out->current = &current_value; out->color = css_color_from_argb(st->color); return; }
-    out->color = css_color_from_argb(c);
+    if (argb == COLOR_CURRENT) { out->current = &current_value; out->color = css_color_from_argb(current); return; }
+    out->color = css_color_from_argb(argb);
+}
+void css_style_color(const style_t *st, enum css_color_slot k, struct css_color_computed *out) {
+    css_color_held(*slot_field((style_t *)st, k), slot_get(st, k), st->color, out);
 }
 static struct css_color style_current(const style_t *st) {
     struct css_color_computed c;
@@ -2338,10 +2371,16 @@ void css_color_resolve(const struct css_color_computed *v, const struct css_colo
     const struct css_color_value *tree;
     if (!cv_compute(v->current, &E, out, &tree) || tree) *out = *current;
 }
-/* the stored form of a computed value: NULL when the 8-bit field holds it */
-static const struct css_color_value *stored(const struct css_color *c, const struct css_color_value *tree, arena_t *a) {
+/* the stored form of a computed value: NULL when the 8-bit field holds it. A legacy colour outside
+   the sRGB cube (exact: only from computed-value text) keeps its components. */
+static bool srgb_inside(const struct css_color *c) {
+    struct css_color s = convert(c, CSS_SPACE_SRGB);
+    return in_gamut(s.c);
+}
+static const struct css_color_value *stored(const struct css_color *c, const struct css_color_value *tree, arena_t *a,
+                                            bool exact) {
     if (tree) return tree == &current_value ? NULL : tree;
-    if (c->legacy && !c->none) return NULL;
+    if (c->legacy && !c->none && (!exact || srgb_inside(c))) return NULL;
     struct css_color_value *v = ar_alloc(a, sizeof *v);
     v->kind = CV_ABS;
     v->color = *c;
@@ -2362,7 +2401,7 @@ bool css_style_set_color(style_t *st, enum css_color_slot k, const struct css_co
         return true;
     }
     *slot_field(st, k) = css_color_argb(&v->color);
-    slot_set(st, k, stored(&v->color, NULL, a), a);
+    slot_set(st, k, stored(&v->color, NULL, a, true), a);
     return true;
 }
 static struct cenv style_env(struct cx *cx) {
@@ -2372,7 +2411,7 @@ static struct cenv style_env(struct cx *cx) {
 bool css_color_value_compute(const char *s, size_t n, struct cx *cx, const struct css_color *current, uint32_t *argb,
                              const struct css_color_value **computed) {
     struct css_color_value root;
-    if (!color_parse(cx->a, s, n, &root)) return false;
+    if (!color_parse(cx->a, s, n, cx->computed_text, &root)) return false;
     if (computed) *computed = NULL;
     if (cx->supports_probe) { *argb = 0; return true; }
     struct cenv E = style_env(cx);
@@ -2386,7 +2425,7 @@ bool css_color_value_compute(const char *s, size_t n, struct cx *cx, const struc
         return true;
     }
     *argb = css_color_argb(&c);
-    if (computed) *computed = stored(&c, NULL, cx->a);
+    if (computed) *computed = stored(&c, NULL, cx->a, cx->computed_text);
     return true;
 }
 bool css_color_apply(const char *s, size_t n, struct cx *cx, enum css_color_slot k) {
@@ -2469,7 +2508,7 @@ static bool parse_scratch(const char *s, size_t n, bool (*use)(const struct css_
     bool ok = false;
     if (!setjmp(trap)) {
         struct css_color_value root;
-        if (color_parse(&a, s, n, &root)) ok = use(&root, context);
+        if (color_parse(&a, s, n, false, &root)) ok = use(&root, context);
     }
     ar_free(&a);
     return ok;
@@ -2520,7 +2559,7 @@ bool css_color(const char *s, size_t n, uint32_t *out) {
     if (!setjmp(trap)) {
         while (n && is_space((unsigned char)*s)) s++, n--;
         while (n && is_space((unsigned char)s[n - 1])) n--;
-        if (color_parse(&a, s, n, &probe)) {
+        if (color_parse(&a, s, n, false, &probe)) {
             struct cenv E = {0};
             const struct css_color_value *tree;
             if (cv_compute(&probe, &E, &c, &tree)) {
@@ -2543,29 +2582,34 @@ bool css_style_color_text(const style_t *st, enum css_color_slot k, sbuf *out) {
     abs_put(out, &resolved, false);
     return true;
 }
-const struct css_color_value *css_color_mix_value(arena_t *a, const struct css_color_computed *from,
-                                                  const struct css_color_computed *to, double p,
-                                                  const struct css_color_interpolation *m) {
-    struct css_color_value *v = ar_alloc(a, sizeof *v);
-    v->kind = CV_MIX;
-    v->space = m->space;
-    v->hue = m->hue;
-    v->method = true;
-    v->count = 2;
-    v->items = ar_alloc(a, 2 * sizeof *v->items);
-    if (p < 0) p = 0;
-    if (p > 1) p = 1;
-    const struct css_color_computed *ends[2] = {from, to};
-    for (int i = 0; i < 2; i++) {
-        const struct css_color_value *c = ends[i]->current;
-        if (!c) {
-            struct css_color_value *abs = ar_alloc(a, sizeof *abs);
-            abs->kind = CV_ABS;
-            abs->color = ends[i]->color;
-            c = abs;
+/* the animation layer's text for a computed colour (cssprop.c), which css_anim_parse reads back as it
+   was: the computed serialization (16), except a legacy colour outside the sRGB cube, which addition
+   and extrapolation leave there until the final value (CSS Values 4, 3.1). Its rgb() keeps the
+   components; the cascade's parse of the final value clamps them. */
+bool css_color_animation_text(const struct css_color *c, sbuf *out) {
+    if (c->legacy && !c->none && !srgb_inside(c)) {
+        struct css_color s = convert(c, CSS_SPACE_SRGB);
+        sb_puts(out, "rgb(");
+        for (int i = 0; i < 3; i++) {
+            if (i) sb_putc(out, ' ');
+            num_put(out, s.c[i] * 255);
         }
-        v->items[i].color = c;
-        v->items[i].pct = (struct chan){.kind = CH_LEAF, .type = MT_PCT, .v = (i ? p : 1 - p) * 100, .unit = "%"};
+        if (c->alpha < 1) { sb_puts(out, " / "); num_put(out, c->alpha); }
+        sb_putc(out, ')');
+        return true;
     }
-    return v;
+    abs_put(out, c, false);
+    return true;
+}
+/* the same computed value: an expression of currentcolor only with the same one, a legacy colour by
+   its sRGB components (hsl() and rgb() compute alike), the others in their own space */
+bool css_color_computed_equal(const struct css_color_computed *a, const struct css_color_computed *b) {
+    if (a->current || b->current) return a->current && b->current && css_color_value_equal(a->current, b->current);
+    struct css_color x = a->color, y = b->color;
+    if (x.legacy != y.legacy || x.none != y.none) return false;
+    if (x.legacy && !x.none) { x = convert(&x, CSS_SPACE_SRGB); y = convert(&y, CSS_SPACE_SRGB); }
+    if (x.space != y.space) return false;
+    for (int i = 0; i < 3; i++)
+        if (!(x.none & 1u << i) && x.c[i] != y.c[i]) return false;
+    return (x.none & CSS_COLOR_NONE_ALPHA) || x.alpha == y.alpha;
 }

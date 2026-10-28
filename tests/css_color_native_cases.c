@@ -8,7 +8,8 @@
                                        is color (empty: inherited); scheme: the parent's
                                        color-scheme (empty: normal)
      I<TAB>from<TAB>to<TAB>progress    CSS Color 4 interpolation by the default method,
-                                       as an animation of color
+                                       as an animation of color: the animation layer's
+                                       sample, applied as computed() applies a value
      H<TAB>color<TAB>value             a canvas's fillStyle after setting value, the canvas
                                        element's color being color (empty: no element)
    An invalid value answers <invalid>. */
@@ -23,8 +24,12 @@ enum http_url_result http_canonical_owned_n(const char *r, size_t n, char **c, c
     (void)r; (void)n; (void)c; (void)o;
     return HTTP_URL_INVALID;
 }
-/* layout.c's, reached only from Geometry's matrix strings */
+/* layout.c's, reached only from Geometry's matrix strings and the animation of transform lists */
 void css_transform_list_matrix_3d(const struct css_transform *t, double m[16]) { (void)t; (void)m; abort(); }
+void css_transform_list_matrix(const struct css_transform *t, float w, float h, double m[16]) {
+    (void)t; (void)w; (void)h; (void)m;
+    abort();
+}
 
 static char *field(char **p) {
     char *s = *p, *tab = strchr(s, '\t');
@@ -76,15 +81,36 @@ static bool computed(char *rest, sbuf *out) {
     ar_free(&a);
     return ok;
 }
+/* the animation layer (cssprop.c) samples color between the two keyframe values, and the cascade
+   applies the sample as computed() does a declaration */
 static bool interpolate(char *rest, sbuf *out) {
     const char *from = field(&rest), *to = field(&rest);
     double p = strtod(rest, NULL);
-    struct css_color a, b;
-    if (!css_color_parse_used(from, strlen(from), NULL, NULL, &a) || !css_color_parse_used(to, strlen(to), NULL, NULL, &b))
-        return false;
-    struct css_color_interpolation m = css_color_default_interpolation(&a, &b);
-    struct css_color r = css_color_interpolate(&a, &b, p, &m);
-    return css_color_serialize(&r, false, out);
+    arena_t a = {0};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    char *request = NULL;
+    if (!setjmp(trap)) {
+        style_t parent, base, x, y;
+        css_style_init(&parent, NULL);
+        css_style_finish(&parent, NULL, true);
+        css_style_init(&base, &parent);
+        css_style_finish(&base, &parent, false);
+        struct css_anim_ctx c = {.base = &base, .parent = &parent, .rem = 16, .vw = 800, .vh = 600, .a = &a};
+        const struct propdef *color = css_prop_lookup("color", 5);
+        sbuf sample = {0};
+        if (css_anim_parse(&c, color, from, strlen(from), false, &x, NULL) &&
+            css_anim_parse(&c, color, to, strlen(to), false, &y, NULL) && css_anim_interpolate(&c, color, &x, &y, p, &sample)) {
+            request = malloc(sample.n + 9);
+            if (request) { memcpy(request, "color\t\t\t", 8); memcpy(request + 8, sb_cstr(&sample), sample.n); request[sample.n + 8] = 0; }
+        }
+        sb_free(&sample);
+    }
+    ar_free(&a);
+    if (request) ok = computed(request, out);
+    free(request);
+    return ok;
 }
 static const style_t *canvas_element(void *context) { return context; }
 static bool canvas(char *rest, sbuf *out) {

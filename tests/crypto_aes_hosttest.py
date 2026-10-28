@@ -20,7 +20,7 @@ source += ["third_party/bearssl/src/aead/gcm.c", "third_party/bearssl/src/hash/g
 name = "worker-body-native-20261012" if worker_body else "crypto-aes-20261012"
 exe = root / ("build/" + name + ".exe")
 options = ["-DWORKER_BODY_NATIVE", "-DWORKER_BODY_PARENT", "-DCONFIG_NOCTURNE", "-ffunction-sections", "-fdata-sections", "-include", "tests/worker_host_include/platform.h", "-Itests/worker_host_include", "-Ibuild/nocturne-audit/url-host-include", "-idirafter", "user/include", "-Icommon", "-Wl,--gc-sections", "-Wl,--stack,8388608"] if worker_body else []
-command = [str(cc), "-O2", "-std=gnu11", "-fwrapv", "-funsigned-char", "-D_GNU_SOURCE", '-DCONFIG_VERSION="Nocturne-test"', "-Ithird_party/quickjs", "-Ithird_party/bearssl/inc", "-Ithird_party/bearssl/src", *options, *source, "-lbcrypt", "-lm", "-o", str(exe)]
+command = [str(cc), "-O2", "-std=gnu11", "-fwrapv", "-funsigned-char", "-D_GNU_SOURCE", '-DCONFIG_VERSION="Nocturne-test"', "-Ithird_party/quickjs", "-Ithird_party/bearssl/inc", "-Ithird_party/bearssl/src", *options, *([] if worker_body else ["-idirafter", "user/include", "-Icommon"]), *source, "-lbcrypt", "-lm", "-o", str(exe)]
 result = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
 output = result.stdout + result.stderr
 output += "COMPILE_EXIT " + str(result.returncode) + "\n"

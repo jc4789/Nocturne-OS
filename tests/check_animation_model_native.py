@@ -19,6 +19,8 @@ host = "#include <stdint.h>\nvoid *thread_local_get(unsigned slot);\nint display
 main = r'''
 bool web_native_checkpoint(web_doc *d){(void)d;return true;}
 void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]){(void)t;(void)w;(void)h;memset(m,0,16*sizeof *m);m[0]=m[5]=m[10]=m[15]=1;}
+/* layout.c's, reached only from Geometry's matrix strings */
+void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]){(void)t;(void)m;abort();}
 uint64_t uptime_ms(void){return 0;}
 static int marks;
 void css_mark_style_own(web_doc *d,node_t *n){(void)d;(void)n;marks++;}
@@ -58,7 +60,7 @@ static void at(uint64_t t){doc.visible=true;web_animations_tick(&doc,t);}
 static style_t styled(const char *property,const char *value){
     struct css_anim_ctx c={.base=&base,.parent=&parent,.rem=16,.vw=800,.vh=600,.a=&arena};style_t s;
     const struct propdef *p=css_prop_lookup(property,strlen(property));
-    if(!p||!css_anim_parse(&c,p,value,strlen(value),&s,NULL))printf("FAIL animation-model parse %s: %s\n",property,value);
+    if(!p||!css_anim_parse(&c,p,value,strlen(value),false,&s,NULL))printf("FAIL animation-model parse %s: %s\n",property,value);
     return s;
 }
 static struct web_animation *script_animation(double duration,const char *from,const char *to){
@@ -278,6 +280,6 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / "model.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include",
            "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c",
-           "user/libc/web/util.c", "user/libc/web/html.c", str(url), "-o", str(exe)]
+           "user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", str(url), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=60)

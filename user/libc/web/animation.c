@@ -626,11 +626,12 @@ static style_t *value_style(struct sampler *s, const struct web_keyframe_value *
     s->subst.n = 0;
     if (!css_substitute(s->ctx->base, v->text, &s->subst)) return NULL;
     style_t *st = ar_alloc(s->ctx->a, sizeof *st);
-    return css_anim_parse(s->ctx, v->p, sb_cstr(&s->subst), s->subst.n, st, NULL) ? st : NULL;
+    return css_anim_parse(s->ctx, v->p, sb_cstr(&s->subst), s->subst.n, false, st, NULL) ? st : NULL;
 }
+/* a value this sampler combined: not yet final, so nothing in it is clamped (CSS Values 4 §3.1) */
 static style_t *text_style(struct sampler *s, const struct propdef *p, const char *text) {
     style_t *st = ar_alloc(s->ctx->a, sizeof *st);
-    return css_anim_parse(s->ctx, p, text, strlen(text), st, NULL) ? st : NULL;
+    return css_anim_parse(s->ctx, p, text, strlen(text), true, st, NULL) ? st : NULL;
 }
 /* the last value in keyframe f that sets longhand p */
 static const struct web_keyframe_value *frame_value(const struct web_keyframe *f, int p) {
@@ -981,7 +982,7 @@ void web_motion_transitions(struct web_motion_site *site, const style_t *before,
         if (running && strcmp(running->to, to)) { /* step 4 */
             char *current = transition_value(site, running);
             style_t *now = current ? ar_alloc(site->ctx.a, sizeof *now) : NULL;
-            bool parsed = now && css_anim_parse(&after_ctx, p, current, strlen(current), now, NULL);
+            bool parsed = now && css_anim_parse(&after_ctx, p, current, strlen(current), false, now, NULL);
             if (!parsed || css_anim_equal(p, now, after) || !transitionable(&after_ctx, p, now, after, allow_discrete) ||
                 combined <= 0) css_disown(running);
             else if (!strcmp(running->reversing_from, to)) {

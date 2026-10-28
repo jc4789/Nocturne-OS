@@ -13,7 +13,7 @@ const mediaEme = (function installEncryptedMedia(host) {
     const typedBuffer=getter(typedPrototype,'buffer'),typedOffset=getter(typedPrototype,'byteOffset'),typedLength=getter(typedPrototype,'byteLength');
     const dataBuffer=getter(DataView.prototype,'buffer'),dataOffset=getter(DataView.prototype,'byteOffset'),dataLength=getter(DataView.prototype,'byteLength');
     const arrayLength=getter(AB.prototype,'byteLength'),resizable=Object.getOwnPropertyDescriptor(AB.prototype,'resizable');
-    const error=(name,message)=>new DomErr(message,name);
+    const error=(name,message)=>domExceptionBridge.create(name,message);
     const schedule=f=>host.set(f,0,false,[]);
     const reject=e=>new P((_,r)=>r(e));
     function slot(map,value,name){const s=apply(get,map,[value]);if(!s)throw new TypeError(name+' receiver required');return s;}

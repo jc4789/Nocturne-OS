@@ -24,8 +24,8 @@ const storageBridge=(()=>{
         const pair=call(native,host,[r.kind,op,key,value,index]);
         if(pair[0]!==0){
             const name=pair[0]===1?'SecurityError':pair[0]===2 || op===3?'QuotaExceededError':'UnknownError';
-            throw new DOMExceptionImpl(pair[0]===1?'Storage is not available for this origin':
-                pair[0]===2?'Storage quota exceeded':'Native storage read/write failed',name);
+            throw domExceptionBridge.create(name,pair[0]===1?'Storage is not available for this origin':
+                pair[0]===2?'Storage quota exceeded':'Native storage read/write failed');
         }
         return pair[1];
     }

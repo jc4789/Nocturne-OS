@@ -337,6 +337,7 @@ struct platform_program {
 static struct platform_program bindings_program = {.source=js_bootstrap, .len=sizeof js_bootstrap - 1, .name="nocturne:browser-bindings"};
 static struct platform_program locale_program = {.source=js_locale, .len=sizeof js_locale - 1, .name="nocturne:locale"};
 static struct platform_program webaudio_program = {.source=js_webaudio, .len=sizeof js_webaudio - 1, .name="nocturne:webaudio"};
+static struct platform_program editing_program = {.source=js_editing, .len=sizeof js_editing - 1, .name="nocturne:editing"};
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic);
 static void dynamic_scripts(struct web_js_state *s, node_t *n);
 static void dynamic_inserted(struct web_js_state *s,node_t *parent,
@@ -7869,6 +7870,18 @@ void web_js_focus_control(web_doc *d, node_t *n) {
         struct web_event e={.type="focus",.related_target=old}; web_js_dispatch(d,actual,&e);
         if(d->focus==actual) {e.type="focusin";e.bubbles=true;web_js_dispatch(d,actual,&e);}
     }
+    /* A focused editing host takes the selection when it is elsewhere, so the
+       user's typing lands in it (js_document_commands.js decides). */
+    struct web_js_state *s=d->js;
+    if(actual && d->focus==actual && actual->type==N_ELEM && node_attr(actual,"contenteditable") &&
+       task_context_active(s) && !s->disabled) {
+        begin_named_task(s,"editing host focus",0);
+        JSValue argument=wrap(s,actual);
+        JSValue result=JS_IsException(argument)?JS_EXCEPTION:custom_element_hook(s,"editingFocus",1,&argument);
+        if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
+        JS_FreeValue(s->ctx,argument);
+        end_task(s);
+    }
 }
 static bool child_event_coordinates(web_doc *outer,web_doc *child,const struct web_event *event,struct web_event *local) {
     if(!outer || !child || !event || !child->frame_element || !child->frame_element->box)return false;
@@ -7969,6 +7982,41 @@ bool web_js_input_event(web_doc *d,node_t *target,const char *type,const char *i
     if(!task_context_active(s)||d->root!=generation||target->owner!=d||doc_node_root(target,true)!=d->root)allowed=false;
     if(!strcmp(type,"beforeinput")&&s->host.navigation_pending&&s->host.navigation_pending(s->host.opaque))allowed=false;
     return allowed;
+}
+/* The user's own edit of an editing host (doc.c's editing keys, the browser's
+   clipboard keys): one task of the realm's, in which the editing layer fires
+   beforeinput, takes the action through the same command execCommand runs, and
+   fires input. 1 when it took the key, 0 when no editing host has the selection. */
+int web_js_editing_action(web_doc *d,const char *action,bool extend,const char *data,size_t length) {
+    struct web_js_state *s=d?d->js:NULL;
+    if(!d||!d->live||d->inert||!action||!task_context_active(s)||s->disabled||s->running)return 0;
+    begin_named_task(s,"native editing",0);
+    JSValue args[]={JS_NewString(s->ctx,action),JS_NewBool(s->ctx,extend),data?JS_NewStringLen(s->ctx,data,length):JS_NULL};
+    JSValue result=JS_EXCEPTION;int handled=0;
+    if(!JS_IsException(args[0])&&!JS_IsException(args[2]))result=custom_element_hook(s,"editingAction",3,args);
+    if(JS_IsException(result))exception(s);else{handled=JS_ToBool(s->ctx,result)>0;JS_FreeValue(s->ctx,result);}
+    for(int i=0;i<3;i++)JS_FreeValue(s->ctx,args[i]);
+    end_task(s);
+    if(handled)d->dirty=true;
+    return handled;
+}
+/* The text of the document's selection (Selection's stringifier), for the
+   browser's copy key; malloc owned, NULL when nothing is selected. */
+char *web_js_selection_text(web_doc *d,size_t *length) {
+    if(length)*length=0;
+    struct web_js_state *s=d?d->js:NULL;
+    if(!d||!d->live||d->inert||!task_context_active(s)||s->disabled||s->running)return NULL;
+    begin_named_task(s,"native selection text",0);
+    JSValue result=custom_element_hook(s,"selectionText",0,NULL);
+    char *text=NULL;
+    if(JS_IsException(result))exception(s);
+    else{
+        size_t size=0;const char *value=JS_IsString(result)?JS_ToCStringLen(s->ctx,&size,result):NULL;
+        if(value&&size&&(text=malloc(size+1))){memcpy(text,value,size);text[size]=0;if(length)*length=size;}
+        JS_FreeCString(s->ctx,value);JS_FreeValue(s->ctx,result);
+    }
+    end_task(s);
+    return text;
 }
 bool web_media_activate(web_doc *d, web_node *target) {
     struct web_js_state *s = d ? d->js : NULL;
@@ -8846,6 +8894,7 @@ void web_js_prepare(void) {
     platform_prepare(&bindings_program);
     platform_prepare(&locale_program);
     platform_prepare(&webaudio_program);
+    platform_prepare(&editing_program);
 }
 /* Where running a platform program went: waiting for the compiler, reading
    (or, without one, compiling) the bytecode, and running it. */
@@ -8900,6 +8949,24 @@ static JSValue native_locale(JSContext *ctx, JSValueConst this_val, int argc, JS
         char message[160];
         snprintf(message, sizeof message, "Locale program: compiler wait %llu, read %llu ms; heap +%zu KiB",
                  (unsigned long long)profile.wait_ms, (unsigned long long)profile.read_ms,
+                 (after > before ? after - before : 0) / 1024);
+        log_text(s,WEB_CONSOLE_TRACE, message);
+    }
+    return fn;
+}
+/* js_editing.js's function in this realm; js_document_commands.js calls it once,
+   the first time a command or an editing key needs the editing layer. */
+static JSValue native_editing(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    struct web_js_state *s = state(ctx);
+    size_t before = s->runtime_owner->allocation.current;
+    struct bindings_profile profile = {0};
+    JSValue fn = platform_run(ctx, &editing_program, &profile);
+    if (s->host.debug_js) {
+        size_t after = s->runtime_owner->allocation.current;
+        char message[160];
+        snprintf(message, sizeof message, "Editing program: compiler wait %llu, read %llu, run %llu ms; heap +%zu KiB",
+                 (unsigned long long)profile.wait_ms, (unsigned long long)profile.read_ms, (unsigned long long)profile.run_ms,
                  (after > before ? after - before : 0) / 1024);
         log_text(s,WEB_CONSOLE_TRACE, message);
     }
@@ -9000,7 +9067,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),
         JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
         JS_CFUNC_DEF("inputListener",2,native_input_listener),JS_CFUNC_DEF("storageListener",1,native_storage_listener),
-        JS_CFUNC_DEF("locale",0,native_locale),
+        JS_CFUNC_DEF("locale",0,native_locale),JS_CFUNC_DEF("editing",0,native_editing),
         JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
         JS_CFUNC_DEF("svgGeometry",2,native_svg_geometry),
         JS_CFUNC_DEF("xpathCompile",2,native_xpath_compile),
