@@ -185,7 +185,10 @@ const textTrackBridge = (() => {
     function removeTrack(o,t){const s=track(t);abortTrack(s);s.owner=null;o.bytes-=s.bytes;o.cueCount-=s.items.length;const i=o.items.indexOf(t);if(i>=0)o.items.splice(i,1);
         for(const c of s.activeItems)cue(c).active=false;s.activeItems=[];indexed(s.active,[]);queue(o.list,'removetrack',{track:t});}
     function sync(o){if(o.syncing)return;o.syncing=true;try{
-        const elements=[];for(const node of o.node.children)if(node.namespaceURI===HTML&&node.localName==='track')elements.push(node);
+        /* The tree as the native DOM holds it: a page may redefine NodeList, HTMLCollection or
+           Element members, and a media element's list of text tracks does not follow them. */
+        const elements=[],children=rawDom.get(o.node,'childNodes');
+        for(let i=0;i<children.length;i++){const node=children[i];if(rawDom.get(node,'nodeType')===1&&rawDom.get(node,'namespaceURI')===HTML&&rawDom.get(node,'localName')==='track')elements.push(node);}
         for(const t of o.items.slice())if(track(t).element&&!elements.includes(track(t).element))removeTrack(o,t);
         for(const element of elements){let t=apply(mapGet,elementSlots,[element]);if(!t){t=new TextTrack(token,null,'subtitles','','',element);put(elementSlots,element,t);}const s=track(t);
             if(s.owner!==o){if(s.owner)removeTrack(s.owner,t);s.owner=o;o.items.push(t);o.bytes+=s.bytes;o.cueCount+=s.items.length;queue(o.list,'addtrack',{track:t});}
@@ -242,7 +245,11 @@ const textTrackBridge = (() => {
     /* Native parser-created media/track elements also work without author
      * touching textTracks. DOM mutations trigger bounded rescan. */
     let discoverPending=false;
-    function discover(){if(discoverPending)return;discoverPending=true;schedule(()=>{discoverPending=false;for(const node of document.querySelectorAll('video,audio')){
+    function discover(){if(discoverPending)return;discoverPending=true;schedule(()=>{discoverPending=false;
+        /* The native query's own array, not a NodeList: a page that redefines NodeList's length
+           or iterator must not make the platform scan elements that are not there. */
+        const found=dom('query',document,'video,audio',false);
+        for(let i=0;i<found.length;i++){const node=found[i];
         /* A managed element follows its own tracks through its observer and
          * media events; only newly inserted media need a first scan. */
         if(apply(mapGet,mediaSlots,[node]))continue;try{manage(node);}catch(e){report(e);}}});}

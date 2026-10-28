@@ -21,6 +21,8 @@ bool web_native_checkpoint(web_doc *d){(void)d;return true;}
 void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]){(void)t;(void)w;(void)h;memset(m,0,16*sizeof *m);m[0]=m[5]=m[10]=m[15]=1;}
 /* layout.c's, reached only from Geometry's matrix strings */
 void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]){(void)t;(void)m;abort();}
+/* web_url.c's (Lexbor's URL parser): CSS url() resolution, not reached by these values */
+int web_resolve_url_owned(const char *base,const char *rel,char **out){(void)base;(void)rel;(void)out;abort();}
 static int checks,failed;
 static void check(bool ok,const char *name,const char *got){checks++;if(!ok){failed++;printf("FAIL animation-values %s: %s\n",name,got?got:"(null)");}}
 static style_t parent,base;
@@ -175,6 +177,7 @@ int main(void){
     EXPECT(computed("animation-duration","auto"),"auto");
     EXPECT(computed("animation-iteration-count","infinite, 2.5"),"infinite, 2.5");
     EXPECT(computed("animation-name","none, foo, \"bar baz\""),"none, foo, \"bar baz\"");
+    EXPECT(computed("animation-name","\"\""),"PARSE"); /* parsing/animation-name-invalid.html */
     EXPECT(computed("animation-delay","-1s"),"-1s");
     EXPECT(computed("animation-direction","alternate-reverse, normal"),"alternate-reverse, normal");
     EXPECT(computed("animation-fill-mode","both"),"both");
@@ -186,6 +189,22 @@ int main(void){
     EXPECT(computed("transition-property","all"),"all");
     EXPECT(computed("transition-behavior","allow-discrete, normal"),"allow-discrete, normal");
     EXPECT(computed("transition-duration","-1s"),"PARSE");
+    /* <time> math functions (css-values/calc-time-values.html; css-easing/step-jump-*.html's
+       animation-delay: calc(var(--at) * -1s)); a negative duration calculation clamps to 0 */
+    EXPECT(computed("transition-delay","calc(4s + 1s)"),"5s");
+    EXPECT(computed("transition-delay","calc(4s + 1ms)"),"4.001s");
+    EXPECT(computed("transition-delay","calc(4ms + 1ms)"),"0.005s");
+    EXPECT(computed("transition-delay","calc(4s - 1ms)"),"3.999s");
+    EXPECT(computed("transition-delay","calc(4 * 1s)"),"4s");
+    EXPECT(computed("transition-delay","calc(4ms / 2)"),"0.002s");
+    EXPECT(computed("transition-delay","calc(4000ms)"),"4s");
+    EXPECT(computed("animation-delay","calc(3.0 * -1s)"),"-3s");
+    EXPECT(computed("animation-duration","min(1s, 200ms), max(1s, 200ms)"),"0.2s, 1s");
+    EXPECT(computed("transition-duration","calc(-1s)"),"0s");
+    EXPECT(computed("transition-delay","calc(1px + 1s)"),"PARSE");
+    EXPECT(computed("transition-delay","calc(1s * 2s)"),"PARSE");
+    EXPECT(computed("transition-delay","calc(50%)"),"PARSE");
+    EXPECT(computed("transition-delay","calc(2)"),"PARSE");
     EXPECT(computed("transition-property","none, opacity"),"PARSE");
     /* a shorthand's longhands */
     uint8_t set[css_prop_count()];css_prop_longhands(css_prop_lookup("margin",6),set);
@@ -214,6 +233,10 @@ int main(void){
     EXPECT(wpt_round(shown("color",mix("color","black","orange",.3))),"rgb(77, 50, 0)");
     EXPECT(wpt_round(shown("color",mix("color","black","orange",.6))),"rgb(153, 99, 0)");
     EXPECT(wpt_round(shown("color",mix("color","black","orange",1.5))),"rgb(255, 248, 0)");
+    /* from neutral (the target's yellow) to green: 178.5 and 64.5 round up */
+    EXPECT(wpt_round(shown("color",mix("color","yellow","green",.3))),"rgb(179, 217, 0)");
+    EXPECT(wpt_round(shown("color",mix("color","yellow","green",.6))),"rgb(102, 179, 0)");
+    EXPECT(wpt_round(shown("color",mix("color","yellow","green",1.5))),"rgb(0, 65, 0)");
     EXPECT(wpt_round(shown("color",mix("color","rgb(0 0 0)","color(srgb 1 1 1)",-.3))),"oklab(0 0 0)");
     EXPECT(wpt_round(shown("color",mix("color","rgb(0 0 0)","color(srgb 1 1 1)",0))),"oklab(0 0 0)");
     EXPECT(wpt_round(shown("color",mix("color","rgb(0 0 0)","color(srgb 1 1 1)",.3))),"oklab(0.3 0 0)");
@@ -267,6 +290,27 @@ int main(void){
     check(same("color","red","hsl(0 100% 50%)"),"red is hsl(0 100% 50%)","");
     check(!same("color","red","color(srgb 1 0 0)"),"red is not color(srgb 1 0 0)","");
     EXPECT(computed("color","color(display-p3 1 0 0)"),"color(display-p3 1 0 0)");
+    /* currentcolor computes to itself (CSS Color 4 §4.4): after the cascade finishes the style the
+       animation layer still reads currentcolor, getComputedStyle the used colour, and inherit takes
+       currentcolor for the child's own colour */
+    {
+        static style_t up,child;
+        uint8_t set2[css_prop_count()];
+        const struct propdef *colour=css_prop_lookup("color",5),*bg=css_prop_lookup("background-color",16);
+        css_style_init(&up,&parent);memset(set2,0,sizeof set2);
+        struct cx ux={.s=&up,.parent=&parent,.em=16,.rem=16,.vw=800,.vh=600,.a=&arena,.set=set2};
+        css_apply(colour,"red",3,&ux);css_apply(bg,"currentcolor",12,&ux);css_style_finish(&up,&parent,false);
+        sbuf b={0};
+        check(css_computed_value(&up,bg,&b,NULL) && !strcmp(sb_cstr(&b),"currentcolor"),"finished currentcolor computes to currentcolor",sb_cstr(&b));
+        b.n=0;check(css_computed_longhand(&up,"background-color",&b,NULL)==1 && !strcmp(sb_cstr(&b),"rgb(255, 0, 0)"),"its resolved value",sb_cstr(&b));
+        css_style_init(&child,&up);memset(set2,0,sizeof set2);
+        struct cx cx2={.s=&child,.parent=&up,.em=16,.rem=16,.vw=800,.vh=600,.a=&arena,.set=set2};
+        css_apply(colour,"blue",4,&cx2);css_apply(bg,"inherit",7,&cx2);css_style_finish(&child,&up,false);
+        b.n=0;check(css_computed_longhand(&child,"background-color",&b,NULL)==1 && !strcmp(sb_cstr(&b),"rgb(0, 0, 255)"),"inherited currentcolor is the child's colour",sb_cstr(&b));
+        memset(set2,0,sizeof set2);css_apply(bg,"lime",4,&cx2);css_style_finish(&child,&up,false);
+        b.n=0;check(css_computed_value(&child,bg,&b,NULL) && !strcmp(sb_cstr(&b),"rgb(0, 255, 0)"),"a new value clears currentcolor",sb_cstr(&b));
+        sb_free(&b);
+    }
     printf("animation-values: %d checks, %d failures\n",checks,failed);
     return failed!=0;
 }
@@ -286,7 +330,7 @@ abi.mkdir(exist_ok=True)
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH", ""))
 exe = out / "values.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include",
-           "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c",
+           "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c", "user/libc/web/shape.c",
            "user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", str(url), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=60)

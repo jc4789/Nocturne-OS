@@ -67,6 +67,13 @@ async function test(){
     check('forced close fires close and closes',closeEvent.type==='close'&&pendingClose);
     check('deleteDatabase success is a version change event',deleted.e instanceof context.IDBVersionChangeEvent&&deleted.e.oldVersion===3&&deleted.e.newVersion===null&&deleted.result===undefined);
     check('deletion commit empties schema',data.get('segments').meta.version===0);
+    const late=idb().open('unique-late',1);let adds=0,dbErrors=0,constraint=false;
+    late.onupgradeneeded=()=>{const udb=late.result,utx=late.transaction,us=udb.createObjectStore('s');
+        for(const k of [1,2])us.add(run('({p:"same"})'),k).onsuccess=()=>adds++;
+        us.createIndex('p','p',{unique:true});udb.onerror=()=>dbErrors++;utx.onabort=()=>{constraint=utx.error?.name==='ConstraintError';};};
+    const lateError=await new Promise((ok,bad)=>{late.onsuccess=()=>bad(new Error('a unique index over equal values was built'));late.onerror=e=>ok(e);});
+    check('requests before createIndex run without the index; its build aborts with ConstraintError',adds===2&&constraint&&dbErrors===0);
+    check('an aborted upgrade answers the open with a new AbortError and no transaction',lateError.target.error.name==='AbortError'&&late.transaction===null);
     context.bridge.retire();console.log(`IndexedDB metadata contract: ${checks} checks, 0 failures; ${payloadWrites} changed payload writes`);
 }
 test().catch(e=>{console.error(e);context.bridge.retire();process.exitCode=1;});

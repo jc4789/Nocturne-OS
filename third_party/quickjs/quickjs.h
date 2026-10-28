@@ -1091,6 +1091,17 @@ int JS_DescribeException(JSContext *ctx, JSValueConst exception, char *buf, int 
    and the native frames they call, are left out of Error stacks, as native
    bindings print none. An empty prefix (the default) shows every frame. */
 void JS_SetPlatformScriptPrefix(JSRuntime *rt, const char *prefix);
+/* For a host class's exotic methods. JS_AtomKeyKind says whether a property
+   key is an array index (0 to 2^32-2, stored in *pindex), another string, or
+   a symbol (private names included); it runs no JavaScript. A refused [[Set]]
+   or [[DefineOwnProperty]] returns JS_ThrowTypeErrorOrFalseStr: a TypeError
+   (-1) when 'flags' has JS_PROP_THROW, or JS_PROP_THROW_STRICT and the running
+   code is strict, FALSE otherwise. A host's own keys come before the ordinary
+   string and symbol keys, and a key that is also an ordinary own property is
+   listed once (Web IDL's legacy platform object [[OwnPropertyKeys]]). */
+enum { JS_ATOM_KEY_STRING, JS_ATOM_KEY_INDEX, JS_ATOM_KEY_SYMBOL };
+int JS_AtomKeyKind(JSContext *ctx, JSAtom atom, uint32_t *pindex);
+int JS_ThrowTypeErrorOrFalseStr(JSContext *ctx, int flags, const char *message);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

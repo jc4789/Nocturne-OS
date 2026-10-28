@@ -3889,6 +3889,16 @@ static BOOL JS_AtomIsArrayIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
     }
 }
 
+#ifdef CONFIG_NOCTURNE
+int JS_AtomKeyKind(JSContext *ctx, JSAtom atom, uint32_t *pindex)
+{
+    if (JS_AtomIsArrayIndex(ctx, pindex, atom))
+        return JS_ATOM_KEY_INDEX;
+    return JS_AtomGetKind(ctx, atom) == JS_ATOM_KIND_STRING ?
+        JS_ATOM_KEY_STRING : JS_ATOM_KEY_SYMBOL;
+}
+#endif
+
 /* This test must be fast if atom is not a numeric index (e.g. a
    method name). Return JS_UNDEFINED if not a numeric
    index. JS_EXCEPTION can also be returned. */
@@ -8147,6 +8157,13 @@ static int __attribute__((format(printf, 3, 4))) JS_ThrowTypeErrorOrFalse(JSCont
     }
 }
 
+#ifdef CONFIG_NOCTURNE
+int JS_ThrowTypeErrorOrFalseStr(JSContext *ctx, int flags, const char *message)
+{
+    return JS_ThrowTypeErrorOrFalse(ctx, flags, "%s", message);
+}
+#endif
+
 /* never use it directly */
 static JSValue __attribute__((format(printf, 3, 4))) __JS_ThrowTypeErrorAtom(JSContext *ctx, JSAtom atom, const char *fmt, ...)
 {
@@ -9037,6 +9054,46 @@ void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab, uint32_t len)
     }
 }
 
+#ifdef CONFIG_NOCTURNE
+/* A host exotic class's own keys and, when 'flags' asks, whether each is
+   enumerable. Its get_own_property_names and get_own_property may run
+   JavaScript, which may change the object's shape, so the caller asks them
+   before it counts the ordinary properties. */
+static int js_exotic_own_keys(JSContext *ctx, JSPropertyEnum **ptab,
+                              uint32_t *plen, JSObject *p, int flags)
+{
+    const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
+    JSPropertyEnum *tab;
+    uint32_t i, count;
+
+    *ptab = NULL;
+    *plen = 0;
+    if (!em || !em->get_own_property_names)
+        return 0;
+    if (em->get_own_property_names(ctx, &tab, &count, JS_MKPTR(JS_TAG_OBJECT, p)))
+        return -1;
+    for(i = 0; i < count; i++) {
+        tab[i].is_enumerable = FALSE;
+        if ((flags & (JS_GPN_SET_ENUM | JS_GPN_ENUM_ONLY)) &&
+            ((flags >> JS_AtomGetKind(ctx, tab[i].atom)) & 1) != 0) {
+            JSPropertyDescriptor desc;
+            int res = JS_GetOwnPropertyInternal(ctx, &desc, p, tab[i].atom);
+            if (res < 0) {
+                JS_FreePropertyEnum(ctx, tab, count);
+                return -1;
+            }
+            if (res) {
+                tab[i].is_enumerable = (desc.flags & JS_PROP_ENUMERABLE) != 0;
+                js_free_desc(ctx, &desc);
+            }
+        }
+    }
+    *ptab = tab;
+    *plen = count;
+    return 0;
+}
+#endif
+
 /* return < 0 in case if exception, 0 if OK. ptab and its atoms must
    be freed by the user. */
 static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
@@ -9051,6 +9108,9 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     JSAtom atom;
     uint32_t num_keys_count, str_keys_count, sym_keys_count, atom_count;
     uint32_t num_index, str_index, sym_index, exotic_count, exotic_keys_count;
+#ifdef CONFIG_NOCTURNE
+    uint32_t exotic_index;
+#endif
     BOOL is_enumerable, num_sorted;
     uint32_t num_key;
     JSAtomKindEnum kind;
@@ -9066,6 +9126,11 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     exotic_keys_count = 0;
     exotic_count = 0;
     tab_exotic = NULL;
+#ifdef CONFIG_NOCTURNE
+    if (p->is_exotic && !p->fast_array && p->class_id != JS_CLASS_STRING &&
+        js_exotic_own_keys(ctx, &tab_exotic, &exotic_count, p, flags))
+        return -1;
+#endif
     sh = p->shape;
     for(i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
         atom = prs->atom;
@@ -9081,6 +9146,9 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                     JSVarRef *var_ref = p->prop[i].u.var_ref;
                     if (unlikely(JS_IsUninitialized(*var_ref->pvalue))) {
                         JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
+#ifdef CONFIG_NOCTURNE
+                        JS_FreePropertyEnum(ctx, tab_exotic, exotic_count);
+#endif
                         return -1;
                     }
                 }
@@ -9105,6 +9173,22 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                 num_keys_count += js_string_obj_get_length(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
             }
         } else {
+#ifdef CONFIG_NOCTURNE
+            for(i = 0; i < exotic_count; i++) {
+                atom = tab_exotic[i].atom;
+                /* A key that is also an ordinary own property is listed
+                   once, as that property. */
+                if (find_own_property1(p, atom)) {
+                    JS_FreeAtom(ctx, atom);
+                    tab_exotic[i].atom = JS_ATOM_NULL;
+                    continue;
+                }
+                kind = JS_AtomGetKind(ctx, atom);
+                if (((flags >> kind) & 1) != 0 &&
+                    (!(flags & JS_GPN_ENUM_ONLY) || tab_exotic[i].is_enumerable))
+                    exotic_keys_count++;
+            }
+#else
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->get_own_property_names) {
                 if (em->get_own_property_names(ctx, &tab_exotic, &exotic_count,
@@ -9137,6 +9221,7 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                     }
                 }
             }
+#endif
         }
     }
 
@@ -9165,7 +9250,12 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     }
 
     num_index = 0;
+#ifdef CONFIG_NOCTURNE
+    exotic_index = num_keys_count;
+    str_index = num_keys_count + exotic_keys_count;
+#else
     str_index = num_keys_count;
+#endif
     sym_index = str_index + str_keys_count;
 
     num_sorted = TRUE;
@@ -9213,6 +9303,26 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                 }
             }
         } else {
+#ifdef CONFIG_NOCTURNE
+            /* Web IDL's [[OwnPropertyKeys]] of a legacy platform object: the
+               host's keys (its indices, then its names) come before the
+               ordinary string keys and the symbols. */
+            for(i = 0; i < exotic_count; i++) {
+                atom = tab_exotic[i].atom;
+                if (atom == JS_ATOM_NULL)
+                    continue;
+                is_enumerable = tab_exotic[i].is_enumerable;
+                kind = JS_AtomGetKind(ctx, atom);
+                if ((!(flags & JS_GPN_ENUM_ONLY) || is_enumerable) &&
+                    ((flags >> kind) & 1) != 0) {
+                    tab_atom[exotic_index].atom = atom;
+                    tab_atom[exotic_index].is_enumerable = is_enumerable;
+                    exotic_index++;
+                } else {
+                    JS_FreeAtom(ctx, atom);
+                }
+            }
+#else
             /* Note: exotic keys are not reordered and comes after the object own properties. */
             for(i = 0; i < exotic_count; i++) {
                 atom = tab_exotic[i].atom;
@@ -9227,12 +9337,18 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                     JS_FreeAtom(ctx, atom);
                 }
             }
+#endif
             js_free(ctx, tab_exotic);
         }
     }
 
     assert(num_index == num_keys_count);
+#ifdef CONFIG_NOCTURNE
+    assert(exotic_index == num_keys_count + exotic_keys_count);
+    assert(str_index == num_keys_count + exotic_keys_count + str_keys_count);
+#else
     assert(str_index == num_keys_count + str_keys_count);
+#endif
     assert(sym_index == atom_count);
 
     if (num_keys_count != 0 && !num_sorted) {

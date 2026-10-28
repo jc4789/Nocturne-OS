@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -441,6 +441,45 @@
         hasChildNodes() { return this.firstChild !== null; }
         getRootNode(options={}) { return rawDom.root(this,!!shadowBridge.dictionary(options).composed); }
     }
+    /* The (Node or DOMString)... arguments of append, prepend, before and after, converted as Web
+       IDL does before the steps run (a string conversion may run author code). */
+    function nodeValues(nodes){const values=[];for(let i=0;i<nodes.length;i++)values[i]=rawDom.isNode(null,nodes[i])?nodes[i]:elementURL.string(nodes[i]);return values;}
+    /* DOM "convert nodes into a node": strings become Text nodes of document, and more than one
+       node goes into a new DocumentFragment, so the caller pre-inserts once and the inserted
+       scripts' post-connection steps run after every node is in place. */
+    function convertNodes(document,values){
+        const make=value=>typeof value==='string'?rawDom.create(document,3,'#text',value):value;
+        if(values.length===1)return make(values[0]);
+        const fragment=rawDom.create(document,11,'#document-fragment','');
+        for(let i=0;i<values.length;i++){const child=make(values[i]);validateInsertion(fragment,child,null);dom('insert',fragment,child,null);}
+        return fragment;
+    }
+    /* ParentNode prepend and append: pre-insert the converted node before this's first child, or
+       at the end. One [CEReactions] scope for the whole call. */
+    function parentInsert(receiver,nodes,first){
+        const type=rawDom.get(receiver,'nodeType');
+        if(type!==1&&type!==9&&type!==11)throw new TypeError('ParentNode receiver required');
+        const values=nodeValues(nodes);
+        const insert=()=>{const node=convertNodes(type===9?receiver:rawDom.get(receiver,'ownerDocument'),values);
+            const child=first?rawDom.get(receiver,'firstChild'):null;validateInsertion(receiver,node,child);dom('insert',receiver,node,child);};
+        if(customElementsReady)customElementsBridge.reactions(insert);else insert();
+    }
+    /* ChildNode before and after: the viable sibling is the first one on that side that is not
+       among the nodes, then the converted node is pre-inserted into the parent next to it. */
+    function siblingInsert(receiver,nodes,after){
+        const kind=rawDom.get(receiver,'nodeType');
+        if(kind!==1 && kind!==3 && kind!==7 && kind!==8 && kind!==10)throw new TypeError('ChildNode receiver required');
+        const values=nodeValues(nodes);
+        const parent=rawDom.get(receiver,'parentNode');
+        if(!parent)return;
+        const among=node=>{for(let i=0;i<values.length;i++)if(values[i]===node)return true;return false;};
+        let viable=rawDom.get(receiver,after?'nextSibling':'previousSibling');
+        while(viable&&among(viable))viable=rawDom.get(viable,after?'nextSibling':'previousSibling');
+        const insert=()=>{const node=convertNodes(rawDom.get(receiver,'ownerDocument'),values);
+            const child=after?viable:viable===null?rawDom.get(parent,'firstChild'):rawDom.get(viable,'nextSibling');
+            validateInsertion(parent,node,child);dom('insert',parent,node,child);};
+        if(customElementsReady)customElementsBridge.reactions(insert);else insert();
+    }
     function replaceChildNode(receiver,nodes) {
         const kind=rawDom.get(receiver,'nodeType');
         if(kind!==1 && kind!==3 && kind!==7 && kind!==8 && kind!==10)throw new TypeError('ChildNode receiver required');
@@ -480,8 +519,8 @@
         get previousElementSibling() { let n=this.previousSibling; while(n && n.nodeType !== 1) n=n.previousSibling; return n; }
         get childElementCount() { return this.children.length; }
         remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-        append(...nodes) { for (const n of nodes) this.appendChild(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n))); }
-        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n)),before); }
+        append(...nodes) { parentInsert(this,nodes,false); }
+        prepend(...nodes) { parentInsert(this,nodes,true); }
         replaceChildren(...nodes) {
             const type=rawDom.get(this,'nodeType');
             if(![1,9,11].includes(type))throw new TypeError('ParentNode receiver required');
@@ -501,8 +540,23 @@
                 dom('replaceAll',this,replacement);
             });
         }
-        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),this); }
-        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),next); } }
+        /* DOM moveBefore: "move" node into this before child, keeping its state (a frame's
+           document, focus, animations); no removing or insertion steps, only the moving steps */
+        moveBefore(node,child) {
+            const type=rawDom.get(this,'nodeType');
+            if(type!==1&&type!==9&&type!==11)throw new TypeError('ParentNode receiver required');
+            if(arguments.length<2)throw new TypeError("Failed to execute 'moveBefore': 2 arguments required");
+            if(!rawDom.isNode(null,node))throw new TypeError("Failed to execute 'moveBefore': parameter 1 is not of type 'Node'");
+            if(child!=null&&!rawDom.isNode(null,child))throw new TypeError("Failed to execute 'moveBefore': parameter 2 is not of type 'Node'");
+            let reference=child??null;
+            if(reference===node)reference=rawDom.get(node,'nextSibling');
+            const status=rawDom.moveStatus(this,node,reference);
+            if(status)throw new DOMException(status===2?'The reference node is not a child of this node':'The node cannot be moved here',
+                status===2?'NotFoundError':'HierarchyRequestError');
+            dom('move',this,node,reference);
+        }
+        before(...nodes) { siblingInsert(this,nodes,false); }
+        after(...nodes) { siblingInsert(this,nodes,true); }
         replaceWith(...nodes) { replaceChildNode(this,nodes); }
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return domGet(this,'localName'); }
@@ -543,7 +597,9 @@
         }
         querySelector(selector) { return dom('query',this,String(selector),true); }
         querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
-        matches(selector) { return dom('matches',this,String(selector)); }
+        matches(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'matches': 1 argument required");return dom('matches',this,String(selector)); }
+        /* DOM: a legacy alias of matches (an operation of its own name, the same steps). */
+        webkitMatchesSelector(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'webkitMatchesSelector': 1 argument required");return dom('matches',this,String(selector)); }
         closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
         getElementsByTagName(name) { name=String(name);return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,name)); }
         getElementsByTagNameNS(namespace,localName) {
@@ -897,7 +953,7 @@
     }
     // ParentNode is shared, but attributes and matching belong only to elements.
     const parentMembers = ['children','firstElementChild','lastElementChild','childElementCount',
-        'append','prepend','replaceChildren','querySelector','querySelectorAll'];
+        'append','prepend','replaceChildren','moveBefore','querySelector','querySelectorAll'];
     copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByTagNameNS','getElementsByClassName']));
     copyElementMembers(DocumentFragment.prototype, parentMembers);
     copyElementMembers(CharacterData.prototype, ['nextElementSibling','previousElementSibling','remove','before','after','replaceWith']);
@@ -907,7 +963,9 @@
         Object.defineProperty(proto,Symbol.unscopables,{configurable:true,value:unscopables});
     }
     const document=host.document;
-    Object.setPrototypeOf(document,HTMLDocument.prototype);
+    /* HTML "create and initialize a Document": a document of type "xml" is a
+       Document, not an HTMLDocument. */
+    Object.setPrototypeOf(document,domGet(document,'htmlDocument')?HTMLDocument.prototype:Document.prototype);
     /* Configurable: these move to Document.prototype at the end of bootstrap. */
     Object.defineProperties(document, {
         documentElement:{configurable:true,get(){return domGet(document,'documentElement');}},
@@ -1136,6 +1194,9 @@
     /* @include js_indexeddb.js */
     /* @include js_opfs.js */
     installOriginPrivateFileSystem(host,cryptoSecureContext,Navigator,false);
+    /* @include js_cache_storage.js */
+    installCacheStorage({...fetchBridge.cache,secure:cryptoSecureContext,native:host.cacheStorage,
+        embedderPolicy:host.cacheEmbedderPolicy,streams:streamBridge});
     /* @include js_messaging.js */
     /* @include js_websocket.js */
     /* @include js_css_supports.js */
@@ -1348,13 +1409,16 @@
             const ceActive=customElementsBridge.active()&&(['clone','import'].includes(args[0]) || reactionNode && rawDom.get(reactionNode,'scripting') || args[0]==='adopt' && rawDom.get(args[1],'scripting'));
             const ce=ceActive?customElementsBridge.before(...args):null;
             let mutationArgs=reactionArgs;
+            /* a move's live range and NodeIterator updates are those of a removal and insertion */
+            if(args[0]==='move')mutationArgs=['insert',...args.slice(1)];
             if(args[0]==='set' && args[2]==='innerHTML' && args[1] instanceof HTMLTemplateElement)
                 mutationArgs=['set',rawDom.get(args[1],'templateContent'),'innerHTML',args[3]];
             const mutation=mutationBridge.native?null:mutationBridge.before(...mutationArgs);
             const range=rangeBridge.active()?rangeBridge.before(...mutationArgs):null;
-            return ce||mutation||range?{ce,mutation,range,op:args[0]}:null;
+            const traversal=traversalBridge.before(...mutationArgs);
+            return ce||mutation||range||traversal?{ce,mutation,range,traversal,op:args[0]}:null;
         },
-        customElementAfter(token,result){rangeBridge.after(token.range);if(!mutationBridge.native)mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
+        customElementAfter(token,result){rangeBridge.after(token.range);traversalBridge.after(token.traversal);if(!mutationBridge.native)mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
         customElementCloneDocuments:customElementsBridge.cloneDocuments,
         mutationFlush(){mutationBridge.flush();},
         customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},

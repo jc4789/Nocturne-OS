@@ -1,8 +1,10 @@
 /* DOM traversal over native node relationships, not a copied JS tree.
  * Include after js_mutations.js and js_document.js. Traversal is ordinary DOM
  * tree order: shadow roots and template contents must be explicit roots.
- * Algorithms: https://dom.spec.whatwg.org/#traversal */
-(() => {
+ * Algorithms: https://dom.spec.whatwg.org/#traversal
+ * traversalBridge: the NodeIterator pre-remove steps at the native structure
+ * boundary (js_bootstrap.js customElementBefore/After), beside live ranges. */
+const traversalBridge = (() => {
     const walkers=new WeakMap(), iteratorData=new WeakMap(), iterators=new Set();
     const WeakRefImpl=WeakRef, deref=WeakRef.prototype.deref;
     const ACCEPT=1, REJECT=2, SKIP=3, SHOW_ALL=0xffffffff;
@@ -227,12 +229,10 @@
      * pointers in the old tree, commit only successful mutations. Iterator
      * objects are weakly tracked: discarded iterators do not pin DOM trees.
      * Native parser/document.write removals do not enter this script boundary. */
-    const beforeMutation=mutationBridge.before, afterMutation=mutationBridge.after;
-    mutationBridge.before=function(...args){
-        const base=apply(beforeMutation,mutationBridge,args);
-        if(!iterators.size)return base;
+    function before(...args){
+        if(!iterators.size)return null;
         const removed=removals(...args);
-        if(!removed.length)return base;
+        if(!removed.length)return null;
         const plans=[];
         for(const d of liveIterators()){
             const oldReference=d.reference, oldCandidate=d.candidate, alreadyRemoved=new Set();
@@ -245,20 +245,17 @@
             if(reference!==oldReference || candidate!==oldCandidate)
                 plans.push({d,oldReference,oldCandidate,reference,candidate});
         }
-        return plans.length?{traversal:true,base,plans}:base;
-    };
-    mutationBridge.after=function(token){
-        if(token && token.traversal){
-            /* A nested mutation/conversion may have changed a pointer since
-             * preparation; never overwrite that newer traversal state. */
-            for(const p of token.plans){
-                if(p.d.reference===p.oldReference)p.d.reference=p.reference;
-                if(p.d.candidate===p.oldCandidate)p.d.candidate=p.candidate;
-            }
-            return apply(afterMutation,mutationBridge,[token.base]);
+        return plans.length?plans:null;
+    }
+    function after(plans){
+        if(!plans)return;
+        /* A nested mutation/conversion may have changed a pointer since
+         * preparation; never overwrite that newer traversal state. */
+        for(const p of plans){
+            if(p.d.reference===p.oldReference)p.d.reference=p.reference;
+            if(p.d.candidate===p.oldCandidate)p.d.candidate=p.candidate;
         }
-        return apply(afterMutation,mutationBridge,[token]);
-    };
+    }
     Object.defineProperties(Document.prototype,{
         createTreeWalker:{enumerable:true,configurable:true,writable:true,value:function createTreeWalker(root,whatToShow=SHOW_ALL,callback=null){
             documentBridge.brand(this);
@@ -272,7 +269,9 @@
             const d=state(root,whatToShow,callback),iterator=Object.create(NodeIterator.prototype);
             d.reference={node:d.root,before:true};d.candidate=null;iteratorData.set(iterator,d);
             if((iterators.size&63)===0)liveIterators();
-            iterators.add(new WeakRefImpl(iterator));return iterator;
+            iterators.add(new WeakRefImpl(iterator));
+            if(host.domHooks)host.domHooks(1,true); /* the structure boundary calls before/after */
+            return iterator;
         }}
     });
     const NodeFilter=()=>{throw new TypeError('Illegal NodeFilter constructor');};
@@ -290,4 +289,5 @@
         Object.defineProperty(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     }
     Object.assign(globalThis,{NodeFilter,TreeWalker,NodeIterator});
+    return {before,after};
 })();

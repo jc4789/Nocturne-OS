@@ -342,6 +342,242 @@ static void documents(void) {
     doc_inert_discard(family);
 }
 
+/* ------------------------------------------- a browsing context's document */
+static web_doc *live_doc(void) {
+    web_doc *d = shim_doc();
+    if (!d) abort();
+    return d;
+}
+/* Resume past slices to the next script, the end or a failure. */
+static int boundary(struct xml_parser *x, node_t **script, int *yields) {
+    for (;;) {
+        int result = xml_parser_resume(x, script);
+        if (result != HTML_PARSE_YIELD) return result;
+        if (yields) (*yields)++;
+    }
+}
+static void link_last(node_t *parent, node_t *n) {
+    n->parent = parent; n->prev = parent->last; n->next = NULL;
+    if (parent->last) parent->last->next = n; else parent->first = n;
+    parent->last = n;
+}
+
+static void scripts(void) {
+    static const char page[] =
+        "<?xml version='1.0' encoding='utf-8'?>"
+        "<html xmlns='http://www.w3.org/1999/xhtml'><head><script>one()</script></head>"
+        "<body><p>x</p><script><![CDATA[if (1 < 2) two();]]></script>"
+        "<svg xmlns='http://www.w3.org/2000/svg'><script>three()</script></svg>"
+        "<template><script>inert()</script></template><s:script xmlns:s='urn:other'>no</s:script><i/></body></html>";
+    size_t before = heap_live;
+    web_doc *d = live_doc();
+    struct xml_parser *x = xml_parser_begin(d, page, sizeof page - 1, NULL);
+    CHECK(x && d->xml && d->root && !strcmp(d->encoding, "UTF-8") && d->encoding_certain, "a browsing context's XML document");
+    node_t *s = NULL;
+    CHECK(boundary(x, &s, NULL) == HTML_PARSE_SCRIPT && element(s, WEB_NS_HTML, NULL, "script"),
+          "a script's end tag stops the parser");
+    node_t *html = child(d->root, 0), *head = child(html, 0);
+    CHECK(s && !s->script_started && s->parent == head && text(child(s, 0), "one()"),
+          "the script is left to be prepared, its text parsed");
+    CHECK(count(html) == 1 && xml_parser_changed(x) && d->mutated && d->synced && d->captures == 1,
+          "nothing after the end tag yet, and the document was told");
+    CHECK(boundary(x, &s, NULL) == HTML_PARSE_SCRIPT && element(s, WEB_NS_HTML, NULL, "script") &&
+          text(child(s, 0), "if (1 < 2) two();") && child(s, 0)->cdata, "a script in a CDATA section");
+    node_t *body = child(html, 1);
+    CHECK(body && count(body) == 2, "the body up to that script");
+    CHECK(boundary(x, &s, NULL) == HTML_PARSE_SCRIPT && element(s, WEB_NS_SVG, NULL, "script"), "an SVG script");
+    CHECK(boundary(x, &s, NULL) == HTML_PARSE_DONE && !s, "the end: no template or foreign script returns");
+    node_t *template = child(body, 3), *other = child(body, 4);
+    CHECK(template && template->template_content && child(template->template_content, 0)->script_started,
+          "a template's script is already started");
+    CHECK(element(other, "urn:other", "s", "script"), "a script element of another namespace");
+    CHECK(element(child(body, 5), WEB_NS_HTML, NULL, "i") && child(body, 5)->elem_index == 6, "element indexes");
+    CHECK(xml_parser_resume(x, &s) == HTML_PARSE_DONE && !xml_parser_changed(x), "the end stays the end");
+    xml_parser_finish(x);
+    CHECK(d->control_bytes == 0 && d->captures == 3 && !d->console_lines, "Expat's memory returned");
+    doc_inert_discard(d);
+    CHECK(heap_live == before, "nothing kept");
+
+    /* A script changes an open element between resumes. */
+    d = live_doc();
+    static const char changed[] = "<r><script xmlns='http://www.w3.org/1999/xhtml'>s</script><b/></r>";
+    x = xml_parser_begin(d, changed, sizeof changed - 1, NULL);
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_SCRIPT, "the script's boundary");
+    node_t *r = child(d->root, 0), *inserted = doc_element_create(d, NULL, NULL, "x");
+    link_last(r, inserted); inserted->elem_index = 2;
+    CHECK(boundary(x, &s, NULL) == HTML_PARSE_DONE && element(child(r, 2), NULL, NULL, "b") && child(r, 2)->elem_index == 3,
+          "the parser appends after what the script inserted");
+    xml_parser_finish(x);
+    doc_inert_discard(d);
+
+    /* The response bytes may go once the document has begun. */
+    d = live_doc();
+    char bytes[] = "<x>abc</x>";
+    x = xml_parser_begin(d, bytes, sizeof bytes - 1, NULL);
+    memset(bytes, 'z', sizeof bytes - 1);
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_DONE && text(child(child(d->root, 0), 0), "abc"), "the parser reads its own copy");
+    xml_parser_finish(x);
+    doc_inert_discard(d);
+}
+
+static void slices(void) {
+    enum { ELEMENTS = 100000 };
+    size_t length = 3 + (size_t)ELEMENTS * 4 + 4;
+    char *s = (malloc)(length + 1), *p = s;
+    if (!s) abort();
+    memcpy(p, "<r>", 3); p += 3;
+    for (int i = 0; i < ELEMENTS; i++) { memcpy(p, "<i/>", 4); p += 4; }
+    memcpy(p, "</r>", 4); p += 4;
+    web_doc *d = live_doc();
+    struct xml_parser *x = xml_parser_begin(d, s, length, NULL);
+    node_t *script = NULL;
+    CHECK(x && xml_parser_resume(x, &script) == HTML_PARSE_YIELD && xml_parser_changed(x), "a resume reads a slice");
+    int first = count(child(d->root, 0)), yields = 1;
+    CHECK(first > 0 && first < ELEMENTS, "part of the document after one slice");
+    CHECK(boundary(x, &script, &yields) == HTML_PARSE_DONE && count(child(d->root, 0)) == ELEMENTS && yields >= 3,
+          "the rest over later resumes");
+    CHECK(child(child(d->root, 0), 0)->elem_index == 1 && child(d->root, 0)->last->elem_index == ELEMENTS, "indexes across slices");
+    xml_parser_finish(x);
+    CHECK(d->control_bytes == 0, "memory returned");
+    doc_inert_discard(d);
+    (free)(s);
+}
+
+static void errors(void) {
+    /* A well-formedness error after a script: the document becomes its error. */
+    static const char broken[] = "<r xmlns='http://www.w3.org/1999/xhtml'><script>s</script><p>unfinished</r>";
+    web_doc *d = live_doc();
+    struct xml_parser *x = xml_parser_begin(d, broken, sizeof broken - 1, NULL);
+    node_t *s = NULL;
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_SCRIPT, "the script before the error runs");
+    node_t *r = child(d->root, 0);
+    CHECK(boundary(x, &s, NULL) == HTML_PARSE_DONE && xml_parser_changed(x), "the error ends the parse");
+    node_t *e = child(d->root, 0);
+    CHECK(count(d->root) == 1 && element(e, XML_PARSERERROR_NS, NULL, "parsererror") && e->first && e->first->type == N_TEXT,
+          "the parsererror element is the document's tree");
+    CHECK(!r->parent && d->removals == 1, "the tree built so far left the document");
+    CHECK(d->console_lines == 1 && strstr(d->console, "XML") && strstr(e->first->text, "1 行"), "the error is reported");
+    xml_parser_finish(x);
+    CHECK(d->control_bytes == 0, "memory returned after the error");
+    doc_inert_discard(d);
+
+    static const char bogus[] = "<?xml version='1.0' encoding='x-bogus'?><x/>";
+    d = live_doc();
+    x = xml_parser_begin(d, bogus, sizeof bogus - 1, NULL);
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_DONE && element(child(d->root, 0), XML_PARSERERROR_NS, NULL, "parsererror"),
+          "an encoding Expat cannot read is the document's error");
+    xml_parser_finish(x);
+    doc_inert_discard(d);
+
+    static const char latin[] = "<x>\xe9</x>";
+    d = live_doc();
+    x = xml_parser_begin(d, latin, sizeof latin - 1, "windows-1252");
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_DONE && text(child(child(d->root, 0), 0), "\xc3\xa9") &&
+          !strcmp(d->encoding, "windows-1252"), "the transport label decodes");
+    xml_parser_finish(x);
+    doc_inert_discard(d);
+
+    /* A native checkpoint cancels: the tree so far stays. */
+    enum { ELEMENTS = 5000 };
+    size_t length = 3 + (size_t)ELEMENTS * 4 + 4;
+    char *big = (malloc)(length + 1), *p = big;
+    if (!big) abort();
+    memcpy(p, "<r>", 3); p += 3;
+    for (int i = 0; i < ELEMENTS; i++) { memcpy(p, "<i/>", 4); p += 4; }
+    memcpy(p, "</r>", 4);
+    d = live_doc();
+    x = xml_parser_begin(d, big, length, NULL);
+    checkpoints = 0; cancel_at = 2000;
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_CANCELLED, "the checkpoint cancels");
+    cancel_at = -1;
+    int kept = count(child(d->root, 0));
+    CHECK(kept > 0 && kept < ELEMENTS && d->mutated && xml_parser_changed(x), "the tree so far stays, and the document knows");
+    CHECK(xml_parser_resume(x, &s) == HTML_PARSE_CANCELLED, "a cancelled parse stays cancelled");
+    xml_parser_finish(x);
+    CHECK(d->control_bytes == 0, "memory returned after cancellation");
+    doc_inert_discard(d);
+    (free)(big);
+}
+
+static void inserted(void) {
+    static const char page[] =
+        "<html xmlns='http://www.w3.org/1999/xhtml'><head>"
+        "<meta http-equiv='Content-Security-Policy' content=\"script-src 'none'\"/><meta name='referrer' content='no-referrer'/>"
+        "</head><body><meta http-equiv='content-security-policy' content='img-src none'/><details open=''/>"
+        "<textarea>v</textarea></body></html>";
+    web_doc *d = live_doc();
+    struct xml_parser *x = xml_parser_begin(d, page, sizeof page - 1, NULL);
+    node_t *s = NULL;
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_DONE, "metadata document parses");
+    node_t *meta = child(child(child(d->root, 0), 0), 0);
+    CHECK(d->policies == 1 && !strcmp(d->policy, "script-src 'none'") && meta->html_policy_processed,
+          "a head meta's Content Security Policy applies; one in body does not");
+    CHECK(d->referrers == 3 && d->details == 1, "referrer metadata and details groups");
+    xml_parser_finish(x);
+    doc_inert_discard(d);
+
+    d = new_doc();
+    CHECK(parse_string(d, page) == XML_PARSED && !d->policies && !d->referrers, "scripting disabled: no policy from the parse");
+    doc_inert_discard(d);
+
+    d = live_doc();
+    policy_fails = true;
+    x = xml_parser_begin(d, page, sizeof page - 1, NULL);
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_FAILED, "a policy that cannot be kept fails the parse");
+    policy_fails = false;
+    xml_parser_finish(x);
+    doc_inert_discard(d);
+
+    static const char script[] = "<r xmlns='http://www.w3.org/1999/xhtml'><script>s</script></r>";
+    d = live_doc();
+    capture_fails = true;
+    x = xml_parser_begin(d, script, sizeof script - 1, NULL);
+    CHECK(x && boundary(x, &s, NULL) == HTML_PARSE_FAILED && !s, "a script text that cannot be kept fails the parse");
+    capture_fails = false;
+    xml_parser_finish(x);
+    doc_inert_discard(d);
+}
+
+static void live_allocation_failures(void) {
+    static const char page[] =
+        "<?xml version='1.0'?><!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.1//EN' 'x'>"
+        "<html xmlns='http://www.w3.org/1999/xhtml'><head><meta http-equiv='Content-Security-Policy' content='a'/>"
+        "<script>one()</script></head><body>&eacute;<template><i/></template><details/>"
+        "<script><![CDATA[two()]]></script><p xmlns:q='urn:q' q:a='1'>t</p></body></html>";
+    size_t before = heap_live;
+    allocations = 0;
+    web_doc *d = live_doc();
+    allocations = 0;
+    struct xml_parser *x = xml_parser_begin(d, page, sizeof page - 1, NULL);
+    node_t *s = NULL;
+    int result;
+    while ((result = xml_parser_resume(x, &s)) == HTML_PARSE_SCRIPT || result == HTML_PARSE_YIELD) {}
+    CHECK(result == HTML_PARSE_DONE, "fault sweep document parses");
+    long needed = allocations;
+    xml_parser_finish(x);
+    doc_inert_discard(d);
+    bool sound = true, clean = true;
+    for (long i = 0; i < needed; i++) {
+        allocations = 0; fail_allocation = -1;
+        d = live_doc();
+        allocations = 0; fail_allocation = i;
+        x = xml_parser_begin(d, page, sizeof page - 1, NULL);
+        result = HTML_PARSE_FAILED;
+        if (x) while ((result = xml_parser_resume(x, &s)) == HTML_PARSE_SCRIPT || result == HTML_PARSE_YIELD) {}
+        fail_allocation = -1;
+        if (x && result != HTML_PARSE_FAILED) sound = false;
+        xml_parser_finish(x);
+        if (d->control_bytes) clean = false;
+        doc_inert_discard(d);
+        if (heap_live != before) { clean = false; heap_live = before; }
+    }
+    char label[96];
+    snprintf(label, sizeof label, "each of %ld allocations of a browsing context's parse fails it", needed);
+    printf("%s\n", label);
+    CHECK(sound, label);
+    CHECK(clean, "every failed browsing context parse returns its memory");
+}
+
 int main(void) {
     well_formed();
     malformed();
@@ -353,6 +589,11 @@ int main(void) {
     expansion();
     allocation_failures();
     documents();
+    scripts();
+    slices();
+    errors();
+    inserted();
+    live_allocation_failures();
     printf("%d checks, %d failed\n", checks, failures);
     return failures != 0;
 }

@@ -75,9 +75,16 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
         JS_FreeValue(s->ctx,JS_GetException(s->ctx));
         f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame blob URL is revoked or unavailable");return;
     }
+    /* An XML type loads an XML document; its encoding is the bytes' own. */
+    if(web_document_kind(mime)==WEB_DOCUMENT_XML){
+        struct web_host host=frame_host(s,NULL);
+        bool made=web_frame_commit_response(f,body,n,url,NULL,NULL,mime,&host,true);
+        js_free(s->ctx,body);f->navigation_owner=NULL;
+        if(!made){f->failed=true;log_text(s,1,"Frame blob document was refused or could not be allocated");}
+        return;
+    }
     /* An untyped Blob is sniffed like an untyped navigation response. */
-    bool html=!strcasecmp(mime,"text/html") || !strcasecmp(mime,"application/xhtml+xml") ||
-        (untyped && n && memchr(body,'<',n<512?n:512));
+    bool html=!strcasecmp(mime,"text/html") || (untyped && n && memchr(body,'<',n<512?n:512));
     /* Text, script and JSON types render as a plain text document. */
     bool text=!html && (!strncasecmp(mime,"text/",5) || strstr(mime,"javascript") || strstr(mime,"json") || strstr(mime,"xml"));
     char *page=NULL;size_t used=0;
@@ -243,7 +250,8 @@ static void frame_response(struct web_js_state *s,struct js_pending *p,bool ok) 
         http_header(&response_headers,"Content-Type",content_type,sizeof content_type);
         html_transport_label(content_type,charset,sizeof charset);
         struct web_host host=frame_host(s,p);
-        if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),&host,false))return;
+        if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),
+                                     content_type,&host,false))return;
         char message[640];
         snprintf(message,sizeof message,"Frame document commit failed: %s; %.*s",
                  f->commit_failure?f->commit_failure:"unknown reason",(int)MIN(strcspn(url,"?#"),(size_t)400),url);
@@ -733,6 +741,7 @@ out:JS_FreeCString(ctx,op);return result;
 static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);int32_t operation=0;
     if(argc && JS_ToInt32(ctx,&operation,argv[0]))return JS_EXCEPTION;
+    if(s->doc->xml)return xml_stream_error(s);
     if(s->disabled || !s->doc->live)return JS_ThrowTypeError(ctx,"Document stream belongs to an inactive browsing context");
     if((sandbox_authority(s)&SB_SCRIPTS) || sandbox_borrowed(s))return history_security_error(ctx,"Sandbox denied document stream authority");
     if(s->dynamic_markup_counter){

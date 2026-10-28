@@ -431,7 +431,10 @@ void box_scroll_clamp(box_t *b) {
     n->scroll_y = scroll_limit(n->scroll_y, my);
 }
 
-bool css_translation_active(const style_t *s){return s&&(s->transform||s->translate.active||s->rotate||s->scale);}
+/* the transform properties, or an offset transform (motion-1 §2.7) */
+static bool transform_properties(const style_t *s){return s->transform||s->translate.active||s->rotate||s->scale;}
+static bool offset_path(const style_t *s){return s->offset&&s->offset->path;}
+bool css_translation_active(const style_t *s){return s&&(transform_properties(s)||offset_path(s));}
 /* Row-major 4x4 of one function; translation percentages use w/h. depth: perspective too,
    which orthographic flattening otherwise discards. */
 static void transform_function_matrix(const struct css_transform *t,float w,float h,bool depth,double m[16]){
@@ -485,6 +488,7 @@ static bool transform_function_translates(const struct css_transform *t){
 }
 bool css_transform_general(const style_t *s){
     if(!s)return false;
+    if(offset_path(s))return true; /* the offset transform is box_transform_matrix's */
     if(s->rotate&&!transform_function_translates(s->rotate))return true;
     if(s->scale&&!transform_function_translates(s->scale))return true;
     for(const struct css_transform *t=s->transform;t;t=t->next)if(!transform_function_translates(t))return true;
@@ -502,18 +506,76 @@ float box_translation_axis(const box_t *b,unsigned axis,unsigned sources){
         value+=t->kind==CT_TRANSLATE?len_resolve(&t->xy[axis],base):t->kind==CT_MATRIX?t->m[axis?7:3]:0;
     return value>FLT_MAX?FLT_MAX:value< -FLT_MAX? -FLT_MAX:(float)value;
 }
+/* The offset transform's parts in document coordinates: the offset position (px, py), the anchor
+   point (ax, ay) and the rotation in degrees. */
+struct offset_used { double px, py, ax, ay, angle; };
+/* A reference box as the outline motion-1 §2.1 and css-shapes-1 §3.3 give it: the rectangle with
+   the corners its border radii round, r its rectangle from b's border box's top left. */
+static void box_outline(const box_t *b,uint8_t which,float r[4],struct css_shape *s){
+    float rx[4],ry[4];
+    box_reference_box(b,which,r,rx,ry);
+    memset(s,0,sizeof *s);
+    s->kind=CSS_SHAPE_INSET;s->box=which;
+    for(int i=0;i<4;i++){
+        s->inset[i].kind=LK_LEN;
+        s->corner[i].axis[0]=(len_t){.kind=LK_LEN,.px=rx[i]};s->corner[i].axis[1]=(len_t){.kind=LK_LEN,.px=ry[i]};
+    }
+}
+/* motion-1 §2.7: where offset-path, offset-distance, offset-position, offset-anchor and offset-rotate
+   put b, whose transform reference box is (x y w h) and origin (ox, oy). The path's reference box is
+   the <coord-box> of the box that establishes b's containing block. */
+static bool box_offset_used(const box_t *b,double x,double y,float w,float h,double ox,double oy,struct offset_used *u){
+    const struct css_offset *o=css_style_offset(b->st);
+    const struct css_shape *path=o->path;
+    float element[4]={box_visual_x(b)-b->p[3]-b->b[3],box_visual_y(b)-b->p[0]-b->b[0],
+                      b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2]};
+    const box_t *c=b->cb?b->cb:b->parent;
+    float cb[4];
+    struct css_shape outline;
+    struct css_offset offset=*o;
+    if(c&&c->kind!=B_TEXT&&c->kind!=B_BR) {
+        uint8_t which=path->box==CSS_BOX_MARGIN?CSS_BOX_BORDER:path->box;
+        if(path->kind==CSS_SHAPE_BOX){box_outline(c,which,cb,&outline);offset.path=&outline;}
+        else{float rx[4],ry[4];box_reference_box(c,which,cb,rx,ry);}
+        double cx=box_visual_x(c)-c->p[3]-c->b[3],cy=box_visual_y(c)-c->p[0]-c->b[0];
+        /* the path is in the containing block's content, which scrolls */
+        if(c->node&&box_element_scrollable(c)){cx-=c->node->scroll_x;cy-=c->node->scroll_y;}
+        cb[0]+=(float)cx;cb[1]+=(float)cy;
+    } else { /* the initial containing block */
+        const web_doc *d=b->node?b->node->owner:NULL;
+        cb[0]=cb[1]=0;cb[2]=d?(float)d->width:0;cb[3]=d?(float)d->height:0;
+        if(path->kind==CSS_SHAPE_BOX){
+            memset(&outline,0,sizeof outline);outline.kind=CSS_SHAPE_INSET;
+            for(int i=0;i<4;i++)outline.inset[i].kind=outline.corner[i].axis[0].kind=outline.corner[i].axis[1].kind=LK_LEN;
+            offset.path=&outline;
+        }
+    }
+    double direction;
+    if(!css_offset_place(&offset,cb,element,&u->px,&u->py,&direction))return false;
+    /* offset-anchor (motion-1 §2.4): auto is transform-origin's point */
+    if(o->anchor[0].kind==LK_AUTO){u->ax=ox;u->ay=oy;}
+    else{u->ax=x+len_resolve(&o->anchor[0],w);u->ay=y+len_resolve(&o->anchor[1],h);}
+    u->angle=(o->rotate.auto_rotate?direction:0)+o->rotate.angle;
+    return isfinite(u->ax)&&isfinite(u->ay)&&isfinite(u->angle);
+}
+static bool style_transform_matrix(const style_t *st,double x,double y,float w,float h,const box_t *b,double out[6]);
 bool box_transform_matrix(const box_t *b,double out[6]){
     if(!box_transformed(b))return false;
     const style_t *st=b->st;
     bool content=st->transform_box==TB_FILL_BOX||st->transform_box==TB_CONTENT_BOX;
     float w=content?b->w:b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],h=content?b->h:b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
     double x=box_visual_x(b)-(content?0:b->p[3]+b->b[3]),y=box_visual_y(b)-(content?0:b->p[0]+b->b[0]);
-    return css_style_transform_matrix(st,x,y,w,h,out);
+    return style_transform_matrix(st,x,y,w,h,b,out);
 }
+/* SVG graphics take the transform properties only; the offset transform is the CSS boxes' */
 bool css_style_transform_matrix(const style_t *st,double x,double y,float w,float h,double out[6]){
+    return st&&transform_properties(st)&&style_transform_matrix(st,x,y,w,h,NULL,out);
+}
+static bool style_transform_matrix(const style_t *st,double x,double y,float w,float h,const box_t *b,double out[6]){
     if(!css_translation_active(st))return false;
     double ox=x+len_resolve(&st->transform_origin[0],w),oy=y+len_resolve(&st->transform_origin[1],h);
-    /* CSS Transforms 2: translate, rotate, scale, then transform, around the origin. */
+    /* CSS Transforms 2: translate, rotate, scale, the offset transform (motion-1 §2.7), then transform,
+       around the origin. */
     double m[16],f[16];
     for(int i=0;i<16;i++)m[i]=i%5?0:1;
     m[3]=ox;m[7]=oy;
@@ -523,6 +585,17 @@ bool css_style_transform_matrix(const style_t *st,double x,double y,float w,floa
     }
     if(st->rotate){transform_function_matrix(st->rotate,w,h,false,f);matrix4_multiply(m,m,f);}
     if(st->scale){transform_function_matrix(st->scale,w,h,false,f);matrix4_multiply(m,m,f);}
+    struct offset_used off;
+    if(b&&offset_path(st)&&box_offset_used(b,x,y,w,h,ox,oy,&off)){
+        /* the anchor point to the offset position, rotated around it */
+        double a=off.angle*M_PI/180;
+        for(int i=0;i<16;i++)f[i]=i%5?0:1;
+        f[3]=off.px-ox;f[7]=off.py-oy;matrix4_multiply(m,m,f);
+        for(int i=0;i<16;i++)f[i]=i%5?0:1;
+        f[0]=cos(a);f[1]=-sin(a);f[4]=sin(a);f[5]=cos(a);matrix4_multiply(m,m,f);
+        for(int i=0;i<16;i++)f[i]=i%5?0:1;
+        f[3]=ox-off.ax;f[7]=oy-off.ay;matrix4_multiply(m,m,f);
+    }
     css_transform_list_matrix(st->transform,w,h,f);matrix4_multiply(m,m,f);
     for(int i=0;i<16;i++)f[i]=i%5?0:1;
     f[3]=-ox;f[7]=-oy;matrix4_multiply(m,m,f);
@@ -728,6 +801,8 @@ static void list_abs(box_t *b) {
 struct fl {
     float x, y, w, h; /* margin box, in BFC coordinates */
     int side;
+    const box_t *box; /* the float; its shape-outside narrows line boxes only */
+    float shape_margin;
 };
 struct bfc {
     struct fl *v;
@@ -737,25 +812,44 @@ struct bfc {
 
 static void bfc_free(struct bfc *f) { free(f->v); }
 
-static void bfc_add(struct bfc *f, float x, float y, float w, float h, int side) {
+static void bfc_add(struct bfc *f, float x, float y, float w, float h, int side, const box_t *box, float shape_margin) {
     if (f->n == f->cap) {
         f->cap = f->cap ? f->cap * 2 : 8;
         f->v = realloc(f->v, sizeof *f->v * (size_t)f->cap);
     }
-    f->v[f->n++] = (struct fl){x, y, w, h, side};
+    f->v[f->n++] = (struct fl){x, y, w, h, side, box, shape_margin};
     f->last_top = y;
 }
 
-/* the free interval within [x0, x1] for the band y .. y+h */
-static void bfc_space(const struct bfc *f, float y, float h, float x0, float x1, float *l, float *r) {
+/* css-shapes-1 §4: the float area of a's shape-outside within the band y .. y+h, clipped to its
+   margin box; false when the band misses it, and the float leaves those lines alone. */
+static bool float_area(const struct fl *a, float y, float h, float *x0, float *x1) {
+    const box_t *b = a->box;
+    const struct css_shape *s = css_style_float_shape(b->st)->outside;
+    float r[4];
+    struct css_shape outline;
+    if (s->kind == CSS_SHAPE_BOX) { box_outline(b, s->box, r, &outline); s = &outline; }
+    else { float rx[4], ry[4]; box_reference_box(b, s->box, r, rx, ry); }
+    r[0] += a->x + b->m[3]; r[1] += a->y + b->m[0];
+    if (!css_shape_band(s, r, a->shape_margin, y, y + h, x0, x1)) return false;
+    *x0 = fmaxf_(*x0, a->x); *x1 = fminf_(*x1, a->x + a->w);
+    return *x1 > *x0;
+}
+
+/* the free interval within [x0, x1] for the band y .. y+h; lines: for line boxes, which floats'
+   shape-outside narrows */
+static void bfc_space(const struct bfc *f, float y, float h, float x0, float x1, float *l, float *r, bool lines) {
     *l = x0;
     *r = x1;
     if (h < 1) h = 1;
     for (int i = 0; f && i < f->n; i++) {
         const struct fl *a = &f->v[i];
         if (a->y >= y + h || a->y + a->h <= y || a->h <= 0) continue;
-        if (a->side == FL_LEFT) *l = fmaxf_(*l, a->x + a->w);
-        else *r = fminf_(*r, a->x);
+        float left = a->x, right = a->x + a->w;
+        const struct css_shape *shape = lines && a->box && a->box->st ? css_style_float_shape(a->box->st)->outside : NULL;
+        if (shape && shape->kind != CSS_SHAPE_URL && !float_area(a, y, h, &left, &right)) continue;
+        if (a->side == FL_LEFT) *l = fmaxf_(*l, right);
+        else *r = fminf_(*r, left);
     }
 }
 
@@ -1334,7 +1428,7 @@ static bool float_fits_line(struct iline *L, box_t *c, float used);
 
 static void line_space(struct iline *L) {
     box_t *b = L->blk;
-    bfc_space(L->f, L->oy + L->y, L->strut_lh, L->ox, L->ox + b->w, &L->left, &L->right);
+    bfc_space(L->f, L->oy + L->y, L->strut_lh, L->ox, L->ox + b->w, &L->left, &L->right, true);
     L->left -= L->ox;
     L->right -= L->ox;
     if (L->first_line) {
@@ -1835,14 +1929,14 @@ static void position_float(box_t *c, float cw, struct bfc *f, float ox, float oy
     float y = float_min_y(c, f, oy + y_rel);
     float l = ox, r = ox + cw;
     for (int guard = 0; f && guard < 200; guard++) {
-        bfc_space(f, y, mh, ox, ox + cw, &l, &r);
+        bfc_space(f, y, mh, ox, ox + cw, &l, &r, false);
         if (r - l >= mw - 0.05f || (l <= ox && r >= ox + cw)) break;
         float nb = bfc_next(f, y);
         if (nb < 0) break;
         y = nb;
     }
     float x = c->st->float_ == FL_LEFT ? l : r - mw;
-    if (f) bfc_add(f, x, y, mw, mh, c->st->float_);
+    if (f) bfc_add(f, x, y, mw, mh, c->st->float_, c, fmaxf_(0, len_resolve(&css_style_float_shape(c->st)->margin, cw)));
     c->x = x - ox + c->m[3] + c->b[3] + c->p[3];
     c->y = y - oy + c->m[0] + c->b[0] + c->p[0];
 }
@@ -1863,7 +1957,7 @@ static bool float_fits_line(struct iline *L, box_t *c, float used) {
     float mw = c->w + hext(c) + c->m[1] + c->m[3];
     float mh = c->h + vext(c) + c->m[0] + c->m[2];
     float l, r;
-    bfc_space(L->f, y, fmaxf_(mh, L->strut_lh), L->ox, L->ox + b->w, &l, &r);
+    bfc_space(L->f, y, fmaxf_(mh, L->strut_lh), L->ox, L->ox + b->w, &l, &r, false);
     if (L->first_line) l += len_resolve(&b->st->text_indent, b->w);
     return r - l - mw >= used - 0.01f;
 }
@@ -1981,14 +2075,14 @@ static void layout_blocks(box_t *b, struct bfc *f, float ox, float oy, float cbh
             float bh = c->kind == B_ATOMIC ? c->h + vext(c) : 1;
             float l, r;
             for (int guard = 0; guard < 100; guard++) {
-                bfc_space(f, oy + y, bh, ox, ox + cw, &l, &r);
+                bfc_space(f, oy + y, bh, ox, ox + cw, &l, &r, false);
                 float need = c->kind == B_ATOMIC || !len_auto(&c->st->width) ? c->w + hext(c) + c->m[1] + c->m[3] : 0;
                 if (r - l >= need || need == 0) break;
                 float nb = bfc_next(f, oy + y);
                 if (nb < 0) break;
                 y = nb - oy;
             }
-            bfc_space(f, oy + y, bh, ox, ox + cw, &l, &r);
+            bfc_space(f, oy + y, bh, ox, ox + cw, &l, &r, false);
             l -= ox;
             r -= ox;
             if (l > 0 || r < cw) {

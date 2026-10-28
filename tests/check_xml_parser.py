@@ -2,10 +2,12 @@
 
 xml.c and Expat are the product sources; Expat keeps the product configuration
 (ports/expat/expat_config.h, XML_NOCTURNE). The native tree, the arena, the
-encoding labels and the checkpoint are small shims below, so this checks the
-parser's grammar, namespaces, entity handling, accounting, cancellation and
-nesting, not Lexbor's decoders or the DOM. It supplements guest tests and WPT;
-it is not rendering evidence.
+encoding labels, the checkpoint and the document's policy, console and script
+hooks are small shims below, so this checks the parser's grammar, namespaces,
+entity handling, accounting, cancellation, nesting and the browsing context's
+resumable parse (script boundaries, slices, the error document), not Lexbor's
+decoders, the DOM or script execution. It supplements guest tests and WPT; it
+is not rendering evidence.
 """
 from pathlib import Path
 import hashlib
@@ -99,6 +101,7 @@ static void ar_free(arena_t *a) { while (a->head) { struct ablock *b = a->head; 
 '''
 types = between(header, "#define WEB_TAGS(X)", "int tag_lookup(")
 types += between(header, "enum { N_DOC", "struct attr {")
+types += between(header, "enum html_parse_result {", "enum html_scripting_mode {")
 shim = r'''
 typedef struct web_doc web_doc;
 typedef struct node node_t;
@@ -106,7 +109,7 @@ struct attr { const char *name, *raw, *value, *namespace_uri, *prefix, *local; }
 struct node {
     int type, namespace_id, tag, nattrs, elem_index, custom_registry_id;
     web_doc *owner; node_t *parent, *prev, *next, *first, *last, *template_content;
-    bool cdata, script_started;
+    bool cdata, script_started, html_policy_processed, value_dirty, control_ready;
     const char *name, *raw_name, *prefix, *local_name, *namespace_uri, *custom_is, *public_id, *system_id;
     char *text; size_t textlen; struct attr *attrs; void *custom_registry_realm;
 };
@@ -115,11 +118,44 @@ struct web_doc {
     int custom_registry_id, mutated, synced; void *custom_registry_realm;
     char encoding[32]; bool encoding_certain, xml, xml_interface, resources_dirty;
     char *content_type;
+    /* What the browsing context's hooks saw. */
+    int policies, referrers, details, captures, removals, console_lines;
+    char policy[128], console[256];
 };
 static long checkpoints, cancel_at = -1;
 static bool web_native_checkpoint(web_doc *d) { (void)d; return checkpoints++ != cancel_at; }
 static void doc_mutated(web_doc *d, node_t *n) { (void)n; d->mutated++; }
 static void doc_sync_tree(web_doc *d) { d->synced++; }
+static uint64_t host_now;
+static uint64_t uptime_ms(void) { return host_now; }
+static bool str_ieq(const char *a, const char *b) {
+    while (*a && *b && lower((unsigned char)*a) == lower((unsigned char)*b)) { a++; b++; }
+    return !*a && !*b;
+}
+static const char *node_attr(const node_t *n, const char *name) {
+    for (int i = 0; i < n->nattrs; i++) if (!strcmp(n->attrs[i].name, name)) return n->attrs[i].value;
+    return NULL;
+}
+static bool policy_fails;
+static bool html_policy_meta(web_doc *d, const char *content, size_t length) {
+    if (policy_fails) return false;
+    d->policies++; snprintf(d->policy, sizeof d->policy, "%.*s", (int)length, content);
+    return true;
+}
+static void doc_referrer_meta(web_doc *d, node_t *n) { (void)n; d->referrers++; }
+static void doc_details_parser_finish(node_t *root) { root->owner->details++; }
+static bool capture_fails;
+static bool web_js_script_parser_capture(web_doc *d, node_t *n) { (void)n; d->captures++; return !capture_fails; }
+static void web_js_console(web_doc *d, int level, const char *message) {
+    (void)level; d->console_lines++; snprintf(d->console, sizeof d->console, "%s", message);
+}
+static void doc_node_remove(web_doc *d, node_t *n) {
+    node_t *p = n->parent;
+    if (n->prev) n->prev->next = n->next; else p->first = n->next;
+    if (n->next) n->next->prev = n->prev; else p->last = n->prev;
+    n->parent = n->prev = n->next = NULL;
+    d->removals++;
+}
 static void *doc_alloc(web_doc *d, size_t n) {
     jmp_buf trap, *old = d->mem.trap;
     d->mem.trap = &trap;
@@ -149,7 +185,13 @@ static node_t *doc_element_create(web_doc *d, const char *ns, const char *prefix
     if (n->namespace_id == NS_OTHER && !(n->namespace_uri = doc_strndup(d, ns, strlen(ns)))) return NULL;
     if (prefix && !(n->prefix = doc_strndup(d, prefix, strlen(prefix)))) return NULL;
     n->local_name = n->name;
-    n->tag = n->namespace_id != NS_HTML ? T_UNKNOWN : !strcmp(local, "script") ? T_script : !strcmp(local, "template") ? T_template : T_UNKNOWN;
+    /* As tag_lookup: the tag follows the local name in any namespace. */
+    static const struct { const char *name; int tag; } tags[] = {
+        {"script", T_script}, {"template", T_template}, {"meta", T_meta}, {"head", T_head},
+        {"details", T_details}, {"textarea", T_textarea},
+    };
+    n->tag = T_UNKNOWN;
+    for (size_t i = 0; i < sizeof tags / sizeof *tags; i++) if (!strcmp(local, tags[i].name)) n->tag = tags[i].tag;
     return n;
 }
 static node_t *doc_doctype_create(web_doc *d, const char *name, size_t nl, const char *pub, size_t pl, const char *sys, size_t sl) {
@@ -214,7 +256,9 @@ static char *html_decode_bytes(web_doc *d, const char *src, size_t n, const char
     return out;
 }
 '''
-body = source.replace('#include "xml.h"', contract.replace('#include "webi.h"', '')).replace('#include "html_encoding.h"', '')
+body = source.replace('#include "xml.h"', contract.replace('#include "webi.h"', ''))
+for include in ('#include "html_encoding.h"', '#include "html_policy.h"', '#include "elements.h"', '#include <nocturne.h>'):
+    body = body.replace(include, '')
 cases = (root / "tests/xml_parser_host_cases.c").read_text(encoding="utf-8")
 generated = out / "xml_parser.c"
 generated.write_text(prefix + types + shim + namespace_id + names + shim2 + body + cases, encoding="utf-8", newline="\n")

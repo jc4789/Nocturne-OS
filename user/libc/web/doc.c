@@ -26,6 +26,7 @@
 #include "html_policy.h"
 #include "html_encoding.h"
 #include "html_lexbor.h"
+#include "xml.h"
 #include "cssom.h"
 #include "web_url.h"
 #include <limits.h>
@@ -911,15 +912,68 @@ web_doc *web_live(const char *html, size_t len, const char *url, const char *cha
     return web_live_child(html,len,url,charset,host,NULL,NULL,NULL);
 }
 web_doc *web_live_response(const char *html,size_t len,const char *url,const char *charset,
-                         const char *headers,const struct web_host *host) {
-    return web_live_child_response(html,len,url,charset,headers,host,NULL,NULL,NULL);
+                         const char *headers,const char *type,const struct web_host *host) {
+    return web_live_child_response(html,len,url,charset,headers,type,host,NULL,NULL,NULL);
 }
 web_doc *web_live_child(const char *html, size_t len, const char *url, const char *charset,
                        const struct web_host *host, web_doc *parent,node_t *frame,web_doc *inherited_origin) {
-    return web_live_child_response(html,len,url,charset,NULL,host,parent,frame,inherited_origin);
+    return web_live_child_response(html,len,url,charset,NULL,NULL,host,parent,frame,inherited_origin);
+}
+static bool mime_token_char(char c) {
+    return c > ' ' && c < 0x7f && !strchr("\"(),/:;<=>?@[\\]{}", c);
+}
+/* MIME Sniffing "parse a MIME type" as far as the essence, then HTML's
+   "HTML MIME type" and "XML MIME type". */
+enum web_document_kind web_document_kind(const char *type) {
+    if (!type) return WEB_DOCUMENT_OTHER;
+    const char *p = type;
+    while (*p && strchr(" \t\r\n", *p)) p++;
+    const char *slash = p;
+    while (mime_token_char(*slash)) slash++;
+    if (slash == p || *slash != '/') return WEB_DOCUMENT_OTHER;
+    const char *subtype = slash + 1, *end = subtype;
+    while (mime_token_char(*end)) end++;
+    const char *after = end;
+    while (*after && strchr(" \t\r\n", *after)) after++;
+    if (end == subtype || (*after && *after != ';')) return WEB_DOCUMENT_OTHER;
+    size_t type_length = (size_t)(slash - p), subtype_length = (size_t)(end - subtype);
+    bool text = strn_ieq(p, "text", type_length);
+    if (text && strn_ieq(subtype, "html", subtype_length)) return WEB_DOCUMENT_HTML;
+    if ((text || strn_ieq(p, "application", type_length)) && strn_ieq(subtype, "xml", subtype_length)) return WEB_DOCUMENT_XML;
+    if (subtype_length >= 4 && strn_ieq(end - 4, "+xml", 4)) return WEB_DOCUMENT_XML;
+    return WEB_DOCUMENT_OTHER;
+}
+/* The essence of a valid type, lowercase (malloc'd). */
+static char *mime_essence(const char *type) {
+    const char *p = type;
+    while (*p && strchr(" \t\r\n", *p)) p++;
+    size_t n = 0;
+    while (mime_token_char(p[n]) || p[n] == '/') n++;
+    char *essence = strndup(p, n);
+    for (size_t i = 0; essence && i < n; i++) essence[i] = (char)lower((unsigned char)essence[i]);
+    return essence;
+}
+const void *doc_parser_current(const web_doc *d) {
+    if (!d) return NULL;
+    return d->parser ? (const void *)d->parser : (const void *)d->xml_parser;
+}
+int doc_parser_resume(web_doc *d, node_t **script) {
+    if (d && d->parser) return html_resume(d->parser, script);
+    if (d && d->xml_parser) return xml_parser_resume(d->xml_parser, script);
+    if (script) *script = NULL;
+    return HTML_PARSE_FAILED;
+}
+bool doc_parser_changed(const web_doc *d) {
+    return d && (d->parser ? html_import_changed(d->parser) : xml_parser_changed(d->xml_parser));
+}
+void doc_parser_stop(web_doc *d) {
+    if (!d) return;
+    html_finish(d->parser); d->parser = NULL;
+    xml_parser_finish(d->xml_parser); d->xml_parser = NULL;
 }
 web_doc *web_live_child_response(const char *html,size_t len,const char *url,const char *charset,
-                       const char *headers,const struct web_host *host,web_doc *parent,node_t *frame,web_doc *inherited_origin) {
+                       const char *headers,const char *type,const struct web_host *host,web_doc *parent,node_t *frame,
+                       web_doc *inherited_origin) {
     if (len == SIZE_MAX || (len && !html)) return NULL;
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
@@ -978,9 +1032,17 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
         if(transport_label[0])charset=transport_label;
     }
     d->html_srcdoc=parent && url && !strcmp(url,"about:srcdoc");
-    d->parser = d->html_srcdoc?html_begin_string(d,html?html:"",html?len:0,!(d->sandbox_flags&SB_SCRIPTS),true):
-        html_begin(d, html ? html : "", html ? len : 0, charset, !(d->sandbox_flags&SB_SCRIPTS));
-    if (!d->parser) { web_free(d); return NULL; }
+    if (!d->html_srcdoc && web_document_kind(type) == WEB_DOCUMENT_XML) {
+        /* HTML "load an XML document": a Document of type "xml" whose content
+           type is the response's, in no-quirks mode, and its XML parser. */
+        d->content_type = mime_essence(type);
+        d->xml_parser = d->content_type ? xml_parser_begin(d, html ? html : "", html ? len : 0, charset) : NULL;
+        if (!d->xml_parser) { web_free(d); return NULL; }
+    } else {
+        d->parser = d->html_srcdoc?html_begin_string(d,html?html:"",html?len:0,!(d->sandbox_flags&SB_SCRIPTS),true):
+            html_begin(d, html ? html : "", html ? len : 0, charset, !(d->sandbox_flags&SB_SCRIPTS));
+        if (!d->parser) { web_free(d); return NULL; }
+    }
     /* The restricted initial blank of a scripted sandbox exposes only a native
        WindowProxy token. Do not create a QuickJS realm whose raw Function/eval
        could bypass disabled task dispatch when borrowed by the embedding
@@ -1557,8 +1619,7 @@ void web_free(web_doc *d) {
     }
     web_form_validation_free(d);
     /* Parser subscriptions can borrow allocation-owned nodes in helper docs. */
-    html_finish(d->parser);
-    d->parser = NULL;
+    doc_parser_stop(d);
     while (d->dom_docs) {
         web_doc *child = d->dom_docs;
         d->dom_docs = child->dom_next; child->dom_next = NULL;

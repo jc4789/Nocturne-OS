@@ -238,6 +238,8 @@ static const char *const round_names[] = {"nearest", "up", "down", "to-zero"};
 struct cm {
     uint8_t op, type, fn, n;
     uint8_t key;     /* MN_KEY: the channel 0..3; MF_ROUND: the strategy */
+    bool hint;       /* a percentage made it though its type is not one (sign(), §10.9's percent hint):
+                        valid only where percentages are */
     char unit[7];    /* MN_LEAF: "" number, "%" percentage, else a lowercase unit */
     double v;
     struct cm **k;
@@ -425,6 +427,7 @@ static struct cm *m_simplify(struct pctx *P, struct cm *m) {
                     if (m_free(m->k[q]) && m_same_unit(m->k[i], m->k[q])) {
                         bool r = true;
                         m->k[i]->v = leaf_value(m->k[i], NULL, &r) + leaf_value(m->k[q], NULL, &r);
+                        m->k[i]->hint |= m->k[q]->hint;
                         if (m->k[i]->type == MT_LEN) strcpy(m->k[i]->unit, "px");
                         if (m->k[i]->type == MT_ANGLE) strcpy(m->k[i]->unit, "deg");
                         memmove(&m->k[q], &m->k[q + 1], (m->n - q - 1) * sizeof *m->k);
@@ -574,7 +577,10 @@ static struct cm *m_function(struct pctx *P, const struct tok *t, bool *calc) {
     case MF_ABS: m->type = t0; break;
     case MF_SIGN: m->type = MT_NUM; break;
     }
+    bool hint = fn == MF_SIGN && t0 == MT_PCT;
+    for (unsigned i = 0; i < n; i++) hint |= args[i]->hint;
     result = m_simplify(P, m);
+    if (result) result->hint |= hint;
 done:
     P->in_math = outer;
     P->depth--;
@@ -638,6 +644,7 @@ static struct cm *m_product(struct pctx *P, const struct tok *t, int n) {
             if (!inv) return NULL;
             inv->k[0] = v;
             inv->type = v->type;
+            inv->hint = v->hint;
             items[k++] = m_simplify(P, inv);
         } else items[k++] = v;
     }
@@ -660,7 +667,11 @@ static struct cm *m_product(struct pctx *P, const struct tok *t, int n) {
     if (!m) return NULL;
     memcpy(m->k, items, k * sizeof *items);
     m->type = type;
-    return m_simplify(P, m);
+    bool hint = false;
+    for (unsigned i = 0; i < k; i++) hint |= items[i]->hint;
+    struct cm *r = m_simplify(P, m);
+    if (r) r->hint |= hint;
+    return r;
 }
 static struct cm *m_sum(struct pctx *P, const struct tok *t, int n) {
     struct cm *items[64];
@@ -681,6 +692,7 @@ static struct cm *m_sum(struct pctx *P, const struct tok *t, int n) {
             if (!neg) return NULL;
             neg->k[0] = v;
             neg->type = v->type;
+            neg->hint = v->hint;
             v = m_simplify(P, neg);
         }
         if (k && v->type != items[0]->type) return NULL;
@@ -693,7 +705,11 @@ static struct cm *m_sum(struct pctx *P, const struct tok *t, int n) {
     if (!m) return NULL;
     memcpy(m->k, items, k * sizeof *items);
     m->type = items[0]->type;
-    return m_simplify(P, m);
+    bool hint = false;
+    for (unsigned i = 0; i < k; i++) hint |= items[i]->hint;
+    struct cm *r = m_simplify(P, m);
+    if (r) r->hint |= hint;
+    return r;
 }
 /* a copy of m with lengths of the element in pixels, simplified again */
 static struct cm *m_bind(struct pctx *P, const struct cm *m, const struct cx *cx) {
@@ -1079,7 +1095,7 @@ static bool parse_chan(struct pctx *P, const struct tok *t, unsigned types, bool
         if (!(m = m_function(P, t, &calc))) return false;
         c->wrapped = m->op != MN_FN; /* serialized inside calc() */
     } else if (!(m = m_value(P, t))) return false;
-    if (!(types & 1u << m->type)) return false;
+    if (!(types & 1u << m->type) || (m->hint && !(types & 1u << MT_PCT))) return false;
     c->kind = CH_MATH;
     c->type = m->type;
     c->m = m;
@@ -2318,6 +2334,7 @@ static const struct css_color_value *slot_get(const style_t *s, int k) {
     return s->color_own ? s->color_own[k - CSS_SLOT_INHERITED] : NULL;
 }
 static void slot_set(style_t *s, int k, const struct css_color_value *v, arena_t *a) {
+    s->color_current &= (uint16_t)~(1u << k); /* a new value; css_style_finish marks currentcolor again */
     if (slot_get(s, k) == v) return;
     bool inherited = k < CSS_SLOT_INHERITED;
     const struct css_color_value *const *old = inherited ? s->color_inherited : s->color_own;
@@ -2358,6 +2375,11 @@ void css_color_held(uint32_t argb, const struct css_color_value *v, uint32_t cur
     out->color = css_color_from_argb(argb);
 }
 void css_style_color(const style_t *st, enum css_color_slot k, struct css_color_computed *out) {
+    if (st->color_current & 1u << k) {
+        out->current = &current_value;
+        out->color = css_color_from_argb(*slot_field((style_t *)st, k));
+        return;
+    }
     css_color_held(*slot_field((style_t *)st, k), slot_get(st, k), st->color, out);
 }
 static struct css_color style_current(const style_t *st) {
@@ -2447,6 +2469,8 @@ bool css_color_apply(const char *s, size_t n, struct cx *cx, enum css_color_slot
 }
 void css_color_slot_copy(style_t *dst, const style_t *src, enum css_color_slot k, arena_t *a) {
     slot_set(dst, k, slot_get(src, k), a);
+    /* a finished currentcolor (inherit from the parent) is currentcolor again, for this element's colour */
+    if (src->color_current & 1u << k) *slot_field(dst, k) = COLOR_CURRENT;
 }
 void css_color_slot_set(style_t *s, enum css_color_slot k, const struct css_color_value *v, arena_t *a) {
     slot_set(s, k, v, a);
