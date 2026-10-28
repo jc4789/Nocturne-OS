@@ -90,7 +90,15 @@ extern const char *const tag_names[T_COUNT];
 enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER, PE_BACKDROP, PE_SLOTTED, PE_PLACEHOLDER };
 
 enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE, N_PI, N_ATTR };
-enum { NS_HTML, NS_SVG, NS_MATHML, NS_NONE };
+/* An element's namespace: the three the renderer knows, the null namespace,
+   or NS_OTHER, whose URI is the element's own namespace_uri. */
+enum { NS_HTML, NS_SVG, NS_MATHML, NS_NONE, NS_OTHER };
+#define WEB_NS_HTML "http://www.w3.org/1999/xhtml"
+#define WEB_NS_SVG "http://www.w3.org/2000/svg"
+#define WEB_NS_MATHML "http://www.w3.org/1998/Math/MathML"
+#define WEB_NS_XML "http://www.w3.org/XML/1998/namespace"
+#define WEB_NS_XMLNS "http://www.w3.org/2000/xmlns/"
+#define WEB_NS_XLINK "http://www.w3.org/1999/xlink"
 
 struct attr {
     const char *name;  /* lowercase */
@@ -133,11 +141,15 @@ typedef struct node {
     struct node *details_toggle_next;
     uint8_t type;
     uint8_t namespace_id; /* stable across detach/clone/adopt; not ancestor-derived */
-    uint16_t tag;
+    uint16_t tag; /* HTML tag ID of the local name; an HTML-namespace local name with ASCII uppercase has none */
     bool foreign;     /* namespace_id != NS_HTML, retained for renderer/parser */
     bool svg_snapshot_dirty; /* outermost <svg>: a descendant restyle may change its serialized paint */
-    const char *name; /* lowercase tag name; case-preserving PI target */
-    const char *raw_name;
+    bool cdata;       /* N_TEXT: a CDATASection node */
+    const char *name; /* element: ASCII-lowercase local name; case-preserving PI target */
+    const char *raw_name; /* element: qualified name, case preserved */
+    /* Element: DOM prefix (NULL for none), local name (a tail of raw_name) and,
+       for NS_OTHER only, the namespace URI. Read the URI with doc_element_namespace. */
+    const char *prefix, *local_name, *namespace_uri;
     const char *public_id, *system_id;
     size_t public_id_len, system_id_len;
     bool doctype_identifiers_sized;
@@ -1096,6 +1108,12 @@ struct web_doc {
     char base[HTTP_URL_MAX];
     bool base_seen;
     bool quirks; /* no (or a legacy) doctype */
+    /* DOM document type and content type. An XML document is not an HTML
+       document: names keep their case and tagName is not uppercased.
+       content_type is NULL for text/html; xml_interface: implements XMLDocument
+       (DOMImplementation.createDocument). */
+    bool xml, xml_interface;
+    char *content_type;
     uint8_t document_mode; /* 0 no-quirks, 1 quirks, 2 limited-quirks (Lexbor values) */
     char encoding[32]; /* canonical transport encoding; DOMString documents use UTF-8 */
     bool encoding_certain; /* BOM/transport/accepted meta/author entry; strings never reparse */
@@ -1159,6 +1177,13 @@ node_t *html_parse(web_doc *d, const char *html, size_t n, const char *charset);
 node_t *html_parse_string(web_doc *d, const char *html, size_t n, bool allow_shadow);
 web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url);
 web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *url, bool allow_shadow);
+/* A document without a browsing context in family's DOM family, with no root
+   yet; doc_inert_discard frees it and every document made after it (its
+   template documents) before a wrapper escapes. */
+web_doc *doc_inert_new(web_doc *family, const char *url);
+web_doc *doc_inert_bytes(web_doc *family, const char *bytes, size_t n, const char *label,
+                         const char *url, const char *content_type); /* XHR's HTML document */
+void doc_inert_discard(web_doc *d);
 size_t doc_dom_remaining(web_doc *d);
 void doc_dom_budget(web_doc *d);
 bool doc_node_adopt(web_doc *d, node_t *node);
@@ -1231,7 +1256,24 @@ int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, 
 enum doc_create_failure { DOC_CREATE_INVALID, DOC_CREATE_QUOTA, DOC_CREATE_ALLOCATOR,
     DOC_CREATE_OVERFLOW, DOC_CREATE_TEMPLATE, DOC_CREATE_WRAPPER };
 void doc_create_diagnostic(web_doc *d, unsigned stage, int type, size_t name_bytes, size_t data_bytes);
-node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t n);
+node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t n); /* N_ELEM: HTML namespace */
+/* DOM "create an element" with an already validated and extracted namespace
+   (NULL: none), prefix (NULL: none) and local name. */
+node_t *doc_element_create(web_doc *d, const char *ns, const char *prefix, const char *local);
+bool doc_element_prefix_set(node_t *n, const char *prefix); /* NULL: no prefix */
+int doc_namespace_id(const char *ns);
+const char *doc_element_namespace(const node_t *n); /* NULL: no namespace */
+/* DOM "locate a namespace" (prefix NULL: the default namespace) and
+   "locate a namespace prefix"; strings borrow the tree's records. */
+const char *doc_locate_namespace(const node_t *n, const char *prefix);
+const char *doc_locate_prefix(const node_t *n, const char *ns);
+/* getElementsByTagName (namespaced false) and getElementsByTagNameNS. */
+void doc_elements_named(node_t *root, bool namespaced, const char *ns, const char *name, pvec *out);
+/* DOM: an attribute or tag name given to an HTML-namespace element whose node
+   document is an HTML document is ASCII-lowercased; any other keeps its case. */
+static inline bool doc_html_names(const node_t *n) {
+    return n && n->type == N_ELEM && n->namespace_id == NS_HTML && !(n->owner && n->owner->xml);
+}
 node_t *doc_doctype_create(web_doc *d, const char *name, size_t name_len,
     const char *public_id, size_t public_len, const char *system_id, size_t system_len);
 int doc_node_insert_validity(node_t *parent, node_t *child, node_t *before);
@@ -1267,6 +1309,7 @@ bool doc_attr_set_node(web_doc *d, node_t *element, node_t *attribute);
 bool doc_attr_remove(web_doc *d, node_t *element, int index);
 bool doc_attr_value(web_doc *d, node_t *attribute, const char *value);
 void doc_attrs_publish(node_t *element, struct attr *attrs, int count);
+void doc_attrs_initial(web_doc *d, node_t *element, struct attr *attrs, int count); /* parser, under its trap */
 bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
 enum { HTML_BRIDGE_FIELDS=1, HTML_BRIDGE_LINKS=2, HTML_BRIDGE_CHILDREN=4 };
 void html_bridge_native_changed(node_t *node, unsigned flags);
