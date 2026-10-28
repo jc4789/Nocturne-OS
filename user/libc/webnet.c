@@ -104,6 +104,7 @@ struct wsock {
 };
 static void wsock_free(struct wsock *s);
 struct webnet {
+    const char *refusal; /* why the last webnet_submit returned 0 (static text) */
     struct request *queue;
     struct slot slots[WORKERS];
     struct slot *parked;
@@ -543,8 +544,28 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
     *out = (size_t)total;
     return tx;
 }
-uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callback cb, void *opaque) {
-    if (!n || !q || !q->url || !cb || n->count == UINT_MAX || q->kind > WEBNET_REPORT ||
+/* Fetch's inflight keepalive bytes of a fetch group: its queued, active and parked keepalive
+   requests that were not aborted. */
+size_t webnet_keepalive_inflight(const webnet *n, uint64_t group) {
+    size_t bytes = 0;
+    if (!n || !group) return 0;
+    for (const struct request *p = n->queue; p; p = p->next)
+        if (p->keepalive && !p->cancelled && p->fetch_group == group) bytes += p->keepalive_bytes;
+    for (int i = 0; i < WORKERS; i++) {
+        const struct request *p = n->slots[i].rq;
+        if (p && p->keepalive && !p->cancelled && p->fetch_group == group) bytes += p->keepalive_bytes;
+    }
+    for (const struct slot *s = n->parked; s; s = s->next) {
+        const struct request *p = s->rq;
+        if (p && p->keepalive && !p->cancelled && p->fetch_group == group) bytes += p->keepalive_bytes;
+    }
+    return bytes;
+}
+const char *webnet_refusal(const webnet *n) { return n && n->refusal ? n->refusal : "the request was not admitted"; }
+/* Why the transport cannot take a request as it was described, or NULL. */
+static const char *request_refusal(const webnet *n, const struct webnet_request *q) {
+    if (n->count == UINT_MAX) return "too many requests are open";
+    if (q->kind > WEBNET_REPORT ||
         q->kind < WEBNET_NAVIGATION || q->body_len > WEBNET_BODY_LIMIT || (q->body_len && !q->body) ||
         q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE ||
         q->cache_mode < WEBNET_CACHE_DEFAULT || q->cache_mode > WEBNET_CACHE_ONLY_IF_CACHED ||
@@ -559,31 +580,24 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
         (q->stream_response && q->kind != WEBNET_FETCH) ||
         (unsigned)q->destination >= WEBNET_DEST_COUNT ||
         ((q->user_activation || q->browser_ui) && q->kind != WEBNET_NAVIGATION) ||
-        (q->browser_ui && !q->user_navigation)) return 0;
+        (q->browser_ui && !q->user_navigation)) return "the request's fields contradict each other";
     if(q->kind==WEBNET_REPORT && (!webnet_report_fields_valid(q->method,q->headers) || !q->origin ||
         !q->body_len || q->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN || !q->redirect_error ||
         q->user_navigation || q->force_preflight || q->same_origin || q->no_cors || q->no_referrer ||
         q->keepalive || q->image_upgrade || q->cache_mode!=WEBNET_CACHE_DEFAULT ||
-        (!web_url_has_scheme(q->url,"http")&&!web_url_has_scheme(q->url,"https"))))return 0;
+        (!web_url_has_scheme(q->url,"http")&&!web_url_has_scheme(q->url,"https"))))return "the report's fields are not a report's";
     /* Fetch Standard's inflight keepalive body bound, per fetch group. Queued
        and active requests both count; explicit aborted requests are done. */
-    if (q->keepalive) {
-        size_t bytes = q->body_len;
-        if (bytes > 65536u) return 0;
-        for (const struct request *p = n->queue; p; p = p->next)
-            if (p->keepalive && !p->cancelled && p->fetch_group == q->fetch_group) {
-                if (p->keepalive_bytes > 65536u - bytes) return 0;
-                bytes += p->keepalive_bytes;
-            }
-        for (int i = 0; i < WORKERS; i++) {
-            const struct request *p = n->slots[i].rq;
-            if (p && p->keepalive && !p->cancelled && p->fetch_group == q->fetch_group) {
-                if (p->keepalive_bytes > 65536u - bytes) return 0;
-                bytes += p->keepalive_bytes;
-            }
-        }
-        for(const struct slot *s=n->parked;s;s=s->next){const struct request *p=s->rq;if(p&&p->keepalive&&!p->cancelled&&p->fetch_group==q->fetch_group){if(p->keepalive_bytes>65536u-bytes)return 0;bytes+=p->keepalive_bytes;}}
-    }
+    if (q->keepalive && (q->body_len > WEBNET_KEEPALIVE_BYTES ||
+        webnet_keepalive_inflight(n, q->fetch_group) > WEBNET_KEEPALIVE_BYTES - q->body_len))
+        return "keepalive request bodies in flight would exceed the fetch group's 64 KiB";
+    return NULL;
+}
+uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callback cb, void *opaque) {
+    if (!n) return 0;
+    if (!q || !q->url || !cb) { n->refusal = "the request is incomplete"; return 0; }
+    if ((n->refusal = request_refusal(n, q))) return 0;
+    n->refusal = "the request could not be encoded or retained";
     const char *origin = q->origin ? q->origin : "";
     const char *top_level_url=q->top_level_url?q->top_level_url:origin;
     bool debug_request = n->debug && (q->kind==WEBNET_RESOURCE||q->kind==WEBNET_CLASSIC||
@@ -650,6 +664,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     while (*at && (*at)->priority <= r->priority) at = &(*at)->next;
     r->next = *at; *at = r;
     n->queued_bytes += len; n->count++;
+    n->refusal = NULL;
     return r->id;
 }
 static bool origin_available(const webnet *n,const struct request *request){

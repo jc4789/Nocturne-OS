@@ -181,6 +181,9 @@ async function main() {
     }
     if (failed) process.exit(1);
 }
-/* A file's top-level body reads (request-disturbed's) reject with nobody waiting: not a result. */
-process.on('unhandledRejection', () => {});
-main().catch(e => { console.error(e); process.exit(1); });
+module.exports = {realms};
+if (require.main === module) {
+    /* A file's top-level body reads (request-disturbed's) reject with nobody waiting: not a result. */
+    process.on('unhandledRejection', () => {});
+    main().catch(e => { console.error(e); process.exit(1); });
+}

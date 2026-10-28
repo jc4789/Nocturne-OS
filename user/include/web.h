@@ -186,6 +186,11 @@ struct web_automation_step {
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
+    /* Why the last request() returned false (static text for the page's console), or NULL. */
+    const char *(*request_refusal)(void *opaque);
+    /* Fetch's inflight keepalive request bytes of a fetch group (web_request.fetch_group): what
+       the host still carries for it, including requests of retired documents. */
+    size_t (*keepalive_inflight)(void *opaque, uint64_t fetch_group);
     void (*cancel)(void *opaque, uint64_t id);
     /* Document retirement, unlike explicit AbortSignal: detach callback delivery
        and retain a keepalive transport. A host without this cannot accept it. */

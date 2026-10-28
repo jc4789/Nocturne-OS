@@ -4,7 +4,9 @@
      realm.signals    the realm's AbortSignal (js_abort.js in a Window, the Worker runtime's own):
                       is, aborted, reason, follow, any (a dependent signal) and controller.
      realm.transport  the native transport that carries a request: noCors(), streaming(),
-                      fetch(query, notify) -> {id, promise}, resume(id), cancel(id). A Window's is
+                      fetch(query, notify) -> {id, promise}, resume(id), cancel(id), and
+                      keepaliveRoom() (the bytes the realm's fetch group can still take into its
+                      inflight keepalive bodies; a Window's only, for Beacon). A Window's is
                       js.c's (host.fetch); a Worker's is its parent window's, through
                       browserjsworker.c, js_worker.c and js.c (NJW_LOAD, NJW_FRAME, NJW_RESUME).
      realm.baseURL(), origin(), clientReferrer(), referrerPolicy(), url()
@@ -739,6 +741,23 @@ function fetchInterfaces(realm) {
         /* The engine's own fetch for an element: a track, a media fallback. Its init is the
            engine's, copied without a prototype. */
         fetchFor(destination,input,init){return fetchCore(input,init===undefined?undefined:record({...init}),undefined,false,destination);},
+        /* Beacon's sendBeacon steps (https://w3c.github.io/beacon/#sec-processing-model, consulted
+           2026-10-28): url parsed against the realm's API base URL, an HTTP(S) scheme, the data's
+           body extracted with keepalive, false when the fetch group's inflight keepalive bytes
+           cannot take it, then a credentialed keepalive POST whose mode is no-cors unless the
+           extracted Content-Type is not a CORS-safelisted request-header. */
+        beacon(url,data){
+            const target=parseURL(usv(url),realm.baseURL()),scheme=apply(urlProtocol,target,[]);
+            if(scheme!=='http:'&&scheme!=='https:')throw new TypeError('sendBeacon requires an HTTP(S) URL');
+            let body=null,type=null;
+            if(data!==null&&data!==undefined){const extracted=extractBody(bodyInit(data),true);body=extracted.bytes;type=extracted.type;}
+            if(body!==null&&apply(abLength,body,[])>transport.keepaliveRoom())return false;
+            const headers=type===null?undefined:record({'content-type':type});
+            const mode=type!==null&&!noCorsSafe('content-type',type)?'cors':'no-cors';
+            const started=fetchCore(href(target),record({method:'POST',body:body===null?undefined:body,headers,keepalive:true,credentials:'include',mode}));
+            apply(then,started,[undefined,()=>{}]);
+            return true;
+        },
         moduleIntegrity(bytes,metadata){return integrityBytes(bytes,integrityMetadata(metadata));},
         initialize(){
             NativeURL=globalThis.URL;paramsString=globalThis.URLSearchParams.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;

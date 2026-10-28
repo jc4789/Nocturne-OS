@@ -5603,7 +5603,12 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         r.image_upgrade=((struct web_image *)s->doc->images.v[p->image])->image_upgrade;
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
     if(ok)p->host_accepted=true;
-    if (!ok) pending_error(p, "The browser rejected the resource request");
+    if (!ok) {
+        const char *why = s->host.request && s->host.request_refusal ? s->host.request_refusal(s->host.opaque) : NULL;
+        char message[160];
+        snprintf(message, sizeof message, "The browser rejected the resource request%s%s", why ? ": " : "", why ? why : "");
+        pending_error(p, message);
+    }
     if (s->host.net_log) {
         /* A stalled page shows what it last asked for, and the matching
            "Net #id" lines say what came back. */
@@ -6176,6 +6181,16 @@ static bool run_automation(struct web_js_state *s) {
     end_task(s);
     return true;
 }
+/* What the document's fetch group can still take into its inflight keepalive bytes. */
+static size_t keepalive_room(struct web_js_state *s) {
+    size_t inflight = s->fetch_group && s->host.keepalive_inflight ? s->host.keepalive_inflight(s->host.opaque, s->fetch_group) : 0;
+    return inflight < WEBNET_KEEPALIVE_BYTES ? WEBNET_KEEPALIVE_BYTES - inflight : 0;
+}
+/* host.keepaliveRoom(): Beacon's synchronous quota check before it queues a keepalive fetch. */
+static JSValue native_keepalive_room(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;(void)argc;(void)argv;
+    return JS_NewInt64(ctx, (int64_t)keepalive_room(state(ctx)));
+}
 static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
     if(sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox denied borrowed asynchronous authority");
@@ -6258,6 +6273,11 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
         /* A pointer or per-runtime request number can be reused after top-level
            navigation while an older native request is still alive. */
         if (!fetch_group_new(&s->fetch_group)) { result = JS_ThrowRangeError(ctx, "Fetch group identity is not representable"); goto out; }
+    }
+    /* Fetch "fetch": a keepalive body that the fetch group's inflight keepalive bytes cannot
+       take is a network error. */
+    if (keepalive && !null_body && n > keepalive_room(s)) {
+        result = JS_ThrowTypeError(ctx, "Keepalive request bodies in flight would exceed the fetch group's 64 KiB"); goto out;
     }
     struct js_pending *p = pending_new(s, P_FETCH, url);
     if (!p) { result = oom(ctx); goto out; }
@@ -9690,7 +9710,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("socketSend", 2, native_socket_send), JS_CFUNC_DEF("socketClose", 3, native_socket_close),
         JS_CFUNC_DEF("socketBuffered", 1, native_socket_buffered), JS_CFUNC_DEF("socketRelease", 1, native_socket_release),
 JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_cancel),
-        JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch),
+        JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch), JS_CFUNC_DEF("keepaliveRoom", 0, native_keepalive_room),
         JS_CFUNC_DEF("promiseThen", 3, native_promise_then),
         JS_CFUNC_DEF("promiseIsHandled", 1, native_promise_is_handled)
     };

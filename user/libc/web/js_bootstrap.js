@@ -1333,7 +1333,7 @@
         transport:{noCors:()=>!!host.noCorsFetch,streaming:()=>!!host.streamingFetch,
             fetch:(q,notify)=>host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:0,q.cache,
                 q.keepalive,q.noCors,q.noReferrer,notify,q.referrer,q.referrerPolicy,q.destination),
-            resume:id=>host.resumeFetch(id),cancel:id=>host.cancel(id)},
+            resume:id=>host.resumeFetch(id),cancel:id=>host.cancel(id),keepaliveRoom:()=>host.keepaliveRoom()},
         baseURL:()=>rawDom.get(document,'baseURI'),origin:()=>rawDom.get(document,'fetchOrigin'),
         clientReferrer:()=>rawDom.get(document,'fetchClientReferrer'),referrerPolicy:()=>rawDom.get(document,'referrerPolicy'),
         url:()=>host.url(),dataURL:url=>host.dataURL(url),task:fn=>host.timer(0,fn,0,[]),clearTask:id=>host.clear(id),
