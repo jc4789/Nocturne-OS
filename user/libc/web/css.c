@@ -5160,7 +5160,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         if(block_container){cx.cq_height=block_container->container_height;cx.cq_height_set=true;}
     }
     for (int i = 0; i < ndents; i++)
-        if ((!underlying || !dents[i].animation) && dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_font(dents[i].d->p)) apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
+        if ((!underlying || !dents[i].animation) && dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_early(dents[i].d->p)) apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
     cx.font_pass = false;
     cx.em = s->font_size;
     for (int i = 0; i < ndents; i++)
@@ -6249,6 +6249,8 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.bg_image=y.bg_image=x.mask_image=y.mask_image=NULL;
     x.bg_img=y.bg_img=x.mask_img=y.mask_img=0;
     x.color=y.color=x.bg_color=y.bg_color=0;
+    x.color_inherited=y.color_inherited=x.color_own=y.color_own=NULL;
+    x.color_scheme=y.color_scheme=0;x.color_scheme_text=y.color_scheme_text=NULL;
     memset(x.border_color,0,sizeof x.border_color);memset(y.border_color,0,sizeof y.border_color);
     x.outline_color=y.outline_color=0;x.outline_width=y.outline_width=x.outline_offset=y.outline_offset=0;
     x.outline_style=y.outline_style=0; /* outlines paint outside layout */
@@ -6274,7 +6276,7 @@ static bool transforms_equal(const struct css_transform *x, const struct css_tra
 static bool shadows_equal(const struct css_box_shadow *x, const struct css_box_shadow *y) {
     for (; x && y; x = x->next, y = y->next)
         if (x->x != y->x || x->y != y->y || x->blur != y->blur || x->spread != y->spread || x->color != y->color ||
-            x->inset != y->inset) return false;
+            x->inset != y->inset || !css_color_value_equal(x->color_value, y->color_value)) return false;
     return !x && !y;
 }
 static bool filters_equal(const struct css_filter *x, const struct css_filter *y) {
@@ -6304,7 +6306,8 @@ static bool gradients_equal(const struct gradient *x, const struct gradient *y) 
         x->to_x != y->to_x || x->to_y != y->to_y || x->rsize != y->rsize || x->angle != y->angle || x->n != y->n ||
         !css_length_equal(&x->at[0], &y->at[0]) || !css_length_equal(&x->at[1], &y->at[1])) return false;
     for (int i = 0; i < x->n; i++)
-        if (x->col[i] != y->col[i] || !css_length_equal(&x->pos[i], &y->pos[i])) return false;
+        if (x->col[i] != y->col[i] || !css_color_value_equal(x->col_value[i], y->col_value[i]) ||
+            !css_length_equal(&x->pos[i], &y->pos[i])) return false;
     return true;
 }
 static bool vars_equal(const struct custom_prop *x, const struct custom_prop *y) {
@@ -6338,7 +6341,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !equal_tracks(a->grid_auto_cols, b->grid_auto_cols) || !equal_tracks(a->grid_auto_rows, b->grid_auto_rows) ||
         !equal_areas(a->grid_areas, b->grid_areas) || !style_equal(a->before, b->before) ||
         !style_equal(a->after, b->after) || !style_equal(a->backdrop, b->backdrop) ||
-        !style_equal(a->placeholder, b->placeholder)) return false;
+        !style_equal(a->placeholder, b->placeholder) || !css_color_slots_equal(a, b) ||
+        !equal_string(a->color_scheme_text, b->color_scheme_text)) return false;
     for (int i = 0; i < 4; i++) if (!equal_string(a->grid_place[i].name, b->grid_place[i].name)) return false;
     style_t x = *a, y = *b;
     len_t *xl[] = {&x.object_pos[0], &x.object_pos[1], &x.line_height, &x.svg_stroke_width, &x.width, &x.height,
@@ -6370,6 +6374,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
+    x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;
     x.grid_cols = y.grid_cols = x.grid_rows = y.grid_rows = NULL;
     x.grid_auto_cols = y.grid_auto_cols = x.grid_auto_rows = y.grid_auto_rows = NULL;
     x.grid_areas = y.grid_areas = NULL;

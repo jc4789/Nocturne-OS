@@ -1115,7 +1115,8 @@ static void resolve_stops(const struct gradient *g, uint32_t cur, float len, str
     o->n = g->n;
     o->rep = g->repeating;
     for (int i = 0; i < g->n; i++) {
-        o->col[i] = g->col[i] == COLOR_CURRENT ? cur : g->col[i];
+        /* a stop that names currentcolor, alone or in an expression (color.c) */
+        o->col[i] = g->col[i] != COLOR_CURRENT ? g->col[i] : g->col_value[i] ? css_color_value_argb(g->col_value[i], cur) : cur;
         o->pos[i] = g->pos[i].kind == LK_AUTO ? NOPOS : len > 0 ? len_resolve(&g->pos[i], len) / len : 0;
     }
     if (o->pos[0] == NOPOS) o->pos[0] = 0;

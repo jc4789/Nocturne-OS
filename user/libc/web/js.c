@@ -1815,6 +1815,11 @@ static JSValue css_style_value(JSContext *ctx, const char *property,
         if(css_radius_specified(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
         sb_free(&text);
     }
+    {
+        sbuf text={0}; /* colours and color-scheme; CSS-wide keywords and var() stay authored */
+        if(css_specified_longhand(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
+        sb_free(&text);
+    }
     if (!strcasecmp(property,"box-shadow")) {
         sbuf serialized={0};
         if (css_shadow_specified(begin,(size_t)(end-begin),&serialized)) {
@@ -1946,6 +1951,7 @@ flushed:
     if(s->host.debug_js)s->task_layout_ms += uptime_ms() - start;
     web_avmedia_service(uptime_ms());
 }
+void web_js_flush_layout(web_doc *d) { if (d && d->js) flush_layout(d->js); }
 static JSValue rect_array(JSContext *ctx, double x, double y, double w, double h) {
     JSValue a = JS_NewArray(ctx);
     const double values[] = {x,y,w,h};
@@ -2309,18 +2315,17 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
             JSValue result = JS_NewStringLen(ctx, value.p, value.n);
             free(absolute); sb_free(&value); return result;
         }
-        uint32_t c = paint->color == COLOR_CURRENT ? st->color : paint->color;
-        computed_color_text(out,sizeof out,c);
-        return JS_NewString(ctx, out);
+        sbuf value = {0};
+        css_style_color_text(st, paint == &st->svg_fill ? CSS_SLOT_FILL : CSS_SLOT_STROKE, &value);
+        JSValue result = JS_NewStringLen(ctx, value.p ? value.p : "", value.n);
+        sb_free(&value); return result;
     }
-    uint32_t color = 0; bool is_color = false; float px = 0; bool is_px = false;
-    if (!strcmp(property, "color")) { color = st->color; is_color = true; }
-    else if (!strcmp(property, "background-color")) { color = st->bg_color; is_color = true; }
+    float px = 0; bool is_px = false;
     /* The layout engine currently resolves logical sides in horizontal LTR.
        Report that effective initial direction rather than an empty value:
        anchor controllers otherwise mistake the surface for RTL. This does
        not advertise RTL/bidi layout, which is not implemented yet. */
-    else if (!strcmp(property, "direction")) snprintf(out, sizeof out, "ltr");
+    if (!strcmp(property, "direction")) snprintf(out, sizeof out, "ltr");
     else if (!strcmp(property, "font-size")) { px = st->font_size; is_px = true; }
     /* CSSOM: normal, or the used value. */
     else if (!strcmp(property, "line-height")) {
@@ -2341,7 +2346,6 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     else if (!strcmp(property, "fill-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_fill_opacity);
     else if (!strcmp(property, "stroke-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stroke_opacity);
     else if (!strcmp(property, "stop-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stop_opacity);
-    else if (!strcmp(property, "stop-color")) { color = st->svg_stop_color == COLOR_CURRENT ? st->color : st->svg_stop_color; is_color = true; }
     else if (!strcmp(property, "stroke-width")) {
         if (st->svg_stroke_width.pct) snprintf(out, sizeof out, "%g%%", (double)st->svg_stroke_width.pct);
         else { px = st->svg_stroke_width.px; is_px = true; }
@@ -2427,15 +2431,13 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
             }
         }
     }
-    if (is_color) computed_color_text(out,sizeof out,color);
     if (is_px) snprintf(out, sizeof out, "%gpx", (double)px);
-    if (!is_color && !is_px && !out[0]) {
+    if (!is_px && !out[0]) {
         /* Every other longhand the property table stores whole. */
         sbuf text={0};
-        int kind=css_computed_longhand(st,property,&text,&color,d);
+        int kind=css_computed_longhand(st,property,&text,d);
         if(kind<0){sb_free(&text);return oom(ctx);}
-        if(kind==2)computed_color_text(out,sizeof out,color);
-        else if(kind==1){JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;}
+        if(kind==1){JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;}
         sb_free(&text);
     }
     return JS_NewString(ctx, out);
