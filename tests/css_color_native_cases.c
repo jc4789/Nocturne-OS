@@ -23,6 +23,8 @@ enum http_url_result http_canonical_owned_n(const char *r, size_t n, char **c, c
     (void)r; (void)n; (void)c; (void)o;
     return HTTP_URL_INVALID;
 }
+/* layout.c's, reached only from Geometry's matrix strings */
+void css_transform_list_matrix_3d(const struct css_transform *t, double m[16]) { (void)t; (void)m; abort(); }
 
 static char *field(char **p) {
     char *s = *p, *tab = strchr(s, '\t');
