@@ -1749,9 +1749,12 @@
         hover,
         customElementBefore(...args){
             const reactionArgs=args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')!==2?['remove',args[2]]:args;
-            const reactionNode=customElementsBridge.active()?(args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')===2?rawDom.get(args[2],'attrOwner'):reactionArgs[1]):null;
-            const ceActive=customElementsBridge.active()&&(['clone','import'].includes(args[0]) || reactionNode && rawDom.get(reactionNode,'scripting') || args[0]==='adopt' && rawDom.get(args[1],'scripting'));
-            const ce=ceActive?customElementsBridge.before(...args):null;
+            /* HTML and DOM choose custom element reactions by an element's registry and state
+               ("look up a custom element definition", insert, remove, adopt), never by whether
+               its document runs script: a document without a browsing context has a null
+               registry, yet a scoped registry's element inserted there joins that registry's
+               scoped document set and its define upgrades the element. */
+            const ce=customElementsBridge.active()?customElementsBridge.before(...args):null;
             let mutationArgs=reactionArgs;
             /* a move's live range and NodeIterator updates are those of a removal and insertion */
             if(args[0]==='move')mutationArgs=['insert',...args.slice(1)];

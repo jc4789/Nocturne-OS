@@ -5,8 +5,11 @@
    way dom.c and js.c keep them: -1 null, a positive number the agent's scoped registry, 0 a
    global registry recorded with its Window's Document; a never-assigned element slot is its node
    document's; reading another realm's global identity gives that realm's registry object
-   (host.customElementAgent's second argument). The DOM operations call the bridge's before/after
-   the way js.c's customElementBefore/After do. The cases follow WPT custom-elements/registries
+   (host.customElementAgent's second argument). The DOM operations (insert, importNode) call
+   js_bootstrap.js's own customElementBefore/customElementAfter hooks, read from that file, the way
+   js.c's native_dom_impl does; js.c's own gate (dom_synchronous_hooks) is not modeled: the hooks
+   run on every such operation. A document's "scripting" is whether it is a Window's Document
+   (web_js_enabled). importNode's copy follows dom.c's clone_registry. The cases follow WPT custom-elements/registries
    (Element-customElementRegistry, Document-createElement, CustomElementRegistry-initialize,
    scoped-registry-define-upgrade-criteria, scoped-registry-append, constructor-reentry-createElement,
    constructor-direct-call-fallback-registry). Not the guest browser, the native DOM or a WPT run.
@@ -15,6 +18,21 @@
 const fs = require('node:fs'), vm = require('node:vm'), crypto = require('node:crypto');
 const source = fs.readFileSync('user/libc/web/js_custom_elements.js', 'utf8');
 console.log('source_sha256=' + crypto.createHash('sha256').update(source).digest('hex'));
+// js_bootstrap.js's DOM operation hooks (host.customElementBefore/After), each method's text.
+const bootstrap = fs.readFileSync('user/libc/web/js_bootstrap.js', 'utf8');
+function method(text, head) {
+    const start = text.indexOf(head);
+    if (start < 0 || text.indexOf(head, start + 1) >= 0) throw new Error('one ' + head + ' expected');
+    let depth = 0;
+    for (let i = text.indexOf('{', start); i < text.length; i++) {
+        if (text[i] === '{') depth++;
+        else if (text[i] === '}' && !--depth) return text.slice(start, i + 1);
+    }
+    throw new Error('unterminated ' + head);
+}
+const hookSource = '({' + method(bootstrap, 'customElementBefore(...args){') + ',\n' +
+    method(bootstrap, 'customElementAfter(token,result){') + '})';
+console.log('hooks_sha256=' + crypto.createHash('sha256').update(hookSource).digest('hex'));
 const HTML = 'http://www.w3.org/1999/xhtml';
 
 let passed = 0, failed = 0;
@@ -70,6 +88,7 @@ function makeRawDom(realm) {
             case 'parentNode': return r.parent;
             case 'attributeNames': return [...r.attrs.keys()];
             case 'shadowRoot': return r.shadowRoot;
+            case 'scripting': return !!R(r.type === 9 ? node : r.owner).window;
             case 'elementBrand': if (r.type !== 1) throw new TypeError('Element receiver required'); return true;
             default: throw new Error('fake rawDom.get: ' + key);
             }
@@ -116,18 +135,42 @@ function makeRawDom(realm) {
     };
     return raw;
 }
-function insert(realm, parent, child) {
-    const bridge = realm.context.customElementsBridge;
+// A native DOM operation: js.c gives the hooks the operation's name and arguments, then its result.
+function operation(realm, args, native) {
+    const {customElementsBridge: bridge, ceHooks: hooks} = realm.context;
     return bridge.reactions(() => {
-        const token = bridge.before('insert', parent, child, null);
+        const token = hooks.customElementBefore(...args);
+        const result = native();
+        if (token !== null) hooks.customElementAfter(token, result);
+        return result;
+    });
+}
+function insert(realm, parent, child) {
+    return operation(realm, ['insert', parent, child, null], () => {
         const c = R(child), p = R(parent);
         if (c.parent) R(c.parent).children.splice(R(c.parent).children.indexOf(child), 1);
         const owner = p.type === 9 ? parent : p.owner;
         if (c.owner !== owner) shadowIncluding(child, n => { R(n).owner = owner; });
         c.parent = parent; p.children.push(child);
-        bridge.after(token, undefined);
         return child;
     });
+}
+// js_document.js importNode (fallbackRegistry: doc's registry) and dom.c doc_node_clone_registry
+// for elements: clone_registry gives the copy the source's registry, else the fallback; a global
+// one becomes doc's effective global registry.
+function importNode(realm, doc, node) {
+    const fallback = registrySlot(doc);
+    function clone(source) {
+        const s = R(source), slot = registrySlot(source);
+        const copy = wrapper(R(doc).realm, {type: 1, localName: s.localName, namespace: s.namespace, prefix: s.prefix, owner: doc, is: s.is});
+        let id = slot.id, where = slot.realm;
+        if (id === -1) { id = fallback.id; where = fallback.realm; }
+        if (id === 0 && fallback.id !== 0) { id = -1; where = null; } else if (id === 0) where = fallback.realm;
+        Object.assign(R(copy), {registry: id, registryRealm: id === 0 ? where : null});
+        for (const child of s.children) if (R(child).type === 1) { const made = clone(child); R(made).parent = copy; R(copy).children.push(made); }
+        return copy;
+    }
+    return operation(realm, ['import', doc, node, true, fallback.id], () => clone(node));
 }
 function attachShadow(host, registry) {
     const realm = R(host).realm;
@@ -158,8 +201,12 @@ function makeRealm(name) {
         class HTMLElement extends Element { constructor() { return customElementsBridge.construct(new.target); } }
         class HTMLUnknownElement extends HTMLElement {}
         class Document extends Node {}
+        class HTMLTemplateElement extends HTMLElement {}
         const apply = Reflect.apply;
         const attributeBridge = {mutation: () => null};
+        // The hooks' other bridges: native MutationObserver records, no live Range or NodeIterator.
+        const mutationBridge = {native: true}, rangeBridge = {active: () => false, after() {}};
+        const traversalBridge = {before: () => null, after() {}};
         const reflectedAttr = (node, key) => rawDom.attrNS(node, null, key);
         const report = e => reported.push(e);
         globalThis.Node = Node; globalThis.Element = Element; globalThis.HTMLElement = HTMLElement;
@@ -175,6 +222,7 @@ function makeRealm(name) {
     context.document = realm.document;
     realms.push(realm);
     vm.runInContext(source + '\nglobalThis.customElementsBridge = customElementsBridge;', context, {filename: 'js_custom_elements.js'});
+    context.ceHooks = vm.runInContext(hookSource, context, {filename: 'js_bootstrap.js hooks'});
     return realm;
 }
 const top = makeRealm('window'), frame = makeRealm('iframe');
@@ -188,6 +236,35 @@ function createElement(realm, doc, name, options) {
     return bridge.create(doc, name, HTML, null, is, true, registry);
 }
 const inertDocument = realm => wrapper(realm, {type: 9, window: false, registry: -1, html: true});
+// A document without a browsing context with its html and body (Document.parseHTMLUnsafe's).
+function parsedDocument(realm) {
+    const doc = inertDocument(realm);
+    const html = wrapper(realm, {type: 1, localName: 'html', namespace: HTML, owner: doc});
+    const body = wrapper(realm, {type: 1, localName: 'body', namespace: HTML, owner: doc});
+    R(html).parent = doc; R(doc).children.push(html);
+    R(body).parent = html; R(html).children.push(body);
+    return {doc, body};
+}
+/* importNode of a scoped registry's element into a document without a browsing context, then its
+   insertion there, then define (tests/js_parser_custom_cases.js): DOM "clone a single node" keeps the
+   scoped registry, "insert" appends the node document to its scoped document set, and HTML define
+   upgrades the element in each document of that set. js.c's DOM operations reach the bridge only
+   through customElementBefore, whatever the document's scripting. */
+function importedIntoParsedDocument(name, label) {
+    const registry = run(top, 'new CustomElementRegistry()');
+    const source = createElement(top, top.document, name, {customElementRegistry: registry});
+    const {doc, body} = parsedDocument(top);
+    const imported = importNode(top, doc, source);
+    check(T.customElementsBridge.registryFor(imported) === registry && R(imported).owner === doc, label + ': importNode keeps the scoped registry');
+    insert(top, body, imported);
+    T.importedClass = vm.runInContext('(class extends HTMLElement { constructor() { super(); this.fastImported = 13; } })', T);
+    check(!(imported instanceof T.importedClass), label + ': not upgraded before define');
+    registry.define(name, T.importedClass);
+    check(imported instanceof T.importedClass && imported.fastImported === 13, label + ': define upgrades it in a document without a browsing context');
+}
+// Before any definition of the agent: js.c's gate is ce_scoped_active alone.
+check(agentState.definitions === 0, 'no definition before the first import case');
+importedIntoParsedDocument('empty-imported', 'before any definition');
 
 // Window and Document registries.
 check(T.customElements instanceof T.CustomElementRegistry, 'customElements is a CustomElementRegistry');
@@ -326,6 +403,10 @@ check(T.customElementsBridge.registryFor(frameScoped) === scoped, 'the same scop
     check(top.reported.length === before + 1 && top.reported[before].name === 'NotSupportedError', 'the other document result is reported');
     check(element instanceof T.HTMLUnknownElement && T.customElementsBridge.registryFor(element) === registry, 'the failed element is HTMLUnknownElement with the registry');
 }
+
+// The same with the agent's definitions in place (js.c's gate: ce_hooks_active).
+check(agentState.definitions > 0, 'definitions before the second import case');
+importedIntoParsedDocument('late-imported', 'with definitions');
 
 console.log(`custom element registries: ${passed} passed, ${failed} failed`);
 process.exitCode = failed ? 1 : 0;
