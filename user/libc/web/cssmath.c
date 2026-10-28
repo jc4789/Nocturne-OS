@@ -1266,6 +1266,23 @@ bool css_calc_specified(const char *s, size_t n, unsigned accept, sbuf *out) {
             if (p < e) p++;
             continue;
         }
+        if (c == '#') { for (p++; p < e && name_char((unsigned char)*p); p++) {} continue; } /* a hash, not a number */
+        /* a number, percentage or dimension outside a math function serializes as CSSOM's "serialize a
+           CSS component value" does (.5em is 0.5em, -0 is 0, +5.0E1PX is 50px); an unknown unit's as written */
+        if (number_start(p, e) && !(p > s && (name_char((unsigned char)p[-1]) || p[-1] == '.'))) {
+            const char *token = p, *unit;
+            size_t unit_n;
+            double v;
+            if (!css_numeric_token(&p, e, &v, &unit, &unit_n)) { p++; continue; }
+            int u = css_unit_find(unit, unit_n);
+            if (u < 0 || !isfinite(v)) continue;
+            put(&o, copied, (size_t)(token - copied));
+            put_number(&o, v);
+            puts_(&o, units[u].name);
+            any = true;
+            copied = p;
+            continue;
+        }
         if (!ident_start(p, e) || (p > s && name_char((unsigned char)p[-1]))) { p++; continue; }
         const char *name = p;
         while (p < e && name_char((unsigned char)*p)) p++;

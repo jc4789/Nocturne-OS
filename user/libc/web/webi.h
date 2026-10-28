@@ -410,8 +410,9 @@ bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *ke
    caller's to clamp. a: the parse's memory (NULL: scratch); *kind: the type it is */
 bool css_numeric_read(const char *s, size_t n, unsigned accept, const struct cx *cx, arena_t *a, double basis, double *out,
                       unsigned *kind);
-/* text whose math functions are each serialized as a specified value (§10.13), the rest as written;
-   false: none, or a value with var() */
+/* text whose math functions are each serialized as a specified value (§10.13) and whose numbers,
+   percentages and dimensions outside them as CSSOM's component values (0.5em, not .5em), the rest as
+   written; false: neither in it, or a value with var() */
 bool css_calc_specified(const char *s, size_t n, unsigned accept, sbuf *out);
 struct css_corner_radius { len_t axis[2]; }; /* x resolves against width, y against height */
 struct style;
