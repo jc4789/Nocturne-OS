@@ -98,8 +98,13 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
     }
     if(text && !page)log_text(s,2,"Frame blob text document allocation failed");
     bool made=page!=NULL;
+    /* The Blob's type is the response's Content-Type: its charset labels the bytes. An unlabeled
+       HTML Blob is sniffed (its container document is same origin); the text page is UTF-8. */
+    char charset[64]={0};
+    html_transport_label(mime,charset,sizeof charset);
+    if(!html && !charset[0])memcpy(charset,"utf-8",6);
     struct web_host host=frame_host(s,NULL);
-    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,"utf-8",&host,true);
+    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,charset,&host,true);
     free(page);js_free(s->ctx,body);f->navigation_owner=NULL;
     if(text && !made){f->failed=true;return;}
     html=html || made;
