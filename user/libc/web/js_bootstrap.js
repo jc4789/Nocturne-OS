@@ -497,6 +497,7 @@
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return domGet(this,'localName'); }
         get namespaceURI() { return domGet(this,'namespaceURI'); }
+        get prefix() { return domGet(this,'prefix'); }
         get id() { return reflectedAttr(this,'id') || ''; }
         set id(v) { reflectedAttr(this,'id',String(v)); }
         get className() { return reflectedAttr(this,'class') || ''; }
@@ -534,7 +535,12 @@
         querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
         matches(selector) { return dom('matches',this,String(selector)); }
         closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
-        getElementsByTagName(name) { const query=String(name)==='*'?'*':CSS.escape(String(name));return collectionBridge.domHTML(this,()=>dom('query',this,query,false)); }
+        getElementsByTagName(name) { name=String(name);return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,name)); }
+        getElementsByTagNameNS(namespace,localName) {
+            if(arguments.length<2)throw new TypeError('Namespace and local name are required');
+            namespace=namespace==null?null:String(namespace);localName=String(localName);
+            return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,namespace===''?null:namespace,localName,true));
+        }
         getElementsByClassName(names) { const query=String(names).trim().split(/\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query?dom('query',this,query,false):[]); }
         getBoundingClientRect() { rawDom.get(this,'elementBrand');return observerBridge.clientBoundingRect(dom('rect',this)); }
         getClientRects() { return observerBridge.clientRects(dom('rect',this,true)); }
@@ -764,8 +770,16 @@
     Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
     for(const [name,value] of [['DISCONNECTED',1],['PRECEDING',2],['FOLLOWING',4],['CONTAINS',8],['CONTAINED_BY',16],['IMPLEMENTATION_SPECIFIC',32]])
         for(const target of [Node,Node.prototype])Object.defineProperty(target,'DOCUMENT_POSITION_'+name,{value,enumerable:true});
-    class Document extends Node {}
-    class HTMLDocument extends Document {}
+    // DOM "new Document()": an XML document of this realm whose content type
+    // is application/xml; it implements Document, not XMLDocument.
+    class Document extends Node {
+        constructor(){
+            const made=rawDom.documentCreate(null,'application/xml',false),proto=new.target.prototype;
+            if(proto!==Document.prototype)Object.setPrototypeOf(made,proto);
+            return made;
+        }
+    }
+    class HTMLDocument extends Document { constructor(){throw new TypeError('Illegal HTMLDocument constructor');} }
     function characterDataBrand(node){
         const type=rawDom.get(node,'nodeType');if(type!==3 && type!==4 && type!==7 && type!==8)throw new TypeError('Illegal CharacterData receiver');
     }
@@ -818,9 +832,9 @@
             return parts.join('');
         }
     }
-    // CDATASection is an exposed Text-derived interface even in an HTML realm.
-    // HTML documents cannot create CDATA nodes; do not alias it to Text or
-    // advertise an XML parser that the native document model does not have.
+    // CDATASection is an exposed Text-derived interface even in an HTML realm:
+    // a native text node of an XML document's CDATA section (createCDATASection,
+    // the XML parser), never an alias of Text.
     class CDATASection extends Text {
         constructor(){throw new TypeError('Illegal CDATASection constructor');}
     }
@@ -874,7 +888,7 @@
     // ParentNode is shared, but attributes and matching belong only to elements.
     const parentMembers = ['children','firstElementChild','lastElementChild','childElementCount',
         'append','prepend','replaceChildren','querySelector','querySelectorAll'];
-    copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByClassName']));
+    copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByTagNameNS','getElementsByClassName']));
     copyElementMembers(DocumentFragment.prototype, parentMembers);
     copyElementMembers(CharacterData.prototype, ['nextElementSibling','previousElementSibling','remove','before','after','replaceWith']);
     copyElementMembers(DocumentType.prototype, ['replaceWith']);
@@ -896,23 +910,6 @@
     });
     document.getElementById=id=>dom('id',document,String(id));
     document.getElementsByName=name=>{const query='[name="'+CSS.escape(String(name))+'"]';return collectionBridge.domLive(document,()=>dom('query',document,query,false));};
-    document.createElement=(name,options)=>customElementsBridge.create(name,options);
-    document.createElementNS=function(ns,name,options=undefined){
-        if(arguments.length<2)throw new TypeError('Namespace and qualified name are required');
-        ns=ns===null || ns===undefined?null:elementURL.string(ns);if(ns==='')ns=null;
-        name=elementURL.string(name);
-        if(ns===null){
-            const colon=name.indexOf(':'),prefix=colon<0?null:name.slice(0,colon),local=colon<0?name:name.slice(colon+1);
-            if(prefix!==null && (!prefix || /[\0\t\n\f\r />]/.test(prefix)) ||
-               !/^(?:[A-Za-z][^\0\t\n\f\r />]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9_.:\-\u0080-\u{10FFFF}]*)$/u.test(local))
-                throw new DOMException('Invalid element name','InvalidCharacterError');
-            if(prefix!==null || name==='xmlns')throw new DOMException('A prefix requires a namespace','NamespaceError');
-            return dom('create',null,1,name,'',null);
-        }
-        if(ns==='http://www.w3.org/1999/xhtml')return customElementsBridge.create(name,options,true);
-        if(ns!=='http://www.w3.org/2000/svg')throw new DOMException('Unsupported namespace','NotSupportedError');
-        return dom('create',null,1,name,'',true);
-    };
     document.createTextNode=text=>dom('create',null,3,'#text',String(text));
     document.createComment=text=>dom('create',null,8,'#comment',String(text));
     document.createDocumentFragment=()=>dom('create',null,11,'#document-fragment','');
@@ -1414,7 +1411,8 @@
             HTMLModElement.prototype,HTMLUListElement.prototype,HTMLDListElement.prototype,HTMLDirectoryElement.prototype,
             HTMLLegendElement.prototype,HTMLOptGroupElement.prototype,HTMLMapElement.prototype,HTMLEmbedElement.prototype,
             HTMLParamElement.prototype,HTMLFontElement.prototype,HTMLFrameSetElement.prototype,HTMLMarqueeElement.prototype,
-            ...htmlTablesBridge.nodeProtos,svgBridge.groupProto],
+            ...htmlTablesBridge.nodeProtos,svgBridge.groupProto,
+            documentBridge.xmlDocumentPrototype,Document.prototype,CDATASection.prototype],
         dispatch:nativeDispatch,
         // js_webaudio.js, run apart when the page first touches a Web Audio interface.
         webaudioBridge:{host,Event,EventTarget,DOMException,eventState,dispatch,handlerValue,setHandler,Promise,
