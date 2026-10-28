@@ -185,7 +185,9 @@ struct mcond {
     bool container;
 };
 
-struct font_source {const char *url;struct font_source *next;};
+/* resource: a FontFace's own source, resolved when its source was set (the
+   document owns it); NULL for an @font-face rule, found by url on demand. */
+struct font_source {const char *url;struct font_source *next;struct web_font_resource *resource;};
 struct font_face {
     const char *family;
     struct font_source *sources;
@@ -196,6 +198,24 @@ struct font_face {
     const struct mcond *media;
     struct font_face *next;
     const struct css_layer_decl *layer;
+    /* CSS Font Loading: the FontFace identity (never reused), the CSSOM
+       serialization of each descriptor (enum css_font_descriptor) its
+       attributes reflect, and the FontFace record when no rule owns it. */
+    uint64_t id;
+    const char *desc[CSS_FONT_DESCRIPTORS];
+    struct css_font_face *author;
+};
+/* A FontFace the page constructed (CSS Font Loading 2.1). Its JS wrapper holds
+   one reference and every document font source (document.fonts) holding it
+   another; selection reads it only through those documents' author_fonts. */
+struct css_font_face {
+    struct font_face face;
+    unsigned refs;
+    bool started; /* load() or a rendering use: as if load() had been called */
+    char *names[CSS_FONT_DESCRIPTORS]; /* face.desc's malloc storage */
+    char *family;                      /* the literal family name it matches */
+    struct web_font_range *ranges;     /* face.ranges, sorted and merged */
+    struct web_font_resource *data;    /* decoded BufferSource, document-owned */
 };
 
 /* Immutable syntax identities. Resolved layer ordering belongs to each
@@ -1968,53 +1988,316 @@ static struct font_source *font_sources(struct pctx *pc,const char *s,const char
     }
     return first;
 }
+/* ---------------------------------------------------------------- @font-face descriptors
+   CSS Fonts 4 descriptor grammar (https://drafts.csswg.org/css-fonts-4/#font-face-rule),
+   parsed once for both a face's matching fields and the CSSOM serialization
+   that the CSS Font Loading FontFace attributes reflect. A rule and a FontFace
+   setter use the same parser, so `font-feature-settings: "smcp" off` and
+   face.featureSettings = "'smcp' off" both read back `"smcp" 0`. */
+struct font_desc {
+    unsigned weight_lo,weight_hi;
+    bool italic;
+    struct web_font_range *ranges; /* malloc: sorted and merged; NULL with 0: U+0-10FFFF */
+    size_t range_count;
+};
 static int font_range_compare(const void *a,const void *b) {
     const struct web_font_range *x=a,*y=b;
     return x->first<y->first?-1:x->first>y->first?1:x->last<y->last?-1:x->last>y->last;
 }
-static bool parse_font_ranges(arena_t *a,const char *s,const char *end,
-                              const struct web_font_range **out,size_t *count) {
+/* <urange>#, each range as written (malloc). 1, 0 syntax error, -1 allocator. */
+static int font_ranges_parse(const char *s,const char *end,struct web_font_range **out,size_t *count) {
     struct web_font_range *ranges=NULL;size_t n=0,capacity=0;
+    *out=NULL;*count=0;
     for(;;){
         s=skip_ws(s,end);
-        if(end-s<3 || (*s!='u'&&*s!='U') || s[1]!='+')return false;
+        if(end-s<3 || (*s!='u'&&*s!='U') || s[1]!='+')goto invalid;
         s+=2;uint32_t lo=0,hi=0;unsigned digits=0,wildcards=0;
         while(s<end && (isxdigit((unsigned char)*s)||*s=='?')){
-            if(++digits>6)return false;
+            if(++digits>6)goto invalid;
             if(*s=='?'){wildcards++;lo<<=4;hi=(hi<<4)|15;}
-            else {if(wildcards)return false;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;lo=(lo<<4)|v;hi=(hi<<4)|v;}
+            else {if(wildcards)goto invalid;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;lo=(lo<<4)|v;hi=(hi<<4)|v;}
             s++;
         }
-        if(!digits)return false;
+        if(!digits)goto invalid;
         if(s<end&&*s=='-'){
-            if(wildcards)return false;s++;hi=0;unsigned d=0;
+            if(wildcards)goto invalid;s++;hi=0;unsigned d=0;
             while(s<end&&isxdigit((unsigned char)*s)){
-                if(++d>6)return false;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;hi=(hi<<4)|v;s++;
+                if(++d>6)goto invalid;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;hi=(hi<<4)|v;s++;
             }
-            if(!d)return false;
+            if(!d)goto invalid;
         }
-        if(lo>hi||lo>0x10ffff)return false;hi=MIN(hi,0x10ffffu);
+        if(lo>hi||lo>0x10ffff)goto invalid;hi=MIN(hi,0x10ffffu);
         if(n==capacity){
             size_t cap=capacity?capacity*2:8;
-            if(cap<capacity||cap>SIZE_MAX/sizeof *ranges){ar_alloc(a,SIZE_MAX);return false;}
-            struct web_font_range *next=ar_alloc(a,cap*sizeof *next);
-            if(n)memcpy(next,ranges,n*sizeof *next);ranges=next;capacity=cap;
+            void *next=cap>capacity&&cap<=SIZE_MAX/sizeof *ranges?realloc(ranges,cap*sizeof *ranges):NULL;
+            if(!next){free(ranges);return -1;}
+            ranges=next;capacity=cap;
         }
         ranges[n++]=(struct web_font_range){lo,hi};s=skip_ws(s,end);
         if(s==end)break;
-        if(*s++!=',')return false;
+        if(*s++!=',')goto invalid;
     }
-    qsort(ranges,n,sizeof *ranges,font_range_compare);
-    size_t merged=0;
+    *out=ranges;*count=n;return 1;
+invalid:
+    free(ranges);return 0;
+}
+/* Matching wants sorted, merged ranges; one covering every code point is no
+   restriction at all, and is selected as an ordinary face. */
+static void font_ranges_merge(struct web_font_range **ranges,size_t *count) {
+    struct web_font_range *r=*ranges;size_t n=*count,merged=0;
+    qsort(r,n,sizeof *r,font_range_compare);
     for(size_t i=0;i<n;i++){
-        if(merged&&ranges[i].first<=ranges[merged-1].last+1)ranges[merged-1].last=MAX(ranges[merged-1].last,ranges[i].last);
-        else ranges[merged++]=ranges[i];
+        if(merged&&r[i].first<=r[merged-1].last+1)r[merged-1].last=MAX(r[merged-1].last,r[i].last);
+        else r[merged++]=r[i];
     }
-    *out=ranges;*count=merged;return true;
+    if(merged==1&&r[0].first==0&&r[0].last>=0x10ffff){free(r);*ranges=NULL;merged=0;}
+    *count=merged;
+}
+/* A keyword (lowercased, at most 31 bytes, without escapes), or false. */
+static bool fd_keyword(const char **ps,const char *e,char word[32]) {
+    const char *s=*ps;size_t n=0;
+    if(s>=e || isdigit((unsigned char)*s) || !ident_char((unsigned char)*s))return false;
+    if(*s=='-' && s+1<e && (isdigit((unsigned char)s[1]) || s[1]=='.'))return false;
+    while(s<e && ident_char((unsigned char)*s)){if(n==31)return false;word[n++]=(char)lower((unsigned char)*s++);}
+    if(s<e && (*s=='(' || *s=='\\'))return false;
+    word[n]=0;*ps=s;return true;
+}
+/* A number, percentage or dimension token: its value, whether it is an
+   <integer>, and its unit ("", "%" or a lowercase identifier). */
+static bool fd_number(const char **ps,const char *e,double *value,bool *integer,char unit[8]) {
+    const char *s=*ps,*start=s;bool digits=false,point=false,exponent=false;
+    if(s<e && (*s=='+' || *s=='-'))s++;
+    while(s<e && isdigit((unsigned char)*s)){s++;digits=true;}
+    if(s+1<e && *s=='.' && isdigit((unsigned char)s[1])){point=digits=true;s++;while(s<e && isdigit((unsigned char)*s))s++;}
+    if(!digits)return false;
+    if(s<e && (*s=='e' || *s=='E')){
+        const char *t=s+1;if(t<e && (*t=='+' || *t=='-'))t++;
+        if(t<e && isdigit((unsigned char)*t)){exponent=true;s=t;while(s<e && isdigit((unsigned char)*s))s++;}
+    }
+    char text[64];size_t n=(size_t)(s-start);if(n>=sizeof text)return false;
+    memcpy(text,start,n);text[n]=0;*value=strtod(text,NULL);
+    if(!isfinite(*value))return false;
+    *integer=!point && !exponent;unit[0]=0;
+    if(s<e && *s=='%'){unit[0]='%';unit[1]=0;s++;}
+    else if(s<e && ident_char((unsigned char)*s)){
+        size_t k=0;
+        while(s<e && ident_char((unsigned char)*s)){if(k==7)return false;unit[k++]=(char)lower((unsigned char)*s++);}
+        unit[k]=0;
+    }
+    if(s<e && (*s=='(' || *s=='\\'))return false;
+    *ps=s;return true;
+}
+static void fd_put_number(sbuf *b,double v) {char t[32];snprintf(t,sizeof t,"%.6g",v==0?0.0:v);sb_puts(b,t);}
+static bool fd_string(const char **ps,const char *e,sbuf *out) {
+    const char *s=*ps;
+    if(s>=e || (*s!='"' && *s!='\''))return false;
+    char quote=*s++;const char *begin=s;
+    while(s<e && *s!=quote){if(*s=='\n')return false;if(*s=='\\' && s+1<e)s++;s++;}
+    if(s>=e)return false;
+    css_unescape(out,begin,(size_t)(s-begin));*ps=s+1;return true;
+}
+/* CSSOM "serialize a string". */
+static void fd_put_string(sbuf *b,const char *s,size_t n) {
+    sb_putc(b,'"');
+    for(size_t i=0;i<n;i++){
+        unsigned char c=(unsigned char)s[i];
+        if(!c){sb_puts(b,"\xEF\xBF\xBD");continue;}
+        if(c<0x20 || c==0x7f){char t[8];snprintf(t,sizeof t,"\\%x ",c);sb_puts(b,t);continue;}
+        if(c=='"' || c=='\\')sb_putc(b,'\\');
+        sb_putc(b,(char)c);
+    }
+    sb_putc(b,'"');
+}
+/* A family name serializes as identifiers when it is a sequence of them, one
+   space apart, that is no generic family or CSS-wide keyword; otherwise as a
+   string ("sans-serif", "a  b", "content:Segoe UI" are quoted). */
+static bool fd_family_identifiers(const char *s,size_t n) {
+    static const char *const reserved[]={"inherit","initial","unset","revert","revert-layer","default",
+        "serif","sans-serif","cursive","fantasy","monospace","system-ui","emoji","math","fangsong",
+        "ui-serif","ui-sans-serif","ui-monospace","ui-rounded",NULL};
+    if(!n || memchr(s,0,n))return false;
+    if(!memchr(s,' ',n))for(int i=0;reserved[i];i++)if(strlen(reserved[i])==n && strn_ieq(s,reserved[i],n))return false;
+    for(const char *w=s,*e=s+n;;){
+        const char *end=memchr(w,' ',(size_t)(e-w));if(!end)end=e;
+        if(end==w)return false; /* leading, trailing or doubled space */
+        unsigned char c=(unsigned char)*w;
+        if(isdigit(c) || !ident_char(c) || (c=='-' && (end-w==1 || isdigit((unsigned char)w[1]))))return false;
+        for(const char *p=w;p<end;p++)if(!ident_char((unsigned char)*p))return false;
+        if(end==e)return true;
+        w=end+1;
+    }
+}
+static void fd_put_family(sbuf *b,const char *name,size_t n) {
+    if(fd_family_identifiers(name,n))sb_put(b,name,n);else fd_put_string(b,name,n);
+}
+static bool fd_tag(const sbuf *tag) {
+    if(tag->n!=4)return false;
+    for(size_t i=0;i<4;i++)if((unsigned char)tag->p[i]<0x20 || (unsigned char)tag->p[i]>0x7e)return false;
+    return true;
+}
+/* `normal`, or a list of <opentype-tag> with an integer, on/off (features) or
+   a number (variations) after each. */
+static int fd_tag_list(const char *s,const char *e,sbuf *out,bool features) {
+    char word[32];double x;bool integer;char unit[8];
+    const char *t=s;
+    if(fd_keyword(&t,e,word)){
+        if(strcmp(word,"normal") || skip_ws(t,e)!=e)return 0;
+        sb_puts(out,"normal");return 1;
+    }
+    for(bool first=true;;first=false){
+        sbuf tag={0};t=skip_ws(s,e);
+        if(!fd_string(&t,e,&tag) || !fd_tag(&tag)){sb_free(&tag);return 0;}
+        if(!first)sb_puts(out,", ");
+        fd_put_string(out,tag.p,tag.n);sb_free(&tag);
+        const char *u=skip_ws(t,e);double value=1;
+        if(features){
+            if(u<e && *u!=','){
+                if(fd_keyword(&u,e,word)){
+                    if(!strcmp(word,"on"))value=1;else if(!strcmp(word,"off"))value=0;else return 0;
+                }else if(!fd_number(&u,e,&x,&integer,unit) || unit[0] || !integer || x<0)return 0;
+                else value=x;
+                t=u;
+            }
+            if(value!=1){sb_putc(out,' ');fd_put_number(out,value);}
+        }else{
+            if(!fd_number(&u,e,&x,&integer,unit) || unit[0])return 0;
+            sb_putc(out,' ');fd_put_number(out,x);t=u;
+        }
+        t=skip_ws(t,e);
+        if(t==e)return 1;
+        if(*t!=',')return 0;
+        s=t+1;
+    }
+}
+/* One or two of normal, the keywords in names, or a non-negative percentage
+   (font-width, the metrics overrides); auto alone where allowed. */
+static int fd_percentages(const char *s,const char *e,sbuf *out,const char *const *names,int most,bool automatic) {
+    char word[32];double x;bool integer;char unit[8];int count=0;
+    for(;;){
+        const char *t=skip_ws(s,e);
+        if(t==e)break;
+        if(count==most || (count && t==s))return 0;
+        if(count)sb_putc(out,' ');
+        if(fd_keyword(&t,e,word)){
+            if(automatic && !count && !strcmp(word,"auto") && skip_ws(t,e)==e){sb_puts(out,word);return 1;}
+            bool known=false;
+            for(int i=0;names&&names[i];i++)if(!strcmp(word,names[i]))known=true;
+            if(!known)return 0;
+            sb_puts(out,word);
+        }else{
+            if(!fd_number(&t,e,&x,&integer,unit) || strcmp(unit,"%") || x<0)return 0;
+            fd_put_number(out,x);sb_putc(out,'%');
+        }
+        count++;s=t;
+    }
+    return count>0;
+}
+/* 1: valid, the serialization appended to out and matching fields in m (if
+   any); 0: syntax error (out is then garbage); -1: allocator. Not the family:
+   a rule parses <family-name>, a FontFace takes its literal name. */
+static int font_desc_parse(enum css_font_descriptor which,const char *v,size_t length,sbuf *out,struct font_desc *m) {
+    static const char *const normal[]={"normal",NULL};
+    static const char *const widths[]={"normal","ultra-condensed","extra-condensed","condensed","semi-condensed",
+        "semi-expanded","expanded","extra-expanded","ultra-expanded",NULL};
+    const char *s=skip_ws(v,v+length),*e=v+length;trim_r(s,&e);
+    char word[32];double x;bool integer;char unit[8];
+    if(s==e)return 0;
+    switch(which){
+    case CSS_FONT_STYLE: {
+        if(!fd_keyword(&s,e,word))return 0;
+        bool oblique=!strcmp(word,"oblique");
+        if(!oblique && strcmp(word,"auto") && strcmp(word,"normal") && strcmp(word,"italic"))return 0;
+        sb_puts(out,word);
+        if(m)m->italic=oblique || !strcmp(word,"italic");
+        for(int angles=0;oblique && skip_ws(s,e)<e;angles++){
+            const char *t=skip_ws(s,e);
+            if(angles==2 || t==s || !fd_number(&t,e,&x,&integer,unit))return 0;
+            double degrees=!strcmp(unit,"deg")?x:!strcmp(unit,"grad")?x*0.9:!strcmp(unit,"rad")?x*57.29577951308232:
+                           !strcmp(unit,"turn")?x*360:NAN;
+            if(!(degrees>=-90 && degrees<=90))return 0;
+            sb_putc(out,' ');fd_put_number(out,x);sb_puts(out,unit);s=t;
+        }
+        return skip_ws(s,e)==e;
+    }
+    case CSS_FONT_WEIGHT: {
+        unsigned weights[2]={400,400};int count=0;
+        for(;;){
+            const char *t=skip_ws(s,e);
+            if(t==e)break;
+            if(count==2 || (count && t==s))return 0;
+            if(count)sb_putc(out,' ');
+            if(fd_keyword(&t,e,word)){
+                if(!count && !strcmp(word,"auto") && skip_ws(t,e)==e){sb_puts(out,word);if(m)m->weight_lo=m->weight_hi=400;return 1;}
+                if(!strcmp(word,"normal"))weights[count]=400;else if(!strcmp(word,"bold"))weights[count]=700;else return 0;
+                sb_puts(out,word);
+            }else{
+                if(!fd_number(&t,e,&x,&integer,unit) || unit[0] || !(x>=1 && x<=1000))return 0;
+                weights[count]=(unsigned)(x+0.5);fd_put_number(out,x);
+            }
+            count++;s=t;
+        }
+        if(!count)return 0;
+        /* A reversed range is swapped where it is used (CSS Fonts 4 4.5). */
+        if(m){m->weight_lo=MIN(weights[0],weights[count-1]);m->weight_hi=MAX(weights[0],weights[count-1]);}
+        return 1;
+    }
+    case CSS_FONT_WIDTH: return fd_percentages(s,e,out,widths,2,true);
+    case CSS_FONT_UNICODE_RANGE: {
+        struct web_font_range *ranges;size_t count;
+        int status=font_ranges_parse(s,e,&ranges,&count);
+        if(status<=0)return status;
+        for(size_t i=0;i<count;i++){
+            char t[40];
+            if(ranges[i].first==ranges[i].last)snprintf(t,sizeof t,"%sU+%X",i?", ":"",(unsigned)ranges[i].first);
+            else snprintf(t,sizeof t,"%sU+%X-%X",i?", ":"",(unsigned)ranges[i].first,(unsigned)ranges[i].last);
+            sb_puts(out,t);
+        }
+        if(m){font_ranges_merge(&ranges,&count);m->ranges=ranges;m->range_count=count;}else free(ranges);
+        return 1;
+    }
+    case CSS_FONT_FEATURE_SETTINGS: return fd_tag_list(s,e,out,true);
+    case CSS_FONT_VARIATION_SETTINGS: return fd_tag_list(s,e,out,false);
+    case CSS_FONT_DISPLAY: {
+        static const char *const displays[]={"auto","block","swap","fallback","optional",NULL};
+        if(!fd_keyword(&s,e,word) || skip_ws(s,e)!=e)return 0;
+        for(int i=0;displays[i];i++)if(!strcmp(word,displays[i])){sb_puts(out,word);return 1;}
+        return 0;
+    }
+    case CSS_FONT_ASCENT_OVERRIDE: case CSS_FONT_DESCENT_OVERRIDE: case CSS_FONT_LINE_GAP_OVERRIDE:
+        return fd_percentages(s,e,out,normal,2,false);
+    case CSS_FONT_SIZE_ADJUST: return fd_percentages(s,e,out,NULL,1,false);
+    default: return 0;
+    }
+}
+/* Initial values: the FontFaceDescriptors defaults, as a rule without the
+   descriptor also reads (CSS Font Loading 2.1). */
+static const char *const font_desc_initial[CSS_FONT_DESCRIPTORS]={
+    [CSS_FONT_FAMILY]="",[CSS_FONT_STYLE]="normal",[CSS_FONT_WEIGHT]="normal",[CSS_FONT_WIDTH]="normal",
+    [CSS_FONT_UNICODE_RANGE]="U+0-10FFFF",[CSS_FONT_FEATURE_SETTINGS]="normal",[CSS_FONT_VARIATION_SETTINGS]="normal",
+    [CSS_FONT_DISPLAY]="auto",[CSS_FONT_ASCENT_OVERRIDE]="normal",[CSS_FONT_DESCENT_OVERRIDE]="normal",
+    [CSS_FONT_LINE_GAP_OVERRIDE]="normal",[CSS_FONT_SIZE_ADJUST]="100%"
+};
+static uint64_t font_face_serials;
+int css_font_descriptor(enum css_font_descriptor which,const char *value,size_t n,char **serialized) {
+    *serialized=NULL;
+    if((unsigned)which>=CSS_FONT_DESCRIPTORS)return 0;
+    sbuf out={0};int status=1;
+    if(which==CSS_FONT_FAMILY)fd_put_family(&out,value,n);
+    else status=font_desc_parse(which,value,n,&out,NULL);
+    if(status>0)*serialized=sb_cstr(&out);else sb_free(&out);
+    return status;
 }
 static void parse_font_face(struct pctx *pc,const char *s,const char *e,const struct mcond *media) {
+    static const struct {const char *name;enum css_font_descriptor which;} names[]={
+        {"font-style",CSS_FONT_STYLE},{"font-weight",CSS_FONT_WEIGHT},{"font-stretch",CSS_FONT_WIDTH},
+        {"font-width",CSS_FONT_WIDTH},{"unicode-range",CSS_FONT_UNICODE_RANGE},
+        {"font-feature-settings",CSS_FONT_FEATURE_SETTINGS},{"font-variation-settings",CSS_FONT_VARIATION_SETTINGS},
+        {"font-display",CSS_FONT_DISPLAY},{"ascent-override",CSS_FONT_ASCENT_OVERRIDE},
+        {"descent-override",CSS_FONT_DESCENT_OVERRIDE},{"line-gap-override",CSS_FONT_LINE_GAP_OVERRIDE},
+        {"size-adjust",CSS_FONT_SIZE_ADJUST}};
     struct font_face *f=ar_alloc(pc->a,sizeof *f);memset(f,0,sizeof *f);
     f->weight_lo=f->weight_hi=400;f->media=media;f->layer=pc->layer;
+    for(int i=0;i<CSS_FONT_DESCRIPTORS;i++)f->desc[i]=font_desc_initial[i];
     while(s<e) {
         const char *end=scan_to(s,e,";"),*colon=scan_to(s,end,":"),*name_end=colon;
         const char *name=skip_ws(s,name_end);trim_r(name,&name_end);
@@ -2023,33 +2306,38 @@ static void parse_font_face(struct pctx *pc,const char *s,const char *e,const st
             size_t n=(size_t)(name_end-name);
             if(n==11 && strn_ieq(name,"font-family",n)) {
                 const char *cursor=value,*family=css_font_family_next(pc->a,&cursor,ve);
-                if(family && cursor==ve)f->family=family;
+                if(family && cursor==ve){
+                    f->family=family;
+                    sbuf b={0};fd_put_family(&b,family,strlen(family));
+                    f->desc[CSS_FONT_FAMILY]=ar_strndup(pc->a,b.p?b.p:"",b.n);sb_free(&b);
+                }
             } else if(n==3 && strn_ieq(name,"src",n)) {
                 struct font_source *sources=font_sources(pc,value,ve);
                 /* A list without any supported component is a parse error,
                    not a valid empty override of an earlier src descriptor. */
                 if(sources)f->sources=sources;
-            }
-            else if(n==13 && strn_ieq(name,"unicode-range",n)){
-                const struct web_font_range *ranges;size_t count;
-                if(parse_font_ranges(pc->a,value,ve,&ranges,&count)){f->ranges=ranges;f->range_count=count;}
-            }
-            else if(n==10 && strn_ieq(name,"font-style",n))f->italic=(ve-value>=6 && strn_ieq(value,"italic",6)) || (ve-value>=7 && strn_ieq(value,"oblique",7));
-            else if(n==11 && strn_ieq(name,"font-weight",n)) {
-                if(ve-value==6 && strn_ieq(value,"normal",6))f->weight_lo=f->weight_hi=400;
-                else if(ve-value==4 && strn_ieq(value,"bold",4))f->weight_lo=f->weight_hi=700;
-                else {
-                    char *text=ar_strndup(pc->a,value,(size_t)(ve-value)),*tail;
-                    unsigned long lo=strtoul(text,&tail,10),hi=lo;
-                    if(tail!=text){while(is_space((unsigned char)*tail))tail++;if(*tail)hi=strtoul(tail,&tail,10);
-                        while(is_space((unsigned char)*tail))tail++;
-                        if(!*tail && lo>=1 && lo<=1000 && hi>=lo && hi<=1000){f->weight_lo=(unsigned)lo;f->weight_hi=(unsigned)hi;}}
+            } else for(size_t i=0;i<sizeof names/sizeof *names;i++) {
+                if(strlen(names[i].name)!=n || !strn_ieq(name,names[i].name,n))continue;
+                /* An invalid declaration leaves the previous valid one. */
+                sbuf b={0};struct font_desc m={.weight_lo=f->weight_lo,.weight_hi=f->weight_hi,.italic=f->italic};
+                int status=font_desc_parse(names[i].which,value,(size_t)(ve-value),&b,&m);
+                if(status<0){sb_free(&b);free(m.ranges);ar_alloc(pc->a,SIZE_MAX);}
+                if(status>0){
+                    f->desc[names[i].which]=ar_strndup(pc->a,b.p?b.p:"",b.n);
+                    f->weight_lo=m.weight_lo;f->weight_hi=m.weight_hi;f->italic=m.italic;
+                    if(names[i].which==CSS_FONT_UNICODE_RANGE){
+                        struct web_font_range *ranges=m.range_count?ar_alloc(pc->a,m.range_count*sizeof *ranges):NULL;
+                        if(m.range_count)memcpy(ranges,m.ranges,m.range_count*sizeof *ranges);
+                        f->ranges=ranges;f->range_count=m.range_count;
+                    }
                 }
+                free(m.ranges);sb_free(&b);break;
             }
         }
         s=end<e?end+1:e;
     }
     if(!f->family || !f->sources)return;
+    f->id=__atomic_add_fetch(&font_face_serials,1,__ATOMIC_RELAXED);
     if(pc->sh->fonts_last)pc->sh->fonts_last->next=f;else pc->sh->fonts=f;
     pc->sh->fonts_last=f;
 }
@@ -2675,6 +2963,21 @@ static void font_bindings_clear(void) {
     free(font_bindings);font_bindings=NULL;font_binding_count=font_binding_capacity=0;
 }
 static struct font_face *scoped_font_face(web_doc *d, node_t *scope, const char *family, unsigned weight, bool italic, int vw, int vh);
+/* The resource of a source: a FontFace's own, or the document's for a rule
+   URL (workers only find the identities build_ctx published). */
+static struct web_font_resource *font_source_resource(web_doc *d,const struct font_source *src) {
+    if(src->resource)return src->resource;
+    if(!css_worker())return doc_font_resource(d,src->url);
+    struct web_font_resource *r=d->fonts;
+    while(r && strcmp(r->url,src->url))r=r->next;
+    return r;
+}
+/* Rendering selected a FontFace: the user agent loads it as if load() had
+   been called (CSS Font Loading 2.2), which its document's realm observes. */
+static void font_face_used(web_doc *d,const struct font_face *f) {
+    if(f->author && !__atomic_exchange_n(&f->author->started,true,__ATOMIC_RELAXED))
+        __atomic_add_fetch(&d->font_generation,1,__ATOMIC_RELAXED);
+}
 static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,int vw,int vh,arena_t *a) {
     if(!style->font_names)return NULL;
     const char *cursor=style->font_names,*end=cursor+strlen(cursor);
@@ -2691,10 +2994,9 @@ static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,i
         /* Restricted faces are selected per character below, never as the
            metrics/raster face for every character in the entire family. */
         if(best->range_count)continue;
+        font_face_used(d,best);
         for(struct font_source *src=best->sources;src;src=src->next) {
-            struct web_font_resource *r=NULL;
-            if(css_worker()) { for(r=d->fonts;r && strcmp(r->url,src->url);r=r->next) {} }
-            else r=doc_font_resource(d,src->url);
+            struct web_font_resource *r=font_source_resource(d,src);
             if(!r){ar_alloc(a,SIZE_MAX);return NULL;}
             if(r->failed)continue;
             __atomic_store_n(&r->wanted,true,__ATOMIC_RELAXED);return r->face;
@@ -3473,6 +3775,18 @@ static struct cascade_layer *binding_layer(const struct css_binding *binding,con
     struct cascade_layer *layer=map?(syntax?map->layers[syntax->id]:map->outer):NULL;
     return layer&&layer->depth?layer:NULL;
 }
+/* Font matching distance of a face for a computed weight and slope. */
+static unsigned font_face_score(const struct font_face *f,unsigned weight,bool italic) {
+    unsigned distance=weight<f->weight_lo?f->weight_lo-weight:weight>f->weight_hi?weight-f->weight_hi:0;
+    return distance+(italic!=f->italic?10000u:0u);
+}
+/* A FontFace of document.fonts takes part in matching once its family and
+   descriptors parsed; it follows the document's rules, as its font source
+   orders them (CSS Font Loading 3), and wins equal matches as the later face. */
+static struct css_font_face *author_font_face(web_doc *d,int i) {
+    struct css_font_face *a=d->author_fonts.v[i];
+    return a->face.family?a:NULL;
+}
 static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *family,unsigned weight,bool italic,int vw,int vh) {
     struct css_scope *scope=root?root->style_scope:NULL;
     struct font_face *best=NULL;unsigned score=UINT_MAX;
@@ -3481,48 +3795,61 @@ static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *fa
     for(struct css_binding *binding=scope?scope->first:NULL;binding;binding=binding->next)
         for(struct font_face *f=binding->index->fonts;f;f=f->next) {
             if(strcasecmp(family,f->family)||!font_conditions_ok(f->media,vw,vh,scripting))continue;
-            unsigned distance=weight<f->weight_lo?f->weight_lo-weight:weight>f->weight_hi?weight-f->weight_hi:0;
-            unsigned candidate=distance+(italic!=f->italic?10000u:0u);
+            unsigned candidate=font_face_score(f,weight,italic);
             struct cascade_layer *layer=binding_layer(binding,f->layer);
             if(candidate<score || (candidate==score && (!best || layer_compare(layer,best_layer)>=0))) {
                 best=f;score=candidate;best_layer=layer;
             }
         }
+    for(int i=0;i<d->author_fonts.n;i++){
+        struct css_font_face *a=author_font_face(d,i);
+        if(!a || strcasecmp(family,a->face.family))continue;
+        unsigned candidate=font_face_score(&a->face,weight,italic);
+        if(candidate<=score){best=&a->face;score=candidate;best_layer=NULL;}
+    }
     return best;
+}
+struct ranked_font_choice {struct web_font_choice choice;struct cascade_layer *layer;};
+/* Add f's first usable source to a family's composite, by layer priority. */
+static bool font_choice_add(web_doc *d,struct font_face *f,struct cascade_layer *layer,
+                            struct web_font_choice **family_first,bool *restricted,arena_t *a) {
+    for(struct font_source *src=f->sources;src;src=src->next){
+        struct web_font_resource *r=font_source_resource(d,src);
+        if(!r){ar_alloc(a,SIZE_MAX);return false;}if(r->failed)continue;
+        struct ranked_font_choice *ranked=ar_alloc(a,sizeof *ranked);
+        struct web_font_choice *choice=&ranked->choice;ranked->layer=layer;
+        *choice=(struct web_font_choice){.resource=r,.face=r->face,.range_count=f->range_count};
+        if(f->range_count){struct web_font_range *ranges=ar_alloc(a,f->range_count*sizeof *ranges);memcpy(ranges,f->ranges,f->range_count*sizeof *ranges);choice->ranges=ranges;*restricted=true;}
+        struct web_font_choice **position=family_first;
+        while(*position && layer_compare(ranked->layer,((struct ranked_font_choice *)*position)->layer)<0)position=&(*position)->next;
+        choice->next=*position;*position=choice;break;
+    }
+    return true;
 }
 static const struct web_font_choice *select_font_choices(web_doc *d,node_t *node,style_t *style,int vw,int vh,arena_t *a) {
     if(!style->font_names)return NULL;
     node_t *root=doc_node_root(node,false);struct css_scope *scope=root?root->style_scope:NULL;
     const char *cursor=style->font_names,*end=cursor+strlen(cursor);
-    struct web_font_choice *first=NULL,**tail=&first;bool restricted=false;
+    struct web_font_choice *first=NULL,**tail=&first;bool restricted=false,italic=style->font_style!=0;
     while(cursor<end){
         const char *token=skip_ws(cursor,end);bool quoted=token<end&&(*token=='"'||*token=='\'');
         const char *family=css_font_family_next(a,&cursor,end);if(!family||!cursor)break;
         if(!quoted&&(!strcasecmp(family,"serif")||!strcasecmp(family,"sans-serif")||!strcasecmp(family,"monospace")||
            !strcasecmp(family,"system-ui")||!strcasecmp(family,"cursive")||!strcasecmp(family,"fantasy")))break;
-        struct font_face *best=scoped_font_face(d,root,family,style->font_weight,style->font_style!=0,vw,vh);
+        struct font_face *best=scoped_font_face(d,root,family,style->font_weight,italic,vw,vh);
         if(!best)continue;
-        unsigned distance=style->font_weight<best->weight_lo?best->weight_lo-style->font_weight:style->font_weight>best->weight_hi?style->font_weight-best->weight_hi:0;
-        unsigned score=distance+((style->font_style!=0)!=best->italic?10000u:0u);
+        unsigned score=font_face_score(best,style->font_weight,italic);
         struct web_font_choice *family_first=NULL;
         for(struct css_binding *b=scope?scope->first:NULL;b;b=b->next)for(struct font_face *f=b->index->fonts;f;f=f->next){
             if(strcasecmp(family,f->family)||!font_conditions_ok(f->media,vw,vh,d->sty.index_scripting))continue;
-            unsigned delta=style->font_weight<f->weight_lo?f->weight_lo-style->font_weight:style->font_weight>f->weight_hi?style->font_weight-f->weight_hi:0;
-            if(delta+((style->font_style!=0)!=f->italic?10000u:0u)!=score)continue;
-            for(struct font_source *src=f->sources;src;src=src->next){
-                struct web_font_resource *r;
-                if(css_worker()){for(r=d->fonts;r&&strcmp(r->url,src->url);r=r->next){}}
-                else r=doc_font_resource(d,src->url);
-                if(!r){ar_alloc(a,SIZE_MAX);return NULL;}if(r->failed)continue;
-                struct ranked_font_choice {struct web_font_choice choice;struct cascade_layer *layer;};
-                struct ranked_font_choice *ranked=ar_alloc(a,sizeof *ranked);
-                struct web_font_choice *choice=&ranked->choice;ranked->layer=binding_layer(b,f->layer);
-                *choice=(struct web_font_choice){.resource=r,.face=r->face,.range_count=f->range_count};
-                if(f->range_count){struct web_font_range *ranges=ar_alloc(a,f->range_count*sizeof *ranges);memcpy(ranges,f->ranges,f->range_count*sizeof *ranges);choice->ranges=ranges;restricted=true;}
-                struct web_font_choice **position=&family_first;
-                while(*position && layer_compare(ranked->layer,((struct ranked_font_choice *)*position)->layer)<0)position=&(*position)->next;
-                choice->next=*position;*position=choice;break;
-            }
+            if(font_face_score(f,style->font_weight,italic)!=score)continue;
+            if(!font_choice_add(d,f,binding_layer(b,f->layer),&family_first,&restricted,a))return NULL;
+        }
+        for(int i=0;i<d->author_fonts.n;i++){
+            struct css_font_face *author=author_font_face(d,i);
+            if(!author || strcasecmp(family,author->face.family) || font_face_score(&author->face,style->font_weight,italic)!=score)continue;
+            /* A text run that needs a code point in its range requests it. */
+            if(!font_choice_add(d,&author->face,NULL,&family_first,&restricted,a))return NULL;
         }
         if(family_first){*tail=family_first;while(*tail)tail=&(*tail)->next;}
     }
@@ -3581,6 +3908,383 @@ void css_refresh_font_selection(web_doc *d) {
         ar_free(scratch);
     }
     ar_free(scratch);free(scratch);
+}
+
+/* ---------------------------------------------------------------- CSS Font Loading
+   The native half of https://drafts.csswg.org/css-font-loading-3/: the
+   document's CSS-connected faces (its @font-face rules), FontFace records,
+   their load status and "find the matching font faces". js_fonts.h binds it. */
+static void font_viewport(web_doc *d,int *vw,int *vh) {
+    *vw=d->styled_w>0?d->styled_w:d->width>0?d->width:800;
+    *vh=d->styled_h>0?d->styled_h:d->height>0?d->height:600;
+}
+/* The document's font source begins with a FontFace per @font-face rule of
+   its style sheets (not a shadow root's), in document order: the cascade's
+   sheet order, imports before their importer's rules. 0: unavailable now
+   (cancelled native work); the caller keeps what it knew. */
+int css_font_rules(web_doc *d,struct css_font_rule **rules,size_t *count) {
+    *rules=NULL;*count=0;
+    if(!d)return 1;
+    if(d->native_cancelled || !sheets_sort(d))return 0;
+    int vw,vh;font_viewport(d,&vw,&vh);bool scripting=web_js_enabled(d);
+    const pvec *sh=&d->sty.sheets;
+    struct css_font_rule *v=NULL;size_t n=0,capacity=0;
+    for(int i=0;i<sh->n;i++){
+        const sheet_t *s=sh->v[i];
+        if(s->ua || s->scope || !s->fonts || !sheet_media_ok(s,vw,vh,scripting))continue;
+        uint32_t occurrence=0;
+        for(int j=0;j<i;j++){
+            const sheet_t *p=sh->v[j];
+            if(p->ast==s->ast && !p->ua && !p->scope && sheet_media_ok(p,vw,vh,scripting))occurrence++;
+        }
+        for(struct font_face *f=s->fonts;f;f=f->next){
+            if(!font_conditions_ok(f->media,vw,vh,scripting))continue;
+            if(n==capacity){
+                size_t cap=capacity?capacity*2:16;
+                void *grown=cap<=SIZE_MAX/sizeof *v?realloc(v,cap*sizeof *v):NULL;
+                if(!grown){free(v);return -1;}
+                v=grown;capacity=cap;
+            }
+            /* The shared AST's arena owns the rule (cssom.c may move it). */
+            v[n++]=(struct css_font_rule){f,s->ast?s->ast->arena:s->arena,f->id,occurrence};
+        }
+    }
+    *rules=v;*count=n;return 1;
+}
+const char *css_font_rule_descriptor(const struct font_face *face,enum css_font_descriptor which) {
+    return face && (unsigned)which<CSS_FONT_DESCRIPTORS?face->desc[which]:NULL;
+}
+/* Load status of a face's src list, as CSS Fonts' "load a font" walks it: a
+   failed source moves on to the next. started (a load() or a rendering use)
+   demands the first untried source; a rule whose earlier source failed has
+   been started by whoever used that resource. */
+static enum css_font_status font_sources_status(web_doc *d,struct font_source *src,bool started) {
+    bool tried=started;
+    for(;src;src=src->next){
+        struct web_font_resource *r=font_source_resource(d,src);
+        if(!r)return tried?CSS_FONT_LOADING:CSS_FONT_UNLOADED;
+        if(r->failed){tried=true;continue;}
+        if(r->done)return CSS_FONT_LOADED;
+        if(r->loading)return CSS_FONT_LOADING;
+        if(!tried && !r->demanded)return CSS_FONT_UNLOADED;
+        r->demanded=true; /* request_fonts sends it at the end of this tick */
+        return CSS_FONT_LOADING;
+    }
+    return tried?CSS_FONT_ERROR:CSS_FONT_UNLOADED;
+}
+enum css_font_status css_font_rule_status(web_doc *d,struct font_face *face,bool started) {
+    return face?font_sources_status(d,face->sources,started):CSS_FONT_ERROR;
+}
+/* Changing a font source or a face in it re-matches every element's fonts;
+   committed shaping and min-content measurements used the old selection. */
+static void font_source_changed(web_doc *d) {
+    if(!d || !d->live)return;
+    css_mark_dirty(d,NULL);d->dirty=true;
+    d->layout_valid=false;layout_invalidate_fonts(d->root_box);
+}
+/* A CSS-connected FontFace's attribute writes its rule's descriptor too (CSS
+   Font Loading 2.3). The rule's sheet arena keeps the new text. */
+int css_font_rule_set(web_doc *d,const struct css_font_rule *rule,enum css_font_descriptor which,const char *value,size_t n) {
+    if(!rule || !rule->face || !rule->arena || (unsigned)which>=CSS_FONT_DESCRIPTORS)return 0;
+    struct font_face *f=rule->face;
+    sbuf b={0};struct font_desc m={.weight_lo=f->weight_lo,.weight_hi=f->weight_hi,.italic=f->italic};
+    int status=1;
+    if(which==CSS_FONT_FAMILY)fd_put_family(&b,value,n);
+    else status=font_desc_parse(which,value,n,&b,&m);
+    if(status<=0){sb_free(&b);free(m.ranges);return status;}
+    arena_t *a=rule->arena;jmp_buf trap,*previous=a->trap;a->trap=&trap;
+    if(setjmp(trap)){a->trap=previous;sb_free(&b);free(m.ranges);return -1;}
+    const char *text=ar_strndup(a,b.p?b.p:"",b.n);
+    const char *family=which==CSS_FONT_FAMILY?ar_strndup(a,value,n):NULL;
+    struct web_font_range *ranges=which==CSS_FONT_UNICODE_RANGE&&m.range_count?ar_alloc(a,m.range_count*sizeof *ranges):NULL;
+    a->trap=previous;
+    if(ranges)memcpy(ranges,m.ranges,m.range_count*sizeof *ranges);
+    f->desc[which]=text;
+    if(family)f->family=family;
+    if(which==CSS_FONT_UNICODE_RANGE){f->ranges=ranges;f->range_count=m.range_count;}
+    f->weight_lo=m.weight_lo;f->weight_hi=m.weight_hi;f->italic=m.italic;
+    sb_free(&b);free(m.ranges);
+    font_source_changed(d);
+    return 1;
+}
+struct css_font_face *css_font_face_new(void) {
+    struct css_font_face *f=calloc(1,sizeof *f);
+    if(!f)return NULL;
+    f->refs=1;f->face.author=f;f->face.weight_lo=f->face.weight_hi=400;
+    f->face.id=__atomic_add_fetch(&font_face_serials,1,__ATOMIC_RELAXED);
+    for(int i=0;i<CSS_FONT_DESCRIPTORS;i++)f->face.desc[i]=font_desc_initial[i];
+    return f;
+}
+static void font_face_sources_free(struct css_font_face *f) {
+    while(f->face.sources){
+        struct font_source *src=f->face.sources;f->face.sources=src->next;
+        free((char *)src->url);free(src);
+    }
+}
+/* Never touches the resources: the record may outlive their document. */
+void css_font_face_release(struct css_font_face *f) {
+    if(!f || --f->refs)return;
+    for(int i=0;i<CSS_FONT_DESCRIPTORS;i++)free(f->names[i]);
+    free(f->family);free(f->ranges);font_face_sources_free(f);free(f);
+}
+uint64_t css_font_face_id(const struct css_font_face *f) { return f?f->face.id:0; }
+const char *css_font_face_descriptor(const struct css_font_face *f,enum css_font_descriptor which) {
+    return f && (unsigned)which<CSS_FONT_DESCRIPTORS?f->face.desc[which]:NULL;
+}
+/* Whether some document font source holds f (its wrapper holds one reference). */
+static bool font_face_in_set(const struct css_font_face *f) { return f->refs>1; }
+int css_font_face_set(web_doc *d,struct css_font_face *f,enum css_font_descriptor which,const char *value,size_t n) {
+    if(!f || (unsigned)which>=CSS_FONT_DESCRIPTORS)return 0;
+    sbuf b={0};struct font_desc m={.weight_lo=f->face.weight_lo,.weight_hi=f->face.weight_hi,.italic=f->face.italic};
+    int status=1;
+    if(which==CSS_FONT_FAMILY)fd_put_family(&b,value,n);
+    else status=font_desc_parse(which,value,n,&b,&m);
+    if(status<=0){sb_free(&b);free(m.ranges);return status;}
+    if(which==CSS_FONT_FAMILY){
+        /* The FontFace family is the literal name it matches (an invalid
+           <family-name> is that name as a string), not a parsed list. */
+        char *name=malloc(n+1);
+        if(!name){sb_free(&b);return -1;}
+        memcpy(name,value,n);name[n]=0;
+        free(f->family);f->family=name;f->face.family=name;
+    }
+    free(f->names[which]);f->names[which]=sb_cstr(&b);f->face.desc[which]=f->names[which];
+    f->face.weight_lo=m.weight_lo;f->face.weight_hi=m.weight_hi;f->face.italic=m.italic;
+    if(which==CSS_FONT_UNICODE_RANGE){free(f->ranges);f->ranges=m.ranges;f->face.ranges=m.ranges;f->face.range_count=m.range_count;}
+    else free(m.ranges);
+    if(font_face_in_set(f))font_source_changed(d);
+    return 1;
+}
+/* format() and tech() hints after a url(), syntactically. */
+static bool font_src_hints_syntax(const char *s,const char *e) {
+    while((s=skip_ws(s,e))<e){
+        const char *name=s;
+        while(s<e && ident_char((unsigned char)*s))s++;
+        size_t n=(size_t)(s-name);
+        if(!n || s>=e || *s!='(' || !((n==6 && strn_ieq(name,"format",6)) || (n==4 && strn_ieq(name,"tech",4))))return false;
+        const char *close=scan_to(s+1,e,")");
+        if(close>=e)return false;
+        s=close+1;
+    }
+    return true;
+}
+/* A FontFace string source parses as the src descriptor (CSS Fonts 4
+   forgiving <font-src-list>): invalid components drop, and only a list with
+   none valid is a syntax error. local() is valid but no native face answers
+   it, so that component always fails to load. */
+int css_font_face_source(web_doc *d,struct css_font_face *f,const char *base,const char *value,size_t n) {
+    if(!d || !f)return 0;
+    arena_t *scratch=calloc(1,sizeof *scratch);
+    if(!scratch)return -1;
+    struct font_source *first=NULL,**tail=&first;
+    jmp_buf trap;scratch->trap=&trap;scratch->chunk_size=1024;
+    if(setjmp(trap)){
+        ar_free(scratch);free(scratch);
+        return -1;
+    }
+    struct pctx pc={.a=scratch,.base=base};
+    bool valid=false;
+    struct font_source *found=NULL,**found_tail=&found;
+    for(const char *s=value,*e=value+n;s<e;){
+        const char *end=scan_to(s,e,","),*c=skip_ws(s,end),*z=end;trim_r(c,&z);
+        if(z-c>=4 && strn_ieq(c,"url(",4)){
+            const char *close=scan_to(c+4,z,")");
+            if(close<z && font_src_hints_syntax(close+1,z)){
+                valid=true;
+                struct font_source *sources=font_sources(&pc,c,z);
+                *found_tail=sources;while(*found_tail)found_tail=&(*found_tail)->next;
+            }
+        }else if(z-c>=6 && strn_ieq(c,"local(",6)){
+            const char *close=scan_to(c+6,z,")");
+            if(close==z-1 && skip_ws(c+6,close)<close)valid=true;
+        }
+        s=end<e?end+1:e;
+    }
+    scratch->trap=NULL;
+    /* Copy out of the scratch arena; each URL is a document resource. */
+    int status=valid?1:0;
+    for(struct font_source *src=valid?found:NULL;src;src=src->next){
+        struct font_source *copy=calloc(1,sizeof *copy);
+        char *url=copy?strdup(src->url):NULL;
+        struct web_font_resource *r=url?doc_font_resource(d,url):NULL;
+        if(!r){free(url);free(copy);status=-1;break;}
+        copy->url=url;copy->resource=r;*tail=copy;tail=&copy->next;
+    }
+    ar_free(scratch);free(scratch);
+    if(status<=0){
+        while(first){struct font_source *src=first;first=src->next;free((char *)src->url);free(src);}
+        return status;
+    }
+    font_face_sources_free(f);f->face.sources=first;
+    return 1;
+}
+int css_font_face_data(web_doc *d,struct css_font_face *f,const void *bytes,size_t n) {
+    if(!d || !f)return 0;
+    font_t *face=bytes && n?font_open_memory(bytes,n):NULL;
+    if(!face)return 0;
+    struct web_font_resource *r=calloc(1,sizeof *r);
+    struct font_source *src=r?calloc(1,sizeof *src):NULL;
+    if(!src){free(r);font_close(face);return -1;}
+    /* Styles may borrow the face after the record goes: the document keeps it. */
+    r->face=face;r->done=true;r->next=d->font_data;d->font_data=r;
+    src->resource=r;font_face_sources_free(f);f->face.sources=src;f->data=r;
+    if(font_face_in_set(f))font_source_changed(d);
+    return 1;
+}
+enum css_font_status css_font_face_status(web_doc *d,struct css_font_face *f,bool load) {
+    if(!f)return CSS_FONT_ERROR;
+    if(load)__atomic_store_n(&f->started,true,__ATOMIC_RELAXED);
+    if(f->data)return f->data->face?CSS_FONT_LOADED:CSS_FONT_ERROR;
+    /* Until load() or a rendering use, a FontFace stays unloaded even when
+       another face already fetched the same URL. */
+    if(!__atomic_load_n(&f->started,__ATOMIC_RELAXED))return CSS_FONT_UNLOADED;
+    return font_sources_status(d,f->face.sources,true);
+}
+bool css_font_set_add(web_doc *d,struct css_font_face *f) {
+    if(!d || !f)return false;
+    for(int i=0;i<d->author_fonts.n;i++)if(d->author_fonts.v[i]==f)return true;
+    pv_push(&d->author_fonts,f);f->refs++;
+    font_source_changed(d);
+    return true;
+}
+void css_font_set_delete(web_doc *d,struct css_font_face *f) {
+    for(int i=0;d && i<d->author_fonts.n;i++)if(d->author_fonts.v[i]==f){
+        memmove(d->author_fonts.v+i,d->author_fonts.v+i+1,sizeof(void *)*(size_t)(d->author_fonts.n-i-1));
+        d->author_fonts.n--;css_font_face_release(f);font_source_changed(d);return;
+    }
+}
+void css_font_set_clear(web_doc *d) {
+    if(!d || !d->author_fonts.n)return;
+    for(int i=0;i<d->author_fonts.n;i++)css_font_face_release(d->author_fonts.v[i]);
+    d->author_fonts.n=0;font_source_changed(d);
+}
+void css_font_set_free(web_doc *d) {
+    for(int i=0;i<d->author_fonts.n;i++)css_font_face_release(d->author_fonts.v[i]);
+    pv_free(&d->author_fonts);
+}
+/* CSS Font Loading 3.1: a CSS-wide keyword, or a var()/env()/attr() that
+   nothing can substitute here, is a syntax error before the font shorthand
+   grammar runs. Strings may still contain those words. */
+static bool font_query_plain(const char *s,size_t n) {
+    static const char *const wide[]={"inherit","initial","unset","revert","revert-layer","default",NULL};
+    const char *e=s+n;s=skip_ws(s,e);trim_r(s,&e);
+    for(int i=0;wide[i];i++)if((size_t)(e-s)==strlen(wide[i]) && strn_ieq(s,wide[i],(size_t)(e-s)))return false;
+    for(const char *p=s;p<e;p++){
+        if(*p=='"' || *p=='\''){char q=*p++;while(p<e && *p!=q){if(*p=='\\')p++;p++;}continue;}
+        if(*p=='\\'){p++;continue;}
+        if(p>s && ident_char((unsigned char)p[-1]))continue;
+        static const char *const functions[]={"var(","env(","attr(",NULL};
+        for(int i=0;functions[i];i++){
+            size_t k=strlen(functions[i]);
+            if((size_t)(e-p)>=k && !strncasecmp(p,functions[i],k))return false;
+        }
+    }
+    return true;
+}
+static bool font_text_points(const char *text,size_t n,uint32_t **points,size_t *count) {
+    *points=NULL;*count=0;
+    uint32_t *v=n?malloc(n*sizeof *v):NULL;
+    if(n && !v)return false;
+    size_t k=0;
+    for(size_t i=0;i<n;){
+        unsigned char c=(unsigned char)text[i];uint32_t cp;size_t len;
+        if(c<0x80){cp=c;len=1;}
+        else if((c&0xe0)==0xc0 && i+1<n){cp=((c&0x1fu)<<6)|(text[i+1]&0x3fu);len=2;}
+        else if((c&0xf0)==0xe0 && i+2<n){cp=((c&0x0fu)<<12)|((text[i+1]&0x3fu)<<6)|(text[i+2]&0x3fu);len=3;}
+        else if((c&0xf8)==0xf0 && i+3<n){cp=((c&0x07u)<<18)|((text[i+1]&0x3fu)<<12)|((text[i+2]&0x3fu)<<6)|(text[i+3]&0x3fu);len=4;}
+        else {cp=0xfffd;len=1;}
+        v[k++]=cp;i+=len;
+    }
+    *points=v;*count=k;return true;
+}
+/* Whether a face's unicode-range covers any code point of the text. */
+static bool font_face_covers(const struct font_face *f,const uint32_t *points,size_t count) {
+    if(!count)return false;
+    if(!f->range_count)return true;
+    for(size_t i=0;i<count;i++){
+        size_t lo=0,hi=f->range_count;
+        while(lo<hi){size_t mid=lo+(hi-lo)/2;if(points[i]>f->ranges[mid].last)lo=mid+1;else hi=mid;}
+        if(lo<f->range_count && points[i]>=f->ranges[lo].first)return true;
+    }
+    return false;
+}
+struct font_match_work {
+    struct css_font_rule *rules;size_t rule_count;
+    struct css_font_match *matches;size_t count,capacity;
+    uint32_t *points;size_t point_count;
+};
+static bool font_match_push(struct font_match_work *w,struct css_font_match match) {
+    for(size_t i=0;i<w->count;i++)
+        if(w->matches[i].id==match.id && w->matches[i].occurrence==match.occurrence && w->matches[i].author==match.author)return true;
+    if(w->count==w->capacity){
+        size_t cap=w->capacity?w->capacity*2:8;
+        void *grown=cap<=SIZE_MAX/sizeof *w->matches?realloc(w->matches,cap*sizeof *w->matches):NULL;
+        if(!grown)return false;
+        w->matches=grown;w->capacity=cap;
+    }
+    w->matches[w->count++]=match;return true;
+}
+/* For each family of the font list, the faces font matching selects (all of
+   a composite face's unicode-range parts), then only those covering a code
+   point of the text. System fonts are never listed: they are loaded. */
+int css_font_match(web_doc *d,const char *font,size_t n,const char *text,size_t tn,
+                   struct css_font_match **matches,size_t *count) {
+    *matches=NULL;*count=0;
+    if(!d || !font_query_plain(font,n))return 0;
+    const struct propdef *p=css_prop_lookup("font",4);
+    if(!p || !css_value_supported(p,font,n))return 0;
+    struct font_match_work *w=calloc(1,sizeof *w);
+    arena_t *arena=calloc(1,sizeof *arena);
+    if(!w || !arena || css_font_rules(d,&w->rules,&w->rule_count)<0 || !font_text_points(text,tn,&w->points,&w->point_count)){
+        if(w){free(w->rules);free(w);}
+        free(arena);return -1;
+    }
+    int status=-1;
+    jmp_buf trap;arena->trap=&trap;arena->chunk_size=4096;
+    if(!setjmp(trap)){
+        style_t parent,st;css_style_init(&parent,NULL);css_style_init(&st,&parent);
+        int vw,vh;font_viewport(d,&vw,&vh);
+        uint8_t *set=ar_alloc(arena,(size_t)css_prop_count());
+        struct cx cx={.s=&st,.parent=&parent,.em=parent.font_size,.rem=16,.vw=(float)vw,.vh=(float)vh,.a=arena,.set=set};
+        status=0;
+        if(css_apply(p,font,n,&cx) && !cx.invalid && st.font_names) {
+            status=1;
+            bool italic=st.font_style!=0;
+            const char *cursor=st.font_names,*end=cursor+strlen(cursor);
+            while(status>0 && cursor<end){
+                const char *token=skip_ws(cursor,end);bool quoted=token<end && (*token=='"' || *token=='\'');
+                const char *family=css_font_family_next(arena,&cursor,end);
+                if(!family || !cursor)break;
+                if(!quoted && (!strcasecmp(family,"serif") || !strcasecmp(family,"sans-serif") || !strcasecmp(family,"monospace") ||
+                   !strcasecmp(family,"system-ui") || !strcasecmp(family,"cursive") || !strcasecmp(family,"fantasy")))continue;
+                unsigned best=UINT_MAX;
+                for(size_t i=0;i<w->rule_count;i++)
+                    if(!strcasecmp(family,w->rules[i].face->family))best=MIN(best,font_face_score(w->rules[i].face,st.font_weight,italic));
+                for(int i=0;i<d->author_fonts.n;i++){
+                    struct css_font_face *a=author_font_face(d,i);
+                    if(a && !strcasecmp(family,a->face.family))best=MIN(best,font_face_score(&a->face,st.font_weight,italic));
+                }
+                if(best==UINT_MAX)continue;
+                for(size_t i=0;i<w->rule_count && status>0;i++){
+                    struct font_face *f=w->rules[i].face;
+                    if(strcasecmp(family,f->family) || font_face_score(f,st.font_weight,italic)!=best ||
+                       !font_face_covers(f,w->points,w->point_count))continue;
+                    if(!font_match_push(w,(struct css_font_match){w->rules[i].id,w->rules[i].occurrence,NULL}))status=-1;
+                }
+                for(int i=0;i<d->author_fonts.n && status>0;i++){
+                    struct css_font_face *a=author_font_face(d,i);
+                    if(!a || strcasecmp(family,a->face.family) || font_face_score(&a->face,st.font_weight,italic)!=best ||
+                       !font_face_covers(&a->face,w->points,w->point_count))continue;
+                    if(!font_match_push(w,(struct css_font_match){a->face.id,0,a}))status=-1;
+                }
+            }
+        }
+    }
+    arena->trap=NULL;ar_free(arena);free(arena);
+    free(w->rules);free(w->points);
+    if(status>0){*matches=w->matches;*count=w->count;}else free(w->matches);
+    free(w);
+    return status;
 }
 
 static void css_ctx_free(struct css_ctx *x) {
@@ -6186,7 +6890,7 @@ void css_cascade(web_doc *d, int vw, int vh) {
     }
     /* Keys borrow computed-style names. Never carry a previous document or
        style-arena generation into this cascade; release on normal exit too. */
-    font_bindings_clear();font_faces_available=false;
+    font_bindings_clear();font_faces_available=d->author_fonts.n>0;
     for(int i=0;i<d->sty.sheets.n;i++)if(((sheet_t *)d->sty.sheets.v[i])->fonts){font_faces_available=true;break;}
     for(struct web_font_resource *f=d->fonts;f;f=f->next)f->wanted=false;
     bool scripting = web_js_enabled(d);

@@ -47,6 +47,7 @@
     let textTrackHandlerTarget = () => false;
     let audioHandlerTarget = () => false;
     let viewportHandlerTarget = () => false;
+    let fontHandlerTarget = () => false;
     const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
     const windowHandlerTypes = new Set(('afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pageswap pagehide pagereveal pageshow popstate rejectionhandled storage unhandledrejection unload').split(' '));
     const bodyWindowTypes=new Set([...windowHandlerTypes,'blur','error','focus','load','resize','scroll']);
@@ -229,7 +230,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type) || viewportHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type) || viewportHandlerTarget(target,type) || fontHandlerTarget(target,type);
     }
     function bodyWindowHandler(target,type){
         if(!bodyWindowTypes.has(type) || target===globalThis)return false;
@@ -1146,6 +1147,7 @@
     /* @include js_attributes.js */
     /* @include js_shadow.js */
     /* @include js_stylesheets.js */
+    /* @include js_font_loading.js */
     /* @include js_animations.js */
     /* @include js_web_legacy.js */
     /* @include js_form_controls.js */
@@ -1351,6 +1353,8 @@
         historyOperation:historyBridge.operation,
         historySecurityError:historyBridge.securityError,
         mediaChanged(){mediaBridge.changed();},
+        // CSS Font Loading's font loading task (js.c web_js_tick).
+        fontsChanged(){fontLoadingBridge.changed();},
         avmediaActivate(node){return avmediaBridge.activate(node);},
         inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true,composed:true}));},
         nodeProtos:[Node.prototype,HTMLDocument.prototype,Element.prototype,HTMLElement.prototype,

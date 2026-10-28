@@ -1444,8 +1444,9 @@ struct web_font_resource *doc_font_resource(web_doc *d,const char *url) {
 void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,size_t length) {
     if(!d || !f || f->done)return;
     f->face=bytes && length?font_open_memory(bytes,length):NULL;
-    f->loading=false;f->done=true;f->failed=!f->face;
+    f->loading=f->demanded=false;f->done=true;f->failed=!f->face;
     d->dirty=true;
+    __atomic_add_fetch(&d->font_generation,1,__ATOMIC_RELAXED); /* FontFace statuses */
     /* A decoded face changes native glyph metrics and fallback coverage.
        Mark committed formatting stale before selecting it at the next layout
        boundary; otherwise a geometry getter can reuse the old font's cache.
@@ -1455,6 +1456,21 @@ void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,si
         layout_invalidate_fonts(d->root_box);
     }
     d->font_selection_dirty=true;
+}
+bool doc_fonts_unrequested(web_doc *d) {
+    for(struct web_font_resource *f=d?d->fonts:NULL;f;f=f->next)
+        if((f->wanted || f->demanded) && !f->loading && !f->done)return true;
+    return false;
+}
+/* CSS Font Loading's "pending stylesheet requests": every requested sheet,
+   whatever its media or scope, until it arrives or fails. */
+bool doc_css_loading(web_doc *d) {
+    if(!d || !d->live || d->inert)return false;
+    for(int i=0;i<d->pending_css.n;i++){
+        const struct cached_css *c=cached_css(d,((const struct pending *)d->pending_css.v[i])->url);
+        if(!c || !c->done)return true;
+    }
+    return false;
 }
 
 void web_free(web_doc *d) {
@@ -1481,9 +1497,16 @@ void web_free(web_doc *d) {
     html_policy_free(d);
     css_motion_doc_free(d);
     pv_free(&d->marquees);
+    /* FontFace records outlive neither their document font sources nor the
+       resources they name: release them before either goes. */
+    css_font_set_free(d);
     while(d->fonts) {
         struct web_font_resource *f=d->fonts;d->fonts=f->next;
         font_close(f->face);free(f->url);free(f);
+    }
+    while(d->font_data) {
+        struct web_font_resource *f=d->font_data;d->font_data=f->next;
+        font_close(f->face);free(f);
     }
     web_form_validation_free(d);
     /* Parser subscriptions can borrow allocation-owned nodes in helper docs. */
