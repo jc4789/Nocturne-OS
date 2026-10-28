@@ -553,6 +553,9 @@
         set className(v) { reflectedAttr(this,'class',String(v)); }
         get classList() { return tokenListBridge.for(this,'class'); }
         set classList(value) { tokenListBridge.for(this,'class').value=value; }
+        /* CSS Shadow Parts: the element's part names, for ::part() */
+        get part() { return tokenListBridge.for(this,'part'); }
+        set part(value) { tokenListBridge.for(this,'part').value=value; }
         getAttribute(name) { return dom('attr',this,String(name)); }
         setAttribute(name,value) { dom('attr',this,String(name),String(value)); }
         removeAttribute(name) { dom('attr',this,String(name),null); }

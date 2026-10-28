@@ -13,8 +13,12 @@
                                      sheet の規則の数と、規則のどれかが要素に当たるか、
                                      querySelector(selector) の最初が要素か（E）・null（N）・他（O）・無効（!）、
                                      要素.matches(selector)（1/0/!）
+     C <tree> <target> <pseudo> <sheets>
+                                     tree の木（shadow root を含む）の target 番目の要素（または
+                                     その ::before・::after・::placeholder）に cascade が勝たせる color
    chain は body の下の要素を / で並べ、各々は [ns:][prefix|]local[@name=value;...]（ns は svg・mathml・none）。
-   最後の要素が問いの要素で、attrs（ns \x1f name \x1f value を \x1e で並べる）を setAttributeNS で付ける。 */
+   最後の要素が問いの要素で、attrs（ns \x1f name \x1f value を \x1e で並べる）を setAttributeNS で付ける。
+   tree と sheets の形は build_tree と answer_cascade の注釈。 */
 #include <stdio.h>
 
 /* ---- the host's ends of what building a document reaches (the rest stop the tool by name) */
@@ -26,6 +30,8 @@ bool web_js_enabled(web_doc *d) { (void)d; return false; }
 void web_js_console(web_doc *d, int level, const char *message) { (void)d; (void)level; (void)message; }
 void html_bridge_native_changed(node_t *node, unsigned flags) { (void)node; (void)flags; }
 bool web_native_checkpoint(web_doc *d) { (void)d; return true; }
+void web_avmedia_checkpoint(void) {}                         /* no media element to supply */
+bool web_presentation_matches(node_t *n) { (void)n; return false; } /* nothing is fullscreen */
 bool parallel_active(void) { return false; }
 unsigned parallel_worker_index(void) { return 0; }
 uint64_t uptime_ms(void) { return 0; }
@@ -159,6 +165,46 @@ static node_t *build_chain(web_doc *d, node_t *parent, const char *chain) {
     }
     return last;
 }
+/* tree: items in tree order separated by \x1d, each "depth\x1f local[\x1f name\x1f value]..."
+   (depth 1: a child of body), or "depth\x1f#shadow": a shadow root of the item
+   before it at depth - 1, whose children follow at depth + 1. shadow_roots[]:
+   the roots in tree order. The node of item target. */
+static node_t *shadow_roots[16];
+static int nshadow;
+static node_t *build_tree(web_doc *d, node_t *body, const char *tree, int target) {
+    node_t *stack[64] = {body}, *found = NULL;
+    nshadow = 0;
+    int index = 0;
+    for (const char *p = tree; *p; index++) {
+        const char *end = strchr(p, '\x1d');
+        if (!end) end = p + strlen(p);
+        char *item = strndup(p, (size_t)(end - p)), *fields[64];
+        int n = 0;
+        for (char *f = item; f && n < 64; n++) {
+            fields[n] = f;
+            f = strchr(f, '\x1f');
+            if (f) *f++ = 0;
+        }
+        int depth = atoi(fields[0]);
+        if (n < 2 || depth < 1 || depth > 63 || !stack[depth - 1]) { puts("木の項目が読めない"); exit(2); }
+        node_t *parent = stack[depth - 1], *node;
+        if (!strcmp(fields[1], "#shadow")) {
+            node = nshadow < 16 ? doc_shadow_attach(d, parent, false, false, false, false, false) : NULL;
+            if (!node) { puts("shadow root を付けられない"); exit(2); }
+            shadow_roots[nshadow++] = node;
+        } else {
+            node = append(d, parent, doc_element_create(d, WEB_NS_HTML, NULL, fields[1]));
+            for (int i = 2; i + 1 < n; i += 2) doc_attr_set_ns(d, node, NULL, NULL, fields[i], fields[i + 1]);
+        }
+        stack[depth] = node;
+        if (depth < 63) stack[depth + 1] = NULL;
+        if (index == target) found = node;
+        free(item);
+        p = *end ? end + 1 : end;
+    }
+    if (!found) { puts("木に目当ての項目が無い"); exit(2); }
+    return found;
+}
 static void set_attributes(web_doc *d, node_t *e, const char *attrs) {
     for (const char *p = attrs; *p;) {
         const char *end = strchr(p, '\x1e');
@@ -287,6 +333,65 @@ static void answer_document(FILE *f, int mode, const char *chain, const char *at
     fputs(!ok ? "\t!" : m ? "\t1" : "\t0", f);
 }
 
+/* The cascade's own collection (cascade_collect and the style attribute, as
+   cascade_node gathers them, sorted by cmp_dent) for one element of a tree:
+   the color that wins for it, or for its pseudo-element ("before", "after",
+   "placeholder"). Without a winner the value comes from the element itself,
+   then from its flat-tree parent (a shadow root's child: the host); none at
+   all: "-". Sheets are "level\x1f css" items separated by \x1e, level 0 the
+   document's, k the k-th shadow root's. Slot assignment is not followed. */
+static const char *winning_color(web_doc *d, node_t *e, uint8_t pseudo) {
+    struct cascade c = {.d = d, .a = &d->smem};
+    ndents = 0;
+    cascade_collect(&c, e);
+    const char *sa = node_attr(e, "style");
+    struct css_declarations *inline_block = declarations_get(&e->style_declarations, sa, d->base, c.a);
+    int depth = scope_depth(doc_node_root(e, false));
+    for (int i = 0; inline_block && i < inline_block->count; i++) {
+        add_dent(&inline_block->values[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255),
+                 PE_NONE, depth);
+        dents[ndents - 1].inline_style = true;
+    }
+    qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
+    const struct propdef *color = css_prop_lookup("color", 5);
+    for (int i = 0; i < ndents; i++)
+        if (dents[i].d->p == color && dents[i].pseudo == pseudo)
+            return strcmp(dents[i].d->value, "inherit") && strcmp(dents[i].d->value, "unset") ? dents[i].d->value : NULL;
+    return NULL;
+}
+static void answer_cascade(FILE *f, const char *tree, int target, const char *pseudo_name, const char *sheets) {
+    static arena_t arenas[16];
+    node_t *body;
+    web_doc *d = document(0, &body);
+    node_t *e = build_tree(d, body, tree, target);
+    int k = 0;
+    for (const char *p = sheets; *p && k < 16;) {
+        const char *end = strchr(p, '\x1e');
+        if (!end) end = p + strlen(p);
+        const char *sep = memchr(p, '\x1f', (size_t)(end - p));
+        if (sep) {
+            int level = atoi(p);
+            ar_free(&arenas[k]);
+            memset(&arenas[k], 0, sizeof arenas[k]);
+            sheet_t *s = css_parse_sheet(&arenas[k], sep + 1, (size_t)(end - sep - 1), "about:blank", k + 1, NULL);
+            k++;
+            s->scope = level > 0 && level <= nshadow ? shadow_roots[level - 1] : NULL;
+            pv_push(&d->sty.sheets, s);
+        }
+        p = *end ? end + 1 : end;
+    }
+    uint8_t pseudo = !*pseudo_name ? PE_NONE : !strcmp(pseudo_name, "before") ? PE_BEFORE :
+                     !strcmp(pseudo_name, "after") ? PE_AFTER : !strcmp(pseudo_name, "placeholder") ? PE_PLACEHOLDER : PE_OTHER;
+    if (pseudo == PE_OTHER) { fputs("?", f); return; } /* the engine generates no such box */
+    d->sty.ctx = build_ctx(d, 800, 600);
+    const char *value = pseudo != PE_NONE ? winning_color(d, e, pseudo) : NULL;
+    for (node_t *n = e; !value && n && n->type == N_ELEM;) {
+        value = winning_color(d, n, PE_NONE);
+        n = n->parent && n->parent->shadow_host ? n->parent->shadow_host : n->parent;
+    }
+    fputs(value ? value : "-", f);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
     FILE *in = fopen(argv[1], "rb"), *outf = fopen(argv[2], "wb");
@@ -321,7 +426,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(kind, "D") && nf >= 6) {
             int mode = !strcmp(fields[1], "quirks") ? 1 : !strcmp(fields[1], "xml") ? 2 : 0;
             answer_document(outf, mode, fields[2], fields[3], fields[4], lengths[4], fields[5], lengths[5]);
-        } else fputs("?", outf);
+        } else if (!strcmp(kind, "C") && nf >= 5) answer_cascade(outf, fields[1], atoi(fields[2]), fields[3], fields[4]);
+        else fputs("?", outf);
         fputc('\n', outf);
         fflush(outf);
         for (int i = 0; i < nf; i++) free(fields[i]);

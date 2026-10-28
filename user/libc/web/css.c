@@ -99,6 +99,7 @@ struct selector {
     struct compound *right;
     uint32_t spec;
     uint8_t pseudo;
+    bool part; /* a ::part(): its subject is an element its host's tree exposes */
 };
 /* A forgiving list keeps its invalid items' text (trimmed), serialized as written
    before the valid item at `at`; matching never reads them. */
@@ -1511,8 +1512,11 @@ static bool sp_pseudo_element(struct selp *x, struct simple *s, const struct sto
     s->pc = pe;
     *behind = part ? SPF_AFTER_PART : slotted ? SPF_AFTER_SLOTTED : SPF_AFTER_ELEMENT;
     *last = pe;
-    /* The cascade generates one pseudo-element of an element; a chain of them never matches. */
-    sel->pseudo = sel->pseudo || part ? PE_OTHER : pe;
+    /* The cascade generates one pseudo-element of an element; a chain of them never
+       matches. ::part() selects an element in a shadow tree (sel->part): a pseudo-element
+       after it is that element's. */
+    if (part) sel->part = true;
+    else sel->pseudo = sel->pseudo ? PE_OTHER : pe;
     if (sel->pseudo == PE_OTHER) pc->unsupported = true;
     sel->spec = spec_add(sel->spec, SPEC_C);
     return true;
@@ -1659,7 +1663,7 @@ static struct selector *sp_complex(struct selp *x, unsigned flags) {
         } else if (ws) comb = ' ';
         else return NULL;
         /* a pseudo-element ends its selector; a compound context has no combinator */
-        if (sel->pseudo || (flags & SPF_COMPOUND)) return NULL;
+        if (sel->pseudo || sel->part || (flags & SPF_COMPOUND)) return NULL;
     }
     sel->right = cur;
     return sel;
@@ -1887,7 +1891,8 @@ static bool ancestor_bit(const struct ancestor_filter *base, const struct ancest
    ancestors); one left of '+' or '~' is a sibling and adds nothing, nor do
    the arguments of :is()/:not()/:has(). */
 static void selector_ancestor_hashes(const struct selector *sel, uint32_t hashes[SELECTOR_ANCESTOR_HASHES]) {
-    if (sel->pseudo == PE_SLOTTED) return; /* its left compounds match the slot's ancestors */
+    /* their left compounds match the slot's or the host's ancestors */
+    if (sel->pseudo == PE_SLOTTED || sel->part) return;
     int n = 0;
     for (int pass = 0; pass < 2; pass++) {
         for (const struct compound *c = sel->right; c && c->left && n < SELECTOR_ANCESTOR_HASHES; c = c->left) {
@@ -2329,13 +2334,15 @@ static bool match_pc(const struct simple *x, node_t *e, const struct selector_ma
     return false;
 }
 
-static bool match_compound(const struct compound *c, node_t *e, const struct selector_match *context) {
+/* The simples [from, to) of c against e: all of them, or one side of a ::part(). */
+static bool match_compound_range(const struct compound *c, int from, int to, node_t *e,
+                                 const struct selector_match *context) {
     node_t *scope = context->shadow;
     if (scope && e == scope->shadow_host) {
         /* a featureless host: only :host, :host() and :host-context() select it */
         bool host = false;
-        if (c->universal) return false;
-        for (int i = 0; i < c->n; i++) {
+        if (c->universal && !from) return false;
+        for (int i = from; i < to; i++) {
             const struct simple *x = &c->s[i];
             if (x->kind == SK_PE || (x->kind == SK_NS && x->q->implicit)) continue;
             if (x->kind != SK_PC || (x->pc != PC_HOST && x->pc != PC_HOST_CONTEXT)) return false;
@@ -2343,7 +2350,7 @@ static bool match_compound(const struct compound *c, node_t *e, const struct sel
         }
         if (!host) return false;
     }
-    for (int i = 0; i < c->n; i++) {
+    for (int i = from; i < to; i++) {
         const struct simple *x = &c->s[i];
         switch (x->kind) {
         case SK_ANCHOR:
@@ -2381,27 +2388,56 @@ static bool match_compound(const struct compound *c, node_t *e, const struct sel
     }
     return true;
 }
+static bool match_compound(const struct compound *c, node_t *e, const struct selector_match *context) {
+    return match_compound_range(c, 0, c->n, e, context);
+}
 
-static bool match_from_bound(const struct compound *c, node_t *e, const struct selector_match *context) {
+/* CSS Shadow Parts. Whether name is a part name of e on host: e's own `part`
+   tokens when e is in host's shadow tree, else what the exportparts of the
+   inner host between them forwards to that name. */
+static bool token_listed(const char *list, const char *token, size_t length);
+static bool part_forwarded(node_t *e, node_t *inner, const char *name, size_t length);
+static bool part_exposed(node_t *e, node_t *host, const char *name, size_t length) {
+    for (node_t *inner = doc_node_root(e, false)->shadow_host; inner;) {
+        node_t *outer = doc_node_root(inner, false)->shadow_host;
+        if (inner == host) return token_listed(node_attr(e, "part"), name, length);
+        if (outer == host) return part_forwarded(e, inner, name, length);
+        inner = outer;
+    }
+    return false;
+}
+/* "Parse a part mapping list": comma-separated `inner` or `inner : outer`
+   items, an item that is neither skipped. Whether one maps to name a part name
+   e has on inner. */
+static bool part_forwarded(node_t *e, node_t *inner, const char *name, size_t length) {
+    for (const char *p = node_attr(inner, "exportparts"); p && *p;) {
+        const char *end = strchr(p, ','), *s = p;
+        if (!end) end = p + strlen(p);
+        p = *end ? end + 1 : end;
+        while (s < end && is_space(*s)) s++;
+        const char *key = s;
+        while (s < end && !is_space(*s) && *s != ':') s++;
+        const char *value = key;
+        size_t key_length = (size_t)(s - key), value_length = key_length;
+        while (s < end && is_space(*s)) s++;
+        if (s < end) {
+            if (*s++ != ':') continue;
+            while (s < end && is_space(*s)) s++;
+            value = s;
+            while (s < end && !is_space(*s) && *s != ':') s++;
+            value_length = (size_t)(s - value);
+            while (s < end && is_space(*s)) s++;
+            if (s < end) continue;
+        }
+        if (key_length && value_length == length && !memcmp(value, name, length) &&
+            part_exposed(e, inner, key, key_length)) return true;
+    }
+    return false;
+}
+
+/* The compounds left of c from e, which matched c. */
+static bool match_left(const struct compound *c, node_t *e, const struct selector_match *context) {
     node_t *scope = context->shadow;
-    if (!e || e->type != N_ELEM) return false;
-    if (e) {
-        if (css_can_service()) { if (!web_native_checkpoint(e->owner)) return false; }
-        else if (__atomic_load_n(&e->owner->native_cancelled, __ATOMIC_ACQUIRE)) return false;
-    }
-    for (int i = 0; i < c->n; i++) if (c->s[i].kind == SK_SLOTTED) {
-        struct selector_match slotted = *context; slotted.shadow = NULL;
-        if (!scope || !match_list_bound(c->s[i].args, e, &slotted)) return false;
-        node_t *slot = doc_assigned_slot(e, false);
-        /* A slot assigned into another slot can expose the same flattened
-           element. Follow assignment links without changing DOM parents. */
-        for (; slot; slot = doc_assigned_slot(slot, false))
-            if (doc_node_root(slot, false) == scope && match_compound(c, slot, context)) break;
-        if (!slot) return false;
-        e = slot;
-        break;
-    }
-    if (!match_compound(c, e, context)) return false;
     if (!c->left) return true;
     switch (c->comb) {
     case '>': {
@@ -2424,9 +2460,53 @@ static bool match_from_bound(const struct compound *c, node_t *e, const struct s
     return false;
 }
 
+/* ::part() at c->s[at], e the element it would select. The simples after it
+   select e; the ones before it and the compounds left of c select a host that
+   exposes e under every listed name and is in the rule's tree, or is that
+   tree's own host (:host::part()). */
+static bool match_part(const struct compound *c, int at, node_t *e, const struct selector_match *context) {
+    node_t *scope = context->shadow;
+    if (!match_compound_range(c, at + 1, c->n, e, context)) return false;
+    for (node_t *host = doc_node_root(e, false)->shadow_host; host; host = doc_node_root(host, false)->shadow_host) {
+        node_t *root = doc_node_root(host, false);
+        if (scope ? root != scope && host != scope->shadow_host : root->type != N_DOC) continue;
+        bool exposed = true;
+        for (const char *name = c->s[at].value; exposed && *name; name += strlen(name) + 1)
+            exposed = part_exposed(e, host, name, strlen(name));
+        if (exposed && match_compound_range(c, 0, at, host, context) && match_left(c, host, context)) return true;
+    }
+    return false;
+}
+
+static bool match_from_bound(const struct compound *c, node_t *e, const struct selector_match *context) {
+    node_t *scope = context->shadow;
+    if (!e || e->type != N_ELEM) return false;
+    if (e) {
+        if (css_can_service()) { if (!web_native_checkpoint(e->owner)) return false; }
+        else if (__atomic_load_n(&e->owner->native_cancelled, __ATOMIC_ACQUIRE)) return false;
+    }
+    /* ::part() (op 1 of SK_PE) and ::slotted() select through another element;
+       a compound has at most one of them */
+    for (int i = 0; i < c->n; i++) if (c->s[i].kind == SK_PE && c->s[i].op == 1) return match_part(c, i, e, context);
+    else if (c->s[i].kind == SK_SLOTTED) {
+        struct selector_match slotted = *context; slotted.shadow = NULL;
+        if (!scope || !match_list_bound(c->s[i].args, e, &slotted)) return false;
+        node_t *slot = doc_assigned_slot(e, false);
+        /* A slot assigned into another slot can expose the same flattened
+           element. Follow assignment links without changing DOM parents. */
+        for (; slot; slot = doc_assigned_slot(slot, false))
+            if (doc_node_root(slot, false) == scope && match_compound(c, slot, context)) break;
+        if (!slot) return false;
+        e = slot;
+        break;
+    }
+    return match_compound(c, e, context) && match_left(c, e, context);
+}
+
+/* A query selects elements of the tree itself: no pseudo-element, no ::part(). */
 static bool match_list_bound(const struct sellist *l, node_t *e, const struct selector_match *context) {
     for (int i = 0; l && i < l->n; i++)
-        if (!l->v[i]->pseudo && match_from_bound(l->v[i]->right, e, context)) return true;
+        if (!l->v[i]->pseudo && !l->v[i]->part && match_from_bound(l->v[i]->right, e, context)) return true;
     return false;
 }
 
@@ -4314,6 +4394,7 @@ struct layer_sheet_map {
 struct css_index {
     struct htab ids, classes, tags;
     struct ient *univ;
+    struct ient *parts; /* ::part() rules: they select elements of other trees */
     struct font_face *fonts;
     struct opacity_keyframes *motions;
     uint32_t rules;
@@ -4572,12 +4653,13 @@ static struct ient *index_rule(arena_t *a, struct css_index *x, const struct rul
     ie->pseudo = s->pseudo;
     const struct compound *c = s->right;
     const char *id = NULL, *cls = NULL, *tag = NULL;
-    for (int i = 0; s->pseudo != PE_SLOTTED && i < c->n; i++) {
+    for (int i = 0; s->pseudo != PE_SLOTTED && !s->part && i < c->n; i++) {
         if (c->s[i].kind == SK_ID && !id) id = c->s[i].name;
         else if (c->s[i].kind == SK_CLASS && !cls) cls = c->s[i].name;
         else if (c->s[i].kind == SK_TAG) tag = c->s[i].name;
     }
-    struct ient **slot = id ? ht_slot(a, &x->ids, id, true)
+    struct ient **slot = s->part ? &x->parts
+                       : id ? ht_slot(a, &x->ids, id, true)
                        : cls ? ht_slot(a, &x->classes, cls, true)
                        : tag ? ht_slot(a, &x->tags, tag, true)
                              : &x->univ;
@@ -4828,10 +4910,13 @@ static void index_compound_features(arena_t *a, struct css_index *x, const struc
         }
     }
 }
-static void index_features(arena_t *a, struct css_index *x, const struct compound *right) {
+static void index_features(arena_t *a, struct css_index *x, const struct selector *sel) {
+    const struct compound *right = sel->right;
     struct feature_key key;
-    bool keyed = subject_key(right, &key);
-    unsigned reach = REACH_SELF;
+    /* ::part(): the subject is in a shadow tree below the host the right
+       compound names, out of a keyed walk's reach */
+    bool keyed = !sel->part && subject_key(right, &key);
+    unsigned reach = sel->part ? REACH_SUBTREE : REACH_SELF;
     for (const struct compound *c = right; c; c = c->left) {
         index_compound_features(a, x, c, c, reach, keyed ? &key : NULL);
         if (c->comb != '+' && c->comb != '~') reach = REACH_DESCENDANTS;
@@ -4885,7 +4970,7 @@ static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
                 index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_SIBLING);
             }
             index_rule(a, index, r, r->sel->v[k], index->rules, media);
-            index_features(a, index, r->sel->v[k]->right);
+            index_features(a, index, r->sel->v[k]);
             if (d->profile_enabled) d->profile.style_index_entries++;
         }
     }
@@ -5804,7 +5889,7 @@ static void collect(const struct ient *l, const struct element_keys *k, node_t *
             } else if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
         }
         tally->bucket[bucket]++;
-        if (!binding->ua) {
+        if (!binding->ua && !l->sel->part) { /* match_part() checks the trees of a ::part() */
             if (!scope && root && root->shadow_host) continue;
             if (scope && l->pseudo != PE_SLOTTED && root != scope && e != scope->shadow_host) continue;
         }
@@ -5856,6 +5941,19 @@ static void collect_index(struct css_binding *binding, const struct element_keys
 static void collect_scope(node_t *root, const struct element_keys *k) {
     if (root && root->style_scope)
         collect_index(root->style_scope->first, k, root->shadow_host ? root : NULL);
+}
+/* ::part(): an element of a shadow tree with part names, from its own tree
+   (:host::part()) out to the document's. */
+static void collect_parts(const struct element_keys *k) {
+    node_t *root = k->root;
+    if (!root || !root->shadow_host || !node_attr(k->e, "part")) return;
+    for (; root; root = root->shadow_host ? doc_node_root(root->shadow_host, false) : NULL) {
+        if (!root->style_scope) continue;
+        node_t *scope = root->shadow_host ? root : NULL;
+        struct collect_tally tally = {0};
+        for (struct css_binding *binding = root->style_scope->first; binding; binding = binding->next)
+            collect(binding->index->parts, k, scope, scope_depth(scope), binding, &tally, COLLECT_UNIVERSAL);
+    }
 }
 
 static int cmp_dent(const void *a, const void *b) {
@@ -7524,6 +7622,7 @@ static __attribute__((noinline)) void cascade_collect(struct cascade *c, node_t 
     if (e->shadow_root) collect_scope(e->shadow_root, &keys); /* :host */
     for (node_t *slot = e->assigned_slot; slot; slot = slot->assigned_slot)
         collect_scope(doc_node_root(slot, false), &keys); /* ::slotted */
+    collect_parts(&keys);
 }
 
 static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
@@ -7933,7 +8032,8 @@ static bool inspect_scope_ok(const sheet_t *s, node_t *e) {
 static bool inspect_sheet(web_doc *d, const sheet_t *s, node_t *e, uint32_t *order, const struct css_inspect_sink *sink) {
     int vw = d->sty.index_w > 0 ? d->sty.index_w : d->styled_w, vh = d->sty.index_h > 0 ? d->sty.index_h : d->styled_h;
     bool scripting = web_js_enabled(d);
-    if (!sheet_media_ok(s, vw, vh, scripting) || !inspect_scope_ok(s, e)) { for (struct rule *r = s->first; r; r = r->next) (*order)++; return true; }
+    if (!sheet_media_ok(s, vw, vh, scripting)) { for (struct rule *r = s->first; r; r = r->next) (*order)++; return true; }
+    bool scoped = inspect_scope_ok(s, e); /* else only a ::part() can select e */
     const struct selector_match context = {.shadow = s->scope};
     for (struct rule *r = s->first; r; r = r->next) {
         uint32_t at = (*order)++;
@@ -7941,7 +8041,7 @@ static bool inspect_sheet(web_doc *d, const sheet_t *s, node_t *e, uint32_t *ord
         bool matched = false; uint32_t spec = 0;
         for (int k = 0; k < r->sel->n; k++) {
             const struct selector *x = r->sel->v[k];
-            if (x->pseudo || !match_from_bound(x->right, e, &context)) continue;
+            if (x->pseudo || (!scoped && !x->part) || !match_from_bound(x->right, e, &context)) continue;
             if (!matched || x->spec > spec) spec = x->spec;
             matched = true;
         }

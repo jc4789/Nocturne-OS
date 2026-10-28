@@ -5,11 +5,14 @@ test_invalid_selector・test_valid_forgiving_selector）、属性の大文字小
 （attribute-selectors/attribute-case の semantics・syntax・cssom）、:heading の頁、
 An+B の上限の頁と、決まった値を照らす小さな頁を node で読み、試験の呼出しと期待を
 取り出して、css.c を取り込んだ道具（tests/css_selectors_native_cases.c）に渡す。
+css/css-shadow/part（::part()）の頁は、頁の木（custom element の template を shadow
+tree に）を道具へ渡し、cascade 自身の集め方（cascade_collect・style 属性・cmp_dent）で
+勝つ色を照らす。読む前に DOM を変える subtest と form の部品のある頁は数えて落とす。
 
 照らすのは native の層だけ：insertRule は css_parse_sheet と css_sheet_single_rule、
 selectorText・cssText は規則の直列化、querySelector・matches は css_select_n・
 css_matches_n、getComputedStyle は「規則の選択子のどれかが要素に当たるか」で置き換える
-（cascade の索引と Bloom の篩は通さない）。JS の束縛（例外の型・CSSOM の物）、iframe の
+（cascade の索引と Bloom の篩は通さない。::part() の頁だけは索引を通る）。JS の束縛（例外の型・CSSOM の物）、iframe の
 読込み、:focus-visible の打鍵は guest の WPT の仕事。
 
   python -X utf8 tests/check_css_selectors.py [--old] [--verbose] [--file 名前の一部]
@@ -339,6 +342,130 @@ subtest("missing-right-token.html", "attribute selectors with missing right toke
          ("D", "html", "div@id=container/span", "", "", "span:not([class]"),
          ("D", "html", "div@id=container/span", "", "", "span:not([class")],
         lambda a: all(x[2] == "E" for x in a))
+
+# css/css-shadow/part (CSS Shadow Parts): the pages that build their shadow trees with
+# support/shadow-helper.js's installCustomElement and read a computed color through
+# getElementByShadowIds. The page's tree, with each custom element's template as its
+# shadow tree, goes to the tool ('C'), which answers with the color the cascade's own
+# collection (cascade_collect, the style attribute, cmp_dent) lets win, inherited along
+# the flat tree. A subtest that changes the DOM before it reads is the guest's: it is
+# counted, and fails here as "not transcribed".
+from html.parser import HTMLParser
+parts = Path("D:/Programes/cloned repos/wpt/css/css-shadow/part")
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+class Element:
+    def __init__(self, tag, attrs):
+        self.tag, self.attrs, self.children, self.text = tag, [(k, v or "") for k, v in attrs], [], ""
+class Builder(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = Element("#document", [])
+        self.stack = [self.root]
+    def handle_starttag(self, tag, attrs):
+        e = Element(tag, attrs)
+        self.stack[-1].children.append(e)
+        if tag not in VOID:
+            self.stack.append(e)
+    def handle_startendtag(self, tag, attrs):
+        self.stack[-1].children.append(Element(tag, attrs))
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, 0, -1):
+            if self.stack[i].tag == tag:
+                del self.stack[i:]
+                break
+    def handle_data(self, data):
+        self.stack[-1].text += data
+def walk(e):
+    yield e
+    for c in e.children:
+        yield from walk(c)
+NAMED = {"green": "rgb(0, 128, 0)", "red": "rgb(255, 0, 0)", "blue": "rgb(0, 0, 255)", "black": "rgb(0, 0, 0)"}
+def computed(value):
+    """the declared value as getComputedStyle serializes it; '-': the initial CanvasText (light)"""
+    v = value.strip().lower()
+    if v == "-":
+        return "rgb(0, 0, 0)"
+    if v in NAMED:
+        return NAMED[v]
+    m = re.fullmatch(r"rgb\(\s*(\d+)\s*,?\s*(\d+)\s*,?\s*(\d+)\s*\)", v)
+    return f"rgb({m.group(1)}, {m.group(2)}, {m.group(3)})" if m else v
+lookup = re.compile(r"(?:const|var|let)\s+(\w+)\s*=\s*getElementByShadowIds\(\s*document\s*,\s*\[([^\]]*)\]\s*\)")
+check = re.compile(r"assert_(not_)?equals\(\s*window\.getComputedStyle\(\s*(\w+)\s*(?:,\s*['\"]::?([\w-]+)['\"])?\s*\)"
+                   r"\.color\s*,\s*(\w+)\s*\)")
+for path in sorted(parts.glob("*.html")):
+    if "-ref" in path.name or ".ref" in path.name:
+        continue
+    page = path.read_text(encoding="utf-8")
+    if "getElementByShadowIds" not in page or "installCustomElement" not in page:
+        continue
+    builder = Builder()
+    builder.feed(page)
+    document = builder.root
+    scripts = [e.text for e in walk(document) if e.tag == "script" and not dict(e.attrs).get("src")]
+    registry = dict(re.findall(r"installCustomElement\(\s*[\"']([\w-]+)[\"']\s*,\s*[\"']([\w-]+)[\"']\s*\)", "\n".join(scripts)))
+    templates = {dict(e.attrs).get("id"): e for e in walk(document) if e.tag == "template"}
+    colors = dict(re.findall(r"const\s+(\w+)\s*=\s*\"(rgb\([^\"]*\))\"", "\n".join(scripts)))
+    items, sheets, ids, shadow_of = [], [], [{}], {}
+    def emit(children, depth, tree):
+        for e in children:
+            index = len(items)
+            items.append([str(depth), e.tag] + [x for kv in e.attrs for x in kv])
+            if dict(e.attrs).get("id"):
+                ids[tree].setdefault(dict(e.attrs)["id"], index)
+            if e.tag == "style":
+                sheets.append((tree, e.text))
+            if e.tag in registry and registry[e.tag] in templates:
+                items.append([str(depth + 1), "#shadow"])
+                ids.append({})
+                shadow_of[index] = len(ids) - 1
+                emit(templates[registry[e.tag]].children, depth + 2, len(ids) - 1)
+            if e.tag != "template":
+                emit(e.children, depth + 1, tree)
+    html = next((e for e in document.children if e.tag == "html"), document)
+    for e in html.children:
+        if e.tag == "head":
+            sheets += [(0, s.text) for s in walk(e) if s.tag == "style"]
+    body = next((e for e in walk(html) if e.tag == "body"), None)
+    emit(body.children if body else [], 1, 0)
+    tree = "\x1d".join("\x1f".join(item) for item in items)
+    sheet_text = "\x1e".join(f"{level}\x1f{text}" for level, text in sheets)
+    # the scripts' statements other than the helpers' calls, the color constants and the tests
+    rest = "\n".join(scripts)
+    for m in re.finditer(r"test\(\s*(?:function\s*\(\s*\)|\(\s*\)\s*=>)\s*\{(.*?)\}\s*,\s*([\"'])(.*?)\2\s*\)\s*;?", rest, re.S):
+        body_text, name = m.group(1), m.group(3)
+        statements = [s.strip() for s in body_text.split(";") if s.strip()]
+        requests, expectations, ok = [], [], bool(statements)
+        elements = {}
+        for s in statements:
+            if (found := lookup.fullmatch(s)):
+                path_ids = re.findall(r"[\"']([^\"']+)[\"']", found.group(2))
+                tree_at, target = 0, None
+                for i, name_id in enumerate(path_ids):
+                    target = ids[tree_at].get(name_id) if tree_at is not None else None
+                    if target is None:
+                        break
+                    tree_at = shadow_of.get(target) if i + 1 < len(path_ids) else tree_at
+                if target is None:
+                    ok = False
+                elements[found.group(1)] = target
+            elif (found := check.fullmatch(s)) and found.group(2) in elements and found.group(4) in colors:
+                requests.append(("C", tree, str(elements[found.group(2)]), found.group(3) or "", sheet_text))
+                expectations.append((bool(found.group(1)), colors[found.group(4)]))
+            elif s in ('"use strict"', "'use strict'"):
+                continue
+            else:
+                ok = False
+        if not ok or not requests:
+            subtest("css-shadow/part/" + path.name, name, [], lambda a: False, "読む前に DOM を変える：guest の WPT")
+            continue
+        if any(item[1] in ("input", "select", "textarea") for item in items):
+            # the tool builds no form control (setting their attributes asks the form layer)
+            subtest("css-shadow/part/" + path.name, name, [], lambda a: False, "form の部品：guest の WPT")
+            continue
+        def judge(a, expectations=expectations):
+            return all((computed(x[0]) != want) if negated else (computed(x[0]) == want)
+                       for x, (negated, want) in zip(a, expectations))
+        subtest("css-shadow/part/" + path.name, name, requests, judge)
 
 # ---- run
 requests = [r for t in subtests for r in t[2]]
