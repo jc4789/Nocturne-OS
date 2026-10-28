@@ -71,6 +71,7 @@ enum js_dom_opcode {
     DOM_submit,
     DOM_validation,
     DOM_viewport,
+    DOM_xpath,
     DOM_OPCODE_COUNT
 };
 static const char *const dom_opcode_names[DOM_OPCODE_COUNT]={
@@ -145,6 +146,7 @@ static const char *const dom_opcode_names[DOM_OPCODE_COUNT]={
     "submit",
     "validation",
     "viewport",
+    "xpath",
 };
 static int dom_opcode(const char *name) {
     int lo=0,hi=DOM_OPCODE_COUNT;
