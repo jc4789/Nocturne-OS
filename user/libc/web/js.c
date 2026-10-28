@@ -8483,7 +8483,7 @@ bool web_console_eval(web_doc *d,const char *source,size_t length) {
         if(d->native_cancelled||d->native_recovery_pending||!d->layout_valid)return false;
     }
     begin_named_task(s,"developer console",0);
-    JSValue result=JS_Eval(s->ctx,source,length,"nocturne:developer-console",JS_EVAL_TYPE_GLOBAL);
+    JSValue result=JS_Eval(s->ctx,source,length,"<developer-console>",JS_EVAL_TYPE_GLOBAL);
     bool ok=!JS_IsException(result);
     if(!ok)exception(s);
     else if(!JS_IsUndefined(result)){
@@ -8678,6 +8678,8 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_SetHostPromiseRejectionTracker(s->rt, promise_rejection, s);
         JS_SetHostJobFilter(s->rt, browser_job_allowed, NULL);
         JS_SetCaughtExceptionHook(s->rt, caught_exception, NULL);
+        /* --debug-js keeps the platform scripts' frames for our own diagnosis. */
+        if (!s->host.debug_js) JS_SetPlatformScriptPrefix(s->rt, "nocturne:");
         web_atomics_runtime_init(s->rt);
     }else s->heap_limit=s->runtime_owner->heap_limit;
     s->ctx = JS_NewContext(s->rt); if (!s->ctx) goto failed;

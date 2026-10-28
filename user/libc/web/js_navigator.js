@@ -29,6 +29,12 @@ const navigatorBridge=(()=>{
         if(!worker)define(Interface.prototype,'webdriver',{configurable:true,enumerable:true,get(){
             requireReceiver(this);return false;
         }});
+        // Pointer Events: Window-only. The input layer turns a touch screen or
+        // pen into the one system pointer (kernel usbhid.c), so pages never see
+        // simultaneous touch contacts.
+        if(!worker)define(Interface.prototype,'maxTouchPoints',{configurable:true,enumerable:true,get(){
+            requireReceiver(this);return 0;
+        }});
         // Beacon: a POST that outlives the document, carried by the native
         // keepalive fetch transport. Only a CORS-safelisted body type may go
         // without CORS; anything else needs the server's consent.

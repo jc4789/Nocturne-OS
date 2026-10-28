@@ -87,8 +87,9 @@ const consoleNamespace = (print, now) => {
             if (text === null) logger(0, [tabularData]); else printer(0, [text]);
         },
         trace(...data) {
-            /* QuickJS stacks have no header line: the first frame is this one. */
-            const stack = StringImpl(new Error().stack || '').split('\n').slice(1).join('\n');
+            /* QuickJS stacks have no header line. The platform's own frames
+               (this one) are left out unless --debug-js keeps them. */
+            const stack = StringImpl(new Error().stack || '').split('\n').filter(frame => frame && !frame.includes('(nocturne:')).join('\n');
             const values = data.length ? format(data) : ['console.trace'];
             if (stack) values.push(values.pop() + '\n' + stack);
             printer(0, values);

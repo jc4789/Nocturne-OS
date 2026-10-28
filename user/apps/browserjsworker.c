@@ -623,7 +623,8 @@ int main(int argc,char**argv){
     JS_SetPropertyStr(w.ctx,global,"__workerHost",host);JS_FreeValue(w.ctx,global);
     /* Worker platform interfaces are built-ins too: no implementation source. */
     {JSRuntime *rt=JS_GetRuntime(w.ctx);int strip=JS_GetStripInfo(rt);JS_SetStripInfo(rt,strip|JS_STRIP_SOURCE);
-    w.hooks=JS_Eval(w.ctx,js_worker_runtime,sizeof js_worker_runtime-1,"<worker-bootstrap>",JS_EVAL_TYPE_GLOBAL);JS_SetStripInfo(rt,strip);}
+    JS_SetPlatformScriptPrefix(rt,"nocturne:");
+    w.hooks=JS_Eval(w.ctx,js_worker_runtime,sizeof js_worker_runtime-1,"nocturne:worker-bindings",JS_EVAL_TYPE_GLOBAL);JS_SetStripInfo(rt,strip);}
     if(JS_IsException(w.hooks))goto shutdown;
     JS_SetDynamicCodeCheck(w.ctx,worker_code_check,&w);
     while(!w.closed||w.output){

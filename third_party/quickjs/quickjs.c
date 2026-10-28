@@ -383,6 +383,7 @@ struct JSRuntime {
     void *atomics_wait_async_opaque;
     JSCaughtExceptionHook *caught_exception_hook;
     void *caught_exception_opaque;
+    char platform_script_prefix[32];
 #endif
 
     JSModuleNormalizeFunc *module_normalize_func;
@@ -2394,6 +2395,11 @@ void JS_SetCaughtExceptionHook(JSRuntime *rt, JSCaughtExceptionHook *hook, void 
 {
     rt->caught_exception_hook = hook;
     rt->caught_exception_opaque = opaque;
+}
+
+void JS_SetPlatformScriptPrefix(JSRuntime *rt, const char *prefix)
+{
+    snprintf(rt->platform_script_prefix, sizeof rt->platform_script_prefix, "%s", prefix ? prefix : "");
 }
 
 int JS_EnqueueJobForCallback(JSContext *ctx, JSValueConst callback,
@@ -7904,6 +7910,27 @@ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop
 
 /* if filename != NULL, an additional level is added with the filename
    and line number information (used for parse error). */
+#ifdef CONFIG_NOCTURNE
+/* A frame of a function compiled from a script named under the runtime's
+   platform prefix (JS_SetPlatformScriptPrefix). */
+static BOOL platform_frame(JSContext *ctx, JSStackFrame *sf)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p;
+    char atom_buf[ATOM_GET_STR_BUF_SIZE];
+    const char *script;
+
+    if (!rt->platform_script_prefix[0] || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return FALSE;
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id) || !p->u.func.function_bytecode->has_debug)
+        return FALSE;
+    script = JS_AtomGetStr(ctx, atom_buf, sizeof atom_buf,
+                           p->u.func.function_bytecode->debug.filename);
+    return !strncmp(script, rt->platform_script_prefix, strlen(rt->platform_script_prefix));
+}
+#endif
+
 static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
                             const char *filename, int line_num, int col_num,
                             int backtrace_flags)
@@ -7964,12 +7991,23 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
             str1 = "<anonymous>";
         else
             str1 = func_name_str;
+        p = JS_VALUE_GET_OBJ(sf->cur_func);
+#ifdef CONFIG_NOCTURNE
+        /* Web IDL operations and attributes implemented in a platform script
+           print no frame, as in engines whose bindings are native code: the
+           page sees its own frames only, never the platform script's name,
+           lines or helpers, nor the built-ins those helpers call. */
+        if (platform_frame(ctx, sf) ||
+            (!js_class_has_bytecode(p->class_id) && sf->prev_frame && platform_frame(ctx, sf->prev_frame))) {
+            JS_FreeCString(ctx, func_name_str);
+            continue;
+        }
+#endif
         dbuf_printf(&dbuf, "    at %s", str1);
         JS_FreeCString(ctx, func_name_str);
         if (dbuf_error(&dbuf))
             goto done;
 
-        p = JS_VALUE_GET_OBJ(sf->cur_func);
         if (js_class_has_bytecode(p->class_id)) {
             JSFunctionBytecode *b;
             const char *atom_str;

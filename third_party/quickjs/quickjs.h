@@ -1087,6 +1087,10 @@ typedef void JSCaughtExceptionHook(JSContext *ctx, JSValueConst exception,
                                    JS_BOOL rejected, void *opaque);
 void JS_SetCaughtExceptionHook(JSRuntime *rt, JSCaughtExceptionHook *hook, void *opaque);
 int JS_DescribeException(JSContext *ctx, JSValueConst exception, char *buf, int size);
+/* Scripts whose name starts with 'prefix' implement built-ins: their frames,
+   and the native frames they call, are left out of Error stacks, as native
+   bindings print none. An empty prefix (the default) shows every frame. */
+void JS_SetPlatformScriptPrefix(JSRuntime *rt, const char *prefix);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
