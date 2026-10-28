@@ -35,9 +35,13 @@ const historyBridge=(()=>{
         string(unused); url=url==null?null:string(url);
         const serialized = host.pack(cloneData.serialize(data,undefined,true));
         const current = currentLocation();
-        let next;
-        try { next = url == null || url === '' ? current : fields(new URLImpl(url, document.baseURI)); }
-        catch (_) { throw new DOMException('Invalid history URL','SecurityError'); }
+        let next = current;
+        // encoding-parse relative to the document: its character encoding for the query.
+        if (url != null && url !== '') {
+            const parsed = urlBridge.encodingParse(url, rawDom.get(document, 'baseURI'), rawDom.get(document, 'characterSet'));
+            if (parsed === null) throw new DOMException('Invalid history URL','SecurityError');
+            next = fields(parsed);
+        }
         const opaque = current.origin === 'null';
         if (current.origin !== next.origin || current.username !== next.username || current.password !== next.password ||
             (opaque && current.href.split('#')[0] !== next.href.split('#')[0]))
@@ -82,9 +86,14 @@ const historyBridge=(()=>{
                 // IDL conversion can reenter history/navigation. Copy the
                 // native document URL only after that conversion completes.
                 value = string(value);
-                const url = new URLImpl(host.url());
-                apply(urlSet[key], url, [value]);
-                host.navigate(apply(urlGet.href, url, []));
+                // Location's search setter parses the query in the document's
+                // character encoding; the URL interface's setters in UTF-8.
+                if (key === 'search') host.navigate(urlBridge.search(host.url(), value, rawDom.get(document, 'characterSet')));
+                else {
+                    const url = new URLImpl(host.url());
+                    apply(urlSet[key], url, [value]);
+                    host.navigate(apply(urlGet.href, url, []));
+                }
                 cachedLocation = null;
             }
         });

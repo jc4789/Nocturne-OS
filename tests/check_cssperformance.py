@@ -80,7 +80,7 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / "native.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include", "-Icommon",
-           "-Iuser/libc", "-Iuser/libc/web", "-Itests", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c",
+           "-Iuser/libc", "-Iuser/libc/web", "-Itests", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c","user/libc/web/color.c",
            "user/libc/web/util.c", "user/libc/web/html.c", str(urls), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)] + (["local-boxes"] if "--local-boxes" in sys.argv else ["placeholder"] if "--placeholder" in sys.argv else ["text-overflow"] if "--text-overflow" in sys.argv else ["font-shorthand"] if "--font-shorthand" in sys.argv else ["flex"] if "--flex" in sys.argv else ["media-calc"] if "--media-calc" in sys.argv else ["fonts"] if "--fonts" in sys.argv else ["second"] if "--second" in sys.argv else []), cwd=root, env=env, check=True, timeout=30)

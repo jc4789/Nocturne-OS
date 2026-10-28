@@ -1,6 +1,7 @@
 #include "js_encoding.h"
 #include "webi.h"
 #include "png.h"
+#include "web_encoding.h"
 #include <limits.h>
 
 /* Validate WHATWG scalar UTF-8 before using QuickJS's string constructor:
@@ -67,6 +68,18 @@ static JSValue utf8_text(JSContext *ctx, const uint8_t *bytes, size_t len, bool 
     return result;
 }
 
+/* A view's bytes in its ArrayBuffer, or NULL with an exception. An empty view
+   reads nothing: a detached buffer's views are empty and its bytes are none. */
+static const uint8_t *view_bytes(JSContext *ctx, JSValueConst buffer, uint64_t offset, uint64_t length) {
+    if(!length)return (const uint8_t *)"";
+    size_t size=0;
+    uint8_t *data=JS_GetArrayBuffer(ctx,&size,buffer);
+    if(!data){if(!JS_HasException(ctx))JS_ThrowTypeError(ctx,"Expected an ArrayBuffer");return NULL;}
+    if(offset>size||length>size-(size_t)offset){JS_ThrowRangeError(ctx,"View exceeds its buffer");return NULL;}
+    if(length>(size_t)INT_MAX/3u){JS_ThrowRangeError(ctx,"Text input is too large");return NULL;}
+    return data+(size_t)offset;
+}
+
 JSValue web_js_decode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
                            void (*prepare)(JSContext *, size_t)) {
     uint64_t offset,length;
@@ -75,12 +88,8 @@ JSValue web_js_decode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
        native pointer across an observable conversion or detached buffer. */
     if(JS_ToIndex(ctx,&offset,argv[1])<0||JS_ToIndex(ctx,&length,argv[2])<0)return JS_EXCEPTION;
     bool fatal=JS_ToBool(ctx,argv[3])>0,ignore_bom=JS_ToBool(ctx,argv[4])>0;
-    size_t size=0;
-    uint8_t *data=JS_GetArrayBuffer(ctx,&size,argv[0]);
-    if(!data&&JS_HasException(ctx))return JS_EXCEPTION;
-    if(offset>size||length>size-(size_t)offset)return JS_ThrowRangeError(ctx,"UTF-8 view exceeds its buffer");
-    if(length>(size_t)INT_MAX/3u)return JS_ThrowRangeError(ctx,"UTF-8 input is too large");
-    const uint8_t *bytes=data?data+(size_t)offset:(const uint8_t *)"";
+    const uint8_t *bytes=view_bytes(ctx,argv[0],offset,length);
+    if(!bytes)return JS_EXCEPTION;
     size_t len=(size_t)length;
     if(!ignore_bom&&len>=3&&bytes[0]==0xef&&bytes[1]==0xbb&&bytes[2]==0xbf){bytes+=3;len-=3;}
     return utf8_text(ctx,bytes,len,fatal,prepare);
@@ -89,17 +98,78 @@ JSValue web_js_utf8_text(JSContext *ctx, const uint8_t *bytes, size_t length) {
     if(length>(size_t)INT_MAX/3u)return JS_ThrowRangeError(ctx,"UTF-8 input is too large");
     return utf8_text(ctx,bytes,length,false,NULL);
 }
-/* QuickJS writes a lone surrogate in its three-byte form ED A0..BF xx, the
-   length of U+FFFD's: the Encoding Standard's scalar values come from
-   replacing those in place. ED never occurs as a continuation byte. */
-void web_utf8_replace_lone_surrogates(uint8_t *bytes, size_t length) {
-    for (uint8_t *p=memchr(bytes,0xed,length);p;p=memchr(p,0xed,length-(size_t)(p-bytes))) {
-        if(p[1]>=0xa0){p[0]=0xef;p[1]=0xbf;p[2]=0xbd;}
-        p+=3;
-        if((size_t)(p-bytes)>=length)break;
-    }
+
+JSValue web_js_get_encoding(JSContext *ctx, int argc, JSValueConst *argv) {
+    if(argc<1||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"get an encoding requires a label");
+    size_t length=0;
+    const char *label=JS_ToCStringLen(ctx,&length,argv[0]);
+    if(!label)return JS_EXCEPTION;
+    web_encoding encoding=web_encoding_get(label,length);
+    JS_FreeCString(ctx,label);
+    return encoding?JS_NewString(ctx,web_encoding_name(encoding)):JS_NULL;
 }
 
+/* A TextDecoder's decoder instance (web_encoding.h) as an object without
+   properties, whose finalizer frees it. */
+static JSClassID decoder_class;
+static void decoder_finalizer(JSRuntime *rt, JSValue value) {
+    js_free_rt(rt,JS_GetOpaque(value,decoder_class));
+}
+
+JSValue web_js_text_decoder(JSContext *ctx, int argc, JSValueConst *argv) {
+    if(argc<3||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"A text decoder requires an encoding");
+    size_t length=0;
+    const char *label=JS_ToCStringLen(ctx,&length,argv[0]);
+    if(!label)return JS_EXCEPTION;
+    web_encoding encoding=web_encoding_get(label,length);
+    JS_FreeCString(ctx,label);
+    /* decode (XHR's text response): a label that is no encoding is UTF-8,
+       replacement decodes, and a BOM chooses the encoding. */
+    bool decode=argc>3&&JS_ToBool(ctx,argv[3])>0;
+    if(decode&&!encoding)encoding=WEB_ENCODING_UTF8;
+    if(!encoding||(!decode&&encoding==LXB_ENCODING_REPLACEMENT))return JS_ThrowRangeError(ctx,"Unsupported text encoding");
+    bool fatal=JS_ToBool(ctx,argv[1])>0,ignore_bom=decode||JS_ToBool(ctx,argv[2])>0;
+    JSRuntime *rt=JS_GetRuntime(ctx);
+    if(!decoder_class)JS_NewClassID(&decoder_class);
+    if(!JS_IsRegisteredClass(rt,decoder_class)){
+        JSClassDef definition={.class_name="NocturneTextDecoder",.finalizer=decoder_finalizer};
+        if(JS_NewClass(rt,decoder_class,&definition)<0)return JS_ThrowOutOfMemory(ctx);
+    }
+    JSValue handle=JS_NewObjectClass(ctx,(int)decoder_class);
+    if(JS_IsException(handle))return handle;
+    struct web_decoder *decoder=js_malloc(ctx,sizeof *decoder);
+    if(!decoder){JS_FreeValue(ctx,handle);return JS_EXCEPTION;}
+    web_decoder_init(decoder,encoding,fatal);
+    /* TextDecoder's serialize I/O queue drops a first U+FEFF of these three. */
+    decoder->drop_bom=!ignore_bom&&(encoding==WEB_ENCODING_UTF8||encoding==LXB_ENCODING_UTF_16BE||
+                                    encoding==LXB_ENCODING_UTF_16LE);
+    decoder->sniff=decode;
+    JS_SetOpaque(handle,decoder);
+    return handle;
+}
+
+JSValue web_js_text_decode(JSContext *ctx, int argc, JSValueConst *argv,
+                           void (*prepare)(JSContext *, size_t)) {
+    uint64_t offset,length;
+    if(argc<5)return JS_ThrowTypeError(ctx,"Text decode requires a decoder and a buffer view");
+    struct web_decoder *decoder=JS_GetOpaque2(ctx,argv[0],decoder_class);
+    if(!decoder)return JS_EXCEPTION;
+    if(JS_ToIndex(ctx,&offset,argv[2])<0||JS_ToIndex(ctx,&length,argv[3])<0)return JS_EXCEPTION;
+    bool stream=JS_ToBool(ctx,argv[4])>0;
+    const uint8_t *bytes=view_bytes(ctx,argv[1],offset,length);
+    if(!bytes)return JS_EXCEPTION;
+    struct web_bytes out={0};
+    int result=web_decoder_run(decoder,bytes,(size_t)length,!stream,&out);
+    if(result!=1){
+        free(out.data);
+        if(result<0)return JS_ThrowOutOfMemory(ctx);
+        return JS_ThrowTypeError(ctx,"The encoded data is not valid %s",web_encoding_name(decoder->encoding));
+    }
+    if(prepare)prepare(ctx,out.length*2u+64u);
+    JSValue text=JS_NewStringLen(ctx,out.data?out.data:"",out.length);
+    free(out.data);
+    return text;
+}
 JSValue web_js_encode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
                            void (*prepare)(JSContext *, size_t)) {
     if(argc<1||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"UTF-8 encode requires a string");
@@ -290,9 +360,21 @@ static JSValue isolated_encode_utf8_into(JSContext *ctx, JSValueConst self, int 
 static JSValue isolated_concat_utf8(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)self;return web_js_concat_utf8(ctx,argc,argv,NULL);
 }
+static JSValue isolated_get_encoding(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_get_encoding(ctx,argc,argv);
+}
+static JSValue isolated_text_decoder(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_text_decoder(ctx,argc,argv);
+}
+static JSValue isolated_text_decode(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_text_decode(ctx,argc,argv,NULL);
+}
 
 void web_js_encoding_init_isolated(JSContext *ctx, JSValue host) {
     static const JSCFunctionListEntry functions[]={
+        JS_CFUNC_DEF("getEncoding",1,isolated_get_encoding),
+        JS_CFUNC_DEF("textDecoder",4,isolated_text_decoder),
+        JS_CFUNC_DEF("textDecode",5,isolated_text_decode),
         JS_CFUNC_DEF("decodeUTF8",5,isolated_decode_utf8),
         JS_CFUNC_DEF("encodeUTF8",1,isolated_encode_utf8),
         JS_CFUNC_DEF("encodeUTF8Into",4,isolated_encode_utf8_into),

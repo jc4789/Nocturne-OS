@@ -20,6 +20,7 @@
 #include "html_lexbor.h"
 #include "html_policy.h"
 #include "html_encoding.h"
+#include "web_encoding.h"
 #include "xml.h"
 #include "js_script_safety.h"
 #include "js_canvas.h"
@@ -91,6 +92,7 @@ struct js_script {
     size_t len;
     bool module, deferred, asynchronous, dynamic, ready, failed, executed, notified;
     bool external, parser_released;
+    bool muted; /* a classic script from another origin: its errors are muted (report_exception) */
     JSValue evaluation;
     uint64_t request, stream_generation;
     struct js_compile *compile; /* a fetched classic script's bytecode, compiled elsewhere */
@@ -592,22 +594,36 @@ static JSValue diagnostic_stack(JSContext *ctx, JSValueConst error) {
     if (JS_HasException(ctx)) { JSValue secondary = JS_GetException(ctx); JS_FreeValue(ctx, secondary); }
     return result;
 }
+/* One frame of a QuickJS stack, "    at name (url:line:col)" or "    at url:line:col" (a syntax
+   error's place), from frame to end: its URL, line and column. False for "(native)" and any other
+   form. */
+static bool stack_frame(const char *frame, const char *end, const char **url_out, size_t *url_length,
+                        unsigned long *row, unsigned long *col) {
+    const char *tail = end;
+    while (tail > frame && (tail[-1] == ')' || tail[-1] == '\r' || tail[-1] == ' ')) tail--;
+    const char *column = tail; while (column > frame && isdigit((unsigned char)column[-1])) column--;
+    const char *line_end = column > frame && column[-1] == ':' ? column - 1 : NULL;
+    const char *line = line_end;
+    if (line) while (line > frame && isdigit((unsigned char)line[-1])) line--;
+    if (!line || line >= line_end || line <= frame || line[-1] != ':') return false;
+    const char *url_end = line - 1, *url = url_end;
+    while (url > frame && url[-1] != '(' && url[-1] != ' ') url--;
+    *url_out = url; *url_length = (size_t)(url_end - url);
+    *row = strtoul(line, NULL, 10); *col = strtoul(column, NULL, 10);
+    return true;
+}
+static bool bindings_url(const char *url, size_t length) {
+    return length == strlen("nocturne:browser-bindings") && !memcmp(url, "nocturne:browser-bindings", length);
+}
 static void diagnostic_excerpt(struct web_js_state *s, const char *stack) {
     unsigned emitted = 0;
     for (const char *frame = stack; frame && *frame && emitted < 3;) {
         const char *end = strchr(frame, '\n'); if (!end) end = frame + strlen(frame);
-        const char *tail = end;
-        while (tail > frame && (tail[-1] == ')' || tail[-1] == '\r' || tail[-1] == ' ')) tail--;
-        const char *column = tail; while (column > frame && isdigit((unsigned char)column[-1])) column--;
-        const char *line_end = column > frame && column[-1] == ':' ? column - 1 : NULL;
-        const char *line = line_end;
-        if (line) while (line > frame && isdigit((unsigned char)line[-1])) line--;
-        if (line && line < line_end && line > frame && line[-1] == ':') {
-            const char *url_end = line - 1, *url = url_end;
-            while (url > frame && url[-1] != '(' && url[-1] != ' ') url--;
-            size_t url_len = (size_t)(url_end - url), length = 0;
+        const char *url; size_t url_len; unsigned long row, col;
+        if (stack_frame(frame, end, &url, &url_len, &row, &col)) {
+            size_t length = 0;
             const char *source = NULL;
-            if (url_len == strlen("nocturne:browser-bindings") && !memcmp(url,"nocturne:browser-bindings",url_len)) {
+            if (bindings_url(url, url_len)) {
                 source = js_bootstrap; length = sizeof js_bootstrap - 1;
             }
             for (struct js_script *script = s->scripts; !source && script; script = script->next)
@@ -619,7 +635,6 @@ static void diagnostic_excerpt(struct web_js_state *s, const char *stack) {
                     source = module->source; length = module->len;
                 }
             if (source) {
-                unsigned long row = strtoul(line,NULL,10), col = strtoul(column,NULL,10);
                 size_t start = 0;
                 for (unsigned long current = 1; current < row && start < length; current++) {
                     const char *nl = memchr(source + start,'\n',length - start);
@@ -674,21 +689,80 @@ static void diagnostic_context(struct web_js_state *s, bool fetch_abort) {
     }
     storage_profile_report(s);
 }
+/* Whether a frame of the stack is a classic script fetched from another origin. Classic scripts are
+   fetched without CORS, so none of those is CORS-same-origin: HTML mutes its errors. Any such frame
+   mutes the report, wherever the throw was (more than the script being run, never less). */
+static bool stack_muted(struct web_js_state *s, const char *stack) {
+    for (const char *frame = stack; frame && *frame;) {
+        const char *end = strchr(frame, '\n'); if (!end) end = frame + strlen(frame);
+        const char *url; size_t length; unsigned long row, col;
+        if (stack_frame(frame, end, &url, &length, &row, &col))
+            for (struct js_script *script = s->scripts; script; script = script->next)
+                if (script->muted && script->url && strlen(script->url) == length && !memcmp(script->url, url, length))
+                    return true;
+        frame = *end ? end + 1 : NULL;
+    }
+    return false;
+}
+/* HTML "report an exception": a cancelable ErrorEvent at the realm's global (the bootstrap's
+   reportException hook, which holds the global's errors reporting mode), and the console report
+   only when no listener canceled it. The location is the first frame outside the bindings. A muted
+   error says "Script error." with no location and a null error. A realm its watchdog stopped, or
+   one still starting, only logs. */
+static void report_exception(struct web_js_state *s, JSValueConst e) {
+    JSValue stack = diagnostic_stack(s->ctx, e);
+    const char *a = JS_ToCString(s->ctx, e), *b = JS_IsUndefined(stack) ? NULL : JS_ToCString(s->ctx, stack);
+    if (JS_HasException(s->ctx)) { JSValue secondary = JS_GetException(s->ctx); JS_FreeValue(s->ctx, secondary); }
+    bool log = true;
+    if (!s->disabled && !s->starting) {
+        const char *url = ""; size_t url_length = 0; unsigned long row = 0, col = 0;
+        for (const char *frame = b; frame && *frame;) {
+            const char *end = strchr(frame, '\n'); if (!end) end = frame + strlen(frame);
+            const char *at; size_t length; unsigned long r, c;
+            if (stack_frame(frame, end, &at, &length, &r, &c) && !bindings_url(at, length)) {
+                url = at; url_length = length; row = r; col = c; break;
+            }
+            frame = *end ? end + 1 : NULL;
+        }
+        sbuf message = {0}; sb_puts(&message, "Uncaught "); sb_puts(&message, a ? a : "exception");
+        JSValue args[6] = {JS_DupValue(s->ctx, e), JS_NewString(s->ctx, sb_cstr(&message)),
+            JS_NewStringLen(s->ctx, url, url_length), JS_NewUint32(s->ctx, (uint32_t)MIN(row, UINT32_MAX)),
+            JS_NewUint32(s->ctx, (uint32_t)MIN(col, UINT32_MAX)), JS_NewBool(s->ctx, stack_muted(s, b))};
+        sb_free(&message);
+        JSValue fired = JS_IsException(args[1]) || JS_IsException(args[2]) ? JS_EXCEPTION :
+            custom_element_hook(s, "reportException", 6, args);
+        /* A failure to report is not reported again: the console has it below. */
+        if (JS_IsException(fired)) { JSValue secondary = JS_GetException(s->ctx); JS_FreeValue(s->ctx, secondary); }
+        else if (JS_IsBool(fired)) log = JS_ToBool(s->ctx, fired) > 0;
+        JS_FreeValue(s->ctx, fired);
+        for (int i = 0; i < 6; i++) JS_FreeValue(s->ctx, args[i]);
+    }
+    if (log) {
+        sbuf text = {0}; sb_puts(&text, a ? a : "JavaScript exception");
+        if (b && *b && (!a || strcmp(a, b))) { sb_putc(&text, '\n'); sb_puts(&text, b); }
+        log_text(s, 2, sb_cstr(&text)); sb_free(&text);
+        diagnostic_context(s,a && !strncmp(a,"AbortError:",11));
+        diagnostic_excerpt(s,b);
+    }
+    JS_FreeCString(s->ctx, a); JS_FreeCString(s->ctx, b);
+    JS_FreeValue(s->ctx, stack);
+}
 static void exception(struct web_js_state *s) {
     report_allocation_failure(s);
     bool temporary = !s->running;
     if (temporary) { JS_UpdateStackTop(s->rt); s->task_deadline = uptime_ms() + s->task_budget_ms; s->running = 1; }
     JSValue e = JS_GetException(s->ctx);
-    JSValue stack = diagnostic_stack(s->ctx, e);
-    const char *a = JS_ToCString(s->ctx, e), *b = JS_IsUndefined(stack) ? NULL : JS_ToCString(s->ctx, stack);
-    sbuf text = {0}; sb_puts(&text, a ? a : "JavaScript exception");
-    if (b && *b && (!a || strcmp(a, b))) { sb_putc(&text, '\n'); sb_puts(&text, b); }
-    log_text(s, 2, sb_cstr(&text)); sb_free(&text);
-    diagnostic_context(s,a && !strncmp(a,"AbortError:",11));
-    diagnostic_excerpt(s,b);
-    JS_FreeCString(s->ctx, a); JS_FreeCString(s->ctx, b);
-    JS_FreeValue(s->ctx, stack); JS_FreeValue(s->ctx, e);
+    report_exception(s, e);
+    JS_FreeValue(s->ctx, e);
     if (temporary) s->running = 0;
+}
+/* host.reportException(error): the bindings' callbacks (listeners, observers, reactions) and
+   self.reportError report what they caught the same way. */
+static JSValue native_report_exception(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    struct web_js_state *s = state(ctx);
+    if (s) report_exception(s, argc ? argv[0] : JS_UNDEFINED);
+    return JS_UNDEFINED;
 }
 static int interrupt(JSRuntime *rt, void *opaque) {
     struct web_js_state *s = opaque;
@@ -1816,6 +1890,11 @@ static JSValue css_style_value(JSContext *ctx, const char *property,
         if(css_radius_specified(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
         sb_free(&text);
     }
+    {
+        sbuf text={0}; /* colours and color-scheme; CSS-wide keywords and var() stay authored */
+        if(css_specified_longhand(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
+        sb_free(&text);
+    }
     if (!strcasecmp(property,"box-shadow")) {
         sbuf serialized={0};
         if (css_shadow_specified(begin,(size_t)(end-begin),&serialized)) {
@@ -1947,6 +2026,7 @@ flushed:
     if(s->host.debug_js)s->task_layout_ms += uptime_ms() - start;
     web_avmedia_service(uptime_ms());
 }
+void web_js_flush_layout(web_doc *d) { if (d && d->js) flush_layout(d->js); }
 static JSValue rect_array(JSContext *ctx, double x, double y, double w, double h) {
     JSValue a = JS_NewArray(ctx);
     const double values[] = {x,y,w,h};
@@ -1957,6 +2037,8 @@ static void viewport_scroll_position(struct web_js_state *s,int *x,int *y);
 static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double rect[4],bool *present);
 static bool element_offset_metrics(node_t *n,double first[4],double bounds[4]);
 #include "js_svg_native.h"
+#include "js_animation_native.h"
+#include "js_xpath_native.h"
 static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root) {
     JSContext *ctx=s->ctx; web_doc *d=s->doc;
     if (!n || n->type!=N_ELEM || (root && root->type!=N_ELEM && root!=d->root))
@@ -2222,20 +2304,6 @@ static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n,
     char text[64]; snprintf(text, sizeof text, "%gpx", (double)(value == 0 ? 0 : value));
     return JS_NewString(ctx, text);
 }
-static void computed_color_text(char *out,size_t capacity,uint32_t color) {
-    unsigned alpha=color>>24;
-    /* CSS Color legacy CSS serialization omits alpha when it is opaque. */
-    if(alpha==255)snprintf(out,capacity,"rgb(%u, %u, %u)",(color>>16)&255,(color>>8)&255,color&255);
-    else {
-        /* CSS Color's legacy 8-bit alpha algorithm preserves integer-percent
-           round trips. Use exact integer rounding, including the 50% midpoint,
-           rather than exposing the quantized channel as 0.501961. */
-        unsigned percent=(alpha*100+127)/255;
-        double value=(percent*255+50)/100==alpha?(double)percent/100:
-            (double)((alpha*1000+127)/255)/1000;
-        snprintf(out,capacity,"rgba(%u, %u, %u, %g)",(color>>16)&255,(color>>8)&255,color&255,value);
-    }
-}
 static int computed_pseudo(const char *pseudo) {
     /* CSSOM ignores a non-colon argument; an unknown pseudo has an empty
        declaration instead of returning the originating element's style. */
@@ -2310,18 +2378,17 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
             JSValue result = JS_NewStringLen(ctx, value.p, value.n);
             free(absolute); sb_free(&value); return result;
         }
-        uint32_t c = paint->color == COLOR_CURRENT ? st->color : paint->color;
-        computed_color_text(out,sizeof out,c);
-        return JS_NewString(ctx, out);
+        sbuf value = {0};
+        css_style_color_text(st, paint == &st->svg_fill ? CSS_SLOT_FILL : CSS_SLOT_STROKE, &value);
+        JSValue result = JS_NewStringLen(ctx, value.p ? value.p : "", value.n);
+        sb_free(&value); return result;
     }
-    uint32_t color = 0; bool is_color = false; float px = 0; bool is_px = false;
-    if (!strcmp(property, "color")) { color = st->color; is_color = true; }
-    else if (!strcmp(property, "background-color")) { color = st->bg_color; is_color = true; }
+    float px = 0; bool is_px = false;
     /* The layout engine currently resolves logical sides in horizontal LTR.
        Report that effective initial direction rather than an empty value:
        anchor controllers otherwise mistake the surface for RTL. This does
        not advertise RTL/bidi layout, which is not implemented yet. */
-    else if (!strcmp(property, "direction")) snprintf(out, sizeof out, "ltr");
+    if (!strcmp(property, "direction")) snprintf(out, sizeof out, "ltr");
     else if (!strcmp(property, "font-size")) { px = st->font_size; is_px = true; }
     /* CSSOM: normal, or the used value. */
     else if (!strcmp(property, "line-height")) {
@@ -2331,18 +2398,9 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     else if (!strcmp(property, "font-family")) return JS_NewString(ctx,st->font_names?st->font_names:st->font_family==FONT_FAMILY_MONO?"monospace":st->font_family==FONT_FAMILY_SANS?"sans-serif":"serif");
     else if (!strcmp(property, "font-weight")) snprintf(out, sizeof out, "%u", st->font_weight);
     else if (!strcmp(property, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
-    else if (!strcmp(property, "animation-name")) return JS_NewString(ctx,st->motion.name?st->motion.name:"none");
-    else if (!strcmp(property, "animation-duration")) snprintf(out,sizeof out,"%gs",(double)st->motion.duration/1000);
-    else if (!strcmp(property, "animation-delay")) snprintf(out,sizeof out,"%gs",(double)st->motion.delay/1000);
-    else if (!strcmp(property, "animation-iteration-count")) {if(isfinite(st->motion.iterations))snprintf(out,sizeof out,"%g",(double)st->motion.iterations);else snprintf(out,sizeof out,"infinite");}
-    else if (!strcmp(property, "animation-play-state")) snprintf(out,sizeof out,"%s",st->motion.paused?"paused":"running");
-    else if (!strcmp(property, "animation-fill-mode")) {static const char *const names[]={"none","forwards","backwards","both"};snprintf(out,sizeof out,"%s",names[st->motion.fill<4?st->motion.fill:0]);}
-    else if (!strcmp(property, "animation-direction")) {static const char *const names[]={"normal","reverse","alternate","alternate-reverse"};snprintf(out,sizeof out,"%s",names[st->motion.direction<4?st->motion.direction:0]);}
-    else if (!strcmp(property, "animation-timing-function")) {const struct css_easing *e=&st->motion.easing;if(e->kind==CM_LINEAR)snprintf(out,sizeof out,"linear");else if(e->kind==CM_STEP_START)snprintf(out,sizeof out,"step-start");else if(e->kind==CM_STEP_END)snprintf(out,sizeof out,"step-end");else snprintf(out,sizeof out,"cubic-bezier(%g, %g, %g, %g)",(double)e->x1,(double)e->y1,(double)e->x2,(double)e->y2);}
     else if (!strcmp(property, "fill-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_fill_opacity);
     else if (!strcmp(property, "stroke-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stroke_opacity);
     else if (!strcmp(property, "stop-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stop_opacity);
-    else if (!strcmp(property, "stop-color")) { color = st->svg_stop_color == COLOR_CURRENT ? st->color : st->svg_stop_color; is_color = true; }
     else if (!strcmp(property, "stroke-width")) {
         if (st->svg_stroke_width.pct) snprintf(out, sizeof out, "%g%%", (double)st->svg_stroke_width.pct);
         else { px = st->svg_stroke_width.px; is_px = true; }
@@ -2428,135 +2486,16 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
             }
         }
     }
-    if (is_color) computed_color_text(out,sizeof out,color);
     if (is_px) snprintf(out, sizeof out, "%gpx", (double)px);
-    if (!is_color && !is_px && !out[0]) {
+    if (!is_px && !out[0]) {
         /* Every other longhand the property table stores whole. */
         sbuf text={0};
-        int kind=css_computed_longhand(st,property,&text,&color,d);
+        int kind=css_computed_longhand(st,property,&text,d);
         if(kind<0){sb_free(&text);return oom(ctx);}
-        if(kind==2)computed_color_text(out,sizeof out,color);
-        else if(kind==1){JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;}
+        if(kind==1){JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;}
         sb_free(&text);
     }
     return JS_NewString(ctx, out);
-}
-/* Private samples live in the animation cascade origin, never inline style.
-   The numeric/color subset renders through the existing native CSS engine. */
-static bool animated_property(const char *p) {
-    static const char *const names[] = {"top", "right", "bottom", "left", "width", "height",
-        "min-width", "max-width", "min-height", "max-height", "opacity", "color", "background-color",
-        "border-radius", "font-size", "letter-spacing", "word-spacing",
-        "margin-top", "margin-right", "margin-bottom", "margin-left",
-        "padding-top", "padding-right", "padding-bottom", "padding-left",
-        "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
-        "border-top-color", "border-right-color", "border-bottom-color", "border-left-color"};
-    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(p, names[i])) return true;
-    return false;
-}
-static JSValue animation_dom(struct web_js_state *s, node_t *n, bool read, int argc, JSValueConst *argv) {
-    JSContext *ctx = s->ctx;
-    if (!n || n->type != N_ELEM || argc < (read ? 4 : 5)) return JS_ThrowTypeError(ctx, "Animation Element receiver required");
-    const char *pseudo = JS_ToCString(ctx, argv[2]);
-    if (!pseudo) return JS_EXCEPTION;
-    int pe = !*pseudo ? PE_NONE : !strcmp(pseudo, "::before") ? PE_BEFORE : !strcmp(pseudo, "::after") ? PE_AFTER : -1;
-    JS_FreeCString(ctx, pseudo);
-    if (pe < 0) return JS_ThrowSyntaxError(ctx, "Unsupported animation pseudo-element");
-    if (read) {
-        /* Detached nodes may retain an old smem pointer after a cascade. Do
-           not dereference it; reconnection will produce fresh style values. */
-        if (!connected(s, n)) return JS_NewString(ctx, "");
-        const char *p = JS_ToCString(ctx, argv[3]);
-        if (!p) return JS_EXCEPTION;
-        if (s->doc->resources_dirty) doc_rescan(s->doc);
-        flush_layout(s);
-        style_t *st = n->animation_base_style ? n->animation_base_style : n->style;
-        if (st && pe == PE_BEFORE) st = st->before;
-        else if (st && pe == PE_AFTER) st = st->after;
-        char out[128] = "";
-        if (st) {
-            const len_t *length = NULL; float px = 0; bool numeric = false, is_color = false;
-            uint32_t color = 0;
-            if (!strcmp(p, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
-            else if (!strcmp(p,"transform")||!strcmp(p,"translate")) {
-                JSValue result=computed_translation(ctx,s->doc,st,geometry_principal_box(n),!strcmp(p,"translate"));
-                JS_FreeCString(ctx,p);return result;
-            }
-            else if (!strcmp(p, "color")) { color = st->color; is_color = true; }
-            else if (!strcmp(p, "background-color")) { color = st->bg_color; is_color = true; }
-            else if (!strcmp(p, "border-radius")) { px = st->border_radius; numeric = true; }
-            else if (!strcmp(p, "font-size")) { px = st->font_size; numeric = true; }
-            else if (!strcmp(p, "letter-spacing")) { px = st->letter_spacing; numeric = true; }
-            else if (!strcmp(p, "word-spacing")) { px = st->word_spacing; numeric = true; }
-            else if (!strcmp(p, "width")) length = &st->width;
-            else if (!strcmp(p, "height")) length = &st->height;
-            else if (!strcmp(p, "min-width")) length = &st->min_width;
-            else if (!strcmp(p, "max-width")) length = &st->max_width;
-            else if (!strcmp(p, "min-height")) length = &st->min_height;
-            else if (!strcmp(p, "max-height")) length = &st->max_height;
-            else {
-                static const char *const sides[] = {"top", "right", "bottom", "left"};
-                for (int i = 0; i < 4; i++) {
-                    char key[32];
-                    if (!strcmp(p, sides[i])) length = &st->inset[i];
-                    snprintf(key, sizeof key, "margin-%s", sides[i]); if (!strcmp(p, key)) length = &st->margin[i];
-                    snprintf(key, sizeof key, "padding-%s", sides[i]); if (!strcmp(p, key)) length = &st->padding[i];
-                    snprintf(key, sizeof key, "border-%s-width", sides[i]); if (!strcmp(p, key)) { px = st->border_width[i]; numeric = true; }
-                    snprintf(key, sizeof key, "border-%s-color", sides[i]); if (!strcmp(p, key)) { color = st->border_color[i]; is_color = true; }
-                }
-            }
-            if (length) {
-                if (length->kind == LK_AUTO || length->kind == LK_NONE || length->kind == LK_NORMAL)
-                    snprintf(out, sizeof out, "%s", length->kind == LK_AUTO ? "auto" : length->kind == LK_NONE ? "none" : "normal");
-                else {
-                    /* Resolve from the underlying declaration, not animated box
-                       geometry: omitted keyframes cannot feed samples back. */
-                    node_t *parent = pe ? n : doc_flat_parent(n);
-                    float base = parent && parent->box ? (strstr(p, "height") || !strcmp(p,"top") || !strcmp(p,"bottom") ? parent->box->h : parent->box->w) : 0;
-                    px = len_resolve(length, base); numeric = true;
-                }
-            }
-            if (is_color) computed_color_text(out,sizeof out,color);
-            if (numeric) snprintf(out, sizeof out, "%gpx", (double)px);
-        }
-        JS_FreeCString(ctx, p); return JS_NewString(ctx, out);
-    }
-    uint32_t id;
-    if (JS_ToUint32(ctx, &id, argv[3]) < 0) return JS_EXCEPTION;
-    if (!id) return JS_ThrowRangeError(ctx, "Invalid animation id");
-    sbuf text = {0}; JSValue result = JS_UNDEFINED;
-    if (!JS_IsNull(argv[4])) {
-        JSValue length = JS_GetPropertyStr(ctx, argv[4], "length"); uint32_t count = 0;
-        int converted = JS_ToUint32(ctx, &count, length); JS_FreeValue(ctx, length);
-        if (converted < 0) return JS_EXCEPTION;
-        if (count % 2) return JS_ThrowRangeError(ctx, "Animation sample requires property/value pairs");
-        for (uint32_t i = 0; i < count; i += 2) {
-            JSValue key = JS_GetPropertyUint32(ctx, argv[4], i), val = JS_GetPropertyUint32(ctx, argv[4], i + 1);
-            size_t kn = 0, vn = 0;
-            const char *k = JS_ToCStringLen(ctx, &kn, key), *v = JS_ToCStringLen(ctx, &vn, val);
-            JS_FreeValue(ctx, key); JS_FreeValue(ctx, val);
-            if (!k || !v) result = JS_EXCEPTION;
-            else if (strlen(k) != kn || strlen(v) != vn || strpbrk(v, ";{}!\r\n"))
-                result = JS_ThrowRangeError(ctx, "Invalid animation property value");
-            else if (animated_property(k)) {
-                if (kn > SIZE_MAX - 3 || vn > SIZE_MAX - 3 - kn || text.n > SIZE_MAX - 3 - kn - vn)
-                    result = JS_ThrowRangeError(ctx, "Animation sample size is not representable");
-                else { sb_puts(&text, k); sb_putc(&text, ':'); sb_puts(&text, v); sb_putc(&text, ';'); }
-            }
-            JS_FreeCString(ctx, k); JS_FreeCString(ctx, v);
-            if (JS_IsException(result)) break;
-        }
-    }
-    if (!JS_IsException(result)) {
-        int changed = css_animation_set(n, (uint8_t)pe, id, text.n ? sb_cstr(&text) : NULL);
-        if (changed == -1) result = oom(ctx);
-        else if (changed) {
-            web_doc *d = n->owner ? n->owner : s->doc;
-            css_mark_dirty(d, n);
-            d->dirty = true;
-        }
-    }
-    sb_free(&text); return result;
 }
 /* Private CE hooks retain native wrapper identity. They only enqueue reactions;
    JavaScript's CEReactions scope invokes callbacks after the DOM operation. */
@@ -3215,7 +3154,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -3239,10 +3178,6 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if(doc_node_replace_all_validity(n,child))result=JS_ThrowTypeError(ctx,"Invalid native replace-all");
         else if(!inserted_roots_capture(s,child,&inserted))result=JS_EXCEPTION;
         else result=doc_node_replace_all(d,n,child)?JS_UNDEFINED:oom(ctx);
-    } break;
-    case DOM_animationStyle: case DOM_animationComputed: {
-        result = animation_dom(s, n, opcode == DOM_animationComputed, argc, argv);
-
     } break;
     case DOM_cssom: {
         result=cssom_dom(s,n,argc,argv);
@@ -3922,6 +3857,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     } break;
     case DOM_geometry: {result = geometry(s, n, p);
     } break;
+    case DOM_xpath: result = xpath_dom(s, n, argc, argv); break;
     default: result = JS_ThrowTypeError(ctx, "Unknown DOM operation"); break;
     }
 dom_complete:;
@@ -7473,6 +7409,10 @@ static bool process_pending(struct web_js_state *s) {
                         if (final) { js_free(s->ctx, script->url); script->url = final; }
                         else { script->failed = true; exception(s); }
                     }
+                    if (!script->failed && (!strncasecmp(script->url, "http://", 7) || !strncasecmp(script->url, "https://", 8))) {
+                        bool oom = false;
+                        script->muted = !same_origin_urls(script->url, s->doc->url, &oom);
+                    }
                     if (!script->failed) compile_elsewhere(s, script);
                 }
             }
@@ -8267,6 +8207,30 @@ static int frame_callback_order(const void *left,const void *right){
     const struct js_frame_callback *a=left,*b=right;
     return a->order<b->order?-1:a->order>b->order;
 }
+/* HTML "update animations and send events" after animation.c updated the timelines (doc.c's
+   tick): the promises they settled, a microtask checkpoint, then the pending animation event
+   queue, one event per turn so each listener gets its own checkpoint. */
+static void run_animations(struct web_js_state *s){
+    uint64_t generation=s->stream_generation;
+    begin_task(s);
+    JSValue result=custom_element_hook(s,"animationUpdate",0,NULL);
+    if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
+    end_task(s);
+    if(s->disabled || s->stream_generation!=generation)return;
+    begin_task(s);
+    JSValue next=custom_element_hook(s,"animationEvents",0,NULL);
+    if(JS_IsException(next))exception(s);
+    else while(JS_IsFunction(s->ctx,next) && !s->disabled && s->stream_generation==generation){
+        result=JS_Call(s->ctx,next,JS_UNDEFINED,0,NULL);
+        if(JS_IsException(result)){exception(s);break;}
+        bool more=JS_ToBool(s->ctx,result)!=0;
+        JS_FreeValue(s->ctx,result);
+        if(!more)break;
+        end_task(s);begin_task(s);
+    }
+    JS_FreeValue(s->ctx,next);
+    end_task(s);
+}
 static bool run_rendering(struct web_js_state *s,uint64_t now){
     /* A hidden document is not rendered (rendering_wanted): its animation frames wait. */
     if(s->disabled || s->running || now<s->rendering_due || !s->doc->visible)return false;
@@ -8276,7 +8240,8 @@ static bool run_rendering(struct web_js_state *s,uint64_t now){
     size_t count=0;
     for(unsigned i=0;i<s->timer_capacity;i++)
         if(s->timers[i].id && s->timers[i].kind==2 && s->timers[i].due<=now)count++;
-    if(!count && !observers_dirty(s)){
+    bool animations=web_animations_script_work(s->doc);
+    if(!count && !observers_dirty(s) && !animations){
         if(resized){rendering_taken(s);return true;}
         /* The display's frame is used even with nothing to render: animation frames asked
            after it wait for the next one, not run between frames. */
@@ -8300,6 +8265,7 @@ static bool run_rendering(struct web_js_state *s,uint64_t now){
         qsort(frames,count,sizeof *frames,frame_callback_order);
     }
     uint64_t generation=s->stream_generation;
+    if(animations)run_animations(s);
     for(size_t at=0;at<count && !s->disabled && s->stream_generation==generation;at++){
         /* Cancellation, growth, or reuse during an earlier callback must not
            invalidate this snapshot or accidentally invoke a new callback. */
@@ -8392,7 +8358,7 @@ static bool idle_eligible(struct web_js_state *s, uint64_t now) {
         s->events || s->posted || s->media_width != d->width || s->media_height != d->height ||
         family->shadow_slots_pending || family->details_toggle_first || JS_IsJobPending(s->rt) ||
         web_worker_runnable(s->workers) || ready_script(s, &script)) return false;
-    if (d->visible && (resize_steps_due(s) || observers_dirty(s)) && s->rendering_due <= now) return false;
+    if (d->visible && (resize_steps_due(s) || observers_dirty(s) || web_animations_script_work(d)) && s->rendering_due <= now) return false;
     int64_t atomics = web_atomics_deadline(s->ctx, now);
     if (atomics >= 0 && (uint64_t)atomics <= now) return false;
     if (web_audio_ready(s->ctx)) return false;
@@ -8735,11 +8701,12 @@ static int64_t js_deadline(web_doc *d, int *why) {
         if (audio_deadline >= 0) EARLIER((uint64_t)audio_deadline, JD_WEB_AUDIO);
         /* A hidden document has no rendering opportunity, so its observers wait for it. */
         if (d->visible && (resize_steps_due(s) || observers_dirty(s))) EARLIER(s->rendering_due, JD_OBSERVERS);
+        if (d->visible && web_animations_script_work(d)) EARLIER(s->rendering_due, JD_OBSERVERS);
         if (s->storage_origin && storage_listening(s) && (s->storage_subscribed[0]||s->storage_subscribed[1])) EARLIER(s->storage_poll_due, JD_STORAGE);
         if(web_presentation_event_peek(d))DUE_NOW();
         if(s->languages_seen!=webprefs_languages_generation())DUE_NOW();
         if(web_idb_next(&s->indexed_db))DUE_NOW();
-        if(web_idb_waiting(&s->indexed_db)){
+        if(web_idb_needs_poll(&s->indexed_db)){
             uint64_t storage_due=now+8;
             EARLIER(storage_due, JD_INDEXED_DB);
         }
@@ -9045,6 +9012,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
        Reject future epochs instead of underflowing performance.now()/rAF. */
     bool seeded = navigation->valid && navigation->navigation_start_ms <= initialized;
     s->now = seeded ? navigation->navigation_start_ms : initialized;
+    web_animations_set_origin(d, s->now); /* the document timeline's zero is performance.now()'s */
     timing_record(s, JS_NAV_START, s->now);
     if (seeded && navigation->fetch_valid && navigation->fetch_start_ms >= s->now && navigation->fetch_start_ms <= initialized)
         timing_record(s, JS_FETCH_START, navigation->fetch_start_ms);
@@ -9081,12 +9049,14 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     JSValue api = JS_NewObject(s->ctx);
     static const JSCFunctionListEntry functions[] = {
         JS_CFUNC_DEF("dom", 2, native_dom), JS_CFUNC_DEF("log", 1, native_log),
+        JS_CFUNC_DEF("reportException", 1, native_report_exception),
         JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),
         JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
         JS_CFUNC_DEF("inputListener",2,native_input_listener),JS_CFUNC_DEF("storageListener",1,native_storage_listener),
         JS_CFUNC_DEF("locale",0,native_locale),JS_CFUNC_DEF("editing",0,native_editing),
         JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
         JS_CFUNC_DEF("svgGeometry",2,native_svg_geometry),
+        JS_CFUNC_DEF("xpathCompile",2,native_xpath_compile),
         JS_CFUNC_DEF("mutationObserve",4,native_mutation_control),
         JS_CFUNC_DEF("mutationTake",0,native_mutation_take),
         JS_CFUNC_DEF("frame", 3, native_frame),JS_CFUNC_DEF("documentStream",1,native_document_stream),
@@ -9104,6 +9074,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("imageBitmap", 5, native_image_bitmap),
         JS_CFUNC_DEF("avmedia", 4, native_avmedia),
         JS_CFUNC_DEF("presentation", 2, native_presentation),
+        JS_CFUNC_DEF("animation", 4, native_animation),
         JS_CFUNC_DEF("observers", 1, native_observers),
         JS_CFUNC_DEF("pointerCapturePending", 1, native_pointer_capture_pending),
         JS_CFUNC_DEF("resolve", 1, native_resolve), JS_CFUNC_DEF("ready", 0, native_ready), JS_CFUNC_DEF("current", 0, native_current),
@@ -9208,13 +9179,13 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
        embedder; its own scripts are refused by sandbox_flags, not by
        retiring the realm. */
     const struct web_js_webidl_report *idl = web_js_webidl_last();
-    char limits[480];
+    char limits[560];
     snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms; "
              "realm setup %llu ms (bindings: compiler wait %llu, read %llu, run %llu, of which Web IDL shapes %u ms: %u interfaces, %u members, "
-             "%u wrapped, %u readonly setters dropped, %u misplaced), heap +%zu KiB",
+             "%u wrapped, built-in shape %u native/%u prototype, %u readonly setters dropped, %u misplaced), heap +%zu KiB",
              JS_STACK_LIMIT/1024u,s->task_budget_ms,(unsigned long long)(uptime_ms()-initialized),
              (unsigned long long)bindings.wait_ms,(unsigned long long)bindings.read_ms,(unsigned long long)bindings.run_ms,
-             idl->milliseconds,idl->interfaces,idl->members,idl->wrapped,idl->setters_dropped,idl->misplaced,
+             idl->milliseconds,idl->interfaces,idl->members,idl->wrapped,idl->builtin_wrapped,idl->builtin_reprototyped,idl->setters_dropped,idl->misplaced,
              (s->runtime_owner->allocation.current>heap_before?s->runtime_owner->allocation.current-heap_before:0)/1024);
     log_text(s,WEB_CONSOLE_TRACE,limits);
     if (s->host.debug_js && (idl->misplaced || idl->setters_dropped)) {

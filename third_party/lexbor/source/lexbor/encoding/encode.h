@@ -233,6 +233,20 @@ LXB_API int8_t
 lxb_encoding_encode_iso_2022_jp_eof_single(lxb_encoding_encode_t *ctx,
                                            lxb_char_t **data, const lxb_char_t *end);
 
+/*
+ * Nocturne: the Encoding Standard's "encode or fail" for one code point.
+ * As ctx->encoding_data->encode_single, except that on
+ * LXB_ENCODING_ENCODE_ERROR the bytes the encoder outputs before its error are
+ * written (*data moves past them) and the state changes with them, and *error
+ * is the error's code point. Only ISO-2022-JP outputs such bytes (ESC ( B when
+ * leaving jis0208) or reports another code point (U+FFFD for U+000E, U+000F
+ * and U+001B). https://encoding.spec.whatwg.org/#encode-or-fail
+ */
+LXB_API int8_t
+lxb_encoding_encode_or_fail_single(lxb_encoding_encode_t *ctx, lxb_char_t **data,
+                                   const lxb_char_t *end, lxb_codepoint_t cp,
+                                   lxb_codepoint_t *error);
+
 LXB_API int8_t
 lxb_encoding_encode_iso_8859_10_single(lxb_encoding_encode_t *ctx, lxb_char_t **data,
                                        const lxb_char_t *end, lxb_codepoint_t cp);

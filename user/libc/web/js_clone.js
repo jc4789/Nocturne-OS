@@ -281,7 +281,7 @@ const cloneData = (() => {
                 if(!blobSnapshotBridge)return fail('target-brand-unavailable',undefined,0,false,'Blob');
                 value=blobSnapshotBridge.restore(r[1]);
             }
-            else if(kind==='DOMException')value=new DomError(r[1][1],r[1][0]);
+            else if(kind==='DOMException')value=exceptionBridge.restore(r[1]);
             else if(has(serializables,kind))value=apply(get(serializables,kind).deserialize,undefined,[r[1]]);
             else if(has(constructors,kind))value=new(get(constructors,kind))(read(r[1]),r[2],r[3]);
             else if(kind==='Date')value=new DateType(r[1]);else if(kind==='RegExp')value=new RegExpType(r[1],r[2]);

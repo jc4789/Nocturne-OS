@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "webi.h"
+#include "web_encoding.h"
 
 /* Lexbor's URL parser and the scratch memory it parses in. Every call leaves
    the scratch memory empty again; one thread uses a parser at a time. */
@@ -31,10 +32,13 @@ struct web_url {
 };
 
 /* Parses input against base, which is parsed first when it is not NULL. Both
-   are the UTF-8 of scalar values. 1: url holds the result (sb_free its href);
+   are the UTF-8 of scalar values. encoding is the URL parser's for input's
+   query: HTML's encoding-parse gives the document's, everything else UTF-8
+   (WEB_ENCODING_UTF8 or failure); the parser itself keeps UTF-8 for a URL that
+   is not special or is ws: or wss:. 1: url holds the result (sb_free its href);
    0: input or base is not a URL; -1: out of memory. */
 int web_url_parse(struct web_url_parser *parser, const char *input, size_t length,
-                  const char *base, size_t base_length, struct web_url *url);
+                  const char *base, size_t base_length, web_encoding encoding, struct web_url *url);
 /* Whether input alone (no base) is a URL. */
 bool web_url_valid(struct web_url_parser *parser, const char *input, size_t length);
 
@@ -44,10 +48,12 @@ enum web_url_part {
     WEB_URL_HOSTNAME, WEB_URL_PORT, WEB_URL_PATHNAME, WEB_URL_SEARCH, WEB_URL_HASH
 };
 /* The URL that href, a URL's serialization, becomes when part's setter is
-   given value; a value the setter turns down leaves it as it was. 1 or -1 as
-   for parsing. */
+   given value; a value the setter turns down leaves it as it was. encoding is
+   the search setter's for the query: Location's is its document's, the URL
+   interface's and HTMLHyperlinkElementUtils' UTF-8. 1 or -1 as for parsing. */
 int web_url_set(struct web_url_parser *parser, const char *href, size_t href_length,
-                enum web_url_part part, const char *value, size_t length, struct web_url *url);
+                enum web_url_part part, const char *value, size_t length, web_encoding encoding,
+                struct web_url *url);
 
 /* application/x-www-form-urlencoded parsing: each name and value, '+' as a
    space and percent-decoded, still to be UTF-8 decoded. 1 when every pair has
@@ -56,5 +62,11 @@ int web_url_form_parse(const char *input, size_t length,
                        bool (*pair)(void *opaque, const char *name, size_t name_length,
                                     const char *value, size_t value_length),
                        void *opaque);
-/* The urlencoded serializer's encoding of one name or value (UTF-8). */
-void url_encode_form(sbuf *out, const char *text, size_t length);
+/* The urlencoded serializer's percent-encoding of one name or value already
+   in the form's encoding: each byte outside the application/x-www-form-urlencoded
+   percent-encode set as it is, a space as '+', every other byte as %XX. UTF-8
+   bytes go in as they are; for another encoding, web_encode_html's bytes:
+   percent-encode after encoding's %26%23N%3B for an unencodable scalar value is
+   exactly html mode's &#N; percent-encoded (ISO-2022-JP's ESC ( B comes first
+   in both). */
+void url_encode_form(sbuf *out, const char *bytes, size_t length);

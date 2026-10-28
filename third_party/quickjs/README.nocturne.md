@@ -105,6 +105,14 @@ RegExpから作成realmへの所有参照には既存の `JS_DupContext`/`JS_Fre
 番号ごとに一つの写しを作る。toString の結果、行番号、strip の扱いは変えない。
 関数が一つでも生きていれば入力全体が残るが、その量は入力一つ分を超えない。
 
+## 元の文の無い関数の toString
+
+js.c はブラウザーの束縛（js_bootstrap.js などの platform の実装）だけを `JS_STRIP_SOURCE`
+で組む。Web IDL ではそれらは組み込みの関数なので、`Function.prototype.toString` は
+ECMA-262 の NativeFunction の形でなければならず、async や generator の前置きを持てない。
+元の文の無い関数は、関数の種類によらず `function 名前() { [native code] }` の形にする。
+元の文を持つ関数（頁の台本）の結果は変えない。
+
 ## 標本取りの問い合わせ
 
 `--debug-js` の JavaScript の時間計測（`user/libc/web/js_profile.c`）のため、

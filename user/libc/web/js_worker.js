@@ -1,6 +1,12 @@
 /* Dedicated native child runtime. No timer-driven main-realm emulation. */
 const workerBridge=(()=>{
     const native=host.worker, slots=new WeakMap(), live=new Map();
+    // encoding-parse relative to the outside settings (this window's document).
+    function scriptURL(url){
+        const parsed=urlBridge.encodingParse(url,rawDom.get(document,'baseURI'),rawDom.get(document,'characterSet'));
+        if(parsed===null)throw new DOMException('Invalid worker script URL','SyntaxError');
+        return parsed.href;
+    }
     class Worker extends EventTarget {
         constructor(url,options={}){
             super();if(!arguments.length)throw new TypeError('Worker script URL required');if(options==null)options={};if(typeof options!=='object'&&typeof options!=='function')throw new TypeError('Worker options must be a dictionary');
@@ -8,7 +14,7 @@ const workerBridge=(()=>{
                 throw new DOMException('Module workers are not supported','NotSupportedError');
             if(options.credentials!==undefined&&String(options.credentials)!=='same-origin')
                 throw new DOMException('Worker credentials mode is not supported','NotSupportedError');
-            const address=new URL(htmlSafetyBridge.check(url,3,'Worker constructor'),document.baseURI).href;
+            const address=scriptURL(htmlSafetyBridge.check(url,3,'Worker constructor'));
             let id;try{id=native(0,0,address,String(options.name??''));}catch(e){if(String(e?.message||'').startsWith('SecurityError:'))throw new DOMException(e.message,'SecurityError');throw e;}
             slots.set(this,{id,closed:false});live.set(id,new Set([this]));
             this.onmessage=null;this.onmessageerror=null;this.onerror=null;
@@ -28,7 +34,7 @@ const workerBridge=(()=>{
             if(typeof options!=='object'&&typeof options!=='function')throw new TypeError('SharedWorker options must be a name or dictionary');
             if(options.type!==undefined&&String(options.type)!=='classic')throw new DOMException('Module workers are not supported','NotSupportedError');
             if(options.credentials!==undefined&&!['omit','same-origin','include'].includes(String(options.credentials)))throw new TypeError('Invalid worker credentials mode');
-            const address=new URL(htmlSafetyBridge.check(url,3,'SharedWorker constructor'),document.baseURI).href;
+            const address=scriptURL(htmlSafetyBridge.check(url,3,'SharedWorker constructor'));
             let id;try{id=native(5,0,address,String(options.name??''));}catch(error){if(String(error?.message||'').startsWith('SecurityError:'))throw new DOMException(error.message,'SecurityError');throw error;}
             const channel=new MessageChannel(),prepared=messagingBridge.prepareWorker(null,[channel.port2],id);
             try{native(10,id,prepared.packet,prepared.plan);}catch(error){messagingBridge.abortWorker(prepared);channel.port1.close();throw error;}

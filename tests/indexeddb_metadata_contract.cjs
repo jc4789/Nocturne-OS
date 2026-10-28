@@ -20,7 +20,10 @@ function hostIDB(op,a,b,c){
 const handlers=new WeakMap(),context={console,setTimeout,Event,EventTarget,DOMException,structuredClone,indexedDBHandlerTarget:()=>false,host:{indexedDB:hostIDB,pack:x=>x,unpack:x=>x},
     cloneData:{serialize:x=>structuredClone(x),deserialize:x=>structuredClone(x),registerUncloneable(){}},eventState:()=>({}),
     dispatch:(t,e)=>t.dispatchEvent(e),installHandlers:(p,events)=>{for(const type of events)Object.defineProperty(p,'on'+type,{configurable:true,get(){return handlers.get(this)?.[type]||null;},set(fn){let h=handlers.get(this);if(!h){h={};handlers.set(this,h);}if(h[type])this.removeEventListener(type,h[type]);h[type]=typeof fn==='function'?fn:null;if(h[type])this.addEventListener(type,h[type]);}});}};
-vm.createContext(context);context.bridge=vm.runInContext(fs.readFileSync('user/libc/web/js_indexeddb.js','utf8')+'\nindexedDBBridge;',context);
+vm.createContext(context);
+// The realm's DOMException owner, as the bootstrap includes it before js_indexeddb.js.
+vm.runInContext(fs.readFileSync('user/libc/web/js_dom_exception.js','utf8'),context);
+context.bridge=vm.runInContext(fs.readFileSync('user/libc/web/js_indexeddb.js','utf8')+'\nindexedDBBridge;',context);
 /* The global's own indexedDB accessor answers its realm's global; node's vm calls a global
    accessor with the outer sandbox object as this, so the getter is called explicitly. */
 const run=code=>vm.runInContext(code,context),idb=()=>run("Object.getOwnPropertyDescriptor(globalThis,'indexedDB').get.call(globalThis)"),request=r=>new Promise((ok,bad)=>{r.onsuccess=()=>ok(r.result);r.onerror=()=>bad(r.error);});

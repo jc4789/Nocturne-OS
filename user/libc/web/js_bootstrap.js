@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -48,7 +48,8 @@
     let audioHandlerTarget = () => false;
     let viewportHandlerTarget = () => false;
     let fontHandlerTarget = () => false;
-    const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
+    let animationHandlerTarget = () => false;
+    const globalHandlerTypes = new Set(('abort animationcancel animationend animationiteration animationstart beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle transitioncancel transitionend transitionrun transitionstart wheel').split(' '));
     const windowHandlerTypes = new Set(('afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pageswap pagehide pagereveal pageshow popstate rejectionhandled storage unhandledrejection unload').split(' '));
     const bodyWindowTypes=new Set([...windowHandlerTypes,'blur','error','focus','load','resize','scroll']);
     // HTML: event handler IDL attributes of Document objects only, with no content attribute
@@ -60,9 +61,22 @@
     /* @include js_collections.js */
     function list(a) { return collectionBridge.list(a); }
     function options(o) { return typeof o === 'boolean' ? {capture:o} : (o || {}); }
-    // Preserve Error identity for native task context/source diagnostics. The
-    // native logger reads only an own stack data property, never a stack getter.
-    function report(e) { host.log(2, e); }
+    // HTML "report an exception" for what a callback threw (js.c report_exception): an ErrorEvent at
+    // this global, then the console unless a listener canceled it. The native side reads only an own
+    // stack data property, never a stack getter. errorReporting is the global's errors reporting
+    // mode: an error listener's own exception goes to the console alone.
+    function report(e) { host.reportException(e); }
+    let errorReporting=false;
+    function reportException(error,message,filename,lineno,colno,muted) {
+        if(errorReporting)return true;
+        errorReporting=true;
+        try {
+            const event=new ErrorEvent('error',muted?{message:'Script error.',error:null,cancelable:true}:
+                {message,filename,lineno,colno,error,cancelable:true});
+            eventState(event).isTrusted=true;
+            return dispatch(globalThis,event);
+        } finally { errorReporting=false; }
+    }
     const eventStates=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set,eventDefine=Object.defineProperty;
     const eventFields=new Set(['type','target','srcElement','currentTarget','eventPhase','bubbles','cancelable','composed','defaultPrevented','isTrusted','timeStamp']);
     function eventState(event){const state=apply(eventGet,eventStates,[event]);if(!state)throw new TypeError('Illegal Event receiver');return state;}
@@ -230,7 +244,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type) || viewportHandlerTarget(target,type) || fontHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type) || viewportHandlerTarget(target,type) || fontHandlerTarget(target,type) || animationHandlerTarget(target,type);
     }
     function bodyWindowHandler(target,type){
         if(!bodyWindowTypes.has(type) || target===globalThis)return false;
@@ -599,7 +613,7 @@
         get currentSrc() { return domGet(this,'imageCurrentSrc'); }
         get src() {
             domGet(this,'imageBrand'); const value=reflectedAttr(this,'src');
-            if(value===null)return '';try{return new URL(value,this.baseURI).href;}catch(_){return value;}
+            if(value===null)return '';return elementURL.resolve(this,value);
         }
         set src(v) { domGet(this,'imageBrand');reflectedAttr(this,'src',String(v)); }
         get alt() { domGet(this,'imageBrand');return reflectedAttr(this,'alt')||''; }
@@ -993,7 +1007,7 @@
     Object.defineProperty(CSSStyleProperties.prototype,Symbol.toStringTag,{value:'CSSStyleProperties',configurable:true});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
     /* @include js_dom_exception.js */
-    const DOMException=domExceptionBridge.DOMException;
+    const DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
     /* @include js_atob.js */
     /* @include js_pointer_events.js */
     /* @include js_tokens.js */
@@ -1010,14 +1024,15 @@
     function requestAnimationFrame(fn){if(typeof fn!=='function')throw new TypeError('Expected callback');return timer(2,fn,16,[]);}
     function cancelAnimationFrame(id){host.clear(Number(id));}
     function queueMicrotask(fn){return host.microtask(fn);}
+    function reportError(e){if(!arguments.length)throw new TypeError("Failed to execute 'reportError': 1 argument required");host.reportException(e);}
     /* @include js_navigator.js */
     const {navigator,Interface:Navigator,languagesChanged}=navigatorBridge.create(false);
     Object.assign(globalThis,{document,console,navigator,Navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
-        Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
-        fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
+        Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,QuotaExceededError,AbortController,AbortSignal,
+        fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,reportError,
         CSSStyleDeclaration,CSSStyleProperties,
         performance:{now:()=>host.now()},getComputedStyle:(n,pseudo=null)=>new CSSStyleProperties(n,true,styleToken,pseudo)});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
@@ -1140,6 +1155,7 @@
     /* @include js_document_selection.js */
     /* @include js_document_commands.js */
     /* @include js_traversal.js */
+    /* @include js_xpath.js */
     /* @include js_svg.js */
     /* @include js_attributes.js */
     /* @include js_shadow.js */
@@ -1265,6 +1281,8 @@
     }
     return {
         presentationSync:presentationBridge.sync,
+        animationUpdate:animationBridge.update,
+        animationEvents:animationBridge.events,
         resourceTiming:performanceBridge.resource,
         workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
@@ -1279,6 +1297,7 @@
         },
         indexedDBTaskEnd:indexedDBBridge.taskEnd,
         promiseRejection:rejectionBridge.unhandled,
+        reportException,
         promiseRejectionHandled:rejectionBridge.handled,
         formNamedProperty:formNameBridge.property,
         formNamedKeys:formNameBridge.keys,

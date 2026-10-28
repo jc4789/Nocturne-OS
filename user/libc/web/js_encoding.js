@@ -1,14 +1,14 @@
-/* UTF-8 Encoding API. No host filesystem or process facilities are exposed. */
+/* Encoding API: TextEncoder (UTF-8) and TextDecoder of every encoding over the
+   native Encoding Standard layer (web_encoding.c). No host filesystem or
+   process facilities are exposed. */
 {
     const slots = new WeakMap(), encoders = new WeakSet();
     const apply = Reflect.apply, U8 = Uint8Array, isView = ArrayBuffer.isView;
     const wmGet = WeakMap.prototype.get, wmSet = WeakMap.prototype.set;
     const wsHas = WeakSet.prototype.has, wsAdd = WeakSet.prototype.add;
-    const str = String, fromCP = String.fromCodePoint;
-    const push = Array.prototype.push, join = Array.prototype.join;
+    const str = String, lower = String.prototype.toLowerCase;
     const nativeDecode = host.decodeUTF8, nativeEncode = host.encodeUTF8, nativeEncodeInto = host.encodeUTF8Into;
-    const assign = Object.assign, regexTest = RegExp.prototype.test;
-    const utf8Label = /^[\t\n\f\r ]*(?:utf-8|utf8|unicode-1-1-utf-8|unicode11utf8|unicode20utf8|x-unicode20utf8)[\t\n\f\r ]*$/i;
+    const getEncoding = host.getEncoding, nativeDecoder = host.textDecoder, nativeTextDecode = host.textDecode;
     const getter = (proto, name) => Object.getOwnPropertyDescriptor(proto, name).get;
     const abLength = getter(ArrayBuffer.prototype, 'byteLength');
     const resizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable');
@@ -43,7 +43,10 @@
         catch (error) { if (!sabLength) throw error; size = apply(sabLength, buffer, []); shared = true; }
         const growable = shared ? sabGrowable : resizable;
         if (growable && apply(growable.get, buffer, [])) throw new TypeError('Resizable buffer is not supported');
-        const view = new U8(buffer, offset, length === undefined ? size : length);
+        if (length === undefined) length = size;
+        // A detached buffer (and each view of it) holds no bytes.
+        if (!length) return new U8(0);
+        const view = new U8(buffer, offset, length);
         return shared && !writable ? new U8(view) : view;
     };
     class TextEncoder {
@@ -67,59 +70,31 @@
             label = text(label);
             options = dictionary(options);
             const fatal = !!options.fatal, ignoreBOM = !!options.ignoreBOM;
-            if (!apply(regexTest, utf8Label, [label]))
-                throw new RangeError('Unsupported text encoding');
-            apply(wmSet, slots, [this, {fatal, ignoreBOM, streaming:false, bom:false,
-                needed:0, seen:0, cp:0, lower:0x80, upper:0xbf}]);
+            const name = getEncoding(label);
+            if (name === null || name === 'replacement') throw new RangeError('Unsupported text encoding');
+            // The decoder instance is made at the first decode that needs one.
+            apply(wmSet, slots, [this, {name, encoding:apply(lower, name, []), fatal, ignoreBOM,
+                streaming:false, decoder:null}]);
         }
-        get encoding() { if (!state(this)) throw new TypeError('Illegal invocation'); return 'utf-8'; }
+        get encoding() { const s=state(this); if(!s) throw new TypeError('Illegal invocation'); return s.encoding; }
         get fatal() { const s=state(this); if(!s) throw new TypeError('Illegal invocation'); return s.fatal; }
         get ignoreBOM() { const s=state(this); if(!s) throw new TypeError('Illegal invocation'); return s.ignoreBOM; }
-        decode(input, options = {}) {
+        decode(input = undefined, options = {}) {
             const s = state(this); if (!s) throw new TypeError('Illegal invocation');
-            const a = bytes(input), out = [], chunks = [];
+            const a = bytes(input);
             const stream = !!dictionary(options).stream;
+            // do not flush: a call after a flushing one starts a new instance,
+            // which the native decoder already is after end-of-queue.
             const fresh = !s.streaming;
-            if (fresh) assign(s, {bom:false, needed:0, seen:0, cp:0, lower:0x80, upper:0xbf});
             s.streaming = stream;
-            if (fresh && !stream)
-                return nativeDecode(apply(taBuffer,a,[]),apply(taOffset,a,[]),apply(taLength,a,[]),s.fatal,s.ignoreBOM);
-            function emit(cp) {
-                if (!s.bom) { s.bom = true; if (!s.ignoreBOM && cp === 0xfeff) return; }
-                apply(push, out, [fromCP(cp)]);
-                // Streaming retains only a small work array, not one JSValue
-                // per scalar across a multi-megabyte XHR/Fetch body.
-                if(out.length===512){apply(push,chunks,[apply(join,out,[''])]);out.length=0;}
-            }
-            function error() {
-                if (s.fatal) { s.streaming = false; throw new TypeError('Invalid UTF-8'); }
-                emit(0xfffd);
-            }
-            for (let i = 0; i < a.length; i++) {
-                const c = a[i];
-                if (!s.needed) {
-                    if (c <= 0x7f) emit(c);
-                    else if (c >= 0xc2 && c <= 0xdf) { s.needed = 1; s.cp = c & 31; }
-                    else if (c >= 0xe0 && c <= 0xef) {
-                        s.needed = 2; s.cp = c & 15;
-                        if (c === 0xe0) s.lower = 0xa0;
-                        if (c === 0xed) s.upper = 0x9f;
-                    } else if (c >= 0xf0 && c <= 0xf4) {
-                        s.needed = 3; s.cp = c & 7;
-                        if (c === 0xf0) s.lower = 0x90;
-                        if (c === 0xf4) s.upper = 0x8f;
-                    } else error();
-                } else if (c < s.lower || c > s.upper) {
-                    assign(s, {needed:0, seen:0, cp:0, lower:0x80, upper:0xbf});
-                    error(); i--;
-                } else {
-                    s.lower = 0x80; s.upper = 0xbf; s.cp = (s.cp << 6) | (c & 63); s.seen++;
-                    if (s.seen === s.needed) { emit(s.cp); s.needed = s.seen = s.cp = 0; }
-                }
-            }
-            if (!s.streaming && s.needed) { s.needed = s.seen = s.cp = 0; error(); }
-            if(out.length)apply(push,chunks,[apply(join,out,[''])]);
-            return apply(join, chunks, ['']);
+            const buffer = apply(taBuffer,a,[]), offset = apply(taOffset,a,[]), length = apply(taLength,a,[]);
+            if (fresh && !stream && s.name === 'UTF-8')
+                return nativeDecode(buffer, offset, length, s.fatal, s.ignoreBOM);
+            if (!s.decoder) s.decoder = nativeDecoder(s.name, s.fatal, s.ignoreBOM);
+            // A fatal error throws and the instance starts afresh: the bytes
+            // after the error are not kept for a later call.
+            try { return nativeTextDecode(s.decoder, buffer, offset, length, stream); }
+            catch (error) { s.streaming = false; throw error; }
         }
     }
     for (const [Type, name] of [[TextEncoder, 'TextEncoder'], [TextDecoder, 'TextDecoder']]) {

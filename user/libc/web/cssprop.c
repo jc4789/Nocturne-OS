@@ -254,7 +254,7 @@ bool css_length_equal(const len_t *a,const len_t *b){
 enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
 
 /* a dimension: number + unit; false if the unit is unknown */
-static bool unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num) {
+bool css_unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num) {
     *px = *pct = 0;
     *num = false;
     if (!un) {
@@ -397,7 +397,7 @@ static struct cexpr *calc_value(const char **s, const char *e, struct cx *cx) {
     const char *u = *s;
     while (*s < e && (isalpha((unsigned char)**s) || **s == '%')) (*s)++;
     struct cexpr *x = cnode(cx, 'v', NULL, NULL);
-    if (!unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
+    if (!css_unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
     return x;
 }
 
@@ -551,12 +551,8 @@ bool css_shadow_serialize(const struct css_box_shadow *shadow, sbuf *out, web_do
     size_t count = 0;
     for (; shadow && success; shadow = shadow->next, count++) {
         if (!(count & 63) && d && !web_native_checkpoint(d)) { success = false; break; }
-        char color[96]; unsigned a = shadow->color >> 24;
-        int n = a == 255 ? snprintf(color, sizeof color, "rgb(%u, %u, %u) ", (shadow->color >> 16) & 255,
-            (shadow->color >> 8) & 255, shadow->color & 255) : snprintf(color, sizeof color, "rgba(%u, %u, %u, %.9g) ",
-            (shadow->color >> 16) & 255, (shadow->color >> 8) & 255, shadow->color & 255, (double)a / 255);
-        success = n > 0 && (size_t)n < sizeof color && (!count || length_append(out, ", ", 2)) &&
-            length_append(out, color, (size_t)n) &&
+        success = (!count || length_append(out, ", ", 2)) &&
+            css_color_value_text(shadow->color_value, shadow->color, out) && length_append(out, " ", 1) &&
             length_number(out, shadow->x, "px") && length_append(out, " ", 1) && length_number(out, shadow->y, "px") &&
             length_append(out, " ", 1) && length_number(out, shadow->blur, "px") && length_append(out, " ", 1) &&
             length_number(out, shadow->spread, "px") && (!shadow->inset || length_append(out, " inset", 6));
@@ -746,7 +742,7 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
     float v;
     if (!parse_number(&p, s + n, &v)) return false;
     bool num;
-    if (!unit_px(p, (size_t)(s + n - p), v, cx, &out->px, &out->pct, &num)) return false;
+    if (!css_unit_px(p, (size_t)(s + n - p), v, cx, &out->px, &out->pct, &num)) return false;
     if((flags&LF_LENGTH)&&num&&v!=0)return false;
     if ((flags & LF_NOPCT) && out->pct) return false;
     if (!(flags & LF_NEG) && v < 0) return false;
@@ -769,262 +765,10 @@ static bool parse_number_value(const char *v, size_t n, struct cx *cx, float *ou
            cfold(x, &number, out, &pct) && number && isfinite(*out);
 }
 
-/* ---------------------------------------------------------------- colours */
-static const struct {
-    const char *name;
-    uint32_t rgb;
-} named[] = {
-    {"aliceblue", 0xF0F8FF}, {"antiquewhite", 0xFAEBD7}, {"aqua", 0x00FFFF}, {"aquamarine", 0x7FFFD4},
-    {"azure", 0xF0FFFF}, {"beige", 0xF5F5DC}, {"bisque", 0xFFE4C4}, {"black", 0x000000},
-    {"blanchedalmond", 0xFFEBCD}, {"blue", 0x0000FF}, {"blueviolet", 0x8A2BE2}, {"brown", 0xA52A2A},
-    {"burlywood", 0xDEB887}, {"buttonface", 0xEFEFEF}, {"buttontext", 0x000000}, {"cadetblue", 0x5F9EA0},
-    {"canvas", 0xFFFFFF}, {"canvastext", 0x000000}, {"chartreuse", 0x7FFF00}, {"chocolate", 0xD2691E},
-    {"coral", 0xFF7F50}, {"cornflowerblue", 0x6495ED}, {"cornsilk", 0xFFF8DC}, {"crimson", 0xDC143C},
-    {"cyan", 0x00FFFF}, {"darkblue", 0x00008B}, {"darkcyan", 0x008B8B}, {"darkgoldenrod", 0xB8860B},
-    {"darkgray", 0xA9A9A9}, {"darkgreen", 0x006400}, {"darkgrey", 0xA9A9A9}, {"darkkhaki", 0xBDB76B},
-    {"darkmagenta", 0x8B008B}, {"darkolivegreen", 0x556B2F}, {"darkorange", 0xFF8C00}, {"darkorchid", 0x9932CC},
-    {"darkred", 0x8B0000}, {"darksalmon", 0xE9967A}, {"darkseagreen", 0x8FBC8F}, {"darkslateblue", 0x483D8B},
-    {"darkslategray", 0x2F4F4F}, {"darkslategrey", 0x2F4F4F}, {"darkturquoise", 0x00CED1}, {"darkviolet", 0x9400D3},
-    {"deeppink", 0xFF1493}, {"deepskyblue", 0x00BFFF}, {"dimgray", 0x696969}, {"dimgrey", 0x696969},
-    {"dodgerblue", 0x1E90FF}, {"field", 0xFFFFFF}, {"fieldtext", 0x000000}, {"firebrick", 0xB22222},
-    {"floralwhite", 0xFFFAF0}, {"forestgreen", 0x228B22}, {"fuchsia", 0xFF00FF}, {"gainsboro", 0xDCDCDC},
-    {"ghostwhite", 0xF8F8FF}, {"gold", 0xFFD700}, {"goldenrod", 0xDAA520}, {"gray", 0x808080},
-    {"graytext", 0x808080}, {"green", 0x008000}, {"greenyellow", 0xADFF2F}, {"grey", 0x808080},
-    {"highlight", 0x3390FF}, {"highlighttext", 0xFFFFFF}, {"honeydew", 0xF0FFF0}, {"hotpink", 0xFF69B4},
-    {"indianred", 0xCD5C5C}, {"indigo", 0x4B0082}, {"ivory", 0xFFFFF0}, {"khaki", 0xF0E68C},
-    {"lavender", 0xE6E6FA}, {"lavenderblush", 0xFFF0F5}, {"lawngreen", 0x7CFC00}, {"lemonchiffon", 0xFFFACD},
-    {"lightblue", 0xADD8E6}, {"lightcoral", 0xF08080}, {"lightcyan", 0xE0FFFF}, {"lightgoldenrodyellow", 0xFAFAD2},
-    {"lightgray", 0xD3D3D3}, {"lightgreen", 0x90EE90}, {"lightgrey", 0xD3D3D3}, {"lightpink", 0xFFB6C1},
-    {"lightsalmon", 0xFFA07A}, {"lightseagreen", 0x20B2AA}, {"lightskyblue", 0x87CEFA}, {"lightslategray", 0x778899},
-    {"lightslategrey", 0x778899}, {"lightsteelblue", 0xB0C4DE}, {"lightyellow", 0xFFFFE0}, {"lime", 0x00FF00},
-    {"limegreen", 0x32CD32}, {"linen", 0xFAF0E6}, {"linktext", 0x0000EE}, {"magenta", 0xFF00FF},
-    {"maroon", 0x800000}, {"mediumaquamarine", 0x66CDAA}, {"mediumblue", 0x0000CD}, {"mediumorchid", 0xBA55D3},
-    {"mediumpurple", 0x9370DB}, {"mediumseagreen", 0x3CB371}, {"mediumslateblue", 0x7B68EE},
-    {"mediumspringgreen", 0x00FA9A}, {"mediumturquoise", 0x48D1CC}, {"mediumvioletred", 0xC71585},
-    {"midnightblue", 0x191970}, {"mintcream", 0xF5FFFA}, {"mistyrose", 0xFFE4E1}, {"moccasin", 0xFFE4B5},
-    {"navajowhite", 0xFFDEAD}, {"navy", 0x000080}, {"oldlace", 0xFDF5E6}, {"olive", 0x808000},
-    {"olivedrab", 0x6B8E23}, {"orange", 0xFFA500}, {"orangered", 0xFF4500}, {"orchid", 0xDA70D6},
-    {"palegoldenrod", 0xEEE8AA}, {"palegreen", 0x98FB98}, {"paleturquoise", 0xAFEEEE}, {"palevioletred", 0xDB7093},
-    {"papayawhip", 0xFFEFD5}, {"peachpuff", 0xFFDAB9}, {"peru", 0xCD853F}, {"pink", 0xFFC0CB},
-    {"plum", 0xDDA0DD}, {"powderblue", 0xB0E0E6}, {"purple", 0x800080}, {"rebeccapurple", 0x663399},
-    {"red", 0xFF0000}, {"rosybrown", 0xBC8F8F}, {"royalblue", 0x4169E1}, {"saddlebrown", 0x8B4513},
-    {"salmon", 0xFA8072}, {"sandybrown", 0xF4A460}, {"seagreen", 0x2E8B57}, {"seashell", 0xFFF5EE},
-    {"sienna", 0xA0522D}, {"silver", 0xC0C0C0}, {"skyblue", 0x87CEEB}, {"slateblue", 0x6A5ACD},
-    {"slategray", 0x708090}, {"slategrey", 0x708090}, {"snow", 0xFFFAFA}, {"springgreen", 0x00FF7F},
-    {"steelblue", 0x4682B4}, {"tan", 0xD2B48C}, {"teal", 0x008080}, {"thistle", 0xD8BFD8},
-    {"tomato", 0xFF6347}, {"turquoise", 0x40E0D0}, {"violet", 0xEE82EE}, {"wheat", 0xF5DEB3},
-    {"white", 0xFFFFFF}, {"whitesmoke", 0xF5F5F5}, {"window", 0xFFFFFF}, {"windowtext", 0x000000},
-    {"yellow", 0xFFFF00}, {"yellowgreen", 0x9ACD32},
-};
-
-static int hexd(int c) {
-    c |= 32;
-    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-}
-
-static uint8_t clamp255(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)(v + 0.5f); }
-
-/* a colour component: a number scaled by full (for 100%), or 'none' */
-static bool comp(const char *s, size_t n, float full, float *out) {
-    if (ident_is(s, n, "none")) {
-        *out = 0;
-        return true;
-    }
-    const char *p = s;
-    float v;
-    if (!parse_number(&p, s + n, &v)) return false;
-    size_t un = (size_t)(s + n - p);
-    if (un == 1 && *p == '%') v = v * full / 100;
-    else if (un) {
-        /* angles */
-        if (ident_is(p, un, "deg")) {
-        } else if (ident_is(p, un, "turn")) v *= 360;
-        else if (ident_is(p, un, "rad")) v = v * 180 / (float)M_PI;
-        else if (ident_is(p, un, "grad")) v *= 0.9f;
-        else return false;
-    }
-    *out = v;
-    return true;
-}
-
-static float hue2rgb(float p, float q, float t) {
-    if (t < 0) t += 1;
-    if (t > 1) t -= 1;
-    if (t < 1.0f / 6) return p + (q - p) * 6 * t;
-    if (t < 0.5f) return q;
-    if (t < 2.0f / 3) return p + (q - p) * (2.0f / 3 - t) * 6;
-    return p;
-}
-
-static float srgb_gamma(float x) {
-    if (x <= 0.0031308f) return 12.92f * x;
-    return 1.055f * (float)pow(x, 1 / 2.4) - 0.055f;
-}
-
-static bool css_color_impl(const char *s, size_t n, uint32_t *out, bool strict, int depth) {
-    if (depth > 32) return false;
-    trim(&s, &n);
-    if (!n) return false;
-    if (s[0] == '#') {
-        int d[8];
-        size_t k = n - 1;
-        if (k != 3 && k != 4 && k != 6 && k != 8) return false;
-        for (size_t i = 0; i < k; i++)
-            if ((d[i] = hexd((unsigned char)s[1 + i])) < 0) return false;
-        uint32_t r, g, b, a = 255;
-        if (k <= 4) {
-            r = (uint32_t)d[0] * 17, g = (uint32_t)d[1] * 17, b = (uint32_t)d[2] * 17;
-            if (k == 4) a = (uint32_t)d[3] * 17;
-        } else {
-            r = (uint32_t)(d[0] * 16 + d[1]), g = (uint32_t)(d[2] * 16 + d[3]), b = (uint32_t)(d[4] * 16 + d[5]);
-            if (k == 8) a = (uint32_t)(d[6] * 16 + d[7]);
-        }
-        *out = ARGB(a, r, g, b);
-        return true;
-    }
-    if (s[n - 1] == ')') {
-        size_t fl = 0;
-        while (fl < n && s[fl] != '(') fl++;
-        if (fl == n) return false;
-        const char *args = s + fl + 1;
-        size_t an = n - fl - 2;
-        if (ident_is(s, fl, "light-dark")) {
-            if (strict) return false; /* current engine always picks the light branch */
-            const char *t[2];
-            size_t tl[2];
-            if (split(args, an, t, tl, 2, ',') < 1) return false;
-            return css_color_impl(t[0], tl[0], out, strict, depth + 1);
-        }
-        if (ident_is(s, fl, "color-mix")) {
-            const char *t[3];
-            size_t tl[3];
-            if (split(args, an, t, tl, 3, ',') != 3) return false;
-            if (strict) {
-                const char *end = t[2] + tl[2];
-                while (end < args + an && is_space((unsigned char)*end)) end++;
-                if (end != args + an || !ident_is(t[0],tl[0],"in srgb")) return false;
-            }
-            uint32_t c[2];
-            float p[2] = {-1, -1};
-            for (int i = 0; i < 2; i++) {
-                const char *u[2];
-                size_t ul[2];
-                int k = split(t[i + 1], tl[i + 1], u, ul, 2, ' ');
-                int ci = 0;
-                if (k == 2 && u[0][ul[0] - 1] == '%') ci = 1;
-                if (!k || !css_color_impl(u[ci], ul[ci], &c[i], strict, depth + 1)) return false;
-                if (k == 2) {
-                    const char *q = u[1 - ci];
-                    if (!parse_number(&q, u[1 - ci] + ul[1 - ci], &p[i])) return false;
-                }
-            }
-            if (p[0] < 0 && p[1] < 0) p[0] = p[1] = 50;
-            else if (p[0] < 0) p[0] = 100 - p[1];
-            else if (p[1] < 0) p[1] = 100 - p[0];
-            float tot = p[0] + p[1];
-            if (tot <= 0) return false;
-            float w = p[1] / tot;
-            float ch[4];
-            for (int k = 0; k < 4; k++) {
-                float a = (float)(c[0] >> (24 - 8 * k) & 255), b = (float)(c[1] >> (24 - 8 * k) & 255);
-                ch[k] = a + (b - a) * w;
-            }
-            float alpha = ch[0] * (tot < 100 ? tot / 100 : 1);
-            *out = ARGB(clamp255(alpha), clamp255(ch[1]), clamp255(ch[2]), clamp255(ch[3]));
-            return true;
-        }
-        /* rgb(), hsl(), oklch(), oklab(): components separated by commas or spaces, alpha after / */
-        char buf[256];
-        if (an >= sizeof buf) return false;
-        for (size_t i = 0; i < an; i++) buf[i] = args[i] == ',' || args[i] == '/' ? ' ' : args[i];
-        const char *t[4];
-        size_t tl[4];
-        int k = split(buf, an, t, tl, 4, ' ');
-        if (k < 3) return false;
-        if (strict) {
-            const char *end = t[k - 1] + tl[k - 1];
-            while (end < buf + an && is_space((unsigned char)*end)) end++;
-            if (end != buf + an) return false;
-            bool commas = memchr(args, ',', an) != NULL;
-            const char *slash = memchr(args, '/', an);
-            if (commas && slash) return false;
-            if (!commas && k == 4 && !slash) return false;
-            if (slash && memchr(slash + 1, '/', (size_t)(args + an - slash - 1))) return false;
-            if (commas) {
-                const char *parts[5]; size_t lengths[5];
-                int count = split(args,an,parts,lengths,5,',');
-                if (count != k) return false;
-                for (int i=0;i<count;i++) if (!lengths[i]) return false;
-            }
-        }
-        float alpha = 1;
-        if (k == 4 && !comp(t[3], tl[3], 1, &alpha)) return false;
-        float c0, c1, c2;
-        if (ident_is(s, fl, "rgb") || ident_is(s, fl, "rgba")) {
-            if (!comp(t[0], tl[0], 255, &c0) || !comp(t[1], tl[1], 255, &c1) || !comp(t[2], tl[2], 255, &c2))
-                return false;
-        } else if (ident_is(s, fl, "hsl") || ident_is(s, fl, "hsla")) {
-            float h, sat, l;
-            if (!comp(t[0], tl[0], 360, &h) || !comp(t[1], tl[1], 100, &sat) || !comp(t[2], tl[2], 100, &l))
-                return false;
-            h = (float)fmod(h, 360) / 360;
-            if (h < 0) h += 1;
-            sat /= 100, l /= 100;
-            float q = l < 0.5f ? l * (1 + sat) : l + sat - l * sat, p = 2 * l - q;
-            c0 = hue2rgb(p, q, h + 1.0f / 3) * 255;
-            c1 = hue2rgb(p, q, h) * 255;
-            c2 = hue2rgb(p, q, h - 1.0f / 3) * 255;
-        } else if (ident_is(s, fl, "oklch") || ident_is(s, fl, "oklab")) {
-            float L, a, b;
-            bool lch = ident_is(s, fl, "oklch");
-            if (!comp(t[0], tl[0], 1, &L)) return false;
-            if (lch) {
-                float C, H;
-                if (!comp(t[1], tl[1], 0.4f, &C) || !comp(t[2], tl[2], 360, &H)) return false;
-                a = C * cosf(H * (float)M_PI / 180);
-                b = C * sinf(H * (float)M_PI / 180);
-            } else if (!comp(t[1], tl[1], 0.4f, &a) || !comp(t[2], tl[2], 0.4f, &b)) return false;
-            float l_ = L + 0.3963377774f * a + 0.2158037573f * b;
-            float m_ = L - 0.1055613458f * a - 0.0638541728f * b;
-            float s_ = L - 0.0894841775f * a - 1.2914855480f * b;
-            float l3 = l_ * l_ * l_, m3 = m_ * m_ * m_, s3 = s_ * s_ * s_;
-            c0 = srgb_gamma(4.0767416621f * l3 - 3.3077115913f * m3 + 0.2309699292f * s3) * 255;
-            c1 = srgb_gamma(-1.2684380046f * l3 + 2.6097574011f * m3 - 0.3413193965f * s3) * 255;
-            c2 = srgb_gamma(-0.0041960863f * l3 - 0.7034186147f * m3 + 1.7076147010f * s3) * 255;
-        } else return false;
-        *out = ARGB(clamp255(alpha * 255), clamp255(c0), clamp255(c1), clamp255(c2));
-        return true;
-    }
-    if (ident_is(s, n, "transparent")) {
-        *out = 0;
-        return true;
-    }
-    if (ident_is(s, n, "currentcolor")) {
-        *out = COLOR_CURRENT;
-        return true;
-    }
-    int lo = 0, hi = (int)(sizeof named / sizeof *named) - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        const char *nm = named[mid].name;
-        int c = 0;
-        size_t i = 0;
-        for (; i < n && nm[i]; i++)
-            if ((c = lower((unsigned char)s[i]) - nm[i])) break;
-        if (!c) c = i < n ? 1 : nm[i] ? -1 : 0;
-        if (!c) {
-            *out = 0xFF000000u | named[mid].rgb;
-            return true;
-        }
-        if (c < 0) hi = mid - 1;
-        else lo = mid + 1;
-    }
-    return false;
-}
-
-bool css_color(const char *s, size_t n, uint32_t *out) { return css_color_impl(s,n,out,false,0); }
+/* ---------------------------------------------------------------- colours (color.c owns them) */
+/* a <color> for a property that keeps only the 8-bit used value (COLOR_CURRENT for currentcolor) */
 static bool css_color_checked(const char *s, size_t n, uint32_t *out, struct cx *cx) {
-    return css_color_impl(s,n,out,cx->supports_probe,0);
+    return css_color_value_compute(s, n, cx, NULL, out, NULL);
 }
 
 /* ---------------------------------------------------------------- the property table */
@@ -1066,10 +810,12 @@ static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, c
         int color_token = -1, length_tokens[4];
         for (int i = 0; i < count; i++) {
             uint32_t candidate;
+            const struct css_color_value *exact;
             if (ident_is(tokens[i], sizes[i], "inset")) {
                 if (inset) return false; inset = shadow.inset = true; lengths_closed |= lengths != 0;
-            } else if (css_color_checked(tokens[i], sizes[i], &candidate, cx)) {
-                if (color) return false; color = true; shadow.color = candidate; color_token=i; lengths_closed |= lengths != 0;
+            } else if (css_color_value_compute(tokens[i], sizes[i], cx, NULL, &candidate, &exact)) {
+                if (color) return false; color = true; shadow.color = candidate; shadow.color_value = exact;
+                color_token=i; lengths_closed |= lengths != 0;
             } else {
                 if (lengths_closed || lengths == 4 || memchr(tokens[i], '%', sizes[i])) return false;
                 len_t dimension;
@@ -1082,7 +828,7 @@ static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, c
         if (lengths < 2) return false;
         if (specified) {
             if (first && !length_append(specified,", ",2)) return false;
-            if (color_token >= 0 && (!length_append(specified,tokens[color_token],sizes[color_token]) ||
+            if (color_token >= 0 && (!css_color_specified(tokens[color_token],sizes[color_token],specified) ||
                 !length_append(specified," ",1))) return false;
             for (unsigned i=0;i<lengths;i++) {
                 int token=length_tokens[i];
@@ -1254,15 +1000,15 @@ bool css_radius_specified(const char *property,const char *value,size_t size,sbu
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
-       PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING, PT_TRANSFORM, PT_TRANSLATE,
-       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_CLIP_PATH, PT_CLIP };
+       PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
+       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_CLIP_PATH, PT_CLIP, PT_COLOR_SCHEME };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
-       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_OUTLINE };
+       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE };
 
 struct propdef {
     const char *name;
@@ -1271,7 +1017,10 @@ struct propdef {
     uint16_t off, size;
     const struct kw *kws;
     uint8_t sh;
+    uint8_t anim; /* AN_*: the animation type when it is not the value type's (css_prop_animation) */
 };
+/* Web Animations 1 §5.3 animation types that differ from a value type's default */
+enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 
 static const struct kw kw_position[] = {{"static", POS_STATIC}, {"relative", POS_RELATIVE}, {"absolute", POS_ABSOLUTE},
                                         {"fixed", POS_FIXED}, {"sticky", POS_STICKY}, {"-webkit-sticky", POS_STICKY}, {0}};
@@ -1282,6 +1031,9 @@ static const struct kw kw_motion_direction[] = {{"normal",CM_NORMAL},{"reverse",
 static const struct kw kw_motion_fill[] = {{"none",CM_FILL_NONE},{"forwards",CM_FILL_FORWARDS},
     {"backwards",CM_FILL_BACKWARDS},{"both",CM_FILL_BOTH},{0}};
 static const struct kw kw_motion_play[] = {{"running",0},{"paused",1},{0}};
+static const struct kw kw_motion_composition[] = {{"replace",CM_COMPOSITE_REPLACE},{"add",CM_COMPOSITE_ADD},
+    {"accumulate",CM_COMPOSITE_ACCUMULATE},{0}};
+static const struct kw kw_transition_behavior[] = {{"normal",0},{"allow-discrete",1},{0}};
 static const struct kw kw_float[] = {{"none", FL_NONE}, {"left", FL_LEFT}, {"right", FL_RIGHT},
                                      {"inline-start", FL_LEFT}, {"inline-end", FL_RIGHT}, {0}};
 static const struct kw kw_clear[] = {{"none", CL_NONE}, {"left", CL_LEFT}, {"right", CL_RIGHT}, {"both", CL_BOTH},
@@ -1363,190 +1115,199 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
                                       {"text-top", VA_TEXT_TOP}, {"text-bottom", VA_TEXT_BOTTOM}, {0}};
 
 #define O(f) (uint16_t) offsetof(style_t, f), (uint16_t)sizeof(((style_t *)0)->f)
-#define SH(name, id) {name, PT_SHORT, 0, false, 0, 0, NULL, id}
+#define SH(name, id) {name, PT_SHORT, 0, false, 0, 0, NULL, id, AN_NONE}
 
 /* sorted by name at first use */
 static struct propdef props[] = {
-    {"-webkit-box-orient", PT_KW, 0, false, O(box_orient), kw_box_orient, 0},
-    {"-webkit-line-clamp", PT_LINE_CLAMP, 0, false, O(line_clamp), NULL, 0},
+    {"-webkit-box-orient", PT_KW, 0, false, O(box_orient), kw_box_orient, 0, AN_TYPE},
+    {"-webkit-line-clamp", PT_LINE_CLAMP, 0, false, O(line_clamp), NULL, 0, AN_TYPE},
     SH("animation", SH_ANIMATION),
-    {"animation-name",PT_MOTION_NAME,0,false,O(motion.name),NULL,0},
-    {"animation-duration",PT_MOTION_TIME,0,false,O(motion.duration),NULL,0},
-    {"animation-delay",PT_MOTION_TIME,LF_NEG,false,O(motion.delay),NULL,0},
-    {"animation-timing-function",PT_MOTION_EASING,0,false,O(motion.easing),NULL,0},
-    {"animation-iteration-count",PT_MOTION_ITERATIONS,0,false,O(motion.iterations),NULL,0},
-    {"animation-direction",PT_KW,0,false,O(motion.direction),kw_motion_direction,0},
-    {"animation-fill-mode",PT_KW,0,false,O(motion.fill),kw_motion_fill,0},
-    {"animation-play-state",PT_KW,0,false,O(motion.paused),kw_motion_play,0},
-    {"align-content", PT_KW, 0, false, O(align_content), kw_acontent, 0},
-    {"align-items", PT_KW, 0, false, O(align_items), kw_align, 0},
-    {"align-self", PT_KW, 0, false, O(align_self), kw_align, 0},
+    /* flags: which ML_* list a motion longhand is */
+    {"animation-name",PT_MOTION_LIST,ML_NAME,false,O(motion.list[ML_NAME]),NULL,0,AN_NONE},
+    {"animation-duration",PT_MOTION_LIST,ML_DURATION,false,O(motion.list[ML_DURATION]),NULL,0,AN_NONE},
+    {"animation-delay",PT_MOTION_LIST,ML_DELAY,false,O(motion.list[ML_DELAY]),NULL,0,AN_NONE},
+    {"animation-timing-function",PT_MOTION_LIST,ML_EASING,false,O(motion.list[ML_EASING]),NULL,0,AN_NONE},
+    {"animation-iteration-count",PT_MOTION_LIST,ML_ITERATIONS,false,O(motion.list[ML_ITERATIONS]),NULL,0,AN_NONE},
+    {"animation-direction",PT_MOTION_LIST,ML_DIRECTION,false,O(motion.list[ML_DIRECTION]),kw_motion_direction,0,AN_NONE},
+    {"animation-fill-mode",PT_MOTION_LIST,ML_FILL,false,O(motion.list[ML_FILL]),kw_motion_fill,0,AN_NONE},
+    {"animation-play-state",PT_MOTION_LIST,ML_PLAY,false,O(motion.list[ML_PLAY]),kw_motion_play,0,AN_NONE},
+    {"animation-composition",PT_MOTION_LIST,ML_COMPOSITION,false,O(motion.list[ML_COMPOSITION]),kw_motion_composition,0,AN_NONE},
+    SH("transition", SH_TRANSITION),
+    {"transition-property",PT_MOTION_LIST,ML_TPROPERTY,false,O(motion.list[ML_TPROPERTY]),NULL,0,AN_NONE},
+    {"transition-duration",PT_MOTION_LIST,ML_TDURATION,false,O(motion.list[ML_TDURATION]),NULL,0,AN_NONE},
+    {"transition-delay",PT_MOTION_LIST,ML_TDELAY,false,O(motion.list[ML_TDELAY]),NULL,0,AN_NONE},
+    {"transition-timing-function",PT_MOTION_LIST,ML_TEASING,false,O(motion.list[ML_TEASING]),NULL,0,AN_NONE},
+    {"transition-behavior",PT_MOTION_LIST,ML_TBEHAVIOR,false,O(motion.list[ML_TBEHAVIOR]),kw_transition_behavior,0,AN_NONE},
+    {"align-content", PT_KW, 0, false, O(align_content), kw_acontent, 0, AN_TYPE},
+    {"align-items", PT_KW, 0, false, O(align_items), kw_align, 0, AN_TYPE},
+    {"align-self", PT_KW, 0, false, O(align_self), kw_align, 0, AN_TYPE},
     SH("background", SH_BACKGROUND),
-    {"background-color", PT_COLOR, 0, false, O(bg_color), NULL, 0},
-    {"background-image", PT_BG_IMAGE, 0, false, O(bg_image), NULL, 0},
-    {"box-shadow", PT_BOX_SHADOW, 0, false, O(box_shadow), NULL, 0},
-    {"background-repeat", PT_KW, 0, false, O(bg_repeat), kw_bg_repeat, 0},
-    {"background-position", PT_BG_POS, 0, false, O(bg_pos), NULL, 0},
-    {"background-size", PT_BG_SIZE, 0, false, O(bg_size), NULL, 0},
+    {"background-color", PT_COLOR, 0, false, O(bg_color), NULL, 0, AN_TYPE},
+    {"background-image", PT_BG_IMAGE, 0, false, O(bg_image), NULL, 0, AN_TYPE},
+    {"box-shadow", PT_BOX_SHADOW, 0, false, O(box_shadow), NULL, 0, AN_TYPE},
+    {"background-repeat", PT_KW, 0, false, O(bg_repeat), kw_bg_repeat, 0, AN_TYPE},
+    {"background-position", PT_BG_POS, 0, false, O(bg_pos), NULL, 0, AN_TYPE},
+    {"background-size", PT_BG_SIZE, 0, false, O(bg_size), NULL, 0, AN_TYPE},
     SH("border", SH_BORDER),
     SH("border-block", SH_BORDER_BLOCK),
     SH("border-bottom", SH_BORDER_BOTTOM),
-    {"border-bottom-left-radius", PT_RADIUS, 0, false, O(corner_radius[3]), NULL, 0},
-    {"border-bottom-right-radius", PT_RADIUS, 0, false, O(corner_radius[2]), NULL, 0},
-    {"border-bottom-color", PT_COLOR, 0, false, O(border_color[2]), NULL, 0},
-    {"border-bottom-style", PT_KW, 0, false, O(border_style[2]), kw_bstyle, 0},
-    {"border-bottom-width", PT_PX, LF_NOPCT, false, O(border_width[2]), kw_bwidth, 0},
-    {"border-collapse", PT_KW, 0, true, O(border_collapse), kw_bcollapse, 0},
+    {"border-bottom-left-radius", PT_RADIUS, 0, false, O(corner_radius[3]), NULL, 0, AN_TYPE},
+    {"border-bottom-right-radius", PT_RADIUS, 0, false, O(corner_radius[2]), NULL, 0, AN_TYPE},
+    {"border-bottom-color", PT_COLOR, 0, false, O(border_color[2]), NULL, 0, AN_TYPE},
+    {"border-bottom-style", PT_KW, 0, false, O(border_style[2]), kw_bstyle, 0, AN_TYPE},
+    {"border-bottom-width", PT_PX, LF_NOPCT, false, O(border_width[2]), kw_bwidth, 0, AN_TYPE},
+    {"border-collapse", PT_KW, 0, true, O(border_collapse), kw_bcollapse, 0, AN_TYPE},
     SH("border-color", SH_BORDER_COLOR),
     SH("border-inline", SH_BORDER_INLINE),
     SH("border-left", SH_BORDER_LEFT),
-    {"border-left-color", PT_COLOR, 0, false, O(border_color[3]), NULL, 0},
-    {"border-left-style", PT_KW, 0, false, O(border_style[3]), kw_bstyle, 0},
-    {"border-left-width", PT_PX, LF_NOPCT, false, O(border_width[3]), kw_bwidth, 0},
+    {"border-left-color", PT_COLOR, 0, false, O(border_color[3]), NULL, 0, AN_TYPE},
+    {"border-left-style", PT_KW, 0, false, O(border_style[3]), kw_bstyle, 0, AN_TYPE},
+    {"border-left-width", PT_PX, LF_NOPCT, false, O(border_width[3]), kw_bwidth, 0, AN_TYPE},
     SH("border-radius", SH_BORDER_RADIUS),
     SH("border-right", SH_BORDER_RIGHT),
-    {"border-right-color", PT_COLOR, 0, false, O(border_color[1]), NULL, 0},
-    {"border-right-style", PT_KW, 0, false, O(border_style[1]), kw_bstyle, 0},
-    {"border-right-width", PT_PX, LF_NOPCT, false, O(border_width[1]), kw_bwidth, 0},
-    {"border-spacing", PT_PX, LF_NOPCT, true, O(border_spacing), NULL, 0},
+    {"border-right-color", PT_COLOR, 0, false, O(border_color[1]), NULL, 0, AN_TYPE},
+    {"border-right-style", PT_KW, 0, false, O(border_style[1]), kw_bstyle, 0, AN_TYPE},
+    {"border-right-width", PT_PX, LF_NOPCT, false, O(border_width[1]), kw_bwidth, 0, AN_TYPE},
+    {"border-spacing", PT_PX, LF_NOPCT, true, O(border_spacing), NULL, 0, AN_TYPE},
     SH("border-style", SH_BORDER_STYLE),
     SH("border-top", SH_BORDER_TOP),
-    {"border-top-left-radius", PT_RADIUS, 0, false, O(corner_radius[0]), NULL, 0},
-    {"border-top-right-radius", PT_RADIUS, 0, false, O(corner_radius[1]), NULL, 0},
-    {"border-top-color", PT_COLOR, 0, false, O(border_color[0]), NULL, 0},
-    {"border-top-style", PT_KW, 0, false, O(border_style[0]), kw_bstyle, 0},
-    {"border-top-width", PT_PX, LF_NOPCT, false, O(border_width[0]), kw_bwidth, 0},
+    {"border-top-left-radius", PT_RADIUS, 0, false, O(corner_radius[0]), NULL, 0, AN_TYPE},
+    {"border-top-right-radius", PT_RADIUS, 0, false, O(corner_radius[1]), NULL, 0, AN_TYPE},
+    {"border-top-color", PT_COLOR, 0, false, O(border_color[0]), NULL, 0, AN_TYPE},
+    {"border-top-style", PT_KW, 0, false, O(border_style[0]), kw_bstyle, 0, AN_TYPE},
+    {"border-top-width", PT_PX, LF_NOPCT, false, O(border_width[0]), kw_bwidth, 0, AN_TYPE},
     SH("border-width", SH_BORDER_WIDTH),
-    {"bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[2]), NULL, 0},
-    {"box-sizing", PT_KW, 0, false, O(box_sizing), kw_boxsizing, 0},
-    {"caption-side", PT_KW, 0, true, O(caption_bottom), kw_capside, 0},
-    {"clear", PT_KW, 0, false, O(clear), kw_clear, 0},
-    {"color", PT_COLOR, 0, true, O(color), NULL, 0},
-    {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0},
-    {"content", PT_CONTENT, 0, false, O(content), NULL, 0},
-    {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0},
+    {"bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[2]), NULL, 0, AN_TYPE},
+    {"box-sizing", PT_KW, 0, false, O(box_sizing), kw_boxsizing, 0, AN_TYPE},
+    {"caption-side", PT_KW, 0, true, O(caption_bottom), kw_capside, 0, AN_TYPE},
+    {"clear", PT_KW, 0, false, O(clear), kw_clear, 0, AN_TYPE},
+    {"color", PT_COLOR, 0, true, O(color), NULL, 0, AN_TYPE},
+    {"color-scheme", PT_COLOR_SCHEME, 0, true, O(color_scheme), NULL, 0, AN_DISCRETE},
+    {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0, AN_TYPE},
+    {"content", PT_CONTENT, 0, false, O(content), NULL, 0, AN_TYPE},
+    {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0, AN_DISPLAY},
     SH("container", SH_CONTAINER),
-    {"container-name", PT_CONTAINER_NAMES, 0, false, O(container_names), NULL, 0},
-    {"container-type", PT_KW, 0, false, O(container_type), kw_container_type, 0},
-    {"display", PT_DISPLAY, 0, false, O(display), NULL, 0},
+    {"container-name", PT_CONTAINER_NAMES, 0, false, O(container_names), NULL, 0, AN_TYPE},
+    {"container-type", PT_KW, 0, false, O(container_type), kw_container_type, 0, AN_NONE},
+    {"display", PT_DISPLAY, 0, false, O(display), NULL, 0, AN_TYPE},
     SH("flex", SH_FLEX),
-    {"flex-basis", PT_LEN, LF_AUTO | LF_LENGTH, false, O(flex_basis), NULL, 0},
-    {"flex-direction", PT_KW, 0, false, O(flex_direction), kw_fdir, 0},
+    {"flex-basis", PT_LEN, LF_AUTO | LF_LENGTH, false, O(flex_basis), NULL, 0, AN_TYPE},
+    {"flex-direction", PT_KW, 0, false, O(flex_direction), kw_fdir, 0, AN_TYPE},
     SH("flex-flow", SH_FLEX_FLOW),
-    {"flex-grow", PT_NUM, 0, false, O(flex_grow), NULL, 0},
-    {"flex-shrink", PT_NUM, 0, false, O(flex_shrink), NULL, 0},
-    {"flex-wrap", PT_KW, 0, false, O(flex_wrap), kw_fwrap, 0},
-    {"float", PT_KW, 0, false, O(float_), kw_float, 0},
-    {"fill", PT_SVG_PAINT, 0, true, O(svg_fill), NULL, 0},
-    {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0},
-    {"filter", PT_FILTER, 0, false, O(filter), NULL, 0},
-    {"clip", PT_CLIP, 0, false, O(clip), NULL, 0},
-    {"clip-path", PT_CLIP_PATH, 0, false, O(clip_path), NULL, 0},
-    {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0},
+    {"flex-grow", PT_NUM, 0, false, O(flex_grow), NULL, 0, AN_TYPE},
+    {"flex-shrink", PT_NUM, 0, false, O(flex_shrink), NULL, 0, AN_TYPE},
+    {"flex-wrap", PT_KW, 0, false, O(flex_wrap), kw_fwrap, 0, AN_TYPE},
+    {"float", PT_KW, 0, false, O(float_), kw_float, 0, AN_TYPE},
+    {"fill", PT_SVG_PAINT, 0, true, O(svg_fill), NULL, 0, AN_TYPE},
+    {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0, AN_TYPE},
+    {"filter", PT_FILTER, 0, false, O(filter), NULL, 0, AN_TYPE},
+    {"clip", PT_CLIP, 0, false, O(clip), NULL, 0, AN_TYPE},
+    {"clip-path", PT_CLIP_PATH, 0, false, O(clip_path), NULL, 0, AN_TYPE},
+    {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0, AN_TYPE},
     SH("font", SH_FONT),
     SH("all", SH_ALL),
-    {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0},
-    {"font-size", PT_FONT_SIZE, 0, true, O(font_size), NULL, 0},
-    {"font-style", PT_KW, 0, true, O(font_style), kw_fstyle, 0},
-    {"font-weight", PT_FONT_WEIGHT, 0, true, O(font_weight), NULL, 0},
+    {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0, AN_TYPE},
+    {"font-size", PT_FONT_SIZE, 0, true, O(font_size), NULL, 0, AN_TYPE},
+    {"font-style", PT_KW, 0, true, O(font_style), kw_fstyle, 0, AN_TYPE},
+    {"font-weight", PT_FONT_WEIGHT, 0, true, O(font_weight), NULL, 0, AN_TYPE},
     SH("gap", SH_GAP),
     SH("grid", SH_GRID),
     SH("grid-area", SH_GRID_AREA),
-    {"grid-auto-columns", PT_GTEMPLATE, 0, false, O(grid_auto_cols), NULL, 0},
-    {"grid-auto-flow", PT_KW, 0, false, O(grid_flow_col), kw_gflow, 0},
-    {"grid-auto-rows", PT_GTEMPLATE, 0, false, O(grid_auto_rows), NULL, 0},
+    {"grid-auto-columns", PT_GTEMPLATE, 0, false, O(grid_auto_cols), NULL, 0, AN_TYPE},
+    {"grid-auto-flow", PT_KW, 0, false, O(grid_flow_col), kw_gflow, 0, AN_TYPE},
+    {"grid-auto-rows", PT_GTEMPLATE, 0, false, O(grid_auto_rows), NULL, 0, AN_TYPE},
     SH("grid-column", SH_GRID_COLUMN),
-    {"grid-column-end", PT_GLINE, 0, false, O(grid_place[3]), NULL, 0},
-    {"grid-column-start", PT_GLINE, 0, false, O(grid_place[1]), NULL, 0},
+    {"grid-column-end", PT_GLINE, 0, false, O(grid_place[3]), NULL, 0, AN_TYPE},
+    {"grid-column-start", PT_GLINE, 0, false, O(grid_place[1]), NULL, 0, AN_TYPE},
     SH("grid-row", SH_GRID_ROW),
-    {"grid-row-end", PT_GLINE, 0, false, O(grid_place[2]), NULL, 0},
-    {"grid-row-start", PT_GLINE, 0, false, O(grid_place[0]), NULL, 0},
+    {"grid-row-end", PT_GLINE, 0, false, O(grid_place[2]), NULL, 0, AN_TYPE},
+    {"grid-row-start", PT_GLINE, 0, false, O(grid_place[0]), NULL, 0, AN_TYPE},
     SH("grid-template", SH_GRID_TEMPLATE),
-    {"grid-template-areas", PT_GAREAS, 0, false, O(grid_areas), NULL, 0},
-    {"grid-template-columns", PT_GTEMPLATE, 0, false, O(grid_cols), NULL, 0},
-    {"grid-template-rows", PT_GTEMPLATE, 0, false, O(grid_rows), NULL, 0},
-    {"height", PT_LEN, LF_AUTO, false, O(height), NULL, 0},
+    {"grid-template-areas", PT_GAREAS, 0, false, O(grid_areas), NULL, 0, AN_TYPE},
+    {"grid-template-columns", PT_GTEMPLATE, 0, false, O(grid_cols), NULL, 0, AN_TYPE},
+    {"grid-template-rows", PT_GTEMPLATE, 0, false, O(grid_rows), NULL, 0, AN_TYPE},
+    {"height", PT_LEN, LF_AUTO, false, O(height), NULL, 0, AN_TYPE},
     SH("inset", SH_INSET),
     SH("inset-block", SH_INSET_BLOCK),
     SH("inset-inline", SH_INSET_INLINE),
-    {"justify-content", PT_KW, 0, false, O(justify_content), kw_justify, 0},
-    {"justify-items", PT_KW, 0, false, O(justify_items), kw_jalign, 0},
-    {"justify-self", PT_KW, 0, false, O(justify_self), kw_jalign, 0},
-    {"left", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[3]), NULL, 0},
-    {"letter-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(letter_spacing), kw_normal0, 0},
-    {"line-height", PT_LINE_HEIGHT, 0, true, O(line_height), NULL, 0},
+    {"justify-content", PT_KW, 0, false, O(justify_content), kw_justify, 0, AN_TYPE},
+    {"justify-items", PT_KW, 0, false, O(justify_items), kw_jalign, 0, AN_TYPE},
+    {"justify-self", PT_KW, 0, false, O(justify_self), kw_jalign, 0, AN_TYPE},
+    {"left", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[3]), NULL, 0, AN_TYPE},
+    {"letter-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(letter_spacing), kw_normal0, 0, AN_TYPE},
+    {"line-height", PT_LINE_HEIGHT, 0, true, O(line_height), NULL, 0, AN_TYPE},
     SH("list-style", SH_LIST_STYLE),
-    {"list-style-position", PT_KW, 0, true, O(list_style_inside), kw_lspos, 0},
-    {"list-style-type", PT_LIST_TYPE, 0, true, O(list_style), NULL, 0},
+    {"list-style-position", PT_KW, 0, true, O(list_style_inside), kw_lspos, 0, AN_TYPE},
+    {"list-style-type", PT_LIST_TYPE, 0, true, O(list_style), NULL, 0, AN_TYPE},
     SH("margin", SH_MARGIN),
     SH("margin-block", SH_MARGIN_BLOCK),
-    {"margin-bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[2]), NULL, 0},
+    {"margin-bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[2]), NULL, 0, AN_TYPE},
     SH("margin-inline", SH_MARGIN_INLINE),
-    {"margin-left", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[3]), NULL, 0},
-    {"margin-right", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[1]), NULL, 0},
-    {"margin-top", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[0]), NULL, 0},
-    {"mask-image", PT_MASK_IMAGE, 0, false, O(mask_image), NULL, 0},
-    {"mask-position", PT_BG_POS, 0, false, O(mask_pos), NULL, 0},
-    {"object-fit", PT_KW, 0, false, O(object_fit), kw_object_fit, 0},
-    {"object-position", PT_BG_POS, 0, true, O(object_pos), NULL, 0},
-    {"mask-repeat", PT_KW, 0, false, O(mask_repeat), kw_bg_repeat, 0},
-    {"mask-size", PT_MASK_SIZE, 0, false, O(mask_size), NULL, 0},
-    {"max-height", PT_LEN, LF_NONE, false, O(max_height), NULL, 0},
-    {"max-width", PT_LEN, LF_NONE, false, O(max_width), NULL, 0},
-    {"min-height", PT_LEN, LF_AUTO, false, O(min_height), NULL, 0},
-    {"min-width", PT_LEN, LF_AUTO, false, O(min_width), NULL, 0},
-    {"opacity", PT_OPACITY, 0, false, O(opacity), NULL, 0},
-    {"order", PT_INT, 0, false, O(order), NULL, 0},
+    {"margin-left", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[3]), NULL, 0, AN_TYPE},
+    {"margin-right", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[1]), NULL, 0, AN_TYPE},
+    {"margin-top", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[0]), NULL, 0, AN_TYPE},
+    {"mask-image", PT_MASK_IMAGE, 0, false, O(mask_image), NULL, 0, AN_TYPE},
+    {"mask-position", PT_BG_POS, 0, false, O(mask_pos), NULL, 0, AN_TYPE},
+    {"object-fit", PT_KW, 0, false, O(object_fit), kw_object_fit, 0, AN_TYPE},
+    {"object-position", PT_BG_POS, 0, true, O(object_pos), NULL, 0, AN_TYPE},
+    {"mask-repeat", PT_KW, 0, false, O(mask_repeat), kw_bg_repeat, 0, AN_TYPE},
+    {"mask-size", PT_MASK_SIZE, 0, false, O(mask_size), NULL, 0, AN_TYPE},
+    {"max-height", PT_LEN, LF_NONE, false, O(max_height), NULL, 0, AN_TYPE},
+    {"max-width", PT_LEN, LF_NONE, false, O(max_width), NULL, 0, AN_TYPE},
+    {"min-height", PT_LEN, LF_AUTO, false, O(min_height), NULL, 0, AN_TYPE},
+    {"min-width", PT_LEN, LF_AUTO, false, O(min_width), NULL, 0, AN_TYPE},
+    {"opacity", PT_OPACITY, 0, false, O(opacity), NULL, 0, AN_TYPE},
+    {"order", PT_INT, 0, false, O(order), NULL, 0, AN_TYPE},
     SH("outline", SH_OUTLINE),
-    {"outline-color", PT_COLOR, 0, false, O(outline_color), NULL, 0},
-    {"outline-offset", PT_PX, LF_NEG | LF_NOPCT, false, O(outline_offset), NULL, 0},
-    {"outline-style", PT_KW, 0, false, O(outline_style), kw_ostyle, 0},
-    {"outline-width", PT_PX, LF_NOPCT, false, O(outline_width), kw_bwidth, 0},
+    {"outline-color", PT_COLOR, 0, false, O(outline_color), NULL, 0, AN_TYPE},
+    {"outline-offset", PT_PX, LF_NEG | LF_NOPCT, false, O(outline_offset), NULL, 0, AN_TYPE},
+    {"outline-style", PT_KW, 0, false, O(outline_style), kw_ostyle, 0, AN_TYPE},
+    {"outline-width", PT_PX, LF_NOPCT, false, O(outline_width), kw_bwidth, 0, AN_TYPE},
     SH("overflow", SH_OVERFLOW),
-    {"overflow-x", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0},
-    {"overflow-y", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0},
+    {"overflow-x", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0, AN_TYPE},
+    {"overflow-y", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0, AN_TYPE},
     SH("padding", SH_PADDING),
     SH("padding-block", SH_PADDING_BLOCK),
-    {"padding-bottom", PT_LEN, 0, false, O(padding[2]), NULL, 0},
+    {"padding-bottom", PT_LEN, 0, false, O(padding[2]), NULL, 0, AN_TYPE},
     SH("padding-inline", SH_PADDING_INLINE),
-    {"padding-left", PT_LEN, 0, false, O(padding[3]), NULL, 0},
-    {"padding-right", PT_LEN, 0, false, O(padding[1]), NULL, 0},
-    {"padding-top", PT_LEN, 0, false, O(padding[0]), NULL, 0},
+    {"padding-left", PT_LEN, 0, false, O(padding[3]), NULL, 0, AN_TYPE},
+    {"padding-right", PT_LEN, 0, false, O(padding[1]), NULL, 0, AN_TYPE},
+    {"padding-top", PT_LEN, 0, false, O(padding[0]), NULL, 0, AN_TYPE},
     SH("place-content", SH_PLACE_CONTENT),
     SH("place-items", SH_PLACE_ITEMS),
     SH("place-self", SH_PLACE_SELF),
-    {"pointer-events", PT_KW, 0, true, O(pointer_events), kw_pointer_events, 0},
-    {"position", PT_KW, 0, false, O(position), kw_position, 0},
-    {"right", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[1]), NULL, 0},
-    {"row-gap", PT_PX, LF_NOPCT, false, O(gap_row), kw_normal0, 0},
-    {"stroke", PT_SVG_PAINT, 0, true, O(svg_stroke), NULL, 0},
-    {"stroke-opacity", PT_OPACITY, 0, true, O(svg_stroke_opacity), NULL, 0},
-    {"stroke-width", PT_SVG_WIDTH, 0, true, O(svg_stroke_width), NULL, 0},
-    {"stroke-linecap", PT_KW, 0, true, O(svg_stroke_cap), kw_svg_cap, 0},
-    {"stroke-linejoin", PT_KW, 0, true, O(svg_stroke_join), kw_svg_join, 0},
-    {"stop-color", PT_COLOR, 0, false, O(svg_stop_color), NULL, 0},
-    {"stop-opacity", PT_OPACITY, 0, false, O(svg_stop_opacity), NULL, 0},
-    {"table-layout", PT_KW, 0, false, O(table_layout), kw_tlayout, 0},
-    {"text-align", PT_KW, 0, true, O(text_align), kw_talign, 0},
-    {"text-overflow",PT_KW,0,false,O(text_overflow),kw_text_overflow,0},
+    {"pointer-events", PT_KW, 0, true, O(pointer_events), kw_pointer_events, 0, AN_TYPE},
+    {"position", PT_KW, 0, false, O(position), kw_position, 0, AN_TYPE},
+    {"right", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[1]), NULL, 0, AN_TYPE},
+    {"row-gap", PT_PX, LF_NOPCT, false, O(gap_row), kw_normal0, 0, AN_TYPE},
+    {"stroke", PT_SVG_PAINT, 0, true, O(svg_stroke), NULL, 0, AN_TYPE},
+    {"stroke-opacity", PT_OPACITY, 0, true, O(svg_stroke_opacity), NULL, 0, AN_TYPE},
+    {"stroke-width", PT_SVG_WIDTH, 0, true, O(svg_stroke_width), NULL, 0, AN_TYPE},
+    {"stroke-linecap", PT_KW, 0, true, O(svg_stroke_cap), kw_svg_cap, 0, AN_TYPE},
+    {"stroke-linejoin", PT_KW, 0, true, O(svg_stroke_join), kw_svg_join, 0, AN_TYPE},
+    {"stop-color", PT_COLOR, 0, false, O(svg_stop_color), NULL, 0, AN_TYPE},
+    {"stop-opacity", PT_OPACITY, 0, false, O(svg_stop_opacity), NULL, 0, AN_TYPE},
+    {"table-layout", PT_KW, 0, false, O(table_layout), kw_tlayout, 0, AN_TYPE},
+    {"text-align", PT_KW, 0, true, O(text_align), kw_talign, 0, AN_TYPE},
+    {"text-overflow",PT_KW,0,false,O(text_overflow),kw_text_overflow,0, AN_TYPE},
     SH("text-decoration", SH_TEXT_DECORATION),
-    {"text-decoration-line", PT_TEXT_DECO, 0, true, O(text_decoration), NULL, 0},
-    {"text-indent", PT_LEN, LF_NEG, true, O(text_indent), NULL, 0},
-    {"text-transform", PT_KW, 0, true, O(text_transform), kw_ttrans, 0},
-    {"text-wrap-mode", PT_KW, 0, true, O(white_space), kw_textwrap, 0},
-    {"top", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[0]), NULL, 0},
-    {"transform", PT_TRANSFORM, 0, false, O(transform), NULL, 0},
-    {"transform-origin", PT_TRANSFORM_ORIGIN, 0, false, O(transform_origin), NULL, 0},
-    {"transform-box", PT_KW, 0, false, O(transform_box), kw_transform_box, 0},
-    {"rotate", PT_ROTATE, 0, false, O(rotate), NULL, 0},
-    {"scale", PT_SCALE, 0, false, O(scale), NULL, 0},
-    {"translate", PT_TRANSLATE, 0, false, O(translate), NULL, 0},
-    {"vertical-align", PT_VALIGN, 0, false, O(vertical_align), kw_valign, 0},
-    {"visibility", PT_KW, 0, true, O(visibility), kw_visibility, 0},
-    {"white-space", PT_KW, 0, true, O(white_space), kw_ws, 0},
-    {"width", PT_LEN, LF_AUTO, false, O(width), NULL, 0},
-    {"word-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(word_spacing), kw_normal0, 0},
-    {"z-index", PT_ZINDEX, 0, false, O(z_index), NULL, 0},
+    {"text-decoration-line", PT_TEXT_DECO, 0, true, O(text_decoration), NULL, 0, AN_TYPE},
+    {"text-indent", PT_LEN, LF_NEG, true, O(text_indent), NULL, 0, AN_TYPE},
+    {"text-transform", PT_KW, 0, true, O(text_transform), kw_ttrans, 0, AN_TYPE},
+    {"text-wrap-mode", PT_KW, 0, true, O(white_space), kw_textwrap, 0, AN_TYPE},
+    {"top", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[0]), NULL, 0, AN_TYPE},
+    {"transform", PT_TRANSFORM, 0, false, O(transform), NULL, 0, AN_TYPE},
+    {"transform-origin", PT_TRANSFORM_ORIGIN, 0, false, O(transform_origin), NULL, 0, AN_TYPE},
+    {"transform-box", PT_KW, 0, false, O(transform_box), kw_transform_box, 0, AN_TYPE},
+    {"rotate", PT_ROTATE, 0, false, O(rotate), NULL, 0, AN_TYPE},
+    {"scale", PT_SCALE, 0, false, O(scale), NULL, 0, AN_TYPE},
+    {"translate", PT_TRANSLATE, 0, false, O(translate), NULL, 0, AN_TYPE},
+    {"vertical-align", PT_VALIGN, 0, false, O(vertical_align), kw_valign, 0, AN_TYPE},
+    {"visibility", PT_KW, 0, true, O(visibility), kw_visibility, 0, AN_VISIBILITY},
+    {"white-space", PT_KW, 0, true, O(white_space), kw_ws, 0, AN_TYPE},
+    {"width", PT_LEN, LF_AUTO, false, O(width), NULL, 0, AN_TYPE},
+    {"word-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(word_spacing), kw_normal0, 0, AN_TYPE},
+    {"z-index", PT_ZINDEX, 0, false, O(z_index), NULL, 0, AN_TYPE},
 };
 #define NPROPS (int)(sizeof props / sizeof *props)
 
@@ -1610,8 +1371,6 @@ static void init_initial(void) {
     s->flex_shrink = 1;
     s->align_content = AC_NORMAL;
     s->opacity = 1;
-    s->motion.iterations = 1;
-    s->motion.easing = (struct css_easing){.x1=.25f,.y1=.1f,.x2=.25f,.y2=1,.kind=CM_BEZIER};
     s->object_pos[0].kind=s->object_pos[1].kind=LK_LEN;
     s->object_pos[0].pct=s->object_pos[1].pct=50;
     s->transform_origin[0].kind=s->transform_origin[1].kind=LK_LEN;
@@ -1668,14 +1427,28 @@ const char *css_prop_name(int index,bool *longhand) {
     return props[index].name;
 }
 int css_prop_index(const struct propdef *p) { return (int)(p - props); }
-bool css_prop_is_font(const struct propdef *p) {
-    return (p->type == PT_FONT_SIZE) || (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_ALL));
+const struct propdef *css_prop_at(int index) { return index >= 0 && index < NPROPS ? &props[index] : NULL; }
+/* font-size gives em, color-scheme the system colours and light-dark() */
+static bool early(const struct propdef *p) { return p->type == PT_FONT_SIZE || p->type == PT_COLOR_SCHEME; }
+bool css_prop_is_early(const struct propdef *p) {
+    return early(p) || (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_ALL));
 }
 bool css_prop_is_motion(const struct propdef *p) {
-    return p && (!strcmp(p->name,"animation") || !strncmp(p->name,"animation-",10));
+    return p && (p->type == PT_MOTION_LIST || (p->type == PT_SHORT && (p->sh == SH_ANIMATION || p->sh == SH_TRANSITION)));
 }
 bool css_prop_inherited(const struct propdef *p) { return p && p->inherited; }
-int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32_t *color, web_doc *d) {
+/* the colour slot (color.c) of a PT_COLOR or PT_SVG_PAINT property */
+static enum css_color_slot color_slot(const struct propdef *p) {
+    size_t off = p->off;
+    if (off == offsetof(style_t, color)) return CSS_SLOT_COLOR;
+    if (off == offsetof(style_t, svg_fill)) return CSS_SLOT_FILL;
+    if (off == offsetof(style_t, svg_stroke)) return CSS_SLOT_STROKE;
+    if (off == offsetof(style_t, bg_color)) return CSS_SLOT_BACKGROUND;
+    if (off == offsetof(style_t, outline_color)) return CSS_SLOT_OUTLINE;
+    if (off == offsetof(style_t, svg_stop_color)) return CSS_SLOT_STOP;
+    return (enum css_color_slot)(CSS_SLOT_BORDER_TOP + (off - offsetof(style_t, border_color)) / sizeof(uint32_t));
+}
+int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
     const void *field = (const char *)st + p->off;
@@ -1702,13 +1475,36 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32
     case PT_INT:
         if (p->size != sizeof(int32_t)) return 0;
         snprintf(text, sizeof text, "%d", (int)*(const int32_t *)field); sb_puts(out, text); return 1;
-    case PT_COLOR: {
-        uint32_t c = *(const uint32_t *)field;
-        *color = c == COLOR_CURRENT ? st->color : c;
-        return 2;
-    }
+    case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
+    case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
+    case PT_MOTION_LIST: return css_computed_value(st, p, out, d) ? 1 : -1;
     }
     return 0;
+}
+/* CSSOM: a declared value's specified serialization for the properties whose
+   values the table serializes itself; false leaves the authored text */
+static bool apply_long(const struct propdef *p, const char *v, size_t n, struct cx *cx);
+bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out) {
+    const struct propdef *p = css_prop_lookup(name, strlen(name));
+    if (!p) return false;
+    trim(&v, &n);
+    if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
+    if (p->type != PT_COLOR_SCHEME) return false;
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    if (!setjmp(trap)) {
+        style_t scratch = {0};
+        uint8_t set[1] = {0};
+        struct cx cx = {.s = &scratch, .a = &a, .set = set, .supports_probe = true};
+        if (apply_long(p, v, n, &cx)) {
+            sb_puts(out, scratch.color_scheme_text ? scratch.color_scheme_text : "normal");
+            ok = true;
+        }
+    }
+    ar_free(&a);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- longhand values */
@@ -2266,6 +2062,7 @@ static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
     return false;
 }
 
+static bool transform_angle(const char *s, size_t n, float *out);
 /* linear-gradient(), radial-gradient() and their repeating- forms; NULL if it is not one */
 static const struct gradient *parse_gradient(const char *s, size_t n, struct cx *cx) {
     size_t fl = 0;
@@ -2294,11 +2091,13 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
         size_t cl[8];
         int q = split_checked(a[j], al[j], c, cl, 8, ' ', cx);
         uint32_t col;
-        if (q >= 1 && css_color_checked(c[0], cl[0], &col, cx)) { /* a colour stop: colour [pos [pos]] */
+        const struct css_color_value *exact;
+        if (q >= 1 && css_color_value_compute(c[0], cl[0], cx, NULL, &col, &exact)) { /* a colour stop: colour [pos [pos]] */
             if (cx->supports_probe && q > 3) return NULL;
             for (int z = 0; z < 2 && g.n < GRAD_MAX; z++) {
                 if (z == 1 && q < 3) break;
                 g.col[g.n] = col;
+                g.col_value[g.n] = col == COLOR_CURRENT ? exact : NULL;
                 g.pos[g.n].kind = LK_AUTO;
                 if (q > 1 + z && !parse_len(c[1 + z], cl[1 + z], cx, &g.pos[g.n], 0)) {
                     if (cx->supports_probe) return NULL;
@@ -2328,7 +2127,7 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
                     g.angle = g.to_y < 0 ? 0 : g.to_x > 0 ? 90 : g.to_y > 0 ? 180 : 270;
                     g.to_x = g.to_y = 0;
                 }
-            } else if (q == 1 && comp(c[0], cl[0], 0, &deg)) g.angle = deg;
+            } else if (q == 1 && transform_angle(c[0], cl[0], &deg)) g.angle = deg * 180 / (float)M_PI;
             else return NULL;
             continue;
         }
@@ -2613,8 +2412,7 @@ static bool is_custom_ident(const char *s, size_t n) {
     return !ident_is(s, n, "auto") && !ident_is(s, n, "span");
 }
 
-/* Deliberately one CSS animation, with an opacity interpolation backend.
-   Lists/steps()/timelines/composition are not accepted as fake support. */
+/* animation-name and transition-property identifiers: <custom-ident> */
 static bool motion_name(const char *s, size_t n) {
     if (!n || ident_is(s,n,"initial") || ident_is(s,n,"inherit") || ident_is(s,n,"unset") ||
         ident_is(s,n,"revert") || ident_is(s,n,"revert-layer") || ident_is(s,n,"default") ||
@@ -2632,58 +2430,292 @@ static bool motion_time(const char *s,size_t n,float *out) {
     if (!isfinite(v)) return false;
     *out=v;return true;
 }
+/* <easing-function> (css-easing-1 §2): linear, the cubic-bezier() keywords and function,
+   step-start/step-end and steps(<integer>[, <step-position>]). */
 bool css_easing_parse(const char *s,size_t n,struct css_easing *out) {
+    trim(&s,&n);
     struct css_easing v={.kind=CM_BEZIER,.y2=1};
-    if(ident_is(s,n,"linear"))v.kind=CM_LINEAR;
-    else if(ident_is(s,n,"step-start"))v.kind=CM_STEP_START;
-    else if(ident_is(s,n,"step-end"))v.kind=CM_STEP_END;
-    else if(ident_is(s,n,"ease")){v.x1=.25f;v.y1=.1f;v.x2=.25f;}
-    else if(ident_is(s,n,"ease-in")){v.x1=.42f;v.x2=1;}
-    else if(ident_is(s,n,"ease-out")){v.x2=.58f;}
-    else if(ident_is(s,n,"ease-in-out")){v.x1=.42f;v.x2=.58f;}
-    else {
-        if(n<15 || !strn_ieq(s,"cubic-bezier(",13) || s[n-1]!=')')return false;
-        const char *p=s+13,*e=s+n-1;float a[4];
-        for(int i=0;i<4;i++) {
-            while(p<e && is_space((unsigned char)*p))p++;
-            if(!parse_number(&p,e,&a[i]) || !isfinite(a[i]))return false;
-            while(p<e && is_space((unsigned char)*p))p++;
-            if(i<3){if(p==e || *p++!=',')return false;}else if(p!=e)return false;
-        }
-        if(a[0]<0 || a[0]>1 || a[2]<0 || a[2]>1)return false;
-        v.x1=a[0];v.y1=a[1];v.x2=a[2];v.y2=a[3];
+    static const struct {const char *name;float x1,y1,x2;uint8_t keyword;} named[]={
+        {"ease",.25f,.1f,.25f,CM_EASE},{"ease-in",.42f,0,1,CM_EASE_IN},{"ease-out",0,0,.58f,CM_EASE_OUT},
+        {"ease-in-out",.42f,0,.58f,CM_EASE_IN_OUT}};
+    for(size_t i=0;i<sizeof named/sizeof *named;i++)if(ident_is(s,n,named[i].name)){
+        v.x1=named[i].x1;v.y1=named[i].y1;v.x2=named[i].x2;v.keyword=named[i].keyword;*out=v;return true;
     }
+    if(ident_is(s,n,"linear")){*out=(struct css_easing){.kind=CM_LINEAR};return true;}
+    if(ident_is(s,n,"step-start")){*out=(struct css_easing){.kind=CM_STEPS,.steps=1,.position=CM_STEP_START};return true;}
+    if(ident_is(s,n,"step-end")){*out=(struct css_easing){.kind=CM_STEPS,.steps=1,.position=CM_STEP_END};return true;}
+    if(n>7 && strn_ieq(s,"steps(",6) && s[n-1]==')') {
+        const char *t[3];size_t tl[3];int k=split(s+6,n-7,t,tl,3,',');
+        if(k<1 || k>2)return false;
+        const char *p=t[0];float count;
+        if(!parse_number(&p,t[0]+tl[0],&count) || p!=t[0]+tl[0] || count!=floorf(count) || count<1 || count>1e9f)return false;
+        uint8_t position=CM_STEP_END;
+        if(k==2) {
+            static const struct kw positions[]={{"end",CM_STEP_END},{"jump-end",CM_STEP_END},{"start",CM_STEP_START},
+                {"jump-start",CM_STEP_JUMP_START},{"jump-both",CM_STEP_JUMP_BOTH},{"jump-none",CM_STEP_JUMP_NONE},{0}};
+            if(!kw_find(positions,t[1],tl[1],&position))return false;
+        }
+        if(position==CM_STEP_JUMP_NONE && count<2)return false;
+        *out=(struct css_easing){.kind=CM_STEPS,.steps=(uint32_t)count,.position=position};return true;
+    }
+    if(n<15 || !strn_ieq(s,"cubic-bezier(",13) || s[n-1]!=')')return false;
+    const char *p=s+13,*e=s+n-1;float a[4];
+    for(int i=0;i<4;i++) {
+        while(p<e && is_space((unsigned char)*p))p++;
+        if(!parse_number(&p,e,&a[i]) || !isfinite(a[i]))return false;
+        while(p<e && is_space((unsigned char)*p))p++;
+        if(i<3){if(p==e || *p++!=',')return false;}else if(p!=e)return false;
+    }
+    if(a[0]<0 || a[0]>1 || a[2]<0 || a[2]>1)return false;
+    v.x1=a[0];v.y1=a[1];v.x2=a[2];v.y2=a[3];
     *out=v;return true;
 }
-static bool motion_shorthand(const char *s,size_t n,struct cx *cx,struct css_motion *out) {
-    const char *t[10];size_t tl[10];int k=split(s,n,t,tl,10,' ');
-    if(!k || t[k-1]+tl[k-1]!=s+n)return false;
-    struct css_motion v=initial.motion;
-    unsigned seen=0,times=0;
-    for(int i=0;i<k;i++) {
-        float f;uint8_t kw;struct css_easing ease;
-        if(motion_time(t[i],tl[i],&f)) {
-            if(times==0){if(f<0)return false;v.duration=f;}
-            else if(times==1)v.delay=f;else return false;
-            times++;continue;
+static double bezier_at(double t,double p1,double p2){double u=1-t;return 3*u*u*t*p1+3*u*t*t*p2+t*t*t;}
+double css_easing_apply(const struct css_easing *e,double x,bool before) {
+    if(!e || e->kind==CM_LINEAR || !isfinite(x))return x;
+    if(e->kind==CM_STEPS) {
+        /* css-easing-1 §2.3 step easing function */
+        double steps=e->steps?e->steps:1,current=floor(x*steps);
+        if(e->position==CM_STEP_START || e->position==CM_STEP_JUMP_START || e->position==CM_STEP_JUMP_BOTH)current+=1;
+        if(before && fmod(x*steps,1)==0)current-=1;
+        if(x>=0 && current<0)current=0;
+        double jumps=e->position==CM_STEP_JUMP_BOTH?steps+1:e->position==CM_STEP_JUMP_NONE?steps-1:steps;
+        if(x<=1 && current>jumps)current=jumps;
+        return current/jumps;
+    }
+    double x1=e->x1,y1=e->y1,x2=e->x2,y2=e->y2;
+    /* §2.2: outside [0, 1] the curve continues along its end tangents */
+    if(x<0) {
+        if(x1>0)return y1/x1*x;
+        if(y1==0 && x2>0)return y2/x2*x;
+        return 0;
+    }
+    if(x>1) {
+        if(x2<1)return 1+(y2-1)/(x2-1)*(x-1);
+        if(y2==1 && x1<1)return 1+(y1-1)/(x1-1)*(x-1);
+        return 1;
+    }
+    if(x==0 || x==1)return x;
+    double t=x;
+    for(int i=0;i<8;i++) {
+        double err=bezier_at(t,x1,x2)-x,u=1-t,slope=3*u*u*x1+6*u*t*(x2-x1)+3*t*t*(1-x2);
+        if(fabs(err)<1e-9)return bezier_at(t,y1,y2);
+        if(fabs(slope)<1e-6)break;
+        t-=err/slope;
+    }
+    double lo=0,hi=1;t=x;
+    for(int i=0;i<60;i++){double z=bezier_at(t,x1,x2);if(fabs(z-x)<1e-9)break;if(z<x)lo=t;else hi=t;t=(lo+hi)/2;}
+    return bezier_at(t,y1,y2);
+}
+bool css_easing_serialize(const struct css_easing *e,sbuf *out) {
+    static const char *const keywords[]={NULL,"ease","ease-in","ease-out","ease-in-out"};
+    char text[160];
+    if(e->kind==CM_LINEAR)snprintf(text,sizeof text,"linear");
+    else if(e->kind==CM_STEPS) {
+        static const char *const positions[]={"",", start",", jump-start",", jump-both",", jump-none"};
+        snprintf(text,sizeof text,"steps(%u%s)",(unsigned)e->steps,positions[e->position<5?e->position:0]);
+    } else if(e->keyword && e->keyword<5)snprintf(text,sizeof text,"%s",keywords[e->keyword]);
+    else snprintf(text,sizeof text,"cubic-bezier(%.7g, %.7g, %.7g, %.7g)",(double)e->x1,(double)e->y1,(double)e->x2,(double)e->y2);
+    sb_puts(out,text);return true;
+}
+static union css_motion_item motion_initial(int list) {
+    union css_motion_item v;
+    memset(&v, 0, sizeof v);
+    if (list == ML_EASING || list == ML_TEASING) v.e = (struct css_easing){.x1=.25f,.y1=.1f,.x2=.25f,.y2=1,.kind=CM_BEZIER,.keyword=CM_EASE};
+    else if (list == ML_ITERATIONS) v.f = 1;
+    else if (list == ML_TPROPERTY) v.s = "all";
+    return v;
+}
+union css_motion_item css_motion_item(const style_t *st, int list, uint32_t i) {
+    const struct css_motion_list *l = st->motion.list[list];
+    return l && l->count ? l->v[i % l->count] : motion_initial(list);
+}
+uint32_t css_motion_count(const style_t *st, int list) {
+    const struct css_motion_list *l = st->motion.list[list];
+    return l && l->count ? l->count : 1;
+}
+static bool motion_item_equal(int list, union css_motion_item a, union css_motion_item b) {
+    switch (list) {
+    case ML_NAME: case ML_TPROPERTY: return a.s == b.s || (a.s && b.s && !strcmp(a.s, b.s));
+    case ML_EASING: case ML_TEASING:
+        return a.e.kind == b.e.kind && a.e.x1 == b.e.x1 && a.e.y1 == b.e.y1 && a.e.x2 == b.e.x2 && a.e.y2 == b.e.y2 &&
+            a.e.steps == b.e.steps && a.e.position == b.e.position && a.e.keyword == b.e.keyword;
+    case ML_DURATION: case ML_DELAY: case ML_ITERATIONS: case ML_TDURATION: case ML_TDELAY:
+        return a.f == b.f || (isnan(a.f) && isnan(b.f));
+    }
+    return a.k == b.k;
+}
+bool css_motion_equal(const struct css_motion *a, const struct css_motion *b) {
+    style_t x, y;
+    x.motion = *a; y.motion = *b;
+    for (int list = 0; list < ML_COUNT; list++) {
+        if (a->list[list] == b->list[list]) continue;
+        uint32_t count = css_motion_count(&x, list);
+        if (count != css_motion_count(&y, list)) return false;
+        for (uint32_t i = 0; i < count; i++)
+            if (!motion_item_equal(list, css_motion_item(&x, list, i), css_motion_item(&y, list, i))) return false;
+    }
+    return true;
+}
+/* one item of an animation-* or transition-* list */
+static bool motion_item_parse(int list, const struct kw *kws, const char *s, size_t n, struct cx *cx, union css_motion_item *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    *out = motion_initial(list);
+    uint8_t k;
+    const char *q = s;
+    switch (list) {
+    case ML_NAME:
+        if (ident_is(s, n, "none")) { out->s = NULL; return true; }
+        if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) {
+            sbuf b = {0}; css_unescape(&b, s + 1, n - 2);
+            out->s = ar_strdup(cx->a, b.n ? sb_cstr(&b) : ""); sb_free(&b);
+            return true;
         }
-        if(!(seen&1) && css_easing_parse(t[i],tl[i],&ease)){v.easing=ease;seen|=1;continue;}
-        if(!(seen&2) && kw_find(kw_motion_direction,t[i],tl[i],&kw)){v.direction=kw;seen|=2;continue;}
-        if(!(seen&4) && kw_find(kw_motion_fill,t[i],tl[i],&kw)){v.fill=kw;seen|=4;continue;}
-        if(!(seen&8) && kw_find(kw_motion_play,t[i],tl[i],&kw)){v.paused=kw;seen|=8;continue;}
-        const char *p=t[i];
-        if(!(seen&16) && (ident_is(t[i],tl[i],"infinite") ||
-            (parse_number(&p,t[i]+tl[i],&f) && p==t[i]+tl[i] && isfinite(f) && f>=0))) {
-            v.iterations=ident_is(t[i],tl[i],"infinite")?INFINITY:f;seen|=16;continue;
+        if (!motion_name(s, n)) return false;
+        out->s = ar_strndup(cx->a, s, n);
+        return true;
+    case ML_DURATION:
+        if (ident_is(s, n, "auto")) { out->f = NAN; return true; }
+        return motion_time(s, n, &out->f) && out->f >= 0;
+    case ML_TDURATION: return motion_time(s, n, &out->f) && out->f >= 0;
+    case ML_DELAY: case ML_TDELAY: return motion_time(s, n, &out->f);
+    case ML_EASING: case ML_TEASING: return css_easing_parse(s, n, &out->e);
+    case ML_ITERATIONS:
+        if (ident_is(s, n, "infinite")) { out->f = INFINITY; return true; }
+        return parse_number(&q, s + n, &out->f) && q == s + n && isfinite(out->f) && out->f >= 0;
+    case ML_TPROPERTY: {
+        if (ident_is(s, n, "all")) { out->s = "all"; return true; }
+        if (ident_is(s, n, "none") || !motion_name(s, n)) return false;
+        /* a supported property keeps its lowercase name; any other identifier is kept as written */
+        const struct propdef *p = n > 2 && s[0] == '-' && s[1] == '-' ? NULL : css_prop_lookup(s, n);
+        char *copy = ar_strndup(cx->a, s, n);
+        if (p) for (size_t i = 0; i < n; i++) copy[i] = (char)lower((unsigned char)copy[i]);
+        out->s = copy;
+        return true;
+    }
+    }
+    if (!kw_find(kws, s, n, &k)) return false;
+    out->k = k;
+    return true;
+}
+/* the top-level comma-separated items of v: their count, and the first max of them */
+static size_t motion_items(const char *v, size_t n, const char **items, size_t *lengths, size_t max) {
+    size_t count = 0, start = 0;
+    int depth = 0; char quote = 0;
+    for (size_t i = 0; i <= n; i++) {
+        char c = i < n ? v[i] : ',';
+        if (quote) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == ',' && depth <= 0) {
+            if (count < max) { items[count] = v + start; lengths[count] = i - start; }
+            count++; start = i + 1;
         }
-        if(!(seen&32) && (ident_is(t[i],tl[i],"none") || motion_name(t[i],tl[i]))) {
-            v.name=ident_is(t[i],tl[i],"none")?NULL:ar_strndup(cx->a,t[i],tl[i]);seen|=32;continue;
+    }
+    return count;
+}
+static struct css_motion_list *motion_list_new(struct cx *cx, size_t count) {
+    struct css_motion_list *l = ar_alloc(cx->a, sizeof *l + count * sizeof *l->v);
+    l->count = (uint32_t)count;
+    return l;
+}
+static bool parse_motion_list(const struct propdef *p, const char *v, size_t n, struct cx *cx, const struct css_motion_list **out) {
+    size_t count = motion_items(v, n, NULL, NULL, 0);
+    if (!count || count > 1u << 20) return false;
+    const char **items = ar_alloc(cx->a, count * sizeof *items);
+    size_t *lengths = ar_alloc(cx->a, count * sizeof *lengths);
+    motion_items(v, n, items, lengths, count);
+    struct css_motion_list *l = motion_list_new(cx, count);
+    for (size_t i = 0; i < count; i++) {
+        const char *s = items[i]; size_t len = lengths[i];
+        trim(&s, &len);
+        /* transition-property: none stands alone */
+        if (p->flags == ML_TPROPERTY && ident_is(s, len, "none")) {
+            if (count != 1) return false;
+            l->v[0].s = NULL;
+            continue;
         }
+        if (!motion_item_parse(p->flags, p->kws, s, len, cx, &l->v[i])) return false;
+    }
+    *out = l;
+    return true;
+}
+/* <single-animation> (CSS Animations 1 §3.11): the first <time> is the duration, the second the
+   delay; a keyword another longhand takes is that longhand's before it can be a name */
+static bool animation_single(const char *s, size_t n, struct cx *cx, union css_motion_item *v) {
+    const char *t[10]; size_t tl[10];
+    int k = split(s, n, t, tl, 10, ' ');
+    if (!k || k > 8) return false;
+    for (int list = ML_NAME; list <= ML_PLAY; list++) v[list] = motion_initial(list);
+    unsigned seen = 0, times = 0;
+    for (int i = 0; i < k; i++) {
+        union css_motion_item item;
+        if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
+            if (times == 0) { if (item.f < 0) return false; v[ML_DURATION] = item; }
+            else if (times == 1) v[ML_DELAY] = item;
+            else return false;
+            times++; continue;
+        }
+        if (!(seen & 1) && motion_item_parse(ML_EASING, NULL, t[i], tl[i], cx, &item)) { v[ML_EASING] = item; seen |= 1; continue; }
+        if (!(seen & 2) && motion_item_parse(ML_ITERATIONS, NULL, t[i], tl[i], cx, &item)) { v[ML_ITERATIONS] = item; seen |= 2; continue; }
+        if (!(seen & 4) && motion_item_parse(ML_DIRECTION, kw_motion_direction, t[i], tl[i], cx, &item)) { v[ML_DIRECTION] = item; seen |= 4; continue; }
+        if (!(seen & 8) && motion_item_parse(ML_FILL, kw_motion_fill, t[i], tl[i], cx, &item)) { v[ML_FILL] = item; seen |= 8; continue; }
+        if (!(seen & 16) && motion_item_parse(ML_PLAY, kw_motion_play, t[i], tl[i], cx, &item)) { v[ML_PLAY] = item; seen |= 16; continue; }
+        if (!(seen & 32) && motion_item_parse(ML_NAME, NULL, t[i], tl[i], cx, &item)) { v[ML_NAME] = item; seen |= 32; continue; }
         return false;
     }
-    *out=v;return true;
+    return true;
 }
-
+/* <single-transition> (CSS Transitions 1 §2.5, 2 §2): [none | <single-transition-property>] || <time> ||
+   <easing-function> || <time> || <transition-behavior-value> */
+static bool transition_single(const char *s, size_t n, struct cx *cx, union css_motion_item *v, bool *none) {
+    const char *t[8]; size_t tl[8];
+    int k = split(s, n, t, tl, 8, ' ');
+    if (!k || k > 5) return false;
+    for (int list = ML_TPROPERTY; list <= ML_TBEHAVIOR; list++) v[list] = motion_initial(list);
+    unsigned seen = 0, times = 0;
+    *none = false;
+    for (int i = 0; i < k; i++) {
+        union css_motion_item item;
+        if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
+            if (times == 0) { if (item.f < 0) return false; v[ML_TDURATION] = item; }
+            else if (times == 1) v[ML_TDELAY] = item;
+            else return false;
+            times++; continue;
+        }
+        if (!(seen & 1) && motion_item_parse(ML_TEASING, NULL, t[i], tl[i], cx, &item)) { v[ML_TEASING] = item; seen |= 1; continue; }
+        if (!(seen & 2) && motion_item_parse(ML_TBEHAVIOR, kw_transition_behavior, t[i], tl[i], cx, &item)) { v[ML_TBEHAVIOR] = item; seen |= 2; continue; }
+        if (!(seen & 4) && ident_is(t[i], tl[i], "none")) { v[ML_TPROPERTY].s = NULL; *none = true; seen |= 4; continue; }
+        if (!(seen & 4) && motion_item_parse(ML_TPROPERTY, NULL, t[i], tl[i], cx, &item)) { v[ML_TPROPERTY] = item; seen |= 4; continue; }
+        return false;
+    }
+    return true;
+}
+/* the animation or transition shorthand: every longhand gets a list of the same length */
+static bool motion_shorthand(bool animation, const char *v, size_t n, struct cx *cx, struct css_motion *out) {
+    size_t count = motion_items(v, n, NULL, NULL, 0);
+    if (!count || count > 1u << 20) return false;
+    const char **items = ar_alloc(cx->a, count * sizeof *items);
+    size_t *lengths = ar_alloc(cx->a, count * sizeof *lengths);
+    motion_items(v, n, items, lengths, count);
+    int first = animation ? ML_NAME : ML_TPROPERTY, last = animation ? ML_PLAY : ML_TBEHAVIOR;
+    struct css_motion_list *lists[ML_COUNT] = {0};
+    for (int list = first; list <= last; list++) lists[list] = motion_list_new(cx, count);
+    for (size_t i = 0; i < count; i++) {
+        union css_motion_item item[ML_COUNT];
+        const char *s = items[i]; size_t len = lengths[i];
+        trim(&s, &len);
+        bool none = false;
+        if (!len || !(animation ? animation_single(s, len, cx, item) : transition_single(s, len, cx, item, &none))) return false;
+        if (none && count != 1) return false;
+        for (int list = first; list <= last; list++) lists[list]->v[i] = item[list];
+    }
+    memset(out, 0, sizeof *out);
+    for (int list = first; list <= last; list++) out->list[list] = lists[list];
+    return true;
+}
 static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g) {
     memset(g, 0, sizeof *g);
     if (ident_is(s, n, "auto")) return true;
@@ -2741,6 +2773,7 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src)
     case PT_ZINDEX: dst->z_auto = src->z_auto; break;
     case PT_BG_SIZE: dst->bg_size_kind = src->bg_size_kind; break;
     case PT_MASK_SIZE: dst->mask_size_kind = src->mask_size_kind; break;
+    case PT_COLOR_SCHEME: dst->color_scheme_text = src->color_scheme_text; break;
     }
 }
 
@@ -2961,17 +2994,16 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     style_t *s = cx->s;
     char *field = (char *)s + p->off;
     const style_t *par = cx->parent ? cx->parent : &initial;
-    if (ident_is(v, n, "inherit")) {
-        copy_prop(p, s, par);
-        if (!p->inherited) s->explicit_inherit = true;
-        return true;
-    }
-    if (ident_is(v, n, "initial")) {
-        copy_prop(p, s, &initial);
-        return true;
-    }
-    if (ident_is(v, n, "unset") || ident_is(v, n, "revert") || ident_is(v, n, "revert-layer")) {
-        copy_prop(p, s, p->inherited ? par : &initial);
+    bool colour = p->type == PT_COLOR || p->type == PT_SVG_PAINT;
+    const style_t *from = ident_is(v, n, "inherit") ? par : ident_is(v, n, "initial") ? &initial :
+        ident_is(v, n, "unset") || ident_is(v, n, "revert") || ident_is(v, n, "revert-layer") ?
+        p->inherited ? par : &initial : NULL;
+    /* the initial colour is CanvasText, which follows color-scheme */
+    if (from == &initial && colour && color_slot(p) == CSS_SLOT_COLOR) return css_color_apply("canvastext", 10, cx, CSS_SLOT_COLOR);
+    if (from) {
+        copy_prop(p, s, from);
+        if (colour && !cx->supports_probe) css_color_slot_copy(s, from, color_slot(p), cx->a);
+        if (from == par && !p->inherited && ident_is(v, n, "inherit")) s->explicit_inherit = true;
         return true;
     }
     switch (p->type) {
@@ -2980,20 +3012,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     case PT_ROTATE:return parse_rotate_value(v,n,cx,&s->rotate);
     case PT_SCALE:return parse_scale_value(v,n,cx,&s->scale);
     case PT_TRANSFORM_ORIGIN:return parse_transform_origin(v,n,cx,s->transform_origin);
-    case PT_MOTION_NAME:
-        if(!ident_is(v,n,"none") && !motion_name(v,n))return false;
-        *(const char **)field=ident_is(v,n,"none")?NULL:ar_strndup(cx->a,v,n);return true;
-    case PT_MOTION_TIME: {
-        float value;if(!motion_time(v,n,&value) || (!(p->flags&LF_NEG) && value<0))return false;
-        *(float *)field=value;return true;
-    }
-    case PT_MOTION_ITERATIONS: {
-        float value;const char *q=v;
-        if(ident_is(v,n,"infinite"))value=INFINITY;
-        else if(!parse_number(&q,v+n,&value) || q!=v+n || !isfinite(value) || value<0)return false;
-        *(float *)field=value;return true;
-    }
-    case PT_MOTION_EASING: return css_easing_parse(v,n,(struct css_easing *)field);
+    case PT_MOTION_LIST: return parse_motion_list(p, v, n, cx, (const struct css_motion_list **)field);
     case PT_CONTAINER_NAMES:
         if (ident_is(v, n, "none")) { s->container_names = NULL; return true; }
         if (!css_container_names_valid(v,n)) return false;
@@ -3063,11 +3082,44 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         *(struct css_corner_radius *)field=parsed;
         return true;
     }
-    case PT_COLOR: {
-        uint32_t c;
-        if (!css_color_checked(v, n, &c, cx)) return false;
-        if (c == COLOR_CURRENT && p->off == offsetof(style_t, color)) c = par->color;
-        *(uint32_t *)field = c;
+    case PT_COLOR: return css_color_apply(v, n, cx, color_slot(p));
+    case PT_COLOR_SCHEME: {
+        /* CSS Color Adjust 1, 2.1: normal | [ light | dark | <custom-ident> ]+ && only? */
+        if (ident_is(v, n, "normal")) {
+            s->color_scheme = 0;
+            s->color_scheme_text = NULL;
+        } else {
+            uint8_t bits = 0;
+            size_t names = 0;
+            char *text = ar_alloc(cx->a, n + 6), *t = text;
+            for (const char *q = v, *e = v + n; q < e;) {
+                while (q < e && is_space((unsigned char)*q)) q++;
+                const char *w = q;
+                while (q < e && !is_space((unsigned char)*q)) q++;
+                size_t wn = (size_t)(q - w);
+                if (!wn) break;
+                /* only once, first or last */
+                if (ident_is(w, wn, "only")) {
+                    if ((bits & CSS_SCHEME_ONLY) || (names && q != e)) return false;
+                    bits |= CSS_SCHEME_ONLY;
+                    continue;
+                }
+                if (ident_is(w, wn, "normal") || !motion_name(w, wn)) return false; /* a <custom-ident> */
+                bool light = ident_is(w, wn, "light"), dark = ident_is(w, wn, "dark");
+                bits |= light ? CSS_SCHEME_LIGHT : dark ? CSS_SCHEME_DARK : 0;
+                if (names++) *t++ = ' ';
+                if (light || dark) { memcpy(t, light ? "light" : "dark", light ? 5 : 4); t += light ? 5 : 4; }
+                else { memcpy(t, w, wn); t += wn; }
+            }
+            if (!names) return false;
+            if (bits & CSS_SCHEME_ONLY) { memcpy(t, " only", 5); t += 5; }
+            *t = 0;
+            s->color_scheme = bits;
+            s->color_scheme_text = text;
+        }
+        /* the root's initial colour follows its scheme until color is declared */
+        if (!cx->parent && !cx->supports_probe && !cx->set[css_prop_index(find_prop("color", 5))])
+            css_color_apply("canvastext", 10, cx, CSS_SLOT_COLOR);
         return true;
     }
     case PT_SVG_WIDTH: {
@@ -3080,8 +3132,9 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     }
     case PT_SVG_PAINT: {
         struct svg_paint paint = {0};
+        const struct css_color_value *exact = NULL;
         if (ident_is(v, n, "none")) paint.kind = SVG_PAINT_NONE;
-        else if (css_color_checked(v, n, &paint.color, cx)) paint.kind = SVG_PAINT_COLOR;
+        else if (css_color_value_compute(v, n, cx, NULL, &paint.color, &exact)) paint.kind = SVG_PAINT_COLOR;
         else {
             /* The rasterizer can resolve local SVG gradients, not external
                paint servers or context paints. Do not claim those in supports(). */
@@ -3102,6 +3155,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
             paint.kind = SVG_PAINT_REF; paint.ref = ref;
         }
         *(struct svg_paint *)field = paint;
+        if (!cx->supports_probe) css_color_slot_set(s, color_slot(p), exact, cx->a);
         return true;
     }
     case PT_NUM: {
@@ -3210,7 +3264,7 @@ static bool set_long(const char *name, const char *v, size_t n, struct cx *cx) {
     if (!p) { if (cx->supports_probe) cx->invalid = true; return false; }
     int i = css_prop_index(p);
     if (cx->set[i]) return true;
-    if (cx->font_pass && p->type != PT_FONT_SIZE) return true;
+    if (cx->font_pass && !early(p)) return true;
     if (!apply_long(p, v, n, cx)) { if (cx->supports_probe) cx->invalid = true; return false; }
     cx->set[i] = 1;
     return true;
@@ -3485,19 +3539,27 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
             strcmp(props[i].name,"unicode-bidi"))set_long(props[i].name,v,n,cx);
         return true;
     }
-    case SH_ANIMATION: {
-        static const char *const names[]={"animation-name","animation-duration","animation-delay",
-            "animation-timing-function","animation-iteration-count","animation-direction",
-            "animation-fill-mode","animation-play-state"};
-        if(global){for(unsigned i=0;i<8;i++)set_long(names[i],v,n,cx);return true;}
+    case SH_ANIMATION: case SH_TRANSITION: {
+        /* the longhands each shorthand sets; animation-composition is reset only */
+        static const char *const animation[] = {"animation-name", "animation-duration", "animation-delay",
+            "animation-timing-function", "animation-iteration-count", "animation-direction",
+            "animation-fill-mode", "animation-play-state", "animation-composition"};
+        static const char *const transition[] = {"transition-property", "transition-duration", "transition-delay",
+            "transition-timing-function", "transition-behavior"};
+        bool is_animation = p->sh == SH_ANIMATION;
+        const char *const *names = is_animation ? animation : transition;
+        unsigned count = is_animation ? 9 : 5;
+        if (global) { for (unsigned i = 0; i < count; i++) set_long(names[i], v, n, cx); return true; }
         struct css_motion motion;
-        if(!motion_shorthand(v,n,cx,&motion))return false;
+        if (!motion_shorthand(is_animation, v, n, cx, &motion)) return false;
         /* The shorthand resets all longhands, but cannot override a higher
            priority longhand already selected by this cascade. */
-        style_t temp=*cx->s;temp.motion=motion;
-        for(unsigned i=0;i<8;i++) {
-            const struct propdef *q=find_prop(names[i],strlen(names[i]));int at=css_prop_index(q);
-            if(!cx->set[at]){copy_prop(q,cx->s,&temp);cx->set[at]=1;}
+        style_t temp = *cx->s;
+        temp.motion = motion;
+        for (unsigned i = 0; i < count; i++) {
+            const struct propdef *q = find_prop(names[i], strlen(names[i]));
+            int at = css_prop_index(q);
+            if (!cx->set[at]) { copy_prop(q, cx->s, &temp); cx->set[at] = 1; }
         }
         return true;
     }
@@ -3854,7 +3916,7 @@ bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx) 
     if (p->type == PT_SHORT) return apply_short(p, v, n, cx);
     int i = css_prop_index(p);
     if (cx->set[i]) return true;
-    if (cx->font_pass && p->type != PT_FONT_SIZE) return true;
+    if (cx->font_pass && !early(p)) return true;
     if (!apply_long(p, v, n, cx)) return false;
     cx->set[i] = 1;
     return true;
@@ -3896,6 +3958,7 @@ void css_style_init(style_t *s, const style_t *parent) {
     s->border_radius=0; /* legacy native-only radius is not inherited */
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &initial);
+    s->color_own = NULL;
     s->before = s->after = s->backdrop = s->placeholder = NULL;
     s->before_generated = s->after_generated = s->explicit_inherit = false;
 }
@@ -3908,6 +3971,7 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &own);
     s->border_radius = own.border_radius;
+    s->color_own = own.color_own;
     s->before = own.before; s->after = own.after; s->backdrop = own.backdrop; s->placeholder = own.placeholder;
     s->before_generated = own.before_generated; s->after_generated = own.after_generated;
     s->explicit_inherit = own.explicit_inherit;
@@ -3915,9 +3979,11 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
 
 void css_style_finish(style_t *s, const style_t *parent, bool root) {
     if (s->color == COLOR_CURRENT) s->color = parent ? parent->color : 0xFF000000u;
+    css_color_finish(s);
     if (s->bg_color == COLOR_CURRENT) s->bg_color = s->color;
     for (struct css_box_shadow *shadow = (struct css_box_shadow *)s->box_shadow; shadow; shadow = shadow->next)
-        if (shadow->color == COLOR_CURRENT) shadow->color = s->color;
+        if (shadow->color == COLOR_CURRENT)
+            shadow->color = shadow->color_value ? css_color_value_argb(shadow->color_value, s->color) : s->color;
     for (int i = 0; i < 4; i++) {
         if (s->border_color[i] == COLOR_CURRENT) s->border_color[i] = s->color;
         if (s->border_style[i] == BS_NONE || s->border_style[i] == BS_HIDDEN) s->border_width[i] = 0;
@@ -3925,8 +3991,11 @@ void css_style_finish(style_t *s, const style_t *parent, bool root) {
     if (s->outline_color == COLOR_CURRENT) s->outline_color = s->color;
     if (s->outline_style == BS_NONE) s->outline_width = 0;
     if (s->has_grad) {
-        for (int i = 0; i < 2; i++)
-            if (s->grad[i] == COLOR_CURRENT) s->grad[i] = s->color;
+        const struct gradient *g = s->gradient;
+        for (int i = 0; i < 2; i++) {
+            const struct css_color_value *exact = g && g->n ? g->col_value[i ? g->n - 1 : 0] : NULL;
+            if (s->grad[i] == COLOR_CURRENT) s->grad[i] = exact ? css_color_value_argb(exact, s->color) : s->color;
+        }
     }
     if (s->position == POS_ABSOLUTE || s->position == POS_FIXED) s->float_ = FL_NONE;
     /* floated, absolutely positioned, root and flex items are blockified */
@@ -4044,4 +4113,784 @@ const char *css_ua_sheet(void) {
            "math { display: inline; }\n"
            "svg:not(:root) { overflow: hidden; }\n"
            "@media (scripting:enabled) { noscript { display: none !important; } }\n";
+}
+
+/* ---------------------------------------------------------------- animation values
+   The one place computed values combine (CSS Values 4 §3 "Combining values", Web Animations 1
+   §5.3 "Animation types"). CSS Transitions, CSS Animations and script animations all reach it
+   through animation.c. The property table gives each longhand its animation type
+   (propdef.anim, else its value type's default); below, each value type has its interpolation,
+   addition and accumulation. Values come in as computed values in scratch copies of the
+   element's base style (css_anim_parse) and leave as computed-value text, which the cascade
+   applies at the animation or transition origin so that em, currentcolor and inheritance
+   follow the animated values. */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+int css_prop_animation(const struct propdef *p) {
+    if (!p || p->type == PT_SHORT) return CSS_ANIM_NONE;
+    switch (p->anim) {
+    case AN_NONE: return CSS_ANIM_NONE;
+    case AN_DISCRETE: return CSS_ANIM_DISCRETE;
+    case AN_VISIBILITY: return CSS_ANIM_VISIBILITY;
+    case AN_DISPLAY: return CSS_ANIM_DISPLAY;
+    }
+    switch (p->type) {
+    case PT_MOTION_LIST: case PT_CONTAINER_NAMES: return CSS_ANIM_NONE;
+    case PT_DISPLAY: return CSS_ANIM_DISPLAY;
+    case PT_KW: case PT_OVERFLOW: case PT_FONT_FAMILY: case PT_CONTENT: case PT_LIST_TYPE: case PT_BG_IMAGE:
+    case PT_TEXT_DECO: case PT_GTEMPLATE: case PT_GAREAS: case PT_GLINE: case PT_MASK_IMAGE: case PT_LINE_CLAMP:
+    case PT_CLIP_PATH: return CSS_ANIM_DISCRETE;
+    }
+    return CSS_ANIM_VALUE;
+}
+/* A shorthand's longhands are what its own parser sets for "initial" (the same expansion
+   revert uses), computed once per shorthand. */
+static uint8_t longhand_sets[NPROPS][NPROPS];
+static uint8_t longhand_ready[NPROPS];
+void css_prop_longhands(const struct propdef *p, uint8_t *set) {
+    memset(set, 0, NPROPS);
+    if (!p) return;
+    int i = css_prop_index(p);
+    if (p->type != PT_SHORT) { set[i] = 1; return; }
+    if (!__atomic_load_n(&longhand_ready[i], __ATOMIC_ACQUIRE)) {
+        arena_t a = {0}; jmp_buf trap; a.trap = &trap;
+        uint8_t bits[NPROPS]; memset(bits, 0, sizeof bits);
+        if (!setjmp(trap)) {
+            style_t st, parent; css_style_init(&parent, NULL); css_style_init(&st, &parent);
+            struct cx cx = {.s=&st, .parent=&parent, .em=16, .rem=16, .vw=800, .vh=600, .a=&a, .set=bits};
+            css_apply(p, "initial", 7, &cx);
+        }
+        ar_free(&a);
+        memcpy(longhand_sets[i], bits, NPROPS);
+        __atomic_store_n(&longhand_ready[i], 1, __ATOMIC_RELEASE);
+    }
+    memcpy(set, longhand_sets[i], NPROPS);
+}
+
+/* Fixed notation within the CSS number grammar, to the precision of the stored floats
+   (seven significant digits) so a value read back serializes as it was written. */
+static void anim_number(sbuf *b, double v) {
+    if (!isfinite(v) || fabs(v) < 5e-10) v = 0;
+    if (v > 1e15) v = 1e15; else if (v < -1e15) v = -1e15;
+    char text[64]; snprintf(text, sizeof text, "%.7g", v);
+    if (strchr(text, 'e')) {
+        int len = snprintf(text, sizeof text, "%.6f", v);
+        while (len > 1 && text[len - 1] == '0') text[--len] = 0;
+        if (len > 1 && text[len - 1] == '.') text[--len] = 0;
+    }
+    if (!strcmp(text, "-0")) strcpy(text, "0");
+    sb_puts(b, text);
+}
+static void anim_unit(sbuf *b, double v, const char *unit) { anim_number(b, v); sb_puts(b, unit); }
+static double anim_clamp(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
+/* the combinations: interpolation, addition, accumulation */
+enum { MIX, ADD, ACCUMULATE };
+/* <color>: computed values of color.c's type (exact, or an expression of currentcolor) */
+static void anim_shadow_color(const style_t *st, const struct css_box_shadow *s, struct css_color_computed *out) {
+    css_color_held(s->color, s->color_value, st->color, out);
+}
+/* the used value a computed colour names: currentcolor is the style's color (CSS Color 4 §13) */
+static struct css_color anim_color_used(const style_t *st, const struct css_color_computed *v) {
+    if (!v->current) return v->color;
+    struct css_color_computed current;
+    css_style_color(st, CSS_SLOT_COLOR, &current);
+    struct css_color out;
+    css_color_resolve(v, &current.color, &out);
+    return out;
+}
+/* currentcolor and expressions of it as written, for the cascade to resolve against the element */
+static bool anim_color_text(sbuf *b, const struct css_color_computed *v) {
+    return v->current ? css_color_value_specified(v->current, b) : css_color_animation_text(&v->color, b);
+}
+/* x interpolated to y at p (MIX: CSS Color 4 §13, in the space §13.2 gives the two), or y added to
+   x (ADD and ACCUMULATE alike: CSS Values 4 §3.3); x's and y's currentcolor are their styles' */
+static bool anim_color(sbuf *b, const style_t *sx, const struct css_color_computed *x, const style_t *sy,
+                       const struct css_color_computed *y, double p, int mode) {
+    /* between one expression of currentcolor the value stays it, resolved after the cascade */
+    if (mode == MIX && x->current && css_color_computed_equal(x, y)) return anim_color_text(b, x);
+    struct css_color u = anim_color_used(sx, x), v = anim_color_used(sy, y);
+    struct css_color_interpolation m = css_color_default_interpolation(&u, &v);
+    struct css_color r = mode == MIX ? css_color_interpolate(&u, &v, p, &m) : css_color_add(&u, &v, &m);
+    return css_color_animation_text(&r, b);
+}
+static bool anim_is_length(const len_t *l) { return l->kind == LK_LEN || l->kind == LK_EXPR; }
+/* ka·x + kb·y of two <length-percentage>s; a keyword (auto, none, normal) combines only with
+   itself. A property without negative values clamps (calc() ranges clamp when parsed). */
+static bool anim_len(sbuf *b, const len_t *x, const len_t *y, double ka, double kb, int flags, web_doc *d) {
+    if (!anim_is_length(x) || !anim_is_length(y)) {
+        if (x->kind != y->kind || anim_is_length(x)) return false;
+        if (x->kind == LK_NUMBER) { anim_number(b, x->px * ka + y->px * kb); return true; }
+        return css_length_serialize(x, b, d);
+    }
+    if (x->kind == LK_LEN && y->kind == LK_LEN) {
+        double px = x->px * ka + y->px * kb, pct = x->pct * ka + y->pct * kb;
+        if (!(flags & LF_NEG)) { if (fabs(pct) < 1e-9 && px < 0) px = 0; if (fabs(px) < 1e-9 && pct < 0) pct = 0; }
+        if (fabs(pct) < 1e-9) { anim_unit(b, px, "px"); return true; }
+        if (fabs(px) < 1e-9) { anim_unit(b, pct, "%"); return true; }
+        sb_puts(b, "calc("); anim_unit(b, pct, "%"); sb_puts(b, " + "); anim_unit(b, px, "px"); sb_putc(b, ')');
+        return true;
+    }
+    /* calc() keeps percentages unresolved: combine the expressions */
+    sbuf ta = {0}, tb = {0};
+    bool ok = css_length_serialize(x, &ta, d) && css_length_serialize(y, &tb, d);
+    if (ok) {
+        sb_puts(b, "calc("); sb_puts(b, sb_cstr(&ta)); sb_puts(b, " * "); anim_number(b, ka);
+        sb_puts(b, " + "); sb_puts(b, sb_cstr(&tb)); sb_puts(b, " * "); anim_number(b, kb); sb_putc(b, ')');
+    }
+    sb_free(&ta); sb_free(&tb);
+    return ok;
+}
+
+/* -------- transform lists (CSS Transforms 1 §9, CSS Transforms 2 §16) */
+static bool tf_axis(const struct css_transform *t, double axis[3]) {
+    double x = t->v[0], y = t->v[1], z = t->v[2], length = sqrt(x * x + y * y + z * z);
+    if (!(length > 0) || !isfinite(length)) return false;
+    axis[0] = x / length; axis[1] = y / length; axis[2] = z / length;
+    return true;
+}
+static bool tf_same_axis(const struct css_transform *a, const struct css_transform *b) {
+    if (a->v[3] == 0 || b->v[3] == 0) return true;
+    double p[3], q[3];
+    if (!tf_axis(a, p) || !tf_axis(b, q)) return false;
+    return fabs(p[0] - q[0]) <= 1e-6 && fabs(p[1] - q[1]) <= 1e-6 && fabs(p[2] - q[2]) <= 1e-6;
+}
+/* the neutral function of t's kind, which pads the shorter list */
+static struct css_transform tf_identity(const struct css_transform *t) {
+    struct css_transform r = {.xy = {{.kind = LK_LEN}, {.kind = LK_LEN}}, .kind = t->kind};
+    if (t->kind == CT_SCALE) r.v[0] = r.v[1] = r.v[2] = 1;
+    if (t->kind == CT_ROTATE) { r.v[0] = t->v[0]; r.v[1] = t->v[1]; r.v[2] = t->v[2]; }
+    for (int i = 0; i < 4; i++) r.m[i * 5] = 1;
+    return r;
+}
+/* Lists combine function by function when every pair shares a primitive (rotations a
+   common axis); matrices and perspective only meet themselves. */
+static bool tf_lists_match(const struct css_transform *a, const struct css_transform *b) {
+    for (; a || b; a = a ? a->next : NULL, b = b ? b->next : NULL) {
+        const struct css_transform *t = a ? a : b;
+        if (t->kind == CT_MATRIX || t->kind == CT_PERSPECTIVE) return false;
+        if (!a || !b) continue;
+        if (a->kind != b->kind) return false;
+        if (a->kind == CT_ROTATE && !tf_same_axis(a, b)) return false;
+    }
+    return true;
+}
+/* ka·x + kb·y function by function (accumulate: scales add their excess over 1). With x == y,
+   ka = 1, kb = 0 it serializes any list exactly, matrices and perspective included. */
+static bool tf_pairs(sbuf *b, const struct css_transform *x, const struct css_transform *y, double ka, double kb,
+                     int mode, web_doc *d) {
+    bool first = true;
+    for (; x || y; x = x ? x->next : NULL, y = y ? y->next : NULL) {
+        struct css_transform ix, iy;
+        const struct css_transform *s = x, *e = y;
+        if (!s) { ix = tf_identity(e); s = &ix; }
+        if (!e) { iy = tf_identity(s); e = &iy; }
+        if (!first) sb_putc(b, ' ');
+        first = false;
+        double v[4];
+        for (int i = 0; i < 4; i++) v[i] = s->v[i] * ka + e->v[i] * kb;
+        if (mode == ACCUMULATE && s->kind == CT_SCALE) for (int i = 0; i < 3; i++) v[i] = s->v[i] + e->v[i] - 1;
+        switch (s->kind) {
+        case CT_TRANSLATE:
+            sb_puts(b, v[0] ? "translate3d(" : "translate(");
+            if (!anim_len(b, &s->xy[0], &e->xy[0], ka, kb, LF_NEG, d)) return false;
+            sb_puts(b, ", ");
+            if (!anim_len(b, &s->xy[1], &e->xy[1], ka, kb, LF_NEG, d)) return false;
+            if (v[0]) { sb_puts(b, ", "); anim_unit(b, v[0], "px"); }
+            sb_putc(b, ')');
+            break;
+        case CT_SCALE:
+            sb_puts(b, v[2] != 1 ? "scale3d(" : "scale(");
+            anim_number(b, v[0]); sb_puts(b, ", "); anim_number(b, v[1]);
+            if (v[2] != 1) { sb_puts(b, ", "); anim_number(b, v[2]); }
+            sb_putc(b, ')');
+            break;
+        case CT_ROTATE: {
+            double axis[3] = {0, 0, 1};
+            if (!tf_axis(s->v[3] != 0 || e->v[3] == 0 ? s : e, axis)) { axis[0] = axis[1] = 0; axis[2] = 1; }
+            double angle = s->v[3] * ka + e->v[3] * kb;
+            if (axis[0] == 0 && axis[1] == 0 && axis[2] > 0) { sb_puts(b, "rotate("); anim_unit(b, angle, "rad)"); }
+            else {
+                sb_puts(b, "rotate3d(");
+                for (int i = 0; i < 3; i++) { anim_number(b, axis[i]); sb_puts(b, ", "); }
+                anim_unit(b, angle, "rad)");
+            }
+            break;
+        }
+        case CT_SKEW:
+            sb_puts(b, "skew("); anim_unit(b, v[0], "rad, "); anim_unit(b, v[1], "rad)");
+            break;
+        case CT_PERSPECTIVE:
+            if (!(v[0] > 0)) { sb_puts(b, "perspective(none)"); break; }
+            sb_puts(b, "perspective("); anim_unit(b, v[0], "px)");
+            break;
+        case CT_MATRIX:
+            sb_puts(b, "matrix3d(");
+            for (int col = 0; col < 4; col++)
+                for (int row = 0; row < 4; row++) {
+                    anim_number(b, s->m[row * 4 + col] * ka + e->m[row * 4 + col] * kb);
+                    if (col < 3 || row < 3) sb_puts(b, ", ");
+                }
+            sb_putc(b, ')');
+            break;
+        default: return false;
+        }
+    }
+    if (first) sb_puts(b, "none");
+    return true;
+}
+struct tf_2d { double tx, ty, sx, sy, angle, m11, m12, m21, m22; };
+/* CSS Transforms 1 §10 "Interpolation of matrices", 2D decomposition. Percentages need the
+   used box; without one the list does not decompose. */
+static bool tf_decompose(const struct css_transform *t, const struct box *box, struct tf_2d *out) {
+    float w = 0, h = 0;
+    if (box) {
+        w = box->w + box->p[1] + box->p[3] + box->b[1] + box->b[3];
+        h = box->h + box->p[0] + box->p[2] + box->b[0] + box->b[2];
+    } else for (const struct css_transform *x = t; x; x = x->next)
+        if (x->kind == CT_TRANSLATE && (len_has_pct(&x->xy[0]) || len_has_pct(&x->xy[1]))) return false;
+    double m[16]; css_transform_list_matrix(t, w, h, m);
+    double r0x = m[0], r0y = m[4], r1x = m[1], r1y = m[5];
+    out->tx = m[3]; out->ty = m[7];
+    out->sx = sqrt(r0x * r0x + r0y * r0y); out->sy = sqrt(r1x * r1x + r1y * r1y);
+    if (r0x * r1y - r0y * r1x < 0) { if (r0x < r1y) out->sx = -out->sx; else out->sy = -out->sy; }
+    if (out->sx) { r0x /= out->sx; r0y /= out->sx; }
+    if (out->sy) { r1x /= out->sy; r1y /= out->sy; }
+    out->angle = atan2(r0y, r0x);
+    if (out->angle) {
+        double sn = -r0y, cs = r0x, a = r0x, b = r0y, cc = r1x, dd = r1y;
+        r0x = cs * a + sn * cc; r0y = cs * b + sn * dd; r1x = -sn * a + cs * cc; r1y = -sn * b + cs * dd;
+    }
+    out->m11 = r0x; out->m12 = r0y; out->m21 = r1x; out->m22 = r1y;
+    const double *f = &out->tx;
+    for (int i = 0; i < 9; i++) if (!isfinite(f[i])) return false;
+    return true;
+}
+static bool tf_matrix_mix(sbuf *b, const struct css_transform *x, const struct css_transform *y, const struct box *box, double t) {
+    struct tf_2d A, B;
+    if (!tf_decompose(x, box, &A) || !tf_decompose(y, box, &B)) return false;
+    if ((A.sx < 0 && B.sy < 0) || (A.sy < 0 && B.sx < 0)) { A.sx = -A.sx; A.sy = -A.sy; A.angle += A.angle < 0 ? M_PI : -M_PI; }
+    if (!A.angle) A.angle = 2 * M_PI;
+    if (!B.angle) B.angle = 2 * M_PI;
+    if (fabs(A.angle - B.angle) > M_PI) { if (A.angle > B.angle) A.angle -= 2 * M_PI; else B.angle -= 2 * M_PI; }
+    struct tf_2d R; double *r = &R.tx; const double *a = &A.tx, *q = &B.tx;
+    for (int i = 0; i < 9; i++) r[i] = a[i] + (q[i] - a[i]) * t;
+    /* rows = diag(sx, sy) · rotate · remainder */
+    double cs = cos(R.angle), sn = sin(R.angle);
+    double n11 = cs * R.m11 + sn * R.m21, n12 = cs * R.m12 + sn * R.m22, n21 = -sn * R.m11 + cs * R.m21, n22 = -sn * R.m12 + cs * R.m22;
+    double values[6] = {n11 * R.sx, n12 * R.sx, n21 * R.sy, n22 * R.sy, R.tx, R.ty};
+    sb_puts(b, "matrix(");
+    for (int i = 0; i < 6; i++) { anim_number(b, values[i]); if (i < 5) sb_puts(b, ", "); }
+    sb_putc(b, ')');
+    return true;
+}
+static bool tf_list(sbuf *b, const struct css_transform *x, const struct css_transform *y, double ka, double kb,
+                    int mode, const struct box *box, web_doc *d) {
+    if (mode == ADD || (mode == ACCUMULATE && !tf_lists_match(x, y))) {
+        /* addition appends the value's functions to the underlying list */
+        if (!x) return tf_pairs(b, y, y, 1, 0, MIX, d);
+        if (!tf_pairs(b, x, x, 1, 0, MIX, d)) return false;
+        if (y) { sb_putc(b, ' '); return tf_pairs(b, y, y, 1, 0, MIX, d); }
+        return true;
+    }
+    if (tf_lists_match(x, y)) return tf_pairs(b, x, y, ka, kb, mode, d);
+    return tf_matrix_mix(b, x, y, box, kb);
+}
+static void tf_rotate_text(sbuf *b, const struct css_transform *t) {
+    if (!t) { sb_puts(b, "none"); return; }
+    double deg = t->v[3] * 180 / M_PI;
+    if (t->v[0] == 0 && t->v[1] == 0 && t->v[2] > 0) { anim_unit(b, deg, "deg"); return; }
+    for (int i = 0; i < 3; i++) { anim_number(b, t->v[i]); sb_putc(b, ' '); }
+    anim_unit(b, deg, "deg");
+}
+static void tf_scale_text(sbuf *b, const struct css_transform *t) {
+    if (!t) { sb_puts(b, "none"); return; }
+    anim_number(b, t->v[0]); sb_putc(b, ' '); anim_number(b, t->v[1]);
+    if (t->v[2] != 1) { sb_putc(b, ' '); anim_number(b, t->v[2]); }
+}
+static bool tf_equal(const struct css_transform *a, const struct css_transform *b) {
+    for (; a && b; a = a->next, b = b->next)
+        if (a->kind != b->kind || memcmp(a->v, b->v, sizeof a->v) || memcmp(a->m, b->m, sizeof a->m) ||
+            !css_length_equal(&a->xy[0], &b->xy[0]) || !css_length_equal(&a->xy[1], &b->xy[1])) return false;
+    return !a && !b;
+}
+
+/* -------- shadow and filter lists */
+/* one shadow's computed value: its colour first, then the four lengths (and inset) */
+static void anim_shadow_lengths(sbuf *b, double x, double y, double blur, double spread, bool inset) {
+    anim_unit(b, x, "px "); anim_unit(b, y, "px ");
+    anim_unit(b, anim_clamp(blur, 0, INFINITY), "px ");
+    anim_unit(b, spread, "px");
+    if (inset) sb_puts(b, " inset");
+}
+static void anim_shadow_text(sbuf *b, const style_t *st, const struct css_box_shadow *s) {
+    struct css_color_computed c;
+    anim_shadow_color(st, s, &c);
+    anim_color_text(b, &c); sb_putc(b, ' ');
+    anim_shadow_lengths(b, s->x, s->y, s->blur, s->spread, s->inset);
+}
+static void anim_shadow_list_text(sbuf *b, const style_t *st) {
+    if (!st->box_shadow) { sb_puts(b, "none"); return; }
+    for (const struct css_box_shadow *s = st->box_shadow; s; s = s->next) {
+        if (s != st->box_shadow) sb_puts(b, ", ");
+        anim_shadow_text(b, st, s);
+    }
+}
+/* a pair of shadows component by component (Web Animations 1, A: interpolation, and accumulation
+   with each component accumulated); the shorter list pads with transparent shadows of no length */
+static bool anim_shadow_item(sbuf *b, const style_t *sa, const struct css_box_shadow *s, const style_t *sv,
+                             const struct css_box_shadow *e, double ka, double kb, int mode) {
+    struct css_box_shadow zs = {0}, ze = {0};
+    if (!s) { zs.inset = e->inset; s = &zs; }
+    if (!e) { ze.inset = s->inset; e = &ze; }
+    if (s->inset != e->inset) return false;
+    struct css_color_computed cs, ce;
+    anim_shadow_color(sa, s, &cs);
+    anim_shadow_color(sv, e, &ce);
+    if (!anim_color(b, sa, &cs, sv, &ce, kb, mode)) return false;
+    sb_putc(b, ' ');
+    anim_shadow_lengths(b, s->x * ka + e->x * kb, s->y * ka + e->y * kb, s->blur * ka + e->blur * kb,
+                        s->spread * ka + e->spread * kb, s->inset);
+    return true;
+}
+static bool anim_shadows(sbuf *b, const style_t *sa, const style_t *sv, double ka, double kb, int mode) {
+    const struct css_box_shadow *x = sa->box_shadow, *y = sv->box_shadow;
+    if (!x && !y) { sb_puts(b, "none"); return true; }
+    bool first = true;
+    if (mode == ADD) {
+        /* addition is the concatenation of the lists */
+        for (const struct css_box_shadow *s = x; s; s = s->next, first = false) {
+            if (!first) sb_puts(b, ", ");
+            anim_shadow_text(b, sa, s);
+        }
+        for (const struct css_box_shadow *s = y; s; s = s->next, first = false) {
+            if (!first) sb_puts(b, ", ");
+            anim_shadow_text(b, sv, s);
+        }
+        return true;
+    }
+    for (; x || y; x = x ? x->next : NULL, y = y ? y->next : NULL, first = false) {
+        if (!first) sb_puts(b, ", ");
+        if (!anim_shadow_item(b, sa, x, sv, y, ka, kb, mode)) return false;
+    }
+    return true;
+}
+static double filter_amount(const struct css_filter_step *s) { return s->percentage ? s->value / 100 : s->value; }
+static bool anim_filters(sbuf *b, const struct css_filter *x, const struct css_filter *y, double ka, double kb, int mode) {
+    size_t nx = x ? x->count : 0, ny = y ? y->count : 0;
+    if (!nx && !ny) { sb_puts(b, "none"); return true; }
+    if (mode == ADD) {
+        for (size_t i = 0; i < nx + ny; i++) {
+            const struct css_filter_step *s = i < nx ? &x->steps[i] : &y->steps[i - nx];
+            if (i) sb_putc(b, ' ');
+            sb_puts(b, "opacity("); anim_number(b, filter_amount(s)); sb_putc(b, ')');
+        }
+        return true;
+    }
+    /* the shorter list pads with each function's initial value, opacity(1) */
+    size_t n = nx > ny ? nx : ny;
+    for (size_t i = 0; i < n; i++) {
+        double a = i < nx ? filter_amount(&x->steps[i]) : 1, c = i < ny ? filter_amount(&y->steps[i]) : 1;
+        double v = mode == ACCUMULATE ? a + c - 1 : a * ka + c * kb;
+        if (i) sb_putc(b, ' ');
+        sb_puts(b, "opacity("); anim_number(b, anim_clamp(v, 0, INFINITY)); sb_putc(b, ')');
+    }
+    return true;
+}
+
+/* -------- serialization of computed values */
+static const char *display_keyword(const style_t *st) {
+    static const char *const names[] = {"none", "inline", "block", "list-item", "inline-block", "table",
+        "inline-table", "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell",
+        "table-column", "table-column-group", "table-caption", "flex", "inline-flex", "grid", "inline-grid",
+        "contents", "flow-root"};
+    if (st->legacy_box) return st->display == D_INLINE_BLOCK || st->display == D_INLINE_FLEX ? "-webkit-inline-box" : "-webkit-box";
+    return st->display < sizeof names / sizeof *names ? names[st->display] : NULL;
+}
+static bool anim_pair_text(sbuf *b, const len_t *l, web_doc *d) {
+    return css_length_serialize(&l[0], b, d) && length_append(b, " ", 1) && css_length_serialize(&l[1], b, d);
+}
+static bool same_text(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
+bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
+    if (!st || !p || p->type == PT_SHORT) return false;
+    const char *field = (const char *)st + p->off;
+    size_t begin = out->n;
+    char text[64];
+    bool ok = true;
+    switch (p->type) {
+    case PT_KW: case PT_OVERFLOW: case PT_VALIGN: {
+        if (p->type == PT_VALIGN && st->vertical_align == VA_LEN) { anim_unit(out, st->vertical_align_px, "px"); break; }
+        uint8_t v = *(const uint8_t *)field;
+        const struct kw *k = p->kws;
+        while (k && k->name && k->v != v) k++;
+        if (!k || !k->name) return false;
+        sb_puts(out, k->name);
+        break;
+    }
+    case PT_DISPLAY: {
+        const char *name = display_keyword(st);
+        if (!name) return false;
+        sb_puts(out, name);
+        break;
+    }
+    case PT_LEN: case PT_SVG_WIDTH: ok = css_length_serialize((const len_t *)field, out, d); break;
+    case PT_PX: anim_unit(out, *(const float *)field, "px"); break;
+    case PT_FONT_SIZE: anim_unit(out, st->font_size, "px"); break;
+    case PT_NUM: case PT_OPACITY: anim_number(out, *(const float *)field); break;
+    case PT_INT: snprintf(text, sizeof text, "%d", *(const int *)field); sb_puts(out, text); break;
+    case PT_ZINDEX:
+        if (st->z_auto) sb_puts(out, "auto");
+        else { snprintf(text, sizeof text, "%d", st->z_index); sb_puts(out, text); }
+        break;
+    case PT_FONT_WEIGHT: snprintf(text, sizeof text, "%u", (unsigned)st->font_weight); sb_puts(out, text); break;
+    case PT_LINE_HEIGHT:
+        if (st->line_height.kind == LK_NORMAL) sb_puts(out, "normal");
+        else if (st->line_height.kind == LK_NUMBER) anim_number(out, st->line_height.px);
+        else anim_unit(out, st->line_height.px, "px");
+        break;
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT && ((const struct svg_paint *)field)->kind != SVG_PAINT_COLOR) {
+            if (((const struct svg_paint *)field)->kind != SVG_PAINT_NONE) return false;
+            sb_puts(out, "none");
+            break;
+        }
+        struct css_color_computed c;
+        css_style_color(st, color_slot(p), &c);
+        ok = anim_color_text(out, &c);
+        break;
+    }
+    case PT_FONT_FAMILY: if (!st->font_names) return false; sb_puts(out, st->font_names); break;
+    case PT_CONTAINER_NAMES: sb_puts(out, st->container_names ? st->container_names : "none"); break;
+    case PT_LINE_CLAMP:
+        if (!st->line_clamp) sb_puts(out, "none");
+        else { snprintf(text, sizeof text, "%u", (unsigned)st->line_clamp); sb_puts(out, text); }
+        break;
+    case PT_TEXT_DECO:
+        if (!st->text_decoration) sb_puts(out, "none");
+        else {
+            bool first = true;
+            if (st->text_decoration & TD_UNDERLINE) { sb_puts(out, "underline"); first = false; }
+            if (st->text_decoration & TD_OVERLINE) { if (!first) sb_putc(out, ' '); sb_puts(out, "overline"); first = false; }
+            if (st->text_decoration & TD_LINE_THROUGH) { if (!first) sb_putc(out, ' '); sb_puts(out, "line-through"); }
+        }
+        break;
+    case PT_BG_IMAGE: case PT_MASK_IMAGE: {
+        const char *url = p->type == PT_BG_IMAGE ? st->bg_image : st->mask_image;
+        if (p->type == PT_BG_IMAGE && st->has_grad) return false;
+        if (!url) { sb_puts(out, "none"); break; }
+        sb_puts(out, "url(\"");
+        for (const char *c = url; *c; c++) { if (*c == '"' || *c == '\\') sb_putc(out, '\\'); sb_putc(out, *c); }
+        sb_puts(out, "\")");
+        break;
+    }
+    case PT_GLINE: {
+        const struct gline *g = (const struct gline *)field;
+        if (g->kind == GL_AUTO) sb_puts(out, "auto");
+        else if (g->kind == GL_SPAN) { snprintf(text, sizeof text, "span %d", g->n); sb_puts(out, text); }
+        else if (g->kind == GL_NAME) {
+            sb_puts(out, g->name);
+            if (g->n != 1) { snprintf(text, sizeof text, " %d", g->n); sb_puts(out, text); }
+        } else { snprintf(text, sizeof text, "%d", g->n); sb_puts(out, text); }
+        break;
+    }
+    case PT_FILTER: ok = css_filter_serialize(st->filter, out, d); break;
+    case PT_BOX_SHADOW: anim_shadow_list_text(out, st); break;
+    case PT_RADIUS: ok = anim_pair_text(out, ((const struct css_corner_radius *)field)->axis, d); break;
+    case PT_BG_POS: case PT_TRANSFORM_ORIGIN: ok = anim_pair_text(out, (const len_t *)field, d); break;
+    case PT_BG_SIZE: case PT_MASK_SIZE: {
+        uint8_t kind = p->type == PT_BG_SIZE ? st->bg_size_kind : st->mask_size_kind;
+        if (kind == BSZ_COVER) sb_puts(out, "cover");
+        else if (kind == BSZ_CONTAIN) sb_puts(out, "contain");
+        else if (kind == BSZ_AUTO) sb_puts(out, "auto");
+        else ok = anim_pair_text(out, p->type == PT_BG_SIZE ? st->bg_size : st->mask_size, d);
+        break;
+    }
+    case PT_TRANSFORM: ok = tf_pairs(out, st->transform, st->transform, 1, 0, MIX, d); break;
+    case PT_TRANSLATE:
+        if (!st->translate.active) sb_puts(out, "none");
+        else ok = anim_pair_text(out, st->translate.xy, d);
+        break;
+    case PT_ROTATE: tf_rotate_text(out, st->rotate); break;
+    case PT_SCALE: tf_scale_text(out, st->scale); break;
+    case PT_CLIP_PATH:
+        if (!st->clip_path) sb_puts(out, "none");
+        else ok = css_clip_path_serialize(st->clip_path, out, d);
+        break;
+    case PT_CLIP: ok = css_clip_rect_serialize(&st->clip, out); break;
+    case PT_MOTION_LIST: {
+        int list = p->flags;
+        uint32_t count = css_motion_count(st, list);
+        for (uint32_t i = 0; i < count; i++) {
+            union css_motion_item item = css_motion_item(st, list, i);
+            if (i) sb_puts(out, ", ");
+            switch (list) {
+            case ML_NAME: case ML_TPROPERTY:
+                if (!item.s) sb_puts(out, "none");
+                else if (list == ML_TPROPERTY || (motion_name(item.s, strlen(item.s)) && !ident_is(item.s, strlen(item.s), "none")))
+                    sb_puts(out, item.s);
+                else {
+                    sb_putc(out, '"');
+                    for (const char *c = item.s; *c; c++) { if (*c == '"' || *c == '\\') sb_putc(out, '\\'); sb_putc(out, *c); }
+                    sb_putc(out, '"');
+                }
+                break;
+            case ML_DURATION: case ML_DELAY: case ML_TDURATION: case ML_TDELAY:
+                if (isnan(item.f)) sb_puts(out, "auto");
+                else anim_unit(out, item.f / 1000, "s");
+                break;
+            case ML_EASING: case ML_TEASING: css_easing_serialize(&item.e, out); break;
+            case ML_ITERATIONS:
+                if (isinf(item.f)) sb_puts(out, "infinite");
+                else anim_number(out, item.f);
+                break;
+            default: {
+                const struct kw *k = p->kws;
+                while (k && k->name && k->v != item.k) k++;
+                if (!k || !k->name) return false;
+                sb_puts(out, k->name);
+            }
+            }
+        }
+        break;
+    }
+
+    default: return false;
+    }
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
+}
+
+bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b) {
+    if (!p || p->type == PT_SHORT) return true;
+    const char *fa = (const char *)a + p->off, *fb = (const char *)b + p->off;
+    switch (p->type) {
+    case PT_LEN: case PT_SVG_WIDTH: return css_length_equal((const len_t *)fa, (const len_t *)fb);
+    case PT_RADIUS: case PT_BG_POS: case PT_TRANSFORM_ORIGIN: {
+        const len_t *x = p->type == PT_RADIUS ? ((const struct css_corner_radius *)fa)->axis : (const len_t *)fa;
+        const len_t *y = p->type == PT_RADIUS ? ((const struct css_corner_radius *)fb)->axis : (const len_t *)fb;
+        return css_length_equal(&x[0], &y[0]) && css_length_equal(&x[1], &y[1]);
+    }
+    case PT_BG_SIZE: return a->bg_size_kind == b->bg_size_kind && css_length_equal(&a->bg_size[0], &b->bg_size[0]) &&
+        css_length_equal(&a->bg_size[1], &b->bg_size[1]);
+    case PT_MASK_SIZE: return a->mask_size_kind == b->mask_size_kind && css_length_equal(&a->mask_size[0], &b->mask_size[0]) &&
+        css_length_equal(&a->mask_size[1], &b->mask_size[1]);
+    case PT_TRANSFORM: case PT_ROTATE: case PT_SCALE:
+        return tf_equal(*(const struct css_transform *const *)fa, *(const struct css_transform *const *)fb);
+    case PT_TRANSLATE: return a->translate.active == b->translate.active && css_length_equal(&a->translate.xy[0], &b->translate.xy[0]) &&
+        css_length_equal(&a->translate.xy[1], &b->translate.xy[1]);
+    case PT_BOX_SHADOW: {
+        const struct css_box_shadow *x = a->box_shadow, *y = b->box_shadow;
+        for (; x && y; x = x->next, y = y->next) {
+            if (x->x != y->x || x->y != y->y || x->blur != y->blur || x->spread != y->spread || x->inset != y->inset)
+                return false;
+            struct css_color_computed u, v;
+            anim_shadow_color(a, x, &u);
+            anim_shadow_color(b, y, &v);
+            if (!css_color_computed_equal(&u, &v)) return false;
+        }
+        return !x && !y;
+    }
+    case PT_FILTER: {
+        const struct css_filter *x = a->filter, *y = b->filter;
+        if (!x || !y) return x == y;
+        return x->count == y->count && !memcmp(x->steps, y->steps, x->count * sizeof *x->steps);
+    }
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT) {
+            const struct svg_paint *x = (const struct svg_paint *)fa, *y = (const struct svg_paint *)fb;
+            if (x->kind != y->kind || !same_text(x->ref, y->ref)) return false;
+            if (x->kind != SVG_PAINT_COLOR) return true;
+        }
+        struct css_color_computed x, y;
+        css_style_color(a, color_slot(p), &x);
+        css_style_color(b, color_slot(p), &y);
+        return css_color_computed_equal(&x, &y);
+    }
+    case PT_VALIGN: return a->vertical_align == b->vertical_align && (a->vertical_align != VA_LEN || a->vertical_align_px == b->vertical_align_px);
+    case PT_ZINDEX: return a->z_auto == b->z_auto && (a->z_auto || a->z_index == b->z_index);
+    case PT_DISPLAY: return a->display == b->display && a->legacy_box == b->legacy_box;
+    case PT_FONT_FAMILY: return a->font_family == b->font_family && same_text(a->font_names, b->font_names);
+    case PT_CONTAINER_NAMES: return same_text(a->container_names, b->container_names);
+    case PT_CONTENT: return same_text(a->content, b->content);
+    case PT_LIST_TYPE: return a->list_style == b->list_style && same_text(a->list_style_string, b->list_style_string);
+    case PT_BG_IMAGE: return same_text(a->bg_image, b->bg_image) && a->has_grad == b->has_grad && a->gradient == b->gradient;
+    case PT_MASK_IMAGE: return same_text(a->mask_image, b->mask_image);
+    case PT_GLINE: {
+        const struct gline *x = (const struct gline *)fa, *y = (const struct gline *)fb;
+        return x->kind == y->kind && x->n == y->n && same_text(x->name, y->name);
+    }
+    case PT_CLIP_PATH: {
+        if (!a->clip_path || !b->clip_path) return a->clip_path == b->clip_path;
+        sbuf x = {0}, y = {0};
+        bool same = css_clip_path_serialize(a->clip_path, &x, NULL) && css_clip_path_serialize(b->clip_path, &y, NULL) &&
+            x.n == y.n && !memcmp(x.p, y.p, x.n);
+        sb_free(&x); sb_free(&y);
+        return same;
+    }
+    case PT_GTEMPLATE: case PT_GAREAS:
+        return *(const void *const *)fa == *(const void *const *)fb;
+    case PT_MOTION_LIST: return css_motion_equal(&a->motion, &b->motion);
+    }
+    return !memcmp(fa, fb, p->size);
+}
+
+bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const char *v, size_t n, bool computed,
+                    style_t *out, uint8_t *set) {
+    if (!p || !v) return false;
+    *out = *c->base;
+    uint8_t local[NPROPS];
+    if (!set) set = local;
+    memset(set, 0, NPROPS);
+    const style_t *parent = c->parent;
+    struct cx cx = {.s = out, .parent = parent, .node = c->node, .em = parent ? parent->font_size : 16, .rem = c->rem,
+                    .vw = c->vw, .vh = c->vh, .a = c->a, .set = set, .font_pass = true, .computed_text = computed};
+    /* font-size first, against the parent's, as the cascade does; then the rest against it */
+    if (css_prop_is_early(p) && !css_apply(p, v, n, &cx)) return false;
+    cx.font_pass = false;
+    cx.em = out->font_size;
+    return css_apply(p, v, n, &cx) && !cx.invalid;
+}
+
+bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const style_t *b, double t) {
+    int type = css_prop_animation(p);
+    if (type == CSS_ANIM_DISPLAY || type == CSS_ANIM_VISIBILITY) {
+        if (t <= 0) return false;
+        if (t >= 1) return true;
+        bool hides_a, hides_b;
+        if (type == CSS_ANIM_VISIBILITY) hides_a = a->visibility != 0, hides_b = b->visibility != 0;
+        else if (p->type == PT_DISPLAY) hides_a = a->display == D_NONE, hides_b = b->display == D_NONE;
+        else hides_a = a->content_visibility == CV_HIDDEN, hides_b = b->content_visibility == CV_HIDDEN;
+        /* inside the interval the showing value wins */
+        if (hides_a != hides_b) return hides_a;
+    }
+    return t >= .5;
+}
+
+/* ka·a + kb·b for each value type (mode MIX), or b added / accumulated onto a */
+static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, const style_t *a, const style_t *b,
+                         double ka, double kb, int mode, sbuf *out) {
+    const char *fa = (const char *)a + p->off, *fb = (const char *)b + p->off;
+    web_doc *d = c->d;
+    switch (p->type) {
+    case PT_LEN: case PT_SVG_WIDTH:
+        return anim_len(out, (const len_t *)fa, (const len_t *)fb, ka, kb, p->type == PT_SVG_WIDTH ? 0 : p->flags, d);
+    case PT_PX: {
+        double v = *(const float *)fa * ka + *(const float *)fb * kb;
+        anim_unit(out, p->flags & LF_NEG ? v : anim_clamp(v, 0, INFINITY), "px");
+        return true;
+    }
+    case PT_FONT_SIZE: anim_unit(out, anim_clamp(a->font_size * ka + b->font_size * kb, 0, INFINITY), "px"); return true;
+    case PT_NUM: anim_number(out, anim_clamp(*(const float *)fa * ka + *(const float *)fb * kb, 0, INFINITY)); return true;
+    case PT_OPACITY: anim_number(out, anim_clamp(*(const float *)fa * ka + *(const float *)fb * kb, 0, 1)); return true;
+    case PT_FONT_WEIGHT: anim_number(out, anim_clamp(a->font_weight * ka + b->font_weight * kb, 1, 1000)); return true;
+    case PT_INT: case PT_ZINDEX: {
+        if (p->type == PT_ZINDEX && (a->z_auto || b->z_auto)) return false;
+        /* <integer>: as a real number, then to the nearest integer, halves towards +infinity */
+        char text[32]; snprintf(text, sizeof text, "%.0f", floor(*(const int *)fa * ka + *(const int *)fb * kb + .5));
+        sb_puts(out, text);
+        return true;
+    }
+    case PT_LINE_HEIGHT:
+        if (a->line_height.kind != b->line_height.kind || a->line_height.kind == LK_NORMAL) return false;
+        if (a->line_height.kind == LK_NUMBER) anim_number(out, anim_clamp(a->line_height.px * ka + b->line_height.px * kb, 0, INFINITY));
+        else anim_unit(out, anim_clamp(a->line_height.px * ka + b->line_height.px * kb, 0, INFINITY), "px");
+        return true;
+    case PT_VALIGN:
+        if (a->vertical_align != VA_LEN || b->vertical_align != VA_LEN) return false;
+        anim_unit(out, a->vertical_align_px * ka + b->vertical_align_px * kb, "px");
+        return true;
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT && (((const struct svg_paint *)fa)->kind != SVG_PAINT_COLOR ||
+                                        ((const struct svg_paint *)fb)->kind != SVG_PAINT_COLOR)) return false;
+        struct css_color_computed x, y;
+        css_style_color(a, color_slot(p), &x);
+        css_style_color(b, color_slot(p), &y);
+        return anim_color(out, a, &x, b, &y, kb, mode);
+    }
+    case PT_RADIUS: {
+        const len_t *x = ((const struct css_corner_radius *)fa)->axis, *y = ((const struct css_corner_radius *)fb)->axis;
+        return anim_len(out, &x[0], &y[0], ka, kb, 0, d) && length_append(out, " ", 1) && anim_len(out, &x[1], &y[1], ka, kb, 0, d);
+    }
+    case PT_BG_POS: case PT_TRANSFORM_ORIGIN: {
+        const len_t *x = (const len_t *)fa, *y = (const len_t *)fb;
+        return anim_len(out, &x[0], &y[0], ka, kb, LF_NEG, d) && length_append(out, " ", 1) && anim_len(out, &x[1], &y[1], ka, kb, LF_NEG, d);
+    }
+    case PT_BG_SIZE: case PT_MASK_SIZE: {
+        bool bg = p->type == PT_BG_SIZE;
+        uint8_t kx = bg ? a->bg_size_kind : a->mask_size_kind, ky = bg ? b->bg_size_kind : b->mask_size_kind;
+        if (kx != BSZ_LEN || ky != BSZ_LEN) {
+            if (kx != ky) return false;
+            return css_computed_value(a, p, out, d);
+        }
+        const len_t *x = bg ? a->bg_size : a->mask_size, *y = bg ? b->bg_size : b->mask_size;
+        return anim_len(out, &x[0], &y[0], ka, kb, 0, d) && length_append(out, " ", 1) && anim_len(out, &x[1], &y[1], ka, kb, 0, d);
+    }
+    case PT_TRANSFORM: return tf_list(out, a->transform, b->transform, ka, kb, mode, c->box, d);
+    case PT_TRANSLATE:
+        if (!a->translate.active && !b->translate.active) { sb_puts(out, "none"); return true; }
+        /* none is translate(0) */
+        return anim_len(out, &a->translate.xy[0], &b->translate.xy[0], ka, kb, LF_NEG, d) && length_append(out, " ", 1) &&
+            anim_len(out, &a->translate.xy[1], &b->translate.xy[1], ka, kb, LF_NEG, d);
+    case PT_ROTATE: {
+        const struct css_transform *x = a->rotate, *y = b->rotate;
+        if (!x && !y) { sb_puts(out, "none"); return true; }
+        struct css_transform ix, iy;
+        if (!x) { ix = tf_identity(y); x = &ix; }
+        if (!y) { iy = tf_identity(x); y = &iy; }
+        if (!tf_same_axis(x, y)) return false;
+        struct css_transform r = x->v[3] != 0 || y->v[3] == 0 ? *x : *y;
+        r.v[3] = x->v[3] * ka + y->v[3] * kb;
+        tf_rotate_text(out, &r);
+        return true;
+    }
+    case PT_SCALE: {
+        const struct css_transform *x = a->scale, *y = b->scale;
+        if (!x && !y) { sb_puts(out, "none"); return true; }
+        struct css_transform ix, iy;
+        if (!x) { ix = tf_identity(y); x = &ix; }
+        if (!y) { iy = tf_identity(x); y = &iy; }
+        struct css_transform r = *x;
+        /* CSS Transforms 2 §16: scales multiply when added, add their excess over 1 when accumulated */
+        for (int i = 0; i < 3; i++)
+            r.v[i] = mode == ADD ? x->v[i] * y->v[i] : mode == ACCUMULATE ? x->v[i] + y->v[i] - 1 : x->v[i] * ka + y->v[i] * kb;
+        tf_scale_text(out, &r);
+        return true;
+    }
+    case PT_BOX_SHADOW: return anim_shadows(out, a, b, ka, kb, mode);
+    case PT_FILTER: return anim_filters(out, a->filter, b->filter, ka, kb, mode);
+    case PT_CLIP:
+        if (!a->clip.rect || !b->clip.rect || a->clip.auto_edges != b->clip.auto_edges) return false;
+        sb_puts(out, "rect(");
+        for (int i = 0; i < 4; i++) {
+            if (i) sb_puts(out, ", ");
+            if (a->clip.auto_edges >> i & 1) sb_puts(out, "auto");
+            else anim_unit(out, a->clip.edge[i] * ka + b->clip.edge[i] * kb, "px");
+        }
+        sb_putc(out, ')');
+        return true;
+    }
+    return false;
+}
+
+bool css_anim_interpolate(const struct css_anim_ctx *c, const struct propdef *p, const style_t *a, const style_t *b,
+                          double t, sbuf *out) {
+    int type = css_prop_animation(p);
+    if (type == CSS_ANIM_VISIBILITY)
+        return css_computed_value(a->visibility == b->visibility || !css_anim_discrete_second(p, a, b, t) ? a : b, p, out, c->d);
+    if (type != CSS_ANIM_VALUE) return false;
+    size_t begin = out->n;
+    if (anim_combine(c, p, a, b, 1 - t, t, MIX, out)) return true;
+    out->n = begin;
+    if (out->p && begin < out->cap) out->p[begin] = 0;
+    return false;
+}
+
+bool css_anim_compose(const struct css_anim_ctx *c, const struct propdef *p, const style_t *underlying,
+                      const style_t *value, bool accumulate, sbuf *out) {
+    if (css_prop_animation(p) != CSS_ANIM_VALUE) return false;
+    size_t begin = out->n;
+    if (anim_combine(c, p, underlying, value, 1, 1, accumulate ? ACCUMULATE : ADD, out)) return true;
+    out->n = begin;
+    if (out->p && begin < out->cap) out->p[begin] = 0;
+    return false;
 }

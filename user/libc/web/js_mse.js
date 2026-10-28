@@ -15,7 +15,7 @@ const mseBridge = (() => {
     cloneData.registerUncloneable(value=>apply(get,sources,[value])!==undefined||apply(get,buffers,[value])!==undefined||apply(get,lists,[value])!==undefined||apply(get,ranges,[value])!==undefined||apply(get,tracksData,[value])!==undefined||apply(get,trackSlots,[value])!==undefined);
     const source=v=>read(sources,v,'MediaSource'),buffer=v=>read(buffers,v,'SourceBuffer');
     const str=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
-    const error=(name,message)=>new ErrorType(message,name);
+    const error=(name,message)=>domExceptionBridge.create(name,message);
     const finite=v=>{const n=+v;if(!Number.isFinite(n))throw new TypeError('Expected finite number');return n;};
     function fire(target,type){const e=new EventType(type);eventState(e).isTrusted=true;dispatch(target,e);}
     function queue(target,type){schedule(()=>fire(target,type));}

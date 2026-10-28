@@ -39,9 +39,10 @@ void web_idb_host_init(JSContext *ctx, JSValueConst host, const struct web_idb_r
 /* Moves the broker's transport on without waiting: an interrupt handler may call it. */
 void web_idb_pump(struct web_idb *idb);
 bool web_idb_used(const struct web_idb *idb);
-/* Requests the broker has not answered yet. The broker is not in an event queue: while some
-   wait, the realm's event loop looks again soon (js.c and browserjsworker.c: 8 ms). */
-bool web_idb_waiting(const struct web_idb *idb);
+/* Requests the broker has not answered whose answer will not end the realm's wait: the broker's
+   channel is watched in web_atomics_queue() while an answer is awaited, and only when that watch
+   could not be made does the realm's event loop look again soon (js.c, browserjsworker.c). */
+bool web_idb_needs_poll(const struct web_idb *idb);
 /* The sequence of the request whose completion task can run now, 0 when none can. */
 uint32_t web_idb_next(struct web_idb *idb);
 /* The completion task's work, inside the caller's task (and before its microtask checkpoint):

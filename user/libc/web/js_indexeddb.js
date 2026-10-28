@@ -16,7 +16,7 @@ const indexedDBBridge=(()=>{
     const connections={get:v=>invoke(mapGet,connectionSlots,[v]),set:(v,r)=>invoke(mapSet,connectionSlots,[v,r]),values:()=>invoke(mapValues,connectionSlots,[]),clear:()=>invoke(mapClear,connectionSlots,[])};
     const later=setTimeout,token={};let watching=false,retired=false;
     const get=(v,kind)=>{const r=records.get(v);if(!r||r.kind!==kind)throw new TypeError('Illegal '+kind+' receiver');return r;};
-    const fail=(name,message=name)=>{throw new DOMException(message,name);};
+    const fail=(name,message=name)=>{throw domExceptionBridge.create(name,message);};
     const strings=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol');return String(v);};
     function names(values){const a=values.slice().sort();Object.defineProperties(a,{contains:{value:v=>a.includes(strings(v))},item:{value:i=>a[i>>>0]??null}});return a;}
     function fire(target,type,extra={},cancelable=false){const r=records.get(target),chain=[target];if(type==='error'&&r?.kind==='IDBRequest'&&r.transaction){chain.push(r.transaction,get(r.transaction,'IDBTransaction').db);}else if(type==='abort'&&r?.kind==='IDBTransaction')chain.push(r.db);const e=new Event(type,{cancelable,bubbles:chain.length>1});for(const [k,v]of Object.entries(extra))Object.defineProperty(e,k,{value:v,enumerable:true});eventState(e).isTrusted=true;dispatch(target,e,chain.length>1?{entries:chain.map(node=>({node,target,visible:chain,atTarget:false,related:undefined})),finalTarget:target,finalRelated:undefined}:undefined);return e;}

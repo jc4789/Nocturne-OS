@@ -7,6 +7,9 @@
 /* What the last web_js_webidl_install found, for the realm's setup trace. */
 struct web_js_webidl_report {
     unsigned interfaces, members, wrapped, setters_dropped, misplaced;
+    /* Functions given the built-in shape: called through a native function (a binding's
+       constructible function), or given %Function.prototype% (an async or generator method). */
+    unsigned builtin_wrapped, builtin_reprototyped;
     unsigned milliseconds;
     /* The first ones, "Interface.member" (a member in another form or place than the IDL's) or
        "Interface" (a prototype chain the IDL does not give), and the readonly attributes whose

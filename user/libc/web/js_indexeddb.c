@@ -1,6 +1,7 @@
 /* IndexedDB: the native half of js_indexeddb.js (js_indexeddb.h). Origin and lifetime come from
  * the realm's owner, never from a caller-selected path; busy leases are retried by JS tasks. */
 #include "js_indexeddb.h"
+#include "js_atomics.h"
 #include <webprefs.h>
 #include <math.h>
 #include <stdlib.h>
@@ -110,7 +111,9 @@ void web_idb_pump(struct web_idb *idb) {
     if(idb&&idb->broker)webidb_async_pump(idb->broker);
 }
 bool web_idb_used(const struct web_idb *idb) {return idb&&idb->used;}
-bool web_idb_waiting(const struct web_idb *idb) {return idb&&idb->pending;}
+bool web_idb_needs_poll(const struct web_idb *idb) {
+    return idb&&idb->pending&&!(idb->broker&&webidb_async_watched(idb->broker));
+}
 static struct web_idb_pending **idb_find(struct web_idb *idb,uint32_t sequence,struct web_idb_pending **previous) {
     struct web_idb_pending **link=&idb->pending;*previous=NULL;
     while(*link&&(*link)->sequence!=sequence){*previous=*link;link=&(*link)->next;}
@@ -264,7 +267,7 @@ static JSValue idb_native(JSContext *ctx,JSValueConst this_val,int argc,JSValueC
     if(JS_IsException(result))goto done;
     struct web_idb_pending *pending=js_mallocz(ctx,sizeof *pending);
     if(!pending){JS_FreeValue(ctx,result);result=JS_EXCEPTION;JS_FreeValue(ctx,callbacks[0]);JS_FreeValue(ctx,callbacks[1]);goto done;}
-    if(!idb->broker&&!idb->failed)idb->broker=webidb_async_create();
+    if(!idb->broker&&!idb->failed)idb->broker=webidb_async_create(web_atomics_queue());
     idb->used=true;
     uint32_t sequence=0;
     if(idb->broker && (origin||(request.operation!=WEB_IDB_BEGIN&&request.operation!=WEB_IDB_DATABASES)))
