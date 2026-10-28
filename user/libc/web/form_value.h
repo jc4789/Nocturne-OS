@@ -53,7 +53,17 @@ void web_option_text(node_t *option, sbuf *out);
 
 bool web_control_labelable(const node_t *n);
 node_t *web_label_control(node_t *label);
-node_t *web_label_activation(node_t *target);
+/* The label element's activation behavior, as the platform's: the labeled control a click at
+   target forwards to, or NULL when target is the control itself or inside interactive content
+   of the label (HTML: such clicks do nothing). */
+node_t *web_label_activation(node_t *label, node_t *target);
+/* An input element's legacy-pre-activation and legacy-canceled-activation behavior (HTML): a
+   checkbox's checkedness flips and its indeterminateness clears, a radio button is checked and
+   remembers the group's checked one; a canceled click puts them back. Not conditional on the
+   element being mutable. */
+struct web_input_activation { bool used, checked, indeterminate; node_t *previous; };
+void web_input_pre_activation(web_doc *d, node_t *input, struct web_input_activation *record);
+void web_input_canceled_activation(web_doc *d, node_t *input, const struct web_input_activation *record);
 node_t *web_input_datalist(node_t *input);
 node_t *web_datalist_option(node_t *input, int index);
 int web_datalist_options(web_doc *d, web_node *input, const char **labels, int capacity);

@@ -1059,6 +1059,7 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     /* HTML "activate history entry" (and "initialize the navigable" for a new navigable's
        first document) sets the initial visibility state to the traversable's system visibility
        state: the host's for a top-level document, the one its top document holds for a frame. */
+    if(host)d->host=*host;
     if(host && host->window_state){d->window_state=host->window_state;d->window_opaque=host->opaque;}
     if(parent){web_doc *top=parent;while(top->frame_parent)top=top->frame_parent;d->visible=top->system_visible;}
     else d->visible=d->system_visible=!d->window_state || (d->window_state(d->window_opaque)&WEB_WINDOW_VISIBLE);
@@ -1562,12 +1563,13 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
         if(!strcmp(e->type,"keydown"))focus_keyboard_input(input,e);
         else if(!strcmp(e->type,"mousedown")||!strcmp(e->type,"pointerdown"))input->focus_modality=WEB_MODALITY_POINTER;
     }
-    /* WHATWG image-button activation: capture the selected point in the
-       displayed image before click listeners can replace layout or reparent
-       it. Only an uncanceled explicit coordinate selection updates it;
-       keyboard/script activation retains the initially-zero selected point.
-       Padding/border clicks may yield negative CSS coordinates, not 0-clamped
-       bitmap pixels. No extra layout flush or mutable author getter is used. */
+    /* HTML image button: "if the user activated the control while explicitly selecting a
+       coordinate", the point in the displayed image, captured before click listeners can
+       replace layout or reparent it. The click's activation behavior (js_activation_native.h)
+       makes it the selected coordinate, only when the click is not canceled; keyboard and
+       script activation keep the initially-zero one. Padding/border clicks may yield negative
+       CSS coordinates, not 0-clamped bitmap pixels. No extra layout flush or mutable author
+       getter is used. */
     web_doc *owner=target?target->owner:NULL;bool image_point=false;int selected_x=0,selected_y=0;
     if(e&&e->type&&!strcmp(e->type,"click")&&!e->synthetic&&!e->keyboard_activation&&
        target&&target->type==N_ELEM&&!target->foreign&&target->tag==T_input&&
@@ -1589,17 +1591,19 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
     bool trace_wheel=d->profile_enabled && e && e->type && !strcmp(e->type,"wheel");
     unsigned target_tag=trace_wheel&&target?target->tag:0;
     uint64_t window_blocking=trace_wheel?(target&&target->owner?target->owner:d)->wheel_window_blocking:0;
+    node_t *saved_image=NULL;int saved_x=0,saved_y=0;
+    if(image_point){
+        saved_image=owner->image_activation;saved_x=owner->image_activation_x;saved_y=owner->image_activation_y;
+        owner->image_activation=target;owner->image_activation_x=selected_x;owner->image_activation_y=selected_y;
+    }
     bool allowed=web_js_dispatch(d,target,e);
+    if(image_point){owner->image_activation=saved_image;owner->image_activation_x=saved_x;owner->image_activation_y=saved_y;}
     if(trace_wheel) {
         char message[256];snprintf(message,sizeof message,
             "Native wheel default: allowed %d, cancelable %d, delta %.0f, tag %u, window-blocking %llu, coherent %d/ready %d, viewport %d/%d, view %d, style %d/boxes %d",
             allowed,e->cancelable,(double)e->delta_y,target_tag,(unsigned long long)window_blocking,
             scroll_input_coherent(d),web_native_input_ready(d,false),d->doc_h,d->height,d->view_y,d->need_style,d->need_boxes);
         web_js_console(d,1,message);
-    }
-    if(allowed&&image_point&&target->owner==owner&&owner->live&&
-       web_input_type(target)==WEB_INPUT_IMAGE&&web_form_owner(owner,target)){
-        target->image_submit_x=selected_x;target->image_submit_y=selected_y;
     }
     return allowed;
 }

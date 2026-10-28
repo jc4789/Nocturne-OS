@@ -239,6 +239,7 @@ typedef struct node {
     bool checked, selected_set;
     bool click_in_progress;
     bool constructing_form_entries; /* entry-list construction and formdata event reentry guard */
+    bool firing_submission_events; /* a form's HTML "firing submission events" (web_form_submit) */
     int image_submit_x,image_submit_y; /* selected image CSS point, initially 0,0; non-pointer activation preserves it */
     bool indeterminate; /* native checkbox display state, independent of checkedness */
     struct web_form_files *files;
@@ -2111,6 +2112,14 @@ struct web_doc {
     web_doc *frame_parent;
     uint32_t sandbox_flags; /* immutable active document restrictions */
     uint64_t sandbox_activation_until; /* only native trusted input writes this */
+    /* The callbacks web_live was given: a document without a realm (a sandbox without
+       allow-scripts) still follows its hyperlinks through them. */
+    struct web_host host;
+    /* During the dispatch of a trusted pointer click at an image button (doc.c web_dispatch):
+       the point the user selected, which that click's activation behavior makes the button's
+       selected coordinate (js_activation_native.h). */
+    node_t *image_activation;
+    int image_activation_x, image_activation_y;
     /* HTML's design mode enabled. js_document_commands.js owns it and writes it
        here for the native readers: :read-write and the editing keys. */
     bool design_mode;

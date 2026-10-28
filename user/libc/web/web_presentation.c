@@ -223,7 +223,7 @@ int web_presentation_request(web_doc *d,node_t *n,int kind,const struct web_host
         for(web_doc *at=d;at;at=at->frame_parent){at->fullscreen_element=element;changed(at,element);element=at->frame_element;}}
     else{top->pip_owner=d;d->pip_element=n;events->session=++d->pip_session;events->width=d->pip_width;events->height=d->pip_height;changed(d,n);}
     events_publish(events);
-    if(consume_activation){top->sandbox_activation_until=0;for(struct web_frame *f=top->frames;f;f=web_frame_walk_next(top,f,true))if(f->document)f->document->sandbox_activation_until=0;}
+    if(consume_activation)web_user_activation_consume(top);
     return WEB_PRESENT_OK;
 }
 bool web_presentation_exit(web_doc *d,int kind){

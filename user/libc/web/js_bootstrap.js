@@ -120,9 +120,12 @@
         constructor(type, init = {}) {
             if(!arguments.length)throw new TypeError('Event requires type');
             type=String(type);init=init==null?{}:Object(init);
+            /* mouse: a MouseEvent object, in any realm (DOM dispatch's isActivationEvent). user: a
+               trusted click's own modifier keys, which no page property can change. */
             apply(eventSet,eventStates,[this,{type,bubbles:!!init.bubbles,cancelable:!!init.cancelable,composed:!!init.composed,
                 target:null,currentTarget:null,eventPhase:0,defaultPrevented:false,isTrusted:false,timeStamp:host.now(),
-                stop:false,immediate:false,passive:false,dispatching:false,initialized:true,listenerException:false,path:null}]);
+                stop:false,immediate:false,passive:false,dispatching:false,initialized:true,listenerException:false,path:null,
+                mouse:false,user:null}]);
             eventDefine(this,'isTrusted',{enumerable:true,get(){return eventState(this).isTrusted;}});
         }
         initEvent(type,bubbles=false,cancelable=false) {
@@ -177,7 +180,7 @@
     Object.defineProperty(FocusEvent.prototype,Symbol.toStringTag,{configurable:true,value:'FocusEvent'});
     Object.defineProperty(FocusEvent.prototype,'relatedTarget',Object.assign({},Object.getOwnPropertyDescriptor(FocusEvent.prototype,'relatedTarget'),{enumerable:true}));
     class MouseEvent extends UIEvent {
-        constructor(t, o = {}) { super(t,o);const defaults={clientX:0, clientY:0, pageX:0, pageY:0,
+        constructor(t, o = {}) { super(t,o);eventState(this).mouse=true;const defaults={clientX:0, clientY:0, pageX:0, pageY:0,
             screenX:0,screenY:0,button:0, buttons:0, relatedTarget:null, ctrlKey:false, shiftKey:false, altKey:false, metaKey:false};
             o=o==null?{}:Object(o);for(const key of Object.keys(defaults))this[key]=o[key]===undefined?defaults[key]:o[key]; }
         initMouseEvent(type,bubbles=false,cancelable=false,view=null,detail=0,screenX=0,screenY=0,clientX=0,clientY=0,ctrlKey=false,altKey=false,shiftKey=false,metaKey=false,button=0,relatedTarget=null){
@@ -571,10 +574,24 @@
             }
         }
     }
+    /* DOM "dispatch". A click MouseEvent's activation target is chosen as its path is (steps 6.4,
+       6.5, 6.9.5.1, 6.9.7.2): the first path item with activation behavior, being the target, a
+       parent it reaches as its own target (a shadow host), or, when it bubbles, any parent. Its
+       legacy-pre-activation behavior runs before the listeners (6.12); after them, with the
+       event's path cleared, its activation behavior when the event was not canceled, else its
+       legacy-canceled-activation behavior (12). The behaviors are js_activation_native.h's. */
     function dispatch(target, event, snapshot) {
         const s=eventState(event);s.dispatching=true;s.target=target;
+        let activationTarget=null,activationRecord;
         try {
         const plan=snapshot && snapshot.entries?snapshot:shadowBridge.path(target,{type:s.type,composed:s.composed,relatedTarget:event.relatedTarget},snapshot),entries=plan.entries;
+        if(s.mouse && s.type==='click'){
+            for(let i=0;i<entries.length && activationTarget===null;i++){
+                const entry=entries[i];
+                if((i===0 || entry.atTarget || s.bubbles) && entry.node!==globalThis && host.activation(0,entry.node))activationTarget=entry.node;
+            }
+            if(activationTarget!==null)activationRecord=host.activation(1,activationTarget);
+        }
         const hasRelated='relatedTarget' in event,relatedState=apply(ownProperty,s,['relatedTarget']);
         // Retarget a FocusEvent's relatedTarget in its Event state, not through its read-only IDL getter.
         // Mouse events still use their existing internal writable field.
@@ -599,10 +616,16 @@
         for(let i=1;i<entries.length && !s.stop;i++)
             if(s.bubbles || entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
         s.target=plan.finalTarget;if(hasRelated)related(plan.finalRelated);
-        return !s.defaultPrevented;
         } finally {
             s.path=null;s.currentTarget=null;s.eventPhase=0;s.dispatching=s.passive=s.stop=s.immediate=false;
         }
+        if(activationTarget!==null){
+            if(!s.defaultPrevented){
+                const user=s.user;
+                host.activation(2,activationTarget,event,target,s.isTrusted,!!(user && user.ctrl),!!(user && user.shift));
+            }else if(activationRecord!==undefined)host.activation(3,activationTarget,activationRecord);
+        }
+        return !s.defaultPrevented;
     }
     class Node extends EventTarget {
         constructor() { super(); throw new TypeError('Use document.createElement/createTextNode'); }
@@ -1048,19 +1071,7 @@
             try { if(dispatch(this,new Event('reset',{bubbles:true,cancelable:true})))dom('reset',this); }
             finally { formResetting.delete(this); }
         }
-        requestSubmit(submitter){
-            htmlElementBrand(this,'form');
-            if(submitter!=null){
-                const tag=rawDom.get(submitter,'localName'),type=(reflectedAttr(submitter,'type')||'').toLowerCase();
-                if(rawDom.get(submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
-                   !(tag==='input' && (type==='submit'||type==='image') || tag==='button' && type!=='reset' && type!=='button'))
-                    throw new TypeError('submitter must be a submit button');
-                if(rawDom.get(submitter,'form:'+tag)!==this)throw new DOMException('submitter belongs to another form','NotFoundError');
-            }
-            const e=new Event('submit',{bubbles:true,cancelable:true});
-            e.submitter=submitter||null;
-            if(dispatch(this,e))dom('submit',submitter||this);
-        }
+        // requestSubmit() is js_form_validation.js's.
     }
     /* @include js_form_named.js */
     class HTMLAnchorElement extends HTMLElement {
@@ -1793,7 +1804,7 @@
         // CSS Font Loading's font loading task (js.c web_js_tick).
         fontsChanged(){fontLoadingBridge.changed();},
         avmediaActivate(node){return avmediaBridge.activate(node);},
-        inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true,composed:true}));},
+        activationForward,
         nodeProtos:[Node.prototype,HTMLDocument.prototype,Element.prototype,HTMLElement.prototype,
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,

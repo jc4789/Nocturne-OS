@@ -18,7 +18,8 @@ const init=new Function(`
     ${capturesSource}
     const listenerMap=new WeakMap(),inlineMap=new WeakMap(),inputWindow=globalThis;
     const reports=[],inactive=new Set();
-    const host={now:()=>1,scroll:()=>0,pointerCapturePending:()=>{},inputListener:()=>false,storageListener:()=>{},
+    // No target here has activation behavior (tests/js_activation_hosttest.js covers activation).
+    const host={now:()=>1,scroll:()=>0,pointerCapturePending:()=>{},inputListener:()=>false,storageListener:()=>{},activation:()=>false,
         eventRealmInit(port,table){host.port=port;return table;},eventRealm(){return host.port;},
         eventActive(target){return !inactive.has(target);},reportException(e){reports.push({error:e,current:currentEvent});}};
     function report(e){host.reportException(e);}
