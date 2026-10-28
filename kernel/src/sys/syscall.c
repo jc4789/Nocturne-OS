@@ -10,7 +10,6 @@
 #include "sys/object.h"
 #include "sys/channel.h"
 #include "sys/stream.h"
-#include "sys/usersettings.h"
 #include "sys/watch.h"
 #include "fs/store.h"
 #include "mm/vmm.h"
@@ -2532,9 +2531,6 @@ enum ap_syscall syscall_ap(struct regs *r) {
     case SYS_UPTIME: result = (int64_t)uptime_ms(); break;
     case SYS_TIME: result = time_now(); break;
     case SYS_SLEEP: return sleep_ap(r->rdi);
-    case SYS_USER_LANGUAGES: /* every request a browser makes asks for them */
-        if (!user_languages_ap((char *)r->rdi, r->rsi, &result)) return AP_SYSCALL_BSP;
-        break;
     case SYS_TCP_SEND: case SYS_TCP_SEND_UNTIL: case SYS_TCP_RECV:
         return net_ap_syscall(r) ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
     case SYS_AUDIO_STATUS: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM: case SYS_WIN_RECEIVE:
@@ -2851,11 +2847,8 @@ void syscall_dispatch(struct regs *r) {
     case SYS_AUDIO_SUBMIT: ret = sys_audio_submit((int)a, (const void *)b, c, (uint32_t)d); break;
     case SYS_AUDIO_STATUS: ret = sys_audio_status((int)a, (struct n_audio_status *)b); break;
     case SYS_AUDIO_OUTPUT: ret = sys_audio_output((struct n_audio_output *)a, (uint32_t)b); break;
+    case SYS_AUDIO_OUTPUT_WATCH: ret = audio_output_watch(); break;
     case SYS_RANDOM: ret = sys_random((void *)a, b); break;
-    case SYS_USER_SETTINGS_WATCH: ret = user_settings_watch((uint32_t)a); break;
-    case SYS_USER_SETTINGS_CHANGES: ret = user_settings_changes((int)a); break;
-    case SYS_USER_LANGUAGES: ret = user_languages((char *)a, b); break;
-    case SYS_USER_LANGUAGES_SET: ret = user_languages_set((const char *)a, b); break;
     case SYS_WATCH_TAKE: ret = watch_take((int)a); break;
     case SYS_ENTRY_WATCH: ret = sys_entry_watch((const char *)a, b); break;
     case SYS_PAGER_CREATE: ret = sys_pager_create(a, (int32_t *)b); break;

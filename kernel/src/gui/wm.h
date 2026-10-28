@@ -2,13 +2,15 @@
 #include "kernel.h"
 #include "gfx.h"
 
-void wm_init(void);           /* start the compositor thread */
+/* Start the compositor thread. The desktop's settings (the pointer's speed, smooth gradients) are
+   the user's: the desktop registers them to be kept (sys/keep.c, AppData\Nocturne\Desktop.conf),
+   read back by keep_start. */
+void wm_init(void);
 bool wm_running(void);
-/* The user's settings the desktop applies (sys/usersettings.c): the pointer's speed, -2 to 2, and
-   smooth gradients, the user's wish (in effect while the screen shown takes them). Setting them
-   here is putting saved ones back: it tells no app. */
-void wm_desktop_settings(int *pointer_speed, bool *smooth_gradients);
-void wm_desktop_settings_set(int pointer_speed, bool smooth_gradients);
+/* Something SYS_SCREEN_INFO reports changed (the screen's mode, gui/screenmode.c): its watches
+   (SCREEN_WATCH, display_abi.h) hear of it. BSP, any lock held; it does not sleep. Nothing without
+   the desktop. */
+void wm_screen_info_changed(void);
 void wm_screen_size(uint32_t *w, uint32_t *h); /* the desktop's size, which a remote viewer may have changed */
 /* The scanout the screen is drawn into is about to be, or now is, w x h (dev/pciuser.c: a display
    driver's mode): the desktop takes that size, its fullscreen and maximised windows are told

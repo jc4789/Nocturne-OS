@@ -18,7 +18,8 @@
 #include "sys/sched.h"
 #include "sys/prof.h"
 #include "sys/stream.h"
-#include "sys/usersettings.h"
+#include "sys/keep.h"
+#include "gui/screenmode.h"
 #include "mm/heap.h"
 
 extern const char *kernel_cmdline;
@@ -103,7 +104,10 @@ void kmain_late(void) {
 
     bool gui = !cmdline_has("nogui");
     if (gui) wm_init();
-    user_settings_start(); /* the user's settings back into the desktop, sound and screen */
+    /* Each part's state back from its document on C: before the first program (sys/keep.c): sound
+       registered in audio_init, the desktop in wm_init, the screen's modes here. */
+    screen_modes_init();
+    keep_start();
     vm_session_init();
     if (!gui || !wm_running()) input_set_sinks(console_key_sink, NULL);
     pm_sleep_check(); /* every driver has registered: whether the start menu offers Sleep */

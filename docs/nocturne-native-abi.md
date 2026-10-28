@@ -416,8 +416,12 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     音量・消音と `device`（音を鳴らしている先：音声装置の名前、遠隔デスクトップの利用者がいれば
     "Remote desktop"。鳴らす先が無ければ空文字列。タスクバーのスピーカーと同じもの）が入る。
     鳴らす先が無くても音量は保たれ、後から付いた先に使われる。範囲外・未知のフラグは
-    `N_ERR_INVALID`。音量と消音は利用者の設定（§12、`N_USER_SETTING_SOUND`）で、アプリが
-    変えても、タスクバーのスピーカーで変えても、システムが保ち、監視するアプリへ知らせる。
+    `N_ERR_INVALID`。音量と消音は音の部品（`dev/audio.c`）の持ち物で、アプリが変えても、
+    タスクバーのスピーカーで変えても、部品が利用者の `AppData\Nocturne\Sound.conf` に保ち、
+    次の起動で init より前に戻す（§12）。
+  - `n_audio_output_watch()`（`SYS_AUDIO_OUTPUT_WATCH`）：`n_audio_output` が返すもの（音量、消音、
+    `device`）が変わると受け取れる見張り（`N_KIND_WATCH`、§12）。誰が変えても知らせ、同じ値を
+    当て直すのは変化ではない。
 - システムログ：`n_system_log(buf, cap)` で読み、`n_system_log_open()` の
   ハンドルへ `n_channel_send` で書く。
 - アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/nvidia/LEDGER.md`）：
@@ -551,9 +555,9 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     `source`）と `SCREEN_MODE_SET`（`struct screen_mode_set`）を使う（display_abi.h）。
     `SCREEN_MODE_TRY` は一覧のモードを試行として出し、`SCREEN_MODE_TRIAL_MS`（15 秒）以内に `SCREEN_MODE_KEEP` が
     無ければ前のモードへ戻る（`SCREEN_MODE_BACK` は即座に）。試行中の別の `TRY` は戻り先を
-    保つ。`KEEP` はそのモニターの利用者の選択にする。これは利用者の設定（§12、
-    `N_USER_SETTING_DISPLAY`）で、システムが C: に保ち、次の起動でも、そのモニターが駆動され
-    そのモードを出すときに使う。`struct screen_modes` の `chosen` は `offered` のモニターに
+    保つ。`KEEP` はそのモニターの利用者の選択にする。選択は画面のモードの部品
+    （`gui/screenmode.c`）の持ち物で、部品が利用者の `AppData\Nocturne\Displays.conf` に保ち
+    （§12）、次の起動でも、そのモニターが駆動されそのモードを出すときに使う。`struct screen_modes` の `chosen` は `offered` のモニターに
     利用者が選んだモード（無ければ全部 0）。`chosen` より前に作ったプログラムは大きさに
     `SCREEN_MODES_FIRST_BYTES` を渡し、その分だけ受け取る。4（以前の `SCREEN_MODE_SAVED`：
     設定アプリが起動時に保存ファイルから戻していた）は割り当てない。
@@ -572,7 +576,15 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
     デスクトップをチャンネルあたり 10 ビットで合成してディザをかけて出す）。後者は利用者の望みで、
     表示中の出力が 8 ビットの xRGB（ドライバーの面を含む）の間だけ効く
     （`smooth_gradients_available`）。マウスの上下の向きはカーネルが自動で決め、設定は無い。
-    どちらも利用者の設定（§12）で、変えるとすぐ効き、システムが保つ。
+    どちらもデスクトップ（`gui/wm.c`）の持ち物で、変えるとすぐ効き、デスクトップが利用者の
+    `AppData\Nocturne\Desktop.conf` に保つ（§12）。
+  - 画面の見張り：`SYS_SCREEN_INFO` の第3引数 `SCREEN_WATCH`（第1・第2引数は 0。libc の
+    `n_screen_watch()`、display.h）は、`SCREEN_SETTINGS_GET`・`struct screen_format` の返事・
+    `SCREEN_MODES_GET` が報告するもののどれかが変わると受け取れる見張り（`N_KIND_WATCH`、§12）。
+    デスクトップの大きさと設定、なめらかな階調を出せるか、申し出たモニターとモード、望まれた
+    モード、試行の始まりと終わり、拒まれたこと、`source`、利用者の選択。試行の残り時間が減るのは
+    変化ではない。第1・第2引数が 0 でなければ `N_ERR_INVALID`、デスクトップの無い起動（`nogui`）では
+    `N_ERR_UNSUPPORTED`。
   - `n_pci_screen_vblank(pci, count, timestamp_ns)`：渡した面の垂直帰線を一つ知らせる
     （`count` はドライバーの帰線番号、`timestamp_ns` はドライバーの時計）。届いている間、
     デスクトップは帰線ごとに 1 枚を描き始める。100 ms 届かなければ、表示中のモードの
@@ -940,41 +952,55 @@ GUIの部品（ボタン、入力欄、一覧、スライダー等）は、libc 
 フォーカスのある入力欄が木から消えると、
 フォーカスも消える。
 
-## 12. 利用者の設定
+## 12. システムの状態の保存と見張り
 
-利用者の設定はシステムの持ち物で、設定アプリはそれを見せて変更を頼む窓にすぎない。変更は
-頼まれた時にすぐ効き、システム自身が保存し、動いているアプリへ知らせる。アプリは設定を
-ファイルへ書かない。端末やコマンドで設定を当てる道は無い。
+値を効かせる者がその値の持ち主で、持ち主が自分の文書に保存し、自分で読み戻す。全部の設定を
+並べた表、設定のビット、全プログラムが共有する設定の文書はどこにも無い。設定アプリ
+（`C:\Nocturne\System\settings.js`）とタスクバーは持ち主へ変更を頼む操作盤で、値も文書も持たない。
+端末やコマンドで状態を当てる道は無い。
 
-- 置き場所：利用者のフォルダーの `AppData\Nocturne\Settings.conf`（`キー=値` の行）。書くのは
-  カーネルだけ。起動時に C: と利用者のフォルダーが使えるようになると（`store_start` と
-  `wm_init` の後、init より前）、カーネルが読んで各持ち主へ当てる。それが無く、以前の設定
-  アプリの `AppData\Settings\desktop.conf` があれば、それを読み、新しいファイルを保存できた
-  後で消す。
-- 持ち主：ポインターの速さとなめらかな階調はデスクトップ（`gui/wm.c`、`SCREEN_SETTINGS_SET`）、
-  モニターごとのモードは画面のモード（`gui/screenmode.c`、`SCREEN_MODE_KEEP`）、音量と消音は
-  音（`dev/audio.c`、`n_audio_output` とタスクバーのスピーカー）、言語は利用者の設定の部品
-  （`sys/usersettings.c`）自身。持ち主が変化を知らせ、システムは最後の変化から 0.5 秒後に保存
-  する。電源を切る前、スリープと休止の前には待たずに保存する。
-- 監視：`n_user_settings_watch(interest)` は `N_KIND_USER_SETTINGS` のハンドルを返す。`interest` は
-  `N_USER_SETTING_LANGUAGES`（1）、`N_USER_SETTING_POINTER`（2）、`N_USER_SETTING_DISPLAY`（4：
-  なめらかな階調、モニターに選んだモード）、`N_USER_SETTING_SOUND`（8）の組（0 や未知のビットは
-  `N_ERR_INVALID`）。そのどれかが変わると `N_EVENT_RECEIVABLE`（レベル：
-  `n_user_settings_changes(watch)` が受け取るまで）。`n_user_settings_changes` は前の呼出しの後に
-  変わった設定のビットを返し（無ければ 0）、印を消す。誰が変えても（そのアプリ自身、ほかの
-  アプリ、タスクバー）知らせる。同じ値を当て直すのは変化ではない。監視は待ち行列（§6）に入れて
-  待つ。窓の無い Worker やサービスでも使える。
-- 言語：`n_user_languages(out, cap)` は利用者が読む言語を、望む順に BCP 47 の言語タグ（RFC 5646）
-  をコンマで区切って書き（`"ja,en-US"`、空白なし、ゼロで終わる）、長さを返す。空になることは
-  無く、利用者が決めるまでは `"en-US"`。ゼロを含めて `N_USER_LANGUAGES_MAX`（1024）バイトまで。
-  `cap` が足りなければ `N_ERR_TOO_LARGE`。AP で済む軽い呼出しで、要求ごとに読んでよい
-  （ブラウザーの `Accept-Language`）。
-- `n_user_languages_set(list, length)`：コンマで区切ったタグ（前後の空白は許す）を利用者の言語に
-  する。システムは各タグを RFC 5646 §2.1.1 の書き方（小文字。先頭でもシングルトンの後でもない
-  2 文字の副タグは大文字、4 文字は頭だけ大文字）にし、二度目のタグを落とす。タグは副タグの
-  水準で検査する：1〜8 文字の英数字をハイフンで区切り、最初は 2〜8 文字の英字か `x`・`i`、最後は
-  シングルトンでない。空の一覧や項目、タグでないものは `N_ERR_INVALID`、`length` が 1024 以上は
-  `N_ERR_TOO_LARGE`。登録簿（IANA の副タグの一覧）との照合はしない。
-- nocturne/ui（TypeScript・JavaScript）では `desktop.languages()`・`desktop.setLanguages(tags)`・
-  `desktop.watch(listener)`（`listener` は変わった設定の名前 `"languages"` `"pointer"` `"display"`
-  `"sound"` の配列を受け取る）。`ScreenModes.chosen` がモニターに選んだモード。
+- プログラムの設定はプログラムの持ち物：`n_app_data_folder(name, out, cap)` の `AppData\<name>`
+  （§3）に自分の形式で置き、自分で読む。原子的な保存は `n_document_save`・`n_entry_replace`、
+  ほかのプロセスの変更は C: の見張り（`n_entry_watch`、§3）で知る。カーネルも共有の文書も
+  通らない（移植したプログラムは自分の profile をそのまま使える）。
+- システムの部品の状態（今はどれもカーネルの中）。文書は利用者の `AppData\Nocturne` にある：
+  - ポインターの速さとなめらかな階調：デスクトップ（`gui/wm.c`、`SCREEN_SETTINGS_SET`、§9）→
+    `Desktop.conf`（`pointer_speed`、`smooth_gradients`）。
+  - 音量と消音：音（`dev/audio.c`、`n_audio_output` とタスクバーのスピーカー、§9）→ `Sound.conf`
+    （`volume`、`muted`）。
+  - モニターごとに選んだモード：画面のモード（`gui/screenmode.c`、`SCREEN_MODE_KEEP`、§9）→
+    `Displays.conf`（`mode.<monitor>`）。
+- 部品の文書は**インターフェースではない**：形（`キー=値` の行、`#` で始まる行は注釈）も鍵も
+  持ち主が決め、版とともに変わりうる。書くのはその持ち主だけ。プログラムは値を §9 の呼出しで
+  読み・頼み、見張りで変化を知る。文書を手で直しても、動いている系には効かない（次の起動で
+  持ち主が読み、分からない行・範囲外の値は捨てる）。
+- 保存：持ち主は値が変わると保存の印を付け、保存の共通の仕組み（`sys/keep.c`。鍵を一つも
+  知らない）が最後の変化から 0.5 秒後に持ち主の文書全体を差し替える（`store_save`）。電源を
+  切る前、再起動の前、スリープと休止の前には待たずに書く。書けなかった変化は次の変化か電源の前に
+  書き直す。
+- 起動：各持ち主が登録し、C: と利用者のフォルダーが使えるようになった後（`store_start` と
+  `wm_init` の後）、init より前に、各文書を読んで持ち主へ渡す。文書の無い持ち主は既定の値の
+  まま。読み戻しと引き継ぎは `keep:` の行でシステムログに書く。
+- 以前の系からの引き継ぎ：自分の文書が無い持ち主だけが、以前の系の文書を新しい方から一つ
+  （a51c4398 の `AppData\Nocturne\Settings.conf`、無ければ以前の設定アプリの
+  `AppData\Settings\desktop.conf`）読んで自分の値にし、すぐ自分の文書を書く。文書を持つ持ち主の
+  値は以前の文書に上書きされない。以前の文書は、全部の行がどれかの持ち主のもので、読んだ
+  持ち主が全部保存できたときだけ消す（`languages=` の行がある `Settings.conf` は残る）。
+- 見張り（`N_KIND_WATCH`、§1）：見張るものが変わると `N_EVENT_RECEIVABLE`（レベル：
+  `n_watch_take(watch)` が取るまで）。`n_watch_take` は前の取り出しの後の変化の数を返し（無ければ
+  0、上限 `N_WATCH_CHANGES_MAX`）、数を消す。見張りは開いた時から数える。誰が変えても（その
+  プログラム自身、ほかのプログラム、タスクバー、遠隔デスクトップの利用者）知らせ、同じ値を
+  当て直すのは変化ではない。待ち行列（§6）に入れて待つ。窓の無い Worker やサービスでも使える。
+  見張りを閉じれば、入っていた待ち行列からも消える。開く口は用途ごと：
+  - `n_audio_output_watch()`（`SYS_AUDIO_OUTPUT_WATCH`）：`n_audio_output` が返すもの。
+  - `n_screen_watch()`（`SYS_SCREEN_INFO` の `SCREEN_WATCH`、display.h）：`SCREEN_SETTINGS_GET`・
+    `struct screen_format` の返事・`SCREEN_MODES_GET` が報告するもの。
+  - `n_entry_watch(path, what)`（`SYS_ENTRY_WATCH`、§3）：C: の名前とフォルダー。
+- 言語の一覧はシステムの状態ではない：読むプログラム（ブラウザー）の好みで、その持ち物である。
+  a51c4398 の `SYS_USER_SETTINGS_WATCH`・`SYS_USER_SETTINGS_CHANGES`・`SYS_USER_LANGUAGES`・
+  `SYS_USER_LANGUAGES_SET`（203〜206）はカーネルが受け付けず（`N_ERR_UNSUPPORTED`）、欠番のまま
+  使い直さない（§10）。
+- nocturne/ui（TypeScript・JavaScript）では `desktop.watch(listener)`：`listener` は変わったものの
+  名前の配列を受け取る。`"screen"` は `desktop.get()`・`desktop.modes()` が報告するもの（画面の
+  見張り）、`"sound"` は `desktop.sound()` が報告するもの（音の見張り）。`ScreenModes.chosen` が
+  モニターに選んだモード。

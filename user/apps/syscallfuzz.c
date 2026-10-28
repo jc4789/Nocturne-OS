@@ -21,9 +21,9 @@
    or "syscallfuzz: RESULT FAIL violations=N".
 
    Left out on purpose: calls that end, power off, launch or stop programs, sleep, claim
-   hardware, use the network or change the user's settings (SYS_EXIT, SYS_POWER, SYS_SLEEP,
-   SYS_THREAD_*, SYS_APP_LAUNCH, SYS_APP_OPEN, SYS_GUI_LAUNCH, SYS_WIN_CREATE, SYS_PCI_CLAIM,
-   SYS_AUDIO_OUTPUT, SYS_USER_LANGUAGES_SET, 96..127).
+   hardware, use the network or change the volume the system keeps for the user (SYS_EXIT,
+   SYS_POWER, SYS_SLEEP, SYS_THREAD_*, SYS_APP_LAUNCH, SYS_APP_OPEN, SYS_GUI_LAUNCH,
+   SYS_WIN_CREATE, SYS_PCI_CLAIM, SYS_AUDIO_OUTPUT, 96..127).
    Pointers into memory this program owns never reach calls that change mappings. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,7 +149,6 @@ static const struct sysinfo_ hinfo[] = {
     {SYS_DMA_CREATE, 1}, {SYS_DMA_ADDRESSES, 1},
     {SYS_WIN_MAP, 1}, {SYS_WIN_PRESENT, 1}, {SYS_WIN_SET_TITLE, 1}, {SYS_WIN_MOVE, 1}, {SYS_WIN_RESIZE, 1},
     {SYS_WIN_STATE, 1}, {SYS_WIN_PRESENTATION, 1}, {SYS_WIN_RECEIVE, 1}, {SYS_WIN_DIRECT, 1}, {SYS_WIN_FRAME, 1},
-    {SYS_USER_SETTINGS_CHANGES, 1},
     {SYS_WATCH_TAKE, 1},
 };
 
@@ -162,8 +161,8 @@ static bool skipped(long n) {
     switch (n) {
     case SYS_EXIT: case SYS_SLEEP: case SYS_POWER: case SYS_THREAD_CREATE: case SYS_THREAD_JOIN:
     case SYS_THREAD_EXIT: case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64: case SYS_GUI_LAUNCH:
-    case SYS_APP_LAUNCH: case SYS_APP_OPEN: case SYS_WIN_CREATE: case SYS_PCI_CLAIM: case SYS_AUDIO_OUTPUT:
-    case SYS_USER_LANGUAGES_SET: /* the user's own setting, kept on C: */
+    case SYS_APP_LAUNCH: case SYS_APP_OPEN: case SYS_WIN_CREATE: case SYS_PCI_CLAIM:
+    case SYS_AUDIO_OUTPUT: /* the volume, kept on C: for the user */
     case SYS_THREAD_TLS: /* a valid block would redirect this thread's TLS base */
         return true;
     }
@@ -185,8 +184,7 @@ static bool creates_handle(long n) {
     switch (n) {
     case SYS_DOCUMENT_OPEN: case SYS_CHANNEL_LISTEN: case SYS_CHANNEL_CONNECT: case SYS_CHANNEL_ACCEPT:
     case SYS_SHARED_CREATE: case SYS_SHARED_RESERVE: case SYS_EVENTS_CREATE: case SYS_SYSTEM_LOG_OPEN:
-    case SYS_AUDIO_OPEN: case SYS_PCI_BAR: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_USER_SETTINGS_WATCH:
-        return true;
+    case SYS_AUDIO_OPEN: case SYS_PCI_BAR: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_AUDIO_OUTPUT_WATCH:
     case SYS_ENTRY_WATCH:
         return true;
     }
@@ -261,6 +259,7 @@ static void live_refill(void) {
     live_add(n_audio_open());
     live_add(n_entry_watch(scratch, N_WATCH_NAME));
     live_add(n_entry_watch(n_temp_folder(), N_WATCH_FOLDER));
+    live_add(n_audio_output_watch());
 }
 
 /* ---- the random call engine ---- */

@@ -7,22 +7,18 @@
    for that monitor, else the monitor's preferred mode; and tells the driver through the screen's
    state (wm_screen_mode, gui/wm.c). The Settings app lists the modes, tries one, keeps it or goes
    back (SYS_SCREEN_INFO, display_abi.h); a mode tried and not kept goes back by itself. The mode
-   kept for a monitor is a user's setting, which the system keeps on C: (sys/usersettings.c).
+   kept for each monitor is the user's: it is kept in the user's AppData\Nocturne\Displays.conf
+   (sys/keep.c), which screen_modes_init registers to be read back by keep_start.
    screen_modes_offer: the driver's monitor, its modes and what it showed (a kernel copy);
    count 0: it drives none any more, though it still runs (it may have given the screen back).
    screen_modes_gone: the same, for a driver whose claim ended. */
 struct n_screen_modes;
+void screen_modes_init(void); /* before keep_start (kmain_late) */
 void screen_modes_offer(const struct n_screen_modes *m);
 void screen_modes_gone(void);
 /* The refresh (millihertz) of the mode the driver says its head shows; 0 while it says none. Any
    thread, no lock (the compositor's frame period, gui/wm.c). */
 uint32_t screen_shown_refresh_mhz(void);
-/* The user's choice of mode for a monitor (its struct n_screen_modes monitor text), put back from
-   the user's settings: shown whenever that monitor is driven and offers it. Tells no app. */
-struct n_screen_mode;
-void screen_modes_choose(const char *monitor, const struct n_screen_mode *mode);
-/* The i'th monitor the user chose a mode for and that mode, for keeping them; false past the last. */
-bool screen_modes_choice(unsigned i, char monitor[32], struct n_screen_mode *mode);
 /* SYS_SCREEN_INFO with op SCREEN_MODES_GET or SCREEN_MODE_SET: user is the app's struct of size
    bytes. Takes no WM lock of its own (it comes before the WM's). */
 int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op);

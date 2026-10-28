@@ -163,8 +163,9 @@ def edit_boot_entry(disk, scratch, cmdline):
 
 
 def put_tests(disk, entries, scratch):
-    """Put (path in C:\\Tests, host file or folder) pairs on the disk's C: with one `store fill`.
-    What C:\\Tests held before goes first, so it holds exactly these."""
+    """Put (path on C:, host file or folder, or "-" for a folder made there) pairs on the disk's C:
+    with one `store fill`. What C:\\Tests held before goes first, so it holds exactly what is put
+    in it."""
     listing = os.path.join(scratch, "tests.list")
     with open(listing, "w", encoding="utf-8", newline="\n") as f:
         f.write("C:\\Tests\t!\nC:\\Tests\t-\n")
@@ -351,6 +352,23 @@ def test_files(a, tcp_port, web_ports, scratch):
     return [("C:\\Tests\\" + name, host) for name, host in files]
 
 
+def state_files(scratch):
+    """What the user's AppData holds at the start, for nativeabi/system-state (tests/systemwatchtest.c):
+    the desktop's own Desktop.conf, and an older system's AppData\\Settings\\desktop.conf that the
+    start takes over into each part's own document and then removes (docs/settings-ownership-20261027.md
+    §7). The desktop's own document wins over the older one: the pointer's speed starts at 1, not -2.
+    The volume is the one the system starts with (tests/audiotest.c expects 80)."""
+    user = "C:\\Users\\User"  # the image's one user (rootfs\\Users\\User)
+    out = [(user + "\\AppData", "-"), (user + "\\AppData\\Nocturne", "-"), (user + "\\AppData\\Settings", "-")]
+    for rel, text in (("Nocturne\\Desktop.conf", "# placed by scripts/test.py\npointer_speed=9\npointer_speed=1\n"),
+                      ("Settings\\desktop.conf", "pointer_speed=-2\nvolume=80\nmuted=off\nrefresh=60\n")):
+        path = os.path.join(scratch, rel.replace("\\", "-"))
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        out.append((user + "\\AppData\\" + rel, path))
+    return out
+
+
 # what tests/audiotest.c plays, in order: (left Hz, right Hz, seconds); the last one is killed early
 AUDIO_TONES = [(1000, 1500, 1.0), (600, 600, 0.5), (700, 900, 0.5), (800, 800, 0.5), (500, 1100, 0.5),
                (440, 440, 0.4), (1200, 750, 0.6), (300, 300, None)]
@@ -436,7 +454,8 @@ def prepare_disk(a, tcp_port, web_ports):
         dns_endpoint = "10.0.2.2:%d" % a.dns_port if getattr(a, "dns_port", None) else None
         if dns_endpoint:
             edit_boot_entry(DISK, scratch, "dns-server=" + dns_endpoint)
-        print("test: C:\\Tests: " + put_tests(DISK, test_files(a, tcp_port, web_ports, scratch), scratch), flush=True)
+        print("test: C:\\Tests: " + put_tests(DISK, test_files(a, tcp_port, web_ports, scratch) + state_files(scratch), scratch),
+              flush=True)
     write_to_larger_disk(DISK, os.path.getsize(DISK) + TEST_ROOM)
     return image_hash, payload
 

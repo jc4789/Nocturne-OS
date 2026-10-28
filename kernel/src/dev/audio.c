@@ -6,7 +6,8 @@
 #include "mm/vmm.h"
 #include "sys/sched.h"
 #include "sys/object.h"
-#include "sys/usersettings.h"
+#include "sys/keep.h"
+#include "sys/watch.h"
 #include "abi.h"
 #include "vm/vm.h"
 
@@ -61,6 +62,9 @@ static int32_t gain = 80 * 80 * 65536 / 10000; /* volume squared, 16.16: loudnes
 static const char *card_name;
 static void (*card_fill)(void);
 static int remote_users;
+/* What SYS_AUDIO_OUTPUT reports (the volume, muting, what plays the sound) changed: its watches
+   (SYS_AUDIO_OUTPUT_WATCH) hear of it, whoever changed it. */
+static struct watched output_watched;
 
 #define TRACE_SECONDS 22
 bool audio_trace_active;
@@ -252,43 +256,79 @@ void audio_tick(void) {
 }
 
 void audio_set_card(const char *name, void (*fill)(void)) {
+    bool changed = name != card_name;
     card_name = name;
     card_fill = fill;
+    if (changed) watched_changed(&output_watched);
 }
 const char *audio_card(void) { return card_name; }
 
+/* From a remote session's thread (vm/rdp.c, a kernel thread: the BSP). */
 void audio_remote_attach(void) {
     uint64_t f = irq_save();
-    remote_users++;
+    bool first = remote_users++ == 0;
     irq_restore(f);
+    if (first) watched_changed(&output_watched); /* "Remote desktop" plays the sound now */
 }
 void audio_remote_detach(void) {
     uint64_t f = irq_save();
+    bool last = remote_users == 1;
     if (remote_users > 0) remote_users--;
     irq_restore(f);
+    if (last) watched_changed(&output_watched);
 }
 bool audio_remote(void) { return remote_users > 0; }
 const char *audio_output(void) { return remote_users ? "Remote desktop" : card_name; }
 
-static void set_gain(void) { gain = muted ? 0 : volume * volume * 65536 / 10000; }
+/* ---- the volume and muting: the user's, kept in AppData\Nocturne\Sound.conf (sys/keep.c) ---- */
+
+static bool sound_line(const char *key, const char *value, bool apply);
+static size_t sound_text(char *out, size_t cap);
+static struct keep sound_keep = {.name = "Sound", .line = sound_line, .text = sound_text};
+
+/* The volume and muting as v and m; whoever changes them (a program, the taskbar's volume control,
+   the document read back), the watches hear of it and the change is kept. */
+static void sound_put(int v, bool m) {
+    bool changed = v != volume || m != muted;
+    volume = v;
+    muted = m;
+    gain = muted ? 0 : volume * volume * 65536 / 10000;
+    if (!changed) return;
+    keep_changed(&sound_keep);
+    watched_changed(&output_watched);
+}
 int audio_volume(void) { return volume; }
 bool audio_muted(void) { return muted; }
-/* The volume and muting are the user's settings (sys/usersettings.c): whoever changes them (an
-   app, the taskbar's volume control), the apps that watch are told and the system keeps them. */
-void audio_set_volume(int percent) {
-    int v = MAX(0, MIN(100, percent));
-    bool changed = v != volume || muted;
-    volume = v;
-    muted = false;
-    set_gain();
-    if (changed) user_settings_changed(N_USER_SETTING_SOUND);
+void audio_set_volume(int percent) { sound_put(MAX(0, MIN(100, percent)), false); }
+void audio_set_muted(bool m) { sound_put(volume, m); }
+
+/* Sound.conf: volume=<0-100>, muted=on|off. */
+static bool sound_line(const char *key, const char *value, bool apply) {
+    int64_t v;
+    bool on = !strcmp(value, "on"), off = !strcmp(value, "off");
+    if (!strcmp(key, "volume")) {
+        if (apply && keep_number(value, 0, 100, &v)) sound_put((int)v, muted);
+        return true;
+    }
+    if (!strcmp(key, "muted")) {
+        if (apply && (on || off)) sound_put(volume, on);
+        return true;
+    }
+    return false;
 }
-void audio_set_muted(bool m) {
-    bool changed = m != muted;
-    muted = m;
-    set_gain();
-    if (changed) user_settings_changed(N_USER_SETTING_SOUND);
+
+static size_t sound_text(char *out, size_t cap) {
+    uint64_t f = irq_save();
+    int v = volume;
+    bool m = muted;
+    irq_restore(f);
+    size_t n = 0;
+    keep_put(out, cap, &n, "# The volume and muting. Nocturne keeps this: change them in Settings or with the taskbar's speaker.\n");
+    keep_put(out, cap, &n, "volume=%d\nmuted=%s\n", v, m ? "on" : "off");
+    return n;
 }
+
+int64_t audio_output_watch(void) { return watched_open(&output_watched); }
 
 static uint8_t system_ring[RING_BYTES];
 static struct stream system_stream = {.ring = system_ring};
@@ -475,5 +515,7 @@ int audio_stream_flush(struct handle *h) {
 }
 
 void audio_init(void) {
+    watched_init(&output_watched, NULL); /* before a card is set */
+    keep_register(&sound_keep);          /* read back by keep_start, before the first program */
     vm_audio_init(); /* no driver for real sound hardware yet */
 }

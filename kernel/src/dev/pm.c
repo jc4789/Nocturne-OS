@@ -11,7 +11,7 @@
 #include "dev/iommu.h"
 #include "gui/wm.h"
 #include "sys/sched.h"
-#include "sys/usersettings.h"
+#include "sys/keep.h"
 #include "arch/ioapic.h"
 #include "arch/smp.h"
 #include "arch/wake.h"
@@ -241,7 +241,7 @@ static void sleep_now(bool hibernate) {
         return;
     }
     kprintf("pm: going to %s\n", hibernate ? "hibernate" : "sleep");
-    user_settings_flush(); /* a setting changed a moment ago is kept too */
+    keep_flush(); /* a state changed a moment ago is kept too */
     store_sync(); /* what was saved is on its volume, whatever becomes of the sleep */
     /* no transfer is cut off by the controllers losing their state, and after a snapshot nothing
        but the image reaches the disks */
@@ -303,7 +303,7 @@ static void pm_thread(void *arg) {
             wm_notify(action == PM_REBOOT ? "Restarting" : "Shutting down",
                       action == PM_REBOOT ? "See you in a moment..." : "Good night!");
             stop_apps();
-            user_settings_flush(); /* a setting changed a moment ago is kept too */
+            keep_flush(); /* a state changed a moment ago is kept too */
             store_sync(); /* what was saved reaches its volume first */
             finish(action);
         }

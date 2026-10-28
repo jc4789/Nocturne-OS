@@ -26,7 +26,8 @@
 #include "sys/sched.h"
 #include "sys/proc.h"
 #include "sys/syscall.h"
-#include "sys/usersettings.h"
+#include "sys/keep.h"
+#include "sys/watch.h"
 #include "dev/pm.h"
 #include "abi.h"
 
@@ -113,11 +114,17 @@ static struct window *direct_win;
 static int direct_shape = -1;
 static struct n_screen_state direct_state = {.serial = 1, .hot_x = DIRECT_HOT, .hot_y = DIRECT_HOT};
 static struct wait_queue direct_wq;
-/* The user's settings (struct desktop_settings, sys/usersettings.c): pointer speed with its
-   leftover quarter steps, and smooth gradients as the user wants them; the compositor applies them
-   between frames while the scanout shown takes them (fb_dither_able). Under wm_lock. */
+/* The user's (struct desktop_settings): pointer speed with its leftover quarter steps, and smooth
+   gradients as the user wants them; the compositor applies them between frames while the scanout
+   shown takes them (fb_dither_able). The desktop keeps them in the user's AppData\Nocturne\
+   Desktop.conf (desktop_keep, sys/keep.c). Under wm_lock. */
 static int pointer_speed, pointer_rest_x, pointer_rest_y;
 static bool deep_wanted;
+/* What SYS_SCREEN_INFO reports changed, the desktop's or the screen mode's (gui/screenmode.c): its
+   watches (SCREEN_WATCH) hear of it. From wm_init on; without the desktop there is none.
+   seen_dither_able and seen_boot are the scanout shown as the compositor last saw it. */
+static struct watched screen_watched;
+static bool screen_watchable, seen_dither_able, seen_boot;
 static bool presenting_back;
 static struct wait_queue present_wait;
 
@@ -893,30 +900,65 @@ static void set_deep_simulation(bool on) {
     kprintf("wm: %u bpc desktop%s\n", fb.bpc, fb.simulated ? ", dithered to the 8 bpc display" : "");
     draw_wall();
     damage_all();
+    wm_screen_info_changed(); /* the colour format, and smooth gradients wanted when there was no memory */
 }
 
-/* The user's pointer speed and smooth gradients, wm_lock held: the N_USER_SETTING_* that changed. */
-static uint32_t desktop_settings_put(int speed, bool smooth) {
-    uint32_t changed = (speed != pointer_speed ? N_USER_SETTING_POINTER : 0) |
-                       (smooth != deep_wanted ? N_USER_SETTING_DISPLAY : 0);
+void wm_screen_info_changed(void) {
+    if (screen_watchable) watched_changed(&screen_watched);
+}
+
+/* ---- the desktop's settings, kept in Desktop.conf ---- */
+
+static bool desktop_line(const char *key, const char *value, bool apply);
+static size_t desktop_text(char *out, size_t cap);
+static struct keep desktop_keep = {.name = "Desktop", .line = desktop_line, .text = desktop_text};
+
+/* The pointer's speed (-2 to 2) and smooth gradients wanted, wm_lock held; whoever changes them
+   (a program, the document read back), the watches hear of it and the change is kept. */
+static void desktop_settings_put(int speed, bool smooth) {
+    if (speed == pointer_speed && smooth == deep_wanted) return;
     if (speed != pointer_speed) pointer_rest_x = pointer_rest_y = 0;
     pointer_speed = speed;
     deep_wanted = smooth;
     wake_compositor();
-    return changed;
+    keep_changed(&desktop_keep);
+    wm_screen_info_changed();
 }
 
-void wm_desktop_settings(int *speed, bool *smooth) {
-    wm_lock();
-    *speed = pointer_speed;
-    *smooth = deep_wanted;
-    wm_unlock();
+/* Desktop.conf: pointer_speed=<-2..2>, smooth_gradients=on|off. deep_colour is what an older
+   system called smooth gradients; pointer_y and refresh it kept too, and this one has them no
+   more. */
+static bool desktop_line(const char *key, const char *value, bool apply) {
+    int64_t v;
+    bool on = !strcmp(value, "on"), off = !strcmp(value, "off");
+    if (!strcmp(key, "pointer_speed")) {
+        if (apply && keep_number(value, -2, 2, &v)) {
+            wm_lock();
+            desktop_settings_put((int)v, deep_wanted);
+            wm_unlock();
+        }
+        return true;
+    }
+    if (!strcmp(key, "smooth_gradients") || !strcmp(key, "deep_colour")) {
+        if (apply && (on || off)) {
+            wm_lock();
+            desktop_settings_put(pointer_speed, on);
+            wm_unlock();
+        }
+        return true;
+    }
+    return !strcmp(key, "pointer_y") || !strcmp(key, "refresh");
 }
 
-void wm_desktop_settings_set(int speed, bool smooth) {
+static size_t desktop_text(char *out, size_t cap) {
     wm_lock();
-    desktop_settings_put(MAX(-2, MIN(2, speed)), smooth);
+    int speed = pointer_speed;
+    bool smooth = deep_wanted;
     wm_unlock();
+    size_t n = 0;
+    keep_put(out, cap, &n, "# The desktop: the pointer's speed and smooth gradients. Nocturne keeps this: change them in Settings.\n");
+    keep_put(out, cap, &n, "pointer_speed=%d\nsmooth_gradients=%s\n", speed, smooth ? "on" : "off");
+    return n;
 }
 
 static int launch(const char *path, const char *arg) {
@@ -2378,6 +2420,14 @@ static void wm_thread(void *arg) {
         /* Nothing is presenting between frames: the planes can be replaced. */
         bool smooth = deep_wanted && fb_dither_able();
         if (smooth != fb.simulated) set_deep_simulation(smooth);
+        /* Another scanout shown (a display driver's taken, the boot screen given back): whether
+           smooth gradients can be shown and where the screen's mode comes from, as reported. */
+        bool able = fb_dither_able(), boot = fb_boot_shown();
+        if (able != seen_dither_able || boot != seen_boot) {
+            seen_dither_able = able;
+            seen_boot = boot;
+            wm_screen_info_changed();
+        }
 
         struct tm_parts tp;
         time_to_parts(time_now(), &tp);
@@ -2525,6 +2575,7 @@ static bool set_screen_size(int w, int h) {
     nrdamage = 0;
     damage_all();
     kprintf("wm: desktop is now %dx%d\n", sw, sh);
+    wm_screen_info_changed();
     return true;
 }
 
@@ -2541,7 +2592,7 @@ void wm_remote_resize(int *w, int *h) {
 bool wm_remote_attach(int *w, int *h) {
     wm_lock();
     if (!running) { wm_unlock(); return false; }
-    remote_users++;
+    if (!remote_users++) wm_screen_info_changed(); /* the source is the remote viewer's window now */
     /* Do not nest WM ownership: set_screen_size may release it while waiting
        for the compositor's VRAM borrow of the previous backbuffer. */
     if (*w > 0 && *h > 0) set_screen_size(MAX(640, MIN(*w, 3840)), MAX(480, MIN(*h, 2160)));
@@ -2565,7 +2616,7 @@ void wm_remote_detach(void) {
     uint32_t w, h;
     fb_screen_size(&w, &h);
     wm_lock();
-    if (remote_users > 0) remote_users--;
+    if (remote_users > 0 && !--remote_users) wm_screen_info_changed();
     if (!remote_users) set_screen_size((int)w, (int)h);
     damage_all();
     wake_compositor();
@@ -2614,9 +2665,14 @@ void wm_init(void) {
     /* PCI has been enumerated. Optional offscreen GPU never changes the display
        or the RAM frame used by Enhanced Session/RDP. */
     gpu_init();
+    watched_init(&screen_watched, NULL);
+    seen_dither_able = fb_dither_able();
+    seen_boot = fb_boot_shown();
+    screen_watchable = true;
     sw = fb.width;
     sh = fb.height;
     deep_wanted = fb.simulated;
+    keep_register(&desktop_keep); /* read back by keep_start (init.c), before the first program */
     size_t pages = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
     if (!bb || !wp) {
@@ -2885,8 +2941,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
                 if (!user_ok(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
                 struct desktop_settings n = *ds;
                 if (n.pointer_speed < -2 || n.pointer_speed > 2 || n.smooth_gradients > 1) return -N_ERR_INVALID;
-                uint32_t changed = desktop_settings_put(n.pointer_speed, n.smooth_gradients != 0);
-                if (changed) user_settings_changed(changed);
+                desktop_settings_put(n.pointer_speed, n.smooth_gradients != 0);
             }
             if (!user_ok_w(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
             memset(ds, 0, sizeof *ds);
@@ -3001,6 +3056,10 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     /* The monitor's mode: its own lock, which comes before the WM's (it tells the driver through
        wm_screen_mode). */
     if (num == SYS_SCREEN_INFO && (c == SCREEN_MODES_GET || c == SCREEN_MODE_SET)) return screen_modes_syscall((void *)a, b, c);
+    /* A watch on what all of SYS_SCREEN_INFO reports: no lock (else 5 would be read as the reply's
+       size below). */
+    if (num == SYS_SCREEN_INFO && c == SCREEN_WATCH)
+        return a || b ? -N_ERR_INVALID : !screen_watchable ? -N_ERR_UNSUPPORTED : watched_open(&screen_watched);
     struct handle *handle = NULL;
     if (num == SYS_WIN_RECEIVE) {
         /* Waits without the WM lock; the handle's reference keeps the window's memory. */

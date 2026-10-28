@@ -55,11 +55,15 @@ bool audio_remote(void); /* a remote client is playing the sound */
    sound card; NULL when nothing does (the volume then changes nothing that is heard). */
 const char *audio_output(void);
 
-/* The master volume, 0-100 (setting it also unmutes), and mute. */
+/* The master volume, 0-100 (setting it also unmutes), and mute: the user's. Sound keeps them in
+   the user's AppData\Nocturne\Sound.conf (sys/keep.c) and reads them back at the start. BSP. */
 int audio_volume(void);
 void audio_set_volume(int percent);
 bool audio_muted(void);
 void audio_set_muted(bool muted);
+/* SYS_AUDIO_OUTPUT_WATCH: a watch (sys/watch.h) on the volume, muting and audio_output(), whoever
+   changes them. */
+int64_t audio_output_watch(void);
 
 /* A short tone from the system itself (the volume control's tick), mixed in like a stream. It is
    dropped while the last one still sounds. */

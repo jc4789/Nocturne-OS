@@ -195,8 +195,9 @@ static const struct test tests[] = {
      {"webnet-tcp-capacity: 0 failed"}, "FAIL", 120, false, true},
     {"nativeabi", "documents-channels-apps-events", "tcc -o .\\nativeabitest C:\\Tests\\nativeabitest.c && .\\nativeabitest", 0,
      {"nativeabitest: ", ", 0 failed"}, "nativeabitest FAIL", 120, false, true},
-    {"nativeabi", "user-settings", "tcc -o .\\usersettingstest C:\\Tests\\usersettingstest.c && .\\usersettingstest", 0,
-     {"usersettingstest: ", ", 0 failed"}, "usersettingstest FAIL", 60, false, true},
+    /* "placed": scripts/test.py put an older system's documents in the user's AppData (state_files) */
+    {"nativeabi", "system-state", "tcc -o .\\systemwatchtest C:\\Tests\\systemwatchtest.c && .\\systemwatchtest placed", 0,
+     {"systemwatchtest: ", ", 0 failed"}, "systemwatchtest FAIL", 60, false, true},
     {"nativeabi", "iso-c-stdio", "tcc -o .\\stdiotest C:\\Tests\\stdiotest.c && .\\stdiotest", 0,
      {"stdiotest: ", ", 0 failed"}, "stdiotest FAIL", 120, false, true},
     {"nativeabi", "entry-watch", "tcc -o .\\entrywatchtest C:\\Tests\\entrywatchtest.c && .\\entrywatchtest", 0,
