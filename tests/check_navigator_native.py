@@ -46,9 +46,9 @@ n_result cpu_info(struct n_cpuinfo *out){*out=native_info;cpu_calls++;return cpu
 uint64_t n_clock_uptime_ms(void){return 0;}
 n_result wait_on_address(volatile uint32_t *address,uint32_t expected,unsigned ms){return -N_ERR_TIMEOUT;}
 n_result wake_address(volatile uint32_t *address,unsigned count){return 0;}
-/* The system's list of the user's languages, as n_user_languages gives it. */
+/* The browser's preferences (webprefs.h): the user's languages as webprefs_languages gives them. */
 static const char *user_languages="ja,en-US";
-n_result n_user_languages(char *out,size_t cap){size_t n=strlen(user_languages);language_calls++;if(n+1>cap)return -N_ERR_TOO_LARGE;memcpy(out,user_languages,n+1);return (n_result)n;}
+n_result webprefs_languages(char *out,size_t cap){size_t n=strlen(user_languages);language_calls++;if(n+1>cap)return -N_ERR_TOO_LARGE;memcpy(out,user_languages,n+1);return (n_result)n;}
 struct web_js_state {struct web_host host;};
 static struct web_js_state *state(JSContext *ctx){return JS_GetContextOpaque(ctx);}
 static bool enabled;

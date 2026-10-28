@@ -46,6 +46,9 @@ struct job {
        the request's URL list so far (0 same-origin, 1 same-site, 2 cross-site). */
     struct webnet_wire_fetch fetch;
     unsigned fetch_site;
+    /* The Accept-Language the browser chose when the fetch began
+       (WEBNET_WIRE_ACCEPT_LANGUAGE), checked; "" when the request has none. */
+    char accept_language[WEBNET_WIRE_ACCEPT_LANGUAGE_MAX + 1];
     /* An element's no-cors subresource (an image, a stylesheet) that left the
        request origin: its response tainting is opaque. The browser still uses
        the bytes, unlike fetch()'s opaque response, but they are not
@@ -920,28 +923,14 @@ static const char *accept_value(const struct job *j) {
     default: return "*/*";
     }
 }
-/* The user's preferred languages, most wanted first, as an Accept-Language
-   value: "ja,en-US;q=0.9,en;q=0.8". The list is the same one navigator.languages
-   reports (n_user_languages). */
+/* Fetch "fetch", step 14: the Accept-Language the user agent appends. The
+   browser chose the value when the fetch began (the user's languages, the
+   list navigator.languages reports) and it came with the request, so every
+   hop sends the same one; the service knows nothing of the user's choice. */
 static bool append_accept_language(struct job *j) {
-    char languages[N_USER_LANGUAGES_MAX];
-    n_result n = n_user_languages(languages, sizeof languages);
-    if (n <= 0) return true;
-    if (!header_text(j, &j->outgoing, "Accept-Language: ")) return false;
-    unsigned rank = 0;
-    for (const char *p = languages; *p;) {
-        size_t length = strcspn(p, ",");
-        if (length) {
-            char q[16] = "";
-            /* Weights fall by a tenth and stay at 0.1 past the tenth language. */
-            if (rank) snprintf(q, sizeof q, ";q=0.%u", rank < 9 ? 10 - rank : 1);
-            if ((rank && !header_text(j, &j->outgoing, ",")) || !header_append(j, &j->outgoing, p, length) ||
-                !header_text(j, &j->outgoing, q)) return false;
-            rank++;
-        }
-        p += length; if (*p) p++;
-    }
-    return header_text(j, &j->outgoing, "\r\n");
+    if (!j->accept_language[0]) return true;
+    return header_text(j, &j->outgoing, "Accept-Language: ") && header_text(j, &j->outgoing, j->accept_language) &&
+        header_text(j, &j->outgoing, "\r\n");
 }
 /* Sec-Fetch-Site: how the request's origin relates to every URL of the
    request's URL list so far (Fetch Metadata 2.3). Called once per URL, the
@@ -2090,10 +2079,25 @@ static int run_one(n_handle input,n_handle output) {
         }
         extended_size+=sizeof *f;
     }
+    struct webnet_wire_language lang={0};
+    if(w->user_navigation&WEBNET_WIRE_ACCEPT_LANGUAGE){
+        if(!job_read_all(j,&lang,sizeof lang)||lang.reserved||!lang.length||lang.length>WEBNET_WIRE_ACCEPT_LANGUAGE_MAX){
+            job_free_io(j);free(j);return 1;
+        }
+        extended_size+=(uint64_t)lang.length+sizeof lang;
+    }
     if(extended_size>SIZE_MAX-8){job_free_io(j);free(j);return 1;}
     j->url = read_string(j,w->url_len, false); j->document = read_string(j,w->origin_len, false);
     if(w->user_navigation&WEBNET_WIRE_REFERRER)j->referrer=read_string(j,ref.length,false);
     if(w->user_navigation&WEBNET_WIRE_TOP_LEVEL)j->top_level_url=read_string(j,top.length,false);
+    /* The value goes into a request's fields as it is: only bytes a CORS-safelisted
+       Accept-Language may hold, so it can never end the field or add another. */
+    bool language_valid=true;
+    if(w->user_navigation&WEBNET_WIRE_ACCEPT_LANGUAGE){
+        language_valid=job_read_all(j,j->accept_language,lang.length)&&
+            webnet_wire_language_valid(j->accept_language,lang.length);
+        j->accept_language[language_valid?lang.length:0]=0;
+    }
     j->method = read_string(j,w->method_len, false); j->headers = read_string(j,w->headers_len, false);
     j->request_body = read_string(j,w->body_len, true);
     /* Private transport diagnostics contain no cookie fields or metadata. */
@@ -2130,6 +2134,7 @@ static int run_one(n_handle input,n_handle output) {
     if (!j->url || !j->document || !j->method || !j->headers || !j->request_body ||
         ((w->user_navigation&WEBNET_WIRE_REFERRER)&&!j->referrer)||
         ((w->user_navigation&WEBNET_WIRE_TOP_LEVEL)&&!j->top_level_url)) fail(j, "Invalid request or out of memory");
+    else if(!language_valid)fail(j,"Invalid Accept-Language in request");
     else if(w->kind==WEBNET_REPORT && (!w->body_len || !webnet_report_fields_valid(j->method,j->headers)))fail(j,"Invalid native CSP report request");
     else if (!webnet_method_valid(j->method) || ((!strcmp(j->method, "GET") || !strcmp(j->method, "HEAD")) && w->body_len)) fail(j, "Invalid HTTP method or body");
     else if (socket && (strcmp(j->method, "GET") || w->body_len || input != output)) fail(j, "Invalid WebSocket request");

@@ -68,6 +68,26 @@
    tools): one private "HTTP/Nocturne-Sent <field>" line each, after the
    metadata line. Server fields are tokens and can never take this form. */
 #define WEBNET_WIRE_SENT_HEADERS 33554432u
+/* The request's Accept-Language as the browser chose it when the fetch began (Fetch "fetch",
+   step 14): a struct webnet_wire_language after struct webnet_wire_fetch, its bytes after the
+   top-level URL's. Sent on every hop unless the author's fields have Accept-Language (a CORS-
+   preflight has none: it does not pass through "fetch"); 1 to WEBNET_WIRE_ACCEPT_LANGUAGE_MAX
+   bytes of [0-9A-Za-z,;=.-] (CORS-safelisted), else the request fails. */
+#define WEBNET_WIRE_ACCEPT_LANGUAGE 67108864u
+#define WEBNET_WIRE_ACCEPT_LANGUAGE_MAX 128u
+struct webnet_wire_language { uint32_t length, reserved; };
+_Static_assert(sizeof(struct webnet_wire_language)==8,"webfetch Accept-Language extension");
+/* Whether length bytes are a value the field may carry: a subset of the CORS-safelisted
+   request-header's Accept-Language bytes (Fetch), never a byte that could end a field. */
+static inline bool webnet_wire_language_valid(const char *value, size_t length) {
+    if (!length || length > WEBNET_WIRE_ACCEPT_LANGUAGE_MAX) return false;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              c == ',' || c == ';' || c == '=' || c == '.' || c == '-')) return false;
+    }
+    return true;
+}
 #define WEBNET_FETCH_USER_ACTIVATION 1u
 #define WEBNET_FETCH_BROWSER_UI 2u
 struct webnet_wire_fetch { uint32_t destination, flags; };
@@ -86,7 +106,7 @@ _Static_assert(sizeof(struct webnet_wire_top_level)==8,"webfetch top document ex
 #define WEBNET_STREAM_UPLOAD  0x574e5304u
 #define WEBNET_STREAM_REQUEST_CREDIT 0x574e5305u
 #define WEBNET_STREAM_CHUNK_MAX 65536u
-#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_IMAGE_UPGRADE | WEBNET_WIRE_DYNAMIC_URL | WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER | WEBNET_WIRE_STREAM | WEBNET_WIRE_DEBUG_REQUEST | WEBNET_WIRE_BODY_PRESENT | WEBNET_WIRE_REFERRER | WEBNET_WIRE_SERVICE | WEBNET_WIRE_TOP_LEVEL | WEBNET_WIRE_REQUIRE_CORP | WEBNET_WIRE_FETCH_METADATA | WEBNET_WIRE_SENT_HEADERS)
+#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_IMAGE_UPGRADE | WEBNET_WIRE_DYNAMIC_URL | WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER | WEBNET_WIRE_STREAM | WEBNET_WIRE_DEBUG_REQUEST | WEBNET_WIRE_BODY_PRESENT | WEBNET_WIRE_REFERRER | WEBNET_WIRE_SERVICE | WEBNET_WIRE_TOP_LEVEL | WEBNET_WIRE_REQUIRE_CORP | WEBNET_WIRE_FETCH_METADATA | WEBNET_WIRE_SENT_HEADERS | WEBNET_WIRE_ACCEPT_LANGUAGE)
 static inline size_t webnet_wire_url_limit(uint32_t flags) {
     return flags & WEBNET_WIRE_DYNAMIC_URL ? (size_t)UINT32_MAX : WEBNET_URL_MAX - 1u;
 }

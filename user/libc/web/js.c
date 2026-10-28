@@ -295,7 +295,7 @@ struct web_js_state {
     unsigned dynamic_markup_counter;
     unsigned ignore_destructive_writes_counter;
     uint64_t storage_source, storage_poll_due, storage_listeners;
-    uint64_t languages_seen; /* web_js_languages_generation() navigator.languages answers for */
+    uint64_t languages_seen; /* webprefs_languages_generation() navigator.languages answers for */
     char *storage_origin;
     webidb_async *indexed_db;
     struct js_idb_pending *indexed_db_pending;
@@ -8295,10 +8295,13 @@ void web_js_tick(web_doc *d, uint64_t now) {
         if(JS_IsException(notified))exception(s);
         JS_FreeValue(s->ctx,notified);end_task(s);ran=true;
     }
-    /* HTML: a new set of the user's languages is a task on the DOM manipulation task source
-       that switches navigator.languages and fires languagechange at the window. */
-    if(!ran&&!s->disabled&&s->languages_seen!=web_js_languages_generation()){
-        s->languages_seen=web_js_languages_generation();
+    /* HTML NavigatorLanguage: when the user's languages change (webprefs, through the process's
+       watch), each global (this window or iframe) queues one task on the DOM manipulation task
+       source; navigator.languages keeps returning the same frozen array until that task
+       begins, which switches it and fires languagechange at the global. A list that changed
+       and came back before the task finds nothing new and fires nothing. */
+    if(!ran&&!s->disabled&&s->languages_seen!=webprefs_languages_generation()){
+        s->languages_seen=webprefs_languages_generation();
         begin_named_task(s,"languagechange",s->languages_seen);
         JSValue fired=custom_element_hook(s,"languageChange",0,NULL);
         if(JS_IsException(fired))exception(s);
@@ -8487,7 +8490,7 @@ static int64_t js_deadline(web_doc *d, int *why) {
         if (s->storage_origin && storage_listening(s) && (s->storage_subscribed[0]||s->storage_subscribed[1])) EARLIER(s->storage_poll_due, JD_STORAGE);
         if(s->indexed_db_failed&&s->indexed_db_pending)DUE_NOW();
         if(web_presentation_event_peek(d))DUE_NOW();
-        if(s->languages_seen!=web_js_languages_generation())DUE_NOW();
+        if(s->languages_seen!=webprefs_languages_generation())DUE_NOW();
         if(s->indexed_db&&webidb_async_pending(s->indexed_db)){
             webidb_async_pump(s->indexed_db);
             if(webidb_async_ready(s->indexed_db))DUE_NOW();
@@ -8837,9 +8840,10 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     JS_SetPropertyStr(s->ctx,api,"domOperations",operations);
     JS_SetPropertyStr(s->ctx,api,"noCorsFetch",JS_TRUE);
     JS_SetPropertyStr(s->ctx,api,"streamingFetch",JS_NewBool(s->ctx,s->host.resume_request != NULL));
-    /* Watch before the realm first reads the languages, so no change falls between. */
-    web_js_languages_watch(web_wait_queue());
-    s->languages_seen=web_js_languages_generation();
+    /* Watch before the realm first reads the languages, so no change falls between
+       (web_wait_queue watches the preferences once for the process). */
+    (void)web_wait_queue();
+    s->languages_seen=webprefs_languages_generation();
     web_js_navigator_init(s->ctx,api);
     web_js_crypto_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);

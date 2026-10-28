@@ -1,5 +1,6 @@
 #include "webnet.h"
 #include "webnet_wire.h"
+#include "webprefs.h"
 #include "http.h"
 #include "nocturne.h"
 #include <stdlib.h>
@@ -268,11 +269,20 @@ int webnet_cookie_set_site(webnet *n,const char *url,const char *top_level_url,c
 }
 long webnet_cookie_get(webnet *n,const char *url,char *out,size_t cap){return webnet_cookie_get_site(n,url,NULL,out,cap);}
 int webnet_cookie_set(webnet *n,const char *url,const char *value){return webnet_cookie_set_site(n,url,NULL,value);}
+/* Fetch "fetch", step 14: the Accept-Language a request that begins now carries, as the user's
+   languages are in this process (webprefs). The service sends this one value on every hop of
+   the request unless the author set the field; "" for none. */
+static void request_language(char out[WEBNET_WIRE_ACCEPT_LANGUAGE_MAX + 1]) {
+    _Static_assert(WEBPREFS_ACCEPT_LANGUAGE_MAX == WEBNET_WIRE_ACCEPT_LANGUAGE_MAX, "Accept-Language bound");
+    n_result n = webprefs_accept_language(out, WEBNET_WIRE_ACCEPT_LANGUAGE_MAX + 1);
+    if (n <= 0 || !webnet_wire_language_valid(out, (size_t)n)) out[0] = 0;
+}
 /* The private service request record shared by fetches and sockets: the
-   64-byte prefix, optional referrer/top-document extensions, the fields and
-   the cookie jar snapshot. NULL for an invalid field or allocation failure. */
+   64-byte prefix, optional referrer/top-document/Accept-Language extensions,
+   the fields and the cookie jar snapshot. NULL for an invalid field or
+   allocation failure. */
 static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint64_t id,uint64_t deadline,
-                                   uint32_t flags,size_t *out) {
+                                   uint32_t flags,const char *language,size_t *out) {
     const char *origin = q->origin ? q->origin : "";
     const char *method = q->method ? q->method : "GET";
     const char *headers = q->headers ? q->headers : "";
@@ -281,6 +291,9 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
     bool referrer_extension=q->referrer!=NULL||q->referrer_policy!=WEBNET_REFERRER_DEFAULT;
     const char *referrer=q->referrer?q->referrer:"";
     size_t ul = strlen(q->url), ol = strlen(origin), ml = strlen(method), hl = strlen(headers),rl=strlen(referrer),tl=strlen(top_level_url);
+    size_t ll = strlen(language);
+    bool language_extension = ll != 0;
+    if (language_extension && !webnet_wire_language_valid(language, ll)) return NULL;
     if (!ul || ul > UINT32_MAX || ol > UINT32_MAX || ul == SIZE_MAX || ol == SIZE_MAX || ml > UINT32_MAX || !webnet_method_valid(method) || hl > UINT32_MAX ||rl>UINT32_MAX||tl>UINT32_MAX||
         ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && q->body_len)) return NULL;
     int64_t cookie_now=time(NULL);
@@ -288,7 +301,8 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
     if (cookie_len < 0 || (uint64_t)cookie_len > UINT32_MAX) return NULL;
     uint64_t total = sizeof(struct webnet_wire_request) + (uint64_t)ul + ol + ml + hl + q->body_len + (uint64_t)cookie_len+
         (referrer_extension?sizeof(struct webnet_wire_referrer)+(uint64_t)rl:0)+
-        (top_extension?sizeof(struct webnet_wire_top_level)+(uint64_t)tl:0)+sizeof(struct webnet_wire_fetch);
+        (top_extension?sizeof(struct webnet_wire_top_level)+(uint64_t)tl:0)+sizeof(struct webnet_wire_fetch)+
+        (language_extension?sizeof(struct webnet_wire_language)+(uint64_t)ll:0);
     if (total > SIZE_MAX) return NULL;
     unsigned char *tx = malloc((size_t)total);
     if (!tx) return NULL;
@@ -299,6 +313,7 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
     if (referrer_extension)h.user_navigation|=WEBNET_WIRE_REFERRER;
     if (top_extension)h.user_navigation|=WEBNET_WIRE_TOP_LEVEL;
     h.user_navigation|=WEBNET_WIRE_FETCH_METADATA;
+    if (language_extension) h.user_navigation |= WEBNET_WIRE_ACCEPT_LANGUAGE;
     if (q->body) h.user_navigation |= WEBNET_WIRE_BODY_PRESENT;
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
     h.id = id; h.generation = q->generation; h.deadline = deadline;
@@ -310,9 +325,11 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
     struct webnet_wire_fetch fetch={(uint32_t)q->destination,
         (q->user_activation?WEBNET_FETCH_USER_ACTIVATION:0u)|(q->browser_ui?WEBNET_FETCH_BROWSER_UI:0u)};
     memcpy(p,&fetch,sizeof fetch);p+=sizeof fetch;
+    if(language_extension){struct webnet_wire_language lang={(uint32_t)ll,0};memcpy(p,&lang,sizeof lang);p+=sizeof lang;}
     memcpy(p, q->url, ul); p += ul; memcpy(p, origin, ol); p += ol;
     if(referrer_extension){memcpy(p,referrer,rl);p+=rl;}
     if(top_extension){memcpy(p,top_level_url,tl);p+=tl;}
+    if(language_extension){memcpy(p,language,ll);p+=ll;}
     memcpy(p, method, ml); p += ml; memcpy(p, headers, hl); p += hl;
     if (q->body_len) memcpy(p, q->body, q->body_len);
     p += q->body_len;
@@ -382,7 +399,9 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     if (!id) id = ++n->serial;
     uint64_t deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
     size_t len;
-    unsigned char *tx = wire_request(n, q, id, deadline, flags, &len);
+    char language[WEBNET_WIRE_ACCEPT_LANGUAGE_MAX + 1];
+    request_language(language);
+    unsigned char *tx = wire_request(n, q, id, deadline, flags, language, &len);
     if (!tx) return 0;
     if (len > SIZE_MAX - n->queued_bytes) { free(tx); return 0; }
     struct request *r = calloc(1, sizeof *r);
@@ -580,7 +599,10 @@ uint64_t webnet_socket_open(webnet *n, const struct webnet_request *q, webnet_so
     s->cookie_url = malloc(rest + 9);
     s->cookie_site = strdup(q->top_level_url ? q->top_level_url : q->origin ? q->origin : "");
     if (s->cookie_url) snprintf(s->cookie_url, rest + 9, "%s://%s", secure ? "https" : "http", q->url + (secure ? 6 : 5));
-    s->tx = wire_request(n, q, id, uptime_ms() + WEBNET_TIMEOUT_MS, 0, &s->tx_len);
+    /* The opening handshake is a fetch (WebSockets "establish a WebSocket connection"). */
+    char language[WEBNET_WIRE_ACCEPT_LANGUAGE_MAX + 1];
+    request_language(language);
+    s->tx = wire_request(n, q, id, uptime_ms() + WEBNET_TIMEOUT_MS, 0, language, &s->tx_len);
     s->tx_cap = s->tx_len;
     if (!s->cookie_url || !s->cookie_site || !s->tx || (s->channel = n_channel_connect(n->service_key)) < 0) { wsock_free(s); return 0; }
     s->id = id; s->generation = q->generation; s->callback = cb; s->opaque = opaque;

@@ -103,7 +103,7 @@ static bool dedicated_wait(struct worker*w,int timeout){
     uint32_t interest=(w->closed?N_EVENT_CLOSED:N_EVENT_RECEIVABLE)|(w->output?N_EVENT_SENDABLE:0);
     if(!watch(w,CHANNEL,INPUT_TOKEN,&w->input_watched,interest))return false;
     struct n_event events[64];n_result n=n_events_wait(w->queue,events,64,timeout);if(n<0)return false;
-    web_atomics_events(events,(size_t)n);web_js_languages_events(events,(size_t)n);return true;
+    web_atomics_events(events,(size_t)n);webprefs_events(events,(size_t)n);return true;
 }
 static bool send_client(struct worker*w,struct client*c,unsigned op,unsigned request,unsigned kind,JSValueConst value){size_t n=0;uint8_t *data=JS_WriteObject(w->ctx,&n,value,JS_WRITE_OBJ_REFERENCE);if(!data)return false;if(n>NJW_MAX_BYTES||n>SIZE_MAX-sizeof(struct njw_header)||n+sizeof(struct njw_header)>SIZE_MAX-w->output_bytes){js_free(w->ctx,data);return false;}struct outgoing*p=calloc(1,sizeof*p);if(!p){js_free(w->ctx,data);return false;}p->data=data;p->client=c;p->h=(struct njw_header){NJW_MAGIC,op,c?c->generation:w->generation,request,kind,(uint32_t)n};struct output_publication t={.worker=w,.packet=p};output_publish(&t);return true;}
 static bool send_value(struct worker*w,unsigned op,unsigned request,unsigned kind,JSValueConst value){
@@ -193,7 +193,7 @@ static struct deferred*shared_receive(struct worker*w,int timeout){
     /* Atomics.waitAsync notifications wake the agent like an incoming task. */
     struct n_event events[64];n_result ready=n_events_wait(w->queue,events,64,watched?timeout:0);
     if(ready<0){w->closed=w->output_failed=true;return NULL;}
-    web_atomics_events(events,(size_t)ready);web_js_languages_events(events,(size_t)ready);
+    web_atomics_events(events,(size_t)ready);webprefs_events(events,(size_t)ready);
     /* A full report (or a failed watch) may leave owners unreported: try all. */
     bool all=ready==64||!watched,accept=!w->closed&&!watched,output=false;
     for(n_result i=0;i<ready;i++){uint64_t token=events[i].token;
@@ -608,8 +608,9 @@ static void policy_task(struct worker *w){
 }
 int main(int argc,char**argv){
     struct worker w={0};w.probe=-1;w.queue=web_atomics_queue();if(w.queue<0)return 1;w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=web_js_new_runtime(NULL);if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,true);web_atomics_runtime_init(w.rt);JS_SetInterruptHandler(w.rt,interrupt,&w);JS_SetHostPromiseRejectionTracker(w.rt,rejection_track,NULL);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=n_clock_uptime_ms()+10000;
-    /* Watch the user's languages before the realm first reads them (languagechange). */
-    web_js_languages_watch(w.queue);w.languages_seen=web_js_languages_generation();
+    /* Watch the browser's preferences in this queue before the realm first reads the languages
+       (languagechange); without a watch the first read takes them once. */
+    (void)webprefs_watch(w.queue);w.languages_seen=webprefs_languages_generation();
     if(trusted_native_init(w.ctx)<0)goto shutdown;
     if(web_js_wasm_init(w.ctx,wasm_poll,wasm_can_compile)<0)goto shutdown;
     JSValue global=JS_GetGlobalObject(w.ctx),host=JS_NewObject(w.ctx);
@@ -653,9 +654,9 @@ int main(int argc,char**argv){
         if(received_task){jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
         /* Atomics.waitAsync settlements are tasks of their own. */
         {uint64_t at=n_clock_uptime_ms();int64_t due=web_atomics_deadline(w.ctx,at);if(due>=0&&due<=(int64_t)at){w.until=at+NJW_TASK_MS;web_atomics_run(w.ctx,at);jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}}
-        /* HTML: a new set of the user's languages is a task that switches navigator.languages
-           and fires languagechange at the global. */
-        if(w.languages_seen!=web_js_languages_generation()){w.languages_seen=web_js_languages_generation();w.until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue r=hook(&w,"languageChange",0,NULL);if(JS_IsException(r))exception(&w);JS_FreeValue(w.ctx,r);jobs(&w);continue;}
+        /* HTML NavigatorLanguage: a new set of the user's languages is one task (this worker's
+           event loop) that switches navigator.languages and fires languagechange at the global. */
+        if(w.languages_seen!=webprefs_languages_generation()){w.languages_seen=webprefs_languages_generation();w.until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue r=hook(&w,"languageChange",0,NULL);if(JS_IsException(r))exception(&w);JS_FreeValue(w.ctx,r);jobs(&w);continue;}
         JSValue now=JS_NewFloat64(w.ctx,(double)n_clock_uptime_ms());JSValue tick=hook(&w,"tick",1,&now);if(JS_IsException(tick))exception(&w);JS_FreeValue(w.ctx,tick);JS_FreeValue(w.ctx,now);jobs(&w);
     }
 shutdown:

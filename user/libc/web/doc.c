@@ -7,7 +7,7 @@
 #include "nocturne.h"
 #include "webi.h"
 #include "js_atomics.h"
-#include "js_navigator_native.h"
+#include <webprefs.h>
 #include "web_presentation.h"
 #include <webidb_async.h>
 #include <webnet.h>
@@ -1259,14 +1259,21 @@ void web_tick(web_doc *d, uint64_t now) {
     if(d->native_cancelled)return;
     TICK_STEP(d, TICK_FRAMES, web_frames_tick(d,now));
 }
+/* The window process's one queue. The first call also watches the browser's preferences in it
+   (webprefs), once for the process, before any realm reads the languages; web_wait_events hands
+   the watch's reports to webprefs, which reads the preferences again. */
 n_handle web_wait_queue(void) {
+    static bool preferences_watched;
     n_handle queue = web_atomics_queue();
-    web_js_languages_watch(queue);
+    if (queue >= 0 && !preferences_watched) {
+        preferences_watched = true;
+        (void)webprefs_watch(queue); /* without it, the first use reads the preferences once */
+    }
     return queue;
 }
 void web_wait_events(const struct n_event *events, size_t count) {
     web_atomics_events(events, count);
-    web_js_languages_events(events, count);
+    webprefs_events(events, count);
 }
 int web_wait_report(char *out, size_t size) { return web_atomics_report(out, size, uptime_ms()); }
 int64_t web_deadline(web_doc *d) {

@@ -1,7 +1,7 @@
 /* Window and Worker share the actual native HTTP identity and scheduler count.
  * Cookies remain a live Window-only host capability, not a write/read probe.
- * The languages are the user's, as the system keeps them (the same list goes
- * out as Accept-Language). HTML: navigator.languages is the same frozen array
+ * The languages are the user's, as the browser's preferences hold them (the
+ * same list goes out as Accept-Language). HTML: navigator.languages is the same frozen array
  * until the global's languagechange task begins; the realm's host calls
  * languagesChanged() there and fires the event when it returns true. */
 const navigatorBridge=(()=>{
