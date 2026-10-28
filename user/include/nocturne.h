@@ -271,19 +271,6 @@ n_result n_audio_flush(n_handle a);
 n_result n_audio_output(struct n_audio_output *io, uint32_t set);
 /* A watch on what n_audio_output reports: the volume, muting and what plays the sound. */
 n_handle n_audio_output_watch(void);
-/* The user's settings (docs/nocturne-native-abi.md §12) belong to the system: it applies a change
-   at once and keeps it; no app writes them to a file. n_user_settings_watch gives a watch
-   (N_KIND_USER_SETTINGS) on the N_USER_SETTING_* in interest: N_EVENT_RECEIVABLE while one of them
-   changed since n_user_settings_changes last took the bits that did (0: none). */
-n_handle n_user_settings_watch(uint32_t interest);
-n_result n_user_settings_changes(n_handle watch);
-/* The languages the user reads, most wanted first: BCP 47 tags, commas between ("ja,en-US"),
-   with a zero; returns the length. N_ERR_TOO_LARGE when cap has no room for them (with the zero
-   they take at most N_USER_LANGUAGES_MAX bytes). A light call, for every request that needs them. */
-n_result n_user_languages(char *out, size_t cap);
-/* Makes length bytes of list, tags between commas (spaces around them allowed), the user's
-   languages, written as n_user_languages gives them; N_ERR_INVALID when one is not a tag. */
-n_result n_user_languages_set(const char *list, size_t length);
 /* Watches (N_KIND_WATCH, docs/nocturne-native-abi.md §1): N_EVENT_RECEIVABLE once what the watch
    watches has changed, until n_watch_take takes the changes; it returns how many came since the
    last take (0: none, at most N_WATCH_CHANGES_MAX). N_EVENT_CLOSED once what it watches is no

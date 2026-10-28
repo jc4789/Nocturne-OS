@@ -13,9 +13,7 @@
 
 #define HEADER "Nocturne browser preferences 1"
 #define DOCUMENT_MAX (64u * 1024u)
-/* The default list. Whether it becomes "en-US,en" waits for the user's decision
-   (docs/settings-ownership-20261027.md, 4). */
-#define DEFAULT_LANGUAGES "en-US"
+#define DEFAULT_LANGUAGES WEBPREFS_DEFAULT_LANGUAGES
 #define ACCEPT_MAX WEBPREFS_ACCEPT_LANGUAGE_MAX
 /* What each tag after the first adds to the Accept-Language: a comma and ";q=0.N". */
 #define WEIGHT_BYTES (sizeof ",;q=0.1" - 1)

@@ -1,6 +1,6 @@
 # Nocturne の地図
 
-探す前に読み、ここに無い所だけを codegraph・grep で探す。README と docs の報告より、この表と今のコードを先に信じる。違いを見つけたらその場で直す。確かめた: 2026-10-27 `e7728bf8`。
+探す前に読み、ここに無い所だけを codegraph・grep で探す。README と docs の報告より、この表と今のコードを先に信じる。違いを見つけたらその場で直す。確かめた: 2026-10-28 `5d099ff7`。
 
 ## 置き場所（K=カーネル、L=libc、A=アプリ、P=移植・上流、H=ホストの道具）
 
@@ -8,18 +8,18 @@
 |---|---|---|
 | `kernel/src/arch/` | GDT・IDT・`isr.asm`、APIC、SMP、FPU、PAT、P ステート、S3 復帰 | K |
 | `kernel/src/mm/` | `pmm`・`vmm`（空間ごとの 4 段ページ表）・`heap` | K |
-| `kernel/src/sys/` | `proc`（ELF）、`sched`（AP の実行キュー）、`kei`（継の選択核）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`usersettings`（利用者の設定：起動時に当て直し、変更を保存し、監視へ知らせる。持ち主は wm・screenmode・audio と自身の言語）、`prof` | K |
-| `kernel/src/fs/` | C: の格納庫（`store`・`volume`・`catalog` の B+木・`namespace`・`document`）。`host/store` も同じコード | K |
+| `kernel/src/sys/` | `proc`（ELF）、`sched`（AP の実行キュー）、`kei`（継の選択核）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`watch`（見張りの共通の部品 `struct watched`、`n_watch_take`）、`keep`（システムの部品の状態の保存：持ち主の wm・audio・screenmode が自分の行を出し、`AppData\Nocturne\{Desktop,Sound,Displays}.conf` へ最後の変更の 500 ms 後に書き、init より前に読み戻す。鍵は知らない）、`prof` | K |
+| `kernel/src/fs/` | C: の格納庫（`store`・`volume`・`catalog` の B+木・`namespace`・`document`）、`watch`（C: の見張り `n_entry_watch`：名前空間の変更を volume の口から聞く）。`host/store` も同じコード（見張りの口は NULL） | K |
 | `kernel/src/dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI・USB、IOMMU、音、`fb`・fbcon、入力、timer、電源 | K |
 | `kernel/src/net/` | `net.c`（Ethernet〜TCP・DHCP・DNS）、`rtl8125.c`（実機の NIC） | K |
 | `kernel/src/gui/` | `wm.c`（窓管理と合成）、`desktop.c`、`screenmode.c` | K |
 | `kernel/src/vm/` | VM だけの処理のすべて（下の「境界」） | K |
 | `kernel/src/{boot,init}.c` | `kmain`（boot.c）→ `kmain_late`（init.c）→ `C:\Nocturne\System\init` | K |
 | `common/` | 核と libc の共有：`abi.h`、`display_abi.h`、`gpu_abi.h`、`store_format.h`、`edid.h`、`gfx.c`、Unifont | K+L |
-| `user/libc/` | ISO C と ABI の包み（`sys.c`）、`gui.c`・`ui.c`、字体・画像、`media*.c`、`net.c`・`http*.c`・`tls.c`・`webnet.c`、`webstorage.c`・`webidb*.c`・`webcookie.c`、`parallel.c` | L |
+| `user/libc/` | ISO C と ABI の包み（`sys.c`）、`gui.c`・`ui.c`、字体・画像、`media*.c`、`net.c`・`http*.c`・`tls.c`・`webnet.c`、`webstorage.c`・`webidb*.c`・`webcookie.c`、`webprefs.c`（ブラウザーの好み `AppData\Browser\preferences`：言語の一覧と検索の履歴。各プロセスが見張る）、`parallel.c` | L |
 | `user/libc/web/` | ブラウザーのエンジン（約 200 ファイル。下の「ブラウザーの流れ」） | L |
 | `user/include/` | 公開の見出し（`nocturne.h`、`web.h`、`webnet.h`、`ui.h` …）。SDK にも入る | L |
-| `user/apps/` | システムのプログラム（`browser*.c`・`webfetch.c`・`uihost.c`・`init.c`・`sh.c`・`agent.c`、`*.cpp`、`*.ts`→`System\*.js`） | A |
+| `user/apps/` | システムのプログラム（`browser*.c`（設定の窓 `browsersettings.c` を含む）・`webfetch.c`・`uihost.c`・`init.c`・`sh.c`・`agent.c`、`*.cpp`、`*.ts`→`System\*.js`） | A |
 | `ports/<名>/` | 移植の差分・設定：ffmpeg、freetype、go、lexbor、llvm、mesa（`nocturne_gl.c`）、nvidia（RM をアプリ `nvrm` にする OS 層）、rust、tcc、typescript、virgl（ホストの QEMU の DLL だけ）、wabt | P |
 | `third_party/<名>/` | 取り込んだ上流：quickjs、lexbor、bearssl・ca、ffmpeg、freetype・brotli・img、mesa、nvidia-open（615.78.08）、tinycc、wabt、uacpi、unicode・formatjs、unifont、web_streams | P |
 | `host/` | `store/store.c`（C: を作る・詰める・検査する）、`limine/` | H |
@@ -73,7 +73,7 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 - 入口 `python -X utf8 scripts/build.py -j 8 [目標]`（UCRT64 の make）。目標：`all`（img・vhd・vhdx・iso）、`qemu-image`（img だけ）、`run`、`test`・`test-quick`・`test-full`、`kernel`、`user`、`clean`。
 - 出力 `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.{img,vhd,vhdx,iso}`。C: の中身は `scripts/layout.py` → `build/c.list` → `build/host/store.exe fill`（`mkroots.py` は TLS の根の証明書で、C: とは無関係）。
 - 任意の移植は道具があるときだけ：Go `tools/go`、TypeScript `tools/TypeScript`、Rust `tools/rust`、OS の中の LLVM `tools/llvm`、NVIDIA の firmware `local/firmware/`。
-- 試験：`scripts/test.py [--quick] [--no-net] [群|群/名]`（`tests/runtests.c` の `tests[]`、114 群 224 件。例 `web/fonts`・`web/engine`・`web/javascript`）。QEMU を窓なしで起動し、`C:\Tests\autorun.sh` から tcc で組んで走らせる。結果 `build/test-serial.log`・`build/test-metadata.json`。`tests/check_*.py` はホストの検査で、まとめる runner は無い。
+- 試験：`scripts/test.py [--quick] [--no-net] [群|群/名]`（`tests/runtests.c` の `tests[]`、114 群 225 件。例 `web/fonts`・`web/engine`・`web/javascript`）。QEMU を窓なしで起動し、`C:\Tests\autorun.sh` から tcc で組んで走らせる。結果 `build/test-serial.log`・`build/test-metadata.json`。`tests/check_*.py` はホストの検査で、まとめる runner は無い。
 - 画面で確かめる：`scripts/platform_qa.py`（ラベル専用の写し、`build/nocturne-platform/<label>/`）、`scripts/qtest.py`、または手で起動した QEMU。
 
 ## 記録と道具

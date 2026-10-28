@@ -45,7 +45,8 @@
 
 /* System call numbers. A number keeps its meaning for as long as it exists, so
    programs built inside Nocturne keep working; the numbers of the first ABI's
-   calls (removed at stage 5 of docs/nocturne-native-abi.md) stay unassigned. */
+   calls (removed at stage 5 of docs/nocturne-native-abi.md) and 203-206 (the user's settings the
+   kernel kept, removed when each part came to keep its own) stay unassigned. */
 enum {
     SYS_EXIT = 0,
     SYS_SLEEP = 19, SYS_UPTIME, SYS_TIME,
@@ -133,12 +134,6 @@ enum {
     /* A display driver's monitor: the modes it can show and the one it shows (the system says
        which it wants in struct n_screen_state) */
     SYS_PCI_SCREEN_MODES,     /* (pci, const struct n_screen_modes *) */
-    /* The user's settings (docs/nocturne-native-abi.md §12): the system keeps them, applies a
-       change at once, saves it itself and tells the apps that watch */
-    SYS_USER_SETTINGS_WATCH,   /* (N_USER_SETTING_* interest): a watch, receivable when one changed */
-    SYS_USER_SETTINGS_CHANGES, /* (watch): the N_USER_SETTING_* changed since its last call, 0: none */
-    SYS_USER_LANGUAGES,        /* (char *out, cap): the list's length; the list and a zero written */
-    SYS_USER_LANGUAGES_SET,    /* (const char *list, length) */
     /* Watches (docs/nocturne-native-abi.md §1): a handle receivable once what it watches has
        changed, until SYS_WATCH_TAKE takes the count. Each call after it gives one. */
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
@@ -159,7 +154,6 @@ enum {
 #define N_KIND_CONNECTION 9
 #define N_KIND_PCI 10       /* the right to drive one PCI function */
 #define N_KIND_PAGER 11     /* the right to supply one paged memory object; never sent */
-#define N_KIND_USER_SETTINGS 12 /* a watch on the user's settings */
 #define N_KIND_WATCH 13     /* a watch (SYS_WATCH_TAKE): receivable once what it watches changed */
 
 /* SYS_ENTRY_WATCH: what is watched on C: */
@@ -167,19 +161,6 @@ enum {
 #define N_WATCH_FOLDER 2u /* every entry directly in the folder the path names */
 /* SYS_WATCH_TAKE counts up to this and stays there until the count is taken */
 #define N_WATCH_CHANGES_MAX 0xffffffffu
-
-/* The user's settings (docs/nocturne-native-abi.md §12). The system keeps them in the user's
-   AppData\Nocturne\Settings.conf, which no app writes: each change an app asks for applies at once,
-   is saved by the system, and makes every watch whose interest has it receivable. */
-#define N_USER_SETTING_LANGUAGES 1u /* the languages the user reads, most wanted first */
-#define N_USER_SETTING_POINTER 2u   /* the pointer's speed */
-#define N_USER_SETTING_DISPLAY 4u   /* smooth gradients, the mode chosen for each monitor */
-#define N_USER_SETTING_SOUND 8u     /* the volume and muting */
-#define N_USER_SETTINGS_ALL 15u
-/* n_user_languages: BCP 47 language tags (RFC 5646) in their usual case, commas between, no
-   spaces, each once, most wanted first ("ja,en-US"); never empty ("en-US" until the user says
-   otherwise). With its zero it takes at most N_USER_LANGUAGES_MAX bytes. */
-#define N_USER_LANGUAGES_MAX 1024u
 
 /* The folders of C: every app and the system know. Apps start in the user's folder, C:\Users\<name>,
    which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */

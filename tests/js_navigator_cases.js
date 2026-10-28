@@ -6,7 +6,7 @@ function runNavigatorChecks(Interface,nav,expected,worker,check){
     ck('instance',nav instanceof Interface);
     ck('tag',Object.prototype.toString.call(nav)===(worker?'[object WorkerNavigator]':'[object Navigator]'));
     let error;try{new Interface();}catch(e){error=e;}ck('illegal-constructor',error instanceof TypeError);
-    /* The user's languages as the system keeps them (expected.languages, most wanted first). */
+    /* The user's languages as the browser's preferences keep them (expected.languages, most wanted first). */
     const values={userAgent:expected.userAgent,platform:'Nocturne',language:expected.languages[0],languages:expected.languages,onLine:true,hardwareConcurrency:expected.cpus};
     if(!worker)values.cookieEnabled=expected.cookies;
     for(const [name,value]of Object.entries(values)){

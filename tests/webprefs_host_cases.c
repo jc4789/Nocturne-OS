@@ -61,6 +61,11 @@ void webprefs_test_lock_failure(const char *what) {
 #define FOLDER "C:\\Users\\User\\AppData\\Browser"
 #define DOCUMENT FOLDER "\\preferences"
 #define H "Nocturne browser preferences 1\n"
+/* The default list (webprefs.h) and its Accept-Language. */
+#define D WEBPREFS_DEFAULT_LANGUAGES
+#define DA "ja,zh;q=0.9"
+/* The default list as tags, for the cases that write it (the catalog case checks that they make D). */
+static const char *const default_tags[] = {"ja", "zh"};
 
 static srw_lock world;
 static condition world_wake;
@@ -718,12 +723,13 @@ int main(void) {
     char text[70000], expected[400];
 
     /* 目録：tag は §2.1 の形と §2.1.1 の大小、ASCII の大小を無視して一つずつ、名前は UTF-8 の文字列。
-       既定の en-US がある。一覧の長さの上限（LIST_TAGS）は二文字より短い tag が無いことに頼る。 */
+       既定の一覧の tag がある。一覧の長さの上限（LIST_TAGS）は二文字より短い tag が無いことに頼る。 */
     {
         struct process *p = fresh();
         size_t count = 0;
         const struct webprefs_language *catalog = p->catalog(&count);
-        bool forms = true, unique = true, names = true, en_us = false, short_tag = false;
+        bool forms = true, unique = true, names = true, short_tag = false;
+        size_t defaults = 0;
         for (size_t i = 0; i < count; i++) {
             const char *t = catalog[i].tag;
             if (!tag_form(t)) { forms = false; printf("失敗 目録の tag \"%s\" が §2.1 の形か §2.1.1 の大小でない\n", t); }
@@ -731,7 +737,8 @@ int main(void) {
             for (size_t k = 0; k < i; k++)
                 if (!_stricmp(catalog[k].tag, t)) unique = false;
             if (!utf8_text(catalog[i].own) || !utf8_text(catalog[i].english)) names = false;
-            if (!strcmp(t, "en-US")) en_us = true;
+            for (size_t k = 0; k < sizeof default_tags / sizeof *default_tags; k++)
+                if (!strcmp(t, default_tags[k])) defaults++;
             const char *one[] = {t};
             if (!p->fit(one, 1)) forms = false;
         }
@@ -740,7 +747,13 @@ int main(void) {
         check(forms, "目録の tag はどれも RFC 5646 §2.1 の形で §2.1.1 の大小、一つだけでも一覧になる");
         check(unique, "目録の tag は大小を無視して一つずつ");
         check(names, "目録の自分の名前と英語の名前は空でない UTF-8 の文字列");
-        check(en_us, "目録に既定の en-US がある");
+        check(defaults == sizeof default_tags / sizeof *default_tags, "目録に既定の一覧の tag が全部ある");
+        char joined[WEBPREFS_ACCEPT_LANGUAGE_MAX + 1] = "";
+        for (size_t k = 0; k < sizeof default_tags / sizeof *default_tags; k++) {
+            if (k) strcat(joined, ",");
+            strcat(joined, default_tags[k]);
+        }
+        check(!strcmp(joined, D), "試験の既定の tag は webprefs.h の既定の一覧と同じ");
         check(!short_tag, "目録に二文字より短い tag が無い");
         settled("目録");
     }
@@ -754,8 +767,8 @@ int main(void) {
         long w = first_note("watch"), e = first_note("events-watch"), o = first_note("open-read");
         check(r == 0, "文書が無くても見張りを置ける");
         check(w >= 0 && e > w && o > e, "見張りを置いて待ち行列に登録してから文書を読む");
-        check(!strcmp(langs(p), "en-US") && !strcmp(accept(p), "en-US") && !p->search_history() && p->languages_default(),
-              "文書が無ければ言語は en-US、検索の履歴は off、言語は既定");
+        check(!strcmp(langs(p), D) && !strcmp(accept(p), DA) && !p->search_history() && p->languages_default(),
+              "文書が無ければ言語は既定の " D "、検索の履歴は off");
         p->sync();
         check(!noted("open-edit") && !noted("open-create") && !noted("save") && !strcmp(document(), "<文書なし>"),
               "読むだけでは文書を作らず書かない");
@@ -795,11 +808,11 @@ int main(void) {
             bool before = !strcmp(langs(p), "ja") && p->search_history();
             put(wrong[i]);
             deliver(p);
-            checkf(before && !strcmp(langs(p), "en-US") && !p->search_history(), "最初の行が違う文書（%zu 番）は全部が既定", i);
+            checkf(before && !strcmp(langs(p), D) && !p->search_history(), "最初の行が違う文書（%zu 番）は全部が既定", i);
         }
         put("Nocturne browser preferences 1");
         deliver(p);
-        check(!strcmp(langs(p), "en-US"), "最初の行だけで改行の無い文書は正しく、全部が既定");
+        check(!strcmp(langs(p), D), "最初の行だけで改行の無い文書は正しく、全部が既定");
         put(H "languages=ja");
         deliver(p);
         check(!strcmp(langs(p), "ja"), "最後の行に改行が無くても読む");
@@ -811,11 +824,11 @@ int main(void) {
     {
         struct process *p = watching();
         static const struct { const char *document, *languages; bool history; const char *label; } bad[] = {
-            {H "languages=\nsearch-history=on\n", "en-US", true, "空の言語の一覧は既定、検索の履歴はそのまま"},
+            {H "languages=\nsearch-history=on\n", D, true, "空の言語の一覧は既定、検索の履歴はそのまま"},
             {H "languages=ja\nsearch-history=yes\n", "ja", false, "検索の履歴の不正な値は既定（off）、言語はそのまま"},
             {H "languages=ja\nsearch-history=On\n", "ja", false, "検索の履歴の値は on・off の小文字だけ"},
-            {H "languages=ja\r\nsearch-history=on\r\n", "en-US", false, "CR の付いた値は不正"},
-            {H "languages=xx,qq-ZZ\nsearch-history=on\n", "en-US", true, "目録の tag が一つも無ければ既定"},
+            {H "languages=ja\r\nsearch-history=on\r\n", D, false, "CR の付いた値は不正"},
+            {H "languages=xx,qq-ZZ\nsearch-history=on\n", D, true, "目録の tag が一つも無ければ既定"},
             {H "languages=fr\nlanguages=de\nsearch-history=on\nsearch-history=off\n", "fr", true, "同じ名前の行は最初のものが効く"},
             {H "languages=ja\nsearch-history\n", "ja", false, "= の無い行は知らない行"},
             {H "Languages=fr\nlanguages=it\n", "it", false, "名前は小文字だけで、大文字の名前は知らない行"},
@@ -844,7 +857,7 @@ int main(void) {
         check(!strcmp(langs(p), "ja"), "目録に無い tag（正しい形でも）は捨て、空の項目は数えない");
         put(H "languages=tlh,x-klingon\n");
         deliver(p);
-        check(!strcmp(langs(p), "en-US") && p->languages_default(), "目録の tag が残らなければ既定");
+        check(!strcmp(langs(p), D) && p->languages_default(), "目録の tag が残らなければ既定");
         const char *upper[] = {"JA", "Es-419"};
         check(p->set_languages(upper, 2) == 0 && strstr(document(), "\nlanguages=ja,es-419\n") && !strcmp(langs(p), "ja,es-419"),
               "大文字で渡しても目録の形で書く");
@@ -935,7 +948,7 @@ int main(void) {
               "無い項目の行は末尾に足す");
         check(p->reset_languages() == 0 &&
               !strcmp(document(), H "# a comment\nzoom=150\n\nLanguages=fr\nfuture-thing=1\nlast-no-lf\nsearch-history=on\n") &&
-              !strcmp(langs(p), "en-US") && p->languages_default(),
+              !strcmp(langs(p), D) && p->languages_default(),
               "既定に戻すと言語の行だけを除き、既定が効く");
         unsigned before = saved();
         check(p->reset_languages() == 0 && saved() == before, "変わらない変更は保存しない");
@@ -957,7 +970,7 @@ int main(void) {
         text[65536] = '\n';
         put_bytes(text, 65537);
         deliver(p);
-        check(!strcmp(langs(p), "en-US"), "64 KiB を越える文書はこの版の文書でなく、全部が既定");
+        check(!strcmp(langs(p), D), "64 KiB を越える文書はこの版の文書でなく、全部が既定");
         check(p->set_search_history(true) == 0 && !strcmp(document(), H "search-history=on\n"), "それへ書くときは始め直す");
         /* 短い読みでも全部を読む。 */
         put(H "languages=ko,ja\nsearch-history=on\n");
@@ -982,8 +995,9 @@ int main(void) {
         check(a->set_search_history(false) == 0 && !strcmp(document(), H "search-history=off\n") && !a->search_history(), "off を書く");
         check(deliver(b) == 1 && !b->search_history(), "off も届く");
         check(b->languages_default(), "言語の行が無ければ既定");
-        const char *en_us[] = {"en-US"}, *ja[] = {"ja"};
-        check(b->set_languages(en_us, 1) == 0 && b->languages_default() && strstr(document(), "languages=en-US\n"), "既定と同じ tag の行も既定");
+        const char *ja[] = {"ja"};
+        check(b->set_languages(default_tags, sizeof default_tags / sizeof *default_tags) == 0 && b->languages_default() &&
+              strstr(document(), "languages=" D "\n"), "既定と同じ tag の行も既定");
         check(b->set_languages(ja, 1) == 0 && !b->languages_default(), "違う一覧は既定でない");
         deliver(a);
         check(!a->languages_default() && a->reset_languages() == 0 && a->languages_default(), "既定に戻すと既定");
@@ -1058,14 +1072,15 @@ int main(void) {
     {
         struct process *a = watching(), *b = watching(), *n = NULL;
         check(a->generation() == 0 && !strcmp(langs(a), "ja"), "最初の読みでは世代は進まない（読む前に誰も一覧を受け取っていない）");
-        const char *ko[] = {"ko"}, *ko_upper[] = {"KO"}, *en_us[] = {"en-US"}, *de[] = {"de"}, *it[] = {"it"};
+        const char *ko[] = {"ko"}, *ko_upper[] = {"KO"}, *de[] = {"de"}, *it[] = {"it"};
         check(b->set_search_history(true) == 0 && deliver(a) == 1 && a->generation() == 0, "検索の履歴だけの変化では進まない");
         check(b->set_languages(ko, 1) == 0 && deliver(a) == 1 && a->generation() == 1 && !strcmp(langs(a), "ko"), "一覧が変われば一つ進む");
         unsigned before = saved();
         check(b->set_languages(ko_upper, 1) == 0 && saved() == before && deliver(a) == 0 && a->generation() == 1, "同じ一覧の変更は保存せず、知らせも無く、進まない");
-        check(b->reset_languages() == 0 && deliver(a) == 1 && a->generation() == 2 && !strcmp(langs(a), "en-US"), "既定に戻れば進む");
-        check(b->set_languages(en_us, 1) == 0 && deliver(a) == 1 && a->generation() == 2, "既定と同じ一覧を書いても一覧は同じなので進まない");
-        put(H "languages=en-US\nsearch-history=on\n");
+        check(b->reset_languages() == 0 && deliver(a) == 1 && a->generation() == 2 && !strcmp(langs(a), D), "既定に戻れば進む");
+        check(b->set_languages(default_tags, sizeof default_tags / sizeof *default_tags) == 0 && deliver(a) == 1 &&
+              a->generation() == 2, "既定と同じ一覧を書いても一覧は同じなので進まない");
+        put(H "languages=" D "\nsearch-history=on\n");
         check(deliver(a) == 1 && a->generation() == 2, "同じ中身の保存でも進まない");
         check(a->set_languages(de, 1) == 0 && a->generation() == 3, "自分の変更はすぐに一つ進む");
         check(deliver(a) == 1 && a->generation() == 3, "自分の保存の知らせでは進まない");
@@ -1138,7 +1153,7 @@ int main(void) {
         leave();
         struct process *p = watching();
         const char *ja[] = {"ja"};
-        check(!strcmp(langs(p), "en-US") && p->set_languages(ja, 1) == -N_ERR_IS_FOLDER, "preferences がフォルダーなら既定で、書けない");
+        check(!strcmp(langs(p), D) && p->set_languages(ja, 1) == -N_ERR_IS_FOLDER, "preferences がフォルダーなら既定で、書けない");
         enter();
         document_is_folder = false;
         leave();
@@ -1152,7 +1167,7 @@ int main(void) {
         struct process *a = watching(), *b = fresh();
         check(!strcmp(langs(a), "ja"), "A が読む");
         drop_folder();
-        check(deliver(a) == 1 && !strcmp(langs(a), "en-US") && a->generation() == 1, "フォルダーが除かれると見張りが閉じ、全部が既定");
+        check(deliver(a) == 1 && !strcmp(langs(a), D) && a->generation() == 1, "フォルダーが除かれると見張りが閉じ、全部が既定");
         check(registered(a->queue) == 0, "閉じた見張りは待ち行列から外す");
         const char *fr[] = {"fr"}, *it[] = {"it"};
         notes_clear();
@@ -1218,7 +1233,7 @@ int main(void) {
     /* 言語を書く・既定に戻す：失敗なら文書も状態も前のまま、成功なら新しい中身。 */
     static const struct { const char *base, *goal, *before, *after; int what; const char *label; } edits[] = {
         {H "languages=fr\nsearch-history=on\nkeep=1\n", H "languages=ja,en\nsearch-history=on\nkeep=1\n", "fr", "ja,en", 0, "言語を書く"},
-        {H "languages=fr\nsearch-history=on\nkeep=1\n", H "search-history=on\nkeep=1\n", "fr", "en-US", 1, "既定に戻す"},
+        {H "languages=fr\nsearch-history=on\nkeep=1\n", H "search-history=on\nkeep=1\n", "fr", D, 1, "既定に戻す"},
     };
     for (size_t e = 0; e < sizeof edits / sizeof *edits; e++) {
         world_reset();

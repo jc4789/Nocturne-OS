@@ -14,6 +14,9 @@
 
 #define WEBPREFS_TOKEN (UINT64_C(0x4c) << 56) /* the watch's token in a process's queue */
 #define WEBPREFS_ACCEPT_LANGUAGE_MAX 128u    /* a CORS-safelisted value's bytes (Fetch) */
+/* The languages while the document has no languages line: Japanese, then Chinese (the user's
+   choice, 2026-10-28). Catalog tags, commas between. */
+#define WEBPREFS_DEFAULT_LANGUAGES "ja,zh"
 
 /* A language the Settings window offers: a valid BCP 47 tag (RFC 5646, registered subtags) in its
    usual case (§2.1.1), its own name, its name in English. The list holds only these. */

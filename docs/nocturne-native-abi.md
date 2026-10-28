@@ -795,8 +795,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 旧番号を使って作ったプログラムは作り直しが要る。カーネルが利用者の設定を持った a51c4398 の
 203〜206（`SYS_USER_SETTINGS_WATCH`、`SYS_USER_SETTINGS_CHANGES`、`SYS_USER_LANGUAGES`、
 `SYS_USER_LANGUAGES_SET`）とハンドルの種類 12（`N_KIND_USER_SETTINGS`）も、設定の持ち主の作り直し
-（`docs/settings-ownership-20261027.md`：値を効かせる者が自分の文書に保存する）で欠番にした。使い手が
-全部離れた後に振り分けと宣言を消し、番号は再利用しない。新たに加えたもの：
+（`docs/settings-ownership-20261027.md`：値を効かせる者が自分の文書に保存する）で欠番にした。振り分けと
+宣言は消してあり（カーネルは `N_ERR_UNSUPPORTED` を返す）、番号は再利用しない。新たに加えたもの：
 
 - `SYS_WIN_RECEIVE`（窓、`struct gui_event *out`、最大数、`timeout_ms`）：待ち行列から
   入るだけ一度に受け取る。件数、期限で0、閉じた窓が最後のイベントを渡し終えると
