@@ -716,6 +716,7 @@ bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* css-easing-1 §2: the output progress for input x; before: the before flag of step easing */
 double css_easing_apply(const struct css_easing *e, double x, bool before);
 bool css_easing_serialize(const struct css_easing *e, sbuf *out);
+bool css_easing_same(const struct css_easing *a, const struct css_easing *b); /* the same function, keyword and all */
 /* list's item i, the list repeating (CSS Animations 1 §3: excess values are not used, missing ones
    repeat the list); the initial value when the list is NULL */
 union css_motion_item css_motion_item(const style_t *st, int list, uint32_t i);

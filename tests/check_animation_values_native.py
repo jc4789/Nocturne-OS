@@ -21,6 +21,8 @@ bool web_native_checkpoint(web_doc *d){(void)d;return true;}
 void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]){(void)t;(void)w;(void)h;memset(m,0,16*sizeof *m);m[0]=m[5]=m[10]=m[15]=1;}
 /* layout.c's, reached only from Geometry's matrix strings */
 void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]){(void)t;(void)m;abort();}
+/* web_url.c's (Lexbor's URL parser): CSS url() resolution, not reached by these values */
+int web_resolve_url_owned(const char *base,const char *rel,char **out){(void)base;(void)rel;(void)out;abort();}
 static int checks,failed;
 static void check(bool ok,const char *name,const char *got){checks++;if(!ok){failed++;printf("FAIL animation-values %s: %s\n",name,got?got:"(null)");}}
 static style_t parent,base;

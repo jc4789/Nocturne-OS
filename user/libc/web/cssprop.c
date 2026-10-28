@@ -2518,6 +2518,10 @@ bool css_easing_serialize(const struct css_easing *e,sbuf *out) {
     else snprintf(text,sizeof text,"cubic-bezier(%.7g, %.7g, %.7g, %.7g)",(double)e->x1,(double)e->y1,(double)e->x2,(double)e->y2);
     sb_puts(out,text);return true;
 }
+bool css_easing_same(const struct css_easing *a, const struct css_easing *b) {
+    return a->kind == b->kind && a->x1 == b->x1 && a->y1 == b->y1 && a->x2 == b->x2 && a->y2 == b->y2 &&
+        a->steps == b->steps && a->position == b->position && a->keyword == b->keyword;
+}
 static union css_motion_item motion_initial(int list) {
     union css_motion_item v;
     memset(&v, 0, sizeof v);
@@ -2537,9 +2541,7 @@ uint32_t css_motion_count(const style_t *st, int list) {
 static bool motion_item_equal(int list, union css_motion_item a, union css_motion_item b) {
     switch (list) {
     case ML_NAME: case ML_TPROPERTY: return a.s == b.s || (a.s && b.s && !strcmp(a.s, b.s));
-    case ML_EASING: case ML_TEASING:
-        return a.e.kind == b.e.kind && a.e.x1 == b.e.x1 && a.e.y1 == b.e.y1 && a.e.x2 == b.e.x2 && a.e.y2 == b.e.y2 &&
-            a.e.steps == b.e.steps && a.e.position == b.e.position && a.e.keyword == b.e.keyword;
+    case ML_EASING: case ML_TEASING: return css_easing_same(&a.e, &b.e);
     case ML_DURATION: case ML_DELAY: case ML_ITERATIONS: case ML_TDURATION: case ML_TDELAY:
         return a.f == b.f || (isnan(a.f) && isnan(b.f));
     }
