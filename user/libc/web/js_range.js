@@ -306,13 +306,75 @@ const rangeBridge = (() => {
     for(const [k,v] of [['START_TO_START',0],['START_TO_END',1],['END_TO_END',2],['END_TO_START',3]])
         for(const target of [Range,Range.prototype])Object.defineProperty(target,k,{value:v,enumerable:true});
     for(const k of ['deleteContents','extractContents'])Object.defineProperty(Range.prototype,k,{enumerable:true});
-    for(const k of ['getClientRects','getBoundingClientRect'])
-        Object.defineProperty(Range.prototype,k,{enumerable:true,configurable:true,writable:true,value:function(){data(this);
-            throw new DOMException('Range '+k+' is not implemented','NotSupportedError');
-        }});
-    for(const C of [AbstractRange,Range,StaticRange])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
+    // CSSOM View §9: the border boxes of the range's topmost selected elements and the
+    // selected part of each of its Text nodes, read from the line layout natively.
+    const rects=(start,end,fragments)=>rawDom.rangeRects(start[0],start[1],end[0],end[1],fragments);
+    Object.defineProperties(Range.prototype,{
+        getClientRects:{enumerable:true,configurable:true,writable:true,value:function getClientRects(){
+            const d=data(this);return observerBridge.clientRects(rects(d.start,d.end,true));}},
+        getBoundingClientRect:{enumerable:true,configurable:true,writable:true,value:function getBoundingClientRect(){
+            const d=data(this);return observerBridge.clientBoundingRect(rects(d.start,d.end,false));}},
+    });
+    // CSSOM View §5: a caret position is a boundary point taken once, not a live range.
+    const caretStates=new WeakMap(),caretToken={};
+    function caret(p){const c=caretStates.get(p);if(!c)throw new TypeError('Illegal CaretPosition receiver');return c;}
+    class CaretPosition {
+        constructor(token){if(token!==caretToken)throw new TypeError('Illegal constructor');}
+        get offsetNode(){return caret(this).node;}
+        get offset(){return caret(this).offset;}
+        getClientRect(){
+            const c=caret(this);
+            // A rendered text entry widget's own caret; else the collapsed range's bounding box.
+            const value=rawDom.caretRect(c.node,c.offset)||rects([c.node,c.offset],[c.node,c.offset],false);
+            return observerBridge.clientBoundingRect(value);
+        }
+    }
+    const shadowHost=n=>get(n,'nodeType')===11?get(n,'shadowHost'):null;
+    function shadowIncludingInclusiveAncestor(a,n){
+        for(;n;n=parent(n)||shadowHost(n))if(n===a)return true;
+        return false;
+    }
+    function shadowRootList(value){
+        // Web IDL sequence<ShadowRoot>: an iterable object of ShadowRoot platform objects.
+        if(value===null || typeof value!=='object' && typeof value!=='function')throw new TypeError('shadowRoots must be a sequence');
+        const method=value[Symbol.iterator];
+        if(typeof method!=='function')throw new TypeError('shadowRoots must be iterable');
+        const list=[];
+        for(const item of {[Symbol.iterator]:()=>apply(method,value,[])}){
+            if(!rawDom.isNode(null,item) || !shadowHost(item))throw new TypeError('shadowRoots must hold ShadowRoot objects');
+            list.push(item);
+        }
+        return list;
+    }
+    Document.prototype.caretPositionFromPoint=function caretPositionFromPoint(x,y){
+        documentBridge.brand(this);
+        if(arguments.length<2)throw new TypeError('Two coordinates required');
+        x=+x;if(!Number.isFinite(x))throw new TypeError('The x coordinate is not a finite number');
+        y=+y;if(!Number.isFinite(y))throw new TypeError('The y coordinate is not a finite number');
+        const options=arguments[2];let shadowRoots=[];
+        if(options!==undefined && options!==null){
+            if(typeof options!=='object' && typeof options!=='function')throw new TypeError('CaretPositionFromPointOptions must be an object');
+            const value=options.shadowRoots;
+            if(value!==undefined)shadowRoots=shadowRootList(value);
+        }
+        const found=rawDom.caretPosition(this,x,y);
+        if(!found)return null;
+        let [node,offset]=found;
+        // A position in a shadow tree none of shadowRoots lies in moves out to its host.
+        for(;;){
+            const r=root(node),host=shadowHost(r);
+            if(!host || shadowRoots.some(s=>shadowIncludingInclusiveAncestor(r,s)))break;
+            const p=parent(host);
+            if(!p)return null;
+            offset=children(p).indexOf(host);node=p;
+        }
+        const position=new CaretPosition(caretToken);
+        caretStates.set(position,{node,offset});
+        return position;
+    };
+    for(const C of [AbstractRange,Range,StaticRange,CaretPosition])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     Document.prototype.createRange=function(){documentBridge.brand(this);return make({start:[this,0],end:[this,0]});};
-    Object.assign(globalThis,{AbstractRange,Range,StaticRange});
+    Object.assign(globalThis,{AbstractRange,Range,StaticRange,CaretPosition});
 
     function capture(){
         const a=[];for(const ref of live){const r=apply(deref,ref,[]);if(!r){live.delete(ref);continue;}
