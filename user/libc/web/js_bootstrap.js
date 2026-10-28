@@ -820,7 +820,7 @@
             namespace=namespace==null?null:String(namespace);localName=String(localName);
             return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,namespace===''?null:namespace,localName,true));
         }
-        getElementsByClassName(names) { const query=String(names).trim().split(/\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query?dom('query',this,query,false):[]); }
+        getElementsByClassName(names) { /* DOM: the names are an ordered set, split on ASCII whitespace only */ const query=String(names).split(/[\t\n\f\r ]+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query?dom('query',this,query,false):[]); }
         getBoundingClientRect() { rawDom.get(this,'elementBrand');return observerBridge.clientBoundingRect(dom('rect',this)); }
         getClientRects() { return observerBridge.clientRects(dom('rect',this,true)); }
         get clientWidth() { return dom('geometry',this,'clientWidth'); }

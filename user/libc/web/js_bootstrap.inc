@@ -1041,7 +1041,7 @@ static const char js_bootstrap[] =
 "            namespace=namespace==null\?null:String(namespace);localName=String(localName);\n"
 "            return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,namespace===''\?null:namespace,localName,true));\n"
 "        }\n"
-"        getElementsByClassName(names) { const query=String(names).trim().split(/\\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query\?dom('query',this,query,false):[]); }\n"
+"        getElementsByClassName(names) { /* DOM: the names are an ordered set, split on ASCII whitespace only */ const query=String(names).split(/[\\t\\n\\f\\r ]+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query\?dom('query',this,query,false):[]); }\n"
 "        getBoundingClientRect() { rawDom.get(this,'elementBrand');return observerBridge.clientBoundingRect(dom('rect',this)); }\n"
 "        getClientRects() { return observerBridge.clientRects(dom('rect',this,true)); }\n"
 "        get clientWidth() { return dom('geometry',this,'clientWidth'); }\n"
