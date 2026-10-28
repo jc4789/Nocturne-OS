@@ -397,7 +397,17 @@ static struct cexpr *calc_value(const char **s, const char *e, struct cx *cx) {
     const char *u = *s;
     while (*s < e && (isalpha((unsigned char)**s) || **s == '%')) (*s)++;
     struct cexpr *x = cnode(cx, 'v', NULL, NULL);
-    if (!css_unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
+    size_t un = (size_t)(*s - u);
+    if (cx->time) {
+        /* a <time> calculation: numbers and times, no lengths or percentages */
+        x->num = !un;
+        if (!un) x->px = v;
+        else if (un == 1 && (u[0] | 32) == 's') x->px = v * 1000;
+        else if (un == 2 && (u[0] | 32) == 'm' && (u[1] | 32) == 's') x->px = v;
+        else return NULL;
+        return x;
+    }
+    if (!css_unit_px(u, un, v, cx, &x->px, &x->pct, &x->num)) return NULL;
     return x;
 }
 
@@ -1488,6 +1498,9 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return false;
     trim(&v, &n);
+    /* a CSS-wide keyword serializes as itself */
+    if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
+        ident_is(v, n, "revert-layer")) return false;
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
     if (p->type != PT_COLOR_SCHEME) return false;
     arena_t a = {.chunk_size = 1024};
@@ -2422,12 +2435,26 @@ static bool motion_name(const char *s, size_t n) {
         s[i]!='_' && s[i]!='-') return false;
     return true;
 }
-static bool motion_time(const char *s,size_t n,float *out) {
+/* a <time> in milliseconds, or a math function of type <time> (CSS Values 4 §10); duration: it
+   may not be negative, which a calculation clamps to 0 (§10.12) and a literal is invalid */
+static bool motion_time(const char *s,size_t n,struct cx *cx,bool duration,float *out) {
     const char *p=s;float v;
+    if (n && isalpha((unsigned char)s[0])) {
+        bool outer=cx->time;
+        cx->time=true;
+        struct cexpr *x=calc_value(&p,s+n,cx);
+        cskip(&p,s+n);
+        cx->time=outer;
+        bool number;float ms,pct;
+        if (!x || p!=s+n || (cx->supports_probe && cx->invalid) || !calc_dimension(x,&number) || number ||
+            !cfold(x,&number,&ms,&pct) || number || pct || isnan(ms)) return false;
+        if (duration && ms<0) ms=0;
+        *out=ms;return true;
+    }
     if (!parse_number(&p,s+n,&v) || !isfinite(v)) return false;
     if (s+n-p==1 && (*p|32)=='s') v*=1000;
     else if (s+n-p!=2 || (p[0]|32)!='m' || (p[1]|32)!='s') return false;
-    if (!isfinite(v)) return false;
+    if (!isfinite(v) || (duration && v<0)) return false;
     *out=v;return true;
 }
 /* <easing-function> (css-easing-1 §2): linear, the cubic-bezier() keywords and function,
@@ -2518,6 +2545,10 @@ bool css_easing_serialize(const struct css_easing *e,sbuf *out) {
     else snprintf(text,sizeof text,"cubic-bezier(%.7g, %.7g, %.7g, %.7g)",(double)e->x1,(double)e->y1,(double)e->x2,(double)e->y2);
     sb_puts(out,text);return true;
 }
+bool css_easing_same(const struct css_easing *a, const struct css_easing *b) {
+    return a->kind == b->kind && a->x1 == b->x1 && a->y1 == b->y1 && a->x2 == b->x2 && a->y2 == b->y2 &&
+        a->steps == b->steps && a->position == b->position && a->keyword == b->keyword;
+}
 static union css_motion_item motion_initial(int list) {
     union css_motion_item v;
     memset(&v, 0, sizeof v);
@@ -2537,9 +2568,7 @@ uint32_t css_motion_count(const style_t *st, int list) {
 static bool motion_item_equal(int list, union css_motion_item a, union css_motion_item b) {
     switch (list) {
     case ML_NAME: case ML_TPROPERTY: return a.s == b.s || (a.s && b.s && !strcmp(a.s, b.s));
-    case ML_EASING: case ML_TEASING:
-        return a.e.kind == b.e.kind && a.e.x1 == b.e.x1 && a.e.y1 == b.e.y1 && a.e.x2 == b.e.x2 && a.e.y2 == b.e.y2 &&
-            a.e.steps == b.e.steps && a.e.position == b.e.position && a.e.keyword == b.e.keyword;
+    case ML_EASING: case ML_TEASING: return css_easing_same(&a.e, &b.e);
     case ML_DURATION: case ML_DELAY: case ML_ITERATIONS: case ML_TDURATION: case ML_TDELAY:
         return a.f == b.f || (isnan(a.f) && isnan(b.f));
     }
@@ -2568,18 +2597,21 @@ static bool motion_item_parse(int list, const struct kw *kws, const char *s, siz
     case ML_NAME:
         if (ident_is(s, n, "none")) { out->s = NULL; return true; }
         if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) {
+            /* <keyframes-name>: a <string>, not the empty one */
             sbuf b = {0}; css_unescape(&b, s + 1, n - 2);
-            out->s = ar_strdup(cx->a, b.n ? sb_cstr(&b) : ""); sb_free(&b);
-            return true;
+            bool named = b.n != 0;
+            if (named) out->s = ar_strdup(cx->a, sb_cstr(&b));
+            sb_free(&b);
+            return named;
         }
         if (!motion_name(s, n)) return false;
         out->s = ar_strndup(cx->a, s, n);
         return true;
     case ML_DURATION:
         if (ident_is(s, n, "auto")) { out->f = NAN; return true; }
-        return motion_time(s, n, &out->f) && out->f >= 0;
-    case ML_TDURATION: return motion_time(s, n, &out->f) && out->f >= 0;
-    case ML_DELAY: case ML_TDELAY: return motion_time(s, n, &out->f);
+        return motion_time(s, n, cx, true, &out->f);
+    case ML_TDURATION: return motion_time(s, n, cx, true, &out->f);
+    case ML_DELAY: case ML_TDELAY: return motion_time(s, n, cx, false, &out->f);
     case ML_EASING: case ML_TEASING: return css_easing_parse(s, n, &out->e);
     case ML_ITERATIONS:
         if (ident_is(s, n, "infinite")) { out->f = INFINITY; return true; }
@@ -2653,7 +2685,7 @@ static bool animation_single(const char *s, size_t n, struct cx *cx, union css_m
     for (int i = 0; i < k; i++) {
         union css_motion_item item;
         if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
-            if (times == 0) { if (item.f < 0) return false; v[ML_DURATION] = item; }
+            if (times == 0) { if (!motion_time(t[i], tl[i], cx, true, &item.f)) return false; v[ML_DURATION] = item; }
             else if (times == 1) v[ML_DELAY] = item;
             else return false;
             times++; continue;
@@ -2680,7 +2712,7 @@ static bool transition_single(const char *s, size_t n, struct cx *cx, union css_
     for (int i = 0; i < k; i++) {
         union css_motion_item item;
         if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
-            if (times == 0) { if (item.f < 0) return false; v[ML_TDURATION] = item; }
+            if (times == 0) { if (!motion_time(t[i], tl[i], cx, true, &item.f)) return false; v[ML_TDURATION] = item; }
             else if (times == 1) v[ML_TDELAY] = item;
             else return false;
             times++; continue;
@@ -3980,15 +4012,18 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
 void css_style_finish(style_t *s, const style_t *parent, bool root) {
     if (s->color == COLOR_CURRENT) s->color = parent ? parent->color : 0xFF000000u;
     css_color_finish(s);
-    if (s->bg_color == COLOR_CURRENT) s->bg_color = s->color;
+    if (s->bg_color == COLOR_CURRENT) { s->bg_color = s->color; s->color_current |= 1u << CSS_SLOT_BACKGROUND; }
     for (struct css_box_shadow *shadow = (struct css_box_shadow *)s->box_shadow; shadow; shadow = shadow->next)
         if (shadow->color == COLOR_CURRENT)
             shadow->color = shadow->color_value ? css_color_value_argb(shadow->color_value, s->color) : s->color;
     for (int i = 0; i < 4; i++) {
-        if (s->border_color[i] == COLOR_CURRENT) s->border_color[i] = s->color;
+        if (s->border_color[i] == COLOR_CURRENT) {
+            s->border_color[i] = s->color;
+            s->color_current |= (uint16_t)(1u << (CSS_SLOT_BORDER_TOP + i));
+        }
         if (s->border_style[i] == BS_NONE || s->border_style[i] == BS_HIDDEN) s->border_width[i] = 0;
     }
-    if (s->outline_color == COLOR_CURRENT) s->outline_color = s->color;
+    if (s->outline_color == COLOR_CURRENT) { s->outline_color = s->color; s->color_current |= 1u << CSS_SLOT_OUTLINE; }
     if (s->outline_style == BS_NONE) s->outline_width = 0;
     if (s->has_grad) {
         const struct gradient *g = s->gradient;

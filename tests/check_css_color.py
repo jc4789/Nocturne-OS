@@ -21,7 +21,8 @@ import sys
 root = Path(__file__).resolve().parent.parent
 wpt = Path("D:/Programes/cloned repos/wpt/css")
 pages = (sorted((wpt / "css-color/parsing").glob("*.html")) + sorted((wpt / "css-color-adjust/parsing").glob("color-scheme-*.html")) +
-         [wpt / "css-color/color-mix-missing-components.html", wpt / "css-color/animation/color-interpolation.html"])
+         [wpt / "css-color/color-mix-missing-components.html", wpt / "css-color/animation/color-interpolation.html",
+          wpt / "css-values/percentage-without-context.html"])
 out = root / "build/check-css-color"
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)
@@ -186,9 +187,6 @@ for path in pages:
         elif "var(" in value:
             skipped["var()"] = skipped.get("var()", 0) + 1
             continue  # the CSSOM keeps a value with var() as written: not the colour owner's
-        elif value.strip().lower() in ("inherit", "initial", "unset", "revert", "revert-layer"):
-            skipped["CSS 全体の語"] = skipped.get("CSS 全体の語", 0) + 1
-            continue  # the CSSOM keeps them as written: not the colour owner's
         else:
             request = ("S", prop, value)
         cases.append((path.name, kind, prop, value, request, None if kind == "invalid" else args[2],

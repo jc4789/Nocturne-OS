@@ -519,6 +519,9 @@ typedef struct style {
        css_color_slot, the inherited ones and the element's own. NULL when no
        slot needs one; shared and never written, copied on change. */
     const struct css_color_value *const *color_inherited, *const *color_own;
+    /* per enum css_color_slot: the computed value is currentcolor and the 8-bit field holds what
+       css_style_finish resolved it to (CSS Color 4 §4.4: currentcolor computes to itself) */
+    uint16_t color_current;
     uint8_t color_scheme; /* CSS_SCHEME_* of color-scheme; 0: normal */
     const char *color_scheme_text; /* its computed value; NULL: normal */
     struct svg_paint svg_fill, svg_stroke;
@@ -716,6 +719,7 @@ bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* css-easing-1 §2: the output progress for input x; before: the before flag of step easing */
 double css_easing_apply(const struct css_easing *e, double x, bool before);
 bool css_easing_serialize(const struct css_easing *e, sbuf *out);
+bool css_easing_same(const struct css_easing *a, const struct css_easing *b); /* the same function, keyword and all */
 /* list's item i, the list repeating (CSS Animations 1 §3: excess values are not used, missing ones
    repeat the list); the initial value when the list is NULL */
 union css_motion_item css_motion_item(const style_t *st, int list, uint32_t i);
@@ -832,6 +836,7 @@ struct cx {
     float cq_width, cq_height;
     bool cq_width_set, cq_height_set;
     bool absolute_lengths; /* relative lengths and percentages fail (Geometry's matrix strings) */
+    bool time;             /* calc() takes <time> (s, ms; in milliseconds where it takes lengths) */
     bool computed_text;    /* the value is computed-value text the animation layer wrote (css_anim_parse):
                               what a style sheet's parse clamps (rgb()'s components) keeps its value */
 };

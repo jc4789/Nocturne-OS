@@ -803,6 +803,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
         ws->padding[i].px = ws->padding[i].pct = 0;
     }
     ws->bg_color = 0;
+    ws->color_current &= (uint16_t)~(1u << CSS_SLOT_BACKGROUND);
     ws->bg_image = NULL;
     ws->has_grad = false;
     ws->gradient = NULL;
@@ -1656,7 +1657,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
             next.border_width[i]=0;
             next.padding[i].kind=LK_LEN; next.padding[i].px=next.padding[i].pct=0;
         }
-        next.bg_color=0; next.bg_image=NULL; next.has_grad=false; next.gradient=NULL;
+        next.bg_color=0; next.color_current&=(uint16_t)~(1u<<CSS_SLOT_BACKGROUND); next.bg_image=NULL; next.has_grad=false; next.gradient=NULL;
         next.box_shadow=NULL;
         next.border_radius=0;memset(next.corner_radius,0,sizeof next.corner_radius);
         next.width.kind=next.height.kind=LK_AUTO;
