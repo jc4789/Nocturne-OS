@@ -22,6 +22,11 @@ static web_doc *load_html(const char *html) {
     if(d) { d->profile_enabled=true; parallel_profile_enable(true); for(int i=0;i<8;i++)web_tick(d,uptime_ms()); }
     return d;
 }
+/* a computed content of one string, text */
+static bool content_is(const style_t *st,const char *text) {
+    const struct css_content *c=st?st->content:NULL;
+    return c && !c->none && c->n==1 && c->item[0].kind==CSS_CONTENT_STRING && !strcmp(c->item[0].text,text);
+}
 static web_doc *load(void) {
     return load_html("<!doctype html><html><head></head><body></body></html>");
 }
@@ -167,7 +172,8 @@ static void derived_styles(void) {
         outer->st->font_names==wrap->style->font_names && inner->st->vars==wrap->style->vars,
         "wrapper copies borrow current computed arena");
     check(legend && legend->st->color==0xff0000ffu && legend->st->font_names==details->style->font_names &&
-        legend->st->vars==details->style->vars && legend->st->list_style==LS_STRING,
+        legend->st->vars==details->style->vars && legend->st->list_style==LS_DISCLOSURE_CLOSED &&
+        legend->st->list_style_inside,
         "default legend refreshes inheritance and keeps marker overrides");
     web_free(d);
 }
@@ -180,17 +186,17 @@ static void declaration_generation_paths(void) {
     doc_node_attr(d,owner,"style","--word:'first';--shade:red;color:var(--shade)");
     web_layout(d,800,600);
     check(owner->style&&owner->style->before&&owner->style->after&&child->style&&
-        !strcmp(owner->style->before->content,"first")&&child->style->color==0xffff0000u,
+        content_is(owner->style->before,"first")&&child->style->color==0xffff0000u,
         "native initial pseudo and child inherit cached inline variables");
     struct css_declarations *initial=owner->style_declarations;
     css_mark_dirty(d,owner);web_layout(d,800,600);
     check(owner->style_declarations==initial&&!owner->style_previous_slots&&
-        owner->style->after&&!strcmp(owner->style->after->content,"first"),
+        owner->style->after&&content_is(owner->style->after,"first"),
         "unchanged native cascade reuses declarations and retires all pseudo slots");
     doc_node_attr(d,owner,"style","--word:'second';--shade:blue;color:var(--shade)");
     web_layout(d,800,600);
     check(owner->style->before&&owner->style->after&&
-        !strcmp(owner->style->before->content,"second")&&!strcmp(owner->style->after->content,"second")&&
+        content_is(owner->style->before,"second")&&content_is(owner->style->after,"second")&&
         child->style&&child->style->color==0xff0000ffu,
         "cache replacement recomputes child and both pseudo variable borrows");
     struct web_animation *lime=script_animation_hold(d,owner,PE_BEFORE,"color","lime");
@@ -206,13 +212,13 @@ static void declaration_generation_paths(void) {
     check(!owner->style&&!child->style,"detach unpublishes ancestor-dependent styles");
     doc_node_move(d,d->body,owner,NULL);web_layout(d,800,600);
     check(owner->style_declarations==current&&owner->style&&owner->style->before&&child->style&&
-        !strcmp(owner->style->before->content,"second")&&child->style->color==0xff0000ffu,
+        content_is(owner->style->before,"second")&&child->style->color==0xff0000ffu,
         "reinsert retains immutable declarations and refreshes inherited variable tails");
     /* a script effect keeps its target across removal (only style cancels CSS animations) */
     check(owner->style&&owner->style->before&&owner->style->before->color==0xff00ff00u,"reinserted pseudo keeps its script effect");
     if(lime)web_animation_cancel(lime);
     css_mark_dirty(d,owner);web_layout(d,800,600);
-    check(owner->style&&owner->style->before&&owner->style->before->color==0xff0000ffu&&!strcmp(owner->style->before->content,"second"),
+    check(owner->style&&owner->style->before&&owner->style->before->color==0xff0000ffu&&content_is(owner->style->before,"second"),
         "removed pseudo effect leaves the underlying body");
     web_free(d);
 }

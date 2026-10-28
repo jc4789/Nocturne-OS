@@ -38,6 +38,7 @@ static void append(box_t *p, box_t *c) {
     else p->first = c;
     p->last = c;
     p->paint_alpha |= c->paint_alpha;
+    p->counter_tree |= c->counter_tree;
 }
 
 static style_t *anon_style(struct bctx *b, const style_t *parent, int display) {
@@ -164,144 +165,92 @@ uint32_t *box_text_source_map(arena_t *a, const box_t *t) {
     return source;
 }
 
-/* ---------------------------------------------------------------- list markers */
-static void roman(char *out, int v, bool upper) {
-    static const int val[] = {1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1};
-    static const char *const sym[] = {"m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i"};
-    out[0] = 0;
-    if (v <= 0 || v >= 4000) {
-        sprintf(out, "%d", v);
-        return;
-    }
-    for (int i = 0; i < 13; i++)
-        while (v >= val[i]) {
-            strcat(out, sym[i]);
-            v -= val[i];
-        }
-    if (upper)
-        for (char *p = out; *p; p++) *p = (char)(*p - 32);
+/* ---------------------------------------------------------------- list markers and counters */
+/* Counting boxes (counter.c): one whose element or pseudo-element counts, and every box above it
+   (append and local_dirty carry counter_tree up). A publication that makes one recounts. */
+static void counting(struct bctx *b, box_t *x, unsigned kind) {
+    x->counter_kind |= (uint8_t)kind;
+    x->counter_tree = true;
+    b->d->counters_dirty = true;
 }
-
-static void alpha(char *out, int v, bool upper) {
-    if (v <= 0) {
-        sprintf(out, "%d", v);
-        return;
-    }
-    char t[16];
-    int n = 0;
-    while (v > 0 && n < 15) {
-        v--;
-        t[n++] = (char)((upper ? 'A' : 'a') + v % 26);
-        v /= 26;
-    }
-    for (int i = 0; i < n; i++) out[i] = t[n - 1 - i];
-    out[n] = 0;
+/* whether a style's own counter-reset, counter-increment or counter-set names a counter */
+static bool counting_style(const style_t *st) {
+    const struct css_counters *g = css_style_counters(st);
+    return g->ops[CSS_COUNTER_RESET] || g->ops[CSS_COUNTER_INCREMENT] || g->ops[CSS_COUNTER_SET];
 }
-
-static bool is_li(node_t *n) {
-    if (n->type != N_ELEM || !n->style || n->style->display != D_LIST_ITEM) return false;
-    for (node_t *c = n, *p; c; c = p) {
-        if (c->style && c->style->display == D_NONE) return false;
-        p = doc_flat_parent(c);
-        if (p && !p->foreign && p->tag == T_details && !node_attr(p, "open") && doc_details_summary(p) != c)
-            return false;
-    }
-    return true;
+/* CSS Lists 3 §3.2: whether a list item's ::marker generates a box: by its content when that is
+   not normal (none: no box), else when the item has a marker image or a marker string */
+static bool marker_generated(const style_t *st) {
+    const style_t *m = st->marker;
+    if (m && m->content) return !m->content->none;
+    return css_style_list(st)->image || st->list_style != LS_NONE;
 }
-
-/* Unlike atoi, HTML integer parsing distinguishes invalid/missing values from
-   a real zero and never overflows on author-provided attribute strings. */
-static bool list_integer(const char *s, int *out) {
-    if (!s) return false;
-    while (is_space((unsigned char)*s)) s++;
-    bool negative = *s == '-';
-    if (*s == '-' || *s == '+') s++;
-    if (*s < '0' || *s > '9') return false;
-    uint64_t value = 0, limit = negative ? 2147483648ull : 2147483647ull;
-    while (*s >= '0' && *s <= '9') {
-        unsigned digit = (unsigned)(*s++ - '0');
-        if (value > (limit - digit) / 10) return false;
-        value = value * 10 + digit;
-    }
-    *out = negative ? (int)(-(int64_t)value) : (int)value;
-    return true;
+/* A text box for generated text that counter.c writes: it exists even while empty. */
+static box_t *counted_text(struct bctx *b, box_t *pb, node_t *n, style_t *st, const char *s, size_t len) {
+    box_t *t = nbox(b, B_TEXT, n, st);
+    size_t k;
+    t->text = ws_process(b->a, s, len, st, &k, NULL);
+    t->len = k;
+    append(pb, t);
+    return t;
 }
-
-static node_t *list_owner(node_t *item) {
-    node_t *ancestor = item->parent;
-    for (node_t *p = item->parent; p; p = p->parent)
-        if (!p->foreign && (p->tag == T_ol || p->tag == T_ul || p->tag == T_menu)) { ancestor = p; break; }
-    for (; ancestor; ancestor = ancestor->parent)
-        if (ancestor->style && ancestor->style->display != D_NONE && ancestor->style->display != D_CONTENTS)
-            return ancestor;
-    return NULL;
-}
-
-static int owned_count(node_t *subtree, node_t *owner) {
-    int count = is_li(subtree) && list_owner(subtree) == owner ? 1 : 0;
-    for (node_t *n = subtree->first; n; n = n->next) count += owned_count(n, owner);
-    return count;
-}
-
-static bool owned_ordinal(node_t *subtree, node_t *owner, node_t *item, int step, int64_t *number) {
-    if (is_li(subtree) && list_owner(subtree) == owner) {
-        int explicit_value;
-        if (!subtree->foreign && subtree->tag == T_li && list_integer(node_attr(subtree, "value"), &explicit_value))
-            *number = explicit_value;
-        if (subtree == item) return true;
-        *number += step;
+/* An inside ::marker (CSS Lists 3 §3.3): an inline box at the start of the item's contents with
+   the marker's style (the item's own ::marker style, or one derived from the item, with the UA
+   style sheet's ::marker rule), holding its text. */
+static box_t *marker_box(struct bctx *b, box_t *x, node_t *n, style_t *item, const char *s, size_t len) {
+    style_t *ms = item->marker;
+    bool derived = !ms;
+    if (derived) {
+        ms = ar_alloc(b->a, sizeof *ms);
+        css_style_marker(ms, item);
     }
-    for (node_t *n = subtree->first; n; n = n->next)
-        if (owned_ordinal(n, owner, item, step, number)) return true;
-    return false;
+    box_t *m = nbox(b, B_INLINE, n, ms);
+    if (derived) m->counter_kind = BOX_COUNTER_MARKER_STYLE;
+    box_t *t = counted_text(b, m, n, ms, s, len);
+    append(x, m);
+    return t;
 }
-
-/* The owning list, not merely siblings, supplies reversed/start/value order.
-   Nested lists are independent; display:none items never affect numbering. */
-static int list_ordinal(node_t *li) {
-    node_t *owner = list_owner(li);
-    if (!owner) return 1;
-    bool ordered = !owner->foreign && owner->tag == T_ol;
-    bool reversed = ordered && node_attr(owner, "reversed");
-    int start;
-    if (!ordered || !list_integer(node_attr(owner, "start"), &start)) start = reversed ? owned_count(owner, owner) : 1;
-    int64_t number = start;
-    owned_ordinal(owner, owner, li, reversed ? -1 : 1, &number);
-    return number < -2147483648ll ? -2147483647 - 1 : number > 2147483647ll ? 2147483647 : (int)number;
+/* A list item's principal box counts (the implicit list-item increment, CSS Lists 3 §4.6), and its
+   ::marker, when it generates a box, is either inside, the first of its contents, or outside,
+   the box's marker; counter.c writes the marker's text into either. */
+static void list_marker(struct bctx *b, box_t *x, node_t *n, style_t *st) {
+    counting(b, x, BOX_COUNTER_ELEMENT);
+    if (!marker_generated(st)) return;
+    x->counter_kind |= BOX_COUNTER_MARKER;
+    if (st->list_style_inside) x->counter_text = marker_box(b, x, n, st, "", 0);
 }
-
-static void make_marker(struct bctx *b, box_t *x, node_t *n, style_t *st) {
-    char buf[64];
-    int ls = st->list_style;
-    if (ls == LS_NONE) return;
-    if (ls == LS_DISC || ls == LS_CIRCLE || ls == LS_SQUARE) {
-        x->marker_shape = (uint8_t)(ls == LS_DISC ? 1 : ls == LS_CIRCLE ? 2 : 3);
-        x->marker = ls == LS_DISC ? "\xe2\x80\xa2 " : ls == LS_CIRCLE ? "\xe2\x97\xa6 " : "\xe2\x96\xaa ";
-        return;
-    }
-    if (ls == LS_STRING) {
-        x->marker = st->list_style_string ? st->list_style_string : "";
-        return;
-    }
-    int v = list_ordinal(n);
-    char num[48];
-    switch (ls) {
-    case LS_DECIMAL_LZ: sprintf(num, "%02d", v); break;
-    case LS_LOWER_ALPHA: alpha(num, v, false); break;
-    case LS_UPPER_ALPHA: alpha(num, v, true); break;
-    case LS_LOWER_ROMAN: roman(num, v, false); break;
-    case LS_UPPER_ROMAN: roman(num, v, true); break;
-    case LS_LOWER_GREEK:
-        if (v >= 1 && v <= 24) {
-            char g[4];
-            g[utf8_put(g, 0x3B1 + (uint32_t)(v - 1) + (v > 17 ? 1 : 0))] = 0;
-            sprintf(num, "%s", g);
-        } else sprintf(num, "%d", v);
-        break;
-    default: sprintf(num, "%d", v);
-    }
-    snprintf(buf, sizeof buf, "%s. ", num);
-    x->marker = ar_strdup(b->a, buf);
+void box_counter_text(box_t *t, const char *s, size_t n) {
+    /* white-space processing is idempotent: the box's text read again is itself */
+    if (!t || (t->len == n && (!n || !memcmp(t->text, s, n)))) return;
+    arena_t next = {.chunk_size = 256};
+    jmp_buf trap;
+    next.trap = &trap;
+    if (setjmp(trap)) { ar_free(&next); return; }
+    size_t length;
+    const char *text = ws_process(&next, s, n, t->st, &length, NULL);
+    next.trap = NULL;
+    if (length == t->len && !memcmp(text, t->text, length)) { ar_free(&next); return; }
+    ar_free(&t->text_mem);
+    t->text_mem = next;
+    t->text = text;
+    t->len = length;
+    layout_invalidate(t);
+}
+void box_counter_marker(web_doc *d, box_t *x, const char *s, size_t n, uint8_t shape) {
+    const struct css_image *image = css_style_list(x->st)->image;
+    if (image && image->kind == CSS_IMAGE_URL && !image->img) doc_css_image(d, image);
+    if (x->marker && x->marker_shape == shape && strlen(x->marker) == n && !memcmp(x->marker, s, n)) return;
+    arena_t next = {.chunk_size = 64};
+    jmp_buf trap;
+    next.trap = &trap;
+    if (setjmp(trap)) { ar_free(&next); return; }
+    char *marker = ar_strndup(&next, s, n);
+    next.trap = NULL;
+    ar_free(&x->text_mem);
+    x->text_mem = next;
+    x->marker = marker;
+    x->marker_shape = shape;
+    layout_invalidate(x);
 }
 
 /* ---------------------------------------------------------------- inline SVG */
@@ -741,7 +690,7 @@ static int atomic_kind(node_t *n) {
 }
 bool box_pseudo_generated(node_t *node, const style_t *origin, const style_t *pseudo) {
     if (!node || !origin || !pseudo || origin->display == D_NONE ||
-        pseudo->display == D_NONE || !pseudo->content) return false;
+        pseudo->display == D_NONE || !pseudo->content || pseudo->content->none) return false;
     if (node->tag == T_br || node->tag == T_wbr || node->tag == T_hr || node->tag == T_frameset) return false;
     int atomic = atomic_kind(node);
     return atomic == AT_NONE || atomic == AT_INLINE_BLOCK;
@@ -773,7 +722,14 @@ static void pseudo_box(struct bctx *b, box_t *pb, node_t *e, style_t *ps) {
     else x = nbox(b, B_BLOCK, e, ps);
     x->floated = ps->float_ != FL_NONE;
     x->abspos = ps->position == POS_ABSOLUTE || ps->position == POS_FIXED;
-    if (ps->content[0]) text_box(b, x, e, ps->content, strlen(ps->content), ps);
+    if (css_content_counted(ps->content)) x->counter_text = counted_text(b, x, e, ps, "", 0);
+    else {
+        sbuf text = {0};
+        css_content_strings(ps->content, &text);
+        if (text.n) text_box(b, x, e, text.p, text.n, ps);
+        sb_free(&text);
+    }
+    if (x->counter_text || counting_style(ps)) counting(b, x, BOX_COUNTER_PSEUDO);
     if (x->kind != B_INLINE) fixup(b, x);
     append(pb, x);
 }
@@ -791,14 +747,16 @@ static void children(struct bctx *b, box_t *pb, node_t *e, style_t *st) {
         /* The default legend is a renderer-owned box, never an invented DOM
            child. Hit testing associates this box with the native details. */
         style_t *legend = anon_style(b, st, D_LIST_ITEM);
-        legend->list_style = LS_STRING;
-        legend->list_style_string = node_attr(e, "open") ? "\xe2\x96\xbe " : "\xe2\x96\xb8 ";
+        legend->list_style = node_attr(e, "open") ? LS_DISCLOSURE_OPEN : LS_DISCLOSURE_CLOSED;
         legend->list_style_inside = true;
         box_t *x = nbox(b, B_BLOCK, e, legend);
         x->anon = true;
-        make_marker(b, x, e, legend);
-        if (x->marker) text_box(b, x, e, x->marker, strlen(x->marker), legend);
-        x->marker = NULL;
+        /* the HTML rendering's default summary: counter-increment: list-item 0, so it does not count */
+        sbuf marker = {0};
+        struct css_counter_style style = {legend->list_style, NULL, NULL};
+        css_counter_text(&style, 1, true, &marker);
+        marker_box(b, x, e, legend, marker.p ? marker.p : "", marker.n);
+        sb_free(&marker);
         text_box(b, x, e, "Details", 7, legend);
         fixup(b, x);
         append(pb, x);
@@ -936,20 +894,14 @@ static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
         default:
             x = nbox(b, B_BLOCK, n, st);
         container:
-            if (st->display == D_LIST_ITEM) {
-                make_marker(b, x, n, st);
-                if (x->marker && st->list_style_inside) {
-                    text_box(b, x, n, x->marker, strlen(x->marker), st);
-                    x->marker = NULL;
-                    x->marker_shape = 0;
-                }
-            }
+            if (st->display == D_LIST_ITEM) list_marker(b, x, n, st);
             children(b, x, n, st);
             fixup(b, x);
         }
     }
     x->floated = st->float_ != FL_NONE;
     x->abspos = st->position == POS_ABSOLUTE || st->position == POS_FIXED;
+    if (!(x->counter_kind & BOX_COUNTER_KIND) && counting_style(st)) counting(b, x, BOX_COUNTER_ELEMENT);
     if(st->content_visibility!=CV_VISIBLE && x->kind!=B_INLINE)x->is_bfc=true;
     /* Every node is generated once per publication. A moved node may still
        name its former box, which its former parent retires afterwards. */
@@ -1144,7 +1096,10 @@ static void unpublish_boxes(box_t *b) {
     ar_free(&b->text_mem);
     /* an anchor-positioned box's record goes with it; the others may name this box until the next layout */
     box_anchor_free(b);
-    if(b->node && b->node->owner)b->node->owner->anchor_epoch++;
+    if(b->node && b->node->owner){
+        b->node->owner->anchor_epoch++;
+        if(b->counter_kind & BOX_COUNTER_KIND)b->node->owner->counters_dirty=true;
+    }
     if(b->node && b->node->box==b){b->node->box=NULL;b->node->anchor_block=NULL;}
     for(box_t *child=b->first,*next;child;child=next){next=child->next;unpublish_boxes(child);}
     arena_t *branch=b->branch_mem;
@@ -1320,7 +1275,11 @@ static void local_discard_box(box_t *x){
 /* A changed box and everything above it: layout, stacking lists, borrows. */
 static void local_dirty(box_t *b){
     layout_invalidate(b);
-    for(;b;b=b->parent){b->paint_layers_valid=b->flow_ink_valid=false;pv_free(&b->paint_layers);b->style_sync_dirty=true;}
+    bool counted=b && b->counter_tree;
+    for(;b;b=b->parent){
+        b->paint_layers_valid=b->flow_ink_valid=false;pv_free(&b->paint_layers);b->style_sync_dirty=true;
+        b->counter_tree|=counted;
+    }
 }
 /* The parent's fixup sorts a child only by these, so two boxes that agree
    take the same place, inside the same anonymous wrapper. */
@@ -1340,52 +1299,6 @@ static bool local_collapses(const node_t *n,const style_t *st){
     if(preserves_space(st))return false;
     for(size_t i=0;i<n->textlen;i++)if(!is_space((unsigned char)n->text[i]))return false;
     return true;
-}
-
-static bool is_list(const node_t *n){
-    return n->type==N_ELEM && !n->foreign && (n->tag==T_ol || n->tag==T_ul || n->tag==T_menu);
-}
-static bool listish(const node_t *n){
-    if(n->type!=N_ELEM)return false;
-    const box_t *b=n->box && n->box->node==n?n->box:NULL;
-    return (!n->foreign && n->tag==T_li) || (n->style && n->style->display==D_LIST_ITEM) ||
-        (n->style_previous && n->style_previous->display==D_LIST_ITEM) || (b && b->st->display==D_LIST_ITEM);
-}
-/* Whether its marker is a number. A removed item has no computed style left;
-   its retiring box still names the last one. */
-static bool list_numbered(const node_t *n){
-    const style_t *s=n->style?n->style: n->box && n->box->node==n?n->box->st:NULL;
-    if(!s)return false;
-    int ls=s->list_style;
-    return ls!=LS_NONE && ls!=LS_DISC && ls!=LS_CIRCLE && ls!=LS_SQUARE && ls!=LS_STRING;
-}
-/* Markers count the items of their owning list (list_owner). Adding,
-   removing or re-displaying an item owned outside the changed subtree
-   renumbers that list, when any of its markers is a number. */
-static node_t *local_list_scope(node_t *parent,node_t *subtree){
-    bool escapes=false,numbered=false;
-    for(node_t *n=subtree;n;){
-        if(listish(n)){
-            bool owned=false;
-            for(node_t *a=n;a && a!=subtree;){a=a->parent;if(a && is_list(a)){owned=true;break;}}
-            if(!owned){escapes=true;numbered=numbered || list_numbered(n);}
-        }
-        if(n->first){n=n->first;continue;}
-        while(n!=subtree && !n->next)n=n->parent;
-        if(n==subtree)break;
-        n=n->next;
-    }
-    if(!escapes)return NULL;
-    node_t *owner=parent;
-    for(node_t *a=parent;a;a=a->parent)if(is_list(a)){owner=a;break;}
-    for(node_t *n=owner->first;n && !numbered;){
-        if(listish(n))numbered=list_numbered(n);
-        if(n->first && !is_list(n)){n=n->first;continue;}
-        while(n!=owner && !n->next)n=n->parent;
-        if(n==owner)break;
-        n=n->next;
-    }
-    return numbered?owner:NULL;
 }
 
 /* The nearest flat ancestor-or-self whose own box a region can replace;
@@ -1573,15 +1486,13 @@ static bool local_request(struct local *L,struct local_units *u,node_t *a,node_t
     if(!local_connected(d,a))return true;
     if(b){
         if(a->type==N_DOC){L->full="document children";return false;}
-        node_t *list=local_list_scope(a,b);
-        if(!(list?local_add(u,list,UNIT_REGION):local_add(u,a,UNIT_SPLICE)))L->full="memory";
+        if(!local_add(u,a,UNIT_SPLICE))L->full="memory";
         return !L->full;
     }
     if(a==d->html){L->full="root element";return false;}
     if(web_dialog_count(d) && web_dialog_is_modal(d,a)){L->full="top layer";return false;}
-    node_t *list=a->type==N_ELEM && a->parent && listish(a)?local_list_scope(a->parent,a):NULL,*p;
-    bool added=list?local_add(u,list,UNIT_REGION):
-        a->type==N_ELEM && a->box && a->box->node==a?local_add(u,a,UNIT_REGION):
+    node_t *p;
+    bool added=a->type==N_ELEM && a->box && a->box->node==a?local_add(u,a,UNIT_REGION):
         !(p=local_flat_parent(a)) || local_add(u,p,UNIT_SPLICE);
     if(!added)L->full="memory";
     return added;
@@ -1619,6 +1530,7 @@ bool boxes_rebuild_local(web_doc *d){
             ok=local_unit(L,u.v[i].node,u.v[i].kind);
         }
     }
+    if(ok)web_counters_update(d);
     if(ok){
         if(L->changed){
             web_hit_index_free(d);d->paint_order_valid=false;d->abs_boxes.n=0;d->visual_revision++;d->style_revision++;
@@ -1656,6 +1568,7 @@ static style_t *replacement_style(node_t *n, style_t *old) {
         if (old==previous->before) return next->before;
         if (old==previous->after) return next->after;
         if (old==previous->backdrop) return next->backdrop;
+        if (old==previous->marker) return next->marker;
     }
     return old;
 }
@@ -1707,6 +1620,12 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
     } else if ((b->st=replacement_style(box_style_node(b),old)) != old) {
         /* a node's style, or the one an anonymous ::backdrop box borrows */
         if (!css_style_layout_equal(old,b->st)) layout_invalidate(b);
+    } else if ((b->counter_kind & BOX_COUNTER_MARKER_STYLE) && b->parent) {
+        /* an inside ::marker's style derived from its item (marker_box); its text box shares it */
+        style_t next;
+        css_style_marker(&next, b->parent->st);
+        if (!css_style_layout_equal(old,&next)) layout_invalidate(b);
+        *old = next;
     } else if (b->anon && b->parent) {
         /* the box arena's own anonymous style, inherited from the parent box's */
         int display = old->display;
@@ -1714,8 +1633,7 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
         css_style_init(&next, b->parent->st);
         css_style_finish(&next, NULL, false); next.display = (uint8_t)display;
         if (b->node && !b->node->foreign && b->node->tag == T_details) {
-            next.list_style=old->list_style; next.list_style_string=old->list_style_string;
-            next.list_style_inside=old->list_style_inside;
+            next.list_style=old->list_style; next.list_style_inside=old->list_style_inside;
         }
         if (!css_style_layout_equal(old,&next)) layout_invalidate(b);
         *old = next;
@@ -1783,6 +1701,7 @@ void boxes_build(web_doc *d, arena_t *a) {
         }
         b.top=n; gen(&b,root,n,NULL); b.top=NULL;
     }
+    web_counters_update(d);
     /* The new tree now owns only entries marked by real SVG generation.
        Compact in place; no quota, replacement array, or stale-node retention. */
     int retained = 0;

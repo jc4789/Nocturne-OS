@@ -864,36 +864,9 @@ static const char *st_scan(struct pctx *pc, const char *p, const char *e, int cl
 }
 
 /* ---- CSSOM serialization */
-static void ser_code_point(sbuf *b, uint32_t cp) {
-    char t[16];
-    snprintf(t, sizeof t, "\\%x ", (unsigned)cp);
-    sb_puts(b, t);
-}
-/* CSSOM "serialize an identifier" of a decoded name */
-static void ser_ident(sbuf *b, const char *s) {
-    const unsigned char *p = (const unsigned char *)s;
-    if (p[0] == '-' && !p[1]) { sb_puts(b, "\\-"); return; }
-    for (size_t i = 0; p[i]; i++) {
-        unsigned char c = p[i];
-        if (c >= 0x80) sb_putc(b, (char)c);
-        else if ((c >= 1 && c <= 0x1F) || c == 0x7F) ser_code_point(b, c);
-        else if (st_digit(c) && (i == 0 || (i == 1 && p[0] == '-'))) ser_code_point(b, c);
-        else if (c == '-' || c == '_' || st_digit(c) || ((c | 32) >= 'a' && (c | 32) <= 'z')) sb_putc(b, (char)c);
-        else { sb_putc(b, '\\'); sb_putc(b, (char)c); }
-    }
-}
-/* CSSOM "serialize a string" */
-static void ser_string(sbuf *b, const char *s) {
-    sb_putc(b, '"');
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        if ((*p >= 1 && *p <= 0x1F) || *p == 0x7F) ser_code_point(b, *p);
-        else {
-            if (*p == '"' || *p == '\\') sb_putc(b, '\\');
-            sb_putc(b, (char)*p);
-        }
-    }
-    sb_putc(b, '"');
-}
+/* CSSOM "serialize an identifier" and "serialize a string" (util.c) */
+static void ser_ident(sbuf *b, const char *s) { css_serialize_ident(b, s); }
+static void ser_string(sbuf *b, const char *s) { css_serialize_string(b, s); }
 static void ser_int(sbuf *b, long long v) {
     char t[24];
     snprintf(t, sizeof t, "%lld", v);
@@ -1085,7 +1058,7 @@ static const struct { const char *name; uint8_t pe, flags; } pseudo_elements[] =
     {"checkmark", PE_OTHER, PEF_TREE}, {"column", PE_OTHER, 0}, {"cue", PE_OTHER, 0}, {"cue-region", PE_OTHER, 0},
     {"details-content", PE_OTHER, PEF_TREE}, {"file-selector-button", PE_OTHER, PEF_TREE},
     {"first-letter", PE_OTHER, 0}, {"first-line", PE_OTHER, 0}, {"grammar-error", PE_OTHER, 0},
-    {"marker", PE_OTHER, PEF_TREE}, {"picker-icon", PE_OTHER, PEF_TREE}, {"placeholder", PE_PLACEHOLDER, PEF_TREE},
+    {"marker", PE_MARKER, PEF_TREE}, {"picker-icon", PE_OTHER, PEF_TREE}, {"placeholder", PE_PLACEHOLDER, PEF_TREE},
     {"scroll-marker", PE_OTHER, PEF_TREE}, {"scroll-marker-group", PE_OTHER, 0}, {"search-text", PE_OTHER, 0},
     {"selection", PE_OTHER, 0}, {"spelling-error", PE_OTHER, 0}, {"target-text", PE_OTHER, 0},
     {"view-transition", PE_OTHER, 0},
@@ -1812,8 +1785,6 @@ bool css_selectors_serialize(const sheet_t *sheet, const char *selector, size_t 
     ar_free(&a);
     return l != NULL;
 }
-void css_serialize_ident(sbuf *out, const char *name) { ser_ident(out, name); }
-void css_serialize_string(sbuf *out, const char *text) { ser_string(out, text); }
 
 /* ---------------------------------------------------------------- the ancestor filter
    A Bloom filter over the ids, classes and type names of an element's
@@ -5797,7 +5768,7 @@ void css_refresh_font_selection(web_doc *d) {
         if(!web_native_checkpoint(d))break;
         if(n->type!=N_ELEM || n->owner!=d || !n->style)continue;
         style_t *s=n->style,*base=n->animation_base_style;
-        style_t *styles[]={s,s->before_generated?s->before:NULL,s->after_generated?s->after:NULL,s->backdrop,base,
+        style_t *styles[]={s,s->before_generated?s->before:NULL,s->after_generated?s->after:NULL,s->backdrop,s->marker,base,
             base&&base->before_generated?base->before:NULL,base&&base->after_generated?base->after:NULL,base?base->backdrop:NULL};
         bool changed=false;
         for(size_t i=0;i<sizeof styles/sizeof *styles;i++)if(styles[i]) {
@@ -6275,6 +6246,23 @@ static bool html_color(const char *v, char *out, size_t n) {
     return false;
 }
 
+/* HTML's rules for parsing integers: false for an error (no digits, or beyond an int32: CSS
+   clamps the integers of the hints above, which may step one past it) */
+static bool html_integer(const char *s, int64_t *out) {
+    if (!s) return false;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\f' || *s == '\r') s++;
+    bool negative = *s == '-';
+    if (*s == '-' || *s == '+') s++;
+    if (*s < '0' || *s > '9') return false;
+    int64_t value = 0;
+    while (*s >= '0' && *s <= '9') {
+        value = value * 10 + (*s++ - '0');
+        if (value > 2147483648ll) return false;
+    }
+    if (!negative && value > 2147483647ll) return false;
+    *out = negative ? -value : value;
+    return true;
+}
 static void pres_hints(node_t *e, struct hints *h) {
     char b[64];
     const char *v;
@@ -6366,15 +6354,28 @@ static void pres_hints(node_t *e, struct hints *h) {
         if (html_color(node_attr(e, "color"), b, sizeof b)) hint(h, "border-color", "%s", b), hint(h, "background-color", "%s", b);
         if (node_attr(e, "noshade")) hint(h, "border-style", "solid"), hint(h, "background-color", "gray");
     }
-    if ((t == T_ul || t == T_ol || t == T_li) && (v = node_attr(e, "type")) && *v) {
+    if (!e->foreign && (t == T_ul || t == T_ol || t == T_li) && (v = node_attr(e, "type")) && *v) {
+        /* ol[type=1], li[type=a s] ...: case-sensitive; ul[type=disc i] ...: not */
         const char *ls = NULL;
-        if (!strcmp(v, "1")) ls = "decimal";
-        else if (!strcmp(v, "a")) ls = "lower-alpha";
-        else if (!strcmp(v, "A")) ls = "upper-alpha";
-        else if (!strcmp(v, "i")) ls = "lower-roman";
-        else if (!strcmp(v, "I")) ls = "upper-roman";
-        else if (str_ieq(v, "disc") || str_ieq(v, "circle") || str_ieq(v, "square")) ls = v;
+        bool ordered = t != T_ul, unordered = t != T_ol;
+        if (ordered && !strcmp(v, "1")) ls = "decimal";
+        else if (ordered && !strcmp(v, "a")) ls = "lower-alpha";
+        else if (ordered && !strcmp(v, "A")) ls = "upper-alpha";
+        else if (ordered && !strcmp(v, "i")) ls = "lower-roman";
+        else if (ordered && !strcmp(v, "I")) ls = "upper-roman";
+        else if (unordered && (str_ieq(v, "none") || str_ieq(v, "disc") || str_ieq(v, "circle") || str_ieq(v, "square"))) ls = v;
         if (ls) hint(h, "list-style-type", "%s", ls);
+    }
+    /* li's value is counter-set: list-item value; ol's start and reversed are its counter-reset */
+    int64_t number;
+    if (!e->foreign && t == T_li && html_integer(node_attr(e, "value"), &number))
+        hint(h, "counter-set", "list-item %lld", (long long)number);
+    if (!e->foreign && t == T_ol) {
+        bool start = html_integer(node_attr(e, "start"), &number);
+        if (node_attr(e, "reversed")) {
+            if (start) hint(h, "counter-reset", "reversed(list-item) %lld", (long long)number + 1);
+            else hint(h, "counter-reset", "reversed(list-item)");
+        } else if (start) hint(h, "counter-reset", "list-item %lld", (long long)number - 1);
     }
     if ((t == T_caption) && (v = node_attr(e, "valign")) && str_ieq(v, "bottom")) {
     }
@@ -6501,7 +6502,7 @@ static void collect(const struct ient *l, const struct element_keys *k, node_t *
         }
         if (!binding->media_ok[l->media]) continue;
         if (ancestor_filter_rejects(&k->ancestors, l->ancestor_hashes)) { tally->filtered++; continue; }
-        if (!container_chain_ok(l->r->media,e,l->pseudo==PE_BEFORE || l->pseudo==PE_AFTER)) continue;
+        if (!container_chain_ok(l->r->media,e,l->pseudo==PE_BEFORE || l->pseudo==PE_AFTER || l->pseudo==PE_MARKER)) continue;
         /* Only cascade rule matching reads the published form snapshot. Live
            matches()/querySelector() outside this call keep their normal API. */
         bool previous = scratch->form_snapshot;
@@ -6955,6 +6956,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
        Author declarations still cascade normally, including explicit inherit,
        currentColor, transparent and revert. No second rule scan at paint time. */
     if (pseudo == PE_PLACEHOLDER) s->color = RGB(117, 117, 117);
+    if (pseudo == PE_MARKER) css_style_marker_defaults(s);
     /* custom properties: the most important declaration of each name */
     const struct custom_prop *inherited = s->vars;
     struct custom_prop *mine = NULL;
@@ -7008,7 +7010,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
                     c->a, setbits, true, false, false, 0, 0, 0, false, false};
     struct css_ctx *index=d->sty.ctx;
     if(index && __atomic_load_n(&index->containers,__ATOMIC_ACQUIRE)) {
-        bool inclusive=pseudo==PE_BEFORE || pseudo==PE_AFTER;
+        bool inclusive=pseudo==PE_BEFORE || pseudo==PE_AFTER || pseudo==PE_MARKER;
         node_t *inline_container=query_container(e,NULL,1,inclusive),*block_container=query_container(e,NULL,2,inclusive);
         if(inline_container){cx.cq_width=inline_container->container_width;cx.cq_width_set=true;}
         if(block_container){cx.cq_height=block_container->container_height;cx.cq_height_set=true;}
@@ -7025,6 +7027,8 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         if(s->display==D_CONTENTS)s->display=D_BLOCK; s->float_=FL_NONE;
     }
     css_style_finish(s, parent, e == d->html && !pseudo);
+    /* CSS Generated Content 3 §1.1: normal computes to none on ::before and ::after */
+    if ((pseudo == PE_BEFORE || pseudo == PE_AFTER) && !s->content) s->content = &css_content_none;
     /* anchor() and anchor-size() resolve only for absolutely positioned boxes (layout.c) */
     css_style_anchor_fallbacks(s, c->a);
     if ((pseudo != PE_BEFORE && pseudo != PE_AFTER) || box_pseudo_generated(e,parent,s))
@@ -7952,9 +7956,11 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
        unchanged; identity versus none also changes fixed containing blocks. */
     if(!same_translation(a,b))return false;
     if ((a->display == D_INLINE || b->display == D_INLINE) && (a->opacity < 1) != (b->opacity < 1)) return false;
-    if(!equal_string(a->font_names,b->font_names) || !equal_string(a->content,b->content) ||
+    /* content, the list and counter values and the ::marker make generated text */
+    if(!equal_string(a->font_names,b->font_names) || !css_content_equal(a->content,b->content) ||
         !equal_string(a->container_names,b->container_names) ||
-        !equal_string(a->list_style_string,b->list_style_string) ||
+        !css_list_equal(a->list,b->list) || !css_counters_equal(a->counters,b->counters) ||
+        !css_style_layout_equal(a->marker,b->marker) ||
         !equal_tracks(a->grid_cols,b->grid_cols) || !equal_tracks(a->grid_rows,b->grid_rows) ||
         !equal_tracks(a->grid_auto_cols,b->grid_auto_cols) || !equal_tracks(a->grid_auto_rows,b->grid_auto_rows) ||
         !equal_areas(a->grid_areas,b->grid_areas))return false;
@@ -7995,7 +8001,8 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.transform_box=y.transform_box=0;
     memset(&x.motion,0,sizeof x.motion);memset(&y.motion,0,sizeof y.motion); /* timing lists are not layout */
     x.animated=y.animated=false;
-    x.font_names=y.font_names=NULL;x.font_choices=y.font_choices=NULL; x.content=y.content=NULL; x.list_style_string=y.list_style_string=NULL;
+    x.font_names=y.font_names=NULL;x.font_choices=y.font_choices=NULL; x.content=y.content=NULL;
+    x.list=y.list=NULL;x.counters=y.counters=NULL;x.marker=y.marker=NULL;
     x.container_names=y.container_names=NULL;
     x.grid_cols=y.grid_cols=x.grid_rows=y.grid_rows=x.grid_auto_cols=y.grid_auto_cols=x.grid_auto_rows=y.grid_auto_rows=NULL;
     x.grid_areas=y.grid_areas=NULL;
@@ -8075,7 +8082,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
             (fa->range_count && memcmp(fa->ranges, fb->ranges, fa->range_count * sizeof *fa->ranges))) return false;
     if (fa || fb) return false;
     if (!equal_string(a->container_names, b->container_names) || !equal_string(a->font_names, b->font_names) ||
-        !equal_string(a->content, b->content) || !equal_string(a->list_style_string, b->list_style_string) ||
+        !css_content_equal(a->content, b->content) || !css_list_equal(a->list, b->list) ||
+        !css_counters_equal(a->counters, b->counters) || !style_equal(a->marker, b->marker) ||
         !equal_string(a->bg_image, b->bg_image) || !equal_string(a->mask_image, b->mask_image) ||
         !css_motion_equal(&a->motion, &b->motion) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
@@ -8116,8 +8124,9 @@ static bool style_equal(const style_t *a, const style_t *b) {
         }
     }
     x.font_choices = y.font_choices = NULL;
-    x.container_names = y.container_names = x.font_names = y.font_names = x.content = y.content = NULL;
-    x.list_style_string = y.list_style_string = x.bg_image = y.bg_image = x.mask_image = y.mask_image = NULL;
+    x.container_names = y.container_names = x.font_names = y.font_names = NULL; x.content = y.content = NULL;
+    x.list = y.list = NULL; x.counters = y.counters = NULL; x.marker = y.marker = NULL; /* compared above */
+    x.bg_image = y.bg_image = x.mask_image = y.mask_image = NULL;
     memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
@@ -8174,7 +8183,8 @@ static bool style_box_compatible(node_t *e, const style_t *old, const style_t *n
         old->container_type != next->container_type ||
         old->overflow != next->overflow || old->content_visibility != next->content_visibility ||
         old->white_space != next->white_space || old->text_transform != next->text_transform ||
-        old->list_style != next->list_style || old->list_style_inside != next->list_style_inside) return false;
+        old->list_style != next->list_style || old->list_style_inside != next->list_style_inside ||
+        !css_counters_equal(old->counters, next->counters)) return false;
     return old->display == D_BLOCK || old->display == D_FLOW_ROOT || old->display == D_INLINE || old->display == D_NONE ||
         old->display==D_FLEX||old->display==D_INLINE_FLEX||old->display==D_GRID||old->display==D_INLINE_GRID;
 }
@@ -8373,11 +8383,12 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         }
     }
     qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
-    bool has_before = false, has_after = false, has_placeholder = false;
+    bool has_before = false, has_after = false, has_placeholder = false, has_marker = false;
     for (int i = 0; i < ndents; i++) {
         if (dents[i].pseudo == PE_BEFORE) has_before = true;
         if (dents[i].pseudo == PE_AFTER) has_after = true;
         if (dents[i].pseudo == PE_PLACEHOLDER) has_placeholder = true;
+        if (dents[i].pseudo == PE_MARKER) has_marker = true;
     }
     /* CSS Transitions 1 §3: the after-change style inherits from the parent's */
     node_t *flat_parent = doc_flat_parent(e);
@@ -8394,6 +8405,9 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         (e->tag == T_input && web_input_type(e) <= WEB_INPUT_PASSWORD)))
         s->placeholder = compute(c, e, s, PE_PLACEHOLDER);
     if (web_dialog_is_modal(d,e)) s->backdrop = compute(c,e,NULL,PE_BACKDROP);
+    /* CSS Lists 3 §3.1: a ::marker with declarations of its own; one without takes
+       css_style_marker() of its item where it is used (box.c, CSSOM) */
+    if (has_marker) s->marker = compute(c, e, s, PE_MARKER);
     if (e == d->html) c->rem = s->font_size;
     /* CSSOM exposes resolved pseudo styles even when content:none, display:none
        or the originating replaced element prevents a generated box. Keep the

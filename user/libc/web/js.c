@@ -2343,6 +2343,7 @@ static int computed_pseudo(const char *pseudo) {
     if(str_ieq(pseudo,"::before")||str_ieq(pseudo,":before"))return PE_BEFORE;
     if(str_ieq(pseudo,"::after")||str_ieq(pseudo,":after"))return PE_AFTER;
     if(str_ieq(pseudo,"::placeholder"))return PE_PLACEHOLDER;
+    if(str_ieq(pseudo,"::marker"))return PE_MARKER;
     return -1;
 }
 static style_t *computed_pseudo_style(node_t *n,int pseudo,style_t *fallback) {
@@ -2355,8 +2356,16 @@ static style_t *computed_pseudo_style(node_t *n,int pseudo,style_t *fallback) {
         if(n->foreign || (n->tag!=T_textarea && (n->tag!=T_input || web_input_type(n)>WEB_INPUT_PASSWORD)))return NULL;
         if(base->placeholder)return base->placeholder;
     }
+    /* CSS Lists 3 §3.1: a ::marker without declarations of its own has the UA style sheet's */
+    if(pseudo==PE_MARKER){
+        if(base->marker)return base->marker;
+        css_style_marker(fallback,base);
+        return fallback;
+    }
     css_style_init(fallback,base);
     if(pseudo==PE_PLACEHOLDER)fallback->color=RGB(117,117,117);
+    /* CSS Generated Content 3 §1.1: their content normal computes to none */
+    if(pseudo==PE_BEFORE || pseudo==PE_AFTER)fallback->content=&css_content_none;
     return fallback;
 }
 static JSValue computed(struct web_js_state *s, node_t *n, const char *property,int pseudo) {

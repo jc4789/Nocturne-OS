@@ -96,6 +96,13 @@ static void declaration_cache(void) {
 static style_t *fresh_style(web_doc *d, node_t *n, const style_t *parent) {
     style_t *s = style_slot_alloc(d, n, &n->style_mem); css_style_init(s, parent); return s;
 }
+/* content: "<text>", allocated in a */
+static const struct css_content *string_content(arena_t *a, const char *text) {
+    struct css_content *c = ar_alloc(a, sizeof *c + sizeof *c->item);
+    memset(c, 0, sizeof *c + sizeof *c->item);
+    c->n = 1; c->item[0].kind = CSS_CONTENT_STRING; c->item[0].text = ar_strdup(a, text);
+    return c;
+}
 static void pseudo_generations(void) {
     web_doc d = {0}; node_t n = {0}; new_pool(&d);
     n.style = fresh_style(&d, &n, NULL);
@@ -105,8 +112,8 @@ static void pseudo_generations(void) {
     n.animation_base_style = fresh_style(&d, &n, NULL);
     n.animation_base_style->before = fresh_style(&d, &n, n.animation_base_style);
     n.animation_base_style->after = fresh_style(&d, &n, n.animation_base_style);
-    n.style->before->content = ar_strdup(&n.style_mem, "old before");
-    n.style->after->content = ar_strdup(&n.style_mem, "old after");
+    n.style->before->content = string_content(&n.style_mem, "old before");
+    n.style->after->content = string_content(&n.style_mem, "old after");
     style_t *old = n.style;
     struct cascade c = {.d=&d}; retire_style(&c, &n);
     n.style = fresh_style(&d, &n, old); n.animation_base_style = NULL;
@@ -115,8 +122,8 @@ static void pseudo_generations(void) {
     n.style->before = fresh_style(&d, &n, n.style);
     n.style->after = fresh_style(&d, &n, n.style);
     n.style->backdrop = fresh_style(&d, &n, NULL);
-    check(d.style_pool->live == 11 && !strcmp(old->before->content, "old before") &&
-        !strcmp(old->after->content, "old after"), "all seven previous pseudo/base slots and tail survive before join");
+    check(d.style_pool->live == 11 && !strcmp(old->before->content->item[0].text, "old before") &&
+        !strcmp(old->after->content->item[0].text, "old after"), "all seven previous pseudo/base slots and tail survive before join");
     css_styles_release(&d);
     check(d.style_pool->live == 4 && !n.style_previous_mem.allocated && !n.style_previous_slots,
         "join returns every previous pseudo and underlying slot plus tail");
@@ -351,11 +358,14 @@ static void placeholder_cases(void) {
     css_style_doc_free(&d);
     style_t origin,body,descendant;css_style_init(&origin,NULL);css_style_init(&body,&origin);
     node_t element={.type=N_ELEM,.tag=T_div,.style=&origin};
-    body.content="";
+    static const struct css_content empty_content={0};
+    body.content=&empty_content;
     check(box_pseudo_generated(&element,&origin,&body),"empty content generates a real pseudo box");
-    body.content=NULL;
+    body.content=&css_content_none;
     check(!box_pseudo_generated(&element,&origin,&body),"content none retains only computed body");
-    body.content="hint";body.display=D_NONE;
+    body.content=NULL;
+    check(!box_pseudo_generated(&element,&origin,&body),"content normal (none on ::before) generates nothing");
+    body.content=string_content(&a,"hint");body.display=D_NONE;
     check(!box_pseudo_generated(&element,&origin,&body),"display none body does not generate");
     body.display=D_INLINE;origin.display=D_NONE;
     check(!box_pseudo_generated(&element,&origin,&body),"hidden origin does not generate pseudo boxes");
@@ -411,26 +421,23 @@ static void local_box_cases(void){
     check(!local_collapses(&text,&pre),"preserved white space keeps its box");
     text.text=" a ";text.textlen=3;
     check(!local_collapses(&text,&style),"text keeps its box");
-    style_t numbered=style,bullet=style;
-    numbered.display=bullet.display=D_LIST_ITEM;numbered.list_style=LS_DECIMAL;bullet.list_style=LS_DISC;
-    web_doc d={0};
-    node_t ul={.type=N_ELEM,.tag=T_ul,.owner=&d,.style=&style};
-    node_t first={.type=N_ELEM,.tag=T_li,.owner=&d,.style=&bullet,.parent=&ul};
-    node_t second={.type=N_ELEM,.tag=T_li,.owner=&d,.style=&bullet,.parent=&ul};
-    ul.first=&first;first.next=&second;ul.last=&second;
-    check(!local_list_scope(&ul,&second),"bullets do not count their items");
-    first.style=&numbered;
-    check(local_list_scope(&ul,&second)==&ul,"an item beside a numbered one renumbers the list");
-    first.style=&bullet;
-    node_t ol={.type=N_ELEM,.tag=T_ol,.owner=&d,.style=&style,.parent=&second};
-    node_t nested={.type=N_ELEM,.tag=T_li,.owner=&d,.style=&numbered,.parent=&ol};
-    ol.first=ol.last=&nested;second.first=second.last=&ol;
-    check(!local_list_scope(&second,&ol),"a nested list owns its own items");
-    node_t div={.type=N_ELEM,.tag=T_div,.owner=&d,.style=&style};
-    check(!local_list_scope(&div,&div),"no item, no list to renumber");
-    second.first=second.last=NULL;second.style=NULL;
-    box_t retiring={.kind=B_BLOCK,.st=&numbered,.node=&second};second.box=&retiring;
-    check(local_list_scope(&ul,&second)==&ul,"a removed numbered item renumbers its former list");
+    /* A changed list item regenerates only its own boxes: the counters (counter.c) number the
+       others again. What makes a box count, and whether a ::marker generates a box: */
+    arena_t arena={0};
+    style_t item=style,none=style;item.display=none.display=D_LIST_ITEM;none.list_style=LS_NONE;
+    uint8_t *set=calloc((size_t)css_prop_count(),1);
+    check(!counting_style(&style),"no counter value, no counting box");
+    struct cx cx={.a=&arena,.s=&style,.set=set,.em=16,.rem=16,.vw=1920,.vh=1080};
+    const struct propdef *increment=css_prop_lookup("counter-increment",17);
+    check(css_apply(increment,"chapter",7,&cx) && counting_style(&style),"counter-increment makes its box count");
+    check(marker_generated(&item),"a list item's marker string generates its ::marker");
+    check(!marker_generated(&none),"list-style-type none without an image or content: no ::marker box");
+    style_t marker;css_style_marker(&marker,&none);marker.content=string_content(&arena,"*");none.marker=&marker;
+    check(marker_generated(&none),"::marker content generates its box");
+    marker.content=&css_content_none;
+    check(!marker_generated(&none),"::marker content none generates no box");
+    check(marker.white_space==WS_PRE,"the UA ::marker rule: white-space pre");
+    free(set);ar_free(&arena);
 }
 int main(int argc, char **argv) {
     if(argc>1 && !strcmp(argv[1],"local-boxes"))local_box_cases();

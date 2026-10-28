@@ -536,7 +536,7 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
        PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
-       PT_RULE_INSET, PT_ANCHOR };
+       PT_RULE_INSET, PT_ANCHOR, PT_COUNTER, PT_QUOTES, PT_LIST_IMAGE };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -558,8 +558,9 @@ struct propdef {
 /* Web Animations 1 §5.3 animation types that differ from a value type's default */
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 /* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
-   offset, gap_rules, anchor). A group holds only properties that are not inherited. */
-enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR };
+   offset, gap_rules, anchor, counters, list). A group holds only properties that are not inherited,
+   but for G_LIST, which holds only inherited ones: a style takes its parent's by the pointer. */
+enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR, G_COUNTER, G_LIST };
 /* the gap decoration shorthands (css-gaps-1): propdef flags hold what one sets (GS_*) and on which
    axes (GS_COLUMN, GS_ROW) */
 enum { GS_RULE, GS_COLOR, GS_STYLE, GS_WIDTH, GS_BREAK, GS_ITEMS, GS_INSET_START, GS_INSET_END, GS_INSET_CAP,
@@ -672,6 +673,7 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 #define SH(name, id) {name, PT_SHORT, 0, false, G_STYLE, 0, 0, NULL, id, AN_NONE}
 #define SH_GAP(name, flags) {name, PT_SHORT, flags, false, G_STYLE, 0, 0, NULL, SH_GAP_RULE, AN_NONE}
 #define OGAP(f) OG(G_GAP_RULE, struct css_gap_rules, f)
+#define OCOUNTER(i) G_COUNTER, (uint16_t)(offsetof(struct css_counters, ops) + (i) * sizeof(void *)), (uint16_t)sizeof(void *)
 
 /* sorted by name at first use */
 static struct propdef props[] = {
@@ -785,6 +787,9 @@ static struct propdef props[] = {
     SH_GAP("row-rule-inset", GS_INSET | GS_ROW),
     SH_GAP("rule-inset", GS_INSET | GS_BOTH),
     {"content", PT_CONTENT, 0, false, O(content), NULL, 0, AN_TYPE},
+    {"counter-increment", PT_COUNTER, CSS_COUNTER_INCREMENT, false, OCOUNTER(CSS_COUNTER_INCREMENT), NULL, 0, AN_DISCRETE},
+    {"counter-reset", PT_COUNTER, CSS_COUNTER_RESET, false, OCOUNTER(CSS_COUNTER_RESET), NULL, 0, AN_DISCRETE},
+    {"counter-set", PT_COUNTER, CSS_COUNTER_SET, false, OCOUNTER(CSS_COUNTER_SET), NULL, 0, AN_DISCRETE},
     {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0, AN_DISPLAY},
     SH("container", SH_CONTAINER),
     {"container-name", PT_CONTAINER_NAMES, 0, false, O(container_names), NULL, 0, AN_TYPE},
@@ -858,8 +863,10 @@ static struct propdef props[] = {
     {"letter-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(letter_spacing), kw_normal0, 0, AN_TYPE},
     {"line-height", PT_LINE_HEIGHT, 0, true, O(line_height), NULL, 0, AN_TYPE},
     SH("list-style", SH_LIST_STYLE),
+    {"list-style-image", PT_LIST_IMAGE, 0, true, OG(G_LIST, struct css_list, image), NULL, 0, AN_DISCRETE},
     {"list-style-position", PT_KW, 0, true, O(list_style_inside), kw_lspos, 0, AN_TYPE},
     {"list-style-type", PT_LIST_TYPE, 0, true, O(list_style), NULL, 0, AN_TYPE},
+    {"quotes", PT_QUOTES, 0, true, OG(G_LIST, struct css_list, quotes), NULL, 0, AN_DISCRETE},
     SH("margin", SH_MARGIN),
     SH("margin-block", SH_MARGIN_BLOCK),
     {"margin-bottom", PT_LEN, LF_AUTO | LF_NEG | LF_ANCHOR_SIZE, false, O(margin[2]), NULL, 0, AN_TYPE},
@@ -1079,16 +1086,30 @@ static const void *group_of(const style_t *s, uint8_t g) {
     case G_OFFSET: return css_style_offset(s);
     case G_GAP_RULE: return css_style_gap_rules(s);
     case G_ANCHOR: return css_style_anchor(s);
+    case G_COUNTER: return css_style_counters(s);
+    case G_LIST: return css_style_list(s);
     }
     return s;
 }
 static size_t group_size(uint8_t g) {
-    return g == G_FLOAT_SHAPE ? sizeof(struct css_float_shape) : g == G_OFFSET ? sizeof(struct css_offset) :
-                                g == G_GAP_RULE ? sizeof(struct css_gap_rules) : sizeof(struct css_anchor);
+    switch (g) {
+    case G_FLOAT_SHAPE: return sizeof(struct css_float_shape);
+    case G_OFFSET: return sizeof(struct css_offset);
+    case G_GAP_RULE: return sizeof(struct css_gap_rules);
+    case G_ANCHOR: return sizeof(struct css_anchor);
+    case G_COUNTER: return sizeof(struct css_counters);
+    }
+    return sizeof(struct css_list);
 }
 static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
-    return g == G_FLOAT_SHAPE ? a->float_shape == b->float_shape : g == G_OFFSET ? a->offset == b->offset :
-           g == G_GAP_RULE ? a->gap_rules == b->gap_rules : a->anchor == b->anchor;
+    switch (g) {
+    case G_FLOAT_SHAPE: return a->float_shape == b->float_shape;
+    case G_OFFSET: return a->offset == b->offset;
+    case G_GAP_RULE: return a->gap_rules == b->gap_rules;
+    case G_ANCHOR: return a->anchor == b->anchor;
+    case G_COUNTER: return a->counters == b->counters;
+    }
+    return a->list == b->list;
 }
 /* s's group g becomes a copy of value in a, for the caller to finish writing: the group s held may
    be another style's too (box.c's copies of a style, the animation layer's copy of its base) */
@@ -1099,15 +1120,18 @@ static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
     if (g == G_FLOAT_SHAPE) s->float_shape = copy;
     else if (g == G_OFFSET) s->offset = copy;
     else if (g == G_GAP_RULE) s->gap_rules = copy;
-    else s->anchor = copy;
+    else if (g == G_ANCHOR) s->anchor = copy;
+    else if (g == G_COUNTER) s->counters = copy;
+    else s->list = copy;
     return copy;
 }
-/* every group of src, as copying each of their (uninherited) properties would */
+/* every group of src whose properties are not inherited, as copying each of them would */
 static void groups_copy(style_t *dst, const style_t *src) {
     dst->float_shape = src->float_shape;
     dst->offset = src->offset;
     dst->gap_rules = src->gap_rules;
     dst->anchor = src->anchor;
+    dst->counters = src->counters;
 }
 /* the property's field in s */
 static const void *field_of(const style_t *s, const struct propdef *p) {
@@ -1119,6 +1143,9 @@ static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, w
 static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
 static bool position_try_text(const struct css_anchor *a, sbuf *out);
 static bool anchor_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+static void list_style_text(const style_t *st, sbuf *out);
+static bool list_value_text(const style_t *st, const struct propdef *p, sbuf *out);
+static bool list_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
@@ -1149,9 +1176,11 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
     case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
     case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
     case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE: case PT_ANCHOR:
+    case PT_CONTENT: case PT_LIST_TYPE: case PT_LIST_IMAGE: case PT_QUOTES: case PT_COUNTER:
         return css_computed_value(st, p, out, d) ? 1 : -1;
     case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
     case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
+        if (p->sh == SH_LIST_STYLE) { list_style_text(st, out); return 1; }
         if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
         if (p->sh == SH_GAP_RULE) return gap_computed(st, p, out, d);
         if (p->sh == SH_POSITION_TRY) return position_try_text(css_style_anchor(st), out) ? 1 : -1;
@@ -1172,6 +1201,9 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
     if (p->group == G_GAP_RULE || (p->type == PT_SHORT && p->sh == SH_GAP_RULE)) return gap_specified(p, v, n, out);
     if (p->group == G_ANCHOR || (p->type == PT_SHORT && p->sh == SH_POSITION_TRY)) return anchor_specified(p, v, n, out);
+    if (p->type == PT_CONTENT || p->type == PT_LIST_TYPE || p->type == PT_LIST_IMAGE || p->type == PT_QUOTES ||
+        p->type == PT_COUNTER || (p->type == PT_SHORT && p->sh == SH_LIST_STYLE))
+        return list_specified(p, v, n, out);
     /* a length (or a shorthand of lengths) with an anchor function in it; the rest as other lengths */
     if (((p->type == PT_LEN && (p->flags & (LF_ANCHOR | LF_ANCHOR_SIZE))) ||
          (p->type == PT_SHORT && (p->sh == SH_INSET || p->sh == SH_INSET_BLOCK || p->sh == SH_INSET_INLINE ||
@@ -2704,33 +2736,6 @@ static bool choose_family(const char *s, size_t n, uint8_t *out, struct cx *cx) 
 
 }
 
-static bool parse_list_type(const char *s, size_t n, struct cx *cx, uint8_t *out, const char **str) {
-    static const struct kw kl[] = {
-        {"disc", LS_DISC}, {"circle", LS_CIRCLE}, {"square", LS_SQUARE}, {"decimal", LS_DECIMAL},
-        {"decimal-leading-zero", LS_DECIMAL_LZ}, {"lower-alpha", LS_LOWER_ALPHA}, {"lower-latin", LS_LOWER_ALPHA},
-        {"upper-alpha", LS_UPPER_ALPHA}, {"upper-latin", LS_UPPER_ALPHA}, {"lower-roman", LS_LOWER_ROMAN},
-        {"upper-roman", LS_UPPER_ROMAN}, {"lower-greek", LS_LOWER_GREEK}, {"none", LS_NONE}, {0}};
-    *str = NULL;
-    if (kw_find(kl, s, n, out)) return true;
-    if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) {
-        sbuf b = {0};
-        css_unescape(&b, s + 1, n - 2);
-        *str = ar_strndup(cx->a, b.p ? b.p : "", b.n);
-        sb_free(&b);
-        *out = LS_STRING;
-        return true;
-    }
-    if (ident_is(s, n, "disclosure-open") || ident_is(s, n, "disclosure-closed")) {
-        *str = ident_is(s, n, "disclosure-open") ? "\xe2\x96\xbe " : "\xe2\x96\xb8 ";
-        *out = LS_STRING;
-        return true;
-    }
-    for (size_t i = 0; i < n; i++)
-        if (!isalnum((unsigned char)s[i]) && s[i] != '-') return false;
-    *out = LS_DECIMAL; /* other counter styles: numbers will do */
-    return true;
-}
-
 /* url(...) contents, unescaped */
 const char *css_parse_url(const char *s, size_t n, arena_t *a) {
     if (n < 5 || !strn_ieq(s, "url(", 4) || s[n - 1] != ')') {
@@ -3028,56 +3033,611 @@ static bool parse_bg_image(const char *s, size_t n, struct cx *cx) {
     return !cx->supports_probe && k > 0;
 }
 
-static bool parse_content(const char *s, size_t n, struct cx *cx) {
-    if (ident_is(s, n, "none") || ident_is(s, n, "normal")) {
-        cx->s->content = NULL;
+/* ---------------------------------------------------------------- lists, counters and generated content */
+/* The values of list-style-* (CSS Lists 3 §3), counter-* (§4), quotes and content (CSS Generated
+   Content 3 §1-2), and the counter styles they name (CSS Counter Styles 3 §3.1, §6.1). counter.c
+   counts the counters and writes the text these values generate. */
+const struct css_counters css_counters_initial = {{NULL}};
+const struct css_list css_list_initial = {0};
+const struct css_content css_content_none = {.none = true};
+static const struct css_quotes quotes_none = {0};
+static const char *const counter_style_names[LS_PREDEFINED] = {
+#define CSS_COUNTER_STYLE_NAME(id, name) name,
+    CSS_COUNTER_STYLES(CSS_COUNTER_STYLE_NAME)
+#undef CSS_COUNTER_STYLE_NAME
+};
+
+static bool prefix_is(const char *s, size_t n, const char *prefix) {
+    size_t k = strlen(prefix);
+    return n >= k && strn_ieq(s, prefix, k);
+}
+/* a <string-token> that is the whole of s */
+static bool string_token(const char *s, size_t n) {
+    if (n < 2 || (s[0] != '"' && s[0] != '\'') || s[n - 1] != s[0]) return false;
+    for (size_t i = 1; i + 1 < n; i++) {
+        if (s[i] == '\\') i++;
+        else if (s[i] == s[0]) return false;
+    }
+    return true;
+}
+static const char *string_value(const char *s, size_t n, arena_t *a) {
+    sbuf b = {0};
+    css_unescape(&b, s + 1, n - 2);
+    const char *r = ar_strndup(a, b.p ? b.p : "", b.n);
+    sb_free(&b);
+    return r;
+}
+/* the next space-separated component of [*p, e), its strings, functions and escapes kept whole */
+static bool value_token(const char **p, const char *e, const char **token, size_t *length) {
+    const char *s = *p;
+    while (s < e && is_space((unsigned char)*s)) s++;
+    if (s >= e) { *p = s; return false; }
+    const char *start = s;
+    int depth = 0;
+    char q = 0;
+    for (; s < e; s++) {
+        char c = *s;
+        if (c == '\\' && s + 1 < e) { s++; continue; }
+        if (q) { if (c == q) q = 0; }
+        else if (c == '"' || c == '\'') q = c;
+        else if (c == '(') depth++;
+        else if (c == ')') { if (depth) depth--; }
+        else if (!depth && is_space((unsigned char)c)) break;
+    }
+    *token = start;
+    *length = (size_t)(s - start);
+    *p = s;
+    return true;
+}
+static bool name_start(const char *s, size_t n, size_t i) {
+    if (i >= n) return false;
+    unsigned char c = (unsigned char)s[i];
+    return isalpha(c) || c == '_' || c >= 0x80 || (c == '\\' && i + 1 < n && s[i + 1] != '\n');
+}
+/* the length of the <ident-token> s starts with, its escapes included; 0: none */
+static size_t ident_token(const char *s, size_t n) {
+    size_t i = 0;
+    if (n && s[0] == '-') i = n > 1 && s[1] == '-' ? 2 : name_start(s, n, 1) ? 1 : 0;
+    if (!i && !name_start(s, n, 0)) return 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\') {
+            if (i + 1 >= n || s[i + 1] == '\n') break;
+            i++;
+            if (isxdigit((unsigned char)s[i])) {
+                for (int k = 0; k < 6 && i < n && isxdigit((unsigned char)s[i]); k++) i++;
+                if (i < n && is_space((unsigned char)s[i])) i++;
+            } else i++;
+        } else if (isalnum(c) || c == '-' || c == '_' || c >= 0x80) i++;
+        else break;
+    }
+    return i;
+}
+/* a <custom-ident> (CSS Values 4 §6.6.1) that is the whole of s, decoded, which is not a CSS-wide
+   keyword, default or excluded (ASCII case-insensitively); NULL when it is not one */
+static const char *custom_ident(const char *s, size_t n, arena_t *a, const char *excluded) {
+    if (!n || ident_token(s, n) != n) return NULL;
+    sbuf b = {0};
+    css_unescape(&b, s, n);
+    const char *name = b.p ? b.p : "";
+    static const char *const reserved[] = {"initial", "inherit", "unset", "revert", "revert-layer", "default"};
+    bool bad = excluded && ident_is(name, b.n, excluded);
+    for (size_t i = 0; i < sizeof reserved / sizeof *reserved; i++) bad = bad || ident_is(name, b.n, reserved[i]);
+    const char *r = bad ? NULL : ar_strndup(a, name, b.n);
+    sb_free(&b);
+    return r;
+}
+
+/* symbols() (CSS Counter Styles 3 §6.1): symbols( <symbols-type>? [ <string> | <image> ]+ ). An
+   <image> symbol is not supported, so the function is invalid with one. */
+static bool parse_symbols(const char *s, size_t n, struct cx *cx, const struct css_symbols **out) {
+    static const char *const types[] = {"cyclic", "numeric", "alphabetic", "symbolic", "fixed"};
+    if (!prefix_is(s, n, "symbols(") || s[n - 1] != ')') return false;
+    const char *p = s + 8, *e = s + n - 1, *t;
+    size_t tn;
+    uint8_t type = CSS_SYMBOLS_SYMBOLIC;
+    uint32_t count = 0;
+    bool first = true;
+    for (const char *q = p; value_token(&q, e, &t, &tn); first = false) {
+        if (string_token(t, tn)) { count++; continue; }
+        bool typed = false;
+        for (uint8_t i = 0; first && i < 5; i++) if (ident_is(t, tn, types[i])) type = i, typed = true;
+        if (!typed) return false;
+    }
+    if (!count || ((type == CSS_SYMBOLS_NUMERIC || type == CSS_SYMBOLS_ALPHABETIC) && count < 2)) return false;
+    struct css_symbols *y = ar_alloc(cx->a, sizeof *y + count * sizeof *y->symbol);
+    y->type = type;
+    for (const char *q = p; value_token(&q, e, &t, &tn);)
+        if (string_token(t, tn)) y->symbol[y->n++] = string_value(t, tn, cx->a);
+    *out = y;
+    return true;
+}
+/* a <counter-style> (§3.1): a <counter-style-name>, which none is not, or symbols(). The predefined
+   names match ASCII case-insensitively; another name keeps its case. */
+static bool parse_counter_style(const char *s, size_t n, struct cx *cx, struct css_counter_style *out) {
+    memset(out, 0, sizeof *out);
+    if (prefix_is(s, n, "symbols(")) { out->id = LS_SYMBOLS; return parse_symbols(s, n, cx, &out->symbols); }
+    const char *name = custom_ident(s, n, cx->a, "none");
+    if (!name) return false;
+    size_t length = strlen(name);
+    for (uint8_t i = 0; i < LS_PREDEFINED; i++)
+        if (ident_is(name, length, counter_style_names[i])) { out->id = i; return true; }
+    out->id = LS_NAMED;
+    out->name = name;
+    return true;
+}
+static void symbols_text(const struct css_symbols *y, sbuf *out) {
+    static const char *const types[] = {"cyclic", "numeric", "alphabetic", "symbolic", "fixed"};
+    sb_puts(out, "symbols(");
+    if (y->type != CSS_SYMBOLS_SYMBOLIC) { sb_puts(out, types[y->type]); sb_putc(out, ' '); }
+    for (uint32_t i = 0; i < y->n; i++) {
+        if (i) sb_putc(out, ' ');
+        css_serialize_string(out, y->symbol[i]);
+    }
+    sb_putc(out, ')');
+}
+static void counter_style_text(const struct css_counter_style *c, sbuf *out) {
+    if (c->id < LS_PREDEFINED) sb_puts(out, counter_style_names[c->id]);
+    else if (c->id == LS_STRING) css_serialize_string(out, c->name ? c->name : "");
+    else if (c->id == LS_NAMED) css_serialize_ident(out, c->name ? c->name : "");
+    else if (c->id == LS_SYMBOLS && c->symbols) symbols_text(c->symbols, out);
+    else sb_puts(out, "none");
+}
+static bool symbols_equal(const struct css_symbols *a, const struct css_symbols *b) {
+    if (a == b) return true;
+    if (!a || !b || a->type != b->type || a->n != b->n) return false;
+    for (uint32_t i = 0; i < a->n; i++) if (strcmp(a->symbol[i], b->symbol[i])) return false;
+    return true;
+}
+static bool counter_style_equal(const struct css_counter_style *a, const struct css_counter_style *b) {
+    return a->id == b->id && same_name(a->name, b->name) && symbols_equal(a->symbols, b->symbols);
+}
+
+/* list-style-type (CSS Lists 3 §3.4): <counter-style> | <string> | none. Its id is the style's
+   list_style; a string, another name or symbols() is the list group's. */
+static bool parse_list_type(const char *s, size_t n, struct cx *cx) {
+    struct css_counter_style c = {0};
+    if (ident_is(s, n, "none")) c.id = LS_NONE;
+    else if (string_token(s, n)) { c.id = LS_STRING; c.name = string_value(s, n, cx->a); }
+    else if (!parse_counter_style(s, n, cx, &c)) return false;
+    cx->s->list_style = c.id;
+    const struct css_list *l = css_style_list(cx->s);
+    if (l->type_name != c.name || l->type_symbols != c.symbols) {
+        struct css_list *own = group_write(cx->s, G_LIST, l, cx->a);
+        own->type_name = c.name;
+        own->type_symbols = c.symbols;
+    }
+    return true;
+}
+/* an <image> (CSS Images 3 §2): url() or a gradient function. image-set(), cross-fade() and
+   element() are not supported; nor do they parse. */
+static bool parse_image_value(const char *s, size_t n, struct cx *cx, const struct css_image **out) {
+    struct css_image im = {0};
+    if (prefix_is(s, n, "url(")) {
+        if (s[n - 1] != ')' || !(im.url = css_parse_url(s, n, cx->a))) return false;
+        im.kind = CSS_IMAGE_URL;
+    } else {
+        static const char *const gradients[] = {"linear-gradient(", "radial-gradient(", "conic-gradient(",
+            "repeating-linear-gradient(", "repeating-radial-gradient(", "repeating-conic-gradient("};
+        int which = -1;
+        for (int i = 0; i < 6; i++) if (prefix_is(s, n, gradients[i])) which = i;
+        if (which < 0 || s[n - 1] != ')') return false;
+        im.gradient = parse_gradient(s, n, cx);
+        if (!im.gradient && which % 3 != 2) return false; /* the background layer's parser reads all but conic */
+        im.kind = CSS_IMAGE_GRADIENT;
+        im.text = ar_strndup(cx->a, s, n);
+    }
+    struct css_image *r = ar_alloc(cx->a, sizeof *r);
+    *r = im;
+    *out = r;
+    return true;
+}
+static void image_text(const struct css_image *im, sbuf *out) {
+    if (im->kind != CSS_IMAGE_URL) { sb_puts(out, im->text ? im->text : ""); return; }
+    sb_puts(out, "url(");
+    css_serialize_string(out, im->url ? im->url : "");
+    sb_putc(out, ')');
+}
+static bool image_equal(const struct css_image *a, const struct css_image *b) {
+    if (a == b) return true;
+    return a && b && a->kind == b->kind && same_name(a->url, b->url) && same_name(a->text, b->text);
+}
+/* exactly one component */
+static bool single_token(const char *s, size_t n, const char **t, size_t *tn) {
+    const char *p = s, *e = s + n, *rest;
+    size_t rn;
+    return value_token(&p, e, t, tn) && !value_token(&p, e, &rest, &rn);
+}
+/* list-style-image (§3.3): <image> | none */
+static bool parse_list_image(const char *s, size_t n, struct cx *cx, const struct css_image **out) {
+    const char *t;
+    size_t tn;
+    if (ident_is(s, n, "none")) { *out = NULL; return true; }
+    return single_token(s, n, &t, &tn) && parse_image_value(t, tn, cx, out);
+}
+/* quotes (CSS Generated Content 3 §2.1): auto | none | [<string> <string>]+ */
+static bool parse_quotes(const char *s, size_t n, struct cx *cx, const struct css_quotes **out) {
+    if (ident_is(s, n, "auto")) { *out = NULL; return true; }
+    if (ident_is(s, n, "none")) { *out = &quotes_none; return true; }
+    const char *p = s, *e = s + n, *t;
+    size_t tn;
+    uint32_t count = 0;
+    while (value_token(&p, e, &t, &tn)) {
+        if (!string_token(t, tn)) return false;
+        count++;
+    }
+    if (!count || count % 2) return false;
+    struct css_quotes *q = ar_alloc(cx->a, sizeof *q + count * sizeof *q->quote);
+    q->pairs = count / 2;
+    count = 0;
+    for (p = s; value_token(&p, e, &t, &tn);) q->quote[count++] = string_value(t, tn, cx->a);
+    *out = q;
+    return true;
+}
+static void quotes_text(const struct css_quotes *q, sbuf *out) {
+    if (!q) { sb_puts(out, "auto"); return; }
+    if (!q->pairs) { sb_puts(out, "none"); return; }
+    for (uint32_t i = 0; i < 2 * q->pairs; i++) {
+        if (i) sb_putc(out, ' ');
+        css_serialize_string(out, q->quote[i]);
+    }
+}
+static bool quotes_equal(const struct css_quotes *a, const struct css_quotes *b) {
+    if (a == b) return true;
+    if (!a || !b || a->pairs != b->pairs) return false;
+    for (uint32_t i = 0; i < 2 * a->pairs; i++) if (strcmp(a->quote[i], b->quote[i])) return false;
+    return true;
+}
+bool css_list_equal(const struct css_list *a, const struct css_list *b) {
+    if (!a) a = &css_list_initial;
+    if (!b) b = &css_list_initial;
+    return a == b || (same_name(a->type_name, b->type_name) && symbols_equal(a->type_symbols, b->type_symbols) &&
+                      image_equal(a->image, b->image) && quotes_equal(a->quotes, b->quotes));
+}
+
+/* an <integer> (CSS Values 4 §5.2), or a math function that resolves to a number, which an integer
+   context rounds to the nearest integer, a half toward +infinity (§10.9); in range */
+static bool integer_value(const char *s, size_t n, struct cx *cx, int32_t *out) {
+    double d;
+    if (css_calc_is_math(s, n)) {
+        if (!css_numeric_read(s, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &d, NULL)) return false;
+        d = isnan(d) ? 0 : floor(d + 0.5);
+    } else {
+        size_t i = n && (s[0] == '+' || s[0] == '-') ? 1 : 0;
+        if (i == n) return false;
+        d = 0;
+        for (size_t k = i; k < n; k++) {
+            if (s[k] < '0' || s[k] > '9') return false;
+            if (d < 1e12) d = d * 10 + (s[k] - '0');
+        }
+        if (s[0] == '-') d = -d;
+    }
+    *out = d >= 2147483647.0 ? INT32_MAX : d <= -2147483648.0 ? INT32_MIN : (int32_t)d;
+    return true;
+}
+/* counter-reset, counter-increment and counter-set (CSS Lists 3 §4.1-4.3): none, or
+   [<counter-name> <integer>?]+, reversed(<counter-name>) also for counter-reset. A missing value is
+   0 (1 for counter-increment), and a reversed one without a value is left for counting to find.
+   specified: the value's CSSOM serialization as declared (its integers' math functions kept). */
+static bool parse_counter_ops(const char *s, size_t n, struct cx *cx, int which, const struct css_counter_ops **out,
+                              sbuf *specified) {
+    if (ident_is(s, n, "none")) {
+        *out = NULL;
+        if (specified) sb_puts(specified, "none");
         return true;
     }
-    /* "text" / alt text after a slash is dropped */
-    for (size_t i = 0, q = 0; i < n; i++) {
-        if (q) {
-            if (s[i] == '\\') i++;
-            else if (s[i] == (char)q) q = 0;
-        } else if (s[i] == '"' || s[i] == '\'') q = (unsigned char)s[i];
-        else if (s[i] == '/') {
-            if (cx->supports_probe) return false;
-            n = i;
-            break;
+    const char *e = s + n, *t, *v = NULL;
+    size_t tn, vn = 0;
+    uint32_t count = 0;
+    for (const char *p = s; value_token(&p, e, &t, &tn);) count++;
+    if (!count) return false;
+    struct css_counter_ops *ops = ar_alloc(cx->a, sizeof *ops + count * sizeof *ops->op);
+    for (const char *p = s; value_token(&p, e, &t, &tn);) {
+        struct css_counter_op op = {0};
+        if (which == CSS_COUNTER_RESET && prefix_is(t, tn, "reversed(") && t[tn - 1] == ')') {
+            const char *in = t + 9;
+            size_t inn = tn - 10;
+            trim(&in, &inn);
+            op.reversed = true;
+            op.name = custom_ident(in, inn, cx->a, "none");
+        } else op.name = custom_ident(t, tn, cx->a, "none");
+        if (!op.name) return false;
+        const char *q = p;
+        if (value_token(&q, e, &v, &vn) && integer_value(v, vn, cx, &op.value)) { op.valued = true; p = q; }
+        else op.value = which == CSS_COUNTER_INCREMENT ? 1 : 0;
+        if (specified) {
+            if (ops->n) sb_putc(specified, ' ');
+            if (op.reversed) sb_puts(specified, "reversed(");
+            css_serialize_ident(specified, op.name);
+            if (op.reversed) sb_putc(specified, ')');
+            if (op.valued || !op.reversed) {
+                char number[16];
+                snprintf(number, sizeof number, " %d", (int)op.value);
+                if (op.valued && css_calc_is_math(v, vn)) {
+                    sb_putc(specified, ' ');
+                    sbuf math = {0};
+                    if (css_calc_specified(v, vn, CSS_CALC_NUMBER, &math)) sb_put(specified, math.p ? math.p : "", math.n);
+                    else sb_put(specified, v, vn);
+                    sb_free(&math);
+                } else sb_puts(specified, number);
+            }
         }
+        ops->op[ops->n++] = op;
     }
-    const char *t[32];
-    size_t tl[32];
-    int k = split_checked(s, n, t, tl, 32, ' ', cx);
-    sbuf b = {0};
-    for (int i = 0; i < k; i++) {
-        const char *v = t[i];
-        size_t vn = tl[i];
-        if (vn >= 2 && (v[0] == '"' || v[0] == '\'') && v[vn - 1] == v[0]) css_unescape(&b, v + 1, vn - 2);
-        else if (ident_is(v, vn, "open-quote")) sb_puts(&b, "\xe2\x80\x9c");
-        else if (ident_is(v, vn, "close-quote")) sb_puts(&b, "\xe2\x80\x9d");
-        else if (ident_is(v, vn, "no-open-quote") || ident_is(v, vn, "no-close-quote")) {
-        } else if (vn > 5 && strn_ieq(v, "attr(", 5) && v[vn - 1] == ')') {
-            const char *an = v + 5;
-            size_t anl = vn - 6;
-            trim(&an, &anl);
-            node_t *e = cx->node;
-            if (e)
-                for (int j = 0; j < e->nattrs; j++)
-                    if (!e->attrs[j].namespace_uri && strlen(e->attrs[j].raw) == anl &&
-                        !memcmp(an, e->attrs[j].raw, anl)) sb_puts(&b, e->attrs[j].value);
-        } else if (vn > 8 && (strn_ieq(v, "counter(", 8) || strn_ieq(v, "counters(", 9))) {
-            if (cx->supports_probe) { sb_free(&b); return false; }
-        } else if (vn > 4 && (strn_ieq(v, "url(", 4) || strn_ieq(v, "image-set(", 10) ||
-                              strstr(v, "gradient("))) {
-            if (cx->supports_probe) { sb_free(&b); return false; }
-        } else {
-            sb_free(&b);
-            return false;
-        }
-    }
-    cx->s->content = ar_strndup(cx->a, b.p ? b.p : "", b.n);
-    sb_free(&b);
+    *out = ops;
     return true;
+}
+static void counter_ops_text(const struct css_counter_ops *ops, sbuf *out) {
+    if (!ops || !ops->n) { sb_puts(out, "none"); return; }
+    for (uint32_t i = 0; i < ops->n; i++) {
+        const struct css_counter_op *op = &ops->op[i];
+        if (i) sb_putc(out, ' ');
+        if (op->reversed) sb_puts(out, "reversed(");
+        css_serialize_ident(out, op->name);
+        if (op->reversed) sb_putc(out, ')');
+        if (op->valued || !op->reversed) {
+            char number[16];
+            snprintf(number, sizeof number, " %d", (int)op->value);
+            sb_puts(out, number);
+        }
+    }
+}
+static bool counter_ops_equal(const struct css_counter_ops *a, const struct css_counter_ops *b) {
+    if (a == b) return true;
+    if (!a || !b || a->n != b->n) return false;
+    for (uint32_t i = 0; i < a->n; i++) {
+        const struct css_counter_op *x = &a->op[i], *y = &b->op[i];
+        if (strcmp(x->name, y->name) || x->value != y->value || x->reversed != y->reversed || x->valued != y->valued)
+            return false;
+    }
+    return true;
+}
+bool css_counters_equal(const struct css_counters *a, const struct css_counters *b) {
+    if (!a) a = &css_counters_initial;
+    if (!b) b = &css_counters_initial;
+    for (int i = 0; i < 3; i++) if (!counter_ops_equal(a->ops[i], b->ops[i])) return false;
+    return true;
+}
+
+/* one item of content's list (alt: of its alternative text, which takes strings, counters and
+   attr() only): <string>, counter(), counters(), a <quote>, attr() or an <image> */
+static bool content_item(const char *t, size_t tn, struct cx *cx, bool alt, struct css_content_item *it) {
+    static const char *const quotes[] = {"open-quote", "close-quote", "no-open-quote", "no-close-quote"};
+    memset(it, 0, sizeof *it);
+    it->style.id = LS_DECIMAL;
+    if (string_token(t, tn)) { it->kind = CSS_CONTENT_STRING; it->text = string_value(t, tn, cx->a); return true; }
+    for (int i = 0; i < 4; i++)
+        if (ident_is(t, tn, quotes[i])) { it->kind = (uint8_t)(CSS_CONTENT_OPEN_QUOTE + i); return !alt; }
+    bool plural = prefix_is(t, tn, "counters(");
+    if ((plural || prefix_is(t, tn, "counter(")) && t[tn - 1] == ')') {
+        size_t head = plural ? 9 : 8;
+        const char *a[4];
+        size_t al[4];
+        int k = split(t + head, tn - head - 1, a, al, 4, ',');
+        if (k < (plural ? 2 : 1) || k > (plural ? 3 : 2)) return false;
+        it->kind = plural ? CSS_CONTENT_COUNTERS : CSS_CONTENT_COUNTER;
+        if (!(it->text = custom_ident(a[0], al[0], cx->a, "none"))) return false;
+        if (plural) {
+            if (!string_token(a[1], al[1])) return false;
+            it->separator = string_value(a[1], al[1], cx->a);
+        }
+        return k == (plural ? 2 : 1) || parse_counter_style(a[k - 1], al[k - 1], cx, &it->style);
+    }
+    if (prefix_is(t, tn, "attr(") && t[tn - 1] == ')') {
+        const char *in = t + 5;
+        size_t inn = tn - 6;
+        trim(&in, &inn);
+        size_t name = ident_token(in, inn);
+        if (!name) return false;
+        it->kind = CSS_CONTENT_STRING;
+        node_t *e = cx->node;
+        if (!e) { it->kind = CSS_CONTENT_ATTR; it->text = ar_strndup(cx->a, t, tn); return true; }
+        /* CSS Values 5 §7.7: substituted at computed-value time; the attribute's value, or the fallback */
+        const char *fallback = NULL;
+        size_t fl = 0;
+        const char *comma = memchr(in, ',', inn);
+        if (comma) { fallback = comma + 1; fl = inn - (size_t)(comma + 1 - in); trim(&fallback, &fl); }
+        for (int j = 0; j < e->nattrs; j++)
+            if (!e->attrs[j].namespace_uri && strlen(e->attrs[j].raw) == name && !memcmp(in, e->attrs[j].raw, name)) {
+                it->text = ar_strdup(cx->a, e->attrs[j].value);
+                return true;
+            }
+        it->text = fallback && string_token(fallback, fl) ? string_value(fallback, fl, cx->a) : "";
+        return true;
+    }
+    if (alt) return false;
+    it->kind = CSS_CONTENT_IMAGE;
+    return parse_image_value(t, tn, cx, &it->image);
+}
+/* content (CSS Generated Content 3 §1.1): normal | none | [<content-replacement> | <content-list>]
+   [/ [<string> | <counter> | <attr()>]+]? */
+static bool parse_content(const char *s, size_t n, struct cx *cx) {
+    if (ident_is(s, n, "normal")) { cx->s->content = NULL; return true; }
+    if (ident_is(s, n, "none")) { cx->s->content = &css_content_none; return true; }
+    size_t slash = n;
+    int depth = 0;
+    char q = 0;
+    for (size_t i = 0; i < n && slash == n; i++) {
+        char c = s[i];
+        if (c == '\\') { i++; continue; }
+        if (q) { if (c == q) q = 0; }
+        else if (c == '"' || c == '\'') q = c;
+        else if (c == '(') depth++;
+        else if (c == ')') { if (depth) depth--; }
+        else if (!depth && c == '/') slash = i;
+    }
+    const char *e = s + slash, *alt_end = s + n, *t;
+    size_t tn;
+    uint32_t main = 0, alt = 0;
+    for (const char *p = s; value_token(&p, e, &t, &tn);) main++;
+    if (slash < n) for (const char *p = e + 1; value_token(&p, alt_end, &t, &tn);) alt++;
+    if (!main || (slash < n && !alt)) return false;
+    struct css_content *c = ar_alloc(cx->a, sizeof *c + (main + alt) * sizeof *c->item);
+    c->n = main;
+    c->alt = alt;
+    uint32_t i = 0;
+    for (const char *p = s; value_token(&p, e, &t, &tn);) if (!content_item(t, tn, cx, false, &c->item[i++])) return false;
+    if (slash < n)
+        for (const char *p = e + 1; value_token(&p, alt_end, &t, &tn);)
+            if (!content_item(t, tn, cx, true, &c->item[i++])) return false;
+    cx->s->content = c;
+    return true;
+}
+static void content_item_text(const struct css_content_item *it, sbuf *out) {
+    static const char *const quotes[] = {"open-quote", "close-quote", "no-open-quote", "no-close-quote"};
+    switch (it->kind) {
+    case CSS_CONTENT_STRING: css_serialize_string(out, it->text ? it->text : ""); break;
+    case CSS_CONTENT_COUNTER: case CSS_CONTENT_COUNTERS:
+        sb_puts(out, it->kind == CSS_CONTENT_COUNTERS ? "counters(" : "counter(");
+        css_serialize_ident(out, it->text);
+        if (it->kind == CSS_CONTENT_COUNTERS) { sb_puts(out, ", "); css_serialize_string(out, it->separator); }
+        if (it->style.id != LS_DECIMAL) { sb_puts(out, ", "); counter_style_text(&it->style, out); }
+        sb_putc(out, ')');
+        break;
+    case CSS_CONTENT_OPEN_QUOTE: case CSS_CONTENT_CLOSE_QUOTE: case CSS_CONTENT_NO_OPEN_QUOTE:
+    case CSS_CONTENT_NO_CLOSE_QUOTE: sb_puts(out, quotes[it->kind - CSS_CONTENT_OPEN_QUOTE]); break;
+    case CSS_CONTENT_IMAGE: image_text(it->image, out); break;
+    case CSS_CONTENT_ATTR: sb_puts(out, it->text); break;
+    }
+}
+static void content_text(const struct css_content *c, sbuf *out) {
+    if (!c) { sb_puts(out, "normal"); return; }
+    if (c->none) { sb_puts(out, "none"); return; }
+    for (uint32_t i = 0; i < c->n + c->alt; i++) {
+        if (i == c->n) sb_puts(out, " / ");
+        else if (i) sb_putc(out, ' ');
+        content_item_text(&c->item[i], out);
+    }
+}
+bool css_content_equal(const struct css_content *a, const struct css_content *b) {
+    if (a == b) return true;
+    if (!a || !b || a->none != b->none || a->n != b->n || a->alt != b->alt) return false;
+    for (uint32_t i = 0; i < a->n + a->alt; i++) {
+        const struct css_content_item *x = &a->item[i], *y = &b->item[i];
+        if (x->kind != y->kind || !same_name(x->text, y->text) || !same_name(x->separator, y->separator) ||
+            !counter_style_equal(&x->style, &y->style) || !image_equal(x->image, y->image)) return false;
+    }
+    return true;
+}
+bool css_content_counted(const struct css_content *c) {
+    if (!c) return false;
+    for (uint32_t i = 0; i < c->n; i++)
+        if (c->item[i].kind != CSS_CONTENT_STRING && c->item[i].kind != CSS_CONTENT_IMAGE &&
+            c->item[i].kind != CSS_CONTENT_ATTR) return true;
+    return false;
+}
+void css_content_strings(const struct css_content *c, sbuf *out) {
+    for (uint32_t i = 0; c && i < c->n; i++)
+        if (c->item[i].kind == CSS_CONTENT_STRING) sb_puts(out, c->item[i].text);
+}
+
+/* CSS Lists 3 §3.1: the UA style sheet's ::marker rule, which the cascade applies under every author
+   declaration of a list item's ::marker (css.c) and which a ::marker without any takes alone. Of
+   its declarations, unicode-bidi and font-variant-numeric have no field here. */
+void css_style_marker_defaults(style_t *s) {
+    s->white_space = WS_PRE;
+    s->text_transform = TT_NONE;
+}
+void css_style_marker(style_t *s, const style_t *item) {
+    css_style_init(s, item);
+    css_style_marker_defaults(s);
+    css_style_finish(s, item, false);
+}
+
+static bool apply_short(const struct propdef *p, const char *v, size_t n, struct cx *cx);
+/* the list-style shorthand (CSS Lists 3 §3.6): <'list-style-position'> || <'list-style-image'> ||
+   <'list-style-type'>, where none goes to whichever of the image and the type the others leave */
+static bool list_style_parts(const char *v, size_t n, struct cx *cx, const char *part[3], size_t length[3]) {
+    const char *p = v, *e = v + n, *t;
+    size_t tn;
+    int nones = 0;
+    part[0] = part[1] = part[2] = NULL; /* position, image, type */
+    style_t scratch = initial;
+    struct cx probe = *cx;
+    probe.s = &scratch;
+    probe.supports_probe = true;
+    const struct css_image *image;
+    uint8_t position;
+    while (value_token(&p, e, &t, &tn)) {
+        /* each component once: after the position, a second "outside" is a <counter-style-name> */
+        int which;
+        if (!part[0] && kw_find(kw_lspos, t, tn, &position)) which = 0;
+        else if (ident_is(t, tn, "none")) { nones++; continue; }
+        else if (!part[1] && parse_image_value(t, tn, &probe, &image)) which = 1;
+        else if (!part[2] && parse_list_type(t, tn, &probe)) which = 2;
+        else return false;
+        part[which] = t;
+        length[which] = tn;
+    }
+    if (nones > !part[1] + !part[2]) return false;
+    if (nones) {
+        if (!part[1]) { part[1] = "none"; length[1] = 4; }
+        if (!part[2]) { part[2] = "none"; length[2] = 4; }
+    }
+    return true;
+}
+static void list_style_text(const style_t *st, sbuf *out) {
+    const struct css_list *l = css_style_list(st);
+    struct css_counter_style c = {st->list_style, l->type_name, l->type_symbols};
+    /* a type named inside or outside alone would read back as the position: write the position first */
+    bool positional = c.id == LS_NAMED && c.name && (!strcasecmp(c.name, "inside") || !strcasecmp(c.name, "outside"));
+    bool any = false;
+    if (st->list_style_inside || positional) { sb_puts(out, st->list_style_inside ? "inside" : "outside"); any = true; }
+    if (l->image) { if (any) sb_putc(out, ' '); image_text(l->image, out); any = true; }
+    if (st->list_style != LS_DISC) {
+        if (any) sb_putc(out, ' ');
+        counter_style_text(&c, out);
+        any = true;
+    }
+    if (!any) sb_puts(out, "outside");
+}
+/* the computed value of a list, counter, quotes or content property */
+static bool list_value_text(const style_t *st, const struct propdef *p, sbuf *out) {
+    const struct css_list *l = css_style_list(st);
+    switch (p->type) {
+    case PT_LIST_TYPE: {
+        struct css_counter_style c = {st->list_style, l->type_name, l->type_symbols};
+        counter_style_text(&c, out);
+        return true;
+    }
+    case PT_LIST_IMAGE:
+        if (l->image) image_text(l->image, out);
+        else sb_puts(out, "none");
+        return true;
+    case PT_QUOTES: quotes_text(l->quotes, out); return true;
+    case PT_COUNTER: counter_ops_text(css_style_counters(st)->ops[p->flags], out); return true;
+    case PT_CONTENT: content_text(st->content, out); return true;
+    }
+    return false;
+}
+/* CSSOM: the specified serialization of a declared list, counter, quotes or content value, or of the
+   list-style shorthand; false leaves the authored text */
+static bool list_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    props_init();
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    size_t begin = out->n;
+    if (!setjmp(trap)) {
+        style_t scratch = initial;
+        uint8_t set[NPROPS];
+        memset(set, 0, sizeof set);
+        struct cx cx = {.s = &scratch, .a = &a, .set = set, .supports_probe = true};
+        if (p->type == PT_COUNTER) {
+            const struct css_counter_ops *ops;
+            ok = parse_counter_ops(v, n, &cx, p->flags, &ops, out);
+        } else if (p->type == PT_SHORT) {
+            ok = apply_short(p, v, n, &cx) && !cx.invalid;
+            if (ok) list_style_text(&scratch, out);
+        } else {
+            ok = apply_long(p, v, n, &cx) && !cx.invalid;
+            if (ok) list_value_text(&scratch, p, out);
+        }
+    }
+    ar_free(&a);
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
 }
 
 /* copy a longhand's value (all the fields it sets) */
@@ -3622,7 +4182,15 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src,
     case PT_DISPLAY: dst->legacy_box = src->legacy_box; break;
     case PT_FONT_FAMILY: dst->font_names=src->font_names;dst->named_font=src->named_font;dst->font_choices=src->font_choices;break;
     case PT_VALIGN: dst->vertical_align_px = src->vertical_align_px; break;
-    case PT_LIST_TYPE: dst->list_style_string = src->list_style_string; break;
+    case PT_LIST_TYPE: {
+        const struct css_list *x = css_style_list(dst), *y = css_style_list(src);
+        if (x->type_name != y->type_name || x->type_symbols != y->type_symbols) {
+            struct css_list *own = group_write(dst, G_LIST, x, a);
+            own->type_name = y->type_name;
+            own->type_symbols = y->type_symbols;
+        }
+        break;
+    }
     case PT_BG_IMAGE:
         dst->bg_img = src->bg_img;
         dst->has_grad = src->has_grad;
@@ -3873,7 +4441,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     if (p->group == G_STYLE) return apply_value(p, v, n, cx, (char *)s + p->off);
     /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
     union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules;
-            struct css_anchor anchor; } own;
+            struct css_anchor anchor; struct css_counters counters; struct css_list list; } own;
     memcpy(&own, group_of(s, p->group), group_size(p->group));
     if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
     group_write(s, p->group, &own, cx->a);
@@ -4119,7 +4687,10 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
         return true;
     }
     case PT_CONTENT: return parse_content(v, n, cx);
-    case PT_LIST_TYPE: return parse_list_type(v, n, cx, &s->list_style, &s->list_style_string);
+    case PT_LIST_TYPE: return parse_list_type(v, n, cx);
+    case PT_LIST_IMAGE: return parse_list_image(v, n, cx, (const struct css_image **)field);
+    case PT_QUOTES: return parse_quotes(v, n, cx, (const struct css_quotes **)field);
+    case PT_COUNTER: return parse_counter_ops(v, n, cx, p->flags, (const struct css_counter_ops **)field, NULL);
     case PT_BG_IMAGE: return parse_bg_image(v, n, cx);
     case PT_BG_POS: return parse_bg_pos(v, n, cx, (len_t *)field);
     case PT_BG_SIZE: return parse_bg_size(v, n, cx, s->bg_size, &s->bg_size_kind);
@@ -4606,27 +5177,17 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_BORDER_STYLE: return set_box("border-%s-style", v, n, cx, all, 4);
     case SH_BORDER_COLOR: return set_box("border-%s-color", v, n, cx, all, 4);
     case SH_LIST_STYLE: {
+        static const char *const names[3] = {"list-style-position", "list-style-image", "list-style-type"};
+        static const char *const initials[3] = {"outside", "none", "disc"};
         if (global) {
-            set_long("list-style-type", v, n, cx);
-            set_long("list-style-position", v, n, cx);
+            for (int i = 0; i < 3; i++) set_long(names[i], v, n, cx);
             return true;
         }
-        const char *t[3];
-        size_t tl[3];
-        int k = split_checked(v, n, t, tl, 3, ' ', cx);
-        const char *type = "disc", *pos = "outside";
-        size_t typel = 4, posl = 7;
-        bool none = false;
-        for (int i = 0; i < k; i++) {
-            uint8_t d;
-            if (kw_find(kw_lspos, t[i], tl[i], &d)) pos = t[i], posl = tl[i];
-            else if (ident_is(t[i], tl[i], "none")) none = true;
-            else if (strn_ieq(t[i], "url(", 4)) {
-            } else type = t[i], typel = tl[i];
-        }
-        if (none && typel == 4 && !strncmp(type, "disc", 4)) type = "none";
-        set_long("list-style-type", type, typel, cx);
-        set_long("list-style-position", pos, posl, cx);
+        const char *part[3];
+        size_t length[3];
+        if (!list_style_parts(v, n, cx, part, length)) return false;
+        for (int i = 0; i < 3; i++)
+            set_long(names[i], part[i] ? part[i] : initials[i], part[i] ? length[i] : strlen(initials[i]), cx);
         return true;
     }
     case SH_FONT:
@@ -4887,7 +5448,7 @@ void css_style_init(style_t *s, const style_t *parent) {
             copy_prop(&props[i], s, &initial, NULL);
     groups_copy(s, &initial);
     s->color_own = NULL;
-    s->before = s->after = s->backdrop = s->placeholder = NULL;
+    s->before = s->after = s->backdrop = s->placeholder = s->marker = NULL;
     s->before_generated = s->after_generated = s->explicit_inherit = false;
 }
 
@@ -4903,6 +5464,7 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
     s->border_radius = own.border_radius;
     s->color_own = own.color_own;
     s->before = own.before; s->after = own.after; s->backdrop = own.backdrop; s->placeholder = own.placeholder;
+    s->marker = own.marker;
     s->before_generated = own.before_generated; s->after_generated = own.after_generated;
     s->explicit_inherit = own.explicit_inherit;
 }
@@ -5005,6 +5567,8 @@ const char *css_ua_sheet(void) {
            "ul ul, ol ul, ul ol, ol ol, menu ul, ul menu { margin-top: 0; margin-bottom: 0; }\n"
            "ul ul, ol ul, menu ul { list-style-type: circle; }\n"
            "ul ul ul, ul ol ul, ol ul ul, ol ol ul { list-style-type: square; }\n"
+           /* HTML §15.3.8: the lists scope the list-item counter */
+           "ol, ul, menu { counter-reset: list-item; }\n"
            "hr { color: gray; border-style: inset; border-width: 1px; margin: 0.5em auto; overflow: hidden; }\n"
            "b, strong { font-weight: bolder; }\n"
            "i, cite, em, var, dfn { font-style: italic; }\n"
@@ -5037,7 +5601,7 @@ const char *css_ua_sheet(void) {
            "select { padding-right: 18px; }\n"
            "option, optgroup { display: none; }\n"
            "summary { display: block; }\n"
-           "details > summary:first-of-type { display: list-item; list-style: disclosure-closed inside; }\n"
+           "details > summary:first-of-type { display: list-item; counter-increment: list-item 0; list-style: disclosure-closed inside; }\n"
            "details[open] > summary:first-of-type { list-style-type: disclosure-open; }\n"
            "ruby { display: ruby; } rt { font-size: 50%; }\n"
            "nobr { white-space: nowrap; }\n"
@@ -5073,6 +5637,7 @@ int css_prop_animation(const struct propdef *p) {
     case PT_DISPLAY: return CSS_ANIM_DISPLAY;
     case PT_KW: case PT_OVERFLOW: case PT_FONT_FAMILY: case PT_CONTENT: case PT_LIST_TYPE: case PT_BG_IMAGE:
     case PT_TEXT_DECO: case PT_GTEMPLATE: case PT_GAREAS: case PT_GLINE: case PT_MASK_IMAGE: case PT_LINE_CLAMP:
+    case PT_COUNTER: case PT_QUOTES: case PT_LIST_IMAGE:
         return CSS_ANIM_DISCRETE;
     }
     return CSS_ANIM_VALUE;
@@ -5590,6 +6155,9 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
     /* gap decorations: currentcolor stays itself, for the cascade to resolve against the element */
     case PT_RULE_LIST: rule_list_text(st, p->flags, (const struct css_rule_list *)field, false, out); break;
     case PT_RULE_INSET: ok = rule_inset_text((const struct css_rule_inset *)field, out, d); break;
+    case PT_CONTENT: case PT_LIST_TYPE: case PT_LIST_IMAGE: case PT_QUOTES: case PT_COUNTER:
+        ok = list_value_text(st, p, out);
+        break;
 
     default: return false;
     }
@@ -5648,8 +6216,15 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
     case PT_DISPLAY: return a->display == b->display && a->legacy_box == b->legacy_box;
     case PT_FONT_FAMILY: return a->font_family == b->font_family && same_text(a->font_names, b->font_names);
     case PT_CONTAINER_NAMES: return same_text(a->container_names, b->container_names);
-    case PT_CONTENT: return same_text(a->content, b->content);
-    case PT_LIST_TYPE: return a->list_style == b->list_style && same_text(a->list_style_string, b->list_style_string);
+    case PT_CONTENT: return css_content_equal(a->content, b->content);
+    case PT_LIST_TYPE: {
+        const struct css_list *x = css_style_list(a), *y = css_style_list(b);
+        return a->list_style == b->list_style && same_text(x->type_name, y->type_name) &&
+            symbols_equal(x->type_symbols, y->type_symbols);
+    }
+    case PT_LIST_IMAGE: return image_equal(css_style_list(a)->image, css_style_list(b)->image);
+    case PT_QUOTES: return quotes_equal(css_style_list(a)->quotes, css_style_list(b)->quotes);
+    case PT_COUNTER: return counter_ops_equal(css_style_counters(a)->ops[p->flags], css_style_counters(b)->ops[p->flags]);
     case PT_BG_IMAGE: return same_text(a->bg_image, b->bg_image) && a->has_grad == b->has_grad && a->gradient == b->gradient;
     case PT_MASK_IMAGE: return same_text(a->mask_image, b->mask_image);
     case PT_GLINE: {

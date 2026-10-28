@@ -313,3 +313,36 @@ int web_base64_decode(uint8_t *data,size_t *length,bool (*check)(void *),void *o
     for(size_t i=0;i<n;i++){if(!data_step(&work))return -2;int digit=data_base64_digit(data[i]);if(digit<0)return 0;buffer=(buffer<<6)|(unsigned)digit;bits+=6;if(bits>=8){bits-=8;data[count++]=(uint8_t)(buffer>>bits);buffer&=(1u<<bits)-1;}}
     *length=count;return 1;
 }
+
+/* ---------------------------------------------------------------- CSSOM serialization (CSSOM §6.1) */
+static void css_serialize_code_point(sbuf *b, uint32_t cp) {
+    char t[16];
+    snprintf(t, sizeof t, "\\%x ", (unsigned)cp);
+    sb_puts(b, t);
+}
+/* "serialize an identifier" of a decoded name */
+void css_serialize_ident(sbuf *b, const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    if (p[0] == '-' && !p[1]) { sb_puts(b, "\\-"); return; }
+    for (size_t i = 0; p[i]; i++) {
+        unsigned char c = p[i];
+        bool digit = c >= '0' && c <= '9';
+        if (c >= 0x80) sb_putc(b, (char)c);
+        else if ((c >= 1 && c <= 0x1F) || c == 0x7F) css_serialize_code_point(b, c);
+        else if (digit && (i == 0 || (i == 1 && p[0] == '-'))) css_serialize_code_point(b, c);
+        else if (c == '-' || c == '_' || digit || ((c | 32) >= 'a' && (c | 32) <= 'z')) sb_putc(b, (char)c);
+        else { sb_putc(b, '\\'); sb_putc(b, (char)c); }
+    }
+}
+/* "serialize a string" */
+void css_serialize_string(sbuf *b, const char *s) {
+    sb_putc(b, '"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if ((*p >= 1 && *p <= 0x1F) || *p == 0x7F) css_serialize_code_point(b, *p);
+        else {
+            if (*p == '"' || *p == '\\') sb_putc(b, '\\');
+            sb_putc(b, (char)*p);
+        }
+    }
+    sb_putc(b, '"');
+}
