@@ -2391,8 +2391,20 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     style_t anchored; struct css_anchor anchored_group;
     if (pseudo == PE_NONE && n->box && box_anchor_style(n->box, &anchored, &anchored_group)) st = &anchored;
     if(property[0]=='-'&&property[1]=='-') {
-        const struct custom_prop *p=css_custom_property(st,property);
-        return JS_NewString(ctx,p&&p->value?p->value:"");
+        /* css-properties-values-api-1 §2.4: a registered property's computed value, its initial
+           value when it has none, its own value only when it does not inherit */
+        const char *value=css_custom_value(d,st,property);
+        /* Typed OM (§6.2) reifies a typed one by the syntax component its computed value is:
+           [value, the component's type name or ident, its multiplier] */
+        const struct css_syntax_component *c=cascade&&value?css_custom_component(d,property,value):NULL;
+        if(!c)return JS_NewString(ctx,value?value:"");
+        char multiplier[2]={c->multiplier,0};
+        JSValue typed=JS_NewArray(ctx);
+        if(JS_IsException(typed))return typed;
+        if(JS_SetPropertyUint32(ctx,typed,0,JS_NewString(ctx,value))<0||
+           JS_SetPropertyUint32(ctx,typed,1,JS_NewString(ctx,css_syntax_type_name(c)))<0||
+           JS_SetPropertyUint32(ctx,typed,2,JS_NewString(ctx,multiplier))<0){JS_FreeValue(ctx,typed);return JS_EXCEPTION;}
+        return typed;
     }
     if (cascade) {
         /* the longhands the property table stores whole serialize their computed value */
@@ -5591,6 +5603,39 @@ static JSValue native_transform_matrix(JSContext *ctx, JSValueConst this_val, in
     JS_SetPropertyUint32(ctx, result, 1, JS_NewBool(ctx, two_d));
     return result;
 }
+/* css-properties-values-api-1 §4.1 registerProperty(): [name, syntax, inherits, initialValue or
+   undefined] → 0 registered, 1 a SyntaxError, 2 an InvalidModificationError (already registered) */
+static JSValue native_css_register_property(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    (void)this_val;struct web_js_state *s=state(ctx);
+    if(argc<3)return JS_ThrowTypeError(ctx,"registerProperty requires a definition");
+    const char *name=JS_ToCString(ctx,argv[0]);if(!name)return JS_EXCEPTION;
+    const char *syntax=JS_ToCString(ctx,argv[1]);if(!syntax){JS_FreeCString(ctx,name);return JS_EXCEPTION;}
+    bool inherits=JS_ToBool(ctx,argv[2]);
+    const char *initial=NULL;
+    if(argc>3&&!JS_IsUndefined(argv[3])&&!(initial=JS_ToCString(ctx,argv[3]))) {
+        JS_FreeCString(ctx,name);JS_FreeCString(ctx,syntax);return JS_EXCEPTION;
+    }
+    int status=s->doc?css_register_property(s->doc,name,syntax,inherits,initial):CSS_REGISTER_SYNTAX;
+    JS_FreeCString(ctx,name);JS_FreeCString(ctx,syntax);if(initial)JS_FreeCString(ctx,initial);
+    if(status==CSS_REGISTER_MEMORY)return oom(ctx);
+    return JS_NewInt32(ctx,status==CSS_REGISTER_OK?0:status==CSS_REGISTER_DUPLICATE?2:1);
+}
+struct computed_custom_list {
+    JSContext *ctx; web_doc *doc; JSValue result; uint32_t index; unsigned work; int failure;
+};
+static bool computed_custom_entry(void *arg,const char *name,const char *value) {
+    struct computed_custom_list *l=arg;JSContext *ctx=l->ctx;
+    if(!(l->work++&63)&&!web_native_checkpoint(l->doc)){l->failure=1;return false;}
+    if(l->index==UINT32_MAX){l->failure=2;return false;}
+    JSValue entry=JS_NewArray(ctx);
+    if(JS_IsException(entry)){l->failure=3;return false;}
+    if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,name))<0||
+       JS_SetPropertyUint32(ctx,entry,1,JS_NewBool(ctx,value!=NULL))<0) {
+        JS_FreeValue(ctx,entry);l->failure=3;return false;
+    }
+    if(JS_SetPropertyUint32(ctx,l->result,l->index++,entry)<0){l->failure=3;return false;}
+    return true;
+}
 static JSValue native_css_properties(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     (void)this_val;JSValue result=JS_NewArray(ctx);if(JS_IsException(result))return result;
     if(argc) {
@@ -5604,17 +5649,14 @@ static JSValue native_css_properties(JSContext *ctx,JSValueConst this_val,int ar
         style_t fallback;style_t *style=computed_pseudo_style(node,computed_pseudo(pseudo),&fallback);
         JS_FreeCString(ctx,pseudo);
         if(!style){JS_FreeValue(ctx,result);return JS_NULL;}
-        uint32_t index=0;unsigned work=0;
-        for(const struct custom_prop *p=style->vars;p;p=p->next) {
-            if(!(work++&63)&&!web_native_checkpoint(owner->doc)){JS_FreeValue(ctx,result);return JS_ThrowInternalError(ctx,"Computed style enumeration interrupted");}
-            if(index==UINT32_MAX){JS_FreeValue(ctx,result);return JS_ThrowRangeError(ctx,"Computed CSS property index overflow");}
-            JSValue entry=JS_NewArray(ctx);
-            if(JS_IsException(entry)){JS_FreeValue(ctx,result);return entry;}
-            if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,p->name))<0||
-               JS_SetPropertyUint32(ctx,entry,1,JS_NewBool(ctx,p->value!=NULL))<0) {
-                JS_FreeValue(ctx,entry);JS_FreeValue(ctx,result);return JS_EXCEPTION;
-            }
-            if(JS_SetPropertyUint32(ctx,result,index++,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+        /* the element's custom properties with their registrations applied (css-properties-values-api-1
+           §2.4): the registered ones it has no value of take their initial values */
+        struct computed_custom_list list={ctx,owner->doc,result,0,0,0};
+        if(!css_custom_values(owner->doc,style,computed_custom_entry,&list)) {
+            JS_FreeValue(ctx,result);
+            if(list.failure==1)return JS_ThrowInternalError(ctx,"Computed style enumeration interrupted");
+            if(list.failure==2)return JS_ThrowRangeError(ctx,"Computed CSS property index overflow");
+            return list.failure==3?JS_EXCEPTION:oom(ctx);
         }
         return result;
     }
@@ -10082,6 +10124,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("cssSupports", 2, native_css_supports),
         JS_CFUNC_DEF("fonts", 4, native_fonts),
         JS_CFUNC_DEF("cssProperties", 1, native_css_properties),
+        JS_CFUNC_DEF("cssRegisterProperty", 4, native_css_register_property),
         JS_CFUNC_DEF("transformMatrix", 1, native_transform_matrix),
         JS_CFUNC_DEF("storage", 5, native_storage),
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("socketOpen", 3, native_socket_open),

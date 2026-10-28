@@ -1650,6 +1650,7 @@ static void doc_release(web_doc *d) {
     layout_cache_free(d);
     css_styles_release(d);
     css_styling_free(&d->sty);
+    css_registrations_free(&d->sty);
     web_dialog_free(d);
     web_avmedia_free(d);
     /* The frames' documents are released here, before this realm, and keep their nodes and

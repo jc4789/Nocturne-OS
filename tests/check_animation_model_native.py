@@ -26,7 +26,17 @@ int web_resolve_url_owned(const char *base,const char *rel,char **out){(void)bas
 uint64_t uptime_ms(void){return 0;}
 static int marks;
 void css_mark_style_own(web_doc *d,node_t *n){(void)d;(void)n;marks++;}
-bool css_substitute(const style_t *st,const char *v,sbuf *out){(void)st;sb_puts(out,v);return true;}
+bool css_substitute(web_doc *d,const style_t *st,node_t *node,const char *v,sbuf *out){(void)d;(void)st;(void)node;sb_puts(out,v);return true;}
+/* the cascade's custom properties (css.c): --x registered as <length>, the others not, their
+   computed values per style; a keyframe's value is already a computed value */
+static const struct css_syntax *length_syntax;
+static struct {const style_t *st;const char *name,*value;} customs[16];static int ncustoms;
+static void custom_set(const style_t *st,const char *name,const char *value){if(ncustoms<16)customs[ncustoms++]=(typeof(customs[0])){st,name,value};}
+const struct css_syntax *css_custom_syntax(web_doc *d,const char *name){(void)d;return !strcmp(name,"--x")?length_syntax:NULL;}
+const char *css_custom_value(web_doc *d,const style_t *st,const char *name){(void)d;for(int i=ncustoms;i-->0;)if(customs[i].st==st&&!strcmp(customs[i].name,name))return customs[i].value;return NULL;}
+int css_custom_animation_value(const struct css_anim_ctx *c,const char *name,const char *text,sbuf *out){(void)c;(void)name;sb_puts(out,text);return 1;}
+bool css_custom_values(web_doc *d,const style_t *st,bool (*each)(void *,const char *,const char *),void *arg){
+    (void)d;for(int i=0;i<ncustoms;i++)if(customs[i].st==st&&!each(arg,customs[i].name,customs[i].value))return false;return true;}
 node_t *doc_node_root(node_t *node,bool composed){(void)composed;while(node&&node->parent)node=node->parent;return node;}
 node_t *doc_flat_parent(node_t *node){return node?node->parent:NULL;}
 bool web_js_enabled(web_doc *d){(void)d;return true;}
@@ -41,6 +51,7 @@ static arena_t arena;
 static uint8_t none_animated[1024];
 static char emitted[8][2][64];static int nemitted;
 static void emit(void *arg,const struct propdef *p,const char *value){(void)arg;if(nemitted<8){snprintf(emitted[nemitted][0],64,"%s",css_prop_name(css_prop_index(p),NULL));snprintf(emitted[nemitted][1],64,"%s",value);nemitted++;}}
+static void emit_custom(void *arg,const char *name,const char *value){(void)arg;if(nemitted<8){snprintf(emitted[nemitted][0],64,"%s",name);snprintf(emitted[nemitted][1],64,"%s",value);nemitted++;}}
 static const char *sampled(const char *property){for(int i=0;i<nemitted;i++)if(!strcmp(emitted[i][0],property))return emitted[i][1];return "";}
 static struct web_keyframe_value kv[4];static struct web_keyframe kf[4];
 static const char *fade_to="1"; /* @keyframes fade{from{opacity:0}to{opacity:<fade_to>}} */
@@ -59,7 +70,26 @@ static const struct web_keyframe *frames_for(void *arg,const char *name,const st
 }
 static struct web_motion_site site(const style_t *st){
     return (struct web_motion_site){.ctx={.base=st,.parent=&parent,.node=&element,.rem=16,.vw=800,.vh=600,.a=&arena,.d=&doc},
-        .pseudo=PE_NONE,.keyframes=frames_for,.emit=emit};
+        .pseudo=PE_NONE,.keyframes=frames_for,.emit=emit,.emit_custom=emit_custom};
+}
+static struct web_animation *custom_animation(double duration,const char *name,const char *from,const char *to){
+    struct web_animation *a=web_animation_new(&doc,WA_SCRIPT);struct web_effect *e=web_effect_new(&doc);
+    struct web_keyframe_value v[2]={{.name=(char*)name,.text=(char*)from},{.name=(char*)name,.text=(char*)to}};
+    struct web_keyframe f[2]={{.offset=NAN,.easing={.kind=CM_LINEAR},.composite=WA_COMPOSITE_AUTO,.count=1,.values=&v[0]},
+                              {.offset=NAN,.easing={.kind=CM_LINEAR},.composite=WA_COMPOSITE_AUTO,.count=1,.values=&v[1]}};
+    web_effect_set_keyframes(e,web_keyframes_build(f,2));
+    e->timing.duration=duration;
+    web_effect_set_target(e,&element,PE_NONE);
+    web_animation_set_effect(a,e);
+    a->wrapped=1;
+    web_animations_join(&doc);
+    return a;
+}
+static struct web_animation *custom_transition_of(const char *name){
+    struct web_animation *t=NULL;
+    for(struct web_animation *o=element.owned;o;o=o->owner_next)
+        if(!o->disowned&&o->kind==WA_CSS_TRANSITION&&!o->property&&o->name&&!strcmp(o->name,name))t=o;
+    return t;
 }
 static size_t sample(const style_t *st,bool transitions){
     nemitted=0;uint8_t animated[css_prop_count()];memset(animated,0,sizeof animated);struct web_motion_site s=site(st);
@@ -353,6 +383,49 @@ int main(void){
     s=site(&added);web_motion_animations(&s);
     CHECK(ra && ra->effect->frames->v[0].composite==CM_COMPOSITE_ADD);
     s=site(&gone);web_motion_animations(&s);at(9300);at(9400);CHECK(ra && !ra->owner);
+    web_animations_join(&doc);
+
+    /* custom properties (css-properties-values-api-1 §2.5): a registered one's keyframes interpolate
+       as its type over the base style's computed value, an unregistered one flips at the middle */
+    length_syntax=css_syntax_parse("<length>",8,&arena);
+    custom_set(&base,"--x","100px");
+    struct web_animation *cx=custom_animation(1000,"--x","200px","300px");
+    CHECK(cx->effect->frames->ncustoms==1 && !strcmp(cx->effect->frames->customs[0],"--x"));
+    web_animation_play(cx,true);at(10000);at(10500);
+    CHECK(sample(&base,false)==1 && !strcmp(sampled("--x"),"250px"));
+    cx->effect->composite=CM_COMPOSITE_ADD; /* each keyframe added to 100px, then interpolated */
+    CHECK(sample(&base,false)==1 && !strcmp(sampled("--x"),"350px"));
+    web_animation_cancel(cx);events(types,8);
+    struct web_animation *cy=custom_animation(1000,"--y","a","b");
+    web_animation_play(cy,true);at(10600);at(11000);
+    CHECK(sample(&base,false)==1 && !strcmp(sampled("--y"),"a"));
+    at(11200);CHECK(sample(&base,false)==1 && !strcmp(sampled("--y"),"b"));
+    web_animation_cancel(cy);events(types,8);
+    /* their transitions (CSS Transitions 1 §3): the registered one by its type, the unregistered one
+       only with allow-discrete */
+    style_t xb=styled("transition","--x 1s linear"),xa=xb;
+    custom_set(&xb,"--x","0px");custom_set(&xa,"--x","100px");
+    s=site(&xa);web_motion_transitions(&s,&xb,&xa,none_animated);
+    struct web_animation *xt=custom_transition_of("--x");
+    CHECK(xt && !strcmp(xt->to,"100px"));
+    web_animations_join(&doc);at(11300);at(11550);
+    CHECK(xt && sample(&xa,true)==1 && !strcmp(sampled("--x"),"25px"));
+    style_t yb=styled("transition","--y 1s"),ya=yb;
+    custom_set(&yb,"--y","a");custom_set(&ya,"--y","b");
+    s=site(&ya);web_motion_transitions(&s,&yb,&ya,none_animated);
+    CHECK(!custom_transition_of("--y"));
+    style_t zb=styled("transition","--y 1s allow-discrete"),za=zb;
+    custom_set(&zb,"--y","a");custom_set(&za,"--y","b");
+    s=site(&za);web_motion_transitions(&s,&zb,&za,none_animated);
+    CHECK(custom_transition_of("--y")!=NULL);
+    /* transition: all covers them too */
+    style_t wb=styled("transition","all 1s linear"),wa=wb;
+    custom_set(&wb,"--x","0px");custom_set(&wa,"--x","40px");
+    web_motion_cancel(&element,-1);at(11600);events(types,8);
+    s=site(&wa);web_motion_transitions(&s,&wb,&wa,none_animated);
+    xt=custom_transition_of("--x");
+    CHECK(xt && !strcmp(xt->to,"40px"));
+    web_motion_cancel(&element,-1);at(11700);events(types,8);
     web_animations_join(&doc);
 
     web_animations_doc_free(&doc);

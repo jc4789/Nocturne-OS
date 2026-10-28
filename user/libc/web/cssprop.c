@@ -3126,15 +3126,7 @@ static bool parse_content(const char *s, size_t n, struct cx *cx) {
         else if (ident_is(v, vn, "open-quote")) sb_puts(&b, "\xe2\x80\x9c");
         else if (ident_is(v, vn, "close-quote")) sb_puts(&b, "\xe2\x80\x9d");
         else if (ident_is(v, vn, "no-open-quote") || ident_is(v, vn, "no-close-quote")) {
-        } else if (vn > 5 && strn_ieq(v, "attr(", 5) && v[vn - 1] == ')') {
-            const char *an = v + 5;
-            size_t anl = vn - 6;
-            trim(&an, &anl);
-            node_t *e = cx->node;
-            if (e)
-                for (int j = 0; j < e->nattrs; j++)
-                    if (!e->attrs[j].namespace_uri && strlen(e->attrs[j].raw) == anl &&
-                        !memcmp(an, e->attrs[j].raw, anl)) sb_puts(&b, e->attrs[j].value);
+            /* attr() has been substituted by the time a value reaches here (css.c, css-values-5 §8.7.1) */
         } else if (vn > 8 && (strn_ieq(v, "counter(", 8) || strn_ieq(v, "counters(", 9))) {
             if (cx->supports_probe) { sb_free(&b); return false; }
         } else if (vn > 4 && (strn_ieq(v, "url(", 4) || strn_ieq(v, "image-set(", 10) ||
@@ -4951,6 +4943,7 @@ void css_style_init(style_t *s, const style_t *parent) {
         return;
     }
     *s = *parent;
+    s->vars_inherited = parent->vars; /* none of the chain is the element's own yet */
     s->border_radius=0; /* legacy native-only radius is not inherited */
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited && props[i].group == G_STYLE)
@@ -6021,4 +6014,729 @@ bool css_anim_compose(const struct css_anim_ctx *c, const struct propdef *p, con
     out->n = begin;
     if (out->p && begin < out->cap) out->p[begin] = 0;
     return false;
+}
+
+/* ---------------------------------------------------------------- registered custom properties
+   css-properties-values-api-1: §5 a registration's syntax string, §2.4 a value's computed value
+   against it. Each data type is read by this file's own grammar for it (lengths, numbers and math
+   functions, colours, transforms, gradients, url()); the cascade (css.c) owns the registrations. */
+static const char *const syntax_type_names[CSS_SYNTAX_TYPES] = {
+    [CSS_SYNTAX_ANGLE] = "<angle>", [CSS_SYNTAX_COLOR] = "<color>", [CSS_SYNTAX_CUSTOM_IDENT] = "<custom-ident>",
+    [CSS_SYNTAX_IMAGE] = "<image>", [CSS_SYNTAX_INTEGER] = "<integer>", [CSS_SYNTAX_LENGTH] = "<length>",
+    [CSS_SYNTAX_LENGTH_PERCENTAGE] = "<length-percentage>", [CSS_SYNTAX_NUMBER] = "<number>",
+    [CSS_SYNTAX_PERCENTAGE] = "<percentage>", [CSS_SYNTAX_RESOLUTION] = "<resolution>",
+    [CSS_SYNTAX_STRING] = "<string>", [CSS_SYNTAX_TIME] = "<time>",
+    [CSS_SYNTAX_TRANSFORM_FUNCTION] = "<transform-function>", [CSS_SYNTAX_TRANSFORM_LIST] = "<transform-list>",
+    [CSS_SYNTAX_URL] = "<url>"};
+/* css-syntax-3 §4.2: an ident code point, the start of one, a valid escape at s */
+static bool syn_ident_start(unsigned char c) { return isalpha(c) || c == '_' || c >= 0x80; }
+static bool syn_ident_code(unsigned char c) { return syn_ident_start(c) || isdigit(c) || c == '-'; }
+static bool syn_escape(const char *s, const char *e) { return e - s >= 2 && s[0] == '\\' && s[1] != '\n' && s[1] != '\r' && s[1] != '\f'; }
+static bool syn_starts_ident(const char *s, const char *e) {
+    if (s >= e) return false;
+    if (*s == '-') return e - s >= 2 && (syn_ident_start((unsigned char)s[1]) || s[1] == '-' || syn_escape(s + 1, e));
+    return syn_ident_start((unsigned char)*s) || syn_escape(s, e);
+}
+/* past one ident sequence at s (which starts one) */
+static const char *syn_ident_end(const char *s, const char *e) {
+    while (s < e) {
+        if (syn_ident_code((unsigned char)*s)) { s++; continue; }
+        if (!syn_escape(s, e)) break;
+        s++;
+        if (isxdigit((unsigned char)*s)) {
+            for (int k = 0; k < 6 && s < e && isxdigit((unsigned char)*s); k++) s++;
+            if (s < e && is_space((unsigned char)*s)) s++; /* CR LF is one newline after preprocessing */
+            if (s < e && s[-1] == '\r' && *s == '\n') s++;
+        } else s++;
+    }
+    return s;
+}
+static const char *const syntax_reserved[] = {"initial", "inherit", "unset", "revert", "revert-layer", "default", NULL};
+static bool syn_reserved(const char *name, size_t n) {
+    for (const char *const *w = syntax_reserved; *w; w++)
+        if (strlen(*w) == n && strn_ieq(name, *w, n)) return true;
+    return false;
+}
+struct css_syntax *css_syntax_parse(const char *s, size_t n, arena_t *a) {
+    if (!s) return NULL;
+    const char *e = s + n;
+    while (s < e && is_space((unsigned char)*s)) s++;
+    while (e > s && is_space((unsigned char)e[-1])) e--;
+    if (s == e) return NULL;
+    size_t bars = 1;
+    for (const char *p = s; p < e; p++) bars += *p == '|';
+    size_t size = sizeof (struct css_syntax) + bars * sizeof (struct css_syntax_component) + (size_t)(e - s) + bars;
+    struct css_syntax *syn = a ? ar_alloc(a, size) : malloc(size);
+    if (!syn) return NULL;
+    syn->count = 0;
+    char *names = (char *)(syn->component + bars);
+    if (e - s == 1 && *s == '*') return syn; /* the universal syntax definition */
+    const char *p = s;
+    for (;;) {
+        /* §5.4.3 consume a syntax component */
+        while (p < e && is_space((unsigned char)*p)) p++;
+        struct css_syntax_component *c = &syn->component[syn->count];
+        *c = (struct css_syntax_component){0};
+        if (p < e && *p == '<') {
+            const char *name = p++;
+            while (p < e && syn_ident_code((unsigned char)*p)) p++;
+            if (p == e || *p != '>') { if (!a) free(syn); return NULL; }
+            p++;
+            int type = -1;
+            for (int t = 0; t < CSS_SYNTAX_TYPES; t++)
+                if (syntax_type_names[t] && strlen(syntax_type_names[t]) == (size_t)(p - name) &&
+                    !memcmp(syntax_type_names[t], name, (size_t)(p - name))) type = t;
+            if (type < 0) { if (!a) free(syn); return NULL; }
+            c->type = (uint8_t)type;
+        } else if (syn_starts_ident(p, e)) {
+            const char *end = syn_ident_end(p, e);
+            sbuf name = {0};
+            css_unescape(&name, p, (size_t)(end - p));
+            if (!name.p || syn_reserved(name.p, name.n) || name.n > (size_t)(end - p)) { sb_free(&name); if (!a) free(syn); return NULL; }
+            memcpy(names, name.p, name.n);
+            names[name.n] = 0;
+            c->type = CSS_SYNTAX_IDENT;
+            c->ident = names;
+            names += name.n + 1;
+            sb_free(&name);
+            p = end;
+        } else { if (!a) free(syn); return NULL; }
+        /* <transform-list> is pre-multiplied: it takes no multiplier of its own */
+        if (c->type != CSS_SYNTAX_TRANSFORM_LIST && p < e && (*p == '+' || *p == '#')) c->multiplier = *p++;
+        syn->count++;
+        /* §5.4.2 step 5 */
+        while (p < e && is_space((unsigned char)*p)) p++;
+        if (p == e) return syn;
+        if (*p != '|' || syn->count == bars) { if (!a) free(syn); return NULL; }
+        p++;
+    }
+}
+
+/* a lexical reading of what a value's computed value depends on: units, keywords and functions by name
+   (strings and url() contents are not read) */
+unsigned css_syntax_dependencies(const char *s, size_t n) {
+    unsigned deps = 0;
+    const char *p = s, *e = s + n;
+    while (p < e) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\'') {
+            p++;
+            while (p < e && *p != (char)c) { if (*p == '\\' && p + 1 < e) p++; p++; }
+            if (p < e) p++;
+            continue;
+        }
+        if (isdigit(c) || (c == '.' && p + 1 < e && isdigit((unsigned char)p[1]))) {
+            while (p < e && (isdigit((unsigned char)*p) || *p == '.')) p++;
+            if (p + 1 < e && (*p | 32) == 'e' && (isdigit((unsigned char)p[1]) || p[1] == '-' || p[1] == '+')) {
+                p += 2;
+                while (p < e && isdigit((unsigned char)*p)) p++;
+            }
+            const char *u = p;
+            while (p < e && syn_ident_code((unsigned char)*p)) p++;
+            size_t un = (size_t)(p - u);
+            char unit[8] = {0};
+            if (!un || un >= sizeof unit) continue;
+            for (size_t i = 0; i < un; i++) unit[i] = (char)tolower((unsigned char)u[i]);
+            if (!strcmp(unit, "em") || !strcmp(unit, "ex") || !strcmp(unit, "cap") || !strcmp(unit, "ch") ||
+                !strcmp(unit, "ic")) deps |= CSS_SYNTAX_DEP_FONT;
+            else if (!strcmp(unit, "lh")) deps |= CSS_SYNTAX_DEP_FONT | CSS_SYNTAX_DEP_LINE_HEIGHT;
+            else if (!strcmp(unit, "rem") || !strcmp(unit, "rex") || !strcmp(unit, "rcap") || !strcmp(unit, "rch") ||
+                     !strcmp(unit, "ric") || !strcmp(unit, "rlh")) deps |= CSS_SYNTAX_DEP_ROOT_FONT;
+            else if (unit[0] == 'c' && unit[1] == 'q') deps |= CSS_SYNTAX_DEP_CONTAINER;
+            else {
+                const char *v = unit + (unit[0] == 's' || unit[0] == 'l' || unit[0] == 'd');
+                if (!strcmp(v, "vw") || !strcmp(v, "vh") || !strcmp(v, "vi") || !strcmp(v, "vb") || !strcmp(v, "vmin") ||
+                    !strcmp(v, "vmax")) deps |= CSS_SYNTAX_DEP_VIEWPORT;
+            }
+            continue;
+        }
+        if (syn_starts_ident(p, e) && (p == s || !syn_ident_code((unsigned char)p[-1]))) {
+            const char *w = p;
+            p = syn_ident_end(p, e);
+            size_t wn = (size_t)(p - w);
+            if (p < e && *p == '(') {
+                if ((wn == 3 && (strn_ieq(w, "var", 3) || strn_ieq(w, "env", 3))) || (wn == 4 && strn_ieq(w, "attr", 4)))
+                    deps |= CSS_SYNTAX_DEP_REFERENCE;
+                else if (wn == 10 && strn_ieq(w, "light-dark", 10)) deps |= CSS_SYNTAX_DEP_SCHEME;
+                else if ((wn == 13 && strn_ieq(w, "sibling-index", 13)) || (wn == 13 && strn_ieq(w, "sibling-count", 13)))
+                    deps |= CSS_SYNTAX_DEP_TREE;
+                else if (wn == 3 && strn_ieq(w, "url", 3)) {
+                    while (p < e && *p != ')') { if (*p == '\\' && p + 1 < e) p++; p++; }
+                }
+            } else if (wn == 12 && strn_ieq(w, "currentcolor", 12)) deps |= CSS_SYNTAX_DEP_COLOR;
+            continue;
+        }
+        p++;
+    }
+    return deps;
+}
+
+/* the next top-level item of a list (§5.2): whitespace-separated for +, comma-separated for #;
+   false at the end, or (#) at an empty item */
+static bool syn_next(const char **p, const char *e, char sep, const char **is, size_t *in, bool *bad) {
+    const char *s = *p;
+    while (s < e && is_space((unsigned char)*s)) s++;
+    if (s == e && (sep != '#' || *p == e)) return false;
+    const char *start = s;
+    int depth = 0;
+    char q = 0;
+    for (; s < e; s++) {
+        char c = *s;
+        if (q) { if (c == '\\' && s + 1 < e) s++; else if (c == q) q = 0; continue; }
+        if (c == '"' || c == '\'') q = c;
+        else if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') depth--;
+        else if (depth <= 0 && (sep == '+' ? is_space((unsigned char)c) : c == ',')) break;
+    }
+    const char *end = s;
+    while (end > start && is_space((unsigned char)end[-1])) end--;
+    *is = start;
+    *in = (size_t)(end - start);
+    if (sep == '#') {
+        if (!*in) *bad = true;
+        *p = s < e ? s + 1 : e;
+        if (s < e && s + 1 == e) *bad = true; /* a trailing comma */
+    } else *p = s;
+    return true;
+}
+/* one string token, whole */
+static bool syn_string(const char *s, size_t n) {
+    if (n < 2 || (s[0] != '"' && s[0] != '\'') || s[n - 1] != s[0]) return false;
+    for (size_t i = 1; i + 1 < n; i++) {
+        if (s[i] == '\\') { if (i + 2 >= n) return false; i++; continue; }
+        if (s[i] == s[0] || s[i] == '\n') return false;
+    }
+    return true;
+}
+/* one ident token, whole, unescaped into name */
+static bool syn_ident(const char *s, size_t n, sbuf *name) {
+    if (!syn_starts_ident(s, s + n) || syn_ident_end(s, s + n) != s + n) return false;
+    css_unescape(name, s, n);
+    return name->p != NULL;
+}
+/* url(...) or a string's text resolved against base (unresolved when there is no base or it fails) */
+static bool syn_url_text(sbuf *out, const char *u, const char *base) {
+    char *absolute = NULL;
+    int resolved = base && *base && strncmp(base, "about:", 6) ? web_resolve_url_owned(base, u, &absolute) : 0;
+    if (resolved < 0) return false;
+    sb_puts(out, "url(");
+    css_serialize_string(out, resolved == 1 ? absolute : u);
+    sb_putc(out, ')');
+    free(absolute);
+    return true;
+}
+/* text with each url() resolved against base */
+static bool syn_urls(sbuf *out, const char *s, size_t n, const char *base, arena_t *a) {
+    const char *p = s, *e = s + n;
+    while (p < e) {
+        if (*p == '"' || *p == '\'') {
+            const char *start = p;
+            char q = *p++;
+            while (p < e && *p != q) { if (*p == '\\' && p + 1 < e) p++; p++; }
+            if (p < e) p++;
+            sb_put(out, start, (size_t)(p - start));
+            continue;
+        }
+        if (e - p >= 4 && strn_ieq(p, "url(", 4) && (p == s || !syn_ident_code((unsigned char)p[-1]))) {
+            const char *close = p + 4;
+            char q = 0;
+            for (; close < e; close++) {
+                if (q) { if (*close == '\\' && close + 1 < e) close++; else if (*close == q) q = 0; continue; }
+                if (*close == '"' || *close == '\'') q = *close;
+                else if (*close == ')') break;
+            }
+            if (close == e) return false;
+            const char *u = css_parse_url(p, (size_t)(close + 1 - p), a);
+            if (!u || !syn_url_text(out, u, base)) return false;
+            p = close + 1;
+            continue;
+        }
+        sb_putc(out, *p++);
+    }
+    return true;
+}
+/* §2.4 transform functions: as specified, their lengths computed (math functions simplified) */
+static bool syn_lengths(sbuf *out, const char *s, size_t n, struct cx *cx) {
+    const char *p = s, *e = s + n;
+    bool space = false;
+    while (p < e) {
+        unsigned char c = (unsigned char)*p;
+        if (is_space(c)) { space = true; p++; continue; }
+        if (space) { if (out->n && out->p[out->n - 1] != '(' && c != ')' && c != ',') sb_putc(out, ' '); space = false; }
+        if (c == '"' || c == '\'') {
+            const char *start = p++;
+            while (p < e && *p != (char)c) { if (*p == '\\' && p + 1 < e) p++; p++; }
+            if (p < e) p++;
+            sb_put(out, start, (size_t)(p - start));
+            continue;
+        }
+        if (isalpha(c) && (p == s || !syn_ident_code((unsigned char)p[-1]))) {
+            const char *w = p;
+            while (p < e && syn_ident_code((unsigned char)*p)) p++;
+            if (p < e && *p == '(' && css_calc_is_math(w, (size_t)(e - w))) {
+                const char *close = p + 1;
+                int depth = 1;
+                for (; close < e && depth; close++) depth += *close == '(' ? 1 : *close == ')' ? -1 : 0;
+                if (depth) return false;
+                size_t mn = (size_t)(close - w);
+                /* a <length-percentage> as the length owner computes one, else the other types' */
+                struct css_calc_parse P = {.a = cx->a, .cx = cx};
+                unsigned kind = 0;
+                struct css_calc *tree = css_calc_read(&P, CSS_CALC_LENGTH | CSS_CALC_PERCENT, w, mn, &kind);
+                len_t l;
+                double v;
+                if (tree && css_length_from_calc(tree, true, &l)) {
+                    if (!css_length_serialize(&l, out, NULL)) return false;
+                } else {
+                    P = (struct css_calc_parse){.a = cx->a, .cx = cx};
+                    tree = css_calc_read(&P, CSS_CALC_ANY, w, mn, &kind);
+                    if (!tree) sb_put(out, w, mn);
+                    else if (css_calc_constant(tree, &v)) {
+                        css_number_serialize(out, v);
+                        sb_puts(out, kind == CSS_CALC_LENGTH ? "px" : kind == CSS_CALC_ANGLE ? "deg" : kind == CSS_CALC_TIME ? "s" :
+                                     kind == CSS_CALC_FREQUENCY ? "hz" : kind == CSS_CALC_RESOLUTION ? "dppx" :
+                                     kind == CSS_CALC_FLEX ? "fr" : kind == CSS_CALC_PERCENT ? "%" : "");
+                    } else if (!css_calc_serialize(out, tree, NULL)) return false;
+                }
+                p = close;
+                continue;
+            }
+            sb_put(out, w, (size_t)(p - w));
+            continue;
+        }
+        if ((isdigit(c) || ((c == '.' || c == '+' || c == '-') && p + 1 < e &&
+             (isdigit((unsigned char)p[1]) || (p[1] == '.' && p + 2 < e && isdigit((unsigned char)p[2]))))) &&
+            (p == s || !syn_ident_code((unsigned char)p[-1]))) {
+            const char *start = p, *u;
+            size_t un;
+            double v;
+            if (css_numeric_token(&p, e, &v, &u, &un)) {
+                int unit = css_unit_find(u, un);
+                if (css_unit_kind(unit) == CSS_CALC_LENGTH) { css_number_serialize(out, css_unit_canonical(unit, v, cx)); sb_puts(out, "px"); }
+                else sb_put(out, start, (size_t)(p - start));
+                continue;
+            }
+            p = start;
+        }
+        sb_putc(out, (char)c);
+        p++;
+    }
+    return true;
+}
+/* <image> (css-images-3 §2): url(), a gradient, image-set(), cross-fade(), element(), image(), and
+   light-dark() of two images or none (css-color-5 §8). out: the computed image, its url()s absolute */
+static bool syn_image(const char *s, size_t n, struct cx *cx, const char *base, sbuf *out) {
+    const char *name = s, *p = s, *e = s + n;
+    while (p < e && syn_ident_code((unsigned char)*p)) p++;
+    size_t wn = (size_t)(p - name);
+    if (!wn || p == e || *p != '(' || e[-1] != ')') return false;
+    bool ok;
+    if (wn == 3 && strn_ieq(name, "url", 3)) {
+        const char *u = css_parse_url(s, n, cx->a);
+        return u && (!out || syn_url_text(out, u, base));
+    } else if (wn == 10 && strn_ieq(name, "light-dark", 10)) {
+        const char *a = p + 1, *z = e - 1, *comma = a;
+        int depth = 0;
+        for (; comma < z; comma++) {
+            if (*comma == '(') depth++; else if (*comma == ')') depth--; else if (!depth && *comma == ',') break;
+        }
+        if (comma == z) return false;
+        const char *parts[2] = {a, comma + 1};
+        size_t lengths[2] = {(size_t)(comma - a), (size_t)(z - comma - 1)};
+        for (int i = 0; i < 2; i++) {
+            trim(&parts[i], &lengths[i]);
+            if (!ident_is(parts[i], lengths[i], "none") && !syn_image(parts[i], lengths[i], cx, base, NULL)) return false;
+        }
+        ok = true;
+    } else if (wn > 8 && strn_ieq(name + wn - 8, "gradient", 8)) {
+        ok = parse_gradient(s, n, cx) != NULL;
+    } else {
+        ok = (wn == 9 && strn_ieq(name, "image-set", 9)) || (wn == 17 && strn_ieq(name, "-webkit-image-set", 17)) ||
+             (wn == 10 && strn_ieq(name, "cross-fade", 10)) || (wn == 7 && strn_ieq(name, "element", 7)) ||
+             (wn == 5 && strn_ieq(name, "image", 5));
+    }
+    return ok && (!out || syn_urls(out, s, n, base, cx->a));
+}
+/* one value of one data type: its computed value's text into out (NULL: only whether it is one) */
+static bool syn_item(const struct css_syntax_component *c, const char *s, size_t n, struct cx *cx, const char *base,
+                     const struct css_color *current, sbuf *out, unsigned *deps) {
+    trim(&s, &n);
+    if (!n) return false;
+    sbuf scratch = {0};
+    sbuf *o = out ? out : &scratch;
+    size_t begin = o->n;
+    bool ok = false;
+    double v;
+    switch (c->type) {
+    case CSS_SYNTAX_IDENT: case CSS_SYNTAX_CUSTOM_IDENT: {
+        sbuf name = {0};
+        if (syn_ident(s, n, &name) &&
+            (c->type == CSS_SYNTAX_IDENT ? strlen(c->ident) == name.n && !memcmp(c->ident, name.p, name.n) :
+                                           !syn_reserved(name.p, name.n))) {
+            css_serialize_ident(o, sb_cstr(&name));
+            ok = true;
+        }
+        sb_free(&name);
+        break;
+    }
+    case CSS_SYNTAX_STRING:
+        if (syn_string(s, n)) {
+            sbuf text = {0};
+            css_unescape(&text, s + 1, n - 2);
+            css_serialize_string(o, sb_cstr(&text));
+            sb_free(&text);
+            ok = true;
+        }
+        break;
+    case CSS_SYNTAX_URL: {
+        const char *u = n > 4 && strn_ieq(s, "url(", 4) ? css_parse_url(s, n, cx->a) : NULL;
+        ok = u && syn_url_text(o, u, base);
+        break;
+    }
+    case CSS_SYNTAX_INTEGER: {
+        size_t i = s[0] == '+' || s[0] == '-';
+        bool literal = i < n;
+        for (size_t k = i; k < n; k++) literal &= isdigit((unsigned char)s[k]) != 0;
+        if (literal || css_calc_is_math(s, n)) {
+            if (css_numeric_read(s, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &v, NULL)) {
+                /* CSS Values 4 §10.9: a math function's <integer> rounds to the nearest, half toward +∞ */
+                v = floor(v + 0.5);
+                char t[48];
+                snprintf(t, sizeof t, "%.0f", v == 0 ? 0.0 : v);
+                sb_puts(o, t);
+                ok = true;
+            }
+        }
+        break;
+    }
+    case CSS_SYNTAX_NUMBER: case CSS_SYNTAX_PERCENTAGE: case CSS_SYNTAX_ANGLE: case CSS_SYNTAX_TIME:
+    case CSS_SYNTAX_RESOLUTION: {
+        static const unsigned accept[CSS_SYNTAX_TYPES] = {[CSS_SYNTAX_NUMBER] = CSS_CALC_NUMBER,
+            [CSS_SYNTAX_PERCENTAGE] = CSS_CALC_PERCENT, [CSS_SYNTAX_ANGLE] = CSS_CALC_ANGLE,
+            [CSS_SYNTAX_TIME] = CSS_CALC_TIME, [CSS_SYNTAX_RESOLUTION] = CSS_CALC_RESOLUTION};
+        static const char *const unit[CSS_SYNTAX_TYPES] = {[CSS_SYNTAX_NUMBER] = "", [CSS_SYNTAX_PERCENTAGE] = "%",
+            [CSS_SYNTAX_ANGLE] = "deg", [CSS_SYNTAX_TIME] = "s", [CSS_SYNTAX_RESOLUTION] = "dppx"};
+        if (css_numeric_read(s, n, accept[c->type], cx, cx->a, NAN, &v, NULL)) {
+            bool math = css_calc_is_math(s, n);
+            /* css-values-4 §7.4: the range of <resolution> excludes negative values; a math function clamps */
+            if (c->type == CSS_SYNTAX_RESOLUTION && v < 0) { if (!math) break; v = 0; }
+            css_number_serialize(o, v);
+            sb_puts(o, unit[c->type]);
+            ok = true;
+        }
+        break;
+    }
+    case CSS_SYNTAX_LENGTH: case CSS_SYNTAX_LENGTH_PERCENTAGE: {
+        len_t l;
+        if (parse_len(s, n, cx, &l, LF_NEG | LF_LENGTH | (c->type == CSS_SYNTAX_LENGTH ? LF_NOPCT : 0)) &&
+            (l.kind == LK_LEN || l.kind == LK_EXPR))
+            ok = css_length_serialize(&l, o, NULL);
+        break;
+    }
+    case CSS_SYNTAX_COLOR: {
+        uint32_t argb;
+        const struct css_color_value *computed = NULL;
+        struct cx probe = *cx;
+        probe.supports_probe = false;
+        if (css_color_value_compute(s, n, &probe, current, &argb, &computed)) {
+            if (argb == COLOR_CURRENT && !current) {
+                /* currentcolor in it: the element's colour finishes it (css.c), as written meanwhile */
+                if (deps) *deps |= CSS_SYNTAX_DEP_COLOR;
+                if (!css_color_value_specified(computed, o)) sb_puts(o, "currentcolor");
+            } else css_color_value_text(computed, argb, o);
+            ok = true;
+        }
+        break;
+    }
+    case CSS_SYNTAX_IMAGE:
+        ok = syn_image(s, n, cx, base, o);
+        break;
+    case CSS_SYNTAX_TRANSFORM_FUNCTION: case CSS_SYNTAX_TRANSFORM_LIST: {
+        const struct css_transform *t = NULL;
+        size_t functions = 0;
+        for (size_t i = 0, depth = 0; i < n; i++) {
+            if (s[i] == '(' && !depth++) functions++;
+            else if (s[i] == ')' && depth) depth--;
+        }
+        if (!ident_is(s, n, "none") && (c->type == CSS_SYNTAX_TRANSFORM_LIST || functions == 1) &&
+            parse_transform_value(s, n, cx, &t) && !cx->invalid && t)
+            ok = syn_lengths(o, s, n, cx);
+        break;
+    }
+    }
+    if (!ok) { o->n = begin; if (o->p && begin < o->cap) o->p[begin] = 0; }
+    sb_free(&scratch);
+    return ok;
+}
+int css_syntax_compute(const struct css_syntax *syn, const char *v, size_t n, struct cx *cx, const char *base,
+                       const struct css_color *current, sbuf *out, unsigned *deps) {
+    if (!syn || !syn->count) {
+        if (out) sb_put(out, v, n);
+        return 0;
+    }
+    trim(&v, &n);
+    if (!n) return -1;
+    for (unsigned k = 0; k < syn->count; k++) {
+        const struct css_syntax_component *c = &syn->component[k];
+        size_t begin = out ? out->n : 0;
+        unsigned found = 0;
+        bool ok;
+        if (!c->multiplier) ok = syn_item(c, v, n, cx, base, current, out, &found);
+        else {
+            const char *p = v, *e = v + n, *is;
+            size_t in, count = 0;
+            bool bad = false;
+            ok = true;
+            while (ok && syn_next(&p, e, c->multiplier, &is, &in, &bad)) {
+                if (bad) { ok = false; break; }
+                if (count++ && out) sb_puts(out, c->multiplier == '#' ? ", " : " ");
+                ok = syn_item(c, is, in, cx, base, current, out, &found);
+            }
+            ok = ok && !bad && count;
+        }
+        if (ok) {
+            if (deps) *deps |= found;
+            return (int)k;
+        }
+        if (out) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    }
+    return -1;
+}
+const char *css_syntax_type_name(const struct css_syntax_component *c) {
+    return c->type == CSS_SYNTAX_IDENT ? c->ident : syntax_type_names[c->type];
+}
+/* a syntax string as CSSOM serializes the registration's (the components as written, | between) */
+bool css_syntax_text(const struct css_syntax *syn, sbuf *out) {
+    if (!syn || !syn->count) { sb_putc(out, '*'); return true; }
+    for (unsigned k = 0; k < syn->count; k++) {
+        const struct css_syntax_component *c = &syn->component[k];
+        if (k) sb_puts(out, " | ");
+        if (c->type == CSS_SYNTAX_IDENT) css_serialize_ident(out, c->ident);
+        else sb_puts(out, syntax_type_names[c->type]);
+        if (c->multiplier) sb_putc(out, c->multiplier);
+    }
+    return true;
+}
+/* -------- a transform-typed custom property's values (css-properties-values-api-1 §2.5)
+   They combine as the transform property does (CSS Transforms 1 §9, CSS Transforms 2 §14-15), but
+   the computed value keeps the functions as written, so the result does too: two functions of one
+   name and as many arguments combine argument by argument and keep the name ("interpolated
+   numerically without a former conversion"), a pair that shares only a primitive becomes it, and a
+   function the other list lacks pads as its own identity. */
+static bool tf_text_next(const char **p, const char *e, const char **name, size_t *nn, const char **args, size_t *an) {
+    while (*p < e && is_space((unsigned char)**p)) (*p)++;
+    const char *s = *p;
+    while (*p < e && **p != '(') (*p)++;
+    if (*p == e || *p == s) return false;
+    *name = s;
+    *nn = (size_t)(*p - s);
+    const char *a = ++*p;
+    unsigned depth = 1;
+    while (*p < e && depth) { if (**p == '(') depth++; else if (**p == ')') depth--; if (depth) (*p)++; }
+    if (depth) return false;
+    *args = a;
+    *an = (size_t)(*p - a);
+    (*p)++;
+    return true;
+}
+/* one argument of a function both values have; scale: a factor, whose identity is 1 */
+static bool tf_text_argument(sbuf *out, const char *a, size_t an, const char *b, size_t bn, double ka, double kb, int mode,
+                             bool scale, struct cx *cx, web_doc *d) {
+    double x, y;
+    if (css_numeric_read(a, an, CSS_CALC_NUMBER, cx, cx->a, NAN, &x, NULL) &&
+        css_numeric_read(b, bn, CSS_CALC_NUMBER, cx, cx->a, NAN, &y, NULL)) {
+        anim_number(out, mode == ACCUMULATE && scale ? x + y - 1 : x * ka + y * kb);
+        return true;
+    }
+    if (css_numeric_read(a, an, CSS_CALC_ANGLE, cx, cx->a, NAN, &x, NULL) &&
+        css_numeric_read(b, bn, CSS_CALC_ANGLE, cx, cx->a, NAN, &y, NULL)) {
+        anim_unit(out, x * ka + y * kb, "deg");
+        return true;
+    }
+    len_t l, m;
+    return parse_len(a, an, cx, &l, LF_NEG | LF_LENGTH) && parse_len(b, bn, cx, &m, LF_NEG | LF_LENGTH) &&
+           anim_len(out, &l, &m, ka, kb, LF_NEG, d);
+}
+/* one pair of functions (a NULL name: the identity of the other), false: they share no more than a primitive */
+static bool tf_text_pair(sbuf *out, const char *na, size_t nan_, const char *aa, size_t aan, const char *nb, size_t nbn,
+                         const char *ab, size_t abn, double ka, double kb, int mode, struct cx *cx, web_doc *d) {
+    const char *pa[17], *pb[17];
+    size_t la[17], lb[17];
+    int ca = na ? split(aa, aan, pa, la, 17, ',') : 0, cb = nb ? split(ab, abn, pb, lb, 17, ',') : 0;
+    if (na && nb) {
+        if (nan_ != nbn || ca != cb) return false;
+        for (size_t i = 0; i < nan_; i++) if (lower((unsigned char)na[i]) != lower((unsigned char)nb[i])) return false;
+    }
+    const char *name = na ? na : nb;
+    size_t nn = na ? nan_ : nbn;
+    int count = na ? ca : cb;
+    if (!count) return false;
+    bool scale = nn >= 5 && strn_ieq(name, "scale", 5);
+    bool axis = nn == 8 && strn_ieq(name, "rotate3d", 8);
+    size_t begin = out->n;
+    sb_put(out, name, nn);
+    sb_putc(out, '(');
+    for (int i = 0; i < count; i++) {
+        if (i) sb_puts(out, ", ");
+        const char *x = na ? pa[i] : NULL, *y = nb ? pb[i] : NULL;
+        size_t xn = na ? la[i] : 0, yn = nb ? lb[i] : 0;
+        if (axis && i < 3) {
+            /* rotate3d()'s axis: the one both have, which the angle turns about */
+            if (x && y && (xn != yn || memcmp(x, y, xn))) goto primitive;
+            sb_put(out, x ? x : y, x ? xn : yn);
+            continue;
+        }
+        if (!x || !y) {
+            /* the identity: a factor of 1, else a zero of the argument's type */
+            const char *have = x ? x : y;
+            size_t hn = x ? xn : yn;
+            double v;
+            const char *zero = scale ? "1" : css_numeric_read(have, hn, CSS_CALC_NUMBER, cx, cx->a, NAN, &v, NULL) ? "0" :
+                               css_numeric_read(have, hn, CSS_CALC_ANGLE, cx, cx->a, NAN, &v, NULL) ? "0deg" : "0px";
+            if (!x) { x = zero; xn = strlen(zero); } else { y = zero; yn = strlen(zero); }
+        }
+        if (!tf_text_argument(out, x, xn, y, yn, ka, kb, mode, scale, cx, d)) goto primitive;
+    }
+    sb_putc(out, ')');
+    return true;
+primitive:
+    out->n = begin;
+    if (out->p && begin < out->cap) out->p[begin] = 0;
+    return false;
+}
+static bool tf_text(sbuf *out, const char *a, size_t an, const char *b, size_t bn, const struct css_transform *x,
+                    const struct css_transform *y, double ka, double kb, int mode, const struct box *box, struct cx *cx,
+                    web_doc *d) {
+    bool match = tf_lists_match(x, y);
+    if (mode == ADD || (mode == ACCUMULATE && !match)) {
+        /* addition appends the value's functions to the underlying list (CSS Transforms 2 §15) */
+        sb_put(out, a, an);
+        sb_putc(out, ' ');
+        sb_put(out, b, bn);
+        return true;
+    }
+    if (!match) return tf_matrix_mix(out, x, y, box, kb);
+    size_t begin = out->n;
+    const char *p = a, *pe = a + an, *q = b, *qe = b + bn;
+    for (const struct css_transform *s = x, *t = y; s || t; s = s ? s->next : NULL, t = t ? t->next : NULL) {
+        const char *na = NULL, *aa = NULL, *nb = NULL, *ab = NULL;
+        size_t nan_ = 0, aan = 0, nbn = 0, abn = 0;
+        if ((s && !tf_text_next(&p, pe, &na, &nan_, &aa, &aan)) || (t && !tf_text_next(&q, qe, &nb, &nbn, &ab, &abn))) {
+            /* the text and the parsed list disagree: the transform property's own serialization */
+            out->n = begin;
+            if (out->p && begin < out->cap) out->p[begin] = 0;
+            return tf_list(out, x, y, ka, kb, mode, box, d);
+        }
+        if (out->n > begin) sb_putc(out, ' ');
+        if (tf_text_pair(out, na, nan_, aa, aan, nb, nbn, ab, abn, ka, kb, mode, cx, d)) continue;
+        struct css_transform one_a, one_b;
+        if (s) { one_a = *s; one_a.next = NULL; }
+        if (t) { one_b = *t; one_b.next = NULL; }
+        if (!tf_pairs(out, s ? &one_a : NULL, t ? &one_b : NULL, ka, kb, mode, d)) return false;
+    }
+    return true;
+}
+/* css-properties-values-api-1 §2.5: two computed values of one data type combined as that type
+   interpolates (CSS Values 4 §3: ka·a + kb·b, MIX), adds or accumulates (b onto a). Lengths and
+   percentages as <length-percentage> mixes, <integer> as a real number rounded half toward +∞,
+   colours by CSS Color 4 §13, transforms as the transform property. false: discrete */
+static bool syn_item_combine(const struct css_anim_ctx *c, const struct css_syntax_component *k, const char *a, size_t an,
+                             const char *b, size_t bn, double ka, double kb, int mode, struct cx *cx, sbuf *out) {
+    trim(&a, &an);
+    trim(&b, &bn);
+    switch (k->type) {
+    case CSS_SYNTAX_INTEGER: case CSS_SYNTAX_NUMBER: case CSS_SYNTAX_PERCENTAGE: case CSS_SYNTAX_ANGLE:
+    case CSS_SYNTAX_TIME: case CSS_SYNTAX_RESOLUTION: {
+        static const unsigned accept[CSS_SYNTAX_TYPES] = {[CSS_SYNTAX_INTEGER] = CSS_CALC_NUMBER, [CSS_SYNTAX_NUMBER] = CSS_CALC_NUMBER,
+            [CSS_SYNTAX_PERCENTAGE] = CSS_CALC_PERCENT, [CSS_SYNTAX_ANGLE] = CSS_CALC_ANGLE,
+            [CSS_SYNTAX_TIME] = CSS_CALC_TIME, [CSS_SYNTAX_RESOLUTION] = CSS_CALC_RESOLUTION};
+        static const char *const unit[CSS_SYNTAX_TYPES] = {[CSS_SYNTAX_INTEGER] = "", [CSS_SYNTAX_NUMBER] = "",
+            [CSS_SYNTAX_PERCENTAGE] = "%", [CSS_SYNTAX_ANGLE] = "deg", [CSS_SYNTAX_TIME] = "s", [CSS_SYNTAX_RESOLUTION] = "dppx"};
+        double x, y;
+        if (!css_numeric_read(a, an, accept[k->type], cx, cx->a, NAN, &x, NULL) ||
+            !css_numeric_read(b, bn, accept[k->type], cx, cx->a, NAN, &y, NULL)) return false;
+        double v = x * ka + y * kb;
+        if (k->type == CSS_SYNTAX_INTEGER) {
+            char t[48];
+            v = floor(v + 0.5);
+            snprintf(t, sizeof t, "%.0f", v == 0 ? 0.0 : v);
+            sb_puts(out, t);
+            return true;
+        }
+        if (k->type == CSS_SYNTAX_RESOLUTION && v < 0) v = 0; /* the type's range */
+        css_number_serialize(out, v);
+        sb_puts(out, unit[k->type]);
+        return true;
+    }
+    case CSS_SYNTAX_LENGTH: case CSS_SYNTAX_LENGTH_PERCENTAGE: {
+        int flags = LF_NEG | LF_LENGTH | (k->type == CSS_SYNTAX_LENGTH ? LF_NOPCT : 0);
+        len_t x, y;
+        if (!parse_len(a, an, cx, &x, flags) || !parse_len(b, bn, cx, &y, flags)) return false;
+        return anim_len(out, &x, &y, ka, kb, LF_NEG, c->d);
+    }
+    case CSS_SYNTAX_COLOR: {
+        uint32_t ax, bx;
+        const struct css_color_value *va = NULL, *vb = NULL;
+        struct cx probe = *cx;
+        probe.supports_probe = false;
+        if (!css_color_value_compute(a, an, &probe, NULL, &ax, &va) || !css_color_value_compute(b, bn, &probe, NULL, &bx, &vb))
+            return false;
+        struct css_color_computed x, y;
+        css_color_held(ax, va, c->base->color, &x);
+        css_color_held(bx, vb, c->base->color, &y);
+        return anim_color(out, c->base, &x, c->base, &y, kb, mode);
+    }
+    case CSS_SYNTAX_TRANSFORM_FUNCTION: case CSS_SYNTAX_TRANSFORM_LIST: {
+        /* one function appended to another would be a list, which the type is not: the two
+           combine argument by argument as accumulation does (for translations, what the list
+           would come to) */
+        bool single = k->type == CSS_SYNTAX_TRANSFORM_FUNCTION && k->multiplier != '+';
+        if (single && mode == ADD) mode = ACCUMULATE;
+        const struct css_transform *x = NULL, *y = NULL;
+        if (!parse_transform_value(a, an, cx, &x) || !parse_transform_value(b, bn, cx, &y) || cx->invalid) return false;
+        if (single && mode != MIX && !tf_lists_match(x, y)) return false;
+        return tf_text(out, a, an, b, bn, x, y, ka, kb, mode, c->box, cx, c->d);
+    }
+    }
+    return false; /* <custom-ident>, idents, <string>, <url>, <image>: discrete */
+}
+/* both values by the component they match; a list (+ or #) item by item, only with as many items,
+   except that <transform-function>+ is a transform list (§2.5) */
+static bool syn_combine(const struct css_anim_ctx *c, const struct css_syntax *syn, const char *a, const char *b, double ka,
+                        double kb, int mode, sbuf *out) {
+    if (!syn || !syn->count || !a || !b || !c->base) return false;
+    style_t scratch = *c->base;
+    struct cx cx = {.s = &scratch, .parent = c->parent, .node = c->node, .em = c->base->font_size, .rem = c->rem,
+                    .vw = c->vw, .vh = c->vh, .a = c->a, .set = ar_alloc(c->a, NPROPS), .supports_probe = true};
+    size_t an = strlen(a), bn = strlen(b);
+    int ia = css_syntax_compute(syn, a, an, &cx, NULL, NULL, NULL, NULL), ib = css_syntax_compute(syn, b, bn, &cx, NULL, NULL, NULL, NULL);
+    if (ia < 0 || ia != ib) return false;
+    const struct css_syntax_component *k = &syn->component[ia];
+    size_t begin = out->n;
+    bool ok;
+    if (!k->multiplier || (k->multiplier == '+' && k->type == CSS_SYNTAX_TRANSFORM_FUNCTION))
+        ok = syn_item_combine(c, k, a, an, b, bn, ka, kb, mode, &cx, out);
+    else {
+        const char *p = a, *pe = a + an, *q = b, *qe = b + bn, *is, *js;
+        size_t in, jn, count = 0;
+        bool bad = false;
+        ok = true;
+        for (;;) {
+            bool more_a = syn_next(&p, pe, k->multiplier, &is, &in, &bad), more_b = !bad && syn_next(&q, qe, k->multiplier, &js, &jn, &bad);
+            if (bad || more_a != more_b) { ok = false; break; } /* a different number of items: discrete */
+            if (!more_a) break;
+            if (count++) sb_puts(out, k->multiplier == '#' ? ", " : " ");
+            if (!syn_item_combine(c, k, is, in, js, jn, ka, kb, mode, &cx, out)) { ok = false; break; }
+        }
+    }
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
+}
+bool css_custom_interpolate(const struct css_anim_ctx *c, const struct css_syntax *syn, const char *a, const char *b, double t,
+                            sbuf *out) {
+    return syn_combine(c, syn, a, b, 1 - t, t, MIX, out);
+}
+bool css_custom_compose(const struct css_anim_ctx *c, const struct css_syntax *syn, const char *underlying, const char *value,
+                        bool accumulate, sbuf *out) {
+    return syn_combine(c, syn, underlying, value, 1, 1, accumulate ? ACCUMULATE : ADD, out);
 }
