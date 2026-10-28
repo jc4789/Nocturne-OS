@@ -1589,8 +1589,12 @@ bool doc_css_loading(web_doc *d) {
     return false;
 }
 
-void web_free(web_doc *d) {
-    if (!d) return;
+/* A document family (a document and its dom_docs) shares nodes: a node is allocation-owned by one
+   member and may be DOM-owned by another after adoption. web_free releases the whole family in
+   three steps, so that no step reads a member that an earlier step freed: each member's own state
+   (scripts, styles, boxes, animations, parsers), then every member's allocation-owned nodes, then
+   every member's storage. */
+static void doc_release(web_doc *d) {
     while (d->scroll_input_first) {
         node_t *n = d->scroll_input_first;
         d->scroll_input_first = n->scroll_input_next;
@@ -1627,11 +1631,8 @@ void web_free(web_doc *d) {
     web_form_validation_free(d);
     /* Parser subscriptions can borrow allocation-owned nodes in helper docs. */
     doc_parser_stop(d);
-    while (d->dom_docs) {
-        web_doc *child = d->dom_docs;
-        d->dom_docs = child->dom_next; child->dom_next = NULL;
-        web_free(child);
-    }
+}
+static void doc_nodes_retire(web_doc *d) {
     if (d->owned_nodes) {
         for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
             /* Allocation ownership differs from DOM ownership after adoption.
@@ -1650,6 +1651,8 @@ void web_free(web_doc *d) {
             free(n->input_edit);
         }
     } else if (d->root) free_values(d->root);
+}
+static void doc_storage_free(web_doc *d) {
     css_style_doc_free(d);
     free_pending(d);
     pv_free(&d->pending_css);
@@ -1693,6 +1696,29 @@ void web_free(web_doc *d) {
     free(d->referrer);
     free(d->content_type);
     free(d);
+}
+static void family_release(web_doc *member) {
+    for (; member; member = member->dom_next) { doc_release(member); family_release(member->dom_docs); }
+}
+static void family_retire(web_doc *member) {
+    for (; member; member = member->dom_next) { family_retire(member->dom_docs); doc_nodes_retire(member); }
+}
+static void family_free(web_doc *d) {
+    while (d->dom_docs) {
+        web_doc *child = d->dom_docs;
+        d->dom_docs = child->dom_next; child->dom_next = NULL;
+        family_free(child);
+        doc_storage_free(child);
+    }
+}
+void web_free(web_doc *d) {
+    if (!d) return;
+    doc_release(d);
+    family_release(d->dom_docs);
+    family_retire(d->dom_docs);
+    doc_nodes_retire(d);
+    family_free(d);
+    doc_storage_free(d);
 }
 
 const char *web_title(web_doc *d) { return d->title ? d->title : ""; }
