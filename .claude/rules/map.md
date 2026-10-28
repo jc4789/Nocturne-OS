@@ -66,6 +66,7 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 | 媒体 | `avmedia.c` → `user/libc/media*.c` → 子 `browsermediaworker`・`browsermseworker`。`js_canvas.c`、`js_webgl.c` → `ports/mesa/nocturne_gl.c` | `web_avmedia_tick` |
 | Web Audio | `webaudio.c`、`webaudio_dsp.c`、`js_webaudio.c`・`.js`。出口は `n_audio_submit` | — |
 | Worker・WASM | `js_worker.c` → 子 `browserjsworker`／`js_wasm.cpp`（wabt） | — |
+| 時間の計測 | 各要求の時刻は一つの記録 `struct http_fetch_timing`（`http.h`）：tls.c・http.c・webfetch.c が書き、私的な行で webnet.c へ運び、`webnet_response.timing` → browser.c・`frame_native.h` の `frame_host`（文書の航行）／js.c の `web_js_loaded`（資源）。JS の項目は js.c の `timing_value` → `js_performance.js`（Performance Timeline・User Timing・Navigation・Resource・Paint・Server Timing）。first-paint・first-contentful-paint は paint.c の `paint_document` が文書に記し、js.c の `report_paint_timing` が出す | `host.navigationTiming`、`resourceTiming`・`paintTiming`・`navigationTimingQueued` の hook |
 | 保存 | `webstorage.c`、IndexedDB は `js_indexeddb.js`＋`js_indexeddb.c`（窓と Worker の両方の realm。Worker は `browserjsworker.c` の主ループ）→ `webidb_async.c` → 子 `browserstorageworker` → `webidb.c`（接続の表で窓と Worker の versionchange・blocked・close が出会う）、`webcookie.c`（永続の Cookie は webnet.c の `cookie_sync` が `AppData\Browser\cookies` へ。窓どうしは見張りで読み直す）、`js_opfs.c`、まとめは `websitedata.c` | — |
 | F12・ログ | `user/apps/browser_devtools.h`＋`web/inspect.c`。console の行は `web_js_console`（js.c）→ `host_console`→`console_add`（browser.c）。`--log-console`／`--debug-js` で serial へ `[browser <level> @秒.ms] …` | — |
 

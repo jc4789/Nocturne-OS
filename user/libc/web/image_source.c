@@ -1,12 +1,14 @@
 #include "image_source.h"
 #include <stdio.h>
 
-static bool supported(const char *type) {
-    if(!type||!*type)return true;
+bool web_image_type_supported(const char *type, size_t n) {
     static const char *const types[]={"image/jpeg","image/png","image/gif","image/webp","image/svg+xml","image/bmp","image/x-icon","image/vnd.microsoft.icon"};
-    size_t n=strcspn(type,";\t ");
     for(size_t i=0;i<sizeof types/sizeof types[0];i++)if(n==strlen(types[i])&&!strncasecmp(type,types[i],n))return true;
     return false;
+}
+static bool supported(const char *type) {
+    if(!type||!*type)return true;
+    return web_image_type_supported(type,strcspn(type,";\t "));
 }
 static float source_size(web_doc *d,const char *sizes) {
     float viewport=d->width>0?d->width:1024;

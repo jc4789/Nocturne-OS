@@ -13,6 +13,8 @@ net_stream *ns_open_http_cancelled_timed(const char *h,uint16_t p,bool tls,int t
     struct http_transport_timing *m,const char *partition,int (*cancelled)(void *),void *ctx){
     (void)cancelled;(void)ctx;return ns_open_http_timed(h,p,tls,t,e,n,m,partition);}
 const char *ns_protocol(net_stream *s){(void)s;return "http/1.1";}
+/* A fixture stream opened no real connection: its connection timing info is empty. */
+int ns_get_connection_timing(const net_stream *s,struct http_connection_timing *out){(void)s;if(out)memset(out,0,sizeof *out);return 0;}
 bool ns_session_resumed(net_stream *s){(void)s;return false;}
 void ns_set_cancel(net_stream *s,int (*f)(void*),void *c){(void)s;(void)f;(void)c;}
 void ns_abort(net_stream *s){if(s)ns_close(s);}

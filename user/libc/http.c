@@ -322,6 +322,7 @@ struct rd {
     size_t pos, len;
     char *line;
     size_t line_capacity;
+    uint64_t filled_at; /* when the bytes now buffered arrived */
     bool eof, err, line_invalid, line_oom;
 };
 
@@ -337,6 +338,7 @@ static bool rd_fill(struct rd *r) {
     }
     r->pos = 0;
     r->len = (size_t)n;
+    r->filled_at = uptime_ms();
     return true;
 }
 
@@ -436,6 +438,8 @@ static bool copy_body(struct rd *r, struct sink *k, size_t n) {
         if (!rd_fill(r)) return n == (size_t)-1 && !r->err;
         size_t take = r->len - r->pos;
         if (take > n) take = n;
+        /* Fetch's encoded size: the body's bytes as transmitted. */
+        if (r->result) r->result->encoded_body_size += take;
         if (!sink_put(k, r->buf + r->pos, take)) return false;
         r->pos += take;
         if (n != (size_t)-1) n -= take;
@@ -621,6 +625,15 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     net_stream *s=work->connection->stream;
     if(!work->connection->h2)ns_set_cancel(s,hooks?hooks->cancelled:NULL,rq->ctx);
     if(timing){timing->phase=HTTP_PHASE_HEADER;*phase_started=uptime_ms();}
+    struct http_transport_result *result=work->result;
+    if(result) {
+        /* The connection's timing info as it opened (an earlier request's
+           when reused). Without ALPN the exchange names its own protocol:
+           cleartext prior knowledge is h2c, HTTP/1 its response's version. */
+        ns_get_connection_timing(s,&result->connection);
+        if(!result->connection.protocol[0])strcpy(result->connection.protocol,prior?"h2c":"http/1.1");
+        result->request_start=uptime_ms();
+    }
 
     /* One complete header block avoids a flush/TLS record and TCP send for
        each fragment. A short write must never be treated as a sent request. */
@@ -662,6 +675,8 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     /* All informational responses precede the final response. 101 changes
        protocols and cannot be handed back as a reusable HTTP connection. */
     do {
+        /* Fetch: each response starts as its first byte reaches the parser. */
+        uint64_t response_started = rd_fill(r) ? r->filled_at : 0;
         if (!rd_line(r, &line) || r->line_invalid || sscanf(line, "HTTP/%d.%d %d", &major,&minor,&status) != 3 ||
             major!=1||(minor!=0&&minor!=1)||status<100||status>599||status==101) {
             if(r->eof&&!r->err)errno=ECONNRESET;else if(!r->err)errno=EPROTO;
@@ -669,6 +684,11 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
             snprintf(rs->error, sizeof rs->error, "no HTTP response (%s)", r->line_oom ? "out of memory reading line" : detail[0] ? detail : "connection closed");
             rd_free(r);
             return -1;
+        }
+        if (result) {
+            result->final_response_start = response_started;
+            if (status < 200 && !result->first_interim_response_start) result->first_interim_response_start = response_started;
+            if (!work->h2 && minor == 0 && !strcmp(result->connection.protocol, "http/1.1")) strcpy(result->connection.protocol, "http/1.0");
         }
         if (status < 200) {
             size_t interim_len = 0;
@@ -794,6 +814,8 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     bool no_body = !strcmp(method, "HEAD") || status == 204 || status == 304;
     size_t decoded_limit = body_limit ? body_limit : HTTP_DECODED_LIMIT;
     struct sink k = {rq, rs, 0, false, body_limit, NULL, 0};
+    char filtered_coding[HTTP_CONTENT_ENCODING_MAX];
+    coding_filtered(encoding, filtered_coding);
     int coded = encoding && !no_body ? coding_create(&k, encoding) : 0;
     free(encoding);
     if (coded < 0) {
@@ -848,6 +870,8 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         }
     }
     coding_free(&k);
+    /* Set once a body byte was transmitted (HTTP-network fetch). */
+    if (result && result->encoded_body_size) memcpy(result->content_encoding, filtered_coding, sizeof filtered_coding);
     if (!rs->body && !rq->on_body) {
         rs->body = calloc(1, 1);
     }

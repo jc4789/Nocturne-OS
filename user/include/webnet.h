@@ -161,6 +161,9 @@ struct webnet_response {
     /* With report_sent: the request fields the final hop sent, as sent
        ("Name: value" CRLF lines, Host first); otherwise empty. */
     const char *sent_headers;
+    /* WEBNET_COMPLETE and WEBNET_END: Fetch's timing record of the request
+       (http.h), network errors included; NULL with every other event. */
+    const struct http_fetch_timing *timing;
 };
 typedef void (*webnet_callback)(webnet *, uint64_t id, uint64_t generation,
                                const struct webnet_response *, void *opaque);

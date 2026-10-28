@@ -80,6 +80,18 @@ struct job {
     size_t input_consumed;
     unsigned char *backlog;
     size_t backlog_pos, backlog_len, backlog_cap;
+    /* Fetch's timing record of this fetch (http.h), returned to the browser
+       (WEBNET_WIRE_TIMING), which adds the start time it asked at. Each hop
+       adds what its transport, the cache and the TAO check recorded:
+       timing_allow_failed is the request's timing allow failed flag,
+       redirect_tao a navigation's redirect hops' Timing-Allow-Origin values
+       (its navigation timing allow values list; NULL when a hop had none),
+       hop_decoded the current hop's decoded body bytes. */
+    struct http_fetch_timing timing;
+    bool timing_allow_failed;
+    char **redirect_tao;
+    size_t redirect_tao_count;
+    uint64_t hop_decoded;
 };
 /* Response bytes the browser has not credited yet wait in the job, so the
    socket keeps being read while the browser's main thread is busy (a long
@@ -581,6 +593,10 @@ struct cache_entry {
     int status;
     uint64_t stored_ms, age_seconds, lifetime_seconds;
     bool no_cache, must_revalidate;
+    /* Fetch stores a response's body info with it: its encoded size and
+       content encoding as they were transmitted. */
+    uint64_t encoded_size;
+    char content_encoding[HTTP_CONTENT_ENCODING_MAX];
 };
 static struct cache_entry *cache_entries;
 static size_t cache_bytes;
@@ -857,7 +873,9 @@ static void cache_store(struct job *j,const struct http_resp *r) {
     }
     struct cache_entry source={.url=j->final_url,.partition=j->partition,.request_headers=j->outgoing.p,
         .headers=(char *)http_response_headers(r),.reason=(char *)http_response_status_text(r),
-        .body=j->cache_body.p?j->cache_body.p:"",.body_len=j->cache_body.length,.status=r->status};
+        .body=j->cache_body.p?j->cache_body.p:"",.body_len=j->cache_body.length,.status=r->status,
+        .encoded_size=j->timing.encoded_body_size};
+    memcpy(source.content_encoding,j->timing.content_encoding,sizeof source.content_encoding);
     struct cache_entry *e=cache_clone(&source);if(!e)return;
     char *clean=cache_clean_headers(e->headers,NULL,false,0);if(!clean){cache_free(e);return;}
     free(e->headers);e->headers=clean;cache_freshness(e);
@@ -1116,6 +1134,144 @@ static bool cors_allowed(struct job *j, const struct http_resp *r) {
     }
     return true;
 }
+/* ---- Fetch's timing record (http.h) ----
+   Fetch "get, decode, and split": whether a list value is exactly token. A
+   quoted string stays one value with its quotes, commas inside it included. */
+static bool split_list_has(const char *value, const char *token) {
+    size_t length = strlen(token);
+    for (const char *p = value;;) {
+        const char *start = p;
+        while (*p && *p != ',') {
+            if (*p != '"') { p++; continue; }
+            for (p++; *p && *p != '"'; p++) if (*p == '\\' && p[1]) p++;
+            if (*p) p++;
+        }
+        const char *a = start, *b = p;
+        while (a < b && (*a == ' ' || *a == '\t')) a++;
+        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        if ((size_t)(b - a) == length && !memcmp(a, token, length)) return true;
+        if (!*p) return false;
+        p++;
+    }
+}
+/* Fetch "get" over every name field: the values combined with ", " into
+   *out (NULL when there is none). False only when memory runs out. */
+static bool combined_field(struct job *j, const char *headers, const char *name, char **out) {
+    *out = NULL;
+    size_t name_length = strlen(name), total = 0;
+    const char *cursor = headers, *value; size_t n;
+    bool any = false;
+    while (field_value_next(&cursor, name, name_length, &value, &n)) {
+        if (n > SIZE_MAX - total - 3) return fail(j, "Out of memory combining a response field");
+        total += n + 2; any = true;
+    }
+    if (!any) return true;
+    char *combined = malloc(total + 1), *at = combined;
+    if (!combined) return fail(j, "Out of memory combining a response field");
+    cursor = headers;
+    while (field_value_next(&cursor, name, name_length, &value, &n)) {
+        const char *end = value + n;
+        while (value < end && (*value == ' ' || *value == '\t')) value++;
+        while (end > value && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if (at != combined) { memcpy(at, ", ", 2); at += 2; }
+        memcpy(at, value, (size_t)(end - value)); at += end - value;
+    }
+    *at = 0; *out = combined;
+    return true;
+}
+/* Fetch's TAO check of one hop's response (HTTP fetch). A failure stays for
+   the rest of the request: the request's timing allow failed flag. */
+static bool timing_allow_check(struct job *j, const char *headers) {
+    if (j->timing_allow_failed) return true;
+    char *values;
+    if (!combined_field(j, headers, "Timing-Allow-Origin", &values)) return false;
+    bool allowed = values && (split_list_has(values, "*") || split_list_has(values, request_origin(j)));
+    free(values);
+    if (allowed) return true;
+    bool cross = !j->origin || !j->target_origin || strcmp(j->origin, j->target_origin);
+    bool navigate = j->wire.kind == WEBNET_NAVIGATION;
+    /* A navigation's tainting is basic; otherwise basic means it never left
+       the request origin (cors and opaque tainting are kept once set). */
+    bool basic = navigate ? !cross : !j->cors_tainted && !j->opaque_tainted && !j->resource_opaque;
+    if (!basic) j->timing_allow_failed = true;
+    return true;
+}
+/* What one hop adds to the record: the transport's times and connection for
+   a network exchange (a 304 revalidation included), the cache state, and
+   the body info (a stored response's own when it came from the cache). */
+static void timing_hop(struct job *j, bool network, bool cached, const struct http_transport_result *transport) {
+    struct http_fetch_timing *f = &j->timing;
+    if (network) {
+        f->connection_valid = true; f->connection = transport->connection;
+        f->final_network_request_start = transport->request_start;
+        f->final_network_response_start = transport->final_response_start;
+        if (!f->first_interim_network_response_start)
+            f->first_interim_network_response_start = transport->first_interim_response_start;
+    }
+    f->cache_state = !cached ? HTTP_CACHE_STATE_NONE : network ? HTTP_CACHE_STATE_VALIDATED : HTTP_CACHE_STATE_LOCAL;
+    if (cached && j->cached) {
+        f->encoded_body_size = j->cached->encoded_size;
+        memcpy(f->content_encoding, j->cached->content_encoding, sizeof f->content_encoding);
+    } else {
+        f->encoded_body_size = transport->encoded_body_size;
+        memcpy(f->content_encoding, transport->content_encoding, sizeof f->content_encoding);
+    }
+    f->decoded_body_size = j->hop_decoded;
+}
+/* The fetch ended (its body's end, or a network error): the end time, the
+   flags only the whole request decides, and HTML's redirect count exposure
+   of a navigation (create and initialize a Document). */
+static void timing_finish(struct job *j) {
+    struct http_fetch_timing *f = &j->timing;
+    f->end_time = uptime_ms();
+    f->timing_allow_passed = !j->timing_allow_failed && !j->error[0] && j->status;
+    f->redirect_same_origin = !j->origin_tainted;
+    if (j->wire.kind != WEBNET_NAVIGATION) return;
+    /* Fetch's navigation TAO check: every redirect hop's values allow the
+       destination origin. */
+    bool tao = j->target_origin != NULL;
+    for (size_t i = 0; tao && i < j->redirect_tao_count; i++)
+        tao = j->redirect_tao[i] && (split_list_has(j->redirect_tao[i], "*") || split_list_has(j->redirect_tao[i], j->target_origin));
+    bool no_client = (j->fetch.flags & WEBNET_FETCH_BROWSER_UI) || !j->document || !*j->document;
+    f->navigation_redirects_exposed = f->redirect_same_origin || ((no_client || (j->referrer && *j->referrer)) && tao);
+}
+/* The private lines that carry the record (WEBNET_WIRE_TIMING): one with its
+   numbers, then the Server-Timing values when the response had any. The
+   browser's webnet.c takes them out of the header block. */
+static char *timing_lines(const struct job *j, size_t *length) {
+    const struct http_fetch_timing *f = &j->timing;
+    const struct http_connection_timing *c = &f->connection;
+    char line[768];
+    int n = snprintf(line, sizeof line,
+        "\r\nHTTP/Nocturne-Timing redirects=%lu redirect_end=%llu post_redirect=%llu lookup_start=%llu lookup_end=%llu "
+        "connect_start=%llu connect_end=%llu secure_start=%llu request=%llu interim=%llu response=%llu end=%llu "
+        "cache=%u tao=%u same_origin=%u navigation_redirects=%u connection=%u encoded=%llu decoded=%llu protocol=%s encoding=%s\r\n",
+        (unsigned long)f->redirect_count, (unsigned long long)f->redirect_end, (unsigned long long)f->post_redirect_start,
+        (unsigned long long)c->domain_lookup_start, (unsigned long long)c->domain_lookup_end,
+        (unsigned long long)c->connect_start, (unsigned long long)c->connect_end, (unsigned long long)c->secure_connection_start,
+        (unsigned long long)f->final_network_request_start, (unsigned long long)f->first_interim_network_response_start,
+        (unsigned long long)f->final_network_response_start, (unsigned long long)f->end_time,
+        (unsigned)f->cache_state, (unsigned)f->timing_allow_passed, (unsigned)f->redirect_same_origin,
+        (unsigned)f->navigation_redirects_exposed, (unsigned)f->connection_valid,
+        (unsigned long long)f->encoded_body_size, (unsigned long long)f->decoded_body_size,
+        f->connection_valid ? c->protocol : "", f->content_encoding);
+    if (n < 0 || (size_t)n >= sizeof line) return NULL;
+    static const char mark[] = "HTTP/Nocturne-Server-Timing ";
+    size_t server = f->server_timing ? strlen(f->server_timing) : 0;
+    if (server > SIZE_MAX - (size_t)n - sizeof mark - 2) return NULL;
+    size_t total = (size_t)n + (server ? sizeof mark - 1 + server + 2 : 0);
+    char *out = malloc(total + 1);
+    if (!out) return NULL;
+    memcpy(out, line, (size_t)n);
+    if (server) {
+        char *at = out + n;
+        memcpy(at, mark, sizeof mark - 1); at += sizeof mark - 1;
+        memcpy(at, f->server_timing, server); at += server;
+        memcpy(at, "\r\n", 2);
+    }
+    out[total] = 0; *length = total;
+    return out;
+}
 static int cookie_header(void *opaque, const char *line, size_t length) {
     struct job *j = opaque;
     if (!j->hop_cookies || length < 11 || strncasecmp(line,"Set-Cookie:",11)) return 0;
@@ -1156,6 +1312,7 @@ static bool apply_cookie_events(struct job *j,size_t start,const char *method) {
 static int body_cb(void *opaque, const char *data, size_t n) {
     struct job *j = opaque;
     if (!remaining(j)||request_cancelled(j)) return -1;
+    j->hop_decoded += n; /* Fetch's decoded size: the bytes after content codings */
     if(j->cache_capture){
         struct header_buffer *b=&j->cache_body;
         if(n>FETCH_CACHE_OBJECT-b->length){free(b->p);*b=(struct header_buffer){0};j->cache_capture=false;}
@@ -1535,7 +1692,7 @@ static bool run_http(struct job *j) {
         if (!prepare_outgoing(j, current, method, cross)) return false;
         if(!cache_partition(j))return false;
         int left = remaining(j); if (!left) return false;
-        free(j->body); j->body = NULL; j->body_len = j->body_cap = 0;
+        free(j->body); j->body = NULL; j->body_len = j->body_cap = 0; j->hop_decoded = 0;
         struct http_req q = {method, current, j->outgoing.p,
                              !drop_body && (j->wire.body_len || (j->wire.user_navigation & WEBNET_WIRE_BODY_PRESENT)) ?
                                  j->request_body : NULL,
@@ -1607,6 +1764,7 @@ static bool run_http(struct job *j) {
             }
         }
         if (result < 0) { j->cookie_len=j->stream_headers_sent?0:cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
+        bool network=!hit;
         if(!hit&&r.status==304&&j->cached){
             if(!cache_validator_matches(j->cached,&r)){
                 http_resp_free(&r);return fail(j,"Revalidation returned a mismatched entity validator");
@@ -1619,9 +1777,19 @@ static bool run_http(struct job *j) {
             http_resp_free(&r);result=cache_response(j,j->cached,&r);
             if(result<0){http_resp_free(&r);return false;}hit=true;
         }
+        timing_hop(j,network,hit,&transport);
+        if(!timing_allow_check(j,http_response_headers(&r))){http_resp_free(&r);return false;}
         bool redirect = !j->stream_final && (r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308);
         if (redirect) {
             j->referrer_policy=webnet_referrer_policy_header(http_response_headers(&r),j->referrer_policy);
+            /* Fetch: a navigation keeps every redirect hop's Timing-Allow-Origin values. */
+            if (j->wire.kind == WEBNET_NAVIGATION) {
+                char **grown = realloc(j->redirect_tao, (j->redirect_tao_count + 1) * sizeof *grown);
+                if (!grown) { http_resp_free(&r); return fail(j, "Out of memory keeping redirect timing"); }
+                j->redirect_tao = grown;
+                if (!combined_field(j, http_response_headers(&r), "Timing-Allow-Origin", &grown[j->redirect_tao_count])) { http_resp_free(&r); return false; }
+                j->redirect_tao_count++;
+            }
             if (hop == 20) { http_resp_free(&r); return fail(j, "Fetch redirect count exceeded"); }
             if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_ERROR) {
                 http_resp_free(&r); return fail(j, "Redirect forbidden by redirect mode");
@@ -1650,6 +1818,9 @@ static bool run_http(struct job *j) {
             free(j->target_origin); j->target_origin = next_origin;
             free(j->final_url);j->final_url=next_url;
             j->redirected = true;
+            /* Fetch (HTTP-redirect fetch): the redirect ends and the next hop starts. */
+            j->timing.redirect_count++;
+            j->timing.redirect_end = j->timing.post_redirect_start = uptime_ms();
             if ((!strcmp(method, "POST") && (r.status == 301 || r.status == 302)) ||
                 (r.status == 303 && strcmp(method, "GET") && strcmp(method, "HEAD"))) {
                 drop_body = true;
@@ -1657,6 +1828,13 @@ static bool run_http(struct job *j) {
             }
             http_resp_free(&r); continue;
         }
+        /* Fetch: the final response's Server-Timing values, when the request's
+           client is a secure context. A browser-UI navigation has no client;
+           the document it makes reads them, so its URL decides. */
+        const char *client = top_level_navigation(j) && ((j->fetch.flags & WEBNET_FETCH_BROWSER_UI) || !*j->document) ? current : j->document;
+        free(j->timing.server_timing); j->timing.server_timing = NULL;
+        if (j->wire.kind != WEBNET_REPORT && potentially_trustworthy(client) &&
+            !combined_field(j, http_response_headers(&r), "Server-Timing", &j->timing.server_timing)) { http_resp_free(&r); return false; }
         if (j->wire.kind == WEBNET_MODULE && (r.status < 200 || r.status >= 300 || !js_mime(http_response_headers(&r)))) {
             reject_script_response(j, &r, "Module response rejected",
                                    r.status < 200 || r.status >= 300 ? "status" : "MIME");
@@ -2170,6 +2348,22 @@ static int run_one(n_handle input,n_handle output) {
                 j->response_headers_len=old+(size_t)length;}
         }
     }
+    /* Fetch's timing record goes after every server field: appended to a
+       buffered response's block, or as the whole block of a stream's end. */
+    char *timing = NULL; size_t timing_length = 0;
+    bool streaming_end = (w->user_navigation & WEBNET_WIRE_STREAM) != 0;
+    if (!socket && (w->user_navigation & WEBNET_WIRE_TIMING) && w->kind != WEBNET_REPORT) {
+        timing_finish(j);
+        timing = timing_lines(j, &timing_length);
+        if (!timing) { if (!j->error[0]) fail(j, "Out of memory reporting fetch timing"); }
+        else if (!streaming_end) {
+            size_t old = j->response_headers_len;
+            char *grown = old <= SIZE_MAX - timing_length - 1 ? realloc(j->response_headers, old + timing_length + 1) : NULL;
+            if (grown) { memcpy(grown + old, timing, timing_length + 1); j->response_headers = grown; j->response_headers_len = old + timing_length; }
+            else if (!j->error[0]) fail(j, "Out of memory reporting fetch timing");
+            free(timing); timing = NULL; timing_length = 0;
+        }
+    }
     bool ok;
     if (socket) {
         /* A socket channel carries socket records only; run_websocket
@@ -2185,13 +2379,16 @@ static int run_one(n_handle input,n_handle output) {
     out.magic = streaming ? WEBNET_STREAM_END : WEBNET_MAGIC;
     out.id = w->id; out.generation = w->generation; out.status = streaming ? 0 : j->status;
     const char *final_url=j->final_url?j->final_url:"";
-    out.url_len = streaming ? 0 : strlen(final_url); out.headers_len = streaming ? 0 : j->response_headers_len;
+    out.url_len = streaming ? 0 : strlen(final_url); out.headers_len = streaming ? timing_length : j->response_headers_len;
     out.body_len = streaming ? 0 : j->body_len; out.error_len = strlen(j->error);
     out.cookie_len=(uint32_t)j->cookie_len;
     ok = job_write(j, &out, sizeof out) && job_write(j, final_url, out.url_len) &&
-              job_write(j, j->response_headers, out.headers_len) && job_write(j, j->body, out.body_len) && job_write(j, j->error, out.error_len) &&
+              job_write(j, streaming ? timing : j->response_headers, out.headers_len) && job_write(j, j->body, out.body_len) && job_write(j, j->error, out.error_len) &&
               job_write(j,j->cookie_events,out.cookie_len) && backlog_drain(j,0);
     }
+    free(timing); http_fetch_timing_free(&j->timing);
+    for (size_t i = 0; i < j->redirect_tao_count; i++) free(j->redirect_tao[i]);
+    free(j->redirect_tao);
     free(j->backlog);
     free(j->origin); free(j->target_origin);free(j->final_url);free(j->referrer);free(j->referrer_origin);
     free(j->top_level_url);free(j->top_origin);

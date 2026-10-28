@@ -43,6 +43,26 @@ static bool frame_string_replace(char **slot,const char *text) {
     if(text && !copy)return false;
     free(*slot);*slot=copy;return true;
 }
+/* The host a frame's new document is made with: the embedder's, with the
+   frame's own navigation in place of the embedder document's (HTML, create
+   and initialize a Document) - its time origin, and the record, status and
+   header block of its response when p fetched it (borrowed until the
+   document is made). A document made without a fetch (about:blank, srcdoc,
+   blob:) has no navigation timing entry; its time origin is its creation. */
+static struct web_host frame_host(struct web_js_state *s,const struct js_pending *p) {
+    struct web_host host=s->host;
+    memset(&host.navigation_timing,0,sizeof host.navigation_timing);
+    host.navigation_timing.valid=true;host.navigation_timing.type=WEB_NAVIGATION_NAVIGATE;
+    host.navigation_timing.navigation_start_ms=uptime_ms();
+    if(p){
+        const struct http_fetch_timing *t=&p->response.timing;
+        host.navigation_timing.navigation_start_ms=t->valid&&t->start_time?t->start_time:p->started;
+        host.navigation_timing.fetch=*t;
+        host.navigation_timing.status=p->response.status;
+        host.navigation_timing.headers=web_response_headers(&p->response);
+    }
+    return host;
+}
 /* A blob: URL resolves only in the creating realm's object-URL registry. The
    document inherits that realm's origin, like a blob URL entry's environment. */
 static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const char *url) {
@@ -71,7 +91,8 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
     }
     if(text && !page)log_text(s,2,"Frame blob text document allocation failed");
     bool made=page!=NULL;
-    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,"utf-8",&s->host,true);
+    struct web_host host=frame_host(s,NULL);
+    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,"utf-8",&host,true);
     free(page);js_free(s->ctx,body);f->navigation_owner=NULL;
     if(text && !made){f->failed=true;return;}
     html=html || made;
@@ -122,14 +143,16 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         log_text(s,1,"Sandboxed frame blocked: unsupported opaque/srcdoc policy");return;
     }
     if(!f->document || f->detached) {
-        if(!web_frame_initial_create(f,&s->host)){
+        struct web_host host=frame_host(s,NULL);
+        if(!web_frame_initial_create(f,&host)){
             log_text(s,2,"Frame initial about:blank context could not be created");return;
         }
         node_t *ignored=NULL;int result;
         do{result=html_resume(f->document->parser,&ignored);}while(result==HTML_PARSE_YIELD);
     }
     if(srcdoc && !f->navigation){
-        if(!web_frame_commit(f,srcdoc,strlen(srcdoc),"about:srcdoc","utf-8",&s->host,true))
+        struct web_host host=frame_host(s,NULL);
+        if(!web_frame_commit(f,srcdoc,strlen(srcdoc),"about:srcdoc","utf-8",&host,true))
             log_text(s,2,"Frame srcdoc document allocation failed");
         return;
     }
@@ -144,7 +167,8 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         /* The restricted initial blank of a scripted sandbox has no realm;
            an allowed authored blank replaces it with the frame's own policy. */
         bool restricted=(f->document->sandbox_flags&SB_SCRIPTS) && !(f->pending_sandbox_flags&SB_SCRIPTS);
-        if((f->navigation || restricted || strcmp(f->document->url,"about:blank")) && !web_frame_commit(f,"",0,"about:blank",NULL,&s->host,true))
+        struct web_host host=frame_host(s,NULL);
+        if((f->navigation || restricted || strcmp(f->document->url,"about:blank")) && !web_frame_commit(f,"",0,"about:blank",NULL,&host,true))
             log_text(s,2,"Frame about:blank navigation failed");
         free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return;
     }
@@ -218,7 +242,8 @@ static void frame_response(struct web_js_state *s,struct js_pending *p,bool ok) 
         struct http_resp response_headers={.headers_full=(char *)web_response_headers(&p->response)};
         http_header(&response_headers,"Content-Type",content_type,sizeof content_type);
         html_transport_label(content_type,charset,sizeof charset);
-        if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),&s->host,false))return;
+        struct web_host host=frame_host(s,p);
+        if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),&host,false))return;
         char message[640];
         snprintf(message,sizeof message,"Frame document commit failed: %s; %.*s",
                  f->commit_failure?f->commit_failure:"unknown reason",(int)MIN(strcspn(url,"?#"),(size_t)400),url);

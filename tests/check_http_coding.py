@@ -102,5 +102,24 @@ expect("empty br", "br", b"", b"")
 expect("empty layers", "deflate, gzip", b"", b"")
 expect("inner layer broken", "deflate, gzip", gzip.compress(bad_adler), error="invalid or truncated deflate")
 
+# Fetch's filtered coding (response body info's content encoding, Resource Timing's
+# contentEncoding): resource-timing/content-encoding.https.html's gzip, deflate and br
+# (its dcb and dcz are codings this client lacks: "@unknown"), and the #rule list.
+FILTERED = [
+    (None, ""), ("", ""), (" , ,", ""), ("gzip", "gzip"), ("GZip", "gzip"), ("deflate", "deflate"),
+    ("br", "br"), (" br\t", "br"), ("x-gzip", "x-gzip"), ("identity", "identity"),
+    ("gzip, ", "gzip"), (", br", "br"), ("gzip, br", "multiple"), ("gzip,gzip", "multiple"),
+    ("zstd", "@unknown"), ("dcb", "@unknown"), ("dcz", "@unknown"), ("compress", "@unknown"),
+    ("gz ip", ""), ("gzip;q=1", ""), ("br\x7f", ""), ("gzip, b r", ""),
+    ("averyveryverylongcoding", "@unknown"),
+]
+for value, want in FILTERED:
+    checks += 1
+    args = [str(exe), "--filtered"] + ([] if value is None else [value])
+    got = subprocess.run(args, capture_output=True).stdout.decode("ascii").rstrip("\r\n")
+    if got != want:
+        failed += 1
+        print(f"FAIL filtered {value!r}: {got!r}, wanted {want!r}")
+
 print(f"http coding: {checks} checks, {failed} failed")
 sys.exit(1 if failed else 0)

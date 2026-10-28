@@ -12,6 +12,7 @@
 #include <webidb.h>
 #include <webidb_async.h>
 #include <webprefs.h>
+#include <media.h>
 #include <quickjs.h>
 #include "webi.h"
 #include "web_dialog.h"
@@ -28,6 +29,7 @@
 #include "js_compile.h"
 #include "js_profile.h"
 #include "avmedia.h"
+#include "image_source.h"
 #include "form_value.h"
 #include "form_validation.h"
 #include "form_file.h"
@@ -101,7 +103,9 @@ struct js_script {
 };
 enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT, P_POLICY_REPORT, P_MODULE };
 struct js_pending {
-    uint64_t id, deadline, stream_generation;
+    /* started: when the request was made, Fetch's start time of a request
+       the transport never answered with its own timing record. */
+    uint64_t id, started, deadline, stream_generation;
     int kind, credentials, cache_mode, referrer_policy;
     int destination; /* P_FETCH: its Request's destination (enum webnet_destination) */
     int image;
@@ -117,11 +121,12 @@ struct js_pending {
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
     /* A streamed response's metadata, kept past the frame that clears response
-       for Resource Timing and net_log. */
-    uint64_t streamed_bytes, response_start;
-    int streamed_status; unsigned streamed_header_bytes;
-    bool timing_allowed, timing_exposed;
+       for Resource Timing and net_log: its status, whether it is an opaque
+       response, its Content-Type and the minimized MIME type of it. */
+    uint64_t streamed_bytes;
+    int streamed_status; bool streamed_opaque;
     char net_type[96]; /* Content-Type */
+    char timing_type[64];
     unsigned char net_preview[64]; unsigned net_preview_len; /* net_log only: body's first bytes */
     /* host.net_body matched: the response's first NET_BODY_HEAD bytes are logged as they
        arrive and its last NET_BODY_TAIL bytes, kept in net_tail, when it ends. */
@@ -269,6 +274,16 @@ struct web_js_state {
     size_t heap_limit;
     uint64_t timing[JS_TIMING_COUNT];
     uint32_t timing_valid; /* Recorded uptime 0 is distinct from unavailable. */
+    /* The navigation that made the document (web_navigation_timing): its
+       response's timing record, status and minimized MIME type, and its
+       kind; navigation_valid when the embedder gave one. */
+    struct http_fetch_timing navigation;
+    int navigation_status;
+    char navigation_content_type[64];
+    uint8_t navigation_type;
+    bool navigation_valid;
+    /* Paint Timing: first-paint and first-contentful-paint reached the timeline. */
+    bool first_paint_reported, first_contentful_paint_reported;
     uint64_t task_layout_ms, task_compile_ms, compile_wait_ms, task_microtask_ms;
     int compiling;
     bool compile_timed_out;
@@ -4097,6 +4112,36 @@ static void timing_record(struct web_js_state *s, unsigned milestone, uint64_t o
     uint32_t bit = 1u << milestone;
     if (!(s->timing_valid & bit)) { s->timing[milestone] = observed; s->timing_valid |= bit; }
 }
+/* Navigation Timing's legacy PerformanceTiming (§8.1) of the navigation
+   response's record, recorded once as the document is made (now): a phase
+   the navigation did not have takes the time before it (no DNS lookup or
+   connection, as from the cache: fetchStart; a reused connection's times
+   are already its fetch's start, webnet.c), redirects count only when all
+   were same-origin, secureConnectionStart only for a secure connection.
+   The unload times stay unrecorded: no previous document's unload ran. */
+static void navigation_legacy_timing(struct web_js_state *s, uint64_t now) {
+    const struct http_fetch_timing *t = &s->navigation;
+    const struct http_connection_timing *c = &t->connection;
+    bool connected = t->connection_valid;
+    uint64_t fetch = t->post_redirect_start;
+    uint64_t lookup_start = connected && c->domain_lookup_start ? c->domain_lookup_start : fetch;
+    uint64_t lookup_end = connected && c->domain_lookup_end ? c->domain_lookup_end : lookup_start;
+    uint64_t connect_start = connected && c->connect_start ? c->connect_start : lookup_end;
+    uint64_t connect_end = connected && c->connect_end ? c->connect_end : connect_start;
+    uint64_t request = t->final_network_request_start ? t->final_network_request_start : connect_end;
+    uint64_t response = t->first_interim_network_response_start ? t->first_interim_network_response_start :
+                        t->final_network_response_start ? t->final_network_response_start : request;
+    struct { unsigned milestone; uint64_t at; } times[] = {
+        {JS_REDIRECT_START, t->redirect_count && t->redirect_same_origin ? t->redirect_start : 0},
+        {JS_REDIRECT_END, t->redirect_count && t->redirect_same_origin ? t->redirect_end : 0},
+        {JS_FETCH_START, fetch}, {JS_DNS_START, lookup_start}, {JS_DNS_END, lookup_end},
+        {JS_CONNECT_START, connect_start}, {JS_CONNECT_END, connect_end},
+        {JS_SECURE_START, connected ? c->secure_connection_start : 0},
+        {JS_REQUEST_START, request}, {JS_RESPONSE_START, response}, {JS_RESPONSE_END, t->end_time},
+    };
+    for (size_t i = 0; i < sizeof times / sizeof *times; i++)
+        if (times[i].at && times[i].at >= s->now && times[i].at <= now) timing_record(s, times[i].milestone, times[i].at);
+}
 static JSValue native_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     return JS_NewFloat64(ctx, (double)relative_time(state(ctx), uptime_ms()));
 }
@@ -5226,7 +5271,7 @@ static struct js_pending *pending_new(struct web_js_state *s, int kind, const ch
     struct js_pending *p = js_mallocz(s->ctx, sizeof *p); if (!p) return NULL;
     p->url = js_strdup(s->ctx, url);
     if (!p->url) { js_free(s->ctx, p); return NULL; }
-    p->id = ++s->runtime_owner->next_request; p->kind = kind; p->deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
+    p->id = ++s->runtime_owner->next_request; p->kind = kind; p->started = uptime_ms(); p->deadline = p->started + WEBNET_TIMEOUT_MS;
     p->stream_generation = s->stream_generation;
     p->resolve = p->reject = p->stream_callback = JS_UNDEFINED; p->next = s->pending; s->pending = p; s->pending_count++;
     return p;
@@ -5236,6 +5281,12 @@ static const char *pending_kind_name(const struct js_pending *p) {
     return p->kind>=0 && (size_t)p->kind<sizeof kinds/sizeof *kinds?kinds[p->kind]:"unknown";
 }
 static void pending_error(struct js_pending *p, const char *error) { p->done = true; snprintf(p->response.error, sizeof p->response.error, "%s", error); }
+/* What a pending request's response owns (web_js_loaded's copies), freed and cleared. */
+static void pending_response_release(JSContext *ctx, struct js_pending *p) {
+    js_free(ctx, p->response.body); js_free(ctx, p->response.headers_full); js_free(ctx, p->response.url_full);
+    http_fetch_timing_free(&p->response.timing);
+    memset(&p->response, 0, sizeof p->response);
+}
 static void release_pending_request(struct web_js_state *s, struct js_pending *p) {
     /* Teardown never routes a completed keepalive response into a retired realm.
        Explicit aborts use host.cancel, not this lifecycle-only operation. */
@@ -5487,7 +5538,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
                 *link=p->next;
                 if (s->host.cancel) s->host.cancel(s->host.opaque,p->id);
                 JS_FreeValue(ctx,p->resolve); JS_FreeValue(ctx,p->reject);
-                js_free(ctx,p->url); js_free(ctx,p->response.body); js_free(ctx,p->response.headers_full); js_free(ctx,p->response.url_full);
+                js_free(ctx,p->url); pending_response_release(ctx,p);
                 js_free(ctx,p); s->pending_count--;
             }
         }
@@ -6035,15 +6086,17 @@ static bool valid_mime_essence(const char *v, const char *end) {
     }
     return slash && slash != v && slash + 1 != end;
 }
-static bool javascript_mime(const char *raw) {
-    bool matched = false;
+/* Fetch "extract a MIME type" from a header block, as far as its essence:
+   the span of the last Content-Type member that parses (ASCII
+   case-insensitive). Fetch's get/decode/split honors quoted commas; each
+   successfully parsed member replaces the previous MIME type, malformed
+   members and the wildcard type do not. False when none parses. */
+static bool content_type_essence(const char *raw, const char **essence, size_t *length) {
+    bool found = false;
     for (const char *p = raw; *p;) {
         const char *e = strchr(p, '\n'); if (!e) e = p + strlen(p);
         if ((size_t)(e - p) >= 13 && !strncasecmp(p, "content-type:", 13)) {
             p += 13;
-            /* Fetch's get/decode/split honors quoted commas. Each successfully
-               parsed member replaces the previous MIME type; malformed members
-               and the wildcard type do not. */
             while (p < e) {
                 const char *v = p, *essence_end = NULL; bool quoted = false;
                 while (p < e) {
@@ -6056,14 +6109,54 @@ static bool javascript_mime(const char *raw) {
                 const char *end = essence_end ? essence_end : p;
                 while (v < end && mime_space((unsigned char)*v)) v++;
                 while (end > v && mime_space((unsigned char)end[-1])) end--;
-                if (valid_mime_essence(v, end) && !strn_ieq(v, "*/*", (size_t)(end - v)))
-                    matched = javascript_essence(v, (size_t)(end - v));
+                if (valid_mime_essence(v, end) && !strn_ieq(v, "*/*", (size_t)(end - v))) {
+                    *essence = v; *length = (size_t)(end - v); found = true;
+                }
                 if (p < e) p++;
             }
         }
         p = *e ? e + 1 : e;
     }
-    return matched;
+    return found;
+}
+static bool javascript_mime(const char *raw) {
+    const char *essence; size_t length;
+    return content_type_essence(raw, &essence, &length) && javascript_essence(essence, length);
+}
+/* MIME Sniffing "minimize a supported MIME type", into out (cap bytes, at
+   least 32): what a Resource or Navigation Timing entry's contentType shows
+   of a response's Content-Type (Fetch, fetch finale), "" when it has none
+   that parses. The types this engine supports are the ones it decodes or
+   renders: HTML, plain text, CSS, WebVTT, event streams, WebAssembly, the
+   image decoders' (image_source.c), the media decoders' (media_types.c) and
+   the web font containers (css.c's font formats). */
+static void minimized_content_type(const char *headers, char *out, size_t cap) {
+    const char *essence; size_t length;
+    out[0] = 0;
+    if (!content_type_essence(headers, &essence, &length)) return;
+    const char *slash = memchr(essence, '/', length), *subtype = slash + 1;
+    size_t subtype_length = length - (size_t)(subtype - essence);
+    bool plus_json = subtype_length >= 5 && strn_ieq(subtype + subtype_length - 5, "+json", 5);
+    bool plus_xml = subtype_length >= 4 && strn_ieq(subtype + subtype_length - 4, "+xml", 4);
+    const char *result = NULL;
+    if (javascript_essence(essence, length)) result = "text/javascript";
+    else if (plus_json || strn_ieq(essence, "application/json", length) || strn_ieq(essence, "text/json", length)) result = "application/json";
+    else if (strn_ieq(essence, "image/svg+xml", length)) result = "image/svg+xml";
+    else if (plus_xml || strn_ieq(essence, "text/xml", length) || strn_ieq(essence, "application/xml", length)) result = "application/xml";
+    if (result) { snprintf(out, cap, "%s", result); return; }
+    if (length >= cap) return;
+    char lower[128];
+    if (length >= sizeof lower) return;
+    for (size_t i = 0; i < length; i++) lower[i] = (char)tolower((unsigned char)essence[i]);
+    lower[length] = 0;
+    static const char *const documents[] = {
+        "text/html", "text/plain", "text/css", "text/vtt", "text/event-stream", "application/wasm",
+        "font/ttf", "font/otf", "font/woff", "font/woff2"
+    };
+    bool supported = web_image_type_supported(lower, length);
+    for (size_t i = 0; !supported && i < sizeof documents / sizeof *documents; i++) supported = !strcmp(lower, documents[i]);
+    if (!supported && (!strncmp(lower, "audio/", 6) || !strncmp(lower, "video/", 6))) supported = nmedia_can_play_type(lower)[0] != 0;
+    if (supported) memcpy(out, lower, length + 1);
 }
 static bool script_data_checkpoint(void *opaque) {
     struct web_js_state *s=opaque;return !interrupt(s->rt,s);
@@ -6389,7 +6482,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         struct js_pending *diagnostic = js_mallocz(ctx, sizeof *diagnostic);
         if (!diagnostic) return NULL;
         struct web_response *r = &diagnostic->response; uint64_t before = uptime_ms();
-        diagnostic->kind = P_SCRIPT; diagnostic->url = (char *)url; diagnostic->deadline = before + WEBNET_TIMEOUT_MS;
+        diagnostic->kind = P_SCRIPT; diagnostic->url = (char *)url; diagnostic->started = before; diagnostic->deadline = before + WEBNET_TIMEOUT_MS;
         struct web_request request={.kind=WEB_RESOURCE_MODULE, .url=url, .method="GET",
             .origin=web_effective_url(s->doc), .credentials=1, .destination=WEBNET_DEST_SCRIPT,
             .referrer=fetch_client_referrer_source(s->doc), .referrer_policy=s->doc->referrer_policy};
@@ -6960,7 +7053,8 @@ static void pending_free(struct web_js_state *s, struct js_pending *p) {
     }
     JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject); JS_FreeValue(s->ctx, p->stream_callback);
     release_module_user(s,p->module);
-    js_free(s->ctx, p->net_tail); js_free(s->ctx, p->url);js_free(s->ctx,p->origin);js_free(s->ctx,p->integrity);js_free(s->ctx,p->referrer); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
+    js_free(s->ctx, p->net_tail); js_free(s->ctx, p->url);js_free(s->ctx,p->origin);js_free(s->ctx,p->integrity);js_free(s->ctx,p->referrer);
+    pending_response_release(s->ctx, p);
     js_free(s->ctx, p); s->pending_count--;
 }
 static bool document_resource_kind(int kind) {
@@ -7078,6 +7172,8 @@ void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *response)
     if (!s || !response) return;
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->id == id && !p->done) {
         p->response = *response; p->response.body = NULL; p->response.headers_full = NULL; p->response.url_full = NULL;
+        p->response.timing.server_timing = NULL;
+        if (!http_fetch_timing_copy(&p->response.timing, &response->timing)) { pending_error(p, "Resource timing allocation failed"); return; }
         if (response->url_full) {
             p->response.url_full = js_strdup(s->ctx, web_response_url(response));
             if (!p->response.url_full) {
@@ -7159,10 +7255,9 @@ static void diagnostic_resource(struct web_js_state *s, struct js_pending *p, co
         h=*end?end+1:end;
     }
     const char *kind=pending_kind_name(p);
-    uint64_t started=p->deadline>=WEBNET_TIMEOUT_MS?p->deadline-WEBNET_TIMEOUT_MS:0;
     snprintf(message,sizeof message,"Resource #%lu %s: HTTP %d, %lu bytes, MIME %s, elapsed %lu ms, %s; %s",
         (unsigned long)p->id,kind,p->response.status,(unsigned long)p->response.body_len,mime,
-        (unsigned long)(uptime_ms()-started),reason,url);
+        (unsigned long)(uptime_ms()-p->started),reason,url);
     /* A script that cannot run is an error, classic or module alike. */
     log_text(s,p->kind==P_SCRIPT||p->kind==P_MODULE?2:1,message);
 }
@@ -7182,69 +7277,121 @@ static const char *response_header_value(const char *headers, const char *name, 
     }
     return NULL;
 }
-/* Resource Timing's timing allow check: same origin as the document, or a
-   Timing-Allow-Origin list naming "*" or the document's origin. */
-static bool timing_allow_check(struct web_js_state *s, const char *url, const char *headers) {
-    char *document_origin=NULL,*resource_origin=NULL;
-    bool allowed=false;
-    if(http_origin_owned(web_effective_url(s->doc),&document_origin)==HTTP_URL_TUPLE){
-        if(http_origin_owned(url,&resource_origin)==HTTP_URL_TUPLE && !strcmp(document_origin,resource_origin))allowed=true;
-        size_t len=0;const char *list=allowed?NULL:response_header_value(headers,"timing-allow-origin",&len);
-        for(const char *item=list,*end=list?list+len:NULL;item && item<end && !allowed;){
-            const char *comma=memchr(item,',',(size_t)(end-item));if(!comma)comma=end;
-            const char *a=item,*b=comma;while(a<b && (*a==' '||*a=='\t'))a++;while(b>a && (b[-1]==' '||b[-1]=='\t'))b--;
-            size_t n=(size_t)(b-a);
-            if((n==1 && *a=='*') || (n==strlen(document_origin) && !memcmp(a,document_origin,n)))allowed=true;
-            item=comma+1;
-        }
-    }
-    free(document_origin);free(resource_origin);
-    return allowed;
-}
 /* Keep a streamed response's metadata past the frame that carries it. */
-static void streamed_response_metadata(struct web_js_state *s, struct js_pending *p, bool opaque) {
+static void streamed_response_metadata(struct js_pending *p, bool opaque) {
     const char *headers=web_response_headers(&p->response);
     size_t type_len=0;const char *type=response_header_value(headers,"content-type",&type_len);
     type_len=type?MIN(type_len,sizeof p->net_type-1):0;
     if(type)memcpy(p->net_type,type,type_len);
     p->net_type[type_len]=0;
-    p->response_start=uptime_ms();
     p->streamed_status=p->response.status;
-    p->streamed_header_bytes=(unsigned)MIN(strlen(headers),(size_t)UINT_MAX);
-    p->timing_exposed=!opaque;
-    p->timing_allowed=!opaque && timing_allow_check(s,p->url,headers);
+    p->streamed_opaque=opaque;
+    minimized_content_type(headers,p->timing_type,sizeof p->timing_type);
 }
 static int fetch_transport_flags(const char *headers);
-/* Resource Timing: a PerformanceResourceTiming entry for each completed
-   request; the bootstrap's performance timeline owns entries and observers. */
-static void resource_timing(struct web_js_state *s, struct js_pending *p, uint64_t bytes) {
+/* Resource Timing's "convert fetch timestamp": zero stays zero, any other
+   time is relative to the realm's time origin. */
+static double fetch_timestamp(struct web_js_state *s, uint64_t at) { return at ? (double)relative_time(s, at) : 0; }
+/* What a PerformanceResourceTiming or PerformanceNavigationTiming entry holds
+   (js_performance.js), from the transport's timing record of one request
+   (http.h). opaque_timing is Fetch's opaque timing info: the record keeps its
+   start and end, and the cache state is empty (Fetch, fetch finale). An
+   opaque response or a network error has an empty body info. A request the
+   transport answered with no record (one it never made) starts at started. */
+static JSValue timing_value(struct web_js_state *s, const struct http_fetch_timing *t, uint64_t started,
+                            bool opaque_timing, bool opaque_body, int status, const char *content_type) {
+    JSContext *ctx=s->ctx;
+    struct http_fetch_timing none={0};
+    if(!t->valid){none.start_time=none.post_redirect_start=started;none.end_time=uptime_ms();t=&none;opaque_timing=true;}
+    const struct http_connection_timing *c=&t->connection;
+    double start=fetch_timestamp(s,t->start_time),fetch_start=opaque_timing?start:fetch_timestamp(s,t->post_redirect_start);
+    /* No connection (a response from the cache): its times are the fetch's start. */
+    bool connection=!opaque_timing && t->connection_valid;
+    static const char *const cache[]={"","local","validated"};
+    struct { const char *name; double value; } numbers[]={
+        {"startTime",start},{"fetchStart",fetch_start},{"responseEnd",fetch_timestamp(s,t->end_time)},
+        {"redirectStart",opaque_timing?0:fetch_timestamp(s,t->redirect_start)},
+        {"redirectEnd",opaque_timing?0:fetch_timestamp(s,t->redirect_end)},
+        {"domainLookupStart",connection?fetch_timestamp(s,c->domain_lookup_start):opaque_timing?0:fetch_start},
+        {"domainLookupEnd",connection?fetch_timestamp(s,c->domain_lookup_end):opaque_timing?0:fetch_start},
+        {"connectStart",connection?fetch_timestamp(s,c->connect_start):opaque_timing?0:fetch_start},
+        {"connectEnd",connection?fetch_timestamp(s,c->connect_end):opaque_timing?0:fetch_start},
+        {"secureConnectionStart",connection?fetch_timestamp(s,c->secure_connection_start):0},
+        {"requestStart",opaque_timing?0:fetch_timestamp(s,t->final_network_request_start)},
+        {"firstInterimResponseStart",opaque_timing?0:fetch_timestamp(s,t->first_interim_network_response_start)},
+        {"finalResponseHeadersStart",opaque_timing?0:fetch_timestamp(s,t->final_network_response_start)},
+        {"encodedBodySize",opaque_body?0:(double)t->encoded_body_size},
+        {"decodedBodySize",opaque_body?0:(double)t->decoded_body_size},
+        {"responseStatus",(double)status},
+        /* HTML: a navigation's redirect count when its redirects may be exposed;
+           the legacy performance.navigation's only when all were same-origin. */
+        {"redirectCount",t->navigation_redirects_exposed?(double)t->redirect_count:0},
+        {"legacyRedirectCount",t->redirect_same_origin?(double)t->redirect_count:0},
+    };
+    struct { const char *name; const char *value; } strings[]={
+        {"nextHopProtocol",connection?c->protocol:""},
+        {"contentEncoding",opaque_body?"":t->content_encoding},
+        {"contentType",content_type?content_type:""},
+        {"cacheState",opaque_timing||t->cache_state>HTTP_CACHE_STATE_VALIDATED?"":cache[t->cache_state]},
+        /* The Server-Timing values (Fetch, HTTP fetch); an opaque timing info has none. */
+        {"serverTiming",!opaque_timing && t->server_timing?t->server_timing:""},
+    };
+    JSValue value=JS_NewObjectProto(ctx,JS_NULL);
+    if(JS_IsException(value))return value;
+    for(size_t i=0;i<sizeof numbers/sizeof *numbers;i++)
+        if(JS_SetPropertyStr(ctx,value,numbers[i].name,JS_NewFloat64(ctx,numbers[i].value))<0)goto failed;
+    for(size_t i=0;i<sizeof strings/sizeof *strings;i++)
+        if(JS_SetPropertyStr(ctx,value,strings[i].name,JS_NewString(ctx,strings[i].value))<0)goto failed;
+    if(JS_SetPropertyStr(ctx,value,"timingAllowPassed",JS_NewBool(ctx,!opaque_timing))<0)goto failed;
+    return value;
+failed:
+    JS_FreeValue(ctx,value);return JS_EXCEPTION;
+}
+/* Fetch's report timing of a request that ended (fetch finale), for its
+   PerformanceResourceTiming entry; the bootstrap's performance timeline
+   owns entries and observers. The status and content type are a navigating
+   request's only when its redirects stayed same-origin; an opaque response
+   or a network error has neither. */
+static void resource_timing(struct web_js_state *s, struct js_pending *p) {
     if (s->disabled || !JS_IsObject(s->hooks) || p->kind==P_POLICY_REPORT || !p->url ||
         (strncasecmp(p->url,"https://",8) && strncasecmp(p->url,"http://",7))) return;
-    uint64_t end=uptime_ms(),start=p->deadline>=WEBNET_TIMEOUT_MS?p->deadline-WEBNET_TIMEOUT_MS:end;
-    bool streamed=p->streaming;
-    const char *headers=web_response_headers(&p->response);
-    int flags=streamed?0:fetch_transport_flags(headers);
-    bool exposed=streamed?p->timing_exposed:!(flags>=0 && (flags&NJW_LOADED_OPAQUE)) && !p->response.error[0];
-    bool allowed=streamed?p->timing_allowed:exposed && timing_allow_check(s,p->url,headers);
-    size_t type_len=0;const char *type=streamed?p->net_type:response_header_value(headers,"content-type",&type_len);
-    if(streamed)type_len=strlen(type);
-    uint64_t response_start=streamed&&p->response_start?p->response_start:end;
-    uint64_t header_bytes=streamed?p->streamed_header_bytes:strlen(headers);
-    int status=streamed?p->streamed_status:p->response.status;
+    const struct http_fetch_timing *t=&p->response.timing;
+    bool failed=p->response.error[0],exposed=p->kind!=P_FRAME || (t->valid && t->redirect_same_origin);
+    bool opaque_body;int status=0;char type[sizeof p->timing_type]="";
+    if(p->streaming){
+        opaque_body=p->streamed_opaque || !p->headers_delivered;
+        if(!opaque_body && exposed){status=p->streamed_status;memcpy(type,p->timing_type,sizeof type);}
+    }else{
+        int flags=fetch_transport_flags(web_response_headers(&p->response));
+        opaque_body=failed || (flags>=0 && (flags&NJW_LOADED_OPAQUE));
+        if(!opaque_body && exposed){status=p->response.status;minimized_content_type(web_response_headers(&p->response),type,sizeof type);}
+    }
     JSValue args[]={JS_NewFloat64(s->ctx,(double)p->id),JS_NewInt32(s->ctx,p->kind),JS_NewString(s->ctx,p->url),
-        JS_NewFloat64(s->ctx,(double)relative_time(s,start)),JS_NewFloat64(s->ctx,(double)relative_time(s,response_start)),
-        JS_NewFloat64(s->ctx,(double)relative_time(s,end)),JS_NewFloat64(s->ctx,(double)bytes),JS_NewFloat64(s->ctx,(double)header_bytes),
-        JS_NewInt32(s->ctx,exposed?status:0),JS_NewStringLen(s->ctx,exposed&&type?type:"",exposed&&type?type_len:0),JS_NewBool(s->ctx,allowed)};
-    JSValue result=custom_element_hook(s,"resourceTiming",(int)(sizeof args/sizeof args[0]),args);
+        timing_value(s,t,p->started,!t->timing_allow_passed,opaque_body,status,type)};
+    JSValue result=JS_IsException(args[2])||JS_IsException(args[3])?JS_EXCEPTION:
+        custom_element_hook(s,"resourceTiming",(int)(sizeof args/sizeof args[0]),args);
     if(JS_IsException(result))exception(s);
     JS_FreeValue(s->ctx,result);
     for(size_t i=0;i<sizeof args/sizeof args[0];i++)JS_FreeValue(s->ctx,args[i]);
+}
+/* The document's navigation, for its PerformanceNavigationTiming: HTML gives
+   the entry the navigation's full timing info, never an opaque one (create
+   and initialize a Document), and its kind. Null when no navigation
+   response made the document. */
+static JSValue native_navigation_timing(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    if(!s->navigation_valid)return JS_NULL;
+    JSValue value=timing_value(s,&s->navigation,s->now,false,false,s->navigation_status,s->navigation_content_type);
+    static const char *const types[]={"navigate","reload","back_forward"};
+    if(!JS_IsException(value) && JS_SetPropertyStr(ctx,value,"type",JS_NewString(ctx,types[s->navigation_type<=2?s->navigation_type:0]))<0){
+        JS_FreeValue(ctx,value);return JS_EXCEPTION;
+    }
+    return value;
 }
 static void net_log_response(struct web_js_state *s, struct js_pending *p, const char *phase, uint64_t bytes) {
     const char *headers=web_response_headers(&p->response);
     size_t type_len=0;const char *type=response_header_value(headers,"content-type",&type_len);
     if(!type){type=p->net_type;type_len=strlen(type);}
-    uint64_t started=p->deadline>=WEBNET_TIMEOUT_MS?p->deadline-WEBNET_TIMEOUT_MS:0;
     /* Script-visible responses also show their first bytes, like a network
        panel's preview: a short control or error body explains a stall. */
     const unsigned char *preview=p->streaming?p->net_preview:(const unsigned char *)p->response.body;
@@ -7256,7 +7403,7 @@ static void net_log_response(struct web_js_state *s, struct js_pending *p, const
     }
     char message[768];
     snprintf(message,sizeof message,"Net #%lu %s %s: HTTP %d, %lu bytes, %lu ms, %.*s%s%s%s",(unsigned long)p->id,
-             pending_kind_name(p),phase,p->response.status?p->response.status:p->streamed_status,(unsigned long)bytes,(unsigned long)(uptime_ms()-started),
+             pending_kind_name(p),phase,p->response.status?p->response.status:p->streamed_status,(unsigned long)bytes,(unsigned long)(uptime_ms()-p->started),
              (int)MIN(type_len,(size_t)96),type?type:"",p->aborted?", aborted":p->response.error[0]?", failed: ":"",
              !p->aborted&&p->response.error[0]?p->response.error:"",hex);
     log_text(s,WEB_CONSOLE_TRACE,message);
@@ -7285,7 +7432,7 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
             /* Same report as a buffered request: a streamed body hides an
                error status from the console until its reader is drained. */
             if (!opaque && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
-            streamed_response_metadata(s, p, opaque);
+            streamed_response_metadata(p, opaque);
             if (s->host.net_log) net_log_response(s, p, "headers", 0);
             JSValue args[] = {JS_NewInt32(s->ctx, opaque ? 0 : p->response.status),
                 JS_NewString(s->ctx, opaque ? "" : web_response_url(&p->response)),
@@ -7355,15 +7502,14 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     }
     JS_FreeValue(s->ctx, value);
     if (terminal) {
-        if (!p->aborted) resource_timing(s, p, p->streamed_bytes);
+        if (!p->aborted) resource_timing(s, p);
         if (s->host.net_log) net_log_response(s, p, "done", p->streamed_bytes);
         if (p->net_body && p->net_tail_len)
             net_log_bytes(s, p, "response body", p->net_tail, p->net_tail_len, p->streamed_bytes - p->net_tail_len);
         if ((event != WEBNET_END || p->response.error[0] || p->aborted) && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
         pending_free(s, p);
     } else {
-        js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx, p->response.url_full);
-        memset(&p->response, 0, sizeof p->response); p->done = false;
+        pending_response_release(s->ctx, p); p->done = false;
         p->next = s->pending; s->pending = p;
         if (resume && s->host.resume_request) s->host.resume_request(s->host.opaque, p->id);
     }
@@ -7390,7 +7536,7 @@ static bool process_pending(struct web_js_state *s) {
         bool ok = !p->response.error[0] && p->response.status >= 200 && p->response.status < 300;
         if (!ok && (p->kind != P_FETCH || p->response.error[0] || p->response.status >= 400))
             diagnostic_resource(s,p,p->aborted?"aborted":p->response.error[0]?p->response.error:"unsuccessful HTTP response");
-        if (!p->aborted && !s->disabled) { begin_named_task(s,"resource timing",p->id); resource_timing(s,p,p->response.body_len); end_task(s); }
+        if (!p->aborted && !s->disabled) { begin_named_task(s,"resource timing",p->id); resource_timing(s,p); end_task(s); }
         if (s->host.net_log) net_log_response(s,p,"done",p->response.body_len);
         if (p->net_body) {
             size_t head = MIN(p->response.body_len, (size_t)NET_BODY_HEAD);
@@ -8317,11 +8463,42 @@ static bool run_document_event(struct web_js_state *s) {
         s->load_sent = true; struct web_event e = {.type="load"};
         timing_record(s, JS_LOAD_START, uptime_ms());
         web_js_dispatch(d, NULL, &e);
-        if(s->stream_generation==generation && !s->disabled && !s->parsing_cancelled)
+        if(s->stream_generation==generation && !s->disabled && !s->parsing_cancelled) {
             timing_record(s, JS_LOAD_END, uptime_ms());
+            /* HTML "the end": queue the navigation timing entry for its observers. */
+            begin_named_task(s,"navigation timing",0);
+            JSValue queued=custom_element_hook(s,"navigationTimingQueued",0,NULL);
+            if(JS_IsException(queued))exception(s);
+            JS_FreeValue(s->ctx,queued);
+            end_task(s);
+        }
         return true;
     }
     return false;
+}
+/* Paint Timing "report paint timing": paint.c records the document's first
+   paint and first contentful paint once each, at the end of the paint walk
+   of that rendering update; the timeline gets each once, first-paint first. */
+static bool paint_timing_due(const struct web_js_state *s) {
+    return (s->doc->first_paint_ms && !s->first_paint_reported) ||
+           (s->doc->first_contentful_paint_ms && !s->first_contentful_paint_reported);
+}
+static bool report_paint_timing(struct web_js_state *s) {
+    if (s->disabled || !paint_timing_due(s)) return false;
+    static const char *const names[2] = {"first-paint", "first-contentful-paint"};
+    uint64_t at[2] = {s->doc->first_paint_ms, s->doc->first_contentful_paint_ms};
+    bool *reported[2] = {&s->first_paint_reported, &s->first_contentful_paint_reported};
+    begin_named_task(s, "paint timing", 0);
+    for (int i = 0; i < 2; i++) {
+        if (!at[i] || *reported[i]) continue;
+        *reported[i] = true;
+        JSValue args[2] = {JS_NewString(s->ctx, names[i]), JS_NewFloat64(s->ctx, (double)relative_time(s, at[i]))};
+        JSValue result = JS_IsException(args[0]) ? JS_EXCEPTION : custom_element_hook(s, "paintTiming", 2, args);
+        if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
+        JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]);
+    }
+    end_task(s);
+    return true;
 }
 static bool run_details_toggle(struct web_js_state *s) {
     bool old_open,new_open;
@@ -8667,6 +8844,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
     begin_task(s);modulepreloads(s);end_task(s);
     request_fonts(s); request_images(s);
     if (!ran) ran = run_document_event(s);
+    if (report_paint_timing(s)) ran = true;
     if(!s->disabled && run_rendering(s,uptime_ms()))ran=true;
     if (ran) s->idle_period_stopped = true;
     else if (!s->disabled) {
@@ -8711,6 +8889,7 @@ static int64_t js_deadline(web_doc *d, int *why) {
         for (struct js_automation *p = s->automations; p; p = p->next) if (p->settled) DUE_NOW();
         for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) DUE_NOW();
         if (JS_IsJobPending(s->rt)) DUE_NOW();
+        if (paint_timing_due(s)) DUE_NOW();
         int64_t audio_deadline = web_audio_deadline(s->ctx, now);
         if (audio_deadline >= 0) EARLIER((uint64_t)audio_deadline, JD_WEB_AUDIO);
         /* A hidden document has no rendering opportunity, so its observers wait for it. */
@@ -9028,10 +9207,21 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     s->now = seeded ? navigation->navigation_start_ms : initialized;
     web_animations_set_origin(d, s->now); /* the document timeline's zero is performance.now()'s */
     timing_record(s, JS_NAV_START, s->now);
-    if (seeded && navigation->fetch_valid && navigation->fetch_start_ms >= s->now && navigation->fetch_start_ms <= initialized)
-        timing_record(s, JS_FETCH_START, navigation->fetch_start_ms);
-    if (seeded && navigation->response_end_valid && navigation->response_end_ms >= s->now && navigation->response_end_ms <= initialized)
-        timing_record(s, JS_RESPONSE_END, navigation->response_end_ms);
+    /* The navigation response's record becomes the document's own; the
+       host's borrowed text is not kept past this call. */
+    s->host.navigation_timing.fetch.server_timing = NULL; s->host.navigation_timing.headers = NULL;
+    if (seeded && navigation->fetch.valid) {
+        s->navigation_valid = http_fetch_timing_copy(&s->navigation, &host->navigation_timing.fetch);
+        s->navigation_type = navigation->type;
+        /* Fetch: a navigation's status and content type are exposed only when its
+           redirects stayed same-origin. */
+        if (s->navigation.redirect_same_origin) {
+            s->navigation_status = navigation->status;
+            if (host->navigation_timing.headers)
+                minimized_content_type(host->navigation_timing.headers, s->navigation_content_type, sizeof s->navigation_content_type);
+        }
+        navigation_legacy_timing(s, initialized);
+    }
     timing_record(s, JS_DOM_LOADING, initialized);
     s->observer_turn = true;
     s->hooks = s->dispatch = s->response = s->reject = s->webaudio = JS_UNDEFINED;
@@ -9074,7 +9264,8 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("mutationObserve",4,native_mutation_control),
         JS_CFUNC_DEF("mutationTake",0,native_mutation_take),
         JS_CFUNC_DEF("frame", 3, native_frame),JS_CFUNC_DEF("documentStream",1,native_document_stream),
-        JS_CFUNC_DEF("now", 0, native_now), JS_CFUNC_DEF("timing", 1, native_timing), JS_CFUNC_DEF("url", 0, native_url), JS_CFUNC_DEF("origin", 0, native_origin),
+        JS_CFUNC_DEF("now", 0, native_now), JS_CFUNC_DEF("timing", 1, native_timing),
+        JS_CFUNC_DEF("navigationTiming", 0, native_navigation_timing), JS_CFUNC_DEF("url", 0, native_url), JS_CFUNC_DEF("origin", 0, native_origin),
         JS_CFUNC_DEF("screen", 0, native_screen),
         JS_CFUNC_DEF("windowState",0,native_window_state),JS_CFUNC_DEF("windowSize",1,native_window_size),
         JS_CFUNC_DEF("visible",0,native_visible),
@@ -9266,5 +9457,6 @@ void web_js_free(web_doc *d) {
     }
     if (s->rt && s->runtime_owner==s) JS_FreeRuntime(s->rt);
     js_profile_free(s->js_profile);
+    http_fetch_timing_free(&s->navigation);
     free(s);
 }
