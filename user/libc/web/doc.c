@@ -725,7 +725,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 if (cached->body && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)complete=add_sheet_ast(d,sheet->source,sheet->length,sheet->base,d->next_sheet_order++,media,scope,sheet->ast);
+                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet->p.ast);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
                     }else complete=add_sheet(d,cached->body,cached->n,cached->base,d->next_sheet_order++,media,scope);
                 }
@@ -748,7 +748,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                 if (css && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)complete=add_sheet_ast(d,sheet->source,sheet->length,sheet->base,pd->order,pd->media,scope,sheet->ast);
+                        if(sheet)complete=add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,pd->order,sheet->media,scope,sheet->p.ast);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
                     }else complete=add_sheet(d,css,dn,d->base,pd->order,pd->media,scope);
                 }
@@ -763,14 +763,17 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
         case T_style: {
             const char *type = node_attr(c, "type");
             const char *media = node_attr(c, "media");
+            /* A sheet CSSOM stands for applies by its MediaList, which starts
+               as the media attribute and scripts may change. */
+            bool cssom = d->live && c->cssom_current;
             if (c->style_disabled || (type && *type && !str_ieq(type, "text/css")) ||
-                !media_wanted(media) || node_ancestor(c, T_template)) break;
+                (!cssom && !media_wanted(media)) || node_ancestor(c, T_template)) break;
             /* Keep the existing per-snapshot native AST reuse for untouched
                sheets. A real CSSOM handle lazily promotes only its owner to
                persistent parser storage, not every repeated component style. */
-            if (d->live && c->cssom_current) {
+            if (cssom) {
                 int error; struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                if (sheet) add_sheet_ast(d,sheet->source,sheet->length,sheet->base,d->next_sheet_order++,media,scope,sheet->ast);
+                if (sheet) add_sheet_ast(d,sheet->p.source,sheet->p.length,sheet->base,d->next_sheet_order++,sheet->media,scope,sheet->p.ast);
                 else if (error==CSSOM_OOM) web_js_console(d,2,"Native style sheet allocation failed");
             } else {
                 sbuf b = {0}; text_of(c,&b);
@@ -802,8 +805,8 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
     if (n == d->root || n->shadow_host) {
         for (uint32_t i = 0; i < n->adopted_count; i++) {
             struct cssom_sheet *s = n->adopted_sheets[i];
-            if (!s->disabled) add_sheet_ast(d, s->source, s->length, s->base,
-                d->next_sheet_order++, s->media, scope, s->ast);
+            if (!s->disabled) add_sheet_ast(d, s->p.source, s->p.length, s->base,
+                d->next_sheet_order++, s->media, scope, s->p.ast);
         }
     }
 }

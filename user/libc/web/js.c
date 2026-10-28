@@ -75,6 +75,7 @@
 #define JS_IDLE_PERIOD_CALLBACKS 8u
 
 #define JS_NODE_BUCKETS 4096
+#define JS_STYLE_MEMO 64
 struct js_node_ref {
     node_t *node;
     struct web_js_state *state;
@@ -226,6 +227,9 @@ struct web_js_state {
     struct js_node_ref *node_buckets[JS_NODE_BUCKETS];
     bool node_cache_syncing, node_cache_failed;
     struct web_js_state *node_cache_next, **node_cache_prev;
+    /* style attributes' declaration blocks: a text and its serialization, by
+       element (style_memo_block) */
+    struct js_style_memo { char *source, *block; size_t source_n, block_n; } style_memo[JS_STYLE_MEMO];
     struct js_script *scripts, *last_script, *blocker;
     uint64_t dynamic_scan_revision;
     bool dynamic_scan_valid;
@@ -1860,159 +1864,125 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
     return ok ? JS_UNDEFINED : oom(ctx);
 }
 
-/* CSS declaration boundaries must not split quoted strings or url()/calc(). */
-static const char *css_separator(const char *p, const char *end, int wanted) {
-    int quote = 0, depth = 0;
-    while (p < end) {
-        int c = (unsigned char)*p;
-        if (c == '\\' && p + 1 < end) { p += 2; continue; }
-        if (quote) { if (c == quote) quote = 0; }
-        else if (c == '\'' || c == '"') quote = c;
-        else if (c == '/' && p + 1 < end && p[1] == '*') { p += 2; while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) p++; if (p + 1 < end) p += 2; continue; }
-        else if (c == '(' || c == '[' || c == '{') depth++;
-        else if (c == ')' || c == ']' || c == '}') { if (depth) depth--; }
-        else if (!depth && c == wanted) return p;
-        p++;
+/* A CSSOM declaration block, which an element's style attribute or a rule's
+   declarations (js_cssom.h) stand for as text. Its declarations are the ones
+   the text parses to (css.c's css_decl_serialize keeps the valid ones in their
+   block, check), so every read is of the block's serialization; a change
+   writes the whole block's serialization ("update style attribute", CSSOM
+   6.7). */
+/* the text as CSS reads it (no comments), serialized as a block */
+static bool style_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names) {
+    size_t clean_n;
+    char *clean = css_preprocess(css, n, &clean_n);
+    bool ok = clean && css_decl_serialize(clean, clean_n, check, out, names);
+    free(clean);
+    return ok;
+}
+/* get or set a property of a serialized block; a set writes the block's new
+   serialization into out, *write when it differs */
+static JSValue style_text_access(JSContext *ctx, const char *block, size_t n, const char *property, bool set,
+                                 JSValueConst value, JSValueConst priority, bool priority_only,
+                                 css_decl_check *check, sbuf *out, bool *write) {
+    *write = false;
+    if (!set) {
+        const char *v; size_t vn; bool important;
+        bool found = css_decl_find(block, n, property, &v, &vn, &important);
+        return priority_only ? JS_NewString(ctx, found && important ? "important" : "") :
+            JS_NewStringLen(ctx, found ? v : "", found ? vn : 0);
     }
-    return end;
-}
-static bool css_property_equal(const char *begin, const char *end, const char *property) {
-    while (begin < end && is_space((unsigned char)*begin)) begin++;
-    while (end > begin && is_space((unsigned char)end[-1])) end--;
-    size_t n = (size_t)(end - begin);
-    return strlen(property) == n && (!strncmp(property, "--", 2) ? !strncmp(begin, property, n) : !strncasecmp(begin, property, n));
-}
-static const char *css_style_ws(const char *p, const char *end) {
-    for (;;) {
-        while (p < end && is_space((unsigned char)*p)) p++;
-        if (end - p < 2 || p[0] != '/' || p[1] != '*') return p;
-        p += 2;
-        while (end - p >= 2 && !(p[0] == '*' && p[1] == '/')) p++;
-        if (end - p < 2) return end;
-        p += 2;
+    const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
+    if (!v || (!JS_IsUndefined(priority) && !prio)) {
+        JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); return JS_EXCEPTION;
     }
+    int status = css_decl_set(block, n, property, v, prio, check, out);
+    JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio);
+    if (status == -2) return JS_ThrowOutOfMemory(ctx);
+    if (status < 0) return JS_ThrowTypeError(ctx, "Invalid CSS property name");
+    *write = status > 0 && (out->n != n || (n && memcmp(out->p, block, n)));
+    return JS_UNDEFINED;
 }
-/* Priority is not part of the CSSOM value. Do not split quoted strings,
-   functions or custom-property token streams at a nested exclamation mark. */
-static bool css_style_priority(const char *begin, const char **end) {
-    const char *bang = css_separator(begin, *end, '!');
-    if (bang == *end) return false;
-    const char *p = css_style_ws(bang + 1, *end);
-    if (*end - p < 9 || strncasecmp(p, "important", 9) ||
-        css_style_ws(p + 9, *end) != *end) return false;
-    *end = bang;
-    while (*end > begin && is_space((unsigned char)(*end)[-1])) (*end)--;
+/* a serialized block's cssText and its declarations' names: [cssText, name...] */
+static JSValue style_text_block(JSContext *ctx, const char *block, size_t n) {
+    sbuf names = {0};
+    css_decl_names(block, n, &names);
+    JSValue list = JS_NewArray(ctx);
+    uint32_t i = 0;
+    bool ok = !JS_IsException(list) && JS_SetPropertyUint32(ctx, list, i++, JS_NewStringLen(ctx, block, n)) >= 0;
+    for (size_t at = 0; ok && at < names.n; at += strlen(names.p + at) + 1)
+        ok = JS_SetPropertyUint32(ctx, list, i++, JS_NewString(ctx, names.p + at)) >= 0;
+    sb_free(&names);
+    if (!ok) { JS_FreeValue(ctx, list); return JS_EXCEPTION; }
+    return list;
+}
+/* An element's style attribute as a serialized block. The serialization is a
+   function of the text alone, so the last text each slot saw and its block
+   stand for any element whose attribute is that text: reading a style or
+   setting one property does not parse every declaration again. */
+static struct js_style_memo *style_memo_slot(struct web_js_state *s, const node_t *n) {
+    uint32_t h = (uint32_t)((uintptr_t)n >> 4) * 2654435761u;
+    return &s->style_memo[h >> 26 & (JS_STYLE_MEMO - 1)];
+}
+static void style_memo_store(struct web_js_state *s, const node_t *n, const char *source, size_t source_n,
+                             const char *block, size_t block_n) {
+    struct js_style_memo *m = style_memo_slot(s, n);
+    char *a = malloc(source_n + 1), *b = malloc(block_n + 1);
+    free(m->source); free(m->block);
+    *m = (struct js_style_memo){0};
+    if (!a || !b) { free(a); free(b); return; }
+    memcpy(a, source, source_n); a[source_n] = 0;
+    memcpy(b, block, block_n); b[block_n] = 0;
+    *m = (struct js_style_memo){a, b, source_n, block_n};
+}
+static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
+    const char *css = node_attr(n, "style"); if (!css) css = "";
+    size_t length = strlen(css);
+    struct js_style_memo *m = style_memo_slot(s, n);
+    if (m->source && m->source_n == length && !memcmp(m->source, css, length)) {
+        sb_put(block, m->block, m->block_n);
+        return true;
+    }
+    if (!style_serialize(css, length, NULL, block, NULL)) return false;
+    style_memo_store(s, n, css, length, block->p ? block->p : "", block->n);
     return true;
 }
-static JSValue css_style_value(JSContext *ctx, const char *property,
-                               const char *begin, const char *end) {
-    if(!strcasecmp(property,"border-radius")||!strcasecmp(property,"border-top-left-radius")||!strcasecmp(property,"border-top-right-radius")||
-       !strcasecmp(property,"border-bottom-right-radius")||!strcasecmp(property,"border-bottom-left-radius")) {
-        sbuf text={0};
-        if(css_radius_specified(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
-        sb_free(&text);
-    }
-    {
-        sbuf text={0}; /* colours and color-scheme; CSS-wide keywords and var() stay authored */
-        if(css_specified_longhand(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
-        sb_free(&text);
-    }
-    if (!strcasecmp(property,"box-shadow")) {
-        sbuf serialized={0};
-        if (css_shadow_specified(begin,(size_t)(end-begin),&serialized)) {
-            JSValue value=JS_NewStringLen(ctx,serialized.p?serialized.p:"",serialized.n);
-            sb_free(&serialized);return value;
-        }
-        sb_free(&serialized); /* CSS-wide keywords / unresolved var() stay authored. */
-    }
-    /* Normalize supported numeric opacity, not arbitrary/custom values.
-       Preserve var()/calc() token streams unchanged. */
-    if (!strcasecmp(property, "opacity") && end - begin > 0 && end - begin < 64) {
-        const char *p = begin, *number_end = end;
-        bool percent = end[-1] == '%';
-        if (percent) number_end--;
-        if (p < number_end && (*p == '+' || *p == '-')) p++;
-        const char *digits = p;
-        while (p < number_end && *p >= '0' && *p <= '9') p++;
-        bool any = p > digits;
-        if (p < number_end && *p == '.') {
-            p++; digits = p;
-            while (p < number_end && *p >= '0' && *p <= '9') p++;
-            any = p > digits;
-        }
-        if (any && p < number_end && (*p == 'e' || *p == 'E')) {
-            p++; if (p < number_end && (*p == '+' || *p == '-')) p++;
-            digits = p;
-            while (p < number_end && *p >= '0' && *p <= '9') p++;
-            any = p > digits;
-        }
-        if (any && p == number_end) {
-            char number[64], result[64];
-            memcpy(number, begin, (size_t)(number_end - begin));
-            number[number_end - begin] = 0;
-            double value = strtod(number, NULL);
-            if (isfinite(value) && fabs(value) < 1e12) {
-                if (fabs(value) < .0000005) value = 0;
-                int len = snprintf(result, sizeof result, "%.6f", value);
-                if (len > 0 && (size_t)len < sizeof result) {
-                    while (len && result[len-1] == '0') len--;
-                    if (len && result[len-1] == '.') len--;
-                    if (percent) result[len++] = '%';
-                    return JS_NewStringLen(ctx, result, (size_t)len);
-                }
-            }
-        }
-    }
-    return JS_NewStringLen(ctx, begin, (size_t)(end - begin));
+/* the attribute becomes a block's serialization; the block is what the
+   attribute now stands for (CSSOM's mutate flag: the attribute is not parsed
+   again) */
+static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *block) {
+    if (!doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)block))) return false;
+    style_memo_store(s, n, block->p ? block->p : "", block->n, block->p ? block->p : "", block->n);
+    return true;
 }
 static JSValue style_access(struct web_js_state *s, node_t *n, const char *property,
                             bool set, JSValueConst value, JSValueConst priority, bool priority_only) {
     JSContext *ctx = s->ctx;
-    const char *css = node_attr(n, "style"); if (!css) css = "";
-    sbuf b = {0}; const char *found = NULL, *found_end = NULL;
-    bool found_important = false;
-    const char *end = css + strlen(css);
-    for (const char *p = css; p < end;) {
-        const char *e = css_separator(p, end, ';'), *colon = css_separator(p, e, ':');
-        if (colon < e && css_property_equal(p, colon, property)) {
-            const char *v = colon + 1, *ve = e;
-            while (v < ve && is_space((unsigned char)*v)) v++;
-            while (ve > v && is_space((unsigned char)ve[-1])) ve--;
-            bool important = css_style_priority(v, &ve);
-            if (!found || important || !found_important) {
-                found = v; found_end = ve; found_important = important;
-            }
-        } else if (set) { sb_put(&b, p, (size_t)(e - p)); if (e < end) sb_putc(&b, ';'); }
-        p = e < end ? e + 1 : end;
-    }
-    if (!set) {
+    sbuf block = {0}, b = {0};
+    if (!style_memo_block(s, n, &block)) { sb_free(&block); return oom(ctx); }
+    bool write;
+    JSValue result = style_text_access(ctx, block.p ? block.p : "", block.n, property, set, value, priority, priority_only,
+                                       NULL, &b, &write);
+    if (write && !style_attribute_set(s, n, &b)) result = oom(ctx);
+    sb_free(&b); sb_free(&block);
+    return result;
+}
+/* an element's inline style as a block: [cssText, name...], or cssText's
+   setter (the attribute becomes the serialization of what text parses to) */
+static JSValue style_block_access(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
+    JSContext *ctx = s->ctx;
+    sbuf b = {0};
+    if (argc <= 2) {
+        JSValue result = style_memo_block(s, n, &b) ? style_text_block(ctx, b.p ? b.p : "", b.n) : oom(ctx);
         sb_free(&b);
-        if (priority_only) return JS_NewString(ctx, found_important ? "important" : "");
-        return found ? css_style_value(ctx, property, found, found_end) : JS_NewString(ctx, "");
+        return result;
     }
-    const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
-    if (!v || (!JS_IsUndefined(priority) && !prio)) { JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_EXCEPTION; }
-    if (strchr(property, ':') || strchr(property, ';') || strchr(property, '{') || strchr(property, '}')) { JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_ThrowTypeError(ctx, "Invalid CSS property name"); }
-    const char *value_end = v + strlen(v);
-    if (*v && ((prio && *prio && strcasecmp(prio, "important")) ||
-               css_separator(v, value_end, '!') != value_end ||
-               css_separator(v, value_end, ';') != value_end)) {
-        JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_UNDEFINED;
-    }
-    /* CSSOM setProperty parses before changing the declaration block. Keep
-       syntactically valid but not-yet-rendered values separate from @supports
-       capability reporting; both use the real property grammar and var rules. */
-    if (*v && !css_valid_declaration(property,strlen(property),v,(size_t)(value_end-v))) {
-        JS_FreeCString(ctx,v);JS_FreeCString(ctx,prio);sb_free(&b);return JS_UNDEFINED;
-    }
-    if (*v) {
-        if (b.n && b.p[b.n - 1] != ';') sb_putc(&b, ';');
-        sb_puts(&b, property); sb_putc(&b, ':'); sb_puts(&b, v);
-        if (prio && *prio) sb_puts(&b, " !important"); sb_putc(&b, ';');
-    }
-    bool ok = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr(&b));
-    JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b);
-    return ok ? JS_UNDEFINED : oom(ctx);
+    size_t length;
+    const char *text = JS_ToCStringLen(ctx, &length, argv[2]);
+    if (!text) return JS_EXCEPTION;
+    bool ok = style_serialize(text, length, NULL, &b, NULL);
+    JS_FreeCString(ctx, text);
+    JSValue result = !ok ? JS_ThrowOutOfMemory(ctx) : style_attribute_set(s, n, &b) ? JS_UNDEFINED : oom(ctx);
+    sb_free(&b);
+    return result;
 }
 static void flush_layout(struct web_js_state *s) {
     web_doc *d = s->doc;
@@ -3280,7 +3250,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_move: case DOM_moveStatus: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_rangeRects: case DOM_caretPosition: case DOM_caretRect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_styleBlock: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -4055,6 +4025,10 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         bool valid; bool matches = css_matches_n(n, scope, p, plen, &valid); result = valid ? JS_NewBool(ctx, matches) : JS_NULL;
     } break;
     case DOM_style: case DOM_stylePriority: {result = style_access(s, n, p, argc > 3, argc > 3 ? argv[3] : JS_UNDEFINED, argc > 4 ? argv[4] : JS_UNDEFINED, opcode == DOM_stylePriority);
+    } break;
+    case DOM_styleBlock: {
+        if (n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Expected an Element");
+        else result = style_block_access(s, n, argc, argv);
     } break;
     case DOM_computed: {
         const char *pseudo=argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])?JS_ToCString(ctx,argv[3]):NULL;
@@ -9859,6 +9833,7 @@ void web_js_free(web_doc *d) {
             JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
         s->last_handled_rejection=NULL;
         node_cache_free(s);
+        for (int i = 0; i < JS_STYLE_MEMO; i++) { free(s->style_memo[i].source); free(s->style_memo[i].block); }
         js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
         JS_FreeValue(s->ctx, s->event_port); JS_FreeValue(s->ctx, s->event_states);

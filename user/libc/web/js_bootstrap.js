@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'caretPosition', 'caretRect', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rangeRects', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'caretPosition', 'caretRect', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rangeRects', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleBlock', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -18,7 +18,7 @@
     function dom(op, ...args) {
         const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'replace' || op === 'replaceAll' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
             (op === 'attrNS' && args.length > 3) ||
-            ((op === 'attr' || op === 'style') && args.length > 2);
+            ((op === 'attr' || op === 'style') && args.length > 2) || (op === 'styleBlock' && args.length > 1);
         return mutation && customElementsReady && customElementsBridge.active() ? customElementsBridge.reactions(() => domOperations[op](...args)) : domOperations[op](...args);
     }
     // IDL reflection always addresses the null namespace; getAttribute remains
@@ -1217,7 +1217,11 @@
         eventState(e).initialized=false;return e;
     };
     function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
-    const styleToken={},styleRecords=new WeakMap(),cssPropertyMetadata=host.cssProperties();
+    /* A CSSStyleDeclaration is an element's inline style (node), its computed
+       style (computed), or a rule's declarations (js_stylesheets.js: backend,
+       whose block, read, write and setText reach cssom.c). Every one is the
+       native declaration block: its names and cssText are its serialization. */
+    const styleToken={},ruleStyleToken={},styleRecords=new WeakMap(),cssPropertyMetadata=host.cssProperties();
     /* CSSOM lists computed longhands in code-unit order with prefixed names
        last; the native table is already in code-unit order. Built on first
        enumeration, not in every realm's bootstrap. */
@@ -1230,20 +1234,22 @@
     }
     function styleRecord(value){const record=styleRecords.get(value);if(!record)throw new TypeError('Invalid CSSStyleDeclaration receiver');return record;}
     function styleProperty(name){name=String(name);return name.startsWith('--')?name:name.toLowerCase();}
+    function styleBlock(record){return record.backend?record.backend.block():dom('styleBlock',record.node);}
     function styleNames(value){
         const record=styleRecord(value);
-        if(!record.computed)return (reflectedAttr(record.node,'style')||'').split(';').filter(x=>x.includes(':')).map(x=>x.split(':')[0].trim());
+        if(!record.computed)return styleBlock(record).slice(1);
         const custom=host.cssProperties(record.node,record.pseudo);if(custom===null)return [];
         const names=[],seen=new Set();for(const [name,valid] of custom){if(seen.has(name))continue;seen.add(name);if(valid)names.push(name);}
         return longhandNames().concat(names);
     }
-    function styleRead(value,name){const record=styleRecord(value);return record.computed?
-        dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
+    function styleRead(value,name){const record=styleRecord(value);
+        if(record.backend)return record.backend.read(styleProperty(name),false);
+        return record.computed?dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
     function styleWrite(value,name,text,priority=''){
         /* CSSOM: value and priority are [LegacyNullToEmptyString]. */
         name=styleProperty(name);text=text==null?'':String(text);priority=priority===null?'':String(priority);
         const record=styleRecord(value);if(record.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');
-        dom('style',record.node,name,text,priority);
+        if(record.backend)record.backend.write(name,text,priority);else dom('style',record.node,name,text,priority);
     }
     function styleIndex(key){return typeof key==='string'&&/^(0|[1-9][0-9]*)$/.test(key)?Number(key):-1;}
     function inlineStyle(node){
@@ -1252,9 +1258,14 @@
     }
     class CSSStyleDeclaration {
         constructor(node,computed,token,pseudo=null){
-            if(token!==styleToken)throw new TypeError('Illegal constructor');
-            if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
-            const record={node,computed:!!computed,pseudo:computed&&pseudo!=null?String(pseudo):''};styleRecords.set(this,record);
+            let record;
+            if(token===ruleStyleToken)record={node:null,backend:node,computed:false,pseudo:''};
+            else {
+                if(token!==styleToken)throw new TypeError('Illegal constructor');
+                if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
+                record={node,computed:!!computed,pseudo:computed&&pseudo!=null?String(pseudo):''};
+            }
+            styleRecords.set(this,record);
             const proxy=new Proxy(this,{
                 get(t,k,r){const i=styleIndex(k);return i>=0?styleNames(t)[i]:Reflect.get(t,k,r);},
                 set(t,k,v,r){if(styleIndex(k)>=0)return false;return Reflect.set(t,k,v,r);},
@@ -1263,11 +1274,13 @@
                 getOwnPropertyDescriptor(t,k){const i=styleIndex(k);if(i>=0){const name=styleNames(t)[i];return name===undefined?undefined:{value:name,writable:false,enumerable:true,configurable:true};}return Reflect.getOwnPropertyDescriptor(t,k);}
             });styleRecords.set(proxy,record);return proxy;
         }
-        get cssText(){const r=styleRecord(this);return r.computed?'':reflectedAttr(r.node,'style')||'';}
-        set cssText(v){v=v==null?'':String(v);const r=styleRecord(this);if(r.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');reflectedAttr(r.node,'style',v);}
-        get parentRule(){styleRecord(this);return null;}
+        get cssText(){const r=styleRecord(this);return r.computed?'':styleBlock(r)[0];}
+        set cssText(v){v=v==null?'':String(v);const r=styleRecord(this);if(r.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');
+            if(r.backend)r.backend.setText(v);else dom('styleBlock',r.node,v);}
+        get parentRule(){const r=styleRecord(this);return r.backend?r.backend.rule:null;}
         getPropertyValue(name){return styleRead(this,name);}
-        getPropertyPriority(name){name=styleProperty(name);const r=styleRecord(this);return r.computed?'':dom('stylePriority',r.node,name);}
+        getPropertyPriority(name){name=styleProperty(name);const r=styleRecord(this);
+            return r.backend?r.backend.read(name,true):r.computed?'':dom('stylePriority',r.node,name);}
         setProperty(name,value,priority=''){styleWrite(this,name,value,priority);}
         removeProperty(name){name=styleProperty(name);const old=styleRead(this,name);styleWrite(this,name,'');return old;}
         get length(){return styleNames(this).length;}
@@ -1275,6 +1288,24 @@
         *[Symbol.iterator](){for(let i=0;i<styleNames(this).length;i++)yield styleNames(this)[i];}
     }
     class CSSStyleProperties extends CSSStyleDeclaration {}
+    /* @font-face's and @page's descriptor blocks (CSS Fonts 5, CSSOM) */
+    class CSSFontFaceDescriptors extends CSSStyleDeclaration {}
+    class CSSPageDescriptors extends CSSStyleDeclaration {}
+    for(const [C,names] of [[CSSFontFaceDescriptors,['src','font-family','font-style','font-weight','font-stretch','font-width','font-size',
+        'size-adjust','unicode-range','font-feature-settings','font-variation-settings','font-named-instance','font-display',
+        'font-language-override','ascent-override','descent-override','line-gap-override','superscript-position-override',
+        'subscript-position-override','superscript-size-override','subscript-size-override']],
+        [CSSPageDescriptors,['margin','margin-top','margin-right','margin-bottom','margin-left','size','page-orientation','marks','bleed']]])
+        for(const name of names){
+            const camel=name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
+            for(const key of new Set([name,camel]))Object.defineProperty(C.prototype,key,{configurable:true,enumerable:true,
+                get(){return styleRead(this,name);},set(value){styleWrite(this,name,value);}});
+        }
+    /* a rule's declarations: kind 'page', 'font-face' or the properties */
+    function cssRuleStyle(kind,backend){
+        const C=kind==='page'?CSSPageDescriptors:kind==='font-face'?CSSFontFaceDescriptors:CSSStyleProperties;
+        return new C(backend,false,ruleStyleToken);
+    }
     /* Expose only the native engine's real properties, not a permissive `has`
        trap. Each named accessor reads/writes the same declaration as methods. */
     for(const [name] of cssPropertyMetadata){
@@ -1284,6 +1315,8 @@
     }
     Object.defineProperty(CSSStyleDeclaration.prototype,Symbol.toStringTag,{value:'CSSStyleDeclaration',configurable:true});
     Object.defineProperty(CSSStyleProperties.prototype,Symbol.toStringTag,{value:'CSSStyleProperties',configurable:true});
+    Object.defineProperty(CSSFontFaceDescriptors.prototype,Symbol.toStringTag,{value:'CSSFontFaceDescriptors',configurable:true});
+    Object.defineProperty(CSSPageDescriptors.prototype,Symbol.toStringTag,{value:'CSSPageDescriptors',configurable:true});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
     /* @include js_dom_exception.js */
     const DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
@@ -1326,7 +1359,7 @@
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
         Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,QuotaExceededError,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,reportError,
-        CSSStyleDeclaration,CSSStyleProperties,
+        CSSStyleDeclaration,CSSStyleProperties,CSSFontFaceDescriptors,CSSPageDescriptors,
         performance:{now:()=>host.now()},getComputedStyle:(n,pseudo=null)=>new CSSStyleProperties(n,true,styleToken,pseudo)});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
     globalThis.window=globalThis;globalThis.self=globalThis;globalThis.top=globalThis;globalThis.parent=globalThis;

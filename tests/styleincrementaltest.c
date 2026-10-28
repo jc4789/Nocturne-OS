@@ -327,15 +327,15 @@ static void cssom_container_roundtrip(void) {
     struct cssom_sheet *s=sheet(d,"@import url('discard.css');"
         "@container(width>1px){.kept{height:23px}}@layer{.kept{color:blue}}"
         "@unrecognized{.kept{height:999px}}");
-    uint32_t count=0;struct css_rule_info *r=s?css_sheet_rules(s->ast,&count):NULL;
-    check(r && count==2 && r->type==0 && r->next && r->next->type==0 &&
-        rule_starts(r,"@container") && rule_starts(r->next,"@layer") && !strstr(s->source,"@import"),
+    uint32_t count=0;struct css_rule_info *r=s?css_sheet_rules(s->p.ast,&count):NULL;
+    check(r && count==2 && r->type==CSS_RULE_CONTAINER && r->next && r->next->type==CSS_RULE_LAYER_BLOCK &&
+        rule_starts(r,"@container") && rule_starts(r->next,"@layer") && !strstr(s->p.source,"@import"),
         "constructed import removal preserves recognized type-zero grouping rules");
     if(!s){web_free(d);return;}
     const char *temporary=".temporary{height:1px}";
-    check(cssom_insert(s,temporary,strlen(temporary),0)==CSSOM_OK,
+    check(cssom_insert(s,0,temporary,strlen(temporary),0)==CSSOM_OK,
         "CSSOM insertion preserves container group source");
-    int deleted=cssom_delete(s,0);r=css_sheet_rules(s->ast,&count);
+    int deleted=cssom_delete(s,0,0);r=css_sheet_rules(s->p.ast,&count);
     check(deleted==CSSOM_OK && count==2 && rule_starts(r,"@container"),
         "CSSOM deletion preserves container group source");
     check(cssom_adopt(d->root,&s,1)==CSSOM_OK,"adopt edited container group sheet");
@@ -370,8 +370,8 @@ static void container_queries(void) {
     check(s && cssom_adopt(d->root,&s,1)==CSSOM_OK,"container sheet");
     if(!s){web_free(d);return;}
     unsigned groups=0;
-    for(struct css_rule_info *r=css_sheet_rules(s->ast,NULL);r;r=r->next)
-        if(r->type==0 && rule_starts(r,"@container"))groups++;
+    for(struct css_rule_info *r=css_sheet_rules(s->p.ast,NULL);r;r=r->next)
+        if(r->type==CSS_RULE_CONTAINER && rule_starts(r,"@container"))groups++;
     check(groups==13,"replaceSync retains all standalone container groups in CSSOM");
     node_t *size=element(d,"div",d->body,NULL);
     doc_node_attr(d,size,"style","container-type:size;width:1500px;height:200px");
