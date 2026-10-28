@@ -5236,14 +5236,11 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
         if(node_attr(anchor,"download") && (sandbox_authority(s)&SB_DOWNLOADS))return JS_UNDEFINED;
         struct web_hit action = {0};
         if (web_link_action(s->doc, anchor, &action) && permitted_url(s, action.href, false)) {
-            if(s->doc->frame_parent) {
-                const char *target=node_attr(anchor,"target");
-                struct web_frame *f=web_frame_find(s->doc->frame_parent,s->doc->frame_element);
-                if(target && *target && strcasecmp(target,"_self"))log_text(s,1,"Scripted child link activation cannot navigate another browsing context");
-                else if(!web_frame_set_navigation(f,action.href,s->doc))return oom(ctx);
-            }else if(!web_frame_navigate(s->doc,anchor,action.href,s->doc->sandbox_activation_until>uptime_ms()) && s->host.navigate){
-                /* A top-level document follows the hyperlink as a click the user made does
-                   (frame.c: its target chooses the navigable), with its own activation. */
+            web_doc *top=s->doc;while(top->frame_parent)top=top->frame_parent;
+            if(!web_frame_navigate(top,anchor,action.href,s->doc->sandbox_activation_until>uptime_ms()) && s->host.navigate){
+                /* The document follows the hyperlink as a click the user made does (frame.c:
+                   its target chooses the navigable), with its own activation; the top-level
+                   one is the host's. */
                 struct web_navigation navigation={.url=action.href,.history=WEB_NAVIGATE_PUSH};
                 web_navigation_source(s->doc,anchor,&navigation);
                 s->host.navigate(s->host.opaque,&navigation);
