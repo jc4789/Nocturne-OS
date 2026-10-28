@@ -180,6 +180,9 @@ typedef struct node {
     arena_t style_inherit_mem;
     struct css_style_slot *style_slots, *style_previous_slots;
     struct css_declarations *style_declarations; /* immutable inline declaration snapshot */
+    /* css.c's css_inline_text: "the style attribute\0its exact declarations", written by the
+       last change through CSSOM */
+    char *style_cssom;
     struct style *style_previous;
     struct node *style_retired_next;
     bool style_dirty, style_children_dirty;
@@ -348,7 +351,29 @@ struct css_calc_parse {
     /* LF_ANCHOR, LF_ANCHOR_SIZE: anchor() and anchor-size() are <length>s here (css-anchor-position-1
        §3.2, §5.1; a computed value only, cx set). cssprop.c reads their arguments; each is a leaf */
     uint8_t anchors;
+    /* CSS Typed OM §5.6 "reify a math expression": the tree as written, not simplified (units kept,
+       subtraction a negate, division an invert, a calc() without an operator a sum of one); a math
+       function Typed OM has no object for fails, unrepresentable set. Typed OM reads values this
+       owner serialized, so what it reads is already simplified (§10.10.1). */
+    bool raw, unrepresentable;
 };
+/* a numeric type (CSS Values 4 §10.7, CSS Typed OM §4.3.2): the exponent of each base type in the
+   order length, angle, time, frequency, resolution, flex, percent, and the percent hint (a base, -1) */
+enum { CSS_TYPE_BASES = 7 };
+struct css_calc_type { int8_t e[CSS_TYPE_BASES]; int8_t hint; };
+bool css_calc_type_add(const struct css_calc_type *a, const struct css_calc_type *b, struct css_calc_type *out);
+bool css_calc_type_multiply(const struct css_calc_type *a, const struct css_calc_type *b, struct css_calc_type *out);
+/* the CSS_CALC_* type t is in a context that accepts accept (CSS Typed OM "match"), or 0 */
+unsigned css_calc_type_match(const struct css_calc_type *t, unsigned accept);
+/* the units of the table, 0 .. css_unit_count() - 1: name ("" a number, "%" a percentage), base type
+   (-1 a number, else as in struct css_calc_type), relative (needs an element), canonical factor */
+int css_unit_count(void);
+void css_unit_info(int unit, const char **name, int *base, bool *relative, double *factor);
+/* a tree's shape for a reader outside this owner: CSS_MATH_* and the leaf's value and unit, or the
+   children (clamp()'s none is NULL) */
+enum { CSS_MATH_VALUE, CSS_MATH_SUM, CSS_MATH_PRODUCT, CSS_MATH_NEGATE, CSS_MATH_INVERT, CSS_MATH_MIN,
+       CSS_MATH_MAX, CSS_MATH_CLAMP, CSS_MATH_OTHER };
+int css_calc_shape(const struct css_calc *c, double *v, int *unit, unsigned *n, struct css_calc *const **children);
 bool css_calc_is_math(const char *s, size_t n); /* s starts with a math function */
 /* s..s+n, one math function: its simplified tree, typed against accept (*kind: the CSS_CALC_* type it
    is); NULL if it is not valid there */
@@ -1141,6 +1166,16 @@ bool css_prop_is_motion(const struct propdef *p);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d);
 /* CSSOM specified value of a declared colour or color-scheme; false: keep the authored text */
 bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out);
+/* CSS Typed OM §5: what a property's value reifies as by its grammar (cssprop.c's table): always a
+   CSSStyleValue, a colour (only currentcolor is a keyword), a transform list, an image layer, or by the
+   value (an identifier a keyword, a numeric value of a type accept takes a CSSNumericValue); whether it
+   is a shorthand or list-valued. false: no such property. */
+enum { CSS_REIFY_VALUE, CSS_REIFY_STYLE, CSS_REIFY_COLOR, CSS_REIFY_TRANSFORM, CSS_REIFY_IMAGE };
+/* accept: the CSS_CALC_* types a lone numeric value of the property takes; typed: accept is all of
+   them (0: the grammar takes no lone numeric value), else the grammar is not known that far;
+   integer: a lone number must be an integer */
+struct css_reify { uint8_t kind; bool shorthand, list, typed, integer; unsigned accept; };
+bool css_prop_reify(const char *name, size_t n, struct css_reify *out);
 /* Animation values (cssprop.c). The property table owns each longhand's animation type
    (Web Animations 1 §5.3): not animatable, discrete, by computed value, visibility (visible
    wins inside the interval), or display (the value that is not none/hidden wins inside it;
@@ -1268,6 +1303,20 @@ bool css_color_parse_used(const char *s, size_t n, const style_t *(*element)(voi
                           struct css_color *out);
 /* CSSOM: the specified value's serialization; false (out unchanged) when s is not a <color> */
 bool css_color_specified(const char *s, size_t n, sbuf *out);
+/* CSS Typed OM §5.7: a <color> as written (color.c). KEYWORD: name (currentcolor, a system colour);
+   a function's channels as authored (a math one's serialization in math at math_at), a hex or named
+   colour RGB with its bytes and its alpha as a unitless fraction; OTHER: relative colours and mixes.
+   false: not a colour */
+enum { CSS_COLOR_REIFY_KEYWORD, CSS_COLOR_REIFY_RGB, CSS_COLOR_REIFY_HSL, CSS_COLOR_REIFY_HWB, CSS_COLOR_REIFY_LAB,
+       CSS_COLOR_REIFY_LCH, CSS_COLOR_REIFY_OKLAB, CSS_COLOR_REIFY_OKLCH, CSS_COLOR_REIFY_COLOR, CSS_COLOR_REIFY_OTHER };
+enum { CSS_COLOR_CHANNEL_ABSENT, CSS_COLOR_CHANNEL_NONE, CSS_COLOR_CHANNEL_VALUE, CSS_COLOR_CHANNEL_MATH };
+struct css_color_channel { uint8_t kind; char unit[7]; double v; size_t math_at, math_n; };
+struct css_color_reified {
+    uint8_t kind;
+    const char *name, *space; /* KEYWORD's name; COLOR's colour space */
+    struct css_color_channel ch[4];
+};
+bool css_color_reify(const char *s, size_t n, struct css_color_reified *out, sbuf *math);
 /* a computed colour held as its 8-bit field argb (COLOR_CURRENT: currentcolor, current the 8-bit
    colour out->color gives it meanwhile) and, when 8 bits cannot hold it, its exact value or
    expression v (a style's slot, a shadow's colour) */
@@ -2136,6 +2185,19 @@ int css_decl_set(const char *css, size_t n, const char *property, const char *va
                  css_decl_check *check, sbuf *out);
 bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names);
 void css_decl_names(const char *css, size_t n, sbuf *names);
+/* An element's inline declarations (CSSOM §6.7). A change through CSSOM sets the style attribute
+   to their serialization with the mutate flag: the attribute is not parsed again, and the
+   declarations keep the values they were given (a specified serialization may round, as an
+   origin colour's channels do, CSS Color 4 §15.2). text: what the cascade parses, those
+   declarations while the attribute is still their serialization, else the attribute's text
+   (NULL: none, or CSP blocked the attribute). set: setProperty (removeProperty for an empty value) where block is the
+   attribute's serialized block: 1 the declarations changed and attribute gets the new block,
+   else as css_decl_set (0 nothing changed). replace: the cssText setter, attribute gets the
+   serialization of what text parses to; false: no memory. */
+const char *css_inline_text(const node_t *e);
+int css_inline_set(web_doc *d, node_t *e, const char *block, size_t n, const char *property, const char *value,
+                   const char *priority, sbuf *attribute);
+bool css_inline_replace(web_doc *d, node_t *e, const char *text, size_t n, sbuf *attribute);
 bool css_decl_balanced(const char *text, size_t n);
 void web_js_start(web_doc *d, const struct web_host *host);
 bool web_js_parser_candidate(web_doc *d, const char *name, const char *is);

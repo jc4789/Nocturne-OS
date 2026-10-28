@@ -234,6 +234,7 @@ struct pctx {
     int depth;
     const char *const *keys; /* relative colour channel keywords (4, the last is alpha), or NULL */
     bool unclamped; /* the animation layer's computed-value text (cx.computed_text): rgb() keeps its range */
+    bool authored;  /* CSS Typed OM: a function keeps its channels as written, not computed */
 };
 static void *p_alloc(struct pctx *P, size_t n) { return ar_alloc(P->a, n); }
 /* a literal's type from its unit; false for an unknown unit */
@@ -657,7 +658,7 @@ static bool parse_fn(struct pctx *P, uint8_t fn, const struct tok *ft, struct cs
 done:
     P->keys = saved;
     if (!ok) return false;
-    if (!origin) {
+    if (!origin && !P->authored) {
         /* An absolute colour: computed now unless a channel needs the element. The
            specified value of a non-legacy function keeps its math functions. */
         bool free = true;
@@ -1980,6 +1981,63 @@ bool css_color_specified(const char *s, size_t n, sbuf *out) {
     while (n && is_space((unsigned char)s[n - 1])) n--;
     bool ok = parse_scratch(s, n, use_specified, out);
     if (!ok) { out->n = original; if (out->p && original < out->cap) out->p[original] = 0; }
+    return ok;
+}
+/* CSS Typed OM §5.7 "reify a color value": the colour as it was written. A function's channels keep
+   their authored values and units (a math function's simplified serialization goes to math); a hex or
+   named colour is its sRGB bytes and its alpha as a unitless fraction. */
+bool css_color_reify(const char *s, size_t n, struct css_color_reified *out, sbuf *math) {
+    while (n && is_space((unsigned char)*s)) s++, n--;
+    while (n && is_space((unsigned char)s[n - 1])) n--;
+    memset(out, 0, sizeof *out);
+    arena_t a = {.chunk_size = 8192};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    if (!setjmp(trap)) {
+        struct tok t[2];
+        struct lex l = {s, s + n};
+        lx_next(&l, &t[0]);
+        lx_next(&l, &t[1]);
+        struct pctx P = {.a = &a, .authored = true};
+        struct css_color_value v;
+        if (t[0].kind != TK_EOF && t[1].kind == TK_EOF && cv_parse(&P, &t[0], &v)) {
+            ok = true;
+            static const uint8_t kinds[] = {[F_RGB] = CSS_COLOR_REIFY_RGB, [F_HSL] = CSS_COLOR_REIFY_HSL,
+                [F_HWB] = CSS_COLOR_REIFY_HWB, [F_LAB] = CSS_COLOR_REIFY_LAB, [F_LCH] = CSS_COLOR_REIFY_LCH,
+                [F_OKLAB] = CSS_COLOR_REIFY_OKLAB, [F_OKLCH] = CSS_COLOR_REIFY_OKLCH, [F_COLOR] = CSS_COLOR_REIFY_COLOR,
+                [F_ALPHA] = CSS_COLOR_REIFY_OTHER};
+            if (v.kind == CV_CURRENT) { out->kind = CSS_COLOR_REIFY_KEYWORD; out->name = "currentcolor"; }
+            else if (v.kind == CV_SYSTEM) { out->kind = CSS_COLOR_REIFY_KEYWORD; out->name = system_colors[v.fn].name; }
+            else if (v.kind == CV_ABS) {
+                uint32_t argb = css_color_argb(&v.color);
+                out->kind = CSS_COLOR_REIFY_RGB;
+                for (int i = 0; i < 3; i++) {
+                    out->ch[i].kind = CSS_COLOR_CHANNEL_VALUE;
+                    out->ch[i].v = (double)(argb >> (16 - 8 * i) & 0xFF);
+                }
+                out->ch[3].kind = CSS_COLOR_CHANNEL_VALUE;
+                out->ch[3].v = v.color.alpha;
+            } else if (v.kind == CV_FN && !v.origin) {
+                out->kind = kinds[v.fn];
+                out->space = v.fn == F_COLOR ? space_names[v.space] : NULL;
+                for (int i = 0; i < 4; i++) {
+                    const struct chan *c = &v.ch[i];
+                    struct css_color_channel *o = &out->ch[i];
+                    o->kind = c->kind == CH_NONE ? CSS_COLOR_CHANNEL_NONE : c->kind == CH_LEAF ? CSS_COLOR_CHANNEL_VALUE :
+                              c->kind == CH_MATH ? CSS_COLOR_CHANNEL_MATH : CSS_COLOR_CHANNEL_ABSENT;
+                    o->v = c->v;
+                    memcpy(o->unit, c->unit, sizeof c->unit);
+                    if (c->kind == CH_MATH) {
+                        o->math_at = math->n;
+                        if (!css_calc_serialize(math, c->m, NULL)) { ok = false; break; }
+                        o->math_n = math->n - o->math_at;
+                    }
+                }
+            } else out->kind = CSS_COLOR_REIFY_OTHER;
+        }
+    }
+    ar_free(&a);
     return ok;
 }
 /* whether a value needs an element: currentcolor, or a colour the scheme decides */

@@ -1205,6 +1205,76 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     ar_free(&a);
     return ok;
 }
+/* CSS Typed OM §5 (css-typed-om-1 "CSSStyleValue reification"): what the property's grammar makes of a
+   value, read from its row: shorthands and font-family are a CSSStyleValue (§5.1), a colour property's
+   keyword is one only for currentcolor, transform and the image layers have their own objects, and a
+   numeric value is a CSSNumericValue where the grammar takes that type. The layered properties
+   (animations, transitions, background and mask layers) are list-valued. The logical shorthands of
+   two sides (margin-block, inset-inline, border-block, ...) and the logical names of the border
+   sides (border-block-start is border-top here) take one value for both, which reifies as one side's
+   longhand does: a length or percentage, or (the borders) a keyword. */
+bool css_prop_reify(const char *name, size_t n, struct css_reify *out) {
+    const struct propdef *p = css_prop_lookup(name, n);
+    if (!p) return false;
+    *out = (struct css_reify){0};
+    if (p->type == PT_SHORT) {
+        bool alias = strlen(p->name) != n || strncasecmp(p->name, name, n);
+        switch (p->sh) {
+        case SH_MARGIN_INLINE: case SH_MARGIN_BLOCK: case SH_PADDING_INLINE: case SH_PADDING_BLOCK:
+        case SH_INSET_INLINE: case SH_INSET_BLOCK:
+            out->kind = CSS_REIFY_VALUE; out->typed = true; out->accept = CSS_CALC_LENGTH | CSS_CALC_PERCENT;
+            return true;
+        case SH_BORDER_INLINE: case SH_BORDER_BLOCK:
+            out->kind = CSS_REIFY_VALUE; out->typed = true;
+            return true;
+        case SH_BORDER_TOP: case SH_BORDER_RIGHT: case SH_BORDER_BOTTOM: case SH_BORDER_LEFT:
+            if (alias) { out->kind = CSS_REIFY_VALUE; out->typed = true; return true; }
+            break;
+        }
+        out->kind = CSS_REIFY_STYLE; out->shorthand = true;
+        return true;
+    }
+    out->list = p->type == PT_MOTION_LIST || p->type == PT_BG_IMAGE || p->type == PT_MASK_IMAGE || p->type == PT_BG_POS ||
+                p->type == PT_BG_SIZE || p->type == PT_MASK_SIZE || (p->type == PT_KW && p->kws == kw_bg_repeat);
+    out->kind = p->type == PT_FONT_FAMILY ? CSS_REIFY_STYLE :
+                p->type == PT_COLOR || p->type == PT_SVG_PAINT ? CSS_REIFY_COLOR :
+                p->type == PT_TRANSFORM ? CSS_REIFY_TRANSFORM :
+                p->type == PT_BG_IMAGE || p->type == PT_MASK_IMAGE ||
+                (p->type == PT_SHAPE && p->flags == CSS_SHAPE_OUTSIDE) ? CSS_REIFY_IMAGE : CSS_REIFY_VALUE;
+    unsigned accept = 0;
+    bool typed = true;
+    switch (p->type) {
+    case PT_LEN: accept = CSS_CALC_LENGTH | (p->flags & LF_NOPCT ? 0 : CSS_CALC_PERCENT); break;
+    case PT_PX: accept = CSS_CALC_LENGTH; break;
+    case PT_FONT_SIZE: case PT_VALIGN: case PT_RADIUS: case PT_TRANSLATE: case PT_BG_SIZE: case PT_MASK_SIZE:
+    case PT_BG_POS: case PT_TRANSFORM_ORIGIN:
+        accept = CSS_CALC_LENGTH | CSS_CALC_PERCENT; break;
+    case PT_GTEMPLATE: accept = CSS_CALC_LENGTH | CSS_CALC_PERCENT | CSS_CALC_FLEX; break;
+    case PT_LINE_HEIGHT: case PT_SVG_WIDTH: accept = CSS_CALC_NUMBER | CSS_CALC_LENGTH | CSS_CALC_PERCENT; break;
+    case PT_INT: case PT_ZINDEX: case PT_LINE_CLAMP: out->integer = true; /* fall through */
+    case PT_NUM: case PT_FONT_WEIGHT: accept = CSS_CALC_NUMBER; break;
+    case PT_OPACITY: case PT_SCALE: accept = CSS_CALC_NUMBER | CSS_CALC_PERCENT; break;
+    case PT_ROTATE: accept = CSS_CALC_ANGLE; break;
+    /* offset-rotate: [auto | reverse] || <angle>; shape-outside: a box, an <image> (a basic shape is
+       not reified in Level 1) */
+    case PT_OFFSET: if (p->flags == CSS_OFFSET_ROTATE) accept = CSS_CALC_ANGLE; else typed = false; break;
+    case PT_SHAPE: if (p->flags != CSS_SHAPE_OUTSIDE) typed = false; break;
+    case PT_MOTION_LIST:
+        accept = p->flags == ML_DURATION || p->flags == ML_DELAY || p->flags == ML_TDURATION || p->flags == ML_TDELAY ?
+                 CSS_CALC_TIME : p->flags == ML_ITERATIONS ? CSS_CALC_NUMBER : 0;
+        break;
+    /* keywords, colours, images, names, shadows and filters: no lone numeric value; a grid line's
+       integer goes with a name or span, a CSSStyleValue (WPT grid-start-end.html) */
+    case PT_KW: case PT_DISPLAY: case PT_COLOR: case PT_FONT_FAMILY: case PT_LIST_TYPE: case PT_BG_IMAGE: case PT_OVERFLOW:
+    case PT_MASK_IMAGE: case PT_SVG_PAINT: case PT_CONTAINER_NAMES: case PT_TRANSFORM: case PT_GAREAS: case PT_FILTER:
+    case PT_BOX_SHADOW: case PT_CLIP: case PT_COLOR_SCHEME: case PT_GLINE:
+        break;
+    default: typed = false;
+    }
+    out->accept = accept;
+    out->typed = typed;
+    return true;
+}
 
 /* ---------------------------------------------------------------- longhand values */
 static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {

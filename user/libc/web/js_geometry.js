@@ -344,7 +344,9 @@ function geometryInterfaces(options){
     /* [LegacyWindowAlias]. */
     if(windowRealm)for(const [alias,target] of [['SVGPoint',DOMPoint],['SVGRect',DOMRect],['SVGMatrix',DOMMatrix],['WebKitCSSMatrix',DOMMatrix]])
         define(globalThis,alias,{configurable:true,writable:true,value:target});
-    return {DOMPoint,DOMPointReadOnly,DOMRect,DOMRectReadOnly,DOMMatrix,identity,affine,multiply,
+    return {DOMPoint,DOMPointReadOnly,DOMRect,DOMRectReadOnly,DOMMatrix,DOMMatrixReadOnly,identity,affine,multiply,rotation,
+        /* a DOMMatrixReadOnly's 16 column-major values and is-2D flag (TypeError for anything else) */
+        matrixValues:value=>{const r=m(value);return {m:r.m.slice(),is2D:r.is2D};},
         matrix:values=>matrixObject(DOMMatrix,values,false),matrix2D:values=>matrixObject(DOMMatrix,values,true),
         matrix2DInit:v=>names2D.map(k=>matrix2DDictionary(v)[index(k)]),
         rectInit,rectList,liveRect,

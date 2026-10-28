@@ -6385,6 +6385,77 @@ static bool hint_reaches_descendants(const node_t *e, const char *name) {
     return !e->foreign && e->tag == T_table && (!strcmp(name, "cellpadding") || !strcmp(name, "border"));
 }
 
+/* ---------------------------------------------------------------- an element's inline declarations */
+/* a valid declaration as it was given: the value the cascade parses */
+static bool decl_exact(const char *name, const char *value, size_t n, sbuf *out) {
+    if (!css_valid_declaration(name, strlen(name), value, n)) return false;
+    sb_put(out, value, n);
+    return true;
+}
+/* a value decl_exact kept, as CSSOM serializes it */
+static bool decl_serialized(const char *name, const char *value, size_t n, sbuf *out) {
+    css_decl_value(name, value, n, out);
+    return true;
+}
+const char *css_inline_text(const node_t *e) {
+    /* a style attribute CSP blocked gives no declarations (dom.c's csp_style_attribute) */
+    if (e->csp_style_attribute == 2) return NULL;
+    const char *attribute = node_attr(e, "style");
+    if (e->style_cssom && attribute && !strcmp(e->style_cssom, attribute)) return e->style_cssom + strlen(e->style_cssom) + 1;
+    return attribute;
+}
+/* the exact declarations, as a block: CSSOM's, or the attribute's valid ones as written */
+static bool inline_exact(const node_t *e, sbuf *out) {
+    const char *text = css_inline_text(e);
+    if (!text || !*text) return true;
+    if (text != node_attr(e, "style")) { sb_puts(out, text); return true; }
+    size_t n;
+    char *clean = css_preprocess(text, strlen(text), &n);
+    bool ok = clean && css_decl_serialize(clean, n, decl_exact, out, NULL);
+    free(clean);
+    return ok;
+}
+/* the declarations stand for the attribute once it is set to attribute; an element whose
+   attribute does not change (the same serialization) restyles for the new values here */
+static bool inline_store(web_doc *d, node_t *e, const sbuf *attribute, const sbuf *exact) {
+    char *text = malloc(attribute->n + exact->n + 2);
+    if (!text) return false;
+    memcpy(text, attribute->p ? attribute->p : "", attribute->n);
+    text[attribute->n] = 0;
+    memcpy(text + attribute->n + 1, exact->p ? exact->p : "", exact->n);
+    text[attribute->n + 1 + exact->n] = 0;
+    const char *before = css_inline_text(e);
+    bool same = before && strlen(before) == exact->n && !memcmp(before, text + attribute->n + 1, exact->n);
+    free(e->style_cssom);
+    e->style_cssom = text;
+    if (!same) css_mark_style_own(d, e);
+    return true;
+}
+int css_inline_set(web_doc *d, node_t *e, const char *block, size_t n, const char *property, const char *value,
+                   const char *priority, sbuf *attribute) {
+    sbuf exact = {0}, changed = {0};
+    int status = inline_exact(e, &exact) ? css_decl_set(exact.p ? exact.p : "", exact.n, property, value, priority,
+                                                         decl_exact, &changed) : -2;
+    if (status > 0 && changed.n == exact.n && (!exact.n || !memcmp(changed.p, exact.p, exact.n))) status = 0;
+    /* the value is valid: the attribute's block takes its serialization */
+    if (status > 0) status = css_decl_set(block, n, property, value, priority, decl_serialized, attribute);
+    if (status > 0 && !inline_store(d, e, attribute, &changed)) status = -2;
+    sb_free(&exact);
+    sb_free(&changed);
+    return status;
+}
+bool css_inline_replace(web_doc *d, node_t *e, const char *text, size_t n, sbuf *attribute) {
+    sbuf exact = {0};
+    size_t clean_n;
+    char *clean = css_preprocess(text, n, &clean_n);
+    bool ok = clean && css_decl_serialize(clean, clean_n, decl_exact, &exact, NULL) &&
+              css_decl_serialize(exact.p ? exact.p : "", exact.n, decl_serialized, attribute, NULL) &&
+              inline_store(d, e, attribute, &exact);
+    free(clean);
+    sb_free(&exact);
+    return ok;
+}
+
 /* ---------------------------------------------------------------- the cascade */
 struct dent {
     const struct decl *d;
@@ -7259,6 +7330,7 @@ void css_node_style_free(node_t *n) {
     ar_free(&n->style_mem); ar_free(&n->style_previous_mem); ar_free(&n->style_inherit_mem);
     style_slots_free(&n->style_slots); style_slots_free(&n->style_previous_slots);
     declarations_free(&n->style_declarations);
+    free(n->style_cssom); n->style_cssom = NULL;
     n->style = n->animation_base_style = n->animation_after_style = n->style_previous = NULL;
 }
 
@@ -8360,8 +8432,9 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     }
     int depth = scope_depth(doc_node_root(e, false));
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
-    /* A style attribute CSP blocked is not applied (dom.c's csp_style_attribute). */
-    const char *sa = e->csp_style_attribute == 2 ? NULL : node_attr(e, "style");
+    /* the declarations the style attribute stands for: none when CSP blocked it, the exact
+       ones when a CSSOM change wrote it (css_inline_text) */
+    const char *sa = css_inline_text(e);
     struct css_declarations *inline_block = declarations_get(&e->style_declarations, sa, d->base, c->a);
     if (inline_block) {
         struct decl *ds = inline_block->values; int nd = inline_block->count;
