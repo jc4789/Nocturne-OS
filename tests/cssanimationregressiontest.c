@@ -1,11 +1,13 @@
 /* First failed assertions only: live parser/resource publication. */
-/* One native CSS opacity animation, not transform/events or site acceptance. */
+/* One native CSS opacity animation, not transform/events or site acceptance. The animations
+   are the one time model's records (animation.h), as in cssanimationtest.c. */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <nocturne.h>
 #include "webi.h"
 #include "cssom.h"
+#include "script_animation_native.h"
 
 static int checks, failures, js_failures, js_checks;
 static void check(const char *name, bool pass) {
@@ -81,9 +83,10 @@ static void sampling(void) {
     ;
     ;
     ;
-    (void)(css_animation_set(a,PE_NONE,1,"opacity:.65;")==1);
+    struct web_animation *script=script_animation_hold(d,a,PE_NONE,"opacity",".65");
     restyle(d,a);;
-    css_animation_set(a,PE_NONE,1,NULL);restyle(d,a);check("WAAPI removal restores CSS sample",opacity(a,.5));
+    if(script)web_animation_cancel(script);
+    restyle(d,a);check("WAAPI removal restores CSS sample",script && opacity(a,.5));
     doc_node_attr(d,a,"style","opacity:.2;animation:fade 1s linear -.5s both paused;width:20px;height:20px;background:red");
     layout(d);static uint32_t pixels[320*200];canvas_t canvas;gfx_init(&canvas,pixels,320,200,320);
     web_paint(d,&canvas,0,0,320,200,0,0);
@@ -95,14 +98,16 @@ static void lifecycle(void) {
     web_doc *d=load("@keyframes fade{from{opacity:0}to{opacity:1}}");
     ;if(!d)return;
     node_t *a=element(d,d->body,"animation:fade 1s linear -.25s both paused");layout(d);
-    struct css_motion_state *identity=a->css_motion;
+    struct web_animation *identity=a->owned;
     check("paused initial negative delay",opacity(a,.25));
     n_sleep_ms(20);restyle(d,a);check("paused wall time does not advance",opacity(a,.25));
     d->style_full_dirty=d->need_style=d->need_boxes=true;layout(d);
-    check("full style rebuild retains playback",a->css_motion==identity && opacity(a,.25));
+    check("full style rebuild retains playback",identity && a->owned==identity && opacity(a,.25));
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both");layout(d);
-    check("resume schedules native frame",css_motion_deadline(d)>=0);
-    n_sleep_ms(35);css_motion_tick(d,uptime_ms());layout(d);
+    check("resume schedules native frame",web_animations_deadline(d)>=0);
+    /* the pending play task at the next frame: the start time is that frame's time */
+    web_animations_tick(d,uptime_ms());layout(d);
+    n_sleep_ms(35);web_animations_tick(d,uptime_ms());layout(d);
     check("resume advances actual native time",a->style->opacity>.27f && a->style->opacity<.6f);
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both paused");layout(d);
     n_sleep_ms(20);restyle(d,a);;
@@ -117,8 +122,8 @@ static void lifecycle(void) {
     check("display restoration restarts",opacity(a,0));
     doc_node_remove(d,a);;
     doc_node_move(d,d->body,a,NULL);layout(d);check("reconnection starts fresh",opacity(a,0));
-    doc_node_attr(d,a,"style","animation:fade 40ms linear forwards");layout(d);
-    n_sleep_ms(65);css_motion_tick(d,uptime_ms());layout(d);
+    doc_node_attr(d,a,"style","animation:fade 40ms linear forwards");layout(d);web_animations_tick(d,uptime_ms());
+    n_sleep_ms(65);web_animations_tick(d,uptime_ms());layout(d);
     ;
     ;
     doc_node_attr(d,a,"style","opacity:.4;animation:fade 0s linear");layout(d);
@@ -152,8 +157,8 @@ static void cssom_scope(void) {
     const char *ordinary=".ordinary{opacity:.4}";
     (void)(cssom_insert(s,ordinary,strlen(ordinary),0)==CSSOM_OK);layout(d);
     check("insert rebuilt keyframes still sample",opacity(a,.45));
-    (void)(cssom_delete(s,1)==CSSOM_OK);layout(d);
-    check("deleted keyframe stops effect and identity",opacity(a,.1) && a->css_motion==NULL);
+    (void)(cssom_delete(s,1)==CSSOM_OK);layout(d);web_animations_tick(d,uptime_ms());
+    check("deleted keyframe stops effect and identity",opacity(a,.1) && a->owned==NULL);
     const char *media="@media print{@keyframes same{to{opacity:.9}}}@media screen{@keyframes same{to{opacity:.35}}}"
         ".sample{opacity:.1;animation:same 0s forwards}";
     (void)(cssom_replace_sync(s,media,strlen(media))==CSSOM_OK);layout(d);

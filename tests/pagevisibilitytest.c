@@ -96,7 +96,7 @@ int main(void){
     node_t *spin=by_id(doc,"spin");
     web_doc *child=doc->frames?doc->frames->document:NULL;
     check("visible top and frame",doc->visible&&doc->system_visible&&child&&child->visible);
-    check("visible CSS animation deadline",css_motion_deadline(doc)>=0);
+    check("visible CSS animation deadline",web_animations_deadline(doc)>=0);
     check("visible marquee deadline",web_marquee_deadline(doc)>=0);
     check("visible animation frames wanted",web_js_rendering_wanted(doc));
 
@@ -111,7 +111,7 @@ int main(void){
     check("hidden after the task",!doc->visible&&!doc->visibility_updates&&all_frames(doc,false,0));
     eval(doc,"check('hidden event',events.join()==='hidden'&&handlerEvents===1&&windowEvents===1&&shapes&&document.hidden);"
              "check('frame hidden event',childEvents.join()==='hidden'&&document.getElementById('child').contentDocument.visibilityState==='hidden')");
-    check("hidden CSS animation has no deadline",css_motion_deadline(doc)==-1);
+    check("hidden CSS animation has no deadline",web_animations_deadline(doc)==-1);
     check("hidden marquee has no deadline",web_marquee_deadline(doc)==-1);
     check("hidden animation frames not wanted",!web_js_rendering_wanted(doc));
     run_until(doc,uptime_ms()+5000,&late_ready);
@@ -129,7 +129,7 @@ int main(void){
     check("visible again",doc->visible&&all_frames(doc,true,0));
     printf("pagevisibility opacity %.4f -> %.4f over %lu ms\n",before,after,(unsigned long)elapsed);
     check("CSS animation time ran while hidden",before>=0&&fabsf((after-before)-(float)elapsed/100000.0f)<0.01f);
-    check("visible CSS animation deadline again",css_motion_deadline(doc)>=0);
+    check("visible CSS animation deadline again",web_animations_deadline(doc)>=0);
     check("visible marquee deadline again",web_marquee_deadline(doc)>=0);
     eval(doc,"check('visible event',events.join()==='hidden,visible'&&handlerEvents===2&&windowEvents===2&&shapes&&!document.hidden);"
              "check('frame visible event',childEvents.join()==='hidden,visible');"

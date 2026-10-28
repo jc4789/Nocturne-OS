@@ -90,16 +90,8 @@ static void declaration_cache(void) {
         "changed document base re-resolves cached relative URL");
     declarations_get(&cache, "", "https://cache.test/two/", &failure);
     check(!cache, "attribute removal reclaims cache"); ar_free(&failure);
-    node_t n = {0};
-    check(css_animation_set(&n, PE_NONE, 9, "opacity:0.3") == 1, "WAAPI sample publication");
-    struct css_animation *a = n.animations;
-    declarations_get(&a->declarations, a->text, "about:blank", &failure); first = a->declarations;
-    check(css_animation_set(&n, PE_NONE, 9, "opacity:0.3") == 0 && a->declarations == first,
-        "same animation sample does not invalidate parsed block");
-    check(css_animation_set(&n, PE_NONE, 9, "opacity:0.7") == 1, "new animation sample changes source");
-    declarations_get(&a->declarations, a->text, "about:blank", &failure);
-    check(!strcmp(declaration_value(a->declarations, "opacity"), "0.7"), "new animation sample replaces immutable AST");
-    css_animation_free(&n); check(!n.animations, "effect removal releases AST and source"); ar_free(&failure);
+    /* An animation's keyframes block (kept while its source stays, replaced when it changes,
+       released with the effect) belongs to animation.c: check_animation_model_native.py. */
 }
 static style_t *fresh_style(web_doc *d, node_t *n, const style_t *parent) {
     style_t *s = style_slot_alloc(d, n, &n->style_mem); css_style_init(s, parent); return s;
