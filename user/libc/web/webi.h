@@ -386,8 +386,17 @@ bool css_shape_equal(const struct css_shape *a, const struct css_shape *b);
    (the caller falls back to discrete, or b replaces) */
 bool css_shape_combine(enum css_shape_property which, const struct css_shape *a, const struct css_shape *b,
                        double t, bool add, sbuf *out, web_doc *d);
+/* CSS Shapes 1 (css-shapes-1#shape-outside-property, #shape-margin-property,
+   #shape-image-threshold-property): the properties that shape a float's area. A style holds them
+   as one group (style_t's float_shape). */
+struct css_float_shape {
+    const struct css_shape *outside; /* shape-outside; NULL: none */
+    len_t margin;                    /* shape-margin */
+    float image_threshold;           /* shape-image-threshold */
+};
 /* Motion Path 1 (motion-1 §2): offset-path (path), offset-distance, offset-position (LK_NORMAL,
-   LK_AUTO or a position), offset-anchor (LK_AUTO or a position), offset-rotate. */
+   LK_AUTO or a position), offset-anchor (LK_AUTO or a position), offset-rotate. A style holds them
+   as one group (style_t's offset). */
 struct css_offset_rotate { float angle; bool auto_rotate; }; /* angle in degrees; reverse is auto 180deg */
 struct css_offset {
     const struct css_shape *path; /* NULL: none */
@@ -395,6 +404,12 @@ struct css_offset {
     len_t position[2], anchor[2];
     struct css_offset_rotate rotate;
 };
+/* the groups' initial values (a style's NULL group), and whether two groups hold the same computed
+   values (NULL: the initial ones) */
+extern const struct css_float_shape css_float_shape_initial;
+extern const struct css_offset css_offset_initial;
+bool css_float_shape_equal(const struct css_float_shape *a, const struct css_float_shape *b);
+bool css_offset_equal(const struct css_offset *a, const struct css_offset *b);
 enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE };
 bool css_offset_parse(enum css_offset_property which, const char *v, size_t n, struct cx *cx, void *out, sbuf *specified);
 bool css_offset_serialize(enum css_offset_property which, const void *value, sbuf *out, web_doc *d);
@@ -631,10 +646,13 @@ typedef struct style {
     float border_spacing;
     float opacity;
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
-    const struct css_shape *clip_path, *shape_outside; /* NULL: none; computed-arena values */
-    len_t shape_margin;
-    float shape_image_threshold;
-    struct css_offset offset; /* Motion Path */
+    const struct css_shape *clip_path; /* NULL: none; a computed-arena value */
+    /* Groups of rarely set properties that are not inherited, held by pointer so that every
+       element's style does not carry them (css_style_float_shape, css_style_offset read them).
+       NULL: all their values initial. A group is a computed-arena record that no one writes once a
+       style holds it: cssprop.c writes a longhand into a copy and points the style at the copy. */
+    const struct css_float_shape *float_shape; /* shape-outside, shape-margin, shape-image-threshold */
+    const struct css_offset *offset;           /* Motion Path */
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -669,6 +687,13 @@ typedef struct style {
     struct custom_prop *vars;
     struct style *before, *after, *backdrop, *placeholder;
 } style_t;
+/* a style's float shape and Motion Path values, the initial ones when it holds no group */
+static inline const struct css_float_shape *css_style_float_shape(const style_t *s) {
+    return s->float_shape ? s->float_shape : &css_float_shape_initial;
+}
+static inline const struct css_offset *css_style_offset(const style_t *s) {
+    return s->offset ? s->offset : &css_offset_initial;
+}
 
 /* ---------------------------------------------------------------- stylesheets */
 typedef struct sheet sheet_t;

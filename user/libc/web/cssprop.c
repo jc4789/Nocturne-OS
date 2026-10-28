@@ -998,6 +998,7 @@ struct propdef {
     const char *name;
     uint8_t type, flags; /* flags: LF_* for lengths; which shape or offset value (shape.c) */
     bool inherited;
+    uint8_t group; /* G_*: the record that holds the field, off being within it */
     uint16_t off, size;
     const struct kw *kws;
     uint8_t sh;
@@ -1005,6 +1006,9 @@ struct propdef {
 };
 /* Web Animations 1 §5.3 animation types that differ from a value type's default */
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
+/* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
+   offset). A group holds only properties that are not inherited. */
+enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET };
 
 static const struct kw kw_position[] = {{"static", POS_STATIC}, {"relative", POS_RELATIVE}, {"absolute", POS_ABSOLUTE},
                                         {"fixed", POS_FIXED}, {"sticky", POS_STICKY}, {"-webkit-sticky", POS_STICKY}, {0}};
@@ -1098,8 +1102,9 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
                                       {"top", VA_TOP}, {"middle", VA_MIDDLE}, {"bottom", VA_BOTTOM},
                                       {"text-top", VA_TEXT_TOP}, {"text-bottom", VA_TEXT_BOTTOM}, {0}};
 
-#define O(f) (uint16_t) offsetof(style_t, f), (uint16_t)sizeof(((style_t *)0)->f)
-#define SH(name, id) {name, PT_SHORT, 0, false, 0, 0, NULL, id, AN_NONE}
+#define O(f) G_STYLE, (uint16_t)offsetof(style_t, f), (uint16_t)sizeof(((style_t *)0)->f)
+#define OG(g, T, f) g, (uint16_t)offsetof(T, f), (uint16_t)sizeof(((T *)0)->f) /* a field of group g, a T */
+#define SH(name, id) {name, PT_SHORT, 0, false, G_STYLE, 0, 0, NULL, id, AN_NONE}
 
 /* sorted by name at first use */
 static struct propdef props[] = {
@@ -1187,15 +1192,16 @@ static struct propdef props[] = {
     {"filter", PT_FILTER, 0, false, O(filter), NULL, 0, AN_TYPE},
     {"clip", PT_CLIP, 0, false, O(clip), NULL, 0, AN_TYPE},
     {"clip-path", PT_SHAPE, CSS_SHAPE_CLIP_PATH, false, O(clip_path), NULL, 0, AN_TYPE},
-    {"shape-outside", PT_SHAPE, CSS_SHAPE_OUTSIDE, false, O(shape_outside), NULL, 0, AN_TYPE},
-    {"shape-margin", PT_LEN, LF_LENGTH, false, O(shape_margin), NULL, 0, AN_TYPE},
-    {"shape-image-threshold", PT_OPACITY, 0, false, O(shape_image_threshold), NULL, 0, AN_TYPE},
+    {"shape-outside", PT_SHAPE, CSS_SHAPE_OUTSIDE, false, OG(G_FLOAT_SHAPE, struct css_float_shape, outside), NULL, 0, AN_TYPE},
+    {"shape-margin", PT_LEN, LF_LENGTH, false, OG(G_FLOAT_SHAPE, struct css_float_shape, margin), NULL, 0, AN_TYPE},
+    {"shape-image-threshold", PT_OPACITY, 0, false, OG(G_FLOAT_SHAPE, struct css_float_shape, image_threshold), NULL, 0,
+     AN_TYPE},
     SH("offset", SH_OFFSET),
-    {"offset-path", PT_SHAPE, CSS_SHAPE_OFFSET_PATH, false, O(offset.path), NULL, 0, AN_TYPE},
-    {"offset-distance", PT_LEN, LF_NEG | LF_LENGTH, false, O(offset.distance), NULL, 0, AN_TYPE},
-    {"offset-position", PT_OFFSET, CSS_OFFSET_POSITION, false, O(offset.position), NULL, 0, AN_TYPE},
-    {"offset-anchor", PT_OFFSET, CSS_OFFSET_ANCHOR, false, O(offset.anchor), NULL, 0, AN_TYPE},
-    {"offset-rotate", PT_OFFSET, CSS_OFFSET_ROTATE, false, O(offset.rotate), NULL, 0, AN_TYPE},
+    {"offset-path", PT_SHAPE, CSS_SHAPE_OFFSET_PATH, false, OG(G_OFFSET, struct css_offset, path), NULL, 0, AN_TYPE},
+    {"offset-distance", PT_LEN, LF_NEG | LF_LENGTH, false, OG(G_OFFSET, struct css_offset, distance), NULL, 0, AN_TYPE},
+    {"offset-position", PT_OFFSET, CSS_OFFSET_POSITION, false, OG(G_OFFSET, struct css_offset, position), NULL, 0, AN_TYPE},
+    {"offset-anchor", PT_OFFSET, CSS_OFFSET_ANCHOR, false, OG(G_OFFSET, struct css_offset, anchor), NULL, 0, AN_TYPE},
+    {"offset-rotate", PT_OFFSET, CSS_OFFSET_ROTATE, false, OG(G_OFFSET, struct css_offset, rotate), NULL, 0, AN_TYPE},
     {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0, AN_TYPE},
     SH("font", SH_FONT),
     SH("all", SH_ALL),
@@ -1371,11 +1377,7 @@ static void init_initial(void) {
     s->align_self = 255;
     s->justify_self = 255;
     s->z_auto = true;
-    s->shape_margin.kind = LK_LEN;
-    s->offset.distance.kind = LK_LEN;
-    s->offset.position[0].kind = s->offset.position[1].kind = LK_NORMAL;
-    s->offset.anchor[0].kind = s->offset.anchor[1].kind = LK_AUTO;
-    s->offset.rotate.auto_rotate = true;
+    /* the groups (float_shape, offset) stay NULL: their initial records */
 }
 
 static void props_init(void) {
@@ -1446,10 +1448,42 @@ static enum css_color_slot color_slot(const struct propdef *p) {
     if (off == offsetof(style_t, svg_stop_color)) return CSS_SLOT_STOP;
     return (enum css_color_slot)(CSS_SLOT_BORDER_TOP + (off - offsetof(style_t, border_color)) / sizeof(uint32_t));
 }
+/* ---------------------------------------------------------------- the style's groups */
+/* the record that holds group g's fields in s (the initial one when s holds none) */
+static const void *group_of(const style_t *s, uint8_t g) {
+    switch (g) {
+    case G_FLOAT_SHAPE: return css_style_float_shape(s);
+    case G_OFFSET: return css_style_offset(s);
+    }
+    return s;
+}
+static size_t group_size(uint8_t g) { return g == G_FLOAT_SHAPE ? sizeof(struct css_float_shape) : sizeof(struct css_offset); }
+static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
+    return g == G_FLOAT_SHAPE ? a->float_shape == b->float_shape : a->offset == b->offset;
+}
+/* s's group g becomes a copy of value in a, for the caller to finish writing: the group s held may
+   be another style's too (box.c's copies of a style, the animation layer's copy of its base) */
+static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
+    size_t size = group_size(g);
+    void *copy = ar_alloc(a, size);
+    memcpy(copy, value, size);
+    if (g == G_FLOAT_SHAPE) s->float_shape = copy;
+    else s->offset = copy;
+    return copy;
+}
+/* every group of src, as copying each of their (uninherited) properties would */
+static void groups_copy(style_t *dst, const style_t *src) {
+    dst->float_shape = src->float_shape;
+    dst->offset = src->offset;
+}
+/* the property's field in s */
+static const void *field_of(const style_t *s, const struct propdef *p) {
+    return (const char *)group_of(s, p->group) + p->off;
+}
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
-    const void *field = (const char *)st + p->off;
+    const void *field = field_of(st, p);
     char text[32];
     switch (p->type) {
     case PT_KW: case PT_OVERFLOW: case PT_VALIGN: {
@@ -1477,7 +1511,7 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
     case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
     case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: return css_computed_value(st, p, out, d) ? 1 : -1;
     case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
-        if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(&st->offset, out, d) ? 1 : -1;
+        if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
         return 0;
     }
     return 0;
@@ -1493,9 +1527,8 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
         ident_is(v, n, "revert-layer")) return false;
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
-    if (p->type == PT_SHAPE || p->type == PT_OFFSET || (p->type == PT_SHORT && p->sh == SH_OFFSET) ||
-        p->off == offsetof(style_t, offset.distance) || p->off == offsetof(style_t, shape_margin) ||
-        p->off == offsetof(style_t, shape_image_threshold)) return css_shape_specified(p->name, v, n, out);
+    if (p->type == PT_SHAPE || p->group != G_STYLE || (p->type == PT_SHORT && p->sh == SH_OFFSET))
+        return css_shape_specified(p->name, v, n, out);
     if (p->type != PT_COLOR_SCHEME) return false;
     arena_t a = {.chunk_size = 1024};
     jmp_buf trap;
@@ -2596,7 +2629,14 @@ static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g)
     return true;
 }
 
-static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src) {
+/* src's value of p into dst; a: where dst's copy of a group goes */
+static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src, arena_t *a) {
+    if (p->group != G_STYLE) {
+        if (group_same(dst, src, p->group)) return;
+        char *own = group_write(dst, p->group, group_of(dst, p->group), a);
+        memcpy(own + p->off, field_of(src, p), p->size);
+        return;
+    }
     memcpy((char *)dst + p->off, (const char *)src + p->off, p->size);
     switch (p->type) {
     case PT_DISPLAY: dst->legacy_box = src->legacy_box; break;
@@ -2831,9 +2871,9 @@ static bool parse_transform_origin(const char *v,size_t n,struct cx *cx,len_t ou
     out[0]=r[0];out[1]=r[1];return true;
 }
 
+static bool apply_value(const struct propdef *p, const char *v, size_t n, struct cx *cx, char *field);
 static bool apply_long(const struct propdef *p, const char *v, size_t n, struct cx *cx) {
     style_t *s = cx->s;
-    char *field = (char *)s + p->off;
     const style_t *par = cx->parent ? cx->parent : &initial;
     bool colour = p->type == PT_COLOR || p->type == PT_SVG_PAINT;
     const style_t *from = ident_is(v, n, "inherit") ? par : ident_is(v, n, "initial") ? &initial :
@@ -2842,11 +2882,22 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     /* the initial colour is CanvasText, which follows color-scheme */
     if (from == &initial && colour && color_slot(p) == CSS_SLOT_COLOR) return css_color_apply("canvastext", 10, cx, CSS_SLOT_COLOR);
     if (from) {
-        copy_prop(p, s, from);
+        copy_prop(p, s, from, cx->a);
         if (colour && !cx->supports_probe) css_color_slot_copy(s, from, color_slot(p), cx->a);
         if (from == par && !p->inherited && ident_is(v, n, "inherit")) s->explicit_inherit = true;
         return true;
     }
+    if (p->group == G_STYLE) return apply_value(p, v, n, cx, (char *)s + p->off);
+    /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
+    union { struct css_float_shape float_shape; struct css_offset offset; } own;
+    memcpy(&own, group_of(s, p->group), group_size(p->group));
+    if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
+    group_write(s, p->group, &own, cx->a);
+    return true;
+}
+/* a value (not a CSS-wide keyword) of p into field, s's own or its group's copy */
+static bool apply_value(const struct propdef *p, const char *v, size_t n, struct cx *cx, char *field) {
+    style_t *s = cx->s;
     switch (p->type) {
     case PT_TRANSFORM:return parse_transform_value(v,n,cx,&s->transform);
     case PT_TRANSLATE:return parse_translate_value(v,n,cx,&s->translate);
@@ -3401,7 +3452,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         for (unsigned i = 0; i < count; i++) {
             const struct propdef *q = find_prop(names[i], strlen(names[i]));
             int at = css_prop_index(q);
-            if (!cx->set[at]) { copy_prop(q, cx->s, &temp); cx->set[at] = 1; }
+            if (!cx->set[at]) { copy_prop(q, cx->s, &temp, cx->a); cx->set[at] = 1; }
         }
         return true;
     }
@@ -3491,14 +3542,21 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_OFFSET: {
         static const char *const names[] = {"offset-position", "offset-path", "offset-distance", "offset-rotate", "offset-anchor"};
         if (global) { for (unsigned i = 0; i < 5; i++) set_long(names[i], v, n, cx); return true; }
-        style_t temp = *cx->s;
-        if (!css_offset_shorthand(v, n, cx, &temp.offset, NULL)) return false;
+        struct css_offset parsed;
+        if (!css_offset_shorthand(v, n, cx, &parsed, NULL)) return false;
         if (cx->font_pass) return true;
+        /* the longhands no more important declaration set, written into one copy of the group */
+        struct css_offset own = *css_style_offset(cx->s);
+        bool written = false;
         for (unsigned i = 0; i < 5; i++) {
             const struct propdef *q = find_prop(names[i], strlen(names[i]));
             int at = css_prop_index(q);
-            if (!cx->set[at]) { copy_prop(q, cx->s, &temp); cx->set[at] = 1; }
+            if (cx->set[at]) continue;
+            memcpy((char *)&own + q->off, (const char *)&parsed + q->off, q->size);
+            cx->set[at] = 1;
+            written = true;
         }
+        if (written) group_write(cx->s, G_OFFSET, &own, cx->a);
         return true;
     }
     case SH_OUTLINE: {
@@ -3812,7 +3870,9 @@ void css_style_init(style_t *s, const style_t *parent) {
     *s = *parent;
     s->border_radius=0; /* legacy native-only radius is not inherited */
     for (int i = 0; i < NPROPS; i++)
-        if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &initial);
+        if (props[i].type != PT_SHORT && !props[i].inherited && props[i].group == G_STYLE)
+            copy_prop(&props[i], s, &initial, NULL);
+    groups_copy(s, &initial);
     s->color_own = NULL;
     s->before = s->after = s->backdrop = s->placeholder = NULL;
     s->before_generated = s->after_generated = s->explicit_inherit = false;
@@ -3824,7 +3884,9 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
     style_t own = *s;
     css_style_init(s, from);
     for (int i = 0; i < NPROPS; i++)
-        if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &own);
+        if (props[i].type != PT_SHORT && !props[i].inherited && props[i].group == G_STYLE)
+            copy_prop(&props[i], s, &own, NULL);
+    groups_copy(s, &own);
     s->border_radius = own.border_radius;
     s->color_own = own.color_own;
     s->before = own.before; s->after = own.after; s->backdrop = own.backdrop; s->placeholder = own.placeholder;
@@ -4371,7 +4433,7 @@ static bool anim_pair_text(sbuf *b, const len_t *l, web_doc *d) {
 static bool same_text(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
 bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
     if (!st || !p || p->type == PT_SHORT) return false;
-    const char *field = (const char *)st + p->off;
+    const char *field = field_of(st, p);
     size_t begin = out->n;
     char text[64];
     bool ok = true;
@@ -4518,7 +4580,7 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
 
 bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b) {
     if (!p || p->type == PT_SHORT) return true;
-    const char *fa = (const char *)a + p->off, *fb = (const char *)b + p->off;
+    const char *fa = field_of(a, p), *fb = field_of(b, p);
     switch (p->type) {
     case PT_LEN: case PT_SVG_WIDTH: return css_length_equal((const len_t *)fa, (const len_t *)fb);
     case PT_RADIUS: case PT_BG_POS: case PT_TRANSFORM_ORIGIN: {
@@ -4622,7 +4684,7 @@ bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const s
 /* ka·a + kb·b for each value type (mode MIX), or b added / accumulated onto a */
 static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, const style_t *a, const style_t *b,
                          double ka, double kb, int mode, sbuf *out) {
-    const char *fa = (const char *)a + p->off, *fb = (const char *)b + p->off;
+    const char *fa = field_of(a, p), *fb = field_of(b, p);
     web_doc *d = c->d;
     switch (p->type) {
     case PT_LEN: case PT_SVG_WIDTH:

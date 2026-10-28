@@ -6008,10 +6008,10 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.filter=y.filter=NULL; /* effect amounts are paint-only arena borrows */
     x.clip_path=y.clip_path=NULL;memset(&x.clip,0,sizeof x.clip);memset(&y.clip,0,sizeof y.clip); /* clipping paints only */
     /* a float's shape-outside and shape-margin shape the lines beside it */
-    if(!css_shape_equal(x.shape_outside,y.shape_outside)||!css_length_equal(&x.shape_margin,&y.shape_margin))return false;
-    x.shape_outside=y.shape_outside=NULL;x.shape_margin.expr=y.shape_margin.expr=NULL;
+    if(!css_float_shape_equal(x.float_shape,y.float_shape))return false;
+    x.float_shape=y.float_shape=NULL;
     /* same_translation() saw whether there is an offset transform; where it puts the box is paint's */
-    memset(&x.offset,0,sizeof x.offset);memset(&y.offset,0,sizeof y.offset);
+    x.offset=y.offset=NULL;
     /* same_translation() decided every geometric effect of the transform
        properties; their values and arena addresses are paint state. */
     x.transform=y.transform=NULL;memset(&x.translate,0,sizeof x.translate);memset(&y.translate,0,sizeof y.translate);
@@ -6105,7 +6105,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !css_motion_equal(&a->motion, &b->motion) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
         !filters_equal(a->filter, b->filter) || !css_shape_equal(a->clip_path, b->clip_path) ||
-        !css_shape_equal(a->shape_outside, b->shape_outside) || !css_shape_equal(a->offset.path, b->offset.path) ||
+        !css_float_shape_equal(a->float_shape, b->float_shape) || !css_offset_equal(a->offset, b->offset) ||
         !transforms_equal(a->transform, b->transform) ||
         !transforms_equal(a->rotate, b->rotate) || !transforms_equal(a->scale, b->scale) ||
         !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) ||
@@ -6121,14 +6121,12 @@ static bool style_equal(const style_t *a, const style_t *b) {
                    &x.min_width, &x.max_width, &x.min_height, &x.max_height, &x.text_indent, &x.flex_basis,
                    &x.translate.xy[0], &x.translate.xy[1], &x.transform_origin[0], &x.transform_origin[1],
                    &x.bg_pos[0], &x.bg_pos[1], &x.bg_size[0], &x.bg_size[1], &x.mask_pos[0], &x.mask_pos[1],
-                   &x.mask_size[0], &x.mask_size[1], &x.shape_margin, &x.offset.distance, &x.offset.position[0],
-                   &x.offset.position[1], &x.offset.anchor[0], &x.offset.anchor[1]};
+                   &x.mask_size[0], &x.mask_size[1]};
     len_t *yl[] = {&y.object_pos[0], &y.object_pos[1], &y.line_height, &y.svg_stroke_width, &y.width, &y.height,
                    &y.min_width, &y.max_width, &y.min_height, &y.max_height, &y.text_indent, &y.flex_basis,
                    &y.translate.xy[0], &y.translate.xy[1], &y.transform_origin[0], &y.transform_origin[1],
                    &y.bg_pos[0], &y.bg_pos[1], &y.bg_size[0], &y.bg_size[1], &y.mask_pos[0], &y.mask_pos[1],
-                   &y.mask_size[0], &y.mask_size[1], &y.shape_margin, &y.offset.distance, &y.offset.position[0],
-                   &y.offset.position[1], &y.offset.anchor[0], &y.offset.anchor[1]};
+                   &y.mask_size[0], &y.mask_size[1]};
     for (size_t i = 0; i < sizeof xl / sizeof *xl; i++) {
         if (!css_length_equal(xl[i], yl[i])) return false;
         xl[i]->expr = yl[i]->expr = NULL;
@@ -6147,7 +6145,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
-    x.shape_outside = y.shape_outside = NULL; x.offset.path = y.offset.path = NULL;
+    x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; /* the groups compared above */
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
     x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;
