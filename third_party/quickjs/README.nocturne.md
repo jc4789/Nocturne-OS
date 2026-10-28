@@ -113,6 +113,44 @@ ECMA-262 の NativeFunction の形でなければならず、async や generator
 元の文の無い関数は、関数の種類によらず `function 名前() { [native code] }` の形にする。
 元の文を持つ関数（頁の台本）の結果は変えない。
 
+## WindowProxy の番号の性質
+
+HTML の「The WindowProxy exotic object」では、窓の番号 P（array index）は
+document-tree child navigables の P 番目の active WindowProxy で、
+{value, writable: false, enumerable: true, configurable: true}。番号の define と
+set は false、delete は子がある間 false、[[OwnPropertyKeys]] は 0..n-1 が先。
+ブラウザーは realm の global object を WindowProxy として使うので、global に
+この口を足した。global の類に is_exotic を立てる一般の exotic にはしない：
+global には global の変数の道（var_ref、uninitialized_vars、JS_GetGlobalVar）が
+あり、exotic にするとそこを外れる。
+
+`JS_SetGlobalIndexMethods(realm, methods)` で realm ごとに count（子の数）と
+get（番号の値、値を求めないときは有無だけ）を渡す。global object は自分の
+realm を弱い参照で持つ（`JSGlobalObject.realm`、JS_FreeContext が消す）。
+JSObject の大きさは変わらない（union 32 バイトの中、host の x86-64 で確かめた）。
+
+口は global object の番号の鍵だけに効く。足した所と原文の手続き：
+
+- `JS_GetOwnPropertyInternal`：[[GetOwnProperty]] 手順 2（自分の性質を探して
+  無かった後、atom の印のビットを試してから）。
+- `JS_GetPropertyInternal`：[[Get]]（OrdinaryGet を上の [[GetOwnProperty]] で）。
+  子が無ければ prototype へ続く。
+- `JS_HasProperty`：`JS_GetOwnPropertyInternal` を通るので変えていない。
+- `JS_SetPropertyInternal`：[[Set]] 手順 3.1。prototype の道で global に着いた所で
+  false（strict なら TypeError）。prototype の setter も受け手も見ない。
+- `JS_CreateProperty`：[[DefineOwnProperty]] 手順 2.1。データの性質は既存の
+  global の枝の中、アクセサーは類の比べ一回の後。ここだけ 2^31〜2^32-2（文字列の
+  atom）も `JS_AtomIsArrayIndex` で拒む（[[Set]] の 2^31 以上はここで止まる）。
+- `delete_property`：[[Delete]] 手順 2.1。毎回 get に有無を聞く（覚えない）。
+- `JS_GetOwnPropertyNamesInternal`：[[OwnPropertyKeys]] 手順 2〜4。count は形を
+  読む前に聞く（host が script を走らせうる）。for-in、Object.keys などはここを通る。
+
+global object は番号の自分の性質を持たない（define と set が作らない）ので、
+番号の答えを普通の自分の性質の探索より前に置かなくてよい。番号でない鍵は
+上の道で atom の印のビットの試し一回か類の比べ一回だけを足し、自分の性質が
+見つかる道は変わらない。IsPlatformObjectSameOrigin は真とみなす：別の origin の
+script は global object を直接持たず、ブラウザーの WindowProxy の Proxy を通る。
+
 ## 標本取りの問い合わせ
 
 `--debug-js` の JavaScript の時間計測（`user/libc/web/js_profile.c`）のため、

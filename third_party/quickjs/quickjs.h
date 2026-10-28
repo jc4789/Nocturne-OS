@@ -1112,6 +1112,23 @@ int JS_ThrowTypeErrorOrFalseStr(JSContext *ctx, int flags, const char *message);
    increments the context's reference count. */
 JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
 JSContext *JS_GetObjectRealm(JSContext *ctx, JSValueConst obj);
+/* HTML "The WindowProxy exotic object": the document-tree child navigables of
+   a Window realm's global object are its own properties "0" .. "n-1". 'realm'
+   owns the global object, 'ctx' is the caller's realm. Both functions may run
+   script.
+     count: n, the number of children; -1 with a pending exception.
+     get:   the value at 'index' (pvalue NULL asks only whether there is one);
+            -1 with a pending exception, FALSE when there is none, TRUE with
+            *pvalue owned by the caller.
+   With methods installed, the global object's array index keys follow the
+   WindowProxy [[GetOwnProperty]], [[DefineOwnProperty]], [[Get]], [[Set]],
+   [[Delete]] and [[OwnPropertyKeys]] (same-origin branches); its other keys
+   and all other objects are unchanged. The methods must outlive the realm. */
+typedef struct JSGlobalIndexMethods {
+    int (*count)(JSContext *ctx, JSContext *realm, uint32_t *pcount);
+    int (*get)(JSContext *ctx, JSContext *realm, uint32_t index, JSValue *pvalue);
+} JSGlobalIndexMethods;
+void JS_SetGlobalIndexMethods(JSContext *realm, const JSGlobalIndexMethods *methods);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

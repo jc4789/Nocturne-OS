@@ -301,6 +301,32 @@ static web_doc *frame_window_document(node_t *token) {
     struct web_frame *f=web_frame_find(token->owner,token);
     return f && !f->detached?f->document:NULL;
 }
+/* HTML "document-tree child navigables" of target: the frames with an active
+   Document, ordered by their containers' insertion (frames_walk's dom_order).
+   Window.length, window.frames[i] and the global object's indexed properties
+   (frame_global_index) all read them here. */
+static uint32_t frame_child_count(web_doc *target) {
+    uint32_t count=0;
+    if(!target)return 0;
+    web_js_frames_sync(target);
+    for(struct web_frame *f=target->frames;f;f=f->next)if(f->document && !f->detached)count++;
+    return count;
+}
+static node_t *frame_child_token(web_doc *target,uint32_t index) {
+    if(!target)return NULL;
+    web_js_frames_sync(target);
+    for(struct web_frame *f=target->frames;f;f=f->next)if(f->document && !f->detached){
+        uint32_t rank=0;
+        for(struct web_frame *other=target->frames;other;other=other->next)
+            if(other->document && !other->detached && other->dom_order<f->dom_order)rank++;
+        if(rank==index)return f->window_token;
+    }
+    return NULL;
+}
+/* A realm-only sandboxed Document exports no Window access to script. */
+static bool frame_scripted_access_refused(struct web_js_state *s) {
+    return !s->starting && (sandbox_authority(s)&SB_SCRIPTS);
+}
 static JSValue frame_security_error(JSContext *ctx) {
     return JS_ThrowTypeError(ctx,"SecurityError: cross-origin Window access is forbidden");
 }
@@ -560,7 +586,7 @@ static JSValue window_named_elements(struct web_js_state *s) {
 static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     struct web_js_state *caller=sandbox_actor(s);
-    if(!s->starting && (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox disallows scripted Window access");
+    if(frame_scripted_access_refused(s))return history_security_error(ctx,"Sandbox disallows scripted Window access");
     const char *op=argc?JS_ToCString(ctx,argv[0]):NULL;if(!op)return JS_EXCEPTION;
     if(!strcmp(op,"namedVersion") || !strcmp(op,"namedElements") || !strcmp(op,"namedChild") || !strcmp(op,"name")){
         if(!s->starting && (s->disabled || !s->doc->live)){
@@ -652,20 +678,12 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         if(!target || !target->live || !target->js || !target->js->ctx || !web_frame_same_origin(caller->doc,target))result=JS_NULL;
         else {JSValue global=JS_GetGlobalObject(target->js->ctx);result=JS_GetPropertyStr(ctx,global,"opener");JS_FreeValue(ctx,global);}
     }
-    else if(!strcmp(op,"length") || !strcmp(op,"index")) {
-        unsigned count=0;uint32_t index=0;
-        if(!strcmp(op,"index") && (argc<3 || JS_ToUint32(ctx,&index,argv[2]))) {result=JS_EXCEPTION;goto out;}
-        result=!strcmp(op,"index")?JS_UNDEFINED:JS_NewInt32(ctx,0);
-        if(target){
-            web_js_frames_sync(target);
-            for(struct web_frame *f=target->frames;f;f=f->next)if(f->document && !f->detached){
-                unsigned rank=0;
-                for(struct web_frame *other=target->frames;other;other=other->next)
-                    if(other->document && !other->detached && other->dom_order<f->dom_order)rank++;
-                if(!strcmp(op,"index") && rank==index){result=wrap(s,f->window_token);break;}count++;
-            }
-        }
-        if(!strcmp(op,"length"))result=JS_NewUint32(ctx,count);
+    else if(!strcmp(op,"length"))result=JS_NewUint32(ctx,frame_child_count(target));
+    else if(!strcmp(op,"index")) {
+        uint32_t index=0;
+        if(argc<3 || JS_ToUint32(ctx,&index,argv[2])) {result=JS_EXCEPTION;goto out;}
+        node_t *child=frame_child_token(target,index);
+        result=child?wrap(s,child):JS_UNDEFINED;
     }else if(!strcmp(op,"frameElement"))result=target && target->frame_parent && web_frame_same_origin(caller->doc,target->frame_parent)?wrap(s,target->frame_element):JS_NULL;
     else if(!strcmp(op,"navigate")) {
         if(!task_context_active(s) || !frame_navigation_authorized(caller,target)){
@@ -763,6 +781,41 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
     }
 out:JS_FreeCString(ctx,op);return result;
 }
+/* HTML "The WindowProxy exotic object": the realm's global object answers its
+   array index keys with its document-tree child navigables (quickjs.c's
+   JS_SetGlobalIndexMethods; the global object is the realm's WindowProxy). The
+   value is the child's WindowProxy that window.frames[i] and contentWindow
+   give: frameBridge.windowProxy for the child's token, created once. The
+   global object is same-origin with the script holding it: cross-origin
+   script reaches a Window only through frameBridge's guarded proxies. */
+static struct web_js_state *frame_global_state(JSContext *realm,int *status) {
+    struct web_js_state *s=state(realm);
+    *status=0;
+    if(!s || !s->ctx || s->disabled || !JS_IsObject(s->hooks))return NULL;
+    if(frame_scripted_access_refused(s)){
+        history_security_error(realm,"Sandbox disallows scripted Window access");*status=-1;return NULL;
+    }
+    return s;
+}
+static int frame_global_index_count(JSContext *ctx,JSContext *realm,uint32_t *count) {
+    int status;struct web_js_state *s=frame_global_state(realm,&status);
+    *count=s?frame_child_count(s->doc):0;
+    return status;
+}
+static int frame_global_index_get(JSContext *ctx,JSContext *realm,uint32_t index,JSValue *value) {
+    int status;struct web_js_state *s=frame_global_state(realm,&status);
+    node_t *child=s?frame_child_token(s->doc,index):NULL;
+    if(!child)return status;
+    if(!value)return 1;
+    JSValue token=wrap(s,child);
+    if(JS_IsException(token))return -1;
+    JSValue proxy=custom_element_hook(s,"frameWindowProxy",1,&token);
+    JS_FreeValue(s->ctx,token);
+    if(JS_IsException(proxy))return -1;
+    if(!JS_IsObject(proxy)){JS_FreeValue(s->ctx,proxy);return 0;}
+    *value=proxy;return 1;
+}
+static const JSGlobalIndexMethods frame_global_index={frame_global_index_count,frame_global_index_get};
 static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);int32_t operation=0;
     if(argc && JS_ToInt32(ctx,&operation,argv[0]))return JS_EXCEPTION;
