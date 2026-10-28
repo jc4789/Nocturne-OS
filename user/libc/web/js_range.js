@@ -187,6 +187,9 @@ const rangeBridge = (() => {
         const fragment=extract(d);
         for(const c of children(n))dom('remove',c);
         insertRange(d,n);
+        /* "Append fragment to newParent" is a pre-insert: a newParent that cannot have children
+           (a Text node, say) throws HierarchyRequestError here, after the steps before it ran. */
+        insertionValidity(n,fragment,null);
         dom('insert',n,fragment,null);
         const p=parent(n),index=children(p).indexOf(n);
         d.start=[p,index];d.end=[p,index+1];changed(d);
