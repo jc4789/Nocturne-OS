@@ -186,9 +186,6 @@ for path in pages:
         elif "var(" in value:
             skipped["var()"] = skipped.get("var()", 0) + 1
             continue  # the CSSOM keeps a value with var() as written: not the colour owner's
-        elif value.strip().lower() in ("inherit", "initial", "unset", "revert", "revert-layer"):
-            skipped["CSS 全体の語"] = skipped.get("CSS 全体の語", 0) + 1
-            continue  # the CSSOM keeps them as written: not the colour owner's
         else:
             request = ("S", prop, value)
         cases.append((path.name, kind, prop, value, request, None if kind == "invalid" else args[2],

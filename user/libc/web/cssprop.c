@@ -1498,6 +1498,9 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return false;
     trim(&v, &n);
+    /* a CSS-wide keyword serializes as itself */
+    if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
+        ident_is(v, n, "revert-layer")) return false;
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
     if (p->type != PT_COLOR_SCHEME) return false;
     arena_t a = {.chunk_size = 1024};
@@ -2594,9 +2597,12 @@ static bool motion_item_parse(int list, const struct kw *kws, const char *s, siz
     case ML_NAME:
         if (ident_is(s, n, "none")) { out->s = NULL; return true; }
         if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) {
+            /* <keyframes-name>: a <string>, not the empty one */
             sbuf b = {0}; css_unescape(&b, s + 1, n - 2);
-            out->s = ar_strdup(cx->a, b.n ? sb_cstr(&b) : ""); sb_free(&b);
-            return true;
+            bool named = b.n != 0;
+            if (named) out->s = ar_strdup(cx->a, sb_cstr(&b));
+            sb_free(&b);
+            return named;
         }
         if (!motion_name(s, n)) return false;
         out->s = ar_strndup(cx->a, s, n);

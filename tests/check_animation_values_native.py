@@ -177,6 +177,7 @@ int main(void){
     EXPECT(computed("animation-duration","auto"),"auto");
     EXPECT(computed("animation-iteration-count","infinite, 2.5"),"infinite, 2.5");
     EXPECT(computed("animation-name","none, foo, \"bar baz\""),"none, foo, \"bar baz\"");
+    EXPECT(computed("animation-name","\"\""),"PARSE"); /* parsing/animation-name-invalid.html */
     EXPECT(computed("animation-delay","-1s"),"-1s");
     EXPECT(computed("animation-direction","alternate-reverse, normal"),"alternate-reverse, normal");
     EXPECT(computed("animation-fill-mode","both"),"both");

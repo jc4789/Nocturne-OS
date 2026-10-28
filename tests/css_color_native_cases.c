@@ -136,9 +136,15 @@ static bool canvas(char *rest, sbuf *out) {
     ar_free(&a);
     return ok;
 }
+/* what CSSStyleDeclaration returns (js.c's css_style_value): the table's serialization, else the
+   authored text of a valid value (a CSS-wide keyword stays as written) */
 static bool specified(char *rest, sbuf *out) {
     const char *property = field(&rest);
-    return css_specified_longhand(property, rest, strlen(rest), out);
+    if (css_specified_longhand(property, rest, strlen(rest), out)) return true;
+    const struct propdef *p = css_prop_lookup(property, strlen(property));
+    if (!p || !css_value_valid(p, rest, strlen(rest))) return false;
+    sb_puts(out, rest);
+    return true;
 }
 int main(int argc, char **argv) {
     static char line[1 << 16];
