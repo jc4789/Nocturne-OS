@@ -238,6 +238,8 @@ static const char *const round_names[] = {"nearest", "up", "down", "to-zero"};
 struct cm {
     uint8_t op, type, fn, n;
     uint8_t key;     /* MN_KEY: the channel 0..3; MF_ROUND: the strategy */
+    bool hint;       /* a percentage made it though its type is not one (sign(), §10.9's percent hint):
+                        valid only where percentages are */
     char unit[7];    /* MN_LEAF: "" number, "%" percentage, else a lowercase unit */
     double v;
     struct cm **k;
@@ -425,6 +427,7 @@ static struct cm *m_simplify(struct pctx *P, struct cm *m) {
                     if (m_free(m->k[q]) && m_same_unit(m->k[i], m->k[q])) {
                         bool r = true;
                         m->k[i]->v = leaf_value(m->k[i], NULL, &r) + leaf_value(m->k[q], NULL, &r);
+                        m->k[i]->hint |= m->k[q]->hint;
                         if (m->k[i]->type == MT_LEN) strcpy(m->k[i]->unit, "px");
                         if (m->k[i]->type == MT_ANGLE) strcpy(m->k[i]->unit, "deg");
                         memmove(&m->k[q], &m->k[q + 1], (m->n - q - 1) * sizeof *m->k);
@@ -574,7 +577,10 @@ static struct cm *m_function(struct pctx *P, const struct tok *t, bool *calc) {
     case MF_ABS: m->type = t0; break;
     case MF_SIGN: m->type = MT_NUM; break;
     }
+    bool hint = fn == MF_SIGN && t0 == MT_PCT;
+    for (unsigned i = 0; i < n; i++) hint |= args[i]->hint;
     result = m_simplify(P, m);
+    if (result) result->hint |= hint;
 done:
     P->in_math = outer;
     P->depth--;
@@ -638,6 +644,7 @@ static struct cm *m_product(struct pctx *P, const struct tok *t, int n) {
             if (!inv) return NULL;
             inv->k[0] = v;
             inv->type = v->type;
+            inv->hint = v->hint;
             items[k++] = m_simplify(P, inv);
         } else items[k++] = v;
     }
@@ -660,7 +667,11 @@ static struct cm *m_product(struct pctx *P, const struct tok *t, int n) {
     if (!m) return NULL;
     memcpy(m->k, items, k * sizeof *items);
     m->type = type;
-    return m_simplify(P, m);
+    bool hint = false;
+    for (unsigned i = 0; i < k; i++) hint |= items[i]->hint;
+    struct cm *r = m_simplify(P, m);
+    if (r) r->hint |= hint;
+    return r;
 }
 static struct cm *m_sum(struct pctx *P, const struct tok *t, int n) {
     struct cm *items[64];
@@ -681,6 +692,7 @@ static struct cm *m_sum(struct pctx *P, const struct tok *t, int n) {
             if (!neg) return NULL;
             neg->k[0] = v;
             neg->type = v->type;
+            neg->hint = v->hint;
             v = m_simplify(P, neg);
         }
         if (k && v->type != items[0]->type) return NULL;
@@ -693,7 +705,11 @@ static struct cm *m_sum(struct pctx *P, const struct tok *t, int n) {
     if (!m) return NULL;
     memcpy(m->k, items, k * sizeof *items);
     m->type = items[0]->type;
-    return m_simplify(P, m);
+    bool hint = false;
+    for (unsigned i = 0; i < k; i++) hint |= items[i]->hint;
+    struct cm *r = m_simplify(P, m);
+    if (r) r->hint |= hint;
+    return r;
 }
 /* a copy of m with lengths of the element in pixels, simplified again */
 static struct cm *m_bind(struct pctx *P, const struct cm *m, const struct cx *cx) {
@@ -1079,7 +1095,7 @@ static bool parse_chan(struct pctx *P, const struct tok *t, unsigned types, bool
         if (!(m = m_function(P, t, &calc))) return false;
         c->wrapped = m->op != MN_FN; /* serialized inside calc() */
     } else if (!(m = m_value(P, t))) return false;
-    if (!(types & 1u << m->type)) return false;
+    if (!(types & 1u << m->type) || (m->hint && !(types & 1u << MT_PCT))) return false;
     c->kind = CH_MATH;
     c->type = m->type;
     c->m = m;
