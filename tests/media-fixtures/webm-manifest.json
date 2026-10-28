@@ -389,6 +389,38 @@
           "pix_fmt": "yuv420p"
         }
       ]
+    },
+    {
+      "path": "opus-clusters.webm",
+      "bytes": 8401,
+      "sha256": "5b9535874b0acaab1ad2f25019dba53f0e4302caf0ea394dc00fbf8ef4e7cfea",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.4",
+        "-c:a",
+        "libopus",
+        "-application",
+        "audio",
+        "-b:a",
+        "96k",
+        "-cluster_time_limit",
+        "100"
+      ],
+      "streams": [
+        {
+          "codec_name": "opus",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 19200
     }
   ]
 }

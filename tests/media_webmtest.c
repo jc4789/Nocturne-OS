@@ -1,6 +1,7 @@
 /* Real WebM/Ogg compressed inputs, including Opus SILK and CELT paths.
  * The host-reference frame totals are recorded in webm-manifest.json. */
 #include "media.h"
+#include "media_mse_private.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +67,27 @@ static void decode(const struct fixture *fixture,bool memory){
     CHECK(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO);CHECK(out.pts_ms>=-20&&out.pts_ms<=20);
     nmedia_close(m);
 }
+/* MSE reads each cluster with its own demuxer. Opus pre-skip belongs to the
+ * track start only: every later cluster continues the PCM without a hole
+ * (a hole became 7 ms of silence every YouTube segment). */
+static void mse_clusters(void){
+    size_t n=0;uint8_t *p=read_fixture("opus-clusters.webm",&n);if(!p)return;
+    char error[160];nmedia_mse *m=nmedia_mse_create("audio/webm; codecs=opus",error,sizeof error);CHECK(m!=NULL);
+    if(m){
+        CHECK(nmedia_mse_append(m,p,n,0,0,INT64_MAX,false));CHECK(nmedia_mse_end(m,true));
+        int frames=0,holes=0,r=NMEDIA_AGAIN;int64_t end=INT64_MIN;struct nmedia_output out;
+        for(int budget=0;budget<2000;budget++){
+            r=nmedia_mse_step(m,&out);if(r==NMEDIA_END||r==NMEDIA_ERROR)break;if(r!=NMEDIA_AUDIO)continue;
+            if(!frames)CHECK(out.pts_ms==0);
+            if(end!=INT64_MIN&&out.pts_ms>end+1)holes++;
+            end=out.pts_ms+(int64_t)out.frames*1000/48000;frames+=(int)out.frames;
+        }
+        if(r==NMEDIA_ERROR)printf("WEBM_MSE_ERROR %s\n",nmedia_mse_error(m));
+        CHECK(r==NMEDIA_END);CHECK(holes==0);CHECK(frames==19200);
+        printf("WEBM_MSE opus-clusters audio_frames=%d holes=%d\n",frames,holes);nmedia_mse_close(m);
+    }
+    free(p);
+}
 static void reject(const char *name){
     char path[256],error[160];snprintf(path,sizeof path,"C:\\Tests\\media-fixtures\\%s",name);
     nmedia *m=nmedia_open(path,error,sizeof error);bool rejected=!m;
@@ -96,7 +118,7 @@ static void capabilities(void){
 }
 int main(void){
     for(size_t i=0;i<sizeof fixtures/sizeof *fixtures;i++){decode(&fixtures[i],false);decode(&fixtures[i],true);}
-    reject("unsupported-av1.webm");
+    reject("unsupported-av1.webm");mse_clusters();
     size_t n=0;uint8_t *p=read_fixture("vp9-opus.webm",&n);if(p){char error[160];CHECK(nmedia_open_memory(p,16,error,sizeof error)==NULL);free(p);}
     capabilities();printf("media_webmtest: %d checks, %d failed\n",checks,failed);return failed!=0;
 }

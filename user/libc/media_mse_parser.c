@@ -618,7 +618,7 @@ static int webm_boundary(struct parser *p, bool have_init, bool eos, size_t *ini
         if (!e.end) return *init_end ? 1 : more(p, eos);
         at = e.end;
     }
-    if (eos && at && have_init) { *segment_end = at; return 1; }
+    if (eos && at && have_init) { *segment_end = at; return NMEDIA_MSE_PARSE_METADATA; }
     return *init_end ? 1 : more(p, eos);
 }
 int nmedia_mse_boundary_sizes(const uint8_t *bytes, size_t length, bool webm,

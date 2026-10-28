@@ -8,6 +8,9 @@
 /* No I/O, FFmpeg state, or mutation of bytes. Demand-sized temporary traversal
  * and run arrays use the media allocator and are released on every return. All offsets are
  * relative to bytes. 1 publishes a complete initialization/media span,
+ * NMEDIA_MSE_PARSE_METADATA publishes a segment_end span of WebM metadata only
+ * (Cues, Chapters, Tags, SeekHead, Void after the last Cluster at EOS) that
+ * the caller consumes without demuxing, as engines skip those elements,
  * 0 needs more bytes, -1 is a permanent append error, and
  * NMEDIA_MSE_PARSE_MEMORY is an actual allocation/metadata size failure. An init-only result
  * has init_end > 0 and segment_end == 0; otherwise segment_end includes any
@@ -18,6 +21,7 @@
  * Unknown-size WebM Clusters wait for the next Cluster/init header or EOS.
  * The caller owns staging allocation and checks its size_t/AVIO arithmetic. */
 #define NMEDIA_MSE_PARSE_MEMORY (-2)
+#define NMEDIA_MSE_PARSE_METADATA 2
 struct nmedia_mse_track_size {uint32_t track_id,sample_size,sample_duration;};
 struct nmedia_mse_sample_time {size_t offset;uint32_t track_id,duration;};
 /* Sorted immutable trex defaults extracted once per validated init. The caller

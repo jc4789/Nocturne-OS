@@ -14,6 +14,7 @@
 #include <errno.h>
 #include "libavutil/dict.h"
 #include "libavutil/encryption_info.h"
+#include "libavutil/intreadwrite.h"
 #include <bearssl_block.h>
 
 struct mse_configuration {
@@ -297,6 +298,14 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
         if(stream->codecpar->codec_type!=AVMEDIA_TYPE_AUDIO&&!video){av_packet_unref(packet);continue;}
         int64_t stamp=packet->pts==AV_NOPTS_VALUE?packet->dts:packet->pts;
         if(stamp==AV_NOPTS_VALUE){bad(m,"MSE packet has no timestamp",false);goto done;}
+        /* Every append is read by a fresh demuxer, and matroska marks the
+         * first packet it reads as the track start (CodecDelay as samples to
+         * skip). Pre-skip belongs only to the real start, whose timestamp the
+         * codec delay makes negative; repeating it cut 6.5 ms from the head
+         * of every Opus segment, which the sink then filled with silence. A
+         * block's own end trim (DiscardPadding) stays. */
+        size_t skip_size=0;uint8_t *skip=m->webm&&stamp>=0?av_packet_get_side_data(packet,AV_PKT_DATA_SKIP_SAMPLES,&skip_size):NULL;
+        if(skip&&skip_size>=10){AV_WL32(skip,0);if(!AV_RL32(skip+4))av_packet_side_data_remove(packet->side_data,&packet->side_data_elems,AV_PKT_DATA_SKIP_SAMPLES);}
         int64_t pts=av_rescale_q(stamp,stream->time_base,(AVRational){1,1000});
         if(pts< -1000000000000LL||pts>1000000000000LL){bad(m,"MSE timestamp outside supported range",false);goto done;}
         if(first==INT64_MIN){first=pts;if(sequence)shift=(m->sequence_group?m->sequence_start:m->end_ms)-pts;}
@@ -373,6 +382,7 @@ static bool process(nmedia_mse *m,int64_t offset,int64_t window0,int64_t window1
             m->init_duration=nmedia_mse_init_duration(m->init,m->init_size,m->webm);
             memmove(m->staging,m->staging+init,m->staged-init);m->staged-=init;continue;}
         if(!end||end>m->staged)return bad(m,"invalid MSE parser boundary",false);
+        if(r==NMEDIA_MSE_PARSE_METADATA){memmove(m->staging,m->staging+end,m->staged-end);m->staged-=end;continue;}
         /* Replace staged encoded bytes with packet references transactionally.
          * They are not simultaneously counted twice against the input quota. */
         size_t staged=m->staged;m->staged-=end;
