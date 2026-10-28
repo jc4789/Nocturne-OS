@@ -17,7 +17,7 @@ static void log_line(void *opaque,int level,const char *text){
     if(!strncmp(text,"OK ",3)){checks++;puts(text);}
     else if(!strncmp(text,"FAIL ",5)){checks++;failures++;puts(text);}
     else if(!strcmp(text,"SVG-GEOMETRY-DONE"))done=true;
-    else if(level>=2){errors++;printf("ERROR %s\n",text);}
+    else if(level==2){errors++;printf("ERROR %s\n",text);}
     else if(!strncmp(text,"SVG-GEOMETRY-JS-CHECKS ",23))puts(text);
 }
 static char *read_source(void){

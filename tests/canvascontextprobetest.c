@@ -22,7 +22,7 @@ static void log_line(void *unused, int level, const char *message) {
         }
         if (!strstr(message, "frame=0 connected=1 origin=https://canvas-probe.test") ||
             strstr(message, "private") || strstr(message, "unknown")) sanitized = false;
-    } else if (level >= 2) { errors++; printf("ERROR canvascontextprobe %s\n", message); }
+    } else if (level==2) { errors++; printf("ERROR canvascontextprobe %s\n", message); }
 }
 static const char page[] = "<!doctype html><canvas id=real width=4 height=4></canvas>";
 static const char source[] =

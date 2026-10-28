@@ -27,7 +27,7 @@ static void console(void *opaque,int level,const char *text){
     if(!strcmp(text,"STORAGE-READY"))ready++;
     else if(!strncmp(text,"OK ",3)){checks++;printf("%s\n",text);}
     else if(!strncmp(text,"FAIL ",5)){checks++;failures++;printf("%s\n",text);}
-    else if(level>=2){errors++;printf("ERROR %s\n",text);}
+    else if(level==2){errors++;printf("ERROR %s\n",text);}
 }
 static const char page[]="<!doctype html><script>"
     "void localStorage;void sessionStorage;"

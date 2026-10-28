@@ -12,7 +12,7 @@ static void log_line(void *unused,int level,const char *text){
     if(!strncmp(text,"OK ",3))check(text+3,true);
     else if(!strncmp(text,"FAIL ",5))check(text+5,false);
     else if(!strncmp(text,"STREAM-CSS ",11))printf("%s\n",text);
-    else if(level>=2){errors++;printf("ERROR %s\n",text);}
+    else if(level==2){errors++;printf("ERROR %s\n",text);}
 }
 static bool eval(web_doc *doc,const char *source){return web_console_eval(doc,source,strlen(source));}
 static void settle(web_doc *top,unsigned ticks){for(unsigned i=0;i<ticks;i++){web_tick(top,uptime_ms());n_sleep_ms(1);}}

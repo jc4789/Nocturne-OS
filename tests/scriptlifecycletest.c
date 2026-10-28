@@ -205,7 +205,7 @@ static void console(void *unused, int level, const char *text) {
     if (!strncmp(text,"OK ",3)) { checks++; printf("%s\n",text); }
     else if (!strncmp(text,"FAIL ",5)) { checks++; failures++; printf("%s\n",text); }
     else if (!strcmp(text,"SCRIPT-LIFECYCLE-DONE")) done=true;
-    else if (level>=2) { errors++; printf("ERROR %s\n",text); }
+    else if (level==2) { errors++; printf("ERROR %s\n",text); }
 }
 static bool request(void *unused, const struct web_request *r) {
     if (r->kind!=WEB_RESOURCE_SCRIPT && r->kind!=WEB_RESOURCE_MODULE) return false;

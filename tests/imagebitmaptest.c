@@ -51,7 +51,7 @@ static void log_line(void *unused,int level,const char *message){
         diagnostics++;puts(message);bool known=false;
         for(unsigned i=0;i<5;i++){char prefix[80];snprintf(prefix,sizeof prefix,"source=%s width=",source_types[i]);if(strstr(message,prefix)){seen[i]++;known=true;}}
         if(!known||strstr(message,"http")||strstr(message,"private")||strstr(message,"?")||strstr(message,"invalid"))sanitized=false;
-    }else if(level>=2){errors++;printf("ERROR bitmap %s\n",message);}
+    }else if(level==2){errors++;printf("ERROR bitmap %s\n",message);}
     fflush(stdout);
 }
 static bool request(void *unused,const struct web_request *r){

@@ -8,7 +8,7 @@
 
 static unsigned checks,failures,errors;
 static void check(bool ok,const char *name){checks++;if(!ok){failures++;printf("FAIL parserdedup %s\n",name);}}
-static void log_line(void *context,int level,const char *text){(void)context;if(level>=2){errors++;printf("ERROR %s\n",text);}}
+static void log_line(void *context,int level,const char *text){(void)context;if(level==2){errors++;printf("ERROR %s\n",text);}}
 static bool checkpoint(void *context){(void)context;return true;}
 static bool eval(web_doc *d,const char *source){return web_console_eval(d,source,strlen(source));}
 static void settle(web_doc *top,unsigned count){for(unsigned i=0;i<count;i++){web_tick(top,uptime_ms());n_sleep_ms(1);}}

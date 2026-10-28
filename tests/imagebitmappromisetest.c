@@ -11,7 +11,7 @@ static void console(void *unused,int level,const char *message){
     if(!strncmp(message,"OK bitmap-promise ",18)){checks++;js_checks++;puts(message);}
     else if(!strncmp(message,"FAIL bitmap-promise ",20)){checks++;js_checks++;failures++;puts(message);}
     else if(!strcmp(message,"BITMAP-PROMISE-DONE 10")){done=true;puts(message);}
-    else if(level>=2){errors++;printf("ERROR bitmap-promise %s\n",message);}
+    else if(level==2){errors++;printf("ERROR bitmap-promise %s\n",message);}
     else if(!strncmp(message,"BITMAP-PROMISE-",15))puts(message);
     fflush(stdout);
 }

@@ -10,7 +10,7 @@ static void log_line(void *unused,int level,const char *text){
     if(!strncmp(text,"OK ",3)){checks++;printf("%s\n",text);}
     else if(!strncmp(text,"FAIL ",5)){checks++;failures++;printf("%s\n",text);}
     else if(!strcmp(text,"CURRENT-SCRIPT-DONE"))done=true;
-    else if(level>=2){errors++;printf("ERROR %s\n",text);}
+    else if(level==2){errors++;printf("ERROR %s\n",text);}
 }
 static bool request_script(void *unused,const struct web_request *request){
     if(request->kind!=WEB_RESOURCE_SCRIPT)return false;

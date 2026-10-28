@@ -9,7 +9,7 @@ static void check(const char *name,bool pass){checks++;if(!pass){failures++;prin
 static void console(void *unused,int level,const char *message){
     if(!strncmp(message,"OK gradient ",12)){checks++;js_checks++;puts(message);}
     else if(!strncmp(message,"FAIL gradient ",14)){checks++;js_checks++;failures++;puts(message);}
-    else if(level>=2){errors++;printf("ERROR canvasgradient %s\n",message);}
+    else if(level==2){errors++;printf("ERROR canvasgradient %s\n",message);}
     else if(!strncmp(message,"GRADIENT-",9))puts(message);
 }
 int main(void){

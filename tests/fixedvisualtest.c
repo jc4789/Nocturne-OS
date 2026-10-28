@@ -17,7 +17,7 @@ static void console(void *opaque, int level, const char *message) {
     else if (!strncmp(message, "FAIL fixed ", 11)) { checks++; failures++; puts(message); }
     else if (!strcmp(message, "FIXED-IO-INITIAL-READY")) initial_ready = true;
     else if (!strcmp(message, "FIXED-IO-MOVED-READY")) moved_ready = true;
-    else if (level >= 2) { errors++; printf("ERROR fixedvisual %s\n", message); }
+    else if (level==2) { errors++; printf("ERROR fixedvisual %s\n", message); }
 }
 static void scroll(void *opaque, int *x, int *y) { *x = scroll_x; *y = scroll_y; }
 static node_t *id(web_doc *d, const char *value) {

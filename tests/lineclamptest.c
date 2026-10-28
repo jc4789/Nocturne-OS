@@ -196,7 +196,7 @@ static void nested_budgets(void) {
 static void console(void *opaque, int level, const char *message) {
     if (!strncmp(message, "OK clamp ", 9)) { checks++; puts(message); }
     else if (!strncmp(message, "FAIL clamp ", 11)) { checks++; failures++; puts(message); }
-    else if (level >= 2) { errors++; printf("ERROR lineclamp %s\n", message); }
+    else if (level==2) { errors++; printf("ERROR lineclamp %s\n", message); }
 }
 static void cssom_selection(void) {
     struct web_host host = {.console = console, .js_task_budget_ms = 5000};

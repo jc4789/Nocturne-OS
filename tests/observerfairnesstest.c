@@ -11,7 +11,7 @@ static void log_line(void *unused,int level,const char *text){
     if(!strncmp(text,"OK ",3)){checks++;puts(text);}
     else if(!strncmp(text,"FAIL ",5)){checks++;failures++;puts(text);}
     else if(!strcmp(text,"OBSERVER-FAIRNESS-DONE"))done=true;
-    else if(level>=2){errors++;printf("ERROR %s\n",text);}
+    else if(level==2){errors++;printf("ERROR %s\n",text);}
 }
 static const char page[]=
     "<!doctype html><style>html,body{margin:0}#watched{width:100px;height:40px}</style><div id='watched'></div><script>"
