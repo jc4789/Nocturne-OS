@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'caretPosition', 'caretRect', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'move', 'moveStatus', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rangeRects', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleBlock', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -18,7 +18,7 @@
     function dom(op, ...args) {
         const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'replace' || op === 'replaceAll' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
             (op === 'attrNS' && args.length > 3) ||
-            ((op === 'attr' || op === 'style') && args.length > 2);
+            ((op === 'attr' || op === 'style') && args.length > 2) || (op === 'styleBlock' && args.length > 1);
         return mutation && customElementsReady && customElementsBridge.active() ? customElementsBridge.reactions(() => domOperations[op](...args)) : domOperations[op](...args);
     }
     // IDL reflection always addresses the null namespace; getAttribute remains
@@ -28,10 +28,11 @@
     }
     const apply = Reflect.apply;
     const eventSlice = Array.prototype.slice, mouseAssign = Object.assign;
+    // Dispatch reads the listener lists through these, never through what a page can replace.
+    const mapGet=WeakMap.prototype.get,mapSet=WeakMap.prototype.set,mapDelete=WeakMap.prototype.delete,EventTypeError=TypeError;
     const listenerMap = new WeakMap(), inlineMap = new WeakMap();
     const inputWindow=globalThis;
     const handlerMap = new WeakMap();
-    const eventPaths = new WeakMap();
     let xhrHandlerTarget = () => false;
     let messageHandlerTarget = () => false;
     let svgHandlerTarget = () => false;
@@ -46,7 +47,10 @@
     let presentationHandlerTarget = () => false;
     let textTrackHandlerTarget = () => false;
     let audioHandlerTarget = () => false;
-    const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
+    let viewportHandlerTarget = () => false;
+    let fontHandlerTarget = () => false;
+    let animationHandlerTarget = () => false;
+    const globalHandlerTypes = new Set(('abort animationcancel animationend animationiteration animationstart beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle transitioncancel transitionend transitionrun transitionstart wheel').split(' '));
     const windowHandlerTypes = new Set(('afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pageswap pagehide pagereveal pageshow popstate rejectionhandled storage unhandledrejection unload').split(' '));
     const bodyWindowTypes=new Set([...windowHandlerTypes,'blur','error','focus','load','resize','scroll']);
     // HTML: event handler IDL attributes of Document objects only, with no content attribute
@@ -57,11 +61,58 @@
     const state = new WeakMap();
     /* @include js_collections.js */
     function list(a) { return collectionBridge.list(a); }
-    function options(o) { return typeof o === 'boolean' ? {capture:o} : (o || {}); }
-    // Preserve Error identity for native task context/source diagnostics. The
-    // native logger reads only an own stack data property, never a stack getter.
-    function report(e) { host.log(2, e); }
-    const eventStates=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set,eventDefine=Object.defineProperty;
+    // HTML "report an exception" for what a callback threw (js.c report_exception): an ErrorEvent at
+    // this global, then the console unless a listener canceled it. The native side reads only an own
+    // stack data property, never a stack getter. errorReporting is the global's errors reporting
+    // mode: an error listener's own exception goes to the console alone.
+    function report(e) { host.reportException(e); }
+    // This Window's current event (DOM "Legacy extensions to the Window interface"): window.event.
+    let currentEvent;
+    /* The steps of DOM "inner invoke" (https://dom.spec.whatwg.org/#concept-event-listener-inner-invoke)
+       that belong to the realm of the listener's callback, run in that realm. This function is
+       the realm's port (js.c native_event_realm_init): a dispatch in any realm of the runtime
+       calls the port of the realm its listener's callback belongs to, which it learned when the
+       listener was added. Steps 2.9 and 2.10: save this Window's current event, and set it to
+       the event unless the invocation target is in a shadow tree (setCurrent). Step 2.13, Web
+       IDL "call a user object's operation" with "handleEvent": a function is called with the
+       event's currentTarget as this; any other object's handleEvent is got now, at every
+       dispatch, and called with the object as this. So the Get, the TypeError for a handleEvent
+       that is not callable and the call all happen in this realm. Step 2.13.1 reports what the
+       callback threw for this realm's global, while the current event is still set; step 2.15
+       restores it. The in passive listener flag (steps 2.11 and 2.14) is the dispatching
+       realm's, set around this call; step 2.12 (record timing info, Event Timing) is not
+       implemented. Returns whether the callback threw (step 2.13.2, the
+       legacyOutputDidListenersThrowFlag IndexedDB reads). */
+    function invokeListener(callback,thisArg,event,setCurrent) {
+        const saved=currentEvent;
+        if(setCurrent)currentEvent=event;
+        try {
+            if(typeof callback==='function')apply(callback,thisArg,[event]);
+            else {
+                const operation=callback.handleEvent;
+                if(typeof operation!=='function')throw new EventTypeError('The event listener has no callable handleEvent');
+                apply(operation,callback,[event]);
+            }
+            return false;
+        } catch(e) { report(e); return true; }
+        finally { currentEvent=saved; }
+    }
+    let errorReporting=false;
+    function reportException(error,message,filename,lineno,colno,muted) {
+        if(errorReporting)return true;
+        errorReporting=true;
+        try {
+            const event=new ErrorEvent('error',muted?{message:'Script error.',error:null,cancelable:true}:
+                {message,filename,lineno,colno,error,cancelable:true});
+            eventState(event).isTrusted=true;
+            return dispatch(globalThis,event);
+        } finally { errorReporting=false; }
+    }
+    /* Event state: one table for every realm of this runtime (js.c native_event_realm_init), so that
+       an Event made in one frame dispatches, and is read, in another (Web IDL brands an Event by its
+       interface, not its realm). */
+    const eventStates=host.eventRealmInit(invokeListener,new WeakMap()),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set,eventDefine=Object.defineProperty,
+        ownProperty=Object.prototype.hasOwnProperty;
     const eventFields=new Set(['type','target','srcElement','currentTarget','eventPhase','bubbles','cancelable','composed','defaultPrevented','isTrusted','timeStamp']);
     function eventState(event){const state=apply(eventGet,eventStates,[event]);if(!state)throw new TypeError('Illegal Event receiver');return state;}
     class Event {
@@ -70,7 +121,7 @@
             type=String(type);init=init==null?{}:Object(init);
             apply(eventSet,eventStates,[this,{type,bubbles:!!init.bubbles,cancelable:!!init.cancelable,composed:!!init.composed,
                 target:null,currentTarget:null,eventPhase:0,defaultPrevented:false,isTrusted:false,timeStamp:host.now(),
-                stop:false,immediate:false,passive:false,dispatching:false,initialized:true}]);
+                stop:false,immediate:false,passive:false,dispatching:false,initialized:true,listenerException:false,path:null}]);
             eventDefine(this,'isTrusted',{enumerable:true,get(){return eventState(this).isTrusted;}});
         }
         initEvent(type,bubbles=false,cancelable=false) {
@@ -83,7 +134,7 @@
         preventDefault() { const s=eventState(this);if(s.cancelable && !s.passive)s.defaultPrevented=true; }
         stopPropagation() { eventState(this).stop=true; }
         stopImmediatePropagation() { const s=eventState(this);s.stop=s.immediate=true; }
-        composedPath() { return apply(eventSlice,eventPaths.get(this)||[],[]); }
+        composedPath() { const path=eventState(this).path;return path?copyList(path):[]; }
         get cancelBubble() { return eventState(this).stop; }
         set cancelBubble(v) { if (v) this.stopPropagation(); }
         get returnValue() { return !eventState(this).defaultPrevented; }
@@ -97,14 +148,8 @@
     /* @include js_error_event.js */
     /* @include js_promise_rejection.js */
     const rejectionBridge=promiseRejectionBridge(event=>dispatch(globalThis,event),host.promiseIsHandled,fn=>setTimeout(fn,0));
-    class CustomEvent extends Event {
-        constructor(t, o = {}) { super(t,o); this.detail = o.detail === undefined ? null : o.detail; }
-        initCustomEvent(type,bubbles=false,cancelable=false,detail=null) {
-            if(!arguments.length)throw new TypeError('initCustomEvent requires type');
-            if(eventState(this).dispatching)return;
-            this.initEvent(type,bubbles,cancelable);this.detail=detail;
-        }
-    }
+    /* @include js_custom_event.js */
+    const CustomEvent=customEventInterface(Event,eventState);
     class UIEvent extends Event {
         constructor(t,o={}){super(t,o);this.view=o.view??null;this.detail=(+(o.detail??0))>>0;}
         initUIEvent(type,bubbles=false,cancelable=false,view=null,detail=0){
@@ -114,7 +159,8 @@
         }
     }
     /* @include js_input_event.js */
-    const focusData=new WeakMap();
+    // A FocusEvent's relatedTarget lives in its Event state, where dispatch in any realm retargets it.
+    const focusEvents=new WeakSet();
     class FocusEvent extends UIEvent {
         constructor(type,init={}) {
             if(!arguments.length)throw new TypeError('FocusEvent requires type');
@@ -122,9 +168,10 @@
             const target=init.relatedTarget??null;
             if(target!==null && !(target instanceof EventTarget) && target!==globalThis)
                 throw new TypeError('Expected an EventTarget');
-            focusData.set(this,target);
+            eventDefine(eventState(this),'relatedTarget',{value:target,writable:true,enumerable:true,configurable:true});
+            focusEvents.add(this);
         }
-        get relatedTarget(){if(!focusData.has(this))throw new TypeError('Illegal FocusEvent receiver');return focusData.get(this);}
+        get relatedTarget(){if(!focusEvents.has(this))throw new TypeError('Illegal FocusEvent receiver');return eventState(this).relatedTarget;}
     }
     Object.defineProperty(FocusEvent.prototype,Symbol.toStringTag,{configurable:true,value:'FocusEvent'});
     Object.defineProperty(FocusEvent.prototype,'relatedTarget',Object.assign({},Object.getOwnPropertyDescriptor(FocusEvent.prototype,'relatedTarget'),{enumerable:true}));
@@ -162,26 +209,110 @@
         if(target===inputWindow)return host.inputListener(null,0);
         return rawDom.isNode(null,target)?host.inputListener(target,0):false;
     }
+    /* The event listener lists are read and changed with loops over own elements and the
+       captured WeakMap methods: a page that replaces Array.prototype methods, Array's species or
+       WeakMap.prototype must not change which listeners an event reaches. */
+    function copyList(a) {
+        const out=[];
+        for(let i=0;i<a.length;i++)out[i]=a[i];
+        return out;
+    }
+    function listenerList(target) { return apply(mapGet,listenerMap,[target]); }
+    function appendListener(target,entry) {
+        let a=listenerList(target);
+        if(!a)apply(mapSet,listenerMap,[target,a=[]]);
+        a[a.length]=entry;
+    }
+    // DOM "remove an event listener".
     function removeListener(target, entry) {
         if (entry.removed) return;
         entry.removed = true;
         nativeListenerChange(target,entry,-1);
-        const a = listenerMap.get(target), i = a ? a.indexOf(entry) : -1;
-        if (i >= 0) {
-            a.splice(i, 1);
-            if (!a.length) listenerMap.delete(target);
+        const a=listenerList(target);
+        if(a) {
+            let i=0;while(i<a.length && a[i]!==entry)i++;
+            if(i<a.length) {
+                for(;i+1<a.length;i++)a[i]=a[i+1];
+                a.length--;
+                if(!a.length)apply(mapDelete,listenerMap,[target]);
+            }
         }
-        if (entry.signal) entry.signal.removeEventListener('abort', entry.abort);
-        entry.signal = entry.abort = null;
+        if(entry.unfollow)entry.unfollow();
+        else if(entry.signal)entry.signal.removeEventListener('abort',entry.abort);
+        entry.signal=entry.abort=entry.unfollow=null;
+    }
+    /* AbortSignal, as js_fetch.js defines it: is(value), aborted(signal), and follow(signal, steps),
+       which adds abort steps (DOM "add an algorithm") and returns their removal. */
+    let abortSignals={is:()=>false,aborted:()=>false,follow:()=>null};
+    /* Another realm's AbortSignal: this realm cannot read its slots, so the listener follows its
+       abort event instead of its abort algorithms. */
+    function foreignSignal(value) {
+        if(value===null || typeof value!=='object')return false;
+        const port=host.eventRealm(value);
+        return port!==null && port!==invokeListener && typeof value.addEventListener==='function';
+    }
+    /* DOM "flatten more" (addEventListener, more) and "flatten" (removeEventListener): the
+       (AddEventListenerOptions or boolean) union. A non-object is the boolean capture; an object
+       is the dictionary, whose members are got once each in Web IDL order: capture, then once,
+       passive and signal. */
+    function flattenOptions(o,more) {
+        let capture=false,once=false,passive=null,signal=null;
+        if(o!==undefined && o!==null) {
+            if(typeof o!=='object' && typeof o!=='function')capture=!!o;
+            else {
+                capture=!!o.capture;
+                if(more) {
+                    once=!!o.once;
+                    const p=o.passive;if(p!==undefined)passive=!!p;
+                    const v=o.signal;
+                    if(v!==undefined) {
+                        if(!abortSignals.is(v) && !foreignSignal(v))throw new EventTypeError('The signal option must be an AbortSignal');
+                        signal=v;
+                    }
+                }
+            }
+        }
+        return {capture,once,passive,signal};
+    }
+    // Web IDL's EventListener? argument: null, undefined or an object, else a TypeError.
+    function listenerArgument(callback) {
+        if(callback===undefined || callback===null)return null;
+        if(typeof callback!=='object' && typeof callback!=='function')throw new EventTypeError('The event listener must be an object');
+        return callback;
+    }
+    /* DOM "add an event listener". The entry keeps the port of its callback's realm
+       (host.eventRealm), looked up here once: a callback's realm never changes, so a dispatch
+       pays nothing to find the realm whose current event and error reporting the listener
+       uses. */
+    function addListener(target,type,callback,o) {
+        handlerRecord(target,type); // parsed inline handlers precede later listeners
+        const signal=o.signal;
+        if(signal!==null && (abortSignals.is(signal)?abortSignals.aborted(signal):!!signal.aborted))return;
+        if(callback===null)return;
+        const a=listenerList(target);
+        if(a)for(let i=0;i<a.length;i++) {
+            const x=a[i];
+            if(x.type===type && x.callback===callback && x.capture===o.capture)return;
+        }
+        const x={type,callback,capture:o.capture,once:o.once,
+            passive:o.passive===null?defaultPassive(target,type):o.passive,removed:false,
+            signal:null,abort:null,unfollow:null,port:host.eventRealm(callback),handler:null};
+        nativeListenerChange(target,x,1);
+        appendListener(target,x);
+        if(signal!==null) {
+            x.signal=signal;x.abort=()=>removeListener(target,x);
+            if(abortSignals.is(signal))x.unfollow=abortSignals.follow(signal,x.abort);
+            else signal.addEventListener('abort',x.abort,{once:true});
+        }
     }
     function resetDocumentEvents(root) {
         // document.open removes listeners and handlers, not the old attributes.
         // Keep null handler records so retained old nodes cannot recompile them.
         const pending=[root,globalThis];
         while(pending.length) {
-            const target=pending.pop(),listeners=listenerMap.get(target);
+            const target=pending.pop(),listeners=listenerList(target);
             if(bodyWindowHandler(target,'load'))parsedBodyHandlers.add(target);
-            if(listeners)for(const entry of listeners.slice())removeListener(target,entry);
+            if(listeners){const copy=copyList(listeners);for(let i=0;i<copy.length;i++)removeListener(target,copy[i]);}
             const handlers=new Map();
             for(const type of globalHandlerTypes)if(handlerTarget(target,type))
                 handlers.set(type,{value:null,text:null,compiled:true,entry:null});
@@ -199,30 +330,17 @@
         pointerCaptureBridge.reset();
     }
     class EventTarget {
+        // The arguments are converted in order (type, callback, options) before any step runs.
         addEventListener(type, callback, init) {
-            if (callback == null) return;
-            if (typeof callback !== 'function' && typeof callback.handleEvent !== 'function') return;
-            type = String(type); const o = options(init);
-            handlerRecord(this,type); // parsed inline handlers precede later listeners
-            let a = listenerMap.get(this);
-            if (!a) listenerMap.set(this, a = []);
-            if (a.some(x => x.type === type && x.callback === callback && x.capture === !!o.capture)) return;
-            if (o.signal && o.signal.aborted) return;
-            const passive=o.passive;
-            const x = {type, callback, capture:!!o.capture, once:!!o.once,
-                passive:passive===undefined?defaultPassive(this,type):!!passive, removed:false, signal:null, abort:null};
-            nativeListenerChange(this,x,1);
-            a.push(x);
-            if (o.signal) {
-                x.signal = o.signal; x.abort = () => removeListener(this, x);
-                x.signal.addEventListener('abort', x.abort, {once:true});
-            }
+            type=`${type}`;callback=listenerArgument(callback);
+            addListener(this,type,callback,flattenOptions(init,true));
         }
         removeEventListener(type, callback, init) {
-            const a = listenerMap.get(this), capture = !!options(init).capture;
-            type = String(type);
-            if (a) for (const x of a) if (x.type === type && x.callback === callback && x.capture === capture) {
-                removeListener(this, x); break;
+            type=`${type}`;callback=listenerArgument(callback);
+            const capture=flattenOptions(init,false).capture,a=listenerList(this);
+            if(a)for(let i=0;i<a.length;i++) {
+                const x=a[i];
+                if(x.type===type && x.callback===callback && x.capture===capture){removeListener(this,x);break;}
             }
         }
         dispatchEvent(event) {
@@ -234,7 +352,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type) || viewportHandlerTarget(target,type) || fontHandlerTarget(target,type) || animationHandlerTarget(target,type);
     }
     function bodyWindowHandler(target,type){
         if(!bodyWindowTypes.has(type) || target===globalThis)return false;
@@ -248,18 +366,46 @@
         bodyWindowBrands.set(target,body);return body;
     }
     function handlerOwner(target,type){return bodyWindowHandler(target,type)?rawDom.get(target,'eventHandlerWindow'):target;}
+    /* HTML "activate an event handler": one listener per handler, added once, whose callback
+       runs the event handler processing algorithm. Its passive is null, so add an event
+       listener gives it the default passive value. The HTML callback's realm is arbitrary;
+       here it is the realm of the handler's current value (handlerPort), so inner invoke's
+       check of the listener's global is also the processing algorithm's step 4, and window.event
+       and the report of what the handler threw belong to the handler's realm. */
     function activateHandler(target,type,r) {
         if(r.entry)return;
-        let a=listenerMap.get(target);if(!a)listenerMap.set(target,a=[]);
-        r.entry={type,capture:false,once:false,passive:false,removed:false,signal:null,abort:null,
-            callback(event){
-                const fn=handlerValue(target,type);if(typeof fn!=='function')return;
-                if(target===globalThis && type==='error' && event instanceof ErrorEvent){
-                    if(fn.call(target,event.message,event.filename,event.lineno,event.colno,event.error)===true)event.preventDefault();
-                }else if(fn.call(target,event)===false)event.preventDefault();
-            }};
+        r.entry={type,capture:false,once:false,passive:defaultPassive(target,type),removed:false,
+            signal:null,abort:null,unfollow:null,port:null,handler:r,
+            callback(event){processHandler(target,type,event);}};
         nativeListenerChange(target,r.entry,1);
-        a.push(r.entry);
+        appendListener(target,r.entry);
+    }
+    /* The port of a handler's value: set with the value when a script assigns an object, and
+       this realm's own for a handler compiled from its content attribute here (r.port undefined). */
+    function handlerPort(r) { return r.port===undefined?invokeListener:r.port; }
+    /* HTML "the event handler processing algorithm", steps 2, 3 and 5 to 7, for target's handler
+       named on+type; inner invoke did step 4 (handlerPort). The value is called with the event's
+       currentTarget as this. Special error event handling (an ErrorEvent named error at a
+       global) passes the ErrorEvent's five values, read from its private data, and cancels when
+       the handler returns true; otherwise returning false cancels. A Window's (and so a body's)
+       onbeforeunload is an OnBeforeUnloadEventHandler, whose result is converted to DOMString?
+       while this event is still the current event. Canceling is DOM "set the canceled flag":
+       it does nothing for a non-cancelable event or inside a passive listener. What the handler
+       throws propagates to invokeListener, which reports it. */
+    function processHandler(target,type,event) {
+        const fn=handlerValue(target,type);
+        if(typeof fn!=='function')return; // null, or an object that is not callable: nothing to invoke
+        const s=eventState(event),current=s.currentTarget;
+        const values=type==='error' && current===globalThis?errorEventValues(event):null;
+        let result=values!==null?apply(fn,current,[values.message,values.filename,values.lineno,values.colno,values.error]):
+            apply(fn,current,[event]);
+        if(type==='beforeunload' && current===globalThis) {
+            if(result!==undefined && result!==null)result=`${result}`;
+            return; // no BeforeUnloadEvent yet, and a DOMString? is never false
+        }
+        if(values!==null?result===true:result===false) {
+            if(s.cancelable && !s.passive)s.defaultPrevented=true;
+        }
     }
     // HTML event handler attribute change steps: a value CSP blocks (script
     // attribute) leaves the handler as it was. Attributes the parser or a
@@ -303,7 +449,10 @@
         if(owner!==target && owner!==globalThis)return host.windowHandler('set',target,type,value,text);
         target=owner;
         const r=handlerRecord(target,type,checked);if(!r)throw new TypeError('Illegal event handler receiver');
-        r.value=typeof value==='function'?value:null;r.text=text;r.compiled=text===null;
+        // [LegacyTreatNonObjectAsNull]: any object is kept, callable or not; anything else is null.
+        const object=value!==null && (typeof value==='object' || typeof value==='function');
+        r.value=object?value:null;r.text=text;r.compiled=text===null;
+        r.port=object?host.eventRealm(value):undefined;
         if(r.value!==null || text!==null)activateHandler(target,type,r);
         else if(r.entry){removeListener(target,r.entry);r.entry=null;}
     }
@@ -321,7 +470,7 @@
             if(text===null || !handlerAllowed(body,text))continue;
             let r=map.get(type);
             if(!r)map.set(type,r={value:null,text:null,compiled:true,entry:null});
-            r.value=null;r.text=text;r.compiled=false;
+            r.value=null;r.text=text;r.compiled=false;r.port=undefined;
             activateHandler(globalThis,type,r);
         }
     }
@@ -343,23 +492,60 @@
             get(){return handlerValue(this,type);},set(v){setHandler(this,type,v,null);}
         });
     }
-    function invoke(target, event, capture) {
-        const s=eventState(event);s.currentTarget=target;
-        handlerRecord(target,s.type);
-        const a = listenerMap.get(target);
-        if (a) for (const x of a.slice()) {
-            if (x.removed || x.capture !== capture || x.type !== s.type) continue;
-            if (x.once) removeListener(target, x);
-            s.passive=x.passive;
-            try {
-                if (typeof x.callback === 'function') x.callback.call(target,event);
-                else x.callback.handleEvent(event);
-            } catch (e) { s.listenerException=true;report(e); }
+    /* DOM "inner invoke" (https://dom.spec.whatwg.org/#concept-event-listener-inner-invoke), in
+       the realm that dispatches. Steps 2.1 to 2.8 are here; the realm part of steps 2.9 to 2.15
+       runs in the port of the listener's realm (invokeListener), with the in passive listener
+       flag set around it. The realm of a listener was found when it was added, so a listener
+       costs one host.eventActive (pointer reads for the target's and the listener's Documents,
+       asked anew for each listener because an earlier one can adopt the target or remove a
+       frame) and one call through its port. capture is the phase: true "capturing", false
+       "bubbling". inShadow is the path item's invocation-target-in-shadow-tree. Returns found. */
+    function innerInvoke(target,event,s,listeners,capture,inShadow) {
+        let found=false;
+        for(let i=0;i<listeners.length;i++) {
+            const x=listeners[i];
+            if(x.removed || x.type!==s.type)continue;
+            found=true;
+            if(x.capture!==capture)continue;
+            if(x.once)removeListener(target,x);
+            const port=x.handler?handlerPort(x.handler):x.port;
+            if(port===null || !host.eventActive(target,port===invokeListener?undefined:port))continue;
+            if(x.passive)s.passive=true;
+            const threw=port(x.callback,target,event,!inShadow);
             s.passive=false;
+            if(threw)s.listenerException=true;
             if(s.immediate)break;
         }
+        return found;
+    }
+    // DOM "invoke" step 10: the legacy types a trusted event also reaches when no listener has its type.
+    const legacyEventTypes={__proto__:null,animationend:'webkitAnimationEnd',animationiteration:'webkitAnimationIteration',
+        animationstart:'webkitAnimationStart',transitionend:'webkitTransitionEnd'};
+    /* DOM "invoke" (https://dom.spec.whatwg.org/#concept-event-listener-invoke) steps 7 to 10;
+       dispatch's visit did steps 1 to 6. The listeners are a clone of the list, so a listener
+       added during this invocation does not run in it, while a removed one is skipped by its
+       removed flag. */
+    function invoke(target, event, capture, inShadow) {
+        const s=eventState(event);s.currentTarget=target;
+        handlerRecord(target,s.type);
+        const a=listenerList(target);
+        if(a) { // a target without listeners finds none, under its type or a legacy one
+            const listeners=copyList(a);
+            const found=innerInvoke(target,event,s,listeners,capture,inShadow);
+            if(!found && s.isTrusted) {
+                const legacy=legacyEventTypes[s.type];
+                if(legacy!==undefined) {
+                    const original=s.type;s.type=legacy;
+                    try { innerInvoke(target,event,s,listeners,capture,inShadow); }
+                    finally { s.type=original; }
+                }
+            }
+        }
+        /* Not in DOM or HTML: an on<type> property or attribute for a type this realm has no
+           event handler for yet (its GlobalEventHandlers list is not complete) is still run as
+           one, at the end of the bubbling invocation, through the same steps as a handler. */
         if (!capture && !s.immediate && !handlerTarget(target,s.type)) {
-            let fn = target['on' + s.type];
+            let fn = target['on' + s.type],port;
             if (fn === undefined && target instanceof Node && target.nodeType === 1) {
                 const text = reflectedAttr(target,'on' + s.type);
                 if (text !== null && rawDom.get(target,'scripting')) {
@@ -370,12 +556,15 @@
                         try { x = {text, fn:host.inline(text)}; cache.set(s.type,x); }
                         catch (e) { s.listenerException=true;report(e); x = {text,fn:null}; cache.set(s.type,x); }
                     }
-                    fn = x.fn;
+                    fn = x.fn;port=invokeListener;
                 }
             }
             if (typeof fn === 'function') {
-                try { if (fn.call(target,event) === false) event.preventDefault(); }
-                catch (e) { s.listenerException=true;report(e); }
+                if(port===undefined)port=host.eventRealm(fn);
+                if(port!==null && host.eventActive(target,port===invokeListener?undefined:port)) {
+                    const handler=function(){const result=apply(fn,target,[event]);if(result===false && s.cancelable && !s.passive)s.defaultPrevented=true;};
+                    if(port(handler,target,event,!inShadow))s.listenerException=true;
+                }
             }
         }
     }
@@ -383,13 +572,19 @@
         const s=eventState(event);s.dispatching=true;s.target=target;
         try {
         const plan=snapshot && snapshot.entries?snapshot:shadowBridge.path(target,{type:s.type,composed:s.composed,relatedTarget:event.relatedTarget},snapshot),entries=plan.entries;
-        const hasRelated='relatedTarget' in event;
-        // Retarget the private FocusEvent slot, not its read-only IDL getter.
+        const hasRelated='relatedTarget' in event,relatedState=apply(ownProperty,s,['relatedTarget']);
+        // Retarget a FocusEvent's relatedTarget in its Event state, not through its read-only IDL getter.
         // Mouse events still use their existing internal writable field.
-        function related(value){if(focusData.has(event))focusData.set(event,value);else event.relatedTarget=value;}
+        function related(value){if(relatedState)s.relatedTarget=value;else event.relatedTarget=value;}
+        /* DOM "invoke" steps 1 to 6 for one path item: its shadow-adjusted target and
+           relatedTarget, the composed path it sees, and the phase. A path item is in a shadow
+           tree when its invocation target's root, snapshotted with the path, is a shadow root
+           (entry.scopes, js_shadow.js); a listener there does not set window.event. */
         function visit(entry,capture,phase){
             s.target=entry.target;if(hasRelated)related(entry.related);
-            eventPaths.set(event,entry.visible);s.eventPhase=phase;invoke(entry.node,event,capture);
+            s.path=entry.visible;s.eventPhase=phase;
+            const scopes=entry.scopes;
+            invoke(entry.node,event,capture,!!scopes && scopes.length>0);
         }
         for(let i=entries.length-1;i>0 && !s.stop;i--)visit(entries[i],true,entries[i].atTarget?2:1);
         if(entries.length && !s.stop){
@@ -401,10 +596,9 @@
         for(let i=1;i<entries.length && !s.stop;i++)
             if(s.bubbles || entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
         s.target=plan.finalTarget;if(hasRelated)related(plan.finalRelated);
-        eventPaths.delete(event);
         return !s.defaultPrevented;
         } finally {
-            eventPaths.delete(event);s.currentTarget=null;s.eventPhase=0;s.dispatching=s.passive=s.stop=s.immediate=false;
+            s.path=null;s.currentTarget=null;s.eventPhase=0;s.dispatching=s.passive=s.stop=s.immediate=false;
         }
     }
     class Node extends EventTarget {
@@ -443,6 +637,45 @@
         contains(other) { for(let n=other;n;n=n.parentNode) if(n===this) return true; return false; }
         hasChildNodes() { return this.firstChild !== null; }
         getRootNode(options={}) { return rawDom.root(this,!!shadowBridge.dictionary(options).composed); }
+    }
+    /* The (Node or DOMString)... arguments of append, prepend, before and after, converted as Web
+       IDL does before the steps run (a string conversion may run author code). */
+    function nodeValues(nodes){const values=[];for(let i=0;i<nodes.length;i++)values[i]=rawDom.isNode(null,nodes[i])?nodes[i]:elementURL.string(nodes[i]);return values;}
+    /* DOM "convert nodes into a node": strings become Text nodes of document, and more than one
+       node goes into a new DocumentFragment, so the caller pre-inserts once and the inserted
+       scripts' post-connection steps run after every node is in place. */
+    function convertNodes(document,values){
+        const make=value=>typeof value==='string'?rawDom.create(document,3,'#text',value):value;
+        if(values.length===1)return make(values[0]);
+        const fragment=rawDom.create(document,11,'#document-fragment','');
+        for(let i=0;i<values.length;i++){const child=make(values[i]);validateInsertion(fragment,child,null);dom('insert',fragment,child,null);}
+        return fragment;
+    }
+    /* ParentNode prepend and append: pre-insert the converted node before this's first child, or
+       at the end. One [CEReactions] scope for the whole call. */
+    function parentInsert(receiver,nodes,first){
+        const type=rawDom.get(receiver,'nodeType');
+        if(type!==1&&type!==9&&type!==11)throw new TypeError('ParentNode receiver required');
+        const values=nodeValues(nodes);
+        const insert=()=>{const node=convertNodes(type===9?receiver:rawDom.get(receiver,'ownerDocument'),values);
+            const child=first?rawDom.get(receiver,'firstChild'):null;validateInsertion(receiver,node,child);dom('insert',receiver,node,child);};
+        if(customElementsReady)customElementsBridge.reactions(insert);else insert();
+    }
+    /* ChildNode before and after: the viable sibling is the first one on that side that is not
+       among the nodes, then the converted node is pre-inserted into the parent next to it. */
+    function siblingInsert(receiver,nodes,after){
+        const kind=rawDom.get(receiver,'nodeType');
+        if(kind!==1 && kind!==3 && kind!==7 && kind!==8 && kind!==10)throw new TypeError('ChildNode receiver required');
+        const values=nodeValues(nodes);
+        const parent=rawDom.get(receiver,'parentNode');
+        if(!parent)return;
+        const among=node=>{for(let i=0;i<values.length;i++)if(values[i]===node)return true;return false;};
+        let viable=rawDom.get(receiver,after?'nextSibling':'previousSibling');
+        while(viable&&among(viable))viable=rawDom.get(viable,after?'nextSibling':'previousSibling');
+        const insert=()=>{const node=convertNodes(rawDom.get(receiver,'ownerDocument'),values);
+            const child=after?viable:viable===null?rawDom.get(parent,'firstChild'):rawDom.get(viable,'nextSibling');
+            validateInsertion(parent,node,child);dom('insert',parent,node,child);};
+        if(customElementsReady)customElementsBridge.reactions(insert);else insert();
     }
     function replaceChildNode(receiver,nodes) {
         const kind=rawDom.get(receiver,'nodeType');
@@ -483,8 +716,8 @@
         get previousElementSibling() { let n=this.previousSibling; while(n && n.nodeType !== 1) n=n.previousSibling; return n; }
         get childElementCount() { return this.children.length; }
         remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-        append(...nodes) { for (const n of nodes) this.appendChild(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n))); }
-        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n)),before); }
+        append(...nodes) { parentInsert(this,nodes,false); }
+        prepend(...nodes) { parentInsert(this,nodes,true); }
         replaceChildren(...nodes) {
             const type=rawDom.get(this,'nodeType');
             if(![1,9,11].includes(type))throw new TypeError('ParentNode receiver required');
@@ -504,18 +737,37 @@
                 dom('replaceAll',this,replacement);
             });
         }
-        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),this); }
-        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),next); } }
+        /* DOM moveBefore: "move" node into this before child, keeping its state (a frame's
+           document, focus, animations); no removing or insertion steps, only the moving steps */
+        moveBefore(node,child) {
+            const type=rawDom.get(this,'nodeType');
+            if(type!==1&&type!==9&&type!==11)throw new TypeError('ParentNode receiver required');
+            if(arguments.length<2)throw new TypeError("Failed to execute 'moveBefore': 2 arguments required");
+            if(!rawDom.isNode(null,node))throw new TypeError("Failed to execute 'moveBefore': parameter 1 is not of type 'Node'");
+            if(child!=null&&!rawDom.isNode(null,child))throw new TypeError("Failed to execute 'moveBefore': parameter 2 is not of type 'Node'");
+            let reference=child??null;
+            if(reference===node)reference=rawDom.get(node,'nextSibling');
+            const status=rawDom.moveStatus(this,node,reference);
+            if(status)throw new DOMException(status===2?'The reference node is not a child of this node':'The node cannot be moved here',
+                status===2?'NotFoundError':'HierarchyRequestError');
+            dom('move',this,node,reference);
+        }
+        before(...nodes) { siblingInsert(this,nodes,false); }
+        after(...nodes) { siblingInsert(this,nodes,true); }
         replaceWith(...nodes) { replaceChildNode(this,nodes); }
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return domGet(this,'localName'); }
         get namespaceURI() { return domGet(this,'namespaceURI'); }
+        get prefix() { return domGet(this,'prefix'); }
         get id() { return reflectedAttr(this,'id') || ''; }
         set id(v) { reflectedAttr(this,'id',String(v)); }
         get className() { return reflectedAttr(this,'class') || ''; }
         set className(v) { reflectedAttr(this,'class',String(v)); }
         get classList() { return tokenListBridge.for(this,'class'); }
         set classList(value) { tokenListBridge.for(this,'class').value=value; }
+        /* CSS Shadow Parts: the element's part names, for ::part() */
+        get part() { return tokenListBridge.for(this,'part'); }
+        set part(value) { tokenListBridge.for(this,'part').value=value; }
         getAttribute(name) { return dom('attr',this,String(name)); }
         setAttribute(name,value) { dom('attr',this,String(name),String(value)); }
         removeAttribute(name) { dom('attr',this,String(name),null); }
@@ -543,11 +795,28 @@
                 dom('remove',this);
             });
         }
-        querySelector(selector) { return dom('query',this,String(selector),true); }
-        querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
-        matches(selector) { return dom('matches',this,String(selector)); }
-        closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
-        getElementsByTagName(name) { const query=String(name)==='*'?'*':CSS.escape(String(name));return collectionBridge.domHTML(this,()=>dom('query',this,query,false)); }
+        querySelector(selector) { return selectorQuery(this,selector,true); }
+        querySelectorAll(selector) { return list(selectorQuery(this,selector,false)); }
+        matches(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'matches': 1 argument required");return selectorMatches(this,String(selector),this); }
+        /* DOM: a legacy alias of matches (an operation of its own name, the same steps). */
+        webkitMatchesSelector(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'webkitMatchesSelector': 1 argument required");return selectorMatches(this,String(selector),this); }
+        closest(selector) {
+            // DOM: parse once, then the inclusive ancestor elements, with this as :scope
+            if(!arguments.length)throw new TypeError("Failed to execute 'closest': 1 argument required");
+            selector=String(selector);
+            for(let n=this;n;){
+                if(selectorMatches(n,selector,this))return n;
+                const parent=domGet(n,'parentNode');
+                n=parent&&domGet(parent,'nodeType')===1?parent:null;
+            }
+            return null;
+        }
+        getElementsByTagName(name) { name=String(name);return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,name)); }
+        getElementsByTagNameNS(namespace,localName) {
+            if(arguments.length<2)throw new TypeError('Namespace and local name are required');
+            namespace=namespace==null?null:String(namespace);localName=String(localName);
+            return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,namespace===''?null:namespace,localName,true));
+        }
         getElementsByClassName(names) { const query=String(names).trim().split(/\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query?dom('query',this,query,false):[]); }
         getBoundingClientRect() { rawDom.get(this,'elementBrand');return observerBridge.clientBoundingRect(dom('rect',this)); }
         getClientRects() { return observerBridge.clientRects(dom('rect',this,true)); }
@@ -560,6 +829,30 @@
         // declaration without replacing its SameObject style wrapper.
         set style(value) { inlineStyle(this).cssText=value; }
         get dataset() { const n=this;return new Proxy({}, {get(_,k){return reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()));},set(_,k,v){reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()),v);return true;}}); }
+    }
+    // DOM "scope-match a selectors string" and "match a selector": an invalid
+    // selector is a "SyntaxError" DOMException.
+    function invalidSelector(selector) { return domExceptionBridge.create('SyntaxError', "'"+selector+"' is not a valid selector"); }
+    function selectorQuery(node, selector, first) {
+        selector=String(selector);
+        const result=dom('query',node,selector,first);
+        if(result===false)throw invalidSelector(selector);
+        return result;
+    }
+    function selectorMatches(node, selector, scope) {
+        const result=dom('matches',node,selector,scope);
+        if(result===null)throw invalidSelector(selector);
+        return result;
+    }
+    // HTML FocusOptions (WebIDL dictionary, members in lexicographic order):
+    // focusVisible, or undefined when absent; preventScroll is read and kept
+    // for the conversion's observable getters.
+    function focusOptionsVisible(options) {
+        if (options === undefined || options === null) return undefined;
+        if (typeof options !== 'object' && typeof options !== 'function') throw new TypeError('FocusOptions must be an object');
+        const visible = options.focusVisible;
+        void options.preventScroll;
+        return visible === undefined ? undefined : !!visible;
     }
     class HTMLElement extends Element {
         constructor() { return customElementsBridge.construct(new.target); }
@@ -578,7 +871,7 @@
         set selected(v) { dom('set',this,'selected',!!v); }
         get disabled() { return reflectedAttr(this,'disabled')!==null; }
         set disabled(v) { reflectedAttr(this,'disabled',v?'':null); }
-        focus() { dom('focus',this); }
+        focus(options = undefined) { dom('focus',this,focusOptionsVisible(options)); }
         blur() { dom('blur',this); }
         click() { host.click(this); }
     }
@@ -610,7 +903,7 @@
         get currentSrc() { return domGet(this,'imageCurrentSrc'); }
         get src() {
             domGet(this,'imageBrand'); const value=reflectedAttr(this,'src');
-            if(value===null)return '';try{return new URL(value,this.baseURI).href;}catch(_){return value;}
+            if(value===null)return '';return elementURL.resolve(this,value);
         }
         set src(v) { domGet(this,'imageBrand');reflectedAttr(this,'src',String(v)); }
         get alt() { domGet(this,'imageBrand');return reflectedAttr(this,'alt')||''; }
@@ -777,8 +1070,16 @@
     Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
     for(const [name,value] of [['DISCONNECTED',1],['PRECEDING',2],['FOLLOWING',4],['CONTAINS',8],['CONTAINED_BY',16],['IMPLEMENTATION_SPECIFIC',32]])
         for(const target of [Node,Node.prototype])Object.defineProperty(target,'DOCUMENT_POSITION_'+name,{value,enumerable:true});
-    class Document extends Node {}
-    class HTMLDocument extends Document {}
+    // DOM "new Document()": an XML document of this realm whose content type
+    // is application/xml; it implements Document, not XMLDocument.
+    class Document extends Node {
+        constructor(){
+            const made=rawDom.documentCreate(null,'application/xml',false),proto=new.target.prototype;
+            if(proto!==Document.prototype)Object.setPrototypeOf(made,proto);
+            return made;
+        }
+    }
+    class HTMLDocument extends Document { constructor(){throw new TypeError('Illegal HTMLDocument constructor');} }
     function characterDataBrand(node){
         const type=rawDom.get(node,'nodeType');if(type!==3 && type!==4 && type!==7 && type!==8)throw new TypeError('Illegal CharacterData receiver');
     }
@@ -831,9 +1132,9 @@
             return parts.join('');
         }
     }
-    // CDATASection is an exposed Text-derived interface even in an HTML realm.
-    // HTML documents cannot create CDATA nodes; do not alias it to Text or
-    // advertise an XML parser that the native document model does not have.
+    // CDATASection is an exposed Text-derived interface even in an HTML realm:
+    // a native text node of an XML document's CDATA section (createCDATASection,
+    // the XML parser), never an alias of Text.
     class CDATASection extends Text {
         constructor(){throw new TypeError('Illegal CDATASection constructor');}
     }
@@ -886,8 +1187,8 @@
     }
     // ParentNode is shared, but attributes and matching belong only to elements.
     const parentMembers = ['children','firstElementChild','lastElementChild','childElementCount',
-        'append','prepend','replaceChildren','querySelector','querySelectorAll'];
-    copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByClassName']));
+        'append','prepend','replaceChildren','moveBefore','querySelector','querySelectorAll'];
+    copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByTagNameNS','getElementsByClassName']));
     copyElementMembers(DocumentFragment.prototype, parentMembers);
     copyElementMembers(CharacterData.prototype, ['nextElementSibling','previousElementSibling','remove','before','after','replaceWith']);
     copyElementMembers(DocumentType.prototype, ['replaceWith']);
@@ -896,7 +1197,9 @@
         Object.defineProperty(proto,Symbol.unscopables,{configurable:true,value:unscopables});
     }
     const document=host.document;
-    Object.setPrototypeOf(document,HTMLDocument.prototype);
+    /* HTML "create and initialize a Document": a document of type "xml" is a
+       Document, not an HTMLDocument. */
+    Object.setPrototypeOf(document,domGet(document,'htmlDocument')?HTMLDocument.prototype:Document.prototype);
     /* Configurable: these move to Document.prototype at the end of bootstrap. */
     Object.defineProperties(document, {
         documentElement:{configurable:true,get(){return domGet(document,'documentElement');}},
@@ -909,23 +1212,6 @@
     });
     document.getElementById=id=>dom('id',document,String(id));
     document.getElementsByName=name=>{const query='[name="'+CSS.escape(String(name))+'"]';return collectionBridge.domLive(document,()=>dom('query',document,query,false));};
-    document.createElement=(name,options)=>customElementsBridge.create(name,options);
-    document.createElementNS=function(ns,name,options=undefined){
-        if(arguments.length<2)throw new TypeError('Namespace and qualified name are required');
-        ns=ns===null || ns===undefined?null:elementURL.string(ns);if(ns==='')ns=null;
-        name=elementURL.string(name);
-        if(ns===null){
-            const colon=name.indexOf(':'),prefix=colon<0?null:name.slice(0,colon),local=colon<0?name:name.slice(colon+1);
-            if(prefix!==null && (!prefix || /[\0\t\n\f\r />]/.test(prefix)) ||
-               !/^(?:[A-Za-z][^\0\t\n\f\r />]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9_.:\-\u0080-\u{10FFFF}]*)$/u.test(local))
-                throw new DOMException('Invalid element name','InvalidCharacterError');
-            if(prefix!==null || name==='xmlns')throw new DOMException('A prefix requires a namespace','NamespaceError');
-            return dom('create',null,1,name,'',null);
-        }
-        if(ns==='http://www.w3.org/1999/xhtml')return customElementsBridge.create(name,options,true);
-        if(ns!=='http://www.w3.org/2000/svg')throw new DOMException('Unsupported namespace','NotSupportedError');
-        return dom('create',null,1,name,'',true);
-    };
     document.createTextNode=text=>dom('create',null,3,'#text',String(text));
     document.createComment=text=>dom('create',null,8,'#comment',String(text));
     document.createDocumentFragment=()=>dom('create',null,11,'#document-fragment','');
@@ -944,7 +1230,11 @@
         eventState(e).initialized=false;return e;
     };
     function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
-    const styleToken={},styleRecords=new WeakMap(),cssPropertyMetadata=host.cssProperties();
+    /* A CSSStyleDeclaration is an element's inline style (node), its computed
+       style (computed), or a rule's declarations (js_stylesheets.js: backend,
+       whose block, read, write and setText reach cssom.c). Every one is the
+       native declaration block: its names and cssText are its serialization. */
+    const styleToken={},ruleStyleToken={},styleRecords=new WeakMap(),cssPropertyMetadata=host.cssProperties();
     /* CSSOM lists computed longhands in code-unit order with prefixed names
        last; the native table is already in code-unit order. Built on first
        enumeration, not in every realm's bootstrap. */
@@ -957,20 +1247,22 @@
     }
     function styleRecord(value){const record=styleRecords.get(value);if(!record)throw new TypeError('Invalid CSSStyleDeclaration receiver');return record;}
     function styleProperty(name){name=String(name);return name.startsWith('--')?name:name.toLowerCase();}
+    function styleBlock(record){return record.backend?record.backend.block():dom('styleBlock',record.node);}
     function styleNames(value){
         const record=styleRecord(value);
-        if(!record.computed)return (reflectedAttr(record.node,'style')||'').split(';').filter(x=>x.includes(':')).map(x=>x.split(':')[0].trim());
+        if(!record.computed)return styleBlock(record).slice(1);
         const custom=host.cssProperties(record.node,record.pseudo);if(custom===null)return [];
         const names=[],seen=new Set();for(const [name,valid] of custom){if(seen.has(name))continue;seen.add(name);if(valid)names.push(name);}
         return longhandNames().concat(names);
     }
-    function styleRead(value,name){const record=styleRecord(value);return record.computed?
-        dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
+    function styleRead(value,name){const record=styleRecord(value);
+        if(record.backend)return record.backend.read(styleProperty(name),false);
+        return record.computed?dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
     function styleWrite(value,name,text,priority=''){
         /* CSSOM: value and priority are [LegacyNullToEmptyString]. */
         name=styleProperty(name);text=text==null?'':String(text);priority=priority===null?'':String(priority);
         const record=styleRecord(value);if(record.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');
-        dom('style',record.node,name,text,priority);
+        if(record.backend)record.backend.write(name,text,priority);else dom('style',record.node,name,text,priority);
     }
     function styleIndex(key){return typeof key==='string'&&/^(0|[1-9][0-9]*)$/.test(key)?Number(key):-1;}
     function inlineStyle(node){
@@ -979,9 +1271,14 @@
     }
     class CSSStyleDeclaration {
         constructor(node,computed,token,pseudo=null){
-            if(token!==styleToken)throw new TypeError('Illegal constructor');
-            if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
-            const record={node,computed:!!computed,pseudo:computed&&pseudo!=null?String(pseudo):''};styleRecords.set(this,record);
+            let record;
+            if(token===ruleStyleToken)record={node:null,backend:node,computed:false,pseudo:''};
+            else {
+                if(token!==styleToken)throw new TypeError('Illegal constructor');
+                if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
+                record={node,computed:!!computed,pseudo:computed&&pseudo!=null?String(pseudo):''};
+            }
+            styleRecords.set(this,record);
             const proxy=new Proxy(this,{
                 get(t,k,r){const i=styleIndex(k);return i>=0?styleNames(t)[i]:Reflect.get(t,k,r);},
                 set(t,k,v,r){if(styleIndex(k)>=0)return false;return Reflect.set(t,k,v,r);},
@@ -990,11 +1287,13 @@
                 getOwnPropertyDescriptor(t,k){const i=styleIndex(k);if(i>=0){const name=styleNames(t)[i];return name===undefined?undefined:{value:name,writable:false,enumerable:true,configurable:true};}return Reflect.getOwnPropertyDescriptor(t,k);}
             });styleRecords.set(proxy,record);return proxy;
         }
-        get cssText(){const r=styleRecord(this);return r.computed?'':reflectedAttr(r.node,'style')||'';}
-        set cssText(v){v=v==null?'':String(v);const r=styleRecord(this);if(r.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');reflectedAttr(r.node,'style',v);}
-        get parentRule(){styleRecord(this);return null;}
+        get cssText(){const r=styleRecord(this);return r.computed?'':styleBlock(r)[0];}
+        set cssText(v){v=v==null?'':String(v);const r=styleRecord(this);if(r.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');
+            if(r.backend)r.backend.setText(v);else dom('styleBlock',r.node,v);}
+        get parentRule(){const r=styleRecord(this);return r.backend?r.backend.rule:null;}
         getPropertyValue(name){return styleRead(this,name);}
-        getPropertyPriority(name){name=styleProperty(name);const r=styleRecord(this);return r.computed?'':dom('stylePriority',r.node,name);}
+        getPropertyPriority(name){name=styleProperty(name);const r=styleRecord(this);
+            return r.backend?r.backend.read(name,true):r.computed?'':dom('stylePriority',r.node,name);}
         setProperty(name,value,priority=''){styleWrite(this,name,value,priority);}
         removeProperty(name){name=styleProperty(name);const old=styleRead(this,name);styleWrite(this,name,'');return old;}
         get length(){return styleNames(this).length;}
@@ -1002,6 +1301,24 @@
         *[Symbol.iterator](){for(let i=0;i<styleNames(this).length;i++)yield styleNames(this)[i];}
     }
     class CSSStyleProperties extends CSSStyleDeclaration {}
+    /* @font-face's and @page's descriptor blocks (CSS Fonts 5, CSSOM) */
+    class CSSFontFaceDescriptors extends CSSStyleDeclaration {}
+    class CSSPageDescriptors extends CSSStyleDeclaration {}
+    for(const [C,names] of [[CSSFontFaceDescriptors,['src','font-family','font-style','font-weight','font-stretch','font-width','font-size',
+        'size-adjust','unicode-range','font-feature-settings','font-variation-settings','font-named-instance','font-display',
+        'font-language-override','ascent-override','descent-override','line-gap-override','superscript-position-override',
+        'subscript-position-override','superscript-size-override','subscript-size-override']],
+        [CSSPageDescriptors,['margin','margin-top','margin-right','margin-bottom','margin-left','size','page-orientation','marks','bleed']]])
+        for(const name of names){
+            const camel=name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
+            for(const key of new Set([name,camel]))Object.defineProperty(C.prototype,key,{configurable:true,enumerable:true,
+                get(){return styleRead(this,name);},set(value){styleWrite(this,name,value);}});
+        }
+    /* a rule's declarations: kind 'page', 'font-face' or the properties */
+    function cssRuleStyle(kind,backend){
+        const C=kind==='page'?CSSPageDescriptors:kind==='font-face'?CSSFontFaceDescriptors:CSSStyleProperties;
+        return new C(backend,false,ruleStyleToken);
+    }
     /* Expose only the native engine's real properties, not a permissive `has`
        trap. Each named accessor reads/writes the same declaration as methods. */
     for(const [name] of cssPropertyMetadata){
@@ -1011,14 +1328,30 @@
     }
     Object.defineProperty(CSSStyleDeclaration.prototype,Symbol.toStringTag,{value:'CSSStyleDeclaration',configurable:true});
     Object.defineProperty(CSSStyleProperties.prototype,Symbol.toStringTag,{value:'CSSStyleProperties',configurable:true});
+    Object.defineProperty(CSSFontFaceDescriptors.prototype,Symbol.toStringTag,{value:'CSSFontFaceDescriptors',configurable:true});
+    Object.defineProperty(CSSPageDescriptors.prototype,Symbol.toStringTag,{value:'CSSPageDescriptors',configurable:true});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
     /* @include js_dom_exception.js */
-    const DOMException=domExceptionBridge.DOMException;
+    const DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
     /* @include js_atob.js */
     /* @include js_pointer_events.js */
     /* @include js_tokens.js */
     const DOMTokenList=tokenListBridge.DOMTokenList;
+    /* @include js_abort.js */
     /* @include js_fetch.js */
+    /* This Window's settings and transport for Fetch: js.c's native fetch (CORS, cookies, Mixed
+       Content, CSP and the HTTP cache are its), the document's base URL, origin, referrer source
+       and policy container. */
+    const fetchBridge=fetchInterfaces({signals:abortBridge.signals,
+        transport:{noCors:()=>!!host.noCorsFetch,streaming:()=>!!host.streamingFetch,
+            fetch:(q,notify)=>host.fetch(q.url,q.method,q.headers,q.body,q.sameOrigin,q.credentials,q.forcePreflight,q.redirectError?1:0,q.cache,
+                q.keepalive,q.noCors,q.noReferrer,notify,q.referrer,q.referrerPolicy,q.destination),
+            resume:id=>host.resumeFetch(id),cancel:id=>host.cancel(id),keepaliveRoom:()=>host.keepaliveRoom()},
+        baseURL:()=>rawDom.get(document,'baseURI'),origin:()=>rawDom.get(document,'fetchOrigin'),
+        clientReferrer:()=>rawDom.get(document,'fetchClientReferrer'),referrerPolicy:()=>rawDom.get(document,'referrerPolicy'),
+        url:()=>host.url(),dataURL:url=>host.dataURL(url),task:fn=>host.timer(0,fn,0,[]),clearTask:id=>host.clear(id),
+        digest:(algorithm,bytes)=>host.cryptoDigest(algorithm,bytes),initiator:id=>performanceBridge.initiator(id,'xmlhttprequest')});
+    const {Headers,Request,Response,fetch}=fetchBridge;
     const location={assign(url){host.navigate(String(url),0);},replace(url){host.navigate(String(url),2);},reload(){host.navigate(host.url(),1);},toString(){return this.href;}};
     Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(htmlSafetyBridge.navigationInput(v));}}});
     document.location=location;
@@ -1030,15 +1363,16 @@
     function requestAnimationFrame(fn){if(typeof fn!=='function')throw new TypeError('Expected callback');return timer(2,fn,16,[]);}
     function cancelAnimationFrame(id){host.clear(Number(id));}
     function queueMicrotask(fn){return host.microtask(fn);}
+    function reportError(e){if(!arguments.length)throw new TypeError("Failed to execute 'reportError': 1 argument required");host.reportException(e);}
     /* @include js_navigator.js */
     const {navigator,Interface:Navigator,languagesChanged}=navigatorBridge.create(false);
     Object.assign(globalThis,{document,console,navigator,Navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
-        Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
-        fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
-        CSSStyleDeclaration,CSSStyleProperties,
+        Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,QuotaExceededError,AbortController,AbortSignal,
+        fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,reportError,
+        CSSStyleDeclaration,CSSStyleProperties,CSSFontFaceDescriptors,CSSPageDescriptors,
         performance:{now:()=>host.now()},getComputedStyle:(n,pseudo=null)=>new CSSStyleProperties(n,true,styleToken,pseudo)});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
     globalThis.window=globalThis;globalThis.self=globalThis;globalThis.top=globalThis;globalThis.parent=globalThis;
@@ -1060,7 +1394,16 @@
         get outerWidth(){return host.windowSize(0);},set outerWidth(v){replace('outerWidth',v);},
         get outerHeight(){return host.windowSize(1);},set outerHeight(v){replace('outerHeight',v);},
         get screenX(){return 0;},set screenX(v){replace('screenX',v);},get screenLeft(){return 0;},set screenLeft(v){replace('screenLeft',v);},
-        get screenY(){return 0;},set screenY(v){replace('screenY',v);},get screenTop(){return 0;},set screenTop(v){replace('screenTop',v);}}));}
+        get screenY(){return 0;},set screenY(v){replace('screenY',v);},get screenTop(){return 0;},set screenTop(v){replace('screenTop',v);}}));
+     /* DOM "Legacy extensions to the Window interface": [Replaceable] readonly attribute
+        (Event or undefined) event, this Window's current event (invokeListener sets it). An
+        undefined this is this global; another receiver is not this Window. The setter is Web
+        IDL's [Replaceable] one: CreateDataPropertyOrThrow on the global. js_webidl.c gives the
+        accessors their IDL names and lengths. */
+     const windowReceiver=self=>{if(self!==undefined && self!==null && self!==globalThis)throw new EventTypeError('Illegal Window receiver');};
+     Object.defineProperties(globalThis,Object.getOwnPropertyDescriptors({
+        get event(){windowReceiver(this);return currentEvent;},
+        set event(v){windowReceiver(this);replace('event',v);}}));}
     Object.defineProperty(Document.prototype,'cookie',{get(){return this===document?host.cookie():'';},set(v){v=String(v);if(this===document)host.cookie(v);}});
     Object.defineProperties(globalThis,{
         scrollX:{get(){return host.scroll(0);}},pageXOffset:{get(){return host.scroll(0);}},
@@ -1141,6 +1484,9 @@
     /* @include js_indexeddb.js */
     /* @include js_opfs.js */
     installOriginPrivateFileSystem(host,cryptoSecureContext,Navigator,false);
+    /* @include js_cache_storage.js */
+    installCacheStorage({...fetchBridge.cache,secure:cryptoSecureContext,native:host.cacheStorage,
+        embedderPolicy:host.cacheEmbedderPolicy,streams:streamBridge});
     /* @include js_messaging.js */
     /* @include js_websocket.js */
     /* @include js_css_supports.js */
@@ -1149,20 +1495,23 @@
     /* @include js_history.js */
     /* @include js_custom_elements.js */
     /* @include js_media.js */
+    /* @include js_geometry.js */
+    const geometryBridge=geometryInterfaces({parse:host.transformMatrix,list:collectionBridge.typed});
     /* @include js_observers.js */
     /* @include js_mutations.js */
     /* @include js_selection.js */
     /* @include js_document.js */
-    /* @include js_document_commands.js */
     /* @include js_frames.js */
     /* @include js_range.js */
     /* @include js_document_selection.js */
+    /* @include js_document_commands.js */
     /* @include js_traversal.js */
-    /* @include js_geometry.js */
+    /* @include js_xpath.js */
     /* @include js_svg.js */
     /* @include js_attributes.js */
     /* @include js_shadow.js */
     /* @include js_stylesheets.js */
+    /* @include js_font_loading.js */
     /* @include js_animations.js */
     /* @include js_web_legacy.js */
     /* @include js_form_controls.js */
@@ -1221,59 +1570,10 @@
     }
     ownMembersToPrototype(document,Document.prototype,['location']);
     ownMembersToPrototype(navigator,Navigator.prototype,[]);
-    /* WebIDL gives each operation a function named by its identifier, each
-       attribute getter/setter "get <id>"/"set <id>", and each interface object
-       its interface name. Bootstrap members are written as object-literal
-       methods and shared closures, so give them their WebIDL names before any
-       author script observes them. A spec alias (Set.prototype.keys, String's
-       trimLeft) keeps the name of the member it aliases; one function serving
-       two attributes gets a delegating function for the second. */
-    (()=>{
-        const named=new Map(),skip=new Set(['prototype','length','name','caller','arguments','constructor']);
-        function rename(fn,name){
-            const previous=named.get(fn);
-            if(previous!==undefined)return previous===name;
-            named.set(fn,name);
-            if(fn.name===name)return true;
-            try{Object.defineProperty(fn,'name',{value:name,configurable:true});return true;}catch(e){return false;}
-        }
-        function delegate(f,kind,key){
-            const holder=kind==='get'?{get [key](){return apply(f,this,[]);}}:kind==='set'?{set [key](v){apply(f,this,[v]);}}:{[key](...a){return apply(f,this,a);}};
-            const d=Object.getOwnPropertyDescriptor(holder,key),w=kind==='value'?d.value:d[kind];
-            Object.defineProperty(w,'length',{value:f.length,configurable:true});
-            named.set(w,kind==='value'?key:kind+' '+key);
-            return w;
-        }
-        function members(object){
-            for(const key of Object.getOwnPropertyNames(object)){
-                if(skip.has(key))continue;
-                const d=Object.getOwnPropertyDescriptor(object,key);
-                let replaced=false;
-                if(typeof d.value==='function'){
-                    const f=d.value,alias=f.name&&f.name!==key&&Object.getOwnPropertyDescriptor(object,f.name);
-                    if(alias&&alias.value===f){named.set(f,f.name);continue;}
-                    if(!rename(f,key)&&d.configurable){d.value=delegate(f,'value',key);replaced=true;}
-                }
-                for(const kind of ['get','set']){
-                    const f=d[kind];if(typeof f!=='function')continue;
-                    if(!rename(f,kind+' '+key)&&d.configurable){d[kind]=delegate(f,kind,key);replaced=true;}
-                }
-                if(replaced)Object.defineProperty(object,key,d);
-            }
-        }
-        for(const key of Object.getOwnPropertyNames(globalThis)){
-            const d=Object.getOwnPropertyDescriptor(globalThis,key);
-            /* Namespaces (console, CSS, ...) are plain objects of operations;
-               a WebIDL namespace sits on an empty object over Object.prototype. */
-            const namespaceProto=d.value&&typeof d.value==='object'&&Object.getPrototypeOf(d.value);
-            if(namespaceProto&&(namespaceProto===Object.prototype||Object.getPrototypeOf(namespaceProto)===Object.prototype&&!Reflect.ownKeys(namespaceProto).length)){members(d.value);continue;}
-            if(typeof d.value!=='function')continue;
-            const c=d.value;
-            if(c.name!==key&&globalThis[c.name]!==c)rename(c,key);else named.set(c,c.name);
-            members(c);
-            if(c.prototype&&typeof c.prototype==='object'&&key[0]>='A'&&key[0]<='Z')members(c.prototype);
-        }
-    })();
+    /* The ECMAScript shape Web IDL gives every interface, namespace and member these
+       bindings define (js_webidl.c, from the specifications' IDL), before any author
+       script observes them. */
+    host.webidl('Window');
     frameBridge.finalizeMethods();
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
@@ -1332,18 +1632,25 @@
     }
     return {
         presentationSync:presentationBridge.sync,
+        animationUpdate:animationBridge.update,
+        animationEvents:animationBridge.events,
         resourceTiming:performanceBridge.resource,
+        navigationTimingQueued:performanceBridge.navigationQueued,
+        paintTiming:performanceBridge.paint,
         workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
         storageEvent:storageBridge.deliver,
         languageChange(){if(!languagesChanged())return;const event=new Event('languagechange');eventState(event).isTrusted=true;dispatch(globalThis,event);},
         // HTML "update the visibility state" steps 3 and 7 (js.c web_js_visibility_changed).
+        // CSSOM View's resize steps (js.c run_resize_steps).
+        resizeSteps(){viewportBridge.resize();},
         visibilityChange(visibility,time){
             performanceBridge.visibility(visibility,time);
             const event=new Event('visibilitychange',{bubbles:true});eventState(event).isTrusted=true;dispatch(document,event);
         },
         indexedDBTaskEnd:indexedDBBridge.taskEnd,
         promiseRejection:rejectionBridge.unhandled,
+        reportException,
         promiseRejectionHandled:rejectionBridge.handled,
         formNamedProperty:formNameBridge.property,
         formNamedKeys:formNameBridge.keys,
@@ -1366,6 +1673,9 @@
         documentOpenReset:resetDocumentEvents,
         parserBodyHandlers,
         documentCommandEvent:documentCommandBridge.event,
+        editingAction:(...args)=>documentCommandBridge.userAction(...args),
+        editingFocus:(...args)=>documentCommandBridge.focused(...args),
+        selectionText:()=>documentCommandBridge.selectionText(),
         frameMethodOriginal:frameBridge.methodOriginal,
         frameWindowProxy:frameBridge.windowProxy,
         windowMessageMethod:messagingBridge.postMessage,
@@ -1389,13 +1699,16 @@
             const ceActive=customElementsBridge.active()&&(['clone','import'].includes(args[0]) || reactionNode && rawDom.get(reactionNode,'scripting') || args[0]==='adopt' && rawDom.get(args[1],'scripting'));
             const ce=ceActive?customElementsBridge.before(...args):null;
             let mutationArgs=reactionArgs;
+            /* a move's live range and NodeIterator updates are those of a removal and insertion */
+            if(args[0]==='move')mutationArgs=['insert',...args.slice(1)];
             if(args[0]==='set' && args[2]==='innerHTML' && args[1] instanceof HTMLTemplateElement)
                 mutationArgs=['set',rawDom.get(args[1],'templateContent'),'innerHTML',args[3]];
             const mutation=mutationBridge.native?null:mutationBridge.before(...mutationArgs);
             const range=rangeBridge.active()?rangeBridge.before(...mutationArgs):null;
-            return ce||mutation||range?{ce,mutation,range,op:args[0]}:null;
+            const traversal=traversalBridge.before(...mutationArgs);
+            return ce||mutation||range||traversal?{ce,mutation,range,traversal,op:args[0]}:null;
         },
-        customElementAfter(token,result){rangeBridge.after(token.range);if(!mutationBridge.native)mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
+        customElementAfter(token,result){rangeBridge.after(token.range);traversalBridge.after(token.traversal);if(!mutationBridge.native)mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
         customElementCloneDocuments:customElementsBridge.cloneDocuments,
         mutationFlush(){mutationBridge.flush();},
         customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},
@@ -1415,6 +1728,8 @@
         historyOperation:historyBridge.operation,
         historySecurityError:historyBridge.securityError,
         mediaChanged(){mediaBridge.changed();},
+        // CSS Font Loading's font loading task (js.c web_js_tick).
+        fontsChanged(){fontLoadingBridge.changed();},
         avmediaActivate(node){return avmediaBridge.activate(node);},
         inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true,composed:true}));},
         nodeProtos:[Node.prototype,HTMLDocument.prototype,Element.prototype,HTMLElement.prototype,
@@ -1427,7 +1742,8 @@
             HTMLModElement.prototype,HTMLUListElement.prototype,HTMLDListElement.prototype,HTMLDirectoryElement.prototype,
             HTMLLegendElement.prototype,HTMLOptGroupElement.prototype,HTMLMapElement.prototype,HTMLEmbedElement.prototype,
             HTMLParamElement.prototype,HTMLFontElement.prototype,HTMLFrameSetElement.prototype,HTMLMarqueeElement.prototype,
-            ...htmlTablesBridge.nodeProtos,svgBridge.groupProto],
+            ...htmlTablesBridge.nodeProtos,svgBridge.groupProto,
+            documentBridge.xmlDocumentPrototype,Document.prototype,CDATASection.prototype],
         dispatch:nativeDispatch,
         // js_webaudio.js, run apart when the page first touches a Web Audio interface.
         webaudioBridge:{host,Event,EventTarget,DOMException,eventState,dispatch,handlerValue,setHandler,Promise,

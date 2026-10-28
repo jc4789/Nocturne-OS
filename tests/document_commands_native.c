@@ -11,7 +11,7 @@ enum web_input_kind {WEB_INPUT_TEXT,WEB_INPUT_SEARCH,WEB_INPUT_TEL,WEB_INPUT_URL
 typedef struct web_doc web_doc;
 typedef struct node {web_doc *owner;int type,tag,kind;bool disabled,readonly;char *value;const char *maxlength;uint32_t selection_start,selection_end;JSValue wrapper;} node_t;
 struct web_js_state {JSContext *ctx;bool disabled;JSValue hooks;};
-struct web_doc {struct web_js_state *js;node_t *root,*focus;bool live,inert;};
+struct web_doc {struct web_js_state *js;node_t *root,*focus;bool live,inert,design_mode,dirty;};
 static JSClassID node_class;static node_t control;static web_doc document;
 static node_t *unwrap(JSContext *ctx,JSValueConst value){return JS_GetOpaque2(ctx,value,node_class);}
 static JSValue wrap(struct web_js_state *s,node_t *n){return n?JS_DupValue(s->ctx,n->wrapper):JS_NULL;}
@@ -28,7 +28,24 @@ static void doc_control_selection(web_doc *d,node_t *n,uint32_t a,uint32_t b,int
 static bool web_input_user_value(web_doc *d,node_t *n,const char *text,size_t len){char *p=malloc(len+1);if(!p)return false;memcpy(p,text,len);p[len]=0;free(n->value);n->value=p;return true;}
 static JSValue oom(JSContext *ctx){return JS_ThrowOutOfMemory(ctx);}
 static JSValue custom_element_hook(struct web_js_state *s,const char *name,int argc,JSValueConst *argv){JSValue f=JS_GetPropertyStr(s->ctx,s->hooks,name),r=JS_Call(s->ctx,f,s->hooks,argc,argv);JS_FreeValue(s->ctx,f);return r;}
+/* The CSS answers js_document_commands.h gives the editing layer; this fixture's
+   commands do not reach them but for the font keyword sizes. */
+#define COLOR_CURRENT 0x00FFFFFEu
+typedef struct sbuf {char *p;size_t n,cap;} sbuf;
+struct css_color {double c[3],alpha;};
+typedef struct style style_t;
+static bool css_color(const char *s,size_t n,uint32_t *out){(void)s;(void)n;(void)out;return false;}
+static bool css_color_parse_used(const char *s,size_t n,const style_t *(*element)(void *),void *context,struct css_color *out){(void)s;(void)n;(void)element;(void)context;(void)out;return false;}
+static bool css_color_serialize(const struct css_color *c,bool html,sbuf *out){(void)c;(void)html;(void)out;return false;}
+static void sb_free(sbuf *b){free(b->p);b->p=NULL;b->n=b->cap=0;}
+static float css_font_keyword_px(unsigned keyword){static const float px[]={9,10,13,16,18,24,32,48};return px[keyword<8?keyword:3];}
+static void css_mark_dirty(web_doc *d,node_t *n){(void)d;(void)n;}
 #include "user/libc/web/js_document_commands.h"
+#include "user/libc/web/js_bootstrap.inc"
+static JSValue print_text(JSContext *ctx,JSValueConst receiver,int argc,JSValueConst *argv){
+    for(int i=0;i<argc;i++){const char *t=JS_ToCString(ctx,argv[i]);printf(i?" %s":"%s",t?t:"?");JS_FreeCString(ctx,t);}
+    printf("\n");return JS_UNDEFINED;
+}
 static JSValue native_dom(JSContext *ctx,JSValueConst receiver,int argc,JSValueConst *argv){return document_command_dom(document.js,argc>1?unwrap(ctx,argv[1]):NULL,argc,argv);}
 static JSValue brand(JSContext *ctx,JSValueConst receiver,int argc,JSValueConst *argv){node_t *n=argc?unwrap(ctx,argv[0]):NULL;if(!n||n->type!=N_DOC)return JS_ThrowTypeError(ctx,"Document required");return JS_DupValue(ctx,argv[0]);}
 static JSValue flag(JSContext *ctx,JSValueConst receiver,int argc,JSValueConst *argv){
@@ -53,6 +70,10 @@ int main(void){
     JSValue g=JS_GetGlobalObject(s.ctx);
     JS_SetPropertyStr(s.ctx,g,"document",JS_DupValue(s.ctx,root.wrapper));JS_SetPropertyStr(s.ctx,g,"control",JS_DupValue(s.ctx,control.wrapper));
     JS_SetPropertyStr(s.ctx,g,"rawDom",JS_NewCFunction(s.ctx,native_dom,"rawDom",4));JS_SetPropertyStr(s.ctx,g,"nativeBrand",JS_NewCFunction(s.ctx,brand,"brand",1));
+    JS_SetPropertyStr(s.ctx,g,"print",JS_NewCFunction(s.ctx,print_text,"print",1));
+    {JSValue editing=JS_Eval(s.ctx,js_editing,sizeof js_editing-1,"nocturne:editing",JS_EVAL_TYPE_GLOBAL);
+     if(JS_IsException(editing)){printf("EDITING PROGRAM EXCEPTION\n");return 1;}
+     JS_SetPropertyStr(s.ctx,g,"editingProgram",editing);}
     JS_SetPropertyStr(s.ctx,g,"flag",JS_NewCFunction(s.ctx,flag,"flag",3));JS_SetPropertyStr(s.ctx,g,"value",JS_NewCFunction(s.ctx,value_get,"value",0));JS_SetPropertyStr(s.ctx,g,"caret",JS_NewCFunction(s.ctx,position_get,"caret",0));JS_FreeValue(s.ctx,g);
     FILE *f=fopen("build/goal-20261009/document-command-bindings.js","rb");fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);char *bytes=malloc(n+1);fread(bytes,1,n,f);fclose(f);bytes[n]=0;
     s.hooks=JS_Eval(s.ctx,bytes,n,"new-document-command-boundary",JS_EVAL_TYPE_GLOBAL);free(bytes);

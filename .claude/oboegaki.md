@@ -82,3 +82,8 @@ CWriter の Write には char の重ね書きが無く、Write('.') や Write(Ma
 - 節を外す（dom.c の doc_node_remove）と css_node_style_unpublish が style を NULL にし、arena は残す。同じ親へ入れ直す（並べ替え）と、cascade は style_previous の無いまま新しい装いを作り、古い arena は retire で放される。箱は local_splice が「box_regen でなければ残す」ので、box_regen を立てないと古い st のまま残る。2026-10-27、これでスクロール中に css_transform_general が落ちた（再現は Bilibili の頁の、shadow DOM の中の並べ替え）。
 - display:contents の要素は箱を持たず、その文字・::before・::after の箱が装いを借りる。modal の dialog の ::backdrop の箱は root の子で anon。どちらも mark_style_borrowers が印を付ける。
 - 確かめ方：release の直前に全部の箱で replacement_style(box_style_node(b),b->st)!=b->st を探すと付け替え漏れが、st!=node->style（node->box==b）を探すと作り直し漏れが見える。
+
+## guest の試験は作業木のヘッダーで組まれる
+対象: scripts/test.py, tests/runtests.c, user/libc/web/webi.h
+確かめた: 2026-10-28 cd5be8b6
+test.py の test_files は、始まった時点の作業木の tests/*.c と webi.h・cssom.h・quickjs.h などを C:\Tests へ写し、guest の tcc がそれで試験を組む。媒体の libc はビルドした時点のヘッダーで組まれている。だから媒体を作った後に webi.h（style_t・struct cx・web_doc などの形）を変えて test.py を始めると、試験と libc の構造体の形が食い違い、webi.h を含む試験（csscachetest・lexbortest・html5lib_tree_test・paintperformancetest など）が番地 0 や stack の壊れで落ちる。2026-10-28 の 1028i の回で起きた（媒体は 11:09 に組み終え、11:08 の取り込みが webi.h を変え、試験は 11:12 に始まった）。媒体を作った後に作業を続けるなら、媒体のコミットの写し（`git archive <commit> tests user scripts third_party/quickjs/quickjs.h` を build の下へ展開）を `--source-tree` で渡す。test.py が照合する sha256 は kernel と programs だけで、ヘッダーの食い違いは見ない。

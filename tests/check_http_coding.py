@@ -1,6 +1,7 @@
 """Host check of user/libc/http_coding.h, the content-coding decoders of an HTTP response.
 
-Builds tests/http_coding_hosttest.c with the product brotli adapter and decoder, then feeds it
+Builds tests/http_coding_hosttest.c with the product DEFLATE codec (deflate.c) and brotli
+adapter and library, then feeds it
 WPT's fetch/content-encoding resources (br, gzip; zstd is not supported, so its bytes must come
 back untouched) and deflate, layered and broken bodies made here, cut at several read sizes.
 Not live websites and not the guest: http.c's header parsing and the guest run are outside it.
@@ -16,10 +17,10 @@ wpt = Path(r"D:\Programes\cloned repos\wpt\fetch\content-encoding")
 out = root / "build" / "coding-host"
 out.mkdir(parents=True, exist_ok=True)
 exe = out / "http_coding_hosttest.exe"
-brotli = sorted(str(p) for p in (root / "third_party/brotli/c").glob("common/*.c")) + \
-    sorted(str(p) for p in (root / "third_party/brotli/c").glob("dec/*.c"))
+brotli = [str(p) for part in ("common", "dec", "enc") for p in sorted((root / "third_party/brotli/c" / part).glob("*.c"))]
 subprocess.run([str(root / "tools/msys64/ucrt64/bin/clang.exe"), "-O2", "-DBROTLI_BUILD_PORTABLE",
-                "-I" + str(root / "third_party/brotli/c/include"), str(root / "tests/http_coding_hosttest.c"),
+                "-I" + str(root / "third_party/brotli/c/include"), "-idirafter", str(root / "user/include"),
+                str(root / "tests/http_coding_hosttest.c"), str(root / "user/libc/deflate.c"),
                 str(root / "user/libc/third_party_brotli.c"), *brotli, "-o", str(exe)], check=True)
 
 checks = failed = 0
@@ -100,6 +101,25 @@ expect("empty gzip", "gzip", b"", b"")
 expect("empty br", "br", b"", b"")
 expect("empty layers", "deflate, gzip", b"", b"")
 expect("inner layer broken", "deflate, gzip", gzip.compress(bad_adler), error="invalid or truncated deflate")
+
+# Fetch's filtered coding (response body info's content encoding, Resource Timing's
+# contentEncoding): resource-timing/content-encoding.https.html's gzip, deflate and br
+# (its dcb and dcz are codings this client lacks: "@unknown"), and the #rule list.
+FILTERED = [
+    (None, ""), ("", ""), (" , ,", ""), ("gzip", "gzip"), ("GZip", "gzip"), ("deflate", "deflate"),
+    ("br", "br"), (" br\t", "br"), ("x-gzip", "x-gzip"), ("identity", "identity"),
+    ("gzip, ", "gzip"), (", br", "br"), ("gzip, br", "multiple"), ("gzip,gzip", "multiple"),
+    ("zstd", "@unknown"), ("dcb", "@unknown"), ("dcz", "@unknown"), ("compress", "@unknown"),
+    ("gz ip", ""), ("gzip;q=1", ""), ("br\x7f", ""), ("gzip, b r", ""),
+    ("averyveryverylongcoding", "@unknown"),
+]
+for value, want in FILTERED:
+    checks += 1
+    args = [str(exe), "--filtered"] + ([] if value is None else [value])
+    got = subprocess.run(args, capture_output=True).stdout.decode("ascii").rstrip("\r\n")
+    if got != want:
+        failed += 1
+        print(f"FAIL filtered {value!r}: {got!r}, wanted {want!r}")
 
 print(f"http coding: {checks} checks, {failed} failed")
 sys.exit(1 if failed else 0)

@@ -191,6 +191,7 @@ enum {
     JS_CLASS_ASYNC_FUNCTION_RESOLVE,    /* u.async_function_data */
     JS_CLASS_ASYNC_FUNCTION_REJECT,     /* u.async_function_data */
     JS_CLASS_ASYNC_FROM_SYNC_ITERATOR,  /* u.async_from_sync_iterator_data */
+    JS_CLASS_ARRAY_FROM_ASYNC,  /* u.opaque (JSArrayFromAsyncData) */
     JS_CLASS_ASYNC_GENERATOR_FUNCTION,  /* u.func */
     JS_CLASS_ASYNC_GENERATOR,   /* u.async_generator_data */
     JS_CLASS_WEAK_REF,
@@ -1429,6 +1430,8 @@ static BOOL js_get_fast_array(JSContext *ctx, JSValueConst obj,
                               JSValue **arrpp, uint32_t *countp);
 static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
                                               JSValueConst sync_iter);
+static JSValue js_array_fromAsync(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv);
 static void js_c_function_data_finalizer(JSRuntime *rt, JSValue val);
 static void js_c_function_data_mark(JSRuntime *rt, JSValueConst val,
                                     JS_MarkFunc *mark_func);
@@ -2375,7 +2378,6 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 }
 
 #ifdef CONFIG_NOCTURNE
-static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
 static JSContext *JS_GetJobCallbackRealm(JSContext *ctx, JSValueConst callback,
                                          BOOL *propagation_only);
 
@@ -3885,6 +3887,16 @@ static BOOL JS_AtomIsArrayIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
         }
     }
 }
+
+#ifdef CONFIG_NOCTURNE
+int JS_AtomKeyKind(JSContext *ctx, JSAtom atom, uint32_t *pindex)
+{
+    if (JS_AtomIsArrayIndex(ctx, pindex, atom))
+        return JS_ATOM_KEY_INDEX;
+    return JS_AtomGetKind(ctx, atom) == JS_ATOM_KIND_STRING ?
+        JS_ATOM_KEY_STRING : JS_ATOM_KEY_SYMBOL;
+}
+#endif
 
 /* This test must be fast if atom is not a numeric index (e.g. a
    method name). Return JS_UNDEFINED if not a numeric
@@ -8144,6 +8156,13 @@ static int __attribute__((format(printf, 3, 4))) JS_ThrowTypeErrorOrFalse(JSCont
     }
 }
 
+#ifdef CONFIG_NOCTURNE
+int JS_ThrowTypeErrorOrFalseStr(JSContext *ctx, int flags, const char *message)
+{
+    return JS_ThrowTypeErrorOrFalse(ctx, flags, "%s", message);
+}
+#endif
+
 /* never use it directly */
 static JSValue __attribute__((format(printf, 3, 4))) __JS_ThrowTypeErrorAtom(JSContext *ctx, JSAtom atom, const char *fmt, ...)
 {
@@ -9047,6 +9066,46 @@ void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab, uint32_t len)
     }
 }
 
+#ifdef CONFIG_NOCTURNE
+/* A host exotic class's own keys and, when 'flags' asks, whether each is
+   enumerable. Its get_own_property_names and get_own_property may run
+   JavaScript, which may change the object's shape, so the caller asks them
+   before it counts the ordinary properties. */
+static int js_exotic_own_keys(JSContext *ctx, JSPropertyEnum **ptab,
+                              uint32_t *plen, JSObject *p, int flags)
+{
+    const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
+    JSPropertyEnum *tab;
+    uint32_t i, count;
+
+    *ptab = NULL;
+    *plen = 0;
+    if (!em || !em->get_own_property_names)
+        return 0;
+    if (em->get_own_property_names(ctx, &tab, &count, JS_MKPTR(JS_TAG_OBJECT, p)))
+        return -1;
+    for(i = 0; i < count; i++) {
+        tab[i].is_enumerable = FALSE;
+        if ((flags & (JS_GPN_SET_ENUM | JS_GPN_ENUM_ONLY)) &&
+            ((flags >> JS_AtomGetKind(ctx, tab[i].atom)) & 1) != 0) {
+            JSPropertyDescriptor desc;
+            int res = JS_GetOwnPropertyInternal(ctx, &desc, p, tab[i].atom);
+            if (res < 0) {
+                JS_FreePropertyEnum(ctx, tab, count);
+                return -1;
+            }
+            if (res) {
+                tab[i].is_enumerable = (desc.flags & JS_PROP_ENUMERABLE) != 0;
+                js_free_desc(ctx, &desc);
+            }
+        }
+    }
+    *ptab = tab;
+    *plen = count;
+    return 0;
+}
+#endif
+
 /* return < 0 in case if exception, 0 if OK. ptab and its atoms must
    be freed by the user. */
 static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
@@ -9061,6 +9120,9 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     JSAtom atom;
     uint32_t num_keys_count, str_keys_count, sym_keys_count, atom_count;
     uint32_t num_index, str_index, sym_index, exotic_count, exotic_keys_count;
+#ifdef CONFIG_NOCTURNE
+    uint32_t exotic_index;
+#endif
     BOOL is_enumerable, num_sorted;
     uint32_t num_key;
     JSAtomKindEnum kind;
@@ -9076,6 +9138,11 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     exotic_keys_count = 0;
     exotic_count = 0;
     tab_exotic = NULL;
+#ifdef CONFIG_NOCTURNE
+    if (p->is_exotic && !p->fast_array && p->class_id != JS_CLASS_STRING &&
+        js_exotic_own_keys(ctx, &tab_exotic, &exotic_count, p, flags))
+        return -1;
+#endif
     sh = p->shape;
     for(i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
         atom = prs->atom;
@@ -9091,6 +9158,9 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                     JSVarRef *var_ref = p->prop[i].u.var_ref;
                     if (unlikely(JS_IsUninitialized(*var_ref->pvalue))) {
                         JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
+#ifdef CONFIG_NOCTURNE
+                        JS_FreePropertyEnum(ctx, tab_exotic, exotic_count);
+#endif
                         return -1;
                     }
                 }
@@ -9115,6 +9185,22 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                 num_keys_count += js_string_obj_get_length(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
             }
         } else {
+#ifdef CONFIG_NOCTURNE
+            for(i = 0; i < exotic_count; i++) {
+                atom = tab_exotic[i].atom;
+                /* A key that is also an ordinary own property is listed
+                   once, as that property. */
+                if (find_own_property1(p, atom)) {
+                    JS_FreeAtom(ctx, atom);
+                    tab_exotic[i].atom = JS_ATOM_NULL;
+                    continue;
+                }
+                kind = JS_AtomGetKind(ctx, atom);
+                if (((flags >> kind) & 1) != 0 &&
+                    (!(flags & JS_GPN_ENUM_ONLY) || tab_exotic[i].is_enumerable))
+                    exotic_keys_count++;
+            }
+#else
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->get_own_property_names) {
                 if (em->get_own_property_names(ctx, &tab_exotic, &exotic_count,
@@ -9147,6 +9233,7 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                     }
                 }
             }
+#endif
         }
     }
 
@@ -9175,7 +9262,12 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     }
 
     num_index = 0;
+#ifdef CONFIG_NOCTURNE
+    exotic_index = num_keys_count;
+    str_index = num_keys_count + exotic_keys_count;
+#else
     str_index = num_keys_count;
+#endif
     sym_index = str_index + str_keys_count;
 
     num_sorted = TRUE;
@@ -9223,6 +9315,26 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                 }
             }
         } else {
+#ifdef CONFIG_NOCTURNE
+            /* Web IDL's [[OwnPropertyKeys]] of a legacy platform object: the
+               host's keys (its indices, then its names) come before the
+               ordinary string keys and the symbols. */
+            for(i = 0; i < exotic_count; i++) {
+                atom = tab_exotic[i].atom;
+                if (atom == JS_ATOM_NULL)
+                    continue;
+                is_enumerable = tab_exotic[i].is_enumerable;
+                kind = JS_AtomGetKind(ctx, atom);
+                if ((!(flags & JS_GPN_ENUM_ONLY) || is_enumerable) &&
+                    ((flags >> kind) & 1) != 0) {
+                    tab_atom[exotic_index].atom = atom;
+                    tab_atom[exotic_index].is_enumerable = is_enumerable;
+                    exotic_index++;
+                } else {
+                    JS_FreeAtom(ctx, atom);
+                }
+            }
+#else
             /* Note: exotic keys are not reordered and comes after the object own properties. */
             for(i = 0; i < exotic_count; i++) {
                 atom = tab_exotic[i].atom;
@@ -9237,12 +9349,18 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                     JS_FreeAtom(ctx, atom);
                 }
             }
+#endif
             js_free(ctx, tab_exotic);
         }
     }
 
     assert(num_index == num_keys_count);
+#ifdef CONFIG_NOCTURNE
+    assert(exotic_index == num_keys_count + exotic_keys_count);
+    assert(str_index == num_keys_count + exotic_keys_count + str_keys_count);
+#else
     assert(str_index == num_keys_count + str_keys_count);
+#endif
     assert(sym_index == atom_count);
 
     if (num_keys_count != 0 && !num_sorted) {
@@ -21348,7 +21466,8 @@ static JSValue JS_CallFree(JSContext *ctx, JSValue func_obj, JSValueConst this_o
 
 /* warning: the refcount of the context is not incremented. Return
    NULL in case of exception (case of revoked proxy only) */
-static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
+/* Nocturne: public (quickjs.h), for the host's "associated realm" of a callback. */
+JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
 {
     JSObject *p;
     JSContext *realm;
@@ -21401,6 +21520,44 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     return realm;
     }
 }
+
+#ifdef CONFIG_NOCTURNE
+/* The realm of an object that is not callable (quickjs.h). ECMAScript records
+   a realm only for functions; any other object is given the realm whose
+   %Object.prototype% ends its prototype chain. Only shapes are read and no
+   JavaScript runs: a Proxy is followed to its target, as GetFunctionRealm
+   does, never asked for a prototype. */
+JSContext *JS_GetObjectRealm(JSContext *ctx, JSValueConst obj)
+{
+    struct list_head *el;
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return ctx;
+    if (JS_IsFunction(ctx, obj))
+        return JS_GetFunctionRealm(ctx, obj);
+    p = JS_VALUE_GET_OBJ(obj);
+    for (;;) {
+        if (p->class_id == JS_CLASS_PROXY) {
+            JSProxyData *s = p->u.opaque;
+            if (!s || s->is_revoked || JS_VALUE_GET_TAG(s->target) != JS_TAG_OBJECT)
+                return ctx;
+            p = JS_VALUE_GET_OBJ(s->target);
+            continue;
+        }
+        if (!p->shape->proto)
+            break;
+        p = p->shape->proto;
+    }
+    list_for_each(el, &ctx->rt->context_list) {
+        JSContext *realm = list_entry(el, JSContext, link);
+        JSValueConst proto = realm->class_proto[JS_CLASS_OBJECT];
+        if (JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(proto) == p)
+            return realm;
+    }
+    return ctx;
+}
+#endif
 
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
                                    int class_id)
@@ -42572,7 +42729,10 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
             return JS_NewStringLen(ctx, b->debug.source->text + b->debug.source_start,
                                    b->debug.source_len);
         }
-        func_kind = b->func_kind;
+        /* Nocturne: a function without its source is a platform binding (js.c compiles
+           only those with JS_STRIP_SOURCE), a built-in function object, whose string is
+           ECMA-262 NativeFunction syntax: no async or generator prefix. */
+        func_kind = JS_FUNC_NORMAL;
     }
     {
         JSValue name;
@@ -43157,6 +43317,7 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj, int64_t l
 static const JSCFunctionListEntry js_array_funcs[] = {
     JS_CFUNC_DEF("isArray", 1, js_array_isArray ),
     JS_CFUNC_DEF("from", 1, js_array_from ),
+    JS_CFUNC_DEF("fromAsync", 1, js_array_fromAsync ),
     JS_CFUNC_DEF("of", 0, js_array_of ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
 };
@@ -56090,6 +56251,434 @@ static const JSCFunctionListEntry js_async_from_sync_iterator_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("throw", 1, js_async_from_sync_iterator_next, GEN_MAGIC_THROW ),
 };
 
+/* Array.fromAsync */
+
+/* The specification gives Array.fromAsync as an abstract closure started with
+   AsyncFunctionStart. Here the closure is a state object: what it captures and its
+   variables live in JSArrayFromAsyncData, and each Await is PromiseResolve(%Promise%)
+   and PerformPromiseThen with two resume functions, as an async function's await is.
+   'awaiting' tells which await a settlement resumes. */
+typedef enum {
+    FROM_ASYNC_NEXT,        /* the iterator's next result */
+    FROM_ASYNC_MAPPED,      /* mapfn's result for an iterated value */
+    FROM_ASYNC_ITEM,        /* an array-like's element */
+    FROM_ASYNC_ITEM_MAPPED, /* mapfn's result for an array-like's element */
+    FROM_ASYNC_CLOSE,       /* the iterator's return() result; then reject with 'error' */
+} JSArrayFromAsyncAwait;
+
+typedef struct JSArrayFromAsyncData {
+    JSValue resolving_funcs[2]; /* the returned promise's */
+    JSValue ctor;               /* C, the this value */
+    JSValue mapfn, this_arg;
+    JSValue array_like;         /* undefined when iterating */
+    JSValue iter, next_method;  /* the iterator record, undefined for an array-like */
+    JSValue result;             /* A */
+    JSValue error;              /* the completion AsyncIteratorClose returns */
+    int64_t k, len;
+    BOOL mapping;
+    JSArrayFromAsyncAwait awaiting;
+} JSArrayFromAsyncData;
+
+static void js_array_from_async_free_values(JSRuntime *rt, JSArrayFromAsyncData *s)
+{
+    JSValue *values[] = { &s->resolving_funcs[0], &s->resolving_funcs[1], &s->ctor,
+                          &s->mapfn, &s->this_arg, &s->array_like, &s->iter,
+                          &s->next_method, &s->result, &s->error };
+    int i;
+
+    for(i = 0; i < countof(values); i++) {
+        JS_FreeValueRT(rt, *values[i]);
+        *values[i] = JS_UNDEFINED;
+    }
+}
+
+static void js_array_from_async_finalizer(JSRuntime *rt, JSValue val)
+{
+    JSArrayFromAsyncData *s = JS_GetOpaque(val, JS_CLASS_ARRAY_FROM_ASYNC);
+    if (s) {
+        js_array_from_async_free_values(rt, s);
+        js_free_rt(rt, s);
+    }
+}
+
+static void js_array_from_async_mark(JSRuntime *rt, JSValueConst val,
+                                     JS_MarkFunc *mark_func)
+{
+    JSArrayFromAsyncData *s = JS_GetOpaque(val, JS_CLASS_ARRAY_FROM_ASYNC);
+    if (s) {
+        JS_MarkValue(rt, s->resolving_funcs[0], mark_func);
+        JS_MarkValue(rt, s->resolving_funcs[1], mark_func);
+        JS_MarkValue(rt, s->ctor, mark_func);
+        JS_MarkValue(rt, s->mapfn, mark_func);
+        JS_MarkValue(rt, s->this_arg, mark_func);
+        JS_MarkValue(rt, s->array_like, mark_func);
+        JS_MarkValue(rt, s->iter, mark_func);
+        JS_MarkValue(rt, s->next_method, mark_func);
+        JS_MarkValue(rt, s->result, mark_func);
+        JS_MarkValue(rt, s->error, mark_func);
+    }
+}
+
+/* The closure returns (resolve) or throws (reject); 'value' is taken. */
+static void js_array_from_async_settle(JSContext *ctx, JSArrayFromAsyncData *s,
+                                       BOOL is_reject, JSValue value)
+{
+    JSValue ret;
+
+    ret = JS_Call(ctx, s->resolving_funcs[is_reject], JS_UNDEFINED,
+                  1, (JSValueConst *)&value);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, ret);
+    js_array_from_async_free_values(ctx->rt, s);
+}
+
+static void js_array_from_async_reject(JSContext *ctx, JSArrayFromAsyncData *s)
+{
+    js_array_from_async_settle(ctx, s, TRUE, JS_GetException(ctx));
+}
+
+static JSValue js_array_from_async_resume(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv,
+                                          int magic, JSValue *func_data);
+
+/* Await(value), 'value' taken. < 0 with the exception pending when the await throws
+   at once (PromiseResolve's Get of "constructor"). */
+static int js_array_from_async_await(JSContext *ctx, JSValueConst state,
+                                     JSArrayFromAsyncData *s, JSValue value,
+                                     JSArrayFromAsyncAwait awaiting)
+{
+    JSValue promise, resume[2], none[2];
+    int i, res;
+
+    promise = js_promise_resolve(ctx, ctx->promise_ctor, 1,
+                                 (JSValueConst *)&value, 0);
+    JS_FreeValue(ctx, value);
+    if (JS_IsException(promise))
+        return -1;
+    for(i = 0; i < 2; i++) {
+        resume[i] = JS_NewCFunctionData(ctx, js_array_from_async_resume, 1, i,
+                                        1, &state);
+        if (JS_IsException(resume[i])) {
+            if (i == 1)
+                JS_FreeValue(ctx, resume[0]);
+            JS_FreeValue(ctx, promise);
+            return -1;
+        }
+        none[i] = JS_UNDEFINED;
+    }
+    s->awaiting = awaiting;
+    res = perform_promise_then(ctx, promise, (JSValueConst *)resume,
+                               (JSValueConst *)none);
+    for(i = 0; i < 2; i++)
+        JS_FreeValue(ctx, resume[i]);
+    JS_FreeValue(ctx, promise);
+    return res;
+}
+
+/* AsyncIteratorClose(iteratorRecord, the pending exception): its return() is called and
+   its result awaited, and the closure throws the pending exception whatever they do. */
+static void js_array_from_async_close(JSContext *ctx, JSValueConst state,
+                                      JSArrayFromAsyncData *s)
+{
+    JSValue error, method, ret;
+
+    error = JS_GetException(ctx);
+    method = JS_GetProperty(ctx, s->iter, JS_ATOM_return);
+    if (JS_IsException(method))
+        goto fail;
+    if (JS_IsUndefined(method) || JS_IsNull(method))
+        goto done;
+    if (!JS_IsFunction(ctx, method)) {
+        JS_FreeValue(ctx, method);
+        goto done;
+    }
+    ret = JS_CallFree(ctx, method, s->iter, 0, NULL);
+    if (JS_IsException(ret))
+        goto fail;
+    s->error = error;
+    if (js_array_from_async_await(ctx, state, s, ret, FROM_ASYNC_CLOSE) == 0)
+        return;
+    error = s->error;
+    s->error = JS_UNDEFINED;
+ fail:
+    JS_FreeValue(ctx, JS_GetException(ctx));
+ done:
+    js_array_from_async_settle(ctx, s, TRUE, error);
+}
+
+/* Set(A, "length", k, true) and return A. */
+static void js_array_from_async_finish(JSContext *ctx, JSArrayFromAsyncData *s)
+{
+    if (JS_SetProperty(ctx, s->result, JS_ATOM_length,
+                       JS_NewInt64(ctx, s->k)) < 0) {
+        js_array_from_async_reject(ctx, s);
+        return;
+    }
+    js_array_from_async_settle(ctx, s, FALSE, JS_DupValue(ctx, s->result));
+}
+
+/* The iterating loop's next round: Call(next) and Await its result. */
+static void js_array_from_async_next(JSContext *ctx, JSValueConst state,
+                                     JSArrayFromAsyncData *s)
+{
+    JSValue next;
+
+    if (s->k >= MAX_SAFE_INTEGER) {
+        JS_ThrowTypeError(ctx, "too many elements");
+        js_array_from_async_close(ctx, state, s);
+        return;
+    }
+    next = JS_Call(ctx, s->next_method, s->iter, 0, NULL);
+    if (JS_IsException(next) ||
+        js_array_from_async_await(ctx, state, s, next, FROM_ASYNC_NEXT) < 0)
+        js_array_from_async_reject(ctx, s);
+}
+
+/* The array-like loop's next round: Get(arrayLike, k) and Await it, or the end. */
+static void js_array_from_async_item(JSContext *ctx, JSValueConst state,
+                                     JSArrayFromAsyncData *s)
+{
+    JSValue value;
+
+    if (s->k >= s->len) {
+        js_array_from_async_finish(ctx, s);
+        return;
+    }
+    value = JS_GetPropertyInt64(ctx, s->array_like, s->k);
+    if (JS_IsException(value) ||
+        js_array_from_async_await(ctx, state, s, value, FROM_ASYNC_ITEM) < 0)
+        js_array_from_async_reject(ctx, s);
+}
+
+/* CreateDataPropertyOrThrow(A, k, value), 'value' taken, then the next round. */
+static void js_array_from_async_define(JSContext *ctx, JSValueConst state,
+                                       JSArrayFromAsyncData *s, JSValue value)
+{
+    if (JS_DefinePropertyValueInt64(ctx, s->result, s->k, value,
+                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+        if (JS_IsUndefined(s->iter))
+            js_array_from_async_reject(ctx, s);
+        else
+            js_array_from_async_close(ctx, state, s);
+        return;
+    }
+    s->k++;
+    if (JS_IsUndefined(s->iter))
+        js_array_from_async_item(ctx, state, s);
+    else
+        js_array_from_async_next(ctx, state, s);
+}
+
+/* An element's value, 'value' taken: through mapfn and its Await when mapping. Abrupt
+   completions close the iterator; for an array-like they only throw. */
+static void js_array_from_async_map(JSContext *ctx, JSValueConst state,
+                                    JSArrayFromAsyncData *s, JSValue value)
+{
+    JSValueConst args[2];
+    JSValue mapped;
+    BOOL iterating = !JS_IsUndefined(s->iter);
+
+    if (!s->mapping) {
+        js_array_from_async_define(ctx, state, s, value);
+        return;
+    }
+    args[0] = value;
+    args[1] = JS_NewInt64(ctx, s->k);
+    mapped = JS_Call(ctx, s->mapfn, s->this_arg, 2, args);
+    JS_FreeValue(ctx, value);
+    if (!JS_IsException(mapped) &&
+        js_array_from_async_await(ctx, state, s, mapped,
+                                  iterating ? FROM_ASYNC_MAPPED :
+                                  FROM_ASYNC_ITEM_MAPPED) == 0)
+        return;
+    if (iterating)
+        js_array_from_async_close(ctx, state, s);
+    else
+        js_array_from_async_reject(ctx, s);
+}
+
+static JSValue js_array_from_async_resume(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv,
+                                          int magic, JSValue *func_data)
+{
+    JSValueConst state = func_data[0];
+    JSArrayFromAsyncData *s = JS_GetOpaque(state, JS_CLASS_ARRAY_FROM_ASYNC);
+    JSValue value = JS_DupValue(ctx, argc > 0 ? argv[0] : JS_UNDEFINED);
+    JSValue done_val;
+    BOOL done;
+
+    if (magic) {
+        /* the awaited promise rejected: the await throws */
+        JS_Throw(ctx, value);
+        switch(s->awaiting) {
+        case FROM_ASYNC_MAPPED:
+            js_array_from_async_close(ctx, state, s);
+            break;
+        case FROM_ASYNC_CLOSE:
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            value = s->error;
+            s->error = JS_UNDEFINED;
+            js_array_from_async_settle(ctx, s, TRUE, value);
+            break;
+        default:
+            js_array_from_async_reject(ctx, s);
+            break;
+        }
+        return JS_UNDEFINED;
+    }
+    switch(s->awaiting) {
+    case FROM_ASYNC_NEXT:
+        if (!JS_IsObject(value)) {
+            JS_FreeValue(ctx, value);
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            goto reject;
+        }
+        done_val = JS_GetProperty(ctx, value, JS_ATOM_done);
+        if (JS_IsException(done_val))
+            goto reject_free;
+        done = JS_ToBoolFree(ctx, done_val);
+        if (done) {
+            JS_FreeValue(ctx, value);
+            js_array_from_async_finish(ctx, s);
+            break;
+        }
+        done_val = JS_GetProperty(ctx, value, JS_ATOM_value);
+        JS_FreeValue(ctx, value);
+        if (JS_IsException(done_val))
+            goto reject;
+        js_array_from_async_map(ctx, state, s, done_val);
+        break;
+    case FROM_ASYNC_ITEM:
+        js_array_from_async_map(ctx, state, s, value);
+        break;
+    case FROM_ASYNC_MAPPED:
+    case FROM_ASYNC_ITEM_MAPPED:
+        js_array_from_async_define(ctx, state, s, value);
+        break;
+    case FROM_ASYNC_CLOSE:
+        JS_FreeValue(ctx, value);
+        value = s->error;
+        s->error = JS_UNDEFINED;
+        js_array_from_async_settle(ctx, s, TRUE, value);
+        break;
+    }
+    return JS_UNDEFINED;
+ reject_free:
+    JS_FreeValue(ctx, value);
+ reject:
+    js_array_from_async_reject(ctx, s);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_array_fromAsync(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    // fromAsync(asyncItems, mapfn = void 0, thisArg = void 0)
+    JSValueConst items = argv[0];
+    JSValueConst mapfn = argc > 1 ? argv[1] : JS_UNDEFINED;
+    JSValueConst this_arg = argc > 2 ? argv[2] : JS_UNDEFINED;
+    JSValue promise, resolving_funcs[2], state, method, sync_iter, len_val;
+    JSArrayFromAsyncData *s;
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        return promise;
+    state = JS_NewObjectClass(ctx, JS_CLASS_ARRAY_FROM_ASYNC);
+    s = JS_IsException(state) ? NULL : js_mallocz(ctx, sizeof(*s));
+    if (!s) {
+        JS_FreeValue(ctx, state);
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
+    }
+    s->resolving_funcs[0] = resolving_funcs[0];
+    s->resolving_funcs[1] = resolving_funcs[1];
+    s->ctor = JS_DupValue(ctx, this_val);
+    s->mapfn = JS_UNDEFINED;
+    s->this_arg = JS_DupValue(ctx, this_arg);
+    s->array_like = JS_UNDEFINED;
+    s->iter = JS_UNDEFINED;
+    s->next_method = JS_UNDEFINED;
+    s->result = JS_UNDEFINED;
+    s->error = JS_UNDEFINED;
+    JS_SetOpaque(state, s);
+
+    /* From here the closure runs: its errors reject the promise. */
+    if (!JS_IsUndefined(mapfn)) {
+        if (check_function(ctx, mapfn))
+            goto reject;
+        s->mapping = TRUE;
+        s->mapfn = JS_DupValue(ctx, mapfn);
+    }
+    method = JS_GetProperty(ctx, items, JS_ATOM_Symbol_asyncIterator);
+    if (JS_IsException(method))
+        goto reject;
+    if (!JS_IsUndefined(method) && !JS_IsNull(method)) {
+        if (!JS_IsFunction(ctx, method)) {
+            JS_FreeValue(ctx, method);
+            JS_ThrowTypeError(ctx, "value is not async iterable");
+            goto reject;
+        }
+        s->iter = JS_GetIterator2(ctx, items, method);
+        JS_FreeValue(ctx, method);
+    } else {
+        method = JS_GetProperty(ctx, items, JS_ATOM_Symbol_iterator);
+        if (JS_IsException(method))
+            goto reject;
+        if (!JS_IsUndefined(method) && !JS_IsNull(method)) {
+            if (!JS_IsFunction(ctx, method)) {
+                JS_FreeValue(ctx, method);
+                JS_ThrowTypeError(ctx, "value is not iterable");
+                goto reject;
+            }
+            sync_iter = JS_GetIterator2(ctx, items, method);
+            JS_FreeValue(ctx, method);
+            if (JS_IsException(sync_iter))
+                goto reject;
+            s->iter = JS_CreateAsyncFromSyncIterator(ctx, sync_iter);
+            JS_FreeValue(ctx, sync_iter);
+        }
+    }
+    if (JS_IsException(s->iter)) {
+        s->iter = JS_UNDEFINED;
+        goto reject;
+    }
+    if (!JS_IsUndefined(s->iter)) {
+        s->next_method = JS_GetProperty(ctx, s->iter, JS_ATOM_next);
+        if (JS_IsException(s->next_method))
+            goto reject;
+        if (JS_IsConstructor(ctx, s->ctor))
+            s->result = JS_CallConstructor(ctx, s->ctor, 0, NULL);
+        else
+            s->result = JS_NewArray(ctx);
+        if (JS_IsException(s->result))
+            goto reject;
+        js_array_from_async_next(ctx, state, s);
+    } else {
+        /* neither async iterable nor iterable: an array-like */
+        s->array_like = JS_ToObject(ctx, items);
+        if (JS_IsException(s->array_like) ||
+            js_get_length64(ctx, &s->len, s->array_like) < 0)
+            goto reject;
+        len_val = JS_NewInt64(ctx, s->len);
+        if (JS_IsConstructor(ctx, s->ctor))
+            s->result = JS_CallConstructor(ctx, s->ctor, 1, (JSValueConst *)&len_val);
+        else
+            s->result = js_array_constructor(ctx, JS_UNDEFINED, 1, (JSValueConst *)&len_val);
+        JS_FreeValue(ctx, len_val);
+        if (JS_IsException(s->result))
+            goto reject;
+        js_array_from_async_item(ctx, state, s);
+    }
+    JS_FreeValue(ctx, state);
+    return promise;
+ reject:
+    js_array_from_async_reject(ctx, s);
+    JS_FreeValue(ctx, state);
+    return promise;
+}
+
 /* AsyncGeneratorFunction */
 
 static const JSCFunctionListEntry js_async_generator_function_proto_funcs[] = {
@@ -56113,6 +56702,7 @@ static JSClassShortDef const js_async_class_def[] = {
     { JS_ATOM_AsyncFunctionResolve, js_async_function_resolve_finalizer, js_async_function_resolve_mark }, /* JS_CLASS_ASYNC_FUNCTION_RESOLVE */
     { JS_ATOM_AsyncFunctionReject, js_async_function_resolve_finalizer, js_async_function_resolve_mark }, /* JS_CLASS_ASYNC_FUNCTION_REJECT */
     { JS_ATOM_empty_string, js_async_from_sync_iterator_finalizer, js_async_from_sync_iterator_mark }, /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR */
+    { JS_ATOM_empty_string, js_array_from_async_finalizer, js_array_from_async_mark }, /* JS_CLASS_ARRAY_FROM_ASYNC */
     { JS_ATOM_AsyncGeneratorFunction, js_bytecode_function_finalizer, js_bytecode_function_mark },  /* JS_CLASS_ASYNC_GENERATOR_FUNCTION */
     { JS_ATOM_AsyncGenerator, js_async_generator_finalizer, js_async_generator_mark },  /* JS_CLASS_ASYNC_GENERATOR */
 };

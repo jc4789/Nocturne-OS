@@ -14,7 +14,7 @@ const cloneData = (() => {
     // assembling a transaction, especially after its final validation pass.
     const add=(array,value)=>define(array,array.length,{value,writable:true,enumerable:true,configurable:true});
     const field=(record,key,value)=>define(record,key,{value,writable:true,enumerable:true,configurable:true});
-    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,bufferTransferable=host.bufferTransferable,uncloneable=[],uncloneableNames=[],transferTypes=[];
+    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,bufferTransferable=host.bufferTransferable,uncloneable=[],uncloneableNames=[],transferTypes=[],serializables=new M(),serializableList=[];
     const workerDiagnostics=typeof host.frame!=='function'&&typeof host.transferCommit==='function';
     const exceptionBridge=domExceptionBridge;
     const blobSnapshotBridge=typeof blobBridge==='undefined'?null:blobBridge;
@@ -102,6 +102,10 @@ const cloneData = (() => {
             for(let i=0;i<uncloneable.length;i++)if(apply(uncloneable[i],undefined,[value]))return reject('non-serializable-brand',value,uncloneableNames[i]);
             if(exceptionBridge&&exceptionBridge.brand(value)){
                 const id=records.length;put(seen,value,id);add(records,['DOMException',exceptionBridge.snapshot(value)]);return [1,id];
+            }
+            // [Serializable] platform objects: their private values, as plain data.
+            for(let i=0;i<serializableList.length;i++){const handler=serializableList[i];if(!apply(handler.brand,undefined,[value]))continue;
+                const id=records.length;put(seen,value,id);add(records,[handler.name,apply(handler.serialize,undefined,[value])]);return [1,id];
             }
             if(blobSnapshotBridge){
                 if(blobSnapshotBridge.readerBrand(value))return reject('non-serializable-brand',value,'FileReader');
@@ -277,7 +281,8 @@ const cloneData = (() => {
                 if(!blobSnapshotBridge)return fail('target-brand-unavailable',undefined,0,false,'Blob');
                 value=blobSnapshotBridge.restore(r[1]);
             }
-            else if(kind==='DOMException')value=new DomError(r[1][1],r[1][0]);
+            else if(kind==='DOMException')value=exceptionBridge.restore(r[1]);
+            else if(has(serializables,kind))value=apply(get(serializables,kind).deserialize,undefined,[r[1]]);
             else if(has(constructors,kind))value=new(get(constructors,kind))(read(r[1]),r[2],r[3]);
             else if(kind==='Date')value=new DateType(r[1]);else if(kind==='RegExp')value=new RegExpType(r[1],r[2]);
             else if(kind==='Error')value=new errors[r[1]](r[2]);else value=Obj(r[1]);
@@ -318,6 +323,11 @@ const cloneData = (() => {
     };
     return {serialize,prepare,validate,commit,commitPlan,deserialize,transferList,registerTransfer(handler){
         add(transferTypes,handler);add(uncloneable,handler.brand);add(uncloneableNames,handlerName(handler));
+    },registerSerializable(name,brand,serialize,deserialize){
+        // Each realm registers its own interfaces under the same name; the receiving realm's
+        // deserialize makes the object there.
+        if(typeof brand!=='function'||typeof serialize!=='function'||typeof deserialize!=='function')throw new TypeErr('Expected serializable steps');
+        const handler={name,brand,serialize,deserialize};put(serializables,name,handler);add(serializableList,handler);
     },registerUncloneable(test,name='Web object'){
         if(typeof test!=='function')throw new TypeErr('Expected a private brand predicate');
         add(uncloneable,test);add(uncloneableNames,name);

@@ -1,10 +1,14 @@
-/* One native CSS opacity animation, not transform/events or site acceptance. */
+/* One native CSS opacity animation, not transform/events or site acceptance. The animations
+   are the one time model's records (animation.h): a CSS animation is the CSSAnimation its
+   element owns (node owned), a frame is web_animations_tick, and play and pause take effect
+   when their pending task runs at the next frame (Web Animations 1 §4.4.8, §4.4.10). */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <nocturne.h>
 #include "webi.h"
 #include "cssom.h"
+#include "script_animation_native.h"
 
 static int checks, failures, js_failures, js_checks;
 static void check(const char *name, bool pass) {
@@ -46,9 +50,12 @@ static void parsing(void) {
     check("unitless duration rejected",!supports("animation-duration","1"));
     check("negative iterations rejected",!supports("animation-iteration-count","-1"));
     check("bezier bad x rejected",!supports("animation-timing-function","cubic-bezier(2,0,.2,1)"));
-    check("multiple animations rejected",!supports("animation","a 1s, b 2s"));
-    check("multiple names rejected",!supports("animation-name","a,b"));
-    check("steps not falsely supported",!supports("animation-timing-function","steps(3,end)"));
+    /* CSS Animations 1 §3: each animation-* property and the shorthand take a comma-separated list */
+    check("multiple animations accepted, a trailing comma rejected",supports("animation","a 1s, b 2s")&&!supports("animation","a 1s,"));
+    check("multiple names accepted, a trailing comma rejected",supports("animation-name","a,b")&&!supports("animation-name","a,"));
+    /* CSS Easing 1 §2.3: steps(<integer>, <step-position>), the integer positive (above 1 for jump-none) */
+    check("steps easing accepted, a zero step count rejected",supports("animation-timing-function","steps(3,end)")&&
+        !supports("animation-timing-function","steps(0,end)")&&!supports("animation-timing-function","steps(1,jump-none)"));
     check("translation and rotation supported, a length angle rejected",supports("transform","translateX(10px)")&&supports("transform","rotate(10deg)")&&!supports("transform","rotate(10px)"));
 }
 static void sampling(void) {
@@ -96,11 +103,16 @@ static void sampling(void) {
     check("later longhand overrides shorthand",opacity(longhand,.25));
     check("delay backwards fill does not apply step-start",opacity(delay_step,0));
     check("delay reverse backwards fill uses directed endpoint",opacity(delay_reverse,1));
-    check("native subset has no paused wake",css_motion_deadline(d)==-1);
+    /* a frame runs the pending play and pause tasks; then the paused animations, and the zero
+       duration ones now finished, want no frame */
+    web_animations_tick(d,uptime_ms());layout(d);
+    check("native subset has no paused wake",web_animations_deadline(d)==-1);
     check("underlying style retained separately",a && a->animation_base_style && near(a->animation_base_style->opacity,.2));
-    check("WAAPI native effect accepted",css_animation_set(a,PE_NONE,1,"opacity:.65;")==1);
+    struct web_animation *script=script_animation_hold(d,a,PE_NONE,"opacity",".65");
+    check("WAAPI native effect accepted",script!=NULL);
     restyle(d,a);check("WAAPI priority above CSS animation",opacity(a,.65));
-    css_animation_set(a,PE_NONE,1,NULL);restyle(d,a);check("WAAPI removal restores CSS sample",opacity(a,.5));
+    if(script)web_animation_cancel(script);
+    restyle(d,a);check("WAAPI removal restores CSS sample",opacity(a,.5));
     doc_node_attr(d,a,"style","opacity:.2;animation:fade 1s linear -.5s both paused;width:20px;height:20px;background:red");
     layout(d);static uint32_t pixels[320*200];canvas_t canvas;gfx_init(&canvas,pixels,320,200,320);
     web_paint(d,&canvas,0,0,320,200,0,0);
@@ -112,35 +124,43 @@ static void lifecycle(void) {
     web_doc *d=load("@keyframes fade{from{opacity:0}to{opacity:1}}");
     check("lifecycle document",d!=NULL);if(!d)return;
     node_t *a=element(d,d->body,"animation:fade 1s linear -.25s both paused");layout(d);
-    struct css_motion_state *identity=a->css_motion;
+    struct web_animation *identity=a->owned;
     check("paused initial negative delay",opacity(a,.25));
     n_sleep_ms(20);restyle(d,a);check("paused wall time does not advance",opacity(a,.25));
     d->style_full_dirty=d->need_style=d->need_boxes=true;layout(d);
-    check("full style rebuild retains playback",a->css_motion==identity && opacity(a,.25));
+    check("full style rebuild retains playback",identity && a->owned==identity && opacity(a,.25));
     doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both");layout(d);
-    check("resume schedules native frame",css_motion_deadline(d)>=0);
-    n_sleep_ms(35);css_motion_tick(d,uptime_ms());layout(d);
+    check("resume schedules native frame",web_animations_deadline(d)>=0);
+    /* the pending play task at the next frame: the start time is that frame's time */
+    web_animations_tick(d,uptime_ms());layout(d);
+    n_sleep_ms(35);web_animations_tick(d,uptime_ms());layout(d);
     check("resume advances actual native time",a->style->opacity>.27f && a->style->opacity<.6f);
-    doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both paused");layout(d);float paused=a->style->opacity;
-    n_sleep_ms(20);restyle(d,a);check("pause retains accumulated elapsed",near(a->style->opacity,paused));
-    check("pause removes deadline",css_motion_deadline(d)==-1);
-    doc_node_attr(d,a,"style","opacity:.4;animation:none");layout(d);
-    check("none cancels identity",a->css_motion==NULL && opacity(a,.4));
+    /* the pending pause task at the next frame: the hold time is the current time then */
+    doc_node_attr(d,a,"style","animation:fade 1s linear -.25s both paused");layout(d);
+    web_animations_tick(d,uptime_ms());layout(d);float paused=a->style->opacity;
+    n_sleep_ms(20);web_animations_tick(d,uptime_ms());restyle(d,a);
+    check("pause retains accumulated elapsed",paused>.27f && near(a->style->opacity,paused));
+    check("pause removes deadline",web_animations_deadline(d)==-1);
+    /* style cancels the CSS animation; the element lets it go once its cancel event is queued */
+    doc_node_attr(d,a,"style","opacity:.4;animation:none");layout(d);web_animations_tick(d,uptime_ms());
+    check("none cancels identity",a->owned==NULL && opacity(a,.4));
     doc_node_attr(d,a,"style","animation:fade 1s linear both paused");layout(d);
     check("restart begins zero",opacity(a,0));
-    doc_node_attr(d,a,"style","display:none;animation:fade 1s linear both");layout(d);
-    check("display none retires native identity",a->css_motion==NULL);
+    doc_node_attr(d,a,"style","display:none;animation:fade 1s linear both");layout(d);web_animations_tick(d,uptime_ms());
+    check("display none retires native identity",a->owned==NULL);
     doc_node_attr(d,a,"style","animation:fade 1s linear both paused");layout(d);
     check("display restoration restarts",opacity(a,0));
-    doc_node_remove(d,a);check("detachment retires native identity",a->css_motion==NULL);
+    doc_node_remove(d,a);web_animations_tick(d,uptime_ms());check("detachment retires native identity",a->owned==NULL);
     doc_node_move(d,d->body,a,NULL);layout(d);check("reconnection starts fresh",opacity(a,0));
-    doc_node_attr(d,a,"style","animation:fade 40ms linear forwards");layout(d);
-    n_sleep_ms(65);css_motion_tick(d,uptime_ms());layout(d);
+    doc_node_attr(d,a,"style","animation:fade 40ms linear forwards");layout(d);web_animations_tick(d,uptime_ms());
+    n_sleep_ms(65);web_animations_tick(d,uptime_ms());layout(d);
     check("short animation completes",opacity(a,1));
-    check("completed animation has no wake",css_motion_deadline(d)==-1);
+    check("completed animation has no wake",web_animations_deadline(d)==-1);
     doc_node_attr(d,a,"style","opacity:.4;animation:fade 0s linear");layout(d);
     check("zero duration without fill restores underlying",opacity(a,.4));
-    d->native_cancelled=true;check("cancel suppresses native wake",css_motion_deadline(d)==-1);
+    /* a longer duration takes the finished animation back to running: it wants frames, unless canceled */
+    doc_node_attr(d,a,"style","animation:fade 1s linear");layout(d);int64_t live=web_animations_deadline(d);
+    d->native_cancelled=true;check("cancel suppresses native wake",live>=0 && web_animations_deadline(d)==-1);
     d->native_cancelled=false;web_free(d);
 }
 static void cssom_scope(void) {
@@ -161,17 +181,17 @@ static void cssom_scope(void) {
     check("same name shadow scoped independently",opacity(b,.75));
     check("unresolved shadow name falls back to document ancestor",opacity(c,.25));
     check("nearest ancestor shadow name wins over document",opacity(nested,.75));
-    struct css_motion_state *identity=a->css_motion;
+    struct web_animation *identity=a->owned;
     const char *replacement="@keyframes same{to{opacity:.45}}.sample{opacity:.1;animation:same 0s linear forwards}";
     check("replaceSync candidate",cssom_replace_sync(s,replacement,strlen(replacement))==CSSOM_OK);layout(d);
     check("replacement AST sampled without dangling old pointer",opacity(a,.45));
-    check("same name replacement preserves playback",a->css_motion==identity);
+    check("same name replacement preserves playback",identity && a->owned==identity);
     check("replacement does not affect foreign scope",opacity(b,.75));
     const char *ordinary=".ordinary{opacity:.4}";
-    check("insertRule rebuild preserves keyframes",cssom_insert(s,ordinary,strlen(ordinary),0)==CSSOM_OK);layout(d);
+    check("insertRule rebuild preserves keyframes",cssom_insert(s,0,ordinary,strlen(ordinary),0)==CSSOM_OK);layout(d);
     check("insert rebuilt keyframes still sample",opacity(a,.45));
-    check("delete keyframes rule",cssom_delete(s,1)==CSSOM_OK);layout(d);
-    check("deleted keyframe stops effect and identity",opacity(a,.1) && a->css_motion==NULL);
+    check("delete keyframes rule",cssom_delete(s,0,1)==CSSOM_OK);layout(d);web_animations_tick(d,uptime_ms());
+    check("deleted keyframe stops effect and identity",opacity(a,.1) && a->owned==NULL);
     const char *media="@media print{@keyframes same{to{opacity:.9}}}@media screen{@keyframes same{to{opacity:.35}}}"
         ".sample{opacity:.1;animation:same 0s forwards}";
     check("conditional keyframe candidate",cssom_replace_sync(s,media,strlen(media))==CSSOM_OK);layout(d);

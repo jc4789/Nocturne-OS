@@ -4,6 +4,7 @@
  * retain crash fallback, and payload GC keeps both committed generations. */
 #include <webidb.h>
 #include <webstorage.h>
+#include <weburl.h>
 #include <nocturne.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,7 +142,7 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
     *bytes=NULL;
     *length=0;
     *token=0;
-    if(!db||!origin||!name||(strncmp(origin,"http://",7)&&strncmp(origin,"https://",8)))
+    if(!db||!name||!web_origin_http(origin))
         return WEB_IDB_SECURITY;
     char root[WEBIDB_BASE_MAX];
     if(!idb_root(root)||!directory(root))return WEB_IDB_IO;
@@ -374,7 +375,7 @@ static int catalog_scan(const char *directory_path,const char *origin,struct web
 }
 int webidb_databases(webidb *db,const char *origin,struct webidb_database **items,size_t *count){
     *items=NULL;*count=0;
-    if(!db||!origin||(strncmp(origin,"http://",7)&&strncmp(origin,"https://",8)))return WEB_IDB_SECURITY;
+    if(!db||!web_origin_http(origin))return WEB_IDB_SECURITY;
     char root[WEBIDB_BASE_MAX];
     return idb_root(root)?catalog_scan(root,origin,items,count,true):WEB_IDB_IO;
 }
@@ -413,6 +414,7 @@ static int base_origin(const char *base,char **origin){
     else{free(ao);free(bo);*origin=calloc(1,1);}
     return *origin?WEB_IDB_OK:WEB_IDB_MEMORY;
 }
+static void clients_force(const char *text);
 /* One database: its bytes, and with remove its files (under its lease: a transaction now leaves it). */
 static int database_visit(const char *folder,const struct n_entry *entries,n_result listed,const char *text,struct idb_visit *v,bool remove){
     char base[WEBIDB_BASE_MAX];if(n_path_join(folder,text,base,sizeof base)<0)return WEB_IDB_IO;
@@ -433,6 +435,9 @@ static int database_visit(const char *folder,const struct n_entry *entries,n_res
         if(e->kind==N_KIND_FOLDER)result=files_tree(path,remove,&bytes);
         else{bytes+=e->size;if(remove&&strcmp(e->name+64,".lock")&&n_entry_remove(path)<0)result=WEB_IDB_IO;}
     }
+    /* Its open connections, of every process, are closed forcibly (IndexedDB "close a database
+       connection" with forced: their transactions abort, then close fires at them). */
+    if(remove&&!result)clients_force(text);
     /* The lease document stays (empty): a transaction that opened it meanwhile would otherwise
        hold a removed document while the next one claims a new one. */
     if(lease>=0){n_document_release(lease);n_handle_close(lease);}
@@ -488,12 +493,31 @@ static int client_alive(struct client_table *t,uint8_t *row){for(int i=0;i<t->pr
 static void table_free(struct client_table *t){free(t->rows);free(t->processes);memset(t,0,sizeof *t);}
 static int table_read(n_handle table,struct client_table *t){n_result size=n_document_size(table);if(size<0||size%CLIENT_BYTES||(uint64_t)size>SIZE_MAX-CLIENT_BYTES)return WEB_IDB_IO;size_t n=(size_t)size;t->rows=calloc(1,n+CLIENT_BYTES);if(!t->rows)return WEB_IDB_MEMORY;t->count=n/CLIENT_BYTES;if(!io(table,0,t->rows,n,0)){table_free(t);return WEB_IDB_IO;}int status=processes(t);if(status){table_free(t);return status;}for(size_t i=0;i<t->count;i++){uint8_t *row=t->rows+i*CLIENT_BYTES;if(u64(row)&&!client_alive(t,row))memset(row,0,CLIENT_BYTES);}return WEB_IDB_OK;}
 static int table_write(n_handle table,struct client_table *t){return io(table,0,t->rows,t->count*CLIENT_BYTES,1)?WEB_IDB_OK:WEB_IDB_IO;}
-int webidb_connections(webidb *db,uint32_t token,uint64_t version,size_t *count){*count=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;n_handle table=clients_open(tx);if(table<0)return WEB_IDB_IO;int status=clients_lock(table);struct client_table t={0};if(!status)status=table_read(table,&t);if(!status){for(size_t i=0;i<t.count;i++){uint8_t *row=t.rows+i*CLIENT_BYTES;if(u64(row)){(*count)++;if(!u64(row+40)||u64(row+32)!=version){put64(row+32,version);put64(row+40,1);}}}status=table_write(table,&t);}table_free(&t);n_handle_close(table);return status;}
+/* A row: identity, pid, process start, version, desired version, and its versionchange to the
+ * desired version: CLIENT_NONE, CLIENT_MARKED (by connections), CLIENT_DELIVERED (by poll), or
+ * CLIENT_FIRED (by fired). CLIENT_FORCED: its database was cleared (clients_force); its poll
+ * delivers the forced close once, and it is then close pending (CLIENT_FIRED: it is still open,
+ * and needs no versionchange). */
+enum {CLIENT_NONE,CLIENT_MARKED,CLIENT_DELIVERED,CLIENT_FIRED,CLIENT_FORCED};
+int webidb_connections(webidb *db,uint32_t token,uint64_t version,size_t *count,size_t *unfired){*count=0;*unfired=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;n_handle table=clients_open(tx);if(table<0)return WEB_IDB_IO;int status=clients_lock(table);struct client_table t={0};if(!status)status=table_read(table,&t);if(!status){for(size_t i=0;i<t.count;i++){uint8_t *row=t.rows+i*CLIENT_BYTES;if(!u64(row))continue;(*count)++;if(u64(row+40)==CLIENT_FORCED)continue;if(u64(row+40)==CLIENT_NONE||u64(row+32)!=version){put64(row+32,version);put64(row+40,CLIENT_MARKED);}if(u64(row+40)!=CLIENT_FIRED)(*unfired)++;}status=table_write(table,&t);}table_free(&t);n_handle_close(table);return status;}
+static void clients_force(const char *text){
+    const char *profile=web_profile_folder(true);char folder[WEBIDB_BASE_MAX],leaf[80],path[WEBIDB_BASE_MAX];
+    if(!profile||n_path_join(profile,"indexeddb",folder,sizeof folder)<0)return;
+    snprintf(leaf,sizeof leaf,"%s.clients",text);
+    if(n_path_join(folder,leaf,path,sizeof path)<0)return;
+    n_handle table=n_document_open(path,N_DOCUMENT_EDIT);if(table<0)return; /* none ever connected */
+    /* Row I/O only (as webidb_forget_connection): the clearing waits for it, never for author code. */
+    if(n_document_claim(table,true)<0){n_handle_close(table);return;}
+    struct client_table t={0};
+    if(!table_read(table,&t)){bool forced=false;for(size_t i=0;i<t.count;i++){uint8_t *row=t.rows+i*CLIENT_BYTES;if(u64(row)){put64(row+40,CLIENT_FORCED);forced=true;}}if(forced)table_write(table,&t);}
+    table_free(&t);n_handle_close(table);
+}
+int webidb_fired(webidb *db,uint32_t connection){struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else if(u64(row+40)==CLIENT_DELIVERED){put64(row+40,CLIENT_FIRED);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);return status;}
 int webidb_connect(webidb *db,uint32_t token,uint64_t version,uint32_t *connection){*connection=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;n_handle table=clients_open(tx);if(table<0)return WEB_IDB_IO;int status=clients_lock(table);struct client_table t={0};if(!status)status=table_read(table,&t);struct idb_client *c=NULL;
     if(!status){c=calloc(1,sizeof *c);if(!c)status=WEB_IDB_MEMORY;else{uint32_t serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);if(!serial)serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);c->handle=serial;c->identity=(uint64_t)(uint32_t)n_app_self()<<32|serial;c->table=table;size_t i=0;while(i<t.count&&u64(t.rows+i*CLIENT_BYTES))i++;if(i==t.count)t.count++;c->offset=i*CLIENT_BYTES;uint8_t *row=t.rows+c->offset;put64(row,c->identity);put64(row+8,(uint32_t)n_app_self());uint64_t start=0;for(int j=0;j<t.process_count;j++)if(t.processes[j].pid==(int)n_app_self())start=t.processes[j].start_ms;put64(row+16,start);put64(row+24,version);status=table_write(table,&t);}}
     table_free(&t);if(status){if(c)free(c);n_handle_close(table);return status;}n_document_release(table);c->next=db->clients;db->clients=c;*connection=c->handle;return WEB_IDB_OK;
 }
-int webidb_poll(webidb *db,uint32_t connection,int *pending,uint64_t *version){*pending=0;*version=0;struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else if(u64(row+40)==1){*pending=1;*version=u64(row+32);put64(row+40,2);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);return status;}
+int webidb_poll(webidb *db,uint32_t connection,int *pending,uint64_t *version){*pending=0;*version=0;struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else if(u64(row+40)==CLIENT_FORCED){*pending=2;put64(row+40,CLIENT_FIRED);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}else if(u64(row+40)==CLIENT_MARKED){*pending=1;*version=u64(row+32);put64(row+40,CLIENT_DELIVERED);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);return status;}
 int webidb_disconnect(webidb *db,uint32_t connection){if(!db)return WEB_IDB_IO;struct idb_client **p=&db->clients;while(*p&&(*p)->handle!=connection)p=&(*p)->next;if(!*p)return WEB_IDB_IO;struct idb_client *c=*p;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else{memset(row,0,sizeof row);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);*p=c->next;n_handle_close(c->table);free(c);return status;}
 int webidb_forget_connection(webidb *db,uint32_t connection){
     int result=webidb_disconnect(db,connection);if(result!=WEB_IDB_BUSY)return result;

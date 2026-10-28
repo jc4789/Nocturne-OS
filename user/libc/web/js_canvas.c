@@ -1092,10 +1092,10 @@ bool web_canvas_fit(const node_t *n,const style_t *st,int x,int y,int w,int h,in
     return true;
 }
 struct web_webgl *web_canvas_webgl(const node_t *n) { return n && n->canvas ? n->canvas->webgl : NULL; }
-void web_canvas_paint(node_t *n,const style_t *st,canvas_t *dst,int x,int y,int w,int h) {
+bool web_canvas_paint(node_t *n,const style_t *st,canvas_t *dst,int x,int y,int w,int h) {
     struct web_canvas *c=n?webgl_sync(n,true):NULL;
     int fit[4];
-    if (!c || !c->pixels || !c->w || !c->h || !web_canvas_fit(n,st,x,y,w,h,fit)) return;
+    if (!c || !c->pixels || !c->w || !c->h || !web_canvas_fit(n,st,x,y,w,h,fit)) return false;
     /* The fitted bitmap, clipped to the content box. */
     int x0=MAX(MAX(x,fit[0]),dst->cx0),y0=MAX(MAX(y,fit[1]),dst->cy0);
     int x1=MIN(MIN((int64_t)x+w,(int64_t)fit[0]+fit[2]),dst->cx1),y1=MIN(MIN((int64_t)y+h,(int64_t)fit[1]+fit[3]),dst->cy1);
@@ -1110,6 +1110,15 @@ void web_canvas_paint(node_t *n,const style_t *st,canvas_t *dst,int x,int y,int 
             uint32_t *p=&dst->px[(size_t)yy*dst->pitch+xx]; *p=over(*p,source);
         }
     }
+    return true;
+}
+/* the canvas element's current style, for a colour that names currentcolor or the scheme;
+   a canvas outside the document has none */
+static const style_t *canvas_style(void *context) {
+    node_t *n=context;
+    if (!n->owner || !doc_node_connected(n)) return NULL;
+    web_js_flush_layout(n->owner);
+    return n->style;
 }
 JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) {
     if (!n || n->type!=N_ELEM || n->foreign || n->tag!=T_canvas) return JS_ThrowTypeError(ctx,"Illegal Canvas receiver");
@@ -1118,14 +1127,27 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
     JSValue out=JS_UNDEFINED;
     if (!strcmp(op,"width") || !strcmp(op,"height")) out=JS_NewUint32(ctx,web_canvas_dimension(n,op));
     else if (!strcmp(op,"color") || !strcmp(op,"gradientColor")) {
-        size_t length=0;const char *text=argc>1?JS_ToCStringLen(ctx,&length,argv[1]):NULL; uint32_t color;
+        size_t length=0;const char *text=argc>1?JS_ToCStringLen(ctx,&length,argv[1]):NULL;
         if (argc>1 && !text) { out=JS_EXCEPTION; goto done; }
         bool gradient=!strcmp(op,"gradientColor");
-        bool valid=text && (!gradient||css_supports_declaration("color",5,text,length)) && css_color(text,length,&color);
-        /* Canvas-neutral gradient colors resolve currentColor to the initial
-           CSS color, never the canvas element that happened to create it. */
-        if(valid && gradient && color==COLOR_CURRENT)color=0xff000000u;
-        out=valid?JS_NewUint32(ctx,color):JS_NULL;
+        /* HTML: fillStyle and strokeStyle parse with the canvas element, so currentcolor is its
+           colour; a gradient's stops parse with no element (opaque black). */
+        struct css_color color;
+        bool valid=text && css_color_parse_used(text,length,gradient?NULL:canvas_style,n,&color);
+        if (!valid) out=JS_NULL;
+        else if (gradient) out=JS_NewUint32(ctx,css_color_argb(&color));
+        else {
+            /* [the used 8-bit colour, the serialization the attribute returns] */
+            sbuf serialized={0};
+            css_color_serialize(&color,true,&serialized);
+            out=JS_NewArray(ctx);
+            if (!JS_IsException(out) &&
+                (JS_SetPropertyUint32(ctx,out,0,JS_NewUint32(ctx,css_color_argb(&color)))<0 ||
+                 JS_SetPropertyUint32(ctx,out,1,JS_NewStringLen(ctx,serialized.p?serialized.p:"",serialized.n))<0)) {
+                JS_FreeValue(ctx,out); out=JS_EXCEPTION;
+            }
+            sb_free(&serialized);
+        }
         JS_FreeCString(ctx,text);
     } else if (!strcmp(op,"font")) out=argc>1?canvas_font(ctx,n,argv[1]):JS_NULL;
     else if (!strcmp(op,"rtl")) {

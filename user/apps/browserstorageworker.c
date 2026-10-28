@@ -1,5 +1,6 @@
-/* Nocturne native IndexedDB I/O owner. It executes real transaction engine
- * operations off the page task; protocol input never contains a file path. */
+/* Nocturne native IndexedDB and Cache Storage I/O owner. It executes real
+ * transaction engine operations (webidb.h) and cache commands (webcache.h)
+ * off the page task; protocol input never contains a file path. */
 #include <webidb_async.h>
 #include <nocturne.h>
 #include <stdlib.h>
@@ -51,14 +52,16 @@ static bool catalog_pack(struct webidb_database *items,size_t count,uint8_t **by
 }
 int main(void) {
     webidb *engine=webidb_create();
-    if(!engine)return 1;
+    webcache *caches=webcache_create();
+    if(!engine||!caches)return 1;
     struct webidb_wire_command command;
     size_t message_length=0;uint8_t *message;
     while((message=receive_command(&message_length))){
         size_t total=0;
         memcpy(&command,message,sizeof command);
         if(command.magic!=WEB_IDB_WIRE_MAGIC||!command.sequence||
-           command.operation<WEB_IDB_BEGIN||command.operation>WEB_IDB_VALUES||
+           ((command.operation<WEB_IDB_BEGIN||command.operation>WEB_IDB_FIRED)&&
+            (command.operation<WEB_CACHE_OPEN||command.operation>WEB_CACHE_LAST))||
            command.reference_count>SIZE_MAX/64||
            !add(&total,command.origin_length)||!add(&total,command.name_length)||
            !add(&total,command.payload_length)||!add(&total,command.reference_count*64)||
@@ -73,6 +76,16 @@ int main(void) {
         uint8_t *output=NULL;size_t output_length=0;
         if(!origin||!name){result.status=WEB_IDB_MEMORY;goto reply;}
         if(memchr(origin,0,(size_t)command.origin_length)){result.status=WEB_IDB_SECURITY;goto reply;}
+        if(command.operation>=WEB_CACHE_OPEN){
+            struct webcache_call call={.operation=command.operation,.origin=origin,.name=(const uint8_t*)name,
+                .name_length=(size_t)command.name_length,.token=command.token,.argument=command.version,
+                .payload=payload,.length=(size_t)command.payload_length};
+            struct webcache_answer answer;
+            result.status=webcache_run(caches,&call,&answer);
+            result.token=answer.token;result.count=answer.count;
+            output=answer.bytes;output_length=answer.length;
+            goto reply;
+        }
         switch(command.operation){
         case WEB_IDB_BEGIN:
             result.status=webidb_begin(engine,origin,name,(size_t)command.name_length,&result.token,&output,&output_length);
@@ -119,8 +132,9 @@ int main(void) {
             webidb_databases_free(items,count);break;
         }
         case WEB_IDB_CONNECTIONS: {
-            size_t count=0;
-            result.status=webidb_connections(engine,command.token,command.version,&count);result.count=count;break;
+            size_t count=0,unfired=0;
+            result.status=webidb_connections(engine,command.token,command.version,&count,&unfired);
+            result.count=count;result.pending=unfired>UINT32_MAX?UINT32_MAX:(uint32_t)unfired;break;
         }
         case WEB_IDB_CONNECT:
             result.status=webidb_connect(engine,command.token,command.version,&result.token);break;
@@ -132,6 +146,8 @@ int main(void) {
             result.status=webidb_disconnect(engine,command.token);break;
         case WEB_IDB_FORGET:
             result.status=webidb_forget_connection(engine,command.token);break;
+        case WEB_IDB_FIRED:
+            result.status=webidb_fired(engine,command.token);break;
         case WEB_IDB_VALUES: {
             size_t count=(size_t)command.reference_count,capacity=0;
             const uint8_t *source=payload+command.payload_length;
@@ -173,5 +189,5 @@ reply:
         free(name);free(origin);free(message);
         if(!sent)break;
     }
-    webidb_free(engine);return 0;
+    webcache_free(caches);webidb_free(engine);return 0;
 }

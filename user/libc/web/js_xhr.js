@@ -1,10 +1,10 @@
 /* Asynchronous XHR over Nocturne's CORS-checked streaming transport.
    No page-replaceable fetch/Promise methods are used to schedule host work.
-   Synchronous requests and XML documents are
-   not implemented; unsupported operations must not pretend to succeed. */
+   Synchronous requests are not implemented; unsupported operations must not
+   pretend to succeed. Document responses use the native HTML and XML parsers. */
 {
     const states = new WeakMap(), uploadStates = new WeakMap(), progressStates = new WeakMap();
-    const NativeURL = globalThis.URL, Decoder = globalThis.TextDecoder;
+    const textDecoder = host.textDecoder, textDecode = host.textDecode;
     const nativeThen = Promise.prototype.then, nativeApply = Reflect.apply;
     const defineProperty=Object.defineProperty, promiseConstructor=Object.freeze({[Symbol.species]:Promise});
     const create=Object.create, assign=Object.assign, NativeNumber=Number;
@@ -13,7 +13,7 @@
     const typedBuffer=Object.getOwnPropertyDescriptor(typedPrototype,'buffer').get;
     const typedLength=Object.getOwnPropertyDescriptor(typedPrototype,'byteLength').get;
     const typedSet=U8.prototype.set;
-    const decode=Decoder.prototype.decode, split=String.prototype.split;
+    const split=String.prototype.split;
     const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, weakHas=WeakMap.prototype.has;
     for(const map of [states,uploadStates,progressStates]) {
         defineProperty(map,'get',{value:key=>nativeApply(weakGet,map,[key])});
@@ -50,6 +50,101 @@
         }
         return out;
     }
+    const httpSpace=c=>c==='\t'||c==='\n'||c==='\r'||c===' ';
+    const asciiLower=v=>v.replace(/[A-Z]/g,c=>String.fromCharCode(c.charCodeAt(0)+32));
+    // Fetch "collect an HTTP quoted string" from input[at] === '"'.
+    function quotedString(input,at,extract) {
+        const start=at;let value='';at++;
+        for(;;) {
+            while(at<input.length && input[at]!=='"' && input[at]!=='\\')value+=input[at++];
+            if(at>=input.length)break;
+            const quote=input[at++];
+            if(quote==='\\'){if(at>=input.length){value+='\\';break;}value+=input[at++];}
+            else break;
+        }
+        return [extract?value:input.slice(start,at),at];
+    }
+    // MIME Sniffing "parse a MIME type": {essence, parameters} or null for failure.
+    function parseMime(input) {
+        let start=0,end=input.length;
+        while(start<end && httpSpace(input[start]))start++;
+        while(end>start && httpSpace(input[end-1]))end--;
+        input=input.slice(start,end);
+        const slash=input.indexOf('/');if(slash<0)return null;
+        const type=input.slice(0,slash);if(!token.test(type))return null;
+        let at=input.indexOf(';',slash+1);if(at<0)at=input.length;
+        let subtype=input.slice(slash+1,at);
+        while(subtype && httpSpace(subtype[subtype.length-1]))subtype=subtype.slice(0,-1);
+        if(!token.test(subtype))return null;
+        const parameters=new Map();
+        while(at<input.length) {
+            at++;
+            while(at<input.length && httpSpace(input[at]))at++;
+            let nameEnd=at;while(nameEnd<input.length && input[nameEnd]!==';' && input[nameEnd]!=='=')nameEnd++;
+            const name=asciiLower(input.slice(at,nameEnd));at=nameEnd;
+            if(at<input.length){if(input[at]===';')continue;at++;}
+            if(at>=input.length)break;
+            let value;
+            if(input[at]==='"'){[value,at]=quotedString(input,at,true);while(at<input.length && input[at]!==';')at++;}
+            else {
+                let valueEnd=input.indexOf(';',at);if(valueEnd<0)valueEnd=input.length;
+                value=input.slice(at,valueEnd);at=valueEnd;
+                while(value && httpSpace(value[value.length-1]))value=value.slice(0,-1);
+                if(!value)continue;
+            }
+            if(name && token.test(name) && /^[\t\x20-\x7e\x80-\xff]*$/.test(value) && !parameters.has(name))parameters.set(name,value);
+        }
+        return {essence:asciiLower(type)+'/'+asciiLower(subtype),parameters};
+    }
+    // Fetch "extract a MIME type" over "get, decode, and split" Content-Type.
+    function extractMime(headers) {
+        const raw=headers?nativeApply(headerGet,headers,['content-type']):null;
+        if(raw===null)return null;
+        const values=[];let at=0,temporary='';
+        for(;;) {
+            while(at<raw.length && raw[at]!=='"' && raw[at]!==',')temporary+=raw[at++];
+            if(at<raw.length && raw[at]==='"'){const [text,next]=quotedString(raw,at,false);temporary+=text;at=next;if(at<raw.length)continue;}
+            values.push(temporary.replace(/^[\t ]+|[\t ]+$/g,''));temporary='';
+            if(at>=raw.length)break;
+            at++;
+        }
+        let charset=null,essence=null,mimeType=null;
+        for(const value of values) {
+            const parsed=parseMime(value);
+            if(!parsed || parsed.essence==='*/*')continue;
+            mimeType=parsed;
+            if(mimeType.essence!==essence){charset=mimeType.parameters.get('charset')??null;essence=mimeType.essence;}
+            else if(!mimeType.parameters.has('charset') && charset!==null)mimeType.parameters.set('charset',charset);
+        }
+        return mimeType;
+    }
+    // XHR "get a response MIME type" and "get a final MIME type".
+    const responseMime=s=>extractMime(s.responseHeaders)??{essence:'text/xml',parameters:new Map()};
+    const finalMime=s=>s.override??responseMime(s);
+    const xmlMime=m=>m.essence==='text/xml' || m.essence==='application/xml' || m.essence.endsWith('+xml');
+    // XHR "get a final encoding": a label; the native parsers resolve it and
+    // treat an unknown one as none.
+    function finalEncoding(s) {
+        let label=responseMime(s).parameters.get('charset')??null;
+        if(s.override && s.override.parameters.has('charset'))label=s.override.parameters.get('charset');
+        return label;
+    }
+    // Whether the received bytes must be kept for a document response.
+    function keepsBytes(s) {
+        if(s.type==='document')return true;
+        return s.type==='' && xmlMime(finalMime(s));
+    }
+    // XHR "set a document response".
+    function documentResponse(s) {
+        const bytes=s.bytes;s.bytes=null;
+        if(!bytes)return null;
+        const mime=finalMime(s),html=mime.essence==='text/html';
+        if(!html && !xmlMime(mime))return null;
+        if(s.type==='' && html)return null;
+        if(html)return rawDom.parseDocument(null,bytes,finalEncoding(s),s.finalURL,mime.essence);
+        // The XML parser with XML scripting support disabled; failure is null.
+        return rawDom.parseXML(null,bytes,mime.essence,false,finalEncoding(s),s.finalURL);
+    }
 
     class ProgressEvent extends Event {
         constructor(type,init={}) {
@@ -74,7 +169,7 @@
         eventState(e).isTrusted=true;dispatch(x,e);
     }
     function stopTimer(s){if(s.timer)host.clear(s.timer);s.timer=0;}
-    function clearResponse(s){s.status=0;s.statusText='';s.responseURL='';s.responseHeaders=null;s.text='';s.bytes=null;s.object=null;s.objectSet=false;s.chunks=[];s.loaded=0;s.total=0;s.decoder=null;s.progressAt=0;s.uploadProgressAt=0;}
+    function clearResponse(s){s.status=0;s.statusText='';s.responseURL='';s.responseHeaders=null;s.text='';s.bytes=null;s.object=null;s.objectSet=false;s.chunks=[];s.loaded=0;s.total=0;s.decoder=null;s.progressAt=0;s.uploadProgressAt=0;s.finalURL='';s.keep=false;}
     function cancel(s){if(s.transport){s.transport.cancel();s.transport=null;}if(s.id)host.cancel(s.id);s.id=0;stopTimer(s);}
     function error(x,s,epoch,type) {
         if(!current(s,epoch))return;
@@ -117,12 +212,16 @@
             emergencyError(x,s,epoch);
         }
     }
+    // The text response's decoder: decode, a BOM over the charset's encoding
+    // (UTF-8 when the label names none, replacement too); JSON's UTF-8 decode.
+    function responseDecoder(s,label) {
+        return s.type==='json'?textDecoder('UTF-8',false,false):textDecoder(label,false,true,true);
+    }
+    const decodeBytes=(decoder,bytes,stream)=>textDecode(decoder,bytes,0,bytes?nativeApply(bufferLength,bytes,[]):0,stream);
     function textResponse(s) {
         const charset=mime=>{const m=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(mime);return m?(m[1]??m[2]):null;};
-        const encoding=charset(s.mime)??charset(s.responseHeaders?nativeApply(headerGet,s.responseHeaders,['content-type'])||'':'')??'utf-8';
-        let decoder;
-        try{decoder=new Decoder(s.type==='json'?'utf-8':encoding);}catch(_){decoder=new Decoder('utf-8');}
-        return nativeApply(decode,decoder,[s.bytes]);
+        const encoding=charset(s.mime)??charset(s.responseHeaders?nativeApply(headerGet,s.responseHeaders,['content-type'])||'':'')??'UTF-8';
+        return decodeBytes(responseDecoder(s,encoding),s.bytes,false);
     }
     function completed(x,s,epoch,response) {
         if(!current(s,epoch))return;
@@ -133,11 +232,12 @@
         }
         const result=fetchBridge.xhrResponse(response);
         s.status=result.status;s.statusText=result.statusText;s.responseURL=nativeApply(split,result.url,['#'])[0];s.responseHeaders=result.headers;
+        s.finalURL=result.url;
         s.ready=2;fire(x,'readystatechange');if(!current(s,epoch))return;
         // Transfer the private Response's sole buffer, without an extra
         // fragment-sized copy or page-defined getters/@@species.
         s.bytes=result.bytes;
-        const text=s.type==='arraybuffer'||s.type==='blob'?'':textResponse(s);
+        const text=s.type==='arraybuffer'||s.type==='blob'||s.type==='document'?'':textResponse(s);
         if(!current(s,epoch))return;
         s.text=text;
         const loaded=nativeApply(bufferLength,s.bytes,[]);
@@ -146,7 +246,7 @@
             // Text/JSON have their decoded representation now. Keep the wire
             // buffer only for binary response types; do not double-retain a
             // large response for the lifetime of Google's cached XHR objects.
-            if(s.type===''||s.type==='text'||s.type==='json')s.bytes=null;
+            if((s.type===''&&!keepsBytes(s))||s.type==='text'||s.type==='json')s.bytes=null;
             fire(x,'readystatechange');if(!current(s,epoch))return;
         }
         const header=nativeApply(headerGet,s.responseHeaders,['content-length']);
@@ -162,21 +262,22 @@
     function receivedHeaders(x,s,epoch,response) {
         const result=fetchBridge.xhrMetadata(response);
         s.status=result.status;s.statusText=result.statusText;s.responseURL=nativeApply(split,result.url,['#'])[0];s.responseHeaders=result.headers;
+        s.finalURL=result.url;s.keep=keepsBytes(s);
         const header=nativeApply(headerGet,s.responseHeaders,['content-length']);
         if(header!==null){const values=header.split(',').map(value=>value.trim());if(values.length&&/^\d+$/.test(values[0])&&values.every(value=>value===values[0]))s.total=NativeNumber(values[0]);}
         s.ready=2;fire(x,'readystatechange');
     }
     function prepareDecoder(s) {
-        if(!s.decoder&&s.type!=='arraybuffer'&&s.type!=='blob'){
+        if(!s.decoder&&s.type!=='arraybuffer'&&s.type!=='blob'&&s.type!=='document'){
             const charset=mime=>{const m=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(mime);return m?(m[1]??m[2]):null;};
-            const encoding=s.type==='json'?'utf-8':charset(s.mime)??charset(nativeApply(headerGet,s.responseHeaders,['content-type'])||'')??'utf-8';
-            try{s.decoder=new Decoder(encoding);}catch(_){s.decoder=new Decoder('utf-8');}
+            s.decoder=responseDecoder(s,charset(s.mime)??charset(nativeApply(headerGet,s.responseHeaders,['content-type'])||'')??'UTF-8');
         }
     }
     function receivedChunk(x,s,epoch,bytes) {
         prepareDecoder(s);
         const count=nativeApply(bufferLength,bytes,[]);s.loaded+=count;
-        if(s.decoder)s.text+=nativeApply(decode,s.decoder,[bytes,{stream:true}]);else s.chunks.push(bytes);
+        if(s.decoder)s.text+=decodeBytes(s.decoder,bytes,true);
+        if(!s.decoder||s.keep)s.chunks.push(bytes);
         s.ready=3;
         const now=host.now();
         if(now-s.progressAt<50)return;
@@ -186,8 +287,8 @@
     function receivedEnd(x,s,epoch,reason) {
         if(reason!==undefined){networkFailure(x,s,epoch,reason);return;}
         prepareDecoder(s);
-        if(s.decoder)s.text+=nativeApply(decode,s.decoder,[]);
-        else {
+        if(s.decoder)s.text+=decodeBytes(s.decoder,null,false);
+        if(!s.decoder||s.keep) {
             const bytes=new U8(s.loaded);let at=0;
             for(const chunk of s.chunks){const input=new U8(chunk);nativeApply(typedSet,bytes,[input,at]);at+=nativeApply(typedLength,input,[]);}
             s.bytes=nativeApply(typedBuffer,bytes,[]);
@@ -214,7 +315,7 @@
             super();const upload=new XMLHttpRequestUpload(uploadToken);
             // The private state later owns the transport ArrayBuffer; inherited
             // setters must not get this record while clearResponse initializes it.
-            const s=assign(create(null),{ready:0,sent:false,epoch:0,id:0,timer:0,started:0,timeout:0,credentials:false,type:'',mime:'',
+            const s=assign(create(null),{ready:0,sent:false,epoch:0,id:0,timer:0,started:0,timeout:0,credentials:false,type:'',mime:'',override:null,
                 method:'',url:'',headers:new Map(),upload,uploadDone:true,uploadSize:0,uploadListener:false});
             clearResponse(s);states.set(this,s);uploadStates.set(upload,s);
         }
@@ -227,7 +328,9 @@
             const upper=method.toUpperCase();
             if(['CONNECT','TRACE','TRACK'].includes(upper))fail('SecurityError','Forbidden HTTP method');
             if(['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper))method=upper;
-            let parsed;try{parsed=new NativeURL(url,document.baseURI);}catch(_){fail('SyntaxError','Invalid request URL');}
+            // encoding-parse relative to the document: its encoding for the query.
+            const parsed=urlBridge.encodingParse(url,rawDom.get(document,'baseURI'),rawDom.get(document,'characterSet'));
+            if(parsed===null)fail('SyntaxError','Invalid request URL');
             if(!async)fail('NotSupportedError','Synchronous XMLHttpRequest is not supported');
             if(username!==null || password!==null || parsed.username || parsed.password)fail('NotSupportedError','URL credentials are not supported');
             cancel(s);s.epoch++;s.sent=false;s.method=method;s.url=parsed.href;s.headers=new Map();clearResponse(s);
@@ -246,8 +349,14 @@
         send(body=null) {
             const s=state(this);if(s.ready!==1 || s.sent)fail('InvalidStateError','The request is not open');
             if(s.method==='GET' || s.method==='HEAD')body=null;
-            if(body!==null && body instanceof Document)fail('NotSupportedError','Document uploads are not supported');
-            const extracted=fetchBridge.xhrBody(body),contentType=extracted.type;
+            // A Document body is its fragment serialization, UTF-8 encoded.
+            let documentType=null;
+            if(body!==null && body instanceof Document){
+                const html=rawDom.get(body,'htmlDocument');
+                documentType=html?'text/html;charset=UTF-8':'application/xml;charset=UTF-8';
+                body=(html?rawDom.get(body,'innerHTML'):rawDom.get(body,'xmlSerialization'))??'';
+            }
+            const extracted=fetchBridge.xhrBody(body),contentType=documentType??extracted.type;
             body=extracted.bytes;
             // Body conversion may have called open()/send()/abort() itself.
             if(s.ready!==1 || s.sent)fail('InvalidStateError','Request state changed during body conversion');
@@ -313,11 +422,15 @@
             const s=state(this);v=string(v);
             if(!['','text','json','arraybuffer','blob','document'].includes(v))return;
             if(s.ready===3 || s.ready===4)fail('InvalidStateError','Response already loading');
-            if(v==='document')fail('NotSupportedError','Document responses are not supported');
             s.type=v;
         }
         get responseText(){const s=state(this);if(s.type!=='' && s.type!=='text')fail('InvalidStateError','Response is not text');return s.ready<3?'':s.text;}
-        get responseXML(){const s=state(this);if(s.type!=='' && s.type!=='document')fail('InvalidStateError','Response is not a document');return null;}
+        get responseXML(){
+            const s=state(this);if(s.type!=='' && s.type!=='document')fail('InvalidStateError','Response is not a document');
+            if(s.ready!==4)return null;
+            if(!s.objectSet){s.object=documentResponse(s);s.objectSet=true;}
+            return s.object;
+        }
         get response(){
             const s=state(this);if(s.type==='' || s.type==='text')return s.ready<3?'':s.text;
             if(s.ready!==4)return null;
@@ -326,11 +439,13 @@
                 if(s.type==='arraybuffer')s.object=s.bytes;
                 else if(s.type==='blob')s.object=blobBridge.fromBytes(s.bytes,s.mime||nativeApply(headerGet,s.responseHeaders,['content-type'])||'');
                 else if(s.type==='json'){try{s.object=parseJSON(s.text);}catch(_){s.object=null;}s.text='';}
+                else if(s.type==='document')s.object=documentResponse(s);
                 s.objectSet=true;
             }
             return s.object;
         }
-        overrideMimeType(mime){const s=state(this);if(!arguments.length)throw new TypeError('overrideMimeType requires a MIME type');mime=string(mime);if(s.ready===3 || s.ready===4)fail('InvalidStateError','Response already loading');s.mime=mime;}
+        overrideMimeType(mime){const s=state(this);if(!arguments.length)throw new TypeError('overrideMimeType requires a MIME type');mime=string(mime);if(s.ready===3 || s.ready===4)fail('InvalidStateError','Response already loading');s.mime=mime;
+            s.override=parseMime(mime)??{essence:'application/octet-stream',parameters:new Map()};}
         getResponseHeader(name){const s=state(this);if(!arguments.length)throw new TypeError('getResponseHeader requires name');name=bytestring(name);if(!token.test(name) || /^set-cookie2?$/i.test(name) || !s.responseHeaders)return null;return nativeApply(headerGet,s.responseHeaders,[name]);}
         getAllResponseHeaders(){
             const s=state(this);if(!s.responseHeaders)return '';

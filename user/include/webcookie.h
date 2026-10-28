@@ -43,9 +43,12 @@ void webcookie_free(webcookie_jar *);
    rules must be converted on the host. Failed loads keep the prior policy.
    Without a PSL, Domain cookies cannot widen scope and sites are exact-host. */
 bool webcookie_psl_load(webcookie_jar *, const char *text, size_t len);
+/* HTML's same site for the origins of the URLs a and b (both tuple origins, the same scheme,
+   the same registrable domain or, without one, the same host), the PSL being this jar's. The
+   one owner of same site: Fetch Metadata, SameSite and the redirect taint all ask it. */
 bool webcookie_same_site(const webcookie_jar *, const char *a, const char *b);
-/* The site (registrable domain, PSL) of a lowercase ASCII host: a suffix of host itself; host
-   when it is an IP address, a public suffix, or there is no PSL. */
+/* The site (registrable domain, PSL) of a host as the URL parser writes it: a suffix of host
+   itself; host when it is an IP address, a public suffix, or there is no PSL. */
 const char *webcookie_site_of(const webcookie_jar *, const char *host);
 
 /* The user's choice for a host (RFC 6265bis §7.2 cookie policy, §7.3 user controls): the jar asks

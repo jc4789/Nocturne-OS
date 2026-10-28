@@ -181,6 +181,7 @@ def main():
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--label', required=True)
+    ap.add_argument('--boot-image', help='build/nocturne.img の代わりに写す媒体（変更前の版と同じ条件で比べる）')
     ap.add_argument('--url')
     ap.add_argument('--command', action='append', default=[])
     ap.add_argument('--guest-file', action='append', default=[], help='明示したconsole入力を隔離コピーのC:\\Testsへ置く（サイトfixture用ではない）')
@@ -284,7 +285,7 @@ def main():
     for stale in [*here.glob('screen-*.p[np][gm]'), here / 'serial.log', here / 'data.img', here / 'data.stamp']:
         if stale.is_file():
             stale.unlink()
-    source = ROOT / 'build/nocturne.img'
+    source = Path(a.boot_image).resolve() if a.boot_image else ROOT / 'build/nocturne.img'
     if not source.is_file() or not Path(TEST.STORE).is_file():
         ap.error('先にbuildしてください（make qemu-image）')
     boot = here / 'boot.img'
@@ -323,8 +324,9 @@ def main():
     script.write_text('\n'.join(commands)+'\n', encoding='utf-8', newline='\n')
     files.append(('C:\\Tests\\autorun.sh', str(script)))
     with tempfile.TemporaryDirectory(prefix='scratch-', dir=here) as scratch:
-        # The copy's kernel and programs are the current build's, every run.
-        hashes = TEST.system_payload(str(boot), scratch)
+        # The copy's kernel and programs are the current build's, every run; a --boot-image is
+        # another version on purpose and is named in the metadata instead.
+        hashes = None if a.boot_image else TEST.system_payload(str(boot), scratch)
         if not reuse_boot:
             if a.cmdline:
                 TEST.edit_boot_entry(str(boot), scratch, a.cmdline)
@@ -352,7 +354,7 @@ def main():
         args += ['-trace', f'enable=virtio_gpu*,file={here / "gpu-trace.log"}', '-d', 'guest_errors']
     if a.audio:
         args += ['-audiodev', f'wav,id=snd,path={here / "audio.wav"}', '-device', 'AC97,audiodev=snd']
-    metadata = {'arguments': args, 'boot_payload_sha256': hashes, 'user_data_attached': False,
+    metadata = {'arguments': args, 'boot_image': a.boot_image, 'boot_payload_sha256': hashes, 'user_data_attached': False,
                 'boot_snapshot': True, 'requested_seconds': a.seconds,
                 'requested_resolution': a.resolution,
                 'requested_scroll_interval': a.scroll_interval,

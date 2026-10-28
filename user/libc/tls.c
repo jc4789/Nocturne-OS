@@ -1,5 +1,6 @@
 /* net_stream: TCP connections, optionally wrapped in TLS 1.2 by BearSSL.
-   Certificates are checked against the Mozilla root store compiled in by scripts/mkroots.py, and
+   Certificates are checked against the Mozilla root store compiled in by scripts/mkroots.py and
+   the certificate authorities added to the system in N_FOLDER_CERTIFICATES (trust_anchors), and
    the current time comes from the CMOS clock. Entropy for the handshake comes from the system entropy pool (n_random). */
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,142 @@
 extern const br_x509_trust_anchor tls_trust_anchors[];
 extern const size_t tls_trust_anchors_num;
 
+/* The trust anchors: the compiled-in roots, then each certificate in the documents of
+   N_FOLDER_CERTIFICATES (PEM with any number of CERTIFICATE blocks, or one DER certificate). A
+   CA certificate anchors chains; any other is trusted as itself (BearSSL's direct trust, for a
+   server's own self-signed certificate). Read once per app, at its first TLS connection; a
+   certificate that does not decode is left out and the rest still count. */
+struct der_bytes { unsigned char *data; size_t len, cap; bool failed; };
+static void der_append(void *ctx, const void *buf, size_t len) {
+    struct der_bytes *b = ctx;
+    if (b->failed || !len) return;
+    if (len > SIZE_MAX - b->len) { b->failed = true; return; }
+    if (b->len + len > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < b->len + len) cap = cap > SIZE_MAX / 2 ? b->len + len : cap * 2;
+        unsigned char *grown = realloc(b->data, cap);
+        if (!grown) { b->failed = true; return; }
+        b->data = grown; b->cap = cap;
+    }
+    memcpy(b->data + b->len, buf, len);
+    b->len += len;
+}
+static unsigned char *blob_copy(const unsigned char *data, size_t len) {
+    unsigned char *copy = malloc(len ? len : 1);
+    if (copy) memcpy(copy, data, len);
+    return copy;
+}
+static bool anchor_from_certificate(const unsigned char *der, size_t len, br_x509_trust_anchor *ta) {
+    br_x509_decoder_context dc;
+    struct der_bytes dn = {0};
+    br_x509_decoder_init(&dc, der_append, &dn);
+    br_x509_decoder_push(&dc, der, len);
+    const br_x509_pkey *pk = br_x509_decoder_get_pkey(&dc);
+    if (!pk || dn.failed || !dn.len) { free(dn.data); return false; }
+    *ta = (br_x509_trust_anchor){.dn = {dn.data, dn.len}, .flags = br_x509_decoder_isCA(&dc) ? BR_X509_TA_CA : 0};
+    ta->pkey.key_type = pk->key_type;
+    if (pk->key_type == BR_KEYTYPE_RSA) {
+        ta->pkey.key.rsa.n = blob_copy(pk->key.rsa.n, pk->key.rsa.nlen);
+        ta->pkey.key.rsa.nlen = pk->key.rsa.nlen;
+        ta->pkey.key.rsa.e = blob_copy(pk->key.rsa.e, pk->key.rsa.elen);
+        ta->pkey.key.rsa.elen = pk->key.rsa.elen;
+        if (ta->pkey.key.rsa.n && ta->pkey.key.rsa.e) return true;
+        free(ta->pkey.key.rsa.n); free(ta->pkey.key.rsa.e);
+    } else if (pk->key_type == BR_KEYTYPE_EC) {
+        ta->pkey.key.ec.curve = pk->key.ec.curve;
+        ta->pkey.key.ec.q = blob_copy(pk->key.ec.q, pk->key.ec.qlen);
+        ta->pkey.key.ec.qlen = pk->key.ec.qlen;
+        if (ta->pkey.key.ec.q) return true;
+    }
+    free(dn.data);
+    return false;
+}
+struct anchor_list { br_x509_trust_anchor *items; size_t count, cap; };
+static void anchor_add(struct anchor_list *list, const unsigned char *der, size_t len) {
+    br_x509_trust_anchor ta;
+    if (!anchor_from_certificate(der, len, &ta)) return;
+    if (list->count == list->cap) {
+        size_t cap = list->cap ? list->cap * 2 : 8;
+        br_x509_trust_anchor *grown = cap > SIZE_MAX / sizeof *grown ? NULL : realloc(list->items, cap * sizeof *grown);
+        if (!grown) {
+            free(ta.dn.data);
+            if (ta.pkey.key_type == BR_KEYTYPE_RSA) { free(ta.pkey.key.rsa.n); free(ta.pkey.key.rsa.e); }
+            else free(ta.pkey.key.ec.q);
+            return;
+        }
+        list->items = grown; list->cap = cap;
+    }
+    list->items[list->count++] = ta;
+}
+static void anchors_from_document(struct anchor_list *list, const unsigned char *data, size_t len) {
+    static const char begin[] = "-----BEGIN ";
+    bool pem = false;
+    for (size_t i = 0; i + sizeof begin - 1 <= len && !pem; i++) pem = !memcmp(data + i, begin, sizeof begin - 1);
+    if (!pem) { anchor_add(list, data, len); return; }
+    br_pem_decoder_context pc;
+    br_pem_decoder_init(&pc);
+    struct der_bytes object = {0};
+    bool certificate = false;
+    while (len) {
+        size_t used = br_pem_decoder_push(&pc, data, len);
+        data += used; len -= used;
+        switch (br_pem_decoder_event(&pc)) {
+        case BR_PEM_BEGIN_OBJ: {
+            const char *name = br_pem_decoder_name(&pc);
+            certificate = !strcmp(name, "CERTIFICATE") || !strcmp(name, "X509 CERTIFICATE");
+            object.len = 0; object.failed = false;
+            br_pem_decoder_setdest(&pc, certificate ? der_append : NULL, &object);
+            break;
+        }
+        case BR_PEM_END_OBJ:
+            if (certificate && !object.failed) anchor_add(list, object.data, object.len);
+            certificate = false;
+            break;
+        case BR_PEM_ERROR:
+            free(object.data);
+            return;
+        }
+    }
+    free(object.data);
+}
+static const br_x509_trust_anchor *anchors = tls_trust_anchors;
+static size_t anchor_count;
+static once_flag anchors_once = ONCE_FLAG_INIT;
+static void anchors_read(void) {
+    anchor_count = tls_trust_anchors_num;
+    struct n_entry *entries = NULL;
+    n_result count = n_folder_entries(N_FOLDER_CERTIFICATES, &entries);
+    struct anchor_list added = {0};
+    for (n_result i = 0; i < count; i++) {
+        char path[4096];
+        if (entries[i].kind == N_KIND_FOLDER || n_path_join(N_FOLDER_CERTIFICATES, entries[i].name, path, sizeof path) < 0)
+            continue;
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        struct der_bytes document = {0};
+        unsigned char chunk[4096];
+        size_t got;
+        while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) der_append(&document, chunk, got);
+        fclose(f);
+        if (!document.failed) anchors_from_document(&added, document.data, document.len);
+        free(document.data);
+    }
+    free(entries);
+    if (!added.count) return;
+    br_x509_trust_anchor *all = malloc((tls_trust_anchors_num + added.count) * sizeof *all);
+    if (!all) return; /* the compiled-in roots still hold */
+    memcpy(all, tls_trust_anchors, tls_trust_anchors_num * sizeof *all);
+    memcpy(all + tls_trust_anchors_num, added.items, added.count * sizeof *all);
+    free(added.items);
+    anchors = all;
+    anchor_count = tls_trust_anchors_num + added.count;
+}
+static const br_x509_trust_anchor *trust_anchors(size_t *count) {
+    call_once(&anchors_once, anchors_read);
+    *count = anchor_count;
+    return anchors;
+}
+
 struct net_stream {
     n_handle sock;
     int timeout_ms;
@@ -23,6 +160,8 @@ struct net_stream {
     uint64_t io_deadline;
     uint64_t bytes_sent;
     struct ns_connection_info connection;
+    /* Fetch's connection timing info, recorded as the connection opened. */
+    struct http_connection_timing timing_info;
     int (*cancelled)(void *);
     void *cancel_ctx;
     char *session_key;
@@ -210,6 +349,13 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     uint64_t resolve_started=0,tls_started=0;
     if(timing){memset(timing,0,sizeof *timing);timing->phase=HTTP_PHASE_RESOLVE;resolve_started=uptime_ms();}
     if(cancelled&&cancelled(cancel_ctx)){errno=ECANCELED;snprintf(err,errlen,"request cancelled");return NULL;}
+    /* host is a URL's host serialized (http.c's http_target): an IPv6 address comes in brackets,
+       and the network stack (SYS_NET_*) has IPv4 only. */
+    if (host && host[0] == '[') {
+        if(timing)timing->resolve_ms=0;
+        errno=N_ERR_UNSUPPORTED;snprintf(err, errlen, "%s: the network has no IPv6", host);
+        return NULL;
+    }
     if (!net_wait_up(5000)) {
         if(timing)timing->resolve_ms=uptime_ms()-resolve_started;
         errno=N_ERR_NETWORK_DOWN;snprintf(err, errlen, "network is down");
@@ -217,6 +363,7 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     }
     uint32_t first[16],*ips=first;
     struct n_dns_result dns;
+    uint64_t lookup_started=uptime_ms();
     n_result resolved=net_resolve_all(host, first,16,&dns);
     if (resolved < 0) {
         if(timing)timing->resolve_ms=uptime_ms()-resolve_started;
@@ -254,7 +401,8 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         if(sock!=-N_ERR_TIMEOUT&&sock!=-N_ERR_CONNECTION_REFUSED&&sock!=-N_ERR_UNREACHABLE)break;
     }
     if(ips!=first)free(ips);
-    if(timing){tls_started=uptime_ms();timing->connect_ms=tls_started-connect_started;}
+    uint64_t connected=uptime_ms();
+    if(timing){tls_started=connected;timing->connect_ms=tls_started-connect_started;}
     if (sock < 0) {
         errno=(int)-sock;
         snprintf(err, errlen, "connect to %s:%d: %s", host, port, n_result_text(sock));
@@ -268,6 +416,11 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     }
     s->sock = (n_handle)sock;
     s->connection=(struct ns_connection_info){1,(uint32_t)count,attempts,peer_ip};
+    /* Fetch: the lookup ends as the connection starts; a TLS connection is
+       established when its handshake is done, its secure start just before. */
+    s->timing_info=(struct http_connection_timing){.domain_lookup_start=lookup_started,
+        .domain_lookup_end=connect_started,.connect_start=connect_started,.connect_end=connected,
+        .secure_connection_start=tls?connected:0};
     s->tls = tls;
     s->http_alpn=http;
     s->cancelled=cancelled;s->cancel_ctx=cancel_ctx;
@@ -276,7 +429,9 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     if(timing)timing->phase=HTTP_PHASE_TLS;
     s->handshaking=true;s->timing=timing;io_begin(s,s->timeout_ms);
 
-    br_ssl_client_init_full(&s->cc, &s->xc, tls_trust_anchors, tls_trust_anchors_num);
+    size_t anchors_known;
+    const br_x509_trust_anchor *known = trust_anchors(&anchors_known);
+    br_ssl_client_init_full(&s->cc, &s->xc, known, anchors_known);
     br_ssl_engine_set_buffer(&s->cc.eng, s->iobuf, sizeof s->iobuf, 1);
     static const char *alpn[] = {"h2","http/1.1"};
     br_ssl_engine_set_protocol_names(&s->cc.eng, http?alpn:alpn+1, http?2:1);
@@ -297,6 +452,8 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     }
     const char *selected=br_ssl_engine_get_selected_protocol(&s->cc.eng);
     s->h2=selected&&!strcmp(selected,"h2");
+    /* Only the IDs offered above can be selected, all shorter than the field. */
+    if(selected&&strlen(selected)<sizeof s->timing_info.protocol)strcpy(s->timing_info.protocol,selected);
     br_ssl_session_parameters negotiated;
     br_ssl_engine_get_session_parameters(&s->cc.eng,&negotiated);
     s->resumed=resume&&offered.session_id_len&&offered.session_id_len==negotiated.session_id_len&&
@@ -318,6 +475,7 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         }
     }
     session_save(s);
+    s->timing_info.connect_end=uptime_ms();
     if(timing){timing->tls_ms=uptime_ms()-tls_started;
         timing->tls_other_ms=timing->tls_ms>=timing->tls_io_ms?timing->tls_ms-timing->tls_io_ms:0;}
     s->handshaking=false;s->io_limited=false;s->timing=NULL;
@@ -337,6 +495,9 @@ net_stream *ns_open(const char *host,uint16_t port,bool tls,int timeout_ms,char 
 }
 int ns_get_connection_info(const net_stream *s,struct ns_connection_info *out){
     if(!s||!out){errno=EINVAL;return -1;}*out=s->connection;return 0;
+}
+int ns_get_connection_timing(const net_stream *s,struct http_connection_timing *out){
+    if(!s||!out){errno=EINVAL;return -1;}*out=s->timing_info;return 0;
 }
 net_stream *ns_open_timed(const char *host,uint16_t port,bool tls,int timeout_ms,char *err,size_t errlen,
                           struct http_transport_timing *timing) {

@@ -11,6 +11,8 @@ struct web_frame {
     web_doc *retired;
     web_doc *navigation_owner;
     char *source, *srcdoc, *navigation, *navigation_origin, *sandbox;
+    char *navigation_body, *navigation_type; /* the navigation's POST body and its Content-Type */
+    size_t navigation_body_length;
     char *target_name, *name_attribute; /* navigable名と最後のHTML name属性を別所有 */
     uint64_t request;
     unsigned dom_order;
@@ -39,12 +41,25 @@ struct web_frame *web_frame_ensure(web_doc *document, node_t *element);
 void web_frame_retire(struct web_frame *frame);
 void web_frames_detach_tree(web_doc *document,node_t *root);
 bool web_frame_set_navigation(struct web_frame *frame,const char *url,web_doc *origin);
+/* The request body (a form's POST entry list) and Content-Type of the navigation
+   web_frame_set_navigation set last; NULL body: none (a GET). */
+bool web_frame_set_navigation_body(struct web_frame *frame,const void *body,size_t length,const char *content_type);
+/* HTML's rules for choosing a navigable, for a source document of top's tree and a target:
+   the source (no target, _self), top (_top), the parent (_parent), or a frame of top's tree with
+   that target name. NULL for _blank and for a name no frame of the page has, which another
+   top-level traversable may have (the host's) or a new one takes. */
+web_doc *web_frame_choose(web_doc *top,web_doc *source,const char *target);
 bool web_frame_initial_blocked(const struct web_frame *frame,const char *source,const char *srcdoc);
 bool web_frame_initial_create(struct web_frame *frame,const struct web_host *host);
+/* A frame's document from markup the browser writes (about:blank, srcdoc,
+   a text document): an HTML document. */
 bool web_frame_commit(struct web_frame *frame, const char *html, size_t length,
                       const char *url, const char *charset, const struct web_host *host, bool inherited);
+/* A frame's document from a response: its body, header block (NULL: none)
+   and Content-Type (NULL: text/html), which picks the document's parser. */
 bool web_frame_commit_response(struct web_frame *frame,const char *html,size_t length,
-                      const char *url,const char *charset,const char *headers,const struct web_host *host,bool inherited);
+                      const char *url,const char *charset,const char *headers,const char *type,
+                      const struct web_host *host,bool inherited);
 void web_frames_free(web_doc *document);
 void web_frames_tick(web_doc *document, uint64_t now);
 int64_t web_frames_deadline(web_doc *document);
@@ -52,6 +67,7 @@ bool web_frames_busy(web_doc *document);
 void web_frames_loaded(web_doc *document, uint64_t id, const struct web_response *response);
 void web_frames_socket_event(web_doc *document, uint64_t id, const struct web_socket_event *event);
 bool web_frame_same_origin(web_doc *first, web_doc *second);
+bool web_doc_fully_active(web_doc *document);
 bool web_sandbox_document_allowed(struct web_frame *frame,const char *url,bool inherited);
 bool web_sandbox_navigation_allowed(web_doc *source,web_doc *destination,bool trusted);
 bool web_sandbox_forms_allowed(web_doc *document);

@@ -3,20 +3,14 @@
  * change native origin selection or the private brand. */
 const storageBridge=(()=>{
     'use strict';
-    const URLImpl=URL, StringImpl=String, TypeErrorImpl=TypeError, DOMExceptionImpl=DOMException;
+    const StringImpl=String, TypeErrorImpl=TypeError, DOMExceptionImpl=DOMException;
     const call=Reflect.apply, getOwn=Reflect.getOwnPropertyDescriptor, reflectGet=Reflect.get;
     const reflectHas=Reflect.has, reflectSet=Reflect.set, reflectDefine=Reflect.defineProperty, reflectDelete=Reflect.deleteProperty;
     const reflectOwn=Reflect.ownKeys, define=Object.defineProperty, create=Object.create;
-    const URLOrigin=Object.getOwnPropertyDescriptor(URLImpl.prototype,'origin').get;
-    const URLProtocol=Object.getOwnPropertyDescriptor(URLImpl.prototype,'protocol').get;
     const records=new WeakMap(), mapGet=WeakMap.prototype.get, mapSet=WeakMap.prototype.set;
     const native=host.storage;
-    function origin(url){
-        try{
-            const u=new URLImpl(url), protocol=call(URLProtocol,u,[]);
-            return protocol==='http:' || protocol==='https:'?call(URLOrigin,u,[]):null;
-        }catch(e){if(e instanceof TypeErrorImpl)return null;throw e;}
-    }
+    /* The storage key's origin, as IndexedDB's of every realm (js_url.js). */
+    const origin=urlBridge.storageOrigin;
     function brand(value){
         const r=call(mapGet,records,[value]);
         if(!r)throw new TypeErrorImpl('Illegal Storage receiver');
@@ -30,8 +24,8 @@ const storageBridge=(()=>{
         const pair=call(native,host,[r.kind,op,key,value,index]);
         if(pair[0]!==0){
             const name=pair[0]===1?'SecurityError':pair[0]===2 || op===3?'QuotaExceededError':'UnknownError';
-            throw new DOMExceptionImpl(pair[0]===1?'Storage is not available for this origin':
-                pair[0]===2?'Storage quota exceeded':'Native storage read/write failed',name);
+            throw domExceptionBridge.create(name,pair[0]===1?'Storage is not available for this origin':
+                pair[0]===2?'Storage quota exceeded':'Native storage read/write failed');
         }
         return pair[1];
     }

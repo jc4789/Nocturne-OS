@@ -26,7 +26,7 @@ static web_doc *begin(const char *source, bool dsd) {
     if (!d) return NULL;
     d->url = strdup("https://parser.test/modern-tree.html");
     if (!d->url) { web_free(d); return NULL; }
-    snprintf(d->base, sizeof d->base, "%s", d->url);
+    if (!doc_set_base(d, d->url)) { web_free(d); return NULL; }
     d->live = true;
     d->parser = html_begin(d, source, strlen(source), "utf-8", true);
     if (!d->parser) { web_free(d); return NULL; }

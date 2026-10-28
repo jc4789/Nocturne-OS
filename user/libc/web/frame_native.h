@@ -43,11 +43,31 @@ static bool frame_string_replace(char **slot,const char *text) {
     if(text && !copy)return false;
     free(*slot);*slot=copy;return true;
 }
+/* The host a frame's new document is made with: the embedder's, with the
+   frame's own navigation in place of the embedder document's (HTML, create
+   and initialize a Document) - its time origin, and the record, status and
+   header block of its response when p fetched it (borrowed until the
+   document is made). A document made without a fetch (about:blank, srcdoc,
+   blob:) has no navigation timing entry; its time origin is its creation. */
+static struct web_host frame_host(struct web_js_state *s,const struct js_pending *p) {
+    struct web_host host=s->host;
+    memset(&host.navigation_timing,0,sizeof host.navigation_timing);
+    host.navigation_timing.valid=true;host.navigation_timing.type=WEB_NAVIGATION_NAVIGATE;
+    host.navigation_timing.navigation_start_ms=uptime_ms();
+    if(p){
+        const struct http_fetch_timing *t=&p->response.timing;
+        host.navigation_timing.navigation_start_ms=t->valid&&t->start_time?t->start_time:p->started;
+        host.navigation_timing.fetch=*t;
+        host.navigation_timing.status=p->response.status;
+        host.navigation_timing.headers=web_response_headers(&p->response);
+    }
+    return host;
+}
 /* A blob: URL resolves only in the creating realm's object-URL registry. The
    document inherits that realm's origin, like a blob URL entry's environment. */
 static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const char *url) {
     web_doc *owner=f->navigation_owner?f->navigation_owner:s->doc;
-    free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;
+    free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);
     if(owner!=s->doc){f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame blob URL belongs to another realm");return;}
     char mime[128];size_t n=0;bool untyped=false;
     char *body=script_blob_source(s,url,false,&n,mime,&untyped);
@@ -55,9 +75,16 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
         JS_FreeValue(s->ctx,JS_GetException(s->ctx));
         f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame blob URL is revoked or unavailable");return;
     }
+    /* An XML type loads an XML document; its encoding is the bytes' own. */
+    if(web_document_kind(mime)==WEB_DOCUMENT_XML){
+        struct web_host host=frame_host(s,NULL);
+        bool made=web_frame_commit_response(f,body,n,url,NULL,NULL,mime,&host,true);
+        js_free(s->ctx,body);f->navigation_owner=NULL;
+        if(!made){f->failed=true;log_text(s,1,"Frame blob document was refused or could not be allocated");}
+        return;
+    }
     /* An untyped Blob is sniffed like an untyped navigation response. */
-    bool html=!strcasecmp(mime,"text/html") || !strcasecmp(mime,"application/xhtml+xml") ||
-        (untyped && n && memchr(body,'<',n<512?n:512));
+    bool html=!strcasecmp(mime,"text/html") || (untyped && n && memchr(body,'<',n<512?n:512));
     /* Text, script and JSON types render as a plain text document. */
     bool text=!html && (!strncasecmp(mime,"text/",5) || strstr(mime,"javascript") || strstr(mime,"json") || strstr(mime,"xml"));
     char *page=NULL;size_t used=0;
@@ -71,7 +98,8 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
     }
     if(text && !page)log_text(s,2,"Frame blob text document allocation failed");
     bool made=page!=NULL;
-    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,"utf-8",&s->host,true);
+    struct web_host host=frame_host(s,NULL);
+    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,"utf-8",&host,true);
     free(page);js_free(s->ctx,body);f->navigation_owner=NULL;
     if(text && !made){f->failed=true;return;}
     html=html || made;
@@ -84,7 +112,7 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
     }
 }
 static void frame_sync(struct web_js_state *s,node_t *n) {
-    if(!web_frame_element(n) || !connected(s,n) || n->owner!=s->doc)return;
+    if(!web_frame_element(n) || !connected(s,n) || n->owner!=s->doc || n->frame_connection_pending)return;
     struct web_frame *f=web_frame_ensure(s->doc,n);
     if(!f){if(!s->doc->frame_allocation_reported){s->doc->frame_allocation_reported=true;log_text(s,2,"Frame metadata allocation failed");}return;}
     const char *name=node_attr(n,"name");if(!name)name="";
@@ -109,7 +137,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     f->pending_sandbox_flags=own|s->doc->sandbox_flags;
     if(s->host.debug_js && f->pending_sandbox_flags) {
         char *absolute=NULL,*origin=NULL;const char *desired=f->navigation?f->navigation:src;
-        if(web_resolve_url_owned(s->doc->base,desired,&absolute)==1)http_origin_owned(absolute,&origin);
+        if(doc_encoding_parse_url(s->doc,desired,&absolute)==1)web_url_origin(absolute,&origin);
         char message[480];snprintf(message,sizeof message,
             "Frame sandbox policy: allow=[%s] origin=[%.160s] inherited=0x%x pending=0x%x supported=%d",
             known,origin?origin:"null",s->doc->sandbox_flags,f->pending_sandbox_flags,
@@ -122,14 +150,16 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         log_text(s,1,"Sandboxed frame blocked: unsupported opaque/srcdoc policy");return;
     }
     if(!f->document || f->detached) {
-        if(!web_frame_initial_create(f,&s->host)){
+        struct web_host host=frame_host(s,NULL);
+        if(!web_frame_initial_create(f,&host)){
             log_text(s,2,"Frame initial about:blank context could not be created");return;
         }
         node_t *ignored=NULL;int result;
         do{result=html_resume(f->document->parser,&ignored);}while(result==HTML_PARSE_YIELD);
     }
     if(srcdoc && !f->navigation){
-        if(!web_frame_commit(f,srcdoc,strlen(srcdoc),"about:srcdoc","utf-8",&s->host,true))
+        struct web_host host=frame_host(s,NULL);
+        if(!web_frame_commit(f,srcdoc,strlen(srcdoc),"about:srcdoc","utf-8",&host,true))
             log_text(s,2,"Frame srcdoc document allocation failed");
         return;
     }
@@ -137,16 +167,17 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     if(f->pending_sandbox_flags && (!*desired || !strcasecmp(desired,"about:blank")) &&
        !web_sandbox_document_allowed(f,"about:blank",true)){
         web_frame_retire(f);f->failed=true;f->detached=false;
-        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;
+        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);f->navigation_owner=NULL;
         log_text(s,1,"Sandboxed authored about:blank policy is outside the supported subset");return;
     }
     if(!*desired || !strcasecmp(desired,"about:blank")) {
         /* The restricted initial blank of a scripted sandbox has no realm;
            an allowed authored blank replaces it with the frame's own policy. */
         bool restricted=(f->document->sandbox_flags&SB_SCRIPTS) && !(f->pending_sandbox_flags&SB_SCRIPTS);
-        if((f->navigation || restricted || strcmp(f->document->url,"about:blank")) && !web_frame_commit(f,"",0,"about:blank",NULL,&s->host,true))
+        struct web_host host=frame_host(s,NULL);
+        if((f->navigation || restricted || strcmp(f->document->url,"about:blank")) && !web_frame_commit(f,"",0,"about:blank",NULL,&host,true))
             log_text(s,2,"Frame about:blank navigation failed");
-        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return;
+        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);f->navigation_owner=NULL;return;
     }
     if(!strncasecmp(desired,"javascript:",11)) {
         /* CSP3 §4.2.4 for a javascript: navigation: the navigating document's
@@ -166,17 +197,23 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
             if(JS_IsException(result))exception(child);else JS_FreeValue(child->ctx,result);
             end_task(child);
         }else log_text(s,1,"Cross-origin javascript frame navigation blocked");
-        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return;
+        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);f->navigation_owner=NULL;return;
     }
+    /* HTML's shared attribute processing steps for iframe and frame elements:
+       encoding-parse the src relative to the element's node document (a
+       navigation's URL is already one). */
     char *url=NULL;
-    int resolved=web_resolve_url_owned(s->doc->base,desired,&url);
-    if(resolved==1 && !strncasecmp(url,"blob:",5)){frame_blob_commit(s,f,url);free(url);return;}
+    int resolved=doc_encoding_parse_url(s->doc,desired,&url);
+    if(resolved==1 && web_url_has_scheme(url,"blob")){frame_blob_commit(s,f,url);free(url);return;}
     bool valid=resolved==1 && permitted_url(s,url,false);
     free(f->navigation);f->navigation=NULL;
-    if(!valid){free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;f->failed=true;log_text(s,resolved<0?2:1,resolved<0?"Frame source URL allocation failed":"Frame source URL is not permitted");return;}
+    /* The navigation's POST body (a form's) goes with its request. */
+    char *post=f->navigation_body,*post_type=f->navigation_type;size_t post_length=f->navigation_body_length;
+    f->navigation_body=f->navigation_type=NULL;f->navigation_body_length=0;
+    if(!valid){free(post);free(post_type);free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;f->failed=true;log_text(s,resolved<0?2:1,resolved<0?"Frame source URL allocation failed":"Frame source URL is not permitted");return;}
     int ancestor=f->navigation_owner?0:web_frame_ancestor_url(s->doc,url);
     if(ancestor){
-        free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->failed=true;
+        free(post);free(post_type);free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->failed=true;
         log_text(s,ancestor<0?2:1,ancestor<0?"Frame ancestor URL comparison allocation failed":
                  "Frame src repeats an ancestor document URL (fragment excluded)");return;
     }
@@ -192,9 +229,16 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         if(!p->referrer)pending_error(p,"Frame referrer could not be retained");
     }
     free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;
-    if(!p){log_text(s,2,"Frame request queue or memory limit reached");return;}
+    if(!p){free(post);free(post_type);log_text(s,2,"Frame request queue or memory limit reached");return;}
     p->frame=f;f->request=p->id;f->notified=false;
-    if(!p->done)send_request(s,p,WEB_RESOURCE_FRAME,"GET",NULL,NULL,0);
+    if(!p->done){
+        size_t length=post?strlen(post_type)+17:0;char *fields=post?malloc(length):NULL;
+        if(fields)snprintf(fields,length,"Content-Type: %s\r\n",post_type);
+        if(post && !fields)pending_error(p,"Frame form request could not be retained");
+        else send_request(s,p,WEB_RESOURCE_FRAME,post?"POST":"GET",fields,post,post_length);
+        free(fields);
+    }
+    free(post);free(post_type);
 }
 static void frames_walk(struct web_js_state *s,node_t *root,unsigned *order) {
     for(node_t *n=root;n;) {
@@ -225,7 +269,9 @@ static void frame_response(struct web_js_state *s,struct js_pending *p,bool ok) 
         struct http_resp response_headers={.headers_full=(char *)web_response_headers(&p->response)};
         http_header(&response_headers,"Content-Type",content_type,sizeof content_type);
         html_transport_label(content_type,charset,sizeof charset);
-        if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),&s->host,false))return;
+        struct web_host host=frame_host(s,p);
+        if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),
+                                     content_type,&host,false))return;
         char message[640];
         snprintf(message,sizeof message,"Frame document commit failed: %s; %.*s",
                  f->commit_failure?f->commit_failure:"unknown reason",(int)MIN(strcspn(url,"?#"),(size_t)400),url);
@@ -246,7 +292,7 @@ static web_doc *frame_window_document(node_t *token) {
             if(f->window_token==token && !f->detached && doc_node_connected(f->element))return f->document;
         return NULL;
     }
-    if(!doc_node_connected(token))return NULL;
+    if(!doc_node_connected(token) || token->frame_connection_pending)return NULL;
     struct web_frame *f=web_frame_find(token->owner,token);
     return f && !f->detached?f->document:NULL;
 }
@@ -378,11 +424,11 @@ static JSValue frame_message_deliver(JSContext *ctx,JSValueConst this_val,int ar
     if(!task_context_active(s) || !generation || generation->owner!=s->doc || generation!=s->doc->root)return JS_UNDEFINED;
     const char *expected=JS_ToCString(ctx,data[3]);if(!expected)return JS_EXCEPTION;
     char *current=NULL;
-    enum http_url_result origin_status=make_origin(web_effective_url(s->doc),&current);
-    if(origin_status==HTTP_URL_OOM){JS_FreeCString(ctx,expected);return JS_ThrowOutOfMemory(ctx);}
-    bool origin_ok=origin_status==HTTP_URL_TUPLE;
+    enum web_url_result origin_status=web_url_origin(web_effective_url(s->doc),&current);
+    if(origin_status==WEB_URL_OOM){JS_FreeCString(ctx,expected);return JS_ThrowOutOfMemory(ctx);}
+    bool origin_ok=origin_status==WEB_URL_TUPLE;
     const char *sent_origin=JS_ToCString(ctx,data[2]);if(!sent_origin){free(current);JS_FreeCString(ctx,expected);return JS_EXCEPTION;}
-    bool default_match=!strcmp(sent_origin,"null")?origin_status==HTTP_URL_OPAQUE&&sender&&web_frame_same_origin(sender->owner,s->doc):origin_ok&&!strcmp(sent_origin,current);
+    bool default_match=!strcmp(sent_origin,"null")?origin_status==WEB_URL_OPAQUE&&sender&&web_frame_same_origin(sender->owner,s->doc):origin_ok&&!strcmp(sent_origin,current);
     bool allowed=!strcmp(expected,"*") || (!strcmp(expected,"/")?default_match:
         origin_ok&&strcmp(expected,"null")&&!strcmp(expected,current));
     free(current);JS_FreeCString(ctx,sent_origin);
@@ -450,10 +496,10 @@ static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct w
     if(JS_GetRuntime(caller->ctx)!=JS_GetRuntime(target->ctx))return JS_ThrowTypeError(ctx,"Window transfers require the same runtime");
     if(target->posted_count==UINT_MAX)return JS_ThrowRangeError(ctx,"Document posted task count cannot be represented");
     char *origin=NULL;
-    enum http_url_result status=make_origin(web_effective_url(caller->doc),&origin);
-    if(status==HTTP_URL_OOM)return JS_ThrowOutOfMemory(ctx);
-    if(status==HTTP_URL_INVALID)return JS_ThrowTypeError(ctx,"Window message sender origin is unavailable");
-    JSValue sender_origin=JS_NewString(ctx,status==HTTP_URL_TUPLE?origin:"null");
+    enum web_url_result status=web_url_origin(web_effective_url(caller->doc),&origin);
+    if(status==WEB_URL_OOM)return JS_ThrowOutOfMemory(ctx);
+    if(status==WEB_URL_INVALID)return JS_ThrowTypeError(ctx,"Window message sender origin is unavailable");
+    JSValue sender_origin=JS_NewString(ctx,status==WEB_URL_TUPLE?origin:"null");
     free(origin);
     if(JS_IsException(sender_origin))return sender_origin;
     JSValue result=frame_message_send_data(ctx,s,caller,target,document,sender_origin,args,argv);
@@ -625,7 +671,7 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         if(argc>3 && JS_ToInt32(ctx,&mode,argv[3])){JS_FreeCString(ctx,value);result=JS_EXCEPTION;goto out;}
         if(!value)result=JS_EXCEPTION;
         else {
-            char *url=js_resolve_owned(ctx,caller->doc->base,value);
+            char *url=js_resolve_owned(ctx,caller->doc,value,true);
             if(!url)result=JS_EXCEPTION;
             else if(!permitted_url(caller,url,false))result=JS_ThrowTypeError(ctx,"Child navigation URL is not permitted");
             else if(!task_context_active(s) || frame_window_document(token)!=target || !frame_navigation_authorized(caller,target))
@@ -715,6 +761,7 @@ out:JS_FreeCString(ctx,op);return result;
 static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);int32_t operation=0;
     if(argc && JS_ToInt32(ctx,&operation,argv[0]))return JS_EXCEPTION;
+    if(s->doc->xml)return xml_stream_error(s);
     if(s->disabled || !s->doc->live)return JS_ThrowTypeError(ctx,"Document stream belongs to an inactive browsing context");
     if((sandbox_authority(s)&SB_SCRIPTS) || sandbox_borrowed(s))return history_security_error(ctx,"Sandbox denied document stream authority");
     if(s->dynamic_markup_counter){

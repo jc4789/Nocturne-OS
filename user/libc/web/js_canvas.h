@@ -26,5 +26,6 @@ unsigned web_canvas_dimension(const node_t *node, const char *name);
 bool web_canvas_fit(const node_t *node, const style_t *st, int x, int y, int w, int h, int fit[4]);
 /* The canvas's WebGL context (borrowed), NULL for 2D or none. */
 struct web_webgl *web_canvas_webgl(const node_t *node);
-/* Paints the bitmap fitted (web_canvas_fit) into the content box x, y, w x h. */
-void web_canvas_paint(node_t *node, const style_t *st, canvas_t *dst, int x, int y, int w, int h);
+/* Paints the bitmap fitted (web_canvas_fit) into the content box x, y, w x h.
+   False when the canvas has no bitmap to show: no context was made for it. */
+bool web_canvas_paint(node_t *node, const style_t *st, canvas_t *dst, int x, int y, int w, int h);

@@ -273,6 +273,7 @@ static bool console_copy_log(const struct console_log *log) {
 }
 
 #include "browser_events.h"
+#include "browser_automation.h"
 
 static int page_w(void) { return MAX(view.w - SCRW, 50); }
 static int devtools_height; /* DevTools panel, dragged by its top edge; 0: default share */
@@ -343,8 +344,9 @@ static void show_chrome(void);
 enum { CMD_BACK = 1, CMD_FORWARD, CMD_RELOAD, CMD_HOME, CMD_SETTINGS, CMD_GO, CMD_FIND, CMD_FIND_NEXT,
        CMD_EVAL, CMD_FOCUS, CMD_NEW_TAB, CMD_CLOSE_TAB, CMD_SELECT_TAB, CMD_MOVE_TAB, CMD_NEW_WINDOW,
        CMD_DEVTOOLS, CMD_QUIT, CMD_SETTINGS_DO, CMD_FIND_OPEN, CMD_RELOAD_TAB, CMD_CLOSE_OTHER_TABS,
-       CMD_POPUP_OPEN, CMD_POPUP_DISMISS };
+       CMD_POPUP_OPEN, CMD_POPUP_DISMISS, CMD_AUTOMATION };
 #define EV_COMMAND 0x100u /* key = CMD_*; CMD_FOCUS: x = F_*, y = got (1) or lost (0);
+                             CMD_AUTOMATION: x = a batch's marker, or y = 1: the page takes the keys;
                              CMD_SETTINGS_DO: x, y = the settings action, pressed = a toggle's state;
                              CMD_CLOSE_TAB, CMD_SELECT_TAB, CMD_RELOAD_TAB, CMD_CLOSE_OTHER_TABS: x = the
                              tab's id; CMD_MOVE_TAB: x = its id, y = the place it goes to in the strip */
@@ -928,7 +930,8 @@ static const char *guess_type(const char *path) {
     const char *dot = strrchr(path, '.');
     if (!dot || strpbrk(dot, "\\/")) return "";
     static const char *map[][2] = {
-        {".html", "text/html"}, {".htm", "text/html"}, {".css", "text/css"}, {".png", "image/png"},
+        {".html", "text/html"}, {".htm", "text/html"}, {".xhtml", "application/xhtml+xml"},
+        {".xht", "application/xhtml+xml"}, {".xml", "text/xml"}, {".css", "text/css"}, {".png", "image/png"},
         {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"}, {".gif", "image/gif"}, {".webp", "image/webp"},
         {".svg", "image/svg+xml"}, {".bmp", "image/bmp"}, {".txt", "text/plain"}, {".c", "text/plain"},
         {".h", "text/plain"}, {".sh", "text/plain"}, {".md", "text/plain"}, {".json", "text/plain"},
@@ -1302,6 +1305,10 @@ static enum webnet_kind network_kind(int kind) {
 
 static void response_copy(struct web_response *out, const struct webnet_response *in, enum webnet_kind kind) {
     memset(out, 0, sizeof *out);
+    /* A network error has its timing record too (an entry with its start and end). */
+    if (in->timing && !http_fetch_timing_copy(&out->timing, in->timing)) {
+        strlcpy(out->error, "out of memory copying response timing", sizeof out->error); return;
+    }
     out->status = in->status;
     const char *url = in->final_url ? in->final_url : "";
     if (!web_response_set_url(out, url)) {
@@ -1388,11 +1395,14 @@ static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
     else if (t->detached) webnet_resume(net, id);
 }
 
+static const char *request_refusal;
+static const char *host_request_refusal(void *opaque) { (void)opaque; return request_refusal; }
+static size_t host_keepalive_inflight(void *opaque, uint64_t group) { (void)opaque; return webnet_keepalive_inflight(network, group); }
 static bool host_request(void *opaque, const struct web_request *request) {
     SERVE(opaque);
-    if (!tab->doc || quit) return false;
+    if (!tab->doc || quit) { request_refusal = "the tab is closing"; return false; }
     struct transfer *t = calloc(1, sizeof *t);
-    if (!t) return false;
+    if (!t) { request_refusal = "out of memory"; return false; }
     t->owner = tab;
     t->resource_id = request->id;
     t->generation = tab->generation;
@@ -1415,7 +1425,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         , .report_sent = tab->console_open /* DevTools records it: show the fields it sent */
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
-    if (!t->network_id) { free(t); return false; }
+    if (!t->network_id) { request_refusal = webnet_refusal(network); free(t); return false; }
     t->devtools = dt_net_begin(false, tab->generation, request->id, request->kind, request->method, request->url, request->headers);
     t->next = transfers;
     transfers = t;
@@ -1903,6 +1913,117 @@ static int browser_event(struct gui_event *event, int timeout) {
     }
     return 1;
 }
+/* ---------------------------------------------------------------- automation */
+/* A test tool, not a product feature: WPT's testdriver (tests/wpt/testdriver-vendor.js) drives
+   the browser's own input through web_host.automation, which documents get only when the
+   browser was started with --wpt-automation. Only tests/wptrunner.c gives it; a page can give
+   neither the flag nor a new window with it (new_window passes an absolute URL or nothing).
+   A run's steps go into the inbox at their times as the window's input does, so they meet
+   everything that input meets: deferral while a page task runs, hit testing, focus, default
+   actions. Runs go one after another, each while its tab is the front one and its document
+   the one that asked. A marker command after each batch says when the browser has handled
+   it; a run ends once the last batch is handled and its duration has passed. A run whose
+   document was replaced or closed ends there, and nothing more of it is put. */
+static bool automation_enabled;
+struct automation_run {
+    struct automation_run *next;
+    uint32_t tab;      /* its tab's id: a closed tab is no longer found */
+    web_doc *document; /* compared, never followed: its tab frees it when it replaces it */
+    uint64_t generation, id;
+    struct web_automation_step *steps;
+    size_t count, fed;
+    uint32_t duration;
+    uint64_t started;  /* 0 until its tab was in front */
+    unsigned marker;   /* the batch in the inbox, 0 for none */
+};
+static struct automation_run *automation_runs;
+/* The automation's pointer and keyboard. A new document gets them with nothing held, where
+   the pointer was (WebDriver's input state is the top-level traversable's). */
+static struct automation_device automation_device;
+static uint64_t automation_generation;
+static unsigned automation_serial, automation_handled;
+static const char *host_automation(void *opaque, web_doc *document, uint64_t id,
+                                   const struct web_automation_step *steps, size_t count, uint32_t duration) {
+    SERVE(opaque);
+    if (!automation_enabled) return "Automation is not enabled";
+    if (!document || document != tab->doc) return "Automation is only for the tab's own document";
+    /* A run that cannot be done whole is refused before any of it reaches the page. */
+    for (size_t i = 0; i < count; i++) {
+        const char *why = automation_step_error(&steps[i]);
+        if (why) return why;
+    }
+    struct automation_run *run = calloc(1, sizeof *run);
+    struct web_automation_step *copy = count && count <= SIZE_MAX / sizeof *copy ? malloc(count * sizeof *copy) : NULL;
+    if (!run || (count && !copy)) { free(run); free(copy); return "Out of memory for the automation steps"; }
+    if (count) memcpy(copy, steps, count * sizeof *copy);
+    *run = (struct automation_run){.tab = tab->id, .document = document, .generation = tab->generation, .id = id,
+                                   .steps = copy, .count = count, .duration = duration};
+    struct automation_run **link = &automation_runs;
+    while (*link) link = &(*link)->next;
+    *link = run;
+    return NULL;
+}
+static void automation_end(const char *error) {
+    struct automation_run *run = automation_runs;
+    automation_runs = run->next;
+    struct tab *t = tab_by_id(run->tab);
+    /* Only the document that asked, while it is still its tab's, hears how the run ended. */
+    if (t && t->doc == run->document && t->generation == run->generation) web_automation_done(run->document, run->id, error);
+    free(run->steps); free(run);
+}
+static bool automation_put(struct gui_event e) {
+    size_t before = inbox_n;
+    inbox_put(e);
+    return inbox_n != before;
+}
+/* Called by the main loop between tasks: puts what is due and says in how many ms the next
+   step is (-1: nothing to wait for; 0: the main loop brings the run's tab to the front). */
+static int automation_service(uint64_t now) {
+    while (automation_runs) {
+        struct automation_run *run = automation_runs;
+        struct tab *t = tab_by_id(run->tab);
+        if (!t || t->doc != run->document || t->generation != run->generation) { automation_end(NULL); continue; }
+        if (t != front) { front_wanted = t; return 0; }
+        if (run->marker && automation_handled != run->marker) return -1; /* its batch waits its turn */
+        run->marker = 0;
+        if (!run->started) {
+            run->started = now;
+            if (automation_generation != run->generation) {
+                automation_device.buttons = automation_device.modifiers = 0;
+                automation_generation = run->generation;
+            }
+        }
+        if (run->fed < run->count) {
+            uint64_t due = run->started + run->steps[run->fed].at;
+            if (due > now) return (int)MIN(due - now, 0x7fffffff);
+            const char *error = NULL;
+            for (size_t i = run->fed; i < run->count && run->started + run->steps[i].at <= now; i++)
+                if (run->steps[i].kind == WEB_AUTOMATION_KEY_DOWN || run->steps[i].kind == WEB_AUTOMATION_KEY_UP) {
+                    /* WebDriver's keys go to the page, not to a field around it. */
+                    if (!automation_put((struct gui_event){.type = EV_COMMAND, .key = CMD_AUTOMATION, .y = 1})) error = "Out of memory for input";
+                    break;
+                }
+            for (; !error && run->fed < run->count && run->started + run->steps[run->fed].at <= now; run->fed++) {
+                struct gui_event events[3];
+                int n = automation_events(&automation_device, &run->steps[run->fed], LINE, events, &error);
+                for (int i = 0; i < n && !error; i++) if (!automation_put(events[i])) error = "Out of memory for input";
+                if (n > 0 && events[n - 1].type != EV_KEY && events[n - 1].type != EV_WHEEL) {
+                    pointer_x = automation_device.x; pointer_y = automation_device.y;
+                }
+            }
+            automation_serial = automation_serial % 0x7fffffffu + 1;
+            if (!error && !automation_put((struct gui_event){.type = EV_COMMAND, .key = CMD_AUTOMATION, .x = (int)automation_serial}))
+                error = "Out of memory for input";
+            if (error) { automation_end(error); continue; }
+            run->marker = automation_serial;
+            return -1; /* the inbox has the batch: the main loop takes it at once */
+        }
+        uint64_t end = run->started + run->duration;
+        if (end > now) return (int)MIN(end - now, 0x7fffffff);
+        automation_end(NULL);
+    }
+    return -1;
+}
 /* Only browser-owned navigation commands cancel a running page task. Keep
    the event in FIFO so the ordinary handler acts after QuickJS unwinds. */
 static bool native_navigation_command(const struct gui_event *event) {
@@ -2166,7 +2287,7 @@ static bool host_sync_load(void *opaque, const char *url, int kind, struct web_r
 }
 
 static const struct web_host browser_host = {
-    .request = host_request, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
+    .request = host_request, .request_refusal = host_request_refusal, .keepalive_inflight = host_keepalive_inflight, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
     .socket_open = host_socket_open, .socket_send = host_socket_send, .socket_close = host_socket_close,
     .socket_buffered = host_socket_buffered, .socket_release = host_socket_release,
     .sync_request = host_sync_request,
@@ -2192,12 +2313,7 @@ static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
     if (id != tab->navigation_id || gen != tab->navigation_generation) return;
     tab->navigation_id = 0;
     dt_net_update(tab->dt->nav_serial, result);
-    /* This callback observes the complete response, never its first byte.
-       Generation/id checks above prevent a canceled request changing timing. */
-    if (!result->error[0] && result->status > 0) {
-        tab->navigation_timing.response_end_ms = n_clock_uptime_ms();
-        tab->navigation_timing.response_end_valid = true;
-    }
+    /* The response carries the request's own timing record (webnet.c). */
     web_response_free(&tab->navigation_response);
     response_copy(&tab->navigation_response, result, WEBNET_NAVIGATION);
     tab->navigation_ready = true;
@@ -2231,6 +2347,9 @@ static void finish_navigation(void) {
     http_header(&headers, "Content-Type", ctype, sizeof ctype);
     char *html = NULL;
     size_t hlen = 0;
+    /* The Content-Type of html when it is the response's own body; NULL for
+       a page the browser writes (text/html). */
+    const char *document_type = NULL;
     /* The settings are a page of the browser's own, with no document. */
     bool native_page = !f->error[0] && settings_url(web_response_url(f));
     struct settings *page = !native_page ? NULL : tab->settings ? tab->settings : settings_new();
@@ -2241,8 +2360,12 @@ static void finish_navigation(void) {
         html = !strcasecmp(web_response_url(f), HOME) ? home_html() : strdup("<!doctype html><title>blank</title>");
     else {
         bool sniff_html = !ctype[0] && f->body_len && memchr(f->body, '<', MIN(f->body_len, 512));
-        if (has_prefix(ctype, "text/html") || has_prefix(ctype, "application/xhtml") || sniff_html) {
+        /* HTML "load a document": HTML and XML types are documents of their
+           own kind (SVG too); the rest the browser displays its own way. */
+        enum web_document_kind kind = web_document_kind(ctype);
+        if (kind != WEB_DOCUMENT_OTHER || sniff_html) {
             html = f->body; hlen = f->body_len; f->body = NULL;
+            if (kind == WEB_DOCUMENT_XML) document_type = ctype;
             const char *cs = strstr(ctype, "charset=");
             if (cs) {
                 cs += 8; if (*cs == '"') cs++;
@@ -2269,8 +2392,13 @@ static void finish_navigation(void) {
     document_host.net_log = net_log;
     document_host.net_body = net_body;
     document_host.navigation_timing = tab->navigation_timing;
+    /* Borrowed until the document is made; it copies what it keeps. */
+    document_host.navigation_timing.fetch = f->timing;
+    document_host.navigation_timing.status = f->status;
+    document_host.navigation_timing.headers = web_response_headers(f);
     document_host.js_task_budget_ms = js_task_budget_ms;
-    nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), &document_host);
+    document_host.automation = automation_enabled ? host_automation : NULL;
+    nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), document_type, &document_host);
     free(html);
     if (!nd) { web_response_free(f); free(f); tab->loading = false; set_status("Out of memory creating document"); return; }
     }
@@ -2381,13 +2509,18 @@ static void navigate_inner(const struct navigation_request *r, const char *heade
     tab->navigation_generation = ++next_generation;
     tab->navigation_timing.valid = true;
     tab->navigation_timing.navigation_start_ms = n_clock_uptime_ms();
+    /* Navigation Timing's type: a reload, a history traversal, otherwise navigate. */
+    tab->navigation_timing.type = mode == NAV_RELOAD ? WEB_NAVIGATION_RELOAD :
+        mode == NAV_HISTORY ? WEB_NAVIGATION_BACK_FORWARD : WEB_NAVIGATION_NAVIGATE;
     tab->navigation_mode = mode;
     tab->loading = true;
     char what[256]; snprintf(what, sizeof what, "Loading %.240s", url); set_status(what);
     show_chrome();
     if (has_prefix(url, "about:") || has_prefix(url, "file://")) {
-        tab->navigation_timing.fetch_start_ms = n_clock_uptime_ms();
-        tab->navigation_timing.fetch_valid = true;
+        /* A local fetch: its record has the start and the end, nothing between. */
+        struct http_fetch_timing *timing = &tab->navigation_response.timing;
+        timing->valid = true; timing->redirect_same_origin = timing->timing_allow_passed = true;
+        timing->start_time = timing->post_redirect_start = n_clock_uptime_ms();
         struct fetched *local = calloc(1, sizeof *local);
         if (!local) { strcpy(tab->navigation_response.error, "navigation allocation failed"); tab->navigation_ready = true; return; }
         local->url = strdup(url);
@@ -2400,10 +2533,7 @@ static void navigate_inner(const struct navigation_request *r, const char *heade
             tab->navigation_response.body_len = local->len;
             snprintf(tab->navigation_response.headers, sizeof tab->navigation_response.headers, "Content-Type: %s\r\n", local->ctype);
         }
-        if (!tab->navigation_response.error[0]) {
-            tab->navigation_timing.response_end_ms = n_clock_uptime_ms();
-            tab->navigation_timing.response_end_valid = true;
-        }
+        timing->end_time = n_clock_uptime_ms();
         if (!web_response_set_url(&tab->navigation_response, local->url))
             strlcpy(tab->navigation_response.error, "navigation URL allocation failed", sizeof tab->navigation_response.error);
         if (local->body != tab->navigation_response.body) free(local->body);
@@ -2424,8 +2554,6 @@ static void navigate_inner(const struct navigation_request *r, const char *heade
         .user_activation = r->user_activation || r->browser_ui, .browser_ui = r->browser_ui,
         .report_sent = tab->console_open
     };
-    tab->navigation_timing.fetch_start_ms = n_clock_uptime_ms();
-    tab->navigation_timing.fetch_valid = true;
     dt_net_clear(); /* the Network panel follows the top-level document */
     tab->navigation_id = webnet_submit(network, &rq, navigation_completed, tab);
     if (tab->navigation_id) tab->dt->nav_serial = dt_net_begin(true, tab->navigation_generation, 0, -1, rq.method, url, rq.headers);
@@ -2770,19 +2898,30 @@ static void console_eval(void) {
 /* These are native user commands. Page scripts receive the ordinary editing
    events, not permission to read the system clipboard outside a user key. */
 static bool page_clipboard_key(web_node *target, const struct gui_event *e) {
-    if (!tab->doc || !target || !(e->mods & NMOD_CTRL) || (e->mods & NMOD_ALT)) return false;
+    if (!tab->doc || !(e->mods & NMOD_CTRL) || (e->mods & NMOD_ALT)) return false;
     uint32_t key = e->key;
     if (key >= 'A' && key <= 'Z') key += 'a' - 'A';
+    /* A text control has its own selection; otherwise the document's selection,
+       and an editing host takes the cut and the paste. */
+    bool editing = web_editing_target(tab->doc);
     if (key == 'c' || key == 'x') {
         size_t length = 0;
-        char *selected = web_control_selected_text(tab->doc,target,&length);
-        if (!selected) return false;
-        if (length && clipboard_set(selected,length) >= 0 && key == 'x')
-            web_control_edit(tab->doc,target,"deleteByCut",NULL,0);
+        char *selected = target ? web_control_selected_text(tab->doc,target,&length) : NULL;
+        if (selected) {
+            if (length && clipboard_set(selected,length) >= 0 && key == 'x')
+                web_control_edit(tab->doc,target,"deleteByCut",NULL,0);
+            free(selected);
+            return true;
+        }
+        selected = web_selection_text(tab->doc,&length);
+        if (!selected) return editing;
+        if (length && clipboard_set(selected,length) >= 0 && key == 'x' && editing)
+            web_editing_edit(tab->doc,"deleteByCut",NULL,0);
         free(selected);
         return true;
     }
     if (key == 'v') {
+        if (!target && !editing) return false;
         char dummy = 0;
         int capacity = clipboard_get(&dummy,0);
         if (capacity <= 0) return true;
@@ -2792,7 +2931,8 @@ static bool page_clipboard_key(web_node *target, const struct gui_event *e) {
         /* A concurrent clipboard replacement must not paste a truncated value. */
         if (length > 0 && length <= capacity && !memchr(text,0,(size_t)length)) {
             text[length] = 0;
-            web_control_edit(tab->doc,target,"insertFromPaste",text,(size_t)length);
+            if (!target || !web_control_edit(tab->doc,target,"insertFromPaste",text,(size_t)length))
+                if (editing) web_editing_edit(tab->doc,"insertFromPaste",text,(size_t)length);
         }
         free(text);
         return true;
@@ -2926,7 +3066,7 @@ static void key(const struct gui_event *e) {
             action.kind==WEB_HIT_CHECKBOX || action.kind==WEB_HIT_RADIO || action.kind==WEB_HIT_FILE ||
             (k==NKEY_ENTER && action.kind==WEB_HIT_LINK))) {page_click(target,0,0,true,e->mods);return;}
     }
-    if (tab->doc && web_focused(tab->doc)) {
+    if (tab->doc && (web_focused(tab->doc) || web_editing_target(tab->doc))) {
         if (k == NKEY_ESC) {
             page_focus(NULL);
             return;
@@ -3113,7 +3253,7 @@ static bool command_waits(uint32_t cmd) {
     switch (cmd) {
     case CMD_FIND: case CMD_FIND_NEXT: case CMD_EVAL: case CMD_FIND_OPEN: case CMD_DEVTOOLS:
     case CMD_NEW_TAB: case CMD_CLOSE_TAB: case CMD_SELECT_TAB: case CMD_MOVE_TAB: case CMD_SETTINGS:
-    case CMD_RELOAD_TAB: case CMD_CLOSE_OTHER_TABS: case CMD_POPUP_OPEN:
+    case CMD_RELOAD_TAB: case CMD_CLOSE_OTHER_TABS: case CMD_POPUP_OPEN: case CMD_AUTOMATION:
         return true;
     }
     return false;
@@ -3151,6 +3291,10 @@ static void command(const struct gui_event *e) {
         break;
     }
     case CMD_POPUP_DISMISS: tab->popups = 0; free(tab->popup_url); tab->popup_url = NULL; show_chrome(); break;
+    case CMD_AUTOMATION:
+        if (e->y) { tab->focus = F_PAGE; show_chrome(); }
+        else automation_handled = (unsigned)e->x;
+        break;
     case CMD_RELOAD_TAB: {
         struct tab *t = tab_by_id((uint32_t)e->x);
         if (!t) break;
@@ -3187,6 +3331,7 @@ static void handle(const struct gui_event *e) {
     case EV_CLOSE: quit = true; return;
     case EV_COMMAND:
         command(e);
+        if (e->key == CMD_AUTOMATION) return; /* only the automation's own state */
         /* the keyboard moving between fields changes only the widgets */
         if (e->key == CMD_FOCUS && !(e->x == F_FIND && e->pressed) && !tab->need_layout && !tab->need_paint) { show_chrome(); return; }
         break;
@@ -3246,9 +3391,10 @@ static void handle(const struct gui_event *e) {
         }
         break;
     case EV_RESIZE:
+        /* The new viewport size reaches the page at its next rendering update, whose resize
+           steps fire resize at the Window and its VisualViewport (js.c run_resize_steps). */
         tab->need_layout = true;
         flush_dom_layout();
-        dispatch_native("resize", NULL, e, false);
         break;
     default: return;
     }
@@ -3582,6 +3728,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[1], "--net-body") && argc > 2) { net_log = true; net_body = argv[2]; argc -= 2; argv += 2; }
         else if (!strcmp(argv[1], "--log-console")) { log_console = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--maximized")) { start_maximized = true; argc--; argv++; }
+        /* A test tool, never a product setting: WPT's runner drives the input (see automation_run). */
+        else if (!strcmp(argv[1], "--wpt-automation")) { automation_enabled = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--console-file-each-document")) { console_each_document = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--js-console")) {
             tab->console_open = true; tab->focus = F_CONSOLE; argc--; argv++;
@@ -3710,6 +3858,10 @@ int main(int argc, char **argv) {
             continue;
         }
         int timeout = webnet_timeout(network, now), source = timeout < 0 ? WAIT_NONE : WAIT_NET;
+        if (automation_runs) {
+            int due = automation_service(now);
+            if (due >= 0 && (timeout < 0 || due < timeout)) { timeout = due; source = WAIT_NOW; }
+        }
         if (webstorage_pending(storage)) {
             struct web_storage_result result;
             if (webstorage_flush(storage, false, &result) != WEB_STORAGE_OK)

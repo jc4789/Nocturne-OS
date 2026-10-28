@@ -18,11 +18,20 @@ static bool document_command_maxlength(node_t *target,uint32_t *limit){
     uint64_t n=0;while(*p>='0'&&*p<='9'){n=n*10+*p++-'0';if(n>UINT32_MAX)n=UINT32_MAX;}
     *limit=(uint32_t)n;return true;
 }
-static JSValue document_command_event(struct web_js_state *owner,node_t *target,const char *type,JSValueConst text){
-    JSContext *ctx=owner->ctx;JSValue args[]={wrap(owner,target),JS_NewString(ctx,type),JS_DupValue(ctx,text)};
+static JSValue document_command_event(struct web_js_state *owner,node_t *target,const char *type,JSValueConst text,JSValueConst input_type){
+    JSContext *ctx=owner->ctx;JSValue args[]={wrap(owner,target),JS_NewString(ctx,type),JS_DupValue(ctx,text),JS_DupValue(ctx,input_type)};
     JSValue result=JS_EXCEPTION;
-    if(!JS_IsException(args[0])&&!JS_IsException(args[1]))result=custom_element_hook(owner,"documentCommandEvent",3,args);
-    for(int i=0;i<3;i++)JS_FreeValue(ctx,args[i]);return result;
+    if(!JS_IsException(args[0])&&!JS_IsException(args[1]))result=custom_element_hook(owner,"documentCommandEvent",4,args);
+    for(int i=0;i<4;i++)JS_FreeValue(ctx,args[i]);return result;
+}
+/* The plain-text commands a focused text control takes (js_document_commands.js
+   computes the value each one makes); all but selectAll edit the value. */
+static bool document_command_text(const char *command,size_t len,bool *edit){
+    static const char *const edits[]={"inserttext","delete","forwarddelete","insertparagraph","insertlinebreak"};
+    *edit=false;
+    if(len==9&&!memcmp(command,"selectall",9))return true;
+    for(size_t i=0;i<sizeof edits/sizeof *edits;i++)if(strlen(edits[i])==len&&!memcmp(command,edits[i],len))return *edit=true;
+    return false;
 }
 static JSValue document_command_dom(struct web_js_state *s,node_t *document,int argc,JSValueConst *argv){
     JSContext *ctx=s->ctx;web_doc *d=document?document->owner:NULL;
@@ -30,10 +39,35 @@ static JSValue document_command_dom(struct web_js_state *s,node_t *document,int 
     if(argc<4)return JS_ThrowTypeError(ctx,"Command operation and id required");
     size_t command_len=0;const char *mode=JS_ToCString(ctx,argv[2]),*command=JS_ToCStringLen(ctx,&command_len,argv[3]);
     if(!mode||!command){JS_FreeCString(ctx,mode);JS_FreeCString(ctx,command);return JS_EXCEPTION;}
-    bool insert=command_len==10&&!memcmp(command,"inserttext",10),select=command_len==9&&!memcmp(command,"selectall",9);
+    /* insert: a command that edits the value, so a readonly control does not take it. */
+    bool insert=false,select=document_command_text(command,command_len,&insert)&&!insert;
     bool live=document_command_live(s,d,document),supported=live&&(insert||select);
     JSValue result=JS_FALSE;
-    if(!strcmp(mode,"supported"))result=JS_NewBool(ctx,supported);
+    /* The editing layer's questions (js_document_commands.js, js_editing.js). */
+    if(!strcmp(mode,"textControl"))result=JS_NewBool(ctx,live&&document_command_target(d,false));
+    else if(!strcmp(mode,"designMode")){
+        /* The bindings own design mode enabled; this copy is for :read-write and the editing keys. */
+        int on=argc>4?JS_ToBool(ctx,argv[4]):0;
+        if(on<0)result=JS_EXCEPTION;
+        else if(d&&d->root==document&&d->design_mode!=(on>0)){d->design_mode=on>0;css_mark_dirty(d,d->root);d->dirty=true;}
+    }else if(!strcmp(mode,"color")){
+        /* The value as getComputedStyle() serializes the color (color.c, the
+           exact used colour, not its 8 bits), or null: not a color, or one
+           that names currentcolor, which has no value of its own. */
+        uint32_t color=0;struct css_color used;
+        if(!css_color(command,command_len,&color)||color==COLOR_CURRENT||
+           !css_color_parse_used(command,command_len,NULL,NULL,&used))result=JS_NULL;
+        else{
+            sbuf text={0};css_color_serialize(&used,false,&text);
+            result=text.p?JS_NewStringLen(ctx,text.p,text.n):JS_ThrowOutOfMemory(ctx);
+            sb_free(&text);
+        }
+    }else if(!strcmp(mode,"fontKeywords")){
+        result=JS_NewArray(ctx);
+        for(unsigned i=0;i<8&&!JS_IsException(result);i++)
+            if(JS_SetPropertyUint32(ctx,result,i,JS_NewFloat64(ctx,css_font_keyword_px(i)))<0){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}
+    }
+    else if(!strcmp(mode,"supported"))result=JS_NewBool(ctx,supported);
     else if(!strcmp(mode,"state")||!strcmp(mode,"indeterm"))result=JS_FALSE;
     else if(!strcmp(mode,"value"))result=JS_NewString(ctx,"");
     else if(!strcmp(mode,"enabled"))result=JS_NewBool(ctx,supported&&document_command_target(d,insert));
@@ -70,21 +104,16 @@ static JSValue document_command_dom(struct web_js_state *s,node_t *document,int 
         if(strlen(next)!=new_len)goto release;
         uint32_t limit=0,new_units=doc_utf16_length(next),old_units=doc_utf16_length(old);
         if(document_command_maxlength(target,&limit)&&new_units>limit&&new_units>old_units)goto release;
+        /* No beforeinput: Input Events fires it only for the user's own input, not
+           for a script's command. The input event carries the command's inputType. */
         struct document_command_guard guard={d,document_commands_running};document_commands_running=&guard;
-        JSValue event=document_command_event(d->js,target,"beforeinput",argv[7]);
-        int allowed=JS_IsException(event)?-1:JS_ToBool(ctx,event);JS_FreeValue(ctx,event);
-        if(allowed<0)result=JS_EXCEPTION;
-        else if(allowed&&document_command_live(s,d,document)&&generation==d->root&&target==document_command_target(d,true)&&
-                kind==(target->tag==T_textarea?-1:(int)web_input_type(target))&&
-                target->selection_start==start&&target->selection_end==end&&
-                old_len==strlen(web_input_edit_text(target))&&!memcmp(old,web_input_edit_text(target),old_len)&&
-                (!document_command_maxlength(target,&limit)||new_units<=limit||new_units<=old_units)){
-            if(!web_input_user_value(d,target,next,new_len))result=oom(ctx);
-            else{
-                doc_control_selection(d,target,caret,caret,0);result=JS_TRUE;
-                event=document_command_event(d->js,target,"input",argv[7]);
-                if(JS_IsException(event))result=JS_EXCEPTION;JS_FreeValue(ctx,event);
-            }
+        if(!web_input_user_value(d,target,next,new_len))result=oom(ctx);
+        else{
+            doc_control_selection(d,target,caret,caret,0);result=JS_TRUE;
+            JSValue input_type=argc>8?JS_DupValue(ctx,argv[8]):JS_NewString(ctx,"insertText");
+            JSValue event=JS_IsException(input_type)?JS_EXCEPTION:document_command_event(d->js,target,"input",argv[7],input_type);
+            if(JS_IsException(event))result=JS_EXCEPTION;
+            JS_FreeValue(ctx,event);JS_FreeValue(ctx,input_type);
         }
         document_commands_running=guard.previous;
 release:

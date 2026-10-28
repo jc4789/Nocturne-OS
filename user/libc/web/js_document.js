@@ -7,6 +7,32 @@
         const StringImpl=String;
         function string(value){if(typeof value==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');return StringImpl(value);}
         function brand(value){if(apply(nodeTypeGetter,value,[])!==9)throw new TypeError('Document receiver required');return value;}
+        const HTML_NS='http://www.w3.org/1999/xhtml',SVG_NS='http://www.w3.org/2000/svg',
+            XML_NS='http://www.w3.org/XML/1998/namespace',XMLNS_NS='http://www.w3.org/2000/xmlns/';
+        // DOM "valid element local name" and "validate and extract" given "element".
+        const elementLocalName=/^(?:[A-Za-z][^\0\t\n\f\r\x20/>]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9\-.:_\u0080-\u{10FFFF}]*)$/u;
+        function validLocalName(name){if(!elementLocalName.test(name))throw new DOMException('Invalid element name','InvalidCharacterError');}
+        function extract(namespace,qualifiedName){
+            if(namespace==='')namespace=null;
+            let prefix=null,localName=qualifiedName;const colon=qualifiedName.indexOf(':');
+            if(colon>=0){
+                prefix=qualifiedName.slice(0,colon);localName=qualifiedName.slice(colon+1);
+                if(!prefix || /[\0\t\n\f\r />]/.test(prefix))throw new DOMException('Invalid namespace prefix','InvalidCharacterError');
+            }
+            validLocalName(localName);
+            if(prefix!==null && namespace===null || prefix==='xml' && namespace!==XML_NS ||
+               (qualifiedName==='xmlns' || prefix==='xmlns') && namespace!==XMLNS_NS ||
+               namespace===XMLNS_NS && qualifiedName!=='xmlns' && prefix!=='xmlns')
+                throw new DOMException('Namespace and prefix disagree','NamespaceError');
+            return {namespace,prefix,localName};
+        }
+        // DOM "internal createElementNS steps": an HTML-namespace element may be custom.
+        function createNS(receiver,namespace,qualifiedName,options){
+            const x=extract(namespace,qualifiedName);
+            if(x.namespace===HTML_NS)return customElementsBridge.create(x.localName,options,true,receiver,x.prefix);
+            return dom('create',receiver,1,x.localName,'',x.namespace,x.prefix);
+        }
+        const xmlTypes=['text/xml','application/xml','application/xhtml+xml','image/svg+xml'];
         function transfer(receiver,node,deep,adopt){
             brand(receiver);
             const kind=apply(nodeTypeGetter,node,[]);
@@ -20,9 +46,11 @@
                 if(!parserBrands.has(this))throw new TypeError('Illegal DOMParser receiver');
                 if(arguments.length<2)throw new TypeError('parseFromString requires two arguments');
                 input=string(input);type=string(type);
-                if(!['text/html','text/xml','application/xml','application/xhtml+xml','image/svg+xml'].includes(type))throw new TypeError('Invalid parser MIME type');
-                if(type!=='text/html')throw new DOMException('XML parsing is not implemented','NotSupportedError');
-                return rawDom.parseDocument(null,input,false);
+                if(type!=='text/html' && !xmlTypes.includes(type))throw new TypeError('Invalid parser MIME type');
+                if(type==='text/html')return rawDom.parseDocument(null,input,false);
+                // HTML: an XML parser with XML scripting support disabled; a
+                // well-formedness error gives the parsererror document.
+                return rawDom.parseXML(null,input,type,true);
             }
         }
         const serializerHas=WeakSet.prototype.has,serializerAdd=WeakSet.prototype.add;
@@ -49,7 +77,18 @@
                 if(present){const element=made.createElement('title');element.appendChild(made.createTextNode(title));made.head.appendChild(element);}
                 return made;
             }
-            createDocument(){if(!implementationBrands.has(this))throw new TypeError('Illegal DOMImplementation receiver');throw new DOMException('XML documents are not implemented','NotSupportedError');}
+            createDocument(namespace,qualifiedName,doctype=null){
+                if(!implementationBrands.has(this))throw new TypeError('Illegal DOMImplementation receiver');
+                if(arguments.length<2)throw new TypeError('Namespace and qualified name are required');
+                namespace=namespace==null?null:string(namespace);
+                qualifiedName=qualifiedName===null?'':string(qualifiedName); // [LegacyNullToEmptyString]
+                if(doctype!==null && doctype!==undefined && apply(nodeTypeGetter,doctype,[])!==10)throw new TypeError('DocumentType required');
+                const x=qualifiedName===''?null:extract(namespace,qualifiedName);
+                const made=rawDom.documentCreate(null,namespace===HTML_NS?'application/xhtml+xml':namespace===SVG_NS?'image/svg+xml':'application/xml',true);
+                if(doctype!==null && doctype!==undefined)made.appendChild(doctype);
+                if(x)made.appendChild(dom('create',made,1,x.localName,'',x.namespace,x.prefix));
+                return made;
+            }
             createDocumentType(name,publicId,systemId){
                 const owner=implementationBrands.get(this);
                 if(!owner)throw new TypeError('Illegal DOMImplementation receiver');
@@ -60,6 +99,9 @@
             }
             hasFeature(){if(!implementationBrands.has(this))throw new TypeError('Illegal DOMImplementation receiver');return true;}
         }
+        // DOMImplementation.createDocument's document; no constructor of its own.
+        class XMLDocument extends Document { constructor(){throw new TypeError('Illegal XMLDocument constructor');} }
+        Object.defineProperty(XMLDocument.prototype,Symbol.toStringTag,{value:'XMLDocument',configurable:true});
         Object.defineProperty(Document.prototype,'implementation',{configurable:true,get(){
             brand(this);let implementation=implementations.get(this);
             if(!implementation){implementation=Object.create(DOMImplementation.prototype);implementationBrands.set(implementation,this);implementations.set(this,implementation);}
@@ -70,6 +112,20 @@
             if(key==='title')descriptor.set=function(value){brand(this);dom('set',this,key,string(value));};
             Object.defineProperty(Document.prototype,key,descriptor);
         }
+        /* CSSOM View "scrollingElement": in quirks mode the body element unless it is potentially
+           scrollable (then null), otherwise the root element. The body is potentially scrollable
+           when it has a box and both it and its parent have an overflow-x or overflow-y other than
+           visible or clip (clip on the parent counts as hidden here). */
+        const scrolls=(node,clip)=>{const x=dom('computed',node,'overflow-x',null),y=dom('computed',node,'overflow-y',null);
+            const open=v=>v==='visible'||(!clip&&v==='clip');return !open(x)||!open(y);};
+        Object.defineProperty(Document.prototype,'scrollingElement',{configurable:true,enumerable:true,get(){brand(this);
+            const root=domGet(this,'documentElement');
+            if(domGet(this,'compatMode')!=='BackCompat')return root;
+            const body=domGet(this,'body'),parent=body&&rawDom.get(body,'parentNode');
+            if(!body)return null;
+            const boxed=dom('computed',body,'display',null)!=='none'&&(!parent||rawDom.get(parent,'nodeType')!==1||dom('computed',parent,'display',null)!=='none');
+            return boxed&&parent&&rawDom.get(parent,'nodeType')===1&&scrolls(parent,true)&&scrolls(body,false)?null:body;
+        }});
         for(const key of ['charset','inputEncoding'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return domGet(this,'characterSet');}});
         for(const key of ['defaultView','location','currentScript'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return this!==document?null:key==='defaultView'?globalThis:key==='location'?location:host.current();}});
         Object.defineProperty(Document.prototype,'readyState',{configurable:true,get(){brand(this);return this===document?host.ready():'complete';}});
@@ -113,25 +169,45 @@
             return rawDom.elementsFromPoint(this,x,y);
         };
         Document.prototype.getElementsByName=function(name){brand(this);if(!arguments.length)throw new TypeError('Missing name');const query='[name="'+CSS.escape(string(name))+'"]';return collectionBridge.domLive(this,()=>dom('query',this,query,false));};
-        function create(receiver,name,options,foreign){
-            brand(receiver);name=string(name);
-            if(!foreign)return customElementsBridge.create(name,options,false,receiver);
-            if(!/^[A-Za-z_\u0080-\uFFFF][A-Za-z0-9_.:\-\u0080-\uFFFF]*$/.test(name))throw new DOMException('Invalid element name','InvalidCharacterError');
-            return dom('create',receiver,1,name,'',!!foreign);
-        }
-        Document.prototype.createElement=function(name,options){if(!arguments.length)throw new TypeError('Missing name');return create(this,name,options,false);};
-        Document.prototype.createElementNS=function(namespace,name,options){
+        // DOM createElement: an HTML document lowercases; its namespace is HTML
+        // for an HTML document or an application/xhtml+xml one, else null.
+        Document.prototype.createElement=function(name){
+            brand(this);if(!arguments.length)throw new TypeError('Missing name');
+            const options=arguments[1];
+            name=string(name);validLocalName(name);
+            const html=rawDom.get(this,'htmlDocument');
+            if(html || rawDom.get(this,'contentType')==='application/xhtml+xml')return customElementsBridge.create(name,options,!html,this);
+            return dom('create',this,1,name,'',null,null);
+        };
+        Document.prototype.createElementNS=function(namespace,name){
             brand(this);
             if(arguments.length<2)throw new TypeError('Missing namespace or name');
-            namespace=namespace==null?null:string(namespace);
-            if(namespace!=='http://www.w3.org/1999/xhtml' && namespace!=='http://www.w3.org/2000/svg')throw new DOMException('Unsupported namespace','NotSupportedError');
-            return create(this,name,options,namespace==='http://www.w3.org/2000/svg');
+            return createNS(this,namespace==null?null:string(namespace),string(name),arguments[2]);
         };
         for(const [method,kind,label] of [['createTextNode',3,'#text'],['createComment',8,'#comment']])Document.prototype[method]=function(value){brand(this);if(!arguments.length)throw new TypeError('Missing data');return dom('create',this,kind,label,string(value));};
         Document.prototype.createDocumentFragment=function(){brand(this);return dom('create',this,11,'#document-fragment','');};
         Document.prototype.createCDATASection=function(data){
-            brand(this);if(!arguments.length)throw new TypeError('Missing data');string(data);
-            throw new DOMException('CDATA sections cannot be created in an HTML document','NotSupportedError');
+            brand(this);if(!arguments.length)throw new TypeError('Missing data');data=string(data);
+            if(rawDom.get(this,'htmlDocument'))throw new DOMException('CDATA sections cannot be created in an HTML document','NotSupportedError');
+            if(data.includes(']]>'))throw new DOMException('CDATA section data cannot contain "]]>"','InvalidCharacterError');
+            return dom('create',this,4,'#cdata-section',data);
+        };
+        // DOM "locate a namespace" and "locate a namespace prefix" on the native tree.
+        Node.prototype.lookupPrefix=function(namespace){
+            apply(nodeTypeGetter,this,[]);if(!arguments.length)throw new TypeError('Missing namespace');
+            namespace=namespace==null?null:string(namespace);
+            if(namespace===null || namespace==='')return null;
+            return rawDom.namespaceLookup(this,namespace,true);
+        };
+        Node.prototype.lookupNamespaceURI=function(prefix){
+            apply(nodeTypeGetter,this,[]);if(!arguments.length)throw new TypeError('Missing prefix');
+            prefix=prefix==null?null:string(prefix);
+            return rawDom.namespaceLookup(this,prefix===''?null:prefix,false);
+        };
+        Node.prototype.isDefaultNamespace=function(namespace){
+            apply(nodeTypeGetter,this,[]);if(!arguments.length)throw new TypeError('Missing namespace');
+            namespace=namespace==null?null:string(namespace);
+            return rawDom.namespaceLookup(this,null,false)===(namespace===''?null:namespace);
         };
         Document.prototype.importNode=function(node,deep=false){if(!arguments.length)throw new TypeError('Missing node');return transfer(this,node,deep,false);};
         Document.prototype.adoptNode=function(node){if(!arguments.length)throw new TypeError('Missing node');return transfer(this,node,false,true);};
@@ -144,7 +220,12 @@
             visibilityState:{configurable:true,enumerable:true,get(){brand(this);return this===document && host.visible()?'visible':'hidden';}}
         });
         Document.prototype.createEvent=function(...args){brand(this);return apply(createEvent,this,args);};
-        for(const method of ['write','writeln'])Document.prototype[method]=function(){brand(this);throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');};
-        Object.assign(globalThis,{DOMParser,XMLSerializer,DOMImplementation});
-        return {brand};
+        // HTML "document write steps": an XML document has no input stream.
+        for(const method of ['write','writeln'])Document.prototype[method]=function(){
+            brand(this);
+            if(!rawDom.get(this,'htmlDocument'))throw new DOMException('An XML document cannot be written to','InvalidStateError');
+            throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');
+        };
+        Object.assign(globalThis,{DOMParser,XMLSerializer,DOMImplementation,XMLDocument});
+        return {brand,xmlDocumentPrototype:XMLDocument.prototype};
     })();

@@ -225,7 +225,7 @@ static bool parser_restart_encoding(struct html_parser *p){
     html_policy_rewind(d,p->initial_policy_tail);
     while(p->native_root->first)doc_node_remove(d,p->native_root->first);
     d->html=d->head=d->body=NULL;d->title=NULL;d->base_seen=d->scan_title_seen=false;
-    snprintf(d->base,sizeof d->base,"%s",p->initial_base?p->initial_base:"");
+    if(!doc_set_base(d,p->initial_base?p->initial_base:""))web_js_console(d,2,"Document base URL allocation failed");
     fresh->raw_bytes=p->raw_bytes;fresh->raw_length=p->raw_length;fresh->initial_base=p->initial_base;
     fresh->initial_policy_tail=p->initial_policy_tail;
     parser_release_content(p);*p=*fresh;free(fresh);
@@ -482,12 +482,10 @@ node_t *html_fragment_mode(web_doc *d, node_t *target, node_t *context, const ch
     if (!p->document) { html_finish(p); return NULL; }
     p->document->dom_document.compat_mode=context_document->document_mode;
     p->document->dom_document.scripting=p->scripting;
-    const char *name = element_context && element_context->raw_name ? element_context->raw_name :
+    const char *name = element_context && element_context->local_name ? element_context->local_name :
+                       element_context && element_context->raw_name ? element_context->raw_name :
                        element_context && element_context->name ? element_context->name : "div";
-    const char *ns_uri=element_context && element_context->namespace_id==NS_NONE?NULL:
-                       element_context && element_context->namespace_id==NS_SVG?"http://www.w3.org/2000/svg":
-                       element_context && element_context->namespace_id==NS_MATHML?"http://www.w3.org/1998/Math/MathML":
-                       "http://www.w3.org/1999/xhtml";
+    const char *ns_uri=element_context && element_context->type==N_ELEM?doc_element_namespace(element_context):WEB_NS_HTML;
     lxb_dom_element_t *context_element=lxb_dom_element_create(&p->document->dom_document,
         (const lxb_char_t *)name,strlen(name),(const lxb_char_t *)ns_uri,ns_uri?strlen(ns_uri):0,NULL,0,NULL,0,false);
     if (!context_element) { html_finish(p); return NULL; }

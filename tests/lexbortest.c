@@ -74,7 +74,7 @@ static web_doc *new_document(void) {
     if (!doc) return NULL;
     doc->url = strdup(BASE);
     if (!doc->url) { check("URL 割り当て", false); web_free(doc); return NULL; }
-    snprintf(doc->base, sizeof doc->base, "%s", BASE);
+    if (!doc_set_base(doc, BASE)) { check("base 割り当て", false); web_free(doc); return NULL; }
     return doc;
 }
 static web_doc *parse_document(const char *html) {
@@ -288,6 +288,17 @@ static void test_fragments(void) {
     fragment = html_fragment(doc, find_id(doc->root, "ta"), source, strlen(source));
     text_is("textarea 文脈は RCDATA", fragment, "\xe2\x89\x82\xcc\xb8<b>literal</b>");
     check("textarea 文脈に b 要素なし", !element_at(fragment, 0));
+    /* WPT domparsing/createContextualFragment.html: a context element in a namespace the
+       parser has no interface for is an ordinary element, as a div */
+    const char *foreign_names[] = {"div", "html"};
+    for (int i = 0; i < 2; i++) {
+        node_t *foreign = doc_element_create(doc, "http://fake-namespace", NULL, foreign_names[i]);
+        source = "<body><p><span>Foo";
+        fragment = foreign ? html_fragment(doc, foreign, source, strlen(source)) : NULL;
+        element_is("別の名前空間の文脈の断片 p", element_at(fragment, 0), T_p);
+        element_is("別の名前空間の文脈の断片 span", element_at(element_at(fragment, 0), 0), T_span);
+        text_is("別の名前空間の文脈の断片の本文", fragment, "Foo");
+    }
     check("断片解析は文書 root/body/doctype モードを維持", doc->root == saved_root && doc->body == saved_body && !doc->quirks);
     links_valid(doc->root, 0);
     web_free(doc);

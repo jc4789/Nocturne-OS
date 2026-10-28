@@ -34,7 +34,7 @@ void html_policy_free(web_doc *d) {
     if(!d || !d->html_policy)return;
     struct web_html_policy_rule *r=d->html_policy->first;
     while(r){struct web_html_policy_rule *next=r->next;rule_free(r);r=next;}
-    web_url_parser_free(d->html_policy->urls);free(d->html_policy->self_url);
+    free(d->html_policy->self_url);
     free(d->html_policy);d->html_policy=NULL;
 }
 void html_policy_rewind(web_doc *d,struct web_html_policy_rule *tail){
@@ -53,25 +53,29 @@ static bool token(const char *begin,const char *end,const char *name) {
 }
 static char *copy_text(const char *begin,const char *end){size_t n=end-begin;char *s=malloc(n+1);if(s){memcpy(s,begin,n);s[n]=0;}return s;}
 /* frame-ancestors matches the serialized ancestor origin, not its document
- * path. The native URL parser supplies canonical hosts and effective ports. */
-static bool ancestor_source(const char *p,const char *end,const struct url_owned *ancestor,const struct url_owned *self) {
-    if(named(p,end,"'self'"))return !strcasecmp(ancestor->host,self->host) &&
-        (ancestor->port==self->port || (ancestor->port==(ancestor->tls?443:80) && self->port==(self->tls?443:80))) &&
-        (ancestor->tls || !self->tls);
+ * path. Both URLs are http(s) URL records: the URL parser supplies canonical
+ * hosts, and a null port is the scheme's default port. */
+static bool ancestor_source(const char *p,const char *end,const struct web_url *ancestor,const struct web_url *self) {
+    bool ancestor_tls=web_url_scheme_is(ancestor,"https"),self_tls=web_url_scheme_is(self,"https");
+    int ancestor_port=web_url_port_or_default(ancestor),self_port=web_url_port_or_default(self);
+    size_t an,sn;const char *ancestor_host=web_url_host_text(ancestor,&an),*self_host=web_url_host_text(self,&sn);
+    if(named(p,end,"'self'"))return an==sn && !memcmp(ancestor_host,self_host,an) &&
+        (ancestor_port==self_port || (ancestor_port==(ancestor_tls?443:80) && self_port==(self_tls?443:80))) &&
+        (ancestor_tls || !self_tls);
     if(token(p,end,"*"))return true; /* Both parsed origins are HTTP(S). */
     if(named(p,end,"http:"))return true;
-    if(named(p,end,"https:"))return ancestor->tls;
+    if(named(p,end,"https:"))return ancestor_tls;
     const char *host=p,*scheme_end=NULL;
     for(const char *q=p;end-q>=3;q++)if(q[0]==':' && q[1]=='/' && q[2]=='/'){scheme_end=q;host=q+3;break;}
-    bool secure=self->tls;
+    bool secure=self_tls;
     if(scheme_end){
         if(named(p,scheme_end,"https"))secure=true;
         else if(named(p,scheme_end,"http"))secure=false;
         else return false;
     }
-    if(secure && !ancestor->tls)return false;
+    if(secure && !ancestor_tls)return false;
     const char *host_end=host;while(host_end<end && *host_end!=':' && *host_end!='/')host_end++;
-    size_t hn=host_end-host,an=strlen(ancestor->host);
+    size_t hn=host_end-host;
     if(!hn)return false;
     bool wildcard=hn>=2 && host[0]=='*' && host[1]=='.';
     const char *domain=host+(wildcard?2:0);bool numeric=true;
@@ -82,12 +86,11 @@ static bool ancestor_source(const char *p,const char *end,const struct url_owned
         }
         if((c<'0'||c>'9') && c!='.')numeric=false;
     }
-    bool ancestor_numeric=true;
-    for(const char *q=ancestor->host;*q;q++)if((*q<'0'||*q>'9') && *q!='.')ancestor_numeric=false;
-    if(numeric || ancestor_numeric)return false; /* CSP host-part requires a domain. */
+    /* CSP's host-part matching: a host that is not a domain never matches. */
+    if(numeric || ancestor->host!=WEB_URL_HOST_DOMAIN)return false;
     if(!(hn==1 && *host=='*')){
-        if(wildcard){if(an<hn || strncasecmp(ancestor->host+an-(hn-1),host+1,hn-1))return false;}
-        else if(an!=hn || strncasecmp(ancestor->host,host,hn))return false;
+        if(wildcard){if(an<hn || strncasecmp(ancestor_host+an-(hn-1),host+1,hn-1))return false;}
+        else if(an!=hn || strncasecmp(ancestor_host,host,hn))return false;
     }
     const char *path=host_end;
     if(path<end && *path==':'){
@@ -98,27 +101,33 @@ static bool ancestor_source(const char *p,const char *end,const struct url_owned
                 if(*q<'0'||*q>'9'||value>(65535u-(unsigned)(*q-'0'))/10)return false;
                 value=value*10+(unsigned)(*q-'0');
             }
-            if(value!=ancestor->port)return false;
+            if((int)value!=ancestor_port)return false;
         }
-    }else if(ancestor->port!=(ancestor->tls?443:80))return false;
+    }else if(ancestor_port!=(ancestor_tls?443:80))return false;
     return path==end || token(path,end,"/");
 }
+/* An http(s) URL's record, or false (not a URL, out of memory, another scheme). */
+static bool http_record(const char *url,struct web_url *record) {
+    if(!url || web_url_read(url,strlen(url),record)!=1)return false;
+    if(web_url_http_scheme(record))return true;
+    web_url_free(record);return false;
+}
 static bool ancestor_list(web_doc *parent,const char *p,const char *end,const char *url) {
-    struct url_owned self;
-    if(url_parse_owned_result_n(url,url?strlen(url):0,&self)!=HTTP_URL_TUPLE)return false;
+    struct web_url self;
+    if(!http_record(url,&self))return false;
     bool allowed=true;
     for(web_doc *d=parent;d;d=d->frame_parent){
-        struct url_owned ancestor;const char *raw=web_effective_url(d);
-        if((d->sandbox_flags&SB_ORIGIN) || url_parse_owned_result_n(raw,strlen(raw),&ancestor)!=HTTP_URL_TUPLE){allowed=false;break;}
+        struct web_url ancestor;
+        if((d->sandbox_flags&SB_ORIGIN) || !http_record(web_effective_url(d),&ancestor)){allowed=false;break;}
         bool matched=false;
         for(const char *q=p;q<end;){
             while(q<end && is_space((unsigned char)*q))q++;
             const char *start=q;while(q<end && !is_space((unsigned char)*q))q++;
             if(ancestor_source(start,q,&ancestor,&self)){matched=true;break;}
         }
-        url_owned_free(&ancestor);if(!matched){allowed=false;break;}
+        web_url_free(&ancestor);if(!matched){allowed=false;break;}
     }
-    url_owned_free(&self);return allowed;
+    web_url_free(&self);return allowed;
 }
 bool html_policy_embedding_allowed(web_doc *parent,const char *headers,const char *url,uint32_t *sandbox) {
     uint32_t restrictions=0;bool has_ancestors=false;
@@ -167,13 +176,8 @@ bool html_policy_embedding_allowed(web_doc *parent,const char *headers,const cha
     if(parent && !has_ancestors){
         if(deny || (same && (allowall||other)) || (allowall&&other))return false;
         if(same){
-            char *origin=NULL;if(http_origin_owned(url,&origin)!=HTTP_URL_TUPLE)return false;
-            for(web_doc *d=parent;d;d=d->frame_parent){
-                char *ancestor=NULL;
-                bool match=!(d->sandbox_flags&SB_ORIGIN) && http_origin_owned(web_effective_url(d),&ancestor)==HTTP_URL_TUPLE && !strcmp(origin,ancestor);
-                free(ancestor);if(!match){free(origin);return false;}
-            }
-            free(origin);
+            for(web_doc *d=parent;d;d=d->frame_parent)
+                if((d->sandbox_flags&SB_ORIGIN) || web_url_same_origin(url,web_effective_url(d))!=1)return false;
         }
     }
     if(sandbox)*sandbox=restrictions;
@@ -184,15 +188,22 @@ static bool policy_name(const char *begin,const char *end){
     for(const char *p=begin;p<end;p++)if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||strchr("-#=_/@.%",*p)))return false;
     return true;
 }
+/* CSP's report-uri: each token through the URL parser (UTF-8) against the
+   policy's URL. */
 static bool report_uri(struct web_html_policy_rule *r,const char *begin,const char *end){
-    char *relative=copy_text(begin,end);if(!relative)return false;char absolute[HTTP_URL_MAX];
-    bool valid=url_resolve(r->base_url,relative,absolute,sizeof absolute);free(relative);
-    if(!valid || (strncasecmp(absolute,"https://",8)&&strncasecmp(absolute,"http://",7)))return true;
-    const char *authority=strstr(absolute,"://")+3,*path=authority+strcspn(authority,"/?#");
-    if(memchr(authority,'@',path-authority))return true;
-    if(r->report_uri_count==SIZE_MAX/sizeof *r->report_uris)return false;
-    char **grown=realloc(r->report_uris,(r->report_uri_count+1)*sizeof *grown);if(!grown)return false;r->report_uris=grown;
-    char *value=copy_text(absolute,absolute+strlen(absolute));if(!value)return false;r->report_uris[r->report_uri_count++]=value;return true;
+    char *relative=copy_text(begin,end);if(!relative)return false;char *absolute=NULL;
+    int resolved=web_resolve_url_owned(r->base_url,relative,&absolute);free(relative);
+    if(resolved<0)return false;
+    /* Reports go to http(s) URLs without credentials (a report request carries none). */
+    struct web_url record;int read=resolved?web_url_read(absolute,strlen(absolute),&record):0;
+    if(read<0){free(absolute);return false;}
+    bool usable=read==1 && web_url_http_scheme(&record) && !web_url_includes_credentials(&record);
+    if(read==1)web_url_free(&record);
+    if(!usable){free(absolute);return true;}
+    char **grown=r->report_uri_count<SIZE_MAX/sizeof *r->report_uris?
+        realloc(r->report_uris,(r->report_uri_count+1)*sizeof *grown):NULL;
+    if(!grown){free(absolute);return false;}
+    r->report_uris=grown;r->report_uris[r->report_uri_count++]=absolute;return true;
 }
 static const struct web_csp_directive *directive_find(const struct web_html_policy_rule *r,const char *name){
     for(size_t i=0;r && i<r->directive_count;i++)if(!strcmp(r->directives[i].name,name))return &r->directives[i];
@@ -345,32 +356,13 @@ bool html_policy_opener_isolated(const char *headers){
     const char *v;size_t n;
     return policy_token(headers,"Cross-Origin-Opener-Policy",&v,&n) && n==11 && !memcmp(v,"same-origin",11);
 }
-bool html_policy_trustworthy(const char *url){
-    if(!url)return false;
-    if(!strncasecmp(url,"https://",8)||!strncasecmp(url,"file://",7))return true;
-    if(strncasecmp(url,"http://",7))return false;
-    const char *host=url+7,*end=host;
-    if(*host=='['){end=strchr(host,']');return end && end-host==4 && !memcmp(host,"[::1",4);}
-    while(*end && *end!=':' && *end!='/' && *end!='?' && *end!='#')end++;
-    size_t n=(size_t)(end-host);
-    if(n==9 && !strncasecmp(host,"localhost",9))return true;
-    /* 127.0.0.0/8 in dotted-decimal; other spellings are not loopback here. */
-    unsigned parts=0,value=0,digits=0;
-    for(const char *c=host;c<=end;c++){
-        if(c<end && isdigit((unsigned char)*c)){if(++digits>3)return false;value=value*10+(unsigned)(*c-'0');continue;}
-        if(!digits||value>255||(c<end && *c!='.'))return false;
-        if(parts==0 && value!=127)return false;
-        parts++;value=digits=0;
-    }
-    return parts==4;
-}
 void html_policy_isolation(web_doc *d,const char *headers,const web_doc *inherit){
     /* Local documents (about:blank, srcdoc, blob:) carry no response: their
        policy container is the creator's. */
     d->embedder_policy=headers?html_policy_embedder(headers):inherit?inherit->embedder_policy:HTML_COEP_UNSAFE_NONE;
     web_doc *parent=d->frame_parent;
     if(!parent)d->cross_origin_isolated=headers && html_policy_opener_isolated(headers) &&
-        d->embedder_policy!=HTML_COEP_UNSAFE_NONE && html_policy_trustworthy(d->url);
+        d->embedder_policy!=HTML_COEP_UNSAFE_NONE && web_url_potentially_trustworthy(d->url);
     else d->cross_origin_isolated=parent->cross_origin_isolated && d->embedder_policy!=HTML_COEP_UNSAFE_NONE &&
         web_frame_same_origin(parent,d);
 }
@@ -421,8 +413,8 @@ bool html_policy_snapshot_init(web_doc *d,const char *text){
 }
 
 /* ---------------------------------------------------------------------------
-   CSP3 §6.7 matching. URLs are read through the WHATWG URL parser (web_url.c)
-   and its component marks; nothing here parses a URL by hand. */
+   CSP3 §6.7 matching. URLs are the URL parser's records (weburl.h): their
+   component marks, host kind and port; nothing here parses a URL by hand. */
 struct csp_url {
     struct web_url parsed;
     const char *scheme; size_t scheme_n;
@@ -430,48 +422,30 @@ struct csp_url {
     long port;            /* -1: null (the scheme's default) */
     const char *path; size_t path_n;
 };
-static bool csp_url(struct web_html_policy *l,const char *text,struct csp_url *u){
+static bool csp_url(const char *text,struct csp_url *u){
     memset(u,0,sizeof *u);u->port=-1;
-    if(!text)return false;
-    if(!l->urls && !(l->urls=web_url_parser_new()))return false;
-    if(web_url_parse(l->urls,text,strlen(text),NULL,0,&u->parsed)!=1){sb_free(&u->parsed.href);return false;}
-    const char *h=u->parsed.href.p?u->parsed.href.p:"";const size_t *m=u->parsed.mark;
+    if(!text || web_url_read(text,strlen(text),&u->parsed)!=1)return false;
+    const char *h=u->parsed.href;const size_t *m=u->parsed.mark;
     u->scheme=h;u->scheme_n=m[WEB_URL_PROTOCOL_END]?m[WEB_URL_PROTOCOL_END]-1:0;
-    u->host=h+m[WEB_URL_HOST_START];u->host_n=m[WEB_URL_HOST_END]-m[WEB_URL_HOST_START];
-    if(m[WEB_URL_PORT_END]>m[WEB_URL_PORT_START]){
-        u->port=0;for(size_t i=m[WEB_URL_PORT_START];i<m[WEB_URL_PORT_END];i++)u->port=u->port*10+(h[i]-'0');
-    }
+    u->host=web_url_host_text(&u->parsed,&u->host_n);
+    u->port=u->parsed.port;
     u->path=h+m[WEB_URL_PATH_START];u->path_n=m[WEB_URL_QUERY_START]-m[WEB_URL_PATH_START];
     return true;
 }
-static void csp_url_free(struct csp_url *u){sb_free(&u->parsed.href);}
+static void csp_url_free(struct csp_url *u){web_url_free(&u->parsed);}
 static bool span_is(const char *p,size_t n,const char *text){return strlen(text)==n && !strncasecmp(p,text,n);}
-static long default_port(const char *scheme,size_t n){
-    if(span_is(scheme,n,"http")||span_is(scheme,n,"ws"))return 80;
-    if(span_is(scheme,n,"https")||span_is(scheme,n,"wss"))return 443;
-    if(span_is(scheme,n,"ftp"))return 21;
-    return -1;
-}
-static bool special(const char *scheme,size_t n){
-    return default_port(scheme,n)>=0 || span_is(scheme,n,"file");
-}
-/* A host that is a domain: neither an IP address nor a non-special URL's
-   opaque host. The URL serializer writes IPv4 dotted-decimal, IPv6 bracketed. */
-static bool is_domain(const struct csp_url *u){
-    if(!u->host_n || !special(u->scheme,u->scheme_n) || u->host[0]=='[')return false;
-    for(size_t i=0;i<u->host_n;i++)if((u->host[i]<'0'||u->host[i]>'9') && u->host[i]!='.')return true;
-    return false;
-}
+/* A host that is a domain: neither an IP address nor an opaque or empty host. */
+static bool is_domain(const struct csp_url *u){return u->parsed.host==WEB_URL_HOST_DOMAIN;}
 /* A URL's origin as (scheme, host, port), for a tuple origin; a blob: URL's
    is its path URL's. Self-origins are kept as URLs. */
-static bool tuple_origin(struct web_html_policy *l,const char *url,struct csp_url *o){
-    if(!csp_url(l,url,o))return false;
+static bool tuple_origin(const char *url,struct csp_url *o){
+    if(!csp_url(url,o))return false;
     if(span_is(o->scheme,o->scheme_n,"blob")){
         char *inner=copy_text(o->path,o->path+o->path_n);csp_url_free(o);
-        bool ok=inner && csp_url(l,inner,o);free(inner);
+        bool ok=inner && csp_url(inner,o);free(inner);
         if(!ok)return false;
     }
-    if(default_port(o->scheme,o->scheme_n)<0){csp_url_free(o);return false;}
+    if(web_url_default_port(&o->parsed)<0){csp_url_free(o);return false;}
     return true;
 }
 static bool same_origin(const struct csp_url *a,const struct csp_url *b){
@@ -608,7 +582,7 @@ static bool port_part_match(const char *port,size_t n,const struct csp_url *u){
     long input=-1;
     if(n){input=0;for(size_t i=0;i<n;i++){input=input*10+(port[i]-'0');if(input>99999)input=99999;}}
     if(input==u->port)return true;
-    if(u->port<0)return input>=0 && input==default_port(u->scheme,u->scheme_n);
+    if(u->port<0)return input>=0 && input==web_url_default_port(&u->parsed);
     return false;
 }
 /* §6.7.2.8 Does url match expression in origin with redirect count?
@@ -753,7 +727,7 @@ static bool is_fetch_directive(const char *name){
 }
 /* The list's self-origin as a URL view; false for an opaque one. */
 static bool self_view(struct web_html_policy *l,struct csp_url *self){
-    return l->self_url && tuple_origin(l,l->self_url,self);
+    return l->self_url && tuple_origin(l->self_url,self);
 }
 static void violation(html_csp_reporter report,void *opaque,struct web_html_policy_rule *policy,const char *directive,
                       const char *resource,const char *sample,size_t sample_length){
@@ -777,7 +751,7 @@ bool html_policy_request_allowed(web_doc *doc,const struct html_csp_request *r,h
     if(!l || !l->first || !r)return true;
     const char *name=request_directive(r);
     if(!name)return true;
-    struct csp_url u,self;bool have_url=csp_url(l,r->url,&u),have_self=self_view(l,&self);
+    struct csp_url u,self;bool have_url=csp_url(r->url,&u),have_self=self_view(l,&self);
     bool allowed=true;
     for(struct web_html_policy_rule *policy=l->first;policy;policy=policy->next){
         const char *violated=NULL;
@@ -949,7 +923,7 @@ bool html_policy_eval_allowed(web_doc *doc,const char *source,size_t length,html
 bool html_policy_base_allowed(web_doc *doc,const char *url,html_csp_reporter report,void *opaque){
     struct web_html_policy *l=doc?doc->html_policy:NULL;
     if(!l || !l->first)return true;
-    struct csp_url u,self;bool have_url=csp_url(l,url,&u),have_self=self_view(l,&self);
+    struct csp_url u,self;bool have_url=csp_url(url,&u),have_self=self_view(l,&self);
     bool allowed=true;
     for(struct web_html_policy_rule *policy=l->first;policy;policy=policy->next){
         const struct web_csp_directive *list=directive_find(policy,"base-uri");
@@ -966,7 +940,7 @@ bool html_policy_navigation_allowed(web_doc *doc,const struct html_csp_request *
     if(!l || !l->first || !r)return true;
     bool allowed=true;
     if(form_submission){
-        struct csp_url u,self;bool have_url=csp_url(l,r->url,&u),have_self=self_view(l,&self);
+        struct csp_url u,self;bool have_url=csp_url(r->url,&u),have_self=self_view(l,&self);
         for(struct web_html_policy_rule *policy=l->first;policy;policy=policy->next){
             const struct web_csp_directive *list=directive_find(policy,"form-action");
             if(!list || (have_url && url_matches_list(&u,list,have_self?&self:NULL,r->redirect_count)))continue;
@@ -997,19 +971,19 @@ bool html_policy_upgrade_insecure(const web_doc *doc){
 }
 char *html_policy_report_url(web_doc *doc,const char *url){
     if(!url)return strdup("");
-    struct web_html_policy probe={0},*l=doc && doc->html_policy?doc->html_policy:&probe;
+    (void)doc;
     struct csp_url u;
-    if(!csp_url(l,url,&u)){web_url_parser_free(probe.urls);return strdup("");}
+    if(!csp_url(url,&u))return strdup("");
     char *out;
     if(!span_is(u.scheme,u.scheme_n,"http") && !span_is(u.scheme,u.scheme_n,"https"))out=copy_text(u.scheme,u.scheme+u.scheme_n);
     else{
         /* The serialization without fragment, username and password. */
-        const char *h=u.parsed.href.p;const size_t *m=u.parsed.mark;
+        const char *h=u.parsed.href;const size_t *m=u.parsed.mark;
         sbuf b={0};sb_put(&b,h,m[WEB_URL_PROTOCOL_END]);sb_puts(&b,"//");
         sb_put(&b,h+m[WEB_URL_HOST_START],m[WEB_URL_FRAGMENT_START]-m[WEB_URL_HOST_START]);
         out=sb_cstr(&b);
         if(!out)sb_free(&b);
     }
-    csp_url_free(&u);web_url_parser_free(probe.urls);
+    csp_url_free(&u);
     return out;
 }

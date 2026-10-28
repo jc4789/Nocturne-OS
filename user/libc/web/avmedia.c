@@ -1680,6 +1680,10 @@ bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h)
     }
     c->cx0=ox0;c->cy0=oy0;c->cx1=ox1;c->cy1=oy1;return true;
 }
+bool web_avmedia_shows_frame(web_doc *d,node_t *n){
+    struct web_avmedia *s=media_node(n)&&n->tag==T_video?find(d,n,false):NULL;
+    return s&&s->pixels;
+}
 node_t *web_avmedia_node_next(web_doc *d,node_t *previous){
     struct web_avmedia *s=streams;
     if(previous){while(s&&s->node!=previous)s=s->next;if(s)s=s->next;}

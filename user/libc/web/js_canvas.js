@@ -157,17 +157,8 @@ const canvasBridge = (() => {
     function append(s,p,move=false){capacity(s,move&&s.path.length?2:1);if(move&&s.path.length)s.path.push(NaN,NaN);s.path.push(p[0],p[1]);s.last=p;if(move||!s.first){s.first=p;s.subpathCount=1;}else s.subpathCount++;}
     function resetPath(s){s.path=[];s.first=null;s.last=null;s.subpathCount=0;}
     function capacity(s,points){if(s.path.length+points*2>ARRAY_LENGTH)throw new RangeError('Canvas path array length representation');}
-    function matrixDictionary(value){
-        if(value==null)return [1,0,0,1,0,0];
-        if(typeof value!=='object'&&typeof value!=='function')throw new TypeError('Expected matrix dictionary');
-        const out=[];
-        for(const [short,long,fallback] of [['a','m11',1],['b','m12',0],['c','m21',0],['d','m22',1],['e','m41',0],['f','m42',0]]){
-            const a=value[short],b=value[long],x=a===undefined?undefined:number(a),y=b===undefined?undefined:number(b);
-            if(x!==undefined&&y!==undefined&&x!==y&&!(Number.isNaN(x)&&Number.isNaN(y)))throw new TypeError('Conflicting matrix aliases');
-            out.push(x===undefined?(y===undefined?fallback:y):x);
-        }
-        return out;
-    }
+    /* Geometry's "create a DOMMatrix from the 2D dictionary": [a, b, c, d, e, f]. */
+    const matrixDictionary=value=>geometryBridge.matrix2DInit(value);
     function transformedPath(s,path){const p=paths.get(path);if(!p)throw new TypeError('Expected Path2D');const out=[];for(let i=0;i<p.path.length;i+=2){if(Number.isNaN(p.path[i]))out.push(NaN,p.path[i+1]);else out.push(...point(s,p.path[i],p.path[i+1]));}return out;}
     function ellipsePath(s,x,y,rx,ry,rotation,start,end,ccw){
         const tau=Math.PI*2;let delta=end-start;
@@ -360,7 +351,7 @@ const canvasBridge = (() => {
     class OffscreenCanvasRenderingContext2D {constructor(){throw new TypeError('Illegal OffscreenCanvasRenderingContext2D constructor');}}
     for(const [property,key,colorkey] of [['fillStyle','fill','fillColor'],['strokeStyle','stroke','strokeColor']])define(CanvasRenderingContext2D.prototype,property,{enumerable:true,configurable:true,
         get(){return state(this)[key];},set(value){state(this);if(gradients.has(value)){state(this)[key]=value;return;}
-            const text=string(value),s=state(this),c=native(s.canvas,'color',text);if(c!==null){s[key]=text;s[colorkey]=c>>>0;}}});
+            const text=string(value),s=state(this),c=native(s.canvas,'color',text);if(c!==null){s[key]=c[1];s[colorkey]=c[0]>>>0;}}});
     define(CanvasRenderingContext2D.prototype,'globalAlpha',{enumerable:true,configurable:true,get(){return state(this).alpha;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>=0&&v<=1)s.alpha=v;}});
     define(CanvasRenderingContext2D.prototype,'lineWidth',{enumerable:true,configurable:true,get(){return state(this).lineWidth;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>0)s.lineWidth=v;}});
     define(CanvasRenderingContext2D.prototype,'lineDashOffset',{enumerable:true,configurable:true,get(){return state(this).dashOffset;},set(value){state(this);const v=+value,s=state(this);if(finite(v))s.dashOffset=v;}});
@@ -390,7 +381,9 @@ const canvasBridge = (() => {
         measureText(value){state(this);if(!arguments.length)throw new TypeError('measureText requires text');const text=textValue(value),s=state(this),result=native(s.canvas,'measureText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),s.fontFamily);const out=create(TextMetrics.prototype);metrics.set(out,result);return out;},
         fillText(value,x,y,maxWidth){state(this);if(arguments.length<3)throw new TypeError('fillText requires text and coordinates');const text=textValue(value),v=[number(x),number(y)],width=arguments.length>3?number(maxWidth):Infinity;if(!valid(v)||!(width>0))return;const s=state(this);native(s.canvas,'fillText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),s.fontFamily,new Float64([...v,width,...s.matrix]).buffer,color(s),paint(s));},
         transform(...v){const s=state(this);v=args(v,6);if(valid(v))multiply(s,v);},
-        setTransform(...v){const s=state(this);if(v.length===0){s.matrix=[1,0,0,1,0,0];return;}if(v.length===1&&typeof v[0]==='object'){const m=v[0];v=[m.a??1,m.b??0,m.c??0,m.d??1,m.e??0,m.f??0];}v=args(v,6);if(valid(v))s.matrix=v;},
+        /* setTransform(a, b, c, d, e, f) or setTransform(optional DOMMatrix2DInit transform = {}). */
+        setTransform(...v){const s=state(this);v=v.length<2?matrixDictionary(v[0]):args(v,6);if(valid(v))s.matrix=v;},
+        getTransform(){const m=state(this).matrix;return geometryBridge.matrix2D(geometryBridge.affine(...m));},
         resetTransform(){state(this).matrix=[1,0,0,1,0,0];},
         translate(...v){const s=state(this);v=args(v,2);if(valid(v))multiply(s,[1,0,0,1,v[0],v[1]]);},
         scale(...v){const s=state(this);v=args(v,2);if(valid(v))multiply(s,[v[0],0,0,v[1],0,0]);},

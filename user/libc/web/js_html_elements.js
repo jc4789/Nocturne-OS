@@ -217,6 +217,18 @@ const htmlElementsBridge = (() => {
     define(HTMLElement.prototype,'inert',{configurable:true,enumerable:true,
         get(){htmlBrand(this);return reflectedAttr(this,'inert')!==null;},
         set(value){htmlBrand(this);reflectedAttr(this,'inert',value?'':null);}});
+    // [Reflect, ReflectRange=(0, 8)] unsigned long: a non-negative integer clamped to the
+    // range; the setter stores any value up to 2147483647 as it is (else 0).
+    define(HTMLElement.prototype,'headingOffset',{configurable:true,enumerable:true,get(){
+        htmlBrand(this);
+        const value=reflectedAttr(this,'headingoffset'),match=value===null?null:/^[\t\n\f\r ]*([+-]?)(\d+)/.exec(value);
+        if(!match || (match[1]==='-' && /[1-9]/.test(match[2])))return 0;
+        const parsed=Number(match[2]);
+        return parsed>8?8:parsed;
+    },set(value){htmlBrand(this);value=value>>>0;reflectedAttr(this,'headingoffset',string(value<=2147483647?value:0));}});
+    define(HTMLElement.prototype,'headingReset',{configurable:true,enumerable:true,
+        get(){htmlBrand(this);return reflectedAttr(this,'headingreset')!==null;},
+        set(value){htmlBrand(this);reflectedAttr(this,'headingreset',value?'':null);}});
     function htmlNamed(node,name){
         return !!node && rawDom.get(node,'nodeType')===1 && rawDom.get(node,'namespaceURI')==='http://www.w3.org/1999/xhtml' &&
             rawDom.get(node,'localName')===name;
@@ -479,9 +491,11 @@ const htmlElementsBridge = (() => {
     reflect(HTMLBaseElement,'base','target');
     define(HTMLBaseElement.prototype,'href',{configurable:true,enumerable:true,get(){
         htmlElementBrand(this,'base');const value=reflectedAttr(this,'href')||'';
+        // The URL parser with the document's character encoding, against its
+        // fallback base URL.
         const fallback=rawDom.get(rawDom.get(this,'ownerDocument'),'URL');
-        try{return call(hrefGet,new URLImpl(value,fallback),[]);}
-        catch(error){if(error instanceof TypeErrorImpl)return scalar(value);throw error;}
+        const url=urlBridge.encodingParse(value,fallback,rawDom.get(this,'characterSet'));
+        return url?call(hrefGet,url,[]):scalar(value);
     },set(value){htmlElementBrand(this,'base');reflectedAttr(this,'href',scalar(value));}});
     define(HTMLTitleElement.prototype,'text',{configurable:true,enumerable:true,get(){
         htmlElementBrand(this,'title');let text='';

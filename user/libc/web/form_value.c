@@ -894,7 +894,41 @@ const char *web_control_direction(node_t *control) {
 
 /* This request owns every exported byte until free. Native transport receives
    body_len and content_type, not a guessed strlen or a form-data placeholder. */
-struct form_encoding { sbuf body; const char *kind; char boundary[96]; bool collision, failed; web_form_entry_sink entries;void *entry_opaque; };
+/* charset is the form's encoding (pick an encoding for the form), an output
+   encoding; an entry list's is UTF-8. */
+struct form_encoding { sbuf body; const char *kind; char boundary[96]; bool collision, failed; web_form_entry_sink entries;void *entry_opaque; web_encoding charset; };
+/* HTML's pick an encoding for a form: the first label in accept-charset that
+   is an encoding (UTF-8 when it has none), otherwise the document's; then its
+   output encoding. */
+static web_encoding submission_charset(web_doc *d, node_t *form) {
+    web_encoding encoding = web_encoding_get(d->encoding, strlen(d->encoding));
+    const char *labels = node_attr(form, "accept-charset");
+    if (labels) {
+        encoding = WEB_ENCODING_UTF8;
+        for (const char *p = labels; *p;) {
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\f' || *p == '\r') p++;
+            const char *label = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\f' && *p != '\r') p++;
+            web_encoding found = p > label ? web_encoding_get(label, (size_t)(p - label)) : WEB_ENCODING_FAILURE;
+            if (found) { encoding = found; break; }
+        }
+    }
+    return web_encoding_output(encoding ? encoding : WEB_ENCODING_UTF8);
+}
+/* A newline-normalized name or value as the form's encoding encodes it (html
+   mode, &#N; for a scalar value it cannot), in place. false when out of memory. */
+static bool submission_encode(const struct form_encoding *encoding, sbuf *text) {
+    if (!text->n) return true;
+    if (encoding->charset == WEB_ENCODING_UTF8) {
+        web_utf8_replace_lone_surrogates((uint8_t *)text->p, text->n);
+        return true;
+    }
+    struct web_bytes bytes = {0};
+    if (!web_encode_html(encoding->charset, text->p, text->n, &bytes)) { free(bytes.data); return false; }
+    sb_free(text);
+    text->p = bytes.data; text->n = bytes.length; text->cap = bytes.capacity;
+    return true;
+}
 static bool submission_contains(const void *bytes, size_t length, const char *needle) {
     size_t count = strlen(needle); const unsigned char *data = bytes;
     if (count > length) return false;
@@ -934,7 +968,8 @@ static void submission_pair(struct form_encoding *encoding, const char *name, co
     if (encoding->failed) return;
     if(encoding->entries){struct web_face_entry entry={.name=(char*)name,.name_length=strlen(name),.bytes=(unsigned char*)(text?text:""),.size=strlen(text?text:"")};if(!encoding->entries(encoding->entry_opaque,&entry,false,NULL,0))encoding->failed=true;return;}
     sbuf normalized_name = {0}, normalized_value = {0};
-    if (!submission_newlines(&normalized_name, name) || !submission_newlines(&normalized_value, text)) {
+    if (!submission_newlines(&normalized_name, name) || !submission_newlines(&normalized_value, text) ||
+        !submission_encode(encoding, &normalized_name) || !submission_encode(encoding, &normalized_value)) {
         encoding->failed = true; sb_free(&normalized_name); sb_free(&normalized_value); return;
     }
     name = normalized_name.p ? sb_cstr(&normalized_name) : "";
@@ -993,7 +1028,8 @@ static void submission_face(struct form_encoding *encoding,const struct web_face
     sbuf normal_name={0},normal_value={0};
     const void *value=entry->file?(const void*)entry->filename:(const void*)entry->bytes;
     size_t value_length=entry->file?entry->filename_length:entry->size;
-    if(!face_newlines(&normal_name,name,name_length)||!face_newlines(&normal_value,value,value_length))encoding->failed=true;
+    if(!face_newlines(&normal_name,name,name_length)||!face_newlines(&normal_value,value,value_length)||
+       !submission_encode(encoding,&normal_name)||!submission_encode(encoding,&normal_value))encoding->failed=true;
     sbuf *body=&encoding->body;
     const char *mime=entry->mime&&*entry->mime?entry->mime:"application/octet-stream";
     size_t extra=0;
@@ -1071,7 +1107,8 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                                 sbuf *body = &encoding->body;
                                 if (encoding->failed) break;
                                 sbuf part_name = {0}, part_filename = {0};
-                                if (!submission_newlines(&part_name, name) || !submission_newlines(&part_filename, filename)) {
+                                if (!submission_newlines(&part_name, name) || !submission_newlines(&part_filename, filename) ||
+                                    !submission_encode(encoding, &part_name) || !submission_encode(encoding, &part_filename)) {
                                     encoding->failed = true; sb_free(&part_name); sb_free(&part_filename); break;
                                 }
                                 const char *field_name = sb_cstr(&part_name), *field_filename = sb_cstr(&part_filename), *mime = file && *file->type ? file->type : "application/octet-stream";
@@ -1079,7 +1116,7 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                                 if (!SUBMISSION_SUM(extra,2,strlen(encoding->boundary),strlen("\r\nContent-Disposition: form-data; name=\""),multipart_name_length(field_name),
                                     strlen("\"; filename=\""),multipart_name_length(field_filename),strlen("\"\r\nContent-Type: "),strlen(mime),4,file ? file->size : 0,2) ||
                                     !submission_append_capacity(body,extra)) { encoding->failed = true; sb_free(&part_name); sb_free(&part_filename); break; }
-                                if ((file && file->size && submission_contains(file->bytes, file->size, encoding->boundary)) || strstr(filename, encoding->boundary) || strstr(name, encoding->boundary)) encoding->collision = true;
+                                if ((file && file->size && submission_contains(file->bytes, file->size, encoding->boundary)) || strstr(field_filename, encoding->boundary) || strstr(field_name, encoding->boundary)) encoding->collision = true;
                                 sb_puts(body, "--"); sb_puts(body, encoding->boundary);
                                 sb_puts(body, "\r\nContent-Disposition: form-data; name=\""); multipart_name(body, field_name);
                                 sb_puts(body, "\"; filename=\""); multipart_name(body, field_filename);
@@ -1088,7 +1125,7 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                                 sb_free(&part_name); sb_free(&part_filename);
                             }
                         }
-                    } else if (kind < WEB_INPUT_SUBMIT) submission_pair(encoding, name, kind==WEB_INPUT_HIDDEN&&str_ieq(name,"_charset_")?"UTF-8":n->value?n->value:"");
+                    } else if (kind < WEB_INPUT_SUBMIT) submission_pair(encoding, name, kind==WEB_INPUT_HIDDEN&&str_ieq(name,"_charset_")?web_encoding_name(encoding->charset):n->value?n->value:"");
                 } else if (n->tag == T_textarea) {
                     if(encoding->entries){submission_pair(encoding,name,n->value?n->value:"");}
                     else {
@@ -1125,7 +1162,7 @@ bool web_form_collect_entries(web_doc *d,node_t *form,node_t *submitter,web_form
     if(!d||!html_tag(form,T_form)||form->owner!=d||!sink)return false;
     if(submitter&&(!web_control_submit_button(submitter)||web_form_owner(d,submitter)!=form))return false;
     node_t *scope=doc_node_root(form,false);if(!scope)return false;
-    struct form_encoding encoding={.kind="entry-list",.entries=sink,.entry_opaque=opaque};
+    struct form_encoding encoding={.kind="entry-list",.entries=sink,.entry_opaque=opaque,.charset=WEB_ENCODING_UTF8};
     if(!(scope->type==N_ELEM&&!scope->foreign&&scope->tag==T_datalist))submission_collect(d,form,scope,submitter,&encoding);
     return !encoding.failed;
 }
@@ -1160,9 +1197,10 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
     }
     if (!target || !*target) target = "_self";
     if (strchr(target, '\t') || strchr(target, '\n') || strchr(target, '<')) target = "_blank";
-    char absolute[2048];
-    if (!url_resolve(d->base, action && *action ? action : d->url, absolute, sizeof absolute) || !strncasecmp(absolute, "javascript:", 11)) return false;
-    struct form_encoding encoding = {.kind = kind};
+    /* HTML's encoding-parse a URL given action, relative to the submitter's node document. */
+    char *absolute = NULL;
+    if (doc_encoding_parse_url(d, action && *action ? action : d->url, &absolute) != 1 || !strncasecmp(absolute, "javascript:", 11)) { free(absolute); return false; }
+    struct form_encoding encoding = {.kind = kind, .charset = submission_charset(d, form)};
     uint64_t stamp = uptime_ms();
     for (unsigned retry = 0; retry < 64; retry++) {
         encoding.body.n = 0; encoding.collision = false;
@@ -1170,15 +1208,15 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
         submission_collect(d, form, doc_node_root(form, false), submitter, &encoding);
         if (encoding.failed || !encoding.collision) break;
     }
-    if (encoding.failed || encoding.collision) { sb_free(&encoding.body); return false; }
+    if (encoding.failed || encoding.collision) { sb_free(&encoding.body); free(absolute); return false; }
     if (!strcmp(kind, "multipart/form-data")) {
         size_t suffix;
-        if (!SUBMISSION_SUM(suffix,strlen(encoding.boundary),6) || !submission_append_capacity(&encoding.body,suffix)) { sb_free(&encoding.body); return false; }
+        if (!SUBMISSION_SUM(suffix,strlen(encoding.boundary),6) || !submission_append_capacity(&encoding.body,suffix)) { sb_free(&encoding.body); free(absolute); return false; }
         sb_puts(&encoding.body, "--"); sb_puts(&encoding.body, encoding.boundary); sb_puts(&encoding.body, "--\r\n");
     }
     request->target = strdup(target);
     if (post) {
-        request->url = strdup(absolute); request->body_len = encoding.body.n;
+        request->url = absolute; absolute = NULL; request->body_len = encoding.body.n;
         request->body = malloc(request->body_len + 1);
         if (request->body) { if (request->body_len) memcpy(request->body, encoding.body.p, request->body_len); request->body[request->body_len] = 0; }
         sbuf content = {0};
@@ -1187,14 +1225,20 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
         if (!strcmp(kind, "multipart/form-data")) { sb_puts(&content, "; boundary="); sb_puts(&content, encoding.boundary); }
         request->content_type = strdup(sb_cstr(&content)); sb_free(&content);
     } else {
-        char fragment_text[2048] = {0};
-        char *fragment = strchr(absolute, '#'); if (fragment) { strcpy(fragment_text, fragment); *fragment = 0; }
-        char *query = strchr(absolute, '?'); if (query) *query = 0;
-        size_t length;
-        if (!SUBMISSION_SUM(length,strlen(absolute),encoding.body.n,strlen(fragment_text),2)) { sb_free(&encoding.body); web_submit_request_free(request); return false; }
-        request->url = malloc(length);
-        if (request->url) snprintf(request->url, length, "%s?%s%s", absolute, encoding.body.p ? sb_cstr(&encoding.body) : "", fragment_text);
+        /* The action URL's query becomes the entry list's; its fragment stays. */
+        char *fragment = strchr(absolute, '#'), *query = strchr(absolute, '?');
+        size_t head = (size_t)((query && (!fragment || query < fragment) ? query : fragment ? fragment : absolute + strlen(absolute)) - absolute);
+        const char *fragment_text = fragment ? fragment : "";
+        size_t length, fragment_length = strlen(fragment_text);
+        if (!SUBMISSION_SUM(length,head,encoding.body.n,fragment_length,2)) { sb_free(&encoding.body); free(absolute); web_submit_request_free(request); return false; }
+        char *url = request->url = malloc(length);
+        if (url) {
+            memcpy(url, absolute, head); url += head; *url++ = '?';
+            if (encoding.body.n) { memcpy(url, encoding.body.p, encoding.body.n); url += encoding.body.n; }
+            memcpy(url, fragment_text, fragment_length + 1);
+        }
     }
+    free(absolute);
     sb_free(&encoding.body);
     if (!request->url || !request->target || (post && (!request->body || !request->content_type))) { web_submit_request_free(request); return false; }
     return true;

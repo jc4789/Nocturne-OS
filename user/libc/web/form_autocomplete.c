@@ -8,6 +8,7 @@
 #include <bearssl_hash.h>
 #include <webprefs.h>
 #include <webstorage.h>
+#include <weburl.h>
 #include "form_autocomplete.h"
 #include "form_value.h"
 
@@ -45,36 +46,15 @@ static bool history_reserve(struct search_history *history, int count) {
     history->entries = grown; history->capacity = capacity; return true;
 }
 
+/* The serialization of url's origin when it is the tuple origin of an http(s) URL (the URL
+   record's owner gives it). Opaque origins, other schemes, out of memory and an origin longer
+   than an entry holds have none: no entry is kept for them. */
 static bool history_origin(const char *url, char out[HISTORY_ORIGIN]) {
-    /* Native url_parse currently lacks IPv6. Fail closed instead of treating
-       unparsed authorities, userinfo or opaque URLs as another site's origin. */
-    bool tls = url && !strncasecmp(url, "https://", 8);
-    const char *host = tls ? url + 8 : url && !strncasecmp(url, "http://", 7) ? url + 7 : NULL;
-    if (!host) return false;
-    size_t length = strcspn(host, "/?#:");
-    if (!length || length >= 128 || host[0] == '.' || host[length - 1] == '.') return false;
-    char normalized[128];
-    for (size_t i = 0; i < length; i++) {
-        unsigned char c = (unsigned char)host[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '.' || c == '-')) return false;
-        if (c == '.' && i && host[i - 1] == '.') return false;
-        normalized[i] = (char)lower(c);
-    }
-    normalized[length] = 0;
-    const char *tail = host + length; unsigned port = tls ? 443 : 80;
-    if (*tail == ':') {
-        tail++; port = 0; int digits = 0;
-        while (*tail >= '0' && *tail <= '9') {
-            if (++digits > 5) return false;
-            port = port * 10 + (unsigned)(*tail++ - '0');
-        }
-        if (!digits || !port || port > 65535) return false;
-    }
-    if (*tail && *tail != '/' && *tail != '?' && *tail != '#') return false;
-    int n = (port == (tls ? 443u : 80u)) ? snprintf(out, HISTORY_ORIGIN, "%s://%s", tls ? "https" : "http", normalized) :
-        snprintf(out, HISTORY_ORIGIN, "%s://%s:%u", tls ? "https" : "http", normalized, port);
-    return n > 0 && n < HISTORY_ORIGIN;
+    char *origin = NULL;
+    bool ok = url && web_url_origin(url, &origin) == WEB_URL_TUPLE && web_origin_http(origin) &&
+              strlen(origin) < HISTORY_ORIGIN;
+    if (ok) memcpy(out, origin, strlen(origin) + 1);
+    free(origin); return ok;
 }
 static bool contains_ascii(const char *value, const char *needle) {
     size_t n = strlen(needle);

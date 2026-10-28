@@ -9,6 +9,7 @@
 #include "cssom.h"
 #include "form_validation.h"
 #include "form_value.h"
+#include "script_animation_native.h"
 
 static int checks, failed;
 static void check(bool ok,const char *name) {
@@ -192,11 +193,13 @@ static void declaration_generation_paths(void) {
         !strcmp(owner->style->before->content,"second")&&!strcmp(owner->style->after->content,"second")&&
         child->style&&child->style->color==0xff0000ffu,
         "cache replacement recomputes child and both pseudo variable borrows");
-    check(css_animation_set(owner,PE_BEFORE,11,"color:lime")==1,"pseudo animation sample");
+    struct web_animation *lime=script_animation_hold(d,owner,PE_BEFORE,"color","lime");
+    check(lime!=NULL,"pseudo animation sample");
     css_mark_dirty(d,owner);web_layout(d,800,600);
+    /* the effect is on ::before alone: neither the element nor what its children inherit takes
+       the pseudo's animated body (its underlying body is checked when the effect goes, below) */
     check(owner->style->before&&owner->style->before->color==0xff00ff00u&&
-        owner->animation_base_style&&owner->animation_base_style->before&&
-        owner->animation_base_style->before->color==0xff0000ffu&&child->style->color==0xff0000ffu,
+        owner->style->color==0xff0000ffu&&child->style->color==0xff0000ffu,
         "pseudo animated and underlying bodies have separate current ownership");
     struct css_declarations *current=owner->style_declarations;
     doc_node_remove(d,owner);web_layout(d,800,600);
@@ -205,6 +208,12 @@ static void declaration_generation_paths(void) {
     check(owner->style_declarations==current&&owner->style&&owner->style->before&&child->style&&
         !strcmp(owner->style->before->content,"second")&&child->style->color==0xff0000ffu,
         "reinsert retains immutable declarations and refreshes inherited variable tails");
+    /* a script effect keeps its target across removal (only style cancels CSS animations) */
+    check(owner->style&&owner->style->before&&owner->style->before->color==0xff00ff00u,"reinserted pseudo keeps its script effect");
+    if(lime)web_animation_cancel(lime);
+    css_mark_dirty(d,owner);web_layout(d,800,600);
+    check(owner->style&&owner->style->before&&owner->style->before->color==0xff0000ffu&&!strcmp(owner->style->before->content,"second"),
+        "removed pseudo effect leaves the underlying body");
     web_free(d);
 }
 static void percentage_padding_cache(void) {
@@ -318,15 +327,15 @@ static void cssom_container_roundtrip(void) {
     struct cssom_sheet *s=sheet(d,"@import url('discard.css');"
         "@container(width>1px){.kept{height:23px}}@layer{.kept{color:blue}}"
         "@unrecognized{.kept{height:999px}}");
-    uint32_t count=0;struct css_rule_info *r=s?css_sheet_rules(s->ast,&count):NULL;
-    check(r && count==2 && r->type==0 && r->next && r->next->type==0 &&
-        rule_starts(r,"@container") && rule_starts(r->next,"@layer") && !strstr(s->source,"@import"),
+    uint32_t count=0;struct css_rule_info *r=s?css_sheet_rules(s->p.ast,&count):NULL;
+    check(r && count==2 && r->type==CSS_RULE_CONTAINER && r->next && r->next->type==CSS_RULE_LAYER_BLOCK &&
+        rule_starts(r,"@container") && rule_starts(r->next,"@layer") && !strstr(s->p.source,"@import"),
         "constructed import removal preserves recognized type-zero grouping rules");
     if(!s){web_free(d);return;}
     const char *temporary=".temporary{height:1px}";
-    check(cssom_insert(s,temporary,strlen(temporary),0)==CSSOM_OK,
+    check(cssom_insert(s,0,temporary,strlen(temporary),0)==CSSOM_OK,
         "CSSOM insertion preserves container group source");
-    int deleted=cssom_delete(s,0);r=css_sheet_rules(s->ast,&count);
+    int deleted=cssom_delete(s,0,0);r=css_sheet_rules(s->p.ast,&count);
     check(deleted==CSSOM_OK && count==2 && rule_starts(r,"@container"),
         "CSSOM deletion preserves container group source");
     check(cssom_adopt(d->root,&s,1)==CSSOM_OK,"adopt edited container group sheet");
@@ -361,8 +370,8 @@ static void container_queries(void) {
     check(s && cssom_adopt(d->root,&s,1)==CSSOM_OK,"container sheet");
     if(!s){web_free(d);return;}
     unsigned groups=0;
-    for(struct css_rule_info *r=css_sheet_rules(s->ast,NULL);r;r=r->next)
-        if(r->type==0 && rule_starts(r,"@container"))groups++;
+    for(struct css_rule_info *r=css_sheet_rules(s->p.ast,NULL);r;r=r->next)
+        if(r->type==CSS_RULE_CONTAINER && rule_starts(r,"@container"))groups++;
     check(groups==13,"replaceSync retains all standalone container groups in CSSOM");
     node_t *size=element(d,"div",d->body,NULL);
     doc_node_attr(d,size,"style","container-type:size;width:1500px;height:200px");

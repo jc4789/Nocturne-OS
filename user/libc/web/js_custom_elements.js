@@ -203,7 +203,8 @@ const customElementsBridge = (() => {
         if(d.formAssociated && d.localName===d.name)faceElements.add(element);
         return element;
     }
-    function create(name, options, preserveCase=false,owner=document) {
+    // DOM "create an element" for the HTML namespace; prefix null is none.
+    function create(name, options, preserveCase=false,owner=document,prefix=null) {
         name = string(name); if (!preserveCase) name = lower(name);
         if(get(owner,'nodeType')!==9)throw new TypeError('Document receiver required');
         let value=registryFor(owner),is=null;
@@ -211,7 +212,7 @@ const customElementsBridge = (() => {
             value=registryOption(options.customElementRegistry,value);
             const optionIs=options.is;if(optionIs!==undefined)is=string(optionIs);
         }
-        const make=()=>{const element=rawDom.create(owner,1,name,'');setRegistry(element,value);
+        const make=()=>{const element=prefix===null?rawDom.create(owner,1,name,''):rawDom.create(owner,1,name,'',HTML,prefix);setRegistry(element,value);
             if(is!==null)rawDom.customData(element,'is',is);return element;};
         const table=value===null?null:registryState(value).definitions;
         const candidate=table && (table.get(name)||is!==null && table.get(is));
@@ -230,6 +231,7 @@ const customElementsBridge = (() => {
                 if (get(element,'ownerDocument')!==document) throw fail('The custom element constructor\'s result belongs to another document');
                 if (get(element,'localName') !== name) throw fail('The custom element constructor\'s result has another local name');
                 if(get(element,'ownerDocument')!==owner)rawDom.adopt(owner,element);
+                if(prefix!==null)rawDom.set(element,'elementPrefix',prefix);
                 return element;
             } catch (e) {
                 report(e);
@@ -254,6 +256,19 @@ const customElementsBridge = (() => {
             if (s && s.state === 'custom') callback(element, 'disconnectedCallback');
         }
     }
+    /* HTML "enqueue a custom element callback reaction" for connectedMoveCallback: without one,
+       disconnectedCallback then connectedCallback, as one callback */
+    function movedCallback(element) {
+        const s = states.get(element), d = s && s.state === 'custom' && s.definition;
+        if (!d) return;
+        if (d.callbacks.connectedMoveCallback) { enqueue(element, {callback:d.callbacks.connectedMoveCallback, args:[]}); return; }
+        const disconnectedCallback = d.callbacks.disconnectedCallback, connectedCallback = d.callbacks.connectedCallback;
+        if (!disconnectedCallback && !connectedCallback) return;
+        enqueue(element, {callback() {
+            if (disconnectedCallback) apply(disconnectedCallback, this, []);
+            if (connectedCallback) apply(connectedCallback, this, []);
+        }, args:[]});
+    }
     function attributeChanged(element, name, oldValue, newValue, namespace=null) {
         const s = states.get(element);
         if (s && s.state === 'custom')
@@ -277,6 +292,7 @@ const customElementsBridge = (() => {
             return {op,nodes,was:nodes.map(connected),old:value,oldWas:connected(value),same:key===value,
                 adopted:nodes.map(node=>({elements:elements(node),oldDocument:get(node,'ownerDocument')}))};
         }
+        if (op === 'move') return key ? {op,node:key} : null;
         if (op === 'remove') return {op,node,was:connected(node),parent:get(node,'parentNode')};
         if(op==='replaceAll')return {op:'children',node,nodes:children(node),was:connected(node)};
         if (op === 'clone' || op === 'import') return {op};
@@ -305,6 +321,8 @@ const customElementsBridge = (() => {
             for(const node of token.nodes)inserted(node);
         } else if(token.op==='adopt'){
             removed(token.node,token.was);adopted(token);
+        } else if (token.op === 'move') {
+            if (connected(token.node)) for (const element of elements(token.node)) movedCallback(element);
         } else if (token.op === 'remove') {
             if (token.parent && get(token.node,'parentNode') !== token.parent) removed(token.node,token.was);
         } else if (token.op === 'clone' || token.op === 'import') upgradeTree(result);

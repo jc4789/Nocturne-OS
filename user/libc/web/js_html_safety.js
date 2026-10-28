@@ -255,19 +255,47 @@ const htmlSafetyBridge=(()=>{
     function compliantInput(html,input,sink,node,fromAuthor=true){const routed=ownerRoute(node,'input',html,input,sink,fromAuthor);if(routed)return routed.value;const o=options(input,sink,node,fromAuthor);return {html:trustedKind(o)===4?ttString(html):check(html,1,sink,node),options:trustedKind(o)===4?copy(payload(o,4)):o};}
     function parseConfig(o,safe){return sanitizer(o.sanitizer===null?undefined:o.sanitizer,safe);}
     function target(node){const type=get(node,'nodeType');if(type!==1&&!(type===11&&get(node,'shadowHost')))throw new TypeError('Element or ShadowRoot receiver required');return type===1&&get(node,'namespaceURI')===HTML&&get(node,'localName')==='template'?get(node,'templateContent'):node;}
+    const htmlElement=n=>get(n,'nodeType')===1&&get(n,'namespaceURI')===HTML&&get(n,'localName')==='html';
+    /* HTML "parse HTML for insertion" and its fragment parsing algorithm, into an Element or a
+       hosted DocumentFragment (a shadow root, a template's contents): a safe insertion whose
+       context element is an HTML or SVG script parses nothing (null). A declarative shadow root
+       the parse attaches to the context is filtered with the fragment. */
+    function parseForInsertion(into,html,o,c,safe,allowShadow){
+        const context=get(into,'nodeType')===1?into:get(into,'insertionHost');
+        if(safe&&get(context,'localName')==='script'){const ns=get(context,'namespaceURI');if(ns===HTML||ns===SVG)return null;}
+        const prior=get(context,'shadowRoot');
+        const fragment=rawDom.parseFragment(into,html,false,{allowShadow,runScripts:!safe&&!!o.runScripts,sanitizing:!!c});sanitize(fragment,c,safe);
+        const added=get(context,'shadowRoot');if(added&&added!==prior)sanitize(added,c,safe);
+        return fragment;
+    }
     function setHTML(node,html,input,safe,allowShadow=true,legacy=false,originalSetter=null){
         const into=target(node),sink=(get(node,'nodeType')===11?'ShadowRoot':'Element')+(legacy?' innerHTML':safe?' setHTML':' setHTMLUnsafe');
         const values=safe?{html:string(html),options:sanitizerDictionary(input)}:compliantInput(html,input,sink,node,!legacy),o=values.options,c=parseConfig(o,safe);
         // Keep the established atomic native replacement, control-state and
         // mutation-observer path for ordinary legacy insertion.
         if(legacy&&!c&&!o.runScripts&&originalSetter)return apply(originalSetter,node,[values.html]);
-        const priorShadow=get(node,'shadowRoot');
-        const fragment=rawDom.parseFragment(into,values.html,false,{allowShadow,runScripts:!safe&&!!o.runScripts,sanitizing:!!c});sanitize(fragment,c,safe);
-        const addedShadow=get(node,'shadowRoot');
-        if(addedShadow&&addedShadow!==priorShadow)sanitize(addedShadow,c,safe);
+        const fragment=parseForInsertion(into,values.html,o,c,safe,allowShadow);if(!fragment)return;
         customElementsBridge.reactions(()=>{while(get(into,'firstChild'))dom('remove',get(into,'firstChild'));dom('insert',into,fragment,null);});
         if(!safe&&o.runScripts)nativeSafety('scripts',into);
     }
+    /* HTML's "parent for HTML insertion": an Element, or a DocumentFragment with a host; a template
+       element stands for its contents and a Document gives no context element. */
+    function insertionParent(node){
+        const parent=get(node,'parentNode');if(!parent)return null;const type=get(parent,'nodeType');
+        if(type===1&&get(parent,'namespaceURI')===HTML&&get(parent,'localName')==='template')throw new DOMException('A template element is not an HTML insertion parent','HierarchyRequestError');
+        if(type===1||type===11&&get(parent,'insertionHost'))return parent;
+        throw new DOMException('An HTML insertion parent must be an element or a hosted fragment','HierarchyRequestError');
+    }
+    /* "Filter and pre-insert HTML" before child (null: at the end), or with replace "filter and
+       replace with HTML" in place of child. An html element would get a head and a body. */
+    function insertHTML(parent,child,values,safe,replace){
+        if(htmlElement(parent))throw new DOMException('An html element cannot take inserted HTML','HierarchyRequestError');
+        const o=values.options,fragment=parseForInsertion(parent,values.html,o,parseConfig(o,safe),safe,true);if(!fragment)return;
+        const inserted=[];for(let n=get(fragment,'firstChild');n;n=get(n,'nextSibling'))inserted[inserted.length]=n;
+        customElementsBridge.reactions(()=>replace?dom('replace',parent,fragment,child):dom('insert',parent,fragment,child));
+        if(!safe&&o.runScripts)for(let i=0;i<inserted.length;i++)nativeSafety('scripts',inserted[i]);
+    }
+    const insertionValues=(node,html,input,safe,sink)=>safe?{html:string(html),options:sanitizerDictionary(input)}:compliantInput(html,input,sink,node);
     if(windowRealm){
     for(const proto of [Element.prototype,ShadowRoot.prototype]){
         define(proto,'setHTML',{configurable:true,writable:true,enumerable:true,value:function(html,options={}){if(!arguments.length)throw new TypeError('HTML required');setHTML(this,html,options,true);}});
@@ -275,7 +303,29 @@ const htmlSafetyBridge=(()=>{
         const descriptor=Object.getOwnPropertyDescriptor(proto,'innerHTML');
         define(proto,'innerHTML',{...descriptor,set(value){if(fast(value,this))return apply(descriptor.set,this,[value]);setHTML(this,value===null?'':value,{},false,false,true,descriptor.set);}});
         define(proto,'getHTML',{configurable:true,writable:true,enumerable:true,value:function(options={}){target(this);const o=dictionary(options),serializable=!!o.serializableShadowRoots,supplied=o.shadowRoots,roots=supplied===undefined?[]:sequence(supplied);for(let i=0;i<roots.length;i++)if(!get(roots[i],'shadowHost'))throw new TypeError('ShadowRoot list required');return nativeSafety('serialize',this,serializable,roots);}});
+        const kind=proto===Element.prototype?'Element':'ShadowRoot';
+        for(const [position,first] of [['append',false],['prepend',true]])for(const safe of [true,false]){
+            const name=position+'HTML'+(safe?'':'Unsafe'),sink=kind+' '+name;
+            define(proto,name,{configurable:true,writable:true,enumerable:true,value:function(html,options={}){
+                if(kind==='Element')get(this,'elementBrand');else get(this,'shadowMode');
+                if(!arguments.length)throw new TypeError('HTML required');
+                const values=insertionValues(this,html,options,safe,sink),into=target(this);
+                insertHTML(into,first?get(into,'firstChild'):null,values,safe,false);
+            }});
+        }
     }
+    /* NonDocumentTypeChildNode's HTML insertion methods, on Element and CharacterData. */
+    for(const proto of [Element.prototype,CharacterData.prototype])
+        for(const [position,after,replace] of [['before',false,false],['after',true,false],['replaceWith',false,true]])for(const safe of [true,false]){
+            const name=position+'HTML'+(safe?'':'Unsafe'),sink='Node '+name,element=proto===Element.prototype;
+            define(proto,name,{configurable:true,writable:true,enumerable:true,value:function(html,options={}){
+                const type=get(this,'nodeType');
+                if(element?type!==1:type!==3&&type!==4&&type!==7&&type!==8)throw new TypeError('Illegal '+(element?'Element':'CharacterData')+' receiver');
+                if(!arguments.length)throw new TypeError('HTML required');
+                const values=insertionValues(this,html,options,safe,sink),parent=insertionParent(this);if(!parent)return;
+                insertHTML(parent,after?get(this,'nextSibling'):this,values,safe,replace);
+            }});
+        }
     for(const [name,safe] of [['parseHTML',true],['parseHTMLUnsafe',false]])define(Document,name,{configurable:true,writable:true,enumerable:true,value:function(html,input={}){
         if(!arguments.length)throw new TypeError('HTML required');const supplied=trustedKind(input)===4?input:sanitizerDictionary(input),v=safe?{html:string(html),options:supplied}:compliantInput(html,supplied,'Document '+name,null),c=parseConfig(v.options,safe);
         const made=rawDom.parseDocument(null,v.html,false,{allowShadow:true,runScripts:false,sanitizing:!!c});sanitize(made,c,safe);return made;

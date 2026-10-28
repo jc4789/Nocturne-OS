@@ -56,8 +56,11 @@ async function runPerformanceCases() {
     const detail={x:{n:1},map:new Map(),bytes:new Uint8Array([4,5])};detail.self=detail;detail.map.set(detail,detail.x);
     const m=performance.mark('metadata',{startTime:1.5,detail});detail.x.n=9;detail.bytes[0]=88;
     ok('metadata構造複製',m.detail!==detail&&m.detail.self===m.detail&&m.detail.x.n===1&&m.detail.map.get(m.detail)===m.detail.x&&m.detail.bytes[0]===4);
-    eq('metadata SameObject',m.detail,m.detail);eq('toJSON detail identity',m.toJSON().detail,m.detail);
-    eq('mark JSON値',JSON.stringify(new PerformanceMark('json',{startTime:12,detail:'猫'})),JSON.stringify({name:'json',entryType:'mark',startTime:12,duration:0,detail:'猫'}));
+    // Web IDL [Default] toJSON: only PerformanceEntry declares it, so detail is not a member.
+    eq('metadata SameObject',m.detail,m.detail);eq('toJSONはdetailを含まない',Object.prototype.hasOwnProperty.call(m.toJSON(),'detail'),false);
+    eq('記録したmarkのJSONのid',m.toJSON().id,m.id);ok('記録したmarkのid',Number.isInteger(m.id)&&m.id>=100);
+    eq('記録したmarkのnavigationId',m.toJSON().navigationId,m.navigationId);
+    eq('mark JSON値',JSON.stringify(new PerformanceMark('json',{startTime:12,detail:'猫'})),JSON.stringify({id:0,name:'json',entryType:'mark',startTime:12,duration:0,navigationId:0}));
     ok('IDL getter descriptor',Object.getOwnPropertyDescriptor(PerformanceEntry.prototype,'name').enumerable);
     eq('IDL optional length',Performance.prototype.clearMarks.length,0);eq('IDL required length',Performance.prototype.getEntriesByName.length,1);
     throws('mark必須名',TypeError,()=>performance.mark());throws('constructor必須名',TypeError,()=>new PerformanceMark());
@@ -124,7 +127,7 @@ async function runPerformanceCases() {
     eq('clearはvisibility保持',performance.getEntriesByType('visibility-state')[0],initialVisibility);
 
     const types=PerformanceObserver.supportedEntryTypes;
-    eq('実装する型だけ広告',types.join(','),'mark,measure,resource,visibility-state');eq('SameObject型配列',types,PerformanceObserver.supportedEntryTypes);
+    eq('実装する型だけ広告',types.join(','),'mark,measure,navigation,paint,resource,visibility-state');eq('SameObject型配列',types,PerformanceObserver.supportedEntryTypes);
     ok('型配列凍結',Object.isFrozen(types));
     throws('callback必須',TypeError,()=>new PerformanceObserver());
     const invalid=new PerformanceObserver(()=>{});

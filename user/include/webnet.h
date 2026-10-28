@@ -161,6 +161,9 @@ struct webnet_response {
     /* With report_sent: the request fields the final hop sent, as sent
        ("Name: value" CRLF lines, Host first); otherwise empty. */
     const char *sent_headers;
+    /* WEBNET_COMPLETE and WEBNET_END: Fetch's timing record of the request
+       (http.h), network errors included; NULL with every other event. */
+    const struct http_fetch_timing *timing;
 };
 typedef void (*webnet_callback)(webnet *, uint64_t id, uint64_t generation,
                                const struct webnet_response *, void *opaque);
@@ -196,6 +199,11 @@ long webnet_cookie_clear(webnet *, const char *site);
 bool webnet_site(const webnet *, const char *host, char *out, size_t cap);
 /* Copies all request data; 0 means invalid request, queue full, or allocation failure. */
 uint64_t webnet_submit(webnet *, const struct webnet_request *, webnet_callback, void *opaque);
+/* Why the last webnet_submit returned 0: static text for the page's console. */
+const char *webnet_refusal(const webnet *);
+/* Fetch's keepalive bound: a fetch group's inflight keepalive request bodies stay within it. */
+#define WEBNET_KEEPALIVE_BYTES ((size_t)65536)
+size_t webnet_keepalive_inflight(const webnet *, uint64_t fetch_group);
 /* Dispatches completions only here. Response pointers remain valid until callback returns.
    Callbacks may submit/cancel requests, but must not free net or recursively pump it. */
 void webnet_pump(webnet *, uint64_t now_ms);

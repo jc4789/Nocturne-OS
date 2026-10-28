@@ -16,14 +16,12 @@ struct web_html_policy_rule {
     bool from_meta;
     struct web_csp_directive *directives; size_t directive_count;
 };
-struct web_url_parser;
 /* A CSP list (§2.2): its policies and its self-origin, kept as the URL whose
    origin 'self' means (the response URL, or the creator's for a document or
    Worker that inherited its policy container). */
 struct web_html_policy {
     struct web_html_policy_rule *first, *last;
     char *self_url;
-    struct web_url_parser *urls; /* this list's own URL parser, made on first use */
     int status; /* §2.4.1: the status of the response the list came with; 0 for none */
 };
 bool html_policy_requires_script(const web_doc *document);
@@ -38,9 +36,6 @@ int html_policy_embedder(const char *headers);
 /* Cross-Origin-Opener-Policy: same-origin, the opener policy that isolates
  * a top-level browsing context group. */
 bool html_policy_opener_isolated(const char *headers);
-/* Potentially trustworthy URL for secure-context gated policy: https, file,
- * and loopback http. */
-bool html_policy_trustworthy(const char *url);
 /* Document creation: COEP is the response's own, or the creator's for local
  * documents; isolation requires a trustworthy isolated top-level document
  * and, in frames, a same-origin isolated parent with its own COEP. */

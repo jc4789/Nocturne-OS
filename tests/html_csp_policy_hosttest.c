@@ -10,17 +10,7 @@
 #include <webnet.h>
 const char *web_effective_url(web_doc *d) { return d && d->inherited_url ? d->inherited_url : d ? d->url : "about:blank"; }
 bool web_frame_same_origin(web_doc *a,web_doc *b){(void)a;(void)b;return true;}
-/* http.c is linked whole for the frame-ancestors URL tuple; its networking
- * and locking are never entered by these checks. */
-net_stream *ns_open(const char *host,uint16_t port,bool tls,int timeout,char *error,size_t cap){abort();}
-long ns_write(net_stream *s,const void *data,size_t n){abort();}
-net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
-uint64_t uptime_ms(void){return 0;}
-long ns_read(net_stream *s,void *data,size_t n){abort();}
-const char *ns_error(net_stream *s){abort();}
-void ns_close(net_stream *s){abort();}
-#include "http_mock_lifecycle.h"
-void *http_br_create(void){abort();}int http_br_decode(void *s,const unsigned char **in,size_t *n,unsigned char **out,size_t *room){abort();}void http_br_free(void *s){(void)s;}
+/* The URL parser's lending pool locks; one thread runs these checks. */
 int *__errno_location(void){static int e;return &e;}
 int mtx_lock(mtx_t *m){(void)m;return 0;}
 int mtx_unlock(mtx_t *m){(void)m;return 0;}

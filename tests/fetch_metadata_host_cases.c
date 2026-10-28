@@ -23,17 +23,17 @@ static struct job request(unsigned kind,unsigned destination,unsigned fetch_flag
     snprintf(j.accept_language,sizeof j.accept_language,"%s",wire_language);
     j.headers=strdup("");j.document=strdup(document);
     if(*document){
-        enum http_url_result r=http_url(j.document,NULL,&j.origin);
-        checkf(r==HTTP_URL_TUPLE||r==HTTP_URL_OPAQUE,"文書の URL %s を製品の正規化が読む",document);
+        enum web_url_result r=http_url(j.document,NULL,&j.origin);
+        checkf(r==WEB_URL_TUPLE||r==WEB_URL_OPAQUE,"文書の URL %s を製品の正規化が読む",document);
     }
     return j;
 }
 /* 要求の URL の一覧へ一つ加える（最初の URL か、リダイレクトの先）。製品の run_http と
    同じく、正規化した URL とその origin で note_fetch_site を呼ぶ。 */
 static void visit(struct job *j,const char *url){
-    enum http_url_result r=http_url(url,&j->final_url,&j->target_origin);
-    checkf(r==HTTP_URL_TUPLE,"要求の URL %s を製品の正規化が読む",url);
-    if(r==HTTP_URL_TUPLE)note_fetch_site(j,j->final_url,j->target_origin);
+    enum web_url_result r=http_url(url,&j->final_url,&j->target_origin);
+    checkf(r==WEB_URL_TUPLE,"要求の URL %s を製品の正規化が読む",url);
+    if(r==WEB_URL_TUPLE)note_fetch_site(j,j->final_url,j->target_origin);
 }
 /* 空にした緩衝へ append_fetch_metadata を呼び、出た頭の塊を返す。 */
 static const char *metadata(struct job *j,const char *current){
@@ -549,8 +549,18 @@ int main(void){
             wire_language=values[v];
             j=request(WEBNET_WEBSOCKET,WEBNET_DEST_EMPTY,0,0,"https://example.test/");
             free(j.headers);j.headers=strdup("Sec-WebSocket-Protocol: chat\r\n");
-            struct url_owned u={0};
-            check(url_parse_owned("https://www.example.test/socket",&u),"WebSocket の URL を製品の解析が読む");
+            struct http_target u={0};
+            /* 要求の層は URL の記録（weburl.h）から読む。URL Standard は special な URL の query と
+               fragment の '\' を残し、その前の '\' を '/' と読む。どの層も同じ解析器なので読み方は一つ。 */
+            check(http_target_of("https://example.test/log?a\\b|c#d\\e",&u)==WEB_URL_TUPLE&&!strcmp(u.path,"/log?a\\b|c"),"query と fragment の '\\' は要求の対象にそのまま残る");
+            http_target_free(&u);
+            check(http_target_of("https://example.test/p\\q",&u)==WEB_URL_TUPLE&&!strcmp(u.path,"/p/q")&&!strcmp(u.host,"example.test"),"path の '\\' は '/' と読む");
+            http_target_free(&u);
+            check(http_target_of("https://example.test\\@other.test/",&u)==WEB_URL_TUPLE&&!strcmp(u.host,"example.test")&&!strcmp(u.path,"/@other.test/"),
+                  "authority の '\\' はそこで終わり、別の host にならない");
+            http_target_free(&u);
+            check(http_target_of("https://exa mple.test/",&u)==WEB_URL_INVALID&&!u.host,"URL でない文字列は要求にならない");
+            check(http_target_of("https://www.example.test/socket",&u)==WEB_URL_TUPLE,"WebSocket の URL を製品の解析が読む");
             struct websocket ws={0};ws.j=&j;socket_sent[0]=0;
             bool ok=ws_handshake(&ws,"https://www.example.test/socket",&u);
             const char *fields=strstr(socket_sent,"\r\n");fields=fields?fields+2:"";
@@ -559,7 +569,7 @@ int main(void){
             if(*values[v])check(field_count(fields,"Accept-Language")==1&&field_is(fields,"Accept-Language",values[v]),"WebSocket の握手にも要求の欄の Accept-Language が一つ");
             else check(field_count(fields,"Accept-Language")==0,"欄の無い WebSocket の握手には Accept-Language を出さない");
             check(field_is(fields,"Accept","*/*")&&field_is(fields,"Sec-Fetch-Mode","websocket"),"握手の Accept と Sec-Fetch-Mode");
-            free(ws.in);url_owned_free(&u);clear(&j);
+            free(ws.in);http_target_free(&u);clear(&j);
         }
         check(socket_records==0,"応答の無い握手は OPEN を記録しない");
     }

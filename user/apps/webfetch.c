@@ -80,6 +80,18 @@ struct job {
     size_t input_consumed;
     unsigned char *backlog;
     size_t backlog_pos, backlog_len, backlog_cap;
+    /* Fetch's timing record of this fetch (http.h), returned to the browser
+       (WEBNET_WIRE_TIMING), which adds the start time it asked at. Each hop
+       adds what its transport, the cache and the TAO check recorded:
+       timing_allow_failed is the request's timing allow failed flag,
+       redirect_tao a navigation's redirect hops' Timing-Allow-Origin values
+       (its navigation timing allow values list; NULL when a hop had none),
+       hop_decoded the current hop's decoded body bytes. */
+    struct http_fetch_timing timing;
+    bool timing_allow_failed;
+    char **redirect_tao;
+    size_t redirect_tao_count;
+    uint64_t hop_decoded;
 };
 /* Response bytes the browser has not credited yet wait in the job, so the
    socket keeps being read while the browser's main thread is busy (a long
@@ -136,14 +148,14 @@ static void stall_report(struct job *j,uint64_t now) {
     if(h<0)return;
     const struct http_transport_result *t=j->live_transport;
     /* The host names the stalled peer; path, query and userinfo stay private. */
-    const char *host=j->url?strstr(j->url,"://"):NULL;host=host?host+3:"";
-    size_t host_len=strcspn(host,"/?#");
-    for(size_t i=host_len;i-->0;)if(host[i]=='@'){host+=i+1;host_len-=i+1;break;}
+    struct web_url url;size_t host_len=0;const char *host="";
+    if(web_url_read(j->url,j->url?strlen(j->url):0,&url)==1)host=web_url_host_text(&url,&host_len);
     if(host_len>96)host_len=96;
     char line[288];
     int n=snprintf(line,sizeof line,"[webfetch] waiting id=%lu phase=%u for %lu ms host=%.*s connection=%lu h2=%u stream=%lu\n",
         (unsigned long)j->wire.id,phase,(unsigned long)(now-j->stall_since),(int)host_len,host,
         (unsigned long)(t?t->connection_id:0),(unsigned)(t&&t->http2),(unsigned long)(t?t->stream_id:0));
+    web_url_free(&url);
     if(n>0)n_channel_send(h,line,(size_t)MIN(n,(int)sizeof line-1),-1);
 }
 static int request_cancelled(void *opaque) {
@@ -266,69 +278,56 @@ static int remaining(struct job *j) {
 static bool token_char(unsigned char c) {
     return isalnum(c) || strchr("!#$%&'*+-.^_`|~", c) != NULL;
 }
-/* Only publish a replacement after complete allocation and buffer checks.
-   Private slot may already own an origin; OOM never becomes opaque/null. */
-static enum http_url_result http_url(const char *raw, char **canonical, char **origin) {
-    /* Preserve this transport caller's stricter wire URL policy. Origin-only
-       users may have non-ASCII paths or underscores: do not impose it there. */
+/* raw read by the URL parser as an http or https URL: *canonical (unless NULL) its
+   serialization without the fragment, *origin its origin's serialization. Only publishes a
+   replacement after every allocation succeeded; a private slot may already own an origin, and
+   out of memory never becomes opaque. OPAQUE: a URL of another scheme. */
+static enum web_url_result http_url(const char *raw, char **canonical, char **origin) {
+    struct web_url url;
+    int parsed = web_url_read(raw, raw ? strlen(raw) : 0, &url);
+    if (parsed != 1) return parsed < 0 ? WEB_URL_OOM : WEB_URL_INVALID;
+    if (!web_url_http_scheme(&url)) { web_url_free(&url); return WEB_URL_OPAQUE; }
     char *next = NULL, *next_origin = NULL;
-    enum http_url_result result = http_canonical_owned_n(raw, raw ? strlen(raw) : 0, canonical ? &next : NULL, &next_origin);
-    if (result != HTTP_URL_TUPLE) return result;
-    for (const unsigned char *p = (const unsigned char *)raw; *p; p++)
-        if (*p >= 127) { free(next); free(next_origin); return HTTP_URL_INVALID; }
-    if (strchr(next_origin, '_')) { free(next); free(next_origin); return HTTP_URL_INVALID; }
+    enum web_url_result result = web_url_origin_of(&url, &next_origin);
+    size_t length = url.mark[WEB_URL_FRAGMENT_START];
+    if (result == WEB_URL_TUPLE && canonical) {
+        next = malloc(length + 1);
+        if (next) { memcpy(next, url.href, length); next[length] = 0; }
+        else result = WEB_URL_OOM;
+    }
+    web_url_free(&url);
+    if (result != WEB_URL_TUPLE) { free(next_origin); return result; }
     if(canonical){free(*canonical);*canonical=next;}
     free(*origin); *origin = next_origin;
-    return HTTP_URL_TUPLE;
+    return WEB_URL_TUPLE;
 }
-static bool url_failure(struct job *j, enum http_url_result result, const char *invalid) {
-    return fail(j, result == HTTP_URL_OOM ? "Out of memory preparing canonical URL or origin" : invalid);
+static bool url_failure(struct job *j, enum web_url_result result, const char *invalid) {
+    return fail(j, result == WEB_URL_OOM ? "Out of memory preparing canonical URL or origin" : invalid);
 }
-/* Strip credentials/fragment through the existing canonical URL boundary.
-   Non-HTTP sources have no network referrer; malformed metadata fails closed. */
+/* Referrer Policy's "strip url for use as a referrer" from the URL's record: no credentials, no
+   fragment, and the origin-only form for referrer_origin. A source of any scheme but http and
+   https has no network referrer; text that is not a URL fails closed. */
 static bool prepare_referrer(struct job *j) {
     if(!j->referrer||!*j->referrer)return true;
-    const char *raw=j->referrer,*scheme=strstr(raw,"://");
-    if(!scheme){free(j->referrer);j->referrer=NULL;return true;}
-    const char *authority=scheme+3,*end=authority+strcspn(authority,"/?#"),*at=NULL;
-    for(const char *p=authority;p<end;p++)if(*p=='@')at=p;
-    char *clean=NULL;
-    if(at){size_t prefix=(size_t)(authority-raw),tail=strlen(at+1);if(prefix>SIZE_MAX-tail-1)return fail(j,"Referrer allocation overflow");
-        clean=malloc(prefix+tail+1);if(!clean)return fail(j,"Out of memory preparing referrer");memcpy(clean,raw,prefix);memcpy(clean+prefix,at+1,tail+1);raw=clean;}
-    char *next=NULL,*origin=NULL;
-    enum http_url_result result=http_canonical_owned_n(raw,strlen(raw),&next,&origin);free(clean);
-    if(result==HTTP_URL_OPAQUE){free(j->referrer);j->referrer=NULL;return true;}
-    if(result!=HTTP_URL_TUPLE)return url_failure(j,result,"Invalid private referrer URL");
-    size_t length=strlen(origin);char *origin_url=malloc(length+2);
-    if(!origin_url){free(next);free(origin);return fail(j,"Out of memory preparing referrer origin");}
-    memcpy(origin_url,origin,length);origin_url[length]='/';origin_url[length+1]=0;free(origin);
+    struct web_url url;int parsed=web_url_read(j->referrer,strlen(j->referrer),&url);
+    if(parsed<0)return fail(j,"Out of memory preparing referrer");
+    if(!parsed)return fail(j,"Invalid private referrer URL");
+    if(!web_url_http_scheme(&url)){web_url_free(&url);free(j->referrer);j->referrer=NULL;return true;}
+    size_t scheme=url.mark[WEB_URL_PROTOCOL_END],authority,rest=url.mark[WEB_URL_FRAGMENT_START]-url.mark[WEB_URL_HOST_START];
+    const char *host=web_url_authority(&url,&authority);
+    char *next=malloc(scheme+2+rest+1),*origin_url=malloc(scheme+2+authority+2);
+    if(!next||!origin_url){free(next);free(origin_url);web_url_free(&url);return fail(j,"Out of memory preparing referrer origin");}
+    memcpy(next,url.href,scheme);memcpy(next+scheme,"//",2);memcpy(next+scheme+2,host,rest);next[scheme+2+rest]=0;
+    memcpy(origin_url,url.href,scheme);memcpy(origin_url+scheme,"//",2);memcpy(origin_url+scheme+2,host,authority);
+    memcpy(origin_url+scheme+2+authority,"/",2);web_url_free(&url);
     if(strlen(next)>4096){free(next);next=strdup(origin_url);if(!next){free(origin_url);return fail(j,"Out of memory reducing referrer");}}
     free(j->referrer);j->referrer=next;j->referrer_origin=origin_url;return true;
-}
-static bool potentially_trustworthy(const char *url) {
-    if(!strncmp(url,"https://",8))return true;
-    if(strncmp(url,"http://",7))return false;
-    const char *host=url+7;
-    if(*host=='['){const char *end=strchr(host,']');return end&&end-host==4&&!memcmp(host,"[::1]",5);}
-    size_t length=strcspn(host,":/");
-    /* The native resolver guarantees exact localhost, not *.localhost.
-       127/8 means an IPv4 literal, never a DNS name like 127.evil.test. */
-    if(length==9&&!memcmp(host,"localhost",9))return true;
-    size_t at=0;
-    for(unsigned part=0;part<4;part++){
-        unsigned value=0,digits=0;
-        while(at<length&&host[at]>='0'&&host[at]<='9'){if(++digits>3)return false;value=value*10+(unsigned)(host[at++]-'0');}
-        if(!digits||value>255||(part==0&&value!=127))return false;
-        if(part==3)return at==length;
-        if(at==length||host[at++]!='.')return false;
-    }
-    return false;
 }
 static bool append_referrer(struct job *j,const char *current) {
     if(!j->referrer||!*j->referrer)return true;
     bool same=j->referrer_origin&&strlen(j->referrer_origin)==strlen(j->target_origin)+1&&
         !memcmp(j->referrer_origin,j->target_origin,strlen(j->target_origin));
-    bool downgrade=potentially_trustworthy(j->referrer)&&!potentially_trustworthy(current);
+    bool downgrade=web_url_potentially_trustworthy(j->referrer)&&!web_url_potentially_trustworthy(current);
     int policy=j->referrer_policy?j->referrer_policy:WEBNET_REFERRER_STRICT_ORIGIN_CROSS;
     const char *value=j->referrer;
     if(j->wire.user_navigation&WEBNET_WIRE_NO_REFERRER)policy=WEBNET_REFERRER_NONE;
@@ -348,60 +347,38 @@ static bool append_referrer(struct job *j,const char *current) {
     if(value!=j->referrer){char *next=strdup(value);if(!next)return fail(j,"Out of memory updating referrer");free(j->referrer);j->referrer=next;}
     return true;
 }
-/* WHATWG host parsing uses the final nonempty label to detect possible IPv4:
-   decimal, shortened/integer, hexadecimal and octal variants must not be
-   treated as DNS domains just because this native stack lacks that parser.
-   Conservatively leave them to the existing mixed-content rejection. */
-static bool image_host_potential_ip(const char *host, size_t length) {
-    if (length && host[length - 1] == '.') length--;
-    size_t start = length;
-    while (start && host[start - 1] != '.') start--;
-    if (start == length) return true;
-    bool decimal = true;
-    for (size_t i = start; i < length; i++)
-        if (host[i] < '0' || host[i] > '9') { decimal = false; break; }
-    if (decimal) return true;
-    if (length - start >= 2 && host[start] == '0' && (host[start + 1] == 'x' || host[start + 1] == 'X')) {
-        for (size_t i = start + 2; i < length; i++)
-            if (!((host[i] >= '0' && host[i] <= '9') ||
-                  (host[i] >= 'a' && host[i] <= 'f') || (host[i] >= 'A' && host[i] <= 'F'))) return false;
-        return true;
-    }
-    return false;
-}
-/* Prepare before publishing either canonical URL or origin. No retry path
-   ever falls back to HTTP after a TLS error. Each redirect calls this too. */
-static enum http_url_result image_http_url(struct job *j, const char *raw,
+/* Mixed Content's "upgrade a mixed content request to a potentially trustworthy URL, if
+   appropriate", before publishing either canonical URL or origin: an http image of an https
+   document goes as https unless its host is an IP address. The scheme changes as the URL
+   Standard's protocol setter changes it (an explicit port 443 then becomes the default, any
+   other stays). No retry path ever falls back to HTTP after a TLS error. Each redirect calls
+   this too. */
+static enum web_url_result image_http_url(struct job *j, const char *raw,
                                           char **canonical, char **origin) {
     char *next_origin = NULL,*prepared=NULL;
-    enum http_url_result result = http_url(raw, &prepared, &next_origin);
-    if (result != HTTP_URL_TUPLE) return result;
-    char *upgraded = NULL;
+    enum web_url_result result = http_url(raw, &prepared, &next_origin);
+    if (result != WEB_URL_TUPLE) return result;
     bool eligible = j->wire.kind == WEBNET_RESOURCE &&
         (j->wire.user_navigation & WEBNET_WIRE_IMAGE_UPGRADE) &&
-        j->origin && !strncmp(j->origin, "https://", 8) && !strncmp(prepared, "http://", 7);
+        web_url_has_scheme(j->origin, "https") && web_url_has_scheme(prepared, "http");
     if (eligible) {
-        const char *host = prepared + 7;
-        size_t hl = strcspn(host, ":/?#");
-        if (!image_host_potential_ip(host, hl)) {
-            /* http_url already removes default port80. Explicit nondefault
-               ports remain in this spelling and survive the scheme change. */
-            size_t length = strlen(prepared);
-            if (length > SIZE_MAX - 2 || length >= UINT32_MAX) {
-                free(prepared);free(next_origin); return HTTP_URL_INVALID;
-            }
-            upgraded = malloc(length + 2);
-            if (!upgraded) { free(prepared);free(next_origin); return HTTP_URL_OOM; }
-            memcpy(upgraded, "https://", 8); memcpy(upgraded + 8, prepared + 7, length - 7 + 1);
+        struct web_url url;
+        int parsed = web_url_read(prepared, strlen(prepared), &url);
+        bool ip = parsed == 1 && (url.host == WEB_URL_HOST_IPV4 || url.host == WEB_URL_HOST_IPV6);
+        web_url_free(&url);
+        char *upgraded = NULL;
+        int changed = parsed == 1 && !ip ? web_url_change(prepared, WEB_URL_PROTOCOL, "https", &upgraded) : parsed;
+        if (changed != 1 && !ip) { free(prepared);free(next_origin); return changed < 0 ? WEB_URL_OOM : WEB_URL_INVALID; }
+        if (upgraded) {
             result = http_url(upgraded, &prepared, &next_origin);
             free(upgraded);
-            if (result != HTTP_URL_TUPLE) { free(prepared);free(next_origin); return result; }
+            if (result != WEB_URL_TUPLE) { free(prepared);free(next_origin); return result; }
         }
     }
     size_t length = strlen(prepared);
-    if (!canonical || length > webnet_wire_url_limit(j->wire.user_navigation) || length == SIZE_MAX) { free(prepared);free(next_origin); return HTTP_URL_INVALID; }
+    if (!canonical || length > webnet_wire_url_limit(j->wire.user_navigation) || length == SIZE_MAX) { free(prepared);free(next_origin); return WEB_URL_INVALID; }
     free(*canonical);*canonical=prepared;
-    free(*origin); *origin = next_origin; return HTTP_URL_TUPLE;
+    free(*origin); *origin = next_origin; return WEB_URL_TUPLE;
 }
 /* The path a file: URL names (n_path_from_url), in *out: 1; 0 invalid, -1 out of memory. */
 static int file_path(const char *url,char **out) {
@@ -581,6 +558,10 @@ struct cache_entry {
     int status;
     uint64_t stored_ms, age_seconds, lifetime_seconds;
     bool no_cache, must_revalidate;
+    /* Fetch stores a response's body info with it: its encoded size and
+       content encoding as they were transmitted. */
+    uint64_t encoded_size;
+    char content_encoding[HTTP_CONTENT_ENCODING_MAX];
 };
 static struct cache_entry *cache_entries;
 static size_t cache_bytes;
@@ -744,11 +725,11 @@ static bool prepare_top_level(struct job *j) {
     if(j->top_prepared)return true;
     const char *raw=j->top_level_url?j->top_level_url:j->document?j->document:"";
     char *origin=NULL;
-    enum http_url_result result=*raw?http_origin_owned(raw,&origin):HTTP_URL_OPAQUE;
-    if(result!=HTTP_URL_TUPLE&&result!=HTTP_URL_OPAQUE){
+    enum web_url_result result=*raw?web_url_origin(raw,&origin):WEB_URL_OPAQUE;
+    if(result!=WEB_URL_TUPLE&&result!=WEB_URL_OPAQUE){
         free(origin);return url_failure(j,result,"Invalid trusted top document URL");
     }
-    free(j->top_origin);j->top_origin=origin;j->top_opaque=result!=HTTP_URL_TUPLE;j->top_prepared=true;return true;
+    free(j->top_origin);j->top_origin=origin;j->top_opaque=result!=WEB_URL_TUPLE;j->top_prepared=true;return true;
 }
 static const char *cookie_site_url(const struct job *j) {
     if(j->top_level_url)return j->top_level_url;
@@ -857,7 +838,9 @@ static void cache_store(struct job *j,const struct http_resp *r) {
     }
     struct cache_entry source={.url=j->final_url,.partition=j->partition,.request_headers=j->outgoing.p,
         .headers=(char *)http_response_headers(r),.reason=(char *)http_response_status_text(r),
-        .body=j->cache_body.p?j->cache_body.p:"",.body_len=j->cache_body.length,.status=r->status};
+        .body=j->cache_body.p?j->cache_body.p:"",.body_len=j->cache_body.length,.status=r->status,
+        .encoded_size=j->timing.encoded_body_size};
+    memcpy(source.content_encoding,j->timing.content_encoding,sizeof source.content_encoding);
     struct cache_entry *e=cache_clone(&source);if(!e)return;
     char *clean=cache_clean_headers(e->headers,NULL,false,0);if(!clean){cache_free(e);return;}
     free(e->headers);e->headers=clean;cache_freshness(e);
@@ -944,7 +927,7 @@ static void note_fetch_site(struct job *j, const char *url, const char *url_orig
 }
 /* Fetch Metadata's headers, for a request to a potentially trustworthy URL. */
 static bool append_fetch_metadata(struct job *j, const char *current) {
-    if (!potentially_trustworthy(current)) return true;
+    if (!web_url_potentially_trustworthy(current)) return true;
     const char *destination = webnet_destination_name((enum webnet_destination)j->fetch.destination);
     const char *mode = navigation_request(j) || j->wire.kind == WEBNET_NAVIGATION ? "navigate" :
         j->wire.kind == WEBNET_WEBSOCKET ? "websocket" :
@@ -994,7 +977,7 @@ static bool prepare_outgoing(struct job *j, const char *current, const char *met
     const char *serialized_origin=request_origin(j);
     if(!cors_kind(j)&&j->wire.kind!=WEBNET_REPORT){
         int policy=j->referrer_policy?j->referrer_policy:WEBNET_REFERRER_STRICT_ORIGIN_CROSS;
-        bool downgrade=j->origin&&potentially_trustworthy(j->origin)&&!potentially_trustworthy(current);
+        bool downgrade=j->origin&&web_url_potentially_trustworthy(j->origin)&&!web_url_potentially_trustworthy(current);
         if((j->wire.user_navigation&WEBNET_WIRE_NO_REFERRER)||policy==WEBNET_REFERRER_NONE ||
            (policy==WEBNET_REFERRER_SAME_ORIGIN&&cross) ||
            ((policy==WEBNET_REFERRER_DOWNGRADE||policy==WEBNET_REFERRER_STRICT_ORIGIN||policy==WEBNET_REFERRER_STRICT_ORIGIN_CROSS)&&downgrade))serialized_origin="null";
@@ -1057,26 +1040,21 @@ static bool record_sent(struct job *j, const struct http_req *q) {
     if (!(j->wire.user_navigation & WEBNET_WIRE_SENT_HEADERS)) return true;
     j->sent.length = 0;
     if (j->sent.p) j->sent.p[0] = 0;
-    const char *authority = strstr(q->url, "://");
-    if (!authority) return fail(j, "Invalid request URL for developer tools");
-    bool tls = !strncasecmp(q->url, "https:", 6);
-    authority += 3;
-    const char *end = authority + strcspn(authority, "/?#");
-    const char *at = memchr(authority, '@', (size_t)(end - authority));
-    if (at) authority = at + 1;
-    size_t host_len = (size_t)(end - authority);
-    const char *port = NULL;
-    for (const char *p = end; p > authority; p--) if (p[-1] == ':') { port = p - 1; break; } else if (p[-1] == ']') break;
-    if (port && ((tls && !strncmp(port, ":443", (size_t)(end - port)) && end - port == 4) ||
-                 (!tls && !strncmp(port, ":80", (size_t)(end - port)) && end - port == 3))) host_len = (size_t)(port - authority);
+    /* The Host field as http.c writes it: the URL's host and port (weburl.h). */
+    struct web_url url;
+    int parsed = web_url_read(q->url, strlen(q->url), &url);
+    if (parsed != 1) return fail(j, parsed < 0 ? "Out of memory reading the request URL" : "Invalid request URL for developer tools");
+    size_t host_len;
+    const char *authority = web_url_authority(&url, &host_len);
     char length[64] = "";
     if (q->body || !strcmp(q->method, "POST") || !strcmp(q->method, "PUT"))
         snprintf(length, sizeof length, "Content-Length: %zu\r\n", q->body_len);
-    if (!header_append(j, &j->sent, "Host: ", 6) || !header_append(j, &j->sent, authority, host_len) ||
-        !header_append(j, &j->sent, "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n", sizeof("\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n") - 1) ||
-        !header_append(j, &j->sent, length, strlen(length)) ||
-        !header_append(j, &j->sent, q->headers ? q->headers : "", q->headers ? strlen(q->headers) : 0)) return false;
-    return true;
+    bool ok = header_append(j, &j->sent, "Host: ", 6) && header_append(j, &j->sent, authority, host_len) &&
+        header_append(j, &j->sent, "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n", sizeof("\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n") - 1) &&
+        header_append(j, &j->sent, length, strlen(length)) &&
+        header_append(j, &j->sent, q->headers ? q->headers : "", q->headers ? strlen(q->headers) : 0);
+    web_url_free(&url);
+    return ok;
 }
 /* One first-hop observation, only after trusted debug negotiation. Never
    retain/log names, values, bodies, URLs, or hashes of credential material. */
@@ -1085,9 +1063,10 @@ static void observe_request(struct job *j, const struct http_req *q) {
     j->debug_request_measured = true;
     j->debug_cookie = field_exists(j->outgoing.p, "Cookie");
     j->debug_content_length = q->body || !strcmp(q->method, "POST") || !strcmp(q->method, "PUT");
-    const char *authority = strstr(q->url, "://") + 3;
-    const char *path = strchr(authority, '/');
-    size_t authority_len = path ? (size_t)(path - authority) : strlen(authority);
+    struct web_url url;
+    size_t authority_len = 0;
+    if (web_url_read(q->url, strlen(q->url), &url) == 1) web_url_authority(&url, &authority_len);
+    web_url_free(&url);
     char length[64] = "";
     if (j->debug_content_length) snprintf(length, sizeof length, "Content-Length: %zu\r\n", q->body_len);
     j->debug_header_bytes = (uint64_t)j->outgoing.length + authority_len +
@@ -1115,6 +1094,144 @@ static bool cors_allowed(struct job *j, const struct http_resp *r) {
             strcmp(credentials,"true")) return fail(j,"Credentialed CORS requires exact origin and credentials permission");
     }
     return true;
+}
+/* ---- Fetch's timing record (http.h) ----
+   Fetch "get, decode, and split": whether a list value is exactly token. A
+   quoted string stays one value with its quotes, commas inside it included. */
+static bool split_list_has(const char *value, const char *token) {
+    size_t length = strlen(token);
+    for (const char *p = value;;) {
+        const char *start = p;
+        while (*p && *p != ',') {
+            if (*p != '"') { p++; continue; }
+            for (p++; *p && *p != '"'; p++) if (*p == '\\' && p[1]) p++;
+            if (*p) p++;
+        }
+        const char *a = start, *b = p;
+        while (a < b && (*a == ' ' || *a == '\t')) a++;
+        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        if ((size_t)(b - a) == length && !memcmp(a, token, length)) return true;
+        if (!*p) return false;
+        p++;
+    }
+}
+/* Fetch "get" over every name field: the values combined with ", " into
+   *out (NULL when there is none). False only when memory runs out. */
+static bool combined_field(struct job *j, const char *headers, const char *name, char **out) {
+    *out = NULL;
+    size_t name_length = strlen(name), total = 0;
+    const char *cursor = headers, *value; size_t n;
+    bool any = false;
+    while (field_value_next(&cursor, name, name_length, &value, &n)) {
+        if (n > SIZE_MAX - total - 3) return fail(j, "Out of memory combining a response field");
+        total += n + 2; any = true;
+    }
+    if (!any) return true;
+    char *combined = malloc(total + 1), *at = combined;
+    if (!combined) return fail(j, "Out of memory combining a response field");
+    cursor = headers;
+    while (field_value_next(&cursor, name, name_length, &value, &n)) {
+        const char *end = value + n;
+        while (value < end && (*value == ' ' || *value == '\t')) value++;
+        while (end > value && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if (at != combined) { memcpy(at, ", ", 2); at += 2; }
+        memcpy(at, value, (size_t)(end - value)); at += end - value;
+    }
+    *at = 0; *out = combined;
+    return true;
+}
+/* Fetch's TAO check of one hop's response (HTTP fetch). A failure stays for
+   the rest of the request: the request's timing allow failed flag. */
+static bool timing_allow_check(struct job *j, const char *headers) {
+    if (j->timing_allow_failed) return true;
+    char *values;
+    if (!combined_field(j, headers, "Timing-Allow-Origin", &values)) return false;
+    bool allowed = values && (split_list_has(values, "*") || split_list_has(values, request_origin(j)));
+    free(values);
+    if (allowed) return true;
+    bool cross = !j->origin || !j->target_origin || strcmp(j->origin, j->target_origin);
+    bool navigate = j->wire.kind == WEBNET_NAVIGATION;
+    /* A navigation's tainting is basic; otherwise basic means it never left
+       the request origin (cors and opaque tainting are kept once set). */
+    bool basic = navigate ? !cross : !j->cors_tainted && !j->opaque_tainted && !j->resource_opaque;
+    if (!basic) j->timing_allow_failed = true;
+    return true;
+}
+/* What one hop adds to the record: the transport's times and connection for
+   a network exchange (a 304 revalidation included), the cache state, and
+   the body info (a stored response's own when it came from the cache). */
+static void timing_hop(struct job *j, bool network, bool cached, const struct http_transport_result *transport) {
+    struct http_fetch_timing *f = &j->timing;
+    if (network) {
+        f->connection_valid = true; f->connection = transport->connection;
+        f->final_network_request_start = transport->request_start;
+        f->final_network_response_start = transport->final_response_start;
+        if (!f->first_interim_network_response_start)
+            f->first_interim_network_response_start = transport->first_interim_response_start;
+    }
+    f->cache_state = !cached ? HTTP_CACHE_STATE_NONE : network ? HTTP_CACHE_STATE_VALIDATED : HTTP_CACHE_STATE_LOCAL;
+    if (cached && j->cached) {
+        f->encoded_body_size = j->cached->encoded_size;
+        memcpy(f->content_encoding, j->cached->content_encoding, sizeof f->content_encoding);
+    } else {
+        f->encoded_body_size = transport->encoded_body_size;
+        memcpy(f->content_encoding, transport->content_encoding, sizeof f->content_encoding);
+    }
+    f->decoded_body_size = j->hop_decoded;
+}
+/* The fetch ended (its body's end, or a network error): the end time, the
+   flags only the whole request decides, and HTML's redirect count exposure
+   of a navigation (create and initialize a Document). */
+static void timing_finish(struct job *j) {
+    struct http_fetch_timing *f = &j->timing;
+    f->end_time = uptime_ms();
+    f->timing_allow_passed = !j->timing_allow_failed && !j->error[0] && j->status;
+    f->redirect_same_origin = !j->origin_tainted;
+    if (j->wire.kind != WEBNET_NAVIGATION) return;
+    /* Fetch's navigation TAO check: every redirect hop's values allow the
+       destination origin. */
+    bool tao = j->target_origin != NULL;
+    for (size_t i = 0; tao && i < j->redirect_tao_count; i++)
+        tao = j->redirect_tao[i] && (split_list_has(j->redirect_tao[i], "*") || split_list_has(j->redirect_tao[i], j->target_origin));
+    bool no_client = (j->fetch.flags & WEBNET_FETCH_BROWSER_UI) || !j->document || !*j->document;
+    f->navigation_redirects_exposed = f->redirect_same_origin || ((no_client || (j->referrer && *j->referrer)) && tao);
+}
+/* The private lines that carry the record (WEBNET_WIRE_TIMING): one with its
+   numbers, then the Server-Timing values when the response had any. The
+   browser's webnet.c takes them out of the header block. */
+static char *timing_lines(const struct job *j, size_t *length) {
+    const struct http_fetch_timing *f = &j->timing;
+    const struct http_connection_timing *c = &f->connection;
+    char line[768];
+    int n = snprintf(line, sizeof line,
+        "\r\nHTTP/Nocturne-Timing redirects=%lu redirect_end=%llu post_redirect=%llu lookup_start=%llu lookup_end=%llu "
+        "connect_start=%llu connect_end=%llu secure_start=%llu request=%llu interim=%llu response=%llu end=%llu "
+        "cache=%u tao=%u same_origin=%u navigation_redirects=%u connection=%u encoded=%llu decoded=%llu protocol=%s encoding=%s\r\n",
+        (unsigned long)f->redirect_count, (unsigned long long)f->redirect_end, (unsigned long long)f->post_redirect_start,
+        (unsigned long long)c->domain_lookup_start, (unsigned long long)c->domain_lookup_end,
+        (unsigned long long)c->connect_start, (unsigned long long)c->connect_end, (unsigned long long)c->secure_connection_start,
+        (unsigned long long)f->final_network_request_start, (unsigned long long)f->first_interim_network_response_start,
+        (unsigned long long)f->final_network_response_start, (unsigned long long)f->end_time,
+        (unsigned)f->cache_state, (unsigned)f->timing_allow_passed, (unsigned)f->redirect_same_origin,
+        (unsigned)f->navigation_redirects_exposed, (unsigned)f->connection_valid,
+        (unsigned long long)f->encoded_body_size, (unsigned long long)f->decoded_body_size,
+        f->connection_valid ? c->protocol : "", f->content_encoding);
+    if (n < 0 || (size_t)n >= sizeof line) return NULL;
+    static const char mark[] = "HTTP/Nocturne-Server-Timing ";
+    size_t server = f->server_timing ? strlen(f->server_timing) : 0;
+    if (server > SIZE_MAX - (size_t)n - sizeof mark - 2) return NULL;
+    size_t total = (size_t)n + (server ? sizeof mark - 1 + server + 2 : 0);
+    char *out = malloc(total + 1);
+    if (!out) return NULL;
+    memcpy(out, line, (size_t)n);
+    if (server) {
+        char *at = out + n;
+        memcpy(at, mark, sizeof mark - 1); at += sizeof mark - 1;
+        memcpy(at, f->server_timing, server); at += server;
+        memcpy(at, "\r\n", 2);
+    }
+    out[total] = 0; *length = total;
+    return out;
 }
 static int cookie_header(void *opaque, const char *line, size_t length) {
     struct job *j = opaque;
@@ -1156,6 +1273,7 @@ static bool apply_cookie_events(struct job *j,size_t start,const char *method) {
 static int body_cb(void *opaque, const char *data, size_t n) {
     struct job *j = opaque;
     if (!remaining(j)||request_cancelled(j)) return -1;
+    j->hop_decoded += n; /* Fetch's decoded size: the bytes after content codings */
     if(j->cache_capture){
         struct header_buffer *b=&j->cache_body;
         if(n>FETCH_CACHE_OBJECT-b->length){free(b->p);*b=(struct header_buffer){0};j->cache_capture=false;}
@@ -1319,10 +1437,24 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
            sent (HTML: the document's referrer), already a canonical URL. */
         const char *referrer = j->wire.kind == WEBNET_NAVIGATION && j->referrer ? j->referrer : "";
         size_t referrer_len = strlen(referrer);
-        char start[32], end[320];
+        char start[32], end[320], resource[16] = "";
+        /* What Fetch's cross-origin resource policy check needs of the response an opaque one
+           hides, for a later check against another embedder policy (Cache Storage's match):
+           1 a valid Cross-Origin-Resource-Policy, 2 a URL of another origin than the request's,
+           4 a request that included credentials. Nothing else of it leaves this process. */
+        if (j->opaque_tainted || j->resource_opaque) {
+            const char *policy = NULL; size_t length = 0;
+            bool other = !j->origin || !j->target_origin || strcmp(j->origin, j->target_origin);
+            bool corp = field_slice(http_response_headers(r), "Cross-Origin-Resource-Policy", &policy, &length) &&
+                ((length == 11 && !memcmp(policy, "same-origin", 11)) || (length == 9 && !memcmp(policy, "same-site", 9)) ||
+                 (length == 12 && !memcmp(policy, "cross-origin", 12)));
+            bool credentials = j->wire.credentials == WEBNET_CREDENTIALS_INCLUDE ||
+                (j->wire.credentials == WEBNET_CREDENTIALS_SAME_ORIGIN && !other);
+            snprintf(resource, sizeof resource, " resource=%u", (corp ? 1u : 0u) | (other ? 2u : 0u) | (credentials ? 4u : 0u));
+        }
         int a = snprintf(start, sizeof start, "HTTP/1.1 %d ", r->status);
-        int m = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s%s", j->cors_tainted, j->redirected,
-                         j->opaque_tainted||j->resource_opaque?" opaque=1":"", referrer_len?" referrer=":"");
+        int m = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s%s%s", j->cors_tainted, j->redirected,
+                         j->opaque_tainted||j->resource_opaque?" opaque=1":"", resource, referrer_len?" referrer=":"");
         int b = m >= 0 && (size_t)m < sizeof end ? snprintf(end + m, sizeof end - (size_t)m, "\r\n") : -1;
         if (b >= 0) b += m;
         if (b >= 0 && (size_t)b < sizeof end && j->debug_request_measured) {
@@ -1491,20 +1623,20 @@ static bool run_http(struct job *j) {
         for (int i = 0; i < 2; i++) {
             if (!context[i] || !*context[i]) continue;
             char *origin = NULL;
-            enum http_url_result result = http_url(context[i], NULL, &origin);
+            enum web_url_result result = http_url(context[i], NULL, &origin);
             free(origin);
-            if (result == HTTP_URL_OOM) return url_failure(j, result, "");
-            if (result == HTTP_URL_TUPLE || result == HTTP_URL_OPAQUE) continue;
+            if (result == WEB_URL_OOM) return url_failure(j, result, "");
+            if (result == WEB_URL_TUPLE || result == WEB_URL_OPAQUE) continue;
             if (i) { free(j->top_level_url); j->top_level_url = NULL; }
             else j->document[0] = 0;
         }
     }
-    enum http_url_result parsed = *j->document ? http_url(j->document, NULL, &j->origin) : HTTP_URL_OPAQUE;
-    if (parsed != HTTP_URL_TUPLE && parsed != HTTP_URL_OPAQUE)
+    enum web_url_result parsed = *j->document ? http_url(j->document, NULL, &j->origin) : WEB_URL_OPAQUE;
+    if (parsed != WEB_URL_TUPLE && parsed != WEB_URL_OPAQUE)
         return url_failure(j, parsed, "Invalid initiating document URL");
-    bool document_http = parsed == HTTP_URL_TUPLE;
+    bool document_http = parsed == WEB_URL_TUPLE;
     parsed = image_http_url(j, j->url, &j->final_url, &j->target_origin);
-    if (parsed != HTTP_URL_TUPLE) return url_failure(j, parsed, "Invalid HTTP(S) URL");
+    if (parsed != WEB_URL_TUPLE) return url_failure(j, parsed, "Invalid HTTP(S) URL");
     if (!validate_headers(j)) return false;
     if(!prepare_referrer(j))return false;
     if(no_cors(j) && strcmp(j->method,"GET") && strcmp(j->method,"HEAD") && strcmp(j->method,"POST"))return fail(j,"No-cors request requires a safelisted method");
@@ -1517,7 +1649,7 @@ static bool run_http(struct job *j) {
         /* Initial and every redirect hop were fully prepared before publish.
            The current final URL is the single canonical owner, not a copy. */
         const char *current=j->final_url;
-        if (!top_level_navigation(j) && document_http && !strncmp(j->origin, "https://", 8) && !strncmp(current, "http://", 7)) return fail(j, "HTTPS page cannot load insecure content");
+        if (!top_level_navigation(j) && document_http && web_url_has_scheme(j->origin, "https") && web_url_has_scheme(current, "http")) return fail(j, "HTTPS page cannot load insecure content");
         bool cross = !j->origin || strcmp(j->origin, j->target_origin) != 0;
         if (cross && (j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN))
             return fail(j, "Cross-origin fetch is forbidden by same-origin mode");
@@ -1535,7 +1667,7 @@ static bool run_http(struct job *j) {
         if (!prepare_outgoing(j, current, method, cross)) return false;
         if(!cache_partition(j))return false;
         int left = remaining(j); if (!left) return false;
-        free(j->body); j->body = NULL; j->body_len = j->body_cap = 0;
+        free(j->body); j->body = NULL; j->body_len = j->body_cap = 0; j->hop_decoded = 0;
         struct http_req q = {method, current, j->outgoing.p,
                              !drop_body && (j->wire.body_len || (j->wire.user_navigation & WEBNET_WIRE_BODY_PRESENT)) ?
                                  j->request_body : NULL,
@@ -1607,6 +1739,7 @@ static bool run_http(struct job *j) {
             }
         }
         if (result < 0) { j->cookie_len=j->stream_headers_sent?0:cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
+        bool network=!hit;
         if(!hit&&r.status==304&&j->cached){
             if(!cache_validator_matches(j->cached,&r)){
                 http_resp_free(&r);return fail(j,"Revalidation returned a mismatched entity validator");
@@ -1619,9 +1752,19 @@ static bool run_http(struct job *j) {
             http_resp_free(&r);result=cache_response(j,j->cached,&r);
             if(result<0){http_resp_free(&r);return false;}hit=true;
         }
+        timing_hop(j,network,hit,&transport);
+        if(!timing_allow_check(j,http_response_headers(&r))){http_resp_free(&r);return false;}
         bool redirect = !j->stream_final && (r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308);
         if (redirect) {
             j->referrer_policy=webnet_referrer_policy_header(http_response_headers(&r),j->referrer_policy);
+            /* Fetch: a navigation keeps every redirect hop's Timing-Allow-Origin values. */
+            if (j->wire.kind == WEBNET_NAVIGATION) {
+                char **grown = realloc(j->redirect_tao, (j->redirect_tao_count + 1) * sizeof *grown);
+                if (!grown) { http_resp_free(&r); return fail(j, "Out of memory keeping redirect timing"); }
+                j->redirect_tao = grown;
+                if (!combined_field(j, http_response_headers(&r), "Timing-Allow-Origin", &grown[j->redirect_tao_count])) { http_resp_free(&r); return false; }
+                j->redirect_tao_count++;
+            }
             if (hop == 20) { http_resp_free(&r); return fail(j, "Fetch redirect count exceeded"); }
             if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_ERROR) {
                 http_resp_free(&r); return fail(j, "Redirect forbidden by redirect mode");
@@ -1637,8 +1780,17 @@ static bool run_http(struct job *j) {
             if(resolution!=1){http_resp_free(&r);return fail(j,resolution<0?"Out of memory resolving redirect target":"Invalid or prohibited redirect target");}
             char *next_origin = NULL,*next_url=NULL;
             parsed = image_http_url(j, resolved, &next_url, &next_origin);free(resolved);
-            if (parsed != HTTP_URL_TUPLE) {
+            if (parsed != WEB_URL_TUPLE) {
                 http_resp_free(&r); return url_failure(j, parsed, "Invalid or prohibited redirect target");
+            }
+            /* Fetch (HTTP-redirect fetch): a cors request is never redirected to a URL that
+               includes credentials unless it stays same origin, and never once the response
+               tainting is cors. */
+            struct web_url location_url;int location_read=web_url_read(next_url,strlen(next_url),&location_url);
+            bool credentials=location_read==1&&web_url_includes_credentials(&location_url);web_url_free(&location_url);
+            if(location_read<0||(credentials&&((cors_kind(j)&&(!j->origin||strcmp(j->origin,next_origin)))||j->cors_tainted))){
+                free(next_url);free(next_origin);http_resp_free(&r);
+                return fail(j,location_read<0?"Out of memory reading redirect target":"Redirect to a URL with credentials is forbidden");
             }
             if (!webcookie_same_site(j->cookies,j->final_url,next_url)) j->redirect_cross_site=true;
             if (strcmp(j->target_origin, next_origin)) {
@@ -1650,6 +1802,9 @@ static bool run_http(struct job *j) {
             free(j->target_origin); j->target_origin = next_origin;
             free(j->final_url);j->final_url=next_url;
             j->redirected = true;
+            /* Fetch (HTTP-redirect fetch): the redirect ends and the next hop starts. */
+            j->timing.redirect_count++;
+            j->timing.redirect_end = j->timing.post_redirect_start = uptime_ms();
             if ((!strcmp(method, "POST") && (r.status == 301 || r.status == 302)) ||
                 (r.status == 303 && strcmp(method, "GET") && strcmp(method, "HEAD"))) {
                 drop_body = true;
@@ -1657,6 +1812,13 @@ static bool run_http(struct job *j) {
             }
             http_resp_free(&r); continue;
         }
+        /* Fetch: the final response's Server-Timing values, when the request's
+           client is a secure context. A browser-UI navigation has no client;
+           the document it makes reads them, so its URL decides. */
+        const char *client = top_level_navigation(j) && ((j->fetch.flags & WEBNET_FETCH_BROWSER_UI) || !*j->document) ? current : j->document;
+        free(j->timing.server_timing); j->timing.server_timing = NULL;
+        if (j->wire.kind != WEBNET_REPORT && web_url_potentially_trustworthy(client) &&
+            !combined_field(j, http_response_headers(&r), "Server-Timing", &j->timing.server_timing)) { http_resp_free(&r); return false; }
         if (j->wire.kind == WEBNET_MODULE && (r.status < 200 || r.status >= 300 || !js_mime(http_response_headers(&r)))) {
             reject_script_response(j, &r, "Module response rejected",
                                    r.status < 200 || r.status >= 300 ? "status" : "MIME");
@@ -1865,7 +2027,7 @@ static void ws_reader(void *opaque) {
 }
 /* Opening handshake (RFC 6455 4.1). The browser supplied only a validated
    Sec-WebSocket-Protocol field; Origin and cookies come from trusted state. */
-static bool ws_handshake(struct websocket *ws, const char *http_url, const struct url_owned *u) {
+static bool ws_handshake(struct websocket *ws, const char *http_url, const struct http_target *u) {
     struct job *j = ws->j;
     unsigned char nonce[16];
     br_hmac_drbg_generate(&ws->mask_random, nonce, sizeof nonce);
@@ -1883,17 +2045,15 @@ static bool ws_handshake(struct websocket *ws, const char *http_url, const struc
         memcpy(accept, encoded, al + 1); free(encoded);
     }
     char *origin = NULL;
-    if (http_origin_owned(j->document, &origin) != HTTP_URL_TUPLE) { free(origin); origin = NULL; }
+    if (web_url_origin(j->document, &origin) != WEB_URL_TUPLE) { free(origin); origin = NULL; }
     /* The handshake is a Fetch with mode websocket: Sec-Fetch-Site relates the
        creating document's origin to the socket's URL. */
     if (origin && !j->origin) { j->origin = strdup(origin); if (!j->origin) { free(origin); free(key); return fail(j, "Out of memory preparing WebSocket origin"); } }
-    if (!j->target_origin && http_origin_owned(http_url, &j->target_origin) != HTTP_URL_TUPLE) { free(j->target_origin); j->target_origin = NULL; }
+    if (!j->target_origin && web_url_origin(http_url, &j->target_origin) != WEB_URL_TUPLE) { free(j->target_origin); j->target_origin = NULL; }
     note_fetch_site(j, http_url, j->target_origin);
     struct header_buffer *b = &j->outgoing; b->length = 0;
-    char port[16] = "";
-    if (u->port != (u->tls ? 443 : 80)) snprintf(port, sizeof port, ":%u", u->port);
     bool ok = header_text(j, b, "GET ") && header_text(j, b, u->path) && header_text(j, b, " HTTP/1.1\r\nHost: ") &&
-        header_text(j, b, u->host) && header_text(j, b, port) &&
+        header_text(j, b, u->authority) &&
         header_text(j, b, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ") && header_text(j, b, key) &&
         header_text(j, b, "\r\nSec-WebSocket-Version: 13\r\nOrigin: ") && header_text(j, b, origin ? origin : "null") &&
         header_text(j, b, "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n") &&
@@ -1962,19 +2122,18 @@ static bool run_websocket(struct job *j) {
     struct websocket *ws = calloc(1, sizeof *ws);
     if (!ws) return fail(j, "Out of memory opening WebSocket");
     ws->j = j;
+    /* The WebSocket Protocol's handshake goes to the URL with its scheme set to http for ws and
+       https for wss, as the URL Standard's protocol setter sets it. */
     char *http_url = NULL;
-    bool secure = !strncasecmp(j->url, "wss://", 6);
-    if (secure || !strncasecmp(j->url, "ws://", 5)) {
-        size_t rest = strlen(j->url) - (secure ? 6 : 5);
-        http_url = malloc(rest + 9);
-        if (http_url) snprintf(http_url, rest + 9, "%s://%s", secure ? "https" : "http", j->url + (secure ? 6 : 5));
-    }
-    struct url_owned u = {0};
+    bool secure = web_url_has_scheme(j->url, "wss");
+    int changed = secure || web_url_has_scheme(j->url, "ws") ?
+        web_url_change(j->url, WEB_URL_PROTOCOL, secure ? "https" : "http", &http_url) : 0;
+    struct http_target u = {0};
     unsigned char seed[32];
     bool seeded = n_random(seed, sizeof seed) == (n_result)sizeof seed;
     if (!seeded) fail(j, "No entropy for WebSocket masking");
-    else if (!http_url) fail(j, "Invalid WebSocket URL");
-    else if (!url_parse_owned(http_url, &u)) fail(j, "Invalid WebSocket URL");
+    else if (changed < 0) fail(j, "Out of memory reading the WebSocket URL");
+    else if (!http_url || http_target_of(http_url, &u) != WEB_URL_TUPLE) fail(j, "Invalid WebSocket URL");
     else if (*j->headers && (strncasecmp(j->headers, "Sec-WebSocket-Protocol: ", 24) || strstr(j->headers, "\r\n") != j->headers + strlen(j->headers) - 2))
         fail(j, "Invalid WebSocket request fields");
     else {
@@ -2024,7 +2183,7 @@ static bool run_websocket(struct job *j) {
         ns_abort(ws->stream);
     }
     if (j->error[0] && !ws->failed) ws_fail(ws, j->error);
-    url_owned_free(&u);
+    http_target_free(&u);
     free(http_url); free(ws->in); free(ws->message); free(ws);
     return !j->error[0];
 }
@@ -2145,7 +2304,7 @@ static int run_one(n_handle input,n_handle output) {
     else if (socket && (strcmp(j->method, "GET") || w->body_len || input != output)) fail(j, "Invalid WebSocket request");
     else if (socket) { if (!j->error[0] && remaining(j)) { socket_ran = true; run_websocket(j); } }
     else if (!j->error[0] && remaining(j)) {
-        if (!strncmp(j->url, "file:", 5)) load_file(j);
+        if (web_url_has_scheme(j->url, "file")) load_file(j);
         else run_http(j);
     }
     if (j->error[0]) {
@@ -2170,6 +2329,22 @@ static int run_one(n_handle input,n_handle output) {
                 j->response_headers_len=old+(size_t)length;}
         }
     }
+    /* Fetch's timing record goes after every server field: appended to a
+       buffered response's block, or as the whole block of a stream's end. */
+    char *timing = NULL; size_t timing_length = 0;
+    bool streaming_end = (w->user_navigation & WEBNET_WIRE_STREAM) != 0;
+    if (!socket && (w->user_navigation & WEBNET_WIRE_TIMING) && w->kind != WEBNET_REPORT) {
+        timing_finish(j);
+        timing = timing_lines(j, &timing_length);
+        if (!timing) { if (!j->error[0]) fail(j, "Out of memory reporting fetch timing"); }
+        else if (!streaming_end) {
+            size_t old = j->response_headers_len;
+            char *grown = old <= SIZE_MAX - timing_length - 1 ? realloc(j->response_headers, old + timing_length + 1) : NULL;
+            if (grown) { memcpy(grown + old, timing, timing_length + 1); j->response_headers = grown; j->response_headers_len = old + timing_length; }
+            else if (!j->error[0]) fail(j, "Out of memory reporting fetch timing");
+            free(timing); timing = NULL; timing_length = 0;
+        }
+    }
     bool ok;
     if (socket) {
         /* A socket channel carries socket records only; run_websocket
@@ -2185,13 +2360,16 @@ static int run_one(n_handle input,n_handle output) {
     out.magic = streaming ? WEBNET_STREAM_END : WEBNET_MAGIC;
     out.id = w->id; out.generation = w->generation; out.status = streaming ? 0 : j->status;
     const char *final_url=j->final_url?j->final_url:"";
-    out.url_len = streaming ? 0 : strlen(final_url); out.headers_len = streaming ? 0 : j->response_headers_len;
+    out.url_len = streaming ? 0 : strlen(final_url); out.headers_len = streaming ? timing_length : j->response_headers_len;
     out.body_len = streaming ? 0 : j->body_len; out.error_len = strlen(j->error);
     out.cookie_len=(uint32_t)j->cookie_len;
     ok = job_write(j, &out, sizeof out) && job_write(j, final_url, out.url_len) &&
-              job_write(j, j->response_headers, out.headers_len) && job_write(j, j->body, out.body_len) && job_write(j, j->error, out.error_len) &&
+              job_write(j, streaming ? timing : j->response_headers, out.headers_len) && job_write(j, j->body, out.body_len) && job_write(j, j->error, out.error_len) &&
               job_write(j,j->cookie_events,out.cookie_len) && backlog_drain(j,0);
     }
+    free(timing); http_fetch_timing_free(&j->timing);
+    for (size_t i = 0; i < j->redirect_tao_count; i++) free(j->redirect_tao[i]);
+    free(j->redirect_tao);
     free(j->backlog);
     free(j->origin); free(j->target_origin);free(j->final_url);free(j->referrer);free(j->referrer_origin);
     free(j->top_level_url);free(j->top_origin);

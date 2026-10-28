@@ -120,6 +120,9 @@ struct web_response {
     char *url_full; /* Complete owned URL for native transports; inline URL remains legacy-compatible. */
     int event; /* webnet_event; zero retains the complete-response contract. */
     size_t uploaded;
+    /* Fetch's timing record of the request (http.h), its Server-Timing values
+       owned (web_response_free); valid only on a complete or ended response. */
+    struct http_fetch_timing timing;
 };
 static inline const char *web_response_url(const struct web_response *r) {
     return r->url_full ? r->url_full : r->url;
@@ -131,12 +134,20 @@ static inline const char *web_response_headers(const struct web_response *r) {
     return r->headers_full ? r->headers_full : r->headers;
 }
 void web_response_free(struct web_response *response);
-/* Navigation observations are copied into the document, not retained as a
-   pointer to a mutable browser request. All values use uptime_ms(), not wall
-   clock time. Unobserved DNS/TLS/first-byte milestones are deliberately absent. */
+/* How a document was navigated to, for its PerformanceNavigationTiming and
+   performance.navigation: navigation start (the time origin), the kind of
+   navigation, and the navigation response's timing record. The document
+   copies it as it is created; fetch.server_timing and headers are borrowed
+   until then. All values use uptime_ms(), not wall clock time. */
+enum web_navigation_type { WEB_NAVIGATION_NAVIGATE, WEB_NAVIGATION_RELOAD, WEB_NAVIGATION_BACK_FORWARD };
 struct web_navigation_timing {
-    bool valid, fetch_valid, response_end_valid;
-    uint64_t navigation_start_ms, fetch_start_ms, response_end_ms;
+    bool valid;
+    uint8_t type; /* enum web_navigation_type */
+    uint64_t navigation_start_ms;
+    struct http_fetch_timing fetch;
+    /* The navigation response's status and header block (its Content-Type). */
+    int status;
+    const char *headers;
 };
 /* Optional native-host cancellation deadline. Normal pages are not rejected
    at an arbitrary 5/15/30-second cutoff. Page code cannot reset it. */
@@ -160,9 +171,26 @@ struct web_video_patch {
    measurement (profiles, network and media traces). A host shows traces apart
    from the page's console, so that they never bury the page's messages. */
 enum { WEB_CONSOLE_LOG, WEB_CONSOLE_WARN, WEB_CONSOLE_ERROR, WEB_CONSOLE_TRACE };
+/* One input step of a test automation run (web_host.automation): at is ms after the run
+   starts; x, y a point in the top-level viewport (CSS px). DOWN and UP press and release
+   WebDriver button value (0 left, 1 middle, 2 right, 3 back, 4 forward) at x, y; KEY_DOWN and
+   KEY_UP the key whose WebDriver code point is value (a character, or U+E000..U+F8FF for the
+   named keys); WHEEL scrolls dx, dy CSS px at x, y. */
+enum web_automation_kind { WEB_AUTOMATION_MOVE, WEB_AUTOMATION_DOWN, WEB_AUTOMATION_UP,
+    WEB_AUTOMATION_KEY_DOWN, WEB_AUTOMATION_KEY_UP, WEB_AUTOMATION_WHEEL };
+struct web_automation_step {
+    enum web_automation_kind kind;
+    uint32_t at, value;
+    double x, y, dx, dy;
+};
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
+    /* Why the last request() returned false (static text for the page's console), or NULL. */
+    const char *(*request_refusal)(void *opaque);
+    /* Fetch's inflight keepalive request bytes of a fetch group (web_request.fetch_group): what
+       the host still carries for it, including requests of retired documents. */
+    size_t (*keepalive_inflight)(void *opaque, uint64_t fetch_group);
     void (*cancel)(void *opaque, uint64_t id);
     /* Document retirement, unlike explicit AbortSignal: detach callback delivery
        and retain a keepalive transport. A host without this cannot accept it. */
@@ -249,6 +277,14 @@ struct web_host {
     bool (*socket_close)(void *opaque, uint64_t id, unsigned code, const char *reason, size_t length);
     size_t (*socket_buffered)(void *opaque, uint64_t id);
     void (*socket_release)(void *opaque, uint64_t id);
+    /* A test tool, not a product feature: WPT's testdriver drives the host's own input with
+       it. A host sets it only when its user started it for automation; then, and only then,
+       a top-level document's realm has the function that calls it (see web_automation_step).
+       The host takes the steps (copied before return) for document, puts them into its real
+       input at their times and calls web_automation_done with id once it has handled the last
+       one and duration has passed. Returns NULL when it took them, else why not (static). */
+    const char *(*automation)(void *opaque, web_doc *document, uint64_t id,
+                              const struct web_automation_step *steps, size_t count, uint32_t duration);
 };
 enum web_socket_event_type { WEB_SOCKET_OPENED, WEB_SOCKET_MESSAGE_TEXT, WEB_SOCKET_MESSAGE_BINARY,
     WEB_SOCKET_CLOSED, WEB_SOCKET_FAILED };
@@ -262,6 +298,9 @@ struct web_socket_event {
 /* Host to document: deliver one event of a socket opened by this document or
    one of its frames. Data is copied before return. */
 void web_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *event);
+/* Host to document: the automation run id of d ended, NULL when every step was handled, else
+   why it failed (copied). Its promise settles in a task of d's (web_tick). Runs no script. */
+void web_automation_done(web_doc *d, uint64_t id, const char *error);
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
 void web_history_event(web_doc *d, const char *old_url, bool popstate);
@@ -278,8 +317,17 @@ void web_visibility_event(web_doc *d);
 void web_js_prepare(void);
 web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
                   const struct web_host *host);
+/* HTML "load a document": the document a response of a Content-Type value
+   (NULL or empty: none) makes. An HTML MIME type an HTML document, an XML
+   MIME type (text/xml, application/xml, a subtype ending in "+xml") an XML
+   document; any other the host displays its own way. */
+enum web_document_kind { WEB_DOCUMENT_OTHER, WEB_DOCUMENT_HTML, WEB_DOCUMENT_XML };
+enum web_document_kind web_document_kind(const char *type);
+/* A browsing context's document from a response: html is its body, headers
+   its header block, type the Content-Type of html (NULL: text/html, as for
+   markup the host writes itself). An XML type loads an XML document. */
 web_doc *web_live_response(const char *html,size_t len,const char *url,const char *charset,
-                         const char *headers,const struct web_host *host);
+                         const char *headers,const char *type,const struct web_host *host);
 void web_tick(web_doc *d, uint64_t now_ms);
 /* Private media/JS-worker children outlive a retired document until nonblocking reap.
  * No document/node callback is retained by this process-lifetime cleanup. */
@@ -398,11 +446,7 @@ const char *web_url(web_doc *d);
 /* <meta http-equiv="refresh" content="N; url=...">: the absolute URL, or NULL */
 const char *web_refresh_url(web_doc *d, int *delay_s);
 
-/* resolve a (possibly relative) URL against base into out; false if it cannot be made absolute */
-bool web_resolve_url(const char *base, const char *rel, char *out, size_t n);
-/* Fresh malloc output: 1 resolved, 0 invalid/representation overflow, -1 OOM.
-   No legacy fixed-buffer URL quota; caller frees successful output. */
-int web_resolve_url_owned(const char *base, const char *rel, char **out);
+/* web_resolve_url_owned, the URL parser for a URL against a base, is weburl.h's. */
 
 /* ---- resources ---- */
 const char *web_pending_stylesheet(web_doc *d);                   /* next stylesheet to fetch, or NULL */
@@ -463,6 +507,15 @@ int web_control_edit(web_doc *top, web_node *target, const char *input_type,
                      const char *data, size_t length);
 /* Caller owns the selected UTF-8 text. Password/default-copy is denied. */
 char *web_control_selected_text(web_doc *top, web_node *target, size_t *length);
+/* Whether the keys go to an editing host: the focused document (through its
+   frames) is in design mode, or its focus is in an element with contenteditable.
+   web_key then takes the typing, deleting, Enter and caret keys. */
+bool web_editing_target(web_doc *top);
+/* The user's clipboard edit of an editing host: "insertFromPaste" with the text,
+   or "deleteByCut". 1 when an editing host took it. */
+int web_editing_edit(web_doc *top, const char *input_type, const char *data, size_t length);
+/* Caller owns the UTF-8 text of the focused document's selection; NULL when empty. */
+char *web_selection_text(web_doc *top, size_t *length);
 struct web_control_activation { web_node *control, *previous; bool checked, indeterminate, radio; };
 void web_control_activation_begin(web_doc *d, web_node *control, struct web_control_activation *activation);
 bool web_control_activation_end(web_doc *d, struct web_control_activation *activation, bool allowed);

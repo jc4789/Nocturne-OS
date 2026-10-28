@@ -431,9 +431,13 @@ void box_scroll_clamp(box_t *b) {
     n->scroll_y = scroll_limit(n->scroll_y, my);
 }
 
-bool css_translation_active(const style_t *s){return s&&(s->transform||s->translate.active||s->rotate||s->scale);}
-/* Row-major 4x4 of one function; translation percentages use w/h. */
-static void transform_function_matrix(const struct css_transform *t,float w,float h,double m[16]){
+/* the transform properties, or an offset transform (motion-1 §2.7) */
+static bool transform_properties(const style_t *s){return s->transform||s->translate.active||s->rotate||s->scale;}
+static bool offset_path(const style_t *s){return s->offset&&s->offset->path;}
+bool css_translation_active(const style_t *s){return s&&(transform_properties(s)||offset_path(s));}
+/* Row-major 4x4 of one function; translation percentages use w/h. depth: perspective too,
+   which orthographic flattening otherwise discards. */
+static void transform_function_matrix(const struct css_transform *t,float w,float h,bool depth,double m[16]){
     for(int i=0;i<16;i++)m[i]=i%5?0:1;
     switch(t->kind){
     case CT_TRANSLATE:m[3]=len_resolve(&t->xy[0],w);m[7]=len_resolve(&t->xy[1],h);m[11]=t->v[0];break;
@@ -450,7 +454,11 @@ static void transform_function_matrix(const struct css_transform *t,float w,floa
         m[8]=z*x*k-y*s; m[9]=z*y*k+x*s; m[10]=c+z*z*k;
         break;
     }
-    default:break; /* perspective only changes w, which orthographic flattening discards */
+    case CT_PERSPECTIVE:
+        /* CSS Transforms 2: perspective(none) is the identity; lengths under 1px act as 1px. */
+        if(depth&&t->v[1]!=1)m[14]=-1.0/(t->v[0]<1?1:t->v[0]);
+        break;
+    default:break;
     }
 }
 static void matrix4_multiply(double out[16],const double a[16],const double b[16]){
@@ -461,7 +469,11 @@ static void matrix4_multiply(double out[16],const double a[16],const double b[16
 }
 void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]){
     for(int i=0;i<16;i++)m[i]=i%5?0:1;
-    for(;t;t=t->next){double f[16];transform_function_matrix(t,w,h,f);matrix4_multiply(m,m,f);}
+    for(;t;t=t->next){double f[16];transform_function_matrix(t,w,h,false,f);matrix4_multiply(m,m,f);}
+}
+void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]){
+    for(int i=0;i<16;i++)m[i]=i%5?0:1;
+    for(;t;t=t->next){double f[16];transform_function_matrix(t,0,0,true,f);matrix4_multiply(m,m,f);}
 }
 /* A function whose x/y linear part is the identity only translates. */
 static bool transform_function_translates(const struct css_transform *t){
@@ -476,6 +488,7 @@ static bool transform_function_translates(const struct css_transform *t){
 }
 bool css_transform_general(const style_t *s){
     if(!s)return false;
+    if(offset_path(s))return true; /* the offset transform is box_transform_matrix's */
     if(s->rotate&&!transform_function_translates(s->rotate))return true;
     if(s->scale&&!transform_function_translates(s->scale))return true;
     for(const struct css_transform *t=s->transform;t;t=t->next)if(!transform_function_translates(t))return true;
@@ -493,27 +506,96 @@ float box_translation_axis(const box_t *b,unsigned axis,unsigned sources){
         value+=t->kind==CT_TRANSLATE?len_resolve(&t->xy[axis],base):t->kind==CT_MATRIX?t->m[axis?7:3]:0;
     return value>FLT_MAX?FLT_MAX:value< -FLT_MAX? -FLT_MAX:(float)value;
 }
+/* The offset transform's parts in document coordinates: the offset position (px, py), the anchor
+   point (ax, ay) and the rotation in degrees. */
+struct offset_used { double px, py, ax, ay, angle; };
+/* A reference box as the outline motion-1 §2.1 and css-shapes-1 §3.3 give it: the rectangle with
+   the corners its border radii round, r its rectangle from b's border box's top left. */
+static void box_outline(const box_t *b,uint8_t which,float r[4],struct css_shape *s){
+    float rx[4],ry[4];
+    box_reference_box(b,which,r,rx,ry);
+    memset(s,0,sizeof *s);
+    s->kind=CSS_SHAPE_INSET;s->box=which;
+    for(int i=0;i<4;i++){
+        s->inset[i].kind=LK_LEN;
+        s->corner[i].axis[0]=(len_t){.kind=LK_LEN,.px=rx[i]};s->corner[i].axis[1]=(len_t){.kind=LK_LEN,.px=ry[i]};
+    }
+}
+/* motion-1 §2.7: where offset-path, offset-distance, offset-position, offset-anchor and offset-rotate
+   put b, whose transform reference box is (x y w h) and origin (ox, oy). The path's reference box is
+   the <coord-box> of the box that establishes b's containing block. */
+static bool box_offset_used(const box_t *b,double x,double y,float w,float h,double ox,double oy,struct offset_used *u){
+    const struct css_offset *o=css_style_offset(b->st);
+    const struct css_shape *path=o->path;
+    float element[4]={box_visual_x(b)-b->p[3]-b->b[3],box_visual_y(b)-b->p[0]-b->b[0],
+                      b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2]};
+    const box_t *c=b->cb?b->cb:b->parent;
+    float cb[4];
+    struct css_shape outline;
+    struct css_offset offset=*o;
+    if(c&&c->kind!=B_TEXT&&c->kind!=B_BR) {
+        uint8_t which=path->box==CSS_BOX_MARGIN?CSS_BOX_BORDER:path->box;
+        if(path->kind==CSS_SHAPE_BOX){box_outline(c,which,cb,&outline);offset.path=&outline;}
+        else{float rx[4],ry[4];box_reference_box(c,which,cb,rx,ry);}
+        double cx=box_visual_x(c)-c->p[3]-c->b[3],cy=box_visual_y(c)-c->p[0]-c->b[0];
+        /* the path is in the containing block's content, which scrolls */
+        if(c->node&&box_element_scrollable(c)){cx-=c->node->scroll_x;cy-=c->node->scroll_y;}
+        cb[0]+=(float)cx;cb[1]+=(float)cy;
+    } else { /* the initial containing block */
+        const web_doc *d=b->node?b->node->owner:NULL;
+        cb[0]=cb[1]=0;cb[2]=d?(float)d->width:0;cb[3]=d?(float)d->height:0;
+        if(path->kind==CSS_SHAPE_BOX){
+            memset(&outline,0,sizeof outline);outline.kind=CSS_SHAPE_INSET;
+            for(int i=0;i<4;i++)outline.inset[i].kind=outline.corner[i].axis[0].kind=outline.corner[i].axis[1].kind=LK_LEN;
+            offset.path=&outline;
+        }
+    }
+    double direction;
+    if(!css_offset_place(&offset,cb,element,&u->px,&u->py,&direction))return false;
+    /* offset-anchor (motion-1 §2.4): auto is transform-origin's point */
+    if(o->anchor[0].kind==LK_AUTO){u->ax=ox;u->ay=oy;}
+    else{u->ax=x+len_resolve(&o->anchor[0],w);u->ay=y+len_resolve(&o->anchor[1],h);}
+    u->angle=(o->rotate.auto_rotate?direction:0)+o->rotate.angle;
+    return isfinite(u->ax)&&isfinite(u->ay)&&isfinite(u->angle);
+}
+static bool style_transform_matrix(const style_t *st,double x,double y,float w,float h,const box_t *b,double out[6]);
 bool box_transform_matrix(const box_t *b,double out[6]){
     if(!box_transformed(b))return false;
     const style_t *st=b->st;
     bool content=st->transform_box==TB_FILL_BOX||st->transform_box==TB_CONTENT_BOX;
     float w=content?b->w:b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],h=content?b->h:b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
     double x=box_visual_x(b)-(content?0:b->p[3]+b->b[3]),y=box_visual_y(b)-(content?0:b->p[0]+b->b[0]);
-    return css_style_transform_matrix(st,x,y,w,h,out);
+    return style_transform_matrix(st,x,y,w,h,b,out);
 }
+/* SVG graphics take the transform properties only; the offset transform is the CSS boxes' */
 bool css_style_transform_matrix(const style_t *st,double x,double y,float w,float h,double out[6]){
+    return st&&transform_properties(st)&&style_transform_matrix(st,x,y,w,h,NULL,out);
+}
+static bool style_transform_matrix(const style_t *st,double x,double y,float w,float h,const box_t *b,double out[6]){
     if(!css_translation_active(st))return false;
     double ox=x+len_resolve(&st->transform_origin[0],w),oy=y+len_resolve(&st->transform_origin[1],h);
-    /* CSS Transforms 2: translate, rotate, scale, then transform, around the origin. */
+    /* CSS Transforms 2: translate, rotate, scale, the offset transform (motion-1 §2.7), then transform,
+       around the origin. */
     double m[16],f[16];
     for(int i=0;i<16;i++)m[i]=i%5?0:1;
     m[3]=ox;m[7]=oy;
     if(st->translate.active){
         struct css_transform t={.kind=CT_TRANSLATE};t.xy[0]=st->translate.xy[0];t.xy[1]=st->translate.xy[1];
-        transform_function_matrix(&t,w,h,f);matrix4_multiply(m,m,f);
+        transform_function_matrix(&t,w,h,false,f);matrix4_multiply(m,m,f);
     }
-    if(st->rotate){transform_function_matrix(st->rotate,w,h,f);matrix4_multiply(m,m,f);}
-    if(st->scale){transform_function_matrix(st->scale,w,h,f);matrix4_multiply(m,m,f);}
+    if(st->rotate){transform_function_matrix(st->rotate,w,h,false,f);matrix4_multiply(m,m,f);}
+    if(st->scale){transform_function_matrix(st->scale,w,h,false,f);matrix4_multiply(m,m,f);}
+    struct offset_used off;
+    if(b&&offset_path(st)&&box_offset_used(b,x,y,w,h,ox,oy,&off)){
+        /* the anchor point to the offset position, rotated around it */
+        double a=off.angle*M_PI/180;
+        for(int i=0;i<16;i++)f[i]=i%5?0:1;
+        f[3]=off.px-ox;f[7]=off.py-oy;matrix4_multiply(m,m,f);
+        for(int i=0;i<16;i++)f[i]=i%5?0:1;
+        f[0]=cos(a);f[1]=-sin(a);f[4]=sin(a);f[5]=cos(a);matrix4_multiply(m,m,f);
+        for(int i=0;i<16;i++)f[i]=i%5?0:1;
+        f[3]=ox-off.ax;f[7]=oy-off.ay;matrix4_multiply(m,m,f);
+    }
     css_transform_list_matrix(st->transform,w,h,f);matrix4_multiply(m,m,f);
     for(int i=0;i<16;i++)f[i]=i%5?0:1;
     f[3]=-ox;f[7]=-oy;matrix4_multiply(m,m,f);
@@ -719,6 +801,8 @@ static void list_abs(box_t *b) {
 struct fl {
     float x, y, w, h; /* margin box, in BFC coordinates */
     int side;
+    const box_t *box; /* the float; its shape-outside narrows line boxes only */
+    float shape_margin;
 };
 struct bfc {
     struct fl *v;
@@ -728,25 +812,44 @@ struct bfc {
 
 static void bfc_free(struct bfc *f) { free(f->v); }
 
-static void bfc_add(struct bfc *f, float x, float y, float w, float h, int side) {
+static void bfc_add(struct bfc *f, float x, float y, float w, float h, int side, const box_t *box, float shape_margin) {
     if (f->n == f->cap) {
         f->cap = f->cap ? f->cap * 2 : 8;
         f->v = realloc(f->v, sizeof *f->v * (size_t)f->cap);
     }
-    f->v[f->n++] = (struct fl){x, y, w, h, side};
+    f->v[f->n++] = (struct fl){x, y, w, h, side, box, shape_margin};
     f->last_top = y;
 }
 
-/* the free interval within [x0, x1] for the band y .. y+h */
-static void bfc_space(const struct bfc *f, float y, float h, float x0, float x1, float *l, float *r) {
+/* css-shapes-1 §4: the float area of a's shape-outside within the band y .. y+h, clipped to its
+   margin box; false when the band misses it, and the float leaves those lines alone. */
+static bool float_area(const struct fl *a, float y, float h, float *x0, float *x1) {
+    const box_t *b = a->box;
+    const struct css_shape *s = css_style_float_shape(b->st)->outside;
+    float r[4];
+    struct css_shape outline;
+    if (s->kind == CSS_SHAPE_BOX) { box_outline(b, s->box, r, &outline); s = &outline; }
+    else { float rx[4], ry[4]; box_reference_box(b, s->box, r, rx, ry); }
+    r[0] += a->x + b->m[3]; r[1] += a->y + b->m[0];
+    if (!css_shape_band(s, r, a->shape_margin, y, y + h, x0, x1)) return false;
+    *x0 = fmaxf_(*x0, a->x); *x1 = fminf_(*x1, a->x + a->w);
+    return *x1 > *x0;
+}
+
+/* the free interval within [x0, x1] for the band y .. y+h; lines: for line boxes, which floats'
+   shape-outside narrows */
+static void bfc_space(const struct bfc *f, float y, float h, float x0, float x1, float *l, float *r, bool lines) {
     *l = x0;
     *r = x1;
     if (h < 1) h = 1;
     for (int i = 0; f && i < f->n; i++) {
         const struct fl *a = &f->v[i];
         if (a->y >= y + h || a->y + a->h <= y || a->h <= 0) continue;
-        if (a->side == FL_LEFT) *l = fmaxf_(*l, a->x + a->w);
-        else *r = fminf_(*r, a->x);
+        float left = a->x, right = a->x + a->w;
+        const struct css_shape *shape = lines && a->box && a->box->st ? css_style_float_shape(a->box->st)->outside : NULL;
+        if (shape && shape->kind != CSS_SHAPE_URL && !float_area(a, y, h, &left, &right)) continue;
+        if (a->side == FL_LEFT) *l = fmaxf_(*l, right);
+        else *r = fminf_(*r, left);
     }
 }
 
@@ -1106,6 +1209,14 @@ float control_text_width(const style_t *st, const char *s, size_t n) {
     }
     return width + text_width_uncached(st, &font, s + first, n - first);
 }
+static float control_measure(const void *opaque, const char *s, size_t at, size_t next, float x) {
+    const style_t *st = opaque;
+    wfont font = style_font(st);
+    return next == at + 1 && s[at] == '\t' ? control_tab_width(st, &font, x) : text_width_uncached(st, &font, s + at, next - at);
+}
+size_t control_text_boundary(const style_t *st, const char *s, size_t n, float x) {
+    return layout_text_boundary(s, n, -1, x, control_measure, st);
+}
 bool control_text_lines(const box_t *b, const style_t *st, const char *text,
                         control_text_line_fn visit, void *opaque, float *width, float *height) {
     if (!b || !st || !text || !width || !height) return false;
@@ -1212,7 +1323,10 @@ static void build_items(box_t *parent, struct ibuild *s) {
     for (box_t *c = parent->first; c; c = c->next) {
         if (!layout_checkpoint()) break;
         layout_media_checkpoint();
-        if (s->collect_paint) c->inline_paint_owner = s->paint_owner;
+        if (s->collect_paint) {
+            c->inline_paint_owner = s->paint_owner;
+            c->frag_first = c->frag_end = 0; /* this line layout records them afresh */
+        }
         if (c->abspos) {
             ipush(s->v, IT_ABS)->box = c;
             continue;
@@ -1325,7 +1439,7 @@ static bool float_fits_line(struct iline *L, box_t *c, float used);
 
 static void line_space(struct iline *L) {
     box_t *b = L->blk;
-    bfc_space(L->f, L->oy + L->y, L->strut_lh, L->ox, L->ox + b->w, &L->left, &L->right);
+    bfc_space(L->f, L->oy + L->y, L->strut_lh, L->ox, L->ox + b->w, &L->left, &L->right, true);
     L->left -= L->ox;
     L->right -= L->ox;
     if (L->first_line) {
@@ -1360,6 +1474,9 @@ static void add_deco(struct iline *L, box_t *ib, float x0, float x1, float basel
     }
     ib->inline_cb_right = d.x + d.w - ib->b[1];
     ib->inline_cb_bottom = d.y + d.h - ib->b[2];
+    int index = (int)(L->decos.n / sizeof d);
+    if (!ib->frag_end) ib->frag_first = index;
+    ib->frag_end = index + 1;
     sb_put(&L->decos, (const char *)&d, sizeof d);
 }
 
@@ -1518,8 +1635,13 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
                 while (n > 0 && it->s[n - 1] == ' ') n--;
             }
             struct run r = {x, baseline - it->shift, w, it->s, n, it->st, it->link, NULL, false,
-                            it->box ? it->box->node : NULL, it->box ? it->box->inline_paint_owner : NULL, -1, it->descent};
-            if (n > 0) sb_put(&L->runs, (const char *)&r, sizeof r);
+                            it->box ? it->box->node : NULL, it->box ? it->box->inline_paint_owner : NULL, -1, it->descent, 0, 0};
+            if (n > 0) {
+                int index = (int)(L->runs.n / sizeof r);
+                if (it->box && !it->box->frag_end) it->box->frag_first = index;
+                if (it->box) it->box->frag_end = index + 1;
+                sb_put(&L->runs, (const char *)&r, sizeof r);
+            }
             x += w;
             if (it->space_end && i != last_text) x += extra_space;
             break;
@@ -1536,7 +1658,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
             c->cb = b;
             c->x = x + c->m[3] + c->b[3] + c->p[3];
             c->y = top + c->m[0] + c->b[0] + c->p[0];
-            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node, c->inline_paint_owner, -1, 0};
+            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node, c->inline_paint_owner, -1, 0, 0, 0};
             sb_put(&L->runs, (const char *)&r, sizeof r);
             x += it->w;
             break;
@@ -1560,7 +1682,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
         if (layout_current()->clamp_depth || b->st->text_overflow == TO_ELLIPSIS) {
             struct line_fragment line = {first_run, (int)(L->runs.n / sizeof(struct run)),
                 first_deco, (int)(L->decos.n / sizeof(struct deco)),
-                L->y, L->y + lh, baseline, L->left, L->right};
+                L->y, L->y + lh, baseline, L->left, L->right, false, 0, 0, 0, 0, 0};
             sb_put(&L->lines, (const char *)&line, sizeof line);
         }
     }
@@ -1791,6 +1913,258 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     b->h = L.y; /* the caller applies height and min/max */
 }
 
+/* ---------------------------------------------------------------- text geometry */
+/* A line layout keeps, for each run, its position and the bytes of its text box's processed
+   text it shows; for each text and inline box, the range of its block's runs or decos that
+   holds its fragments (frag_first, frag_end). box_text_source_map (box.c) gives the bytes of
+   the Text node's data those bytes came from. Together they map a DOM position to a line
+   position and back, for every caller, without walking other nodes' fragments. Readers run
+   between layouts (script, paint, native input), never inside one. */
+void layout_runs_origin(const box_t *b, bool visual, float *x, float *y) {
+    if (!visual) { *x = box_abs_x(b); *y = box_abs_y(b) + b->content_dy; return; }
+    *x = box_visual_x(b); *y = box_visual_y(b) + b->content_dy;
+    if (web_marquee_box(b)) { *x += b->node->marquee_x; *y += b->node->marquee_y; }
+    if (box_element_scrollable(b)) { *x -= (float)b->node->scroll_x; *y -= (float)b->node->scroll_y; }
+}
+void layout_run_extent(const struct run *r, float *top, float *bottom) {
+    wfont f = style_font(r->st);
+    float ascent, descent;
+    wf_metrics(&f, &ascent, &descent);
+    *top = r->y - ascent; *bottom = r->y + descent;
+}
+float layout_run_x(const struct run *r, size_t at) {
+    if (!r->s || r->n <= 0 || !at) return 0;
+    if (at >= (size_t)r->n) return r->w; /* the width the line placed */
+    return style_text_width(r->st, r->s, at);
+}
+size_t layout_text_boundary(const char *s, size_t n, float width, float dx, layout_measure_fn measure, const void *opaque) {
+    if (!s || !n || !(dx > 0)) return 0;
+    size_t at = 0;
+    float x = 0;
+    while (at < n) {
+        size_t next = wf_grapheme_next(s, n, at);
+        if (next <= at || next > n) next = n;
+        float w = next == n && width >= 0 ? width - x : measure(opaque, s, at, next, x);
+        if (dx <= x + w / 2) return at; /* a boundary at the middle is the earlier one */
+        x += w; at = next;
+    }
+    return n;
+}
+static float run_measure(const void *opaque, const char *s, size_t at, size_t next, float x) {
+    (void)x;
+    return style_text_width(opaque, s + at, next - at);
+}
+size_t layout_run_boundary(const struct run *r, float dx) {
+    if (!r->s || r->n <= 0) return 0;
+    return layout_text_boundary(r->s, (size_t)r->n, r->w, dx, run_measure, r->st);
+}
+box_t *layout_inline_root(const box_t *b) {
+    const box_t *p = b ? b->parent : NULL;
+    while (p && p->kind == B_INLINE) p = p->parent;
+    return p && p->inline_ctx ? (box_t *)p : NULL;
+}
+/* r is one of text box t's runs: its node and a part of t's current text. */
+static bool text_run_of(const struct run *r, const box_t *t) {
+    return !r->atomic && r->s && r->node == t->node && r->n > 0 &&
+           r->s >= t->text && (size_t)(r->s - t->text) + (size_t)r->n <= t->len;
+}
+/* The first processed byte whose source byte is at or after byte (map is nondecreasing). */
+static size_t source_lower_bound(const uint32_t *map, size_t length, size_t byte) {
+    size_t low = 0, high = length;
+    while (low < high) { size_t mid = low + (high - low) / 2; if (map[mid] < byte) low = mid + 1; else high = mid; }
+    return low;
+}
+static bool text_checkpoint(const box_t *t, unsigned *work) {
+    return (++*work & 63) || !t->node || !t->node->owner || web_native_checkpoint(t->node->owner);
+}
+bool layout_text_rects(node_t *n, uint32_t start, uint32_t end, bool visual, layout_rect_fn visit, void *opaque) {
+    box_t *t = n && n->type == N_TEXT ? n->box : NULL;
+    if (!t || t->kind != B_TEXT || t->node != n || !t->frag_end) return true;
+    box_t *b = layout_inline_root(t);
+    if (!b || !b->runs) return true;
+    int first = t->frag_first, last = t->frag_end < b->nruns ? t->frag_end : b->nruns;
+    if (first < 0 || first >= last) return true;
+    if (end != UINT32_MAX && start > end) start = end;
+    size_t ps = 0, pe = t->len;
+    unsigned work = 0;
+    if (start || end != UINT32_MAX) {
+        arena_t scratch = {.chunk_size = 4096};
+        jmp_buf trap; scratch.trap = &trap;
+        if (setjmp(trap)) { ar_free(&scratch); return false; }
+        uint32_t *map = box_text_source_map(&scratch, t);
+        if (!map) { ar_free(&scratch); return true; }
+        /* Inside a surrogate pair the whole pair counts (CSSOM View §9). */
+        size_t from = doc_text_byte(n->text, n->textlen, start, false);
+        size_t to = end == UINT32_MAX ? n->textlen : doc_text_byte(n->text, n->textlen, end, true);
+        ps = source_lower_bound(map, t->len, from); pe = source_lower_bound(map, t->len, to);
+        ar_free(&scratch);
+        if (pe < ps) pe = ps;
+        /* So does a whole grapheme cluster, the typographic character unit here. */
+        size_t down = ps, up = pe;
+        for (size_t at = 0; at < t->len && at < pe;) {
+            if (!text_checkpoint(t, &work)) return false;
+            size_t next = wf_grapheme_next(t->text, t->len, at);
+            if (next <= at || next > t->len) next = t->len;
+            if (at < ps && ps < next) down = at;
+            if (at < pe && pe < next) up = next;
+            at = next;
+        }
+        bool collapsed = ps == pe;
+        ps = down; pe = collapsed ? down : up;
+    }
+    float ox, oy;
+    layout_runs_origin(b, visual, &ox, &oy);
+    bool drawn = false;
+    int inside = -1, ending = -1, after = -1, before = -1;
+    for (int i = first; i < last; i++) {
+        if (!text_checkpoint(t, &work)) return false;
+        const struct run *r = &b->runs[i];
+        if (!text_run_of(r, t)) continue;
+        size_t rs = (size_t)(r->s - t->text), re = rs + (size_t)r->n;
+        if (ps < pe) {
+            size_t a = ps > rs ? ps : rs, z = pe < re ? pe : re;
+            if (a < z) {
+                float x0 = layout_run_x(r, a - rs), x1 = layout_run_x(r, z - rs), top, bottom;
+                layout_run_extent(r, &top, &bottom);
+                drawn = true;
+                if (!visit(opaque, b, (double)ox + r->x + x0, (double)oy + top, (double)x1 - x0, (double)bottom - top)) return false;
+                continue;
+            }
+        }
+        if (inside < 0 && rs <= ps && ps < re) inside = i;
+        if (re == ps) ending = i;
+        if (after < 0 && rs > ps) after = i;
+        if (re < ps) before = i;
+    }
+    if (drawn) return true;
+    /* A collapsed point, or a selection none of whose characters are rendered: a zero-width
+       fragment where it lies, at a fragment's start before the end of the one ahead. */
+    int at = inside >= 0 ? inside : ending >= 0 ? ending : after >= 0 ? after : before;
+    if (at < 0) return true;
+    const struct run *r = &b->runs[at];
+    size_t rs = (size_t)(r->s - t->text);
+    float x = at == after ? 0 : at == before ? r->w : layout_run_x(r, ps - rs), top, bottom;
+    layout_run_extent(r, &top, &bottom);
+    return visit(opaque, b, (double)ox + r->x + x, (double)oy + top, 0, (double)bottom - top);
+}
+bool layout_inline_rects(node_t *n, bool visual, layout_rect_fn visit, void *opaque) {
+    box_t *ib = n ? n->box : NULL;
+    if (!ib || ib->kind != B_INLINE || ib->node != n || !ib->frag_end) return true;
+    box_t *a = layout_inline_root(ib);
+    if (!a || !a->decos) return true;
+    int last = ib->frag_end < a->ndecos ? ib->frag_end : a->ndecos;
+    float ox, oy;
+    layout_runs_origin(a, visual, &ox, &oy);
+    const style_t *own = n->style;
+    for (int i = ib->frag_first; i >= 0 && i < last; i++) {
+        const struct deco *span = &a->decos[i];
+        /* The element's ::before/::after inline boxes have decos with its node too. */
+        if (span->node != n || (own && (span->st == own->before || span->st == own->after))) continue;
+        if (!visit(opaque, a, (double)ox + span->x, (double)oy + span->y, span->w, span->h)) return false;
+    }
+    return true;
+}
+static uint32_t child_count(const node_t *n) {
+    uint32_t count = 0;
+    for (const node_t *c = n->first; c; c = c->next) count++;
+    return count;
+}
+bool layout_run_position(const box_t *block, int run, float dx, node_t **node, uint32_t *offset) {
+    if (!block || run < 0 || run >= block->nruns) return false;
+    const struct run *r = &block->runs[run];
+    node_t *n = r->node;
+    if (r->atomic || !n) return false;
+    if (n->type == N_ELEM) {
+        /* Generated content is not in the DOM: the point is at its edge of the element. */
+        const style_t *own = n->style;
+        *node = n; *offset = own && r->st == own->after ? child_count(n) : 0;
+        return true;
+    }
+    box_t *t = n->type == N_TEXT ? n->box : NULL;
+    if (!t || t->kind != B_TEXT || !text_run_of(r, t)) return false;
+    size_t at = (size_t)(r->s - t->text) + layout_run_boundary(r, dx);
+    arena_t scratch = {.chunk_size = 4096};
+    jmp_buf trap; scratch.trap = &trap;
+    if (setjmp(trap)) { ar_free(&scratch); return false; }
+    uint32_t *map = box_text_source_map(&scratch, t);
+    bool ok = map != NULL;
+    if (ok) { *node = n; *offset = doc_text_utf16(n->text, n->textlen, map[at]); }
+    ar_free(&scratch);
+    return ok;
+}
+static float axis_distance(float v, float low, float high) { return v < low ? low - v : v > high ? v - high : 0; }
+/* The DOM position before (or, right of its middle, after) replaced element box a. */
+static bool replaced_position(const box_t *a, float x, node_t **node, uint32_t *offset) {
+    node_t *n = a->node;
+    if (!n) return false;
+    node_t *p = n->parent;
+    if (!p) { *node = n; *offset = 0; return true; }
+    uint32_t index = 0;
+    for (const node_t *c = p->first; c && c != n; c = c->next) index++;
+    float left = box_visual_x(a) - a->p[3] - a->b[3];
+    *node = p; *offset = index + (x > left + (a->w + hext(a)) / 2);
+    return true;
+}
+bool layout_position_at(const box_t *b, float x, float y, node_t **node, uint32_t *offset) {
+    unsigned work = 0;
+    web_doc *d = NULL;
+    for (const box_t *p = b; p && !d; p = p->parent) if (p->node) d = p->node->owner;
+#define POSITION_CHECKPOINT() do { if (!(++work & 63) && d && !web_native_checkpoint(d)) return false; } while (0)
+    while (b) {
+        POSITION_CHECKPOINT();
+        if (b->kind == B_TEXT || b->kind == B_INLINE || b->kind == B_BR) {
+            box_t *root = layout_inline_root(b);
+            if (!root) break;
+            b = root; continue;
+        }
+        if (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) return replaced_position(b, x, node, offset);
+        if (b->inline_ctx && b->nruns) {
+            float ox, oy;
+            layout_runs_origin(b, true, &ox, &oy);
+            int best = -1; float best_dy = INFINITY, best_dx = INFINITY;
+            for (int i = 0; i < b->nruns; i++) {
+                POSITION_CHECKPOINT();
+                const struct run *r = &b->runs[i];
+                float left, top, right, bottom;
+                if (r->atomic) {
+                    const box_t *a = r->atomic;
+                    if (a->clamp_hidden) continue;
+                    left = box_visual_x(a) - a->p[3] - a->b[3]; top = box_visual_y(a) - a->p[0] - a->b[0];
+                    right = left + a->w + hext(a); bottom = top + a->h + vext(a);
+                } else {
+                    if (!r->node || !r->s) continue;
+                    layout_run_extent(r, &top, &bottom);
+                    left = ox + r->x; right = left + r->w; top += oy; bottom += oy;
+                }
+                float dy = axis_distance(y, top, bottom), dx = axis_distance(x, left, right);
+                if (dy < best_dy || (dy == best_dy && dx < best_dx)) { best = i; best_dy = dy; best_dx = dx; }
+            }
+            if (best >= 0) {
+                const struct run *r = &b->runs[best];
+                if (r->atomic) { b = r->atomic; continue; }
+                return layout_run_position(b, best, x - (ox + r->x), node, offset);
+            }
+        }
+        const box_t *pick = NULL; float best_dy = INFINITY, best_dx = INFINITY;
+        for (const box_t *c = b->first; c; c = c->next) {
+            POSITION_CHECKPOINT();
+            /* Text, inline and line-break boxes lie only in an inline formatting context,
+               whose runs hold their fragments. */
+            if (c->clamp_hidden || !c->st || c->st->display == D_NONE || c->kind == B_TEXT ||
+                c->kind == B_BR || c->kind == B_INLINE) continue;
+            float left = box_visual_x(c) - c->p[3] - c->b[3], top = box_visual_y(c) - c->p[0] - c->b[0];
+            float dy = axis_distance(y, top, top + c->h + vext(c)), dx = axis_distance(x, left, left + c->w + hext(c));
+            if (dy < best_dy || (dy == best_dy && dx < best_dx)) { pick = c; best_dy = dy; best_dx = dx; }
+        }
+        if (pick) { b = pick; continue; }
+        break;
+    }
+#undef POSITION_CHECKPOINT
+    /* No fragment below: the start of the nearest node's contents. */
+    for (; b; b = b->parent) if (b->node) { *node = b->node; *offset = 0; return true; }
+    return false;
+}
+
 /* ---------------------------------------------------------------- floats */
 static void size_float(box_t *c, box_t *parent, float cbh) {
     float cw = parent->w;
@@ -1826,14 +2200,14 @@ static void position_float(box_t *c, float cw, struct bfc *f, float ox, float oy
     float y = float_min_y(c, f, oy + y_rel);
     float l = ox, r = ox + cw;
     for (int guard = 0; f && guard < 200; guard++) {
-        bfc_space(f, y, mh, ox, ox + cw, &l, &r);
+        bfc_space(f, y, mh, ox, ox + cw, &l, &r, false);
         if (r - l >= mw - 0.05f || (l <= ox && r >= ox + cw)) break;
         float nb = bfc_next(f, y);
         if (nb < 0) break;
         y = nb;
     }
     float x = c->st->float_ == FL_LEFT ? l : r - mw;
-    if (f) bfc_add(f, x, y, mw, mh, c->st->float_);
+    if (f) bfc_add(f, x, y, mw, mh, c->st->float_, c, fmaxf_(0, len_resolve(&css_style_float_shape(c->st)->margin, cw)));
     c->x = x - ox + c->m[3] + c->b[3] + c->p[3];
     c->y = y - oy + c->m[0] + c->b[0] + c->p[0];
 }
@@ -1854,7 +2228,7 @@ static bool float_fits_line(struct iline *L, box_t *c, float used) {
     float mw = c->w + hext(c) + c->m[1] + c->m[3];
     float mh = c->h + vext(c) + c->m[0] + c->m[2];
     float l, r;
-    bfc_space(L->f, y, fmaxf_(mh, L->strut_lh), L->ox, L->ox + b->w, &l, &r);
+    bfc_space(L->f, y, fmaxf_(mh, L->strut_lh), L->ox, L->ox + b->w, &l, &r, false);
     if (L->first_line) l += len_resolve(&b->st->text_indent, b->w);
     return r - l - mw >= used - 0.01f;
 }
@@ -1972,14 +2346,14 @@ static void layout_blocks(box_t *b, struct bfc *f, float ox, float oy, float cbh
             float bh = c->kind == B_ATOMIC ? c->h + vext(c) : 1;
             float l, r;
             for (int guard = 0; guard < 100; guard++) {
-                bfc_space(f, oy + y, bh, ox, ox + cw, &l, &r);
+                bfc_space(f, oy + y, bh, ox, ox + cw, &l, &r, false);
                 float need = c->kind == B_ATOMIC || !len_auto(&c->st->width) ? c->w + hext(c) + c->m[1] + c->m[3] : 0;
                 if (r - l >= need || need == 0) break;
                 float nb = bfc_next(f, oy + y);
                 if (nb < 0) break;
                 y = nb - oy;
             }
-            bfc_space(f, oy + y, bh, ox, ox + cw, &l, &r);
+            bfc_space(f, oy + y, bh, ox, ox + cw, &l, &r, false);
             l -= ox;
             r -= ox;
             if (l > 0 || r < cw) {
@@ -2521,6 +2895,195 @@ static bool layout_children_parallel(box_t **boxes,int n,float cbh) {
     return true;
 }
 
+/* ---------------------------------------------------------------- gap decorations (css-gaps-1 §3) */
+/* Grid and flex layout describe their gaps here, and one algorithm turns them into the segments
+   paint.c draws (box_t's gap_decorations): §3.1.2's segments, §3.4's visibility, §3.3's insets. A
+   gap runs along its axis (0: a column gap, 1: a row gap) from its start bound to its end bound,
+   between lo and hi across it, in the container's content box (coordinates grow rightwards and
+   downwards). Its cells lie between its bounds: bound k ends cell k - 1 at end_at and starts cell k
+   at start_at, so a gap of n cells has n + 1 bounds, the first and the last at its edges. */
+struct gd_bound {
+    float end_at, start_at;
+    float width;            /* the crossing gap width (§3.3): the junction's size, 0 at a container edge */
+    uint32_t cross, ncross; /* the gaps abutting or crossing it here: gd.cross[cross, cross + ncross) */
+    bool flanked;           /* items on opposing sides span every crossing gap here (§3.1.2) */
+};
+enum { GD_CROSSED = 1, GD_BEFORE = 2, GD_AFTER = 4 }; /* a cell: an item crosses the gap; the areas beside hold items */
+struct gd_gap {
+    float lo, hi;
+    size_t cell, bound, ncell; /* gd.cell[cell, cell + ncell), gd.bound[bound, bound + ncell + 1) */
+    size_t run, nrun;          /* its runs of painted cells: gd.run[run, run + nrun) */
+    uint32_t order;            /* its place among its axis' gaps, the index §4.6 assigns values by */
+    uint8_t axis;
+};
+struct gd_run { size_t k0, k1; }; /* cells k0 to k1: a segment before its insets */
+struct gd {
+    struct gd_gap *gap;
+    uint8_t *cell;
+    struct gd_bound *bound;
+    uint32_t *cross;
+    struct gd_run *run;
+    size_t ngap, ncell, nbound, ncross, nrun;
+    size_t capgap, capcell, capbound, capcross, caprun;
+    uint32_t count[2];                /* the gaps of each axis */
+    uint8_t rule_break[2], visibility[2]; /* the used values, which depend on the container's type */
+};
+static void gd_free(struct gd *g) {
+    free(g->gap); free(g->cell); free(g->bound); free(g->cross); free(g->run);
+}
+static bool gd_room(void **p, size_t *cap, size_t need, size_t size) {
+    if (need <= *cap) return true;
+    size_t c = *cap ? *cap : 16;
+    while (c < need) {
+        if (c > SIZE_MAX / 2 / size) return false;
+        c *= 2;
+    }
+    void *q = realloc(*p, c * size);
+    if (!q) return false;
+    *p = q;
+    *cap = c;
+    return true;
+}
+#define GD_ROOM(g, field, cap, need) gd_room((void **)&(g)->field, &(g)->cap, (need), sizeof *(g)->field)
+/* a gap of ncell (>= 1) cells, whose zeroed cells and bounds the caller fills before adding the next
+   gap; NULL out of memory */
+static struct gd_gap *gd_gap_add(struct gd *g, uint8_t axis, float lo, float hi, size_t ncell) {
+    if (ncell >= SIZE_MAX / 2 || !GD_ROOM(g, gap, capgap, g->ngap + 1) || !GD_ROOM(g, cell, capcell, g->ncell + ncell) ||
+        !GD_ROOM(g, bound, capbound, g->nbound + ncell + 1)) return NULL;
+    struct gd_gap *x = &g->gap[g->ngap++];
+    *x = (struct gd_gap){.lo = lo, .hi = hi, .cell = g->ncell, .bound = g->nbound, .ncell = ncell,
+                         .order = g->count[axis]++, .axis = axis};
+    memset(g->cell + g->ncell, 0, ncell);
+    memset(g->bound + g->nbound, 0, (ncell + 1) * sizeof *g->bound);
+    g->ncell += ncell;
+    g->nbound += ncell + 1;
+    return x;
+}
+/* gap y crosses or abuts bound b of the gap being filled (each bound's gaps added together) */
+static bool gd_cross(struct gd *g, struct gd_bound *b, size_t y) {
+    if (!GD_ROOM(g, cross, capcross, g->ncross + 1)) return false;
+    if (!b->ncross) b->cross = (uint32_t)g->ncross;
+    g->cross[g->ncross++] = (uint32_t)y;
+    b->ncross++;
+    return true;
+}
+static bool gd_shown(uint8_t cell, uint8_t visibility) {
+    if (visibility == CSS_RULE_ITEMS_AROUND) return cell & (GD_BEFORE | GD_AFTER);
+    if (visibility == CSS_RULE_ITEMS_BETWEEN) return (cell & (GD_BEFORE | GD_AFTER)) == (GD_BEFORE | GD_AFTER);
+    return true;
+}
+/* §3.1.2 "determine gap decoration segments" for every gap, as runs of cells. none: one segment
+   from one end of the gap to the other; normal: each stretch no item crosses; intersection: also
+   broken at each junction not flanked by spanning items. A cell §3.4 does not paint ends a run. */
+static bool gd_runs(struct gd *g) {
+    for (size_t i = 0; i < g->ngap; i++) {
+        struct gd_gap *x = &g->gap[i];
+        const uint8_t *cell = g->cell + x->cell;
+        const struct gd_bound *bound = g->bound + x->bound;
+        uint8_t brk = g->rule_break[x->axis], vis = g->visibility[x->axis];
+        x->run = g->nrun;
+        x->nrun = 0;
+        for (size_t k = 0; k < x->ncell; k++) {
+            if (!(k & 1023) && !layout_checkpoint()) return false;
+            if (!gd_shown(cell[k], vis) || (brk != CSS_RULE_BREAK_NONE && (cell[k] & GD_CROSSED))) continue;
+            size_t k1 = k;
+            while (k1 + 1 < x->ncell && gd_shown(cell[k1 + 1], vis) &&
+                   (brk == CSS_RULE_BREAK_NONE ||
+                    (!(cell[k1 + 1] & GD_CROSSED) && (brk != CSS_RULE_BREAK_INTERSECTION || bound[k1 + 1].flanked))))
+                k1++;
+            if (!GD_ROOM(g, run, caprun, g->nrun + 1)) return false;
+            g->run[g->nrun++] = (struct gd_run){k, k1};
+            x->nrun++;
+            k = k1;
+        }
+    }
+    return true;
+}
+/* whether a segment of gap y, before its insets, reaches into [lo, hi] along y */
+static bool gd_present(const struct gd *g, size_t y, float lo, float hi) {
+    const struct gd_gap *x = &g->gap[y];
+    const struct gd_bound *bound = g->bound + x->bound;
+    size_t a = 0, b = x->nrun;
+    while (a < b) { /* the first whose end reaches lo */
+        size_t m = a + (b - a) / 2;
+        if (bound[g->run[x->run + m].k1 + 1].end_at < lo) a = m + 1;
+        else b = m;
+    }
+    return a < x->nrun && bound[g->run[x->run + a].k0].start_at <= hi;
+}
+/* §3.3: how far the endpoint a run makes at bound k of gap x moves into the run (start: the run's
+   start). It is a junction segment endpoint when another segment is present at the junction: the
+   gap's own next one (neighbour) or a crossing gap's. overlap-join reaches into the junction by
+   half its size and half the crossing gap's rule width. */
+static float gd_inset(const struct gd *g, const struct css_gap_rules *rules, const struct gd_gap *x, size_t k, bool start,
+                      bool neighbour) {
+    const struct gd_bound *b = &g->bound[x->bound + k];
+    bool junction = neighbour;
+    for (uint32_t i = 0; i < b->ncross && !junction; i++) junction = gd_present(g, g->cross[b->cross + i], x->lo, x->hi);
+    const struct css_rule_inset *in =
+        &rules->axis[x->axis].inset[junction ? start ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END :
+                                    start ? CSS_RULE_CAP_START : CSS_RULE_CAP_END];
+    if (!in->join) return len_resolve(&in->length, b->width);
+    if (!junction) return 0;
+    const struct css_rule_list *widths = &rules->axis[!x->axis].list[CSS_GAP_WIDTH];
+    float rule = 0;
+    for (uint32_t i = 0; i < b->ncross; i++) {
+        const struct gd_gap *y = &g->gap[g->cross[b->cross + i]];
+        rule = fmaxf_(rule, css_rule_value_at(widths, y->order, g->count[y->axis]).width);
+    }
+    return -(b->width / 2 + rule / 2);
+}
+/* the segments of the gaps g holds, into b's layout memory; g is freed */
+static void gd_finish(box_t *b, struct gd *g) {
+    const struct css_gap_rules *rules = css_style_gap_rules(b->st);
+    struct gap_segment *seg = NULL;
+    size_t n = 0;
+    bool ok = gd_runs(g) && (!g->nrun || (seg = malloc(g->nrun * sizeof *seg)));
+    for (size_t i = 0; ok && i < g->ngap; i++) {
+        const struct gd_gap *x = &g->gap[i];
+        const struct gd_bound *bound = g->bound + x->bound;
+        size_t first = n;
+        for (size_t t = 0; t < x->nrun; t++) {
+            const struct gd_run *r = &g->run[x->run + t];
+            bool before = t > 0 && g->run[x->run + t - 1].k1 + 1 == r->k0;
+            bool after = t + 1 < x->nrun && g->run[x->run + t + 1].k0 == r->k1 + 1;
+            /* positive start insets move towards the end, positive end insets towards the start */
+            float s = bound[r->k0].start_at + gd_inset(g, rules, x, r->k0, true, before);
+            float e = bound[r->k1 + 1].end_at - gd_inset(g, rules, x, r->k1 + 1, false, after);
+            if (!(e > s)) continue;
+            if (n > first && s <= seg[n - 1].e) { /* overlapping segments of one gap paint as one */
+                if (s < seg[n - 1].s) seg[n - 1].s = s;
+                if (e > seg[n - 1].e) seg[n - 1].e = e;
+                continue;
+            }
+            seg[n++] = (struct gap_segment){s, e, (x->lo + x->hi) / 2, x->order, x->axis};
+        }
+    }
+    uint32_t count[2] = {g->count[0], g->count[1]};
+    gd_free(g);
+    if (!ok) {
+        free(seg);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    /* the layout memory's trap would leave seg behind */
+    jmp_buf trap, *previous = b->layout_mem.trap;
+    b->layout_mem.trap = &trap;
+    if (setjmp(trap)) {
+        b->layout_mem.trap = previous;
+        free(seg);
+        ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    struct gap_decorations *out = ar_alloc(&b->layout_mem, sizeof *out);
+    struct gap_segment *kept = n ? ar_alloc(&b->layout_mem, n * sizeof *kept) : NULL;
+    b->layout_mem.trap = previous;
+    if (n) memcpy(kept, seg, n * sizeof *kept);
+    free(seg);
+    *out = (struct gap_decorations){kept, (uint32_t)n, {count[0], count[1]}};
+    b->gap_decorations = out;
+}
+
 /* ---------------------------------------------------------------- flexbox */
 struct fitem {
     box_t *b;
@@ -2532,6 +3095,7 @@ struct fitem {
 struct fline {
     int first, end;
     float cross, ascent, descent;
+    float origin; /* where its cross extent starts (flex_cross_lines) */
 };
 
 /* CSS Flexbox 9.7: clamped items leave the flexible pool, and their unused
@@ -2636,6 +3200,7 @@ static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
     for (int l = 0; l < count; l++) {
         struct fline *line = &lines[l];
         float origin = flip ? available - cursor - line->cross : cursor;
+        line->origin = origin;
         for (int i = line->first; i < line->end; i++) {
             if (!layout_checkpoint()) break;
             layout_media_checkpoint();
@@ -2680,6 +3245,125 @@ static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
     }
     if (!column) b->h = available;
     b->baseline = b->last_baseline = first_bl;
+}
+
+/* css-gaps-1 §2 in a flex container: a gap between adjacent items of a line runs across the line,
+   a gap between adjacent lines from one edge of the container to the other. Values are assigned
+   in placement order, the items' gaps on through the lines (§4.6); normal breaks behave as none,
+   and the visibility properties do not apply. */
+struct gd_span { float lo, hi; uint32_t gap; };
+static int gd_span_order(const void *a, const void *b) {
+    float x = ((const struct gd_span *)a)->lo, y = ((const struct gd_span *)b)->lo;
+    return x < y ? -1 : x > y;
+}
+/* an item's margin box along the main axis */
+static void flex_main_range(const box_t *c, bool column, float *lo, float *hi) {
+    *lo = column ? c->y - c->p[0] - c->b[0] - c->m[0] : c->x - c->p[3] - c->b[3] - c->m[3];
+    *hi = *lo + (column ? c->h + vext(c) + c->m[0] + c->m[2] : c->w + hext(c) + c->m[1] + c->m[3]);
+}
+static size_t flex_line_gaps(const struct fline *line) {
+    return line->end - line->first > 1 ? (size_t)(line->end - line->first - 1) : 0;
+}
+static void flex_gap_decorations(box_t *b, const struct fitem *it, const struct fline *lines, int count, bool column,
+                                 bool reverse) {
+    const struct css_gap_rules *rules = b->st->gap_rules;
+    if (!rules || count <= 0) return;
+    struct gd g = {0};
+    for (int a = 0; a < 2; a++) {
+        g.rule_break[a] = rules->axis[a].rule_break == CSS_RULE_BREAK_NORMAL ? CSS_RULE_BREAK_NONE : rules->axis[a].rule_break;
+        g.visibility[a] = CSS_RULE_ITEMS_ALL;
+    }
+    bool flip = b->st->flex_wrap == FW_WRAP_REVERSE;
+    uint8_t item_axis = column ? 1 : 0;
+    float main_size = column ? b->h : b->w;
+    size_t items_gaps = 0;
+    for (int l = 0; l < count; l++) items_gaps += flex_line_gaps(&lines[l]);
+    /* the gutters between lines, across: line l + 1 follows line l, before it when wrap-reverse */
+    float (*gutter)[2] = count > 1 ? malloc((size_t)(count - 1) * sizeof *gutter) : NULL;
+    /* the items' gaps along the main axis (spans, by gap) and two lines' of them sorted (pair) */
+    struct gd_span *spans = items_gaps ? malloc(items_gaps * sizeof *spans) : NULL;
+    struct gd_span *pair = items_gaps ? malloc(items_gaps * sizeof *pair) : NULL;
+    bool ok = (count < 2 || gutter) && (!items_gaps || (spans && pair));
+    for (int l = 0; ok && l + 1 < count; l++) {
+        float e0 = lines[l].origin, e1 = e0 + lines[l].cross, f0 = lines[l + 1].origin, f1 = f0 + lines[l + 1].cross;
+        float lo = flip ? f1 : e1, hi = flip ? e0 : f0;
+        if (hi < lo) lo = hi = (lo + hi) / 2;
+        gutter[l][0] = lo;
+        gutter[l][1] = hi;
+    }
+    /* the gaps between items, line by line in placement order (gap ids 0 .. items_gaps - 1) */
+    for (int l = 0; ok && l < count; l++) {
+        const struct fline *line = &lines[l];
+        /* the gaps between lines on the line's near (top or left) and far side */
+        int near = flip ? (l + 1 < count ? l : -1) : l - 1, far = flip ? l - 1 : (l + 1 < count ? l : -1);
+        for (int i = line->first; ok && i + 1 < line->end; i++) {
+            if (!(i & 1023) && !layout_checkpoint()) { ok = false; break; }
+            float a0, a1, b0, b1;
+            flex_main_range(it[i].b, column, &a0, &a1);
+            flex_main_range(it[i + 1].b, column, &b0, &b1);
+            float lo = reverse ? b1 : a1, hi = reverse ? a0 : b0;
+            if (hi < lo) lo = hi = (lo + hi) / 2;
+            struct gd_gap *x = gd_gap_add(&g, item_axis, lo, hi, 1);
+            if (!x) { ok = false; break; }
+            g.cell[x->cell] = GD_BEFORE | GD_AFTER;
+            struct gd_bound *bound = g.bound + x->bound;
+            bound[0].start_at = line->origin;
+            bound[1].end_at = line->origin + line->cross;
+            /* where a gap between lines abuts it, its bound is a junction as wide as that gap */
+            if (near >= 0) {
+                bound[0].width = gutter[near][1] - gutter[near][0];
+                ok = gd_cross(&g, &bound[0], items_gaps + (size_t)near);
+            }
+            if (ok && far >= 0) {
+                bound[1].width = gutter[far][1] - gutter[far][0];
+                ok = gd_cross(&g, &bound[1], items_gaps + (size_t)far);
+            }
+            spans[g.ngap - 1] = (struct gd_span){lo, hi, (uint32_t)(g.ngap - 1)};
+        }
+    }
+    /* the gaps between lines (ids from items_gaps): the items' gaps of the lines on either side abut
+       it, those that overlap or touch making one junction */
+    size_t first = 0;
+    for (int l = 0; ok && l + 1 < count; l++) {
+        size_t here = flex_line_gaps(&lines[l]), ns = here + flex_line_gaps(&lines[l + 1]);
+        if (ns) {
+            memcpy(pair, spans + first, ns * sizeof *pair);
+            qsort(pair, ns, sizeof *pair, gd_span_order);
+        }
+        first += here;
+        size_t junctions = 0;
+        for (size_t i = 0; i < ns; junctions++) {
+            float hi = pair[i].hi;
+            for (i++; i < ns && pair[i].lo <= hi; i++) hi = fmaxf_(hi, pair[i].hi);
+        }
+        struct gd_gap *x = gd_gap_add(&g, (uint8_t)!item_axis, gutter[l][0], gutter[l][1], junctions + 1);
+        if (!x) { ok = false; break; }
+        memset(g.cell + x->cell, GD_BEFORE | GD_AFTER, junctions + 1);
+        struct gd_bound *bound = g.bound + x->bound;
+        bound[0].start_at = 0;
+        bound[junctions + 1].end_at = main_size;
+        for (size_t i = 0, j = 1; ok && i < ns; j++) {
+            struct gd_bound *at = &bound[j];
+            float hi = pair[i].hi;
+            at->end_at = pair[i].lo;
+            ok = gd_cross(&g, at, pair[i].gap);
+            for (i++; ok && i < ns && pair[i].lo <= hi; i++) {
+                hi = fmaxf_(hi, pair[i].hi);
+                ok = gd_cross(&g, at, pair[i].gap);
+            }
+            at->start_at = hi;
+            at->width = hi - at->end_at;
+        }
+    }
+    free(gutter);
+    free(spans);
+    free(pair);
+    if (!ok) {
+        gd_free(&g);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    gd_finish(b, &g);
 }
 
 static void layout_flex(box_t *b, float defh) {
@@ -2803,6 +3487,7 @@ static void layout_flex(box_t *b, float defh) {
         }
         b->h = defh >= 0 ? defh : content_height;
         flex_cross_lines(b, it, lines, line_count, true, single, defh, gap_cross);
+        flex_gap_decorations(b, it, lines, line_count, true, reverse);
         free(lines); free(it);
         return;
     }
@@ -2912,6 +3597,7 @@ static void layout_flex(box_t *b, float defh) {
         i0 = i1;
     }
     flex_cross_lines(b, it, lines, line_count, false, single, defh, gap_cross);
+    flex_gap_decorations(b, it, lines, line_count, false, reverse);
     free(lines); free(it);
 }
 
@@ -3436,6 +4122,98 @@ static void grid_intrinsic(box_t *b, float *mn, float *mx) {
     gr_free(&g);
 }
 
+/* css-gaps-1 §2 in a grid: the gutters between adjacent tracks that are not collapsed (§4.6 counts
+   a run of collapsed gutters as one gap), each running along all the tracks of the other axis with
+   a junction at every gutter crossing it. Which areas hold items comes from the placed items. */
+static void grid_gap_decorations(box_t *b, const struct grid *gr) {
+    const struct css_gap_rules *rules = b->st->gap_rules;
+    if (!rules) return;
+    struct gd g = {0};
+    for (int a = 0; a < 2; a++) {
+        g.rule_break[a] = rules->axis[a].rule_break;
+        g.visibility[a] = rules->axis[a].visibility == CSS_RULE_ITEMS_NORMAL ? CSS_RULE_ITEMS_ALL : rules->axis[a].visibility;
+    }
+    /* the tracks that are not collapsed (rows, then columns), and each track's index among them */
+    size_t nr = (size_t)(gr->nr > 0 ? gr->nr : 0), nc = (size_t)(gr->nc > 0 ? gr->nc : 0);
+    int *track = malloc((nr + nc) * 2 * sizeof *track + 1);
+    if (!track) { ar_alloc(layout_scratch(), SIZE_MAX); return; }
+    int *rows = track, *cols = track + nr, *row_at = track + nr + nc, *col_at = row_at + nr;
+    size_t vr = 0, vc = 0;
+    for (size_t i = 0; i < nr; i++) { row_at[i] = gr->row[i].collapsed ? -1 : (int)vr; if (!gr->row[i].collapsed) rows[vr++] = (int)i; }
+    for (size_t i = 0; i < nc; i++) { col_at[i] = gr->col[i].collapsed ? -1 : (int)vc; if (!gr->col[i].collapsed) cols[vc++] = (int)i; }
+    if (!vr || !vc || (vr < 2 && vc < 2)) { free(track); return; }
+    /* the item (index + 1) each area holds; an area two items share is the first one's */
+    uint32_t *area = vr > SIZE_MAX / sizeof *area / vc ? NULL : calloc(vr * vc, sizeof *area);
+    bool ok = area != NULL;
+    for (int i = 0; ok && i < gr->n; i++) {
+        if (!(i & 255) && !layout_checkpoint()) { ok = false; break; }
+        const struct gitem *t = &gr->it[i];
+        for (int r = t->r0; r < t->r1 && r < (int)nr; r++) {
+            if (r < 0 || row_at[r] < 0) continue;
+            for (int c = t->c0; c < t->c1 && c < (int)nc; c++)
+                if (c >= 0 && col_at[c] >= 0 && !area[(size_t)row_at[r] * vc + (size_t)col_at[c]])
+                    area[(size_t)row_at[r] * vc + (size_t)col_at[c]] = (uint32_t)i + 1;
+        }
+    }
+#define AREA(r, c) area[(size_t)(r) * vc + (size_t)(c)]
+    size_t column_gaps = vc - 1;
+    /* column gaps (ids 0 .. vc - 2), along the rows; the row gaps (ids from vc - 1) cross them */
+    for (size_t k = 0; ok && k + 1 < vc; k++) {
+        const struct gtr *left = &gr->col[cols[k]], *right = &gr->col[cols[k + 1]];
+        struct gd_gap *x = gd_gap_add(&g, 0, left->pos + left->size, right->pos, vr);
+        if (!x) { ok = false; break; }
+        uint8_t *cell = g.cell + x->cell;
+        struct gd_bound *bound = g.bound + x->bound;
+        for (size_t j = 0; j < vr; j++) {
+            uint32_t l = AREA(j, k), r = AREA(j, k + 1);
+            cell[j] = (l && l == r ? GD_CROSSED : 0) | (l ? GD_BEFORE : 0) | (r ? GD_AFTER : 0);
+        }
+        bound[0].start_at = gr->row[rows[0]].pos;
+        bound[vr].end_at = gr->row[rows[vr - 1]].pos + gr->row[rows[vr - 1]].size;
+        for (size_t j = 1; ok && j < vr; j++) {
+            const struct gtr *above = &gr->row[rows[j - 1]];
+            bound[j].end_at = above->pos + above->size;
+            bound[j].start_at = gr->row[rows[j]].pos;
+            bound[j].width = fmaxf_(0, bound[j].start_at - bound[j].end_at);
+            uint32_t l0 = AREA(j - 1, k), l1 = AREA(j, k), r0 = AREA(j - 1, k + 1), r1 = AREA(j, k + 1);
+            bound[j].flanked = l0 && l0 == l1 && r0 && r0 == r1;
+            ok = gd_cross(&g, &bound[j], column_gaps + j - 1);
+        }
+    }
+    /* row gaps, along the columns; the column gaps cross them */
+    for (size_t j = 0; ok && j + 1 < vr; j++) {
+        const struct gtr *above = &gr->row[rows[j]], *below = &gr->row[rows[j + 1]];
+        struct gd_gap *x = gd_gap_add(&g, 1, above->pos + above->size, below->pos, vc);
+        if (!x) { ok = false; break; }
+        uint8_t *cell = g.cell + x->cell;
+        struct gd_bound *bound = g.bound + x->bound;
+        for (size_t k = 0; k < vc; k++) {
+            uint32_t a = AREA(j, k), c = AREA(j + 1, k);
+            cell[k] = (a && a == c ? GD_CROSSED : 0) | (a ? GD_BEFORE : 0) | (c ? GD_AFTER : 0);
+        }
+        bound[0].start_at = gr->col[cols[0]].pos;
+        bound[vc].end_at = gr->col[cols[vc - 1]].pos + gr->col[cols[vc - 1]].size;
+        for (size_t k = 1; ok && k < vc; k++) {
+            const struct gtr *left = &gr->col[cols[k - 1]];
+            bound[k].end_at = left->pos + left->size;
+            bound[k].start_at = gr->col[cols[k]].pos;
+            bound[k].width = fmaxf_(0, bound[k].start_at - bound[k].end_at);
+            uint32_t a0 = AREA(j, k - 1), a1 = AREA(j, k), c0 = AREA(j + 1, k - 1), c1 = AREA(j + 1, k);
+            bound[k].flanked = a0 && a0 == a1 && c0 && c0 == c1;
+            ok = gd_cross(&g, &bound[k], k - 1);
+        }
+    }
+#undef AREA
+    free(area);
+    free(track);
+    if (!ok) {
+        gd_free(&g);
+        if (!__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE)) ar_alloc(layout_scratch(), SIZE_MAX);
+        return;
+    }
+    gd_finish(b, &g);
+}
+
 static void layout_grid(box_t *b, float defh) {
     const style_t *st = b->st;
     float cw = b->w;
@@ -3543,6 +4321,7 @@ static void layout_grid(box_t *b, float defh) {
     }
     b->h = defh >= 0 ? defh : rows_h;
     b->baseline = b->last_baseline = first_bl;
+    grid_gap_decorations(b, &g);
     gr_free(&g);
 }
 
@@ -3926,7 +4705,7 @@ static void clamp_apply(box_t *root) {
     struct run *runs = ar_alloc(&b->layout_mem, ((size_t)end + 1) * sizeof *runs);
     if (end) memcpy(runs, b->runs, (size_t)end * sizeof *runs);
     runs[end] = (struct run){x, line->baseline, ellipsis_width, clamp_ellipsis,
-        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL, NULL, -1, 0};
+        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL, NULL, -1, 0, 0, 0};
     float ellipsis_ascent;
     wf_metrics(&font, &ellipsis_ascent, &runs[end].descent);
     b->layout_mem.trap = previous_trap;
@@ -3996,6 +4775,7 @@ static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float
     }
     ar_free(&b->layout_mem);
     b->decos=NULL;b->ndecos=0; /* including early-return frameset layout */
+    b->gap_decorations = NULL;
     b->layout_mem.chunk_size = 4096;
     b->layout_mem.trap = layout_scratch()->trap;
     b->clamp_trace = NULL;
@@ -4466,8 +5246,17 @@ static void scroll_area_publish(box_t *b) {
        x(b)-x(cb) = b.x+b.rel_dx; y(b)-y(cb) additionally has cb.content_dy.
        Do not walk that same ancestor chain four times for every box. Local
        coordinates also avoid losing small offsets beside a huge ancestor. */
-    float right = b->x + b->rel_dx - b->p[3] + bw + b->b[1] + b->m[1] + cb->p[3] + cb->p[1];
-    float bottom = b->y + b->rel_dy + cb->content_dy - b->p[0] + bh + b->b[2] + b->m[2] + cb->p[0] + cb->p[2];
+    /* "Scrollable overflow area" (CSS Overflow 3): b's border box with the overflow it carries,
+       and b's margin box followed by cb's end-side padding. A negative margin shrinks only the
+       second; a border box of zero area adds nothing of its own. */
+    float box_right = b->x + b->rel_dx - b->p[3] + bw + b->b[1] + cb->p[3];
+    float box_bottom = b->y + b->rel_dy + cb->content_dy - b->p[0] + bh + b->b[2] + cb->p[0];
+    float right = box_right + b->m[1] + cb->p[1];
+    float bottom = box_bottom + b->m[2] + cb->p[2];
+    if (bw + b->b[1] + b->b[3] > 0 && bh + b->b[0] + b->b[2] > 0) {
+        right = fmaxf_(right, box_right);
+        bottom = fmaxf_(bottom, box_bottom);
+    }
     /* CSS transforms extend, never shrink, the union of original and visual
        overflow. Descendant overflow has already propagated into b; add only
        b's own translation here, not its ancestors a second time. */

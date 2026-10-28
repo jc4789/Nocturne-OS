@@ -20,17 +20,19 @@ static struct web_url_parser *realm_parser(JSContext *ctx, JSValueConst holder) 
 
 static JSValue record(JSContext *ctx, int result, struct web_url *url) {
     if (result != 1) {
-        sb_free(&url->href);
+        web_url_free(url);
         return result < 0 ? JS_ThrowOutOfMemory(ctx) : JS_NULL;
     }
-    JSValue href = JS_NewStringLen(ctx, url->href.p ? url->href.p : "", url->href.n);
-    sb_free(&url->href);
+    JSValue href = JS_NewStringLen(ctx, url->href ? url->href : "", url->length);
+    size_t mark[WEB_URL_MARKS];
+    memcpy(mark, url->mark, sizeof mark);
+    web_url_free(url);
     if (JS_IsException(href)) return href;
     JSValue array = JS_NewArray(ctx);
     if (JS_IsException(array)) { JS_FreeValue(ctx, href); return array; }
     if (JS_DefinePropertyValueUint32(ctx, array, 0, href, JS_PROP_C_W_E) < 0) goto failed;
     for (int i = 0; i < WEB_URL_MARKS; i++)
-        if (JS_DefinePropertyValueUint32(ctx, array, (uint32_t)i + 1, JS_NewInt32(ctx, (int32_t)url->mark[i]),
+        if (JS_DefinePropertyValueUint32(ctx, array, (uint32_t)i + 1, JS_NewInt32(ctx, (int32_t)mark[i]),
                                          JS_PROP_C_W_E) < 0) goto failed;
     return array;
 failed:
@@ -38,10 +40,25 @@ failed:
     return JS_EXCEPTION;
 }
 
+/* An encoding's name for the query (HTML's encoding-parse passes its
+   document's character encoding), or undefined for UTF-8. */
+static bool encoding_argument(JSContext *ctx, int argc, JSValueConst *argv, int at, web_encoding *encoding) {
+    *encoding = WEB_ENCODING_UTF8;
+    if (argc <= at || JS_IsUndefined(argv[at])) return true;
+    size_t length;
+    const char *name = JS_ToCStringLen(ctx, &length, argv[at]);
+    if (!name) return false;
+    web_encoding found = web_encoding_get(name, length);
+    JS_FreeCString(ctx, name);
+    if (found) *encoding = found;
+    return true;
+}
+
 static JSValue native_parse(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv, int magic, JSValue *data) {
-    (void)self; (void)argc; (void)magic;
+    (void)self; (void)magic;
     struct web_url_parser *parser = realm_parser(ctx, data[0]);
-    if (!parser) return JS_EXCEPTION;
+    web_encoding encoding;
+    if (!parser || !encoding_argument(ctx, argc, argv, 2, &encoding)) return JS_EXCEPTION;
     size_t length, base_length = 0;
     const char *input = JS_ToCStringLen(ctx, &length, argv[0]), *base = NULL;
     if (!input) return JS_EXCEPTION;
@@ -50,17 +67,19 @@ static JSValue native_parse(JSContext *ctx, JSValueConst self, int argc, JSValue
         return JS_EXCEPTION;
     }
     struct web_url url = {0};
-    int result = web_url_parse(parser, input, length, base, base_length, &url);
+    int result = web_url_parse(parser, input, length, base, base_length, encoding, &url);
     JS_FreeCString(ctx, input);
     JS_FreeCString(ctx, base);
     return record(ctx, result, &url);
 }
 
 static JSValue native_set(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv, int magic, JSValue *data) {
-    (void)self; (void)argc; (void)magic;
+    (void)self; (void)magic;
     struct web_url_parser *parser = realm_parser(ctx, data[0]);
     int32_t part;
-    if (!parser || JS_ToInt32(ctx, &part, argv[1]) < 0) return JS_EXCEPTION;
+    web_encoding encoding;
+    if (!parser || JS_ToInt32(ctx, &part, argv[1]) < 0 || !encoding_argument(ctx, argc, argv, 3, &encoding))
+        return JS_EXCEPTION;
     if (part < WEB_URL_PROTOCOL || part > WEB_URL_HASH) return JS_ThrowRangeError(ctx, "Unknown URL part");
     size_t href_length, length;
     const char *href = JS_ToCStringLen(ctx, &href_length, argv[0]);
@@ -70,7 +89,7 @@ static JSValue native_set(JSContext *ctx, JSValueConst self, int argc, JSValueCo
         return JS_EXCEPTION;
     }
     struct web_url url = {0};
-    int result = web_url_set(parser, href, href_length, (enum web_url_part)part, value, length, &url);
+    int result = web_url_set(parser, href, href_length, (enum web_url_part)part, value, length, encoding, &url);
     JS_FreeCString(ctx, href);
     JS_FreeCString(ctx, value);
     return record(ctx, result, &url);
@@ -137,8 +156,8 @@ void web_js_url_init(JSContext *ctx, JSValue host) {
     }
     JSValue holder = JS_NewObjectClass(ctx, (int)parser_class);
     if (JS_IsException(holder)) return;
-    JS_SetPropertyStr(ctx, host, "urlParse", JS_NewCFunctionData(ctx, native_parse, 2, 0, 1, &holder));
-    JS_SetPropertyStr(ctx, host, "urlSet", JS_NewCFunctionData(ctx, native_set, 3, 0, 1, &holder));
+    JS_SetPropertyStr(ctx, host, "urlParse", JS_NewCFunctionData(ctx, native_parse, 3, 0, 1, &holder));
+    JS_SetPropertyStr(ctx, host, "urlSet", JS_NewCFunctionData(ctx, native_set, 4, 0, 1, &holder));
     JS_FreeValue(ctx, holder);
     JS_SetPropertyFunctionList(ctx, host, functions, sizeof functions / sizeof *functions);
 }

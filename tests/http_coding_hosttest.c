@@ -1,7 +1,9 @@
 /* Feed the product content-coding decoders across every byte/bit boundary on the host:
      http_coding_hosttest "<Content-Encoding value>" [chunk] < coded > decoded
    A list this decoder leaves alone (Fetch: the codings are not supported) is copied as it is.
-   Built with user/libc/third_party_brotli.c and third_party/brotli/c/{common,dec}. */
+     http_coding_hosttest --filtered "<Content-Encoding value>"
+   prints Fetch's filtered coding of that value (response body info's content encoding).
+   Built with user/libc/deflate.c, user/libc/third_party_brotli.c and third_party/brotli/c. */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,6 +12,8 @@
 #include <strings.h>
 #include <fcntl.h>
 #include <io.h>
+#include "../user/include/http.h" /* HTTP_CONTENT_ENCODING_MAX; its struct http_resp is not used */
+#define http_resp http_coding_resp
 struct http_resp { char error[256]; };
 struct sink { struct http_resp *rs; struct http_coding *coding; size_t codings; };
 static bool sink_plain_put(struct sink *sink,const char *bytes,size_t n){
@@ -19,6 +23,11 @@ static bool sink_plain_put(struct sink *sink,const char *bytes,size_t n){
 int main(int argc,char **argv){
     _setmode(_fileno(stdin),_O_BINARY);_setmode(_fileno(stdout),_O_BINARY);
     if(argc<2)return 2;
+    if(!strcmp(argv[1],"--filtered")){
+        char filtered[HTTP_CONTENT_ENCODING_MAX];
+        coding_filtered(argc>2?argv[2]:NULL,filtered);
+        printf("%s\n",filtered);return 0;
+    }
     size_t chunk=argc>2?(size_t)atoi(argv[2]):1;if(!chunk||chunk>8192)return 2;
     struct http_resp response={0};struct sink sink={&response,NULL,0};
     int made=coding_create(&sink,argv[1]);if(made<0){coding_free(&sink);return 2;}

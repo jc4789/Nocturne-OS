@@ -14,7 +14,7 @@ int main(void){
     nodes[2].text=".inline {width:1px}";nodes[9].text=".shadow{}";nodes[12].text=".template{}";nodes[15].text=".second{}";
     for(int i=0;i<NODE_COUNT;i++)if(nodes[i].text)nodes[i].textlen=strlen(nodes[i].text);
     docs[0].root=&nodes[0];docs[1].root=&nodes[13];docs[0].url="https://parent.test/page";docs[1].url="about:blank";docs[1].inherited_url="https://parent.test/page";
-    for(int i=0;i<2;i++){docs[i].live=true;docs[i].dom_revision=1;strcpy(docs[i].base,"https://parent.test/page");}
+    for(int i=0;i<2;i++){docs[i].live=true;docs[i].dom_revision=1;doc_set_base(&docs[i],"https://parent.test/page");}
     child(0,1);child(1,2);child(0,3);child(0,4);child(0,5);child(0,6);child(7,8);child(8,9);child(0,10);child(10,11);child(11,12);child(0,14);child(14,15);child(0,16);child(0,17);
     attr(3,"rel","stylesheet");attr(3,"href","/a.css");attr(4,"rel","stylesheet");attr(4,"href","/pending.css");
     attr(5,"rel","stylesheet");attr(5,"href","https://cross.test/x.css");attr(16,"rel","stylesheet");attr(16,"href","data:text/css,.data%7Bcolor:blue%7D");

@@ -2,11 +2,11 @@
    keywords), shorthand expansion, and the user agent stylesheet. */
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
 #include <stddef.h>
 #include <ctype.h>
 #include "webi.h"
 #include "inspect_private.h"
-#include "svg_geometry.h"
 
 /* ---------------------------------------------------------------- small parsing helpers */
 static void trim(const char **s, size_t *n) {
@@ -220,305 +220,8 @@ static bool parse_filter(const char *v, size_t n, struct cx *cx, const struct cs
     return true;
 }
 
-/* ---------------------------------------------------------------- lengths and calc() */
-struct cexpr {
-    char op; /* 'v' value, + - * /, 'm' min, 'M' max */
-    bool num;
-    float px, pct;
-    struct cexpr *a, *b;
-};
-static bool expression_equal(const struct cexpr *a,const struct cexpr *b){
-    struct expression_pair {const struct cexpr *a,*b;} local[32],*pending=local;
-    size_t count=0,capacity=32;bool equal=true;
-    for(;;){
-        if(a!=b){
-            if(!a||!b||a->op!=b->op||(a->op=='v'&&(a->num!=b->num||a->px!=b->px||a->pct!=b->pct))){equal=false;break;}
-            if(a->b!=b->b){
-                if(count==capacity){size_t n=capacity*2;
-                    if(n<capacity||n>SIZE_MAX/sizeof *pending){equal=false;break;}
-                    struct expression_pair *v=malloc(n*sizeof *v);if(!v){equal=false;break;}
-                    memcpy(v,pending,count*sizeof *v);if(pending!=local)free(pending);pending=v;capacity=n;
-                }
-                pending[count++]=(struct expression_pair){a->b,b->b};
-            }
-            a=a->a;b=b->a;continue;
-        }
-        if(!count)break;struct expression_pair p=pending[--count];a=p.a;b=p.b;
-    }
-    if(pending!=local)free(pending);return equal;
-}
-bool css_length_equal(const len_t *a,const len_t *b){
-    return a==b||(a&&b&&a->kind==b->kind&&a->px==b->px&&a->pct==b->pct&&expression_equal(a->expr,b->expr));
-}
-
-enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
-
-/* a dimension: number + unit; false if the unit is unknown */
-static bool unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num) {
-    *px = *pct = 0;
-    *num = false;
-    if (!un) {
-        *px = v;
-        *num = true;
-        return true;
-    }
-    if (un == 1 && u[0] == '%') {
-        *pct = v;
-        return true;
-    }
-    char b[8];
-    if (un >= sizeof b) return false;
-    for (size_t i = 0; i < un; i++) b[i] = (char)lower((unsigned char)u[i]);
-    b[un] = 0;
-    float em = cx->em;
-    static const struct {
-        const char *u;
-        int kind; /* 0 absolute, 1 em, 2 rem, 3..6 viewport, 7..10 container */
-        float f;
-    } units[] = {
-        {"px", 0, 1},     {"em", 1, 1},     {"rem", 2, 1},    {"ex", 1, 0.5f}, {"ch", 1, 0.6f},
-        {"lh", 1, 1.2f},  {"rlh", 2, 1.2f}, {"cap", 1, 0.7f}, {"ic", 1, 1},    {"vw", 3, 1},
-        {"vh", 4, 1},     {"svw", 3, 1},    {"svh", 4, 1},    {"lvw", 3, 1},   {"lvh", 4, 1},
-        {"dvw", 3, 1},    {"dvh", 4, 1},    {"cqw", 7, 1},    {"cqh", 8, 1},   {"vi", 3, 1},
-        {"vb", 4, 1},     {"vmin", 5, 1},   {"vmax", 6, 1},   {"cqmin", 9, 1}, {"cqmax", 10, 1},
-        {"cqi", 7, 1},    {"cqb", 8, 1},
-        {"pt", 0, 4.0f / 3}, {"pc", 0, 16}, {"in", 0, 96},    {"cm", 0, 96 / 2.54f}, {"mm", 0, 96 / 25.4f},
-        {"q", 0, 96 / 101.6f},
-    };
-    for (size_t i = 0; i < sizeof units / sizeof *units; i++) {
-        if (strcmp(units[i].u, b)) continue;
-        float f = units[i].f;
-        switch (units[i].kind) {
-        case 0: *px = v * f; break;
-        case 1: *px = v * f * em; break;
-        case 2: *px = v * f * cx->rem; break;
-        case 3: *px = v * f * cx->vw / 100; break;
-        case 4: *px = v * f * cx->vh / 100; break;
-        case 5: *px = v * f * (cx->vw < cx->vh ? cx->vw : cx->vh) / 100; break;
-        case 6: *px = v * f * (cx->vw > cx->vh ? cx->vw : cx->vh) / 100; break;
-        case 7: *px = v * f * (cx->cq_width_set ? cx->cq_width : cx->vw) / 100; break;
-        case 8: *px = v * f * (cx->cq_height_set ? cx->cq_height : cx->vh) / 100; break;
-        case 9: {
-            float w=cx->cq_width_set?cx->cq_width:cx->vw,h=cx->cq_height_set?cx->cq_height:cx->vh;
-            *px=v*f*(w<h?w:h)/100;break;
-        }
-        case 10: {
-            float w=cx->cq_width_set?cx->cq_width:cx->vw,h=cx->cq_height_set?cx->cq_height:cx->vh;
-            *px=v*f*(w>h?w:h)/100;break;
-        }
-        }
-        return true;
-    }
-    return false;
-}
-
-static struct cexpr *calc_sum(const char **s, const char *e, struct cx *cx);
-
-static void cskip(const char **s, const char *e) {
-    while (*s < e && is_space((unsigned char)**s)) (*s)++;
-}
-
-static struct cexpr *cnode(struct cx *cx, char op, struct cexpr *a, struct cexpr *b) {
-    if (cx->supports_probe && ++cx->supports_nodes > 512) cx->invalid = true;
-    struct cexpr *x = ar_alloc(cx->a, sizeof *x);
-    x->op = op;
-    x->a = a;
-    x->b = b;
-    return x;
-}
-
-/* the arguments of min(), max() or clamp() up to the closing parenthesis */
-static struct cexpr *calc_args(const char **s, const char *e, struct cx *cx, char op, bool clamp) {
-    struct cexpr *result = NULL, *first = NULL, *second = NULL;
-    /* min/max accept an author-sized list. Keep only clamp's grammatical
-       arity, not an arbitrary fixed argument array or quota. Arena OOM is
-       handled by the same allocation trap as the expression nodes. */
-    unsigned clamp_count = 0;
-    for (;;) {
-        cskip(s, e);
-        struct cexpr *x = calc_sum(s, e, cx);
-        if (!x) return NULL;
-        if (clamp) {
-            if (clamp_count == 3) return NULL;
-            if (clamp_count == 0) first = x;
-            else if (clamp_count == 1) second = x;
-            else result = cnode(cx, 'M', first, cnode(cx, 'm', second, x));
-            clamp_count++;
-        } else result = result ? cnode(cx, op, result, x) : x;
-        cskip(s, e);
-        if (*s < e && **s == ',') {
-            (*s)++;
-            continue;
-        }
-        if (*s < e && **s == ')') {
-            (*s)++;
-            break;
-        }
-        return NULL;
-    }
-    if (clamp && clamp_count != 3) return NULL;
-    return result;
-}
-
-static struct cexpr *calc_value(const char **s, const char *e, struct cx *cx) {
-    cskip(s, e);
-    if (*s >= e) return NULL;
-    if (**s == '(') {
-        (*s)++;
-        struct cexpr *x = calc_sum(s, e, cx);
-        cskip(s, e);
-        if (!x || *s >= e || **s != ')') return NULL;
-        (*s)++;
-        return x;
-    }
-    const char *st = *s;
-    while (*s < e && (isalpha((unsigned char)**s) || **s == '-') && !(**s == '-' && *s + 1 < e && isdigit((unsigned char)(*s)[1])))
-        (*s)++;
-    if (*s > st && *s < e && **s == '(') {
-        size_t fl = (size_t)(*s - st);
-        (*s)++;
-        if (ident_is(st, fl, "calc") || ident_is(st, fl, "-webkit-calc")) {
-            struct cexpr *x = calc_sum(s, e, cx);
-            cskip(s, e);
-            if (!x || *s >= e || **s != ')') return NULL;
-            (*s)++;
-            return x;
-        }
-        if (ident_is(st, fl, "min")) return calc_args(s, e, cx, 'm', false);
-        if (ident_is(st, fl, "max")) return calc_args(s, e, cx, 'M', false);
-        if (ident_is(st, fl, "clamp")) return calc_args(s, e, cx, 0, true);
-        return NULL;
-    }
-    *s = st;
-    float v;
-    if (!parse_number(s, e, &v)) return NULL;
-    const char *u = *s;
-    while (*s < e && (isalpha((unsigned char)**s) || **s == '%')) (*s)++;
-    struct cexpr *x = cnode(cx, 'v', NULL, NULL);
-    if (!unit_px(u, (size_t)(*s - u), v, cx, &x->px, &x->pct, &x->num)) return NULL;
-    return x;
-}
-
-static struct cexpr *calc_product(const char **s, const char *e, struct cx *cx) {
-    struct cexpr *x = calc_value(s, e, cx);
-    for (;;) {
-        if (!x) return NULL;
-        const char *before_space = *s;
-        cskip(s, e);
-        if (*s < e && (**s == '*' || **s == '/')) {
-            char op = *(*s)++;
-            x = cnode(cx, op, x, calc_value(s, e, cx));
-            if (!x->b) return NULL;
-        } else { *s = before_space; return x; }
-    }
-}
-
-static struct cexpr *calc_sum(const char **s, const char *e, struct cx *cx) {
-    struct cexpr *x = calc_product(s, e, cx);
-    for (;;) {
-        if (!x) return NULL;
-        const char *before_space = *s;
-        cskip(s, e);
-        if (*s < e && (**s == '+' || **s == '-')) {
-            /* CSS calc-sum requires whitespace on both sides. Product does
-               not consume that whitespace when it returns its final value. */
-            if (*s == before_space || *s + 1 == e || !is_space((unsigned char)(*s)[1])) return NULL;
-            char op = *(*s)++;
-            x = cnode(cx, op, x, calc_product(s, e, cx));
-            if (!x->b) return NULL;
-        } else return x;
-    }
-}
-
-/* fold to px + pct% when possible */
-static bool cfold(const struct cexpr *x, bool *num, float *px, float *pct) {
-    if (x->op == 'v') {
-        *num = x->num;
-        *px = x->px;
-        *pct = x->pct;
-        return true;
-    }
-    bool an, bn;
-    float apx, apc, bpx, bpc;
-    if (!cfold(x->a, &an, &apx, &apc) || !cfold(x->b, &bn, &bpx, &bpc)) return false;
-    switch (x->op) {
-    case '+': case '-': {
-        float sg = x->op == '-' ? -1 : 1;
-        if (an != bn) return false;
-        *num = an;
-        *px = apx + sg * bpx;
-        *pct = apc + sg * bpc;
-        return true;
-    }
-    case '*':
-        if (an) {
-            *num = bn;
-            *px = apx * bpx;
-            *pct = apx * bpc;
-            return true;
-        }
-        if (bn) {
-            *num = false;
-            *px = apx * bpx;
-            *pct = apc * bpx;
-            return true;
-        }
-        return false;
-    case '/':
-        if (!bn || bpx == 0) return false;
-        *num = an;
-        *px = apx / bpx;
-        *pct = apc / bpx;
-        return true;
-    case 'm': case 'M':
-        if (an != bn || apc != 0 || bpc != 0) return false;
-        *num = an;
-        *pct = 0;
-        *px = x->op == 'm' ? (apx < bpx ? apx : bpx) : (apx > bpx ? apx : bpx);
-        return true;
-    }
-    return false;
-}
-
-static float ceval(const struct cexpr *x, float base) {
-    switch (x->op) {
-    case 'v': return x->px + x->pct * base / 100;
-    case '+': return ceval(x->a, base) + ceval(x->b, base);
-    case '-': return ceval(x->a, base) - ceval(x->b, base);
-    case '*': return ceval(x->a, base) * ceval(x->b, base);
-    case '/': {
-        float d = ceval(x->b, base);
-        return d ? ceval(x->a, base) / d : 0;
-    }
-    case 'm': {
-        float a = ceval(x->a, base), b = ceval(x->b, base);
-        return a < b ? a : b;
-    }
-    case 'M': {
-        float a = ceval(x->a, base), b = ceval(x->b, base);
-        return a > b ? a : b;
-    }
-    }
-    return 0;
-}
-
-/* lengths are kept within +-LEN_MAX px, so that sums of them stay finite and fit an int */
-#define LEN_MAX 1e7f
-static float len_clamp(float v) { return v != v ? 0 : v > LEN_MAX ? LEN_MAX : v < -LEN_MAX ? -LEN_MAX : v; }
-
-float len_resolve(const len_t *l, float base) {
-    switch (l->kind) {
-    case LK_LEN: return len_clamp(l->px + (l->pct ? l->pct * base / 100 : 0));
-    case LK_NUMBER: return len_clamp(l->px);
-    case LK_EXPR: return len_clamp(ceval(l->expr, base));
-    }
-    return 0;
-}
-
-/* CSSOM must preserve unresolved percentages and comparison expressions,
-   not turn opaque calculation nodes into a fabricated zero. Keep this next
-   to the native calculation representation; callers never mirror cexpr.
-   Unlike the general sb_put API, this author-readable path reports OOM. */
+/* ---------------------------------------------------------------- lengths and numbers (cssmath.c owns the math) */
+/* Unlike the general sb_put API, the author-readable paths report OOM. */
 static bool length_append(sbuf *out, const char *text, size_t length) {
     if (out->n == SIZE_MAX || length > SIZE_MAX - out->n - 1) return false;
     size_t need = out->n + length + 1;
@@ -549,12 +252,8 @@ bool css_shadow_serialize(const struct css_box_shadow *shadow, sbuf *out, web_do
     size_t count = 0;
     for (; shadow && success; shadow = shadow->next, count++) {
         if (!(count & 63) && d && !web_native_checkpoint(d)) { success = false; break; }
-        char color[96]; unsigned a = shadow->color >> 24;
-        int n = a == 255 ? snprintf(color, sizeof color, "rgb(%u, %u, %u) ", (shadow->color >> 16) & 255,
-            (shadow->color >> 8) & 255, shadow->color & 255) : snprintf(color, sizeof color, "rgba(%u, %u, %u, %.9g) ",
-            (shadow->color >> 16) & 255, (shadow->color >> 8) & 255, shadow->color & 255, (double)a / 255);
-        success = n > 0 && (size_t)n < sizeof color && (!count || length_append(out, ", ", 2)) &&
-            length_append(out, color, (size_t)n) &&
+        success = (!count || length_append(out, ", ", 2)) &&
+            css_color_value_text(shadow->color_value, shadow->color, out) && length_append(out, " ", 1) &&
             length_number(out, shadow->x, "px") && length_append(out, " ", 1) && length_number(out, shadow->y, "px") &&
             length_append(out, " ", 1) && length_number(out, shadow->blur, "px") && length_append(out, " ", 1) &&
             length_number(out, shadow->spread, "px") && (!shadow->inset || length_append(out, " inset", 6));
@@ -582,105 +281,8 @@ bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d
     }
     return success;
 }
-static bool length_coefficients(sbuf *out, float px, float pct, bool number) {
-    if (!isfinite(px) || !isfinite(pct)) return false;
-    if (number) return pct == 0 && length_number(out, px, "");
-    if (pct == 0) return length_number(out, px, "px");
-    if (px == 0) return length_number(out, pct, "%");
-    /* css-values-4 §10.13 sorts a sum's terms: the percentage before the dimensions. */
-    return length_append(out, "calc(", 5) && length_number(out, pct, "%") &&
-        length_append(out, px < 0 ? " - " : " + ", 3) && length_number(out, fabsf(px), "px") &&
-        length_append(out, ")", 1);
-}
-struct length_frame { const struct cexpr *node; unsigned phase; };
-static bool length_expression(sbuf *out, const struct cexpr *expression, web_doc *d) {
-    struct length_frame local[32], *stack = local;
-    size_t capacity = sizeof local / sizeof local[0], count = 1;
-    local[0] = (struct length_frame){expression, 0};
-    bool success = false;
-    unsigned work = 0;
-    while (count) {
-        struct length_frame *frame = &stack[count - 1];
-        const struct cexpr *x = frame->node, *child = NULL;
-        if (!x) goto done;
-        if (frame->phase == 0 && d && !(++work & 63) && !web_native_checkpoint(d)) goto done;
-        if (x->op == 'v') {
-            if (!length_coefficients(out, x->px, x->pct, x->num)) goto done;
-            count--; continue;
-        }
-        bool comparison = x->op == 'm' || x->op == 'M';
-        if (!comparison && x->op != '+' && x->op != '-' && x->op != '*' && x->op != '/') goto done;
-        if (!x->a || !x->b) goto done;
-        if (frame->phase == 0) {
-            const char *open = comparison ? (x->op == 'm' ? "min(" : "max(") : count == 1 ? "calc(" : "(";
-            if (!length_append(out, open, strlen(open))) goto done;
-            frame->phase = 1; child = x->a;
-        } else if (frame->phase == 1) {
-            char op[3] = {' ', x->op, ' '};
-            if (!length_append(out, comparison ? ", " : op, comparison ? 2 : sizeof op)) goto done;
-            frame->phase = 2; child = x->b;
-        } else {
-            if (!length_append(out, ")", 1)) goto done;
-            count--; continue;
-        }
-        if (count == capacity) {
-            if (capacity > SIZE_MAX / 2 / sizeof *stack) goto done;
-            size_t next = capacity * 2;
-            struct length_frame *grown = stack == local ? malloc(next * sizeof *stack) : realloc(stack, next * sizeof *stack);
-            if (!grown) goto done;
-            if (stack == local) memcpy(grown, local, count * sizeof *stack);
-            stack = grown; capacity = next;
-        }
-        stack[count++] = (struct length_frame){child, 0};
-    }
-    success = true;
-done:
-    if (stack != local) free(stack);
-    return success;
-}
-bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d) {
-    if (!l || !out || out->n > out->cap || (!out->p && (out->n || out->cap))) return false;
-    size_t begin = out->n;
-    bool success = false;
-    switch (l->kind) {
-    case LK_AUTO: success = length_append(out, "auto", 4); break;
-    case LK_NONE: success = length_append(out, "none", 4); break;
-    case LK_NORMAL: success = length_append(out, "normal", 6); break;
-    case LK_NUMBER: success = length_coefficients(out, l->px, l->pct, true); break;
-    case LK_LEN: success = length_coefficients(out, l->px, l->pct, false); break;
-    case LK_EXPR: success = length_expression(out, l->expr, d); break;
-    }
-    if (!success) {
-        out->n = begin;
-        if (out->p && begin < out->cap) out->p[begin] = 0;
-    }
-    return success;
-}
-
-static bool calc_dimension(const struct cexpr *x,bool *number){
-    if(!x)return false;if(x->op=='v'){*number=x->num;return true;}
-    bool a,b;if(!calc_dimension(x->a,&a)||!calc_dimension(x->b,&b))return false;
-    if(x->op=='*'){if(!a&&!b)return false;*number=a&&b;return true;}
-    if(x->op=='/'){if(!b)return false;*number=a;return true;}
-    if(a!=b)return false;*number=a;return true;
-}
-/* Media feature lengths have no percentage basis or property range clamp.
-   Share the actual CSS arithmetic grammar/type checker instead of using a
-   permissive strtod prefix or rewriting calc() in the media-query parser. */
-bool css_query_length(const char *text, size_t length, float em, float rem, float vw, float vh, double *value) {
-    if (!text || !value || memchr(text, '%', length)) return false;
-    arena_t *arena = calloc(1, sizeof *arena); if (!arena) return false;
-    jmp_buf trap; arena->trap = &trap;
-    if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
-    struct cx context = {.a = arena, .em = em, .rem = rem, .vw = vw, .vh = vh};
-    const char *cursor = text, *end = text + length;
-    struct cexpr *expression = calc_value(&cursor, end, &context); cskip(&cursor, end);
-    bool number; float px, percentage; bool success = expression && cursor == end &&
-        calc_dimension(expression, &number) && !number && cfold(expression, &number, &px, &percentage) &&
-        !number && percentage == 0 && isfinite(px);
-    if (success) *value = px;
-    ar_free(arena); free(arena); return success;
-}
+/* a math function's infinity is the largest value a float field keeps (CSS Values 4 §10.12) */
+static float calc_float(double v) { return v != v ? 0 : v > FLT_MAX ? FLT_MAX : v < -FLT_MAX ? -FLT_MAX : (float)v; }
 static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int flags) {
     trim(&s, &n);
     if (!n) return false;
@@ -721,32 +323,30 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
             out->kind = LK_AUTO;
             return true;
         }
-        const char *p = s;
-        struct cexpr *x = calc_value(&p, s + n, cx);
-        cskip(&p, s + n);
-        if (!x || p != s + n || (cx->supports_probe && cx->invalid)) return false;
-        if(flags&LF_LENGTH){bool number;if(!calc_dimension(x,&number)||number)return false;}
-        bool num;
-        float px, pct;
-        if (cfold(x, &num, &px, &pct)) {
-            if ((flags & LF_NOPCT) && pct) return false;
-            if (!(flags & LF_NEG) && pct == 0 && px < 0) px = 0; /* calc() clamps to the range */
-            out->kind = LK_LEN;
-            out->px = px;
-            out->pct = pct;
-            return true;
-        }
-        out->kind = LK_EXPR;
-        out->expr = x;
-        return true;
+        /* a math function of type <length> (or <length-percentage>): computed, range-clamped */
+        struct css_calc_parse P = {.a = cx->a, .cx = cx};
+        struct css_calc *c = css_calc_read(&P, CSS_CALC_LENGTH | (flags & LF_NOPCT ? 0 : CSS_CALC_PERCENT), s, n, NULL);
+        return c && css_length_from_calc(c, flags & LF_NEG, out);
     }
     const char *p = s;
     float v;
     if (!parse_number(&p, s + n, &v)) return false;
-    bool num;
-    if (!unit_px(p, (size_t)(s + n - p), v, cx, &out->px, &out->pct, &num)) return false;
-    if((flags&LF_LENGTH)&&num&&v!=0)return false;
-    if ((flags & LF_NOPCT) && out->pct) return false;
+    int unit = css_unit_find(p, (size_t)(s + n - p));
+    switch (css_unit_kind(unit)) {
+    case CSS_CALC_NUMBER:
+        if ((flags & LF_LENGTH) && v != 0) return false;
+        out->px = v;
+        break;
+    case CSS_CALC_PERCENT:
+        if ((flags & LF_NOPCT) || cx->absolute_lengths) return false;
+        out->pct = v;
+        break;
+    case CSS_CALC_LENGTH:
+        if (cx->absolute_lengths && css_unit_relative(unit)) return false;
+        out->px = (float)css_unit_canonical(unit, v, cx);
+        break;
+    default: return false;
+    }
     if (!(flags & LF_NEG) && v < 0) return false;
     out->kind = LK_LEN;
     return true;
@@ -758,271 +358,19 @@ static bool parse_number_value(const char *v, size_t n, struct cx *cx, float *ou
     trim(&v, &n);
     const char *q = v;
     if (parse_number(&q, v + n, out)) return q == v + n;
-    if (!n || !isalpha((unsigned char)v[0])) return false;
-    struct cexpr *x = calc_value(&q, v + n, cx);
-    cskip(&q, v + n);
-    bool number;
-    float pct;
-    return x && q == v + n && !(cx->supports_probe && cx->invalid) && calc_dimension(x, &number) && number &&
-           cfold(x, &number, out, &pct) && number && isfinite(*out);
-}
-
-/* ---------------------------------------------------------------- colours */
-static const struct {
-    const char *name;
-    uint32_t rgb;
-} named[] = {
-    {"aliceblue", 0xF0F8FF}, {"antiquewhite", 0xFAEBD7}, {"aqua", 0x00FFFF}, {"aquamarine", 0x7FFFD4},
-    {"azure", 0xF0FFFF}, {"beige", 0xF5F5DC}, {"bisque", 0xFFE4C4}, {"black", 0x000000},
-    {"blanchedalmond", 0xFFEBCD}, {"blue", 0x0000FF}, {"blueviolet", 0x8A2BE2}, {"brown", 0xA52A2A},
-    {"burlywood", 0xDEB887}, {"buttonface", 0xEFEFEF}, {"buttontext", 0x000000}, {"cadetblue", 0x5F9EA0},
-    {"canvas", 0xFFFFFF}, {"canvastext", 0x000000}, {"chartreuse", 0x7FFF00}, {"chocolate", 0xD2691E},
-    {"coral", 0xFF7F50}, {"cornflowerblue", 0x6495ED}, {"cornsilk", 0xFFF8DC}, {"crimson", 0xDC143C},
-    {"cyan", 0x00FFFF}, {"darkblue", 0x00008B}, {"darkcyan", 0x008B8B}, {"darkgoldenrod", 0xB8860B},
-    {"darkgray", 0xA9A9A9}, {"darkgreen", 0x006400}, {"darkgrey", 0xA9A9A9}, {"darkkhaki", 0xBDB76B},
-    {"darkmagenta", 0x8B008B}, {"darkolivegreen", 0x556B2F}, {"darkorange", 0xFF8C00}, {"darkorchid", 0x9932CC},
-    {"darkred", 0x8B0000}, {"darksalmon", 0xE9967A}, {"darkseagreen", 0x8FBC8F}, {"darkslateblue", 0x483D8B},
-    {"darkslategray", 0x2F4F4F}, {"darkslategrey", 0x2F4F4F}, {"darkturquoise", 0x00CED1}, {"darkviolet", 0x9400D3},
-    {"deeppink", 0xFF1493}, {"deepskyblue", 0x00BFFF}, {"dimgray", 0x696969}, {"dimgrey", 0x696969},
-    {"dodgerblue", 0x1E90FF}, {"field", 0xFFFFFF}, {"fieldtext", 0x000000}, {"firebrick", 0xB22222},
-    {"floralwhite", 0xFFFAF0}, {"forestgreen", 0x228B22}, {"fuchsia", 0xFF00FF}, {"gainsboro", 0xDCDCDC},
-    {"ghostwhite", 0xF8F8FF}, {"gold", 0xFFD700}, {"goldenrod", 0xDAA520}, {"gray", 0x808080},
-    {"graytext", 0x808080}, {"green", 0x008000}, {"greenyellow", 0xADFF2F}, {"grey", 0x808080},
-    {"highlight", 0x3390FF}, {"highlighttext", 0xFFFFFF}, {"honeydew", 0xF0FFF0}, {"hotpink", 0xFF69B4},
-    {"indianred", 0xCD5C5C}, {"indigo", 0x4B0082}, {"ivory", 0xFFFFF0}, {"khaki", 0xF0E68C},
-    {"lavender", 0xE6E6FA}, {"lavenderblush", 0xFFF0F5}, {"lawngreen", 0x7CFC00}, {"lemonchiffon", 0xFFFACD},
-    {"lightblue", 0xADD8E6}, {"lightcoral", 0xF08080}, {"lightcyan", 0xE0FFFF}, {"lightgoldenrodyellow", 0xFAFAD2},
-    {"lightgray", 0xD3D3D3}, {"lightgreen", 0x90EE90}, {"lightgrey", 0xD3D3D3}, {"lightpink", 0xFFB6C1},
-    {"lightsalmon", 0xFFA07A}, {"lightseagreen", 0x20B2AA}, {"lightskyblue", 0x87CEFA}, {"lightslategray", 0x778899},
-    {"lightslategrey", 0x778899}, {"lightsteelblue", 0xB0C4DE}, {"lightyellow", 0xFFFFE0}, {"lime", 0x00FF00},
-    {"limegreen", 0x32CD32}, {"linen", 0xFAF0E6}, {"linktext", 0x0000EE}, {"magenta", 0xFF00FF},
-    {"maroon", 0x800000}, {"mediumaquamarine", 0x66CDAA}, {"mediumblue", 0x0000CD}, {"mediumorchid", 0xBA55D3},
-    {"mediumpurple", 0x9370DB}, {"mediumseagreen", 0x3CB371}, {"mediumslateblue", 0x7B68EE},
-    {"mediumspringgreen", 0x00FA9A}, {"mediumturquoise", 0x48D1CC}, {"mediumvioletred", 0xC71585},
-    {"midnightblue", 0x191970}, {"mintcream", 0xF5FFFA}, {"mistyrose", 0xFFE4E1}, {"moccasin", 0xFFE4B5},
-    {"navajowhite", 0xFFDEAD}, {"navy", 0x000080}, {"oldlace", 0xFDF5E6}, {"olive", 0x808000},
-    {"olivedrab", 0x6B8E23}, {"orange", 0xFFA500}, {"orangered", 0xFF4500}, {"orchid", 0xDA70D6},
-    {"palegoldenrod", 0xEEE8AA}, {"palegreen", 0x98FB98}, {"paleturquoise", 0xAFEEEE}, {"palevioletred", 0xDB7093},
-    {"papayawhip", 0xFFEFD5}, {"peachpuff", 0xFFDAB9}, {"peru", 0xCD853F}, {"pink", 0xFFC0CB},
-    {"plum", 0xDDA0DD}, {"powderblue", 0xB0E0E6}, {"purple", 0x800080}, {"rebeccapurple", 0x663399},
-    {"red", 0xFF0000}, {"rosybrown", 0xBC8F8F}, {"royalblue", 0x4169E1}, {"saddlebrown", 0x8B4513},
-    {"salmon", 0xFA8072}, {"sandybrown", 0xF4A460}, {"seagreen", 0x2E8B57}, {"seashell", 0xFFF5EE},
-    {"sienna", 0xA0522D}, {"silver", 0xC0C0C0}, {"skyblue", 0x87CEEB}, {"slateblue", 0x6A5ACD},
-    {"slategray", 0x708090}, {"slategrey", 0x708090}, {"snow", 0xFFFAFA}, {"springgreen", 0x00FF7F},
-    {"steelblue", 0x4682B4}, {"tan", 0xD2B48C}, {"teal", 0x008080}, {"thistle", 0xD8BFD8},
-    {"tomato", 0xFF6347}, {"turquoise", 0x40E0D0}, {"violet", 0xEE82EE}, {"wheat", 0xF5DEB3},
-    {"white", 0xFFFFFF}, {"whitesmoke", 0xF5F5F5}, {"window", 0xFFFFFF}, {"windowtext", 0x000000},
-    {"yellow", 0xFFFF00}, {"yellowgreen", 0x9ACD32},
-};
-
-static int hexd(int c) {
-    c |= 32;
-    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-}
-
-static uint8_t clamp255(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)(v + 0.5f); }
-
-/* a colour component: a number scaled by full (for 100%), or 'none' */
-static bool comp(const char *s, size_t n, float full, float *out) {
-    if (ident_is(s, n, "none")) {
-        *out = 0;
-        return true;
-    }
-    const char *p = s;
-    float v;
-    if (!parse_number(&p, s + n, &v)) return false;
-    size_t un = (size_t)(s + n - p);
-    if (un == 1 && *p == '%') v = v * full / 100;
-    else if (un) {
-        /* angles */
-        if (ident_is(p, un, "deg")) {
-        } else if (ident_is(p, un, "turn")) v *= 360;
-        else if (ident_is(p, un, "rad")) v = v * 180 / (float)M_PI;
-        else if (ident_is(p, un, "grad")) v *= 0.9f;
-        else return false;
-    }
-    *out = v;
+    double x;
+    if (!css_calc_is_math(v, n) || !css_numeric_read(v, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &x, NULL)) return false;
+    *out = calc_float(x);
     return true;
 }
+/* The value grammar for the value owners outside this file (shape.c). */
+bool css_parse_length(const char *s, size_t n, struct cx *cx, len_t *out, int flags) { return parse_len(s, n, cx, out, flags); }
+bool css_number_token(const char **s, const char *end, float *out) { return parse_number(s, end, out); }
 
-static float hue2rgb(float p, float q, float t) {
-    if (t < 0) t += 1;
-    if (t > 1) t -= 1;
-    if (t < 1.0f / 6) return p + (q - p) * 6 * t;
-    if (t < 0.5f) return q;
-    if (t < 2.0f / 3) return p + (q - p) * (2.0f / 3 - t) * 6;
-    return p;
-}
-
-static float srgb_gamma(float x) {
-    if (x <= 0.0031308f) return 12.92f * x;
-    return 1.055f * (float)pow(x, 1 / 2.4) - 0.055f;
-}
-
-static bool css_color_impl(const char *s, size_t n, uint32_t *out, bool strict, int depth) {
-    if (depth > 32) return false;
-    trim(&s, &n);
-    if (!n) return false;
-    if (s[0] == '#') {
-        int d[8];
-        size_t k = n - 1;
-        if (k != 3 && k != 4 && k != 6 && k != 8) return false;
-        for (size_t i = 0; i < k; i++)
-            if ((d[i] = hexd((unsigned char)s[1 + i])) < 0) return false;
-        uint32_t r, g, b, a = 255;
-        if (k <= 4) {
-            r = (uint32_t)d[0] * 17, g = (uint32_t)d[1] * 17, b = (uint32_t)d[2] * 17;
-            if (k == 4) a = (uint32_t)d[3] * 17;
-        } else {
-            r = (uint32_t)(d[0] * 16 + d[1]), g = (uint32_t)(d[2] * 16 + d[3]), b = (uint32_t)(d[4] * 16 + d[5]);
-            if (k == 8) a = (uint32_t)(d[6] * 16 + d[7]);
-        }
-        *out = ARGB(a, r, g, b);
-        return true;
-    }
-    if (s[n - 1] == ')') {
-        size_t fl = 0;
-        while (fl < n && s[fl] != '(') fl++;
-        if (fl == n) return false;
-        const char *args = s + fl + 1;
-        size_t an = n - fl - 2;
-        if (ident_is(s, fl, "light-dark")) {
-            if (strict) return false; /* current engine always picks the light branch */
-            const char *t[2];
-            size_t tl[2];
-            if (split(args, an, t, tl, 2, ',') < 1) return false;
-            return css_color_impl(t[0], tl[0], out, strict, depth + 1);
-        }
-        if (ident_is(s, fl, "color-mix")) {
-            const char *t[3];
-            size_t tl[3];
-            if (split(args, an, t, tl, 3, ',') != 3) return false;
-            if (strict) {
-                const char *end = t[2] + tl[2];
-                while (end < args + an && is_space((unsigned char)*end)) end++;
-                if (end != args + an || !ident_is(t[0],tl[0],"in srgb")) return false;
-            }
-            uint32_t c[2];
-            float p[2] = {-1, -1};
-            for (int i = 0; i < 2; i++) {
-                const char *u[2];
-                size_t ul[2];
-                int k = split(t[i + 1], tl[i + 1], u, ul, 2, ' ');
-                int ci = 0;
-                if (k == 2 && u[0][ul[0] - 1] == '%') ci = 1;
-                if (!k || !css_color_impl(u[ci], ul[ci], &c[i], strict, depth + 1)) return false;
-                if (k == 2) {
-                    const char *q = u[1 - ci];
-                    if (!parse_number(&q, u[1 - ci] + ul[1 - ci], &p[i])) return false;
-                }
-            }
-            if (p[0] < 0 && p[1] < 0) p[0] = p[1] = 50;
-            else if (p[0] < 0) p[0] = 100 - p[1];
-            else if (p[1] < 0) p[1] = 100 - p[0];
-            float tot = p[0] + p[1];
-            if (tot <= 0) return false;
-            float w = p[1] / tot;
-            float ch[4];
-            for (int k = 0; k < 4; k++) {
-                float a = (float)(c[0] >> (24 - 8 * k) & 255), b = (float)(c[1] >> (24 - 8 * k) & 255);
-                ch[k] = a + (b - a) * w;
-            }
-            float alpha = ch[0] * (tot < 100 ? tot / 100 : 1);
-            *out = ARGB(clamp255(alpha), clamp255(ch[1]), clamp255(ch[2]), clamp255(ch[3]));
-            return true;
-        }
-        /* rgb(), hsl(), oklch(), oklab(): components separated by commas or spaces, alpha after / */
-        char buf[256];
-        if (an >= sizeof buf) return false;
-        for (size_t i = 0; i < an; i++) buf[i] = args[i] == ',' || args[i] == '/' ? ' ' : args[i];
-        const char *t[4];
-        size_t tl[4];
-        int k = split(buf, an, t, tl, 4, ' ');
-        if (k < 3) return false;
-        if (strict) {
-            const char *end = t[k - 1] + tl[k - 1];
-            while (end < buf + an && is_space((unsigned char)*end)) end++;
-            if (end != buf + an) return false;
-            bool commas = memchr(args, ',', an) != NULL;
-            const char *slash = memchr(args, '/', an);
-            if (commas && slash) return false;
-            if (!commas && k == 4 && !slash) return false;
-            if (slash && memchr(slash + 1, '/', (size_t)(args + an - slash - 1))) return false;
-            if (commas) {
-                const char *parts[5]; size_t lengths[5];
-                int count = split(args,an,parts,lengths,5,',');
-                if (count != k) return false;
-                for (int i=0;i<count;i++) if (!lengths[i]) return false;
-            }
-        }
-        float alpha = 1;
-        if (k == 4 && !comp(t[3], tl[3], 1, &alpha)) return false;
-        float c0, c1, c2;
-        if (ident_is(s, fl, "rgb") || ident_is(s, fl, "rgba")) {
-            if (!comp(t[0], tl[0], 255, &c0) || !comp(t[1], tl[1], 255, &c1) || !comp(t[2], tl[2], 255, &c2))
-                return false;
-        } else if (ident_is(s, fl, "hsl") || ident_is(s, fl, "hsla")) {
-            float h, sat, l;
-            if (!comp(t[0], tl[0], 360, &h) || !comp(t[1], tl[1], 100, &sat) || !comp(t[2], tl[2], 100, &l))
-                return false;
-            h = (float)fmod(h, 360) / 360;
-            if (h < 0) h += 1;
-            sat /= 100, l /= 100;
-            float q = l < 0.5f ? l * (1 + sat) : l + sat - l * sat, p = 2 * l - q;
-            c0 = hue2rgb(p, q, h + 1.0f / 3) * 255;
-            c1 = hue2rgb(p, q, h) * 255;
-            c2 = hue2rgb(p, q, h - 1.0f / 3) * 255;
-        } else if (ident_is(s, fl, "oklch") || ident_is(s, fl, "oklab")) {
-            float L, a, b;
-            bool lch = ident_is(s, fl, "oklch");
-            if (!comp(t[0], tl[0], 1, &L)) return false;
-            if (lch) {
-                float C, H;
-                if (!comp(t[1], tl[1], 0.4f, &C) || !comp(t[2], tl[2], 360, &H)) return false;
-                a = C * cosf(H * (float)M_PI / 180);
-                b = C * sinf(H * (float)M_PI / 180);
-            } else if (!comp(t[1], tl[1], 0.4f, &a) || !comp(t[2], tl[2], 0.4f, &b)) return false;
-            float l_ = L + 0.3963377774f * a + 0.2158037573f * b;
-            float m_ = L - 0.1055613458f * a - 0.0638541728f * b;
-            float s_ = L - 0.0894841775f * a - 1.2914855480f * b;
-            float l3 = l_ * l_ * l_, m3 = m_ * m_ * m_, s3 = s_ * s_ * s_;
-            c0 = srgb_gamma(4.0767416621f * l3 - 3.3077115913f * m3 + 0.2309699292f * s3) * 255;
-            c1 = srgb_gamma(-1.2684380046f * l3 + 2.6097574011f * m3 - 0.3413193965f * s3) * 255;
-            c2 = srgb_gamma(-0.0041960863f * l3 - 0.7034186147f * m3 + 1.7076147010f * s3) * 255;
-        } else return false;
-        *out = ARGB(clamp255(alpha * 255), clamp255(c0), clamp255(c1), clamp255(c2));
-        return true;
-    }
-    if (ident_is(s, n, "transparent")) {
-        *out = 0;
-        return true;
-    }
-    if (ident_is(s, n, "currentcolor")) {
-        *out = COLOR_CURRENT;
-        return true;
-    }
-    int lo = 0, hi = (int)(sizeof named / sizeof *named) - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        const char *nm = named[mid].name;
-        int c = 0;
-        size_t i = 0;
-        for (; i < n && nm[i]; i++)
-            if ((c = lower((unsigned char)s[i]) - nm[i])) break;
-        if (!c) c = i < n ? 1 : nm[i] ? -1 : 0;
-        if (!c) {
-            *out = 0xFF000000u | named[mid].rgb;
-            return true;
-        }
-        if (c < 0) hi = mid - 1;
-        else lo = mid + 1;
-    }
-    return false;
-}
-
-bool css_color(const char *s, size_t n, uint32_t *out) { return css_color_impl(s,n,out,false,0); }
+/* ---------------------------------------------------------------- colours (color.c owns them) */
+/* a <color> for a property that keeps only the 8-bit used value (COLOR_CURRENT for currentcolor) */
 static bool css_color_checked(const char *s, size_t n, uint32_t *out, struct cx *cx) {
-    return css_color_impl(s,n,out,cx->supports_probe,0);
+    return css_color_value_compute(s, n, cx, NULL, out, NULL);
 }
 
 /* ---------------------------------------------------------------- the property table */
@@ -1064,10 +412,12 @@ static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, c
         int color_token = -1, length_tokens[4];
         for (int i = 0; i < count; i++) {
             uint32_t candidate;
+            const struct css_color_value *exact;
             if (ident_is(tokens[i], sizes[i], "inset")) {
                 if (inset) return false; inset = shadow.inset = true; lengths_closed |= lengths != 0;
-            } else if (css_color_checked(tokens[i], sizes[i], &candidate, cx)) {
-                if (color) return false; color = true; shadow.color = candidate; color_token=i; lengths_closed |= lengths != 0;
+            } else if (css_color_value_compute(tokens[i], sizes[i], cx, NULL, &candidate, &exact)) {
+                if (color) return false; color = true; shadow.color = candidate; shadow.color_value = exact;
+                color_token=i; lengths_closed |= lengths != 0;
             } else {
                 if (lengths_closed || lengths == 4 || memchr(tokens[i], '%', sizes[i])) return false;
                 len_t dimension;
@@ -1080,7 +430,7 @@ static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, c
         if (lengths < 2) return false;
         if (specified) {
             if (first && !length_append(specified,", ",2)) return false;
-            if (color_token >= 0 && (!length_append(specified,tokens[color_token],sizes[color_token]) ||
+            if (color_token >= 0 && (!css_color_specified(tokens[color_token],sizes[color_token],specified) ||
                 !length_append(specified," ",1))) return false;
             for (unsigned i=0;i<lengths;i++) {
                 int token=length_tokens[i];
@@ -1134,75 +484,6 @@ bool css_radius_serialize(const style_t *style,int corner,sbuf *out,web_doc *doc
     } else ok=radius_lengths_serialize(lengths,out,doc);
     if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}return ok;
 }
-/* A CSS string's contents (CSSOM §6.6.2 "serialize a string"), without the quotes */
-static bool string_escaped(sbuf *out,const char *s) {
-    for(;*s;s++) {
-        unsigned char c=(unsigned char)*s;char escape[16];
-        if(c<0x20||c==0x7f){int n=snprintf(escape,sizeof escape,"\\%x ",c);if(!length_append(out,escape,(size_t)n))return false;}
-        else if(c=='"'||c=='\\'){escape[0]='\\';escape[1]=(char)c;if(!length_append(out,escape,2))return false;}
-        else if(!length_append(out,(const char *)s,1))return false;
-    }
-    return true;
-}
-static bool clip_side_zero_percent(const struct css_clip_path *c,int side) {
-    const len_t *l=&c->inset[side];
-    return l->kind==LK_LEN&&l->px==0&&l->pct==0&&(c->inset_percent>>side&1);
-}
-static bool clip_sides_equal(const struct css_clip_path *c,int a,int b) {
-    return css_length_equal(&c->inset[a],&c->inset[b])&&clip_side_zero_percent(c,a)==clip_side_zero_percent(c,b);
-}
-static const char *const clip_boxes[]={"border-box","padding-box","content-box","margin-box","fill-box","stroke-box","view-box"};
-bool css_clip_path_serialize(const struct css_clip_path *c,sbuf *out,web_doc *d) {
-    size_t original=out->n;bool ok=true;
-    if(!c)ok=length_append(out,"none",4);
-    else switch(c->shape) {
-    case CLIP_SHAPE_URL: ok=length_append(out,"url(\"",5)&&string_escaped(out,c->text)&&length_append(out,"\")",2);break;
-    case CLIP_SHAPE_BOX: ok=length_append(out,clip_boxes[c->box],strlen(clip_boxes[c->box]));break;
-    case CLIP_SHAPE_INSET: {
-        int count=4;
-        if(clip_sides_equal(c,1,3)){count=3;if(clip_sides_equal(c,0,2)){count=2;if(clip_sides_equal(c,0,1))count=1;}}
-        ok=length_append(out,"inset(",6);
-        for(int i=0;i<count&&ok;i++)ok=(!i||length_append(out," ",1))&&(clip_side_zero_percent(c,i)?length_append(out,"0%",2):css_length_serialize(&c->inset[i],out,d));
-        len_t lengths[2][4];bool round=false;
-        for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++){const len_t *r=&c->corner[i].axis[axis];lengths[axis][i]=*r;round|=r->kind!=LK_LEN||r->px!=0||r->pct!=0;}
-        if(ok&&round)ok=length_append(out," round ",7)&&radius_lengths_serialize(lengths,out,d);
-        ok=ok&&length_append(out,")",1);
-        break;
-    }
-    case CLIP_SHAPE_CIRCLE: case CLIP_SHAPE_ELLIPSE: {
-        int radii=c->shape==CLIP_SHAPE_CIRCLE?1:2;bool closest=true;
-        ok=radii==1?length_append(out,"circle(",7):length_append(out,"ellipse(",8);
-        for(int i=0;i<radii;i++)closest&=c->extent[i]==CLIP_EXTENT_CLOSEST;
-        for(int i=0;i<radii&&ok&&!closest;i++)
-            ok=(!i||length_append(out," ",1))&&(c->extent[i]==CLIP_EXTENT_CLOSEST?length_append(out,"closest-side",12):
-               c->extent[i]==CLIP_EXTENT_FARTHEST?length_append(out,"farthest-side",13):css_length_serialize(&c->radius[i],out,d));
-        ok=ok&&(closest||length_append(out," ",1))&&length_append(out,"at ",3)&&css_length_serialize(&c->at[0],out,d)&&
-           length_append(out," ",1)&&css_length_serialize(&c->at[1],out,d)&&length_append(out,")",1);
-        break;
-    }
-    case CLIP_SHAPE_POLYGON:
-        ok=length_append(out,"polygon(",8)&&(!c->evenodd||length_append(out,"evenodd",7));
-        if(ok&&c->round>0)ok=(!c->evenodd||length_append(out," ",1))&&length_append(out,"round ",6)&&length_number(out,c->round,"px");
-        if(ok&&(c->evenodd||c->round>0))ok=length_append(out,", ",2);
-        for(size_t i=0;i<c->points&&ok;i++) {
-            if(!(i&63)&&d&&!web_native_checkpoint(d)){ok=false;break;}
-            ok=(!i||length_append(out,", ",2))&&css_length_serialize(&c->point[i][0],out,d)&&length_append(out," ",1)&&
-               css_length_serialize(&c->point[i][1],out,d);
-        }
-        ok=ok&&length_append(out,")",1);
-        break;
-    case CLIP_SHAPE_PATH:
-        ok=length_append(out,"path(",5)&&(!c->evenodd||length_append(out,"evenodd, ",9))&&length_append(out,"\"",1)&&
-           string_escaped(out,c->text)&&length_append(out,"\")",2);
-        break;
-    default: ok=false;
-    }
-    /* A shape's default box is border-box (css-masking-1 §5.1): the shortest form leaves it out. */
-    if(ok&&c&&c->shape!=CLIP_SHAPE_BOX&&c->shape!=CLIP_SHAPE_URL&&c->box!=CLIP_BOX_BORDER)
-        ok=length_append(out," ",1)&&length_append(out,clip_boxes[c->box],strlen(clip_boxes[c->box]));
-    if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}
-    return ok;
-}
 bool css_clip_rect_serialize(const struct css_clip_rect *clip,sbuf *out) {
     size_t original=out->n;bool ok=true;
     if(!clip->rect)ok=length_append(out,"auto",4);
@@ -1252,24 +533,39 @@ bool css_radius_specified(const char *property,const char *value,size_t size,sbu
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
-       PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING, PT_TRANSFORM, PT_TRANSLATE,
-       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_CLIP_PATH, PT_CLIP };
+       PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
+       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
+       PT_RULE_INSET };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
-       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_OUTLINE };
+       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE, SH_OFFSET, SH_GAP_RULE };
 
 struct propdef {
     const char *name;
-    uint8_t type, flags; /* flags: LF_* for lengths */
+    uint8_t type, flags; /* flags: LF_* for lengths; which shape or offset value (shape.c) */
     bool inherited;
+    uint8_t group; /* G_*: the record that holds the field, off being within it */
     uint16_t off, size;
     const struct kw *kws;
     uint8_t sh;
+    uint8_t anim; /* AN_*: the animation type when it is not the value type's (css_prop_animation) */
 };
+/* Web Animations 1 §5.3 animation types that differ from a value type's default */
+enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
+/* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
+   offset, gap_rules). A group holds only properties that are not inherited. */
+enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE };
+/* the gap decoration shorthands (css-gaps-1): propdef flags hold what one sets (GS_*) and on which
+   axes (GS_COLUMN, GS_ROW) */
+enum { GS_RULE, GS_COLOR, GS_STYLE, GS_WIDTH, GS_BREAK, GS_ITEMS, GS_INSET_START, GS_INSET_END, GS_INSET_CAP,
+       GS_INSET_JUNCTION, GS_INSET };
+#define GS_COLUMN 0x10
+#define GS_ROW 0x20
+#define GS_BOTH (GS_COLUMN | GS_ROW)
 
 static const struct kw kw_position[] = {{"static", POS_STATIC}, {"relative", POS_RELATIVE}, {"absolute", POS_ABSOLUTE},
                                         {"fixed", POS_FIXED}, {"sticky", POS_STICKY}, {"-webkit-sticky", POS_STICKY}, {0}};
@@ -1280,6 +576,9 @@ static const struct kw kw_motion_direction[] = {{"normal",CM_NORMAL},{"reverse",
 static const struct kw kw_motion_fill[] = {{"none",CM_FILL_NONE},{"forwards",CM_FILL_FORWARDS},
     {"backwards",CM_FILL_BACKWARDS},{"both",CM_FILL_BOTH},{0}};
 static const struct kw kw_motion_play[] = {{"running",0},{"paused",1},{0}};
+static const struct kw kw_motion_composition[] = {{"replace",CM_COMPOSITE_REPLACE},{"add",CM_COMPOSITE_ADD},
+    {"accumulate",CM_COMPOSITE_ACCUMULATE},{0}};
+static const struct kw kw_transition_behavior[] = {{"normal",0},{"allow-discrete",1},{0}};
 static const struct kw kw_float[] = {{"none", FL_NONE}, {"left", FL_LEFT}, {"right", FL_RIGHT},
                                      {"inline-start", FL_LEFT}, {"inline-end", FL_RIGHT}, {0}};
 static const struct kw kw_clear[] = {{"none", CL_NONE}, {"left", CL_LEFT}, {"right", CL_RIGHT}, {"both", CL_BOTH},
@@ -1356,195 +655,267 @@ static const struct kw kw_ostyle[] = {{"none", BS_NONE}, {"solid", BS_SOLID}, {"
                                       {"dotted", BS_DOTTED}, {"double", BS_DOUBLE}, {"groove", BS_GROOVE},
                                       {"ridge", BS_RIDGE}, {"inset", BS_INSET}, {"outset", BS_OUTSET}, {0}};
 static const struct kw kw_normal0[] = {{"normal", 0}, {0}};
+static const struct kw kw_rule_break[] = {{"none", CSS_RULE_BREAK_NONE}, {"normal", CSS_RULE_BREAK_NORMAL},
+                                          {"intersection", CSS_RULE_BREAK_INTERSECTION}, {0}};
+static const struct kw kw_rule_items[] = {{"all", CSS_RULE_ITEMS_ALL}, {"around", CSS_RULE_ITEMS_AROUND},
+                                          {"between", CSS_RULE_ITEMS_BETWEEN}, {"normal", CSS_RULE_ITEMS_NORMAL}, {0}};
+static const struct kw kw_rule_overlap[] = {{"row-over-column", CSS_RULE_ROW_OVER_COLUMN},
+                                            {"column-over-row", CSS_RULE_COLUMN_OVER_ROW}, {0}};
 static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}, {"super", VA_SUPER},
                                       {"top", VA_TOP}, {"middle", VA_MIDDLE}, {"bottom", VA_BOTTOM},
                                       {"text-top", VA_TEXT_TOP}, {"text-bottom", VA_TEXT_BOTTOM}, {0}};
 
-#define O(f) (uint16_t) offsetof(style_t, f), (uint16_t)sizeof(((style_t *)0)->f)
-#define SH(name, id) {name, PT_SHORT, 0, false, 0, 0, NULL, id}
+#define O(f) G_STYLE, (uint16_t)offsetof(style_t, f), (uint16_t)sizeof(((style_t *)0)->f)
+#define OG(g, T, f) g, (uint16_t)offsetof(T, f), (uint16_t)sizeof(((T *)0)->f) /* a field of group g, a T */
+#define SH(name, id) {name, PT_SHORT, 0, false, G_STYLE, 0, 0, NULL, id, AN_NONE}
+#define SH_GAP(name, flags) {name, PT_SHORT, flags, false, G_STYLE, 0, 0, NULL, SH_GAP_RULE, AN_NONE}
+#define OGAP(f) OG(G_GAP_RULE, struct css_gap_rules, f)
 
 /* sorted by name at first use */
 static struct propdef props[] = {
-    {"-webkit-box-orient", PT_KW, 0, false, O(box_orient), kw_box_orient, 0},
-    {"-webkit-line-clamp", PT_LINE_CLAMP, 0, false, O(line_clamp), NULL, 0},
+    {"-webkit-box-orient", PT_KW, 0, false, O(box_orient), kw_box_orient, 0, AN_TYPE},
+    {"-webkit-line-clamp", PT_LINE_CLAMP, 0, false, O(line_clamp), NULL, 0, AN_TYPE},
     SH("animation", SH_ANIMATION),
-    {"animation-name",PT_MOTION_NAME,0,false,O(motion.name),NULL,0},
-    {"animation-duration",PT_MOTION_TIME,0,false,O(motion.duration),NULL,0},
-    {"animation-delay",PT_MOTION_TIME,LF_NEG,false,O(motion.delay),NULL,0},
-    {"animation-timing-function",PT_MOTION_EASING,0,false,O(motion.easing),NULL,0},
-    {"animation-iteration-count",PT_MOTION_ITERATIONS,0,false,O(motion.iterations),NULL,0},
-    {"animation-direction",PT_KW,0,false,O(motion.direction),kw_motion_direction,0},
-    {"animation-fill-mode",PT_KW,0,false,O(motion.fill),kw_motion_fill,0},
-    {"animation-play-state",PT_KW,0,false,O(motion.paused),kw_motion_play,0},
-    {"align-content", PT_KW, 0, false, O(align_content), kw_acontent, 0},
-    {"align-items", PT_KW, 0, false, O(align_items), kw_align, 0},
-    {"align-self", PT_KW, 0, false, O(align_self), kw_align, 0},
+    /* flags: which ML_* list a motion longhand is */
+    {"animation-name",PT_MOTION_LIST,ML_NAME,false,O(motion.list[ML_NAME]),NULL,0,AN_NONE},
+    {"animation-duration",PT_MOTION_LIST,ML_DURATION,false,O(motion.list[ML_DURATION]),NULL,0,AN_NONE},
+    {"animation-delay",PT_MOTION_LIST,ML_DELAY,false,O(motion.list[ML_DELAY]),NULL,0,AN_NONE},
+    {"animation-timing-function",PT_MOTION_LIST,ML_EASING,false,O(motion.list[ML_EASING]),NULL,0,AN_NONE},
+    {"animation-iteration-count",PT_MOTION_LIST,ML_ITERATIONS,false,O(motion.list[ML_ITERATIONS]),NULL,0,AN_NONE},
+    {"animation-direction",PT_MOTION_LIST,ML_DIRECTION,false,O(motion.list[ML_DIRECTION]),kw_motion_direction,0,AN_NONE},
+    {"animation-fill-mode",PT_MOTION_LIST,ML_FILL,false,O(motion.list[ML_FILL]),kw_motion_fill,0,AN_NONE},
+    {"animation-play-state",PT_MOTION_LIST,ML_PLAY,false,O(motion.list[ML_PLAY]),kw_motion_play,0,AN_NONE},
+    {"animation-composition",PT_MOTION_LIST,ML_COMPOSITION,false,O(motion.list[ML_COMPOSITION]),kw_motion_composition,0,AN_NONE},
+    SH("transition", SH_TRANSITION),
+    {"transition-property",PT_MOTION_LIST,ML_TPROPERTY,false,O(motion.list[ML_TPROPERTY]),NULL,0,AN_NONE},
+    {"transition-duration",PT_MOTION_LIST,ML_TDURATION,false,O(motion.list[ML_TDURATION]),NULL,0,AN_NONE},
+    {"transition-delay",PT_MOTION_LIST,ML_TDELAY,false,O(motion.list[ML_TDELAY]),NULL,0,AN_NONE},
+    {"transition-timing-function",PT_MOTION_LIST,ML_TEASING,false,O(motion.list[ML_TEASING]),NULL,0,AN_NONE},
+    {"transition-behavior",PT_MOTION_LIST,ML_TBEHAVIOR,false,O(motion.list[ML_TBEHAVIOR]),kw_transition_behavior,0,AN_NONE},
+    {"align-content", PT_KW, 0, false, O(align_content), kw_acontent, 0, AN_TYPE},
+    {"align-items", PT_KW, 0, false, O(align_items), kw_align, 0, AN_TYPE},
+    {"align-self", PT_KW, 0, false, O(align_self), kw_align, 0, AN_TYPE},
     SH("background", SH_BACKGROUND),
-    {"background-color", PT_COLOR, 0, false, O(bg_color), NULL, 0},
-    {"background-image", PT_BG_IMAGE, 0, false, O(bg_image), NULL, 0},
-    {"box-shadow", PT_BOX_SHADOW, 0, false, O(box_shadow), NULL, 0},
-    {"background-repeat", PT_KW, 0, false, O(bg_repeat), kw_bg_repeat, 0},
-    {"background-position", PT_BG_POS, 0, false, O(bg_pos), NULL, 0},
-    {"background-size", PT_BG_SIZE, 0, false, O(bg_size), NULL, 0},
+    {"background-color", PT_COLOR, 0, false, O(bg_color), NULL, 0, AN_TYPE},
+    {"background-image", PT_BG_IMAGE, 0, false, O(bg_image), NULL, 0, AN_TYPE},
+    {"box-shadow", PT_BOX_SHADOW, 0, false, O(box_shadow), NULL, 0, AN_TYPE},
+    {"background-repeat", PT_KW, 0, false, O(bg_repeat), kw_bg_repeat, 0, AN_TYPE},
+    {"background-position", PT_BG_POS, 0, false, O(bg_pos), NULL, 0, AN_TYPE},
+    {"background-size", PT_BG_SIZE, 0, false, O(bg_size), NULL, 0, AN_TYPE},
     SH("border", SH_BORDER),
     SH("border-block", SH_BORDER_BLOCK),
     SH("border-bottom", SH_BORDER_BOTTOM),
-    {"border-bottom-left-radius", PT_RADIUS, 0, false, O(corner_radius[3]), NULL, 0},
-    {"border-bottom-right-radius", PT_RADIUS, 0, false, O(corner_radius[2]), NULL, 0},
-    {"border-bottom-color", PT_COLOR, 0, false, O(border_color[2]), NULL, 0},
-    {"border-bottom-style", PT_KW, 0, false, O(border_style[2]), kw_bstyle, 0},
-    {"border-bottom-width", PT_PX, LF_NOPCT, false, O(border_width[2]), kw_bwidth, 0},
-    {"border-collapse", PT_KW, 0, true, O(border_collapse), kw_bcollapse, 0},
+    {"border-bottom-left-radius", PT_RADIUS, 0, false, O(corner_radius[3]), NULL, 0, AN_TYPE},
+    {"border-bottom-right-radius", PT_RADIUS, 0, false, O(corner_radius[2]), NULL, 0, AN_TYPE},
+    {"border-bottom-color", PT_COLOR, 0, false, O(border_color[2]), NULL, 0, AN_TYPE},
+    {"border-bottom-style", PT_KW, 0, false, O(border_style[2]), kw_bstyle, 0, AN_TYPE},
+    {"border-bottom-width", PT_PX, LF_NOPCT, false, O(border_width[2]), kw_bwidth, 0, AN_TYPE},
+    {"border-collapse", PT_KW, 0, true, O(border_collapse), kw_bcollapse, 0, AN_TYPE},
     SH("border-color", SH_BORDER_COLOR),
     SH("border-inline", SH_BORDER_INLINE),
     SH("border-left", SH_BORDER_LEFT),
-    {"border-left-color", PT_COLOR, 0, false, O(border_color[3]), NULL, 0},
-    {"border-left-style", PT_KW, 0, false, O(border_style[3]), kw_bstyle, 0},
-    {"border-left-width", PT_PX, LF_NOPCT, false, O(border_width[3]), kw_bwidth, 0},
+    {"border-left-color", PT_COLOR, 0, false, O(border_color[3]), NULL, 0, AN_TYPE},
+    {"border-left-style", PT_KW, 0, false, O(border_style[3]), kw_bstyle, 0, AN_TYPE},
+    {"border-left-width", PT_PX, LF_NOPCT, false, O(border_width[3]), kw_bwidth, 0, AN_TYPE},
     SH("border-radius", SH_BORDER_RADIUS),
     SH("border-right", SH_BORDER_RIGHT),
-    {"border-right-color", PT_COLOR, 0, false, O(border_color[1]), NULL, 0},
-    {"border-right-style", PT_KW, 0, false, O(border_style[1]), kw_bstyle, 0},
-    {"border-right-width", PT_PX, LF_NOPCT, false, O(border_width[1]), kw_bwidth, 0},
-    {"border-spacing", PT_PX, LF_NOPCT, true, O(border_spacing), NULL, 0},
+    {"border-right-color", PT_COLOR, 0, false, O(border_color[1]), NULL, 0, AN_TYPE},
+    {"border-right-style", PT_KW, 0, false, O(border_style[1]), kw_bstyle, 0, AN_TYPE},
+    {"border-right-width", PT_PX, LF_NOPCT, false, O(border_width[1]), kw_bwidth, 0, AN_TYPE},
+    {"border-spacing", PT_PX, LF_NOPCT, true, O(border_spacing), NULL, 0, AN_TYPE},
     SH("border-style", SH_BORDER_STYLE),
     SH("border-top", SH_BORDER_TOP),
-    {"border-top-left-radius", PT_RADIUS, 0, false, O(corner_radius[0]), NULL, 0},
-    {"border-top-right-radius", PT_RADIUS, 0, false, O(corner_radius[1]), NULL, 0},
-    {"border-top-color", PT_COLOR, 0, false, O(border_color[0]), NULL, 0},
-    {"border-top-style", PT_KW, 0, false, O(border_style[0]), kw_bstyle, 0},
-    {"border-top-width", PT_PX, LF_NOPCT, false, O(border_width[0]), kw_bwidth, 0},
+    {"border-top-left-radius", PT_RADIUS, 0, false, O(corner_radius[0]), NULL, 0, AN_TYPE},
+    {"border-top-right-radius", PT_RADIUS, 0, false, O(corner_radius[1]), NULL, 0, AN_TYPE},
+    {"border-top-color", PT_COLOR, 0, false, O(border_color[0]), NULL, 0, AN_TYPE},
+    {"border-top-style", PT_KW, 0, false, O(border_style[0]), kw_bstyle, 0, AN_TYPE},
+    {"border-top-width", PT_PX, LF_NOPCT, false, O(border_width[0]), kw_bwidth, 0, AN_TYPE},
     SH("border-width", SH_BORDER_WIDTH),
-    {"bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[2]), NULL, 0},
-    {"box-sizing", PT_KW, 0, false, O(box_sizing), kw_boxsizing, 0},
-    {"caption-side", PT_KW, 0, true, O(caption_bottom), kw_capside, 0},
-    {"clear", PT_KW, 0, false, O(clear), kw_clear, 0},
-    {"color", PT_COLOR, 0, true, O(color), NULL, 0},
-    {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0},
-    {"content", PT_CONTENT, 0, false, O(content), NULL, 0},
-    {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0},
+    {"bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[2]), NULL, 0, AN_TYPE},
+    {"box-sizing", PT_KW, 0, false, O(box_sizing), kw_boxsizing, 0, AN_TYPE},
+    {"caption-side", PT_KW, 0, true, O(caption_bottom), kw_capside, 0, AN_TYPE},
+    {"clear", PT_KW, 0, false, O(clear), kw_clear, 0, AN_TYPE},
+    {"color", PT_COLOR, 0, true, O(color), NULL, 0, AN_TYPE},
+    {"color-scheme", PT_COLOR_SCHEME, 0, true, O(color_scheme), NULL, 0, AN_DISCRETE},
+    {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0, AN_TYPE},
+    /* CSS Gap Decorations 1. flags: a list's enum css_gap_rule_kind, a shorthand's GS_* */
+    SH_GAP("column-rule", GS_RULE | GS_COLUMN),
+    SH_GAP("row-rule", GS_RULE | GS_ROW),
+    SH_GAP("rule", GS_RULE | GS_BOTH),
+    {"column-rule-color", PT_RULE_LIST, CSS_GAP_COLOR, false, OGAP(axis[0].list[CSS_GAP_COLOR]), NULL, 0, AN_TYPE},
+    {"column-rule-style", PT_RULE_LIST, CSS_GAP_STYLE, false, OGAP(axis[0].list[CSS_GAP_STYLE]), NULL, 0, AN_DISCRETE},
+    {"column-rule-width", PT_RULE_LIST, CSS_GAP_WIDTH, false, OGAP(axis[0].list[CSS_GAP_WIDTH]), NULL, 0, AN_TYPE},
+    {"row-rule-color", PT_RULE_LIST, CSS_GAP_COLOR, false, OGAP(axis[1].list[CSS_GAP_COLOR]), NULL, 0, AN_TYPE},
+    {"row-rule-style", PT_RULE_LIST, CSS_GAP_STYLE, false, OGAP(axis[1].list[CSS_GAP_STYLE]), NULL, 0, AN_DISCRETE},
+    {"row-rule-width", PT_RULE_LIST, CSS_GAP_WIDTH, false, OGAP(axis[1].list[CSS_GAP_WIDTH]), NULL, 0, AN_TYPE},
+    SH_GAP("rule-color", GS_COLOR | GS_BOTH),
+    SH_GAP("rule-style", GS_STYLE | GS_BOTH),
+    SH_GAP("rule-width", GS_WIDTH | GS_BOTH),
+    {"column-rule-break", PT_KW, 0, false, OGAP(axis[0].rule_break), kw_rule_break, 0, AN_TYPE},
+    {"row-rule-break", PT_KW, 0, false, OGAP(axis[1].rule_break), kw_rule_break, 0, AN_TYPE},
+    SH_GAP("rule-break", GS_BREAK | GS_BOTH),
+    {"column-rule-visibility-items", PT_KW, 0, false, OGAP(axis[0].visibility), kw_rule_items, 0, AN_TYPE},
+    {"row-rule-visibility-items", PT_KW, 0, false, OGAP(axis[1].visibility), kw_rule_items, 0, AN_TYPE},
+    SH_GAP("rule-visibility-items", GS_ITEMS | GS_BOTH),
+    {"rule-overlap", PT_KW, 0, false, OGAP(overlap), kw_rule_overlap, 0, AN_TYPE},
+    {"column-rule-inset-cap-start", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_CAP_START]), NULL, 0, AN_TYPE},
+    {"column-rule-inset-cap-end", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_CAP_END]), NULL, 0, AN_TYPE},
+    {"column-rule-inset-junction-start", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_JUNCTION_START]), NULL, 0,
+     AN_TYPE},
+    {"column-rule-inset-junction-end", PT_RULE_INSET, 0, false, OGAP(axis[0].inset[CSS_RULE_JUNCTION_END]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-cap-start", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_CAP_START]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-cap-end", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_CAP_END]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-junction-start", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_JUNCTION_START]), NULL, 0, AN_TYPE},
+    {"row-rule-inset-junction-end", PT_RULE_INSET, 0, false, OGAP(axis[1].inset[CSS_RULE_JUNCTION_END]), NULL, 0, AN_TYPE},
+    SH_GAP("column-rule-inset-start", GS_INSET_START | GS_COLUMN),
+    SH_GAP("column-rule-inset-end", GS_INSET_END | GS_COLUMN),
+    SH_GAP("row-rule-inset-start", GS_INSET_START | GS_ROW),
+    SH_GAP("row-rule-inset-end", GS_INSET_END | GS_ROW),
+    SH_GAP("rule-inset-start", GS_INSET_START | GS_BOTH),
+    SH_GAP("rule-inset-end", GS_INSET_END | GS_BOTH),
+    SH_GAP("column-rule-inset-cap", GS_INSET_CAP | GS_COLUMN),
+    SH_GAP("column-rule-inset-junction", GS_INSET_JUNCTION | GS_COLUMN),
+    SH_GAP("row-rule-inset-cap", GS_INSET_CAP | GS_ROW),
+    SH_GAP("row-rule-inset-junction", GS_INSET_JUNCTION | GS_ROW),
+    SH_GAP("rule-inset-cap", GS_INSET_CAP | GS_BOTH),
+    SH_GAP("rule-inset-junction", GS_INSET_JUNCTION | GS_BOTH),
+    SH_GAP("column-rule-inset", GS_INSET | GS_COLUMN),
+    SH_GAP("row-rule-inset", GS_INSET | GS_ROW),
+    SH_GAP("rule-inset", GS_INSET | GS_BOTH),
+    {"content", PT_CONTENT, 0, false, O(content), NULL, 0, AN_TYPE},
+    {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0, AN_DISPLAY},
     SH("container", SH_CONTAINER),
-    {"container-name", PT_CONTAINER_NAMES, 0, false, O(container_names), NULL, 0},
-    {"container-type", PT_KW, 0, false, O(container_type), kw_container_type, 0},
-    {"display", PT_DISPLAY, 0, false, O(display), NULL, 0},
+    {"container-name", PT_CONTAINER_NAMES, 0, false, O(container_names), NULL, 0, AN_TYPE},
+    {"container-type", PT_KW, 0, false, O(container_type), kw_container_type, 0, AN_NONE},
+    {"display", PT_DISPLAY, 0, false, O(display), NULL, 0, AN_TYPE},
     SH("flex", SH_FLEX),
-    {"flex-basis", PT_LEN, LF_AUTO | LF_LENGTH, false, O(flex_basis), NULL, 0},
-    {"flex-direction", PT_KW, 0, false, O(flex_direction), kw_fdir, 0},
+    {"flex-basis", PT_LEN, LF_AUTO | LF_LENGTH, false, O(flex_basis), NULL, 0, AN_TYPE},
+    {"flex-direction", PT_KW, 0, false, O(flex_direction), kw_fdir, 0, AN_TYPE},
     SH("flex-flow", SH_FLEX_FLOW),
-    {"flex-grow", PT_NUM, 0, false, O(flex_grow), NULL, 0},
-    {"flex-shrink", PT_NUM, 0, false, O(flex_shrink), NULL, 0},
-    {"flex-wrap", PT_KW, 0, false, O(flex_wrap), kw_fwrap, 0},
-    {"float", PT_KW, 0, false, O(float_), kw_float, 0},
-    {"fill", PT_SVG_PAINT, 0, true, O(svg_fill), NULL, 0},
-    {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0},
-    {"filter", PT_FILTER, 0, false, O(filter), NULL, 0},
-    {"clip", PT_CLIP, 0, false, O(clip), NULL, 0},
-    {"clip-path", PT_CLIP_PATH, 0, false, O(clip_path), NULL, 0},
-    {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0},
+    {"flex-grow", PT_NUM, 0, false, O(flex_grow), NULL, 0, AN_TYPE},
+    {"flex-shrink", PT_NUM, 0, false, O(flex_shrink), NULL, 0, AN_TYPE},
+    {"flex-wrap", PT_KW, 0, false, O(flex_wrap), kw_fwrap, 0, AN_TYPE},
+    {"float", PT_KW, 0, false, O(float_), kw_float, 0, AN_TYPE},
+    {"fill", PT_SVG_PAINT, 0, true, O(svg_fill), NULL, 0, AN_TYPE},
+    {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0, AN_TYPE},
+    {"filter", PT_FILTER, 0, false, O(filter), NULL, 0, AN_TYPE},
+    {"clip", PT_CLIP, 0, false, O(clip), NULL, 0, AN_TYPE},
+    {"clip-path", PT_SHAPE, CSS_SHAPE_CLIP_PATH, false, O(clip_path), NULL, 0, AN_TYPE},
+    {"shape-outside", PT_SHAPE, CSS_SHAPE_OUTSIDE, false, OG(G_FLOAT_SHAPE, struct css_float_shape, outside), NULL, 0, AN_TYPE},
+    {"shape-margin", PT_LEN, LF_LENGTH, false, OG(G_FLOAT_SHAPE, struct css_float_shape, margin), NULL, 0, AN_TYPE},
+    {"shape-image-threshold", PT_OPACITY, 0, false, OG(G_FLOAT_SHAPE, struct css_float_shape, image_threshold), NULL, 0,
+     AN_TYPE},
+    SH("offset", SH_OFFSET),
+    {"offset-path", PT_SHAPE, CSS_SHAPE_OFFSET_PATH, false, OG(G_OFFSET, struct css_offset, path), NULL, 0, AN_TYPE},
+    {"offset-distance", PT_LEN, LF_NEG | LF_LENGTH, false, OG(G_OFFSET, struct css_offset, distance), NULL, 0, AN_TYPE},
+    {"offset-position", PT_OFFSET, CSS_OFFSET_POSITION, false, OG(G_OFFSET, struct css_offset, position), NULL, 0, AN_TYPE},
+    {"offset-anchor", PT_OFFSET, CSS_OFFSET_ANCHOR, false, OG(G_OFFSET, struct css_offset, anchor), NULL, 0, AN_TYPE},
+    {"offset-rotate", PT_OFFSET, CSS_OFFSET_ROTATE, false, OG(G_OFFSET, struct css_offset, rotate), NULL, 0, AN_TYPE},
+    {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0, AN_TYPE},
     SH("font", SH_FONT),
     SH("all", SH_ALL),
-    {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0},
-    {"font-size", PT_FONT_SIZE, 0, true, O(font_size), NULL, 0},
-    {"font-style", PT_KW, 0, true, O(font_style), kw_fstyle, 0},
-    {"font-weight", PT_FONT_WEIGHT, 0, true, O(font_weight), NULL, 0},
+    {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0, AN_TYPE},
+    {"font-size", PT_FONT_SIZE, 0, true, O(font_size), NULL, 0, AN_TYPE},
+    {"font-style", PT_KW, 0, true, O(font_style), kw_fstyle, 0, AN_TYPE},
+    {"font-weight", PT_FONT_WEIGHT, 0, true, O(font_weight), NULL, 0, AN_TYPE},
     SH("gap", SH_GAP),
     SH("grid", SH_GRID),
     SH("grid-area", SH_GRID_AREA),
-    {"grid-auto-columns", PT_GTEMPLATE, 0, false, O(grid_auto_cols), NULL, 0},
-    {"grid-auto-flow", PT_KW, 0, false, O(grid_flow_col), kw_gflow, 0},
-    {"grid-auto-rows", PT_GTEMPLATE, 0, false, O(grid_auto_rows), NULL, 0},
+    {"grid-auto-columns", PT_GTEMPLATE, 0, false, O(grid_auto_cols), NULL, 0, AN_TYPE},
+    {"grid-auto-flow", PT_KW, 0, false, O(grid_flow_col), kw_gflow, 0, AN_TYPE},
+    {"grid-auto-rows", PT_GTEMPLATE, 0, false, O(grid_auto_rows), NULL, 0, AN_TYPE},
     SH("grid-column", SH_GRID_COLUMN),
-    {"grid-column-end", PT_GLINE, 0, false, O(grid_place[3]), NULL, 0},
-    {"grid-column-start", PT_GLINE, 0, false, O(grid_place[1]), NULL, 0},
+    {"grid-column-end", PT_GLINE, 0, false, O(grid_place[3]), NULL, 0, AN_TYPE},
+    {"grid-column-start", PT_GLINE, 0, false, O(grid_place[1]), NULL, 0, AN_TYPE},
     SH("grid-row", SH_GRID_ROW),
-    {"grid-row-end", PT_GLINE, 0, false, O(grid_place[2]), NULL, 0},
-    {"grid-row-start", PT_GLINE, 0, false, O(grid_place[0]), NULL, 0},
+    {"grid-row-end", PT_GLINE, 0, false, O(grid_place[2]), NULL, 0, AN_TYPE},
+    {"grid-row-start", PT_GLINE, 0, false, O(grid_place[0]), NULL, 0, AN_TYPE},
     SH("grid-template", SH_GRID_TEMPLATE),
-    {"grid-template-areas", PT_GAREAS, 0, false, O(grid_areas), NULL, 0},
-    {"grid-template-columns", PT_GTEMPLATE, 0, false, O(grid_cols), NULL, 0},
-    {"grid-template-rows", PT_GTEMPLATE, 0, false, O(grid_rows), NULL, 0},
-    {"height", PT_LEN, LF_AUTO, false, O(height), NULL, 0},
+    {"grid-template-areas", PT_GAREAS, 0, false, O(grid_areas), NULL, 0, AN_TYPE},
+    {"grid-template-columns", PT_GTEMPLATE, 0, false, O(grid_cols), NULL, 0, AN_TYPE},
+    {"grid-template-rows", PT_GTEMPLATE, 0, false, O(grid_rows), NULL, 0, AN_TYPE},
+    {"height", PT_LEN, LF_AUTO, false, O(height), NULL, 0, AN_TYPE},
     SH("inset", SH_INSET),
     SH("inset-block", SH_INSET_BLOCK),
     SH("inset-inline", SH_INSET_INLINE),
-    {"justify-content", PT_KW, 0, false, O(justify_content), kw_justify, 0},
-    {"justify-items", PT_KW, 0, false, O(justify_items), kw_jalign, 0},
-    {"justify-self", PT_KW, 0, false, O(justify_self), kw_jalign, 0},
-    {"left", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[3]), NULL, 0},
-    {"letter-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(letter_spacing), kw_normal0, 0},
-    {"line-height", PT_LINE_HEIGHT, 0, true, O(line_height), NULL, 0},
+    {"justify-content", PT_KW, 0, false, O(justify_content), kw_justify, 0, AN_TYPE},
+    {"justify-items", PT_KW, 0, false, O(justify_items), kw_jalign, 0, AN_TYPE},
+    {"justify-self", PT_KW, 0, false, O(justify_self), kw_jalign, 0, AN_TYPE},
+    {"left", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[3]), NULL, 0, AN_TYPE},
+    {"letter-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(letter_spacing), kw_normal0, 0, AN_TYPE},
+    {"line-height", PT_LINE_HEIGHT, 0, true, O(line_height), NULL, 0, AN_TYPE},
     SH("list-style", SH_LIST_STYLE),
-    {"list-style-position", PT_KW, 0, true, O(list_style_inside), kw_lspos, 0},
-    {"list-style-type", PT_LIST_TYPE, 0, true, O(list_style), NULL, 0},
+    {"list-style-position", PT_KW, 0, true, O(list_style_inside), kw_lspos, 0, AN_TYPE},
+    {"list-style-type", PT_LIST_TYPE, 0, true, O(list_style), NULL, 0, AN_TYPE},
     SH("margin", SH_MARGIN),
     SH("margin-block", SH_MARGIN_BLOCK),
-    {"margin-bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[2]), NULL, 0},
+    {"margin-bottom", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[2]), NULL, 0, AN_TYPE},
     SH("margin-inline", SH_MARGIN_INLINE),
-    {"margin-left", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[3]), NULL, 0},
-    {"margin-right", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[1]), NULL, 0},
-    {"margin-top", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[0]), NULL, 0},
-    {"mask-image", PT_MASK_IMAGE, 0, false, O(mask_image), NULL, 0},
-    {"mask-position", PT_BG_POS, 0, false, O(mask_pos), NULL, 0},
-    {"object-fit", PT_KW, 0, false, O(object_fit), kw_object_fit, 0},
-    {"object-position", PT_BG_POS, 0, true, O(object_pos), NULL, 0},
-    {"mask-repeat", PT_KW, 0, false, O(mask_repeat), kw_bg_repeat, 0},
-    {"mask-size", PT_MASK_SIZE, 0, false, O(mask_size), NULL, 0},
-    {"max-height", PT_LEN, LF_NONE, false, O(max_height), NULL, 0},
-    {"max-width", PT_LEN, LF_NONE, false, O(max_width), NULL, 0},
-    {"min-height", PT_LEN, LF_AUTO, false, O(min_height), NULL, 0},
-    {"min-width", PT_LEN, LF_AUTO, false, O(min_width), NULL, 0},
-    {"opacity", PT_OPACITY, 0, false, O(opacity), NULL, 0},
-    {"order", PT_INT, 0, false, O(order), NULL, 0},
+    {"margin-left", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[3]), NULL, 0, AN_TYPE},
+    {"margin-right", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[1]), NULL, 0, AN_TYPE},
+    {"margin-top", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[0]), NULL, 0, AN_TYPE},
+    {"mask-image", PT_MASK_IMAGE, 0, false, O(mask_image), NULL, 0, AN_TYPE},
+    {"mask-position", PT_BG_POS, 0, false, O(mask_pos), NULL, 0, AN_TYPE},
+    {"object-fit", PT_KW, 0, false, O(object_fit), kw_object_fit, 0, AN_TYPE},
+    {"object-position", PT_BG_POS, 0, true, O(object_pos), NULL, 0, AN_TYPE},
+    {"mask-repeat", PT_KW, 0, false, O(mask_repeat), kw_bg_repeat, 0, AN_TYPE},
+    {"mask-size", PT_MASK_SIZE, 0, false, O(mask_size), NULL, 0, AN_TYPE},
+    {"max-height", PT_LEN, LF_NONE, false, O(max_height), NULL, 0, AN_TYPE},
+    {"max-width", PT_LEN, LF_NONE, false, O(max_width), NULL, 0, AN_TYPE},
+    {"min-height", PT_LEN, LF_AUTO, false, O(min_height), NULL, 0, AN_TYPE},
+    {"min-width", PT_LEN, LF_AUTO, false, O(min_width), NULL, 0, AN_TYPE},
+    {"opacity", PT_OPACITY, 0, false, O(opacity), NULL, 0, AN_TYPE},
+    {"order", PT_INT, 0, false, O(order), NULL, 0, AN_TYPE},
     SH("outline", SH_OUTLINE),
-    {"outline-color", PT_COLOR, 0, false, O(outline_color), NULL, 0},
-    {"outline-offset", PT_PX, LF_NEG | LF_NOPCT, false, O(outline_offset), NULL, 0},
-    {"outline-style", PT_KW, 0, false, O(outline_style), kw_ostyle, 0},
-    {"outline-width", PT_PX, LF_NOPCT, false, O(outline_width), kw_bwidth, 0},
+    {"outline-color", PT_COLOR, 0, false, O(outline_color), NULL, 0, AN_TYPE},
+    {"outline-offset", PT_PX, LF_NEG | LF_NOPCT, false, O(outline_offset), NULL, 0, AN_TYPE},
+    {"outline-style", PT_KW, 0, false, O(outline_style), kw_ostyle, 0, AN_TYPE},
+    {"outline-width", PT_PX, LF_NOPCT, false, O(outline_width), kw_bwidth, 0, AN_TYPE},
     SH("overflow", SH_OVERFLOW),
-    {"overflow-x", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0},
-    {"overflow-y", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0},
+    {"overflow-x", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0, AN_TYPE},
+    {"overflow-y", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0, AN_TYPE},
     SH("padding", SH_PADDING),
     SH("padding-block", SH_PADDING_BLOCK),
-    {"padding-bottom", PT_LEN, 0, false, O(padding[2]), NULL, 0},
+    {"padding-bottom", PT_LEN, 0, false, O(padding[2]), NULL, 0, AN_TYPE},
     SH("padding-inline", SH_PADDING_INLINE),
-    {"padding-left", PT_LEN, 0, false, O(padding[3]), NULL, 0},
-    {"padding-right", PT_LEN, 0, false, O(padding[1]), NULL, 0},
-    {"padding-top", PT_LEN, 0, false, O(padding[0]), NULL, 0},
+    {"padding-left", PT_LEN, 0, false, O(padding[3]), NULL, 0, AN_TYPE},
+    {"padding-right", PT_LEN, 0, false, O(padding[1]), NULL, 0, AN_TYPE},
+    {"padding-top", PT_LEN, 0, false, O(padding[0]), NULL, 0, AN_TYPE},
     SH("place-content", SH_PLACE_CONTENT),
     SH("place-items", SH_PLACE_ITEMS),
     SH("place-self", SH_PLACE_SELF),
-    {"pointer-events", PT_KW, 0, true, O(pointer_events), kw_pointer_events, 0},
-    {"position", PT_KW, 0, false, O(position), kw_position, 0},
-    {"right", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[1]), NULL, 0},
-    {"row-gap", PT_PX, LF_NOPCT, false, O(gap_row), kw_normal0, 0},
-    {"stroke", PT_SVG_PAINT, 0, true, O(svg_stroke), NULL, 0},
-    {"stroke-opacity", PT_OPACITY, 0, true, O(svg_stroke_opacity), NULL, 0},
-    {"stroke-width", PT_SVG_WIDTH, 0, true, O(svg_stroke_width), NULL, 0},
-    {"stroke-linecap", PT_KW, 0, true, O(svg_stroke_cap), kw_svg_cap, 0},
-    {"stroke-linejoin", PT_KW, 0, true, O(svg_stroke_join), kw_svg_join, 0},
-    {"stop-color", PT_COLOR, 0, false, O(svg_stop_color), NULL, 0},
-    {"stop-opacity", PT_OPACITY, 0, false, O(svg_stop_opacity), NULL, 0},
-    {"table-layout", PT_KW, 0, false, O(table_layout), kw_tlayout, 0},
-    {"text-align", PT_KW, 0, true, O(text_align), kw_talign, 0},
-    {"text-overflow",PT_KW,0,false,O(text_overflow),kw_text_overflow,0},
+    {"pointer-events", PT_KW, 0, true, O(pointer_events), kw_pointer_events, 0, AN_TYPE},
+    {"position", PT_KW, 0, false, O(position), kw_position, 0, AN_TYPE},
+    {"right", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[1]), NULL, 0, AN_TYPE},
+    {"row-gap", PT_PX, LF_NOPCT, false, O(gap_row), kw_normal0, 0, AN_TYPE},
+    {"stroke", PT_SVG_PAINT, 0, true, O(svg_stroke), NULL, 0, AN_TYPE},
+    {"stroke-opacity", PT_OPACITY, 0, true, O(svg_stroke_opacity), NULL, 0, AN_TYPE},
+    {"stroke-width", PT_SVG_WIDTH, 0, true, O(svg_stroke_width), NULL, 0, AN_TYPE},
+    {"stroke-linecap", PT_KW, 0, true, O(svg_stroke_cap), kw_svg_cap, 0, AN_TYPE},
+    {"stroke-linejoin", PT_KW, 0, true, O(svg_stroke_join), kw_svg_join, 0, AN_TYPE},
+    {"stop-color", PT_COLOR, 0, false, O(svg_stop_color), NULL, 0, AN_TYPE},
+    {"stop-opacity", PT_OPACITY, 0, false, O(svg_stop_opacity), NULL, 0, AN_TYPE},
+    {"table-layout", PT_KW, 0, false, O(table_layout), kw_tlayout, 0, AN_TYPE},
+    {"text-align", PT_KW, 0, true, O(text_align), kw_talign, 0, AN_TYPE},
+    {"text-overflow",PT_KW,0,false,O(text_overflow),kw_text_overflow,0, AN_TYPE},
     SH("text-decoration", SH_TEXT_DECORATION),
-    {"text-decoration-line", PT_TEXT_DECO, 0, true, O(text_decoration), NULL, 0},
-    {"text-indent", PT_LEN, LF_NEG, true, O(text_indent), NULL, 0},
-    {"text-transform", PT_KW, 0, true, O(text_transform), kw_ttrans, 0},
-    {"text-wrap-mode", PT_KW, 0, true, O(white_space), kw_textwrap, 0},
-    {"top", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[0]), NULL, 0},
-    {"transform", PT_TRANSFORM, 0, false, O(transform), NULL, 0},
-    {"transform-origin", PT_TRANSFORM_ORIGIN, 0, false, O(transform_origin), NULL, 0},
-    {"transform-box", PT_KW, 0, false, O(transform_box), kw_transform_box, 0},
-    {"rotate", PT_ROTATE, 0, false, O(rotate), NULL, 0},
-    {"scale", PT_SCALE, 0, false, O(scale), NULL, 0},
-    {"translate", PT_TRANSLATE, 0, false, O(translate), NULL, 0},
-    {"vertical-align", PT_VALIGN, 0, false, O(vertical_align), kw_valign, 0},
-    {"visibility", PT_KW, 0, true, O(visibility), kw_visibility, 0},
-    {"white-space", PT_KW, 0, true, O(white_space), kw_ws, 0},
-    {"width", PT_LEN, LF_AUTO, false, O(width), NULL, 0},
-    {"word-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(word_spacing), kw_normal0, 0},
-    {"z-index", PT_ZINDEX, 0, false, O(z_index), NULL, 0},
+    {"text-decoration-line", PT_TEXT_DECO, 0, true, O(text_decoration), NULL, 0, AN_TYPE},
+    {"text-indent", PT_LEN, LF_NEG, true, O(text_indent), NULL, 0, AN_TYPE},
+    {"text-transform", PT_KW, 0, true, O(text_transform), kw_ttrans, 0, AN_TYPE},
+    {"text-wrap-mode", PT_KW, 0, true, O(white_space), kw_textwrap, 0, AN_TYPE},
+    {"top", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[0]), NULL, 0, AN_TYPE},
+    {"transform", PT_TRANSFORM, 0, false, O(transform), NULL, 0, AN_TYPE},
+    {"transform-origin", PT_TRANSFORM_ORIGIN, 0, false, O(transform_origin), NULL, 0, AN_TYPE},
+    {"transform-box", PT_KW, 0, false, O(transform_box), kw_transform_box, 0, AN_TYPE},
+    {"rotate", PT_ROTATE, 0, false, O(rotate), NULL, 0, AN_TYPE},
+    {"scale", PT_SCALE, 0, false, O(scale), NULL, 0, AN_TYPE},
+    {"translate", PT_TRANSLATE, 0, false, O(translate), NULL, 0, AN_TYPE},
+    {"vertical-align", PT_VALIGN, 0, false, O(vertical_align), kw_valign, 0, AN_TYPE},
+    {"visibility", PT_KW, 0, true, O(visibility), kw_visibility, 0, AN_VISIBILITY},
+    {"white-space", PT_KW, 0, true, O(white_space), kw_ws, 0, AN_TYPE},
+    {"width", PT_LEN, LF_AUTO, false, O(width), NULL, 0, AN_TYPE},
+    {"word-spacing", PT_PX, LF_NEG | LF_NOPCT, true, O(word_spacing), kw_normal0, 0, AN_TYPE},
+    {"z-index", PT_ZINDEX, 0, false, O(z_index), NULL, 0, AN_TYPE},
 };
 #define NPROPS (int)(sizeof props / sizeof *props)
 
@@ -1608,8 +979,6 @@ static void init_initial(void) {
     s->flex_shrink = 1;
     s->align_content = AC_NORMAL;
     s->opacity = 1;
-    s->motion.iterations = 1;
-    s->motion.easing = (struct css_easing){.x1=.25f,.y1=.1f,.x2=.25f,.y2=1,.kind=CM_BEZIER};
     s->object_pos[0].kind=s->object_pos[1].kind=LK_LEN;
     s->object_pos[0].pct=s->object_pos[1].pct=50;
     s->transform_origin[0].kind=s->transform_origin[1].kind=LK_LEN;
@@ -1617,6 +986,7 @@ static void init_initial(void) {
     s->align_self = 255;
     s->justify_self = 255;
     s->z_auto = true;
+    /* the groups (float_shape, offset, gap_rules) stay NULL: their initial records */
 }
 
 static void props_init(void) {
@@ -1666,17 +1036,74 @@ const char *css_prop_name(int index,bool *longhand) {
     return props[index].name;
 }
 int css_prop_index(const struct propdef *p) { return (int)(p - props); }
-bool css_prop_is_font(const struct propdef *p) {
-    return (p->type == PT_FONT_SIZE) || (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_ALL));
+const struct propdef *css_prop_at(int index) { return index >= 0 && index < NPROPS ? &props[index] : NULL; }
+/* font-size gives em, color-scheme the system colours and light-dark() */
+static bool early(const struct propdef *p) { return p->type == PT_FONT_SIZE || p->type == PT_COLOR_SCHEME; }
+bool css_prop_is_early(const struct propdef *p) {
+    return early(p) || (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_ALL));
 }
 bool css_prop_is_motion(const struct propdef *p) {
-    return p && (!strcmp(p->name,"animation") || !strncmp(p->name,"animation-",10));
+    return p && (p->type == PT_MOTION_LIST || (p->type == PT_SHORT && (p->sh == SH_ANIMATION || p->sh == SH_TRANSITION)));
 }
 bool css_prop_inherited(const struct propdef *p) { return p && p->inherited; }
-int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32_t *color, web_doc *d) {
+/* the colour slot (color.c) of a PT_COLOR or PT_SVG_PAINT property */
+static enum css_color_slot color_slot(const struct propdef *p) {
+    size_t off = p->off;
+    if (off == offsetof(style_t, color)) return CSS_SLOT_COLOR;
+    if (off == offsetof(style_t, svg_fill)) return CSS_SLOT_FILL;
+    if (off == offsetof(style_t, svg_stroke)) return CSS_SLOT_STROKE;
+    if (off == offsetof(style_t, bg_color)) return CSS_SLOT_BACKGROUND;
+    if (off == offsetof(style_t, outline_color)) return CSS_SLOT_OUTLINE;
+    if (off == offsetof(style_t, svg_stop_color)) return CSS_SLOT_STOP;
+    return (enum css_color_slot)(CSS_SLOT_BORDER_TOP + (off - offsetof(style_t, border_color)) / sizeof(uint32_t));
+}
+/* ---------------------------------------------------------------- the style's groups */
+/* the record that holds group g's fields in s (the initial one when s holds none) */
+static const void *group_of(const style_t *s, uint8_t g) {
+    switch (g) {
+    case G_FLOAT_SHAPE: return css_style_float_shape(s);
+    case G_OFFSET: return css_style_offset(s);
+    case G_GAP_RULE: return css_style_gap_rules(s);
+    }
+    return s;
+}
+static size_t group_size(uint8_t g) {
+    return g == G_FLOAT_SHAPE ? sizeof(struct css_float_shape) : g == G_OFFSET ? sizeof(struct css_offset) :
+                                sizeof(struct css_gap_rules);
+}
+static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
+    return g == G_FLOAT_SHAPE ? a->float_shape == b->float_shape : g == G_OFFSET ? a->offset == b->offset :
+                                a->gap_rules == b->gap_rules;
+}
+/* s's group g becomes a copy of value in a, for the caller to finish writing: the group s held may
+   be another style's too (box.c's copies of a style, the animation layer's copy of its base) */
+static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
+    size_t size = group_size(g);
+    void *copy = ar_alloc(a, size);
+    memcpy(copy, value, size);
+    if (g == G_FLOAT_SHAPE) s->float_shape = copy;
+    else if (g == G_OFFSET) s->offset = copy;
+    else s->gap_rules = copy;
+    return copy;
+}
+/* every group of src, as copying each of their (uninherited) properties would */
+static void groups_copy(style_t *dst, const style_t *src) {
+    dst->float_shape = src->float_shape;
+    dst->offset = src->offset;
+    dst->gap_rules = src->gap_rules;
+}
+/* the property's field in s */
+static const void *field_of(const style_t *s, const struct propdef *p) {
+    return (const char *)group_of(s, p->group) + p->off;
+}
+/* the gap decorations' values (below): the computed value getComputedStyle reads, longhand or
+   shorthand (1; -1 out of memory), and a declared value's specified serialization */
+static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d);
+static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
-    const void *field = (const char *)st + p->off;
+    const void *field = field_of(st, p);
     char text[32];
     switch (p->type) {
     case PT_KW: case PT_OVERFLOW: case PT_VALIGN: {
@@ -1700,13 +1127,56 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32
     case PT_INT:
         if (p->size != sizeof(int32_t)) return 0;
         snprintf(text, sizeof text, "%d", (int)*(const int32_t *)field); sb_puts(out, text); return 1;
-    case PT_COLOR: {
-        uint32_t c = *(const uint32_t *)field;
-        *color = c == COLOR_CURRENT ? st->color : c;
-        return 2;
-    }
+    case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
+    case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
+    case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE:
+        return css_computed_value(st, p, out, d) ? 1 : -1;
+    case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
+    case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
+        if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
+        if (p->sh == SH_GAP_RULE) return gap_computed(st, p, out, d);
+        return 0;
     }
     return 0;
+}
+/* CSSOM: a declared value's specified serialization for the properties whose
+   values the table serializes itself; false leaves the authored text */
+static bool apply_long(const struct propdef *p, const char *v, size_t n, struct cx *cx);
+bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out) {
+    const struct propdef *p = css_prop_lookup(name, strlen(name));
+    if (!p) return false;
+    trim(&v, &n);
+    /* a CSS-wide keyword serializes as itself */
+    if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
+        ident_is(v, n, "revert-layer")) return false;
+    if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
+    if (p->group == G_GAP_RULE || (p->type == PT_SHORT && p->sh == SH_GAP_RULE)) return gap_specified(p, v, n, out);
+    if (p->type == PT_SHAPE || p->group != G_STYLE || (p->type == PT_SHORT && p->sh == SH_OFFSET))
+        return css_shape_specified(p->name, v, n, out);
+    if (p->type != PT_COLOR_SCHEME) {
+        /* math functions serialize simplified (CSS Values 4 §10.13); in a <length-percentage> context
+           percentages are lengths' (calc(10% / 1px) is a number there) */
+        unsigned accept = CSS_CALC_ANY;
+        if (p->type == PT_LEN || p->type == PT_PX || p->type == PT_FONT_SIZE || p->type == PT_VALIGN)
+            accept = CSS_CALC_LENGTH | (p->type == PT_PX || (p->type == PT_LEN && (p->flags & LF_NOPCT)) ? 0 : CSS_CALC_PERCENT);
+        else if (p->type == PT_LINE_HEIGHT) accept = CSS_CALC_NUMBER | CSS_CALC_LENGTH | CSS_CALC_PERCENT;
+        return css_calc_specified(v, n, accept, out);
+    }
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    if (!setjmp(trap)) {
+        style_t scratch = {0};
+        uint8_t set[1] = {0};
+        struct cx cx = {.s = &scratch, .a = &a, .set = set, .supports_probe = true};
+        if (apply_long(p, v, n, &cx)) {
+            sb_puts(out, scratch.color_scheme_text ? scratch.color_scheme_text : "normal");
+            ok = true;
+        }
+    }
+    ar_free(&a);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- longhand values */
@@ -1717,6 +1187,553 @@ static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {
             return true;
         }
     return false;
+}
+static const char *kw_name(const struct kw *k, uint8_t v) {
+    for (; k->name; k++) if (k->v == v) return k->name;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- gap decorations (css-gaps-1) */
+static void anim_unit(sbuf *b, double v, const char *unit);
+static struct css_color anim_color_used(const style_t *st, const struct css_color_computed *v);
+static bool anim_color_text(sbuf *b, const struct css_color_computed *v);
+
+/* §4.1-4.3 and §3: currentcolor, none, medium; insets 0; normal; row-over-column */
+static const struct css_rule_item rule_initial_item = {0, 0, 1};
+static const union css_rule_value rule_initial_values[3] = {
+    {.color = {COLOR_CURRENT, NULL}}, {.style = BS_NONE}, {.width = 3}};
+#define RULE_INITIAL_AXIS {                                                                                          \
+    .list = {{&rule_initial_item, &rule_initial_values[CSS_GAP_COLOR], 1, 1},                                     \
+             {&rule_initial_item, &rule_initial_values[CSS_GAP_STYLE], 1, 1},                                     \
+             {&rule_initial_item, &rule_initial_values[CSS_GAP_WIDTH], 1, 1}},                                    \
+    .inset = {{{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}, {{.kind = LK_LEN}, false}}, \
+    .rule_break = CSS_RULE_BREAK_NORMAL, .visibility = CSS_RULE_ITEMS_NORMAL}
+const struct css_gap_rules css_gap_rules_initial = {.axis = {RULE_INITIAL_AXIS, RULE_INITIAL_AXIS},
+                                                    .overlap = CSS_RULE_ROW_OVER_COLUMN};
+
+static bool rule_value_equal(int kind, const union css_rule_value *a, const union css_rule_value *b) {
+    if (kind == CSS_GAP_COLOR) return a->color.argb == b->color.argb && css_color_value_equal(a->color.exact, b->color.exact);
+    return kind == CSS_GAP_STYLE ? a->style == b->style : a->width == b->width;
+}
+static bool rule_items_equal(const struct css_rule_list *a, const struct css_rule_list *b) {
+    if (a->nitems != b->nitems || a->nvalues != b->nvalues) return false;
+    for (uint32_t i = 0; i < a->nitems; i++)
+        if (a->items[i].repeat != b->items[i].repeat || a->items[i].count != b->items[i].count) return false;
+    return true;
+}
+static bool rule_list_equal(int kind, const struct css_rule_list *a, const struct css_rule_list *b) {
+    if (!rule_items_equal(a, b)) return false;
+    for (uint32_t i = 0; i < a->nvalues; i++) if (!rule_value_equal(kind, &a->values[i], &b->values[i])) return false;
+    return true;
+}
+static bool rule_inset_equal(const struct css_rule_inset *a, const struct css_rule_inset *b) {
+    return a->join == b->join && (a->join || css_length_equal(&a->length, &b->length));
+}
+/* what the segments' geometry takes from one axis (layout.c): everything but colour and style */
+static bool rule_axis_layout_equal(const struct css_gap_axis *a, const struct css_gap_axis *b) {
+    if (a->rule_break != b->rule_break || a->visibility != b->visibility ||
+        !rule_list_equal(CSS_GAP_WIDTH, &a->list[CSS_GAP_WIDTH], &b->list[CSS_GAP_WIDTH])) return false;
+    for (int i = 0; i < 4; i++) if (!rule_inset_equal(&a->inset[i], &b->inset[i])) return false;
+    return true;
+}
+bool css_gap_rules_equal(const struct css_gap_rules *a, const struct css_gap_rules *b) {
+    if (a == b) return true;
+    if (!a) a = &css_gap_rules_initial;
+    if (!b) b = &css_gap_rules_initial;
+    if (a->overlap != b->overlap) return false;
+    for (int x = 0; x < 2; x++)
+        if (!rule_axis_layout_equal(&a->axis[x], &b->axis[x]) ||
+            !rule_list_equal(CSS_GAP_COLOR, &a->axis[x].list[CSS_GAP_COLOR], &b->axis[x].list[CSS_GAP_COLOR]) ||
+            !rule_list_equal(CSS_GAP_STYLE, &a->axis[x].list[CSS_GAP_STYLE], &b->axis[x].list[CSS_GAP_STYLE])) return false;
+    return true;
+}
+/* a container records its segments only while its style holds the group (layout.c) */
+bool css_gap_rules_layout_equal(const struct css_gap_rules *a, const struct css_gap_rules *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    return rule_axis_layout_equal(&a->axis[0], &b->axis[0]) && rule_axis_layout_equal(&a->axis[1], &b->axis[1]);
+}
+
+/* how many values item it stands for once written out (an auto repeater's own values once) */
+static uint64_t rule_item_span(const struct css_rule_item *it) {
+    return it->repeat == 0 ? 1 : it->repeat == CSS_RULE_AUTO ? it->count : (uint64_t)it->repeat * it->count;
+}
+/* value k of items [from, to) with their integer repeaters written out */
+static union css_rule_value rule_expanded_at(const struct css_rule_list *l, uint32_t from, uint32_t to, uint64_t k) {
+    for (uint32_t i = from; i < to; i++) {
+        const struct css_rule_item *it = &l->items[i];
+        uint64_t span = rule_item_span(it);
+        if (k < span) return l->values[it->first + (uint32_t)(k % it->count)];
+        k -= span;
+    }
+    return l->values[l->nvalues - 1];
+}
+/* §4.6 "assign gap decoration values to a list of gaps" for gap index of count */
+union css_rule_value css_rule_value_at(const struct css_rule_list *l, uint32_t index, uint32_t count) {
+    uint32_t a = l->nitems;
+    for (uint32_t i = 0; i < l->nitems; i++) if (l->items[i].repeat == CSS_RULE_AUTO) { a = i; break; }
+    uint64_t leading = 0, trailing = 0;
+    for (uint32_t i = 0; i < a; i++) leading += rule_item_span(&l->items[i]);
+    if (a == l->nitems) return rule_expanded_at(l, 0, a, leading ? index % leading : 0);
+    for (uint32_t i = a + 1; i < l->nitems; i++) trailing += rule_item_span(&l->items[i]);
+    if (index < leading) return rule_expanded_at(l, 0, a, index);
+    /* the trailing gaps are the last trailing count, without the leading ones */
+    uint64_t first_trailing = count > trailing ? count - trailing : 0;
+    if (first_trailing < leading) first_trailing = leading;
+    if (index >= first_trailing) return rule_expanded_at(l, a + 1, l->nitems, index - first_trailing);
+    const struct css_rule_item *it = &l->items[a];
+    return l->values[it->first + (uint32_t)((index - leading) % it->count)];
+}
+
+/* the parts of a comma-separated list, each trimmed; -1 for an empty part or an unbalanced bracket */
+static int rule_parts(const char *v, size_t n, struct cx *cx, const char ***tok, size_t **len) {
+    size_t count = 1;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = v[i];
+        if (quote) { if (c == '\\') i++; else if (c == quote) quote = 0; }
+        else if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') depth++;
+        else if (c == ')') { if (!depth) return -1; depth--; }
+        else if (c == ',' && !depth) count++;
+    }
+    if (depth || quote || count > INT32_MAX) return -1;
+    const char **t = ar_alloc(cx->a, count * sizeof *t);
+    size_t *l = ar_alloc(cx->a, count * sizeof *l), k = 0, start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        char c = i < n ? v[i] : ',';
+        if (i < n && quote) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+        if (i < n && (c == '"' || c == '\'')) { quote = c; continue; }
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == ',' && !depth) {
+            const char *s = v + start;
+            size_t m = (i < n ? i : n) - start;
+            trim(&s, &m);
+            if (!m) return -1;
+            t[k] = s; l[k++] = m;
+            start = i + 1;
+        }
+    }
+    *tok = t; *len = l;
+    return (int)k;
+}
+/* repeat( <count> , <values> ): the two arguments' text, when s is that whole function */
+static bool rule_repeat(const char *s, size_t n, const char **count, size_t *count_n, const char **values, size_t *values_n) {
+    if (n < 8 || !strn_ieq(s, "repeat(", 7)) return false;
+    const char *p = s + 7, *end = s + n, *comma = NULL;
+    int depth = 0;
+    for (; p < end; p++) {
+        if (*p == '(') depth++;
+        else if (*p == ')') { if (!depth) break; depth--; }
+        else if (*p == ',' && !depth && !comma) comma = p;
+    }
+    if (p != end - 1) return false; /* its closing bracket ends the part */
+    if (!comma) comma = p;
+    *count = s + 7; *count_n = (size_t)(comma - (s + 7));
+    *values = comma < p ? comma + 1 : p; *values_n = (size_t)(p - *values);
+    return true;
+}
+/* <integer [1,∞]> (a math function rounds to one) or auto */
+static bool rule_repeat_count(const char *s, size_t n, struct cx *cx, uint32_t *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    if (ident_is(s, n, "auto")) { *out = CSS_RULE_AUTO; return true; }
+    size_t i = s[0] == '+' ? 1 : 0;
+    if (i < n && isdigit((unsigned char)s[i])) {
+        uint64_t v = 0;
+        for (; i < n; i++) {
+            if (!isdigit((unsigned char)s[i])) return false;
+            if (v < INT32_MAX) v = v * 10 + (uint64_t)(s[i] - '0');
+        }
+        if (v < 1) return false;
+        *out = v > INT32_MAX ? INT32_MAX : (uint32_t)v; /* integers beyond the range clamp */
+        return true;
+    }
+    float x;
+    if (!isalpha((unsigned char)s[0]) || !parse_number_value(s, n, cx, &x)) return false;
+    x = roundf(x);
+    if (!(x >= 1)) return false;
+    *out = x > (float)INT32_MAX ? INT32_MAX : (uint32_t)x;
+    return true;
+}
+/* §4.3: a <line-width> as a border width snaps (css-values-4 "snap as a border width") */
+static float rule_snap(float w) { return w > 0 && w < 1 ? 1 : floorf(w); }
+static bool rule_width(const char *s, size_t n, struct cx *cx, float *out) {
+    uint8_t k;
+    if (kw_find(kw_bwidth, s, n, &k)) { *out = k; return true; }
+    len_t l;
+    if (!parse_len(s, n, cx, &l, LF_NOPCT | LF_LENGTH) || (l.kind != LK_LEN && l.kind != LK_EXPR)) return false;
+    float px = len_resolve(&l, 0);
+    if (!isfinite(px) || px != len_resolve(&l, 100)) return false; /* a <length>: no percentage inside */
+    *out = rule_snap(px < 0 ? 0 : px); /* a math function clamps to the range */
+    return true;
+}
+/* one value of a list of kind */
+static bool rule_value(int kind, const char *s, size_t n, struct cx *cx, union css_rule_value *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    if (kind == CSS_GAP_STYLE) return kw_find(kw_bstyle, s, n, &out->style);
+    if (kind == CSS_GAP_WIDTH) return rule_width(s, n, cx, &out->width);
+    return css_color_value_compute(s, n, cx, NULL, &out->color.argb, &out->color.exact);
+}
+static void rule_spec_word(sbuf *spec, const char *s, size_t n) {
+    if (!isalpha((unsigned char)s[0])) { shadow_specified_length(spec, s, n); return; }
+    for (size_t i = 0; i < n; i++) sb_putc(spec, (char)lower((unsigned char)s[i]));
+}
+/* §4.4 <gap-rule> = <line-width> || <line-style> || <color>, by list kind; the specified value
+   leaves out what is initial and orders the rest as the grammar does */
+static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_value v[3], sbuf *spec) {
+    const char *t[4];
+    size_t tl[4];
+    int k = split(s, n, t, tl, 4, ' ');
+    if (k < 1 || k > 3 || t[k - 1] + tl[k - 1] != s + n) return false;
+    int at[3] = {-1, -1, -1};
+    v[CSS_GAP_COLOR] = rule_initial_values[CSS_GAP_COLOR];
+    v[CSS_GAP_STYLE] = rule_initial_values[CSS_GAP_STYLE];
+    v[CSS_GAP_WIDTH] = rule_initial_values[CSS_GAP_WIDTH];
+    static const int order[3] = {CSS_GAP_STYLE, CSS_GAP_COLOR, CSS_GAP_WIDTH};
+    for (int i = 0; i < k; i++) {
+        int found = -1;
+        for (int j = 0; j < 3 && found < 0; j++)
+            if (at[order[j]] < 0 && rule_value(order[j], t[i], tl[i], cx, &v[order[j]])) found = order[j];
+        if (found < 0) return false;
+        at[found] = i;
+    }
+    if (!spec) return true;
+    size_t begin = spec->n;
+    int w = at[CSS_GAP_WIDTH], st = at[CSS_GAP_STYLE], c = at[CSS_GAP_COLOR];
+    if (w >= 0 && !ident_is(t[w], tl[w], "medium")) rule_spec_word(spec, t[w], tl[w]);
+    if (st >= 0 && !ident_is(t[st], tl[st], "none")) {
+        if (spec->n > begin) sb_putc(spec, ' ');
+        rule_spec_word(spec, t[st], tl[st]);
+    }
+    if (c >= 0) {
+        sbuf color = {0};
+        if (css_color_specified(t[c], tl[c], &color) && !ident_is(color.p, color.n, "currentcolor")) {
+            if (spec->n > begin) sb_putc(spec, ' ');
+            sb_put(spec, color.p, color.n);
+        }
+        sb_free(&color);
+    }
+    if (spec->n == begin) sb_puts(spec, "medium");
+    return true;
+}
+/* §4.1-4.5: a list of kind's values (kind RULE_GAP: the shorthand's <gap-rule-list>, into the three
+   lists at once, with its specified value in spec) with at most one auto repeater */
+enum { RULE_GAP = 3 };
+static bool rule_lists(int kind, const char *v, size_t n, struct cx *cx, struct css_rule_list out[3], sbuf *spec) {
+    const char **part;
+    size_t *part_n;
+    int parts = rule_parts(v, n, cx, &part, &part_n);
+    if (parts < 1) return false;
+    struct css_rule_item *items = ar_alloc(cx->a, (size_t)parts * sizeof *items);
+    const char ***text = ar_alloc(cx->a, (size_t)parts * sizeof *text);
+    size_t **text_n = ar_alloc(cx->a, (size_t)parts * sizeof *text_n);
+    uint64_t total = 0;
+    bool repeat_auto = false;
+    for (int i = 0; i < parts; i++) {
+        const char *count, *values;
+        size_t count_n, values_n;
+        if (rule_repeat(part[i], part_n[i], &count, &count_n, &values, &values_n)) {
+            uint32_t times;
+            if (!rule_repeat_count(count, count_n, cx, &times)) return false;
+            if (times == CSS_RULE_AUTO) { if (repeat_auto) return false; repeat_auto = true; }
+            int inner = rule_parts(values, values_n, cx, &text[i], &text_n[i]);
+            if (inner < 1) return false;
+            items[i] = (struct css_rule_item){times, (uint32_t)total, (uint32_t)inner};
+            total += (uint64_t)inner;
+        } else {
+            text[i] = &part[i]; text_n[i] = &part_n[i];
+            items[i] = (struct css_rule_item){0, (uint32_t)total, 1};
+            total++;
+        }
+        if (total > UINT32_MAX) return false;
+    }
+    int first = kind == RULE_GAP ? 0 : kind, last = kind == RULE_GAP ? 2 : kind;
+    union css_rule_value *values[3] = {NULL, NULL, NULL};
+    for (int l = first; l <= last; l++) values[l] = ar_alloc(cx->a, (size_t)total * sizeof *values[l]);
+    for (int i = 0; i < parts; i++) {
+        const struct css_rule_item *it = &items[i];
+        if (spec) {
+            if (i) sb_puts(spec, ", ");
+            if (it->repeat == CSS_RULE_AUTO) sb_puts(spec, "repeat(auto, ");
+            else if (it->repeat) { char number[16]; snprintf(number, sizeof number, "repeat(%u, ", it->repeat); sb_puts(spec, number); }
+        }
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (spec && j) sb_puts(spec, ", ");
+            if (kind == RULE_GAP) {
+                union css_rule_value triple[3];
+                if (!gap_rule(text[i][j], text_n[i][j], cx, triple, spec)) return false;
+                for (int l = 0; l < 3; l++) values[l][it->first + j] = triple[l];
+            } else if (!rule_value(kind, text[i][j], text_n[i][j], cx, &values[kind][it->first + j])) return false;
+        }
+        if (spec && it->repeat) sb_putc(spec, ')');
+    }
+    for (int l = first; l <= last; l++) out[l] = (struct css_rule_list){items, values[l], (uint32_t)parts, (uint32_t)total};
+    return true;
+}
+/* <inset-value> (§3.3) */
+static bool rule_inset(const char *s, size_t n, struct cx *cx, struct css_rule_inset *out, sbuf *spec) {
+    trim(&s, &n);
+    if (ident_is(s, n, "overlap-join")) {
+        *out = (struct css_rule_inset){{.kind = LK_LEN}, true};
+        if (spec) sb_puts(spec, "overlap-join");
+        return true;
+    }
+    len_t l;
+    if (!parse_len(s, n, cx, &l, LF_NEG | LF_LENGTH) || (l.kind != LK_LEN && l.kind != LK_EXPR)) return false;
+    *out = (struct css_rule_inset){l, false};
+    if (spec) shadow_specified_length(spec, s, n);
+    return true;
+}
+/* the longhand names each GS_* sets on one axis, after its column- or row- */
+static const char *const gap_longhand_names[GS_INSET + 1][4] = {
+    [GS_RULE] = {"-rule-width", "-rule-style", "-rule-color"},
+    [GS_COLOR] = {"-rule-color"}, [GS_STYLE] = {"-rule-style"}, [GS_WIDTH] = {"-rule-width"},
+    [GS_BREAK] = {"-rule-break"}, [GS_ITEMS] = {"-rule-visibility-items"},
+    [GS_INSET_START] = {"-rule-inset-cap-start", "-rule-inset-junction-start"},
+    [GS_INSET_END] = {"-rule-inset-cap-end", "-rule-inset-junction-end"},
+    [GS_INSET_CAP] = {"-rule-inset-cap-start", "-rule-inset-cap-end"},
+    [GS_INSET_JUNCTION] = {"-rule-inset-junction-start", "-rule-inset-junction-end"},
+    [GS_INSET] = {"-rule-inset-cap-start", "-rule-inset-cap-end", "-rule-inset-junction-start", "-rule-inset-junction-end"},
+};
+static const struct propdef *find_prop(const char *name, size_t n);
+static const struct propdef *gap_longhand(int what, int axis, int i) {
+    const char *suffix = gap_longhand_names[what][i];
+    if (!suffix) return NULL;
+    char name[64];
+    snprintf(name, sizeof name, "%s%s", axis ? "row" : "column", suffix);
+    return find_prop(name, strlen(name));
+}
+/* the inset shorthands' values (§3.3.1-3.3.3) into inset in the longhands' order, each value's
+   specified text in spec (when given) */
+static bool rule_insets(int what, const char *v, size_t n, struct cx *cx, struct css_rule_inset inset[4], sbuf spec[4]) {
+    const char *half[3], *t[3];
+    size_t half_n[3], tn[3];
+    trim(&v, &n);
+    int halves = what == GS_INSET ? split(v, n, half, half_n, 3, '/') : 1;
+    if (what != GS_INSET) { half[0] = v; half_n[0] = n; }
+    if (halves < 1 || halves > 2 || half[halves - 1] + half_n[halves - 1] != v + n) return false;
+    int slot[2][2] = {{CSS_RULE_CAP_START, CSS_RULE_CAP_END}, {CSS_RULE_JUNCTION_START, CSS_RULE_JUNCTION_END}};
+    if (what == GS_INSET_JUNCTION) slot[0][0] = CSS_RULE_JUNCTION_START, slot[0][1] = CSS_RULE_JUNCTION_END;
+    int most = what == GS_INSET_START || what == GS_INSET_END ? 1 : 2;
+    for (int h = 0; h < halves; h++) {
+        if (!half_n[h]) return false;
+        int k = split(half[h], half_n[h], t, tn, 3, ' ');
+        if (k < 1 || k > most || t[k - 1] + tn[k - 1] != half[h] + half_n[h]) return false;
+        if (what == GS_INSET_START || what == GS_INSET_END) {
+            int a = what == GS_INSET_START ? CSS_RULE_CAP_START : CSS_RULE_CAP_END;
+            int b = what == GS_INSET_START ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END;
+            if (!rule_inset(t[0], tn[0], cx, &inset[a], spec ? &spec[a] : NULL)) return false;
+            inset[b] = inset[a];
+            if (spec) sb_put(&spec[b], spec[a].p, spec[a].n);
+            return true;
+        }
+        int a = slot[h][0], b = slot[h][1];
+        if (!rule_inset(t[0], tn[0], cx, &inset[a], spec ? &spec[a] : NULL) ||
+            !rule_inset(t[k - 1], tn[k - 1], cx, &inset[b], spec ? &spec[b] : NULL)) return false;
+    }
+    if (halves == 1 && what == GS_INSET) { /* the junction values are the cap ones */
+        inset[CSS_RULE_JUNCTION_START] = inset[CSS_RULE_CAP_START];
+        inset[CSS_RULE_JUNCTION_END] = inset[CSS_RULE_CAP_END];
+        if (spec) {
+            sb_put(&spec[CSS_RULE_JUNCTION_START], spec[CSS_RULE_CAP_START].p, spec[CSS_RULE_CAP_START].n);
+            sb_put(&spec[CSS_RULE_JUNCTION_END], spec[CSS_RULE_CAP_END].p, spec[CSS_RULE_CAP_END].n);
+        }
+    }
+    return true;
+}
+/* a gap decoration shorthand's value (what: GS_*) into one axis' values */
+static bool gap_shorthand_parse(int what, const char *v, size_t n, struct cx *cx, struct css_gap_axis *out, sbuf *spec,
+                                sbuf inset_spec[4]) {
+    switch (what) {
+    case GS_RULE: return rule_lists(RULE_GAP, v, n, cx, out->list, spec);
+    case GS_COLOR: return rule_lists(CSS_GAP_COLOR, v, n, cx, out->list, NULL);
+    case GS_STYLE: return rule_lists(CSS_GAP_STYLE, v, n, cx, out->list, NULL);
+    case GS_WIDTH: return rule_lists(CSS_GAP_WIDTH, v, n, cx, out->list, NULL);
+    case GS_BREAK: return kw_find(kw_rule_break, v, n, &out->rule_break);
+    case GS_ITEMS: return kw_find(kw_rule_items, v, n, &out->visibility);
+    }
+    return rule_insets(what, v, n, cx, out->inset, inset_spec);
+}
+/* a shorthand: the longhands no more important declaration set, written into one copy of the group */
+static bool set_long(const char *name, const char *v, size_t n, struct cx *cx);
+static bool gap_shorthand_apply(const struct propdef *p, const char *v, size_t n, bool global, struct cx *cx) {
+    int what = p->flags & 15;
+    if (global) {
+        for (int axis = 0; axis < 2; axis++)
+            if (p->flags & (axis ? GS_ROW : GS_COLUMN))
+                for (int i = 0; i < 4; i++) {
+                    const struct propdef *q = gap_longhand(what, axis, i);
+                    if (q) set_long(q->name, v, n, cx);
+                }
+        return true;
+    }
+    struct css_gap_axis parsed = css_gap_rules_initial.axis[0];
+    if (!gap_shorthand_parse(what, v, n, cx, &parsed, NULL, NULL)) return false;
+    if (cx->font_pass) return true;
+    struct css_gap_rules own = *css_style_gap_rules(cx->s);
+    bool written = false;
+    for (int axis = 0; axis < 2; axis++) {
+        if (!(p->flags & (axis ? GS_ROW : GS_COLUMN))) continue;
+        size_t base = offsetof(struct css_gap_rules, axis) + (size_t)axis * sizeof(struct css_gap_axis);
+        for (int i = 0; i < 4; i++) {
+            const struct propdef *q = gap_longhand(what, axis, i);
+            if (!q) continue;
+            int at = css_prop_index(q);
+            if (cx->set[at]) continue;
+            memcpy((char *)&own + q->off, (const char *)&parsed + (q->off - base), q->size);
+            cx->set[at] = 1;
+            written = true;
+        }
+    }
+    if (written) group_write(cx->s, G_GAP_RULE, &own, cx->a);
+    return true;
+}
+
+/* ---- serialization */
+static void rule_value_text(const style_t *st, int kind, const union css_rule_value *v, bool resolved, sbuf *out) {
+    if (kind == CSS_GAP_STYLE) { sb_puts(out, kw_name(kw_bstyle, v->style)); return; }
+    if (kind == CSS_GAP_WIDTH) { anim_unit(out, v->width, "px"); return; }
+    struct css_color_computed c;
+    css_color_held(v->color.argb, v->color.exact, st->color, &c);
+    if (!resolved) { anim_color_text(out, &c); return; }
+    struct css_color used = anim_color_used(st, &c);
+    css_color_serialize(&used, false, out);
+}
+static void rule_repeat_open(const struct css_rule_item *it, sbuf *out) {
+    if (it->repeat == CSS_RULE_AUTO) sb_puts(out, "repeat(auto, ");
+    else { char number[24]; snprintf(number, sizeof number, "repeat(%u, ", it->repeat); sb_puts(out, number); }
+}
+/* a list's computed value; resolved: currentcolor as the used colour (getComputedStyle), else as
+   the animation layer reads it back */
+static void rule_list_text(const style_t *st, int kind, const struct css_rule_list *l, bool resolved, sbuf *out) {
+    for (uint32_t i = 0; i < l->nitems; i++) {
+        const struct css_rule_item *it = &l->items[i];
+        if (i) sb_puts(out, ", ");
+        if (it->repeat) rule_repeat_open(it, out);
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (j) sb_puts(out, ", ");
+            rule_value_text(st, kind, &l->values[it->first + j], resolved, out);
+        }
+        if (it->repeat) sb_putc(out, ')');
+    }
+}
+static bool rule_inset_text(const struct css_rule_inset *v, sbuf *out, web_doc *d) {
+    if (v->join) { sb_puts(out, "overlap-join"); return true; }
+    return css_length_serialize(&v->length, out, d);
+}
+/* §4.8: column-rule and row-rule from their longhands when they are repeater aligned (false: they
+   serialize as the empty string) */
+static bool rule_triple_text(const style_t *st, const struct css_gap_axis *x, sbuf *out) {
+    const struct css_rule_list *w = &x->list[CSS_GAP_WIDTH], *s = &x->list[CSS_GAP_STYLE], *c = &x->list[CSS_GAP_COLOR];
+    if (w->nitems != s->nitems || w->nitems != c->nitems) return false;
+    for (uint32_t i = 0; i < w->nitems; i++)
+        if (w->items[i].repeat != s->items[i].repeat || w->items[i].repeat != c->items[i].repeat ||
+            w->items[i].count != s->items[i].count || w->items[i].count != c->items[i].count) return false;
+    for (uint32_t i = 0; i < w->nitems; i++) {
+        const struct css_rule_item *it = &w->items[i];
+        if (i) sb_puts(out, ", ");
+        if (it->repeat) rule_repeat_open(it, out);
+        for (uint32_t j = 0; j < it->count; j++) {
+            if (j) sb_puts(out, ", ");
+            rule_value_text(st, CSS_GAP_WIDTH, &w->values[w->items[i].first + j], true, out);
+            sb_putc(out, ' ');
+            rule_value_text(st, CSS_GAP_STYLE, &s->values[s->items[i].first + j], true, out);
+            sb_putc(out, ' ');
+            rule_value_text(st, CSS_GAP_COLOR, &c->values[c->items[i].first + j], true, out);
+        }
+        if (it->repeat) sb_putc(out, ')');
+    }
+    return true;
+}
+/* a shorthand's value on one axis: false when its longhands have no common value */
+static bool gap_axis_text(const style_t *st, int what, const struct css_gap_axis *x, sbuf *out, web_doc *d) {
+    const struct css_rule_inset *in = x->inset;
+    switch (what) {
+    case GS_RULE: return rule_triple_text(st, x, out);
+    case GS_COLOR: rule_list_text(st, CSS_GAP_COLOR, &x->list[CSS_GAP_COLOR], true, out); return true;
+    case GS_STYLE: rule_list_text(st, CSS_GAP_STYLE, &x->list[CSS_GAP_STYLE], true, out); return true;
+    case GS_WIDTH: rule_list_text(st, CSS_GAP_WIDTH, &x->list[CSS_GAP_WIDTH], true, out); return true;
+    case GS_BREAK: sb_puts(out, kw_name(kw_rule_break, x->rule_break)); return true;
+    case GS_ITEMS: sb_puts(out, kw_name(kw_rule_items, x->visibility)); return true;
+    case GS_INSET_START: case GS_INSET_END: {
+        int a = what == GS_INSET_START ? CSS_RULE_CAP_START : CSS_RULE_CAP_END;
+        int b = what == GS_INSET_START ? CSS_RULE_JUNCTION_START : CSS_RULE_JUNCTION_END;
+        return rule_inset_equal(&in[a], &in[b]) && rule_inset_text(&in[a], out, d);
+    }
+    case GS_INSET_CAP: case GS_INSET_JUNCTION: {
+        int a = what == GS_INSET_CAP ? CSS_RULE_CAP_START : CSS_RULE_JUNCTION_START;
+        if (!rule_inset_text(&in[a], out, d)) return false;
+        if (rule_inset_equal(&in[a], &in[a + 1])) return true;
+        sb_putc(out, ' ');
+        return rule_inset_text(&in[a + 1], out, d);
+    }
+    }
+    /* <'column-rule-inset-cap'> [ / <'column-rule-inset-junction'> ]?: one value when the four agree */
+    bool same = true;
+    for (int i = 1; i < 4; i++) same &= rule_inset_equal(&in[0], &in[i]);
+    if (same) return rule_inset_text(&in[0], out, d);
+    return rule_inset_text(&in[0], out, d) && (sb_putc(out, ' '), rule_inset_text(&in[1], out, d)) &&
+           (sb_puts(out, " / "), rule_inset_text(&in[2], out, d)) && (sb_putc(out, ' '), rule_inset_text(&in[3], out, d));
+}
+static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
+    const struct css_gap_rules *g = css_style_gap_rules(st);
+    size_t begin = out->n;
+    if (p->type == PT_RULE_LIST) { rule_list_text(st, p->flags, (const struct css_rule_list *)field_of(st, p), true, out); return 1; }
+    if (p->type == PT_RULE_INSET) return rule_inset_text((const struct css_rule_inset *)field_of(st, p), out, d) ? 1 : -1;
+    int what = p->flags & 15;
+    bool column = p->flags & GS_COLUMN, row = p->flags & GS_ROW, ok = true;
+    if (column) ok = gap_axis_text(st, what, &g->axis[0], out, d);
+    if (ok && row) {
+        if (!column) ok = gap_axis_text(st, what, &g->axis[1], out, d);
+        else { /* the bidirectional shorthands: both axes' values, when they agree */
+            sbuf other = {0};
+            ok = gap_axis_text(st, what, &g->axis[1], &other, d) && other.n == out->n - begin &&
+                 !memcmp(other.p, out->p + begin, other.n);
+            sb_free(&other);
+        }
+    }
+    if (!ok) { out->n = begin; sb_cstr(out); }
+    return 1;
+}
+/* CSSOM: a declared value's specified serialization; false leaves the authored text */
+static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    int what = p->type == PT_SHORT ? p->flags & 15 : -1;
+    if (p->type != PT_RULE_INSET && what != GS_RULE && what < GS_INSET_START) return false;
+    if (memchr(v, '\\', n)) return false;
+    for (size_t i = 0; i + 4 <= n; i++) if (strn_ieq(v + i, "var(", 4)) return false;
+    arena_t arena = {.chunk_size = 4096};
+    jmp_buf trap;
+    arena.trap = &trap;
+    size_t begin = out->n;
+    volatile bool ok = false;
+    sbuf spec[4] = {{0}};
+    if (!setjmp(trap)) {
+        struct cx cx = {.em = 16, .rem = 16, .vw = 800, .vh = 600, .a = &arena};
+        struct css_gap_axis parsed = css_gap_rules_initial.axis[0];
+        if (p->type == PT_RULE_INSET) ok = rule_inset(v, n, &cx, &parsed.inset[0], out);
+        else if (what == GS_RULE) ok = rule_lists(RULE_GAP, v, n, &cx, parsed.list, out);
+        else if ((ok = gap_shorthand_parse(what, v, n, &cx, &parsed, NULL, spec))) {
+            /* the shortest form of the specified values, as the computed ones' */
+            int a = what == GS_INSET_JUNCTION ? CSS_RULE_JUNCTION_START : what == GS_INSET_END ? CSS_RULE_CAP_END : 0;
+            int count = what == GS_INSET ? 4 : what == GS_INSET_START || what == GS_INSET_END ? 1 : 2;
+            bool same = true;
+            for (int i = 1; i < count; i++)
+                same &= spec[a + i].n == spec[a].n && !memcmp(spec[a + i].p, spec[a].p, spec[a].n);
+            for (int i = 0; i < (same ? 1 : count); i++) {
+                if (i) sb_puts(out, i == 2 ? " / " : " ");
+                sb_put(out, spec[a + i].p, spec[a + i].n);
+            }
+        }
+    }
+    for (int i = 0; i < 4; i++) sb_free(&spec[i]);
+    ar_free(&arena);
+    if (!ok) out->n = begin;
+    sb_cstr(out);
+    return ok;
 }
 
 static bool parse_display(const char *s, size_t n, uint8_t *out, struct cx *cx) {
@@ -1768,6 +1785,9 @@ static bool parse_display(const char *s, size_t n, uint8_t *out, struct cx *cx) 
 }
 
 static const float font_kw_px[] = {9, 10, 13, 16, 18, 24, 32, 48};
+float css_font_keyword_px(unsigned keyword) {
+    return font_kw_px[keyword < sizeof font_kw_px / sizeof *font_kw_px ? keyword : 3];
+}
 
 static bool parse_font_size(const char *s, size_t n, struct cx *cx, float *out) {
     static const char *const kws[] = {"xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"};
@@ -1803,7 +1823,12 @@ static bool parse_font_weight(const char *s, size_t n, struct cx *cx, uint16_t *
     else if (ident_is(s, n, "bold")) *out = 700;
     else if (ident_is(s, n, "bolder")) *out = pw < 350 ? 400 : pw < 550 ? 700 : 900;
     else if (ident_is(s, n, "lighter")) *out = pw < 550 ? 100 : pw < 750 ? 400 : 700;
-    else {
+    else if (css_calc_is_math(s, n)) {
+        /* a calculation clamps to [1, 1000] (§10.12) */
+        double v;
+        if (!css_numeric_read(s, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &v, NULL)) return false;
+        *out = (uint16_t)(v < 1 ? 1 : v > 1000 ? 1000 : v);
+    } else {
         const char *p = s;
         float v;
         if (!parse_number(&p, s + n, &v) || p != s + n || v < 1 || v > 1000) return false;
@@ -1834,7 +1859,8 @@ const char *css_font_family_next(arena_t *a,const char **cursor,const char *end)
         }
         finish=s;while(finish>begin && is_space((unsigned char)finish[-1]))finish--;
     }
-    if(finish==begin)goto bad;
+    /* A <string> family name may be empty; a <custom-ident>+ one may not. */
+    if(!quoted && finish==begin)goto bad;
     sbuf b={0};css_unescape(&b,begin,(size_t)(finish-begin));
     if(!quoted) {
         size_t write=0;bool space=false;
@@ -1843,8 +1869,9 @@ const char *css_font_family_next(arena_t *a,const char **cursor,const char *end)
         b.n=write;
     }
     const char *name=ar_strndup(a,b.p?b.p:"",b.n);sb_free(&b);
+    /* <custom-ident> excludes the CSS-wide keywords and default (CSS Values 4). */
     if(!quoted && (!strcasecmp(name,"inherit") || !strcasecmp(name,"initial") || !strcasecmp(name,"unset") ||
-       !strcasecmp(name,"revert") || !strcasecmp(name,"revert-layer")))goto bad;
+       !strcasecmp(name,"revert") || !strcasecmp(name,"revert-layer") || !strcasecmp(name,"default")))goto bad;
     if(s<end){s++;const char *tail=s;while(tail<end && is_space((unsigned char)*tail))tail++;if(tail==end)goto bad;}
     *cursor=s;return name;
 bad:*cursor=NULL;return NULL;
@@ -1910,7 +1937,7 @@ static bool parse_list_type(const char *s, size_t n, struct cx *cx, uint8_t *out
 }
 
 /* url(...) contents, unescaped */
-static const char *parse_url(const char *s, size_t n, arena_t *a) {
+const char *css_parse_url(const char *s, size_t n, arena_t *a) {
     if (n < 5 || !strn_ieq(s, "url(", 4) || s[n - 1] != ')') {
         if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) { /* @import "x" */
             sbuf b = {0};
@@ -2009,7 +2036,7 @@ static bool parse_bg_size(const char *s, size_t n, struct cx *cx, len_t *size, u
     return true;
 }
 
-/* ---------------------------------------------------------------- clip-path and clip */
+/* ---------------------------------------------------------------- border-radius lists and clip (shape.c owns clip-path) */
 /* A <border-radius> value: one to four horizontal radii and, after a /, one to four vertical ones,
    expanded to each axis's four corners (TL TR BR BL). */
 static bool parse_radius_list(const char *v, size_t n, struct cx *cx, len_t lengths[2][4]) {
@@ -2027,196 +2054,11 @@ static bool parse_radius_list(const char *v, size_t n, struct cx *cx, len_t leng
     if(count==1)memcpy(lengths[1],lengths[0],sizeof lengths[0]);
     return true;
 }
-static const struct kw kw_clip_box[]={{"border-box",CLIP_BOX_BORDER},{"padding-box",CLIP_BOX_PADDING},
-    {"content-box",CLIP_BOX_CONTENT},{"margin-box",CLIP_BOX_MARGIN},{"fill-box",CLIP_BOX_FILL},
-    {"stroke-box",CLIP_BOX_STROKE},{"view-box",CLIP_BOX_VIEW},{0}};
 /* name(arguments): the arguments, NULL for any other token */
 static const char *function_args(const char *v,size_t n,const char *name,size_t *size) {
     size_t k=strlen(name);
     if(n<k+2||!strn_ieq(v,name,k)||v[k]!='('||v[n-1]!=')')return NULL;
     *size=n-k-2;return v+k+1;
-}
-/* The end of the comma-separated item at s: the next top-level comma, or end. */
-static const char *item_end(const char *s,const char *end) {
-    int depth=0;char quote=0;
-    for(;s<end;s++) {
-        char c=*s;
-        if(quote){if(c=='\\'&&s+1<end)s++;else if(c==quote)quote=0;}
-        else if(c=='"'||c=='\'')quote=c;
-        else if(c=='(')depth++;
-        else if(c==')')depth--;
-        else if(c==','&&depth<=0)break;
-    }
-    return s;
-}
-static bool ends_percent(const char *t,size_t n){return n&&t[n-1]=='%';}
-/* 100% - a - b: inset()'s far edge for rect()'s and xywh()'s (css-shapes-1 §3.2). */
-static void clip_far_edge(struct cx *cx,const len_t *a,const len_t *b,len_t *out) {
-    if(a->kind==LK_LEN&&(!b||b->kind==LK_LEN)) {
-        *out=(len_t){.kind=LK_LEN,.px=-a->px-(b?b->px:0),.pct=100-a->pct-(b?b->pct:0)};return;
-    }
-    struct cexpr *x=ar_alloc(cx->a,sizeof *x);*x=(struct cexpr){.op='v',.pct=100};
-    const len_t *terms[2]={a,b};
-    for(int i=0;i<2&&terms[i];i++) {
-        struct cexpr *term=terms[i]->expr;
-        if(terms[i]->kind!=LK_EXPR){term=ar_alloc(cx->a,sizeof *term);*term=(struct cexpr){.op='v',.px=terms[i]->px,.pct=terms[i]->pct};}
-        struct cexpr *difference=ar_alloc(cx->a,sizeof *difference);*difference=(struct cexpr){.op='-',.a=x,.b=term};x=difference;
-    }
-    *out=(len_t){.kind=LK_EXPR,.expr=x};
-}
-/* [round <'border-radius'>]? closing a rectangle function: the corners (zero without it), and in
-   *before how much of the arguments precedes it */
-static bool parse_clip_round(const char *v,size_t n,struct cx *cx,struct css_clip_path *c,size_t *before) {
-    const char *t[16];size_t tl[16];int k=split_checked(v,n,t,tl,16,' ',cx);
-    *before=n;
-    for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++)c->corner[i].axis[axis]=(len_t){.kind=LK_LEN};
-    for(int i=0;i<k;i++)if(ident_is(t[i],tl[i],"round")) {
-        *before=(size_t)(t[i]-v);
-        const char *radii=t[i]+tl[i];len_t lengths[2][4];
-        if(!parse_radius_list(radii,(size_t)(v+n-radii),cx,lengths))return false;
-        for(int corner=0;corner<4;corner++)for(int axis=0;axis<2;axis++)c->corner[corner].axis[axis]=lengths[axis][corner];
-        break;
-    }
-    return true;
-}
-static bool parse_clip_sides(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
-    const char *t[5];size_t tl[5];int k=split_checked(v,n,t,tl,5,' ',cx);
-    if(k<1||k>4)return false;
-    static const int pick[5][4]={{0},{0,0,0,0},{0,1,0,1},{0,1,2,1},{0,1,2,3}};
-    len_t values[4];unsigned percent=0;
-    for(int i=0;i<k;i++) {
-        if(!parse_len(t[i],tl[i],cx,&values[i],LF_NEG|LF_LENGTH))return false;
-        if(ends_percent(t[i],tl[i]))percent|=1u<<i;
-    }
-    for(int i=0;i<4;i++){c->inset[i]=values[pick[k][i]];if(percent>>pick[k][i]&1)c->inset_percent|=(uint8_t)(1u<<i);}
-    return true;
-}
-/* xywh(x y w h): inset(y, 100% - x - w, 100% - y - h, x) */
-static bool parse_clip_xywh(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
-    const char *t[5];size_t tl[5];
-    if(split_checked(v,n,t,tl,5,' ',cx)!=4)return false;
-    len_t x[4];
-    for(int i=0;i<4;i++)if(!parse_len(t[i],tl[i],cx,&x[i],(i<2?LF_NEG:0)|LF_LENGTH))return false;
-    c->inset[0]=x[1];c->inset[3]=x[0];
-    clip_far_edge(cx,&x[0],&x[2],&c->inset[1]);clip_far_edge(cx,&x[1],&x[3],&c->inset[2]);
-    c->inset_percent=(uint8_t)(1u<<1|1u<<2|(ends_percent(t[1],tl[1])?1u:0)|(ends_percent(t[0],tl[0])?1u<<3:0));
-    return true;
-}
-/* rect(top right bottom left), auto edges the reference box's: inset(top, 100% - right, 100% - bottom, left) */
-static bool parse_clip_rect_shape(const char *v,size_t n,struct cx *cx,struct css_clip_path *c) {
-    const char *t[5];size_t tl[5];
-    if(split_checked(v,n,t,tl,5,' ',cx)!=4)return false;
-    len_t edge[4];unsigned percent=1u<<1|1u<<2;
-    for(int i=0;i<4;i++) {
-        if(ident_is(t[i],tl[i],"auto")){edge[i]=(len_t){.kind=LK_LEN,.pct=i==1||i==2?100:0};percent|=1u<<i;}
-        else if(!parse_len(t[i],tl[i],cx,&edge[i],LF_NEG|LF_LENGTH))return false;
-        else if(ends_percent(t[i],tl[i]))percent|=1u<<i;
-    }
-    c->inset[0]=edge[0];c->inset[3]=edge[3];
-    clip_far_edge(cx,&edge[1],NULL,&c->inset[1]);clip_far_edge(cx,&edge[2],NULL,&c->inset[2]);
-    c->inset_percent=(uint8_t)percent;
-    return true;
-}
-/* circle( <radial-size>? [at <position>]? ), ellipse( [<radial-size>{2}]? [at <position>]? ) */
-static bool parse_clip_radial(const char *v,size_t n,struct cx *cx,struct css_clip_path *c,int radii) {
-    const char *t[8];size_t tl[8];int k=split_checked(v,n,t,tl,8,' ',cx);
-    if(k==8)return false;
-    int at=k;for(int i=0;i<k;i++)if(ident_is(t[i],tl[i],"at")){at=i;break;}
-    if(at&&at!=radii)return false;
-    c->extent[0]=c->extent[1]=CLIP_EXTENT_CLOSEST;
-    for(int i=0;i<at;i++) {
-        if(ident_is(t[i],tl[i],"closest-side"))c->extent[i]=CLIP_EXTENT_CLOSEST;
-        else if(ident_is(t[i],tl[i],"farthest-side"))c->extent[i]=CLIP_EXTENT_FARTHEST;
-        else if(parse_len(t[i],tl[i],cx,&c->radius[i],LF_LENGTH))c->extent[i]=CLIP_EXTENT_LENGTH;
-        else return false;
-    }
-    c->at[0]=c->at[1]=(len_t){.kind=LK_LEN,.pct=50};
-    if(at==k)return true;
-    if(at+1==k)return false;
-    const char *position=t[at+1];size_t size=(size_t)(v+n-position);trim(&position,&size);
-    return !memchr(position,',',size)&&parse_bg_pos(position,size,cx,c->at);
-}
-/* polygon( [<fill-rule> || round <length>]?, [<length-percentage> <length-percentage>]# ) */
-static bool parse_clip_polygon(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
-    const char *end=v+n,*first=item_end(v,end);
-    size_t items=1;for(const char *q=first;q<end;q=item_end(q+1,end))items++;
-    const char *t[5];size_t tl[5];int k=split_checked(v,(size_t)(first-v),t,tl,5,' ',cx);
-    bool evenodd=false;float round=0;
-    if(k>0&&(ident_is(t[0],tl[0],"nonzero")||ident_is(t[0],tl[0],"evenodd")||ident_is(t[0],tl[0],"round"))) {
-        int i=0;
-        if(!ident_is(t[0],tl[0],"round")){evenodd=ident_is(t[0],tl[0],"evenodd");i=1;}
-        if(i<k) {
-            len_t r;
-            if(!ident_is(t[i],tl[i],"round")||i+1>=k||!parse_len(t[i+1],tl[i+1],cx,&r,LF_LENGTH|LF_NOPCT)||r.kind!=LK_LEN)return false;
-            round=r.px;i+=2;
-        }
-        if(i!=k||first==end)return false;
-        v=first+1;items--;
-    }
-    if(items>(SIZE_MAX-sizeof(struct css_clip_path))/sizeof(len_t[2]))return false;
-    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c+items*sizeof c->point[0]);
-    memset(c,0,sizeof *c);
-    c->shape=CLIP_SHAPE_POLYGON;c->evenodd=evenodd;c->round=round;c->points=items;
-    for(size_t i=0;i<items;i++) {
-        const char *e=item_end(v,end),*xy[3];size_t xyn[3];
-        if(split_checked(v,(size_t)(e-v),xy,xyn,3,' ',cx)!=2||!parse_len(xy[0],xyn[0],cx,&c->point[i][0],LF_NEG|LF_LENGTH)||
-           !parse_len(xy[1],xyn[1],cx,&c->point[i][1],LF_NEG|LF_LENGTH))return false;
-        if(!(i&63)&&!cx->supports_probe&&cx->node&&!web_native_checkpoint(cx->node->owner))return false;
-        v=e+1;
-    }
-    *out=c;return true;
-}
-/* path( [<fill-rule>,]? <string> ), the string SVG path data */
-static bool parse_clip_path_data(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
-    const char *end=v+n,*e=item_end(v,end);bool evenodd=false;
-    if(e!=end) {
-        const char *rule=v;size_t size=(size_t)(e-v);trim(&rule,&size);
-        if(ident_is(rule,size,"evenodd"))evenodd=true;
-        else if(!ident_is(rule,size,"nonzero"))return false;
-        v=e+1;
-        if(item_end(v,end)!=end)return false;
-    }
-    size_t size=(size_t)(end-v);trim(&v,&size);
-    if(size<2||(v[0]!='"'&&v[0]!='\'')||v[size-1]!=v[0])return false;
-    sbuf data={0};css_unescape(&data,v+1,size-2);
-    bool valid=data.p&&svg_path_data_valid(data.p);
-    const char *text=valid?ar_strndup(cx->a,data.p,data.n):NULL;
-    sb_free(&data);
-    if(!valid)return false;
-    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);
-    c->shape=CLIP_SHAPE_PATH;c->evenodd=evenodd;c->text=text;*out=c;return true;
-}
-static bool parse_clip_shape(const char *v,size_t n,struct cx *cx,struct css_clip_path **out) {
-    size_t size,before;const char *args;
-    if((args=function_args(v,n,"polygon",&size)))return parse_clip_polygon(args,size,cx,out);
-    if((args=function_args(v,n,"path",&size)))return parse_clip_path_data(args,size,cx,out);
-    struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);*out=c;
-    if((args=function_args(v,n,"circle",&size))){c->shape=CLIP_SHAPE_CIRCLE;return parse_clip_radial(args,size,cx,c,1);}
-    if((args=function_args(v,n,"ellipse",&size))){c->shape=CLIP_SHAPE_ELLIPSE;return parse_clip_radial(args,size,cx,c,2);}
-    c->shape=CLIP_SHAPE_INSET;
-    if((args=function_args(v,n,"inset",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_sides(args,before,cx,c);
-    if((args=function_args(v,n,"xywh",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_xywh(args,before,cx,c);
-    if((args=function_args(v,n,"rect",&size)))return parse_clip_round(args,size,cx,c,&before)&&parse_clip_rect_shape(args,before,cx,c);
-    return false;
-}
-/* clip-path: none | <url> | [<basic-shape> || <geometry-box>] */
-static bool parse_clip_path(const char *v,size_t n,struct cx *cx,const struct css_clip_path **out) {
-    trim(&v,&n);
-    if(ident_is(v,n,"none")){*out=NULL;return true;}
-    const char *t[3];size_t tl[3];int k=split_checked(v,n,t,tl,3,' ',cx);
-    if(k<1||k>2)return false;
-    if(k==1&&n>=5&&strn_ieq(v,"url(",4)&&v[n-1]==')') {
-        const char *ref=parse_url(v,n,cx->a);if(!ref)return false;
-        struct css_clip_path *c=ar_alloc(cx->a,sizeof *c);memset(c,0,sizeof *c);
-        c->shape=CLIP_SHAPE_URL;c->text=ref;*out=c;return true;
-    }
-    struct css_clip_path *shape=NULL;uint8_t box=CLIP_BOX_BORDER;bool box_given=false;
-    for(int i=0;i<k;i++) {
-        if(kw_find(kw_clip_box,t[i],tl[i],&box)){if(box_given)return false;box_given=true;continue;}
-        if(shape||!parse_clip_shape(t[i],tl[i],cx,&shape))return false;
-    }
-    if(!shape){shape=ar_alloc(cx->a,sizeof *shape);memset(shape,0,sizeof *shape);shape->shape=CLIP_SHAPE_BOX;}
-    shape->box=box;*out=shape;return true;
 }
 /* clip: auto | rect(<top>, <right>, <bottom>, <left>), each a length or auto; CSS 2.1's spaces still parse */
 static bool parse_clip_rect(const char *v,size_t n,struct cx *cx,struct css_clip_rect *out) {
@@ -2249,7 +2091,7 @@ static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
     int k = split_checked(s, n, t, tl, 8, ',', cx);
     if (cx->supports_probe && (k != 1 || !strn_ieq(s, "url(", 4))) return false;
     for (int i = 0; i < k; i++) {
-        const char *u = parse_url(t[i], tl[i], cx->a);
+        const char *u = css_parse_url(t[i], tl[i], cx->a);
         if (u) {
             cx->s->mask_image = u;
             cx->s->mask_img = 0;
@@ -2259,6 +2101,7 @@ static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
     return false;
 }
 
+static bool transform_angle(const char *s, size_t n, struct cx *cx, float *out);
 /* linear-gradient(), radial-gradient() and their repeating- forms; NULL if it is not one */
 static const struct gradient *parse_gradient(const char *s, size_t n, struct cx *cx) {
     size_t fl = 0;
@@ -2287,11 +2130,13 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
         size_t cl[8];
         int q = split_checked(a[j], al[j], c, cl, 8, ' ', cx);
         uint32_t col;
-        if (q >= 1 && css_color_checked(c[0], cl[0], &col, cx)) { /* a colour stop: colour [pos [pos]] */
+        const struct css_color_value *exact;
+        if (q >= 1 && css_color_value_compute(c[0], cl[0], cx, NULL, &col, &exact)) { /* a colour stop: colour [pos [pos]] */
             if (cx->supports_probe && q > 3) return NULL;
             for (int z = 0; z < 2 && g.n < GRAD_MAX; z++) {
                 if (z == 1 && q < 3) break;
                 g.col[g.n] = col;
+                g.col_value[g.n] = col == COLOR_CURRENT ? exact : NULL;
                 g.pos[g.n].kind = LK_AUTO;
                 if (q > 1 + z && !parse_len(c[1 + z], cl[1 + z], cx, &g.pos[g.n], 0)) {
                     if (cx->supports_probe) return NULL;
@@ -2321,7 +2166,7 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
                     g.angle = g.to_y < 0 ? 0 : g.to_x > 0 ? 90 : g.to_y > 0 ? 180 : 270;
                     g.to_x = g.to_y = 0;
                 }
-            } else if (q == 1 && comp(c[0], cl[0], 0, &deg)) g.angle = deg;
+            } else if (q == 1 && transform_angle(c[0], cl[0], cx, &deg)) g.angle = deg * 180 / (float)M_PI;
             else return NULL;
             continue;
         }
@@ -2369,7 +2214,7 @@ static bool parse_bg_image(const char *s, size_t n, struct cx *cx) {
     int k = split_checked(s, n, t, tl, 8, ',', cx);
     if (cx->supports_probe && k != 1) return false; /* no layered painting */
     for (int i = 0; i < k; i++) {
-        const char *u = parse_url(t[i], tl[i], cx->a);
+        const char *u = css_parse_url(t[i], tl[i], cx->a);
         if (u) {
             st->bg_image = u;
             st->bg_img = 0;st->has_grad=false;st->gradient=NULL;
@@ -2606,8 +2451,7 @@ static bool is_custom_ident(const char *s, size_t n) {
     return !ident_is(s, n, "auto") && !ident_is(s, n, "span");
 }
 
-/* Deliberately one CSS animation, with an opacity interpolation backend.
-   Lists/steps()/timelines/composition are not accepted as fake support. */
+/* animation-name and transition-property identifiers: <custom-ident> */
 static bool motion_name(const char *s, size_t n) {
     if (!n || ident_is(s,n,"initial") || ident_is(s,n,"inherit") || ident_is(s,n,"unset") ||
         ident_is(s,n,"revert") || ident_is(s,n,"revert-layer") || ident_is(s,n,"default") ||
@@ -2617,66 +2461,320 @@ static bool motion_name(const char *s, size_t n) {
         s[i]!='_' && s[i]!='-') return false;
     return true;
 }
-static bool motion_time(const char *s,size_t n,float *out) {
-    const char *p=s;float v;
-    if (!parse_number(&p,s+n,&v) || !isfinite(v)) return false;
-    if (s+n-p==1 && (*p|32)=='s') v*=1000;
-    else if (s+n-p!=2 || (p[0]|32)!='m' || (p[1]|32)!='s') return false;
-    if (!isfinite(v)) return false;
-    *out=v;return true;
+/* a <time> in milliseconds, or a math function of type <time> (CSS Values 4 §10); duration: it
+   may not be negative, which a calculation clamps to 0 (§10.12) and a literal is invalid */
+static bool motion_time(const char *s,size_t n,struct cx *cx,bool duration,float *out) {
+    double v;
+    bool math=css_calc_is_math(s,n);
+    if (!css_numeric_read(s,n,CSS_CALC_TIME,cx,cx->a,NAN,&v,NULL)) return false;
+    v*=1000;
+    if (math) { if (duration && v<0) v=0; } /* the range clamps a calculation (§10.12) */
+    else if (!isfinite(v) || (duration && v<0)) return false;
+    *out=calc_float(v);return true;
 }
+/* an <easing-function>'s <number> or <integer>: a literal or a math function (no element) */
+static bool easing_number(const char *s,size_t n,bool integer,float *out) {
+    double v;
+    bool math=css_calc_is_math(s,n);
+    if (!css_numeric_read(s,n,CSS_CALC_NUMBER,NULL,NULL,NAN,&v,NULL) || (!math && !isfinite(v))) return false;
+    if (integer) { if (math) v=floor(v+0.5); else if (v!=floor(v)) return false; }
+    *out=calc_float(v);return true;
+}
+/* <easing-function> (css-easing-1 §2): linear, the cubic-bezier() keywords and function,
+   step-start/step-end and steps(<integer>[, <step-position>]). */
 bool css_easing_parse(const char *s,size_t n,struct css_easing *out) {
+    trim(&s,&n);
     struct css_easing v={.kind=CM_BEZIER,.y2=1};
-    if(ident_is(s,n,"linear"))v.kind=CM_LINEAR;
-    else if(ident_is(s,n,"step-start"))v.kind=CM_STEP_START;
-    else if(ident_is(s,n,"step-end"))v.kind=CM_STEP_END;
-    else if(ident_is(s,n,"ease")){v.x1=.25f;v.y1=.1f;v.x2=.25f;}
-    else if(ident_is(s,n,"ease-in")){v.x1=.42f;v.x2=1;}
-    else if(ident_is(s,n,"ease-out")){v.x2=.58f;}
-    else if(ident_is(s,n,"ease-in-out")){v.x1=.42f;v.x2=.58f;}
-    else {
-        if(n<15 || !strn_ieq(s,"cubic-bezier(",13) || s[n-1]!=')')return false;
-        const char *p=s+13,*e=s+n-1;float a[4];
-        for(int i=0;i<4;i++) {
-            while(p<e && is_space((unsigned char)*p))p++;
-            if(!parse_number(&p,e,&a[i]) || !isfinite(a[i]))return false;
-            while(p<e && is_space((unsigned char)*p))p++;
-            if(i<3){if(p==e || *p++!=',')return false;}else if(p!=e)return false;
-        }
-        if(a[0]<0 || a[0]>1 || a[2]<0 || a[2]>1)return false;
-        v.x1=a[0];v.y1=a[1];v.x2=a[2];v.y2=a[3];
+    static const struct {const char *name;float x1,y1,x2;uint8_t keyword;} named[]={
+        {"ease",.25f,.1f,.25f,CM_EASE},{"ease-in",.42f,0,1,CM_EASE_IN},{"ease-out",0,0,.58f,CM_EASE_OUT},
+        {"ease-in-out",.42f,0,.58f,CM_EASE_IN_OUT}};
+    for(size_t i=0;i<sizeof named/sizeof *named;i++)if(ident_is(s,n,named[i].name)){
+        v.x1=named[i].x1;v.y1=named[i].y1;v.x2=named[i].x2;v.keyword=named[i].keyword;*out=v;return true;
     }
+    if(ident_is(s,n,"linear")){*out=(struct css_easing){.kind=CM_LINEAR};return true;}
+    if(ident_is(s,n,"step-start")){*out=(struct css_easing){.kind=CM_STEPS,.steps=1,.position=CM_STEP_START};return true;}
+    if(ident_is(s,n,"step-end")){*out=(struct css_easing){.kind=CM_STEPS,.steps=1,.position=CM_STEP_END};return true;}
+    if(n>7 && strn_ieq(s,"steps(",6) && s[n-1]==')') {
+        const char *t[3];size_t tl[3];int k=split(s+6,n-7,t,tl,3,',');
+        if(k<1 || k>2)return false;
+        float count;
+        if(!easing_number(t[0],tl[0],true,&count) || count<1)return false;
+        if(count>1e9f)count=1e9f; /* steps beyond a float's integers are not told apart */
+        uint8_t position=CM_STEP_END;
+        if(k==2) {
+            static const struct kw positions[]={{"end",CM_STEP_END},{"jump-end",CM_STEP_END},{"start",CM_STEP_START},
+                {"jump-start",CM_STEP_JUMP_START},{"jump-both",CM_STEP_JUMP_BOTH},{"jump-none",CM_STEP_JUMP_NONE},{0}};
+            if(!kw_find(positions,t[1],tl[1],&position))return false;
+        }
+        if(position==CM_STEP_JUMP_NONE && count<2)return false;
+        *out=(struct css_easing){.kind=CM_STEPS,.steps=(uint32_t)count,.position=position};return true;
+    }
+    if(n<15 || !strn_ieq(s,"cubic-bezier(",13) || s[n-1]!=')')return false;
+    const char *t[5];size_t tl[5];float a[4];
+    if(split(s+13,n-14,t,tl,5,',')!=4)return false;
+    for(int i=0;i<4;i++) if(!easing_number(t[i],tl[i],false,&a[i]))return false;
+    if(a[0]<0 || a[0]>1 || a[2]<0 || a[2]>1)return false;
+    v.x1=a[0];v.y1=a[1];v.x2=a[2];v.y2=a[3];
     *out=v;return true;
 }
-static bool motion_shorthand(const char *s,size_t n,struct cx *cx,struct css_motion *out) {
-    const char *t[10];size_t tl[10];int k=split(s,n,t,tl,10,' ');
-    if(!k || t[k-1]+tl[k-1]!=s+n)return false;
-    struct css_motion v=initial.motion;
-    unsigned seen=0,times=0;
-    for(int i=0;i<k;i++) {
-        float f;uint8_t kw;struct css_easing ease;
-        if(motion_time(t[i],tl[i],&f)) {
-            if(times==0){if(f<0)return false;v.duration=f;}
-            else if(times==1)v.delay=f;else return false;
-            times++;continue;
+static double bezier_at(double t,double p1,double p2){double u=1-t;return 3*u*u*t*p1+3*u*t*t*p2+t*t*t;}
+double css_easing_apply(const struct css_easing *e,double x,bool before) {
+    if(!e || e->kind==CM_LINEAR || !isfinite(x))return x;
+    if(e->kind==CM_STEPS) {
+        /* css-easing-1 §2.3 step easing function */
+        double steps=e->steps?e->steps:1,current=floor(x*steps);
+        if(e->position==CM_STEP_START || e->position==CM_STEP_JUMP_START || e->position==CM_STEP_JUMP_BOTH)current+=1;
+        if(before && fmod(x*steps,1)==0)current-=1;
+        if(x>=0 && current<0)current=0;
+        double jumps=e->position==CM_STEP_JUMP_BOTH?steps+1:e->position==CM_STEP_JUMP_NONE?steps-1:steps;
+        if(x<=1 && current>jumps)current=jumps;
+        return current/jumps;
+    }
+    double x1=e->x1,y1=e->y1,x2=e->x2,y2=e->y2;
+    /* §2.2: outside [0, 1] the curve continues along its end tangents */
+    if(x<0) {
+        if(x1>0)return y1/x1*x;
+        if(y1==0 && x2>0)return y2/x2*x;
+        return 0;
+    }
+    if(x>1) {
+        if(x2<1)return 1+(y2-1)/(x2-1)*(x-1);
+        if(y2==1 && x1<1)return 1+(y1-1)/(x1-1)*(x-1);
+        return 1;
+    }
+    if(x==0 || x==1)return x;
+    double t=x;
+    for(int i=0;i<8;i++) {
+        double err=bezier_at(t,x1,x2)-x,u=1-t,slope=3*u*u*x1+6*u*t*(x2-x1)+3*t*t*(1-x2);
+        if(fabs(err)<1e-9)return bezier_at(t,y1,y2);
+        if(fabs(slope)<1e-6)break;
+        t-=err/slope;
+    }
+    double lo=0,hi=1;t=x;
+    for(int i=0;i<60;i++){double z=bezier_at(t,x1,x2);if(fabs(z-x)<1e-9)break;if(z<x)lo=t;else hi=t;t=(lo+hi)/2;}
+    return bezier_at(t,y1,y2);
+}
+bool css_easing_serialize(const struct css_easing *e,sbuf *out) {
+    static const char *const keywords[]={NULL,"ease","ease-in","ease-out","ease-in-out"};
+    char text[160];
+    if(e->kind==CM_LINEAR)snprintf(text,sizeof text,"linear");
+    else if(e->kind==CM_STEPS) {
+        static const char *const positions[]={"",", start",", jump-start",", jump-both",", jump-none"};
+        snprintf(text,sizeof text,"steps(%u%s)",(unsigned)e->steps,positions[e->position<5?e->position:0]);
+    } else if(e->keyword && e->keyword<5)snprintf(text,sizeof text,"%s",keywords[e->keyword]);
+    else snprintf(text,sizeof text,"cubic-bezier(%.7g, %.7g, %.7g, %.7g)",(double)e->x1,(double)e->y1,(double)e->x2,(double)e->y2);
+    sb_puts(out,text);return true;
+}
+bool css_easing_same(const struct css_easing *a, const struct css_easing *b) {
+    return a->kind == b->kind && a->x1 == b->x1 && a->y1 == b->y1 && a->x2 == b->x2 && a->y2 == b->y2 &&
+        a->steps == b->steps && a->position == b->position && a->keyword == b->keyword;
+}
+static union css_motion_item motion_initial(int list) {
+    union css_motion_item v;
+    memset(&v, 0, sizeof v);
+    if (list == ML_EASING || list == ML_TEASING) v.e = (struct css_easing){.x1=.25f,.y1=.1f,.x2=.25f,.y2=1,.kind=CM_BEZIER,.keyword=CM_EASE};
+    else if (list == ML_ITERATIONS) v.f = 1;
+    else if (list == ML_TPROPERTY) v.s = "all";
+    return v;
+}
+union css_motion_item css_motion_item(const style_t *st, int list, uint32_t i) {
+    const struct css_motion_list *l = st->motion.list[list];
+    return l && l->count ? l->v[i % l->count] : motion_initial(list);
+}
+uint32_t css_motion_count(const style_t *st, int list) {
+    const struct css_motion_list *l = st->motion.list[list];
+    return l && l->count ? l->count : 1;
+}
+static bool motion_item_equal(int list, union css_motion_item a, union css_motion_item b) {
+    switch (list) {
+    case ML_NAME: case ML_TPROPERTY: return a.s == b.s || (a.s && b.s && !strcmp(a.s, b.s));
+    case ML_EASING: case ML_TEASING: return css_easing_same(&a.e, &b.e);
+    case ML_DURATION: case ML_DELAY: case ML_ITERATIONS: case ML_TDURATION: case ML_TDELAY:
+        return a.f == b.f || (isnan(a.f) && isnan(b.f));
+    }
+    return a.k == b.k;
+}
+bool css_motion_equal(const struct css_motion *a, const struct css_motion *b) {
+    style_t x, y;
+    x.motion = *a; y.motion = *b;
+    for (int list = 0; list < ML_COUNT; list++) {
+        if (a->list[list] == b->list[list]) continue;
+        uint32_t count = css_motion_count(&x, list);
+        if (count != css_motion_count(&y, list)) return false;
+        for (uint32_t i = 0; i < count; i++)
+            if (!motion_item_equal(list, css_motion_item(&x, list, i), css_motion_item(&y, list, i))) return false;
+    }
+    return true;
+}
+/* one item of an animation-* or transition-* list */
+static bool motion_item_parse(int list, const struct kw *kws, const char *s, size_t n, struct cx *cx, union css_motion_item *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    *out = motion_initial(list);
+    uint8_t k;
+    const char *q = s;
+    switch (list) {
+    case ML_NAME:
+        if (ident_is(s, n, "none")) { out->s = NULL; return true; }
+        if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) {
+            /* <keyframes-name>: a <string>, not the empty one */
+            sbuf b = {0}; css_unescape(&b, s + 1, n - 2);
+            bool named = b.n != 0;
+            if (named) out->s = ar_strdup(cx->a, sb_cstr(&b));
+            sb_free(&b);
+            return named;
         }
-        if(!(seen&1) && css_easing_parse(t[i],tl[i],&ease)){v.easing=ease;seen|=1;continue;}
-        if(!(seen&2) && kw_find(kw_motion_direction,t[i],tl[i],&kw)){v.direction=kw;seen|=2;continue;}
-        if(!(seen&4) && kw_find(kw_motion_fill,t[i],tl[i],&kw)){v.fill=kw;seen|=4;continue;}
-        if(!(seen&8) && kw_find(kw_motion_play,t[i],tl[i],&kw)){v.paused=kw;seen|=8;continue;}
-        const char *p=t[i];
-        if(!(seen&16) && (ident_is(t[i],tl[i],"infinite") ||
-            (parse_number(&p,t[i]+tl[i],&f) && p==t[i]+tl[i] && isfinite(f) && f>=0))) {
-            v.iterations=ident_is(t[i],tl[i],"infinite")?INFINITY:f;seen|=16;continue;
+        if (!motion_name(s, n)) return false;
+        out->s = ar_strndup(cx->a, s, n);
+        return true;
+    case ML_DURATION:
+        if (ident_is(s, n, "auto")) { out->f = NAN; return true; }
+        return motion_time(s, n, cx, true, &out->f);
+    case ML_TDURATION: return motion_time(s, n, cx, true, &out->f);
+    case ML_DELAY: case ML_TDELAY: return motion_time(s, n, cx, false, &out->f);
+    case ML_EASING: case ML_TEASING: return css_easing_parse(s, n, &out->e);
+    case ML_ITERATIONS:
+        if (ident_is(s, n, "infinite")) { out->f = INFINITY; return true; }
+        if (css_calc_is_math(s, n)) {
+            /* a calculation clamps to [0, infinity], which the count keeps (§10.12) */
+            double v;
+            if (!css_numeric_read(s, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &v, NULL)) return false;
+            out->f = v < 0 ? 0 : v > FLT_MAX ? INFINITY : (float)v;
+            return true;
         }
-        if(!(seen&32) && (ident_is(t[i],tl[i],"none") || motion_name(t[i],tl[i]))) {
-            v.name=ident_is(t[i],tl[i],"none")?NULL:ar_strndup(cx->a,t[i],tl[i]);seen|=32;continue;
+        return parse_number(&q, s + n, &out->f) && q == s + n && isfinite(out->f) && out->f >= 0;
+    case ML_TPROPERTY: {
+        if (ident_is(s, n, "all")) { out->s = "all"; return true; }
+        if (ident_is(s, n, "none") || !motion_name(s, n)) return false;
+        /* a supported property keeps its lowercase name; any other identifier is kept as written */
+        const struct propdef *p = n > 2 && s[0] == '-' && s[1] == '-' ? NULL : css_prop_lookup(s, n);
+        char *copy = ar_strndup(cx->a, s, n);
+        if (p) for (size_t i = 0; i < n; i++) copy[i] = (char)lower((unsigned char)copy[i]);
+        out->s = copy;
+        return true;
+    }
+    }
+    if (!kw_find(kws, s, n, &k)) return false;
+    out->k = k;
+    return true;
+}
+/* the top-level comma-separated items of v: their count, and the first max of them */
+static size_t motion_items(const char *v, size_t n, const char **items, size_t *lengths, size_t max) {
+    size_t count = 0, start = 0;
+    int depth = 0; char quote = 0;
+    for (size_t i = 0; i <= n; i++) {
+        char c = i < n ? v[i] : ',';
+        if (quote && i < n) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+        if (i < n && (c == '"' || c == '\'')) quote = c;
+        else if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == ',' && (depth <= 0 || i == n)) { /* the end closes what is open (CSS Syntax) */
+            if (count < max) { items[count] = v + start; lengths[count] = i - start; }
+            count++; start = i + 1;
         }
+    }
+    return count;
+}
+static struct css_motion_list *motion_list_new(struct cx *cx, size_t count) {
+    struct css_motion_list *l = ar_alloc(cx->a, sizeof *l + count * sizeof *l->v);
+    l->count = (uint32_t)count;
+    return l;
+}
+static bool parse_motion_list(const struct propdef *p, const char *v, size_t n, struct cx *cx, const struct css_motion_list **out) {
+    size_t count = motion_items(v, n, NULL, NULL, 0);
+    if (!count || count > 1u << 20) return false;
+    const char **items = ar_alloc(cx->a, count * sizeof *items);
+    size_t *lengths = ar_alloc(cx->a, count * sizeof *lengths);
+    motion_items(v, n, items, lengths, count);
+    struct css_motion_list *l = motion_list_new(cx, count);
+    for (size_t i = 0; i < count; i++) {
+        const char *s = items[i]; size_t len = lengths[i];
+        trim(&s, &len);
+        /* transition-property: none stands alone */
+        if (p->flags == ML_TPROPERTY && ident_is(s, len, "none")) {
+            if (count != 1) return false;
+            l->v[0].s = NULL;
+            continue;
+        }
+        if (!motion_item_parse(p->flags, p->kws, s, len, cx, &l->v[i])) return false;
+    }
+    *out = l;
+    return true;
+}
+/* <single-animation> (CSS Animations 1 §3.11): the first <time> is the duration, the second the
+   delay; a keyword another longhand takes is that longhand's before it can be a name */
+static bool animation_single(const char *s, size_t n, struct cx *cx, union css_motion_item *v) {
+    const char *t[10]; size_t tl[10];
+    int k = split(s, n, t, tl, 10, ' ');
+    if (!k || k > 8) return false;
+    for (int list = ML_NAME; list <= ML_PLAY; list++) v[list] = motion_initial(list);
+    unsigned seen = 0, times = 0;
+    for (int i = 0; i < k; i++) {
+        union css_motion_item item;
+        if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
+            if (times == 0) { if (!motion_time(t[i], tl[i], cx, true, &item.f)) return false; v[ML_DURATION] = item; }
+            else if (times == 1) v[ML_DELAY] = item;
+            else return false;
+            times++; continue;
+        }
+        if (!(seen & 1) && motion_item_parse(ML_EASING, NULL, t[i], tl[i], cx, &item)) { v[ML_EASING] = item; seen |= 1; continue; }
+        if (!(seen & 2) && motion_item_parse(ML_ITERATIONS, NULL, t[i], tl[i], cx, &item)) { v[ML_ITERATIONS] = item; seen |= 2; continue; }
+        if (!(seen & 4) && motion_item_parse(ML_DIRECTION, kw_motion_direction, t[i], tl[i], cx, &item)) { v[ML_DIRECTION] = item; seen |= 4; continue; }
+        if (!(seen & 8) && motion_item_parse(ML_FILL, kw_motion_fill, t[i], tl[i], cx, &item)) { v[ML_FILL] = item; seen |= 8; continue; }
+        if (!(seen & 16) && motion_item_parse(ML_PLAY, kw_motion_play, t[i], tl[i], cx, &item)) { v[ML_PLAY] = item; seen |= 16; continue; }
+        if (!(seen & 32) && motion_item_parse(ML_NAME, NULL, t[i], tl[i], cx, &item)) { v[ML_NAME] = item; seen |= 32; continue; }
         return false;
     }
-    *out=v;return true;
+    return true;
 }
-
+/* <single-transition> (CSS Transitions 1 §2.5, 2 §2): [none | <single-transition-property>] || <time> ||
+   <easing-function> || <time> || <transition-behavior-value> */
+static bool transition_single(const char *s, size_t n, struct cx *cx, union css_motion_item *v, bool *none) {
+    const char *t[8]; size_t tl[8];
+    int k = split(s, n, t, tl, 8, ' ');
+    if (!k || k > 5) return false;
+    for (int list = ML_TPROPERTY; list <= ML_TBEHAVIOR; list++) v[list] = motion_initial(list);
+    unsigned seen = 0, times = 0;
+    *none = false;
+    for (int i = 0; i < k; i++) {
+        union css_motion_item item;
+        if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
+            if (times == 0) { if (!motion_time(t[i], tl[i], cx, true, &item.f)) return false; v[ML_TDURATION] = item; }
+            else if (times == 1) v[ML_TDELAY] = item;
+            else return false;
+            times++; continue;
+        }
+        if (!(seen & 1) && motion_item_parse(ML_TEASING, NULL, t[i], tl[i], cx, &item)) { v[ML_TEASING] = item; seen |= 1; continue; }
+        if (!(seen & 2) && motion_item_parse(ML_TBEHAVIOR, kw_transition_behavior, t[i], tl[i], cx, &item)) { v[ML_TBEHAVIOR] = item; seen |= 2; continue; }
+        if (!(seen & 4) && ident_is(t[i], tl[i], "none")) { v[ML_TPROPERTY].s = NULL; *none = true; seen |= 4; continue; }
+        if (!(seen & 4) && motion_item_parse(ML_TPROPERTY, NULL, t[i], tl[i], cx, &item)) { v[ML_TPROPERTY] = item; seen |= 4; continue; }
+        return false;
+    }
+    return true;
+}
+/* the animation or transition shorthand: every longhand gets a list of the same length */
+static bool motion_shorthand(bool animation, const char *v, size_t n, struct cx *cx, struct css_motion *out) {
+    size_t count = motion_items(v, n, NULL, NULL, 0);
+    if (!count || count > 1u << 20) return false;
+    const char **items = ar_alloc(cx->a, count * sizeof *items);
+    size_t *lengths = ar_alloc(cx->a, count * sizeof *lengths);
+    motion_items(v, n, items, lengths, count);
+    int first = animation ? ML_NAME : ML_TPROPERTY, last = animation ? ML_PLAY : ML_TBEHAVIOR;
+    struct css_motion_list *lists[ML_COUNT] = {0};
+    for (int list = first; list <= last; list++) lists[list] = motion_list_new(cx, count);
+    for (size_t i = 0; i < count; i++) {
+        union css_motion_item item[ML_COUNT];
+        const char *s = items[i]; size_t len = lengths[i];
+        trim(&s, &len);
+        bool none = false;
+        if (!len || !(animation ? animation_single(s, len, cx, item) : transition_single(s, len, cx, item, &none))) return false;
+        if (none && count != 1) return false;
+        for (int list = first; list <= last; list++) lists[list]->v[i] = item[list];
+    }
+    memset(out, 0, sizeof *out);
+    for (int list = first; list <= last; list++) out->list[list] = lists[list];
+    return true;
+}
 static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g) {
     memset(g, 0, sizeof *g);
     if (ident_is(s, n, "auto")) return true;
@@ -2716,7 +2814,14 @@ static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g)
     return true;
 }
 
-static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src) {
+/* src's value of p into dst; a: where dst's copy of a group goes */
+static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src, arena_t *a) {
+    if (p->group != G_STYLE) {
+        if (group_same(dst, src, p->group)) return;
+        char *own = group_write(dst, p->group, group_of(dst, p->group), a);
+        memcpy(own + p->off, field_of(src, p), p->size);
+        return;
+    }
     memcpy((char *)dst + p->off, (const char *)src + p->off, p->size);
     switch (p->type) {
     case PT_DISPLAY: dst->legacy_box = src->legacy_box; break;
@@ -2734,6 +2839,7 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src)
     case PT_ZINDEX: dst->z_auto = src->z_auto; break;
     case PT_BG_SIZE: dst->bg_size_kind = src->bg_size_kind; break;
     case PT_MASK_SIZE: dst->mask_size_kind = src->mask_size_kind; break;
+    case PT_COLOR_SCHEME: dst->color_scheme_text = src->color_scheme_text; break;
     }
 }
 
@@ -2745,23 +2851,26 @@ static bool parse_translate_value(const char *v,size_t n,struct cx *cx,struct cs
     for(int i=0;i<count;i++)if(!parse_len(parts[i],lengths[i],cx,&t.xy[i],LF_NEG|LF_LENGTH))return false;
     t.active=true;*out=t;return true;
 }
-static bool transform_number(const char *s,size_t n,bool percentage,float *out){
-    trim(&s,&n);const char *p=s,*e=s+n;float v;
-    if(!parse_number(&p,e,&v)||!isfinite(v))return false;
-    if(p==e){*out=v;return true;}
-    if(percentage&&p+1==e&&*p=='%'){*out=v/100;return true;}
-    return false;
+/* a <number> (percentage: or a <percentage>, as a fraction) of a transform: a literal or a math function */
+static bool transform_number(const char *s,size_t n,struct cx *cx,bool percentage,float *out){
+    double v;unsigned kind;
+    bool math=css_calc_is_math(s,n);
+    if(!css_numeric_read(s,n,CSS_CALC_NUMBER|(percentage?CSS_CALC_PERCENT:0),cx,cx->a,NAN,&v,&kind))return false;
+    if(kind==CSS_CALC_PERCENT)v/=100;
+    if(!math&&(!isfinite(v)||fabs(v)>FLT_MAX))return false;
+    *out=calc_float(v);return true;
 }
-static bool transform_angle(const char *s,size_t n,float *out){
-    trim(&s,&n);const char *p=s,*e=s+n;float v;
-    if(!parse_number(&p,e,&v))return false;
-    size_t unit=(size_t)(e-p);double r;
-    if(!unit){if(v!=0)return false;r=0;} /* unitless zero only */
-    else if(ident_is(p,unit,"deg"))r=v*M_PI/180;
-    else if(ident_is(p,unit,"rad"))r=v;
-    else if(ident_is(p,unit,"grad"))r=v*M_PI/200;
-    else if(ident_is(p,unit,"turn"))r=v*2*M_PI;
-    else return false;
+/* an <angle> of a transform in radians: a literal (unitless zero too) or a math function of type <angle> */
+static bool transform_angle(const char *s,size_t n,struct cx *cx,float *out){
+    double v;unsigned kind;
+    bool math=css_calc_is_math(s,n);
+    if(!css_numeric_read(s,n,CSS_CALC_ANGLE|(math?0:CSS_CALC_NUMBER),cx,cx->a,NAN,&v,&kind))return false;
+    if(kind==CSS_CALC_NUMBER&&v!=0)return false; /* unitless zero only */
+    if(!isfinite(v)){
+        if(!math)return false;
+        v=0; /* an infinite or NaN calculation is no turn: it has no angle in range to clamp to */
+    }
+    double r=v*M_PI/180;
     *out=(float)r;return isfinite(*out);
 }
 static struct css_transform transform_identity(uint8_t kind){
@@ -2777,7 +2886,7 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
     if(IS("matrix")||IS("matrix3d")){
         bool three=IS("matrix3d");float v[16];
         if(count!=(three?16:6))return false;
-        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],false,&v[i]))return false;
+        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],cx,false,&v[i]))return false;
         *t=transform_identity(CT_MATRIX);
         if(three){for(int r=0;r<4;r++)for(int c=0;c<4;c++)t->m[r*4+c]=v[c*4+r];} /* column-major input */
         else{t->m[0]=v[0];t->m[4]=v[1];t->m[1]=v[2];t->m[5]=v[3];t->m[3]=v[4];t->m[7]=v[5];}
@@ -2800,7 +2909,7 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
         *t=transform_identity(CT_SCALE);
         bool both=IS("scale"),three=IS("scale3d");float v[3];
         if(three?count!=3:both?(count<1||count>2):count!=1)return false;
-        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],true,&v[i]))return false;
+        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],cx,true,&v[i]))return false;
         if(three){t->v[0]=v[0];t->v[1]=v[1];t->v[2]=v[2];}
         else if(both){t->v[0]=v[0];t->v[1]=count>1?v[1]:v[0];}
         else t->v[IS("scaleX")?0:IS("scaleY")?1:2]=v[0];
@@ -2810,10 +2919,10 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
         *t=transform_identity(CT_ROTATE);
         if(IS("rotate3d")){
             if(count!=4)return false;
-            for(int i=0;i<3;i++)if(!transform_number(a[i],al[i],false,&t->v[i]))return false;
-            return transform_angle(a[3],al[3],&t->v[3]);
+            for(int i=0;i<3;i++)if(!transform_number(a[i],al[i],cx,false,&t->v[i]))return false;
+            return transform_angle(a[3],al[3],cx,&t->v[3]);
         }
-        if(count!=1||!transform_angle(a[0],al[0],&t->v[3]))return false;
+        if(count!=1||!transform_angle(a[0],al[0],cx,&t->v[3]))return false;
         if(IS("rotateX")){t->v[0]=1;t->v[2]=0;}
         else if(IS("rotateY")){t->v[1]=1;t->v[2]=0;}
         return true;
@@ -2821,13 +2930,13 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
     if(IS("skew")||IS("skewX")||IS("skewY")){
         *t=transform_identity(CT_SKEW);
         if(IS("skew")?(count<1||count>2):count!=1)return false;
-        for(int i=0;i<count;i++)if(!transform_angle(a[i],al[i],&t->v[IS("skewY")?1:i]))return false;
+        for(int i=0;i<count;i++)if(!transform_angle(a[i],al[i],cx,&t->v[IS("skewY")?1:i]))return false;
         return true;
     }
     if(IS("perspective")){
         *t=transform_identity(CT_PERSPECTIVE);
         if(count!=1)return false;
-        if(ident_is(a[0],al[0],"none"))return true;
+        if(ident_is(a[0],al[0],"none")){t->v[1]=1;return true;}
         len_t depth;if(!parse_len(a[0],al[0],cx,&depth,LF_NOPCT|LF_LENGTH))return false;
         t->v[0]=len_resolve(&depth,0);return true;
     }
@@ -2853,15 +2962,60 @@ static bool parse_transform_value(const char *v,size_t n,struct cx *cx,const str
     }
     if(!first)return false;*out=first;return true;
 }
+bool css_transform_string_matrix(const char *s,size_t n,double m[16],bool *two_d){
+    static const char identity2d[]="matrix(1, 0, 0, 1, 0, 0)";
+    if(!n){s=identity2d;n=sizeof identity2d-1;}
+    if(n>65536)return false;
+    /* A comment separates tokens as white space does: "none" followed by a comment is none, a
+       comment between a function's name and its parenthesis leaves no function. */
+    char *text=malloc(n+1);if(!text)return false;
+    size_t len=0;
+    for(size_t i=0;i<n;){
+        if(s[i]=='/'&&i+1<n&&s[i+1]=='*'){
+            const char *close=NULL;for(size_t j=i+2;j+1<n;j++)if(s[j]=='*'&&s[j+1]=='/'){close=s+j;break;}
+            text[len++]=' ';i=close?(size_t)(close-s)+2:n;continue;
+        }
+        text[len++]=s[i++];
+    }
+    const char *v=text;size_t vn=len;trim(&v,&vn);
+    bool ok=false,flat=true;
+    arena_t *a=calloc(1,sizeof *a);
+    jmp_buf trap;
+    if(a){
+        a->limit=1u<<20;a->trap=&trap;
+        if(!setjmp(trap)){
+            style_t style,parent;css_style_init(&parent,NULL);css_style_init(&style,&parent);
+            struct cx cx={.s=&style,.parent=&parent,.em=16,.rem=16,.vw=800,.vh=600,.a=a,
+                .set=ar_alloc(a,(size_t)css_prop_count()),.supports_probe=true,.absolute_lengths=true};
+            const struct css_transform *t=NULL;
+            if(parse_transform_value(v,vn,&cx,&t)&&!cx.invalid){
+                double r[16];css_transform_list_matrix_3d(t,r);
+                for(int c=0;c<4;c++)for(int row=0;row<4;row++)m[c*4+row]=r[row*4+c];
+                ok=true;
+                /* 2D-ness is by function name, not by value: translate3d(0, 0, 0) is 3D. */
+                static const char *const three[]={"matrix3d","translate3d","translateZ","scale3d","scaleZ","rotate3d","rotateX","rotateY","perspective"};
+                for(size_t i=0;i<vn;){
+                    if(!isalpha((unsigned char)v[i])){i++;continue;}
+                    size_t start=i;while(i<vn&&(isalnum((unsigned char)v[i])||v[i]=='-'))i++;
+                    if(i<vn&&v[i]=='(')for(size_t k=0;k<sizeof three/sizeof *three;k++)if(ident_is(v+start,i-start,three[k]))flat=false;
+                }
+            }
+        }
+        ar_free(a);free(a);
+    }
+    free(text);
+    if(ok)*two_d=flat;
+    return ok;
+}
 /* rotate: none | <angle> | [x | y | z | <number>{3}] && <angle> */
 static bool parse_rotate_value(const char *v,size_t n,struct cx *cx,const struct css_transform **out){
     if(ident_is(v,n,"none")){*out=NULL;return true;}
     const char *t[5];size_t tl[5];int k=split_checked(v,n,t,tl,5,' ',cx);
     struct css_transform value=transform_identity(CT_ROTATE);
-    if(k==1){if(!transform_angle(t[0],tl[0],&value.v[3]))return false;}
+    if(k==1){if(!transform_angle(t[0],tl[0],cx,&value.v[3]))return false;}
     else if(k==2||k==4){
-        int angle=transform_angle(t[0],tl[0],&value.v[3])?0:k-1;
-        if(angle&&!transform_angle(t[angle],tl[angle],&value.v[3]))return false;
+        int angle=transform_angle(t[0],tl[0],cx,&value.v[3])?0:k-1;
+        if(angle&&!transform_angle(t[angle],tl[angle],cx,&value.v[3]))return false;
         int axis=angle?0:1;
         if(k==2){
             value.v[2]=0;
@@ -2869,7 +3023,7 @@ static bool parse_rotate_value(const char *v,size_t n,struct cx *cx,const struct
             else if(ident_is(t[axis],tl[axis],"y"))value.v[1]=1;
             else if(ident_is(t[axis],tl[axis],"z"))value.v[2]=1;
             else return false;
-        }else for(int i=0;i<3;i++)if(!transform_number(t[axis+i],tl[axis+i],false,&value.v[i]))return false;
+        }else for(int i=0;i<3;i++)if(!transform_number(t[axis+i],tl[axis+i],cx,false,&value.v[i]))return false;
     }else return false;
     struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*out=node;return true;
 }
@@ -2879,7 +3033,7 @@ static bool parse_scale_value(const char *v,size_t n,struct cx *cx,const struct 
     const char *t[4];size_t tl[4];int k=split_checked(v,n,t,tl,4,' ',cx);
     if(k<1||k>3)return false;
     struct css_transform value=transform_identity(CT_SCALE);
-    for(int i=0;i<k;i++)if(!transform_number(t[i],tl[i],true,&value.v[i]))return false;
+    for(int i=0;i<k;i++)if(!transform_number(t[i],tl[i],cx,true,&value.v[i]))return false;
     if(k==1)value.v[1]=value.v[0];
     struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*out=node;return true;
 }
@@ -2905,43 +3059,40 @@ static bool parse_transform_origin(const char *v,size_t n,struct cx *cx,len_t ou
     out[0]=r[0];out[1]=r[1];return true;
 }
 
+static bool apply_value(const struct propdef *p, const char *v, size_t n, struct cx *cx, char *field);
 static bool apply_long(const struct propdef *p, const char *v, size_t n, struct cx *cx) {
     style_t *s = cx->s;
-    char *field = (char *)s + p->off;
     const style_t *par = cx->parent ? cx->parent : &initial;
-    if (ident_is(v, n, "inherit")) {
-        copy_prop(p, s, par);
-        if (!p->inherited) s->explicit_inherit = true;
+    bool colour = p->type == PT_COLOR || p->type == PT_SVG_PAINT;
+    const style_t *from = ident_is(v, n, "inherit") ? par : ident_is(v, n, "initial") ? &initial :
+        ident_is(v, n, "unset") || ident_is(v, n, "revert") || ident_is(v, n, "revert-layer") ?
+        p->inherited ? par : &initial : NULL;
+    /* the initial colour is CanvasText, which follows color-scheme */
+    if (from == &initial && colour && color_slot(p) == CSS_SLOT_COLOR) return css_color_apply("canvastext", 10, cx, CSS_SLOT_COLOR);
+    if (from) {
+        copy_prop(p, s, from, cx->a);
+        if (colour && !cx->supports_probe) css_color_slot_copy(s, from, color_slot(p), cx->a);
+        if (from == par && !p->inherited && ident_is(v, n, "inherit")) s->explicit_inherit = true;
         return true;
     }
-    if (ident_is(v, n, "initial")) {
-        copy_prop(p, s, &initial);
-        return true;
-    }
-    if (ident_is(v, n, "unset") || ident_is(v, n, "revert") || ident_is(v, n, "revert-layer")) {
-        copy_prop(p, s, p->inherited ? par : &initial);
-        return true;
-    }
+    if (p->group == G_STYLE) return apply_value(p, v, n, cx, (char *)s + p->off);
+    /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
+    union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules; } own;
+    memcpy(&own, group_of(s, p->group), group_size(p->group));
+    if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
+    group_write(s, p->group, &own, cx->a);
+    return true;
+}
+/* a value (not a CSS-wide keyword) of p into field, s's own or its group's copy */
+static bool apply_value(const struct propdef *p, const char *v, size_t n, struct cx *cx, char *field) {
+    style_t *s = cx->s;
     switch (p->type) {
     case PT_TRANSFORM:return parse_transform_value(v,n,cx,&s->transform);
     case PT_TRANSLATE:return parse_translate_value(v,n,cx,&s->translate);
     case PT_ROTATE:return parse_rotate_value(v,n,cx,&s->rotate);
     case PT_SCALE:return parse_scale_value(v,n,cx,&s->scale);
     case PT_TRANSFORM_ORIGIN:return parse_transform_origin(v,n,cx,s->transform_origin);
-    case PT_MOTION_NAME:
-        if(!ident_is(v,n,"none") && !motion_name(v,n))return false;
-        *(const char **)field=ident_is(v,n,"none")?NULL:ar_strndup(cx->a,v,n);return true;
-    case PT_MOTION_TIME: {
-        float value;if(!motion_time(v,n,&value) || (!(p->flags&LF_NEG) && value<0))return false;
-        *(float *)field=value;return true;
-    }
-    case PT_MOTION_ITERATIONS: {
-        float value;const char *q=v;
-        if(ident_is(v,n,"infinite"))value=INFINITY;
-        else if(!parse_number(&q,v+n,&value) || q!=v+n || !isfinite(value) || value<0)return false;
-        *(float *)field=value;return true;
-    }
-    case PT_MOTION_EASING: return css_easing_parse(v,n,(struct css_easing *)field);
+    case PT_MOTION_LIST: return parse_motion_list(p, v, n, cx, (const struct css_motion_list **)field);
     case PT_CONTAINER_NAMES:
         if (ident_is(v, n, "none")) { s->container_names = NULL; return true; }
         if (!css_container_names_valid(v,n)) return false;
@@ -3011,11 +3162,44 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         *(struct css_corner_radius *)field=parsed;
         return true;
     }
-    case PT_COLOR: {
-        uint32_t c;
-        if (!css_color_checked(v, n, &c, cx)) return false;
-        if (c == COLOR_CURRENT && p->off == offsetof(style_t, color)) c = par->color;
-        *(uint32_t *)field = c;
+    case PT_COLOR: return css_color_apply(v, n, cx, color_slot(p));
+    case PT_COLOR_SCHEME: {
+        /* CSS Color Adjust 1, 2.1: normal | [ light | dark | <custom-ident> ]+ && only? */
+        if (ident_is(v, n, "normal")) {
+            s->color_scheme = 0;
+            s->color_scheme_text = NULL;
+        } else {
+            uint8_t bits = 0;
+            size_t names = 0;
+            char *text = ar_alloc(cx->a, n + 6), *t = text;
+            for (const char *q = v, *e = v + n; q < e;) {
+                while (q < e && is_space((unsigned char)*q)) q++;
+                const char *w = q;
+                while (q < e && !is_space((unsigned char)*q)) q++;
+                size_t wn = (size_t)(q - w);
+                if (!wn) break;
+                /* only once, first or last */
+                if (ident_is(w, wn, "only")) {
+                    if ((bits & CSS_SCHEME_ONLY) || (names && q != e)) return false;
+                    bits |= CSS_SCHEME_ONLY;
+                    continue;
+                }
+                if (ident_is(w, wn, "normal") || !motion_name(w, wn)) return false; /* a <custom-ident> */
+                bool light = ident_is(w, wn, "light"), dark = ident_is(w, wn, "dark");
+                bits |= light ? CSS_SCHEME_LIGHT : dark ? CSS_SCHEME_DARK : 0;
+                if (names++) *t++ = ' ';
+                if (light || dark) { memcpy(t, light ? "light" : "dark", light ? 5 : 4); t += light ? 5 : 4; }
+                else { memcpy(t, w, wn); t += wn; }
+            }
+            if (!names) return false;
+            if (bits & CSS_SCHEME_ONLY) { memcpy(t, " only", 5); t += 5; }
+            *t = 0;
+            s->color_scheme = bits;
+            s->color_scheme_text = text;
+        }
+        /* the root's initial colour follows its scheme until color is declared */
+        if (!cx->parent && !cx->supports_probe && !cx->set[css_prop_index(find_prop("color", 5))])
+            css_color_apply("canvastext", 10, cx, CSS_SLOT_COLOR);
         return true;
     }
     case PT_SVG_WIDTH: {
@@ -3028,12 +3212,13 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     }
     case PT_SVG_PAINT: {
         struct svg_paint paint = {0};
+        const struct css_color_value *exact = NULL;
         if (ident_is(v, n, "none")) paint.kind = SVG_PAINT_NONE;
-        else if (css_color_checked(v, n, &paint.color, cx)) paint.kind = SVG_PAINT_COLOR;
+        else if (css_color_value_compute(v, n, cx, NULL, &paint.color, &exact)) paint.kind = SVG_PAINT_COLOR;
         else {
             /* The rasterizer can resolve local SVG gradients, not external
                paint servers or context paints. Do not claim those in supports(). */
-            const char *ref = n >= 5 && strn_ieq(v, "url(", 4) && v[n-1] == ')' ? parse_url(v, n, cx->a) : NULL;
+            const char *ref = n >= 5 && strn_ieq(v, "url(", 4) && v[n-1] == ')' ? css_parse_url(v, n, cx->a) : NULL;
             if (!ref) return false;
             if (ref[0] != '#') {
                 const char *fragment = strchr(ref, '#');
@@ -3050,24 +3235,35 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
             paint.kind = SVG_PAINT_REF; paint.ref = ref;
         }
         *(struct svg_paint *)field = paint;
+        if (!cx->supports_probe) css_color_slot_set(s, color_slot(p), exact, cx->a);
         return true;
     }
     case PT_NUM: {
         float x;
-        if (!parse_number_value(v, n, cx, &x) || x < 0) return false;
+        if (!parse_number_value(v, n, cx, &x)) return false;
+        if (x < 0) { if (!css_calc_is_math(v, n)) return false; x = 0; } /* a calculation clamps to the range */
         *(float *)field = x;
         return true;
     }
     case PT_FILTER: return parse_filter(v, n, cx, &s->filter);
-    case PT_CLIP_PATH: return parse_clip_path(v, n, cx, &s->clip_path);
+    case PT_SHAPE: return css_shape_parse(p->flags, v, n, cx, (const struct css_shape **)field, NULL);
+    case PT_OFFSET: return css_offset_parse(p->flags, v, n, cx, field, NULL);
+    case PT_RULE_LIST: {
+        struct css_rule_list lists[3];
+        if (!rule_lists(p->flags, v, n, cx, lists, NULL)) return false;
+        *(struct css_rule_list *)field = lists[p->flags];
+        return true;
+    }
+    case PT_RULE_INSET: return rule_inset(v, n, cx, (struct css_rule_inset *)field, NULL);
     case PT_CLIP: return parse_clip_rect(v, n, cx, &s->clip);
     case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
     case PT_OPACITY: {
-        const char *q = v;
-        float x;
-        if (parse_number(&q, v + n, &x) && q + 1 == v + n && *q == '%') x /= 100;
-        else if (!parse_number_value(v, n, cx, &x)) return false;
-        *(float *)field = x < 0 ? 0 : x > 1 ? 1 : x;
+        /* <opacity-value>: <number> | <percentage>, either of them a calculation */
+        double x;
+        unsigned kind;
+        if (!css_numeric_read(v, n, CSS_CALC_NUMBER | CSS_CALC_PERCENT, cx, cx->a, NAN, &x, &kind)) return false;
+        if (kind == CSS_CALC_PERCENT) x /= 100;
+        *(float *)field = x < 0 ? 0 : x > 1 ? 1 : (float)x;
         return true;
     }
     case PT_INT: case PT_ZINDEX: {
@@ -3079,8 +3275,13 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         const char *q = v;
         float x;
         bool math = !parse_number(&q, v + n, &x) || q != v + n;
-        if (math && !parse_number_value(v, n, cx, &x)) return false;
-        if (math) x = roundf(x); /* a math function resolves to the nearest integer */
+        if (math) {
+            /* a calculation resolves to the nearest integer, a half toward +infinity, in range (§10.12) */
+            double d;
+            if (!css_calc_is_math(v, n) || !css_numeric_read(v, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &d, NULL)) return false;
+            d = floor(d + 0.5);
+            x = d > 2147483520.0 ? 2147483520.0f : d < -2147483648.0 ? -2147483648.0f : (float)d;
+        }
         if (cx->supports_probe && (x != floorf(x) || x > 2147483520.0f || x < -2147483648.0f)) return false;
         *(int *)field = (int)x;
         if (p->type == PT_ZINDEX) s->z_auto = false;
@@ -3092,22 +3293,19 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         if(!choose_family(v,n,&s->font_family,cx))return false;
         s->font_names=ar_strndup(cx->a,v,n);s->named_font=NULL;s->font_choices=NULL;return true;
     case PT_LINE_HEIGHT: {
-        len_t l;
         if (ident_is(v, n, "normal")) {
             s->line_height.kind = LK_NORMAL;
             return true;
         }
-        float x;
-        if (parse_number_value(v, n, cx, &x)) {
-            if (x < 0) return false;
-            s->line_height.kind = LK_NUMBER;
-            s->line_height.px = x;
-            s->line_height.pct = 0;
-            return true;
-        }
-        if (!parse_len(v, n, cx, &l, 0)) return false;
-        s->line_height.kind = LK_LEN;
-        s->line_height.px = len_resolve(&l, s->font_size);
+        /* <number> | <length-percentage>: percentages are of the font size, also in a calculation
+           (calc(10% / 1px) is a number) */
+        double x;
+        unsigned kind;
+        if (!css_numeric_read(v, n, CSS_CALC_NUMBER | CSS_CALC_LENGTH | CSS_CALC_PERCENT, cx, cx->a, s->font_size, &x, &kind))
+            return false;
+        if (x < 0) { if (!css_calc_is_math(v, n)) return false; x = 0; }
+        s->line_height.kind = kind == CSS_CALC_NUMBER ? LK_NUMBER : LK_LEN;
+        s->line_height.px = kind == CSS_CALC_NUMBER ? calc_float(x) : x > 1e7 ? 1e7f : (float)x;
         s->line_height.pct = 0;
         return true;
     }
@@ -3158,7 +3356,7 @@ static bool set_long(const char *name, const char *v, size_t n, struct cx *cx) {
     if (!p) { if (cx->supports_probe) cx->invalid = true; return false; }
     int i = css_prop_index(p);
     if (cx->set[i]) return true;
-    if (cx->font_pass && p->type != PT_FONT_SIZE) return true;
+    if (cx->font_pass && !early(p)) return true;
     if (!apply_long(p, v, n, cx)) { if (cx->supports_probe) cx->invalid = true; return false; }
     cx->set[i] = 1;
     return true;
@@ -3281,12 +3479,21 @@ static bool set_font(const char *v, size_t n, struct cx *cx) {
     float fs;
     if (!parse_font_size(sz, szl, cx, &fs)) return false;
     if (fam >= k) return false;
+    /* The shorthand takes <'font-family'>, the property's own grammar: a
+       CSS-wide keyword there is not a family list (CSS Fonts 4 font). */
+    const char *family = t[fam];
+    size_t family_n = (size_t)(v + n - t[fam]);
+    if (ident_is(family, family_n, "inherit") || ident_is(family, family_n, "initial") || ident_is(family, family_n, "unset") ||
+        ident_is(family, family_n, "revert") || ident_is(family, family_n, "revert-layer") || ident_is(family, family_n, "default")) {
+        if (cx->supports_probe) cx->invalid = true;
+        return false;
+    }
     set_long("font-size", sz, szl, cx);
     if (cx->font_pass) return true;
     set_long("font-style", style, stl, cx);
     set_long("font-weight", weight, wl, cx);
     set_long("line-height", lh, lhl, cx);
-    set_long("font-family", t[fam], (size_t)(v + n - t[fam]), cx);
+    set_long("font-family", family, family_n, cx);
     return true;
 }
 
@@ -3424,19 +3631,27 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
             strcmp(props[i].name,"unicode-bidi"))set_long(props[i].name,v,n,cx);
         return true;
     }
-    case SH_ANIMATION: {
-        static const char *const names[]={"animation-name","animation-duration","animation-delay",
-            "animation-timing-function","animation-iteration-count","animation-direction",
-            "animation-fill-mode","animation-play-state"};
-        if(global){for(unsigned i=0;i<8;i++)set_long(names[i],v,n,cx);return true;}
+    case SH_ANIMATION: case SH_TRANSITION: {
+        /* the longhands each shorthand sets; animation-composition is reset only */
+        static const char *const animation[] = {"animation-name", "animation-duration", "animation-delay",
+            "animation-timing-function", "animation-iteration-count", "animation-direction",
+            "animation-fill-mode", "animation-play-state", "animation-composition"};
+        static const char *const transition[] = {"transition-property", "transition-duration", "transition-delay",
+            "transition-timing-function", "transition-behavior"};
+        bool is_animation = p->sh == SH_ANIMATION;
+        const char *const *names = is_animation ? animation : transition;
+        unsigned count = is_animation ? 9 : 5;
+        if (global) { for (unsigned i = 0; i < count; i++) set_long(names[i], v, n, cx); return true; }
         struct css_motion motion;
-        if(!motion_shorthand(v,n,cx,&motion))return false;
+        if (!motion_shorthand(is_animation, v, n, cx, &motion)) return false;
         /* The shorthand resets all longhands, but cannot override a higher
            priority longhand already selected by this cascade. */
-        style_t temp=*cx->s;temp.motion=motion;
-        for(unsigned i=0;i<8;i++) {
-            const struct propdef *q=find_prop(names[i],strlen(names[i]));int at=css_prop_index(q);
-            if(!cx->set[at]){copy_prop(q,cx->s,&temp);cx->set[at]=1;}
+        style_t temp = *cx->s;
+        temp.motion = motion;
+        for (unsigned i = 0; i < count; i++) {
+            const struct propdef *q = find_prop(names[i], strlen(names[i]));
+            int at = css_prop_index(q);
+            if (!cx->set[at]) { copy_prop(q, cx->s, &temp, cx->a); cx->set[at] = 1; }
         }
         return true;
     }
@@ -3522,6 +3737,27 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
             return true;
         }
         return set_border(v, n, cx, sides, ns);
+    }
+    case SH_GAP_RULE: return gap_shorthand_apply(p, v, n, global, cx);
+    case SH_OFFSET: {
+        static const char *const names[] = {"offset-position", "offset-path", "offset-distance", "offset-rotate", "offset-anchor"};
+        if (global) { for (unsigned i = 0; i < 5; i++) set_long(names[i], v, n, cx); return true; }
+        struct css_offset parsed;
+        if (!css_offset_shorthand(v, n, cx, &parsed, NULL)) return false;
+        if (cx->font_pass) return true;
+        /* the longhands no more important declaration set, written into one copy of the group */
+        struct css_offset own = *css_style_offset(cx->s);
+        bool written = false;
+        for (unsigned i = 0; i < 5; i++) {
+            const struct propdef *q = find_prop(names[i], strlen(names[i]));
+            int at = css_prop_index(q);
+            if (cx->set[at]) continue;
+            memcpy((char *)&own + q->off, (const char *)&parsed + q->off, q->size);
+            cx->set[at] = 1;
+            written = true;
+        }
+        if (written) group_write(cx->s, G_OFFSET, &own, cx->a);
+        return true;
     }
     case SH_OUTLINE: {
         if (global) {
@@ -3793,7 +4029,7 @@ bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx) 
     if (p->type == PT_SHORT) return apply_short(p, v, n, cx);
     int i = css_prop_index(p);
     if (cx->set[i]) return true;
-    if (cx->font_pass && p->type != PT_FONT_SIZE) return true;
+    if (cx->font_pass && !early(p)) return true;
     if (!apply_long(p, v, n, cx)) return false;
     cx->set[i] = 1;
     return true;
@@ -3834,7 +4070,10 @@ void css_style_init(style_t *s, const style_t *parent) {
     *s = *parent;
     s->border_radius=0; /* legacy native-only radius is not inherited */
     for (int i = 0; i < NPROPS; i++)
-        if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &initial);
+        if (props[i].type != PT_SHORT && !props[i].inherited && props[i].group == G_STYLE)
+            copy_prop(&props[i], s, &initial, NULL);
+    groups_copy(s, &initial);
+    s->color_own = NULL;
     s->before = s->after = s->backdrop = s->placeholder = NULL;
     s->before_generated = s->after_generated = s->explicit_inherit = false;
 }
@@ -3845,8 +4084,11 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
     style_t own = *s;
     css_style_init(s, from);
     for (int i = 0; i < NPROPS; i++)
-        if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &own);
+        if (props[i].type != PT_SHORT && !props[i].inherited && props[i].group == G_STYLE)
+            copy_prop(&props[i], s, &own, NULL);
+    groups_copy(s, &own);
     s->border_radius = own.border_radius;
+    s->color_own = own.color_own;
     s->before = own.before; s->after = own.after; s->backdrop = own.backdrop; s->placeholder = own.placeholder;
     s->before_generated = own.before_generated; s->after_generated = own.after_generated;
     s->explicit_inherit = own.explicit_inherit;
@@ -3854,18 +4096,26 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
 
 void css_style_finish(style_t *s, const style_t *parent, bool root) {
     if (s->color == COLOR_CURRENT) s->color = parent ? parent->color : 0xFF000000u;
-    if (s->bg_color == COLOR_CURRENT) s->bg_color = s->color;
+    css_color_finish(s);
+    if (s->bg_color == COLOR_CURRENT) { s->bg_color = s->color; s->color_current |= 1u << CSS_SLOT_BACKGROUND; }
     for (struct css_box_shadow *shadow = (struct css_box_shadow *)s->box_shadow; shadow; shadow = shadow->next)
-        if (shadow->color == COLOR_CURRENT) shadow->color = s->color;
+        if (shadow->color == COLOR_CURRENT)
+            shadow->color = shadow->color_value ? css_color_value_argb(shadow->color_value, s->color) : s->color;
     for (int i = 0; i < 4; i++) {
-        if (s->border_color[i] == COLOR_CURRENT) s->border_color[i] = s->color;
+        if (s->border_color[i] == COLOR_CURRENT) {
+            s->border_color[i] = s->color;
+            s->color_current |= (uint16_t)(1u << (CSS_SLOT_BORDER_TOP + i));
+        }
         if (s->border_style[i] == BS_NONE || s->border_style[i] == BS_HIDDEN) s->border_width[i] = 0;
     }
-    if (s->outline_color == COLOR_CURRENT) s->outline_color = s->color;
+    if (s->outline_color == COLOR_CURRENT) { s->outline_color = s->color; s->color_current |= 1u << CSS_SLOT_OUTLINE; }
     if (s->outline_style == BS_NONE) s->outline_width = 0;
     if (s->has_grad) {
-        for (int i = 0; i < 2; i++)
-            if (s->grad[i] == COLOR_CURRENT) s->grad[i] = s->color;
+        const struct gradient *g = s->gradient;
+        for (int i = 0; i < 2; i++) {
+            const struct css_color_value *exact = g && g->n ? g->col_value[i ? g->n - 1 : 0] : NULL;
+            if (s->grad[i] == COLOR_CURRENT) s->grad[i] = exact ? css_color_value_argb(exact, s->color) : s->color;
+        }
     }
     if (s->position == POS_ABSOLUTE || s->position == POS_FIXED) s->float_ = FL_NONE;
     /* floated, absolutely positioned, root and flex items are blockified */
@@ -3983,4 +4233,907 @@ const char *css_ua_sheet(void) {
            "math { display: inline; }\n"
            "svg:not(:root) { overflow: hidden; }\n"
            "@media (scripting:enabled) { noscript { display: none !important; } }\n";
+}
+
+/* ---------------------------------------------------------------- animation values
+   The one place computed values combine (CSS Values 4 §3 "Combining values", Web Animations 1
+   §5.3 "Animation types"). CSS Transitions, CSS Animations and script animations all reach it
+   through animation.c. The property table gives each longhand its animation type
+   (propdef.anim, else its value type's default); below, each value type has its interpolation,
+   addition and accumulation. Values come in as computed values in scratch copies of the
+   element's base style (css_anim_parse) and leave as computed-value text, which the cascade
+   applies at the animation or transition origin so that em, currentcolor and inheritance
+   follow the animated values. */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+int css_prop_animation(const struct propdef *p) {
+    if (!p || p->type == PT_SHORT) return CSS_ANIM_NONE;
+    switch (p->anim) {
+    case AN_NONE: return CSS_ANIM_NONE;
+    case AN_DISCRETE: return CSS_ANIM_DISCRETE;
+    case AN_VISIBILITY: return CSS_ANIM_VISIBILITY;
+    case AN_DISPLAY: return CSS_ANIM_DISPLAY;
+    }
+    switch (p->type) {
+    case PT_MOTION_LIST: case PT_CONTAINER_NAMES: return CSS_ANIM_NONE;
+    case PT_DISPLAY: return CSS_ANIM_DISPLAY;
+    case PT_KW: case PT_OVERFLOW: case PT_FONT_FAMILY: case PT_CONTENT: case PT_LIST_TYPE: case PT_BG_IMAGE:
+    case PT_TEXT_DECO: case PT_GTEMPLATE: case PT_GAREAS: case PT_GLINE: case PT_MASK_IMAGE: case PT_LINE_CLAMP:
+        return CSS_ANIM_DISCRETE;
+    }
+    return CSS_ANIM_VALUE;
+}
+/* A shorthand's longhands are what its own parser sets for "initial" (the same expansion
+   revert uses), computed once per shorthand. */
+static uint8_t longhand_sets[NPROPS][NPROPS];
+static uint8_t longhand_ready[NPROPS];
+void css_prop_longhands(const struct propdef *p, uint8_t *set) {
+    memset(set, 0, NPROPS);
+    if (!p) return;
+    int i = css_prop_index(p);
+    if (p->type != PT_SHORT) { set[i] = 1; return; }
+    if (!__atomic_load_n(&longhand_ready[i], __ATOMIC_ACQUIRE)) {
+        arena_t a = {0}; jmp_buf trap; a.trap = &trap;
+        uint8_t bits[NPROPS]; memset(bits, 0, sizeof bits);
+        if (!setjmp(trap)) {
+            style_t st, parent; css_style_init(&parent, NULL); css_style_init(&st, &parent);
+            struct cx cx = {.s=&st, .parent=&parent, .em=16, .rem=16, .vw=800, .vh=600, .a=&a, .set=bits};
+            css_apply(p, "initial", 7, &cx);
+        }
+        ar_free(&a);
+        memcpy(longhand_sets[i], bits, NPROPS);
+        __atomic_store_n(&longhand_ready[i], 1, __ATOMIC_RELEASE);
+    }
+    memcpy(set, longhand_sets[i], NPROPS);
+}
+
+/* Fixed notation within the CSS number grammar, to the precision of the stored floats
+   (seven significant digits) so a value read back serializes as it was written. */
+static void anim_number(sbuf *b, double v) {
+    if (!isfinite(v) || fabs(v) < 5e-10) v = 0;
+    if (v > 1e15) v = 1e15; else if (v < -1e15) v = -1e15;
+    char text[64]; snprintf(text, sizeof text, "%.7g", v);
+    if (strchr(text, 'e')) {
+        int len = snprintf(text, sizeof text, "%.6f", v);
+        while (len > 1 && text[len - 1] == '0') text[--len] = 0;
+        if (len > 1 && text[len - 1] == '.') text[--len] = 0;
+    }
+    if (!strcmp(text, "-0")) strcpy(text, "0");
+    sb_puts(b, text);
+}
+static void anim_unit(sbuf *b, double v, const char *unit) { anim_number(b, v); sb_puts(b, unit); }
+static double anim_clamp(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
+/* the combinations: interpolation, addition, accumulation */
+enum { MIX, ADD, ACCUMULATE };
+/* <color>: computed values of color.c's type (exact, or an expression of currentcolor) */
+static void anim_shadow_color(const style_t *st, const struct css_box_shadow *s, struct css_color_computed *out) {
+    css_color_held(s->color, s->color_value, st->color, out);
+}
+/* the used value a computed colour names: currentcolor is the style's color (CSS Color 4 §13) */
+static struct css_color anim_color_used(const style_t *st, const struct css_color_computed *v) {
+    if (!v->current) return v->color;
+    struct css_color_computed current;
+    css_style_color(st, CSS_SLOT_COLOR, &current);
+    struct css_color out;
+    css_color_resolve(v, &current.color, &out);
+    return out;
+}
+/* currentcolor and expressions of it as written, for the cascade to resolve against the element */
+static bool anim_color_text(sbuf *b, const struct css_color_computed *v) {
+    return v->current ? css_color_value_specified(v->current, b) : css_color_animation_text(&v->color, b);
+}
+/* x interpolated to y at p (MIX: CSS Color 4 §13, in the space §13.2 gives the two), or y added to
+   x (ADD and ACCUMULATE alike: CSS Values 4 §3.3); x's and y's currentcolor are their styles' */
+static bool anim_color(sbuf *b, const style_t *sx, const struct css_color_computed *x, const style_t *sy,
+                       const struct css_color_computed *y, double p, int mode) {
+    /* between one expression of currentcolor the value stays it, resolved after the cascade */
+    if (mode == MIX && x->current && css_color_computed_equal(x, y)) return anim_color_text(b, x);
+    struct css_color u = anim_color_used(sx, x), v = anim_color_used(sy, y);
+    struct css_color_interpolation m = css_color_default_interpolation(&u, &v);
+    struct css_color r = mode == MIX ? css_color_interpolate(&u, &v, p, &m) : css_color_add(&u, &v, &m);
+    return css_color_animation_text(&r, b);
+}
+static bool anim_is_length(const len_t *l) { return l->kind == LK_LEN || l->kind == LK_EXPR; }
+/* ka·x + kb·y of two <length-percentage>s; a keyword (auto, none, normal) combines only with
+   itself. A property without negative values clamps (calc() ranges clamp when parsed). */
+static bool anim_len(sbuf *b, const len_t *x, const len_t *y, double ka, double kb, int flags, web_doc *d) {
+    if (!anim_is_length(x) || !anim_is_length(y)) {
+        if (x->kind != y->kind || anim_is_length(x)) return false;
+        if (x->kind == LK_NUMBER) { anim_number(b, x->px * ka + y->px * kb); return true; }
+        return css_length_serialize(x, b, d);
+    }
+    if (x->kind == LK_LEN && y->kind == LK_LEN) {
+        double px = x->px * ka + y->px * kb, pct = x->pct * ka + y->pct * kb;
+        if (!(flags & LF_NEG)) { if (fabs(pct) < 1e-9 && px < 0) px = 0; if (fabs(px) < 1e-9 && pct < 0) pct = 0; }
+        if (fabs(pct) < 1e-9) { anim_unit(b, px, "px"); return true; }
+        if (fabs(px) < 1e-9) { anim_unit(b, pct, "%"); return true; }
+        sb_puts(b, "calc("); anim_unit(b, pct, "%"); sb_puts(b, " + "); anim_unit(b, px, "px"); sb_putc(b, ')');
+        return true;
+    }
+    /* calc() keeps percentages unresolved: combine the expressions */
+    sbuf ta = {0}, tb = {0};
+    bool ok = css_length_serialize(x, &ta, d) && css_length_serialize(y, &tb, d);
+    if (ok) {
+        sb_puts(b, "calc("); sb_puts(b, sb_cstr(&ta)); sb_puts(b, " * "); anim_number(b, ka);
+        sb_puts(b, " + "); sb_puts(b, sb_cstr(&tb)); sb_puts(b, " * "); anim_number(b, kb); sb_putc(b, ')');
+    }
+    sb_free(&ta); sb_free(&tb);
+    return ok;
+}
+
+/* -------- transform lists (CSS Transforms 1 §9, CSS Transforms 2 §16) */
+static bool tf_axis(const struct css_transform *t, double axis[3]) {
+    double x = t->v[0], y = t->v[1], z = t->v[2], length = sqrt(x * x + y * y + z * z);
+    if (!(length > 0) || !isfinite(length)) return false;
+    axis[0] = x / length; axis[1] = y / length; axis[2] = z / length;
+    return true;
+}
+static bool tf_same_axis(const struct css_transform *a, const struct css_transform *b) {
+    if (a->v[3] == 0 || b->v[3] == 0) return true;
+    double p[3], q[3];
+    if (!tf_axis(a, p) || !tf_axis(b, q)) return false;
+    return fabs(p[0] - q[0]) <= 1e-6 && fabs(p[1] - q[1]) <= 1e-6 && fabs(p[2] - q[2]) <= 1e-6;
+}
+/* the neutral function of t's kind, which pads the shorter list */
+static struct css_transform tf_identity(const struct css_transform *t) {
+    struct css_transform r = {.xy = {{.kind = LK_LEN}, {.kind = LK_LEN}}, .kind = t->kind};
+    if (t->kind == CT_SCALE) r.v[0] = r.v[1] = r.v[2] = 1;
+    if (t->kind == CT_ROTATE) { r.v[0] = t->v[0]; r.v[1] = t->v[1]; r.v[2] = t->v[2]; }
+    for (int i = 0; i < 4; i++) r.m[i * 5] = 1;
+    return r;
+}
+/* Lists combine function by function when every pair shares a primitive (rotations a
+   common axis); matrices and perspective only meet themselves. */
+static bool tf_lists_match(const struct css_transform *a, const struct css_transform *b) {
+    for (; a || b; a = a ? a->next : NULL, b = b ? b->next : NULL) {
+        const struct css_transform *t = a ? a : b;
+        if (t->kind == CT_MATRIX || t->kind == CT_PERSPECTIVE) return false;
+        if (!a || !b) continue;
+        if (a->kind != b->kind) return false;
+        if (a->kind == CT_ROTATE && !tf_same_axis(a, b)) return false;
+    }
+    return true;
+}
+/* ka·x + kb·y function by function (accumulate: scales add their excess over 1). With x == y,
+   ka = 1, kb = 0 it serializes any list exactly, matrices and perspective included. */
+static bool tf_pairs(sbuf *b, const struct css_transform *x, const struct css_transform *y, double ka, double kb,
+                     int mode, web_doc *d) {
+    bool first = true;
+    for (; x || y; x = x ? x->next : NULL, y = y ? y->next : NULL) {
+        struct css_transform ix, iy;
+        const struct css_transform *s = x, *e = y;
+        if (!s) { ix = tf_identity(e); s = &ix; }
+        if (!e) { iy = tf_identity(s); e = &iy; }
+        if (!first) sb_putc(b, ' ');
+        first = false;
+        double v[4];
+        for (int i = 0; i < 4; i++) v[i] = s->v[i] * ka + e->v[i] * kb;
+        if (mode == ACCUMULATE && s->kind == CT_SCALE) for (int i = 0; i < 3; i++) v[i] = s->v[i] + e->v[i] - 1;
+        switch (s->kind) {
+        case CT_TRANSLATE:
+            sb_puts(b, v[0] ? "translate3d(" : "translate(");
+            if (!anim_len(b, &s->xy[0], &e->xy[0], ka, kb, LF_NEG, d)) return false;
+            sb_puts(b, ", ");
+            if (!anim_len(b, &s->xy[1], &e->xy[1], ka, kb, LF_NEG, d)) return false;
+            if (v[0]) { sb_puts(b, ", "); anim_unit(b, v[0], "px"); }
+            sb_putc(b, ')');
+            break;
+        case CT_SCALE:
+            sb_puts(b, v[2] != 1 ? "scale3d(" : "scale(");
+            anim_number(b, v[0]); sb_puts(b, ", "); anim_number(b, v[1]);
+            if (v[2] != 1) { sb_puts(b, ", "); anim_number(b, v[2]); }
+            sb_putc(b, ')');
+            break;
+        case CT_ROTATE: {
+            double axis[3] = {0, 0, 1};
+            if (!tf_axis(s->v[3] != 0 || e->v[3] == 0 ? s : e, axis)) { axis[0] = axis[1] = 0; axis[2] = 1; }
+            double angle = s->v[3] * ka + e->v[3] * kb;
+            if (axis[0] == 0 && axis[1] == 0 && axis[2] > 0) { sb_puts(b, "rotate("); anim_unit(b, angle, "rad)"); }
+            else {
+                sb_puts(b, "rotate3d(");
+                for (int i = 0; i < 3; i++) { anim_number(b, axis[i]); sb_puts(b, ", "); }
+                anim_unit(b, angle, "rad)");
+            }
+            break;
+        }
+        case CT_SKEW:
+            sb_puts(b, "skew("); anim_unit(b, v[0], "rad, "); anim_unit(b, v[1], "rad)");
+            break;
+        case CT_PERSPECTIVE:
+            if (!(v[0] > 0)) { sb_puts(b, "perspective(none)"); break; }
+            sb_puts(b, "perspective("); anim_unit(b, v[0], "px)");
+            break;
+        case CT_MATRIX:
+            sb_puts(b, "matrix3d(");
+            for (int col = 0; col < 4; col++)
+                for (int row = 0; row < 4; row++) {
+                    anim_number(b, s->m[row * 4 + col] * ka + e->m[row * 4 + col] * kb);
+                    if (col < 3 || row < 3) sb_puts(b, ", ");
+                }
+            sb_putc(b, ')');
+            break;
+        default: return false;
+        }
+    }
+    if (first) sb_puts(b, "none");
+    return true;
+}
+struct tf_2d { double tx, ty, sx, sy, angle, m11, m12, m21, m22; };
+/* CSS Transforms 1 §10 "Interpolation of matrices", 2D decomposition. Percentages need the
+   used box; without one the list does not decompose. */
+static bool tf_decompose(const struct css_transform *t, const struct box *box, struct tf_2d *out) {
+    float w = 0, h = 0;
+    if (box) {
+        w = box->w + box->p[1] + box->p[3] + box->b[1] + box->b[3];
+        h = box->h + box->p[0] + box->p[2] + box->b[0] + box->b[2];
+    } else for (const struct css_transform *x = t; x; x = x->next)
+        if (x->kind == CT_TRANSLATE && (len_has_pct(&x->xy[0]) || len_has_pct(&x->xy[1]))) return false;
+    double m[16]; css_transform_list_matrix(t, w, h, m);
+    double r0x = m[0], r0y = m[4], r1x = m[1], r1y = m[5];
+    out->tx = m[3]; out->ty = m[7];
+    out->sx = sqrt(r0x * r0x + r0y * r0y); out->sy = sqrt(r1x * r1x + r1y * r1y);
+    if (r0x * r1y - r0y * r1x < 0) { if (r0x < r1y) out->sx = -out->sx; else out->sy = -out->sy; }
+    if (out->sx) { r0x /= out->sx; r0y /= out->sx; }
+    if (out->sy) { r1x /= out->sy; r1y /= out->sy; }
+    out->angle = atan2(r0y, r0x);
+    if (out->angle) {
+        double sn = -r0y, cs = r0x, a = r0x, b = r0y, cc = r1x, dd = r1y;
+        r0x = cs * a + sn * cc; r0y = cs * b + sn * dd; r1x = -sn * a + cs * cc; r1y = -sn * b + cs * dd;
+    }
+    out->m11 = r0x; out->m12 = r0y; out->m21 = r1x; out->m22 = r1y;
+    const double *f = &out->tx;
+    for (int i = 0; i < 9; i++) if (!isfinite(f[i])) return false;
+    return true;
+}
+static bool tf_matrix_mix(sbuf *b, const struct css_transform *x, const struct css_transform *y, const struct box *box, double t) {
+    struct tf_2d A, B;
+    if (!tf_decompose(x, box, &A) || !tf_decompose(y, box, &B)) return false;
+    if ((A.sx < 0 && B.sy < 0) || (A.sy < 0 && B.sx < 0)) { A.sx = -A.sx; A.sy = -A.sy; A.angle += A.angle < 0 ? M_PI : -M_PI; }
+    if (!A.angle) A.angle = 2 * M_PI;
+    if (!B.angle) B.angle = 2 * M_PI;
+    if (fabs(A.angle - B.angle) > M_PI) { if (A.angle > B.angle) A.angle -= 2 * M_PI; else B.angle -= 2 * M_PI; }
+    struct tf_2d R; double *r = &R.tx; const double *a = &A.tx, *q = &B.tx;
+    for (int i = 0; i < 9; i++) r[i] = a[i] + (q[i] - a[i]) * t;
+    /* rows = diag(sx, sy) · rotate · remainder */
+    double cs = cos(R.angle), sn = sin(R.angle);
+    double n11 = cs * R.m11 + sn * R.m21, n12 = cs * R.m12 + sn * R.m22, n21 = -sn * R.m11 + cs * R.m21, n22 = -sn * R.m12 + cs * R.m22;
+    double values[6] = {n11 * R.sx, n12 * R.sx, n21 * R.sy, n22 * R.sy, R.tx, R.ty};
+    sb_puts(b, "matrix(");
+    for (int i = 0; i < 6; i++) { anim_number(b, values[i]); if (i < 5) sb_puts(b, ", "); }
+    sb_putc(b, ')');
+    return true;
+}
+static bool tf_list(sbuf *b, const struct css_transform *x, const struct css_transform *y, double ka, double kb,
+                    int mode, const struct box *box, web_doc *d) {
+    if (mode == ADD || (mode == ACCUMULATE && !tf_lists_match(x, y))) {
+        /* addition appends the value's functions to the underlying list */
+        if (!x) return tf_pairs(b, y, y, 1, 0, MIX, d);
+        if (!tf_pairs(b, x, x, 1, 0, MIX, d)) return false;
+        if (y) { sb_putc(b, ' '); return tf_pairs(b, y, y, 1, 0, MIX, d); }
+        return true;
+    }
+    if (tf_lists_match(x, y)) return tf_pairs(b, x, y, ka, kb, mode, d);
+    return tf_matrix_mix(b, x, y, box, kb);
+}
+static void tf_rotate_text(sbuf *b, const struct css_transform *t) {
+    if (!t) { sb_puts(b, "none"); return; }
+    double deg = t->v[3] * 180 / M_PI;
+    if (t->v[0] == 0 && t->v[1] == 0 && t->v[2] > 0) { anim_unit(b, deg, "deg"); return; }
+    for (int i = 0; i < 3; i++) { anim_number(b, t->v[i]); sb_putc(b, ' '); }
+    anim_unit(b, deg, "deg");
+}
+static void tf_scale_text(sbuf *b, const struct css_transform *t) {
+    if (!t) { sb_puts(b, "none"); return; }
+    anim_number(b, t->v[0]);
+    /* the shortest form that reads back (CSS Transforms 2: scale's y is its x when omitted) */
+    if (t->v[1] != t->v[0] || t->v[2] != 1) { sb_putc(b, ' '); anim_number(b, t->v[1]); }
+    if (t->v[2] != 1) { sb_putc(b, ' '); anim_number(b, t->v[2]); }
+}
+static bool tf_equal(const struct css_transform *a, const struct css_transform *b) {
+    for (; a && b; a = a->next, b = b->next)
+        if (a->kind != b->kind || memcmp(a->v, b->v, sizeof a->v) || memcmp(a->m, b->m, sizeof a->m) ||
+            !css_length_equal(&a->xy[0], &b->xy[0]) || !css_length_equal(&a->xy[1], &b->xy[1])) return false;
+    return !a && !b;
+}
+
+/* -------- shadow and filter lists */
+/* one shadow's computed value: its colour first, then the four lengths (and inset) */
+static void anim_shadow_lengths(sbuf *b, double x, double y, double blur, double spread, bool inset) {
+    anim_unit(b, x, "px "); anim_unit(b, y, "px ");
+    anim_unit(b, anim_clamp(blur, 0, INFINITY), "px ");
+    anim_unit(b, spread, "px");
+    if (inset) sb_puts(b, " inset");
+}
+static void anim_shadow_text(sbuf *b, const style_t *st, const struct css_box_shadow *s) {
+    struct css_color_computed c;
+    anim_shadow_color(st, s, &c);
+    anim_color_text(b, &c); sb_putc(b, ' ');
+    anim_shadow_lengths(b, s->x, s->y, s->blur, s->spread, s->inset);
+}
+static void anim_shadow_list_text(sbuf *b, const style_t *st) {
+    if (!st->box_shadow) { sb_puts(b, "none"); return; }
+    for (const struct css_box_shadow *s = st->box_shadow; s; s = s->next) {
+        if (s != st->box_shadow) sb_puts(b, ", ");
+        anim_shadow_text(b, st, s);
+    }
+}
+/* a pair of shadows component by component (Web Animations 1, A: interpolation, and accumulation
+   with each component accumulated); the shorter list pads with transparent shadows of no length */
+static bool anim_shadow_item(sbuf *b, const style_t *sa, const struct css_box_shadow *s, const style_t *sv,
+                             const struct css_box_shadow *e, double ka, double kb, int mode) {
+    struct css_box_shadow zs = {0}, ze = {0};
+    if (!s) { zs.inset = e->inset; s = &zs; }
+    if (!e) { ze.inset = s->inset; e = &ze; }
+    if (s->inset != e->inset) return false;
+    struct css_color_computed cs, ce;
+    anim_shadow_color(sa, s, &cs);
+    anim_shadow_color(sv, e, &ce);
+    if (!anim_color(b, sa, &cs, sv, &ce, kb, mode)) return false;
+    sb_putc(b, ' ');
+    anim_shadow_lengths(b, s->x * ka + e->x * kb, s->y * ka + e->y * kb, s->blur * ka + e->blur * kb,
+                        s->spread * ka + e->spread * kb, s->inset);
+    return true;
+}
+static bool anim_shadows(sbuf *b, const style_t *sa, const style_t *sv, double ka, double kb, int mode) {
+    const struct css_box_shadow *x = sa->box_shadow, *y = sv->box_shadow;
+    if (!x && !y) { sb_puts(b, "none"); return true; }
+    bool first = true;
+    if (mode == ADD) {
+        /* addition is the concatenation of the lists */
+        for (const struct css_box_shadow *s = x; s; s = s->next, first = false) {
+            if (!first) sb_puts(b, ", ");
+            anim_shadow_text(b, sa, s);
+        }
+        for (const struct css_box_shadow *s = y; s; s = s->next, first = false) {
+            if (!first) sb_puts(b, ", ");
+            anim_shadow_text(b, sv, s);
+        }
+        return true;
+    }
+    for (; x || y; x = x ? x->next : NULL, y = y ? y->next : NULL, first = false) {
+        if (!first) sb_puts(b, ", ");
+        if (!anim_shadow_item(b, sa, x, sv, y, ka, kb, mode)) return false;
+    }
+    return true;
+}
+static double filter_amount(const struct css_filter_step *s) { return s->percentage ? s->value / 100 : s->value; }
+static bool anim_filters(sbuf *b, const struct css_filter *x, const struct css_filter *y, double ka, double kb, int mode) {
+    size_t nx = x ? x->count : 0, ny = y ? y->count : 0;
+    if (!nx && !ny) { sb_puts(b, "none"); return true; }
+    if (mode == ADD) {
+        for (size_t i = 0; i < nx + ny; i++) {
+            const struct css_filter_step *s = i < nx ? &x->steps[i] : &y->steps[i - nx];
+            if (i) sb_putc(b, ' ');
+            sb_puts(b, "opacity("); anim_number(b, filter_amount(s)); sb_putc(b, ')');
+        }
+        return true;
+    }
+    /* the shorter list pads with each function's initial value, opacity(1) */
+    size_t n = nx > ny ? nx : ny;
+    for (size_t i = 0; i < n; i++) {
+        double a = i < nx ? filter_amount(&x->steps[i]) : 1, c = i < ny ? filter_amount(&y->steps[i]) : 1;
+        double v = mode == ACCUMULATE ? a + c - 1 : a * ka + c * kb;
+        if (i) sb_putc(b, ' ');
+        sb_puts(b, "opacity("); anim_number(b, anim_clamp(v, 0, INFINITY)); sb_putc(b, ')');
+    }
+    return true;
+}
+
+/* -------- serialization of computed values */
+static const char *display_keyword(const style_t *st) {
+    static const char *const names[] = {"none", "inline", "block", "list-item", "inline-block", "table",
+        "inline-table", "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell",
+        "table-column", "table-column-group", "table-caption", "flex", "inline-flex", "grid", "inline-grid",
+        "contents", "flow-root"};
+    if (st->legacy_box) return st->display == D_INLINE_BLOCK || st->display == D_INLINE_FLEX ? "-webkit-inline-box" : "-webkit-box";
+    return st->display < sizeof names / sizeof *names ? names[st->display] : NULL;
+}
+static bool anim_pair_text(sbuf *b, const len_t *l, web_doc *d) {
+    return css_length_serialize(&l[0], b, d) && length_append(b, " ", 1) && css_length_serialize(&l[1], b, d);
+}
+static bool same_text(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
+bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, web_doc *d) {
+    if (!st || !p || p->type == PT_SHORT) return false;
+    const char *field = field_of(st, p);
+    size_t begin = out->n;
+    char text[64];
+    bool ok = true;
+    switch (p->type) {
+    case PT_KW: case PT_OVERFLOW: case PT_VALIGN: {
+        if (p->type == PT_VALIGN && st->vertical_align == VA_LEN) { anim_unit(out, st->vertical_align_px, "px"); break; }
+        uint8_t v = *(const uint8_t *)field;
+        const struct kw *k = p->kws;
+        while (k && k->name && k->v != v) k++;
+        if (!k || !k->name) return false;
+        sb_puts(out, k->name);
+        break;
+    }
+    case PT_DISPLAY: {
+        const char *name = display_keyword(st);
+        if (!name) return false;
+        sb_puts(out, name);
+        break;
+    }
+    case PT_LEN: case PT_SVG_WIDTH: ok = css_length_serialize((const len_t *)field, out, d); break;
+    case PT_PX: anim_unit(out, *(const float *)field, "px"); break;
+    case PT_FONT_SIZE: anim_unit(out, st->font_size, "px"); break;
+    case PT_NUM: case PT_OPACITY: anim_number(out, *(const float *)field); break;
+    case PT_INT: snprintf(text, sizeof text, "%d", *(const int *)field); sb_puts(out, text); break;
+    case PT_ZINDEX:
+        if (st->z_auto) sb_puts(out, "auto");
+        else { snprintf(text, sizeof text, "%d", st->z_index); sb_puts(out, text); }
+        break;
+    case PT_FONT_WEIGHT: snprintf(text, sizeof text, "%u", (unsigned)st->font_weight); sb_puts(out, text); break;
+    case PT_LINE_HEIGHT:
+        if (st->line_height.kind == LK_NORMAL) sb_puts(out, "normal");
+        else if (st->line_height.kind == LK_NUMBER) anim_number(out, st->line_height.px);
+        else anim_unit(out, st->line_height.px, "px");
+        break;
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT && ((const struct svg_paint *)field)->kind != SVG_PAINT_COLOR) {
+            if (((const struct svg_paint *)field)->kind != SVG_PAINT_NONE) return false;
+            sb_puts(out, "none");
+            break;
+        }
+        struct css_color_computed c;
+        css_style_color(st, color_slot(p), &c);
+        ok = anim_color_text(out, &c);
+        break;
+    }
+    case PT_FONT_FAMILY: if (!st->font_names) return false; sb_puts(out, st->font_names); break;
+    case PT_CONTAINER_NAMES: sb_puts(out, st->container_names ? st->container_names : "none"); break;
+    case PT_LINE_CLAMP:
+        if (!st->line_clamp) sb_puts(out, "none");
+        else { snprintf(text, sizeof text, "%u", (unsigned)st->line_clamp); sb_puts(out, text); }
+        break;
+    case PT_TEXT_DECO:
+        if (!st->text_decoration) sb_puts(out, "none");
+        else {
+            bool first = true;
+            if (st->text_decoration & TD_UNDERLINE) { sb_puts(out, "underline"); first = false; }
+            if (st->text_decoration & TD_OVERLINE) { if (!first) sb_putc(out, ' '); sb_puts(out, "overline"); first = false; }
+            if (st->text_decoration & TD_LINE_THROUGH) { if (!first) sb_putc(out, ' '); sb_puts(out, "line-through"); }
+        }
+        break;
+    case PT_BG_IMAGE: case PT_MASK_IMAGE: {
+        const char *url = p->type == PT_BG_IMAGE ? st->bg_image : st->mask_image;
+        if (p->type == PT_BG_IMAGE && st->has_grad) return false;
+        if (!url) { sb_puts(out, "none"); break; }
+        sb_puts(out, "url(\"");
+        for (const char *c = url; *c; c++) { if (*c == '"' || *c == '\\') sb_putc(out, '\\'); sb_putc(out, *c); }
+        sb_puts(out, "\")");
+        break;
+    }
+    case PT_GLINE: {
+        const struct gline *g = (const struct gline *)field;
+        if (g->kind == GL_AUTO) sb_puts(out, "auto");
+        else if (g->kind == GL_SPAN) { snprintf(text, sizeof text, "span %d", g->n); sb_puts(out, text); }
+        else if (g->kind == GL_NAME) {
+            sb_puts(out, g->name);
+            if (g->n != 1) { snprintf(text, sizeof text, " %d", g->n); sb_puts(out, text); }
+        } else { snprintf(text, sizeof text, "%d", g->n); sb_puts(out, text); }
+        break;
+    }
+    case PT_FILTER: ok = css_filter_serialize(st->filter, out, d); break;
+    case PT_BOX_SHADOW: anim_shadow_list_text(out, st); break;
+    case PT_RADIUS: ok = anim_pair_text(out, ((const struct css_corner_radius *)field)->axis, d); break;
+    case PT_BG_POS: case PT_TRANSFORM_ORIGIN: ok = anim_pair_text(out, (const len_t *)field, d); break;
+    case PT_BG_SIZE: case PT_MASK_SIZE: {
+        uint8_t kind = p->type == PT_BG_SIZE ? st->bg_size_kind : st->mask_size_kind;
+        if (kind == BSZ_COVER) sb_puts(out, "cover");
+        else if (kind == BSZ_CONTAIN) sb_puts(out, "contain");
+        else if (kind == BSZ_AUTO) sb_puts(out, "auto");
+        else ok = anim_pair_text(out, p->type == PT_BG_SIZE ? st->bg_size : st->mask_size, d);
+        break;
+    }
+    case PT_TRANSFORM: ok = tf_pairs(out, st->transform, st->transform, 1, 0, MIX, d); break;
+    case PT_TRANSLATE:
+        if (!st->translate.active) sb_puts(out, "none");
+        else ok = anim_pair_text(out, st->translate.xy, d);
+        break;
+    case PT_ROTATE: tf_rotate_text(out, st->rotate); break;
+    case PT_SCALE: tf_scale_text(out, st->scale); break;
+    case PT_SHAPE: ok = css_shape_serialize(p->flags, *(const struct css_shape *const *)field, out, d); break;
+    case PT_OFFSET: ok = css_offset_serialize(p->flags, field, out, d); break;
+    case PT_CLIP: ok = css_clip_rect_serialize(&st->clip, out); break;
+    case PT_MOTION_LIST: {
+        int list = p->flags;
+        uint32_t count = css_motion_count(st, list);
+        for (uint32_t i = 0; i < count; i++) {
+            union css_motion_item item = css_motion_item(st, list, i);
+            if (i) sb_puts(out, ", ");
+            switch (list) {
+            case ML_NAME: case ML_TPROPERTY:
+                if (!item.s) sb_puts(out, "none");
+                else if (list == ML_TPROPERTY || (motion_name(item.s, strlen(item.s)) && !ident_is(item.s, strlen(item.s), "none")))
+                    sb_puts(out, item.s);
+                else {
+                    sb_putc(out, '"');
+                    for (const char *c = item.s; *c; c++) { if (*c == '"' || *c == '\\') sb_putc(out, '\\'); sb_putc(out, *c); }
+                    sb_putc(out, '"');
+                }
+                break;
+            case ML_DURATION: case ML_DELAY: case ML_TDURATION: case ML_TDELAY:
+                if (isnan(item.f)) sb_puts(out, "auto");
+                else anim_unit(out, item.f / 1000, "s");
+                break;
+            case ML_EASING: case ML_TEASING: css_easing_serialize(&item.e, out); break;
+            case ML_ITERATIONS:
+                if (isinf(item.f)) sb_puts(out, "infinite");
+                else anim_number(out, item.f);
+                break;
+            default: {
+                const struct kw *k = p->kws;
+                while (k && k->name && k->v != item.k) k++;
+                if (!k || !k->name) return false;
+                sb_puts(out, k->name);
+            }
+            }
+        }
+        break;
+    }
+    /* gap decorations: currentcolor stays itself, for the cascade to resolve against the element */
+    case PT_RULE_LIST: rule_list_text(st, p->flags, (const struct css_rule_list *)field, false, out); break;
+    case PT_RULE_INSET: ok = rule_inset_text((const struct css_rule_inset *)field, out, d); break;
+
+    default: return false;
+    }
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
+}
+
+bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b) {
+    if (!p || p->type == PT_SHORT) return true;
+    const char *fa = field_of(a, p), *fb = field_of(b, p);
+    switch (p->type) {
+    case PT_LEN: case PT_SVG_WIDTH: return css_length_equal((const len_t *)fa, (const len_t *)fb);
+    case PT_RADIUS: case PT_BG_POS: case PT_TRANSFORM_ORIGIN: {
+        const len_t *x = p->type == PT_RADIUS ? ((const struct css_corner_radius *)fa)->axis : (const len_t *)fa;
+        const len_t *y = p->type == PT_RADIUS ? ((const struct css_corner_radius *)fb)->axis : (const len_t *)fb;
+        return css_length_equal(&x[0], &y[0]) && css_length_equal(&x[1], &y[1]);
+    }
+    case PT_BG_SIZE: return a->bg_size_kind == b->bg_size_kind && css_length_equal(&a->bg_size[0], &b->bg_size[0]) &&
+        css_length_equal(&a->bg_size[1], &b->bg_size[1]);
+    case PT_MASK_SIZE: return a->mask_size_kind == b->mask_size_kind && css_length_equal(&a->mask_size[0], &b->mask_size[0]) &&
+        css_length_equal(&a->mask_size[1], &b->mask_size[1]);
+    case PT_TRANSFORM: case PT_ROTATE: case PT_SCALE:
+        return tf_equal(*(const struct css_transform *const *)fa, *(const struct css_transform *const *)fb);
+    case PT_TRANSLATE: return a->translate.active == b->translate.active && css_length_equal(&a->translate.xy[0], &b->translate.xy[0]) &&
+        css_length_equal(&a->translate.xy[1], &b->translate.xy[1]);
+    case PT_BOX_SHADOW: {
+        const struct css_box_shadow *x = a->box_shadow, *y = b->box_shadow;
+        for (; x && y; x = x->next, y = y->next) {
+            if (x->x != y->x || x->y != y->y || x->blur != y->blur || x->spread != y->spread || x->inset != y->inset)
+                return false;
+            struct css_color_computed u, v;
+            anim_shadow_color(a, x, &u);
+            anim_shadow_color(b, y, &v);
+            if (!css_color_computed_equal(&u, &v)) return false;
+        }
+        return !x && !y;
+    }
+    case PT_FILTER: {
+        const struct css_filter *x = a->filter, *y = b->filter;
+        if (!x || !y) return x == y;
+        return x->count == y->count && !memcmp(x->steps, y->steps, x->count * sizeof *x->steps);
+    }
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT) {
+            const struct svg_paint *x = (const struct svg_paint *)fa, *y = (const struct svg_paint *)fb;
+            if (x->kind != y->kind || !same_text(x->ref, y->ref)) return false;
+            if (x->kind != SVG_PAINT_COLOR) return true;
+        }
+        struct css_color_computed x, y;
+        css_style_color(a, color_slot(p), &x);
+        css_style_color(b, color_slot(p), &y);
+        return css_color_computed_equal(&x, &y);
+    }
+    case PT_VALIGN: return a->vertical_align == b->vertical_align && (a->vertical_align != VA_LEN || a->vertical_align_px == b->vertical_align_px);
+    case PT_ZINDEX: return a->z_auto == b->z_auto && (a->z_auto || a->z_index == b->z_index);
+    case PT_DISPLAY: return a->display == b->display && a->legacy_box == b->legacy_box;
+    case PT_FONT_FAMILY: return a->font_family == b->font_family && same_text(a->font_names, b->font_names);
+    case PT_CONTAINER_NAMES: return same_text(a->container_names, b->container_names);
+    case PT_CONTENT: return same_text(a->content, b->content);
+    case PT_LIST_TYPE: return a->list_style == b->list_style && same_text(a->list_style_string, b->list_style_string);
+    case PT_BG_IMAGE: return same_text(a->bg_image, b->bg_image) && a->has_grad == b->has_grad && a->gradient == b->gradient;
+    case PT_MASK_IMAGE: return same_text(a->mask_image, b->mask_image);
+    case PT_GLINE: {
+        const struct gline *x = (const struct gline *)fa, *y = (const struct gline *)fb;
+        return x->kind == y->kind && x->n == y->n && same_text(x->name, y->name);
+    }
+    case PT_SHAPE: return css_shape_equal(*(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb);
+    case PT_RULE_LIST: return rule_list_equal(p->flags, (const struct css_rule_list *)fa, (const struct css_rule_list *)fb);
+    case PT_RULE_INSET: return rule_inset_equal((const struct css_rule_inset *)fa, (const struct css_rule_inset *)fb);
+    case PT_OFFSET:
+        if (p->flags == CSS_OFFSET_ROTATE) return !memcmp(fa, fb, sizeof(struct css_offset_rotate));
+        return css_length_equal(&((const len_t *)fa)[0], &((const len_t *)fb)[0]) &&
+            css_length_equal(&((const len_t *)fa)[1], &((const len_t *)fb)[1]);
+    case PT_GTEMPLATE: case PT_GAREAS:
+        return *(const void *const *)fa == *(const void *const *)fb;
+    case PT_MOTION_LIST: return css_motion_equal(&a->motion, &b->motion);
+    }
+    return !memcmp(fa, fb, p->size);
+}
+
+bool css_anim_parse(const struct css_anim_ctx *c, const struct propdef *p, const char *v, size_t n, bool computed,
+                    style_t *out, uint8_t *set) {
+    if (!p || !v) return false;
+    *out = *c->base;
+    uint8_t local[NPROPS];
+    if (!set) set = local;
+    memset(set, 0, NPROPS);
+    const style_t *parent = c->parent;
+    struct cx cx = {.s = out, .parent = parent, .node = c->node, .em = parent ? parent->font_size : 16, .rem = c->rem,
+                    .vw = c->vw, .vh = c->vh, .a = c->a, .set = set, .font_pass = true, .computed_text = computed};
+    /* font-size first, against the parent's, as the cascade does; then the rest against it */
+    if (css_prop_is_early(p) && !css_apply(p, v, n, &cx)) return false;
+    cx.font_pass = false;
+    cx.em = out->font_size;
+    return css_apply(p, v, n, &cx) && !cx.invalid;
+}
+
+bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const style_t *b, double t) {
+    int type = css_prop_animation(p);
+    if (type == CSS_ANIM_DISPLAY || type == CSS_ANIM_VISIBILITY) {
+        if (t <= 0) return false;
+        if (t >= 1) return true;
+        bool hides_a, hides_b;
+        if (type == CSS_ANIM_VISIBILITY) hides_a = a->visibility != 0, hides_b = b->visibility != 0;
+        else if (p->type == PT_DISPLAY) hides_a = a->display == D_NONE, hides_b = b->display == D_NONE;
+        else hides_a = a->content_visibility == CV_HIDDEN, hides_b = b->content_visibility == CV_HIDDEN;
+        /* inside the interval the showing value wins */
+        if (hides_a != hides_b) return hides_a;
+    }
+    return t >= .5;
+}
+
+/* -------- gap decoration lists (css-gaps-1 §4.7) */
+/* a walk through items [from, to) of a list with their integer repeaters written out, round and
+   round (an auto repeater's values once a round) */
+struct rule_walk {
+    const struct css_rule_list *l;
+    uint32_t from, to, item, j;
+    uint64_t round;
+};
+static void rule_walk_start(struct rule_walk *w, const struct css_rule_list *l, uint32_t from, uint32_t to) {
+    *w = (struct rule_walk){l, from, to, from, 0, 0};
+}
+static const union css_rule_value *rule_walk_next(struct rule_walk *w) {
+    const struct css_rule_item *it = &w->l->items[w->item];
+    const union css_rule_value *v = &w->l->values[it->first + w->j];
+    if (++w->j < it->count) return v;
+    w->j = 0;
+    uint64_t rounds = it->repeat && it->repeat != CSS_RULE_AUTO ? it->repeat : 1;
+    if (++w->round < rounds) return v;
+    w->round = 0;
+    if (++w->item == w->to) w->item = w->from;
+    return v;
+}
+static uint64_t rule_span(const struct css_rule_list *l, uint32_t from, uint32_t to) {
+    uint64_t n = 0;
+    for (uint32_t i = from; i < to; i++) {
+        uint64_t span = rule_item_span(&l->items[i]);
+        if (n > UINT64_MAX - span) return UINT64_MAX;
+        n += span;
+    }
+    return n;
+}
+static uint32_t rule_auto_item(const struct css_rule_list *l) {
+    for (uint32_t i = 0; i < l->nitems; i++) if (l->items[i].repeat == CSS_RULE_AUTO) return i;
+    return l->nitems;
+}
+/* the repeatable list's length (Web Animations 1 §5.3): the lowest common multiple; 0 past 64 bits */
+static uint64_t rule_lcm(uint64_t a, uint64_t b) {
+    if (!a || !b) return 0;
+    uint64_t x = a, y = b;
+    while (y) { uint64_t r = x % y; x = y; y = r; }
+    a /= x;
+    return a > UINT64_MAX / b ? 0 : a * b;
+}
+static bool rule_value_combine(int kind, const style_t *a, const union css_rule_value *x, const style_t *b,
+                               const union css_rule_value *y, double ka, double kb, int mode, sbuf *out) {
+    if (kind == CSS_GAP_WIDTH) { anim_unit(out, anim_clamp(x->width * ka + y->width * kb, 0, INFINITY), "px"); return true; }
+    struct css_color_computed u, v;
+    css_color_held(x->color.argb, x->color.exact, a->color, &u);
+    css_color_held(y->color.argb, y->color.exact, b->color, &v);
+    return anim_color(out, a, &u, b, &v, kb, mode);
+}
+/* n values of the two walks against each other, each after a comma unless *first; the text grows
+   only while memory allows, and stops when the document is cancelled */
+static bool rule_walks_combine(const struct css_anim_ctx *c, int kind, const style_t *a, struct rule_walk *wx,
+                               const style_t *b, struct rule_walk *wy, uint64_t n, double ka, double kb, int mode,
+                               bool *first, sbuf *out) {
+    sbuf one = {0};
+    bool ok = true;
+    for (uint64_t k = 0; k < n && ok; k++) {
+        if (!(k & 1023) && c->d && __atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE)) { ok = false; break; }
+        one.n = 0;
+        ok = rule_value_combine(kind, a, rule_walk_next(wx), b, rule_walk_next(wy), ka, kb, mode, &one) &&
+             (*first || length_append(out, ", ", 2)) && length_append(out, one.p, one.n);
+        *first = false;
+    }
+    sb_free(&one);
+    return ok;
+}
+/* §4.7: integer repeaters written out, then the repeatable list's items against each other; with
+   an auto repeater in both, the leading and trailing values pairwise (their lengths must match)
+   and the auto repeaters' values as a repeatable list. Otherwise false: discrete. */
+static bool rule_lists_combine(const struct css_anim_ctx *c, int kind, const style_t *a, const struct css_rule_list *x,
+                               const style_t *b, const struct css_rule_list *y, double ka, double kb, int mode, sbuf *out) {
+    uint32_t ax = rule_auto_item(x), ay = rule_auto_item(y);
+    bool repeat_auto = ax < x->nitems;
+    if (repeat_auto != (ay < y->nitems)) return false;
+    struct rule_walk wx, wy;
+    bool first = true;
+    if (!repeat_auto) {
+        uint64_t n = rule_lcm(rule_span(x, 0, x->nitems), rule_span(y, 0, y->nitems));
+        if (!n) return false;
+        rule_walk_start(&wx, x, 0, x->nitems);
+        rule_walk_start(&wy, y, 0, y->nitems);
+        return rule_walks_combine(c, kind, a, &wx, b, &wy, n, ka, kb, mode, &first, out);
+    }
+    uint64_t leading = rule_span(x, 0, ax), trailing = rule_span(x, ax + 1, x->nitems);
+    if (leading != rule_span(y, 0, ay) || trailing != rule_span(y, ay + 1, y->nitems)) return false;
+    if (leading) {
+        rule_walk_start(&wx, x, 0, ax);
+        rule_walk_start(&wy, y, 0, ay);
+        if (!rule_walks_combine(c, kind, a, &wx, b, &wy, leading, ka, kb, mode, &first, out)) return false;
+    }
+    uint64_t n = rule_lcm(x->items[ax].count, y->items[ay].count);
+    bool inner = true;
+    if (!n || !length_append(out, first ? "repeat(auto, " : ", repeat(auto, ", first ? 13 : 15)) return false;
+    rule_walk_start(&wx, x, ax, ax + 1);
+    rule_walk_start(&wy, y, ay, ay + 1);
+    if (!rule_walks_combine(c, kind, a, &wx, b, &wy, n, ka, kb, mode, &inner, out) || !length_append(out, ")", 1)) return false;
+    first = false;
+    if (!trailing) return true;
+    rule_walk_start(&wx, x, ax + 1, x->nitems);
+    rule_walk_start(&wy, y, ay + 1, y->nitems);
+    return rule_walks_combine(c, kind, a, &wx, b, &wy, trailing, ka, kb, mode, &first, out);
+}
+
+/* ka·a + kb·b for each value type (mode MIX), or b added / accumulated onto a */
+static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, const style_t *a, const style_t *b,
+                         double ka, double kb, int mode, sbuf *out) {
+    const char *fa = field_of(a, p), *fb = field_of(b, p);
+    web_doc *d = c->d;
+    switch (p->type) {
+    case PT_LEN: case PT_SVG_WIDTH:
+        return anim_len(out, (const len_t *)fa, (const len_t *)fb, ka, kb, p->type == PT_SVG_WIDTH ? 0 : p->flags, d);
+    case PT_PX: {
+        double v = *(const float *)fa * ka + *(const float *)fb * kb;
+        anim_unit(out, p->flags & LF_NEG ? v : anim_clamp(v, 0, INFINITY), "px");
+        return true;
+    }
+    case PT_FONT_SIZE: anim_unit(out, anim_clamp(a->font_size * ka + b->font_size * kb, 0, INFINITY), "px"); return true;
+    case PT_NUM: anim_number(out, anim_clamp(*(const float *)fa * ka + *(const float *)fb * kb, 0, INFINITY)); return true;
+    case PT_OPACITY: anim_number(out, anim_clamp(*(const float *)fa * ka + *(const float *)fb * kb, 0, 1)); return true;
+    case PT_FONT_WEIGHT: anim_number(out, anim_clamp(a->font_weight * ka + b->font_weight * kb, 1, 1000)); return true;
+    case PT_INT: case PT_ZINDEX: {
+        if (p->type == PT_ZINDEX && (a->z_auto || b->z_auto)) return false;
+        /* <integer>: as a real number, then to the nearest integer, halves towards +infinity */
+        char text[32]; snprintf(text, sizeof text, "%.0f", floor(*(const int *)fa * ka + *(const int *)fb * kb + .5));
+        sb_puts(out, text);
+        return true;
+    }
+    case PT_LINE_HEIGHT:
+        if (a->line_height.kind != b->line_height.kind || a->line_height.kind == LK_NORMAL) return false;
+        if (a->line_height.kind == LK_NUMBER) anim_number(out, anim_clamp(a->line_height.px * ka + b->line_height.px * kb, 0, INFINITY));
+        else anim_unit(out, anim_clamp(a->line_height.px * ka + b->line_height.px * kb, 0, INFINITY), "px");
+        return true;
+    case PT_VALIGN:
+        if (a->vertical_align != VA_LEN || b->vertical_align != VA_LEN) return false;
+        anim_unit(out, a->vertical_align_px * ka + b->vertical_align_px * kb, "px");
+        return true;
+    case PT_COLOR: case PT_SVG_PAINT: {
+        if (p->type == PT_SVG_PAINT && (((const struct svg_paint *)fa)->kind != SVG_PAINT_COLOR ||
+                                        ((const struct svg_paint *)fb)->kind != SVG_PAINT_COLOR)) return false;
+        struct css_color_computed x, y;
+        css_style_color(a, color_slot(p), &x);
+        css_style_color(b, color_slot(p), &y);
+        return anim_color(out, a, &x, b, &y, kb, mode);
+    }
+    case PT_RADIUS: {
+        const len_t *x = ((const struct css_corner_radius *)fa)->axis, *y = ((const struct css_corner_radius *)fb)->axis;
+        return anim_len(out, &x[0], &y[0], ka, kb, 0, d) && length_append(out, " ", 1) && anim_len(out, &x[1], &y[1], ka, kb, 0, d);
+    }
+    case PT_BG_POS: case PT_TRANSFORM_ORIGIN: {
+        const len_t *x = (const len_t *)fa, *y = (const len_t *)fb;
+        return anim_len(out, &x[0], &y[0], ka, kb, LF_NEG, d) && length_append(out, " ", 1) && anim_len(out, &x[1], &y[1], ka, kb, LF_NEG, d);
+    }
+    case PT_BG_SIZE: case PT_MASK_SIZE: {
+        bool bg = p->type == PT_BG_SIZE;
+        uint8_t kx = bg ? a->bg_size_kind : a->mask_size_kind, ky = bg ? b->bg_size_kind : b->mask_size_kind;
+        if (kx != BSZ_LEN || ky != BSZ_LEN) {
+            if (kx != ky) return false;
+            return css_computed_value(a, p, out, d);
+        }
+        const len_t *x = bg ? a->bg_size : a->mask_size, *y = bg ? b->bg_size : b->mask_size;
+        return anim_len(out, &x[0], &y[0], ka, kb, 0, d) && length_append(out, " ", 1) && anim_len(out, &x[1], &y[1], ka, kb, 0, d);
+    }
+    case PT_TRANSFORM: return tf_list(out, a->transform, b->transform, ka, kb, mode, c->box, d);
+    case PT_TRANSLATE:
+        if (!a->translate.active && !b->translate.active) { sb_puts(out, "none"); return true; }
+        /* none is translate(0) */
+        return anim_len(out, &a->translate.xy[0], &b->translate.xy[0], ka, kb, LF_NEG, d) && length_append(out, " ", 1) &&
+            anim_len(out, &a->translate.xy[1], &b->translate.xy[1], ka, kb, LF_NEG, d);
+    case PT_ROTATE: {
+        const struct css_transform *x = a->rotate, *y = b->rotate;
+        if (!x && !y) { sb_puts(out, "none"); return true; }
+        struct css_transform ix, iy;
+        if (!x) { ix = tf_identity(y); x = &ix; }
+        if (!y) { iy = tf_identity(x); y = &iy; }
+        if (!tf_same_axis(x, y)) return false;
+        struct css_transform r = x->v[3] != 0 || y->v[3] == 0 ? *x : *y;
+        r.v[3] = x->v[3] * ka + y->v[3] * kb;
+        tf_rotate_text(out, &r);
+        return true;
+    }
+    case PT_SCALE: {
+        const struct css_transform *x = a->scale, *y = b->scale;
+        if (!x && !y) { sb_puts(out, "none"); return true; }
+        struct css_transform ix, iy;
+        if (!x) { ix = tf_identity(y); x = &ix; }
+        if (!y) { iy = tf_identity(x); y = &iy; }
+        struct css_transform r = *x;
+        /* CSS Transforms 2 §16: scales multiply when added, add their excess over 1 when accumulated */
+        for (int i = 0; i < 3; i++)
+            r.v[i] = mode == ADD ? x->v[i] * y->v[i] : mode == ACCUMULATE ? x->v[i] + y->v[i] - 1 : x->v[i] * ka + y->v[i] * kb;
+        tf_scale_text(out, &r);
+        return true;
+    }
+    case PT_BOX_SHADOW: return anim_shadows(out, a, b, ka, kb, mode);
+    case PT_FILTER: return anim_filters(out, a->filter, b->filter, ka, kb, mode);
+    case PT_SHAPE: /* css-shapes-1 §3.4, motion-1 §2.1; accumulation is addition */
+        return css_shape_combine(p->flags, *(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb,
+                                 kb, mode != MIX, out, d);
+    case PT_OFFSET: return css_offset_combine(p->flags, fa, fb, kb, mode != MIX, out, d);
+    case PT_RULE_LIST:
+        return rule_lists_combine(c, p->flags, a, (const struct css_rule_list *)fa, b, (const struct css_rule_list *)fb, ka,
+                                  kb, mode, out);
+    case PT_RULE_INSET: { /* <length-percentage> | overlap-join: the keyword only with itself */
+        const struct css_rule_inset *x = (const struct css_rule_inset *)fa, *y = (const struct css_rule_inset *)fb;
+        if (x->join || y->join) {
+            if (mode != MIX || !x->join || !y->join) return false;
+            sb_puts(out, "overlap-join");
+            return true;
+        }
+        return anim_len(out, &x->length, &y->length, ka, kb, LF_NEG, d);
+    }
+    case PT_CLIP:
+        if (!a->clip.rect || !b->clip.rect || a->clip.auto_edges != b->clip.auto_edges) return false;
+        sb_puts(out, "rect(");
+        for (int i = 0; i < 4; i++) {
+            if (i) sb_puts(out, ", ");
+            if (a->clip.auto_edges >> i & 1) sb_puts(out, "auto");
+            else anim_unit(out, a->clip.edge[i] * ka + b->clip.edge[i] * kb, "px");
+        }
+        sb_putc(out, ')');
+        return true;
+    }
+    return false;
+}
+
+bool css_anim_interpolate(const struct css_anim_ctx *c, const struct propdef *p, const style_t *a, const style_t *b,
+                          double t, sbuf *out) {
+    int type = css_prop_animation(p);
+    if (type == CSS_ANIM_VISIBILITY)
+        return css_computed_value(a->visibility == b->visibility || !css_anim_discrete_second(p, a, b, t) ? a : b, p, out, c->d);
+    if (type != CSS_ANIM_VALUE) return false;
+    size_t begin = out->n;
+    if (anim_combine(c, p, a, b, 1 - t, t, MIX, out)) return true;
+    out->n = begin;
+    if (out->p && begin < out->cap) out->p[begin] = 0;
+    return false;
+}
+
+bool css_anim_compose(const struct css_anim_ctx *c, const struct propdef *p, const style_t *underlying,
+                      const style_t *value, bool accumulate, sbuf *out) {
+    if (css_prop_animation(p) != CSS_ANIM_VALUE) return false;
+    size_t begin = out->n;
+    if (anim_combine(c, p, underlying, value, 1, 1, accumulate ? ACCUMULATE : ADD, out)) return true;
+    out->n = begin;
+    if (out->p && begin < out->cap) out->p[begin] = 0;
+    return false;
 }

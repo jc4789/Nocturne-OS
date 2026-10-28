@@ -24,7 +24,8 @@ int main(int argc,char **argv){
     JSValue global=JS_GetGlobalObject(ctx),host=JS_NewObject(ctx);web_js_crypto_init(ctx,host);
     JS_SetPropertyStr(ctx,host,"url",JS_NewCFunction(ctx,url,"url",0));
     JS_SetPropertyStr(ctx,global,"host",host);JS_FreeValue(ctx,global);
-    JS_FreeValue(ctx,evaluate(ctx,"globalThis.DOMException=class DOMException extends Error{constructor(m,n){super(m);this.name=n;}};host.decodeUTF8=(b,o,n)=>{let s='';for(const v of new Uint8Array(b,o,n))s+='%'+v.toString(16).padStart(2,'0');return decodeURIComponent(s);};","setup"));
+    load(ctx,"user/libc/web/js_dom_exception.js");
+    JS_FreeValue(ctx,evaluate(ctx,"globalThis.DOMException=domExceptionBridge.DOMException;host.decodeUTF8=(b,o,n)=>{let s='';for(const v of new Uint8Array(b,o,n))s+='%'+v.toString(16).padStart(2,'0');return decodeURIComponent(s);};","setup"));
     load(ctx,"user/libc/web/js_encoding.js");load(ctx,"user/libc/web/js_url.js");load(ctx,"user/libc/web/js_crypto.js");
     bool incremental=argc>1&&!strcmp(argv[1],"--incremental");
     load(ctx,"tests/js_aes_cases.js");printf("Production AES checks: %d\n",await_result(ctx,evaluate(ctx,incremental?"runGCMCases()":"runAESCases()","AES cases")));

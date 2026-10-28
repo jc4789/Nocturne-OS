@@ -94,21 +94,25 @@ static void transform(char *s, size_t n, int tt) {
     }
 }
 
-/* white-space processing and text-transform */
-static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t *st, size_t *out_n) {
+/* white-space processing and text-transform. With source, also the byte of s each output
+   byte came from (source has room for one entry per output byte and one for the end, which
+   is n): the one record of how a text box's text corresponds to its Text node's data. */
+static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t *st, size_t *out_n,
+                              uint32_t *source) {
     char *o = ar_alloc(a, n * 8 + 1); /* tabs may expand */
     size_t k = 0;
     int ws = st->white_space;
+#define WS_EMIT(c, from) do { if (source) source[k] = (uint32_t)(from); o[k++] = (c); } while (0)
     if (ws == WS_PRE || ws == WS_PRE_WRAP || ws == WS_BREAK_SPACES) {
         int col = 0;
         for (size_t i = 0; i < n; i++) {
             char c = s[i];
             if (c == '\t') {
                 int sp = 8 - col % 8;
-                for (int j = 0; j < sp; j++) o[k++] = ' ';
+                for (int j = 0; j < sp; j++) WS_EMIT(' ', i);
                 col += sp;
             } else {
-                o[k++] = c;
+                WS_EMIT(c, i);
                 col = c == '\n' ? 0 : col + 1;
             }
         }
@@ -119,12 +123,12 @@ static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t
             char c = s[i];
             if (c == '\n' && keep_nl) {
                 while (k > 0 && o[k - 1] == ' ') k--;
-                o[k++] = '\n';
+                WS_EMIT('\n', i);
                 space = true; /* drops the spaces after it */
                 continue;
             }
             if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
-                if (!space) o[k++] = ' ';
+                if (!space) WS_EMIT(' ', i);
                 space = true;
                 continue;
             }
@@ -133,14 +137,31 @@ static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t
                 i++;
                 continue;
             }
-            o[k++] = c;
+            WS_EMIT(c, i);
             space = false;
         }
     }
+#undef WS_EMIT
     o[k] = 0;
+    if (source) source[k] = (uint32_t)n;
+    /* In place and byte for byte: the source map stays exact. */
     if (st->text_transform) transform(o, k, st->text_transform);
     *out_n = k;
     return o;
+}
+
+uint32_t *box_text_source_map(arena_t *a, const box_t *t) {
+    const node_t *n = t ? t->node : NULL;
+    if (!n || n->type != N_TEXT || t->kind != B_TEXT || n->box != t || !t->st || !t->text ||
+        n->textlen > UINT32_MAX - 1 || t->len > SIZE_MAX / sizeof(uint32_t) - 1) return NULL;
+    /* t->len is what this data made when the box was built; a different result means a
+       text change the next layout has not published yet. */
+    uint32_t *source = ar_alloc(a, (t->len + 1) * sizeof *source);
+    size_t length = 0;
+    const char *text = ws_process(a, n->text ? n->text : "", n->textlen, t->st, &length, NULL);
+    if (length != t->len || memcmp(text, t->text, length)) return NULL;
+    ws_process(a, n->text ? n->text : "", n->textlen, t->st, &length, source);
+    return source;
 }
 
 /* ---------------------------------------------------------------- list markers */
@@ -731,7 +752,7 @@ static void fixup(struct bctx *b, box_t *x);
 
 static void text_box(struct bctx *b, box_t *pb, node_t *n, const char *s, size_t len, style_t *st) {
     size_t k;
-    const char *t = ws_process(b->a, s, len, st, &k);
+    const char *t = ws_process(b->a, s, len, st, &k, NULL);
     if (!k) return;
     box_t *x = nbox(b, B_TEXT, n, st);
     x->text = t;
@@ -803,6 +824,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
         ws->padding[i].px = ws->padding[i].pct = 0;
     }
     ws->bg_color = 0;
+    ws->color_current &= (uint16_t)~(1u << CSS_SLOT_BACKGROUND);
     ws->bg_image = NULL;
     ws->has_grad = false;
     ws->gradient = NULL;
@@ -814,7 +836,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     *is = *st;
     is->filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
     is->clip_path = NULL; memset(&is->clip, 0, sizeof is->clip);
-    is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);
+    is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);is->offset=NULL;
     is->display = inner_kind == B_TABLE ? D_TABLE : inner_kind == B_GRID ? D_GRID : D_FLEX;
     for (int i = 0; i < 4; i++) {
         is->margin[i].kind = LK_LEN;
@@ -1656,14 +1678,14 @@ static bool restyle_derived(box_t *b, style_t *old) {
             next.border_width[i]=0;
             next.padding[i].kind=LK_LEN; next.padding[i].px=next.padding[i].pct=0;
         }
-        next.bg_color=0; next.bg_image=NULL; next.has_grad=false; next.gradient=NULL;
+        next.bg_color=0; next.color_current&=(uint16_t)~(1u<<CSS_SLOT_BACKGROUND); next.bg_image=NULL; next.has_grad=false; next.gradient=NULL;
         next.box_shadow=NULL;
         next.border_radius=0;memset(next.corner_radius,0,sizeof next.corner_radius);
         next.width.kind=next.height.kind=LK_AUTO;
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
         next.filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
-        next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);
+        next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);next.offset=NULL;
         for (int i=0;i<4;i++) {
             next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;
         }
@@ -1728,7 +1750,7 @@ bool boxes_update_text(web_doc *d, node_t *n) {
     arena_t next = {.chunk_size=4096}; jmp_buf trap; next.trap = &trap;
     if (setjmp(trap)) { ar_free(&next); return false; }
     size_t length;
-    const char *text = ws_process(&next,n->text,n->textlen,b->st,&length);
+    const char *text = ws_process(&next,n->text,n->textlen,b->st,&length,NULL);
     next.trap = NULL; ar_free(&b->text_mem); b->text_mem = next;
     b->text=text; b->len=length;
     layout_invalidate(b); return true;

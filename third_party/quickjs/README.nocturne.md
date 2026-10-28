@@ -105,6 +105,14 @@ RegExpから作成realmへの所有参照には既存の `JS_DupContext`/`JS_Fre
 番号ごとに一つの写しを作る。toString の結果、行番号、strip の扱いは変えない。
 関数が一つでも生きていれば入力全体が残るが、その量は入力一つ分を超えない。
 
+## 元の文の無い関数の toString
+
+js.c はブラウザーの束縛（js_bootstrap.js などの platform の実装）だけを `JS_STRIP_SOURCE`
+で組む。Web IDL ではそれらは組み込みの関数なので、`Function.prototype.toString` は
+ECMA-262 の NativeFunction の形でなければならず、async や generator の前置きを持てない。
+元の文の無い関数は、関数の種類によらず `function 名前() { [native code] }` の形にする。
+元の文を持つ関数（頁の台本）の結果は変えない。
+
 ## 標本取りの問い合わせ
 
 `--debug-js` の JavaScript の時間計測（`user/libc/web/js_profile.c`）のため、
@@ -113,3 +121,72 @@ RegExpから作成realmへの所有参照には既存の `JS_DupContext`/`JS_Fre
 返す。`JS_DescribeFunction` はその名前、定義された script、始まる行と桁を返し、
 JavaScript を一切走らせない。桁は、一行に詰めた（minify した）script の関数を
 見分けるため。解釈器の動きは変えない。
+
+## Array.fromAsync
+
+上流（2026-06-04 とその後の 2026-09 の commit）に無い ECMA-262 の
+`Array.fromAsync` を足した。仕様はこれを AsyncFunctionStart で始める抽象の閉包と
+して書くので、閉包の捕まえる値と変数を `JS_CLASS_ARRAY_FROM_ASYNC` の状態の object
+（`JSArrayFromAsyncData`）に持ち、各 Await を async 関数の await と同じく
+`PromiseResolve(%Promise%)` と `perform_promise_then` の二つの再開の関数で行う。
+非同期の反復子、同期の反復子（上流の `JS_CreateAsyncFromSyncIterator`）、
+配列もどきの三つの道、写像の関数の結果の Await、写像・定義の失敗での
+AsyncIteratorClose（`return()` の結果を待ってから元の例外で拒否）を仕様の順に通す。
+JS で書いた組み込み（quickjs-ng の方式）にしないのは、その toString・stack と、
+`return()` を正常な終わりでも呼ぶ差を持ち込まないため。
+
+確かめ方は `python -X utf8 tests/check_test262.py built-ins/Array/fromAsync`
+（WPT の同梱の test262 を host の同じ QuickJS で走らせる）。class の番号は
+`JS_CLASS_ASYNC_FROM_SYNC_ITERATOR` の次に一つ増えた。
+
+## host の exotic な class（Web IDL の legacy platform object）
+
+DOM の集まり（NodeList・HTMLCollection とその派生、`user/libc/web/js_collections_native.h`）は
+`JSClassExoticMethods` の class で、Web IDL の legacy platform object の内部の手順を native で
+答える。上流の exotic の口のままでは足りない三点だけを `CONFIG_NOCTURNE` の下に足した。
+
+- `JS_AtomKeyKind`（quickjs.h）：property key が配列の添字（0〜2^32−2、`*pindex` に入る）か、
+  ほかの文字列か、symbol（private name を含む）か。JavaScript を走らせない。上流の
+  `JS_AtomIsArrayIndex` と `JS_AtomGetKind` は static で、host から添字と名前を分けられない。
+- `JS_ThrowTypeErrorOrFalseStr`：拒んだ [[Set]]・[[DefineOwnProperty]] の結果。`flags` に
+  `JS_PROP_THROW` があるか、`JS_PROP_THROW_STRICT` で走っている code が strict なら TypeError
+  （−1）、そうでなければ FALSE。上流の `JS_ThrowTypeErrorOrFalse` が static なため。
+- `JS_GetOwnPropertyNamesInternal`：host の `get_own_property_names` の鍵（添字、次に名前）を
+  普通の文字列の鍵と symbol より前に並べ、普通の own property でもある鍵は一度だけ（その
+  property として）出す。Web IDL の [[OwnPropertyKeys]] の順。上流は host の鍵を普通の
+  property の後ろに付け、重ねも除かない。host の鍵と列挙できるかの問い合わせは
+  JavaScript を走らせて object の shape を変えうるので、普通の property を数える前に
+  済ませる（`js_exotic_own_keys`）。
+
+ほかに `get_own_property_names` を持つ exotic な class は Proxy だけで、Proxy の shape には
+普通の property が無いので、順も呼ぶ時機も変わらない。集まりの [[DefineOwnProperty]] が普通の
+定義へ戻すのは上流の `JS_PROP_NO_EXOTIC` で、これは変えていない。確かめ方は
+`python -X utf8 tests/check_collections_native.py`（集まりの WPT の期待）。`tests/check_test262.py`
+は `CONFIG_NOCTURNE` なしで組むので、この変更を test262 に通すには `CONFIG_NOCTURNE` で組んだ回が
+要る（2026-10-28 に一度、built-ins/Proxy・Reflect/ownKeys・Object の keys・getOwnPropertyNames・
+getOwnPropertySymbols・entries・values・assign・getOwnPropertyDescriptors、
+language/statements/for-in、JSON/stringify の 1398 件を流し、上流の形と同じく全部合格）。
+
+## callback の realm（Web IDL の associated realm）
+
+DOM の「inner invoke」と HTML の event handler processing algorithm は、listener の callback の
+associated realm の global を見る：その Window の current event（`window.event`）を置き直し、
+その Document が fully active でなければ呼ばず、callback が投げたものをその global で報告する。
+枠は同じ runtime の別の JSContext なので（`user/libc/web/js.c` の `runtime_realms`）、host が
+callback の realm を引く口が要る。二つを quickjs.h に出した。
+
+- `JS_GetFunctionRealm`：上流の static の関数を公開しただけで、中身は変えていない（上流の
+  static の前方宣言は除いた）。ECMAScript の GetFunctionRealm：関数の [[Realm]]、bound function と
+  Proxy はその target をたどる。取り消された Proxy では TypeError を残して NULL。
+- `JS_GetObjectRealm`（`CONFIG_NOCTURNE` の下）：呼べない object の realm。ECMAScript は関数にしか
+  realm を記録しないので、prototype の鎖の終わりの %Object.prototype% を持つ realm とする（関数なら
+  `JS_GetFunctionRealm` と同じ）。shape の proto を読むだけで、JavaScript を走らせない。Proxy は
+  target へたどり、`getPrototypeOf` の罠は呼ばない。見つからなければ（prototype が null の object
+  など）ctx。
+
+どちらも context の参照の数を増やさない。取り消された Proxy は作られた realm を覚えていないので、
+呼び出す側（js.c の `native_event_realm`）は今の realm を使う（WPT
+`dom/events/EventListener-handleEvent-cross-realm` の取り消された Proxy の二つは、この理由で
+枠の TypeError にならない）。bindings は listener を足すとき・handler に値を置くときに一度だけ
+引くので、事象の配りの一回ごとの費用にはならない。確かめ方は
+`node tests/js_event_state_hosttest.js`（一つの realm の配り）と、枠を持つ WPT の `dom/events`。

@@ -39,7 +39,7 @@ description: Nocturne OS の実物を動かして確かめる手順。QEMU の�
 
 ## 試験
 
-- `python -X utf8 scripts/test.py [--quick] [--no-net] [--accel whpx] [群|群/名]`：`build/nocturne.img` を `build/test.img` へ写して窓なしで起動し、`C:\Tests\autorun.sh` から `tests/runtests.c` を tcc で組んで走らせる。群と名は `runtests.c` の `tests[]`（114 群 224 件。例 `web`、`web/fonts`、`web/engine`、`web/javascript`）。既定は tcg・2048 MiB・4 CPU・1920×1080・1200 秒。結果は `build/test-serial.log`・`build/test-metadata.json`、別に残すなら `--output-dir build/<新しい名>`。
+- `python -X utf8 scripts/test.py [--quick] [--no-net] [--accel whpx] [群|群/名]`：`build/nocturne.img` を `build/test.img` へ写して窓なしで起動し、`C:\Tests\autorun.sh` から `tests/runtests.c` を tcc で組んで走らせる。群と名は `runtests.c` の `tests[]`（117 群 227 件。例 `web`、`web/fonts`、`web/engine`、`web/javascript`）。既定は tcg・2048 MiB・4 CPU・1920×1080・1200 秒。結果は `build/test-serial.log`・`build/test-metadata.json`、別に残すなら `--output-dir build/<新しい名>`。
 - `python -X utf8 scripts/platform_qa.py --label <名> --accel whpx --memory 4096 --resolution 2560x1440 --url <URL> --seconds <秒>`：ラベル専用の写しを snapshot=on で一台起動し、`--command`（ゲストのコマンド）・`--key`・`--timed-key 秒:キー`・`--cmdline prof`（カーネルの標本）・`--expect`・`--reject` で操作と判定。`build/nocturne-platform/<label>/` に serial と画面が残る。既定は tcg・2048 MiB・1920×1080。
 - `tests/check_*.py` はホストの検査で、各自 `python tests/check_<名>.py`。まとめる runner は無い。
 - 同じ試験を繰り返さない。再実行は、製品を直した、試験の不備を直した、別の条件で切り分ける、のどれかを言えるときだけ。期待値を弱める・skip を足す・製品の経路を迂回して合格を作らない。

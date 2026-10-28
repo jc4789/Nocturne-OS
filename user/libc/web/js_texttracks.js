@@ -12,7 +12,7 @@ const textTrackBridge = (() => {
     const token={}, HTML='http://www.w3.org/1999/xhtml', KINDS=['subtitles','captions','descriptions','chapters','metadata'];
     const schedule=fn=>host.timer(0,fn,0,[]), encoder=new TextEncoder(), encode=TextEncoder.prototype.encode;
     const decoder=new TextDecoder('utf-8',{fatal:true}), decode=TextDecoder.prototype.decode;
-    const Abort=fetchBridge.AbortController, bodyBytes=fetchBridge.Response.prototype.arrayBuffer;
+    const Abort=abortBridge.AbortController, bodyBytes=fetchBridge.Response.prototype.arrayBuffer;
     const refs=new Set();
     let pollTimer=0, sequence=0;
     const lookup=(map,value,name)=>{const s=apply(mapGet,map,[value]);if(!s)throw new TypeError('Illegal '+name+' receiver');return s;};
@@ -116,7 +116,7 @@ const textTrackBridge = (() => {
         constructor(){return customElementsBridge.construct(new.target,HTMLTrackElement);}
         get kind(){elementBrand(this);const v=(this.getAttribute('kind')||'subtitles').toLowerCase();return KINDS.includes(v)?v:'metadata';}
         set kind(v){elementBrand(this);this.setAttribute('kind',string(v));}
-        get src(){elementBrand(this);const v=this.getAttribute('src');return v?new URL(v,this.baseURI).href:'';}
+        get src(){elementBrand(this);const v=this.getAttribute('src');return v?elementURL.resolve(this,v):'';}
         set src(v){elementBrand(this);this.setAttribute('src',string(v));}
         get srclang(){elementBrand(this);return this.getAttribute('srclang')||'';}
         set srclang(v){elementBrand(this);this.setAttribute('srclang',string(v));}
@@ -185,13 +185,16 @@ const textTrackBridge = (() => {
     function removeTrack(o,t){const s=track(t);abortTrack(s);s.owner=null;o.bytes-=s.bytes;o.cueCount-=s.items.length;const i=o.items.indexOf(t);if(i>=0)o.items.splice(i,1);
         for(const c of s.activeItems)cue(c).active=false;s.activeItems=[];indexed(s.active,[]);queue(o.list,'removetrack',{track:t});}
     function sync(o){if(o.syncing)return;o.syncing=true;try{
-        const elements=[];for(const node of o.node.children)if(node.namespaceURI===HTML&&node.localName==='track')elements.push(node);
+        /* The tree as the native DOM holds it: a page may redefine NodeList, HTMLCollection or
+           Element members, and a media element's list of text tracks does not follow them. */
+        const elements=[],children=rawDom.get(o.node,'childNodes');
+        for(let i=0;i<children.length;i++){const node=children[i];if(rawDom.get(node,'nodeType')===1&&rawDom.get(node,'namespaceURI')===HTML&&rawDom.get(node,'localName')==='track')elements.push(node);}
         for(const t of o.items.slice())if(track(t).element&&!elements.includes(track(t).element))removeTrack(o,t);
         for(const element of elements){let t=apply(mapGet,elementSlots,[element]);if(!t){t=new TextTrack(token,null,'subtitles','','',element);put(elementSlots,element,t);}const s=track(t);
             if(s.owner!==o){if(s.owner)removeTrack(s.owner,t);s.owner=o;o.items.push(t);o.bytes+=s.bytes;o.cueCount+=s.items.length;queue(o.list,'addtrack',{track:t});}
             const kind=(element.getAttribute('kind')||'subtitles').toLowerCase();s.kind=KINDS.includes(kind)?kind:'metadata';s.label=element.getAttribute('label')||'';s.language=element.getAttribute('srclang')||'';s.id=element.id;
             if(!s.explicitMode&&element.hasAttribute('default')&&!o.items.some(x=>x!==t&&track(x).mode==='showing'&&['captions','subtitles'].includes(track(x).kind)))s.mode='showing';
-            const raw=element.getAttribute('src');let url='',urlError=null;try{if(raw)url=new URL(raw,element.baseURI).href;}catch(e){urlError=e;}
+            const raw=element.getAttribute('src');let url='',urlError=null;if(raw){url=elementURL.serialize(element,raw);if(url===null){url='';urlError=new TypeError('Invalid track URL');}}
             const signature=generation(o.node)+'|'+o.node.crossOrigin+'|'+(urlError?'invalid:'+raw:url);
             if(s.signature!==null&&s.signature!==signature){abortTrack(s);clearCues(s);s.ready=0;}
             if(urlError){if(s.signature!==signature){s.signature=signature;s.ready=3;s.error=urlError;queue(element,'error');}}
@@ -242,7 +245,11 @@ const textTrackBridge = (() => {
     /* Native parser-created media/track elements also work without author
      * touching textTracks. DOM mutations trigger bounded rescan. */
     let discoverPending=false;
-    function discover(){if(discoverPending)return;discoverPending=true;schedule(()=>{discoverPending=false;for(const node of document.querySelectorAll('video,audio')){
+    function discover(){if(discoverPending)return;discoverPending=true;schedule(()=>{discoverPending=false;
+        /* The native query's own array, not a NodeList: a page that redefines NodeList's length
+           or iterator must not make the platform scan elements that are not there. */
+        const found=dom('query',document,'video,audio',false);
+        for(let i=0;i<found.length;i++){const node=found[i];
         /* A managed element follows its own tracks through its observer and
          * media events; only newly inserted media need a first scan. */
         if(apply(mapGet,mediaSlots,[node]))continue;try{manage(node);}catch(e){report(e);}}});}

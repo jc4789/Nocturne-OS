@@ -20,6 +20,10 @@ struct web_face_state {
     size_t message_length, allocation;
     node_t *anchor;
     struct web_face_value *value, *state;
+    /* HTML: the custom element's states set, for :state(): names, each NUL-terminated,
+       in insertion order (CustomStateSet keeps the same order) */
+    char *custom_states;
+    size_t custom_states_length;
 };
 struct web_face_value *web_face_value_create(bool single);
 bool web_face_value_reserve(struct web_face_value *value, unsigned count);
@@ -29,3 +33,5 @@ bool web_face_set_value(web_doc *d, node_t *n, struct web_face_value *value, str
 bool web_face_set_validity(web_doc *d, node_t *n, uint32_t flags, const char *message, size_t length);
 void web_face_release(node_t *n);
 node_t *web_face_validation_anchor(node_t *n);
+/* CustomStateSet's add ('a'), delete ('d') and clear ('c'); false: allocation failure */
+bool web_custom_state_change(web_doc *d, node_t *n, char op, const char *name, size_t length);

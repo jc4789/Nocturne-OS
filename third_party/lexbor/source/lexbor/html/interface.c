@@ -146,6 +146,12 @@ lxb_html_interface_destroy(lxb_dom_interface_t *intrfc)
                     return lxb_dom_element_interface_destroy(intrfc);
                 }
             }
+            /* As lxb_html_interface_create: an element in a namespace outside the
+               table (one the document registered, such as a context element's
+               own namespace) is a plain DOM element. */
+            else if (node->ns >= LXB_NS__LAST_ENTRY) {
+                return lxb_dom_element_interface_destroy(intrfc);
+            }
             else {
                 return lxb_html_interface_res_destructor[node->local_name][node->ns](intrfc);
             }

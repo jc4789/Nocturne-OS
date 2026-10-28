@@ -3,7 +3,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 #include <threads.h>
+#include "weburl.h"
 
 /* ---- streams: plain TCP or TLS 1.2 (BearSSL, verified against the built-in Mozilla roots) ---- */
 typedef struct net_stream net_stream;
@@ -25,6 +28,19 @@ net_stream *ns_open_timed(const char *host, uint16_t port, bool tls, int timeout
    successful peer. Separate from the existing timing structure's native ABI. */
 struct ns_connection_info { uint32_t version, candidates, attempts, peer_ip; };
 int ns_get_connection_info(const net_stream *,struct ns_connection_info *);
+/* Fetch's "connection timing info" of one connection, which the connection
+   records as it opens: when the domain lookup started and ended, when the
+   connection started, when its secure handshake started (0 on a cleartext
+   connection) and when it was established, handshake included. Absolute
+   uptime_ms values. protocol is the ALPN negotiated protocol ID; an HTTP/1
+   connection that negotiated none reports "http/1.1". */
+#define HTTP_PROTOCOL_MAX 16u
+#define HTTP_CONTENT_ENCODING_MAX 16u
+struct http_connection_timing {
+    uint64_t domain_lookup_start, domain_lookup_end, connect_start, connect_end, secure_connection_start;
+    char protocol[HTTP_PROTOCOL_MAX];
+};
+int ns_get_connection_timing(const net_stream *, struct http_connection_timing *);
 long ns_write(net_stream *s, const void *buf, size_t n); /* all or -1 */
 long ns_read(net_stream *s, void *buf, size_t n);        /* >0 bytes, 0 = end of stream, -1 = error */
 void ns_set_timeout(net_stream *s, int timeout_ms);      /* per read; -1 waits forever */
@@ -59,48 +75,26 @@ uint64_t ns_bytes_sent(net_stream *); /* accepted TCP bytes, including TLS recor
 void ns_sessions_clear(void);
 
 /* ---- URLs ---- */
-#define HTTP_URL_MAX 16384u /* legacy fixed struct/url_parse bound, including NUL */
-#define HTTP_URL_PATH_MAX HTTP_URL_MAX
-struct url {
-    bool tls;
-    char host[128];
-    uint16_t port;
-    char path[HTTP_URL_PATH_MAX]; /* includes the query string; "/" if empty */
-};
-bool url_parse(const char *s, struct url *u);
+/* The inline URL of struct web_response (web.h) and the network wire's older bound, NUL
+   included. A request's own URL has no fixed bound. */
+#define HTTP_URL_MAX 16384u
 
-/* Exact-length storage for the real transport. The legacy struct/url_parse
-   remain ABI-compatible for callers not yet migrated. A successful parse owns
-   both strings; release with url_owned_free. Pass a fresh output, not a live
-   owned result. The span entry rejects embedded NUL rather than accepting a
-   different prefix. IPv6 transport is not implemented and fails closed. */
-struct url_owned {
-    bool tls;
-    char *host;
-    uint16_t port;
-    char *path;
+/* What a request to an http or https URL is made with, read from the URL Standard's record
+   of it (weburl.h), never from a second reading of its text. The URL's credentials are never
+   part of a request: Fetch sends them only from an authentication entry, after a 401, which
+   this layer does not make. */
+struct http_target {
+    bool tls;          /* https */
+    uint16_t port;     /* the URL's port, or the scheme's default */
+    char *host;        /* the host, serialized: an IPv6 address in brackets */
+    char *authority;   /* the host and the URL's port, if any: the Host field and :authority */
+    char *path;        /* path and query (origin-form); never empty, never the fragment */
 };
-bool url_parse_owned_n(const char *s, size_t length, struct url_owned *u);
-bool url_parse_owned(const char *s, struct url_owned *u);
-void url_owned_free(struct url_owned *u);
-
-enum http_url_result {
-    HTTP_URL_OOM = -2, HTTP_URL_INVALID = -1, HTTP_URL_OPAQUE = 0, HTTP_URL_TUPLE = 1
-};
-/* Same grammar/ownership as url_parse_owned_n, but distinguish malformed spans
-   from actual allocation failure. The owned entries accept uint32_t byte spans
-   (plus a representable terminator), without the legacy fixed-buffer quota.
-   Fresh u is zero on failure; on TUPLE release it with url_owned_free. */
-enum http_url_result url_parse_owned_result_n(const char *s, size_t length, struct url_owned *u);
-/* Fresh output slots are NULL on every non-TUPLE result. On TUPLE each output
-   owns an exact-length malloc string. canonical may be NULL to request origin
-   only; origin is required. Unsupported non-HTTP documents are OPAQUE, never
-   comparable empty origins. HTTP parse/allocation failures are distinct.
-   Fragment is excluded, host ASCII case/default port canonicalize; userinfo,
-   embedded NUL and unsupported IPv6 fail closed. Caller frees both strings. */
-enum http_url_result http_canonical_owned_n(const char *raw, size_t length, char **canonical, char **origin);
-enum http_url_result http_origin_owned_n(const char *raw, size_t length, char **origin);
-enum http_url_result http_origin_owned(const char *raw, char **origin);
+/* url (a URL's serialization, or any absolute URL the URL parser reads) as a request's
+   target. WEB_URL_TUPLE: t's strings are malloc'd (http_target_free them); WEB_URL_OPAQUE: a
+   URL of another scheme; WEB_URL_INVALID: not a URL; WEB_URL_OOM. t is zero unless TUPLE. */
+enum web_url_result http_target_of(const char *url, struct http_target *t);
+void http_target_free(struct http_target *t);
 
 /* ---- HTTP ---- */
 /* body callback: return a negative value to abort the transfer */
@@ -168,7 +162,71 @@ struct http_transport_result {
     uint64_t connection_id;
     uint32_t stream_id;
     bool http2;
+    /* This attempt's part of Fetch's timing record (absolute uptime_ms, 0 for
+       not reached): the timing info of the connection it used, as that
+       connection recorded it when it opened (an earlier request's for a reused
+       one; the caller clamps it), the protocol of this exchange, when the
+       request started to go out (final network-request start), when the first
+       interim (1xx) and the final response began to arrive, and the body's
+       encoded size: the bytes transmitted, before content codings are undone. */
+    struct http_connection_timing connection;
+    uint64_t request_start, first_interim_response_start, final_response_start;
+    uint64_t encoded_body_size;
+    /* Fetch's filtered content coding of the response body: "" (none, or no
+       body byte arrived), the lowercased coding this client undoes,
+       "multiple" or "@unknown" (HTTP-network fetch, response body info). */
+    char content_encoding[HTTP_CONTENT_ENCODING_MAX];
 };
+/* Fetch's timing record of one fetch, from its start to the end of its body:
+   "fetch timing info" (start, redirect, post-redirect start, final connection
+   timing info, request and response starts, end), the final response's cache
+   state, "timing allow passed" flag, redirect taint and body info, and its
+   Server-Timing field values. Absolute uptime_ms values, 0 for not reached.
+   The transport (webfetch) records it as the request goes, the browser's
+   network layer (webnet.c) adds the start time it was asked at and clamps a
+   reused connection's times, and the document builds Navigation and Resource
+   Timing entries from it. The record is never the opaque form: the
+   performance timeline makes that itself when timing_allow_passed is false. */
+enum http_cache_state { HTTP_CACHE_STATE_NONE, HTTP_CACHE_STATE_LOCAL, HTTP_CACHE_STATE_VALIDATED };
+struct http_fetch_timing {
+    bool valid;
+    /* A network hop ran, so "final connection timing info" is non-null. */
+    bool connection_valid;
+    /* Fetch: every hop passed the TAO check (timing allow passed flag). */
+    bool timing_allow_passed;
+    /* Fetch: the response's redirect taint is "same-origin". */
+    bool redirect_same_origin;
+    /* HTML (create and initialize a Document): a navigation's redirect count
+       is exposed (redirect taint same-origin, or the navigation TAO check over
+       every redirect hop passed for a request that had no client or sent a
+       referrer). Meaningful for navigations only. */
+    bool navigation_redirects_exposed;
+    uint8_t cache_state; /* enum http_cache_state */
+    uint32_t redirect_count;
+    uint64_t start_time, redirect_start, redirect_end, post_redirect_start;
+    struct http_connection_timing connection;
+    uint64_t final_network_request_start, first_interim_network_response_start,
+             final_network_response_start, end_time;
+    uint64_t encoded_body_size, decoded_body_size;
+    char content_encoding[HTTP_CONTENT_ENCODING_MAX];
+    /* Owned by whoever holds the record (NULL: none): the final response's
+       Server-Timing field values combined (", "), before the timing allow
+       check; the timeline parses them (Server Timing §2). */
+    char *server_timing;
+};
+/* Copies a record into *out, the Server-Timing values included; false when
+   that copy cannot be allocated (out is then the record without them). */
+static inline bool http_fetch_timing_copy(struct http_fetch_timing *out, const struct http_fetch_timing *in) {
+    *out = *in; out->server_timing = NULL;
+    if (!in->server_timing) return true;
+    size_t n = strlen(in->server_timing);
+    if (!(out->server_timing = malloc(n + 1))) return false;
+    memcpy(out->server_timing, in->server_timing, n + 1);
+    return true;
+}
+static inline void http_fetch_timing_free(struct http_fetch_timing *timing) {
+    free(timing->server_timing); timing->server_timing = NULL;
+}
 int http_request_stream_ex(const struct http_req *, struct http_resp *, size_t,
                            const struct http_stream_hooks *, struct http_transport_timing *,
                            const char *partition, struct http_transport_result *);

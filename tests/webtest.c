@@ -551,8 +551,9 @@ static void title_is(const char *name, const char *html, const char *charset, co
 }
 
 static void url_is(const char *name, const char *base, const char *rel, const char *want) {
-    char out[512];
-    str_is(name, web_resolve_url(base, rel, out, sizeof out) ? out : NULL, want);
+    char *out = NULL;
+    str_is(name, web_resolve_url_owned(base, rel, &out) == 1 ? out : NULL, want);
+    free(out);
 }
 
 static const unsigned char blue_png[] = {

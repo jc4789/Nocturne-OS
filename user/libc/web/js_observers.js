@@ -2,66 +2,9 @@
    there is no always-visible result and no synthetic periodic resize event. */
 const observerBridge=(()=>{
     const roSlots=new WeakMap(),ioSlots=new WeakMap(),resize=new Set(),intersections=new Set();
-    const rectSlots=new WeakMap(),mutableRects=new WeakSet();
-    const rectGet=WeakMap.prototype.get, rectSet=WeakMap.prototype.set, rectApply=Reflect.apply;
-    const rectHas=WeakSet.prototype.has,rectAdd=WeakSet.prototype.add;
-    const rectTypeError=TypeError, rectDefine=Object.defineProperty, rectMin=Math.min, rectMax=Math.max;
-    function rectRecord(value){
-        const r=rectApply(rectGet,rectSlots,[value]);
-        if(!r)throw new rectTypeError('Illegal DOMRect receiver');
-        return r;
-    }
-    function mutableRect(value){
-        if(!rectApply(rectHas,mutableRects,[value]))throw new rectTypeError('Illegal mutable DOMRect receiver');
-        return rectRecord(value);
-    }
-    function rectDictionary(value){
-        if(value===undefined || value===null)value={};
-        if(typeof value!=='object' && typeof value!=='function')throw new rectTypeError('Expected DOMRectInit dictionary');
-        const member=key=>{const v=value[key];return v===undefined?0:+v;};
-        // Web IDL dictionary members are converted in lexicographic order.
-        const height=member('height'),width=member('width'),x=member('x'),y=member('y');
-        return [x,y,width,height];
-    }
-    class DOMRectReadOnly {
-        constructor(x=0,y=0,width=0,height=0){rectApply(rectSet,rectSlots,[this,[+x,+y,+width,+height]]);}
-        static fromRect(r={}){return new DOMRectReadOnly(...rectDictionary(r));}
-        get x(){return rectRecord(this)[0];}get y(){return rectRecord(this)[1];}
-        get width(){return rectRecord(this)[2];}get height(){return rectRecord(this)[3];}
-        get top(){const r=rectRecord(this);return rectMin(r[1],r[1]+r[3]);}
-        get bottom(){const r=rectRecord(this);return rectMax(r[1],r[1]+r[3]);}
-        get left(){const r=rectRecord(this);return rectMin(r[0],r[0]+r[2]);}
-        get right(){const r=rectRecord(this);return rectMax(r[0],r[0]+r[2]);}
-        toJSON(){const [x,y,width,height]=rectRecord(this);return {x,y,width,height,
-            top:rectMin(y,y+height),right:rectMax(x,x+width),bottom:rectMax(y,y+height),left:rectMin(x,x+width)};}
-    }
-    class DOMRect extends DOMRectReadOnly {
-        constructor(x=0,y=0,width=0,height=0){super(x,y,width,height);rectApply(rectAdd,mutableRects,[this]);}
-        static fromRect(r={}){return new DOMRect(...rectDictionary(r));}
-        get x(){return mutableRect(this)[0];}set x(value){mutableRect(this)[0]=+value;}
-        get y(){return mutableRect(this)[1];}set y(value){mutableRect(this)[1]=+value;}
-        get width(){return mutableRect(this)[2];}set width(value){mutableRect(this)[2]=+value;}
-        get height(){return mutableRect(this)[3];}set height(value){mutableRect(this)[3]=+value;}
-    }
-    for(const [C,name] of [[DOMRectReadOnly,'DOMRectReadOnly'],[DOMRect,'DOMRect']])
-        rectDefine(C.prototype,Symbol.toStringTag,{configurable:true,value:name});
-    const rectListSlots=new WeakMap();
-    function rectListRecord(value){const r=rectApply(rectGet,rectListSlots,[value]);if(!r)throw new rectTypeError('Illegal DOMRectList receiver');return r;}
-    class DOMRectList {
-        constructor(){throw new rectTypeError('Illegal DOMRectList constructor');}
-        get length(){return rectListRecord(this).length;}
-        item(index){const values=rectListRecord(this);if(!arguments.length)throw new rectTypeError('DOMRectList item requires an index');return values[index>>>0]||null;}
-    }
-    rectDefine(DOMRectList.prototype,Symbol.toStringTag,{value:'DOMRectList',configurable:true});
-    rectDefine(DOMRectList.prototype,Symbol.iterator,{value:Array.prototype.values,writable:true,configurable:true});
-    for(const name of ['length','item'])rectDefine(DOMRectList.prototype,name,{enumerable:true});
-    rectDefine(globalThis,'DOMRectList',{value:DOMRectList,writable:true,configurable:true});
-    function clientRects(values){
-        const rects=[];
-        for(let i=0;i<values.length;i++)rects.push(new DOMRect(...values[i]));
-        const list=collectionBridge.typed(()=>rects,DOMRectList.prototype);
-        rectApply(rectSet,rectListSlots,[list,rects]);return list;
-    }
+    const {DOMRectReadOnly,DOMRect,rectInit:rectDictionary}=geometryBridge;
+    const rectApply=Reflect.apply,rectGet=WeakMap.prototype.get,rectSet=WeakMap.prototype.set,rectTypeError=TypeError,rectDefine=Object.defineProperty;
+    const clientRects=values=>geometryBridge.rectList(values);
     const rect=a=>new DOMRectReadOnly(...a);
     function readonly(object,values){for(const key of Object.keys(values))Object.defineProperty(object,key,{enumerable:true,value:values[key]});return object;}
     function slot(map,value){const s=map.get(value);if(!s)throw new TypeError('Illegal observer receiver');return s;}
@@ -203,12 +146,7 @@ const observerBridge=(()=>{
             },0);}
         }
     }
-    Object.assign(globalThis,{DOMRectReadOnly,DOMRect,SVGRect:DOMRect,ResizeObserver,ResizeObserverEntry,ResizeObserverSize,IntersectionObserver,IntersectionObserverEntry});
+    Object.assign(globalThis,{ResizeObserver,ResizeObserverEntry,ResizeObserverSize,IntersectionObserver,IntersectionObserverEntry});
     return {clientRects,clientBoundingRect(value){return new DOMRect(value.x,value.y,value.width,value.height);},createSVGRect(){return new DOMRect();},
-        createLiveSVGRect(read,write){
-            const rect=write?new DOMRect():new DOMRectReadOnly(),values=[0,0,0,0];
-            for(let i=0;i<4;i++)rectDefine(values,i,{get(){return read()[i];},
-                ...(write?{set(v){write(i,v);}}:{}),configurable:true});
-            rectApply(rectSet,rectSlots,[rect,values]);return rect;
-        },frame(){resizeFrame();intersectionFrame();}};
+        createLiveSVGRect:geometryBridge.liveRect,frame(){resizeFrame();intersectionFrame();}};
 })();

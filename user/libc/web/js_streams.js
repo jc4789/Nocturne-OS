@@ -29,7 +29,7 @@ const streamBridge=(()=>{
     const ta=Object.getPrototypeOf(U8.prototype),tag=getter(ta,Symbol.toStringTag);
     const length=getter(ta,'byteLength'),buffer=getter(ta,'buffer');
     const set=U8.prototype.set,locked=getter(ReadableStream.prototype,'locked');
-    const getReader=ReadableStream.prototype.getReader,tee=ReadableStream.prototype.tee;
+    const getReader=ReadableStream.prototype.getReader,tee=ReadableStream.prototype.tee,pipeThrough=ReadableStream.prototype.pipeThrough;
     const read=types.ReadableStreamDefaultReader.prototype.read;
     const release=types.ReadableStreamDefaultReader.prototype.releaseLock;
     const cancel=types.ReadableStreamDefaultReader.prototype.cancel;
@@ -64,6 +64,26 @@ const streamBridge=(()=>{
             error(reason){if(!ended){ended=true;apply(error,controller,[reason]);}}
         });
     }
+    /* A body read on demand (Cache Storage's stored bodies): next is asked for the next piece only
+       while a read waits for one, and answers an ArrayBuffer, or null at the end. */
+    function pulled(next,cancelSource){
+        return new ReadableStream({type:'bytes',async pull(c){
+            const bytes=await next();
+            if(bytes===null){apply(close,c,[]);return;}
+            apply(enqueue,c,[new U8(bytes)]);
+        },cancel(reason){return cancelSource(reason);}},{highWaterMark:0});
+    }
+    /* A body's pieces one at a time, copied, from a reader the stream stays locked to (Fetch's "read
+       all bytes" keeps its reader): next answers a Uint8Array, or null at the end. */
+    function chunks(stream){
+        const reader=apply(getReader,stream,[]);
+        return Object.freeze({async next(){
+            const item=await apply(read,reader,[]);
+            if(item.done)return null;
+            if(apply(tag,item.value,[])!=='Uint8Array')throw new TypeError('Body stream must contain Uint8Array chunks');
+            const n=apply(length,item.value,[]),copy=new U8(n);apply(set,copy,[item.value]);return copy;
+        }});
+    }
     async function collect(stream){
         const reader=apply(getReader,stream,[]),chunks=[];let total=0;
         try{for(;;){const item=await apply(read,reader,[]);if(item.done)break;
@@ -75,24 +95,147 @@ const streamBridge=(()=>{
         finally{apply(release,reader,[]);}
         const bytes=new U8(total);let at=0;for(const chunk of chunks){apply(set,bytes,[chunk,at]);at+=apply(length,chunk,[]);}return apply(buffer,bytes,[]);
     }
+    /* Streams' GenericTransformStream mixin for the interface Type: readable and
+       writable are attributes on its prototype that read the object's transform,
+       the TransformStream its constructor set up; the getters check that the
+       object is a Type. Returns how a constructor attaches its transform. */
+    const define=Object.defineProperty,wmGet=WeakMap.prototype.get,wmSet=WeakMap.prototype.set;
+    const transformReadable=getter(TransformStream.prototype,'readable'),transformWritable=getter(TransformStream.prototype,'writable');
+    function genericTransformStream(Type){
+        const transforms=new WeakMap();
+        for(const key of ['readable','writable']){
+            const get=Object.getOwnPropertyDescriptor({get [key](){
+                const transform=apply(wmGet,transforms,[this]);
+                if(!transform)throw new TypeError('Illegal invocation');
+                return transform[key];
+            }},key).get;
+            define(Type.prototype,key,{get,set:undefined,enumerable:true,configurable:true});
+        }
+        return (object,transform)=>apply(wmSet,transforms,[object,{__proto__:null,
+            readable:apply(transformReadable,transform,[]),writable:apply(transformWritable,transform,[])}]);
+    }
+    // TextEncoderCommon and TextDecoderCommon are prototype attributes over each
+    // stream's slot (its interface, and a TextDecoderStream's decoder).
+    const textStreams=new WeakMap();
+    const textStream=(value,Type)=>{const s=apply(wmGet,textStreams,[value]);if(!s||s.type!==Type)throw new TypeError('Illegal invocation');return s;};
+    const encodingOf=getter(decoder.prototype,'encoding'),fatalOf=getter(decoder.prototype,'fatal'),ignoreBOMOf=getter(decoder.prototype,'ignoreBOM');
+    const codeUnit=String.prototype.charCodeAt,sliceText=String.prototype.slice;
     class TextEncoderStream {
         constructor(){let pending='';const enc=new encoder();
+            // A leading surrogate at a chunk's end waits for the next chunk.
             const transform=new TransformStream({transform(chunk,c){
-                let text=pending+String(chunk);pending='';
-                if(text.length&&/[\uD800-\uDBFF]/.test(text[text.length-1])){pending=text[text.length-1];text=text.slice(0,-1);}
+                let text=pending+`${chunk}`;pending='';
+                const last=text.length?apply(codeUnit,text,[text.length-1]):0;
+                if(last>=0xd800&&last<=0xdbff){pending=apply(sliceText,text,[-1]);text=apply(sliceText,text,[0,-1]);}
                 if(text)c.enqueue(apply(encode,enc,[text]));
             },flush(c){if(pending)c.enqueue(apply(encode,enc,[pending]));}});
-            Object.defineProperties(this,{readable:{value:transform.readable,enumerable:true},writable:{value:transform.writable,enumerable:true}});
+            apply(wmSet,textStreams,[this,{__proto__:null,type:TextEncoderStream}]);
+            textEncoderTransform(this,transform);
         }
-        get encoding(){return 'utf-8';}
+        get encoding(){textStream(this,TextEncoderStream);return 'utf-8';}
     }
+    const textEncoderTransform=genericTransformStream(TextEncoderStream);
     class TextDecoderStream {
         constructor(label='utf-8',options={}){const dec=new decoder(label,options);
-            const transform=new TransformStream({transform(chunk,c){const text=apply(decode,dec,[chunk,{stream:true}]);if(text)c.enqueue(text);},flush(c){const text=apply(decode,dec,[]);if(text)c.enqueue(text);}});
-            for(const key of ['encoding','fatal','ignoreBOM'])Object.defineProperty(this,key,{value:dec[key],enumerable:true});
-            Object.defineProperties(this,{readable:{value:transform.readable,enumerable:true},writable:{value:transform.writable,enumerable:true}});
+            // A chunk is an AllowSharedBufferSource; undefined is not one.
+            const transform=new TransformStream({transform(chunk,c){if(chunk===undefined)throw new TypeError('Expected a BufferSource');const text=apply(decode,dec,[chunk,{stream:true}]);if(text)c.enqueue(text);},flush(c){const text=apply(decode,dec,[]);if(text)c.enqueue(text);}});
+            apply(wmSet,textStreams,[this,{__proto__:null,type:TextDecoderStream,decoder:dec}]);
+            textDecoderTransform(this,transform);
+        }
+        get encoding(){return apply(encodingOf,textStream(this,TextDecoderStream).decoder,[]);}
+        get fatal(){return apply(fatalOf,textStream(this,TextDecoderStream).decoder,[]);}
+        get ignoreBOM(){return apply(ignoreBOMOf,textStream(this,TextDecoderStream).decoder,[]);}
+    }
+    const textDecoderTransform=genericTransformStream(TextDecoderStream);
+    for(const Type of [TextEncoderStream,TextDecoderStream]){
+        define(Type.prototype,Symbol.toStringTag,{value:Type.name,configurable:true});
+        for(const key of ['encoding','fatal','ignoreBOM'])if(Object.getOwnPropertyDescriptor(Type.prototype,key))define(Type.prototype,key,{enumerable:true});
+    }
+    /* The Compression Standard's CompressionStream and DecompressionStream. The
+       compression context is native (js_compression.h); the transform is set up
+       as Streams' "set up" does it, with no transformer or strategy object a page
+       could reach through Object.prototype. */
+    const compressionNew=host.compressionNew,compressionFeed=host.compressionFeed,compressionEnd=host.compressionEnd;
+    const COMPRESSION_FORMATS=['brotli','deflate','deflate-raw','gzip'],indexOf=Array.prototype.indexOf;
+    const transformEnqueue=types.TransformStreamDefaultController.prototype.enqueue;
+    const isView=AB.isView,taOffset=getter(ta,'byteOffset');
+    const dvBuffer=getter(DataView.prototype,'buffer'),dvOffset=getter(DataView.prototype,'byteOffset'),dvLength=getter(DataView.prototype,'byteLength');
+    const abLength=getter(AB.prototype,'byteLength'),abResizable=Object.getOwnPropertyDescriptor(AB.prototype,'resizable');
+    // Web IDL's enumeration conversion: ToString (which may throw), then a value of the enum.
+    function compressionFormat(value){
+        const name=`${value}`,index=apply(indexOf,COMPRESSION_FORMATS,[name]);
+        if(index<0)throw new TypeError(`'${name}' is not a supported compression format`);
+        return index;
+    }
+    // Web IDL's BufferSource: an ArrayBuffer or a view, not shared and not resizable.
+    function bufferSource(value){
+        let source=value,offset=0,size,total;
+        if(isView(value)){
+            const typed=apply(tag,value,[])!==undefined;
+            source=apply(typed?buffer:dvBuffer,value,[]);
+            offset=apply(typed?taOffset:dvOffset,value,[]);
+            size=apply(typed?length:dvLength,value,[]);
+        }
+        try{total=apply(abLength,source,[]);}catch(_){throw new TypeError('The chunk is not an ArrayBuffer or an ArrayBuffer view');}
+        if(abResizable&&apply(abResizable.get,source,[]))throw new TypeError('The chunk is on a resizable ArrayBuffer');
+        return [source,offset,size===undefined?total:size];
+    }
+    function compressionTransform(object,format,decompress,attach){
+        const context=compressionNew(format,decompress);
+        /* Runs the context over buffer[offset, offset + length) in its bounded
+           steps, then enqueues the output. A fault throws before anything of the
+           chunk is enqueued; data after the end of the compressed data throws
+           after the output (the standard's "decompress and enqueue a chunk"). */
+        function run(controller,source,offset,length,finish){
+            const output=[];let pieces=0,status,trailing=false;
+            for(;;){
+                const result=compressionFeed(context,source,offset,length,finish);
+                status=result[0];
+                if(status<0)throw new TypeError(decompress?'The compressed data is not valid':'The data could not be compressed');
+                for(let i=2;i<result.length;i++)define(output,pieces++,{value:result[i],writable:true,enumerable:true,configurable:true});
+                if(status!==2){trailing=status===1&&result[1]<length;break;}
+                offset+=result[1];length-=result[1];
+            }
+            for(let i=0;i<pieces;i++)apply(transformEnqueue,controller,[new U8(output[i])]);
+            if(trailing)throw new TypeError('Data follows the end of the compressed data');
+            return status;
+        }
+        const transform=new TransformStream({__proto__:null,
+            transform(chunk,controller){
+                const bytes=bufferSource(chunk);
+                if(bytes[2])run(controller,bytes[0],bytes[1],bytes[2],false);
+            },
+            flush(controller){
+                if(run(controller,null,0,0,true)!==1)throw new TypeError('The compressed data ended early');
+            },
+            cancel(){compressionEnd(context);}
+        },{__proto__:null},{__proto__:null});
+        attach(object,transform);
+    }
+    class CompressionStream {
+        constructor(format){
+            if(!arguments.length)throw new TypeError('CompressionStream requires a format');
+            compressionTransform(this,compressionFormat(format),false,compressionStreamTransform);
         }
     }
+    const compressionStreamTransform=genericTransformStream(CompressionStream);
+    class DecompressionStream {
+        constructor(format){
+            if(!arguments.length)throw new TypeError('DecompressionStream requires a format');
+            compressionTransform(this,compressionFormat(format),true,decompressionStreamTransform);
+        }
+    }
+    const decompressionStreamTransform=genericTransformStream(DecompressionStream);
+    for(const Type of [CompressionStream,DecompressionStream]){
+        define(Type.prototype,Symbol.toStringTag,{value:Type.name,writable:false,enumerable:false,configurable:true});
+        define(globalThis,Type.name,{value:Type,writable:true,enumerable:false,configurable:true}); // [Exposed=*]
+    }
     Object.assign(globalThis,types,{TextEncoderStream,TextDecoderStream});
-    return Object.freeze({brand,disturbed,fromBytes,network,collect,locked:v=>apply(locked,v,[]),tee:v=>apply(tee,v,[])});
+    /* Streams "create a proxy": a new stream pulling from v, which becomes locked and disturbed at
+       once (v piped through an identity TransformStream, its pair read without the page's getters). */
+    function proxy(v){
+        const identity=new TransformStream();
+        return apply(pipeThrough,v,[{__proto__:null,readable:apply(transformReadable,identity,[]),writable:apply(transformWritable,identity,[])},{__proto__:null}]);
+    }
+    return Object.freeze({brand,disturbed,fromBytes,network,pulled,chunks,collect,proxy,locked:v=>apply(locked,v,[]),tee:v=>apply(tee,v,[])});
 })();

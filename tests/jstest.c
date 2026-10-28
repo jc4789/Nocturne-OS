@@ -398,7 +398,7 @@ static web_doc *open_case_url_budget(const char *html, bool expected_errors, con
     if(case_real_network)host.resume_request=resume_request;
     fixture.history_length = 1; fixture.history_serial = 1;
     fixture.history[0].url = strdup(url); fixture.history[0].entry = 1;
-    fixture.doc = web_live_response(html, strlen(html), url, "utf-8",case_response_headers,&host);
+    fixture.doc = web_live_response(html, strlen(html), url, "utf-8",case_response_headers,NULL,&host);
     test_check("web-live-allocation", fixture.doc != NULL);
     return fixture.doc;
 }
@@ -1248,6 +1248,49 @@ static void test_native_selection(void) {
     free(page);
 }
 
+/* The editing commands (js_editing_cases.js), then the user's keys in an
+   editing host through web_key: typing, Backspace, Left, Enter and Ctrl+Z go
+   through the editing layer's beforeinput, command and input. */
+static void test_editing(void) {
+    external_case("js_editing_cases.js", ";try{const n=runEditingCases();console.log('Editing checks '+n);check('editing-count',n>=60);}catch(e){console.log('FAIL editing '+e+' '+e.stack);}mark('api-done');", BASE);
+    const char *source =
+        "const editor=document.createElement('div');editor.contentEditable='true';editor.style.cssText='position:absolute;left:0;top:0;width:200px;height:30px';"
+        "editor.textContent='xy';document.body.appendChild(editor);let stage=0;const seen=[];"
+        "for(const type of ['beforeinput','input'])editor.addEventListener(type,e=>seen.push(e.type+':'+e.inputType+':'+e.data+(e.isTrusted?'':':untrusted')));"
+        "editor.focus();getSelection().collapse(editor.firstChild,1);"
+        "editor.addEventListener('editing-probe',()=>{"
+        "console.log('NATIVE-EDITING stage='+stage+' html='+JSON.stringify(editor.innerHTML)+' events='+seen.join(' '));"
+        "if(stage===0)check('native-editing-type',editor.innerHTML==='xay'&&seen.join(' ')==='beforeinput:insertText:a input:insertText:a');"
+        "if(stage===1)check('native-editing-type-again',editor.innerHTML==='xaby');"
+        "if(stage===2)check('native-editing-backspace',editor.innerHTML==='xay');"
+        "if(stage===3)check('native-editing-left',getSelection().focusOffset===1&&getSelection().isCollapsed);"
+        "if(stage===4)check('native-editing-enter',editor.innerHTML==='<div>x</div><div>ay</div>');"
+        "if(stage===5)check('native-editing-undo',editor.innerHTML==='xay');"
+        "seen.length=0;stage++;mark('native-editing-step-'+stage);});mark('native-editing-ready');";
+    char *page=script_page(source);
+    test_check("native-editing-page",page!=NULL);
+    if(page && open_case(page,false)) {
+        test_check("native-editing-ready",pump("native-editing-ready",5000));
+        test_check("native-editing-target",web_editing_target(fixture.doc));
+        web_node *editor=web_focused(fixture.doc);
+        test_check("native-editing-focus",editor!=NULL);
+        static const struct {uint32_t key,mods;} keys[]={{'a',0},{'b',0},{NKEY_BACKSPACE,0},{NKEY_LEFT,0},{NKEY_ENTER,0},{'z',NMOD_CTRL}};
+        for(unsigned i=0;editor && i<sizeof keys/sizeof *keys;i++) {
+            struct gui_event key={.key=keys[i].key,.mods=keys[i].mods};
+            test_check("native-editing-key-handled",web_key(fixture.doc,&key)==1);
+            struct web_event probe={.type="editing-probe"};web_dispatch(fixture.doc,editor,&probe);
+            char mark[48];snprintf(mark,sizeof mark,"native-editing-step-%u",i+1);
+            test_check("native-editing-step",has_mark(&fixture,mark));
+        }
+        static const char *const names[]={"native-editing-type","native-editing-type-again","native-editing-backspace",
+            "native-editing-left","native-editing-enter","native-editing-undo"};
+        require_marks(names,sizeof names/sizeof *names);
+        test_check("native-editing-no-errors",fixture.errors==0);
+        close_case();
+    }
+    free(page);
+}
+
 static void test_lifetime(void) {
     const char *oldsource =
         "globalThis.oldDocumentValue=42;const saved=document.createElement('span');saved.textContent='retained';document.body.appendChild(saved);saved.remove();"
@@ -1593,6 +1636,7 @@ int main(int argc, char **argv) {
     RUN("failed-module-graph", test_failed_module_graph);
     RUN("events", test_events_and_forms);
     RUN("selection-native", test_native_selection);
+    RUN("editing", test_editing);
     RUN("timers", test_timers_and_promises);
     RUN("microtasks", test_host_microtasks);
     RUN("fetch", test_fetch_and_cancel);

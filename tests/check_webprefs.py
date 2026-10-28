@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import subprocess
+import url_owner
 
 root = Path(__file__).resolve().parent.parent
 out = root / 'build/webprefs-host'
@@ -114,10 +115,13 @@ for tag in tags:
         problems.append(f'目録の {tag}：地域の subtag {region} が CLDR の地域名の表に無いか、別名')
     cldr_checked += 1
 
-cc = root / 'tools/msys64/ucrt64/bin/clang.exe'
+cc = url_owner.clang(root)
 env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get('PATH', ''))
 log = out / 'result.log'
 exe = out / 'webprefs_host.exe'
+# A URL's host comes from its record: the URL parser's own objects (tests/url_owner.py), one for
+# every process copy, as each program links its own.
+owner = url_owner.objects(root, cc)
 with log.open('w', encoding='utf-8') as stream:
     for name in ['user/libc/webprefs.c', 'user/include/webprefs.h', 'user/include/nocturne.h', 'common/abi.h',
                  'tests/webprefs_host_cases.c', 'tests/check_webprefs.py']:
@@ -128,7 +132,7 @@ with log.open('w', encoding='utf-8') as stream:
     stream.flush()
     built = subprocess.run([str(cc), '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-sign-compare',
                             '-I', str(stub), '-iquote', str(root), '-iquote', str(out), '-idirafter', 'user/include',
-                            '-idirafter', 'common', *map(str, sources), 'tests/webprefs_host_cases.c', '-o', str(exe)],
+                            '-idirafter', 'common', *map(str, sources), 'tests/webprefs_host_cases.c', *owner, '-o', str(exe)],
                            cwd=root, env=env, stdout=stream, stderr=subprocess.STDOUT)
     stream.flush()
     code = built.returncode

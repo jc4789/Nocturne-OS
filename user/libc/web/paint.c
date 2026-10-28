@@ -33,6 +33,11 @@ struct hit_primitive {
     box_t *box;
     const struct radius_cache *radius;
     float radius_x,radius_y;
+    /* A text run's primitive: the run (run_block's runs[run]) and its start's x, for the
+       text position under the point (caretPositionFromPoint). run_block NULL otherwise. */
+    const box_t *run_block;
+    int run;
+    float run_x;
 };
 struct hit_branch {
     float rect[4];
@@ -77,6 +82,15 @@ struct pctx {
     const struct gfx_mask_clip *viewport_mask;
     const box_t *untransformed; /* this box's own used transform is being applied by the caller */
     struct hit_stack *stack; /* doc_elements_at: every target the exact walk reaches, bottom first */
+    /* Paint Timing, of a paint walk: it drew something other than the default
+       background (first paint), and something contentful (first contentful
+       paint): text, an image, a canvas bitmap, a video frame, an input's value. */
+    bool painted, contentful;
+    /* The latest target's hit point in its own untransformed space and, for a text run, the
+       run and the point's advance from its start: the topmost hit's text position. */
+    float hit_local_x, hit_local_y, hit_run_dx;
+    const box_t *hit_run_block;
+    int hit_run;
 };
 struct hit_entry { node_t *node; uint8_t pseudo; };
 struct hit_stack { struct hit_entry *items; size_t count, capacity; bool failed; };
@@ -88,6 +102,18 @@ static struct { uint64_t paints, order_ms, frames_ms, walk_ms, probe_ms, total_m
 static struct { uint64_t commits, boxes, lost_layout, lost_unbounded, lost_room, lost_ink,
     taken_partial, taken_full, taken_none, taken_stale; } damage_profile;
 
+/* What a paint walk drew, for Paint Timing; only a real paint counts. */
+static void paint_drew(struct pctx *P, bool contentful) {
+    if (P->mode != M_PAINT) return;
+    P->painted = true;
+    if (contentful) P->contentful = true;
+}
+/* Paint Timing's non-empty text: a character that is not document white space. */
+static bool contentful_text(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\f' && s[i] != '\r') return true;
+    return false;
+}
 static bool positioned(const box_t *b) {
     if (!b->st || b->kind == B_INLINE || b->kind == B_TEXT) return false;
     if (b->st->position != POS_STATIC) return b->st->position != POS_STICKY;
@@ -361,29 +387,35 @@ static bool box_clips(const box_t *b) {
     return b->st->clip_path||(b->st->clip.rect&&(b->st->position==POS_ABSOLUTE||b->st->position==POS_FIXED));
 }
 static bool clips_above(const box_t *b){for(b=b->parent;b;b=b->parent)if(box_clips(b))return true;return false;}
-/* A CLIP_BOX_*'s rectangle (x y w h) and the radii its corners take from the border radii
-   (css-backgrounds-3 §5.3: inner boxes shrink them, the margin box grows curved ones). */
-static void clip_reference(const box_t *b,uint8_t which,float r[4],struct border_radii *radii) {
-    float x=box_visual_x(b),y=box_visual_y(b);
-    r[0]=x-b->p[3]-b->b[3];r[1]=y-b->p[0]-b->b[0];
+/* A CSS_BOX_*'s rectangle (x y w h, from b's border box's top left) and the radii its corners take
+   from the border radii (css-backgrounds-3 §5.3: inner boxes shrink them, the margin box grows
+   curved ones); clip-path, shape-outside and offset-path's reference boxes. */
+void box_reference_box(const box_t *b,uint8_t which,float r[4],float rx[4],float ry[4]) {
+    r[0]=r[1]=0;
     r[2]=b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3];r[3]=b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
-    struct border_radii outer=used_radii(b->st,r[2],r[3]);
+    struct border_radii outer=b->st?used_radii(b->st,r[2],r[3]):(struct border_radii){0},radii=outer;
     float edges[4];
     switch(which) {
-    case CLIP_BOX_PADDING: memcpy(edges,b->b,sizeof edges);break;
-    case CLIP_BOX_CONTENT: case CLIP_BOX_FILL: for(int i=0;i<4;i++)edges[i]=b->b[i]+b->p[i];break;
-    case CLIP_BOX_MARGIN: for(int i=0;i<4;i++)edges[i]=-b->m[i];break;
-    default: if(radii)*radii=outer;return; /* border-box; stroke-box and view-box are it for CSS boxes */
+    case CSS_BOX_PADDING: memcpy(edges,b->b,sizeof edges);break;
+    case CSS_BOX_CONTENT: case CSS_BOX_FILL: for(int i=0;i<4;i++)edges[i]=b->b[i]+b->p[i];break;
+    case CSS_BOX_MARGIN: for(int i=0;i<4;i++)edges[i]=-b->m[i];break;
+    default: memset(edges,0,sizeof edges);break; /* border-box; stroke-box and view-box are it for CSS boxes */
     }
     r[0]+=edges[3];r[1]+=edges[0];r[2]=fmaxf(0,r[2]-edges[1]-edges[3]);r[3]=fmaxf(0,r[3]-edges[0]-edges[2]);
-    if(!radii)return;
-    if(which!=CLIP_BOX_MARGIN){*radii=inset_radii(outer,edges,r[2],r[3]);return;}
-    static const int xs[4]={3,1,1,3},ys[4]={0,0,2,2};
-    *radii=outer;
-    for(int i=0;i<4;i++)if(outer.x[i]>0&&outer.y[i]>0){
-        radii->x[i]=fmaxf(0,outer.x[i]+b->m[xs[i]]);radii->y[i]=fmaxf(0,outer.y[i]+b->m[ys[i]]);
-    }
-    radii_normalize(radii,r[2],r[3]);
+    if(which==CSS_BOX_MARGIN) {
+        static const int xs[4]={3,1,1,3},ys[4]={0,0,2,2};
+        for(int i=0;i<4;i++)if(outer.x[i]>0&&outer.y[i]>0){
+            radii.x[i]=fmaxf(0,outer.x[i]+b->m[xs[i]]);radii.y[i]=fmaxf(0,outer.y[i]+b->m[ys[i]]);
+        }
+        radii_normalize(&radii,r[2],r[3]);
+    } else if(which==CSS_BOX_PADDING||which==CSS_BOX_CONTENT||which==CSS_BOX_FILL) radii=inset_radii(outer,edges,r[2],r[3]);
+    memcpy(rx,radii.x,sizeof radii.x);memcpy(ry,radii.y,sizeof radii.y);
+}
+static void clip_reference(const box_t *b,uint8_t which,float r[4],struct border_radii *radii) {
+    struct border_radii scratch;
+    if(!radii)radii=&scratch;
+    box_reference_box(b,which,r,radii->x,radii->y);
+    r[0]+=box_visual_x(b)-b->p[3]-b->b[3];r[1]+=box_visual_y(b)-b->p[0]-b->b[0];
 }
 static void clip_rect_set(struct clip_used *u,double x0,double y0,double x1,double y1) {
     u->rect[0]=(float)x0;u->rect[1]=(float)y0;u->rect[2]=(float)fmax(x0,x1);u->rect[3]=(float)fmax(y0,y1);
@@ -392,71 +424,53 @@ static void clip_rect_meet(struct clip_used *u,double x0,double y0,double x1,dou
     u->rect[0]=fmaxf(u->rect[0],(float)x0);u->rect[1]=fmaxf(u->rect[1],(float)y0);
     u->rect[2]=fmaxf(u->rect[0],fminf(u->rect[2],(float)x1));u->rect[3]=fmaxf(u->rect[1],fminf(u->rect[3],(float)y1));
 }
-static void clip_polygon_point(const struct css_clip_path *c,size_t i,const float r[4],double *x,double *y) {
-    *x=r[0]+(double)len_resolve(&c->point[i][0],r[2]);*y=r[1]+(double)len_resolve(&c->point[i][1],r[3]);
-}
-/* False when b has no clip. Before b's coverage is drawn, a path's or a <clipPath>'s bounds are
-   not known, and the rectangle does not limit it. */
+/* False when b has no clip. Before b's coverage is drawn, a <clipPath>'s bounds are not known,
+   and the rectangle does not limit it. The shape's geometry is shape.c's. */
 static bool clip_used(const box_t *b,struct clip_used *u) {
     if(!box_clips(b))return false;
-    const style_t *st=b->st;const struct css_clip_path *c=st->clip_path;
+    const style_t *st=b->st;const struct css_shape *c=st->clip_path;
     u->rect[0]=u->rect[1]=-INFINITY;u->rect[2]=u->rect[3]=INFINITY;u->cut=CLIP_CUT_NONE;
     if(c&&!(b->clip_cache&&b->clip_cache->none)) {
         float r[4];struct border_radii radii;clip_reference(b,c->box,r,&radii);
         double x=r[0],y=r[1],w=r[2],h=r[3];
-        switch(c->shape) {
-        case CLIP_SHAPE_BOX:
+        switch(c->kind) {
+        case CSS_SHAPE_BOX:
             clip_rect_set(u,x,y,x+w,y+h);
             if(radii_any(&radii)){u->cut=CLIP_CUT_ROUND;memcpy(u->shape,r,sizeof r);u->radii=radii;}
             break;
-        case CLIP_SHAPE_INSET: {
-            double top=len_resolve(&c->inset[0],r[3]),right=len_resolve(&c->inset[1],r[2]);
-            double bottom=len_resolve(&c->inset[2],r[3]),left=len_resolve(&c->inset[3],r[2]);
-            /* Opposing insets that pass each other shrink in proportion (css-shapes-1 §3.1). */
-            if(left+right>w&&left+right>0){double f=w/(left+right);left*=f;right*=f;}
-            if(top+bottom>h&&top+bottom>0){double f=h/(top+bottom);top*=f;bottom*=f;}
-            double iw=fmax(0,w-left-right),ih=fmax(0,h-top-bottom);
-            clip_rect_set(u,x+left,y+top,x+left+iw,y+top+ih);
-            struct border_radii round;
-            for(int i=0;i<4;i++){round.x[i]=fmaxf(0,len_resolve(&c->corner[i].axis[0],r[2]));round.y[i]=fmaxf(0,len_resolve(&c->corner[i].axis[1],r[3]));}
-            radii_normalize(&round,(float)iw,(float)ih);
-            if(radii_any(&round)&&iw>0&&ih>0){
-                u->cut=CLIP_CUT_ROUND;u->shape[0]=(float)(x+left);u->shape[1]=(float)(y+top);u->shape[2]=(float)iw;u->shape[3]=(float)ih;u->radii=round;
+        case CSS_SHAPE_INSET: {
+            double q[4];struct border_radii round;
+            css_shape_inset(c,r,q,round.x,round.y);
+            clip_rect_set(u,q[0],q[1],q[0]+q[2],q[1]+q[3]);
+            radii_normalize(&round,(float)q[2],(float)q[3]);
+            if(radii_any(&round)&&q[2]>0&&q[3]>0){
+                u->cut=CLIP_CUT_ROUND;for(int i=0;i<4;i++)u->shape[i]=(float)q[i];u->radii=round;
             }
             break;
         }
-        case CLIP_SHAPE_CIRCLE: case CLIP_SHAPE_ELLIPSE: {
-            double cx=x+len_resolve(&c->at[0],r[2]),cy=y+len_resolve(&c->at[1],r[3]);
-            double side[4]={fabs(cx-x),fabs(x+w-cx),fabs(cy-y),fabs(y+h-cy)},rx,ry;
-            if(c->shape==CLIP_SHAPE_CIRCLE) {
-                rx=c->extent[0]==CLIP_EXTENT_LENGTH?len_resolve(&c->radius[0],(float)(sqrt(w*w+h*h)/sqrt(2))):
-                   c->extent[0]==CLIP_EXTENT_CLOSEST?fmin(fmin(side[0],side[1]),fmin(side[2],side[3])):fmax(fmax(side[0],side[1]),fmax(side[2],side[3]));
-                ry=rx;
-            } else {
-                rx=c->extent[0]==CLIP_EXTENT_LENGTH?len_resolve(&c->radius[0],r[2]):c->extent[0]==CLIP_EXTENT_CLOSEST?fmin(side[0],side[1]):fmax(side[0],side[1]);
-                ry=c->extent[1]==CLIP_EXTENT_LENGTH?len_resolve(&c->radius[1],r[3]):c->extent[1]==CLIP_EXTENT_CLOSEST?fmin(side[2],side[3]):fmax(side[2],side[3]);
-            }
+        case CSS_SHAPE_CIRCLE: case CSS_SHAPE_ELLIPSE: {
+            double centre[2],rr[2];css_shape_ellipse(c,r,centre,rr);
+            double cx=centre[0],cy=centre[1],rx=rr[0],ry=rr[1];
             if(!(rx>0&&ry>0)){clip_rect_set(u,cx,cy,cx,cy);break;}
             clip_rect_set(u,cx-rx,cy-ry,cx+rx,cy+ry);
             u->cut=CLIP_CUT_ROUND;u->shape[0]=(float)(cx-rx);u->shape[1]=(float)(cy-ry);u->shape[2]=(float)(2*rx);u->shape[3]=(float)(2*ry);
             for(int i=0;i<4;i++){u->radii.x[i]=(float)rx;u->radii.y[i]=(float)ry;}
             break;
         }
-        default: {
+        default: { /* polygon(), path(), shape(), url(): coverage */
             const struct clip_cache *cache=b->clip_cache;
+            double q[4];
             u->cut=CLIP_CUT_COVERAGE;
             if(cache&&cache->markup)clip_rect_set(u,(double)cache->origin_x+cache->left,(double)cache->origin_y+cache->top,
                 (double)cache->origin_x+cache->left+cache->w,(double)cache->origin_y+cache->top+cache->h);
-            else if(c->shape==CLIP_SHAPE_POLYGON) {
-                double x0=INFINITY,y0=INFINITY,x1=-INFINITY,y1=-INFINITY;
-                for(size_t i=0;i<c->points;i++){double px,py;clip_polygon_point(c,i,r,&px,&py);x0=fmin(x0,px);y0=fmin(y0,py);x1=fmax(x1,px);y1=fmax(y1,py);}
-                if(c->points)clip_rect_set(u,x0,y0,x1,y1);else clip_rect_set(u,x,y,x,y);
+            else if(c->kind!=CSS_SHAPE_URL) {
+                if(css_shape_bounds(c,r,q))clip_rect_set(u,q[0],q[1],q[2],q[3]);else clip_rect_set(u,x,y,x,y);
             }
         }
         }
     }
     if(st->clip.rect&&(st->position==POS_ABSOLUTE||st->position==POS_FIXED)) {
-        float r[4];clip_reference(b,CLIP_BOX_BORDER,r,NULL);
+        float r[4];clip_reference(b,CSS_BOX_BORDER,r,NULL);
         const struct css_clip_rect *k=&st->clip;
         clip_rect_meet(u,r[0]+(k->auto_edges&8?0:k->edge[3]),r[1]+(k->auto_edges&1?0:k->edge[0]),
                          r[0]+(k->auto_edges&2?r[2]:k->edge[1]),r[1]+(k->auto_edges&4?r[3]:k->edge[2]));
@@ -507,47 +521,21 @@ static bool clip_push(struct pctx *P,const box_t *b,const struct clip_used *u,st
 static void clip_pop(canvas_t *c,const int saved[4],const struct gfx_mask_clip *prior) {
     c->cx0=saved[0];c->cy0=saved[1];c->cx1=saved[2];c->cy1=saved[3];c->mask_clip=prior;
 }
-/* A polygon whose corners are rounded by radius (css-shapes-2 §2.4.1) as path data: each corner an
-   arc tangent to both edges, its tangent points no farther from the corner than half of either. */
-static void clip_round_polygon(const struct css_clip_path *c,const float r[4],double ox,double oy,sbuf *m) {
-    char text[200];
-    for(size_t i=0;i<c->points;i++) {
-        double px,py,ax,ay,bx,by;
-        clip_polygon_point(c,i,r,&px,&py);clip_polygon_point(c,(i+c->points-1)%c->points,r,&ax,&ay);clip_polygon_point(c,(i+1)%c->points,r,&bx,&by);
-        double ux=ax-px,uy=ay-py,vx=bx-px,vy=by-py,lu=hypot(ux,uy),lv=hypot(vx,vy);
-        double angle=lu>0&&lv>0?acos(fmax(-1,fmin(1,(ux*vx+uy*vy)/(lu*lv)))):0,t=0,radius=0;
-        if(angle>1e-6&&angle<M_PI-1e-6){t=fmin(c->round/tan(angle/2),fmin(lu,lv)/2);radius=t*tan(angle/2);}
-        double x1=px-ox+(lu>0?ux/lu*t:0),y1=py-oy+(lu>0?uy/lu*t:0),x2=px-ox+(lv>0?vx/lv*t:0),y2=py-oy+(lv>0?vy/lv*t:0);
-        int n=radius>0?snprintf(text,sizeof text,"%s%.9g %.9g A%.9g %.9g 0 0 %d %.9g %.9g ",i?"L":"M",x1,y1,radius,radius,
-                                (-ux)*vy-(-uy)*vx>0,x2,y2):snprintf(text,sizeof text,"%s%.9g %.9g ",i?"L":"M",px-ox,py-oy);
-        if(n>0)sb_puts(m,text);
-    }
-    sb_puts(m,"Z");
-}
-/* nanosvg markup of b's polygon, path or <clipPath>, in document pixels from (ox, oy). False when a
-   url() names no <clipPath>. */
-static bool clip_markup(const box_t *b,const struct css_clip_path *c,const float r[4],double ox,double oy,sbuf *m) {
-    if(c->shape==CLIP_SHAPE_URL) {
+/* nanosvg markup of b's polygon(), path(), shape() or <clipPath>, in document pixels from (ox, oy).
+   False when a url() names no <clipPath>. */
+static bool clip_markup(const box_t *b,const struct css_shape *c,const float r[4],double ox,double oy,sbuf *m) {
+    if(c->kind==CSS_SHAPE_URL) {
         const float box[4]={(float)(r[0]-ox),(float)(r[1]-oy),r[2],r[3]};
-        return b->node&&doc_svg_clip_markup(b->node,c->text,box,m);
+        return b->node&&doc_svg_clip_markup(b->node,c->url,box,m);
     }
-    char text[200];
-    sb_puts(m,"<svg xmlns=\"http://www.w3.org/2000/svg\">");
-    if(c->shape==CLIP_SHAPE_PATH) {
-        snprintf(text,sizeof text,"<path transform=\"translate(%.9g %.9g)\" d=\"",r[0]-ox,r[1]-oy);sb_puts(m,text);
-        sb_puts(m,c->text); /* svg_path_data_valid() let only commands, numbers, spaces and commas through */
-    } else if(c->round>0) {
-        sb_puts(m,"<path d=\"");clip_round_polygon(c,r,ox,oy,m);
-    } else {
-        sb_puts(m,"<polygon points=\"");
-        for(size_t i=0;i<c->points;i++){double x,y;clip_polygon_point(c,i,r,&x,&y);snprintf(text,sizeof text,"%.9g,%.9g ",x-ox,y-oy);sb_puts(m,text);}
-    }
+    sb_puts(m,"<svg xmlns=\"http://www.w3.org/2000/svg\"><path d=\"");
+    css_shape_path_data(c,r,ox,oy,m); /* only commands and numbers */
     sb_puts(m,c->evenodd?"\" fill=\"#000\" fill-rule=\"evenodd\"/></svg>":"\" fill=\"#000\"/></svg>");
     return true;
 }
 static bool clip_cache_prepare(web_doc *d,box_t *b) {
     struct clip_used u;
-    const struct css_clip_path *c=box_clips(b)?b->st->clip_path:NULL;
+    const struct css_shape *c=box_clips(b)?b->st->clip_path:NULL;
     if(!c){web_clip_cache_free(&b->clip_cache);return true;}
     struct clip_cache *cache=b->clip_cache;
     if(!cache&&!(cache=b->clip_cache=calloc(1,sizeof *cache)))return false;
@@ -1063,6 +1051,7 @@ static void paint_layer(struct pctx *P, int img_idx, uint8_t size_kind, const le
     if (X0 >= c->cx1 || Y0 >= c->cy1 || X1 <= c->cx0 || Y1 <= c->cy0) return;
     image_t *img = scaled_image(im, TW, TH, c, X0, Y0, X1-X0, Y1-Y0);
     if (!img) return;
+    paint_drew(P, !col);
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     /* rounded edges, so a box at a fractional position shows no sliver of a neighbouring tile */
     gfx_clip(c, X0, Y0, (int)roundf(x + w) - X0, (int)roundf(y + h) - Y0);
@@ -1115,7 +1104,8 @@ static void resolve_stops(const struct gradient *g, uint32_t cur, float len, str
     o->n = g->n;
     o->rep = g->repeating;
     for (int i = 0; i < g->n; i++) {
-        o->col[i] = g->col[i] == COLOR_CURRENT ? cur : g->col[i];
+        /* a stop that names currentcolor, alone or in an expression (color.c) */
+        o->col[i] = g->col[i] != COLOR_CURRENT ? g->col[i] : g->col_value[i] ? css_color_value_argb(g->col_value[i], cur) : cur;
         o->pos[i] = g->pos[i].kind == LK_AUTO ? NOPOS : len > 0 ? len_resolve(&g->pos[i], len) / len : 0;
     }
     if (o->pos[0] == NOPOS) o->pos[0] = 0;
@@ -1295,6 +1285,7 @@ static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y,
         c->mask_clip=previous;return;
     }
     if (!skip_bg) {
+        if ((st->bg_color >> 24) || (st->has_grad && st->gradient)) paint_drew(P, false);
         if (st->bg_color >> 24) {
             if(rounded&&rounded[0])gfx_fill_blend(c,(int)floorf(x),(int)floorf(y),(int)ceilf(x+w)-(int)floorf(x),(int)ceilf(y+h)-(int)floorf(y),st->bg_color);
             else fill_rrect(c, x, y, w, h, r, st->bg_color, st->bg_color);
@@ -1311,6 +1302,7 @@ static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y,
     for (int i = 0; i < 4; i++)
         if (bw[i] > 0 && (bc[i] >> 24) && st->border_style[i] > BS_HIDDEN) any = true;
     if (!any) return;
+    paint_drew(P, false);
     if(rounded&&rounded[0]) {
         float widths[4];uint32_t colors[4];for(int i=0;i<4;i++){widths[i]=bw[i];colors[i]=st->border_style[i]>BS_HIDDEN?bc[i]:0;}
         paint_corner_border(P,x,y,w,h,widths,colors,rounded[0],rounded[1]);return;
@@ -1363,7 +1355,13 @@ static void paint_run_text(struct pctx *P, const struct run *r, float bx, float 
     float asc, desc;
     wf_metrics(&f, &asc, &desc);
     if (base - asc > P->c->cy1 || base + desc < P->c->cy0) return;
-    if (r->highlight) gfx_fill_blend(P->c, (int)x, (int)(base - asc), (int)ceilf(r->w), (int)ceilf(asc + desc), RGB(255, 213, 0));
+    if (r->highlight && r->highlight_first < r->highlight_end) {
+        /* Only the matched bytes of the run, measured as the line placed them. */
+        float x0 = layout_run_x(r, (size_t)r->highlight_first), x1 = layout_run_x(r, (size_t)r->highlight_end);
+        gfx_fill_blend(P->c, (int)(x + x0), (int)(base - asc), (int)ceilf(x1 - x0), (int)ceilf(asc + desc), RGB(255, 213, 0));
+    }
+    /* Text is contentful even in a transparent colour (Paint Timing). */
+    if (r->n > 0) paint_drew(P, contentful_text(r->s, (size_t)r->n));
     uint32_t col = st->color;
     draw_text(P, st, x, base, r->s, r->n, col);
     if (st->text_decoration) {
@@ -1418,6 +1416,116 @@ static size_t password_offset(const char *text, size_t byte) {
     size_t bullets = 0;
     for (size_t i = 0; i < byte && text[i]; i++) if (((unsigned char)text[i] & 0xc0) != 0x80) bullets++;
     return bullets * 3;
+}
+/* ---- where a text control shows its value. paint_control draws from these; the caret
+   positions and caret rects of caretPositionFromPoint read them, so both agree. */
+/* An <input>'s one line: the text it draws for text (a bullet for each character of a
+   password) and the scroll that keeps the caret at byte caret (or none, -1) in view. */
+struct input_line { sbuf shown; const char *text, *drawn; bool password; float scroll; };
+static float input_line_x(const struct input_line *L, const style_t *st, size_t byte) {
+    wfont f = style_font(st);
+    size_t at = L->password ? password_offset(L->text, byte) : byte, n = strlen(L->drawn);
+    return wf_width(&f, L->drawn, at < n ? at : n);
+}
+static void input_line_begin(struct input_line *L, const style_t *st, const char *text, bool password,
+                             float width, int caret) {
+    *L = (struct input_line){.text = text, .password = password};
+    if (password) for (const char *p = text; *p; p++) if (((unsigned char)*p & 0xC0) != 0x80) sb_puts(&L->shown, "\xe2\x80\xa2");
+    L->drawn = !password ? text : L->shown.p ? sb_cstr(&L->shown) : "";
+    if (caret >= 0) {
+        float caret_w = input_line_x(L, st, (size_t)caret);
+        L->scroll = caret_w > width - 2 ? caret_w - width + 2 : 0;
+    }
+}
+static void input_line_end(struct input_line *L) { sb_free(&L->shown); }
+static float input_measure(const void *opaque, const char *s, size_t at, size_t next, float x) {
+    (void)x;
+    return wf_width(opaque, s + at, next - at);
+}
+/* The byte of the input's text nearest dx from the start of its drawn text. */
+static size_t input_line_byte(const struct input_line *L, const style_t *st, float dx) {
+    wfont f = style_font(st);
+    size_t at = layout_text_boundary(L->drawn, strlen(L->drawn), -1, dx, input_measure, &f);
+    if (!L->password) return at;
+    /* Each character of the value drew one 3-byte bullet. */
+    size_t bullets = at / 3, byte = 0;
+    while (L->text[byte] && bullets) {
+        byte++;
+        while (((unsigned char)L->text[byte] & 0xC0) == 0x80) byte++;
+        bullets--;
+    }
+    return byte;
+}
+static bool input_password(node_t *n) {
+    const char *type = node_attr(n, "type");
+    return type && str_ieq(type, "password");
+}
+/* A <textarea>'s line holding a point (the first line whose bottom is below it, else the
+   last) or a caret (the line paint_control draws it on). */
+struct textarea_find { size_t byte, length, first, line_length; float y, top, height; bool point, found; };
+static void textarea_find_line(const struct control_text_line *line, void *opaque) {
+    struct textarea_find *f = opaque;
+    if (f->found) return;
+    bool take;
+    if (f->point) { take = true; f->found = f->y < line->top + line->height; }
+    else take = f->found = f->byte >= line->first && f->byte <= line->first + line->length &&
+        (f->byte < line->first + line->length || line->hard_break || line->next == f->length);
+    if (take) { f->first = line->first; f->line_length = line->length; f->top = line->top; f->height = line->height; }
+}
+static bool text_control_box(const box_t *b) {
+    return b && b->kind == B_ATOMIC && b->node &&
+        (b->atomic == AT_TEXTAREA || (b->atomic == AT_INPUT && web_input_type(b->node) != WEB_INPUT_FILE));
+}
+/* The UTF-16 offset in control b's value nearest point (x, y) of b's own space. */
+static bool control_offset_at(web_doc *d, const box_t *b, float x, float y, uint32_t *offset) {
+    node_t *n = b->node;
+    const char *v = web_input_edit_text(n);
+    *offset = 0;
+    if (!v || !*v) return true;
+    float left = box_visual_x(b), top = cy(b);
+    size_t byte;
+    if (b->atomic == AT_INPUT) {
+        struct input_line L;
+        input_line_begin(&L, b->st, v, input_password(n), b->w, d->focus == n ? d->caret : -1);
+        byte = input_line_byte(&L, b->st, x - (left - L.scroll));
+        input_line_end(&L);
+    } else {
+        if (box_element_scrollable(b)) { left -= (float)n->scroll_x; top -= (float)n->scroll_y; }
+        struct textarea_find f = {.length = strlen(v), .y = y - top, .point = true};
+        float width, height;
+        if (!control_text_lines(b, b->st, v, textarea_find_line, &f, &width, &height)) return false;
+        byte = f.first + control_text_boundary(b->st, v + f.first, f.line_length, x - left);
+    }
+    *offset = doc_text_utf16(v, strlen(v), byte);
+    return true;
+}
+bool doc_control_caret_rect(node_t *control, uint32_t offset, double rect[4]) {
+    box_t *b = control ? control->box : NULL;
+    if (!text_control_box(b) || b->node != control || !control->owner) return false;
+    const char *v = web_input_edit_text(control);
+    if (!v) v = "";
+    size_t length = strlen(v), byte = doc_text_byte(v, length, offset, false);
+    double left = box_visual_x(b), top = cy(b), height = b->h;
+    if (b->atomic == AT_INPUT) {
+        web_doc *d = control->owner;
+        struct input_line L;
+        input_line_begin(&L, b->st, v, input_password(control), b->w, d->focus == control && *v ? d->caret : -1);
+        left += input_line_x(&L, b->st, byte) - L.scroll;
+        input_line_end(&L);
+    } else {
+        if (box_element_scrollable(b)) { left -= control->scroll_x; top -= control->scroll_y; }
+        struct textarea_find f = {.byte = byte, .length = length, .height = style_line_height(b->st)};
+        float width, lines_height;
+        if (!control_text_lines(b, b->st, v, textarea_find_line, &f, &width, &lines_height)) return false;
+        if (f.found) {
+            left += control_text_width(b->st, v + f.first, byte - f.first);
+            top += f.top;
+        }
+        height = f.height;
+    }
+    rect[0] = left; rect[1] = top; rect[2] = 0; rect[3] = height;
+    box_transform_rect(b, rect);
+    return isfinite(rect[0]) && isfinite(rect[1]) && isfinite(rect[2]) && isfinite(rect[3]);
 }
 static uint32_t control_text_color(const style_t *style, bool placeholder) {
     if (!placeholder) return style->color;
@@ -1496,36 +1604,25 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
         /* like browsers, clip to the padding box: descenders may hang below a short content box */
         gfx_clip(c, (int)(x - b->p[3]), (int)(y - b->p[0]), (int)ceilf(w + b->p[1] + b->p[3]) + 1, (int)ceilf(h + b->p[0] + b->p[2]) + 1);
-        const char *t = node_attr(n, "type");
-        bool pw = t && str_ieq(t, "password") && !placeholder;
+        bool pw = input_password(n) && !placeholder;
         uint32_t col = control_text_color(st, placeholder);
         if (placeholder && !(col >> 24) && b->atomic == AT_INPUT) v = "";
+        if (!placeholder) paint_drew(P, contentful_text(v, strlen(v))); /* an input's value */
         size_t selection_start = !placeholder ? doc_utf16_to_byte(v, n->selection_start, false) : 0;
         size_t selection_end = !placeholder ? doc_utf16_to_byte(v, n->selection_end, true) : 0;
         bool selected = focused && !placeholder && n->selection_start != n->selection_end;
         float caret_x = x;
         if (b->atomic == AT_INPUT) {
-            sbuf s = {0};
-            if (pw)
-                for (const char *p = v; *p; p++) {
-                    if (((unsigned char)*p & 0xC0) != 0x80) sb_puts(&s, "\xe2\x80\xa2");
-                }
-            else sb_puts(&s, v);
-            const char *txt = s.p ? sb_cstr(&s) : "";
-            /* keep the caret in view */
-            float caret_w = 0;
-            if (focused && !placeholder) {
-                int cb = P->d->caret;
-                if (pw) cb = (int)password_offset(v, (size_t)cb);
-                caret_w = wf_width(&f, txt, (size_t)cb);
-            }
-            float scroll = caret_w > w - 2 ? caret_w - w + 2 : 0;
+            /* The caret stays in view; caret positions and rects scroll the same way. */
+            struct input_line L;
+            int caret = focused && !placeholder ? P->d->caret : -1;
+            input_line_begin(&L, st, v, pw, w, caret);
+            const char *txt = L.drawn;
+            float scroll = L.scroll;
             float left = 0, right = 0;
             if (selected) {
-                size_t start = pw ? password_offset(v, selection_start) : selection_start;
-                size_t end = pw ? password_offset(v, selection_end) : selection_end;
-                left = x - scroll + wf_width(&f, txt, start);
-                right = x - scroll + wf_width(&f, txt, end);
+                left = x - scroll + input_line_x(&L, st, selection_start);
+                right = x - scroll + input_line_x(&L, st, selection_end);
                 gfx_fill(c, (int)floorf(left), (int)y, (int)ceilf(right - left), (int)ceilf(h), RGB(0, 117, 255));
             }
             text_in(P, text_style, x - scroll, y, h, txt, col);
@@ -1535,8 +1632,8 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
                 text_in(P, st, x - scroll, y, h, txt, RGB(255, 255, 255));
                 c->cx0 = cx0; c->cy0 = cy0; c->cx1 = cx1; c->cy1 = cy1;
             }
-            caret_x = x - scroll + caret_w;
-            sb_free(&s);
+            if (caret >= 0) caret_x = x - scroll + input_line_x(&L, st, (size_t)caret);
+            input_line_end(&L);
         } else {
             struct control_line_paint lines = {.P=P,.style=text_style,.base=st,.text=v,.length=strlen(v),
                 .selection_start=selection_start,.selection_end=selection_end,.x=x,.y=y,
@@ -1552,6 +1649,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_BUTTON_INPUT: {
         const char *l = web_button_label(n);
+        paint_drew(P, contentful_text(l, strlen(l)));
         float tw = wf_width(&f, l, strlen(l));
         text_in(P, st, x + (w - tw) / 2, y, h, l, st->color);
         break;
@@ -1613,6 +1711,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         (void)sel;
         const char *txt = s.p ? sb_cstr(&s) : "";
         while (*txt == ' ' || *txt == '\n') txt++;
+        paint_drew(P, contentful_text(txt, strlen(txt)));
         int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
         gfx_clip(c, (int)x, (int)y, (int)w - 12, (int)ceilf(h) + 1);
         text_in(P, st, x, y, h, txt, st->color);
@@ -1628,12 +1727,13 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         if(web_frame_element(n)&&web_avmedia_snapshot_is_probe())break;
         if(web_frame_paint(n,c,X,Y,W,H))break;
         if (n->tag == T_canvas) {
-            web_canvas_paint(n,st,c,X,Y,W,H);
+            /* A canvas with a context is contentful (Paint Timing). */
+            if (web_canvas_paint(n,st,c,X,Y,W,H)) paint_drew(P, true);
             break;
         }
         if (n->tag == T_audio || n->tag == T_video) {
             paint_debug_reached(n,c,X,Y,W,H);
-            if(web_avmedia_paint(P->d,n,c,X,Y,W,H))break;
+            if(web_avmedia_paint(P->d,n,c,X,Y,W,H)){paint_drew(P,web_avmedia_shows_frame(P->d,n));break;}
         }
         if (n->tag == T_meter || n->tag == T_progress) {
             double value = web_gauge_value(n, "value"), max = web_gauge_value(n, "max"), min = web_gauge_value(n, "min");
@@ -1694,6 +1794,7 @@ static void paint_replaced(struct pctx *P, box_t *b) {
             fitted_w=(int)roundf(fw);fitted_h=(int)roundf(fh);
         }
         image_t *s = im ? scaled_image(im, fitted_w, fitted_h, c, X, Y, W, H) : NULL;
+        paint_drew(P, s != NULL);
         if (s) {
             float dx=len_resolve(&b->st->object_pos[0],(float)(W-fitted_w));
             float dy=len_resolve(&b->st->object_pos[1],(float)(H-fitted_h));
@@ -1727,9 +1828,10 @@ static void paint_replaced(struct pctx *P, box_t *b) {
             sc->w = W;
             sc->h = H;
         }
-        if (sc->img) image_draw(c, sc->img, X, Y);
+        if (sc->img) { paint_drew(P, true); image_draw(c, sc->img, X, Y); }
         return;
     }
+    paint_drew(P, false);
     paint_control(P, b, x, y);
 }
 
@@ -1745,6 +1847,7 @@ static void paint_marker(struct pctx *P, box_t *b) {
     float base = y + bl;
     float fs = st->font_size;
     if (b->marker_shape) {
+        paint_drew(P, false);
         float r = fs * 0.18f;
         if (r < 2) r = 2;
         float mx = x - fs * 0.85f, my = base - fs * 0.32f;
@@ -1758,6 +1861,7 @@ static void paint_marker(struct pctx *P, box_t *b) {
         return;
     }
     const char *m = b->marker;
+    paint_drew(P, contentful_text(m, strlen(m))); /* a ::marker's text */
     float w = wf_width(&f, m, strlen(m));
     draw_text(P, st, x - w, base, m, (int)strlen(m), st->color);
 }
@@ -1831,6 +1935,7 @@ static bool hit_target(struct pctx *P,node_t *target,uint8_t pseudo) {
     const struct radius_cache *radius=P->hit_radius?P->hit_radius:box?box->radius_clip[0]:NULL;
     if(!P->index_build&&radius&&corners_coverage(P->hx,P->hy,P->hit_shape_x,P->hit_shape_y,radius->w,radius->h,&radius->radii)<.5f)return false;
     P->target=target;P->target_pseudo=pseudo;
+    P->hit_local_x=P->hx;P->hit_local_y=P->hy;P->hit_run_block=NULL;
     if(P->stack&&!hit_stack_push(P->stack,target,pseudo)){P->failed=true;return false;}
     P->hit_any=false;
     memset(P->hit,0,sizeof *P->hit);
@@ -2229,6 +2334,61 @@ static void flow_ink_inline(struct ink_walk *W,box_t *b,float r[4],bool *layers)
         else flow_ink_child(W,c,r,layers);
     }
 }
+/* ---------------------------------------------------------------- gap decorations (css-gaps-1) */
+/* Segment s of b's gap decorations (layout.c) as the rectangle it paints, relative to b's content
+   box before scrolling, with the style and width §4.6 gives its gap; false when it paints nothing. */
+static bool gap_segment_rect(const box_t *b, const struct gap_segment *s, float r[4], uint8_t *style) {
+    const struct css_gap_axis *a = &css_style_gap_rules(b->st)->axis[s->axis];
+    uint32_t count = b->gap_decorations->gaps[s->axis];
+    *style = css_rule_value_at(&a->list[CSS_GAP_STYLE], s->gap, count).style;
+    float w = css_rule_value_at(&a->list[CSS_GAP_WIDTH], s->gap, count).width;
+    if (*style == BS_NONE || *style == BS_HIDDEN || !(w > 0) || !(s->e > s->s)) return false;
+    /* a column gap's line runs down its centre, a row gap's across */
+    if (s->axis == 0) { r[0] = s->centre - w / 2; r[1] = s->s; r[2] = s->centre + w / 2; r[3] = s->e; }
+    else { r[0] = s->s; r[1] = s->centre - w / 2; r[2] = s->e; r[3] = s->centre + w / 2; }
+    return true;
+}
+/* where b's content scrolls to: its decorations scroll with its items (§3) */
+static void gap_scroll(const box_t *b, float *x, float *y) {
+    if (b->node && box_element_scrollable(b)) { *x -= (float)b->node->scroll_x; *y -= (float)b->node->scroll_y; }
+}
+/* §3: painted just above the container's border, each gap's line in its gap's colour and style as
+   a border's side; rule-overlap (§3.5) puts one axis' lines over the other's */
+static void paint_gap_decorations(struct pctx *P, const box_t *b, float x, float y) {
+    const struct gap_decorations *g = b->gap_decorations;
+    if (!g || !g->n) return;
+    const style_t *st = b->st;
+    const struct css_gap_rules *rules = css_style_gap_rules(st);
+    gap_scroll(b, &x, &y);
+    int under = rules->overlap == CSS_RULE_ROW_OVER_COLUMN ? 0 : 1;
+    for (int pass = 0; pass < 2; pass++) {
+        int axis = pass ? !under : under;
+        const struct css_rule_list *colors = &rules->axis[axis].list[CSS_GAP_COLOR];
+        for (uint32_t i = 0; i < g->n; i++) {
+            const struct gap_segment *s = &g->seg[i];
+            float r[4];
+            uint8_t style;
+            if (s->axis != axis || !gap_segment_rect(b, s, r, &style)) continue;
+            union css_rule_value c = css_rule_value_at(colors, s->gap, g->gaps[axis]);
+            uint32_t col = c.color.exact ? css_color_value_argb(c.color.exact, st->color) :
+                           c.color.argb == COLOR_CURRENT ? st->color : c.color.argb;
+            if (!(col >> 24)) continue;
+            edge(P->c, style, axis ? 0 : 3, x + r[0], y + r[1], r[2] - r[0], r[3] - r[1], col);
+        }
+    }
+}
+/* the rectangles they paint, relative to (x, y), b's content box */
+static void gap_decorations_ink(const box_t *b, float x, float y, float rect[4]) {
+    const struct gap_decorations *g = b->gap_decorations;
+    if (!g) return;
+    for (uint32_t i = 0; i < g->n; i++) {
+        float r[4];
+        uint8_t style;
+        if (!gap_segment_rect(b, &g->seg[i], r, &style)) continue;
+        float a[4] = {x + r[0], y + r[1], x + r[2], y + r[3]};
+        ink_union(rect, a);
+    }
+}
 static const float *flow_ink(struct ink_walk *W,box_t *b) {
     web_doc *d=W->d;
     if(b->flow_ink_valid&&b->flow_ink_layout==d->layout_revision)return b->flow_ink;
@@ -2260,6 +2420,7 @@ static const float *flow_ink(struct ink_walk *W,box_t *b) {
                     if(!b->runs[i].atomic){run_ink(&b->runs[i],rx,ry,&W->metrics,true,a);ink_union(r,a);}
                 flow_ink_inline(W,b,r,&layers);
             } else for(box_t *c=b->first;c&&!W->failed;c=c->next)flow_ink_child(W,c,r,&layers);
+            gap_decorations_ink(b,x,y,r);
         }
     }
     if(W->failed)return NULL;
@@ -2328,13 +2489,9 @@ static struct line_fragment *overflow_line(box_t *b,int run) {
     return low<b->nlines && b->lines[low].first_run<=run && b->lines[low].ellipsis_active?&b->lines[low]:NULL;
 }
 static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
-    float bx = box_visual_x(b), by = cy(b);
+    float bx, by;
+    layout_runs_origin(b, true, &bx, &by); /* the origin every text geometry reader uses */
     struct run_metrics metrics = {0};
-    if(web_marquee_box(b)){bx+=b->node->marquee_x;by+=b->node->marquee_y;}
-    if (box_element_scrollable(b)) {
-        bx -= (float)b->node->scroll_x;
-        by -= (float)b->node->scroll_y;
-    }
     /* inline box backgrounds */
     for (int i = scope ? scope->inline_deco_first : 0; i >= 0 && i < b->ndecos;
          i = scope ? b->decos[i].paint_next : i + 1) {
@@ -2375,15 +2532,23 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
         }
         if (P->mode == M_HIT) {
             if (!hit_style(r->st)) continue;
-            wfont f = style_font(r->st);
-            float asc, desc;
-            wf_metrics(&f, &asc, &desc);
-            if (inside(P, bx + r->x, by + r->y - asc, r->w, asc + desc)) {
+            float top, bottom;
+            layout_run_extent(r, &top, &bottom);
+            if (inside(P, bx + r->x, by + top, r->w, bottom - top)) {
+                bool targeted = false;
                 if (r->node) {
-                    if (r->node->type == N_ELEM) hit_target(P,r->node,hit_pseudo(r->node,r->st));
-                    else hit_target(P,doc_flat_parent(r->node),PE_NONE);
+                    if (r->node->type == N_ELEM) targeted = hit_target(P,r->node,hit_pseudo(r->node,r->st));
+                    else targeted = hit_target(P,doc_flat_parent(r->node),PE_NONE);
                 }
                 if (r->link) set_hit(P, WEB_HIT_NONE, NULL, NULL, r->link);
+                if (targeted && !P->failed) {
+                    /* The element is the target; the run keeps the text position under it. */
+                    P->hit_run_block = b; P->hit_run = i; P->hit_run_dx = P->hx - (bx + r->x);
+                    if (P->index_build && P->index_build->count) {
+                        struct hit_primitive *item = &P->index_build->items[P->index_build->count-1];
+                        item->run_block = b; item->run = i; item->run_x = bx + r->x;
+                    }
+                }
             }
             continue;
         }
@@ -2708,6 +2873,12 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         bounds_rect(P, P->vx0 - P->ox, P->vy0 - P->oy, P->vx1 - P->vx0, P->vy1 - P->vy0);
     if (P->mode == M_BOUNDS && !st->visibility && b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR) {
         bounds_decoration(P,st,bx,by,bw,bh);
+        if (b->gap_decorations) {
+            float gx = x, gy = y, ink[4] = {INFINITY, INFINITY, -INFINITY, -INFINITY};
+            gap_scroll(b, &gx, &gy);
+            gap_decorations_ink(b, gx, gy, ink);
+            bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]);
+        }
         if (b->marker || b->marker_shape) { float ink[4]; marker_ink(b, ink); bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]); }
     }
     /* A table row or row group is painted in its cells (CSS 2.1 17.5.1) and is not a
@@ -2812,6 +2983,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             if(corners_coverage(P->hx,P->hy,bx+b->b[3],by+b->b[0],bw-b->b[1]-b->b[3],bh-b->b[0]-b->b[2],&radii)<.5f)contents=false;
         }
     }
+    if (P->mode == M_PAINT && visible && b->gap_decorations) paint_gap_decorations(P, b, P->ox + x, P->oy + y);
     int layer = 0;
     for (; layer < layers.n && layer_z(layers.v[layer]) < 0; layer++)
         paint_stacked_layer(P, layers.v[layer]);
@@ -3048,7 +3220,14 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
         if (!P.canvas_group) gfx_fill_blend(c, x, y, w, h, bg);
     }
     P.canvas_bg_from = (uint32_t)from;
+    if (from) paint_drew(&P, false); /* a non-default canvas background */
     walk(&P);
+    /* Paint Timing "mark paint timing": this rendering update's end, once each. */
+    if (!P.failed && (P.painted || P.contentful)) {
+        uint64_t painted_at = uptime_ms();
+        if (!d->first_paint_ms) d->first_paint_ms = painted_at;
+        if (P.contentful && !d->first_contentful_paint_ms) d->first_contentful_paint_ms = painted_at;
+    }
     if (P.failed && frame_saved)
         for (int row = 0; row < fh; row++) memcpy(c->px + (size_t)(fy + row) * c->pitch + fx,
             frame_saved + (size_t)row * fw, sizeof *frame_saved * (size_t)fw);
@@ -3341,7 +3520,12 @@ static bool hit_index_lookup(struct pctx *P){
     }
     for(size_t i=0;i<index->region_count;i++)if(hit_rect_contains(index->regions[i],P->hx,P->hy))return false;
     const struct hit_primitive *item=index->count?hit_query(index,0,P->hx,P->hy,NULL):NULL;
-    if(item){P->target=item->target;P->hit->kind=item->kind;P->hit->node=item->node;}
+    if(item){
+        P->target=item->target;P->hit->kind=item->kind;P->hit->node=item->node;
+        /* Indexed primitives are untransformed: the point is already in their space. */
+        P->hit_local_x=P->hx;P->hit_local_y=P->hy;
+        P->hit_run_block=item->run_block;P->hit_run=item->run;P->hit_run_dx=P->hx-item->run_x;
+    }
     return true;
 }
 
@@ -3418,6 +3602,35 @@ node_t *doc_element_at(web_doc *d,int x,int y) {
     }
     if(hit && hit->type!=N_ELEM)hit=doc_flat_parent(hit);
     return hit;
+}
+
+bool doc_caret_at(web_doc *d, double x, double y, node_t **node, uint32_t *offset) {
+    *node = NULL; *offset = 0;
+    if (!d || d->native_cancelled || d->native_recovery_pending || d->native_recovery_active || !d->root_box ||
+        !isfinite(x) || !isfinite(y)) return false;
+    /* The same hit test as elementFromPoint: the topmost target, and the run under the point
+       when it is text. Children of other documents' viewports stay their frame element's. */
+    struct pctx P = {0};
+    struct web_hit hit = {0};
+    canvas_t dummy = {0};
+    dummy.cx0 = dummy.cy0 = -1000000000;
+    dummy.cx1 = dummy.cy1 = 1000000000;
+    P.d = d; P.c = &dummy; P.mode = M_HIT; P.hx = (float)x; P.hy = (float)y; P.hit = &hit;
+    if (!hit_index_lookup(&P)) walk(&P);
+    if (P.failed) return false;
+    node_t *target = P.target && P.target->owner == d && !web_dialog_inert(d, P.target) ? P.target : NULL;
+    float local_x = target ? P.hit_local_x : (float)x, local_y = target ? P.hit_local_y : (float)y;
+    if (target && P.hit_run_block && layout_run_position(P.hit_run_block, P.hit_run, P.hit_run_dx, node, offset))
+        return true;
+    box_t *box = target ? target->box : NULL;
+    /* A target painted inside its ancestor's box (an SVG shape) has no box of its own. */
+    if (target && !box) { *node = target; return true; }
+    if (text_control_box(box) && box->node == target) {
+        if (!control_offset_at(d, box, local_x, local_y, offset)) return false;
+        *node = target;
+        return true;
+    }
+    return layout_position_at(box ? box : d->root_box, local_x, local_y, node, offset);
 }
 
 struct hit_found { const struct hit_primitive **items; size_t count, capacity; bool failed; };
@@ -3703,32 +3916,42 @@ static bool find_hidden(struct hidden_match *H) {
     return true;
 }
 
+/* The searchable text of inline formatting root b: its rendered runs' bytes in line order,
+   with a space between lines that do not already end in one; owner[k] is the run byte k came
+   from, -1 for a joining space. Matching and highlighting both read this one text. */
+static bool find_block_text(const box_t *b, sbuf *t, int **owner_out) {
+    int *owner = NULL;
+    size_t cap = 0;
+    float prev_y = -1e30f;
+    *t = (sbuf){0}; *owner_out = NULL;
+    for (int i = 0; i < b->nruns; i++) {
+        const struct run *r = &b->runs[i];
+        if (r->atomic || !r->n || r->st->visibility) continue;
+        if (t->n && r->y != prev_y && t->p[t->n - 1] != ' ') sb_putc(t, ' ');
+        sb_put(t, r->s, (size_t)r->n);
+        prev_y = r->y;
+        if (t->n > cap) {
+            size_t old = cap;
+            size_t max=SIZE_MAX/sizeof *owner;
+            if(t->n>max){free(owner);sb_free(t);return false;}
+            cap = t->n>max/2?t->n:t->n*2;
+            int *grown = realloc(owner, sizeof *owner * cap);
+            if(!grown){free(owner);sb_free(t);return false;}
+            owner=grown;
+            for (size_t k = old; k < cap; k++) owner[k] = -1;
+        }
+        for (size_t k = t->n - (size_t)r->n; k < t->n; k++) owner[k] = i;
+    }
+    *owner_out = owner;
+    return true;
+}
+
 static void find_in(struct fmatch *F, box_t *b) {
     if (F->failed || b->clamp_hidden || !b->st || b->st->display == D_NONE || b->st->content_visibility==CV_HIDDEN || (b->node && web_dialog_inert(F->d,b->node))) return;
     if (b->nruns) {
-        /* the block's text, with the run each byte came from */
-        sbuf t = {0};
-        int *owner = NULL;
-        size_t cap = 0;
-        float prev_y = -1e30f;
-        for (int i = 0; i < b->nruns; i++) {
-            struct run *r = &b->runs[i];
-            if (r->atomic || !r->n || r->st->visibility) continue;
-            if (t.n && r->y != prev_y && t.p[t.n - 1] != ' ') sb_putc(&t, ' ');
-            sb_put(&t, r->s, (size_t)r->n);
-            prev_y = r->y;
-            if (t.n > cap) {
-                size_t old = cap;
-                size_t max=SIZE_MAX/sizeof *owner;
-                if(t.n>max){F->failed=true;free(owner);sb_free(&t);return;}
-                cap = t.n>max/2?t.n:t.n*2;
-                int *grown = realloc(owner, sizeof *owner * cap);
-                if(!grown){F->failed=true;free(owner);sb_free(&t);return;}
-                owner=grown;
-                for (size_t k = old; k < cap; k++) owner[k] = -1;
-            }
-            for (size_t k = t.n - (size_t)r->n; k < t.n; k++) owner[k] = i;
-        }
+        sbuf t;
+        int *owner;
+        if (!find_block_text(b, &t, &owner)) { F->failed = true; return; }
         for (size_t k = 0; F->qn<=t.n && k<=t.n-F->qn; k++) {
             if (!ieq_at(t.p + k, t.n - k, F->q, F->qn)) continue;
             size_t j = k;
@@ -3750,21 +3973,27 @@ static void clear_highlight(box_t *b) {
     for (box_t *c = b->first; c; c = c->next) clear_highlight(c);
 }
 
-/* highlight the runs that make up the match starting at byte off of b's text */
-static void highlight(box_t *b, size_t off, size_t qn) {
-    size_t pos = 0;
-    float prev_y = -1e30f;
-    bool last_space = false;
-    for (int i = 0; i < b->nruns; i++) {
+/* Highlight the bytes of the match at byte off of b's searchable text, run by run. */
+static bool highlight(box_t *b, size_t off, size_t qn) {
+    sbuf t;
+    int *owner;
+    if (!find_block_text(b, &t, &owner)) return false;
+    size_t end = off + qn < t.n ? off + qn : t.n;
+    for (size_t k = off; k < end; k++) {
+        int i = owner[k];
+        if (i < 0 || (k > off && owner[k - 1] == i)) continue;
+        /* A run's bytes are contiguous: find where they start once, at its first matched byte. */
+        size_t start = k;
+        while (start > 0 && owner[start - 1] == i) start--;
         struct run *r = &b->runs[i];
-        if (r->atomic || !r->n || r->st->visibility) continue;
-        if (pos && r->y != prev_y && !last_space) pos++;
-        size_t s = pos, e = pos + (size_t)r->n;
-        if (e > (size_t)off && s < (size_t)off + qn) r->highlight = true;
-        pos = e;
-        prev_y = r->y;
-        last_space = r->s[r->n - 1] == ' ';
+        size_t last = start + (size_t)r->n < end ? start + (size_t)r->n : end;
+        r->highlight = true;
+        r->highlight_first = (int)(k - start);
+        r->highlight_end = (int)(last - start);
     }
+    free(owner);
+    sb_free(&t);
+    return true;
 }
 
 int web_find(web_doc *d, const char *text, int from_y) {
@@ -3818,9 +4047,9 @@ int web_find(web_doc *d, const char *text, int from_y) {
     if (!b) return -1;
     size_t off = F.best_b ? F.best_off : F.first_off;
     float y = F.best_b ? F.best_y : F.first_y;
-    highlight(b, off, F.qn);
-    wfont f = style_font(b->runs[F.best_b ? F.best_r : F.first_r].st);
-    float asc, desc;
-    wf_metrics(&f, &asc, &desc);
-    return (int)(y - asc);
+    if (!highlight(b, off, F.qn)) return -2;
+    const struct run *r = &b->runs[F.best_b ? F.best_r : F.first_r];
+    float top, bottom;
+    layout_run_extent(r, &top, &bottom);
+    return (int)(y - r->y + top);
 }
