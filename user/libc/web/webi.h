@@ -413,7 +413,6 @@ bool css_numeric_read(const char *s, size_t n, unsigned accept, const struct cx 
 /* text whose math functions are each serialized as a specified value (§10.13), the rest as written;
    false: none, or a value with var() */
 bool css_calc_specified(const char *s, size_t n, unsigned accept, sbuf *out);
-struct css_filter_step { float value; bool percentage; };
 struct css_corner_radius { len_t axis[2]; }; /* x resolves against width, y against height */
 struct style;
 bool css_radius_serialize(const struct style *,int,sbuf *,web_doc *);
@@ -433,12 +432,47 @@ struct radius_cache;
 void web_radius_cache_free(struct radius_cache **);
 struct clip_cache;
 void web_clip_cache_free(struct clip_cache **);
+/* A <filter-value-list> (Filter Effects 1 §5, filter and backdrop-filter): its computed value, the
+   functions in order with their omitted arguments filled in (§6.2). value is the amount as a number
+   (a percentage over 100; grayscale, invert, opacity and sepia clamped to 1), blur's and
+   drop-shadow's standard deviation in px, hue-rotate's angle in degrees; x and y are drop-shadow's
+   offset in px. Its colour is held as a shadow's (COLOR_CURRENT: currentcolor, resolved against the
+   element's colour where it is used). A url() keeps the URL as written. */
+enum { CSS_FILTER_URL, CSS_FILTER_BLUR, CSS_FILTER_BRIGHTNESS, CSS_FILTER_CONTRAST, CSS_FILTER_DROP_SHADOW,
+       CSS_FILTER_GRAYSCALE, CSS_FILTER_HUE_ROTATE, CSS_FILTER_INVERT, CSS_FILTER_OPACITY, CSS_FILTER_SATURATE,
+       CSS_FILTER_SEPIA };
+struct css_filter_step {
+    uint8_t kind;
+    float value, x, y;
+    uint32_t color;
+    const struct css_color_value *color_value; /* the exact computed colour when 8 bits cannot hold it */
+    const char *url;
+};
 struct css_filter {
     size_t count;
-    float opacity; /* product of used, range-clamped steps; not the computed list */
+    /* the used amount the opacity() functions multiply to when no other step changes a pixel or
+       reads a reference (paint.c composites such a list as group opacity), else 1 */
+    float opacity;
+    bool effects; /* a step other than opacity() that changes pixels, or a url() */
     struct css_filter_step steps[];
 };
-bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d);
+/* its computed value (§6.3); st: the element, whose colour currentcolor is (NULL: currentcolor kept) */
+bool css_filter_serialize(const struct style *st, const struct css_filter *filter, sbuf *out, web_doc *d);
+/* CSSOM: the specified value's serialization (§6.3); false: not none or a <filter-value-list> */
+bool css_filter_specified(const char *s, size_t n, sbuf *out);
+/* filter.c: the functions' pixels (Filter Effects 1 §13) on premultiplied ARGB. A drop-shadow()'s
+   used colour, its currentcolor st's colour */
+uint32_t web_filter_shadow_color(const struct style *st, const struct css_filter_step *s);
+/* how far f's output reaches past its input on each side (left, top, right, bottom) in px, and how
+   far an output pixel reads the input past itself (reach); url() steps add nothing */
+void web_filter_extent(const struct css_filter *f, float outset[4], float reach[4]);
+/* f's functions in order over the w×h surface px (pitch w); url() steps are the caller's. mirror:
+   backdrop-filter's edge mode (Filter Effects 2 §2.1), else transparent past the edges. d (may be
+   NULL): checkpoints and cancellation. False: cancelled or out of memory */
+bool web_filter_apply(web_doc *d, const struct style *st, const struct css_filter *f, uint32_t *px, int w, int h,
+                      bool mirror);
+/* color-interpolation-filters (§10): the initial linearRGB is 0 */
+enum { CIF_LINEARRGB, CIF_AUTO, CIF_SRGB };
 /* The shape values (shape.c): <basic-shape> (css-shapes-1 §3: inset(), circle(), ellipse(),
    polygon(), path(), shape(), with rect() and xywh() computing to inset()), a reference box
    alone, ray() (motion-1 §2.1.1) and <url>. clip-path, shape-outside and offset-path hold the
@@ -1136,6 +1170,8 @@ typedef struct style {
     float border_spacing;
     float opacity;
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
+    const struct css_filter *backdrop_filter; /* Filter Effects 2 §2; NULL: none */
+    uint8_t color_interpolation_filters; /* CIF_*; inherited, initial linearRGB */
     const struct css_shape *clip_path; /* NULL: none; a computed-arena value */
     /* Groups of rarely set properties, all but text not inherited, held by pointer so that every
        element's style does not carry them (css_style_float_shape, css_style_offset read them).
@@ -1751,6 +1787,11 @@ typedef struct box {
     struct shadow_cache *shadow_cache; /* geometry-only Gaussian masks; box lifetime */
     struct radius_cache *radius_clip[3]; /* border, padding, replaced-content clip masks */
     struct clip_cache *clip_cache; /* clip-path's shape coverage; box lifetime */
+    /* paint.c filter_used: whether a url() of its filter list names no <filter> (Filter Effects 1
+       §5: the whole list is then ignored), decided for that list at that dom_revision */
+    const struct css_filter *filter_ref_list;
+    uint64_t filter_ref_dom;
+    bool filter_ref_ignored;
     bool style_sync_dirty; /* retirement join: this subtree has changed style borrows */
     bool style_sync_subtree; /* and every box below may borrow one: a display:contents element generated them */
     /* inline formatting results (block containers with inline content) */
@@ -1843,6 +1884,9 @@ struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color);
    their clip-rule: clipPathUnits="objectBoundingBox" maps the unit square onto box (x y w h),
    userSpaceOnUse puts the origin at its corner. False when ref names no <clipPath>. */
 bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out);
+/* The element a CSS url() names in n's own tree: a fragment alone, or this document's URL with
+   one (CSS Values 4 §4.5.1 local references). NULL for another document or no such element. */
+node_t *doc_svg_reference(node_t *n, const char *ref);
 bool box_block_level(const box_t *b);
 
 struct run {
@@ -2190,6 +2234,13 @@ struct web_doc {
     struct restyle_damage { box_t *box; float rect[4]; } restyle_damage[32];
     uint8_t restyle_damage_n;
     bool restyle_damage_lost;
+    /* paint.c: the border boxes whose backdrop-filter read the canvas, in document space, since the
+       last whole paint at this layout revision. Damage that reaches one repaints all of it (its
+       backdrop is what is painted under it there); more than these repaints whole. */
+    struct backdrop_region { const box_t *box; float rect[4]; } backdrop_regions[32];
+    uint8_t backdrop_count;
+    bool backdrop_overflow;
+    uint64_t backdrop_layout;
     struct html_parser *parser;
     struct xml_parser *xml_parser; /* an XML document's, while it loads (xml.h) */
     struct web_js_state *js;

@@ -667,7 +667,7 @@ bool box_filter_containing_block(const box_t *b) {
        inner box owns its real padding/border containing-block geometry. */
     if (b && b->wrapped_inner && b->parent) effect = b->parent;
     return effect && effect->st && b->kind != B_TEXT && b->kind != B_BR &&
-        ((effect->kind!=B_INLINE&&css_translation_active(effect->st))||(effect->st->filter&&
+        ((effect->kind!=B_INLINE&&css_translation_active(effect->st))||((effect->st->filter||effect->st->backdrop_filter)&&
          !(b->node&&b->node->owner&&b->node==b->node->owner->html)));
 }
 bool box_viewport_fixed(const box_t *b) {

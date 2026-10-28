@@ -24,6 +24,7 @@ static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
     x->node = n;
     x->st = st;
     x->paint_alpha = kind != B_TEXT && kind != B_BR && st && (st->opacity * (st->filter ? st->filter->opacity : 1) < 1 ||
+        (st->filter && st->filter->effects) || st->backdrop_filter ||
         (kind != B_INLINE && (css_transform_general(st) || css_style_mask_border(st)->source.url ||
                               css_style_mask_border(st)->source.gradient)));
     x->baseline = -1;
@@ -594,16 +595,20 @@ struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color) {
     return c;
 }
 
-bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out) {
+node_t *doc_svg_reference(node_t *n, const char *ref) {
     web_doc *d = n ? n->owner : NULL;
     const char *fragment = ref ? strchr(ref, '#') : NULL;
-    if (!d || !fragment || !fragment[1]) return false;
+    if (!d || !fragment || !fragment[1]) return NULL;
     if (fragment != ref) { /* this document's own URL with a fragment names one of its elements */
         size_t prefix = (size_t)(fragment - ref), own = d->url ? strcspn(d->url, "#") : 0;
-        if (!d->url || prefix != own || memcmp(ref, d->url, prefix)) return false;
+        if (!d->url || prefix != own || memcmp(ref, d->url, prefix)) return NULL;
     }
     node_t *scope = doc_node_root(n, false);
-    node_t *clip = scope ? find_id(scope, fragment + 1) : NULL;
+    return scope ? find_id(scope, fragment + 1) : NULL;
+}
+
+bool doc_svg_clip_markup(node_t *n, const char *ref, const float box[4], sbuf *out) {
+    node_t *clip = doc_svg_reference(n, ref);
     if (!clip || !clip->foreign || strcmp(clip->name, "clippath")) return false;
     const char *units = node_attr(clip, "clipPathUnits");
     bool bbox = units && !strcmp(units, "objectBoundingBox");
@@ -781,7 +786,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     ws->height.kind = LK_AUTO;
     style_t *is = ar_alloc(b->a, sizeof *is);
     *is = *st;
-    is->filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
+    is->filter = is->backdrop_filter = NULL; is->opacity = 1; /* the element's outer group composites once, and clips once */
     is->clip_path = NULL; memset(&is->clip, 0, sizeof is->clip);
     is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);is->offset=NULL;
     is->mask_border = NULL; is->mask_border_img = 0; /* masked with the outer group */
@@ -1590,7 +1595,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
         next.width.kind=next.height.kind=LK_AUTO;
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
-        next.filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
+        next.filter=next.backdrop_filter=NULL; next.opacity=1; next.clip_path=NULL; memset(&next.clip,0,sizeof next.clip);
         next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);next.offset=NULL;
         next.mask_border=NULL; next.mask_border_img=0;
         for (int i=0;i<4;i++) {
@@ -1642,7 +1647,8 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
         deco->st=replacement_style(deco->node?deco->node:fallback,deco->st);
     }
     b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
-        (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || box_transformed(b) ||
+        (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || (b->st->filter && b->st->filter->effects) ||
+         b->st->backdrop_filter || box_transformed(b) ||
          (b->kind != B_INLINE && (css_style_mask_border(b->st)->source.url || css_style_mask_border(b->st)->source.gradient)));
     for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }
     b->style_sync_dirty=b->style_sync_subtree=false;

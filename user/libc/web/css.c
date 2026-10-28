@@ -8519,7 +8519,8 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
            (fa->range_count&&memcmp(fa->ranges,fb->ranges,fa->range_count*sizeof *fa->ranges)))return false;
     }
     if(fa||fb)return false;
-    if (!!a->filter != !!b->filter) return false; /* containing-block ownership changes */
+    /* containing-block ownership changes (Filter Effects 1 §5, 2 §2) */
+    if (!!a->filter != !!b->filter || !!a->backdrop_filter != !!b->backdrop_filter) return false;
     /* Values change scrollable overflow even though normal-flow boxes stay
        unchanged; identity versus none also changes fixed containing blocks. */
     if(!same_translation(a,b))return false;
@@ -8548,7 +8549,7 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     for(unsigned group=0;group<4;group++)for(unsigned i=0;i<(group==3?2:4);i++){
         if(!css_length_equal(&xa[group][i],&ya[group][i]))return false;xa[group][i].expr=ya[group][i].expr=NULL;
     }
-    x.filter=y.filter=NULL; /* effect amounts are paint-only arena borrows */
+    x.filter=y.filter=x.backdrop_filter=y.backdrop_filter=NULL; /* effect amounts are paint-only arena borrows */
     x.clip_path=y.clip_path=NULL;memset(&x.clip,0,sizeof x.clip);memset(&y.clip,0,sizeof y.clip); /* clipping paints only */
     /* a float's shape-outside and shape-margin shape the lines beside it */
     if(!css_float_shape_equal(x.float_shape,y.float_shape))return false;
@@ -8624,9 +8625,12 @@ static bool shadows_equal(const struct css_box_shadow *x, const struct css_box_s
 }
 static bool filters_equal(const struct css_filter *x, const struct css_filter *y) {
     if (x == y) return true;
-    if (!x || !y || x->count != y->count || x->opacity != y->opacity) return false;
-    for (size_t i = 0; i < x->count; i++)
-        if (x->steps[i].value != y->steps[i].value || x->steps[i].percentage != y->steps[i].percentage) return false;
+    if (!x || !y || x->count != y->count || x->opacity != y->opacity || x->effects != y->effects) return false;
+    for (size_t i = 0; i < x->count; i++) {
+        const struct css_filter_step *s = &x->steps[i], *e = &y->steps[i];
+        if (s->kind != e->kind || s->value != e->value || s->x != e->x || s->y != e->y || s->color != e->color ||
+            !css_color_value_equal(s->color_value, e->color_value) || !equal_string(s->url, e->url)) return false;
+    }
     return true;
 }
 static bool gradients_equal(const struct gradient *x, const struct gradient *y) {
@@ -8663,7 +8667,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !equal_string(a->bg_image, b->bg_image) || !equal_string(a->mask_image, b->mask_image) ||
         !css_motion_equal(&a->motion, &b->motion) || !equal_string(a->svg_fill.ref, b->svg_fill.ref) ||
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
-        !filters_equal(a->filter, b->filter) || !css_shape_equal(a->clip_path, b->clip_path) ||
+        !filters_equal(a->filter, b->filter) || !filters_equal(a->backdrop_filter, b->backdrop_filter) ||
+        !css_shape_equal(a->clip_path, b->clip_path) ||
         !css_float_shape_equal(a->float_shape, b->float_shape) || !css_offset_equal(a->offset, b->offset) ||
         !css_gap_rules_equal(a->gap_rules, b->gap_rules) || !css_anchor_equal(a->anchor, b->anchor) || !position_options_equal(a, b) ||
         !css_background_equal(a->background, b->background) || !css_border_image_equal(a->border_image, b->border_image, false) ||
@@ -8710,7 +8715,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.bg_image = y.bg_image = x.mask_image = y.mask_image = NULL;
     memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
-    x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
+    x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = x.backdrop_filter = y.backdrop_filter = NULL;
+    x.clip_path = y.clip_path = NULL;
     x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; x.anchor = y.anchor = NULL; x.ui = y.ui = NULL; /* the groups compared above */
     x.background = y.background = NULL; x.border_image = y.border_image = x.mask_border = y.mask_border = NULL;
     x.text = y.text = NULL; x.decoration = y.decoration = NULL; x.decorations = y.decorations = NULL;
@@ -8762,7 +8768,7 @@ static bool style_box_compatible(node_t *e, const style_t *old, const style_t *n
         old->before_generated || old->after_generated || old->backdrop ||
         next->before_generated || next->after_generated || next->backdrop) return false;
     if (old->display != next->display || old->position != next->position || old->float_ != next->float_ ||
-        !!old->filter != !!next->filter ||
+        !!old->filter != !!next->filter || !!old->backdrop_filter != !!next->backdrop_filter ||
         ((old->display == D_INLINE || next->display == D_INLINE) && (old->opacity < 1) != (next->opacity < 1)) ||
         old->container_type != next->container_type ||
         old->overflow != next->overflow || old->content_visibility != next->content_visibility ||

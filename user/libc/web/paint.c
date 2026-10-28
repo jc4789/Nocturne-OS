@@ -81,6 +81,8 @@ struct pctx {
     float hit_shape_x,hit_shape_y;
     const struct gfx_mask_clip *viewport_mask;
     const box_t *untransformed; /* this box's own used transform is being applied by the caller */
+    const box_t *unfiltered; /* this box's own filter, clip and opacity are being applied by the caller */
+    bool private_surface; /* a surface of a transform or filter, not the canvas the page is shown on */
     struct hit_stack *stack; /* doc_elements_at: every target the exact walk reaches, bottom first */
     /* Paint Timing, of a paint walk: it drew something other than the default
        background (first paint), and something contentful (first contentful
@@ -132,7 +134,7 @@ static bool mask_border_set(const style_t *st) {
 }
 static bool stacking_context(const box_t *b) {
     if (!b->st || b->kind == B_TEXT || b->kind == B_BR) return false;
-    if (b->st->filter || b->st->opacity < 1 || mask_border_set(b->st) ||
+    if (b->st->filter || b->st->backdrop_filter || b->st->opacity < 1 || mask_border_set(b->st) ||
         (b->kind!=B_INLINE&&css_translation_active(b->st))) return true;
     if (b->kind == B_INLINE) return false;
     /* Opacity groups are atomic even in normal flow. Fixed/sticky boxes also
@@ -3609,6 +3611,7 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
 
 /* ---------------------------------------------------------------- 2D transforms */
 static void paint_box(struct pctx *P, box_t *b, bool layer_root);
+static void paint_backdrop(struct pctx *P, const box_t *b, const double *m, float opacity);
 static void affine_rect(const double m[6], double x0, double y0, double x1, double y1, double out[4]) {
     double xs[4] = {x0, x1, x0, x1}, ys[4] = {y0, y0, y1, y1};
     out[0] = out[1] = INFINITY; out[2] = out[3] = -INFINITY;
@@ -3718,7 +3721,7 @@ static void transformed_resample(size_t tile, void *context) {
    checkpoint may draw browser chrome into the window canvas, so only a step
    writing private buffers is serviced; one writing the canvas joins as a
    raster primitive does. */
-static void transformed_run(web_doc *d, parallel_fn fn, int rows, size_t pixels, struct transformed_job *j) {
+static void transformed_run(web_doc *d, parallel_fn fn, int rows, size_t pixels, void *j) {
     size_t tiles = ((size_t)rows + 31) / 32;
     if (rows < 64 || pixels < 65536) { for (size_t t = 0; t < tiles; t++) fn(t, j); return; }
     parallel_for_stage(PARALLEL_RASTER, tiles, fn, j, d ? shadow_service : NULL, d);
@@ -3768,10 +3771,15 @@ static void paint_transformed_surface(struct pctx *P, box_t *b, bool layer_root,
         struct pctx Q = *P;
         Q.c = &surface; Q.ox = (float)-sx0; Q.oy = (float)-sy0;
         Q.vx0 = 0; Q.vy0 = 0; Q.vx1 = sw; Q.vy1 = sh; Q.viewport_mask = NULL;
-        Q.untransformed = b;
+        Q.untransformed = b; Q.private_surface = true;
         paint_box(&Q, b, layer_root);
         if (Q.failed) P->failed = true;
+        P->painted |= Q.painted; P->contentful |= Q.contentful;
     }
+    if (P->failed) { free(black); free(white); return; }
+    /* Filter Effects 2 §2.1: the backdrop through the transformed border box, under b */
+    if (b->st->backdrop_filter && !b->st->visibility && !P->private_surface)
+        paint_backdrop(P, b, m, b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1));
     if (P->failed) { free(black); free(white); return; }
     /* Both steps write disjoint 32-row bands: coverage per surface row, then
        the destination rows the inverse matrix samples it into. Every band of
@@ -3837,6 +3845,247 @@ static void paint_transformed(struct pctx *P, box_t *b, bool layer_root) {
     c->cx0 = cx0; c->cy0 = cy0; c->cx1 = cx1; c->cy1 = cy1;
 }
 
+/* ---------------------------------------------------------------- filter effects */
+/* The filter list b's paint applies: none when it is only opacity (the group's, filter_opacity) or
+   has no effect, or when a url() names no <filter> element in b's tree (Filter Effects 1 §5: the
+   whole list is then ignored and nothing is filtered). A <filter>'s primitives are not drawn: its
+   reference maps nothing. Decided once for a list and a DOM revision. */
+static const struct css_filter *filter_used(web_doc *d, box_t *b) {
+    const struct css_filter *f = b->st ? b->st->filter : NULL;
+    if (!f || !f->effects || b->kind == B_TEXT || b->kind == B_BR) return NULL;
+    if (b->filter_ref_list != f || b->filter_ref_dom != d->dom_revision) {
+        bool ignored = false;
+        for (size_t i = 0; i < f->count && !ignored; i++) {
+            if (f->steps[i].kind != CSS_FILTER_URL) continue;
+            node_t *e = b->node ? doc_svg_reference(b->node, f->steps[i].url) : NULL;
+            ignored = !e || e->type != N_ELEM || !e->foreign || strcmp(e->name, "filter");
+        }
+        b->filter_ref_list = f; b->filter_ref_dom = d->dom_revision; b->filter_ref_ignored = ignored;
+    }
+    return b->filter_ref_ignored ? NULL : f;
+}
+/* The filtered surface, premultiplied, over the opaque destination through the canvas's mask
+   clip, with the element's opacity: Filter Effects 1 §6 applies the filter, then the clip, then
+   opacity. Each 32-row band of the destination is its own. */
+struct filtered_job {
+    const uint32_t *surface;
+    canvas_t *canvas;
+    int sw, sx, sy, dx, dy, dw, dh;
+    uint32_t alpha; /* opacity, of 255 */
+};
+static void filtered_composite(size_t tile, void *context) {
+    const struct filtered_job *j = context;
+    const canvas_t *c = j->canvas;
+    int last = MIN((int)(tile + 1) * 32, j->dh);
+    for (int row_index = (int)tile * 32; row_index < last; row_index++) {
+        int py = j->dy + row_index, x0 = j->dx, x1 = j->dx + j->dw, opaque0 = x0, opaque1 = x1;
+        if (c->mask_clip) {
+            struct gfx_clip_span span;
+            if (!gfx_clip_row(c, py, x0, x1, &span)) continue;
+            x0 = span.x0; x1 = span.x1; opaque0 = span.opaque0; opaque1 = span.opaque1;
+        }
+        const uint32_t *s = j->surface + (size_t)(py - j->sy) * (size_t)j->sw;
+        uint32_t *row = c->px + (size_t)py * c->pitch;
+        for (int px = x0; px < x1; px++) {
+            uint32_t v = s[px - j->sx];
+            if (!(v >> 24)) continue; /* the filters keep each colour within its alpha */
+            uint32_t mask = px >= opaque0 && px < opaque1 ? 255 : gfx_clip_alpha(c, px, py);
+            if (!mask) continue;
+            /* one rounding: s·w + d·(1 − a·w), w the opacity times the mask */
+            float w = (float)(j->alpha * mask) * (1.f / 65025.f), keep = 1.f - (float)(v >> 24) * (1.f / 255.f) * w;
+            uint32_t d = row[px], out = 0xFF000000u;
+            for (int shift = 0; shift < 24; shift += 8) {
+                uint32_t value = (uint32_t)((float)((v >> shift) & 255) * w + (float)((d >> shift) & 255) * keep + .5f);
+                out |= (value > 255 ? 255 : value) << shift;
+            }
+            row[px] = out;
+        }
+    }
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)j->dw * (uint64_t)MAX(0, last - (int)tile * 32));
+}
+/* A surface past this many pixels reads less of its reach (a blur of hundreds of pixels across the
+   viewport): the pixels past it read as the transparent black beyond any edge. */
+#define FILTER_SURFACE_MAX (16.0 * 1024 * 1024)
+/* Filter Effects 1 §6: b and its descendants paint into a surface of their own, without b's
+   filter, clip and opacity; the filter list maps the surface, and the result is clipped and
+   composited with b's opacity. Like a transform's surface, it is painted over black and over
+   white, and the two recover premultiplied colour. The surface holds the filtered ink that
+   reaches the destination and every pixel the filter reads for it (web_filter_extent), no more:
+   a damage repaint filters only its rectangle and that reach. */
+static void paint_filtered(struct pctx *P, box_t *b, bool layer_root, const struct css_filter *f) {
+    canvas_t *c = P->c;
+    const int clip_saved[4] = {c->cx0, c->cy0, c->cx1, c->cy1};
+    const struct gfx_mask_clip *clip_prior = c->mask_clip; struct gfx_mask_clip clip_cut;
+    uint32_t *black = NULL, *white = NULL;
+    struct clip_used u;
+    if (clip_used(b, &u) && !clip_push(P, b, &u, &clip_cut)) goto done;
+    /* what b paints unfiltered, in document space; a private bounds generation, as a transform's */
+    struct pctx Q = *P;
+    Q.mode = M_BOUNDS; Q.bounds_valid = false; Q.unfiltered = b;
+    Q.bounds_generation = __atomic_add_fetch(&P->d->paint_bounds_generation, 1, __ATOMIC_RELAXED);
+    paint_box(&Q, b, layer_root);
+    if (Q.failed) { P->failed = true; goto done; }
+    if (!Q.bounds_valid) goto done;
+    float outset[4], reach[4];
+    web_filter_extent(f, outset, reach);
+    double ink[4] = {floor((double)Q.bounds[0] - outset[0] + P->ox), floor((double)Q.bounds[1] - outset[1] + P->oy),
+                     ceil((double)Q.bounds[2] + outset[2] + P->ox), ceil((double)Q.bounds[3] + outset[3] + P->oy)};
+    double l = fmax(ink[0], c->cx0), t = fmax(ink[1], c->cy0), r = fmin(ink[2], c->cx1), bt = fmin(ink[3], c->cy1);
+    if (!(r > l && bt > t)) goto done;
+    double grow[4];
+    for (int k = 0; k < 4; k++) grow[k] = ceil(reach[k]);
+    double dw = r - l, dh = bt - t;
+    if (!((dw + grow[0] + grow[2]) * (dh + grow[1] + grow[3]) <= FILTER_SURFACE_MAX)) {
+        /* the largest equal reach on every side that keeps the surface within the cap */
+        double sum = dw + dh, most = (-sum + sqrt(fmax(0, sum * sum - 4 * (dw * dh - FILTER_SURFACE_MAX)))) / 4;
+        for (int k = 0; k < 4; k++) grow[k] = fmin(grow[k], floor(fmax(0, most)));
+    }
+    double sx0 = fmax(ink[0], l - grow[0]), sy0 = fmax(ink[1], t - grow[1]);
+    double sx1 = fmin(ink[2], r + grow[2]), sy1 = fmin(ink[3], bt + grow[3]);
+    if (!((sx1 - sx0) * (sy1 - sy0) <= 2 * FILTER_SURFACE_MAX)) { P->failed = true; goto done; } /* never an unfiltered substitute */
+    int sw = (int)(sx1 - sx0), sh = (int)(sy1 - sy0);
+    size_t count = (size_t)sw * (size_t)sh;
+    black = malloc(count * sizeof *black); white = malloc(count * sizeof *white);
+    if (!black || !white) { P->failed = true; goto done; }
+    if (P->d->profile_enabled) { paint_profile.groups++; paint_profile.group_pixels += count; }
+    for (int pass = 0; pass < 2 && !P->failed; pass++) {
+        canvas_t surface;
+        gfx_init(&surface, pass ? white : black, sw, sh, sw);
+        gfx_fill(&surface, 0, 0, sw, sh, pass ? RGB(255, 255, 255) : RGB(0, 0, 0));
+        struct pctx S = *P;
+        S.c = &surface; S.ox = (float)(P->ox - sx0); S.oy = (float)(P->oy - sy0);
+        S.vx0 = 0; S.vy0 = 0; S.vx1 = sw; S.vy1 = sh; S.viewport_mask = NULL;
+        S.unfiltered = b; S.private_surface = true;
+        paint_box(&S, b, layer_root);
+        if (S.failed) P->failed = true;
+        P->painted |= S.painted; P->contentful |= S.contentful;
+    }
+    if (P->failed) goto done;
+    struct transformed_job coverage = {.black = black, .white = white, .sw = sw, .sh = sh};
+    transformed_run(P->d, transformed_coverage, sh, count, &coverage);
+    free(white); white = NULL;
+    if (!web_native_checkpoint(P->d) || !web_filter_apply(P->d, b->st, f, black, sw, sh, false)) { P->failed = true; goto done; }
+    /* The result is a fixed surface over what is under it, as an opacity group mixes it; a video
+       inside it painted into the private surface, which the snapshot refuses. */
+    web_avmedia_snapshot_blend_region(c, (int)l, (int)t, (int)dw, (int)dh);
+    float opacity = b->st->opacity;
+    struct filtered_job j = {black, c, sw, (int)sx0, (int)sy0, (int)l, (int)t, (int)dw, (int)dh,
+                             (uint32_t)(fminf(1, fmaxf(0, opacity)) * 255 + .5f)};
+    transformed_run(NULL, filtered_composite, (int)dh, (size_t)dw * (size_t)dh, &j);
+done:
+    free(black); free(white);
+    clip_pop(c, clip_saved, clip_prior);
+}
+/* The border boxes whose backdrop the canvas gave, for web_take_paint_damage. */
+static void backdrop_note(web_doc *d, const box_t *b, const double area[4]) {
+    if (d->backdrop_overflow) return;
+    float rect[4] = {(float)area[0] - 1, (float)area[1] - 1, (float)area[2] + 1, (float)area[3] + 1};
+    for (unsigned i = 0; i < d->backdrop_count; i++)
+        if (d->backdrop_regions[i].box == b) { memcpy(d->backdrop_regions[i].rect, rect, sizeof rect); return; }
+    const unsigned room = sizeof d->backdrop_regions / sizeof *d->backdrop_regions;
+    if (d->backdrop_count == room) { d->backdrop_overflow = true; return; }
+    d->backdrop_regions[d->backdrop_count].box = b;
+    memcpy(d->backdrop_regions[d->backdrop_count++].rect, rect, sizeof rect);
+}
+struct backdrop_job {
+    const uint32_t *filtered;
+    canvas_t *canvas;
+    int x, y, w, h;
+    float ox, oy, bx, by, bw, bh, inner[4];
+    struct border_radii radii;
+    bool mapped;
+    double inv[6];
+    uint32_t alpha;
+};
+/* The filtered backdrop over itself (source-over: §2.1's T' composited into b's parent) through
+   b's border box, its corners and the canvas's mask clip. */
+static void backdrop_composite(size_t tile, void *context) {
+    const struct backdrop_job *j = context;
+    const canvas_t *c = j->canvas;
+    int last = MIN((int)(tile + 1) * 32, j->h);
+    for (int row_index = (int)tile * 32; row_index < last; row_index++) {
+        int py = j->y + row_index, x0 = j->x, x1 = j->x + j->w, opaque0 = x0, opaque1 = x1;
+        if (c->mask_clip) {
+            struct gfx_clip_span span;
+            if (!gfx_clip_row(c, py, x0, x1, &span)) continue;
+            x0 = span.x0; x1 = span.x1; opaque0 = span.opaque0; opaque1 = span.opaque1;
+        }
+        const uint32_t *s = j->filtered + (size_t)row_index * (size_t)j->w;
+        uint32_t *row = c->px + (size_t)py * c->pitch;
+        double Y = py + 0.5 - j->oy;
+        for (int px = x0; px < x1; px++) {
+            double X = px + 0.5 - j->ox, u = X, v = Y;
+            if (j->mapped) { u = j->inv[0] * X + j->inv[2] * Y + j->inv[4]; v = j->inv[1] * X + j->inv[3] * Y + j->inv[5]; }
+            float cover = !j->mapped && u >= j->inner[0] && u < j->inner[2] && v >= j->inner[1] && v < j->inner[3] ? 1 :
+                corners_coverage((float)u, (float)v, j->bx, j->by, j->bw, j->bh, &j->radii);
+            float w = cover * (float)j->alpha * (1.f / 255.f);
+            if (w > 0 && !(px >= opaque0 && px < opaque1)) w *= (float)gfx_clip_alpha(c, px, py) * (1.f / 255.f);
+            if (!(w > 0)) continue;
+            /* one rounding: (f + d·(1 − fa))·w + d·(1 − w) = f·w + d·(1 − fa·w) */
+            uint32_t f = s[px - j->x], d = row[px], out = 0xFF000000u;
+            float keep = 1.f - (float)(f >> 24) * (1.f / 255.f) * w;
+            for (int shift = 0; shift < 24; shift += 8) {
+                uint32_t value = (uint32_t)((float)((f >> shift) & 255) * w + (float)((d >> shift) & 255) * keep + .5f);
+                out |= (value > 255 ? 255 : value) << shift;
+            }
+            row[px] = out;
+        }
+    }
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)j->w * (uint64_t)MAX(0, last - (int)tile * 32));
+}
+/* Filter Effects 2 §2.1 and §3: before b paints, what the canvas holds under b's border box (the
+   Backdrop Root Image: what the page painted before b) is filtered with mirrored edges at the
+   clipped border box, and drawn back through that box, its corners and b's clip; b then paints
+   over it, and b's opacity mixes the result as the rest of b's (the group it paints in). Only the
+   page's own canvas holds a backdrop: in a transform's or filter's private surface, nothing of
+   what is under the surface is there (an approximation of §3's Backdrop Root, LEDGER K113). m:
+   b's own transform, when b paints from such a surface; the box is mapped through it, and
+   opacity is b's. */
+static void paint_backdrop(struct pctx *P, const box_t *b, const double *m, float opacity) {
+    canvas_t *c = P->c;
+    if (P->private_surface || !(opacity > 0) || (b->node && b->node == P->d->html)) return;
+    /* an inline-table, -flex or -grid's border box and corners are its inner box's */
+    const box_t *shape = b->kind == B_ATOMIC && b->atomic == AT_INLINE_BLOCK && b->first && b->first->wrapped_inner ? b->first : b;
+    float x = box_visual_x(shape) - shape->p[3] - shape->b[3], y = box_visual_y(shape) - shape->p[0] - shape->b[0];
+    float w = shape->w + shape->p[1] + shape->p[3] + shape->b[1] + shape->b[3];
+    float h = shape->h + shape->p[0] + shape->p[2] + shape->b[0] + shape->b[2];
+    if (!(w > 0 && h > 0) || !shape->st) return;
+    struct backdrop_job j = {.canvas = c, .ox = P->ox, .oy = P->oy, .bx = x, .by = y, .bw = w, .bh = h,
+                             .radii = used_radii(shape->st, w, h), .mapped = m != NULL,
+                             .alpha = (uint32_t)(fminf(1, opacity) * 255 + .5f)};
+    double area[4] = {x, y, (double)x + w, (double)y + h};
+    if (m) {
+        if (!affine_invert(m, j.inv)) return;
+        affine_rect(m, x, y, (double)x + w, (double)y + h, area);
+    }
+    for (int k = 0; k < 4; k++) if (!isfinite(area[k])) return;
+    backdrop_note(P->d, b, area);
+    float reach[4];
+    radii_reach(&j.radii, reach);
+    j.inner[0] = x + reach[0]; j.inner[1] = y + reach[1]; j.inner[2] = x + w - reach[2]; j.inner[3] = y + h - reach[3];
+    double l = fmax(floor(area[0] + P->ox), c->cx0), t = fmax(floor(area[1] + P->oy), c->cy0);
+    double r = fmin(ceil(area[2] + P->ox), c->cx1), bt = fmin(ceil(area[3] + P->oy), c->cy1);
+    if (!(r > l && bt > t)) return;
+    j.x = (int)l; j.y = (int)t; j.w = (int)(r - l); j.h = (int)(bt - t);
+    size_t count = (size_t)j.w * (size_t)j.h;
+    uint32_t *px = malloc(count * sizeof *px);
+    if (!px) { P->failed = true; return; }
+    for (int row = 0; row < j.h; row++) {
+        const uint32_t *from = c->px + (size_t)(j.y + row) * c->pitch + j.x;
+        uint32_t *to = px + (size_t)row * j.w;
+        for (int i = 0; i < j.w; i++) to[i] = from[i] | 0xFF000000u;
+    }
+    /* the result reads its neighbours: a video under it repaints with it */
+    web_avmedia_snapshot_reject_region(c, j.x, j.y, j.w, j.h);
+    if (P->d->profile_enabled) { paint_profile.groups++; paint_profile.group_pixels += count; }
+    if (!web_filter_apply(P->d, b->st, b->st->backdrop_filter, px, j.w, j.h, true) || !web_native_checkpoint(P->d)) {
+        P->failed = true; free(px); return;
+    }
+    j.filtered = px;
+    transformed_run(NULL, backdrop_composite, j.h, count, &j);
+    free(px);
+}
+
 static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->failed) return;
     if (P->mode==M_PAINT && b->ellipsis_hidden && b->ellipsis_hidden_revision==P->d->layout_revision) return;
@@ -3847,10 +4096,15 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
     if (P->mode != M_BOUNDS && paint_box_layer(b) && !layer_root) return; /* painted with the layers */
     const style_t *st = b->st;
-    float group_opacity = st->opacity * (st->filter ? st->filter->opacity : 1);
+    /* paint_filtered applies a filtered box's opacity after its filter */
+    float group_opacity = P->unfiltered == b ? 1 : st->opacity * (st->filter ? st->filter->opacity : 1);
     /* Transparent auto boxes still participate in hit testing. */
     if (P->mode != M_HIT && group_opacity <= 0) return;
     if (P->untransformed != b && box_transformed(b)) { paint_transformed(P, b, layer_root); return; }
+    /* A filter maps what b paints, before its clip and opacity (and inside its transform); it
+       never moves where b is hit. */
+    const struct css_filter *filter = P->mode != M_HIT && P->unfiltered != b ? filter_used(P->d, b) : NULL;
+    if (filter && P->mode == M_PAINT) { paint_filtered(P, b, layer_root, filter); return; }
     float parent_bounds[4]; bool parent_valid = P->bounds_valid;
     if (P->mode == M_BOUNDS) {
         if (!(++P->bounds_work & 63) && !web_native_checkpoint(P->d)) { P->failed = true; return; }
@@ -3882,7 +4136,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     /* clip-path and clip: b and everything it paints, and where they are hit */
     const int clip_saved[4] = {c->cx0, c->cy0, c->cx1, c->cy1};
     const struct gfx_mask_clip *clip_prior = c->mask_clip; struct gfx_mask_clip clip_cut;
-    bool clipped = P->mode != M_BOUNDS && box_clips(b);
+    bool clipped = P->mode != M_BOUNDS && P->unfiltered != b && box_clips(b);
     if (clipped) {
         struct clip_used u; bool shown = true;
         if (clip_used(b, &u)) {
@@ -3895,6 +4149,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         bounds_rect(P, P->vx0 - P->ox, P->vy0 - P->oy, P->vx1 - P->vx0, P->vy1 - P->vy0);
     if (P->mode == M_BOUNDS && !st->visibility && b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR) {
         bounds_decoration(P,st,bx,by,bw,bh);
+        if (st->backdrop_filter) bounds_rect(P, bx, by, bw, bh); /* it repaints its backdrop there */
         if (b->gap_decorations) {
             float gx = x, gy = y, ink[4] = {INFINITY, INFINITY, -INFINITY, -INFINITY};
             gap_scroll(b, &gx, &gy);
@@ -3951,9 +4206,10 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             if (right > P->vx1) right = P->vx1; if (bottom > P->vy1) bottom = P->vy1;
             if (right > left && bottom > top) {
                 gx = (int)left; gy = (int)top; gw = (int)(right - left); gh = (int)(bottom - top);
-                /* Group opacity mixes each pixel with what was under it, and
-                   nothing else; other filter functions mix neighbours. */
-                if(st->filter||masked)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
+                /* Group opacity mixes each pixel with what was under it, and nothing else
+                   (filters that mix neighbours paint in paint_filtered; a backdrop below
+                   reads them and rejects its own region). A mask is not one factor. */
+                if(masked)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
                 else web_avmedia_snapshot_blend_region(c,gx,gy,gw,gh);
                 if(P->d->profile_enabled){paint_profile.groups++;paint_profile.group_pixels+=(uint64_t)gw*(uint64_t)gh;}
                 if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
@@ -3969,6 +4225,9 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->mode == M_PAINT && canvas_group)
         gfx_fill_blend(c, P->vx0, P->vy0, P->vx1 - P->vx0, P->vy1 - P->vy0, P->canvas_bg);
     bool visible = !st->visibility;
+    if (P->mode == M_PAINT && visible && st->backdrop_filter && b->kind != B_INLINE && b->kind != B_TEXT &&
+        b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP && P->untransformed != b)
+        paint_backdrop(P, b, NULL, 1);
     if (b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP) {
         if (P->mode == M_PAINT && visible) {
             bool skip_bg = (P->canvas_bg_from == 1 && b->node == P->d->html && b->node) ||
@@ -4058,7 +4317,13 @@ done:
         free(saved);
     }
     if (P->mode == M_BOUNDS) {
-        if (P->bounds_valid && box_clips(b)) clip_bounds(b, P->bounds, &P->bounds_valid);
+        /* the filter's spread, then the clip (a filtered box's own clip is its caller's) */
+        if (P->bounds_valid && filter) {
+            float outset[4], reach[4];
+            web_filter_extent(filter, outset, reach);
+            P->bounds[0] -= outset[0]; P->bounds[1] -= outset[1]; P->bounds[2] += outset[2]; P->bounds[3] += outset[3];
+        }
+        if (P->bounds_valid && P->unfiltered != b && box_clips(b)) clip_bounds(b, P->bounds, &P->bounds_valid);
         b->paint_bounds_generation = P->bounds_generation;
         b->paint_bounds_valid = P->bounds_valid;
         if (P->bounds_valid) memcpy(b->paint_bounds, P->bounds, sizeof b->paint_bounds);
@@ -4208,6 +4473,13 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
     paint_debug_begin(d);
     d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    /* A whole paint lists the backdrops again; a damage repaint keeps the list of the layout it
+       was made at (one with none recorded takes the new layout). Scrolling repaints whole, and a
+       restyle's damage holds what moved, old and new, so paint_backdrop moves its entry. */
+    bool whole = c->cx0 <= x && c->cy0 <= y && c->cx1 >= x + w && c->cy1 >= y + h;
+    if (whole) { d->backdrop_count = 0; d->backdrop_overflow = false; }
+    if (whole || (!d->backdrop_count && !d->backdrop_overflow)) d->backdrop_layout = d->layout_revision;
+    else if (d->backdrop_layout != d->layout_revision) d->backdrop_overflow = true;
     gfx_clip(c, x, y, w, h);
     bool snapshot_root=!d->frame_parent;
     if(snapshot_root){
@@ -4304,6 +4576,23 @@ void web_hit_index_free(web_doc *d) {
     if(!d||!d->hit_index)return;
     free(d->hit_index->items);free(d->hit_index->branches);free(d->hit_index->regions);free(d->hit_index);d->hit_index=NULL;
 }
+/* Maps a document rectangle (x, y, w, h) of b's subtree to what the page shows of it: grown by the
+   spread of each filter that maps it (b's own when own) and mapped through each transform, from b
+   up. A filter whose url() is ignored still counts: the rectangle only grows. */
+static void effect_rect(const box_t *b, bool own, double r[4]) {
+    for (const box_t *a = own ? b : b->parent; a; a = a->parent) {
+        const struct css_filter *f = a->st && a->kind != B_TEXT && a->kind != B_BR ? a->st->filter : NULL;
+        if (f && f->effects) {
+            float outset[4], reach[4];
+            web_filter_extent(f, outset, reach);
+            r[0] -= outset[0]; r[1] -= outset[1]; r[2] += (double)outset[0] + outset[2]; r[3] += (double)outset[1] + outset[3];
+        }
+        double m[6], out[4];
+        if (!box_transform_matrix(a, m)) continue;
+        affine_rect(m, r[0], r[1], r[0] + r[2], r[1] + r[3], out);
+        r[0] = out[0]; r[1] = out[1]; r[2] = out[2] - out[0]; r[3] = out[3] - out[1];
+    }
+}
 /* Unites a document rectangle (left, top, right, bottom) with the next paint's damage. */
 static void damage_add(web_doc *d,const float rect[4]){
     if(!d->paint_damage_valid){memcpy(d->paint_damage,rect,sizeof d->paint_damage);d->paint_damage_valid=true;return;}
@@ -4323,9 +4612,9 @@ void doc_paint_damage(web_doc *d,node_t *node){
     float bottom=y+box->h+box->p[0]+box->p[2]+box->b[0]+box->b[2]+4;
     float ink[4]={x,y,right,bottom};
     if(box->st)shadow_ink_bounds(box->st,x+2,y+2,right-x-4,bottom-y-4,ink);
-    /* The box's own transform and those above it move what it paints. */
+    /* The box's own filter and transform and those above it spread and move what it paints. */
     double r[4]={ink[0],ink[1],(double)ink[2]-ink[0],(double)ink[3]-ink[1]};
-    box_transform_rect(box,r);
+    effect_rect(box,true,r);
     for(int i=0;i<4;i++)if(!isfinite(r[i])){d->paint_damage_full=true;return;}
     ink[0]=(float)r[0];ink[1]=(float)r[1];ink[2]=(float)(r[0]+r[2]);ink[3]=(float)(r[1]+r[3]);
     damage_add(d,ink);
@@ -4368,9 +4657,9 @@ static bool restyle_box_ink(web_doc *d,box_t *b,float rect[4]){
     box_visual_memo_end(memo);
     if(P.failed)return false;
     if(!P.bounds_valid){rect[0]=rect[1]=INFINITY;rect[2]=rect[3]=-INFINITY;return true;}
-    /* the subtree's own transform is in its bounds; its antialiased edges reach a pixel out */
+    /* the subtree's own filter and transform are in its bounds; its antialiased edges reach a pixel out */
     double r[4]={P.bounds[0]-2,P.bounds[1]-2,P.bounds[2]-P.bounds[0]+4,P.bounds[3]-P.bounds[1]+4};
-    box_transform_rect(b->parent,r);
+    effect_rect(b,false,r);
     for(int i=0;i<4;i++)if(!isfinite(r[i]))return false;
     rect[0]=(float)r[0];rect[1]=(float)r[1];rect[2]=(float)(r[0]+r[2]);rect[3]=(float)(r[1]+r[3]);
     return true;
@@ -4421,6 +4710,18 @@ void doc_restyle_damage_commit(web_doc *d){
 bool web_take_paint_damage(web_doc *d,int *x,int *y,int *w,int *h){
     if(!d)return false;
     bool valid=d->paint_damage_valid&&!d->paint_damage_full&&d->layout_valid&&!d->need_style&&!d->need_boxes;
+    /* A backdrop is what is painted under its whole border box, read where it is drawn: damage
+       that reaches one repaints all of it, and that may reach another. */
+    if(valid&&(d->backdrop_overflow||d->backdrop_count)){
+        if(d->backdrop_overflow||d->backdrop_layout!=d->layout_revision){valid=false;d->paint_damage_full=true;}
+        else for(bool grown=true;grown;){
+            grown=false;
+            for(unsigned i=0;i<d->backdrop_count;i++){
+                const float *r=d->backdrop_regions[i].rect,*g=d->paint_damage;
+                if(r[0]<g[2]&&r[2]>g[0]&&r[1]<g[3]&&r[3]>g[1]&&(r[0]<g[0]||r[1]<g[1]||r[2]>g[2]||r[3]>g[3])){damage_add(d,r);grown=true;}
+            }
+        }
+    }
     if(d->profile_enabled){
         if(valid)damage_profile.taken_partial++;
         else if(d->paint_damage_full)damage_profile.taken_full++;
