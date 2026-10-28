@@ -355,24 +355,25 @@ function run(options) {
     return new App(options);
 }
 
-/* The user's settings belong to the system, which applies each change at once and keeps it;
-   watchers hear which changed (N_USER_SETTING_* bits, abi.h), whoever changed them. */
-const SETTING_NAMES = [[1, 'languages'], [2, 'pointer'], [4, 'display'], [8, 'sound']];
-const settingsListeners = new Set();
-internal.settingsChanged = bits => {
-    const changed = Object.freeze(SETTING_NAMES.filter(([bit]) => bits & bit).map(([, name]) => name));
+/* What desktop.get(), modes() and sound() report is kept by the part of the system that applies
+   it (the desktop, the display modes, the sound), which says when it changed: the program watches
+   the screen and the sound (js.c's systemWatch), and listeners hear which changed, whoever changed
+   it. */
+const systemListeners = new Set();
+internal.systemChanged = (screen, sound) => {
+    const changed = Object.freeze([...(screen ? ['screen'] : []), ...(sound ? ['sound'] : [])]);
     if (!changed.length) return;
-    for (const listener of [...settingsListeners]) {
+    for (const listener of [...systemListeners]) {
         try { listener(changed); }
         catch (e) { internal.reportError?.(e); }
     }
 };
-function watchSettings(listener) {
+function watchSystem(listener) {
     if (typeof listener !== 'function') throw new TypeError('desktop.watch() needs a function');
-    if (!settingsListeners.size && !host.settingsWatch(true)) throw new Error('the system does not tell of changed settings');
-    settingsListeners.add(listener);
+    if (!systemListeners.size && !host.systemWatch(true)) throw new Error('the system does not tell of changes');
+    systemListeners.add(listener);
     return () => {
-        if (settingsListeners.delete(listener) && !settingsListeners.size) host.settingsWatch(false);
+        if (systemListeners.delete(listener) && !systemListeners.size) host.systemWatch(false);
     };
 }
 
@@ -383,7 +384,8 @@ internal.ui = Object.freeze({
     /* The computer: processor, memory, uptime and running tasks (null if the system will not say). */
     systemInfo: () => host.systemInfo(),
     launch: (path, arg) => host.uiLaunch(String(path), arg === undefined ? undefined : String(arg)),
-    /* The user's settings (what Settings changes): the system applies and keeps them. */
+    /* The desktop, the monitor's modes and the sound (what Settings changes): each change goes to
+       the part of the system that applies it, which keeps it. */
     desktop: Object.freeze({
         get: () => host.desktop(),
         set: s => host.desktopSet(s.pointerSpeed | 0, !!s.smoothGradients),
@@ -396,17 +398,9 @@ internal.ui = Object.freeze({
         tryMode: m => host.screenModeSet('try', m.width >>> 0, m.height >>> 0, m.refreshMillihertz >>> 0),
         keepMode: () => host.screenModeSet('keep', 0, 0, 0),
         backMode: () => host.screenModeSet('back', 0, 0, 0),
-        /* The languages the user reads, most wanted first (n_user_languages): BCP 47 tags. */
-        languages: () => {
-            const list = host.userLanguages();
-            return list === null ? null : Object.freeze(list.split(','));
-        },
-        setLanguages: tags => {
-            const list = Array.from(tags, String);
-            return list.length > 0 && !list.some(t => t.includes(',')) && host.userLanguagesSet(list.join(',')) === 0;
-        },
-        /* listener(changed) after the user's settings changed, whoever changed them; returns the
-           function that stops it. A watch alone does not keep the program running. */
-        watch: watchSettings,
+        /* listener(changed: "screen", "sound") after what get(), modes() or sound() report changed,
+           whoever changed it; returns the function that stops it. A watch alone does not keep the
+           program running. */
+        watch: watchSystem,
     }),
 });

@@ -964,47 +964,37 @@ static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSVa
     return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_MODE_SET, 0, 0) == 0);
 }
 
-/* The languages the user reads, most wanted first (n_user_languages): "ja,en-US"; null on failure. */
-static JSValue h_user_languages(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    char list[N_USER_LANGUAGES_MAX];
-    n_result n = n_user_languages(list, sizeof list);
-    return n < 0 ? JS_NULL : JS_NewStringLen(ctx, list, (size_t)n);
-}
-
-/* (list, the tags between commas): 0, or the negative result of n_user_languages_set */
-static JSValue h_user_languages_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    size_t n;
-    const char *list = JS_ToCStringLen(ctx, &n, argv[0]);
-    if (!list) return JS_EXCEPTION;
-    n_result r = n_user_languages_set(list, n);
-    JS_FreeCString(ctx, list);
-    return JS_NewInt32(ctx, (int32_t)r);
-}
-
-/* The user's settings, watched for internal.settingsChanged (n_user_settings_watch) in the
-   windows' event queue, so that a change ends the event loop's wait as a window's event does. */
-#define SETTINGS_TOKEN (1ull << 40)
-static n_handle settings_watch = -1;
-static bool settings_signal;
+/* What desktop, screenModes and sound report, watched where it is kept (display_abi.h's
+   SCREEN_WATCH, n_audio_output_watch) for internal.systemChanged. Both watches sit in the
+   windows' event queue, each with its own token, so that a change ends the event loop's wait as a
+   window's event does and the loop knows which one to take (n_watch_take). */
+#define SCREEN_TOKEN (1ull << 40)
+#define SOUND_TOKEN (SCREEN_TOKEN + 1)
+static n_handle screen_watch = -1, sound_watch = -1; /* both open, or neither */
+static bool screen_signal, sound_signal;
 
 /* (on): whether the program now hears of changes */
-static JSValue h_settings_watch(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+static JSValue h_system_watch(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
     bool on = JS_ToBool(ctx, argv[0]);
-    if (on && settings_watch < 0) {
+    if (on && screen_watch < 0) {
         struct ui_session *s = ui_get();
-        n_handle w = s ? n_user_settings_watch(N_USER_SETTINGS_ALL) : -N_ERR_NO_MEMORY;
-        if (w < 0) return JS_FALSE;
-        if (n_events_watch(ui_session_queue(s), w, N_EVENT_RECEIVABLE, SETTINGS_TOKEN) < 0) {
-            n_handle_close(w);
+        if (!s) return JS_FALSE;
+        n_handle q = ui_session_queue(s), screen = n_screen_watch(), sound = n_audio_output_watch();
+        if (screen < 0 || sound < 0 || n_events_watch(q, screen, N_EVENT_RECEIVABLE, SCREEN_TOKEN) < 0 ||
+            n_events_watch(q, sound, N_EVENT_RECEIVABLE, SOUND_TOKEN) < 0) {
+            if (screen >= 0) n_handle_close(screen); /* a watch in the queue ends with its handle */
+            if (sound >= 0) n_handle_close(sound);
             return JS_FALSE;
         }
-        settings_watch = w;
-    } else if (!on && settings_watch >= 0) {
-        n_handle_close(settings_watch); /* its watch in the queue ends with it */
-        settings_watch = -1;
-        settings_signal = false;
+        screen_watch = screen;
+        sound_watch = sound;
+    } else if (!on && screen_watch >= 0) {
+        n_handle_close(screen_watch);
+        n_handle_close(sound_watch);
+        screen_watch = sound_watch = -1;
+        screen_signal = sound_signal = false;
     }
-    return JS_NewBool(ctx, settings_watch >= 0);
+    return JS_NewBool(ctx, screen_watch >= 0);
 }
 
 /* The computer: processor, memory, uptime, running tasks. */
@@ -1069,32 +1059,37 @@ static void ui_deliver(void) {
 
 static bool ui_open(void) { return ui && ui_session_open(ui); }
 
-/* Tells the program which of the user's settings changed (N_USER_SETTING_* bits). */
-static void deliver_settings(void) {
-    if (!settings_signal || settings_watch < 0) return;
-    settings_signal = false;
-    n_result bits = n_user_settings_changes(settings_watch);
-    if (bits <= 0) return;
-    JSValue r = internal_call("settingsChanged", 1, (JSValue[]){JS_NewInt32(ctx, (int32_t)bits)});
+/* Tells the program which of what the system reports changed since it last heard: the screen
+   (desktop, screenModes), the sound, or both. */
+static void deliver_system(void) {
+    if (screen_watch < 0 || (!screen_signal && !sound_signal)) return;
+    bool screen = screen_signal && n_watch_take(screen_watch) > 0;
+    bool sound = sound_signal && n_watch_take(sound_watch) > 0;
+    screen_signal = sound_signal = false;
+    if (!screen && !sound) return;
+    JSValue r = internal_call("systemChanged", 2, (JSValue[]){JS_NewBool(ctx, screen), JS_NewBool(ctx, sound)});
     if (JS_IsException(r)) report_exception();
     JS_FreeValue(ctx, r);
     drain();
 }
 
-/* Waits up to ms for the windows, the engine's own timers or a change of the user's settings,
-   then hands on what came. */
+/* Waits up to ms for the windows, the engine's own timers or a change the system reports, then
+   hands on what came. While the system is watched, a window to draw now still looks (without
+   waiting) for a change that came, so that drawing does not hold it back. */
 static void wait_ui(int ms) {
     int t = ui_session_timeout(ui);
     if (t < 0 || (ms >= 0 && ms < t)) t = ms;
-    if (t != 0) {
-        struct n_event ev[8];
-        n_result n = n_events_wait(ui_session_queue(ui), ev, 8, t);
-        for (n_result i = 0; i < n; i++)
-            if (ev[i].token == SETTINGS_TOKEN) settings_signal = true;
+    if (t != 0 || screen_watch >= 0) {
+        struct n_event ev[16];
+        n_result n = n_events_wait(ui_session_queue(ui), ev, 16, t);
+        for (n_result i = 0; i < n; i++) {
+            if (ev[i].token == SCREEN_TOKEN) screen_signal = true;
+            else if (ev[i].token == SOUND_TOKEN) sound_signal = true;
+        }
     }
     ui_session_pump(ui);
     ui_deliver();
-    deliver_settings();
+    deliver_system();
 }
 
 /* ---------------------------------------------------------------- event loop */
@@ -1108,7 +1103,7 @@ static void run_loop(JSValueConst until) {
         drain();
         deliver_fetches();
         if (ui) { ui_session_pump(ui); ui_deliver(); }
-        deliver_settings();
+        deliver_system();
         for (;;) {
             JSValue now = JS_NewFloat64(ctx, (double)n_clock_uptime_ms());
             JSValue fired = internal_call("fireTimer", 1, (JSValue[]){now});
@@ -1131,8 +1126,9 @@ static void run_loop(JSValueConst until) {
         if (ms > 1000) ms = 1000;
         if (!ms) continue;
         fflush(stdout);
-        /* window events and a change of the user's settings end the wait */
-        if (ui_open() || settings_watch >= 0) wait_ui(fetch_pending > 0 && ms > 10 ? 10 : (int)ms);
+        /* window events and a change the system reports end the wait; a watch alone does not keep
+           the program running (the return above), but while timers or fetches do, it is heard */
+        if (ui_open() || screen_watch >= 0) wait_ui(fetch_pending > 0 && ms > 10 ? 10 : (int)ms);
         else if (fetch_pending > 0) wait_on_address(&fetch_signal, seen, (unsigned)ms);
         else n_sleep_ms(ms);
     }
@@ -1464,9 +1460,7 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("desktopSet", 2, h_desktop_set),
     JS_CFUNC_DEF("screenModes", 0, h_screen_modes),
     JS_CFUNC_DEF("screenModeSet", 4, h_screen_mode_set),
-    JS_CFUNC_DEF("userLanguages", 0, h_user_languages),
-    JS_CFUNC_DEF("userLanguagesSet", 1, h_user_languages_set),
-    JS_CFUNC_DEF("settingsWatch", 1, h_settings_watch),
+    JS_CFUNC_DEF("systemWatch", 1, h_system_watch),
     JS_CFUNC_DEF("sound", 2, h_sound),
     JS_CFUNC_DEF("systemInfo", 0, h_system_info),
 };
