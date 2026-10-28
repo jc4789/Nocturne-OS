@@ -1,6 +1,8 @@
-Nocturne HTML Shift_JIS decoder: JIS0208 mapping data from WHATWG Encoding.
-Source: https://github.com/whatwg/encoding/tree/a985b62a9b45c17da3e17a9f0a0b4e30c34c4a8a
-Derived table: user/libc/web/encoding/jis0208.inc
+Nocturne's Encoding Standard layer (user/libc/web/web_encoding.c): the indexes, labels
+and the gb18030 encoder's side table in Lexbor's encoding module are WHATWG Encoding data.
+Source: https://encoding.spec.whatwg.org/ (https://github.com/whatwg/encoding)
+Derived tables: third_party/lexbor/source/lexbor/encoding/ (res.c's label table by
+ports/lexbor/encoding_labels.py from encodings.json)
 
 Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
 

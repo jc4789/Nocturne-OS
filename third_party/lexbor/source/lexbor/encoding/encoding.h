@@ -196,14 +196,32 @@ lxb_inline lxb_status_t
 lxb_encoding_decode_finish(lxb_encoding_decode_t *decode)
 {
     lxb_status_t status;
+    lxb_char_t lead;
+    const lxb_char_t *p;
+    lxb_encoding_ctx_2022_jp_t *iso;
 
-    if (decode->status != LXB_STATUS_OK) {
+    /*
+     * Nocturne: ISO-2022-JP's end-of-queue by state, whatever the status
+     * (a trailing byte's ESC leaves escape start with LXB_STATUS_OK). ASCII,
+     * Roman, katakana and leading byte are finished; trailing byte and escape
+     * start are one error; escape is an error, then its leading byte again in
+     * the output state, then end-of-queue again.
+     * https://encoding.spec.whatwg.org/#iso-2022-jp-decoder
+     */
+    iso = &decode->u.iso_2022_jp;
 
-        if (decode->encoding_data->encoding == LXB_ENCODING_ISO_2022_JP
-            && decode->u.iso_2022_jp.state == LXB_ENCODING_DECODE_2022_JP_ASCII)
+    if (decode->encoding_data->encoding == LXB_ENCODING_ISO_2022_JP) {
+        if (iso->state != LXB_ENCODING_DECODE_2022_JP_TRAIL
+            && iso->state != LXB_ENCODING_DECODE_2022_JP_ESCAPE_START
+            && iso->state != LXB_ENCODING_DECODE_2022_JP_ESCAPE)
         {
             return LXB_STATUS_OK;
         }
+
+        decode->status = LXB_STATUS_CONTINUE;
+    }
+
+    if (decode->status != LXB_STATUS_OK) {
 
         if (decode->replace_to == NULL) {
             return LXB_STATUS_ERROR;
@@ -213,6 +231,27 @@ lxb_encoding_decode_finish(lxb_encoding_decode_t *decode)
                                                 decode->replace_len);
         if (status == LXB_STATUS_SMALL_BUFFER) {
             return status;
+        }
+
+        if (decode->encoding_data->encoding == LXB_ENCODING_ISO_2022_JP
+            && iso->state == LXB_ENCODING_DECODE_2022_JP_ESCAPE)
+        {
+            lead = iso->lead;
+            p = &lead;
+
+            iso->lead = 0x00;
+            iso->out_flag = false;
+            iso->state = iso->out_state;
+
+            status = decode->encoding_data->decode(decode, &p, p + 1);
+            if (status == LXB_STATUS_SMALL_BUFFER) {
+                return status;
+            }
+
+            if (iso->state == LXB_ENCODING_DECODE_2022_JP_TRAIL) {
+                return lxb_encoding_decode_buf_add_to(decode, decode->replace_to,
+                                                      decode->replace_len);
+            }
         }
     }
 

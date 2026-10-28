@@ -3206,7 +3206,7 @@ lxb_url_percent_encode_after_encoding(const lxb_char_t *data,
     int8_t len;
     size_t length, size;
     lxb_status_t status;
-    lxb_codepoint_t cp;
+    lxb_codepoint_t cp, error;
     const lxb_char_t *p, *pb;
     lxb_encoding_encode_t encode;
     lxb_char_t c, buffer[128], percent[3];
@@ -3247,28 +3247,15 @@ lxb_url_percent_encode_after_encoding(const lxb_char_t *data,
             continue;
         }
 
-        len = encoding->encode_single(&encode, &buf, buf_end, cp);
-
-        if (len < LXB_ENCODING_ENCODE_OK) {
-            size = lexbor_conv_int64_to_data((int64_t) cp, buffer,
-                                             sizeof(buffer));
-
-            if (lexbor_str_append(str, mraw, esc_str.data, esc_str.length) == NULL) {
-                return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
-            }
-
-            if (lexbor_str_append(str, mraw, buffer, size) == NULL) {
-                return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
-            }
-
-            percent[1] = '3';
-            percent[2] = 'B';
-
-            if (lexbor_str_append(str, mraw, percent, 3) == NULL) {
-                return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
-            }
-
-            continue;
+        /*
+         * Nocturne: encode or fail. The bytes before an error (ISO-2022-JP's
+         * return to ASCII) are output first, then %26%23 error %3B.
+         */
+        error = LXB_ENCODING_ERROR_CODEPOINT;
+        len = lxb_encoding_encode_or_fail_single(&encode, &buf, buf_end, cp,
+                                                 &error);
+        if (len == LXB_ENCODING_ENCODE_SMALL_BUFFER) {
+            return LXB_STATUS_ERROR_WRONG_ARGS;
         }
 
     iso_2022_jp:
@@ -3303,6 +3290,28 @@ lxb_url_percent_encode_after_encoding(const lxb_char_t *data,
         }
 
         buf = buffer;
+
+        if (len == LXB_ENCODING_ENCODE_ERROR) {
+            len = LXB_ENCODING_ENCODE_OK;
+
+            size = lexbor_conv_int64_to_data((int64_t) error, buffer,
+                                             sizeof(buffer));
+
+            if (lexbor_str_append(str, mraw, esc_str.data, esc_str.length) == NULL) {
+                return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+            }
+
+            if (lexbor_str_append(str, mraw, buffer, size) == NULL) {
+                return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+            }
+
+            percent[1] = '3';
+            percent[2] = 'B';
+
+            if (lexbor_str_append(str, mraw, percent, 3) == NULL) {
+                return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+            }
+        }
     }
 
     if (encoding->encoding == LXB_ENCODING_ISO_2022_JP) {
