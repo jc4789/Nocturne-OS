@@ -19,6 +19,8 @@ static void check(bool ok, const char *what) {
 
 /* reached only from properties these cases do not set */
 bool web_native_checkpoint(web_doc *d) { (void)d; return true; }
+/* web_url.c's, reached only from a registered <url> custom property (cssprop.c's syn_url_text) */
+int web_resolve_url_owned(const char *base, const char *rel, char **out) { (void)base; (void)rel; (void)out; abort(); }
 void web_avmedia_checkpoint(void) {}
 void *thread_local_get(unsigned slot) { (void)slot; return NULL; }
 unsigned parallel_worker_index(void) { return 0; }

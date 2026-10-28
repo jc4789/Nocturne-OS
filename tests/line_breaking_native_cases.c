@@ -24,6 +24,8 @@ static void near(double got, double want, const char *what) {
 
 /* reached only from properties these cases do not set */
 bool web_native_checkpoint(web_doc *d) { (void)d; return true; }
+/* web_url.c's, reached only from a registered <url> custom property (cssprop.c's syn_url_text) */
+int web_resolve_url_owned(const char *base, const char *rel, char **out) { (void)base; (void)rel; (void)out; abort(); }
 void web_avmedia_checkpoint(void) {}
 bool web_avmedia_snapshot_is_probe(void) { return false; }
 void *thread_local_get(unsigned slot) { (void)slot; return NULL; }

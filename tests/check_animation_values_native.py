@@ -53,6 +53,19 @@ static bool same(const char *property,const char *a,const char *b){
     const struct propdef *p=css_prop_lookup(property,strlen(property));style_t x,y;
     return p&&css_anim_parse(&ctx,p,a,strlen(a),false,&x,NULL)&&css_anim_parse(&ctx,p,b,strlen(b),false,&y,NULL)&&css_anim_equal(p,&x,&y);
 }
+/* a registered custom property's computed values a and b (css-properties-values-api-1 §2.5) */
+static const char *custom(const char *syntax,const char *a,const char *b,double t){
+    const struct css_syntax *syn=css_syntax_parse(syntax,strlen(syntax),&arena);
+    if(!syn)return "SYNTAX";
+    text.n=0;if(text.p)text.p[0]=0;
+    return css_custom_interpolate(&ctx,syn,a,b,t,&text)?sb_cstr(&text):"DISCRETE";
+}
+static const char *custom_compose(const char *syntax,const char *a,const char *b,bool accumulate){
+    const struct css_syntax *syn=css_syntax_parse(syntax,strlen(syntax),&arena);
+    if(!syn)return "SYNTAX";
+    text.n=0;if(text.p)text.p[0]=0;
+    return css_custom_compose(&ctx,syn,a,b,accumulate,&text)?sb_cstr(&text):"REPLACE";
+}
 /* the base style's color (what currentcolor is) */
 static void base_color(const char *c){
     css_style_init(&base,&parent);
@@ -172,6 +185,34 @@ int main(void){
     EXPECT(computed("z-index","auto"),"auto");
     EXPECT(computed("line-height","1.5"),"1.5");
     EXPECT(computed("background-position","left 10px top 20%"),"10px 20%");
+    /* registered custom properties (css-properties-values-api/animation: the keyframes composited
+       with the underlying value, then interpolated at the middle) */
+    EXPECT(custom("<length>","100px","200px",.5),"150px");
+    EXPECT(custom_compose("<length>","100px","200px",false),"300px");
+    EXPECT(custom("<integer>","100","200",.5),"150");
+    EXPECT(custom("<integer>","1","2",.5),"2");
+    EXPECT(custom("<number>","0","1",.25),"0.25");
+    EXPECT(custom("<angle>","0deg","180deg",.5),"90deg");
+    EXPECT(custom("<time>","1s","2s",.5),"1.5s");
+    EXPECT(custom("<percentage>","10%","20%",.5),"15%");
+    EXPECT(custom("<resolution>","1dppx","3dppx",.5),"2dppx");
+    EXPECT(custom("<color>","rgb(100, 100, 100)","rgb(200, 200, 200)",.5),"rgb(150, 150, 150)");
+    EXPECT(custom_compose("<color>","rgb(100, 100, 100)","rgb(50, 50, 50)",false),"rgb(150, 150, 150)");
+    EXPECT(custom("<length-percentage>#","100px, 150%","200%, 250px",.5),"calc(100% + 50px), calc(75% + 125px)");
+    EXPECT(custom("<length-percentage>#","10px, 20%","30px",.5),"DISCRETE");
+    EXPECT(custom("<length>+","1px 2px","3px 4px",.5),"2px 3px");
+    EXPECT(custom("<custom-ident>","a","b",.5),"DISCRETE");
+    EXPECT(custom("<number>+ | <transform-list>","translateX(100px)","200",.5),"DISCRETE");
+    EXPECT(custom("<transform-function>","translateX(100px)","translateX(200px)",.5),"translateX(150px)");
+    EXPECT(custom_compose("<transform-function>","translateX(100px)","translateX(200px)",false),"translateX(300px)");
+    EXPECT(custom_compose("<transform-function>","translateX(100px)","scale(2)",false),"REPLACE");
+    EXPECT(custom("<transform-list>","translateX(100px) scale(2)","translateX(200px) scale(4)",.5),"translateX(150px) scale(3)");
+    EXPECT(custom("<transform-list>","scale(2)","scale(4) rotate(90deg)",.5),"scale(3) rotate(45deg)");
+    EXPECT(custom("<transform-list>","translateX(100px)","translateY(100px)",.5),"translate(50px, 50px)");
+    EXPECT(custom_compose("<transform-list>","translateX(100px) scale(2)","translateX(200px) scale(3)",false),
+           "translateX(100px) scale(2) translateX(200px) scale(3)");
+    EXPECT(custom_compose("<transform-list>","translateX(50px) scale(3.5)","translateX(100px) scale(4)",true),"translateX(150px) scale(6.5)");
+    EXPECT(custom("<transform-function>+","rotate(0deg)","rotate(90deg)",.5),"rotate(45deg)");
     /* the animation-* and transition-* lists (css-animations/parsing, css-transitions/parsing) */
     EXPECT(computed("animation-duration","1s, 200ms"),"1s, 0.2s");
     EXPECT(computed("animation-duration","auto"),"auto");

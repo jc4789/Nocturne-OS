@@ -187,6 +187,9 @@ typedef struct node {
     struct node *style_retired_next;
     bool style_dirty, style_children_dirty;
     bool style_self_dirty; /* only this element's own match changed */
+    /* a child's style read sibling-index() or sibling-count() (css-values-5 §10): a change of the
+       child list restyles the children; css workers set it, so it is written atomically */
+    bool style_counts_children;
     uint8_t style_mark_source; /* --debug-js: what set style_dirty */
     uint8_t style_form_state; /* supervisor-published form pseudo snapshot; cascade reads only */
     uint32_t style_subtree_work; /* elements the next cascade restyles here, counted before it splits */
@@ -953,10 +956,9 @@ struct css_list {
 extern const struct css_list css_list_initial;
 /* content (CSS Generated Content 3 §1.1): the items of its content list, then those of its
    alternative text. A style's content NULL is normal; css_content_none is none. attr() is
-   substituted at computed-value time, as a string item. */
+   substituted before the value is parsed (css.c's subst), like var(). */
 enum { CSS_CONTENT_STRING, CSS_CONTENT_COUNTER, CSS_CONTENT_COUNTERS, CSS_CONTENT_OPEN_QUOTE,
-       CSS_CONTENT_CLOSE_QUOTE, CSS_CONTENT_NO_OPEN_QUOTE, CSS_CONTENT_NO_CLOSE_QUOTE, CSS_CONTENT_IMAGE,
-       CSS_CONTENT_ATTR /* attr() as written, in a value no element computes (a declaration's CSSOM text) */ };
+       CSS_CONTENT_CLOSE_QUOTE, CSS_CONTENT_NO_OPEN_QUOTE, CSS_CONTENT_NO_CLOSE_QUOTE, CSS_CONTENT_IMAGE };
 struct css_content_item {
     uint8_t kind;
     const char *text;      /* STRING: the string; COUNTER(S): the counter's name */
@@ -1058,7 +1060,16 @@ struct custom_prop {
     /* Only on the first of one element's own declarations: a name index of
        that element's declarations and the inherited chain after them. */
     const struct var_segment *segment;
+    /* the cascade's, while it computes the element (css.c): the declared value and the URL of the
+       sheet that declared it (a registered <url> resolves against it), and CUSTOM_* */
+    const char *raw, *base;
+    uint8_t state;
 };
+/* custom_prop.state: a registered value waits for the element's font size or colour scheme (the
+   early properties) or its colour; it took part in a cycle (through them, or a substitution that
+   guarded it again: css-values-5 §8.6); attr() substituted into it (§8.7.3 attr()-tainted); its
+   computed value is not known yet this round (a substitution that reaches it computes it then) */
+enum { CUSTOM_PENDING = 1, CUSTOM_COLOR = 2, CUSTOM_CYCLE = 4, CUSTOM_TAINTED = 8, CUSTOM_LAZY = 16 };
 
 /* linear-gradient() and radial-gradient(): colour stops along a line, or out from a centre */
 #define GRAD_MAX 8
@@ -1228,6 +1239,9 @@ typedef struct style {
     bool before_generated, after_generated; /* computed pseudo bodies need not generate boxes */
     bool explicit_inherit; /* some property that is not inherited took its parent's value */
     struct custom_prop *vars;
+    /* where vars reaches the inherited chain: the entries before it are the element's own (a registered
+       property that does not inherit takes only those, else its initial value) */
+    const struct custom_prop *vars_inherited;
     struct style *before, *after, *backdrop, *placeholder;
     struct style *marker; /* a list item's ::marker with declarations of its own; NULL: css_style_marker() */
 } style_t;
@@ -1350,11 +1364,14 @@ struct css_rule_info {
 #define CSS_NESTED_DECLARATIONS_MARKER "@-nocturne-nested-declarations"
 
 /* the document's styling state */
+struct css_script_registration;
 struct styling {
     pvec sheets;   /* sheet_t*, in cascade order */
     css_ctx *ctx;  /* the sheets' rule indexes bound for the current viewport */
     int index_w, index_h;
     bool index_dirty, index_scripting, index_quirks;
+    /* css-properties-values-api-1 [[registeredPropertySet]]: CSS.registerProperty()'s, newest first */
+    struct css_script_registration *registered;
 };
 
 /* imports: receives struct css_import* for each @import, to be fetched and added with their order */
@@ -1475,11 +1492,55 @@ void css_styles_release(web_doc *d);
 bool css_restyled(const node_t *n);
 bool css_style_layout_equal(const style_t *a, const style_t *b);
 const struct custom_prop *css_custom_property(const style_t *s, const char *name); /* computed --name, or NULL */
+/* ---- registered custom properties (css-properties-values-api-1). cssprop.c reads a registration's
+   syntax string (§5) and computes a value against it (§2.4); css.c owns the document's registrations:
+   CSS.registerProperty()'s, else the last valid @property of the active sheets (§2.1) */
+enum { CSS_SYNTAX_IDENT, CSS_SYNTAX_ANGLE, CSS_SYNTAX_COLOR, CSS_SYNTAX_CUSTOM_IDENT, CSS_SYNTAX_IMAGE,
+       CSS_SYNTAX_INTEGER, CSS_SYNTAX_LENGTH, CSS_SYNTAX_LENGTH_PERCENTAGE, CSS_SYNTAX_NUMBER,
+       CSS_SYNTAX_PERCENTAGE, CSS_SYNTAX_RESOLUTION, CSS_SYNTAX_STRING, CSS_SYNTAX_TIME,
+       CSS_SYNTAX_TRANSFORM_FUNCTION, CSS_SYNTAX_TRANSFORM_LIST, CSS_SYNTAX_URL, CSS_SYNTAX_TYPES };
+struct css_syntax_component { uint8_t type; char multiplier; const char *ident; /* IDENT: unescaped */ };
+struct css_syntax { unsigned count; struct css_syntax_component component[]; }; /* count 0: universal */
+/* §5.4.2 consume a syntax definition: one block from a (NULL: malloc, free()), NULL on failure */
+struct css_syntax *css_syntax_parse(const char *s, size_t n, arena_t *a);
+bool css_syntax_text(const struct css_syntax *syn, sbuf *out);
+/* a component's data type name as the syntax writes it ("<length>"), or an ident component's ident */
+const char *css_syntax_type_name(const struct css_syntax_component *c);
+/* what a value's computed value depends on, read from its units, keywords and functions */
+enum { CSS_SYNTAX_DEP_FONT = 1, CSS_SYNTAX_DEP_ROOT_FONT = 2, CSS_SYNTAX_DEP_LINE_HEIGHT = 4, CSS_SYNTAX_DEP_COLOR = 8,
+       CSS_SYNTAX_DEP_SCHEME = 16, CSS_SYNTAX_DEP_CONTAINER = 32, CSS_SYNTAX_DEP_TREE = 64, CSS_SYNTAX_DEP_VIEWPORT = 128,
+       CSS_SYNTAX_DEP_REFERENCE = 256 };
+unsigned css_syntax_dependencies(const char *s, size_t n);
+/* v (var() already substituted) against syn: the index of the component it matched (§5.3: the first
+   that does), -1 none. out (NULL: only match) gets its computed value's text; cx is the element (em
+   its font size); current is what currentcolor is (NULL keeps it, *deps gets CSS_SYNTAX_DEP_COLOR);
+   base resolves a <url> */
+int css_syntax_compute(const struct css_syntax *syn, const char *v, size_t n, struct cx *cx, const char *base,
+                       const struct css_color *current, sbuf *out, unsigned *deps);
+struct css_registration {
+    const char *name;
+    const struct css_syntax *syntax;
+    bool inherits;
+    const char *initial; /* the computed initial value; NULL: the guaranteed-invalid value */
+};
+/* the registration of a custom property name (NULL: none); its records live until the next cascade */
+const struct css_registration *css_registration(web_doc *d, const char *name, size_t n);
+/* §4.1 registerProperty(): CSS_REGISTER_SYNTAX is a SyntaxError, DUPLICATE an InvalidModificationError */
+enum { CSS_REGISTER_OK, CSS_REGISTER_SYNTAX, CSS_REGISTER_DUPLICATE, CSS_REGISTER_MEMORY };
+int css_register_property(web_doc *d, const char *name, const char *syntax, bool inherits, const char *initial);
+/* st's computed value of a custom property, its registration's rules applied (NULL: guaranteed-invalid) */
+const char *css_custom_value(web_doc *d, const style_t *st, const char *name);
+/* each custom property st has a computed value for, once (each returns false to stop: false) */
+bool css_custom_values(web_doc *d, const style_t *st, bool (*each)(void *arg, const char *name, const char *value),
+                       void *arg);
+/* the syntax component a registered property's computed value matches (CSS Typed OM reifies it by that
+   component's type, css-properties-values-api-1 §6.2); NULL: unregistered or universal, or no match */
+const struct css_syntax_component *css_custom_component(web_doc *d, const char *name, const char *value);
 void css_box_change_report(web_doc *d); /* debug_js only */
 /* An animation sample changes the element's own values only: restyle it, not what selectors match. */
 void css_mark_style_own(web_doc *d, node_t *n);
 /* v with var() and env() substituted against st's custom properties; false: invalid at computed-value time */
-bool css_substitute(const style_t *st, const char *v, sbuf *out);
+bool css_substitute(web_doc *d, const style_t *st, node_t *node, const char *v, sbuf *out); /* node: what attr() reads */
 bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* css-easing-1 §2: the output progress for input x; before: the before flag of step easing */
 double css_easing_apply(const struct css_easing *e, double x, bool before);
@@ -1493,6 +1554,7 @@ bool css_motion_equal(const struct css_motion *a, const struct css_motion *b);
 /* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
 bool css_media_evaluate(const char *query, int vw, int vh, bool scripting, char *out, size_t cap);
 void css_styling_free(struct styling *st);
+void css_registrations_free(struct styling *st); /* at the document's end only */
 /* Around a rescan's rebuild of st->sheets: true when it rebuilt the list the
    rule bindings came from, which then stay, with the styles computed from them. */
 void css_sheets_rescan(struct styling *st);
@@ -1584,6 +1646,19 @@ bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const s
 /* value added (or accumulated) onto underlying; false: the type is not additive (value replaces) */
 bool css_anim_compose(const struct css_anim_ctx *c, const struct propdef *p, const style_t *underlying,
                       const style_t *value, bool accumulate, sbuf *out);
+/* css-properties-values-api-1 §2.5, a custom property: by computed value, as the type its values parsed
+   as against syn (cssprop.c); false: discrete (unregistered, the universal syntax, a type that does not
+   interpolate, or lists of different lengths) */
+bool css_custom_interpolate(const struct css_anim_ctx *c, const struct css_syntax *syn, const char *a, const char *b, double t,
+                            sbuf *out);
+bool css_custom_compose(const struct css_anim_ctx *c, const struct css_syntax *syn, const char *underlying, const char *value,
+                        bool accumulate, sbuf *out);
+/* the cascade's (css.c): a registered custom property's typed syntax, NULL when its values animate
+   discretely; a keyframe value of custom property name at a site, its var() and attr() substituted against
+   the base style, a CSS-wide keyword defaulted and a registered one computed: 1 the computed value into
+   out, 0 the guaranteed-invalid value, -1 no value (invalid: no keyframe) */
+const struct css_syntax *css_custom_syntax(web_doc *d, const char *name);
+int css_custom_animation_value(const struct css_anim_ctx *c, const char *name, const char *text, sbuf *out);
 const struct propdef *css_prop_at(int index);
 /* animation.c, the one time model (animation.h), as the cascade sees it. A site is one element or
    one of its pseudo-elements in one cascade. */
@@ -1595,7 +1670,13 @@ struct web_motion_site {
        keyframes' default); NULL: there is no such rule */
     const struct web_keyframe *(*keyframes)(void *arg, const char *name, const struct css_easing *easing, uint32_t *count);
     void (*emit)(void *arg, const struct propdef *p, const char *value); /* one longhand's sampled value */
+    /* one custom property's sampled computed value; NULL: the guaranteed-invalid value */
+    void (*emit_custom)(void *arg, const char *name, const char *value);
     void *arg;
+    /* the custom properties the animation origin set (web_motion_sample fills them, in ctx.a): the
+       transition origin leaves them alone, as it does the animated longhands */
+    const char **animated_customs;
+    uint32_t nanimated_customs;
 };
 /* 1: animations may apply or update (animation-name, owned CSS animations, script effects);
    2: transitions may (transition durations, owned transitions). base NULL: the records only. */
@@ -1632,6 +1713,8 @@ struct cx {
     uint8_t anchor_depth;     /* the anchor functions' fallbacks the length being parsed is in */
     css_longhand_record *record; /* when set: each longhand a shorthand gives a value, by name, with its text */
     void *record_opaque;
+    bool tree_mismatch;       /* the declaration is from an outer tree than node's (css-values-5 §10: a
+                                 tree-counting function's reference fails to match) */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);

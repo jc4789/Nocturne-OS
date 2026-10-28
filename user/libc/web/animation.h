@@ -28,8 +28,9 @@ struct web_timing {
     struct css_easing easing;
 };
 /* One property value of a keyframe as written (a shorthand stays a shorthand); its
-   longhands, the properties it animates, are computed once. */
-struct web_keyframe_value { const struct propdef *p; char *text; uint16_t *longhands; uint16_t nlonghands; };
+   longhands, the properties it animates, are computed once. A custom property's has no propdef
+   (p NULL) but its name (css-properties-values-api-1 §2.5: it animates by its computed value). */
+struct web_keyframe_value { const struct propdef *p; char *text; uint16_t *longhands; uint16_t nlonghands; char *name; };
 struct web_keyframe {
     double offset, computed; /* offset NAN: null (computed spaces it) */
     struct css_easing easing;
@@ -41,6 +42,8 @@ struct web_keyframes {
     uint32_t count;
     struct web_keyframe *v;
     uint8_t *properties;     /* css_prop_count() flags: the longhands any keyframe sets */
+    char **customs;          /* the custom properties any keyframe sets, each once */
+    uint32_t ncustoms;
     struct web_keyframes *garbage_next;
 };
 struct web_effect {
@@ -82,7 +85,7 @@ struct web_animation {
     bool css_paused;                   /* animation-play-state was paused at the last update */
     bool disowned;                     /* style canceled it: no longer owned, the element kept for the cancel event */
     double cancel_elapsed;             /* the active time at the cancel (fill both), for its CSS event */
-    const struct propdef *property;    /* CSSTransition */
+    const struct propdef *property;    /* CSSTransition; NULL for a custom property's (name is it) */
     char *to, *reversing_from;         /* end value, reversing-adjusted start value */
     double shortening;
     uint64_t generation;               /* transition generation */

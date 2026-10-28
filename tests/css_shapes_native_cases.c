@@ -38,6 +38,8 @@
 
 /* reached only from properties these requests do not set */
 bool web_native_checkpoint(web_doc *d) { (void)d; return true; }
+/* web_url.c's, reached only from a registered <url> custom property (cssprop.c's syn_url_text) */
+int web_resolve_url_owned(const char *base, const char *rel, char **out) { (void)base; (void)rel; (void)out; abort(); }
 #ifndef CSS_BLOCK /* css.c's */
 bool css_valid_declaration(const char *p, size_t pn, const char *v, size_t vn) { (void)p; (void)pn; (void)v; (void)vn; return false; }
 bool css_container_names_valid(const char *s, size_t n) { (void)s; (void)n; return false; }

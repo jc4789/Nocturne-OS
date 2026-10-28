@@ -116,6 +116,7 @@ struct decl {
     const struct propdef *p; /* NULL: a custom property */
     const char *name;        /* custom properties */
     const char *value;
+    const char *base;        /* custom properties: the declaring sheet's URL (a registered <url> resolves against it) */
     bool important;
 };
 
@@ -293,11 +294,21 @@ struct position_try_rule {
     int count;
 };
 
+/* @property (css-properties-values-api-1 §3): a valid rule's registration as declared */
+struct property_rule {
+    struct property_rule *next;
+    const char *name, *syntax, *initial; /* syntax unescaped; initial NULL when absent */
+    const char *base;
+    bool inherits;
+    const struct mcond *media;
+};
+
 struct sheet {
     struct rule *first, *last;
     struct font_face *fonts,*fonts_last;
     struct opacity_keyframes *motions, *motions_last;
     struct position_try_rule *position_tries, *position_tries_last;
+    struct property_rule *properties, *properties_last;
     double order;
     bool ua;
     node_t *scope; /* NULL: document author sheet; otherwise its shadow root */
@@ -2687,6 +2698,15 @@ static bool supports_vars(arena_t *a, const char *s, const char *e, bool *has) {
                     continue;
                 }
                 if (!strcmp(name, "env")) return false;
+                if (!strcmp(name, "attr")) {
+                    /* css-values-5 §8.7: attr( <declaration-value>, <declaration-value>? ) makes the
+                       declaration valid at parse time; its arguments are component values */
+                    const char *comma = supports_delim(s + 1, end, ",");
+                    if (skip_ws(s + 1, comma) == comma) return false;
+                    *has = true;
+                    s++;
+                    continue;
+                }
                 if (!strcmp(name, "var")) {
                     const char *comma = supports_delim(s + 1, end, ",");
                     const char *p = skip_ws(s + 1, comma), *pe = comma;
@@ -3599,6 +3619,7 @@ static struct decl *parse_decl(struct pctx *pc, const char *s, const char *e, st
     if (namelen > 2 && name[0] == '-' && name[1] == '-') {
         d->name = ar_strndup(pc->a, name, namelen);
         d->value = ar_strndup(pc->a, v, vn);
+        d->base = pc->base;
         return d;
     }
     d->p = css_prop_lookup(name, namelen);
@@ -4495,28 +4516,104 @@ static bool cssom_margin_name(const char *name) {
         "left-top","left-middle","left-bottom","right-top","right-middle","right-bottom",NULL};
     return name && cssom_keyword(name,boxes);
 }
-/* the value of a descriptor in a declaration list, or NULL */
+/* the value of a descriptor in a declaration list (the last one), false if there is none; an empty
+   value is one (initial-value: ; is the empty value of a universal syntax, csswg-drafts#9078) */
 static bool cssom_descriptor(const char *s,const char *e,const char *name,const char **vs,const char **ve) {
     bool found=false;size_t n=strlen(name);
     while(s<e) {
         const char *end=scan_to(s,e,";"),*colon=scan_to(s,end,":"),*a=skip_ws(s,colon),*z=colon;trim_r(a,&z);
         if(colon<end && (size_t)(z-a)==n && strn_ieq(a,name,n)) {
-            *vs=skip_ws(colon+1,end);*ve=end;trim_r(*vs,ve);found=*vs<*ve;
+            *vs=skip_ws(colon+1,end);*ve=end;trim_r(*vs,ve);found=true;
         }
         s=end<e?end+1:e;
     }
     return found;
 }
-/* css-properties-values-api: syntax and inherits are required, and so is
-   initial-value unless the syntax is the universal one. */
-static bool cssom_property_rule(struct pctx *pc,const char *qs,const char *qe,const char *s,const char *e) {
+enum { SYNTAX_NOT_INDEPENDENT = CSS_SYNTAX_DEP_FONT | CSS_SYNTAX_DEP_ROOT_FONT | CSS_SYNTAX_DEP_LINE_HEIGHT |
+       CSS_SYNTAX_DEP_COLOR | CSS_SYNTAX_DEP_CONTAINER | CSS_SYNTAX_DEP_TREE | CSS_SYNTAX_DEP_REFERENCE };
+/* a registration's initial value computed against a viewport (§3.3, §4.1 steps 5-6): it parses against
+   the syntax and is computationally independent (§4.1: only the property's own value and what CSS cannot
+   change: no font-relative, root or container length, no currentcolor, no var() or attr()). A universal
+   syntax takes any token stream, or none at all (the guaranteed-invalid value). */
+static bool registration_initial(const struct css_syntax *syn, const char *text, int vw, int vh, const char *base,
+                                 arena_t *a, const char **out) {
+    *out = NULL;
+    if (!text) return !syn->count;
+    const char *v = text, *end = text + strlen(text);
+    v = skip_ws(v, end);
+    trim_r(v, &end);
+    size_t n = (size_t)(end - v);
+    if (css_syntax_dependencies(v, n) & SYNTAX_NOT_INDEPENDENT) return false;
+    /* a CSS-wide keyword defaults through the cascade (the parent, other origins and layers, or the very
+       initial value being defined): not computationally independent */
+    for (const char *const *k = css_wide; *k; k++)
+        if (strcmp(*k, "default") && strn_ieq(v, *k, n)) return false; /* default is only reserved */
+    if (!syn->count) {
+        if (!css_valid_declaration("--x", 3, v, n)) return false;
+        *out = ar_strndup(a, v, n);
+        return true;
+    }
+    style_t st;
+    css_style_init(&st, NULL);
+    struct cx cx = {.s = &st, .em = 16, .rem = 16, .vw = (float)vw, .vh = (float)vh, .a = a,
+                    .set = ar_alloc(a, (size_t)css_prop_count())};
+    sbuf b = {0};
+    unsigned deps = 0;
+    bool ok = css_syntax_compute(syn, v, n, &cx, base, NULL, &b, &deps) >= 0 && !(deps & CSS_SYNTAX_DEP_COLOR);
+    if (ok) *out = ar_strndup(a, b.p ? b.p : "", b.n);
+    sb_free(&b);
+    return ok;
+}
+static bool registration_valid(const char *syntax, const char *initial, const char *base) {
+    struct css_syntax *syn = css_syntax_parse(syntax, strlen(syntax), NULL);
+    if (!syn) return false;
+    arena_t *a = calloc(1, sizeof *a);
+    volatile bool ok = false;
+    if (a) {
+        jmp_buf trap;
+        a->trap = &trap;
+        a->chunk_size = 1024;
+        const char *computed;
+        if (!setjmp(trap)) ok = registration_initial(syn, initial, 800, 600, base, a, &computed);
+        ar_free(a);
+        free(a);
+    }
+    free(syn);
+    return ok;
+}
+/* css-properties-values-api-1 §3: an @property rule's registration. syntax (a string) and inherits are
+   required, and so is initial-value unless the syntax is the universal one (§3.1-3.3, as WPT and the
+   engines read the descriptors); the initial value parses against the syntax and is computationally
+   independent (§3.3). A rule that is not valid is not a rule (§3: the CSSOM drops it too). */
+static bool property_descriptors(struct pctx *pc,const char *s,const char *e,struct property_rule *out) {
     const char *vs,*ve;
-    if(!cssom_dashed_ident(pc,qs,qe) || !cssom_descriptor(s,e,"inherits",&vs,&ve) ||
-       !((ve-vs==4&&strn_ieq(vs,"true",4)) || (ve-vs==5&&strn_ieq(vs,"false",5))) ||
-       !cssom_descriptor(s,e,"syntax",&vs,&ve) || !cssom_string(vs,ve))return false;
-    const char *a=skip_ws(vs+1,ve-1),*z=ve-1;trim_r(a,&z);
-    if(z-a==1 && *a=='*')return true;
-    return cssom_descriptor(s,e,"initial-value",&vs,&ve);
+    if(!cssom_descriptor(s,e,"inherits",&vs,&ve))return false;
+    if(ve-vs==4&&strn_ieq(vs,"true",4))out->inherits=true;
+    else if(ve-vs==5&&strn_ieq(vs,"false",5))out->inherits=false;
+    else return false;
+    if(!cssom_descriptor(s,e,"syntax",&vs,&ve) || !cssom_string(vs,ve))return false;
+    sbuf text={0};
+    css_unescape(&text,vs+1,(size_t)(ve-vs-2));
+    out->syntax=ar_strndup(pc->a,text.p?text.p:"",text.n);
+    sb_free(&text);
+    out->initial=cssom_descriptor(s,e,"initial-value",&vs,&ve)?ar_strndup(pc->a,vs,(size_t)(ve-vs)):NULL;
+    out->base=pc->base;
+    return registration_valid(out->syntax,out->initial,out->base);
+}
+static bool cssom_property_rule(struct pctx *pc,const char *qs,const char *qe,const char *s,const char *e) {
+    struct property_rule rule={0};
+    return cssom_dashed_ident(pc,qs,qe) && property_descriptors(pc,s,e,&rule);
+}
+/* a valid rule, in the sheet's order, for the document's registrations (build_ctx) */
+static void parse_property_rule(struct pctx *pc,const char *qs,const char *qe,const char *s,const char *e,
+                                const struct mcond *media) {
+    const char *cursor=qs,*name=qe-qs>2&&qs[0]=='-'&&qs[1]=='-'?read_ident(pc->a,&cursor,qe,false):NULL;
+    if(!name || skip_ws(cursor,qe)!=qe)return;
+    struct property_rule *rule=ar_alloc(pc->a,sizeof *rule);
+    if(!property_descriptors(pc,s,e,rule))return;
+    rule->name=name;rule->media=media;
+    if(pc->sh->properties_last)pc->sh->properties_last->next=rule;else pc->sh->properties=rule;
+    pc->sh->properties_last=rule;
 }
 static void cssom_keyframe_rules(struct pctx *pc,const char *s,const char *e) {
     while((s=skip_ws(s,e))<e) {
@@ -4743,6 +4840,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                     if (info) cssom_keyframe_rules(pc,bs,be);
                 }
                 else if (!strcmp(name, "position-try")) parse_position_try(pc, qs, qe, bs, be, media);
+                else if (!strcmp(name, "property")) parse_property_rule(pc, qs, qe, bs, be, media);
                 else if (!strcmp(name,"media") || !strcmp(name,"container")) {
                     const struct mcond *mc=parse_condition(pc,qs,qe,media,!strcmp(name,"container"));
                     parse_rules(pc,bs,be,mc);
@@ -4763,7 +4861,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                 } else if (info && kind == CSS_RULE_STARTING_STYLE) {
                     parse_rules(pc, bs, be, cssom_inert(pc, media));
                 } else if (info && kind == CSS_RULE_PAGE) cssom_page_rules(pc, bs, be);
-                /* @page, @property, @counter-style ... have no cascade effect yet */
+                /* @page, @counter-style ... have no cascade effect yet */
             }
             pc->cssom_parent = outer;
             s = end;
@@ -4864,7 +4962,8 @@ static uint64_t sheet_serials;
 /* context: the sheet the text's rules are parsed for (css_parse_cssom_rules) */
 static sheet_t *parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports,
                             bool cssom_tree, const uint32_t *markers, uint32_t nmarkers, sheet_t *context) {
-    struct pctx pc = {.a = a, .base = base_url, .imports = imports, .import_allowed = !context,
+    /* the sheet keeps its URL: custom property declarations resolve registered <url>s against it */
+    struct pctx pc = {.a = a, .base = base_url ? ar_strdup(a, base_url) : NULL, .imports = imports, .import_allowed = !context,
                       .namespace_allowed = !context, .cssom_tree = cssom_tree,
                       .cssom_markers = markers, .cssom_nmarkers = nmarkers};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
@@ -5385,6 +5484,7 @@ struct css_index {
     struct font_face *fonts;
     struct opacity_keyframes *motions;
     struct position_try_rule *position_tries;
+    struct property_rule *properties;
     uint32_t rules;
     unsigned form_features;
     bool containers, siblings;
@@ -5439,6 +5539,9 @@ struct css_ctx {
     struct layer_sheet_map *layer_sheets[256];
     bool relational, relational_siblings, siblings, parallel_safe, containers;
     unsigned form_features;
+    /* the document's custom property registrations by name (struct registered); NULL: none */
+    struct var_slot *registry;
+    size_t registry_capacity;
 };
 
 /* Custom-property declarations can feed a container unit to an ordinary
@@ -5953,6 +6056,7 @@ static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
     arena_t *a = s->arena;
     struct css_index *index = ar_alloc(a, sizeof *index);
     index->fonts = s->fonts; index->motions = s->motions; index->position_tries = s->position_tries;
+    index->properties = s->properties;
     /* Small component sheets no longer allocate a document-sized hash
        table, nor duplicate selector entries for every adoption. */
     ht_init(a, &index->ids, 64);
@@ -6059,6 +6163,8 @@ static struct sheet_signature sign_sheet(arena_t *a, const pvec *sh, int i) {
                                     sheet_position(sh, s->import_parent), s->import_owner, s->ua};
 }
 
+static void registry_build(web_doc *d, struct css_ctx *x, const struct css_index **sheets, int nsheets, int vw, int vh,
+                           bool scripting);
 /* The bindings of the document's sheets for one viewport. */
 static struct css_ctx *build_ctx(web_doc *d, int vw, int vh) {
     struct css_ctx *x = calloc(1, sizeof *x);
@@ -6082,12 +6188,15 @@ static struct css_ctx *build_ctx(web_doc *d, int vw, int vh) {
     layers_build(d,x,vw,vh);
     bool scripting = web_js_enabled(d);
     uint32_t order = 1;
+    const struct css_index **registering = sh->n ? ar_alloc(&x->a, (size_t)sh->n * sizeof *registering) : NULL;
+    int nregistering = 0;
     for (int i = -2; i < sh->n; i++) {
         sheet_t *s = i == -2 ? ua_sheet : i == -1 ? quirks_sheet : sh->v[i];
         if (!sheet_media_ok(s,vw,vh,scripting)) continue;
         if (i == -1 && !d->quirks) continue;
         struct css_index *index = sheet_index(d, s);
         if (!index) return x;
+        if (i >= 0 && index->properties) registering[nregistering++] = index;
         /* Registry identities are published before workers start. Worker
            font selection only reads this list and atomically marks demand. */
         for(struct font_face *font=s->fonts;font;font=font->next)
@@ -6109,6 +6218,7 @@ static struct css_ctx *build_ctx(web_doc *d, int vw, int vh) {
         if (scope->last) scope->last->next = binding; else scope->first = binding;
         scope->last = binding;
     }
+    registry_build(d, x, registering, nregistering, vw, vh, scripting);
     x->complete = !__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE);
     return x;
 }
@@ -7147,6 +7257,141 @@ static void *var_slot_get(const struct var_slot *slots, size_t capacity, const c
     return NULL;
 }
 
+/* ---------------------------------------------------------------- registered custom properties
+   css-properties-values-api-1 §2.1: a document's registration of a name is its [[registeredPropertySet]]
+   record (CSS.registerProperty, kept for the document's life), else the last valid @property in its
+   active sheets in document order, shadow trees' included (§2.8). build_ctx gathers them into the
+   context with the viewport their initial values compute against; a cascade reads them by name. */
+struct registered {
+    struct css_registration r;
+    struct custom_prop initial; /* r.initial as the entry var() and the computed style read */
+};
+struct css_script_registration {
+    struct css_script_registration *next;
+    char *name, *syntax_text, *initial; /* initial: comments removed, escapes canonical, closed at its end */
+    struct css_syntax *syntax;
+    bool inherits;
+};
+static const struct registered *registry_get(const struct css_ctx *x, const char *name, size_t n) {
+    return x && x->registry ? var_slot_get(x->registry, x->registry_capacity, name, n) : NULL;
+}
+const struct css_registration *css_registration(web_doc *d, const char *name, size_t n) {
+    const struct registered *r = d && name ? registry_get(d->sty.ctx, name, n) : NULL;
+    return r ? &r->r : NULL;
+}
+static void registry_put(struct css_ctx *x, const char *name, const struct css_syntax *syntax, bool inherits,
+                         const char *initial, const char *base, int vw, int vh) {
+    if (var_slot_get(x->registry, x->registry_capacity, name, strlen(name))) return; /* an earlier one wins */
+    struct registered *r = ar_alloc(&x->a, sizeof *r);
+    r->r.name = ar_strdup(&x->a, name);
+    r->r.syntax = syntax;
+    r->r.inherits = inherits;
+    if (!registration_initial(syntax, initial, vw, vh, base, &x->a, &r->r.initial)) return;
+    r->initial.name = r->r.name;
+    r->initial.value = r->r.initial;
+    var_slot_put(x->registry, x->registry_capacity, r->r.name, strlen(r->r.name), r);
+}
+static void registry_build(web_doc *d, struct css_ctx *x, const struct css_index **sheets, int nsheets, int vw, int vh,
+                           bool scripting) {
+    size_t count = 0;
+    for (struct css_script_registration *s = d->sty.registered; s; s = s->next) count++;
+    for (int i = 0; i < nsheets; i++)
+        for (const struct property_rule *r = sheets[i]->properties; r; r = r->next) count++;
+    if (!count) return;
+    x->registry_capacity = var_slot_capacity(count);
+    x->registry = ar_alloc(&x->a, x->registry_capacity * sizeof *x->registry);
+    /* the first put of a name is kept: the scripts' first, then the rules from the last back */
+    for (struct css_script_registration *s = d->sty.registered; s; s = s->next)
+        registry_put(x, s->name, s->syntax, s->inherits, s->initial, NULL, vw, vh);
+    const struct property_rule **rules = ar_alloc(&x->a, count * sizeof *rules);
+    size_t n = 0;
+    for (int i = 0; i < nsheets; i++)
+        for (const struct property_rule *r = sheets[i]->properties; r; r = r->next)
+            if (font_conditions_ok(r->media, vw, vh, scripting)) rules[n++] = r;
+    while (n--) {
+        const struct property_rule *r = rules[n];
+        if (var_slot_get(x->registry, x->registry_capacity, r->name, strlen(r->name))) continue;
+        struct css_syntax *syntax = css_syntax_parse(r->syntax, strlen(r->syntax), &x->a);
+        if (syntax) registry_put(x, r->name, syntax, r->inherits, r->initial, r->base, vw, vh);
+    }
+}
+/* text as a whole value: its comments removed, its escapes canonical and what it leaves open closed at its
+   end (css-syntax-3: an EOF ends a string or a block) */
+static char *registration_text(const char *text) {
+    size_t n;
+    char *stripped = css_preprocess(text, strlen(text), &n);
+    if (!stripped) return NULL;
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    char *volatile out = NULL;
+    if (!setjmp(trap)) {
+        size_t cn;
+        const char *v = css_value_canonical(&a, stripped, n, &cn);
+        sbuf b = {0}, closers = {0};
+        char quote = 0;
+        for (size_t i = 0; i < cn; i++) {
+            char c = v[i];
+            if (c == '\\' && i + 1 < cn) { i++; continue; }
+            if (quote) { if (c == quote) quote = 0; continue; }
+            if (c == '"' || c == '\'') quote = c;
+            else if (c == '(' || c == '[' || c == '{') sb_putc(&closers, c == '(' ? ')' : c == '[' ? ']' : '}');
+            else if ((c == ')' || c == ']' || c == '}') && closers.n && closers.p[closers.n - 1] == c) closers.n--;
+        }
+        sb_put(&b, v, cn);
+        if (quote) sb_putc(&b, quote);
+        while (closers.n) sb_putc(&b, closers.p[--closers.n]);
+        out = malloc(b.n + 1);
+        if (out) { memcpy(out, b.p ? b.p : "", b.n); out[b.n] = 0; }
+        sb_free(&b);
+        sb_free(&closers);
+    }
+    ar_free(&a);
+    free(stripped);
+    return out;
+}
+/* §4.1 registerProperty(): the name is a custom property name, not registered by script already; the
+   syntax parses; an initial value is given unless the syntax is universal, and it parses against the
+   syntax and is computationally independent */
+int css_register_property(web_doc *d, const char *name, const char *syntax, bool inherits, const char *initial) {
+    if (!d || !name || !syntax) return CSS_REGISTER_SYNTAX;
+    if (strlen(name) <= 2 || name[0] != '-' || name[1] != '-') return CSS_REGISTER_SYNTAX;
+    for (struct css_script_registration *s = d->sty.registered; s; s = s->next)
+        if (!strcmp(s->name, name)) return CSS_REGISTER_DUPLICATE;
+    struct css_syntax *parsed = css_syntax_parse(syntax, strlen(syntax), NULL);
+    if (!parsed) return CSS_REGISTER_SYNTAX;
+    char *text = initial ? registration_text(initial) : NULL;
+    if (initial && !text) { free(parsed); return CSS_REGISTER_MEMORY; }
+    struct css_script_registration *r = calloc(1, sizeof *r);
+    if (r) { r->name = strdup(name); r->syntax_text = strdup(syntax); }
+    if (!r || !r->name || !r->syntax_text) {
+        if (r) { free(r->name); free(r->syntax_text); free(r); }
+        free(parsed); free(text);
+        return CSS_REGISTER_MEMORY;
+    }
+    if (!registration_valid(syntax, text, NULL)) {
+        free(r->name); free(r->syntax_text); free(r); free(parsed); free(text);
+        return CSS_REGISTER_SYNTAX;
+    }
+    r->syntax = parsed;
+    r->initial = text;
+    r->inherits = inherits;
+    r->next = d->sty.registered;
+    d->sty.registered = r;
+    /* every element's values of the name may change (§2.4): the registrations are the context's */
+    d->sty.index_dirty = true;
+    css_mark_dirty(d, NULL);
+    return CSS_REGISTER_OK;
+}
+/* the document's end: its [[registeredPropertySet]] outlives sheet invalidation (css_styling_free) */
+void css_registrations_free(struct styling *st) {
+    while (st->registered) {
+        struct css_script_registration *r = st->registered;
+        st->registered = r->next;
+        free(r->name); free(r->syntax_text); free(r->initial); free(r->syntax); free(r);
+    }
+}
+
 /* The chain is one segment per declaring ancestor, nearest first. Indexed
    segments are immutable once published, so workers share them unlocked. */
 static const struct custom_prop *find_var(const struct custom_prop *v, const char *name, size_t n) {
@@ -7164,6 +7409,82 @@ static const struct custom_prop *find_var(const struct custom_prop *v, const cha
 }
 const struct custom_prop *css_custom_property(const style_t *s, const char *name) {
     return s && name ? find_var(s->vars, name, strlen(name)) : NULL;
+}
+/* the element's own entry of a name: the entries before own_end (one segment indexes them all) */
+static const struct custom_prop *own_find(const struct custom_prop *vars, const struct custom_prop *own_end,
+                                          const char *name, size_t n) {
+    if (!vars || vars == own_end) return NULL;
+    if (vars->segment) return var_slot_get(vars->segment->slots, vars->segment->capacity, name, n);
+    for (const struct custom_prop *v = vars; v && v != own_end; v = v->next)
+        if (strlen(v->name) == n && !memcmp(v->name, name, n)) return v;
+    return NULL;
+}
+/* a name's computed value on an element whose chain is vars (own_end: where its own entries end), its
+   registration applied (§2.1, §2.4): a registered property that does not inherit takes the element's
+   own value only, and a registered one without a value has its initial value */
+static const struct custom_prop *custom_find(const struct css_ctx *x, const struct custom_prop *vars,
+                                             const struct custom_prop *own_end, const char *name, size_t n) {
+    const struct registered *reg = registry_get(x, name, n);
+    const struct custom_prop *found = reg && !reg->r.inherits ? own_find(vars, own_end, name, n) : find_var(vars, name, n);
+    return found ? found : reg ? &reg->initial : NULL;
+}
+const char *css_custom_value(web_doc *d, const style_t *st, const char *name) {
+    if (!st || !name) return NULL;
+    const struct custom_prop *p = custom_find(d ? d->sty.ctx : NULL, st->vars, st->vars_inherited, name, strlen(name));
+    return p ? p->value : NULL;
+}
+bool css_custom_values(web_doc *d, const style_t *st, bool (*each)(void *arg, const char *name, const char *value),
+                       void *arg) {
+    const struct css_ctx *x = d ? d->sty.ctx : NULL;
+    size_t count = 0;
+    for (const struct custom_prop *p = st ? st->vars : NULL; p; p = p->next) count++;
+    size_t capacity = var_slot_capacity(count + 1);
+    struct var_slot *seen = calloc(capacity, sizeof *seen);
+    if (!seen) return false;
+    bool own = true, ok = true;
+    for (const struct custom_prop *p = st ? st->vars : NULL; p && ok; p = p->next) {
+        if (p == st->vars_inherited) own = false;
+        size_t n = strlen(p->name);
+        if (var_slot_get(seen, capacity, p->name, n)) continue;
+        var_slot_put(seen, capacity, p->name, n, (void *)p);
+        const struct registered *reg = registry_get(x, p->name, n);
+        if (reg && !reg->r.inherits && !own) continue; /* its initial value, below */
+        ok = each(arg, p->name, p->value);
+    }
+    /* the registered properties the element has no entry of take their initial values */
+    if (ok && x && x->registry)
+        for (size_t i = 0; i < x->registry_capacity && ok; i++) {
+            const struct registered *reg = x->registry[i].value;
+            if (!reg) continue;
+            const struct custom_prop *p = var_slot_get(seen, capacity, reg->r.name, strlen(reg->r.name));
+            bool own_entry = p && (!st || own_find(st->vars, st->vars_inherited, reg->r.name, strlen(reg->r.name)));
+            if ((p && (reg->r.inherits || own_entry)) || !reg->r.initial) continue;
+            ok = each(arg, reg->r.name, reg->r.initial);
+        }
+    free(seen);
+    return ok;
+}
+/* a computed value is its own computed value (canonical units, resolved colours and URLs), so it matches
+   the component its specified value matched: the first one that takes it (§5.3) */
+const struct css_syntax_component *css_custom_component(web_doc *d, const char *name, const char *value) {
+    const struct registered *reg = d && name && value ? registry_get(d->sty.ctx, name, strlen(name)) : NULL;
+    if (!reg || !reg->r.syntax->count) return NULL;
+    arena_t *a = calloc(1, sizeof *a);
+    if (!a) return NULL;
+    volatile int k = -1;
+    jmp_buf trap;
+    a->trap = &trap;
+    a->chunk_size = 1024;
+    if (!setjmp(trap)) {
+        style_t st;
+        css_style_init(&st, NULL);
+        struct cx cx = {.s = &st, .em = 16, .rem = 16, .vw = 800, .vh = 600, .a = a,
+                        .set = ar_alloc(a, (size_t)css_prop_count())};
+        k = css_syntax_compute(reg->r.syntax, value, strlen(value), &cx, NULL, NULL, NULL, NULL);
+    }
+    ar_free(a);
+    free(a);
+    return k >= 0 ? &reg->r.syntax->component[k] : NULL;
 }
 
 static bool subst_put(sbuf *b, const char *s, size_t n) {
@@ -7188,20 +7509,356 @@ struct subst_walk {
     const struct custom_prop *property;
     const char *s;
     size_t n, i;
+    size_t start;  /* where its text began in the output */
+    bool tainted;  /* it is an attr()-tainted value: the whole of what it puts is */
+    /* lazy: property's computed value, computed here because a var() reached it before its turn
+       (CUSTOM_LAZY; css-values-5 §8.6 replace a var() function), with that var()'s fallback and
+       whether the substitution around it was tainted before */
+    bool lazy, outer_tainted, has_fallback;
+    bool invalid; /* a function of its text was the guaranteed-invalid value: so is the whole text */
+    const char *fallback;
+    size_t fallback_n;
 };
 
-/* No C recursion: real allocation/output overflow bounds expansion. Cyclic
-   computed custom properties are represented by NULL, distinct from an empty
-   but valid value; a defensive active-property check also protects raw callers. */
-static bool subst(const char *s, size_t n, const struct custom_prop *vars, sbuf *out) {
+/* What one substitution of arbitrary substitution functions (css-values-5 §8.6: var(), attr(), env())
+   reads and finds. mode: DEFER, a custom property that waits for the early properties makes the value
+   wait (the cascade computes it after them); EARLY, the value is an early property's, so such a reference
+   is a cycle through the font size (css-properties-values-api-1 §2.7.1). */
+enum { SUBST_PLAIN, SUBST_DEFER, SUBST_EARLY };
+struct subst_taint { size_t (*range)[2]; size_t n, cap; bool all; };
+/* a substitution context «attribute, name» (§8.6): marked cyclic when it is guarded again inside itself;
+   walk: where the substitution that entered it was, whose «property» contexts are still guarded */
+struct subst_walk;
+struct attr_context { const char *name; struct attr_context *parent; const struct subst_walk *walk; bool cyclic; };
+struct subst_env {
+    const struct css_ctx *x;                 /* the registrations; NULL: none */
+    const struct custom_prop *vars, *own;    /* the chain var() reads; where the element's own entries end */
+    node_t *node;                            /* the element attr() reads (a pseudo-element's originating one) */
+    struct cx *cx;                           /* attr()'s type() parses against it (NULL: a probe) */
+    struct attr_context *attrs;              /* «attribute, name» substitution contexts being substituted */
+    const struct subst_walk *walk;           /* the walk an attr() is replaced from (subst sets it) */
+    const struct custom_prop *self;          /* «property, name» of the custom property being computed */
+    bool *self_cyclic;                       /* set when a var() inside reaches it again */
+    struct resolve *resolve;                 /* computes a CUSTOM_LAZY entry a var() reaches; NULL: none */
+    struct subst_taint *taint;               /* NULL: whether only (tainted) */
+    uint8_t mode;
+    bool waited, tainted;
+};
+struct resolve;
+static void custom_settle(struct resolve *R, struct custom_prop *p, const char *text, size_t n, bool tainted);
+static void taint_range(struct subst_env *env, size_t a, size_t b) {
+    env->tainted = true;
+    struct subst_taint *t = env->taint;
+    if (!t || a >= b || t->all) return;
+    if (t->n == t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 8;
+        void *r = realloc(t->range, cap * sizeof *t->range);
+        if (!r) { t->all = true; return; } /* every byte counts as tainted then */
+        t->range = r; t->cap = cap;
+    }
+    t->range[t->n][0] = a;
+    t->range[t->n++][1] = b;
+}
+static bool subst(const char *s, size_t n, struct subst_env *env, sbuf *out);
+/* css-syntax-3: s starts with a function token of this name */
+static bool function_at(const char *s, size_t i, size_t n, const char *name, size_t k) {
+    return n - i > k && strn_ieq(s + i, name, k) && s[i + k] == '(' &&
+           (i == 0 || (!ident_char((unsigned char)s[i - 1]) && s[i - 1] != '#' && s[i - 1] != '@' && s[i - 1] != '\\'));
+}
+/* §2.7.1: an early property's declaration references a value that waits for the font size. That value,
+   and the values waiting with it that its var()s reach, are in a cycle with font-size. */
+static void custom_cycle(const struct subst_env *env, const struct custom_prop *start) {
+    struct custom_prop *p = (struct custom_prop *)start; /* waiting entries are the element's own */
+    p->state |= CUSTOM_CYCLE;
+    size_t cap = 8, count = 0;
+    struct custom_prop **stack = malloc(cap * sizeof *stack);
+    if (!stack) return;
+    stack[count++] = p;
+    while (count) {
+        p = stack[--count];
+        const char *s = p->raw ? p->raw : "";
+        size_t n = strlen(s);
+        for (size_t i = 0; i < n; i++) {
+            if (s[i] == '"' || s[i] == '\'') {
+                char q = s[i++];
+                while (i < n && s[i] != q) { if (s[i] == '\\' && i + 1 < n) i++; i++; }
+                continue;
+            }
+            if (!function_at(s, i, n, "var", 3)) continue;
+            const char *a = s + i + 4, *e = s + n, *close = scan_to(a, e, ")"), *comma = scan_to(a, close, ",");
+            const char *ns = skip_ws(a, comma), *ne = comma;
+            trim_r(ns, &ne);
+            struct custom_prop *q = (struct custom_prop *)own_find(env->vars, env->own, ns, (size_t)(ne - ns));
+            if (!q || !(q->state & CUSTOM_PENDING) || (q->state & CUSTOM_CYCLE)) continue;
+            q->state |= CUSTOM_CYCLE;
+            if (count == cap) {
+                struct custom_prop **grown = realloc(stack, cap * 2 * sizeof *stack);
+                if (!grown) continue;
+                stack = grown;
+                cap *= 2;
+            }
+            stack[count++] = q;
+        }
+    }
+    free(stack);
+}
+/* the element's attribute of a name, as an attribute selector matches it (Selectors 4: the name ASCII
+   lowercased on an HTML element in an HTML document; no namespace) */
+static const char *attr_named(const node_t *e, const char *name) {
+    if (!e || e->type != N_ELEM) return NULL;
+    bool html = doc_html_names(e);
+    for (int i = 0; i < e->nattrs; i++) {
+        const struct attr *a = &e->attrs[i];
+        if (a->namespace_uri) continue;
+        const char *local = attr_local(a);
+        /* HTML: a non-HTML element's attribute in an HTML document matches ASCII case-insensitively too */
+        if (html || (e->owner && !e->owner->xml) ? str_ieq(local, name) : !strcmp(local, name))
+            return a->value ? a->value : "";
+    }
+    return NULL;
+}
+/* css-values-5 §8.7 attr( <attr-name> <attr-type>? , <declaration-value>? ): the first argument (its
+   arbitrary substitution functions substituted) as a name and a type */
+enum { ATTR_STRING, ATTR_NUMBER, ATTR_UNIT, ATTR_TYPE };
+struct attr_arguments { const char *name; uint8_t type; bool typed; int unit; const char *unit_name; struct css_syntax *syntax; };
+static bool attr_arguments(arena_t *a, const char *s, const char *e, struct attr_arguments *out) {
+    *out = (struct attr_arguments){0};
+    s = skip_ws(s, e);
+    trim_r(s, &e);
+    const char *p = s;
+    if (p < e && *p == '|') p++; /* [ <ident-token>? '|' ]: the null namespace */
+    const char *name = read_ident(a, &p, e, false);
+    if (!name || !*name || (p < e && *p == '|')) return false; /* a namespace prefix: no @namespace map here */
+    out->name = name;
+    p = skip_ws(p, e);
+    if (p == e) return true;
+    out->typed = true;
+    if (e - p >= 5 && strn_ieq(p, "type(", 5)) {
+        const char *close = scan_to(p + 5, e, ")");
+        if (close >= e || skip_ws(close + 1, e) != e) return false;
+        out->syntax = css_syntax_parse(p + 5, (size_t)(close - p - 5), a);
+        if (!out->syntax) return false;
+        /* <url> is not a <syntax-single-component> here (§8.7.2) */
+        for (unsigned k = 0; k < out->syntax->count; k++) if (out->syntax->component[k].type == CSS_SYNTAX_URL) return false;
+        out->type = ATTR_TYPE;
+        return true;
+    }
+    if (*p == '%' && skip_ws(p + 1, e) == e) { out->type = ATTR_UNIT; out->unit = css_unit_find("%", 1); out->unit_name = "%"; return true; }
+    const char *word = read_ident(a, &p, e, true);
+    if (!word || skip_ws(p, e) != e) return false;
+    if (!strcmp(word, "raw-string")) { out->type = ATTR_STRING; return true; }
+    if (!strcmp(word, "number")) { out->type = ATTR_NUMBER; return true; }
+    /* an <attr-unit> is any <custom-ident>; one that is no unit falls back */
+    out->type = ATTR_UNIT;
+    out->unit = css_unit_find(word, strlen(word));
+    out->unit_name = word;
+    return true;
+}
+/* §8.7.1 replace an attr() function: its value into out (attr()-tainted), or false for the fallback */
+static bool attr_value(struct subst_env *env, const struct attr_arguments *arg, const char *value, sbuf *out) {
+    switch (arg->type) {
+    case ATTR_STRING:
+        css_serialize_string(out, value);
+        return true;
+    case ATTR_NUMBER: case ATTR_UNIT: {
+        const char *v = value, *e = value + strlen(value), *p, *u;
+        while (v < e && is_space((unsigned char)*v)) v++;
+        while (e > v && is_space((unsigned char)e[-1])) e--;
+        double number;
+        size_t un;
+        p = v;
+        if (!css_numeric_token(&p, e, &number, &u, &un) || p != e || un) return false;
+        if (arg->type == ATTR_UNIT) {
+            unsigned kind = css_unit_kind(arg->unit);
+            if (arg->unit < 0 || kind == CSS_CALC_NUMBER || !kind) return false;
+        }
+        sb_put(out, v, (size_t)(e - v));
+        if (arg->type == ATTR_UNIT) sb_puts(out, arg->unit_name);
+        return true;
+    }
+    case ATTR_TYPE: {
+        /* its arbitrary substitution functions, with «attribute, name» the substitution context: one
+           that a nested substitution guarded again is cyclic, and gives the guaranteed-invalid value */
+        struct attr_context here = {arg->name, env->attrs, env->walk, false};
+        struct subst_env inner = *env;
+        inner.attrs = &here;
+        inner.taint = NULL;
+        sbuf text = {0};
+        bool ok = subst(value, strlen(value), &inner, &text) && !here.cyclic;
+        env->waited |= inner.waited;
+        const char *t = text.p ? text.p : "";
+        if (ok && !arg->syntax->count) ok = css_valid_declaration("--x", 3, t, text.n);
+        else if (ok) {
+            arena_t scratch = {.chunk_size = 1024};
+            jmp_buf trap;
+            scratch.trap = &trap;
+            style_t probe_style;
+            volatile bool matched = false;
+            if (!setjmp(trap)) {
+                struct cx probe = {0};
+                if (env->cx) probe = *env->cx;
+                else {
+                    css_style_init(&probe_style, NULL);
+                    probe = (struct cx){.s = &probe_style, .em = 16, .rem = 16, .vw = 800, .vh = 600};
+                }
+                probe.a = &scratch;
+                probe.set = NULL;
+                matched = css_syntax_compute(arg->syntax, t, text.n, &probe, NULL, NULL, NULL, NULL) >= 0;
+            }
+            ar_free(&scratch);
+            ok = matched;
+        }
+        if (ok) sb_put(out, t, text.n);
+        sb_free(&text);
+        return ok;
+    }
+    }
+    return false;
+}
+
+/* the lazy frames of a walk from f up to stop (NULL: to its root) are cyclic */
+static void subst_mark_cyclic(const struct subst_walk *f, const struct subst_walk *stop) {
+    for (; f; f = f->parent) {
+        if (f->lazy) ((struct custom_prop *)f->property)->state |= CUSTOM_CYCLE;
+        if (f == stop) break;
+    }
+}
+/* §8.7.1 replace an attr() function whose arguments are a..close (comma: the first's end): DONE, its
+   value put into out (attr()-tainted); FALLBACK, its fallback is what close has after comma; FAIL, the
+   guaranteed-invalid value */
+enum { ATTR_DONE, ATTR_FALLBACK, ATTR_FAIL };
+static int attr_replace(struct subst_env *env, const char *a, const char *comma, const char *close, sbuf *out) {
+    arena_t scratch = {.chunk_size = 512};
+    jmp_buf trap;
+    scratch.trap = &trap;
+    volatile int result = ATTR_FAIL;
+    sbuf first = {0}, value = {0};
+    if (!setjmp(trap)) {
+        struct subst_env inner = *env;
+        inner.taint = NULL;
+        bool parsed = subst(a, (size_t)(comma - a), &inner, &first);
+        env->waited |= inner.waited;
+        struct attr_arguments arg;
+        if (parsed && attr_arguments(&scratch, first.p ? first.p : "", first.p ? first.p + first.n : "", &arg)) {
+            /* the attribute is already being substituted: guarding «attribute, name» again marks every
+               context of the cycle cyclic, and this attr() fails (§8.6): the «attribute» contexts since
+               that one, and the «property» contexts (lazy frames) of the walks inside it. Only a type()
+               substitutes in the value and guards it; a string, a number or a unit is the value as it
+               is (§8.7.1) */
+            struct attr_context *again = arg.type == ATTR_TYPE ? env->attrs : NULL;
+            while (again && strcmp(again->name, arg.name)) again = again->parent;
+            if (again) subst_mark_cyclic(env->walk, NULL);
+            for (struct attr_context *c = env->attrs; again && c; c = c->parent) {
+                c->cyclic = true;
+                if (c == again) break;
+                subst_mark_cyclic(c->walk, NULL);
+            }
+            const char *attribute = again ? NULL : attr_named(env->node, arg.name);
+            size_t begin = out->n;
+            if (attribute && attr_value(env, &arg, attribute, &value)) {
+                if (subst_put(out, value.p ? value.p : "", value.n)) { taint_range(env, begin, out->n); result = ATTR_DONE; }
+            } else if (comma < close) result = ATTR_FALLBACK;
+            /* FAILURE without a fallback: an empty string when no type was given, else invalid */
+            else if (!arg.typed && subst_put(out, "\"\"", 2)) result = ATTR_DONE;
+        }
+    }
+    sb_free(&first);
+    sb_free(&value);
+    ar_free(&scratch);
+    return result;
+}
+
+/* No C recursion for var(): real allocation/output overflow bounds expansion (attr()'s type() recurses
+   once per distinct attribute, which its substitution contexts bound). Cyclic computed custom properties
+   are represented by NULL, distinct from an empty but valid value; a defensive active-property check also
+   protects raw callers. */
+/* a fallback argument, what follows the comma: a <declaration-value>? of the function's argument
+   grammar, so without the whitespace that separates it from the comma and the closing parenthesis */
+static void fallback(const char *comma, const char *close, const char **text, size_t *length) {
+    const char *t = skip_ws(comma + 1, close), *end = close;
+    trim_r(t, &end);
+    *text = t;
+    *length = (size_t)(end - t);
+}
+/* §8.6: whether «property, q» is guarded: the property being computed, one a lazy frame of this walk
+   computes, or one an enclosing attr() substitution is in. Guarding it again marks it and every
+   context guarded since then cyclic. */
+static bool subst_guarded(struct subst_env *env, const struct subst_walk *f, const struct custom_prop *q) {
+    if (q == env->self) {
+        subst_mark_cyclic(f, NULL);
+        for (struct attr_context *c = env->attrs; c; c = c->parent) { c->cyclic = true; subst_mark_cyclic(c->walk, NULL); }
+        if (env->self_cyclic) *env->self_cyclic = true;
+        return true;
+    }
+    for (const struct subst_walk *p = f; p; p = p->parent)
+        if (p->lazy && p->property == q) { subst_mark_cyclic(f, p); return true; }
+    for (struct attr_context *c = env->attrs; c; c = c->parent)
+        for (const struct subst_walk *p = c->walk; p; p = p->parent)
+            if (p->property == q) {
+                subst_mark_cyclic(f, NULL);
+                for (struct attr_context *m = env->attrs; m; m = m->parent) {
+                    m->cyclic = true;
+                    subst_mark_cyclic(m->walk, m == c ? p : NULL);
+                    if (m == c) break;
+                }
+                return true;
+            }
+    return false;
+}
+/* whether the substitution context that f's text is substituted in is cyclic: the nearest lazy frame's
+   «property», else the innermost «attribute» context of this walk, else the property being computed */
+static bool subst_context_cyclic(const struct subst_env *env, const struct subst_walk *f) {
+    for (; f; f = f->parent)
+        if (f->lazy) return (f->property->state & CUSTOM_CYCLE) != 0;
+    if (env->attrs) return env->attrs->cyclic;
+    if (env->self_cyclic && *env->self_cyclic) return true;
+    return env->self && (env->self->state & CUSTOM_CYCLE);
+}
+/* §8.6 substitute arbitrary substitution functions. Every function of a sequence is replaced, also after
+   one was the guaranteed-invalid value, which makes the sequence the guaranteed-invalid value (f->invalid,
+   carried up to the frame its text is part of): the later ones' contexts are guarded too, and a cycle
+   through them marks every context in it. A var() of an entry not computed yet this round (CUSTOM_LAZY)
+   computes it where it is (a lazy frame): its value substituted, then settled as its computed value. A
+   function whose value is the guaranteed-invalid value substitutes its fallback, unless the context it
+   is substituted in is already cyclic: that is the guaranteed-invalid value whatever the fallback is,
+   which therefore is not substituted (short-circuiting, csswg-drafts#11500). */
+static bool subst(const char *s, size_t n, struct subst_env *env, sbuf *out) {
     size_t original = out->n;
     struct subst_walk *f = calloc(1, sizeof *f);
     if (!f) return false;
-    f->s = s; f->n = n;
+    f->s = s; f->n = n; f->start = out->n;
     bool ok = true;
     while (f) {
         s = f->s; n = f->n; size_t i = f->i;
-        if (i == n) { struct subst_walk *parent = f->parent; free(f); f = parent; continue; }
+        if (i == n) {
+            struct subst_walk *parent = f->parent;
+            if (f->lazy) {
+                /* the entry's computed value, where its var() was */
+                struct custom_prop *p = (struct custom_prop *)f->property;
+                bool inner = env->tainted;
+                env->tainted = f->outer_tainted;
+                if (f->invalid) custom_settle(env->resolve, p, NULL, 0, false);
+                else custom_settle(env->resolve, p, out->p ? out->p + f->start : "", out->n - f->start, inner);
+                out->n = f->start;
+                if (out->p && out->cap > out->n) out->p[out->n] = 0;
+                if (p->state & CUSTOM_PENDING) { env->waited = true; ok = false; break; }
+                if (!p->value) {
+                    /* the guaranteed-invalid value: its var()'s fallback, unless what holds it is cyclic */
+                    if (f->has_fallback && !subst_context_cyclic(env, parent)) {
+                        f->lazy = false; f->property = NULL; f->tainted = false; f->invalid = false;
+                        f->s = f->fallback; f->n = f->fallback_n; f->i = 0; f->start = out->n;
+                        continue;
+                    }
+                    parent->invalid = true;
+                } else if (!subst_put(out, p->value, strlen(p->value))) { ok = false; break; }
+                else if (p->state & CUSTOM_TAINTED) taint_range(env, f->start, out->n);
+            } else if (f->invalid) {
+                if (parent) parent->invalid = true;
+                else ok = false;
+            } else if (f->tainted) taint_range(env, f->start, out->n);
+            free(f); f = parent;
+            continue;
+        }
         if (s[i] == '"' || s[i] == '\'') {
             size_t start = i; char quote = s[i++];
             while (i < n && s[i] != quote) { if (s[i] == '\\' && i + 1 < n) i++; i++; }
@@ -7210,39 +7867,76 @@ static bool subst(const char *s, size_t n, const struct custom_prop *vars, sbuf 
             f->i = i;
             continue;
         }
-        bool token = i == 0 || (!ident_char((unsigned char)s[i-1]) && s[i-1] != '#' && s[i-1] != '@');
-        bool is_var = n - i >= 4 && strn_ieq(s + i, "var(", 4) && token;
-        bool is_env = !is_var && n - i >= 4 && strn_ieq(s + i, "env(", 4) && token;
-        if (!is_var && !is_env) {
+        bool is_var = function_at(s, i, n, "var", 3), is_env = !is_var && function_at(s, i, n, "env", 3);
+        bool is_attr = !is_var && !is_env && function_at(s, i, n, "attr", 4);
+        if (!is_var && !is_env && !is_attr) {
             if (!subst_put(out, s + i, 1)) { ok = false; break; }
             f->i++;
             continue;
         }
-        const char *a = s + i + 4, *e = s + n;
+        const char *a = s + i + (is_attr ? 5 : 4), *e = s + n;
         const char *close = scan_to(a, e, ")");
-        if (close >= e) { ok = false; break; }
+        if (close >= e) { f->invalid = true; f->i = n; continue; }
+        f->i = (size_t)(close + 1 - s); /* what follows the function is substituted next */
         const char *comma = scan_to(a, close, ",");
-        const char *ns = skip_ws(a, comma), *ne = comma;
-        trim_r(ns, &ne);
-        if (is_var && !supports_custom_name(ns, (size_t)(ne-ns))) { ok = false; break; }
-        const struct custom_prop *property = is_var ? find_var(vars, ns, (size_t)(ne - ns)) : NULL;
-        const char *val = property ? property->value : NULL, *text;
+        const char *text;
         size_t length;
-        if (val) {
-            for (struct subst_walk *p = f; p; p = p->parent)
-                if (p->property == property) { ok = false; break; }
-            if (!ok) break;
-            text = val; length = strlen(val);
-        } else if (comma < close) {
-            text = comma + 1; length = (size_t)(close - comma - 1); property = NULL;
-        } else if (is_env) {
-            if (!subst_put(out, "0px", 3)) { ok = false; break; }
-            f->i = (size_t)(close + 1 - s); continue;
-        } else { ok = false; break; }
+        const struct custom_prop *property = NULL;
+        bool tainted = false;
+        if (is_attr) {
+            env->walk = f;
+            int replaced = attr_replace(env, a, comma, close, out);
+            env->walk = NULL;
+            if (env->waited) { ok = false; break; }
+            if (replaced == ATTR_DONE) continue;
+            if (replaced == ATTR_FAIL || subst_context_cyclic(env, f)) { f->invalid = true; continue; }
+            fallback(comma, close, &text, &length);
+        } else {
+            const char *ns = skip_ws(a, comma), *ne = comma;
+            trim_r(ns, &ne);
+            if (is_var && !supports_custom_name(ns, (size_t)(ne-ns))) { f->invalid = true; continue; }
+            property = is_var ? custom_find(env->x, env->vars, env->own, ns, (size_t)(ne - ns)) : NULL;
+            const char *val = property ? property->value : NULL;
+            /* «property, name» guarded again: the guaranteed-invalid value */
+            if (val && subst_guarded(env, f, property)) val = NULL;
+            else if (val && env->resolve && (property->state & CUSTOM_LAZY)) {
+                struct subst_walk *child = calloc(1, sizeof *child);
+                if (!child) { ok = false; break; }
+                ((struct custom_prop *)property)->state &= (uint8_t)~CUSTOM_PENDING;
+                child->parent = f; child->property = property; child->s = val; child->n = strlen(val);
+                child->start = out->n; child->lazy = true; child->outer_tainted = env->tainted;
+                if (comma < close) { child->has_fallback = true; fallback(comma, close, &child->fallback, &child->fallback_n); }
+                env->tainted = false;
+                f = child;
+                continue;
+            } else if (property && (property->state & CUSTOM_PENDING)) {
+                /* it waits for the early properties (§2.7.1) */
+                if (env->mode == SUBST_EARLY) custom_cycle(env, property);
+                else env->waited = true;
+                ok = false;
+                break;
+            } else if (val) {
+                /* a raw value already being substituted (a caller without lazy frames) */
+                const struct subst_walk *p = f;
+                while (p && p->property != property) p = p->parent;
+                if (p) { f->invalid = true; continue; }
+            }
+            if (val) {
+                text = val; length = strlen(val);
+                tainted = (property->state & CUSTOM_TAINTED) != 0; /* §8.7.2: tainted as a whole */
+            } else if (comma < close) {
+                if (subst_context_cyclic(env, f)) { f->invalid = true; continue; }
+                fallback(comma, close, &text, &length); property = NULL;
+            } else if (is_env) {
+                if (!subst_put(out, "0px", 3)) { ok = false; break; }
+                continue;
+            } else { f->invalid = true; continue; }
+        }
         struct subst_walk *child = calloc(1, sizeof *child);
         if (!child) { ok = false; break; }
         child->parent = f; child->property = property; child->s = text; child->n = length;
-        f->i = (size_t)(close + 1 - s); f = child;
+        child->start = out->n; child->tainted = tainted;
+        f = child;
     }
     while (f) { struct subst_walk *parent = f->parent; free(f); f = parent; }
     if (!ok) { out->n = original; if (out->p && out->cap > original) out->p[original] = 0; }
@@ -7254,7 +7948,7 @@ struct var_walk {
     struct custom_prop *property;
     const char *s, *e;
     size_t index, low;
-    bool seen, on_stack, self_edge;
+    bool seen, on_stack;
 };
 /* This element's declarations as graph vertices; indexed when numerous. */
 struct var_walks { struct var_walk *all; struct var_slot *slots; size_t capacity; };
@@ -7294,29 +7988,224 @@ static struct var_walk *var_dependency(struct var_walk *f, const struct var_walk
 }
 
 static bool value_references(const char *s);
-static bool subst(const char *s, size_t n, const struct custom_prop *vars, sbuf *out);
-bool css_substitute(const style_t *st, const char *v, sbuf *out) {
+/* §8.7.2: attr()-tainted bytes of a substituted value used as or in a <url> make its declaration
+   invalid at computed-value time: in url() and src(), and the strings image() and image-set() (and
+   cross-fade()'s images) take as URLs */
+static bool taint_in_url(const struct subst_taint *t, const char *v, size_t n) {
+    if (!t->n && !t->all) return false;
+    for (size_t i = 0; i < n; i++) {
+        bool whole = function_at(v, i, n, "url", 3) || function_at(v, i, n, "src", 3);
+        size_t k = whole ? 4 : function_at(v, i, n, "image", 5) ? 6 : function_at(v, i, n, "image-set", 9) ? 10 :
+                   function_at(v, i, n, "-webkit-image-set", 17) ? 18 : function_at(v, i, n, "cross-fade", 10) ? 11 : 0;
+        if (!k) continue;
+        const char *close = scan_to(v + i + k, v + n, ")");
+        size_t from = i, to = (size_t)(close - v) + (close < v + n);
+        if (t->all) return true;
+        for (size_t r = 0; r < t->n; r++) {
+            size_t a = t->range[r][0], b = t->range[r][1];
+            if (b <= from || a >= to) continue;
+            if (whole) return true;
+            /* a string inside, or a url() inside, overlapped */
+            for (size_t j = i + k; j < to; j++) {
+                if (v[j] == '"' || v[j] == '\'') {
+                    size_t start = j;
+                    char q = v[j++];
+                    while (j < to && v[j] != q) { if (v[j] == '\\' && j + 1 < to) j++; j++; }
+                    if (!(j < a || start >= b)) return true;
+                } else if (function_at(v, j, n, "url", 3) || function_at(v, j, n, "src", 3)) {
+                    const char *end = scan_to(v + j + 4, v + to, ")");
+                    if (!((size_t)(end - v) < a || j >= b)) return true;
+                    j = (size_t)(end - v);
+                }
+            }
+        }
+    }
+    return false;
+}
+bool css_substitute(web_doc *d, const style_t *st, node_t *node, const char *v, sbuf *out) {
     size_t n = strlen(v);
     if (!value_references(v)) { sb_put(out, v, n); return true; }
-    return subst(v, n, st ? st->vars : NULL, out);
+    struct subst_taint taint = {0};
+    struct subst_env env = {.x = d ? d->sty.ctx : NULL, .vars = st ? st->vars : NULL, .own = st ? st->vars_inherited : NULL,
+                            .node = node, .taint = &taint};
+    size_t begin = out->n;
+    bool ok = subst(v, n, &env, out) && !taint_in_url(&taint, out->p + begin, out->n - begin);
+    free(taint.range);
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
+}
+const struct css_syntax *css_custom_syntax(web_doc *d, const char *name) {
+    const struct registered *reg = d && name ? registry_get(d->sty.ctx, name, strlen(name)) : NULL;
+    return reg && reg->r.syntax->count ? reg->r.syntax : NULL;
+}
+/* Web Animations 1 §5.3 and css-properties-values-api-1 §2.5: a custom property's keyframe value as the
+   computed value it animates by. Its substitution is the declarations' (css-values-5 §8.6, attr() reading
+   the site's element); a CSS-wide keyword, written or substituted, defaults as compute() defaults one */
+int css_custom_animation_value(const struct css_anim_ctx *c, const char *name, const char *text, sbuf *out) {
+    web_doc *d = c->d;
+    const struct css_ctx *x = d && d->sty.ctx && d->sty.ctx->registry ? d->sty.ctx : NULL;
+    size_t nn = strlen(name);
+    const struct registered *reg = registry_get(x, name, nn);
+    sbuf value = {0};
+    if (!css_substitute(d, c->base, c->node, text, &value)) { sb_free(&value); return -1; }
+    const char *v = value.p ? value.p : "", *end = v + value.n;
+    v = skip_ws(v, end); trim_r(v, &end);
+    size_t n = (size_t)(end - v);
+    bool initial = strn_ieq(v, "initial", n), inherit = strn_ieq(v, "inherit", n),
+         unset = strn_ieq(v, "unset", n) || strn_ieq(v, "revert", n);
+    int result = 1;
+    if (initial || inherit || unset) {
+        const char *from;
+        if (initial || (unset && reg && !reg->r.inherits)) from = reg ? reg->r.initial : NULL;
+        else {
+            const struct custom_prop *p = c->parent ? custom_find(x, c->parent->vars, c->parent->vars_inherited, name, nn)
+                                                    : reg ? &reg->initial : NULL;
+            from = p ? p->value : NULL;
+        }
+        if (from) sb_puts(out, from); else result = 0;
+    } else if (reg && reg->r.syntax->count) {
+        style_t scratch = *c->base;
+        struct cx cx = {.s = &scratch, .parent = c->parent, .node = c->node, .em = c->base->font_size, .rem = c->rem,
+                        .vw = c->vw, .vh = c->vh, .a = c->a, .set = ar_alloc(c->a, (size_t)css_prop_count())};
+        struct css_color_computed color;
+        css_style_color(c->base, CSS_SLOT_COLOR, &color);
+        if (css_syntax_compute(reg->r.syntax, v, n, &cx, d ? d->base : NULL, &color.color, out, NULL) < 0) result = -1;
+    } else sb_put(out, v, n);
+    sb_free(&value);
+    return result;
 }
 static bool value_references(const char *s) {
     if (!s) return false;
     size_t n = strlen(s);
     for (size_t i=0; n-i>=4; i++)
-        if (strn_ieq(s+i,"var(",4) || strn_ieq(s+i,"env(",4)) return true;
+        if (strn_ieq(s+i,"var(",4) || strn_ieq(s+i,"env(",4) || (n-i>=5 && strn_ieq(s+i,"attr(",5))) return true;
     return false;
+}
+
+/* what an element's own custom properties are computed against */
+struct resolve {
+    struct cx *cx;
+    struct subst_env env;
+    const struct custom_prop *inherited;
+    bool late, root;
+    sbuf *output;   /* what custom_finish substitutes into */
+    sbuf *scratch;  /* what custom_settle computes a registered value into */
+    arena_t *arena; /* the computed values' */
+};
+/* invalid at computed-value time: a registered property's unset value (inherited, else initial) */
+static const char *custom_unset(const struct registered *reg, const struct custom_prop *inherited) {
+    if (reg->r.inherits) {
+        const struct custom_prop *p = find_var(inherited, reg->r.name, strlen(reg->r.name));
+        if (p) return p->value;
+    }
+    return reg->r.initial;
+}
+/* p's computed value from text, what its value substituted to (NULL, or p marked cyclic: invalid at
+   computed-value time, a registered property's unset value). A value that is, after substitution, one
+   CSS-wide keyword is as if that keyword were specified: explicit defaulting (css-values-5 §8.6,
+   css-cascade-4 §7.3), as compute() does for a written one; revert rolls an author declaration back
+   to origins without custom properties. Then a registered property's value is computed against its
+   syntax (css-properties-values-api-1 §2.4); in the first round one that needs the element's font
+   size or colour scheme waits for the early properties (late: the round after them). */
+static void custom_settle(struct resolve *R, struct custom_prop *p, const char *text, size_t n, bool tainted) {
+    const struct registered *reg = registry_get(R->env.x, p->name, strlen(p->name));
+    bool typed = reg && reg->r.syntax->count;
+    p->state &= (uint8_t)~CUSTOM_LAZY;
+    if (!text || (p->state & CUSTOM_CYCLE)) { p->value = typed ? custom_unset(reg, R->inherited) : NULL; return; }
+    if (text != p->value) {
+        const char *k = skip_ws(text, text + n), *end = text + n;
+        trim_r(k, &end);
+        size_t kn = (size_t)(end - k);
+        bool initial = strn_ieq(k, "initial", kn), inherit = strn_ieq(k, "inherit", kn),
+             unset = strn_ieq(k, "unset", kn) || strn_ieq(k, "revert", kn);
+        if (initial || inherit || unset) {
+            p->state &= (uint8_t)~CUSTOM_TAINTED;
+            if (initial || (unset && reg && !reg->r.inherits)) { p->value = reg ? reg->r.initial : NULL; return; }
+            const style_t *parent = R->cx->parent;
+            const struct custom_prop *from = parent ? custom_find(R->env.x, parent->vars, parent->vars_inherited, p->name, strlen(p->name))
+                                                    : reg ? &reg->initial : NULL;
+            p->value = from ? from->value : NULL;
+            return;
+        }
+        if (tainted) p->state |= CUSTOM_TAINTED;
+        p->value = ar_strndup(R->arena, text, n);
+    }
+    if (!typed) return;
+    n = strlen(p->value);
+    unsigned deps = css_syntax_dependencies(p->value, n);
+    if (!R->late && (deps & (CSS_SYNTAX_DEP_FONT | CSS_SYNTAX_DEP_LINE_HEIGHT | CSS_SYNTAX_DEP_SCHEME |
+                             (R->root ? CSS_SYNTAX_DEP_ROOT_FONT : 0)))) {
+        p->state |= CUSTOM_PENDING;
+        return;
+    }
+    R->scratch->n = 0;
+    deps = 0;
+    if (css_syntax_compute(reg->r.syntax, p->value, n, R->cx, p->base, NULL, R->scratch, &deps) < 0) {
+        p->value = custom_unset(reg, R->inherited);
+        return;
+    }
+    p->value = ar_strndup(R->arena, R->scratch->p ? R->scratch->p : "", R->scratch->n);
+    if (deps & CSS_SYNTAX_DEP_COLOR) p->state |= CUSTOM_COLOR;
+}
+/* one own entry's computed value in its turn (css-variables-1 §3, css-properties-values-api-1 §2.4):
+   the entries it references come first, and one a substitution reaches before its turn (a cycle, or
+   through an attribute's value) is computed there (subst) */
+static void custom_finish(struct resolve *R, struct custom_prop *p) {
+    if (!(p->state & CUSTOM_LAZY)) return; /* not this round's, or computed already */
+    p->state &= (uint8_t)~CUSTOM_PENDING;
+    if (p->state & CUSTOM_CYCLE) { custom_settle(R, p, NULL, 0, false); return; }
+    if (!p->value) { p->state &= (uint8_t)~CUSTOM_LAZY; return; }
+    if (!value_references(p->value)) { custom_settle(R, p, p->value, strlen(p->value), false); return; }
+    R->output->n = 0;
+    R->env.waited = R->env.tainted = false;
+    R->env.mode = R->late ? SUBST_PLAIN : SUBST_DEFER;
+    bool cyclic = false;
+    p->state &= (uint8_t)~CUSTOM_LAZY; /* guarded as the property being computed */
+    R->env.self = p;
+    R->env.self_cyclic = &cyclic;
+    bool ok = subst(p->value, strlen(p->value), &R->env, R->output);
+    R->env.self = NULL;
+    R->env.self_cyclic = NULL;
+    if (R->env.waited && !cyclic) { p->value = p->raw; p->state |= CUSTOM_PENDING; return; }
+    if (cyclic) p->state |= CUSTOM_CYCLE;
+    custom_settle(R, p, ok ? (R->output->p ? R->output->p : "") : NULL, R->output->n, R->env.tainted);
+}
+
+/* CSS Color 4 §15: a registered <color> that names currentcolor computes against the element's colour,
+   known once its declarations applied (its descendants inherit the resolved colour) */
+static void custom_colors(web_doc *d, arena_t *a, struct cx *cx, struct custom_prop *mine, const struct custom_prop *inherited) {
+    struct css_color_computed color;
+    css_style_color(cx->s, CSS_SLOT_COLOR, &color);
+    sbuf out = {0};
+    for (struct custom_prop *p = mine; p && p != inherited; p = p->next) {
+        if (!(p->state & CUSTOM_COLOR) || !p->value) continue;
+        p->state &= (uint8_t)~CUSTOM_COLOR;
+        const struct registered *reg = registry_get(d->sty.ctx, p->name, strlen(p->name));
+        if (!reg) continue;
+        out.n = 0;
+        if (css_syntax_compute(reg->r.syntax, p->value, strlen(p->value), cx, p->base, &color.color, &out, NULL) >= 0)
+            p->value = ar_strndup(a, out.p ? out.p : "", out.n);
+    }
+    sb_free(&out);
 }
 
 /* Iterative Tarjan: only declarations on this element form graph vertices.
    Inherited properties are already computed, so cannot form child cycles.
-   Components are resolved in dependency order before mutating raw values. */
-static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const struct custom_prop *inherited) {
+   Components are resolved in dependency order before mutating raw values. The edges include
+   references in fallbacks, so a component can be cyclic only through a fallback no substitution
+   takes: within one, the substitution finds the cycles it goes through (css-values-5 §8.6, a cycle
+   only through what is substituted: csswg-drafts#11500). */
+static void resolve_vars(web_doc *d, arena_t *a, struct cx *cx, struct custom_prop *mine, const struct custom_prop *inherited,
+                         bool late, bool root) {
+    const struct css_ctx *x = d->sty.ctx && d->sty.ctx->registry ? d->sty.ctx : NULL;
     bool references=false;
-    for (struct custom_prop *m=mine;m!=inherited;m=m->next)
-        if (value_references(m->value)) { references=true; break; }
+    for (struct custom_prop *m=mine;m!=inherited;m=m->next) {
+        if (!m->raw) continue;
+        if (late ? (m->state & CUSTOM_PENDING) != 0 :
+            value_references(m->value) || (x && registry_get(x, m->name, strlen(m->name)))) { references=true; break; }
+    }
     if (!references) return; /* Retain immutable literal AST values, no scratch/copy. */
-    struct var_workspace { arena_t arena; sbuf output; } *work = calloc(1,sizeof *work);
+    struct var_workspace { arena_t arena; sbuf output, scratch; } *work = calloc(1,sizeof *work);
     if (!work) {
         if (css_worker()) { ar_alloc(a, SIZE_MAX); return; }
         for (struct custom_prop *m=mine;m!=inherited;m=m->next) m->value=NULL;
@@ -7326,7 +8215,7 @@ static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const
     work->arena.trap = a->trap = &trap;
     int failed = setjmp(trap);
     if (failed) {
-        sb_free(&work->output); ar_free(&work->arena); free(work); a->trap=outer;
+        sb_free(&work->output); sb_free(&work->scratch); ar_free(&work->arena); free(work); a->trap=outer;
         if (outer) longjmp(*outer,failed);
         for (struct custom_prop *m=mine;m!=inherited;m=m->next) m->value=NULL;
         web_js_console(d,2,"Custom property graph/value allocation failed"); return;
@@ -7345,9 +8234,16 @@ static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const
     }
     size_t index=0;
     struct var_walk *components=NULL;
-    for (struct var_walk *root=all;root;root=root->next) {
-        if (root->seen) continue;
-        struct var_walk *f=root;
+    struct resolve R = {.cx = cx, .env = {.x = x, .vars = mine, .own = inherited, .node = cx->node, .cx = cx},
+                        .inherited = inherited, .late = late, .root = root, .output = &work->output,
+                        .scratch = &work->scratch, .arena = a};
+    R.env.resolve = &R;
+    /* this round's entries are not computed yet: one a substitution reaches before its turn is computed there */
+    for (struct custom_prop *m=mine;m!=inherited;m=m->next)
+        if (m->raw && (!late || (m->state & CUSTOM_PENDING))) m->state |= CUSTOM_LAZY;
+    for (struct var_walk *start=all;start;start=start->next) {
+        if (start->seen) continue;
+        struct var_walk *f=start;
         while (f) {
             if (!f->seen) {
                 if (index==SIZE_MAX) longjmp(trap,1);
@@ -7356,23 +8252,15 @@ static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const
             }
             struct var_walk *dep=var_dependency(f,&walks);
             if (dep) {
-                if (dep==f) f->self_edge=true;
                 if (!dep->seen) { dep->parent=f;f=dep;continue; }
                 if (dep->on_stack && dep->index<f->low) f->low=dep->index;
                 continue;
             }
             if (f->low==f->index) {
-                bool cycle=components!=f || f->self_edge;
                 struct var_walk *v;
                 do {
                     v=components;components=v->component;v->on_stack=false;
-                    if (cycle) v->property->value=NULL;
-                    else if (value_references(v->property->value)) {
-                        work->output.n=0;
-                        if (subst(v->property->value,strlen(v->property->value),mine,&work->output))
-                            v->property->value=ar_strndup(a,work->output.p?work->output.p:"",work->output.n);
-                        else v->property->value=NULL;
-                    }
+                    custom_finish(&R, v->property);
                 } while (v!=f);
             }
             struct var_walk *parent=f->parent;
@@ -7380,7 +8268,7 @@ static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const
             f=parent;
         }
     }
-    sb_free(&work->output); ar_free(&work->arena); free(work); a->trap=outer;
+    sb_free(&work->output); sb_free(&work->scratch); ar_free(&work->arena); free(work); a->trap=outer;
 }
 
 /* Why an element restyles: the whole cascade, it has no style yet, it is in a
@@ -7429,15 +8317,27 @@ static void apply_decl(struct cascade *c, struct cx *cx, const struct dent *entr
     if (cx->set[css_prop_index(d->p)]) return;
     const char *v = d->value;
     size_t n = strlen(v);
-    if (value_references(v)) {
+    bool substituted = value_references(v);
+    if (substituted) {
         c->vbuf.n = 0;
-        if (!subst(v, n, cx->s->vars, &c->vbuf)) return;
-        v = sb_cstr(&c->vbuf);
-        n = c->vbuf.n;
+        struct subst_taint taint = {0};
+        struct subst_env env = {.x = c->d->sty.ctx && c->d->sty.ctx->registry ? c->d->sty.ctx : NULL,
+                                .vars = cx->s->vars, .own = cx->s->vars_inherited, .node = cx->node, .cx = cx,
+                                .taint = &taint, .mode = cx->font_pass ? SUBST_EARLY : SUBST_PLAIN};
+        bool ok = subst(v, n, &env, &c->vbuf) && !taint_in_url(&taint, c->vbuf.p, c->vbuf.n);
+        free(taint.range);
+        /* css-values-5 §8.6 / css-variables-1 §3: a declaration whose substitution fails is invalid at
+           computed-value time: its property computes as unset, not as the declarations below it */
+        if (!ok) { v = "unset"; n = 5; }
+        else { v = sb_cstr(&c->vbuf); n = c->vbuf.n; }
     }
     const char *end=v+n;v=skip_ws(v,end);trim_r(v,&end);n=(size_t)(end-v);
     bool revert_layer=strn_ieq(v,"revert-layer",n),revert_origin=strn_ieq(v,"revert",n);
-    if(!*has_rollback&&!revert_layer&&!revert_origin){css_apply(d->p,v,n,cx);return;}
+    /* the same for a substituted value that does not match the property's grammar */
+    if(!*has_rollback&&!revert_layer&&!revert_origin){
+        if(!css_apply(d->p,v,n,cx)&&substituted)css_apply(d->p,"unset",5,cx);
+        return;
+    }
     int count=css_prop_count();uint8_t hidden[count];bool was_rollback=*has_rollback;
     if(!was_rollback)memset(rollback,0,(size_t)count*sizeof *rollback);
     if(was_rollback)for(int i=0;i<count;i++) {
@@ -7451,7 +8351,7 @@ static void apply_decl(struct cascade *c, struct cx *cx, const struct dent *entr
         style_t scratch=*cx->s;struct cx probe=*cx;probe.s=&scratch;probe.set=affected;
         if(css_apply(d->p,"initial",7,&probe))for(int i=0;i<count;i++)
             if(affected[i]&&!cx->set[i]){rollback[i]=(struct css_rollback){entry,revert_origin};*has_rollback=true;}
-    } else css_apply(d->p, v, n, cx);
+    } else if (!css_apply(d->p, v, n, cx) && substituted) css_apply(d->p, "unset", 5, cx);
     /* Restore only temporarily hidden bits. Real winners remain consumed. */
     if(was_rollback)for(int i=0;i<count;i++)if(hidden[i])cx->set[i]=0;
 }
@@ -7525,6 +8425,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     if (pseudo == PE_MARKER) css_style_marker_defaults(s);
     /* custom properties: the most important declaration of each name */
     const struct custom_prop *inherited = s->vars;
+    const struct css_ctx *registry = d->sty.ctx && d->sty.ctx->registry ? d->sty.ctx : NULL;
     struct custom_prop *mine = NULL;
     struct custom_rollback {const char *name;struct css_rollback state;struct custom_rollback *next;} *custom_rollbacks=NULL;
     size_t own = 0;
@@ -7557,18 +8458,27 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
            cascade. Computed variable chains own their bytes, and inherited
            borrows still retire with the existing node-generation protocol. */
         cp->name = ar_strdup(c->a, x->name);
-        cp->value = ar_strdup(c->a, x->value);
+        /* css-cascade-4 §7.3 explicit defaulting: initial is the initial value (a registered one, else the
+           guaranteed-invalid value), inherit the parent's computed value, unset either, as the property
+           inherits (css-properties-values-api-1 §2.3: registered or not) */
+        bool initial = !strcasecmp(x->value, "initial"), inherit = !strcasecmp(x->value, "inherit"),
+             unset = !strcasecmp(x->value, "unset");
+        if (initial || inherit || unset) {
+            const struct registered *reg = registry_get(registry, cp->name, strlen(cp->name));
+            if (initial || (unset && reg && !reg->r.inherits)) cp->value = reg ? reg->r.initial : NULL;
+            else {
+                const struct custom_prop *from = parent ? custom_find(registry, parent->vars, parent->vars_inherited,
+                                                                      cp->name, strlen(cp->name))
+                                                        : reg ? &reg->initial : NULL;
+                cp->value = from ? from->value : NULL;
+            }
+        } else {
+            cp->value = cp->raw = ar_strdup(c->a, x->value);
+            cp->base = x->base;
+        }
         cp->next = mine;
         mine = cp;
         if (segment) var_slot_put(segment->slots, segment->capacity, cp->name, strlen(cp->name), cp);
-    }
-    if (mine) {
-        struct custom_prop *last = mine;
-        while (last->next) last = last->next;
-        last->next = (struct custom_prop *)inherited;
-        mine->segment = segment;
-        s->vars = mine;
-        resolve_vars(d,c->a,mine,inherited);
     }
     memset(setbits, 0, (size_t)css_prop_count());
     struct css_rollback rollback[css_prop_count()];bool has_rollback=false; /* initialized only for a real rollback */
@@ -7581,12 +8491,35 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         if(inline_container){cx.cq_width=inline_container->container_width;cx.cq_width_set=true;}
         if(block_container){cx.cq_height=block_container->container_height;cx.cq_height_set=true;}
     }
+    /* the custom properties first: the declarations below substitute them. A registered value that needs
+       the element's font size or colour scheme is computed after the early properties (§2.7.1) */
+    bool root_element = e == d->html && !pseudo;
+    if (mine) {
+        struct custom_prop *last = mine;
+        while (last->next) last = last->next;
+        last->next = (struct custom_prop *)inherited;
+        mine->segment = segment;
+        s->vars = mine;
+        resolve_vars(d, c->a, &cx, mine, inherited, false, root_element);
+    }
+    /* css-values-5 §10: a declaration from a tree outside the element's (::part()) does not count its
+       siblings; the animation and position fallback origins are the element's own (their depth is 0) */
+    int tree_depth = scope_depth(doc_node_root(e, false));
     for (int i = 0; i < ndents; i++)
-        if (dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_early(dents[i].d->p)) apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
+        if (dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_early(dents[i].d->p)) {
+            cx.tree_mismatch = !dents[i].animation && !dents[i].position_try && dents[i].scope_depth < tree_depth;
+            apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
+        }
     cx.font_pass = false;
+    cx.tree_mismatch = false;
     cx.em = s->font_size;
+    if (mine && registry) resolve_vars(d, c->a, &cx, mine, inherited, true, root_element);
     for (int i = 0; i < ndents; i++)
-        if (dents[i].pseudo == pseudo && dents[i].d->p) apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
+        if (dents[i].pseudo == pseudo && dents[i].d->p) {
+            cx.tree_mismatch = !dents[i].animation && !dents[i].position_try && dents[i].scope_depth < tree_depth;
+            apply_decl(c, &cx, &dents[i],rollback,&has_rollback);
+        }
+    cx.tree_mismatch = false;
     if (!pseudo) web_dialog_style(d,e,s);
     if(pseudo==PE_BACKDROP) {
         if(s->position!=POS_FIXED && s->position!=POS_ABSOLUTE)s->position=POS_ABSOLUTE;
@@ -7595,6 +8528,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     css_style_finish(s, parent, e == d->html && !pseudo);
     /* CSS Generated Content 3 §1.1: normal computes to none on ::before and ::after */
     if ((pseudo == PE_BEFORE || pseudo == PE_AFTER) && !s->content) s->content = &css_content_none;
+    if (registry && mine) custom_colors(d, c->a, &cx, mine, inherited);
     /* anchor() and anchor-size() resolve only for absolutely positioned boxes (layout.c) */
     css_style_anchor_fallbacks(s, c->a);
     if ((pseudo != PE_BEFORE && pseudo != PE_AFTER) || box_pseudo_generated(e,parent,s))
@@ -7662,7 +8596,12 @@ static const struct web_keyframe *motion_frames(void *arg, const char *name, con
         k->values = ar_alloc(c->a, (size_t)(f->count ? f->count : 1) * sizeof *k->values);
         for (int j = 0; j < f->count; j++) {
             const struct decl *x = &f->decls[j];
-            if (!x->p || x->important) continue; /* CSS Animations 1 §3: !important in a keyframe is ignored */
+            if (x->important) continue; /* CSS Animations 1 §3: !important in a keyframe is ignored */
+            if (!x->p) {
+                /* css-properties-values-api-1 §2.5: custom properties animate by computed value */
+                if (x->name && x->value) k->values[k->count++] = (struct web_keyframe_value){.name = (char *)x->name, .text = (char *)x->value};
+                continue;
+            }
             const char *v = x->value, *end = v + strlen(v);
             v = skip_ws(v, end); trim_r(v, &end);
             if (x->p == timing) {
@@ -7700,6 +8639,17 @@ static void motion_emit(void *arg, const struct propdef *p, const char *value) {
     dents[ndents - 1].animation = true;
     dents[ndents - 1].transition = m->transition;
 }
+/* a custom property's sampled computed value, a declaration of the same origin; the guaranteed-invalid
+   value is the initial keyword's (an unregistered property's initial value, css-variables-1 §2) */
+static void motion_emit_custom(void *arg, const char *name, const char *value) {
+    struct motion_cascade *m = arg;
+    struct cascade *c = m->c;
+    struct decl *x = ar_alloc(c->a, sizeof *x);
+    *x = (struct decl){.name = ar_strdup(c->a, name), .value = ar_strdup(c->a, value ? value : "initial")};
+    add_dent(x, 0, m->pseudo, 0);
+    dents[ndents - 1].animation = true;
+    dents[ndents - 1].transition = m->transition;
+}
 /* The style of one site with its effects. base: the style with none of them; CSS Animations
    update from it and the animation origin is sampled into it (the after-change style, which
    inherits from the parent's after-change style); CSS Transitions update from the before-change
@@ -7718,7 +8668,7 @@ static style_t *motion_compute(struct cascade *c, node_t *e, const style_t *pare
     struct web_motion_site site = {
         .ctx = {.base = base, .parent = parent, .node = e, .box = e->box, .rem = c->rem, .vw = (float)c->vw,
                 .vh = (float)c->vh, .a = c->a, .d = c->d},
-        .pseudo = pseudo, .keyframes = motion_frames, .emit = motion_emit, .arg = &m};
+        .pseudo = pseudo, .keyframes = motion_frames, .emit = motion_emit, .emit_custom = motion_emit_custom, .arg = &m};
     if (shown && (want & 1)) web_motion_animations(&site);
     uint8_t animated[css_prop_count()];
     memset(animated, 0, sizeof animated);
@@ -8439,6 +9389,10 @@ void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool in
     for(node_t *p=parent;p;p=dirty_flat_parent(p))p->style_children_dirty=true;
     if(subtree->parent==parent && subtree->type==N_ELEM)mark_style_subject(d,subtree,MARK_INSERTED);
     struct css_binding *authored=scope?scope->first:NULL,*ua=d->sty.ctx->ua;
+    /* css-values-5 §10: the children whose styles count their siblings (sibling-index(), sibling-count()) */
+    if(subtree->type==N_ELEM && __atomic_load_n(&parent->style_counts_children,__ATOMIC_RELAXED))
+        for(node_t *child=parent->first;child;child=child->next)
+            if(child->type==N_ELEM && child!=subtree)mark_style_subject(d,child,MARK_POSITION);
     if(!inserted || subtree->parent!=parent) {
         /* Removal and reordering lost the former position: any positional
            subject among the remaining children may have changed. */
