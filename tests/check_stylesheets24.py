@@ -49,7 +49,7 @@ abi=out/'host-abi';abi.mkdir(exist_ok=True)
 (abi/'setjmp.h').write_text('#include "'+(cc.parent.parent/'include/setjmp.h').as_posix()+'"\n',encoding='utf-8')
 objects=[]
 native_flags=['-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web','-Ithird_party/quickjs']
-for i,path in enumerate((c,root/'user/libc/web/cssprop.c',root/'user/libc/web/shape.c',root/'user/libc/web/color.c',root/'user/libc/web/util.c',root/'user/libc/web/html.c',urls)):
+for i,path in enumerate((c,root/'user/libc/web/cssprop.c',root/'user/libc/web/shape.c',root/'user/libc/web/color.c',root/'user/libc/web/cssmath.c',root/'user/libc/web/util.c',root/'user/libc/web/html.c',urls)):
     obj=out/f'native{i}.o';objects.append(obj)
     subprocess.run([str(cc),*native_flags,'-c',str(path),'-o',str(obj)],cwd=root,env=env,check=True)
 for name in ('quickjs','dtoa','libregexp','libunicode','cutils'):

@@ -3,6 +3,7 @@
      html.c    HTML tag IDs (html_lexbor.c builds the tree)
      css.c     CSS parser, selectors, the cascade and computed values
      cssprop.c CSS properties, values, shorthands and the UA stylesheet
+     cssmath.c CSS units and math functions: parsing, types, simplification, evaluation, serialization
      color.c   CSS colours: parsing, computed values, conversion, interpolation, serialization
      box.c     box tree generation
      layout.c  block, inline, float, table and positioned layout
@@ -281,17 +282,20 @@ node_t *node_ancestor(node_t *n, int tag); /* the nearest ancestor (or n) with t
 void node_text_content(const node_t *n, sbuf *out);
 
 /* ---------------------------------------------------------------- CSS values */
-/* a length or percentage, possibly calc(): resolved at layout time against a base */
+/* a length or percentage, possibly a math function: resolved at layout time against a base */
 enum { LK_AUTO, LK_LEN, LK_NONE, LK_EXPR, LK_NORMAL, LK_NUMBER };
-struct cexpr;
+struct css_calc;
 typedef struct len {
     uint8_t kind;
     float px, pct; /* LK_LEN: px + pct% of the base; LK_NUMBER: px is the number */
-    struct cexpr *expr;
+    struct css_calc *expr; /* LK_EXPR: a computed calculation (cssmath.c) that needs the base */
 } len_t;
 float len_resolve(const len_t *l, float base); /* LK_AUTO/LK_NONE resolve to 0 */
 bool css_length_equal(const len_t *,const len_t *); /* semantic computed expression, not arena address */
-bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d); /* fallible/cancellable computed value; append/NUL or restore */
+bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d); /* fallible computed value; append/NUL or restore */
+/* a computed calculation of type <length-percentage> as a len_t: px + pct% when it is one (negative:
+   the property allows negative values, else a negative one clamps to 0), else LK_EXPR */
+bool css_length_from_calc(const struct css_calc *c, bool negative, len_t *out);
 /* What a value's grammar accepts (cssprop.c): auto, none, normal, negative values, percentages, and
    LF_LENGTH: unitless numbers other than 0 are not lengths */
 enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
@@ -302,6 +306,56 @@ const char *css_parse_url(const char *s, size_t n, arena_t *a); /* url(...) (or 
 void css_length_complement(arena_t *a, const len_t *x, const len_t *y, len_t *out); /* 100% - x - y (y may be NULL) */
 void css_length_mix(arena_t *a, const len_t *x, const len_t *y, double ka, double kb, len_t *out); /* ka·x + kb·y */
 bool css_query_length(const char *, size_t, float em, float rem, float vw, float vh, double *value);
+
+/* ---------------------------------------------------------------- units and math functions (cssmath.c) */
+/* CSS units: a dimension's unit by name ("" a number, "%" a percentage), -1 for none */
+int css_unit_find(const char *u, size_t n);
+unsigned css_unit_kind(int unit);   /* its CSS_CALC_* type */
+bool css_unit_relative(int unit);   /* a length of the element's font, the viewport or a container */
+const char *css_unit_name(int unit);
+/* v in the type's canonical unit: px, deg, s, Hz, dppx, fr; numbers and percentages as they are.
+   cx resolves relative lengths (NULL: no element, the initial font and an 800x600 viewport) */
+double css_unit_canonical(int unit, double v, const struct cx *cx);
+/* a <number-token>, <percentage-token> or <dimension-token> at *s: its value and unit's name */
+bool css_numeric_token(const char **s, const char *end, double *v, const char **unit, size_t *unit_n);
+void css_number_serialize(sbuf *b, double v); /* a <number> as CSSOM writes one: six significant figures */
+/* What a context accepts where a math function is (CSS Values 4 §10.7). PERCENT with one dimension:
+   <dimension-percentage>, whose percentages resolve against that dimension; PERCENT otherwise:
+   <percentage> is a type of its own (opacity, scale, a colour's channels). */
+enum { CSS_CALC_NUMBER = 1, CSS_CALC_PERCENT = 2, CSS_CALC_LENGTH = 4, CSS_CALC_ANGLE = 8, CSS_CALC_TIME = 16,
+       CSS_CALC_FREQUENCY = 32, CSS_CALC_RESOLUTION = 64, CSS_CALC_FLEX = 128, CSS_CALC_ANY = 255 };
+struct css_calc_parse {
+    arena_t *a;              /* the tree's memory */
+    const struct cx *cx;     /* a computed value: relative lengths resolve against it; NULL keeps them */
+    const char *const *keys; /* identifiers that stand for numbers (a relative colour's channels) */
+    unsigned nkeys;
+    unsigned nodes, depth;   /* the parse's budget, from 0 */
+};
+bool css_calc_is_math(const char *s, size_t n); /* s starts with a math function */
+/* s..s+n, one math function: its simplified tree, typed against accept (*kind: the CSS_CALC_* type it
+   is); NULL if it is not valid there */
+struct css_calc *css_calc_read(struct css_calc_parse *P, unsigned accept, const char *s, size_t n, unsigned *kind);
+struct css_calc *css_calc_key(arena_t *a, unsigned index); /* a key written outside a math function */
+int css_calc_key_of(const struct css_calc *c);             /* the key c is, or -1 */
+bool css_calc_function_root(const struct css_calc *c);     /* min(), round() ...: not serialized in calc() */
+bool css_calc_constant(const struct css_calc *c, double *v); /* one value that needs nothing, canonical */
+bool css_calc_linear(const struct css_calc *c, double *px, double *pct); /* px + pct% of a length's basis */
+bool css_calc_context_free(const struct css_calc *c);      /* no relative length, no key */
+bool css_calc_percent_free(const struct css_calc *c);      /* no percentage that needs a basis */
+bool css_calc_equal(const struct css_calc *a, const struct css_calc *b);
+/* c's value in its canonical unit: basis is what 100% is (NaN: percentages stay numbers), keys the
+   keys' values, cx the element's relative lengths. NaN and infinities as IEEE-754 gives them. */
+double css_calc_value(const struct css_calc *c, double basis, const double *keys, const struct cx *cx);
+struct css_calc *css_calc_bind(arena_t *a, const struct css_calc *c, const struct cx *cx); /* relative lengths resolved */
+bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *keys); /* §10.13; false: out of memory */
+/* a literal or a math function of a type accept allows, in its canonical unit (a percentage that
+   resolves against a dimension: of basis, NaN if none); a top-level NaN is 0 (§10.9), infinities are the
+   caller's to clamp. a: the parse's memory (NULL: scratch); *kind: the type it is */
+bool css_numeric_read(const char *s, size_t n, unsigned accept, const struct cx *cx, arena_t *a, double basis, double *out,
+                      unsigned *kind);
+/* text whose math functions are each serialized as a specified value (§10.13), the rest as written;
+   false: none, or a value with var() */
+bool css_calc_specified(const char *s, size_t n, unsigned accept, sbuf *out);
 struct css_filter_step { float value; bool percentage; };
 struct css_corner_radius { len_t axis[2]; }; /* x resolves against width, y against height */
 struct style;
@@ -944,15 +998,11 @@ struct cx {
     uint8_t *set;          /* per property: already given a value by a more important declaration */
     bool font_pass;        /* only the early properties (font-size, color-scheme) are being computed */
     bool supports_probe, invalid; /* scratch validation: never touch a document */
-    unsigned supports_nodes; /* bound arithmetic AST traversal, not just parentheses */
     float cq_width, cq_height;
     bool cq_width_set, cq_height_set;
     bool absolute_lengths; /* relative lengths and percentages fail (Geometry's matrix strings) */
-    bool time;             /* dimensions are <time>s, in milliseconds; lengths and percentages fail */
     bool computed_text;    /* the value is computed-value text the animation layer wrote (css_anim_parse):
                               what a style sheet's parse clamps (rgb()'s components) keeps its value */
-    bool absolute_units;   /* relative lengths fail, percentages stay (a specified value's calc()) */
-    bool angles;           /* dimensions are <angle>s, in degrees; lengths and percentages fail */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -969,8 +1019,6 @@ void css_style_init(style_t *s, const style_t *parent);
 void css_style_adopt_inherited(style_t *s, const style_t *from);
 /* computed-value fixups after all declarations: currentColor, blockification, border widths */
 void css_style_finish(style_t *s, const style_t *parent, bool root);
-/* a dimension's pixels against cx: false for an unknown unit; *num for no unit, *pct for % */
-bool css_unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num);
 
 /* colours (color.c) */
 struct css_color css_color_from_argb(uint32_t argb);       /* legacy sRGB */
