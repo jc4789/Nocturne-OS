@@ -31,6 +31,13 @@ font_t *font_family(int family, int style);
 /* line metrics in pixels for size px: ascent above the baseline, descent below it (positive),
    and the recommended gap between lines */
 void font_metrics(font_t *f, float px, float *ascent, float *descent, float *line_gap);
+/* The face's aspect value of a metric, per em (CSS Fonts 5 font-size-adjust, CSS Values 4 §6.1.1):
+   the x-height, the cap height, the advance of "0", the advance of 水 (U+6C34) and its vertical
+   advance. A face without the metric gives CSS's fallback: 0.5 for the x-height and "0", the ascent
+   for the cap height, 1 for the ideograph. */
+enum { FONT_ASPECT_EX_HEIGHT, FONT_ASPECT_CAP_HEIGHT, FONT_ASPECT_CH_WIDTH, FONT_ASPECT_IC_WIDTH, FONT_ASPECT_IC_HEIGHT,
+       FONT_ASPECTS };
+float font_aspect(font_t *f, int metric);
 bool font_has(font_t *f, uint32_t codepoint);
 /* The face's own cmap only, without bundled fallback. CSS composite fonts
    intersect this coverage with each unicode-range descriptor. */

@@ -96,11 +96,26 @@ struct box_anchor {
 };
 
 /* ---------------------------------------------------------------- fonts */
+/* The face text is measured and drawn in, and its used size. CSS Fonts 4: font-synthesis-weight none
+   (§3.1) leaves a bold weight in the regular face where the bundled bold is synthesized (Noto, whose
+   bold is the regular outline emboldened; Maple Mono has a bold of its own). Fonts 5 §2.6
+   font-size-adjust: a number scales the size so the face's aspect value of its metric is that number
+   times the font size. The other CSS Fonts 4 values (font-variant-*, font-feature-settings,
+   font-variation-settings, font-kerning, font-optical-sizing, font-palette, font-language-override,
+   synthesized italic, small caps and sub/superscripts) need OpenType shaping, variations or palettes
+   this face layer does not have (font.h). */
 wfont style_font(const style_t *st) {
-    wfont f = {.px=st->font_size,.bold=st->font_weight>=600,.choices=st->font_choices};
+    const struct css_font *font = css_style_font(st);
+    bool bold = st->font_weight >= 600 && (font->synthesis[CSS_SYNTHESIS_WEIGHT] != CSS_SYNTHESIS_NONE ||
+                                           st->named_font || st->font_family == FONT_FAMILY_MONO);
+    wfont f = {.px=st->font_size,.bold=bold,.choices=st->font_choices};
     int idx = (f.bold ? FONT_BOLD : 0) | (st->font_style ? FONT_ITALIC : 0);
     f.ttf = st->named_font ? st->named_font : font_family(st->font_family, idx);
     if (!f.ttf) f.ttf = font_ui(FONT_REGULAR);
+    if (font->size_adjust.kind == CSS_SIZE_ADJUST_NUMBER && f.ttf) {
+        float aspect = font_aspect(f.ttf, font->size_adjust.metric);
+        if (aspect > 0) f.px = st->font_size * font->size_adjust.value / aspect;
+    }
     return f;
 }
 

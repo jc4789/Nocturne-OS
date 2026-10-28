@@ -165,6 +165,20 @@ static bool is_number(const struct css_calc *c) { return is_leaf(c) && c->unit =
 /* a percentage that is a type of its own whose value is known: a fraction (opacity, a colour's channel), not
    a percentage of a basis the context did not say (key 1 marks it) */
 static bool own_percent(const struct css_calc *c) { return c->unit == U_PERCENT && c->type.e[T_PERCENT] == 1 && c->key == 1; }
+/* a leaf of value v in like's unit and type: a percentage of its own type stays one (simplification
+   folds calc(100% + 100%) where the percentage is the value's own, as in font-width or opacity) */
+static struct css_calc *mk_like(struct mp *m, double v, const struct css_calc *like) {
+    struct css_calc *c = mk_leaf(m, v, like->unit, like->type);
+    if (c && own_percent(like)) c->key = 1;
+    return c;
+}
+/* a value of type t computed from known leaves (percentages only of their own type): its percentage,
+   if it is one, is its own too */
+static struct css_calc *mk_known(struct mp *m, double v, uint8_t unit, struct css_calc_type t) {
+    struct css_calc *c = mk_leaf(m, v, unit, t);
+    if (c && unit == U_PERCENT && t.e[T_PERCENT] == 1) c->key = 1;
+    return c;
+}
 /* a leaf whose value needs nothing: a number, a canonical dimension, a percentage of its own type */
 static bool known(const struct css_calc *c) {
     if (!is_leaf(c)) return false;
@@ -290,7 +304,7 @@ static struct css_calc *simplify_sum(struct mp *m, struct css_calc *c) {
         struct css_calc *sum = k[i];
         for (unsigned q = i + 1; q < n;) {
             if (is_leaf(k[q]) && k[q]->unit == sum->unit && (sum->unit != U_PERCENT || t_eq(&k[q]->type, &sum->type))) {
-                struct css_calc *x = mk_leaf(m, sum->v + k[q]->v, sum->unit, sum->type);
+                struct css_calc *x = mk_like(m, sum->v + k[q]->v, sum);
                 if (!x) return NULL;
                 sum = x;
                 memmove(&k[q], &k[q + 1], (n - q - 1) * sizeof *k);
@@ -324,7 +338,7 @@ static struct css_calc *simplify_product(struct mp *m, struct css_calc *c) {
         if (all) {
             struct css_calc **t = ar_alloc(m->P->a, s->n * sizeof *t);
             for (unsigned i = 0; i < s->n; i++)
-                if (!(t[i] = mk_leaf(m, s->k[i]->v * number, s->k[i]->unit, s->k[i]->type))) return NULL;
+                if (!(t[i] = mk_like(m, s->k[i]->v * number, s->k[i]))) return NULL;
             return with_children(m, s, t, s->n);
         }
     }
@@ -339,13 +353,13 @@ static struct css_calc *simplify_product(struct mp *m, struct css_calc *c) {
             int base = -1;
             for (int i = 0; i < T_BASES; i++) if (c->type.e[i]) base = i;
             uint8_t unit = base < 0 ? U_NUMBER : base == T_PERCENT ? U_PERCENT : canonical[base];
-            return mk_leaf(m, v, unit, c->type);
+            return mk_known(m, v, unit, c->type);
         }
     }
     /* a number times one numeric value: the value scaled, in its unit */
     if (w == 1 && is_leaf(k[0])) {
         if (!numbers) return k[0];
-        return mk_leaf(m, k[0]->v * number, k[0]->unit, k[0]->type);
+        return mk_like(m, k[0]->v * number, k[0]);
     }
     if (w == 1 && !numbers) return k[0];
     if (numbers) {
@@ -383,7 +397,7 @@ static struct css_calc *simplify_fn(struct mp *m, struct css_calc *c) {
             }
             v = fn_eval(c->fn, c->key, x, present, c->n, angle);
         }
-        return mk_leaf(m, v, type_unit(&c->type), c->type);
+        return mk_known(m, v, type_unit(&c->type), c->type);
     }
     if (c->fn == F_MIN || c->fn == F_MAX) {
         /* partly: the children of one unit compare among themselves */
@@ -416,7 +430,7 @@ static struct css_calc *simplify(struct mp *m, struct css_calc *c) {
     switch (c->op) {
     case N_NEGATE: {
         struct css_calc *x = c->k[0];
-        if (is_leaf(x)) return mk_leaf(m, -x->v, x->unit, x->type);
+        if (is_leaf(x)) return mk_like(m, -x->v, x);
         if (x->op == N_NEGATE) return x->k[0];
         return c;
     }
