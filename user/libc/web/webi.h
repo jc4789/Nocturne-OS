@@ -519,6 +519,9 @@ typedef struct style {
        css_color_slot, the inherited ones and the element's own. NULL when no
        slot needs one; shared and never written, copied on change. */
     const struct css_color_value *const *color_inherited, *const *color_own;
+    /* per enum css_color_slot: the computed value is currentcolor and the 8-bit field holds what
+       css_style_finish resolved it to (CSS Color 4 §4.4: currentcolor computes to itself) */
+    uint16_t color_current;
     uint8_t color_scheme; /* CSS_SCHEME_* of color-scheme; 0: normal */
     const char *color_scheme_text; /* its computed value; NULL: normal */
     struct svg_paint svg_fill, svg_stroke;

@@ -4012,15 +4012,18 @@ void css_style_adopt_inherited(style_t *s, const style_t *from) {
 void css_style_finish(style_t *s, const style_t *parent, bool root) {
     if (s->color == COLOR_CURRENT) s->color = parent ? parent->color : 0xFF000000u;
     css_color_finish(s);
-    if (s->bg_color == COLOR_CURRENT) s->bg_color = s->color;
+    if (s->bg_color == COLOR_CURRENT) { s->bg_color = s->color; s->color_current |= 1u << CSS_SLOT_BACKGROUND; }
     for (struct css_box_shadow *shadow = (struct css_box_shadow *)s->box_shadow; shadow; shadow = shadow->next)
         if (shadow->color == COLOR_CURRENT)
             shadow->color = shadow->color_value ? css_color_value_argb(shadow->color_value, s->color) : s->color;
     for (int i = 0; i < 4; i++) {
-        if (s->border_color[i] == COLOR_CURRENT) s->border_color[i] = s->color;
+        if (s->border_color[i] == COLOR_CURRENT) {
+            s->border_color[i] = s->color;
+            s->color_current |= (uint16_t)(1u << (CSS_SLOT_BORDER_TOP + i));
+        }
         if (s->border_style[i] == BS_NONE || s->border_style[i] == BS_HIDDEN) s->border_width[i] = 0;
     }
-    if (s->outline_color == COLOR_CURRENT) s->outline_color = s->color;
+    if (s->outline_color == COLOR_CURRENT) { s->outline_color = s->color; s->color_current |= 1u << CSS_SLOT_OUTLINE; }
     if (s->outline_style == BS_NONE) s->outline_width = 0;
     if (s->has_grad) {
         const struct gradient *g = s->gradient;

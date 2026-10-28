@@ -290,6 +290,27 @@ int main(void){
     check(same("color","red","hsl(0 100% 50%)"),"red is hsl(0 100% 50%)","");
     check(!same("color","red","color(srgb 1 0 0)"),"red is not color(srgb 1 0 0)","");
     EXPECT(computed("color","color(display-p3 1 0 0)"),"color(display-p3 1 0 0)");
+    /* currentcolor computes to itself (CSS Color 4 §4.4): after the cascade finishes the style the
+       animation layer still reads currentcolor, getComputedStyle the used colour, and inherit takes
+       currentcolor for the child's own colour */
+    {
+        static style_t up,child;
+        uint8_t set2[css_prop_count()];
+        const struct propdef *colour=css_prop_lookup("color",5),*bg=css_prop_lookup("background-color",16);
+        css_style_init(&up,&parent);memset(set2,0,sizeof set2);
+        struct cx ux={.s=&up,.parent=&parent,.em=16,.rem=16,.vw=800,.vh=600,.a=&arena,.set=set2};
+        css_apply(colour,"red",3,&ux);css_apply(bg,"currentcolor",12,&ux);css_style_finish(&up,&parent,false);
+        sbuf b={0};
+        check(css_computed_value(&up,bg,&b,NULL) && !strcmp(sb_cstr(&b),"currentcolor"),"finished currentcolor computes to currentcolor",sb_cstr(&b));
+        b.n=0;check(css_computed_longhand(&up,"background-color",&b,NULL)==1 && !strcmp(sb_cstr(&b),"rgb(255, 0, 0)"),"its resolved value",sb_cstr(&b));
+        css_style_init(&child,&up);memset(set2,0,sizeof set2);
+        struct cx cx2={.s=&child,.parent=&up,.em=16,.rem=16,.vw=800,.vh=600,.a=&arena,.set=set2};
+        css_apply(colour,"blue",4,&cx2);css_apply(bg,"inherit",7,&cx2);css_style_finish(&child,&up,false);
+        b.n=0;check(css_computed_longhand(&child,"background-color",&b,NULL)==1 && !strcmp(sb_cstr(&b),"rgb(0, 0, 255)"),"inherited currentcolor is the child's colour",sb_cstr(&b));
+        memset(set2,0,sizeof set2);css_apply(bg,"lime",4,&cx2);css_style_finish(&child,&up,false);
+        b.n=0;check(css_computed_value(&child,bg,&b,NULL) && !strcmp(sb_cstr(&b),"rgb(0, 255, 0)"),"a new value clears currentcolor",sb_cstr(&b));
+        sb_free(&b);
+    }
     printf("animation-values: %d checks, %d failures\n",checks,failed);
     return failed!=0;
 }

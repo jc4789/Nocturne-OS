@@ -2334,6 +2334,7 @@ static const struct css_color_value *slot_get(const style_t *s, int k) {
     return s->color_own ? s->color_own[k - CSS_SLOT_INHERITED] : NULL;
 }
 static void slot_set(style_t *s, int k, const struct css_color_value *v, arena_t *a) {
+    s->color_current &= (uint16_t)~(1u << k); /* a new value; css_style_finish marks currentcolor again */
     if (slot_get(s, k) == v) return;
     bool inherited = k < CSS_SLOT_INHERITED;
     const struct css_color_value *const *old = inherited ? s->color_inherited : s->color_own;
@@ -2374,6 +2375,11 @@ void css_color_held(uint32_t argb, const struct css_color_value *v, uint32_t cur
     out->color = css_color_from_argb(argb);
 }
 void css_style_color(const style_t *st, enum css_color_slot k, struct css_color_computed *out) {
+    if (st->color_current & 1u << k) {
+        out->current = &current_value;
+        out->color = css_color_from_argb(*slot_field((style_t *)st, k));
+        return;
+    }
     css_color_held(*slot_field((style_t *)st, k), slot_get(st, k), st->color, out);
 }
 static struct css_color style_current(const style_t *st) {
@@ -2463,6 +2469,8 @@ bool css_color_apply(const char *s, size_t n, struct cx *cx, enum css_color_slot
 }
 void css_color_slot_copy(style_t *dst, const style_t *src, enum css_color_slot k, arena_t *a) {
     slot_set(dst, k, slot_get(src, k), a);
+    /* a finished currentcolor (inherit from the parent) is currentcolor again, for this element's colour */
+    if (src->color_current & 1u << k) *slot_field(dst, k) = COLOR_CURRENT;
 }
 void css_color_slot_set(style_t *s, enum css_color_slot k, const struct css_color_value *v, arena_t *a) {
     slot_set(s, k, v, a);

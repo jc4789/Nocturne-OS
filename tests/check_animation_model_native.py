@@ -241,6 +241,15 @@ int main(void){
     started=false;for(struct web_animation *o=element.owned;o;o=o->owner_next)if(!o->disowned&&o->property==css_prop_lookup("float",5))started=true;
     CHECK(started);
     web_motion_cancel(&element,-1);at(6800);events(types,8);at(6900);
+    /* currentcolor's computed value is currentcolor: a change of color starts no transition of
+       background-color (css-transitions/currentcolor-animation-001.html) */
+    style_t cb=styled("color","red");cb=styled_on(&cb,"background-color","currentcolor");css_style_finish(&cb,&parent,false);
+    style_t ca=styled("color","blue");ca=styled_on(&ca,"background-color","currentcolor");
+    ca=styled_on(&ca,"transition","background-color linear 50s -10s");css_style_finish(&ca,&parent,false);
+    s=site(&ca);web_motion_transitions(&s,&cb,&ca,none_animated);
+    started=false;for(struct web_animation *o=element.owned;o;o=o->owner_next)if(!o->disowned&&o->property==css_prop_lookup("background-color",16))started=true;
+    CHECK(!started);
+    web_motion_cancel(&element,-1);at(6910);events(types,8);at(6920);
 
     /* CSS Animations: created from animation-name, reused while the name stays, canceled when it goes */
     style_t anim=styled("animation","fade 1s linear forwards");

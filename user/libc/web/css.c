@@ -6029,7 +6029,7 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.bg_image=y.bg_image=x.mask_image=y.mask_image=NULL;
     x.bg_img=y.bg_img=x.mask_img=y.mask_img=0;
     x.color=y.color=x.bg_color=y.bg_color=0;
-    x.color_inherited=y.color_inherited=x.color_own=y.color_own=NULL;
+    x.color_inherited=y.color_inherited=x.color_own=y.color_own=NULL;x.color_current=y.color_current=0;
     x.color_scheme=y.color_scheme=0;x.color_scheme_text=y.color_scheme_text=NULL;
     memset(x.border_color,0,sizeof x.border_color);memset(y.border_color,0,sizeof y.border_color);
     x.outline_color=y.outline_color=0;x.outline_width=y.outline_width=x.outline_offset=y.outline_offset=0;
