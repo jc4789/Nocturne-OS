@@ -12,6 +12,18 @@ JSValue web_js_decode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
 /* A string from UTF-8 as the Encoding Standard decodes it without a BOM check:
    each invalid sequence becomes U+FFFD. */
 JSValue web_js_utf8_text(JSContext *ctx, const uint8_t *bytes, size_t length);
+/* host.getEncoding(label): get an encoding's name ("UTF-8", "Shift_JIS"), or
+   null for failure (web_encoding.c owns the labels). */
+JSValue web_js_get_encoding(JSContext *ctx, int argc, JSValueConst *argv);
+/* host.textDecoder(name, fatal, ignoreBOM): a decoder instance of any encoding
+   but replacement (RangeError), for TextDecoder and TextDecoderStream. */
+JSValue web_js_text_decoder(JSContext *ctx, int argc, JSValueConst *argv);
+/* host.textDecode(decoder, buffer, offset, length, stream): the string of the
+   view's bytes, then end-of-queue unless stream; TypeError at a fatal error.
+   After end-of-queue or an error the instance starts afresh. prepare as for
+   decodeUTF8. */
+JSValue web_js_text_decode(JSContext *ctx, int argc, JSValueConst *argv,
+                           void (*prepare)(JSContext *, size_t));
 /* QuickJS's UTF-8 of a string keeps a lone surrogate in its three-byte form;
    this makes the UTF-8 of the scalar values (a USVString's), in place. */
 void web_utf8_replace_lone_surrogates(uint8_t *bytes, size_t length);

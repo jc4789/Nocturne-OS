@@ -51,9 +51,9 @@ struct web_decoder {
 /* A new instance of the encoding's decoder (not failure). */
 void web_decoder_init(struct web_decoder *decoder, web_encoding encoding, bool fatal);
 /* Processes bytes, then end-of-queue when last, appending each scalar value's
-   UTF-8 to out. A decoder that has seen end-of-queue starts afresh. 1; 0 at an
-   error in fatal mode (out has the scalar values before it, and the instance is
-   to be replaced); -1 when out of memory. */
+   UTF-8 to out. 1; 0 at an error in fatal mode (out has the scalar values
+   before it); -1 when out of memory. After end-of-queue, an error or running
+   out of memory the instance starts afresh (TextDecoder's new instance). */
 int web_decoder_run(struct web_decoder *decoder, const uint8_t *bytes, size_t length,
                     bool last, struct web_bytes *out);
 

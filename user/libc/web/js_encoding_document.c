@@ -23,6 +23,15 @@ static JSValue native_btoa(JSContext *ctx, JSValueConst self, int argc, JSValueC
 static JSValue native_atob(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)self;return web_js_atob(ctx,argc,argv,web_js_prepare_bytes);
 }
+static JSValue native_get_encoding(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_get_encoding(ctx,argc,argv);
+}
+static JSValue native_text_decoder(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_text_decoder(ctx,argc,argv);
+}
+static JSValue native_text_decode(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;return web_js_text_decode(ctx,argc,argv,web_js_prepare_bytes);
+}
 
 struct data_url_checkpoint { JSContext *ctx; int (*poll)(JSContext *); };
 static bool data_url_checkpoint(void *opaque) {
@@ -58,6 +67,9 @@ done:
 
 void web_js_encoding_init(JSContext *ctx, JSValue host) {
     static const JSCFunctionListEntry functions[]={
+        JS_CFUNC_DEF("getEncoding",1,native_get_encoding),
+        JS_CFUNC_DEF("textDecoder",3,native_text_decoder),
+        JS_CFUNC_DEF("textDecode",5,native_text_decode),
         JS_CFUNC_DEF("decodeUTF8",5,native_decode_utf8),
         JS_CFUNC_DEF("encodeUTF8",1,native_encode_utf8),
         JS_CFUNC_DEF("encodeUTF8Into",4,native_encode_utf8_into),

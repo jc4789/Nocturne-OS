@@ -112,6 +112,7 @@ size_t web_utf8_valid(const uint8_t *s, size_t n) {
 
 int web_decoder_run(struct web_decoder *d, const uint8_t *bytes, size_t length, bool last,
                     struct web_bytes *out) {
+    int result = 1;
     if (!bytes) length = 0;
     /* UTF-8 between sequences: a valid prefix is its own output. */
     if (d->encoding == WEB_ENCODING_UTF8 && !d->lexbor.u.utf_8.need && !d->lexbor.have_error) {
@@ -120,26 +121,26 @@ int web_decoder_run(struct web_decoder *d, const uint8_t *bytes, size_t length, 
             d->started = true;
             if (d->drop_bom && valid >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf) skip = 3;
         }
-        if (!web_bytes_put(out, bytes + skip, valid - skip)) return -1;
+        if (!web_bytes_put(out, bytes + skip, valid - skip)) result = -1;
         bytes += valid; length -= valid;
     }
     const lxb_char_t *p = bytes, *end = bytes + length;
-    while (p < end) {
+    while (result == 1 && p < end) {
         const lxb_char_t *before = p;
         lxb_status_t status = d->lexbor.encoding_data->decode(&d->lexbor, &p, end);
         bool output = lxb_encoding_decode_buf_used(&d->lexbor) != 0;
-        if (!flush(d, out)) return -1;
+        if (!flush(d, out)) result = -1;
         /* An error in fatal mode; anything else that neither reads nor outputs
            would not end. */
-        if (status == LXB_STATUS_ERROR || (p == before && !output)) return 0;
+        else if (status == LXB_STATUS_ERROR || (p == before && !output)) result = 0;
     }
-    if (last) {
+    if (result == 1 && last) {
         lxb_status_t status = lxb_encoding_decode_finish(&d->lexbor);
-        if (!flush(d, out)) return -1;
-        if (status == LXB_STATUS_ERROR) return 0;
-        decoder_start(d);
+        if (!flush(d, out)) result = -1;
+        else if (status == LXB_STATUS_ERROR) result = 0;
     }
-    return 1;
+    if (last || result != 1) decoder_start(d);
+    return result;
 }
 
 char *web_decode(const uint8_t *bytes, size_t length, web_encoding fallback,

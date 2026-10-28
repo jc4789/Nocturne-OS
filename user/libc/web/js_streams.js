@@ -75,22 +75,46 @@ const streamBridge=(()=>{
         finally{apply(release,reader,[]);}
         const bytes=new U8(total);let at=0;for(const chunk of chunks){apply(set,bytes,[chunk,at]);at+=apply(length,chunk,[]);}return apply(buffer,bytes,[]);
     }
+    // TextEncoderCommon, TextDecoderCommon and GenericTransformStream are
+    // prototype attributes over each stream's private slot.
+    const textStreams=new WeakMap(),textGet=WeakMap.prototype.get,textSet=WeakMap.prototype.set;
+    const textStream=(value,Type)=>{const s=apply(textGet,textStreams,[value]);if(!s||s.type!==Type)throw new TypeError('Illegal invocation');return s;};
+    const readableOf=getter(TransformStream.prototype,'readable'),writableOf=getter(TransformStream.prototype,'writable');
+    const encodingOf=getter(decoder.prototype,'encoding'),fatalOf=getter(decoder.prototype,'fatal'),ignoreBOMOf=getter(decoder.prototype,'ignoreBOM');
+    const codeUnit=String.prototype.charCodeAt,sliceText=String.prototype.slice;
     class TextEncoderStream {
         constructor(){let pending='';const enc=new encoder();
+            // A leading surrogate at a chunk's end waits for the next chunk.
             const transform=new TransformStream({transform(chunk,c){
-                let text=pending+String(chunk);pending='';
-                if(text.length&&/[\uD800-\uDBFF]/.test(text[text.length-1])){pending=text[text.length-1];text=text.slice(0,-1);}
+                let text=pending+`${chunk}`;pending='';
+                const last=text.length?apply(codeUnit,text,[text.length-1]):0;
+                if(last>=0xd800&&last<=0xdbff){pending=apply(sliceText,text,[-1]);text=apply(sliceText,text,[0,-1]);}
                 if(text)c.enqueue(apply(encode,enc,[text]));
             },flush(c){if(pending)c.enqueue(apply(encode,enc,[pending]));}});
-            Object.defineProperties(this,{readable:{value:transform.readable,enumerable:true},writable:{value:transform.writable,enumerable:true}});
+            apply(textSet,textStreams,[this,{type:TextEncoderStream,readable:apply(readableOf,transform,[]),writable:apply(writableOf,transform,[])}]);
         }
-        get encoding(){return 'utf-8';}
+        get encoding(){textStream(this,TextEncoderStream);return 'utf-8';}
+        get readable(){return textStream(this,TextEncoderStream).readable;}
+        get writable(){return textStream(this,TextEncoderStream).writable;}
     }
     class TextDecoderStream {
         constructor(label='utf-8',options={}){const dec=new decoder(label,options);
-            const transform=new TransformStream({transform(chunk,c){const text=apply(decode,dec,[chunk,{stream:true}]);if(text)c.enqueue(text);},flush(c){const text=apply(decode,dec,[]);if(text)c.enqueue(text);}});
-            for(const key of ['encoding','fatal','ignoreBOM'])Object.defineProperty(this,key,{value:dec[key],enumerable:true});
-            Object.defineProperties(this,{readable:{value:transform.readable,enumerable:true},writable:{value:transform.writable,enumerable:true}});
+            // A chunk is an AllowSharedBufferSource; undefined is not one.
+            const transform=new TransformStream({transform(chunk,c){if(chunk===undefined)throw new TypeError('Expected a BufferSource');const text=apply(decode,dec,[chunk,{stream:true}]);if(text)c.enqueue(text);},flush(c){const text=apply(decode,dec,[]);if(text)c.enqueue(text);}});
+            apply(textSet,textStreams,[this,{type:TextDecoderStream,decoder:dec,readable:apply(readableOf,transform,[]),writable:apply(writableOf,transform,[])}]);
+        }
+        get encoding(){return apply(encodingOf,textStream(this,TextDecoderStream).decoder,[]);}
+        get fatal(){return apply(fatalOf,textStream(this,TextDecoderStream).decoder,[]);}
+        get ignoreBOM(){return apply(ignoreBOMOf,textStream(this,TextDecoderStream).decoder,[]);}
+        get readable(){return textStream(this,TextDecoderStream).readable;}
+        get writable(){return textStream(this,TextDecoderStream).writable;}
+    }
+    for(const [Type,name] of [[TextEncoderStream,'TextEncoderStream'],[TextDecoderStream,'TextDecoderStream']]){
+        Object.defineProperty(Type.prototype,Symbol.toStringTag,{value:name,configurable:true});
+        for(const key of Object.getOwnPropertyNames(Type.prototype)){
+            if(key==='constructor')continue;
+            const d=Object.getOwnPropertyDescriptor(Type.prototype,key);d.enumerable=true;
+            Object.defineProperty(Type.prototype,key,d);
         }
     }
     Object.assign(globalThis,types,{TextEncoderStream,TextDecoderStream});
