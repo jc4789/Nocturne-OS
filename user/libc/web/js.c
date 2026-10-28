@@ -2413,9 +2413,10 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
         sbuf text={0};if(!css_radius_serialize(st,radius_corner,&text,d)){sb_free(&text);return JS_ThrowInternalError(ctx,"CSS radius serialization failed");}
         JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;
     }
-    if (!strcmp(property,"filter") || !strcmp(property,"box-shadow") || !strcmp(property,"clip")) {
+    if (!strcmp(property,"filter") || !strcmp(property,"backdrop-filter") || !strcmp(property,"box-shadow") || !strcmp(property,"clip")) {
         sbuf text={0};
-        bool serialized = !strcmp(property,"filter") ? css_filter_serialize(st->filter,&text,d) :
+        bool serialized = !strcmp(property,"filter") ? css_filter_serialize(st,st->filter,&text,d) :
+            !strcmp(property,"backdrop-filter") ? css_filter_serialize(st,st->backdrop_filter,&text,d) :
             !strcmp(property,"clip") ? css_clip_rect_serialize(&st->clip,&text) :
             css_shadow_serialize(st->box_shadow,&text,d);
         if (!serialized) {

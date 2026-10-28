@@ -175,51 +175,6 @@ static bool parse_number(const char **ps, const char *e, float *out) {
     return true;
 }
 
-/* The implemented filter backend is a real opacity function list. Preserve
-   computed numbers/percentages (including values above one), while clipping
-   only their used amounts. Unknown effects invalidate the whole declaration. */
-static bool parse_filter(const char *v, size_t n, struct cx *cx, const struct css_filter **out) {
-    if (ident_is(v, n, "none")) { *out = NULL; return true; }
-    size_t count = 0;
-    const char *end = v + n;
-    struct css_filter *result = NULL;
-    for (unsigned pass = 0; pass < 2; pass++) {
-        const char *q = v;
-        size_t i = 0;
-        float used = 1;
-        while (q < end) {
-            while (q < end && is_space((unsigned char)*q)) q++;
-            if (q == end) break;
-            if ((size_t)(end - q) < 8 || !strn_ieq(q, "opacity", 7) || q[7] != '(') return false;
-            q += 8;
-            while (q < end && is_space((unsigned char)*q)) q++;
-            float value = 1;
-            bool percentage = false;
-            if (q == end) return false;
-            if (*q != ')') {
-                if (!parse_number(&q, end, &value) || !isfinite(value) || value < 0) return false;
-                if (q < end && *q == '%') { percentage = true; q++; }
-                while (q < end && is_space((unsigned char)*q)) q++;
-            }
-            if (q == end || *q++ != ')') return false;
-            if (i == SIZE_MAX) return false;
-            if (pass) result->steps[i] = (struct css_filter_step){value, percentage};
-            i++;
-            float amount = percentage ? value / 100 : value;
-            used *= amount > 1 ? 1 : amount;
-            if (!(i & 63) && !cx->supports_probe && cx->node && !web_native_checkpoint(cx->node->owner)) return false;
-        }
-        if (!i) return false;
-        if (!pass) {
-            count = i;
-            if (count > (SIZE_MAX - sizeof *result) / sizeof *result->steps) return false;
-            result = ar_alloc(cx->a, sizeof *result + count * sizeof *result->steps);
-        } else { result->count = count; result->opacity = used; }
-    }
-    *out = result;
-    return true;
-}
-
 /* ---------------------------------------------------------------- lengths and numbers (cssmath.c owns the math) */
 /* Unlike the general sb_put API, the author-readable paths report OOM. */
 static bool length_append(sbuf *out, const char *text, size_t length) {
@@ -259,26 +214,6 @@ bool css_shadow_serialize(const struct css_box_shadow *shadow, sbuf *out, web_do
             length_number(out, shadow->spread, "px") && (!shadow->inset || length_append(out, " inset", 6));
     }
     if (!success) { out->n = original; if (out->p && original < out->cap) out->p[original] = 0; }
-    return success;
-}
-bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d) {
-    size_t original = out->n;
-    bool success = false;
-    if (!filter) success = length_append(out, "none", 4);
-    else if (filter->count) {
-        success = true;
-        for (size_t i = 0; i < filter->count; i++) {
-            if (!(i & 63) && d && !web_native_checkpoint(d)) { success = false; break; }
-            const struct css_filter_step *step = &filter->steps[i];
-            if (step->value < 0 || (i && !length_append(out, " ", 1)) ||
-                !length_append(out, "opacity(", 8) || !length_number(out, step->value, step->percentage ? "%" : "") ||
-                !length_append(out, ")", 1)) { success = false; break; }
-        }
-    }
-    if (!success) {
-        out->n = original;
-        if (out->p && original < out->cap) out->p[original] = 0;
-    }
     return success;
 }
 /* a math function's infinity is the largest value a float field keeps (CSS Values 4 §10.12) */
@@ -372,6 +307,282 @@ bool css_number_token(const char **s, const char *end, float *out) { return pars
 /* a <color> for a property that keeps only the 8-bit used value (COLOR_CURRENT for currentcolor) */
 static bool css_color_checked(const char *s, size_t n, uint32_t *out, struct cx *cx) {
     return css_color_value_compute(s, n, cx, NULL, out, NULL);
+}
+
+/* ---------------------------------------------------------------- <filter-value-list> (Filter Effects 1 §5, §6) */
+static const struct { const char *name; uint8_t kind; } filter_functions[] = {
+    {"blur", CSS_FILTER_BLUR}, {"brightness", CSS_FILTER_BRIGHTNESS}, {"contrast", CSS_FILTER_CONTRAST},
+    {"drop-shadow", CSS_FILTER_DROP_SHADOW}, {"grayscale", CSS_FILTER_GRAYSCALE}, {"hue-rotate", CSS_FILTER_HUE_ROTATE},
+    {"invert", CSS_FILTER_INVERT}, {"opacity", CSS_FILTER_OPACITY}, {"saturate", CSS_FILTER_SATURATE},
+    {"sepia", CSS_FILTER_SEPIA}};
+static const char *filter_function_name(uint8_t kind) {
+    for (size_t i = 0; i < sizeof filter_functions / sizeof *filter_functions; i++)
+        if (filter_functions[i].kind == kind) return filter_functions[i].name;
+    return "url";
+}
+/* grayscale(), invert(), opacity() and sepia() clamp their amounts to 1 (§6.1) */
+static bool filter_clamped(uint8_t kind) {
+    return kind == CSS_FILTER_GRAYSCALE || kind == CSS_FILTER_INVERT || kind == CSS_FILTER_OPACITY || kind == CSS_FILTER_SEPIA;
+}
+/* the initial value for interpolation (§6.1): 1 for the amounts that scale, 0 for the rest (and a
+   transparent shadow of no length) */
+static float filter_lacuna(uint8_t kind) {
+    return kind == CSS_FILTER_BRIGHTNESS || kind == CSS_FILTER_CONTRAST || kind == CSS_FILTER_OPACITY ||
+           kind == CSS_FILTER_SATURATE ? 1 : 0;
+}
+/* what an omitted amount defaults to (§6.1): no blur, no rotation, the whole effect otherwise */
+static float filter_omitted(uint8_t kind) { return kind == CSS_FILTER_BLUR || kind == CSS_FILTER_HUE_ROTATE ? 0 : 1; }
+/* a function that leaves every pixel as it was: it adds nothing to the group but the group itself */
+static bool filter_step_identity(const struct css_filter_step *s) {
+    switch (s->kind) {
+    case CSS_FILTER_BLUR: case CSS_FILTER_GRAYSCALE: case CSS_FILTER_INVERT: case CSS_FILTER_SEPIA: return s->value <= 0;
+    case CSS_FILTER_BRIGHTNESS: case CSS_FILTER_CONTRAST: case CSS_FILTER_SATURATE: return s->value == 1;
+    case CSS_FILTER_HUE_ROTATE: return fmod(s->value, 360) == 0;
+    case CSS_FILTER_DROP_SHADOW: return s->color != COLOR_CURRENT && !(s->color >> 24);
+    }
+    return false;
+}
+/* the next item of a <filter-value-list> at *ps: a function's name and argument (the text between
+   its parentheses); one the end of the value leaves open is closed there (CSS Syntax 3 §5.4.9) */
+static bool filter_next(const char **ps, const char *e, const char **name, size_t *nn, const char **arg, size_t *an) {
+    const char *p = *ps;
+    while (p < e && is_space((unsigned char)*p)) p++;
+    const char *start = p;
+    while (p < e && (isalnum((unsigned char)*p) || *p == '-' || *p == '_' || (unsigned char)*p >= 0x80)) p++;
+    if (p == start || p >= e || *p != '(' || isdigit((unsigned char)*start)) return false;
+    *name = start;
+    *nn = (size_t)(p - start);
+    const char *a = ++p;
+    unsigned depth = 0;
+    for (; p < e; p++) {
+        if (*p == '"' || *p == '\'') {
+            char q = *p;
+            for (p++; p < e && *p != q; p++) if (*p == '\\' && p + 1 < e) p++;
+            if (p >= e) break;
+        } else if (*p == '\\' && p + 1 < e) p++;
+        else if (*p == '(') depth++;
+        else if (*p == ')') { if (!depth) break; depth--; }
+    }
+    *arg = a;
+    *an = (size_t)((p < e ? p : e) - a);
+    *ps = p < e ? p + 1 : e;
+    return true;
+}
+/* a literal numeric token's specified serialization: its number as CSSOM writes one, its unit in
+   lowercase (unit when it has none); max: the largest number it keeps */
+static bool filter_literal_specified(sbuf *out, const char *s, size_t n, const char *unit, float max) {
+    const char *p = s;
+    float number;
+    if (!parse_number(&p, s + n, &number)) return false;
+    css_number_serialize(out, number > max ? max : number);
+    if (p == s + n) sb_puts(out, unit);
+    else for (; p < s + n; p++) sb_putc(out, (char)tolower((unsigned char)*p));
+    return true;
+}
+/* an amount: <number> | <percentage> (hue-rotate(): <angle> | <zero>), as a number (an angle in degrees) */
+static bool filter_amount(const char *s, size_t n, uint8_t kind, struct cx *cx, float *out, sbuf *specified) {
+    trim(&s, &n);
+    if (!n) { *out = filter_omitted(kind); return true; }
+    bool angle = kind == CSS_FILTER_HUE_ROTATE, math = css_calc_is_math(s, n), exact = cx->computed_text;
+    unsigned accept = angle ? CSS_CALC_ANGLE : CSS_CALC_NUMBER | CSS_CALC_PERCENT, type = 0;
+    double v;
+    /* a percentage is its own type here: a basis of 100 keeps its value (the math of a calculation with
+       a percentage in it is resolved at computed-value time all the same) */
+    if (!css_numeric_read(s, n, accept, cx, cx->a, 100, &v, &type)) {
+        const char *p = s;
+        float zero;
+        if (!angle || math || !parse_number(&p, s + n, &zero) || p != s + n || zero != 0) return false;
+        v = 0;
+        type = CSS_CALC_ANGLE;
+    }
+    if (type == CSS_CALC_PERCENT) v /= 100;
+    /* the animation layer's sums keep their value until the one they end in is used */
+    if (!angle && v < 0) {
+        if (!math && !exact) return false; /* negative values are not allowed */
+        if (!exact) v = 0;                 /* a calculation clamps to the range (CSS Values 4 §10.12) */
+    }
+    if (filter_clamped(kind) && v > 1 && !exact) v = 1;
+    *out = calc_float(v);
+    if (!specified) return true;
+    if (math) return css_calc_specified(s, n, accept, specified);
+    bool percent = s[n - 1] == '%';
+    return filter_literal_specified(specified, s, n, angle ? "deg" : "", filter_clamped(kind) ? percent ? 100 : 1 : INFINITY);
+}
+/* a <length> of blur() or drop-shadow(), without percentages; only an offset may be negative */
+static bool filter_length(const char *s, size_t n, bool offset, struct cx *cx, float *out, sbuf *specified) {
+    trim(&s, &n);
+    len_t l;
+    if (!parse_len(s, n, cx, &l, LF_NOPCT | LF_LENGTH | (offset || cx->computed_text ? LF_NEG : 0)) || l.kind != LK_LEN ||
+        l.pct || !isfinite(l.px)) return false;
+    *out = l.px;
+    if (!specified) return true;
+    if (css_calc_is_math(s, n)) return css_calc_specified(s, n, CSS_CALC_LENGTH, specified);
+    return filter_literal_specified(specified, s, n, "px", INFINITY);
+}
+/* drop-shadow( [ <color>? && <length>{2,3} ] ): the colour before or after the lengths */
+static bool filter_shadow(const char *s, size_t n, struct cx *cx, struct css_filter_step *step, sbuf *specified) {
+    trim(&s, &n);
+    const char *t[5];
+    size_t tl[5];
+    int count = split_checked(s, n, t, tl, 5, ' ', cx);
+    if (count < 2 || count > 4) return false;
+    const char *consumed = t[count - 1] + tl[count - 1];
+    while (consumed < s + n && is_space((unsigned char)*consumed)) consumed++;
+    if (consumed != s + n) return false;
+    int color = -1, lengths[3], nl = 0;
+    float *field[3] = {&step->x, &step->y, &step->value};
+    step->color = COLOR_CURRENT;
+    for (int i = 0; i < count; i++) {
+        uint32_t argb;
+        const struct css_color_value *value;
+        if (color < 0 && (i == 0 || i == count - 1) && css_color_value_compute(t[i], tl[i], cx, NULL, &argb, &value)) {
+            color = i;
+            step->color = argb;
+            step->color_value = value;
+            continue;
+        }
+        if (nl == 3 || !filter_length(t[i], tl[i], nl < 2, cx, field[nl], NULL)) return false;
+        lengths[nl++] = i;
+    }
+    if (nl < 2) return false;
+    if (!specified) return true;
+    if (color >= 0 && (!css_color_specified(t[color], tl[color], specified) || !length_append(specified, " ", 1))) return false;
+    for (int i = 0; i < nl; i++) {
+        float ignored;
+        if ((i && !length_append(specified, " ", 1)) || !filter_length(t[lengths[i]], tl[lengths[i]], i < 2, cx, &ignored, specified))
+            return false;
+    }
+    return true;
+}
+/* filter, backdrop-filter: none | <filter-value-list>; specified (may be NULL): its CSSOM serialization */
+static bool parse_filter(const char *v, size_t n, struct cx *cx, const struct css_filter **out, sbuf *specified) {
+    trim(&v, &n);
+    if (ident_is(v, n, "none")) {
+        *out = NULL;
+        return !specified || length_append(specified, "none", 4);
+    }
+    const char *e = v + n, *name, *arg;
+    size_t nn, an, count = 0;
+    for (const char *p = v;;) {
+        while (p < e && is_space((unsigned char)*p)) p++;
+        if (p == e) break;
+        if (!filter_next(&p, e, &name, &nn, &arg, &an) || count == SIZE_MAX) return false;
+        count++;
+    }
+    if (!count || count > (SIZE_MAX - sizeof(struct css_filter)) / sizeof(struct css_filter_step)) return false;
+    size_t size = sizeof(struct css_filter) + count * sizeof(struct css_filter_step);
+    struct css_filter *f = ar_alloc(cx->a, size);
+    memset(f, 0, size);
+    f->count = count;
+    double opacity = 1;
+    const char *p = v;
+    for (size_t i = 0; i < count; i++) {
+        filter_next(&p, e, &name, &nn, &arg, &an);
+        struct css_filter_step *step = &f->steps[i];
+        if (specified && i && !length_append(specified, " ", 1)) return false;
+        if (ident_is(name, nn, "url")) {
+            /* a reference to a filter element: the chain is the element's primitives (§8) */
+            sbuf text = {0};
+            sb_puts(&text, "url(");
+            sb_put(&text, arg, an);
+            sb_putc(&text, ')');
+            step->kind = CSS_FILTER_URL;
+            step->url = text.p ? css_parse_url(text.p, text.n, cx->a) : NULL;
+            sb_free(&text);
+            if (!step->url) return false;
+            f->effects = true;
+            if (specified) {
+                sb_puts(specified, "url(");
+                css_serialize_string(specified, step->url);
+                sb_putc(specified, ')');
+            }
+            continue;
+        }
+        size_t k = 0;
+        while (k < sizeof filter_functions / sizeof *filter_functions && !ident_is(name, nn, filter_functions[k].name)) k++;
+        if (k == sizeof filter_functions / sizeof *filter_functions) return false;
+        step->kind = filter_functions[k].kind;
+        if (specified) { sb_puts(specified, filter_functions[k].name); sb_putc(specified, '('); }
+        const char *a = arg;
+        size_t al = an;
+        trim(&a, &al);
+        bool ok = step->kind == CSS_FILTER_BLUR ? !al || filter_length(a, al, false, cx, &step->value, specified) :
+                  step->kind == CSS_FILTER_DROP_SHADOW ? filter_shadow(a, al, cx, step, specified) :
+                  filter_amount(a, al, step->kind, cx, &step->value, specified);
+        if (!ok) return false;
+        if (specified) sb_putc(specified, ')');
+        if (step->kind == CSS_FILTER_OPACITY) opacity *= step->value < 0 ? 0 : step->value > 1 ? 1 : step->value;
+        else if (!filter_step_identity(step)) f->effects = true;
+        if (!(i & 63) && i && !cx->supports_probe && cx->node && !web_native_checkpoint(cx->node->owner)) return false;
+    }
+    /* a list of opacity() amounts alone is group opacity (paint.c composites it so) */
+    f->opacity = f->effects ? 1 : (float)opacity;
+    *out = f;
+    return true;
+}
+bool css_filter_specified(const char *s, size_t n, sbuf *out) {
+    size_t begin = out->n;
+    arena_t *arena = calloc(1, sizeof *arena);
+    if (!arena) return false;
+    jmp_buf trap;
+    arena->trap = &trap;
+    bool ok = false;
+    if (!setjmp(trap)) {
+        struct cx cx = {.em = 16, .rem = 16, .vw = 800, .vh = 600, .a = arena, .supports_probe = true};
+        const struct css_filter *ignored;
+        ok = parse_filter(s, n, &cx, &ignored, out) && !cx.invalid;
+    }
+    ar_free(arena);
+    free(arena);
+    if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    return ok;
+}
+/* a drop-shadow()'s colour: currentcolor resolved against st (CSSOM's resolved value), or kept (st NULL)
+   for the cascade to resolve when the animation layer's text is read back */
+static bool filter_color_text(const style_t *st, const struct css_filter_step *s, sbuf *out) {
+    struct css_color_computed c;
+    css_color_held(s->color, s->color_value, st ? st->color : 0xFF000000u, &c);
+    if (!st) return c.current ? css_color_value_specified(c.current, out) : css_color_animation_text(&c.color, out);
+    if (!c.current) return css_color_serialize(&c.color, false, out);
+    struct css_color_computed current;
+    css_style_color(st, CSS_SLOT_COLOR, &current);
+    struct css_color used;
+    css_color_resolve(&c, &current.color, &used);
+    return css_color_serialize(&used, false, out);
+}
+bool css_filter_serialize(const style_t *st, const struct css_filter *filter, sbuf *out, web_doc *d) {
+    size_t original = out->n;
+    bool ok = true;
+    if (!filter) ok = length_append(out, "none", 4);
+    for (size_t i = 0; filter && i < filter->count && ok; i++) {
+        if (!(i & 63) && i && d && !web_native_checkpoint(d)) { ok = false; break; }
+        const struct css_filter_step *s = &filter->steps[i];
+        if (i && !length_append(out, " ", 1)) { ok = false; break; }
+        if (s->kind == CSS_FILTER_URL) {
+            sb_puts(out, "url(");
+            css_serialize_string(out, s->url);
+            sb_putc(out, ')');
+            continue;
+        }
+        sb_puts(out, filter_function_name(s->kind));
+        sb_putc(out, '(');
+        /* the value used: what the animation layer's sums hold clamps to the function's range */
+        double v = s->value;
+        if (s->kind != CSS_FILTER_HUE_ROTATE && v < 0) v = 0;
+        if (filter_clamped(s->kind) && v > 1) v = 1;
+        if (s->kind == CSS_FILTER_DROP_SHADOW) {
+            ok = filter_color_text(st, s, out) && length_append(out, " ", 1);
+            css_number_serialize(out, s->x);
+            sb_puts(out, "px ");
+            css_number_serialize(out, s->y);
+            sb_puts(out, "px ");
+        }
+        css_number_serialize(out, v);
+        sb_puts(out, s->kind == CSS_FILTER_BLUR || s->kind == CSS_FILTER_DROP_SHADOW ? "px" : s->kind == CSS_FILTER_HUE_ROTATE ? "deg" : "");
+        sb_putc(out, ')');
+    }
+    if (!ok) { out->n = original; if (out->p && original < out->cap) out->p[original] = 0; }
+    return ok;
 }
 
 /* ---------------------------------------------------------------- the property table */
@@ -643,6 +854,8 @@ static const struct kw kw_gflow[] = {{"row", 0}, {"column", 1}, {"dense", 0}, {"
 static const struct kw kw_capside[] = {{"top", 0}, {"bottom", 1}, {"block-start", 0}, {"block-end", 1}, {0}};
 static const struct kw kw_tlayout[] = {{"auto", 0}, {"fixed", 1}, {0}};
 static const struct kw kw_svg_fill_rule[] = {{"nonzero", 0}, {"evenodd", 1}, {0}};
+/* Filter Effects 1 §10: the canonical names are lowercase */
+static const struct kw kw_color_interpolation_filters[] = {{"linearrgb", CIF_LINEARRGB}, {"auto", CIF_AUTO}, {"srgb", CIF_SRGB}, {0}};
 static const struct kw kw_svg_cap[] = {{"butt", 0}, {"round", 1}, {"square", 2}, {0}};
 static const struct kw kw_svg_join[] = {{"miter", 0}, {"round", 1}, {"bevel", 2}, {0}};
 static const struct kw kw_bstyle[] = {{"none", BS_NONE}, {"hidden", BS_HIDDEN}, {"solid", BS_SOLID},
@@ -801,6 +1014,8 @@ static struct propdef props[] = {
     {"fill", PT_SVG_PAINT, 0, true, O(svg_fill), NULL, 0, AN_TYPE},
     {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0, AN_TYPE},
     {"filter", PT_FILTER, 0, false, O(filter), NULL, 0, AN_TYPE},
+    {"backdrop-filter", PT_FILTER, 0, false, O(backdrop_filter), NULL, 0, AN_TYPE},
+    {"color-interpolation-filters", PT_KW, 0, true, O(color_interpolation_filters), kw_color_interpolation_filters, 0, AN_TYPE},
     {"clip", PT_CLIP, 0, false, O(clip), NULL, 0, AN_TYPE},
     {"clip-path", PT_SHAPE, CSS_SHAPE_CLIP_PATH, false, O(clip_path), NULL, 0, AN_TYPE},
     {"shape-outside", PT_SHAPE, CSS_SHAPE_OUTSIDE, false, OG(G_FLOAT_SHAPE, struct css_float_shape, outside), NULL, 0, AN_TYPE},
@@ -1148,6 +1363,7 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
         snprintf(text, sizeof text, "%d", (int)*(const int32_t *)field); sb_puts(out, text); return 1;
     case PT_COLOR: return css_style_color_text(st, color_slot(p), out) ? 1 : -1;
     case PT_COLOR_SCHEME: sb_puts(out, st->color_scheme_text ? st->color_scheme_text : "normal"); return 1;
+    case PT_FILTER: return css_filter_serialize(st, *(const struct css_filter *const *)field, out, d) ? 1 : -1;
     case PT_MOTION_LIST: case PT_SHAPE: case PT_OFFSET: case PT_ROTATE: case PT_SCALE: case PT_ANCHOR:
         return css_computed_value(st, p, out, d) ? 1 : -1;
     case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
@@ -1170,6 +1386,12 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
     if (ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") || ident_is(v, n, "revert") ||
         ident_is(v, n, "revert-layer")) return false;
     if (p->type == PT_COLOR || (p->type == PT_SVG_PAINT && !ident_is(v, n, "none"))) return css_color_specified(v, n, out);
+    if (p->type == PT_FILTER) return css_filter_specified(v, n, out);
+    /* a keyword serializes in ASCII lowercase (CSSOM "serialize a CSS component value"); the tables
+       write theirs so */
+    if (p->type == PT_KW && p->kws)
+        for (const struct kw *k = p->kws; k->name; k++)
+            if (ident_is(v, n, k->name)) { sb_puts(out, k->name); return true; }
     if (p->group == G_GAP_RULE || (p->type == PT_SHORT && p->sh == SH_GAP_RULE)) return gap_specified(p, v, n, out);
     if (p->group == G_ANCHOR || (p->type == PT_SHORT && p->sh == SH_POSITION_TRY)) return anchor_specified(p, v, n, out);
     /* a length (or a shorthand of lengths) with an anchor function in it; the rest as other lengths */
@@ -4111,7 +4333,7 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
         *(float *)field = x;
         return true;
     }
-    case PT_FILTER: return parse_filter(v, n, cx, &s->filter);
+    case PT_FILTER: return parse_filter(v, n, cx, (const struct css_filter **)field, NULL);
     case PT_SHAPE: return css_shape_parse(p->flags, v, n, cx, (const struct css_shape **)field, NULL);
     case PT_OFFSET: return css_offset_parse(p->flags, v, n, cx, field, NULL);
     case PT_RULE_LIST: {
@@ -5480,25 +5702,81 @@ static bool anim_shadows(sbuf *b, const style_t *sa, const style_t *sv, double k
     }
     return true;
 }
-static double filter_amount(const struct css_filter_step *s) { return s->percentage ? s->value / 100 : s->value; }
-static bool anim_filters(sbuf *b, const struct css_filter *x, const struct css_filter *y, double ka, double kb, int mode) {
+/* a drop-shadow()'s colour, currentcolor being st's */
+static void anim_filter_color(const style_t *st, const struct css_filter_step *s, struct css_color_computed *out) {
+    css_color_held(s->color, s->color_value, st->color, out);
+}
+/* an amount's computed-value text; final: the value an interpolation ends in, which clamps to the
+   function's range (a sum's amounts keep theirs until then) */
+static void anim_filter_amount(sbuf *b, uint8_t kind, double v, bool final) {
+    if (final && kind != CSS_FILTER_HUE_ROTATE && v < 0) v = 0;
+    if (final && filter_clamped(kind) && v > 1) v = 1;
+    anim_unit(b, v, kind == CSS_FILTER_BLUR ? "px" : kind == CSS_FILTER_HUE_ROTATE ? "deg" : "");
+}
+static bool anim_filter_text(sbuf *b, const style_t *st, const struct css_filter_step *s) {
+    if (s->kind == CSS_FILTER_URL) {
+        sb_puts(b, "url(");
+        css_serialize_string(b, s->url);
+        sb_putc(b, ')');
+        return true;
+    }
+    sb_puts(b, filter_function_name(s->kind));
+    sb_putc(b, '(');
+    if (s->kind == CSS_FILTER_DROP_SHADOW) {
+        struct css_color_computed c;
+        anim_filter_color(st, s, &c);
+        if (!anim_color_text(b, &c)) return false;
+        sb_putc(b, ' ');
+        anim_unit(b, s->x, "px ");
+        anim_unit(b, s->y, "px ");
+        anim_unit(b, s->value, "px");
+    } else anim_filter_amount(b, s->kind, s->value, false);
+    sb_putc(b, ')');
+    return true;
+}
+/* Filter Effects 1 §14: addition concatenates the lists (§14.2); interpolation and accumulation
+   pair the functions of two lists without url() whose common items are of one type each, the shorter
+   list extended with the initial values for interpolation of the longer one's functions (§14.1),
+   and accumulation adds the arguments, one-based where that initial value is 1 (§14.3).
+   Otherwise false: discrete, and replace for accumulation. */
+static bool anim_filters(sbuf *b, const style_t *sa, const struct css_filter *x, const style_t *sv, const struct css_filter *y,
+                         double ka, double kb, int mode) {
     size_t nx = x ? x->count : 0, ny = y ? y->count : 0;
     if (!nx && !ny) { sb_puts(b, "none"); return true; }
     if (mode == ADD) {
         for (size_t i = 0; i < nx + ny; i++) {
-            const struct css_filter_step *s = i < nx ? &x->steps[i] : &y->steps[i - nx];
             if (i) sb_putc(b, ' ');
-            sb_puts(b, "opacity("); anim_number(b, filter_amount(s)); sb_putc(b, ')');
+            if (!anim_filter_text(b, i < nx ? sa : sv, i < nx ? &x->steps[i] : &y->steps[i - nx])) return false;
         }
         return true;
     }
-    /* the shorter list pads with each function's initial value, opacity(1) */
     size_t n = nx > ny ? nx : ny;
     for (size_t i = 0; i < n; i++) {
-        double a = i < nx ? filter_amount(&x->steps[i]) : 1, c = i < ny ? filter_amount(&y->steps[i]) : 1;
-        double v = mode == ACCUMULATE ? a + c - 1 : a * ka + c * kb;
+        const struct css_filter_step *s = i < nx ? &x->steps[i] : NULL, *e = i < ny ? &y->steps[i] : NULL;
+        if ((s && s->kind == CSS_FILTER_URL) || (e && e->kind == CSS_FILTER_URL) || (s && e && s->kind != e->kind)) return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const struct css_filter_step *s = i < nx ? &x->steps[i] : NULL, *e = i < ny ? &y->steps[i] : NULL;
+        struct css_filter_step initial = {.kind = s ? s->kind : e->kind};
+        initial.value = filter_lacuna(initial.kind);
+        if (!s) s = &initial;
+        if (!e) e = &initial;
+        double v = s->value * ka + e->value * kb - (mode == ACCUMULATE && filter_lacuna(s->kind) == 1 ? 1 : 0);
         if (i) sb_putc(b, ' ');
-        sb_puts(b, "opacity("); anim_number(b, anim_clamp(v, 0, INFINITY)); sb_putc(b, ')');
+        sb_puts(b, filter_function_name(s->kind));
+        sb_putc(b, '(');
+        if (s->kind == CSS_FILTER_DROP_SHADOW) {
+            /* as a shadow: the colour, then the lengths */
+            struct css_color_computed cs, ce;
+            anim_filter_color(sa, s, &cs);
+            anim_filter_color(sv, e, &ce);
+            if (!anim_color(b, sa, &cs, sv, &ce, kb, mode)) return false;
+            sb_putc(b, ' ');
+            anim_unit(b, s->x * ka + e->x * kb, "px ");
+            anim_unit(b, s->y * ka + e->y * kb, "px ");
+            anim_unit(b, mode == MIX && v < 0 ? 0 : v, "px");
+        } else anim_filter_amount(b, s->kind, v, mode == MIX);
+        sb_putc(b, ')');
     }
     return true;
 }
@@ -5598,7 +5876,7 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         } else { snprintf(text, sizeof text, "%d", g->n); sb_puts(out, text); }
         break;
     }
-    case PT_FILTER: ok = css_filter_serialize(st->filter, out, d); break;
+    case PT_FILTER: ok = css_filter_serialize(NULL, *(const struct css_filter *const *)field, out, d); break;
     case PT_BOX_SHADOW: anim_shadow_list_text(out, st); break;
     case PT_RADIUS: ok = anim_pair_text(out, ((const struct css_corner_radius *)field)->axis, d); break;
     case PT_BG_POS: case PT_TRANSFORM_ORIGIN: ok = anim_pair_text(out, (const len_t *)field, d); break;
@@ -5698,9 +5976,20 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         return !x && !y;
     }
     case PT_FILTER: {
-        const struct css_filter *x = a->filter, *y = b->filter;
+        const struct css_filter *x = *(const struct css_filter *const *)fa, *y = *(const struct css_filter *const *)fb;
         if (!x || !y) return x == y;
-        return x->count == y->count && !memcmp(x->steps, y->steps, x->count * sizeof *x->steps);
+        if (x->count != y->count) return false;
+        for (size_t i = 0; i < x->count; i++) {
+            const struct css_filter_step *s = &x->steps[i], *e = &y->steps[i];
+            if (s->kind != e->kind || s->value != e->value || s->x != e->x || s->y != e->y || !same_text(s->url, e->url))
+                return false;
+            if (s->kind != CSS_FILTER_DROP_SHADOW) continue;
+            struct css_color_computed u, v;
+            anim_filter_color(a, s, &u);
+            anim_filter_color(b, e, &v);
+            if (!css_color_computed_equal(&u, &v)) return false;
+        }
+        return true;
     }
     case PT_COLOR: case PT_SVG_PAINT: {
         if (p->type == PT_SVG_PAINT) {
@@ -5969,7 +6258,8 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
         return true;
     }
     case PT_BOX_SHADOW: return anim_shadows(out, a, b, ka, kb, mode);
-    case PT_FILTER: return anim_filters(out, a->filter, b->filter, ka, kb, mode);
+    case PT_FILTER:
+        return anim_filters(out, a, *(const struct css_filter *const *)fa, b, *(const struct css_filter *const *)fb, ka, kb, mode);
     case PT_SHAPE: /* css-shapes-1 §3.4, motion-1 §2.1; accumulation is addition */
         return css_shape_combine(p->flags, *(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb,
                                  kb, mode != MIX, out, d);

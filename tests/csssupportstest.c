@@ -164,13 +164,17 @@ static web_doc *filter_document(const char *value, node_t **probe) {
     if(css_select(d,d->root,"#probe",&nodes)&&nodes.n==1)*probe=nodes.v[0];
     pv_free(&nodes);return d;
 }
+/* Filter Effects 1 §13 and §15: a percentage computes to its number and opacity() to at most 1;
+   a list of opacity() alone is the group's opacity, any other function is an effect to paint. */
 static void test_filter_values(void) {
-    const struct {const char *value,*text;float used;size_t count;} cases[]={
-        {"none","none",1,0},{"opacity()","opacity(1)",1,1},
-        {"opacity(.5)","opacity(0.5)",.5f,1},{"opacity(25%)","opacity(25%)",.25f,1},
-        {"opacity(200%) opacity(2)","opacity(200%) opacity(2)",1,2},
-        {"opacity(.5) opacity(50%)","opacity(0.5) opacity(50%)",.25f,2},
-        {"opacity(0) opacity(4)","opacity(0) opacity(4)",0,2}
+    const struct {const char *value,*text;float used;size_t count;bool effects;} cases[]={
+        {"none","none",1,0,false},{"opacity()","opacity(1)",1,1,false},
+        {"opacity(.5)","opacity(0.5)",.5f,1,false},{"opacity(25%)","opacity(0.25)",.25f,1,false},
+        {"opacity(200%) opacity(2)","opacity(1) opacity(1)",1,2,false},
+        {"opacity(.5) opacity(50%)","opacity(0.5) opacity(0.5)",.25f,2,false},
+        {"opacity(0) opacity(4)","opacity(0) opacity(1)",0,2,false},
+        {"blur(1px)","blur(1px)",1,1,true},{"blur(0px)","blur(0px)",1,1,false},
+        {"grayscale(150%) opacity(.5)","grayscale(1) opacity(0.5)",1,2,true}
     };
     for(size_t i=0;i<sizeof cases/sizeof *cases;i++) {
         node_t *probe=NULL;web_doc *d=filter_document(cases[i].value,&probe);sbuf out={0};
@@ -178,12 +182,14 @@ static void test_filter_values(void) {
         const struct css_filter *f=probe&&probe->style?probe->style->filter:NULL;
         check("none versus identity filter",cases[i].count?f&&f->count==cases[i].count:!f,true);
         check("filter used step clamp/product",(f?f->opacity:1)==cases[i].used,true);
-        check("filter real computed list serialization",probe&&css_filter_serialize(f,&out,d)&&out.p&&
+        check("filter effects beyond opacity",f?f->effects==cases[i].effects:!cases[i].effects,true);
+        check("filter real computed list serialization",probe&&css_filter_serialize(probe->style,f,&out,d)&&out.p&&
             !strcmp(out.p,cases[i].text)&&out.p[out.n]==0,true);
         check("filter not inherited into descendants",probe&&probe->first&&probe->first->style&&!probe->first->style->filter,true);
         sb_free(&out);if(d)web_free(d);
     }
-    node_t *probe=NULL;web_doc *d=filter_document("opacity(.5);filter:blur(1px)",&probe);sbuf out={0};
+    /* a negative blur() is invalid (§13.1) */
+    node_t *probe=NULL;web_doc *d=filter_document("opacity(.5);filter:blur(-1px)",&probe);sbuf out={0};
     check("invalid effect preserves valid cascade",probe&&probe->style&&probe->style->filter&&
         probe->style->filter->opacity==.5f,true);
     if(probe&&probe->style) {
@@ -201,7 +207,7 @@ static void test_filter_values(void) {
     len_t held={.kind=LK_AUTO};css_length_serialize(&held,&out,NULL);
     if(d)d->native_cancelled=true;
     check("filter cancellation restores caller prefix",probe&&probe->style&&
-        !css_filter_serialize(probe->style->filter,&out,d)&&out.n==4&&!strcmp(out.p,"auto"),true);
+        !css_filter_serialize(probe->style,probe->style->filter,&out,d)&&out.n==4&&!strcmp(out.p,"auto"),true);
     sb_free(&out);if(d)web_free(d);
 }
 static uint32_t filter_pixels[32*32];
