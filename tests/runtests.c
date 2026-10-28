@@ -254,6 +254,9 @@ static const struct test tests[] = {
      {"Navigator languages=", "navigatortest: 264 checks, 0 failed"}, "FAIL", 120, false, true},
     {"browserdeferred", "hover-fifo-boundaries", "tcc -IC:\\Tests -o .\\browserdeferredtest C:\\Tests\\browserdeferredtest.c && .\\browserdeferredtest", 0,
      {"browserdeferred: 27 checks, 0 failed"}, "FAIL", 120, false, true},
+    /* The WPT automation tool's own check (--wpt-automation), not a browser behaviour. */
+    {"automation", "wpt-tool-port", "tcc -IC:\\Tests -o .\\automationtest C:\\Tests\\automationtest.c && .\\automationtest", 0,
+     {"automation: 86 checks, 0 failed"}, "FAIL", 120, false, true},
     {"canvasgradient", "native-linear-radial-rgba", "tcc -IC:\\Tests -o .\\canvasgradienttest C:\\Tests\\canvasgradienttest.c && .\\canvasgradienttest", 0,
      {"canvasgradient: 89 checks, 0 failed"}, "FAIL", 120, false, true},
     {"lineclamp", "legacy-native-fragments", "tcc -IC:\\Tests -o .\\lineclamptest C:\\Tests\\lineclamptest.c && .\\lineclamptest", 0,

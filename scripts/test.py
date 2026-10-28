@@ -316,6 +316,7 @@ def test_files(a, tcp_port, web_ports, scratch):
     srcs.append(os.path.join(source_root, "user", "libc", "web", "js_canvas.h"))
     srcs.append(os.path.join(source_root, "third_party", "quickjs", "quickjs.h"))
     srcs.append(os.path.join(source_root, "user", "apps", "browser_events.h"))
+    srcs.append(os.path.join(source_root, "user", "apps", "browser_automation.h"))
     srcs += [os.path.join(source_root, "user", "libc", "web", name) for name in
              ("form_value.h", "form_file.h", "form_face.h", "form_validation.h", "elements.h", "frame.h", "html_lexbor.h", "html_policy.h", "html_pi.h", "sandbox.h")]
     srcs += sorted(glob.glob(os.path.join(source_root, "tests", "*.h")))
