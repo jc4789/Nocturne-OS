@@ -681,6 +681,8 @@ void css_sheets_rescan(struct styling *st);
 bool css_sheets_rescanned(web_doc *d);
 /* parse a color; false if it is not one */
 bool css_color(const char *s, size_t n, uint32_t *out);
+/* The pixel size of the absolute-size keyword xx-small (0) .. xxx-large (7). */
+float css_font_keyword_px(unsigned keyword);
 
 /* properties (cssprop.c), used by the cascade in css.c */
 struct propdef;
@@ -1053,6 +1055,9 @@ struct web_doc {
     web_doc *frame_parent;
     uint32_t sandbox_flags; /* immutable active document restrictions */
     uint64_t sandbox_activation_until; /* only native trusted input writes this */
+    /* HTML's design mode enabled. js_document_commands.js owns it and writes it
+       here for the native readers: :read-write and the editing keys. */
+    bool design_mode;
     web_doc *frame_retired_next;
     node_t *frame_element;
     node_t *address_frame; /* native chrome selection; resolves the current child generation */
@@ -1481,6 +1486,11 @@ bool web_js_input_event(web_doc *d,node_t *target,const char *type,const char *i
 /* One physical edit task encloses beforeinput, native default and input. */
 void *web_js_edit_begin(web_doc *d);
 void web_js_edit_end(void *scope);
+/* The user's edit of an editing host, by its Input Events inputType or a caret
+   move (js_document_commands.js's editingAction); 1 when it was taken. */
+int web_js_editing_action(web_doc *d,const char *action,bool extend,const char *data,size_t length);
+/* The document selection's text, malloc owned; NULL when empty. */
+char *web_js_selection_text(web_doc *d,size_t *length);
 void web_js_selection_changed(web_doc *d, node_t *node);
 
 /* URL helpers (util.c) */

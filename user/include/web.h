@@ -486,6 +486,15 @@ int web_control_edit(web_doc *top, web_node *target, const char *input_type,
                      const char *data, size_t length);
 /* Caller owns the selected UTF-8 text. Password/default-copy is denied. */
 char *web_control_selected_text(web_doc *top, web_node *target, size_t *length);
+/* Whether the keys go to an editing host: the focused document (through its
+   frames) is in design mode, or its focus is in an element with contenteditable.
+   web_key then takes the typing, deleting, Enter and caret keys. */
+bool web_editing_target(web_doc *top);
+/* The user's clipboard edit of an editing host: "insertFromPaste" with the text,
+   or "deleteByCut". 1 when an editing host took it. */
+int web_editing_edit(web_doc *top, const char *input_type, const char *data, size_t length);
+/* Caller owns the UTF-8 text of the focused document's selection; NULL when empty. */
+char *web_selection_text(web_doc *top, size_t *length);
 struct web_control_activation { web_node *control, *previous; bool checked, indeterminate, radio; };
 void web_control_activation_begin(web_doc *d, web_node *control, struct web_control_activation *activation);
 bool web_control_activation_end(web_doc *d, struct web_control_activation *activation, bool allowed);

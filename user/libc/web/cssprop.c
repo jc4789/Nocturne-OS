@@ -1770,6 +1770,9 @@ static bool parse_display(const char *s, size_t n, uint8_t *out, struct cx *cx) 
 }
 
 static const float font_kw_px[] = {9, 10, 13, 16, 18, 24, 32, 48};
+float css_font_keyword_px(unsigned keyword) {
+    return font_kw_px[keyword < sizeof font_kw_px / sizeof *font_kw_px ? keyword : 3];
+}
 
 static bool parse_font_size(const char *s, size_t n, struct cx *cx, float *out) {
     static const char *const kws[] = {"xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"};
