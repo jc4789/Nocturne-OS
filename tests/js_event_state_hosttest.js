@@ -186,7 +186,7 @@ const workerEvents=workerSource.slice(workerStart,workerEnd)
     .replace('    /* @include js_error_event.js */',read('js_error_event.js'))
     .replace('    /* @include js_promise_rejection.js */',read('js_promise_rejection.js'))
     .replace('    /* @include js_custom_event.js */',read('js_custom_event.js'));
-const workerInit=new Function(`const apply=Reflect.apply,host={now:()=>1},report=e=>{throw e;},workerAbortBridge={brand:()=>false};
+const workerInit=new Function(`const apply=Reflect.apply,host={now:()=>1},report=e=>{throw e;},abortBridge={signals:{is:()=>false},listen(){}};
     ${workerEvents}
     const target=new EventTarget();return {Event,ErrorEvent,EventTarget,native:dispatchNativeWorkerEvent,target};`);
 const worker=workerInit(),wt=new worker.EventTarget();let workerChecks=0;

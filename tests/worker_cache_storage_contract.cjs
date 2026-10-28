@@ -22,8 +22,8 @@ function slice(start, end) {
     assert(a >= 0 && b > a, start);
     return source.slice(a, b + end.length);
 }
-const fetchPart = slice('    const workerAbortBridge=(()=>{', '    const {Headers,Request,Response,fetch}=fetchBridge;\n');
-assert(fetchPart.includes('/* @include js_fetch.js */') && !source.includes('workerFetchBridge'));
+const fetchPart = slice('    /* @include js_abort.js */', '    const {Headers,Request,Response,fetch}=fetchBridge;\n');
+assert(fetchPart.includes('/* @include js_fetch.js */') && !source.includes('workerFetchBridge') && !source.includes('workerAbortBridge'));
 
 const broker = makeBroker();
 const digest = (algorithm, bytes) => new Uint8Array(crypto.createHash(algorithm.replace('-', '').toLowerCase()).update(Buffer.from(bytes)).digest()).buffer;
@@ -42,11 +42,14 @@ function report(e){reported.push(e);}
 function timer(fn,ms,args){setTimeout(()=>fn(...(args||[])),0);return 1;}
 function clearTimer(){}
 function dispatchNativeWorkerEvent(target,event){return EventTarget.prototype.dispatchEvent.call(target,event);}
+let abortHandlerTarget=()=>false;
+function installHandlers(prototype,types){for(const type of types)Object.defineProperty(prototype,'on'+type,{configurable:true,enumerable:true,writable:true,value:null});}
 Object.assign(host,{now:()=>Date.now(),securityURL:()=>address,referrerPolicy:()=>7,cryptoDigest:digest,
     dataURL:url=>[new TextEncoder().encode(decodeURIComponent(url.slice(url.indexOf(',')+1))).buffer,'text/plain'],
     request(q,stream){sent.push({...q,stream,proto:Object.getPrototypeOf(q)});return sent.length;},resume(id){resumed.push(id);},cancel(id){cancelled.push(id);}});
 `);
-run(fetchPart.replace('/* @include js_fetch.js */', fs.readFileSync(web + 'js_fetch.js', 'utf8')));
+run(fetchPart.replace('/* @include js_abort.js */', fs.readFileSync(web + 'js_abort.js', 'utf8'))
+    .replace('/* @include js_fetch.js */', fs.readFileSync(web + 'js_fetch.js', 'utf8')));
 run(fs.readFileSync(web + 'js_cache_storage.js', 'utf8') +
     `\nconst policy={value:0};installCacheStorage({...fetchBridge.cache,secure:true,native:broker.native,embedderPolicy:()=>policy.value,streams:streamBridge});`);
 const caches = () => run("Object.getOwnPropertyDescriptor(globalThis,'caches').get.call(globalThis)");

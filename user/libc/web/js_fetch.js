@@ -1,7 +1,7 @@
 /* Fetch API (https://fetch.spec.whatwg.org/#fetch-api, consulted 2026-10-28): Headers, Request,
    Response, the Body mixin and fetch(), one definition for a Window and a Worker realm.
    fetchInterfaces(realm) builds them over what differs between the two:
-     realm.signals    the realm's AbortSignal (js_abort.js in a Window, the Worker runtime's own):
+     realm.signals    the realm's AbortSignal (js_abort.js's abortInterfaces, in both realms):
                       is, aborted, reason, follow, any (a dependent signal) and controller.
      realm.transport  the native transport that carries a request: noCors(), streaming(),
                       fetch(query, notify) -> {id, promise}, resume(id), cancel(id). A Window's is

@@ -42,7 +42,7 @@
     /* @include js_custom_event.js */
     const CustomEvent=customEventInterface(Event,eventState);
     function workerListeners(value){const m=apply(eventGet,listeners,[value]);if(!m)throw new TypeError('Illegal EventTarget receiver');return m;}
-    function removeWorkerListener(list,entry){if(entry.removed)return;entry.removed=true;const index=apply(eventIndexOf,list,[entry]);if(index>=0)apply(eventSplice,list,[index,1]);if(entry.unlisten){entry.unlisten();entry.unlisten=null;}}
+    function removeWorkerListener(target,list,entry){if(entry.removed)return;entry.removed=true;const index=apply(eventIndexOf,list,[entry]);if(index>=0)apply(eventSplice,list,[index,1]);if(entry.unlisten){entry.unlisten();entry.unlisten=null;}if(entry.type==='abort')abortBridge.listen(target,-1);}
     class EventTarget{
         constructor(){apply(eventSet,listeners,[this,new EventMap()]);}
         addEventListener(type,fn,options={}){
@@ -50,17 +50,18 @@
             if(typeof fn!=='function'&&typeof fn!=='object')throw new TypeError('Invalid event listener');
             const capture=typeof options==='boolean'?options:!!options?.capture,once=typeof options==='object'&&!!options?.once,
                 passive=typeof options==='object'&&!!options?.passive,signal=typeof options==='object'?options?.signal:null;
-            if(signal!=null&&!workerAbortBridge.brand(signal))throw new TypeError('Expected AbortSignal');
-            if(signal!=null&&workerAbortBridge.state(signal).aborted)return;
+            if(signal!=null&&!abortBridge.signals.is(signal))throw new TypeError('Expected AbortSignal');
+            if(signal!=null&&abortBridge.signals.aborted(signal))return;
             const list=apply(eventMapGet,m,[type])||[];
             if(list.some(x=>!x.removed&&x.fn===fn&&x.capture===capture))return;
-            const entry={fn,capture,once,passive,removed:false,unlisten:null};list.push(entry);apply(eventMapSet,m,[type,list]);
-            if(signal!=null)entry.unlisten=workerAbortBridge.subscribe(signal,()=>removeWorkerListener(list,entry));
+            const entry={type,fn,capture,once,passive,removed:false,unlisten:null};list.push(entry);apply(eventMapSet,m,[type,list]);
+            if(type==='abort')abortBridge.listen(this,1);
+            if(signal!=null)entry.unlisten=abortBridge.signals.follow(signal,()=>removeWorkerListener(this,list,entry));
         }
         removeEventListener(type,fn,options={}){
             const m=workerListeners(this);type=eventString(type);const capture=typeof options==='boolean'?options:!!options?.capture,
                 list=apply(eventMapGet,m,[type])||[];
-            for(const entry of list)if(!entry.removed&&entry.fn===fn&&entry.capture===capture){removeWorkerListener(list,entry);break;}
+            for(const entry of list)if(!entry.removed&&entry.fn===fn&&entry.capture===capture){removeWorkerListener(this,list,entry);break;}
         }
         dispatchEvent(event){workerListeners(this);const s=eventState(event);if(!s.initialized||s.dispatching)throw new DOMException('Uninitialized or dispatching event','InvalidStateError');s.isTrusted=false;return dispatchWorkerEvent(this,event);}
     }
@@ -80,7 +81,7 @@
             const node=entry.node,current=scope(node),list=apply(eventMapGet,workerListeners(node),[type])||[],listed=apply(eventSlice,list,[]);
             s.target=scope(entry.target);s.path=entry.visible;s.eventPhase=phase;s.currentTarget=current;
             for(const item of listed){
-                if(item.removed||item.capture!==capture)continue;if(item.once)removeWorkerListener(list,item);s.passive=item.passive;
+                if(item.removed||item.capture!==capture)continue;if(item.once)removeWorkerListener(node,list,item);s.passive=item.passive;
                 try{
                     if(typeof item.fn==='function')apply(item.fn,current,[event]);
                     else{const fn=item.fn.handleEvent;if(typeof fn!=='function')throw new TypeError('EventListener handleEvent is not callable');apply(fn,item.fn,[event]);}
@@ -118,13 +119,16 @@
         get total(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.total;}
     }
     Object.defineProperty(globalThis,'ProgressEvent',{value:ProgressEvent,writable:true,configurable:true});
-    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false;
+    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false,abortHandlerTarget=()=>false;
     const fileHandlers=new WeakMap();
     const dispatch=dispatchNativeWorkerEvent;
-    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type);
+    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type)||abortHandlerTarget(value,type);
     function installHandlers(prototype,types){for(const type of types)eventDefine(prototype,'on'+type,{enumerable:true,configurable:true,
         get(){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
-        set(value){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}map[type]=typeof value==='function'?value:null;}});}
+        set(value){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}
+            const had=typeof map[type]==='function';map[type]=typeof value==='function'?value:null;
+            /* An abort handler is an abort listener for AbortSignal's garbage collection rule. */
+            if(type==='abort'&&had!==(map[type]!==null))abortBridge.listen(this,had?-1:1);}});}
     /* @include js_navigator.js */
     const {navigator,Interface:WorkerNavigator,languagesChanged}=navigatorBridge.create(true);
     /* @include js_encoding.js */
@@ -172,64 +176,13 @@
     function clearTimer(id){const t=timers.get(Number(id));if(!t)return;timers.delete(t.id);const index=t.index,last=timerHeap.pop();if(index<timerHeap.length){timerHeap[index]=last;last.index=index;timerFix(index);}}
     function timer(fn,ms,args,repeat){if(closed)return 0;if(typeof fn!=='function')fn=new Function(htmlSafetyBridge.timerCode(fn,repeat?'setInterval':'setTimeout'));let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');if(timerOrder===9007199254740991){timerOrder=0;for(const t of timers.values())t.order=++timerOrder;for(let i=Math.floor(timerHeap.length/2)-1;i>=0;i--)timerFix(i);}const delay=Math.max(1,Math.min(2147483647,Number(ms)||0)),t={id,order:++timerOrder,fn,args,repeat,delay,due:host.now()+delay,index:timerHeap.length};timers.set(id,t);timerHeap.push(t);timerFix(t.index);return id;}
     function importScripts(...urls){for(const u of urls){const url=new URL(htmlSafetyBridge.check(u,3,'WorkerGlobalScope importScripts'),address).href;const r=host.import(url);if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
-    const workerAbortBridge=(()=>{
-        const apply=Reflect.apply,get=WeakMap.prototype.get,set=WeakMap.prototype.set,has=WeakMap.prototype.has,
-            add=Set.prototype.add,remove=Set.prototype.delete,values=Set.prototype.values,clear=Set.prototype.clear,
-            NativeSet=Set,Reference=WeakRef,deref=WeakRef.prototype.deref,define=Object.defineProperty,
-            dispatch=EventTarget.prototype.dispatchEvent,listen=EventTarget.prototype.addEventListener,unlisten=EventTarget.prototype.removeEventListener,
-            mapGet=Map.prototype.get,string=String,trunc=Math.trunc,finite=Number.isFinite,
-            slots=new WeakMap(),controllers=new WeakMap(),retained=new NativeSet(),token={};
-        const setSize=Object.getOwnPropertyDescriptor(Set.prototype,'size').get,setNext=Object.getPrototypeOf(apply(values,retained,[])).next;
-        const size=s=>apply(setSize,s,[]),each=(s,fn)=>{const iterator=apply(values,s,[]);for(;;){const item=apply(setNext,iterator,[]);if(item.done)return;fn(item.value);}};
-        const safeReport=error=>{try{report(error);}catch(_){}};
-        const state=signal=>{const s=apply(get,slots,[signal]);if(!s)throw new TypeError('Illegal AbortSignal invocation');return s;};
-        const text=value=>{if(typeof value==='symbol')throw new TypeError('Symbol is not a DOMString');return string(value);};
-        const removeDependencies=list=>{for(let i=0;i<list.length;i++)apply(remove,state(list[i][0]).dependents,[list[i][1]]);};
-        const finalizer=new FinalizationRegistry(removeDependencies),register=FinalizationRegistry.prototype.register,unregister=FinalizationRegistry.prototype.unregister;
-        function retain(signal){const s=state(signal),m=apply(get,listeners,[signal]),events=m&&apply(mapGet,m,['abort']);if(!s.aborted&&size(s.sources)&&(size(s.algorithms)||s.handler||(events&&events.some(entry=>!entry.removed))))apply(add,retained,[signal]);else apply(remove,retained,[signal]);}
-        function clean(signal){const s=state(signal);removeDependencies(s.dependencies);s.dependencies=[];apply(clear,s.sources,[]);apply(unregister,finalizer,[signal]);apply(remove,retained,[signal]);}
-        function run(signal){const s=state(signal);each(s.algorithms,algorithm=>{try{algorithm(s.reason);}catch(error){safeReport(error);}});apply(clear,s.algorithms,[]);clean(signal);const event=new Event('abort');try{dispatchNativeWorkerEvent(signal,event);}catch(error){safeReport(error);}}
-        function abort(signal,reason){
-            const s=state(signal);if(s.aborted)return;s.aborted=true;s.reason=reason===undefined?new DOMException('The operation was aborted','AbortError'):reason;
-            const dependents=[];each(s.dependents,reference=>{const dependent=apply(deref,reference,[]);if(!dependent){apply(remove,s.dependents,[reference]);return;}const d=state(dependent);if(!d.aborted){d.aborted=true;d.reason=s.reason;dependents[dependents.length]=dependent;}});
-            run(signal);for(let i=0;i<dependents.length;i++)run(dependents[i]);apply(clear,s.dependents,[]);
-        }
-        function newSignal(){return new AbortSignal(token);}
-        /* DOM "create a dependent abort signal" from sources: any()'s converted sequence, or an
-           array this realm made (Fetch's Request signals). */
-        function dependent(sources){
-            for(let i=0;i<sources.length;i++)state(sources[i]);
-            const signal=newSignal(),s=state(signal);for(let i=0;i<sources.length;i++){const p=state(sources[i]);if(p.aborted){s.aborted=true;s.reason=p.reason;return signal;}}s.dependent=true;
-            for(let i=0;i<sources.length;i++){const source=sources[i],p=state(source);if(p.dependent)each(p.sources,root=>apply(add,s.sources,[root]));else apply(add,s.sources,[source]);}
-            const reference=new Reference(signal);each(s.sources,source=>{apply(add,state(source).dependents,[reference]);s.dependencies[s.dependencies.length]=[source,reference];});if(s.dependencies.length)apply(register,finalizer,[signal,s.dependencies,signal]);return signal;
-        }
-        class AbortSignal extends EventTarget{
-            constructor(secret){super();if(secret!==token)throw new TypeError('Illegal constructor');apply(set,slots,[this,{aborted:false,reason:undefined,handler:null,dependent:false,algorithms:new NativeSet(),sources:new NativeSet(),dependents:new NativeSet(),dependencies:[]}]);}
-            get aborted(){return state(this).aborted;}get reason(){return state(this).reason;}throwIfAborted(){const s=state(this);if(s.aborted)throw s.reason;}
-            get onabort(){return state(this).handler;}set onabort(value){state(this).handler=typeof value==='function'?value:null;retain(this);}
-            addEventListener(type,fn,options){state(this);apply(listen,this,[text(type),fn,options]);retain(this);}
-            removeEventListener(type,fn){state(this);apply(unlisten,this,[text(type),fn]);retain(this);}
-            static abort(reason){const signal=newSignal(),s=state(signal);s.aborted=true;s.reason=reason===undefined?new DOMException('The operation was aborted','AbortError'):reason;return signal;}
-            static timeout(milliseconds){
-                if(!arguments.length)throw new TypeError('timeout requires milliseconds');const number=+milliseconds,ms=trunc(number);if(!finite(number)||ms<0||ms>=18446744073709551616)throw new TypeError('Timeout is outside unsigned long long range');
-                const signal=newSignal(),started=host.now();function elapsed(){const left=ms-(host.now()-started);if(left>0)timer(elapsed,Math.min(left,2147483647),[],false);else abort(signal,new DOMException('Timed out','TimeoutError'));}timer(elapsed,Math.min(ms,2147483647),[],false);return signal;
-            }
-            static any(input){
-                if(!arguments.length||input==null||(typeof input!=='object'&&typeof input!=='function'))throw new TypeError('any requires a signal sequence');return dependent([...input]);
-            }
-        }
-        class AbortController{
-            constructor(){apply(set,controllers,[this,newSignal()]);}
-            get signal(){const signal=apply(get,controllers,[this]);if(!signal)throw new TypeError('Illegal AbortController invocation');return signal;}
-            abort(reason){const signal=apply(get,controllers,[this]);if(!signal)throw new TypeError('Illegal AbortController invocation');abort(signal,reason);}
-        }
-        function subscribe(signal,algorithm){const s=state(signal);if(s.aborted)return ()=>{};apply(add,s.algorithms,[algorithm]);retain(signal);return ()=>{apply(remove,s.algorithms,[algorithm]);retain(signal);};}
-        return {AbortSignal,AbortController,state,brand:signal=>apply(has,slots,[signal]),sources:signal=>size(state(signal).sources),subscribe,
-            /* What Fetch (js_fetch.js) asks of this realm's signals, as js_abort.js's abortBridge.signals in a Window. */
-            signals:Object.freeze({is:signal=>apply(has,slots,[signal]),aborted:signal=>state(signal).aborted,reason:signal=>state(signal).reason,
-                follow:subscribe,any:dependent,controller(){const signal=newSignal();return {signal,abort(reason){abort(signal,reason);}};}})};
-    })();
-    const {AbortSignal,AbortController}=workerAbortBridge;
+    /* @include js_abort.js */
+    /* This Worker's events for AbortSignal: a trusted abort event through this realm's dispatch,
+       its event handler attributes and timers. */
+    const abortBridge=abortInterfaces({fire:signal=>dispatchNativeWorkerEvent(signal,new Event('abort')),
+        handlers:installHandlers,report,now:()=>host.now(),timer:(fn,ms)=>timer(fn,ms,[],false)});
+    abortHandlerTarget=abortBridge.handlerTarget;
+    const {AbortSignal,AbortController}=abortBridge;
     /* @include js_fetch.js */
     /* This Worker's transport for Fetch: its parent window's native fetch, through
        browserjsworker.c (NJW_LOAD with the Request's modes, NJW_FRAME, NJW_RESUME, NJW_CANCEL) to
@@ -294,7 +247,7 @@
         const apply=Reflect.apply,NativeURL=URL,urlOrigin=Object.getOwnPropertyDescriptor(URL.prototype,'origin').get,
             dataURL=host.dataURL,digest=host.cryptoDigest,securityURL=host.securityURL,referrerPolicy=host.referrerPolicy;
         const origin=()=>{try{return apply(urlOrigin,new NativeURL(apply(securityURL,host,[])),[]);}catch(_){return 'null';}};
-        return fetchInterfaces({signals:workerAbortBridge.signals,transport:workerFetchTransport,
+        return fetchInterfaces({signals:abortBridge.signals,transport:workerFetchTransport,
             baseURL:()=>address,origin,clientReferrer:()=>address,referrerPolicy:()=>apply(referrerPolicy,host,[]),
             url:()=>apply(securityURL,host,[])||address,dataURL:url=>apply(dataURL,host,[url]),
             task:fn=>timer(fn,0,[],false),clearTask:clearTimer,digest:(algorithm,bytes)=>apply(digest,host,[algorithm,bytes])});
