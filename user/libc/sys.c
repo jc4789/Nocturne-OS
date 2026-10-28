@@ -451,6 +451,12 @@ n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_
 n_result n_audio_status(n_handle a, struct n_audio_status *out) { return NC5(SYS_AUDIO_STATUS, a, out, 0, 0, 0); }
 n_result n_audio_flush(n_handle a) { return NC5(SYS_AUDIO_FLUSH, a, 0, 0, 0, 0); }
 n_result n_audio_output(struct n_audio_output *io, uint32_t set) { return NC5(SYS_AUDIO_OUTPUT, io, set, 0, 0, 0); }
+n_handle n_user_settings_watch(uint32_t interest) { return (n_handle)NC5(SYS_USER_SETTINGS_WATCH, interest, 0, 0, 0, 0); }
+n_result n_user_settings_changes(n_handle watch) { return NC5(SYS_USER_SETTINGS_CHANGES, watch, 0, 0, 0, 0); }
+n_result n_user_languages(char *out, size_t cap) { return NC5(SYS_USER_LANGUAGES, out, cap, 0, 0, 0); }
+n_result n_user_languages_set(const char *list, size_t length) {
+    return NC5(SYS_USER_LANGUAGES_SET, list, length, 0, 0, 0);
+}
 n_handle n_events_create(void) { return (n_handle)NC5(SYS_EVENTS_CREATE, 0, 0, 0, 0, 0); }
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token) {
     return NC5(SYS_EVENTS_WATCH, q, h, interest, token, 0);

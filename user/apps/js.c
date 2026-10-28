@@ -942,16 +942,15 @@ static JSValue h_screen_modes(JSContext *c, JSValueConst this, int argc, JSValue
     JS_SetPropertyStr(ctx, o, "wanted", screen_mode_value(&s->wanted));
     JS_SetPropertyStr(ctx, o, "trialMs", JS_NewUint32(ctx, s->trial_ms));
     JS_SetPropertyStr(ctx, o, "refused", JS_NewBool(ctx, s->refused));
+    JS_SetPropertyStr(ctx, o, "chosen", screen_mode_value(&s->chosen));
     free(s);
     return o;
 }
 
-/* (how: "try", "keep", "back" or "saved"; monitor, width, height, refresh in mHz): SCREEN_MODE_SET;
-   whether the system took it */
+/* (how: "try", "keep" or "back"; width, height, refresh in mHz): SCREEN_MODE_SET; whether the
+   system took it */
 static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
-    static const char *const hows[] = {
-        [SCREEN_MODE_TRY] = "try", [SCREEN_MODE_KEEP] = "keep", [SCREEN_MODE_BACK] = "back", [SCREEN_MODE_SAVED] = "saved",
-    };
+    static const char *const hows[] = {[SCREEN_MODE_TRY] = "try", [SCREEN_MODE_KEEP] = "keep", [SCREEN_MODE_BACK] = "back"};
     struct screen_mode_set s = {0};
     const char *how = JS_ToCString(ctx, argv[0]);
     if (!how) return JS_EXCEPTION;
@@ -959,14 +958,53 @@ static JSValue h_screen_mode_set(JSContext *c, JSValueConst this, int argc, JSVa
         if (!strcmp(how, hows[i])) s.how = i;
     JS_FreeCString(ctx, how);
     if (!s.how) return JS_FALSE;
-    const char *monitor = JS_ToCString(ctx, argv[1]);
-    if (!monitor) return JS_EXCEPTION;
-    snprintf(s.monitor, sizeof s.monitor, "%s", monitor);
-    JS_FreeCString(ctx, monitor);
-    JS_ToUint32(ctx, &s.mode.width, argv[2]);
-    JS_ToUint32(ctx, &s.mode.height, argv[3]);
-    JS_ToUint32(ctx, &s.mode.refresh_mhz, argv[4]);
+    JS_ToUint32(ctx, &s.mode.width, argv[1]);
+    JS_ToUint32(ctx, &s.mode.height, argv[2]);
+    JS_ToUint32(ctx, &s.mode.refresh_mhz, argv[3]);
     return JS_NewBool(ctx, __syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_MODE_SET, 0, 0) == 0);
+}
+
+/* The languages the user reads, most wanted first (n_user_languages): "ja,en-US"; null on failure. */
+static JSValue h_user_languages(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    char list[N_USER_LANGUAGES_MAX];
+    n_result n = n_user_languages(list, sizeof list);
+    return n < 0 ? JS_NULL : JS_NewStringLen(ctx, list, (size_t)n);
+}
+
+/* (list, the tags between commas): 0, or the negative result of n_user_languages_set */
+static JSValue h_user_languages_set(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    size_t n;
+    const char *list = JS_ToCStringLen(ctx, &n, argv[0]);
+    if (!list) return JS_EXCEPTION;
+    n_result r = n_user_languages_set(list, n);
+    JS_FreeCString(ctx, list);
+    return JS_NewInt32(ctx, (int32_t)r);
+}
+
+/* The user's settings, watched for internal.settingsChanged (n_user_settings_watch) in the
+   windows' event queue, so that a change ends the event loop's wait as a window's event does. */
+#define SETTINGS_TOKEN (1ull << 40)
+static n_handle settings_watch = -1;
+static bool settings_signal;
+
+/* (on): whether the program now hears of changes */
+static JSValue h_settings_watch(JSContext *c, JSValueConst this, int argc, JSValueConst *argv) {
+    bool on = JS_ToBool(ctx, argv[0]);
+    if (on && settings_watch < 0) {
+        struct ui_session *s = ui_get();
+        n_handle w = s ? n_user_settings_watch(N_USER_SETTINGS_ALL) : -N_ERR_NO_MEMORY;
+        if (w < 0) return JS_FALSE;
+        if (n_events_watch(ui_session_queue(s), w, N_EVENT_RECEIVABLE, SETTINGS_TOKEN) < 0) {
+            n_handle_close(w);
+            return JS_FALSE;
+        }
+        settings_watch = w;
+    } else if (!on && settings_watch >= 0) {
+        n_handle_close(settings_watch); /* its watch in the queue ends with it */
+        settings_watch = -1;
+        settings_signal = false;
+    }
+    return JS_NewBool(ctx, settings_watch >= 0);
 }
 
 /* The computer: processor, memory, uptime, running tasks. */
@@ -1031,6 +1069,34 @@ static void ui_deliver(void) {
 
 static bool ui_open(void) { return ui && ui_session_open(ui); }
 
+/* Tells the program which of the user's settings changed (N_USER_SETTING_* bits). */
+static void deliver_settings(void) {
+    if (!settings_signal || settings_watch < 0) return;
+    settings_signal = false;
+    n_result bits = n_user_settings_changes(settings_watch);
+    if (bits <= 0) return;
+    JSValue r = internal_call("settingsChanged", 1, (JSValue[]){JS_NewInt32(ctx, (int32_t)bits)});
+    if (JS_IsException(r)) report_exception();
+    JS_FreeValue(ctx, r);
+    drain();
+}
+
+/* Waits up to ms for the windows, the engine's own timers or a change of the user's settings,
+   then hands on what came. */
+static void wait_ui(int ms) {
+    int t = ui_session_timeout(ui);
+    if (t < 0 || (ms >= 0 && ms < t)) t = ms;
+    if (t != 0) {
+        struct n_event ev[8];
+        n_result n = n_events_wait(ui_session_queue(ui), ev, 8, t);
+        for (n_result i = 0; i < n; i++)
+            if (ev[i].token == SETTINGS_TOKEN) settings_signal = true;
+    }
+    ui_session_pump(ui);
+    ui_deliver();
+    deliver_settings();
+}
+
 /* ---------------------------------------------------------------- event loop */
 
 /* Runs tasks until nothing is left to wait for, or until the promise until
@@ -1042,6 +1108,7 @@ static void run_loop(JSValueConst until) {
         drain();
         deliver_fetches();
         if (ui) { ui_session_pump(ui); ui_deliver(); }
+        deliver_settings();
         for (;;) {
             JSValue now = JS_NewFloat64(ctx, (double)n_clock_uptime_ms());
             JSValue fired = internal_call("fireTimer", 1, (JSValue[]){now});
@@ -1064,7 +1131,8 @@ static void run_loop(JSValueConst until) {
         if (ms > 1000) ms = 1000;
         if (!ms) continue;
         fflush(stdout);
-        if (ui_open()) { ui_session_wait(ui, fetch_pending > 0 && ms > 10 ? 10 : (int)ms); ui_deliver(); } /* window events end the wait */
+        /* window events and a change of the user's settings end the wait */
+        if (ui_open() || settings_watch >= 0) wait_ui(fetch_pending > 0 && ms > 10 ? 10 : (int)ms);
         else if (fetch_pending > 0) wait_on_address(&fetch_signal, seen, (unsigned)ms);
         else n_sleep_ms(ms);
     }
@@ -1395,7 +1463,10 @@ static const JSCFunctionListEntry host_functions[] = {
     JS_CFUNC_DEF("desktop", 0, h_desktop),
     JS_CFUNC_DEF("desktopSet", 2, h_desktop_set),
     JS_CFUNC_DEF("screenModes", 0, h_screen_modes),
-    JS_CFUNC_DEF("screenModeSet", 5, h_screen_mode_set),
+    JS_CFUNC_DEF("screenModeSet", 4, h_screen_mode_set),
+    JS_CFUNC_DEF("userLanguages", 0, h_user_languages),
+    JS_CFUNC_DEF("userLanguagesSet", 1, h_user_languages_set),
+    JS_CFUNC_DEF("settingsWatch", 1, h_settings_watch),
     JS_CFUNC_DEF("sound", 2, h_sound),
     JS_CFUNC_DEF("systemInfo", 0, h_system_info),
 };

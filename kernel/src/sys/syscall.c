@@ -10,6 +10,7 @@
 #include "sys/object.h"
 #include "sys/channel.h"
 #include "sys/stream.h"
+#include "sys/usersettings.h"
 #include "fs/store.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -28,7 +29,7 @@
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
-_Static_assert(SYS_PCI_SCREEN_MODES < SYS_MAX, "every system call number is below SYS_MAX");
+_Static_assert(SYS_USER_LANGUAGES_SET < SYS_MAX, "every system call number is below SYS_MAX");
 _Static_assert(sizeof(struct n_pager_fault) == 16 && sizeof(struct n_pager_supply) == 32, "pager ABI");
 
 extern char cpu_brand[64];
@@ -2520,6 +2521,9 @@ enum ap_syscall syscall_ap(struct regs *r) {
     case SYS_UPTIME: result = (int64_t)uptime_ms(); break;
     case SYS_TIME: result = time_now(); break;
     case SYS_SLEEP: return sleep_ap(r->rdi);
+    case SYS_USER_LANGUAGES: /* every request a browser makes asks for them */
+        if (!user_languages_ap((char *)r->rdi, r->rsi, &result)) return AP_SYSCALL_BSP;
+        break;
     case SYS_TCP_SEND: case SYS_TCP_SEND_UNTIL: case SYS_TCP_RECV:
         return net_ap_syscall(r) ? AP_SYSCALL_DONE : AP_SYSCALL_BSP;
     case SYS_AUDIO_STATUS: case SYS_CHANNEL_RECEIVE: case SYS_CHANNEL_RECEIVE_FROM: case SYS_WIN_RECEIVE:
@@ -2837,6 +2841,10 @@ void syscall_dispatch(struct regs *r) {
     case SYS_AUDIO_STATUS: ret = sys_audio_status((int)a, (struct n_audio_status *)b); break;
     case SYS_AUDIO_OUTPUT: ret = sys_audio_output((struct n_audio_output *)a, (uint32_t)b); break;
     case SYS_RANDOM: ret = sys_random((void *)a, b); break;
+    case SYS_USER_SETTINGS_WATCH: ret = user_settings_watch((uint32_t)a); break;
+    case SYS_USER_SETTINGS_CHANGES: ret = user_settings_changes((int)a); break;
+    case SYS_USER_LANGUAGES: ret = user_languages((char *)a, b); break;
+    case SYS_USER_LANGUAGES_SET: ret = user_languages_set((const char *)a, b); break;
     case SYS_PAGER_CREATE: ret = sys_pager_create(a, (int32_t *)b); break;
     case SYS_PAGER_TAKE: ret = sys_pager_take((int)a, (struct n_pager_fault *)b, c, (int64_t)d); break;
     case SYS_PAGER_SUPPLY: ret = sys_pager_supply((int)a, (const struct n_pager_supply *)b, c); break;

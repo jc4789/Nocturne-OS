@@ -535,9 +535,8 @@ static uint32_t screen_source(void) {
     free(s);
     return source;
 }
-static n_result mode_set(uint32_t how, const char *monitor, const struct n_screen_mode *m) {
+static n_result mode_set(uint32_t how, const struct n_screen_mode *m) {
     struct screen_mode_set s = {.how = how};
-    if (monitor) snprintf(s.monitor, sizeof s.monitor, "%s", monitor);
     if (m) s.mode = *m;
     return (n_result)__syscall(SYS_SCREEN_INFO, (long)&s, sizeof s, SCREEN_MODE_SET, 0, 0);
 }
@@ -627,13 +626,13 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
               same_mode(&seen->offered.shown, &native) && same_mode(&seen->wanted, &native) && !seen->trial_ms && !seen->refused &&
               seen->source == SCREEN_SOURCE_DRIVER,
           "Settings sees the monitor, its modes and the one the driver shows: %s", n_result_text(r));
-    CHECK(mode_set(SCREEN_MODE_KEEP, NULL, NULL) == -N_ERR_NOT_FOUND && mode_set(SCREEN_MODE_BACK, NULL, NULL) == -N_ERR_NOT_FOUND,
+    CHECK(mode_set(SCREEN_MODE_KEEP, NULL) == -N_ERR_NOT_FOUND && mode_set(SCREEN_MODE_BACK, NULL) == -N_ERR_NOT_FOUND,
           "nothing on trial to keep or go back from");
     struct n_screen_mode odd = {800, 600, 60000, 0};
-    CHECK(mode_set(SCREEN_MODE_TRY, NULL, &odd) == -N_ERR_INVALID, "a mode the monitor was not offered");
+    CHECK(mode_set(SCREEN_MODE_TRY, &odd) == -N_ERR_INVALID, "a mode the monitor was not offered");
 
     /* a mode tried and not kept goes back by itself */
-    r = mode_set(SCREEN_MODE_TRY, NULL, &small);
+    r = mode_set(SCREEN_MODE_TRY, &small);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small), "a mode on trial is wanted: %s",
           n_result_text(r));
     r = mode_show(vga, surface, d, dispi, offer, &st, false);
@@ -650,16 +649,16 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(r == 0 && desktop_width((int)native.width), "the mode before shown again: %s", n_result_text(r));
 
     /* back at once; then kept, the user's choice for this monitor */
-    r = mode_set(SCREEN_MODE_TRY, NULL, &wide);
+    r = mode_set(SCREEN_MODE_TRY, &wide);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &wide), "another mode on trial: %s", n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, false);
-    r = mode_set(SCREEN_MODE_BACK, NULL, NULL);
+    r = mode_set(SCREEN_MODE_BACK, NULL);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native), "going back at once: %s", n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, false);
-    r = mode_set(SCREEN_MODE_TRY, NULL, &small);
+    r = mode_set(SCREEN_MODE_TRY, &small);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "tried again: %s", n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, false);
-    r = mode_set(SCREEN_MODE_KEEP, NULL, NULL);
+    r = mode_set(SCREEN_MODE_KEEP, NULL);
     CHECK(r == 0 && n_pci_screen_state(vga, st.serial, &st, 100) == -N_ERR_TIMEOUT && modes_get(seen) == 0 && !seen->trial_ms,
           "kept: the trial ends and the mode stays: %s", n_result_text(r));
     offer->count = 0;
@@ -670,15 +669,22 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(n_pci_screen_modes(vga, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small),
           "offered again, the monitor shows the mode kept: %ux%u", st.mode.width, st.mode.height);
     mode_show(vga, surface, d, dispi, offer, &st, false);
-    r = mode_set(SCREEN_MODE_SAVED, "pcitest-vga", &native);
-    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native),
-          "a saved choice for this monitor is shown: %s", n_result_text(r));
+    CHECK(modes_get(seen) == 0 && same_mode(&seen->chosen, &small), "Settings sees the mode kept for this monitor: %ux%u",
+          seen->chosen.width, seen->chosen.height);
+    CHECK(__syscall(SYS_SCREEN_INFO, (long)seen, SCREEN_MODES_FIRST_BYTES, SCREEN_MODES_GET, 0, 0) == 0 &&
+              seen->offered.count == 4 && same_mode(&seen->wanted, &small),
+          "a program built before chosen reads its struct screen_modes");
+    r = mode_set(SCREEN_MODE_TRY, &native);
+    CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native), "the preferred mode tried: %s",
+          n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, false);
-    CHECK(mode_set(SCREEN_MODE_SAVED, "another monitor", &wide) == 0 && n_pci_screen_state(vga, st.serial, &st, 100) == -N_ERR_TIMEOUT,
-          "a choice for another monitor changes nothing here");
+    r = mode_set(SCREEN_MODE_KEEP, NULL);
+    CHECK(r == 0 && modes_get(seen) == 0 && same_mode(&seen->chosen, &native), "kept: the user's new choice for this monitor: %s",
+          n_result_text(r));
+    CHECK(mode_set(4, &native) == -N_ERR_INVALID, "4, once a saved choice put back by Settings, is no operation");
 
     /* a mode the driver could not show */
-    r = mode_set(SCREEN_MODE_TRY, NULL, &wide);
+    r = mode_set(SCREEN_MODE_TRY, &wide);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "tried: %s", n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, true);
     CHECK(mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native) && modes_get(seen) == 0 && seen->refused && !seen->trial_ms,
@@ -719,13 +725,13 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
               seen->source == SCREEN_SOURCE_HANDED_BACK && seen->offered.count == 4 &&
               seen->offered.shown.width == native.width && seen->offered.shown.height == native.height,
           "modes offered with the boot screen shown: listed, the boot screen's mode shown (source %u)", seen->source);
-    r = mode_set(SCREEN_MODE_TRY, NULL, &small);
+    r = mode_set(SCREEN_MODE_TRY, &small);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small),
           "a mode tried with the boot screen shown is wanted: %s", n_result_text(r));
     r = mode_show(vga, surface, d, dispi, offer, &st, false);
     CHECK(r == 0 && desktop_width(1024) && screen_source() == SCREEN_SOURCE_DRIVER,
           "the driver shows its screen again: %s", n_result_text(r));
-    r = mode_set(SCREEN_MODE_BACK, NULL, NULL);
+    r = mode_set(SCREEN_MODE_BACK, NULL);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "back from that trial: %s", n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, false);
     offer->count = 0;

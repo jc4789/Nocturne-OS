@@ -8,7 +8,7 @@
 |---|---|---|
 | `kernel/src/arch/` | GDT・IDT・`isr.asm`、APIC、SMP、FPU、PAT、P ステート、S3 復帰 | K |
 | `kernel/src/mm/` | `pmm`・`vmm`（空間ごとの 4 段ページ表）・`heap` | K |
-| `kernel/src/sys/` | `proc`（ELF）、`sched`（AP の実行キュー）、`kei`（継の選択核）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`prof` | K |
+| `kernel/src/sys/` | `proc`（ELF）、`sched`（AP の実行キュー）、`kei`（継の選択核）、`syscall`、`object`、`channel`、`events`、`stream`（console・system log）、`usersettings`（利用者の設定：起動時に当て直し、変更を保存し、監視へ知らせる。持ち主は wm・screenmode・audio と自身の言語）、`prof` | K |
 | `kernel/src/fs/` | C: の格納庫（`store`・`volume`・`catalog` の B+木・`namespace`・`document`）。`host/store` も同じコード | K |
 | `kernel/src/dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI・USB、IOMMU、音、`fb`・fbcon、入力、timer、電源 | K |
 | `kernel/src/net/` | `net.c`（Ethernet〜TCP・DHCP・DNS）、`rtl8125.c`（実機の NIC） | K |
@@ -73,7 +73,7 @@ user/libc/sys.c int $0x80 → arch/isr.asm → isr_dispatch (arch/idt.c)
 - 入口 `python -X utf8 scripts/build.py -j 8 [目標]`（UCRT64 の make）。目標：`all`（img・vhd・vhdx・iso）、`qemu-image`（img だけ）、`run`、`test`・`test-quick`・`test-full`、`kernel`、`user`、`clean`。
 - 出力 `build/kernel.elf`、`build/programs/`、`build/sdk/`、`build/c.list`、`build/nocturne.{img,vhd,vhdx,iso}`。C: の中身は `scripts/layout.py` → `build/c.list` → `build/host/store.exe fill`（`mkroots.py` は TLS の根の証明書で、C: とは無関係）。
 - 任意の移植は道具があるときだけ：Go `tools/go`、TypeScript `tools/TypeScript`、Rust `tools/rust`、OS の中の LLVM `tools/llvm`、NVIDIA の firmware `local/firmware/`。
-- 試験：`scripts/test.py [--quick] [--no-net] [群|群/名]`（`tests/runtests.c` の `tests[]`、113 群 221 件。例 `web/fonts`・`web/engine`・`web/javascript`）。QEMU を窓なしで起動し、`C:\Tests\autorun.sh` から tcc で組んで走らせる。結果 `build/test-serial.log`・`build/test-metadata.json`。`tests/check_*.py` はホストの検査で、まとめる runner は無い。
+- 試験：`scripts/test.py [--quick] [--no-net] [群|群/名]`（`tests/runtests.c` の `tests[]`、113 群 223 件。例 `web/fonts`・`web/engine`・`web/javascript`）。QEMU を窓なしで起動し、`C:\Tests\autorun.sh` から tcc で組んで走らせる。結果 `build/test-serial.log`・`build/test-metadata.json`。`tests/check_*.py` はホストの検査で、まとめる runner は無い。
 - 画面で確かめる：`scripts/platform_qa.py`（ラベル専用の写し、`build/nocturne-platform/<label>/`）、`scripts/qtest.py`、または手で起動した QEMU。
 
 ## 記録と道具

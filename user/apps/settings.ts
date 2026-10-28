@@ -1,93 +1,25 @@
-/* Settings: display, mouse and sound, all by mouse. Every change applies at
- * once and is kept in C:\Users\<name>\AppData\Settings\desktop.conf; at
- * startup init runs "js C:\Nocturne\System\settings.js --apply", which puts the
- * saved settings back before the desktop is used. Nothing here needs a
- * terminal or the boot command line. Each page shows only what the system can
- * do on this computer now, and says why when it cannot. */
-import { args, createFolder, exists, exit, getSetting, readText, resolvePath, writeText } from "nocturne";
+/* Settings: display, mouse, sound and language, all by mouse. This is only a
+ * window onto the user's settings, which belong to the system: each change
+ * asked for here applies at once, the system keeps it (in the user's
+ * AppData\Nocturne\Settings.conf, which no program writes) and puts it back at
+ * every start, and every program watching hears of it. A change made elsewhere
+ * (the taskbar's volume, another program) shows here at once. Nothing here
+ * needs a terminal or the boot command line. Each page shows only what the
+ * system can do on this computer now, and says why when it cannot. */
+import { args, exit } from "nocturne";
 import {
-    button, caption, card, column, desktop, heading, listItem, row, run, scroll, segmented, slider, text, theme, title,
-    toggle, icon, type App, type Child, type DesktopSettings, type IconName, type ScreenMode, type ScreenModeChoice,
-    type ScreenModes, type ScreenSource, type SoundOutput,
+    button, caption, card, column, desktop, divider, heading, listItem, row, run, scroll, segmented, slider, text,
+    textField, theme, title, toggle, icon, type App, type Child, type DesktopSettings, type IconName, type ScreenMode,
+    type ScreenModeChoice, type ScreenModes, type ScreenSource, type SoundOutput,
 } from "nocturne/ui";
 
-/* The user's folder is the launch setting USERFOLDER ("C:\" without it, as libc's n_user_folder). */
-const FOLDER = resolvePath(`${getSetting("USERFOLDER") ?? "C:\\"}\\AppData\\Settings`);
-const PATH = FOLDER + "\\desktop.conf";
-
-type Section = "display" | "mouse" | "sound";
+type Section = "display" | "mouse" | "sound" | "language";
 const SECTIONS: {id: Section; label: string; icon: IconName}[] = [
     {id: "display", label: "Display", icon: "display"},
     {id: "mouse", label: "Mouse", icon: "mouse"},
     {id: "sound", label: "Sound", icon: "sound"},
+    {id: "language", label: "Language", icon: "language"},
 ];
-
-/* modes: the user's display mode for each monitor ("mode.<monitor>=<width>x<height>@<mHz>"). Keys
-   an older Settings wrote that the system no longer has (refresh, pointer_y) are left out;
-   deep_colour is what smooth_gradients was called. */
-type Saved = {pointerSpeed?: number; smoothGradients?: boolean; volume?: number; muted?: boolean;
-              modes: Map<string, ScreenModeChoice>};
-
-/* ---- the saved file ---- */
-function loadSaved(): Saved | null {
-    let content: string;
-    try { content = readText(PATH); } catch { return null; }
-    const saved: Saved = {modes: new Map()};
-    let oldSmooth: boolean | undefined;
-    for (const raw of content.split("\n")) {
-        const line = raw.trim();
-        const eq = line.indexOf("=");
-        if (line.startsWith("#") || eq < 0) continue;
-        const key = line.slice(0, eq), value = line.slice(eq + 1).trim(), n = Number.parseInt(value, 10);
-        const mode = /^(\d{1,5})x(\d{1,5})@(\d{1,7})$/.exec(value);
-        if (key === "pointer_speed" && n >= -2 && n <= 2) saved.pointerSpeed = n;
-        else if (key === "smooth_gradients") saved.smoothGradients = value === "on";
-        else if (key === "deep_colour") oldSmooth = value === "on";
-        else if (key === "volume" && n >= 0 && n <= 100) saved.volume = n;
-        else if (key === "muted") saved.muted = value === "on";
-        else if (key.startsWith("mode.") && key.length > 5 && mode && Number(mode[1]) && Number(mode[2]) && Number(mode[3]))
-            saved.modes.set(key.slice(5), {width: Number(mode[1]), height: Number(mode[2]),
-                                           refreshMillihertz: Number(mode[3])});
-    }
-    saved.smoothGradients ??= oldSmooth;
-    return saved;
-}
-
-function save(s: DesktopSettings, sound: SoundOutput | null, modes: Map<string, ScreenModeChoice>): string | null {
-    let content = "# Nocturne desktop settings, written by Settings\n" +
-        `pointer_speed=${s.pointerSpeed}\nsmooth_gradients=${s.smoothGradients ? "on" : "off"}\n`;
-    if (sound) content += `volume=${sound.volume}\nmuted=${sound.muted ? "on" : "off"}\n`;
-    for (const [monitor, m] of modes) content += `mode.${monitor}=${m.width}x${m.height}@${m.refreshMillihertz}\n`;
-    try {
-        if (!exists(FOLDER)) createFolder(FOLDER, {recursive: true});
-        writeText(PATH, content);
-        return null;
-    } catch (e) {
-        return (e as Error).message;
-    }
-}
-
-/* At startup: the saved settings over the system's own. Smooth gradients stay wished for while the
-   screen cannot take them, and come on when it can. A monitor's mode is put back whenever a display
-   driver drives that monitor, which may be later. The volume is put back even without a sound
-   device, for when one plays the sound (a Remote Desktop viewer). */
-function applySaved(): number {
-    const now = desktop.get();
-    if (!now) return 1;
-    const saved = loadSaved();
-    if (!saved) return 0;
-    let ok = desktop.set({
-        pointerSpeed: saved.pointerSpeed ?? now.pointerSpeed,
-        smoothGradients: saved.smoothGradients ?? now.smoothGradients,
-    });
-    /* The volume first: setting it unmutes. */
-    if (saved.volume !== undefined) ok = desktop.setVolume(saved.volume) !== null && ok;
-    if (saved.muted !== undefined) ok = desktop.setMuted(saved.muted) !== null && ok;
-    for (const [monitor, m] of saved.modes) ok = desktop.savedMode(monitor, m) && ok;
-    return ok ? 0 : 1;
-}
-
-if (args[0] === "--apply") exit(applySaved());
 
 /* ---- the window ---- */
 const current = desktop.get();
@@ -98,38 +30,31 @@ if (!current) {
 let settings: DesktopSettings = current;
 let screen: ScreenModes | null = desktop.modes();
 let sound: SoundOutput | null = desktop.sound();
-const savedModes = loadSaved()?.modes ?? new Map<string, ScreenModeChoice>();
-let section: Section = args[0] === "mouse" ? "mouse" : args[0] === "sound" ? "sound" : "display";
+let languages: readonly string[] = desktop.languages() ?? ["en-US"];
+let section: Section = SECTIONS.find(s => s.id === args[0])?.id ?? "display";
 let status = "", statusError = false;
 let dragging = false;
 let tried: ScreenModeChoice | null = null; /* the mode on trial from this window */
 
-/* Apply, read back what the system took, save. */
+function refused(what: string) {
+    status = `The system did not accept ${what}.`;
+    statusError = true;
+}
+
+/* Apply, then show what the system took. */
 function change(next: Partial<Pick<DesktopSettings, "pointerSpeed" | "smoothGradients">>) {
     const ok = desktop.set({...settings, ...next});
     settings = desktop.get() ?? settings;
-    if (ok) store();
-    else {
-        status = "The system did not accept that setting.";
-        statusError = true;
-    }
-}
-
-function store() {
-    const error = save(settings, sound, savedModes);
-    statusError = error !== null;
-    status = error ? `Applied, but not saved: ${error}` : "Applied and saved. It stays this way after a restart.";
+    if (!ok) refused("that setting");
 }
 
 function setVolume(v: number, done: boolean) {
     sound = desktop.setVolume(Math.max(0, Math.min(100, Math.round(v)))) ?? sound;
     dragging = !done;
-    if (done) store();
 }
 
 function setMuted(on: boolean) {
     sound = desktop.setMuted(on) ?? sound;
-    store();
 }
 
 /* ---- the monitor's modes ---- */
@@ -156,10 +81,7 @@ function tryMode(m: ScreenModeChoice) {
         tried = m;
         status = "";
         statusError = false;
-    } else {
-        status = "The system did not accept that mode.";
-        statusError = true;
-    }
+    } else refused("that mode");
     screen = desktop.modes() ?? screen;
 }
 
@@ -175,16 +97,12 @@ function trySize(modes: readonly ScreenMode[], size: ScreenModeChoice) {
     tryMode(best);
 }
 
+/* The mode on trial becomes the user's choice for this monitor, which the system keeps. */
 function keepMode() {
-    const monitor = screen?.monitor ?? "";
     if (!desktop.keepMode()) {
         status = "The mode had already gone back.";
         statusError = true;
-    } else {
-        screen = desktop.modes() ?? screen;
-        if (screen?.wanted && monitor) savedModes.set(monitor, screen.wanted);
-        store();
-    }
+    } else screen = desktop.modes() ?? screen;
     tried = null;
 }
 
@@ -223,7 +141,6 @@ function screenCard(): Child {
     const listed = source !== "remote" && modes.length > 0;
     const shown = source === "remote" || !s?.shown ? `${settings.screenWidth} × ${settings.screenHeight}`
                                                    : modeName(s.shown, modes);
-    const saved = s?.monitor ? savedModes.get(s.monitor) : undefined;
     const why = source === "driver" && listed ? "The monitor's own preferred mode is marked recommended."
               : source === "handedBack" && listed ? `${REASONS.handedBack} Pick a resolution to try again.`
               : REASONS[source];
@@ -231,8 +148,8 @@ function screenCard(): Child {
         heading(s?.name || "Screen"),
         text(shown),
         caption(why),
-        !listed && saved && source !== "remote" &&
-            caption(`Saved for this monitor: ${modeName(saved, [])}, used when a display driver runs.`));
+        !listed && s?.chosen && source !== "remote" &&
+            caption(`Kept for this monitor: ${modeName(s.chosen, [])}, used when a display driver runs.`));
     if (!listed || !s) return card({gap: 14}, words);
 
     /* The mode marked: the one the driver is asked for while it shows its own, else the one shown. */
@@ -305,8 +222,185 @@ function soundPage(): Child {
     ];
 }
 
+/* ---- languages ---- */
+
+/* Languages to add, by BCP 47 language tag: each one's own name, and its name in English (what the
+   search also finds). */
+const LANGUAGES: readonly {tag: string; own: string; english: string}[] = [
+    {tag: "af", own: "Afrikaans", english: "Afrikaans"},
+    {tag: "am", own: "አማርኛ", english: "Amharic"},
+    {tag: "ar", own: "العربية", english: "Arabic"},
+    {tag: "az", own: "azərbaycan", english: "Azerbaijani"},
+    {tag: "be", own: "беларуская", english: "Belarusian"},
+    {tag: "bg", own: "български", english: "Bulgarian"},
+    {tag: "bn", own: "বাংলা", english: "Bangla"},
+    {tag: "br", own: "brezhoneg", english: "Breton"},
+    {tag: "bs", own: "bosanski", english: "Bosnian"},
+    {tag: "ca", own: "català", english: "Catalan"},
+    {tag: "cs", own: "čeština", english: "Czech"},
+    {tag: "cy", own: "Cymraeg", english: "Welsh"},
+    {tag: "da", own: "dansk", english: "Danish"},
+    {tag: "de", own: "Deutsch", english: "German"},
+    {tag: "de-AT", own: "Deutsch (Österreich)", english: "German (Austria)"},
+    {tag: "de-CH", own: "Deutsch (Schweiz)", english: "German (Switzerland)"},
+    {tag: "de-DE", own: "Deutsch (Deutschland)", english: "German (Germany)"},
+    {tag: "el", own: "Ελληνικά", english: "Greek"},
+    {tag: "en", own: "English", english: "English"},
+    {tag: "en-AU", own: "English (Australia)", english: "English (Australia)"},
+    {tag: "en-CA", own: "English (Canada)", english: "English (Canada)"},
+    {tag: "en-GB", own: "English (United Kingdom)", english: "English (United Kingdom)"},
+    {tag: "en-IN", own: "English (India)", english: "English (India)"},
+    {tag: "en-US", own: "English (United States)", english: "English (United States)"},
+    {tag: "eo", own: "esperanto", english: "Esperanto"},
+    {tag: "es", own: "español", english: "Spanish"},
+    {tag: "es-419", own: "español (Latinoamérica)", english: "Spanish (Latin America)"},
+    {tag: "es-ES", own: "español (España)", english: "Spanish (Spain)"},
+    {tag: "es-MX", own: "español (México)", english: "Spanish (Mexico)"},
+    {tag: "et", own: "eesti", english: "Estonian"},
+    {tag: "eu", own: "euskara", english: "Basque"},
+    {tag: "fa", own: "فارسی", english: "Persian"},
+    {tag: "fi", own: "suomi", english: "Finnish"},
+    {tag: "fil", own: "Filipino", english: "Filipino"},
+    {tag: "fr", own: "français", english: "French"},
+    {tag: "fr-CA", own: "français (Canada)", english: "French (Canada)"},
+    {tag: "fr-FR", own: "français (France)", english: "French (France)"},
+    {tag: "fy", own: "Frysk", english: "Western Frisian"},
+    {tag: "ga", own: "Gaeilge", english: "Irish"},
+    {tag: "gd", own: "Gàidhlig", english: "Scottish Gaelic"},
+    {tag: "gl", own: "galego", english: "Galician"},
+    {tag: "gu", own: "ગુજરાતી", english: "Gujarati"},
+    {tag: "ha", own: "Hausa", english: "Hausa"},
+    {tag: "he", own: "עברית", english: "Hebrew"},
+    {tag: "hi", own: "हिन्दी", english: "Hindi"},
+    {tag: "hr", own: "hrvatski", english: "Croatian"},
+    {tag: "hu", own: "magyar", english: "Hungarian"},
+    {tag: "hy", own: "հայերեն", english: "Armenian"},
+    {tag: "id", own: "Bahasa Indonesia", english: "Indonesian"},
+    {tag: "ig", own: "Igbo", english: "Igbo"},
+    {tag: "is", own: "íslenska", english: "Icelandic"},
+    {tag: "it", own: "italiano", english: "Italian"},
+    {tag: "ja", own: "日本語", english: "Japanese"},
+    {tag: "ka", own: "ქართული", english: "Georgian"},
+    {tag: "kk", own: "қазақ тілі", english: "Kazakh"},
+    {tag: "km", own: "ខ្មែរ", english: "Khmer"},
+    {tag: "kn", own: "ಕನ್ನಡ", english: "Kannada"},
+    {tag: "ko", own: "한국어", english: "Korean"},
+    {tag: "ku", own: "kurdî", english: "Kurdish"},
+    {tag: "ky", own: "кыргызча", english: "Kyrgyz"},
+    {tag: "la", own: "Latina", english: "Latin"},
+    {tag: "lb", own: "Lëtzebuergesch", english: "Luxembourgish"},
+    {tag: "lo", own: "ລາວ", english: "Lao"},
+    {tag: "lt", own: "lietuvių", english: "Lithuanian"},
+    {tag: "lv", own: "latviešu", english: "Latvian"},
+    {tag: "mk", own: "македонски", english: "Macedonian"},
+    {tag: "ml", own: "മലയാളം", english: "Malayalam"},
+    {tag: "mn", own: "монгол", english: "Mongolian"},
+    {tag: "mr", own: "मराठी", english: "Marathi"},
+    {tag: "ms", own: "Bahasa Melayu", english: "Malay"},
+    {tag: "mt", own: "Malti", english: "Maltese"},
+    {tag: "my", own: "မြန်မာ", english: "Burmese"},
+    {tag: "nb", own: "norsk bokmål", english: "Norwegian Bokmål"},
+    {tag: "ne", own: "नेपाली", english: "Nepali"},
+    {tag: "nl", own: "Nederlands", english: "Dutch"},
+    {tag: "nn", own: "norsk nynorsk", english: "Norwegian Nynorsk"},
+    {tag: "oc", own: "occitan", english: "Occitan"},
+    {tag: "pa", own: "ਪੰਜਾਬੀ", english: "Punjabi"},
+    {tag: "pl", own: "polski", english: "Polish"},
+    {tag: "ps", own: "پښتو", english: "Pashto"},
+    {tag: "pt", own: "português", english: "Portuguese"},
+    {tag: "pt-BR", own: "português (Brasil)", english: "Portuguese (Brazil)"},
+    {tag: "pt-PT", own: "português (Portugal)", english: "Portuguese (Portugal)"},
+    {tag: "ro", own: "română", english: "Romanian"},
+    {tag: "ru", own: "русский", english: "Russian"},
+    {tag: "si", own: "සිංහල", english: "Sinhala"},
+    {tag: "sk", own: "slovenčina", english: "Slovak"},
+    {tag: "sl", own: "slovenščina", english: "Slovenian"},
+    {tag: "so", own: "Soomaali", english: "Somali"},
+    {tag: "sq", own: "shqip", english: "Albanian"},
+    {tag: "sr", own: "српски", english: "Serbian"},
+    {tag: "sv", own: "svenska", english: "Swedish"},
+    {tag: "sw", own: "Kiswahili", english: "Swahili"},
+    {tag: "ta", own: "தமிழ்", english: "Tamil"},
+    {tag: "te", own: "తెలుగు", english: "Telugu"},
+    {tag: "tg", own: "тоҷикӣ", english: "Tajik"},
+    {tag: "th", own: "ไทย", english: "Thai"},
+    {tag: "tk", own: "türkmen dili", english: "Turkmen"},
+    {tag: "tr", own: "Türkçe", english: "Turkish"},
+    {tag: "tt", own: "татар", english: "Tatar"},
+    {tag: "uk", own: "українська", english: "Ukrainian"},
+    {tag: "ur", own: "اردو", english: "Urdu"},
+    {tag: "uz", own: "oʻzbek", english: "Uzbek"},
+    {tag: "vi", own: "Tiếng Việt", english: "Vietnamese"},
+    {tag: "xh", own: "isiXhosa", english: "Xhosa"},
+    {tag: "yo", own: "Èdè Yorùbá", english: "Yoruba"},
+    {tag: "yue", own: "粵語", english: "Cantonese"},
+    {tag: "zh", own: "中文", english: "Chinese"},
+    {tag: "zh-CN", own: "中文（中国）", english: "Chinese (China)"},
+    {tag: "zh-HK", own: "中文（香港）", english: "Chinese (Hong Kong)"},
+    {tag: "zh-TW", own: "中文（台灣）", english: "Chinese (Taiwan)"},
+    {tag: "zu", own: "isiZulu", english: "Zulu"},
+];
+const known = (tag: string) => LANGUAGES.find(l => l.tag.toLowerCase() === tag.toLowerCase());
+
+let search = "";
+let searchFocused = false;
+
+/* Ask for the new list, then show what the system took. */
+function setLanguages(next: readonly string[]) {
+    if (!desktop.setLanguages(next)) refused("that list of languages");
+    else {
+        status = "";
+        statusError = false;
+    }
+    languages = desktop.languages() ?? languages;
+}
+
+function moveLanguage(i: number, by: number) {
+    const next = [...languages];
+    [next[i], next[i + by]] = [next[i + by], next[i]];
+    setLanguages(next);
+}
+
+function languageRow(tag: string, i: number): Child {
+    const l = known(tag), last = i === languages.length - 1;
+    return [
+        i > 0 && divider(),
+        row({gap: 8, key: tag},
+            text(String(i + 1), {width: 22, colour: theme.textDim}),
+            column({grow: 1, gap: 2},
+                   text(l?.own ?? tag, {weight: 1}),
+                   caption(l ? `${l.english} · ${tag}` : tag)),
+            button("", () => moveLanguage(i, -1), {icon: "chevron-up", variant: "ghost", compact: true, disabled: i === 0}),
+            button("", () => moveLanguage(i, 1), {icon: "chevron-down", variant: "ghost", compact: true, disabled: last}),
+            button("", () => setLanguages(languages.filter(t => t !== tag)),
+                   {icon: "close", variant: "ghost", compact: true, disabled: languages.length === 1})),
+    ];
+}
+
+function languagePage(): Child {
+    const q = search.trim().toLowerCase();
+    const choices = LANGUAGES.filter(l => !languages.some(t => t.toLowerCase() === l.tag.toLowerCase()) &&
+        (!q || l.own.toLowerCase().includes(q) || l.english.toLowerCase().includes(q) || l.tag.toLowerCase().startsWith(q)));
+    return [
+        card({gap: 12},
+             column({gap: 4}, heading("Preferred languages"),
+                    caption("Programs show text in the first of these languages they have, and web pages are asked " +
+                            "for them in this order. The first is the one you want most.")),
+             languages.map(languageRow)),
+        card({gap: 12},
+             column({gap: 4}, heading("Add a language"), caption("It is added at the end of the list.")),
+             textField(search, v => { search = v; }, {placeholder: "Search languages", onFocus: on => { searchFocused = on; }}),
+             choices.length
+                 ? scroll({maxHeight: 260, gap: 2},
+                          choices.map(l => listItem(l.own === l.english ? l.own : `${l.own} — ${l.english}`, false,
+                                                    () => setLanguages([...languages, l.tag]), {key: l.tag})))
+                 : caption(q ? "No language matches." : "Every language listed is already chosen.")),
+    ];
+}
+
 function view(): Child {
-    const page = section === "display" ? displayPage() : section === "mouse" ? mousePage() : soundPage();
+    const page = section === "display" ? displayPage() : section === "mouse" ? mousePage()
+               : section === "sound" ? soundPage() : languagePage();
     const label = SECTIONS.find(s => s.id === section)!.label;
     return row({gap: 0, align: "stretch"},
         column({width: 216, padding: [22, 12], gap: 4, background: theme.sidebar},
@@ -325,7 +419,7 @@ const app: App = run({
     title: "Settings", width: 880, height: 640, view,
     onKey: e => {
         if (e.key === "Escape") { app.close(); return true; }
-        if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !searchFocused) {
             const i = SECTIONS.findIndex(s => s.id === section);
             section = SECTIONS[(i + (e.key === "ArrowDown" ? 1 : SECTIONS.length - 1)) % SECTIONS.length].id;
             status = "";
@@ -334,15 +428,12 @@ const app: App = run({
     },
 });
 
-/* What changed elsewhere: the taskbar speaker, a sound device coming or going, smooth gradients
-   becoming available or not, the desktop's new size, the screen handed back, or the monitor's modes
-   changing (a trial counting down or ending, a monitor plugged in). */
+/* What the window shows, read again; whether any of it changed. */
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-const poll = setInterval(() => {
-    if (app.closed) { clearInterval(poll); return; }
+function refresh(): boolean {
     const now = desktop.get();
-    if (!now) return;
-    const nextScreen = desktop.modes(), nextSound = desktop.sound();
+    if (!now) return false;
+    const nextScreen = desktop.modes(), nextSound = desktop.sound(), nextLanguages = desktop.languages() ?? languages;
     let changed = !same(nextScreen, screen);
     if (changed && screen?.trialMs && nextScreen && !nextScreen.trialMs && tried && !nextScreen.refused &&
         !sameMode(nextScreen.wanted, tried)) {
@@ -359,5 +450,24 @@ const poll = setInterval(() => {
         sound = nextSound;
         changed = true;
     }
-    if (changed) app.invalidate();
+    if (!same(nextLanguages, languages)) {
+        languages = nextLanguages;
+        changed = true;
+    }
+    return changed;
+}
+
+/* The user's settings changed, here or elsewhere (the taskbar's volume, another program): the system
+   says so at once. */
+const unwatch = desktop.watch(() => { if (!app.closed && refresh()) app.invalidate(); });
+/* What is the system's and no setting: a sound device coming or going, smooth gradients becoming
+   available or not, the desktop's new size, the screen handed back, or the monitor's modes changing
+   (a trial counting down or ending, a monitor plugged in). */
+const poll = setInterval(() => {
+    if (app.closed) {
+        clearInterval(poll);
+        unwatch();
+        return;
+    }
+    if (refresh()) app.invalidate();
 }, 500);

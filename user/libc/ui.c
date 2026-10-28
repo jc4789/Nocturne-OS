@@ -993,6 +993,12 @@ static void draw_icon(canvas_t *c, struct str name, float x, float y, float size
     else if (str_is(name, "close")) { L(6, 6, 18, 18, 2); L(18, 6, 6, 18, 2); }
     else if (str_is(name, "chevron-right")) { L(9, 5.5, 15.5, 12, 2); L(15.5, 12, 9, 18.5, 2); }
     else if (str_is(name, "chevron-left")) { L(15, 5.5, 8.5, 12, 2); L(8.5, 12, 15, 18.5, 2); }
+    else if (str_is(name, "chevron-up")) { L(5.5, 15, 12, 8.5, 2); L(12, 8.5, 18.5, 15, 2); }
+    else if (str_is(name, "chevron-down")) { L(5.5, 9, 12, 15.5, 2); L(12, 15.5, 18.5, 9, 2); }
+    else if (str_is(name, "language")) {
+        BOX(3, 3, 18, 18, 9); BOX(8, 3, 8, 18, 4);
+        L(3.5, 12, 20.5, 12, 1.8); L(5, 7.5, 19, 7.5, 1.5); L(5, 16.5, 19, 16.5, 1.5);
+    }
     else if (str_is(name, "settings")) {
         BOX(8.5, 8.5, 7, 7, 3.5);
         for (int i = 0; i < 8; i++) {

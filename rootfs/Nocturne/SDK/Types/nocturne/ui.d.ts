@@ -99,8 +99,9 @@ export interface TextProps extends Common {
     ellipsis?: boolean;
 }
 
-export type IconName = "display" | "mouse" | "sound" | "info" | "check" | "plus" | "minus" | "close" |
-    "chevron-right" | "chevron-left" | "settings" | "folder" | "clock" | "refresh" | "backspace" | "home" | "search";
+export type IconName = "display" | "mouse" | "sound" | "language" | "info" | "check" | "plus" | "minus" | "close" |
+    "chevron-right" | "chevron-left" | "chevron-up" | "chevron-down" | "settings" | "folder" | "clock" | "refresh" |
+    "backspace" | "home" | "search";
 
 export interface ButtonProps extends Common {
     /** primary: the accent colour; secondary (default): a framed button; ghost: no frame. */
@@ -248,7 +249,8 @@ export function withAlpha(colour: Colour, alpha: number): Colour;
     C:\Nocturne\System, then in each folder of C:\Programs ("notepad"), or by a path. */
 export function launch(path: string, argument?: string): boolean;
 
-/** The desktop's settings, as the Settings app shows them. */
+/** The desktop's settings, as the Settings app shows them. They are the user's settings: the
+    system applies a change at once and keeps it after a restart. */
 export interface DesktopSettings {
     /** The desktop's size: the monitor's mode (ScreenModes), or a remote viewer's window. */
     readonly screenWidth: number;
@@ -273,6 +275,16 @@ export interface SoundOutput {
     readonly muted: boolean;
 }
 
+/** Which of the user's settings changed:
+    - "languages": the languages the user reads (desktop.languages()).
+    - "pointer": the pointer's speed.
+    - "display": smooth gradients, or the mode kept for a monitor (ScreenModes.chosen).
+    - "sound": the volume or muting. */
+export type SettingChange = "languages" | "pointer" | "display" | "sound";
+
+/** The user's settings. They belong to the system: each change asked for here applies at once, the
+    system keeps it after a restart, and every program watching hears of it. No program keeps them
+    in a file of its own. */
 export const desktop: {
     /** null when the desktop is not running. */
     get(): DesktopSettings | null;
@@ -290,13 +302,21 @@ export const desktop: {
         keepMode() comes within 15 seconds (backMode(): at once). False when no display driver
         offers modes or the monitor has no such mode. */
     tryMode(mode: ScreenModeChoice): boolean;
-    /** Keeps the mode on trial as the user's choice for this monitor until a restart. */
+    /** Keeps the mode on trial as the user's choice for this monitor (ScreenModes.chosen), shown
+        whenever the monitor is driven and offers it, after a restart too. */
     keepMode(): boolean;
     /** Goes back to the mode before the trial now. */
     backMode(): boolean;
-    /** The user's choice for the monitor named monitor (ScreenModes.monitor), shown whenever that
-        monitor is driven and offers it (what Settings puts back at startup). */
-    savedMode(monitor: string, mode: ScreenModeChoice): boolean;
+    /** The languages the user reads, most wanted first, as BCP 47 language tags ("ja", "en-US");
+        never empty. null when the system will not say. */
+    languages(): readonly string[] | null;
+    /** Makes tags, most wanted first, the user's languages (the system writes each tag in its usual
+        case and drops one given twice); false when the list is empty or one is not a language tag. */
+    setLanguages(tags: Iterable<string>): boolean;
+    /** Calls listener after the user's settings changed, whoever changed them (this program,
+        another, the taskbar), with which changed. Returns the function that stops it. Watching
+        alone does not keep the program running: its windows, timers or requests do. */
+    watch(listener: (changed: readonly SettingChange[]) => void): () => void;
 };
 
 /** A resolution and refresh rate. */
@@ -341,6 +361,9 @@ export interface ScreenModes {
     readonly trialMs: number;
     /** The mode tried last could not be shown, and the one before is back. */
     readonly refused: boolean;
+    /** The mode the user kept for this monitor, whether or not it is offered now; null while the
+        user chose none (the monitor's preferred mode is shown). */
+    readonly chosen: ScreenModeChoice | null;
 }
 
 /** The computer, as About shows it. */

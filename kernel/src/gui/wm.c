@@ -26,6 +26,7 @@
 #include "sys/sched.h"
 #include "sys/proc.h"
 #include "sys/syscall.h"
+#include "sys/usersettings.h"
 #include "dev/pm.h"
 #include "abi.h"
 
@@ -112,9 +113,9 @@ static struct window *direct_win;
 static int direct_shape = -1;
 static struct n_screen_state direct_state = {.serial = 1, .hot_x = DIRECT_HOT, .hot_y = DIRECT_HOT};
 static struct wait_queue direct_wq;
-/* Settings (struct desktop_settings): pointer speed with its leftover quarter steps, and smooth
-   gradients as the user wants them; the compositor applies them between frames while the scanout
-   shown takes them (fb_dither_able). */
+/* The user's settings (struct desktop_settings, sys/usersettings.c): pointer speed with its
+   leftover quarter steps, and smooth gradients as the user wants them; the compositor applies them
+   between frames while the scanout shown takes them (fb_dither_able). Under wm_lock. */
 static int pointer_speed, pointer_rest_x, pointer_rest_y;
 static bool deep_wanted;
 static bool presenting_back;
@@ -892,6 +893,30 @@ static void set_deep_simulation(bool on) {
     kprintf("wm: %u bpc desktop%s\n", fb.bpc, fb.simulated ? ", dithered to the 8 bpc display" : "");
     draw_wall();
     damage_all();
+}
+
+/* The user's pointer speed and smooth gradients, wm_lock held: the N_USER_SETTING_* that changed. */
+static uint32_t desktop_settings_put(int speed, bool smooth) {
+    uint32_t changed = (speed != pointer_speed ? N_USER_SETTING_POINTER : 0) |
+                       (smooth != deep_wanted ? N_USER_SETTING_DISPLAY : 0);
+    if (speed != pointer_speed) pointer_rest_x = pointer_rest_y = 0;
+    pointer_speed = speed;
+    deep_wanted = smooth;
+    wake_compositor();
+    return changed;
+}
+
+void wm_desktop_settings(int *speed, bool *smooth) {
+    wm_lock();
+    *speed = pointer_speed;
+    *smooth = deep_wanted;
+    wm_unlock();
+}
+
+void wm_desktop_settings_set(int speed, bool smooth) {
+    wm_lock();
+    desktop_settings_put(MAX(-2, MIN(2, speed)), smooth);
+    wm_unlock();
 }
 
 static int launch(const char *path, const char *arg) {
@@ -2860,10 +2885,8 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
                 if (!user_ok(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
                 struct desktop_settings n = *ds;
                 if (n.pointer_speed < -2 || n.pointer_speed > 2 || n.smooth_gradients > 1) return -N_ERR_INVALID;
-                if (n.pointer_speed != pointer_speed) pointer_rest_x = pointer_rest_y = 0;
-                pointer_speed = n.pointer_speed;
-                deep_wanted = n.smooth_gradients != 0;
-                wake_compositor();
+                uint32_t changed = desktop_settings_put(n.pointer_speed, n.smooth_gradients != 0);
+                if (changed) user_settings_changed(changed);
             }
             if (!user_ok_w(ds, sizeof *ds)) return -N_ERR_BAD_ADDRESS;
             memset(ds, 0, sizeof *ds);

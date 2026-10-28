@@ -91,10 +91,12 @@ general-purpose OS for daily use (see [Limits](#limits)).
     of up to 1 MiB.
   - Kernel text uses GNU Unifont Japanese 18.0.01 bitmaps (57,086 glyphs, 8×16 half-width and 16×16 full-width).
 - **Settings**: the Settings app (the gear on the desktop, Settings in the start menu) changes the display
-  (resolution and refresh rate with a display driver, smooth gradients), the mouse (pointer speed) and the sound
-  (volume and mute) with the mouse alone.
-  Changes apply at once and are saved in `AppData\Settings\desktop.conf` in the user's folder, so they survive a restart. No terminal opens at startup, and
-  nothing in everyday use needs one.
+  (resolution and refresh rate with a display driver, smooth gradients), the mouse (pointer speed), the sound
+  (volume and mute) and the languages the user reads, in order (what the browser asks web pages for), with the
+  mouse alone. The settings belong to the system (the kernel), and the Settings app is a window onto them: a
+  change applies at once, the system saves it in `AppData\Nocturne\Settings.conf` in the user's folder and puts it
+  back at the next start, and running apps hear of it wherever it was made, the taskbar's volume included
+  (`docs/nocturne-native-abi.md` §12). No terminal opens at startup, and nothing in everyday use needs one.
 - **Hyper-V**: VMBus and the synthetic devices, heartbeat, shutdown and restart from Hyper-V Manager, time sync,
   KVP (Hyper-V Manager shows the VM's IP address and OS), Hyper-V sockets, and the RDP server on them for the
   Enhanced Session.

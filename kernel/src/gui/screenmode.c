@@ -21,6 +21,7 @@
 #include "dev/fb.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
+#include "sys/usersettings.h"
 #include "mm/heap.h"
 #include "display_abi.h"
 
@@ -269,9 +270,40 @@ static void firmware_part(struct n_screen_modes *m, bool boot) {
     m->shown = (struct n_screen_mode){w, h, boot ? fb.refresh_mhz : 0, 0};
 }
 
+void screen_modes_choose(const char *monitor, const struct n_screen_mode *mode) {
+    char name[sizeof offered.monitor] = {0};
+    strlcpy(name, monitor, sizeof name);
+    bool changed = false;
+    mutex_lock(&lock);
+    choose_for(name, mode);
+    const struct n_screen_mode *m = offered.count && !strcmp(offered.monitor, name) ? offered_mode(mode) : NULL;
+    if (m && !trial_on && !same(m, &wanted)) {
+        unrefuse(m);
+        wish(m, "the user's choice for this monitor");
+        changed = true;
+    }
+    mutex_unlock(&lock);
+    if (changed) publish();
+}
+
+bool screen_modes_choice(unsigned i, char monitor[32], struct n_screen_mode *mode) {
+    mutex_lock(&lock);
+    bool there = i < nchoices;
+    if (there) {
+        memcpy(monitor, choices[i].monitor, sizeof choices[i].monitor);
+        monitor[sizeof choices[i].monitor - 1] = 0;
+        *mode = choices[i].mode;
+    }
+    mutex_unlock(&lock);
+    return there;
+}
+
+_Static_assert(offsetof(struct screen_modes, chosen) == SCREEN_MODES_FIRST_BYTES, "the first struct screen_modes");
+
 int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
     if (op == SCREEN_MODES_GET) {
-        if (size != sizeof(struct screen_modes)) return -N_ERR_INVALID;
+        /* the struct of the caller's build: with chosen or without */
+        if (size != sizeof(struct screen_modes) && size != SCREEN_MODES_FIRST_BYTES) return -N_ERR_INVALID;
         struct screen_modes *out = kmalloc(sizeof *out);
         if (!out) return -N_ERR_NO_MEMORY;
         memset(out, 0, sizeof *out);
@@ -289,7 +321,11 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
                                                  : SCREEN_SOURCE_FIRMWARE;
         mutex_unlock(&lock);
         firmware_part(&out->offered, boot);
-        int64_t r = copy_to_user(user, out, sizeof *out);
+        mutex_lock(&lock);
+        const struct n_screen_mode *chosen = out->offered.monitor[0] ? choice_for(out->offered.monitor) : NULL;
+        if (chosen) out->chosen = *chosen;
+        mutex_unlock(&lock);
+        int64_t r = copy_to_user(user, out, size);
         kfree(out);
         return r;
     }
@@ -300,18 +336,7 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
     int64_t r = 0;
     bool changed = false;
     mutex_lock(&lock);
-    if (s.how == SCREEN_MODE_SAVED) {
-        if (!s.monitor[0] || !s.mode.width || !s.mode.height || !s.mode.refresh_mhz) r = -N_ERR_INVALID;
-        else {
-            choose_for(s.monitor, &s.mode);
-            const struct n_screen_mode *m = offered.count && !strcmp(offered.monitor, s.monitor) ? offered_mode(&s.mode) : NULL;
-            if (m && !trial_on && !same(m, &wanted)) {
-                unrefuse(m);
-                wish(m, "the user's choice for this monitor");
-                changed = true;
-            }
-        }
-    } else if (s.how == SCREEN_MODE_TRY) {
+    if (s.how == SCREEN_MODE_TRY) {
         const struct n_screen_mode *m = offered.count ? offered_mode(&s.mode) : NULL;
         if (!offered.count) r = -N_ERR_NOT_FOUND;
         else if (!m) r = -N_ERR_INVALID;
@@ -334,10 +359,13 @@ int64_t screen_modes_syscall(void *user, uint64_t size, uint64_t op) {
         else {
             trial_end();
             if (s.how == SCREEN_MODE_KEEP) {
+                const struct n_screen_mode *before = choice_for(offered.monitor);
+                bool differs = !before || !same(before, &wanted);
                 choose_for(offered.monitor, &wanted);
                 char text[48];
                 mode_text(&wanted, text, sizeof text);
                 kprintf("screen: the user keeps %s\n", text);
+                if (differs) user_settings_changed(N_USER_SETTING_DISPLAY); /* a user's setting, kept */
             } else {
                 wish(&trial_from, "the user goes back to");
                 changed = true;

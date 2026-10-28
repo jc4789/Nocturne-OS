@@ -195,6 +195,8 @@ static const struct test tests[] = {
      {"webnet-tcp-capacity: 0 failed"}, "FAIL", 120, false, true},
     {"nativeabi", "documents-channels-apps-events", "tcc -o .\\nativeabitest C:\\Tests\\nativeabitest.c && .\\nativeabitest", 0,
      {"nativeabitest: ", ", 0 failed"}, "nativeabitest FAIL", 120, false, true},
+    {"nativeabi", "user-settings", "tcc -o .\\usersettingstest C:\\Tests\\usersettingstest.c && .\\usersettingstest", 0,
+     {"usersettingstest: ", ", 0 failed"}, "usersettingstest FAIL", 60, false, true},
     {"nativeabi", "iso-c-stdio", "tcc -o .\\stdiotest C:\\Tests\\stdiotest.c && .\\stdiotest", 0,
      {"stdiotest: ", ", 0 failed"}, "stdiotest FAIL", 120, false, true},
     {"sharedpages", "native-video-shared-pages", "tcc -o .\\sharedpagetest C:\\Tests\\sharedpagetest.c && .\\sharedpagetest", 0,

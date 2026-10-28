@@ -22,8 +22,9 @@ struct screen_format {
 
 /* Desktop settings, read and changed by the Settings app: SYS_SCREEN_INFO with
    its third argument SCREEN_SETTINGS_GET or SCREEN_SETTINGS_SET and its second
-   argument sizeof(struct desktop_settings). Changes apply at once; keeping
-   them across restarts is the Settings app's job (its saved file). */
+   argument sizeof(struct desktop_settings). They are the user's settings
+   (abi.h, N_USER_SETTING_POINTER and N_USER_SETTING_DISPLAY): a change applies
+   at once and the system keeps it across restarts. */
 #define SCREEN_SETTINGS_GET 1
 #define SCREEN_SETTINGS_SET 2
 struct desktop_settings {
@@ -46,7 +47,9 @@ struct desktop_settings {
    name from the EDID the firmware read, "" without one; shown the mode of the screen shown), and
    SCREEN_MODE_SET's TRY, KEEP and BACK say N_ERR_NOT_FOUND. While the firmware's framebuffer is
    shown, shown is the firmware's mode whether or not modes are offered, its refresh 0 where no
-   timing of the EDID names that size. source says what decides the desktop's size. */
+   timing of the EDID names that size. source says what decides the desktop's size, chosen the
+   mode the user chose for the monitor offered names (all 0: none), whether or not it is offered
+   now. A program built before chosen passes SCREEN_MODES_FIRST_BYTES and gets that much. */
 #define SCREEN_MODES_GET 3
 #define SCREEN_MODE_SET 4
 #define SCREEN_MODE_TRIAL_MS 15000u /* a mode tried and not kept goes back after this */
@@ -67,19 +70,21 @@ struct screen_modes {
     uint32_t refused;              /* the mode tried last could not be shown: the one before is back */
     uint32_t source;               /* SCREEN_SOURCE_* */
     uint32_t reserved;
+    struct n_screen_mode chosen;   /* the user's choice for offered.monitor (all 0: none) */
 };
+#define SCREEN_MODES_FIRST_BYTES 2176u /* the first struct screen_modes: offered to reserved */
 /* TRY: mode (one offered, as listed) is shown on trial, and goes back to the mode before it
    unless KEEP comes within SCREEN_MODE_TRIAL_MS (BACK: at once). Another TRY during a trial
-   keeps the mode to go back to. KEEP makes it the user's choice for that monitor until a
-   restart (keeping it longer is the Settings app's job: its saved file and SAVED at startup).
-   SAVED: mode is the user's choice for the monitor named in monitor, shown whenever that monitor
-   is driven and offers it. */
-enum { SCREEN_MODE_TRY = 1, SCREEN_MODE_KEEP, SCREEN_MODE_BACK, SCREEN_MODE_SAVED };
+   keeps the mode to go back to. KEEP makes it the user's choice for that monitor, a user's
+   setting (abi.h, N_USER_SETTING_DISPLAY) the system keeps across restarts and shows whenever
+   that monitor is driven and offers it. 4 stays unassigned: it put a saved choice back, which
+   the system now does itself. */
+enum { SCREEN_MODE_TRY = 1, SCREEN_MODE_KEEP, SCREEN_MODE_BACK };
 struct screen_mode_set {
     uint32_t how;              /* SCREEN_MODE_* */
     uint32_t reserved;
-    char monitor[32];          /* SAVED: the monitor's struct n_screen_modes monitor text */
-    struct n_screen_mode mode; /* TRY, SAVED: width, height and refresh_mhz (flags ignored) */
+    char monitor[32];          /* unused: 0 */
+    struct n_screen_mode mode; /* TRY: width, height and refresh_mhz (flags ignored) */
 };
 
 /* Window flag. The window buffer carries a deep plane of w*h bytes directly

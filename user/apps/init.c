@@ -95,13 +95,8 @@ int main(void) {
     fflush(stdout);
     start_drivers();
     if (gui_available()) {
-        /* desktop session: put the saved Settings back; the desktop is the user's
-           from here, opened apps come from its icons and menu */
-        n_handle settings = start2(N_FOLDER_SYSTEM "\\js", "js", N_FOLDER_SYSTEM "\\settings.js", "--apply", -1, -1, NULL);
-        if (settings >= 0) {
-            n_app_result(settings, 5000, NULL);
-            n_handle_close(settings);
-        }
+        /* desktop session: the desktop is the user's from here (the system has put the user's
+           settings back before this app started), opened apps come from its icons and menu */
         autorun();
         for (;;) n_sleep_ms(60000);
     }

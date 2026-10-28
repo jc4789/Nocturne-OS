@@ -353,7 +353,8 @@ plane、connector のオブジェクトや atomic の状態）は真似ず、KMS
    状態スレッドが無いと次の望みで取り戻せないので、その時は立ち上げを失敗にする。
 
 設定アプリの「Resolution and refresh rate」で選んだモードは試行として出し、15 秒以内に Keep を押さなければ前のモードへ戻る。
-Keep したモードはモニターごとに `desktop.conf` に保存し、次の起動でも推奨モードの代わりに使う。
+Keep したモードはモニターごとの利用者の設定になり、システム（`kernel/src/sys/usersettings.c`）が
+`AppData\Nocturne\Settings.conf` に保存して、次の起動でも推奨モードの代わりに使う。
 
 BAR1 の offset：RM のカーネル写像は `os_map_kernel_space` が BAR の一部を写したもの。`os_pci.c` が写像ごとに bus 番地を
 覚えておき、`nvrm_kernel_mapping_phys()`（`os_pci.c` の末尾）が写像の番地から bus 番地を返す。面の先頭と末尾がともに同じ写像の

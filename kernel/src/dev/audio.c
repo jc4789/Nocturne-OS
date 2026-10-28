@@ -6,6 +6,7 @@
 #include "mm/vmm.h"
 #include "sys/sched.h"
 #include "sys/object.h"
+#include "sys/usersettings.h"
 #include "abi.h"
 #include "vm/vm.h"
 
@@ -272,14 +273,21 @@ const char *audio_output(void) { return remote_users ? "Remote desktop" : card_n
 static void set_gain(void) { gain = muted ? 0 : volume * volume * 65536 / 10000; }
 int audio_volume(void) { return volume; }
 bool audio_muted(void) { return muted; }
+/* The volume and muting are the user's settings (sys/usersettings.c): whoever changes them (an
+   app, the taskbar's volume control), the apps that watch are told and the system keeps them. */
 void audio_set_volume(int percent) {
-    volume = MAX(0, MIN(100, percent));
+    int v = MAX(0, MIN(100, percent));
+    bool changed = v != volume || muted;
+    volume = v;
     muted = false;
     set_gain();
+    if (changed) user_settings_changed(N_USER_SETTING_SOUND);
 }
 void audio_set_muted(bool m) {
+    bool changed = m != muted;
     muted = m;
     set_gain();
+    if (changed) user_settings_changed(N_USER_SETTING_SOUND);
 }
 
 static uint8_t system_ring[RING_BYTES];
