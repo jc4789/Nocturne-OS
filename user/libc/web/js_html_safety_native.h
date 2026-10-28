@@ -17,26 +17,70 @@ static int trusted_native_init(JSContext *ctx) {
     JSClassDef def={.class_name="TrustedType",.finalizer=trusted_value_finalizer,.gc_mark=trusted_value_mark};
     return JS_NewClass(rt,trusted_value_class,&def);
 }
-/* Shared native CSP record for Window and Worker. These fields never come
- * from writable author globals or an author-provided policy dictionary. */
-static JSValue wasm_policy_violation_init(JSContext *ctx,const struct web_html_policy_rule *rule,
-                                           const char *url,int status) {
+/* CSP3 §2.4.1 and §5.5's event fields for a violation the policy model found
+ * (html_policy.h), shared by Window and Worker: one record that becomes both
+ * the SecurityPolicyViolationEvent's init and the report-uri body. Nothing
+ * here comes from writable author globals or an author-provided dictionary.
+ * document is the global's (its CSP list, URL and referrer); status is its
+ * response's status. The source location is the running author script's
+ * (§2.4.1: only "if the user agent is currently executing script"). */
+static JSValue csp_report_text(JSContext *ctx,web_doc *document,const char *url){
+    if(!url || !*url)return JS_NewString(ctx,"");
+    char *stripped=html_policy_report_url(document,url);
+    if(!stripped)return JS_ThrowOutOfMemory(ctx);
+    JSValue value=JS_NewString(ctx,stripped);free(stripped);return value;
+}
+static JSValue csp_violation_init(JSContext *ctx,web_doc *document,const struct html_csp_violation *violation,int status){
     JSValue init=JS_NewObjectProto(ctx,JS_NULL);
     if(JS_IsException(init))return init;
-    const char *keys[]={"effectiveDirective","violatedDirective","blockedURI","sample",
-        "disposition","originalPolicy","documentURI","sourceFile","referrer"};
-    const char *values[]={"script-src","script-src","wasm-eval","",
-        rule->report_only?"report":"enforce",rule->original_policy?rule->original_policy:"",
-        url?url:"",url?url:"",""};
+    const struct web_html_policy_rule *rule=violation->policy;
+    /* §5.2: a URL is stripped; "inline", "eval", "wasm-eval" and the
+       Trusted Types keywords are reported as they are. */
+    const char *resource=violation->resource?violation->resource:"";
+    bool url=strchr(resource,':')!=NULL;
+    char file[512];int column=0,line=JS_GetScriptLocation(ctx,file,sizeof file,&column);
+    JSValue values[]={
+        csp_report_text(ctx,document,document->url),
+        csp_report_text(ctx,document,document->referrer),
+        url?csp_report_text(ctx,document,resource):JS_NewString(ctx,resource),
+        JS_NewString(ctx,violation->directive),JS_NewString(ctx,violation->directive),
+        JS_NewString(ctx,rule&&rule->original_policy?rule->original_policy:""),
+        JS_NewString(ctx,rule&&rule->report_only?"report":"enforce"),
+        line?csp_report_text(ctx,document,file):JS_NewString(ctx,""),
+        JS_NewStringLen(ctx,violation->sample?violation->sample:"",violation->sample?violation->sample_length:0),
+        JS_NewInt32(ctx,status),JS_NewInt32(ctx,line),JS_NewInt32(ctx,line?column:0)};
+    const char *keys[]={"documentURI","referrer","blockedURI","effectiveDirective","violatedDirective","originalPolicy",
+        "disposition","sourceFile","sample","statusCode","lineNumber","columnNumber"};
+    bool ok=true;
     for(size_t i=0;i<sizeof keys/sizeof *keys;i++){
-        JSValue value=JS_NewString(ctx,values[i]);
-        if(JS_IsException(value)||JS_DefinePropertyValueStr(ctx,init,keys[i],value,JS_PROP_C_W_E)<0)goto fail;
+        if(!ok || JS_IsException(values[i])){JS_FreeValue(ctx,values[i]);ok=false;continue;}
+        ok=JS_DefinePropertyValueStr(ctx,init,keys[i],values[i],JS_PROP_C_W_E)>=0;
     }
-    if(JS_DefinePropertyValueStr(ctx,init,"statusCode",JS_NewInt32(ctx,status),JS_PROP_C_W_E)<0 ||
-       JS_DefinePropertyValueStr(ctx,init,"lineNumber",JS_NewInt32(ctx,0),JS_PROP_C_W_E)<0 ||
-       JS_DefinePropertyValueStr(ctx,init,"columnNumber",JS_NewInt32(ctx,0),JS_PROP_C_W_E)<0)goto fail;
+    if(!ok){JS_FreeValue(ctx,init);return JS_EXCEPTION;}
     return init;
-fail:JS_FreeValue(ctx,init);return JS_EXCEPTION;
+}
+/* §4.4.1 EnsureCSPDoesNotBlockStringCompilation after its Trusted Types step,
+   from QuickJS's dynamic code check: code is eval's string or the Function
+   constructor's source, which QuickJS assembles inside parentheses (the
+   ECMAScript sourceString is what is between them). Takes code; returns it,
+   or throws the EvalError. */
+static JSValue csp_compile_check(JSContext *ctx,web_doc *document,JSValue code,bool function,
+                                 html_csp_reporter report,void *opaque){
+    if(JS_IsException(code) || !JS_IsString(code) || !document->html_policy || !document->html_policy->first)return code;
+    size_t length;const char *source=JS_ToCStringLen(ctx,&length,code);
+    if(!source){JS_FreeValue(ctx,code);return JS_EXCEPTION;}
+    const char *text=source;
+    if(function && length>=2 && source[0]=='(' && source[length-1]==')'){text++;length-=2;}
+    bool allowed=html_policy_eval_allowed(document,text,length,report,opaque);
+    JS_FreeCString(ctx,source);
+    if(allowed)return code;
+    JS_FreeValue(ctx,code);
+    return JS_ThrowEvalError(ctx,"Code generation from strings disallowed by Content Security Policy");
+}
+/* §4.5.1's violation: script-src, resource "wasm-eval". */
+static JSValue wasm_policy_violation_init(JSContext *ctx,web_doc *document,struct web_html_policy_rule *rule,int status) {
+    struct html_csp_violation violation={.policy=rule,.directive="script-src",.resource="wasm-eval"};
+    return csp_violation_init(ctx,document,&violation,status);
 }
 static JSValue native_trusted(JSContext *ctx,JSValueConst this_value,int argc,JSValueConst *argv) {
     (void)this_value;

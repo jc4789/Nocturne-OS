@@ -98,8 +98,13 @@ static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const c
     }
     if(text && !page)log_text(s,2,"Frame blob text document allocation failed");
     bool made=page!=NULL;
+    /* The Blob's type is the response's Content-Type: its charset labels the bytes. An unlabeled
+       HTML Blob is sniffed (its container document is same origin); the text page is UTF-8. */
+    char charset[64]={0};
+    html_transport_label(mime,charset,sizeof charset);
+    if(!html && !charset[0])memcpy(charset,"utf-8",6);
     struct web_host host=frame_host(s,NULL);
-    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,"utf-8",&host,true);
+    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,charset,&host,true);
     free(page);js_free(s->ctx,body);f->navigation_owner=NULL;
     if(text && !made){f->failed=true;return;}
     html=html || made;
@@ -180,7 +185,17 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);f->navigation_owner=NULL;return;
     }
     if(!strncasecmp(desired,"javascript:",11)) {
-        if(web_frame_same_origin(s->doc,f->document) && f->document->js && !f->document->js->disabled &&
+        /* CSP3 §4.2.4 for a javascript: navigation: the navigating document's
+           policies' inline check of type "navigation" on the URL. The event
+           targets the frame element, as engines and WPT expect. */
+        web_doc *source=f->navigation_owner?f->navigation_owner:s->doc;
+        struct web_js_state *initiator=source==s->doc?s:source->js;
+        struct html_csp_request navigation={.url=desired,.original_url=desired};
+        struct csp_site site={initiator,f->element};
+        bool reported=initiator && !initiator->disabled;
+        bool csp_allowed=html_policy_navigation_allowed(source,&navigation,false,reported?csp_report:NULL,&site);
+        if(!csp_allowed)log_text(s,1,"javascript: frame navigation blocked by Content Security Policy");
+        else if(web_frame_same_origin(s->doc,f->document) && f->document->js && !f->document->js->disabled &&
            !(f->document->sandbox_flags&SB_SCRIPTS)){
             struct web_js_state *child=f->document->js;begin_task(child);
             JSValue result=JS_Eval(child->ctx,desired+11,strlen(desired+11),s->doc->url,JS_EVAL_TYPE_GLOBAL);

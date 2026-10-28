@@ -63,9 +63,12 @@ struct web_decoder {
 void web_decoder_init(struct web_decoder *decoder, web_encoding encoding, bool fatal);
 /* Processes bytes, then end-of-queue when last, appending each scalar value's
    UTF-8 to out. 1; 0 at an error in fatal mode (out has the scalar values
-   before it); -1 when out of memory. After end-of-queue, an error or running
-   out of memory the instance starts afresh with init's encoding (TextDecoder's
-   new instance). */
+   before it, the bytes after it are dropped); -1 when out of memory. After
+   end-of-queue or running out of memory the instance starts afresh with init's
+   encoding (TextDecoder's new instance). An error before end-of-queue keeps the
+   instance (TextDecoder's do not flush stays): the encoding's own decoder state
+   as the standard leaves it, which is its initial one except ISO-2022-JP's, and
+   whether a BOM was seen. */
 int web_decoder_run(struct web_decoder *decoder, const uint8_t *bytes, size_t length,
                     bool last, struct web_bytes *out);
 

@@ -12,6 +12,7 @@
 #include <webidb.h>
 #include <webidb_async.h>
 #include <webprefs.h>
+#include <webcookie.h>
 #include <media.h>
 #include <quickjs.h>
 #include "webi.h"
@@ -87,7 +88,10 @@ struct js_node_ref {
     uint64_t wheel_blocking;
 };
 struct js_timer { uint32_t id; int kind; uint64_t due, interval, order; JSValue fn, args; };
-struct js_policy_violation {struct js_policy_violation *next;JSValue init;struct web_html_policy_rule *rule;};
+/* CSP3 §5.5's queued task: the event's fields, the header policy whose report-uri
+   is sent (meta rules may be rewound before the task runs), and the element
+   the event targets while it stays connected (a wrapper; zero for none). */
+struct js_policy_violation {struct js_policy_violation *next;JSValue init,target;struct web_html_policy_rule *rule;};
 struct js_posted_task { struct js_posted_task *next; JSValue fn; uint32_t id; };
 struct js_idle_task { struct js_idle_task *next; JSValue fn; uint32_t id; uint64_t due; };
 struct js_script {
@@ -120,6 +124,9 @@ struct js_pending {
     struct cached_css *css;
     JSValue resolve, reject, stream_callback;
     char *url,*origin,*integrity,*referrer;
+    char *nonce; /* CSP: the request's cryptographic nonce metadata */
+    bool parser_inserted; /* CSP: the request's parser metadata */
+    node_t *element; /* CSP: P_CSS, the link element a violation targets */
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
     /* P_WORKER streamed: a frame is in the child, its NJW_RESUME not yet taken (worker_resume). */
@@ -146,6 +153,9 @@ struct js_module {
        module it reaches is still fetching. */
     struct js_module **children; uint32_t child_count;
     int credentials, referrer_policy; bool descendants, graph_settled; uint64_t visit;
+    /* Its script fetch options' nonce and parser metadata, which its
+       descendants are fetched with (HTML: descendant script fetch options). */
+    char *nonce; bool parser_inserted;
     struct js_module *next;
 };
 /* An import() waiting for its module graph to be fetched. */
@@ -402,6 +412,13 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
 static bool frame_string_replace(char **slot, const char *text);
 static void policy_report_send(struct web_js_state *s,JSValueConst init,struct web_html_policy_rule *rule);
 static void js_policy_worker_report(void *opaque,JSValueConst message);
+/* For whom a CSP check of this realm's document reports (js_policy_report.h):
+   the violation's element, NULL for the document. */
+struct csp_site { struct web_js_state *s; node_t *element; };
+static void csp_report(void *opaque,const struct html_csp_violation *violation);
+static bool csp_request_allowed(struct web_js_state *s,struct js_pending *p,const char *url,unsigned redirects);
+static bool csp_fetch_allowed(struct web_js_state *s,const struct html_csp_request *request,node_t *element);
+static bool csp_script_allowed(struct web_js_state *s,node_t *n,bool parser_inserted,const char *text,size_t length);
 static void storage_release_document(struct web_js_state *s);
 static void signal_slots(struct web_js_state *s) {
     web_doc *family = s->doc->dom_family ? s->doc->dom_family : s->doc;
@@ -1937,7 +1954,8 @@ static void style_memo_store(struct web_js_state *s, const node_t *n, const char
     *m = (struct js_style_memo){a, b, source_n, block_n};
 }
 static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
-    const char *css = node_attr(n, "style"); if (!css) css = "";
+    /* A style attribute CSP blocked gives no declarations. */
+    const char *css = n->csp_style_attribute == 2 ? NULL : node_attr(n, "style"); if (!css) css = "";
     size_t length = strlen(css);
     struct js_style_memo *m = style_memo_slot(s, n);
     if (m->source && m->source_n == length && !memcmp(m->source, css, length)) {
@@ -1952,7 +1970,13 @@ static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
    attribute now stands for (CSSOM's mutate flag: the attribute is not parsed
    again) */
 static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *block) {
-    if (!doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)block))) return false;
+    /* CSSOM's updating flag: the attribute change steps neither parse the
+       value again nor run CSP's check on it; the block applies. */
+    uint8_t state = n->csp_style_attribute;
+    n->csp_style_attribute = 3;
+    bool set = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)block));
+    n->csp_style_attribute = set ? 1 : state;
+    if (!set) return false;
     style_memo_store(s, n, block->p ? block->p : "", block->n, block->p ? block->p : "", block->n);
     return true;
 }
@@ -2263,8 +2287,7 @@ static JSValue computed_translation(JSContext *ctx,web_doc *d,const style_t *st,
     else snprintf(text,sizeof text,"matrix(%g, %g, %g, %g, %g, %g)",m[0],m[4],m[1],m[5],m[3],m[7]);
     return JS_NewString(ctx,text);
 }
-static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n, unsigned side) {
-    style_t *st = n->style;
+static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n, const style_t *st, unsigned side) {
     box_t *b = n->box;
     const len_t *in = st->inset;
     bool horizontal = side == 1 || side == 3;
@@ -2276,6 +2299,11 @@ static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n,
     if (!b || st->display == D_NONE || st->display == D_CONTENTS || st->position == POS_STATIC ||
         st->position == POS_STICKY || constrained) return computed_length(ctx, &in[side], n->owner);
     float value;
+    /* an anchor-positioned box's used inset, against the containing block its position-area made */
+    if (box_anchor_inset(b, side, &value)) {
+        char text[64]; snprintf(text, sizeof text, "%gpx", (double)(value == 0 ? 0 : value));
+        return JS_NewString(ctx, text);
+    }
     if (st->position == POS_RELATIVE) {
         box_t *relative_cb = b->cb ? b->cb : n->anchor_block;
         float base = relative_cb ? (horizontal ? relative_cb->w : relative_cb->h) : horizontal ? s->doc->width : s->doc->height;
@@ -2333,6 +2361,10 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     style_t fallback;
     style_t *st = computed_pseudo_style(n,pseudo,&fallback); char out[128]; out[0] = 0;
     if (!st) return JS_NewString(ctx, "");
+    /* css-anchor-position-1: an anchor-positioned box's styles with its anchor functions resolved and
+       its chosen position option applied (§6.5: they are its computed values) */
+    style_t anchored; struct css_anchor anchored_group;
+    if (pseudo == PE_NONE && n->box && box_anchor_style(n->box, &anchored, &anchored_group)) st = &anchored;
     if(property[0]=='-'&&property[1]=='-') {
         const struct custom_prop *p=css_custom_property(st,property);
         return JS_NewString(ctx,p&&p->value?p->value:"");
@@ -2357,7 +2389,7 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     }
     static const char *const inset_names[] = {"top", "right", "bottom", "left"};
     for (unsigned side = 0; side < 4; side++) if (!strcmp(property, inset_names[side]))
-        return pseudo==PE_NONE?computed_inset(owner,ctx,n,side):computed_length(ctx,&st->inset[side],n->owner);
+        return pseudo==PE_NONE?computed_inset(owner,ctx,n,st,side):computed_length(ctx,&st->inset[side],n->owner);
     box_t *principal = pseudo==PE_NONE?geometry_principal_box(n):NULL;
     if(!strcmp(property,"transform")||!strcmp(property,"translate"))
         return computed_translation(ctx,d,st,principal,!strcmp(property,"translate"));
@@ -2950,6 +2982,10 @@ void web_form_navigate(web_doc *d, node_t *submitter) {
     struct web_js_state *s = d->js;
     struct web_form_request request;
     if (!web_submit_request(d,submitter,&request)) return;
+    /* HTML navigate, for a form submission: CSP3 §4.2.4's form-action. */
+    struct html_csp_request csp={.url=request.url,.original_url=request.url};
+    struct csp_site site={s,NULL};
+    if (!html_policy_navigation_allowed(d,&csp,true,csp_report,&site)) { web_submit_request_free(&request); return; }
     web_autocomplete_record(d,submitter,request.url);
     /* "Plan to navigate": the form's target chooses the navigable among this page's frames
        first (frame.c), then the host's top-level traversables. */
@@ -5571,6 +5607,9 @@ static int pending_destination(const struct js_pending *p) {
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
     if(s->disabled){pending_error(p,"Browsing context is inactive");return false;}
+    /* Main fetch step 7: a blocked request's response is a network error,
+       for a local data: or blob: resource too. */
+    if(!csp_request_allowed(s,p,p->url,0)){pending_error(p,"Blocked by Content Security Policy");return false;}
     if ((p->kind==P_SCRIPT || p->kind==P_MODULE || p->kind==P_FONT || p->kind==P_CSS) && (web_url_has_scheme(p->url,"data") || web_url_has_scheme(p->url,"blob"))) {
         char mime[128];
         p->response.body=web_url_has_scheme(p->url,"data")
@@ -5687,6 +5726,13 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
     p->redirect_error = (policy & NJW_LOAD_REDIRECT_ERROR) != 0; p->force_preflight = (policy & NJW_LOAD_PREFLIGHT) != 0;
     p->no_cors = (policy & NJW_LOAD_NO_CORS) != 0; p->no_referrer = (policy & NJW_LOAD_NO_REFERRER) != 0;
     p->keepalive = keepalive; p->streaming = streaming; p->referrer_policy = referrer_policy;
+    /* The worker's script is fetched by its creating document: its CSP list's
+       worker-src (then script-src, default-src) decides, for blob: too. The
+       worker's own requests answer to the worker's own list (not this one). */
+    if (kind == 0) {
+        struct html_csp_request csp = {.url = url, .original_url = url, .destination = WEBNET_DEST_WORKER};
+        if (!csp_fetch_allowed(s, &csp, NULL)) { pending_error(p, "Blocked by Content Security Policy"); return true; }
+    }
     bool blob = web_url_has_scheme(url,"blob");
     if (strlen(url) > UINT32_MAX || (!blob && !permitted_url(s,url,true)) || (blob && kind == 2)) {
         pending_error(p,"Worker resource URL is not permitted"); return true;
@@ -5907,6 +5953,19 @@ static JSValue native_socket_open(JSContext *ctx, JSValueConst this_val, int arg
     if (memchr(url, 0, url_length) || (protocols && memchr(protocols, 0, protocols_length)) ||
         (strncmp(url, "ws://", 5) && strncmp(url, "wss://", 6))) { result = JS_ThrowSyntaxError(ctx, "Invalid WebSocket URL"); goto out; }
     if (!task_context_active(s)) { result = JS_ThrowTypeError(ctx, "WebSocket browsing context retired during conversion"); goto out; }
+    {
+        /* The establishment fetch is for the URL's http(s) form (WebSockets:
+           obtain a WebSocket connection), so connect-src sees that URL. A
+           blocked one is a failed connection (0), not an exception. */
+        bool secure = url[2] == 's';
+        char *fetch_url = js_malloc(ctx, url_length + 3);
+        if (!fetch_url) goto out;
+        snprintf(fetch_url, url_length + 3, "%s%s", secure ? "https" : "http", url + (secure ? 3 : 2));
+        struct html_csp_request csp = {.url = fetch_url, .original_url = fetch_url, .destination = WEBNET_DEST_EMPTY};
+        bool allowed = csp_fetch_allowed(s, &csp, NULL);
+        js_free(ctx, fetch_url);
+        if (!allowed) { result = JS_NewInt64(ctx, 0); goto out; }
+    }
     p = js_mallocz(ctx, sizeof *p);
     if (!p) goto out;
     p->id = s->host.socket_open(s->host.opaque, url, protocols, web_effective_url(s->doc));
@@ -6147,6 +6206,91 @@ static JSValue native_automation(JSContext *ctx, JSValueConst this_val, int argc
     while (*link) link = &(*link)->next;
     *link = record;
     return promise;
+}
+/* The same tool's WebDriver Cookies (§14). With web_host.automation_cookies, beside
+   __nocturne_automation and only where it is, a top-level realm has
+   __nocturne_cookies(command, window, name). window is a Window of this document's tree, as a
+   realm of the tree holds one (a global, or a WindowProxy): WebDriver's current browsing context
+   is its browsing context, whose active document's associated cookies (HttpOnly ones too) "get"
+   returns serialized, name's alone when name is given, and "delete" removes (WebDriver's "delete
+   cookies"). A frame under a cross-origin parent asks through its top-level window's testdriver,
+   which knows the frame as a message's source. The jar is the host's; no cookie is logged. */
+static web_doc *automation_window_document(struct web_js_state *s, JSValueConst window) {
+    /* A global, a WindowProxy (frame_message_receiver), or a frame realm's own global, which only
+       that realm holds: a frame's testdriver passes its own window. */
+    bool brand = false;
+    web_doc *d = frame_message_receiver(s, window, &brand);
+    if (brand) return d;
+    for (struct web_js_state *realm = s->runtime_owner->runtime_realms; realm; realm = realm->runtime_next) {
+        if (!task_context_active(realm)) continue;
+        JSValue global = JS_GetGlobalObject(realm->ctx);
+        bool own = JS_StrictEq(s->ctx, global, window);
+        JS_FreeValue(s->ctx, global);
+        if (own) return realm->doc;
+    }
+    return NULL;
+}
+/* WebDriver's serialized cookies (§14, the table for cookie conversion); a session cookie has no
+   expiry. */
+static JSValue automation_serialized_cookies(JSContext *ctx, const struct webcookie_record *list, size_t count) {
+    static const char *const same_site[] = {[WEBCOOKIE_SAME_SITE_LAX] = "Lax", [WEBCOOKIE_SAME_SITE_STRICT] = "Strict",
+                                            [WEBCOOKIE_SAME_SITE_NONE] = "None"};
+    JSValue array = JS_NewArray(ctx);
+    if (JS_IsException(array)) return array;
+    for (size_t i = 0; i < count; i++) {
+        const struct webcookie_record *c = &list[i];
+        const char *policy = c->same_site < sizeof same_site / sizeof *same_site ? same_site[c->same_site] : "Lax";
+        JSValue cookie = JS_NewObject(ctx);
+        if (JS_IsException(cookie) ||
+            JS_DefinePropertyValueStr(ctx, cookie, "name", JS_NewString(ctx, c->name), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "value", JS_NewString(ctx, c->value), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "path", JS_NewString(ctx, c->path), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "domain", JS_NewString(ctx, c->domain), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "secure", JS_NewBool(ctx, c->secure), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "httpOnly", JS_NewBool(ctx, c->http_only), JS_PROP_C_W_E) < 0 ||
+            (c->persistent && JS_DefinePropertyValueStr(ctx, cookie, "expiry", JS_NewInt64(ctx, c->expires), JS_PROP_C_W_E) < 0) ||
+            JS_DefinePropertyValueStr(ctx, cookie, "sameSite", JS_NewString(ctx, policy), JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, cookie); JS_FreeValue(ctx, array);
+            return JS_EXCEPTION;
+        }
+        if (JS_DefinePropertyValueUint32(ctx, array, (uint32_t)i, cookie, JS_PROP_C_W_E) < 0) { JS_FreeValue(ctx, array); return JS_EXCEPTION; }
+    }
+    return array;
+}
+static JSValue native_automation_cookies(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx);
+    if (!s->host.automation || !s->host.automation_cookies || !s->host.automation_delete_cookies || s->doc->frame_parent)
+        return JS_ThrowTypeError(ctx, "Automation is not available");
+    if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Automation browsing context is inactive");
+    if (argc < 2) return JS_ThrowTypeError(ctx, "Automation cookies need a command and a window");
+    const char *command = JS_ToCString(ctx, argv[0]);
+    if (!command) return JS_EXCEPTION;
+    int deleting = !strcmp(command, "delete") ? 1 : !strcmp(command, "get") ? 0 : -1;
+    JS_FreeCString(ctx, command);
+    if (deleting < 0) return JS_ThrowTypeError(ctx, "Unknown automation cookie command");
+    const char *name = NULL;
+    size_t name_len = 0;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2]) && !(name = JS_ToCStringLen(ctx, &name_len, argv[2])))
+        return JS_EXCEPTION;
+    JSValue result;
+    /* A conversion may have run page script that ended the document or its frame. */
+    web_doc *target = task_context_active(s) ? automation_window_document(s, argv[1]) : NULL;
+    const web_doc *tree = target;
+    while (tree && tree != s->doc) tree = tree->frame_parent;
+    if (!task_context_active(s)) result = JS_ThrowTypeError(ctx, "Automation browsing context is inactive");
+    else if (!tree || !target->live) result = JS_ThrowTypeError(ctx, "no such window: not a browsing context of this window");
+    else if (name && strlen(name) != name_len) result = deleting ? JS_UNDEFINED : JS_NewArray(ctx); /* no cookie's name has U+0000 */
+    else if (deleting) {
+        long removed = s->host.automation_delete_cookies(s->host.opaque, s->doc, web_effective_url(target), name);
+        result = removed < 0 ? JS_ThrowTypeError(ctx, "unable to delete cookies") : JS_UNDEFINED;
+    } else {
+        struct webcookie_record *list = NULL;
+        long count = s->host.automation_cookies(s->host.opaque, s->doc, web_effective_url(target), name, &list);
+        result = count < 0 ? JS_ThrowTypeError(ctx, "unable to read cookies") : automation_serialized_cookies(ctx, list, (size_t)count);
+        free(list);
+    }
+    if (name) JS_FreeCString(ctx, name);
+    return result;
 }
 void web_automation_done(web_doc *d, uint64_t id, const char *error) {
     struct web_js_state *s = d ? d->js : NULL;
@@ -6600,7 +6744,7 @@ static struct js_module *find_module(struct web_js_state *s,const char *url) {
    of the realm is freed together. */
 static void module_free(struct web_js_state *s,struct js_module *m) {
     JS_FreeValue(s->ctx,m->compiled);JS_FreeValue(s->ctx,m->error);js_free(s->ctx,m->children);
-    js_free(s->ctx,m->url);js_free(s->ctx,m->base);js_free(s->ctx,m->source);js_free(s->ctx,m);
+    js_free(s->ctx,m->url);js_free(s->ctx,m->base);js_free(s->ctx,m->source);js_free(s->ctx,m->nonce);js_free(s->ctx,m);
 }
 /* A record is freed alone only when it failed and nothing uses it. A module
    failed after it was received (a stopped or replaced stream) can have
@@ -6654,9 +6798,10 @@ static void module_received(struct web_js_state *s,struct js_pending *p) {
     if(!ok && !p->response.error[0])diagnostic_resource(s,p,"module response rejected (MIME, URL or integrity)");
 }
 /* referrer: the importing module's base URL, NULL for the document ("client");
-   referrer_policy: the script fetch options', 0 for the document's. */
+   referrer_policy: the script fetch options', 0 for the document's; nonce and
+   parser_inserted: the options' cryptographic nonce and parser metadata. */
 static struct js_module *request_module(struct web_js_state *s,const char *url,int credentials,const char *integrity,
-                                        const char *referrer,int referrer_policy) {
+                                        const char *referrer,int referrer_policy,const char *nonce,bool parser_inserted) {
     struct js_module *m=find_module(s,url);if(m)return m;
     m=cache_module(s,url,"",0,url);if(!m)return NULL;
     struct js_pending *p=pending_new(s,P_MODULE,url);
@@ -6665,9 +6810,12 @@ static struct js_module *request_module(struct web_js_state *s,const char *url,i
     p->referrer_policy=m->referrer_policy=referrer_policy;
     p->integrity=integrity&&*integrity?js_strdup(s->ctx,integrity):NULL;
     p->referrer=referrer?js_strdup(s->ctx,referrer):NULL;
+    p->parser_inserted=m->parser_inserted=parser_inserted;
+    if(nonce&&*nonce){p->nonce=js_strdup(s->ctx,nonce);m->nonce=js_strdup(s->ctx,nonce);}
     m->request=p->id;m->fetching=true;
     if(integrity&&*integrity&&!p->integrity)pending_error(p,"Module integrity metadata allocation failed");
     else if(referrer&&!p->referrer)pending_error(p,"Module referrer allocation failed");
+    else if(nonce&&*nonce&&(!p->nonce||!m->nonce))pending_error(p,"Module nonce allocation failed");
     else send_request(s,p,WEB_RESOURCE_MODULE,"GET",NULL,NULL,0);
     return m;
 }
@@ -6697,7 +6845,7 @@ static void module_descendants(struct web_js_state *s,struct js_module *m) {
         JS_FreeCString(s->ctx,specifier);
         if(!url){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
         struct js_module *child=!web_url_has_scheme(url,"data")&&!web_url_has_scheme(url,"blob")&&permitted_script_url(s,url)?
-            request_module(s,url,m->credentials,NULL,m->base,m->referrer_policy):NULL;
+            request_module(s,url,m->credentials,NULL,m->base,m->referrer_policy,m->nonce,m->parser_inserted):NULL;
         js_free(s->ctx,url);
         if(child){child->users++;children[n++]=child;}
         else if(JS_HasException(s->ctx))JS_FreeValue(s->ctx,JS_GetException(s->ctx)); /* no memory: linking loads it */
@@ -6794,6 +6942,12 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         module_received(s,pending);
     }
     if(m && m->fetch_failed){JS_ThrowReferenceError(ctx,"Module fetch failed: %s",url);return NULL;}
+    /* What arrives here was not fetched as a graph (a local URL, or a module
+       loaded synchronously): CSP's pre-request check runs here, with the
+       running classic script's nonce or the default fetch options. */
+    struct html_csp_request csp_probe={.url=url,.original_url=url,.destination=WEBNET_DEST_SCRIPT,
+        .nonce=s->current_script?node_attr(s->current_script,"nonce"):NULL};
+    if(!m && !csp_fetch_allowed(s,&csp_probe,NULL)){JS_ThrowTypeError(ctx,"Module blocked by Content Security Policy");return NULL;}
     if (!m && (web_url_has_scheme(url,"data") || web_url_has_scheme(url,"blob"))) {
         size_t length; char mime[128];
         char *source=web_url_has_scheme(url,"data")
@@ -6845,6 +6999,11 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
             (!local && !javascript_mime(web_response_headers(r))) || (web_response_url(r)[0] && !permitted_url(s, web_response_url(r), false))) {
             diagnostic_resource(s,diagnostic,r->error[0]?r->error:"module response rejected (HTTP, MIME, size or URL policy)");
             JS_ThrowReferenceError(ctx, "Cannot load JavaScript module %s: %s", url, r->error[0] ? r->error : "invalid response or JavaScript MIME type");
+            web_response_free(r); js_free(ctx, diagnostic); return NULL;
+        }
+        if (web_response_url(r)[0] && strcmp(web_response_url(r), url) &&
+            (csp_probe.url = web_response_url(r), csp_probe.redirect_count = 1, !csp_fetch_allowed(s, &csp_probe, NULL))) {
+            JS_ThrowTypeError(ctx, "Module blocked by Content Security Policy after a redirect");
             web_response_free(r); js_free(ctx, diagnostic); return NULL;
         }
         if(waited>=2000 && s->resource_failures<64){
@@ -6906,8 +7065,13 @@ static int import_module(JSContext *ctx,const char *basename,const char *specifi
     if(!module_context_current(s,s->doc->root)){JS_ThrowTypeError(ctx,"Module browsing context is inactive");return -1;}
     char *url=normalize_module(ctx,basename,specifier,s);
     if(!url)return -1;
+    /* The referencing script's fetch options: a module's own; for a classic
+       script, the nonce of the script element running now; otherwise the
+       default classic script fetch options (no nonce, not parser-inserted). */
+    struct js_module *referencing=basename?find_module(s,basename):NULL;
+    const char *nonce=referencing?referencing->nonce:s->current_script?node_attr(s->current_script,"nonce"):NULL;
     struct js_module *m=!web_url_has_scheme(url,"data")&&!web_url_has_scheme(url,"blob")&&permitted_script_url(s,url)?
-        request_module(s,url,1,NULL,NULL,0):NULL;
+        request_module(s,url,1,NULL,NULL,0,nonce,referencing&&referencing->parser_inserted):NULL;
     js_free(ctx,url);
     struct js_import *p=m&&!module_graph_settled(s,m)?js_mallocz(ctx,sizeof *p):NULL;
     if(p){
@@ -7018,6 +7182,8 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
         sbuf text = {0}; node_text_content(n, &text);
         if(!prepared_script_text(s,n,&text)){sb_free(&text);return NULL;}
         if(s->stream_generation!=generation){sb_free(&text);return NULL;}
+        /* Step 31: an inline script CSP blocks is not executed (no event). */
+        if(!csp_script_allowed(s,n,!dynamic,text.p?text.p:"",text.n)){sb_free(&text);return NULL;}
         begin_task(s);
         JSValue value = text.n > JS_BODY_LIMIT ? JS_ThrowRangeError(s->ctx, "Import map length is not representable") :
             module_bridge_call(s, "registerImportMap", text.p ? text.p : "", text.n, s->doc->base);
@@ -7062,14 +7228,17 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
             if(module){
                 const char *cors=node_attr(n,"crossorigin");
                 struct js_module *m=request_module(s,script->url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(n,"integrity"),
-                                                   NULL,doc_element_referrer_policy(n));
+                                                   NULL,doc_element_referrer_policy(n),node_attr(n,"nonce"),!dynamic);
                 if(!m)script->ready=script->failed=true;
                 else {script->request=m->request;script->graph=m;m->users++;module_script_source(s,script,m);}
             }else{
                 struct js_pending *p = pending_new(s, P_SCRIPT, script->url);
                 if (!p) script->ready = script->failed = true;
                 else { p->script = script; script->request = p->id; p->referrer_policy = doc_element_referrer_policy(n);
-                    send_request(s, p, WEB_RESOURCE_SCRIPT, "GET", NULL, NULL, 0); }
+                    /* The script fetch options' nonce and parser metadata. */
+                    const char *nonce = node_attr(n, "nonce"); p->parser_inserted = !dynamic;
+                    if (nonce && *nonce && !(p->nonce = js_strdup(s->ctx, nonce))) pending_error(p, "Script nonce allocation failed");
+                    else send_request(s, p, WEB_RESOURCE_SCRIPT, "GET", NULL, NULL, 0); }
             }
         }
     } else {
@@ -7086,7 +7255,12 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
         } else if (url) script->url = js_strdup(s->ctx, url);
         js_free(s->ctx, url);
         sbuf b = {0}; node_text_content(n, &b);
-        if(prepared_script_text(s,n,&b)){script->source = js_strndup(s->ctx, b.p ? b.p : "", b.n);script->len=b.n;}
+        if(prepared_script_text(s,n,&b)){
+            /* HTML prepare the script element step 31: blocked inline script
+               is not executed, and no event is fired for it. */
+            if(!csp_script_allowed(s,n,!dynamic,b.p?b.p:"",b.n)){sb_free(&b);discard_prepared_script(s,script);return NULL;}
+            script->source = js_strndup(s->ctx, b.p ? b.p : "", b.n);script->len=b.n;
+        }
         sb_free(&b);
         script->ready = true; if (!script->source) script->failed = true;
     }
@@ -7106,8 +7280,11 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
         struct js_module *m = cache_module(s, script->url, script->source, script->len, script->base);
         if (!m) { script->failed = true; if (JS_HasException(s->ctx)) exception(s); }
         else {
-            const char *cors = node_attr(n, "crossorigin");
+            const char *cors = node_attr(n, "crossorigin"), *nonce = node_attr(n, "nonce");
             m->credentials = cors && str_ieq(cors, "use-credentials") ? 2 : 1;
+            /* Its descendants are fetched with its options (nonce, parser metadata). */
+            m->parser_inserted = !dynamic;
+            if (nonce && *nonce && !m->nonce) { m->nonce = js_strdup(s->ctx, nonce); if (!m->nonce) JS_FreeValue(s->ctx, JS_GetException(s->ctx)); }
             script->graph = m; m->users++; script->ready = false;
             module_script_source(s, script, m);
         }
@@ -7157,7 +7334,7 @@ static void queue_modulepreload(struct web_js_state *s,node_t *node) {
     if(!url){if(JS_HasException(s->ctx))exception(s);link->notified=true;return;}
     const char *cors=node_attr(node,"crossorigin");
     link->module=request_module(s,url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(node,"integrity"),
-                                NULL,doc_element_referrer_policy(node));
+                                NULL,doc_element_referrer_policy(node),node_attr(node,"nonce"),false);
     if(link->module)link->module->users++;
     js_free(s->ctx,url);
     if(!link->module){script_event(s,node,true);link->notified=true;}
@@ -7394,7 +7571,7 @@ static void pending_free(struct web_js_state *s, struct js_pending *p) {
     }
     JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject); JS_FreeValue(s->ctx, p->stream_callback);
     release_module_user(s,p->module);
-    js_free(s->ctx, p->net_tail); js_free(s->ctx, p->url);js_free(s->ctx,p->origin);js_free(s->ctx,p->integrity);js_free(s->ctx,p->referrer);
+    js_free(s->ctx, p->net_tail); js_free(s->ctx, p->url);js_free(s->ctx,p->origin);js_free(s->ctx,p->integrity);js_free(s->ctx,p->referrer);js_free(s->ctx,p->nonce);
     pending_response_release(s->ctx, p);
     js_free(s->ctx, p); s->pending_count--;
 }
@@ -7520,6 +7697,16 @@ void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *response)
             if (!p->response.url_full) {
                 JSValue error = JS_GetException(s->ctx); JS_FreeValue(s->ctx, error);
                 pending_error(p, "Resource URL allocation failed"); return;
+            }
+        }
+        /* CSP3 §4.1.3 after a redirect (the transport follows them): the
+           response's URL against the request's directive, its path ignored.
+           Without a redirect the pre-request check already gave the answer. */
+        const char *final_url = web_response_url(&p->response);
+        if (final_url[0] && !response->error[0] && (!p->streaming || response->event == WEBNET_HEADERS)) {
+            size_t a = strcspn(p->url, "#"), b = strcspn(final_url, "#");
+            if ((a != b || strncmp(p->url, final_url, a)) && !csp_request_allowed(s, p, final_url, 1)) {
+                p->response.body_len = 0; pending_error(p, "Blocked by Content Security Policy"); return;
             }
         }
         const char *headers = web_response_headers(response);
@@ -8142,8 +8329,8 @@ static void request_styles(struct web_js_state *s) {
     if (!s->ctx) return;
     if (s->doc->resources_dirty) doc_rescan(s->doc);
     size_t cursor=0;uint64_t generation=s->stream_generation;
-    struct cached_css *css;
-    while((css=doc_css_request_next(s->doc,&cursor))) {
+    struct cached_css *css;node_t *owner;
+    while((css=doc_css_request_next(s->doc,&cursor,&owner))) {
         if((cursor&31)==0&&!web_native_checkpoint(s->doc))return;
         struct js_pending *p=pending_new(s,P_CSS,css->url);
         if(!p) {
@@ -8155,6 +8342,11 @@ static void request_styles(struct web_js_state *s) {
            before dispatch (even a synchronous host completion) so neither a
            duplicate link/import nor the next tick sends the same request. */
         p->css=css;css->loading_id=p->id;
+        /* HTML link: the request's cryptographic nonce metadata is the
+           element's nonce (no memory to copy it: the request has none). */
+        const char *nonce=owner?node_attr(owner,"nonce"):NULL;
+        p->element=owner;
+        if(nonce&&*nonce&&!(p->nonce=js_strdup(s->ctx,nonce)))JS_FreeValue(s->ctx,JS_GetException(s->ctx));
         send_request(s,p,WEB_RESOURCE_CSS,"GET",NULL,NULL,0);
         if(s->stream_generation!=generation)return;
     }
@@ -9126,9 +9318,13 @@ void web_js_tick(web_doc *d, uint64_t now) {
         s->policy_violations=event->next;if(!s->policy_violations)s->last_policy_violation=NULL;
         begin_named_task(s,"Security policy violation",0);
         policy_report_send(s,event->init,event->rule);
-        JSValue value=custom_element_hook(s,"safetyViolation",1,&event->init);
+        /* §5.5: the element, while its shadow-including root is this
+           document; otherwise the document. */
+        node_t *element=JS_IsObject(event->target)?node_opaque(event->target):NULL;
+        JSValue args[]={event->init,element&&connected(s,element)?event->target:JS_NULL};
+        JSValue value=custom_element_hook(s,"safetyViolation",2,args);
         if(JS_IsException(value))exception(s);
-        JS_FreeValue(s->ctx,value);JS_FreeValue(s->ctx,event->init);js_free(s->ctx,event);
+        JS_FreeValue(s->ctx,value);JS_FreeValue(s->ctx,event->init);JS_FreeValue(s->ctx,event->target);js_free(s->ctx,event);
         end_task(s);ran=true;
     }
     request_styles(s);
@@ -9785,6 +9981,9 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
         JSValue global = JS_GetGlobalObject(s->ctx);
         int defined = JS_DefinePropertyValueStr(s->ctx, global, "__nocturne_automation",
             JS_NewCFunction(s->ctx, native_automation, "__nocturne_automation", 2), JS_PROP_CONFIGURABLE);
+        if (defined >= 0 && s->host.automation_cookies && s->host.automation_delete_cookies)
+            defined = JS_DefinePropertyValueStr(s->ctx, global, "__nocturne_cookies",
+                JS_NewCFunction(s->ctx, native_automation_cookies, "__nocturne_cookies", 3), JS_PROP_CONFIGURABLE);
         JS_FreeValue(s->ctx, global);
         if (defined < 0) { exception(s); end_task(s); goto failed; }
     }
@@ -9842,7 +10041,7 @@ void web_js_free(web_doc *d) {
         }
         while (s->events) { struct js_resource_event *e = s->events; s->events = e->next; js_free(s->ctx, e); }
         while (s->image_pins) { struct js_image_pin *p = s->image_pins; s->image_pins = p->next; JS_FreeValue(s->ctx, p->object); js_free(s->ctx, p); }
-        while(s->policy_violations){struct js_policy_violation *e=s->policy_violations;s->policy_violations=e->next;JS_FreeValue(s->ctx,e->init);js_free(s->ctx,e);}
+        while(s->policy_violations){struct js_policy_violation *e=s->policy_violations;s->policy_violations=e->next;JS_FreeValue(s->ctx,e->init);JS_FreeValue(s->ctx,e->target);js_free(s->ctx,e);}
         JS_SetDynamicCodeCheck(s->ctx,NULL,NULL);
         while (s->pending) { struct js_pending *p = s->pending; s->pending = p->next; release_pending_request(s, p); pending_free(s, p); }
         while (s->scripts) { struct js_script *p = s->scripts; s->scripts = p->next; script_free(s, p); }

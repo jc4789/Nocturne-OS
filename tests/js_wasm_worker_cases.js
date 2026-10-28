@@ -95,8 +95,10 @@ onmessage=async event=>{
         assert(pendingError===reason,'Worker data pending abort reason identity');
         const late=new AbortController(),lateResponse=await fetch('data:,late',{signal:late.signal}),lateClone=lateResponse.clone();late.abort(reason);
         for(const response of [lateResponse,lateClone]){let error;try{await response.text();}catch(e){error=e;}assert(error===reason,'Worker data response body/clone abort');}
-        let integrityError;try{await fetch('data:,hello',{integrity:'sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ='});}catch(error){integrityError=error;}
-        assert(integrityError&&integrityError.name==='NotSupportedError','Worker existing integrity limitation is explicit');
+        // A Worker's Fetch is the Window's (js_fetch.js): Subresource Integrity checks the bytes.
+        assert(await (await fetch('data:,hello',{integrity:'sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ='})).text()==='hello','Worker integrity match');
+        let integrityError;try{await fetch('data:,hello',{integrity:'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='});}catch(error){integrityError=error;}
+        assert(integrityError&&integrityError.name==='TypeError','Worker integrity mismatch is a network error');
         const dataWasm='data:application/wasm;base64,AGFzbQEAAAABBwFgAn9/AX8DAgEABwcBA2FkZAAACgkBBwAgACABags=';
         const dataPair=await WebAssembly.instantiate(await (await fetch(dataWasm)).arrayBuffer()),dataWasmValue=dataPair.instance.exports.add(17,25);
         assert(dataWasmValue===42,'Worker data fetch bytes execute Wasm');

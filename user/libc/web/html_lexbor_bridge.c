@@ -417,9 +417,13 @@ static void commit_fields(struct binding *b) {
     if (!prepared) return;
     if (n->type == N_ELEM) {
         bool was_open = node_attr(n, "open") != NULL;
+        const char *style = node_attr(n, "style");
         doc_attrs_publish(n, prepared->attrs, prepared->nattrs);
         n->id = prepared->id; n->classes = prepared->classes; n->nclasses = prepared->nclasses;
         doc_details_parser_attribute_changed(n, was_open);
+        /* A style attribute the parser set or changed meets CSP's check. */
+        const char *now = node_attr(n, "style");
+        if (now ? !style || strcmp(style, now) : style != NULL) doc_style_attribute_changed(n->owner, n, now);
     } else {
         n->text = prepared->text; n->textlen = prepared->textlen;
         if (n->type == N_PI) { n->pi_attributes_ready = false; n->pi_attributes = NULL; n->pi_attribute_count = 0; }

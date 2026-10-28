@@ -300,7 +300,8 @@ int main(void) {
     check(css_supports_condition("selector(:host)",15,false), "host selector support");
     check(css_supports_condition("selector(:host(.x))",19,false), "host compound support");
     check(css_supports_condition("selector(slot::slotted(.x))",27,false), "slotted selector support");
-    check(!css_supports_condition("selector(::part(x))",19,false), "part is not advertised");
+    /* ::part() matches through exportparts (css.c), so @supports advertises it. */
+    check(css_supports_condition("selector(::part(x))",19,false), "part selector support");
     printf("shadowtest: %d checks, %d failed\n",checks,failed);
     return failed != 0;
 }

@@ -114,34 +114,65 @@ static JSValue native_safety(JSContext *ctx,JSValueConst this_value,int argc,JSV
             pv_free(&stack);
         }
     }else if(!strcmp(op,"violation")){
+        /* A Trusted Types violation (its sample already formatted). */
         if(argc<6)result=JS_ThrowTypeError(ctx,"Policy violation fields required");
         else{
-            struct js_policy_violation *event=js_mallocz(ctx,sizeof *event);
+            int32_t index=-1;if(argc>6 && JS_ToInt32(ctx,&index,argv[6])<0){JS_FreeCString(ctx,op);return JS_EXCEPTION;}
+            struct web_html_policy_rule *rule=NULL;int32_t at=0;
+            for(struct web_html_policy_rule *r=owner->html_policy?owner->html_policy->first:NULL;r;r=r->next,at++)if(at==index){rule=r;break;}
+            size_t sample_length=0;
+            const char *directive=JS_ToCString(ctx,argv[2]),*sample=JS_ToCStringLen(ctx,&sample_length,argv[4]);
+            struct js_policy_violation *event=directive&&sample?js_mallocz(ctx,sizeof *event):NULL;
             if(!event)result=JS_EXCEPTION;
             else{
-                event->init=JS_NewObjectProto(ctx,JS_NULL);
-                const char *fields[]={"effectiveDirective","sample","disposition"};
-                const unsigned values[]={2,4,5};
-                int32_t index=-1;if(argc>6 && JS_ToInt32(ctx,&index,argv[6])<0){JS_FreeValue(ctx,event->init);js_free(ctx,event);JS_FreeCString(ctx,op);return JS_EXCEPTION;}
-                int32_t at=0;for(struct web_html_policy_rule *r=owner->html_policy?owner->html_policy->first:NULL;r;r=r->next,at++)if(at==index){event->rule=r;break;}
-                bool ok=!JS_IsException(event->init);
-                for(unsigned i=0;i<3 && ok;i++)ok=JS_DefinePropertyValueStr(ctx,event->init,fields[i],JS_DupValue(ctx,argv[values[i]]),JS_PROP_C_W_E)>=0;
-                if(ok)ok=JS_DefinePropertyValueStr(ctx,event->init,"violatedDirective",JS_DupValue(ctx,argv[2]),JS_PROP_C_W_E)>=0;
-                if(ok)ok=JS_DefinePropertyValueStr(ctx,event->init,"sourceFile",JS_NewString(ctx,owner->url),JS_PROP_C_W_E)>=0;
-                if(ok)ok=JS_DefinePropertyValueStr(ctx,event->init,"documentURI",JS_NewString(ctx,owner->url),JS_PROP_C_W_E)>=0;
-                const char *directive=JS_ToCString(ctx,argv[2]);
-                if(!directive)ok=false;
-                if(ok)ok=JS_DefinePropertyValueStr(ctx,event->init,"blockedURI",JS_NewString(ctx,!strcmp(directive,"trusted-types")?"trusted-types-policy":"trusted-types-sink"),JS_PROP_C_W_E)>=0;
-                JS_FreeCString(ctx,directive);
-                if(ok)ok=JS_DefinePropertyValueStr(ctx,event->init,"originalPolicy",JS_NewString(ctx,event->rule?event->rule->original_policy:""),JS_PROP_C_W_E)>=0;
-                if(!ok){JS_FreeValue(ctx,event->init);js_free(ctx,event);result=JS_EXCEPTION;}
+                struct html_csp_violation violation={.policy=rule,.directive=directive,
+                    .resource=!strcmp(directive,"trusted-types")?"trusted-types-policy":"trusted-types-sink",
+                    .sample=sample,.sample_length=sample_length};
+                event->init=csp_violation_init(ctx,owner,&violation,owner->html_policy?owner->html_policy->status:0);
+                /* Without a policy record the caller's disposition stands. */
+                if(!JS_IsException(event->init) && !rule &&
+                   JS_DefinePropertyValueStr(ctx,event->init,"disposition",JS_DupValue(ctx,argv[5]),JS_PROP_C_W_E)<0){
+                    JS_FreeValue(ctx,event->init);event->init=JS_EXCEPTION;
+                }
+                if(JS_IsException(event->init)){js_free(ctx,event);result=JS_EXCEPTION;}
                 else{
                     /* Parser rewind can release meta rules before this task.
                      * Their report endpoints are ignored; init owns the text. */
-                    if(event->rule && event->rule->from_meta)event->rule=NULL;
+                    event->rule=rule && !rule->from_meta?rule:NULL;
                     if(s->last_policy_violation)s->last_policy_violation->next=event;else s->policy_violations=event;s->last_policy_violation=event;
                 }
             }
+            JS_FreeCString(ctx,directive);JS_FreeCString(ctx,sample);
+        }
+    }else if(!strcmp(op,"cspInline")){
+        /* HTML: an event handler content attribute's (or a style attribute's)
+           "Should element's inline behavior be blocked by CSP?" */
+        size_t length=0;
+        const char *type=argc>2?JS_ToCString(ctx,argv[2]):NULL,*text=argc>3?JS_ToCStringLen(ctx,&length,argv[3]):NULL;
+        struct web_js_state *realm=owner==s->doc?s:owner->js;
+        if(!type||!text)result=JS_EXCEPTION;
+        else if(!node || node->type!=N_ELEM || !realm || realm->disabled)result=JS_ThrowTypeError(ctx,"Inline check requires an element of an active document");
+        else{
+            struct html_csp_element element={.nonce=node_attr(node,"nonce"),.nonceable=html_policy_nonceable(node)};
+            struct csp_site site={realm,node};
+            result=JS_NewBool(ctx,html_policy_inline_allowed(realm->doc,!strcmp(type,"style attribute")?HTML_CSP_STYLE_ATTRIBUTE:HTML_CSP_SCRIPT_ATTRIBUTE,
+                                                            &element,text,length,csp_report,&site));
+        }
+        JS_FreeCString(ctx,type);JS_FreeCString(ctx,text);
+    }else if(!strcmp(op,"cspTimer")){
+        /* HTML timer initialization steps: a string handler, after its Trusted
+           Types step, is EnsureCSPDoesNotBlockStringCompilation's "timer"
+           codeString; blocked, setTimeout returns 0 (null here). */
+        size_t length=0;const char *text=argc>2?JS_ToCStringLen(ctx,&length,argv[2]):NULL;
+        if(!text)result=JS_EXCEPTION;
+        else{
+            struct csp_site site={s,NULL};
+            if(!html_policy_eval_allowed(s->doc,text,length,csp_report,&site))result=JS_NULL;
+            else{
+                sbuf b={0};sb_puts(&b,"(function(){\n");sb_put(&b,text,length);sb_puts(&b,"\n})");
+                result=JS_Eval(ctx,sb_cstr(&b),b.n,s->doc->url,JS_EVAL_TYPE_GLOBAL);sb_free(&b);
+            }
+            JS_FreeCString(ctx,text);
         }
     }else result=JS_ThrowTypeError(ctx,"Unknown HTML safety operation");
     JS_FreeCString(ctx,op);return result;
@@ -149,13 +180,20 @@ static JSValue native_safety(JSContext *ctx,JSValueConst this_value,int argc,JSV
 static JSValue trusted_code_check(JSContext *ctx,JSValueConst value,int kind,int argc,JSValueConst *argv,void *opaque){
     struct web_js_state *s=opaque;
     if(!s || !JS_IsObject(s->hooks))return JS_DupValue(ctx,value);
-    if(!html_policy_requires_script(s->doc) && (kind==JS_DYNAMIC_FUNCTION || !JS_IsObject(value)))return JS_DupValue(ctx,value);
-    JSValue args_array=JS_NewArray(ctx);
-    if(JS_IsException(args_array))return args_array;
-    for(int i=0;i<argc;i++)if(JS_SetPropertyUint32(ctx,args_array,(uint32_t)i,JS_DupValue(ctx,argv[i]))<0){JS_FreeValue(ctx,args_array);return JS_EXCEPTION;}
-    JSValue args[]={JS_DupValue(ctx,value),JS_NewInt32(ctx,kind),args_array};
-    JSValue result=custom_element_hook(s,"safetyDynamicCode",3,args);
-    for(unsigned i=0;i<3;i++)JS_FreeValue(ctx,args[i]);return result;
+    JSValue result;
+    if(!html_policy_requires_script(s->doc) && (kind==JS_DYNAMIC_FUNCTION || !JS_IsObject(value)))result=JS_DupValue(ctx,value);
+    else{
+        JSValue args_array=JS_NewArray(ctx);
+        if(JS_IsException(args_array))return args_array;
+        for(int i=0;i<argc;i++)if(JS_SetPropertyUint32(ctx,args_array,(uint32_t)i,JS_DupValue(ctx,argv[i]))<0){JS_FreeValue(ctx,args_array);return JS_EXCEPTION;}
+        JSValue args[]={JS_DupValue(ctx,value),JS_NewInt32(ctx,kind),args_array};
+        result=custom_element_hook(s,"safetyDynamicCode",3,args);
+        for(unsigned i=0;i<3;i++)JS_FreeValue(ctx,args[i]);
+    }
+    /* A Function's parameters and body are checked once, assembled. */
+    if(kind==JS_DYNAMIC_FUNCTION_ARGUMENT)return result;
+    struct csp_site site={s,NULL};
+    return csp_compile_check(ctx,s->doc,result,kind==JS_DYNAMIC_FUNCTION,csp_report,&site);
 }
 static int wasm_can_compile(JSContext *ctx){
     struct web_js_state *s=state(ctx);
@@ -166,7 +204,7 @@ static int wasm_can_compile(JSContext *ctx){
         if(!rule->report_only)allowed=false;
         struct js_policy_violation *event=js_mallocz(ctx,sizeof *event);
         if(!event)return -1;
-        event->init=wasm_policy_violation_init(ctx,rule,s->doc->url,0);
+        event->init=wasm_policy_violation_init(ctx,s->doc,rule,s->doc->html_policy?s->doc->html_policy->status:0);
         if(JS_IsException(event->init)){js_free(ctx,event);return -1;}
         event->rule=rule->from_meta?NULL:rule;
         if(s->last_policy_violation)s->last_policy_violation->next=event;else s->policy_violations=event;

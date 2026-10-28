@@ -282,10 +282,22 @@ struct opacity_keyframes {
     const struct css_layer_decl *layer;
 };
 
+/* @position-try (css-anchor-position-1 §6.4): a named position option, its accepted declarations
+   without !important; rules of one name cascade as @keyframes do */
+struct position_try_rule {
+    struct position_try_rule *next;
+    const char *name;
+    const struct mcond *media;
+    const struct css_layer_decl *layer;
+    struct decl *decls;
+    int count;
+};
+
 struct sheet {
     struct rule *first, *last;
     struct font_face *fonts,*fonts_last;
     struct opacity_keyframes *motions, *motions_last;
+    struct position_try_rule *position_tries, *position_tries_last;
     double order;
     bool ua;
     node_t *scope; /* NULL: document author sheet; otherwise its shadow root */
@@ -4072,6 +4084,22 @@ static void parse_opacity_keyframes(struct pctx *pc,const char *ns,const char *n
     pc->sh->motions_last=key;
 }
 
+static void parse_position_try(struct pctx *pc, const char *ns, const char *ne, const char *s, const char *e,
+                               const struct mcond *media) {
+    const char *cursor = ns, *name = read_ident(pc->a, &cursor, ne, false);
+    if (!name || skip_ws(cursor, ne) != ne || name[0] != '-' || name[1] != '-' || !name[2]) return;
+    struct decl *decls = NULL;
+    int count = 0, kept = 0;
+    parse_body(pc, s, e, NULL, NULL, &decls, &count);
+    /* only the accepted properties; !important makes a declaration invalid, not the rule */
+    for (int i = 0; i < count; i++)
+        if (decls[i].p && !decls[i].important && css_prop_position_try_accepted(decls[i].p)) decls[kept++] = decls[i];
+    struct position_try_rule *rule = ar_alloc(pc->a, sizeof *rule);
+    *rule = (struct position_try_rule){.name = name, .media = media, .layer = pc->layer, .decls = decls, .count = kept};
+    if (pc->sh->position_tries_last) pc->sh->position_tries_last->next = rule; else pc->sh->position_tries = rule;
+    pc->sh->position_tries_last = rule;
+}
+
 /* ---- CSSOM-only grammar: the rules the cascade does not implement still
    belong to the CSSOM tree when their own grammar accepts them. */
 static bool cssom_keyword(const char *name,const char *const *words) {
@@ -4350,6 +4378,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                     parse_opacity_keyframes(pc,qs,qe,bs,be,media);
                     if (info) cssom_keyframe_rules(pc,bs,be);
                 }
+                else if (!strcmp(name, "position-try")) parse_position_try(pc, qs, qe, bs, be, media);
                 else if (!strcmp(name,"media") || !strcmp(name,"container")) {
                     const struct mcond *mc=parse_condition(pc,qs,qe,media,!strcmp(name,"container"));
                     parse_rules(pc,bs,be,mc);
@@ -4977,6 +5006,7 @@ struct css_index {
     struct ient *parts; /* ::part() rules: they select elements of other trees */
     struct font_face *fonts;
     struct opacity_keyframes *motions;
+    struct position_try_rule *position_tries;
     uint32_t rules;
     unsigned form_features;
     bool containers, siblings;
@@ -5515,7 +5545,7 @@ static uint32_t index_media(arena_t *a, struct css_index *x, const struct mcond 
 static struct css_index *index_sheet(web_doc *d, sheet_t *s) {
     arena_t *a = s->arena;
     struct css_index *index = ar_alloc(a, sizeof *index);
-    index->fonts = s->fonts; index->motions = s->motions;
+    index->fonts = s->fonts; index->motions = s->motions; index->position_tries = s->position_tries;
     /* Small component sheets no longer allocate a document-sized hash
        table, nor duplicate selector entries for every adoption. */
     ht_init(a, &index->ids, 64);
@@ -6363,6 +6393,8 @@ struct dent {
     int scope_depth;
     bool animation;  /* the animation or transition origin (CSS Cascade 5 §6.1) */
     bool transition; /* the transition origin, above every other */
+    bool position_try; /* the position fallback origin, between the author and animation origins
+                          (css-anchor-position-1 §6.4) */
     bool inline_style;
     struct cascade_layer *layer;
 };
@@ -6388,7 +6420,7 @@ static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo, int dep
     dents[ndents].key = d->important ? (key ^ (1ull << 62)) | (1ull << 63) : key;
     dents[ndents].pseudo = pseudo;
     dents[ndents].scope_depth = depth;
-    dents[ndents].animation = dents[ndents].transition = false;
+    dents[ndents].animation = dents[ndents].transition = dents[ndents].position_try = false;
     dents[ndents].inline_style=false;dents[ndents].layer=NULL;
     ndents++;
 }
@@ -6541,6 +6573,13 @@ static int cmp_dent(const void *a, const void *b) {
         return da->animation == animated_first ? -1 : 1;
     }
     if (da->animation) return da->key < db->key ? 1 : da->key > db->key ? -1 : 0;
+    /* The position fallback origin likewise: above normal declarations, below important ones. */
+    if (da->position_try != db->position_try) {
+        const struct dent *normal = da->position_try ? db : da;
+        bool tried_first = !normal->d->important;
+        return da->position_try == tried_first ? -1 : 1;
+    }
+    if (da->position_try) return da->key < db->key ? 1 : da->key > db->key ? -1 : 0;
     uint64_t x = da->key, y = db->key;
     /* Encapsulation context precedes specificity: outer normal declarations
        win; inner !important declarations win, including over inline styles. */
@@ -6857,6 +6896,8 @@ static bool dent_author(const struct dent *d) {return ((d->key>>62)&1)!=d->d->im
 static bool rollback_blocks(const struct css_rollback *rollback,const struct dent *candidate) {
     const struct dent *from=rollback->from;if(!from)return false;
     if(from->animation)return candidate->animation;
+    /* revert in the position fallback origin reverts as the author origin does (§6.4) */
+    if(from->position_try)return rollback->origin?candidate->position_try||dent_author(candidate):candidate->position_try;
     if(rollback->origin)return candidate->animation?dent_author(from):dent_author(candidate)==dent_author(from);
     if(from->inline_style) return candidate->animation?from->d->important:
         candidate->inline_style&&dent_author(candidate)==dent_author(from)&&candidate->scope_depth==from->scope_depth;
@@ -6984,6 +7025,8 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         if(s->display==D_CONTENTS)s->display=D_BLOCK; s->float_=FL_NONE;
     }
     css_style_finish(s, parent, e == d->html && !pseudo);
+    /* anchor() and anchor-size() resolve only for absolutely positioned boxes (layout.c) */
+    css_style_anchor_fallbacks(s, c->a);
     if ((pseudo != PE_BEFORE && pseudo != PE_AFTER) || box_pseudo_generated(e,parent,s))
         s->named_font=select_web_font(d,e,s,c->vw,c->vh,c->a);
     else { s->named_font=NULL; s->font_choices=NULL; }
@@ -7130,6 +7173,64 @@ static style_t *motion_compute(struct cascade *c, node_t *e, const style_t *pare
     if (after != final && after != base) *after_out = after;
     return final;
 }
+/* css-anchor-position-1 §6.4: the @position-try rule of a name, searched as @keyframes are */
+static const struct position_try_rule *position_try_lookup(struct cascade *c, node_t *n, const char *name) {
+    for (node_t *root = doc_node_root(n, false); root; root = root->shadow_host ? doc_node_root(root->shadow_host, false) : NULL) {
+        const struct position_try_rule *found = NULL;
+        struct cascade_layer *found_layer = NULL;
+        struct css_scope *scope = root->style_scope;
+        for (struct css_binding *b = scope ? scope->first : NULL; b; b = b->next)
+            for (const struct position_try_rule *r = b->index->position_tries; r; r = r->next)
+                if (!strcmp(r->name, name) && font_conditions_ok(r->media, c->vw, c->vh, web_js_enabled(c->d))) {
+                    struct cascade_layer *layer = binding_layer(b, r->layer);
+                    if (!found || layer_compare(layer, found_layer) >= 0) { found = r; found_layer = layer; }
+                }
+        if (found) return found;
+    }
+    return NULL;
+}
+/* §6.1, §6.5.2: an absolutely positioned box's @position-try and <position-area> options, each the
+   cascade with the option's declarations inserted in the position fallback origin. s's anchor group
+   becomes a copy whose options hold them; layout (layout.c) applies the try tactics and chooses. */
+static void position_try_styles(struct cascade *c, node_t *e, const style_t *parent, uint8_t pseudo, style_t *s) {
+    if (!s || (s->position != POS_ABSOLUTE && s->position != POS_FIXED)) return;
+    const struct css_anchor *anchor = css_style_anchor(s);
+    const struct css_position_tries *tries = &anchor->tries;
+    bool any = false;
+    for (uint32_t i = 0; i < tries->count; i++) any |= tries->option[i].rule || tries->option[i].area[0];
+    if (!any) return;
+    struct css_position_try *options = ar_alloc(c->a, tries->count * sizeof *options);
+    memcpy(options, tries->option, tries->count * sizeof *options);
+    const struct propdef *area = css_prop_lookup("position-area", 13);
+    for (uint32_t i = 0; i < tries->count; i++) {
+        struct css_position_try *o = &options[i];
+        o->style = NULL;
+        if (o->rule) {
+            const struct position_try_rule *rule = position_try_lookup(c, e, o->rule);
+            if (!rule) continue;
+            for (int j = 0; j < rule->count; j++) { add_dent(&rule->decls[j], (uint64_t)j, pseudo, 0); dents[ndents - 1].position_try = true; }
+        } else if (o->area[0] && area) {
+            sbuf text = {0};
+            bool written = css_position_area_text(o->area, &text);
+            struct decl *x = written ? ar_alloc(c->a, sizeof *x) : NULL;
+            if (x) *x = (struct decl){.p = area, .value = ar_strndup(c->a, text.p ? text.p : "", text.n)};
+            sb_free(&text);
+            if (!x) continue;
+            add_dent(x, 0, pseudo, 0); dents[ndents - 1].position_try = true;
+        } else continue;
+        qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
+        o->style = compute(c, e, parent, pseudo);
+        /* the option's declarations out again; the others keep their order */
+        int kept = 0;
+        for (int j = 0; j < ndents; j++) if (!dents[j].position_try) dents[kept++] = dents[j];
+        ndents = kept;
+    }
+    struct css_anchor *copy = ar_alloc(c->a, sizeof *copy);
+    *copy = *anchor;
+    copy->tries.option = options;
+    s->anchor = copy;
+}
+
 /* What a display: none element hides is its flat subtree: also the light children its slots
    take from a host above it, which are not its descendants. */
 static void clear_styles(node_t *n) {
@@ -7190,6 +7291,13 @@ void css_styles_release(web_doc *d) {
     }
 }
 static bool style_equal(const style_t *a, const style_t *b);
+/* the styles of two styles' position options (css_position_try's style) */
+static bool position_options_equal(const style_t *a, const style_t *b) {
+    const struct css_position_tries *x = &css_style_anchor(a)->tries, *y = &css_style_anchor(b)->tries;
+    if (x->count != y->count) return false;
+    for (uint32_t i = 0; i < x->count; i++) if (!style_equal(x->option[i].style, y->option[i].style)) return false;
+    return true;
+}
 /* Between a cascade and css_styles_release: whether n's computed values differ from the
    retired ones its boxes still borrow. A kept style retires the equal new one. */
 bool css_restyled(const node_t *n) {
@@ -7871,6 +7979,9 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     /* a float's shape-outside and shape-margin shape the lines beside it */
     if(!css_float_shape_equal(x.float_shape,y.float_shape))return false;
     x.float_shape=y.float_shape=NULL;
+    /* anchor positioning: the anchor names others find, and this box's anchors and options */
+    if(!css_anchor_equal(x.anchor,y.anchor) || !position_options_equal(a,b))return false;
+    x.anchor=y.anchor=NULL;
     /* same_translation() saw whether there is an offset transform; where it puts the box is paint's */
     x.offset=y.offset=NULL;
     /* a gap decoration's segments are layout's (layout.c records them); colour and style paint only */
@@ -7970,7 +8081,8 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !equal_string(a->svg_stroke.ref, b->svg_stroke.ref) || !shadows_equal(a->box_shadow, b->box_shadow) ||
         !filters_equal(a->filter, b->filter) || !css_shape_equal(a->clip_path, b->clip_path) ||
         !css_float_shape_equal(a->float_shape, b->float_shape) || !css_offset_equal(a->offset, b->offset) ||
-        !css_gap_rules_equal(a->gap_rules, b->gap_rules) || !transforms_equal(a->transform, b->transform) ||
+        !css_gap_rules_equal(a->gap_rules, b->gap_rules) || !css_anchor_equal(a->anchor, b->anchor) || !position_options_equal(a, b) ||
+        !transforms_equal(a->transform, b->transform) ||
         !transforms_equal(a->rotate, b->rotate) || !transforms_equal(a->scale, b->scale) ||
         !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) ||
         !equal_tracks(a->grid_cols, b->grid_cols) || !equal_tracks(a->grid_rows, b->grid_rows) ||
@@ -8009,7 +8121,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
-    x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; /* the groups compared above */
+    x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; x.anchor = y.anchor = NULL; /* the groups compared above */
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
     x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;
@@ -8248,7 +8360,8 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     }
     int depth = scope_depth(doc_node_root(e, false));
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
-    const char *sa = node_attr(e, "style");
+    /* A style attribute CSP blocked is not applied (dom.c's csp_style_attribute). */
+    const char *sa = e->csp_style_attribute == 2 ? NULL : node_attr(e, "style");
     struct css_declarations *inline_block = declarations_get(&e->style_declarations, sa, d->base, c->a);
     if (inline_block) {
         struct decl *ds = inline_block->values; int nd = inline_block->count;
@@ -8271,6 +8384,7 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     const style_t *parent_after = flat_parent && flat_parent->style == parent ? flat_parent->animation_after_style : NULL;
     style_t *base = NULL, *after = NULL;
     style_t *s = motion_compute(c, e, parent, parent_after, PE_NONE, e->style_previous, &base, &after);
+    position_try_styles(c, e, parent, PE_NONE, s);
     e->style = s;
     e->animation_base_style = base;
     e->animation_after_style = after;
@@ -8288,10 +8402,12 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     style_t *pseudo_base = NULL, *pseudo_after = NULL;
     if (has_before) {
         s->before = motion_compute(c, e, s, after, PE_BEFORE, previous ? previous->before : NULL, &pseudo_base, &pseudo_after);
+        position_try_styles(c, e, s, PE_BEFORE, s->before);
         if (base) base->before = pseudo_base ? pseudo_base : s->before;
     }
     if (has_after) {
         s->after = motion_compute(c, e, s, after, PE_AFTER, previous ? previous->after : NULL, &pseudo_base, &pseudo_after);
+        position_try_styles(c, e, s, PE_AFTER, s->after);
         if (base) base->after = pseudo_base ? pseudo_base : s->after;
     }
     s->before_generated=box_pseudo_generated(e,s,s->before);

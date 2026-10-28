@@ -193,6 +193,30 @@ int main(int argc, char **argv) {
     CHECK(sends(a, "https://b.test/", "keep=1"));
     CHECK(settled());
 
+    /* WebDriver's Cookies (the testdriver's, web_host.automation_cookies): a document's associated
+       cookies, HttpOnly ones too, with what another window saved (its save reported: stale). */
+    CHECK(set(b, "https://w.test/p/q", "wd=1; Max-Age=3600; HttpOnly") == 1 && set(b, "https://w.test/p/q", "ws=2") == 1);
+    later(b);
+    a->cookie_stale = true;
+    struct webcookie_record *wr = NULL;
+    CHECK(webnet_cookie_associated(a, "https://w.test/p/x", NULL, &wr) == 1 && wr && !strcmp(wr[0].name, "wd") &&
+          wr[0].http_only && wr[0].persistent && !a->cookie_stale);
+    free(wr); wr = NULL;
+    CHECK(webnet_cookie_associated(b, "https://w.test/p/x", "ws", &wr) == 1 && wr && !strcmp(wr[0].value, "2") && !wr[0].persistent);
+    free(wr); wr = NULL;
+    CHECK(webnet_cookie_associated(a, "https://w.test/other", NULL, &wr) == 0 && !wr);
+    CHECK(webnet_cookie_associated(NULL, "https://w.test/p/x", NULL, &wr) < 0 && !wr);
+    /* Deleting them is saved at once: the other window's goes when it reads the store, its own
+       session cookie stays. */
+    before = saves;
+    CHECK(webnet_cookie_delete_associated(a, "https://w.test/p/x", NULL) == 1 && saves == before + 1 && !a->cookie_due);
+    CHECK(webnet_cookie_associated(a, "https://w.test/p/x", NULL, &wr) == 0 && !wr);
+    CHECK(cookie_sync(b, false) == 0 && !sends(b, "https://w.test/p/q", "wd=1") && sends(b, "https://w.test/p/q", "ws=2"));
+    before = saves;
+    CHECK(webnet_cookie_delete_associated(b, "https://w.test/p/x", "missing") == 0 && saves == before);
+    CHECK(webnet_cookie_delete_associated(b, "https://w.test/p/x", "ws") == 1 && !sends(b, "https://w.test/p/q", "ws=2"));
+    CHECK(settled());
+
     /* A host whose data is not kept: its persistent cookie lives in the window only. */
     CHECK(set(a, "https://temp.test/", "t=1; Max-Age=3600") == 1);
     later(a);
