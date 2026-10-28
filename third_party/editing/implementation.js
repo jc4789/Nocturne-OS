@@ -4077,10 +4077,15 @@ function getNextEquivalentPoint(node, offset) {
 
     // "If node has a child with index offset, and that child's length is not
     // zero, and that child is an inline node, return (that child, 0)."
+    //
+    // Nocturne: not into a select or datalist, whose boundary points are
+    // among its option data (holdsOptionData, js_editing.js), not equivalent
+    // to the points around it.
     if (0 <= offset
     && offset < node.childNodes.length
     && getNodeLength(node.childNodes[offset]) != 0
-    && isInlineNode(node.childNodes[offset])) {
+    && isInlineNode(node.childNodes[offset])
+    && !holdsOptionData(node.childNodes[offset])) {
         return [node.childNodes[offset], 0];
     }
 
@@ -4105,10 +4110,13 @@ function getPreviousEquivalentPoint(node, offset) {
     // "If node has a child with index offset − 1, and that child's length is
     // not zero, and that child is an inline node, return (that child, that
     // child's length)."
+    //
+    // Nocturne: not into a select or datalist (see getNextEquivalentPoint).
     if (0 <= offset - 1
     && offset - 1 < node.childNodes.length
     && getNodeLength(node.childNodes[offset - 1]) != 0
-    && isInlineNode(node.childNodes[offset - 1])) {
+    && isInlineNode(node.childNodes[offset - 1])
+    && !holdsOptionData(node.childNodes[offset - 1])) {
         return [node.childNodes[offset - 1], getNodeLength(node.childNodes[offset - 1])];
     }
 
@@ -7834,6 +7842,15 @@ commands.insertparagraph = {
 //@{
 commands.inserttext = {
     action: function(value) {
+        // Nocturne: with an empty value and a collapsed active range there is
+        // nothing to delete or insert, and the action returns true as below.
+        // Upstream deleted the selection first, which canonicalizes the
+        // whitespace around even a collapsed one, so inserting nothing changed
+        // the text.
+        if (value == "" && getActiveRange().collapsed) {
+            return true;
+        }
+
         // "Delete the selection, with strip wrappers false."
         deleteSelection({stripWrappers: false});
 

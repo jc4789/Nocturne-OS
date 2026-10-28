@@ -171,6 +171,38 @@ check('cut', editor.innerHTML, 'ac');
 editor = setup('a[]b', ' contenteditable="plaintext-only"');
 documentCommandBridge.userAction('formatBold', false, null);
 check('plaintext-only takes no formatting', editor.innerHTML, 'ab');
+check('plaintext-only: bold disabled', document.queryCommandEnabled('bold') + ' ' + document.execCommand('bold') + ' ' + editor.innerHTML, 'false false ab');
+check('plaintext-only: insertText enabled', document.queryCommandEnabled('insertText'), true);
+check('plaintext-only: no input for a refused command', events(), '');
+editor = setup('<span contenteditable="true">a[]b</span>', ' contenteditable="plaintext-only"');
+check('an editing host in a plaintext-only one is edited as its part', document.queryCommandEnabled('bold'), false);
+editor = setup('A[]B', ' contenteditable="plaintext-only"');
+document.execCommand('insertLineBreak');
+check('plaintext-only, white-space normal: a br', editor.innerHTML, 'A<br>B');
+editor = setup('<p style="white-space:normal">A[]B</p>', ' contenteditable="plaintext-only" style="white-space:pre"');
+document.execCommand('insertLineBreak');
+check('plaintext-only, a white-space normal paragraph: a br', editor.innerHTML, '<p style="white-space:normal">A<br>B</p>');
+editor = setup('A[]', ' contenteditable="plaintext-only" style="white-space:pre"');
+document.execCommand('insertLineBreak');
+check('plaintext-only pre: a line feed, padded', editor.innerHTML, 'A\n<br>');
+document.execCommand('insertText', false, 'b');
+check('text filling the padded line drops the padding', editor.innerHTML, 'A\nb');
+editor = setup('[]\n', ' contenteditable="plaintext-only" style="white-space:pre"');
+document.execCommand('insertText', false, 'a');
+check('text filling a padding line feed drops it', editor.innerHTML, 'a');
+editor = setup('AB[]\n', ' contenteditable="plaintext-only" style="white-space:pre"');
+document.execCommand('insertText', false, 'c');
+check('a line feed extraneous before stays', editor.innerHTML, 'ABc\n');
+editor = setup('[]', ' contenteditable="plaintext-only" style="white-space:pre"');
+document.execCommand('insertText', false, 'x\ny');
+check('plaintext-only insertText: line feeds', editor.innerHTML, 'x\ny');
+editor = setup('a[]<select><option>x</option></select>b');
+selection.collapse(editor.childNodes[1].firstChild.firstChild, 0);
+check('nothing edits option data', document.queryCommandEnabled('insertText') + ' ' + document.execCommand('insertText', false, 'y') + ' ' + editor.innerHTML,
+    'false false a<select><option>x</option></select>b');
+selection.setBaseAndExtent(editor, 1, editor, 2);
+document.execCommand('delete');
+check('deleting a selected select removes it', editor.innerHTML, 'ab');
 check('no editing host: not taken', (body.innerHTML = '<p>x</p>', selection.collapse(body.firstChild.firstChild, 0), documentCommandBridge.userAction('insertText', false, 'y')), false);
 
 // Caret moves.
