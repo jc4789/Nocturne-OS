@@ -26,19 +26,26 @@ static JSValue cssom_declaration_op(struct web_js_state *s, struct cssom_sheet *
         JS_FreeCString(ctx, value);
         return cssom_error(ctx, error);
     }
-    /* the rule's declarations as its block serializes them */
     css_decl_check *check = cssom_declaration_check(r);
+    if (!strcmp(operation, "decls")) {
+        /* cssText and the names: the block's serialization */
+        sbuf text = {0}, names = {0};
+        JSValue list = cssom_block_serialize(r, &text, &names) ?
+            style_text_block(ctx, text.p ? text.p : "", text.n, names.p ? names.p : "", names.n) : oom(ctx);
+        sb_free(&text); sb_free(&names);
+        return list;
+    }
+    /* a property of the rule's declarations: of its block's text */
     sbuf block = {0};
     if (!cssom_block(r, &block)) { sb_free(&block); return oom(ctx); }
-    const char *serialized = block.p ? block.p : "";
-    if (!strcmp(operation, "decls")) { JSValue list = style_text_block(ctx, serialized, block.n); sb_free(&block); return list; }
+    const char *text = block.p ? block.p : "";
     const char *property = argc > 5 ? JS_ToCString(ctx, argv[5]) : NULL;
     if (!property) { sb_free(&block); return argc > 5 ? JS_EXCEPTION : JS_ThrowTypeError(ctx, "Property name required"); }
     JSValue result;
     bool write;
     if (!strcmp(operation, "declGet")) {
         bool priority = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
-        result = style_text_access(ctx, serialized, block.n, property, false, JS_UNDEFINED, JS_UNDEFINED, priority, check,
+        result = style_text_access(ctx, text, block.n, property, false, JS_UNDEFINED, JS_UNDEFINED, priority, check,
                                    NULL, &write);
     } else if (r->type == CSS_RULE_KEYFRAME && argc > 7 && JS_IsString(argv[6]) && JS_IsString(argv[7]) &&
                !string_empty(ctx, argv[6]) && !string_empty(ctx, argv[7])) {
@@ -47,7 +54,7 @@ static JSValue cssom_declaration_op(struct web_js_state *s, struct cssom_sheet *
         result = JS_UNDEFINED;
     } else {
         sbuf b = {0};
-        result = style_text_access(ctx, serialized, block.n, property, true, argc > 6 ? argv[6] : JS_UNDEFINED,
+        result = style_text_access(ctx, text, block.n, property, true, argc > 6 ? argv[6] : JS_UNDEFINED,
                                    argc > 7 ? argv[7] : JS_UNDEFINED, false, check, &b, &write);
         if (write && !JS_IsException(result)) {
             int error = cssom_set_declarations(sheet, id, b.p ? b.p : "", b.n);
@@ -120,7 +127,7 @@ static JSValue cssom_rule_op(struct web_js_state *s, struct cssom_sheet *sheet, 
     }
     if (!r) {
         /* a rule that stands nowhere now: it reads as empty and changes nothing */
-        if (!strcmp(operation, "decls")) return style_text_block(ctx, "", 0);
+        if (!strcmp(operation, "decls")) return style_text_block(ctx, "", 0, "", 0);
         return !strcmp(operation, "cssText") || !strcmp(operation, "declGet") ? JS_NewString(ctx, "") :
             !strcmp(operation, "keyframe") || !strcmp(operation, "attr") ? JS_NULL :
             !strcmp(operation, "features") ? JS_NewArray(ctx) : JS_NewInt32(ctx, 0);

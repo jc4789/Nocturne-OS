@@ -24,13 +24,21 @@ int web_resolve_url_owned(const char *base, const char *rel, char **out) {
     *out = strstr(rel, "://") ? strdup(rel) : NULL;
     return *out ? 1 : 0;
 }
+/* web_url.c's place (the source before 3435c5b4 asked http.c) */
+#ifdef OLD_SOURCE
 enum http_url_result http_origin_owned(const char *raw, char **origin) {
+#define WEB_URL_OPAQUE HTTP_URL_OPAQUE
+#define WEB_URL_TUPLE HTTP_URL_TUPLE
+#define WEB_URL_OOM HTTP_URL_OOM
+#else
+enum web_url_result web_url_origin(const char *raw, char **origin) {
+#endif
     *origin = NULL;
     const char *host = raw ? strstr(raw, "://") : NULL;
-    if (!host) return HTTP_URL_OPAQUE;
+    if (!host) return WEB_URL_OPAQUE;
     const char *path = strchr(host + 3, '/');
     *origin = strndup(raw, path ? (size_t)(path - raw) : strlen(raw));
-    return *origin ? HTTP_URL_TUPLE : HTTP_URL_OOM;
+    return *origin ? WEB_URL_TUPLE : WEB_URL_OOM;
 }
 const char *web_effective_url(web_doc *d) { return d->url; }
 bool web_native_checkpoint(web_doc *d) { return d && !d->native_cancelled; }

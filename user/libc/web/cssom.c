@@ -1336,18 +1336,25 @@ css_decl_check *cssom_declaration_check(const struct css_rule_info *r) {
     default: return NULL;
     }
 }
-bool cssom_block(const struct css_rule_info *r, sbuf *out) {
+/* the rule's declarations as a block's text (block) or serialized (out, with
+   their names) */
+static bool rule_block(const struct css_rule_info *r, sbuf *block, sbuf *out, sbuf *names) {
     const char *text; size_t n;
     cssom_declarations(r, &text, &n);
-    if (!r || r->type != CSS_RULE_KEYFRAME) return css_decl_serialize(text, n, cssom_declaration_check(r), out, NULL);
-    /* CSS Animations 1: a keyframe's !important declarations are invalid */
+    css_decl_check *check = cssom_declaration_check(r);
     sbuf kept = {0};
-    css_decl_drop_important(text, n, &kept);
-    bool ok = css_decl_serialize(kept.p ? kept.p : "", kept.n, NULL, out, NULL);
+    if (r && r->type == CSS_RULE_KEYFRAME) {
+        /* CSS Animations 1: a keyframe's !important declarations are invalid */
+        css_decl_drop_important(text, n, &kept);
+        text = kept.p ? kept.p : ""; n = kept.n;
+    }
+    bool ok = block ? css_decl_block(text, n, check, block) : css_decl_serialize(text, n, check, out, names);
     sb_free(&kept);
     return ok;
 }
-static void declarations(const struct css_rule_info *r, sbuf *out) { cssom_block(r, out); }
+bool cssom_block(const struct css_rule_info *r, sbuf *block) { return rule_block(r, block, NULL, NULL); }
+bool cssom_block_serialize(const struct css_rule_info *r, sbuf *out, sbuf *names) { return rule_block(r, NULL, out, names); }
+static void declarations(const struct css_rule_info *r, sbuf *out) { cssom_block_serialize(r, out, NULL); }
 /* a descriptor's value in a rule's declaration block; false: none */
 static bool descriptor(const struct css_rule_info *r, const char *name, sbuf *out) {
     sbuf block = {0};
@@ -1879,7 +1886,7 @@ int cssom_set_attribute(struct cssom_sheet *s, uint32_t id, const char *name, co
         const char *d; size_t dn;
         cssom_declarations(r, &d, &dn);
         sbuf block = {0};
-        css_decl_serialize(d, dn, descriptor_check, &block, NULL);
+        css_decl_block(d, dn, descriptor_check, &block);
         int status = css_decl_set(block.p ? block.p : "", block.n, counter_descriptor(name), text, NULL, descriptor_check, &b);
         sb_free(&block);
         if (status > 0) error = cssom_set_declarations(s, id, b.p ? b.p : "", b.n);
@@ -1896,7 +1903,7 @@ int cssom_set_declarations(struct cssom_sheet *s, uint32_t id, const char *value
     char *text = clean_text(value, length, &n);
     if (!text) return CSSOM_OOM;
     sbuf decls = {0};
-    bool ok = css_decl_serialize(text, n, cssom_declaration_check(r), &decls, NULL);
+    bool ok = css_decl_block(text, n, cssom_declaration_check(r), &decls);
     free(text);
     if (!ok) { sb_free(&decls); return CSSOM_OOM; }
     int error = CSSOM_OK;
@@ -2122,7 +2129,7 @@ static int candidate(struct cssom_sheet *s, const struct cssom_parse *p, const s
     if (*kind == CSS_RULE_NESTED_DECLARATIONS || (!*kind && nested_list(container))) {
         /* insert a CSS rule, step 4: nested declarations of what parses as a declaration block */
         sbuf decls = {0};
-        bool ok = css_decl_serialize(t->p, t->n, NULL, &decls, NULL);
+        bool ok = css_decl_block(t->p, t->n, NULL, &decls);
         if (!ok) { sb_free(&decls); return CSSOM_OOM; }
         if (!decls.n || !css_decl_balanced(decls.p, decls.n)) { sb_free(&decls); return CSSOM_SYNTAX; }
         marker_text(out, decls.p, decls.n);

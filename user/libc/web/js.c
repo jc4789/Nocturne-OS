@@ -246,9 +246,14 @@ struct web_js_state {
     struct js_node_ref *node_buckets[JS_NODE_BUCKETS];
     bool node_cache_syncing, node_cache_failed;
     struct web_js_state *node_cache_next, **node_cache_prev;
-    /* style attributes' declaration blocks: a text and its serialization, by
-       element (style_memo_block) */
-    struct js_style_memo { char *source, *block; size_t source_n, block_n; } style_memo[JS_STYLE_MEMO];
+    /* inline styles' declaration blocks, by element (style_memo_get): an
+       attribute's text and the block it parses to, or (own) the block CSSOM
+       wrote; the block's serialization and names */
+    struct js_style_memo {
+        char *source, *block, *serialized, *names;
+        size_t source_n, block_n, serialized_n, names_n;
+        bool own;
+    } style_memo[JS_STYLE_MEMO];
     struct js_script *scripts, *last_script, *blocker;
     uint64_t dynamic_scan_revision;
     bool dynamic_scan_valid;
@@ -1898,30 +1903,26 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
 }
 
 /* A CSSOM declaration block, which an element's style attribute or a rule's
-   declarations (js_cssom.h) stand for as text. Its declarations are the ones
-   the text parses to (css.c's css_decl_serialize keeps the valid ones in their
-   block, check), so every read is of the block's serialization; a change
-   writes the whole block's serialization ("update style attribute", CSSOM
-   6.7). */
-/* the text as CSS reads it (no comments), serialized as a block */
-static bool style_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names) {
-    size_t clean_n;
-    char *clean = css_preprocess(css, n, &clean_n);
-    bool ok = clean && css_decl_serialize(clean, clean_n, check, out, names);
-    free(clean);
-    return ok;
-}
-/* get or set a property of a serialized block; a set writes the block's new
-   serialization into out, *write when it differs */
+   declarations (js_cssom.h) stand for. Its declarations are held as a block's
+   text (css.c's css_decl_block: its longhands with the values they were given,
+   and a shorthand kept whole where no longhand can hold its value);
+   getPropertyValue() reads the block (a shorthand from its longhands), cssText
+   and the names its serialization, and a change writes the block's
+   serialization into the attribute ("update style attribute", CSSOM 6.7). */
+/* get or set a property of a block's text; a set writes the block's new text
+   into out, *write when it differs */
 static JSValue style_text_access(JSContext *ctx, const char *block, size_t n, const char *property, bool set,
                                  JSValueConst value, JSValueConst priority, bool priority_only,
                                  css_decl_check *check, sbuf *out, bool *write) {
     *write = false;
     if (!set) {
-        const char *v; size_t vn; bool important;
-        bool found = css_decl_find(block, n, property, &v, &vn, &important);
-        return priority_only ? JS_NewString(ctx, found && important ? "important" : "") :
-            JS_NewStringLen(ctx, found ? v : "", found ? vn : 0);
+        sbuf v = {0};
+        bool important;
+        if (!css_decl_get(block, n, property, check, &v, &important)) { sb_free(&v); return JS_ThrowOutOfMemory(ctx); }
+        JSValue result = priority_only ? JS_NewString(ctx, important ? "important" : "") :
+            JS_NewStringLen(ctx, v.p ? v.p : "", v.n);
+        sb_free(&v);
+        return result;
     }
     const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
     if (!v || (!JS_IsUndefined(priority) && !prio)) {
@@ -1934,70 +1935,88 @@ static JSValue style_text_access(JSContext *ctx, const char *block, size_t n, co
     *write = status > 0 && (out->n != n || (n && memcmp(out->p, block, n)));
     return JS_UNDEFINED;
 }
-/* a serialized block's cssText and its declarations' names: [cssText, name...] */
-static JSValue style_text_block(JSContext *ctx, const char *block, size_t n) {
-    sbuf names = {0};
-    css_decl_names(block, n, &names);
+/* a block's cssText and its declarations' names (each NUL-terminated):
+   [cssText, name...] */
+static JSValue style_text_block(JSContext *ctx, const char *text, size_t n, const char *names, size_t names_n) {
     JSValue list = JS_NewArray(ctx);
     uint32_t i = 0;
-    bool ok = !JS_IsException(list) && JS_SetPropertyUint32(ctx, list, i++, JS_NewStringLen(ctx, block, n)) >= 0;
-    for (size_t at = 0; ok && at < names.n; at += strlen(names.p + at) + 1)
-        ok = JS_SetPropertyUint32(ctx, list, i++, JS_NewString(ctx, names.p + at)) >= 0;
-    sb_free(&names);
+    bool ok = !JS_IsException(list) && JS_SetPropertyUint32(ctx, list, i++, JS_NewStringLen(ctx, text, n)) >= 0;
+    for (size_t at = 0; ok && at < names_n; at += strlen(names + at) + 1)
+        ok = JS_SetPropertyUint32(ctx, list, i++, JS_NewString(ctx, names + at)) >= 0;
     if (!ok) { JS_FreeValue(ctx, list); return JS_EXCEPTION; }
     return list;
 }
-/* An element's style attribute as a serialized block. The serialization is a
-   function of the text alone, so the last text each slot saw and its block
-   stand for any element whose attribute is that text: reading a style or
-   setting one property does not parse every declaration again. */
+/* An element's inline style as a block: the one CSSOM wrote (css.c's
+   css_inline_block), or the one its attribute parses to, a function of the text
+   alone. The last block each slot saw, its serialization and names stand for
+   any element whose block that is: reading a style or setting one property
+   does not parse every declaration again. */
 static struct js_style_memo *style_memo_slot(struct web_js_state *s, const node_t *n) {
     uint32_t h = (uint32_t)((uintptr_t)n >> 4) * 2654435761u;
     return &s->style_memo[h >> 26 & (JS_STYLE_MEMO - 1)];
 }
-static void style_memo_store(struct web_js_state *s, const node_t *n, const char *source, size_t source_n,
-                             const char *block, size_t block_n) {
-    struct js_style_memo *m = style_memo_slot(s, n);
-    char *a = malloc(source_n + 1), *b = malloc(block_n + 1);
-    free(m->source); free(m->block);
+static void style_memo_clear(struct js_style_memo *m) {
+    free(m->source); free(m->block); free(m->serialized); free(m->names);
     *m = (struct js_style_memo){0};
-    if (!a || !b) { free(a); free(b); return; }
-    memcpy(a, source, source_n); a[source_n] = 0;
-    memcpy(b, block, block_n); b[block_n] = 0;
-    *m = (struct js_style_memo){a, b, source_n, block_n};
 }
-static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
-    /* A style attribute CSP blocked gives no declarations. */
-    const char *css = n->csp_style_attribute == 2 ? NULL : node_attr(n, "style"); if (!css) css = "";
-    size_t length = strlen(css);
+static char *style_copy(const char *p, size_t n) {
+    char *copy = malloc(n + 1);
+    if (copy) { if (n) memcpy(copy, p, n); copy[n] = 0; }
+    return copy;
+}
+static struct js_style_memo *style_memo_get(struct web_js_state *s, node_t *n) {
     struct js_style_memo *m = style_memo_slot(s, n);
-    if (m->source && m->source_n == length && !memcmp(m->source, css, length)) {
-        sb_put(block, m->block, m->block_n);
-        return true;
+    const char *own = css_inline_block(n), *css = NULL;
+    size_t length;
+    if (own) {
+        length = strlen(own);
+        if (m->own && m->block_n == length && !memcmp(m->block, own, length)) return m;
+    } else {
+        /* a style attribute CSP blocked gives no declarations */
+        css = n->csp_style_attribute == 2 ? NULL : node_attr(n, "style");
+        if (!css) css = "";
+        length = strlen(css);
+        if (m->source && !m->own && m->source_n == length && !memcmp(m->source, css, length)) return m;
     }
-    if (!style_serialize(css, length, NULL, block, NULL)) return false;
-    style_memo_store(s, n, css, length, block->p ? block->p : "", block->n);
-    return true;
+    sbuf block = {0}, text = {0}, names = {0};
+    bool ok = true;
+    if (own) sb_put(&block, own, length);
+    else {
+        size_t clean_n;
+        char *clean = css_preprocess(css, length, &clean_n);
+        ok = clean && css_decl_block(clean, clean_n, NULL, &block);
+        free(clean);
+    }
+    ok = ok && css_decl_block_serialize(block.p ? block.p : "", block.n, NULL, &text, &names);
+    struct js_style_memo next = {style_copy(own ? "" : css, own ? 0 : length), style_copy(block.p, block.n),
+                                 style_copy(text.p, text.n), style_copy(names.p, names.n),
+                                 own ? 0 : length, block.n, text.n, names.n, own != NULL};
+    sb_free(&block); sb_free(&text); sb_free(&names);
+    style_memo_clear(m);
+    if (!ok || !next.source || !next.block || !next.serialized || !next.names) { style_memo_clear(&next); return NULL; }
+    *m = next;
+    return m;
 }
-/* the attribute becomes a block's serialization (CSSOM's mutate flag: the
-   attribute is not parsed again); reads see that block, and the cascade the
+/* the attribute becomes the declarations' serialization (CSSOM's mutate flag:
+   the attribute is not parsed again); reads and the cascade see the
    declarations css_inline_set or css_inline_replace kept as given */
-static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *block) {
+static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *attribute) {
     /* CSSOM's updating flag: the attribute change steps neither parse the
        value again nor run CSP's check on it; the block applies. */
     uint8_t state = n->csp_style_attribute;
     n->csp_style_attribute = 3;
-    bool set = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)block));
+    bool set = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr((sbuf *)attribute));
     n->csp_style_attribute = set ? 1 : state;
-    if (!set) return false;
-    style_memo_store(s, n, block->p ? block->p : "", block->n, block->p ? block->p : "", block->n);
-    return true;
+    return set;
 }
 static JSValue style_access(struct web_js_state *s, node_t *n, const char *property,
                             bool set, JSValueConst value, JSValueConst priority, bool priority_only) {
     JSContext *ctx = s->ctx;
+    struct js_style_memo *m = style_memo_get(s, n);
+    if (!m) return oom(ctx);
+    /* the block stays the caller's while the value converts (which can run script) */
     sbuf block = {0}, b = {0};
-    if (!style_memo_block(s, n, &block)) { sb_free(&block); return oom(ctx); }
+    sb_put(&block, m->block, m->block_n);
     JSValue result;
     if (!set) {
         bool write;
@@ -2021,15 +2040,14 @@ static JSValue style_access(struct web_js_state *s, node_t *n, const char *prope
    setter (the attribute becomes the serialization of what text parses to) */
 static JSValue style_block_access(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
     JSContext *ctx = s->ctx;
-    sbuf b = {0};
     if (argc <= 2) {
-        JSValue result = style_memo_block(s, n, &b) ? style_text_block(ctx, b.p ? b.p : "", b.n) : oom(ctx);
-        sb_free(&b);
-        return result;
+        struct js_style_memo *m = style_memo_get(s, n);
+        return m ? style_text_block(ctx, m->serialized, m->serialized_n, m->names, m->names_n) : oom(ctx);
     }
     size_t length;
     const char *text = JS_ToCStringLen(ctx, &length, argv[2]);
     if (!text) return JS_EXCEPTION;
+    sbuf b = {0};
     bool ok = css_inline_replace(n->owner, n, text, length, &b);
     JS_FreeCString(ctx, text);
     JSValue result = !ok ? JS_ThrowOutOfMemory(ctx) : style_attribute_set(s, n, &b) ? JS_UNDEFINED : oom(ctx);
@@ -3321,7 +3339,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     doc_dom_budget(d);
     bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_move || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
                     opcode == DOM_attrSetNode || opcode == DOM_attrRemoveNode ||
-                    ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_attrNS && argc > 4);
+                    ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_styleBlock && argc > 2) ||
+                    (opcode == DOM_attrNS && argc > 4);
     bool synchronous_hooks=mutation&&(s->ce_hooks_active||s->ce_scoped_active||s->range_hooks_active)&&dom_synchronous_hooks(s,opcode,n,argc,argv);
     JSValue operation=synchronous_hooks ? JS_NewString(ctx,dom_opcode_names[opcode]) : JS_UNDEFINED;
     if(JS_IsException(operation))return operation;
@@ -10312,7 +10331,10 @@ void web_js_free(web_doc *d) {
             JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
         s->last_handled_rejection=NULL;
         node_cache_free(s);
-        for (int i = 0; i < JS_STYLE_MEMO; i++) { free(s->style_memo[i].source); free(s->style_memo[i].block); }
+        for (int i = 0; i < JS_STYLE_MEMO; i++) {
+            free(s->style_memo[i].source); free(s->style_memo[i].block);
+            free(s->style_memo[i].serialized); free(s->style_memo[i].names);
+        }
         js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
         JS_FreeValue(s->ctx, s->event_port); JS_FreeValue(s->ctx, s->event_states);

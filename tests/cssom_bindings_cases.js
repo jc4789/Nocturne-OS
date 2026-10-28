@@ -85,3 +85,17 @@ check(child.ownerRule === dataImport && dataImport.styleSheet === child, 'the re
 fixture('restyled');
 child.insertRule('.later {}', 0);
 check(child.cssRules.length === 3 && !fixture('restyled'), 'a removed rule\'s sheet reaches no cascade');
+
+/* CSSOM 6.7, CSSStyleRule.style: setProperty() keeps the declaration's value as given in what the
+   cascade parses (the sheet's text), and cssText and getPropertyValue() serialize it; the
+   specified value's serialization rounds the origin colour's components, which the computed
+   value must not see (css/css-color/parsing/color-computed-color-mix-function.html) */
+const at = sheet.insertRule('.colour {}', sheet.cssRules.length), colour = sheet.cssRules[at];
+colour.style.setProperty('color', 'color-mix(in hsl, hsl(0 100% 100%), blue)');
+const given = fixture('declarations', 0, at);
+check(given === 'color: color-mix(in hsl, hsl(0 100% 100%), blue);', 'a rule\'s setProperty() keeps the value as given: ' + given);
+check(colour.style.cssText === 'color: ' + colour.style.getPropertyValue('color') + ';' &&
+    colour.cssText === '.colour { ' + colour.style.cssText + ' }', 'a rule\'s cssText serializes its declarations: ' + colour.cssText);
+colour.style.setProperty('margin', '1px 1px 1px 1px', 'important');
+check(colour.style.getPropertyValue('margin') === '1px' && colour.style.getPropertyPriority('margin') === 'important',
+    'a rule\'s setProperty() of a shorthand sets its longhands: ' + colour.style.cssText);

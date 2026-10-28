@@ -74,14 +74,27 @@ int web_resolve_url_owned(const char *base, const char *rel, char **out) {
     memcpy(*out, base, a); memcpy(*out + a, rel, b + 1);
     return 1;
 }
-/* http.c's place: a URL's origin is its text before the path */
+/* web_url.c's place: a URL's origin is its text before the path (the source
+   before 3435c5b4 asked http.c) */
+#ifdef OLD_SOURCE
 enum http_url_result http_origin_owned(const char *raw, char **origin) {
+#define WEB_URL_OPAQUE HTTP_URL_OPAQUE
+#define WEB_URL_TUPLE HTTP_URL_TUPLE
+#define WEB_URL_OOM HTTP_URL_OOM
+#else
+enum web_url_result web_url_origin(const char *raw, char **origin) {
+#endif
     *origin = NULL;
     const char *host = raw ? strstr(raw, "://") : NULL;
-    if (!host) return HTTP_URL_OPAQUE;
+    if (!host) return WEB_URL_OPAQUE;
     const char *path = strchr(host + 3, '/');
     *origin = strndup(raw, path ? (size_t)(path - raw) : strlen(raw));
-    return *origin ? HTTP_URL_TUPLE : HTTP_URL_OOM;
+    return *origin ? WEB_URL_TUPLE : WEB_URL_OOM;
+}
+/* doc.c's place: CSP (html_policy.c) blocks no style element's text here */
+bool doc_style_csp_allowed(web_doc *d, node_t *style, const char *text, size_t length) {
+    (void)d; (void)style; (void)text; (void)length;
+    return true;
 }
 /* doc.c's place: the resources @import rules name, and links (none here) */
 static const struct { const char *url, *base, *text; } resources[] = {
@@ -131,6 +144,18 @@ static JSValue fixture(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
     } else if (!strcmp(op, "newestBase")) {
         struct cssom_sheet *s = nodes[0].cssom_sheets;
         result = s && s->base ? JS_NewString(ctx, s->base) : JS_NULL;
+    } else if (!strcmp(op, "declarations")) {
+        /* a top-level rule's declarations in its sheet's text: what the cascade parses */
+        int32_t i = 0, at = 0;
+        JS_ToInt32(ctx, &i, argv[1]); JS_ToInt32(ctx, &at, argv[2]);
+        int error;
+        uint32_t count;
+        struct cssom_sheet *s = cssom_style_sheet(&document_, &nodes[1 + 2 * i], &error);
+        struct css_rule_info *rule = s ? cssom_child(s, 0, (uint32_t)at, &count) : NULL;
+        const char *text = NULL;
+        size_t n = 0;
+        if (rule) cssom_declarations(rule, &text, &n);
+        result = text ? JS_NewStringLen(ctx, text, n) : JS_NULL;
     }
     JS_FreeCString(ctx, op);
     return result;

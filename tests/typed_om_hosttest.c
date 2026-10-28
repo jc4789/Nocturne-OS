@@ -5,8 +5,8 @@
  * The scripts run in order in one realm; then microtasks and the stand-in timers of
  * tests/typed_om_host.js run until nothing is left. Not the guest and not a document: an
  * element's inline style is a stand-in over css.c's declaration-block functions, the ones
- * js.c's inline style reads and writes (css_decl_find, css_decl_set, css_decl_serialize);
- * there is no cascade, no style sheet and no layout. */
+ * js.c's inline style reads and writes (css_decl_block, css_decl_get, css_decl_set,
+ * css_decl_block_serialize); there is no cascade, no style sheet and no layout. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,11 +22,11 @@ typedef struct sbuf { char *p; size_t n, cap; } sbuf;
 void sb_free(sbuf *b);
 typedef bool css_decl_check(const char *name, const char *value, size_t n, sbuf *serialized);
 char *css_preprocess(const char *css, size_t n, size_t *out_n);
-bool css_decl_find(const char *css, size_t n, const char *property, const char **value, size_t *value_n, bool *important);
-int css_decl_set(const char *css, size_t n, const char *property, const char *value, const char *priority,
+bool css_decl_block(const char *css, size_t n, css_decl_check *check, sbuf *block);
+bool css_decl_get(const char *block, size_t n, const char *property, css_decl_check *check, sbuf *value, bool *important);
+int css_decl_set(const char *block, size_t n, const char *property, const char *value, const char *priority,
                  css_decl_check *check, sbuf *out);
-bool css_decl_serialize(const char *css, size_t n, css_decl_check *check, sbuf *out, sbuf *names);
-void css_decl_names(const char *css, size_t n, sbuf *names);
+bool css_decl_block_serialize(const char *block, size_t n, css_decl_check *check, sbuf *out, sbuf *names);
 
 /* js_webidl.c times its pass for the realm's setup trace, which the host does not print */
 uint64_t uptime_ms(void) { return 0; }
@@ -66,8 +66,8 @@ static JSValue print(JSContext *ctx, JSValueConst self, int argc, JSValueConst *
     return JS_UNDEFINED;
 }
 
-/* host.declBlock(text): the text as js.c's inline style serializes it, [cssText, name...] */
-static JSValue decl_block(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+/* host.declParse(text): the block an inline style's text parses to, as js.c holds it */
+static JSValue decl_parse(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)self;
     size_t n;
     const char *text = JS_ToCStringLen(ctx, &n, argc ? argv[0] : JS_UNDEFINED);
@@ -75,40 +75,53 @@ static JSValue decl_block(JSContext *ctx, JSValueConst self, int argc, JSValueCo
     size_t clean_n;
     char *clean = css_preprocess(text, n, &clean_n);
     JS_FreeCString(ctx, text);
-    sbuf block = {0}, names = {0};
-    bool ok = clean && css_decl_serialize(clean, clean_n, NULL, &block, NULL);
+    sbuf block = {0};
+    bool ok = clean && css_decl_block(clean, clean_n, NULL, &block);
     free(clean);
-    if (!ok) { sb_free(&block); return JS_ThrowOutOfMemory(ctx); }
-    css_decl_names(block.p ? block.p : "", block.n, &names);
+    JSValue result = ok ? JS_NewStringLen(ctx, block.p ? block.p : "", block.n) : JS_ThrowOutOfMemory(ctx);
+    sb_free(&block);
+    return result;
+}
+
+/* host.declBlock(block): the block as js.c's inline style serializes it, [cssText, name...] */
+static JSValue decl_block(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;
+    size_t n;
+    const char *block = JS_ToCStringLen(ctx, &n, argc ? argv[0] : JS_UNDEFINED);
+    if (!block) return JS_EXCEPTION;
+    sbuf text = {0}, names = {0};
+    bool ok = css_decl_block_serialize(block, n, NULL, &text, &names);
+    JS_FreeCString(ctx, block);
+    if (!ok) { sb_free(&text); sb_free(&names); return JS_ThrowOutOfMemory(ctx); }
     JSValue list = JS_NewArray(ctx);
     uint32_t i = 0;
-    JS_SetPropertyUint32(ctx, list, i++, JS_NewStringLen(ctx, block.p ? block.p : "", block.n));
+    JS_SetPropertyUint32(ctx, list, i++, JS_NewStringLen(ctx, text.p ? text.p : "", text.n));
     for (size_t at = 0; at < names.n; at += strlen(names.p + at) + 1)
         JS_SetPropertyUint32(ctx, list, i++, JS_NewString(ctx, names.p + at));
     sb_free(&names);
-    sb_free(&block);
+    sb_free(&text);
     return list;
 }
 
-/* host.declGet(block, property): the declaration's value in a serialized block, or "" */
+/* host.declGet(block, property): getPropertyValue() of a block, or "" */
 static JSValue decl_get(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)self;
     size_t n;
     const char *block = JS_ToCStringLen(ctx, &n, argc > 0 ? argv[0] : JS_UNDEFINED);
     const char *property = JS_ToCString(ctx, argc > 1 ? argv[1] : JS_UNDEFINED);
     if (!block || !property) { JS_FreeCString(ctx, block); JS_FreeCString(ctx, property); return JS_EXCEPTION; }
-    const char *v;
-    size_t vn;
+    sbuf value = {0};
     bool important;
-    bool found = css_decl_find(block, n, property, &v, &vn, &important);
-    JSValue result = JS_NewStringLen(ctx, found ? v : "", found ? vn : 0);
+    bool ok = css_decl_get(block, n, property, NULL, &value, &important);
+    JSValue result = ok ? JS_NewStringLen(ctx, value.p ? value.p : "", value.n) : JS_ThrowOutOfMemory(ctx);
+    sb_free(&value);
     JS_FreeCString(ctx, block);
     JS_FreeCString(ctx, property);
     return result;
 }
 
-/* host.declSet(block, property, value): the block's serialization after setting (or, with "",
-   removing) the property, as CSSOM's setProperty() writes it */
+/* host.declSet(block, property, value): the block after setting (or, with "", removing) the
+   property, as CSSOM's setProperty() changes it */
 static JSValue decl_set(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)self;
     size_t n;
@@ -164,6 +177,7 @@ int main(int argc, char **argv) {
     JSValue global = JS_GetGlobalObject(ctx), host = JS_NewObject(ctx);
     web_js_typed_om_init(ctx, host);
     web_js_webidl_init(ctx, host);
+    JS_SetPropertyStr(ctx, host, "declParse", JS_NewCFunction(ctx, decl_parse, "declParse", 1));
     JS_SetPropertyStr(ctx, host, "declBlock", JS_NewCFunction(ctx, decl_block, "declBlock", 1));
     JS_SetPropertyStr(ctx, host, "declGet", JS_NewCFunction(ctx, decl_get, "declGet", 2));
     JS_SetPropertyStr(ctx, host, "declSet", JS_NewCFunction(ctx, decl_set, "declSet", 3));

@@ -9,7 +9,9 @@ node で取り出し、color.c・cssprop.c を host の clang で組んだ道具
 css_apply に渡す道と、computed-testcommon.js のとおり element.style に書く道（css.c の
 css_inline_set が宣言と style 属性を書き、cascade が読む css_inline_text の値を css_apply に
 渡す）。後者は、属性の指定値の直列化（色の origin の成分は丸まる）を cascade が読み直して
-落ちた退行（1028k）の道。CSSOM・cascade・var() の全部を通す
+落ちた退行（1028k）の道。同じ値を規則の style（CSSStyleRule.style.cssText、cssom.c の
+cssom_set_declarations：setProperty の終わりの段も同じ）にも書き、シートの文が持つ規則の宣言
+（cascade が読む一回の解析の文）から css_apply に渡す道でも照らす。CSSOM・cascade・var() の全部を通す
 guest の WPT の代わりではない：var() は頁の :root と html の custom property だけを
 置き換え、要素は「親の color が rgb(255, 0, 0)」の一つだけ、補間は端が値のものだけ。
 
@@ -43,7 +45,7 @@ command = [str(cc), "-std=gnu11", "-O2", "-ffunction-sections", "-fdata-sections
            "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include", "-Icommon", "-Iuser/libc",
            "-Iuser/libc/web", "-Ithird_party/quickjs", "tests/css_color_native_cases.c", "user/libc/web/color.c", "user/libc/web/cssmath.c",
            "user/libc/web/cssprop.c", "user/libc/web/shape.c", "user/libc/web/util.c", "user/libc/web/html.c",
-           "user/libc/web/css.c", str(out / "unreached.c"), "-o", str(exe)]
+           "user/libc/web/css.c", "user/libc/web/cssom.c", "user/libc/web/dom.c", str(out / "unreached.c"), "-o", str(exe)]
 # css.c (the element's inline declarations, the O requests) reaches the document, layout and
 # script: every external these requests never call stops with its name
 undefined = re.compile(r"undefined (?:symbol: |reference to `)([A-Za-z_][A-Za-z0-9_]*)")
@@ -256,7 +258,9 @@ round_trip = tool.run(again) if again else []
 # declarations the cascade reads, not the style attribute's specified serialization parsed again
 cssom_index = {i: k for k, i in enumerate(i for i, c in enumerate(cases) if c[1] == "computed")}
 through_cssom = tool.run([("O",) + cases[i][4][1:] for i in cssom_index])
+through_rule = tool.run([("R",) + cases[i][4][1:] for i in cssom_index])
 cssom_lost = []
+rule_lost = []
 report = {}
 failures = {}
 round_trips = []
@@ -278,7 +282,11 @@ for i, (name, kind, prop, value, request, want, epsilon, scheme) in enumerate(ca
             through = through_cssom[cssom_index[i]]
             if not (through != "<invalid>" and matches(through, want, epsilon)) and ok:
                 cssom_lost.append((name, value, want, through))
-            ok = ok and through != "<invalid>" and matches(through, want, epsilon)
+            ruled = through_rule[cssom_index[i]]
+            if not (ruled != "<invalid>" and matches(ruled, want, epsilon)) and ok:
+                rule_lost.append((name, value, want, ruled))
+            ok = ok and through != "<invalid>" and matches(through, want, epsilon) and \
+                ruled != "<invalid>" and matches(ruled, want, epsilon)
     good, count = report.get(name, (0, 0))
     report[name] = (good + ok, count + 1)
     if not ok:
@@ -295,6 +303,9 @@ for name, value, got, back in round_trips:
 for name, value, want, through in cssom_lost:
     print(f"element.style を通すと落ちる：{name}: {value!r} → {through!r}（期待 {want!r}）")
 print(f"element.style を通す計算値 {len(cssom_index)} 件、直接に合って通すと落ちる {len(cssom_lost)} 件")
+for name, value, want, through in rule_lost:
+    print(f"規則の style を通すと落ちる：{name}: {value!r} → {through!r}（期待 {want!r}）")
+print(f"規則の style を通す計算値 {len(cssom_index)} 件、直接に合って通すと落ちる {len(rule_lost)} 件")
 passed = sum(g for g, c in report.values())
 total = sum(c for g, c in report.values())
 print(f"合計 {passed}/{total}（数えない：{skipped}）")

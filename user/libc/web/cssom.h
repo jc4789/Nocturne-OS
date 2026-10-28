@@ -103,11 +103,14 @@ bool cssom_attribute(struct cssom_sheet *sheet, const struct css_rule_info *rule
 /* An attribute's setter: CSSOM_SYNTAX when the value does not parse (setters
    the specifications make throw, the binding throws for; others do nothing). */
 int cssom_set_attribute(struct cssom_sheet *sheet, uint32_t id, const char *name, const char *value, size_t length);
-/* a rule's declarations as written, their validity in its block, and setting them */
+/* a rule's declarations as written, their validity in its block, and setting
+   them (text: any declaration text; the rule keeps its block's text) */
 void cssom_declarations(const struct css_rule_info *rule, const char **text, size_t *length);
-/* the rule's declaration block serialized: the declarations its block keeps
-   (a keyframe's without !important ones, CSS Animations 1); false: no memory */
-bool cssom_block(const struct css_rule_info *rule, sbuf *out);
+/* the rule's declaration block: the declarations its block keeps (a keyframe's
+   without !important ones, CSS Animations 1) as a block's text (css_decl_block),
+   or serialized with their names (css_decl_serialize); false: no memory */
+bool cssom_block(const struct css_rule_info *rule, sbuf *block);
+bool cssom_block_serialize(const struct css_rule_info *rule, sbuf *out, sbuf *names);
 css_decl_check *cssom_declaration_check(const struct css_rule_info *rule);
 int cssom_set_declarations(struct cssom_sheet *sheet, uint32_t id, const char *text, size_t length);
 /* MediaList of the sheet (id 0), an @media rule or an @import rule:

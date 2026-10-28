@@ -43,21 +43,23 @@ globalThis.__hostRealm = (title, url) => {
     globalThis.CSS = {escape: () => { throw new Error(HOST_UNAVAILABLE); }};
     const unavailable = () => { throw new Error(HOST_UNAVAILABLE); };
     const typedOM = typedOMInterfaces({native: host, geometry, DOMException, css: CSS, declarations: {
-        read: (block, name) => host.declGet(block.cssText, name),
-        write: (block, name, text) => { block.cssText = host.declSet(block.cssText, name, text); },
-        names: block => host.declBlock(block.cssText).slice(1),
+        read: (block, name) => host.declGet(block.block, name),
+        write: (block, name, text) => { block.block = host.declSet(block.block, name, text); },
+        names: block => host.declBlock(block.block).slice(1),
         computed: unavailable, computedNames: unavailable}});
     host.webidl('Window');
     /* idlharness's exposure: this realm stands for a Window */
     globalThis.Window = function Window() { unavailable(); };
+    /* js.c's inline style: the declarations as a block's text (host.declParse), read and
+       changed there, cssText and the names its serialization */
     class HostStyle {
-        constructor() { this.text = ''; }
-        get cssText() { return this.text; }
-        set cssText(v) { this.text = host.declBlock(String(v))[0]; }
-        getPropertyValue(name) { return host.declGet(this.text, String(name)); }
-        setProperty(name, value) { this.text = host.declSet(this.text, String(name), value == null ? '' : String(value)); }
+        constructor() { this.block = ''; }
+        get cssText() { return host.declBlock(this.block)[0]; }
+        set cssText(v) { this.block = host.declParse(String(v)); }
+        getPropertyValue(name) { return host.declGet(this.block, String(name)); }
+        setProperty(name, value) { this.block = host.declSet(this.block, String(name), value == null ? '' : String(value)); }
         removeProperty(name) { const old = this.getPropertyValue(name); this.setProperty(name, ''); return old; }
-        get length() { return host.declBlock(this.text).length - 1; }
+        get length() { return host.declBlock(this.block).length - 1; }
     }
     /* CSSStyleProperties' named accessors (style.width, style.backgroundImage), as the product's
        bootstrap defines one per property */
