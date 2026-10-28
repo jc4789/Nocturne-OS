@@ -58,7 +58,8 @@ struct web_effect {
 struct web_animation {
     uint32_t id;
     uint8_t kind, pending, replace;
-    bool timeline;                     /* the document timeline; false: no timeline */
+    bool timeline;                     /* a document timeline; false: no timeline */
+    double timeline_origin;            /* DocumentTimeline originTime: its zero on the document's */
     struct web_animations *doc;
     struct web_animation *next;        /* every animation, in creation order */
     struct web_effect *effect;
@@ -121,7 +122,8 @@ void web_effect_set_target(struct web_effect *e, node_t *target, uint8_t pseudo)
 void web_effect_set_keyframes(struct web_effect *e, struct web_keyframes *k);
 struct web_keyframes *web_keyframes_build(const struct web_keyframe *frames, uint32_t count);
 bool web_animation_set_effect(struct web_animation *a, struct web_effect *e);
-void web_animation_set_timeline(struct web_animation *a, bool document);
+void web_animation_set_timeline(struct web_animation *a, bool document, double origin);
+void web_effect_timing_changed(struct web_effect *e); /* after updateTiming and the like: the finished state, the style */
 int web_animation_play(struct web_animation *a, bool auto_rewind); /* <0: InvalidStateError */
 int web_animation_pause(struct web_animation *a);
 int web_animation_finish(struct web_animation *a);
@@ -144,8 +146,10 @@ struct web_animation *web_animation_by_id(web_doc *d, uint32_t id);
 struct web_effect *web_effect_by_id(web_doc *d, uint32_t id);
 void web_animation_release(struct web_animation *a);
 void web_effect_release(struct web_effect *e);
-/* the relevant animations of a document, or of a target (and its descendants), in composite order */
-size_t web_animations_list(web_doc *d, node_t *root, bool subtree, struct web_animation ***out);
+/* the relevant animations in composite order (Web Animations 1 §5.4.2) of the document (root NULL:
+   targets in it), else of root: pseudo >= 0, its element (PE_NONE) or that pseudo-element; pseudo < 0,
+   all of root's and, with subtree, its descendants' in the same tree (not across a shadow boundary) */
+size_t web_animations_list(web_doc *d, node_t *root, bool subtree, int pseudo, struct web_animation ***out);
 /* commitStyles: the effect's current values, longhand by longhand, as text pairs */
 bool web_animation_commit(struct web_animation *a, sbuf *out, int *count);
 /* the doc's queued events in dispatch order; the caller frees the names and the array */

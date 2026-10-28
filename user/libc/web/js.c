@@ -1919,6 +1919,7 @@ static void viewport_scroll_position(struct web_js_state *s,int *x,int *y);
 static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double rect[4],bool *present);
 static bool element_offset_metrics(node_t *n,double first[4],double bounds[4]);
 #include "js_svg_native.h"
+#include "js_animation_native.h"
 static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root) {
     JSContext *ctx=s->ctx; web_doc *d=s->doc;
     if (!n || n->type!=N_ELEM || (root && root->type!=N_ELEM && root!=d->root))
@@ -7962,13 +7963,38 @@ static int frame_callback_order(const void *left,const void *right){
     const struct js_frame_callback *a=left,*b=right;
     return a->order<b->order?-1:a->order>b->order;
 }
+/* HTML "update animations and send events" after animation.c updated the timelines (doc.c's
+   tick): the promises they settled, a microtask checkpoint, then the pending animation event
+   queue, one event per turn so each listener gets its own checkpoint. */
+static void run_animations(struct web_js_state *s){
+    uint64_t generation=s->stream_generation;
+    begin_task(s);
+    JSValue result=custom_element_hook(s,"animationUpdate",0,NULL);
+    if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
+    end_task(s);
+    if(s->disabled || s->stream_generation!=generation)return;
+    begin_task(s);
+    JSValue next=custom_element_hook(s,"animationEvents",0,NULL);
+    if(JS_IsException(next))exception(s);
+    else while(JS_IsFunction(s->ctx,next) && !s->disabled && s->stream_generation==generation){
+        result=JS_Call(s->ctx,next,JS_UNDEFINED,0,NULL);
+        if(JS_IsException(result)){exception(s);break;}
+        bool more=JS_ToBool(s->ctx,result)!=0;
+        JS_FreeValue(s->ctx,result);
+        if(!more)break;
+        end_task(s);begin_task(s);
+    }
+    JS_FreeValue(s->ctx,next);
+    end_task(s);
+}
 static bool run_rendering(struct web_js_state *s,uint64_t now){
     /* A hidden document is not rendered (rendering_wanted): its animation frames wait. */
     if(s->disabled || s->running || now<s->rendering_due || !s->doc->visible)return false;
     size_t count=0;
     for(unsigned i=0;i<s->timer_capacity;i++)
         if(s->timers[i].id && s->timers[i].kind==2 && s->timers[i].due<=now)count++;
-    if(!count && !observers_dirty(s)){
+    bool animations=web_animations_script_work(s->doc);
+    if(!count && !observers_dirty(s) && !animations){
         /* The display's frame is used even with nothing to render: animation frames asked
            after it wait for the next one, not run between frames. */
         if(s->host.display_frames)s->rendering_due=UINT64_MAX;
@@ -7991,6 +8017,7 @@ static bool run_rendering(struct web_js_state *s,uint64_t now){
         qsort(frames,count,sizeof *frames,frame_callback_order);
     }
     uint64_t generation=s->stream_generation;
+    if(animations)run_animations(s);
     for(size_t at=0;at<count && !s->disabled && s->stream_generation==generation;at++){
         /* Cancellation, growth, or reuse during an earlier callback must not
            invalidate this snapshot or accidentally invoke a new callback. */
@@ -8083,7 +8110,7 @@ static bool idle_eligible(struct web_js_state *s, uint64_t now) {
         s->events || s->posted || s->media_width != d->width || s->media_height != d->height ||
         family->shadow_slots_pending || family->details_toggle_first || JS_IsJobPending(s->rt) ||
         web_worker_runnable(s->workers) || ready_script(s, &script)) return false;
-    if (d->visible && observers_dirty(s) && s->rendering_due <= now) return false;
+    if (d->visible && (observers_dirty(s) || web_animations_script_work(d)) && s->rendering_due <= now) return false;
     int64_t atomics = web_atomics_deadline(s->ctx, now);
     if (atomics >= 0 && (uint64_t)atomics <= now) return false;
     if (web_audio_ready(s->ctx)) return false;
@@ -8413,6 +8440,7 @@ static int64_t js_deadline(web_doc *d, int *why) {
         if (audio_deadline >= 0) EARLIER((uint64_t)audio_deadline, JD_WEB_AUDIO);
         /* A hidden document has no rendering opportunity, so its observers wait for it. */
         if (d->visible && observers_dirty(s)) EARLIER(s->rendering_due, JD_OBSERVERS);
+        if (d->visible && web_animations_script_work(d)) EARLIER(s->rendering_due, JD_OBSERVERS);
         if (s->storage_origin && storage_listening(s) && (s->storage_subscribed[0]||s->storage_subscribed[1])) EARLIER(s->storage_poll_due, JD_STORAGE);
         if(s->indexed_db_failed&&s->indexed_db_pending)DUE_NOW();
         if(web_presentation_event_peek(d))DUE_NOW();
@@ -8705,6 +8733,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
        Reject future epochs instead of underflowing performance.now()/rAF. */
     bool seeded = navigation->valid && navigation->navigation_start_ms <= initialized;
     s->now = seeded ? navigation->navigation_start_ms : initialized;
+    web_animations_set_origin(d, s->now); /* the document timeline's zero is performance.now()'s */
     timing_record(s, JS_NAV_START, s->now);
     if (seeded && navigation->fetch_valid && navigation->fetch_start_ms >= s->now && navigation->fetch_start_ms <= initialized)
         timing_record(s, JS_FETCH_START, navigation->fetch_start_ms);
@@ -8764,6 +8793,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("imageBitmap", 5, native_image_bitmap),
         JS_CFUNC_DEF("avmedia", 4, native_avmedia),
         JS_CFUNC_DEF("presentation", 2, native_presentation),
+        JS_CFUNC_DEF("animation", 4, native_animation),
         JS_CFUNC_DEF("observers", 1, native_observers),
         JS_CFUNC_DEF("pointerCapturePending", 1, native_pointer_capture_pending),
         JS_CFUNC_DEF("resolve", 1, native_resolve), JS_CFUNC_DEF("ready", 0, native_ready), JS_CFUNC_DEF("current", 0, native_current),

@@ -241,7 +241,7 @@ double web_effect_active_duration(const struct web_timing *t) {
     return d == 0 || t->iterations == 0 ? 0 : d * t->iterations;
 }
 double web_effect_end(const struct web_timing *t) { return fmax(t->delay + web_effect_active_duration(t) + t->end_delay, 0); }
-static double timeline_time(const struct web_animation *a) { return a->timeline && a->doc ? a->doc->now : NAN; }
+static double timeline_time(const struct web_animation *a) { return a->timeline && a->doc ? a->doc->now - a->timeline_origin : NAN; }
 static double effect_end(const struct web_animation *a) { return a->effect ? web_effect_end(&a->effect->timing) : 0; }
 static double effective_rate(const struct web_animation *a) { return resolved(a->pending_rate) ? a->pending_rate : a->rate; }
 static double current_without_hold(const struct web_animation *a) {
@@ -533,14 +533,18 @@ bool web_animation_set_effect(struct web_animation *a, struct web_effect *e) {
     return true;
 }
 /* §4.4.1 setting the timeline (the document timeline or none) */
-void web_animation_set_timeline(struct web_animation *a, bool document) {
-    if (a->timeline == document) return;
-    a->timeline = document;
+void web_animation_set_timeline(struct web_animation *a, bool document, double origin) {
+    if (a->timeline == document && (!document || a->timeline_origin == origin)) return;
+    a->timeline = document; a->timeline_origin = document ? origin : 0;
     if (resolved(a->start)) a->hold = NAN;
     update_finished(a, false, false);
     mark_target(a->effect);
 }
 void web_animation_persist(struct web_animation *a) { a->replace = WA_PERSISTED; }
+void web_effect_timing_changed(struct web_effect *e) {
+    if (e->animation) update_finished(e->animation, false, false);
+    mark_target(e);
+}
 
 /* ---------------------------------------------------------------- composite order (§5.4.2) */
 static node_t *composed_parent(node_t *n) { return n->parent ? n->parent : n->shadow_host; }
@@ -583,7 +587,7 @@ static int composite_order(const struct web_animation *a, const struct web_anima
 static int composite_qsort(const void *x, const void *y) {
     return composite_order(*(struct web_animation *const *)x, *(struct web_animation *const *)y);
 }
-size_t web_animations_list(web_doc *d, node_t *root, bool subtree, struct web_animation ***out) {
+size_t web_animations_list(web_doc *d, node_t *root, bool subtree, int pseudo, struct web_animation ***out) {
     *out = NULL;
     struct web_animations *x = d ? d->animations : NULL;
     if (!x) return 0;
@@ -592,10 +596,11 @@ size_t web_animations_list(web_doc *d, node_t *root, bool subtree, struct web_an
     for (struct web_animation *a = x->first; a; a = a->next) {
         if (!a->effect || !a->effect->target || !web_animation_relevant(a)) continue;
         node_t *t = a->effect->target;
-        if (doc_node_root(t, true) != d->root) continue;
-        if (root) {
+        if (!root) { if (doc_node_root(t, true) != d->root) continue; }
+        else if (pseudo >= 0) { if (t != root || a->effect->pseudo != pseudo) continue; }
+        else {
             bool inside = t == root;
-            if (!inside && subtree) for (node_t *p = composed_parent(t); p && !inside; p = composed_parent(p)) inside = p == root;
+            if (subtree) for (node_t *p = t->parent; p && !inside; p = p->parent) inside = p == root;
             if (!inside) continue;
         }
         if (n == cap) {
@@ -1193,9 +1198,10 @@ bool web_animations_script_work(web_doc *d) {
     struct web_animations *x = d ? d->animations : NULL;
     return x && (x->nevents || __atomic_load_n(&x->script_dirty, __ATOMIC_RELAXED));
 }
+/* the script's time origin wins over the first tick's guess: a cascade can make the records first */
 void web_animations_set_origin(web_doc *d, uint64_t origin) {
     struct web_animations *x = web_animations_of(d);
-    if (x && !x->origin_set) { x->origin = origin; x->origin_set = true; }
+    if (x) { x->origin = origin; x->origin_set = true; }
 }
 size_t web_animations_take_events(web_doc *d, struct web_animation_event **out) {
     struct web_animations *x = d ? d->animations : NULL;

@@ -243,6 +243,20 @@ int main(void){
     at(8300);CHECK(!c->owner);
     CHECK(sample(&gone,false)==0);
 
+    /* getAnimations: the element's own (not its pseudo-elements'), one pseudo-element's, the subtree,
+       the document's */
+    static node_t child;child.type=N_ELEM;child.owner=&doc;child.parent=&element;doc.root=&element;
+    struct web_animation *own=script_animation(1000,"0","1"),*marked=script_animation(1000,"0","1"),*inner=script_animation(1000,"0","1");
+    web_effect_set_target(marked->effect,&element,PE_BEFORE);web_effect_set_target(inner->effect,&child,PE_NONE);
+    web_animation_play(own,true);web_animation_play(marked,true);web_animation_play(inner,true);at(9000);
+    struct web_animation **v;size_t n;
+    n=web_animations_list(&doc,&element,false,PE_NONE,&v);CHECK(n==1&&v[0]==own);free(v);
+    n=web_animations_list(&doc,&element,false,PE_BEFORE,&v);CHECK(n==1&&v[0]==marked);free(v);
+    n=web_animations_list(&doc,&element,true,-1,&v);CHECK(n==3&&v[0]==own&&v[1]==marked&&v[2]==inner);free(v);
+    n=web_animations_list(&doc,&child,true,-1,&v);CHECK(n==1&&v[0]==inner);free(v);
+    n=web_animations_list(&doc,NULL,false,-1,&v);CHECK(n==3);free(v);
+    web_animation_cancel(own);web_animation_cancel(marked);web_animation_cancel(inner);events(types,8);
+
     web_animations_doc_free(&doc);
     printf("animation-model: %d checks, %d failures\n",checks,failed);
     return failed!=0;
