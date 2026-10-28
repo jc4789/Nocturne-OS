@@ -2293,14 +2293,6 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     else if (!strcmp(property, "font-family")) return JS_NewString(ctx,st->font_names?st->font_names:st->font_family==FONT_FAMILY_MONO?"monospace":st->font_family==FONT_FAMILY_SANS?"sans-serif":"serif");
     else if (!strcmp(property, "font-weight")) snprintf(out, sizeof out, "%u", st->font_weight);
     else if (!strcmp(property, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
-    else if (!strcmp(property, "animation-name")) return JS_NewString(ctx,st->motion.name?st->motion.name:"none");
-    else if (!strcmp(property, "animation-duration")) snprintf(out,sizeof out,"%gs",(double)st->motion.duration/1000);
-    else if (!strcmp(property, "animation-delay")) snprintf(out,sizeof out,"%gs",(double)st->motion.delay/1000);
-    else if (!strcmp(property, "animation-iteration-count")) {if(isfinite(st->motion.iterations))snprintf(out,sizeof out,"%g",(double)st->motion.iterations);else snprintf(out,sizeof out,"infinite");}
-    else if (!strcmp(property, "animation-play-state")) snprintf(out,sizeof out,"%s",st->motion.paused?"paused":"running");
-    else if (!strcmp(property, "animation-fill-mode")) {static const char *const names[]={"none","forwards","backwards","both"};snprintf(out,sizeof out,"%s",names[st->motion.fill<4?st->motion.fill:0]);}
-    else if (!strcmp(property, "animation-direction")) {static const char *const names[]={"normal","reverse","alternate","alternate-reverse"};snprintf(out,sizeof out,"%s",names[st->motion.direction<4?st->motion.direction:0]);}
-    else if (!strcmp(property, "animation-timing-function")) {sbuf b={0};css_easing_serialize(&st->motion.easing,&b);snprintf(out,sizeof out,"%s",b.n?sb_cstr(&b):"ease");sb_free(&b);}
     else if (!strcmp(property, "fill-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_fill_opacity);
     else if (!strcmp(property, "stroke-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stroke_opacity);
     else if (!strcmp(property, "stop-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stop_opacity);
@@ -2402,123 +2394,6 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
         sb_free(&text);
     }
     return JS_NewString(ctx, out);
-}
-/* Private samples live in the animation cascade origin, never inline style.
-   The numeric/color subset renders through the existing native CSS engine. */
-static bool animated_property(const char *p) {
-    static const char *const names[] = {"top", "right", "bottom", "left", "width", "height",
-        "min-width", "max-width", "min-height", "max-height", "opacity", "color", "background-color",
-        "border-radius", "font-size", "letter-spacing", "word-spacing",
-        "margin-top", "margin-right", "margin-bottom", "margin-left",
-        "padding-top", "padding-right", "padding-bottom", "padding-left",
-        "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
-        "border-top-color", "border-right-color", "border-bottom-color", "border-left-color"};
-    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(p, names[i])) return true;
-    return false;
-}
-static JSValue animation_dom(struct web_js_state *s, node_t *n, bool read, int argc, JSValueConst *argv) {
-    JSContext *ctx = s->ctx;
-    if (!n || n->type != N_ELEM || argc < (read ? 4 : 5)) return JS_ThrowTypeError(ctx, "Animation Element receiver required");
-    const char *pseudo = JS_ToCString(ctx, argv[2]);
-    if (!pseudo) return JS_EXCEPTION;
-    int pe = !*pseudo ? PE_NONE : !strcmp(pseudo, "::before") ? PE_BEFORE : !strcmp(pseudo, "::after") ? PE_AFTER : -1;
-    JS_FreeCString(ctx, pseudo);
-    if (pe < 0) return JS_ThrowSyntaxError(ctx, "Unsupported animation pseudo-element");
-    if (read) {
-        /* Detached nodes may retain an old smem pointer after a cascade. Do
-           not dereference it; reconnection will produce fresh style values. */
-        if (!connected(s, n)) return JS_NewString(ctx, "");
-        const char *p = JS_ToCString(ctx, argv[3]);
-        if (!p) return JS_EXCEPTION;
-        if (s->doc->resources_dirty) doc_rescan(s->doc);
-        flush_layout(s);
-        style_t *st = n->animation_base_style ? n->animation_base_style : n->style;
-        if (st && pe == PE_BEFORE) st = st->before;
-        else if (st && pe == PE_AFTER) st = st->after;
-        char out[128] = "";
-        if (st) {
-            const len_t *length = NULL; float px = 0; bool numeric = false, is_color = false;
-            uint32_t color = 0;
-            if (!strcmp(p, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
-            else if (!strcmp(p,"transform")||!strcmp(p,"translate")) {
-                JSValue result=computed_translation(ctx,s->doc,st,geometry_principal_box(n),!strcmp(p,"translate"));
-                JS_FreeCString(ctx,p);return result;
-            }
-            else if (!strcmp(p, "color")) { color = st->color; is_color = true; }
-            else if (!strcmp(p, "background-color")) { color = st->bg_color; is_color = true; }
-            else if (!strcmp(p, "border-radius")) { px = st->border_radius; numeric = true; }
-            else if (!strcmp(p, "font-size")) { px = st->font_size; numeric = true; }
-            else if (!strcmp(p, "letter-spacing")) { px = st->letter_spacing; numeric = true; }
-            else if (!strcmp(p, "word-spacing")) { px = st->word_spacing; numeric = true; }
-            else if (!strcmp(p, "width")) length = &st->width;
-            else if (!strcmp(p, "height")) length = &st->height;
-            else if (!strcmp(p, "min-width")) length = &st->min_width;
-            else if (!strcmp(p, "max-width")) length = &st->max_width;
-            else if (!strcmp(p, "min-height")) length = &st->min_height;
-            else if (!strcmp(p, "max-height")) length = &st->max_height;
-            else {
-                static const char *const sides[] = {"top", "right", "bottom", "left"};
-                for (int i = 0; i < 4; i++) {
-                    char key[32];
-                    if (!strcmp(p, sides[i])) length = &st->inset[i];
-                    snprintf(key, sizeof key, "margin-%s", sides[i]); if (!strcmp(p, key)) length = &st->margin[i];
-                    snprintf(key, sizeof key, "padding-%s", sides[i]); if (!strcmp(p, key)) length = &st->padding[i];
-                    snprintf(key, sizeof key, "border-%s-width", sides[i]); if (!strcmp(p, key)) { px = st->border_width[i]; numeric = true; }
-                    snprintf(key, sizeof key, "border-%s-color", sides[i]); if (!strcmp(p, key)) { color = st->border_color[i]; is_color = true; }
-                }
-            }
-            if (length) {
-                if (length->kind == LK_AUTO || length->kind == LK_NONE || length->kind == LK_NORMAL)
-                    snprintf(out, sizeof out, "%s", length->kind == LK_AUTO ? "auto" : length->kind == LK_NONE ? "none" : "normal");
-                else {
-                    /* Resolve from the underlying declaration, not animated box
-                       geometry: omitted keyframes cannot feed samples back. */
-                    node_t *parent = pe ? n : doc_flat_parent(n);
-                    float base = parent && parent->box ? (strstr(p, "height") || !strcmp(p,"top") || !strcmp(p,"bottom") ? parent->box->h : parent->box->w) : 0;
-                    px = len_resolve(length, base); numeric = true;
-                }
-            }
-            if (is_color) computed_color_text(out,sizeof out,color);
-            if (numeric) snprintf(out, sizeof out, "%gpx", (double)px);
-        }
-        JS_FreeCString(ctx, p); return JS_NewString(ctx, out);
-    }
-    uint32_t id;
-    if (JS_ToUint32(ctx, &id, argv[3]) < 0) return JS_EXCEPTION;
-    if (!id) return JS_ThrowRangeError(ctx, "Invalid animation id");
-    sbuf text = {0}; JSValue result = JS_UNDEFINED;
-    if (!JS_IsNull(argv[4])) {
-        JSValue length = JS_GetPropertyStr(ctx, argv[4], "length"); uint32_t count = 0;
-        int converted = JS_ToUint32(ctx, &count, length); JS_FreeValue(ctx, length);
-        if (converted < 0) return JS_EXCEPTION;
-        if (count % 2) return JS_ThrowRangeError(ctx, "Animation sample requires property/value pairs");
-        for (uint32_t i = 0; i < count; i += 2) {
-            JSValue key = JS_GetPropertyUint32(ctx, argv[4], i), val = JS_GetPropertyUint32(ctx, argv[4], i + 1);
-            size_t kn = 0, vn = 0;
-            const char *k = JS_ToCStringLen(ctx, &kn, key), *v = JS_ToCStringLen(ctx, &vn, val);
-            JS_FreeValue(ctx, key); JS_FreeValue(ctx, val);
-            if (!k || !v) result = JS_EXCEPTION;
-            else if (strlen(k) != kn || strlen(v) != vn || strpbrk(v, ";{}!\r\n"))
-                result = JS_ThrowRangeError(ctx, "Invalid animation property value");
-            else if (animated_property(k)) {
-                if (kn > SIZE_MAX - 3 || vn > SIZE_MAX - 3 - kn || text.n > SIZE_MAX - 3 - kn - vn)
-                    result = JS_ThrowRangeError(ctx, "Animation sample size is not representable");
-                else { sb_puts(&text, k); sb_putc(&text, ':'); sb_puts(&text, v); sb_putc(&text, ';'); }
-            }
-            JS_FreeCString(ctx, k); JS_FreeCString(ctx, v);
-            if (JS_IsException(result)) break;
-        }
-    }
-    if (!JS_IsException(result)) {
-        int changed = css_animation_set(n, (uint8_t)pe, id, text.n ? sb_cstr(&text) : NULL);
-        if (changed == -1) result = oom(ctx);
-        else if (changed) {
-            web_doc *d = n->owner ? n->owner : s->doc;
-            css_mark_dirty(d, n);
-            d->dirty = true;
-        }
-    }
-    sb_free(&text); return result;
 }
 /* Private CE hooks retain native wrapper identity. They only enqueue reactions;
    JavaScript's CEReactions scope invokes callbacks after the DOM operation. */
@@ -3200,10 +3075,6 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if(doc_node_replace_all_validity(n,child))result=JS_ThrowTypeError(ctx,"Invalid native replace-all");
         else if(!inserted_roots_capture(s,child,&inserted))result=JS_EXCEPTION;
         else result=doc_node_replace_all(d,n,child)?JS_UNDEFINED:oom(ctx);
-    } break;
-    case DOM_animationStyle: case DOM_animationComputed: {
-        result = animation_dom(s, n, opcode == DOM_animationComputed, argc, argv);
-
     } break;
     case DOM_cssom: {
         result=cssom_dom(s,n,argc,argv);

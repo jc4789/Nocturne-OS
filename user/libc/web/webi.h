@@ -182,8 +182,9 @@ typedef struct node {
     struct node *query_inline_container, *query_size_container;
     struct css_scope *style_scope; /* root-only, borrowed from current immutable rule index */
     struct style *animation_base_style; /* cascade without this node's effects */
-    struct css_animation *animations; /* bounded malloc storage, not DOM attributes */
-    struct css_motion_state *css_motion; /* document-owned native CSS playback, not a style-arena borrow */
+    struct style *animation_after_style; /* CSS Transitions: the after-change style its children inherit from */
+    struct web_effect *effects;          /* the animation effects targeting it (animation.c) */
+    struct web_animation *owned;         /* the CSS animations and transitions it owns (animation.c) */
     struct box *box;          /* the element's first box */
     struct box *anchor_block; /* inline elements: the block holding its first line */
     bool box_regen; /* its own box must be generated again (restyle or box-only HTML semantics) */
@@ -427,12 +428,16 @@ enum { CM_BEZIER, CM_LINEAR, CM_STEPS };
 enum { CM_STEP_END, CM_STEP_START, CM_STEP_JUMP_START, CM_STEP_JUMP_BOTH, CM_STEP_JUMP_NONE };
 enum { CM_CURVE, CM_EASE, CM_EASE_IN, CM_EASE_OUT, CM_EASE_IN_OUT };
 struct css_easing { float x1, y1, x2, y2; uint32_t steps; uint8_t kind, position, keyword; };
-struct css_motion {
-    const char *name; /* NULL = none; one animation, never an accepted comma-list */
-    float duration, delay, iterations; /* milliseconds; infinity allowed only for iterations */
-    struct css_easing easing;
-    uint8_t direction, fill, paused;
-};
+enum { CM_COMPOSITE_REPLACE, CM_COMPOSITE_ADD, CM_COMPOSITE_ACCUMULATE };
+/* The animation-* and transition-* lists (CSS Animations 1 §3, CSS Animations 2 §4,
+   CSS Transitions 1 §2, CSS Transitions 2 §2): one comma-separated list per longhand,
+   NULL being the property's initial single value. Times are milliseconds; a NAN duration
+   is auto; a NULL name is none; a transition property keeps its identifier as written. */
+union css_motion_item { float f; uint8_t k; const char *s; struct css_easing e; };
+struct css_motion_list { uint32_t count; union css_motion_item v[]; };
+enum { ML_NAME, ML_DURATION, ML_DELAY, ML_EASING, ML_ITERATIONS, ML_DIRECTION, ML_FILL, ML_PLAY, ML_COMPOSITION,
+       ML_TPROPERTY, ML_TDURATION, ML_TDELAY, ML_TEASING, ML_TBEHAVIOR, ML_COUNT };
+struct css_motion { const struct css_motion_list *list[ML_COUNT]; };
 /* One computed transform function. Translation percentages retain the
  * element's border-box reference; every other function is size independent.
  * 3D functions keep their parameters and are flattened orthographically
@@ -501,7 +506,8 @@ typedef struct style {
     struct css_translate translate;
     const struct css_transform *rotate, *scale; /* individual properties; NULL = none */
     len_t transform_origin[2];
-    struct css_motion motion; /* native opacity animation subset; not inherited */
+    struct css_motion motion; /* animation-* and transition-*; not inherited */
+    bool animated; /* the cascade applied animation or transition values to this style */
     int z_index, order;
     const char *content; /* ::before / ::after text, NULL = none */
     const char *list_style_string;
@@ -610,16 +616,20 @@ void css_styles_release(web_doc *d);
 bool css_restyled(const node_t *n);
 bool css_style_layout_equal(const style_t *a, const style_t *b);
 const struct custom_prop *css_custom_property(const style_t *s, const char *name); /* computed --name, or NULL */
-int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text);
-void css_animation_free(node_t *n);
-void css_motion_tick(web_doc *d, uint64_t now);
 void css_box_change_report(web_doc *d); /* debug_js only */
-int64_t css_motion_deadline(web_doc *d); /* absolute uptime_ms(), as web_deadline */
-void css_motion_doc_free(web_doc *d);
+/* An animation sample changes the element's own values only: restyle it, not what selectors match. */
+void css_mark_style_own(web_doc *d, node_t *n);
+/* v with var() and env() substituted against st's custom properties; false: invalid at computed-value time */
+bool css_substitute(const style_t *st, const char *v, sbuf *out);
 bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* css-easing-1 §2: the output progress for input x; before: the before flag of step easing */
 double css_easing_apply(const struct css_easing *e, double x, bool before);
 bool css_easing_serialize(const struct css_easing *e, sbuf *out);
+/* list's item i, the list repeating (CSS Animations 1 §3: excess values are not used, missing ones
+   repeat the list); the initial value when the list is NULL */
+union css_motion_item css_motion_item(const style_t *st, int list, uint32_t i);
+uint32_t css_motion_count(const style_t *st, int list); /* 1 for an initial (NULL) list */
+bool css_motion_equal(const struct css_motion *a, const struct css_motion *b);
 /* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
 bool css_media_evaluate(const char *query, int vw, int vh, bool scripting, char *out, size_t cap);
 void css_styling_free(struct styling *st);
@@ -679,6 +689,35 @@ bool css_anim_discrete_second(const struct propdef *p, const style_t *a, const s
 /* value added (or accumulated) onto underlying; false: the type is not additive (value replaces) */
 bool css_anim_compose(const struct css_anim_ctx *c, const struct propdef *p, const style_t *underlying,
                       const style_t *value, bool accumulate, sbuf *out);
+const struct propdef *css_prop_at(int index);
+/* animation.c, the one time model (animation.h), as the cascade sees it. A site is one element or
+   one of its pseudo-elements in one cascade. */
+struct web_effect; struct web_animation; struct web_animations; struct web_keyframe;
+struct web_motion_site {
+    struct css_anim_ctx ctx;  /* .base: the site's style without effects */
+    uint8_t pseudo;
+    /* the keyframes of the @keyframes rule called name for this site, in ctx.a (easing: the
+       keyframes' default); NULL: there is no such rule */
+    const struct web_keyframe *(*keyframes)(void *arg, const char *name, const struct css_easing *easing, uint32_t *count);
+    void (*emit)(void *arg, const struct propdef *p, const char *value); /* one longhand's sampled value */
+    void *arg;
+};
+/* 1: animations may apply or update (animation-name, owned CSS animations, script effects);
+   2: transitions may (transition durations, owned transitions). base NULL: the records only. */
+int web_motion_wanted(const node_t *n, uint8_t pseudo, const style_t *base);
+void web_motion_animations(struct web_motion_site *site);      /* CSS Animations 2 §3 */
+/* the effect stack into the animation origin (transitions false) or the transition origin;
+   animated: css_prop_count() flags, set by the first, skipped by the second */
+size_t web_motion_sample(struct web_motion_site *site, bool transitions, uint8_t *animated);
+void web_motion_transitions(struct web_motion_site *site, const style_t *before, const style_t *after, const uint8_t *animated);
+void web_motion_cancel(node_t *n, int pseudo);                  /* style canceled them; pseudo -1: all */
+void web_animations_cascading(web_doc *d, bool on);
+void web_animations_tick(web_doc *d, uint64_t now);
+int64_t web_animations_deadline(web_doc *d);                   /* absolute uptime_ms(), as web_deadline */
+void web_animations_doc_free(web_doc *d);
+void web_animations_node_free(node_t *n);
+void web_animations_set_origin(web_doc *d, uint64_t origin);   /* the time origin of performance.now() */
+bool web_animations_script_work(web_doc *d);                   /* events or promises for the script facade */
 /* the values a declaration is resolved against */
 struct cx {
     style_t *s;
@@ -1027,8 +1066,7 @@ struct web_profile {
 struct web_doc {
     uint64_t paint_bounds_generation;
     bool paint_effect_failure_reported;
-    struct css_motion_state *css_motions;
-    uint64_t css_motion_now; /* supervisor snapshot; immutable during AP cascade */
+    struct web_animations *animations; /* animation.c: timelines, animations, effects, events */
     web_doc *frame_parent;
     uint32_t sandbox_flags; /* immutable active document restrictions */
     uint64_t sandbox_activation_until; /* only native trusted input writes this */

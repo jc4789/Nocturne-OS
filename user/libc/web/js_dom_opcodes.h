@@ -1,8 +1,6 @@
 /* Native DOM opcodes. The bootstrap calls each magic-bound function directly. */
 enum js_dom_opcode {
     DOM_adopt,
-    DOM_animationComputed,
-    DOM_animationStyle,
     DOM_attr,
     DOM_attrCreate,
     DOM_attrList,
@@ -75,8 +73,6 @@ enum js_dom_opcode {
 };
 static const char *const dom_opcode_names[DOM_OPCODE_COUNT]={
     "adopt",
-    "animationComputed",
-    "animationStyle",
     "attr",
     "attrCreate",
     "attrList",

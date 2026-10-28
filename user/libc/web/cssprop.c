@@ -1252,7 +1252,7 @@ bool css_radius_specified(const char *property,const char *value,size_t size,sbu
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
-       PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING, PT_TRANSFORM, PT_TRANSLATE,
+       PT_MOTION_LIST, PT_TRANSFORM, PT_TRANSLATE,
        PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_CLIP_PATH, PT_CLIP };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
@@ -1260,7 +1260,7 @@ enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORD
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
-       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_OUTLINE };
+       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_TRANSITION, SH_OUTLINE };
 
 struct propdef {
     const char *name;
@@ -1283,6 +1283,9 @@ static const struct kw kw_motion_direction[] = {{"normal",CM_NORMAL},{"reverse",
 static const struct kw kw_motion_fill[] = {{"none",CM_FILL_NONE},{"forwards",CM_FILL_FORWARDS},
     {"backwards",CM_FILL_BACKWARDS},{"both",CM_FILL_BOTH},{0}};
 static const struct kw kw_motion_play[] = {{"running",0},{"paused",1},{0}};
+static const struct kw kw_motion_composition[] = {{"replace",CM_COMPOSITE_REPLACE},{"add",CM_COMPOSITE_ADD},
+    {"accumulate",CM_COMPOSITE_ACCUMULATE},{0}};
+static const struct kw kw_transition_behavior[] = {{"normal",0},{"allow-discrete",1},{0}};
 static const struct kw kw_float[] = {{"none", FL_NONE}, {"left", FL_LEFT}, {"right", FL_RIGHT},
                                      {"inline-start", FL_LEFT}, {"inline-end", FL_RIGHT}, {0}};
 static const struct kw kw_clear[] = {{"none", CL_NONE}, {"left", CL_LEFT}, {"right", CL_RIGHT}, {"both", CL_BOTH},
@@ -1371,14 +1374,22 @@ static struct propdef props[] = {
     {"-webkit-box-orient", PT_KW, 0, false, O(box_orient), kw_box_orient, 0, AN_TYPE},
     {"-webkit-line-clamp", PT_LINE_CLAMP, 0, false, O(line_clamp), NULL, 0, AN_TYPE},
     SH("animation", SH_ANIMATION),
-    {"animation-name",PT_MOTION_NAME,0,false,O(motion.name),NULL,0, AN_TYPE},
-    {"animation-duration",PT_MOTION_TIME,0,false,O(motion.duration),NULL,0, AN_TYPE},
-    {"animation-delay",PT_MOTION_TIME,LF_NEG,false,O(motion.delay),NULL,0, AN_TYPE},
-    {"animation-timing-function",PT_MOTION_EASING,0,false,O(motion.easing),NULL,0, AN_TYPE},
-    {"animation-iteration-count",PT_MOTION_ITERATIONS,0,false,O(motion.iterations),NULL,0, AN_TYPE},
-    {"animation-direction",PT_KW,0,false,O(motion.direction),kw_motion_direction,0,AN_NONE},
-    {"animation-fill-mode",PT_KW,0,false,O(motion.fill),kw_motion_fill,0,AN_NONE},
-    {"animation-play-state",PT_KW,0,false,O(motion.paused),kw_motion_play,0,AN_NONE},
+    /* flags: which ML_* list a motion longhand is */
+    {"animation-name",PT_MOTION_LIST,ML_NAME,false,O(motion.list[ML_NAME]),NULL,0,AN_NONE},
+    {"animation-duration",PT_MOTION_LIST,ML_DURATION,false,O(motion.list[ML_DURATION]),NULL,0,AN_NONE},
+    {"animation-delay",PT_MOTION_LIST,ML_DELAY,false,O(motion.list[ML_DELAY]),NULL,0,AN_NONE},
+    {"animation-timing-function",PT_MOTION_LIST,ML_EASING,false,O(motion.list[ML_EASING]),NULL,0,AN_NONE},
+    {"animation-iteration-count",PT_MOTION_LIST,ML_ITERATIONS,false,O(motion.list[ML_ITERATIONS]),NULL,0,AN_NONE},
+    {"animation-direction",PT_MOTION_LIST,ML_DIRECTION,false,O(motion.list[ML_DIRECTION]),kw_motion_direction,0,AN_NONE},
+    {"animation-fill-mode",PT_MOTION_LIST,ML_FILL,false,O(motion.list[ML_FILL]),kw_motion_fill,0,AN_NONE},
+    {"animation-play-state",PT_MOTION_LIST,ML_PLAY,false,O(motion.list[ML_PLAY]),kw_motion_play,0,AN_NONE},
+    {"animation-composition",PT_MOTION_LIST,ML_COMPOSITION,false,O(motion.list[ML_COMPOSITION]),kw_motion_composition,0,AN_NONE},
+    SH("transition", SH_TRANSITION),
+    {"transition-property",PT_MOTION_LIST,ML_TPROPERTY,false,O(motion.list[ML_TPROPERTY]),NULL,0,AN_NONE},
+    {"transition-duration",PT_MOTION_LIST,ML_TDURATION,false,O(motion.list[ML_TDURATION]),NULL,0,AN_NONE},
+    {"transition-delay",PT_MOTION_LIST,ML_TDELAY,false,O(motion.list[ML_TDELAY]),NULL,0,AN_NONE},
+    {"transition-timing-function",PT_MOTION_LIST,ML_TEASING,false,O(motion.list[ML_TEASING]),NULL,0,AN_NONE},
+    {"transition-behavior",PT_MOTION_LIST,ML_TBEHAVIOR,false,O(motion.list[ML_TBEHAVIOR]),kw_transition_behavior,0,AN_NONE},
     {"align-content", PT_KW, 0, false, O(align_content), kw_acontent, 0, AN_TYPE},
     {"align-items", PT_KW, 0, false, O(align_items), kw_align, 0, AN_TYPE},
     {"align-self", PT_KW, 0, false, O(align_self), kw_align, 0, AN_TYPE},
@@ -1611,8 +1622,6 @@ static void init_initial(void) {
     s->flex_shrink = 1;
     s->align_content = AC_NORMAL;
     s->opacity = 1;
-    s->motion.iterations = 1;
-    s->motion.easing = (struct css_easing){.x1=.25f,.y1=.1f,.x2=.25f,.y2=1,.kind=CM_BEZIER,.keyword=CM_EASE};
     s->object_pos[0].kind=s->object_pos[1].kind=LK_LEN;
     s->object_pos[0].pct=s->object_pos[1].pct=50;
     s->transform_origin[0].kind=s->transform_origin[1].kind=LK_LEN;
@@ -1669,11 +1678,12 @@ const char *css_prop_name(int index,bool *longhand) {
     return props[index].name;
 }
 int css_prop_index(const struct propdef *p) { return (int)(p - props); }
+const struct propdef *css_prop_at(int index) { return index >= 0 && index < NPROPS ? &props[index] : NULL; }
 bool css_prop_is_font(const struct propdef *p) {
     return (p->type == PT_FONT_SIZE) || (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_ALL));
 }
 bool css_prop_is_motion(const struct propdef *p) {
-    return p && (!strcmp(p->name,"animation") || !strncmp(p->name,"animation-",10));
+    return p && (p->type == PT_MOTION_LIST || (p->type == PT_SHORT && (p->sh == SH_ANIMATION || p->sh == SH_TRANSITION)));
 }
 bool css_prop_inherited(const struct propdef *p) { return p && p->inherited; }
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32_t *color, web_doc *d) {
@@ -1708,6 +1718,7 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, uint32
         *color = c == COLOR_CURRENT ? st->color : c;
         return 2;
     }
+    case PT_MOTION_LIST: return css_computed_value(st, p, out, d) ? 1 : -1;
     }
     return 0;
 }
@@ -2609,8 +2620,7 @@ static bool is_custom_ident(const char *s, size_t n) {
     return !ident_is(s, n, "auto") && !ident_is(s, n, "span");
 }
 
-/* Deliberately one CSS animation, with an opacity interpolation backend.
-   Lists/steps()/timelines/composition are not accepted as fake support. */
+/* animation-name and transition-property identifiers: <custom-ident> */
 static bool motion_name(const char *s, size_t n) {
     if (!n || ident_is(s,n,"initial") || ident_is(s,n,"inherit") || ident_is(s,n,"unset") ||
         ident_is(s,n,"revert") || ident_is(s,n,"revert-layer") || ident_is(s,n,"default") ||
@@ -2716,35 +2726,204 @@ bool css_easing_serialize(const struct css_easing *e,sbuf *out) {
     else snprintf(text,sizeof text,"cubic-bezier(%.7g, %.7g, %.7g, %.7g)",(double)e->x1,(double)e->y1,(double)e->x2,(double)e->y2);
     sb_puts(out,text);return true;
 }
-static bool motion_shorthand(const char *s,size_t n,struct cx *cx,struct css_motion *out) {
-    const char *t[10];size_t tl[10];int k=split(s,n,t,tl,10,' ');
-    if(!k || t[k-1]+tl[k-1]!=s+n)return false;
-    struct css_motion v=initial.motion;
-    unsigned seen=0,times=0;
-    for(int i=0;i<k;i++) {
-        float f;uint8_t kw;struct css_easing ease;
-        if(motion_time(t[i],tl[i],&f)) {
-            if(times==0){if(f<0)return false;v.duration=f;}
-            else if(times==1)v.delay=f;else return false;
-            times++;continue;
+static union css_motion_item motion_initial(int list) {
+    union css_motion_item v;
+    memset(&v, 0, sizeof v);
+    if (list == ML_EASING || list == ML_TEASING) v.e = (struct css_easing){.x1=.25f,.y1=.1f,.x2=.25f,.y2=1,.kind=CM_BEZIER,.keyword=CM_EASE};
+    else if (list == ML_ITERATIONS) v.f = 1;
+    else if (list == ML_TPROPERTY) v.s = "all";
+    return v;
+}
+union css_motion_item css_motion_item(const style_t *st, int list, uint32_t i) {
+    const struct css_motion_list *l = st->motion.list[list];
+    return l && l->count ? l->v[i % l->count] : motion_initial(list);
+}
+uint32_t css_motion_count(const style_t *st, int list) {
+    const struct css_motion_list *l = st->motion.list[list];
+    return l && l->count ? l->count : 1;
+}
+static bool motion_item_equal(int list, union css_motion_item a, union css_motion_item b) {
+    switch (list) {
+    case ML_NAME: case ML_TPROPERTY: return a.s == b.s || (a.s && b.s && !strcmp(a.s, b.s));
+    case ML_EASING: case ML_TEASING:
+        return a.e.kind == b.e.kind && a.e.x1 == b.e.x1 && a.e.y1 == b.e.y1 && a.e.x2 == b.e.x2 && a.e.y2 == b.e.y2 &&
+            a.e.steps == b.e.steps && a.e.position == b.e.position && a.e.keyword == b.e.keyword;
+    case ML_DURATION: case ML_DELAY: case ML_ITERATIONS: case ML_TDURATION: case ML_TDELAY:
+        return a.f == b.f || (isnan(a.f) && isnan(b.f));
+    }
+    return a.k == b.k;
+}
+bool css_motion_equal(const struct css_motion *a, const struct css_motion *b) {
+    style_t x, y;
+    x.motion = *a; y.motion = *b;
+    for (int list = 0; list < ML_COUNT; list++) {
+        if (a->list[list] == b->list[list]) continue;
+        uint32_t count = css_motion_count(&x, list);
+        if (count != css_motion_count(&y, list)) return false;
+        for (uint32_t i = 0; i < count; i++)
+            if (!motion_item_equal(list, css_motion_item(&x, list, i), css_motion_item(&y, list, i))) return false;
+    }
+    return true;
+}
+/* one item of an animation-* or transition-* list */
+static bool motion_item_parse(int list, const struct kw *kws, const char *s, size_t n, struct cx *cx, union css_motion_item *out) {
+    trim(&s, &n);
+    if (!n) return false;
+    *out = motion_initial(list);
+    uint8_t k;
+    const char *q = s;
+    switch (list) {
+    case ML_NAME:
+        if (ident_is(s, n, "none")) { out->s = NULL; return true; }
+        if (n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n - 1] == s[0]) {
+            sbuf b = {0}; css_unescape(&b, s + 1, n - 2);
+            out->s = ar_strdup(cx->a, b.n ? sb_cstr(&b) : ""); sb_free(&b);
+            return true;
         }
-        if(!(seen&1) && css_easing_parse(t[i],tl[i],&ease)){v.easing=ease;seen|=1;continue;}
-        if(!(seen&2) && kw_find(kw_motion_direction,t[i],tl[i],&kw)){v.direction=kw;seen|=2;continue;}
-        if(!(seen&4) && kw_find(kw_motion_fill,t[i],tl[i],&kw)){v.fill=kw;seen|=4;continue;}
-        if(!(seen&8) && kw_find(kw_motion_play,t[i],tl[i],&kw)){v.paused=kw;seen|=8;continue;}
-        const char *p=t[i];
-        if(!(seen&16) && (ident_is(t[i],tl[i],"infinite") ||
-            (parse_number(&p,t[i]+tl[i],&f) && p==t[i]+tl[i] && isfinite(f) && f>=0))) {
-            v.iterations=ident_is(t[i],tl[i],"infinite")?INFINITY:f;seen|=16;continue;
+        if (!motion_name(s, n)) return false;
+        out->s = ar_strndup(cx->a, s, n);
+        return true;
+    case ML_DURATION:
+        if (ident_is(s, n, "auto")) { out->f = NAN; return true; }
+        return motion_time(s, n, &out->f) && out->f >= 0;
+    case ML_TDURATION: return motion_time(s, n, &out->f) && out->f >= 0;
+    case ML_DELAY: case ML_TDELAY: return motion_time(s, n, &out->f);
+    case ML_EASING: case ML_TEASING: return css_easing_parse(s, n, &out->e);
+    case ML_ITERATIONS:
+        if (ident_is(s, n, "infinite")) { out->f = INFINITY; return true; }
+        return parse_number(&q, s + n, &out->f) && q == s + n && isfinite(out->f) && out->f >= 0;
+    case ML_TPROPERTY: {
+        if (ident_is(s, n, "all")) { out->s = "all"; return true; }
+        if (ident_is(s, n, "none") || !motion_name(s, n)) return false;
+        /* a supported property keeps its lowercase name; any other identifier is kept as written */
+        const struct propdef *p = n > 2 && s[0] == '-' && s[1] == '-' ? NULL : css_prop_lookup(s, n);
+        char *copy = ar_strndup(cx->a, s, n);
+        if (p) for (size_t i = 0; i < n; i++) copy[i] = (char)lower((unsigned char)copy[i]);
+        out->s = copy;
+        return true;
+    }
+    }
+    if (!kw_find(kws, s, n, &k)) return false;
+    out->k = k;
+    return true;
+}
+/* the top-level comma-separated items of v: their count, and the first max of them */
+static size_t motion_items(const char *v, size_t n, const char **items, size_t *lengths, size_t max) {
+    size_t count = 0, start = 0;
+    int depth = 0; char quote = 0;
+    for (size_t i = 0; i <= n; i++) {
+        char c = i < n ? v[i] : ',';
+        if (quote) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') depth++;
+        else if (c == ')') depth--;
+        else if (c == ',' && depth <= 0) {
+            if (count < max) { items[count] = v + start; lengths[count] = i - start; }
+            count++; start = i + 1;
         }
-        if(!(seen&32) && (ident_is(t[i],tl[i],"none") || motion_name(t[i],tl[i]))) {
-            v.name=ident_is(t[i],tl[i],"none")?NULL:ar_strndup(cx->a,t[i],tl[i]);seen|=32;continue;
+    }
+    return count;
+}
+static struct css_motion_list *motion_list_new(struct cx *cx, size_t count) {
+    struct css_motion_list *l = ar_alloc(cx->a, sizeof *l + count * sizeof *l->v);
+    l->count = (uint32_t)count;
+    return l;
+}
+static bool parse_motion_list(const struct propdef *p, const char *v, size_t n, struct cx *cx, const struct css_motion_list **out) {
+    size_t count = motion_items(v, n, NULL, NULL, 0);
+    if (!count || count > 1u << 20) return false;
+    const char **items = ar_alloc(cx->a, count * sizeof *items);
+    size_t *lengths = ar_alloc(cx->a, count * sizeof *lengths);
+    motion_items(v, n, items, lengths, count);
+    struct css_motion_list *l = motion_list_new(cx, count);
+    for (size_t i = 0; i < count; i++) {
+        const char *s = items[i]; size_t len = lengths[i];
+        trim(&s, &len);
+        /* transition-property: none stands alone */
+        if (p->flags == ML_TPROPERTY && ident_is(s, len, "none")) {
+            if (count != 1) return false;
+            l->v[0].s = NULL;
+            continue;
         }
+        if (!motion_item_parse(p->flags, p->kws, s, len, cx, &l->v[i])) return false;
+    }
+    *out = l;
+    return true;
+}
+/* <single-animation> (CSS Animations 1 §3.11): the first <time> is the duration, the second the
+   delay; a keyword another longhand takes is that longhand's before it can be a name */
+static bool animation_single(const char *s, size_t n, struct cx *cx, union css_motion_item *v) {
+    const char *t[10]; size_t tl[10];
+    int k = split(s, n, t, tl, 10, ' ');
+    if (!k || k > 8) return false;
+    for (int list = ML_NAME; list <= ML_PLAY; list++) v[list] = motion_initial(list);
+    unsigned seen = 0, times = 0;
+    for (int i = 0; i < k; i++) {
+        union css_motion_item item;
+        if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
+            if (times == 0) { if (item.f < 0) return false; v[ML_DURATION] = item; }
+            else if (times == 1) v[ML_DELAY] = item;
+            else return false;
+            times++; continue;
+        }
+        if (!(seen & 1) && motion_item_parse(ML_EASING, NULL, t[i], tl[i], cx, &item)) { v[ML_EASING] = item; seen |= 1; continue; }
+        if (!(seen & 2) && motion_item_parse(ML_ITERATIONS, NULL, t[i], tl[i], cx, &item)) { v[ML_ITERATIONS] = item; seen |= 2; continue; }
+        if (!(seen & 4) && motion_item_parse(ML_DIRECTION, kw_motion_direction, t[i], tl[i], cx, &item)) { v[ML_DIRECTION] = item; seen |= 4; continue; }
+        if (!(seen & 8) && motion_item_parse(ML_FILL, kw_motion_fill, t[i], tl[i], cx, &item)) { v[ML_FILL] = item; seen |= 8; continue; }
+        if (!(seen & 16) && motion_item_parse(ML_PLAY, kw_motion_play, t[i], tl[i], cx, &item)) { v[ML_PLAY] = item; seen |= 16; continue; }
+        if (!(seen & 32) && motion_item_parse(ML_NAME, NULL, t[i], tl[i], cx, &item)) { v[ML_NAME] = item; seen |= 32; continue; }
         return false;
     }
-    *out=v;return true;
+    return true;
 }
-
+/* <single-transition> (CSS Transitions 1 §2.5, 2 §2): [none | <single-transition-property>] || <time> ||
+   <easing-function> || <time> || <transition-behavior-value> */
+static bool transition_single(const char *s, size_t n, struct cx *cx, union css_motion_item *v, bool *none) {
+    const char *t[8]; size_t tl[8];
+    int k = split(s, n, t, tl, 8, ' ');
+    if (!k || k > 5) return false;
+    for (int list = ML_TPROPERTY; list <= ML_TBEHAVIOR; list++) v[list] = motion_initial(list);
+    unsigned seen = 0, times = 0;
+    *none = false;
+    for (int i = 0; i < k; i++) {
+        union css_motion_item item;
+        if (motion_item_parse(ML_TDELAY, NULL, t[i], tl[i], cx, &item)) {
+            if (times == 0) { if (item.f < 0) return false; v[ML_TDURATION] = item; }
+            else if (times == 1) v[ML_TDELAY] = item;
+            else return false;
+            times++; continue;
+        }
+        if (!(seen & 1) && motion_item_parse(ML_TEASING, NULL, t[i], tl[i], cx, &item)) { v[ML_TEASING] = item; seen |= 1; continue; }
+        if (!(seen & 2) && motion_item_parse(ML_TBEHAVIOR, kw_transition_behavior, t[i], tl[i], cx, &item)) { v[ML_TBEHAVIOR] = item; seen |= 2; continue; }
+        if (!(seen & 4) && ident_is(t[i], tl[i], "none")) { v[ML_TPROPERTY].s = NULL; *none = true; seen |= 4; continue; }
+        if (!(seen & 4) && motion_item_parse(ML_TPROPERTY, NULL, t[i], tl[i], cx, &item)) { v[ML_TPROPERTY] = item; seen |= 4; continue; }
+        return false;
+    }
+    return true;
+}
+/* the animation or transition shorthand: every longhand gets a list of the same length */
+static bool motion_shorthand(bool animation, const char *v, size_t n, struct cx *cx, struct css_motion *out) {
+    size_t count = motion_items(v, n, NULL, NULL, 0);
+    if (!count || count > 1u << 20) return false;
+    const char **items = ar_alloc(cx->a, count * sizeof *items);
+    size_t *lengths = ar_alloc(cx->a, count * sizeof *lengths);
+    motion_items(v, n, items, lengths, count);
+    int first = animation ? ML_NAME : ML_TPROPERTY, last = animation ? ML_PLAY : ML_TBEHAVIOR;
+    struct css_motion_list *lists[ML_COUNT] = {0};
+    for (int list = first; list <= last; list++) lists[list] = motion_list_new(cx, count);
+    for (size_t i = 0; i < count; i++) {
+        union css_motion_item item[ML_COUNT];
+        const char *s = items[i]; size_t len = lengths[i];
+        trim(&s, &len);
+        bool none = false;
+        if (!len || !(animation ? animation_single(s, len, cx, item) : transition_single(s, len, cx, item, &none))) return false;
+        if (none && count != 1) return false;
+        for (int list = first; list <= last; list++) lists[list]->v[i] = item[list];
+    }
+    memset(out, 0, sizeof *out);
+    for (int list = first; list <= last; list++) out->list[list] = lists[list];
+    return true;
+}
 static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g) {
     memset(g, 0, sizeof *g);
     if (ident_is(s, n, "auto")) return true;
@@ -2996,20 +3175,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     case PT_ROTATE:return parse_rotate_value(v,n,cx,&s->rotate);
     case PT_SCALE:return parse_scale_value(v,n,cx,&s->scale);
     case PT_TRANSFORM_ORIGIN:return parse_transform_origin(v,n,cx,s->transform_origin);
-    case PT_MOTION_NAME:
-        if(!ident_is(v,n,"none") && !motion_name(v,n))return false;
-        *(const char **)field=ident_is(v,n,"none")?NULL:ar_strndup(cx->a,v,n);return true;
-    case PT_MOTION_TIME: {
-        float value;if(!motion_time(v,n,&value) || (!(p->flags&LF_NEG) && value<0))return false;
-        *(float *)field=value;return true;
-    }
-    case PT_MOTION_ITERATIONS: {
-        float value;const char *q=v;
-        if(ident_is(v,n,"infinite"))value=INFINITY;
-        else if(!parse_number(&q,v+n,&value) || q!=v+n || !isfinite(value) || value<0)return false;
-        *(float *)field=value;return true;
-    }
-    case PT_MOTION_EASING: return css_easing_parse(v,n,(struct css_easing *)field);
+    case PT_MOTION_LIST: return parse_motion_list(p, v, n, cx, (const struct css_motion_list **)field);
     case PT_CONTAINER_NAMES:
         if (ident_is(v, n, "none")) { s->container_names = NULL; return true; }
         if (!css_container_names_valid(v,n)) return false;
@@ -3492,19 +3658,27 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
             strcmp(props[i].name,"unicode-bidi"))set_long(props[i].name,v,n,cx);
         return true;
     }
-    case SH_ANIMATION: {
-        static const char *const names[]={"animation-name","animation-duration","animation-delay",
-            "animation-timing-function","animation-iteration-count","animation-direction",
-            "animation-fill-mode","animation-play-state"};
-        if(global){for(unsigned i=0;i<8;i++)set_long(names[i],v,n,cx);return true;}
+    case SH_ANIMATION: case SH_TRANSITION: {
+        /* the longhands each shorthand sets; animation-composition is reset only */
+        static const char *const animation[] = {"animation-name", "animation-duration", "animation-delay",
+            "animation-timing-function", "animation-iteration-count", "animation-direction",
+            "animation-fill-mode", "animation-play-state", "animation-composition"};
+        static const char *const transition[] = {"transition-property", "transition-duration", "transition-delay",
+            "transition-timing-function", "transition-behavior"};
+        bool is_animation = p->sh == SH_ANIMATION;
+        const char *const *names = is_animation ? animation : transition;
+        unsigned count = is_animation ? 9 : 5;
+        if (global) { for (unsigned i = 0; i < count; i++) set_long(names[i], v, n, cx); return true; }
         struct css_motion motion;
-        if(!motion_shorthand(v,n,cx,&motion))return false;
+        if (!motion_shorthand(is_animation, v, n, cx, &motion)) return false;
         /* The shorthand resets all longhands, but cannot override a higher
            priority longhand already selected by this cascade. */
-        style_t temp=*cx->s;temp.motion=motion;
-        for(unsigned i=0;i<8;i++) {
-            const struct propdef *q=find_prop(names[i],strlen(names[i]));int at=css_prop_index(q);
-            if(!cx->set[at]){copy_prop(q,cx->s,&temp);cx->set[at]=1;}
+        style_t temp = *cx->s;
+        temp.motion = motion;
+        for (unsigned i = 0; i < count; i++) {
+            const struct propdef *q = find_prop(names[i], strlen(names[i]));
+            int at = css_prop_index(q);
+            if (!cx->set[at]) { copy_prop(q, cx->s, &temp); cx->set[at] = 1; }
         }
         return true;
     }
@@ -4074,8 +4248,7 @@ int css_prop_animation(const struct propdef *p) {
     case AN_DISPLAY: return CSS_ANIM_DISPLAY;
     }
     switch (p->type) {
-    case PT_MOTION_NAME: case PT_MOTION_TIME: case PT_MOTION_ITERATIONS: case PT_MOTION_EASING:
-    case PT_CONTAINER_NAMES: return CSS_ANIM_NONE;
+    case PT_MOTION_LIST: case PT_CONTAINER_NAMES: return CSS_ANIM_NONE;
     case PT_DISPLAY: return CSS_ANIM_DISPLAY;
     case PT_KW: case PT_OVERFLOW: case PT_FONT_FAMILY: case PT_CONTENT: case PT_LIST_TYPE: case PT_BG_IMAGE:
     case PT_TEXT_DECO: case PT_GTEMPLATE: case PT_GAREAS: case PT_GLINE: case PT_MASK_IMAGE: case PT_LINE_CLAMP:
@@ -4523,7 +4696,43 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         else ok = css_clip_path_serialize(st->clip_path, out, d);
         break;
     case PT_CLIP: ok = css_clip_rect_serialize(&st->clip, out); break;
-    case PT_MOTION_EASING: ok = css_easing_serialize((const struct css_easing *)field, out); break;
+    case PT_MOTION_LIST: {
+        int list = p->flags;
+        uint32_t count = css_motion_count(st, list);
+        for (uint32_t i = 0; i < count; i++) {
+            union css_motion_item item = css_motion_item(st, list, i);
+            if (i) sb_puts(out, ", ");
+            switch (list) {
+            case ML_NAME: case ML_TPROPERTY:
+                if (!item.s) sb_puts(out, "none");
+                else if (list == ML_TPROPERTY || (motion_name(item.s, strlen(item.s)) && !ident_is(item.s, strlen(item.s), "none")))
+                    sb_puts(out, item.s);
+                else {
+                    sb_putc(out, '"');
+                    for (const char *c = item.s; *c; c++) { if (*c == '"' || *c == '\\') sb_putc(out, '\\'); sb_putc(out, *c); }
+                    sb_putc(out, '"');
+                }
+                break;
+            case ML_DURATION: case ML_DELAY: case ML_TDURATION: case ML_TDELAY:
+                if (isnan(item.f)) sb_puts(out, "auto");
+                else anim_unit(out, item.f / 1000, "s");
+                break;
+            case ML_EASING: case ML_TEASING: css_easing_serialize(&item.e, out); break;
+            case ML_ITERATIONS:
+                if (isinf(item.f)) sb_puts(out, "infinite");
+                else anim_number(out, item.f);
+                break;
+            default: {
+                const struct kw *k = p->kws;
+                while (k && k->name && k->v != item.k) k++;
+                if (!k || !k->name) return false;
+                sb_puts(out, k->name);
+            }
+            }
+        }
+        break;
+    }
+
     default: return false;
     }
     if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
@@ -4587,8 +4796,9 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         sb_free(&x); sb_free(&y);
         return same;
     }
-    case PT_GTEMPLATE: case PT_GAREAS: case PT_MOTION_NAME:
+    case PT_GTEMPLATE: case PT_GAREAS:
         return *(const void *const *)fa == *(const void *const *)fb;
+    case PT_MOTION_LIST: return css_motion_equal(&a->motion, &b->motion);
     }
     return !memcmp(fa, fb, p->size);
 }

@@ -101,6 +101,23 @@ int main(void){
     EXPECT(computed("z-index","auto"),"auto");
     EXPECT(computed("line-height","1.5"),"1.5");
     EXPECT(computed("background-position","left 10px top 20%"),"10px 20%");
+    /* the animation-* and transition-* lists (css-animations/parsing, css-transitions/parsing) */
+    EXPECT(computed("animation-duration","1s, 200ms"),"1s, 0.2s");
+    EXPECT(computed("animation-duration","auto"),"auto");
+    EXPECT(computed("animation-iteration-count","infinite, 2.5"),"infinite, 2.5");
+    EXPECT(computed("animation-name","none, foo, \"bar baz\""),"none, foo, \"bar baz\"");
+    EXPECT(computed("animation-delay","-1s"),"-1s");
+    EXPECT(computed("animation-direction","alternate-reverse, normal"),"alternate-reverse, normal");
+    EXPECT(computed("animation-fill-mode","both"),"both");
+    EXPECT(computed("animation-play-state","paused, running"),"paused, running");
+    EXPECT(computed("animation-composition","add, accumulate"),"add, accumulate");
+    EXPECT(computed("animation-timing-function","ease, step-start, cubic-bezier(0.1, 0.2, 0.3, 0.4)"),"ease, steps(1, start), cubic-bezier(0.1, 0.2, 0.3, 0.4)");
+    EXPECT(computed("transition-property","opacity, WIDTH, --x, unknown-thing"),"opacity, width, --x, unknown-thing");
+    EXPECT(computed("transition-property","none"),"none");
+    EXPECT(computed("transition-property","all"),"all");
+    EXPECT(computed("transition-behavior","allow-discrete, normal"),"allow-discrete, normal");
+    EXPECT(computed("transition-duration","-1s"),"PARSE");
+    EXPECT(computed("transition-property","none, opacity"),"PARSE");
     /* a shorthand's longhands */
     uint8_t set[css_prop_count()];css_prop_longhands(css_prop_lookup("margin",6),set);
     int count=0;for(int i=0;i<css_prop_count();i++)count+=set[i];

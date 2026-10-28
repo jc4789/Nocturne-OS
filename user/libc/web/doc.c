@@ -1281,7 +1281,7 @@ void web_tick(web_doc *d, uint64_t now) {
     if(d->native_cancelled)return;
     TICK_STEP(d, TICK_MEDIA, web_avmedia_tick(d, now));
     if(d->native_cancelled)return;
-    TICK_STEP(d, TICK_MOTION, css_motion_tick(d,now));
+    TICK_STEP(d, TICK_MOTION, web_animations_tick(d,now));
     if(d->native_cancelled)return;
     TICK_STEP(d, TICK_MARQUEE, web_marquee_tick(d,now));
     if(d->native_cancelled)return;
@@ -1322,7 +1322,7 @@ int64_t web_deadline(web_doc *d) {
     const int64_t sources[DUE_SOURCES] = {-1, background,
         !d->initial_render_done && now < d->initial_render_deadline ? (int64_t)d->initial_render_deadline : -1,
         d->visibility_updates ? (int64_t)now : -1,
-        web_js_deadline(d), web_avmedia_deadline(d, now), css_motion_deadline(d), web_marquee_deadline(d),
+        web_js_deadline(d), web_avmedia_deadline(d, now), web_animations_deadline(d), web_marquee_deadline(d),
         web_frames_deadline(d)};
     int64_t deadline = -1; int from = DUE_NONE;
     for (int i = DUE_BACKGROUND; i < DUE_SOURCES; i++)
@@ -1419,7 +1419,7 @@ static void free_values(node_t *n) {
     css_node_style_free(n);
     cssom_style_free(n);
     web_paint_debug_node_free(n);
-    css_animation_free(n);
+    web_animations_node_free(n);
     web_canvas_free(n);
     web_input_files_release(n);
     web_face_release(n);
@@ -1479,7 +1479,7 @@ void web_free(web_doc *d) {
     web_frames_free(d);
     web_js_free(d);
     html_policy_free(d);
-    css_motion_doc_free(d);
+    web_animations_doc_free(d);
     pv_free(&d->marquees);
     while(d->fonts) {
         struct web_font_resource *f=d->fonts;d->fonts=f->next;
@@ -1504,7 +1504,7 @@ void web_free(web_doc *d) {
             css_node_style_free(n);
             cssom_style_free(n);
             web_paint_debug_node_free(n);
-            css_animation_free(n);
+            web_animations_node_free(n);
             web_canvas_free(n);
             web_input_files_release(n);
             web_face_release(n);

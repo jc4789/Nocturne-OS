@@ -1254,7 +1254,7 @@ static void adopt_subtree(web_doc *d, node_t *root) {
     doc_parser_form_set(n,NULL);n->owner = owner;
     html_bridge_native_changed(n, HTML_BRIDGE_FIELDS | HTML_BRIDGE_LINKS);
     for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = owner;
-    n->style = n->animation_base_style = NULL; n->box = n->anchor_block = NULL;
+    n->style = n->animation_base_style = n->animation_after_style = NULL; n->box = n->anchor_block = NULL;
     n->image = -1; n->image_request = -1; n->image_initialized = false;
     n->image_generation++;
     /* Adoption is an image-data mutation even without a later insertion or
