@@ -728,6 +728,37 @@ struct gap_decorations {
     uint32_t n;
     uint32_t gaps[2]; /* the gaps of each axis, the count the value lists assign to */
 };
+/* CSS Basic User Interface 4 (css-ui-4 §5, §6.2, §6.3): the pointer over the element and the
+   colours of its caret and of its controls' accents. All inherited; a style holds them as one group
+   (style_t's ui), NULL being the initial ones. light-dark() is resolved to one side by the element's
+   used color-scheme when the value is computed. */
+/* a <cursor-image>'s image (§5.1): url() (one choice, resolution 0), or a <url-set> (image-set() of
+   url()s or strings: each choice's resolution in dppx, 0 when it gives none, and its type() or NULL) */
+struct css_cursor_choice { const char *url, *type; float dppx; };
+struct css_cursor_image {
+    const struct css_cursor_choice *choices;
+    uint32_t count;
+    bool set;    /* written as image-set() */
+    bool hot;    /* <x> <y> given: the hot spot, in the image's pixels from its top left */
+    float x, y;
+};
+#define CSS_CURSOR_AUTO 0xFFu /* the shape auto: the user agent's choice by what is under the pointer */
+/* cursor: the images to try in order, then the shape (a native N_POINTER_* of abi.h, or auto) */
+struct css_cursor {
+    const struct css_cursor_image *images;
+    uint32_t count;
+    uint8_t shape;
+};
+/* auto | <color>: a computed colour held as a shadow's is (argb COLOR_CURRENT for currentcolor, exact
+   when 8 bits cannot hold it) */
+struct css_ui_color { uint32_t argb; const struct css_color_value *exact; bool automatic; };
+struct css_ui {
+    struct css_cursor cursor;
+    struct css_ui_color caret[2]; /* caret-color: the caret's, and the text's under a block caret */
+    struct css_ui_color accent;   /* accent-color */
+};
+extern const struct css_ui css_ui_initial;
+bool css_ui_equal(const struct css_ui *a, const struct css_ui *b); /* NULL: the initial values */
 /* A computed shape's geometry against its reference box r (x y w h, any one space). */
 void css_shape_ellipse(const struct css_shape *s, const float r[4], double centre[2], double radii[2]); /* circle(), ellipse() */
 /* inset(): the inner rectangle (x y w h) and its corner radii TL TR BR BL, scaled to fit (css-backgrounds-3 §5.5) */
@@ -1052,6 +1083,7 @@ typedef struct style {
     const struct css_anchor *anchor;           /* Anchor Positioning */
     const struct css_background *background;   /* the layered background lists */
     const struct css_border_image *border_image, *mask_border;
+    const struct css_ui *ui; /* cursor, caret-color, accent-color: inherited, the group a parent's style shares */
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -1124,6 +1156,12 @@ static inline const struct css_border_image *css_style_border_image(const style_
 static inline const struct css_border_image *css_style_mask_border(const style_t *s) {
     return s->mask_border ? s->mask_border : &css_mask_border_initial;
 }
+static inline const struct css_ui *css_style_ui(const style_t *s) {
+    return s->ui ? s->ui : &css_ui_initial;
+}
+/* the used colour of caret-color's caret (auto: currentcolor), and of accent-color (false: auto) */
+uint32_t css_ui_caret_color(const style_t *st);
+bool css_ui_accent_color(const style_t *st, uint32_t *argb);
 
 /* ---------------------------------------------------------------- stylesheets */
 typedef struct sheet sheet_t;
@@ -1547,6 +1585,8 @@ bool css_color_value_text(const struct css_color_value *v, uint32_t argb, sbuf *
 bool css_color_value_specified(const struct css_color_value *v, sbuf *out);
 bool css_color_value_equal(const struct css_color_value *a, const struct css_color_value *b);
 bool css_color_slots_equal(const style_t *a, const style_t *b);
+/* the element's used color-scheme is dark (light-dark() takes its second value) */
+bool css_style_dark(const style_t *s);
 /* unescape a CSS string or identifier body (backslash escapes) */
 void css_unescape(sbuf *out, const char *s, size_t n);
 /* One decoded family at a time; no fixed family-count/identifier truncation.
@@ -1759,6 +1799,12 @@ bool doc_caret_at(web_doc *d,double x,double y,node_t **node,uint32_t *offset);
    value, in document coordinates through the transforms that apply. false when not one. */
 bool doc_control_caret_rect(node_t *control,uint32_t offset,double rect[4]);
 void doc_hover_update(web_doc *document,node_t *target); /* native-only CSS state; no JS dispatch */
+/* n is editable: d is in design mode, or n is in an element whose contenteditable state is true or
+   plaintext-only below no false state (HTML "editing host", "editable") */
+bool doc_node_editable(web_doc *d, node_t *n);
+/* css-ui-4 §5.1: d's image (its index) for a cursor image, the image-set() option shown (css-images-4
+   §2.3.1) requested as CSS images are, and that option's resolution (dppx); -1 when it has none */
+int doc_cursor_image(web_doc *d, const struct css_cursor_image *image, float *dppx);
 void doc_active_cancel(web_doc *document); /* retire/free only this context subtree */
 node_t *doc_active_target(web_doc *document); /* validates live native press and embedding generation */
 

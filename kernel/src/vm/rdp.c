@@ -201,7 +201,7 @@ struct rdp {
     uint32_t tile[TILE * TILE]; /* owned snapshot; never borrow the WM frame */
     uint8_t *dirty;   /* tiles to look at */
     int tiles_x, tiles_y;
-    int pointer_shape;
+    uint32_t pointer_serial; /* the desktop's pointer the client has (wm_pointer_image), 0 for none */
     int mouse_buttons;
 };
 
@@ -702,13 +702,15 @@ static int send_tile(struct rdp *c, const uint32_t *px, int pitch, int x, int y,
     return 0;
 }
 
-/* the pointer as a 32x32 32bpp colour pointer with an AND mask */
-static int send_pointer(struct rdp *c, int shape) {
-    static uint32_t img[32 * 32];
-    canvas_t cv;
-    memset(img, 0, sizeof img);
-    gfx_init(&cv, img, 32, 32, 32);
-    desktop_draw_cursor(&cv, 8, 8, shape);
+/* The desktop's pointer (the WM's choice: its art or a window's image, wm_pointer_image) as a
+   32x32 32bpp colour pointer with an AND mask, when it is not the one the client has. */
+static int send_pointer(struct rdp *c) {
+    static uint32_t img[N_SCREEN_POINTER_SIZE * N_SCREEN_POINTER_SIZE];
+    _Static_assert(N_SCREEN_POINTER_SIZE == 32, "the pointer PDU below is 32 x 32");
+    int hot_x, hot_y;
+    uint32_t serial = wm_pointer_image(c->pointer_serial, img, &hot_x, &hot_y);
+    if (serial == c->pointer_serial) return 0;
+    c->pointer_serial = serial;
     struct wbuf o = {c->out, 0, MAX_PDU};
     w8(&o, 0x00);
     w16be(&o, 0);
@@ -716,8 +718,8 @@ static int send_pointer(struct rdp *c, int shape) {
     w16(&o, 0); /* size, patched */
     w16(&o, 32); /* xor bpp */
     w16(&o, 0);  /* cache index */
-    w16(&o, 8);  /* hot spot */
-    w16(&o, 8);
+    w16(&o, (uint16_t)hot_x); /* hot spot */
+    w16(&o, (uint16_t)hot_y);
     w16(&o, 32);
     w16(&o, 32);
     w16(&o, 128);  /* AND mask length */
@@ -741,12 +743,8 @@ static int push_updates(struct rdp *c) {
     int n = wm_remote_damage(d, 16);
     for (int i = 0; i < n; i++) mark_dirty(c, d[i].x, d[i].y, d[i].w, d[i].h);
     if (!c->active || c->suppress) return 0;
-    int shape = wm_cursor_shape();
-    if (shape != c->pointer_shape) {
-        c->pointer_shape = shape;
-        int r = send_pointer(c, shape);
-        if (r) return r;
-    }
+    int pointer = send_pointer(c);
+    if (pointer) return pointer;
     for (int ty = 0; ty < c->tiles_y; ty++)
         for (int tx = 0; tx < c->tiles_x; tx++) {
             if (!c->dirty[ty * c->tiles_x + tx]) continue;
@@ -1486,7 +1484,7 @@ static int share_pdu(struct rdp *c, struct rbuf *r) {
             }
         }
         c->active = true;
-        c->pointer_shape = -1;
+        c->pointer_serial = 0;
         refresh_all(c);
         return e;
     }

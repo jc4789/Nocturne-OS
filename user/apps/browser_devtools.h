@@ -946,13 +946,24 @@ static void devtools_wheel(int x, int y, int wheel) {
     tab->console_dirty = true;
 }
 static bool dt_in_page(int x, int y) { return y >= 0 && y < page_h() && x >= 0 && x < page_w(); }
+/* the band between the page and the panel that a press drags to resize it */
+static bool dt_on_edge(int y) { int top = page_h(); return y >= top - 3 && y < top + 3 && y < view.h; }
+/* The pointer DevTools wants at a point of the page's surface: the resize band's while over it
+   or dragging it, the arrow over the panel and over the page while an element is being picked.
+   false: the point is not DevTools' (the page says). */
+static bool devtools_pointer_shape(int x, int y, uint32_t *shape) {
+    if (!tab->console_open || browser_fullscreen) return false;
+    if (dt_resizing || dt_on_edge(y)) { *shape = N_POINTER_NS_RESIZE; return true; }
+    if ((tab->dt->picking && dt_in_page(x, y)) || (y >= page_h() && y < view.h)) { *shape = N_POINTER_DEFAULT; return true; }
+    return false;
+}
 /* Primary press: the resize edge, a picked page element, or the panel.
    Returns true when DevTools consumed the press. */
 static bool devtools_pointer_down(int x, int y) {
     if (!tab->console_open || browser_fullscreen) return false;
     int top = page_h();
     dt_sync_doc();
-    if (y >= top - 3 && y < top + 3 && y < view.h) { dt_resizing = true; return true; }
+    if (dt_on_edge(y)) { dt_resizing = true; return true; }
     if (tab->dt->picking && tab->doc && dt_in_page(x, y)) {
         web_node *n = web_node_at(tab->doc, document_x(x), y + tab->scroll_y);
         tab->dt->picking = false;

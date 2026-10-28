@@ -36,8 +36,7 @@
 #define BORDER    1
 #define TASKBAR_H 40
 #define SHADOW    10
-#define CURSOR_BOX_W 26 /* every pointer shape fits this box at (mx-8, my-8) */
-#define CURSOR_BOX_H 30
+#define POINTER_SIZE ((int)N_SCREEN_POINTER_SIZE) /* every pointer image is this square */
 #define MAX_WIN   64
 #define EVQ       128
 #define MIN_CW    120
@@ -65,6 +64,13 @@ struct window {
     bool shown, minimized, maximized, dead,fullscreen;
     bool direct_wanted; /* win_direct: its own images shown by the display driver when it can be */
     bool deep; /* WIN_DEEP_COLOR: each surface ends with its deep plane (read while back_deep exists) */
+    /* SYS_WIN_POINTER: the pointer the window wants over its client area (N_POINTER_*) and the
+       image it gave instead (pointer_w x pointer_h with its hot spot; NULL without one).
+       pointer_serial counts the calls. */
+    uint32_t pointer_shape;
+    uint32_t *pointer_image;
+    int pointer_w, pointer_h, pointer_hx, pointer_hy;
+    uint32_t pointer_serial;
     struct rect restore;
     struct rect fullscreen_restore;
     char title[64];
@@ -108,11 +114,10 @@ static bool vblank_seen, vblank_waiting, vblank_pacing;
    driver reads, with the mode the system wants it to show (gui/screenmode.c); its serial changes
    with every change of it, the pointer's moves included while a window is shown. Under the WM
    lock. */
-#define DIRECT_HOT 8 /* desktop_draw_cursor draws every shape in a box from (x-8, y-8) */
 static bool direct_able;
 static struct window *direct_win;
-static int direct_shape = -1;
-static struct n_screen_state direct_state = {.serial = 1, .hot_x = DIRECT_HOT, .hot_y = DIRECT_HOT};
+static uint32_t direct_pointer; /* the pointer_serial of the image in direct_state, 0 for none */
+static struct n_screen_state direct_state = {.serial = 1};
 static struct wait_queue direct_wq;
 /* The user's (struct desktop_settings): pointer speed with its leftover quarter steps, and smooth
    gradients as the user wants them; the compositor applies them between frames while the scanout
@@ -147,7 +152,16 @@ static int mx, my, mbuttons;
 static int remote_users;
 static struct rect rdamage[MAX_RDAMAGE];
 static int nrdamage;
-static int cursor_shape = CURSOR_ARROW;
+
+/* The pointer (SYS_WIN_POINTER, abi.h). The WM owns it: it draws it at (mx, my) less its hot spot,
+   and chooses what it shows (pointer_update): one of its own shapes (desktop_pointer), or the image
+   the window under it gave. pointer_px is that image, pointer_shape the shape it was chosen as and
+   pointer_from the id of the window whose image it is (0 for the WM's art) as of that window's
+   pointer_from_serial. pointer_serial changes with the image and is never 0. Under the WM lock. */
+static uint32_t pointer_px[POINTER_SIZE * POINTER_SIZE];
+static int pointer_hx, pointer_hy;
+static int pointer_shape = -1, pointer_from;
+static uint32_t pointer_from_serial, pointer_serial = 1;
 
 enum { DRAG_NONE, DRAG_MOVE, DRAG_RESIZE, DRAG_CLIENT, DRAG_BUTTON, DRAG_VOLUME };
 static int drag_mode;
@@ -422,12 +436,11 @@ static void direct_update(void) {
         changed = true;
     }
     if (w) {
-        if (direct_shape != cursor_shape) {
-            canvas_t c;
-            memset(direct_state.pointer, 0, sizeof direct_state.pointer);
-            gfx_init(&c, direct_state.pointer, N_SCREEN_POINTER_SIZE, N_SCREEN_POINTER_SIZE, N_SCREEN_POINTER_SIZE);
-            desktop_draw_cursor(&c, DIRECT_HOT, DIRECT_HOT, cursor_shape);
-            direct_shape = cursor_shape;
+        if (direct_pointer != pointer_serial) {
+            memcpy(direct_state.pointer, pointer_px, sizeof direct_state.pointer);
+            direct_state.hot_x = (uint32_t)pointer_hx;
+            direct_state.hot_y = (uint32_t)pointer_hy;
+            direct_pointer = pointer_serial;
             direct_state.pointer_serial++;
             changed = true;
         }
@@ -512,6 +525,8 @@ static void win_destroy_locked(struct window *w) {
     if (w->user_buf) vfree(w->user_buf, w->pages);
     w->buf = NULL;
     w->user_buf = NULL;
+    kfree(w->pointer_image);
+    w->pointer_image = NULL;
     int i = zindex(w);
     if (i >= 0) {
         for (; i < nwin - 1; i++) zorder[i] = zorder[i + 1];
@@ -1784,11 +1799,13 @@ static void composite_rect(struct rect r) {
     if (toast_until) draw_toast(c);
     /* a remote viewer draws the pointer itself; keep it out of the picture it is sent */
     if (!remote_users) {
-        static uint32_t under[CURSOR_BOX_W * CURSOR_BOX_H];
+        static uint32_t under[POINTER_SIZE * POINTER_SIZE];
         struct deep_mark mark;
-        bool track = back_deep && deep_mark_begin(&mark, c, mx - 8, my - 8, CURSOR_BOX_W, CURSOR_BOX_H,
-                                                  under, CURSOR_BOX_W);
-        desktop_draw_cursor(c, mx, my, cursor_shape);
+        int px = mx - pointer_hx, py = my - pointer_hy;
+        bool track = back_deep && deep_mark_begin(&mark, c, px, py, POINTER_SIZE, POINTER_SIZE, under, POINTER_SIZE);
+        canvas_t image;
+        gfx_init(&image, pointer_px, POINTER_SIZE, POINTER_SIZE, POINTER_SIZE);
+        gfx_blit_alpha(c, px, py, &image, 0, 0, POINTER_SIZE, POINTER_SIZE);
         if (track) deep_mark_end(&mark, c, back_deep);
     }
     if (back_deep) { /* the shell's own drawing above is 8-bit content */
@@ -1859,7 +1876,7 @@ static void composite(void) {
     }
 }
 
-static void damage_cursor(void) { damage_rect(mx - 8, my - 8, CURSOR_BOX_W, CURSOR_BOX_H); }
+static void damage_cursor(void) { damage_rect(mx - pointer_hx, my - pointer_hy, POINTER_SIZE, POINTER_SIZE); }
 
 /* ---- input handling (compositor thread) ---- */
 #define INQ 256
@@ -2061,6 +2078,59 @@ static void handle_key(const struct key_event *k) {
     }
 }
 
+/* What the pointer is over decides what it shows: the WM's own shapes over what the WM draws (a
+   menu, the volume panel, a toast, the taskbar, a frame, the resize band) and during its drags, the
+   window's wish (SYS_WIN_POINTER) over its client area and while a drag that started there goes on.
+   *from is that window, NULL for one of the WM's shapes. */
+static int pointer_choose(struct window **from) {
+    *from = NULL;
+    if (drag_mode == DRAG_RESIZE) return N_POINTER_NWSE_RESIZE;
+    if (drag_mode == DRAG_CLIENT) {
+        if (!drag_win) return N_POINTER_DEFAULT;
+        *from = drag_win;
+        return (int)drag_win->pointer_shape;
+    }
+    if (drag_mode != DRAG_NONE) return N_POINTER_DEFAULT;
+    struct rect r;
+    if (menu_open && (r = menu_rect(), in_rect(mx, my, r.x, r.y, r.w, r.h))) return N_POINTER_DEFAULT;
+    if (vol_open && (r = vol_rect(), in_rect(mx, my, r.x, r.y, r.w, r.h))) return N_POINTER_DEFAULT;
+    if (toast_until && (r = toast_rect(), in_rect(mx, my, r.x, r.y, r.w, r.h))) return N_POINTER_DEFAULT;
+    struct window *f = focused();
+    if (my >= sh - TASKBAR_H && (!f || !f->fullscreen || menu_open || vol_open)) return N_POINTER_DEFAULT;
+    struct window *w = window_at(mx, my);
+    if (!w || in_resize_grip(w, mx, my)) return w ? N_POINTER_NWSE_RESIZE : N_POINTER_DEFAULT;
+    if (!in_rect(mx, my, client_x(w), client_y(w), w->cw, w->ch)) return N_POINTER_DEFAULT;
+    *from = w;
+    return (int)w->pointer_shape;
+}
+
+/* Brings the pointer's image up to what it should show; the old and the new place are drawn again.
+   After input, after a window's wish, and once a pass (windows that moved, opened or closed under
+   it). */
+static void pointer_update(void) {
+    struct window *w;
+    int shape = pointer_choose(&w);
+    int from = w && w->pointer_image ? w->id : 0;
+    uint32_t serial = from ? w->pointer_serial : 0;
+    if (shape == pointer_shape && from == pointer_from && serial == pointer_from_serial) return;
+    damage_cursor();
+    if (from) {
+        memset(pointer_px, 0, sizeof pointer_px);
+        for (int y = 0; y < w->pointer_h; y++)
+            memcpy(pointer_px + y * POINTER_SIZE, w->pointer_image + y * w->pointer_w, (size_t)w->pointer_w * 4);
+        pointer_hx = w->pointer_hx;
+        pointer_hy = w->pointer_hy;
+    } else {
+        memcpy(pointer_px, desktop_pointer(shape, &pointer_hx, &pointer_hy), sizeof pointer_px);
+    }
+    pointer_shape = shape;
+    pointer_from = from;
+    pointer_from_serial = serial;
+    if (!++pointer_serial) pointer_serial = 1;
+    damage_cursor();
+    wake_compositor();
+}
+
 static void update_hover(void) {
     struct window *w = window_at(mx, my);
     int b = w ? hit_button(w, mx, my) : 0;
@@ -2070,13 +2140,7 @@ static void update_hover(void) {
         hover_btn = b;
         if (hover_win) damage_rect(w->x + frame_w(w) - 80, w->y, 80, TITLE_H);
     }
-    int shape = (drag_mode == DRAG_RESIZE || (w && drag_mode == DRAG_NONE && in_resize_grip(w, mx, my)))
-                    ? CURSOR_RESIZE
-                    : CURSOR_ARROW;
-    if (shape != cursor_shape) {
-        cursor_shape = shape;
-        damage_cursor();
-    }
+    pointer_update();
 }
 
 static void left_press(void) {
@@ -2441,6 +2505,7 @@ static void wm_thread(void *arg) {
             struct rect t = toast_rect();
             damage_rect(t.x, t.y, t.w, t.h);
         }
+        pointer_update();
         direct_update();
         fl = irq_save();
         now = uptime_ms();
@@ -2659,7 +2724,16 @@ bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h) {
     return valid;
 }
 
-int wm_cursor_shape(void) { return cursor_shape; }
+uint32_t wm_pointer_image(uint32_t seen, uint32_t *px, int *hot_x, int *hot_y) {
+    if (__atomic_load_n(&pointer_serial, __ATOMIC_RELAXED) == seen) return seen;
+    wm_lock();
+    memcpy(px, pointer_px, sizeof pointer_px);
+    *hot_x = pointer_hx;
+    *hot_y = pointer_hy;
+    uint32_t serial = pointer_serial;
+    wm_unlock();
+    return serial;
+}
 
 void wm_init(void) {
     /* PCI has been enumerated. Optional offscreen GPU never changes the display
@@ -2876,6 +2950,39 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         wake_compositor();
         return 0;
     }
+    case SYS_WIN_POINTER: {
+        struct window *w = handle_window(handle);
+        if (!w) return -N_ERR_NO_HANDLE;
+        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (c != sizeof(struct n_win_pointer)) return -N_ERR_INVALID;
+        if (!user_ok((const void *)b, sizeof(struct n_win_pointer))) return -N_ERR_BAD_ADDRESS;
+        struct n_win_pointer p;
+        memcpy(&p, (const void *)b, sizeof p);
+        if (p.shape >= N_POINTER_SHAPES || p.reserved) return -N_ERR_INVALID;
+        uint32_t *image = NULL;
+        if (p.width || p.height) {
+            if (!p.width || !p.height || p.width > N_POINTER_IMAGE_MAX || p.height > N_POINTER_IMAGE_MAX ||
+                p.hot_x >= p.width || p.hot_y >= p.height)
+                return -N_ERR_INVALID;
+            size_t bytes = (size_t)p.width * p.height * 4;
+            if (!p.pixels || !user_ok(p.pixels, bytes)) return -N_ERR_BAD_ADDRESS;
+            image = kmalloc(bytes);
+            if (!image) return -N_ERR_NO_MEMORY;
+            memcpy(image, p.pixels, bytes);
+        } else if (p.hot_x || p.hot_y) {
+            return -N_ERR_INVALID;
+        }
+        kfree(w->pointer_image);
+        w->pointer_image = image;
+        w->pointer_shape = p.shape;
+        w->pointer_w = (int)p.width;
+        w->pointer_h = (int)p.height;
+        w->pointer_hx = (int)p.hot_x;
+        w->pointer_hy = (int)p.hot_y;
+        w->pointer_serial++;
+        pointer_update();
+        return 0;
+    }
     case SYS_WIN_PRESENTATION: {
         struct window *w=handle_window(handle);if(!w)return -N_ERR_NO_HANDLE;
         if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;if(b>1)return -N_ERR_INVALID;
@@ -3071,7 +3178,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     }
     if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENTATION || num == SYS_WIN_PRESENT ||
         num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE || num == SYS_WIN_DIRECT ||
-        num == SYS_WIN_FRAME)
+        num == SYS_WIN_FRAME || num == SYS_WIN_POINTER)
         handle = handle_get((int)a);
     wm_lock();
     int64_t result = wm_syscall_locked(num,a,b,c,d,e,handle);

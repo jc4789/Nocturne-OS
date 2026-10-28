@@ -8513,6 +8513,7 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     x.background=y.background=NULL;x.border_image=y.border_image=x.mask_border=y.mask_border=NULL;
     x.border_image_img=y.border_image_img=x.mask_border_img=y.mask_border_img=0;
     x.bg_layers=y.bg_layers=x.bg_layer=y.bg_layer=0;
+    x.ui=y.ui=NULL; /* the pointer and the caret's and accents' colours are not layout */
     /* same_translation() decided every geometric effect of the transform
        properties; their values and arena addresses are paint state. */
     x.transform=y.transform=NULL;memset(&x.translate,0,sizeof x.translate);memset(&y.translate,0,sizeof y.translate);
@@ -8611,6 +8612,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !css_gap_rules_equal(a->gap_rules, b->gap_rules) || !css_anchor_equal(a->anchor, b->anchor) || !position_options_equal(a, b) ||
         !css_background_equal(a->background, b->background) || !css_border_image_equal(a->border_image, b->border_image, false) ||
         !css_border_image_equal(a->mask_border, b->mask_border, true) ||
+        !css_ui_equal(a->ui, b->ui) ||
         !transforms_equal(a->transform, b->transform) ||
         !transforms_equal(a->rotate, b->rotate) || !transforms_equal(a->scale, b->scale) ||
         !gradients_equal(a->gradient, b->gradient) || !vars_equal(a->vars, b->vars) ||
@@ -8651,7 +8653,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     memset(&x.motion, 0, sizeof x.motion); memset(&y.motion, 0, sizeof y.motion);
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
-    x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; x.anchor = y.anchor = NULL; /* the groups compared above */
+    x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; x.anchor = y.anchor = NULL; x.ui = y.ui = NULL; /* the groups compared above */
     x.background = y.background = NULL; x.border_image = y.border_image = x.mask_border = y.mask_border = NULL;
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;

@@ -55,6 +55,8 @@ extern const struct ui_theme ui_theme;
      'S' u32 surface, u32 width, u32 height [u32 flags]    make or resize a surface (UI_SURFACE_DEEP)
      'P' u32 surface [u32 x, y, width, height]             its pixels (in that part) changed
      'F' u32 window                                        UI_EVENT_FRAME at the next frame, changed or not
+     'U' u32 surface, u32 shape [u32 width, u32 height, u32 hot x, u32 hot y, width x height u32 pixels]
+                                                           the pointer over it while it takes the pointer
      'D' u32 surface                                       drop it
    A node is: u8 kind length, kind, u16 property count, u16 child count, the
    properties, the children. A property is: u8 name length, name, u8 type,
@@ -233,6 +235,13 @@ n_result ui_window_frame(struct ui_session *s, uint32_t window);
 canvas_t *ui_surface(struct ui_session *s, uint32_t surface, int width, int height, uint32_t flags);
 void ui_surface_changed(struct ui_session *s, uint32_t surface);
 void ui_surface_changed_rect(struct ui_session *s, uint32_t surface, int x, int y, int width, int height);
+/* The pointer over a surface placed with "pointer" ('U'): a shape (N_POINTER_*), or an image of at
+   most N_POINTER_IMAGE_MAX square (0xAARRGGBB, not premultiplied) with its hot spot and the shape for
+   where it is not shown, as win_pointer takes it. The engine owns the window's pointer: it asks the
+   desktop for this one while the pointer is over the surface or held on it, for the text beam over
+   a field and for the arrow elsewhere. It stays until the next; a surface starts with none (the
+   arrow). */
+n_result ui_surface_pointer(struct ui_session *s, uint32_t surface, const struct n_win_pointer *pointer);
 
 /* An 'e' message taken apart (text points into the message). */
 struct ui_event {

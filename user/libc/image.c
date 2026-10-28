@@ -33,6 +33,8 @@ static image_t *image_new(int w, int h) {
     if (!img) return NULL;
     img->w = w;
     img->h = h;
+    img->hot = false;
+    img->hot_x = img->hot_y = 0;
     img->px = malloc((size_t)w * h * 4);
     if (!img->px) {
         free(img);
@@ -245,7 +247,10 @@ static image_t *decode_icon_dib(const uint8_t *d, size_t n, int w, int h) {
     return img;
 }
 
+/* An ICO, or a CUR (the same directory, type 2, whose entries give a hot spot where an icon's give
+   planes and depth). */
 static image_t *decode_icon(const uint8_t *d, size_t n) {
+    bool cursor = image_le16(d + 2) == 2;
     unsigned count = image_le16(d + 4);
     if (!count || count > (n - 6) / 16) return NULL;
     size_t directory_end = 6 + (size_t)count * 16;
@@ -256,7 +261,7 @@ static image_t *decode_icon(const uint8_t *d, size_t n) {
     for (unsigned i = 0; i < count; i++) {
         const uint8_t *entry = d + 6 + (size_t)i * 16;
         unsigned w = entry[0] ? entry[0] : 256, h = entry[1] ? entry[1] : 256;
-        unsigned depth = image_le16(entry + 6);
+        unsigned depth = cursor ? 32 : image_le16(entry + 6);
         unsigned score = w * h * 33 + (depth > 32 ? 32 : depth);
         size_t size = image_le32(entry + 8), offset = image_le32(entry + 12);
         if (offset < directory_end || offset > n || size > n - offset || size < 12) continue;
@@ -270,7 +275,7 @@ static image_t *decode_icon(const uint8_t *d, size_t n) {
         if (pass && i == first) continue;
         const uint8_t *entry = d + 6 + (size_t)i * 16;
         int w = entry[0] ? entry[0] : 256, h = entry[1] ? entry[1] : 256;
-        unsigned depth = image_le16(entry + 6);
+        unsigned depth = cursor ? 32 : image_le16(entry + 6);
         unsigned score = (unsigned)w * h * 33 + (depth > 32 ? 32 : depth);
         size_t size = image_le32(entry + 8), offset = image_le32(entry + 12);
         if (score <= best_score || offset < directory_end || offset > n || size > n - offset || size < 12) continue;
@@ -279,6 +284,12 @@ static image_t *decode_icon(const uint8_t *d, size_t n) {
         else img = decode_icon_dib(d + offset, size, w, h);
         if (!img) continue;
         if (img->w != w || img->h != h) { image_free(img); continue; }
+        if (cursor) {
+            unsigned x = image_le16(entry + 4), y = image_le16(entry + 6);
+            img->hot = x < (unsigned)w && y < (unsigned)h;
+            img->hot_x = img->hot ? (uint16_t)x : 0;
+            img->hot_y = img->hot ? (uint16_t)y : 0;
+        }
         image_free(best); best = img; best_score = score;
     }
     return best;
@@ -287,7 +298,7 @@ static image_t *decode_icon(const uint8_t *d, size_t n) {
 image_t *image_decode(const void *data, size_t n) {
     const uint8_t *d = data;
     if (!data || n < 8 || n > 0x7FFFFFFF) return NULL;
-    if (!memcmp(d, "\0\0\1\0", 4)) return decode_icon(d, n);
+    if (!memcmp(d, "\0\0\1\0", 4) || !memcmp(d, "\0\0\2\0", 4)) return decode_icon(d, n);
     if (n >= 12 && !memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WEBP", 4)) {
         jebp_image_t ji;
         if (jebp_decode_size(&ji, n, data) != JEBP_OK || (long long)ji.width * ji.height > IMAGE_MAX_PIXELS) return NULL;
@@ -310,6 +321,24 @@ image_t *image_decode(const void *data, size_t n) {
     image_codec_release();
     if (looks_like_svg((const char *)d, n)) return decode_svg((const char *)d, n, 0, 0);
     return NULL;
+}
+
+bool image_type_supported(const char *type) {
+    /* what image_decode sniffs: ICO and CUR, WebP, stb_image's PNG, JPEG, GIF and BMP (third_party_img.c), SVG */
+    static const char *const types[] = {"image/png", "image/apng", "image/jpeg", "image/pjpeg", "image/gif",
+        "image/bmp", "image/x-bmp", "image/webp", "image/x-icon", "image/vnd.microsoft.icon", "image/svg+xml"};
+    if (!type) return false;
+    while (*type == ' ' || *type == '\t' || *type == '\n' || *type == '\r' || *type == '\f') type++;
+    size_t n = strcspn(type, ";");
+    while (n && (type[n - 1] == ' ' || type[n - 1] == '\t' || type[n - 1] == '\n' || type[n - 1] == '\r' ||
+                 type[n - 1] == '\f')) n--;
+    for (size_t i = 0; i < sizeof types / sizeof *types; i++) {
+        if (strlen(types[i]) != n) continue;
+        size_t k = 0;
+        while (k < n && tolower((unsigned char)type[k]) == types[i][k]) k++;
+        if (k == n) return true;
+    }
+    return false;
 }
 
 struct decode_job { const void *data; size_t size; image_t *result; };
