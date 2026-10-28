@@ -13,7 +13,7 @@ guest の WPT の代わりではない。CSSOM の宣言の塊・cascade・var()
 文字を持つかどうかは宣言の塊の仕事）、補間の端が neutral・CSS 全体の語（cascade の仕事）。
 補間は CSS animation の流儀（離散は 0.5 で入れ替わる）だけを試す。
 
-  python -X utf8 tests/check_css_shapes_native.py [--verbose] [--file 名前の一部] [--out 出力の場所]
+  python -X utf8 tests/check_css_shapes_native.py [--set anchor] [--verbose] [--file 名前の一部] [--out 出力の場所]
 """
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -25,7 +25,14 @@ import sys
 
 root = Path(__file__).resolve().parent.parent
 wpt = Path(os.environ.get("NOCTURNE_WPT", "D:/Programes/cloned repos/wpt")) / "css"
-pages = (sorted(p for p in (wpt / "css-shapes/shape-functions").glob("*.html") if re.search(r"-(valid|invalid|computed|parsing)\.html$", p.name)) +
+# --set anchor: CSS Anchor Positioning 1 の値（anchor-position の構文と計算値の頁）を同じ道具で
+page_set = sys.argv[sys.argv.index("--set") + 1] if "--set" in sys.argv else "shapes"
+anchor_pages = (sorted((wpt / "css-anchor-position/parsing").glob("*.html")) +
+                [wpt / "css-anchor-position" / name for name in (
+                    "anchor-parse-valid.html", "anchor-parse-invalid.html", "anchor-size-parse-valid.html",
+                    "anchor-size-parse-invalid.html", "position-area-parsing.html", "position-area-computed.html",
+                    "anchor-name-basics.html", "position-anchor-basics.html", "property-interpolations.html")])
+pages = anchor_pages if page_set == "anchor" else (sorted(p for p in (wpt / "css-shapes/shape-functions").glob("*.html") if re.search(r"-(valid|invalid|computed|parsing)\.html$", p.name)) +
          sorted((wpt / "css-shapes/parsing").glob("*.html")) +
          sorted((wpt / "css-masking/parsing").glob("clip-path-*.html")) +
          sorted((wpt / "motion/parsing").glob("*.html")) +
@@ -33,7 +40,7 @@ pages = (sorted(p for p in (wpt / "css-shapes/shape-functions").glob("*.html") i
          sorted((wpt / "css-masking/animations").glob("clip-path-*.html")) +
          [wpt / "css-masking/clip-path/animations/clip-path-interpolation-discrete.html"] +
          sorted((wpt / "motion/animation").glob("*.html")))
-out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / "build/check-css-shapes"
+out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / ("build/check-css-" + page_set)
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)
 cc = next(p / "tools/msys64/ucrt64/bin/clang.exe" for p in (root, *root.parents)

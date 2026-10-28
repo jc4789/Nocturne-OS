@@ -2287,8 +2287,7 @@ static JSValue computed_translation(JSContext *ctx,web_doc *d,const style_t *st,
     else snprintf(text,sizeof text,"matrix(%g, %g, %g, %g, %g, %g)",m[0],m[4],m[1],m[5],m[3],m[7]);
     return JS_NewString(ctx,text);
 }
-static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n, unsigned side) {
-    style_t *st = n->style;
+static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n, const style_t *st, unsigned side) {
     box_t *b = n->box;
     const len_t *in = st->inset;
     bool horizontal = side == 1 || side == 3;
@@ -2300,6 +2299,11 @@ static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n,
     if (!b || st->display == D_NONE || st->display == D_CONTENTS || st->position == POS_STATIC ||
         st->position == POS_STICKY || constrained) return computed_length(ctx, &in[side], n->owner);
     float value;
+    /* an anchor-positioned box's used inset, against the containing block its position-area made */
+    if (box_anchor_inset(b, side, &value)) {
+        char text[64]; snprintf(text, sizeof text, "%gpx", (double)(value == 0 ? 0 : value));
+        return JS_NewString(ctx, text);
+    }
     if (st->position == POS_RELATIVE) {
         box_t *relative_cb = b->cb ? b->cb : n->anchor_block;
         float base = relative_cb ? (horizontal ? relative_cb->w : relative_cb->h) : horizontal ? s->doc->width : s->doc->height;
@@ -2357,6 +2361,10 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     style_t fallback;
     style_t *st = computed_pseudo_style(n,pseudo,&fallback); char out[128]; out[0] = 0;
     if (!st) return JS_NewString(ctx, "");
+    /* css-anchor-position-1: an anchor-positioned box's styles with its anchor functions resolved and
+       its chosen position option applied (§6.5: they are its computed values) */
+    style_t anchored; struct css_anchor anchored_group;
+    if (pseudo == PE_NONE && n->box && box_anchor_style(n->box, &anchored, &anchored_group)) st = &anchored;
     if(property[0]=='-'&&property[1]=='-') {
         const struct custom_prop *p=css_custom_property(st,property);
         return JS_NewString(ctx,p&&p->value?p->value:"");
@@ -2381,7 +2389,7 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     }
     static const char *const inset_names[] = {"top", "right", "bottom", "left"};
     for (unsigned side = 0; side < 4; side++) if (!strcmp(property, inset_names[side]))
-        return pseudo==PE_NONE?computed_inset(owner,ctx,n,side):computed_length(ctx,&st->inset[side],n->owner);
+        return pseudo==PE_NONE?computed_inset(owner,ctx,n,st,side):computed_length(ctx,&st->inset[side],n->owner);
     box_t *principal = pseudo==PE_NONE?geometry_principal_box(n):NULL;
     if(!strcmp(property,"transform")||!strcmp(property,"translate"))
         return computed_translation(ctx,d,st,principal,!strcmp(property,"translate"));

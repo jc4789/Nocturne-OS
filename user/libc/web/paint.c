@@ -2648,6 +2648,8 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->failed) return;
     if (P->mode==M_PAINT && b->ellipsis_hidden && b->ellipsis_hidden_revision==P->d->layout_revision) return;
     if (b->clamp_hidden || !b->st || b->st->display == D_NONE) return;
+    /* css-anchor-position-1 §6.6: position-visibility makes it and its descendants force-hidden */
+    if (b->anchored && P->mode != M_BOUNDS && box_anchor_hidden(b)) return;
     if (web_dialog_layer_box(P->d,b) && b != P->top_root) return;
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
     if (P->mode != M_BOUNDS && paint_box_layer(b) && !layer_root) return; /* painted with the layers */
@@ -2857,7 +2859,8 @@ done:
 static void stacked_ancestor_clips(struct pctx *P,box_t *layer,box_t *ancestor,bool reached,bool fixed_escape,bool skip) {
     if(!ancestor||!ancestor->parent){if(!skip)paint_box(P,layer,true);return;}
     canvas_t *canvas=P->c;const struct gfx_mask_clip *previous=canvas->mask_clip;struct gfx_mask_clip boundary,cut;
-    if(ancestor->clamp_hidden||(ancestor->st&&ancestor->st->display==D_NONE))skip=true;
+    if(ancestor->clamp_hidden||(ancestor->st&&ancestor->st->display==D_NONE)||
+       (ancestor->anchored&&P->mode!=M_BOUNDS&&box_anchor_hidden(ancestor)))skip=true;
     if(ancestor==layer->cb)reached=true;
     if(ancestor->st&&(web_marquee_box(ancestor)||((ancestor->clamp_truncated||ancestor->st->overflow!=OV_VISIBLE)&&reached&&!fixed_escape))&&
         !doc_viewport_overflow_box(P->d,ancestor)&&ancestor->kind!=B_INLINE) {
