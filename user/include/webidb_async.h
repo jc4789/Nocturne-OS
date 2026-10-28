@@ -1,10 +1,14 @@
 #pragma once
 #include <webidb.h>
+#include <webcache.h>
 #include <nocturne.h>
 #include <stdbool.h>
 
 /* Browser-private, pointer-free native storage broker protocol. Only the
- * browser's origin-policy gate supplies origin; scripts never supply paths. */
+ * browser's origin-policy gate supplies origin; scripts never supply paths.
+ * The broker serves IndexedDB (WEB_IDB_*, webidb.h) and Cache Storage
+ * (WEB_CACHE_OPEN to WEB_CACHE_LAST, webcache.h): one realm's requests of
+ * both go through its one broker, in the order they were made. */
 #define WEB_IDB_WIRE_MAGIC 0x49444231u
 enum webidb_operation {
     WEB_IDB_BEGIN=1, WEB_IDB_STAGE, WEB_IDB_VALUE, WEB_IDB_COMMIT,

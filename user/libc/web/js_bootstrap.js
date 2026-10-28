@@ -1136,6 +1136,9 @@
     /* @include js_indexeddb.js */
     /* @include js_opfs.js */
     installOriginPrivateFileSystem(host,cryptoSecureContext,Navigator,false);
+    /* @include js_cache_storage.js */
+    installCacheStorage({...fetchBridge.cache,secure:cryptoSecureContext,native:host.cacheStorage,
+        embedderPolicy:host.cacheEmbedderPolicy,streams:streamBridge});
     /* @include js_messaging.js */
     /* @include js_websocket.js */
     /* @include js_css_supports.js */

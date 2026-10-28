@@ -17,6 +17,7 @@
 #include "../libc/web/js_memory.h"
 #include "../libc/web/js_opfs.h"
 #include "../libc/web/js_indexeddb.h"
+#include "../libc/web/js_cachestorage.h"
 #include "../libc/web/js_worker_transfer.h"
 #include "../libc/web/js_worker_port_lifetime.h"
 #include "../libc/web/js_worker_runtime.inc"
@@ -291,7 +292,8 @@ static const char *worker_idb_origin(JSContext *ctx){
     const char *origin=JS_IsException(value)||JS_IsNull(value)?NULL:JS_ToCString(ctx,value);
     JS_FreeValue(ctx,value);return origin;
 }
-static const struct web_idb_realm worker_idb_realm={worker_idb_state,worker_idb_authority,worker_idb_origin};
+static int worker_embedder_policy(JSContext *ctx){struct worker*w=state(ctx);return w&&w->policy_initialized?(int)w->policy_doc.embedder_policy:HTML_COEP_UNSAFE_NONE;}
+static const struct web_idb_realm worker_idb_realm={worker_idb_state,worker_idb_authority,worker_idb_origin,worker_embedder_policy};
 /* The child has no DOM, but owns the same native CSP rules as a document.
  * Neither writable Worker globals nor an author-supplied JS dictionary is
  * consulted for policy authority. These plain objects are private snapshots. */
@@ -657,7 +659,7 @@ int main(int argc,char**argv){
         JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",6,native_request),JS_CFUNC_DEF("dataURL",1,native_data_url),JS_CFUNC_DEF("cancel",1,native_cancel),
         JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};
     JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);
-    web_js_encoding_init_isolated(w.ctx,host);web_js_url_init(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_webidl_init(w.ctx,host);web_js_crypto_init(w.ctx,host);web_js_compression_init(w.ctx,host);web_atomics_host_init(w.ctx,host);web_opfs_host_init(w.ctx,host,opfs_storage_url);web_idb_host_init(w.ctx,host,&worker_idb_realm);web_js_wasm_host_init(w.ctx,host);web_js_webgl_init(w.ctx,host,NULL);
+    web_js_encoding_init_isolated(w.ctx,host);web_js_url_init(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_webidl_init(w.ctx,host);web_js_crypto_init(w.ctx,host);web_js_compression_init(w.ctx,host);web_atomics_host_init(w.ctx,host);web_opfs_host_init(w.ctx,host,opfs_storage_url);web_idb_host_init(w.ctx,host,&worker_idb_realm);web_cache_host_init(w.ctx,host,&worker_idb_realm);web_js_wasm_host_init(w.ctx,host);web_js_webgl_init(w.ctx,host,NULL);
     JS_SetPropertyStr(w.ctx,global,"__workerHost",host);JS_FreeValue(w.ctx,global);
     /* Worker platform interfaces are built-ins too: no implementation source. */
     {JSRuntime *rt=JS_GetRuntime(w.ctx);int strip=JS_GetStripInfo(rt);JS_SetStripInfo(rt,strip|JS_STRIP_SOURCE);

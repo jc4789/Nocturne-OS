@@ -1319,10 +1319,24 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
            sent (HTML: the document's referrer), already a canonical URL. */
         const char *referrer = j->wire.kind == WEBNET_NAVIGATION && j->referrer ? j->referrer : "";
         size_t referrer_len = strlen(referrer);
-        char start[32], end[320];
+        char start[32], end[320], resource[16] = "";
+        /* What Fetch's cross-origin resource policy check needs of the response an opaque one
+           hides, for a later check against another embedder policy (Cache Storage's match):
+           1 a valid Cross-Origin-Resource-Policy, 2 a URL of another origin than the request's,
+           4 a request that included credentials. Nothing else of it leaves this process. */
+        if (j->opaque_tainted || j->resource_opaque) {
+            const char *policy = NULL; size_t length = 0;
+            bool other = !j->origin || !j->target_origin || strcmp(j->origin, j->target_origin);
+            bool corp = field_slice(http_response_headers(r), "Cross-Origin-Resource-Policy", &policy, &length) &&
+                ((length == 11 && !memcmp(policy, "same-origin", 11)) || (length == 9 && !memcmp(policy, "same-site", 9)) ||
+                 (length == 12 && !memcmp(policy, "cross-origin", 12)));
+            bool credentials = j->wire.credentials == WEBNET_CREDENTIALS_INCLUDE ||
+                (j->wire.credentials == WEBNET_CREDENTIALS_SAME_ORIGIN && !other);
+            snprintf(resource, sizeof resource, " resource=%u", (corp ? 1u : 0u) | (other ? 2u : 0u) | (credentials ? 4u : 0u));
+        }
         int a = snprintf(start, sizeof start, "HTTP/1.1 %d ", r->status);
-        int m = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s%s", j->cors_tainted, j->redirected,
-                         j->opaque_tainted||j->resource_opaque?" opaque=1":"", referrer_len?" referrer=":"");
+        int m = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s%s%s", j->cors_tainted, j->redirected,
+                         j->opaque_tainted||j->resource_opaque?" opaque=1":"", resource, referrer_len?" referrer=":"");
         int b = m >= 0 && (size_t)m < sizeof end ? snprintf(end + m, sizeof end - (size_t)m, "\r\n") : -1;
         if (b >= 0) b += m;
         if (b >= 0 && (size_t)b < sizeof end && j->debug_request_measured) {

@@ -231,7 +231,7 @@ static void settings_clear(struct settings *s, const char *site) {
         strlcpy(s->status, "使用中のデータベースかファイルが残りました。頁を閉じてから、もう一度消してください。", sizeof s->status);
     else if (r < 0)
         snprintf(s->status, sizeof s->status, "消し切れませんでした：%s", n_result_text(r));
-    else if (site) snprintf(s->status, sizeof s->status, "%s の Cookie とサイトデータを消しました。", *site ? site : "持ち主の分からない OPFS");
+    else if (site) snprintf(s->status, sizeof s->status, "%s の Cookie とサイトデータを消しました。", *site ? site : "持ち主の分からないデータ");
     else strlcpy(s->status, "すべての Cookie とサイトデータを消しました。", sizeof s->status);
 }
 static const char *settings_rule_label(enum webprefs_site_rule rule) {
@@ -500,7 +500,7 @@ static void settings_card_site_data(struct ui_msg *m, struct settings *s, float 
     char a[32], said[256];
     settings_bytes(total, a, sizeof a);
     snprintf(said, sizeof said, "%zu のサイトが、Cookie %zu 件を含めて %s を保存しています"
-             "（Cookie・Web Storage・IndexedDB・OPFS。HTTP のキャッシュは含まない）。", settings_sites_count, cookies, a);
+             "（Cookie・Web Storage・IndexedDB・OPFS・Cache Storage。HTTP のキャッシュは含まない）。", settings_sites_count, cookies, a);
     bool on_close = webprefs_clear_on_close();
     ui_node(m, "card"); ui_num(m, "gap", 14); ui_str(m, "key", "site-data");
         settings_card_head(m, "Cookie とサイトデータ", said);
@@ -514,7 +514,7 @@ static void settings_card_site_data(struct ui_msg *m, struct settings *s, float 
                 settings_button(m, "すべて消去…", "trash", settings_sites_count != 0, SET_CLEAR_ALL, 0);
             ui_end(m);
         } else {
-            settings_say(m, "すべてのサイトの Cookie・Web Storage・IndexedDB・OPFS を消します。ログインしているサイトからは"
+            settings_say(m, "すべてのサイトの Cookie・Web Storage・IndexedDB・OPFS・Cache Storage を消します。ログインしているサイトからは"
                             "ログアウトし、開いている頁は空の保存を読みます。元に戻せません。", NULL, t->warning);
             ui_node(m, "row"); ui_num(m, "gap", 8);
                 settings_button(m, "すべて消去する", "trash", true, SET_CLEAR_ALL_SURE, 0);
@@ -548,15 +548,16 @@ static void settings_card_sites(struct ui_msg *m, struct settings *s, float widt
         ui_node(m, "scroll"); ui_num(m, "maxHeight", 360); ui_num(m, "gap", 2); ui_str(m, "key", "site-rows");
         for (size_t i = 0; i < settings_sites_count; i++) {
             const struct websitedata_site *r = &settings_sites_list[i];
-            const char *name = r->site[0] ? r->site : "持ち主の分からない OPFS";
+            const char *name = r->site[0] ? r->site : "持ち主の分からないデータ";
             if (*q && !settings_contains(name, q)) continue;
-            char about[256], part[4][32];
+            char about[320], part[5][32];
             settings_bytes(r->cookie_bytes, part[0], sizeof part[0]);
             settings_bytes(r->storage_bytes, part[1], sizeof part[1]);
             settings_bytes(r->indexeddb_bytes, part[2], sizeof part[2]);
             settings_bytes(r->opfs_bytes, part[3], sizeof part[3]);
-            snprintf(about, sizeof about, "Cookie %zu 件（%s） · Web Storage %s · IndexedDB %s · OPFS %s",
-                     r->cookies, part[0], part[1], part[2], part[3]);
+            settings_bytes(r->cache_bytes, part[4], sizeof part[4]);
+            snprintf(about, sizeof about, "Cookie %zu 件（%s） · Web Storage %s · IndexedDB %s · OPFS %s · Cache Storage %s",
+                     r->cookies, part[0], part[1], part[2], part[3], part[4]);
             if (any) { ui_node(m, "divider"); ui_end(m); }
             any = true;
             ui_node(m, "row"); ui_num(m, "gap", 8); ui_str(m, "align", "center"); ui_str(m, "key", r->site[0] ? r->site : "-");
@@ -565,7 +566,7 @@ static void settings_card_sites(struct ui_msg *m, struct settings *s, float widt
                     ui_node(m, "text"); ui_str(m, "text", name); ui_num(m, "weight", 1); ui_end(m);
                     settings_say(m, about, "caption", 0);
                 ui_end(m);
-                /* The OPFS of no known origin goes only with everything ("" clears every site). */
+                /* The data of no known origin (OPFS, Cache Storage) goes only with everything ("" clears every site). */
                 uint32_t place = r->site[0] ? settings_name(s, r->site) : UINT32_MAX;
                 settings_tool(m, "trash", place != UINT32_MAX, SET_CLEAR_SITE, place);
             ui_end(m);

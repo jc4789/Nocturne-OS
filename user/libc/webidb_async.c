@@ -35,6 +35,14 @@ struct webidb_async {
 static webidb_async *retired;
 #define WEBIDB_TOKEN (UINT64_C(0x49) << 56)
 
+/* A Cache Storage command that names the realm's origin (the rest name a token of the broker's). */
+static bool cache_origin_operation(unsigned operation) {
+    return operation>=WEB_CACHE_OPEN&&operation<=WEB_CACHE_LAST&&operation!=WEB_CACHE_WRITE&&
+        operation!=WEB_CACHE_DISCARD&&operation!=WEB_CACHE_READ&&operation!=WEB_CACHE_CLOSE;
+}
+static bool known_operation(unsigned operation) {
+    return (operation>=WEB_IDB_BEGIN&&operation<=WEB_IDB_FIRED)||(operation>=WEB_CACHE_OPEN&&operation<=WEB_CACHE_LAST);
+}
 static bool add_length(size_t *total,size_t add) {
     if(add>SIZE_MAX-*total)return false;
     *total+=add;return true;
@@ -97,7 +105,7 @@ webidb_async *webidb_async_create(n_handle queue) {
     return db;
 }
 uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request *request) {
-    if(!db||db->failed||!request||request->operation<WEB_IDB_BEGIN||request->operation>WEB_IDB_FIRED)return 0;
+    if(!db||db->failed||!request||!known_operation(request->operation))return 0;
     size_t origin_length=request->origin?strlen(request->origin):0;
     size_t name_length=request->name?request->name_length:0;
     size_t value_length=request->operation==WEB_IDB_VALUE?64:request->length;
@@ -135,8 +143,8 @@ uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request 
         .name_length=name_length,.payload_length=value_length,.reference_count=request->reference_count
     };
     p->length=total;
-    p->refused=(request->operation==WEB_IDB_BEGIN||request->operation==WEB_IDB_DATABASES)&&
-        !webprefs_storage_allowed(request->origin);
+    p->refused=(request->operation==WEB_IDB_BEGIN||request->operation==WEB_IDB_DATABASES||
+        cache_origin_operation(request->operation))&&!webprefs_storage_allowed(request->origin);
     if(!p->refused&&db->app<0&&!spawn_broker(db)){packet_free(p);return 0;}
     if(db->last)db->last->next=p;
     else db->first=p;
@@ -165,7 +173,8 @@ void webidb_async_pump(webidb_async *db) {
     if(!bytes||n_channel_receive(db->channel,bytes,(size_t)size,0,NULL)!=size){free(bytes);stop(db);return;}
     memcpy(r,bytes,sizeof *r);
     if(r->magic!=WEB_IDB_WIRE_MAGIC||r->operation!=p->command.operation||
-       r->sequence!=p->command.sequence||r->status>WEB_IDB_MEMORY||
+       r->sequence!=p->command.sequence||
+       r->status>(p->command.operation>=WEB_CACHE_OPEN?(uint32_t)WEB_CACHE_INVALID_STATE:(uint32_t)WEB_IDB_MEMORY)||
        r->payload_length!=(size_t)size-sizeof *r||r->count>SIZE_MAX){free(bytes);stop(db);return;}
     /* A pending BEGIN carries a present (possibly empty) body. */
     if(r->payload_length||(r->operation==WEB_IDB_BEGIN&&r->pending)){

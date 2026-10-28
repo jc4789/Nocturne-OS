@@ -240,7 +240,9 @@ void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,co
             if(cors)kind|=NJW_LOADED_CORS;
             if(redirected)kind|=NJW_LOADED_REDIRECTED;
             if(opaque){
-                kind=NJW_LOADED_OPAQUE;
+                const char *end=strstr(meta+2,"\r\n"),*at=strstr(meta+2," resource=");unsigned bits=2;
+                if(!at||!end||at>end||sscanf(at+10,"%u",&bits)!=1||bits>7)bits=2;
+                kind=NJW_LOADED_OPAQUE|(bits<<NJW_LOADED_RESOURCE_SHIFT);
                 /* Never place opaque internals in the author's Worker realm,
                    even if its built-in prototypes have been replaced. */
                 status=0;url="";headers="";bytes=NULL;n=0;

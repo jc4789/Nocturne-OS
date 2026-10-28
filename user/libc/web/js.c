@@ -39,6 +39,7 @@
 #include "js_atomics.h"
 #include "js_opfs.h"
 #include "js_indexeddb.h"
+#include "js_cachestorage.h"
 #include "inspect_private.h"
 #include "js_collator_native.h"
 #include "js_worker.h"
@@ -4739,7 +4740,11 @@ static const char *window_idb_origin(JSContext *ctx) {
     const char *origin=JS_IsException(value)||JS_IsNull(value)?NULL:JS_ToCString(ctx,value);
     JS_FreeValue(ctx,value);return origin;
 }
-static const struct web_idb_realm window_idb_realm={window_idb_state,window_idb_authority,window_idb_origin};
+static int window_embedder_policy(JSContext *ctx) {
+    struct web_js_state *s=state(ctx);
+    return s&&s->doc?(int)s->doc->embedder_policy:HTML_COEP_UNSAFE_NONE;
+}
+static const struct web_idb_realm window_idb_realm={window_idb_state,window_idb_authority,window_idb_origin,window_embedder_policy};
 /* One completion as its own task: its promise settles, then the task's microtasks run. */
 static bool indexed_db_run_one(struct web_js_state *s) {
     if(s->disabled)return false;
@@ -7269,6 +7274,16 @@ static int fetch_transport_flags(const char *headers) {
     if(!meta||sscanf(meta+2,"HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u",&cors,&redirected,&opaque)<2||cors>1||redirected>1||opaque>1)return -1;
     return (cors?NJW_LOADED_CORS:0)|(redirected?NJW_LOADED_REDIRECTED:0)|(opaque?NJW_LOADED_OPAQUE:0);
 }
+/* What the transport noted of the response an opaque one hides (webfetch.c's resource=): 2, a URL of
+   another origin and nothing else known, when it noted nothing. Cache Storage's match checks it
+   against the matching realm's embedder policy (js_cache_storage.js). */
+static int fetch_resource_bits(const char *headers) {
+    const char *meta=headers?strstr(headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
+    const char *end=meta?strstr(meta+2,"\r\n"):NULL,*at=meta?strstr(meta+2," resource="):NULL;
+    unsigned bits=2;
+    if(at&&end&&at<end&&sscanf(at+10,"%u",&bits)==1&&bits<=7)return (int)bits;
+    return 2;
+}
 /* Consume exactly one native stream frame in its own task. Metadata/chunks
    are owned by this pending request; no JS callback runs inside network pump. */
 static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
@@ -7291,10 +7306,11 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
                 JS_NewString(s->ctx, opaque ? "" : web_response_url(&p->response)),
                 JS_NewString(s->ctx, opaque ? "" : web_response_headers(&p->response)), JS_UNDEFINED,
                 JS_NewArrayBufferCopy(s->ctx, NULL, 0), JS_NewBool(s->ctx, !opaque && (flags & NJW_LOADED_REDIRECTED)),
-                JS_UNDEFINED, JS_NewString(s->ctx, opaque ? "opaque" : (flags & NJW_LOADED_CORS) ? "cors" : "basic")};
-            bool valid = true; for (unsigned i = 0; i < 8; i++) if (JS_IsException(args[i])) valid = false;
-            value = valid ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 8, args) : JS_EXCEPTION;
-            for (unsigned i = 0; i < 8; i++) JS_FreeValue(s->ctx, args[i]);
+                JS_UNDEFINED, JS_NewString(s->ctx, opaque ? "opaque" : (flags & NJW_LOADED_CORS) ? "cors" : "basic"),
+                opaque ? JS_NewInt32(s->ctx, fetch_resource_bits(web_response_headers(&p->response))) : JS_UNDEFINED};
+            bool valid = true; for (unsigned i = 0; i < 9; i++) if (JS_IsException(args[i])) valid = false;
+            value = valid ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
+            for (unsigned i = 0; i < 9; i++) JS_FreeValue(s->ctx, args[i]);
         }
     } else if (event == WEBNET_CHUNK && !terminal) {
         p->streamed_bytes += p->response.body_len;
@@ -7500,11 +7516,12 @@ static bool process_pending(struct web_js_state *s) {
                 JSValue args[] = {JS_NewInt32(s->ctx,opaque?0:p->response.status),
                     JS_NewString(s->ctx,opaque?"":web_response_url(&p->response)[0]?web_response_url(&p->response):p->url),
                     JS_NewString(s->ctx,opaque?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
-                    JS_NewBool(s->ctx,!opaque&&redirected),JS_UNDEFINED,type};
+                    JS_NewBool(s->ctx,!opaque&&redirected),JS_UNDEFINED,type,
+                    opaque?JS_NewInt32(s->ctx,fetch_resource_bits(web_response_headers(&p->response))):JS_UNDEFINED};
                 bool valid_args = true;
-                for (int i = 0; i < 8; ++i) if (JS_IsException(args[i])) valid_args = false;
-                value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 8, args) : JS_EXCEPTION;
-                for (int i = 0; i < 8; ++i) JS_FreeValue(s->ctx, args[i]);
+                for (int i = 0; i < 9; ++i) if (JS_IsException(args[i])) valid_args = false;
+                value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 9, args) : JS_EXCEPTION;
+                for (int i = 0; i < 9; ++i) JS_FreeValue(s->ctx, args[i]);
                 if (JS_IsException(value)) { exception(s); success = false; value = JS_NewString(s->ctx, "Could not construct fetch response"); }
             } else { JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)}; value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args); JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]); }
             JSValue r = JS_Call(s->ctx, success ? p->resolve : p->reject, JS_UNDEFINED, 1, &value);
@@ -8478,7 +8495,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
     if (!s || s->running) return;
     if (s->disabled) run_native_scroll_notifications(s);
     prune_stream_scripts(s);
-    if(s->disabled && (s->storage_source || web_idb_used(&s->indexed_db)))storage_release_document(s);
+    if(s->disabled && (s->storage_source || web_idb_held(&s->indexed_db)))storage_release_document(s);
     web_idb_pump(&s->indexed_db);
     web_worker_pump(s->workers,now);
     /* Expired idle requests are ordinary watchdog-bounded tasks, not idle
@@ -9137,6 +9154,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     web_atomics_host_init(s->ctx, api);
     web_opfs_host_init(s->ctx, api, opfs_storage_url);
     web_idb_host_init(s->ctx, api, &window_idb_realm);
+    web_cache_host_init(s->ctx, api, &window_idb_realm);
     web_js_wasm_host_init(s->ctx, api);
     web_js_webgl_init(s->ctx, api, webgl_source);
     web_js_collator_init(s->ctx, api);
