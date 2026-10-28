@@ -1320,7 +1320,7 @@ struct web_doc {
     pvec marquees; /* connected candidates collected by the existing resource scan */
     char *url;      /* the document's own URL */
     char *resolved_link; /* native hit/getter URL, borrowed until this doc's next link getter */
-    char base[HTTP_URL_MAX];
+    char *base;     /* the document base URL's serialization (doc_set_base), never NULL */
     bool base_seen;
     bool quirks; /* no (or a legacy) doctype */
     /* DOM document type and content type. An XML document is not an HTML
@@ -1412,6 +1412,12 @@ bool doc_node_adopt(web_doc *d, node_t *node);
 node_t *doc_template_content(web_doc *d, node_t *node);
 bool doc_templates_finish(web_doc *d, node_t *root);
 const char *doc_link_href(web_doc *d, node_t *a); /* node-owner-relative absolute URL; valid until the next call */
+/* HTML's encoding-parse a URL relative to d: input against d's base URL, with d's
+   character encoding for the query (web_url_resolve's 1, 0 or -1; *out malloc'd). */
+int doc_encoding_parse_url(web_doc *d, const char *input, char **out);
+/* d's base URL becomes a copy of url (unchanged when it is the same); false when out of
+   memory, the base as it was. */
+bool doc_set_base(web_doc *d, const char *url);
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base);
 void doc_viewport_update(web_doc *d,int width,int height); /* size publication; no author callbacks */
 /* wanted: a cascade or text run selected it (reset by each cascade);
@@ -1647,8 +1653,6 @@ void *web_js_edit_begin(web_doc *d);
 void web_js_edit_end(void *scope);
 void web_js_selection_changed(web_doc *d, node_t *node);
 
-/* URL helpers (util.c) */
-bool url_resolve(const char *base, const char *rel, char *out, size_t n);
 /* Fetch's data URL processor. Input is a serialized URL; outputs are malloc
  * owned, binary body is length-delimited (and also NUL terminated). Return 1
  * on success, 0 for malformed input, -1 for allocation/size failure, -2 when

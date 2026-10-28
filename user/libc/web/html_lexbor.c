@@ -225,7 +225,7 @@ static bool parser_restart_encoding(struct html_parser *p){
     html_policy_rewind(d,p->initial_policy_tail);
     while(p->native_root->first)doc_node_remove(d,p->native_root->first);
     d->html=d->head=d->body=NULL;d->title=NULL;d->base_seen=d->scan_title_seen=false;
-    snprintf(d->base,sizeof d->base,"%s",p->initial_base?p->initial_base:"");
+    if(!doc_set_base(d,p->initial_base?p->initial_base:""))web_js_console(d,2,"Document base URL allocation failed");
     fresh->raw_bytes=p->raw_bytes;fresh->raw_length=p->raw_length;fresh->initial_base=p->initial_base;
     fresh->initial_policy_tail=p->initial_policy_tail;
     parser_release_content(p);*p=*fresh;free(fresh);

@@ -109,7 +109,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     f->pending_sandbox_flags=own|s->doc->sandbox_flags;
     if(s->host.debug_js && f->pending_sandbox_flags) {
         char *absolute=NULL,*origin=NULL;const char *desired=f->navigation?f->navigation:src;
-        if(web_resolve_url_owned(s->doc->base,desired,&absolute)==1)http_origin_owned(absolute,&origin);
+        if(doc_encoding_parse_url(s->doc,desired,&absolute)==1)http_origin_owned(absolute,&origin);
         char message[480];snprintf(message,sizeof message,
             "Frame sandbox policy: allow=[%s] origin=[%.160s] inherited=0x%x pending=0x%x supported=%d",
             known,origin?origin:"null",s->doc->sandbox_flags,f->pending_sandbox_flags,
@@ -158,8 +158,11 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         }else log_text(s,1,"Cross-origin javascript frame navigation blocked");
         free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return;
     }
+    /* HTML's shared attribute processing steps for iframe and frame elements:
+       encoding-parse the src relative to the element's node document (a
+       navigation's URL is already one). */
     char *url=NULL;
-    int resolved=web_resolve_url_owned(s->doc->base,desired,&url);
+    int resolved=doc_encoding_parse_url(s->doc,desired,&url);
     if(resolved==1 && !strncasecmp(url,"blob:",5)){frame_blob_commit(s,f,url);free(url);return;}
     bool valid=resolved==1 && permitted_url(s,url,false);
     free(f->navigation);f->navigation=NULL;
@@ -615,7 +618,7 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         if(argc>3 && JS_ToInt32(ctx,&mode,argv[3])){JS_FreeCString(ctx,value);result=JS_EXCEPTION;goto out;}
         if(!value)result=JS_EXCEPTION;
         else {
-            char *url=js_resolve_owned(ctx,caller->doc->base,value);
+            char *url=js_resolve_owned(ctx,caller->doc,value,true);
             if(!url)result=JS_EXCEPTION;
             else if(!permitted_url(caller,url,false))result=JS_ThrowTypeError(ctx,"Child navigation URL is not permitted");
             else if(!task_context_active(s) || frame_window_document(token)!=target || !frame_navigation_authorized(caller,target))

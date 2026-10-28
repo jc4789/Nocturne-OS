@@ -2460,18 +2460,22 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                     if(record){record->media=rest<qe?ar_strndup(pc->a,rest,(size_t)(qe-rest)):NULL;info->import=record;}
                     const struct mcond *import_condition=rest<qe?parse_condition(pc,rest,qe,media,false):media;
                     if(ok)layer_event(pc,import_layer,import_condition,info);
-                    char abs[2048];
-                    if (ok && url_resolve(pc->base, sb_cstr(&u), abs, sizeof abs)) {
+                    /* CSS's url(): UTF-8 against the style sheet's base URL. */
+                    char *abs = NULL;
+                    int resolved = ok ? web_resolve_url_owned(pc->base, sb_cstr(&u), &abs) : 0;
+                    sb_free(&u);
+                    if (resolved < 0) ar_alloc(pc->a, SIZE_MAX);
+                    if (resolved == 1) {
                         if (record) { record->url = ar_strdup(pc->a, abs); pc->sh->import_urls++; }
-                        if (pc->imports) {
-                            struct css_import *im = malloc(sizeof *im);
-                            im->url = strdup(abs);
+                        struct css_import *im = pc->imports ? malloc(sizeof *im) : NULL;
+                        if (im) {
+                            im->url = abs; abs = NULL;
                             im->order = pc->sh->order - 0.1 + 0.001 * pc->nimports++;
                             im->owner=info;
                             pv_push(pc->imports, im);
-                        }
+                        } else if (pc->imports) { free(abs); ar_alloc(pc->a, SIZE_MAX); }
                     }
-                    sb_free(&u);
+                    free(abs);
                 }
                 s = p < e ? p + 1 : e;
                 continue;

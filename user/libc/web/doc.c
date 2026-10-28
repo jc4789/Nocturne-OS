@@ -27,6 +27,7 @@
 #include "html_encoding.h"
 #include "html_lexbor.h"
 #include "cssom.h"
+#include "web_url.h"
 #include <limits.h>
 
 /* Document arenas and stylesheet storage grow through the OS allocator. */
@@ -377,10 +378,37 @@ void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *
     add_sheet(d, css, n, base, d->next_sheet_order++, NULL, NULL);
 }
 
-static char *doc_absolute_url(const char *base,const char *relative) {
+/* The document's character encoding, the URL parser's for a query (failure,
+   an empty name, is UTF-8). */
+static web_encoding doc_url_encoding(const web_doc *d) {
+    return web_encoding_get(d->encoding, strlen(d->encoding));
+}
+int doc_encoding_parse_url(web_doc *d, const char *input, char **out) {
+    return web_url_resolve(d->base, input, doc_url_encoding(d), out);
+}
+bool doc_set_base(web_doc *d, const char *url) {
+    if (d->base && !strcmp(d->base, url)) return true;
+    char *copy = strdup(url);
+    if (!copy) return false;
+    free(d->base); d->base = copy;
+    return true;
+}
+/* HTML's encoding-parse-and-serialize a URL relative to d: NULL for failure
+   (or out of memory). */
+static char *doc_absolute_url(web_doc *d,const char *relative) {
     char *url=NULL;
-    if(web_resolve_url_owned(base,relative,&url)==1)return url;
-    free(url);return NULL;
+    return doc_encoding_parse_url(d,relative,&url)==1?url:NULL;
+}
+/* HTML's "set the frozen base URL": href against the fallback base URL with
+   the document's character encoding; failure, a data: or a javascript: URL
+   leaves the fallback. */
+static void doc_frozen_base(web_doc *d,const char *href) {
+    const char *fallback=web_effective_url(d);
+    char *url=NULL;
+    if(web_url_resolve(fallback,href,doc_url_encoding(d),&url)!=1 ||
+       !strncmp(url,"data:",5) || !strncmp(url,"javascript:",11)){free(url);url=NULL;}
+    if(!doc_set_base(d,url?url:fallback))web_js_console(d,2,"Document base URL allocation failed");
+    free(url);
 }
 static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred,bool image_upgrade,int cors,int referrer_policy) {
     if (preferred >= 0 && preferred < d->images.n) {
@@ -420,13 +448,16 @@ static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int prefer
     }
     return idx;
 }
-static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred,bool image_upgrade,int cors,int referrer_policy) {
+/* An image's URL is HTML's (encoding-parse a URL relative to d), or with
+   css CSS's url() (UTF-8 against d's base URL). */
+static int add_image_request(web_doc *d, const char *rel, bool css, bool retry_failed, int preferred,bool image_upgrade,int cors,int referrer_policy) {
     if(!rel || !*rel)return -1;
     while(is_space((unsigned char)*rel))rel++;
-    char *abs=doc_absolute_url(d->base,rel);if(!abs)return -1;
+    char *abs=NULL;
+    if((css?web_resolve_url_owned(d->base,rel,&abs):doc_encoding_parse_url(d,rel,&abs))!=1)return -1;
     int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade,cors,referrer_policy);free(abs);return result;
 }
-static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1,true,WEB_IMAGE_NO_CORS,WEBNET_REFERRER_DEFAULT); }
+static int add_image(web_doc *d, const char *rel, bool css) { return add_image_request(d, rel, css, false, -1,true,WEB_IMAGE_NO_CORS,WEBNET_REFERRER_DEFAULT); }
 int doc_element_referrer_policy(const node_t *n) {
     const char *value=n&&n->type==N_ELEM?node_attr((node_t *)n,"referrerpolicy"):NULL;
     char token[40];size_t length=value?strlen(value):0;
@@ -489,7 +520,7 @@ void doc_image_sync(web_doc *d, node_t *n) {
     int cors = image_cors(n);
     bool image_upgrade=!ss && cors==WEB_IMAGE_NO_CORS &&
         !(n->parent && !n->parent->foreign && n->parent->tag==T_picture);
-    int requested = add_image_request(d, src, n->image_invalidated,
+    int requested = add_image_request(d, src, false, n->image_invalidated,
         n->image_initialized && !n->image_invalidated ? n->image_request : -1,image_upgrade,cors,doc_element_referrer_policy(n));
     free(pick);
     if (!n->image_initialized || n->image_invalidated || requested != n->image_request || has_source != n->image_has_source) {
@@ -576,7 +607,7 @@ int doc_cssom_link_source(web_doc *d,node_t *n,struct cssom_link_source *source)
     if(!d||!n||n->owner!=d||!d->live||d->inert||!link_stylesheet(n)||
         doc_node_root(n,true)!=d->root||node_ancestor(n,T_template))return CSSOM_INACTIVE;
     const char *href=node_attr(n,"href");if(!href||!*href)return CSSOM_INACTIVE;
-    int resolved=web_resolve_url_owned(d->base,href,&source->url);
+    int resolved=doc_encoding_parse_url(d,href,&source->url);
     if(resolved!=1)return resolved<0?CSSOM_OOM:CSSOM_INACTIVE;
     if(!strncasecmp(source->url,"data:",5)) {
         int result;source->owned_text=data_url(d,source->url,&source->length,&result);
@@ -592,7 +623,7 @@ bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation) {
         doc_node_root(n,true) != d->root || n->stylesheet_owner != d || n->stylesheet_generation != generation ||
         !n->stylesheet_url || !link_stylesheet(n)) return false;
     const char *href = node_attr(n,"href");
-    char *url = href && *href ? doc_absolute_url(d->base,href) : NULL;
+    char *url = href && *href ? doc_absolute_url(d,href) : NULL;
     bool current = url && !strcmp(url,n->stylesheet_url);
     free(url); return current;
 }
@@ -615,9 +646,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             if (scope) break;
             const char *h = node_attr(c, "href");
             if (h && !d->base_seen) { /* only the first <base> counts */
-                char *abs=doc_absolute_url(web_effective_url(d),h);
-                if(abs)snprintf(d->base,sizeof d->base,"%s",abs);
-                free(abs);
+                doc_frozen_base(d,h);
                 d->base_seen = true;
             }
             break;
@@ -666,7 +695,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                     char *q = strpbrk(tmp, "'\"");
                     if (q) *q = 0;
                 }
-                char *abs=doc_absolute_url(d->base,*tmp?tmp:d->url);
+                char *abs=doc_absolute_url(d,*tmp?tmp:d->url);
                 if(abs)d->refresh_url=ar_strdup(&d->mem,abs);
                 free(abs);free(tmp);
             }
@@ -683,7 +712,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
                Preserve its screen-only pending-resource API, while live
                documents may fetch inactive sheets for CSSOM/load events. */
             if (!d->live && !link_sheet_applies(c)) break;
-            char *abs=doc_absolute_url(d->base,href);if(!abs)break;
+            char *abs=doc_absolute_url(d,href);if(!abs)break;
             if (d->live && (c->stylesheet_owner != d || !c->stylesheet_url || strcmp(c->stylesheet_url,abs))) {
                 c->stylesheet_url = ar_strdup(&d->mem,abs);
                 c->stylesheet_owner = d;
@@ -751,7 +780,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
         case T_img: doc_image_sync(d, c); break;
         case T_input: {
             const char *t = node_attr(c, "type");
-            if (t && str_ieq(t, "image")) c->image = add_image(d, node_attr(c, "src"));
+            if (t && str_ieq(t, "image")) c->image = add_image(d, node_attr(c, "src"), false);
             doc_control_init(d, c);
             break;
         }
@@ -817,8 +846,8 @@ web_doc *doc_inert_new(web_doc *family, const char *url) {
     d->inert = true; d->custom_registry_id = -1; d->dom_family = family;
     d->referrer_policy=referrer_policy;
     d->url = strdup(url && *url ? url : "about:blank");
-    if (!d->url) { free(d); return NULL; }
-    snprintf(d->base, sizeof d->base, "%s", d->url);
+    d->base = d->url ? strdup(d->url) : NULL;
+    if (!d->base) { free(d->url); free(d); return NULL; }
     family->dom_family = family;
     d->dom_next = family->dom_docs; family->dom_docs = d;
     doc_dom_budget(d);
@@ -869,7 +898,8 @@ web_doc *web_parse(const char *html, size_t len, const char *url, const char *ch
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->url = strdup(url && *url ? url : "about:blank");
-    snprintf(d->base, sizeof d->base, "%s", d->url);
+    d->base = d->url ? strdup(d->url) : NULL;
+    if (!d->base) { free(d->url); free(d); return NULL; }
     d->root = html_parse(d, html ? html : "", html ? len : 0, charset);
     d->need_style = true;
     if (d->root) scan(d, d->root, NULL);
@@ -924,8 +954,8 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     d->mem.limit = 0;
     d->cssmem.limit = 0;
     d->url = strdup(url && *url ? url : "about:blank");
-    if (!d->url) { free((void *)d->inherited_url);free(d); return NULL; }
-    snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
+    d->base = d->url ? strdup(web_effective_url(d)) : NULL;
+    if (!d->base) { free(d->url);free((void *)d->inherited_url);free(d); return NULL; }
     if(!html_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
     html_policy_isolation(d,headers,inherited_origin);
     if(!web_presentation_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
@@ -1013,12 +1043,8 @@ void doc_sync_tree(web_doc *d) {
     node_t *base = first_base(d, d->root, &profile->metadata_visits);
     if (d->native_cancelled) return; /* never publish a cancelled partial tree */
     d->html=html;d->head=head;d->body=body;
-    snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
-    if (base) {
-        char *url=doc_absolute_url(web_effective_url(d),node_attr(base,"href"));
-        if(url)snprintf(d->base,sizeof d->base,"%s",url);
-        free(url);
-    }
+    if (base) doc_frozen_base(d,node_attr(base,"href"));
+    else if (!doc_set_base(d,web_effective_url(d))) web_js_console(d,2,"Document base URL allocation failed");
     d->metadata_revision=d->dom_revision;d->metadata_valid=true;
     if (d->profile_enabled) profile->metadata_ms += uptime_ms() - start;
 }
@@ -1056,7 +1082,7 @@ void doc_rescan(web_doc *d) {
     d->scan_title_seen = false;
     d->refresh_url = NULL;
     d->refresh_delay = 0;
-    snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
+    if (!doc_set_base(d,web_effective_url(d))) web_js_console(d,2,"Document base URL allocation failed");
     d->html = d->head = d->body = NULL;
     for (node_t *n = d->root ? d->root->first : NULL; n; n = n->next)
         if (n->type == N_ELEM) { d->html = n; break; }
@@ -1591,6 +1617,7 @@ void web_free(web_doc *d) {
     ar_free(&d->cssmem);
     sheet_reuse_sweep(d,true);
     free(d->url);
+    free(d->base);
     free(d->resolved_link);
     free(d->find_text);
     free((void *)d->inherited_url);
@@ -1608,8 +1635,7 @@ bool web_set_url(web_doc *d, const char *url) {
     if (!copy) return false;
     free(d->url); d->url = copy;
     d->metadata_valid=false;
-    if (!d->base_seen) snprintf(d->base, sizeof d->base, "%s", url);
-    return true;
+    return d->base_seen || doc_set_base(d, url);
 }
 const char *web_control_value(web_node *control) { return control ? web_input_edit_text(control) : NULL; }
 
@@ -1700,11 +1726,11 @@ void web_image_loaded(web_doc *d, int i, const void *data, size_t n, bool origin
 /* CSS background images are known once styles are: add them to the document's images */
 static void bg_images(web_doc *d, style_t *st) {
     if (st && st->bg_image && !st->bg_img) {
-        int i = add_image(d, st->bg_image);
+        int i = add_image(d, st->bg_image, true);
         st->bg_img = i >= 0 ? i + 1 : 0;
     }
     if (st && st->mask_image && !st->mask_img) {
-        int i = add_image(d, st->mask_image);
+        int i = add_image(d, st->mask_image, true);
         st->mask_img = i >= 0 ? i + 1 : 0;
     }
 }
@@ -2310,7 +2336,7 @@ const char *doc_link_href(web_doc *d, node_t *a) {
     while (is_space((unsigned char)*h)) h++;
     if (!strncasecmp(h, "javascript:", 11)) return NULL;
     char *resolved=NULL;
-    if(web_resolve_url_owned(d->base,h,&resolved)!=1)return NULL;
+    if(doc_encoding_parse_url(d,h,&resolved)!=1)return NULL;
     free(d->resolved_link);d->resolved_link=resolved;
     return d->resolved_link;
 }

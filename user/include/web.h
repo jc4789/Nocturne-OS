@@ -421,10 +421,10 @@ const char *web_url(web_doc *d);
 /* <meta http-equiv="refresh" content="N; url=...">: the absolute URL, or NULL */
 const char *web_refresh_url(web_doc *d, int *delay_s);
 
-/* resolve a (possibly relative) URL against base into out; false if it cannot be made absolute */
-bool web_resolve_url(const char *base, const char *rel, char *out, size_t n);
-/* Fresh malloc output: 1 resolved, 0 invalid/representation overflow, -1 OOM.
-   No legacy fixed-buffer URL quota; caller frees successful output. */
+/* The URL Standard's URL parser, UTF-8 for the query: rel against base (NULL, or a
+   base that is not a URL: none). 1: *out is the URL's serialization, malloc'd for
+   the caller to free; 0: rel is not a URL (*out NULL); -1: out of memory. No
+   length limit. */
 int web_resolve_url_owned(const char *base, const char *rel, char **out);
 
 /* ---- resources ---- */
