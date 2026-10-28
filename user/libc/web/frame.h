@@ -60,7 +60,7 @@ bool web_frame_commit(struct web_frame *frame, const char *html, size_t length,
 bool web_frame_commit_response(struct web_frame *frame,const char *html,size_t length,
                       const char *url,const char *charset,const char *headers,const char *type,
                       const struct web_host *host,bool inherited);
-void web_frames_free(web_doc *document);
+web_doc *web_frames_detach(web_doc *document);
 void web_frames_tick(web_doc *document, uint64_t now);
 int64_t web_frames_deadline(web_doc *document);
 bool web_frames_busy(web_doc *document);

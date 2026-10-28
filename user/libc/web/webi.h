@@ -1708,6 +1708,7 @@ struct web_doc {
     node_t *window_token; /* stable for navigation, distinct after removal */
     struct web_frame *frame_container;
     web_doc *frame_free_next;
+    web_doc *frame_docs; /* web_free: the frames' documents (web_frames_detach), released with this one */
     struct web_profile profile;
     bool profile_enabled; /* debug_js only; diagnostic counters remain cheap */
     uint8_t clamp_trace_reported; /* at most four numeric diagnostics per document */

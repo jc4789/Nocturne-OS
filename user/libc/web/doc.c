@@ -1633,6 +1633,7 @@ bool doc_css_loading(web_doc *d) {
    three steps, so that no step reads a member that an earlier step freed: each member's own state
    (scripts, styles, boxes, animations, parsers), then every member's allocation-owned nodes, then
    every member's storage. */
+static void family_release(web_doc *member);
 static void doc_release(web_doc *d) {
     while (d->scroll_input_first) {
         node_t *n = d->scroll_input_first;
@@ -1651,7 +1652,11 @@ static void doc_release(web_doc *d) {
     css_styling_free(&d->sty);
     web_dialog_free(d);
     web_avmedia_free(d);
-    web_frames_free(d);
+    /* The frames' documents are released here, before this realm, and keep their nodes and
+       allocations until web_free retires and frees this document's: a node can be adopted
+       between a document and its frames' documents in either direction. */
+    d->frame_docs = web_frames_detach(d);
+    for (web_doc *c = d->frame_docs; c; c = c->frame_free_next) { doc_release(c); family_release(c->dom_docs); }
     web_js_free(d);
     html_policy_free(d);
     web_animations_doc_free(d);
@@ -1739,23 +1744,45 @@ static void doc_storage_free(web_doc *d) {
 static void family_release(web_doc *member) {
     for (; member; member = member->dom_next) { doc_release(member); family_release(member->dom_docs); }
 }
+static void frames_retire(web_doc *c);
 static void family_retire(web_doc *member) {
-    for (; member; member = member->dom_next) { family_retire(member->dom_docs); doc_nodes_retire(member); }
+    for (; member; member = member->dom_next) { family_retire(member->dom_docs); doc_nodes_retire(member); frames_retire(member->frame_docs); }
+}
+/* A frames' documents list is flat (web_frames_detach): only a family member's own frames add
+   another level. */
+static void frames_retire(web_doc *c) {
+    for (; c; c = c->frame_free_next) { family_retire(c->dom_docs); doc_nodes_retire(c); frames_retire(c->frame_docs); }
+}
+static void family_free(web_doc *d);
+static void frames_free(web_doc *c) {
+    while (c) {
+        web_doc *next = c->frame_free_next; c->frame_free_next = NULL;
+        frames_free(c->frame_docs); c->frame_docs = NULL;
+        family_free(c);
+        doc_storage_free(c);
+        c = next;
+    }
 }
 static void family_free(web_doc *d) {
     while (d->dom_docs) {
         web_doc *child = d->dom_docs;
         d->dom_docs = child->dom_next; child->dom_next = NULL;
         family_free(child);
+        frames_free(child->frame_docs); child->frame_docs = NULL;
         doc_storage_free(child);
     }
 }
+/* Three stages over the document, its family (dom_docs) and its frames' documents (theirs too):
+   every state, then every node, then every allocation. A node's allocation owner and DOM owner
+   can be any two of them after adoption, so no stage may free what another's nodes still name. */
 void web_free(web_doc *d) {
     if (!d) return;
     doc_release(d);
     family_release(d->dom_docs);
     family_retire(d->dom_docs);
     doc_nodes_retire(d);
+    frames_retire(d->frame_docs);
+    frames_free(d->frame_docs); d->frame_docs = NULL;
     family_free(d);
     doc_storage_free(d);
 }

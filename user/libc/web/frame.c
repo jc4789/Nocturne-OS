@@ -309,8 +309,12 @@ void web_frames_socket_event(web_doc *d,uint64_t id,const struct web_socket_even
     }
     running=false;
 }
-void web_frames_free(web_doc *d) {
-    if(!d)return;
+/* The frames' documents (theirs too, and the ones each navigation retired), detached from d and
+   its frames, in the order web_free releases them: each before the documents it was discovered
+   from, so every descendant's native owner outlives its realm and cache finalizers. The list is
+   linked by frame_free_next; web_free releases, retires and frees them with d's own stages. */
+web_doc *web_frames_detach(web_doc *d) {
+    if(!d)return NULL;
     web_doc *pending=d,*finished=NULL;
     while(pending) {
         web_doc *current=pending;pending=current->frame_free_next;current->frame_free_next=NULL;
@@ -322,9 +326,8 @@ void web_frames_free(web_doc *d) {
         }
         if(current!=d){current->frame_free_next=finished;finished=current;}
     }
-    /* Reverse discovery keeps every descendant's native owner alive until
-     * its realm/cache finalizers have completed. All frame lists are empty. */
-    while(finished){web_doc *old=finished;finished=old->frame_free_next;old->frame_free_next=NULL;web_free(old);}
+    /* Reverse discovery. All frame lists are empty. */
+    return finished;
 }
 static bool frame_viewport_commit(struct web_frame *f) {
     box_t *b=f->element?f->element->box:NULL;

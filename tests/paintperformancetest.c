@@ -331,7 +331,7 @@ static int scroll_inputs(void){
     check(d!=NULL,"sibling allocation-owner pending lifetime document");
     if(d){
         web_frames_prepare_paint(d,NULL);web_frames_finish_paint(d);
-        /* web_frames_free reverses discovery into frame-list order. Allocate
+        /* web_frames_detach reverses discovery into frame-list order. Allocate
            in its first sibling and queue in the later sibling, exercising the
            unsafe allocation-owner-first direction without fabricating nodes. */
         struct web_frame *allocation=d->frames,*destination=allocation?allocation->next:NULL;

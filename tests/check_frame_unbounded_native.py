@@ -10,7 +10,7 @@ def function(text,sig):
     at=text.index(sig);return text[at:text.index("\n}",at)+2]+"\n"
 at=header.index("struct web_frame {")
 structure=header[at:header.index("\n};",at)+3]
-functions="".join(function(source,s) for s in ("const char *web_effective_url(","bool web_frame_element(","node_t *web_frame_dom_next(","struct web_frame *web_frame_walk_next(","int web_frame_ancestor_url(","struct web_frame *web_frame_find(","struct web_frame *web_frame_ensure(","void web_frame_retire(","bool web_frame_commit(","void web_frames_tick(","int64_t web_frames_deadline(","void web_frames_loaded(","void web_frames_free(","static bool frame_surface_prepare(","void web_frames_prepare_paint(","void web_frames_finish_paint(","bool web_frame_paint("))
+functions="".join(function(source,s) for s in ("const char *web_effective_url(","bool web_frame_element(","node_t *web_frame_dom_next(","struct web_frame *web_frame_walk_next(","int web_frame_ancestor_url(","struct web_frame *web_frame_find(","struct web_frame *web_frame_ensure(","void web_frame_retire(","bool web_frame_commit(","void web_frames_tick(","int64_t web_frames_deadline(","void web_frames_loaded(","web_doc *web_frames_detach(","static bool frame_surface_prepare(","void web_frames_prepare_paint(","void web_frames_finish_paint(","bool web_frame_paint("))
 address=(root / "user/libc/web/frame_address.h").read_text(encoding="utf-8")
 cases=(root / "tests/frame_unbounded_native_cases.c").read_text(encoding="utf-8")
 c=out / "frame-unbounded-native-generated.c"

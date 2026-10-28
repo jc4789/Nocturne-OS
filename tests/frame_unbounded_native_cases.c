@@ -46,7 +46,7 @@ static void web_js_retire(web_doc *d){d->live=false;}
 void web_frames_tick(web_doc *d,uint64_t now);
 int64_t web_frames_deadline(web_doc *d);
 void web_frames_loaded(web_doc *d,uint64_t id,const struct web_response *r);
-void web_frames_free(web_doc *d);
+web_doc *web_frames_detach(web_doc *d);
 bool web_frame_paint(node_t *n,canvas_t *c,int x,int y,int w,int h);
 static void web_tick(web_doc *d,uint64_t now){ticks++;web_frames_tick(d,now);}
 static bool web_dirty(web_doc *d){bool dirty=d->dirty;d->dirty=false;return dirty;}
@@ -55,7 +55,9 @@ static bool web_js_complete(web_doc *d){(void)d;return true;}
 static bool web_dispatch(web_doc *d,node_t *n,const struct web_event *event){(void)d;(void)n;(void)event;return true;}
 static int64_t web_deadline(web_doc *d){int64_t n=web_frames_deadline(d);return n<0?17:n;}
 static void web_resource_loaded(web_doc *d,uint64_t id,const struct web_response *r){resources++;web_frames_loaded(d,id,r);}
-static void web_free(web_doc *d){if(d){web_frames_free(d);frees++;free(d);}}
+/* web_free's last stage over the list web_frames_detach hands it; this fixture's documents have no
+   realm or nodes to release and retire first. */
+static void frames_free(web_doc *d){for(web_doc *c=web_frames_detach(d);c;){web_doc *next=c->frame_free_next;c->frame_free_next=NULL;frees++;free(c);c=next;}}
 static int web_layout(web_doc *d,int w,int h){(void)d;(void)w;(void)h;layouts++;return 0;}
 static void web_paint(web_doc *d,canvas_t *c,int x,int y,int w,int h,int sx,int sy){
     (void)sx;(void)sy;paints++;publish_depth++;if(publish_depth>max_depth)max_depth=publish_depth;
@@ -75,7 +77,7 @@ int main(void){
     check(web_frame_ancestor_url(&root,"https://EXAMPLE.test:443/top#next")==1,"same ancestor URL excludes fragment and canonical origin");
     check(web_frame_ancestor_url(&root,"https://example.test/other")==0,"same domain different resource allowed");
     check(web_frame_ancestor_url(&root,"https://example.test/top?x=1")==0,"different query allowed");
-    web_frames_free(&root);check(!root.frames&&frees==180,"all uncapped retired documents freed");
+    frames_free(&root);check(!root.frames&&frees==180,"all uncapped retired documents freed");
     enum {DEPTH=2048};node_t *nodes=calloc(DEPTH,sizeof *nodes);box_t *boxes=calloc(DEPTH,sizeof *boxes);style_t style={.display=D_BLOCK};
     web_doc *parent=&root;struct web_frame *leaf=NULL;
     for(int i=0;i<DEPTH;i++){
@@ -93,7 +95,7 @@ int main(void){
     check(!leaf->paint.px,"consumed child surfaces released before top publication");
     web_frames_finish_paint(&root);check(!root.frames->paint.px,"paint completion releases native surfaces");
     leaf->detached=true;check(web_frame_address(&root)==NULL,"stale deep address selection rejected");
-    int before=frees;web_frames_free(&root);check(frees-before==DEPTH&&!root.frames,"deep postorder teardown without native stack growth");
+    int before=frees;frames_free(&root);check(frees-before==DEPTH&&!root.frames,"deep postorder teardown without native stack growth");
     node_t *tree=calloc(2049,sizeof *tree);for(int i=0;i<2048;i++){tree[i].first=&tree[i+1];tree[i+1].parent=&tree[i];}
     count=0;for(node_t *n=tree;n;n=web_frame_dom_next(tree,n))count++;
     check(count==2049,"DOM traversal exceeds removed depth400 gate");free(tree);
