@@ -506,6 +506,15 @@ static int add_image_request(web_doc *d, const char *rel, bool css, bool retry_f
     int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade,cors,referrer_policy);free(abs);return result;
 }
 static int add_image(web_doc *d, const char *rel, bool css) { return add_image_request(d, rel, css, false, -1,true,WEB_IMAGE_NO_CORS,WEBNET_REFERRER_DEFAULT); }
+int doc_css_image(web_doc *d, const struct css_image *image) {
+    if (!d || !image || image->kind != CSS_IMAGE_URL) return -1;
+    struct css_image *cached = (struct css_image *)image; /* the value's cache of its document image */
+    if (!cached->img) {
+        int i = add_image(d, image->url, true);
+        cached->img = i >= 0 ? i + 1 : -1;
+    }
+    return cached->img > 0 ? cached->img - 1 : -1;
+}
 int doc_element_referrer_policy(const node_t *n) {
     const char *value=n&&n->type==N_ELEM?node_attr((node_t *)n,"referrerpolicy"):NULL;
     char token[40];size_t length=value?strlen(value):0;

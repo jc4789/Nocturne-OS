@@ -89,7 +89,7 @@ extern const char *const tag_names[T_COUNT];
 
 /* PE_SLOTTED selects assigned elements, never a generated pseudo box. Keep
    that existing selector marker in the same value namespace as real pseudos. */
-enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER, PE_BACKDROP, PE_SLOTTED, PE_PLACEHOLDER };
+enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER, PE_BACKDROP, PE_SLOTTED, PE_PLACEHOLDER, PE_MARKER };
 
 enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE, N_PI, N_ATTR };
 /* An element's namespace: the three the renderer knows, the null namespace,
@@ -704,8 +704,91 @@ enum { WS_NORMAL, WS_PRE, WS_NOWRAP, WS_PRE_WRAP, WS_PRE_LINE, WS_BREAK_SPACES }
 enum { TO_CLIP, TO_ELLIPSIS };
 enum { TA_LEFT, TA_RIGHT, TA_CENTER, TA_JUSTIFY, TA_WCENTER /* -webkit-center: also centers blocks */ };
 enum { VA_BASELINE, VA_SUB, VA_SUPER, VA_TOP, VA_MIDDLE, VA_BOTTOM, VA_TEXT_TOP, VA_TEXT_BOTTOM, VA_LEN };
-enum { LS_DISC, LS_CIRCLE, LS_SQUARE, LS_DECIMAL, LS_DECIMAL_LZ, LS_LOWER_ALPHA, LS_UPPER_ALPHA,
-       LS_LOWER_ROMAN, LS_UPPER_ROMAN, LS_LOWER_GREEK, LS_NONE, LS_STRING };
+/* CSS Counter Styles 3 §6: the predefined counter styles a <counter-style-name> matches ASCII
+   case-insensitively (§3.1), each an LS_* value; counter.c holds their definitions. A
+   list-style-type or counter() style is one of them, none, a <string> (list-style-type only),
+   another name (LS_NAMED, case-sensitive; no @counter-style rule defines it, so it is decimal) or
+   symbols() (LS_SYMBOLS). */
+#define CSS_COUNTER_STYLES(X)                                                                                      \
+    X(DISC, "disc") X(CIRCLE, "circle") X(SQUARE, "square") X(DISCLOSURE_OPEN, "disclosure-open")                 \
+    X(DISCLOSURE_CLOSED, "disclosure-closed") X(DECIMAL, "decimal") X(DECIMAL_LEADING_ZERO, "decimal-leading-zero") \
+    X(ARABIC_INDIC, "arabic-indic") X(ARMENIAN, "armenian") X(UPPER_ARMENIAN, "upper-armenian")                   \
+    X(LOWER_ARMENIAN, "lower-armenian") X(BENGALI, "bengali") X(CAMBODIAN, "cambodian") X(KHMER, "khmer")         \
+    X(CJK_DECIMAL, "cjk-decimal") X(DEVANAGARI, "devanagari") X(GEORGIAN, "georgian") X(GUJARATI, "gujarati")     \
+    X(GURMUKHI, "gurmukhi") X(HEBREW, "hebrew") X(KANNADA, "kannada") X(LAO, "lao") X(MALAYALAM, "malayalam")     \
+    X(MONGOLIAN, "mongolian") X(MYANMAR, "myanmar") X(ORIYA, "oriya") X(PERSIAN, "persian")                       \
+    X(LOWER_ROMAN, "lower-roman") X(UPPER_ROMAN, "upper-roman") X(TAMIL, "tamil") X(TELUGU, "telugu")             \
+    X(THAI, "thai") X(TIBETAN, "tibetan") X(LOWER_ALPHA, "lower-alpha") X(LOWER_LATIN, "lower-latin")             \
+    X(UPPER_ALPHA, "upper-alpha") X(UPPER_LATIN, "upper-latin") X(LOWER_GREEK, "lower-greek")                     \
+    X(HIRAGANA, "hiragana") X(HIRAGANA_IROHA, "hiragana-iroha") X(KATAKANA, "katakana")                           \
+    X(KATAKANA_IROHA, "katakana-iroha") X(CJK_EARTHLY_BRANCH, "cjk-earthly-branch")                                \
+    X(CJK_HEAVENLY_STEM, "cjk-heavenly-stem")
+enum {
+#define CSS_COUNTER_STYLE_ID(id, name) LS_##id,
+    CSS_COUNTER_STYLES(CSS_COUNTER_STYLE_ID)
+#undef CSS_COUNTER_STYLE_ID
+    LS_PREDEFINED, /* the count of the predefined styles */
+    LS_NONE = LS_PREDEFINED, LS_STRING, LS_NAMED, LS_SYMBOLS
+};
+/* symbols() (§6.1): its type and symbols, each a decoded string */
+enum { CSS_SYMBOLS_CYCLIC, CSS_SYMBOLS_NUMERIC, CSS_SYMBOLS_ALPHABETIC, CSS_SYMBOLS_SYMBOLIC, CSS_SYMBOLS_FIXED };
+struct css_symbols { uint8_t type; uint32_t n; const char *symbol[]; };
+/* a counter style as a value names it: id an LS_*; name the LS_STRING string or the LS_NAMED
+   name; symbols the LS_SYMBOLS function */
+struct css_counter_style { uint8_t id; const char *name; const struct css_symbols *symbols; };
+/* CSS Lists 3 §4.1-4.3: counter-reset, counter-increment and counter-set, each a list of
+   (name, value) in their order; NULL is none. A reset's value may be reversed() and not given. */
+enum { CSS_COUNTER_RESET, CSS_COUNTER_INCREMENT, CSS_COUNTER_SET };
+struct css_counter_op { const char *name; int32_t value; bool reversed, valued; };
+struct css_counter_ops { uint32_t n; struct css_counter_op op[]; };
+struct css_counters { const struct css_counter_ops *ops[3]; }; /* by CSS_COUNTER_* */
+extern const struct css_counters css_counters_initial;
+/* an <image> of list-style-image or content: a url() (url as the style sheet's base resolves it)
+   or a gradient (text: its serialization; gradient: what the background layer's parser reads
+   of it, NULL when it does not) */
+enum { CSS_IMAGE_URL, CSS_IMAGE_GRADIENT };
+/* img: its index in the document's images + 1, found once the image is first used (a marker's:
+   counter.c), 0 until then, -1 when it cannot be fetched */
+struct css_image { uint8_t kind; const char *url; const char *text; const struct gradient *gradient; int img; };
+/* quotes (CSS Generated Content 3 §2.1): pairs of strings, open then close; NULL is auto, no
+   pair none */
+struct css_quotes { uint32_t pairs; const char *quote[]; };
+/* the inherited list and quotation values (CSS Lists 3 §3, CSS Generated Content 3 §2.1) held by
+   pointer (style_t's list): list-style-type's name or symbols (its id is style_t's list_style),
+   list-style-image (NULL: none) and quotes */
+struct css_list {
+    const char *type_name;                  /* LS_STRING: the string; LS_NAMED: the name */
+    const struct css_symbols *type_symbols; /* LS_SYMBOLS */
+    const struct css_image *image;
+    const struct css_quotes *quotes;
+};
+extern const struct css_list css_list_initial;
+/* content (CSS Generated Content 3 §1.1): the items of its content list, then those of its
+   alternative text. A style's content NULL is normal; css_content_none is none. attr() is
+   substituted at computed-value time, as a string item. */
+enum { CSS_CONTENT_STRING, CSS_CONTENT_COUNTER, CSS_CONTENT_COUNTERS, CSS_CONTENT_OPEN_QUOTE,
+       CSS_CONTENT_CLOSE_QUOTE, CSS_CONTENT_NO_OPEN_QUOTE, CSS_CONTENT_NO_CLOSE_QUOTE, CSS_CONTENT_IMAGE,
+       CSS_CONTENT_ATTR /* attr() as written, in a value no element computes (a declaration's CSSOM text) */ };
+struct css_content_item {
+    uint8_t kind;
+    const char *text;      /* STRING: the string; COUNTER(S): the counter's name */
+    const char *separator; /* COUNTERS */
+    struct css_counter_style style; /* COUNTER(S) */
+    const struct css_image *image;  /* IMAGE */
+};
+struct css_content { uint32_t n, alt; bool none; struct css_content_item item[]; }; /* item[n .. n+alt): alt text */
+extern const struct css_content css_content_none;
+/* the same computed values (NULL: the initial ones, or normal) */
+bool css_list_equal(const struct css_list *a, const struct css_list *b);
+bool css_counters_equal(const struct css_counters *a, const struct css_counters *b);
+bool css_content_equal(const struct css_content *a, const struct css_content *b);
+/* whether content holds an item that counters or quotes decide (counter.c writes its text) */
+bool css_content_counted(const struct css_content *c);
+/* the text of content's strings alone (its counters and quotes left out) */
+void css_content_strings(const struct css_content *c, sbuf *out);
+/* CSS Counter Styles 3 §2.2: value represented in style (a marker's representation with the style's
+   prefix and suffix), appended to out (counter.c) */
+void css_counter_text(const struct css_counter_style *style, int32_t value, bool marker, sbuf *out);
 enum { BS_NONE, BS_HIDDEN, BS_SOLID, BS_DASHED, BS_DOTTED, BS_DOUBLE, BS_GROOVE, BS_RIDGE, BS_INSET, BS_OUTSET };
 enum { TT_NONE, TT_UPPER, TT_LOWER, TT_CAPITALIZE };
 enum { TD_UNDERLINE = 1, TD_OVERLINE = 2, TD_LINE_THROUGH = 4 };
@@ -915,8 +998,9 @@ typedef struct style {
     struct css_motion motion; /* animation-* and transition-*; not inherited */
     bool animated; /* the cascade applied animation or transition values to this style */
     int z_index, order;
-    const char *content; /* ::before / ::after text, NULL = none */
-    const char *list_style_string;
+    const struct css_content *content; /* NULL: normal (none, for ::before and ::after) */
+    const struct css_list *list;       /* list-style-type's name, list-style-image, quotes; NULL: initial */
+    const struct css_counters *counters; /* counter-*: a group that is not inherited; NULL: none */
     const char *bg_image; /* url() of background-image (absolute, or relative to the document) */
     int bg_img;           /* its index in the document's images + 1, or 0 (set after the cascade) */
     uint8_t bg_repeat;    /* BR_* */
@@ -940,6 +1024,7 @@ typedef struct style {
     bool explicit_inherit; /* some property that is not inherited took its parent's value */
     struct custom_prop *vars;
     struct style *before, *after, *backdrop, *placeholder;
+    struct style *marker; /* a list item's ::marker with declarations of its own; NULL: css_style_marker() */
 } style_t;
 /* a style's float shape and Motion Path values, the initial ones when it holds no group */
 static inline const struct css_float_shape *css_style_float_shape(const style_t *s) {
@@ -954,6 +1039,17 @@ static inline const struct css_gap_rules *css_style_gap_rules(const style_t *s) 
 static inline const struct css_anchor *css_style_anchor(const style_t *s) {
     return s->anchor ? s->anchor : &css_anchor_initial;
 }
+static inline const struct css_list *css_style_list(const style_t *s) {
+    return s->list ? s->list : &css_list_initial;
+}
+static inline const struct css_counters *css_style_counters(const style_t *s) {
+    return s->counters ? s->counters : &css_counters_initial;
+}
+/* A list item's ::marker style when the cascade gave it none of its own (CSS Lists 3 §3.1): inherited
+   from the item, with the UA style sheet's ::marker rule (white-space: pre, text-transform: none). */
+void css_style_marker(style_t *s, const style_t *item);
+/* the UA style sheet's ::marker declarations, which the cascade applies under the author's */
+void css_style_marker_defaults(style_t *s);
 
 /* ---------------------------------------------------------------- stylesheets */
 typedef struct sheet sheet_t;
@@ -1488,9 +1584,15 @@ typedef struct box {
     float cached_padding[4], cached_border[4];
     /* tables */
     int colspan, rowspan, col, row;
-    /* list items: marker text, or a shape (1 disc, 2 circle, 3 square) */
+    /* list items: an outside marker's text (in text_mem), or a shape (1 disc, 2 circle, 3
+       square); its image is the list-style-image of st, painted instead once loaded */
     const char *marker;
     uint8_t marker_shape;
+    /* counters (counter.c): a box whose element or pseudo-element counts (BOX_COUNTER_*), the
+       text box its content or inside marker writes, and whether it or a box below it counts */
+    uint8_t counter_kind;
+    bool counter_tree;
+    struct box *counter_text;
     /* inline <svg>: its entry in the document's cache */
     struct svg_cache *svg;
     /* an anchor-positioned box's resolved position (layout.c, css-anchor-position-1): the styles it
@@ -1596,6 +1698,24 @@ bool boxes_rebuild_local(web_doc *d);
 void boxes_changes_clear(web_doc *d);
 bool box_pseudo_generated(node_t *node, const style_t *origin, const style_t *pseudo);
 bool boxes_update_text(web_doc *d, node_t *n);
+/* A box's counter_kind: its element (a list item, or one with counter-* values: the element's
+   principal box) or its ::before or ::after counts; BOX_COUNTER_MARKER: and the list item's
+   ::marker generates a box; BOX_COUNTER_MARKER_STYLE: an inside ::marker's inline box, its style
+   the box arena's css_style_marker() of the item (restyle_boxes derives it again). */
+enum { BOX_COUNTER_ELEMENT = 1, BOX_COUNTER_PSEUDO = 2, BOX_COUNTER_KIND = 3, BOX_COUNTER_MARKER = 4,
+       BOX_COUNTER_MARKER_STYLE = 8 };
+/* counter.c's writes into the box tree: the text a counting box's content or inside marker
+   makes (white space processed as its style says; t is its counter_text), and an outside
+   marker's text and shape. Each changes the box and invalidates its layout only when the text
+   differs. */
+void box_counter_text(box_t *t, const char *s, size_t n);
+void box_counter_marker(web_doc *d, box_t *item, const char *s, size_t n, uint8_t shape);
+/* counter.c: count the document's counters again, after a publication made or retired a
+   counting box (d->counters_dirty), and write the texts that changed */
+void web_counters_update(web_doc *d);
+/* an <image> of a style (a marker image): its index in d's images, registering it when first
+   used (doc.c); -1 when it is not a url() or cannot be fetched */
+int doc_css_image(web_doc *d, const struct css_image *image);
 /* A Text node's text box: for each byte of its processed text (white space collapsed,
    transformed), the byte of the node's data it came from, and the data's length at [t->len].
    Allocated in a. NULL when t is not a Text node's box, or the data has changed since. */
@@ -1850,6 +1970,7 @@ struct web_doc {
     uint64_t style_revision; /* published box styles: opacity/filter/z-index decide stacking contexts */
     node_t *box_change_node; /* debug_js only: last element whose restyle required new boxes */
     bool svg_snapshots_dirty; /* a restyled SVG element has no boxed outermost <svg>; <use> may reference it */
+    bool counters_dirty; /* a publication made or retired a counting box (counter.c counts again) */
     float paint_damage[4];
     bool paint_damage_valid, paint_damage_full;
     /* Between a cascade and its publication: the boxes whose styles changed and what they

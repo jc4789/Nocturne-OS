@@ -66,17 +66,19 @@ static void reversed_lists(void) {
     if (!d) return;
     node_t *list = id(d,"list"), *one = id(d,"one"), *two = id(d,"two"), *three = id(d,"three"),
            *four = id(d,"four"), *invalid = id(d,"invalid"), *nested = id(d,"nested");
-    check("reversed count owned visible items", marker(one,"6. "));
-    check("wrapped item shares owning list", marker(two,"5. "));
+    /* CSS Lists 3 §4.4.2 (WPT css-lists/li-value-reversed-001): a reversed list-item counter
+       without a value starts where the items before the first li value count down to it */
+    check("reversed start counts down to the li value", marker(one,"10. "));
+    check("wrapped item shares owning list", marker(two,"9. "));
     check("li value resets reversed order", marker(three,"8. ") && marker(four,"7. "));
     check("invalid value does not become zero", marker(invalid,"6. "));
     check("nested list independent ordinal", marker(nested,"1. "));
     check("start native mutation", doc_node_attr(d,list,"start","-2"));web_layout(d,400,240);
     check("negative reversed start", marker(one,"-2. ") && marker(two,"-3. "));
     check("invalid start native mutation", doc_node_attr(d,list,"start","notanumber"));web_layout(d,400,240);
-    check("invalid start restores reversed count", marker(one,"6. "));
+    check("invalid start restores reversed count", marker(one,"10. "));
     check("overflow start native mutation", doc_node_attr(d,list,"start","999999999999999999999999999"));web_layout(d,400,240);
-    check("overflow start bounded", marker(one,"6. "));
+    check("overflow start is no start", marker(one,"10. "));
     check("remove reversed native mutation", doc_node_attr(d,list,"reversed",NULL));web_layout(d,400,240);
     check("forward default marker", marker(one,"1. ") && marker(two,"2. ") && marker(four,"9. "));
     web_free(d);

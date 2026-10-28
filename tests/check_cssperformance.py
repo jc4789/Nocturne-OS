@@ -47,12 +47,11 @@ def box_function(signature):
     first = box[start:box.index("\n", start)]
     return (first if first.endswith("}") else box[start:box.index("\n}", start) + 2]) + "\n"
 # The decisions of a local box publication: where a regenerated box goes in
-# its parent's fixup, and which list a changed item renumbers.
+# its parent's fixup, and which boxes count (counter.c numbers the lists again).
 for signature in ("static int atomic_kind(", "bool box_pseudo_generated(", "bool box_block_level(",
                   "static bool preserves_space(", "static bool ws_only(", "static bool table_part(",
                   "static bool real_inline(", "static bool local_same_place(", "static bool inline_content(",
-                  "static bool local_collapses(", "static bool is_list(", "static bool listish(",
-                  "static bool list_numbered(", "static node_t *local_list_scope("):
+                  "static bool local_collapses(", "static bool counting_style(", "static bool marker_generated("):
     production += box_function(signature)
 dom = (root / "user/libc/web/dom.c").read_text(encoding="utf-8")
 for signature in ("node_t *doc_shadow_parent(", "node_t *doc_node_root("):

@@ -1836,16 +1836,53 @@ static void paint_replaced(struct pctx *P, box_t *b) {
 }
 
 /* ---------------------------------------------------------------- list markers */
+/* An outside marker (CSS Lists 3 §3.1-3.2): its style, the list item's ::marker or the one the
+   item gives it (inherited, which paints the same); and its marker image, a url() that loaded or a
+   gradient, sized by the default sizing algorithm with a default object of 1em square, which it
+   shows followed by a space in the place of its text (w, h: 0 when none) */
+struct marker_look { const style_t *st; struct web_image *im; const struct gradient *gradient; float w, h; };
+static void marker_look(const web_doc *d, const box_t *b, struct marker_look *m) {
+    *m = (struct marker_look){.st = b->st->marker ? b->st->marker : b->st};
+    const struct css_image *image = css_style_list(b->st)->image;
+    float em = m->st->font_size;
+    if (!image) return;
+    if (image->kind == CSS_IMAGE_GRADIENT) {
+        if (image->gradient) { m->gradient = image->gradient; m->w = m->h = em; }
+        return;
+    }
+    int i = image->img - 1;
+    struct web_image *im = d && i >= 0 && i < d->images.n ? d->images.v[i] : NULL;
+    if (!im || !im->img || im->failed) return;
+    m->im = im;
+    m->w = im->img->w > 0 ? (float)im->img->w : em;
+    m->h = im->img->h > 0 ? (float)im->img->h : em;
+}
 static void paint_marker(struct pctx *P, box_t *b) {
-    const style_t *st = b->st;
+    struct marker_look look;
+    marker_look(P->d, b, &look);
+    const style_t *st = look.st;
     if (st->visibility || (!b->marker && !b->marker_shape)) return;
     float x = P->ox + box_visual_x(b), y = P->oy + cy(b);
     wfont f = style_font(st);
     float asc, desc;
     wf_metrics(&f, &asc, &desc);
-    float bl = b->baseline >= 0 ? b->baseline : (style_line_height(st) - asc - desc) / 2 + asc;
+    float bl = b->baseline >= 0 ? b->baseline : (style_line_height(b->st) - asc - desc) / 2 + asc;
     float base = y + bl;
     float fs = st->font_size;
+    if (look.w > 0 && look.h > 0) { /* an inline replaced element on the baseline, then a space */
+        float right = x - wf_width(&f, " ", 1), left = right - look.w, top = base - look.h;
+        canvas_t *c = P->c;
+        int X = (int)roundf(left), Y = (int)roundf(top), W = (int)roundf(look.w), H = (int)roundf(look.h);
+        if (look.gradient) {
+            paint_drew(P, true);
+            fill_gradient(c, left, top, look.w, look.h, 0, look.gradient, st->color);
+            return;
+        }
+        image_t *img = W > 0 && H > 0 ? scaled_image(look.im, W, H, c, X, Y, W, H) : NULL;
+        paint_drew(P, img != NULL);
+        if (img) image_draw(c, img, X, Y);
+        return;
+    }
     if (b->marker_shape) {
         paint_drew(P, false);
         float r = fs * 0.18f;
@@ -2284,11 +2321,13 @@ static void run_ink(const struct run *r,float bx,float by,struct run_metrics *m,
     rect[2]=bx+r->x+r->w+fs;rect[3]=by+r->y+m->desc+slack;
 }
 /* An outside list marker's ink (paint_marker): left of the content box on its baseline. */
-static void marker_ink(const box_t *b,float rect[4]) {
-    const style_t *st=b->st;float fs=st->font_size,x=box_visual_x(b),y=cy(b);
+static void marker_ink(const web_doc *d,const box_t *b,float rect[4]) {
+    struct marker_look look;marker_look(d,b,&look);
+    const style_t *st=look.st;float fs=st->font_size,x=box_visual_x(b),y=cy(b);
     wfont f=style_font(st);float asc,desc;wf_metrics(&f,&asc,&desc);
-    float base=y+(b->baseline>=0?b->baseline:(style_line_height(st)-asc-desc)/2+asc);
-    float w=b->marker?wf_width(&f,b->marker,strlen(b->marker)):fs*.85f+fmaxf(2,fs*.18f);
+    float base=y+(b->baseline>=0?b->baseline:(style_line_height(b->st)-asc-desc)/2+asc);
+    float w=look.w>0?look.w+wf_width(&f," ",1):b->marker?wf_width(&f,b->marker,strlen(b->marker)):fs*.85f+fmaxf(2,fs*.18f);
+    asc=fmaxf(asc,look.h);
     float slack=fmaxf(2,fs*.5f),bx=x-b->p[3]-b->b[3],by=y-b->content_dy-b->p[0]-b->b[0];
     rect[0]=fminf(x-w,bx-fs*2)-slack;rect[1]=fminf(base-asc,by)-slack;
     rect[2]=x+slack;rect[3]=fmaxf(base+desc,by+b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2])+slack;
@@ -2403,7 +2442,7 @@ static const float *flow_ink(struct ink_walk *W,box_t *b) {
             float bx=x-b->p[3]-b->b[3],by=y-b->p[0]-b->b[0];
             float bw=b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],bh=b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
             float a[4]={bx,by,bx+bw,by+bh};shadow_ink_bounds(st,bx,by,bw,bh,a);ink_union(r,a);
-            if(b->marker||b->marker_shape){marker_ink(b,a);ink_union(r,a);}
+            if(b->marker||b->marker_shape){marker_ink(d,b,a);ink_union(r,a);}
         }
         if(!(b->kind==B_ATOMIC&&b->atomic!=AT_INLINE_BLOCK)&&st->content_visibility!=CV_HIDDEN&&!overflow_clips(d,b)) {
             layers=false;
@@ -2881,7 +2920,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             gap_decorations_ink(b, gx, gy, ink);
             bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]);
         }
-        if (b->marker || b->marker_shape) { float ink[4]; marker_ink(b, ink); bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]); }
+        if (b->marker || b->marker_shape) { float ink[4]; marker_ink(P->d, b, ink); bounds_rect(P, ink[0], ink[1], ink[2] - ink[0], ink[3] - ink[1]); }
     }
     /* A table row or row group is painted in its cells (CSS 2.1 17.5.1) and is not a
        target itself: a point between cells is the table's. */
