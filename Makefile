@@ -200,7 +200,7 @@ $(BUILD)/expat/%.o: %.c ports/expat/expat_config.h
 	@mkdir -p $(dir $@)
 	@echo "  XML  $<"
 	@$(CC) $(EXPATFLAGS) -c $< -o $@
-$(BUILD)/u/user/libc/web/xml.o: UCFLAGS += -Ithird_party/expat/lib
+$(BUILD)/u/user/libc/web/xml.o: UCFLAGS += -Ithird_party/expat/lib -Iports/expat
 
 # stb_truetype, stb_image, jebp and nanosvg are compiled as they are, without warnings
 $(BUILD)/u/user/libc/third_party_%.o: UCFLAGS += -w
