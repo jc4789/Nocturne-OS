@@ -120,13 +120,13 @@ static const char *const fn_names[F_COUNT] = {"min", "max", "clamp", "round", "m
 enum { RS_NEAREST, RS_UP, RS_DOWN, RS_TO_ZERO };
 static const char *const round_names[] = {"nearest", "up", "down", "to-zero"};
 /* a type (§10.7): the exponent of each base type and the percent hint (a base, or -1) */
-struct ctype { int8_t e[T_BASES]; int8_t hint; };
+_Static_assert(T_BASES == CSS_TYPE_BASES, "the base types are webi.h's");
 struct css_calc {
     uint8_t op, fn;
     uint8_t unit; /* N_VALUE: U_* or another unit of the table */
     uint8_t key;  /* N_KEY: the key's index; F_ROUND: the strategy */
     uint16_t n;
-    struct ctype type;
+    struct css_calc_type type;
     double v;
     struct css_calc **k; /* the children; clamp()'s none is NULL */
     const struct css_anchor_function *anchor; /* N_ANCHOR: its arguments (cssprop.c) */
@@ -140,6 +140,7 @@ struct mp {
     const char *p, *e;
     int8_t pct; /* the base a percentage has here: T_PERCENT for its own type, -1: percentages fail */
     bool own;   /* T_PERCENT: the context says a percentage is a fraction, not of a basis it did not name */
+    struct css_calc *made; /* P->raw: the last operator node the grammar made (a calc() without one wraps) */
 };
 static struct css_calc *node(struct mp *m, uint8_t op, unsigned n) {
     if (++m->P->nodes > CALC_NODES || n > 0xffff) return NULL;
@@ -150,7 +151,7 @@ static struct css_calc *node(struct mp *m, uint8_t op, unsigned n) {
     if (n) c->k = ar_alloc(m->P->a, n * sizeof *c->k);
     return c;
 }
-static struct css_calc *mk_leaf(struct mp *m, double v, uint8_t unit, struct ctype type) {
+static struct css_calc *mk_leaf(struct mp *m, double v, uint8_t unit, struct css_calc_type type) {
     struct css_calc *c = node(m, N_VALUE, 0);
     if (!c) return NULL;
     c->v = v;
@@ -170,32 +171,32 @@ static bool known(const struct css_calc *c) {
     if (c->unit == U_PERCENT) return own_percent(c);
     return units[c->unit].rel == R_ABS;
 }
-static bool zero_type(const struct ctype *t) {
+static bool zero_type(const struct css_calc_type *t) {
     for (int i = 0; i < T_BASES; i++) if (t->e[i]) return false;
     return true;
 }
 
 /* ---------------------------------------------------------------- types (§10.7, CSS Typed OM §4) */
-static void t_hint(struct ctype *t, int8_t hint) {
+static void t_hint(struct css_calc_type *t, int8_t hint) {
     if (t->e[T_PERCENT]) { t->e[hint] = (int8_t)(t->e[hint] + t->e[T_PERCENT]); t->e[T_PERCENT] = 0; }
     t->hint = hint;
 }
-static bool t_eq(const struct ctype *a, const struct ctype *b) { return !memcmp(a->e, b->e, sizeof a->e); }
-static bool t_hints(struct ctype *a, struct ctype *b) {
+static bool t_eq(const struct css_calc_type *a, const struct css_calc_type *b) { return !memcmp(a->e, b->e, sizeof a->e); }
+static bool t_hints(struct css_calc_type *a, struct css_calc_type *b) {
     if (a->hint >= 0 && b->hint >= 0 && a->hint != b->hint) return false;
     if (a->hint >= 0 && b->hint < 0) t_hint(b, a->hint);
     else if (b->hint >= 0 && a->hint < 0) t_hint(a, b->hint);
     return true;
 }
 /* "add two types" */
-static bool t_add(struct ctype a, struct ctype b, struct ctype *out) {
+static bool t_add(struct css_calc_type a, struct css_calc_type b, struct css_calc_type *out) {
     if (!t_hints(&a, &b)) return false;
     if (t_eq(&a, &b)) { *out = a; return true; }
     bool pct = a.e[T_PERCENT] || b.e[T_PERCENT], other = false;
     for (int i = 0; i < T_PERCENT; i++) other |= a.e[i] || b.e[i];
     if (pct && other)
         for (int8_t h = 0; h < T_PERCENT; h++) {
-            struct ctype x = a, y = b;
+            struct css_calc_type x = a, y = b;
             t_hint(&x, h);
             t_hint(&y, h);
             if (t_eq(&x, &y)) { *out = x; return true; }
@@ -203,7 +204,7 @@ static bool t_add(struct ctype a, struct ctype b, struct ctype *out) {
     return false;
 }
 /* "multiply two types" */
-static bool t_mul(struct ctype a, struct ctype b, struct ctype *out) {
+static bool t_mul(struct css_calc_type a, struct css_calc_type b, struct css_calc_type *out) {
     if (!t_hints(&a, &b)) return false;
     for (int i = 0; i < T_BASES; i++) {
         int e = a.e[i] + b.e[i];
@@ -213,12 +214,12 @@ static bool t_mul(struct ctype a, struct ctype b, struct ctype *out) {
     *out = a;
     return true;
 }
-static struct ctype t_inv(struct ctype a) {
+static struct css_calc_type t_inv(struct css_calc_type a) {
     for (int i = 0; i < T_BASES; i++) a.e[i] = (int8_t)-a.e[i];
     return a;
 }
 /* what the type is in a context that accepts accept (whose percentages are pct): a CSS_CALC_* bit, or 0 */
-static unsigned t_match(const struct ctype *t, unsigned accept, int8_t pct) {
+static unsigned t_match(const struct css_calc_type *t, unsigned accept, int8_t pct) {
     int count = 0, base = -1;
     for (int i = 0; i < T_BASES; i++) if (t->e[i]) { count++; base = i; }
     /* a percent hint is only for a context whose percentages resolve against that type */
@@ -230,9 +231,25 @@ static unsigned t_match(const struct ctype *t, unsigned accept, int8_t pct) {
     return accept & base_kind[base];
 }
 /* "made consistent with" another type: the number keeps its percent hint */
-static struct ctype t_number(const struct ctype *from) {
-    struct ctype t = {{0}, from->hint};
+static struct css_calc_type t_number(const struct css_calc_type *from) {
+    struct css_calc_type t = {{0}, from->hint};
     return t;
+}
+static int8_t pct_base(unsigned accept);
+bool css_calc_type_add(const struct css_calc_type *a, const struct css_calc_type *b, struct css_calc_type *out) {
+    return t_add(*a, *b, out);
+}
+bool css_calc_type_multiply(const struct css_calc_type *a, const struct css_calc_type *b, struct css_calc_type *out) {
+    return t_mul(*a, *b, out);
+}
+unsigned css_calc_type_match(const struct css_calc_type *t, unsigned accept) { return t_match(t, accept, pct_base(accept)); }
+int css_unit_count(void) { return UNIT_COUNT; }
+void css_unit_info(int unit, const char **name, int *base, bool *relative, double *factor) {
+    const struct unit *d = &units[unit >= 0 && unit < UNIT_COUNT ? unit : U_NUMBER];
+    *name = d->name;
+    *base = d->base;
+    *relative = d->rel != R_ABS;
+    *factor = d->f;
 }
 
 /* ---------------------------------------------------------------- simplification (§10.10.1) */
@@ -297,7 +314,7 @@ static struct css_calc *simplify_product(struct mp *m, struct css_calc *c) {
         if (is_number(k[i])) { number = numbers ? number * k[i]->v : k[i]->v; if (!numbers++) first_number = k[i]; }
         else k[w++] = k[i];
     }
-    struct ctype none = {{0}, -1};
+    struct css_calc_type none = {{0}, -1};
     if (!w) return numbers == 1 ? first_number : mk_leaf(m, number, U_NUMBER, t_number(&c->type));
     /* a number times a sum of numeric values: into each of them */
     if (w == 1 && numbers && k[0]->op == N_SUM) {
@@ -340,7 +357,7 @@ static struct css_calc *simplify_product(struct mp *m, struct css_calc *c) {
     return with_children(m, c, k, w);
 }
 /* the result's unit for a function of known values */
-static uint8_t type_unit(const struct ctype *t) {
+static uint8_t type_unit(const struct css_calc_type *t) {
     for (int i = 0; i < T_BASES; i++)
         if (t->e[i]) return i == T_PERCENT ? U_PERCENT : canonical[i];
     return U_NUMBER;
@@ -395,7 +412,7 @@ static struct css_calc *simplify_fn(struct mp *m, struct css_calc *c) {
     return c;
 }
 static struct css_calc *simplify(struct mp *m, struct css_calc *c) {
-    if (!c) return NULL;
+    if (!c || m->P->raw) return c; /* Typed OM reifies the tree as written */
     switch (c->op) {
     case N_NEGATE: {
         struct css_calc *x = c->k[0];
@@ -638,8 +655,12 @@ static bool push_slot(struct mp *m, struct list *l, struct css_calc *c) {
 }
 static bool push(struct mp *m, struct list *l, struct css_calc *c) { return c && push_slot(m, l, c); }
 static struct css_calc *m_leaf(struct mp *m, double v, int unit) {
-    struct ctype t = {{0}, -1};
+    struct css_calc_type t = {{0}, -1};
     const struct cx *cx = m->P->cx;
+    if (m->P->raw) { /* "create a type" from the unit as written (CSS Typed OM §4.3.2) */
+        if (unit != U_NUMBER) t.e[unit == U_PERCENT ? T_PERCENT : units[unit].base] = 1;
+        return mk_leaf(m, v, (uint8_t)unit, t);
+    }
     if (unit == U_PERCENT) {
         if (m->pct < 0 || (cx && cx->absolute_lengths)) return NULL;
         t.e[m->pct] = 1;
@@ -690,6 +711,11 @@ static struct css_calc *m_function(struct mp *m, const char *name, size_t name_n
         struct css_calc *x = m_sum(m);
         sp(m);
         if (x && (m->p >= m->e || *m->p == ')')) { if (m->p < m->e) m->p++; result = x; }
+        if (result && m->P->raw && result != m->made) { /* a calc() without an operator: a sum of one */
+            struct css_calc *sum = node(m, N_SUM, 1);
+            if (sum) { sum->k[0] = result; sum->type = result->type; }
+            result = sum;
+        }
         goto done;
     }
     bool size = word_is(name, name_n, "anchor-size");
@@ -701,6 +727,7 @@ static struct css_calc *m_function(struct mp *m, const char *name, size_t name_n
     int fn = -1;
     for (int i = 0; i < F_COUNT; i++) if (word_is(name, name_n, fn_names[i])) fn = i;
     if (fn < 0) goto done;
+    if (m->P->raw && fn != F_MIN && fn != F_MAX && fn != F_CLAMP) { m->P->unrepresentable = true; goto done; }
     int strategy = RS_NEAREST;
     if (fn == F_ROUND) {
         sp(m);
@@ -723,6 +750,7 @@ static struct css_calc *m_function(struct mp *m, const char *name, size_t name_n
     unsigned n = args.n;
     if (n < min_args[fn] || n > max_args[fn]) goto done;
     for (unsigned i = 0; i < n; i++) if (!args.v[i] && (fn != F_CLAMP || i == 1)) goto done;
+    if (m->P->raw) for (unsigned i = 0; i < n; i++) if (!args.v[i]) { m->P->unrepresentable = true; goto done; }
     struct css_calc *c = node(m, N_FN, 0);
     if (!c) goto done;
     c->fn = (uint8_t)fn;
@@ -730,20 +758,20 @@ static struct css_calc *m_function(struct mp *m, const char *name, size_t name_n
     c->n = (uint16_t)n;
     c->k = args.v;
     /* the argument types and the function's (§10.7.1) */
-    struct ctype t = args.v[fn == F_CLAMP ? 1 : 0]->type;
+    struct css_calc_type t = args.v[fn == F_CLAMP ? 1 : 0]->type;
     switch (fn) {
     case F_MIN: case F_MAX: case F_CLAMP: case F_HYPOT: case F_MOD: case F_REM: case F_ATAN2: case F_ROUND:
         if (fn == F_ROUND && n == 1 && !zero_type(&t)) goto done; /* the step is 1 only for a number */
         for (unsigned i = 0; i < n; i++)
             if (args.v[i] && !t_add(t, args.v[i]->type, &t)) goto done;
         if (fn == F_ATAN2) {
-            struct ctype a = t_number(&t);
+            struct css_calc_type a = t_number(&t);
             a.e[T_ANGLE] = 1;
             t = a;
         }
         break;
     case F_SIN: case F_COS: case F_TAN: {
-        struct ctype x = t;
+        struct css_calc_type x = t;
         if (x.hint >= 0) t_hint(&x, x.hint);
         bool angle = true;
         for (int i = 0; i < T_BASES; i++) if (x.e[i] && (i != T_ANGLE || x.e[i] != 1)) angle = false;
@@ -816,7 +844,7 @@ static struct css_calc *m_product(struct mp *m) {
     struct list items = {0};
     struct css_calc *x = m_value(m);
     if (!push(m, &items, x)) return NULL;
-    struct ctype t = x->type;
+    struct css_calc_type t = x->type;
     for (;;) {
         const char *save = m->p;
         sp(m);
@@ -839,13 +867,14 @@ static struct css_calc *m_product(struct mp *m) {
     c->n = (uint16_t)items.n;
     c->k = items.v;
     c->type = t;
+    m->made = c;
     return simplify(m, c);
 }
 static struct css_calc *m_sum(struct mp *m) {
     struct list items = {0};
     struct css_calc *x = m_product(m);
     if (!push(m, &items, x)) return NULL;
-    struct ctype t = x->type;
+    struct css_calc_type t = x->type;
     for (;;) {
         const char *before = m->p;
         sp(m);
@@ -870,6 +899,7 @@ static struct css_calc *m_sum(struct mp *m) {
     c->n = (uint16_t)items.n;
     c->k = items.v;
     c->type = t;
+    m->made = c;
     return simplify(m, c);
 }
 /* the base percentages have in a context that accepts accept */
@@ -893,7 +923,7 @@ bool css_calc_is_math(const char *s, size_t n) {
     return false;
 }
 struct css_calc *css_calc_read(struct css_calc_parse *P, unsigned accept, const char *s, size_t n, unsigned *kind) {
-    struct mp m = {P, s, s + n, pct_base(accept), accept != CSS_CALC_ANY};
+    struct mp m = {P, s, s + n, pct_base(accept), accept != CSS_CALC_ANY, NULL};
     sp(&m);
     const char *name = m.p;
     while (m.p < m.e && name_char((unsigned char)*m.p)) m.p++;
@@ -918,6 +948,22 @@ struct css_calc *css_calc_key(arena_t *a, unsigned index) {
 }
 int css_calc_key_of(const struct css_calc *c) { return c && c->op == N_KEY ? c->key : -1; }
 bool css_calc_function_root(const struct css_calc *c) { return c && (c->op == N_FN || c->op == N_ANCHOR); }
+/* anchor() and anchor-size() have no Typed OM object: OTHER */
+int css_calc_shape(const struct css_calc *c, double *v, int *unit, unsigned *n, struct css_calc *const **children) {
+    *n = c ? c->n : 0;
+    *children = c ? c->k : NULL;
+    if (!c) return CSS_MATH_OTHER;
+    switch (c->op) {
+    case N_VALUE: *v = c->v; *unit = c->unit; return CSS_MATH_VALUE;
+    case N_SUM: return CSS_MATH_SUM;
+    case N_PRODUCT: return CSS_MATH_PRODUCT;
+    case N_NEGATE: return CSS_MATH_NEGATE;
+    case N_INVERT: return CSS_MATH_INVERT;
+    case N_FN: return c->fn == F_MIN ? CSS_MATH_MIN : c->fn == F_MAX ? CSS_MATH_MAX : c->fn == F_CLAMP ? CSS_MATH_CLAMP :
+                      CSS_MATH_OTHER;
+    }
+    return CSS_MATH_OTHER;
+}
 bool css_calc_constant(const struct css_calc *c, double *v) {
     if (!known(c)) return false;
     *v = c->v;
@@ -972,7 +1018,7 @@ static struct css_calc *rebuild(struct mp *m, const struct css_calc *c) {
 struct css_calc *css_calc_bind(arena_t *a, const struct css_calc *c, const struct cx *cx) {
     if (css_calc_context_free(c)) return (struct css_calc *)c;
     struct css_calc_parse P = {.a = a, .cx = cx};
-    struct mp m = {&P, NULL, NULL, T_PERCENT, false};
+    struct mp m = {&P, NULL, NULL, T_PERCENT, false, NULL};
     return rebuild(&m, c);
 }
 bool css_calc_anchored(const struct css_calc *c) {
@@ -995,17 +1041,19 @@ static struct css_calc *map_anchors(struct mp *m, const struct css_calc *c, css_
 struct css_calc *css_calc_map_anchors(arena_t *a, const struct css_calc *c, css_calc_anchor_map map, void *context) {
     if (!c) return NULL;
     struct css_calc_parse P = {.a = a};
-    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false, NULL};
     return map_anchors(&m, c, map, context);
 }
 struct css_calc *css_calc_anchor(arena_t *a, const struct css_anchor_function *f) {
     struct css_calc_parse P = {.a = a};
-    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false, NULL};
     return anchor_leaf(&m, f);
 }
 
 /* ---------------------------------------------------------------- serialization (§10.13) */
-struct out { sbuf *b; bool ok; };
+/* d: the document a computed value belongs to, whose native work the walk checkpoints every 64
+   nodes (a cancelled document stops it and the output rolls back); NULL: none */
+struct out { sbuf *b; bool ok; web_doc *d; unsigned work; };
 static void put(struct out *o, const char *s, size_t n) {
     sbuf *b = o->b;
     if (!o->ok) return;
@@ -1044,7 +1092,7 @@ static void put_number(struct out *o, double v) {
     puts_(o, t);
 }
 void css_number_serialize(sbuf *b, double v) {
-    struct out o = {b, true};
+    struct out o = {b, true, NULL, 0};
     put_number(&o, v);
 }
 static void put_leaf(struct out *o, const struct css_calc *c) {
@@ -1089,6 +1137,8 @@ static void put_fn(struct out *o, const struct css_calc *c, const char *const *k
 }
 /* "serialize a calculation tree"; bare: directly in calc( or a function's argument, without parentheses */
 static void put_tree(struct out *o, const struct css_calc *c, const char *const *keys, bool bare) {
+    if (!o->ok) return;
+    if (o->d && !(++o->work & 63) && !web_native_checkpoint(o->d)) { o->ok = false; return; }
     switch (c->op) {
     case N_VALUE: put_leaf(o, c); return;
     case N_KEY: puts_(o, keys && keys[c->key] ? keys[c->key] : "none"); return;
@@ -1120,10 +1170,10 @@ static void put_tree(struct out *o, const struct css_calc *c, const char *const 
     if (!bare) put(o, ")", 1);
     if (k != local) free((void *)k);
 }
-bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *keys) {
+static bool calc_serialize(sbuf *b, const struct css_calc *c, const char *const *keys, web_doc *d) {
     if (!b || !c) return false;
     size_t begin = b->n;
-    struct out o = {b, true};
+    struct out o = {b, true, d, 0};
     if (c->op == N_FN) put_fn(&o, c, keys);
     else if (c->op == N_ANCHOR) put_tree(&o, c, keys, true); /* a function of its own, not in calc() */
     else {
@@ -1136,6 +1186,9 @@ bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *ke
         if (b->p && begin < b->cap) b->p[begin] = 0;
     }
     return o.ok;
+}
+bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *keys) {
+    return calc_serialize(b, c, keys, NULL);
 }
 
 /* ---------------------------------------------------------------- values that use it */
@@ -1205,7 +1258,7 @@ bool css_calc_specified(const char *s, size_t n, unsigned accept, sbuf *out) {
     jmp_buf trap;
     a.trap = &trap;
     if (setjmp(trap)) { ar_free(&a); out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; return false; }
-    struct out o = {out, true};
+    struct out o = {out, true, NULL, 0};
     while (p < e && ok) {
         char c = *p;
         if (c == '"' || c == '\'') {
@@ -1293,7 +1346,7 @@ bool css_length_from_calc(const struct css_calc *c, bool negative, len_t *out) {
 /* a computed <length-percentage> as a tree */
 static struct css_calc *length_tree(struct mp *m, const len_t *l) {
     if (l->kind == LK_EXPR) return l->expr;
-    struct ctype px = {{0}, -1}, pct = {{0}, T_LENGTH};
+    struct css_calc_type px = {{0}, -1}, pct = {{0}, T_LENGTH};
     px.e[T_LENGTH] = pct.e[T_LENGTH] = 1;
     struct css_calc *a = mk_leaf(m, l->px, U_PX, px), *b = mk_leaf(m, l->pct, U_PERCENT, pct);
     if (!a || !b) return NULL;
@@ -1308,11 +1361,11 @@ static struct css_calc *length_tree(struct mp *m, const len_t *l) {
 }
 struct css_calc *css_calc_length(arena_t *a, const len_t *l) {
     struct css_calc_parse P = {.a = a};
-    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false, NULL};
     return length_tree(&m, l);
 }
 static struct css_calc *scaled(struct mp *m, struct css_calc *x, double k) {
-    struct ctype none = {{0}, -1};
+    struct css_calc_type none = {{0}, -1};
     struct css_calc *f = mk_leaf(m, k, U_NUMBER, none), *p = node(m, N_PRODUCT, 2);
     if (!f || !p || !x) return NULL;
     p->k[0] = f;
@@ -1322,10 +1375,10 @@ static struct css_calc *scaled(struct mp *m, struct css_calc *x, double k) {
 }
 static void length_combine(arena_t *a, struct css_calc *const *terms, unsigned n, len_t *out) {
     struct css_calc_parse P = {.a = a};
-    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false, NULL};
     struct css_calc *s = node(&m, N_SUM, n);
     bool ok = s != NULL;
-    struct ctype t = {{0}, T_LENGTH};
+    struct css_calc_type t = {{0}, T_LENGTH};
     t.e[T_LENGTH] = 1;
     for (unsigned i = 0; ok && i < n; i++) ok = (s->k[i] = terms[i]) != NULL;
     if (ok) {
@@ -1341,7 +1394,7 @@ void css_length_complement(arena_t *a, const len_t *x, const len_t *y, len_t *ou
         return;
     }
     struct css_calc_parse P = {.a = a};
-    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false, NULL};
     len_t hundred = {.kind = LK_LEN, .pct = 100};
     struct css_calc *terms[3] = {length_tree(&m, &hundred), scaled(&m, length_tree(&m, x), -1),
                                  y ? scaled(&m, length_tree(&m, y), -1) : NULL};
@@ -1353,16 +1406,15 @@ void css_length_mix(arena_t *a, const len_t *x, const len_t *y, double ka, doubl
         return;
     }
     struct css_calc_parse P = {.a = a};
-    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false, NULL};
     struct css_calc *terms[2] = {scaled(&m, length_tree(&m, x), ka), scaled(&m, length_tree(&m, y), kb)};
     length_combine(a, terms, 2, out);
 }
 /* a computed <length-percentage>'s serialization (CSSOM: percentages and math kept, never a zero made up) */
 bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d) {
-    (void)d;
     if (!l || !out || out->n > out->cap || (!out->p && (out->n || out->cap))) return false;
     size_t begin = out->n;
-    struct out o = {out, true};
+    struct out o = {out, true, NULL, 0};
     char t[64];
     switch (l->kind) {
     case LK_AUTO: puts_(&o, "auto"); break;
@@ -1379,7 +1431,7 @@ bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d) {
         puts_(&o, t);
         break;
     }
-    case LK_EXPR: if (!l->expr || !css_calc_serialize(out, l->expr, NULL)) o.ok = false; break;
+    case LK_EXPR: if (!l->expr || !calc_serialize(out, l->expr, NULL, d)) o.ok = false; break;
     default: o.ok = false;
     }
     if (!o.ok) {

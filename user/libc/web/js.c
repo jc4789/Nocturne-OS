@@ -37,6 +37,7 @@
 #include "elements.h"
 #include "js_crypto.h"
 #include "js_compression.h"
+#include "js_typed_om.h"
 #include "js_encoding.h"
 #include "js_url.h"
 #include "js_atomics.h"
@@ -1975,9 +1976,9 @@ static bool style_memo_block(struct web_js_state *s, node_t *n, sbuf *block) {
     style_memo_store(s, n, css, length, block->p ? block->p : "", block->n);
     return true;
 }
-/* the attribute becomes a block's serialization; the block is what the
-   attribute now stands for (CSSOM's mutate flag: the attribute is not parsed
-   again) */
+/* the attribute becomes a block's serialization (CSSOM's mutate flag: the
+   attribute is not parsed again); reads see that block, and the cascade the
+   declarations css_inline_set or css_inline_replace kept as given */
 static bool style_attribute_set(struct web_js_state *s, node_t *n, const sbuf *block) {
     /* CSSOM's updating flag: the attribute change steps neither parse the
        value again nor run CSP's check on it; the block applies. */
@@ -1994,10 +1995,22 @@ static JSValue style_access(struct web_js_state *s, node_t *n, const char *prope
     JSContext *ctx = s->ctx;
     sbuf block = {0}, b = {0};
     if (!style_memo_block(s, n, &block)) { sb_free(&block); return oom(ctx); }
-    bool write;
-    JSValue result = style_text_access(ctx, block.p ? block.p : "", block.n, property, set, value, priority, priority_only,
-                                       NULL, &b, &write);
-    if (write && !style_attribute_set(s, n, &b)) result = oom(ctx);
+    JSValue result;
+    if (!set) {
+        bool write;
+        result = style_text_access(ctx, block.p ? block.p : "", block.n, property, false, value, priority, priority_only,
+                                   NULL, &b, &write);
+    } else {
+        /* the declarations change as given and the attribute becomes their serialization (css.c's
+           css_inline_set): the cascade does not parse a rounded value again */
+        const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
+        int status = !v || (!JS_IsUndefined(priority) && !prio) ? -3 :
+            css_inline_set(n->owner, n, block.p ? block.p : "", block.n, property, v, prio, &b);
+        JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio);
+        result = status == -3 ? JS_EXCEPTION : status == -2 ? JS_ThrowOutOfMemory(ctx) :
+                 status == -1 ? JS_ThrowTypeError(ctx, "Invalid CSS property name") : JS_UNDEFINED;
+        if (status > 0 && !style_attribute_set(s, n, &b)) result = oom(ctx);
+    }
     sb_free(&b); sb_free(&block);
     return result;
 }
@@ -2014,7 +2027,7 @@ static JSValue style_block_access(struct web_js_state *s, node_t *n, int argc, J
     size_t length;
     const char *text = JS_ToCStringLen(ctx, &length, argv[2]);
     if (!text) return JS_EXCEPTION;
-    bool ok = style_serialize(text, length, NULL, &b, NULL);
+    bool ok = css_inline_replace(n->owner, n, text, length, &b);
     JS_FreeCString(ctx, text);
     JSValue result = !ok ? JS_ThrowOutOfMemory(ctx) : style_attribute_set(s, n, &b) ? JS_UNDEFINED : oom(ctx);
     sb_free(&b);
@@ -2359,7 +2372,10 @@ static style_t *computed_pseudo_style(node_t *n,int pseudo,style_t *fallback) {
     if(pseudo==PE_PLACEHOLDER)fallback->color=RGB(117,117,117);
     return fallback;
 }
-static JSValue computed(struct web_js_state *s, node_t *n, const char *property,int pseudo) {
+/* An element's value of property: the resolved value getComputedStyle() reads (CSSOM), or with
+   cascade the computed value (CSS Cascade 5 §4.4) CSS Typed OM's computedStyleMap() reifies; the
+   two differ where the resolved value is the used one (width, margins) or a matrix (transform). */
+static JSValue computed(struct web_js_state *s, node_t *n, const char *property,int pseudo,bool cascade) {
     JSContext *ctx = s->ctx;
     if (!n || n->type != N_ELEM) return JS_ThrowTypeError(ctx, "Computed style requires an element");
     struct web_js_state *owner = n->owner ? geometry_owner(s, n->owner) : NULL;
@@ -2377,6 +2393,15 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     if(property[0]=='-'&&property[1]=='-') {
         const struct custom_prop *p=css_custom_property(st,property);
         return JS_NewString(ctx,p&&p->value?p->value:"");
+    }
+    if (cascade) {
+        /* the longhands the property table stores whole serialize their computed value */
+        sbuf text={0};
+        int kind=css_computed_longhand(st,property,&text,d);
+        if(kind<0){sb_free(&text);return oom(ctx);}
+        JSValue result=kind==1?JS_NewStringLen(ctx,text.p?text.p:"",text.n):JS_UNDEFINED;
+        sb_free(&text);
+        if(kind==1)return result;
     }
     static const char *const radius_names[]={"border-top-left-radius","border-top-right-radius","border-bottom-right-radius","border-bottom-left-radius"};
     int radius_corner=-2;if(!strcmp(property,"border-radius"))radius_corner=-1;
@@ -4129,7 +4154,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     case DOM_computed: {
         const char *pseudo=argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])?JS_ToCString(ctx,argv[3]):NULL;
         if(argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])&&!pseudo)result=JS_EXCEPTION;
-        else result=computed(s,n,p,computed_pseudo(pseudo));
+        else result=computed(s,n,p,computed_pseudo(pseudo),argc>4&&JS_ToBool(ctx,argv[4])>0);
         JS_FreeCString(ctx,pseudo);
     } break;
     case DOM_geometry: {result = geometry(s, n, p);
@@ -9757,7 +9782,7 @@ char *web_js_inspect_computed(web_doc *d,node_t *n){
     for(int i=0,count=css_prop_count();i<count;i++){
         bool longhand=false;const char *name=css_prop_name(i,&longhand);
         if(!name||!longhand)continue;
-        JSValue value=computed(s,n,name,PE_NONE);
+        JSValue value=computed(s,n,name,PE_NONE,false);
         if(JS_IsException(value)){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
         const char *text=JS_ToCString(s->ctx,value);JS_FreeValue(s->ctx,value);
         if(!text){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
@@ -10084,6 +10109,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     web_js_webidl_init(s->ctx,api);
     web_js_crypto_init(s->ctx, api);
     web_js_compression_init(s->ctx, api);
+    web_js_typed_om_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);
     web_js_url_init(s->ctx, api);
     web_atomics_host_init(s->ctx, api);

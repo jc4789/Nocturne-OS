@@ -5,7 +5,11 @@ css-color の欠けた成分と補間の頁から、試験の呼出し（test_va
 test_invalid_value・test_computed_value と色の fuzzy の版、test_interpolation）を、
 html/canvas の fill-and-stroke-styles から fillStyle・strokeStyle の文字の期待を
 node で取り出し、color.c・cssprop.c を host の clang で組んだ道具に渡して、WPT の
-比べ方（数の誤差と形、補間は小数 2 桁）で照らす。CSSOM・cascade・var() の全部を通す
+比べ方（数の誤差と形、補間は小数 2 桁）で照らす。計算値は二つの道で照らす：値を直接
+css_apply に渡す道と、computed-testcommon.js のとおり element.style に書く道（css.c の
+css_inline_set が宣言と style 属性を書き、cascade が読む css_inline_text の値を css_apply に
+渡す）。後者は、属性の指定値の直列化（色の origin の成分は丸まる）を cascade が読み直して
+落ちた退行（1028k）の道。CSSOM・cascade・var() の全部を通す
 guest の WPT の代わりではない：var() は頁の :root と html の custom property だけを
 置き換え、要素は「親の color が rgb(255, 0, 0)」の一つだけ、補間は端が値のものだけ。
 
@@ -38,8 +42,24 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 command = [str(cc), "-std=gnu11", "-O2", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include", "-Icommon", "-Iuser/libc",
            "-Iuser/libc/web", "-Ithird_party/quickjs", "tests/css_color_native_cases.c", "user/libc/web/color.c", "user/libc/web/cssmath.c",
-           "user/libc/web/cssprop.c", "user/libc/web/shape.c", "user/libc/web/util.c", "user/libc/web/html.c", "-o", str(exe)]
-subprocess.run(command, cwd=root, env=env, check=True)
+           "user/libc/web/cssprop.c", "user/libc/web/shape.c", "user/libc/web/util.c", "user/libc/web/html.c",
+           "user/libc/web/css.c", str(out / "unreached.c"), "-o", str(exe)]
+# css.c (the element's inline declarations, the O requests) reaches the document, layout and
+# script: every external these requests never call stops with its name
+undefined = re.compile(r"undefined (?:symbol: |reference to `)([A-Za-z_][A-Za-z0-9_]*)")
+unreached = set()
+for attempt in range(6):
+    (out / "unreached.c").write_text("int puts(const char *);\nvoid exit(int);\n" + "".join(
+        f'void {n}(void) {{ puts("unreached: {n}"); exit(3); }}\n' for n in sorted(unreached)), encoding="utf-8")
+    r = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode == 0:
+        break
+    found = set(undefined.findall(r.stdout + r.stderr)) - unreached
+    if not found:
+        sys.exit(r.stdout + r.stderr)
+    unreached |= found
+else:
+    sys.exit("道具を組めない")
 
 node = None
 for candidate in ("node", "C:/nvm4w/nodejs/node.exe", "C:/Program Files/nodejs/node.exe"):
@@ -232,6 +252,11 @@ for i, (name, kind, prop, value, request, want, epsilon, scheme) in enumerate(ca
         again_index[i] = len(again)
         again.append(("S", prop, got) if kind == "valid" else ("C", prop, scheme, request[3], got))
 round_trip = tool.run(again) if again else []
+# the same computed values through element.style, as computed-testcommon.js sets them: the inline
+# declarations the cascade reads, not the style attribute's specified serialization parsed again
+cssom_index = {i: k for k, i in enumerate(i for i, c in enumerate(cases) if c[1] == "computed")}
+through_cssom = tool.run([("O",) + cases[i][4][1:] for i in cssom_index])
+cssom_lost = []
 report = {}
 failures = {}
 round_trips = []
@@ -249,6 +274,11 @@ for i, (name, kind, prop, value, request, want, epsilon, scheme) in enumerate(ca
         # beyond WPT: the serialization parses back to itself (parsing clamps what mixing may not)
         if ok and i in again_index and round_trip[again_index[i]] != got:
             round_trips.append((name, value, got, round_trip[again_index[i]]))
+        if i in cssom_index:
+            through = through_cssom[cssom_index[i]]
+            if not (through != "<invalid>" and matches(through, want, epsilon)) and ok:
+                cssom_lost.append((name, value, want, through))
+            ok = ok and through != "<invalid>" and matches(through, want, epsilon)
     good, count = report.get(name, (0, 0))
     report[name] = (good + ok, count + 1)
     if not ok:
@@ -262,6 +292,9 @@ for name, (good, count) in report.items():
             print(f"      got  {got!r}")
 for name, value, got, back in round_trips:
     print(f"往復で変わる（WPT の外）：{name}: {value!r} → {got!r} → {back!r}")
+for name, value, want, through in cssom_lost:
+    print(f"element.style を通すと落ちる：{name}: {value!r} → {through!r}（期待 {want!r}）")
+print(f"element.style を通す計算値 {len(cssom_index)} 件、直接に合って通すと落ちる {len(cssom_lost)} 件")
 passed = sum(g for g, c in report.values())
 total = sum(c for g, c in report.values())
 print(f"合計 {passed}/{total}（数えない：{skipped}）")

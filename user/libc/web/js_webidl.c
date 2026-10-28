@@ -221,20 +221,6 @@ static JSValue constant_value(JSContext *ctx, const struct webidl_member *m) {
     return JS_NewFloat64(ctx, m->value);
 }
 
-/* A symbol-keyed method of holder (@@iterator, @@asyncIterator): writable, configurable, not
-   enumerable. */
-static void shape_symbol_method(struct shaper *s, JSValueConst holder, JSAtom atom) {
-    JSPropertyDescriptor d;
-    int has = JS_GetOwnProperty(s->ctx, &d, holder, atom);
-    if (has < 0) { forget_exception(s->ctx); return; }
-    if (!has) return;
-    if (!(d.flags & JS_PROP_GETSET) && JS_IsFunction(s->ctx, d.value))
-        JS_DefineProperty(s->ctx, holder, atom, JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED,
-                          JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_ENUMERABLE |
-                          JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE);
-    JS_FreeValue(s->ctx, d.value); JS_FreeValue(s->ctx, d.getter); JS_FreeValue(s->ctx, d.setter);
-}
-
 static void shape_member(struct shaper *s, const struct webidl_interface *i, JSValueConst holder,
                          const struct webidl_member *m) {
     JSContext *ctx = s->ctx;
@@ -265,9 +251,15 @@ static void shape_member(struct shaper *s, const struct webidl_interface *i, JSV
         if (!(d.flags & JS_PROP_GETSET) && JS_IsFunction(ctx, d.value)) {
             JSValue fn = named_function(s, JS_DupValue(ctx, d.value), m, ROLE_VALUE, m->length);
             if (JS_IsException(fn)) forget_exception(ctx);
-            else JS_DefinePropertyValue(ctx, holder, atom, fn, JS_PROP_C_W_E);
-            if (m->flags & WEBIDL_ITERATOR) shape_symbol_method(s, holder, s->iterator);
-            if (m->flags & WEBIDL_ASYNC_ITERATOR) shape_symbol_method(s, holder, s->async_iterator);
+            else {
+                /* @@iterator and @@asyncIterator are the member they stand for (a pair iterator's
+                   entries, a setlike's values) as the same function object: the shaped one */
+                JSAtom symbol = m->flags & WEBIDL_ITERATOR ? s->iterator : m->flags & WEBIDL_ASYNC_ITERATOR ? s->async_iterator : JS_ATOM_NULL;
+                if (symbol != JS_ATOM_NULL &&
+                    JS_DefinePropertyValue(ctx, holder, symbol, JS_DupValue(ctx, fn), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0)
+                    forget_exception(ctx);
+                JS_DefinePropertyValue(ctx, holder, atom, fn, JS_PROP_C_W_E);
+            }
             s->report.members++;
         } else {
             misplaced(s, i->name, m->name);

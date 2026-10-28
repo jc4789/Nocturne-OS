@@ -1253,7 +1253,11 @@
     function styleNames(value){
         const record=styleRecord(value);
         if(!record.computed)return styleBlock(record).slice(1);
-        const custom=host.cssProperties(record.node,record.pseudo);if(custom===null)return [];
+        return computedNames(record.node,record.pseudo);
+    }
+    /* an element's computed properties: the longhands, then its valid custom properties */
+    function computedNames(node,pseudo){
+        const custom=host.cssProperties(node,pseudo);if(custom===null)return [];
         const names=[],seen=new Set();for(const [name,valid] of custom){if(seen.has(name))continue;seen.add(name);if(valid)names.push(name);}
         return longhandNames().concat(names);
     }
@@ -1537,6 +1541,22 @@
     /* @include js_attributes.js */
     /* @include js_shadow.js */
     /* @include js_stylesheets.js */
+    /* @include js_typed_om.js */
+    {
+        /* CSS Typed OM's maps over the declaration blocks above (an inline style's, a rule's) and an
+           element's computed values */
+        const typedOM=typedOMInterfaces({native:host,geometry:geometryBridge,DOMException,css:CSS,declarations:{
+            read:(block,name)=>styleRead(block,name),write:(block,name,text)=>styleWrite(block,name,text),names:block=>styleNames(block),
+            computed:(element,name)=>dom('computed',element,name,null,true),computedNames:element=>computedNames(element,'')}});
+        const elementOf=v=>{if(!rawDom.isNode(null,v)||rawDom.get(v,'nodeType')!==1)throw new TypeError('Expected an Element');return v;};
+        Object.defineProperty(Element.prototype,'attributeStyleMap',{configurable:true,enumerable:true,
+            get:{attributeStyleMap(){return typedOM.declaredMap(inlineStyle(this));}}.attributeStyleMap});
+        Object.defineProperty(Element.prototype,'computedStyleMap',{configurable:true,enumerable:true,writable:true,
+            value:{computedStyleMap(){return typedOM.computedMap(elementOf(this));}}.computedStyleMap});
+        const ruleStyle=Object.getOwnPropertyDescriptor(CSSStyleRule.prototype,'style').get;
+        Object.defineProperty(CSSStyleRule.prototype,'styleMap',{configurable:true,enumerable:true,
+            get:{styleMap(){return typedOM.declaredMap(Reflect.apply(ruleStyle,this,[]));}}.styleMap});
+    }
     /* @include js_font_loading.js */
     /* @include js_animations.js */
     /* @include js_web_legacy.js */
