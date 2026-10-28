@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport', 'xpath'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     // Reading never runs custom element reactions: getters go to the native operation directly.
     const domGet=domOperations.get;
@@ -1155,6 +1155,7 @@
     /* @include js_range.js */
     /* @include js_document_selection.js */
     /* @include js_traversal.js */
+    /* @include js_xpath.js */
     /* @include js_svg.js */
     /* @include js_attributes.js */
     /* @include js_shadow.js */

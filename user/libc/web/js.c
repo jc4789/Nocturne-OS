@@ -2037,6 +2037,7 @@ static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double r
 static bool element_offset_metrics(node_t *n,double first[4],double bounds[4]);
 #include "js_svg_native.h"
 #include "js_animation_native.h"
+#include "js_xpath_native.h"
 static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root) {
     JSContext *ctx=s->ctx; web_doc *d=s->doc;
     if (!n || n->type!=N_ELEM || (root && root->type!=N_ELEM && root!=d->root))
@@ -3152,7 +3153,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     if(!n){switch(opcode){
-    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry:
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry: case DOM_xpath:
         result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
     default:break;
     }}
@@ -3855,6 +3856,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     } break;
     case DOM_geometry: {result = geometry(s, n, p);
     } break;
+    case DOM_xpath: result = xpath_dom(s, n, argc, argv); break;
     default: result = JS_ThrowTypeError(ctx, "Unknown DOM operation"); break;
     }
 dom_complete:;
@@ -8987,6 +8989,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("locale",0,native_locale),
         JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
         JS_CFUNC_DEF("svgGeometry",2,native_svg_geometry),
+        JS_CFUNC_DEF("xpathCompile",2,native_xpath_compile),
         JS_CFUNC_DEF("mutationObserve",4,native_mutation_control),
         JS_CFUNC_DEF("mutationTake",0,native_mutation_take),
         JS_CFUNC_DEF("frame", 3, native_frame),JS_CFUNC_DEF("documentStream",1,native_document_stream),
