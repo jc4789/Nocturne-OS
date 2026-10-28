@@ -4617,6 +4617,7 @@ static const char js_worker_runtime[] =
 "        setTimeout:(fn,ms,...args)=>timer(fn,ms,args,false),setInterval:(fn,ms,...args)=>timer(fn,ms,args,true),\n"
 "        clearTimeout:clearTimer,clearInterval:clearTimer,\n"
 "        queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},\n"
+"        reportError(e){if(!arguments.length)throw new TypeError(\"Failed to execute 'reportError': 1 argument required\");report(e);},\n"
 "        console:consoleNamespace((level,values)=>host.send(7,0,{message:values.map(String).join(' '),filename:address}),()=>host.now()),\n"
 "        addEventListener:target.addEventListener.bind(target),removeEventListener:target.removeEventListener.bind(target),dispatchEvent:target.dispatchEvent.bind(target)});\n"
 "    // No DOM image sources here; context loss events are timer tasks.\n"

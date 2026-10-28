@@ -61,9 +61,22 @@
     /* @include js_collections.js */
     function list(a) { return collectionBridge.list(a); }
     function options(o) { return typeof o === 'boolean' ? {capture:o} : (o || {}); }
-    // Preserve Error identity for native task context/source diagnostics. The
-    // native logger reads only an own stack data property, never a stack getter.
-    function report(e) { host.log(2, e); }
+    // HTML "report an exception" for what a callback threw (js.c report_exception): an ErrorEvent at
+    // this global, then the console unless a listener canceled it. The native side reads only an own
+    // stack data property, never a stack getter. errorReporting is the global's errors reporting
+    // mode: an error listener's own exception goes to the console alone.
+    function report(e) { host.reportException(e); }
+    let errorReporting=false;
+    function reportException(error,message,filename,lineno,colno,muted) {
+        if(errorReporting)return true;
+        errorReporting=true;
+        try {
+            const event=new ErrorEvent('error',muted?{message:'Script error.',error:null,cancelable:true}:
+                {message,filename,lineno,colno,error,cancelable:true});
+            eventState(event).isTrusted=true;
+            return dispatch(globalThis,event);
+        } finally { errorReporting=false; }
+    }
     const eventStates=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set,eventDefine=Object.defineProperty;
     const eventFields=new Set(['type','target','srcElement','currentTarget','eventPhase','bubbles','cancelable','composed','defaultPrevented','isTrusted','timeStamp']);
     function eventState(event){const state=apply(eventGet,eventStates,[event]);if(!state)throw new TypeError('Illegal Event receiver');return state;}
@@ -1011,6 +1024,7 @@
     function requestAnimationFrame(fn){if(typeof fn!=='function')throw new TypeError('Expected callback');return timer(2,fn,16,[]);}
     function cancelAnimationFrame(id){host.clear(Number(id));}
     function queueMicrotask(fn){return host.microtask(fn);}
+    function reportError(e){if(!arguments.length)throw new TypeError("Failed to execute 'reportError': 1 argument required");host.reportException(e);}
     /* @include js_navigator.js */
     const {navigator,Interface:Navigator,languagesChanged}=navigatorBridge.create(false);
     Object.assign(globalThis,{document,console,navigator,Navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLFrameElement,HTMLImageElement,Image,
@@ -1018,7 +1032,7 @@
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
         Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
-        fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
+        fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,reportError,
         CSSStyleDeclaration,CSSStyleProperties,
         performance:{now:()=>host.now()},getComputedStyle:(n,pseudo=null)=>new CSSStyleProperties(n,true,styleToken,pseudo)});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
@@ -1282,6 +1296,7 @@
         },
         indexedDBTaskEnd:indexedDBBridge.taskEnd,
         promiseRejection:rejectionBridge.unhandled,
+        reportException,
         promiseRejectionHandled:rejectionBridge.handled,
         formNamedProperty:formNameBridge.property,
         formNamedKeys:formNameBridge.keys,
