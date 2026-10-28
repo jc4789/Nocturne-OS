@@ -38,6 +38,8 @@ uint64_t webprefs_languages_generation(void);
    the length, or -N_ERR_TOO_LARGE. The same list navigator.languages and Accept-Language use
    (HTML). */
 n_result webprefs_languages(char *out, size_t cap);
+/* Whether the list of languages is the default one: no languages line, or one naming the same tags in the same order. */
+bool webprefs_languages_default(void);
 /* The Accept-Language of a fetch that begins now: the first tag bare, then each with ";q=0.9"
    falling by a tenth to ";q=0.1"; at most WEBPREFS_ACCEPT_LANGUAGE_MAX bytes of [0-9A-Za-z,;=.-],
    with a zero. The length, or -N_ERR_TOO_LARGE. */
