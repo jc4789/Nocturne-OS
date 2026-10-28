@@ -13,6 +13,10 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
 int webidb_stage(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,char reference[65]);
 int webidb_value(webidb *db,uint32_t token,const char *reference,uint8_t **bytes,size_t *length);
 int webidb_commit(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,const char *const *references,size_t count,uint64_t version);
+/* commit with the lease kept: the token stays valid at the generation just written (its staged
+ * payloads that are not referenced dropped), for the next transaction its caller schedules on
+ * the database; webidb_commit or webidb_abort ends it. */
+int webidb_save(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,const char *const *references,size_t count,uint64_t version);
 struct webidb_database {char *name;size_t name_length;uint64_t version;};
 int webidb_databases(webidb *db,const char *origin,struct webidb_database **items,size_t *count);
 void webidb_databases_free(struct webidb_database *items,size_t count);
@@ -21,7 +25,9 @@ int webidb_abort(webidb *db,uint32_t token);
  * (Window or Worker) of the origin. A caller retries BUSY asynchronously; desired_version=0
  * means database deletion. connections marks a versionchange to desired_version on each open
  * connection (once per desired version) and counts them: count those still open, unfired those
- * whose versionchange has not been fired yet. poll delivers a connection's marked versionchange
+ * whose versionchange has not been fired yet. count also has, once (in the call whose unfired is
+ * 0), each connection that closed after its versionchange to desired_version was fired while it
+ * was open: its opener must fire blocked however soon the close came. poll delivers a connection's marked versionchange
  * once (*pending 1, *desired_version), or that webidb_clear removed its database (*pending 2:
  * close it forcibly); fired acknowledges that its versionchange has been fired (or skipped: its
  * close is pending), so IndexedDB's open fires blocked only after every one was fired. */

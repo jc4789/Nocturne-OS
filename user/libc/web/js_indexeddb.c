@@ -203,7 +203,7 @@ static JSValue idb_native(JSContext *ctx,JSValueConst this_val,int argc,JSValueC
         {"begin",WEB_IDB_BEGIN},{"stage",WEB_IDB_STAGE},{"value",WEB_IDB_VALUE},{"commit",WEB_IDB_COMMIT},
         {"abort",WEB_IDB_ABORT},{"databases",WEB_IDB_DATABASES},{"connections",WEB_IDB_CONNECTIONS},
         {"connect",WEB_IDB_CONNECT},{"poll",WEB_IDB_POLL},{"disconnect",WEB_IDB_DISCONNECT},{"forget",WEB_IDB_FORGET},
-        {"values",WEB_IDB_VALUES},{"fired",WEB_IDB_FIRED}};
+        {"values",WEB_IDB_VALUES},{"fired",WEB_IDB_FIRED},{"save",WEB_IDB_SAVE}};
     struct webidb_async_request request={0};
     for(unsigned i=0;i<sizeof operations/sizeof *operations;i++)if(!strcmp(op,operations[i].name)){request.operation=operations[i].operation;break;}
     JS_FreeCString(ctx,op);
@@ -224,15 +224,17 @@ static JSValue idb_native(JSContext *ctx,JSValueConst this_val,int argc,JSValueC
         if(argc<2){JS_ThrowTypeError(ctx,"IndexedDB token required");goto done;}
         if(JS_ToUint32(ctx,&request.token,argv[1])<0)goto done;
     }
-    if(request.operation==WEB_IDB_CONNECT||request.operation==WEB_IDB_CONNECTIONS||request.operation==WEB_IDB_COMMIT){
-        int version_index=request.operation==WEB_IDB_COMMIT?4:2;
+    /* save is commit with the lease kept: the same arguments. */
+    bool committing=request.operation==WEB_IDB_COMMIT||request.operation==WEB_IDB_SAVE;
+    if(request.operation==WEB_IDB_CONNECT||request.operation==WEB_IDB_CONNECTIONS||committing){
+        int version_index=committing?4:2;
         double version;
         if(argc<=version_index){JS_ThrowTypeError(ctx,"IndexedDB version required");goto done;}
         if(JS_ToFloat64(ctx,&version,argv[version_index])<0)goto done;
         if(!isfinite(version)||version<0||version>9007199254740991.0||floor(version)!=version){JS_ThrowTypeError(ctx,"Invalid IndexedDB version");goto done;}
         request.version=(uint64_t)version;
     }
-    if(request.operation==WEB_IDB_STAGE||request.operation==WEB_IDB_COMMIT){
+    if(request.operation==WEB_IDB_STAGE||committing){
         if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB payload required");goto done;}
         uint8_t *bytes=NULL;
         if(!idb_buffer(ctx,argv[2],&bytes,&request.length))goto done;
@@ -243,8 +245,8 @@ static JSValue idb_native(JSContext *ctx,JSValueConst this_val,int argc,JSValueC
         reference=JS_ToCString(ctx,argv[2]);if(!reference)goto done;
         request.reference=reference;
     }
-    if(request.operation==WEB_IDB_COMMIT||request.operation==WEB_IDB_VALUES){
-        int index=request.operation==WEB_IDB_COMMIT?3:2;
+    if(committing||request.operation==WEB_IDB_VALUES){
+        int index=committing?3:2;
         if(argc<=index){JS_ThrowTypeError(ctx,"IndexedDB references required");goto done;}
         JSValue count_value=JS_GetPropertyStr(ctx,argv[index],"length");uint32_t count=0;
         int failed=JS_IsException(count_value)?-1:JS_ToUint32(ctx,&count,count_value);

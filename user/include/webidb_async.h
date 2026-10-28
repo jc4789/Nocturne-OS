@@ -16,7 +16,11 @@ enum webidb_operation {
     WEB_IDB_POLL, WEB_IDB_DISCONNECT, WEB_IDB_FORGET, WEB_IDB_VALUES,
     /* The connection's versionchange event (the one POLL delivered) has been fired: the
        opener's CONNECTIONS no longer counts it as waiting to be fired (webidb_fired). */
-    WEB_IDB_FIRED
+    WEB_IDB_FIRED,
+    /* COMMIT with the lease kept (webidb_save): the realm's next scheduled transaction goes on
+       with the same token, at the generation just written. */
+    WEB_IDB_SAVE,
+    WEB_IDB_LAST=WEB_IDB_SAVE
 };
 struct webidb_wire_command {
     uint32_t magic, operation, sequence, token;

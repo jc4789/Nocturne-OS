@@ -248,13 +248,10 @@ int webidb_stage(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,ch
     p->next=tx->staged;tx->staged=p;
     return WEB_IDB_OK;
 }
-int webidb_abort(webidb *db,uint32_t token){
-    if(!db)return WEB_IDB_IO;
-    struct idb_tx **p=&db->active;
-    while(*p&&(*p)->token!=token)p=&(*p)->next;
-    if(!*p)return WEB_IDB_IO;
-    struct idb_tx *tx=*p;
-    *p=tx->next;
+/* The staged payloads at the end of a transaction (or of a commit that keeps the lease): the ones
+   neither generation references are removed, and the journal of the transaction's payloads is
+   cleared (failed clearing is retried by the next begin; it cannot invalidate a commit). */
+static void staged_drop(struct idb_tx *tx){
     while(tx->staged){
         struct idb_stage *s=tx->staged;
         tx->staged=s->next;
@@ -263,16 +260,25 @@ int webidb_abort(webidb *db,uint32_t token){
         }
         free(s);
     }
-    /* Failed clearing is retried by next begin; it cannot invalidate a commit. */
     pending_clear(tx);
+}
+int webidb_abort(webidb *db,uint32_t token){
+    if(!db)return WEB_IDB_IO;
+    struct idb_tx **p=&db->active;
+    while(*p&&(*p)->token!=token)p=&(*p)->next;
+    if(!*p)return WEB_IDB_IO;
+    struct idb_tx *tx=*p;
+    *p=tx->next;
+    staged_drop(tx);
     free(tx->origin);free(tx->name);
     free(tx->current.data);free(tx->old.data);
     n_handle_close(tx->lease);free(tx);
     return WEB_IDB_OK;
 }
-int webidb_commit(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,const char *const *references,size_t count,uint64_t version){
-    struct idb_tx *tx=find(db,token);
-    if(!tx||tx->generation==UINT64_MAX)return WEB_IDB_IO;
+/* The manifest of the next generation written in the other slot, every reference current, old
+   or staged; payloads neither generation keeps are collected. */
+static int manifest_write(struct idb_tx *tx,const uint8_t *bytes,size_t length,const char *const *references,size_t count,uint64_t version){
+    if(tx->generation==UINT64_MAX)return WEB_IDB_IO;
     size_t on=strlen(tx->origin);
     if(on>SIZE_MAX-IDB_CATALOG_HEAD||tx->name_length>SIZE_MAX-IDB_CATALOG_HEAD-on)
         return WEB_IDB_MEMORY;
@@ -318,7 +324,23 @@ int webidb_commit(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,c
     free(tx->old.data);
     tx->old=tx->current;
     tx->current=live;
-    return webidb_abort(db,token);
+    tx->slot=1-tx->slot;tx->generation++;
+    return WEB_IDB_OK;
+}
+int webidb_commit(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,const char *const *references,size_t count,uint64_t version){
+    struct idb_tx *tx=find(db,token);
+    if(!tx)return WEB_IDB_IO;
+    int status=manifest_write(tx,bytes,length,references,count,version);
+    return status?status:webidb_abort(db,token);
+}
+/* The same commit with the lease kept: the token stays the database's, at the generation just
+   written, for the transactions the realm schedules after this one. */
+int webidb_save(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,const char *const *references,size_t count,uint64_t version){
+    struct idb_tx *tx=find(db,token);
+    if(!tx)return WEB_IDB_IO;
+    int status=manifest_write(tx,bytes,length,references,count,version);
+    if(!status)staged_drop(tx);
+    return status;
 }
 
 /* A slot's catalog: the database's name and version, when it is origin's (origin NULL: any, its
@@ -497,9 +519,22 @@ static int table_write(n_handle table,struct client_table *t){return io(table,0,
  * desired version: CLIENT_NONE, CLIENT_MARKED (by connections), CLIENT_DELIVERED (by poll), or
  * CLIENT_FIRED (by fired). CLIENT_FORCED: its database was cleared (clients_force); its poll
  * delivers the forced close once, and it is then close pending (CLIENT_FIRED: it is still open,
- * and needs no versionchange). */
-enum {CLIENT_NONE,CLIENT_MARKED,CLIENT_DELIVERED,CLIENT_FIRED,CLIENT_FORCED};
-int webidb_connections(webidb *db,uint32_t token,uint64_t version,size_t *count,size_t *unfired){*count=0;*unfired=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;n_handle table=clients_open(tx);if(table<0)return WEB_IDB_IO;int status=clients_lock(table);struct client_table t={0};if(!status)status=table_read(table,&t);if(!status){for(size_t i=0;i<t.count;i++){uint8_t *row=t.rows+i*CLIENT_BYTES;if(!u64(row))continue;(*count)++;if(u64(row+40)==CLIENT_FORCED)continue;if(u64(row+40)==CLIENT_NONE||u64(row+32)!=version){put64(row+32,version);put64(row+40,CLIENT_MARKED);}if(u64(row+40)!=CLIENT_FIRED)(*unfired)++;}status=table_write(table,&t);}table_free(&t);n_handle_close(table);return status;}
+ * and needs no versionchange; its desired version is none an opener asks for).
+ * CLIENT_GHOST: a free row (identity 0) left by a connection that closed after its versionchange
+ * to the desired version was fired while it was open. The opener that asked for that version had
+ * to fire blocked at its request ("If any of the connections in openConnections are still not
+ * closed" once every versionchange was fired), however soon the close came; the ghost is that
+ * evidence, counted once by its connections and then cleared. A ghost of another desired version
+ * is stale (its opener has gone on or gone) and is cleared; connect never reuses a ghost. */
+enum {CLIENT_NONE,CLIENT_MARKED,CLIENT_DELIVERED,CLIENT_FIRED,CLIENT_FORCED,CLIENT_GHOST};
+int webidb_connections(webidb *db,uint32_t token,uint64_t version,size_t *count,size_t *unfired){*count=0;*unfired=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;n_handle table=clients_open(tx);if(table<0)return WEB_IDB_IO;int status=clients_lock(table);struct client_table t={0};if(!status)status=table_read(table,&t);if(!status){size_t ghosts=0;
+        for(size_t i=0;i<t.count;i++){uint8_t *row=t.rows+i*CLIENT_BYTES;
+            if(!u64(row)){if(u64(row+40)==CLIENT_GHOST){if(u64(row+32)==version)ghosts++;else memset(row,0,CLIENT_BYTES);}continue;}
+            (*count)++;if(u64(row+40)==CLIENT_FORCED)continue;if(u64(row+40)==CLIENT_NONE||u64(row+32)!=version){put64(row+32,version);put64(row+40,CLIENT_MARKED);}if(u64(row+40)!=CLIENT_FIRED)(*unfired)++;}
+        /* The ghosts count as open until every versionchange was fired; then once, cleared. */
+        *count+=ghosts;
+        if(!*unfired)for(size_t i=0;ghosts&&i<t.count;i++){uint8_t *row=t.rows+i*CLIENT_BYTES;if(!u64(row)&&u64(row+40)==CLIENT_GHOST&&u64(row+32)==version)memset(row,0,CLIENT_BYTES);}
+        status=table_write(table,&t);}table_free(&t);n_handle_close(table);return status;}
 static void clients_force(const char *text){
     const char *profile=web_profile_folder(true);char folder[WEBIDB_BASE_MAX],leaf[80],path[WEBIDB_BASE_MAX];
     if(!profile||n_path_join(profile,"indexeddb",folder,sizeof folder)<0)return;
@@ -514,11 +549,11 @@ static void clients_force(const char *text){
 }
 int webidb_fired(webidb *db,uint32_t connection){struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else if(u64(row+40)==CLIENT_DELIVERED){put64(row+40,CLIENT_FIRED);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);return status;}
 int webidb_connect(webidb *db,uint32_t token,uint64_t version,uint32_t *connection){*connection=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;n_handle table=clients_open(tx);if(table<0)return WEB_IDB_IO;int status=clients_lock(table);struct client_table t={0};if(!status)status=table_read(table,&t);struct idb_client *c=NULL;
-    if(!status){c=calloc(1,sizeof *c);if(!c)status=WEB_IDB_MEMORY;else{uint32_t serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);if(!serial)serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);c->handle=serial;c->identity=(uint64_t)(uint32_t)n_app_self()<<32|serial;c->table=table;size_t i=0;while(i<t.count&&u64(t.rows+i*CLIENT_BYTES))i++;if(i==t.count)t.count++;c->offset=i*CLIENT_BYTES;uint8_t *row=t.rows+c->offset;put64(row,c->identity);put64(row+8,(uint32_t)n_app_self());uint64_t start=0;for(int j=0;j<t.process_count;j++)if(t.processes[j].pid==(int)n_app_self())start=t.processes[j].start_ms;put64(row+16,start);put64(row+24,version);status=table_write(table,&t);}}
+    if(!status){c=calloc(1,sizeof *c);if(!c)status=WEB_IDB_MEMORY;else{uint32_t serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);if(!serial)serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);c->handle=serial;c->identity=(uint64_t)(uint32_t)n_app_self()<<32|serial;c->table=table;size_t i=0;while(i<t.count&&(u64(t.rows+i*CLIENT_BYTES)||u64(t.rows+i*CLIENT_BYTES+40)==CLIENT_GHOST))i++;if(i==t.count)t.count++;c->offset=i*CLIENT_BYTES;uint8_t *row=t.rows+c->offset;put64(row,c->identity);put64(row+8,(uint32_t)n_app_self());uint64_t start=0;for(int j=0;j<t.process_count;j++)if(t.processes[j].pid==(int)n_app_self())start=t.processes[j].start_ms;put64(row+16,start);put64(row+24,version);status=table_write(table,&t);}}
     table_free(&t);if(status){if(c)free(c);n_handle_close(table);return status;}n_document_release(table);c->next=db->clients;db->clients=c;*connection=c->handle;return WEB_IDB_OK;
 }
-int webidb_poll(webidb *db,uint32_t connection,int *pending,uint64_t *version){*pending=0;*version=0;struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else if(u64(row+40)==CLIENT_FORCED){*pending=2;put64(row+40,CLIENT_FIRED);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}else if(u64(row+40)==CLIENT_MARKED){*pending=1;*version=u64(row+32);put64(row+40,CLIENT_DELIVERED);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);return status;}
-int webidb_disconnect(webidb *db,uint32_t connection){if(!db)return WEB_IDB_IO;struct idb_client **p=&db->clients;while(*p&&(*p)->handle!=connection)p=&(*p)->next;if(!*p)return WEB_IDB_IO;struct idb_client *c=*p;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else{memset(row,0,sizeof row);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);*p=c->next;n_handle_close(c->table);free(c);return status;}
+int webidb_poll(webidb *db,uint32_t connection,int *pending,uint64_t *version){*pending=0;*version=0;struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else if(u64(row+40)==CLIENT_FORCED){*pending=2;put64(row+32,UINT64_MAX);put64(row+40,CLIENT_FIRED);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}else if(u64(row+40)==CLIENT_MARKED){*pending=1;*version=u64(row+32);put64(row+40,CLIENT_DELIVERED);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);return status;}
+int webidb_disconnect(webidb *db,uint32_t connection){if(!db)return WEB_IDB_IO;struct idb_client **p=&db->clients;while(*p&&(*p)->handle!=connection)p=&(*p)->next;if(!*p)return WEB_IDB_IO;struct idb_client *c=*p;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else{uint64_t desired=u64(row+32);int ghost=u64(row+40)==CLIENT_FIRED;memset(row,0,sizeof row);if(ghost){put64(row+32,desired);put64(row+40,CLIENT_GHOST);}if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);*p=c->next;n_handle_close(c->table);free(c);return status;}
 int webidb_forget_connection(webidb *db,uint32_t connection){
     int result=webidb_disconnect(db,connection);if(result!=WEB_IDB_BUSY)return result;
     struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;

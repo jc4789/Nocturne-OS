@@ -4,11 +4,13 @@
 const canvasBridge = (() => {
     'use strict';
     const define=Object.defineProperty, create=Object.create, number=Number, string=elementURL.string;
-    const contexts=new WeakMap(), states=new WeakMap(), images=new WeakMap(), metrics=new WeakMap(), paths=new WeakMap(), gradients=new WeakMap(), bitmaps=new WeakMap();
+    const contexts=new WeakMap(), states=new WeakMap(), metrics=new WeakMap(), paths=new WeakMap(), gradients=new WeakMap(), bitmaps=new WeakMap();
     const Float64=Float64Array, Bytes=Uint8ClampedArray, finite=Number.isFinite;
     const abs=Math.abs,ceil=Math.ceil,floor=Math.floor,cos=Math.cos,sin=Math.sin,atan2=Math.atan2;
     const native=host.canvas, defer=setTimeout, apply=Reflect.apply, blobFrom=blobBridge.fromBytes;
     const nativeBitmap=host.imageBitmap, PromiseCtor=Promise;
+    /* ImageData is the realms' shared one (js_offscreen_canvas.js). */
+    const ImageData=offscreenCanvasBridge.ImageData, imageRecord=offscreenCanvasBridge.imageRecord;
     const debugProbe=host.debugCanvasProbe===true;
     /* Array length is a uint32 representation in this engine. Typed-array
        backing buffers enforce their own representation/allocation failures. */
@@ -70,7 +72,7 @@ const canvasBridge = (() => {
             let kind,source=image,dimensions,packet;
             try {
                 if(argumentCount<1)throw new TypeError('createImageBitmap requires a source');
-                const bitmap=bitmaps.get(image),im=images.get(image),offscreen=offscreenCanvasBridge.backing(image);
+                const bitmap=bitmaps.get(image),im=imageRecord(image),offscreen=offscreenCanvasBridge.backing(image);
                 if(bitmap)kind=3;
                 else if(im)kind=1;
                 else if(offscreen!==undefined){
@@ -388,7 +390,7 @@ const canvasBridge = (() => {
         translate(...v){const s=state(this);v=args(v,2);if(valid(v))multiply(s,[1,0,0,1,v[0],v[1]]);},
         scale(...v){const s=state(this);v=args(v,2);if(valid(v))multiply(s,[v[0],0,0,v[1],0,0]);},
         rotate(value){const s=state(this),v=number(value);if(finite(v)){const c=cos(v),t=sin(v);multiply(s,[c,t,-t,c,0,0]);}},
-        createImageData(a,b){state(this);const image=images.get(a);if(image)return new ImageData(image.w,image.h);return new ImageData(a,b);},
+        createImageData(a,b){state(this);const image=imageRecord(a);if(image)return new ImageData(image.w,image.h);return new ImageData(a,b);},
         drawImage(image,dx,dy,...rest){state(this);const count=arguments.length-1;if(count!==2&&count!==4&&count<8)throw new TypeError('drawImage requires 3, 5 or 9 arguments');
             const v=args([dx,dy,...rest],count>=8?8:count),s=state(this);
             /* All author conversions precede borrowing the native bitmap. A
@@ -399,22 +401,13 @@ const canvasBridge = (() => {
             const result=native(s.canvas,'drawImage',bitmaps.get(image)||offscreen||image,new Float64(v).buffer,new Float64(s.matrix).buffer,s.alpha,s.smoothing);
             if(result===1)throw namedError('InvalidStateError','The source image has no usable bitmap');},
         getImageData(...v){const s=state(this);v=args(v,4);if(!valid(v))throw new TypeError('Nonfinite ImageData coordinates');let [x,y,w,h]=v.map(Math.trunc);if(!w||!h)throw namedError('IndexSizeError','Empty ImageData rectangle');if(w<0){x+=w;w=-w;}if(h<0){y+=h;h=-h;}const data=native(s.canvas,'read',x,y,w,h);if(data===null)throw namedError('SecurityError','Canvas contains an image with unverified origin');return new ImageData(new Bytes(data),w,h);},
-        putImageData(image,dx,dy,...dirty){const s=state(this),im=images.get(image);if(!im)throw new TypeError('Expected ImageData');dx=Math.trunc(number(dx));dy=Math.trunc(number(dy));if(!finite(dx)||!finite(dy))throw new TypeError('Nonfinite ImageData coordinates');
+        putImageData(image,dx,dy,...dirty){const s=state(this),im=imageRecord(image);if(!im)throw new TypeError('Expected ImageData');dx=Math.trunc(number(dx));dy=Math.trunc(number(dy));if(!finite(dx)||!finite(dy))throw new TypeError('Nonfinite ImageData coordinates');
             let data=im.data,w=im.w,h=im.h;if(dirty.length){if(dirty.length<4)throw new TypeError('Missing dirty rectangle');let [x,y,dw,dh]=dirty.map(number).map(Math.trunc);if(!valid([x,y,dw,dh]))throw new TypeError('Nonfinite dirty rectangle');if(dw<0){x+=dw;dw=-dw;}if(dh<0){y+=dh;dh=-dh;}const x0=Math.max(0,x),y0=Math.max(0,y),x1=Math.min(w,x+dw),y1=Math.min(h,y+dh);if(x1<=x0||y1<=y0)return;const copy=new Bytes((x1-x0)*(y1-y0)*4);for(let j=y0;j<y1;j++)copy.set(data.subarray((j*w+x0)*4,(j*w+x1)*4),(j-y0)*(x1-x0)*4);data=copy;w=x1-x0;h=y1-y0;dx+=x0;dy+=y0;}
             native(s.canvas,'put',dx,dy,w,h,apply(byteBuffer,data,[]),apply(byteOffset,data,[]));},
         getContextAttributes(){state(this);return {alpha:true,colorSpace:'srgb',desynchronized:false,willReadFrequently:false};}
     };
     for(const [name,value] of Object.entries(methods))define(CanvasRenderingContext2D.prototype,name,{value:pathMethods[name]?function(...args){state(this);return apply(value,this,args);}:value,writable:true,configurable:true});
     for(const [name,value] of Object.entries(pathMethods))define(Path2D.prototype,name,{value:function(...args){if(!paths.has(this))throw new TypeError('Illegal Path2D receiver');return apply(value,this,args);},writable:true,configurable:true});
-    class ImageData {
-        constructor(a,b,c){let data,w,h;if(a instanceof Bytes){data=a;w=number(b)>>>0;h=c===undefined?data.length/4/w:number(c)>>>0;if(!w||!finite(h)||h!==floor(h)||h<1||data.length!==w*h*4)throw namedError('IndexSizeError','Invalid ImageData dimensions');}
-            else{w=abs(Math.trunc(number(a)));h=abs(Math.trunc(number(b)));if(!finite(w)||!finite(h)||!w||!h||w>ARRAY_LENGTH||h>ARRAY_LENGTH)throw namedError('IndexSizeError','Invalid ImageData dimensions');if(!Number.isSafeInteger(w*h*4))throw new RangeError('ImageData byte size representation');data=new Bytes(w*h*4);}
-            images.set(this,{data,w,h});}
-        get width(){const s=images.get(this);if(!s)throw new TypeError('Illegal ImageData receiver');return s.w;}
-        get height(){const s=images.get(this);if(!s)throw new TypeError('Illegal ImageData receiver');return s.h;}
-        get data(){const s=images.get(this);if(!s)throw new TypeError('Illegal ImageData receiver');return s.data;}
-        get colorSpace(){if(!images.has(this))throw new TypeError('Illegal ImageData receiver');return 'srgb';}
-    }
     for(const [i,name] of ['width','actualBoundingBoxLeft','actualBoundingBoxRight','actualBoundingBoxAscent','actualBoundingBoxDescent','fontBoundingBoxAscent','fontBoundingBoxDescent'].entries())define(TextMetrics.prototype,name,{enumerable:true,configurable:true,get(){const values=metrics.get(this);if(!values)throw new TypeError('Illegal TextMetrics receiver');return values[i];}});
     for(const key of Reflect.ownKeys(CanvasRenderingContext2D.prototype))
         if(key!=='constructor'&&key!=='canvas')define(OffscreenCanvasRenderingContext2D.prototype,key,Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype,key));
@@ -426,7 +419,7 @@ const canvasBridge = (() => {
     function webglSource(value){
         if(value===null||(typeof value!=='object'&&typeof value!=='function'))return undefined;
         const token=bitmaps.get(value);if(token)return token;
-        const im=images.get(value);
+        const im=imageRecord(value);
         if(im){const data=im.data,offset=apply(byteOffset,data,[]);let buffer=apply(byteBuffer,data,[]);
             if(offset)buffer=apply(bufferSlice,buffer,[offset,offset+im.w*im.h*4]);return [im.w,im.h,buffer,false];}
         const offscreen=offscreenCanvasBridge.backing(value);
@@ -461,7 +454,7 @@ const canvasBridge = (() => {
             return bytes===null?null:blobFrom(bytes,'image/png');
         }
     });
-    for(const C of [HTMLCanvasElement,CanvasRenderingContext2D,OffscreenCanvasRenderingContext2D,CanvasGradient,ImageData,ImageBitmap,TextMetrics,Path2D])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
-    Object.assign(globalThis,{HTMLCanvasElement,CanvasRenderingContext2D,OffscreenCanvasRenderingContext2D,CanvasGradient,ImageData,ImageBitmap,createImageBitmap,TextMetrics,Path2D});
+    for(const C of [HTMLCanvasElement,CanvasRenderingContext2D,OffscreenCanvasRenderingContext2D,CanvasGradient,ImageBitmap,TextMetrics,Path2D])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
+    Object.assign(globalThis,{HTMLCanvasElement,CanvasRenderingContext2D,OffscreenCanvasRenderingContext2D,CanvasGradient,ImageBitmap,createImageBitmap,TextMetrics,Path2D});
     return {nodeProtos:[HTMLCanvasElement.prototype]};
 })();
