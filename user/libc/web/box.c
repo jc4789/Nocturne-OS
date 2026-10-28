@@ -98,26 +98,18 @@ static void transform(char *s, size_t n, int tt) {
 
 /* white-space processing and text-transform. With source, also the byte of s each output
    byte came from (source has room for one entry per output byte and one for the end, which
-   is n): the one record of how a text box's text corresponds to its Text node's data. */
+   is n): the one record of how a text box's text corresponds to its Text node's data.
+   Preserved tabs stay tabs: their advance reaches the next tab stop of the line they land on,
+   which layout knows (css-text-4 §4.1.3, tab-size). Soft hyphens stay too: invisible, they are
+   where line breaking may hyphenate (§6.3.1). The output is never longer than s. */
 static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t *st, size_t *out_n,
                               uint32_t *source) {
-    char *o = ar_alloc(a, n * 8 + 1); /* tabs may expand */
+    char *o = ar_alloc(a, n + 1);
     size_t k = 0;
     int ws = st->white_space;
 #define WS_EMIT(c, from) do { if (source) source[k] = (uint32_t)(from); o[k++] = (c); } while (0)
     if (ws == WS_PRE || ws == WS_PRE_WRAP || ws == WS_BREAK_SPACES) {
-        int col = 0;
-        for (size_t i = 0; i < n; i++) {
-            char c = s[i];
-            if (c == '\t') {
-                int sp = 8 - col % 8;
-                for (int j = 0; j < sp; j++) WS_EMIT(' ', i);
-                col += sp;
-            } else {
-                WS_EMIT(c, i);
-                col = c == '\n' ? 0 : col + 1;
-            }
-        }
+        for (size_t i = 0; i < n; i++) WS_EMIT(s[i], i);
     } else {
         bool keep_nl = ws == WS_PRE_LINE;
         bool space = false;
@@ -132,11 +124,6 @@ static const char *ws_process(arena_t *a, const char *s, size_t n, const style_t
             if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
                 if (!space) WS_EMIT(' ', i);
                 space = true;
-                continue;
-            }
-            /* soft hyphens are invisible */
-            if ((unsigned char)c == 0xC2 && i + 1 < n && (unsigned char)s[i + 1] == 0xAD) {
-                i++;
                 continue;
             }
             WS_EMIT(c, i);

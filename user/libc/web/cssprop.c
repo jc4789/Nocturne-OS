@@ -390,8 +390,10 @@ static bool shadow_specified_length(sbuf *out, const char *token, size_t size) {
         return length_append(out, "0px", 3);
     return length_append(out, token, size);
 }
+/* <shadow>#: box-shadow's (css-backgrounds-3 §7.1), or with text text-shadow's, which has no spread and
+   no inset (css-text-decor-3 §4) */
 static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, const struct css_box_shadow **out,
-                              sbuf *specified) {
+                              sbuf *specified, bool text) {
     if (ident_is(value, length, "none")) { *out = NULL; return !specified || length_append(specified,"none",4); }
     const char *cursor = value, *end = value + length;
     struct css_box_shadow *first = NULL, **tail = &first;
@@ -417,12 +419,12 @@ static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, c
             uint32_t candidate;
             const struct css_color_value *exact;
             if (ident_is(tokens[i], sizes[i], "inset")) {
-                if (inset) return false; inset = shadow.inset = true; lengths_closed |= lengths != 0;
+                if (inset || text) return false; inset = shadow.inset = true; lengths_closed |= lengths != 0;
             } else if (css_color_value_compute(tokens[i], sizes[i], cx, NULL, &candidate, &exact)) {
                 if (color) return false; color = true; shadow.color = candidate; shadow.color_value = exact;
                 color_token=i; lengths_closed |= lengths != 0;
             } else {
-                if (lengths_closed || lengths == 4 || memchr(tokens[i], '%', sizes[i])) return false;
+                if (lengths_closed || lengths == (text ? 3u : 4u) || memchr(tokens[i], '%', sizes[i])) return false;
                 len_t dimension;
                 unsigned flags = LF_NOPCT | LF_LENGTH | (lengths == 2 ? 0 : LF_NEG);
                 if (!parse_len(tokens[i], sizes[i], cx, &dimension, flags) || dimension.kind != LK_LEN || dimension.pct ||
@@ -450,7 +452,7 @@ static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, c
     }
     if (!first) return false; *out = first; return true;
 }
-bool css_shadow_specified(const char *value, size_t size, sbuf *out) {
+static bool shadow_specified(const char *value, size_t size, bool text, sbuf *out) {
     size_t original=out->n;
     arena_t *arena=calloc(1,sizeof *arena);if(!arena)return false;
     jmp_buf trap;arena->trap=&trap;
@@ -459,12 +461,13 @@ bool css_shadow_specified(const char *value, size_t size, sbuf *out) {
         struct cx cx={.em=16,.rem=16,.vw=800,.vh=600,.a=arena};
         const struct css_box_shadow *ignored;
         trim(&value,&size);
-        success=parse_box_shadows(value,size,&cx,&ignored,out);
+        success=parse_box_shadows(value,size,&cx,&ignored,out,text);
     }
     ar_free(arena);free(arena);
     if(!success){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}
     return success;
 }
+bool css_shadow_specified(const char *value, size_t size, sbuf *out) { return shadow_specified(value, size, false, out); }
 /* A <border-radius> value of four corners (TL TR BR BL) per axis, in its shortest form. */
 static bool radius_lengths_serialize(const len_t lengths[2][4],sbuf *out,web_doc *doc) {
     bool ok=true,equal=true;for(int i=0;i<4;i++)equal&=css_length_equal(&lengths[0][i],&lengths[1][i]);
@@ -540,7 +543,7 @@ enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_
        PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN, PT_SHAPE, PT_OFFSET, PT_CLIP, PT_COLOR_SCHEME, PT_RULE_LIST,
        PT_RULE_INSET, PT_ANCHOR, PT_COUNTER, PT_QUOTES, PT_LIST_IMAGE,
        PT_BG_LIST, PT_BG_OFFSET, PT_BI_SOURCE, PT_BI_SLICE, PT_BI_SIDES, PT_BI_REPEAT,
-       PT_CURSOR, PT_UI_COLOR };
+       PT_CURSOR, PT_UI_COLOR, PT_TEXT };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -563,16 +566,20 @@ struct propdef {
 /* Web Animations 1 §5.3 animation types that differ from a value type's default */
 enum { AN_TYPE, AN_NONE, AN_DISCRETE, AN_VISIBILITY, AN_DISPLAY };
 /* style_t itself, or a group of rarely set properties it holds by pointer (style_t's float_shape,
-   offset, gap_rules, anchor, counters, list, background, border_image, mask_border, ui). A group
-   holds only properties that are not inherited, but for G_LIST and G_UI, which hold only inherited
-   ones: an element's style starts with its parent's group by the pointer (css_style_init's copy of
-   the parent), and with the initial values the others (groups_copy). */
+   offset, gap_rules, anchor, counters, list, background, border_image, mask_border, ui, decoration,
+   text). A group holds only properties that are not inherited, but for G_LIST, G_UI and G_TEXT, which
+   hold only inherited ones: an element's style starts with its parent's group by the pointer
+   (css_style_init's copy of the parent), and with the initial values the others (groups_copy). */
 enum { G_STYLE, G_FLOAT_SHAPE, G_OFFSET, G_GAP_RULE, G_ANCHOR, G_COUNTER, G_LIST, G_BACKGROUND, G_BORDER_IMAGE,
-       G_MASK_BORDER, G_UI };
+       G_MASK_BORDER, G_UI, G_DECORATION, G_TEXT };
 /* which sides list a PT_BI_SIDES property holds (its flags) */
 enum { BI_WIDTH, BI_OUTSET };
 /* which colour a PT_UI_COLOR property is (its flags) */
 enum { UI_CARET, UI_ACCENT };
+/* which text value a PT_TEXT property holds (its flags): the text group's, and the decoration group's */
+enum { CSS_TEXT_SHADOW, CSS_TEXT_HYPHENATE_CHARACTER, CSS_TEXT_HYPHENATE_LIMIT_CHARS, CSS_TEXT_HYPHENATE_LIMIT_LINES,
+       CSS_TEXT_TAB_SIZE, CSS_TEXT_UNDERLINE_POSITION, CSS_TEXT_UNDERLINE_OFFSET, CSS_TEXT_DECORATION_COLOR,
+       CSS_TEXT_DECORATION_THICKNESS };
 /* the gap decoration shorthands (css-gaps-1): propdef flags hold what one sets (GS_*) and on which
    axes (GS_COLUMN, GS_ROW) */
 enum { GS_RULE, GS_COLOR, GS_STYLE, GS_WIDTH, GS_BREAK, GS_ITEMS, GS_INSET_START, GS_INSET_END, GS_INSET_CAP,
@@ -705,6 +712,17 @@ static const struct kw kw_cursor[] = {{"auto", CSS_CURSOR_AUTO}, {"default", N_P
     {"ns-resize", N_POINTER_NS_RESIZE}, {"nesw-resize", N_POINTER_NESW_RESIZE}, {"nwse-resize", N_POINTER_NWSE_RESIZE},
     {"col-resize", N_POINTER_COL_RESIZE}, {"row-resize", N_POINTER_ROW_RESIZE}, {"all-scroll", N_POINTER_ALL_SCROLL},
     {"zoom-in", N_POINTER_ZOOM_IN}, {"zoom-out", N_POINTER_ZOOM_OUT}, {0}};
+/* css-text-4 §5.2-5.5, §6.1; css-text-decor-4 §2.3 */
+static const struct kw kw_word_break[] = {{"normal", CSS_WORD_BREAK_NORMAL}, {"break-all", CSS_WORD_BREAK_BREAK_ALL},
+    {"keep-all", CSS_WORD_BREAK_KEEP_ALL}, {"manual", CSS_WORD_BREAK_MANUAL}, {"auto-phrase", CSS_WORD_BREAK_AUTO_PHRASE},
+    {"break-word", CSS_WORD_BREAK_BREAK_WORD}, {0}};
+static const struct kw kw_line_break[] = {{"auto", CSS_LINE_BREAK_AUTO}, {"loose", CSS_LINE_BREAK_LOOSE},
+    {"normal", CSS_LINE_BREAK_NORMAL}, {"strict", CSS_LINE_BREAK_STRICT}, {"anywhere", CSS_LINE_BREAK_ANYWHERE}, {0}};
+static const struct kw kw_overflow_wrap[] = {{"normal", CSS_OVERFLOW_WRAP_NORMAL}, {"break-word", CSS_OVERFLOW_WRAP_BREAK_WORD},
+    {"anywhere", CSS_OVERFLOW_WRAP_ANYWHERE}, {0}};
+static const struct kw kw_hyphens[] = {{"manual", CSS_HYPHENS_MANUAL}, {"none", CSS_HYPHENS_NONE}, {"auto", CSS_HYPHENS_AUTO}, {0}};
+static const struct kw kw_decoration_style[] = {{"solid", CSS_DECORATION_SOLID}, {"double", CSS_DECORATION_DOUBLE},
+    {"dotted", CSS_DECORATION_DOTTED}, {"dashed", CSS_DECORATION_DASHED}, {"wavy", CSS_DECORATION_WAVY}, {0}};
 static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}, {"super", VA_SUPER},
                                       {"top", VA_TOP}, {"middle", VA_MIDDLE}, {"bottom", VA_BOTTOM},
                                       {"text-top", VA_TEXT_TOP}, {"text-bottom", VA_TEXT_BOTTOM}, {0}};
@@ -718,6 +736,8 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 #define OBG(f) OG(G_BACKGROUND, struct css_background, f)
 #define OBI(f) OG(G_BORDER_IMAGE, struct css_border_image, f)
 #define OMB(f) OG(G_MASK_BORDER, struct css_border_image, f)
+#define OTEXT(f) OG(G_TEXT, struct css_text, f)
+#define ODECO(f) OG(G_DECORATION, struct css_decoration, f)
 
 /* sorted by name at first use */
 static struct propdef props[] = {
@@ -988,7 +1008,22 @@ static struct propdef props[] = {
     {"text-align", PT_KW, 0, true, O(text_align), kw_talign, 0, AN_TYPE},
     {"text-overflow",PT_KW,0,false,O(text_overflow),kw_text_overflow,0, AN_TYPE},
     SH("text-decoration", SH_TEXT_DECORATION),
-    {"text-decoration-line", PT_TEXT_DECO, 0, true, O(text_decoration), NULL, 0, AN_TYPE},
+    {"text-decoration-line", PT_TEXT_DECO, 0, false, O(text_decoration), NULL, 0, AN_TYPE},
+    /* flags: which CSS_TEXT_* value; the text group is inherited, the decoration group not */
+    {"text-decoration-color", PT_TEXT, CSS_TEXT_DECORATION_COLOR, false, ODECO(color), NULL, 0, AN_TYPE},
+    {"text-decoration-style", PT_KW, 0, false, ODECO(style), kw_decoration_style, 0, AN_TYPE},
+    {"text-decoration-thickness", PT_TEXT, CSS_TEXT_DECORATION_THICKNESS, false, ODECO(thickness), NULL, 0, AN_TYPE},
+    {"text-shadow", PT_TEXT, CSS_TEXT_SHADOW, true, OTEXT(shadow), NULL, 0, AN_TYPE},
+    {"text-underline-offset", PT_TEXT, CSS_TEXT_UNDERLINE_OFFSET, true, OTEXT(underline_offset), NULL, 0, AN_TYPE},
+    {"text-underline-position", PT_TEXT, CSS_TEXT_UNDERLINE_POSITION, true, OTEXT(underline_position), NULL, 0, AN_DISCRETE},
+    {"hyphenate-character", PT_TEXT, CSS_TEXT_HYPHENATE_CHARACTER, true, OTEXT(hyphenate_character), NULL, 0, AN_DISCRETE},
+    {"hyphenate-limit-chars", PT_TEXT, CSS_TEXT_HYPHENATE_LIMIT_CHARS, true, OTEXT(hyphenate_limit_chars), NULL, 0, AN_TYPE},
+    {"hyphenate-limit-lines", PT_TEXT, CSS_TEXT_HYPHENATE_LIMIT_LINES, true, OTEXT(hyphenate_limit_lines), NULL, 0, AN_TYPE},
+    {"hyphens", PT_KW, 0, true, OTEXT(hyphens), kw_hyphens, 0, AN_TYPE},
+    {"line-break", PT_KW, 0, true, OTEXT(line_break), kw_line_break, 0, AN_TYPE},
+    {"overflow-wrap", PT_KW, 0, true, OTEXT(overflow_wrap), kw_overflow_wrap, 0, AN_TYPE},
+    {"tab-size", PT_TEXT, CSS_TEXT_TAB_SIZE, true, OTEXT(tab_size), NULL, 0, AN_TYPE},
+    {"word-break", PT_KW, 0, true, OTEXT(word_break), kw_word_break, 0, AN_TYPE},
     {"text-indent", PT_LEN, LF_NEG, true, O(text_indent), NULL, 0, AN_TYPE},
     {"text-transform", PT_KW, 0, true, O(text_transform), kw_ttrans, 0, AN_TYPE},
     {"text-wrap-mode", PT_KW, 0, true, O(white_space), kw_textwrap, 0, AN_TYPE},
@@ -1008,9 +1043,14 @@ static struct propdef props[] = {
 };
 #define NPROPS (int)(sizeof props / sizeof *props)
 
-/* other names for the same properties (logical properties map to left-to-right, horizontal text) */
+/* other names for the same properties: the legacy name aliases the specifications define (legacy: CSS
+   Cascade's legacy name alias, a supported property with its own CSSOM attribute, never listed among a
+   computed style's longhands: word-wrap of CSS Text's overflow-wrap, the grid gaps of CSS Box Alignment's
+   legacy gap properties), and the
+   logical properties, which map to left-to-right, horizontal text */
 static const struct {
     const char *alias, *name;
+    bool legacy;
 } aliases[] = {
     {"-webkit-transform", "transform"},
     {"block-size", "height"}, {"border-block-end", "border-bottom"}, {"border-block-start", "border-top"},
@@ -1021,14 +1061,14 @@ static const struct {
     {"border-inline-end-color", "border-right-color"}, {"border-inline-start-color", "border-left-color"},
     {"border-inline-end-width", "border-right-width"}, {"border-inline-start-width", "border-left-width"},
     {"border-inline-end-style", "border-right-style"}, {"border-inline-start-style", "border-left-style"},
-    {"grid-column-gap", "column-gap"}, {"grid-gap", "gap"}, {"grid-row-gap", "row-gap"},
+    {"grid-column-gap", "column-gap", true}, {"grid-gap", "gap", true}, {"grid-row-gap", "row-gap", true},
     {"inline-size", "width"}, {"inset-block-end", "bottom"}, {"inset-block-start", "top"},
     {"inset-inline-end", "right"}, {"inset-inline-start", "left"}, {"margin-block-end", "margin-bottom"},
     {"margin-block-start", "margin-top"}, {"margin-inline-end", "margin-right"},
     {"margin-inline-start", "margin-left"}, {"max-block-size", "max-height"}, {"max-inline-size", "max-width"},
     {"min-block-size", "min-height"}, {"min-inline-size", "min-width"}, {"padding-block-end", "padding-bottom"},
     {"padding-block-start", "padding-top"}, {"padding-inline-end", "padding-right"},
-    {"padding-inline-start", "padding-left"}, {"word-wrap", ""},
+    {"padding-inline-start", "padding-left"}, {"word-wrap", "overflow-wrap", true},
 };
 
 static bool props_sorted;
@@ -1121,6 +1161,11 @@ const struct propdef *css_prop_lookup(const char *name, size_t n) {
 }
 
 int css_prop_count(void) { return NPROPS; }
+const char *css_prop_legacy_alias(int index) {
+    for (size_t i = 0; i < sizeof aliases / sizeof *aliases; i++)
+        if (aliases[i].legacy && !index--) return aliases[i].alias;
+    return NULL;
+}
 const char *css_prop_name(int index,bool *longhand) {
     if(index<0||index>=NPROPS)return NULL;
     props_init();
@@ -1163,6 +1208,8 @@ static const void *group_of(const style_t *s, uint8_t g) {
     case G_BORDER_IMAGE: return css_style_border_image(s);
     case G_MASK_BORDER: return css_style_mask_border(s);
     case G_UI: return css_style_ui(s);
+    case G_DECORATION: return css_style_decoration(s);
+    case G_TEXT: return css_style_text(s);
     }
     return s;
 }
@@ -1176,6 +1223,8 @@ static size_t group_size(uint8_t g) {
     case G_BACKGROUND: return sizeof(struct css_background);
     case G_BORDER_IMAGE: case G_MASK_BORDER: return sizeof(struct css_border_image);
     case G_UI: return sizeof(struct css_ui);
+    case G_DECORATION: return sizeof(struct css_decoration);
+    case G_TEXT: return sizeof(struct css_text);
     }
     return sizeof(struct css_list);
 }
@@ -1190,6 +1239,8 @@ static bool group_same(const style_t *a, const style_t *b, uint8_t g) {
     case G_BORDER_IMAGE: return a->border_image == b->border_image;
     case G_MASK_BORDER: return a->mask_border == b->mask_border;
     case G_UI: return a->ui == b->ui;
+    case G_DECORATION: return a->decoration == b->decoration;
+    case G_TEXT: return a->text == b->text;
     }
     return a->list == b->list;
 }
@@ -1209,12 +1260,14 @@ static void *group_write(style_t *s, uint8_t g, const void *value, arena_t *a) {
     case G_ANCHOR: s->anchor = copy; break;
     case G_COUNTER: s->counters = copy; break;
     case G_UI: s->ui = copy; break;
+    case G_DECORATION: s->decoration = copy; break;
+    case G_TEXT: s->text = copy; break;
     default: s->list = copy;
     }
     return copy;
 }
-/* every group of uninherited properties of src, as copying each of those properties would (G_LIST's
-   and G_UI's are inherited: css_style_init's copy of the parent already holds them) */
+/* every group of uninherited properties of src, as copying each of those properties would (G_LIST's,
+   G_UI's and G_TEXT's are inherited: css_style_init's copy of the parent already holds them) */
 static void groups_copy(style_t *dst, const style_t *src) {
     dst->float_shape = src->float_shape;
     dst->offset = src->offset;
@@ -1224,6 +1277,7 @@ static void groups_copy(style_t *dst, const style_t *src) {
     dst->background = src->background;
     dst->border_image = src->border_image; dst->border_image_img = src->border_image_img;
     dst->mask_border = src->mask_border; dst->mask_border_img = src->mask_border_img;
+    dst->decoration = src->decoration;
 }
 /* the property's field in s */
 static const void *field_of(const style_t *s, const struct propdef *p) {
@@ -1247,6 +1301,10 @@ static void ui_cursor_text(const struct css_cursor *c, sbuf *out);
 static bool ui_colors_text(const struct propdef *p, const style_t *st, const struct css_ui_color *field, bool resolved,
                            sbuf *out);
 static bool ui_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
+static bool text_value_text(const style_t *st, const struct propdef *p, bool resolved, sbuf *out, web_doc *d);
+static void decoration_line_text(sbuf *out, uint8_t lines);
+static bool decoration_shorthand_text(const style_t *st, sbuf *out, web_doc *d);
+static bool text_specified(const struct propdef *p, const char *v, size_t n, sbuf *out);
 int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_doc *d) {
     const struct propdef *p = css_prop_lookup(name, strlen(name));
     if (!p) return 0;
@@ -1284,8 +1342,11 @@ int css_computed_longhand(const style_t *st, const char *name, sbuf *out, web_do
     case PT_RULE_LIST: case PT_RULE_INSET: return gap_computed(st, p, out, d);
     case PT_CURSOR: ui_cursor_text((const struct css_cursor *)field, out); return 1;
     case PT_UI_COLOR: return ui_colors_text(p, st, (const struct css_ui_color *)field, true, out) ? 1 : -1;
+    case PT_TEXT: return text_value_text(st, p, true, out, d) ? 1 : -1;
+    case PT_TEXT_DECO: decoration_line_text(out, st->text_decoration); return 1;
     case PT_SHORT: /* the shorthands whose longhands' owner serializes them together */
         if (p->sh == SH_LIST_STYLE) { list_style_text(st, out); return 1; }
+        if (p->sh == SH_TEXT_DECORATION) return decoration_shorthand_text(st, out, d) ? 1 : -1;
         if (p->sh == SH_OFFSET) return css_offset_shorthand_serialize(css_style_offset(st), out, d) ? 1 : -1;
         if (p->sh == SH_GAP_RULE) return gap_computed(st, p, out, d);
         if (p->sh == SH_POSITION_TRY) return position_try_text(css_style_anchor(st), out) ? 1 : -1;
@@ -1325,6 +1386,9 @@ bool css_specified_longhand(const char *name, const char *v, size_t n, sbuf *out
                                   p->sh == SH_MARGIN || p->sh == SH_MARGIN_BLOCK || p->sh == SH_MARGIN_INLINE))) &&
         anchor_specified(p, v, n, out))
         return true;
+    if (p->type == PT_TEXT || p->type == PT_TEXT_DECO || (p->type == PT_SHORT && p->sh == SH_TEXT_DECORATION))
+        return text_specified(p, v, n, out);
+    if (p->group == G_TEXT || p->group == G_DECORATION) return false; /* their keywords, as written */
     if (p->type == PT_SHAPE || p->group != G_STYLE || (p->type == PT_SHORT && p->sh == SH_OFFSET))
         return css_shape_specified(p->name, v, n, out);
     if (p->type != PT_COLOR_SCHEME) {
@@ -1804,6 +1868,7 @@ static bool gap_shorthand_parse(int what, const char *v, size_t n, struct cx *cx
 }
 /* a shorthand: the longhands no more important declaration set, written into one copy of the group */
 static bool set_long(const char *name, const char *v, size_t n, struct cx *cx);
+static bool decoration_shorthand_split(const char *v, size_t n, struct cx *cx, const char *part[4], size_t part_n[4]);
 static bool gap_shorthand_apply(const struct propdef *p, const char *v, size_t n, bool global, struct cx *cx) {
     int what = p->flags & 15;
     if (global) {
@@ -5762,6 +5827,8 @@ static bool parse_transform_origin(const char *v,size_t n,struct cx *cx,len_t ou
 }
 
 static bool apply_value(const struct propdef *p, const char *v, size_t n, struct cx *cx, char *field);
+static bool text_value_parse(const struct propdef *p, const char *v, size_t n, struct cx *cx, char *field);
+static bool decoration_line_parse(const char *v, size_t n, uint8_t *out);
 static bool apply_long(const struct propdef *p, const char *v, size_t n, struct cx *cx) {
     style_t *s = cx->s;
     const style_t *par = cx->parent ? cx->parent : &initial;
@@ -5781,7 +5848,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     /* a group's field: parsed into a copy of the group, which s takes when the value is valid */
     union { struct css_float_shape float_shape; struct css_offset offset; struct css_gap_rules gap_rules;
             struct css_anchor anchor; struct css_counters counters; struct css_list list;
-            struct css_background background; struct css_border_image border_image; struct css_ui ui; } own;
+            struct css_background background; struct css_border_image border_image; struct css_ui ui;
+            struct css_decoration decoration; struct css_text text; } own;
     memcpy(&own, group_of(s, p->group), group_size(p->group));
     if (!apply_value(p, v, n, cx, (char *)&own + p->off)) return false;
     group_write(s, p->group, &own, cx->a);
@@ -5963,7 +6031,8 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     case PT_CURSOR: return ui_cursor(v, n, cx, (struct css_cursor *)field, NULL);
     case PT_UI_COLOR: return ui_color(p, v, n, cx, (struct css_ui_color *)field, NULL);
     case PT_CLIP: return parse_clip_rect(v, n, cx, &s->clip);
-    case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
+    case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL, false);
+    case PT_TEXT: return text_value_parse(p, v, n, cx, field);
     case PT_OPACITY: {
         /* <opacity-value>: <number> | <percentage>, either of them a calculation */
         double x;
@@ -6047,23 +6116,566 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     case PT_GTEMPLATE: return parse_gtemplate(v, n, cx, (const struct gtemplate **)field);
     case PT_GAREAS: return parse_gareas(v, n, cx, &s->grid_areas);
     case PT_GLINE: return parse_gline(v, n, cx, (struct gline *)field);
-    case PT_TEXT_DECO: {
-        const char *t[4];
-        size_t tl[4];
-        int k = split_checked(v, n, t, tl, 4, ' ', cx);
-        uint8_t d = 0;
-        for (int i = 0; i < k; i++) {
-            if (ident_is(t[i], tl[i], "underline")) d |= TD_UNDERLINE;
-            else if (ident_is(t[i], tl[i], "overline")) d |= TD_OVERLINE;
-            else if (ident_is(t[i], tl[i], "line-through")) d |= TD_LINE_THROUGH;
-            else if (ident_is(t[i], tl[i], "none") || ident_is(t[i], tl[i], "blink")) {
-            } else return false;
+    case PT_TEXT_DECO: return decoration_line_parse(v, n, &s->text_decoration);
+    }
+    return false;
+}
+
+static void anim_unit(sbuf *b, double v, const char *unit);
+static void anim_number(sbuf *b, double v);
+static bool anim_color_text(sbuf *b, const struct css_color_computed *v);
+/* the animation layer's combinations (below): interpolation, addition, accumulation */
+enum { MIX, ADD, ACCUMULATE };
+/* ---------------------------------------------------------------- text (css-text-3/4, css-text-decor-4)
+   The inherited text group (struct css_text: word-break, line-break, overflow-wrap, hyphens and the
+   hyphenation limits, tab-size, text-shadow, text-underline-position and -offset) and the decoration
+   group (text-decoration-color, -style, -thickness); text-decoration-line is style_t's own. */
+const struct css_text css_text_initial = {
+    .hyphenate_limit_chars = {CSS_TEXT_AUTO, CSS_TEXT_AUTO, CSS_TEXT_AUTO}, .hyphenate_limit_lines = CSS_TEXT_AUTO,
+    .tab_size = {8, false}, .underline_offset = {.kind = LK_AUTO}};
+const struct css_decoration css_decoration_initial = {.color = {COLOR_CURRENT, NULL}, .thickness = {.kind = LK_AUTO}};
+static bool text_same_string(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
+static bool shadow_lists_equal(const struct css_box_shadow *x, const struct css_box_shadow *y) {
+    for (; x && y; x = x->next, y = y->next)
+        if (x->x != y->x || x->y != y->y || x->blur != y->blur || x->spread != y->spread || x->color != y->color ||
+            x->inset != y->inset || !css_color_value_equal(x->color_value, y->color_value)) return false;
+    return !x && !y;
+}
+bool css_text_layout_equal(const struct css_text *a, const struct css_text *b) {
+    if (a == b) return true;
+    if (!a) a = &css_text_initial;
+    if (!b) b = &css_text_initial;
+    return a->word_break == b->word_break && a->line_break == b->line_break && a->overflow_wrap == b->overflow_wrap &&
+           a->hyphens == b->hyphens && a->tab_size.value == b->tab_size.value && a->tab_size.length == b->tab_size.length &&
+           !memcmp(a->hyphenate_limit_chars, b->hyphenate_limit_chars, sizeof a->hyphenate_limit_chars) &&
+           a->hyphenate_limit_lines == b->hyphenate_limit_lines &&
+           text_same_string(a->hyphenate_character, b->hyphenate_character);
+}
+bool css_text_equal(const struct css_text *a, const struct css_text *b) {
+    if (a == b) return true;
+    if (!a) a = &css_text_initial;
+    if (!b) b = &css_text_initial;
+    return css_text_layout_equal(a, b) && a->underline_position == b->underline_position &&
+           css_length_equal(&a->underline_offset, &b->underline_offset) && shadow_lists_equal(a->shadow, b->shadow);
+}
+bool css_decoration_equal(const struct css_decoration *a, const struct css_decoration *b) {
+    if (a == b) return true;
+    if (!a) a = &css_decoration_initial;
+    if (!b) b = &css_decoration_initial;
+    return a->color.argb == b->color.argb && css_color_value_equal(a->color.exact, b->color.exact) &&
+           a->style == b->style && css_length_equal(&a->thickness, &b->thickness);
+}
+bool css_decorating_equal(const struct css_decorating *a, const struct css_decorating *b) {
+    for (; a != b; a = a->next, b = b->next) {
+        if (!a || !b) return false;
+        /* thickness and offset are NAN for auto: compared by their bits */
+        if (a->font != b->font || a->font_size != b->font_size || memcmp(&a->thickness, &b->thickness, sizeof a->thickness) ||
+            memcmp(&a->underline_offset, &b->underline_offset, sizeof a->underline_offset) || a->shift != b->shift ||
+            a->color != b->color || a->lines != b->lines || a->style != b->style ||
+            a->underline_position != b->underline_position) return false;
+    }
+    return true;
+}
+uint32_t css_text_shadow_color(const style_t *st, const struct css_box_shadow *shadow) {
+    if (shadow->color != COLOR_CURRENT) return shadow->color;
+    return shadow->color_value ? css_color_value_argb(shadow->color_value, st->color) : st->color;
+}
+float css_tab_interval(const style_t *st, float space) {
+    const struct css_tab_size *t = &css_style_text(st)->tab_size;
+    float interval = t->length ? t->value : t->value * space;
+    return isfinite(interval) && interval > 0 ? interval : 0;
+}
+/* the tokens of a value separated by white space, at most max; -1: more, or an empty one */
+static int text_tokens(const char *v, size_t n, const char **t, size_t *tl, int max) {
+    int k = split(v, n, t, tl, max + 1, ' ');
+    if (k < 1 || k > max) return -1;
+    for (int i = 0; i < k; i++) if (!tl[i]) return -1;
+    return k;
+}
+/* <string> (css-syntax-3 §4.3.5): one string token, its contents unescaped */
+static bool text_string(const char *v, size_t n, struct cx *cx, const char **out) {
+    if (n < 2 || (v[0] != '"' && v[0] != '\'') || v[n - 1] != v[0]) return false;
+    for (size_t i = 1; i + 1 < n; i++) {
+        if (v[i] == '\\') { if (++i + 1 >= n) return false; continue; } /* the closing quote escaped */
+        if (v[i] == v[0] || v[i] == '\n') return false;
+    }
+    sbuf b = {0};
+    css_unescape(&b, v + 1, n - 2);
+    *out = ar_strndup(cx->a, b.p ? b.p : "", b.n);
+    sb_free(&b);
+    return true;
+}
+/* CSSOM "serialize a string": in double quotes, with '"', '\' and control characters escaped */
+static void text_string_text(sbuf *out, const char *s) {
+    sb_putc(out, '"');
+    for (const unsigned char *c = (const unsigned char *)s; *c; c++) {
+        if (*c < 0x20 || *c == 0x7f) { char hex[8]; snprintf(hex, sizeof hex, "\\%x ", *c); sb_puts(out, hex); }
+        else { if (*c == '"' || *c == '\\') sb_putc(out, '\\'); sb_putc(out, (char)*c); }
+    }
+    sb_putc(out, '"');
+}
+/* <integer> (css-values-4 §5.1): a literal, or a math function of type <number> rounded to the
+   nearest integer (a half toward +infinity, §10.12); negative: a negative one is valid, else a math
+   function's clamps to 0 */
+static bool text_integer(const char *v, size_t n, struct cx *cx, bool negative, int32_t *out) {
+    size_t i = v[0] == '+' || v[0] == '-' ? 1 : 0;
+    if (i < n && v[i] >= '0' && v[i] <= '9') {
+        double x = 0;
+        for (; i < n; i++) {
+            if (v[i] < '0' || v[i] > '9') return false;
+            x = fmin(x * 10 + (v[i] - '0'), 2147483647.0);
         }
-        s->text_decoration = d;
+        if (v[0] == '-') x = -x;
+        if (x < 0 && !negative) return false;
+        *out = (int32_t)x;
+        return true;
+    }
+    double d;
+    if (!css_calc_is_math(v, n) || !css_numeric_read(v, n, CSS_CALC_NUMBER, cx, cx->a, NAN, &d, NULL)) return false;
+    d = floor(d + .5);
+    if (d < 0 && !negative) d = 0;
+    *out = d >= 2147483647.0 ? INT32_MAX : d <= -2147483647.0 ? -INT32_MAX : (int32_t)d;
+    return true;
+}
+/* text-decoration-line: none | [ underline || overline || line-through || blink ] | spelling-error |
+   grammar-error (css-text-decor-4 §2.1) */
+static bool decoration_line_parse(const char *v, size_t n, uint8_t *out) {
+    const char *t[4];
+    size_t tl[4];
+    int k = text_tokens(v, n, t, tl, 4);
+    if (k < 1) return false;
+    uint8_t lines = 0;
+    for (int i = 0; i < k; i++) {
+        bool alone = ident_is(t[i], tl[i], "none") || ident_is(t[i], tl[i], "spelling-error") ||
+                     ident_is(t[i], tl[i], "grammar-error");
+        if (alone) {
+            if (k != 1) return false;
+            *out = ident_is(t[i], tl[i], "none") ? 0 : ident_is(t[i], tl[i], "spelling-error") ? TD_SPELLING_ERROR :
+                   TD_GRAMMAR_ERROR;
+            return true;
+        }
+        uint8_t bit = ident_is(t[i], tl[i], "underline") ? TD_UNDERLINE : ident_is(t[i], tl[i], "overline") ? TD_OVERLINE :
+                      ident_is(t[i], tl[i], "line-through") ? TD_LINE_THROUGH : ident_is(t[i], tl[i], "blink") ? TD_BLINK : 0;
+        if (!bit || (lines & bit)) return false;
+        lines |= bit;
+    }
+    *out = lines;
+    return true;
+}
+static void decoration_line_text(sbuf *out, uint8_t lines) {
+    static const char *const names[] = {"underline", "overline", "line-through", "blink", "spelling-error", "grammar-error"};
+    if (!lines) { sb_puts(out, "none"); return; }
+    bool first = true;
+    for (int i = 0; i < 6; i++)
+        if (lines & 1u << i) { if (!first) sb_putc(out, ' '); sb_puts(out, names[i]); first = false; }
+}
+/* text-underline-position: auto | [ from-font | under ] || [ left | right ] (css-text-decor-4 §2.5) */
+static bool underline_position_parse(const char *v, size_t n, uint8_t *out) {
+    if (ident_is(v, n, "auto")) { *out = 0; return true; }
+    const char *t[2];
+    size_t tl[2];
+    int k = text_tokens(v, n, t, tl, 2);
+    if (k < 1) return false;
+    uint8_t bits = 0;
+    for (int i = 0; i < k; i++) {
+        uint8_t bit = ident_is(t[i], tl[i], "from-font") ? CSS_UNDERLINE_FROM_FONT : ident_is(t[i], tl[i], "under") ?
+                      CSS_UNDERLINE_UNDER : ident_is(t[i], tl[i], "left") ? CSS_UNDERLINE_LEFT :
+                      ident_is(t[i], tl[i], "right") ? CSS_UNDERLINE_RIGHT : 0;
+        uint8_t kind = bit & (CSS_UNDERLINE_FROM_FONT | CSS_UNDERLINE_UNDER) ? CSS_UNDERLINE_FROM_FONT | CSS_UNDERLINE_UNDER :
+                       CSS_UNDERLINE_LEFT | CSS_UNDERLINE_RIGHT;
+        if (!bit || (bits & kind)) return false;
+        bits |= bit;
+    }
+    *out = bits;
+    return true;
+}
+static void underline_position_text(sbuf *out, uint8_t bits) {
+    if (!bits) { sb_puts(out, "auto"); return; }
+    const char *vertical = bits & CSS_UNDERLINE_FROM_FONT ? "from-font" : bits & CSS_UNDERLINE_UNDER ? "under" : NULL;
+    const char *side = bits & CSS_UNDERLINE_LEFT ? "left" : bits & CSS_UNDERLINE_RIGHT ? "right" : NULL;
+    if (vertical) sb_puts(out, vertical);
+    if (vertical && side) sb_putc(out, ' ');
+    if (side) sb_puts(out, side);
+}
+/* hyphenate-limit-chars: [ auto | <integer [0,∞]> ]{1,3}; the third missing is the second, the second
+   missing auto (css-text-4 §6.3.4). The animation layer's values may be negative. */
+static bool limit_chars_parse(const char *v, size_t n, struct cx *cx, int32_t limit[3], const char **t, size_t *tl, int *count) {
+    int k = text_tokens(v, n, t, tl, 3);
+    if (k < 1) return false;
+    for (int i = 0; i < k; i++)
+        if (ident_is(t[i], tl[i], "auto")) limit[i] = CSS_TEXT_AUTO;
+        else if (!text_integer(t[i], tl[i], cx, cx->computed_text, &limit[i])) return false;
+    if (k == 1) limit[1] = CSS_TEXT_AUTO;
+    if (k < 3) limit[2] = limit[1];
+    *count = k;
+    return true;
+}
+/* its shortest serialization: the third omitted when it is the second, then the second when auto */
+static int limit_chars_shortest(const int32_t limit[3]) {
+    int k = 3;
+    if (limit[2] == limit[1]) { k = 2; if (limit[1] == CSS_TEXT_AUTO) k = 1; }
+    return k;
+}
+static void limit_chars_text(sbuf *out, const int32_t limit[3]) {
+    int k = limit_chars_shortest(limit);
+    for (int i = 0; i < k; i++) {
+        if (i) sb_putc(out, ' ');
+        if (limit[i] == CSS_TEXT_AUTO) sb_puts(out, "auto");
+        else { char number[16]; snprintf(number, sizeof number, "%d", (int)limit[i]); sb_puts(out, number); }
+    }
+}
+/* auto | from-font (thickness) | <length-percentage>, a percentage of 1em (css-text-decor-4 §2.4, §2.7) */
+static bool decoration_length_parse(const char *v, size_t n, struct cx *cx, bool from_font, len_t *out) {
+    if (from_font && ident_is(v, n, "from-font")) { *out = (len_t){.kind = LK_NONE}; return true; }
+    return parse_len(v, n, cx, out, LF_AUTO | LF_NEG | LF_LENGTH);
+}
+static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, const struct css_box_shadow **out,
+                              sbuf *specified, bool text);
+static bool text_value_parse(const struct propdef *p, const char *v, size_t n, struct cx *cx, char *field) {
+    switch (p->flags) {
+    case CSS_TEXT_SHADOW: return parse_box_shadows(v, n, cx, (const struct css_box_shadow **)field, NULL, true);
+    case CSS_TEXT_HYPHENATE_CHARACTER:
+        if (ident_is(v, n, "auto")) { *(const char **)field = NULL; return true; }
+        return text_string(v, n, cx, (const char **)field);
+    case CSS_TEXT_HYPHENATE_LIMIT_CHARS: {
+        const char *t[3];
+        size_t tl[3];
+        int count;
+        return limit_chars_parse(v, n, cx, (int32_t *)field, t, tl, &count);
+    }
+    case CSS_TEXT_HYPHENATE_LIMIT_LINES:
+        if (ident_is(v, n, "no-limit")) { *(int32_t *)field = CSS_TEXT_AUTO; return true; }
+        return text_integer(v, n, cx, false, (int32_t *)field);
+    case CSS_TEXT_TAB_SIZE: {
+        /* <number [0,∞]> | <length [0,∞]>: a calculation clamps to the range (css-text-3 §4.2) */
+        double x;
+        unsigned kind;
+        if (!css_numeric_read(v, n, CSS_CALC_NUMBER | CSS_CALC_LENGTH, cx, cx->a, NAN, &x, &kind)) return false;
+        if (x < 0) { if (!css_calc_is_math(v, n)) return false; x = 0; }
+        *(struct css_tab_size *)field = (struct css_tab_size){calc_float(x), kind == CSS_CALC_LENGTH};
+        return true;
+    }
+    case CSS_TEXT_UNDERLINE_POSITION: return underline_position_parse(v, n, (uint8_t *)field);
+    case CSS_TEXT_UNDERLINE_OFFSET: return decoration_length_parse(v, n, cx, false, (len_t *)field);
+    case CSS_TEXT_DECORATION_THICKNESS: return decoration_length_parse(v, n, cx, true, (len_t *)field);
+    case CSS_TEXT_DECORATION_COLOR: {
+        struct css_decoration_color c;
+        if (!css_color_value_compute(v, n, cx, NULL, &c.argb, &c.exact)) return false;
+        *(struct css_decoration_color *)field = c;
         return true;
     }
     }
     return false;
+}
+/* -------- computed values: getComputedStyle's (resolved: currentcolor as the used colour) and the
+   animation layer's (currentcolor kept, for the cascade to resolve) */
+static void anim_shadow_list_text(sbuf *b, const style_t *st, const struct css_box_shadow *list, bool text);
+static bool text_value_text(const style_t *st, const struct propdef *p, bool resolved, sbuf *out, web_doc *d) {
+    const char *field = field_of(st, p);
+    switch (p->flags) {
+    case CSS_TEXT_SHADOW: {
+        const struct css_box_shadow *list = *(const struct css_box_shadow *const *)field;
+        if (!resolved || !list) { anim_shadow_list_text(out, st, list, true); return true; }
+        for (const struct css_box_shadow *s = list; s; s = s->next) {
+            if (s != list) sb_puts(out, ", ");
+            struct css_color_computed c;
+            css_color_held(s->color, s->color_value, st->color, &c);
+            struct css_color used = anim_color_used(st, &c);
+            css_color_serialize(&used, false, out);
+            sb_putc(out, ' ');
+            anim_unit(out, s->x, "px "); anim_unit(out, s->y, "px "); anim_unit(out, s->blur, "px");
+        }
+        return true;
+    }
+    case CSS_TEXT_HYPHENATE_CHARACTER: {
+        const char *s = *(const char *const *)field;
+        if (!s) sb_puts(out, "auto");
+        else text_string_text(out, s);
+        return true;
+    }
+    case CSS_TEXT_HYPHENATE_LIMIT_CHARS: limit_chars_text(out, (const int32_t *)field); return true;
+    case CSS_TEXT_HYPHENATE_LIMIT_LINES: {
+        int32_t v = *(const int32_t *)field;
+        if (v == CSS_TEXT_AUTO) sb_puts(out, "no-limit");
+        else { char number[16]; snprintf(number, sizeof number, "%d", (int)v); sb_puts(out, number); }
+        return true;
+    }
+    case CSS_TEXT_TAB_SIZE: {
+        const struct css_tab_size *t = (const struct css_tab_size *)field;
+        if (t->length) anim_unit(out, t->value, "px");
+        else anim_number(out, t->value);
+        return true;
+    }
+    case CSS_TEXT_UNDERLINE_POSITION: underline_position_text(out, *(const uint8_t *)field); return true;
+    case CSS_TEXT_UNDERLINE_OFFSET: case CSS_TEXT_DECORATION_THICKNESS: {
+        const len_t *l = (const len_t *)field;
+        if (l->kind == LK_NONE) { sb_puts(out, "from-font"); return true; }
+        return css_length_serialize(l, out, d);
+    }
+    case CSS_TEXT_DECORATION_COLOR: {
+        const struct css_decoration_color *c = (const struct css_decoration_color *)field;
+        struct css_color_computed v;
+        css_color_held(c->argb, c->exact, st->color, &v);
+        if (!resolved) return anim_color_text(out, &v);
+        struct css_color used = anim_color_used(st, &v);
+        return css_color_serialize(&used, false, out);
+    }
+    }
+    return false;
+}
+/* text-decoration's computed value: its longhands' in canonical order, the initial ones omitted */
+static bool decoration_shorthand_text(const style_t *st, sbuf *out, web_doc *d) {
+    const struct css_decoration *dec = css_style_decoration(st);
+    size_t begin = out->n;
+    bool any = false;
+    if (st->text_decoration) { decoration_line_text(out, st->text_decoration); any = true; }
+    if (dec->thickness.kind != LK_AUTO) {
+        if (any) sb_putc(out, ' ');
+        if (dec->thickness.kind == LK_NONE) sb_puts(out, "from-font");
+        else if (!css_length_serialize(&dec->thickness, out, d)) { out->n = begin; return false; }
+        any = true;
+    }
+    if (dec->style != CSS_DECORATION_SOLID) {
+        if (any) sb_putc(out, ' ');
+        sb_puts(out, kw_name(kw_decoration_style, dec->style));
+        any = true;
+    }
+    if (dec->color.argb != COLOR_CURRENT || dec->color.exact) {
+        if (any) sb_putc(out, ' ');
+        struct css_color_computed v;
+        css_color_held(dec->color.argb, dec->color.exact, st->color, &v);
+        struct css_color used = anim_color_used(st, &v);
+        css_color_serialize(&used, false, out);
+        any = true;
+    }
+    if (!any) sb_puts(out, "none");
+    return true;
+}
+/* -------- combining values (the animation layer's, below): text-shadow as a shadow list,
+   hyphenate-limit-chars by component, tab-size and the decoration lengths by computed value type */
+static bool anim_shadows(sbuf *b, const style_t *sa, const struct css_box_shadow *x, const style_t *sv,
+                         const struct css_box_shadow *y, double ka, double kb, int mode, bool text);
+static bool anim_len(sbuf *b, const len_t *x, const len_t *y, double ka, double kb, int flags, web_doc *d);
+static bool anim_color(sbuf *b, const style_t *sx, const struct css_color_computed *x, const style_t *sy,
+                       const struct css_color_computed *y, double p, int mode);
+/* <integer>: as a real number, then the nearest integer, a half toward +infinity */
+static int32_t anim_integer(int32_t x, int32_t y, double ka, double kb) {
+    double v = floor(x * ka + y * kb + .5);
+    return v >= 2147483647.0 ? INT32_MAX : v <= -2147483647.0 ? -INT32_MAX : (int32_t)v;
+}
+static bool text_combine(const struct css_anim_ctx *c, const struct propdef *p, const style_t *a, const char *fa,
+                         const style_t *b, const char *fb, double ka, double kb, int mode, sbuf *out) {
+    switch (p->flags) {
+    case CSS_TEXT_SHADOW:
+        return anim_shadows(out, a, *(const struct css_box_shadow *const *)fa, b, *(const struct css_box_shadow *const *)fb,
+                            ka, kb, mode, true);
+    case CSS_TEXT_HYPHENATE_LIMIT_CHARS: {
+        const int32_t *x = (const int32_t *)fa, *y = (const int32_t *)fb;
+        int32_t r[3];
+        for (int i = 0; i < 3; i++) {
+            if ((x[i] == CSS_TEXT_AUTO) != (y[i] == CSS_TEXT_AUTO)) return false; /* auto only with itself */
+            r[i] = x[i] == CSS_TEXT_AUTO ? CSS_TEXT_AUTO : anim_integer(x[i], y[i], ka, kb);
+        }
+        limit_chars_text(out, r);
+        return true;
+    }
+    case CSS_TEXT_HYPHENATE_LIMIT_LINES: {
+        int32_t x = *(const int32_t *)fa, y = *(const int32_t *)fb;
+        if ((x == CSS_TEXT_AUTO) != (y == CSS_TEXT_AUTO)) return false;
+        if (x == CSS_TEXT_AUTO) { sb_puts(out, "no-limit"); return true; }
+        int32_t v = anim_integer(x, y, ka, kb);
+        char number[16];
+        snprintf(number, sizeof number, "%d", (int)(v < 0 ? 0 : v));
+        sb_puts(out, number);
+        return true;
+    }
+    case CSS_TEXT_TAB_SIZE: {
+        const struct css_tab_size *x = (const struct css_tab_size *)fa, *y = (const struct css_tab_size *)fb;
+        if (x->length != y->length) return false; /* a number and a length do not combine */
+        double v = x->value * ka + y->value * kb;
+        if (!(v > 0)) v = 0;
+        if (x->length) anim_unit(out, v, "px");
+        else anim_number(out, v);
+        return true;
+    }
+    case CSS_TEXT_UNDERLINE_OFFSET: case CSS_TEXT_DECORATION_THICKNESS: {
+        const len_t *x = (const len_t *)fa, *y = (const len_t *)fb;
+        if (x->kind == LK_NONE || y->kind == LK_NONE) { /* from-font only with itself */
+            if (x->kind != y->kind || mode != MIX) return false;
+            sb_puts(out, "from-font");
+            return true;
+        }
+        return anim_len(out, x, y, ka, kb, LF_NEG, c->d);
+    }
+    case CSS_TEXT_DECORATION_COLOR: {
+        const struct css_decoration_color *x = (const struct css_decoration_color *)fa, *y = (const struct css_decoration_color *)fb;
+        struct css_color_computed u, v;
+        css_color_held(x->argb, x->exact, a->color, &u);
+        css_color_held(y->argb, y->exact, b->color, &v);
+        return anim_color(out, a, &u, b, &v, kb, mode);
+    }
+    }
+    return false;
+}
+static bool text_value_equal(const struct propdef *p, const style_t *a, const char *fa, const style_t *b, const char *fb) {
+    switch (p->flags) {
+    case CSS_TEXT_SHADOW: {
+        const struct css_box_shadow *x = *(const struct css_box_shadow *const *)fa, *y = *(const struct css_box_shadow *const *)fb;
+        for (; x && y; x = x->next, y = y->next) {
+            if (x->x != y->x || x->y != y->y || x->blur != y->blur) return false;
+            struct css_color_computed u, v;
+            css_color_held(x->color, x->color_value, a->color, &u);
+            css_color_held(y->color, y->color_value, b->color, &v);
+            if (!css_color_computed_equal(&u, &v)) return false;
+        }
+        return !x && !y;
+    }
+    case CSS_TEXT_HYPHENATE_CHARACTER: return text_same_string(*(const char *const *)fa, *(const char *const *)fb);
+    case CSS_TEXT_UNDERLINE_OFFSET: case CSS_TEXT_DECORATION_THICKNESS:
+        return css_length_equal((const len_t *)fa, (const len_t *)fb);
+    case CSS_TEXT_DECORATION_COLOR: {
+        const struct css_decoration_color *x = (const struct css_decoration_color *)fa, *y = (const struct css_decoration_color *)fb;
+        struct css_color_computed u, v;
+        css_color_held(x->argb, x->exact, a->color, &u);
+        css_color_held(y->argb, y->exact, b->color, &v);
+        return css_color_computed_equal(&u, &v);
+    }
+    }
+    return !memcmp(fa, fb, p->size);
+}
+/* text-decoration: <'text-decoration-line'> || <'text-decoration-thickness'> || <'text-decoration-style'> ||
+   <'text-decoration-color'> (css-text-decor-4 §2.6): each component's text, NULL where it is omitted.
+   The line's keywords are one component, written together. */
+static bool decoration_line_keyword(const char *t, size_t n) {
+    return ident_is(t, n, "none") || ident_is(t, n, "underline") || ident_is(t, n, "overline") ||
+           ident_is(t, n, "line-through") || ident_is(t, n, "blink") || ident_is(t, n, "spelling-error") ||
+           ident_is(t, n, "grammar-error");
+}
+static bool decoration_shorthand_split(const char *v, size_t n, struct cx *cx, const char *part[4], size_t part_n[4]) {
+    const char *t[6];
+    size_t tl[6];
+    int k = text_tokens(v, n, t, tl, 6);
+    if (k < 1) return false;
+    for (int i = 0; i < 4; i++) part[i] = NULL, part_n[i] = 0;
+    for (int i = 0; i < k;) {
+        int j = i;
+        while (j < k && decoration_line_keyword(t[j], tl[j])) j++;
+        if (j > i) {
+            uint8_t lines;
+            if (part[0]) return false;
+            part[0] = t[i];
+            part_n[0] = (size_t)(t[j - 1] + tl[j - 1] - t[i]);
+            if (!decoration_line_parse(part[0], part_n[0], &lines)) return false;
+            i = j;
+            continue;
+        }
+        uint8_t style;
+        len_t length;
+        uint32_t color;
+        int which = kw_find(kw_decoration_style, t[i], tl[i], &style) ? 2 :
+                    decoration_length_parse(t[i], tl[i], cx, true, &length) ? 1 :
+                    css_color_checked(t[i], tl[i], &color, cx) ? 3 : -1;
+        if (which < 0 || part[which]) return false;
+        part[which] = t[i];
+        part_n[which] = tl[i];
+        i++;
+    }
+    return true;
+}
+/* -------- the specified values CSSOM serializes */
+static bool shadow_specified(const char *value, size_t size, bool text, sbuf *out);
+static bool text_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
+    arena_t a = {.chunk_size = 1024};
+    jmp_buf trap;
+    a.trap = &trap;
+    bool ok = false;
+    if (!setjmp(trap)) {
+        struct cx cx = {.em = 16, .rem = 16, .vw = 800, .vh = 600, .a = &a, .supports_probe = true};
+        size_t begin = out->n;
+        switch (p->type == PT_SHORT ? -1 : p->type == PT_TEXT_DECO ? -2 : (int)p->flags) {
+        case -2: {
+            uint8_t lines;
+            if ((ok = decoration_line_parse(v, n, &lines))) decoration_line_text(out, lines);
+            break;
+        }
+        case CSS_TEXT_SHADOW: ok = shadow_specified(v, n, true, out); break;
+        case CSS_TEXT_HYPHENATE_CHARACTER: {
+            const char *s;
+            if (ident_is(v, n, "auto")) { sb_puts(out, "auto"); ok = true; }
+            else if ((ok = text_string(v, n, &cx, &s))) text_string_text(out, s);
+            break;
+        }
+        case CSS_TEXT_HYPHENATE_LIMIT_CHARS: {
+            const char *t[3];
+            size_t tl[3];
+            int32_t limit[3];
+            int count;
+            if (!(ok = limit_chars_parse(v, n, &cx, limit, t, tl, &count))) break;
+            /* as written, the shortest form; each math function simplified */
+            int k = limit_chars_shortest(limit);
+            for (int i = 0; i < k && ok; i++) {
+                if (i) sb_putc(out, ' ');
+                if (i >= count) sb_puts(out, "auto"); /* only for the second, missing and auto */
+                else if (ident_is(t[i], tl[i], "auto")) sb_puts(out, "auto");
+                else if (!css_calc_specified(t[i], tl[i], CSS_CALC_NUMBER, out)) sb_put(out, t[i], tl[i]);
+            }
+            break;
+        }
+        case CSS_TEXT_UNDERLINE_POSITION: {
+            uint8_t bits;
+            if ((ok = underline_position_parse(v, n, &bits))) underline_position_text(out, bits);
+            break;
+        }
+        case CSS_TEXT_DECORATION_COLOR: ok = css_color_specified(v, n, out); break;
+        case CSS_TEXT_UNDERLINE_OFFSET: case CSS_TEXT_DECORATION_THICKNESS: {
+            len_t l;
+            if (!(ok = decoration_length_parse(v, n, &cx, p->flags == CSS_TEXT_DECORATION_THICKNESS, &l))) break;
+            if (l.kind == LK_AUTO || l.kind == LK_NONE) sb_puts(out, l.kind == LK_AUTO ? "auto" : "from-font");
+            else if (!css_calc_specified(v, n, CSS_CALC_LENGTH | CSS_CALC_PERCENT, out)) sb_put(out, v, n);
+            break;
+        }
+        case CSS_TEXT_TAB_SIZE: case CSS_TEXT_HYPHENATE_LIMIT_LINES: {
+            char scratch[sizeof(struct css_tab_size)];
+            if (!(ok = text_value_parse(p, v, n, &cx, scratch))) break;
+            if (!css_calc_specified(v, n, p->flags == CSS_TEXT_TAB_SIZE ? CSS_CALC_NUMBER | CSS_CALC_LENGTH : CSS_CALC_NUMBER, out))
+                ok = false; /* not a math function: as written */
+            break;
+        }
+        case -1: { /* text-decoration: its longhands' specified values in canonical order, the initial ones omitted */
+            const char *part[4];
+            size_t part_n[4];
+            if (!(ok = decoration_shorthand_split(v, n, &cx, part, part_n))) break;
+            bool any = false;
+            for (int i = 0; i < 4; i++) {
+                if (!part[i]) continue;
+                size_t mark = out->n;
+                if (any) sb_putc(out, ' ');
+                if (i == 0) { uint8_t lines; decoration_line_parse(part[i], part_n[i], &lines); if (!lines) { out->n = mark; continue; } decoration_line_text(out, lines); }
+                else if (i == 1) {
+                    len_t l;
+                    decoration_length_parse(part[i], part_n[i], &cx, true, &l);
+                    if (l.kind == LK_AUTO) { out->n = mark; continue; }
+                    if (l.kind == LK_NONE) sb_puts(out, "from-font");
+                    else if (!css_calc_specified(part[i], part_n[i], CSS_CALC_LENGTH | CSS_CALC_PERCENT, out)) sb_put(out, part[i], part_n[i]);
+                } else if (i == 2) {
+                    uint8_t style;
+                    kw_find(kw_decoration_style, part[i], part_n[i], &style);
+                    if (style == CSS_DECORATION_SOLID) { out->n = mark; continue; }
+                    sb_puts(out, kw_name(kw_decoration_style, style));
+                } else {
+                    if (ident_is(part[i], part_n[i], "currentcolor")) { out->n = mark; continue; }
+                    if (!css_color_specified(part[i], part_n[i], out)) sb_put(out, part[i], part_n[i]);
+                }
+                any = true;
+            }
+            if (!any) sb_puts(out, "none");
+            break;
+        }
+        }
+        if (!ok) { out->n = begin; if (out->p && begin < out->cap) out->p[begin] = 0; }
+    }
+    ar_free(&a);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- shorthands */
@@ -6545,24 +7157,18 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         return true;
     }
     case SH_TEXT_DECORATION: {
-        if (global) return set_long("text-decoration-line", v, n, cx);
-        const char *t[6];
-        size_t tl[6];
-        int k = split_checked(v, n, t, tl, 6, ' ', cx);
-        char line[64] = "none";
-        size_t ln = 4;
-        for (int i = 0; i < k; i++)
-            if (ident_is(t[i], tl[i], "underline") || ident_is(t[i], tl[i], "overline") ||
-                ident_is(t[i], tl[i], "line-through")) {
-                if (ln == 4 && !strcmp(line, "none")) ln = 0;
-                if (ln + tl[i] + 1 < sizeof line) {
-                    if (ln) line[ln++] = ' ';
-                    memcpy(line + ln, t[i], tl[i]);
-                    ln += tl[i];
-                    line[ln] = 0;
-                }
-            } else if (cx->supports_probe && !ident_is(t[i],tl[i],"none")) return false; /* other decoration fields aren't painted */
-        return set_long("text-decoration-line", line, ln, cx);
+        /* css-text-decor-4 §2.6: each longhand from its component, an omitted one initial */
+        static const char *const longhands[4] = {"text-decoration-line", "text-decoration-thickness",
+                                                 "text-decoration-style", "text-decoration-color"};
+        static const char *const initial_values[4] = {"none", "auto", "solid", "currentcolor"};
+        const char *part[4];
+        size_t part_n[4];
+        if (!global && !decoration_shorthand_split(v, n, cx, part, part_n)) return false;
+        for (int i = 0; i < 4; i++) {
+            const char *value = global ? v : part[i] ? part[i] : initial_values[i];
+            set_long(longhands[i], value, global ? n : part[i] ? part_n[i] : strlen(value), cx);
+        }
+        return true;
     }
     case SH_PLACE_SELF: case SH_PLACE_CONTENT: {
         const char *t[2];
@@ -7438,8 +8044,6 @@ static void anim_number(sbuf *b, double v) {
 }
 static void anim_unit(sbuf *b, double v, const char *unit) { anim_number(b, v); sb_puts(b, unit); }
 static double anim_clamp(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
-/* the combinations: interpolation, addition, accumulation */
-enum { MIX, ADD, ACCUMULATE };
 /* <color>: computed values of color.c's type (exact, or an expression of currentcolor) */
 static void anim_shadow_color(const style_t *st, const struct css_box_shadow *s, struct css_color_computed *out) {
     css_color_held(s->color, s->color_value, st->color, out);
@@ -7673,29 +8277,31 @@ static bool tf_equal(const struct css_transform *a, const struct css_transform *
 
 /* -------- shadow and filter lists */
 /* one shadow's computed value: its colour first, then the four lengths (and inset) */
-static void anim_shadow_lengths(sbuf *b, double x, double y, double blur, double spread, bool inset) {
+/* a shadow's lengths; text: text-shadow's, which has neither spread nor inset */
+static void anim_shadow_lengths(sbuf *b, double x, double y, double blur, double spread, bool inset, bool text) {
     anim_unit(b, x, "px "); anim_unit(b, y, "px ");
+    if (text) { anim_unit(b, anim_clamp(blur, 0, INFINITY), "px"); return; }
     anim_unit(b, anim_clamp(blur, 0, INFINITY), "px ");
     anim_unit(b, spread, "px");
     if (inset) sb_puts(b, " inset");
 }
-static void anim_shadow_text(sbuf *b, const style_t *st, const struct css_box_shadow *s) {
+static void anim_shadow_text(sbuf *b, const style_t *st, const struct css_box_shadow *s, bool text) {
     struct css_color_computed c;
     anim_shadow_color(st, s, &c);
     anim_color_text(b, &c); sb_putc(b, ' ');
-    anim_shadow_lengths(b, s->x, s->y, s->blur, s->spread, s->inset);
+    anim_shadow_lengths(b, s->x, s->y, s->blur, s->spread, s->inset, text);
 }
-static void anim_shadow_list_text(sbuf *b, const style_t *st) {
-    if (!st->box_shadow) { sb_puts(b, "none"); return; }
-    for (const struct css_box_shadow *s = st->box_shadow; s; s = s->next) {
-        if (s != st->box_shadow) sb_puts(b, ", ");
-        anim_shadow_text(b, st, s);
+static void anim_shadow_list_text(sbuf *b, const style_t *st, const struct css_box_shadow *list, bool text) {
+    if (!list) { sb_puts(b, "none"); return; }
+    for (const struct css_box_shadow *s = list; s; s = s->next) {
+        if (s != list) sb_puts(b, ", ");
+        anim_shadow_text(b, st, s, text);
     }
 }
 /* a pair of shadows component by component (Web Animations 1, A: interpolation, and accumulation
    with each component accumulated); the shorter list pads with transparent shadows of no length */
 static bool anim_shadow_item(sbuf *b, const style_t *sa, const struct css_box_shadow *s, const style_t *sv,
-                             const struct css_box_shadow *e, double ka, double kb, int mode) {
+                             const struct css_box_shadow *e, double ka, double kb, int mode, bool text) {
     struct css_box_shadow zs = {0}, ze = {0};
     if (!s) { zs.inset = e->inset; s = &zs; }
     if (!e) { ze.inset = s->inset; e = &ze; }
@@ -7706,28 +8312,29 @@ static bool anim_shadow_item(sbuf *b, const style_t *sa, const struct css_box_sh
     if (!anim_color(b, sa, &cs, sv, &ce, kb, mode)) return false;
     sb_putc(b, ' ');
     anim_shadow_lengths(b, s->x * ka + e->x * kb, s->y * ka + e->y * kb, s->blur * ka + e->blur * kb,
-                        s->spread * ka + e->spread * kb, s->inset);
+                        s->spread * ka + e->spread * kb, s->inset, text);
     return true;
 }
-static bool anim_shadows(sbuf *b, const style_t *sa, const style_t *sv, double ka, double kb, int mode) {
-    const struct css_box_shadow *x = sa->box_shadow, *y = sv->box_shadow;
+/* x (sa's list) and y (sv's) combined: box-shadow's, or with text text-shadow's */
+static bool anim_shadows(sbuf *b, const style_t *sa, const struct css_box_shadow *x, const style_t *sv,
+                         const struct css_box_shadow *y, double ka, double kb, int mode, bool text) {
     if (!x && !y) { sb_puts(b, "none"); return true; }
     bool first = true;
     if (mode == ADD) {
         /* addition is the concatenation of the lists */
         for (const struct css_box_shadow *s = x; s; s = s->next, first = false) {
             if (!first) sb_puts(b, ", ");
-            anim_shadow_text(b, sa, s);
+            anim_shadow_text(b, sa, s, text);
         }
         for (const struct css_box_shadow *s = y; s; s = s->next, first = false) {
             if (!first) sb_puts(b, ", ");
-            anim_shadow_text(b, sv, s);
+            anim_shadow_text(b, sv, s, text);
         }
         return true;
     }
     for (; x || y; x = x ? x->next : NULL, y = y ? y->next : NULL, first = false) {
         if (!first) sb_puts(b, ", ");
-        if (!anim_shadow_item(b, sa, x, sv, y, ka, kb, mode)) return false;
+        if (!anim_shadow_item(b, sa, x, sv, y, ka, kb, mode, text)) return false;
     }
     return true;
 }
@@ -7828,15 +8435,7 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         if (!st->line_clamp) sb_puts(out, "none");
         else { snprintf(text, sizeof text, "%u", (unsigned)st->line_clamp); sb_puts(out, text); }
         break;
-    case PT_TEXT_DECO:
-        if (!st->text_decoration) sb_puts(out, "none");
-        else {
-            bool first = true;
-            if (st->text_decoration & TD_UNDERLINE) { sb_puts(out, "underline"); first = false; }
-            if (st->text_decoration & TD_OVERLINE) { if (!first) sb_putc(out, ' '); sb_puts(out, "overline"); first = false; }
-            if (st->text_decoration & TD_LINE_THROUGH) { if (!first) sb_putc(out, ' '); sb_puts(out, "line-through"); }
-        }
-        break;
+    case PT_TEXT_DECO: decoration_line_text(out, st->text_decoration); break;
     case PT_BG_IMAGE: case PT_MASK_IMAGE: {
         const char *url = p->type == PT_BG_IMAGE ? st->bg_image : st->mask_image;
         if (p->type == PT_BG_IMAGE && st->has_grad) return false;
@@ -7857,7 +8456,8 @@ bool css_computed_value(const style_t *st, const struct propdef *p, sbuf *out, w
         break;
     }
     case PT_FILTER: ok = css_filter_serialize(st->filter, out, d); break;
-    case PT_BOX_SHADOW: anim_shadow_list_text(out, st); break;
+    case PT_BOX_SHADOW: anim_shadow_list_text(out, st, st->box_shadow, false); break;
+    case PT_TEXT: ok = text_value_text(st, p, false, out, d); break;
     case PT_RADIUS: ok = anim_pair_text(out, ((const struct css_corner_radius *)field)->axis, d); break;
     case PT_BG_POS: case PT_TRANSFORM_ORIGIN: ok = anim_pair_text(out, (const len_t *)field, d); break;
     case PT_BG_SIZE: case PT_MASK_SIZE: {
@@ -8036,6 +8636,7 @@ bool css_anim_equal(const struct propdef *p, const style_t *a, const style_t *b)
         const struct css_ui_color *x = (const struct css_ui_color *)fa, *y = (const struct css_ui_color *)fb;
         return ui_color_equal(&x[0], &y[0]) && (p->flags != UI_CARET || ui_color_equal(&x[1], &y[1]));
     }
+    case PT_TEXT: return text_value_equal(p, a, fa, b, fb);
     }
     return !memcmp(fa, fb, p->size);
 }
@@ -8327,7 +8928,8 @@ static bool anim_combine(const struct css_anim_ctx *c, const struct propdef *p, 
         tf_scale_text(out, &r);
         return true;
     }
-    case PT_BOX_SHADOW: return anim_shadows(out, a, b, ka, kb, mode);
+    case PT_BOX_SHADOW: return anim_shadows(out, a, a->box_shadow, b, b->box_shadow, ka, kb, mode, false);
+    case PT_TEXT: return text_combine(c, p, a, fa, b, fb, ka, kb, mode, out);
     case PT_FILTER: return anim_filters(out, a->filter, b->filter, ka, kb, mode);
     case PT_SHAPE: /* css-shapes-1 §3.4, motion-1 §2.1; accumulation is addition */
         return css_shape_combine(p->flags, *(const struct css_shape *const *)fa, *(const struct css_shape *const *)fb,

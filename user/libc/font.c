@@ -500,10 +500,11 @@ void font_metrics(font_t *f, float px, float *ascent, float *descent, float *lin
 }
 
 /* Unicode Default_Ignorable_Code_Point (the subset that reaches text runs):
-   variation selectors, joiners, bidi and invisible format controls. Without
-   a shaping table they have no visible glyph and no advance. */
+   the soft hyphen, variation selectors, joiners, bidi and invisible format
+   controls. Without a shaping table they have no visible glyph and no advance;
+   a line broken at a soft hyphen shows its hyphen as text of its own. */
 static bool default_ignorable(uint32_t cp) {
-    return cp == 0x034f || (cp >= 0x180b && cp <= 0x180f) || (cp >= 0x200b && cp <= 0x200f) ||
+    return cp == 0x00ad || cp == 0x034f || (cp >= 0x180b && cp <= 0x180f) || (cp >= 0x200b && cp <= 0x200f) ||
            (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2060 && cp <= 0x206f) ||
            (cp >= 0xfe00 && cp <= 0xfe0f) || cp == 0xfeff || (cp >= 0x1bca0 && cp <= 0x1bca3) ||
            (cp >= 0xe0000 && cp <= 0xe0fff);

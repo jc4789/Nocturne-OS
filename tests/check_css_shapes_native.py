@@ -18,7 +18,7 @@ guest の WPT の代わりではない。CSSOM の宣言の塊・cascade・var()
 文字を持つかどうかは宣言の塊の仕事）、補間の端が neutral・CSS 全体の語（cascade の仕事）。
 補間は CSS animation の流儀（離散は 0.5 で入れ替わる）だけを試す。
 
-  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|ui] [--verbose] [--file 名前の一部] [--out 出力の場所]
+  python -X utf8 tests/check_css_shapes_native.py [--group shapes|gaps|anchor|lists|backgrounds|ui|text|decor] [--verbose] [--file 名前の一部] [--out 出力の場所]
 """
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -31,6 +31,7 @@ import sys
 root = Path(__file__).resolve().parent.parent
 wpt = Path(os.environ.get("NOCTURNE_WPT", "D:/Programes/cloned repos/wpt")) / "css"
 # --group anchor: CSS Anchor Positioning 1 の値（anchor-position の構文と計算値の頁）を同じ道具で
+# --group text・decor: CSS Text 3/4 と CSS Text Decoration 4 の値（解析・計算値・補間の頁）を同じ道具で
 group = sys.argv[sys.argv.index("--group") + 1] if "--group" in sys.argv else "shapes"
 if group == "gaps":
     pages = sorted((wpt / "css-gaps/parsing").glob("*.html")) + sorted((wpt / "css-gaps/animation").glob("*.html"))
@@ -46,6 +47,30 @@ elif group == "lists":
     pages = (sorted((wpt / "css-lists/parsing").glob("*.html")) + sorted((wpt / "css-content/parsing").glob("*.html")) +
              sorted((wpt / "css-lists/animations").glob("*.html")) +
              [wpt / "css-lists/css-lists-no-interpolation.html", wpt / "css-content/content-no-interpolation.html"])
+elif group == "text":
+    # CSS Text 3/4: line breaking, hyphenation and tab-size; text-shadow (css-text-decor and its
+    # interpolation pages in css-transitions)
+    names = ("hyphenate-character", "hyphenate-limit-chars", "hyphenate-limit-lines", "hyphens", "line-break",
+             "overflow-wrap", "tab-size", "word-break", "word-wrap")
+    pages = (sorted(p for p in (wpt / "css-text/parsing").glob("*.html") if p.name.rsplit("-", 1)[0] in names) +
+             [wpt / "css-text/animations" / name for name in (
+                 "hyphen-no-interpolation.html", "hyphenate-limit-chars-interpolation.html",
+                 "hyphenate-limit-lines-interpolation.html", "line-break-no-interpolation.html",
+                 "tab-size-interpolation.html")] +
+             sorted((wpt / "css-text-decor/text-shadow/parsing").glob("*.html")) +
+             [wpt / "css-transitions/animations" / name for name in (
+                 "text-shadow-interpolation.html", "text-shadow-composition.html")])
+elif group == "decor":
+    # CSS Text Decoration 4: the text-decoration longhands and shorthand, text-underline-position and -offset
+    pages = (sorted(p for p in (wpt / "css-text-decor/parsing").glob("*.html")
+                    if p.name.startswith(("text-decoration-color", "text-decoration-line", "text-decoration-style",
+                                          "text-decoration-computed", "text-decoration-valid", "text-decoration-invalid",
+                                          "text-decoration-shorthand", "text-underline-position"))) +
+             [wpt / "css-text-decor" / name for name in (
+                 "text-decoration-thickness-computed.html", "text-decoration-thickness-valid.html",
+                 "text-decoration-thickness-invalid.html", "text-underline-offset-computed.html",
+                 "text-underline-offset-valid.html", "text-underline-offset-invalid.html")] +
+             sorted((wpt / "css-text-decor/animations").glob("*.html")))
 elif group == "shapes":
     pages = (sorted(p for p in (wpt / "css-shapes/shape-functions").glob("*.html") if re.search(r"-(valid|invalid|computed|parsing)\.html$", p.name)) +
              sorted((wpt / "css-shapes/parsing").glob("*.html")) +
@@ -71,7 +96,7 @@ elif group == "ui":
                  "caret-color-interpolation.html", "caret-color-composition.html", "accent-color-interpolation.html",
                  "cursor-no-interpolation.html")])
 else:
-    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・ui のどれか：{group}")
+    sys.exit(f"群は shapes・gaps・anchor・lists・backgrounds・ui・text・decor のどれか：{group}")
 out = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else root / f"build/check-css-{group}"
 out.mkdir(parents=True, exist_ok=True)
 # the repository's tools (a worktree has them in the main checkout above it)
@@ -188,7 +213,9 @@ def page_font(page):
     (computed values of currentcolor) when it gives one"""
     m = re.search(r"font-size:\s*(\d+(?:\.\d+)?)px", page)
     font = m.group(1) if m else "16"
-    c = re.search(r"#target\s*\{[^}]*?(?<![-\w])color:\s*([^;}]+)", page)
+    # the text pages give the interpolation target its colour by class (.target), the others by id
+    target = r"(?:#|\.)target" if group in ("text", "decor") else "#target"
+    c = re.search(target + r"\s*\{[^}]*?(?<![-\w])color:\s*([^;}]+)", page)
     return font + ";" + c.group(1).strip() if c else font
 
 tool = Tool()
