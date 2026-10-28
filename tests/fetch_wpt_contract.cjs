@@ -64,6 +64,35 @@ const files = [
     'FileAPI/url/url-format.any.js', 'FileAPI/url/url-with-fetch.any.js',
     /* HTTP fetch's redirect mode "manual" and main fetch's no-cors rule for it. */
     {file: 'fetch/api/redirect/redirect-mode.any.js', network: 'redirect'},
+    /* An empty FormData's body (Fetch "extract a body": HTML's multipart/form-data encoding
+       algorithm, RFC 7578). Its encoding is the close delimiter alone, which Body's formData()
+       reads back as an empty FormData (WPT body/formdata.any.js). WPT's request- and
+       response-consume-empty "Consume empty FormData ... as text" expect no bytes; their FIXME
+       says that expectation is unsettled, and an empty multipart body is not one formData() can
+       parse (the last check), so those two subtests fail by this choice. */
+    {file: '(contract) fetch/body', text: `
+        const boundaryOf = type => /^multipart\\/form-data; boundary=(.+)$/.exec(type)[1];
+        promise_test(async () => {
+            const request = new Request('https://web-platform.test:8443/', {method: 'POST', body: new FormData()});
+            const boundary = boundaryOf(request.headers.get('content-type'));
+            assert_equals(await request.text(), '--' + boundary + '--\\r\\n');
+        }, 'An empty FormData encodes as its close delimiter alone');
+        promise_test(async () => {
+            const read = await new Response(new FormData()).formData();
+            assert_array_equals([...read.keys()], []);
+            const form = new FormData();
+            form.append('a', 'b');
+            form.append('file', new Blob(['xy'], {type: 'text/plain'}), 'name.txt');
+            const back = await new Response(form).formData();
+            assert_array_equals([...back.keys()], ['a', 'file']);
+            assert_equals(back.get('a'), 'b');
+            assert_equals(back.get('file').name, 'name.txt');
+            assert_equals(await back.get('file').text(), 'xy');
+        }, 'A FormData body reads back as the same entries');
+        promise_test(async t => {
+            const response = new Response('', {headers: {'content-type': 'multipart/form-data; boundary=x'}});
+            await promise_rejects_js(t, TypeError, response.formData());
+        }, 'An empty multipart body is not a FormData');`},
     /* DOM "Aborting ongoing activities", in testharness.js's form: the garbage collection rule
        ("A non-aborted dependent AbortSignal object must not be garbage collected while its source
        signals is non-empty and it has registered event listeners for its abort event or its abort
