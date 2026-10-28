@@ -7634,36 +7634,37 @@ static void streamed_response_metadata(struct js_pending *p, bool opaque) {
 }
 static int fetch_transport_flags(const char *headers);
 /* Resource Timing's "convert fetch timestamp": zero stays zero, any other
-   time is relative to the realm's time origin. */
-static double fetch_timestamp(struct web_js_state *s, uint64_t at) { return at ? (double)relative_time(s, at) : 0; }
+   time is relative to the time origin, an uptime_ms value (the realm's
+   s->now; 0 keeps monotonic times, for a Worker's own time origin). */
+static double fetch_timestamp(uint64_t origin, uint64_t at) { return at ? (double)(at >= origin ? at - origin : 0) : 0; }
 /* What a PerformanceResourceTiming or PerformanceNavigationTiming entry holds
    (js_performance.js), from the transport's timing record of one request
    (http.h). opaque_timing is Fetch's opaque timing info: the record keeps its
    start and end, and the cache state is empty (Fetch, fetch finale). An
    opaque response or a network error has an empty body info. A request the
    transport answered with no record (one it never made) starts at started. */
-static JSValue timing_value(struct web_js_state *s, const struct http_fetch_timing *t, uint64_t started,
+static JSValue timing_value(struct web_js_state *s, uint64_t origin, const struct http_fetch_timing *t, uint64_t started,
                             bool opaque_timing, bool opaque_body, int status, const char *content_type) {
     JSContext *ctx=s->ctx;
     struct http_fetch_timing none={0};
     if(!t->valid){none.start_time=none.post_redirect_start=started;none.end_time=uptime_ms();t=&none;opaque_timing=true;}
     const struct http_connection_timing *c=&t->connection;
-    double start=fetch_timestamp(s,t->start_time),fetch_start=opaque_timing?start:fetch_timestamp(s,t->post_redirect_start);
+    double start=fetch_timestamp(origin,t->start_time),fetch_start=opaque_timing?start:fetch_timestamp(origin,t->post_redirect_start);
     /* No connection (a response from the cache): its times are the fetch's start. */
     bool connection=!opaque_timing && t->connection_valid;
     static const char *const cache[]={"","local","validated"};
     struct { const char *name; double value; } numbers[]={
-        {"startTime",start},{"fetchStart",fetch_start},{"responseEnd",fetch_timestamp(s,t->end_time)},
-        {"redirectStart",opaque_timing?0:fetch_timestamp(s,t->redirect_start)},
-        {"redirectEnd",opaque_timing?0:fetch_timestamp(s,t->redirect_end)},
-        {"domainLookupStart",connection?fetch_timestamp(s,c->domain_lookup_start):opaque_timing?0:fetch_start},
-        {"domainLookupEnd",connection?fetch_timestamp(s,c->domain_lookup_end):opaque_timing?0:fetch_start},
-        {"connectStart",connection?fetch_timestamp(s,c->connect_start):opaque_timing?0:fetch_start},
-        {"connectEnd",connection?fetch_timestamp(s,c->connect_end):opaque_timing?0:fetch_start},
-        {"secureConnectionStart",connection?fetch_timestamp(s,c->secure_connection_start):0},
-        {"requestStart",opaque_timing?0:fetch_timestamp(s,t->final_network_request_start)},
-        {"firstInterimResponseStart",opaque_timing?0:fetch_timestamp(s,t->first_interim_network_response_start)},
-        {"finalResponseHeadersStart",opaque_timing?0:fetch_timestamp(s,t->final_network_response_start)},
+        {"startTime",start},{"fetchStart",fetch_start},{"responseEnd",fetch_timestamp(origin,t->end_time)},
+        {"redirectStart",opaque_timing?0:fetch_timestamp(origin,t->redirect_start)},
+        {"redirectEnd",opaque_timing?0:fetch_timestamp(origin,t->redirect_end)},
+        {"domainLookupStart",connection?fetch_timestamp(origin,c->domain_lookup_start):opaque_timing?0:fetch_start},
+        {"domainLookupEnd",connection?fetch_timestamp(origin,c->domain_lookup_end):opaque_timing?0:fetch_start},
+        {"connectStart",connection?fetch_timestamp(origin,c->connect_start):opaque_timing?0:fetch_start},
+        {"connectEnd",connection?fetch_timestamp(origin,c->connect_end):opaque_timing?0:fetch_start},
+        {"secureConnectionStart",connection?fetch_timestamp(origin,c->secure_connection_start):0},
+        {"requestStart",opaque_timing?0:fetch_timestamp(origin,t->final_network_request_start)},
+        {"firstInterimResponseStart",opaque_timing?0:fetch_timestamp(origin,t->first_interim_network_response_start)},
+        {"finalResponseHeadersStart",opaque_timing?0:fetch_timestamp(origin,t->final_network_response_start)},
         {"encodedBodySize",opaque_body?0:(double)t->encoded_body_size},
         {"decodedBodySize",opaque_body?0:(double)t->decoded_body_size},
         {"responseStatus",(double)status},
@@ -7691,14 +7692,17 @@ static JSValue timing_value(struct web_js_state *s, const struct http_fetch_timi
 failed:
     JS_FreeValue(ctx,value);return JS_EXCEPTION;
 }
-/* Fetch's report timing of a request that ended (fetch finale), for its
-   PerformanceResourceTiming entry; the bootstrap's performance timeline
-   owns entries and observers. The status and content type are a navigating
-   request's only when its redirects stayed same-origin; an opaque response
-   or a network error has neither. */
-static void resource_timing(struct web_js_state *s, struct js_pending *p) {
-    if (s->disabled || !JS_IsObject(s->hooks) || p->kind==P_POLICY_REPORT || !p->url ||
-        (strncasecmp(p->url,"https://",8) && strncasecmp(p->url,"http://",7))) return;
+/* A Worker's request whose client is the Worker itself (importScripts, fetch): its report timing
+   belongs to the Worker's performance timeline (Fetch, fetch finale: the request's client's global
+   object), not this document's. The Worker's script (kind 0) is fetched for this document. */
+static bool worker_client_request(const struct js_pending *p) { return p->kind==P_WORKER && p->worker_kind!=0; }
+/* Fetch's report timing of a request that ended (fetch finale): the record of its
+   PerformanceResourceTiming entry, times relative to origin; JS_UNDEFINED for a request with none
+   (not HTTP(S), a policy report). The status and content type are a navigating request's only
+   when its redirects stayed same-origin; an opaque response or a network error has neither. */
+static JSValue report_timing(struct web_js_state *s, struct js_pending *p, uint64_t origin) {
+    if (s->disabled || p->kind==P_POLICY_REPORT || !p->url ||
+        (strncasecmp(p->url,"https://",8) && strncasecmp(p->url,"http://",7))) return JS_UNDEFINED;
     const struct http_fetch_timing *t=&p->response.timing;
     bool failed=p->response.error[0],exposed=p->kind!=P_FRAME || (t->valid && t->redirect_same_origin);
     bool opaque_body;int status=0;char type[sizeof p->timing_type]="";
@@ -7710,13 +7714,30 @@ static void resource_timing(struct web_js_state *s, struct js_pending *p) {
         opaque_body=failed || (flags>=0 && (flags&NJW_LOADED_OPAQUE));
         if(!opaque_body && exposed){status=p->response.status;minimized_content_type(web_response_headers(&p->response),type,sizeof type);}
     }
-    JSValue args[]={JS_NewFloat64(s->ctx,(double)p->id),JS_NewInt32(s->ctx,p->kind),JS_NewString(s->ctx,p->url),
-        timing_value(s,t,p->started,!t->timing_allow_passed,opaque_body,status,type)};
+    return timing_value(s,origin,t,p->started,!t->timing_allow_passed,opaque_body,status,type);
+}
+/* The report timing of this document's request: its entry in the bootstrap's performance
+   timeline, which owns entries and observers. A Worker's own requests report to the Worker
+   (worker_timing). */
+static void resource_timing(struct web_js_state *s, struct js_pending *p) {
+    if (!JS_IsObject(s->hooks) || worker_client_request(p)) return;
+    JSValue record=report_timing(s,p,s->now);
+    if (JS_IsUndefined(record)) return;
+    JSValue args[]={JS_NewFloat64(s->ctx,(double)p->id),JS_NewInt32(s->ctx,p->kind),JS_NewString(s->ctx,p->url),record};
     JSValue result=JS_IsException(args[2])||JS_IsException(args[3])?JS_EXCEPTION:
         custom_element_hook(s,"resourceTiming",(int)(sizeof args/sizeof args[0]),args);
     if(JS_IsException(result))exception(s);
     JS_FreeValue(s->ctx,result);
     for(size_t i=0;i<sizeof args/sizeof args[0];i++)JS_FreeValue(s->ctx,args[i]);
+}
+/* The report timing a Worker's own request sends its Worker (NJW_LOADED_TIMING), in monotonic
+   times the Worker converts with its time origin. JS_UNDEFINED for an aborted request or one with
+   no report. */
+static JSValue worker_timing(struct web_js_state *s, struct js_pending *p) {
+    if (!worker_client_request(p) || p->aborted) return JS_UNDEFINED;
+    JSValue record=report_timing(s,p,0);
+    if (JS_IsException(record)) { exception(s); return JS_UNDEFINED; }
+    return record;
 }
 /* The document's navigation, for its PerformanceNavigationTiming: HTML gives
    the entry the navigation's full timing info, never an opaque one (create
@@ -7725,7 +7746,7 @@ static void resource_timing(struct web_js_state *s, struct js_pending *p) {
 static JSValue native_navigation_timing(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     if(!s->navigation_valid)return JS_NULL;
-    JSValue value=timing_value(s,&s->navigation,s->now,false,false,s->navigation_status,s->navigation_content_type);
+    JSValue value=timing_value(s,s->now,&s->navigation,s->now,false,false,s->navigation_status,s->navigation_content_type);
     static const char *const types[]={"navigate","reload","back_forward"};
     if(!JS_IsException(value) && JS_SetPropertyStr(ctx,value,"type",JS_NewString(ctx,types[s->navigation_type<=2?s->navigation_type:0]))<0){
         JS_FreeValue(ctx,value);return JS_EXCEPTION;
@@ -7887,23 +7908,26 @@ static void worker_fetch_frame(struct web_js_state *s, struct js_pending *p) {
             if (s->host.net_log) net_log_response(s, p, "headers", 0);
             const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;
             queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_HEADERS, p->response.status,
-                final, web_response_headers(&p->response), NULL, 0, NULL);
+                final, web_response_headers(&p->response), NULL, 0, NULL, JS_UNDEFINED);
             p->headers_delivered = queued;
         }
     } else if (event == WEBNET_CHUNK && !terminal) {
         p->streamed_bytes += p->response.body_len;
         if (p->streamed_opaque) resume = true;
         else queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_CHUNK, 0, NULL, NULL,
-            p->response.body, p->response.body_len, NULL);
+            p->response.body, p->response.body_len, NULL, JS_UNDEFINED);
     } else if (event == WEBNET_UPLOAD && !terminal)
         queued = web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_UPLOAD, 0, NULL, NULL, NULL,
-            (size_t)p->response.uploaded, NULL);
+            (size_t)p->response.uploaded, NULL, JS_UNDEFINED);
     if (!queued) { p->aborted = true; terminal = true; } /* the child is gone */
     if (terminal) {
         if (p->response.error[0] && !p->aborted) diagnostic_resource(s, p, p->response.error);
-        if (queued) web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_END, 0, NULL, NULL, NULL, 0,
-            p->response.error[0] ? p->response.error : event == WEBNET_END ? "" : "Worker fetch failed");
-        if (!p->aborted) { begin_named_task(s, "resource timing", p->id); resource_timing(s, p); end_task(s); }
+        if (queued) {
+            JSValue timing = worker_timing(s, p);
+            web_worker_frame(s->workers, p->worker, p->worker_request, WEBNET_END, 0, NULL, NULL, NULL, 0,
+                p->response.error[0] ? p->response.error : event == WEBNET_END ? "" : "Worker fetch failed", timing);
+            JS_FreeValue(s->ctx, timing);
+        }
         if (s->host.net_log) net_log_response(s, p, "done", p->streamed_bytes);
         if ((event != WEBNET_END || p->response.error[0] || p->aborted) && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
         pending_free(s, p);
@@ -8000,8 +8024,10 @@ static bool process_pending(struct web_js_state *s) {
                 if (!valid) pending_error(p, allocation_failed ? "Out of memory while checking Worker response origin" :
                     "Worker response rejected (URL, origin, HTTP status or JavaScript MIME type)");
             }
+            JSValue timing=worker_timing(s,p);
             web_worker_loaded(s->workers,p->worker,p->worker_request,p->response.status,final,
-                web_response_headers(&p->response),p->response.body,p->response.body_len,p->response.error);
+                web_response_headers(&p->response),p->response.body,p->response.body_len,p->response.error,timing);
+            JS_FreeValue(s->ctx,timing);
         } else if (p->kind == P_CSS) {
             if(p->css&&p->css->loading_id==p->id)
                 doc_css_loaded(s->doc,p->url,web_response_url(&p->response)[0]?web_response_url(&p->response):p->url,

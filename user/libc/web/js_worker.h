@@ -47,12 +47,15 @@ void web_worker_set_reporter(web_workers *,web_worker_reporter,void *);
 void web_worker_set_canceler(web_workers *,web_worker_canceler);
 JSValue web_worker_native(web_workers *,int,JSValueConst *);
 void web_worker_set_callback(web_workers *,JSValueConst);
-void web_worker_loaded(web_workers *,uint32_t,uint32_t,int,const char *,const char *,const void *,size_t,const char *);
+/* A request's response or error (NJW_LOADED; request 0 is the Worker's script, NJW_START). timing is
+ * the request's report timing (NJW_LOADED_TIMING) or JS_UNDEFINED. */
+void web_worker_loaded(web_workers *,uint32_t,uint32_t,int,const char *,const char *,const void *,size_t,const char *,JSValueConst);
 /* One frame of a streamed fetch (event: WEBNET_HEADERS, WEBNET_CHUNK, WEBNET_END or
  * WEBNET_UPLOAD; bytes: a chunk's, or the uploaded count for WEBNET_UPLOAD). An opaque response's
- * headers enter the child blank. False when the child is gone or the frame was not queued; the
- * caller then cancels the request. */
-bool web_worker_frame(web_workers *,uint32_t,uint32_t,int,int,const char *,const char *,const void *,size_t,const char *);
+ * headers enter the child blank; WEBNET_END carries the error and the request's report timing
+ * (NJW_LOADED_TIMING, JS_UNDEFINED for none). False when the child is gone or the frame was not
+ * queued; the caller then cancels the request. */
+bool web_worker_frame(web_workers *,uint32_t,uint32_t,int,int,const char *,const char *,const void *,size_t,const char *,JSValueConst);
 void web_worker_pump(web_workers *,uint64_t);
 bool web_worker_runnable(const web_workers *);
 /* Invoke under the caller's ordinary main-JS task budget/microtask checkpoint. */

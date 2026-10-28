@@ -15,8 +15,9 @@ enum { NJW_START=1,NJW_MESSAGE,NJW_LOADED,NJW_ERROR,NJW_LOAD,NJW_CLOSE,NJW_CONSO
 /* NJW_FRAME (parent to child) is one frame of a streamed Fetch response, a fetch the child asked
  * to stream (NJW_LOAD_STREAM): its kind is the frame's event and, for the headers, the
  * NJW_LOADED_* flags. The parent's transport sends the next frame only after the child's
- * NJW_RESUME (child to parent, payload null) for the one before; an END frame (payload: the
- * error, "" for none) or an NJW_LOADED error ends the request. */
+ * NJW_RESUME (child to parent, payload null) for the one before; an END frame (payload: [the
+ * error, "" for none; the request's timing record or null], NJW_LOADED_TIMING's) or an NJW_LOADED
+ * error ends the request. */
 /* NJW_ATTACH is a carrier: a bare header (bytes 0, nothing else in the
  * message) whose channel attachment is one shared-page handle of the message
  * that follows. The sender puts every carrier of a message ahead of its
@@ -31,6 +32,12 @@ enum { NJW_START=1,NJW_MESSAGE,NJW_LOADED,NJW_ERROR,NJW_LOAD,NJW_CLOSE,NJW_CONSO
 enum { NJW_START_CREATOR_POLICY=7, NJW_START_INHERIT_POLICY=8, NJW_START_SHARED=9,
        NJW_START_CREATOR_ORIGIN=10, NJW_START_CREATOR_REFERRER_POLICY=11,
        NJW_START_CROSS_ORIGIN_ISOLATED=12, NJW_START_STREAMING=13 };
+/* An NJW_LOADED's (a request's, never START's) array field: Fetch's report timing of a request
+   whose client is the Worker (its importScripts and fetch), the record js.c's timing_value makes,
+   its times in monotonic milliseconds (n_clock_uptime_ms) for the Worker's own time origin to
+   convert (Resource Timing in the Worker's performance timeline). Absent for a request with no
+   report (aborted, or not HTTP(S)). */
+enum { NJW_LOADED_TIMING=7 };
 #define NJW_WITH_PORTS 3u
 /* LOAD policy belongs to the private transport, not URL/header author data.
    Import scripts cannot opt out of their existing origin policy. */

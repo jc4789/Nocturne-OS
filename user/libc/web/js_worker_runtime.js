@@ -175,7 +175,7 @@
     }
     function clearTimer(id){const t=timers.get(Number(id));if(!t)return;timers.delete(t.id);const index=t.index,last=timerHeap.pop();if(index<timerHeap.length){timerHeap[index]=last;last.index=index;timerFix(index);}}
     function timer(fn,ms,args,repeat){if(closed)return 0;if(typeof fn!=='function')fn=new Function(htmlSafetyBridge.timerCode(fn,repeat?'setInterval':'setTimeout'));let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');if(timerOrder===9007199254740991){timerOrder=0;for(const t of timers.values())t.order=++timerOrder;for(let i=Math.floor(timerHeap.length/2)-1;i>=0;i--)timerFix(i);}const delay=Math.max(1,Math.min(2147483647,Number(ms)||0)),t={id,order:++timerOrder,fn,args,repeat,delay,due:host.now()+delay,index:timerHeap.length};timers.set(id,t);timerHeap.push(t);timerFix(t.index);return id;}
-    function importScripts(...urls){for(const u of urls){const url=new URL(htmlSafetyBridge.check(u,3,'WorkerGlobalScope importScripts'),address).href;const r=host.import(url);if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
+    function importScripts(...urls){for(const u of urls){const url=new URL(htmlSafetyBridge.check(u,3,'WorkerGlobalScope importScripts'),address).href;const r=host.import(url);performanceBridge.monotonicResource(0,IMPORT_REQUEST,url,wireField(r,LOADED_TIMING));if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
     /* @include js_abort.js */
     /* This Worker's events for AbortSignal: a trusted abort event through this realm's dispatch,
        its event handler attributes and timers. */
@@ -189,6 +189,12 @@
        js.c's worker_request, which applies the creating document's CORS, cookies, Mixed Content
        and CSP. An opaque response arrives blank from the parent (js_worker.c); a fetch the
        parent has not ended is in fetches, by its request id. */
+    /* The parent's report timing of this Worker's own request (NJW_LOADED_TIMING, field 7 of an
+       NJW_LOADED record, [1] of an END frame's), with js.c's request kind: 4 (P_WORKER) is
+       importScripts' initiator type "other", 1 (P_FETCH) is fetch()'s "fetch". */
+    const LOADED_TIMING=7,IMPORT_REQUEST=4,FETCH_REQUEST=1,ownProperty=Object.prototype.hasOwnProperty;
+    /* An optional field of a wire record: its own, never one the page put on Array.prototype. */
+    const wireField=(record,index)=>record!==null&&typeof record==='object'&&apply(ownProperty,record,[index])?record[index]:undefined;
     const workerFetchTransport=(()=>{
         const apply=Reflect.apply,mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete,mapForEach=Map.prototype.forEach,mapClear=Map.prototype.clear,
             setPrototype=Object.setPrototypeOf,NativePromise=Promise,NativeTypeError=TypeError,request=host.request,resume=host.resume,cancel=host.cancel;
@@ -204,20 +210,23 @@
         }
         /* One frame taken: the parent sends the next on this resume, once per frame. */
         function next(id,p,more){if(more&&!p.done)apply(resume,host,[id]);else p.paused=!p.done;}
+        /* Fetch's report timing, once the fetch has ended (as a Window's js.c reports it): the
+           entry in this Worker's performance timeline. */
+        function timing(p,record){try{performanceBridge.monotonicResource(0,FETCH_REQUEST,p.url,record);}catch(error){report(error);}}
         return {
             noCors:()=>true,streaming:()=>workerStreaming,
             fetch(q,notify){
                 if(closed)throw new NativeTypeError('Worker closed');
                 const stream=!!notify&&workerStreaming,id=apply(request,host,[q,stream]);
                 let resolve,reject;const promise=new NativePromise((a,b)=>{resolve=a;reject=b;});
-                apply(mapSet,fetches,[id,record({resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,published:false,paused:false,done:false})]);
+                apply(mapSet,fetches,[id,record({resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,url:q.url,published:false,paused:false,done:false})]);
                 return record({id,promise});
             },
             resume(id){const p=apply(mapGet,fetches,[id]);if(!p||!p.paused||closed)return;p.paused=false;apply(resume,host,[id]);},
             cancel(id){const p=take(id);if(!p)return;p.done=true;if(workerCanCancel&&!closed)apply(cancel,host,[id]);},
             /* NJW_LOADED: a buffered response, or the error that ends any fetch. */
             loaded(id,r,flags){
-                const p=take(id);if(!p||closed)return;p.done=true;
+                const p=take(id);if(!p||closed)return;p.done=true;timing(p,wireField(r,LOADED_TIMING));
                 if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
                 try{p.published=true;p.resolve(response(r,flags,r[3]));}catch(error){p.reject(error);}
             },
@@ -226,7 +235,10 @@
             frame(id,value,kind){
                 const p=apply(mapGet,fetches,[id]);if(!p||closed||!p.notify)return;
                 const event=(kind>>8)&7,flags=kind&63;
-                if(event===3){take(id);p.done=true;end(p,value?new NativeTypeError(value):undefined);return;}
+                if(event===3){
+                    const error=wireField(value,0);take(id);p.done=true;end(p,error?new NativeTypeError(error):undefined);
+                    timing(p,wireField(value,1));return;
+                }
                 if(event===1){
                     if((flags&4)&&!p.noCors){take(id);p.done=true;end(p,new NativeTypeError('Native Fetch response contradicts its filtering policy'));return;}
                     const published=response(value,flags,new ArrayBuffer(0)),more=p.notify(1,published);

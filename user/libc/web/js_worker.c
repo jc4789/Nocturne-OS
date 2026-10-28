@@ -252,7 +252,7 @@ static uint32_t response_kind(int *status,const char **url,const char **headers,
     }
     return kind;
 }
-void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,const char *url,const char *headers,const void *bytes,size_t n,const char *error){
+void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,const char *url,const char *headers,const void *bytes,size_t n,const char *error,JSValueConst timing){
     if(!w)return;struct child *c=find(w,id);if(!c||c->stopped)return;
     resource_retire(c,request);
     uint32_t kind=0;
@@ -264,6 +264,7 @@ void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,co
         resource_field(ctx,a,3,JS_NewArrayBufferCopy(ctx,bytes,n)) && resource_field(ctx,a,4,JS_NewString(ctx,error?error:"")) &&
         resource_field(ctx,a,5,JS_NewStringLen(ctx,c->name?c->name:"",c->name_len)) && resource_field(ctx,a,6,JS_NewBool(ctx,w->cancel!=NULL));
     bool first=request==0;
+    if(!first&&JS_IsObject(timing))filled=filled&&resource_field(ctx,a,NJW_LOADED_TIMING,JS_DupValue(ctx,timing));
     if(first)filled=filled && resource_field(ctx,a,NJW_START_CREATOR_POLICY,JS_NewString(ctx,c->creator_policy?c->creator_policy:"")) &&
         resource_field(ctx,a,NJW_START_INHERIT_POLICY,JS_NewBool(ctx,c->inherit_policy)) && resource_field(ctx,a,NJW_START_SHARED,JS_NewBool(ctx,c->shared)) &&
         resource_field(ctx,a,NJW_START_CREATOR_ORIGIN,JS_NewString(ctx,c->origin?c->origin:"")) &&
@@ -272,7 +273,7 @@ void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,co
         resource_field(ctx,a,NJW_START_STREAMING,JS_NewBool(ctx,w->resume!=NULL));
     bool ok=filled && serialized(w,c,first?NJW_START:NJW_LOADED,request,kind,a,first);JS_FreeValue(ctx,a);if(!ok){fail(w,c,"Worker resource allocation, representation or transport failed");return;}if(first)c->started=true;
 }
-bool web_worker_frame(web_workers *w,uint32_t id,uint32_t request,int event,int status,const char *url,const char *headers,const void *bytes,size_t n,const char *error){
+bool web_worker_frame(web_workers *w,uint32_t id,uint32_t request,int event,int status,const char *url,const char *headers,const void *bytes,size_t n,const char *error,JSValueConst timing){
     if(!w||!request||event<1||event>4)return false;struct child *c=find(w,id);if(!c||c->stopped)return false;
     JSContext *ctx=w->ctx;JSValue value;uint32_t kind=(uint32_t)event<<NJW_FRAME_SHIFT;
     if(event==1){
@@ -284,7 +285,12 @@ bool web_worker_frame(web_workers *w,uint32_t id,uint32_t request,int event,int 
         if(n>NJW_MAX_BYTES){fail(w,c,"Worker resource length is not representable on the wire");return false;}
         value=JS_NewArrayBufferCopy(ctx,bytes,n);
     } else if(event==4)value=JS_NewFloat64(ctx,(double)n);
-    else {value=JS_NewString(ctx,error?error:"");resource_retire(c,request);}
+    else {
+        /* The end: [error, report timing or null]. */
+        value=JS_NewArray(ctx);resource_retire(c,request);
+        if(!JS_IsException(value)&&!(resource_field(ctx,value,0,JS_NewString(ctx,error?error:""))&&
+            resource_field(ctx,value,1,JS_IsObject(timing)?JS_DupValue(ctx,timing):JS_NULL))){JS_FreeValue(ctx,value);value=JS_EXCEPTION;}
+    }
     bool ok=!JS_IsException(value)&&serialized(w,c,NJW_FRAME,request,kind,value,false);JS_FreeValue(ctx,value);
     if(!ok){if(JS_HasException(ctx))JS_FreeValue(ctx,JS_GetException(ctx));fail(w,c,"Worker resource allocation, representation or transport failed");}
     return ok;
@@ -393,7 +399,7 @@ bool web_worker_run_one(web_workers *w){
                 if(valid)ok=w->request&&w->request(w->opaque,c->id,e->h.request,(int)e->h.kind,&fetch);
                 for(unsigned i=0;i<5;i++)JS_FreeCString(ctx,strings[i]);for(unsigned i=0;i<7;i++)JS_FreeValue(ctx,fields[i]);
             }
-            if(!ok){if(JS_HasException(ctx)){JSValue error=JS_GetException(ctx);JS_FreeValue(ctx,error);}web_worker_loaded(w,c->id,e->h.request,0,"","",NULL,0,"Worker resource request rejected or allocation failed");}
+            if(!ok){if(JS_HasException(ctx)){JSValue error=JS_GetException(ctx);JS_FreeValue(ctx,error);}web_worker_loaded(w,c->id,e->h.request,0,"","",NULL,0,"Worker resource request rejected or allocation failed",JS_UNDEFINED);}
         }
         else if(e->h.op==NJW_CSP_REPORT){if(report_private(ctx,v)){if(w->reporter)w->reporter(w->report_opaque,v);}else fail(w,c,"Invalid private Worker CSP report");}
         else if(e->h.op==NJW_CANCEL){if(!JS_IsNull(v)||!w->cancel)fail(w,c,"Worker host cannot cancel this resource");else w->cancel(w->opaque,c->id,e->h.request);}
@@ -427,7 +433,7 @@ void web_worker_free(web_workers *w){
         if(c->shared&&!c->stopped)for(web_workers*other=managers;other;other=other->next){if(other==w)continue;for(struct shared_ref*r=other->shared;r;r=r->next)if(r->child==c){replacement=other;break;}if(replacement)break;}
         if(replacement){
             if(w->cancel)w->cancel(w->opaque,c->id,0);
-            while(c->resources&&!c->stopped){uint32_t id=c->resources->id;web_worker_loaded(w,c->id,id,0,"","",NULL,0,"Worker resource owner navigated");}
+            while(c->resources&&!c->stopped){uint32_t id=c->resources->id;web_worker_loaded(w,c->id,id,0,"","",NULL,0,"Worker resource owner navigated",JS_UNDEFINED);}
             w->children=c->next;c->next=replacement->children;replacement->children=c;
             size_t charge=0;for(struct packet*p=c->tx;p;p=p->next)charge+=sizeof p->h+p->h.bytes;
             for(struct broker_pair*p=c->ports;p;p=p->next){struct packet*a=p->held_close,*b=p->held_ack;if(a)charge+=sizeof a->h+a->h.bytes;if(b)charge+=sizeof b->h+b->h.bytes;}

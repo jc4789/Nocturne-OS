@@ -39,6 +39,8 @@ let closed=false,address='https://cache.test/worker/w.js',workerCanCancel=true,w
 const fetches=new Map(),listeners=new WeakMap(),reported=[],sent=[],cancelled=[],resumed=[];
 const blobBridge={brand:()=>false,bytes:()=>new ArrayBuffer(0),type:()=>'',fromBytes:(bytes,type)=>new Blob([bytes],{type})};
 function report(e){reported.push(e);}
+/* js_performance.js's bridge, included after Fetch: the report timings it is given. */
+const timings=[],performanceBridge={monotonicResource(...a){timings.push(a);}};
 function timer(fn,ms,args){setTimeout(()=>fn(...(args||[])),0);return 1;}
 function clearTimer(){}
 function dispatchNativeWorkerEvent(target,event){return EventTarget.prototype.dispatchEvent.call(target,event);}
@@ -57,12 +59,17 @@ const tick = () => new Promise(ok => setTimeout(ok, 0));
 const transport = run('workerFetchTransport'), sent = run('sent'), cancelled = run('cancelled'), resumed = run('resumed');
 const last = () => sent[sent.length - 1];
 const bytesOf = text => new TextEncoder().encode(text).buffer;
-/* The parent's NJW_LOADED for fetch id: status, headers text, body; flags are NJW_LOADED_*. */
-function respond(id, status, url, headers, body, flags = 0, error = '') {
-    transport.loaded(id, [status, url, 'HTTP/1.1 ' + status + ' X\r\n' + headers, body === null ? new ArrayBuffer(0) : bytesOf(body), error], flags);
+/* The parent's NJW_LOADED for fetch id: status, headers text, body; flags are NJW_LOADED_*;
+   timing its NJW_LOADED_TIMING field (7), absent when undefined. */
+function respond(id, status, url, headers, body, flags = 0, error = '', timing = undefined) {
+    const r = [status, url, 'HTTP/1.1 ' + status + ' X\r\n' + headers, body === null ? new ArrayBuffer(0) : bytesOf(body), error];
+    if (timing !== undefined) r[7] = timing;
+    transport.loaded(id, r, flags);
 }
 /* The parent's NJW_FRAME events: 1 headers, 2 chunk, 3 end, 4 upload (NJW_FRAME_SHIFT 8). */
 const frame = (id, event, value, flags = 0) => transport.frame(id, value, (event << 8) | flags);
+/* An END frame: [error, the report timing or null]. */
+const end = (id, error = '', timing = null) => frame(id, 3, [error, timing]);
 const count = (list, id) => list.filter(x => x === id).length;
 
 async function test() {
@@ -183,7 +190,7 @@ async function test() {
     frame(id, 2, bytesOf('ab'));
     check('chunk asks for the next', count(resumed, id) === 2);
     frame(id, 2, bytesOf('cd'));
-    frame(id, 3, '');
+    end(id, '');
     check('stream body', (await sr.text()) === 'abcd' && count(resumed, id) === 3);
     check('ended fetch forgotten', !R('fetches').has(id));
 
@@ -198,18 +205,18 @@ async function test() {
     check('paused resume once', count(resumed, id) === resumedBefore + 1);
     const piece = await reader.read();
     check('read the chunk', piece.value.byteLength === (1 << 20) + 1);
-    frame(id, 3, 'connection reset');
+    end(id, 'connection reset');
     check('error after headers', await rejects(reader.read(), 'TypeError'));
 
     p = R("fetch('before')");
-    frame(sent.length, 3, 'refused');
+    end(sent.length, 'refused');
     check('error before headers', await R("p=>p.then(()=>false,e=>e instanceof TypeError&&e.message==='refused')")(p));
 
     p = R("fetch('https://other.test/so',{mode:'no-cors'})");
     id = sent.length;
     frame(id, 1, [0, '', ''], 4 | (2 << 3));
     const so = await p;
-    frame(id, 3, '');
+    end(id, '');
     check('opaque headers frame', so.type === 'opaque' && so.body === null && so.status === 0 && [...so.headers].length === 0);
     p = R("fetch('https://other.test/sc')");
     frame(sent.length, 1, [0, '', ''], 4);
@@ -221,7 +228,7 @@ async function test() {
     check('upload frame resumes', count(resumed, id) === 1);
     frame(id, 1, [204, 'https://cache.test/worker/up', 'HTTP/1.1 204 No Content\r\n']);
     check('null body status', (await p).body === null);
-    frame(id, 3, '');
+    end(id, '');
 
     const sc = R('new AbortController()');
     p = R('s=>fetch("sa",{signal:s})')(sc.signal);
@@ -272,6 +279,34 @@ async function test() {
     check('opaque blocked by require-corp', await rejects(cache.match('https://other.test/p'), 'TypeError'));
     run('policy').value = 0;
     check('opaque under unsafe-none', (await cache.match('https://other.test/p')).type === 'opaque');
+    /* Fetch's report timing of this Worker's own fetches, from the parent's records (monotonic times
+       js_performance.js's monotonicResource converts): after the fetch ended, with the request's URL
+       and fetch()'s request kind (js.c P_FETCH). */
+    const timings = run('timings');
+    timings.length = 0;
+    const record = {startTime: 1000, responseEnd: 1010};
+    p = R("fetch('timed')");
+    respond(sent.length, 200, 'https://cache.test/worker/timed', '', 'ok', 0, '', record);
+    await p;
+    check('loaded reports timing', timings.length === 1 && timings[0][1] === 1 && timings[0][2] === 'https://cache.test/worker/timed' && timings[0][3] === record);
+    p = R("fetch('failed')");
+    respond(sent.length, 0, '', '', null, 0, 'refused', record);
+    check('a failed fetch reports timing', await rejects(p, 'TypeError') && timings.length === 2 && timings[1][2] === 'https://cache.test/worker/failed');
+    R("Object.defineProperty(Array.prototype,7,{configurable:true,get(){return {startTime:1};}})");
+    p = R("fetch('untimed')");
+    respond(sent.length, 200, 'https://cache.test/worker/untimed', '', 'ok');
+    await p;
+    R("delete Array.prototype[7]");
+    check("the page's Array.prototype is no timing", timings.length === 3 && timings[2][3] === undefined);
+    R('workerStreaming=true');
+    p = R("fetch('streamed')");
+    id = sent.length;
+    frame(id, 1, [200, 'https://cache.test/worker/streamed', 'HTTP/1.1 200 OK\r\n']);
+    const streamed = await p;
+    check('no timing before the end', timings.length === 3);
+    end(id, '', record);
+    check('the end reports timing', (await streamed.text()) === '' && timings.length === 4 && timings[3][2] === 'https://cache.test/worker/streamed' && timings[3][3] === record);
+    R('workerStreaming=false');
     check('no reports', R('reported.length') === 0);
     await tick();
     console.log(`worker cache storage contract: ${checks} checks passed`);
