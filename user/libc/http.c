@@ -218,8 +218,13 @@ static enum http_url_result url_parse_owned_status(const char *s, size_t length,
         for (const char *p = s; (size_t)(end - p) > 2; p++)
             if (p[0] == ':' && p[1] == '/' && p[2] == '/') return HTTP_URL_INVALID;
     }
+    /* The URL Standard's serializer keeps '\' in a special URL's query and fragment (no
+       percent-encode set of theirs has it); before them it is a separator the URL parser has
+       already turned into '/', so a raw one there would be a second reading of the URL. */
+    const char *query = s;
+    while (query < end && *query != '?' && *query != '#') query++;
     for (const unsigned char *p = (const unsigned char *)s; p < (const unsigned char *)end; p++)
-        if (*p <= 32 || *p == 127 || *p == '\\') return HTTP_URL_INVALID;
+        if (*p <= 32 || *p == 127 || (*p == '\\' && p < (const unsigned char *)query)) return HTTP_URL_INVALID;
     const char *tail = authority;
     while (tail < end && *tail != '/' && *tail != '?' && *tail != '#') tail++;
     const char *colon = NULL;
