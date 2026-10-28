@@ -1,24 +1,43 @@
-/* 文書単位の実 Blob / MediaSource URL。ネイティブのfile権限へ変換しない。 */
-const objectURLBridge = (() => {
-    const URLType=URL, apply=Reflect.apply, define=Object.defineProperty;
-    const blobSize=Object.getOwnPropertyDescriptor(Blob.prototype,'size').get;
+/* FileAPI's blob URL store (https://w3c.github.io/FileAPI/#url-model, consulted 2026-10-28): this
+   realm's blob URL entries of real Blob and MediaSource objects, never native file authority. One
+   definition for a Window (js_bootstrap.js) and a Worker (js_worker_runtime.js); the realm passes
+     origin()   the ASCII serialization of its environment's origin ("null" when opaque),
+     policy()   the policy container's headers a blob: document or Worker inherits from the entry's
+                environment (null for none).
+   URL.createObjectURL and URL.revokeObjectURL are installed on the realm's URL. resolve(url) is the
+   URL parser's "resolve a blob URL" (the entry, null for none), obtain(entry) "obtain a blob
+   object" for one of this realm's entries; Fetch (js_fetch.js) runs scheme fetch over them. Every
+   entry here was made by this realm's environment, so the same-partition check of "obtain a blob
+   object" holds for it; a Worker's request for a URL this store does not hold is its parent
+   document's to resolve (js.c, worker_blob). */
+function objectURLInterfaces(realm) {
+    const URLType=URL, apply=Reflect.apply, define=Object.defineProperty, setPrototype=Object.setPrototypeOf;
     const urls=new Map(), get=Map.prototype.get, put=Map.prototype.set, remove=Map.prototype.delete;
-    const origin=new URLType(host.url()).origin, random=crypto.getRandomValues, cryptoObject=crypto;
-    const hex=Number.prototype.toString,pad=String.prototype.padStart, LIMIT=64*1024*1024;
-    let bytes=0,count=0,mediaBrand=()=>false;
+    const randomUUID=crypto.randomUUID, cryptoObject=crypto, indexOf=String.prototype.indexOf, strSlice=String.prototype.slice;
+    const urlGetter=name=>Object.getOwnPropertyDescriptor(URLType.prototype,name).get, href=urlGetter('href'), protocol=urlGetter('protocol');
+    let mediaBrand=()=>false;
     const string=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
-    function key(value){return string(value).split('#')[0];}
+    /* "Resolve a blob URL": the store's key is the URL serialized without its fragment. */
+    function key(value){const url=string(value),hash=apply(indexOf,url,['#']);return hash<0?url:apply(strSlice,url,[0,hash]);}
     function lookup(value){return apply(get,urls,[key(value)]);}
+    /* "Add an entry to the blob URL store": a new blob URL ("generate a new blob URL": blob:, the
+       origin, /, a random UUID) for object and this realm's environment. */
     function createObjectURL(value){
         const blob=blobBridge.brand(value),media=mediaBrand(value);
         if(!blob&&!media)throw new TypeError('Blob or MediaSource required');
-        const size=blob?apply(blobSize,value,[]):0;
-        if(count>=256||size>LIMIT-bytes)throw new DOMException('Object URL quota exceeded','QuotaExceededError');
-        let id;do{const data=new Uint8Array(16);apply(random,cryptoObject,[data]);id='';for(let i=0;i<data.length;i++)id+=apply(pad,apply(hex,data[i],[16]),[2,'0']);id='blob:'+origin+'/'+id;}while(lookup(id));
-        const policyHeaders=host.safety('policyHeaders',null);
-        apply(put,urls,[id,{value,size,blob,policyHeaders}]);bytes+=size;count++;return id;
+        let id;do id='blob:'+realm.origin()+'/'+apply(randomUUID,cryptoObject,[]);while(lookup(id));
+        apply(put,urls,[id,setPrototype({value,blob,policyHeaders:realm.policy()},null)]);return id;
     }
-    function revokeObjectURL(value){const id=key(value),entry=apply(get,urls,[id]);if(entry){apply(remove,urls,[id]);bytes-=entry.size;count--;}}
+    /* revokeObjectURL: the parsed URL's entry, when it is a blob: URL, "removed from the blob URL
+       store" by the URL's whole serialization, so a URL with a fragment removes nothing. Every
+       entry here is this realm's environment's, so the same-partition check holds. An entry a URL
+       record already resolved keeps its object. */
+    function revokeObjectURL(value){
+        const text=string(value);let record;
+        try{record=new URLType(text);}catch(_){return;}
+        if(apply(protocol,record,[])!=='blob:')return;
+        apply(remove,urls,[apply(href,record,[])]);
+    }
     define(URLType,'createObjectURL',{value:createObjectURL,writable:true,configurable:true,enumerable:true});
     define(URLType,'revokeObjectURL',{value:revokeObjectURL,writable:true,configurable:true,enumerable:true});
     return {
@@ -26,21 +45,8 @@ const objectURLBridge = (() => {
         mediaSource(value){const entry=lookup(value);return entry&&!entry.blob?entry.value:null;},
         blob(value){const entry=lookup(value);return entry&&entry.blob?entry.value:null;},
         policy(value){const entry=lookup(value);return entry&&entry.blob?entry.policyHeaders:null;},
-        fetch(value,method,range=null){
-            const entry=lookup(value);if(!entry||!entry.blob||method!=='GET'&&method!=='HEAD')throw new TypeError('Blob URL is revoked, unavailable, or not fetchable');
-            const type=blobBridge.type(entry.value);let first=0,last=entry.size-1,status=200;
-            if(method==='GET'&&range!==null){
-                const match=/^bytes=(\d*)-(\d*)$/.exec(range);
-                if(!match||!match[1]&&!match[2]||!entry.size)throw new TypeError('Invalid Blob range');
-                const a=match[1]?Number(match[1]):null,b=match[2]?Number(match[2]):null;
-                if(a!==null&&!Number.isSafeInteger(a)||b!==null&&!Number.isSafeInteger(b))throw new TypeError('Invalid Blob range');
-                if(a===null){if(!b)throw new TypeError('Invalid Blob suffix range');first=Math.max(0,entry.size-b);}
-                else {first=a;if(b!==null)last=Math.min(last,b);}
-                if(first>=entry.size||last<first)throw new TypeError('Blob range is not satisfiable');status=206;
-            }
-            const full=method==='HEAD'?null:blobBridge.bytes(entry.value);
-            const data=full===null?null:status===206?full.slice(first,last+1):full;
-            return {bytes:data,type,size:method==='HEAD'?entry.size:last-first+1,status,range:status===206?'bytes '+first+'-'+last+'/'+entry.size:null};
-        }
+        resolve(value){return lookup(value)||null;},
+        /* "Obtain a blob object": the entry's Blob, null for a MediaSource's entry. */
+        obtain(entry){return entry&&entry.blob?entry.value:null;}
     };
-})();
+}

@@ -5,7 +5,8 @@
  * transport's own loaded and frame hooks, and the storage broker cache_storage_contract.cjs's
  * in-memory one. It verifies the Request constructor's steps, the Response statics, the transport
  * query fetch hands the parent (modes, referrer, body), integrity, the streamed frames and their
- * flow control, opaque responses, close, the records Cache Storage keeps of this realm's objects,
+ * flow control, opaque responses, a blob: URL obtained from the parent, close, the records Cache
+ * Storage keeps of this realm's objects,
  * and add, addAll and match through them; not browserjsworker.c, js_worker.c or js.c (the wire and
  * the parent's checks), not webcache.c, not a guest browser.
  * Run: node tests/worker_cache_storage_contract.cjs */
@@ -149,6 +150,39 @@ async function test() {
     respond(sent.length, 200, 'https://other.test/final', '', 'x', 1 | 2);
     const cr = await p;
     check('cors redirected response', cr.type === 'cors' && cr.redirected === true && cr.url === 'https://other.test/final');
+
+    /* A blob: URL this Worker's store does not hold: obtained from the parent document's store
+       (js.c's worker_blob answers with the Blob's bytes and its type as Content-Type), and the
+       rest of scheme fetch "blob" here. No report timing: the request never reached the network. */
+    const blobURL = 'blob:https://cache.test/0b6c5e6a-5f39-4d1c-9a4b-2f0e8d7c6b5a', blobTimings = run('timings').length;
+    const blobAnswer = (id, type, text) => transport.loaded(id, [200, blobURL, 'Content-Type: ' + type + '\r\n', bytesOf(text), ''], 0);
+    p = R(`fetch('${blobURL}#f')`);
+    check('blob: to the parent', last().url === blobURL + '#f' && last().method === 'GET' && last().body === null &&
+        last().noReferrer === true && last().stream === false && last().proto === null);
+    blobAnswer(sent.length, 'text/plain;charset=utf-8', 'hello');
+    const br = await p;
+    check('blob: response', br.status === 200 && br.statusText === 'OK' && br.type === 'basic' && br.url === blobURL &&
+        br.headers.get('content-type') === 'text/plain;charset=utf-8' && br.headers.get('content-length') === '5' &&
+        (await br.text()) === 'hello');
+    p = R(`fetch('${blobURL}',{headers:{Range:'bytes= 1 - 3'}})`);
+    blobAnswer(sent.length, '', 'hello');
+    const ranged = await p;
+    check('blob: range', ranged.status === 206 && ranged.statusText === 'Partial Content' && ranged.headers.get('content-range') === 'bytes 1-3/5' &&
+        ranged.headers.get('content-length') === '3' && ranged.headers.get('content-type') === '' && (await ranged.text()) === 'ell');
+    p = R(`fetch('${blobURL}',{headers:{Range:'bytes=5-'}})`);
+    blobAnswer(sent.length, '', 'hello');
+    check('blob: range past the end', await rejects(p, 'TypeError'));
+    p = R(`fetch('${blobURL}')`);
+    transport.loaded(sent.length, [0, '', '', new ArrayBuffer(0), "The blob: URL has no Blob in the creating document's store"], 0);
+    check('blob: not in the parent', await rejects(p, 'TypeError'));
+    before = sent.length;
+    check('blob: GET only', await rejects(R(`fetch('${blobURL}',{method:'POST',body:'x'})`), 'TypeError') && sent.length === before);
+    const blobAbort = R('new AbortController()');
+    p = R(`s=>fetch('${blobURL}',{signal:s})`)(blobAbort.signal);
+    blobAbort.abort();
+    check('blob: aborted', await rejects(p, 'AbortError') && cancelled.includes(sent.length));
+    blobAnswer(sent.length, '', 'late');
+    check('blob: no report timing', run('timings').length === blobTimings);
 
     /* Opaque responses: blank from the parent, never contents in this realm. */
     p = R("fetch('https://other.test/o',{mode:'no-cors'})");

@@ -1437,6 +1437,9 @@
     /* @include js_credentials.js */
     /* @include js_navigator_plugins.js */
     /* @include js_object_url.js */
+    /* This document's environment: its origin, and the policy container a blob: document or
+       Worker made from its entries inherits. */
+    const objectURLBridge=objectURLInterfaces({origin:()=>rawDom.get(document,'fetchOrigin'),policy:()=>host.safety('policyHeaders',null)});
     fetchBridge.initializeObjectURLs(objectURLBridge);
     /* @include js_clone.js */
     cloneData.registerUncloneable(formDataBridge.brand,'FormData');

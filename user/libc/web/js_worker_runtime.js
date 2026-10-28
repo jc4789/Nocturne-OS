@@ -160,6 +160,12 @@
         /* @include js_formdata.js */
         fetchBridge.initializeFormData(formDataBridge);
         cloneData.registerUncloneable(value=>formDataBridge.brand(value));
+        /* @include js_object_url.js */
+        /* This Worker's environment for its blob URL store: its origin (START's, "null" for a
+           data: Worker's opaque one); a Worker creates no blob: document or Worker to inherit a
+           policy container. */
+        const objectURLOrigin=(()=>{try{return new URL(host.securityURL()).origin;}catch(_){return 'null';}})();
+        fetchBridge.initializeObjectURLs(objectURLInterfaces({origin:()=>objectURLOrigin,policy:()=>null}));
         return formDataBridge;
     }
     const errorPayload=e=>({message:String(e?.message||e),filename:address,lineno:0,stack:String(e?.stack||'')});
@@ -197,7 +203,8 @@
     const wireField=(record,index)=>record!==null&&typeof record==='object'&&apply(ownProperty,record,[index])?record[index]:undefined;
     const workerFetchTransport=(()=>{
         const apply=Reflect.apply,mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete,mapForEach=Map.prototype.forEach,mapClear=Map.prototype.clear,
-            setPrototype=Object.setPrototypeOf,NativePromise=Promise,NativeTypeError=TypeError,request=host.request,resume=host.resume,cancel=host.cancel;
+            setPrototype=Object.setPrototypeOf,NativePromise=Promise,NativeTypeError=TypeError,request=host.request,resume=host.resume,cancel=host.cancel,
+            strIndex=String.prototype.indexOf,strSlice=String.prototype.slice;
         const record=object=>setPrototype(object,null);
         const take=id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;};
         /* A fetch's end: its stream's (notify), then its promise's when no response was published. */
@@ -222,11 +229,31 @@
                 apply(mapSet,fetches,[id,record({resolve,reject,notify:stream?notify:undefined,noCors:q.noCors,url:q.url,published:false,paused:false,done:false})]);
                 return record({id,promise});
             },
+            /* FileAPI "obtain a blob object" for a blob: URL this Worker's store does not hold: the
+               parent's js.c resolves it in its document's store when this Worker is in that
+               document's storage partition (worker_blob). The NJW_LOADED body and its Content-Type
+               field are the Blob's bytes and type; Fetch (js_fetch.js) runs the rest of scheme
+               fetch here, as a Window does. */
+            obtainBlob(url){
+                if(closed)throw new NativeTypeError('Worker closed');
+                const id=apply(request,host,[record({url,method:'GET',headers:'',body:null,sameOrigin:false,credentials:0,forcePreflight:false,
+                    redirectError:false,cache:0,keepalive:false,noCors:false,noReferrer:true,referrer:'',referrerPolicy:0,destination:''}),false]);
+                let resolve,reject;const promise=new NativePromise((a,b)=>{resolve=a;reject=b;});
+                apply(mapSet,fetches,[id,record({resolve,reject,notify:undefined,noCors:false,url,blob:true,published:false,paused:false,done:false})]);
+                return record({id,promise});
+            },
             resume(id){const p=apply(mapGet,fetches,[id]);if(!p||!p.paused||closed)return;p.paused=false;apply(resume,host,[id]);},
             cancel(id){const p=take(id);if(!p)return;p.done=true;if(workerCanCancel&&!closed)apply(cancel,host,[id]);},
             /* NJW_LOADED: a buffered response, or the error that ends any fetch. */
             loaded(id,r,flags){
-                const p=take(id);if(!p||closed)return;p.done=true;timing(p,wireField(r,LOADED_TIMING));
+                const p=take(id);if(!p||closed)return;p.done=true;
+                if(p.blob){
+                    const headers=typeof r[2]==='string'?r[2]:'',field=apply(strIndex,headers,['Content-Type: ']),end=field<0?-1:apply(strIndex,headers,['\r\n',field]);
+                    if(r[4]||r[0]!==200||end<0)p.reject(new NativeTypeError(r[4]||'The blob: URL has no Blob in this Worker\'s partition'));
+                    else p.resolve([r[3],apply(strSlice,headers,[field+14,end])]);
+                    return;
+                }
+                timing(p,wireField(r,LOADED_TIMING));
                 if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
                 try{p.published=true;p.resolve(response(r,flags,r[3]));}catch(error){p.reject(error);}
             },

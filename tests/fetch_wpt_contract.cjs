@@ -4,12 +4,18 @@
  * js_bootstrap.js's ports, as js_embed.py includes them) and a Worker's (the same files with
  * js_worker_runtime.js's ports, as js_worker_embed.py includes them). Both realms' Event and
  * EventTarget are js_worker_runtime.js's (its dispatch and event handler attributes); the
- * Window's EventTarget in js_bootstrap.js is not run here. The native transports are recorders
- * that never answer, so a test that needs the network times out in every realm; the realms have
- * node's URL and TextEncoder, and no Blob is a BodyInit. This is not the guest browser and not
- * wptrunner: it shows the two realms give the same results and, with --base=REV, that neither
- * realm passes fewer subtests than REV's did. The checks after the WPT files are the parts of
- * DOM's AbortSignal no WPT file tests in a realm without a garbage collector to call.
+ * Window's EventTarget in js_bootstrap.js is not run here. Blob, File and FileReader are
+ * js_blob.js's (its UTF-8 concatenation is node's here), and each realm's blob URL store is
+ * js_object_url.js as its bootstrap installs it (a Worker's only in the REVs whose Worker has
+ * one). The native transports are recorders that never answer, so a test that needs the network
+ * times out in every realm, except in a file marked network:'error', where every request is a
+ * network error. A Worker's request for a blob: URL is answered as js.c's worker_blob answers
+ * for a creating document whose store does not hold it: a network error. The realms have node's
+ * URL (its createObjectURL hidden until a realm installs its own) and TextEncoder. This is not
+ * the guest browser and not wptrunner: it shows the two realms give the same results and, with
+ * --base=REV, that neither realm passes fewer subtests than REV's did. The checks after the WPT
+ * files are the parts of DOM's AbortSignal no WPT file tests in a realm without a garbage
+ * collector to call.
  * Run: node tests/fetch_wpt_contract.cjs [--base=REV] [--wpt=DIR] [--verbose] */
 'use strict';
 const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path'), cp = require('node:child_process');
@@ -45,6 +51,10 @@ const files = [
     'fetch/api/response/response-stream-disturbed-by-pipe.any.js',
     'fetch/api/body/formdata.any.js', 'fetch/api/body/cloned-any.js', 'fetch/api/abort/request.any.js',
     'dom/abort/AbortSignal.any.js', 'dom/abort/abort-signal-any.any.js', 'dom/abort/event.any.js', 'dom/abort/timeout.any.js',
+    /* Fetch's scheme fetch "blob" and FileAPI's blob URL store. scheme-blob's /images/blue.png
+       needs the network: there it is a network error, so the tests after it run. */
+    {file: 'fetch/api/basic/scheme-blob.sub.any.js', network: 'error'}, 'fetch/range/blob.any.js',
+    'FileAPI/url/url-format.any.js', 'FileAPI/url/url-with-fetch.any.js',
     /* DOM "Aborting ongoing activities", in testharness.js's form: the garbage collection rule
        ("A non-aborted dependent AbortSignal object must not be garbage collected while its source
        signals is non-empty and it has registered event listeners for its abort event or its abort
@@ -138,35 +148,53 @@ function events(rev) {
         .replace('/* @include js_custom_event.js */', read(web + 'js_custom_event.js')) +
         'const target=new EventTarget();Object.assign(globalThis,{Event,EventTarget,CustomEvent});\n' + handlers;
 }
-/* The realm's shared start: what both a Window's and a Worker's bootstrap have before Fetch. */
+/* node's URL is every realm's: a realm without a blob URL store has no URL.createObjectURL. */
+const hideObjectURLs = () => { for (const name of ['createObjectURL', 'revokeObjectURL'])
+    Object.defineProperty(URL, name, {value: undefined, writable: true, configurable: true, enumerable: false}); };
+/* The realm's shared start: what both a Window's and a Worker's bootstrap have before Fetch:
+   js_worker_runtime.js's ProgressEvent and js_blob.js (this tree's, the environment of every REV). */
 function context(rev) {
-    const c = {console, URL, URLSearchParams, TextEncoder, TextDecoder, setTimeout, clearTimeout, Blob, File, crypto: globalThis.crypto,
-        queueMicrotask, Buffer, WeakRef, FinalizationRegistry, digest, __gc: global.gc};
+    hideObjectURLs();
+    const c = {console, URL, URLSearchParams, TextEncoder, TextDecoder, setTimeout, clearTimeout, crypto: globalThis.crypto,
+        location: new URL(BASE_URL), queueMicrotask, Buffer, WeakRef, FinalizationRegistry, digest, __gc: global.gc};
     vm.createContext(c);
     c.self = vm.runInContext('globalThis', c);
     vm.runInContext(read(web + 'js_dom_exception.js'), c);
     vm.runInContext(`const apply=Reflect.apply,DOMException=domExceptionBridge.DOMException;globalThis.DOMException=DOMException;
         const reported=[],calls=[],sent=[],cancelled=[],resumed=[];
         function report(e){reported.push(e);}
-        const host={now:()=>Date.now(),promiseThen:(p,f,r)=>Promise.prototype.then.call(p,f,r),dataURL:${dataURL},cryptoDigest:digest};
-        /* Body's blob(): node's Blob of the bytes; no Blob is a BodyInit here. */
-        const blobBridge={brand:()=>false,bytes:()=>new ArrayBuffer(0),type:()=>'',fromBytes:(bytes,type)=>new Blob([bytes],{type})};`, c);
+        const host={now:()=>Date.now(),promiseThen:(p,f,r)=>Promise.prototype.then.call(p,f,r),dataURL:${dataURL},cryptoDigest:digest,
+            safety:(name,fallback)=>fallback,
+            /* The native UTF-8 concatenation of Blob parts: strings as scalar values, bytes as they are. */
+            concatUTF8(chunks){const parts=[];let n=0;
+                for(const c of chunks){const b=typeof c==='string'?new Uint8Array(Buffer.from(c.toWellFormed(),'utf8')):new Uint8Array(c.buffer,c.byteOffset,c.byteLength);parts.push(b);n+=b.length;}
+                const out=new Uint8Array(n);let at=0;for(const b of parts){out.set(b,at);at+=b.length;}return out.buffer;}};`, c);
     vm.runInContext(events(rev), c, {filename: (rev ? rev + ':' : '') + 'js_worker_runtime.js (events)'});
     vm.runInContext(streamsSource(), c);
+    const runtime = read(web + 'js_worker_runtime.js');
+    vm.runInContext(slice(runtime, '    const progressSlots=new WeakMap();', "{value:ProgressEvent,writable:true,configurable:true});") +
+        '\n' + read(web + 'js_blob.js'), c, {filename: 'js_blob.js'});
     return c;
+}
+/* The realm's blob URL store, as its bootstrap installs it after FormData. */
+function objectURLs(c, rev, text, start, end) {
+    if (!text.includes(start)) return;
+    vm.runInContext(slice(text, start, end).replace('/* @include js_object_url.js */', source(rev, web + 'js_object_url.js')),
+        c, {filename: (rev ? rev + ':' : '') + 'js_object_url.js'});
 }
 const includes = (rev, text) => text.replace('/* @include js_abort.js */', source(rev, web + 'js_abort.js'))
     .replace('/* @include js_fetch.js */', source(rev, web + 'js_fetch.js'));
 const realms = {
     /* js_bootstrap.js from its js_abort.js include to the Fetch globals. */
-    window(rev) {
+    window(rev, networkError) {
         const c = context(rev);
         vm.runInContext(`let abortSignals,abortListen=()=>{};const mapGet=WeakMap.prototype.get;
             const document={},performanceBridge={initiator(){}};
             const rawDom={get:(d,k)=>({baseURI:'${BASE_URL}',fetchOrigin:new URL('${BASE_URL}').origin,fetchClientReferrer:'${BASE_URL}',referrerPolicy:0})[k]};
             Object.assign(host,{url:()=>'${BASE_URL}',timer:(k,fn,ms,args)=>setTimeout(()=>fn(...args),ms),clear:id=>clearTimeout(id),
                 noCorsFetch:true,streamingFetch:true,resumeFetch(id){resumed.push(id);},cancel(id){cancelled.push(id);},
-                fetch(...args){calls.push(args);return {id:calls.length,promise:new Promise(()=>{})};}});
+                fetch(...args){calls.push(args);
+                    return {id:calls.length,promise:${networkError}?Promise.reject(new TypeError('Network error (the harness has no network)')):new Promise(()=>{})};}});
             /* REV's Worker events asked the Worker's own AbortSignal copy for the signal option. */
             var workerAbortBridge={brand:v=>abortSignals.is(v),state:v=>({aborted:abortSignals.aborted(v)}),subscribe:(s,f)=>abortSignals.follow(s,f)};`, c);
         const bootstrap = source(rev, web + 'js_bootstrap.js');
@@ -175,23 +203,29 @@ const realms = {
         vm.runInContext(`fetchBridge.initialize();fetchBridge.initializeStreams(streamBridge);fetchBridge.initializeBlobs(blobBridge);
             Object.assign(globalThis,{Headers,Request,Response,fetch,AbortController,AbortSignal});`, c);
         formData(c, rev);
+        objectURLs(c, rev, bootstrap, '    /* @include js_object_url.js */', 'fetchBridge.initializeObjectURLs(objectURLBridge);');
         return c;
     },
-    /* js_worker_runtime.js from its AbortSignal to the Fetch globals. */
-    worker(rev) {
+    /* js_worker_runtime.js from its AbortSignal to the Fetch globals. The parent answers a blob:
+       URL's request as worker_blob does for a document whose store does not hold it. */
+    worker(rev, networkError) {
         const c = context(rev);
         vm.runInContext(`let closed=false,address='${BASE_URL}',workerCanCancel=true,workerStreaming=true;
             const fetches=new Map();
             function timer(fn,ms,args){return setTimeout(()=>fn(...(args||[])),ms);}
             function clearTimer(id){clearTimeout(id);}
             Object.assign(host,{securityURL:()=>address,referrerPolicy:()=>0,resume(id){resumed.push(id);},cancel(id){cancelled.push(id);},
-                request(...args){sent.push(args);return sent.length;}});`, c);
+                request(...args){sent.push(args);const id=sent.length,blob=String(args[0].url).startsWith('blob:');
+                    if(blob||${networkError})setTimeout(()=>workerFetchTransport.loaded(id,[0,'','',new ArrayBuffer(0),
+                        blob?"The blob: URL has no Blob in the creating document's store":'Network error (the harness has no network)'],0));
+                    return id;}});`, c);
         const runtime = source(rev, web + 'js_worker_runtime.js');
         const start = runtime.includes('    /* @include js_abort.js */') ? '    /* @include js_abort.js */' : '    const workerAbortBridge=(()=>{';
         vm.runInContext(includes(rev, slice(runtime, start, '    const {Headers,Request,Response,fetch}=fetchBridge;\n')),
             c, {filename: (rev ? rev + ':' : '') + 'js_worker_runtime.js (Fetch)'});
         vm.runInContext(`Object.assign(globalThis,{Headers,Request,Response,fetch,AbortController,AbortSignal});`, c);
         formData(c, rev);
+        objectURLs(c, rev, runtime, '        /* @include js_object_url.js */', 'policy:()=>null}));');
         return c;
     },
 };
@@ -203,10 +237,14 @@ function formData(c, rev) {
 const testharness = read(path.join(wpt, 'resources/testharness.js'));
 const statusName = ['PASS', 'FAIL', 'TIMEOUT', 'NOTRUN', 'PRECONDITION_FAILED'];
 /* One WPT file (or one of this file's own checks) in a new realm: its subtests' names and statuses. */
+/* wptserve's substitutions in a .sub. file: the test domains and ports. */
+const substitute = text => text.replace(/\{\{domains\[([^\]]*)\]\}\}/g, (m, sub) => (sub ? sub + '.' : '') + 'web-platform.test')
+    .replace(/\{\{host\}\}/g, 'web-platform.test')
+    .replace(/\{\{ports\[(https?)\]\[([01])\]\}\}/g, (m, scheme, i) => String({http: [8000, 8001], https: [8443, 8444]}[scheme][i]));
 function runFile(kind, rev, entry) {
     const file = typeof entry === 'string' ? entry : entry.file;
     return new Promise(resolve => {
-        const c = realms[kind](rev);
+        const c = realms[kind](rev, typeof entry === 'object' && entry.network === 'error');
         const results = new Map();
         let timer;
         c.__done = (tests, status) => {
@@ -217,7 +255,9 @@ function runFile(kind, rev, entry) {
         };
         vm.runInContext(testharness, c, {filename: 'testharness.js'});
         vm.runInContext('add_completion_callback((tests,status)=>__done(tests,status));', c);
-        const full = path.join(wpt, typeof entry === 'string' ? file : 'dom/abort/x'), text = typeof entry === 'string' ? read(full) : entry.text;
+        const own = typeof entry === 'object' && entry.text !== undefined;
+        const full = path.join(wpt, own ? 'dom/abort/x' : file);
+        const text = own ? entry.text : file.includes('.sub.') ? substitute(read(full)) : read(full);
         try {
             for (const line of text.split('\n')) {
                 const m = /^\/\/ META: script=(.*)$/.exec(line.trim());

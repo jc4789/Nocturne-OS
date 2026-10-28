@@ -42,6 +42,9 @@ bool web_worker_set_policy(web_workers *,const char *,int);
 bool web_worker_set_origin(web_workers *,const char *);
 /* The creator's agent-cluster isolation, inherited by dedicated Workers. */
 void web_worker_set_isolated(web_workers *,bool);
+/* Whether a child is in this document's storage partition (FileAPI's same-partition blob URL
+ * usage), so a blob: URL it fetches may be obtained from this document's store. */
+bool web_worker_blob_partition(web_workers *,uint32_t);
 typedef void (*web_worker_reporter)(void *,JSValueConst);
 void web_worker_set_reporter(web_workers *,web_worker_reporter,void *);
 void web_worker_set_canceler(web_workers *,web_worker_canceler);

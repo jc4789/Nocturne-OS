@@ -74,7 +74,7 @@ function fetchInterfaces(realm) {
     const promiseConstructor=freeze({[Symbol.species]:NativePromise});
     const U8=Uint8Array, AB=ArrayBuffer, isView=ArrayBuffer.isView, taSet=Uint8Array.prototype.set;
     const getter=(proto,key)=>Object.getOwnPropertyDescriptor(proto,key).get;
-    const abLength=getter(AB.prototype,'byteLength'), ta=Object.getPrototypeOf(U8.prototype);
+    const abLength=getter(AB.prototype,'byteLength'), abSlice=AB.prototype.slice, ta=Object.getPrototypeOf(U8.prototype);
     const taBuffer=getter(ta,'buffer'), taOffset=getter(ta,'byteOffset'), taLength=getter(ta,'byteLength');
     const taTag=getter(ta,Symbol.toStringTag), dvBuffer=getter(DataView.prototype,'buffer');
     const dvOffset=getter(DataView.prototype,'byteOffset'), dvLength=getter(DataView.prototype,'byteLength');
@@ -458,8 +458,12 @@ function fetchInterfaces(realm) {
         return record({bytes:b.bytes===null?null:copyBytes(b.bytes),stream,used:false,abort:b.abort});}
     function requestObject(s,b){const object=create(Request.prototype);requestSlots.set(object,s);storeBody(object,b);return object;}
     function requestCopy(s,b){return requestObject(record({...s,headers:copyHeaders(s.headers,headerSlots.get(s.headers).guard),signal:signals.any([s.signal])}),b);}
+    /* blobEntry is the URL record's blob URL entry: the URL parser resolves a blob: URL against the
+       realm's store when the Request parses it (FileAPI "resolve a blob URL"), so a URL revoked
+       later still fetches the Blob, in the Request and its clones. */
     const newRequestRecord=url=>record({url,method:'GET',mode:'cors',credentials:'same-origin',cache:'default',redirect:'follow',
-        referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false,destination:'',priority:'auto',preflight:false});
+        referrer:'about:client',referrerPolicy:'',integrity:'',keepalive:false,destination:'',priority:'auto',preflight:false,
+        blobEntry:objectURLAPI&&beginsWith(url,'blob:')?objectURLAPI.resolve(url):null});
     class Request {
         constructor(input,init=undefined) {
             if(!arguments.length)throw new TypeError('Request requires input');
@@ -622,6 +626,64 @@ function fetchInterfaces(realm) {
             if(signals.aborted(s.signal))fail(signals.reason(s.signal));
         });
     }
+    /* Fetch's "parse a single range header value" with allowWhitespace: [start, end], each null
+       when absent, or null for failure. */
+    function singleRange(data) {
+        if(!beginsWith(data,'bytes'))return null;
+        let at=5;
+        const space=()=>{while(at<data.length&&tabSpace(code(data,at)))at++;};
+        const digits=()=>{const start=at;while(at<data.length&&code(data,at)>=48&&code(data,at)<=57)at++;return at===start?null:+slice(data,start,at);};
+        space();if(code(data,at)!==61)return null;at++;space();
+        const start=digits();space();
+        if(code(data,at)!==45)return null;at++;space();
+        const end=digits();
+        if(at<data.length||start===null&&end===null||start!==null&&end!==null&&start>end)return null;
+        const out=newList();out[0]=start;out[1]=end;return out;
+    }
+    /* FileAPI's "slice blob" of bytes from start to end (relative to the end when negative). */
+    function sliceBytes(bytes,start,end) {
+        const size=apply(abLength,bytes,[]);
+        const from=start<0?(size+start>0?size+start:0):(start<size?start:size),to=end<0?(size+end>0?size+end:0):(end<size?end:size);
+        return apply(abSlice,bytes,[from,to>from?to:from]);
+    }
+    /* Fetch's scheme fetch for "blob": only GET; the URL record's blob URL entry and FileAPI's
+       "obtain a blob object"; the whole Blob, or a Range's slice (status 206) with its
+       Content-Range. A Worker's URL its own store does not hold is obtained from its parent
+       document's store by the transport (transport.obtainBlob: js.c checks the Worker's storage
+       partition); a Window's is a network error. */
+    function blobFetch(s,integrity) {
+        return new NativePromise((resolve,reject)=>{
+            if(s.method!=='GET')throw new TypeError('A blob: URL is fetched with GET only');
+            if(!blobAPI)throw notSupported('Blob is not initialized');
+            const range=headerValue(headerSlots.get(s.headers),'range');
+            const respond=(bytes,type)=>{
+                const fullLength=apply(abLength,bytes,[]),headers=makeHeaders(undefined,'immutable'),list=headerSlots.get(headers).list;
+                let status=200,body=bytes;
+                if(range===null){add(list,pair('content-length',NativeString(fullLength)));add(list,pair('content-type',type));}
+                else{
+                    const value=singleRange(range);if(value===null)throw new TypeError('Invalid Range for a blob: URL');
+                    let start=value[0],end=value[1];
+                    if(start===null){start=fullLength-end;end=start+end-1;}
+                    else{if(start>=fullLength)throw new TypeError('Range start is past the Blob');if(end===null||end>=fullLength)end=fullLength-1;}
+                    body=sliceBytes(bytes,start,end+1);status=206;
+                    add(list,pair('content-length',NativeString(apply(abLength,body,[]))));add(list,pair('content-type',type));
+                    add(list,pair('content-range','bytes '+NativeString(start)+'-'+NativeString(end)+'/'+NativeString(fullLength)));
+                }
+                const response=responseObject({status,statusText:status===206?'Partial Content':'OK',url:urlWithoutFragment(s.url),headers,redirected:false,type:'basic'},
+                    {bytes:body,used:false,abort:s.signal});
+                resolve(verifyIntegrity(response,integrity,s.signal));
+            };
+            const blob=s.blobEntry?objectURLAPI.obtain(s.blobEntry):null;
+            if(blob!==null){respond(blobAPI.bytes(blob),blobAPI.type(blob));return;}
+            if(s.blobEntry||!transport.obtainBlob)throw new TypeError('The blob: URL has no Blob in this realm\'s store');
+            const started=transport.obtainBlob(s.url),id=started.id;
+            let finished=false;
+            const unfollow=signals.follow(s.signal,reason=>{if(finished)return;finished=true;transport.cancel(id);reject(reason);});
+            define(started.promise,'constructor',{value:promiseConstructor});
+            apply(then,started.promise,[obtained=>{if(finished)return;finished=true;unfollow();try{respond(obtained[0],obtained[1]);}catch(e){reject(e);}},
+                error=>{if(finished)return;finished=true;unfollow();reject(error);}]);
+        });
+    }
     /* prepared: input is a Request this bridge made for the fetch (Cache Storage's addAll), fetched
        as it is, without the Request constructor's steps for init. */
     function fetchCore(input,init,observer,forcePreflight=false,destination='',prepared=false) {
@@ -641,12 +703,7 @@ function fetchInterfaces(realm) {
             let referrer=noReferrer?'':s.referrer==='about:client'?realm.clientReferrer():s.referrer;
             if(referrer){const source=parseURL(referrer);apply(setUsername,source,['']);apply(setPassword,source,['']);apply(setHash,source,['']);referrer=href(source);}
             const referrerPolicy=s.referrerPolicy?position(referrerPolicies,s.referrerPolicy):realm.referrerPolicy();
-            if(objectURLAPI&&beginsWith(s.url,'blob:')){
-                const local=objectURLAPI.fetch(s.url,s.method,headerValue(headerSlots.get(s.headers),'range')),headers=makeHeaders(undefined,'immutable'),list=headerSlots.get(headers).list;
-                add(list,pair('content-type',local.type));add(list,pair('content-length',NativeString(local.size)));if(local.range)add(list,pair('content-range',local.range));
-                const response=responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:urlWithoutFragment(s.url),headers,redirected:false,type:'basic'},{bytes:s.method==='HEAD'?null:local.bytes,used:false,abort:s.signal});
-                return new NativePromise(resolve=>resolve(verifyIntegrity(response,integrity,s.signal)));
-            }
+            if(beginsWith(s.url,'blob:'))return blobFetch(s,integrity);
             if(s.mode==='no-cors'&&!transport.noCors())throw notSupported('This native context has no no-cors transport');
             if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
             // HTTP-network fetch: a body without a source (an author's stream) cannot be sent

@@ -4229,6 +4229,7 @@ static bool permitted_script_url(struct web_js_state *s,const char *url) {
 }
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
 static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped);
+static void worker_blob(struct web_js_state *s,struct js_pending *p);
 /* Console text is author data, not a diagnostic excerpt. Grow on demand and
  * report real allocation failure instead of truncating or aborting the task. */
 static bool console_text_append(sbuf *text, const char *bytes, size_t length) {
@@ -5707,8 +5708,18 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request, int 
     p->no_cors = (policy & NJW_LOAD_NO_CORS) != 0; p->no_referrer = (policy & NJW_LOAD_NO_REFERRER) != 0;
     p->keepalive = keepalive; p->streaming = streaming; p->referrer_policy = referrer_policy;
     bool blob = !strncasecmp(url,"blob:",5);
-    if (strlen(url) > UINT32_MAX || (!blob && !permitted_url(s,url,true)) || (blob && kind == 2)) {
+    /* Fetch's scheme fetch "blob" takes a GET without a body; the Blob is this document's to
+       give only to a child in its partition. */
+    if (strlen(url) > UINT32_MAX || (!blob && !permitted_url(s,url,true)) ||
+        (blob && kind == 2 && (strcmp(method,"GET") || body || streaming || !web_worker_blob_partition(s->workers,worker)))) {
         pending_error(p,"Worker resource URL is not permitted"); return true;
+    }
+    if (blob && kind == 2) {
+        /* Obtained now when this realm runs (before author code can revoke the URL), otherwise
+           at the next task boundary (process_pending). */
+        p->done = true;
+        if (s->running) worker_blob(s,p);
+        return true;
     }
     if (blob) {
         p->done = true; p->response.status = 200;
@@ -6518,40 +6529,83 @@ static char *script_data_source(struct web_js_state *s,const char *url,bool modu
     if(bytes){memcpy(bytes,data.body,data.length+1);*length=data.length;}
     web_data_url_free(&data);return bytes;
 }
-/* The private hook returns only real Blob bytes from this document's live
- * registry, never an author-visible URL property or an OS path. Root its result
- * while allocating the tracked source copy; MIME and byte limits remain native. */
-static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped) {
+/* FileAPI "obtain a blob object" in this document's blob URL store, through the private blobScript
+ * hook: a copy of the Blob's bytes (NUL-terminated, *length without it) and of its type, never an
+ * author-visible URL property or an OS path. Root the hook's result while allocating the copies. */
+static char *blob_url_bytes(struct web_js_state *s,const char *url,size_t *length,char **type,size_t *type_length) {
     JSContext *ctx=s->ctx;
     JSValue value=module_bridge_call(s,"blobScript",url,strlen(url),s->doc->base);
     if (JS_IsException(value)) return NULL;
-    JSValue buffer=JS_GetPropertyUint32(ctx,value,0),type=JS_UNDEFINED;
-    const char *content_type=NULL; char *source=NULL; size_t n=0,tn=0;
+    JSValue buffer=JS_GetPropertyUint32(ctx,value,0),kind=JS_UNDEFINED;
+    const char *text=NULL; char *source=NULL,*copy=NULL; size_t n=0,tn=0;
     if (JS_IsException(buffer)) goto out;
     const uint8_t *bytes=JS_GetArrayBuffer(ctx,&n,buffer);
     if (!bytes && JS_HasException(ctx)) goto out;
-    if (n>JS_BODY_LIMIT) { JS_ThrowRangeError(ctx,"Blob script length is not representable"); goto out; }
-    type=JS_GetPropertyUint32(ctx,value,1);
-    if (JS_IsException(type)) goto out;
-    content_type=JS_ToCStringLen(ctx,&tn,type);
-    if (!content_type) goto out;
-    const char *first=content_type,*end=memchr(first,';',tn);
+    if (n>JS_BODY_LIMIT) { JS_ThrowRangeError(ctx,"Blob length is not representable"); goto out; }
+    kind=JS_GetPropertyUint32(ctx,value,1);
+    if (JS_IsException(kind)) goto out;
+    text=JS_ToCStringLen(ctx,&tn,kind);
+    if (!text) goto out;
+    copy=js_strndup(ctx,text,tn);
+    if (!copy) goto out;
+    web_js_prepare_bytes(ctx,n+1);
+    source=js_malloc(ctx,n+1);
+    if (!source) { js_free(ctx,copy); goto out; }
+    if (n) memcpy(source,bytes,n);
+    source[n]=0; *length=n; *type=copy; *type_length=tn;
+out:
+    JS_FreeCString(ctx,text); JS_FreeValue(ctx,kind);
+    JS_FreeValue(ctx,buffer); JS_FreeValue(ctx,value); return source;
+}
+/* A blob: script's source: the Blob's bytes, with its type's MIME essence in mime (text/plain when
+ * the type is not a valid MIME type; a module requires a JavaScript one). MIME and byte limits
+ * remain native. */
+static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped) {
+    JSContext *ctx=s->ctx; char *type=NULL; size_t n=0,tn=0;
+    char *source=blob_url_bytes(s,url,&n,&type,&tn);
+    if (!source) return NULL;
+    const char *first=type,*end=memchr(first,';',tn);
     if (!end) end=first+tn;
     while (first<end && mime_space((unsigned char)*first)) first++;
     while (end>first && mime_space((unsigned char)end[-1])) end--;
     size_t mn=(size_t)(end-first);
     bool valid=valid_mime_essence(first,end) && mn<128;
     if (module && (!valid || !javascript_essence(first,mn))) {
-        JS_ThrowTypeError(ctx,"Blob module requires a JavaScript MIME type"); goto out;
+        JS_ThrowTypeError(ctx,"Blob module requires a JavaScript MIME type");
+        js_free(ctx,source); js_free(ctx,type); return NULL;
     }
     if (valid) { memcpy(mime,first,mn); mime[mn]=0; } else strcpy(mime,"text/plain");
     if (untyped) *untyped=!mn;
-    web_js_prepare_bytes(ctx,n+1);
-    source=js_malloc(ctx,n+1);
-    if (source) { if (n) memcpy(source,bytes,n); source[n]=0; *length=n; }
-out:
-    JS_FreeCString(ctx,content_type); JS_FreeValue(ctx,type);
-    JS_FreeValue(ctx,buffer); JS_FreeValue(ctx,value); return source;
+    js_free(ctx,type); *length=n; return source;
+}
+/* Fetch's scheme fetch "blob" for a Worker's request (js_worker_runtime.js obtainBlob) whose URL
+ * the Worker's own store does not hold: "obtain a blob object" from this document's store, for a
+ * child in this document's partition (worker_request checked web_worker_blob_partition). The
+ * response is the Blob's bytes with its type as Content-Type; the child runs the rest of scheme
+ * fetch (Range, Content-Length) as a Window does in js_fetch.js. */
+static void worker_blob(struct web_js_state *s,struct js_pending *p) {
+    JSContext *ctx=s->ctx; char *type=NULL; size_t n=0,tn=0;
+    char *bytes=blob_url_bytes(s,p->url,&n,&type,&tn);
+    if (!bytes) {
+        /* A revoked or foreign URL is the child's network error, not this realm's exception. */
+        if (JS_HasException(ctx)) { JSValue error=JS_GetException(ctx); JS_FreeValue(ctx,error); }
+        pending_error(p,"The blob: URL has no Blob in the creating document's store"); return;
+    }
+    static const char name[]="Content-Type: ";
+    const size_t prefix=sizeof name-1;
+    char *block=NULL;
+    /* A Blob's type is ASCII from U+0020 to U+007E (FileAPI's Blob constructor). */
+    bool printable=tn<=WEB_RESPONSE_HEADERS_MAX-prefix-3;
+    for (size_t i=0;printable&&i<tn;i++) printable=(unsigned char)type[i]>=0x20&&(unsigned char)type[i]<0x7f;
+    if (printable) block=prefix+tn+3<=sizeof p->response.headers?p->response.headers:js_malloc(ctx,prefix+tn+3);
+    if (!block) {
+        js_free(ctx,bytes); js_free(ctx,type);
+        pending_error(p,printable?"Out of memory while copying the Blob's type":"The Blob's type is not a header value"); return;
+    }
+    memcpy(block,name,prefix); if (tn) memcpy(block+prefix,type,tn); memcpy(block+prefix+tn,"\r\n",3);
+    if (block!=p->response.headers) p->response.headers_full=block;
+    js_free(ctx,type);
+    p->response.status=200; p->response.body=bytes; p->response.body_len=n;
 }
 /* Only the host's explicit source-preparation boundary gets this allowance.
    COMPILE_ONLY does not run page code. Recursive module preparation is counted
@@ -8006,11 +8060,14 @@ static bool process_pending(struct web_js_state *s) {
             if (!strncasecmp(p->url,"blob:",5) && !p->response.body && !p->response.error[0]) {
                 char mime[128];
                 ran_task = true; begin_named_task(s,"Worker object-URL source",p->worker);
-                p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL);
-                if (!p->response.body) {
-                    if (JS_HasException(s->ctx)) exception(s);
-                    pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
-                } else snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s\r\n",mime);
+                if (p->worker_kind == 2) worker_blob(s,p);
+                else {
+                    p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL);
+                    if (!p->response.body) {
+                        if (JS_HasException(s->ctx)) exception(s);
+                        pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
+                    } else snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s\r\n",mime);
+                }
                 end_task(s);
             }
             const char *final = web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url;

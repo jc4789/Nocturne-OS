@@ -187,6 +187,13 @@ web_workers *web_worker_new(JSContext *ctx,uint32_t generation,web_worker_loader
 bool web_worker_set_policy(web_workers *w,const char *headers,int referrer_policy){if(!w||referrer_policy<0||referrer_policy>8)return false;char *copy=policy_copy(headers);if(!copy)return false;free(w->creator_policy);w->creator_policy=copy;w->creator_referrer_policy=referrer_policy;return true;}
 bool web_worker_set_origin(web_workers*w,const char*origin){if(!w)return false;char*copy=policy_copy(origin);if(!copy)return false;free(w->origin);w->origin=copy;return true;}
 void web_worker_set_isolated(web_workers*w,bool isolated){if(w)w->isolated=isolated;}
+/* FileAPI's same-partition check (storage keys for non-storage purposes) between this document and
+   one of its children: the child's origin is its creator's (startup is same-origin and a blob:
+   script inherits it), except a data: script's opaque one, which shares no partition. */
+bool web_worker_blob_partition(web_workers*w,uint32_t id){
+    struct child*c=w?find(w,id):NULL;
+    return c&&c->origin&&c->url&&w->origin&&c->origin[0]&&strcmp(c->origin,"null")&&!strcmp(c->origin,w->origin)&&strncasecmp(c->url,"data:",5);
+}
 void web_worker_set_reporter(web_workers *w,web_worker_reporter reporter,void *opaque){if(w){w->reporter=reporter;w->report_opaque=opaque;}}
 void web_worker_set_canceler(web_workers *w,web_worker_canceler cancel){if(w)w->cancel=cancel;}
 void web_worker_set_requester(web_workers *w,web_worker_requester request){if(w)w->request=request;}
