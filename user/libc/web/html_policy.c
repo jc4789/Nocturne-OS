@@ -170,15 +170,19 @@ static bool policy_name(const char *begin,const char *end){
     for(const char *p=begin;p<end;p++)if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||strchr("-#=_/@.%",*p)))return false;
     return true;
 }
+/* CSP's report-uri: each token through the URL parser (UTF-8) against the
+   policy's URL. */
 static bool report_uri(struct web_html_policy_rule *r,const char *begin,const char *end){
-    char *relative=copy_text(begin,end);if(!relative)return false;char absolute[HTTP_URL_MAX];
-    bool valid=url_resolve(r->base_url,relative,absolute,sizeof absolute);free(relative);
-    if(!valid || (strncasecmp(absolute,"https://",8)&&strncasecmp(absolute,"http://",7)))return true;
-    const char *authority=strstr(absolute,"://")+3,*path=authority+strcspn(authority,"/?#");
-    if(memchr(authority,'@',path-authority))return true;
-    if(r->report_uri_count==SIZE_MAX/sizeof *r->report_uris)return false;
-    char **grown=realloc(r->report_uris,(r->report_uri_count+1)*sizeof *grown);if(!grown)return false;r->report_uris=grown;
-    char *value=copy_text(absolute,absolute+strlen(absolute));if(!value)return false;r->report_uris[r->report_uri_count++]=value;return true;
+    char *relative=copy_text(begin,end);if(!relative)return false;char *absolute=NULL;
+    int resolved=web_resolve_url_owned(r->base_url,relative,&absolute);free(relative);
+    if(resolved<0)return false;
+    if(!resolved || (strncmp(absolute,"https://",8)&&strncmp(absolute,"http://",7))){free(absolute);return true;}
+    const char *authority=absolute+(absolute[4]=='s'?8:7),*path=authority+strcspn(authority,"/?#");
+    if(memchr(authority,'@',path-authority)){free(absolute);return true;}
+    char **grown=r->report_uri_count<SIZE_MAX/sizeof *r->report_uris?
+        realloc(r->report_uris,(r->report_uri_count+1)*sizeof *grown):NULL;
+    if(!grown){free(absolute);return false;}
+    r->report_uris=grown;r->report_uris[r->report_uri_count++]=absolute;return true;
 }
 static bool append(web_doc *d,const char *begin,const char *end,bool report,bool meta,const char *base) {
     struct web_html_policy_rule *r=calloc(1,sizeof *r);

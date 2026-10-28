@@ -7,8 +7,19 @@
 #include "webi.h"
 #include "web_encoding.h"
 
+/* The URL parser for the engine's native callers, on any thread: input
+   against base (NULL: none; a base that is not a URL is none), with encoding
+   for input's query. HTML's encoding-parse a URL gives its document's
+   character encoding (doc_encoding_parse_url); CSS's url(), Fetch, a worker's
+   own URLs and every other caller UTF-8, as web_resolve_url_owned (web.h)
+   parses. A lone surrogate's three bytes (the DOM's and QuickJS's strings
+   keep them) parse as U+FFFD, a USVString's conversion. 1: *out is the URL's
+   serialization, malloc'd; 0: not a URL (*out NULL); -1: out of memory. */
+int web_url_resolve(const char *base, const char *input, web_encoding encoding, char **out);
+
 /* Lexbor's URL parser and the scratch memory it parses in. Every call leaves
-   the scratch memory empty again; one thread uses a parser at a time. */
+   the scratch memory empty again (the last base parsed is kept apart, to be
+   used again for the same base); one thread uses a parser at a time. */
 struct web_url_parser;
 struct web_url_parser *web_url_parser_new(void);
 void web_url_parser_free(struct web_url_parser *parser);
@@ -35,8 +46,8 @@ struct web_url {
    are the UTF-8 of scalar values. encoding is the URL parser's for input's
    query: HTML's encoding-parse gives the document's, everything else UTF-8
    (WEB_ENCODING_UTF8 or failure); the parser itself keeps UTF-8 for a URL that
-   is not special or is ws: or wss:. 1: url holds the result (sb_free its href);
-   0: input or base is not a URL; -1: out of memory. */
+   is not special or is ws: or wss:. url is given empty ({0}). 1: url holds the
+   result (sb_free its href); 0: input or base is not a URL; -1: out of memory. */
 int web_url_parse(struct web_url_parser *parser, const char *input, size_t length,
                   const char *base, size_t base_length, web_encoding encoding, struct web_url *url);
 /* Whether input alone (no base) is a URL. */

@@ -1197,8 +1197,9 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
     }
     if (!target || !*target) target = "_self";
     if (strchr(target, '\t') || strchr(target, '\n') || strchr(target, '<')) target = "_blank";
-    char absolute[2048];
-    if (!url_resolve(d->base, action && *action ? action : d->url, absolute, sizeof absolute) || !strncasecmp(absolute, "javascript:", 11)) return false;
+    /* HTML's encoding-parse a URL given action, relative to the submitter's node document. */
+    char *absolute = NULL;
+    if (doc_encoding_parse_url(d, action && *action ? action : d->url, &absolute) != 1 || !strncasecmp(absolute, "javascript:", 11)) { free(absolute); return false; }
     struct form_encoding encoding = {.kind = kind, .charset = submission_charset(d, form)};
     uint64_t stamp = uptime_ms();
     for (unsigned retry = 0; retry < 64; retry++) {
@@ -1207,15 +1208,15 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
         submission_collect(d, form, doc_node_root(form, false), submitter, &encoding);
         if (encoding.failed || !encoding.collision) break;
     }
-    if (encoding.failed || encoding.collision) { sb_free(&encoding.body); return false; }
+    if (encoding.failed || encoding.collision) { sb_free(&encoding.body); free(absolute); return false; }
     if (!strcmp(kind, "multipart/form-data")) {
         size_t suffix;
-        if (!SUBMISSION_SUM(suffix,strlen(encoding.boundary),6) || !submission_append_capacity(&encoding.body,suffix)) { sb_free(&encoding.body); return false; }
+        if (!SUBMISSION_SUM(suffix,strlen(encoding.boundary),6) || !submission_append_capacity(&encoding.body,suffix)) { sb_free(&encoding.body); free(absolute); return false; }
         sb_puts(&encoding.body, "--"); sb_puts(&encoding.body, encoding.boundary); sb_puts(&encoding.body, "--\r\n");
     }
     request->target = strdup(target);
     if (post) {
-        request->url = strdup(absolute); request->body_len = encoding.body.n;
+        request->url = absolute; absolute = NULL; request->body_len = encoding.body.n;
         request->body = malloc(request->body_len + 1);
         if (request->body) { if (request->body_len) memcpy(request->body, encoding.body.p, request->body_len); request->body[request->body_len] = 0; }
         sbuf content = {0};
@@ -1224,14 +1225,20 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
         if (!strcmp(kind, "multipart/form-data")) { sb_puts(&content, "; boundary="); sb_puts(&content, encoding.boundary); }
         request->content_type = strdup(sb_cstr(&content)); sb_free(&content);
     } else {
-        char fragment_text[2048] = {0};
-        char *fragment = strchr(absolute, '#'); if (fragment) { strcpy(fragment_text, fragment); *fragment = 0; }
-        char *query = strchr(absolute, '?'); if (query) *query = 0;
-        size_t length;
-        if (!SUBMISSION_SUM(length,strlen(absolute),encoding.body.n,strlen(fragment_text),2)) { sb_free(&encoding.body); web_submit_request_free(request); return false; }
-        request->url = malloc(length);
-        if (request->url) snprintf(request->url, length, "%s?%s%s", absolute, encoding.body.p ? sb_cstr(&encoding.body) : "", fragment_text);
+        /* The action URL's query becomes the entry list's; its fragment stays. */
+        char *fragment = strchr(absolute, '#'), *query = strchr(absolute, '?');
+        size_t head = (size_t)((query && (!fragment || query < fragment) ? query : fragment ? fragment : absolute + strlen(absolute)) - absolute);
+        const char *fragment_text = fragment ? fragment : "";
+        size_t length, fragment_length = strlen(fragment_text);
+        if (!SUBMISSION_SUM(length,head,encoding.body.n,fragment_length,2)) { sb_free(&encoding.body); free(absolute); web_submit_request_free(request); return false; }
+        char *url = request->url = malloc(length);
+        if (url) {
+            memcpy(url, absolute, head); url += head; *url++ = '?';
+            if (encoding.body.n) { memcpy(url, encoding.body.p, encoding.body.n); url += encoding.body.n; }
+            memcpy(url, fragment_text, fragment_length + 1);
+        }
     }
+    free(absolute);
     sb_free(&encoding.body);
     if (!request->url || !request->target || (post && (!request->body || !request->content_type))) { web_submit_request_free(request); return false; }
     return true;

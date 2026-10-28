@@ -39,6 +39,6 @@ for path in ['user/libc/web/css.c','user/libc/web/cssom.c','user/libc/web/doc.c'
 exe=out/'native.exe'
 command=[str(cc),'-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-Wl,--gc-sections',
          '-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web',str(native),
-         'user/libc/web/cssprop.c','user/libc/web/color.c','user/libc/web/util.c','user/libc/web/html.c','-o',str(exe)]
+         'user/libc/web/cssprop.c','user/libc/web/shape.c','user/libc/web/color.c','user/libc/web/util.c','user/libc/web/html.c','-o',str(exe)]
 subprocess.run(command,cwd=root,env=env,check=True)
 subprocess.run([str(exe)],cwd=root,env=env,check=True,timeout=30)

@@ -241,7 +241,8 @@ $(BUILD)/u/%.o: %.c
 	@$(CC) $(UCFLAGS) -c $< -o $@
 
 # The checked-in copy permits in-OS linking without Python; regenerate on host edits.
-user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json
+user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json \
+                                third_party/editing/implementation.js third_party/editing/upstream.json
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
 # The Web IDL table the binding layer shapes interfaces by, from the specifications' IDL.
@@ -315,10 +316,15 @@ $(LIBC_RSP): $(LIBC_LINK) $(LLVM_JIT_LIBS) Makefile
 # A unit's check (scripts/link_unit.py) reads the symbols of every other member.
 $(NVK_UNIT): | $(filter-out $(NVK_UNIT),$(LIBC_LINK))
 
+# A program keeps its symbol table beside the build (build/symbols/<name>), so that the address
+# of a fault in a serial log maps to a function (llvm-symbolizer --obj=build/symbols/<name>); the
+# copy C: gets is the same link stripped, at the same addresses.
+SYMBOLS := $(BUILD)/symbols
 $(PROGRAMS)/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
-	@mkdir -p $(dir $@)
+	@mkdir -p $(dir $@) $(SYMBOLS)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
+	@$(LD) $(filter-out -s,$(ULDFLAGS)) --strip-debug --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $(SYMBOLS)/$*
+	@llvm-objcopy --strip-all $(SYMBOLS)/$* $@
 
 # C++ is an additional host cross-build path; C/TinyCC keep their own flags.
 $(BUILD)/u/tests/media_cenc_test.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)

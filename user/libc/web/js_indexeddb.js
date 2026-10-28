@@ -177,7 +177,12 @@ const indexedDBBridge=(()=>{
         r.executing=null;r.queue=[];
         later(()=>{
             for(const q of queue)if(q.request)finish(q.request,undefined,new DOMException('Transaction aborted','AbortError'));
-            fire(tx,'abort');if(r.openRequest)finish(r.openRequest,undefined,r.error);
+            fire(tx,'abort');
+            /* "Abort a transaction" resets an upgrade's open request (no transaction, so the open's
+               error does not reach the transaction or the connection), and "open a database
+               connection" then answers it with a new AbortError, in a task of its own. */
+            if(r.openRequest){const request=get(r.openRequest,'IDBRequest');request.transaction=null;request.result=undefined;request.done=false;
+                later(()=>finish(r.openRequest,undefined,new DOMException('The upgrade transaction was aborted','AbortError')),0);}
         },0);
     }
     async function complete(tx){
@@ -268,8 +273,13 @@ const indexedDBBridge=(()=>{
     function write(source,v,provided,hasKey,addOnly){const s=get(source,'IDBObjectStore');live(s.tx,true);const detached=clone(v),store=schema(s);let candidate=provided;
         if(store.keyPath!==null){if(hasKey)fail('DataError');candidate=path(detached,store.keyPath);}
         let initial;if(candidate===undefined){if(!store.autoIncrement)fail('DataError');}else initial=key(candidate);
+        /* Requests run in the order they were placed. Only a version change transaction changes an
+           index set, and it is the only transaction then, so the indexes this request finds when it
+           runs are the ones the store's handle has now: an index created after it is built by its
+           own later step, one deleted after it is still there. */
+        const present=store.indexes.slice();
         return enqueue(s.tx,source,async r=>{const st=schema(s);let k=initial;if(k===undefined){if(st.generator>9007199254740992)fail('ConstraintError');k=st.generator;if(st.keyPath!==null)inject(detached,st.keyPath,k);}const at=insertion(st.records,k),exists=at<st.records.length&&!compare(st.records[at][0],k);if(addOnly&&exists)fail('ConstraintError');
-            const indexes=[];for(const index of st.indexes){const keys=indexKeys(index,detached);indexes.push([index.name,keys]);if(index.unique)for(const old of st.records){if(!compare(old[0],k))continue;for(const oldKey of old[2]?.find(v=>v[0]===index.name)?.[1]||[])if(keys.some(ik=>!compare(ik,oldKey)))fail('ConstraintError');}}
+            const indexes=[];for(const index of present){const keys=indexKeys(index,detached);indexes.push([index.name,keys]);if(index.unique)for(const old of st.records){if(!compare(old[0],k))continue;for(const oldKey of old[2]?.find(v=>v[0]===index.name)?.[1]||[])if(keys.some(ik=>!compare(ik,oldKey)))fail('ConstraintError');}}
             const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached,undefined,true)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
     }
     function query(source,kind,q){const s=records.get(source);live(s.tx);const r=range(q,kind==='count');
@@ -352,7 +362,10 @@ const indexedDBBridge=(()=>{
                 }
             }});
             return new IDBIndex(token,s.tx,s.name,name);}
-        deleteIndex(name){const s=get(this,'IDBObjectStore'),r=live(s.tx,true);if(r.mode!=='versionchange')fail('InvalidStateError');const st=schema(s);name=strings(name);const i=st.indexes.findIndex(x=>x.name===name);if(i<0)fail('NotFoundError');st.indexes.splice(i,1);for(const record of st.records)record[2]=record[2].filter(v=>v[0]!==name);}
+        deleteIndex(name){const s=get(this,'IDBObjectStore'),r=live(s.tx,true);if(r.mode!=='versionchange')fail('InvalidStateError');const st=schema(s);name=strings(name);const i=st.indexes.findIndex(x=>x.name===name);if(i<0)fail('NotFoundError');const index=st.indexes[i];st.indexes.splice(i,1);
+            /* The handle loses the index now; its records go when the requests placed before this
+               call have run, in order, as createIndex builds one. */
+            r.queue.push({request:null,operation:async()=>{for(const record of st.records)if(record[2])record[2]=record[2].filter(v=>v[0]!==index.name);}});}
         openCursor(q,d='next'){return cursor(this,q,d,true);}
         openKeyCursor(q,d='next'){return cursor(this,q,d,false);}
     }

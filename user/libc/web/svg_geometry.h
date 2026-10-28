@@ -54,40 +54,61 @@ static inline int svg_viewbox(const char *s, float out[4]) {
     return out[2] == 0 || out[3] == 0 ? 2 : 1;
 }
 
-/* Whether d is whole, valid SVG path data (SVG 2 §9.3.9): a moveto first, each command's
-   argument groups complete, an arc's flags single 0 or 1 digits, commas only between numbers. */
-static inline int svg_path_data_valid(const char *d) {
+/* One command of SVG path data, as written: its letter (z is kept as Z, which means the
+   same) and its numbers, an arc's flags as 0 or 1. An argument group repeated after its
+   command is a command of its own, and one after a moveto is a lineto (SVG 2 §9.3.3). */
+struct svg_path_seg { char cmd; float v[7]; };
+static inline int svg_path_arity(char cmd) {
+    switch (cmd | 32) {
+    case 'm': case 'l': case 't': return 2;
+    case 'h': case 'v': return 1;
+    case 'c': return 6;
+    case 's': case 'q': return 4;
+    case 'a': return 7;
+    }
+    return 0;
+}
+/* Whole, valid SVG path data (SVG 2 §9.3.9): a moveto first, each command's argument groups
+   complete, an arc's flags single 0 or 1 digits, commas only between numbers. The number of
+   commands, each written to seg[] while it fits cap; -1 when d is not path data. */
+static inline long svg_path_data_parse(const char *d, struct svg_path_seg *seg, size_t cap) {
     static const char commands[] = "MmZzLlHhVvCcSsQqTtAa";
-    static const unsigned char arity[] = {2, 2, 0, 0, 2, 2, 1, 1, 1, 1, 6, 6, 4, 4, 4, 4, 2, 2, 7, 7};
     const char *p = d;
-    int command = -1;
+    char command = 0;
+    long count = 0;
     for (;;) {
         while (svg_space(*p)) p++;
-        if (!*p) return command >= 0;
-        const char *found = strchr(commands, *p);
-        if (found) {
-            int index = (int)(found - commands);
-            if (command < 0 && index > 1) return 0;
-            command = index;
-            p++;
-            if (!arity[command]) continue;
-        } else if (command < 0 || !arity[command]) return 0;
-        for (int i = 0; i < arity[command]; i++) {
+        if (!*p) return command ? count : -1;
+        int arity;
+        if (strchr(commands, *p)) {
+            if (!command && (*p | 32) != 'm') return -1;
+            command = *p++;
+            arity = svg_path_arity(command);
+            if (!arity) {
+                if (seg && (size_t)count < cap) seg[count].cmd = 'Z';
+                count++;
+                continue;
+            }
+        } else {
+            if (!command || !(arity = svg_path_arity(command))) return -1;
+            if ((command | 32) == 'm') command = command == 'M' ? 'L' : 'l';
+        }
+        struct svg_path_seg one = {command, {0}};
+        for (int i = 0; i < arity; i++) {
             while (svg_space(*p)) p++;
             if (i && *p == ',') { p++; while (svg_space(*p)) p++; }
-            if (arity[command] == 7 && (i == 3 || i == 4)) {
-                if (*p != '0' && *p != '1') return 0;
-                p++;
-            } else {
-                float value;
-                if (!svg_number(&p, &value)) return 0;
-            }
+            if (arity == 7 && (i == 3 || i == 4)) {
+                if (*p != '0' && *p != '1') return -1;
+                one.v[i] = (float)(*p++ - '0');
+            } else if (!svg_number(&p, &one.v[i])) return -1;
         }
+        if (seg && (size_t)count < cap) seg[count] = one;
+        count++;
         while (svg_space(*p)) p++;
         if (*p == ',') {
             p++;
             while (svg_space(*p)) p++;
-            if (!*p || strchr(commands, *p)) return 0; /* a comma joins argument groups only */
+            if (!*p || strchr(commands, *p)) return -1; /* a comma joins argument groups only */
         }
     }
 }

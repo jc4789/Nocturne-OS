@@ -77,7 +77,7 @@ struct shaper {
     unsigned bit;            /* the realm's WEBIDL_GLOBAL_* */
     const char *global_name; /* its [Global] interface */
     JSAtom name, length, prototype, constructor, iterator, async_iterator, to_string_tag, unscopables;
-    JSValue object_prototype, function_prototype, error_prototype;
+    JSValue object_prototype, function_prototype, error_prototype, array_prototype;
     struct named *named;
     size_t named_count, named_capacity;
     struct web_js_webidl_report report;
@@ -249,6 +249,18 @@ static void shape_member(struct shaper *s, const struct webidl_interface *i, JSV
         JS_DefinePropertyValue(ctx, holder, atom, constant_value(ctx, m), JS_PROP_ENUMERABLE);
         if (JS_HasException(ctx)) forget_exception(ctx);
         s->report.members++;
+    } else if (m->kind == WEBIDL_OPERATION && (m->flags & WEBIDL_ARRAY_ITERATOR)) {
+        /* A value iterator's entries, keys, values and forEach, and its @@iterator, are the
+           %Array.prototype% functions themselves (Web IDL "iterable declarations"): they read the
+           object's length and indices, which the interface's indexed property getter answers, so
+           no binding of its own stands in for them. */
+        JSValue fn = JS_GetPropertyStr(ctx, s->array_prototype, m->name);
+        if (JS_IsException(fn) || JS_DefinePropertyValue(ctx, holder, atom, JS_DupValue(ctx, fn), JS_PROP_C_W_E) < 0 ||
+            ((m->flags & WEBIDL_ITERATOR) &&
+             JS_DefinePropertyValue(ctx, holder, s->iterator, JS_DupValue(ctx, fn), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0))
+            forget_exception(ctx);
+        else s->report.members++;
+        JS_FreeValue(ctx, fn);
     } else if (has && m->kind == WEBIDL_OPERATION) {
         if (!(d.flags & JS_PROP_GETSET) && JS_IsFunction(ctx, d.value)) {
             JSValue fn = named_function(s, JS_DupValue(ctx, d.value), m, ROLE_VALUE, m->length);
@@ -469,6 +481,9 @@ static bool shaper_open(struct shaper *s, JSContext *ctx, const char *global) {
     s->object_prototype = JS_GetProperty(ctx, object, s->prototype);
     s->function_prototype = JS_GetPrototype(ctx, object);
     JS_FreeValue(ctx, object);
+    JSValue array = JS_GetPropertyStr(ctx, s->global, "Array");
+    s->array_prototype = JS_GetProperty(ctx, array, s->prototype);
+    JS_FreeValue(ctx, array);
     JSValue error = JS_GetPropertyStr(ctx, s->global, "Error");
     s->error_prototype = JS_GetProperty(ctx, error, s->prototype);
     JS_FreeValue(ctx, error);
@@ -480,7 +495,7 @@ static void shaper_close(struct shaper *s) {
     JSContext *ctx = s->ctx;
     JSAtom atoms[] = {s->name, s->length, s->prototype, s->constructor, s->iterator, s->async_iterator, s->to_string_tag, s->unscopables};
     for (size_t k = 0; k < sizeof atoms / sizeof atoms[0]; k++) JS_FreeAtom(ctx, atoms[k]);
-    JS_FreeValue(ctx, s->object_prototype); JS_FreeValue(ctx, s->function_prototype); JS_FreeValue(ctx, s->error_prototype);
+    JS_FreeValue(ctx, s->object_prototype); JS_FreeValue(ctx, s->function_prototype); JS_FreeValue(ctx, s->error_prototype); JS_FreeValue(ctx, s->array_prototype);
     JS_FreeValue(ctx, s->global);
     for (size_t k = 0; k < s->named_capacity; k++)
         if (s->named[k].function) JS_FreeValue(ctx, s->named[k].shaped);

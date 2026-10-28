@@ -337,6 +337,7 @@ struct platform_program {
 static struct platform_program bindings_program = {.source=js_bootstrap, .len=sizeof js_bootstrap - 1, .name="nocturne:browser-bindings"};
 static struct platform_program locale_program = {.source=js_locale, .len=sizeof js_locale - 1, .name="nocturne:locale"};
 static struct platform_program webaudio_program = {.source=js_webaudio, .len=sizeof js_webaudio - 1, .name="nocturne:webaudio"};
+static struct platform_program editing_program = {.source=js_editing, .len=sizeof js_editing - 1, .name="nocturne:editing"};
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic);
 static void dynamic_scripts(struct web_js_state *s, node_t *n);
 static void dynamic_inserted(struct web_js_state *s,node_t *parent,
@@ -2348,10 +2349,9 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
         sbuf text={0};if(!css_radius_serialize(st,radius_corner,&text,d)){sb_free(&text);return JS_ThrowInternalError(ctx,"CSS radius serialization failed");}
         JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;
     }
-    if (!strcmp(property,"filter") || !strcmp(property,"box-shadow") || !strcmp(property,"clip-path") || !strcmp(property,"clip")) {
+    if (!strcmp(property,"filter") || !strcmp(property,"box-shadow") || !strcmp(property,"clip")) {
         sbuf text={0};
         bool serialized = !strcmp(property,"filter") ? css_filter_serialize(st->filter,&text,d) :
-            !strcmp(property,"clip-path") ? css_clip_path_serialize(st->clip_path,&text,d) :
             !strcmp(property,"clip") ? css_clip_rect_serialize(&st->clip,&text) :
             css_shadow_serialize(st->box_shadow,&text,d);
         if (!serialized) {
@@ -3120,14 +3120,19 @@ static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double r
     rect[2]=out.first_seen?r[2]-r[0]:0;rect[3]=out.first_seen?r[3]-r[1]:0;
     return true;
 }
+/* Before any native DOM work on d (the operations here and the DOM collections'
+   revision check): a sandboxed actor borrows no other document's authority. */
+static bool dom_authority_denied(struct web_js_state *s, web_doc *d) {
+    return !s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
+       (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d));
+}
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
     if (argc < 2) return JS_ThrowTypeError(ctx, "DOM operation requires a receiver");
     node_t *n = unwrap(ctx, argv[1]);
     if (!n && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) { return JS_EXCEPTION; }
     if (n && n->owner) d = n->owner;
-    if(!s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
-       (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d)))
+    if(dom_authority_denied(s,d))
         return history_security_error(ctx,"Sandbox denied borrowed document authority");
     doc_dom_budget(d);
     bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
@@ -4016,6 +4021,7 @@ static bool same_origin_urls(const char *a, const char *b, bool *allocation_fail
 }
 #include "js_html_safety_host.h"
 #include "js_pi_native.h"
+#include "js_collections_native.h"
 static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
     if (!strncasecmp(url, "https://", 8) || !strncasecmp(url, "http://", 7)) {
         struct url_owned parsed = {0};
@@ -4786,9 +4792,12 @@ static JSValue native_scroll(JSContext *ctx, JSValueConst this_val, int argc, JS
     return JS_NewInt32(ctx, axis ? y : x);
 }
 /* Native URL ownership follows actual length; the native wire uses uint32_t.
-   Resolver OOM must remain OOM rather than being rewritten as a policy denial. */
-static char *js_resolve_owned(JSContext *ctx,const char *base,const char *relative) {
-    char *owned=NULL; int status=web_resolve_url_owned(base,relative,&owned);
+   Resolver OOM must remain OOM rather than being rewritten as a policy denial.
+   encoding_parse: HTML's encoding-parse a URL relative to d (a navigation's
+   URL); otherwise the URL parser against d's base URL with UTF-8 (Fetch's). */
+static char *js_resolve_owned(JSContext *ctx,web_doc *d,const char *relative,bool encoding_parse) {
+    char *owned=NULL;
+    int status=encoding_parse?doc_encoding_parse_url(d,relative,&owned):web_resolve_url_owned(d->base,relative,&owned);
     if(status!=1){if(status<0)JS_ThrowOutOfMemory(ctx);else JS_ThrowTypeError(ctx,"Invalid URL");return NULL;}
     char *resolved=js_strdup(ctx,owned);free(owned);return resolved;
 }
@@ -4796,7 +4805,7 @@ static JSValue native_resolve(JSContext *ctx, JSValueConst this_val, int argc, J
     if (!argc) return JS_UNDEFINED;
     const char *rel = JS_ToCString(ctx, argv[0]); if (!rel) return JS_EXCEPTION;
     struct web_js_state *s = state(ctx); if (s->doc->resources_dirty) doc_sync_tree(s->doc);
-    char *url = js_resolve_owned(ctx, s->doc->base, rel);
+    char *url = js_resolve_owned(ctx, s->doc, rel, true);
     JS_FreeCString(ctx, rel);
     if (!url) return JS_EXCEPTION;
     JSValue result = JS_NewString(ctx, url);
@@ -4879,7 +4888,7 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     const char *p = JS_ToCString(ctx, argv[0]); if (!p) return JS_EXCEPTION;
     if(!task_context_active(s) || !task_context_active(actor)){JS_FreeCString(ctx,p);return history_security_error(ctx,"Navigation context retired during conversion");}
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
-    char *url = js_resolve_owned(ctx, s->doc->base, p);
+    char *url = js_resolve_owned(ctx, s->doc, p, true);
     if (!url) { JS_FreeCString(ctx, p); return JS_EXCEPTION; }
     bool ok = permitted_url(s, url, false);
     JS_FreeCString(ctx, p);
@@ -5851,7 +5860,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if(referrer_length>UINT32_MAX||(referrer&&memchr(referrer,0,referrer_length))){result=JS_ThrowTypeError(ctx,"Invalid private referrer URL");goto out;}
     if (!task_context_active(s) || s->doc->root != generation) { result = JS_ThrowTypeError(ctx, "Fetch browsing context retired during conversion"); goto out; }
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
-    url = js_resolve_owned(ctx, s->doc->base, rel); if (!url) goto out;
+    url = js_resolve_owned(ctx, s->doc, rel, false); if (!url) goto out;
     if (!permitted_url(s, url, true)) { result = JS_ThrowTypeError(ctx, "fetch supports HTTP(S) resources only"); goto out; }
     if (method_length > UINT32_MAX || memchr(method, 0, method_length) || !webnet_method_valid(method) || ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && body)) { result = JS_ThrowTypeError(ctx, "Invalid HTTP method or body"); goto out; }
     if (n > JS_BODY_LIMIT || header_length > UINT32_MAX) { result = JS_ThrowRangeError(ctx, "Request length is not representable on the native wire"); goto out; }
@@ -5985,6 +5994,19 @@ static JSValue module_bridge_call(struct web_js_state *s, const char *hook, cons
     JSValue args[] = {JS_NewStringLen(ctx, input, len), JS_NewString(ctx, base)};
     JSValue result = JS_IsException(args[0]) || JS_IsException(args[1]) ? JS_EXCEPTION : JS_Call(ctx, fn, s->hooks, 2, args);
     JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); JS_FreeValue(ctx, fn);
+    return result;
+}
+/* HTML's encoding-parse a URL given a script's src (or a module preload's href),
+   relative to the document, as a URL a script may come from: NULL with a
+   pending exception otherwise. */
+static char *script_src_url(struct web_js_state *s, const char *src) {
+    char *owned = NULL, *result = NULL;
+    int status = doc_encoding_parse_url(s->doc, src, &owned);
+    if (status < 0) JS_ThrowOutOfMemory(s->ctx);
+    else if (!status) JS_ThrowTypeError(s->ctx, "Invalid script URL: %s", src);
+    else if (!permitted_script_url(s, owned)) JS_ThrowTypeError(s->ctx, "Script URL is not permitted: %s", src);
+    else result = js_strdup(s->ctx, owned);
+    free(owned);
     return result;
 }
 static char *module_url(struct web_js_state *s, const char *hook, const char *name, const char *base) {
@@ -6611,13 +6633,11 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
     script->deferred = !fragment && !dynamic && !script->asynchronous && (module || (src && *src && node_attr(n, "defer")));
     if (src && *src) {
         if (module) {
-            begin_task(s); script->url = module_url(s, "moduleURL", src, s->doc->base);
+            begin_task(s); script->url = script_src_url(s, src);
             if (!script->url) { script->ready = script->failed = true; exception(s); }
             end_task(s);
         } else {
-            /* The generic native resolver rewrites backslashes even for opaque
-             * URLs and may truncate. Use the script-private WHATWG URL binding. */
-            begin_task(s); script->url=module_url(s,"moduleURL",src,s->doc->base);
+            begin_task(s); script->url=script_src_url(s,src);
             if (!script->url) { script->ready=script->failed=true; exception(s); }
             end_task(s);
         }
@@ -6726,7 +6746,7 @@ static void queue_modulepreload(struct web_js_state *s,node_t *node) {
     if(recognized_as&&!str_ieq(as,"script")){
         script_event(s,node,true);link->notified=true;return;
     }
-    char *url=module_url(s,"moduleURL",href,s->doc->base);
+    char *url=script_src_url(s,href);
     if(!url){if(JS_HasException(s->ctx))exception(s);link->notified=true;return;}
     const char *cors=node_attr(node,"crossorigin");
     link->module=request_module(s,url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(node,"integrity"),
@@ -7876,6 +7896,18 @@ void web_js_focus_control(web_doc *d, node_t *n) {
         struct web_event e={.type="focus",.related_target=old}; web_js_dispatch(d,actual,&e);
         if(d->focus==actual) {e.type="focusin";e.bubbles=true;web_js_dispatch(d,actual,&e);}
     }
+    /* A focused editing host takes the selection when it is elsewhere, so the
+       user's typing lands in it (js_document_commands.js decides). */
+    struct web_js_state *s=d->js;
+    if(actual && d->focus==actual && actual->type==N_ELEM && node_attr(actual,"contenteditable") &&
+       task_context_active(s) && !s->disabled) {
+        begin_named_task(s,"editing host focus",0);
+        JSValue argument=wrap(s,actual);
+        JSValue result=JS_IsException(argument)?JS_EXCEPTION:custom_element_hook(s,"editingFocus",1,&argument);
+        if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
+        JS_FreeValue(s->ctx,argument);
+        end_task(s);
+    }
 }
 static bool child_event_coordinates(web_doc *outer,web_doc *child,const struct web_event *event,struct web_event *local) {
     if(!outer || !child || !event || !child->frame_element || !child->frame_element->box)return false;
@@ -7976,6 +8008,41 @@ bool web_js_input_event(web_doc *d,node_t *target,const char *type,const char *i
     if(!task_context_active(s)||d->root!=generation||target->owner!=d||doc_node_root(target,true)!=d->root)allowed=false;
     if(!strcmp(type,"beforeinput")&&s->host.navigation_pending&&s->host.navigation_pending(s->host.opaque))allowed=false;
     return allowed;
+}
+/* The user's own edit of an editing host (doc.c's editing keys, the browser's
+   clipboard keys): one task of the realm's, in which the editing layer fires
+   beforeinput, takes the action through the same command execCommand runs, and
+   fires input. 1 when it took the key, 0 when no editing host has the selection. */
+int web_js_editing_action(web_doc *d,const char *action,bool extend,const char *data,size_t length) {
+    struct web_js_state *s=d?d->js:NULL;
+    if(!d||!d->live||d->inert||!action||!task_context_active(s)||s->disabled||s->running)return 0;
+    begin_named_task(s,"native editing",0);
+    JSValue args[]={JS_NewString(s->ctx,action),JS_NewBool(s->ctx,extend),data?JS_NewStringLen(s->ctx,data,length):JS_NULL};
+    JSValue result=JS_EXCEPTION;int handled=0;
+    if(!JS_IsException(args[0])&&!JS_IsException(args[2]))result=custom_element_hook(s,"editingAction",3,args);
+    if(JS_IsException(result))exception(s);else{handled=JS_ToBool(s->ctx,result)>0;JS_FreeValue(s->ctx,result);}
+    for(int i=0;i<3;i++)JS_FreeValue(s->ctx,args[i]);
+    end_task(s);
+    if(handled)d->dirty=true;
+    return handled;
+}
+/* The text of the document's selection (Selection's stringifier), for the
+   browser's copy key; malloc owned, NULL when nothing is selected. */
+char *web_js_selection_text(web_doc *d,size_t *length) {
+    if(length)*length=0;
+    struct web_js_state *s=d?d->js:NULL;
+    if(!d||!d->live||d->inert||!task_context_active(s)||s->disabled||s->running)return NULL;
+    begin_named_task(s,"native selection text",0);
+    JSValue result=custom_element_hook(s,"selectionText",0,NULL);
+    char *text=NULL;
+    if(JS_IsException(result))exception(s);
+    else{
+        size_t size=0;const char *value=JS_IsString(result)?JS_ToCStringLen(s->ctx,&size,result):NULL;
+        if(value&&size&&(text=malloc(size+1))){memcpy(text,value,size);text[size]=0;if(length)*length=size;}
+        JS_FreeCString(s->ctx,value);JS_FreeValue(s->ctx,result);
+    }
+    end_task(s);
+    return text;
 }
 bool web_media_activate(web_doc *d, web_node *target) {
     struct web_js_state *s = d ? d->js : NULL;
@@ -8853,6 +8920,7 @@ void web_js_prepare(void) {
     platform_prepare(&bindings_program);
     platform_prepare(&locale_program);
     platform_prepare(&webaudio_program);
+    platform_prepare(&editing_program);
 }
 /* Where running a platform program went: waiting for the compiler, reading
    (or, without one, compiling) the bytecode, and running it. */
@@ -8907,6 +8975,24 @@ static JSValue native_locale(JSContext *ctx, JSValueConst this_val, int argc, JS
         char message[160];
         snprintf(message, sizeof message, "Locale program: compiler wait %llu, read %llu ms; heap +%zu KiB",
                  (unsigned long long)profile.wait_ms, (unsigned long long)profile.read_ms,
+                 (after > before ? after - before : 0) / 1024);
+        log_text(s,WEB_CONSOLE_TRACE, message);
+    }
+    return fn;
+}
+/* js_editing.js's function in this realm; js_document_commands.js calls it once,
+   the first time a command or an editing key needs the editing layer. */
+static JSValue native_editing(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    struct web_js_state *s = state(ctx);
+    size_t before = s->runtime_owner->allocation.current;
+    struct bindings_profile profile = {0};
+    JSValue fn = platform_run(ctx, &editing_program, &profile);
+    if (s->host.debug_js) {
+        size_t after = s->runtime_owner->allocation.current;
+        char message[160];
+        snprintf(message, sizeof message, "Editing program: compiler wait %llu, read %llu, run %llu ms; heap +%zu KiB",
+                 (unsigned long long)profile.wait_ms, (unsigned long long)profile.read_ms, (unsigned long long)profile.run_ms,
                  (after > before ? after - before : 0) / 1024);
         log_text(s,WEB_CONSOLE_TRACE, message);
     }
@@ -9007,7 +9093,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),
         JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
         JS_CFUNC_DEF("inputListener",2,native_input_listener),JS_CFUNC_DEF("storageListener",1,native_storage_listener),
-        JS_CFUNC_DEF("locale",0,native_locale),
+        JS_CFUNC_DEF("locale",0,native_locale),JS_CFUNC_DEF("editing",0,native_editing),
         JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
         JS_CFUNC_DEF("svgGeometry",2,native_svg_geometry),
         JS_CFUNC_DEF("xpathCompile",2,native_xpath_compile),
@@ -9080,6 +9166,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     web_js_wasm_host_init(s->ctx, api);
     web_js_webgl_init(s->ctx, api, webgl_source);
     web_js_collator_init(s->ctx, api);
+    if (collections_native_init(s->ctx, api) < 0) { JS_FreeValue(s->ctx, api); goto failed; }
     JS_SetPropertyStr(s->ctx, api, "debugCanvasProbe", JS_NewBool(s->ctx,s->host.debug_js));
     JS_SetPropertyStr(s->ctx, api, "document", wrap(s, d->root));
     JSValue global = JS_GetGlobalObject(s->ctx);
