@@ -565,20 +565,47 @@ static JSValue native_cancel(JSContext *ctx,JSValueConst thisv,int argc,JSValueC
     return JS_UNDEFINED;
 }
 static JSValue native_referrer_policy(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){(void)self;(void)argc;(void)argv;return JS_NewInt32(ctx,state(ctx)->policy_doc.referrer_policy);}
-static JSValue native_import(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
-    (void)thisv;struct worker *w=state(ctx);if(!argc)return JS_ThrowTypeError(ctx,"URL required");if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");uint32_t id=++w->request;if(!send_value(w,NJW_LOAD,id,1,argv[0]))return JS_ThrowTypeError(ctx,"Worker import IPC failed");
-    uint64_t wait_start=n_clock_uptime_ms(),deadline=wait_start+WEBNET_TIMEOUT_MS;
-    while(!w->closed){uint64_t now=n_clock_uptime_ms();if(now>=deadline){send_value(w,NJW_CANCEL,id,0,JS_NULL);return JS_ThrowTypeError(ctx,"Worker import deadline exceeded");}uint64_t left=deadline-now;int timeout=left>(uint64_t)INT_MAX?INT_MAX:(int)left;struct deferred*d=NULL;
+/* The NJW_LOADED that answers request id, while this worker's event loop pauses: every other
+ * record waits in its task queue (transport credit is applied). importScripts waits so, and a
+ * synchronous XMLHttpRequest's send() (https://xhr.spec.whatwg.org/#the-send()-method, "pause").
+ * At deadline (an uptime; UINT64_MAX for none) the parent is told to cancel and *timed_out is set.
+ * NULL with an exception when the worker closed or its channel failed. The paused time does not
+ * count against the running task's deadline. */
+static struct deferred *loaded_wait(JSContext *ctx,struct worker *w,uint32_t id,uint64_t deadline,bool *timed_out){
+    uint64_t wait_start=n_clock_uptime_ms();*timed_out=false;
+    while(!w->closed){uint64_t now=n_clock_uptime_ms();if(now>=deadline){send_value(w,NJW_CANCEL,id,0,JS_NULL);*timed_out=true;return NULL;}uint64_t left=deadline-now;int timeout=left>(uint64_t)INT_MAX?INT_MAX:(int)left;struct deferred*d=NULL;
         if(w->shared){
             struct deferred**at=&w->head;while(*at&&((*at)->h.op!=NJW_LOADED||(*at)->h.request!=id))at=&(*at)->next;
             if(*at){d=*at;*at=d->next;w->queued-=d->h.bytes;w->tail=NULL;for(struct deferred*p=w->head;p;p=p->next)w->tail=p;d->next=NULL;}
             else d=shared_receive(w,timeout);
             if(!d)continue;if(!shared_incoming(w,d)){deferred_free(d);continue;}
-        }else{if(!dedicated_wait(w,timeout))return JS_ThrowTypeError(ctx,"Worker import wait failed");if(w->output)output_flush(w);if(w->closed)break;bool failed=false;d=receive(w,&failed);if(failed){w->closed=true;return JS_ThrowTypeError(ctx,"Worker import channel closed");}if(!d)continue;}
+        }else{if(!dedicated_wait(w,timeout)){JS_ThrowTypeError(ctx,"Worker wait failed");return NULL;}if(w->output)output_flush(w);if(w->closed)break;bool failed=false;d=receive(w,&failed);if(failed){w->closed=true;JS_ThrowTypeError(ctx,"Worker channel closed");return NULL;}if(!d)continue;}
         if(d->h.op==NJW_CREDIT){transport_credit(w,d);deferred_free(d);continue;}
-        if(d->h.op==NJW_LOADED&&d->h.request==id){if(w->until!=UINT64_MAX)w->until+=n_clock_uptime_ms()-wait_start;JSValue result=JS_ReadObject(ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE);deferred_free(d);return result;}
-        if(d->h.bytes>SIZE_MAX-w->queued){deferred_free(d);return JS_ThrowRangeError(ctx,"Worker deferred message accounting overflow");}w->queued+=d->h.bytes;if(w->tail)w->tail->next=d;else w->head=d;w->tail=d;
-    }return JS_ThrowTypeError(ctx,"Worker closed");
+        if(d->h.op==NJW_LOADED&&d->h.request==id){if(w->until!=UINT64_MAX)w->until+=n_clock_uptime_ms()-wait_start;return d;}
+        if(d->h.bytes>SIZE_MAX-w->queued){deferred_free(d);JS_ThrowRangeError(ctx,"Worker deferred message accounting overflow");return NULL;}w->queued+=d->h.bytes;if(w->tail)w->tail->next=d;else w->head=d;w->tail=d;
+    }JS_ThrowTypeError(ctx,"Worker closed");return NULL;
+}
+static JSValue native_import(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
+    (void)thisv;struct worker *w=state(ctx);if(!argc)return JS_ThrowTypeError(ctx,"URL required");if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");uint32_t id=++w->request;if(!send_value(w,NJW_LOAD,id,1,argv[0]))return JS_ThrowTypeError(ctx,"Worker import IPC failed");
+    bool timed_out;struct deferred*d=loaded_wait(ctx,w,id,n_clock_uptime_ms()+WEBNET_TIMEOUT_MS,&timed_out);
+    if(!d)return timed_out?JS_ThrowTypeError(ctx,"Worker import deadline exceeded"):JS_EXCEPTION;
+    JSValue result=JS_ReadObject(ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE);deferred_free(d);return result;
+}
+/* requestWait(id, timeout): the answer to request(query, false)'s fetch id, for a synchronous
+ * XMLHttpRequest: [NJW_LOADED's record, its NJW_LOADED_* flags], or null when timeout ms (0: none)
+ * passed first and the parent was told to cancel. */
+static JSValue native_request_wait(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
+    (void)thisv;struct worker *w=state(ctx);uint32_t id;double timeout=0;
+    if(argc<2||JS_ToUint32(ctx,&id,argv[0])<0||JS_ToFloat64(ctx,&timeout,argv[1])<0)return JS_EXCEPTION;
+    if(!id||id>w->request)return JS_ThrowTypeError(ctx,"Worker request identifier required");
+    if(!(timeout>=0))return JS_ThrowRangeError(ctx,"Invalid synchronous request timeout");
+    uint64_t now=n_clock_uptime_ms(),deadline=timeout<1?UINT64_MAX:timeout>=(double)(UINT64_MAX-now)?UINT64_MAX:now+(uint64_t)timeout;
+    bool timed_out;struct deferred*d=loaded_wait(ctx,w,id,deadline,&timed_out);
+    if(!d)return timed_out?JS_NULL:JS_EXCEPTION;
+    JSValue record=JS_ReadObject(ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE),out=JS_IsException(record)?JS_EXCEPTION:JS_NewArray(ctx);uint32_t flags=d->h.kind;deferred_free(d);
+    if(JS_IsException(out)){JS_FreeValue(ctx,record);return out;}
+    if(JS_DefinePropertyValueUint32(ctx,out,0,record,JS_PROP_C_W_E)<0||JS_DefinePropertyValueUint32(ctx,out,1,JS_NewUint32(ctx,flags),JS_PROP_C_W_E)<0){JS_FreeValue(ctx,out);return JS_EXCEPTION;}
+    return out;
 }
 static int interrupt(JSRuntime *rt,void *opaque){
     (void)rt;struct worker*w=opaque;if(w->closed)return 1;
@@ -691,7 +718,7 @@ int main(int argc,char**argv){
         JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),
         JS_CFUNC_DEF("bufferTransferable",1,native_buffer_transferable),JS_CFUNC_DEF("pack",1,native_pack),JS_CFUNC_DEF("unpack",1,native_unpack),
         JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("promiseThen",3,native_promise_then),JS_CFUNC_DEF("promiseIsHandled",1,native_promise_is_handled),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),JS_CFUNC_DEF("referrerPolicy",0,native_referrer_policy),
-        JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",2,native_request),JS_CFUNC_DEF("resume",1,native_resume),JS_CFUNC_DEF("dataURL",1,native_data_url),JS_CFUNC_DEF("cancel",1,native_cancel),
+        JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",2,native_request),JS_CFUNC_DEF("requestWait",2,native_request_wait),JS_CFUNC_DEF("resume",1,native_resume),JS_CFUNC_DEF("dataURL",1,native_data_url),JS_CFUNC_DEF("cancel",1,native_cancel),
         JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};
     JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);
     web_js_encoding_init_isolated(w.ctx,host);web_js_url_init(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_webidl_init(w.ctx,host);web_js_crypto_init(w.ctx,host);web_js_compression_init(w.ctx,host);web_atomics_host_init(w.ctx,host);web_opfs_host_init(w.ctx,host,opfs_storage_url);web_idb_host_init(w.ctx,host,&worker_idb_realm);web_cache_host_init(w.ctx,host,&worker_idb_realm);web_js_wasm_host_init(w.ctx,host);web_js_webgl_init(w.ctx,host,NULL);

@@ -9,7 +9,7 @@
     const DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
     /* @include js_atob.js */
     const eventStates=new WeakMap(),listeners=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set;
-    const eventDefine=Object.defineProperty,eventCreate=Object.create,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventSlice=Array.prototype.slice;
+    const eventDefine=Object.defineProperty,eventCreate=Object.create,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventMapForEach=Map.prototype.forEach,eventSlice=Array.prototype.slice;
     const EventMap=Map,EventString=String,eventIndexOf=Array.prototype.indexOf,eventSplice=Array.prototype.splice;
     const eventString=value=>{if(typeof value==='symbol')throw new TypeError('Symbol is not a DOMString');return EventString(value);};
     function eventState(event){const s=apply(eventGet,eventStates,[event]);if(!s)throw new TypeError('Illegal Event receiver');return s;}
@@ -110,21 +110,27 @@
     }
     function dispatchNativeWorkerEvent(object,event,snapshot){eventState(event).isTrusted=true;return dispatchWorkerEvent(object,event,snapshot);}
     Object.assign(globalThis,{DOMException,QuotaExceededError,Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,EventTarget});
-    const progressSlots=new WeakMap();
-    class ProgressEvent extends Event{
-        constructor(type,init={}){init=init==null?{}:Object(init);super(type,init);const number=v=>{const n=Number(v)||0;return Number.isFinite(n)?Number(BigInt(Math.trunc(n))&18446744073709551615n):0;};apply(eventSet,progressSlots,[this,{lengthComputable:!!init.lengthComputable,loaded:number(init.loaded),total:number(init.total)}]);}
-        get lengthComputable(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.lengthComputable;}
-        get loaded(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.loaded;}
-        get total(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.total;}
-    }
+    /* XMLHttpRequest and ProgressEvent are the Window's (js_xhr.js); ProgressEvent is made here,
+       before FileReader (js_blob.js) takes it, the rest once this realm's Fetch exists. */
+    /* @include js_xhr.js */
+    const ProgressEvent=progressEventInterface(Event);
     Object.defineProperty(globalThis,'ProgressEvent',{value:ProgressEvent,writable:true,configurable:true});
-    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false;
+    let blobHandlerTarget=()=>false,indexedDBHandlerTarget=()=>false,xhrHandlerTarget=()=>false;
     const fileHandlers=new WeakMap();
     const dispatch=dispatchNativeWorkerEvent;
-    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type);
+    const handlerTarget=(value,type)=>blobHandlerTarget(value,type)||indexedDBHandlerTarget(value,type)||xhrHandlerTarget(value,type);
     function installHandlers(prototype,types){for(const type of types)eventDefine(prototype,'on'+type,{enumerable:true,configurable:true,
         get(){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
         set(value){if(!handlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}map[type]=typeof value==='function'?value:null;}});}
+    /* Whether one or more event listeners are registered on target, an event handler among them
+       (XMLHttpRequest's upload listener flag). */
+    function workerListened(target){
+        const handlers=apply(eventGet,fileHandlers,[target]);
+        if(handlers)for(const type in handlers)if(handlers[type])return true;
+        const m=apply(eventGet,listeners,[target]);let found=false;
+        if(m)apply(eventMapForEach,m,[list=>{for(let i=0;i<list.length;i++)if(!list[i].removed)found=true;}]);
+        return found;
+    }
     /* @include js_navigator.js */
     const {navigator,Interface:WorkerNavigator,languagesChanged}=navigatorBridge.create(true);
     /* @include js_encoding.js */
@@ -238,9 +244,13 @@
        parent has not ended is in fetches, by its request id. */
     const workerFetchTransport=(()=>{
         const apply=Reflect.apply,mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete,mapForEach=Map.prototype.forEach,mapClear=Map.prototype.clear,
-            setPrototype=Object.setPrototypeOf,NativePromise=Promise,NativeTypeError=TypeError,request=host.request,resume=host.resume,cancel=host.cancel;
+            setPrototype=Object.setPrototypeOf,NativePromise=Promise,NativeTypeError=TypeError,request=host.request,resume=host.resume,cancel=host.cancel,
+            requestWait=host.requestWait;
         const record=object=>setPrototype(object,null);
         const take=id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;};
+        /* An NJW_LOADED that is a network error: the parent's reason, no status, or an opaque
+           response to a request that did not ask for no-cors. */
+        const failed=(r,flags,noCors)=>r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!noCors);
         /* A fetch's end: its stream's (notify), then its promise's when no response was published. */
         function end(p,error){if(p.notify)p.notify(3,error);if(!p.published)p.reject(error===undefined?new NativeTypeError('Worker fetch failed'):error);}
         /* The response the parent delivered: NJW_LOADED's [status, url, headers, bytes] or a
@@ -265,7 +275,7 @@
             /* NJW_LOADED: a buffered response, or the error that ends any fetch. */
             loaded(id,r,flags){
                 const p=take(id);if(!p||closed)return;p.done=true;
-                if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
+                if(failed(r,flags,p.noCors)||p.notify){end(p,new NativeTypeError(r[4]||'Worker fetch failed'));return;}
                 try{p.published=true;p.resolve(response(r,flags,r[3]));}catch(error){p.reject(error);}
             },
             /* NJW_FRAME: one frame of a streamed fetch (the parent's process_fetch_frame order:
@@ -285,6 +295,18 @@
             close(){
                 const list=[];apply(mapForEach,fetches,[p=>{list[list.length]=p;}]);apply(mapClear,fetches,[]);
                 for(let i=0;i<list.length;i++){list[i].done=true;try{end(list[i],new DOMException('Worker closed','AbortError'));}catch(error){report(error);}}
+            },
+            /* A synchronous XMLHttpRequest's fetch, unstreamed: browserjsworker.c's requestWait
+               pauses this worker's event loop (other records wait in its task queue) until the
+               parent's NJW_LOADED, or until timeout ms (0: none) pass, when it tells the parent to
+               cancel and gives null. */
+            fetchSync(q,timeout){
+                if(closed)throw new NativeTypeError('Worker closed');
+                const answer=apply(requestWait,host,[apply(request,host,[q,false]),timeout]);
+                if(answer===null)return null;
+                const r=answer[0],flags=answer[1];
+                if(failed(r,flags,q.noCors))throw new NativeTypeError(r[4]||'Worker fetch failed');
+                return response(r,flags,r[3]);
             }
         };
     })();
@@ -301,6 +323,13 @@
     })();
     fetchBridge.initialize();fetchBridge.initializeStreams(streamBridge);fetchBridge.initializeBlobs(blobBridge);
     const {Headers,Request,Response,fetch}=fetchBridge;
+    /* This Worker's XMLHttpRequest: its Fetch, open()'s URL against its API base URL in UTF-8, no
+       documents; its event loop pauses for a synchronous request (workerFetchTransport.fetchSync). */
+    const xhr=xhrInterfaces({fetch:fetchBridge,parseURL:url=>urlBridge.encodingParse(url,address,'UTF-8'),listened:workerListened,
+        log:text=>host.send(7,0,{message:text,filename:address}),document:null,synchronous:true});
+    xhrHandlerTarget=xhr.handlerTarget;
+    for(const name of ['XMLHttpRequest','XMLHttpRequestUpload','XMLHttpRequestEventTarget'])
+        Object.defineProperty(globalThis,name,{value:xhr[name],writable:true,configurable:true});
     /* @include js_performance.js */
     /* @include js_console.js */
     Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Request,Response,AbortSignal,AbortController,fetch,

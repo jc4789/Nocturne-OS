@@ -6,9 +6,11 @@
      realm.transport  the native transport that carries a request: noCors(), streaming(),
                       fetch(query, notify) -> {id, promise}, resume(id), cancel(id), and
                       keepaliveRoom() (the bytes the realm's fetch group can still take into its
-                      inflight keepalive bodies; a Window's only, for Beacon). A Window's is
-                      js.c's (host.fetch); a Worker's is its parent window's, through
-                      browserjsworker.c, js_worker.c and js.c (NJW_LOAD, NJW_FRAME, NJW_RESUME).
+                      inflight keepalive bodies; a Window's only, for Beacon), and fetchSync(query,
+                      timeout) -> a Response or null (a Worker's only: its event loop pauses for a
+                      synchronous XMLHttpRequest). A Window's is js.c's (host.fetch); a Worker's
+                      is its parent window's, through browserjsworker.c, js_worker.c and js.c
+                      (NJW_LOAD, NJW_FRAME, NJW_RESUME).
      realm.baseURL(), origin(), clientReferrer(), referrerPolicy(), url()
                       the realm's settings object: API base URL, origin, the "client" referrer
                       source and its referrer policy (enum webnet_referrer_policy).
@@ -593,6 +595,13 @@ function fetchInterfaces(realm) {
     for(const name of ['type','url','redirected','status','statusText','headers'])define(Response.prototype,name,{configurable:true,enumerable:true,get(){return slot(responseSlots,this,'Response')[name];}});
     installBody(Request.prototype);installBody(Response.prototype);
     const urlWithoutFragment=url=>{const hash=indexOf(url,'#');return hash<0?url:slice(url,0,hash);};
+    /* Fetch "scheme fetch" for data: (the realm's own data: URL processor): a basic 200 response. */
+    function dataResponse(s) {
+        const local=realm.dataURL(s.url),bytes=s.method==='HEAD'?null:local[0];
+        const headers=makeHeaders(undefined,'immutable');add(headerSlots.get(headers).list,pair('content-type',local[1]));
+        return responseObject({status:200,statusText:'OK',url:urlWithoutFragment(s.url),
+            headers,redirected:false,type:'basic'},{bytes,used:false,abort:s.signal});
+    }
     function dataFetch(s,body,integrity,observer) {
         if(body.bytes!==null)body.used=true;
         return new NativePromise((resolve,reject)=>{
@@ -609,10 +618,7 @@ function fetchInterfaces(realm) {
             unfollow=signals.follow(s.signal,fail);
             try {
                 schedule(()=>{
-                    const local=realm.dataURL(s.url),bytes=s.method==='HEAD'?null:local[0];
-                    const headers=makeHeaders(undefined,'immutable');add(headerSlots.get(headers).list,pair('content-type',local[1]));
-                    const response=responseObject({status:200,statusText:'OK',url:urlWithoutFragment(s.url),
-                        headers,redirected:false,type:'basic'},{bytes,used:false,abort:s.signal});
+                    const response=dataResponse(s),bytes=bodySlots.get(response).bytes;
                     verifyIntegrity(response,integrity,s.signal);
                     if(!observer){done=true;unfollow();resolve(response);return;}
                     const end=()=>{if(done)return;done=true;unfollow();observer('end',undefined,()=>{});};
@@ -625,18 +631,21 @@ function fetchInterfaces(realm) {
         });
     }
     /* prepared: input is a Request this bridge made for the fetch (Cache Storage's addAll), fetched
-       as it is, without the Request constructor's steps for init. */
-    function fetchCore(input,init,observer,forcePreflight=false,destination='',prepared=false) {
+       as it is, without the Request constructor's steps for init.
+       sync: a synchronous XMLHttpRequest's {timeout} (ms, 0 for none). The realm's event loop
+       pauses in transport.fetchSync until the response is whole; the result is the Response, null
+       when timeout passed first, and a network error throws. */
+    function fetchCore(input,init,observer,forcePreflight=false,destination='',prepared=false,sync=null) {
         let r,s,b,integrity;
         try {
             r=prepared?input:new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
             if(destination)s.destination=destination;
-            if(signals.aborted(s.signal))return reject(signals.reason(s.signal));
+            if(signals.aborted(s.signal))throw signals.reason(s.signal);
             integrity=s.integrity?integrityMetadata(s.integrity):null;
             // Fetch main fetch selects data before same-origin/no-cors/CORS
             // checks. Local data has a basic response and no HTTP transport,
             // redirect, cache miss, preflight, cookie, or request-header wire.
-            if(beginsWith(s.url,'data:'))return dataFetch(s,b,integrity,observer);
+            if(beginsWith(s.url,'data:'))return sync?verifyIntegrity(dataResponse(s),integrity,s.signal):dataFetch(s,b,integrity,observer);
             // Referrer policy/source are private native metadata, never part
             // of author headers or CORS preflight header classification.
             const noReferrer=s.referrer===''||s.referrerPolicy==='no-referrer';
@@ -647,6 +656,7 @@ function fetchInterfaces(realm) {
                 const local=objectURLAPI.fetch(s.url,s.method,headerValue(headerSlots.get(s.headers),'range')),headers=makeHeaders(undefined,'immutable'),list=headerSlots.get(headers).list;
                 add(list,pair('content-type',local.type));add(list,pair('content-length',NativeString(local.size)));if(local.range)add(list,pair('content-range',local.range));
                 const response=responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:urlWithoutFragment(s.url),headers,redirected:false,type:'basic'},{bytes:s.method==='HEAD'?null:local.bytes,used:false,abort:s.signal});
+                if(sync)return verifyIntegrity(response,integrity,s.signal);
                 return new NativePromise(resolve=>resolve(verifyIntegrity(response,integrity,s.signal)));
             }
             if(s.mode==='no-cors'&&!transport.noCors())throw notSupported('This native context has no no-cors transport');
@@ -661,7 +671,7 @@ function fetchInterfaces(realm) {
             /* Integrity responses must be fully verified before either their
                headers/Response or body stream is exposed. Requests without
                metadata retain the existing native streaming flow control. */
-            if(transport.streaming()&&streams&&!integrity){
+            if(!sync&&transport.streaming()&&streams&&!integrity){
                 channel=streams.network(()=>new NativePromise(resolve=>{waiting=resolve;resume();}),reason=>{
                     if(done)return;done=true;finishStream();transport.cancel(transportId);
                     if(waiting){const resolve=waiting;waiting=null;resolve();}
@@ -697,10 +707,23 @@ function fetchInterfaces(realm) {
                 }
                 return false;
             }:undefined;
-            started=transport.fetch(record({url:s.url,method:s.method,headers:raw,body:b.bytes,sameOrigin:s.mode==='same-origin',
+            const query=record({url:s.url,method:s.method,headers:raw,body:b.bytes,sameOrigin:s.mode==='same-origin',
                 credentials:position(credentialModes,s.credentials),forcePreflight:forcePreflight||s.preflight,redirectError:s.redirect==='error',
                 cache:position(cacheModes,s.cache),keepalive:s.keepalive,noCors:s.mode==='no-cors',noReferrer,referrer,referrerPolicy,
-                destination:s.destination}),notify);
+                destination:s.destination});
+            /* The response the transport delivered: its request's signal, HEAD's null body, integrity. */
+            const settle=response=>{
+                const state=slot(bodySlots,response,'Body');state.abort=s.signal;
+                if(s.method==='HEAD')state.bytes=null;
+                return verifyIntegrity(response,integrity,s.signal);
+            };
+            if(sync){
+                if(!transport.fetchSync)throw notSupported('This realm cannot pause for a synchronous fetch');
+                if(b.bytes!==null)b.used=true;
+                const response=transport.fetchSync(query,sync.timeout);
+                return response===null?null:settle(response);
+            }
+            started=transport.fetch(query,notify);
             transportId=started.id;const transportPromise=started.promise;started=null;
             if(observer&&realm.initiator)realm.initiator(transportId);
             if(b.bytes!==null)b.used=true;
@@ -714,16 +737,12 @@ function fetchInterfaces(realm) {
                     define(transportPromise,'constructor',{value:promiseConstructor});
                     apply(then,transportPromise,[response=>{
                         if(finished)return;finished=true;pendingReject=null;if(!notify)cleanup();
-                        try {
-                            const state=slot(bodySlots,response,'Body');state.abort=s.signal;
-                            if(s.method==='HEAD')state.bytes=null;
-                            resolve(verifyIntegrity(response,integrity,s.signal));
-                        }catch(e){reject(e);}
+                        try{resolve(settle(response));}catch(e){reject(e);}
                     },error=>{if(finished)return;finished=true;done=true;cleanup();reject(error);}]);
                 }catch(e){finished=true;done=true;cleanup();const active=liveChannel();if(active)active.error(e);transport.cancel(transportId);pendingReject=null;reject(e);}
                 if(signals.aborted(s.signal))abort(signals.reason(s.signal));
             });
-        }catch(e){return reject(e);}
+        }catch(e){if(sync)throw e;return reject(e);}
     }
     function fetch(input,init=undefined){if(!arguments.length)return reject(new TypeError('fetch requires input'));return fetchCore(input,init);}
     for(const [C,name]of [[Headers,'Headers'],[Request,'Request'],[Response,'Response']]) {
@@ -779,11 +798,22 @@ function fetchInterfaces(realm) {
             const bytes=b.bytes===null?new AB(0):b.bytes;b.bytes=null;b.used=true;
             return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers,bytes};
         },
-        /* XHR's own request: init and its header record are the engine's, read without a prototype. */
+        /* XHR's own request (js_xhr.js): init and its header record are the engine's, read without a
+           prototype. observed: whether the observer gets the response's headers, chunks and end
+           (a data: URL's local fetch, a streaming transport's frames); otherwise the promise
+           brings the whole response (a blob: URL, a transport that buffers). */
         xhrFetch(url,init,observer,forcePreflight){
             const c=signals.controller(),q=record({...init,signal:c.signal});
             if(q.headers!==null&&typeof q.headers==='object')q.headers=record({...q.headers});
-            return {promise:fetchCore(url,q,observer,forcePreflight),cancel(){c.abort();}};
+            const observed=beginsWith(url,'data:')||(!(objectURLAPI&&beginsWith(url,'blob:'))&&transport.streaming()&&!!streams);
+            return {promise:fetchCore(url,q,observer,forcePreflight),cancel(){c.abort();},observed};
+        },
+        /* A synchronous XHR's request (fetchCore's sync): the Response, null when timeout ms passed
+           first. Only a realm whose transport has fetchSync can pause for it. */
+        xhrFetchSync(url,init,forcePreflight,timeout){
+            const q=record({...init,signal:signals.controller().signal});
+            if(q.headers!==null&&typeof q.headers==='object')q.headers=record({...q.headers});
+            return fetchCore(url,q,undefined,forcePreflight,'',false,record({timeout}));
         },
         xhrMetadata(response){const s=slot(responseSlots,response,'Response');return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers};},
         /* Cache Storage's view of this realm's Fetch objects (js_cache_storage.js): a record of a
