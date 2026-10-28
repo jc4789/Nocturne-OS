@@ -3,9 +3,12 @@
  * XPathEvaluatorBase. Parsing and evaluation are native (xpath.c, through
  * js_xpath_native.h's host.xpathCompile and the xpath DOM operation); this file
  * owns argument conversion, the XPathNSResolver callback interface and each
- * result's state. [Exposed=Window] only. Include after js_document.js. */
+ * result's state; js_webidl.c gives the interfaces their Web IDL shape (constants,
+ * class strings, names, lengths, enumerability). [Exposed=Window] only. Include
+ * after js_document.js. */
 (() => {
     const apply=Reflect.apply, define=Object.defineProperty, createObject=Object.create, isArray=Array.isArray;
+    const ownKeys=Reflect.ownKeys, ownDescriptor=Reflect.getOwnPropertyDescriptor;
     const StringImpl=String, NumberImpl=Number, TypeErr=TypeError, DOMExceptionImpl=DOMException;
     const WeakMapImpl=WeakMap, weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set;
     const WeakSetImpl=WeakSet, setHas=WeakSet.prototype.has, setAdd=WeakSet.prototype.add;
@@ -14,9 +17,6 @@
     const results=new WeakMapImpl(), expressions=new WeakMapImpl(), evaluators=new WeakSetImpl();
     const NUMBER=1, STRING=2, BOOLEAN=3, UNORDERED_ITERATOR=4, ORDERED_ITERATOR=5,
         UNORDERED_SNAPSHOT=6, ORDERED_SNAPSHOT=7, ANY_UNORDERED=8, FIRST_ORDERED=9;
-    const constants=['ANY_TYPE','NUMBER_TYPE','STRING_TYPE','BOOLEAN_TYPE','UNORDERED_NODE_ITERATOR_TYPE',
-        'ORDERED_NODE_ITERATOR_TYPE','UNORDERED_NODE_SNAPSHOT_TYPE','ORDERED_NODE_SNAPSHOT_TYPE',
-        'ANY_UNORDERED_NODE_TYPE','FIRST_ORDERED_NODE_TYPE'];
 
     /* Web IDL conversions. */
     function domString(value){
@@ -164,23 +164,14 @@
     class XPathEvaluator {
         constructor(){apply(setAdd,evaluators,[this]);}
     }
-    function members(target,source){
-        for(const key of Object.getOwnPropertyNames(source))if(key!=='constructor'){
-            const descriptor=Object.getOwnPropertyDescriptor(source,key);
-            define(target,key,{...descriptor,enumerable:true,configurable:true});
-        }
+    /* The mixin's members: each interface gets functions of its own. */
+    function includes(target,source){
+        for(const key of ownKeys(source))define(target,key,ownDescriptor(source,key));
     }
-    members(XPathEvaluator.prototype,evaluatorBase(receiver=>{
+    includes(XPathEvaluator.prototype,evaluatorBase(receiver=>{
         if(!apply(setHas,evaluators,[receiver]))throw new TypeErr('Illegal XPathEvaluator receiver');
     }));
-    members(Document.prototype,evaluatorBase(brandDocument));
-    for(const C of [XPathResult,XPathExpression])members(C.prototype,C.prototype);
-    constants.forEach((name,value)=>{
-        for(const target of [XPathResult,XPathResult.prototype])
-            define(target,name,{value,writable:false,enumerable:true,configurable:false});
-    });
-    for(const C of [XPathResult,XPathExpression,XPathEvaluator]){
-        define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
-        define(globalThis,C.name,{value:C,writable:true,enumerable:false,configurable:true});
-    }
+    includes(Document.prototype,evaluatorBase(brandDocument));
+    for(const C of [XPathResult,XPathExpression,XPathEvaluator])
+        define(globalThis,C.name,{value:C,writable:true,configurable:true});
 })();

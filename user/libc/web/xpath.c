@@ -9,11 +9,6 @@
 #include <stdio.h>
 #include "dtoa.h"
 
-#define XP_NS_HTML "http://www.w3.org/1999/xhtml"
-#define XP_NS_SVG "http://www.w3.org/2000/svg"
-#define XP_NS_MATHML "http://www.w3.org/1998/Math/MathML"
-#define XP_NS_XML "http://www.w3.org/XML/1998/namespace"
-#define XP_NS_XMLNS "http://www.w3.org/2000/xmlns/"
 /* Native stack the recursive parser and evaluator may use below their entry
    frame; deeper nesting is refused instead of overflowing the thread stack. */
 #define XP_STACK_BUDGET (256u * 1024u)
@@ -25,30 +20,24 @@ static bool xp_stack_exhausted(const char *base) {
 
 /* ---------------------------------------------------------------- the DOM's names */
 /* An element's namespace, prefix, local name and qualified name as the DOM
-   reports them (js.c namespaceURI and localName). Elements carry no DOM prefix
-   in this DOM, so an element's qualified name is its local name. */
-static const char *xp_element_namespace(const node_t *n) {
-    switch (n->namespace_id) {
-    case NS_HTML: return XP_NS_HTML;
-    case NS_SVG: return XP_NS_SVG;
-    case NS_MATHML: return XP_NS_MATHML;
-    default: return NULL;
-    }
+   reports them (js.c namespaceURI, prefix, localName and the qualified name
+   tagName starts from). */
+static const char *xp_element_namespace(const node_t *n) { return doc_element_namespace(n); }
+static const char *xp_element_prefix(const node_t *n) { return n->prefix; }
+static const char *xp_element_local(const node_t *n) {
+    return n->local_name ? n->local_name : n->foreign ? n->raw_name : n->name;
 }
-static const char *xp_element_prefix(const node_t *n) { (void)n; return NULL; }
-static const char *xp_element_local(const node_t *n) { return n->foreign ? n->raw_name : n->name; }
-static const char *xp_element_qualified(const node_t *n) { return xp_element_local(n); }
-/* DOM "HTML document". Every Document this DOM creates is one: contentType is
-   text/html, and DOMImplementation.createDocument and the XML parser are not
-   implemented. An XML document's type is to be read here. */
-static bool xp_html_document(const web_doc *d) { (void)d; return true; }
+static const char *xp_element_qualified(const node_t *n) { return n->raw_name ? n->raw_name : n->name; }
+/* DOM "HTML document": a document that is not an XML document. The context
+   node's document decides (HTML: "If the context node is from an HTML DOM"). */
+static bool xp_html_document(const web_doc *d) { return d && !d->xml; }
 /* DOM: names given to an HTML-namespace element of an HTML document, its tag
    and attribute names, are compared in ASCII lowercase. */
 static bool xp_html_names(const node_t *n) { return n->namespace_id == NS_HTML && xp_html_document(n->owner); }
 static const char *xp_attr_local(const struct attr *a) { return a->local ? a->local : a->raw; }
 /* DOM Level 3 XPath 1.2.2: namespace declarations are not attribute nodes. */
 static bool xp_namespace_declaration(const struct attr *a) {
-    return a->namespace_uri && !strcmp(a->namespace_uri, XP_NS_XMLNS);
+    return a->namespace_uri && !strcmp(a->namespace_uri, WEB_NS_XMLNS);
 }
 /* Equal nullable strings: namespaces and namespace prefixes. */
 static bool xp_same(const char *a, const char *b) { return a ? b && !strcmp(a, b) : !b; }
@@ -1095,7 +1084,7 @@ static bool xp_test(const struct xp_eval *e, const struct xp_step *s, const stru
     const char *ns = xp_element_namespace(n);
     if (s->test == NT_NS_ANY) return xp_same(ns, s->ns);
     /* HTML: an unprefixed name test means the default element namespace. */
-    return xp_same(ns, s->prefixed ? s->ns : e->html ? XP_NS_HTML : NULL) &&
+    return xp_same(ns, s->prefixed ? s->ns : e->html ? WEB_NS_HTML : NULL) &&
            xp_name_is(xp_element_local(n), xp_html_names(n) ? s->lower : s->local, s->local_length);
 }
 /* Adds an axis match; false ends the walk, with axis_full set when the walk
@@ -1155,7 +1144,7 @@ static bool xp_namespace_nodes(struct xp_eval *e, const struct xp_step *s, node_
             else if (!a->prefix && !strcmp(local, "xmlns")) ok = xp_bind(e, &v, &n, &cap, NULL, a->value);
         }
     }
-    if (ok) ok = xp_bind(e, &v, &n, &cap, "xml", XP_NS_XML);
+    if (ok) ok = xp_bind(e, &v, &n, &cap, "xml", WEB_NS_XML);
     int32_t index = 0;
     for (size_t i = 0; ok && i < n; i++) {
         if (!v[i].uri || !*v[i].uri || (v[i].prefix && !strcmp(v[i].prefix, "xmlns"))) continue;
@@ -1565,7 +1554,7 @@ static bool xp_step_eval(struct xp_eval *e, const struct xp_step *s, const struc
             ok = xp_axis(e, s, x, &part) || e->axis_full;
             e->axis_limit = 0;
         }
-        for (int k = 0; ok && k < s->npredicates; k++) ok = xp_predicate(e, s->predicates[k], &part);
+        for (int k = 0; ok && part.n && k < s->npredicates; k++) ok = xp_predicate(e, s->predicates[k], &part);
         if (!ok) break;
         if (reverse)
             for (size_t a = 0, b = part.n; a + 1 < b; a++, b--) {
@@ -1608,7 +1597,7 @@ static bool xp_lang(const struct xp_node *x, const struct xs *want) {
         if (n->type != N_ELEM) continue;
         for (int i = 0; i < n->nattrs; i++) {
             const struct attr *a = &n->attrs[i];
-            if (!a->namespace_uri || strcmp(a->namespace_uri, XP_NS_XML) || strcmp(xp_attr_local(a), "lang")) continue;
+            if (!a->namespace_uri || strcmp(a->namespace_uri, WEB_NS_XML) || strcmp(xp_attr_local(a), "lang")) continue;
             const char *value = a->value ? a->value : "";
             size_t length = strlen(value);
             if (length < want->n) return false;
@@ -1929,7 +1918,7 @@ static bool xp_eval(struct xp_eval *e, const struct xp_expr *x, const struct xp_
         struct xp_set set;
         if (!xp_eval_set(e, x->left, c, &set)) return false;
         /* A filter's predicates count positions along the child axis: document order. */
-        for (int k = 0; k < x->count; k++) if (!xp_predicate(e, x->items[k], &set)) { free(set.v); return false; }
+        for (int k = 0; set.n && k < x->count; k++) if (!xp_predicate(e, x->items[k], &set)) { free(set.v); return false; }
         out->type = XT_NODESET; out->set = set;
         return true;
     }
