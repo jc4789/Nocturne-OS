@@ -4840,8 +4840,17 @@ static void scroll_area_publish(box_t *b) {
        x(b)-x(cb) = b.x+b.rel_dx; y(b)-y(cb) additionally has cb.content_dy.
        Do not walk that same ancestor chain four times for every box. Local
        coordinates also avoid losing small offsets beside a huge ancestor. */
-    float right = b->x + b->rel_dx - b->p[3] + bw + b->b[1] + b->m[1] + cb->p[3] + cb->p[1];
-    float bottom = b->y + b->rel_dy + cb->content_dy - b->p[0] + bh + b->b[2] + b->m[2] + cb->p[0] + cb->p[2];
+    /* "Scrollable overflow area" (CSS Overflow 3): b's border box with the overflow it carries,
+       and b's margin box followed by cb's end-side padding. A negative margin shrinks only the
+       second; a border box of zero area adds nothing of its own. */
+    float box_right = b->x + b->rel_dx - b->p[3] + bw + b->b[1] + cb->p[3];
+    float box_bottom = b->y + b->rel_dy + cb->content_dy - b->p[0] + bh + b->b[2] + cb->p[0];
+    float right = box_right + b->m[1] + cb->p[1];
+    float bottom = box_bottom + b->m[2] + cb->p[2];
+    if (bw + b->b[1] + b->b[3] > 0 && bh + b->b[0] + b->b[2] > 0) {
+        right = fmaxf_(right, box_right);
+        bottom = fmaxf_(bottom, box_bottom);
+    }
     /* CSS transforms extend, never shrink, the union of original and visual
        overflow. Descendant overflow has already propagated into b; add only
        b's own translation here, not its ancestors a second time. */

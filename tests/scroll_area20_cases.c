@@ -35,6 +35,15 @@ int main(void){
     check(near(cb.scroll_w,149)&&near(cb.scroll_h,182),"native mutation is recalculated directly without stale cache");
     cb.scroll_w=300;cb.scroll_h=400;scroll_area_publish(&b);
     check(near(cb.scroll_w,300)&&near(cb.scroll_h,400),"contribution preserves existing larger sibling overflow");
+    /* CSS Overflow 3: the border box counts whatever its margin; the margin box followed by the
+       end padding counts too (WPT scrollWidthHeight-negative-margin-002, horizontal-tb ltr). */
+    box_t wrap={.kind=B_BLOCK,.st=&style,.p={1,4,8,16},.scroll_w=100,.scroll_h=89};
+    box_t inner={.kind=B_BLOCK,.st=&style,.cb=&wrap,.parent=&wrap,.x=-100,.y=-100,.w=300,.h=300,.scroll_w=300,.scroll_h=300,.m={-100,-100,-100,-100}};
+    scroll_area_publish(&inner);
+    check(near(wrap.scroll_w,216)&&near(wrap.scroll_h,201),"negative margins do not shrink the border box's contribution");
+    box_t empty={.kind=B_BLOCK,.st=&style,.cb=&wrap,.parent=&wrap,.x=50,.y=300,.m={0,0,20,0}};
+    wrap.scroll_w=100;wrap.scroll_h=89;scroll_area_publish(&empty);
+    check(near(wrap.scroll_w,100)&&near(wrap.scroll_h,329),"a zero-area box adds only its margin box and the end padding");
     enum{DEPTH=4097};box_t *forest=calloc(DEPTH,sizeof *forest);
     if(!forest){printf("native allocation failed\n");return 1;}
     for(int i=0;i<DEPTH;i++){forest[i].kind=B_BLOCK;forest[i].st=&style;forest[i].x=3;forest[i].y=4;forest[i].content_dy=5;forest[i].scroll_w=1;forest[i].scroll_h=2;forest[i].cb=i?&forest[i-1]:NULL;}
