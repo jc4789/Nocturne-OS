@@ -9,6 +9,7 @@
 #include "cssom.h"
 #include "form_validation.h"
 #include "form_value.h"
+#include "script_animation_native.h"
 
 static int checks, failed;
 static void check(bool ok,const char *name) {
@@ -192,11 +193,13 @@ static void declaration_generation_paths(void) {
         !strcmp(owner->style->before->content,"second")&&!strcmp(owner->style->after->content,"second")&&
         child->style&&child->style->color==0xff0000ffu,
         "cache replacement recomputes child and both pseudo variable borrows");
-    check(css_animation_set(owner,PE_BEFORE,11,"color:lime")==1,"pseudo animation sample");
+    struct web_animation *lime=script_animation_hold(d,owner,PE_BEFORE,"color","lime");
+    check(lime!=NULL,"pseudo animation sample");
     css_mark_dirty(d,owner);web_layout(d,800,600);
+    /* the effect is on ::before alone: neither the element nor what its children inherit takes
+       the pseudo's animated body (its underlying body is checked when the effect goes, below) */
     check(owner->style->before&&owner->style->before->color==0xff00ff00u&&
-        owner->animation_base_style&&owner->animation_base_style->before&&
-        owner->animation_base_style->before->color==0xff0000ffu&&child->style->color==0xff0000ffu,
+        owner->style->color==0xff0000ffu&&child->style->color==0xff0000ffu,
         "pseudo animated and underlying bodies have separate current ownership");
     struct css_declarations *current=owner->style_declarations;
     doc_node_remove(d,owner);web_layout(d,800,600);
@@ -205,6 +208,12 @@ static void declaration_generation_paths(void) {
     check(owner->style_declarations==current&&owner->style&&owner->style->before&&child->style&&
         !strcmp(owner->style->before->content,"second")&&child->style->color==0xff0000ffu,
         "reinsert retains immutable declarations and refreshes inherited variable tails");
+    /* a script effect keeps its target across removal (only style cancels CSS animations) */
+    check(owner->style&&owner->style->before&&owner->style->before->color==0xff00ff00u,"reinserted pseudo keeps its script effect");
+    if(lime)web_animation_cancel(lime);
+    css_mark_dirty(d,owner);web_layout(d,800,600);
+    check(owner->style&&owner->style->before&&owner->style->before->color==0xff0000ffu&&!strcmp(owner->style->before->content,"second"),
+        "removed pseudo effect leaves the underlying body");
     web_free(d);
 }
 static void percentage_padding_cache(void) {
