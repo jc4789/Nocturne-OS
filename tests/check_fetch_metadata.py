@@ -175,7 +175,7 @@ product+=between(fetch,'static const char *cookie_site_url(','static bool cache_
 product+=between(fetch,'/* Fetch: a navigation request','/* Browser-generated fields remain')
 product+=between(fetch,'static bool cache_headers(','/* Headers have already been validated.')
 # 窓の側：fetch の始まりに Accept-Language を決めて要求の wire に入れる。
-product+=between(net,'static void request_language(','uint64_t webnet_submit(')
+product+=between(net,'static void request_language(',"/* Fetch's inflight keepalive bytes of a fetch group")
 # CORS-preflight と WebSocket の握手が頭を作る製品の本文。
 product+=between(fetch,'static int remaining(','static bool token_char(')
 product+=between(fetch,'static bool list_has_slice(','static bool list_has(')
