@@ -6940,6 +6940,57 @@ static void apply_decl(struct cascade *c, struct cx *cx, const struct dent *entr
     if(was_rollback)for(int i=0;i<count;i++)if(hidden[i])cx->set[i]=0;
 }
 
+/* css-text-decor-4 §2: an element's text-decoration-line decorates its box, whose lines then draw over
+   the text of its in-flow inline content, its in-flow descendants included; not over out-of-flow
+   descendants (floats, absolutely positioned boxes) nor the contents of atomic inlines, which start
+   afresh, and a display: contents element has no box to decorate. s's list is its parent's so filtered,
+   its own entry first; each entry keeps the decorating box's used values (its color, thickness and
+   offset against its own font size), so a descendant borrows the list as it borrows inherited values.
+   The baseline shift is how far vertical-align raised s's inline box within its line, so that paint
+   keeps a decorating box's lines at its own baseline over a raised descendant's text (§2: a decoration's
+   position follows the vertical-align of the decorating box, not of its descendants). */
+static void style_decorations(style_t *s, const style_t *parent, arena_t *a) {
+    bool atomic = s->display == D_INLINE_BLOCK || s->display == D_INLINE_TABLE || s->display == D_INLINE_FLEX ||
+                  s->display == D_INLINE_GRID;
+    bool out_of_flow = s->float_ != FL_NONE || s->position == POS_ABSOLUTE || s->position == POS_FIXED;
+    const struct css_decorating *list = parent && !atomic && !out_of_flow ? parent->decorations : NULL;
+    float shift = parent ? parent->baseline_shift : 0;
+    if (s->display == D_INLINE) shift += css_style_baseline_shift(s);
+    else if (s->display != D_CONTENTS) {
+        /* a block container's lines are their own: its ancestors' lines draw at their baseline */
+        shift = 0;
+        bool shifted = false;
+        for (const struct css_decorating *d = list; d && !shifted; d = d->next) shifted = d->shift != 0;
+        if (shifted) {
+            struct css_decorating *first = NULL, **tail = &first;
+            for (const struct css_decorating *d = list; d; d = d->next) {
+                struct css_decorating *copy = ar_alloc(a, sizeof *copy);
+                *copy = *d; copy->shift = 0; copy->next = NULL; *tail = copy; tail = (struct css_decorating **)&copy->next;
+            }
+            list = first;
+        }
+    }
+    s->baseline_shift = shift;
+    if (s->text_decoration && s->display != D_CONTENTS && s->display != D_NONE) {
+        const struct css_decoration *dec = css_style_decoration(s);
+        const struct css_text *text = css_style_text(s);
+        struct css_decorating *own = ar_alloc(a, sizeof *own);
+        wfont f = style_font(s);
+        *own = (struct css_decorating){.next = list, .font = f.ttf, .font_size = s->font_size, .shift = shift,
+                                       .lines = s->text_decoration, .style = dec->style,
+                                       .underline_position = text->underline_position};
+        /* a percentage is of 1em (§2.4, §2.7); from-font has no metric from this font: auto */
+        own->thickness = dec->thickness.kind == LK_LEN || dec->thickness.kind == LK_EXPR ?
+                         len_resolve(&dec->thickness, s->font_size) : NAN;
+        own->underline_offset = text->underline_offset.kind == LK_LEN || text->underline_offset.kind == LK_EXPR ?
+                                len_resolve(&text->underline_offset, s->font_size) : NAN;
+        own->color = dec->color.argb != COLOR_CURRENT ? dec->color.argb :
+                     dec->color.exact ? css_color_value_argb(dec->color.exact, s->color) : s->color;
+        list = own;
+    }
+    s->decorations = list;
+}
+
 static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uint8_t pseudo) {
     web_doc *d = c->d;
     style_t *s = style_slot_alloc(d, e, c->a);
@@ -7041,6 +7092,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
                              p->style->display == D_GRID || p->style->display == D_INLINE_GRID))
             css_style_finish(s, p->style, false);
     }
+    style_decorations(s, parent, c->a);
     return s;
 }
 
@@ -7987,6 +8039,10 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     /* a gap decoration's segments are layout's (layout.c records them); colour and style paint only */
     if(!css_gap_rules_layout_equal(x.gap_rules,y.gap_rules))return false;
     x.gap_rules=y.gap_rules=NULL;
+    /* line breaking reads the text group's breaking and hyphenation values; text-shadow and the
+       decorations (their lines, colour, style, thickness, offset) paint only */
+    if(!css_text_layout_equal(x.text,y.text))return false;
+    x.text=y.text=NULL;x.decoration=y.decoration=NULL;x.decorations=y.decorations=NULL;x.text_decoration=y.text_decoration=0;
     /* same_translation() decided every geometric effect of the transform
        properties; their values and arena addresses are paint state. */
     x.transform=y.transform=NULL;memset(&x.translate,0,sizeof x.translate);memset(&y.translate,0,sizeof y.translate);
@@ -8090,7 +8146,9 @@ static bool style_equal(const style_t *a, const style_t *b) {
         !equal_areas(a->grid_areas, b->grid_areas) || !style_equal(a->before, b->before) ||
         !style_equal(a->after, b->after) || !style_equal(a->backdrop, b->backdrop) ||
         !style_equal(a->placeholder, b->placeholder) || !css_color_slots_equal(a, b) ||
-        !equal_string(a->color_scheme_text, b->color_scheme_text)) return false;
+        !equal_string(a->color_scheme_text, b->color_scheme_text) || !css_text_equal(a->text, b->text) ||
+        !css_decoration_equal(a->decoration, b->decoration) || !css_decorating_equal(a->decorations, b->decorations))
+        return false;
     for (int i = 0; i < 4; i++) if (!equal_string(a->grid_place[i].name, b->grid_place[i].name)) return false;
     style_t x = *a, y = *b;
     len_t *xl[] = {&x.object_pos[0], &x.object_pos[1], &x.line_height, &x.svg_stroke_width, &x.width, &x.height,
@@ -8122,6 +8180,7 @@ static bool style_equal(const style_t *a, const style_t *b) {
     x.svg_fill.ref = y.svg_fill.ref = x.svg_stroke.ref = y.svg_stroke.ref = NULL;
     x.box_shadow = y.box_shadow = NULL; x.filter = y.filter = NULL; x.clip_path = y.clip_path = NULL;
     x.float_shape = y.float_shape = NULL; x.offset = y.offset = NULL; x.gap_rules = y.gap_rules = NULL; x.anchor = y.anchor = NULL; /* the groups compared above */
+    x.text = y.text = NULL; x.decoration = y.decoration = NULL; x.decorations = y.decorations = NULL;
     x.transform = y.transform = x.rotate = y.rotate = x.scale = y.scale = NULL;
     x.gradient = y.gradient = NULL; x.vars = y.vars = NULL;
     x.color_inherited = y.color_inherited = x.color_own = y.color_own = NULL; x.color_scheme_text = y.color_scheme_text = NULL;

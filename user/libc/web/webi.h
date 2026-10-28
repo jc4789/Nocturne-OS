@@ -583,6 +583,68 @@ extern const struct css_anchor css_anchor_initial;
 bool css_float_shape_equal(const struct css_float_shape *a, const struct css_float_shape *b);
 bool css_offset_equal(const struct css_offset *a, const struct css_offset *b);
 bool css_anchor_equal(const struct css_anchor *a, const struct css_anchor *b);
+/* CSS Text 3/4 and CSS Text Decoration 4's inherited text properties that few elements set: a style's
+   text group (style_t's text; NULL: every one initial). Unlike the other groups it is inherited, and
+   as a whole: an element that sets none of them shares its parent's record (css_style_init copies the
+   parent), so inheriting it costs a pointer; one that sets one writes a copy. */
+enum { CSS_WORD_BREAK_NORMAL, CSS_WORD_BREAK_BREAK_ALL, CSS_WORD_BREAK_KEEP_ALL, CSS_WORD_BREAK_MANUAL,
+       CSS_WORD_BREAK_AUTO_PHRASE, CSS_WORD_BREAK_BREAK_WORD };
+enum { CSS_LINE_BREAK_AUTO, CSS_LINE_BREAK_LOOSE, CSS_LINE_BREAK_NORMAL, CSS_LINE_BREAK_STRICT,
+       CSS_LINE_BREAK_ANYWHERE };
+enum { CSS_OVERFLOW_WRAP_NORMAL, CSS_OVERFLOW_WRAP_BREAK_WORD, CSS_OVERFLOW_WRAP_ANYWHERE };
+enum { CSS_HYPHENS_MANUAL, CSS_HYPHENS_NONE, CSS_HYPHENS_AUTO };
+/* text-underline-position: auto is none of them; at most one of FROM_FONT and UNDER, of LEFT and RIGHT */
+enum { CSS_UNDERLINE_FROM_FONT = 1, CSS_UNDERLINE_UNDER = 2, CSS_UNDERLINE_LEFT = 4, CSS_UNDERLINE_RIGHT = 8 };
+#define CSS_TEXT_AUTO INT32_MIN /* hyphenate-limit-chars' auto, hyphenate-limit-lines' no-limit */
+struct css_text {
+    /* text-shadow, the first on top: no spread and never inset (css-text-decor-3 §4); a colour that is
+       currentcolor stays COLOR_CURRENT, which each style resolves against its own color */
+    const struct css_box_shadow *shadow;
+    const char *hyphenate_character; /* UTF-8; NULL: auto */
+    int32_t hyphenate_limit_chars[3]; /* the word, before and after the hyphenation point; CSS_TEXT_AUTO: auto */
+    int32_t hyphenate_limit_lines;    /* CSS_TEXT_AUTO: no-limit */
+    struct css_tab_size { float value; bool length; } tab_size; /* spaces' advances, or (length) px */
+    len_t underline_offset;           /* text-underline-offset; LK_AUTO: auto */
+    uint8_t word_break, line_break, overflow_wrap, hyphens; /* CSS_WORD_BREAK_* ... CSS_HYPHENS_* */
+    uint8_t underline_position;       /* CSS_UNDERLINE_* */
+};
+extern const struct css_text css_text_initial;
+bool css_text_equal(const struct css_text *a, const struct css_text *b);
+/* the values of a and b that line breaking and white-space processing read */
+bool css_text_layout_equal(const struct css_text *a, const struct css_text *b);
+/* text-decoration-color, -style and -thickness: a style's decoration group (style_t's decoration;
+   NULL: currentcolor, solid, auto). Not inherited; text-decoration-line is style_t's text_decoration. */
+enum { CSS_DECORATION_SOLID, CSS_DECORATION_DOUBLE, CSS_DECORATION_DOTTED, CSS_DECORATION_DASHED,
+       CSS_DECORATION_WAVY };
+struct css_decoration {
+    /* argb COLOR_CURRENT: currentcolor; exact: the computed colour when 8 bits cannot hold it */
+    struct css_decoration_color { uint32_t argb; const struct css_color_value *exact; } color;
+    len_t thickness;                          /* LK_AUTO: auto; LK_NONE: from-font; a percentage of 1em */
+    uint8_t style;                            /* CSS_DECORATION_* */
+};
+extern const struct css_decoration css_decoration_initial;
+bool css_decoration_equal(const struct css_decoration *a, const struct css_decoration *b);
+/* A decorating box's lines (css-text-decor-4 §2: an element's own text-decoration-line, drawn over its
+   in-flow inline content and propagated to its in-flow descendants, but not into out-of-flow ones nor
+   the contents of atomic inlines). A style holds the list of every decorating box whose lines draw
+   over its text, its own first; each entry holds the decorating box's used values, so it outlives
+   that box's style (descendants borrow the list as they borrow inherited values). */
+struct css_decorating {
+    const struct css_decorating *next;
+    font_t *font;          /* the decorating box's first available font, NULL the bitmap font */
+    float font_size;
+    float thickness;       /* px; NAN: auto (from-font: the font gives no metric here, so auto too) */
+    float underline_offset; /* px; NAN: auto */
+    float shift;           /* the decorating box's baseline shift (vertical-align) within its line */
+    uint32_t color;        /* the used text-decoration-color */
+    uint8_t lines, style, underline_position;
+};
+bool css_decorating_equal(const struct css_decorating *a, const struct css_decorating *b);
+/* the used text-shadow colour of a shadow of st's text group */
+uint32_t css_text_shadow_color(const struct style *st, const struct css_box_shadow *shadow);
+/* tab-size's tab stop interval in px for st's preserved tabs, given space: the advance of a space
+   (letter-spacing and word-spacing included) of their nearest block container (css-text-4 §4.4) */
+float css_tab_interval(const struct style *st, float space);
 enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE };
 bool css_offset_parse(enum css_offset_property which, const char *v, size_t n, struct cx *cx, void *out, sbuf *specified);
 bool css_offset_serialize(enum css_offset_property which, const void *value, sbuf *out, web_doc *d);
@@ -683,7 +745,9 @@ enum { LS_DISC, LS_CIRCLE, LS_SQUARE, LS_DECIMAL, LS_DECIMAL_LZ, LS_LOWER_ALPHA,
        LS_LOWER_ROMAN, LS_UPPER_ROMAN, LS_LOWER_GREEK, LS_NONE, LS_STRING };
 enum { BS_NONE, BS_HIDDEN, BS_SOLID, BS_DASHED, BS_DOTTED, BS_DOUBLE, BS_GROOVE, BS_RIDGE, BS_INSET, BS_OUTSET };
 enum { TT_NONE, TT_UPPER, TT_LOWER, TT_CAPITALIZE };
-enum { TD_UNDERLINE = 1, TD_OVERLINE = 2, TD_LINE_THROUGH = 4 };
+/* text-decoration-line (css-text-decor-4 §2.1): the lines, or one of the two error lines alone */
+enum { TD_UNDERLINE = 1, TD_OVERLINE = 2, TD_LINE_THROUGH = 4, TD_BLINK = 8, TD_SPELLING_ERROR = 16,
+       TD_GRAMMAR_ERROR = 32 };
 enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO, OV_CLIP };
 enum { FD_ROW, FD_ROW_REVERSE, FD_COLUMN, FD_COLUMN_REVERSE };
 enum { FW_NOWRAP, FW_WRAP, FW_WRAP_REVERSE };
@@ -874,7 +938,7 @@ typedef struct style {
     float opacity;
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
     const struct css_shape *clip_path; /* NULL: none; a computed-arena value */
-    /* Groups of rarely set properties that are not inherited, held by pointer so that every
+    /* Groups of rarely set properties, all but text not inherited, held by pointer so that every
        element's style does not carry them (css_style_float_shape, css_style_offset read them).
        NULL: all their values initial. A group is a computed-arena record that no one writes once a
        style holds it: cssprop.c writes a longhand into a copy and points the style at the copy. */
@@ -882,6 +946,13 @@ typedef struct style {
     const struct css_offset *offset;           /* Motion Path */
     const struct css_gap_rules *gap_rules;     /* gap decorations */
     const struct css_anchor *anchor;           /* Anchor Positioning */
+    const struct css_decoration *decoration;   /* text-decoration-color, -style and -thickness */
+    /* the one inherited group: the text properties of struct css_text */
+    const struct css_text *text;
+    /* not computed values: the decorating boxes whose lines draw over this style's text, and the
+       baseline shift of its box within its line (css_style_decorations) */
+    const struct css_decorating *decorations;
+    float baseline_shift;
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -928,6 +999,22 @@ static inline const struct css_gap_rules *css_style_gap_rules(const style_t *s) 
 }
 static inline const struct css_anchor *css_style_anchor(const style_t *s) {
     return s->anchor ? s->anchor : &css_anchor_initial;
+}
+static inline const struct css_decoration *css_style_decoration(const style_t *s) {
+    return s->decoration ? s->decoration : &css_decoration_initial;
+}
+static inline const struct css_text *css_style_text(const style_t *s) {
+    return s->text ? s->text : &css_text_initial;
+}
+/* how far vertical-align raises an inline box's baseline above its parent's (sub, super, a length;
+   the line-relative values align the box in layout.c instead) */
+static inline float css_style_baseline_shift(const style_t *st) {
+    switch (st->vertical_align) {
+    case VA_SUB: return -st->font_size * 0.25f;
+    case VA_SUPER: return st->font_size * 0.4f;
+    case VA_LEN: return st->vertical_align_px;
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------- stylesheets */
@@ -1130,6 +1217,7 @@ struct propdef;
 const struct propdef *css_prop_lookup(const char *name, size_t n); /* NULL: not supported */
 int css_prop_count(void);
 const char *css_prop_name(int index,bool *longhand); /* actual native table, lexicographical order */
+const char *css_prop_legacy_alias(int index); /* the index-th legacy name alias (NULL past the last) */
 int css_prop_index(const struct propdef *p);
 /* computed before the other declarations, which depend on them: font-size, color-scheme, or a
    shorthand that sets one */
@@ -1462,6 +1550,7 @@ struct run {
     node_t *link;  /* the <a href> it belongs to */
     box_t *atomic; /* or an atomic inline box at (x, y = its top) */
     bool highlight;
+    bool hyphen;   /* the line breaks at the soft hyphen ending s: w includes layout_hyphen_string's advance */
     node_t *node; /* original text/atomic node, for generic DOM event targeting */
     box_t *paint_owner; /* filtered inline group; private layout-arena dependency */
     int paint_next;
@@ -1534,6 +1623,9 @@ void layout_runs_origin(const box_t *b, bool visual, float *x, float *y);
 void layout_run_extent(const struct run *r, float *top, float *bottom);
 /* The advance from the start of r's text to its byte boundary at (r->w at its end). */
 float layout_run_x(const struct run *r, size_t at);
+/* What a line broken at a soft hyphen of st's text shows (css-text-4 §6.3.2): hyphenate-character's
+   string, or for auto U+2010 where st's font has it and else U+002D. Layout measures and paint draws it. */
+const char *layout_hyphen_string(const style_t *st);
 /* The advance of s[at, next), one grapheme cluster, x after the text's start. */
 typedef float (*layout_measure_fn)(const void *opaque, const char *s, size_t at, size_t next, float x);
 /* The grapheme cluster boundary of s[0,n) nearest the advance dx from its start; a boundary

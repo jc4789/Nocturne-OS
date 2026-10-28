@@ -5602,6 +5602,17 @@ static JSValue native_css_properties(JSContext *ctx,JSValueConst this_val,int ar
         }
         if(JS_SetPropertyUint32(ctx,result,(uint32_t)i,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
     }
+    /* the legacy name aliases: CSSOM attributes of their own, never computed longhands */
+    uint32_t index=(uint32_t)css_prop_count();
+    for(int i=0;css_prop_legacy_alias(i);i++) {
+        JSValue entry=JS_NewArray(ctx);
+        if(JS_IsException(entry)){JS_FreeValue(ctx,result);return entry;}
+        if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,css_prop_legacy_alias(i)))<0||
+           JS_SetPropertyUint32(ctx,entry,1,JS_FALSE)<0) {
+            JS_FreeValue(ctx,entry);JS_FreeValue(ctx,result);return JS_EXCEPTION;
+        }
+        if(JS_SetPropertyUint32(ctx,result,index++,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+    }
     return result;
 }
 static JSValue native_clear(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
