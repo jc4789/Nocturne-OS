@@ -582,7 +582,9 @@
         }
         querySelector(selector) { return dom('query',this,String(selector),true); }
         querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
-        matches(selector) { return dom('matches',this,String(selector)); }
+        matches(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'matches': 1 argument required");return dom('matches',this,String(selector)); }
+        /* DOM: a legacy alias of matches (an operation of its own name, the same steps). */
+        webkitMatchesSelector(selector) { if(!arguments.length)throw new TypeError("Failed to execute 'webkitMatchesSelector': 1 argument required");return dom('matches',this,String(selector)); }
         closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
         getElementsByTagName(name) { name=String(name);return collectionBridge.domHTML(this,()=>rawDom.tagQuery(this,name)); }
         getElementsByTagNameNS(namespace,localName) {
