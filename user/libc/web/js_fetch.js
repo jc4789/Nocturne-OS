@@ -770,7 +770,9 @@ function fetchInterfaces(realm) {
         initializeFormData(api){formDataAPI=api;},
         initializeStreams(api){streams=api;},
         initializeObjectURLs(api){objectURLAPI=api;},
-        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value))||!!(formDataAPI&&formDataAPI.brand(value)),body=extractBody(bodyInit(value));if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
+        /* XHR send()'s body is nullable (Document or XMLHttpRequestBodyInit)?: null is no body,
+           never the string "null". */
+        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value))||!!(formDataAPI&&formDataAPI.brand(value)),body=extractBody(value===null?null:bodyInit(value));if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
         xhrResponse(response) {
             // Only the private XHR completion path calls this. Do not invoke
             // page-mutable Response getters or publish a backing-buffer API.

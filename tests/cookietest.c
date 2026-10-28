@@ -165,7 +165,10 @@ int main(int argc,char **argv) {
     CHECK(set(j,"https://example.com/","__Host-Http-x=1; Secure; HttpOnly; Path=/",true)==1);
     CHECK(set(j,"https://example.com/","partitioned=1; Secure; Partitioned",true)==0);
     CHECK(set(j,"file:///C:/Users/User/index.html","x=1",false)==0);
-    CHECK(set(j,"https://example.com@evil.com/","x=1",true)==0);
+    /* The URL's host is evil.com; its userinfo never names the cookie's domain. */
+    CHECK(set(j,"https://example.com@evil.com/","userinfo=1",true)==1);
+    CHECK(sends(j,"https://evil.com/","userinfo"));
+    CHECK(!sends(j,"https://example.com/","userinfo"));
     CHECK(set(j,"https://example.com/","x=1\r\nCookie: secret",true)==0);
     CHECK(set(j,"https://example.com/","invalid name=1",true)==0);
     webcookie_free(j);
