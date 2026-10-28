@@ -827,6 +827,17 @@ for bom, name in ((b"\xEF\xBB\xBF", "UTF-8"), (b"\xFE\xFF", "UTF-16BE"), (b"\xFF
                                      else "utf-8") + b"\xFE\xFF"
         used = name or fallback
         ask("B", fallback, bom + body, (1, used.encode() + b"\0" + utf8(decode(used, body))), what=bom.hex())
+        # The same decode streaming (the decoder's BOM sniff), in chunks of each size.
+        for chunk in (1, 2, 3, 0):
+            ask("D", fallback, bom + body, (1, utf8(decode(used, body))), flags=4, chunk=chunk,
+                what="sniff " + bom.hex())
+# Fewer bytes than a BOM at the end.
+for fallback in ("windows-1252", "UTF-8"):
+    for data in (b"", b"\xEF", b"\xEF\xBB", b"\xFE", b"\xFE\xFF", b"\xFF\xFE", b"a"):
+        used = "UTF-16BE" if data == b"\xFE\xFF" else "UTF-16LE" if data == b"\xFF\xFE" else fallback
+        rest = data if used == fallback else b""
+        for chunk in (1, 0):
+            ask("D", fallback, data, (1, utf8(decode(used, rest))), flags=4, chunk=chunk, what="short " + data.hex())
 
 # Strings: html mode, URL queries, urlencoded.
 def pool_for(name):
@@ -839,7 +850,14 @@ def pool_for(name):
     return sample + encodable[:200] + [rng.randrange(0x80, 0xD800) for _ in range(40)]
 
 
+def form_bytes(data):
+    """url_encode_form (web_url.c) over bytes: the x-www-form set, space as '+'."""
+    keep = set(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789*-._")
+    return "".join("+" if b == 0x20 else chr(b) if b in keep else f"%{b:02X}" for b in data)
+
+
 SAFE = set(map(ord, "\t\n\r#"))
+composed_failed = 0
 for name in NAMES:
     pool = pool_for(name)
     for i in range(300):
@@ -847,12 +865,19 @@ for name in NAMES:
         ask("H", name, text.encode(), (1, encode_html(name, text)), what=repr(text))
         ask("P", name, text.encode(), (1, percent_encode_after_encoding(name, text, FORM, True).encode()),
             what=repr(text))
+        # Forms percent-encode html mode's bytes: the same as percent-encode after encoding.
+        composed_failed += form_bytes(encode_html(name, text)) != percent_encode_after_encoding(name, text, FORM, True)
         query = "".join(c for c in text if ord(c) not in SAFE and ord(c) >= 0x20) + "x"
         for prefix, special in (("https://example.com/?", True), ("ws://example.com/?", True),
                                 ("foo://h/?", False)):
             used = name if prefix.startswith("https") else "UTF-8"
             want = prefix + percent_encode_after_encoding(used, query, SPECIAL_QUERY if special else QUERY)
             ask("Q", name, (prefix + query).encode(), (1, want.encode()), what=repr(query))
+            # The same query relative to a base: the scheme comes from the base.
+            ask("Q", name, (prefix + "\0?" + query).encode(), (1, want.encode()), what="relative " + repr(query))
+
+if composed_failed:
+    sys.exit(f"html mode's bytes percent-encoded differ from percent-encode after encoding {composed_failed} times")
 
 work = out / "requests.bin"
 work.write_bytes(b"".join(requests))

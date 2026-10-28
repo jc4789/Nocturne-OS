@@ -3,14 +3,15 @@
    results. Each request: op, label length, label, flags, chunk size (u32),
    data length (u32), data. Each result: status (i8), length (u32), data.
      L  get an encoding of data; data out is the name (status 0 on failure)
-     D  decoder of label over data in chunks; flags 1 fatal, 2 drop BOM;
+     D  decoder of label over data in chunks; flags 1 fatal, 2 drop BOM, 4 sniff;
         out is UTF-8, status as web_decoder_run
      B  decode (BOM sniff, label as fallback); out is name, NUL, UTF-8
      S  data is u32 scalar values; for each a fresh encoder, encode or fail,
         then end-of-queue; out per value: byte count (u8), bytes, error (u32)
      H  encode in html mode of data (UTF-8)
      P  percent-encode after encoding, x-www-form-urlencoded set, space as +
-     Q  URL parser over data (UTF-8) with label's encoding; out is the href */
+     Q  URL parser over data (UTF-8) with label's encoding; out is the href.
+        With a NUL in data, the part before it is the base (parsed as UTF-8) */
 #include "../user/libc/web/web_encoding.h"
 #include <lexbor/url/url.h>
 #include <stdio.h>
@@ -67,6 +68,7 @@ int main(int argc, char **argv) {
         case 'D':
             web_decoder_init(decoder, encoding, flags & 1);
             decoder->drop_bom = flags & 2;
+            decoder->sniff = flags & 4;
             if (!chunk) chunk = length ? length : 1;
             for (uint32_t i = 0;; i += chunk) {
                 uint32_t n = length - i < chunk ? length - i : chunk;
@@ -114,9 +116,19 @@ int main(int argc, char **argv) {
             break;
         }
         case 'Q': {
-            lxb_url_t *url = lxb_url_parse_basic(&parser, NULL, NULL, data, length,
-                                                 LXB_URL_STATE__UNDEF, encoding) == LXB_STATUS_OK ?
-                parser.url : NULL;
+            const uint8_t *nul = memchr(data, 0, length);
+            lxb_url_t *base = NULL;
+            if (nul) {
+                base = lxb_url_parse_basic(&parser, NULL, NULL, data, (size_t)(nul - data),
+                                           LXB_URL_STATE__UNDEF, LXB_ENCODING_UTF_8) == LXB_STATUS_OK ?
+                    parser.url : NULL;
+                lxb_url_parser_clean(&parser);
+                length -= (uint32_t)(nul + 1 - data);
+                data = nul + 1;
+            }
+            lxb_url_t *url = !nul || base ?
+                (lxb_url_parse_basic(&parser, NULL, base, data, length, LXB_URL_STATE__UNDEF, encoding) ==
+                 LXB_STATUS_OK ? parser.url : NULL) : NULL;
             lxb_url_parser_clean(&parser);
             status = url != NULL;
             if (url) lxb_url_serialize(url, put, &result, false);

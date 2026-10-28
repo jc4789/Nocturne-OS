@@ -597,7 +597,7 @@
         get currentSrc() { return domGet(this,'imageCurrentSrc'); }
         get src() {
             domGet(this,'imageBrand'); const value=reflectedAttr(this,'src');
-            if(value===null)return '';try{return new URL(value,this.baseURI).href;}catch(_){return value;}
+            if(value===null)return '';return elementURL.resolve(this,value);
         }
         set src(v) { domGet(this,'imageBrand');reflectedAttr(this,'src',String(v)); }
         get alt() { domGet(this,'imageBrand');return reflectedAttr(this,'alt')||''; }

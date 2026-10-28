@@ -123,8 +123,12 @@ JSValue web_js_text_decoder(JSContext *ctx, int argc, JSValueConst *argv) {
     if(!label)return JS_EXCEPTION;
     web_encoding encoding=web_encoding_get(label,length);
     JS_FreeCString(ctx,label);
-    if(!encoding||encoding==LXB_ENCODING_REPLACEMENT)return JS_ThrowRangeError(ctx,"Unsupported text encoding");
-    bool fatal=JS_ToBool(ctx,argv[1])>0,ignore_bom=JS_ToBool(ctx,argv[2])>0;
+    /* decode (XHR's text response): a label that is no encoding is UTF-8,
+       replacement decodes, and a BOM chooses the encoding. */
+    bool decode=argc>3&&JS_ToBool(ctx,argv[3])>0;
+    if(decode&&!encoding)encoding=WEB_ENCODING_UTF8;
+    if(!encoding||(!decode&&encoding==LXB_ENCODING_REPLACEMENT))return JS_ThrowRangeError(ctx,"Unsupported text encoding");
+    bool fatal=JS_ToBool(ctx,argv[1])>0,ignore_bom=decode||JS_ToBool(ctx,argv[2])>0;
     JSRuntime *rt=JS_GetRuntime(ctx);
     if(!decoder_class)JS_NewClassID(&decoder_class);
     if(!JS_IsRegisteredClass(rt,decoder_class)){
@@ -139,6 +143,7 @@ JSValue web_js_text_decoder(JSContext *ctx, int argc, JSValueConst *argv) {
     /* TextDecoder's serialize I/O queue drops a first U+FEFF of these three. */
     decoder->drop_bom=!ignore_bom&&(encoding==WEB_ENCODING_UTF8||encoding==LXB_ENCODING_UTF_16BE||
                                     encoding==LXB_ENCODING_UTF_16LE);
+    decoder->sniff=decode;
     JS_SetOpaque(handle,decoder);
     return handle;
 }
@@ -165,17 +170,6 @@ JSValue web_js_text_decode(JSContext *ctx, int argc, JSValueConst *argv,
     free(out.data);
     return text;
 }
-/* QuickJS writes a lone surrogate in its three-byte form ED A0..BF xx, the
-   length of U+FFFD's: the Encoding Standard's scalar values come from
-   replacing those in place. ED never occurs as a continuation byte. */
-void web_utf8_replace_lone_surrogates(uint8_t *bytes, size_t length) {
-    for (uint8_t *p=memchr(bytes,0xed,length);p;p=memchr(p,0xed,length-(size_t)(p-bytes))) {
-        if(p[1]>=0xa0){p[0]=0xef;p[1]=0xbf;p[2]=0xbd;}
-        p+=3;
-        if((size_t)(p-bytes)>=length)break;
-    }
-}
-
 JSValue web_js_encode_utf8(JSContext *ctx, int argc, JSValueConst *argv,
                            void (*prepare)(JSContext *, size_t)) {
     if(argc<1||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"UTF-8 encode requires a string");
@@ -379,7 +373,7 @@ static JSValue isolated_text_decode(JSContext *ctx, JSValueConst self, int argc,
 void web_js_encoding_init_isolated(JSContext *ctx, JSValue host) {
     static const JSCFunctionListEntry functions[]={
         JS_CFUNC_DEF("getEncoding",1,isolated_get_encoding),
-        JS_CFUNC_DEF("textDecoder",3,isolated_text_decoder),
+        JS_CFUNC_DEF("textDecoder",4,isolated_text_decoder),
         JS_CFUNC_DEF("textDecode",5,isolated_text_decode),
         JS_CFUNC_DEF("decodeUTF8",5,isolated_decode_utf8),
         JS_CFUNC_DEF("encodeUTF8",1,isolated_encode_utf8),

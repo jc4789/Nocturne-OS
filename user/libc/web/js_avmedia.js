@@ -39,7 +39,9 @@ const avmediaBridge = (() => {
             const type=child.getAttribute('type');if(!type||native('type',null,type)){value=child.getAttribute('src');break;}
         }
         if(!value)return '';
-        return new URL(value,node.baseURI).href;
+        const url=elementURL.serialize(node,value);
+        if(url===null)throw new TypeError('Invalid media URL');
+        return url;
     }
     function abortError() { return new DOMException('Media source changed','AbortError'); }
     function current(node,s,generation,url) { return s.generation===generation&&s.currentSrc===url&&source(node)===url; }
@@ -199,7 +201,7 @@ const avmediaBridge = (() => {
         Object.defineProperty(MediaError,name,{value});Object.defineProperty(MediaError.prototype,name,{value});
     }
     class HTMLMediaElement extends HTMLElement {
-        get src(){brand(this);const value=this.getAttribute('src');return value===null?'':new URL(value,this.baseURI).href;}
+        get src(){brand(this);const value=this.getAttribute('src');return value===null?'':elementURL.resolve(this,value);}
         set src(value){const s=get(this);this.setAttribute('src',String(value));reset(this,s);if(this.preload!=='none')load(this).catch(()=>{});}
         get currentSrc(){return get(this).currentSrc;}
         get networkState(){return get(this).network;}
@@ -313,7 +315,7 @@ const avmediaBridge = (() => {
         set width(v){brand(this);this.setAttribute('width',String(Number(v)>>>0));}
         get height(){brand(this);return Math.max(0,Number(this.getAttribute('height'))||0);}
         set height(v){brand(this);this.setAttribute('height',String(Number(v)>>>0));}
-        get poster(){brand(this);const v=this.getAttribute('poster');return v===null?'':new URL(v,this.baseURI).href;}
+        get poster(){brand(this);const v=this.getAttribute('poster');return v===null?'':elementURL.resolve(this,v);}
         set poster(v){brand(this);this.setAttribute('poster',String(v));}
         getVideoPlaybackQuality(){
             const s=snapshot(this);

@@ -52,18 +52,25 @@ bool web_bytes_put(struct web_bytes *out, const void *bytes, size_t length) {
    is a compound literal, which lives only in the block that names it.) */
 static const lxb_codepoint_t replacement = LXB_ENCODING_REPLACEMENT_CODEPOINT;
 
-/* The instance's handler state afresh; the encoding and modes stay. */
-static void decoder_start(struct web_decoder *d) {
-    d->started = false;
+/* Lexbor's handler state afresh for the instance's encoding. */
+static void handler_start(struct web_decoder *d) {
     lxb_encoding_decode_init(&d->lexbor, lxb_encoding_data(d->encoding), d->buffer,
                              sizeof d->buffer / sizeof *d->buffer);
     if (!d->fatal) lxb_encoding_decode_replace_set(&d->lexbor, &replacement, 1);
 }
 
+/* The instance afresh; init's encoding and the modes stay. */
+static void decoder_start(struct web_decoder *d) {
+    d->started = d->sniffed = false;
+    d->held_length = 0;
+    d->encoding = d->given;
+    handler_start(d);
+}
+
 void web_decoder_init(struct web_decoder *d, web_encoding encoding, bool fatal) {
-    d->encoding = encoding;
+    d->given = encoding;
     d->fatal = fatal;
-    d->drop_bom = false;
+    d->drop_bom = d->sniff = false;
     decoder_start(d);
 }
 
@@ -110,10 +117,21 @@ size_t web_utf8_valid(const uint8_t *s, size_t n) {
     return i;
 }
 
-int web_decoder_run(struct web_decoder *d, const uint8_t *bytes, size_t length, bool last,
-                    struct web_bytes *out) {
+/* A lone surrogate's three-byte form is ED A0..BF xx, the length of U+FFFD's;
+   ED never occurs as a continuation byte. */
+void web_utf8_replace_lone_surrogates(uint8_t *bytes, size_t length) {
+    for (uint8_t *p = memchr(bytes, 0xed, length); p; p = memchr(p, 0xed, length - (size_t)(p - bytes))) {
+        if ((size_t)(p - bytes) + 2 < length && p[1] >= 0xa0) { p[0] = 0xef; p[1] = 0xbf; p[2] = 0xbd; }
+        p += 3;
+        if ((size_t)(p - bytes) >= length) break;
+    }
+}
+
+/* The decoder over bytes, then end-of-queue when last; web_decoder_run's
+   result, the instance as it is left. */
+static int run(struct web_decoder *d, const uint8_t *bytes, size_t length, bool last,
+               struct web_bytes *out) {
     int result = 1;
-    if (!bytes) length = 0;
     /* UTF-8 between sequences: a valid prefix is its own output. */
     if (d->encoding == WEB_ENCODING_UTF8 && !d->lexbor.u.utf_8.need && !d->lexbor.have_error) {
         size_t valid = web_utf8_valid(bytes, length), skip = 0;
@@ -139,6 +157,26 @@ int web_decoder_run(struct web_decoder *d, const uint8_t *bytes, size_t length, 
         if (!flush(d, out)) result = -1;
         else if (status == LXB_STATUS_ERROR) result = 0;
     }
+    return result;
+}
+
+int web_decoder_run(struct web_decoder *d, const uint8_t *bytes, size_t length, bool last,
+                    struct web_bytes *out) {
+    int result = 1;
+    if (!bytes) bytes = (const uint8_t *)"", length = 0;
+    if (d->sniff && !d->sniffed) {
+        while (d->held_length < sizeof d->held && length) { d->held[d->held_length++] = *bytes++; length--; }
+        if (d->held_length < sizeof d->held && !last) return 1;
+        size_t bom = 0;
+        web_encoding found = web_encoding_bom_sniff(d->held, d->held_length, &bom);
+        d->sniffed = true;
+        if (found && found != d->encoding) {
+            d->encoding = found;
+            handler_start(d);
+        }
+        result = run(d, d->held + bom, d->held_length - bom, false, out);
+    }
+    if (result == 1) result = run(d, bytes, length, last, out);
     if (last || result != 1) decoder_start(d);
     return result;
 }
@@ -182,7 +220,9 @@ size_t web_encoder_finish(struct web_encoder *e, uint8_t out[WEB_ENCODER_MAX]) {
     return (size_t)(p - out);
 }
 
-/* One scalar value from UTF-8 known to be of scalar values; *at moves past it. */
+/* One scalar value from UTF-8; *at moves past it. A surrogate's three bytes
+   (a string's lone surrogate as QuickJS and the DOM keep it) are U+FFFD, as
+   converting to a scalar value string makes it. */
 static uint32_t utf8_next(const uint8_t *s, size_t n, size_t *at) {
     size_t i = *at;
     unsigned c = s[i++];
@@ -191,14 +231,19 @@ static uint32_t utf8_next(const uint8_t *s, size_t n, size_t *at) {
     if (more) cp = c & (0x3f >> more);
     while (more-- && i < n) cp = cp << 6 | (s[i++] & 63);
     *at = i;
-    return cp;
+    return cp >= 0xd800 && cp <= 0xdfff ? 0xfffd : cp;
 }
 
 bool web_encode_html(web_encoding encoding, const char *utf8, size_t length, struct web_bytes *out) {
     const uint8_t *s = (const uint8_t *)utf8;
     struct web_encoder e;
     web_encoder_init(&e, encoding);
-    if (e.encoding == WEB_ENCODING_UTF8) return web_bytes_put(out, utf8, length);
+    if (e.encoding == WEB_ENCODING_UTF8) {
+        size_t at = out->length;
+        if (!web_bytes_put(out, utf8, length)) return false;
+        if (length) web_utf8_replace_lone_surrogates((uint8_t *)out->data + at, length);
+        return true;
+    }
     uint8_t bytes[WEB_ENCODER_MAX];
     for (size_t i = 0; i < length;) {
         uint32_t error, cp = utf8_next(s, length, &i);

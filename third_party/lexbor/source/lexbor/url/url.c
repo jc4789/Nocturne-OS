@@ -2383,10 +2383,12 @@ again:
         break;
 
     case LXB_URL_STATE_QUERY_STATE:
+        /* Nocturne: the URL's scheme, which a relative input takes from its
+           base without schm being set. */
         if (encoding != LXB_ENCODING_UTF_8
             && (!lxb_url_is_special(url)
-                || schm->type == LXB_URL_SCHEMEL_TYPE_WS
-                || schm->type == LXB_URL_SCHEMEL_TYPE_WSS))
+                || url->scheme.type == LXB_URL_SCHEMEL_TYPE_WS
+                || url->scheme.type == LXB_URL_SCHEMEL_TYPE_WSS))
         {
             encoding = LXB_ENCODING_UTF_8;
 

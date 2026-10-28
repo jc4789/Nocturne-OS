@@ -16,7 +16,10 @@ JSValue web_js_utf8_text(JSContext *ctx, const uint8_t *bytes, size_t length);
    null for failure (web_encoding.c owns the labels). */
 JSValue web_js_get_encoding(JSContext *ctx, int argc, JSValueConst *argv);
 /* host.textDecoder(name, fatal, ignoreBOM): a decoder instance of any encoding
-   but replacement (RangeError), for TextDecoder and TextDecoderStream. */
+   but replacement (RangeError), for TextDecoder and TextDecoderStream.
+   host.textDecoder(label, fatal, ignoreBOM, true): the Encoding Standard's
+   decode as a stream (XHR's text response): label's encoding or UTF-8,
+   replacement too, overridden by a BOM, which is not output. */
 JSValue web_js_text_decoder(JSContext *ctx, int argc, JSValueConst *argv);
 /* host.textDecode(decoder, buffer, offset, length, stream): the string of the
    view's bytes, then end-of-queue unless stream; TypeError at a fatal error.
@@ -24,9 +27,6 @@ JSValue web_js_text_decoder(JSContext *ctx, int argc, JSValueConst *argv);
    decodeUTF8. */
 JSValue web_js_text_decode(JSContext *ctx, int argc, JSValueConst *argv,
                            void (*prepare)(JSContext *, size_t));
-/* QuickJS's UTF-8 of a string keeps a lone surrogate in its three-byte form;
-   this makes the UTF-8 of the scalar values (a USVString's), in place. */
-void web_utf8_replace_lone_surrogates(uint8_t *bytes, size_t length);
 /* host.encodeUTF8(string): an ArrayBuffer of the string's scalar values in
    UTF-8, each lone surrogate as U+FFFD; prepare as for decoding. */
 JSValue web_js_encode_utf8(JSContext *ctx, int argc, JSValueConst *argv,

@@ -68,7 +68,7 @@ done:
 void web_js_encoding_init(JSContext *ctx, JSValue host) {
     static const JSCFunctionListEntry functions[]={
         JS_CFUNC_DEF("getEncoding",1,native_get_encoding),
-        JS_CFUNC_DEF("textDecoder",3,native_text_decoder),
+        JS_CFUNC_DEF("textDecoder",4,native_text_decoder),
         JS_CFUNC_DEF("textDecode",5,native_text_decode),
         JS_CFUNC_DEF("decodeUTF8",5,native_decode_utf8),
         JS_CFUNC_DEF("encodeUTF8",1,native_encode_utf8),

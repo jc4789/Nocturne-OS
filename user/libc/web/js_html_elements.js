@@ -479,9 +479,11 @@ const htmlElementsBridge = (() => {
     reflect(HTMLBaseElement,'base','target');
     define(HTMLBaseElement.prototype,'href',{configurable:true,enumerable:true,get(){
         htmlElementBrand(this,'base');const value=reflectedAttr(this,'href')||'';
+        // The URL parser with the document's character encoding, against its
+        // fallback base URL.
         const fallback=rawDom.get(rawDom.get(this,'ownerDocument'),'URL');
-        try{return call(hrefGet,new URLImpl(value,fallback),[]);}
-        catch(error){if(error instanceof TypeErrorImpl)return scalar(value);throw error;}
+        const url=urlBridge.encodingParse(value,fallback,rawDom.get(this,'characterSet'));
+        return url?call(hrefGet,url,[]):scalar(value);
     },set(value){htmlElementBrand(this,'base');reflectedAttr(this,'href',scalar(value));}});
     define(HTMLTitleElement.prototype,'text',{configurable:true,enumerable:true,get(){
         htmlElementBrand(this,'title');let text='';

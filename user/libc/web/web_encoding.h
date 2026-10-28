@@ -30,6 +30,10 @@ web_encoding web_encoding_bom_sniff(const uint8_t *bytes, size_t length, size_t 
 /* The length of bytes' longest prefix of whole, valid UTF-8 sequences: the
    UTF-8 decoder outputs exactly those bytes for it. */
 size_t web_utf8_valid(const uint8_t *bytes, size_t length);
+/* QuickJS's and the DOM's UTF-8 of a string keeps a lone surrogate in its
+   three-byte form; this makes the UTF-8 of the scalar values (a USVString's),
+   in place. */
+void web_utf8_replace_lone_surrogates(uint8_t *bytes, size_t length);
 
 /* A growing malloc'd buffer the decoders append UTF-8 to and the encoders bytes
    to. Zero-initialize; the caller frees data. */
@@ -40,12 +44,19 @@ bool web_bytes_put(struct web_bytes *out, const void *bytes, size_t length);
    mode, keeping its state between chunks of a stream. */
 struct web_decoder {
     lxb_encoding_decode_t lexbor;
-    web_encoding encoding;
+    web_encoding encoding; /* the instance's: init's, or what sniff found */
+    web_encoding given;    /* init's */
     bool fatal;
     /* TextDecoder's serialize I/O queue: the first scalar value of UTF-8 and
        UTF-16BE/LE, if U+FEFF, is not output. Set after init by the caller. */
     bool drop_bom;
+    /* decode's BOM sniff, streaming: the first three bytes (fewer at the end)
+       wait, and a BOM among them chooses UTF-8 or UTF-16BE/LE over the
+       encoding and is not decoded. Set after init by the caller. */
+    bool sniff;
+    bool sniffed;
     bool started; /* a scalar value has been output (or dropped) */
+    uint8_t held[3], held_length; /* bytes waiting for the sniff */
     lxb_codepoint_t buffer[256];
 };
 /* A new instance of the encoding's decoder (not failure). */
@@ -53,7 +64,8 @@ void web_decoder_init(struct web_decoder *decoder, web_encoding encoding, bool f
 /* Processes bytes, then end-of-queue when last, appending each scalar value's
    UTF-8 to out. 1; 0 at an error in fatal mode (out has the scalar values
    before it); -1 when out of memory. After end-of-queue, an error or running
-   out of memory the instance starts afresh (TextDecoder's new instance). */
+   out of memory the instance starts afresh with init's encoding (TextDecoder's
+   new instance). */
 int web_decoder_run(struct web_decoder *decoder, const uint8_t *bytes, size_t length,
                     bool last, struct web_bytes *out);
 
@@ -82,5 +94,6 @@ size_t web_encoder_put(struct web_encoder *encoder, uint32_t scalar,
 /* end-of-queue: the bytes the encoder still gives (ISO-2022-JP's return to ASCII). */
 size_t web_encoder_finish(struct web_encoder *encoder, uint8_t out[WEB_ENCODER_MAX]);
 /* encode in the "html" error mode (HTML forms): the UTF-8 of scalar values
-   encoded, each error as &#N;, appended to out. false when out of memory. */
+   encoded, each error as &#N;, appended to out (a surrogate's three bytes are
+   taken as U+FFFD). false when out of memory. */
 bool web_encode_html(web_encoding encoding, const char *utf8, size_t length, struct web_bytes *out);

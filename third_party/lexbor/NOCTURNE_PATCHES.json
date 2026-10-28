@@ -49,7 +49,7 @@
         "source/lexbor/encoding/res.h",
         "source/lexbor/url/url.c"
       ],
-      "purpose": "Every label of the current standard (upstream's table lacked unicode11utf8, unicode20utf8, x-unicode20utf8, csunicode, iso-10646-ucs-2, ucs-2, unicode, unicodefeff, unicodefffe); the gb18030 and GBK encoders' GB18030-2022 side table (U+E78D..U+E864 to two bytes); gb18030 ranges pointer 39419 decodes to U+FFFF; the gb18030 decoder no longer carries a stale prepend into the next chunk after a three-byte prefix's error; the replacement decoder gives one error for non-empty input, then finished; ISO-2022-JP's end-of-queue by state (leading byte, Roman and katakana are finished, a trailing byte's ESC still errs, escape restores its leading byte); the ISO-2022-JP encoder does not output U+000E, U+000F or U+001B in jis0208 state; lxb_encoding_encode_or_fail_single gives encode or fail's ESC ( B before an error and U+FFFD as the error for those three; percent-encode after encoding outputs the bytes before an error, then %26%23N%3B.",
+      "purpose": "Every label of the current standard (upstream's table lacked unicode11utf8, unicode20utf8, x-unicode20utf8, csunicode, iso-10646-ucs-2, ucs-2, unicode, unicodefeff, unicodefffe); the gb18030 and GBK encoders' GB18030-2022 side table (U+E78D..U+E864 to two bytes); gb18030 ranges pointer 39419 decodes to U+FFFF; the gb18030 decoder no longer carries a stale prepend into the next chunk after a three-byte prefix's error; the replacement decoder gives one error for non-empty input, then finished; ISO-2022-JP's end-of-queue by state (leading byte, Roman and katakana are finished, a trailing byte's ESC still errs, escape restores its leading byte); the ISO-2022-JP encoder does not output U+000E, U+000F or U+001B in jis0208 state; lxb_encoding_encode_or_fail_single gives encode or fail's ESC ( B before an error and U+FFFD as the error for those three; percent-encode after encoding outputs the bytes before an error, then %26%23N%3B. The URL parser's query state keeps UTF-8 for ws: and wss: by the URL's scheme, which a relative input takes from its base (upstream read the scheme it had parsed, none for such an input).",
       "default_behavior": "Decoding and encoding of every other byte sequence and scalar value are upstream's; tests/check_encoding.py compares all encoders on every BMP scalar value and all decoders on every one- and two-byte input with a reference written from the standard.",
       "generated": "source/lexbor/encoding/res.c's lxb_encoding_res_shs_entities and its size in res.h by ports/lexbor/encoding_labels.py from the standard's encodings.json",
       "specifications": [
@@ -60,7 +60,8 @@
         "https://encoding.spec.whatwg.org/#iso-2022-jp-decoder",
         "https://encoding.spec.whatwg.org/#iso-2022-jp-encoder",
         "https://encoding.spec.whatwg.org/#encode-or-fail",
-        "https://url.spec.whatwg.org/#string-percent-encode-after-encoding"
+        "https://url.spec.whatwg.org/#string-percent-encode-after-encoding",
+        "https://url.spec.whatwg.org/#query-state"
       ]
     }
   ]
