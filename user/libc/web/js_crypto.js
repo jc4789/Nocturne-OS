@@ -19,7 +19,7 @@ const cryptoSecureContext = (function installCrypto(host) {
   const nativeRandom = host.cryptoRandom, nativeDigest = host.cryptoDigest, nativeAES = host.cryptoAES;
   const keySlots = new WeakMap(), keyGet = WeakMap.prototype.get, keySet = WeakMap.prototype.set;
   const freeze = Object.freeze, create=Object.create, slice=Array.prototype.slice;
-  const error = (name, message) => new DomErr(message, name);
+  const error = (name, message) => domExceptionBridge.create(name, message);
   const integers = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
     'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array', 'BigUint64Array'];
 

@@ -1007,7 +1007,7 @@
     Object.defineProperty(CSSStyleProperties.prototype,Symbol.toStringTag,{value:'CSSStyleProperties',configurable:true});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
     /* @include js_dom_exception.js */
-    const DOMException=domExceptionBridge.DOMException;
+    const DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
     /* @include js_atob.js */
     /* @include js_pointer_events.js */
     /* @include js_tokens.js */
@@ -1031,7 +1031,7 @@
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
-        Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
+        Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,QuotaExceededError,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,reportError,
         CSSStyleDeclaration,CSSStyleProperties,
         performance:{now:()=>host.now()},getComputedStyle:(n,pseudo=null)=>new CSSStyleProperties(n,true,styleToken,pseudo)});

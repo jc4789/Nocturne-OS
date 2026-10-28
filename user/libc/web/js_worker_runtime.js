@@ -6,7 +6,7 @@
     // SharedArrayBuffer and Atomics stay for the platform bootstrap; the
     // native policy start removes the constructor outside isolation.
     /* @include js_dom_exception.js */
-    const DOMException=domExceptionBridge.DOMException;
+    const DOMException=domExceptionBridge.DOMException,QuotaExceededError=domExceptionBridge.QuotaExceededError;
     /* @include js_atob.js */
     const eventStates=new WeakMap(),listeners=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set;
     const eventDefine=Object.defineProperty,eventCreate=Object.create,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventSlice=Array.prototype.slice;
@@ -98,7 +98,7 @@
         }finally{s.currentTarget=null;s.eventPhase=0;s.path=[];s.dispatching=s.passive=s.stop=s.immediate=false;}
     }
     function dispatchNativeWorkerEvent(object,event,snapshot){eventState(event).isTrusted=true;return dispatchWorkerEvent(object,event,snapshot);}
-    Object.assign(globalThis,{DOMException,Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,EventTarget});
+    Object.assign(globalThis,{DOMException,QuotaExceededError,Event,ErrorEvent,PromiseRejectionEvent,CustomEvent,EventTarget});
     const progressSlots=new WeakMap();
     class ProgressEvent extends Event{
         constructor(type,init={}){init=init==null?{}:Object(init);super(type,init);const number=v=>{const n=Number(v)||0;return Number.isFinite(n)?Number(BigInt(Math.trunc(n))&18446744073709551615n):0;};apply(eventSet,progressSlots,[this,{lengthComputable:!!init.lengthComputable,loaded:number(init.loaded),total:number(init.total)}]);}
