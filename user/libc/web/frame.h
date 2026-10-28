@@ -11,6 +11,8 @@ struct web_frame {
     web_doc *retired;
     web_doc *navigation_owner;
     char *source, *srcdoc, *navigation, *navigation_origin, *sandbox;
+    char *navigation_body, *navigation_type; /* the navigation's POST body and its Content-Type */
+    size_t navigation_body_length;
     char *target_name, *name_attribute; /* navigable名と最後のHTML name属性を別所有 */
     uint64_t request;
     unsigned dom_order;
@@ -39,6 +41,14 @@ struct web_frame *web_frame_ensure(web_doc *document, node_t *element);
 void web_frame_retire(struct web_frame *frame);
 void web_frames_detach_tree(web_doc *document,node_t *root);
 bool web_frame_set_navigation(struct web_frame *frame,const char *url,web_doc *origin);
+/* The request body (a form's POST entry list) and Content-Type of the navigation
+   web_frame_set_navigation set last; NULL body: none (a GET). */
+bool web_frame_set_navigation_body(struct web_frame *frame,const void *body,size_t length,const char *content_type);
+/* HTML's rules for choosing a navigable, for a source document of top's tree and a target:
+   the source (no target, _self), top (_top), the parent (_parent), or a frame of top's tree with
+   that target name. NULL for _blank and for a name no frame of the page has, which another
+   top-level traversable may have (the host's) or a new one takes. */
+web_doc *web_frame_choose(web_doc *top,web_doc *source,const char *target);
 bool web_frame_initial_blocked(const struct web_frame *frame,const char *source,const char *srcdoc);
 bool web_frame_initial_create(struct web_frame *frame,const struct web_host *host);
 /* A frame's document from markup the browser writes (about:blank, srcdoc,

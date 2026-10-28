@@ -113,7 +113,21 @@ bool web_frame_set_navigation(struct web_frame *f,const char *url,web_doc *origi
     if(!f || !url || !origin)return false;
     char *copy=strdup(url),*initiator=strdup(web_effective_url(origin));
     if(!copy || !initiator){free(copy);free(initiator);return false;}
-    free(f->navigation);free(f->navigation_origin);f->navigation=copy;f->navigation_origin=initiator;f->navigation_owner=origin;f->initial_failed=false;return true;
+    free(f->navigation);free(f->navigation_origin);f->navigation=copy;f->navigation_origin=initiator;f->navigation_owner=origin;f->initial_failed=false;
+    web_frame_set_navigation_body(f,NULL,0,NULL);return true;
+}
+bool web_frame_set_navigation_body(struct web_frame *f,const void *body,size_t length,const char *content_type) {
+    if(!f)return false;
+    free(f->navigation_body);free(f->navigation_type);f->navigation_body=f->navigation_type=NULL;f->navigation_body_length=0;
+    if(!body)return true;
+    char *copy=malloc(length?length:1),*type=strdup(content_type?content_type:"");
+    if(!copy || !type){
+        /* Without its body the navigation would be another request: none is kept. */
+        free(copy);free(type);free(f->navigation);free(f->navigation_origin);
+        f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return false;
+    }
+    if(length)memcpy(copy,body,length);
+    f->navigation_body=copy;f->navigation_type=type;f->navigation_body_length=length;return true;
 }
 bool web_frame_initial_blocked(const struct web_frame *f,const char *src,const char *srcdoc) {
     return f && f->initial_failed && !f->detached && f->source && !strcmp(f->source,src?src:"") &&
@@ -329,7 +343,7 @@ void web_frames_free(web_doc *d) {
             struct web_frame *f=current->frames;current->frames=f->next;
             if(f->document){f->document->frame_free_next=pending;pending=f->document;}
             while(f->retired){web_doc *old=f->retired;f->retired=old->frame_retired_next;old->frame_free_next=pending;pending=old;}
-            free(f->paint.px);free(f->source);free(f->srcdoc);free(f->navigation);free(f->navigation_origin);free(f->sandbox);free(f->target_name);free(f->name_attribute);free(f);
+            free(f->paint.px);free(f->source);free(f->srcdoc);free(f->navigation);free(f->navigation_origin);free(f->navigation_body);free(f->navigation_type);free(f->sandbox);free(f->target_name);free(f->name_attribute);free(f);
         }
         if(current!=d){current->frame_free_next=finished;finished=current;}
     }
@@ -452,6 +466,13 @@ static web_doc *named_frame(web_doc *d,const char *name) {
     }
     return NULL;
 }
+web_doc *web_frame_choose(web_doc *top,web_doc *source,const char *target) {
+    if(!target || !*target || !strcasecmp(target,"_self"))return source;
+    if(!strcasecmp(target,"_top"))return top;
+    if(!strcasecmp(target,"_parent"))return source->frame_parent?source->frame_parent:source;
+    if(!strcasecmp(target,"_blank"))return NULL;
+    return named_frame(top,target);
+}
 static bool frame_link_space(unsigned char c) {
     return c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\f';
 }
@@ -490,26 +511,22 @@ bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url,bool activ
     web_doc *root=source;while(root->frame_parent)root=root->frame_parent;
     if(root!=top){web_js_console(source,1,"Link source belongs to another browsing context");return true;}
     if(source->sandbox_flags && node_attr(anchor,"download") && (source->sandbox_flags&SB_DOWNLOADS)){web_js_console(source,1,"Sandbox denied link download");return true;}
-    const char *target=frame_link_target(source,anchor);web_doc *destination=source;
-    if(target && *target && strcasecmp(target,"_self")){
-        if(!strcasecmp(target,"_top"))destination=top;
-        else if(!strcasecmp(target,"_parent"))destination=source->frame_parent?source->frame_parent:source;
-        else if(!strcasecmp(target,"_blank")){
-            if(!frame_auxiliary_allowed(source))return true;
-            const char *rel=node_attr(anchor,"rel");
-            if(frame_link_token(rel,"opener") && !frame_link_token(rel,"noopener") && !frame_link_token(rel,"noreferrer")){
-                web_js_console(source,1,"Auxiliary link opener relationships are not implemented");return true;
-            }
-            if(!web_js_auxiliary_link(source,anchor,url,"_blank",activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
-            return true;
+    const char *target=frame_link_target(source,anchor);web_doc *destination=web_frame_choose(top,source,target);
+    if(!destination && !strcasecmp(target,"_blank")){
+        if(!frame_auxiliary_allowed(source))return true;
+        const char *rel=node_attr(anchor,"rel");
+        if(frame_link_token(rel,"opener") && !frame_link_token(rel,"noopener") && !frame_link_token(rel,"noreferrer")){
+            web_js_console(source,1,"Auxiliary link opener relationships are not implemented");return true;
         }
-        else if(!(destination=named_frame(top,target))) {
-            /* No frame of this page has the name: another top-level traversable may (the
-               host's tab of that name), or a new one takes it as a popup would. */
-            if(!frame_auxiliary_allowed(source))return true;
-            if(!web_js_auxiliary_link(source,anchor,url,target,activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
-            return true;
-        }
+        if(!web_js_auxiliary_link(source,anchor,url,"_blank",activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
+        return true;
+    }
+    if(!destination) {
+        /* No frame of this page has the name: another top-level traversable may (the
+           host's tab of that name), or a new one takes it as a popup would. */
+        if(!frame_auxiliary_allowed(source))return true;
+        if(!web_js_auxiliary_link(source,anchor,url,target,activated))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
+        return true;
     }
     if(!web_sandbox_navigation_allowed(source,destination,activated)){web_js_console(source,1,"Sandbox destination policy denied link navigation");return true;}
     if(destination==top)return false;

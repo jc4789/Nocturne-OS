@@ -67,7 +67,7 @@ static struct web_host frame_host(struct web_js_state *s,const struct js_pending
    document inherits that realm's origin, like a blob URL entry's environment. */
 static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const char *url) {
     web_doc *owner=f->navigation_owner?f->navigation_owner:s->doc;
-    free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;
+    free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);
     if(owner!=s->doc){f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame blob URL belongs to another realm");return;}
     char mime[128];size_t n=0;bool untyped=false;
     char *body=script_blob_source(s,url,false,&n,mime,&untyped);
@@ -167,7 +167,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     if(f->pending_sandbox_flags && (!*desired || !strcasecmp(desired,"about:blank")) &&
        !web_sandbox_document_allowed(f,"about:blank",true)){
         web_frame_retire(f);f->failed=true;f->detached=false;
-        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;
+        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);f->navigation_owner=NULL;
         log_text(s,1,"Sandboxed authored about:blank policy is outside the supported subset");return;
     }
     if(!*desired || !strcasecmp(desired,"about:blank")) {
@@ -177,7 +177,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         struct web_host host=frame_host(s,NULL);
         if((f->navigation || restricted || strcmp(f->document->url,"about:blank")) && !web_frame_commit(f,"",0,"about:blank",NULL,&host,true))
             log_text(s,2,"Frame about:blank navigation failed");
-        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return;
+        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);f->navigation_owner=NULL;return;
     }
     if(!strncasecmp(desired,"javascript:",11)) {
         if(web_frame_same_origin(s->doc,f->document) && f->document->js && !f->document->js->disabled &&
@@ -187,7 +187,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
             if(JS_IsException(result))exception(child);else JS_FreeValue(child->ctx,result);
             end_task(child);
         }else log_text(s,1,"Cross-origin javascript frame navigation blocked");
-        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return;
+        free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;web_frame_set_navigation_body(f,NULL,0,NULL);f->navigation_owner=NULL;return;
     }
     /* HTML's shared attribute processing steps for iframe and frame elements:
        encoding-parse the src relative to the element's node document (a
@@ -197,10 +197,13 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     if(resolved==1 && !strncasecmp(url,"blob:",5)){frame_blob_commit(s,f,url);free(url);return;}
     bool valid=resolved==1 && permitted_url(s,url,false);
     free(f->navigation);f->navigation=NULL;
-    if(!valid){free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;f->failed=true;log_text(s,resolved<0?2:1,resolved<0?"Frame source URL allocation failed":"Frame source URL is not permitted");return;}
+    /* The navigation's POST body (a form's) goes with its request. */
+    char *post=f->navigation_body,*post_type=f->navigation_type;size_t post_length=f->navigation_body_length;
+    f->navigation_body=f->navigation_type=NULL;f->navigation_body_length=0;
+    if(!valid){free(post);free(post_type);free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;f->failed=true;log_text(s,resolved<0?2:1,resolved<0?"Frame source URL allocation failed":"Frame source URL is not permitted");return;}
     int ancestor=f->navigation_owner?0:web_frame_ancestor_url(s->doc,url);
     if(ancestor){
-        free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->failed=true;
+        free(post);free(post_type);free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->failed=true;
         log_text(s,ancestor<0?2:1,ancestor<0?"Frame ancestor URL comparison allocation failed":
                  "Frame src repeats an ancestor document URL (fragment excluded)");return;
     }
@@ -216,9 +219,16 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         if(!p->referrer)pending_error(p,"Frame referrer could not be retained");
     }
     free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;
-    if(!p){log_text(s,2,"Frame request queue or memory limit reached");return;}
+    if(!p){free(post);free(post_type);log_text(s,2,"Frame request queue or memory limit reached");return;}
     p->frame=f;f->request=p->id;f->notified=false;
-    if(!p->done)send_request(s,p,WEB_RESOURCE_FRAME,"GET",NULL,NULL,0);
+    if(!p->done){
+        size_t length=post?strlen(post_type)+17:0;char *fields=post?malloc(length):NULL;
+        if(fields)snprintf(fields,length,"Content-Type: %s\r\n",post_type);
+        if(post && !fields)pending_error(p,"Frame form request could not be retained");
+        else send_request(s,p,WEB_RESOURCE_FRAME,post?"POST":"GET",fields,post,post_length);
+        free(fields);
+    }
+    free(post);free(post_type);
 }
 static void frames_walk(struct web_js_state *s,node_t *root,unsigned *order) {
     for(node_t *n=root;n;) {

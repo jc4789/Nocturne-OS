@@ -2972,18 +2972,31 @@ void web_form_navigate(web_doc *d, node_t *submitter) {
     if (submitter && submitter->owner) d = submitter->owner;
     if (!d || !d->js || web_js_dialog_submit(d,submitter) != 0) return;
     struct web_js_state *s = d->js;
-    if(d->frame_parent){web_js_console(d,2,"Child form navigation requires a destination/origin-aware embedder and is not implemented");return;}
     struct web_form_request request;
     if (!web_submit_request(d,submitter,&request)) return;
     web_autocomplete_record(d,submitter,request.url);
+    /* "Plan to navigate": the form's target chooses the navigable among this page's frames
+       first (frame.c), then the host's top-level traversables. */
+    web_doc *top=d;while(top->frame_parent)top=top->frame_parent;
+    web_doc *destination=web_frame_choose(top,d,request.target);
+    struct web_navigation navigation={.url=request.url,.history=WEB_NAVIGATE_PUSH,.body=request.body,
+        .body_length=request.body_len,.content_type=request.content_type,.target=destination?NULL:request.target};
+    web_navigation_source(d,web_form_owner(d,submitter),&navigation);
     if (strncmp(request.url,"https://",8) && strncmp(request.url,"http://",7))
         web_js_console(d,2,"Form navigation requires an HTTP(S) destination");
-    else if (s->host.navigate) {
-        struct web_navigation navigation={.url=request.url,.history=WEB_NAVIGATE_PUSH,.body=request.body,
-            .body_length=request.body_len,.content_type=request.content_type,.target=request.target};
-        web_navigation_source(d,web_form_owner(d,submitter),&navigation);
-        s->host.navigate(s->host.opaque,&navigation);
+    else if (destination && !web_sandbox_navigation_allowed(d,destination,navigation.user_activation))
+        web_js_console(d,1,"Sandbox destination policy denied form navigation");
+    else if (!destination && !web_sandbox_auxiliary_allowed(d))
+        web_js_console(d,1,"Sandbox auxiliary policy denied form navigation");
+    else if (destination && destination!=top) {
+        /* The chosen frame fetches the form's request itself, its body with it. */
+        struct web_frame *frame=web_frame_find(destination->frame_parent,destination->frame_element);
+        if (!web_frame_set_navigation(frame,request.url,d) ||
+            (request.body && !web_frame_set_navigation_body(frame,request.body,request.body_len,request.content_type)))
+            web_js_console(d,2,"Child form navigation could not retain its request");
+        else top->dirty=true;
     }
+    else if (s->host.navigate) s->host.navigate(s->host.opaque,&navigation);
     else web_js_console(d,2,"The embedder cannot preserve this form encoding or destination");
     web_submit_request_free(&request);
 }
