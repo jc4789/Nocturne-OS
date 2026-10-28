@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 import subprocess
+import url_owner
 
 root=Path(__file__).resolve().parent.parent
 out=root/'build/goal-20261009/stylesheets24'
@@ -23,10 +24,6 @@ for signature in ('static struct cached_css *cached_css(','static int b64(','sta
     doc_parts+=function(doc,signature)
 dom=read('user/libc/web/dom.c')
 doc_parts+=function(dom,'node_t *doc_shadow_parent(')+function(dom,'node_t *doc_node_root(')
-http=read('user/libc/http.c')
-urls=out/'url.c'
-at=http.index('enum http_url_result http_origin_owned(')
-urls.write_text(http[:http.index('\n}',at)+2],encoding='utf-8')
 prefix=read('tests/stylesheets24_native_prefix.c')
 c=out/'native.c'
 c.write_text(prefix.replace('/* REAL_PARSER */',parser).replace('/* REAL_DOCUMENT_HELPERS */',doc_parts)
@@ -49,9 +46,11 @@ abi=out/'host-abi';abi.mkdir(exist_ok=True)
 (abi/'setjmp.h').write_text('#include "'+(cc.parent.parent/'include/setjmp.h').as_posix()+'"\n',encoding='utf-8')
 objects=[]
 native_flags=['-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web','-Ithird_party/quickjs']
-for i,path in enumerate((c,root/'user/libc/web/cssprop.c',root/'user/libc/web/shape.c',root/'user/libc/web/color.c',root/'user/libc/web/util.c',root/'user/libc/web/html.c',urls)):
+for i,path in enumerate((c,root/'user/libc/web/cssprop.c',root/'user/libc/web/shape.c',root/'user/libc/web/color.c',root/'user/libc/web/util.c',root/'user/libc/web/html.c')):
     obj=out/f'native{i}.o';objects.append(obj)
     subprocess.run([str(cc),*native_flags,'-c',str(path),'-o',str(obj)],cwd=root,env=env,check=True)
+# CSSOM's origin-clean flag compares origins from the URL record's owner (tests/url_owner.py).
+objects+=url_owner.objects(root,cc,util=False)
 for name in ('quickjs','dtoa','libregexp','libunicode','cutils'):
     obj=out/f'{name}.o';objects.append(obj)
     subprocess.run([str(cc),'-std=gnu11','-O1','-fwrapv','-funsigned-char','-DCONFIG_NOCTURNE','-DCONFIG_VERSION="Nocturne-test"',

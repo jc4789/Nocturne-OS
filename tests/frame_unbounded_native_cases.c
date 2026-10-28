@@ -6,9 +6,9 @@
 #include <math.h>
 #include <limits.h>
 #include "gfx.h"
+#include <weburl.h>
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
-#define HTTP_URL_MAX 16384u
 enum {N_DOC,N_ELEM,N_FRAGMENT,T_iframe,T_frame,T_template,T_frameset,D_BLOCK,D_NONE};
 typedef struct web_doc web_doc;
 typedef struct node node_t;
@@ -20,7 +20,6 @@ struct web_doc {struct web_frame *frames,*frame_container;web_doc *frame_parent,
 struct web_host {int unused;};
 struct web_response {int unused;};
 struct web_event {const char *type;};
-struct url {bool tls;char host[128];uint16_t port;char path[HTTP_URL_MAX];};
 /* PRODUCT_STRUCT */
 static int checks,failed,ticks,resources,frees,layouts,paints,publish_depth,max_depth;
 static int live_surfaces,max_surfaces;

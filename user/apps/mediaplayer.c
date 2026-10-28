@@ -8,6 +8,7 @@
 #include "ui.h"
 #include "media_video_private.h"
 #include "media_alloc_private.h"
+#include "weburl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -156,7 +157,10 @@ static void open_media(void) {
     if (!path[0]) { strlcpy(error,"Enter a file path or anonymous HTTP(S) URL.",sizeof error);return; }
     strlcpy(error,"Opening media (network reads are synchronous)...",sizeof error);
     show();ui_session_pump(ui); /* the blocking open below must not leave the window blank */
-    bool url = !strncmp(path,"http://",7)||!strncmp(path,"https://",8);
+    /* What the field holds is an http or https URL when the URL parser reads it as one. */
+    struct web_url typed;bool url=web_url_read(path,strlen(path),&typed)==1&&
+        web_url_http_scheme(&typed);
+    web_url_free(&typed);
     media=url?nmedia_open_url(path,error,sizeof error):nmedia_open(path,error,sizeof error);
     /* 10-bit frames either way: scaled in 10 bits, then kept by a 10 bpc
        display or dithered where they land on an 8 bpc one. */

@@ -11,7 +11,7 @@ def part(start, end):
 out = Path('build/goal-20261009/http-request-headers-tested.inc')
 out.write_text(part('struct header_buffer', 'static bool read_all') +
     part('static bool fail(', 'static int remaining(') +
-    part('static bool token_char(', '/* Only publish') +
+    part('static bool token_char(', '/* raw read by the URL parser') +
     part('static bool no_cors(', '/* Headers have already') +
     part('static bool cors_allowed(', 'static int cookie_header(') +
     part('static bool preflight(', 'static bool js_mime('),

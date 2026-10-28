@@ -1,7 +1,7 @@
 /* Origin private file system: the native half of js_opfs.js.
  * https://fs.spec.whatwg.org/ (2026-10-15) */
 #include "js_opfs.h"
-#include "http.h"
+#include <weburl.h>
 #include "nocturne.h"
 #include <webstorage.h>
 #include <webprefs.h>
@@ -77,10 +77,9 @@ static void origin_note(const char *folder, const char *name, const char *origin
 static int opfs_root(JSContext *ctx, char *out, size_t size) {
     const char *url = context_url ? context_url(ctx) : NULL;
     char *origin = NULL;
-    enum http_url_result r = url ? http_origin_owned(url, &origin) : HTTP_URL_INVALID;
-    if (r == HTTP_URL_OOM) return OPFS_MEMORY;
-    if (r != HTTP_URL_TUPLE || (strncmp(origin, "http://", 7) && strncmp(origin, "https://", 8)) ||
-        !webprefs_storage_allowed(origin)) {
+    enum web_url_result r = url ? web_url_origin(url, &origin) : WEB_URL_INVALID;
+    if (r == WEB_URL_OOM) return OPFS_MEMORY;
+    if (r != WEB_URL_TUPLE || !web_origin_http(origin) || !webprefs_storage_allowed(origin)) {
         free(origin);
         return OPFS_SECURITY;
     }

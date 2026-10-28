@@ -317,9 +317,6 @@ int main(void){
 '''
 source = out / "values.c"
 source.write_text(css_host + production + main, encoding="utf-8")
-http = (root / "user/libc/http.c").read_text(encoding="utf-8")
-url = out / "url.c"
-url.write_text(http[:http.index("/* The pool is process-local.")] + http[http.index("bool url_parse(const char *s, struct url *u)"):http.index("enum http_url_result http_origin_owned_n(")], encoding="utf-8")
 cc = root / "tools/msys64/ucrt64/bin/clang.exe"
 if not cc.exists():
     cc = root.parents[2] / "tools/msys64/ucrt64/bin/clang.exe"  # a git worktree shares the main tree's tools
@@ -331,6 +328,6 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / "values.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include",
            "-Icommon", "-Iuser/libc", "-Iuser/libc/web", "-Ithird_party/quickjs", str(source), "user/libc/web/cssprop.c", "user/libc/web/shape.c",
-           "user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", str(url), "-o", str(exe)]
+           "user/libc/web/color.c", "user/libc/web/util.c", "user/libc/web/html.c", "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=60)

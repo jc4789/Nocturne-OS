@@ -20,17 +20,19 @@ static struct web_url_parser *realm_parser(JSContext *ctx, JSValueConst holder) 
 
 static JSValue record(JSContext *ctx, int result, struct web_url *url) {
     if (result != 1) {
-        sb_free(&url->href);
+        web_url_free(url);
         return result < 0 ? JS_ThrowOutOfMemory(ctx) : JS_NULL;
     }
-    JSValue href = JS_NewStringLen(ctx, url->href.p ? url->href.p : "", url->href.n);
-    sb_free(&url->href);
+    JSValue href = JS_NewStringLen(ctx, url->href ? url->href : "", url->length);
+    size_t mark[WEB_URL_MARKS];
+    memcpy(mark, url->mark, sizeof mark);
+    web_url_free(url);
     if (JS_IsException(href)) return href;
     JSValue array = JS_NewArray(ctx);
     if (JS_IsException(array)) { JS_FreeValue(ctx, href); return array; }
     if (JS_DefinePropertyValueUint32(ctx, array, 0, href, JS_PROP_C_W_E) < 0) goto failed;
     for (int i = 0; i < WEB_URL_MARKS; i++)
-        if (JS_DefinePropertyValueUint32(ctx, array, (uint32_t)i + 1, JS_NewInt32(ctx, (int32_t)url->mark[i]),
+        if (JS_DefinePropertyValueUint32(ctx, array, (uint32_t)i + 1, JS_NewInt32(ctx, (int32_t)mark[i]),
                                          JS_PROP_C_W_E) < 0) goto failed;
     return array;
 failed:
