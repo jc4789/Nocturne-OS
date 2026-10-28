@@ -6,7 +6,8 @@
 
    Not the guest WPT: the cascade (css.c's selectors, the UA style sheet and the presentational
    hints of ol and li, which the cases write as the declarations css.c maps them to), box
-   generation (box.c's tree, display: none and contents), white-space processing of the texts,
+   generation (box.c's tree: a display: contents element is made here as no box with its children's
+   boxes under the box above), white-space processing of the texts,
    layout and paint are not reached. The flat tree is the DOM tree (no shadow trees). */
 
 static int checks, failed;
@@ -60,7 +61,7 @@ static jmp_buf values_trap;
 static style_t root_style;
 static box_t *boxes[2048];
 static int nboxes;
-static bool pseudos[2048];
+static bool pseudos[2048], unboxed[2048]; /* a pseudo-element's box; a display: contents element's record */
 static box_t *root;
 struct want { const box_t *b; const char *text; int at; };
 static struct want wants[1024];
@@ -105,6 +106,7 @@ static box_t *new_box(box_t *parent, node_t *node, const style_t *st, bool pseud
         parent->last = b;
     }
     pseudos[nboxes] = pseudo;
+    unboxed[nboxes] = false;
     boxes[nboxes++] = b;
     return b;
 }
@@ -127,14 +129,30 @@ static void scene(const char *name) {
     n->box = root; n->style = root->st;
     doc.root_box = root;
 }
-/* an element's principal box, the last child of parent's */
+static bool is_unboxed(const box_t *b) {
+    for (int i = 0; i < nboxes; i++) if (boxes[i] == b) return unboxed[i];
+    return false;
+}
+/* an element's principal box, the last child of parent's (of the nearest box above parent when
+   that is a display: contents element, which generates none) */
 static box_t *element(box_t *parent, const char *decls) {
     node_t *n = calloc(1, sizeof *n);
     n->type = N_ELEM; n->owner = &doc; n->parent = parent->node;
     if (parent->node->last) parent->node->last->next = n; else parent->node->first = n;
     n->prev = parent->node->last;
     parent->node->last = n;
-    box_t *b = new_box(parent, n, style_of(parent->st, decls), false);
+    const style_t *st = style_of(parent->st, decls);
+    if (st->display == D_CONTENTS) {
+        /* no box: a record of its node and style for its children, outside the box tree */
+        box_t *record = new_box(NULL, n, st, false);
+        unboxed[nboxes - 1] = true;
+        record->parent = parent;
+        n->style = record->st;
+        return record;
+    }
+    box_t *host = parent;
+    while (is_unboxed(host)) host = host->parent;
+    box_t *b = new_box(host, n, st, false);
     n->box = b; n->style = b->st;
     return b;
 }
@@ -186,6 +204,7 @@ static void want(box_t *b, const char *text) {
 static void count(void) {
     for (int i = 0; i < nboxes; i++) {
         box_t *b = boxes[i];
+        if (unboxed[i]) continue;
         if (pseudos[i]) b->counter_kind = BOX_COUNTER_PSEUDO;
         else if (b->st->display == D_LIST_ITEM)
             b->counter_kind = BOX_COUNTER_ELEMENT | (marker_generated(b->st) ? BOX_COUNTER_MARKER : 0);

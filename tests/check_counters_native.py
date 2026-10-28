@@ -6,12 +6,13 @@
 で走らせる。試すのは WPT の css/css-lists の reftest（li-value-reversed-*、li-list-item-counter-*、
 counter-list-item、counter-reset-reversed-*、counters-scope-*、counters-00*、counter-set-001、
 counter-reset-increment-overflow-underflow、implicit-and-explicit-list-item-counters、
-marker-quotes）が参照の頁で示す番号と文字。counters-001〜004 は WPT の頁と参照から読む。
+marker-quotes、display: contents の二つ）が参照の頁で示す番号と文字。counters-001〜004 は WPT の頁と参照から読む。
 
 guest の WPT の代わりではない。cascade（css.c の selector、UA の style sheet、ol・li の
 presentational hint。hint は css.c が写す宣言で書く：li value=V → counter-set: list-item V、
 ol reversed → counter-reset: reversed(list-item)、start=S → list-item S-1、reversed と start →
-reversed(list-item) S+1）、箱の生成（display: none・contents）、空白の処理、配置・描画は通らない。
+reversed(list-item) S+1）、箱の生成（display: none の要素は箱を作らない。contents は箱を作らず子の箱を
+上の箱へ置く形を手で組む）、空白の処理、配置・描画は通らない。
 
   python -X utf8 tests/check_counters_native.py [--out 出力の場所]
 """
@@ -252,6 +253,15 @@ case("implicit-and-explicit-list-item-counters",
 # ol { quotes: "\2018" "\2019"; } ::marker { content: open-quote counter(list-item) close-quote " "; }
 # :nth-child(2)::marker { quotes: "«" "»"; } :nth-child(3)::marker { quotes: "‹" "›"; }
 mq = "content: open-quote counter(list-item) close-quote ' '"
+# .inc { counter-increment: x } .reset-6 { counter-reset: x 6 } .reset-666 { counter-reset: x 666 }
+# .set-666 { counter-set: x 666 } .contents { display: contents } .result::before { content: counter(x) }
+# (CSS Lists 3 §4.5: an element without a box does not touch counters; its children do)
+result = ("content: counter(x)", "7")
+case("counter-reset-increment-set-display-contents",
+     E("", E("counter-reset: x 6"), E("display: contents; counter-reset: x 666; counter-increment: x"),
+       E("display: contents; counter-set: x 666"), E("counter-increment: x", before=result)))
+case("counter-increment-inside-display-contents",
+     E("", E("counter-reset: x 6"), E("display: contents", E("counter-increment: x")), E(before=result)))
 case("marker-quotes",
      E(UA_OL + "; quotes: '\u2018' '\u2019'", li("\u20181\u2019 ", marker_decls=mq),
        li("\u00ab2\u00bb ", marker_decls=mq + "; quotes: '\u00ab' '\u00bb'"),
