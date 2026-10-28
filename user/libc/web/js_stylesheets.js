@@ -9,7 +9,7 @@
     const StringType = String, Exception = DOMException, TypeErr = TypeError, MapType = Map, ProxyType = Proxy;
     const ReflectGet = Reflect.get, ReflectSet = Reflect.set, OwnKeys = Reflect.ownKeys, Descriptor = Reflect.getOwnPropertyDescriptor;
     const DefineProperty = Reflect.defineProperty, DeleteProperty = Reflect.deleteProperty;
-    const push = Array.prototype.push, concat = Array.prototype.concat, freeze = Object.freeze;
+    const push = Array.prototype.push, concat = Array.prototype.concat, join = Array.prototype.join, freeze = Object.freeze;
     const slice = Array.prototype.slice, splice = Array.prototype.splice;
     const constructorDocument = document, PromiseType = Promise;
     const mapGet = Map.prototype.get, mapSet = Map.prototype.set;
@@ -44,6 +44,8 @@
     function ruleOp(rule, op, ...args) { const state = ruleState(rule); return operation(state.sheet, op, state.id, ...args); }
     function attr(rule, name) { return ruleOp(rule, 'attr', name); }
     function info(rule) { return ruleOp(rule, 'rule'); }
+    /* CSSRule.parentStyleSheet: null once the rule is removed */
+    function ruleSheet(rule) { const r = info(rule); return r && r[1] ? ruleState(rule).sheet : null; }
     /* the CSSRule object a native rule id stands for, one per id */
     function ruleFor(sheet, id, type) {
         const state = owner(sheet);
@@ -168,7 +170,7 @@
         get cssText() { return ruleOp(this, 'cssText'); }
         // CSSOM explicitly specifies no rule mutation for this base setter.
         set cssText(value) { ruleState(this); string(value); }
-        get parentStyleSheet() { const r = info(this); return r && r[1] ? ruleState(this).sheet : null; }
+        get parentStyleSheet() { return ruleSheet(this); }
         get parentRule() { const r = info(this); return r && r[2] ? ruleFor(ruleState(this).sheet, r[2], r[3]) : null; }
     }
     class CSSGroupingRule extends CSSRule {
@@ -185,8 +187,11 @@
     class CSSMediaRule extends CSSConditionRule {
         get media() { const s = ruleState(this); return mediaOf(s.sheet, s.id, s); }
         set media(value) { this.media.mediaText = value; }
+        get matches() { return attr(this, 'matches') === 'true'; }
     }
-    class CSSSupportsRule extends CSSConditionRule {}
+    class CSSSupportsRule extends CSSConditionRule {
+        get matches() { return attr(this, 'matches') === 'true'; }
+    }
     class CSSContainerRule extends CSSConditionRule {
         get containerName() { return attr(this, 'containerName') ?? ''; }
         get containerQuery() { return attr(this, 'containerQuery') ?? ''; }
@@ -206,7 +211,16 @@
         get href() { return attr(this, 'href') ?? ''; }
         get media() { const s = ruleState(this); return mediaOf(s.sheet, s.id, s); }
         set media(value) { this.media.mediaText = value; }
-        get styleSheet() { ruleState(this); return null; }
+        // [SameObject]: the sheet of the rule's resource once it has loaded, with this rule its ownerRule
+        get styleSheet() {
+            const s = ruleState(this);
+            if (s.styleSheet) return s.styleSheet;
+            const id = ruleOp(this, 'importSheet');
+            if (!id) return null;
+            const sheet = new CSSStyleSheet(token, owner(s.sheet).node, id);
+            owner(sheet).ownerRule = this;
+            return s.styleSheet = sheet;
+        }
         get layerName() { return attr(this, 'layerName'); }
         get supportsText() { return attr(this, 'supportsText'); }
     }
@@ -272,7 +286,12 @@
         get name() { return attr(this, 'name') ?? ''; }
     }
     class CSSLayerStatementRule extends CSSRule {
-        get nameList() { return freeze(attr(this, 'nameList') ?? []); }
+        // FrozenArray: the same array for as long as the names are the same
+        get nameList() {
+            const s = ruleState(this), names = attr(this, 'nameList') ?? [], key = apply(join, names, ['\u0000']);
+            if (!s.nameList || s.nameKey !== key) { s.nameList = freeze(names); s.nameKey = key; }
+            return s.nameList;
+        }
     }
     class CSSScopeRule extends CSSGroupingRule {
         get start() { return attr(this, 'start'); }
@@ -359,30 +378,56 @@
         get href() { return operation(this,'href'); }
         get ownerNode() {
             const state = owner(this);
-            return operation(this,'current') ? state.node : null;
+            return !state.ownerRule && operation(this,'current') ? state.node : null;
         }
-        get parentStyleSheet() { owner(this); return null; }
-        get title() { const state = owner(this); if (state.constructed) return null; const title = reflectedAttr(state.node, 'title'); return title ? title : null; }
-        get media() { const state = owner(this); return mediaOf(this, 0, state); }
+        // an @import rule's sheet: its rule's sheet, while the rule stands in it
+        get parentStyleSheet() { const state = owner(this); return state.ownerRule ? ruleSheet(state.ownerRule) : null; }
+        get title() {
+            const state = owner(this); if (state.constructed || state.ownerRule) return null;
+            const title = reflectedAttr(state.node, 'title'); return title ? title : null;
+        }
+        // an @import rule's sheet has the rule's MediaList (CSSImportRule.media is styleSheet.media)
+        get media() {
+            const state = owner(this);
+            if (state.ownerRule) { const s = ruleState(state.ownerRule); return mediaOf(s.sheet, s.id, s); }
+            return mediaOf(this, 0, state);
+        }
         set media(value) { this.media.mediaText = value; }
         get disabled() { return operation(this,'disabled'); }
         set disabled(value) { operation(this,'disable',value ? 1 : 0); }
     }
+    /* the CSSStyleSheetInit dictionary (WebIDL: its members in order, each converted) */
+    function sheetInit(options) {
+        const init = { baseURL: null, disabled: false, media: '' };
+        if (options === undefined || options === null) return init;
+        if (typeof options !== 'object' && typeof options !== 'function') throw new TypeErr('CSSStyleSheetInit must be an object');
+        const base = options.baseURL;
+        if (base !== undefined && base !== null) init.baseURL = string(base);
+        const disabled = options.disabled;
+        if (disabled !== undefined) init.disabled = !!disabled;
+        const media = options.media;
+        if (media !== undefined) init.media = apply(get, mediaOwners, [media]) ? media : string(media);
+        return init;
+    }
     class CSSStyleSheet extends StyleSheet {
         constructor(key, node, id) {
             const constructed = key !== token;
-            const options = constructed ? key ?? {} : null;
-            if (constructed) { node = constructorDocument; id = checked(rawDom.cssom(node, 'construct')); }
+            let init = null;
+            if (constructed) {
+                // CSSOM "create a constructed CSSStyleSheet"; a baseURL that is not a URL throws NotAllowedError
+                init = sheetInit(key);
+                node = constructorDocument; id = checked(rawDom.cssom(node, 'construct', 0, init.baseURL));
+            }
             super(token, node, id);
             if (constructed) {
                 const state = owner(this); state.constructed = true;
                 rememberConstructed(node, id, this);
-                if (options.media !== undefined)
-                    this.media.mediaText = options.media instanceof MediaList ? options.media.mediaText : string(options.media);
-                if (options.disabled) this.disabled = true;
+                const media = typeof init.media === 'string' ? init.media : mediaText(mediaState(init.media));
+                if (media) operation(this, 'media', 0, 1, media);
+                if (init.disabled) operation(this, 'disable', 1);
             }
         }
-        get ownerRule() { owner(this); return null; }
+        get ownerRule() { return owner(this).ownerRule ?? null; }
         get cssRules() { return rulesOf(this, 0, owner(this)); }
         get rules() { return rulesOf(this, 0, owner(this)); }
         insertRule(rule, at = 0) {

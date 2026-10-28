@@ -130,6 +130,8 @@ static struct js_mutation_snapshot mutation_before(struct web_js_state *s,int op
         name=incoming->attribute->local?incoming->attribute->local:incoming->attribute->raw;ns=incoming->attribute->namespace_uri;
     }else if(opcode==DOM_adopt&&incoming&&incoming->type==N_ATTR){attribute=incoming;element=incoming->attr_owner;}
     else if(opcode==DOM_style&&argc>3){name="style";c.style_only=true;}
+    /* cssText's setter updates the style attribute even to the value it has (CSSOM 6.7) */
+    else if(opcode==DOM_styleBlock&&argc>2)name="style";
     else if(opcode==DOM_set&&argc>3&&JS_IsString(argv[2])){
         const char *key=JS_ToCString(s->ctx,argv[2]);
         if(key){

@@ -6,6 +6,13 @@
 #include "cssom.h"
 static JSValue cssom_string(JSContext *ctx, const sbuf *b) { return JS_NewStringLen(ctx, b->p ? b->p : "", b->n); }
 static JSValue cssom_error(JSContext *ctx, int error) { return error == CSSOM_OOM ? oom(ctx) : JS_NewInt32(ctx, -error); }
+/* whether a string the binding converted is empty */
+static bool string_empty(JSContext *ctx, JSValueConst value) {
+    const char *text = JS_ToCString(ctx, value);
+    bool empty = !text || !*text;
+    JS_FreeCString(ctx, text);
+    return empty;
+}
 /* a rule's declaration block (CSSOM CSSStyleDeclaration over the rule's
    declarations, its validity in the rule's block) */
 static JSValue cssom_declaration_op(struct web_js_state *s, struct cssom_sheet *sheet, struct css_rule_info *r,
@@ -19,25 +26,35 @@ static JSValue cssom_declaration_op(struct web_js_state *s, struct cssom_sheet *
         JS_FreeCString(ctx, value);
         return cssom_error(ctx, error);
     }
-    /* the rule's declarations as its block serializes them */
-    const char *text; size_t n;
-    cssom_declarations(r, &text, &n);
     css_decl_check *check = cssom_declaration_check(r);
+    if (!strcmp(operation, "decls")) {
+        /* cssText and the names: the block's serialization */
+        sbuf text = {0}, names = {0};
+        JSValue list = cssom_block_serialize(r, &text, &names) ?
+            style_text_block(ctx, text.p ? text.p : "", text.n, names.p ? names.p : "", names.n) : oom(ctx);
+        sb_free(&text); sb_free(&names);
+        return list;
+    }
+    /* a property of the rule's declarations: of its block's text */
     sbuf block = {0};
-    if (!style_serialize(text, n, check, &block, NULL)) { sb_free(&block); return oom(ctx); }
-    const char *serialized = block.p ? block.p : "";
-    if (!strcmp(operation, "decls")) { JSValue list = style_text_block(ctx, serialized, block.n); sb_free(&block); return list; }
+    if (!cssom_block(r, &block)) { sb_free(&block); return oom(ctx); }
+    const char *text = block.p ? block.p : "";
     const char *property = argc > 5 ? JS_ToCString(ctx, argv[5]) : NULL;
     if (!property) { sb_free(&block); return argc > 5 ? JS_EXCEPTION : JS_ThrowTypeError(ctx, "Property name required"); }
     JSValue result;
     bool write;
     if (!strcmp(operation, "declGet")) {
         bool priority = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
-        result = style_text_access(ctx, serialized, block.n, property, false, JS_UNDEFINED, JS_UNDEFINED, priority, check,
+        result = style_text_access(ctx, text, block.n, property, false, JS_UNDEFINED, JS_UNDEFINED, priority, check,
                                    NULL, &write);
+    } else if (r->type == CSS_RULE_KEYFRAME && argc > 7 && JS_IsString(argv[6]) && JS_IsString(argv[7]) &&
+               !string_empty(ctx, argv[6]) && !string_empty(ctx, argv[7])) {
+        /* CSS Animations 1: an !important declaration in a keyframe is invalid,
+           so setProperty() of a value with a priority changes nothing */
+        result = JS_UNDEFINED;
     } else {
         sbuf b = {0};
-        result = style_text_access(ctx, serialized, block.n, property, true, argc > 6 ? argv[6] : JS_UNDEFINED,
+        result = style_text_access(ctx, text, block.n, property, true, argc > 6 ? argv[6] : JS_UNDEFINED,
                                    argc > 7 ? argv[7] : JS_UNDEFINED, false, check, &b, &write);
         if (write && !JS_IsException(result)) {
             int error = cssom_set_declarations(sheet, id, b.p ? b.p : "", b.n);
@@ -110,10 +127,16 @@ static JSValue cssom_rule_op(struct web_js_state *s, struct cssom_sheet *sheet, 
     }
     if (!r) {
         /* a rule that stands nowhere now: it reads as empty and changes nothing */
-        if (!strcmp(operation, "decls")) return style_text_block(ctx, "", 0);
+        if (!strcmp(operation, "decls")) return style_text_block(ctx, "", 0, "", 0);
         return !strcmp(operation, "cssText") || !strcmp(operation, "declGet") ? JS_NewString(ctx, "") :
             !strcmp(operation, "keyframe") || !strcmp(operation, "attr") ? JS_NULL :
             !strcmp(operation, "features") ? JS_NewArray(ctx) : JS_NewInt32(ctx, 0);
+    }
+    if (!strcmp(operation, "importSheet")) {
+        /* CSSImportRule.styleSheet: the id of its sheet in the owner's list, or null */
+        int error;
+        struct cssom_sheet *child = cssom_import_sheet(sheet, r, &error);
+        return error == CSSOM_OOM ? oom(ctx) : child ? JS_NewInt64(ctx, child->id) : JS_NULL;
     }
     if (!strcmp(operation, "cssText")) {
         sbuf b = {0};
@@ -128,6 +151,8 @@ static JSValue cssom_rule_op(struct web_js_state *s, struct cssom_sheet *sheet, 
     JSValue result;
     if (!strcmp(operation, "attr")) {
         sbuf b = {0};
+        /* a frame's viewport is its container's layout, as matchMedia() reads it */
+        if (!strcmp(name, "matches") && s->doc->frame_parent) flush_layout(s);
         if (!cssom_attribute(sheet, r, name, &b)) result = JS_NULL;
         else if (!strcmp(name, "nameList")) {
             result = JS_NewArray(ctx);
@@ -218,8 +243,12 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
         !s->doc->live || s->doc->js!=s || s->disabled) { result=JS_NewInt32(ctx,-CSSOM_INACTIVE);goto out; }
     if (!strcmp(operation,"construct")) {
         if(n!=d->root){result=JS_ThrowTypeError(ctx,"Constructed sheet document required");goto out;}
-        int error;struct cssom_sheet *sheet=cssom_construct(d,&error);
-        result=error==CSSOM_OOM?oom(ctx):JS_NewInt64(ctx,sheet?sheet->id:0);goto out;
+        /* argv[4]: options' baseURL, converted by the binding (null: none) */
+        const char *base=argc>4&&JS_IsString(argv[4])?JS_ToCString(ctx,argv[4]):NULL;
+        if(argc>4&&JS_IsString(argv[4])&&!base)goto out;
+        int error;struct cssom_sheet *sheet=cssom_construct_based(d,base,&error);
+        JS_FreeCString(ctx,base);
+        result=error==CSSOM_OOM?oom(ctx):error?JS_NewInt32(ctx,-error):JS_NewInt64(ctx,sheet?sheet->id:0);goto out;
     }
     if (adoption || !strcmp(operation,"adopted")) {
         if(!((n->type==N_DOC&&n==d->root)||(n->type==N_FRAGMENT&&n->shadow_host))) {
@@ -287,7 +316,7 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
         if(current)sheet->disabled=cssom_owner_disabled(n);
         if(!strcmp(operation,"disable")) {
             sheet->disabled=index!=0;
-            if(sheet->constructed)cssom_changed(sheet);
+            if(sheet->constructed||sheet->parent)cssom_changed(sheet);
             if(current){n->style_disabled=sheet->disabled;n->style_disabled_set=true;d->resources_dirty=d->dirty=d->need_style=true;}
         }
         result=JS_NewBool(ctx,sheet->disabled);goto out;

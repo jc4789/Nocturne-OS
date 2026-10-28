@@ -18,9 +18,17 @@
                                        (css.c's css_inline_set), the style attribute becoming
                                        their serialization, and the property's value in what
                                        the cascade parses (css_inline_text)
+     R<TAB>property<TAB>scheme<TAB>color<TAB>value
+                                       as C, the value set through a style rule's style:
+                                       cssText = "property: value" on a CSSStyleRule
+                                       (cssom.c's cssom_set_declarations, the end of
+                                       setProperty too), and the property's value in the
+                                       rule's declarations in the sheet's text, which the
+                                       cascade parses (css.c's one parse of the sheet)
    An invalid value answers <invalid>. */
 #include <stdio.h>
 #include "webi.h"
+#include "cssom.h"
 
 /* reached only from properties these requests do not set */
 bool web_native_checkpoint(web_doc *d) { (void)d; return true; }
@@ -171,6 +179,36 @@ static bool through_cssom(char *rest, sbuf *out) {
     sb_free(&request);
     return ok;
 }
+/* a style sheet with one style rule: its style's cssText becomes "property: value", then the
+   property's value in the declarations the sheet's text now holds for the rule */
+static bool through_rule(char *rest, sbuf *out) {
+    const char *property = field(&rest), *scheme = field(&rest), *color = field(&rest), *value = rest;
+    static web_doc document_;
+    static node_t root = {.type = N_DOC};
+    document_.root = &root; root.owner = &document_;
+    int error;
+    uint32_t count;
+    struct cssom_sheet *sheet = cssom_construct(&document_, &error);
+    struct css_rule_info *rule = sheet && !cssom_replace_sync(sheet, "a {}", 4) ? cssom_child(sheet, 0, 0, &count) : NULL;
+    sbuf text = {0}, request = {0};
+    sb_puts(&text, property); sb_puts(&text, ": "); sb_puts(&text, value);
+    bool ok = rule && cssom_set_declarations(sheet, rule->id, text.p, text.n) == CSSOM_OK;
+    rule = ok ? cssom_child(sheet, 0, 0, &count) : NULL;
+    const char *declarations = NULL, *v;
+    size_t n = 0, vn;
+    bool important;
+    if (rule) cssom_declarations(rule, &declarations, &n);
+    if (declarations && css_decl_find(declarations, n, property, &v, &vn, &important)) {
+        sb_puts(&request, property); sb_putc(&request, '\t');
+        sb_puts(&request, scheme); sb_putc(&request, '\t');
+        sb_puts(&request, color); sb_putc(&request, '\t');
+        sb_put(&request, v, vn);
+        ok = computed((char *)sb_cstr(&request), out);
+    } else ok = false;
+    sb_free(&text);
+    sb_free(&request);
+    return ok;
+}
 int main(int argc, char **argv) {
     static char line[1 << 16];
     if (argc < 3) return 2;
@@ -185,7 +223,8 @@ int main(int argc, char **argv) {
                   line[0] == 'C' ? computed(rest, &out) :
                   line[0] == 'I' ? interpolate(rest, &out) :
                   line[0] == 'H' ? canvas(rest, &out) :
-                  line[0] == 'O' ? through_cssom(rest, &out) : false;
+                  line[0] == 'O' ? through_cssom(rest, &out) :
+                  line[0] == 'R' ? through_rule(rest, &out) : false;
         fputs(ok ? sb_cstr(&out) : "<invalid>", answers);
         fputs("\n", answers);
         fflush(answers); /* a request that hangs shows as the first one unanswered */
