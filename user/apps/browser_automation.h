@@ -12,8 +12,8 @@ struct automation_device {
     uint32_t buttons;   /* the native mask: 1 left, 2 right, 4 middle, 8 back, 16 forward */
     unsigned modifiers; /* AUTOMATION_* bits of the modifier keys held */
 };
-enum { AUTOMATION_SHIFT = 1, AUTOMATION_SHIFT_RIGHT = 2, AUTOMATION_CONTROL = 4,
-       AUTOMATION_CONTROL_RIGHT = 8, AUTOMATION_ALT = 16, AUTOMATION_ALT_RIGHT = 32 };
+/* WebDriver's left and right keys of a modifier are one key ("Shift"), as here. */
+enum { AUTOMATION_SHIFT = 1, AUTOMATION_CONTROL = 2, AUTOMATION_ALT = 4 };
 
 /* A WebDriver button (0 left, 1 middle, 2 right, 3 back, 4 forward) as a native mask bit. */
 static uint32_t automation_button(uint32_t button) {
@@ -21,9 +21,8 @@ static uint32_t automation_button(uint32_t button) {
     return button < 5 ? bits[button] : 0;
 }
 static uint32_t automation_mods(const struct automation_device *d) {
-    return (d->modifiers & (AUTOMATION_SHIFT | AUTOMATION_SHIFT_RIGHT) ? NMOD_SHIFT : 0) |
-           (d->modifiers & (AUTOMATION_CONTROL | AUTOMATION_CONTROL_RIGHT) ? NMOD_CTRL : 0) |
-           (d->modifiers & (AUTOMATION_ALT | AUTOMATION_ALT_RIGHT) ? NMOD_ALT : 0);
+    return (d->modifiers & AUTOMATION_SHIFT ? NMOD_SHIFT : 0) | (d->modifiers & AUTOMATION_CONTROL ? NMOD_CTRL : 0) |
+           (d->modifiers & AUTOMATION_ALT ? NMOD_ALT : 0);
 }
 
 /* A key's WebDriver code point (the WebDriver spec's table of special keys, U+E000..U+E05D,
@@ -51,12 +50,9 @@ static const char *automation_key(uint32_t raw, uint32_t *key, unsigned *modifie
             [0x5C] = NKEY_INSERT, [0x5D] = NKEY_DELETE,
         };
         switch (raw) {
-        case 0xE008: *modifier = AUTOMATION_SHIFT; return NULL;
-        case 0xE009: *modifier = AUTOMATION_CONTROL; return NULL;
-        case 0xE00A: *modifier = AUTOMATION_ALT; return NULL;
-        case 0xE050: *modifier = AUTOMATION_SHIFT_RIGHT; return NULL;
-        case 0xE051: *modifier = AUTOMATION_CONTROL_RIGHT; return NULL;
-        case 0xE052: *modifier = AUTOMATION_ALT_RIGHT; return NULL;
+        case 0xE008: case 0xE050: *modifier = AUTOMATION_SHIFT; return NULL;
+        case 0xE009: case 0xE051: *modifier = AUTOMATION_CONTROL; return NULL;
+        case 0xE00A: case 0xE052: *modifier = AUTOMATION_ALT; return NULL;
         case 0xE03D: case 0xE053: return "The native keyboard has no Meta key";
         }
         *key = named[raw - 0xE000];
@@ -79,16 +75,34 @@ static int32_t automation_lines(double px, int line) {
     return n ? n : px > 0 ? 1 : -1;
 }
 
+/* Why the step cannot be done at all, NULL when it can: the browser refuses such a run before
+ * any of it reaches the page. */
+static const char *automation_step_error(const struct web_automation_step *step) {
+    uint32_t key; unsigned modifier;
+    switch (step->kind) {
+    case WEB_AUTOMATION_KEY_DOWN: case WEB_AUTOMATION_KEY_UP: return automation_key(step->value, &key, &modifier);
+    case WEB_AUTOMATION_DOWN: case WEB_AUTOMATION_UP:
+        if (!automation_button(step->value)) return "Unknown pointer button";
+        /* fall through */
+    case WEB_AUTOMATION_MOVE: case WEB_AUTOMATION_WHEEL:
+        if (!isfinite(step->x) || !isfinite(step->y) || fabs(step->x) > 1e9 || fabs(step->y) > 1e9)
+            return "A pointer position must be finite";
+        if (!isfinite(step->dx) || !isfinite(step->dy)) return "A wheel delta must be finite";
+        return NULL;
+    }
+    return "Unknown automation step";
+}
+
 /* One step as at most three events into out, the device changed as the step does. Returns
  * how many, or -1 with *error when the step cannot be done. A press or release away from the
  * pointer moves it there first; a modifier key changes only what later events carry. */
 static int automation_events(struct automation_device *d, const struct web_automation_step *step,
                              int line, struct gui_event out[3], const char **error) {
     int n = 0;
-    *error = NULL;
+    if ((*error = automation_step_error(step))) return -1;
     if (step->kind == WEB_AUTOMATION_KEY_DOWN || step->kind == WEB_AUTOMATION_KEY_UP) {
         uint32_t key; unsigned modifier;
-        if ((*error = automation_key(step->value, &key, &modifier))) return -1;
+        automation_key(step->value, &key, &modifier);
         bool down = step->kind == WEB_AUTOMATION_KEY_DOWN;
         if (modifier) {
             if (down) d->modifiers |= modifier; else d->modifiers &= ~modifier;
@@ -97,9 +111,6 @@ static int automation_events(struct automation_device *d, const struct web_autom
         out[n++] = (struct gui_event){.type = EV_KEY, .key = key, .mods = automation_mods(d),
                                       .pressed = down, .x = d->x, .y = d->y};
         return n;
-    }
-    if (!isfinite(step->x) || !isfinite(step->y) || fabs(step->x) > 1e9 || fabs(step->y) > 1e9) {
-        *error = "A pointer position must be finite"; return -1;
     }
     int x = (int)floor(step->x), y = (int)floor(step->y);
     if (step->kind == WEB_AUTOMATION_WHEEL) {
@@ -110,11 +121,7 @@ static int automation_events(struct automation_device *d, const struct web_autom
                                                  .mods = automation_mods(d) | NMOD_SHIFT};
         return n;
     }
-    if (step->kind != WEB_AUTOMATION_MOVE && step->kind != WEB_AUTOMATION_DOWN && step->kind != WEB_AUTOMATION_UP) {
-        *error = "Unknown automation step"; return -1;
-    }
     uint32_t bit = step->kind == WEB_AUTOMATION_MOVE ? 0 : automation_button(step->value);
-    if (step->kind != WEB_AUTOMATION_MOVE && !bit) { *error = "Unknown pointer button"; return -1; }
     /* WebDriver: a move to where the pointer already is dispatches nothing. */
     if (x != d->x || y != d->y) {
         out[n++] = (struct gui_event){.type = EV_MOUSE_MOVE, .x = x, .y = y, .buttons = d->buttons, .mods = automation_mods(d)};

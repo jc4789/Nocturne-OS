@@ -1939,6 +1939,11 @@ static const char *host_automation(void *opaque, web_doc *document, uint64_t id,
     SERVE(opaque);
     if (!automation_enabled) return "Automation is not enabled";
     if (!document || document != tab->doc) return "Automation is only for the tab's own document";
+    /* A run that cannot be done whole is refused before any of it reaches the page. */
+    for (size_t i = 0; i < count; i++) {
+        const char *why = automation_step_error(&steps[i]);
+        if (why) return why;
+    }
     struct automation_run *run = calloc(1, sizeof *run);
     struct web_automation_step *copy = count && count <= SIZE_MAX / sizeof *copy ? malloc(count * sizeof *copy) : NULL;
     if (!run || (count && !copy)) { free(run); free(copy); return "Out of memory for the automation steps"; }
