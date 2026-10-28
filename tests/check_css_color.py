@@ -37,7 +37,7 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 command = [str(cc), "-std=gnu11", "-O2", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include", "-Icommon", "-Iuser/libc",
            "-Iuser/libc/web", "-Ithird_party/quickjs", "tests/css_color_native_cases.c", "user/libc/web/color.c",
-           "user/libc/web/cssprop.c", "user/libc/web/util.c", "user/libc/web/html.c", "-o", str(exe)]
+           "user/libc/web/cssprop.c", "user/libc/web/shape.c", "user/libc/web/util.c", "user/libc/web/html.c", "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
 
 node = None

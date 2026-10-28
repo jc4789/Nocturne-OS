@@ -361,29 +361,35 @@ static bool box_clips(const box_t *b) {
     return b->st->clip_path||(b->st->clip.rect&&(b->st->position==POS_ABSOLUTE||b->st->position==POS_FIXED));
 }
 static bool clips_above(const box_t *b){for(b=b->parent;b;b=b->parent)if(box_clips(b))return true;return false;}
-/* A CLIP_BOX_*'s rectangle (x y w h) and the radii its corners take from the border radii
-   (css-backgrounds-3 §5.3: inner boxes shrink them, the margin box grows curved ones). */
-static void clip_reference(const box_t *b,uint8_t which,float r[4],struct border_radii *radii) {
-    float x=box_visual_x(b),y=box_visual_y(b);
-    r[0]=x-b->p[3]-b->b[3];r[1]=y-b->p[0]-b->b[0];
+/* A CSS_BOX_*'s rectangle (x y w h, from b's border box's top left) and the radii its corners take
+   from the border radii (css-backgrounds-3 §5.3: inner boxes shrink them, the margin box grows
+   curved ones); clip-path, shape-outside and offset-path's reference boxes. */
+void box_reference_box(const box_t *b,uint8_t which,float r[4],float rx[4],float ry[4]) {
+    r[0]=r[1]=0;
     r[2]=b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3];r[3]=b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
-    struct border_radii outer=used_radii(b->st,r[2],r[3]);
+    struct border_radii outer=b->st?used_radii(b->st,r[2],r[3]):(struct border_radii){0},radii=outer;
     float edges[4];
     switch(which) {
-    case CLIP_BOX_PADDING: memcpy(edges,b->b,sizeof edges);break;
-    case CLIP_BOX_CONTENT: case CLIP_BOX_FILL: for(int i=0;i<4;i++)edges[i]=b->b[i]+b->p[i];break;
-    case CLIP_BOX_MARGIN: for(int i=0;i<4;i++)edges[i]=-b->m[i];break;
-    default: if(radii)*radii=outer;return; /* border-box; stroke-box and view-box are it for CSS boxes */
+    case CSS_BOX_PADDING: memcpy(edges,b->b,sizeof edges);break;
+    case CSS_BOX_CONTENT: case CSS_BOX_FILL: for(int i=0;i<4;i++)edges[i]=b->b[i]+b->p[i];break;
+    case CSS_BOX_MARGIN: for(int i=0;i<4;i++)edges[i]=-b->m[i];break;
+    default: memset(edges,0,sizeof edges);break; /* border-box; stroke-box and view-box are it for CSS boxes */
     }
     r[0]+=edges[3];r[1]+=edges[0];r[2]=fmaxf(0,r[2]-edges[1]-edges[3]);r[3]=fmaxf(0,r[3]-edges[0]-edges[2]);
-    if(!radii)return;
-    if(which!=CLIP_BOX_MARGIN){*radii=inset_radii(outer,edges,r[2],r[3]);return;}
-    static const int xs[4]={3,1,1,3},ys[4]={0,0,2,2};
-    *radii=outer;
-    for(int i=0;i<4;i++)if(outer.x[i]>0&&outer.y[i]>0){
-        radii->x[i]=fmaxf(0,outer.x[i]+b->m[xs[i]]);radii->y[i]=fmaxf(0,outer.y[i]+b->m[ys[i]]);
-    }
-    radii_normalize(radii,r[2],r[3]);
+    if(which==CSS_BOX_MARGIN) {
+        static const int xs[4]={3,1,1,3},ys[4]={0,0,2,2};
+        for(int i=0;i<4;i++)if(outer.x[i]>0&&outer.y[i]>0){
+            radii.x[i]=fmaxf(0,outer.x[i]+b->m[xs[i]]);radii.y[i]=fmaxf(0,outer.y[i]+b->m[ys[i]]);
+        }
+        radii_normalize(&radii,r[2],r[3]);
+    } else if(which==CSS_BOX_PADDING||which==CSS_BOX_CONTENT||which==CSS_BOX_FILL) radii=inset_radii(outer,edges,r[2],r[3]);
+    memcpy(rx,radii.x,sizeof radii.x);memcpy(ry,radii.y,sizeof radii.y);
+}
+static void clip_reference(const box_t *b,uint8_t which,float r[4],struct border_radii *radii) {
+    struct border_radii scratch;
+    if(!radii)radii=&scratch;
+    box_reference_box(b,which,r,radii->x,radii->y);
+    r[0]+=box_visual_x(b)-b->p[3]-b->b[3];r[1]+=box_visual_y(b)-b->p[0]-b->b[0];
 }
 static void clip_rect_set(struct clip_used *u,double x0,double y0,double x1,double y1) {
     u->rect[0]=(float)x0;u->rect[1]=(float)y0;u->rect[2]=(float)fmax(x0,x1);u->rect[3]=(float)fmax(y0,y1);
@@ -392,71 +398,53 @@ static void clip_rect_meet(struct clip_used *u,double x0,double y0,double x1,dou
     u->rect[0]=fmaxf(u->rect[0],(float)x0);u->rect[1]=fmaxf(u->rect[1],(float)y0);
     u->rect[2]=fmaxf(u->rect[0],fminf(u->rect[2],(float)x1));u->rect[3]=fmaxf(u->rect[1],fminf(u->rect[3],(float)y1));
 }
-static void clip_polygon_point(const struct css_clip_path *c,size_t i,const float r[4],double *x,double *y) {
-    *x=r[0]+(double)len_resolve(&c->point[i][0],r[2]);*y=r[1]+(double)len_resolve(&c->point[i][1],r[3]);
-}
-/* False when b has no clip. Before b's coverage is drawn, a path's or a <clipPath>'s bounds are
-   not known, and the rectangle does not limit it. */
+/* False when b has no clip. Before b's coverage is drawn, a <clipPath>'s bounds are not known,
+   and the rectangle does not limit it. The shape's geometry is shape.c's. */
 static bool clip_used(const box_t *b,struct clip_used *u) {
     if(!box_clips(b))return false;
-    const style_t *st=b->st;const struct css_clip_path *c=st->clip_path;
+    const style_t *st=b->st;const struct css_shape *c=st->clip_path;
     u->rect[0]=u->rect[1]=-INFINITY;u->rect[2]=u->rect[3]=INFINITY;u->cut=CLIP_CUT_NONE;
     if(c&&!(b->clip_cache&&b->clip_cache->none)) {
         float r[4];struct border_radii radii;clip_reference(b,c->box,r,&radii);
         double x=r[0],y=r[1],w=r[2],h=r[3];
-        switch(c->shape) {
-        case CLIP_SHAPE_BOX:
+        switch(c->kind) {
+        case CSS_SHAPE_BOX:
             clip_rect_set(u,x,y,x+w,y+h);
             if(radii_any(&radii)){u->cut=CLIP_CUT_ROUND;memcpy(u->shape,r,sizeof r);u->radii=radii;}
             break;
-        case CLIP_SHAPE_INSET: {
-            double top=len_resolve(&c->inset[0],r[3]),right=len_resolve(&c->inset[1],r[2]);
-            double bottom=len_resolve(&c->inset[2],r[3]),left=len_resolve(&c->inset[3],r[2]);
-            /* Opposing insets that pass each other shrink in proportion (css-shapes-1 §3.1). */
-            if(left+right>w&&left+right>0){double f=w/(left+right);left*=f;right*=f;}
-            if(top+bottom>h&&top+bottom>0){double f=h/(top+bottom);top*=f;bottom*=f;}
-            double iw=fmax(0,w-left-right),ih=fmax(0,h-top-bottom);
-            clip_rect_set(u,x+left,y+top,x+left+iw,y+top+ih);
-            struct border_radii round;
-            for(int i=0;i<4;i++){round.x[i]=fmaxf(0,len_resolve(&c->corner[i].axis[0],r[2]));round.y[i]=fmaxf(0,len_resolve(&c->corner[i].axis[1],r[3]));}
-            radii_normalize(&round,(float)iw,(float)ih);
-            if(radii_any(&round)&&iw>0&&ih>0){
-                u->cut=CLIP_CUT_ROUND;u->shape[0]=(float)(x+left);u->shape[1]=(float)(y+top);u->shape[2]=(float)iw;u->shape[3]=(float)ih;u->radii=round;
+        case CSS_SHAPE_INSET: {
+            double q[4];struct border_radii round;
+            css_shape_inset(c,r,q,round.x,round.y);
+            clip_rect_set(u,q[0],q[1],q[0]+q[2],q[1]+q[3]);
+            radii_normalize(&round,(float)q[2],(float)q[3]);
+            if(radii_any(&round)&&q[2]>0&&q[3]>0){
+                u->cut=CLIP_CUT_ROUND;for(int i=0;i<4;i++)u->shape[i]=(float)q[i];u->radii=round;
             }
             break;
         }
-        case CLIP_SHAPE_CIRCLE: case CLIP_SHAPE_ELLIPSE: {
-            double cx=x+len_resolve(&c->at[0],r[2]),cy=y+len_resolve(&c->at[1],r[3]);
-            double side[4]={fabs(cx-x),fabs(x+w-cx),fabs(cy-y),fabs(y+h-cy)},rx,ry;
-            if(c->shape==CLIP_SHAPE_CIRCLE) {
-                rx=c->extent[0]==CLIP_EXTENT_LENGTH?len_resolve(&c->radius[0],(float)(sqrt(w*w+h*h)/sqrt(2))):
-                   c->extent[0]==CLIP_EXTENT_CLOSEST?fmin(fmin(side[0],side[1]),fmin(side[2],side[3])):fmax(fmax(side[0],side[1]),fmax(side[2],side[3]));
-                ry=rx;
-            } else {
-                rx=c->extent[0]==CLIP_EXTENT_LENGTH?len_resolve(&c->radius[0],r[2]):c->extent[0]==CLIP_EXTENT_CLOSEST?fmin(side[0],side[1]):fmax(side[0],side[1]);
-                ry=c->extent[1]==CLIP_EXTENT_LENGTH?len_resolve(&c->radius[1],r[3]):c->extent[1]==CLIP_EXTENT_CLOSEST?fmin(side[2],side[3]):fmax(side[2],side[3]);
-            }
+        case CSS_SHAPE_CIRCLE: case CSS_SHAPE_ELLIPSE: {
+            double centre[2],rr[2];css_shape_ellipse(c,r,centre,rr);
+            double cx=centre[0],cy=centre[1],rx=rr[0],ry=rr[1];
             if(!(rx>0&&ry>0)){clip_rect_set(u,cx,cy,cx,cy);break;}
             clip_rect_set(u,cx-rx,cy-ry,cx+rx,cy+ry);
             u->cut=CLIP_CUT_ROUND;u->shape[0]=(float)(cx-rx);u->shape[1]=(float)(cy-ry);u->shape[2]=(float)(2*rx);u->shape[3]=(float)(2*ry);
             for(int i=0;i<4;i++){u->radii.x[i]=(float)rx;u->radii.y[i]=(float)ry;}
             break;
         }
-        default: {
+        default: { /* polygon(), path(), shape(), url(): coverage */
             const struct clip_cache *cache=b->clip_cache;
+            double q[4];
             u->cut=CLIP_CUT_COVERAGE;
             if(cache&&cache->markup)clip_rect_set(u,(double)cache->origin_x+cache->left,(double)cache->origin_y+cache->top,
                 (double)cache->origin_x+cache->left+cache->w,(double)cache->origin_y+cache->top+cache->h);
-            else if(c->shape==CLIP_SHAPE_POLYGON) {
-                double x0=INFINITY,y0=INFINITY,x1=-INFINITY,y1=-INFINITY;
-                for(size_t i=0;i<c->points;i++){double px,py;clip_polygon_point(c,i,r,&px,&py);x0=fmin(x0,px);y0=fmin(y0,py);x1=fmax(x1,px);y1=fmax(y1,py);}
-                if(c->points)clip_rect_set(u,x0,y0,x1,y1);else clip_rect_set(u,x,y,x,y);
+            else if(c->kind!=CSS_SHAPE_URL) {
+                if(css_shape_bounds(c,r,q))clip_rect_set(u,q[0],q[1],q[2],q[3]);else clip_rect_set(u,x,y,x,y);
             }
         }
         }
     }
     if(st->clip.rect&&(st->position==POS_ABSOLUTE||st->position==POS_FIXED)) {
-        float r[4];clip_reference(b,CLIP_BOX_BORDER,r,NULL);
+        float r[4];clip_reference(b,CSS_BOX_BORDER,r,NULL);
         const struct css_clip_rect *k=&st->clip;
         clip_rect_meet(u,r[0]+(k->auto_edges&8?0:k->edge[3]),r[1]+(k->auto_edges&1?0:k->edge[0]),
                          r[0]+(k->auto_edges&2?r[2]:k->edge[1]),r[1]+(k->auto_edges&4?r[3]:k->edge[2]));
@@ -507,47 +495,21 @@ static bool clip_push(struct pctx *P,const box_t *b,const struct clip_used *u,st
 static void clip_pop(canvas_t *c,const int saved[4],const struct gfx_mask_clip *prior) {
     c->cx0=saved[0];c->cy0=saved[1];c->cx1=saved[2];c->cy1=saved[3];c->mask_clip=prior;
 }
-/* A polygon whose corners are rounded by radius (css-shapes-2 §2.4.1) as path data: each corner an
-   arc tangent to both edges, its tangent points no farther from the corner than half of either. */
-static void clip_round_polygon(const struct css_clip_path *c,const float r[4],double ox,double oy,sbuf *m) {
-    char text[200];
-    for(size_t i=0;i<c->points;i++) {
-        double px,py,ax,ay,bx,by;
-        clip_polygon_point(c,i,r,&px,&py);clip_polygon_point(c,(i+c->points-1)%c->points,r,&ax,&ay);clip_polygon_point(c,(i+1)%c->points,r,&bx,&by);
-        double ux=ax-px,uy=ay-py,vx=bx-px,vy=by-py,lu=hypot(ux,uy),lv=hypot(vx,vy);
-        double angle=lu>0&&lv>0?acos(fmax(-1,fmin(1,(ux*vx+uy*vy)/(lu*lv)))):0,t=0,radius=0;
-        if(angle>1e-6&&angle<M_PI-1e-6){t=fmin(c->round/tan(angle/2),fmin(lu,lv)/2);radius=t*tan(angle/2);}
-        double x1=px-ox+(lu>0?ux/lu*t:0),y1=py-oy+(lu>0?uy/lu*t:0),x2=px-ox+(lv>0?vx/lv*t:0),y2=py-oy+(lv>0?vy/lv*t:0);
-        int n=radius>0?snprintf(text,sizeof text,"%s%.9g %.9g A%.9g %.9g 0 0 %d %.9g %.9g ",i?"L":"M",x1,y1,radius,radius,
-                                (-ux)*vy-(-uy)*vx>0,x2,y2):snprintf(text,sizeof text,"%s%.9g %.9g ",i?"L":"M",px-ox,py-oy);
-        if(n>0)sb_puts(m,text);
-    }
-    sb_puts(m,"Z");
-}
-/* nanosvg markup of b's polygon, path or <clipPath>, in document pixels from (ox, oy). False when a
-   url() names no <clipPath>. */
-static bool clip_markup(const box_t *b,const struct css_clip_path *c,const float r[4],double ox,double oy,sbuf *m) {
-    if(c->shape==CLIP_SHAPE_URL) {
+/* nanosvg markup of b's polygon(), path(), shape() or <clipPath>, in document pixels from (ox, oy).
+   False when a url() names no <clipPath>. */
+static bool clip_markup(const box_t *b,const struct css_shape *c,const float r[4],double ox,double oy,sbuf *m) {
+    if(c->kind==CSS_SHAPE_URL) {
         const float box[4]={(float)(r[0]-ox),(float)(r[1]-oy),r[2],r[3]};
-        return b->node&&doc_svg_clip_markup(b->node,c->text,box,m);
+        return b->node&&doc_svg_clip_markup(b->node,c->url,box,m);
     }
-    char text[200];
-    sb_puts(m,"<svg xmlns=\"http://www.w3.org/2000/svg\">");
-    if(c->shape==CLIP_SHAPE_PATH) {
-        snprintf(text,sizeof text,"<path transform=\"translate(%.9g %.9g)\" d=\"",r[0]-ox,r[1]-oy);sb_puts(m,text);
-        sb_puts(m,c->text); /* svg_path_data_valid() let only commands, numbers, spaces and commas through */
-    } else if(c->round>0) {
-        sb_puts(m,"<path d=\"");clip_round_polygon(c,r,ox,oy,m);
-    } else {
-        sb_puts(m,"<polygon points=\"");
-        for(size_t i=0;i<c->points;i++){double x,y;clip_polygon_point(c,i,r,&x,&y);snprintf(text,sizeof text,"%.9g,%.9g ",x-ox,y-oy);sb_puts(m,text);}
-    }
+    sb_puts(m,"<svg xmlns=\"http://www.w3.org/2000/svg\"><path d=\"");
+    css_shape_path_data(c,r,ox,oy,m); /* only commands and numbers */
     sb_puts(m,c->evenodd?"\" fill=\"#000\" fill-rule=\"evenodd\"/></svg>":"\" fill=\"#000\"/></svg>");
     return true;
 }
 static bool clip_cache_prepare(web_doc *d,box_t *b) {
     struct clip_used u;
-    const struct css_clip_path *c=box_clips(b)?b->st->clip_path:NULL;
+    const struct css_shape *c=box_clips(b)?b->st->clip_path:NULL;
     if(!c){web_clip_cache_free(&b->clip_cache);return true;}
     struct clip_cache *cache=b->clip_cache;
     if(!cache&&!(cache=b->clip_cache=calloc(1,sizeof *cache)))return false;

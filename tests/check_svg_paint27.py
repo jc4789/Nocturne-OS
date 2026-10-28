@@ -63,12 +63,12 @@ abi=out/'host-abi'; abi.mkdir(exist_ok=True)
 (abi/'setjmp.h').write_text('#include "'+(cc.parent.parent/'include/setjmp.h').as_posix()+'"\n',encoding='utf-8')
 env=dict(os.environ,PATH=str(cc.parent)+os.pathsep+os.environ.get('PATH',''))
 exe=out/'native.exe'
-command=[str(cc),'-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-Wl,--gc-sections','-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web',str(c),str(css_source),'user/libc/web/cssprop.c','user/libc/web/color.c','user/libc/web/util.c','user/libc/web/html.c',str(urls),'-o',str(exe)]
+command=[str(cc),'-std=gnu11','-O1','-ffunction-sections','-fdata-sections','-Wl,--gc-sections','-I'+str(abi),'-Iuser/include','-Icommon','-Iuser/libc/web',str(c),str(css_source),'user/libc/web/cssprop.c','user/libc/web/shape.c','user/libc/web/color.c','user/libc/web/util.c','user/libc/web/html.c',str(urls),'-o',str(exe)]
 r=subprocess.run(command,cwd=root,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace')
 (out/f'compile-{attempt}.log').write_text(r.stdout+r.stderr,encoding='utf-8')
 print('compile',r.returncode,flush=True)
 if r.returncode: print((r.stdout+r.stderr)[-6500:]); raise SystemExit(r.returncode)
-(out/'runtime-started.json').write_text(json.dumps({'source_sha256':{p:hashlib.sha256((root/p).read_bytes()).hexdigest() for p in ['user/libc/web/webi.h','user/libc/web/css.c','user/libc/web/cssprop.c','user/libc/web/color.c','user/libc/web/box.c','user/libc/web/js.c']}}),encoding='utf-8')
+(out/'runtime-started.json').write_text(json.dumps({'source_sha256':{p:hashlib.sha256((root/p).read_bytes()).hexdigest() for p in ['user/libc/web/webi.h','user/libc/web/css.c','user/libc/web/cssprop.c','user/libc/web/shape.c','user/libc/web/color.c','user/libc/web/box.c','user/libc/web/js.c']}}),encoding='utf-8')
 r=subprocess.run([str(exe)],cwd=root,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=30)
 (out/'runtime-original.log').write_text(r.stdout+r.stderr,encoding='utf-8')
 (out/'result.json').write_text(json.dumps({'compile':0,'runtime':r.returncode,'output':r.stdout+r.stderr},ensure_ascii=False,indent=2),encoding='utf-8')
