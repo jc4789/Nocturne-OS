@@ -1690,9 +1690,20 @@ static void rule_spec_word(sbuf *spec, const char *s, size_t n) {
     if (!isalpha((unsigned char)s[0])) { shadow_specified_length(spec, s, n); return; }
     for (size_t i = 0; i < n; i++) sb_putc(spec, (char)lower((unsigned char)s[i]));
 }
+/* one value of a list of kind (rule_value has read it), as its specified value: a keyword in
+   lower case, a length with a unit, a colour as css_color_specified writes it */
+static void rule_value_spec(int kind, const char *s, size_t n, sbuf *spec) {
+    if (kind != CSS_GAP_COLOR) { rule_spec_word(spec, s, n); return; }
+    sbuf color = {0};
+    if (css_color_specified(s, n, &color)) sb_put(spec, color.p, color.n);
+    else sb_put(spec, s, n);
+    sb_free(&color);
+}
 /* §4.4 <gap-rule> = <line-width> || <line-style> || <color>, by list kind; the specified value
-   leaves out what is initial and orders the rest as the grammar does */
-static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_value v[3], sbuf *spec) {
+   leaves out what is initial and orders the rest as the grammar does. each (when given, by list
+   kind): the value each longhand gets, its initial one where the rule leaves it out (CSSOM's
+   longhands of the shorthand) */
+static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_value v[3], sbuf *spec, sbuf each[3]) {
     const char *t[4];
     size_t tl[4];
     int k = split(s, n, t, tl, 4, ' ');
@@ -1709,9 +1720,17 @@ static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_valu
         if (found < 0) return false;
         at[found] = i;
     }
+    int w = at[CSS_GAP_WIDTH], st = at[CSS_GAP_STYLE], c = at[CSS_GAP_COLOR];
+    if (each) {
+        static const char *const initial[3] = {[CSS_GAP_COLOR] = "currentcolor", [CSS_GAP_STYLE] = "none",
+                                               [CSS_GAP_WIDTH] = "medium"};
+        for (int l = 0; l < 3; l++) {
+            if (at[l] >= 0) rule_value_spec(l, t[at[l]], tl[at[l]], &each[l]);
+            else sb_puts(&each[l], initial[l]);
+        }
+    }
     if (!spec) return true;
     size_t begin = spec->n;
-    int w = at[CSS_GAP_WIDTH], st = at[CSS_GAP_STYLE], c = at[CSS_GAP_COLOR];
     if (w >= 0 && !ident_is(t[w], tl[w], "medium")) rule_spec_word(spec, t[w], tl[w]);
     if (st >= 0 && !ident_is(t[st], tl[st], "none")) {
         if (spec->n > begin) sb_putc(spec, ' ');
@@ -1729,9 +1748,11 @@ static bool gap_rule(const char *s, size_t n, struct cx *cx, union css_rule_valu
     return true;
 }
 /* §4.1-4.5: a list of kind's values (kind RULE_GAP: the shorthand's <gap-rule-list>, into the three
-   lists at once, with its specified value in spec) with at most one auto repeater */
+   lists at once, with its specified value in spec and each longhand's list in each, by list kind)
+   with at most one auto repeater */
 enum { RULE_GAP = 3 };
-static bool rule_lists(int kind, const char *v, size_t n, struct cx *cx, struct css_rule_list out[3], sbuf *spec) {
+static bool rule_lists(int kind, const char *v, size_t n, struct cx *cx, struct css_rule_list out[3], sbuf *spec,
+                       sbuf each[3]) {
     const char **part;
     size_t *part_n;
     int parts = rule_parts(v, n, cx, &part, &part_n);
@@ -1762,22 +1783,32 @@ static bool rule_lists(int kind, const char *v, size_t n, struct cx *cx, struct 
     int first = kind == RULE_GAP ? 0 : kind, last = kind == RULE_GAP ? 2 : kind;
     union css_rule_value *values[3] = {NULL, NULL, NULL};
     for (int l = first; l <= last; l++) values[l] = ar_alloc(cx->a, (size_t)total * sizeof *values[l]);
+    if (kind != RULE_GAP) each = NULL;
     for (int i = 0; i < parts; i++) {
         const struct css_rule_item *it = &items[i];
+        char open[24] = "";
+        if (it->repeat == CSS_RULE_AUTO) snprintf(open, sizeof open, "repeat(auto, ");
+        else if (it->repeat) snprintf(open, sizeof open, "repeat(%u, ", it->repeat);
         if (spec) {
             if (i) sb_puts(spec, ", ");
-            if (it->repeat == CSS_RULE_AUTO) sb_puts(spec, "repeat(auto, ");
-            else if (it->repeat) { char number[16]; snprintf(number, sizeof number, "repeat(%u, ", it->repeat); sb_puts(spec, number); }
+            sb_puts(spec, open);
+        }
+        for (int l = 0; each && l < 3; l++) {
+            if (i) sb_puts(&each[l], ", ");
+            sb_puts(&each[l], open);
         }
         for (uint32_t j = 0; j < it->count; j++) {
             if (spec && j) sb_puts(spec, ", ");
+            for (int l = 0; each && j && l < 3; l++) sb_puts(&each[l], ", ");
             if (kind == RULE_GAP) {
                 union css_rule_value triple[3];
-                if (!gap_rule(text[i][j], text_n[i][j], cx, triple, spec)) return false;
+                if (!gap_rule(text[i][j], text_n[i][j], cx, triple, spec, each)) return false;
                 for (int l = 0; l < 3; l++) values[l][it->first + j] = triple[l];
             } else if (!rule_value(kind, text[i][j], text_n[i][j], cx, &values[kind][it->first + j])) return false;
+            else if (spec) rule_value_spec(kind, text[i][j], text_n[i][j], spec);
         }
         if (spec && it->repeat) sb_putc(spec, ')');
+        for (int l = 0; each && it->repeat && l < 3; l++) sb_putc(&each[l], ')');
     }
     for (int l = first; l <= last; l++) out[l] = (struct css_rule_list){items, values[l], (uint32_t)parts, (uint32_t)total};
     return true;
@@ -1853,20 +1884,36 @@ static bool rule_insets(int what, const char *v, size_t n, struct cx *cx, struct
     }
     return true;
 }
-/* a gap decoration shorthand's value (what: GS_*) into one axis' values */
+/* a gap decoration shorthand's value (what: GS_*) into one axis' values; each (when given): the
+   text each longhand gets, by list kind for GS_RULE and by inset for the inset shorthands */
 static bool gap_shorthand_parse(int what, const char *v, size_t n, struct cx *cx, struct css_gap_axis *out, sbuf *spec,
-                                sbuf inset_spec[4]) {
+                                sbuf each[4]) {
     switch (what) {
-    case GS_RULE: return rule_lists(RULE_GAP, v, n, cx, out->list, spec);
-    case GS_COLOR: return rule_lists(CSS_GAP_COLOR, v, n, cx, out->list, NULL);
-    case GS_STYLE: return rule_lists(CSS_GAP_STYLE, v, n, cx, out->list, NULL);
-    case GS_WIDTH: return rule_lists(CSS_GAP_WIDTH, v, n, cx, out->list, NULL);
+    case GS_RULE: return rule_lists(RULE_GAP, v, n, cx, out->list, spec, each);
+    /* one list kind: its specified value is the one its longhands get */
+    case GS_COLOR: return rule_lists(CSS_GAP_COLOR, v, n, cx, out->list, each ? &each[0] : spec, NULL);
+    case GS_STYLE: return rule_lists(CSS_GAP_STYLE, v, n, cx, out->list, each ? &each[0] : spec, NULL);
+    case GS_WIDTH: return rule_lists(CSS_GAP_WIDTH, v, n, cx, out->list, each ? &each[0] : spec, NULL);
     case GS_BREAK: return kw_find(kw_rule_break, v, n, &out->rule_break);
     case GS_ITEMS: return kw_find(kw_rule_items, v, n, &out->visibility);
     }
-    return rule_insets(what, v, n, cx, out->inset, inset_spec);
+    return rule_insets(what, v, n, cx, out->inset, each);
 }
-/* a shorthand: the longhands no more important declaration set, written into one copy of the group */
+/* the text a gap decoration shorthand gives longhand q (of one axis, its fields from base on): the
+   one of its list kind or inset in each (a one-kind shorthand's list in each[0]), or the
+   shorthand's own value */
+static void gap_longhand_text(int what, const struct propdef *q, size_t base, const sbuf each[4], const char *v, size_t n,
+                              const char **text, size_t *len) {
+    int slot = what == GS_RULE ? q->flags
+             : what == GS_COLOR || what == GS_STYLE || what == GS_WIDTH ? 0
+             : what >= GS_INSET_START ? (int)((q->off - base - offsetof(struct css_gap_axis, inset)) / sizeof(struct css_rule_inset))
+             : -1;
+    if (slot < 0) { *text = v; *len = n; return; }
+    *text = each[slot].p ? each[slot].p : "";
+    *len = each[slot].n;
+}
+/* a shorthand: the longhands no more important declaration set, written into one copy of the group
+   (cx->record gets each one's name and text, as set_long gives it) */
 static bool set_long(const char *name, const char *v, size_t n, struct cx *cx);
 static bool decoration_shorthand_split(const char *v, size_t n, struct cx *cx, const char *part[4], size_t part_n[4]);
 static bool gap_shorthand_apply(const struct propdef *p, const char *v, size_t n, bool global, struct cx *cx) {
@@ -1880,26 +1927,37 @@ static bool gap_shorthand_apply(const struct propdef *p, const char *v, size_t n
                 }
         return true;
     }
+    trim(&v, &n);
     struct css_gap_axis parsed = css_gap_rules_initial.axis[0];
-    if (!gap_shorthand_parse(what, v, n, cx, &parsed, NULL, NULL)) return false;
-    if (cx->font_pass) return true;
-    struct css_gap_rules own = *css_style_gap_rules(cx->s);
-    bool written = false;
-    for (int axis = 0; axis < 2; axis++) {
-        if (!(p->flags & (axis ? GS_ROW : GS_COLUMN))) continue;
-        size_t base = offsetof(struct css_gap_rules, axis) + (size_t)axis * sizeof(struct css_gap_axis);
-        for (int i = 0; i < 4; i++) {
-            const struct propdef *q = gap_longhand(what, axis, i);
-            if (!q) continue;
-            int at = css_prop_index(q);
-            if (cx->set[at]) continue;
-            memcpy((char *)&own + q->off, (const char *)&parsed + (q->off - base), q->size);
-            cx->set[at] = 1;
-            written = true;
+    sbuf each[4] = {{0}};
+    bool record = cx->record && !cx->font_pass;
+    bool ok = gap_shorthand_parse(what, v, n, cx, &parsed, NULL, record ? each : NULL);
+    if (ok && !cx->font_pass) {
+        struct css_gap_rules own = *css_style_gap_rules(cx->s);
+        bool written = false;
+        for (int axis = 0; axis < 2; axis++) {
+            if (!(p->flags & (axis ? GS_ROW : GS_COLUMN))) continue;
+            size_t base = offsetof(struct css_gap_rules, axis) + (size_t)axis * sizeof(struct css_gap_axis);
+            for (int i = 0; i < 4; i++) {
+                const struct propdef *q = gap_longhand(what, axis, i);
+                if (!q) continue;
+                int at = css_prop_index(q);
+                if (cx->set[at]) continue;
+                memcpy((char *)&own + q->off, (const char *)&parsed + (q->off - base), q->size);
+                cx->set[at] = 1;
+                written = true;
+                if (record) {
+                    const char *text;
+                    size_t len;
+                    gap_longhand_text(what, q, base, each, v, n, &text, &len);
+                    cx->record(cx->record_opaque, q->name, text, len);
+                }
+            }
         }
+        if (written) group_write(cx->s, G_GAP_RULE, &own, cx->a);
     }
-    if (written) group_write(cx->s, G_GAP_RULE, &own, cx->a);
-    return true;
+    for (int i = 0; i < 4; i++) sb_free(&each[i]);
+    return ok;
 }
 
 /* ---- serialization */
@@ -1935,7 +1993,10 @@ static bool rule_inset_text(const struct css_rule_inset *v, sbuf *out, web_doc *
     return css_length_serialize(&v->length, out, d);
 }
 /* §4.8: column-rule and row-rule from their longhands when they are repeater aligned (false: they
-   serialize as the empty string) */
+   serialize as the empty string). Each <gap-rule> writes its width and colour, and its style unless
+   it is the initial none (WPT css-multicol column-rule-computed.html: "0px none rgb(255, 0, 255)"
+   computes to "0px rgb(255, 0, 255)"), so that the value round-trips through the specified one,
+   which leaves out what is initial */
 static bool rule_triple_text(const style_t *st, const struct css_gap_axis *x, sbuf *out) {
     const struct css_rule_list *w = &x->list[CSS_GAP_WIDTH], *s = &x->list[CSS_GAP_STYLE], *c = &x->list[CSS_GAP_COLOR];
     if (w->nitems != s->nitems || w->nitems != c->nitems) return false;
@@ -1950,8 +2011,11 @@ static bool rule_triple_text(const style_t *st, const struct css_gap_axis *x, sb
             if (j) sb_puts(out, ", ");
             rule_value_text(st, CSS_GAP_WIDTH, &w->values[w->items[i].first + j], true, out);
             sb_putc(out, ' ');
-            rule_value_text(st, CSS_GAP_STYLE, &s->values[s->items[i].first + j], true, out);
-            sb_putc(out, ' ');
+            const union css_rule_value *style = &s->values[s->items[i].first + j];
+            if (style->style != BS_NONE) {
+                rule_value_text(st, CSS_GAP_STYLE, style, true, out);
+                sb_putc(out, ' ');
+            }
             rule_value_text(st, CSS_GAP_COLOR, &c->values[c->items[i].first + j], true, out);
         }
         if (it->repeat) sb_putc(out, ')');
@@ -2011,7 +2075,10 @@ static int gap_computed(const style_t *st, const struct propdef *p, sbuf *out, w
 /* CSSOM: a declared value's specified serialization; false leaves the authored text */
 static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf *out) {
     int what = p->type == PT_SHORT ? p->flags & 15 : -1;
-    if (p->type != PT_RULE_INSET && what != GS_RULE && what < GS_INSET_START) return false;
+    /* one list kind: a longhand's, or the bidirectional rule-color's (-style's, -width's) */
+    int kind = p->type == PT_RULE_LIST ? (int)p->flags
+             : what == GS_COLOR ? CSS_GAP_COLOR : what == GS_STYLE ? CSS_GAP_STYLE : what == GS_WIDTH ? CSS_GAP_WIDTH : -1;
+    if (p->type != PT_RULE_INSET && kind < 0 && what != GS_RULE && what < GS_INSET_START) return false;
     if (memchr(v, '\\', n)) return false;
     for (size_t i = 0; i + 4 <= n; i++) if (strn_ieq(v + i, "var(", 4)) return false;
     arena_t arena = {.chunk_size = 4096};
@@ -2024,7 +2091,8 @@ static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf
         struct cx cx = {.em = 16, .rem = 16, .vw = 800, .vh = 600, .a = &arena};
         struct css_gap_axis parsed = css_gap_rules_initial.axis[0];
         if (p->type == PT_RULE_INSET) ok = rule_inset(v, n, &cx, &parsed.inset[0], out);
-        else if (what == GS_RULE) ok = rule_lists(RULE_GAP, v, n, &cx, parsed.list, out);
+        else if (kind >= 0) ok = rule_lists(kind, v, n, &cx, parsed.list, out, NULL);
+        else if (what == GS_RULE) ok = rule_lists(RULE_GAP, v, n, &cx, parsed.list, out, NULL);
         else if ((ok = gap_shorthand_parse(what, v, n, &cx, &parsed, NULL, spec))) {
             /* the shortest form of the specified values, as the computed ones' */
             int a = what == GS_INSET_JUNCTION ? CSS_RULE_JUNCTION_START : what == GS_INSET_END ? CSS_RULE_CAP_END : 0;
@@ -2042,6 +2110,98 @@ static bool gap_specified(const struct propdef *p, const char *v, size_t n, sbuf
     ar_free(&arena);
     if (!ok) out->n = begin;
     sb_cstr(out);
+    return ok;
+}
+static bool gap_text_same(const char *a, size_t an, const char *b, size_t bn) { return an == bn && !memcmp(a, b, an); }
+/* §4.8: column-rule's (row-rule's) <gap-rule-list> from its width, style and colour lists' texts
+   (w[0..2]) when they are repeater aligned: as many items, each the same kind of item (a value,
+   a repeater of one count) with as many values; false when they are not */
+static bool gap_rule_join(const char *const *w, const size_t *wl, struct cx *cx, sbuf *out) {
+    const char **part[3];
+    size_t *part_n[3];
+    int parts = -1;
+    for (int k = 0; k < 3; k++) {
+        int m = rule_parts(w[k], wl[k], cx, &part[k], &part_n[k]);
+        if (m < 1 || (parts >= 0 && m != parts)) return false;
+        parts = m;
+    }
+    for (int i = 0; i < parts; i++) {
+        const char **value[3];
+        size_t *value_n[3];
+        int values = -1, repeated = 0;
+        uint32_t times[3] = {0, 0, 0};
+        for (int k = 0; k < 3; k++) {
+            const char *count, *inner;
+            size_t count_n, inner_n;
+            int m = 1;
+            if (rule_repeat(part[k][i], part_n[k][i], &count, &count_n, &inner, &inner_n)) {
+                if (!rule_repeat_count(count, count_n, cx, &times[k])) return false;
+                m = rule_parts(inner, inner_n, cx, &value[k], &value_n[k]);
+                repeated++;
+            } else {
+                value[k] = &part[k][i];
+                value_n[k] = &part_n[k][i];
+            }
+            if (m < 1 || (values >= 0 && m != values)) return false;
+            values = m;
+        }
+        if ((repeated && repeated != 3) || times[1] != times[0] || times[2] != times[0]) return false;
+        if (i) sb_puts(out, ", ");
+        if (repeated) {
+            if (times[0] == CSS_RULE_AUTO) sb_puts(out, "repeat(auto, ");
+            else { char number[24]; snprintf(number, sizeof number, "repeat(%u, ", times[0]); sb_puts(out, number); }
+        }
+        for (int j = 0; j < values; j++) {
+            if (j) sb_puts(out, ", ");
+            for (int k = 0; k < 3; k++) {
+                if (k) sb_putc(out, ' ');
+                sb_put(out, value[k][j], value_n[k][j]);
+            }
+        }
+        if (repeated) sb_putc(out, ')');
+    }
+    return true;
+}
+/* CSSOM: a gap decoration shorthand's value from its longhands' serialized values v (in the order
+   css_shorthand_longhands gives: each axis' as gap_longhand_names names them, the column one first),
+   in the form gap_specified gives the shorthand's own value; false when they have none in common
+   (§4.8: the rule lists are not repeater aligned; a bidirectional shorthand's two axes differ; the
+   cap and junction insets of rule-inset-start or -end differ) */
+static bool gap_shorthand_serialize(const struct propdef *p, const char *const *v, const size_t *l, int count, sbuf *out) {
+    int what = p->flags & 15;
+    int axes = !!(p->flags & GS_COLUMN) + !!(p->flags & GS_ROW), per = 0;
+    while (per < 4 && gap_longhand_names[what][per]) per++;
+    if (!axes || count != per * axes) return false;
+    for (int i = 0; axes == 2 && i < per; i++) if (!gap_text_same(v[i], l[i], v[per + i], l[per + i])) return false;
+    if (what == GS_INSET_START || what == GS_INSET_END) {
+        if (!gap_text_same(v[0], l[0], v[1], l[1])) return false;
+        per = 1;
+    }
+    if (what < GS_INSET_START && what != GS_RULE) { /* one longhand an axis, as it is written */
+        sb_put(out, v[0], l[0]);
+        return true;
+    }
+    sbuf text = {0};
+    arena_t arena = {.chunk_size = 4096};
+    jmp_buf trap;
+    arena.trap = &trap;
+    volatile bool ok = false;
+    if (!setjmp(trap)) {
+        struct cx cx = {.em = 16, .rem = 16, .vw = 800, .vh = 600, .a = &arena};
+        if (what == GS_RULE) ok = gap_rule_join(v, l, &cx, &text);
+        else {
+            /* the insets in their shorthand's grammar, then its shortest form */
+            for (int i = 0; i < per; i++) {
+                if (i) sb_puts(&text, i == 2 ? " / " : " ");
+                sb_put(&text, v[i], l[i]);
+            }
+            ok = true;
+        }
+    }
+    ar_free(&arena);
+    size_t begin = out->n;
+    if (ok && !gap_specified(p, text.p ? text.p : "", text.n, out)) { out->n = begin; sb_put(out, text.p, text.n); }
+    sb_free(&text);
     return ok;
 }
 
@@ -6022,7 +6182,7 @@ static bool apply_value(const struct propdef *p, const char *v, size_t n, struct
     case PT_OFFSET: return css_offset_parse(p->flags, v, n, cx, field, NULL);
     case PT_RULE_LIST: {
         struct css_rule_list lists[3];
-        if (!rule_lists(p->flags, v, n, cx, lists, NULL)) return false;
+        if (!rule_lists(p->flags, v, n, cx, lists, NULL, NULL)) return false;
         *(struct css_rule_list *)field = lists[p->flags];
         return true;
     }
@@ -7840,6 +8000,7 @@ bool css_shorthand_serialize(const struct propdef *p, const char *const *v, cons
         if (count != 1) return false;
         sb_put(out, v[0], l[0]);
         return true;
+    case SH_GAP_RULE: return gap_shorthand_serialize(p, v, l, count, out);
     case SH_ALL: case SH_ANIMATION: case SH_TRANSITION: case SH_OFFSET:
         return false; /* only a CSS-wide keyword: their longhands' values are not the shorthand's text */
     case SH_FONT: {
