@@ -7,9 +7,11 @@
 // real, trusted events through the browser's own hit testing, focus and default actions.
 //
 // click, send_keys and action_sequence follow WebDriver's Element Click, Element Send Keys and
-// Perform Actions as far as the native input can carry them. Every other testdriver function
-// keeps testdriver.js's refusal; in_automation makes it fail at once instead of waiting for a
-// person.
+// Perform Actions as far as the native input can carry them. get_all_cookies, get_named_cookie
+// and delete_all_cookies are WebDriver's Get All Cookies, Get Named Cookie and Delete All
+// Cookies on the browser's own jar, through __nocturne_cookies, which the browser gives the same
+// top-level window under the same flag. Every other testdriver function keeps testdriver.js's
+// refusal; in_automation makes it fail at once instead of waiting for a person.
 (function() {
   "use strict";
   var internal = window.test_driver_internal;
@@ -105,6 +107,24 @@
       if (!waiting) return;
       relays.delete(data.id);
       if (data.error) waiting.reject(new Error(data.error)); else waiting.resolve();
+      return;
+    }
+    if (data.nocturneTestdriver === "cookies-done") {
+      var asked = event.source === window.top ? cookieAsks.get(data.id) : undefined;
+      if (!asked) return;
+      cookieAsks.delete(data.id);
+      if (data.error) asked.reject(new Error(data.error)); else asked.resolve(data.result);
+      return;
+    }
+    if (data.nocturneTestdriver === "cookies") {
+      // Only the top-level window answers, and only about the frame that asked.
+      if (window !== window.top || !event.source) return;
+      var asker = event.source, ask = data.id;
+      var answer = function(error, result) {
+        asker.postMessage({nocturneTestdriver: "cookies-done", id: ask, error: error, result: result}, "*");
+      };
+      cookies(data.command === "delete" ? "delete" : "get", asker, typeof data.name === "string" ? data.name : null)
+        .then(function(result) { answer(null, result); }, function(e) { answer(String(e && e.message || e)); });
       return;
     }
     if (data.nocturneTestdriver !== "perform" || !event.source || !Array.isArray(data.steps)) return;
@@ -411,5 +431,47 @@
   }
   internal.action_sequence = function(actions, context) {
     return serially(function() { return actionSequence(actions, context || null); });
+  };
+
+  // ------------------------------------------------------------------ Cookies
+  // WebDriver's current browsing context is context's, the test's own when it is null. The
+  // browser's function takes that window and works on its active document's associated cookies:
+  // "get" serializes them (name's alone when name is a string), "delete" is WebDriver's "delete
+  // cookies". A window that reads up to its top-level window calls the function there; a frame
+  // under a cross-origin parent asks the top-level window's testdriver, which knows the frame as
+  // the message's source.
+  var cookieAsks = new Map(), cookieSerial = 0;
+  function cookies(command, context, name) {
+    var target = context || window;
+    var place = climb(window);
+    if (place.top) {
+      var port;
+      try { port = place.window.__nocturne_cookies; } catch (e) { port = undefined; }
+      if (typeof port !== "function")
+        return Promise.reject(failure("unsupported operation", "the browser is not driven for automation"));
+      return Promise.resolve().then(function() { return port(command, target, name); });
+    }
+    if (target !== window)
+      return Promise.reject(failure("unsupported operation", "a frame under a cross-origin parent asks only for its own cookies"));
+    return new Promise(function(resolve, reject) {
+      var id = ++cookieSerial;
+      cookieAsks.set(id, {resolve: resolve, reject: reject});
+      window.top.postMessage({nocturneTestdriver: "cookies", id: id, command: command, name: name}, "*");
+    });
+  }
+  // Get All Cookies.
+  internal.get_all_cookies = function(context) {
+    return serially(function() { return cookies("get", context || null, null); });
+  };
+  // Get Named Cookie: the first associated cookie of that name, null for none (testdriver.js
+  // turns that into "no such cookie").
+  internal.get_named_cookie = function(name, context) {
+    return serially(function() {
+      return cookies("get", context || null, String(name)).then(function(list) { return list.length ? list[0] : null; });
+    });
+  };
+  // Delete All Cookies.
+  internal.delete_all_cookies = function(context) {
+    return serially(function() { return cookies("delete", context || null, null).then(function() {}); });
   };
 })();

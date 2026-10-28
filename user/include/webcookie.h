@@ -111,3 +111,31 @@ long webcookie_sites(webcookie_jar *, struct webcookie_site **out, int64_t now);
 /* Removes the cookies of site and of every subdomain of it (NULL or "": every cookie), session
    ones too, and records the clear for the store: the count removed. */
 size_t webcookie_clear(webcookie_jar *, const char *site);
+
+/* WebDriver's view of the jar, for the test automation alone (webnet_cookie_associated, behind
+   web_host.automation_cookies). A document's associated cookies (WebDriver §14) are what the
+   cookie-string of its address for an "HTTP" API holds (RFC 6265 §5.4): the cookies whose domain,
+   path and Secure match the URL, HttpOnly ones too; SameSite is no part of it, and the user's
+   block omits them all as it omits the Cookie field. In that string's order: the longer path
+   first, then the earlier created.
+
+   One cookie as WebDriver serializes it (§14, the table for cookie conversion): its strings point
+   into the block webcookie_associated returns; domain is the domain field (host_only: the host);
+   same_site is a WEBCOOKIE_SAME_SITE_*, the jar's default Lax for a cookie set without the
+   attribute; expires (UTC s) is a persistent cookie's expiry-time, a session cookie has none. */
+enum { WEBCOOKIE_SAME_SITE_LAX, WEBCOOKIE_SAME_SITE_STRICT, WEBCOOKIE_SAME_SITE_NONE };
+struct webcookie_record {
+    const char *name, *value, *domain, *path;
+    bool host_only, secure, http_only, persistent;
+    unsigned same_site;
+    int64_t expires;
+};
+/* The associated cookies of url, name's alone unless name is NULL: one malloc'd block (free it)
+   in *out and the count. 0 for a URL no cookie is for (not http or https, or not a URL), -1 for
+   no memory. Like the cookie-string, it makes now their last access. */
+long webcookie_associated(webcookie_jar *, const char *url, const char *name,
+                          struct webcookie_record **out, int64_t now);
+/* WebDriver's "delete cookies": each associated cookie of url (name's alone unless NULL) leaves
+   the jar as one whose expiry-time has passed does, and the store with it. The count, or -1 for
+   no memory. */
+long webcookie_delete_associated(webcookie_jar *, const char *url, const char *name, int64_t now);

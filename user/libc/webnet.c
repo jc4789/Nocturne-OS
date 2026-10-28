@@ -460,6 +460,23 @@ long webnet_cookie_clear(webnet *n, const char *site) {
     n->cookie_due = r < 0 && webcookie_changed(n->cookies) ? uptime_ms() + COOKIE_RETRY_MS : 0;
     return r < 0 ? r : (long)removed;
 }
+long webnet_cookie_associated(webnet *n, const char *url, const char *name, struct webcookie_record **out) {
+    if (out) *out = NULL;
+    if (!n || !out) return -1;
+    if (n->cookie_stale) { n->cookie_stale = false; (void)cookie_sync(n, false); } /* what other windows saved */
+    return webcookie_associated(n->cookies, url, name, out, time(NULL));
+}
+long webnet_cookie_delete_associated(webnet *n, const char *url, const char *name) {
+    if (!n) return -1;
+    /* What other windows saved goes too, and the removal is saved at once, as a clear is. */
+    if (n->cookie_stale) { n->cookie_stale = false; (void)cookie_sync(n, false); }
+    long removed = webcookie_delete_associated(n->cookies, url, name, time(NULL));
+    if (removed > 0 && webcookie_changed(n->cookies)) {
+        n_result r = cookie_sync(n, true);
+        n->cookie_due = r < 0 && webcookie_changed(n->cookies) ? uptime_ms() + COOKIE_RETRY_MS : 0;
+    }
+    return removed;
+}
 bool webnet_site(const webnet *n, const char *host, char *out, size_t cap) {
     if (!n || !host || !out || !cap) return false;
     char key[256];

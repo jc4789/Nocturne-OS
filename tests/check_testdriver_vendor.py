@@ -1,10 +1,13 @@
 """Host self-check of the WPT testdriver tool (tests/wpt/testdriver-vendor.js), not of the browser.
 
-Runs the vendor in node against a stand-in window whose __nocturne_automation records what it is
-given, and checks the steps it builds for WebDriver's Element Click, Element Send Keys and Perform
-Actions, that it stays off without the browser's automation, and how it places a same-origin
-frame's points. It says nothing about what the browser does with the steps: that is for WPT's own
-infrastructure/testdriver/ tests run in the guest.
+Runs the vendor in node against a stand-in window whose __nocturne_automation and
+__nocturne_cookies record what they are given, and checks the steps it builds for WebDriver's
+Element Click, Element Send Keys and Perform Actions, what it asks for Get All Cookies, Get Named
+Cookie and Delete All Cookies (the window meant, from the top-level window, a same-origin frame and,
+by message, a frame under a cross-origin parent), that it stays off without the browser's
+automation, and how it places a same-origin frame's points. It says nothing about what the browser
+does with the steps or the cookies: that is for WPT's own infrastructure/testdriver/ tests run in
+the guest.
 
 usage: python -X utf8 tests/check_testdriver_vendor.py
 """
@@ -20,7 +23,9 @@ if any(ord(c) > 127 for c in vendor):
 
 harness = r"""
 const vm = require('vm');
-const source = process.argv[1]; // node -e: the first argument after the script
+// node -e: the first argument after the script is the vendor's path (its text would pass the
+// longest command line Windows takes).
+const source = require('fs').readFileSync(process.argv[1], 'utf8');
 let failed = 0, checks = 0;
 function check(name, pass, detail) {
   checks++;
@@ -38,19 +43,29 @@ function element(doc, props) {
 function realm(options) {
   const calls = [];
   const internal = {in_automation: false};
-  for (const name of ['click', 'send_keys', 'action_sequence', 'set_permission']) internal[name] = function original() { return 'original ' + name; };
+  for (const name of ['click', 'send_keys', 'action_sequence', 'set_permission', 'get_all_cookies', 'get_named_cookie', 'delete_all_cookies'])
+    internal[name] = function original() { return 'original ' + name; };
+  const listeners = [], cookieCalls = [];
   const doc = {activeElement: null, querySelectorAll() { return []; }};
   const win = {test_driver_internal: internal, innerWidth: 800, innerHeight: 600, navigator: {webdriver: !!options.webdriver},
     document: doc, Promise, Map, Set, Array, Object, Math, JSON, String, Error, isFinite, parseFloat,
-    addEventListener() {}, postMessage() {},
+    addEventListener(type, listener) { if (type === 'message') listeners.push(listener); }, postMessage() {},
     getComputedStyle() { return {paddingLeft: '3px', paddingTop: '4px'}; }};
   win.window = win; win.top = options.top || win; win.frameElement = options.frameElement || null;
   doc.defaultView = win; doc.body = element(doc, {localName: 'body'}); doc.documentElement = element(doc, {localName: 'html'});
   doc.activeElement = doc.body;
   if (options.port) win.__nocturne_automation = function(steps, duration) { calls.push({steps: JSON.parse(JSON.stringify(steps)), duration}); return Promise.resolve(); };
+  // The browser's cookie function: what it is given, and a jar of two cookies of the window.
+  if (options.cookies) win.__nocturne_cookies = function(command, target, name) {
+    cookieCalls.push({command, target, name, args: arguments.length});
+    if (command === 'delete') return undefined;
+    return [{name: 'a', value: '1'}, {name: 'b', value: '2'}, {name: 'b', value: '3'}].filter(c => name === null || c.name === name);
+  };
   vm.createContext(win);
   vm.runInContext(source, win);
-  return {win, doc, internal, calls};
+  // The window as the vendor sees it: inside its context the sandbox is the global.
+  const self = vm.runInContext('window', win);
+  return {win, self, doc, internal, calls, listeners, cookieCalls};
 }
 const plain = s => s.map(x => x.type + (x.key !== undefined ? ':' + x.key.toString(16) : '') +
   (x.x !== undefined ? '@' + x.x + ',' + x.y : '') + (x.button !== undefined ? '#' + x.button : '') + (x.at ? '+' + x.at : ''));
@@ -59,7 +74,9 @@ const plain = s => s.map(x => x.type + (x.key !== undefined ? ':' + x.key.toStri
   const off = realm({port: false});
   check('no port leaves in_automation false', off.internal.in_automation === false);
   check('no port leaves click as it was', off.internal.click() === 'original click');
-  const on = realm({port: true});
+  check('no port leaves the cookie functions as they were', off.internal.get_all_cookies() === 'original get_all_cookies' &&
+        off.internal.delete_all_cookies() === 'original delete_all_cookies');
+  const on = realm({port: true, cookies: true});
   check('port sets in_automation', on.internal.in_automation === true);
   check('other functions keep the default refusal', on.internal.set_permission() === 'original set_permission');
 
@@ -141,11 +158,56 @@ const plain = s => s.map(x => x.type + (x.key !== undefined ? ':' + x.key.toStri
     JSON.stringify(plain(on.calls[0].steps)) === JSON.stringify(['move@40,51', 'down@40,51#0', 'up@40,51#0']), plain(on.calls[0].steps));
   const unautomated = realm({port: false, webdriver: false, top: on.win, frameElement});
   check('a frame without automation stays off', unautomated.internal.in_automation === false);
+
+  // Cookies: the browser's function, given the window whose document is meant.
+  let list = await on.internal.get_all_cookies(null);
+  let call = on.cookieCalls[on.cookieCalls.length - 1];
+  check('get_all_cookies asks for the own window, every name', call.command === 'get' && call.target === on.self && call.name === null && call.args === 3);
+  check('get_all_cookies gives the list', list.length === 3 && list[0].name === 'a');
+  let named = await on.internal.get_named_cookie('b', null);
+  call = on.cookieCalls[on.cookieCalls.length - 1];
+  check('get_named_cookie asks by name and gives the first', call.name === 'b' && named && named.value === '2', named);
+  named = await on.internal.get_named_cookie('none', null);
+  check('get_named_cookie of no cookie is null (testdriver.js: no such cookie)', named === null);
+  const deleted = await on.internal.delete_all_cookies(null);
+  call = on.cookieCalls[on.cookieCalls.length - 1];
+  check('delete_all_cookies deletes every name', call.command === 'delete' && call.target === on.self && call.name === null && deleted === undefined);
+  const given = {};
+  await on.internal.get_all_cookies(given);
+  check('a given context is the window asked about', on.cookieCalls[on.cookieCalls.length - 1].target === given);
+  const noJar = realm({port: true});
+  refused = null;
+  await noJar.internal.get_all_cookies(null).catch(e => refused = e);
+  check('without the cookie function the cookies are refused, not faked', refused && /unsupported operation/.test(refused.message));
+  // A same-origin frame calls the top-level window's function with its own window.
+  on.cookieCalls.length = 0;
+  await child.internal.delete_all_cookies(null);
+  check('a same-origin frame deletes its own document\'s cookies through the top', on.cookieCalls.length === 1 &&
+        on.cookieCalls[0].command === 'delete' && on.cookieCalls[0].target === child.self);
+  // A frame under a cross-origin parent asks the top-level window's testdriver by message.
+  const far = realm({port: false, webdriver: true, top: on.win, frameElement: null});
+  const deliver = (to, from) => data => Promise.resolve().then(() => {
+    const event = {data: JSON.parse(JSON.stringify(data)), source: from, stopImmediatePropagation() {}};
+    to.listeners.forEach(listener => listener(event));
+  });
+  on.win.postMessage = deliver(on, far.win);
+  far.win.postMessage = deliver(far, on.win);
+  on.cookieCalls.length = 0;
+  named = await far.internal.get_named_cookie('b', null);
+  check('a cross-origin frame is asked about as the message source', on.cookieCalls.length === 1 && on.cookieCalls[0].target === far.win &&
+        on.cookieCalls[0].name === 'b');
+  check('its answer comes back to it', named && named.name === 'b' && named.value === '2', named);
+  await far.internal.delete_all_cookies(null);
+  check('a cross-origin frame deletes its own', on.cookieCalls.length === 2 && on.cookieCalls[1].command === 'delete' && on.cookieCalls[1].target === far.win);
+  refused = null;
+  await far.internal.get_all_cookies(on.win).catch(e => refused = e);
+  check('a cross-origin frame cannot name another window', refused && /unsupported operation/.test(refused.message) && on.cookieCalls.length === 2);
   console.log('testdriver-vendor: ' + checks + ' checks, ' + failed + ' failed');
   process.exit(failed ? 1 : 0);
 })().catch(e => { console.log('FAIL harness ' + (e && e.stack || e)); process.exit(1); });
 """
-result = subprocess.run(["node", "-e", harness, vendor], capture_output=True, text=True, encoding="utf-8")
+result = subprocess.run(["node", "-e", harness, str(root / "tests/wpt/testdriver-vendor.js")],
+                        capture_output=True, text=True, encoding="utf-8")
 sys.stdout.write(result.stdout)
 sys.stderr.write(result.stderr)
 sys.exit(result.returncode)

@@ -123,6 +123,75 @@ static void store(void) {
     CHECK(webcookie_load(a,bad,sizeof bad,now)==0);CHECK(sends(a,"https://example.com/","k"));
     free(file4);webcookie_free(a);webcookie_free(b);
 }
+/* WebDriver's associated cookies and its "delete cookies" (the WPT testdriver's Cookies). */
+static void webdriver(void) {
+    webcookie_jar *j=jar();webcookie_track(j);
+    CHECK(set(j,"https://www.example.com/a/b","host=1",true)==1);
+    CHECK(set(j,"https://www.example.com/a/b","root=2; Path=/; HttpOnly; SameSite=Strict",true)==1);
+    CHECK(set(j,"https://www.example.com/","wide=3; Domain=example.com; Path=/; Secure; SameSite=None; Max-Age=1000",true)==1);
+    CHECK(set(j,"https://www.example.com/c/d","other=4",true)==1);
+    CHECK(set(j,"https://sub.example.com/","sub=5",true)==1);
+    CHECK(set(j,"https://www.example.com/a/b","sec=6; Secure",true)==1);
+    CHECK(set(j,"https://www.example.com/a/b","gone=7; Max-Age=10",true)==1);
+    /* The cookie-string's cookies for an HTTP API, HttpOnly too, Secure ones only for https; the
+       longer path first, then the earlier created. */
+    struct webcookie_record *r=NULL;
+    long n=webcookie_associated(j,"https://www.example.com/a/x",NULL,&r,now);
+    CHECK(n==5&&r);
+    if(n==5&&r){
+        CHECK(!strcmp(r[0].name,"host")&&!strcmp(r[1].name,"sec")&&!strcmp(r[2].name,"gone")&&!strcmp(r[3].name,"root")&&!strcmp(r[4].name,"wide"));
+        CHECK(!strcmp(r[0].value,"1")&&!strcmp(r[0].domain,"www.example.com")&&!strcmp(r[0].path,"/a")&&r[0].host_only);
+        CHECK(!r[0].secure&&!r[0].http_only&&!r[0].persistent&&r[0].same_site==WEBCOOKIE_SAME_SITE_LAX);
+        CHECK(r[1].secure&&r[1].host_only);
+        CHECK(r[3].http_only&&r[3].same_site==WEBCOOKIE_SAME_SITE_STRICT&&!strcmp(r[3].path,"/")&&!r[3].persistent&&!r[3].expires);
+        CHECK(!strcmp(r[4].domain,"example.com")&&!r[4].host_only&&r[4].secure&&r[4].persistent&&r[4].expires==now+1000);
+        CHECK(r[4].same_site==WEBCOOKIE_SAME_SITE_NONE&&!strcmp(r[4].value,"3"));
+    }
+    free(r);r=NULL;
+    /* http: no Secure cookie. */
+    n=webcookie_associated(j,"http://www.example.com/a/x",NULL,&r,now);
+    CHECK(n==3&&r&&!strcmp(r[0].name,"host")&&!strcmp(r[1].name,"gone")&&!strcmp(r[2].name,"root"));
+    free(r);r=NULL;
+    /* By name: Get Named Cookie's list. Another host's cookie and another path's are not the URL's. */
+    CHECK(webcookie_associated(j,"https://www.example.com/a/x","root",&r,now)==1&&r&&!strcmp(r[0].name,"root")&&r[0].http_only);
+    free(r);r=NULL;
+    CHECK(webcookie_associated(j,"https://www.example.com/a/x","",&r,now)==0&&!r);
+    CHECK(webcookie_associated(j,"https://www.example.com/a/x","other",&r,now)==0&&!r);
+    CHECK(webcookie_associated(j,"https://www.example.com/a/x","sub",&r,now)==0&&!r);
+    /* A document no cookie is for: not http or https, or not a URL. */
+    CHECK(webcookie_associated(j,"about:blank",NULL,&r,now)==0&&!r);
+    CHECK(webcookie_associated(j,"file:///C:/a",NULL,&r,now)==0&&!r);
+    CHECK(webcookie_associated(j,"https://exa mple.com/",NULL,&r,now)==0&&!r);
+    CHECK(webcookie_associated(j,NULL,NULL,&r,now)==0&&!r);
+    CHECK(webcookie_associated(j,"https://www.example.com/",NULL,NULL,now)<0);
+    /* The store has the persistent one; another process sees it go once the deletion is saved. */
+    long n0;unsigned char *file=save(j,NULL,0,&n0);
+    webcookie_jar *k=jar();CHECK(webcookie_load(k,file,(size_t)n0,now)==1);CHECK(sends(k,"https://www.example.com/","wide"));
+    /* Delete Cookie by name, then Delete All Cookies: the URL's associated cookies alone. */
+    CHECK(webcookie_delete_associated(j,"https://www.example.com/a/x","host",now)==1);
+    get(j,"https://www.example.com/a/x",true,"sec=6; gone=7; root=2; wide=3");
+    CHECK(webcookie_delete_associated(j,"http://www.example.com/a/x","missing",now)==0);
+    CHECK(webcookie_delete_associated(j,"https://www.example.com/a/x",NULL,now)==4);
+    get(j,"https://www.example.com/a/x",true,"");
+    get(j,"https://www.example.com/c/d",true,"other=4");
+    CHECK(sends(j,"https://sub.example.com/","sub"));
+    CHECK(webcookie_delete_associated(j,"about:blank",NULL,now)==0);
+    long n1;unsigned char *file1=save(j,file,n0,&n1);free(file);
+    CHECK(webcookie_load(k,file1,(size_t)n1,now)==1);CHECK(!sends(k,"https://www.example.com/","wide"));
+    free(file1);webcookie_free(k);webcookie_free(j);
+    /* The user's block: none of a blocked host's cookies are its document's, none removed. */
+    j=jar();
+    CHECK(set(j,"https://www.blocked.com/","a=1",true)==1);
+    webcookie_set_rule(j,test_rule,NULL);
+    CHECK(webcookie_associated(j,"https://www.blocked.com/",NULL,&r,now)==0&&!r);
+    CHECK(webcookie_delete_associated(j,"https://www.blocked.com/",NULL,now)==0);
+    /* Past its expiry-time a cookie is no document's. */
+    CHECK(set(j,"https://example.com/","late=1; Max-Age=10",true)==1);
+    CHECK(webcookie_associated(j,"https://example.com/",NULL,&r,now)==1&&r&&r[0].persistent&&r[0].expires==now+10);
+    free(r);r=NULL;
+    CHECK(webcookie_associated(j,"https://example.com/",NULL,&r,now+10)==0&&!r);
+    webcookie_free(j);
+}
 int main(int argc,char **argv) {
     webcookie_jar *j=jar();
     CHECK(set(j,"https://www.example.com/a/b?x=y","first=1",true)==1);
@@ -285,6 +354,7 @@ int main(int argc,char **argv) {
     limits();
     rules();
     store();
+    webdriver();
     /* The deployed complete PSL, not merely the small policy-unit table. */
     FILE *f=fopen(argc>1?argv[1]:"C:\\Nocturne\\Web\\public_suffix_list.dat","r");
     CHECK(f!=NULL);

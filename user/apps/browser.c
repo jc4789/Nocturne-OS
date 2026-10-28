@@ -1963,6 +1963,21 @@ static const char *host_automation(void *opaque, web_doc *document, uint64_t id,
     *link = run;
     return NULL;
 }
+/* WebDriver's Cookies for the same testdriver (web_host.automation_cookies): the window's own jar,
+   the one document.cookie and the requests use, for a document of the tab's own tree. Nothing of
+   a cookie goes to the console or the serial log. */
+static long host_automation_cookies(void *opaque, web_doc *document, const char *url, const char *name,
+                                    struct webcookie_record **out) {
+    SERVE(opaque);
+    if (out) *out = NULL;
+    if (!automation_enabled || !document || document != tab->doc) return -1;
+    return webnet_cookie_associated(network, url, name, out);
+}
+static long host_automation_delete_cookies(void *opaque, web_doc *document, const char *url, const char *name) {
+    SERVE(opaque);
+    if (!automation_enabled || !document || document != tab->doc) return -1;
+    return webnet_cookie_delete_associated(network, url, name);
+}
 static void automation_end(const char *error) {
     struct automation_run *run = automation_runs;
     automation_runs = run->next;
@@ -2405,6 +2420,8 @@ static void finish_navigation(void) {
     document_host.navigation_timing.headers = web_response_headers(f);
     document_host.js_task_budget_ms = js_task_budget_ms;
     document_host.automation = automation_enabled ? host_automation : NULL;
+    document_host.automation_cookies = automation_enabled ? host_automation_cookies : NULL;
+    document_host.automation_delete_cookies = automation_enabled ? host_automation_delete_cookies : NULL;
     nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), document_type, &document_host);
     free(html);
     if (!nd) { web_response_free(f); free(f); tab->loading = false; set_status("Out of memory creating document"); return; }

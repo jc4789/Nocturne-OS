@@ -12,6 +12,7 @@
 #include <webidb.h>
 #include <webidb_async.h>
 #include <webprefs.h>
+#include <webcookie.h>
 #include <media.h>
 #include <quickjs.h>
 #include "webi.h"
@@ -6206,6 +6207,91 @@ static JSValue native_automation(JSContext *ctx, JSValueConst this_val, int argc
     *link = record;
     return promise;
 }
+/* The same tool's WebDriver Cookies (§14). With web_host.automation_cookies, beside
+   __nocturne_automation and only where it is, a top-level realm has
+   __nocturne_cookies(command, window, name). window is a Window of this document's tree, as a
+   realm of the tree holds one (a global, or a WindowProxy): WebDriver's current browsing context
+   is its browsing context, whose active document's associated cookies (HttpOnly ones too) "get"
+   returns serialized, name's alone when name is given, and "delete" removes (WebDriver's "delete
+   cookies"). A frame under a cross-origin parent asks through its top-level window's testdriver,
+   which knows the frame as a message's source. The jar is the host's; no cookie is logged. */
+static web_doc *automation_window_document(struct web_js_state *s, JSValueConst window) {
+    /* A global, a WindowProxy (frame_message_receiver), or a frame realm's own global, which only
+       that realm holds: a frame's testdriver passes its own window. */
+    bool brand = false;
+    web_doc *d = frame_message_receiver(s, window, &brand);
+    if (brand) return d;
+    for (struct web_js_state *realm = s->runtime_owner->runtime_realms; realm; realm = realm->runtime_next) {
+        if (!task_context_active(realm)) continue;
+        JSValue global = JS_GetGlobalObject(realm->ctx);
+        bool own = JS_StrictEq(s->ctx, global, window);
+        JS_FreeValue(s->ctx, global);
+        if (own) return realm->doc;
+    }
+    return NULL;
+}
+/* WebDriver's serialized cookies (§14, the table for cookie conversion); a session cookie has no
+   expiry. */
+static JSValue automation_serialized_cookies(JSContext *ctx, const struct webcookie_record *list, size_t count) {
+    static const char *const same_site[] = {[WEBCOOKIE_SAME_SITE_LAX] = "Lax", [WEBCOOKIE_SAME_SITE_STRICT] = "Strict",
+                                            [WEBCOOKIE_SAME_SITE_NONE] = "None"};
+    JSValue array = JS_NewArray(ctx);
+    if (JS_IsException(array)) return array;
+    for (size_t i = 0; i < count; i++) {
+        const struct webcookie_record *c = &list[i];
+        const char *policy = c->same_site < sizeof same_site / sizeof *same_site ? same_site[c->same_site] : "Lax";
+        JSValue cookie = JS_NewObject(ctx);
+        if (JS_IsException(cookie) ||
+            JS_DefinePropertyValueStr(ctx, cookie, "name", JS_NewString(ctx, c->name), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "value", JS_NewString(ctx, c->value), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "path", JS_NewString(ctx, c->path), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "domain", JS_NewString(ctx, c->domain), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "secure", JS_NewBool(ctx, c->secure), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValueStr(ctx, cookie, "httpOnly", JS_NewBool(ctx, c->http_only), JS_PROP_C_W_E) < 0 ||
+            (c->persistent && JS_DefinePropertyValueStr(ctx, cookie, "expiry", JS_NewInt64(ctx, c->expires), JS_PROP_C_W_E) < 0) ||
+            JS_DefinePropertyValueStr(ctx, cookie, "sameSite", JS_NewString(ctx, policy), JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, cookie); JS_FreeValue(ctx, array);
+            return JS_EXCEPTION;
+        }
+        if (JS_DefinePropertyValueUint32(ctx, array, (uint32_t)i, cookie, JS_PROP_C_W_E) < 0) { JS_FreeValue(ctx, array); return JS_EXCEPTION; }
+    }
+    return array;
+}
+static JSValue native_automation_cookies(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx);
+    if (!s->host.automation || !s->host.automation_cookies || !s->host.automation_delete_cookies || s->doc->frame_parent)
+        return JS_ThrowTypeError(ctx, "Automation is not available");
+    if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Automation browsing context is inactive");
+    if (argc < 2) return JS_ThrowTypeError(ctx, "Automation cookies need a command and a window");
+    const char *command = JS_ToCString(ctx, argv[0]);
+    if (!command) return JS_EXCEPTION;
+    int deleting = !strcmp(command, "delete") ? 1 : !strcmp(command, "get") ? 0 : -1;
+    JS_FreeCString(ctx, command);
+    if (deleting < 0) return JS_ThrowTypeError(ctx, "Unknown automation cookie command");
+    const char *name = NULL;
+    size_t name_len = 0;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2]) && !(name = JS_ToCStringLen(ctx, &name_len, argv[2])))
+        return JS_EXCEPTION;
+    JSValue result;
+    /* A conversion may have run page script that ended the document or its frame. */
+    web_doc *target = task_context_active(s) ? automation_window_document(s, argv[1]) : NULL;
+    const web_doc *tree = target;
+    while (tree && tree != s->doc) tree = tree->frame_parent;
+    if (!task_context_active(s)) result = JS_ThrowTypeError(ctx, "Automation browsing context is inactive");
+    else if (!tree || !target->live) result = JS_ThrowTypeError(ctx, "no such window: not a browsing context of this window");
+    else if (name && strlen(name) != name_len) result = deleting ? JS_UNDEFINED : JS_NewArray(ctx); /* no cookie's name has U+0000 */
+    else if (deleting) {
+        long removed = s->host.automation_delete_cookies(s->host.opaque, s->doc, web_effective_url(target), name);
+        result = removed < 0 ? JS_ThrowTypeError(ctx, "unable to delete cookies") : JS_UNDEFINED;
+    } else {
+        struct webcookie_record *list = NULL;
+        long count = s->host.automation_cookies(s->host.opaque, s->doc, web_effective_url(target), name, &list);
+        result = count < 0 ? JS_ThrowTypeError(ctx, "unable to read cookies") : automation_serialized_cookies(ctx, list, (size_t)count);
+        free(list);
+    }
+    if (name) JS_FreeCString(ctx, name);
+    return result;
+}
 void web_automation_done(web_doc *d, uint64_t id, const char *error) {
     struct web_js_state *s = d ? d->js : NULL;
     for (struct js_automation *p = s && s->ctx ? s->automations : NULL; p; p = p->next) {
@@ -9895,6 +9981,9 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
         JSValue global = JS_GetGlobalObject(s->ctx);
         int defined = JS_DefinePropertyValueStr(s->ctx, global, "__nocturne_automation",
             JS_NewCFunction(s->ctx, native_automation, "__nocturne_automation", 2), JS_PROP_CONFIGURABLE);
+        if (defined >= 0 && s->host.automation_cookies && s->host.automation_delete_cookies)
+            defined = JS_DefinePropertyValueStr(s->ctx, global, "__nocturne_cookies",
+                JS_NewCFunction(s->ctx, native_automation_cookies, "__nocturne_cookies", 3), JS_PROP_CONFIGURABLE);
         JS_FreeValue(s->ctx, global);
         if (defined < 0) { exception(s); end_task(s); goto failed; }
     }

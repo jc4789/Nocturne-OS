@@ -194,6 +194,14 @@ long webnet_cookie_sites(webnet *, struct webcookie_site **out);
    at once; other windows remove theirs when they read the store. The count removed, or the
    store's failure (negative n_result; the clear is saved at a later try). */
 long webnet_cookie_clear(webnet *, const char *site);
+/* For the test automation alone (WebDriver's Cookies, web_host.automation_cookies): the
+   associated cookies of a document at url, HttpOnly ones too (webcookie_associated, name's alone
+   unless NULL), with what other windows saved: a malloc'd block (free it) in *out and the count,
+   or -1. delete_associated removes them (WebDriver's "delete cookies") and saves at once: the
+   count removed, or -1. */
+struct webcookie_record;
+long webnet_cookie_associated(webnet *, const char *url, const char *name, struct webcookie_record **out);
+long webnet_cookie_delete_associated(webnet *, const char *url, const char *name);
 /* The site (registrable domain, by the Public Suffix List the jar uses) of a host, in out: the
    key the settings page groups a site's cookies and storage by. false when it does not fit. */
 bool webnet_site(const webnet *, const char *host, char *out, size_t cap);

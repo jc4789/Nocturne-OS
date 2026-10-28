@@ -183,6 +183,7 @@ struct web_automation_step {
     uint32_t at, value;
     double x, y, dx, dy;
 };
+struct webcookie_record; /* webcookie.h: one cookie as WebDriver serializes it */
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
@@ -285,6 +286,15 @@ struct web_host {
        one and duration has passed. Returns NULL when it took them, else why not (static). */
     const char *(*automation)(void *opaque, web_doc *document, uint64_t id,
                               const struct web_automation_step *steps, size_t count, uint32_t duration);
+    /* The same tool's WebDriver Cookies (§14), set with automation and only then: document is the
+       top-level document whose realm asks, url the address of a document of its tree.
+       automation_cookies gives that document's associated cookies, HttpOnly ones too
+       (webcookie_associated: name's alone unless NULL), as a malloc'd block in *out (the caller
+       frees it) and their count; automation_delete_cookies removes them (WebDriver's "delete
+       cookies") and gives how many. -1 when refused or out of memory. */
+    long (*automation_cookies)(void *opaque, web_doc *document, const char *url, const char *name,
+                               struct webcookie_record **out);
+    long (*automation_delete_cookies)(void *opaque, web_doc *document, const char *url, const char *name);
 };
 enum web_socket_event_type { WEB_SOCKET_OPENED, WEB_SOCKET_MESSAGE_TEXT, WEB_SOCKET_MESSAGE_BINARY,
     WEB_SOCKET_CLOSED, WEB_SOCKET_FAILED };
