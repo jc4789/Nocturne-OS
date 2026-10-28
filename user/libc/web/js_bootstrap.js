@@ -441,6 +441,45 @@
         hasChildNodes() { return this.firstChild !== null; }
         getRootNode(options={}) { return rawDom.root(this,!!shadowBridge.dictionary(options).composed); }
     }
+    /* The (Node or DOMString)... arguments of append, prepend, before and after, converted as Web
+       IDL does before the steps run (a string conversion may run author code). */
+    function nodeValues(nodes){const values=[];for(let i=0;i<nodes.length;i++)values[i]=rawDom.isNode(null,nodes[i])?nodes[i]:elementURL.string(nodes[i]);return values;}
+    /* DOM "convert nodes into a node": strings become Text nodes of document, and more than one
+       node goes into a new DocumentFragment, so the caller pre-inserts once and the inserted
+       scripts' post-connection steps run after every node is in place. */
+    function convertNodes(document,values){
+        const make=value=>typeof value==='string'?rawDom.create(document,3,'#text',value):value;
+        if(values.length===1)return make(values[0]);
+        const fragment=rawDom.create(document,11,'#document-fragment','');
+        for(let i=0;i<values.length;i++){const child=make(values[i]);validateInsertion(fragment,child,null);dom('insert',fragment,child,null);}
+        return fragment;
+    }
+    /* ParentNode prepend and append: pre-insert the converted node before this's first child, or
+       at the end. One [CEReactions] scope for the whole call. */
+    function parentInsert(receiver,nodes,first){
+        const type=rawDom.get(receiver,'nodeType');
+        if(type!==1&&type!==9&&type!==11)throw new TypeError('ParentNode receiver required');
+        const values=nodeValues(nodes);
+        const insert=()=>{const node=convertNodes(type===9?receiver:rawDom.get(receiver,'ownerDocument'),values);
+            const child=first?rawDom.get(receiver,'firstChild'):null;validateInsertion(receiver,node,child);dom('insert',receiver,node,child);};
+        if(customElementsReady)customElementsBridge.reactions(insert);else insert();
+    }
+    /* ChildNode before and after: the viable sibling is the first one on that side that is not
+       among the nodes, then the converted node is pre-inserted into the parent next to it. */
+    function siblingInsert(receiver,nodes,after){
+        const kind=rawDom.get(receiver,'nodeType');
+        if(kind!==1 && kind!==3 && kind!==7 && kind!==8 && kind!==10)throw new TypeError('ChildNode receiver required');
+        const values=nodeValues(nodes);
+        const parent=rawDom.get(receiver,'parentNode');
+        if(!parent)return;
+        const among=node=>{for(let i=0;i<values.length;i++)if(values[i]===node)return true;return false;};
+        let viable=rawDom.get(receiver,after?'nextSibling':'previousSibling');
+        while(viable&&among(viable))viable=rawDom.get(viable,after?'nextSibling':'previousSibling');
+        const insert=()=>{const node=convertNodes(rawDom.get(receiver,'ownerDocument'),values);
+            const child=after?viable:viable===null?rawDom.get(parent,'firstChild'):rawDom.get(viable,'nextSibling');
+            validateInsertion(parent,node,child);dom('insert',parent,node,child);};
+        if(customElementsReady)customElementsBridge.reactions(insert);else insert();
+    }
     function replaceChildNode(receiver,nodes) {
         const kind=rawDom.get(receiver,'nodeType');
         if(kind!==1 && kind!==3 && kind!==7 && kind!==8 && kind!==10)throw new TypeError('ChildNode receiver required');
@@ -480,8 +519,8 @@
         get previousElementSibling() { let n=this.previousSibling; while(n && n.nodeType !== 1) n=n.previousSibling; return n; }
         get childElementCount() { return this.children.length; }
         remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-        append(...nodes) { for (const n of nodes) this.appendChild(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n))); }
-        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n)),before); }
+        append(...nodes) { parentInsert(this,nodes,false); }
+        prepend(...nodes) { parentInsert(this,nodes,true); }
         replaceChildren(...nodes) {
             const type=rawDom.get(this,'nodeType');
             if(![1,9,11].includes(type))throw new TypeError('ParentNode receiver required');
@@ -501,8 +540,8 @@
                 dom('replaceAll',this,replacement);
             });
         }
-        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),this); }
-        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),next); } }
+        before(...nodes) { siblingInsert(this,nodes,false); }
+        after(...nodes) { siblingInsert(this,nodes,true); }
         replaceWith(...nodes) { replaceChildNode(this,nodes); }
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return domGet(this,'localName'); }
