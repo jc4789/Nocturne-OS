@@ -358,6 +358,7 @@
         setTimeout:(fn,ms,...args)=>timer(fn,ms,args,false),setInterval:(fn,ms,...args)=>timer(fn,ms,args,true),
         clearTimeout:clearTimer,clearInterval:clearTimer,
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},
+        reportError(e){if(!arguments.length)throw new TypeError("Failed to execute 'reportError': 1 argument required");report(e);},
         console:consoleNamespace((level,values)=>host.send(7,0,{message:values.map(String).join(' '),filename:address}),()=>host.now()),
         addEventListener:target.addEventListener.bind(target),removeEventListener:target.removeEventListener.bind(target),dispatchEvent:target.dispatchEvent.bind(target)});
     // No DOM image sources here; context loss events are timer tasks.

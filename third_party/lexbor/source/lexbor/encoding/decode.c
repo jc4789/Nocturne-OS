@@ -1502,7 +1502,8 @@ lxb_encoding_decode_gb18030_range(uint32_t index)
      * Pointer greater than 39419 and less than 189000,
      * or pointer is greater than 1237575
      */
-    if ((unsigned) (index - 39419) < (189000 - 39419)
+    /* Nocturne: 39419 itself is U+FFFF. */
+    if ((unsigned) (index - 39420) < (189000 - 39420)
         || index > 1237575)
     {
         return LXB_ENCODING_ERROR_CODEPOINT;
@@ -1753,8 +1754,10 @@ lxb_encoding_decode_gb18030(lxb_encoding_decode_t *ctx,
 
         /* Range 0x30 to 0x39, inclusive */
         if ((unsigned) (**data - 0x30) > (0x39 - 0x30)) {
-            ctx->prepend = true;
-
+            /*
+             * Nocturne: prepend only marks a return with SMALL_BUFFER; left
+             * set here, the next chunk took a three-byte prefix for one.
+             */
             LXB_ENCODING_DECODE_ERROR_BEGIN {
                 ctx->prepend = true;
                 ctx->have_error = true;
@@ -1826,8 +1829,17 @@ lxb_status_t
 lxb_encoding_decode_replacement(lxb_encoding_decode_t *ctx,
                                 const lxb_char_t **data, const lxb_char_t *end)
 {
+    /*
+     * Nocturne: one error for the first byte (u.lead: replacement error
+     * returned), then finished whatever follows.
+     */
+    if (*data < end && ctx->u.lead == 0) {
+        LXB_ENCODING_DECODE_ERROR(ctx);
+        ctx->u.lead = 1;
+    }
+
     *data = end;
-    return LXB_STATUS_ERROR;
+    return LXB_STATUS_OK;
 }
 
 lxb_status_t

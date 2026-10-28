@@ -1,8 +1,10 @@
 /* URL and URLSearchParams (https://url.spec.whatwg.org/#api). The parser, the
    setters and the urlencoded format are native (js_url.c over Lexbor's WHATWG
    parser). A URL is the record host.urlParse returns: its serialization, then
-   where each component lies in it (web_url.h's enum web_url_mark). The realm's
-   bootstrap keeps urlBridge: storageOrigin. */
+   where each component lies in it (web_url.h's enum web_url_mark).
+   urlBridge holds what the realm's bootstrap and HTML take from it: the
+   storage origin of a URL, and the parser with the document's character
+   encoding for the query. */
 const urlBridge = (() => {
     'use strict';
     const apply = Reflect.apply, define = Object.defineProperty, ownKeys = Reflect.ownKeys;
@@ -339,5 +341,19 @@ const urlBridge = (() => {
     expose(iteratorPrototype, 'URLSearchParams Iterator');
     define(globalThis, 'URL', {value: URL, writable: true, configurable: true});
     define(globalThis, 'URLSearchParams', {value: URLSearchParams, writable: true, configurable: true});
-    return {storageOrigin};
+    return Object.freeze({
+        storageOrigin,
+        /* HTML's encoding-parse a URL: url against base (or none) with the
+           encoding named for the query; a URL, or null for failure. */
+        encodingParse(url, base, encoding) {
+            const r = parse(usv(url), base === undefined ? undefined : usv(base), encoding);
+            return r === null ? null : new URL(RECORD, r);
+        },
+        /* Location's search setter on href: the query from value in the
+           encoding named; the serialization. */
+        search(href, value, encoding) {
+            const r = update(href, SEARCH, usv(value), encoding);
+            return r === null ? href : r[HREF];
+        }
+    });
 })();

@@ -20,6 +20,7 @@
 #include "html_lexbor.h"
 #include "html_policy.h"
 #include "html_encoding.h"
+#include "web_encoding.h"
 #include "xml.h"
 #include "js_script_safety.h"
 #include "js_canvas.h"
@@ -91,6 +92,7 @@ struct js_script {
     size_t len;
     bool module, deferred, asynchronous, dynamic, ready, failed, executed, notified;
     bool external, parser_released;
+    bool muted; /* a classic script from another origin: its errors are muted (report_exception) */
     JSValue evaluation;
     uint64_t request, stream_generation;
     struct js_compile *compile; /* a fetched classic script's bytecode, compiled elsewhere */
@@ -591,22 +593,36 @@ static JSValue diagnostic_stack(JSContext *ctx, JSValueConst error) {
     if (JS_HasException(ctx)) { JSValue secondary = JS_GetException(ctx); JS_FreeValue(ctx, secondary); }
     return result;
 }
+/* One frame of a QuickJS stack, "    at name (url:line:col)" or "    at url:line:col" (a syntax
+   error's place), from frame to end: its URL, line and column. False for "(native)" and any other
+   form. */
+static bool stack_frame(const char *frame, const char *end, const char **url_out, size_t *url_length,
+                        unsigned long *row, unsigned long *col) {
+    const char *tail = end;
+    while (tail > frame && (tail[-1] == ')' || tail[-1] == '\r' || tail[-1] == ' ')) tail--;
+    const char *column = tail; while (column > frame && isdigit((unsigned char)column[-1])) column--;
+    const char *line_end = column > frame && column[-1] == ':' ? column - 1 : NULL;
+    const char *line = line_end;
+    if (line) while (line > frame && isdigit((unsigned char)line[-1])) line--;
+    if (!line || line >= line_end || line <= frame || line[-1] != ':') return false;
+    const char *url_end = line - 1, *url = url_end;
+    while (url > frame && url[-1] != '(' && url[-1] != ' ') url--;
+    *url_out = url; *url_length = (size_t)(url_end - url);
+    *row = strtoul(line, NULL, 10); *col = strtoul(column, NULL, 10);
+    return true;
+}
+static bool bindings_url(const char *url, size_t length) {
+    return length == strlen("nocturne:browser-bindings") && !memcmp(url, "nocturne:browser-bindings", length);
+}
 static void diagnostic_excerpt(struct web_js_state *s, const char *stack) {
     unsigned emitted = 0;
     for (const char *frame = stack; frame && *frame && emitted < 3;) {
         const char *end = strchr(frame, '\n'); if (!end) end = frame + strlen(frame);
-        const char *tail = end;
-        while (tail > frame && (tail[-1] == ')' || tail[-1] == '\r' || tail[-1] == ' ')) tail--;
-        const char *column = tail; while (column > frame && isdigit((unsigned char)column[-1])) column--;
-        const char *line_end = column > frame && column[-1] == ':' ? column - 1 : NULL;
-        const char *line = line_end;
-        if (line) while (line > frame && isdigit((unsigned char)line[-1])) line--;
-        if (line && line < line_end && line > frame && line[-1] == ':') {
-            const char *url_end = line - 1, *url = url_end;
-            while (url > frame && url[-1] != '(' && url[-1] != ' ') url--;
-            size_t url_len = (size_t)(url_end - url), length = 0;
+        const char *url; size_t url_len; unsigned long row, col;
+        if (stack_frame(frame, end, &url, &url_len, &row, &col)) {
+            size_t length = 0;
             const char *source = NULL;
-            if (url_len == strlen("nocturne:browser-bindings") && !memcmp(url,"nocturne:browser-bindings",url_len)) {
+            if (bindings_url(url, url_len)) {
                 source = js_bootstrap; length = sizeof js_bootstrap - 1;
             }
             for (struct js_script *script = s->scripts; !source && script; script = script->next)
@@ -618,7 +634,6 @@ static void diagnostic_excerpt(struct web_js_state *s, const char *stack) {
                     source = module->source; length = module->len;
                 }
             if (source) {
-                unsigned long row = strtoul(line,NULL,10), col = strtoul(column,NULL,10);
                 size_t start = 0;
                 for (unsigned long current = 1; current < row && start < length; current++) {
                     const char *nl = memchr(source + start,'\n',length - start);
@@ -673,21 +688,80 @@ static void diagnostic_context(struct web_js_state *s, bool fetch_abort) {
     }
     storage_profile_report(s);
 }
+/* Whether a frame of the stack is a classic script fetched from another origin. Classic scripts are
+   fetched without CORS, so none of those is CORS-same-origin: HTML mutes its errors. Any such frame
+   mutes the report, wherever the throw was (more than the script being run, never less). */
+static bool stack_muted(struct web_js_state *s, const char *stack) {
+    for (const char *frame = stack; frame && *frame;) {
+        const char *end = strchr(frame, '\n'); if (!end) end = frame + strlen(frame);
+        const char *url; size_t length; unsigned long row, col;
+        if (stack_frame(frame, end, &url, &length, &row, &col))
+            for (struct js_script *script = s->scripts; script; script = script->next)
+                if (script->muted && script->url && strlen(script->url) == length && !memcmp(script->url, url, length))
+                    return true;
+        frame = *end ? end + 1 : NULL;
+    }
+    return false;
+}
+/* HTML "report an exception": a cancelable ErrorEvent at the realm's global (the bootstrap's
+   reportException hook, which holds the global's errors reporting mode), and the console report
+   only when no listener canceled it. The location is the first frame outside the bindings. A muted
+   error says "Script error." with no location and a null error. A realm its watchdog stopped, or
+   one still starting, only logs. */
+static void report_exception(struct web_js_state *s, JSValueConst e) {
+    JSValue stack = diagnostic_stack(s->ctx, e);
+    const char *a = JS_ToCString(s->ctx, e), *b = JS_IsUndefined(stack) ? NULL : JS_ToCString(s->ctx, stack);
+    if (JS_HasException(s->ctx)) { JSValue secondary = JS_GetException(s->ctx); JS_FreeValue(s->ctx, secondary); }
+    bool log = true;
+    if (!s->disabled && !s->starting) {
+        const char *url = ""; size_t url_length = 0; unsigned long row = 0, col = 0;
+        for (const char *frame = b; frame && *frame;) {
+            const char *end = strchr(frame, '\n'); if (!end) end = frame + strlen(frame);
+            const char *at; size_t length; unsigned long r, c;
+            if (stack_frame(frame, end, &at, &length, &r, &c) && !bindings_url(at, length)) {
+                url = at; url_length = length; row = r; col = c; break;
+            }
+            frame = *end ? end + 1 : NULL;
+        }
+        sbuf message = {0}; sb_puts(&message, "Uncaught "); sb_puts(&message, a ? a : "exception");
+        JSValue args[6] = {JS_DupValue(s->ctx, e), JS_NewString(s->ctx, sb_cstr(&message)),
+            JS_NewStringLen(s->ctx, url, url_length), JS_NewUint32(s->ctx, (uint32_t)MIN(row, UINT32_MAX)),
+            JS_NewUint32(s->ctx, (uint32_t)MIN(col, UINT32_MAX)), JS_NewBool(s->ctx, stack_muted(s, b))};
+        sb_free(&message);
+        JSValue fired = JS_IsException(args[1]) || JS_IsException(args[2]) ? JS_EXCEPTION :
+            custom_element_hook(s, "reportException", 6, args);
+        /* A failure to report is not reported again: the console has it below. */
+        if (JS_IsException(fired)) { JSValue secondary = JS_GetException(s->ctx); JS_FreeValue(s->ctx, secondary); }
+        else if (JS_IsBool(fired)) log = JS_ToBool(s->ctx, fired) > 0;
+        JS_FreeValue(s->ctx, fired);
+        for (int i = 0; i < 6; i++) JS_FreeValue(s->ctx, args[i]);
+    }
+    if (log) {
+        sbuf text = {0}; sb_puts(&text, a ? a : "JavaScript exception");
+        if (b && *b && (!a || strcmp(a, b))) { sb_putc(&text, '\n'); sb_puts(&text, b); }
+        log_text(s, 2, sb_cstr(&text)); sb_free(&text);
+        diagnostic_context(s,a && !strncmp(a,"AbortError:",11));
+        diagnostic_excerpt(s,b);
+    }
+    JS_FreeCString(s->ctx, a); JS_FreeCString(s->ctx, b);
+    JS_FreeValue(s->ctx, stack);
+}
 static void exception(struct web_js_state *s) {
     report_allocation_failure(s);
     bool temporary = !s->running;
     if (temporary) { JS_UpdateStackTop(s->rt); s->task_deadline = uptime_ms() + s->task_budget_ms; s->running = 1; }
     JSValue e = JS_GetException(s->ctx);
-    JSValue stack = diagnostic_stack(s->ctx, e);
-    const char *a = JS_ToCString(s->ctx, e), *b = JS_IsUndefined(stack) ? NULL : JS_ToCString(s->ctx, stack);
-    sbuf text = {0}; sb_puts(&text, a ? a : "JavaScript exception");
-    if (b && *b && (!a || strcmp(a, b))) { sb_putc(&text, '\n'); sb_puts(&text, b); }
-    log_text(s, 2, sb_cstr(&text)); sb_free(&text);
-    diagnostic_context(s,a && !strncmp(a,"AbortError:",11));
-    diagnostic_excerpt(s,b);
-    JS_FreeCString(s->ctx, a); JS_FreeCString(s->ctx, b);
-    JS_FreeValue(s->ctx, stack); JS_FreeValue(s->ctx, e);
+    report_exception(s, e);
+    JS_FreeValue(s->ctx, e);
     if (temporary) s->running = 0;
+}
+/* host.reportException(error): the bindings' callbacks (listeners, observers, reactions) and
+   self.reportError report what they caught the same way. */
+static JSValue native_report_exception(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    struct web_js_state *s = state(ctx);
+    if (s) report_exception(s, argc ? argv[0] : JS_UNDEFINED);
+    return JS_UNDEFINED;
 }
 static int interrupt(JSRuntime *rt, void *opaque) {
     struct web_js_state *s = opaque;
@@ -7334,6 +7408,10 @@ static bool process_pending(struct web_js_state *s) {
                         if (final) { js_free(s->ctx, script->url); script->url = final; }
                         else { script->failed = true; exception(s); }
                     }
+                    if (!script->failed && (!strncasecmp(script->url, "http://", 7) || !strncasecmp(script->url, "https://", 8))) {
+                        bool oom = false;
+                        script->muted = !same_origin_urls(script->url, s->doc->url, &oom);
+                    }
                     if (!script->failed) compile_elsewhere(s, script);
                 }
             }
@@ -8904,6 +8982,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     JSValue api = JS_NewObject(s->ctx);
     static const JSCFunctionListEntry functions[] = {
         JS_CFUNC_DEF("dom", 2, native_dom), JS_CFUNC_DEF("log", 1, native_log),
+        JS_CFUNC_DEF("reportException", 1, native_report_exception),
         JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),
         JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
         JS_CFUNC_DEF("inputListener",2,native_input_listener),JS_CFUNC_DEF("storageListener",1,native_storage_listener),

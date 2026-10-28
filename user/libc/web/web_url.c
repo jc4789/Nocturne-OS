@@ -81,11 +81,12 @@ static void serialize(const lxb_url_t *url, struct web_url *out) {
     }
 }
 
-/* A parse in the parser's scratch memory: NULL for failure, with *status. */
-static lxb_url_t *parse(struct web_url_parser *p, const lxb_url_t *base,
-                        const char *input, size_t length, lxb_status_t *status) {
+/* A parse in the parser's scratch memory: NULL for failure, with *status.
+   Lexbor takes failure, as every encoding without an encoder, as UTF-8. */
+static lxb_url_t *parse(struct web_url_parser *p, const lxb_url_t *base, const char *input,
+                        size_t length, web_encoding encoding, lxb_status_t *status) {
     *status = lxb_url_parse_basic(&p->parser, NULL, base, (const lxb_char_t *)input, length,
-                                  LXB_URL_STATE__UNDEF, LXB_ENCODING_AUTO);
+                                  LXB_URL_STATE__UNDEF, encoding);
     lxb_url_t *url = *status == LXB_STATUS_OK ? p->parser.url : NULL;
     lxb_url_parser_clean(&p->parser);
     return url;
@@ -96,10 +97,10 @@ static int result_of(lxb_status_t status) {
 }
 
 int web_url_parse(struct web_url_parser *p, const char *input, size_t length,
-                  const char *base, size_t base_length, struct web_url *out) {
+                  const char *base, size_t base_length, web_encoding encoding, struct web_url *out) {
     lxb_status_t status = LXB_STATUS_OK;
-    lxb_url_t *base_url = base ? parse(p, NULL, base, base_length, &status) : NULL;
-    lxb_url_t *url = !base || base_url ? parse(p, base_url, input, length, &status) : NULL;
+    lxb_url_t *base_url = base ? parse(p, NULL, base, base_length, WEB_ENCODING_UTF8, &status) : NULL;
+    lxb_url_t *url = !base || base_url ? parse(p, base_url, input, length, encoding, &status) : NULL;
     int result = url ? 1 : result_of(status);
     if (url) serialize(url, out);
     lexbor_mraw_clean(p->mraw);
@@ -108,19 +109,34 @@ int web_url_parse(struct web_url_parser *p, const char *input, size_t length,
 
 bool web_url_valid(struct web_url_parser *p, const char *input, size_t length) {
     lxb_status_t status;
-    bool valid = parse(p, NULL, input, length, &status) != NULL;
+    bool valid = parse(p, NULL, input, length, WEB_ENCODING_UTF8, &status) != NULL;
     lexbor_mraw_clean(p->mraw);
     return valid;
 }
 
+/* The search setter with the query's encoding (Lexbor's own setter parses it
+   as UTF-8): empty, no query; otherwise the value without one leading '?',
+   basic URL parsed into an empty query in query state. */
+static lxb_status_t search_set(lxb_url_t *url, lxb_url_parser_t *parser, const lxb_char_t *value,
+                               size_t length, web_encoding encoding) {
+    lexbor_str_destroy(&url->query, url->mraw, false);
+    url->query.length = 0;
+    if (!length) return LXB_STATUS_OK;
+    if (*value == '?') { value++; length--; }
+    return lxb_url_parse_basic(parser, url, NULL, value, length, LXB_URL_STATE_QUERY_STATE, encoding);
+}
+
 int web_url_set(struct web_url_parser *p, const char *href, size_t href_length,
-                enum web_url_part part, const char *value, size_t length, struct web_url *out) {
+                enum web_url_part part, const char *value, size_t length, web_encoding encoding,
+                struct web_url *out) {
     lxb_status_t status;
-    lxb_url_t *url = parse(p, NULL, href, href_length, &status);
+    lxb_url_t *url = parse(p, NULL, href, href_length, WEB_ENCODING_UTF8, &status);
     if (url) {
         lxb_url_parser_t *parser = &p->parser;
         const lxb_char_t *v = (const lxb_char_t *)value;
-        switch (part) {
+        if (part == WEB_URL_SEARCH && web_encoding_output(encoding) != WEB_ENCODING_UTF8)
+            status = search_set(url, parser, v, length, encoding);
+        else switch (part) {
         case WEB_URL_PROTOCOL: status = lxb_url_api_protocol_set(url, parser, v, length); break;
         case WEB_URL_USERNAME: status = lxb_url_api_username_set(url, v, length); break;
         case WEB_URL_PASSWORD: status = lxb_url_api_password_set(url, v, length); break;

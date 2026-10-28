@@ -24,7 +24,7 @@ extern "C" {
 
 #ifndef LEXBOR_DISABLE_INTERNAL_EXTERN
 LXB_EXTERN const lxb_encoding_data_t lxb_encoding_res_map[LXB_ENCODING_LAST_ENTRY];
-LXB_EXTERN const lexbor_shs_entry_t lxb_encoding_res_shs_entities[220];
+LXB_EXTERN const lexbor_shs_entry_t lxb_encoding_res_shs_entities[392];
 #endif /* !LEXBOR_DISABLE_INTERNAL_EXTERN */
 
 #ifdef __cplusplus
