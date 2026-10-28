@@ -809,14 +809,14 @@ bool web_native_checkpoint(web_doc *d) {
            author task. Only an active author stack or parser must be retired;
            a completed document keeps its queued scripts and resource jobs. */
         bool abort_author=s->running || (s->runtime_owner && s->runtime_owner->runtime_active &&
-            s->runtime_owner->runtime_active->running) || d->parser || !s->parsing_done || s->parsing_cancelled;
+            s->runtime_owner->runtime_active->running) || doc_parser_current(d) || !s->parsing_done || s->parsing_cancelled;
         if(abort_author)s->disabled=true;
         if(abort_author && s->runtime_owner && s->runtime_owner->runtime_active)s->runtime_owner->runtime_active->disabled=true;
         __atomic_store_n(&d->native_cancelled,true,__ATOMIC_RELEASE);
         if(first){
             char message[160];
             snprintf(message,sizeof message,"Native processing cancelled: layout depth %u, author depth %d, parser %s; %s, coherent view recovery pending.",
-                d->native_layout_depth,s->running,d->parser?"active":"complete",abort_author?"scripts stopped":"author tasks preserved");
+                d->native_layout_depth,s->running,doc_parser_current(d)?"active":"complete",abort_author?"scripts stopped":"author tasks preserved");
             log_text(s,1,message);
         }
         return false;
@@ -4809,8 +4809,17 @@ static JSValue native_ready(JSContext *ctx, JSValueConst this_val, int argc, JSV
     return JS_NewString(ctx, s->parsing_cancelled ? "loading" : s->load_sent ? "complete" : s->parsing_done ? "interactive" : "loading");
 }
 static JSValue native_current(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return wrap(state(ctx), state(ctx)->current_script); }
+/* HTML "document open steps", "document write steps" and close(): an XML
+   document has no input stream, before any other check. */
+static JSValue xml_stream_error(struct web_js_state *s) {
+    JSValue message=JS_NewString(s->ctx,"An XML document has no input stream to open, write or close");
+    JSValue error=custom_element_hook(s,"invalidStateError",1,&message);JS_FreeValue(s->ctx,message);
+    return JS_IsException(error)?error:JS_Throw(s->ctx,error);
+}
 static JSValue native_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
+    /* The Trusted Types check (js_html_safety.js) came first. */
+    if (s->doc->xml) return xml_stream_error(s);
     if (s->dynamic_markup_counter) {
         JSValue message=JS_NewString(ctx,"A custom element constructor cannot write to its parser document");
         JSValue error=custom_element_hook(s,"invalidStateError",1,&message);JS_FreeValue(ctx,message);
@@ -6582,6 +6591,9 @@ static void discard_prepared_script(struct web_js_state *s,struct js_script *scr
 }
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic) {
     if (n->script_started) return NULL;
+    /* Only HTMLScriptElement and SVGScriptElement are prepared: an element
+       named script in another namespace (MathML, an XML vocabulary) is not. */
+    if (n->namespace_id != NS_HTML && n->namespace_id != NS_SVG) return NULL;
     uint64_t generation=s->stream_generation;
     bool fragment = n->script_parse_eligible;
     if(s->doc->sandbox_flags&SB_SCRIPTS){n->script_started=true;return NULL;}
@@ -7001,8 +7013,8 @@ bool web_js_native_recover(web_doc *d) {
         __atomic_store_n(&d->native_cancelled,false,__ATOMIC_RELEASE);
         return true;
     }
-    bool aborted_parser=d->parser || !s->parsing_done || s->parsing_cancelled;
-    if(d->parser){html_finish(d->parser);d->parser=NULL;}
+    bool aborted_parser=doc_parser_current(d) || !s->parsing_done || s->parsing_cancelled;
+    doc_parser_stop(d);
     s->blocker=NULL;s->parser_write=false;s->document_waiting=false;
     if(aborted_parser){
         s->parsing_done=s->parsing_cancelled=true;
@@ -8578,34 +8590,39 @@ void web_js_tick(web_doc *d, uint64_t now) {
     if (s->blocker && (s->blocker->executed || s->disabled)) s->blocker = NULL;
     /* A tick executes at most one JavaScript task plus its microtask checkpoint.
        Parsing and native completions may progress without invoking callbacks. */
-    if (!s->parsing_done && !s->blocker && d->parser) {
+    /* The HTML parser or an XML document's XML parser (doc.c): at a script's
+       end tag either returns HTML_PARSE_SCRIPT, and this task's microtask
+       checkpoint precedes "prepare the script element". */
+    if (!s->parsing_done && !s->blocker && doc_parser_current(d)) {
         node_t *created_before = d->owned_nodes;
         for (int step = 0; step < 32 && !s->blocker; step++) {
             node_t *node = NULL;
-            struct html_parser *parser=d->parser;
+            const void *parser=doc_parser_current(d);
             uint64_t generation=s->stream_generation;
             begin_task(s);
-            int result = html_resume(parser, &node);
-            if (d->parser==parser && s->stream_generation==generation && result >= 0) sync_parser_body_handlers(s);
+            int result = doc_parser_resume(d, &node);
+            if (doc_parser_current(d)==parser && s->stream_generation==generation && result >= 0) sync_parser_body_handlers(s);
             end_task(s);
             /* Parser reactions and the stack-empty microtask checkpoint can
                replace this Document's stream without replacing its identity. */
-            if(d->parser!=parser || s->stream_generation!=generation)break;
+            if(doc_parser_current(d)!=parser || s->stream_generation!=generation)break;
             /* Script/EOF boundaries can import a byte-identical forest. Only
                real parser changes publish resources; errors stay conservative. */
-            if (result < 0 || html_import_changed(parser)) d->dirty = d->resources_dirty = true;
+            if (result < 0 || doc_parser_changed(d)) d->dirty = d->resources_dirty = true;
             if(result==HTML_PARSE_INPUT_WAIT){s->document_waiting=true;break;}
             if(result==HTML_PARSE_YIELD)break;
             if (result==HTML_PARSE_DONE || result==HTML_PARSE_FAILED || result==HTML_PARSE_CANCELLED) {
-                if (result==HTML_PARSE_FAILED) log_text(s, 2, "HTML parsing stopped at the document's memory limit");
-                html_finish(d->parser); d->parser = NULL;
+                if (result==HTML_PARSE_FAILED)
+                    log_text(s, 2, d->xml ? "XML parsing stopped at the document's memory limit" :
+                                            "HTML parsing stopped at the document's memory limit");
+                doc_parser_stop(d);
                 s->parsing_cancelled=result==HTML_PARSE_CANCELLED;
                 if(!s->parsing_cancelled)timing_record(s, JS_DOM_INTERACTIVE, uptime_ms());
                 s->parsing_done = true; break;
             }
             if (result==HTML_PARSE_SCRIPT && node && node->tag == T_script) {
                 struct js_script *script = queue_script(s, node, false);
-                if(d->parser!=parser || s->stream_generation!=generation)break;
+                if(doc_parser_current(d)!=parser || s->stream_generation!=generation)break;
                 if (script && !script->deferred && !script->asynchronous) s->blocker = script;
             }
         }

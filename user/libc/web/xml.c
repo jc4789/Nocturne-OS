@@ -8,11 +8,19 @@
    Entities expand as XML specifies, without an amplification cap: every byte
    Expat and the pending text hold is charged to the document, an allocator
    failure fails the parse, and the native checkpoint cancels a long
-   expansion. Element depth lives in heap stacks, never in C recursion. */
+   expansion. Element depth lives in heap stacks, never in C recursion.
+   One parser serves both callers: DOMParser and XHR parse a whole input
+   at once with XML scripting support disabled; a browsing context's
+   document (doc.c) is parsed a slice at a time with it enabled, and Expat
+   stops (resumably) after each script's end tag so the document's parser
+   loop prepares the script, with the HTML parser's html_resume results. */
 #include "xml.h"
 #include "html_encoding.h"
+#include "html_policy.h"
+#include "elements.h"
 #include "expat_config.h" /* the features the library was built with */
 #include <expat.h>
+#include <nocturne.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -20,6 +28,12 @@
 
 #define XML_PARSERERROR_NS "http://www.mozilla.org/newlayout/xml/parsererror.xml"
 #define XML_FEED_BYTES ((size_t)1 << 20)
+/* A document's parse is cooperative like the HTML parser's (html_lexbor.c):
+   Expat reads slices, and a resume returns after these many bytes or this
+   long. Work quanta, not limits on the document. */
+#define XML_SLICE_BYTES ((size_t)16384)
+#define XML_RESUME_BYTES ((size_t)131072)
+#define XML_RESUME_MS 16u
 
 /* ---------------------------------------------------------------- accounting */
 /* Expat's allocator has no context argument. A parse runs on its document's
@@ -82,10 +96,12 @@ static bool grow(void **array, size_t *capacity, size_t need, size_t size) {
    NULL is no namespace (xmlns=""). Bindings shadow by a hash chain whose head
    is the innermost binding of that bucket, so lookups do not scan the scope. */
 struct xml_binding { const char *prefix, *uri; size_t prefix_length; uint32_t hash; int next; };
-/* An open element: children go to container (a template's contents for an
-   HTML template); elements counts its element children for elem_index. */
-struct xml_open { node_t *container; int elements; size_t bindings; };
-struct xml_state {
+/* An open element (HTML: "as if the element was in a stack of open
+   elements"): element is the node its start tag made; children go to
+   container, a template's contents for an HTML template. The bottom entry
+   is the document, with no element. */
+struct xml_open { node_t *element, *container; size_t bindings; };
+struct xml_parser {
     web_doc *d, *checkpoint;
     XML_Parser expat, current;
     struct xml_memory memory;
@@ -97,10 +113,21 @@ struct xml_state {
     size_t *order; size_t order_capacity;
     bool cdata, in_doctype;
     enum xml_parse_result result;
-    struct xml_parse_error *error;
+    struct xml_parse_error *error, own_error;
+    /* What Expat reads, in its protocol encoding: the caller's bytes, or the
+       parser's own copy or decoding of them (owned). */
+    const char *feed; char *owned; size_t feed_length, fed;
+    /* HTML "XML scripting support enabled": d is a browsing context's
+       document, the parse runs a slice at a time, and a script's end tag
+       stops Expat (resumable) with script naming the element. */
+    bool scripting, suspended, finished;
+    bool unpublished; /* nodes appended since the document was last told */
+    bool changed;     /* the latest resume told the document of new nodes */
+    bool details;     /* an HTML details element was appended since then */
+    node_t *script;
 };
 
-static void fail(struct xml_state *x, enum xml_parse_result result, const char *reason) {
+static void fail(struct xml_parser *x, enum xml_parse_result result, const char *reason) {
     if (x->result != XML_PARSED) return;
     x->result = result;
     if (x->error && reason) {
@@ -108,10 +135,12 @@ static void fail(struct xml_state *x, enum xml_parse_result result, const char *
         x->error->column = XML_GetCurrentColumnNumber(x->current) + 1;
         snprintf(x->error->reason, sizeof x->error->reason, "%s", reason);
     }
-    XML_StopParser(x->current, XML_FALSE);
+    /* Outside Expat (an encoding refused before it starts) there is nothing
+       to stop. */
+    if (x->current) XML_StopParser(x->current, XML_FALSE);
 }
-static bool live(struct xml_state *x) { return x->result == XML_PARSED; }
-static bool checkpoint(struct xml_state *x) {
+static bool live(struct xml_parser *x) { return x->result == XML_PARSED; }
+static bool checkpoint(struct xml_parser *x) {
     if (!live(x)) return false;
     if (!x->checkpoint || web_native_checkpoint(x->checkpoint)) return true;
     fail(x, XML_PARSE_CANCELLED, NULL);
@@ -124,7 +153,7 @@ static uint32_t prefix_hash(const char *p, size_t n) {
     for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)p[i]) * 16777619u;
     return h;
 }
-static bool buckets_fit(struct xml_state *x, size_t count) {
+static bool buckets_fit(struct xml_parser *x, size_t count) {
     if (count <= x->bucket_count) return true;
     size_t next = x->bucket_count ? x->bucket_count : 64;
     while (next < count) { if (next > SIZE_MAX / 2 / sizeof(int)) return false; next *= 2; }
@@ -139,7 +168,7 @@ static bool buckets_fit(struct xml_state *x, size_t count) {
     }
     return true;
 }
-static const struct xml_binding *lookup(const struct xml_state *x, const char *prefix, size_t length) {
+static const struct xml_binding *lookup(const struct xml_parser *x, const char *prefix, size_t length) {
     if (!x->bucket_count) return NULL;
     for (int i = x->buckets[prefix_hash(prefix, length) & (x->bucket_count - 1)]; i >= 0; i = x->bindings[i].next) {
         const struct xml_binding *b = &x->bindings[i];
@@ -147,7 +176,7 @@ static const struct xml_binding *lookup(const struct xml_state *x, const char *p
     }
     return NULL;
 }
-static bool bind(struct xml_state *x, const char *prefix, size_t length, const char *uri) {
+static bool bind(struct xml_parser *x, const char *prefix, size_t length, const char *uri) {
     size_t uri_length = uri ? strlen(uri) : 0;
     if (x->binding_count >= INT_MAX || length > SIZE_MAX - uri_length - 2 ||
         !grow((void **)&x->bindings, &x->binding_capacity, x->binding_count + 1, sizeof *x->bindings) ||
@@ -164,7 +193,7 @@ static bool bind(struct xml_state *x, const char *prefix, size_t length, const c
     return true;
 }
 /* LIFO: the newest binding is the head of its chain. */
-static void unbind_to(struct xml_state *x, size_t count) {
+static void unbind_to(struct xml_parser *x, size_t count) {
     while (x->binding_count > count) {
         struct xml_binding *b = &x->bindings[--x->binding_count];
         x->buckets[b->hash & (x->bucket_count - 1)] = b->next;
@@ -173,7 +202,7 @@ static void unbind_to(struct xml_state *x, size_t count) {
 }
 /* Namespaces in XML 1.0, "Namespace constraints: Reserved Prefixes and
    Namespace Names" and "No Prefix Undeclaring". */
-static bool declare(struct xml_state *x, const char *prefix, size_t length, const char *uri) {
+static bool declare(struct xml_parser *x, const char *prefix, size_t length, const char *uri) {
     bool xml_uri = !strcmp(uri, WEB_NS_XML), xmlns_uri = !strcmp(uri, WEB_NS_XMLNS);
     const char *reason = NULL;
     if (length) {
@@ -198,7 +227,7 @@ static bool qname(const char *name, size_t *prefix_length) {
     return true;
 }
 /* The namespace of a prefixed name; an unprefixed attribute has none. */
-static bool resolve(struct xml_state *x, const char *name, size_t length, const char **ns) {
+static bool resolve(struct xml_parser *x, const char *name, size_t length, const char **ns) {
     if (length == 3 && !memcmp(name, "xml", 3)) { *ns = WEB_NS_XML; return true; }
     const struct xml_binding *b = length == 5 && !memcmp(name, "xmlns", 5) ? NULL : lookup(x, name, length);
     if (!b) { fail(x, XML_PARSE_MALFORMED, "宣言されていない名前空間の接頭辞"); return false; }
@@ -207,16 +236,23 @@ static bool resolve(struct xml_state *x, const char *name, size_t length, const 
 }
 
 /* ---------------------------------------------------------------- the tree */
-static struct xml_open *top(struct xml_state *x) { return &x->open[x->depth - 1]; }
-static void append(struct xml_state *x, node_t *child) {
-    struct xml_open *at = top(x);
-    node_t *parent = at->container;
+static struct xml_open *top(struct xml_parser *x) { return &x->open[x->depth - 1]; }
+/* Appended last. A document's scripts can change an open element's children
+   between resumes, so the index follows the element siblings before it, not
+   a count kept by the parser; the walk back stops at the nearest element. */
+static void append(struct xml_parser *x, node_t *child) {
+    node_t *parent = top(x)->container;
     child->parent = parent; child->prev = parent->last; child->next = NULL;
     if (parent->last) parent->last->next = child; else parent->first = child;
     parent->last = child;
-    if (child->type == N_ELEM) child->elem_index = ++at->elements;
+    if (child->type == N_ELEM) {
+        child->elem_index = 1;
+        for (node_t *c = child->prev; c; c = c->prev)
+            if (c->type == N_ELEM) { child->elem_index = c->elem_index + 1; break; }
+    }
+    x->unpublished = true;
 }
-static bool text_append(struct xml_state *x, const char *s, size_t n) {
+static bool text_append(struct xml_parser *x, const char *s, size_t n) {
     if (n > SIZE_MAX - 1 - x->text_length) return false;
     if (!grow((void **)&x->text, &x->text_capacity, x->text_length + n + 1, 1)) return false;
     memcpy(x->text + x->text_length, s, n);
@@ -224,16 +260,21 @@ static bool text_append(struct xml_state *x, const char *s, size_t n) {
     return true;
 }
 /* DOM "create a text node" (or a CDATA section node) of the pending text. */
-static void text_flush(struct xml_state *x, bool cdata) {
+static void text_flush(struct xml_parser *x, bool cdata) {
     if (!live(x) || (!x->text_length && !cdata)) return;
-    node_t *t = doc_node_create(top(x)->container->owner, N_TEXT, NULL, x->text ? x->text : "", x->text_length);
+    node_t *container = top(x)->container;
+    node_t *t = doc_node_create(container->owner, N_TEXT, NULL, x->text ? x->text : "", x->text_length);
     x->text_length = 0;
     if (!t) { fail(x, XML_PARSE_OOM, NULL); return; }
     t->cdata = cdata;
     append(x, t);
+    /* HTML textarea: its default value is its child text, which can follow
+       a publication of the element itself. */
+    if (container->type == N_ELEM && container->namespace_id == NS_HTML && container->tag == T_textarea &&
+        !container->value_dirty) container->control_ready = false;
 }
 /* NUL-terminated copy of a name's prefix in the parse's scratch buffer. */
-static const char *scratch_prefix(struct xml_state *x, const char *name, size_t length) {
+static const char *scratch_prefix(struct xml_parser *x, const char *name, size_t length) {
     if (!length) return NULL;
     if (length == SIZE_MAX || !grow((void **)&x->scratch, &x->scratch_capacity, length + 1, 1)) return NULL;
     memcpy(x->scratch, name, length); x->scratch[length] = 0;
@@ -247,7 +288,7 @@ static int expanded_order(const void *a, const void *b, void *context) {
 }
 /* Namespaces in XML "Attributes Unique": no two attributes with a namespace
    share an expanded name. Expat already rejected equal qualified names. */
-static bool attributes_unique(struct xml_state *x, const struct attr *attrs, int count) {
+static bool attributes_unique(struct xml_parser *x, const struct attr *attrs, int count) {
     size_t n = 0;
     for (int i = 0; i < count; i++) if (attrs[i].namespace_uri && attrs[i].prefix) n++;
     if (n < 2) return true;
@@ -263,10 +304,25 @@ static bool attributes_unique(struct xml_state *x, const struct attr *attrs, int
     return true;
 }
 
+/* HTML elements whose insertion into a browsing context's document acts at
+   once, as when the HTML parser inserts them: a meta's Content Security
+   Policy pragma (a child of head) and referrer metadata apply before any
+   later script runs; details name groups are settled at the publication. */
+static void inserted_html(struct xml_parser *x, node_t *element) {
+    if (element->tag == T_details) { x->details = true; return; }
+    if (element->tag != T_meta) return;
+    element->html_policy_processed = true;
+    node_t *parent = element->parent;
+    const char *equiv = node_attr(element, "http-equiv"), *content = node_attr(element, "content");
+    if (parent && parent->type == N_ELEM && parent->namespace_id == NS_HTML && parent->tag == T_head &&
+        equiv && str_ieq(equiv, "content-security-policy") && content && *content &&
+        !html_policy_meta(x->d, content, strlen(content))) { fail(x, XML_PARSE_OOM, NULL); return; }
+    doc_referrer_meta(x->d, element);
+}
 /* HTML "create an element for the token" with the token's prefix, then its
    attributes in source order (Expat appends the DTD's defaulted ones). */
 static void XMLCALL start_element(void *data, const XML_Char *name, const XML_Char **atts) {
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     if (!checkpoint(x)) return;
     text_flush(x, false);
     if (!live(x)) return;
@@ -325,8 +381,10 @@ static void XMLCALL start_element(void *data, const XML_Char *name, const XML_Ch
     owner->mem.trap = old;
     element->custom_registry_id = owner->custom_registry_id;
     element->custom_registry_realm = owner->custom_registry_realm;
-    /* XML scripting support is disabled: a script is already started. */
-    if (element->tag == T_script) element->script_started = true;
+    /* HTML: a script the parser creates with XML scripting support enabled
+       waits for its end tag to be prepared. With it disabled, and in template
+       contents (an inert document), it is already started. */
+    if (element->tag == T_script) element->script_started = !x->scripting || owner != x->d;
     node_t *children = element;
     if (element->namespace_id == NS_HTML && element->tag == T_template) {
         children = doc_template_content(owner, element);
@@ -334,33 +392,51 @@ static void XMLCALL start_element(void *data, const XML_Char *name, const XML_Ch
     }
     append(x, element);
     if (!grow((void **)&x->open, &x->open_capacity, x->depth + 1, sizeof *x->open)) { fail(x, XML_PARSE_OOM, NULL); return; }
-    x->open[x->depth++] = (struct xml_open){ .container = children, .bindings = mark };
+    x->open[x->depth++] = (struct xml_open){ .element = element, .container = children, .bindings = mark };
+    if (x->scripting && owner == x->d && element->namespace_id == NS_HTML) inserted_html(x, element);
 }
+/* A script's end tag with XML scripting support enabled: HTML's microtask
+   checkpoint, "prepare the script element" and the wait for a
+   parsing-blocking script belong to the document's parser loop (js.c), as
+   for the HTML parser's script results, so Expat stops here, resumably, and
+   the resume that reached this tag returns the script. A script that has
+   left the document meanwhile is never prepared by this parser. */
 static void XMLCALL end_element(void *data, const XML_Char *name) {
     (void)name;
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     text_flush(x, false);
     if (!live(x) || x->depth < 2) return;
-    unbind_to(x, top(x)->bindings);
+    struct xml_open *at = top(x);
+    node_t *element = at->element;
+    unbind_to(x, at->bindings);
     x->depth--;
+    if (!x->scripting || element->tag != T_script || element->script_started ||
+        (element->namespace_id != NS_HTML && element->namespace_id != NS_SVG)) return;
+    if (element->owner != x->d) { element->script_started = true; return; }
+    x->script = element;
+    if (XML_StopParser(x->expat, XML_TRUE) != XML_STATUS_OK) {
+        /* Not stoppable here (Expat refuses only inside a parameter entity,
+           which holds no content): the script cannot be prepared in order. */
+        x->script = NULL; element->script_started = true;
+    }
 }
 static void XMLCALL characters(void *data, const XML_Char *s, int length) {
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     if (!checkpoint(x)) return;
     if (length > 0 && !text_append(x, s, (size_t)length)) fail(x, XML_PARSE_OOM, NULL);
 }
 static void XMLCALL cdata_start(void *data) {
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     text_flush(x, false);
     x->cdata = true;
 }
 static void XMLCALL cdata_end(void *data) {
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     text_flush(x, true);
     x->cdata = false;
 }
 static void XMLCALL comment(void *data, const XML_Char *text) {
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     if (!checkpoint(x) || x->in_doctype) return; /* the internal subset is not the tree */
     text_flush(x, false);
     if (!live(x)) return;
@@ -369,7 +445,7 @@ static void XMLCALL comment(void *data, const XML_Char *text) {
     append(x, c);
 }
 static void XMLCALL instruction(void *data, const XML_Char *target, const XML_Char *text) {
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     if (!checkpoint(x)) return;
     if (strchr(target, ':')) { fail(x, XML_PARSE_MALFORMED, "処理命令の対象の名前にコロンがある"); return; }
     if (x->in_doctype) return;
@@ -382,7 +458,7 @@ static void XMLCALL instruction(void *data, const XML_Char *target, const XML_Ch
 static void XMLCALL doctype_start(void *data, const XML_Char *name, const XML_Char *system_id,
                                   const XML_Char *public_id, int internal_subset) {
     (void)internal_subset;
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     x->in_doctype = true;
     size_t prefix_length;
     if (!live(x)) return;
@@ -392,19 +468,19 @@ static void XMLCALL doctype_start(void *data, const XML_Char *name, const XML_Ch
     if (!doctype) { fail(x, XML_PARSE_OOM, NULL); return; }
     append(x, doctype);
 }
-static void XMLCALL doctype_end(void *data) { ((struct xml_state *)data)->in_doctype = false; }
+static void XMLCALL doctype_end(void *data) { ((struct xml_parser *)data)->in_doctype = false; }
 /* Namespaces in XML: no entity name or notation name contains a colon. */
 static void XMLCALL entity_declaration(void *data, const XML_Char *name, int parameter, const XML_Char *value,
                                        int value_length, const XML_Char *base, const XML_Char *system_id,
                                        const XML_Char *public_id, const XML_Char *notation) {
     (void)parameter; (void)value; (void)value_length; (void)base; (void)system_id; (void)public_id; (void)notation;
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     if (live(x) && strchr(name, ':')) fail(x, XML_PARSE_MALFORMED, "実体の名前にコロンがある");
 }
 static void XMLCALL notation_declaration(void *data, const XML_Char *name, const XML_Char *base,
                                          const XML_Char *system_id, const XML_Char *public_id) {
     (void)base; (void)system_id; (void)public_id;
-    struct xml_state *x = data;
+    struct xml_parser *x = data;
     if (live(x) && strchr(name, ':')) fail(x, XML_PARSE_MALFORMED, "記法の名前にコロンがある");
 }
 /* A reference to an entity in a DTD that was not read: XML 1.0 "Entity
@@ -425,7 +501,7 @@ static const char *const xhtml_public_ids[] = {
 static int XMLCALL external_entity(XML_Parser parser, const XML_Char *context, const XML_Char *base,
                                    const XML_Char *system_id, const XML_Char *public_id) {
     (void)base; (void)system_id;
-    struct xml_state *x = XML_GetUserData(parser);
+    struct xml_parser *x = XML_GetUserData(parser);
     bool listed = false;
     for (size_t i = 0; public_id && i < sizeof xhtml_public_ids / sizeof *xhtml_public_ids; i++)
         if (!strcmp(public_id, xhtml_public_ids[i])) { listed = true; break; }
@@ -479,11 +555,109 @@ static bool xml_encoding(const char *s, size_t n, const char *transport, char *n
 }
 
 /* -------------------------------------------------------------------- parse */
-static void release_state(struct xml_state *x) {
+static struct xml_memory *enter(struct xml_parser *x) {
+    struct xml_memory *outer = xml_memory_current;
+    xml_memory_current = &x->memory;
+    return outer;
+}
+static void close_parser(struct xml_parser *x) {
     if (x->bindings) unbind_to(x, 0);
     xml_free(x->bindings); xml_free(x->buckets); xml_free(x->open);
     xml_free(x->text); xml_free(x->scratch); xml_free(x->order);
     if (x->expat) XML_ParserFree(x->expat);
+    free(x->owned);
+    x->bindings = NULL; x->buckets = NULL; x->open = NULL; x->order = NULL;
+    x->text = x->scratch = x->owned = NULL;
+    x->expat = x->current = NULL;
+}
+/* The input's encoding, then Expat over it with the document at the bottom
+   of the open elements. copy: the input does not outlive this call (a
+   browsing context's response), so the parser reads its own copy. */
+static bool open_parser(struct xml_parser *x, const char *input, size_t length, bool string,
+                        const char *transport_label, bool copy) {
+    web_doc *d = x->d;
+    const char *protocol = "UTF-8";
+    x->feed = input ? input : ""; x->feed_length = length;
+    if (string) snprintf(d->encoding, sizeof d->encoding, "UTF-8");
+    else {
+        char name[32]; size_t bom = 0;
+        if (!xml_encoding(x->feed, length, transport_label, name, sizeof name, &bom)) {
+            x->result = XML_PARSE_MALFORMED; x->error->line = x->error->column = 1;
+            snprintf(x->error->reason, sizeof x->error->reason, "対応しない文字の符号化");
+            return false;
+        }
+        if (!strcmp(name, "UTF-8") || !strcmp(name, "UTF-16LE") || !strcmp(name, "UTF-16BE")) {
+            /* Expat decodes these itself, and a malformed sequence is fatal. */
+            protocol = !strcmp(name, "UTF-8") ? "UTF-8" : !strcmp(name, "UTF-16LE") ? "UTF-16LE" : "UTF-16BE";
+            x->feed += bom; x->feed_length -= bom;
+            snprintf(d->encoding, sizeof d->encoding, "%s", name);
+        } else {
+            x->owned = html_decode_bytes(d, x->feed, length, name, &x->feed_length);
+            if (!x->owned) { x->result = XML_PARSE_OOM; return false; }
+            x->feed = x->owned;
+        }
+        d->encoding_certain = true;
+    }
+    if (copy && !x->owned) {
+        if (x->feed_length == SIZE_MAX || !(x->owned = malloc(x->feed_length + 1))) { x->result = XML_PARSE_OOM; return false; }
+        memcpy(x->owned, x->feed, x->feed_length); x->owned[x->feed_length] = 0;
+        x->feed = x->owned;
+    }
+    x->expat = x->current = XML_ParserCreate_MM(protocol, &xml_suite, NULL);
+    if (!x->expat || !grow((void **)&x->open, &x->open_capacity, 1, sizeof *x->open)) { x->result = XML_PARSE_OOM; return false; }
+    x->open[x->depth++] = (struct xml_open){ .container = d->root };
+    XML_SetUserData(x->expat, x);
+    XML_SetElementHandler(x->expat, start_element, end_element);
+    XML_SetCharacterDataHandler(x->expat, characters);
+    XML_SetCdataSectionHandler(x->expat, cdata_start, cdata_end);
+    XML_SetCommentHandler(x->expat, comment);
+    XML_SetProcessingInstructionHandler(x->expat, instruction);
+    XML_SetDoctypeDeclHandler(x->expat, doctype_start, doctype_end);
+    XML_SetEntityDeclHandler(x->expat, entity_declaration);
+    XML_SetNotationDeclHandler(x->expat, notation_declaration);
+    XML_SetSkippedEntityHandler(x->expat, skipped_entity);
+    XML_SetExternalEntityRefHandler(x->expat, external_entity);
+    XML_SetParamEntityParsing(x->expat, XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE);
+    /* No amplification cap: the accounting above and the checkpoint answer it. */
+    XML_SetBillionLaughsAttackProtectionActivationThreshold(x->expat, ULLONG_MAX);
+    XML_SetAllocTrackerActivationThreshold(x->expat, ULLONG_MAX);
+    return true;
+}
+static void expat_failed(struct xml_parser *x) {
+    if (!live(x)) return; /* fail() stopped Expat and said why */
+    enum XML_Error code = XML_GetErrorCode(x->expat);
+    x->result = code == XML_ERROR_NO_MEMORY ? XML_PARSE_OOM : XML_PARSE_MALFORMED;
+    x->error->line = XML_GetCurrentLineNumber(x->expat);
+    x->error->column = XML_GetCurrentColumnNumber(x->expat) + 1;
+    snprintf(x->error->reason, sizeof x->error->reason, "%s", XML_ErrorString(code));
+}
+/* Run Expat in parts of slice bytes until it stops at a script's end tag,
+   reaches the end, fails, or has read bytes more input or passed deadline
+   (uptime_ms; 0: none). A stopped Expat resumes in the part it stopped in. */
+static void run(struct xml_parser *x, size_t slice, size_t bytes, uint64_t deadline) {
+    size_t start = x->fed;
+    if (x->suspended) {
+        x->suspended = false;
+        enum XML_Status status = XML_ResumeParser(x->expat);
+        if (status == XML_STATUS_SUSPENDED) { x->suspended = true; return; }
+        if (status != XML_STATUS_OK) { expat_failed(x); return; }
+        XML_ParsingStatus parsing;
+        XML_GetParsingStatus(x->expat, &parsing);
+        if (parsing.parsing == XML_FINISHED) { x->finished = true; return; }
+        if (!checkpoint(x)) return;
+    }
+    while (live(x)) {
+        size_t part = x->feed_length - x->fed < slice ? x->feed_length - x->fed : slice;
+        bool final = x->fed + part == x->feed_length;
+        const char *at = x->feed + x->fed;
+        x->fed += part;
+        enum XML_Status status = XML_Parse(x->expat, at, (int)part, final);
+        if (status == XML_STATUS_SUSPENDED) { x->suspended = true; return; }
+        if (status != XML_STATUS_OK) { expat_failed(x); return; }
+        if (final) { x->finished = true; return; }
+        if (!checkpoint(x)) return;
+        if (x->fed - start >= bytes || (deadline && uptime_ms() >= deadline)) return;
+    }
 }
 enum xml_parse_result xml_parse_document(web_doc *d, web_doc *checkpoint_doc, const char *input, size_t length,
                                          bool string, const char *transport_label, struct xml_parse_error *error) {
@@ -491,69 +665,11 @@ enum xml_parse_result xml_parse_document(web_doc *d, web_doc *checkpoint_doc, co
     if (!error) error = &unused;
     memset(error, 0, sizeof *error);
     if (!d || !d->root || d->root->first || (length && !input)) return XML_PARSE_OOM;
-    struct xml_state x = { .d = d, .checkpoint = checkpoint_doc, .memory = { .d = d }, .error = error, .result = XML_PARSED };
-    struct xml_memory *outer = xml_memory_current;
-    xml_memory_current = &x.memory;
-    const char *protocol = "UTF-8", *feed = input ? input : "";
-    size_t feed_length = length;
-    char *decoded = NULL;
-    if (string) snprintf(d->encoding, sizeof d->encoding, "UTF-8");
-    else {
-        char name[32]; size_t bom = 0;
-        if (!xml_encoding(feed, length, transport_label, name, sizeof name, &bom)) {
-            x.result = XML_PARSE_MALFORMED; error->line = error->column = 1;
-            snprintf(error->reason, sizeof error->reason, "対応しない文字の符号化");
-            goto done;
-        }
-        if (!strcmp(name, "UTF-8") || !strcmp(name, "UTF-16LE") || !strcmp(name, "UTF-16BE")) {
-            /* Expat decodes these itself, and a malformed sequence is fatal. */
-            protocol = !strcmp(name, "UTF-8") ? "UTF-8" : !strcmp(name, "UTF-16LE") ? "UTF-16LE" : "UTF-16BE";
-            feed += bom; feed_length -= bom;
-            snprintf(d->encoding, sizeof d->encoding, "%s", name);
-        } else {
-            decoded = html_decode_bytes(d, feed, length, name, &feed_length);
-            if (!decoded) { x.result = XML_PARSE_OOM; goto done; }
-            feed = decoded;
-        }
-        d->encoding_certain = true;
-    }
-    x.expat = x.current = XML_ParserCreate_MM(protocol, &xml_suite, NULL);
-    if (!x.expat || !grow((void **)&x.open, &x.open_capacity, 1, sizeof *x.open)) { x.result = XML_PARSE_OOM; goto done; }
-    x.open[x.depth++] = (struct xml_open){ .container = d->root };
-    XML_SetUserData(x.expat, &x);
-    XML_SetElementHandler(x.expat, start_element, end_element);
-    XML_SetCharacterDataHandler(x.expat, characters);
-    XML_SetCdataSectionHandler(x.expat, cdata_start, cdata_end);
-    XML_SetCommentHandler(x.expat, comment);
-    XML_SetProcessingInstructionHandler(x.expat, instruction);
-    XML_SetDoctypeDeclHandler(x.expat, doctype_start, doctype_end);
-    XML_SetEntityDeclHandler(x.expat, entity_declaration);
-    XML_SetNotationDeclHandler(x.expat, notation_declaration);
-    XML_SetSkippedEntityHandler(x.expat, skipped_entity);
-    XML_SetExternalEntityRefHandler(x.expat, external_entity);
-    XML_SetParamEntityParsing(x.expat, XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE);
-    /* No amplification cap: the accounting above and the checkpoint answer it. */
-    XML_SetBillionLaughsAttackProtectionActivationThreshold(x.expat, ULLONG_MAX);
-    XML_SetAllocTrackerActivationThreshold(x.expat, ULLONG_MAX);
-    for (size_t at = 0;;) {
-        size_t part = feed_length - at < XML_FEED_BYTES ? feed_length - at : XML_FEED_BYTES;
-        bool final = at + part == feed_length;
-        if (XML_Parse(x.expat, feed + at, (int)part, final) != XML_STATUS_OK) {
-            if (live(&x)) {
-                enum XML_Error code = XML_GetErrorCode(x.expat);
-                x.result = code == XML_ERROR_NO_MEMORY ? XML_PARSE_OOM : XML_PARSE_MALFORMED;
-                error->line = XML_GetCurrentLineNumber(x.expat);
-                error->column = XML_GetCurrentColumnNumber(x.expat) + 1;
-                snprintf(error->reason, sizeof error->reason, "%s", XML_ErrorString(code));
-            }
-            break;
-        }
-        at += part;
-        if (final || !checkpoint(&x)) break;
-    }
-done:
-    release_state(&x);
-    free(decoded);
+    struct xml_parser x = { .d = d, .checkpoint = checkpoint_doc, .memory = { .d = d }, .error = error, .result = XML_PARSED };
+    struct xml_memory *outer = enter(&x);
+    /* Scripting disabled: nothing stops Expat before the end. */
+    if (open_parser(&x, input, length, string, transport_label, false)) run(&x, XML_FEED_BYTES, SIZE_MAX, 0);
+    close_parser(&x);
     xml_memory_current = outer;
     if (x.result != XML_PARSED) {
         /* DOMParser asserts the document has no children before parsererror. */
@@ -564,6 +680,106 @@ done:
     if (d->template_doc) doc_mutated(d->template_doc, NULL);
     doc_sync_tree(d);
     return XML_PARSED;
+}
+
+/* ------------------------------------------------------- a browsing context */
+/* The nodes appended since the previous resume reach the document's
+   bookkeeping (mutation, the html/head/body/title snapshot, details groups)
+   at one coherent boundary, before any script the resume returns runs. */
+static void publish(struct xml_parser *x) {
+    if (!x->unpublished) return;
+    x->unpublished = false; x->changed = true;
+    if (x->details) { x->details = false; doc_details_parser_finish(x->d->root); }
+    doc_mutated(x->d, NULL);
+    if (x->d->template_doc) doc_mutated(x->d->template_doc, NULL);
+    doc_sync_tree(x->d);
+}
+/* A well-formedness error. HTML ("Loading XML documents") lets the error be
+   reported inline by mutating the Document, and no WPT test fixes how.
+   Gecko replaces the document's children with its parsererror element;
+   Blink and WebKit keep the tree built so far under an error banner of
+   their own. This parser does as Gecko: the error is the parsererror
+   element DOMParser also gives (xml_error_document), so the document
+   describes itself the same way to its scripts, to DOMParser's callers and
+   to its reader, and markup the author did not finish is never shown as
+   if it were the document. Scripts that already ran keep the nodes they
+   hold, now outside the document. */
+static bool report_error(struct xml_parser *x) {
+    web_doc *d = x->d;
+    char message[256];
+    snprintf(message, sizeof message, "XML の解析の誤り（%lu 行 %lu 列）：%s",
+             x->error->line, x->error->column, x->error->reason);
+    web_js_console(d, 2, message);
+    publish(x);
+    while (d->root->first) doc_node_remove(d, d->root->first);
+    x->changed = true;
+    return xml_error_document(d, x->error);
+}
+struct xml_parser *xml_parser_begin(web_doc *d, const char *input, size_t length, const char *transport_label) {
+    if (!d || d->root || (length && !input)) return NULL;
+    d->xml = true;
+    if (!(d->root = doc_node_create(d, N_DOC, NULL, "", 0))) return NULL;
+    struct xml_parser *x = malloc(sizeof *x);
+    if (!x) return NULL;
+    *x = (struct xml_parser){ .d = d, .checkpoint = d, .memory = { .d = d }, .result = XML_PARSED, .scripting = true };
+    x->error = &x->own_error;
+    struct xml_memory *outer = enter(x);
+    bool opened = open_parser(x, input, length, false, transport_label, true);
+    xml_memory_current = outer;
+    /* An encoding Expat cannot read is the document's error, which the
+       first resume reports like any other. */
+    if (!opened && x->result != XML_PARSE_MALFORMED) { xml_parser_finish(x); return NULL; }
+    return x;
+}
+int xml_parser_resume(struct xml_parser *x, node_t **script) {
+    if (script) *script = NULL;
+    if (!x) return HTML_PARSE_FAILED;
+    x->changed = false;
+    if (x->finished) return x->result == XML_PARSE_CANCELLED ? HTML_PARSE_CANCELLED :
+                            x->result == XML_PARSE_OOM ? HTML_PARSE_FAILED : HTML_PARSE_DONE;
+    if (live(x)) {
+        struct xml_memory *outer = enter(x);
+        if (checkpoint(x)) run(x, XML_SLICE_BYTES, XML_RESUME_BYTES, uptime_ms() + XML_RESUME_MS);
+        xml_memory_current = outer;
+    }
+    switch (x->result) {
+    case XML_PARSE_CANCELLED:
+        /* No script, and no more of the tree: what is in it stays, known to
+           the document's mutation bookkeeping only. */
+        x->finished = true;
+        if (x->unpublished) { x->unpublished = false; x->changed = true; doc_mutated(x->d, NULL); }
+        return HTML_PARSE_CANCELLED;
+    case XML_PARSE_OOM:
+        /* As the HTML parser at the memory limit: the tree so far stays. */
+        x->finished = true;
+        publish(x);
+        return HTML_PARSE_FAILED;
+    case XML_PARSE_MALFORMED:
+        x->finished = true;
+        if (!report_error(x)) { x->result = XML_PARSE_OOM; return HTML_PARSE_FAILED; }
+        return HTML_PARSE_DONE;
+    case XML_PARSED:
+        break;
+    }
+    publish(x);
+    if (x->script) {
+        node_t *element = x->script;
+        x->script = NULL;
+        /* The parser's text is the script's trusted script text. */
+        if (!web_js_script_parser_capture(x->d, element)) {
+            x->result = XML_PARSE_OOM; x->finished = true;
+            return HTML_PARSE_FAILED;
+        }
+        if (script) *script = element;
+        return HTML_PARSE_SCRIPT;
+    }
+    return x->finished ? HTML_PARSE_DONE : HTML_PARSE_YIELD;
+}
+bool xml_parser_changed(const struct xml_parser *x) { return x && x->changed; }
+void xml_parser_finish(struct xml_parser *x) {
+    if (!x) return;
+    close_parser(x);
+    free(x);
 }
 
 /* DOMParser "parseFromString": a parsererror element in the Mozilla

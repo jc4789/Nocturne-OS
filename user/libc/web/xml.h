@@ -3,10 +3,12 @@
 
 #include "webi.h"
 
-/* HTML "XML parser" (with XML scripting support disabled) into a native
-   document. Expat owns the XML 1.0 grammar, well-formedness, the internal
-   DTD subset and entity expansion; xml.c owns Namespaces in XML, the DOM it
-   builds, the parsererror element, memory accounting and cancellation. */
+/* HTML "XML parser" into a native document. Expat owns the XML 1.0 grammar,
+   well-formedness, the internal DTD subset and entity expansion; xml.c owns
+   Namespaces in XML, the DOM it builds, the parsererror element, memory
+   accounting and cancellation. DOMParser and XHR parse with XML scripting
+   support disabled (xml_parse_document); a browsing context's document
+   with it enabled (xml_parser_begin), driven by doc.c's parser loop. */
 enum xml_parse_result { XML_PARSED, XML_PARSE_MALFORMED, XML_PARSE_OOM, XML_PARSE_CANCELLED };
 struct xml_parse_error {
     unsigned long line, column; /* 1-based */
@@ -32,5 +34,23 @@ web_doc *xml_document_new(web_doc *family, const char *url, const char *content_
 web_doc *xml_document_parse(web_doc *family, web_doc *checkpoint, const char *input, size_t length, bool string,
                             const char *transport_label, const char *url, const char *content_type,
                             bool error_document, enum xml_parse_result *result);
+
+/* HTML "load an XML document": the XML parser, with XML scripting support
+   enabled, of d, a new browsing context's document that has no tree yet.
+   It makes d an XML document and its tree, and reads its own copy of the
+   response bytes, decoded by BOM, transport_label (NULL or empty: none),
+   the XML declaration, then UTF-8. NULL: out of memory. */
+struct xml_parser *xml_parser_begin(web_doc *d, const char *input, size_t length, const char *transport_label);
+/* Parse on, as html_resume: HTML_PARSE_SCRIPT after a script element's end
+   tag (*script: the element, to prepare after a microtask checkpoint),
+   HTML_PARSE_YIELD after a slice of work, HTML_PARSE_DONE at the end of
+   the input or at a well-formedness error (the document's tree is then its
+   parsererror element), HTML_PARSE_FAILED at the document's memory limit
+   and HTML_PARSE_CANCELLED at a native checkpoint; the last two keep the
+   tree so far. */
+int xml_parser_resume(struct xml_parser *x, node_t **script);
+/* The latest resume changed the document's tree. */
+bool xml_parser_changed(const struct xml_parser *x);
+void xml_parser_finish(struct xml_parser *x);
 
 #endif

@@ -41,10 +41,15 @@ void web_frames_detach_tree(web_doc *document,node_t *root);
 bool web_frame_set_navigation(struct web_frame *frame,const char *url,web_doc *origin);
 bool web_frame_initial_blocked(const struct web_frame *frame,const char *source,const char *srcdoc);
 bool web_frame_initial_create(struct web_frame *frame,const struct web_host *host);
+/* A frame's document from markup the browser writes (about:blank, srcdoc,
+   a text document): an HTML document. */
 bool web_frame_commit(struct web_frame *frame, const char *html, size_t length,
                       const char *url, const char *charset, const struct web_host *host, bool inherited);
+/* A frame's document from a response: its body, header block (NULL: none)
+   and Content-Type (NULL: text/html), which picks the document's parser. */
 bool web_frame_commit_response(struct web_frame *frame,const char *html,size_t length,
-                      const char *url,const char *charset,const char *headers,const struct web_host *host,bool inherited);
+                      const char *url,const char *charset,const char *headers,const char *type,
+                      const struct web_host *host,bool inherited);
 void web_frames_free(web_doc *document);
 void web_frames_tick(web_doc *document, uint64_t now);
 int64_t web_frames_deadline(web_doc *document);
