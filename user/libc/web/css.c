@@ -1285,19 +1285,52 @@ static void select_walk(node_t *scope, const struct sellist *sel, pvec *out) {
     }
 }
 
+/* DOM "parse a selector" from a string (querySelector, matches, closest): CSS Syntax drops
+   comments while tokenizing, so they go before the selector grammar sees the text. A comment
+   between two code points of one name (".a", a comment, "b") separates two tokens that the text
+   would join into one, and a selector never has two such tokens side by side, so that is a
+   failure. Strings and escapes keep their contents. */
+static struct sellist *parse_selector_string(struct pctx *p, const char *selector) {
+    size_t n = strlen(selector), k = 0;
+    char *text = ar_alloc(p->a, n + 1);
+    for (size_t i = 0; i < n;) {
+        char c = selector[i];
+        if (c == '/' && i + 1 < n && selector[i + 1] == '*') {
+            i += 2;
+            while (i < n && !(selector[i] == '*' && i + 1 < n && selector[i + 1] == '/')) i++;
+            i = i < n ? i + 2 : n;
+            if (k && i < n && (ident_char((unsigned char)text[k - 1]) || text[k - 1] == '\\') &&
+                (ident_char((unsigned char)selector[i]) || selector[i] == '\\')) return NULL;
+            continue;
+        }
+        if (c == '\\' && i + 1 < n) { text[k++] = selector[i++]; text[k++] = selector[i++]; continue; }
+        if (c == '"' || c == '\'') {
+            text[k++] = selector[i++];
+            while (i < n && selector[i] != c) {
+                if (selector[i] == '\\' && i + 1 < n) text[k++] = selector[i++];
+                text[k++] = selector[i++];
+            }
+            if (i < n) text[k++] = selector[i++];
+            continue;
+        }
+        text[k++] = selector[i++];
+    }
+    while (k && is_space((unsigned char)text[k - 1])) k--;
+    text[k] = 0;
+    if (!k || text[k - 1] == ',') return NULL;
+    return parse_sellist(p, text, text + k, false);
+}
+
 bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out) {
     (void)d;
     if (!selector || !scope) return false;
-    size_t len = strlen(selector);
-    while (len && is_space((unsigned char)selector[len - 1])) len--;
-    if (!len || selector[len - 1] == ',') return false;
     arena_t *arena = calloc(1, sizeof *arena);
     if (!arena) return false;
     jmp_buf trap;
     arena->trap = &trap;
     if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
     struct pctx p = {.a = arena};
-    struct sellist *sel = parse_sellist(&p, selector, selector + len, false);
+    struct sellist *sel = parse_selector_string(&p, selector);
     if (sel) select_walk(scope, sel, out);
     bool valid = sel != NULL;
     ar_free(arena);
@@ -1308,16 +1341,13 @@ bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out) {
 bool css_matches(node_t *node, const char *selector, bool *valid) {
     if (valid) *valid = false;
     if (!node || node->type != N_ELEM || !selector) return false;
-    size_t len = strlen(selector);
-    while (len && is_space((unsigned char)selector[len - 1])) len--;
-    if (!len || selector[len - 1] == ',') return false;
     arena_t *arena = calloc(1, sizeof *arena);
     if (!arena) return false;
     jmp_buf trap;
     arena->trap = &trap;
     if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
     struct pctx p = {.a = arena};
-    struct sellist *sel = parse_sellist(&p, selector, selector + len, false);
+    struct sellist *sel = parse_selector_string(&p, selector);
     if (valid) *valid = sel != NULL;
     const struct selector_match context = {.reference = node};
     bool matched = sel && match_list_bound(sel, node, &context);
