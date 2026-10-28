@@ -50,6 +50,7 @@
     let viewportHandlerTarget = () => false;
     let fontHandlerTarget = () => false;
     let animationHandlerTarget = () => false;
+    let eventSourceHandlerTarget = () => false;
     const globalHandlerTypes = new Set(('abort animationcancel animationend animationiteration animationstart beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle transitioncancel transitionend transitionrun transitionstart wheel').split(' '));
     const windowHandlerTypes = new Set(('afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pageswap pagehide pagereveal pageshow popstate rejectionhandled storage unhandledrejection unload').split(' '));
     const bodyWindowTypes=new Set([...windowHandlerTypes,'blur','error','focus','load','resize','scroll']);
@@ -354,7 +355,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type) || viewportHandlerTarget(target,type) || fontHandlerTarget(target,type) || animationHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || (documentHandlerTypes.has(type) && target instanceof Document) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type) || audioHandlerTarget(target,type) || viewportHandlerTarget(target,type) || fontHandlerTarget(target,type) || animationHandlerTarget(target,type) || eventSourceHandlerTarget(target,type);
     }
     function bodyWindowHandler(target,type){
         if(!bodyWindowTypes.has(type) || target===globalThis)return false;
@@ -1527,6 +1528,16 @@
         embedderPolicy:host.cacheEmbedderPolicy,streams:streamBridge});
     /* @include js_messaging.js */
     /* @include js_websocket.js */
+    /* @include js_event_source.js */
+    /* This Window's EventSource: its Fetch, the constructor's URL against the document's base URL
+       in the document's encoding, its MessageEvent, trusted events through this realm's dispatch
+       and its timers. */
+    const eventSourceBridge=eventSourceInterfaces({fetch:fetchBridge,
+        parseURL:url=>urlBridge.encodingParse(url,rawDom.get(document,'baseURI'),rawDom.get(document,'characterSet')),
+        MessageEvent:globalThis.MessageEvent,fire(target,event){eventState(event).isTrusted=true;dispatch(target,event);},
+        handlers:installHandlers,report,now:()=>host.now(),timer:(fn,ms)=>host.timer(0,fn,ms,[]),clear:id=>host.clear(id)});
+    eventSourceHandlerTarget=eventSourceBridge.handlerTarget;
+    Object.defineProperty(globalThis,'EventSource',{value:eventSourceBridge.EventSource,writable:true,configurable:true});
     /* @include js_css_supports.js */
     /* @include js_performance.js */
     /* @include js_idle.js */

@@ -7,7 +7,8 @@
      realm.fetch         the realm's Fetch (fetchInterfaces's bridge). Every request is its xhrFetch
                          or, synchronous, its xhrFetchSync: CORS, credentials, Mixed Content and CSP
                          are its native transport's. xhrBody, xhrResponse and xhrMetadata read
-                         bodies and responses without page-mutable getters.
+                         bodies and responses without page-mutable getters; mimeType and parseMIME
+                         are Fetch's "extract a MIME type" and MIME Sniffing's "parse a MIME type".
      realm.parseURL(url) encoding-parse url relative to the relevant settings object: a Window's
                          document base URL and the document's encoding, a Worker's API base URL and
                          UTF-8. A URL, or null for failure.
@@ -101,74 +102,6 @@ function xhrInterfaces(realm) {
         }
         return out;
     }
-    const httpSpace=c=>c==='\t'||c==='\n'||c==='\r'||c===' ';
-    const asciiLower=v=>v.replace(/[A-Z]/g,c=>String.fromCharCode(c.charCodeAt(0)+32));
-    // Fetch "collect an HTTP quoted string" from input[at] === '"'.
-    function quotedString(input,at,extract) {
-        const start=at;let value='';at++;
-        for(;;) {
-            while(at<input.length && input[at]!=='"' && input[at]!=='\\')value+=input[at++];
-            if(at>=input.length)break;
-            const quote=input[at++];
-            if(quote==='\\'){if(at>=input.length){value+='\\';break;}value+=input[at++];}
-            else break;
-        }
-        return [extract?value:input.slice(start,at),at];
-    }
-    // MIME Sniffing "parse a MIME type": {essence, parameters} or null for failure.
-    function parseMime(input) {
-        let start=0,end=input.length;
-        while(start<end && httpSpace(input[start]))start++;
-        while(end>start && httpSpace(input[end-1]))end--;
-        input=input.slice(start,end);
-        const slash=input.indexOf('/');if(slash<0)return null;
-        const type=input.slice(0,slash);if(!token.test(type))return null;
-        let at=input.indexOf(';',slash+1);if(at<0)at=input.length;
-        let subtype=input.slice(slash+1,at);
-        while(subtype && httpSpace(subtype[subtype.length-1]))subtype=subtype.slice(0,-1);
-        if(!token.test(subtype))return null;
-        const parameters=new Map();
-        while(at<input.length) {
-            at++;
-            while(at<input.length && httpSpace(input[at]))at++;
-            let nameEnd=at;while(nameEnd<input.length && input[nameEnd]!==';' && input[nameEnd]!=='=')nameEnd++;
-            const name=asciiLower(input.slice(at,nameEnd));at=nameEnd;
-            if(at<input.length){if(input[at]===';')continue;at++;}
-            if(at>=input.length)break;
-            let value;
-            if(input[at]==='"'){[value,at]=quotedString(input,at,true);while(at<input.length && input[at]!==';')at++;}
-            else {
-                let valueEnd=input.indexOf(';',at);if(valueEnd<0)valueEnd=input.length;
-                value=input.slice(at,valueEnd);at=valueEnd;
-                while(value && httpSpace(value[value.length-1]))value=value.slice(0,-1);
-                if(!value)continue;
-            }
-            if(name && token.test(name) && /^[\t\x20-\x7e\x80-\xff]*$/.test(value) && !parameters.has(name))parameters.set(name,value);
-        }
-        return {essence:asciiLower(type)+'/'+asciiLower(subtype),parameters};
-    }
-    // Fetch "extract a MIME type" over "get, decode, and split" Content-Type.
-    function extractMime(headers) {
-        const raw=headers?nativeApply(headerGet,headers,['content-type']):null;
-        if(raw===null)return null;
-        const values=[];let at=0,temporary='';
-        for(;;) {
-            while(at<raw.length && raw[at]!=='"' && raw[at]!==',')temporary+=raw[at++];
-            if(at<raw.length && raw[at]==='"'){const [text,next]=quotedString(raw,at,false);temporary+=text;at=next;if(at<raw.length)continue;}
-            values.push(temporary.replace(/^[\t ]+|[\t ]+$/g,''));temporary='';
-            if(at>=raw.length)break;
-            at++;
-        }
-        let charset=null,essence=null,mimeType=null;
-        for(const value of values) {
-            const parsed=parseMime(value);
-            if(!parsed || parsed.essence==='*/*')continue;
-            mimeType=parsed;
-            if(mimeType.essence!==essence){charset=mimeType.parameters.get('charset')??null;essence=mimeType.essence;}
-            else if(!mimeType.parameters.has('charset') && charset!==null)mimeType.parameters.set('charset',charset);
-        }
-        return mimeType;
-    }
     /* Fetch "extract a length" of a header list's Content-Length: its one decimal value, or 0 when
        it has none, differing values or one that is not digits (send()'s "not an integer"). */
     function extractLength(headers) {
@@ -185,7 +118,8 @@ function xhrInterfaces(realm) {
         return candidate!==null&&/^\d+$/.test(candidate)?NativeNumber(candidate):0;
     }
     // XHR "get a response MIME type" and "get a final MIME type".
-    const responseMime=s=>extractMime(s.responseHeaders)??{essence:'text/xml',parameters:new Map()};
+    // The MIME types are Fetch's and MIME Sniffing's (js_fetch.js's mimeType and parseMIME).
+    const responseMime=s=>fetch.mimeType(s.responseHeaders)??{essence:'text/xml',parameters:new Map()};
     const finalMime=s=>s.override??responseMime(s);
     const xmlMime=m=>m.essence==='text/xml' || m.essence==='application/xml' || m.essence.endsWith('+xml');
     // XHR "get a final encoding": a label; the native parsers resolve it and
@@ -522,7 +456,7 @@ function xhrInterfaces(realm) {
             return s.object;
         }
         overrideMimeType(mime){const s=state(this);if(!arguments.length)throw new TypeError('overrideMimeType requires a MIME type');mime=string(mime);if(s.ready===3 || s.ready===4)fail('InvalidStateError','Response already loading');s.mime=mime;
-            s.override=parseMime(mime)??{essence:'application/octet-stream',parameters:new Map()};}
+            s.override=fetch.parseMIME(mime)??{essence:'application/octet-stream',parameters:new Map()};}
         getResponseHeader(name){const s=state(this);if(!arguments.length)throw new TypeError('getResponseHeader requires name');name=bytestring(name);if(!token.test(name) || /^set-cookie2?$/i.test(name) || !s.responseHeaders)return null;return nativeApply(headerGet,s.responseHeaders,[name]);}
         getAllResponseHeaders(){
             const s=state(this);if(!s.responseHeaders)return '';
