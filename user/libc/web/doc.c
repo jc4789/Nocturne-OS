@@ -1462,6 +1462,7 @@ void web_response_free(struct web_response *r) {
     if (!r) return;
     free(r->body); free(r->headers_full); free(r->url_full);
     r->body = r->headers_full = r->url_full = NULL; r->body_len = 0;
+    http_fetch_timing_free(&r->timing);
 }
 bool web_dirty(web_doc *d) {
     if (!d) return false;

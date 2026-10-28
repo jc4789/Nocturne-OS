@@ -82,6 +82,37 @@ static int coding_kind(const char *p,size_t n){
     if(n==8&&!strncasecmp(p,"identity",8))return -1;
     return -2;
 }
+/* Fetch's filtered coding of a body (HTTP-network fetch, "response body
+   info"): value is every Content-Encoding field's value joined by commas, NULL
+   when there is none. Extracting the header list values parses the #rule list
+   of content-coding tokens: optional white space around each element, empty
+   elements ignored, any element that is not a token a failure (""). No
+   element is the empty coding (""), more than one is "multiple"; one this
+   client undoes, which the HTTP Content Coding Registry lists, is that coding
+   lowercased; any other is "@unknown". */
+static void coding_filtered(const char *value,char out[HTTP_CONTENT_ENCODING_MAX]){
+    out[0]=0;
+    if(!value)return;
+    const char *only=NULL;size_t only_n=0,elements=0;
+    for(const char *p=value;;p++){
+        const char *start=p;
+        while(*p&&*p!=',')p++;
+        const char *end=p;
+        while(start<end&&(*start==' '||*start=='\t'))start++;
+        while(end>start&&(end[-1]==' '||end[-1]=='\t'))end--;
+        if(end>start){
+            for(const char *c=start;c<end;c++)if(!coding_tchar((unsigned char)*c))return;
+            if(!elements++){only=start;only_n=(size_t)(end-start);}
+        }
+        if(!*p)break;
+    }
+    if(!elements)return;
+    if(elements>1){strcpy(out,"multiple");return;}
+    /* identity (-1) is listed and needs nothing undone; -2 is a coding this client lacks. */
+    if(coding_kind(only,only_n)==-2||only_n>=HTTP_CONTENT_ENCODING_MAX){strcpy(out,"@unknown");return;}
+    for(size_t i=0;i<only_n;i++)out[i]=only[i]>='A'&&only[i]<='Z'?(char)(only[i]+32):only[i]; /* byte-lowercase */
+    out[only_n]=0;
+}
 static void coding_free(struct sink *sink){
     for(size_t i=0;i<sink->codings;i++){
         struct http_coding *c=&sink->coding[i];

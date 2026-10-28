@@ -1538,6 +1538,8 @@
         animationUpdate:animationBridge.update,
         animationEvents:animationBridge.events,
         resourceTiming:performanceBridge.resource,
+        navigationTimingQueued:performanceBridge.navigationQueued,
+        paintTiming:performanceBridge.paint,
         workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
         storageEvent:storageBridge.deliver,

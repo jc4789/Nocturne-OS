@@ -27,6 +27,7 @@ net_stream *ns_open_timed(const char *h, uint16_t p, bool t, int to, char *e, si
 net_stream *ns_open_http_timed(const char *h, uint16_t p, bool t, int to, char *e, size_t el,
     struct http_transport_timing *tm, const char *part) { return &the_stream; }
 int ns_get_connection_info(const net_stream *s, struct ns_connection_info *i) { return -1; }
+int ns_get_connection_timing(const net_stream *s, struct http_connection_timing *t) { if (t) memset(t, 0, sizeof *t); return 0; }
 long ns_write(net_stream *s, const void *b, size_t n) { return (long)n; }
 long ns_read(net_stream *s, void *b, size_t n) {
     size_t left = stub_len - stub_at; if (n > stub_chunk) n = stub_chunk; if (n > left) n = left;

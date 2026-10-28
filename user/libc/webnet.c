@@ -62,6 +62,11 @@ struct request {
     bool image_upgrade;
     uint64_t fetch_group;
     size_t keepalive_bytes;
+    /* Fetch's timing record (http.h) the worker returned, completed at the
+       end with the start time below (queued_at); timing_seen once its
+       private line arrived. */
+    struct http_fetch_timing timing;
+    bool timing_seen;
     char error[160];
 };
 /* A started request's connection to the webfetch service: one message
@@ -165,7 +170,7 @@ n_result webnet_wire_write(n_handle h, const void *data, size_t n) {
         if (done == n) return (n_result)n;
     }
 }
-static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->merge);free(r->sent);free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); webnet_wire_in_free(&r->wire_in); free(r); }
+static void request_free(struct request *r) { if(!r)return;http_fetch_timing_free(&r->timing);free(r->tx); free(r->rx); free(r->merge);free(r->sent);free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); webnet_wire_in_free(&r->wire_in); free(r); }
 static unsigned worker_budget(void){
     struct n_cpuinfo cpu={0};struct n_sysinfo memory={0};
     unsigned online=cpu_info(&cpu)>=0&&cpu.online_cpus?cpu.online_cpus:1;
@@ -513,7 +518,7 @@ static unsigned char *wire_request(webnet *n,const struct webnet_request *q,uint
         WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_DYNAMIC_URL;
     if (referrer_extension)h.user_navigation|=WEBNET_WIRE_REFERRER;
     if (top_extension)h.user_navigation|=WEBNET_WIRE_TOP_LEVEL;
-    h.user_navigation|=WEBNET_WIRE_FETCH_METADATA;
+    h.user_navigation|=WEBNET_WIRE_FETCH_METADATA|WEBNET_WIRE_TIMING;
     if (language_extension) h.user_navigation |= WEBNET_WIRE_ACCEPT_LANGUAGE;
     if (q->body) h.user_navigation |= WEBNET_WIRE_BODY_PRESENT;
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
@@ -955,6 +960,27 @@ static bool cookie_events(webnet *n, struct request *r) {
     free(work);
     return ok;
 }
+/* The record as the request ends: Fetch's start time is when the browser
+   asked (webnet_submit); a fetch with no redirect starts its only hop then,
+   one with redirects has its redirect start there; a connection opened
+   before the final hop started is a reused one whose times are that hop's
+   start (Fetch, clamp and coarsen connection timing info). A request the
+   worker never answered keeps only its start and end. */
+static const struct http_fetch_timing *timing_finish(struct request *r, uint64_t now) {
+    struct http_fetch_timing *t = &r->timing;
+    t->valid = true; t->start_time = r->queued_at;
+    if (!t->redirect_count) t->post_redirect_start = t->start_time;
+    else t->redirect_start = t->start_time;
+    struct http_connection_timing *c = &t->connection;
+    if (t->connection_valid && c->connect_start < t->post_redirect_start) {
+        uint64_t at = t->post_redirect_start;
+        c->domain_lookup_start = c->domain_lookup_end = c->connect_start = c->connect_end = at;
+        /* A cleartext connection never had a secure start. */
+        if (c->secure_connection_start) c->secure_connection_start = at;
+    }
+    if (!t->end_time) t->end_time = now;
+    return t;
+}
 static void complete(webnet *n, struct slot *s) {
     struct request *r = s->rq;
     s->rq = NULL; s->live = false; slot_close(s); n->count--;
@@ -977,6 +1003,7 @@ static void complete(webnet *n, struct slot *s) {
         struct webnet_response response = {0};
         response.final_url = ""; response.headers = ""; response.body = ""; response.error = r->error;
         response.event = r->streaming ? WEBNET_END : WEBNET_COMPLETE;
+        response.timing = timing_finish(r, uptime_ms());
         if (!r->error[0] && r->rx) {
             char *p = (char *)r->rx;
             response.status = (int)r->head.status;
@@ -1086,6 +1113,59 @@ static bool consume_transport_diagnostic(struct request *r,char *headers) {
     fputc('\n',stderr);
     return true;
 }
+/* A token of the timing line (an ALPN protocol ID or a filtered coding): the
+   bytes up to the next space or the line's end, fewer than cap. */
+static bool timing_token(const char **cursor, const char *field, char *out, size_t cap) {
+    size_t n = strlen(field);
+    if (strncmp(*cursor, field, n)) return false;
+    const char *p = *cursor + n, *start = p;
+    while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
+           *p == '/' || *p == '.' || *p == '-' || *p == '_' || *p == '@') p++;
+    if ((size_t)(p - start) >= cap) return false;
+    memcpy(out, start, (size_t)(p - start)); out[p - start] = 0;
+    *cursor = p; return true;
+}
+/* Fetch's timing record (WEBNET_WIRE_TIMING) moves out of the header block
+   into r->timing, the Server-Timing values with it. It comes once, after
+   every server field; a frame without it reports nothing. */
+static bool consume_timing(struct request *r, char *headers) {
+    static const char mark[] = "\r\nHTTP/Nocturne-Timing ", server[] = "\r\nHTTP/Nocturne-Server-Timing ";
+    char *line = strstr(headers, mark);
+    if (!line) return !strstr(headers, server); /* field values hold no CR or LF */
+    if (r->timing_seen) return false;
+    const char *p = line + sizeof mark - 1;
+    struct http_fetch_timing t = {0};
+    struct http_connection_timing *c = &t.connection;
+    uint64_t redirects, cache, tao, same_origin, navigation, connection;
+    if (!diagnostic_number(&p, "redirects=", &redirects) || !diagnostic_number(&p, " redirect_end=", &t.redirect_end) ||
+        !diagnostic_number(&p, " post_redirect=", &t.post_redirect_start) ||
+        !diagnostic_number(&p, " lookup_start=", &c->domain_lookup_start) || !diagnostic_number(&p, " lookup_end=", &c->domain_lookup_end) ||
+        !diagnostic_number(&p, " connect_start=", &c->connect_start) || !diagnostic_number(&p, " connect_end=", &c->connect_end) ||
+        !diagnostic_number(&p, " secure_start=", &c->secure_connection_start) ||
+        !diagnostic_number(&p, " request=", &t.final_network_request_start) ||
+        !diagnostic_number(&p, " interim=", &t.first_interim_network_response_start) ||
+        !diagnostic_number(&p, " response=", &t.final_network_response_start) || !diagnostic_number(&p, " end=", &t.end_time) ||
+        !diagnostic_number(&p, " cache=", &cache) || !diagnostic_number(&p, " tao=", &tao) ||
+        !diagnostic_number(&p, " same_origin=", &same_origin) || !diagnostic_number(&p, " navigation_redirects=", &navigation) ||
+        !diagnostic_number(&p, " connection=", &connection) || !diagnostic_number(&p, " encoded=", &t.encoded_body_size) ||
+        !diagnostic_number(&p, " decoded=", &t.decoded_body_size) ||
+        !timing_token(&p, " protocol=", c->protocol, sizeof c->protocol) ||
+        !timing_token(&p, " encoding=", t.content_encoding, sizeof t.content_encoding) ||
+        p[0] != '\r' || p[1] != '\n' || redirects > 20 || cache > HTTP_CACHE_STATE_VALIDATED || tao > 1 ||
+        same_origin > 1 || navigation > 1 || connection > 1 || (redirects && !t.post_redirect_start)) return false;
+    t.redirect_count = (uint32_t)redirects; t.cache_state = (uint8_t)cache; t.timing_allow_passed = tao;
+    t.redirect_same_origin = same_origin; t.navigation_redirects_exposed = navigation; t.connection_valid = connection;
+    if (!strncmp(p, server, sizeof server - 1)) {
+        const char *value = p + sizeof server - 1, *end = strstr(value, "\r\n");
+        if (!end || !(t.server_timing = malloc((size_t)(end - value) + 1))) return false;
+        memcpy(t.server_timing, value, (size_t)(end - value)); t.server_timing[end - value] = 0;
+        p = end;
+    }
+    memmove(line, p + 2, strlen(p + 2) + 1);
+    if (strstr(headers, mark) || strstr(headers, server)) { http_fetch_timing_free(&t); return false; }
+    r->timing = t; r->timing_seen = true;
+    return true;
+}
 /* Wire data has no terminators; insert them after the complete payload has arrived. */
 static bool unpack(struct request *r) {
     const struct webnet_wire_response *h = &r->head;
@@ -1108,6 +1188,7 @@ static bool unpack(struct request *r) {
     if (!consume_request_diagnostic(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
     if (!consume_sent_fields(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
     if (!consume_transport_diagnostic(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
+    if (!consume_timing(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
     free(r->rx); r->rx = out;
     return true;
 }
@@ -1120,7 +1201,8 @@ static bool stream_frame_valid(struct request *r) {
             !h->url_len && !h->headers_len && !h->error_len && !h->cookie_len && !h->status;
     if (h->magic == WEBNET_STREAM_UPLOAD)
         return !r->headers_seen && !h->url_len && !h->headers_len && !h->body_len && !h->error_len && !h->cookie_len;
-    return h->magic == WEBNET_STREAM_END && !h->url_len && !h->headers_len && !h->body_len && !h->status &&
+    /* The end's block is the timing record's lines alone (dispatch checks). */
+    return h->magic == WEBNET_STREAM_END && !h->url_len && !h->body_len && !h->status &&
         (r->headers_seen || h->error_len);
 }
 /* Every stream event pauses the transport until the consumer resumes it. */
@@ -1134,7 +1216,8 @@ static void deliver_stream_event(webnet *n, struct request *r, const struct webn
 static bool dispatch_stream_frame(webnet *n, struct request *r) {
     if (!unpack(r)) return false;
     if (!cookie_events(n, r)) return false;
-    if (r->head.magic == WEBNET_STREAM_END) return true; /* terminal callback after reaping */
+    /* terminal callback after reaping; nothing but the timing lines in its block */
+    if (r->head.magic == WEBNET_STREAM_END) return !r->rx[(size_t)r->head.url_len + 1];
     char *p = (char *)r->rx;
     struct webnet_response response = {0};
     response.status = (int)r->head.status;

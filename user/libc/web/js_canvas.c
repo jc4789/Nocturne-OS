@@ -1092,10 +1092,10 @@ bool web_canvas_fit(const node_t *n,const style_t *st,int x,int y,int w,int h,in
     return true;
 }
 struct web_webgl *web_canvas_webgl(const node_t *n) { return n && n->canvas ? n->canvas->webgl : NULL; }
-void web_canvas_paint(node_t *n,const style_t *st,canvas_t *dst,int x,int y,int w,int h) {
+bool web_canvas_paint(node_t *n,const style_t *st,canvas_t *dst,int x,int y,int w,int h) {
     struct web_canvas *c=n?webgl_sync(n,true):NULL;
     int fit[4];
-    if (!c || !c->pixels || !c->w || !c->h || !web_canvas_fit(n,st,x,y,w,h,fit)) return;
+    if (!c || !c->pixels || !c->w || !c->h || !web_canvas_fit(n,st,x,y,w,h,fit)) return false;
     /* The fitted bitmap, clipped to the content box. */
     int x0=MAX(MAX(x,fit[0]),dst->cx0),y0=MAX(MAX(y,fit[1]),dst->cy0);
     int x1=MIN(MIN((int64_t)x+w,(int64_t)fit[0]+fit[2]),dst->cx1),y1=MIN(MIN((int64_t)y+h,(int64_t)fit[1]+fit[3]),dst->cy1);
@@ -1110,6 +1110,7 @@ void web_canvas_paint(node_t *n,const style_t *st,canvas_t *dst,int x,int y,int 
             uint32_t *p=&dst->px[(size_t)yy*dst->pitch+xx]; *p=over(*p,source);
         }
     }
+    return true;
 }
 /* the canvas element's current style, for a colour that names currentcolor or the scheme;
    a canvas outside the document has none */

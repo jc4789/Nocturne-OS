@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 #include <threads.h>
 
 /* ---- streams: plain TCP or TLS 1.2 (BearSSL, verified against the built-in Mozilla roots) ---- */
@@ -25,6 +27,19 @@ net_stream *ns_open_timed(const char *host, uint16_t port, bool tls, int timeout
    successful peer. Separate from the existing timing structure's native ABI. */
 struct ns_connection_info { uint32_t version, candidates, attempts, peer_ip; };
 int ns_get_connection_info(const net_stream *,struct ns_connection_info *);
+/* Fetch's "connection timing info" of one connection, which the connection
+   records as it opens: when the domain lookup started and ended, when the
+   connection started, when its secure handshake started (0 on a cleartext
+   connection) and when it was established, handshake included. Absolute
+   uptime_ms values. protocol is the ALPN negotiated protocol ID; an HTTP/1
+   connection that negotiated none reports "http/1.1". */
+#define HTTP_PROTOCOL_MAX 16u
+#define HTTP_CONTENT_ENCODING_MAX 16u
+struct http_connection_timing {
+    uint64_t domain_lookup_start, domain_lookup_end, connect_start, connect_end, secure_connection_start;
+    char protocol[HTTP_PROTOCOL_MAX];
+};
+int ns_get_connection_timing(const net_stream *, struct http_connection_timing *);
 long ns_write(net_stream *s, const void *buf, size_t n); /* all or -1 */
 long ns_read(net_stream *s, void *buf, size_t n);        /* >0 bytes, 0 = end of stream, -1 = error */
 void ns_set_timeout(net_stream *s, int timeout_ms);      /* per read; -1 waits forever */
@@ -168,7 +183,71 @@ struct http_transport_result {
     uint64_t connection_id;
     uint32_t stream_id;
     bool http2;
+    /* This attempt's part of Fetch's timing record (absolute uptime_ms, 0 for
+       not reached): the timing info of the connection it used, as that
+       connection recorded it when it opened (an earlier request's for a reused
+       one; the caller clamps it), the protocol of this exchange, when the
+       request started to go out (final network-request start), when the first
+       interim (1xx) and the final response began to arrive, and the body's
+       encoded size: the bytes transmitted, before content codings are undone. */
+    struct http_connection_timing connection;
+    uint64_t request_start, first_interim_response_start, final_response_start;
+    uint64_t encoded_body_size;
+    /* Fetch's filtered content coding of the response body: "" (none, or no
+       body byte arrived), the lowercased coding this client undoes,
+       "multiple" or "@unknown" (HTTP-network fetch, response body info). */
+    char content_encoding[HTTP_CONTENT_ENCODING_MAX];
 };
+/* Fetch's timing record of one fetch, from its start to the end of its body:
+   "fetch timing info" (start, redirect, post-redirect start, final connection
+   timing info, request and response starts, end), the final response's cache
+   state, "timing allow passed" flag, redirect taint and body info, and its
+   Server-Timing field values. Absolute uptime_ms values, 0 for not reached.
+   The transport (webfetch) records it as the request goes, the browser's
+   network layer (webnet.c) adds the start time it was asked at and clamps a
+   reused connection's times, and the document builds Navigation and Resource
+   Timing entries from it. The record is never the opaque form: the
+   performance timeline makes that itself when timing_allow_passed is false. */
+enum http_cache_state { HTTP_CACHE_STATE_NONE, HTTP_CACHE_STATE_LOCAL, HTTP_CACHE_STATE_VALIDATED };
+struct http_fetch_timing {
+    bool valid;
+    /* A network hop ran, so "final connection timing info" is non-null. */
+    bool connection_valid;
+    /* Fetch: every hop passed the TAO check (timing allow passed flag). */
+    bool timing_allow_passed;
+    /* Fetch: the response's redirect taint is "same-origin". */
+    bool redirect_same_origin;
+    /* HTML (create and initialize a Document): a navigation's redirect count
+       is exposed (redirect taint same-origin, or the navigation TAO check over
+       every redirect hop passed for a request that had no client or sent a
+       referrer). Meaningful for navigations only. */
+    bool navigation_redirects_exposed;
+    uint8_t cache_state; /* enum http_cache_state */
+    uint32_t redirect_count;
+    uint64_t start_time, redirect_start, redirect_end, post_redirect_start;
+    struct http_connection_timing connection;
+    uint64_t final_network_request_start, first_interim_network_response_start,
+             final_network_response_start, end_time;
+    uint64_t encoded_body_size, decoded_body_size;
+    char content_encoding[HTTP_CONTENT_ENCODING_MAX];
+    /* Owned by whoever holds the record (NULL: none): the final response's
+       Server-Timing field values combined (", "), before the timing allow
+       check; the timeline parses them (Server Timing §2). */
+    char *server_timing;
+};
+/* Copies a record into *out, the Server-Timing values included; false when
+   that copy cannot be allocated (out is then the record without them). */
+static inline bool http_fetch_timing_copy(struct http_fetch_timing *out, const struct http_fetch_timing *in) {
+    *out = *in; out->server_timing = NULL;
+    if (!in->server_timing) return true;
+    size_t n = strlen(in->server_timing);
+    if (!(out->server_timing = malloc(n + 1))) return false;
+    memcpy(out->server_timing, in->server_timing, n + 1);
+    return true;
+}
+static inline void http_fetch_timing_free(struct http_fetch_timing *timing) {
+    free(timing->server_timing); timing->server_timing = NULL;
+}
 int http_request_stream_ex(const struct http_req *, struct http_resp *, size_t,
                            const struct http_stream_hooks *, struct http_transport_timing *,
                            const char *partition, struct http_transport_result *);

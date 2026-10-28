@@ -1428,6 +1428,10 @@ struct web_doc {
     bool live, dirty, paint_dirty, resources_dirty, images_dirty;
     bool restyle_dirty; /* dirty, but only marked elements' own computed values (CSS animation samples) */
     bool initial_render_done;
+    /* Paint Timing: when this document's first paint, and its first
+       contentful paint, ended (uptime_ms; 0 before). paint.c records each
+       once from a real paint walk; js.c reports them to the timeline. */
+    uint64_t first_paint_ms, first_contentful_paint_ms;
     uint64_t initial_render_deadline; /* paint fallback only: never cancels resources */
     /* HTML Page visibility (interaction.html 6.2). visible is this Document's visibility state
        (false is "hidden", a Document's initial value). A hidden document has no rendering
