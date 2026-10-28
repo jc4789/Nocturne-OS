@@ -190,6 +190,18 @@ $(BUILD)/qjs/%.o: %.c
 	@echo "  QJS  $<"
 	@$(CC) $(QJSFLAGS) -c $< -o $@
 
+# Expat: XML tokens, the internal DTD subset and entity replacement only
+# (third_party/expat/README.nocturne.md). Namespaces, the DOM and the
+# parsererror document belong to user/libc/web/xml.c.
+EXPAT_C := $(addprefix third_party/expat/lib/,xmlparse.c xmlrole.c xmltok.c)
+EXPAT_OBJ := $(patsubst %.c,$(BUILD)/expat/%.o,$(EXPAT_C))
+EXPATFLAGS := $(filter-out -W%,$(UCFLAGS)) -w -fno-addrsig -Iports/expat
+$(BUILD)/expat/%.o: %.c ports/expat/expat_config.h
+	@mkdir -p $(dir $@)
+	@echo "  XML  $<"
+	@$(CC) $(EXPATFLAGS) -c $< -o $@
+$(BUILD)/u/user/libc/web/xml.o: UCFLAGS += -Ithird_party/expat/lib
+
 # stb_truetype, stb_image, jebp and nanosvg are compiled as they are, without warnings
 $(BUILD)/u/user/libc/third_party_%.o: UCFLAGS += -w
 
@@ -282,7 +294,7 @@ CXX_RUNTIME_LINK := $(if $(LLVMPIPE),$(LLVM_RUNTIMES)/Lib/libc++.a $(LLVM_RUNTIM
     $(BUILD)/u/user/libc/cxxabi.cpp.o $(CXX_RUNTIME_OBJ))
 # Zink and NVK (with its Rust archive and libnvrm) are lazy members like the rest: only a program
 # that draws with OpenGL pulls them in.
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) \
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(EXPAT_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) \
     $(CXX_RUNTIME_LINK) $(MESA_OBJ) $(ZINK_OBJ) $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
 # Programs are linked from the libc's members and, with llvmpipe, LLVM's libraries. The SDK's
 # libc.a is made from the same list: a program linked inside Nocturne reaches llvmpipe through
@@ -428,7 +440,7 @@ $(LICENSES)/%: third_party/%
 	@mkdir -p $(dir $@)
 	@cp $< $@
 LICENSE_FILES := $(LICENSES)/libcxx/LICENSE.TXT $(addprefix $(LICENSES)/,uacpi/LICENSE wabt/LICENSE wabt/UPSTREAM.json \
-    lexbor/LICENSE lexbor/NOTICE lexbor/UPSTREAM.json ffmpeg/LICENSE.md ffmpeg/COPYING.LGPLv2.1 ffmpeg/manifest.json \
+    lexbor/LICENSE lexbor/NOTICE lexbor/UPSTREAM.json expat/COPYING expat/README.nocturne.md ffmpeg/LICENSE.md ffmpeg/COPYING.LGPLv2.1 ffmpeg/manifest.json \
     ffmpeg/README.nocturne.md unifont/OFL-1.1.txt unifont/NOTICE.txt unifont/manifest.json)
 $(PROGRAMS)/nvrm: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ) $(NVKMS_LINK_OBJ) $(UVM_LINK_OBJ) $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
