@@ -3,6 +3,7 @@
 #include "fs/document.h"
 #include "arch/cpu.h"
 #include "fs/space.h"
+#include "fs/watch.h"
 #include "dev/blk.h"
 #include "dev/timer.h"
 #include "dev/usb.h"
@@ -322,6 +323,7 @@ void store_init(void) {
     if (r < 0) panic("store: C: on %s cannot be mounted (%d)", medium(), r);
     /* clean blocks kept: a 16th of memory for a disk; in memory, reading one again is a copy */
     if (part.disk) v->limit = MAX(v->limit, (size_t)(pmm_total_pages() / 16));
+    entry_watch_start(v);
     store.v = v;
     char label[sizeof v->super.label + 1] = {0};
     memcpy(label, v->super.label, sizeof v->super.label);

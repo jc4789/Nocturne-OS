@@ -25,6 +25,22 @@ struct ns_entry {
 };
 /* name in folder. */
 int ns_find(struct volume *v, uint64_t folder, const char *name, size_t n, struct ns_entry *out);
+/* The place name has in folder, whether an entry has it or not: its key (STORE_KEY_MAX bytes of
+   room), as struct ns_entry and struct ns_change give it. Its length, or an error for a bad name. */
+int ns_key(struct volume *v, uint64_t folder, const char *name, size_t n, uint8_t *key);
+
+/* A change to the namespace as the volume's watcher (struct volume) hears it: a name of folder
+   that names another entry from now on, or none (key: its place; id: what it names now, 0:
+   nothing), or (key NULL) document id of folder whose content changed. Each change that a new
+   opening, entry info or folder listing sees is told once, with what else changed in the same
+   step (a move: the name it leaves, the name it takes, the document that goes aside). */
+struct ns_change {
+    uint64_t folder, id;
+    const uint8_t *key;
+    size_t klen;
+    uint64_t gone;  /* a folder that is no more, removed with its name */
+    bool hidden;    /* the entry is PRIVATE: no app sees the change */
+};
 /* The entry the path names (the root: id STORE_ID_ROOT, no name), with its record. */
 int ns_lookup(struct volume *v, const struct path *p, struct ns_entry *entry, struct store_record *record);
 /* The folder entry after `after` (NULL: the first). */

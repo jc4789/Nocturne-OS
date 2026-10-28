@@ -150,6 +150,7 @@ static const struct sysinfo_ hinfo[] = {
     {SYS_WIN_MAP, 1}, {SYS_WIN_PRESENT, 1}, {SYS_WIN_SET_TITLE, 1}, {SYS_WIN_MOVE, 1}, {SYS_WIN_RESIZE, 1},
     {SYS_WIN_STATE, 1}, {SYS_WIN_PRESENTATION, 1}, {SYS_WIN_RECEIVE, 1}, {SYS_WIN_DIRECT, 1}, {SYS_WIN_FRAME, 1},
     {SYS_USER_SETTINGS_CHANGES, 1},
+    {SYS_WATCH_TAKE, 1},
 };
 
 static unsigned hmask_of(long num) {
@@ -185,6 +186,8 @@ static bool creates_handle(long n) {
     case SYS_DOCUMENT_OPEN: case SYS_CHANNEL_LISTEN: case SYS_CHANNEL_CONNECT: case SYS_CHANNEL_ACCEPT:
     case SYS_SHARED_CREATE: case SYS_SHARED_RESERVE: case SYS_EVENTS_CREATE: case SYS_SYSTEM_LOG_OPEN:
     case SYS_AUDIO_OPEN: case SYS_PCI_BAR: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_USER_SETTINGS_WATCH:
+        return true;
+    case SYS_ENTRY_WATCH:
         return true;
     }
     return false;
@@ -256,6 +259,8 @@ static void live_refill(void) {
     live_add(n_shared_reserve(65536));
     live_add(n_channel_listen("syscallfuzz.listener"));
     live_add(n_audio_open());
+    live_add(n_entry_watch(scratch, N_WATCH_NAME));
+    live_add(n_entry_watch(n_temp_folder(), N_WATCH_FOLDER));
 }
 
 /* ---- the random call engine ---- */
@@ -333,6 +338,7 @@ static void checks(void) {
         MUST_FAIL("entry_move of a bad path", call5(SYS_ENTRY_MOVE, p, (long)(uintptr_t)"C:\\x", 0, 0, 0));
         MUST_FAIL("document_save of bad data", call5(SYS_DOCUMENT_APPEND, (long)(uintptr_t)scratch, p, 16, 0, 0));
         MUST_FAIL("channel_listen on a bad key", call5(SYS_CHANNEL_LISTEN, p, 0, 0, 0, 0));
+        MUST_FAIL("entry_watch of a bad path", call5(SYS_ENTRY_WATCH, p, N_WATCH_NAME, 0, 0, 0));
         call5(SYS_SYSTEM_LOG, p, 64, 0, 0, 0);
         MUST_FAIL("random into a bad buffer", call5(SYS_RANDOM, p, 16, 0, 0, 0));
         MUST_FAIL("sysinfo into a bad buffer", call5(SYS_SYSINFO, p, 0, 0, 0, 0));
@@ -424,7 +430,13 @@ static void checks(void) {
         call5(SYS_FOLDER_LIST, p, (long)(uintptr_t)buf, 2, 0, 0);
         call5(SYS_FOLDER_CREATE, p, 0, 0, 0, 0);
         call5(SYS_ENTRY_MOVE, p, p, 0, 0, 0);
+        h = call5(SYS_ENTRY_WATCH, p, N_WATCH_FOLDER, 0, 0, 0);
+        if (h >= 3) call5(SYS_HANDLE_CLOSE, h, 0, 0, 0, 0);
     }
+    /* what a watch on C: watches is one of two, in all 64 bits */
+    long kinds[] = {0, N_WATCH_NAME | N_WATCH_FOLDER, 4, -1, (1L << 32) | N_WATCH_NAME, (long)(1UL << 63 | N_WATCH_FOLDER)};
+    for (size_t i = 0; i < sizeof kinds / sizeof *kinds; i++)
+        MUST_FAIL("entry_watch of no kind of watch", call5(SYS_ENTRY_WATCH, (long)(uintptr_t)"C:\\", kinds[i], 0, 0, 0));
     /* An unterminated string ending where the mapping ends. */
     for (long back = 1; back <= 9; back += 4) {
         long p = (long)(uintptr_t)edge - back;

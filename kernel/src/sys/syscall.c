@@ -2167,6 +2167,16 @@ static int64_t sys_folder_create(const char *upath) {
     return r;
 }
 
+static int64_t sys_entry_watch(const char *upath, uint64_t what) {
+    if (what != N_WATCH_NAME && what != N_WATCH_FOLDER) return -N_ERR_INVALID; /* the upper bits too */
+    char *path;
+    int r = user_string(upath, &path);
+    if (r < 0) return r;
+    int64_t h = store_entry_watch(path, (uint32_t)what, true);
+    kfree(path);
+    return h;
+}
+
 static int64_t sys_channel_pair(int32_t *uout) {
     if (!user_ok_w(uout, 2 * sizeof *uout)) return -N_ERR_BAD_ADDRESS;
     struct handle *a, *b;
@@ -2847,6 +2857,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_USER_LANGUAGES: ret = user_languages((char *)a, b); break;
     case SYS_USER_LANGUAGES_SET: ret = user_languages_set((const char *)a, b); break;
     case SYS_WATCH_TAKE: ret = watch_take((int)a); break;
+    case SYS_ENTRY_WATCH: ret = sys_entry_watch((const char *)a, b); break;
     case SYS_PAGER_CREATE: ret = sys_pager_create(a, (int32_t *)b); break;
     case SYS_PAGER_TAKE: ret = sys_pager_take((int)a, (struct n_pager_fault *)b, c, (int64_t)d); break;
     case SYS_PAGER_SUPPLY: ret = sys_pager_supply((int)a, (const struct n_pager_supply *)b, c); break;

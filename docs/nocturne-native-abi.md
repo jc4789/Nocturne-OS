@@ -19,10 +19,22 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - カーネル資源はすべて**種類つきハンドル**（`n_handle`、非負の `int32_t`）で表す。
 - 種類：`N_KIND_DOCUMENT`、`N_KIND_FOLDER`、`N_KIND_CHANNEL`、`N_KIND_WINDOW`、
   `N_KIND_SHARED`、`N_KIND_APP`、`N_KIND_EVENTS`、`N_KIND_DEVICE`（音声等）、
-  `N_KIND_CONNECTION`（TCP／UDP）、`N_KIND_PCI`、`N_KIND_PAGER`、`N_KIND_USER_SETTINGS`
-  （利用者の設定の監視。§12）。
+  `N_KIND_CONNECTION`（TCP／UDP）、`N_KIND_PCI`、`N_KIND_PAGER`、`N_KIND_WATCH`（見張り。下）。
+  12 は欠番（§10）。
 - 汎用操作は `n_handle_close(h)` と `n_handle_kind(h)` だけ。読み書きは種類ごとの
   専用関数で行い、種類の違うハンドルを渡すと `N_ERR_WRONG_KIND`。
+- 見張り（`N_KIND_WATCH`）は、見ている物が変わったことを知らせるハンドル。開く口は見る物ごとに
+  あり（C: の `n_entry_watch`（§3）、音の `n_audio_output_watch`（§9）、画面の `n_screen_watch`）、
+  取り出しは共通の `n_watch_take(h)`（`SYS_WATCH_TAKE`）一つ。
+  - 変化があると `N_EVENT_RECEIVABLE` になり、`n_watch_take` が数を取るまでそのまま（レベル）。
+    `n_watch_take` は前の取り出しの後に来た変化の数を返す（無ければ 0）。数えるのはハンドルごとに
+    開いた時からで、同じ物を見るほかのハンドルの取り出しは関わらない。`N_WATCH_CHANGES_MAX` で
+    止まり、溢れない。
+  - 見ている物が無くなると `N_EVENT_CLOSED`。取り出しはまず残っていた数を返し、その後は
+    `N_ERR_CLOSED`。
+  - 見張りでないハンドルの取り出しは `N_ERR_WRONG_KIND`。見張りはイベント待ち行列（§6）に入れて待つ。
+    中身（値や内容）は運ばず、知らせを受けた側が持ち主の読み出し（`n_entry_info`、`n_document_load`、
+    `n_audio_output` など）で読み直す。
 - 複製（`dup`／`dup2`）と、番号を指定した付け替えはない。子アプリへ渡す資源は
   起動時の引渡し表（§5）で明示する。
 
@@ -139,6 +151,37 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - `n_entry_replace(from, to)` は `n_entry_move` と同じだが、文書 `from` は既存の文書 `to` の名前を
   取れる。元の `to` は同じ確定（commit）の中で `n_entry_remove` と同じように消える（開いている
   ハンドルは消えた文書を読み書きし続ける）。`to` が文書以外なら `N_ERR_EXISTS`。
+- 見張り：`n_entry_watch(path, what)`（`SYS_ENTRY_WATCH`）は C: の見張り（§1）を返す。プログラムは
+  自分の設定や好みの文書をこれで見張り、ほかのプログラム（自分の別の窓、設定の窓）が保存すると
+  読み直す。
+  - `what` は `N_WATCH_NAME`（`path` の最後の名前を、そのフォルダーの中で。その名前の項目が今
+    あるかは問わず、大文字・小文字の違う綴りも同じ名前）か `N_WATCH_FOLDER`（`path` のフォルダーの
+    直下の全部。中のフォルダーの中は見ない）。それ以外は `N_ERR_INVALID`（64 ビット全体で比べる）、
+    `C:\` の名前も `N_ERR_INVALID`。フォルダーが無ければ `N_ERR_NOT_FOUND`、途中や
+    `N_WATCH_FOLDER` の相手がフォルダーでなければ `N_ERR_NOT_FOLDER`。
+  - 数えるのは、新しく開いた `READ`・`n_entry_info`・`n_folder_list` から見えるようになった変化：
+    項目の作成、削除（開いたままの文書も名前はその時に消える）、移動の出入り、名前の変更（大文字・
+    小文字だけでも。今と同じ綴りへの移動は変化でない）、`n_entry_replace`、文書に書いた内容が
+    保存された版になった時（`n_document_save`、`n_document_commit`、最後の書き手の
+    `n_handle_close`、`N_DOCUMENT_EDIT` の書き込みが 16 MiB たまった時、システムの書き手が数秒
+    ごとに取り込む時）。`n_document_write_at` だけでは数えない（知らせで読んだ側が古い内容を読み、
+    その後に知らせが来なくなる）。書き手が開いている間の `n_entry_info` の `size` は書きかけの長さ
+    だが、それも保存までは数えない。
+  - 一つの操作は、見張りごとに一回：移動は離れる名前、入る名前、両方のフォルダーに一回ずつ
+    （同じフォルダーの中の名前の変更はそのフォルダーに一回）、まだ無い名前への `n_document_save`
+    も一回（作成と内容の取り込みの間は誰にも見えない）。`N_DOCUMENT_CREATE` で開いた文書は、
+    作った時と、書いた内容を保存した時の二回。
+  - 名前で見て、項目の `id` では見ない（`n_entry_replace` や `n_document_save` で名前の指す項目が
+    替わっても、同じ名前を見続ける）。フォルダーは項目そのものとして持つので、移されても名前が
+    変わっても見続ける。フォルダーが削除されると、それを見る見張りもその中の名前を見る見張りも
+    `N_EVENT_CLOSED` になる。同じ名前で作り直したフォルダーは別のフォルダー。`N_WATCH_NAME` の
+    名前がフォルダーを指していても、その中の変化は数えない。
+  - 権利は `n_entry_info` と同じ：アプリに見えない（PRIVATE の）項目の変化は数えず、PRIVATE の
+    フォルダー（`C:\Nocturne\Temp`）は見張れない（`N_ERR_NOT_FOUND`）。SYSTEM のフォルダーは
+    読めるので見張れる。
+  - 同じ物を見る見張りは一つの物を共有し、数はハンドルごと。C: に見張りが一つも無ければ変化の費用は
+    変わらない。見張りがあれば、変化ごとにフォルダーの番号で表を一度引き、そのフォルダーの見張りの
+    数だけかかる（ほかのフォルダーの見張りの数にはよらない）。
 - ISO Cの `stdio` は文書ハンドルの上で自分の位置を持つ：`"r"`＝`READ`、`"r+"`＝`EDIT`、
   `"w"`＝既存なら `EDIT` で長さ0にし、無ければ `CREATE`（ISO Cの切り詰め）、`"wx"`＝`CREATE`、
   `"a"`＝`EDIT`／`CREATE` で、書出しのたびに排他を取って末尾へ書く。`fseek`／`ftell` は
@@ -735,7 +778,11 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 
 段階5で削除した番号（1〜18、22〜25、30〜32、35〜37、57、59〜63、90）は欠番のまま
 再利用しない。残る番号は意味を変えない（OS内で tcc 等が作ったプログラムのため）。
-旧番号を使って作ったプログラムは作り直しが要る。新たに加えたもの：
+旧番号を使って作ったプログラムは作り直しが要る。カーネルが利用者の設定を持った a51c4398 の
+203〜206（`SYS_USER_SETTINGS_WATCH`、`SYS_USER_SETTINGS_CHANGES`、`SYS_USER_LANGUAGES`、
+`SYS_USER_LANGUAGES_SET`）とハンドルの種類 12（`N_KIND_USER_SETTINGS`）も、設定の持ち主の作り直し
+（`docs/settings-ownership-20261027.md`：値を効かせる者が自分の文書に保存する）で欠番にした。使い手が
+全部離れた後に振り分けと宣言を消し、番号は再利用しない。新たに加えたもの：
 
 - `SYS_WIN_RECEIVE`（窓、`struct gui_event *out`、最大数、`timeout_ms`）：待ち行列から
   入るだけ一度に受け取る。件数、期限で0、閉じた窓が最後のイベントを渡し終えると
@@ -748,6 +795,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   （パス、`out`、最大数、`start`、`sizeof *out`。件数）、`SYS_DOCUMENT_INFO`（文書、`out`、
   `sizeof *out`）：§3 の長さを渡す `struct n_entry`。`SYS_ENTRY_INFO`（139）と `SYS_FOLDER_LIST`
   （143）は `id` の無い最初の形（`N_ENTRY_FIRST_BYTES`、280バイト）を書き続ける。
+- `SYS_WATCH_TAKE`（207、見張り）：§1 の見張りの数の取り出し。`SYS_ENTRY_WATCH`（208、パス、
+  `N_WATCH_NAME` か `N_WATCH_FOLDER`）：§3 の C: の見張り。`N_KIND_WATCH`（13）を返す。
 
 ## 11. インターフェースエンジン（`ui.h`）
 

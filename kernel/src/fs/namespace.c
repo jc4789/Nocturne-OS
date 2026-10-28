@@ -35,6 +35,17 @@ static int entry_key(struct volume *v, uint8_t *key, uint64_t folder, const char
     return r < 0 ? r : 9 + r;
 }
 
+int ns_key(struct volume *v, uint64_t folder, const char *name, size_t n, uint8_t *key) {
+    return entry_key(v, key, folder, name, n);
+}
+
+/* The volume's watcher hears of n changes, all made: nothing when there is none. */
+static void tell(struct volume *v, const struct ns_change *c, size_t n) {
+    if (v->watch) v->watch(v, c, n);
+}
+
+static bool hidden(const struct store_record *r) { return r->attributes & STORE_PRIVATE; }
+
 /* A change that went part of the way: what was done stays in memory, so nothing more of it may
    reach the medium. */
 static int broken(struct volume *v, int r) {
@@ -155,6 +166,7 @@ int ns_create(struct volume *v, uint64_t folder, const char *name, size_t n, uin
     if ((r = ns_record_put(v, new_id, &rec, NULL, 0)) < 0 || (r = touch(v, folder)) < 0) return broken(v, r);
     v->next_id++;
     *id = new_id;
+    tell(v, &(struct ns_change){.folder = folder, .id = new_id, .key = key, .klen = (size_t)k, .hidden = hidden(&rec)}, 1);
     return 0;
 }
 
@@ -231,7 +243,14 @@ static int move(struct volume *v, uint64_t folder, const char *name, size_t n, u
     struct relink m, *b = NULL; /* the entry that moves, and the document that goes aside from its name */
     uint64_t over, taken;
     int r = relink_find(v, &m, folder, name, n, to_folder, to_name, to_n, &over);
-    if (r == 1) return entry_put(v, m.key, m.klen, m.e.id, to_name, to_n, true); /* only its case changes */
+    if (r == 1) { /* only its case changes */
+        bool same = m.e.n == to_n && !memcmp(m.e.name, to_name, to_n);
+        struct store_record rec;
+        if ((r = entry_put(v, m.key, m.klen, m.e.id, to_name, to_n, true)) >= 0 && !same && v->watch &&
+            ns_record(v, m.e.id, &rec, NULL) >= 0)
+            tell(v, &(struct ns_change){.folder = to_folder, .id = m.e.id, .key = m.key, .klen = m.klen, .hidden = hidden(&rec)}, 1);
+        return r;
+    }
     if (r >= 0 && over && !aside_name) r = -N_ERR_EXISTS;
     if (r >= 0 && over) {
         b = kmalloc(sizeof *b);
@@ -251,6 +270,15 @@ static int move(struct volume *v, uint64_t folder, const char *name, size_t n, u
         r = entry_put(v, m.key, m.klen, m.e.id, to_name, to_n, false);
     }
     if (r >= 0 && ((r = relink_finish(v, &m, true)) < 0 || (b && (r = relink_finish(v, b, false)) < 0))) broken(v, r);
+    if (r >= 0) {
+        /* the name it leaves, the name it takes, and where the document it replaces goes */
+        struct ns_change c[3] = {
+            {.folder = folder, .key = m.e.key, .klen = m.e.klen, .hidden = hidden(&m.rec)},
+            {.folder = to_folder, .id = m.e.id, .key = m.key, .klen = m.klen, .hidden = hidden(&m.rec)},
+        };
+        if (b) c[2] = (struct ns_change){.folder = aside, .id = b->e.id, .key = b->key, .klen = b->klen, .hidden = hidden(&b->rec)};
+        tell(v, c, b ? 3 : 2);
+    }
     kfree(b);
     return r;
 }
@@ -278,6 +306,8 @@ int ns_remove(struct volume *v, uint64_t folder, const char *name, size_t n, str
     if ((r = catalog_delete(v, e.key, e.klen)) < 0 ||
         (r = catalog_delete(v, key, key_head(key, e.id, STORE_KEY_RECORD))) < 0 || (r = touch(v, folder)) < 0)
         return broken(v, r);
+    tell(v, &(struct ns_change){.folder = folder, .key = e.key, .klen = e.klen,
+                                .gone = rec.kind == STORE_FOLDER ? e.id : 0, .hidden = hidden(&rec)}, 1);
     return 0;
 }
 
@@ -628,6 +658,7 @@ int ns_update(struct volume *v, uint64_t id, uint64_t size, uint64_t cut, struct
     kfree(content);
     if (unspent) space_unreserve(v, unspent);
     if (r < 0) return changed ? broken(v, r) : r;
+    tell(v, &(struct ns_change){.folder = rec.parent, .id = id, .hidden = hidden(&rec)}, 1);
     return 0;
 }
 
@@ -671,7 +702,9 @@ int ns_take(struct volume *v, uint64_t doc, uint64_t from, struct ranges *droppe
         r = ns_record_put(v, from, &rec, NULL, 0);
     }
     kfree(content);
-    return r < 0 && changed ? broken(v, r) : r < 0 ? r : 0;
+    if (r < 0) return changed ? broken(v, r) : r;
+    tell(v, &(struct ns_change){.folder = to.parent, .id = doc, .hidden = hidden(&to)}, 1);
+    return 0;
 }
 
 int ns_save(struct volume *v, uint64_t id, const void *data, size_t n) {

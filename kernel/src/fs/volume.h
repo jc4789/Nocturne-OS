@@ -56,9 +56,14 @@ struct space {
     uint64_t cursor;
 };
 
+struct ns_change;
+
 struct volume {
     struct store_device *dev;
     struct mutex lock;
+    /* Hears each change to the namespace once it is made (fs/namespace.h, struct ns_change), with
+       v->lock held: the kernel's watches on C: (fs/watch.c). NULL: no one does (the host tool). */
+    void (*watch)(struct volume *v, const struct ns_change *c, size_t n);
     struct store_super super;       /* the last commit's */
     uint32_t seed;
     uint64_t generation;            /* the open one: the next commit */

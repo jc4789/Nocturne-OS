@@ -199,6 +199,8 @@ static const struct test tests[] = {
      {"usersettingstest: ", ", 0 failed"}, "usersettingstest FAIL", 60, false, true},
     {"nativeabi", "iso-c-stdio", "tcc -o .\\stdiotest C:\\Tests\\stdiotest.c && .\\stdiotest", 0,
      {"stdiotest: ", ", 0 failed"}, "stdiotest FAIL", 120, false, true},
+    {"nativeabi", "entry-watch", "tcc -o .\\entrywatchtest C:\\Tests\\entrywatchtest.c && .\\entrywatchtest", 0,
+     {"entrywatchtest: ", ", 0 failed"}, "entrywatchtest FAIL", 180, false, true},
     {"sharedpages", "native-video-shared-pages", "tcc -o .\\sharedpagetest C:\\Tests\\sharedpagetest.c && .\\sharedpagetest", 0,
      {"共有ページ ", "検査 0 失敗"}, "共有ページ失敗", 120, true, true}, /* writer-ro faults on purpose */
     {"pager", "native-pager-shared-memory", "tcc -o .\\pagertest C:\\Tests\\pagertest.c && .\\pagertest", 0,

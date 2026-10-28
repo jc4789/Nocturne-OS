@@ -61,6 +61,10 @@ int store_folder_create(const char *path, bool user);
 int store_entry_remove(const char *path, bool user);
 /* replace: a document may take the name of another document, which goes in the same commit. */
 int store_entry_move(const char *from, const char *to, bool replace, bool user);
+/* A watch on C: (n_entry_watch, fs/watch.c): what is N_WATCH_NAME (the last name of path in its
+   folder) or N_WATCH_FOLDER (everything directly in the folder path names). A new handle in the
+   calling app's table: its number, or an error (-N_ERR_NOT_FOUND without the folder). */
+int64_t store_entry_watch(const char *path, uint32_t what, bool user);
 
 /* Raw documents: content the kernel reads and writes on the disk itself, past the store and its
    checks (the hibernation image). Their blocks keep their place until the document is removed.

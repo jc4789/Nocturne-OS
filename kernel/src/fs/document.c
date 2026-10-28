@@ -17,6 +17,7 @@
 #include "fs/document.h"
 #include "arch/cpu.h"
 #include "fs/space.h"
+#include "fs/watch.h"
 #include "mm/heap.h"
 #include "sys/object.h"
 
@@ -771,20 +772,23 @@ static int replace(struct volume *v, struct opening *op) {
     struct ns_entry e;
     struct store_record rec;
     uint64_t id = 0;
+    struct doc *d = NULL;
+    struct ranges dropped = {0};
+    /* a name made here and the content taken in under it are one change to whatever watches them:
+       nothing sees the empty document between */
+    entry_watch_together();
     if ((r = ns_find(v, t->folder, t->name, t->n, &e)) == -N_ERR_NOT_FOUND)
         r = ns_create(v, t->folder, t->name, t->n, STORE_DOCUMENT, 0, 0, &id);
     else if (r >= 0 && (r = ns_record(v, id = e.id, &rec, NULL)) >= 0)
         r = rec.kind != STORE_DOCUMENT ? -N_ERR_IS_FOLDER : op->user && (rec.attributes & STORE_SYSTEM) ? -N_ERR_DENIED : 0;
-    if (r < 0) return r;
-    struct doc *d = doc_get(id);
-    if (!d) return -N_ERR_NO_MEMORY;
-    struct ranges dropped = {0};
-    if ((r = supersede(v, d)) >= 0) {
+    if (r >= 0 && !(d = doc_get(id))) r = -N_ERR_NO_MEMORY;
+    if (r >= 0 && (r = supersede(v, d)) >= 0) {
         r = ns_take(v, id, t->id, &dropped);
         dropped_to(v, d, &dropped);
     }
+    entry_watch_apart();
     if (r < 0) {
-        doc_put(v, d);
+        if (d) doc_put(v, d);
         return r;
     }
     d->changed_in = v->generation;
