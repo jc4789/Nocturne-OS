@@ -509,6 +509,12 @@ static int set_for(webcookie_jar *j, const struct webcookie_context *ctx, const 
     else if (was_saved) note(j,CHANGE_DELETE,c);
     j->cookies[j->count++]=c; j->bytes+=record_bytes(c); return 1;
 }
+/* Whether the cookie-string of a holds c as to domain (host-only: the same host), path and
+   Secure; an HttpOnly cookie only for an HTTP API. SameSite is the caller's. */
+static bool sent_to(const struct cookie *c,const struct address *a,bool http) {
+    if ((c->flags&F_HOST) ? strcmp(a->host,c->domain)!=0 : !domain_match(a->host,c->domain)) return false;
+    return path_match_n(a->path,a->path_len,c->path) && (!(c->flags&F_SECURE)||a->secure) && (!(c->flags&F_HTTP)||http);
+}
 static int send_order(const void *a,const void *b) {
     const struct cookie *x=*(const struct cookie *const *)a,*y=*(const struct cookie *const *)b;
     if (x->pl!=y->pl) return x->pl>y->pl?-1:1;
@@ -534,8 +540,7 @@ static long get_for(webcookie_jar *j,const struct webcookie_context *ctx,const s
     bool safe=!strcmp(method,"GET")||!strcmp(method,"HEAD")||!strcmp(method,"OPTIONS")||!strcmp(method,"TRACE");
     for (size_t i=0;i<j->count;i++) {
         struct cookie *c=j->cookies[i];
-        if ((c->flags&F_HOST) ? strcmp(a.host,c->domain)!=0 : !domain_match(a.host,c->domain)) continue;
-        if (!path_match_n(a.path,a.path_len,c->path) || ((c->flags&F_SECURE)&&!a.secure) || ((c->flags&F_HTTP)&&!ctx->http)) continue;
+        if (!sent_to(c,&a,ctx->http)) continue;
         if (!same && c->same!=S_NONE && !(c->same==S_LAX && ctx->http && ctx->top_level && safe)) continue;
         list[count++]=c; len+=c->nl+c->vl+(c->nl?1:0)+(count>1?2:0);
     }
@@ -837,5 +842,60 @@ size_t webcookie_clear(webcookie_jar *j,const char *site){
     size_t removed=0;
     for(size_t i=0;i<j->count;)if(!*host||domain_match(j->cookies[i]->domain,host)){remove_cookie(j,i);removed++;}else i++;
     note_clear(j,host);
+    return removed;
+}
+_Static_assert(S_LAX==WEBCOOKIE_SAME_SITE_LAX&&S_STRICT==WEBCOOKIE_SAME_SITE_STRICT&&S_NONE==WEBCOOKIE_SAME_SITE_NONE,"SameSite values");
+/* An associated cookie of a document at a (webcookie_associated): the cookie-string for an HTTP
+   API holds it, and its name is name unless that is NULL. */
+static bool associated(const struct cookie *c,const struct address *a,const char *name){
+    return sent_to(c,a,true)&&(!name||!strcmp(c->name,name));
+}
+long webcookie_associated(webcookie_jar *j,const char *url,const char *name,struct webcookie_record **out,int64_t now){
+    if(!out)return -1;
+    *out=NULL;if(!j)return -1;
+    struct address a;int parsed=address(url,&a);
+    if(parsed!=1)return parsed;
+    purge(j,now);
+    long result=0;size_t count=0,bytes=0;
+    struct cookie **list=NULL;
+    if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)&&j->count){ /* the user's block: no Cookie field */
+        if(!(list=malloc(j->count*sizeof *list)))result=-1;
+        else for(size_t i=0;i<j->count;i++){
+            struct cookie *c=j->cookies[i];
+            if(associated(c,&a,name)){list[count++]=c;bytes+=c->nl+c->vl+c->dl+c->pl+4;}
+        }
+    }
+    if(count){
+        qsort(list,count,sizeof *list,send_order);
+        struct webcookie_record *r=malloc(count*sizeof *r+bytes);
+        if(!r)result=-1;
+        else{
+            char *text=(char *)(r+count);
+            for(size_t i=0;i<count;i++){
+                struct cookie *c=list[i];
+                const char *from[4]={c->name,c->value,c->domain,c->path};
+                size_t len[4]={c->nl,c->vl,c->dl,c->pl};
+                const char **to[4]={&r[i].name,&r[i].value,&r[i].domain,&r[i].path};
+                for(int k=0;k<4;k++){memcpy(text,from[k],len[k]+1);*to[k]=text;text+=len[k]+1;}
+                r[i].host_only=c->flags&F_HOST;r[i].secure=c->flags&F_SECURE;r[i].http_only=c->flags&F_HTTP;
+                r[i].persistent=c->flags&F_PERSIST;r[i].same_site=c->same;r[i].expires=r[i].persistent?c->expires:0;
+                c->access=stamp(j,now);
+            }
+            *out=r;result=(long)count;
+        }
+    }
+    free(list);address_free(&a);
+    return result;
+}
+long webcookie_delete_associated(webcookie_jar *j,const char *url,const char *name,int64_t now){
+    if(!j)return -1;
+    struct address a;int parsed=address(url,&a);
+    if(parsed!=1)return parsed;
+    purge(j,now);
+    long removed=0;
+    if(!(policy(j,a.host)&WEBCOOKIE_BLOCK)){
+        for(size_t i=0;i<j->count;)if(associated(j->cookies[i],&a,name)){evict(j,i);removed++;}else i++;
+    }
+    address_free(&a);
     return removed;
 }
