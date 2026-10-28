@@ -166,6 +166,8 @@ enum {
    which the setting USERFOLDER names; its AppData\Temp, emptied at every start, is the setting TEMP. */
 #define N_FOLDER_SYSTEM   "C:\\Nocturne\\System"  /* the system's programs */
 #define N_FOLDER_PROGRAMS "C:\\Programs"           /* the apps, each in a folder of its own */
+/* certificate authorities the system trusts besides the roots built into TLS (user/libc/tls.c) */
+#define N_FOLDER_CERTIFICATES "C:\\Nocturne\\Certificates"
 
 /* n_document_open access: one of these, not a bit set. */
 #define N_DOCUMENT_READ 1     /* read an existing document */

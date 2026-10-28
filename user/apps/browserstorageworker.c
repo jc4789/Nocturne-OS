@@ -58,7 +58,7 @@ int main(void) {
         size_t total=0;
         memcpy(&command,message,sizeof command);
         if(command.magic!=WEB_IDB_WIRE_MAGIC||!command.sequence||
-           command.operation<WEB_IDB_BEGIN||command.operation>WEB_IDB_VALUES||
+           command.operation<WEB_IDB_BEGIN||command.operation>WEB_IDB_FIRED||
            command.reference_count>SIZE_MAX/64||
            !add(&total,command.origin_length)||!add(&total,command.name_length)||
            !add(&total,command.payload_length)||!add(&total,command.reference_count*64)||
@@ -119,8 +119,9 @@ int main(void) {
             webidb_databases_free(items,count);break;
         }
         case WEB_IDB_CONNECTIONS: {
-            size_t count=0;
-            result.status=webidb_connections(engine,command.token,command.version,&count);result.count=count;break;
+            size_t count=0,unfired=0;
+            result.status=webidb_connections(engine,command.token,command.version,&count,&unfired);
+            result.count=count;result.pending=unfired>UINT32_MAX?UINT32_MAX:(uint32_t)unfired;break;
         }
         case WEB_IDB_CONNECT:
             result.status=webidb_connect(engine,command.token,command.version,&result.token);break;
@@ -132,6 +133,8 @@ int main(void) {
             result.status=webidb_disconnect(engine,command.token);break;
         case WEB_IDB_FORGET:
             result.status=webidb_forget_connection(engine,command.token);break;
+        case WEB_IDB_FIRED:
+            result.status=webidb_fired(engine,command.token);break;
         case WEB_IDB_VALUES: {
             size_t count=(size_t)command.reference_count,capacity=0;
             const uint8_t *source=payload+command.payload_length;

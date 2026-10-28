@@ -8,7 +8,10 @@
 enum webidb_operation {
     WEB_IDB_BEGIN=1, WEB_IDB_STAGE, WEB_IDB_VALUE, WEB_IDB_COMMIT,
     WEB_IDB_ABORT, WEB_IDB_DATABASES, WEB_IDB_CONNECTIONS, WEB_IDB_CONNECT,
-    WEB_IDB_POLL, WEB_IDB_DISCONNECT, WEB_IDB_FORGET, WEB_IDB_VALUES
+    WEB_IDB_POLL, WEB_IDB_DISCONNECT, WEB_IDB_FORGET, WEB_IDB_VALUES,
+    /* The connection's versionchange event (the one POLL delivered) has been fired: the
+       opener's CONNECTIONS no longer counts it as waiting to be fired (webidb_fired). */
+    WEB_IDB_FIRED
 };
 struct webidb_wire_command {
     uint32_t magic, operation, sequence, token;

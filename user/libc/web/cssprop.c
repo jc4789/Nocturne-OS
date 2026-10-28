@@ -263,6 +263,7 @@ static bool unit_px(const char *u, size_t un, float v, const struct cx *cx, floa
         return true;
     }
     if (un == 1 && u[0] == '%') {
+        if (cx->absolute_lengths) return false;
         *pct = v;
         return true;
     }
@@ -287,6 +288,7 @@ static bool unit_px(const char *u, size_t un, float v, const struct cx *cx, floa
     };
     for (size_t i = 0; i < sizeof units / sizeof *units; i++) {
         if (strcmp(units[i].u, b)) continue;
+        if (cx->absolute_lengths && units[i].kind) return false;
         float f = units[i].f;
         switch (units[i].kind) {
         case 0: *px = v * f; break;
@@ -2827,7 +2829,7 @@ static bool transform_function(const char *name,size_t nn,const char **a,const s
     if(IS("perspective")){
         *t=transform_identity(CT_PERSPECTIVE);
         if(count!=1)return false;
-        if(ident_is(a[0],al[0],"none"))return true;
+        if(ident_is(a[0],al[0],"none")){t->v[1]=1;return true;}
         len_t depth;if(!parse_len(a[0],al[0],cx,&depth,LF_NOPCT|LF_LENGTH))return false;
         t->v[0]=len_resolve(&depth,0);return true;
     }
@@ -2852,6 +2854,51 @@ static bool parse_transform_value(const char *v,size_t n,struct cx *cx,const str
         struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*tail=node;tail=&node->next;p++;
     }
     if(!first)return false;*out=first;return true;
+}
+bool css_transform_string_matrix(const char *s,size_t n,double m[16],bool *two_d){
+    static const char identity2d[]="matrix(1, 0, 0, 1, 0, 0)";
+    if(!n){s=identity2d;n=sizeof identity2d-1;}
+    if(n>65536)return false;
+    /* A comment separates tokens as white space does: "none" followed by a comment is none, a
+       comment between a function's name and its parenthesis leaves no function. */
+    char *text=malloc(n+1);if(!text)return false;
+    size_t len=0;
+    for(size_t i=0;i<n;){
+        if(s[i]=='/'&&i+1<n&&s[i+1]=='*'){
+            const char *close=NULL;for(size_t j=i+2;j+1<n;j++)if(s[j]=='*'&&s[j+1]=='/'){close=s+j;break;}
+            text[len++]=' ';i=close?(size_t)(close-s)+2:n;continue;
+        }
+        text[len++]=s[i++];
+    }
+    const char *v=text;size_t vn=len;trim(&v,&vn);
+    bool ok=false,flat=true;
+    arena_t *a=calloc(1,sizeof *a);
+    jmp_buf trap;
+    if(a){
+        a->limit=1u<<20;a->trap=&trap;
+        if(!setjmp(trap)){
+            style_t style,parent;css_style_init(&parent,NULL);css_style_init(&style,&parent);
+            struct cx cx={.s=&style,.parent=&parent,.em=16,.rem=16,.vw=800,.vh=600,.a=a,
+                .set=ar_alloc(a,(size_t)css_prop_count()),.supports_probe=true,.absolute_lengths=true};
+            const struct css_transform *t=NULL;
+            if(parse_transform_value(v,vn,&cx,&t)&&!cx.invalid){
+                double r[16];css_transform_list_matrix_3d(t,r);
+                for(int c=0;c<4;c++)for(int row=0;row<4;row++)m[c*4+row]=r[row*4+c];
+                ok=true;
+                /* 2D-ness is by function name, not by value: translate3d(0, 0, 0) is 3D. */
+                static const char *const three[]={"matrix3d","translate3d","translateZ","scale3d","scaleZ","rotate3d","rotateX","rotateY","perspective"};
+                for(size_t i=0;i<vn;){
+                    if(!isalpha((unsigned char)v[i])){i++;continue;}
+                    size_t start=i;while(i<vn&&(isalnum((unsigned char)v[i])||v[i]=='-'))i++;
+                    if(i<vn&&v[i]=='(')for(size_t k=0;k<sizeof three/sizeof *three;k++)if(ident_is(v+start,i-start,three[k]))flat=false;
+                }
+            }
+        }
+        ar_free(a);free(a);
+    }
+    free(text);
+    if(ok)*two_d=flat;
+    return ok;
 }
 /* rotate: none | <angle> | [x | y | z | <number>{3}] && <angle> */
 static bool parse_rotate_value(const char *v,size_t n,struct cx *cx,const struct css_transform **out){

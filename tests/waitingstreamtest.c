@@ -36,7 +36,7 @@ int main(void){
         "document.write('<!doctype html><style>#target{color:rgb(1,2,3)}</style><body><div id=target>A</div><div id=tail>B');"
         "var savedTarget=document.getElementById('target');"
         "check('initial-visible-text',savedTarget.textContent==='A');"
-        "colour('initial-css','rgba(1, 2, 3, 1)');"));
+        "colour('initial-css','rgb(1, 2, 3)');"));
     settle(top,10);
     check("open-stream-has-no-input",child->parser&&!html_pending_input(child->parser));
     check("native-edit-during-wait",eval(child,
@@ -56,7 +56,7 @@ int main(void){
         "check('native-attribute-exported',document.body.getAttribute('data-native')==='kept');"
         "check('native-text-exported',savedTarget.textContent==='native');"
         "check('parser-attribute-imported',document.body.getAttribute('data-late')==='from-parser');"
-        "colour('new-css-imported','rgba(4, 5, 6, 1)');"
+        "colour('new-css-imported','rgb(4, 5, 6)');"
         "check('new-element-visible',document.getElementById('new').textContent==='new');"
         "check('suspended-token-text-imported',document.getElementById('tail').textContent==='BC');"));
     settle(top,10);check("actual-write-rescans",child->profile.rescans>rescans);
@@ -65,7 +65,7 @@ int main(void){
     check("closed-visible-dom",eval(child,
         "check('closed-ready-state',document.readyState==='complete');"
         "check('closed-visible-text',savedTarget.textContent==='native'&&document.getElementById('tail').textContent==='BC');"
-        "colour('closed-css','rgba(4, 5, 6, 1)');"));
+        "colour('closed-css','rgb(4, 5, 6)');"));
 cleanup:web_free(top);
 done:check("no-unexpected-js-errors",errors==0);
     printf("waitingstreamtest: %d checks, %d failed\n",checks,failures);return failures?1:0;

@@ -84,7 +84,7 @@ webidb_async *webidb_async_create(void) {
     return db;
 }
 uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request *request) {
-    if(!db||db->failed||!request||request->operation<WEB_IDB_BEGIN||request->operation>WEB_IDB_VALUES)return 0;
+    if(!db||db->failed||!request||request->operation<WEB_IDB_BEGIN||request->operation>WEB_IDB_FIRED)return 0;
     size_t origin_length=request->origin?strlen(request->origin):0;
     size_t name_length=request->name?request->name_length:0;
     size_t value_length=request->operation==WEB_IDB_VALUE?64:request->length;

@@ -190,7 +190,9 @@ bool web_sandbox_document_allowed(struct web_frame *f,const char *url,bool inher
     }
     free(origin);return allowed;
 }
-static bool sandbox_active_document(web_doc *d) {
+/* HTML "fully active": d is its navigable's active document, and every container document up to
+   the top is too (a detached or replaced frame's document is not). */
+bool web_doc_fully_active(web_doc *d) {
     if(!d || !d->live || d->inert)return false;
     for(web_doc *p=d;p && p->frame_parent;p=p->frame_parent) {
         struct web_frame *f=web_frame_find(p->frame_parent,p->frame_element);
@@ -199,11 +201,11 @@ static bool sandbox_active_document(web_doc *d) {
     return true;
 }
 bool web_sandbox_forms_allowed(web_doc *d) {
-    return d && !(d->sandbox_flags&SB_FORMS) && (!d->sandbox_flags || sandbox_active_document(d));
+    return d && !(d->sandbox_flags&SB_FORMS) && (!d->sandbox_flags || web_doc_fully_active(d));
 }
 bool web_sandbox_form_submission_allowed(web_doc *top,web_node *submitter) {
     web_doc *owner=submitter?submitter->owner:NULL,*root=owner;
-    if(!top || !owner || !sandbox_active_document(owner))return false;
+    if(!top || !owner || !web_doc_fully_active(owner))return false;
     while(root->frame_parent)root=root->frame_parent;
     web_doc *top_root=top;while(top_root->frame_parent)top_root=top_root->frame_parent;
     return root==top_root && web_sandbox_forms_allowed(owner);
@@ -211,12 +213,12 @@ bool web_sandbox_form_submission_allowed(web_doc *top,web_node *submitter) {
 bool web_sandbox_auxiliary_allowed(web_doc *d) {
     /* Opening a sandbox-inheriting window is not implemented: decline it,
        rather than open an unrestricted host window under allow-popups. */
-    return sandbox_active_document(d) && !(d->sandbox_flags&(SB_POPUPS|SB_PROPAGATE|SB_SCRIPTS));
+    return web_doc_fully_active(d) && !(d->sandbox_flags&(SB_POPUPS|SB_PROPAGATE|SB_SCRIPTS));
 }
 bool web_sandbox_navigation_allowed(web_doc *source,web_doc *destination,bool trusted) {
     if(!source || !destination)return false;
     if(!source->sandbox_flags)return true;
-    if(!sandbox_active_document(source) || !sandbox_active_document(destination) ||
+    if(!web_doc_fully_active(source) || !web_doc_fully_active(destination) ||
        (source->sandbox_flags&SB_SCRIPTS))return false;
     for(web_doc *p=destination;p;p=p->frame_parent)if(p==source)return true;
     /* The only supported ancestor escape is explicit top-by-user-activation.

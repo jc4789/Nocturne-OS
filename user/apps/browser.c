@@ -3246,9 +3246,10 @@ static void handle(const struct gui_event *e) {
         }
         break;
     case EV_RESIZE:
+        /* The new viewport size reaches the page at its next rendering update, whose resize
+           steps fire resize at the Window and its VisualViewport (js.c run_resize_steps). */
         tab->need_layout = true;
         flush_dom_layout();
-        dispatch_native("resize", NULL, e, false);
         break;
     default: return;
     }

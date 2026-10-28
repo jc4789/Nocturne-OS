@@ -103,19 +103,22 @@ FT_C := $(addprefix third_party/freetype/src/,base/ftbase.c base/ftinit.c base/f
         truetype/truetype.c cff/cff.c psaux/psaux.c psnames/psnames.c \
         pshinter/pshinter.c sfnt/sfnt.c smooth/smooth.c gzip/ftgzip.c)
 BROTLI_C := $(wildcard third_party/brotli/c/common/*.c third_party/brotli/c/dec/*.c)
-FT_OBJ := $(patsubst %.c,$(BUILD)/font/%.o,$(FT_C) $(BROTLI_C))
+# The encoder is for the Compression Standard's "brotli" (web/js_compression.c).
+BROTLI_ENC_C := $(wildcard third_party/brotli/c/enc/*.c)
+FT_OBJ := $(patsubst %.c,$(BUILD)/font/%.o,$(FT_C) $(BROTLI_C) $(BROTLI_ENC_C))
 FTFLAGS := $(filter-out -W%,$(UCFLAGS)) -w -Iports/freetype -Ithird_party/brotli/c/include \
            -DFT2_BUILD_LIBRARY -DFT_CONFIG_OPTIONS_H='"nocturne-ftoption.h"' \
            -DFT_CONFIG_MODULES_H='"nocturne-ftmodule.h"' -DBROTLI_BUILD_PORTABLE
 $(BUILD)/u/user/libc/third_party_ttf.o: UCFLAGS += $(filter -Iports/freetype -DFT%,$(FTFLAGS))
-# HTTP's br content coding shares the same brotli decoder objects.
+# HTTP's br content coding and the Compression Standard share the same brotli objects.
 $(BUILD)/u/user/libc/third_party_brotli.o: UCFLAGS += -Ithird_party/brotli/c/include
 .PHONY: font-decoders
 font-decoders: $(FT_OBJ) $(BUILD)/u/user/libc/font.o $(BUILD)/u/user/libc/third_party_ttf.o
 FONT_VENDOR_INPUTS := $(wildcard third_party/freetype/src/*/*.c third_party/freetype/src/*/*.h \
     third_party/freetype/src/*/*/*.c third_party/freetype/src/*/*/*.h \
     third_party/freetype/include/freetype/*.h third_party/freetype/include/freetype/*/*.h \
-    third_party/brotli/c/common/*.h third_party/brotli/c/dec/*.h third_party/brotli/c/include/brotli/*.h)
+    third_party/brotli/c/common/*.h third_party/brotli/c/dec/*.h third_party/brotli/c/enc/*.h \
+    third_party/brotli/c/include/brotli/*.h)
 $(BUILD)/font/%.o: %.c ports/freetype/nocturne-ftoption.h ports/freetype/nocturne-ftmodule.h $(FONT_VENDOR_INPUTS)
 	@mkdir -p $(dir $@)
 	@echo "  FONT $<"
@@ -229,6 +232,10 @@ $(BUILD)/u/%.o: %.c
 user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
+# The Web IDL table the binding layer shapes interfaces by, from the specifications' IDL.
+user/libc/web/webidl_data.inc: scripts/build_webidl.py third_party/webref/upstream.json $(wildcard third_party/webref/idl/*.idl)
+	@$(PY) scripts/build_webidl.py
+$(BUILD)/u/user/libc/web/js_webidl.o: user/libc/web/webidl_data.inc
 # 原UCD／generator変更時に表を正規再生成。guest内linkは保全された表を使う。
 user/libc/web/unicode_grapheme_data.h: scripts/unicode_grapheme.py scripts/ucd.py third_party/unicode/18.0.0/GraphemeBreakProperty.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt third_party/unicode/18.0.0/emoji-data.txt
 	@$(PY) scripts/unicode_grapheme.py
@@ -239,7 +246,7 @@ $(BUILD)/u/user/libc/wctype.o: user/libc/wctype_data.h
 third_party/lexbor/source/lexbor/unicode/idna_validity_res.h: scripts/unicode_idna.py scripts/ucd.py third_party/unicode/18.0.0/UnicodeData.txt
 	@$(PY) scripts/unicode_idna.py
 $(BUILD)/lexbor/third_party/lexbor/source/lexbor/unicode/idna.o: third_party/lexbor/source/lexbor/unicode/idna_validity_res.h
-user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_console.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_atob.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_console.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_atob.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_custom_event.js user/libc/web/js_geometry.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_indexeddb.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h
 $(BUILD)/u/user/libc/web/js_worker.o: user/libc/web/js_worker.h user/include/js_worker_wire.h user/libc/web/js_worker_port_lifetime.h

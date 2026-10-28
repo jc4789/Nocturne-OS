@@ -113,3 +113,20 @@ RegExpから作成realmへの所有参照には既存の `JS_DupContext`/`JS_Fre
 返す。`JS_DescribeFunction` はその名前、定義された script、始まる行と桁を返し、
 JavaScript を一切走らせない。桁は、一行に詰めた（minify した）script の関数を
 見分けるため。解釈器の動きは変えない。
+
+## Array.fromAsync
+
+上流（2026-06-04 とその後の 2026-09 の commit）に無い ECMA-262 の
+`Array.fromAsync` を足した。仕様はこれを AsyncFunctionStart で始める抽象の閉包と
+して書くので、閉包の捕まえる値と変数を `JS_CLASS_ARRAY_FROM_ASYNC` の状態の object
+（`JSArrayFromAsyncData`）に持ち、各 Await を async 関数の await と同じく
+`PromiseResolve(%Promise%)` と `perform_promise_then` の二つの再開の関数で行う。
+非同期の反復子、同期の反復子（上流の `JS_CreateAsyncFromSyncIterator`）、
+配列もどきの三つの道、写像の関数の結果の Await、写像・定義の失敗での
+AsyncIteratorClose（`return()` の結果を待ってから元の例外で拒否）を仕様の順に通す。
+JS で書いた組み込み（quickjs-ng の方式）にしないのは、その toString・stack と、
+`return()` を正常な終わりでも呼ぶ差を持ち込まないため。
+
+確かめ方は `python -X utf8 tests/check_test262.py built-ins/Array/fromAsync`
+（WPT の同梱の test262 を host の同じ QuickJS で走らせる）。class の番号は
+`JS_CLASS_ASYNC_FROM_SYNC_ITERATOR` の次に一つ増えた。

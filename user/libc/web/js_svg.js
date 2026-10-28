@@ -5,7 +5,35 @@ const svgBridge = (() => {
     const StringImpl=String, TypeErrorImpl=TypeError, create=Object.create, define=Object.defineProperty;
     const get=WeakMap.prototype.get, set=WeakMap.prototype.set, call=Reflect.apply;
     const nativeGeometry=host.svgGeometry,finite=Number.isFinite,hypot=Math.hypot;
-    const {DOMPoint,DOMMatrix,identity,affine,multiply,matrix,numbers,svgTransform}=geometryBridge;
+    const {DOMPoint,DOMMatrix,identity,affine,multiply,matrix2D:matrix}=geometryBridge;
+    const pi=Math.PI;
+    /* SVG 1.1 number lists (viewBox, transform arguments): comma or white space separated. */
+    function numbers(text){
+        const out=[];let rest=text.trim(),need=false;
+        while(rest){const m=/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/.exec(rest);if(!m)return null;
+            const n=+m[0];if(!finite(n))return null;out.push(n);rest=rest.slice(m[0].length);need=false;
+            const ws=/^[\t\n\r ]+/.exec(rest);if(ws)rest=rest.slice(ws[0].length);
+            if(rest[0]===','){rest=rest.slice(1).trim();need=true;}
+            else if(rest&&!ws&&rest[0]!=='+'&&rest[0]!=='-')return null;
+        }return need?null:out;
+    }
+    function rotation(angle){const r=angle*pi/180,c=Math.cos(r),s=Math.sin(r);return affine(c,s,-s,c);}
+    /* The SVG transform attribute's grammar (not CSS <transform-list>): a 2D matrix or null. */
+    function svgTransform(text){
+        let out=identity(),rest=(text||'').trim();
+        while(rest){const match=/^([a-zA-Z]+)\s*\(([^)]*)\)/.exec(rest);if(!match)return null;
+            const v=numbers(match[2]);if(!v)return null;let m;
+            switch(match[1]){
+                case 'matrix':if(v.length===6)m=affine(...v);break;
+                case 'translate':if(v.length===1||v.length===2)m=affine(1,0,0,1,v[0],v[1]||0);break;
+                case 'scale':if(v.length===1||v.length===2)m=affine(v[0],0,0,v.length===2?v[1]:v[0]);break;
+                case 'rotate':if(v.length===1)m=rotation(v[0]);else if(v.length===3)m=multiply(multiply(affine(1,0,0,1,v[1],v[2]),rotation(v[0])),affine(1,0,0,1,-v[1],-v[2]));break;
+                case 'skewX':if(v.length===1)m=affine(1,0,Math.tan(v[0]*pi/180),1);break;
+                case 'skewY':if(v.length===1)m=affine(1,Math.tan(v[0]*pi/180),0,1);break;
+            }
+            if(!m)return null;out=multiply(out,m);rest=rest.slice(match[0].length).trim();if(rest[0]===',')rest=rest.slice(1).trim();
+        }return out;
+    }
     function geometry(node,mode){return nativeGeometry(node,mode);}
     function string(value) {
         if(typeof value==='symbol')throw new TypeErrorImpl('Cannot convert Symbol to DOMString');

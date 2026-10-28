@@ -10,14 +10,17 @@
 #include "../libc/web/js_encoding.h"
 #include "../libc/web/js_url.h"
 #include "../libc/web/js_crypto.h"
+#include "../libc/web/js_compression.h"
 #include "../libc/web/js_wasm.h"
 #include "../libc/web/js_webgl.h"
 #include "../libc/web/js_atomics.h"
 #include "../libc/web/js_memory.h"
 #include "../libc/web/js_opfs.h"
+#include "../libc/web/js_indexeddb.h"
 #include "../libc/web/js_worker_transfer.h"
 #include "../libc/web/js_worker_port_lifetime.h"
 #include "../libc/web/js_worker_runtime.inc"
+#include "../libc/web/js_webidl.h"
 #include "../libc/web/js_navigator_native.h"
 #include "../libc/web/html_policy.h"
 #include "../libc/web/js_html_safety_native.h"
@@ -33,7 +36,7 @@ struct pending_load {struct pending_load*next;uint32_t id;struct client*client;}
 struct deferred {struct deferred *next;struct njw_header h;uint8_t *data;struct client*client;struct web_inbox inbox;bool normalized;};
 struct outgoing {struct outgoing *next;struct njw_header h;uint8_t *data;struct client*client;struct web_attachments attach;size_t attach_sent;};
 struct policy_violation {struct policy_violation *next;JSValue init;struct web_html_policy_rule *rule;};
-struct worker {JSRuntime *rt;JSContext *ctx;JSValue hooks;uint32_t generation,request,interrupt_ticks,next_shared_port;uint64_t until;bool closed,established,output_failed,policy_initialized,shared,had_client,need_start;struct deferred *head,*tail,*before_start,*before_start_tail;struct outgoing *output,*last_output;size_t queued,output_bytes,in_flight;uint32_t next_lease;struct broker_lease *leases;struct broker_pair *ports;struct client*clients,*current_client,*network_client;struct pending_load*loads;n_handle queue,probe;struct web_inbox inbox;uint64_t next_client;uint32_t input_watched;const char*script_url;char*security_url;web_doc policy_doc;struct policy_violation *violations,*last_violation;int policy_status;uint64_t languages_seen;};
+struct worker {JSRuntime *rt;JSContext *ctx;JSValue hooks;uint32_t generation,request,interrupt_ticks,next_shared_port;uint64_t until;bool closed,established,output_failed,policy_initialized,shared,had_client,need_start;struct deferred *head,*tail,*before_start,*before_start_tail;struct outgoing *output,*last_output;size_t queued,output_bytes,in_flight;uint32_t next_lease;struct broker_lease *leases;struct broker_pair *ports;struct client*clients,*current_client,*network_client;struct pending_load*loads;n_handle queue,probe;struct web_inbox inbox;uint64_t next_client;uint32_t input_watched;const char*script_url;char*security_url;web_doc policy_doc;struct policy_violation *violations,*last_violation;int policy_status;uint64_t languages_seen;struct web_idb indexed_db;bool indexed_db_turn;};
 struct output_publication {struct worker *worker;struct outgoing *packet;struct broker_pair *ports,*close_pair,*ack_pair;};
 static void output_link(void *opaque,void *packet){struct worker*w=opaque;struct outgoing*p=packet;size_t charge=sizeof p->h+p->h.bytes;if(p->client)p->client->in_flight+=charge;else w->in_flight+=charge;if(w->last_output)w->last_output->next=p;else w->output=p;w->last_output=p;}
 static void output_packet_free(struct worker*w,void *opaque){struct outgoing*p=opaque;if(p){if(p->client)p->client->references--;web_attachments_release(&p->attach);js_free(w->ctx,p->data);free(p);}}
@@ -266,6 +269,29 @@ static bool output_wait(struct worker*w,struct client*client,size_t next){
 static struct worker *state(JSContext *ctx){return JS_GetContextOpaque(ctx);}
 /* OPFS storage key: a blob Worker's creator snapshot, else its policy URL. */
 static const char *opfs_storage_url(JSContext *ctx){struct worker*w=state(ctx);return w&&w->policy_initialized?(w->security_url?w->security_url:w->policy_doc.url):NULL;}
+/* IndexedDB (js_indexeddb.c): the Window's storage owner, reached from this realm the same way.
+   Its storage key is made from the same URL as OPFS's, by the Window's algorithm (js_url.js's
+   storageOrigin, called directly: hook() would cancel the running task's port captures). */
+static struct web_idb *worker_idb_state(JSContext *ctx){struct worker*w=state(ctx);return w?&w->indexed_db:NULL;}
+static JSValue worker_idb_authority(JSContext *ctx){
+    struct worker*w=state(ctx);
+    if(!w||!w->policy_initialized)return JS_ThrowTypeError(ctx,"IndexedDB before the Worker started");
+    if(w->closed)return JS_ThrowTypeError(ctx,"Worker closed");
+    return JS_UNDEFINED;
+}
+static const char *worker_idb_origin(JSContext *ctx){
+    struct worker*w=state(ctx);const char *url=opfs_storage_url(ctx);
+    if(!url||!JS_IsObject(w->hooks))return NULL;
+    JSValue fn=JS_GetPropertyStr(ctx,w->hooks,"storageOrigin");
+    if(JS_IsException(fn))return NULL;
+    if(!JS_IsFunction(ctx,fn)){JS_FreeValue(ctx,fn);JS_ThrowInternalError(ctx,"Missing private origin parser");return NULL;}
+    JSValue address=JS_NewString(ctx,url);
+    JSValue value=JS_IsException(address)?JS_EXCEPTION:JS_Call(ctx,fn,w->hooks,1,&address);
+    JS_FreeValue(ctx,fn);JS_FreeValue(ctx,address);
+    const char *origin=JS_IsException(value)||JS_IsNull(value)?NULL:JS_ToCString(ctx,value);
+    JS_FreeValue(ctx,value);return origin;
+}
+static const struct web_idb_realm worker_idb_realm={worker_idb_state,worker_idb_authority,worker_idb_origin};
 /* The child has no DOM, but owns the same native CSP rules as a document.
  * Neither writable Worker globals nor an author-supplied JS dictionary is
  * consulted for policy authority. These plain objects are private snapshots. */
@@ -446,6 +472,9 @@ static JSValue native_send(JSContext *ctx,JSValueConst thisv,int argc,JSValueCon
 static JSValue native_class(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;return JS_NewUint32(ctx,argc?JS_GetClassID(argv[0]):0);}
 static JSValue native_detach(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;if(argc&&!JS_IsArrayBufferTransferable(ctx,argv[0]))return JS_ThrowTypeError(ctx,"ArrayBuffer cannot be transferred");if(argc)JS_DetachArrayBuffer(ctx,argv[0]);return JS_UNDEFINED;}
 static JSValue native_buffer_transferable(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;return JS_NewBool(ctx,argc&&JS_IsArrayBufferTransferable(ctx,argv[0]));}
+/* The private structured-clone graph IndexedDB stores (as js.c's pack and unpack). */
+static JSValue native_pack(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;size_t size=0;uint8_t *data=JS_WriteObject(ctx,&size,argc?argv[0]:JS_UNDEFINED,JS_WRITE_OBJ_REFERENCE);if(!data)return JS_EXCEPTION;JSValue out=JS_NewArrayBufferCopy(ctx,data,size);js_free(ctx,data);return out;}
+static JSValue native_unpack(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;size_t size=0;uint8_t *data=argc?JS_GetArrayBuffer(ctx,&size,argv[0]):NULL;if(!data)return JS_EXCEPTION;return JS_ReadObject(ctx,data,size,JS_READ_OBJ_REFERENCE);}
 static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)n_clock_uptime_ms());}
 /* Web IDL promise reactions: no page Promise constructor or @@species lookup. */
 static JSValue native_promise_then(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
@@ -525,6 +554,8 @@ static int interrupt(JSRuntime *rt,void *opaque){
      * clock syscall, not cancellation: process kill and closed remain live.
      * Import waits are charged separately and preserve the same deadline. */
     if(++w->interrupt_ticks&15u)return 0;
+    /* The storage broker's transport moves on during a long author task (native I/O only). */
+    web_idb_pump(&w->indexed_db);
     if(w->shared&&shared_without_owners(w)){w->closed=true;return 1;}
     if(w->until==UINT64_MAX)return 0;
     return n_clock_uptime_ms()>=w->until;
@@ -580,6 +611,10 @@ static void jobs(struct worker *w){
         rejection_free(w->ctx,r);
     }
     web_js_wasm_collect(w->ctx);
+    /* IndexedDB's active period is the task and its microtasks, never the next task. */
+    if(!w->closed&&!JS_IsJobPending(w->rt)&&web_idb_used(&w->indexed_db)&&JS_IsObject(w->hooks)){
+        JSValue r=hook(w,"indexedDBTaskEnd",0,NULL);if(JS_IsException(r))exception(w);JS_FreeValue(w->ctx,r);
+    }
 }
 static void policy_task(struct worker *w){
     struct policy_violation *v=w->violations;w->violations=v->next;if(!w->violations)w->last_violation=NULL;
@@ -617,12 +652,12 @@ int main(int argc,char**argv){
     const JSCFunctionListEntry funcs[]={JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),
         JS_CFUNC_DEF("safetyRequired",1,native_safety_required),JS_CFUNC_DEF("send",3,native_send),JS_CFUNC_DEF("classID",1,native_class),
         JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),
-        JS_CFUNC_DEF("bufferTransferable",1,native_buffer_transferable),
+        JS_CFUNC_DEF("bufferTransferable",1,native_buffer_transferable),JS_CFUNC_DEF("pack",1,native_pack),JS_CFUNC_DEF("unpack",1,native_unpack),
         JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("promiseThen",3,native_promise_then),JS_CFUNC_DEF("promiseIsHandled",1,native_promise_is_handled),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),JS_CFUNC_DEF("referrerPolicy",0,native_referrer_policy),
         JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",6,native_request),JS_CFUNC_DEF("dataURL",1,native_data_url),JS_CFUNC_DEF("cancel",1,native_cancel),
         JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};
     JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);
-    web_js_encoding_init_isolated(w.ctx,host);web_js_url_init(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_crypto_init(w.ctx,host);web_atomics_host_init(w.ctx,host);web_opfs_host_init(w.ctx,host,opfs_storage_url);web_js_wasm_host_init(w.ctx,host);web_js_webgl_init(w.ctx,host,NULL);
+    web_js_encoding_init_isolated(w.ctx,host);web_js_url_init(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_webidl_init(w.ctx,host);web_js_crypto_init(w.ctx,host);web_js_compression_init(w.ctx,host);web_atomics_host_init(w.ctx,host);web_opfs_host_init(w.ctx,host,opfs_storage_url);web_idb_host_init(w.ctx,host,&worker_idb_realm);web_js_wasm_host_init(w.ctx,host);web_js_webgl_init(w.ctx,host,NULL);
     JS_SetPropertyStr(w.ctx,global,"__workerHost",host);JS_FreeValue(w.ctx,global);
     /* Worker platform interfaces are built-ins too: no implementation source. */
     {JSRuntime *rt=JS_GetRuntime(w.ctx);int strip=JS_GetStripInfo(rt);JS_SetStripInfo(rt,strip|JS_STRIP_SOURCE);
@@ -641,6 +676,8 @@ int main(int argc,char**argv){
         struct deferred *d=NULL;if(w.head){d=w.head;w.head=d->next;if(!w.head)w.tail=NULL;w.queued-=d->h.bytes;}
         else{
             w.until=UINT64_MAX;JSValue deadline=hook(&w,"deadline",0,NULL);int64_t due=-1;JS_ToInt64(w.ctx,&due,deadline);JS_FreeValue(w.ctx,deadline);uint64_t now=n_clock_uptime_ms();int64_t atomics_due=web_atomics_deadline(w.ctx,now);if(atomics_due>=0&&(due<0||atomics_due<due))due=atomics_due;int wait=JS_IsJobPending(w.rt)?0:due<0?-1:due<=(int64_t)now?0:due-(int64_t)now>INT_MAX?INT_MAX:(int)(due-(int64_t)now);
+            /* The storage broker is not in this queue: while it has requests, look again soon. */
+            if(web_idb_next(&w.indexed_db))wait=0;else if(web_idb_waiting(&w.indexed_db)&&(wait<0||wait>8))wait=8;
             if(w.shared){d=shared_receive(&w,wait);if(w.closed&&!d)continue;}
             else{if(!dedicated_wait(&w,wait))break;if(w.output)output_flush(&w);if(w.output_failed)break;bool failed=false;d=receive(&w,&failed);if(failed)break;}
         }
@@ -657,6 +694,10 @@ int main(int argc,char**argv){
         /* HTML NavigatorLanguage: a new set of the user's languages is one task (this worker's
            event loop) that switches navigator.languages and fires languagechange at the global. */
         if(w.languages_seen!=webprefs_languages_generation()){w.languages_seen=webprefs_languages_generation();w.until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue r=hook(&w,"languageChange",0,NULL);if(JS_IsException(r))exception(&w);JS_FreeValue(w.ctx,r);jobs(&w);continue;}
+        /* An IndexedDB completion is a task of its own (its request's promise settles, then its
+           microtasks run); it takes turns with the timer and port tasks below. */
+        if(w.indexed_db_turn&&web_idb_next(&w.indexed_db)){w.indexed_db_turn=false;w.until=n_clock_uptime_ms()+NJW_TASK_MS;web_idb_complete(w.ctx,&w.indexed_db);if(JS_HasException(w.ctx))exception(&w);jobs(&w);continue;}
+        w.indexed_db_turn=true;
         JSValue now=JS_NewFloat64(w.ctx,(double)n_clock_uptime_ms());JSValue tick=hook(&w,"tick",1,&now);if(JS_IsException(tick))exception(&w);JS_FreeValue(w.ctx,tick);JS_FreeValue(w.ctx,now);jobs(&w);
     }
 shutdown:
@@ -664,5 +705,5 @@ shutdown:
     html_policy_free(&w.policy_doc);free(w.policy_doc.url);free(w.security_url);
     while(w.output){struct outgoing*p=w.output;w.output=p->next;output_packet_free(&w,p);}
     web_js_wasm_cancel(w.ctx);
-    while(w.head){struct deferred*d=w.head;w.head=d->next;deferred_free(d);}while(w.before_start){struct deferred*d=w.before_start;w.before_start=d->next;deferred_free(d);}output_ports_free(&w,w.ports);while(w.leases){struct broker_lease*l=w.leases;w.leases=l->next;free(l);}while(w.loads){struct pending_load*p=w.loads;w.loads=p->next;if(p->client)p->client->references--;free(p);}while(w.clients){struct client*c=w.clients;w.clients=c->next;if(c->active)n_handle_close(c->channel);web_inbox_close(&c->inbox);free(c);}web_inbox_close(&w.inbox);if(w.probe>=0)n_handle_close(w.probe);while(rejections){struct rejection*r=rejections;rejections=r->next;rejection_free(w.ctx,r);}JS_FreeValue(w.ctx,w.hooks);web_atomics_release(w.ctx);web_opfs_release(w.ctx);JS_FreeContext(w.ctx);JS_FreeRuntime(w.rt);return 0;
+    while(w.head){struct deferred*d=w.head;w.head=d->next;deferred_free(d);}while(w.before_start){struct deferred*d=w.before_start;w.before_start=d->next;deferred_free(d);}output_ports_free(&w,w.ports);while(w.leases){struct broker_lease*l=w.leases;w.leases=l->next;free(l);}while(w.loads){struct pending_load*p=w.loads;w.loads=p->next;if(p->client)p->client->references--;free(p);}while(w.clients){struct client*c=w.clients;w.clients=c->next;if(c->active)n_handle_close(c->channel);web_inbox_close(&c->inbox);free(c);}web_inbox_close(&w.inbox);if(w.probe>=0)n_handle_close(w.probe);while(rejections){struct rejection*r=rejections;rejections=r->next;rejection_free(w.ctx,r);}JS_FreeValue(w.ctx,w.hooks);web_idb_release(w.ctx,&w.indexed_db);web_atomics_release(w.ctx);web_opfs_release(w.ctx);JS_FreeContext(w.ctx);JS_FreeRuntime(w.rt);return 0;
 }

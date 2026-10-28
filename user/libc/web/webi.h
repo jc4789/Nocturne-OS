@@ -440,7 +440,7 @@ enum { TB_VIEW_BOX, TB_FILL_BOX, TB_STROKE_BOX, TB_CONTENT_BOX, TB_BORDER_BOX };
 struct css_transform {
     struct css_transform *next;
     len_t xy[2];  /* CT_TRANSLATE x/y; its z length is v[0] */
-    float v[4];   /* SCALE x,y,z; ROTATE axis x,y,z + radians; SKEW x,y radians; PERSPECTIVE length */
+    float v[4];   /* SCALE x,y,z; ROTATE axis x,y,z + radians; SKEW x,y radians; PERSPECTIVE length (v[1] 1: none) */
     float m[16];  /* CT_MATRIX, row-major 4x4 */
     uint8_t kind;
 };
@@ -648,6 +648,7 @@ struct cx {
     unsigned supports_nodes; /* bound arithmetic AST traversal, not just parentheses */
     float cq_width, cq_height;
     bool cq_width_set, cq_height_set;
+    bool absolute_lengths; /* relative lengths and percentages fail (Geometry's matrix strings) */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -887,6 +888,11 @@ bool box_transform_matrix(const box_t *b,double m[6]);
    w x h whose top-left corner is at (x,y); false if none or not finite. */
 bool css_style_transform_matrix(const style_t *s,double x,double y,float w,float h,double m[6]);
 void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]);
+/* The same list as a full 4x4 with perspective and no box (Geometry Interfaces); row-major. */
+void css_transform_list_matrix_3d(const struct css_transform *t,double m[16]);
+/* Geometry's "parse a string into an abstract matrix": column-major m, *two_d false when a
+   3D transform function is in the list. False when the string is no valid list. */
+bool css_transform_string_matrix(const char *s,size_t n,double m[16],bool *two_d);
 /* Maps a document rectangle (x,y,w,h) through b's and its ancestors' used
    transforms and returns its bounding box. */
 void box_transform_rect(const box_t *b,double rect[4]);

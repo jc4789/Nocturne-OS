@@ -74,7 +74,24 @@ const indexedDBBridge=(()=>{
         static bound(a,b,ao=false,bo=false){a=key(a);b=key(b);const c=compare(a,b);if(c>0||!c&&(ao||bo))fail('DataError');return new IDBKeyRange(token,{lower:a,upper:b,lowerOpen:!!ao,upperOpen:!!bo});}
     }
     function matches(k,r){if(!r)return true;return (r.lower===undefined||compare(k,r.lower)>(r.lowerOpen?0:-1))&&(r.upper===undefined||compare(k,r.upper)<(r.upperOpen?0:1));}
-    function range(v,optional=false){if(v==null&&optional)return null;if(v instanceof IDBKeyRange)return get(v,'IDBKeyRange');const k=key(v);return {lower:k,upper:k,lowerOpen:false,upperOpen:false};}
+    const isRange=v=>records.get(v)?.kind==='IDBKeyRange';
+    function range(v,optional=false){if(v==null&&optional)return null;if(isRange(v))return get(v,'IDBKeyRange');const k=key(v);return {lower:k,upper:k,lowerOpen:false,upperOpen:false};}
+    /* "is a potentially valid key range": a key range, or a value whose conversion to a key is
+       not "invalid type" (it may still be an invalid value, a DataError when converted). */
+    const potentialRange=v=>isRange(v)||typeof v==='number'||typeof v==='string'||v instanceof Date||v instanceof ArrayBuffer||ArrayBuffer.isView(v)||Array.isArray(v);
+    /* WebIDL [EnforceRange] unsigned long. */
+    function enforceCount(v){v=Number(v);if(!Number.isFinite(v))throw new TypeError('Count is not a finite number');v=Math.trunc(v);if(v<0||v>4294967295)throw new TypeError('Count is outside the unsigned long range');return v===0?0:v;}
+    const directions=['next','nextunique','prev','prevunique'];
+    function direction(v){v=strings(v);if(!directions.includes(v))throw new TypeError('Invalid cursor direction');return v;}
+    /* The IDBGetAllOptions dictionary: its members in order (count, direction, query). */
+    function getAllOptions(v){
+        if(v!==undefined&&v!==null&&typeof v!=='object'&&typeof v!=='function')throw new TypeError('IDBGetAllOptions must be an object');
+        if(v==null)return {count:undefined,direction:'next',query:null};
+        const count=v.count,c=count===undefined?undefined:enforceCount(count);
+        const d=v.direction,dir=d===undefined?'next':direction(d);
+        const query=v.query;
+        return {count:c,direction:dir,query:query===undefined?null:query};
+    }
     class IDBRequest extends EventTarget {
         constructor(t,source=null,transaction=null){if(t!==token)throw new TypeError('Illegal IDBRequest constructor');super();records.set(this,{kind:'IDBRequest',source,transaction,done:false,result:undefined,error:null});}
         get result(){const r=get(this,'IDBRequest');if(!r.done)fail('InvalidStateError');return r.result;}
@@ -120,12 +137,29 @@ const indexedDBBridge=(()=>{
                     active=true;
                     const connection=r.connection,a=await native('poll',connection);
                     if(retired)return;
-                    if(r.connection===connection&&a[0]===0&&a[1]!==null)
-                        versionEvent(db,'versionchange',r.version,a[1]===0?null:a[1]);
+                    if(r.connection===connection&&a[0]===0&&a[2]===true)forceClose(db);
+                    else if(r.connection===connection&&a[0]===0&&a[1]!==null){
+                        /* A connection whose close is pending gets no versionchange. Either way
+                           the opener learns it has been fired, after this task (a close its
+                           handler began goes to the broker first), and only then may fire
+                           blocked at its request. */
+                        if(!r.closed)versionEvent(db,'versionchange',r.version,a[1]===0?null:a[1]);
+                        const fired=async()=>{if(retired||r.connection!==connection)return;try{if(await native('fired',connection)===1)later(fired,5);}catch(_){}};
+                        later(fired,0);
+                    }
                 }
             }catch(_){/* Broker failure is also delivered to its pending requests. */}
             finally{watching=false;if(active&&!retired)watch();}
         },100);
+    }
+    /* "Close a database connection" with forced (its database was cleared): close pending, its
+       transactions abort with AbortError, and once they are done close fires at it. */
+    function forceClose(db){
+        const r=get(db,'IDBDatabase');if(r.forced)return;
+        r.forced=r.closed=true;
+        for(const tx of [...r.transactions])abort(tx,new DOMException('The database connection was closed','AbortError'));
+        closing(db);
+        later(()=>{const e=new Event('close');eventState(e).isTrusted=true;dispatch(db,e);},0);
     }
     function discard(nativeToken){
         if(nativeToken)try{Promise.resolve(native('abort',nativeToken)).catch(()=>{});}catch(_){}
@@ -238,21 +272,49 @@ const indexedDBBridge=(()=>{
             const indexes=[];for(const index of st.indexes){const keys=indexKeys(index,detached);indexes.push([index.name,keys]);if(index.unique)for(const old of st.records){if(!compare(old[0],k))continue;for(const oldKey of old[2]?.find(v=>v[0]===index.name)?.[1]||[])if(keys.some(ik=>!compare(ik,oldKey)))fail('ConstraintError');}}
             const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached,undefined,true)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
     }
-    function query(source,kind,q,count){const s=records.get(source);live(s.tx);const r=range(q,kind!=='get'&&kind!=='getKey');if(count!==undefined){count=Number(count);if(!Number.isInteger(count)||count<0||count>4294967295)throw new TypeError('Invalid count');}
+    function query(source,kind,q){const s=records.get(source);live(s.tx);const r=range(q,kind==='count');
         return enqueue(s.tx,source,async()=>{
-            const list=rows(source,r),n=count===undefined?list.length:Math.min(count,list.length);
+            const list=rows(source,r);
             if(kind==='count')return list.length;
             if(kind==='get')return list.length?value(list[0].record,s.tx):undefined;
-            if(kind==='getKey')return list.length?clone(list[0].primaryKey):undefined;
-            const result=[];
+            return list.length?clone(list[0].primaryKey):undefined;
+        });
+    }
+    /* "Create a request to retrieve multiple items" for getAll (kind 'value'), getAllKeys ('key')
+       and getAllRecords ('record'). getAll and getAllKeys take a potentially valid key range and
+       a count, or else an IDBGetAllOptions (and ignore count); getAllRecords takes the options,
+       converted as its WebIDL argument before the steps. A count of 0 is no limit. */
+    function many(source,kind,queryOrOptions,countArgument){
+        const s=records.get(source);
+        let options=kind==='record'?getAllOptions(queryOrOptions):null;
+        const counted=countArgument===undefined?undefined:enforceCount(countArgument);
+        live(s.tx);
+        let r,count,order='next';
+        /* An absent query (undefined or null) is the unbounded range with the count argument, as
+           before IDBGetAllOptions; only an options dictionary replaces the count. */
+        if(!options&&(queryOrOptions==null||potentialRange(queryOrOptions))){r=range(queryOrOptions,true);count=counted;}
+        else{if(!options)options=getAllOptions(queryOrOptions);r=range(options.query,true);count=options.count;order=options.direction;}
+        return enqueue(s.tx,source,async()=>{
+            let list=rows(source,r);
+            if(order.endsWith('unique'))list=list.filter((v,i)=>!i||compare(v.key,list[i-1].key));
+            if(order.startsWith('prev'))list.reverse();
+            const n=count?Math.min(count,list.length):list.length,result=[];
             for(let i=0;i<n;i++){
-                if(kind!=='getAllKeys'&&i%32===0)
+                if(kind!=='key'&&i%32===0)
                     await prefetch(list.slice(i,Math.min(i+32,n)).map(row=>row.record),s.tx);
                 if(get(s.tx,'IDBTransaction').finished)return;
-                result.push(kind==='getAllKeys'?clone(list[i].primaryKey):await value(list[i].record,s.tx));
+                const row=list[i];
+                result.push(kind==='key'?clone(row.primaryKey):kind==='value'?await value(row.record,s.tx):
+                    new IDBRecord(token,clone(row.key),clone(row.primaryKey),await value(row.record,s.tx)));
             }
             return result;
         });
+    }
+    class IDBRecord {
+        constructor(t,k,primaryKey,v){if(t!==token)throw new TypeError('Illegal IDBRecord constructor');records.set(this,{kind:'IDBRecord',key:k,primaryKey,value:v});}
+        get key(){return clone(get(this,'IDBRecord').key);}
+        get primaryKey(){return clone(get(this,'IDBRecord').primaryKey);}
+        get value(){return get(this,'IDBRecord').value;}
     }
     class IDBObjectStore {
         constructor(t,tx,name){if(t!==token)throw new TypeError('Illegal IDBObjectStore constructor');records.set(this,{kind:'IDBObjectStore',tx,name});}
@@ -266,8 +328,9 @@ const indexedDBBridge=(()=>{
         add(v,k){if(!arguments.length)throw new TypeError('Value required');return write(this,v,k,arguments.length>1,true);}
         get(q){if(!arguments.length)throw new TypeError('Query required');return query(this,'get',q);}
         getKey(q){if(!arguments.length)throw new TypeError('Query required');return query(this,'getKey',q);}
-        getAll(q,c){return query(this,'getAll',q,c);}
-        getAllKeys(q,c){return query(this,'getAllKeys',q,c);}
+        getAll(q,c){return many(this,'value',q,c);}
+        getAllKeys(q,c){return many(this,'key',q,c);}
+        getAllRecords(options){return many(this,'record',options);}
         count(q){return query(this,'count',q);}
         delete(q){const s=get(this,'IDBObjectStore');live(s.tx,true);if(!arguments.length)throw new TypeError('Query required');const r=range(q);return enqueue(s.tx,this,()=>{const st=schema(s);st.records=st.records.filter(record=>!matches(record[0],r));});}
         clear(){const s=get(this,'IDBObjectStore');live(s.tx,true);return enqueue(s.tx,this,()=>{schema(s).records=[];});}
@@ -303,8 +366,9 @@ const indexedDBBridge=(()=>{
         get multiEntry(){const s=get(this,'IDBIndex'),i=schema(s).indexes.find(i=>i.name===s.index);if(!i)fail('InvalidStateError');return i.multiEntry;}
         get(q){if(!arguments.length)throw new TypeError('Query required');return query(this,'get',q);}
         getKey(q){if(!arguments.length)throw new TypeError('Query required');return query(this,'getKey',q);}
-        getAll(q,c){return query(this,'getAll',q,c);}
-        getAllKeys(q,c){return query(this,'getAllKeys',q,c);}
+        getAll(q,c){return many(this,'value',q,c);}
+        getAllKeys(q,c){return many(this,'key',q,c);}
+        getAllRecords(options){return many(this,'record',options);}
         count(q){return query(this,'count',q);}
         openCursor(q,d='next'){return cursor(this,q,d,true);}
         openKeyCursor(q,d='next'){return cursor(this,q,d,false);}
@@ -342,7 +406,7 @@ const indexedDBBridge=(()=>{
         get key(){const r=get(this,'IDBCursor');return r.position?clone(r.position.key):undefined;}
         get primaryKey(){const r=get(this,'IDBCursor');return r.position?clone(r.position.primaryKey):undefined;}
         continue(k){this._continue(k,undefined,1);}
-        advance(n){n=Number(n);if(!Number.isInteger(n)||n<=0||n>4294967295)throw new TypeError('Invalid advance count');this._continue(undefined,undefined,n);}
+        advance(n){if(!arguments.length)throw new TypeError('Count required');n=enforceCount(n);if(n===0)throw new TypeError('Invalid advance count');this._continue(undefined,undefined,n);}
         continuePrimaryKey(k,p){const r=get(this,'IDBCursor');if(records.get(r.source).kind!=='IDBIndex'||r.direction.endsWith('unique'))fail('InvalidAccessError');this._continue(key(k),key(p),1);}
         _continue(k,p,n){const r=get(this,'IDBCursor'),s=records.get(r.source),tx=live(s.tx);if(r.pending||!r.position)fail('InvalidStateError');if(k!==undefined){k=key(k);const c=compare(k,r.position.key)||(p===undefined?0:compare(p,r.position.primaryKey));if(r.direction.startsWith('next')?c<=0:c>=0)fail('DataError');}r.pending=true;get(r.request,'IDBRequest').done=false;tx.queue.push({request:r.request,operation:()=>move(this,k,p,n)});}
         update(v){const r=get(this,'IDBCursor'),s=records.get(r.source);live(s.tx,true);if(r.pending||!r.position||!(this instanceof IDBCursorWithValue))fail('InvalidStateError');const store=s.tx.objectStore(s.name),st=schema(records.get(store));if(st.keyPath!==null){const candidate=key(path(v,st.keyPath));if(compare(candidate,r.position.primaryKey))fail('DataError');return store.put(v);}return store.put(v,r.position.primaryKey);}
@@ -366,8 +430,11 @@ const indexedDBBridge=(()=>{
         async function attempt(){let a;try{a=await native('begin',name);if(retired){if(a[0]===0)discard(a[1]);return;}if(a[0]===1){later(attempt,5);return;}status(a[0]);const data=a[2]===null?{version:0,stores:[]}:unpack(a[2]),wanted=deleting?0:version===undefined?data.version||1:version;
                 if(!deleting&&wanted<data.version){await native('abort',a[1]);finish(request,undefined,new DOMException('Requested version is older','VersionError'));return;}
                 const list=connections.get(name)||[];
-                if(deleting||wanted>data.version){const active=await native('connections',a[1],deleting?0:wanted);if(active[0]===1){await native('abort',a[1]);later(attempt,5);return;}status(active[0]);if(active[1]){await native('abort',a[1]);if(!blocked){blocked=true;versionEvent(request,'blocked',data.version,deleting?null:wanted);}later(attempt,50);return;}}
-                if(deleting){status(await native('commit',a[1],pack({version:0,stores:[]}),[],0));finish(request,undefined);return;}
+                /* versionchange goes to every other open connection (each realm's poll fires it);
+                   blocked waits until all of them were fired, then fires once if any is still
+                   open; the open goes on when none is. active: [status, open, not yet fired]. */
+                if(deleting||wanted>data.version){const active=await native('connections',a[1],deleting?0:wanted);if(active[0]===1){await native('abort',a[1]);later(attempt,5);return;}status(active[0]);if(active[1]){await native('abort',a[1]);if(!blocked&&!active[2]){blocked=true;versionEvent(request,'blocked',data.version,deleting?null:wanted);}later(attempt,50);return;}}
+                if(deleting){status(await native('commit',a[1],pack({version:0,stores:[]}),[],0));const rr=get(request,'IDBRequest');rr.done=true;rr.result=undefined;rr.error=null;versionEvent(request,'success',data.version,null);return;}
                 let connection=0;if(wanted===data.version){const c=await native('connect',a[1],wanted);if(c[0]===1){await native('abort',a[1]);later(attempt,5);return;}status(c[0]);connection=c[1];}const db=new IDBDatabase(token,name,data);get(db,'IDBDatabase').connection=connection;list.push(db);connections.set(name,list);watch();
                 if(wanted>data.version){const tx=new IDBTransaction(token,db,data.stores.map(s=>s.name),'versionchange'),r=get(tx,'IDBTransaction');r.nativeToken=a[1];r.data=data;r.oldVersion=data.version;r.upgradeVersion=wanted;r.openRequest=request;get(db,'IDBDatabase').upgrade=tx;r.data.version=wanted;activate(tx);const rr=get(request,'IDBRequest');rr.result=db;rr.done=true;rr.transaction=tx;const e=versionEvent(request,'upgradeneeded',r.oldVersion,wanted);if(eventState(e).listenerException)abort(tx,new DOMException('Upgrade listener threw','AbortError'));}
                 else {status(await native('abort',a[1]));finish(request,db);}
@@ -377,8 +444,19 @@ const indexedDBBridge=(()=>{
     class IDBFactory {constructor(t){if(t!==token)throw new TypeError('Illegal IDBFactory constructor');}open(name,version){if(!arguments.length)throw new TypeError('Database name required');return open(name,version);}deleteDatabase(name){if(!arguments.length)throw new TypeError('Database name required');return open(name,undefined,true);}cmp(a,b){if(arguments.length<2)throw new TypeError('Two keys required');return compare(key(a),key(b));}databases(){return new Promise((resolve,reject)=>{async function attempt(){try{const a=await native('databases');if(a[0]===1){later(attempt,5);return;}status(a[0]);resolve(a[1]);}catch(e){reject(e);}}later(attempt,0);});}}
     indexedDBHandlerTarget=(v,type)=>{const r=records.get(v);return !!r&&(r.kind==='IDBRequest'&&(['success','error'].includes(type)||v instanceof IDBOpenDBRequest&&['blocked','upgradeneeded'].includes(type))||r.kind==='IDBDatabase'&&['abort','error','versionchange','close'].includes(type)||r.kind==='IDBTransaction'&&['abort','complete','error'].includes(type));};
     for(const [ctor,events]of [[IDBRequest,['success','error']],[IDBOpenDBRequest,['blocked','upgradeneeded']],[IDBDatabase,['abort','error','versionchange','close']],[IDBTransaction,['abort','complete','error']]])installHandlers(ctor.prototype,events);
-    for(const ctor of [IDBFactory,IDBRequest,IDBOpenDBRequest,IDBDatabase,IDBTransaction,IDBObjectStore,IDBIndex,IDBCursor,IDBCursorWithValue,IDBKeyRange,IDBVersionChangeEvent]){Object.defineProperty(ctor.prototype,Symbol.toStringTag,{value:ctor.name,configurable:true});Object.defineProperty(globalThis,ctor.name,{value:ctor,writable:true,configurable:true});}
-    Object.defineProperty(globalThis,'indexedDB',{value:new IDBFactory(token),configurable:true,enumerable:true});
+    /* WebIDL: the members of an interface (and its static operations) are enumerable. */
+    for(const ctor of [IDBFactory,IDBRequest,IDBOpenDBRequest,IDBDatabase,IDBTransaction,IDBObjectStore,IDBIndex,IDBCursor,IDBCursorWithValue,IDBKeyRange,IDBVersionChangeEvent,IDBRecord]){
+        for(const holder of [ctor.prototype,ctor])for(const name of Object.getOwnPropertyNames(holder)){
+            if(name==='constructor'||name==='prototype'||name==='length'||name==='name'||name.startsWith('_'))continue;
+            Object.defineProperty(holder,name,{enumerable:true});
+        }
+        Object.defineProperty(ctor.prototype,Symbol.toStringTag,{value:ctor.name,configurable:true});Object.defineProperty(globalThis,ctor.name,{value:ctor,writable:true,configurable:true});
+    }
+    /* WindowOrWorkerGlobalScope's indexedDB: a read-only attribute of the global, an accessor
+       whose getter (named "get indexedDB") answers the realm's one IDBFactory. */
+    const factory=new IDBFactory(token),globalScope=globalThis;
+    Object.defineProperty(globalThis,'indexedDB',{configurable:true,enumerable:true,
+        get:Object.getOwnPropertyDescriptor({get indexedDB(){if(this!=null&&this!==globalScope)throw new TypeError('Illegal invocation');return factory;}},'indexedDB').get});
     cloneData.registerUncloneable(v=>records.has(v),'IndexedDB object');
     return {taskEnd,retire(){retired=true;for(const list of connections.values())for(const db of list){const r=get(db,'IDBDatabase');r.closed=true;for(const tx of r.transactions)abort(tx);closing(db);}connections.clear();invoke(setClear,activeTasks,[]);}};
 })();
