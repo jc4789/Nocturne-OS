@@ -300,8 +300,10 @@ bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d); /* fallible co
    the property allows negative values, else a negative one clamps to 0), else LK_EXPR */
 bool css_length_from_calc(const struct css_calc *c, bool negative, len_t *out);
 /* What a value's grammar accepts (cssprop.c): auto, none, normal, negative values, percentages, and
-   LF_LENGTH: unitless numbers other than 0 are not lengths */
-enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
+   LF_LENGTH: unitless numbers other than 0 are not lengths; LF_ANCHOR, LF_ANCHOR_SIZE: anchor() (the
+   inset properties) and anchor-size() (the properties @position-try accepts), css-anchor-position-1 */
+enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32, LF_ANCHOR = 64,
+       LF_ANCHOR_SIZE = 128 };
 struct cx;
 bool css_parse_length(const char *s, size_t n, struct cx *cx, len_t *out, int flags);
 bool css_number_token(const char **s, const char *end, float *out); /* a CSS <number-token> at *s */
@@ -333,6 +335,9 @@ struct css_calc_parse {
     const char *const *keys; /* identifiers that stand for numbers (a relative colour's channels) */
     unsigned nkeys;
     unsigned nodes, depth;   /* the parse's budget, from 0 */
+    /* LF_ANCHOR, LF_ANCHOR_SIZE: anchor() and anchor-size() are <length>s here (css-anchor-position-1
+       §3.2, §5.1; a computed value only, cx set). cssprop.c reads their arguments; each is a leaf */
+    uint8_t anchors;
 };
 bool css_calc_is_math(const char *s, size_t n); /* s starts with a math function */
 /* s..s+n, one math function: its simplified tree, typed against accept (*kind: the CSS_CALC_* type it
@@ -350,6 +355,20 @@ bool css_calc_equal(const struct css_calc *a, const struct css_calc *b);
    keys' values, cx the element's relative lengths. NaN and infinities as IEEE-754 gives them. */
 double css_calc_value(const struct css_calc *c, double basis, const double *keys, const struct cx *cx);
 struct css_calc *css_calc_bind(arena_t *a, const struct css_calc *c, const struct cx *cx); /* relative lengths resolved */
+/* anchor() and anchor-size() leaves (css-anchor-position-1): whether c holds one; a copy of c in a with
+   each replaced by what map gives (NULL: the copy fails), simplified again; the leaves map may give */
+struct css_anchor_function;
+typedef struct css_calc *(*css_calc_anchor_map)(void *context, arena_t *a, const struct css_anchor_function *f);
+bool css_calc_anchored(const struct css_calc *c);
+struct css_calc *css_calc_map_anchors(arena_t *a, const struct css_calc *c, css_calc_anchor_map map, void *context);
+struct css_calc *css_calc_anchor(arena_t *a, const struct css_anchor_function *f); /* a <length> */
+struct css_calc *css_calc_length(arena_t *a, const len_t *l); /* a computed <length-percentage> as a tree */
+/* cssprop.c: an anchor function's arguments from *s, after its '(' up to and past its ')'; NULL: invalid.
+   Its text and equality */
+const struct css_anchor_function *css_anchor_function_read(struct css_calc_parse *P, const char **s, const char *e,
+                                                           bool size);
+bool css_anchor_function_text(sbuf *out, const struct css_anchor_function *f);
+bool css_anchor_function_equal(const struct css_anchor_function *a, const struct css_anchor_function *b);
 bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *keys); /* §10.13; false: out of memory */
 /* a literal or a math function of a type accept allows, in its canonical unit (a percentage that
    resolves against a dimension: of basis, NaN if none); a top-level NaN is 0 (§10.9), infinities are the
@@ -461,12 +480,99 @@ struct css_offset {
     len_t position[2], anchor[2];
     struct css_offset_rotate rotate;
 };
+/* CSS Anchor Positioning 1 (css-anchor-position-1): anchor-name (§2.1), anchor-scope (§2.2),
+   position-anchor (§2.4), position-area (§3.1), position-try-fallbacks (§6.1), position-try-order
+   (§6.2) and position-visibility (§6.6). A style holds them as one group (style_t's anchor). Names
+   are <dashed-ident>s with their escapes resolved. */
+struct css_anchor_names {
+    const char *const *name;
+    uint32_t count;      /* 0: none */
+    bool all;            /* anchor-scope: all */
+};
+enum { CSS_ANCHOR_NORMAL, CSS_ANCHOR_NONE, CSS_ANCHOR_AUTO, CSS_ANCHOR_NAMED, CSS_ANCHOR_MATCH_PARENT };
+struct css_position_anchor { const char *name; uint8_t kind; }; /* kind CSS_ANCHOR_*; name: CSS_ANCHOR_NAMED */
+/* <position-area> (§3.1.2): a keyword of each axis, the block axis's (or the horizontal axis's)
+   first; the computed value holds the long logical keywords. css_area_keyword describes one. */
+enum { CSS_AREA_X = 1, CSS_AREA_Y, CSS_AREA_BLOCK, CSS_AREA_INLINE, CSS_AREA_SELF_BLOCK, CSS_AREA_SELF_INLINE,
+       CSS_AREA_LOGICAL, CSS_AREA_SELF_LOGICAL }; /* families; 0: center and span-all, either axis */
+enum { CSS_AREA_START, CSS_AREA_END, CSS_AREA_CENTER, CSS_AREA_SPAN_START, CSS_AREA_SPAN_END, CSS_AREA_SPAN_ALL };
+struct css_area_keyword {
+    const char *name;
+    uint8_t family, track; /* CSS_AREA_X..., CSS_AREA_START... */
+    uint8_t writing;       /* x and y keywords: 0 physical, 1 the containing block's writing mode, 2 the box's */
+};
+const struct css_area_keyword *css_area_keyword(uint8_t keyword); /* NULL: 0 or not one */
+/* position-try-fallbacks' try tactics (§6.1), in the order they apply */
+enum { CSS_TRY_FLIP_BLOCK = 1, CSS_TRY_FLIP_INLINE, CSS_TRY_FLIP_START, CSS_TRY_FLIP_X, CSS_TRY_FLIP_Y };
+struct css_position_try {
+    const char *rule;  /* a @position-try rule's name; NULL: the base styles */
+    uint8_t tactic[5], tactics;
+    uint8_t area[2];   /* a <position-area> option instead; area[0] 0: none */
+    /* not a computed value: the cascade with the option's declarations in the position fallback
+       origin (§6.4, css.c), for an absolutely positioned box's rule and area options. NULL: the
+       base styles, or (rule set) no @position-try rule has the name, and the option is skipped. */
+    const struct style *style;
+};
+struct css_position_tries { const struct css_position_try *option; uint32_t count; }; /* count 0: none */
+enum { CSS_TRY_ORDER_NORMAL, CSS_TRY_ORDER_MOST_WIDTH, CSS_TRY_ORDER_MOST_HEIGHT, CSS_TRY_ORDER_MOST_BLOCK,
+       CSS_TRY_ORDER_MOST_INLINE };
+enum { CSS_VISIBLE_ANCHOR_VALID = 1, CSS_VISIBLE_ANCHOR_VISIBLE = 2, CSS_VISIBLE_NO_OVERFLOW = 4 }; /* 0: always */
+struct css_anchor {
+    struct css_anchor_names name, scope;
+    struct css_position_anchor position_anchor;
+    uint8_t area[2];   /* area[0] 0: none */
+    struct css_position_tries tries;
+    uint8_t try_order, visibility;
+};
+/* anchor() and anchor-size() (§3.2, §5.1) in a length: a leaf of its calc() tree. side is a
+   CSS_SIDE_* (anchor()) or CSS_SIZE_* (anchor-size()); a percentage side is CSS_SIDE_PERCENT. */
+enum { CSS_SIDE_INSIDE, CSS_SIDE_OUTSIDE, CSS_SIDE_TOP, CSS_SIDE_LEFT, CSS_SIDE_RIGHT, CSS_SIDE_BOTTOM,
+       CSS_SIDE_START, CSS_SIDE_END, CSS_SIDE_SELF_START, CSS_SIDE_SELF_END, CSS_SIDE_CENTER, CSS_SIDE_PERCENT };
+enum { CSS_SIZE_IMPLIED, CSS_SIZE_WIDTH, CSS_SIZE_HEIGHT, CSS_SIZE_BLOCK, CSS_SIZE_INLINE, CSS_SIZE_SELF_BLOCK,
+       CSS_SIZE_SELF_INLINE };
+struct css_anchor_function {
+    bool size;          /* anchor-size() */
+    uint8_t side;
+    bool percent_function; /* a math function gave the percentage: it serializes as calc() */
+    float percent;
+    const char *name;   /* NULL: the default anchor */
+    bool fallback_given;
+    len_t fallback;
+};
+/* A positioned box's anchor functions resolved (layout.c): for each function, the length it is, or
+   false when it is not resolvable (its fallback, if any, is used instead). axis: the property's (0
+   horizontal, 1 vertical); inset: which inset property (0-3, top right bottom left), -1 otherwise. */
+typedef bool (*css_anchor_resolver)(void *context, const struct css_anchor_function *f, unsigned axis, int inset,
+                                    float *out);
+/* the length l with every anchor function it holds replaced by what resolve gives, or its fallback;
+   false: one has neither, and the declaration is invalid at computed-value time. resolve NULL: no
+   function is resolvable (a box that is not absolutely positioned). */
+bool css_length_resolve_anchors(arena_t *a, const len_t *l, css_anchor_resolver resolve, void *context,
+                                unsigned axis, int inset, len_t *out);
+bool css_length_anchored(const len_t *l); /* l holds an anchor function */
+void css_length_own(arena_t *a, len_t *l); /* l's calculation, if any, copied into a */
+/* the anchor functions of a style that is not absolutely positioned: each computes to its fallback,
+   or the property to its initial value (cssprop.c) */
+void css_style_anchor_fallbacks(struct style *s, arena_t *a);
+/* The accepted @position-try properties (§6.4): the inset, margin, sizing and self-alignment
+   properties, position-anchor and position-area. css_style_position_option copies them from a
+   position option's style into used (anchor: storage for used's anchor group); css_style_try_tactic
+   executes a try tactic on them (§6.5.2), in horizontal-tb ltr; css_style_position_hash digests them
+   with position and the position-try longhands, to tell a fallback-sensitive change (§6.5.1). */
+struct propdef;
+bool css_prop_position_try_accepted(const struct propdef *p);
+void css_style_position_option(struct style *used, const struct style *option, struct css_anchor *anchor);
+void css_style_try_tactic(struct style *s, uint8_t tactic, struct css_anchor *anchor, arena_t *a);
+uint64_t css_style_position_hash(const struct style *s);
+bool css_position_area_text(const uint8_t area[2], sbuf *out); /* a computed <position-area> */
 /* the groups' initial values (a style's NULL group), and whether two groups hold the same computed
    values (NULL: the initial ones) */
 extern const struct css_float_shape css_float_shape_initial;
 extern const struct css_offset css_offset_initial;
+extern const struct css_anchor css_anchor_initial;
 bool css_float_shape_equal(const struct css_float_shape *a, const struct css_float_shape *b);
 bool css_offset_equal(const struct css_offset *a, const struct css_offset *b);
+bool css_anchor_equal(const struct css_anchor *a, const struct css_anchor *b);
 enum css_offset_property { CSS_OFFSET_POSITION, CSS_OFFSET_ANCHOR, CSS_OFFSET_ROTATE };
 bool css_offset_parse(enum css_offset_property which, const char *v, size_t n, struct cx *cx, void *out, sbuf *specified);
 bool css_offset_serialize(enum css_offset_property which, const void *value, sbuf *out, web_doc *d);
@@ -572,7 +678,12 @@ enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO, OV_CLIP };
 enum { FD_ROW, FD_ROW_REVERSE, FD_COLUMN, FD_COLUMN_REVERSE };
 enum { FW_NOWRAP, FW_WRAP, FW_WRAP_REVERSE };
 enum { JC_START, JC_END, JC_CENTER, JC_BETWEEN, JC_AROUND, JC_EVENLY };
-enum { AI_STRETCH, AI_START, AI_END, AI_CENTER, AI_BASELINE };
+/* AI_NORMAL: normal (and justify-items' legacy), which flex, grid and block layout treat as stretch
+   and an anchor-positioned box's position-area replaces (css-anchor-position-1 §4.1); AI_ANCHOR_CENTER:
+   justify-self and align-self anchor-center (§4.2), which is center for a box that is not anchor
+   positioned. ai_used: the value those other layouts use. */
+enum { AI_STRETCH, AI_START, AI_END, AI_CENTER, AI_BASELINE, AI_ANCHOR_CENTER, AI_NORMAL };
+static inline int ai_used(int v) { return v == AI_ANCHOR_CENTER ? AI_CENTER : v == AI_NORMAL ? AI_STRETCH : v; }
 enum { AC_NORMAL, AC_STRETCH, AC_FLEX_START, AC_FLEX_END, AC_CENTER,
        AC_BETWEEN, AC_AROUND, AC_EVENLY, AC_START, AC_END };
 enum { BR_REPEAT, BR_REPEAT_X, BR_REPEAT_Y, BR_NO_REPEAT };
@@ -760,6 +871,7 @@ typedef struct style {
     const struct css_float_shape *float_shape; /* shape-outside, shape-margin, shape-image-threshold */
     const struct css_offset *offset;           /* Motion Path */
     const struct css_gap_rules *gap_rules;     /* gap decorations */
+    const struct css_anchor *anchor;           /* Anchor Positioning */
     struct css_clip_rect clip;
     const struct css_transform *transform;
     struct css_translate translate;
@@ -803,6 +915,9 @@ static inline const struct css_offset *css_style_offset(const style_t *s) {
 }
 static inline const struct css_gap_rules *css_style_gap_rules(const style_t *s) {
     return s->gap_rules ? s->gap_rules : &css_gap_rules_initial;
+}
+static inline const struct css_anchor *css_style_anchor(const style_t *s) {
+    return s->anchor ? s->anchor : &css_anchor_initial;
 }
 
 /* ---------------------------------------------------------------- stylesheets */
@@ -1099,6 +1214,8 @@ struct cx {
     bool absolute_lengths; /* relative lengths and percentages fail (Geometry's matrix strings) */
     bool computed_text;    /* the value is computed-value text the animation layer wrote (css_anim_parse):
                               what a style sheet's parse clamps (rgb()'s components) keeps its value */
+    uint8_t anchor_functions; /* LF_ANCHOR, LF_ANCHOR_SIZE: the anchor functions the length being parsed may hold */
+    uint8_t anchor_depth;     /* the anchor functions' fallbacks the length being parsed is in */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -1211,6 +1328,7 @@ typedef struct box {
     float static_x, static_y;
     struct box *static_cb;
     uint32_t gen;           /* layout pass that listed it */
+    uint32_t abs_placed;    /* layout pass that placed it, which an anchor-positioned box may do early */
     struct box *cb;         /* the block box these coordinates are relative to */
     struct box *inline_paint_owner, *inline_paint_source;
     int inline_run_first, inline_run_last, inline_deco_first, inline_deco_last;
@@ -1278,7 +1396,19 @@ typedef struct box {
     uint8_t marker_shape;
     /* inline <svg>: its entry in the document's cache */
     struct svg_cache *svg;
+    /* an anchor-positioned box's resolved position (layout.c, css-anchor-position-1): the styles it
+       is laid out with, the chosen position option, the scroll it compensates for. Box lifetime. */
+    struct box_anchor *anchored;
 } box_t;
+/* layout.c: an anchor-positioned box's used styles (its own st with its anchor functions resolved and
+   its chosen position option applied, into style and its anchor group into anchor; false: it is not
+   anchor positioned), its used inset in px (side 0-3; false: auto, or not anchor positioned),
+   whether position-visibility hides it, and its default scroll shift on an axis (§3.3) */
+bool box_anchor_style(const box_t *b, struct style *style, struct css_anchor *anchor);
+bool box_anchor_inset(const box_t *b, unsigned side, float *out);
+bool box_anchor_hidden(const box_t *b);
+float box_anchor_shift(const box_t *b, unsigned axis);
+void box_anchor_free(box_t *b);
 
 static inline bool box_line_clamp(const box_t *b) {
     return b && !b->anon && b->st && b->st->legacy_box &&
@@ -1699,6 +1829,8 @@ struct web_doc {
     pvec svgs;        /* struct svg_cache* */
     box_t *root_box;
     pvec abs_boxes;   /* absolutely positioned boxes, painted last */
+    struct box_anchor *anchored_boxes; /* layout.c: the anchor-positioned boxes (box_t's anchored), linked */
+    uint32_t anchor_epoch; /* box.c: counts unpublished element boxes, which those boxes' records name */
     pvec box_changes; /* parent/subtree pairs, or node/NULL to regenerate a node, until box publication */
     bool box_changes_full;
     const char *box_full_reason; /* debug_js only: why the next publication rebuilds every box */

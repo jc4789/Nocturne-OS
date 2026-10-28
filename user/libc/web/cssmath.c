@@ -111,7 +111,8 @@ double css_unit_canonical(int unit, double v, const struct cx *cx) {
 }
 
 /* ---------------------------------------------------------------- the tree */
-enum { N_VALUE, N_KEY, N_SUM, N_PRODUCT, N_NEGATE, N_INVERT, N_FN };
+/* N_ANCHOR: anchor() or anchor-size() (css-anchor-position-1), a <length> that layout resolves */
+enum { N_VALUE, N_KEY, N_SUM, N_PRODUCT, N_NEGATE, N_INVERT, N_FN, N_ANCHOR };
 enum { F_MIN, F_MAX, F_CLAMP, F_ROUND, F_MOD, F_REM, F_SIN, F_COS, F_TAN, F_ASIN, F_ACOS, F_ATAN, F_ATAN2, F_POW,
        F_SQRT, F_HYPOT, F_LOG, F_EXP, F_ABS, F_SIGN, F_COUNT };
 static const char *const fn_names[F_COUNT] = {"min", "max", "clamp", "round", "mod", "rem", "sin", "cos", "tan",
@@ -128,6 +129,7 @@ struct css_calc {
     struct ctype type;
     double v;
     struct css_calc **k; /* the children; clamp()'s none is NULL */
+    const struct css_anchor_function *anchor; /* N_ANCHOR: its arguments (cssprop.c) */
 };
 #define CALC_NODES 4096
 #define CALC_DEPTH 64
@@ -531,6 +533,8 @@ static double ev(const struct css_calc *c, const struct ev *E) {
         for (unsigned i = 1; i < c->n; i++) r *= ev(c->k[i], E);
         return r;
     }
+    case N_ANCHOR: /* not resolved against an anchor (css_length_resolve_anchors): its fallback */
+        return c->anchor->fallback_given ? len_resolve(&c->anchor->fallback, isnan(E->basis) ? 0 : (float)E->basis) : 0;
     }
     if (c->fn == F_MIN || c->fn == F_MAX || c->fn == F_HYPOT) {
         double r = ev(c->k[0], E);
@@ -671,6 +675,14 @@ static bool m_args(struct mp *m, struct list *args, bool none) {
         return false;
     }
 }
+/* an anchor function's leaf: a <length> */
+static struct css_calc *anchor_leaf(struct mp *m, const struct css_anchor_function *f) {
+    struct css_calc *c = f ? node(m, N_ANCHOR, 0) : NULL;
+    if (!c) return NULL;
+    c->type.e[T_LENGTH] = 1;
+    c->anchor = f;
+    return c;
+}
 static struct css_calc *m_function(struct mp *m, const char *name, size_t name_n) {
     if (++m->P->depth > CALC_DEPTH) return NULL;
     struct css_calc *result = NULL;
@@ -678,6 +690,12 @@ static struct css_calc *m_function(struct mp *m, const char *name, size_t name_n
         struct css_calc *x = m_sum(m);
         sp(m);
         if (x && (m->p >= m->e || *m->p == ')')) { if (m->p < m->e) m->p++; result = x; }
+        goto done;
+    }
+    bool size = word_is(name, name_n, "anchor-size");
+    if (size || word_is(name, name_n, "anchor")) {
+        if (m->P->anchors & (size ? LF_ANCHOR_SIZE : LF_ANCHOR) && m->P->cx)
+            result = anchor_leaf(m, css_anchor_function_read(m->P, &m->p, m->e, size));
         goto done;
     }
     int fn = -1;
@@ -899,7 +917,7 @@ struct css_calc *css_calc_key(arena_t *a, unsigned index) {
     return c;
 }
 int css_calc_key_of(const struct css_calc *c) { return c && c->op == N_KEY ? c->key : -1; }
-bool css_calc_function_root(const struct css_calc *c) { return c && c->op == N_FN; }
+bool css_calc_function_root(const struct css_calc *c) { return c && (c->op == N_FN || c->op == N_ANCHOR); }
 bool css_calc_constant(const struct css_calc *c, double *v) {
     if (!known(c)) return false;
     *v = c->v;
@@ -934,6 +952,7 @@ bool css_calc_equal(const struct css_calc *a, const struct css_calc *b) {
     if (a == b) return true;
     if (!a || !b || a->op != b->op || a->fn != b->fn || a->unit != b->unit || a->key != b->key || a->n != b->n) return false;
     if (a->op == N_VALUE && !(a->v == b->v ? signbit(a->v) == signbit(b->v) : isnan(a->v) && isnan(b->v))) return false;
+    if (a->op == N_ANCHOR && !css_anchor_function_equal(a->anchor, b->anchor)) return false;
     for (unsigned i = 0; i < a->n; i++) if (!css_calc_equal(a->k[i], b->k[i])) return false;
     return true;
 }
@@ -944,7 +963,7 @@ static struct css_calc *rebuild(struct mp *m, const struct css_calc *c) {
         if (units[c->unit].rel == R_ABS) return (struct css_calc *)c;
         return mk_leaf(m, css_unit_canonical(c->unit, c->v, m->P->cx), U_PX, c->type);
     }
-    if (c->op == N_KEY) return (struct css_calc *)c;
+    if (c->op == N_KEY || c->op == N_ANCHOR) return (struct css_calc *)c;
     struct css_calc **k = ar_alloc(m->P->a, c->n * sizeof *k);
     for (unsigned i = 0; i < c->n; i++)
         if (c->k[i] && !(k[i] = rebuild(m, c->k[i]))) return NULL;
@@ -955,6 +974,34 @@ struct css_calc *css_calc_bind(arena_t *a, const struct css_calc *c, const struc
     struct css_calc_parse P = {.a = a, .cx = cx};
     struct mp m = {&P, NULL, NULL, T_PERCENT, false};
     return rebuild(&m, c);
+}
+bool css_calc_anchored(const struct css_calc *c) {
+    if (!c) return false;
+    if (c->op == N_ANCHOR) return true;
+    for (unsigned i = 0; i < c->n; i++) if (css_calc_anchored(c->k[i])) return true;
+    return false;
+}
+static struct css_calc *map_anchors(struct mp *m, const struct css_calc *c, css_calc_anchor_map map, void *context) {
+    if (c->op == N_ANCHOR) return map(context, m->P->a, c->anchor);
+    if (++m->P->depth > CALC_DEPTH * 4) return NULL;
+    struct css_calc *r = node(m, c->op, c->n);
+    if (!r) return NULL;
+    r->fn = c->fn; r->unit = c->unit; r->key = c->key; r->type = c->type; r->v = c->v;
+    for (unsigned i = 0; i < c->n; i++)
+        if (c->k[i] && !(r->k[i] = map_anchors(m, c->k[i], map, context))) return NULL;
+    m->P->depth--;
+    return simplify(m, r);
+}
+struct css_calc *css_calc_map_anchors(arena_t *a, const struct css_calc *c, css_calc_anchor_map map, void *context) {
+    if (!c) return NULL;
+    struct css_calc_parse P = {.a = a};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    return map_anchors(&m, c, map, context);
+}
+struct css_calc *css_calc_anchor(arena_t *a, const struct css_anchor_function *f) {
+    struct css_calc_parse P = {.a = a};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    return anchor_leaf(&m, f);
 }
 
 /* ---------------------------------------------------------------- serialization (§10.13) */
@@ -1046,6 +1093,7 @@ static void put_tree(struct out *o, const struct css_calc *c, const char *const 
     case N_VALUE: put_leaf(o, c); return;
     case N_KEY: puts_(o, keys && keys[c->key] ? keys[c->key] : "none"); return;
     case N_FN: put_fn(o, c, keys); return;
+    case N_ANCHOR: if (o->ok && !css_anchor_function_text(o->b, c->anchor)) o->ok = false; return;
     case N_NEGATE: case N_INVERT:
         if (!bare) put(o, "(", 1);
         puts_(o, c->op == N_NEGATE ? "-1 * " : "1 / ");
@@ -1077,6 +1125,7 @@ bool css_calc_serialize(sbuf *b, const struct css_calc *c, const char *const *ke
     size_t begin = b->n;
     struct out o = {b, true};
     if (c->op == N_FN) put_fn(&o, c, keys);
+    else if (c->op == N_ANCHOR) put_tree(&o, c, keys, true); /* a function of its own, not in calc() */
     else {
         put(&o, "calc(", 5);
         put_tree(&o, c, keys, true);
@@ -1256,6 +1305,11 @@ static struct css_calc *length_tree(struct mp *m, const len_t *l) {
     s->k[1] = a;
     s->type = pct;
     return s;
+}
+struct css_calc *css_calc_length(arena_t *a, const len_t *l) {
+    struct css_calc_parse P = {.a = a};
+    struct mp m = {&P, NULL, NULL, T_LENGTH, false};
+    return length_tree(&m, l);
 }
 static struct css_calc *scaled(struct mp *m, struct css_calc *x, double k) {
     struct ctype none = {{0}, -1};
