@@ -241,6 +241,7 @@ static void tab_leave(struct tab **served) { tab = *served; }
 struct navigation_request;
 static struct tab *tab_new(struct tab *after);
 static struct tab *tab_open(const struct navigation_request *r, struct tab *after, bool foreground);
+static void new_window(const char *url);
 static void tab_select(struct tab *t);
 static void tab_close(struct tab *t);
 static void tab_move(struct tab *t, int to);
@@ -1576,6 +1577,15 @@ static void host_navigate(void *opaque, const struct web_navigation *n) {
     if (tab->doc && !has_prefix(web_url(tab->doc), "file://") && !has_prefix(web_url(tab->doc), "about:") &&
         has_prefix(n->url, "file://")) {
         console_add("error", "A remote document cannot navigate to a local file.");
+        set_status("A remote page cannot open a local file");
+        return;
+    }
+    if (n->disposition != WEB_DISPOSITION_CURRENT) {
+        /* The user's own Ctrl or Shift on a hyperlink: a tab behind this one, or a window. */
+        struct navigation_request r = {.url = n->url, .mode = NAV_PUSH, .initiator = n->initiator ? n->initiator : "",
+            .referrer = n->referrer, .referrer_policy = n->referrer_policy, .user_activation = true};
+        if (n->disposition == WEB_DISPOSITION_TAB) tab_open(&r, tab, false);
+        else new_window(n->url);
         return;
     }
     const char *target = n->target;
@@ -2693,17 +2703,12 @@ static void apply_pending_history(void) {
     else go_history(delta, false);
 }
 
+/* Implicit submission from a field when the form has no submit button: HTML "submit" from the
+   form element itself. */
 static void submit(web_node *n) {
     if (!web_sandbox_form_submission_allowed(tab->doc, n)) return;
     web_node *form = web_form_owner(tab->doc, n);
-    if(!form || !web_form_submission_validate(tab->doc,n)) {flush_dom_layout();return;}
-    struct web_event event = {.type = "submit", .bubbles = true, .cancelable = true};
-    struct web_hit action={0};
-    if(web_node_action(tab->doc,n,&action) && action.kind==WEB_HIT_SUBMIT)event.submitter=n;
-    bool allowed = form && web_dispatch(tab->doc, form, &event);
-    flush_dom_layout();
-    if (!allowed) return;
-    web_form_navigate(tab->doc, n);
+    if (form) web_form_submit(tab->doc, form);
     flush_dom_layout();
 }
 
@@ -3114,71 +3119,36 @@ static void page_click(web_node *target, int x, int y, bool keyboard, uint32_t m
     tab->focus = F_PAGE;
     if (!tab->doc) return;
     if(web_control_disabled(target))return;
-    /* Author click listeners may reparent the target. Capture its first
-       native link activation now, without changing the event target. */
-    web_node *anchor = web_link_activation_anchor(tab->doc,target);
+    /* The click's DOM dispatch runs its activation behavior, the one script's click() and
+       dispatchEvent() reach too (js_activation_native.h): links, form controls, labels,
+       summaries and media controls. */
+    web_node *focused = web_focused(tab->doc);
     struct gui_event native = {.x = x, .y = y, .buttons = 0, .mods = mods};
-    struct web_control_activation activation;
-    web_control_activation_begin(tab->doc, target, &activation);
     bool allowed = dispatch_native_mode("click", target, &native, true, keyboard);
-    bool input_events = web_control_activation_end(tab->doc, &activation, allowed);
-    if (!allowed) { flush_dom_layout(); return; }
-    if (!anchor && web_media_activate(tab->doc,target)) { flush_dom_layout(); return; }
-    web_node *label_control = anchor ? NULL : web_label_activation(target);
-    if (label_control) { page_focus(label_control); page_click(label_control, x, y, keyboard, mods); return; }
-    struct web_hit hit = {0};
-    if (anchor) {
-        /* Read this same anchor's latest href after dispatch. Removal of
-           href or reparenting must not select another ancestor anchor. */
-        if (!web_link_action(tab->doc,anchor,&hit)) return;
-    } else if (!web_node_action(tab->doc,target,&hit) || hit.kind==WEB_HIT_LINK) return;
-    if (!keyboard && hit.kind==WEB_HIT_DETAILS) {
-        struct web_hit pointer={0};
-        if (!web_hit_test(tab->doc,document_x(x),y+tab->scroll_y,&pointer) || pointer.kind!=WEB_HIT_DETAILS || pointer.node!=hit.node) return;
+    web_node *now = web_focused(tab->doc);
+    if (now != focused || (now && web_input_is_file(now))) {
+        /* A label's control took the focus, or a file input's picker chose files: a later blur
+           compares against the value it has now. */
+        if (now != focused && focused) {
+            const char *value = web_control_value(focused);
+            if (tab->focus_value && value && strcmp(tab->focus_value, value)) dispatch_native("change", focused, NULL, false);
+        }
+        free(tab->focus_value);
+        const char *value = now ? web_control_value(now) : NULL;
+        tab->focus_value = value ? strdup(value) : NULL;
     }
-    switch (hit.kind) {
-    case WEB_HIT_LINK:
-        if (hit.href) {
-            if (has_prefix(hit.href, "file://") && !has_prefix(web_url(tab->doc), "file://") &&
-                !has_prefix(web_url(tab->doc), "about:")) {
-                set_status("A remote page cannot open a local file");
-                return;
-            }
-            /* Ctrl: a new tab behind this one; Shift: a new window. */
-            if (mods & (NMOD_CTRL | NMOD_SHIFT)) {
-                struct navigation_request r = page_navigation(hit.href, NAV_PUSH, anchor);
-                if (mods & NMOD_CTRL) tab_open(&r, tab, false);
-                else new_window(hit.href);
-                return;
-            }
-            if (!web_frame_navigate(tab->doc, anchor, hit.href, true)) {
-                struct navigation_request r = page_navigation(hit.href, NAV_PUSH, anchor);
-                queue_navigation(&r);
-            }
+    if (!allowed) return;
+    /* What the platform's widgets do beyond HTML's activation behavior: a select's list, and
+       the default summary of a details element without one. */
+    struct web_hit hit = {0};
+    if (!web_node_action(tab->doc,target,&hit)) return;
+    if (hit.kind == WEB_HIT_SELECT) open_select(hit.node);
+    else if (hit.kind == WEB_HIT_DETAILS && hit.node == target) {
+        if (!keyboard) {
+            struct web_hit pointer={0};
+            if (!web_hit_test(tab->doc,document_x(x),y+tab->scroll_y,&pointer) || pointer.kind!=WEB_HIT_DETAILS || pointer.node!=hit.node) return;
         }
-        return;
-    case WEB_HIT_TEXT_INPUT:
-    case WEB_HIT_TEXTAREA: break; /* focusing belongs to the preceding mousedown */
-    case WEB_HIT_FILE:
-        if (web_input_choose_files(tab->doc, hit.node)) {
-            dispatch_native("input", hit.node, &native, false);
-            dispatch_native("change", hit.node, &native, false);
-            if (web_focused(tab->doc) == hit.node) { free(tab->focus_value); tab->focus_value = strdup(web_control_value(hit.node)); }
-            flush_dom_layout();
-        }
-        break;
-    case WEB_HIT_CHECKBOX:
-    case WEB_HIT_RADIO:
-        if (input_events) { dispatch_native("input", hit.node, &native, false); dispatch_native("change", hit.node, &native, false); }
-        break;
-    case WEB_HIT_SUBMIT: submit(hit.node); return;
-    case WEB_HIT_BUTTON: web_reset(tab->doc,hit.node); flush_dom_layout(); break;
-    case WEB_HIT_DETAILS:
-        web_toggle(tab->doc,hit.node); flush_dom_layout(); break;
-    case WEB_HIT_SELECT:
-        open_select(hit.node);
-        break;
-    default: break;
+        web_toggle(tab->doc,hit.node); flush_dom_layout();
     }
 }
 

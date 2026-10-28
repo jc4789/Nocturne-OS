@@ -3157,6 +3157,32 @@ static void navigate_form_request(struct web_js_state *s, node_t *submitter) {
     if(sandbox_authority(s)&SB_FORMS){log_text(s,1,"Sandbox denied form submission");return;}
     web_form_navigate(s->doc,submitter);
 }
+bool web_form_submit(web_doc *d, node_t *submitter) {
+    if (submitter && submitter->owner) d = submitter->owner;
+    if (!d || !submitter || submitter->type != N_ELEM || submitter->foreign) return false;
+    node_t *form = submitter->tag == T_form ? submitter : web_form_owner(d, submitter);
+    if (!form || form->type != N_ELEM || form->foreign || form->tag != T_form) return false;
+    /* 1. "If form cannot navigate, then return": not connected, or not fully active. */
+    if (!doc_node_connected(form) || !web_doc_fully_active(d)) return false;
+    /* 2. Constructing its entry list. 4. The sandboxed forms browsing context flag. */
+    if (form->constructing_form_entries) return false;
+    if (!web_sandbox_forms_allowed(d)) { web_js_console(d, 1, "Sandbox denied form submission"); return false; }
+    /* 5. Not from submit(): the firing-submission-events guard, interactive validation (the
+       no-validate state is the form's or the submitter's), and the submit event. */
+    if (form->firing_submission_events) return false;
+    form->firing_submission_events = true;
+    bool go = web_form_submission_validate(d, submitter);
+    if (go) {
+        struct web_event e = {.type = "submit", .bubbles = true, .cancelable = true,
+            .submitter = submitter != form && web_control_submit_button(submitter) ? submitter : NULL};
+        go = web_js_dispatch(d, form, &e);
+    }
+    form->firing_submission_events = false;
+    /* 5.9 Listeners may have removed the form or replaced the document. */
+    if (!go || form->owner != d || !doc_node_connected(form) || !web_doc_fully_active(d)) return false;
+    web_form_navigate(d, submitter);
+    return true;
+}
 #include "js_document_commands.h"
 #include "js_cssom.h"
 #include "js_fonts.h"
@@ -5442,82 +5468,21 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     else if (s->host.navigate) s->host.navigate(s->host.opaque,&navigation);
     js_free(ctx, url); return JS_UNDEFINED;
 }
-/* Capture the native activation path before author listeners can reparent
-   the clicked descendant. The event target itself remains the clicked node. */
-static node_t *native_click_anchor(web_doc *d, node_t *target) {
-    return web_link_activation_anchor(d, target);
-}
-static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+/* HTML click(): a disabled form control or a click already in progress does nothing; otherwise
+   "fire a synthetic pointer event named click" with the not trusted flag, whose dispatch runs
+   the activation (js_activation_native.h). */
+static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
     struct web_js_state *s = state(ctx); node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
     if (!n) return JS_EXCEPTION;
     if((sandbox_authority(s)&SB_SCRIPTS) || (sandbox_borrowed(s) && n->owner!=sandbox_actor(s)->doc))
         return history_security_error(ctx,"Sandbox denied borrowed activation authority");
-    if (n->owner && n->owner->inert) {
-        JSValue args[] = {argv[0], JS_NewString(ctx, "click")};
-        JSValue value = custom_element_hook(s, "inertClick", 2, args);
-        JS_FreeValue(ctx, args[1]); return value;
-    }
-    if (web_control_disabled(n)) return JS_UNDEFINED;
-    node_t *anchor = native_click_anchor(s->doc, n);
-    struct web_event e = {.type="click", .bubbles=true, .cancelable=true, .synthetic=true};
-    struct web_control_activation activation;
-    web_control_activation_begin(s->doc, n, &activation);
-    bool allowed = web_js_dispatch(s->doc, n, &e);
-    bool input_events = web_control_activation_end(s->doc, &activation, allowed);
-    if (!allowed) return JS_UNDEFINED;
-    e.synthetic = false; /* default-action input/change/submit events are UA generated */
-    if (s->doc->resources_dirty) doc_rescan(s->doc);
-    node_t *label_control = anchor ? NULL : web_label_activation(n);
-    if (label_control && !web_control_disabled(label_control)) {
-        web_js_focus_control(s->doc, label_control);
-        JSValue argument = wrap(s, label_control);
-        JSValue result = JS_IsException(argument) ? argument : native_click(ctx, this_val, 1, &argument);
-        JS_FreeValue(ctx, argument); return result;
-    }
-    node_t *disclosure=anchor ? NULL : doc_details_activation(n);
-    if (disclosure) doc_details_toggle(s->doc,disclosure);
-    else if (!anchor && (n->tag == T_audio || n->tag == T_video)) web_media_activate(s->doc, n);
-    else if (anchor) {
-        if(node_attr(anchor,"download") && (sandbox_authority(s)&SB_DOWNLOADS))return JS_UNDEFINED;
-        struct web_hit action = {0};
-        if (web_link_action(s->doc, anchor, &action) && permitted_url(s, action.href, false)) {
-            web_doc *top=s->doc;while(top->frame_parent)top=top->frame_parent;
-            if(!web_frame_navigate(top,anchor,action.href,s->doc->sandbox_activation_until>uptime_ms()) && s->host.navigate){
-                /* The document follows the hyperlink as a click the user made does (frame.c:
-                   its target chooses the navigable), with its own activation; the top-level
-                   one is the host's. */
-                struct web_navigation navigation={.url=action.href,.history=WEB_NAVIGATE_PUSH};
-                web_navigation_source(s->doc,anchor,&navigation);
-                s->host.navigate(s->host.opaque,&navigation);
-            }
-        }
-    } else if (n->tag == T_input) {
-        const char *type = node_attr(n, "type");
-        if (type && (str_ieq(type, "checkbox") || str_ieq(type, "radio"))) {
-            if (input_events) { e.type = "input"; e.cancelable = false;  web_js_dispatch(s->doc, n, &e); e.type = "change";  web_js_dispatch(s->doc, n, &e); } s->doc->dirty = true;
-        } else if (type && (str_ieq(type, "submit") || str_ieq(type, "image"))) {
-            node_t *form = web_form_owner(s->doc, n); e.type = "submit";
-            e.submitter=n;
-            if (form && web_sandbox_forms_allowed(s->doc) && web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) {
-                navigate_form_request(s,n);
-            }
-        } else if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
-    } else if (n->tag == T_button) {
-        const char *type = node_attr(n, "type"); node_t *form = web_form_owner(s->doc, n);
-        if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
-        else if (form && web_control_submit_button(n) && web_sandbox_forms_allowed(s->doc)) { e.type = "submit"; e.submitter=n; if (web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) navigate_form_request(s,n); }
-    }
-    return JS_UNDEFINED;
-}
-static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
-    if (!n) return JS_EXCEPTION;
-    if (n->click_in_progress) return JS_UNDEFINED;
+    if (web_control_disabled(n) || n->click_in_progress) return JS_UNDEFINED;
     n->click_in_progress = true;
-    JSValue result = native_click_impl(ctx, this_val, argc, argv);
-    n->click_in_progress = false;
-    return result;
+    struct web_event e = {.type="click", .bubbles=true, .cancelable=true, .synthetic=true};
+    web_js_dispatch(s->doc, n, &e);
+    n->click_in_progress = false; /* nodes are their document's allocations */
+    return JS_UNDEFINED;
 }
 static void release_timer(struct web_js_state *s, unsigned index) {
     /* Unpublish before releasing references. Never retain a slot pointer across
@@ -5647,6 +5612,7 @@ static JSValue native_cancel_post(JSContext *ctx, JSValueConst this_val, int arg
     }
     return JS_UNDEFINED;
 }
+#include "js_activation_native.h"
 /* Native idle-task source: no timer alias, no allocation until requested, and
    every callback reference/queue node uses the QuickJS allocator. */
 static struct js_idle_task *take_idle(struct js_idle_task **first, struct js_idle_task **last, uint32_t id) {
@@ -9052,7 +9018,9 @@ bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) 
         return web_js_dispatch(target->owner,target,&local);
     }
     struct web_js_state *s = d ? d->js : NULL;
-    if (!s || s->disabled || !event || !event->type || JS_IsUndefined(s->dispatch)) return true;
+    /* No realm runs listeners: a click still has its activation. */
+    if (!s || s->disabled || JS_IsUndefined(s->dispatch)) return activation_dispatch_native(d, target, event);
+    if (!event || !event->type) return true;
     if(!event->synthetic && target && web_dialog_inert(d,target) &&
        (!strncmp(event->type,"key",3) || !strncmp(event->type,"mouse",5) || !strcmp(event->type,"click") || !strcmp(event->type,"dblclick"))) return false;
     if(!target && !event->synthetic && !strncmp(event->type,"key",3) && web_dialog_top(d)) target=web_dialog_top(d);
@@ -10310,7 +10278,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("windowHandler", 5, native_window_handler),
         JS_CFUNC_DEF("eventRealmInit", 2, native_event_realm_init), JS_CFUNC_DEF("customElementAgent", 2, native_custom_element_agent), JS_CFUNC_DEF("eventRealm", 1, native_event_realm),
         JS_CFUNC_DEF("eventActive", 2, native_event_active),
-        JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
+        JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("activation", 7, native_activation), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
         JS_CFUNC_DEF("microtask", 1, native_microtask),
         JS_CFUNC_DEF("postTask", 1, native_post_task), JS_CFUNC_DEF("cancelPost", 1, native_cancel_post),
         JS_CFUNC_DEF("broadcast", 3, native_broadcast),

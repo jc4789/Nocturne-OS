@@ -149,8 +149,22 @@ function nativeDispatch(target,type,init) {
     const e=new C(type,ui?mouseAssign({},init,{view:globalThis}):init);
     // pageX/pageY are where the native event occurred (MouseEvent's record, not own fields).
     if(ui&&!focus)mouseNativePosition(e,init.pageX,init.pageY);
-    for(const key of Object.keys(init))if(!eventFields.has(key)&&key!=='submitter'&&!(focus&&key==='relatedTarget')&&!(wheelData.has(e)&&wheelFields.has(key))&&!pointerData.has(e)&&!(ui&&!focus&&mouseCoordinateFields.has(key)))e[key]=init[key];
+    /* The HTML submit algorithm's SubmitEvent has Event's members and its submitter only. */
+    if(C!==formValidationBridge.SubmitEvent)for(const key of Object.keys(init))if(!eventFields.has(key)&&key!=='submitter'&&!(focus&&key==='relatedTarget')&&!(wheelData.has(e)&&wheelFields.has(key))&&!pointerData.has(e)&&!(ui&&!focus&&mouseCoordinateFields.has(key)))e[key]=init[key];
     eventState(e).composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|pointerdown|pointerup|pointermove|pointerout|pointerover|pointercancel|wheel|focus|blur|focusin|focusout|input)$/.test(type);
     eventState(e).isTrusted=init.isTrusted!==false;
+    /* The keys the user held for this click, where a hyperlink opens (js_activation_native.h). */
+    if(type==='click' && init.isTrusted!==false)eventState(e).user={ctrl:!!init.ctrlKey,shift:!!init.shiftKey};
     return dispatch(target,e);
+}
+/* HTML's label activation behavior, as the platform's: the labeled control gets a click that
+   keeps the label click's trust, pointer, position and keys, the user's own included. */
+const forwardedFields=['screenX','screenY','clientX','clientY','pageX','pageY','button','buttons','ctrlKey','shiftKey','altKey','metaKey'];
+function activationForward(control,event){
+    const source=eventState(event),data=pointerData.get(event);
+    const init={bubbles:true,cancelable:true,composed:true,view:event.view??null,detail:event.detail};
+    for(const key of forwardedFields)init[key]=event[key];
+    const e=data?new PointerEvent('click',mouseAssign(init,data)):new MouseEvent('click',init);
+    eventState(e).isTrusted=source.isTrusted;eventState(e).user=source.user;
+    return dispatch(control,e);
 }
