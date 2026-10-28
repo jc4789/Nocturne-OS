@@ -250,6 +250,23 @@ int main(void){
     started=false;for(struct web_animation *o=element.owned;o;o=o->owner_next)if(!o->disowned&&o->property==css_prop_lookup("background-color",16))started=true;
     CHECK(!started);
     web_motion_cancel(&element,-1);at(6910);events(types,8);at(6920);
+    /* a descendant that inherits its parent's transition start value, read again from the
+       text the layer wrote (10pt is 13.333333px, written 13.33333px): the same value to the layer,
+       no transition (css-transitions/properties-value-inherit-001.html, length(pt)); a real change
+       still starts one */
+    style_t hb=styled("height","10pt");hb=styled_on(&hb,"transition","height 2s linear");
+    struct css_anim_ctx hx={.base=&hb,.parent=&parent,.rem=16,.vw=800,.vh=600,.a=&arena};sbuf written={0};
+    CHECK(css_anim_interpolate(&hx,css_prop_lookup("height",6),&hb,&hb,0,&written));
+    style_t ha=styled("height",sb_cstr(&written));ha=styled_on(&ha,"transition","height 2s linear");sb_free(&written);
+    CHECK(hb.height.px!=ha.height.px);
+    s=site(&ha);web_motion_transitions(&s,&hb,&ha,none_animated);
+    started=false;for(struct web_animation *o=element.owned;o;o=o->owner_next)if(!o->disowned&&o->property==css_prop_lookup("height",6))started=true;
+    CHECK(!started);
+    style_t hc=styled("height","20pt");hc=styled_on(&hc,"transition","height 2s linear");
+    s=site(&hc);web_motion_transitions(&s,&hb,&hc,none_animated);
+    started=false;for(struct web_animation *o=element.owned;o;o=o->owner_next)if(!o->disowned&&o->property==css_prop_lookup("height",6))started=true;
+    CHECK(started);
+    web_motion_cancel(&element,-1);at(6930);events(types,8);at(6940);
 
     /* CSS Animations: created from animation-name, reused while the name stays, canceled when it goes */
     style_t anim=styled("animation","fade 1s linear forwards");

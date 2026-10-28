@@ -941,6 +941,17 @@ static bool transitionable(const struct css_anim_ctx *ctx, const struct propdef 
     sb_free(&t);
     return ok;
 }
+/* a and b as this layer writes them (its numbers have the stored floats' seven significant
+   digits) are one value: a transition between them would change nothing. A descendant that
+   inherits a transition's start value, written so, differs from its style before only below
+   that (10pt is 13.333333px, read back 13.33333px). */
+static bool same_written(const struct css_anim_ctx *ctx, const struct propdef *p, const style_t *a, const style_t *b) {
+    sbuf x = {0}, y = {0};
+    bool same = css_anim_interpolate(ctx, p, a, b, 0, &x) && css_anim_interpolate(ctx, p, a, b, 1, &y) &&
+                !strcmp(sb_cstr(&x), sb_cstr(&y));
+    sb_free(&x); sb_free(&y);
+    return same;
+}
 static char *computed_text(const style_t *st, const struct propdef *p, web_doc *d) {
     sbuf b = {0};
     char *text = css_computed_value(st, p, &b, d) ? strdup(sb_cstr(&b)) : NULL;
@@ -1031,7 +1042,8 @@ void web_motion_transitions(struct web_motion_site *site, const style_t *before,
         char *to = computed_text(after, p, d);
         if (!to) continue;
         if (!running && changed && i >= 0 && combined > 0 &&
-            transitionable(&after_ctx, p, before, after, allow_discrete) && (!completed || strcmp(completed->to, to))) {
+            transitionable(&after_ctx, p, before, after, allow_discrete) && !same_written(&after_ctx, p, before, after) &&
+            (!completed || strcmp(completed->to, to))) {
             /* §3 step 1 */
             if (completed) { css_disown(completed); completed = NULL; }
             char *from = computed_text(before, p, d);
